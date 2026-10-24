@@ -24982,6 +24982,9 @@ function monoFrameOfNode(ix: i32, root: i32): i32 {
 // stamp and the statement count: one walk answers every query between two edits (D4942).
 let monoProgTop: i32[] = []
 let monoProgHeldStamp = 0 - 1
+// Whether that walk marked a node more than `MONO_PROG_DEPTH` below its statement.
+let monoProgTopDeep = false
+const MONO_PROG_DEPTH = 400
 
 // Per node: the first module-scope function statement whose subtree holds it, -1 when only
 // another statement does, -2 when none does; rebuilt when the arena stamp moves.
@@ -24989,11 +24992,17 @@ function monoProgTopOf(ix: i32): i32 {
   const stamp = monoArenaStamp() + monoProgStmts.length
   if stamp != monoProgHeldStamp {
     const top: i32[] = __array_new__(P.nodes.length, -2)
+    let deep = false
     for st in monoProgStmts {
-      if nodeAt(st) is FuncDecl { monoProgTopMark(top, st, st) }
+      if nodeAt(st) is FuncDecl {
+        if monoProgTopMark(top, st, st) { deep = true }
+      }
     }
-    for st in monoProgStmts { monoProgTopMark(top, st, -1) }
+    for st in monoProgStmts {
+      if monoProgTopMark(top, st, -1) { deep = true }
+    }
     monoProgTop = top
+    monoProgTopDeep = deep
     monoProgHeldStamp = stamp
   }
   if ix < 0 || ix >= monoProgTop.length { return -2 }
@@ -25001,18 +25010,27 @@ function monoProgTopOf(ix: i32): i32 {
 }
 
 // Marks every node `root`'s subtree reaches, entering function bodies (a function's body is
-// its last child), that no earlier walk marked, as held by `owner`.
-function monoProgTopMark(top: i32[], root: i32, owner: i32) {
+// its last child), that no earlier walk marked, as held by `owner`; whether one it marked lies
+// more than `MONO_PROG_DEPTH` below `root`.
+function monoProgTopMark(top: i32[], root: i32, owner: i32): boolean {
   const stack: i32[] = [root]
+  const depths: i32[] = [0]
+  let deep = false
   while stack.length > 0 {
     const cur = stack.pop() ?? -1
+    const d = depths.pop() ?? 0
     if cur >= 0 && cur < top.length && top[cur] == -2 {
       // arena-tick exempt: top is the caller's fresh table, not the arena
       top[cur] = owner
-      nodeChildrenPush(cur, stack)
+      if d > MONO_PROG_DEPTH { deep = true }
+      let k = nodeChildrenPush(cur, stack)
+      while k > 0 {
+        depths.push(d + 1)
+        k = k - 1
+      }
     }
   }
-  0
+  deep
 }
 
 // Whether node `ix` lies in the program, entering function bodies (`monoSubtreeHolds` over every
@@ -27808,34 +27826,23 @@ let monoProgNamesStamp = 0 - 1
 function monoProgNamesIdent(nm: string): boolean {
   const stamp = monoArenaStamp() + monoProgStmts.length
   if stamp != monoProgNamesStamp {
+    // The program's nodes are the ones `monoProgTop` holds, read off its walk at this stamp.
+    monoProgTopOf(-1)
     const names: {[string]: boolean} = Map()
-    let deep = false
-    const ixs: i32[] = []
-    const depths: i32[] = []
-    for st in monoProgStmts {
-      ixs.push(st)
-      depths.push(0)
-    }
-    while ixs.length > 0 {
-      const ix = ixs.pop() ?? -1
-      const d = depths.pop() ?? 0
-      if ix >= 0 && ix < P.nodes.length {
-        const n = nodeAt(ix)
-        if d > 400 {
-          deep = true
-        } else if n is Ident {
+    const top = monoProgTop
+    if !monoProgTopDeep {
+      let ix = 0
+      while ix < top.length {
+        if top[ix] != -2 {
+          const n = nodeAt(ix)
           // arena-tick exempt: names is this function's fresh table, not the arena
-          names[n.identName] = true
-        } else {
-          for k in nodeChildren(ix) {
-            ixs.push(k)
-            depths.push(d + 1)
-          }
+          if n is Ident { names[n.identName] = true }
         }
+        ix = ix + 1
       }
     }
     monoProgNames = names
-    monoProgNamesDeep = deep
+    monoProgNamesDeep = monoProgTopDeep
     monoProgNamesStamp = stamp
   }
   monoProgNamesDeep || (monoProgNames[nm] ?? false)
@@ -28353,6 +28360,7 @@ export function monomorphize(stmts: i32[]) {
   monoExactLow = 0
   monoProgStmts = stmts
   monoProgHeldStamp = 0 - 1
+  monoProgTopDeep = false
   monoProgNamesStamp = 0 - 1
   monoProgTop = []
   monoProgNames = Map()
@@ -28550,7 +28558,8 @@ function monoPruneTemplates(nDecl: i32) {
     sl = sl + 1
   }
 
-  const memberProps = monoMemberPropNames()
+  // `monoMemberPropNames`, built the first time `monoNestedFnDead` consults it.
+  const memberProps: {[string]: i32}[] = []
   let gp = 0
   while gp < nDecl {
     if fnStmts[gp] == monoOrigNode[gp] {
@@ -28649,7 +28658,7 @@ function monoPruneTemplates(nDecl: i32) {
 // function between it and its module-scope function, is not named in its parent's body, and no
 // member call anywhere spells that name, which a `self`-function call would. A module-scope
 // function's own deadness is not asked: a specialised copy shares its nested slots.
-function monoNestedFnDead(gp: i32, memberProps: {[string]: i32}): boolean {
+function monoNestedFnDead(gp: i32, memberProps: {[string]: i32}[]): boolean {
   let slot = gp
   let guard = 0
   while slot >= 0 && slot < fnParent.length && guard <= fnStmts.length {
@@ -28661,8 +28670,12 @@ function monoNestedFnDead(gp: i32, memberProps: {[string]: i32}): boolean {
     let nm = ""
     const f = nodeAt(fx)
     if f is FuncDecl { nm = f.fnName }
-    if criFnIsAnonLambda(slot) { nm = monoConstNameOfInit(pb, fx) }
-    else if (memberProps[nm] ?? 0) == 1 { return false }
+    if criFnIsAnonLambda(slot) {
+      nm = monoConstNameOfInit(pb, fx)
+    } else {
+      if memberProps.length == 0 { memberProps.push(monoMemberPropNames()) }
+      if (memberProps[0][nm] ?? 0) == 1 { return false }
+    }
     if nm == "" { return false }
     if !monoSubtreeNamesIdent(pb, nm, 0) { return true }
     slot = ps
