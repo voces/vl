@@ -77,15 +77,15 @@ import {
 } from "./emit_state"
 import { i32ListHas } from "./listutil"
 
-import { identDeclOf } from "./symbols"
+import { identDeclOf, sidArrGet, sidArrPut } from "./symbols"
 import { tyHasTyVar, tyIsArray, tyReachesHole } from "./tyquery"
 
-let vrParent: {[i32]: i32} = Map()
+let vrParent: i32[] = []
 let vrUses: {[i32]: i32[]} = Map()
 let vrUnres: {[string]: boolean} = Map()
 let vrMemoState: {[string]: i32} = Map()
 let vrMemoVal: {[string]: i32[]} = Map()
-let vrSeen: {[i32]: boolean} = Map()
+let vrSeen: i32[] = []
 let vrStmts: i32[] = []
 // The list and record literals the index holds, in the order it reached them.
 export let vrLits: i32[] = []
@@ -97,10 +97,10 @@ let vrExact = false
 // runs this value or a loop variable over its list, so a join, a write, a parameter or an
 // unnamed element position is lost.
 export function vrReset(stmts: i32[], inst: boolean, exact: boolean) {
-  vrParent = Map()
+  vrParent = __array_new__(P.nodes.length, -1)
   vrUses = Map()
   vrUnres = Map()
-  vrSeen = Map()
+  vrSeen = __array_new__(P.nodes.length, -1)
   vrMemoState = Map()
   vrMemoVal = Map()
   vrStmts = stmts
@@ -119,9 +119,9 @@ export function vrIndex(roots: i32[], cands: i32[]) {
     const stack: i32[] = [root]
     while stack.length > 0 {
       const ix = stack.pop()
-      if ix >= 0 && ix < P.nodes.length && !(vrSeen[ix] ?? false) {
+      if ix >= 0 && ix < P.nodes.length && !vrIndexed(ix) {
         // arena-tick exempt: a side table of this pass, not the arena
-        vrSeen[ix] = true
+        sidArrPut(vrSeen, ix, 1)
         if nodeAt(ix) is ArrayLit || nodeAt(ix) is ObjLit { vrLits.push(ix) }
         vrNoteRead(ix, cands)
         const k0 = stack.length
@@ -129,9 +129,9 @@ export function vrIndex(roots: i32[], cands: i32[]) {
         let k = k0
         while k < stack.length {
           const ch = stack[k]
-          if ch >= 0 && (vrParent[ch] ?? -1) < 0 {
+          if ch >= 0 && sidArrGet(vrParent, ch) < 0 {
             // arena-tick exempt: a side table of this pass, not the arena
-            vrParent[ch] = ix
+            sidArrPut(vrParent, ch, ix)
           }
           k = k + 1
         }
@@ -142,7 +142,7 @@ export function vrIndex(roots: i32[], cands: i32[]) {
 }
 
 // Whether node `ix` is in the index.
-export function vrIndexed(ix: i32): boolean { vrSeen[ix] ?? false }
+export function vrIndexed(ix: i32): boolean { sidArrGet(vrSeen, ix) == 1 }
 
 function vrNoteRead(ix: i32, cands: i32[]) {
   const n = nodeAt(ix)
@@ -271,7 +271,7 @@ function vrJoin(acc: i32[], add: i32[]): boolean {
 // The step of `vrCalls` the node holding `x` decides.
 function vrStep(x: i32, path: string): i32[] {
   const none: i32[] = []
-  const p = vrParent[x] ?? -1
+  const p = sidArrGet(vrParent, x)
   // A module statement's value is dropped.
   if p < 0 {
     if i32ListHas(vrStmts, x) { return none }
@@ -422,8 +422,8 @@ function vrForVar(n: ForIn, p: i32, path: string): i32[] {
 
 // The function declaration holding node `ix`, or -1 at module scope.
 export function vrFrameOf(ix: i32): i32 {
-  let o = vrParent[ix] ?? -1
-  while o >= 0 && !(nodeAt(o) is FuncDecl) { o = vrParent[o] ?? -1 }
+  let o = sidArrGet(vrParent, ix)
+  while o >= 0 && !(nodeAt(o) is FuncDecl) { o = sidArrGet(vrParent, o) }
   o
 }
 
@@ -441,7 +441,7 @@ function vrTmplOf(fd: i32): i32 {
 function vrFnValue(f0: i32, path: string): i32[] {
   const out: i32[] = []
   const f = vrTmplOf(f0)
-  if f < 0 || !(vrSeen[f] ?? false) { return vrLost() }
+  if f < 0 || !vrIndexed(f) { return vrLost() }
   const fn = nodeAt(f)
   if !(fn is FuncDecl) { return vrLost() }
   if fn.fnRet >= 0 {
@@ -458,10 +458,10 @@ function vrFnValue(f0: i32, path: string): i32[] {
   }
   for u in vrUses[f] ?? [] {
     let callee = u
-    let c = vrParent[u] ?? -1
+    let c = sidArrGet(vrParent, u)
     while c >= 0 && nodeAt(c) is Paren {
       callee = c
-      c = vrParent[c] ?? -1
+      c = sidArrGet(vrParent, c)
     }
     if c < 0 { return vrLost() }
     const cn = nodeAt(c)
@@ -481,15 +481,10 @@ function vrDecl(d: i32, path: string): i32[] {
     nm = dn.letName
   }
   if dn is Param && !vrExact { nm = dn.parName }
-  if (
-    nm == ""
-    || declExported(d)
-    || (vrUnres[nm] ?? false)
-    || !(vrSeen[d] ?? false)
-  ) {
+  if (nm == "" || declExported(d) || (vrUnres[nm] ?? false) || !vrIndexed(d)) {
     return vrLost()
   }
-  if (vrParent[d] ?? -1) < 0 && monoNameIsExported(nm) { return vrLost() }
+  if sidArrGet(vrParent, d) < 0 && monoNameIsExported(nm) { return vrLost() }
   for u in vrUses[d] ?? [] {
     if !vrJoin(out, vrCalls(u, path)) { return vrLost() }
   }
@@ -500,10 +495,10 @@ function vrDecl(d: i32, path: string): i32[] {
 function vrWritten(d: i32): boolean {
   for u in vrUses[d] ?? [] {
     let t = u
-    let p = vrParent[u] ?? -1
+    let p = sidArrGet(vrParent, u)
     while p >= 0 && nodeAt(p) is Paren {
       t = p
-      p = vrParent[p] ?? -1
+      p = sidArrGet(vrParent, p)
     }
     if p >= 0 {
       const pn = nodeAt(p)
@@ -594,7 +589,7 @@ function vrProp(prop: string, p: i32, path: string): i32[] {
   const none: i32[] = []
   if vrElemOf(path) != -2 {
     if prop == "length" { return none }
-    const c = vrParent[p] ?? -1
+    const c = sidArrGet(vrParent, p)
     if c >= 0 {
       const cn = nodeAt(c)
       if cn is Call && cn.callFn == p && vrPushRecv(cn) >= 0 { return none }
@@ -618,7 +613,7 @@ export function vrReadsInert(fd: i32): boolean {
     || monoNameIsExported(f.fnName)
     || declExported(fd)
     || (vrUnres[f.fnName] ?? false)
-    || !(vrSeen[fd] ?? false)
+    || !vrIndexed(fd)
   ) {
     return false
   }
