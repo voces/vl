@@ -14,6 +14,7 @@
 //
 // @test-timing native
 
+import { checkBatch } from "./support/checkBatch.ts";
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -239,22 +240,75 @@ function rebuilt(val: string, ty: string): string[] | null {
   return out;
 }
 
-async function vl(verb: string, prelude: string[], src: string, tag: string) {
-  const dir = await Deno.makeTempDir({ prefix: "vl_widen_hint_" });
+// Every case's refusal comes from ONE `vl check --batch --json`, and every fix it offers
+// runs in ONE `vl run --batch`; each case is still its own file, graded on its own record.
+const write = async (
+  dir: string,
+  tag: string,
+  prelude: string[],
+  src: string,
+) => {
   const f = `${dir}/${tag}.vl`;
   await Deno.writeTextFile(f, `${prelude.join("\n")}\n${src}`);
-  const out = await new Deno.Command(VL, {
-    args: [verb, f, "--compiler", COMPILER],
+  return f;
+};
+
+type RunJob = {
+  where: string;
+  label: string;
+  out: string;
+  file: string;
+  tag: string;
+};
+
+const runAll = async (dir: string, jobs: RunJob[], fails: string[]) => {
+  if (jobs.length === 0) return;
+  const outDir = `${dir}/out`;
+  await Deno.mkdir(outDir);
+  const r = await new Deno.Command(VL, {
+    args: [
+      "run",
+      "--batch",
+      "--out-dir",
+      outDir,
+      ...jobs.map((j) => j.file),
+      "--compiler",
+      COMPILER,
+    ],
     env: nativeEnv(),
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",
   }).output();
-  await Deno.remove(dir, { recursive: true });
-  const text = new TextDecoder().decode(out.stdout) +
-    new TextDecoder().decode(out.stderr);
-  return { code: out.code, text };
-}
+  if (!r.success) {
+    throw new Error(
+      `vl run --batch failed (exit ${r.code}): ${
+        new TextDecoder().decode(r.stderr)
+      }`,
+    );
+  }
+  for (const j of jobs) {
+    let out: string;
+    try {
+      out = await Deno.readTextFile(`${outDir}/${j.tag}.vl.out`);
+    } catch {
+      throw new Error(
+        `${j.where}: vl run --batch wrote no output for the ${j.label} fix`,
+      );
+    }
+    let err: string | null = null;
+    try {
+      err = await Deno.readTextFile(`${outDir}/${j.tag}.vl.err`);
+    } catch { /* no .err: the case ran */ }
+    if (err !== null || out.trim() !== j.out) {
+      fails.push(
+        `${j.where}: the ${j.label} fix does not print ${j.out}: ${
+          (out + (err ?? "")).slice(0, 300)
+        }`,
+      );
+    }
+  }
+};
 
 Deno.test({
   name:
@@ -262,85 +316,90 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const fails: string[] = [];
-    await Promise.all(
-      CASES.flatMap((c, ci) =>
-        POSITIONS.map(async (pos, pi) => {
-          const tag = `c${ci}p${pi}`;
-          const where = `${c.val} -> ${c.dst} (position ${pi})`;
-          const run = async (
-            label: string,
-            prelude: string[],
-            dst: string,
-            val: string,
-          ) => {
-            const r = await vl(
-              "run",
-              prelude,
-              pos(dst, val, c.show),
-              tag + label,
-            );
-            if (r.code !== 0 || r.text.trim() !== c.out) {
-              fails.push(
-                `${where}: the ${label} fix does not print ${c.out}: ${
-                  r.text.slice(0, 300)
-                }`,
-              );
-            }
-          };
-          const refused = await vl(
-            "check",
+    const dir = await Deno.makeTempDir({ prefix: "vl_widen_hint_" });
+    try {
+      const at = CASES.flatMap((c, ci) =>
+        POSITIONS.map((pos, pi) => ({ c, ci, pos, pi }))
+      );
+      const files: string[] = [];
+      for (const { c, ci, pos, pi } of at) {
+        files.push(
+          await write(
+            dir,
+            `c${ci}p${pi}`,
             PRELUDE,
             pos(c.dst, plain(c.val), c.show),
-            tag,
+          ),
+        );
+      }
+      const recs = await checkBatch(files, { cwd: ROOT });
+      const jobs: RunJob[] = [];
+      for (let k = 0; k < at.length; k++) {
+        const { c, ci, pos, pi } = at[k];
+        const tag = `c${ci}p${pi}`;
+        const where = `${c.val} -> ${c.dst} (position ${pi})`;
+        const run = async (
+          label: string,
+          prelude: string[],
+          dst: string,
+          val: string,
+        ) => {
+          const file = await write(
+            dir,
+            tag + label,
+            prelude,
+            pos(dst, val, c.show),
           );
-          if (refused.code === 0) {
-            fails.push(`${where}: want a container refusal, got a clean check`);
-            return;
-          }
-          const errs = [...refused.text.matchAll(/\[ERROR\]: (.*)/g)].map((m) =>
-            m[1]
+          jobs.push({ where, label, out: c.out, file, tag: tag + label });
+        };
+        const refused = recs[k];
+        if (refused.exit === 0) {
+          fails.push(`${where}: want a container refusal, got a clean check`);
+          continue;
+        }
+        const errs = refused.diagnostics.filter((d) => d.severity === "error")
+          .map((d) => d.message);
+        const msg = errs.find((e) =>
+          e.includes("never widens") || e.includes("D2196") ||
+          e.includes("WRITTEN THROUGH")
+        );
+        if (!msg) {
+          fails.push(
+            `${where}: want the container refusal, got ${JSON.stringify(errs)}`,
           );
-          const msg = errs.find((e) =>
-            e.includes("never widens") || e.includes("D2196") ||
-            e.includes("WRITTEN THROUGH")
+          continue;
+        }
+        const ro = msg.match(/Declare the destination `([^`]*)`/);
+        const mp = msg.match(/opy it with `(\.map\([^`]*\))`/);
+        const bd = msg.match(/Build the source as `([^`]*)`/);
+        const got: Fix[] = [];
+        if (ro) got.push("readonly");
+        if (bd) got.push("build");
+        if (mp) got.push("map");
+        if ([...got].sort().join() !== [...c.want].sort().join()) {
+          fails.push(
+            `${where}: want fixes [${c.want}], got [${got}] in ${
+              JSON.stringify(msg)
+            }`,
           );
-          if (!msg) {
+        }
+        if (ro) await run("readonly", PRELUDE, ro[1], plain(c.val));
+        if (mp) await run("map", PRELUDE, c.dst, mapped(c.val, mp[1]));
+        if (bd) {
+          const pre = rebuilt(plain(c.val), bd[1]);
+          if (!pre) {
             fails.push(
-              `${where}: want the container refusal, got ${
-                JSON.stringify(errs)
-              }`,
-            );
-            return;
-          }
-          const ro = msg.match(/Declare the destination `([^`]*)`/);
-          const mp = msg.match(/opy it with `(\.map\([^`]*\))`/);
-          const bd = msg.match(/Build the source as `([^`]*)`/);
-          const got: Fix[] = [];
-          if (ro) got.push("readonly");
-          if (bd) got.push("build");
-          if (mp) got.push("map");
-          if ([...got].sort().join() !== [...c.want].sort().join()) {
-            fails.push(
-              `${where}: want fixes [${c.want}], got [${got}] in ${
+              `${where}: a build fix names no declaration: ${
                 JSON.stringify(msg)
               }`,
             );
-          }
-          if (ro) await run("readonly", PRELUDE, ro[1], plain(c.val));
-          if (mp) await run("map", PRELUDE, c.dst, mapped(c.val, mp[1]));
-          if (bd) {
-            const pre = rebuilt(plain(c.val), bd[1]);
-            if (!pre) {
-              fails.push(
-                `${where}: a build fix names no declaration: ${
-                  JSON.stringify(msg)
-                }`,
-              );
-            } else await run("build", pre, c.dst, plain(c.val));
-          }
-        })
-      ),
-    );
+          } else await run("build", pre, c.dst, plain(c.val));
+        }
+      }
+      await runAll(dir, jobs, fails);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
     if (fails.length) {
       throw new Error(`${fails.length} hint failure(s):\n${fails.join("\n")}`);
     }

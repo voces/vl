@@ -20,6 +20,7 @@
 //
 // @test-timing native
 
+import { checkBatch } from "./support/checkBatch.ts";
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -64,6 +65,22 @@ const diagsOf = async (dir: string, name: string, src: string) => {
     throw new Error(`${name}: --json stdout is not JSON: ${out}\n${err}`);
   }
   return { file, diags: parsed };
+};
+
+// `diagsOf` for every case at once: each case is still its own file and its own
+// record, graded by one `vl check --batch --json` process.
+const diagsOfAll = async (
+  dir: string,
+  cases: { name: string; src: string }[],
+): Promise<{ file: string; diags: Diag[] }[]> => {
+  const files: string[] = [];
+  for (const c of cases) {
+    const file = `${dir}/${c.name}.vl`;
+    await Deno.writeTextFile(file, c.src);
+    files.push(file);
+  }
+  const recs = await checkBatch(files);
+  return recs.map((r, i) => ({ file: files[i], diags: r.diagnostics }));
 };
 
 const withDir = async (fn: (dir: string) => Promise<void>): Promise<void> => {
@@ -206,8 +223,10 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      for (const c of ONE) {
-        const { diags } = await diagsOf(dir, c.name, c.src);
+      const all = await diagsOfAll(dir, ONE);
+      for (let i = 0; i < ONE.length; i++) {
+        const c = ONE[i];
+        const { diags } = all[i];
         if (diags.length !== 1) {
           throw new Error(
             `${c.name}: want exactly 1 diagnostic, got ${diags.length}: ${
@@ -365,8 +384,10 @@ Deno.test({
           want: "expected `{` but found end of line",
         },
       ];
-      for (const c of cases) {
-        const { diags } = await diagsOf(dir, c.name, c.src);
+      const all = await diagsOfAll(dir, cases);
+      for (let i = 0; i < cases.length; i++) {
+        const c = cases[i];
+        const { diags } = all[i];
         if (!diags.some((d) => d.message === c.want)) {
           throw new Error(
             `${c.name}: want a diagnostic ${JSON.stringify(c.want)}, got ${
@@ -430,8 +451,10 @@ Deno.test({
           stdout: "2\n",
         },
       ];
-      for (const c of cases) {
-        const { file, diags } = await diagsOf(dir, c.name, c.src);
+      const all = await diagsOfAll(dir, cases);
+      for (let i = 0; i < cases.length; i++) {
+        const c = cases[i];
+        const { file, diags } = all[i];
         if (diags.length !== 0) {
           throw new Error(
             `${c.name}: want no diagnostics, got ${fmtDiags(diags)}`,
