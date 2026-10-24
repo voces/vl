@@ -3,7 +3,8 @@
 // A pure source scan: no seed, no binary.
 //
 // 1. Exit codes. `cli.vl` names its codes in `CliExit` and the `EXIT_*` consts;
-//    the host owns `EXIT_COMPILER_BUG`; `docs/internals/cli-design.md` §Exit codes
+//    the host names every code it exits with as an `EXIT_*` const of the same
+//    value, never a bare `process::exit(<n>)`; `docs/internals/cli-design.md` §Exit codes
 //    is the table a caller reads. All three must list the same codes, and no
 //    `cliExit` write in `cli.vl` may go back to a bare number.
 // 2. Value-taking flags. The host's `value_flags` decides which token a help scan
@@ -56,13 +57,26 @@ Deno.test("exit codes: cli.vl, the host and cli-design.md list one table", () =>
   }
   same("cli-design.md §Exit codes against CliExit", members, rows);
 
-  const host = /^const EXIT_COMPILER_BUG: i32 = (\d+);$/m.exec(MAIN_RS);
-  if (!host) throw new Error("main.rs: `const EXIT_COMPILER_BUG` not found");
-  if (consts.get("EXIT_COMPILER_BUG") !== host[1]) {
+  // Every code the host exits with is a named const, and each holds cli.vl's value.
+  const hostConsts = new Map<string, string>();
+  for (const m of MAIN_RS.matchAll(/^const (EXIT_[A-Z_]+): i32 = (\d+);$/gm)) {
+    hostConsts.set(m[1], m[2]);
+  }
+  for (const name of ["EXIT_FAILED", "EXIT_USAGE", "EXIT_COMPILER_BUG"]) {
+    if (!hostConsts.has(name)) {
+      throw new Error(`main.rs: \`const ${name}\` not found`);
+    }
+  }
+  for (const [name, value] of hostConsts) {
+    if (consts.get(name) !== value) {
+      throw new Error(`${name}: cli.vl ${consts.get(name)}, main.rs ${value}`);
+    }
+  }
+  const bareHost = [...MAIN_RS.matchAll(/^.*process::exit\(\d+\).*$/gm)]
+    .map((m) => m[0].trim());
+  if (bareHost.length > 0) {
     throw new Error(
-      `EXIT_COMPILER_BUG: cli.vl ${consts.get("EXIT_COMPILER_BUG")}, main.rs ${
-        host[1]
-      }`,
+      `main.rs exits with a bare code:\n  ${bareHost.join("\n  ")}`,
     );
   }
 

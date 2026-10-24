@@ -19,15 +19,18 @@ restate measurements; follow the links.
 - The repo's tooling follows the standing order: everything that can be written in VL is
   written in VL (Track T).
 
-## Status, 2026-10-19
+## Status, 2026-10-24
 
-Done: L4, L7, L8, L10 (T4), L11 (T2), L13, L14 and L12, whose row still reads "in review" but whose
-adapter merged as #3879. In progress: L1 as lane SC; L2 stage 3, whose name rungs are deleted
-(D6950 closed) and whose field rung stays; L6's render-parse readers (83 / 228, floor 21 / 22), with the name-dispatch switch paused; L9's D1;
-S5 step 13 in review; and the R ratchet floors, now
-110 ladders, 2 splits and 148 sentinel reads. Waiting: L3's family (d) on SC, and S-g on SC.
-Partial: S-c and the other SMALL rows. L5 is done to C2 with no next step chosen, and RepDesc
-is ruled. ARCHITECTURE.md §7 has 14 rows, measured at `3fbefe6d6`.
+Done: L4, L5 (#4680: the deep-`is` walkers run as the pin driver's last stage), L7, L8, L10 (T4;
+the JS hosts run `-O` through binaryen.js, #4683), L11 (T2), L12 (#3879), L13, L14 and the R
+ratchet floors (ladders, splits and sentinel reads all at zero). In progress: L1 as lane SC; L2
+stage 3, whose name rungs are deleted (D6950 closed) and whose field rung stays; L3, whose
+`checkFnParams` pass row is deleted (#4682) and whose `emitFail` sites remain; L6's render-parse
+readers (58 / 117, floor 21 / 22), with the name-dispatch switch paused; L9's D1; and S5's
+artifact steps. Waiting: L3's family (d) on SC, and S-g on SC. S-c's `Tok` row and the host's
+named exit codes are done; S-h's closed `EmitPass` dispatch waits on registering the union in
+`compiler/lint.vl`'s ladder sets; the other SMALL rows are partial. RepDesc is ruled.
+ARCHITECTURE.md §7 has 8 rows, measured at `bc8b191a4`.
 
 | item | state | where |
 | --- | --- | --- |
@@ -45,8 +48,8 @@ is ruled. ARCHITECTURE.md §7 has 14 rows, measured at `3fbefe6d6`.
 | L13 host import surface, errno once | first PR (A5) **done**. Last: the Deno stubs are `FS_FLOOR`'s names, read at load by `tests/support/hostFloor.ts`. Next: none in the floor; every copy reads the table. | [L13 log](#l13-log) |
 | L9 split `typecheck.vl` | D1 **in progress**. Budget: a carve may add up to +1.5% L2 fuel when the cost is source shape alone and identity reads 0 differ. Last: hook census, 111 sites, none can be direct (each is the checker's own recursion); the code is unchanged, since moving the slot's install beside `checkNode` cost +0.44% L2 fuel with no change in behaviour. Next: none planned in `typecheck.vl` (429 lines, the dispatcher's home). | [L9 log](#l9-log) |
 | L12 | **done** (#3879). Last: the playground adapter calls every `lsp/src/features.ts` function and gains references, highlights, outline and rename; playground TS 3,687 → 3,471 lines. Next: nothing; the lane is done. | [L12 log](#l12-log) |
-| SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
-| SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-e row 2 (#3989), S-i row 2, S-m in part. Open: S-g (waits on SC); S-m's `std:seed` drop (waits on Q14) and hex (waits on `std-hex-parse-format`). | [SMALL log](#small-log) |
+| SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; `ast.vl` re-exports the lexer's `Tok` (2026-10-24, identity tier: difftree 0 differ). The other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
+| SMALL S-a, S-b, S-d … S-n | **partial**. Last (2026-10-24): the host names every exit code (`EXIT_FAILED`, `EXIT_USAGE`, `EXIT_COMPILER_BUG`), held to `cli.vl` by `tests/cli_host_tables_test.ts`. Before that: S-e row 2 (#3989), S-i row 2, S-m in part. Open: S-g (waits on SC); S-h's closed `runEmitPass` dispatch (waits on registering `EmitPass` in `compiler/lint.vl`'s ladder sets); S-m's `std:seed` drop (waits on Q14) and hex (waits on `std-hex-parse-format`). | [SMALL log](#small-log) |
 | RepDesc rulings | **ruled** 2026-10-13. `one-literal-union-rep` applied (#3653); `nullable-rep-rule-stated-once` ruled (b). | [RepDesc log](#repdesc-log) |
 | S5 incremental compilation | step 13 done (#4155); artifacts steps 1, 2, 3a, 3b and 4 done (#4164, #4189, #4192, #4200, #4474); artifacts steps 5, 5b, 5c and 6 done (#4479, #4484, #4487, #4492, #4494), step 7 in progress (#4498, #4500, #4503, then per-module init functions, then the pooled-string fill at link). Last: step 7's fifth part moves the pooled-string fill out of `rt#0`. Every pool global is emitted in its fixed form, and `link()` decides from the linked pool which ones to fill, writing the fill calls and the init calls into the start, so `rt#0` no longer depends on the program's literal set. Over the 122 armed `modules/**` builds `rt#0` pairs go 27 → 1 (the 1 is a single-file program) and module pairs 235 → 233; over all 4,795 armed tests/cases builds no count grows. Disarmed output does not change: difftree `--identity` 0 differ, regress.vl loses 0 runs, seed +0.10%, L2 fuel +412 units (artifacts doc §22). Before that, step 7's fourth part gives each module's top-level initialisation its own init function, keyed `init:<path>` (§21); the earlier steps are in artifacts doc §§9–20. Next: the artifact cache switch-over (§7 step 6 of the artifacts doc). D7321: D7500's per-module serving of imports was measured and dropped. D7501 is closed: `ambient` meets a record only where the served closure holds it, a type name only with a report row, and a `new`-type operator by its name, which cuts diderven's `vl check src` guest fuel 37.6% at 2 jobs. D7801 is closed: a check with type errors banks every target whose closure holds all of them, served with its diagnostics attributed once, which halves `vl check` guest fuel on diderven and on `compiler std scripts` with one injected error. D7940 is closed: a clean closure is banked from a check whose errors all lie outside it, unless an outside error could reach its check, which cuts diderven's guest fuel with one injected error a further 12.8%. D7800 is closed: `ambient` serves a redundant-annotation row that renders one word no outside module declares, and meets a literal's field set only where an outside record can still build it, so no `ambient` root is left on clean diderven or heregeat (guest fuel at 1 job, both halves together: diderven −7.2%, heregeat −29.5%). Its rows half now reads every row's text, which cuts `compiler std scripts` with one injected error by 15.7% at 1 job, `ambient` 22 → 7. That also closed D8640: a served root could print a string literal union by another module's spelling. Then the arena half, the method-call receiver key and the literal-union order guard narrowed, each with a mask witness, so `ambient` on that tree goes 7 → 2 at 1 job (−7.0% guest fuel). Still open: roots no other root imports (D7500), and a miss the sibling scan may answer, which declines every target of its check. | [S5 log](#s5-log) |
 
@@ -1571,7 +1574,8 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 
 - **S-c front-end tidy**: State on 2026-10-14: **partial**
 - **S-c front-end tidy**: `typecheck.vl` imports `./ast` once (byte-identical seed).
-- **S-c front-end tidy**: Not byte-identical, so not done: the second `Tok` (the lexer's has no `pos`), the operator-name table (a shared `isStrFuncName` shrinks the seed 299 bytes), `kindTag` (inlining grows it ~2.4 KB), `ErrExpr.errWhat`/`errAt` (a pos-only `ErrExpr` absorbs other pos-only literals at the `asObj` literal in `typecheck.vl` and fails to check).
+- **S-c front-end tidy**: 2026-10-24: `ast.vl` re-exports the lexer's `Tok`, so there is one token record; the parser never read `pos`. Identity tier, not byte-identical: difftree `--identity` 0 differ.
+- **S-c front-end tidy**: Not byte-identical, so not done: the operator-name table (a shared `isStrFuncName` shrinks the seed 299 bytes), `kindTag` (inlining grows it ~2.4 KB), `ErrExpr.errWhat`/`errAt` (a pos-only `ErrExpr` absorbs other pos-only literals at the `asObj` literal in `typecheck.vl` and fails to check).
 - **S-c front-end tidy**: `await` skipped: a surface decision.
 - **S-a, S-b, S-d … S-n**: State on 2026-10-14: **partial**
 - **S-a, S-b, S-d … S-n**: Per-row status is in the SMALL table of `code-quality-2026-10.md`.
@@ -1579,6 +1583,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - **S-a, S-b, S-d … S-n**: Open: S-e row 2 (the `literal-opcode-write` budget rule), S-g (waits on SC), S-i row 2's `engineFailOffset` test (the seed does not export it), S-l, S-m, S-n.
 - **S-a, S-b, S-d … S-n**: S-k is superseded by the no-Python direction.
 - **S-a, S-b, S-d … S-n**: 2026-10-17. S-l was already done by #3731 and S-n by #3739. S-e row 2 is the `literal-byte-write` budget rule (#3989, baseline 274). S-i row 2: `engineFailOffset` moved to the leaf `compiler/engine_msg.vl`, and one table, `tests/fixtures/engine-fail-offset.txt`, now tests both it and its Rust twin; against master's parser the table fails on 6 cases, which are now aligned. S-m: the tests use `std:str` instead of `std:seed`, and `casesWasmOracle.ts` uses `isStdKey`. Dropping `std:seed` waits on OPEN-QUESTIONS Q14. Hex is filed as `std-hex-parse-format` in `open-rulings.md`.
+- **S-a, S-b, S-d … S-n**: 2026-10-24. The host names every exit code it uses (`EXIT_FAILED` 1, `EXIT_USAGE` 2, beside `EXIT_COMPILER_BUG` 70), and `tests/cli_host_tables_test.ts` holds each to `cli.vl`'s const of the same name and refuses a bare `process::exit(<n>)`. With S-c's `Tok`, at `80a54c99a`: a double refresh gives the same seed, difftree `--identity` 0 differ over 11,684 builds, the candidate compiles master's source to master's fixpoint, L2 fuel 74,147,037,863 → 73,808,736,823 (−0.46%) with the same input under both compilers at 74,147,037,863, seed 5,786,238 bytes on both sides. S-h's closed `EmitPass` dispatch was built and is held back: `scripts/ladder-sets.vl` requires the new union in `compiler/lint.vl`'s ladder sets.
 
 ### RepDesc log
 

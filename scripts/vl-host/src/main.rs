@@ -386,7 +386,7 @@ fn bare_usage_hint() -> ! {
     eprintln!("  {c}vl run{r} <file.vl>    compile and run a program");
     eprintln!("  {c}vl check{r} [path]     typecheck and report diagnostics");
     eprintln!("  {c}vl --help{r}           list every command");
-    std::process::exit(2);
+    std::process::exit(EXIT_USAGE);
 }
 
 /// Levenshtein distance, for the did-you-mean below. Six candidate commands and
@@ -429,7 +429,7 @@ fn unknown_command(bad: &str) -> ! {
         None => eprintln!("vl: unknown command `{bad}`"),
     }
     eprintln!("    run `{c}vl --help{r}` for the list of commands");
-    std::process::exit(2);
+    std::process::exit(EXIT_USAGE);
 }
 
 /// `vl --help` / `-h` / `vl help`: the overview. Stdout, exit 0. Commands are
@@ -2412,7 +2412,7 @@ fn std_cmd(rest: &[String]) -> Result<()> {
     {
         eprintln!("vl std: unknown flag `{bad}`");
         eprintln!("    usage: vl std [--list | --hash | --dump <dir>]  —  see `vl help std`");
-        std::process::exit(2);
+        std::process::exit(EXIT_USAGE);
     }
     if let Some(i) = rest.iter().position(|a| a == "--dump") {
         let dir = rest
@@ -3976,7 +3976,7 @@ fn heap_window(base: Option<i64>, limit: Option<i64>) -> Option<(i32, i32)> {
 fn usage_exit(msg: &str) -> ! {
     eprintln!("vl build: {msg}");
     eprintln!("    see `vl help build`");
-    std::process::exit(2);
+    std::process::exit(EXIT_USAGE);
 }
 
 /// Which `--names` custom sections a compile asks the seed for.
@@ -7327,7 +7327,7 @@ fn arg_error(msg: &str, token: Option<&str>) -> ! {
 --max-memory=<size>, -O/-O3, --names, --wat, --no-validate."
     );
     eprintln!("note: `vl help run` shows the full flag list.");
-    std::process::exit(2);
+    std::process::exit(EXIT_USAGE);
 }
 
 /// `vl run` — compile + run a VL program, matching the TS CLI's `run`. Source comes
@@ -7540,7 +7540,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
     } else {
         if std::io::stdin().is_terminal() {
             eprintln!("{USAGE}");
-            std::process::exit(2);
+            std::process::exit(EXIT_USAGE);
         }
         let mut s = String::new();
         std::io::stdin().read_to_string(&mut s)?;
@@ -7548,7 +7548,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
     };
     if source.trim().is_empty() {
         eprintln!("{USAGE}");
-        std::process::exit(2);
+        std::process::exit(EXIT_USAGE);
     }
     finish_gc_stats(
         gc_stats,
@@ -9361,7 +9361,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 Some(c) => choice = c,
                 None => {
                     eprintln!("vl: `{a}` — --color takes always, never, or auto");
-                    std::process::exit(2);
+                    std::process::exit(EXIT_USAGE);
                 }
             }
         }
@@ -9385,7 +9385,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
     }
     if let Some(msg) = unused_defines_error() {
         eprintln!("vl test: {msg}");
-        code = code.max(1);
+        code = code.max(EXIT_FAILED);
     }
     std::process::exit(code);
 }
@@ -9958,7 +9958,7 @@ fn take_test_externs(args: &[String]) -> Vec<String> {
         if a == EXTERN_FLAG {
             let Some(spec) = args.get(i + 1) else {
                 eprintln!("vl test: `{EXTERN_FLAG}` requires a value");
-                std::process::exit(2);
+                std::process::exit(EXIT_USAGE);
             };
             test_define(&mut defines, spec);
             i += 2;
@@ -9982,7 +9982,7 @@ fn take_test_externs(args: &[String]) -> Vec<String> {
 fn test_define(defines: &mut Vec<(String, String)>, spec: &str) {
     if let Err(m) = push_global_define(defines, spec) {
         eprintln!("vl test: {m}");
-        std::process::exit(2);
+        std::process::exit(EXIT_USAGE);
     }
 }
 
@@ -10766,14 +10766,14 @@ fn addr2line_cmd(args: &[String]) -> Result<()> {
         eprintln!(
             "    usage: vl addr2line <module.wasm> <location>...  —  see `vl help addr2line`"
         );
-        std::process::exit(2);
+        std::process::exit(EXIT_USAGE);
     };
     if locs.is_empty() {
         eprintln!("vl addr2line: no location given");
         eprintln!(
             "    give a byte offset (0x12a), a trace's `wasm-function[0]:0x12a`, or `-` for stdin"
         );
-        std::process::exit(2);
+        std::process::exit(EXIT_USAGE);
     }
     let bytes =
         std::fs::read(module).map_err(|e| Error::from(e).context(format!("reading `{module}`")))?;
@@ -10804,7 +10804,7 @@ fn addr2line_cmd(args: &[String]) -> Result<()> {
         for loc in locs {
             let Some(off) = parse_wasm_location(loc) else {
                 eprintln!("vl addr2line: `{loc}` is not a location (0x12a, 298, or wasm-function[0]:0x12a)");
-                std::process::exit(2);
+                std::process::exit(EXIT_USAGE);
             };
             match addr2line_answer(&map, &bytes, off) {
                 Some(a) => println!("{a}"),
@@ -10816,7 +10816,7 @@ fn addr2line_cmd(args: &[String]) -> Result<()> {
         }
     }
     if missed {
-        std::process::exit(1);
+        std::process::exit(EXIT_FAILED);
     }
     Ok(())
 }
@@ -10868,6 +10868,10 @@ static SEED_SIZE: AtomicUsize = AtomicUsize::new(0);
 /// stderr. 70 is sysexits(3)'s `EX_SOFTWARE`, "an internal software error has been
 /// detected", which is exactly the claim being made.
 const EXIT_COMPILER_BUG: i32 = 70;
+/// The program, its check or a gate failed (`cli.vl`'s `EXIT_FAILED`).
+const EXIT_FAILED: i32 = 1;
+/// An unusable command line or an unreadable input (`cli.vl`'s `EXIT_USAGE`).
+const EXIT_USAGE: i32 = 2;
 
 /// Record the file whose compile is under way, for `report`'s banner.
 fn note_compiling(path: &str) {
@@ -11058,7 +11062,7 @@ fn real_main() -> Result<()> {
                     None => eprintln!("vl: no help for `{topic}`"),
                 }
                 eprintln!("    run `{c}vl --help{r}` for the list of commands");
-                std::process::exit(2);
+                std::process::exit(EXIT_USAGE);
             }
         },
         // `fmt`, `check` and `test` share the in-wasm CLI pump; the subcommand
@@ -11245,7 +11249,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
         let (c, r) = (s.cmd, s.reset);
         eprintln!("vl build: missing the <file.vl> input");
         eprintln!("    usage: vl build <file.vl> [-o out.wasm]  —  see {c}vl help build{r}");
-        std::process::exit(2);
+        std::process::exit(EXIT_USAGE);
     };
     let flag = |name: &str| -> Option<String> {
         args.iter()
@@ -11279,20 +11283,20 @@ fn build_cmd(args: &[String]) -> Result<()> {
                 "vl build: `-o -` writes a binary module to stdout, but stdout is a terminal"
             );
             eprintln!("    redirect it (`-o - > out.wasm`) or pipe it (`-o - | …`)");
-            std::process::exit(2);
+            std::process::exit(EXIT_USAGE);
         }
         // `--wat` writes `<out>.wat` BESIDE the module; with no path there is nowhere
         // beside. A loud refusal, not a silently skipped dump.
         if args.iter().any(|a| a == "--wat") {
             eprintln!("vl build: `--wat` writes a .wat beside the module and needs a path");
             eprintln!("    it cannot combine with `-o -` — give `-o <file.wasm>` instead");
-            std::process::exit(2);
+            std::process::exit(EXIT_USAGE);
         }
         // `--source-map` writes `<out>.map` beside the module, the same refusal.
         if args.iter().any(|a| a == "--source-map") {
             eprintln!("vl build: `--source-map` writes a .map beside the module and needs a path");
             eprintln!("    it cannot combine with `-o -` — give `-o <file.wasm>` instead");
-            std::process::exit(2);
+            std::process::exit(EXIT_USAGE);
         }
     }
     // Everything below writes and optimizes a PATH, so stdout mode borrows a temporary
