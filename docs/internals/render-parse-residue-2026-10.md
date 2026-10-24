@@ -127,11 +127,11 @@ the slice retires.
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, 13 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted) | 13 | 0 / 13 / 0 | 0 / 13 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
-| C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
+| C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type; 4 retired, 19 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; 5 retired, 18 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; probed: the atom tests and the uncovered-row fallback have atoms with no type, the rest are the registry's own split and the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -170,6 +170,15 @@ What each slice changes:
   through `mvValNamesCompat`'s shape-text query, and `mapValKindLowerable` in 1 under the D34 arm
   mint. The function and literal-union rungs are listed in the ledger's `next` as the deliberate
   rep change, with the rep each one moves.
+
+  Re-probed at 7dfbcfa6d with C4, still no parse retired. `mvValNamesCompat`'s value name is
+  cut from shape text inside `structIndexOfTypeName` and `variantIndexOfTypeName`. The callers
+  that reach it hold only a name: `nameIsRefArrayGo` and `refArrElemNameGo` in 2 files each,
+  and `isSName`, `anonHandleTyIx`, `anonRowKindsAgree`, `shapeElemDeclaredStructIdx` and
+  `monoSpelledShapeStaysAnon` in 1 each. The one that holds a type, `mintUnionFieldObjRow` (1
+  file), gets a different row from `structIndexOfTypeNameTy` in 12 of 128 files. So threading
+  types through C4's field-code walkers does not reach these rows. The callers above have to
+  carry the shape's type first.
 - **A2.** These `emit_mono` predicates test the type they hold instead of rendering it.
   - Done, byte-identical: `monoModuleLetTyIs` and `monoModuleDupPin` compare the site's type
     with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
@@ -720,6 +729,20 @@ What each slice changes:
       `anonRowServesLeafSet` (23). Also `internShapeAs` (40), `gaeEnsure` (11) and
       `nameFieldCodeTy` called with -1 (62 to 107).
     - `fieldCodeOfSpelling` is the name-only caller that C5 waits on.
+  - Re-probed at 7dfbcfa6d by the call site that asks the resolver, still 3 left (16,635
+    files, 0 uncompared; counts are files where the spelling answers true):
+    - The arm mint has 18, 39 and 2 (literal union, array, function). The rest come from
+      resolver callers that hold only a name. These include `nameIsRefArrayGo` and
+      `refArrShapeKindGo` (D2), `refArrElemNameGo`, `isSName`, `anonHandleTyIx`,
+      `anonRowKindsAgree`, `monoSpelledShapeStaysAnon` (22 array files) and
+      `rlElemVariantRow`. Each status lists them all.
+    - Two callers hold a type:
+      - `mintUnionFieldObjRow` (D6): `structIndexOfTypeNameTy` gives a different row in 12
+        of its 128 files, so swapping it changes output.
+      - `structIndexOfIndexExpr`: the typed resolver agrees in all 29 files (1,622 events).
+        It is the next swap, but it removes only 7 function-arm files.
+    - So these arms retire when the resolvers' callers carry the shape's type, not in the
+      field-code walkers. That is D2's and D6's work.
   - Done: 2 parses, the rendered rung 3 of `rlSlotByNameTyK`. The 35 unhinted call sites
     pass the element type they hold to `rlSlotByNameTwin`: the two name rungs, then
     `rlSlotOfTyTwin`. Keying rung 2 by that type instead moved the slot in 80 files, because
@@ -1103,6 +1126,23 @@ What each slice changes:
     The first and the last need the pin's own type rather than the argument's, which is C1
     step 3's per-instance render. The other two would change the instance's spelled key, so
     each would move a registry row and its box tags (see D4). The 22 entries keep their status.
+  - Measured, the sharing risk: keying an instance by its ARGUMENT's type alone would split
+    instances. A probe compared the spelled key with the argument's type at every key lookup
+    over 16,634 files plus the self-compile: in 1,546 files (8,178 events) one key held one
+    argument type, and in 51 files (98 events) one spelled key was shared by arguments of
+    different types. So the typed key stays the clone's resolved pin type, behind the spelled
+    lookup, and no sharing changed in this step.
+  - Done: `monoArgTyNameProjected`'s field-argument rung finds a nullable receiver's record from
+    its recorded type's non-null part, at the instance's pin when the type names a parameter,
+    instead of peeling `|null` off the receiver's spelling. It agreed with the spelled peel in
+    8 of 8 files that reach it (15 of 15 events) over the 1,680-file reach set and the
+    self-compile, with `tests/cases/inference/hole-param-nullable-self-ref-field-arg.vl` as the
+    control. One parse retired; difftree --identity found 0 files differ.
+  - Left, measured: the indexed-element rung (`nameIsArray(arrTy)`) is not the typed element's
+    pin. The element's recorded type, spelled as a pin, disagrees in 121 of 140 files: the rung
+    names `#anon` rows and record names where the type renders the inline shape.
+    `unionParamPinName`'s render agreed with the literal `string` in only 2 events in 1 file,
+    and no control reaches it, so it stays. 18 entries are left.
 - **D4.** `monoRegisterPinUnion` and `canonUnionKeyOfName` register a narrowed pin's union by its
   type.
   - Probed and blocked: no entry retired. A side-by-side probe read the spelling and the type at
