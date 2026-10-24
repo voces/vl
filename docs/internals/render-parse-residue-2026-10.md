@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; 5 retired, 18 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 13 retired, 8 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; probed: the atom tests and the uncovered-row fallback have atoms with no type, the rest are the registry's own split and the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 6 retired, 1 to B and since deleted, 4 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left; every mv slot banks a type, the mint classifies by it, 0 retired) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -1215,9 +1215,20 @@ What each slice changes:
       caller refuses it. 1 file reaches it, and it agrees.
 
     difftree `--identity` found 0 of the 699 reach-set files differ.
+  - Done: 1 render. `pushIndexMapComplement` names the map value by `unionSpellingOfTy` and
+    still finds its set by name, so a literal-alias member keeps its row (D8120), which
+    `msSetOfTy` did not. Over the self-compile and 16,635 files the set agreed in all 13 files
+    that reach it. In 3 of them the name differs as a string: a record member leaves the spelling
+    empty, and neither name has a set. difftree `--identity` found 0 of 16,523 files differ.
   - Left: the atom tests. `isVariantBoxUnionAtoms` (2 entries) and the uncovered-row fallback of
     `markRefArrayArmsOf` need the spelling where an atom has no arena type (69, 25 and 1 files).
-    `pushIndexMapComplement` differs at literal-alias members in 4 files (D8120).
+    A re-probe over 16,635 files found why the swap is not a refactor:
+    - The literal test differs in 6 files, each at a lone string literal atom, which
+      `tyIsLitUnion` calls a literal union and the spelling does not.
+    - The array test agrees in all 149 typed files. In 25 files, an array atom inside a generic
+      instance or a d3140 named cell has no type.
+    - The fallback finds no member type in either of its 2 files, even through the row's own
+      `unTyIx`.
   - Done: 2 renders. `cloCallParamUnionName` no longer has a render rung: past the alias and
     nominal rungs the lifted lambda's own pin answers. 5 files reach the old rung, all with an
     empty render that already fell through to that pin. `njStash` names the union by
@@ -1228,8 +1239,9 @@ What each slice changes:
     13 of them the render differs from the canon row's own name (`{x:i32}[]|i32[]` against
     `P[]|i32[]`). That is the alias D4930 needs, because readers look the structural spelling up
     by name.
-  - Left, not probed: the registry's own `recordUnMemTys`, `unionSetAtomsOf` and `unionSetMemberCount`, which go
-    when rows mint from types.
+  - Left, not probed: the registry's own `recordUnMemTys`, `unionSetAtomsOf` and
+    `unionSetMemberCount`. They split a row's set spelling in box-tag order, and they go when
+    rows mint from `canonUnionMemberTysOf`.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
   `structIndexOfLet` answer by type.
 
