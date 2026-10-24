@@ -7,13 +7,19 @@
 // splits it into a chunk fetched only when the WAT pane is first shown — keeping
 // the ~13 MB toolchain off the initial load (and off the Run path entirely).
 
-/** Disassemble `wasm` to WAT text. Throws if binaryen can't read the module. */
-export const watFromBytes = async (wasm: Uint8Array): Promise<string> => {
+/** binaryen.js, loaded on first use (the WAT pane and an `-O` Run share the chunk). */
+// deno-lint-ignore no-explicit-any
+export const loadBinaryen = async (): Promise<any> => {
   const Binaryen = (await import("binaryen")).default;
   // Tolerate both binaryen forms (sync object / async init), mirroring toWasm.
   // deno-lint-ignore no-explicit-any
   const _Binaryen = Binaryen as any;
-  const binaryen = typeof _Binaryen === "function" ? await _Binaryen() : _Binaryen;
+  return typeof _Binaryen === "function" ? await _Binaryen() : _Binaryen;
+};
+
+/** Disassemble `wasm` to WAT text. Throws if binaryen can't read the module. */
+export const watFromBytes = async (wasm: Uint8Array): Promise<string> => {
+  const binaryen = await loadBinaryen();
   const m = binaryen.readBinary(wasm);
   try {
     return m.emitText();

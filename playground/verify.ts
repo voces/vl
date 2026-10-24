@@ -340,6 +340,28 @@ const main = async (): Promise<void> => {
       `OK: clean run -> logs ${JSON.stringify(ok.logs)}, WAT emitted`,
     );
 
+    // 1b. The same program under `-O`: the compiler's optimizer on a fresh seed, with the
+    // BUNDLED binaryen answering its requests. It must log the same and shrink the module.
+    const seedModule = new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource);
+    for (const release of [false, true]) {
+      const opt = await mod.runProgram(
+        `print(42)\nlet s = 0\nwhile s < 10 { s = s + 1 }\nprint(s)`,
+        runChecker,
+        { optimize: { release, freshSeed: () => new WebAssembly.Instance(seedModule, {}).exports } },
+      );
+      const flag = release ? "-O3" : "-O";
+      if (opt.diagnostics.some((d) => d.severity === "error")) {
+        fail(`${flag} run produced errors: ${JSON.stringify(opt.diagnostics)}`);
+      }
+      if (opt.logs.join(",") !== "42,10") {
+        fail(`${flag} run: want logs ["42","10"], got ${JSON.stringify(opt.logs)}`);
+      }
+      if (!(opt.wasmBytes! < ok.wasmBytes!)) {
+        fail(`${flag} run: want a module smaller than ${ok.wasmBytes} bytes, got ${opt.wasmBytes}`);
+      }
+      console.error(`OK: ${flag} run -> ${opt.wasmBytes} bytes (from ${ok.wasmBytes}), same logs`);
+    }
+
     // 2. A broken program yields an error diagnostic with a real position.
     const bad = await mod.runProgram(`let n: i32 = "nope"`, runChecker);
     const err = bad.diagnostics.find((d) => d.severity === "error");

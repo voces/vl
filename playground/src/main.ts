@@ -38,7 +38,7 @@ import { SAMPLES, type Sample } from "./samples.ts";
 import * as lsp from "./lspAdapter.ts";
 import { decodeHash, encodeSource } from "./share.ts";
 import { loadLastSession, saveLastSession } from "./projects.ts";
-import { loadBrowserChecker } from "./wasmCheckerBrowser.ts";
+import { freshSeed, loadBrowserChecker } from "./wasmCheckerBrowser.ts";
 
 const VL_LANGUAGE_ID = "vital";
 const ENTRY_FILE = "main.vl";
@@ -76,6 +76,7 @@ const runBtn = $<HTMLButtonElement>("run");
 const shareBtn = $<HTMLButtonElement>("share");
 const formatBtn = $<HTMLButtonElement>("format");
 const autorunBtn = $<HTMLButtonElement>("autorun");
+const optimizeBtn = $<HTMLButtonElement>("optimize");
 const themeBtn = $<HTMLButtonElement>("theme");
 const faddBtn = $<HTMLButtonElement>("fadd");
 const pickerBtn = $<HTMLButtonElement>("pickerBtn");
@@ -1056,9 +1057,21 @@ const run = async () => {
   const fileSet = projectFiles();
   const startedAt = performance.now();
   try {
+    const opts = {
+      wat: true,
+      optimize: optimize
+        ? {
+          freshSeed: async () => {
+            const exp = await freshSeed();
+            if (exp === undefined) throw new Error("the compiler seed is not loaded");
+            return exp;
+          },
+        }
+        : undefined,
+    };
     const result = nFiles > 1
-      ? await runProject(fileSet, ENTRY_FILE, checker, { wat: true })
-      : await runProgram(fileSet[ENTRY_FILE] ?? "", checker, { wat: true });
+      ? await runProject(fileSet, ENTRY_FILE, checker, opts)
+      : await runProgram(fileSet[ENTRY_FILE] ?? "", checker, opts);
     const elapsed = Math.max(1, Math.round(performance.now() - startedAt));
 
     // Whole-program diagnostics drive the run verdict; the per-file panel was
@@ -1160,6 +1173,18 @@ autorunBtn.setAttribute("aria-checked", autoRun ? "true" : "false");
 $<HTMLSpanElement>("run").querySelector<HTMLSpanElement>(".run-label")!
   .textContent = autoRun ? "Run now" : "Run";
 autorunBtn.addEventListener("click", () => setAutoRun(!autoRun));
+
+// `-O`: Run builds the module as `vl build -O` does — the compiler's own optimizer, with
+// binaryen.js answering its requests (persisted, like auto-run).
+let optimize = localStorage.getItem("vl-optimize") === "1";
+const setOptimize = (on: boolean) => {
+  optimize = on;
+  localStorage.setItem("vl-optimize", on ? "1" : "0");
+  optimizeBtn.setAttribute("aria-checked", on ? "true" : "false");
+  if (autoRun && compilerReady) run();
+};
+optimizeBtn.setAttribute("aria-checked", optimize ? "true" : "false");
+optimizeBtn.addEventListener("click", () => setOptimize(!optimize));
 
 // Fired on every model edit (any file). Always: debounced diagnostics + WAT,
 // editor meta, the share-hash update. When auto-run execution is on: also a
