@@ -73,6 +73,7 @@ import { refViewSrcTys } from "./check_ref_list_view"
 import { widenRetagToHas } from "./check_retag_rows"
 import {
   T,
+  TY_NULL,
   TyArray,
   TyErr,
   TyFunc,
@@ -607,6 +608,7 @@ import {
   structNameIxReset,
   structTyIxReset,
   uFieldElemTyIxAt,
+  valueAtomKindOfTy,
 } from "./emit_atom_kinds"
 import {
   parentBindingFrameArenaOf,
@@ -965,6 +967,7 @@ import {
   unKeyPushOfTy,
   unNameBound,
   unRowOfCanon,
+  unRowOfKeyOrMembers,
   unSiteOnSoftKey,
   unVarSliceAdoptKeySibling,
   unionAtomTysOf,
@@ -2826,14 +2829,6 @@ export function collectFns(stmts: i32[]) {
   fnStmts.length
 }
 
-// True if function-result type name `r` round-trips through the nested-closure value-call ABI.
-// Only a plain numeric or boolean scalar does: it is the closure `call_ref`'s literal result
-// valtype, read straight off the stack. Excluding a composite result keeps those shapes a
-// clean reject with no interned sig, rather than invalid wasm or a trap.
-function cloResultIsPlainScalar(r: string) {
-  r == "i32" || r == "boolean" || r == "f64" || r == "f32" || r == "i64"
-}
-
 // The one home of the `$fnsig` intern. Append `key` to the signature table under representative
 // lifted-function `rep` (a real `fnStmts` index, or -1 for a key synthesized from an
 // annotation). A "" key interns nothing; a present key keeps its original slot, so every pass
@@ -2867,17 +2862,10 @@ function markSigKeyMonoMapsUsed(key: string) {
   0
 }
 
-// Interns the `$fnsig` of type-atom `atom` of arena type `ty` (-1 when unknown) at rep -1, keyed
-// by `unionArmSigKeyTy` to match the call site's key. A mixed scalar-plus-composite union result
+// Interns the `$fnsig` of union arm `atom` of arena type `ty` (-1 when unknown) at rep -1, keyed
+// `kIn`, or by `unionArmSigKeyTy` when `kIn` is "". A mixed scalar-plus-composite union result
 // is skipped: its synthesized sig would pass the call's floor while the un-pinned producer keeps
 // its own functype, and the cast traps.
-function internCloSigOfAtom(atom: string, ty: i32) {
-  internCloSigOfAtomTy(atom, "", ty)
-}
-
-// `internCloSigOfAtom` with the key already in hand; `kIn` of "" keys the atom off `ty`
-// instead. The guard still runs: `nulCloMixedUnionUnregistered(atom)` is a deliberate reject,
-// evaluated on the atom whether or not the key came from the arena.
 function internCloSigOfAtomTy(atom: string, kIn: string, ty: i32) {
   let k = kIn
   if k == "" { k = unionArmSigKeyTy(atom, ty) }
@@ -2890,13 +2878,24 @@ function internCloSigOfAtomTy(atom: string, kIn: string, ty: i32) {
 // declines (-1, a type parameter, a part outside the value-call ABI) interns nothing.
 function internCloSigOfTy(ty: i32) { internCloSigKey(sigKeyOfTy(ty), -1) }
 
+// `internCloSigOfTy` for a nullable closure's inner function type `ty`, skipping the mixed
+// scalar-plus-composite union result `nulCloMixedUnionUnregisteredTy` names.
+function internNulCloSigOfTy(ty: i32) {
+  const k = sigKeyOfTy(ty)
+  if k == "" { return 0 }
+  if nulCloMixedUnionUnregisteredTy(ty) { return 0 }
+  internCloSigKey(k, -1)
+}
+
 // Intern every closure `$fnsig` reachable through the result chain of a function type — a
 // closure whose result is itself a closure (`() => ((i32) => f32)`), to any nesting depth. The
 // concrete-lambda loop keys the outer sig as a collapsed `>c` and never mints the inner one, so
 // a value call on the result finds nothing. Bounded to results that round-trip a value call.
-function internCloResultChainTy(ty: i32) { internCloResultSpineTy(ty) }
+function internCloResultChainTy(ty: i32) { internCloResultSpineTy(ty, false) }
 
-function internCloResultSpineTy(ty: i32) {
+// The spine walk. `wideShape` also takes an anonymous record result, for a nullable closure
+// annotation whose value may only ever be `null`, so no concrete lambda mints that level's sig.
+function internCloResultSpineTy(ty: i32, wideShape: boolean) {
   if ty < 0 { return 0 }
   let curTy = ty
   let guard = 0
@@ -2924,55 +2923,14 @@ function internCloResultSpineTy(ty: i32) {
         }
       }
     }
+    if !takes && wideShape && rt is TyObj {
+      takes = structNameOfTy(retTy) == ""
+    }
     if takes { internCloSigKey(sigKeyOfTy(curTy), -1) }
     if !retIsClosure { return 0 }
     curTy = retTy
   }
   0
-}
-
-// The closure result-spine walk on a name, for the nulclosure-annotation entry's `| null` inner,
-// where an author's litunion alias survives (the checker-type entry walks the arena instead,
-// `internCloResultSpineTy`). `ty`, stepped down the spine beside the spelling, decides whether
-// a level descends (-1 stops after one); `wideShape` is the disjunct the arena twin lacks.
-function internCloResultSpine(tn: string, ty: i32, wideShape: boolean) {
-  if tn == "" { return 0 }
-  let cur = normTypeAtom(tn)
-  let curTy = ty
-  let guard = 0
-  while guard < 64 {
-    guard = guard + 1
-    // `annRetNameOf` is the `annArrowAt`-then-slice this loop spelled out; "" is its "no
-    // top-level arrow" answer, the spine's terminator.
-    const rawRet = annRetNameOf(cur)
-    if rawRet == "" { return 0 }
-    const ret = normTypeAtom(rawRet)
-    const retTy = tyStepRet(curTy)
-    const retIsClosure = retTy >= 0 && tyAt(retTy) is TyFunc
-    let takes = retIsClosure || cloResultIsPlainScalar(ret)
-    // Evaluated only when the two cheap disjuncts declined; `nameIsWholeSpanShape` is a depth
-    // scanner, not a char test. `wideShape` is redundant rather than dead: the sibling covering
-    // it is coverage-gated, since `collectTyReachCloSigs`'s roots come from `nodeTyIxOf` and it
-    // returns at once for -1, so on an arena-uncovered annotation this flag is the only cover.
-    if !takes && wideShape { takes = nameIsWholeSpanShape(ret) }
-    // No `nulCloMixedUnionUnregistered` guard, and it is inert here rather than missing:
-    // `takes` already restricts this level's result to a nested closure, a plain scalar or a
-    // whole-span shape — never a union — so the guard's mix test cannot fire on `cur`.
-    if takes { internCloSigKey(unionArmSigKeyTy(cur, curTy), -1) }
-    // Descend only through a nested-closure result; a scalar or composite result ends the spine.
-    if !retIsClosure { return 0 }
-    cur = ret
-    curTy = retTy
-  }
-  0
-}
-
-// The nulclosure-annotation dual of `internCloResultChain`: intern every closure `$fnsig`
-// reachable through the result chain of a nullable closure annotation's inner function type.
-// The annotation may be the program's only spelling of these types — the value only ever
-// `null`, narrowed and called — so no concrete lambda ever mints them.
-function internNulCloResultSpine(tn: string, ty: i32) {
-  internCloResultSpine(tn, ty, true)
 }
 
 // Collect the distinct `$fnsig` env-leading functypes — one per distinct eligible signature key
@@ -3098,19 +3056,14 @@ export function collectCloSigs() {
   while ni < P.nodes.length {
     const nn = nodeAt(ni)
     if nn is TypeRef {
-      const nm = nn.tyName
       if nodeTyIsNulClosure(ni) {
-        // The nulclosure's inner function type, classified once: `nullablePartOf` is a pure
-        // scan of `nm` and nothing between the three former call sites writes `nm`, so the
-        // hoist is total by construction.
-        const nInner = nullablePartOf(nm)
         const nInnerTy = tyPeelNul(nodeTyIxOf(ni))
         // The nulclosure annotation's inner closure sig.
-        internCloSigOfAtom(nInner, nInnerTy)
+        internNulCloSigOfTy(nInnerTy)
         // A nulclosure whose result is itself a closure: the intern above mints only the outer
         // sig, its result collapsed to the shared `>c` fat pointer, so a chained value call on
         // the narrowed result finds no sig for the inner closure. Walk the result spine.
-        internNulCloResultSpine(nInner, nInnerTy)
+        internCloResultSpineTy(nInnerTy, true)
       }
       // A closure-element array annotation, plain or nullable-element, whose value may carry no
       // concrete lambda of the element type: the narrowed indexed or rebound call still
@@ -3164,12 +3117,10 @@ function collectLiftedCloSig(fe: i32, sx: i32) {
   if cloRetValKind(fe) == "nulclosure" {
     const rfn = nodeAt(sx)
     if rfn is FuncDecl {
-      // The mixed-union skip belongs here too, and this is the one synth site where its
-      // absence is not inert: for an un-instantiated generic template `inm` still carries the
-      // type parameter, which counts as the composite side of the mix test and is registered
-      // by nothing. Unguarded, such a template steals a concrete lambda's rep for its key.
-      const inm = nullablePartOf(tyNameOf(rfn.fnRet))
-      if inm != "" { internCloSigOfAtom(inm, tyPeelNul(nodeTyIxOf(rfn.fnRet))) }
+      // An un-instantiated generic template's result still holds its type parameter, which
+      // `sigKeyOfTy` declines, so the template cannot steal a concrete lambda's rep for its key.
+      const inTy = tyPeelNul(nodeTyIxOf(rfn.fnRet))
+      if inTy >= 0 && tyAt(inTy) is TyFunc { internNulCloSigOfTy(inTy) }
     }
   }
   0
@@ -14897,6 +14848,47 @@ function nulCloMixedUnionUnregistered(arm: string, ty: i32) {
   if isUName(res) { return false }
   if isValueUnionName(res) { return false }
   if nameIsLitUnionArmValueUnion(res) { return false }
+  if tyIsMapMemberUnion(rt) { return false }
+  true
+}
+
+// `nulCloMixedUnionUnregistered` on function type `ty` (its `| null` peeled): true when the
+// result is a union of a scalar and a composite member that no registration admitted. A closure
+// member is composite, a literal union scalar.
+function nulCloMixedUnionUnregisteredTy(ty: i32) {
+  const rt = tyStepRet(tyPeelNul(ty))
+  if rt < 0 { return false }
+  const t = tyAt(rt)
+  const ms: i32[] = []
+  if t is TyUnion {
+    for m in t.uMembers { ms.push(m) }
+  } else if t is TyNullable {
+    if t.nInner < 0 { return false }
+    const it = tyAt(t.nInner)
+    if it is TyUnion {
+      for m in it.uMembers { ms.push(m) }
+    } else {
+      ms.push(t.nInner)
+    }
+  } else {
+    return false
+  }
+  let hasScalar = false
+  let hasComposite = false
+  for m in ms {
+    if m < 0 || tyAt(m) is TyFunc {
+      hasComposite = true
+    } else if m != TY_NULL {
+      if valueAtomKindOfTy(m) >= 0 || tyIsLitUnion(m) {
+        hasScalar = true
+      } else {
+        hasComposite = true
+      }
+    }
+  }
+  if !hasScalar || !hasComposite { return false }
+  if unRowOfKeyOrMembers(rt) >= 0 { return false }
+  if isValueUnionTyOr(rt) == 1 { return false }
   if tyIsMapMemberUnion(rt) { return false }
   true
 }

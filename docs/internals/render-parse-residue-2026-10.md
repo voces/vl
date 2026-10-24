@@ -136,7 +136,7 @@ the slice retires.
 | D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; probed: the atom tests and the uncovered-row fallback have atoms with no type, the rest are the registry's own split and the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
-| D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left; every mv slot banks a type, the mint classifies by it, 0 retired) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
+| D8 | mv, closure-sig and field-companion slots by type (landed: 7 retired, 11 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
 slice that retires them in the same change. For example, A3's one C entry is a rung of the same
@@ -1520,9 +1520,16 @@ What each slice changes:
   - Left: `annRefListSlot`. `rlSlotOfTy` misses the slot the spelling finds in 72 files at the
     parameter call and 6 at the result call: nested ref lists, lists of map-valued records, and
     inline records the spelling adopts. That waits on D1.
-  - Left: the two closure-signature keys in `emit_collect`. The key agrees with `sigKeyOfTy`
-    everywhere but one generic template, and there `nulCloMixedUnionUnregistered` rejects the
-    atom by its spelling. The guard and the result spine's whole-span disjunct still read it.
+  - Done: the two closure-signature keys in `emit_collect`. A nullable closure annotation and a
+    lifted lambda's nullable result key their sig by `sigKeyOfTy` of the peeled type, the
+    mixed-union guard asks the result type's members, and the result spine walks the arena
+    (`internCloResultSpineTy`, with a wide-shape leg for an anonymous record result). The
+    spelling helpers are deleted. Over the self-compile and 16,641 files the key set agreed in
+    88 files and the lifted key in 22, with 0 differing; a template's `T` result is declined by
+    `sigKeyOfTy` as the spelling guard declined it. One hand-written program outside the
+    population differed: the spelling key of `((x: i32) => R) | null` came out empty only when a
+    `((x: i32) => i32 | R) | null` stood beside it. Its module is unchanged once lambdas are
+    assigned, since the lambda mints the same sig.
   - Left, not probed: the products. These are the signature-ladder
     renders, the mv mint key in `mvShapeOfMapNameTys`, `cloArmTagOfTy`'s render, which the link
     step reads as the `clo:` key, and the two D34 entries. The mv slot stays keyed by spelling,
