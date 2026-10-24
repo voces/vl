@@ -131,12 +131,12 @@ the slice retires.
 | C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 13 retired, 17 left; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; re-probed at fec5cd698: the `fill`, `.map` result and `string\|null` renders name rows not minted yet, and the rest are producers and grammar predicates) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; re-checked at fec5cd698: D1's retired reader unblocks none, and the rest waits on a ref-list mint keyed by type) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
-| D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
-| D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer; re-checked at 84b98d149 after #4700: the pins are computed before the instance exists, none retired) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D4 | narrowed pins and pin unions (probed: blocked on D3 and D5; re-checked at 84b98d149, unchanged) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
+| D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; the rest is the D4930 alias; re-probed at 84b98d149, none retired: the split fallbacks are reached by callers with no type) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired; at 84b98d149 the typed-beside legs of `mvValNamesCompat` are reached by no event) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
-| D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
+| D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149: the field companion's render is the name its readers rebuild the box under) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
 slice that retires them in the same change. For example, A3's one C entry is a rung of the same
@@ -1396,6 +1396,12 @@ What each slice changes:
 
     `monoArgLitUnionPin` cannot become a constant, because a list of literals keeps its inline
     spelling. 16 entries are left.
+
+    Re-checked at `84b98d149`, after #4700 made the hole binding once per instance: every pin
+    above is computed before `monoInstanceFor` finds or makes the instance, so the instance's
+    banked rows cannot answer it, and none retires. The `monoI32AtomPinName` fallback runs in no
+    event over the self-compile and 16,655 files, nor on a control pinning nullable functions,
+    lists of them and a bare function, so a constant `""` has nothing to agree with.
 - **D4.** `monoRegisterPinUnion` and `canonUnionKeyOfName` register a narrowed pin's union by its
   type.
   - Probed and blocked: no entry retired. A side-by-side probe read the spelling and the type at
@@ -1624,6 +1630,10 @@ What each slice changes:
     fallback, with 6 events, each answering false: the generic-body row `((T)=>void)|string` in
     `closures/generic-written-into-function-or-string-union-slot.vl`. The `#anon0[]|i32[]` row
     the fallback was kept for is now covered.
+  - Re-probed at `84b98d149` over the self-compile and 16,655 files, none retired:
+    `recordUnMemTys` still falls back in 22 events in 13 files; `unionSetAtomsOf` splits a set no
+    row records in 39,836 events in 4,381 files, and `unionSetMemberCount` counts one in 1,241,275
+    events in 11,883. Their callers pass no type.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
   `structIndexOfLet` answer by type.
 
@@ -1708,6 +1718,9 @@ What each slice changes:
       691, and its map-value query (`mvValNamesCompat` with no type) 262 to 12. The
       self-compile reaches the first 918 times, down from 4,064, and the second 0 times,
       down from 74.
+    - Probed at `84b98d149` over the self-compile and 16,655 files: `mvValNamesCompat`'s two
+      literal-union legs, which hold the value types beside the names, are reached by no event,
+      so a `tyIsLitUnion` leg has nothing to agree with. They stay with the resolver.
 - **D7.** `narrowVariants` banks a type for multi-member sets, where `narrowSlotTy` is `-1` today.
 
   No new column was needed for the two sites that moved: the slot's member set already holds the
@@ -2042,6 +2055,10 @@ What each slice changes:
     The three rungs, `mapValKindLowerable` and `mvValKindOfName` can then go. That retires the
     D2 entries at 450, 709 and 649 and the A1 entry at 469. Keying `mvValName` by type, and the
     mint key in `mvShapeOfMapNameTys`, come after that.
+
+    Re-checked at `84b98d149`, none retired: `memReadBoxNames`'s render is also the name
+    `memReadBoxNarrowName` hands its three readers, which rebuild the box under it, so a
+    member-set compare by `msSetOfTy` would still leave the render in place.
 
 **Order.** The five A slices and C4 can start today. C1 waits on L1's bind columns. D1 and D2
 come before C3, because C3's walkers feed the ref-list slots. D3 and D4 share the pin seam, and D4 lands after D3 and D5.
