@@ -808,14 +808,14 @@ axis(
   (d) => twoFiles(d, genValueWrites(6000, true), genValueWrites(1500, true)),
 );
 
-// D3276's GROWTH pair, 4,000 functions of arm and branch bodies against 1,000, so linear reads 4.
-// A per-block scan of the object-looking arms once read 9.5x master at 8,000; at 4,000 fuel
-// reads 3.98, and a planted per-function arena scan 10.08.
+// D3276's GROWTH pair, 2,000 functions of arm and branch bodies against 500, so linear reads 4.
+// A per-block scan of the object-looking arms once read 9.5x master at 8,000; at 2,000 fuel
+// reads 4.00, and an arena scan planted per arm body (`parseArmBody`) 10.58.
 axis(
   "object-looking arm bodies",
   5.0,
   "A per-block or per-function pass is scanning the arm bodies (compiler/parser.vl `parseArmBody`).",
-  (d) => twoFiles(d, genArmBodies(4000), genArmBodies(1000)),
+  (d) => twoFiles(d, genArmBodies(2000), genArmBodies(500)),
 );
 
 // D2914's GROWTH pair, 400 re-seated lists against 100, so linear reads 4 and quadratic 16. A
@@ -1353,8 +1353,8 @@ axis(
 // enclosing declaration" should make the search past the first miss O(1). D2326:
 // `plBestDupAt`'s walk past a binary-search miss stepped to the previous SIBLING instead of
 // jumping via `plSortedSkip` to the nearest ENCLOSING one, re-walking the whole closed chain
-// on every one of the `n` reads. At 6,000 fuel reads 2.61, and an arena scan planted on every
-// `let` reads 18.85.
+// on every one of the `n` reads. At 3,000 fuel reads 2.67, an arena scan planted on every
+// `let` reads 7.87, and stepping to the previous sibling instead of `plSortedSkip` 6.79.
 const genManyClosedSiblingReads = (n: number, many: boolean): string => {
   const o = ["type U = i32 | string", "function h(): i32 {", "  let t = 0", "  let v = 1"];
   const shadows = many ? n : 1;
@@ -1368,7 +1368,7 @@ axis(
   "reads after many closed sibling shadows",
   3.4,
   "`plBestDupAt` is stepping past every closed sibling instead of jumping via `plSortedSkip` (D2326).",
-  (d) => twoFiles(d, genManyClosedSiblingReads(6000, true), genManyClosedSiblingReads(6000, false)),
+  (d) => twoFiles(d, genManyClosedSiblingReads(3000, true), genManyClosedSiblingReads(3000, false)),
 );
 
 // `n` top-level `if true` blocks, each declaring `const u` and a closure reading it — the
@@ -1377,8 +1377,8 @@ axis(
 // sids rather than one. Its own per-sid scan of every start statement made that O(n) per sid,
 // O(n²) overall — the query-side fix above does not touch this, since each sid is asked once
 // (D2326). A GROWTH pair — `n` blocks against `n/4` — because a one-block arm is an empty
-// compile, and a ratio against it is a budget. Linear reads 4 and quadratic 16; today it reads
-// 7.14, and with `startBlockLetRowOfSid`'s memo disabled 15.3.
+// compile, and a ratio against it is a budget. Linear reads 4 and quadratic 16; at 1,500 blocks
+// against 375 it reads 5.35, and with `startBlockLetRowOfSid`'s memo disabled 14.71.
 const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
   const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  "s"', "}"];
   const blocks = many ? n : 1;
@@ -1402,7 +1402,7 @@ axis(
   "many distinct captured sibling blocks",
   8.9,
   "`startBlockLetRowOfSid` re-scans every start statement per DISTINCT sid (D2326).",
-  (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(750, true)),
+  (d) => twoFiles(d, genManyCapturedSiblingBlocks(1500, true), genManyCapturedSiblingBlocks(375, true)),
 );
 
 // `n` loops walking one name, each binding a copy of its loop variable that a closure
@@ -1655,8 +1655,8 @@ axis(
 );
 
 // D3417's GROWTH pair: one `n`-element literal per element kind (i32, f64, i64, a record) at
-// 20,000 against 5,000, so linear reads 4 and quadratic 16; it reads 3.72, the fixed cost of a
-// compile riding the short arm, and 14.13 with an arena scan planted per object literal. A
+// 10,000 against 2,500, so linear reads 4 and quadratic 16; it reads 3.96, the fixed cost of a
+// compile riding the short arm, and 11.43 with an arena scan planted per object literal. A
 // scalar literal past the operand cap is a data segment, and each element is asked its width
 // once per classification.
 const genArrayLiterals = (n: number): string => {
@@ -1674,7 +1674,7 @@ axis(
   "array literal length",
   5.0,
   "A literal's elements are re-scanned per element, or a scalar literal past the operand cap stopped lowering as a data segment (`arrLitNumKind`, `arrLitDataBuild`; D3417).",
-  (d) => twoFiles(d, genArrayLiterals(20000), genArrayLiterals(5000)),
+  (d) => twoFiles(d, genArrayLiterals(10000), genArrayLiterals(2500)),
 );
 
 // A chain of `depth` generics, each calling the next, every body carrying deferred
@@ -2062,8 +2062,8 @@ axis(
 // it, and that answer comes off a per-sid index of the frame's bindings, not a body walk (D2289).
 // At 16,000 calls: 0.38 / 0.34 / 0.95 here, 15.66 / 0.36 / 39.15 on #3135's round-3 cut, and
 // 0.72 / 0.36 / 1.80 on master, whose `blockDeclaresStmt` scanned the body's statements per read.
-// The pair runs at 10,000, where fuel reads 1.03 and an arena scan planted in `chainShadowsAt`
-// reads 170.
+// The pair runs at 2,500, where fuel reads 1.04 and an arena scan planted in `chainShadowsAt`
+// reads 23.5.
 const genShadowedCallee = (n: number, shadow: boolean): string => {
   const b = shadow ? "w" : "v";
   const o = ["function w(): i32 { return 1 }", "function g(): i32 {", "  let acc = 0"];
@@ -2078,7 +2078,7 @@ axis(
   "calls under a same-named binding",
   2.5,
   "A call's shadow test is walking the frame body per call (`chainShadowsAt`, D2289).",
-  (d) => twoFiles(d, genShadowedCallee(10000, true), genShadowedCallee(10000, false)),
+  (d) => twoFiles(d, genShadowedCallee(2500, true), genShadowedCallee(2500, false)),
 );
 
 // `fns` functions of `arms` sibling blocks, each binding its function's one list name to a
@@ -2137,6 +2137,7 @@ axis(
 // its own local `8 * fns` times, named `out` in the many arm and `sink` in the one. A
 // binding's store scan walked its name's occurrences in every frame rather than its own
 // (`cwIxFrHead`, compiler/check_write_scan.vl; D2688), so the sink's rows cost each binding.
+// At 1,200 functions fuel reads 1.00, and `constStoresForeignList` walking every frame 3.54.
 const genSharedListName = (fns: number, shared: boolean): string => {
   const o = ["type U = i32 | string"];
   for (let f = 0; f < fns; f++) {
@@ -2164,7 +2165,7 @@ axis(
   "a list name shared across functions",
   2.0,
   "An un-annotated list const's store scan walked its name's occurrences in every function (`constStoresForeignList`, D2688).",
-  (d) => twoFiles(d, genSharedListName(2000, true), genSharedListName(2000, false)),
+  (d) => twoFiles(d, genSharedListName(1200, true), genSharedListName(1200, false)),
 );
 
 // `n` generics that each call every other one at `<T>`, as one cycle or as a chain (a call to

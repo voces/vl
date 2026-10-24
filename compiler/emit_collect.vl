@@ -157,6 +157,7 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
+  arenaEpochNow,
   arithRegionSeen,
   callHasTyArgs,
   elseIfLink,
@@ -5056,89 +5057,74 @@ function checkExprI32(exprIx: i32) {
   0
 }
 
-// Walk the block at `blockIx`, descending into `if` branches and `while` bodies as
-// `collectLocals` does, and collect every distinct ref-list `.push` receiver slot into
-// `fnRefPushSlots`. Parallel to the `blockPushPopBits` walk but recording the slot rather than
-// testing presence, so a function pushing onto `Tok[]` and `Diag[]` reserves a frame for each.
-export function collectRefPushSlots(blockIx: i32, fnIx: i32) {
-  const b = nodeAt(blockIx)
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      if callIsPushKind(stmts[i], fnIx, "ref") {
-        const s = nodeAt(stmts[i])
-        if s is Call && s.callFn >= 0 {
-          const callee = nodeAt(s.callFn)
-          if callee is Member {
-            recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
-            recordFitPushSlot(callee.memObj)
-          }
-        }
-      }
-      const s = nodeAt(stmts[i])
-      if s is IfStmt { collectRefPushSlotsIf(stmts[i], fnIx) }
-      else if s is WhileStmt { collectRefPushSlots(s.whileBody, fnIx) }
-      else if s is ForRange { collectRefPushSlots(s.frBody, fnIx) }
-      else if s is ForIn { collectRefPushSlots(s.fiBody, fnIx) }
-      i = i + 1
+// Collect every distinct ref-list slot a `.push`, `.pop` or `.clear` in the block at `blockIx`
+// needs a typed scratch frame for into `fnRefPushSlots`. Statement-level pushes go ahead of
+// every slot found inside an expression, since that order is the frame order; one walk finds
+// both, so each `if` arm is narrowed once.
+export function collectRefSlots(blockIx: i32, fnIx: i32) {
+  refSlotsStmtPush = []
+  refSlotsExpr = []
+  refSlotsBuffering = true
+  collectMemberPopRefSlots(blockIx, fnIx)
+  refSlotsBuffering = false
+  let i = 0
+  while i < refSlotsStmtPush.length {
+    recordRefPushSlot(refSlotsStmtPush[i])
+    i = i + 1
+  }
+  i = 0
+  while i < refSlotsExpr.length {
+    recordRefPushSlot(refSlotsExpr[i])
+    i = i + 1
+  }
+  refSlotsStmtPush = []
+  refSlotsExpr = []
+  0
+}
+
+// The slots `collectRefSlots` holds back until its walk ends, and whether one is running; a
+// standalone `collectMemberPopRefSlotsExpr` records straight into `fnRefPushSlots`.
+let refSlotsStmtPush: i32[] = []
+let refSlotsExpr: i32[] = []
+let refSlotsBuffering = false
+
+function refSlotNote(slot: i32) {
+  if refSlotsBuffering {
+    refSlotsExpr.push(slot)
+    return 0
+  }
+  recordRefPushSlot(slot)
+}
+
+// The slots a ref-list `.push` statement at `stmtIx` reserves, held for `collectRefSlots`.
+function noteStmtPushSlots(stmtIx: i32, fnIx: i32) {
+  if !callIsPushKind(stmtIx, fnIx, "ref") { return 0 }
+  const s = nodeAt(stmtIx)
+  if s is Call && s.callFn >= 0 {
+    const callee = nodeAt(s.callFn)
+    if callee is Member {
+      refSlotsStmtPush.push(refListSlotOfExpr(callee.memObj, fnIx))
+      refSlotsStmtPush.push(fitPushSlotOf(callee.memObj))
     }
   }
   0
 }
 
-// Also reserves the frame of the `K[]` an `is K[]` arm pushes onto in place of its receiver,
-// whose own list holds another element (D4962): its row is the receiver's checked type's.
-function recordFitPushSlot(recv: i32) {
+// The frame of the `K[]` an `is K[]` arm pushes onto in place of its receiver, whose own list
+// holds another element (D4962): its row is the receiver's checked type's. -1 when none.
+function fitPushSlotOf(recv: i32): i32 {
   const o = nodeAt(unwrapParen(recv))
-  if !(o is Ident) || !strListHas(listIsIdentNames, o.identName) { return 0 }
+  if !(o is Ident) || !strListHas(listIsIdentNames, o.identName) { return -1 }
   const t = nodeTyIxOf(recv)
-  if t < 0 || t >= T.tys.length { return 0 }
+  if t < 0 || t >= T.tys.length { return -1 }
   const a = tyAt(t)
-  if !(a is TyArray) { return 0 }
-  recordRefPushSlot(rlSlotOfTy(a.aElem))
-}
-
-// Collect ref-push receiver slots from every arm of the `if` / `else if` chain at `ifIx` — the
-// then-branch, an `else` block, and recursively each chained `else if`. Mirrors
-// `ifChainPushPopBits`'s recursion, so a push under two or more `else if` arms is recorded.
-function collectRefPushSlotsIf(ifIx: i32, fnIx: i32) {
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990); the
-  // outermost else narrowing restored is the state the nested restores would have left.
-  let elseTop = -1
-  let cur = ifIx
-  while cur >= 0 {
-    const s = nodeAt(cur)
-    cur = -1
-    if s is IfStmt {
-      // Each arm is walked under its own narrowing, as `emitStmt` lowers it and `startScanIf`
-      // scans the top-level chain. Without the arm's pin a receiver narrowed to a ref-list arm
-      // classifies as its whole union, reserves no scratch frame, and the emit-time lookup has
-      // no row to find (D1823).
-      const savedTop = narrowTop
-      const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-      collectRefPushSlots(s.ifThen, fnIx)
-      if narrowed { restoreNarrow(savedTop) }
-      if s.ifElse >= 0 {
-        const savedElseTop = narrowTop
-        if setNarrowFromCondElse(s.ifCond, fnIx) {
-          if elseTop < 0 { elseTop = savedElseTop }
-        }
-        if nodeAt(s.ifElse) is IfStmt {
-          cur = s.ifElse
-        } else {
-          collectRefPushSlots(s.ifElse, fnIx)
-        }
-      }
-    }
-  }
-  if elseTop >= 0 { restoreNarrow(elseTop) }
-  0
+  if !(a is TyArray) { return -1 }
+  rlSlotOfTy(a.aElem)
 }
 
 // Record the ref-list table slot of every Member-receiver ref-list `.pop` in expression `exprIx`
-// into `fnRefPushSlots`, so its typed scratch frame is reserved — the pop-side analogue of
-// `collectRefPushSlots`, descending value positions, since a `.pop` is a value.
+// into `fnRefPushSlots`, so its typed scratch frame is reserved, descending value positions,
+// since a `.pop` is a value.
 export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const e = nodeAt(exprIx)
@@ -5154,8 +5140,8 @@ export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
         if e.callFn >= 0 {
           const callee = nodeAt(e.callFn)
           if callee is Member {
-            recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
-            recordFitPushSlot(callee.memObj)
+            refSlotNote(refListSlotOfExpr(callee.memObj, fnIx))
+            refSlotNote(fitPushSlotOf(callee.memObj))
           }
         }
       }
@@ -5231,9 +5217,9 @@ export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
   0
 }
 
-// Walk the block at `blockIx` (if/else + while) collecting Member-receiver ref-list
-// `.pop` slots from statements + let-inits / returns / while-conds.
-export function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
+// `collectRefSlots`'s walk of the block at `blockIx`: statements, let-inits, returns and loop
+// headers, into `if` arms and loop bodies.
+function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
   const b = nodeAt(blockIx)
   if b is Block {
     const stmts = b.blkStmts
@@ -5260,6 +5246,7 @@ export function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
       } else {
         // Bare expression statement — a fall-through, not only the `BinExpr` and `Call` shapes.
         // See `blockHasScratch`.
+        noteStmtPushSlots(stmts[i], fnIx)
         collectMemberPopRefSlotsExpr(stmts[i], fnIx)
       }
       i = i + 1
@@ -5282,9 +5269,9 @@ function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
     cur = -1
     if s is IfStmt {
       collectMemberPopRefSlotsExpr(s.ifCond, fnIx)
-      // The pop side of `collectRefPushSlotsIf`'s narrowing, and for the same reason: the two
-      // walks reserve one frame set, so an arm scanned without its pin leaves `.pop` and
-      // `.clear` with no row at emit time (D1823).
+      // Each arm is walked under its own narrowing, as `emitStmt` lowers it: an arm scanned
+      // without its pin classifies a receiver as its whole union, and `.push`, `.pop` and
+      // `.clear` find no row at emit time (D1823).
       const savedTop = narrowTop
       const narrowed = setNarrowFromCond(s.ifCond, fnIx)
       collectMemberPopRefSlots(s.ifThen, fnIx)
@@ -8710,6 +8697,7 @@ function collectAnonShapes() {
   // The index is built for the passes above; a later reader rebuilds it through
   // `anonLeafIxEnsure`, so it does not sit in the heap the rest of the compile runs in (D2319).
   anonLeafIxClear()
+  anonKindIxClear()
 }
 
 // The main loop's body for the object literal at `ai`: mint its row unless one already serves it.
@@ -9130,9 +9118,10 @@ function anonLeafNameWrites(nm: string, out: i32[]) {
 // `a`); a left operand neither can read yields the default alone, and claims nothing.
 function anonLeafJoinedMark() {
   if anonLeafMarkCap < P.nodes.length { anonLeafMarkCap = P.nodes.length }
-  let qi = 0
-  while qi < P.nodes.length {
-    const qn = nodeAt(qi)
+  anonKindIxSync()
+  let qk = 0
+  while qk < anonKindCoalesce.length {
+    const qn = nodeAt(anonKindCoalesce[qk])
     if qn is BinExpr {
       if qn.binOp == "??" {
         const d = unwrapParen(qn.binRight)
@@ -9168,7 +9157,7 @@ function anonLeafJoinedMark() {
         }
       }
     }
-    qi = qi + 1
+    qk = qk + 1
   }
   0
 }
@@ -11604,9 +11593,10 @@ function anonLeafAtomName(valIx: i32): string {
 // rows and the box is the only shared rep. Two literals that merely both exist need two rows
 // (D391's shape), which is why the gate is on the join.
 function anonLeafOwnersJoined(ow: i32, fname: string, owAtom: string): boolean {
-  let qi = 0
-  while qi < P.nodes.length {
-    const qn = nodeAt(qi)
+  anonKindIxSync()
+  let qk = 0
+  while qk < anonKindCoalesce.length {
+    const qn = nodeAt(anonKindCoalesce[qk])
     if qn is BinExpr {
       if qn.binOp == "??" {
         const d = unwrapParen(qn.binRight)
@@ -11625,7 +11615,7 @@ function anonLeafOwnersJoined(ow: i32, fname: string, owAtom: string): boolean {
         }
       }
     }
-    qi = qi + 1
+    qk = qk + 1
   }
   false
 }
@@ -11655,9 +11645,10 @@ function anonLeafJoinLhsIndexed(
   fname: string,
   owAtom: string,
 ): boolean {
-  let qi = 0
-  while qi < P.nodes.length {
-    const qn = nodeAt(qi)
+  anonKindIxSync()
+  let qk = 0
+  while qk < anonKindCoalesce.length {
+    const qn = nodeAt(anonKindCoalesce[qk])
     if qn is BinExpr {
       if qn.binOp == "??" {
         let names = false
@@ -11679,7 +11670,7 @@ function anonLeafJoinLhsIndexed(
         }
       }
     }
-    qi = qi + 1
+    qk = qk + 1
   }
   false
 }
@@ -11713,8 +11704,10 @@ function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
   const owFam = anonLeafFamRowOf(ow)
   const atoms: string[] = []
   atoms.push(owAtom)
-  let qi = 0
-  while qi < P.nodes.length {
+  anonKindIxSync()
+  let qk = 0
+  while qk < anonKindObjLits.length {
+    const qi = anonKindObjLits[qk]
     if qi != ow {
       const qn = nodeAt(qi)
       if qn is ObjLit {
@@ -11740,7 +11733,7 @@ function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
         }
       }
     }
-    qi = qi + 1
+    qk = qk + 1
   }
   // D872 — and the atom the `??`'s left operand is declared to have, appended last and
   // deduped: for a one-literal family it is the only other atom there is.
@@ -11817,9 +11810,10 @@ function anonLeafPolyFieldCode(set: string): i32 {
 // shape) are not joined and keep two rows — the gate is on the join, not the disagreement,
 // which both shapes have. Deliberately just `??`: a general join would claim rows not this one's.
 function anonPolyOwnersJoined(ow: i32, fname: string, inner: i32): boolean {
-  let qi = 0
-  while qi < P.nodes.length {
-    const qn = nodeAt(qi)
+  anonKindIxSync()
+  let qk = 0
+  while qk < anonKindCoalesce.length {
+    const qn = nodeAt(anonKindCoalesce[qk])
     if qn is BinExpr {
       if qn.binOp == "??" {
         const d = unwrapParen(qn.binRight)
@@ -11840,7 +11834,7 @@ function anonPolyOwnersJoined(ow: i32, fname: string, inner: i32): boolean {
         }
       }
     }
-    qi = qi + 1
+    qk = qk + 1
   }
   false
 }
@@ -11885,6 +11879,44 @@ function anonNestFieldNameOf(ow: i32, inner: i32) {
   ""
 }
 
+// Every `ObjLit` and every `??` `BinExpr` in the arena, in arena order: the nodes the
+// per-literal family scans visit, so each asks about those and not the whole arena. A node's
+// kind changes only by a push (the length) or an in-place replacement (the epoch).
+let anonKindObjLits: i32[] = []
+let anonKindCoalesce: i32[] = []
+let akIxLen: i32 = -1
+let akIxEpoch: i32 = -1
+
+function anonKindIxSync() {
+  if P.nodes.length == akIxLen && akIxEpoch == arenaEpochNow() { return 0 }
+  let i = akIxLen
+  if akIxEpoch != arenaEpochNow() || i < 0 || i > P.nodes.length {
+    anonKindObjLits = []
+    anonKindCoalesce = []
+    i = 0
+  }
+  while i < P.nodes.length {
+    const n = nodeAt(i)
+    if n is ObjLit {
+      anonKindObjLits.push(i)
+    } else if n is BinExpr {
+      if n.binOp == "??" { anonKindCoalesce.push(i) }
+    }
+    i = i + 1
+  }
+  akIxLen = P.nodes.length
+  akIxEpoch = arenaEpochNow()
+  0
+}
+
+function anonKindIxClear() {
+  anonKindObjLits = []
+  anonKindCoalesce = []
+  akIxLen = -1
+  akIxEpoch = -1
+  0
+}
+
 // Do two object literals set the same field names? The key `structIndexOfObj` matches a
 // literal to a row on, asked between two literals.
 function anonObjFieldSetEq(aIx: i32, bIx: i32) {
@@ -11914,8 +11946,10 @@ function anonObjFieldSetEq(aIx: i32, bIx: i32) {
 // two literals share it and disagree about the nested layout at `fname`, neither can have its
 // own anonymous row — that disagreement is exactly what the union box exists for.
 function anonNestFieldMono(ow: i32, fname: string, inner: i32) {
-  let qi = 0
-  while qi < P.nodes.length {
+  anonKindIxSync()
+  let qk = 0
+  while qk < anonKindObjLits.length {
+    const qi = anonKindObjLits[qk]
     if qi != ow {
       const qn = nodeAt(qi)
       if qn is ObjLit {
@@ -11931,7 +11965,7 @@ function anonNestFieldMono(ow: i32, fname: string, inner: i32) {
         }
       }
     }
-    qi = qi + 1
+    qk = qk + 1
   }
   true
 }
