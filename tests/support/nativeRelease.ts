@@ -129,8 +129,13 @@ export const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: n
   // present in every module that has a string OR a list and dead in all three of these
   // fixtures. `-O`/`-O3` unmoved again (0/0, 0/0, 3/2), which is the DCE proving the sites
   // are unreachable rather than an assertion that they are.
-  { fixture: "list-wrapper-literal", none: 6, O: 0, O3: 0 },
-  { fixture: "list-wrapper-call", none: 6, O: 0, O3: 0 },
+  //
+  // AND FELL BY FOUR, ON ALL FOUR LIST ROWS, WHEN A PLAIN BUILD STOPPED EMITTING THE BODIES NO
+  // ROOT REACHES (DECISIONS.md, "A plain build drops the functions no root reaches"): the
+  // two sites each of `__str_concat__` and `__utf8_enc__` are now `unreachable` stubs. Every
+  // reached function disassembles identically, and `-O`/`-O3` are unmoved.
+  { fixture: "list-wrapper-literal", none: 2, O: 0, O3: 0 },
+  { fixture: "list-wrapper-call", none: 2, O: 0, O3: 0 },
   // Both union-box producers here are two-armed helpers, and the RETURN SINK gives such a
   // function ONE construction site: every `return` writes the tag/payload pair into two
   // reserved locals and branches to a single exit that performs the only `struct.new`. So
@@ -163,10 +168,10 @@ export const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: n
   // (`unboxed-union-rep-design.md` §12.4), not a sink.
   { fixture: "union-box-branch-local-read", none: 4, O: 4, O3: 4 },
   // D3623 split this row. Its unconditional pushes are now counted and the list is reserved,
-  // which melts it outright (10/0/0, `list-wrapper-push-reserved`); the grown worst case keeps
+  // which melts it outright (6/0/0, `list-wrapper-push-reserved`); the grown worst case keeps
   // its row, unchanged, by putting the pushes under an `if`.
-  { fixture: "list-wrapper-push", none: 9, O: 3, O3: 2 },
-  { fixture: "list-wrapper-push-reserved", none: 10, O: 0, O3: 0 },
+  { fixture: "list-wrapper-push", none: 5, O: 3, O3: 2 },
+  { fixture: "list-wrapper-push-reserved", none: 6, O: 0, O3: 0 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
   // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the
   // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD
@@ -574,7 +579,13 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // D4784: `std:fmt` renders an integer into one exact-size string, so the per-digit
     // append sites and their `ref.eq` frontier test leave: allocs 89 -> 71 and 43 -> 20,
     // refEq 2 -> 1 at both rungs, bytes 8896 -> 8549 and 2639 -> 2292.
-    O: { bytes: 8549, fns: 15, allocs: 71, indirect: 0, refEq: 1 },
+    // `-O` fns 15 -> 16, D3565 undone: `std:fmt`'s `bnLen` is a function again. A plain build
+    // stubs the functions no root reaches (DECISIONS.md, "A plain build drops the functions no
+    // root reaches"), so the unreached `bnBitLen` (via `toFixed`/`parseF64`) no longer counts as
+    // a caller of it; every caller left is run-once code, one of them in a loop, and `bnLen` has a
+    // loop, so the run-once rule keeps it out (DECISIONS.md, "`-O3` keeps hot callees out of
+    // run-once code"). Bytes 8549 -> 8333, allocation sites unchanged, `-O3` byte-identical.
+    O: { bytes: 8333, fns: 16, allocs: 71, indirect: 0, refEq: 1 },
     O3: { bytes: 2292, fns: 6, allocs: 20, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
@@ -650,7 +661,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // `select` to -1, structure unchanged: `-O` 9388 -> 9954, `-O3` 3746 -> 3861 bytes.
     // D4784: the same `std:fmt` integer renderer as on `collections/map-string`: allocs
     // 98 -> 82 and 51 -> 30, refEq 4 -> 3, `-O3` fns 6 -> 5, bytes 9954 -> 9630 and 3861 -> 3562.
-    O: { bytes: 9630, fns: 16, allocs: 82, indirect: 0, refEq: 3 },
+    // `-O` fns 16 -> 17, the same `bnLen` as on `collections/map-string` once the plain build
+    // stubs the unreached `bnBitLen`. Bytes 9630 -> 9506, the rest held.
+    O: { bytes: 9506, fns: 17, allocs: 82, indirect: 0, refEq: 3 },
     O3: { bytes: 3562, fns: 5, allocs: 30, indirect: 0, refEq: 3 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady

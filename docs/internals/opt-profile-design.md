@@ -65,17 +65,21 @@ sites (`struct.new*` / `array.new*`) surviving in the module**, read out of
 | fixture | what it is | (none) | `-O` | `-O3` |
 |---|---|---|---|---|
 | `struct-scratch-call` | `{x,y}` record built by a helper, read, discarded | 3 | **0** | **0** |
-| `list-wrapper-literal` | `[i, i+1, i+2]` built and read in the loop | 3 | **0** | **0** |
-| `list-wrapper-call` | same list, built by a helper across a call | 3 | **0** | **0** |
+| `list-wrapper-literal` | `[i, i+1, i+2]` built and read in the loop | 2 | **0** | **0** |
+| `list-wrapper-call` | same list, built by a helper across a call | 2 | **0** | **0** |
 | `union-box-call` | `i64 \| boolean` from a helper, `is`-narrowed in the loop | 3 | **0** | **0** |
 | `union-box-payload-read` | same, with the narrowed payload READ | 3 | 2 | **2** |
 | `union-box-branch-local` | same box via a `let` written on two SEPARATE statements | 4 | 4 | **2** |
-| `list-wrapper-push` | scratch list GROWN by `.push` each trip | 6 | 3 | **2** |
-| `list-wrapper-push-reserved` | same three pushes, unconditional, so reserved (D3623) | 10 | **0** | **0** |
+| `list-wrapper-push` | scratch list GROWN by `.push` each trip | 5 | 3 | **2** |
+| `list-wrapper-push-reserved` | same three pushes, unconditional, so reserved (D3623) | 6 | **0** | **0** |
 
 The count is over the whole module, which is the honest upper bound: unoptimized,
 some sites live in helpers the loop calls; optimized, everything reachable has
-been inlined into the one loop, so the module IS the loop.
+been inlined into the one loop, so the module IS the loop. The `(none)` column counts
+only reachable code too: a plain build writes an `unreachable` stub for every function
+no root reaches (DECISIONS.md, "A plain build drops the functions no root reaches"),
+which took the four sites of the unreached `__str_concat__` and `__utf8_enc__` helpers
+out of the four list rows.
 
 The four `union-sink-*` fixtures in the same directory belong to the box sink and
 are pinned by `tests/vl_union_return_sink_test.ts`, not here.

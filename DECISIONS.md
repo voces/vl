@@ -10823,8 +10823,17 @@ is conservative, and `-O`'s DCE still removes what is unreachable through values
 
 Over tests/cases, 41,963 functions became stubs, no function a root reaches did, and the
 three stubs some live function calls are bodies that were already `unreachable`. `-O` and
-`-O3` output is byte-identical, since binaryen already removed these. Build wall, CPU and RSS
-did not move on either measured program, and the L2 self-compile fuel moved +0.03%.
+`-O3` output over tests/cases is byte-identical, since binaryen already removed these. Build
+wall, CPU and RSS did not move on either measured program, and the L2 self-compile fuel moved
++0.03%.
+
+**The one way it reaches `-O`/`-O3`.** The rungs' run-once marks (`runOnceHotCallees` in
+`compiler/opt_scan.vl`) are read off the plain module's direct calls, and a stub makes none.
+A dead caller used to count as a caller from outside run-once code, which vetoed the mark; now
+it does not. On `bench/collections/map-string` and `word-freq` this marks `std:fmt`'s `bnLen`
+(it has a loop, and its remaining callers are run-once, one of them in a loop) once the
+unreached `bnBitLen` stops calling it, so `-O` keeps it as a function: fns +1, and bytes fall (8,549 to 8,333 and 9,630 to
+9,506). That is the run-once rule now judging the program instead of its dead code.
 
 **What it changes elsewhere.** A plain build is no longer a size ceiling for `-O`: inlining
 can make a small program larger than the stubbed plain build, so the native `-O`/`-O3` suites
