@@ -1038,6 +1038,17 @@ const CASES: Case[] = [
     extra: { "rx.vl": 'export { area as foo } from "./lib"\n' },
     uses: 'import { foo } from "./rx"\nprint(foo(2))\n',
   },
+  {
+    // Main's own literal type is spelled like lib's hidden inline-union alias (D11850): its
+    // message keeps the literal, so it is not banked.
+    name: "a literal type spelled like a hidden union alias",
+    want: "decline",
+    why: "no bank",
+    from: '"x" | "y"',
+    to: "i32 | i64",
+    libUses: 'function luq(): void {\n  const u: "x" | "y" | null = null\n  print(1)\n}\n',
+    uses: 'const l0: "#lu0" = "c"\n',
+  },
 ];
 
 const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
