@@ -332,11 +332,12 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // A live emit-side refusal (`scripts/capability-probes/for-range-step-min-i32.vl`):
-      // `vl check` accepts it and the emitter refuses the step.
+      // A live emit-side refusal (`scripts/capability-probes/map-union-member-under-fn-type.vl`):
+      // `vl check` accepts it and the emitter refuses the map union member.
       await Deno.writeTextFile(
         file,
-        "for i in 10 to 1 step -2147483648 { print(i) }\n",
+        "type Circle = { r: i32 }\ntype Sq = { s: i32 }\ntype K = Circle | Sq\n" +
+          "function f(h: () => ({[string]: i32} | K)): i32 { 1 }\nprint(f(() => Map()))\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
