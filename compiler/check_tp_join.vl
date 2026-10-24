@@ -19,6 +19,15 @@ import {
   tyParamsApart,
   tyVarOwnerOf,
 } from "./check_hole_pins"
+import {
+  UM_DJOIN_RELAYED,
+  UM_TP_IF_JOIN_AT,
+  UM_TP_IF_OK_AT,
+  undoReplayBool,
+  undoReplayI32,
+  undoSetBool,
+  undoSetI32,
+} from "./check_map_undo"
 import { nodeTyIxOf } from "./check_node_tys"
 import {
   flattenVariantsInto,
@@ -591,6 +600,13 @@ export function holeNameIsParamOf(
 export let dJoinNode: i32[] = []
 export let dJoinTy: i32[] = []
 
+// The deferred joins `inferRetTyOf` has handed a return accumulator, by type: a call's join,
+// not a join of the returning body's own arms. Rolled back with the dJoin rows.
+export let dJoinRelayed: {[i32]: boolean} = Map()
+export function dJoinRelayedMark(t: i32) {
+  undoSetBool(UM_DJOIN_RELAYED, dJoinRelayed, t, true)
+}
+
 // Deferred joins that escaped a call site lossily — the collapse handed out one arm while the
 // join still named holes this site could not pin. Parallel arrays: the uncollapsed join, the
 // call node to anchor a diagnostic on, and the callee's name. `validateEscJoins` re-folds each
@@ -610,6 +626,25 @@ export let tpIfNode: i32[] = []
 
 // Whether each row's join is delivered where an instance builds its union (`tpIfMarkOk`).
 export let tpIfOk: boolean[] = []
+
+// The apart join a generic body reads collapsed (`T[]` beside `string[]` is `T[]`), by `if`
+// node, which a pin re-joins (D2832); rolled back with the rows.
+export let tpIfJoinAt: {[i32]: i32} = Map()
+export function tpIfJoinAtSet(ix: i32, aj: i32) {
+  undoSetI32(UM_TP_IF_JOIN_AT, tpIfJoinAt, ix, aj)
+}
+
+// The `if`s and `match`es delivered where an instance builds that union (`tpIfMarkOk`). Every
+// rollback puts back a probe's marks (`tpIfOkAtUndo`), since the pass that keeps a node marks
+// it again.
+export let tpIfOkAt: {[i32]: boolean} = Map()
+export function tpIfOkAtMark(ix: i32) {
+  undoSetBool(UM_TP_IF_OK_AT, tpIfOkAt, ix, true)
+}
+
+export function tpIfOkAtUndo(undo: i32) {
+  tpIfOkAt = undoReplayBool(undo, UM_TP_IF_OK_AT, tpIfOkAt)
+}
 
 // A call from a generic body whose pin leaves such a join open: the callee, the caller that
 // pins it later, and the callee's bindings and parameter types in the caller's terms.
@@ -675,8 +710,10 @@ export function noteTpIfRe(
   0
 }
 
-// Drops the deferred-join rows past `n`, both columns together.
-export function dJoinTruncate(n: i32) {
+// Drops the deferred-join rows past `n`, both columns together, and the relays logged since
+// `undo`.
+export function dJoinTruncate(n: i32, undo: i32) {
+  dJoinRelayed = undoReplayBool(undo, UM_DJOIN_RELAYED, dJoinRelayed)
   while dJoinNode.length > n {
     dJoinNode.pop()
     dJoinTy.pop()
@@ -697,7 +734,9 @@ export function escJoinTruncate(n: i32) {
 
 // Drops the `tpIf*` rows past `rows` and the `tpIfRe*` rows past `res`; the latter's names and
 // types are spans `tpIfReStart` indexes, so they are left for the next row to overwrite.
-export function tpIfTruncate(rows: i32, res: i32) {
+// `tpIfJoinAt` puts back each write logged since `undo`.
+export function tpIfTruncate(rows: i32, res: i32, undo: i32) {
+  tpIfJoinAt = undoReplayI32(undo, UM_TP_IF_JOIN_AT, tpIfJoinAt)
   while tpIfFn.length > rows {
     tpIfFn.pop()
     tpIfJoin.pop()
@@ -717,7 +756,8 @@ export function tpIfTruncate(rows: i32, res: i32) {
 // The joins typed by their destination rather than their arms.
 export let joinByWant: {[i32]: boolean} = Map()
 
-// Clears the deferred, escaped and `tpIf*` join rows and `joinByWant` for a new program.
+// Clears the deferred, escaped and `tpIf*` join rows, their keyed maps and `joinByWant` for a new
+// program.
 export function joinRowsReset() {
   tpIfFn = []
   tpIfJoin = []
@@ -732,6 +772,9 @@ export function joinRowsReset() {
   tpIfReParams = []
   dJoinNode = []
   dJoinTy = []
+  dJoinRelayed = Map()
+  tpIfJoinAt = Map()
+  tpIfOkAt = Map()
   escJoinTy = []
   escJoinIx = []
   escJoinWho = []

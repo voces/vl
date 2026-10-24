@@ -96,6 +96,39 @@ const LEAKED_BEFORE = [
   "inference/glean-vl005-inferred-union-return-hole-arm.vl", // globalInitPrePass: bin
 ];
 
+// Programs whose probes each grew one keyed map beside the join rows before the maps joined the
+// rollback (`check_map_undo`); the census counts a map by its key count.
+const KEYED_LEAKED_BEFORE = [
+  "generics/if-join-two-list-types-union.vl", // globalInitPrePass: tpIfJoinAt
+  "generics/if-join-typaram-list-record-pin.vl", // globalInitPrePass: tpIfJoinAt
+  "numerics/recursive-generic-joins-runtime-numbers-apart.vl", // cstrProbeBefore, inferReturnsPrePass: dJoinRelayed
+  "generics/coalesce-join-at-list-pin.vl", // globalInitPrePass: tpIfOkAt
+  "generics/fn-result-null-into-generic-nullable.vl", // cstrProbeBefore: tpIfOkAt
+  "maps/for-in-union-of-maps.vl", // monoRecheck: tpIfOkAt
+  "generics/enclosing-param-into-generic-nullable.vl", // solveUnannotParams: tpIfOkAt
+];
+const KEYED_MAPS = ["tpIfJoinAt", "tpIfOkAt", "dJoinRelayed"];
+
+Deno.test({
+  name: "probe rollback: no probe leaves a keyed join map grown",
+  ignore,
+  fn() {
+    const bad: string[] = [];
+    for (const f of KEYED_LEAKED_BEFORE) {
+      const src = Deno.readTextFileSync(
+        new URL(`./cases/${f}`, import.meta.url),
+      );
+      const moved = [...rows(src, 1, 0, true)].filter(([k]) =>
+        KEYED_MAPS.some((m) => k.includes(`| ${m} |`))
+      );
+      if (moved.length > 0) bad.push(`${f}: ${show(new Map(moved))}`);
+    }
+    if (bad.length > 0) {
+      throw new Error(`want no keyed map moved, got:\n  ${bad.join("\n  ")}`);
+    }
+  },
+});
+
 Deno.test({
   name: "probe rollback: the sites that leaked leave no table behind",
   ignore,
