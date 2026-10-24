@@ -124,14 +124,14 @@ the slice retires.
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
-| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left; composite renderer measured, different-type rows ablated, no site swaps; step 3 at the four `monoBindFromAnn` callers measured, blocked on typed fn-flow pins and a typed twin binder) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
+| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites B, C and D bind by type, site A blocked on typed fn-flow pins) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, hole-function and written-let pins typed; 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function and written-let pins typed; 2 retired, 21 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 13 retired, 8 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -515,9 +515,56 @@ What each slice changes:
     `nameToTy` parses the pin, so its gap is a missing type, not a different answer. Typing
     those callers is D3's `mono-pin-key-by-type` work on the signature table.
 
-  A swap at B, C and D alone keeps `monoBindFromAnn` for A, so it retires no entry. The 4
-  `monoBindFromAnn` entries wait on a typed fn-flow pin (D3) and a typed twin binder. The
-  other 8 walker entries stay on spellings that come from the same text pins. No entry retired.
+  **Sites B, C and D bind by type (landed 2026-10-23).** The typed twin is `bindGenWalkFull`
+  (`check_relate_core.vl`): `bindGenWalk` with two arms added at every depth, behind a flag,
+  so the checker's own calls are unchanged.
+  - The union arm: one open member binds the argument's members that no other member `tyEq`s.
+    It binds the whole argument when every member or none is covered, and otherwise pairs
+    members by position when the counts are equal. A map member is never paired with `null`.
+  - The generic-application arm binds the arguments pairwise under one head.
+  - The checker's `bindGenUnionArm` is not reused. It covers by assignability and declines a
+    member that holds a type variable, but an exact pin needs equality.
+
+  Arrow parameters and results were already walked. Their disagreements came from the actual
+  type, not the binder.
+
+  `monoBindArenaFull` (`emit_mono.vl`) binds with the twin. Three things about its inputs:
+  - **Pattern.** It takes the declared signature type where the instance's own type has no
+    type variable (`monoParamPatTy`), so an alias shadowed by a type parameter (`Inner<Id>`)
+    binds.
+  - **Spelling.** It spells a pin nominal-first (`monoPinNominalSpelling`). A structural
+    render of a declared record made a second instance (`Tbl<{w:i32}>` beside `Tbl<Tex>`,
+    an invalid module) and lost a `@flat` row's layout. Lists and literal unions keep
+    `monoPinAnnSpelling`.
+  - **Open arguments.** Where the argument's own type is still open, the binder reads the
+    `let` annotation that `monoPinListElems` pinned (`monoLetAnnTyOf`) and each closed
+    element of a list literal (`monoBindListLitElems`).
+
+  `monoArgBindSpelling` is deleted, along with its entry.
+
+  The probe before the swap counted bindings that disagree with the spelling binder, as
+  events. Only the 56 files that still disagreed were re-run with the final twin, so their
+  "with twin" figures do not sum to the 16,624-file totals. The probe is not committed.
+
+  | site | `bindGenWalk` (16,624 files) | twin (16,624 files) | twin (56 files) | after the swap |
+  | --- | --- | --- | --- | --- |
+  | B | 7 of 33 | 2 of 33 | 2 of 12 | binds by type |
+  | C | 25 of 266 | 24 of 266 | 0 of 63 | binds by type |
+  | D | 140 of 1,738 | 6 of 1,738 | 2 of 401 | binds by type |
+
+  - The residue left after the swap had two parts:
+    - nominal-against-structural spellings, which the nominal-first spelling closed;
+    - the `((U)=>U)[]` list literal and the push-written list, which `monoBindListLitElems`
+      and `monoLetAnnTyOf` closed.
+  - `difftree --identity` over the 411-file reach set: 7 files differ, every one printing the
+    same output as master.
+    - Four keep their size and differ only in instance or type order.
+    - One builds a single `h` where master built two for the same `T`.
+    - The others are within 8 bytes.
+
+  Site A still calls `monoBindFromAnn`, so its 4 entries stay. They wait on a typed fn-flow
+  pin (D3). The other 8 walker entries stay on spellings that come from the same text pins.
+  Retired: 1 (`monoArgBindSpelling`, D3).
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSigTys`), so the change cannot
