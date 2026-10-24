@@ -120,7 +120,7 @@ the slice retires.
 | slice | name | entries | A / C / D | renders / parses | files |
 | --- | --- | --- | --- | --- | --- |
 | A1 | shape-row typed twins (landed: 0 retired, 14 left; re-probed at 2401febe6: callers with no type, typed rungs that differ, and the class C alias parameter; mv slots typed: 5 files still reach with no type, func and lit-union rungs listed as the next rep change) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
-| A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
+| A2 | emit_mono typed tests (landed: 7 retired, 1 to B, 1 left; the arrow test waits on one hole pin with no type) | 1 | 0 / 1 / 0 | 0 / 1 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
@@ -184,10 +184,17 @@ What each slice changes:
     with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
     is a union. That retires 2 renders and 1 parse. `monoCloPinListAnn` now records its text
     beside `mkArrayTy(ety)`, so its render moves to B.
-  - Left: `monoNicheNulListCheck`'s two annotation parses stay A. The arena keeps a type
-    parameter that shadows an alias where the canon spelling has erased it, so the typed test
-    refuses a fixture that runs. Its two bound-pin tests and `monoRetOfClosureCall` are C. The
-    pin there is text, or `-1` for an un-annotated hole parameter, until C1 binds by type.
+  - Done, byte-identical: `monoNicheNulListCheck` reads its type parameter off the
+    annotation's arena type (`monoNulParamListTp`) and asks the bound type itself whether it is a
+    literal union or a function (`tyIsLitUnion`, `tyIxIsFunc`). The bound type comes from the
+    caller's typed binding columns; a parameter those leave unbound binds by walking the
+    annotation against the argument's pin type. That retires 4 parses. Probed over the
+    self-compile and 16,641 files: the refusal agrees at all 17,347 events. The parameter name
+    differs at 4 events in 3 files and the refusal is the same at each: two function-typed
+    elements name no parameter, and the shadowing fixture now reads the parameter the arena
+    keeps and still runs.
+  - Left: `monoRetOfClosureCall`'s arrow test is C. One un-annotated hole parameter reaches it
+    with no pin type, so the return name is still cut from the pin text until C1 binds it.
 - **A3.** Each typed rung of the `emit_collect` field-hint ladders and the `collectATypeRef` ladder
   reads the arena, and the `emit_classify` rung reads the rl-slot columns. Hazard: the
   `collectATypeRef` chain is order-dependent, so its rungs move together.
