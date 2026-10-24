@@ -136,7 +136,7 @@ the slice retires.
 | D5 | union registry by type (step 5 remainder) (landed: 16 retired, 5 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; the registry's own split disagrees with canonical members in 2,573 files, so minting by type changes box tags; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
-| D8 | mv, closure-sig and field-companion slots by type (landed: 7 retired, 11 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
+| D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
 slice that retires them in the same change. For example, A3's one C entry is a rung of the same
@@ -1794,9 +1794,16 @@ What each slice changes:
     its type is one, in 4 and 8 files. Neither answer reached the module: difftree --identity
     found 0 of 16,460 files differ. A user-written parenthesized annotation keeps its tree and
     already ran.
+  - Done: `anonFieldElemName`'s inline arm (code 3) is deleted, 1 render. It rendered the
+    field's type at the root and kept the render only if it was an inline member set. A root
+    render never is one: `tyNameUnion` keeps an inline literal union only under an element,
+    field or map-value context, so at the root its members soften to `string`. A counter build
+    over 16,794 test and corpus files reached the arm 108 times in 84 files, 3 of them with a
+    literal-union field type, and it answered `""` every time. The self-compile does not reach
+    it. difftree `--identity` against `34f51ca46`: the fixpoint identity holds, and of
+    16,534 files (11,684 built) 0 differ and 0 are uncompared.
   - Left: the field companion. `sFieldElemTyIx` already banks its type, but the readers key by
-    the name. `anonFieldElemName`'s inline arm returns a member set in 0 of 16,715 files.
-    `memReadBoxNames` is reached in 1,089, and its render is not the member-set text in 421.
+    the name. `memReadBoxNames` is reached in 1,089, and its render is not the member-set text in 421.
     Comparing member-set ids there decides differently in 166.
   - Left: `annRefListSlot`. `rlSlotOfTy` misses the slot the spelling finds in 72 files at the
     parameter call and 6 at the result call: nested ref lists, lists of map-valued records, and
