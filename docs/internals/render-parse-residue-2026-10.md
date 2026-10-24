@@ -128,7 +128,7 @@ the slice retires.
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 10 retired, 6 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
-| C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
+| C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 12 retired, 18 left; the `rlMapElemValSlot` fall-through waits on D8) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; 5 retired, 18 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
@@ -841,12 +841,23 @@ What each slice changes:
     (`Pair<(i32) => i32, …>`, `R<string>`) and a parenthesised function arm whose result is a
     shape. All 6 build byte-identical modules with the same output. No file had a spelling
     that reserved where the node had no type. The D1092 fixture is the control that trips it.
-  - Left: `nameIsNulClosure`. `nameFieldCode` was reached in 4,805 files. Where it held a
-    type, the typed answer agreed in every file. It held only a name and answered true in 2
-    (`generic-function-into-nullable-function-slot.vl` and
-    `map-closure-return-nulclosure-field-struct.vl`), so the name leg is live.
+  - Done: 2 parses. `nameIsNulClosure` is deleted, and `nameFieldCode` asks `tyIsNulClosure`
+    of the caller's type. An earlier probe found the name leg live in 2 files. Re-probed after
+    D7 and D8, over the self-compile and 16,640 files, `nameFieldCode` was reached in 3,652
+    files, 1,126 with a type and 2,526 without. The spelling answered true in 2 typed files
+    (`map-closure-return-nulclosure-field-struct.vl` and
+    `nested-struct-field-nullable-closure-sig.vl`), where the type agreed, and in no untyped
+    file. The whole field code with the typed arm agreed with the old one in all 3,652 files.
+    `difftree --identity` over 16,529 files: 0 differ, 0 uncompared.
   - Left: `gaePeelWrappers` and `collectGenAliasShapes`. They produce the application spelling
-    `gaeEnsure` keys on, and the arena has no node for a generic application.
+    `gaeEnsure` keys on, and the arena has no node for a generic application. Probed over the
+    same population: the walk ran in 265 files, the array peel changed the name in 118 and
+    the map-value leg found an application in 10. In 4 the application had no arena type at
+    all, being an application over the enclosing declaration's own parameter (`I<U>[]`). The
+    blocker is the instance registry keyed by spelling, not this walk.
+  - Left, re-probed after D7 and D8: the four grammar predicates answered true in as many
+    files as before (`nameIsNulString` 231, `nameIsNulBool` 65, `nulLitUnionScan` 121, and
+    `nameIsStrLitSet` 266). The callers that reach their true arms are unchanged.
   - Converted, no parse retired: every caller of the niche ladders and the name-grammar tests
     that holds a type. A probe compared the name and type answers at each converted site, over
     the self-compile and 16,880 files. 11,957 of the files compile, and a file the compiler
