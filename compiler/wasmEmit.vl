@@ -2488,7 +2488,7 @@ function emitCloCellRef(body: u8[], fe: i32, fnIx: i32) {
 // recovers at its own use site instead.
 function emitCapturedReadRecover(fe: i32, name: string) {
   if captureValKind(fe, name) == "nulstr" {
-    if !nulStrReadStaysRaw() { fbRefAsNonNull() }
+    if !nulStrReadStaysRaw(expCtxCur) { fbRefAsNonNull() }
   }
   0
 }
@@ -11088,7 +11088,7 @@ function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32): i32 {
     // needs `ref.is_null`, and a nullable-string target, where recovering would `ref.as_non_null`
     // a legitimately-null value and trap. A `boolean | null` field needs no recovery at all.
     if sFieldTypeAt(si, idx) == FC_NUL_STR {
-      if !nulStrReadStaysRaw() { fbRefAsNonNull() }
+      if !nulStrReadStaysRaw(expCtxCur) { fbRefAsNonNull() }
     }
     // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
     // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
@@ -11261,11 +11261,11 @@ function spreadBackIdx(k: MfKind, row: i32) {
 // `array.new_fixed`'s length is a compile-time constant. Every item group — a spread's
 // source, or a run of plain elements as its own literal — is evaluated in source order into
 // its own frame slot; the destination is allocated once, and each group is one `array.copy`.
-function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
+function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32, ctx: ExpCtx) {
   const a = nodeAt(arrIx)
   if a is ArrayLit {
     const elems = a.arrElems
-    const boxRow = spreadBoxDestRow(elems, fnIx)
+    const boxRow = spreadBoxDestRow(elems, fnIx, ctx)
     if boxRow >= 0 { return emitArrSpreadBoxed(body, arrIx, boxRow, fnIx) }
     const boxSrc = spreadBoxingSource(arrIx, fnIx)
     if boxSrc >= 0 {
@@ -11281,7 +11281,7 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
     let kk = spreadDestKind(arrIx, fnIx)
     // A destination that threaded a wider scalar list (`const q: f64[] = [...ints]`) is
     // built at, since the literal is built at the type it flows into.
-    const pdk = spreadPendingScalar(expCtxCur.listKind)
+    const pdk = spreadPendingScalar(ctx.listKind)
     if (
       kk != null
       && pdk != null
@@ -11293,7 +11293,7 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
     // A `string[]` destination builds a literal-union atom source's strings (D2868).
     if (
       kk == "i32"
-      && expCtxCur.listKind == LBK_STR_LIST
+      && ctx.listKind == LBK_STR_LIST
       && spreadSourcesStrOrAtoms(elems, fnIx)
     ) {
       kk = "str"
@@ -11304,7 +11304,7 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
       )
     }
     const ownRow = spreadDestRow(elems, fnIx)
-    const row = spreadFreshDestRow(arrIx, kk, ownRow, fnIx)
+    const row = spreadFreshDestRow(arrIx, kk, ownRow, fnIx, ctx)
     const wrap = spreadWrapIdx(kk, row)
     const back = spreadBackIdx(kk, row)
     if wrap < 0 || back < 0 {
@@ -11376,12 +11376,18 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
 // The ref-list row spread literal `arrIx` of kind `kk` builds at: the threaded destination's
 // row, else the literal's own typed element's, when every source of another row is itself a
 // list literal, built there as any literal is (D4871); else `own`, the first source's.
-function spreadFreshDestRow(arrIx: i32, kk: MfKind, own: i32, fnIx: i32): i32 {
+function spreadFreshDestRow(
+  arrIx: i32,
+  kk: MfKind,
+  own: i32,
+  fnIx: i32,
+  ctx: ExpCtx,
+): i32 {
   const a = nodeAt(arrIx)
   if kk != "ref" || !(a is ArrayLit) { return own }
   let want = spreadLitElemRow(arrIx)
-  if expCtxCur.listKind == LBK_REF || expCtxCur.listKind == LBK_REF_AT_SLOT {
-    want = expCtxCur.listSlot
+  if ctx.listKind == LBK_REF || ctx.listKind == LBK_REF_AT_SLOT {
+    want = ctx.listSlot
   }
   if want == own || want < 0 || want >= rlElemName.length { return own }
   const elems = a.arrElems
@@ -11460,15 +11466,15 @@ function spreadJoinGroups(
 // (`const q: (i32 | null)[] = [...ints]`, or the row an outer literal, `push` or cell write
 // names as `LBK_REF_AT_SLOT`) and some spread source is another list, whose elements are then
 // each boxed; -1 otherwise, including when nothing threaded (D2869, D2883).
-function spreadBoxDestRow(elems: i32[], fnIx: i32): i32 {
+function spreadBoxDestRow(elems: i32[], fnIx: i32, ctx: ExpCtx): i32 {
   if (
-    expCtxCur.listKind != LBK_UNION
-    && expCtxCur.listKind != LBK_REF_AT_SLOT
-    && expCtxCur.listKind != LBK_REF
+    ctx.listKind != LBK_UNION
+    && ctx.listKind != LBK_REF_AT_SLOT
+    && ctx.listKind != LBK_REF
   ) {
     return -1
   }
-  const row = expCtxCur.listSlot
+  const row = ctx.listSlot
   if row < 0 || row >= rlElemKindTbl.length || row >= rlElemName.length {
     return -1
   }
@@ -11663,7 +11669,7 @@ function arrLitHoldsNulStr(elems: i32[], fnIx: i32): boolean {
 // context is restored on every exit.
 function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
   const saved = expCtxHere()
-  expCtxLeave(saved, emitArrUnder(body, arrIx, fnIx))
+  expCtxLeave(saved, emitArrUnder(body, arrIx, fnIx, expCtxCur))
 }
 
 // The packed `u8[]` arm of `emitArrUnder`: each element as a plain i32 truncated into the
@@ -11895,20 +11901,26 @@ function emitArrStr(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
 // The ref-list arm of `emitArrUnder`: the element slot comes from a threaded annotation, else
 // element 0, and decides the backing, the wrapper and the context each element builds under.
 // Returns 0 once the list is on the stack, -1 on failure.
-function emitArrRef(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
+function emitArrRef(
+  body: u8[],
+  arrIx: i32,
+  elems: i32[],
+  fnIx: i32,
+  ctx: ExpCtx,
+) {
   if !rlUsed {
     return emitFail(
       "emitProgram: ref array literal but ref list type not collected",
     )
   }
   // The element type decides which (backing, wrapper) pair this literal builds. A binding or
-  // field site that threaded a ref-list annotation (`expCtxCur.listKind` 1 or 2, and
-  // `expCtxCur.listSlot` the element slot) is authoritative: its declared element type wins over
+  // field site that threaded a ref-list annotation (`ctx.listKind` 1 or 2, and
+  // `ctx.listSlot` the element slot) is authoritative: its declared element type wins over
   // the first-element field-shape guess. An un-annotated literal types itself from element 0.
-  const rslot = arrRefSlotOf(arrIx, elems, fnIx)
+  const rslot = arrRefSlotOf(arrIx, elems, fnIx, ctx)
   if rslot < 0 { return -1 }
   // A STRUCT-element list (kind 1, NOT a union box) types each element literal as the
-  // list's declared element struct — seed `expCtxCur.structIdx` (consumed by `emitObj`)
+  // list's declared element struct — seed `ctx.structIdx` (consumed by `emitObj`)
   // so a same-field-name sibling struct does not win the field-shape match. A union
   // list (kind 2) boxes by variant name and needs no struct hint.
   let elemStructIdx = -1
@@ -11916,7 +11928,7 @@ function emitArrRef(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
   if rlElemKindTbl[rslot] == RLK_STRUCT {
     // A nullable-struct element list (`(P | null)[]`): the struct row comes off the arena, so
     // an object element builds `P` and a `null` element gets `ref.null $P` from the seeded
-    // `expCtxCur.structIdx`.
+    // `ctx.structIdx`.
     elemStructIdx = rlElemLitStructRow(rslot)
     // A concrete-VARIANT element list (`Cat[]`): no `sNames` entry, so seed the VARIANT
     // index instead, read off the slot's element type with any `| null` peeled.
@@ -11942,7 +11954,7 @@ function emitArrRef(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
   }
   // A nested LIST element kind (`i32[][]` 4 / `string[][]` 6 / `f64[][]` 7 / `i64[][]` 8):
   // the elements ARE arrays. Kind 4 builds the default i32-list; 6/7/8 seed the inner list
-  // kind (`expCtxCur.listKind` 3 string / 4 f64 / 6 i64) so a bare `["a"]` / `[1.0]` / `[1,2]`
+  // kind (`ctx.listKind` 3 string / 4 f64 / 6 i64) so a bare `["a"]` / `[1.0]` / `[1,2]`
   // element builds the right list, not the default i32-list.
   const elemNest = rlElemKindTbl[rslot]
   let dstRef = -1
@@ -12038,9 +12050,9 @@ function emitArrRef(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
 
 // `emitArrRef`'s ref-list slot: a threaded ref-list annotation's slot, else element 0's, else
 // slot 0 when the literal names none. -1 when no element type is interned at all.
-function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32) {
-  const annKind = expCtxCur.listKind
-  const annSlot = expCtxCur.listSlot
+function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32, ctx: ExpCtx) {
+  const annKind = ctx.listKind
+  const annSlot = ctx.listSlot
   let rslot = 0
   if (
     annKind == LBK_REF
@@ -12242,11 +12254,11 @@ function emitArrI32(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
 
 // `emitArr`'s body: it applies each arm's element context and leaves it for the wrapper's
 // exit to undo.
-function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
+function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32, ctx: ExpCtx) {
   const a = nodeAt(arrIx)
   if a is ArrayLit {
     const elems = a.arrElems
-    if hasSpreadItem(elems) { return emitArrSpread(body, arrIx, fnIx) }
+    if hasSpreadItem(elems) { return emitArrSpread(body, arrIx, fnIx, ctx) }
     if monoIsClashLit(arrIx) {
       return emitFailAt(
         "emitProgram: a list literal around a generic call whose `??` default is a list of "
@@ -12257,17 +12269,17 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
     }
     // An empty `[]` no destination threaded a kind to builds at the element type the checker
     // pinned on the literal itself — a join arm's sibling, a return's witness (D2209).
-    if elems.length == 0 && expCtxCur.listKind == LBK_I32_LIST {
+    if elems.length == 0 && ctx.listKind == LBK_I32_LIST {
       const hbk = emptyArrHoleBuildKind(arrIx)
       if hbk != LBK_I32_LIST {
         const hc = expCtxHere()
         hc.listKind = hbk
         hc.listSlot = emptyArrHoleBuildSlot(arrIx)
         expCtxApply(hc)
-        return emitArrUnder(body, arrIx, fnIx)
+        return emitArrUnder(body, arrIx, fnIx, ctx)
       }
     }
-    // Which (backing, wrapper) pair the literal builds — `expCtxCur.listKind` 1/2 a ref backing, 3 a
+    // Which (backing, wrapper) pair the literal builds — `ctx.listKind` 1/2 a ref backing, 3 a
     // string one, 4 f64, 6 i64, 7 f32, anything else the default `$lTypeIdx` i32 list. Two signals
     // answer it: the literal's own elements (`arrLitIs*`) and a threaded annotation from the
     // binding, field or param. A threaded kind is authoritative and clears what it displaces.
@@ -12281,19 +12293,19 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
     // elements, and a `.` literal is deliberately not one — so an annotation remains the only
     // route to `[1.5]` as an f32 list.
     let isF32Lit = arrLitIsF32(arrIx, fnIx)
-    if expCtxCur.listKind == LBK_I64_LIST {
+    if ctx.listKind == LBK_I64_LIST {
       isI64Lit = true
       isF64Lit = false
       isStrLit = false
       isF32Lit = false
     }
-    if expCtxCur.listKind == LBK_F64_LIST {
+    if ctx.listKind == LBK_F64_LIST {
       isF64Lit = true
       isI64Lit = false
       isStrLit = false
       isF32Lit = false
     }
-    if expCtxCur.listKind == LBK_F32_LIST {
+    if ctx.listKind == LBK_F32_LIST {
       isF32Lit = true
       isF64Lit = false
       isI64Lit = false
@@ -12302,33 +12314,33 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
     // A string list under a threaded `null` seed is the `(string | null)[]` niche, whose first
     // element may be a `null` the element probe cannot classify: a literal that records no type
     // of its own, as the run a variadic `.push` appends, has only the threaded kind (D4553).
-    if expCtxCur.listKind == LBK_STR_LIST && expCtxCur.nulString && !isRefLit {
+    if ctx.listKind == LBK_STR_LIST && ctx.nulString && !isRefLit {
       isStrLit = true
       isF64Lit = false
       isI64Lit = false
       isF32Lit = false
     }
     if elems.length == 0 {
-      if expCtxCur.listKind == LBK_STR_LIST {
+      if ctx.listKind == LBK_STR_LIST {
         isStrLit = true
-      } else if expCtxCur.listKind == LBK_F64_LIST {
+      } else if ctx.listKind == LBK_F64_LIST {
         isF64Lit = true
-      } else if expCtxCur.listKind == LBK_I64_LIST {
+      } else if ctx.listKind == LBK_I64_LIST {
         isI64Lit = true
-      } else if expCtxCur.listKind == LBK_F32_LIST {
+      } else if ctx.listKind == LBK_F32_LIST {
         isF32Lit = true
-      } else if expCtxCur.listKind == LBK_NUL_BOOL_LIST {
+      } else if ctx.listKind == LBK_NUL_BOOL_LIST {
         // A `(boolean | null)[]` empty literal — a plain i32-list wrapper (the boolean
         // sentinel niche shares the i32 backing); nothing to force here.
       } else {
-        if expCtxCur.listKind != LBK_I32_LIST { isRefLit = true }
+        if ctx.listKind != LBK_I32_LIST { isRefLit = true }
       }
     }
     // A non-empty literal under a threaded union-list annotation (kind 2) is a ref literal even
     // when its elements are bare scalars or strings: a `(string|i32)[]` literal's elements coerce
     // into the union box at the write boundary, they do not type the list. Without the annotation
     // a scalar literal stays the i32 list.
-    if expCtxCur.listKind == LBK_UNION {
+    if ctx.listKind == LBK_UNION {
       isRefLit = true
       isStrLit = false
       isF64Lit = false
@@ -12342,7 +12354,7 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
     // bare idents, so `arrLitIsRef` — which keys off an objlit or nested-array first element —
     // misses it, and the threaded annotation is authoritative. `isI64Lit` clears too, or a
     // ref-list value with an i64-magnitude first element would build the scalar i64 wrapper.
-    if expCtxCur.listKind == LBK_REF_AT_SLOT {
+    if ctx.listKind == LBK_REF_AT_SLOT {
       isRefLit = true
       isStrLit = false
       isF64Lit = false
@@ -12353,18 +12365,18 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
     // Matters for a NULLABLE-struct array (`(P | null)[]`) whose FIRST element is `null` —
     // `arrLitIsRef` keys off the first element (a `null` is neither objlit nor nested array)
     // and would otherwise mis-route the literal to the i32-list path.
-    if expCtxCur.listKind == LBK_REF {
+    if ctx.listKind == LBK_REF {
       isRefLit = true
       isStrLit = false
       isF64Lit = false
       isI64Lit = false
       isF32Lit = false
     }
-    // An ATOM-element literal under a threaded atom context (`expCtxCur.litUnion` — a `K[]`
+    // An ATOM-element literal under a threaded atom context (`ctx.litUnion` — a `K[]`
     // field / binding): the member elements are STRING exprs syntactically (`arrLitIsStr`
     // would claim the string-list build), but each lowers as its interned i32 atom id —
     // the i32-list path is authoritative, like the kind overrides above.
-    if expCtxCur.litUnion == 1 {
+    if ctx.litUnion == 1 {
       isRefLit = false
       isStrLit = false
       isF64Lit = false
@@ -12376,8 +12388,8 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
     // i32-list path is authoritative over `arrLitIsStr`'s string-literal claim. The element seeds
     // are set further below.
     if (
-      expCtxCur.listKind == LBK_NUL_LIT_UNION_LIST
-      || (nodeArrayElemIsNulLitUnion(arrIx) && expCtxCur.listKind != LBK_UNION)
+      ctx.listKind == LBK_NUL_LIT_UNION_LIST
+      || (nodeArrayElemIsNulLitUnion(arrIx) && ctx.listKind != LBK_UNION)
     ) {
       isRefLit = false
       isStrLit = false
@@ -12385,7 +12397,7 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
       isI64Lit = false
       isF32Lit = false
     }
-    // A `u8[]` literal (`expCtxCur.listKind == 10`) — the packed byte list. Checked ahead of every
+    // A `u8[]` literal (`ctx.listKind == 10`) — the packed byte list. Checked ahead of every
     // scalar arm below and returning directly, because the elements are ordinary i32 expressions:
     // nothing about the literal itself says `u8`, only the threaded annotation does. Each element
     // is emitted as a plain i32 and `array.new_fixed` truncates it into the packed byte.
@@ -12394,17 +12406,14 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
     // Its three siblings each get an arm above (4 f64, 6 i64, 7 f32) that flips the literal's
     // element flag; without one, the literal falls to the default i32 backing while the cell is
     // typed as the packed wrapper — two heap types for one value (D983). `coerceListKind` maps it.
-    if (
-      expCtxCur.listKind == LBK_U8_LIST
-      || expCtxCur.listKind == LBK_NUL_U8_LIST
-    ) {
+    if (ctx.listKind == LBK_U8_LIST || ctx.listKind == LBK_NUL_U8_LIST) {
       return emitArrU8(body, elems, fnIx)
     }
     if isF32Lit { return emitArrF32(body, elems, fnIx) }
     if isF64Lit { return emitArrF64(body, arrIx, elems, fnIx) }
     if isI64Lit { return emitArrI64(body, elems, fnIx) }
     if isStrLit { return emitArrStr(body, arrIx, elems, fnIx) }
-    if isRefLit { return emitArrRef(body, arrIx, elems, fnIx) }
+    if isRefLit { return emitArrRef(body, arrIx, elems, fnIx, ctx) }
     return emitArrI32(body, arrIx, elems, fnIx)
   }
   emitFail("emitProgram: expected an array literal")
@@ -16071,14 +16080,14 @@ function loopHoistClose(n: i32) {
   0
 }
 
-function emitIndex(body: u8[], idxIx: i32, fnIx: i32) {
+function emitIndex(body: u8[], idxIx: i32, fnIx: i32, ctx: ExpCtx) {
   const nd = nodeAt(idxIx)
   // A list literal read in place (`[x, null][0]`) builds from its own elements: the seeds a
   // destination threaded are for the element read out, not for the literal.
   if nd is Index {
     if (
       nodeAt(unwrapParen(nd.idxArr)) is ArrayLit
-      && expCtxCur.listKind != LBK_I32_LIST
+      && ctx.listKind != LBK_I32_LIST
     ) {
       const savedBuild = expCtxSwapListBuild(LBK_I32_LIST, 0)
       const r = emitIndexGo(body, idxIx, fnIx)
@@ -16496,8 +16505,8 @@ function emitStrConcat(body: u8[], binIx: i32, fnIx: i32) {
     // the shared `__str_concat__` helper — the allocate+copy core lives once per
     // module (`emitStrConcatFnCode`). A literal-union atom operand widens to its
     // member string (`emitStrValue`) before the call.
-    if emitStrCatOperand(body, e.binLeft, fnIx) < 0 { return -1 }
-    if emitStrCatOperand(body, e.binRight, fnIx) < 0 { return -1 }
+    if emitStrCatOperand(body, e.binLeft, fnIx, expCtxCur) < 0 { return -1 }
+    if emitStrCatOperand(body, e.binRight, fnIx, expCtxCur) < 0 { return -1 }
     fbCall(gHelpStrConcat)
     return 0
   }
@@ -16547,7 +16556,7 @@ function emitStrCatN(body: u8[], parts: i32[], fnIx: i32) {
   const n = parts.length
   let i = 0
   while i < n {
-    if emitStrCatOperand(body, parts[i], fnIx) < 0 { return -1 }
+    if emitStrCatOperand(body, parts[i], fnIx, expCtxCur) < 0 { return -1 }
     i = i + 1
   }
   let j = n - 1
@@ -17010,7 +17019,7 @@ function emitStrSiteCat(
   const n = parts.length
   let i = 0
   while i < n {
-    if emitStrCatOperand(body, parts[i], fnIx) < 0 { return -1 }
+    if emitStrCatOperand(body, parts[i], fnIx, expCtxCur) < 0 { return -1 }
     i = i + 1
   }
   let j = n - 1
@@ -17305,7 +17314,7 @@ function emitStrAccAppend(body: u8[], binIx: i32, fnIx: i32) {
       const n = parts.length
       let i = 1
       while i < n {
-        if emitStrCatOperand(body, parts[i], fnIx) < 0 { return -1 }
+        if emitStrCatOperand(body, parts[i], fnIx, expCtxCur) < 0 { return -1 }
         i = i + 1
       }
       let j = n - 1
@@ -19820,11 +19829,13 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
       return emitMapRetag(body, exprIx, rtFrom, rtTo, wtFrom, wtTo, fnIx)
     }
   }
+  // The context the nearest enclosing boundary applied, handed to every consumer below.
+  const ctx = expCtxCur
   // A string-repped literal union reaching an atom-typed destination narrows to its
-  // interned id here — one hook rather than one per destination, since `expCtxCur.litUnion`
+  // interned id here — one hook rather than one per destination, since `ctx.litUnion`
   // is already the context every atom-typed slot seeds. Without it the store is a
   // `local.set` of a `(ref $array)` into an `i32` slot: invalid wasm at every such destination.
-  if expCtxCur.litUnion == 1 {
+  if ctx.litUnion == 1 {
     // A read of a `const` bound to a literal is that literal, whose id needs no conversion.
     const wideIx = unwrapParen(exprIx)
     if nodeHasWideStrLit(wideIx) {
@@ -19847,12 +19858,12 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   }
   // …and its nullable twin: a `K | null` place held as a nullable string reaches the niche as
   // `-1` or the present string's id (D5431).
-  if expCtxCur.nulLitUnion && nulStrReppedNulLitPlace(exprIx, fnIx) {
+  if ctx.nulLitUnion && nulStrReppedNulLitPlace(exprIx, fnIx) {
     return emitNulStrToNulAtom(body, unwrapParen(exprIx), fnIx)
   }
   // …and a `K | null` read out of a wider box, reaching the atom niche (D3118), a hole's or an
   // instance's read at the type its calls pin.
-  if expCtxCur.nulLitUnion {
+  if ctx.nulLitUnion {
     const nlk = narrowedNulLitPinBoxKey(exprIx, fnIx)
     if nlk != "" {
       return emitNarrowedNicheRead(body, exprIx, nlk, NICHE_NUL_LIT, fnIx)
@@ -19862,20 +19873,20 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   if e is Index && exprIx != idxSpanNode && idxSpanOn() {
     return emitIndexBanked(body, exprIx, fnIx)
   }
-  if e is NumLit { return emitNumLitNode(body, e, exprIx, fnIx) }
+  if e is NumLit { return emitNumLitNode(body, e, exprIx, fnIx, ctx) }
   if e is BoolLit {
     // `boolean` rides in an i32: true=1, false=0 (already decoded into `boolVal`).
     fbI32Const(e.boolVal)
     return 0
   }
   if e is CharLit { return emitCharLitNode(body, e, exprIx, fnIx) }
-  if e is Ident { return emitIdentNode(body, e, exprIx, fnIx) }
+  if e is Ident { return emitIdentNode(body, e, exprIx, fnIx, ctx) }
   if e is Paren { return emitExpr(body, e.parInner, fnIx) }
   if (
     (e is Member || e is Index || callIsMethodAt(exprIx))
     && exprIsNulNone(exprIx, fnIx)
   ) {
-    return emitNulNoneRead(body, exprIx, fnIx)
+    return emitNulNoneRead(body, exprIx, fnIx, ctx)
   }
   if e is Member || e is Index {
     const pnk = placeNicheAtomKind(exprIx, fnIx)
@@ -19889,15 +19900,15 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
       )
     }
   }
-  if e is Unary { return emitUnaryNode(body, e, exprIx, fnIx) }
+  if e is Unary { return emitUnaryNode(body, e, exprIx, fnIx, ctx) }
   if e is AsExpr { return emitAsCast(body, e, exprIx, fnIx) }
   if e is Call { return emitCallNode(body, e, exprIx, fnIx) }
   if e is IsExpr { return emitIs(body, exprIx, fnIx) }
-  if e is NullLit { return emitNullLitNode(body, e, exprIx, fnIx) }
-  if e is ObjLit { return emitObjLitNode(body, e, exprIx, fnIx) }
+  if e is NullLit { return emitNullLitNode(body, e, exprIx, fnIx, ctx) }
+  if e is ObjLit { return emitObjLitNode(body, e, exprIx, fnIx, ctx) }
   if e is StrLit {
-    // A literal-union MEMBER in atom context (`expCtxCur.litUnion`) lowers as its interned i32 id.
-    if expCtxCur.litUnion == 1 {
+    // A literal-union MEMBER in atom context (`ctx.litUnion`) lowers as its interned i32 id.
+    if ctx.litUnion == 1 {
       fbI32Rel(RS_ATOM, internAtom(e.strText))
       return 0
     }
@@ -19922,7 +19933,7 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
       if emitMapGet(body, e.idxArr, e.idxIndex, fnIx) < 0 { return -1 }
       return emitNarrowedMapReadTail(exprIx, fnIx)
     }
-    return emitIndex(body, exprIx, fnIx)
+    return emitIndex(body, exprIx, fnIx, ctx)
   }
   if e is Member { return emitMemberNode(body, e, exprIx, fnIx) }
   // A STANDALONE `?.` (one no enclosing `?? d` / null-test pattern consumed) yields its
@@ -20084,7 +20095,7 @@ function armPreludeScopeOpen(ifIx: i32): boolean {
 // bare `null` there takes, so no arm can pick a blocktype for it (D2227).
 function emitAllNullIf(body: u8[], ifIx: i32, fnIx: i32) {
   if emitIfForEffect(body, unwrapParen(ifIx), fnIx) < 0 { return -1 }
-  emitNullBySeed(fnIx, true)
+  emitNullBySeed(fnIx, true, expCtxCur)
 }
 
 // Whether node `ix` is a method call `recv.m(…)`.
@@ -20097,7 +20108,7 @@ function callIsMethodAt(ix: i32): boolean {
 // A field, element or map read, or a `null[]`'s `pop`/`get`, whose type is the `null` unit type:
 // the read runs in its own stored rep with the destination's null seeds lifted, is dropped, and
 // the value is the `null` the destination seeded, as an ident read of a `null` binding is (D4671).
-function emitNulNoneRead(body: u8[], exprIx: i32, fnIx: i32) {
+function emitNulNoneRead(body: u8[], exprIx: i32, fnIx: i32, ctx: ExpCtx) {
   const outer = expCtxHere()
   const raw = expCtxHere()
   raw.structIdx = -1
@@ -20119,7 +20130,7 @@ function emitNulNoneRead(body: u8[], exprIx: i32, fnIx: i32) {
     if exprMap(e.idxArr, fnIx) {
       rc = emitMapGet(body, e.idxArr, e.idxIndex, fnIx)
     } else {
-      rc = emitIndex(body, exprIx, fnIx)
+      rc = emitIndex(body, exprIx, fnIx, ctx)
     }
   } else if e is Call {
     rc = emitCallNode(body, e, exprIx, fnIx)
@@ -20127,7 +20138,7 @@ function emitNulNoneRead(body: u8[], exprIx: i32, fnIx: i32) {
   expCtxApply(outer)
   if rc < 0 { return -1 }
   fbDrop()
-  emitNullBySeed(fnIx, true)
+  emitNullBySeed(fnIx, true, ctx)
 }
 
 // Lower a ref-typed if-expression join (string / struct / array) as a value-typed `if`
@@ -20344,7 +20355,7 @@ function emitIfArmClose(rc: i32) {
     armNarrowTops.pop()
   }
   if armSeedCtxs.length > 0 {
-    armSeedRestore(armSeedCtxs[armSeedCtxs.length - 1])
+    armSeedRestore(armSeedCtxs[armSeedCtxs.length - 1], expCtxCur)
     armSeedCtxs.pop()
   }
   rc
@@ -20360,9 +20371,9 @@ const armSeedCtxs: ExpCtx[] = []
 
 // Put back the list build the arm opened under, and a record seed the arm set and left
 // unconsumed; a record seed the arm consumed stays consumed.
-function armSeedRestore(at: ExpCtx) {
+function armSeedRestore(at: ExpCtx, ctx: ExpCtx) {
   expCtxSetListBuild(at.listKind, at.listSlot)
-  if expCtxCur.structIdx >= 0 && expCtxCur.structIdx != at.structIdx {
+  if ctx.structIdx >= 0 && ctx.structIdx != at.structIdx {
     expCtxSetStruct(at.structIdx)
   }
   0
@@ -33821,9 +33832,9 @@ export type ExpCtx = {
   litUnion: i32,        // a member StrLit lowers as its atom id
 }
 
-// The context every expression emit reads, private to this module: one record, written in
-// place only by `expCtxApply` and `expCtxReset`, so a reader holding it sees the live seeds.
-let expCtxCur: ExpCtx = expCtxDefault()
+// The live context, private to this module: one record, never replaced and written in place only
+// by `expCtxApply`. `emitExpr` hands it to the consumers, so a held `ctx` sees the live seeds.
+const expCtxCur: ExpCtx = expCtxDefault()
 
 // The context no destination has seeded: every field at its inert value.
 function expCtxDefault(): ExpCtx {
@@ -33852,7 +33863,7 @@ function expCtxDefault(): ExpCtx {
 // Whether a `string | null` read stays the raw nullable ref rather than recovering with
 // `ref.as_non_null`: under a null test (`rawNullRead`) or a nullable-string target
 // (`nulString`), where recovering would trap. The reads and the `??` block type both ask it.
-function nulStrReadStaysRaw() { expCtxCur.rawNullRead || expCtxCur.nulString }
+function nulStrReadStaysRaw(ctx: ExpCtx) { ctx.rawNullRead || ctx.nulString }
 
 // A copy of the current context — the BASE every site starts from (exact ambient
 // semantics), overriding only the fields it knows.
@@ -33957,7 +33968,7 @@ export function expCtxApply(c: ExpCtx) {
 // Puts the current context back to its default, the first thing a compile does: an earlier
 // compile that stopped on a failure path may have left a seed set.
 export function expCtxReset() {
-  expCtxCur = expCtxDefault()
+  expCtxApply(expCtxDefault())
   0
 }
 
@@ -34607,19 +34618,19 @@ function emitStrValue(body: u8[], ix: i32, fnIx: i32) {
 // A concatenation operand: a string VALUE even when the destination the whole chain feeds is
 // `string | null`, so that target's raw-read seed must not reach it, or a narrowed nullable
 // reads as `(ref null)` into a non-null slot (D2682).
-function emitStrCatOperand(body: u8[], ix: i32, fnIx: i32) {
-  if expCtxCur.nulString || expCtxCur.rawNullRead {
-    const ctx = expCtxHere()
-    ctx.nulString = false
-    ctx.rawNullRead = false
+function emitStrCatOperand(body: u8[], ix: i32, fnIx: i32, ctx: ExpCtx) {
+  if ctx.nulString || ctx.rawNullRead {
+    const opCtx = expCtxHere()
+    opCtx.nulString = false
+    opCtx.rawNullRead = false
     if exprIsLitAtom(ix, fnIx) {
       const saved = expCtxHere()
-      expCtxApply(ctx)
+      expCtxApply(opCtx)
       const ra = emitAtomToStr(body, ix, fnIx)
       expCtxApply(saved)
       return ra
     }
-    return emitExprExpect(body, ix, fnIx, ctx)
+    return emitExprExpect(body, ix, fnIx, opCtx)
   }
   emitStrValue(body, ix, fnIx)
 }
@@ -34932,13 +34943,19 @@ function eqAtomOperandOk(ix: i32, fnIx: i32) {
   nodeTyIsLitUnion(av)
 }
 
-function emitNumLitNode(_body: u8[], e: NumLit, exprIx: i32, fnIx: i32) {
-  // A FLOAT literal (lexeme carries a `.`) in f32 CONTEXT (`expCtxCur.wantF32` — an `: f32`
+function emitNumLitNode(
+  _body: u8[],
+  e: NumLit,
+  exprIx: i32,
+  fnIx: i32,
+  ctx: ExpCtx,
+) {
+  // A FLOAT literal (lexeme carries a `.`) in f32 CONTEXT (`ctx.wantF32` — an `: f32`
   // binding/param/return) lowers as `f32.const`. Checked before the default f64 path
   // so a float literal re-encodes at single precision in an f32 slot (never demoted
   // from f64). Outside f32 context a `.` literal stays f64, unchanged. (Slice 5.)
   if numLexIsFloat(e.numText) {
-    if expCtxCur.wantF32 {
+    if ctx.wantF32 {
       fbF32Const(e.numText)
       return 0
     }
@@ -34948,21 +34965,21 @@ function emitNumLitNode(_body: u8[], e: NumLit, exprIx: i32, fnIx: i32) {
   // An integer literal in f32 CONTEXT lowers DIRECTLY as `f32.const` (re-encoded at
   // single precision — `f32Bytes` parses an integer lexeme as `mant/10^0`), so it is a
   // valid constexpr in a const-global init (a convert op is not). (Slice 5.)
-  if expCtxCur.wantF32 {
+  if ctx.wantF32 {
     fbF32Const(e.numText)
     return 0
   }
   // An integer literal in f64 CONTEXT (const-global init) lowers directly as
   // `f64.const`, keeping the global init a constexpr (`const b: f64 = 5`). (Slice 5.)
-  if expCtxCur.wantF64 {
+  if ctx.wantF64 {
     fbF64Const(e.numText)
     return 0
   }
-  // An integer literal in i64 CONTEXT (`expCtxCur.wantI64`) lowers as `i64.const` over the
+  // An integer literal in i64 CONTEXT (`ctx.wantI64`) lowers as `i64.const` over the
   // 64-bit (hi, lo) pair parsed from its lexeme — so a value past the i32 range
   // (`9000000000`, `0xFFFFFFFFFF`) survives. Otherwise the default i32 path is
   // unchanged (bare integer literals stay i32 — Slice 1 invariant).
-  if expCtxCur.wantI64 {
+  if ctx.wantI64 {
     const pr = parseI64Pair(e.numText)
     fbI64Const(pr[0], pr[1])
     return 0
@@ -35011,10 +35028,10 @@ function emitCharLitNode(_body: u8[], e: CharLit, _exprIx: i32, _fnIx: i32) {
 // identifier read and a substituted parameter default. A kind-16 `string | null` cell is
 // always a nullable ref; a non-const ref cell is start-initialised, so it is nullable in
 // wasm and recovered unless its kind legitimately holds null or is not a ref at all.
-function emitGlobalReadRecover(isid: i32) {
+function emitGlobalReadRecover(isid: i32, ctx: ExpCtx) {
   const gck0 = globalCellKind(globalLetOfSid(isid))
   if gck0 == "nulstr" {
-    if !nulStrReadStaysRaw() { fbRefAsNonNull() }
+    if !nulStrReadStaysRaw(ctx) { fbRefAsNonNull() }
     return 0
   }
   if !globalNameIsNonConstSid(isid) { return 0 }
@@ -35041,13 +35058,19 @@ function emitGlobalReadRecover(isid: i32) {
 // through seven name-keyed lookups here, each otherwise a hash plus a string probe. The
 // arena index `_exprIx`, already threaded in and unused, turns the id lookup and the
 // other six into array reads.
-function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
+function emitIdentNode(
+  body: u8[],
+  e: Ident,
+  exprIx: i32,
+  fnIx: i32,
+  ctx: ExpCtx,
+) {
   // D1576 — a read of a never-filled `let x = null` is the value `null`, so it takes the
   // destination's null rep from the same table a bare `null` literal does. With no seed
   // the read is `ref.null none` (`nulNoneOk`'s last resort), the GC bottom and a subtype
   // of every nullable ref cell.
   if identCellVKind(exprIx, fnIx) == "nulnone" {
-    return emitNullBySeed(fnIx, true)
+    return emitNullBySeed(fnIx, true, ctx)
   }
   // An `is K[]` arm's read of an empty list of another element (D4911), ahead of the narrowed
   // unboxes, which would cast the receiver's own list to `K[]`.
@@ -35077,7 +35100,7 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
     if dgIdx >= 0 {
       if emitUserGlobalGet(dgIdx) < 0 { return -1 }
       // the same recovery the argument spelling of this read gets (D3510)
-      emitGlobalReadRecover(isid)
+      emitGlobalReadRecover(isid, ctx)
       return 0
     }
   }
@@ -35152,8 +35175,8 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   if emitCapturedRead(body, e.identName, fnIx, true) == 1 { return 0 }
   // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
   const idx = localIndexOf(fnIx, e.identName)
-  if idx < 0 { return emitIdentNonLocalRead(body, e, isid, exprIx, fnIx) }
-  emitIdentLocalRead(e, idx, fnIx)
+  if idx < 0 { return emitIdentNonLocalRead(body, e, isid, exprIx, fnIx, ctx) }
+  emitIdentLocalRead(e, idx, fnIx, ctx)
 }
 
 // Whether a narrowed read of `name` finds the union box it unboxes: a binding of this frame
@@ -35178,6 +35201,7 @@ function emitIdentNonLocalRead(
   isid: i32,
   exprIx: i32,
   fnIx: i32,
+  ctx: ExpCtx,
 ) {
   // a bare top-level/lifted function name in value position constructs a function
   // value (closure fat-pointer): `fnIndexOf` is the function index `emitClosureValue`
@@ -35215,7 +35239,7 @@ function emitIdentNonLocalRead(
   const gIdx = globalIndexOfSid(isid)
   if gIdx >= 0 {
     if emitUserGlobalGet(gIdx) < 0 { return -1 }
-    emitGlobalReadRecover(isid)
+    emitGlobalReadRecover(isid, ctx)
     return 0
   }
   return emitFail(
@@ -35224,7 +35248,7 @@ function emitIdentNonLocalRead(
 }
 
 // A read of `e` from its local `idx`, or an unrolled range variable's constant. Returns 0.
-function emitIdentLocalRead(e: Ident, idx: i32, fnIx: i32) {
+function emitIdentLocalRead(e: Ident, idx: i32, fnIx: i32, ctx: ExpCtx) {
   // A fully unrolled range loop's variable reads as its copy's constant.
   const urAt = unrolledSlotAt(idx)
   if urAt >= 0 {
@@ -35242,7 +35266,7 @@ function emitIdentLocalRead(e: Ident, idx: i32, fnIx: i32) {
   fbLocalGet(idx)
   // The `string | null` (kind 16) read rule for a param/local — stated at `emitMem`'s
   // field read. Mirrors the kind-15 list read, which never eagerly recovers.
-  if !nulStrReadStaysRaw() {
+  if !nulStrReadStaysRaw(ctx) {
     if paramNulString(fnIx, e.identName) || declaredNulString(e.identName) {
       fbRefAsNonNull() // 0xd4
     }
@@ -35250,7 +35274,13 @@ function emitIdentLocalRead(e: Ident, idx: i32, fnIx: i32) {
   return 0
 }
 
-function emitUnaryNode(body: u8[], e: Unary, exprIx: i32, fnIx: i32) {
+function emitUnaryNode(
+  body: u8[],
+  e: Unary,
+  exprIx: i32,
+  fnIx: i32,
+  ctx: ExpCtx,
+) {
   // Logical not `!a`: a boolean rides in an i32 (0/1), so `i32.eqz` (0x45) maps
   // 0→1 and any non-zero→0 — exactly `a == 0`. Push the operand, then eqz.
   if e.unOp == "!" {
@@ -35342,9 +35372,9 @@ function emitUnaryNode(body: u8[], e: Unary, exprIx: i32, fnIx: i32) {
   // I32_MIN (`parseI32`'s reading, its own negation) rather than as an i64 negation below. A
   // wider const cell's init, or a chain the checker typed i64, is that width, and the fold
   // below serves it.
-  const negWide = expCtxCur.wantI64
-    || expCtxCur.wantF64
-    || expCtxCur.wantF32
+  const negWide = ctx.wantI64
+    || ctx.wantF64
+    || ctx.wantF32
     || nodeNumScalarBaseName(exprIx) == "i64"
   if negNode is NumLit && !negWide {
     if !numLexIsFloat(negNode.numText) {
@@ -35521,57 +35551,63 @@ function emitCallNode(body: u8[], e: Call, exprIx: i32, fnIx: i32) {
 // the null-rep table: a bare `null` takes the rep the enclosing position seeded (one
 // `ExpCtx` field per `X | null` boundary in this file, each mapped to its sentinel/heap
 // in the arms below). Order is load-bearing: the niche arms come first, or the struct seed would claim them.
-function emitNullLitNode(_body: u8[], _e: NullLit, _exprIx: i32, fnIx: i32) {
-  emitNullBySeed(fnIx, false)
+function emitNullLitNode(
+  _body: u8[],
+  _e: NullLit,
+  _exprIx: i32,
+  fnIx: i32,
+  ctx: ExpCtx,
+) {
+  emitNullBySeed(fnIx, false, ctx)
 }
 
 // The table above, asked of a value rather than a literal: `nulNoneOk` is the one caller
 // holding a value whose type is `null` (D1576), changing only the last resort — with no
 // seed, such a read is `ref.null none`. `expCtxCur.nulNone` reaches the same answer from a
 // boundary whose cell is `nulnone`.
-function emitNullBySeed(fnIx: i32, nulNoneOk: boolean) {
-  if expCtxCur.nulBool {
+function emitNullBySeed(fnIx: i32, nulNoneOk: boolean, ctx: ExpCtx) {
+  if ctx.nulBool {
     fbI32Const(2)
     return 0
   }
-  if expCtxCur.nulLitUnion {
+  if ctx.nulLitUnion {
     fbI32Const(-1)
     return 0
   }
-  if expCtxCur.nulString {
+  if ctx.nulString {
     fbRefNull(sTypeIdx)
     return 0
   }
-  if expCtxCur.nulClosure {
+  if ctx.nulClosure {
     fbRefNull(cloStructIdx)
     return 0
   }
-  if expCtxCur.nulList {
+  if ctx.nulList {
     fbRefNull(lTypeIdx)
     return 0
   }
   // Reset the seed after CONSUMING it, so it never persists past this `null` (a stray
   // non-(-1) value would mis-type a later bare `null`).
-  if expCtxCur.nulRefHeap >= 0 {
+  if ctx.nulRefHeap >= 0 {
     const nrh = expCtxTakeNulRefHeap()
     fbRefNull(nrh)
     return 0
   }
   // a bare `null` under a nullable-variant context: `ref.null $uVarHeap[vi]`, the variant
-  // twin of the `expCtxCur.structIdx` arm below. Persistent for the binding/return, since an
+  // twin of the `ctx.structIdx` arm below. Persistent for the binding/return, since an
   // implicit tail `null` reaches this node after the one-shot seed above is consumed.
-  if expCtxCur.variantIdx >= 0 {
-    if expCtxCur.variantIdx < uVarHeap.length {
-      fbRefNull(uVarHeap[expCtxCur.variantIdx])
+  if ctx.variantIdx >= 0 {
+    if ctx.variantIdx < uVarHeap.length {
+      fbRefNull(uVarHeap[ctx.variantIdx])
       return 0
     }
   }
   // A bare `null` VALUE: its target struct comes from the binding/argument/
-  // return seed (`expCtxCur.structIdx`) — `ref.null $S`. Ahead of the enclosing function's
+  // return seed (`ctx.structIdx`) — `ref.null $S`. Ahead of the enclosing function's
   // own return below, which a `const c: C | null = null` inside it does not name (D2564).
-  if expCtxCur.structIdx >= 0 {
-    if expCtxCur.structIdx < sHeapIdx.length {
-      fbRefNull(sHeapIdx[expCtxCur.structIdx])
+  if ctx.structIdx >= 0 {
+    if ctx.structIdx < sHeapIdx.length {
+      fbRefNull(sHeapIdx[ctx.structIdx])
       return 0
     }
   }
@@ -35614,19 +35650,25 @@ function emitNullBySeed(fnIx: i32, nulNoneOk: boolean) {
       }
     }
   }
-  if nulNoneOk || expCtxCur.nulNone {
+  if nulNoneOk || ctx.nulNone {
     fbRefNullNone()
     return 0
   }
   return emitFail("emitProgram: bare null needs a struct-typed context")
 }
 
-function emitObjLitNode(body: u8[], _e: ObjLit, exprIx: i32, fnIx: i32) {
+function emitObjLitNode(
+  body: u8[],
+  _e: ObjLit,
+  exprIx: i32,
+  fnIx: i32,
+  ctx: ExpCtx,
+) {
   // a context that expects a concrete variant constructs the bare variant struct, not a
-  // union box; `expCtxCur.variantIdx` is the variant, consumed so a nested literal doesn't
+  // union box; `ctx.variantIdx` is the variant, consumed so a nested literal doesn't
   // inherit the hint. Bounded, since the hint can be mis-paired — set from many sites,
   // some of which fall through to the struct table while the kind ladder said variant.
-  if expCtxCur.variantIdx >= 0 {
+  if ctx.variantIdx >= 0 {
     const pvi = expCtxTakeVariant()
     if pvi < uVariants.length {
       return emitVariantStruct(body, exprIx, pvi, fnIx)
@@ -37163,7 +37205,7 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   ) {
     return -1
   }
-  emitDirectCallTail(target, fnIx)
+  emitDirectCallTail(target, fnIx, expCtxCur)
 }
 
 // Does a direct call with `nArgs` operands pass more than callee `target` declares? False when
@@ -37616,7 +37658,7 @@ function directArgSeedsOf(target: i32, i: i32, ac: ExpCtx): DirectArgSeeds {
 
 // The `call` and what follows it, under the caller's restored context: the tail-call
 // cursor, a lifted callee's capture write-back, and the `nulnone` result's niche re-rep.
-function emitDirectCallTail(target: i32, fnIx: i32) {
+function emitDirectCallTail(target: i32, fnIx: i32, ctx: ExpCtx) {
   fbCall(gImports + target) // 0x10 call (imports occupy indices 0..gImports-1)
   // Arm the tail-call cursor: if this call is still the last thing written when the
   // enclosing `return` terminates, it is in tail position and `emitUnionRetSink`
@@ -37647,9 +37689,9 @@ function emitDirectCallTail(target: i32, fnIx: i32) {
   // the result unchanged; the two niche nullables do not (`boolean | null` is sentinel 2, `K |
   // null` is sentinel -1), and storing a ref into either is invalid wasm the checker cannot see. Re-derive the rep at the site from the same two seeds `emitNullLitNode` reads.
   if fnPosRetIsNulNone(target) {
-    if expCtxCur.nulBool || expCtxCur.nulLitUnion {
+    if ctx.nulBool || ctx.nulLitUnion {
       fbDrop()
-      if expCtxCur.nulBool { fbI32Const(2) } else { fbI32Const(0 - 1) }
+      if ctx.nulBool { fbI32Const(2) } else { fbI32Const(0 - 1) }
       tailCallIdx = -1
     }
   }
@@ -38116,7 +38158,7 @@ function emitArrayCopyIntr(body: u8[], callIx: i32, fnIx: i32) {
 // It asks `exprNullableString` of the `??` node itself, since the checker's banked type is
 // missing on a synthesized node (a chained `p ?? q ?? r` re-associates through `mkBinary`).
 function coalesceNulStrStaysNullable(exprIx: i32, fnIx: i32) {
-  nulStrReadStaysRaw() && exprNullableString(exprIx, fnIx)
+  nulStrReadStaysRaw(expCtxCur) && exprNullableString(exprIx, fnIx)
 }
 
 // The context one arm of a `string | null` `??` emits under: `raw` iff the arm's value may be
