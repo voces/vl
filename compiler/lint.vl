@@ -1722,7 +1722,7 @@ function byteAsCpVisit(ix: i32) {
 // Report each argument of call `n` to this module's function `name` that lands on a
 // code-point parameter; `shift` is 1 for a method call, whose receiver is parameter 0.
 function bacCpArgs(n: Call, name: string, shift: i32) {
-  const d = lintModFnDecl[name] ?? -1
+  const d = lintModFnDeclOf(name)
   if d < 0 || d >= P.nodes.length { return 0 }
   const fd = nodeAt(d)
   if fd is FuncDecl {
@@ -1987,7 +1987,7 @@ function vecModFnOf(fnIx: i32, shift: i32): i32 {
     if f is Member { name = f.memProp }
   }
   if name == "" || lintBindDecl(name) >= 0 { return -1 }
-  lintModFnDecl[name] ?? -1
+  lintModFnDeclOf(name)
 }
 
 // The element type list literal `ix` visibly has when every element is a float, else "".
@@ -2013,7 +2013,7 @@ function vecEnterFn(n: FuncDecl, ix: i32): i32 {
   const saved = vecFnRet
   vecFnRet = n.fnRet
   vecFnDecl = -1
-  if n.fnName != "" && (lintModFnDecl[n.fnName] ?? -1) == ix { vecFnDecl = ix }
+  if n.fnName != "" && lintModFnDeclOf(n.fnName) == ix { vecFnDecl = ix }
   vecInFn = true
   let tail = n.fnBody
   if tail >= 0 && tail < P.nodes.length {
@@ -2072,8 +2072,8 @@ function vecLetCandidate(ix: i32): string {
 
 // Classify one `Ident` occurrence against the binding it resolves to: a constant-index
 // read, or any other use.
-function vecNoteUse(ix: i32, name: string) {
-  const i = visHead[name] ?? -1
+function vecNoteUse(ix: i32, nid: i32) {
+  const i = lnHead[nid]
   if i < 0 { return 0 }
   const id = visIds[i]
   if id < 0 || !vecTy.has(id) { return 0 }
@@ -2147,9 +2147,9 @@ function vecNoteCallLet(ix: i32, id: i32) {
 }
 
 // A module function's name read anywhere but as a callee lets its result go unseen.
-function vecNoteFnRef(ix: i32, name: string) {
-  if vecCalleeIx.has(ix) || lintBindDecl(name) >= 0 { return 0 }
-  const d = lintModFnDecl[name] ?? -1
+function vecNoteFnRef(ix: i32, nid: i32) {
+  if vecCalleeIx.has(ix) || lintBindDeclId(nid) >= 0 { return 0 }
+  const d = lnModFnDecl[nid]
   if d >= 0 { vecFnEscapes[d] = 1 }
   0
 }
@@ -2777,9 +2777,84 @@ function urcBlockFlags(stmts: i32[]) {
 
 // Exemptions: an `export`ed function is public surface and never flagged; a
 // `_`-prefixed name is the intentionally-unused marker and downgrades to a `hint`.
-let lintRefNames: {[string]: i32} = Map()
 
-function refNamesHas(name: string) { (lintRefNames[name] ?? 0) != 0 }
+// Every name the scan meets gets a dense per-module id, so the scope chain and the name
+// sets below are array reads; `lnFlags` holds one bit per set a name belongs to.
+let lnIds: {[string]: i32} = Map()
+let lnFlags: i32[] = []
+// Per name id: the innermost scope entry, the module function's name token, its declaration.
+let lnHead: i32[] = []
+let lnModFnTok: i32[] = []
+let lnModFnDecl: i32[] = []
+const LN_REF = 1
+const LN_GETTER = 2
+const LN_PROP = 4
+const LN_TYPE = 8
+const LN_BUILTIN = 16
+
+// Empty the ids, then mint the builtins' so `shadowed-function` reads a bit for them.
+function lnReset() {
+  lnIds = Map()
+  lnFlags = []
+  lnHead = []
+  lnModFnTok = []
+  lnModFnDecl = []
+  let i = 0
+  while i < LINT_BUILTIN_FNS.length {
+    lnMark(lnId(LINT_BUILTIN_FNS[i]), LN_BUILTIN)
+    i = i + 1
+  }
+  0
+}
+
+// The id of `name`, minted on first sight.
+function lnId(name: string): i32 {
+  const hit = lnIds[name]
+  if hit != null { return hit }
+  const id = lnFlags.length
+  lnIds[name] = id
+  lnFlags.push(0)
+  lnHead.push(-1)
+  lnModFnTok.push(-1)
+  lnModFnDecl.push(-1)
+  id
+}
+
+// The id of `name`, or -1 when the scan never met it.
+function lnFind(name: string) { lnIds[name] ?? -1 }
+
+function lnHas(name: string, bit: i32) {
+  const id = lnFind(name)
+  id >= 0 && (lnFlags[id] & bit) != 0
+}
+
+function lnMark(id: i32, bit: i32) {
+  lnFlags[id] = lnFlags[id] | bit
+  0
+}
+
+// The declaration of module function `name`, or -1.
+function lintModFnDeclOf(name: string) {
+  const id = lnFind(name)
+  if id < 0 { return -1 }
+  lnModFnDecl[id]
+}
+
+// Record module function `nid`'s name token `tok` (kept when -1) and declaration `ix`.
+function lnNoteModFn(nid: i32, tok: i32, ix: i32) {
+  if tok >= 0 { lnModFnTok[nid] = tok }
+  lnModFnDecl[nid] = ix
+  0
+}
+
+// Whether the file references `name`. A property read `.p` sets `p`'s getter bit, so `.p`
+// is referenced when `p` is read as a property or the name `.p` is itself recorded.
+function refNamesHas(name: string) {
+  if lnHas(name, LN_REF) { return true }
+  name.length > 0
+    && name[0] == '.'
+    && lnHas(name.slice(1, name.length), LN_GETTER)
+}
 
 // Did the file use a bracket at all — a read `x[i]`, a write `x[i] = v`? An index
 // operator has no callable name, so the reference-name set above structurally cannot
@@ -2788,10 +2863,7 @@ function refNamesHas(name: string) { (lintRefNames[name] ?? 0) != 0 }
 let lintSawIndexRead = false
 let lintSawIndexWrite = false
 
-function refNamesAdd(name: string) {
-  lintRefNames[name] = 1
-  0
-}
+function refNamesAdd(name: string) { lnMark(lnId(name), LN_REF) }
 
 // ── import-use side channels (unused-import) ─────────────────────────────────
 
@@ -2799,25 +2871,18 @@ function refNamesAdd(name: string) {
 // member-call whose property is a string on the `Member` and names the function
 // regardless of shadowing, and a type position, since type names are never value
 // `Ident`s. `unusedImports` consults both sets alongside the binding-keyed `declUsed`.
-let lintPropNames: {[string]: i32} = Map()
+function propNamesHas(name: string) { lnHas(name, LN_PROP) }
 
-function propNamesHas(name: string) { (lintPropNames[name] ?? 0) != 0 }
+function propNamesAdd(name: string) { lnMark(lnId(name), LN_PROP) }
 
-function propNamesAdd(name: string) {
-  lintPropNames[name] = 1
-  0
-}
-
-let lintTypeNames: {[string]: i32} = Map()
-
-function typeNamesHas(name: string) { (lintTypeNames[name] ?? 0) != 0 }
+function typeNamesHas(name: string) { lnHas(name, LN_TYPE) }
 
 // Add every maximal identifier RUN of a (possibly compound) type-annotation
 // name to the type-name set: `Box<Point>` → Box, Point; `i32[]` → i32;
 // `{[string]: Tok}` → string, Tok; `A | B` → A, B. Segment-wise because the
 // parser folds compound annotations into a single synthetic name string.
 function typeNamesAddSegments(name: string) {
-  let run: i32[] = []
+  let start = 0
   let i = 0
   while i <= name.length {
     let isIdent = false
@@ -2828,11 +2893,9 @@ function typeNamesAddSegments(name: string) {
       if c >= '0' && c <= '9' { isIdent = true }
       if c == '_' { isIdent = true }
     }
-    if isIdent {
-      run.push(name[i])
-    } else if run.length > 0 {
-      lintTypeNames[fromCodePoints(run)] = 1
-      run = []
+    if !isIdent {
+      if i > start { lnMark(lnId(name.slice(start, i)), LN_TYPE) }
+      start = i + 1
     }
     i = i + 1
   }
@@ -2879,16 +2942,15 @@ function collectTypeNameRefs() {
 let declUsed: i32[] = []
 let declWritten: i32[] = []
 
-// The lexical scope stack: parallel (name, declNodes-index) entries; `-1` marks
+// The lexical scope stack: parallel (name id, declNodes-index) entries; `-1` marks
 // a shadowing-only entry (a loop variable). Innermost binding = highest index.
-let visNames: string[] = []
+let visNames: i32[] = []
 let visIds: i32[] = []
 
-// The per-name chain through that stack: `visHead[name]` is the innermost entry's index
+// The per-name chain through that stack: `lnHead[id]` is the innermost entry's index
 // and `visPrev[i]` the next-outer entry sharing entry `i`'s name, -1 at each end. Pushes
-// and pops are LIFO, so the head is the innermost — a resolution is one probe, not a walk
+// and pops are LIFO, so the head is the innermost — a resolution is one read, not a walk
 // as deep as the module has bindings (B6a, `docs/internals/perf-opportunities-2026-09.md`).
-let visHead: {[string]: i32} = Map()
 let visPrev: i32[] = []
 // The name token that declares each entry (-1 when the source holds none), and the
 // `visReadSeq` stamp of the last read that resolved to it.
@@ -2901,19 +2963,15 @@ let visReadSeq = 0
 // The stack depth at which the innermost enclosing function's entries begin, or -1
 // outside any function. An entry at or above it belongs to that function.
 let visFnMark = -1
-// The module's top-level functions, by name, each with its name token.
-let lintModFns: {[string]: i32} = Map()
-// The same functions' declaration nodes, by name.
-let lintModFnDecl: {[string]: i32} = Map()
 // The body of the innermost enclosing function, or -1 outside any.
 let visFnBody = -1
 
 // Push one scope entry: `id` is its `declNodes` index, or -1 for a shadowing-only
 // entry. The single writer of the stack and its chain, so the two cannot disagree.
-function visPush(name: string, id: i32, tok: i32) {
-  visPrev.push(visHead[name] ?? -1)
-  visHead[name] = visNames.length
-  visNames.push(name)
+function visPushId(nid: i32, id: i32, tok: i32) {
+  visPrev.push(lnHead[nid])
+  lnHead[nid] = visNames.length
+  visNames.push(nid)
   visIds.push(id)
   visToks.push(tok)
   visLastRead.push(0)
@@ -2926,6 +2984,11 @@ function visPush(name: string, id: i32, tok: i32) {
 // node cannot provide it — an `ImportDecl` declares several names, so kind 2 passes
 // its per-name token while kinds 0 and 1 pass -1 and read `declNameTokOf`.
 function bindPush(name: string, ix: i32, kind: i32, tok: i32) {
+  bindPushId(lnId(name), name, ix, kind, tok)
+}
+
+// `bindPush` for a name already interned as `nid`.
+function bindPushId(nid: i32, name: string, ix: i32, kind: i32, tok: i32) {
   declNodes.push(ix)
   declKinds.push(kind)
   declNames.push(name)
@@ -2934,7 +2997,7 @@ function bindPush(name: string, ix: i32, kind: i32, tok: i32) {
   declWritten.push(0)
   let at = tok
   if at < 0 { at = declNameTokOf(ix) }
-  visPush(name, declNodes.length - 1, at)
+  visPushId(nid, declNodes.length - 1, at)
   0
 }
 
@@ -2943,7 +3006,7 @@ function bindPush(name: string, ix: i32, kind: i32, tok: i32) {
 function bindTrim(mark: i32) {
   while visNames.length > mark {
     const top = visNames.length - 1
-    visHead[visNames[top]] = visPrev[top]
+    lnHead[visNames[top]] = visPrev[top]
     visNames.pop()
     visIds.pop()
     visPrev.pop()
@@ -2957,8 +3020,12 @@ function bindTrim(mark: i32) {
 // Resolve `name` to its innermost visible binding; `flag` 0 marks it USED,
 // 1 marks it WRITTEN. A shadowing-only entry (`visIds` -1, a loop variable)
 // stops resolution — the name is that entry's, not an outer binding's.
-function bindMark(name: string, flag: i32) {
-  const i = visHead[name] ?? -1
+function bindMark(name: string, flag: i32) { bindMarkId(lnFind(name), flag) }
+
+// `bindMark` for the name with id `nid` (-1 for a name the scan never met).
+function bindMarkId(nid: i32, flag: i32) {
+  if nid < 0 { return 0 }
+  const i = lnHead[nid]
   if i < 0 { return 0 }
   if flag == 0 {
     visReadSeq = visReadSeq + 1
@@ -3001,10 +3068,11 @@ function nameVisit(ix: i32) {
   } else if n is Ident {
     // Every occurrence counts as a use, an assignment LHS included, which keeps a
     // write-only binding off the unused-variable list.
-    refNamesAdd(n.identName)
-    vecNoteUse(ix, n.identName)
-    vecNoteFnRef(ix, n.identName)
-    bindMark(n.identName, 0)
+    const nid = lnId(n.identName)
+    lnMark(nid, LN_REF)
+    vecNoteUse(ix, nid)
+    vecNoteFnRef(ix, nid)
+    bindMarkId(nid, 0)
   } else if n is Unary {
     // The name is recorded although there is no unary operator dispatch: `n.unOp` is
     // `"-"`, `"!"`, `"p+"` or `"p-"`, none of which can name a declaration this linter
@@ -3018,11 +3086,10 @@ function nameVisit(ix: i32) {
     if bacAstStr(n.idxArr, 0) { bacMark(ix) }
     vecNoteIndex(n)
   } else if n is Member {
-    // A property read may be a getter's use. `.` opens no identifier, so the key cannot
-    // collide with a name.
-    refNamesAdd("." + n.memProp)
+    // A property read may be a getter's use, recorded as `.p` (`refNamesHas`).
+    lnMark(lnId(n.memProp), LN_GETTER)
   } else if n is OptMember {
-    refNamesAdd("." + n.omProp)
+    lnMark(lnId(n.omProp), LN_GETTER)
   } else if n is BinExpr {
     // An assignment `x = e` (the parser desugars `x += e` / `x++` to this shape)
     // whose LHS is a bare name marks that BINDING written — prefer-const
@@ -3136,8 +3203,12 @@ function lintHasLitVariant(vs: string[]) {
 }
 
 // The declaration the innermost visible binding of `name` came from, or -1.
-function lintBindDecl(name: string) {
-  const i = visHead[name] ?? -1
+function lintBindDecl(name: string) { lintBindDeclId(lnFind(name)) }
+
+// `lintBindDecl` for the name with id `nid` (-1 for a name the scan never met).
+function lintBindDeclId(nid: i32) {
+  if nid < 0 { return -1 }
+  const i = lnHead[nid]
   if i < 0 { return -1 }
   const id = visIds[i]
   if id < 0 { return -1 }
@@ -3271,10 +3342,10 @@ function lintIsBareName(s: string) {
 // and returns 1 when it joins a reported chain. Skips module names, an outer function's or
 // lambda's bindings, and a rebinding whose initialiser read the outer one after `readMark`
 // (`const x = x as f64`; -1 for a loop variable).
-function shadowedLocal(name: string, tok: i32, readMark: i32): i32 {
-  if visFnMark < 0 || tok < 0 { return 0 }
-  const i = visHead[name] ?? -1
-  if i < visFnMark { return 0 }
+function shadowedLocal(name: string, nid: i32, tok: i32, readMark: i32): i32 {
+  if visFnMark < 0 || tok < 0 || nid < 0 || nid >= lnHead.length { return 0 }
+  const i = lnHead[nid]
+  if i < 0 || i < visFnMark { return 0 }
   const outer = visToks[i]
   if outer < 0 { return 0 }
   if visShadowed[i] == 1 { return 1 }
@@ -3302,7 +3373,6 @@ const LINT_BUILTIN_FNS = [
   "floor", "ceil", "trunc", "nearest", "min", "max", "copysign", "clz", "ctz",
   "popcnt", "rotl", "rotr",
 ]
-function lintBuiltinFnName(name: string) { strListHas(LINT_BUILTIN_FNS, name) }
 
 // Whether the subtree at `root` holds a call of the bare name `name` whose callee token
 // comes before token `before`.
@@ -3332,12 +3402,12 @@ function lintCallsNameBefore(root: i32, name: string, before: i32) {
 // of the module or a builtin that the same function calls above it, since the calls on either
 // side of the binding then mean different things (D3599). A name that already shadows one of
 // the same function is `shadowed-local`'s.
-function shadowedFunction(name: string, tok: i32) {
-  if visFnMark < 0 || tok < 0 { return 0 }
-  if (visHead[name] ?? -1) >= visFnMark { return 0 }
+function shadowedFunction(name: string, nid: i32, tok: i32) {
+  if visFnMark < 0 || tok < 0 || nid < 0 || nid >= lnHead.length { return 0 }
+  if lnHead[nid] >= visFnMark { return 0 }
   // Only a module function or a builtin can be shadowed, so the body walk runs for no other name.
-  const ft = lintModFns[name] ?? -1
-  if ft < 0 && !lintBuiltinFnName(name) { return 0 }
+  const ft = lnModFnTok[nid]
+  if ft < 0 && (lnFlags[nid] & LN_BUILTIN) == 0 { return 0 }
   if !lintCallsNameBefore(visFnBody, name, tok) { return 0 }
   let what = ""
   if ft >= 0 {
@@ -3347,10 +3417,9 @@ function shadowedFunction(name: string, tok: i32) {
       + i32ToStr(lintTokLine(ft))
       + ":"
       + i32ToStr(lintTokCol(ft) + 1)
-  } else if lintBuiltinFnName(name) {
+  } else {
     what = "the builtin `" + name + "`"
   }
-  if what == "" { return 0 }
   lintEmitAtTok(
     "shadowed-function",
     "`"
@@ -3393,8 +3462,7 @@ function bindScan(ix: i32) {
           bindPush(s.letName, six, 0, -1)
         } else if s is FuncDecl {
           const ft = declNameTokOf(six)
-          if ft >= 0 { lintModFns[s.fnName] = ft }
-          lintModFnDecl[s.fnName] = six
+          lnNoteModFn(lnId(s.fnName), ft, six)
         } else if s is ImportDecl {
           let q = 0
           while q < s.impLocals.length {
@@ -3435,9 +3503,11 @@ function bindScan(ix: i32) {
     const readMark = visReadSeq
     bindScanLetInit(ix)
     const vecTyOf = vecLetCandidate(ix)
-    shadowedFunction(n.letName, declNameTokOf(ix))
-    const shadowed = shadowedLocal(n.letName, declNameTokOf(ix), readMark)
-    bindPush(n.letName, ix, 0, -1)
+    const nid = lnId(n.letName)
+    const nTok = declNameTokOf(ix)
+    shadowedFunction(n.letName, nid, nTok)
+    const shadowed = shadowedLocal(n.letName, nid, nTok, readMark)
+    bindPushId(nid, n.letName, ix, 0, -1)
     visShadowed[visNames.length - 1] = shadowed
     if vecTyOf != "" { vecTrack(declNodes.length - 1, vecTyOf) }
     if vecInFn { vecNoteCallLet(ix, declNodes.length - 1) }
@@ -3471,8 +3541,9 @@ function bindScan(ix: i32) {
       if pix >= 0 && pix < P.nodes.length {
         const pn = nodeAt(pix)
         if pn is Param {
-          shadowedFunction(pn.parName, declNameTokOf(pix))
-          bindPush(pn.parName, pix, 1, -1)
+          const pid = lnId(pn.parName)
+          shadowedFunction(pn.parName, pid, declNameTokOf(pix))
+          bindPushId(pid, pn.parName, pix, 1, -1)
           vecTrackParam(pix, declNodes.length - 1)
         }
       }
@@ -3489,9 +3560,10 @@ function bindScan(ix: i32) {
     bindScan(n.frStep)
     const mark = visNames.length
     const vTok = declNameTokOf(ix)
-    shadowedFunction(n.frVar, vTok)
-    const shadowed = shadowedLocal(n.frVar, vTok, -1)
-    visPush(n.frVar, -1, vTok)
+    const vid = lnId(n.frVar)
+    shadowedFunction(n.frVar, vid, vTok)
+    const shadowed = shadowedLocal(n.frVar, vid, vTok, -1)
+    visPushId(vid, -1, vTok)
     visShadowed[visNames.length - 1] = shadowed
     bindScan(n.frBody)
     bindTrim(mark)
@@ -3499,16 +3571,18 @@ function bindScan(ix: i32) {
     bindScan(n.fiIter)
     const mark = visNames.length
     const vTok = declNameTokOf(ix)
-    shadowedFunction(n.fiVar, vTok)
-    const shadowed = shadowedLocal(n.fiVar, vTok, -1)
-    visPush(n.fiVar, -1, vTok)
+    const vid = lnId(n.fiVar)
+    shadowedFunction(n.fiVar, vid, vTok)
+    const shadowed = shadowedLocal(n.fiVar, vid, vTok, -1)
+    visPushId(vid, -1, vTok)
     visShadowed[visNames.length - 1] = shadowed
     if n.fiVar2 != "" {
       let v2Tok = -1
       if vTok >= 0 { v2Tok = vTok + 2 }
-      shadowedFunction(n.fiVar2, v2Tok)
-      const shadowed2 = shadowedLocal(n.fiVar2, v2Tok, -1)
-      visPush(n.fiVar2, -1, v2Tok)
+      const v2id = lnId(n.fiVar2)
+      shadowedFunction(n.fiVar2, v2id, v2Tok)
+      const shadowed2 = shadowedLocal(n.fiVar2, v2id, v2Tok, -1)
+      visPushId(v2id, -1, v2Tok)
       visShadowed[visNames.length - 1] = shadowed2
     }
     bindScan(n.fiBody)
@@ -3532,11 +3606,9 @@ function bindScan(ix: i32) {
 }
 
 function collectBindingsAndRefs(progRoot: i32) {
-  lintRefNames = Map()
+  lnReset()
   lintSawIndexRead = false
   lintSawIndexWrite = false
-  lintPropNames = Map()
-  lintTypeNames = Map()
   declNodes = []
   declKinds = []
   declNames = []
@@ -3545,7 +3617,6 @@ function collectBindingsAndRefs(progRoot: i32) {
   declWritten = []
   visNames = []
   visIds = []
-  visHead = Map()
   visPrev = []
   visToks = []
   visLastRead = []
@@ -3553,8 +3624,6 @@ function collectBindingsAndRefs(progRoot: i32) {
   visReadSeq = 0
   visFnMark = -1
   visFnBody = -1
-  lintModFns = Map()
-  lintModFnDecl = Map()
   bacAstIdx = []
   upeAstIdx = []
   vecReset()
