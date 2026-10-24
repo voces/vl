@@ -802,9 +802,11 @@ import {
   arrLitIsStr,
   arrLitNumKind,
   arrNewIntrKind,
+  asExprBoxToLitUnion,
   asExprIsUnionCastIn,
   asExprLitAtomCast,
   asExprLitAtomYieldsAtom,
+  asExprNumLitScalarCast,
   asgReadNode,
   asgReadUnwidenOp,
   assignTargetReReads,
@@ -1062,6 +1064,7 @@ import {
   listPayloadStashSlot,
   litAtomCastSlot,
   nulNicheBoxSlot,
+  numLitCastSlot,
   objOrderStashSlot,
   spreadDstBackSlot,
   spreadElemWidens,
@@ -21473,6 +21476,84 @@ function emitAsUnionOpt(
   return 0
 }
 
+// The cast of a union box to literal-union target `tty` (node `exprIx`): a hit is the base's tag
+// with a payload equal to a member. The result is the base scalar, the atom id or the member
+// string, as the node reps; a miss traps, returns the box, or is `null`, by mode. Returns 0 or -1.
+function emitAsBoxToLitUnion(
+  body: u8[],
+  e: AsExpr,
+  exprIx: i32,
+  tty: i32,
+  fnIx: i32,
+) {
+  let texts = tyNumLitMemberTexts(tty)
+  let k = 2
+  if texts.length > 0 {
+    k = unMemAtomKind(numLitUnionBaseTy(tty))
+  } else {
+    texts = tyLitMemberTexts(tty)
+  }
+  if texts.length == 0 || k < 0 || (k == 2 && !aUsed) {
+    return emitFail(
+      "emitProgram: `as "
+        + e.asTy
+        + "` names a literal union with no members",
+    )
+  }
+  const st = unionAsBoxSlot()
+  if emitExpr(body, e.asObj, fnIx) < 0 { return -1 }
+  fbLocalSet(st)
+  fbLocalGet(st)
+  fbStructGet(uBoxIdx, 0) // field 0: the tag
+  fbI32Rel(RS_TAG, scalarTagOfKind(k))
+  fbI32Bin(70)            // 0x46 i32.eq
+  fbIf(127)               // the payload is read only under its own tag
+  let i = 0
+  while i < texts.length {
+    fbLocalGet(st)
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    if emitUnionPayloadUnbox(body, k) < 0 { return -1 }
+    if k == 2 {
+      if emitStrEqLit(body, mkStr(quoteLex(texts[i]), -1), fnIx) < 0 {
+        return -1
+      }
+    } else {
+      if emitNumLitConstEq(valueAtomNameOfKind(k), texts[i]) < 0 { return -1 }
+    }
+    if i > 0 {
+      fbI32Bin(114) // 0x72 i32.or
+    }
+    i = i + 1
+  }
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  const atom = k == 2 && exprIsLitAtom(exprIx, fnIx)
+  if e.asMode == "null" {
+    if k == 2 && exprNulLitUnion(exprIx, fnIx) {
+      fbIf(127)
+      if emitStashedStrToAtomChain(body, st, texts, 0, fnIx) < 0 { return -1 }
+      fbElse()
+      fbI32Const(-1) // the atom niche's null
+      fbEnd()
+      return 0
+    }
+    return emitAsUnionOpt(false, -1, k, -1, e.asTy)
+  }
+  fbI32Eqz() // 0x45
+  fbIf(64)   // if, void
+  if e.asMode == "trap" {
+    fbUnreachable()
+  } else {
+    fbLocalGet(st)
+    fbReturn()
+  }
+  fbEnd()
+  if atom { return emitStashedStrToAtomChain(body, st, texts, 0, fnIx) }
+  fbLocalGet(st)
+  emitUnionUnboxTail(k)
+}
+
 // The union-operand cast of `e` (node `_exprIx`): a niche operand's null test, else the tag
 // test of the box against the target's arms, then `as?`'s value-producing arm or the
 // propagating (`as`) or trapping (`as!`) miss and the unbox. Returns 0 or -1.
@@ -21490,6 +21571,13 @@ function emitAsUnionCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   // the target's arms, flattened rather than tested as `TyUnion`: a sub-union target
   // only widens the membership test (a tag chain), with no unbox at all.
   if mapSoftTwinTagFail(obj, tty, fnIx, _exprIx) < 0 { return -1 }
+  if asExprBoxToLitUnion(_exprIx, fnIx) {
+    // Outside the atom context, so each member compares as its string and not as its id.
+    const savedLU = expCtxSwapLitUnion(0)
+    const rl = emitAsBoxToLitUnion(body, e, _exprIx, tty, fnIx)
+    expCtxSwapLitUnion(savedLU)
+    return rl
+  }
   const wantTags: i32[] = []
   const wantVis: i32[] = []
   if !unionArmTagsOfTy(tty, wantTags, wantVis) {
@@ -21649,6 +21737,97 @@ function emitAsLitAtom(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
   0
 }
 
+// The `as` trio from a numeric literal-union scalar to a numeric literal union of its base: the
+// scalar is staged once and compared against each target member. A hit is the scalar, or for `as?`
+// the base-tagged box; a miss traps, is handed back by `return`, or is the null box (D11221).
+function emitAsNumLitScalar(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
+  let tty = nodeTyIxOf(exprIx)
+  if e.asMode == "null" { tty = tyPeelNul(tty) }
+  const base = numLitUnionBaseTy(tty)
+  const texts = tyNumLitMemberTexts(tty)
+  const k = unMemAtomKind(base)
+  if texts.length == 0 || (k != 0 && k != 3) {
+    return emitFail(
+      "emitProgram: `as "
+        + e.asTy
+        + "` names a literal union with no members",
+    )
+  }
+  let sk: MfKind = "i32"
+  if k == 3 { sk = "i64" }
+  // A propagated miss leaves at the result's rep: the scalar itself, or boxed under its base's tag.
+  let retBox = false
+  if e.asMode == "prop" {
+    let rk = ""
+    if fnIx >= 0 && fnIx < P.nodes.length {
+      const fd = nodeAt(fnIx)
+      if fd is FuncDecl {
+        if fd.fnRet >= 0 {
+          rk = vtKindOfType(fd.fnRet)
+        } else {
+          const fp = fnStmtsPosOf(fnIx)
+          if fp >= 0 && fp < fRetKind.length { rk = fRetKind[fp] }
+        }
+      }
+    }
+    retBox = rk == "union"
+    if !retBox && rk != sk {
+      return emitFail(
+        "emitProgram: `as "
+          + e.asTy
+          + "` over a numeric literal union propagates its miss, and this function returns neither that number type nor a union — write `as!` or `as?`",
+      )
+    }
+  }
+  if emitExpr(body, e.asObj, fnIx) < 0 { return -1 }
+  const s = numLitCastSlot(sk)
+  fbLocalSet(s)
+  let i = 0
+  while i < texts.length {
+    fbLocalGet(s)
+    if emitNumLitConstEq(valueAtomNameOfKind(k), texts[i]) < 0 { return -1 }
+    if i > 0 {
+      fbI32Bin(114) // 0x72 i32.or
+    }
+    i = i + 1
+  }
+  if e.asMode == "null" {
+    const vb = vbHeapIdxOfKind(k)
+    if vb < 0 {
+      return emitFail("emitProgram: `as? " + e.asTy + "` has no value-box type")
+    }
+    fbOpenIf()             // 0x04 if
+    fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
+    fbI32Rel(RS_TAG, scalarTagOfKind(k))
+    fbLocalGet(s)
+    fbStructNew(vb)
+    fbStructNew(uBoxIdx)
+    fbElse()
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone()        // the payload slot is unread under the null tag
+    fbStructNew(uBoxIdx)
+    fbEnd()
+    return 0
+  }
+  fbI32Eqz()
+  fbIf(64) // if, void
+  if e.asMode == "trap" {
+    fbUnreachable()
+  } else if retBox {
+    fbI32Rel(RS_TAG, scalarTagOfKind(k))
+    fbLocalGet(s)
+    fbStructNew(vbHeapIdxOfKind(k))
+    fbStructNew(uBoxIdx)
+    fbReturn()
+  } else {
+    fbLocalGet(s)
+    fbReturn()
+  }
+  fbEnd()
+  fbLocalGet(s)
+  0
+}
+
 function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const obj = e.asObj
   const tgt = e.asTy
@@ -21664,6 +21843,9 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   if e.asMode == "wrap" { return emitNumWrapCast(body, e, _exprIx, fnIx) }
   if asExprLitAtomCast(_exprIx, fnIx) {
     return emitAsLitAtom(body, e, _exprIx, fnIx)
+  }
+  if asExprNumLitScalarCast(_exprIx, fnIx) {
+    return emitAsNumLitScalar(body, e, _exprIx, fnIx)
   }
   // A numeric union converts at whichever member it holds when no member's conversion fails.
   if numUnionMinted && nodeIsNumUnion(obj, fnIx) {
