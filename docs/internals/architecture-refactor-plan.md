@@ -649,7 +649,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - The valtype-ladder fall-through is a FLOOR. 42 direct-spelling parameter probes cover maps, nullable scalars, unions, brands, `null`, nested lists, inline records, nullable functions, literal unions and generics. Each one lowers or is refused at check by design (`u8`, `u32`, `u64` and float literal types). Only a monomorphizer pin defect reaches the arm: D5001, which is open and CAPABILITY (clause 2), plus the closed D4710, D6602, D6886, D7451, D7484, D9180, D10204, D10250 and D10251.
   - "parameter type is not a type name" and "malformed parameter" are unreachable and removed. Every `parType` is a `TypeRef`, and every `fnParams` entry is a `Param`.
   - The row cannot be deleted bare. Without it, `vtKindOfType`'s `i32` default lowers D5001's function-typed sibling to check-clean invalid wasm, and four other siblings run only by that default's luck. So the two live arms move to `paramValtypeFloor`, which `emitFuncCode` calls before `buildLocals`. They keep their messages, which now carry the call's span.
-  - Results: `capability-probes.vl` reads the same before and after (198 of 209, and 11 of 11 live sites). The seed fixpoint goes from 5,786,238 to 5,785,182 bytes. `emit-refusal-sites.vl` goes from 748 to 745 sites.
+  - Results: `capability-probes.vl` reads the same before and after (198 of 209, and 11 of 11 live sites). The seed fixpoint goes from 5,786,238 to 5,785,170 bytes. `emit-refusal-sites.vl` goes from 748 to 745 sites.
 
 ### L4 log
 
