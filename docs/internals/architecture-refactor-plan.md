@@ -1319,6 +1319,15 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - `difftree.sh --identity`: `16534 files · 11684 built · 0 differ · 0 uncompared`, and the fixpoint matches master's.
     - Filed witnesses: 3,752 as filed.
     - The seed goes from 5,785,692 to 5,785,782 bytes (+90).
+- **2026-10-24, render-parse C1's 5 left entries re-probed per site: ty-string-parse stays 119.**
+  - Each entry in `annFnDecompose`, `monoTyParamOf` and `monoSubstAnn` was probed against the type its caller hands down, aligned through map values, record fields, fn parameters and returns, parens and `[]` runs. Population: the self-compile, 16,646 files (tests, the distilled corpus) and the 3,242 inventory witnesses.
+  - None swaps. The disagreements are in 26, 17, 68 and 46 files. Their causes:
+    - grouping parens the spelling keeps for a following `[]` (D1896);
+    - a literal-union alias that the spelling keeps as one positional atom;
+    - a `T[]` node the clone already retyped to the instance.
+  - The re-split of the walker's own output has no type at any of its 3,279 events.
+  - All five wait on step 1, the substitution on types (D3). The per-entry counts are in the ledger rows and the C1 section.
+  - No compiler change, so there is no identity run and no baseline move.
 
 ### L10 log
 
