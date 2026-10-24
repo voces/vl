@@ -20,6 +20,10 @@
 // rows, and reds naming the five rows when `classifyStateReset`'s clears are ignored, so a
 // detector that stopped counting cannot pass quietly.
 //
+// The fourth holds the index rule: an integer register holding a per-program id that only an
+// inner function clears. Ignoring `wasmEmitStateReset`'s clears must name `nulWidenWriteRhs`,
+// which is D11770 put back.
+//
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed.
 //
 // @test-timing native
@@ -33,6 +37,10 @@ const EMIT_SECTIONS = `${ROOT}/compiler/emit_sections.vl`;
 /** The control: a prologue reset whose clears are the only ones these variables have. */
 const CONTROL_RESET = "classifyStateReset";
 const CONTROL_NAMES = ["capFrame", "gckDepth", "irkDepth", "lrDepth", "narrowDropWin"];
+
+/** The index rule's control: the reset whose line D11770 added, and the register it clears. */
+const INDEX_CONTROL_RESET = "wasmEmitStateReset";
+const INDEX_CONTROL_NAME = "nulWidenWriteRhs";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -133,6 +141,29 @@ Deno.test({
       throw new Error(
         `--check --without-reset ${CONTROL_RESET}: want exit 1, BROKEN and the names ` +
           `${CONTROL_NAMES.join(", ")}, got ${red.code}\n${red.out}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "emitter-state-audit: --check reds on an index register whose per-program reset is gone",
+  ignore: !ENABLED,
+  fn: async () => {
+    const held = await audit(["--check"]);
+    if (held.code !== 0 || !/unguarded inner index registers 0\b/.test(held.out)) {
+      throw new Error(`--check on the tree: want exit 0 and 0 unguarded, got ${held.code}\n${held.out}`);
+    }
+    // D11770's shape: `nulWidenWriteRhs` keeps its inner clear in `emitAssignUnder`, so without
+    // the reset's clear it is no NEVER row, and only the index rule can see it.
+    const red = await audit(["--check", "--without-reset", INDEX_CONTROL_RESET]);
+    if (
+      red.code !== 1 || !red.out.includes("unguarded inner index registers") ||
+      !red.out.includes(`  ${INDEX_CONTROL_NAME} `)
+    ) {
+      throw new Error(
+        `--check --without-reset ${INDEX_CONTROL_RESET}: want exit 1 naming ` +
+          `${INDEX_CONTROL_NAME} as an unguarded index register, got ${red.code}\n${red.out}`,
       );
     }
   },
