@@ -119,7 +119,7 @@ the slice retires.
 
 | slice | name | entries | A / C / D | renders / parses | files |
 | --- | --- | --- | --- | --- | --- |
-| A1 | shape-row typed twins (landed: 0 retired, 14 left; re-probed at 2401febe6: callers with no type, typed rungs that differ, and the class C alias parameter; mv slots typed: 5 files still reach with no type, func and lit-union rungs listed as the next rep change) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
+| A1 | shape-row typed twins (landed: 1 retired, 13 left; re-probed at 27fc385d1: callers with no type, typed rungs that differ, and the class C alias parameter; func and lit-union rungs listed as the next rep change) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
 | A2 | emit_mono typed tests (landed: 7 retired, 1 to B, 1 left; the arrow test waits on one hole pin with no type) | 1 | 0 / 1 / 0 | 0 / 1 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
@@ -179,6 +179,22 @@ What each slice changes:
   file), gets a different row from `structIndexOfTypeNameTy` in 12 of 128 files. So threading
   types through C4's field-code walkers does not reach these rows. The callers above have to
   carry the shape's type first.
+
+  Re-probed at 27fc385d1 over the self-compile and 16,642 files, 0 uncompared. One parse
+  retired: `mvValKindOfNameTy`'s nullable-closure `annArrowAt` repeated the call
+  `nulRefMapValInnerOfTy` had just made on the same member, so that function now banks the
+  index (`nrmInnerArrow`) and the classifier reads it. The other 13 stay:
+  - Reached with no type: `nulRefMapValInnerOfTy` in 2 files and `mvValKindOfNameTy` in 4,
+    through `mvValNamesCompat`'s shape-text name; `mapValKindLowerable` in 1, under the D34
+    arm mint.
+  - The closure return's lit-union rung agrees everywhere it is typed, but still needs the
+    spelling for the -1 callers above.
+  - Typed rungs that differ: the func rung in 31 files and the lit-union rung in 1, as before.
+  - Blocked in `emit_collect` (the A3 lane): `nulScalarListKind` through `forceAnnLeafReps`,
+    and the five `genTyParamArr`/`genTyParamNulArr` rows. Their `nodeTyIxOf` twin is -1 in
+    179 files and differs in 13.
+  - `rlElemNicheNullable`: the rl type answers non-nullable where the spelling has `| null`,
+    in 195 files.
 - **A2.** These `emit_mono` predicates test the type they hold instead of rendering it.
   - Done, byte-identical: `monoModuleLetTyIs` and `monoModuleDupPin` compare the site's type
     with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
