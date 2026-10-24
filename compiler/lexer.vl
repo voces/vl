@@ -264,6 +264,55 @@ export function advance() {
   c
 }
 
+// Consume the run of identifier characters at the cursor, returning the hash `lexIdText`
+// keys that run by. None of them ends a line, so the column moves by the run's length,
+// exactly as `advance` would move it one at a time.
+function skipIdRun(): i32 {
+  const src = gSrc
+  const end = src.length
+  let p = gPos
+  let h = 0
+  while p < end {
+    const d = src[p]
+    if (
+      (d >= 'a' && d <= 'z')
+      || (d >= 'A' && d <= 'Z')
+      || (d >= '0' && d <= '9')
+      || d == '_'
+    ) {
+      h = (h ^ d) * 16777619
+      p = p + 1
+    } else {
+      break
+    }
+  }
+  gCol = gCol + (p - gPos)
+  gPos = p
+  h
+}
+
+// Consume the run of spaces and tabs at the cursor; the `skipIdRun` of whitespace.
+function skipBlankRun() {
+  const src = gSrc
+  const end = src.length
+  let p = gPos
+  while p < end && (src[p] == ' ' || src[p] == '\t') { p = p + 1 }
+  gCol = gCol + (p - gPos)
+  gPos = p
+  0
+}
+
+// Consume up to, not including, the next `\n` or `\r`; the `skipIdRun` of a comment's text.
+function skipLineRest() {
+  const src = gSrc
+  const end = src.length
+  let p = gPos
+  while p < end && src[p] != '\n' && src[p] != '\r' { p = p + 1 }
+  gCol = gCol + (p - gPos)
+  gPos = p
+  0
+}
+
 // Record a diagnostic at the current position. Returns the diagnostic count
 // (VL has no `void`; functions infer their return type).
 export function diag(msg: string) {
@@ -570,17 +619,12 @@ function lexPinSource() {
 
 // The identifier `gSrc[a, b)`, one string per spelling for the life of the tables, so
 // every later comparison of two occurrences short-circuits on identity instead of walking
-// bytes. A lexeme of four bytes or fewer goes through `lexText`'s table.
-function lexIdText(a: i32, b: i32): string {
+// bytes. A lexeme of four bytes or fewer goes through `lexText`'s table. `run` is the
+// lexeme's hash as `skipIdRun` returned it.
+function lexIdText(a: i32, b: i32, run: i32): string {
   const n = b - a
   if n <= 4 { return lexText(a, b) }
-  let h = 0
-  let i = a
-  while i < b {
-    h = (h ^ gSrc[i]) * 16777619
-    i = i + 1
-  }
-  h = h ^ (h >>> 15)
+  const h = run ^ (run >>> 15)
   const mask = gIdVal.length - 1
   let s = h & mask
   while gIdVal[s].length > 0 {
@@ -690,9 +734,7 @@ function scanRadix(base: i32, baseName: string, prefixChar: i32) {
       bad = true
     }
   }
-  if bad {
-    while gPos < gSrc.length && isIdPart(peek()) { advance() }
-  }
+  if bad { skipIdRun() }
   gDiags.length
 }
 
@@ -958,7 +1000,7 @@ function lexStringLit(
 function lexLabel(toks: Tok[], startPos: i32, startLine: i32, startCol: i32) {
   advance()
   if gPos < gSrc.length && isIdStart(peek()) {
-    while gPos < gSrc.length && isIdPart(peek()) { advance() }
+    skipIdRun()
     toks.push(mkTok("LABEL", startPos, startLine, startCol))
   } else {
     diagSpan(
@@ -1080,7 +1122,7 @@ export function tokenize(source: string): LexResult {
 
     // Whitespace: space, tab.
     if c == ' ' || c == '\t' {
-      advance()
+      skipBlankRun()
       continue
     }
 
@@ -1095,8 +1137,8 @@ export function tokenize(source: string): LexResult {
 
     // Identifier / keyword.
     if isIdStart(c) {
-      while gPos < gSrc.length && isIdPart(peek()) { advance() }
-      const text = lexIdText(startPos, gPos)
+      const run = skipIdRun()
+      const text = lexIdText(startPos, gPos, run)
       toks.push(
         mkTokText(keywordKind(text), text, startPos, startLine, startCol),
       )
@@ -1208,7 +1250,7 @@ function lexReset(source: string) {
 // sits on the same source line.
 function lexComment(toks: Tok[], startPos: i32, startLine: i32, startCol: i32) {
   const isDoc = peekN(2) == '/'
-  while gPos < gSrc.length && peek() != '\n' && peek() != '\r' { advance() }
+  skipLineRest()
   let isTrailing = false
   if toks.length > 0 {
     const lt = toks[toks.length - 1]
@@ -1284,7 +1326,7 @@ function lexNumber(c: i32) {
       } else {
         diag("float exponent has no digits after `e`")
         expBad = true
-        while gPos < gSrc.length && isIdPart(peek()) { advance() }
+        skipIdRun()
       }
     }
     // A misplaced separator (doubled `1__0`, trailing `1_`, `1e5_`) — a `_` left
@@ -1293,7 +1335,7 @@ function lexNumber(c: i32) {
     // a `_` here would be a second diagnostic for one broken literal.
     if !expBad && peek() == '_' {
       diag("`_` may only separate digits in a numeric literal")
-      while gPos < gSrc.length && isIdPart(peek()) { advance() }
+      skipIdRun()
     }
   }
 }
