@@ -55,6 +55,8 @@ import {
   expObsReadAt,
   expObsReadParam,
   expObsReset,
+  expRePublicOf,
+  expReSet,
 } from "./check_exp_obs"
 import { ovHoleSites } from "./check_call_resolve"
 import {
@@ -285,14 +287,21 @@ let expInfDone: i32[] = []
 // Whether the entry is a std module, which only ever runs imported: its exports have callers.
 let expInfEntryStd = false
 
-// Stages whether the program's entry module is a std module, before `checkProgram`.
+// Stages whether the program's entry module is a std module, before `checkProgram`, and clears
+// the staged re-exports.
 export function expInfSetEntryStd(b: boolean) {
   expInfEntryStd = b
-  0
+  expReSet([], [])
+}
+
+// Stages the entry module's re-exports, after `expInfSetEntryStd` and before `checkProgram`.
+export function expInfSetReExports(targets: string[], publics: string[]) {
+  expReSet(targets, publics)
 }
 
 // The entry module's exported functions no statement outside their own body names, among those
-// `expParamInfer` has work for; with none, the program is not walked for readers.
+// `expParamInfer` has work for; with none, the program is not walked for readers. A function
+// the entry re-exports from a dependency is one too.
 function expUncalledExports(): i32[] {
   const out: i32[] = []
   if expInfEntryStd { return out }
@@ -301,12 +310,13 @@ function expUncalledExports(): i32[] {
   for st in gRootStmts {
     const f = nodeAt(st)
     if f is FuncDecl {
-      if (
-        f.fnName != ""
-        && ufcsModOfNode(st) <= 0
+      const ownExport = ufcsModOfNode(st) <= 0
         && declIsExportedFn(st)
         && expInfOwed(f)
-      ) {
+      const reExport = (ufcsModOfNode(st) > 0
+        && expInfOwed(f)
+        && expRePublicOf(f.fnName) != "")
+      if f.fnName != "" && (ownExport || reExport) {
         cands.push(st)
         expShWanted[f.fnName] = 1
       }
@@ -476,9 +486,11 @@ function expParamInfer(): i32 {
     const f = nodeAt(fx)
     if f is FuncDecl {
       if f.fnTyParams.length > 0 {
+        let pub = expRePublicOf(f.fnName)
+        if pub == "" { pub = demangleName(f.fnName) }
         expInfRefuse(
           "exported function `"
-            + demangleName(f.fnName)
+            + pub
             + "` is generic over `"
             + f.fnTyParams[0]
             + "` and nothing in the program calls it; the host calls it, so its signature must be explicit. Give its parameters concrete types, or export a concrete wrapper",
