@@ -15,10 +15,10 @@
 // lists the `fnUses*` flags one of the two frame builders resets and the other does not
 // (D1006/D1007), pinned by `tests/vl_emitter_state_audit_test.ts`.
 //
-// `--check` is an invariant, not a ratchet: it exits 1 and names every NEVER row when there
-// is any (lane L7 took the count to 0). `--without-reset NAME` ignores the clears one
-// function makes, so the test's control can make it red. Run from the checkout root: paths
-// are relative to the working directory.
+// `--check` is an invariant, not a ratchet: it exits 1 naming every NEVER row, and every
+// inner integer register holding a per-program id (D11770) that GUARDED does not cover.
+// `--without-reset NAME` ignores one function's clears, so the test's control can make it
+// red. Run from the checkout root: paths are relative to the working directory.
 
 import { IoError, listDir, readTextFile } from "std:fs"
 import { programArgs } from "std:args"
@@ -27,7 +27,7 @@ import { Utf8Error } from "std:utf8"
 import { toString } from "std:fmt"
 import { endsWith, join, padEnd, padStart, split, startsWith } from "std:str"
 import { sort } from "std:array"
-import { die, hasFlag, lstripWs, stripWs } from "./lib/common"
+import { die, findFrom, hasFlag, lstripWs, stripWs } from "./lib/common"
 
 const CDIR = "compiler"
 
@@ -51,8 +51,8 @@ const EMIT = [
 ]
 
 // `emitProgram`'s prologue and the `*Reset` helpers it calls there: state cleared in one of
-// these is clean before any pass of the next program runs. The one hand-kept input; a helper
-// added to the prologue and not here reads as "inner", more hazardous than it is.
+// these is clean before any pass of the next program runs. Each stands also for what it
+// calls unconditionally (`closureOf`), so a helper a listed reset calls needs no entry here.
 const PROLOGUE = [
   "emitProgram", "emitModule", "compileSrc", "checkSrc", "checkSrcSym",
   "srcReset", "modReset", "resetLitAtoms", "repReset", "msPoolReset",
@@ -97,6 +97,25 @@ const PASS = [
 // The two per-function frame builders; each stands for itself plus the same-module helpers
 // it calls, which are walked rather than listed so a split of a builder is followed.
 const FRAME_ROOTS = ["emitFuncCode", "emitStartFnCode"]
+
+// The driver functions whose own unconditional calls are prologue too, beside PROLOGUE.
+const DRIVERS = ["runEmitPasses", "emitProgramRun"]
+
+// The pass dispatcher: every `return NAME(` in its body is a pass, added to PASS.
+const PASS_DISPATCH = "runEmitPass"
+
+// Index-shaped registers that are cleared only inside some inner function and are still safe
+// across programs, each with the guard that makes them so: a memo key the row's module asks a
+// `memo*Moved` call about (`memoCompileReset` moves every key, so the first ask of a compile
+// rebuilds), or `length` (rebuilt whenever a table's length differs from it, and that table is
+// emptied per program). Resetting one of these instead could let a stale stamp match. A guard
+// the audit cannot find in the row's module, or a name no longer such a row, stops the audit.
+const GUARDED = [
+  "ercKeepGen:ercKeepKey", "ercWalk:ercGenKey", "fdnLen:fdnGenKey",
+  "fnPosFsLen:fnPosLenKey", "fnPosMoLen:fnPosLenKey", "gckGen:gckGenKey",
+  "lixLen:length", "rasGen:rasGenKey", "ucIxUpTo:ucIxKey", "uovUpTo:uovKey",
+  "vrIxUpTo:vrIxKey",
+]
 
 // One module-scope mutable. A name declared twice keeps its first slot and its last
 // declaration, as the Python original's dict did.
@@ -263,6 +282,262 @@ function frameSide(root: string, srcs: Src[]): string[] {
   []
 }
 
+// Whether `s` holds the word `w`, bounded by non-identifier characters.
+function hasWord(s: string, w: string): boolean {
+  let at = s.indexOf(w)
+  while at >= 0 {
+    const okL = at == 0 || !isIdChar(s[at - 1])
+    const e = at + w.length
+    if okL && (e >= s.length || !isIdChar(s[e])) { return true }
+    at = findFrom(s, w, at + 1)
+  }
+  false
+}
+
+// The callee a top-level line of a function body calls unconditionally, or "": `  f(…`,
+// `  const x = f(…`, `  let x: T = f(…`, and the failure idiom `  if f(…) < 0 { return …`.
+function topCallee(ln: string): string {
+  if ln.length < 3 || ln[0] != 32 || ln[1] != 32 || !isIdStart(ln[2]) {
+    return ""
+  }
+  let i = 2
+  if startsWith(ln, "  const ") || startsWith(ln, "  let ") {
+    const eq = ln.indexOf("=")
+    if eq < 0 || (eq + 1 < ln.length && ln[eq + 1] == 61) { return "" }
+    i = eq + 1
+    while i < ln.length && isSp(ln[i]) { i = i + 1 }
+  } else if startsWith(ln, "  if ") {
+    if ln.indexOf(") < 0 { return") < 0 { return "" }
+    i = 5
+  }
+  const id = identAt(ln, i)
+  const j = i + id.length
+  if id.length == 0 || j >= ln.length || ln[j] != 40 { return "" }
+  id
+}
+
+// Whether a body line ends the unconditional prefix: a top-level `return`, a top-level `if`
+// that returns other than by the failure idiom, or a `return` in any nested block.
+function endsPrefix(ln: string): boolean {
+  if !hasWord(ln, "return") { return false }
+  if startsWith(ln, "   ") { return true }
+  if startsWith(ln, "  if ") { return ln.indexOf(") < 0 { return") < 0 }
+  true
+}
+
+// `roots` and every function they reach through `topCallee` lines before `endsPrefix`: the
+// functions that run, start to finish of that prefix, whenever a root does.
+function closureOf(roots: readonly string[], srcs: Src[]): string[] {
+  const fsrc = Map<string, i32>()
+  const fspan = Map<string, i32>()
+  let si = 0
+  while si < srcs.length {
+    let pi = 0
+    while pi < srcs[si].spans.length {
+      const nm = srcs[si].spans[pi].name
+      if fsrc[nm] == null {
+        fsrc[nm] = si
+        fspan[nm] = pi
+      }
+      pi = pi + 1
+    }
+    si = si + 1
+  }
+  const seen: string[] = []
+  const on = Map<string, boolean>()
+  for r in roots {
+    if on[r] == null {
+      on[r] = true
+      seen.push(r)
+    }
+  }
+  let w = 0
+  while w < seen.length {
+    const fn = seen[w]
+    w = w + 1
+    const s = fsrc[fn]
+    const p = fspan[fn]
+    if s == null || p == null { continue }
+    const src = srcs[s]
+    const sp = src.spans[p]
+    let k = sp.a
+    while k < sp.b && k < src.lines.length {
+      let ln = src.lines[k]
+      const cut = ln.indexOf("//")
+      if cut >= 0 { ln = ln.slice(0, cut) }
+      if endsPrefix(ln) { break }
+      const c = topCallee(ln)
+      if c.length > 0 && on[c] == null && fsrc[c] != null {
+        on[c] = true
+        seen.push(c)
+      }
+      k = k + 1
+    }
+  }
+  seen
+}
+
+// PASS plus every pass `PASS_DISPATCH` returns into.
+function passRoots(srcs: Src[]): string[] {
+  const out: string[] = []
+  for p in PASS { out.push(p) }
+  for s in srcs {
+    for sp in s.spans {
+      if sp.name != PASS_DISPATCH { continue }
+      let k = sp.a
+      while k < sp.b && k < s.lines.length {
+        const ln = s.lines[k]
+        let at = ln.indexOf("return ")
+        while at >= 0 {
+          const id = identAt(ln, at + 7)
+          const e = at + 7 + id.length
+          if id.length > 0 && e < ln.length && ln[e] == 40 && id != "emitFail" {
+            addUnique(out, id)
+          }
+          at = findFrom(ln, "return ", at + 1)
+        }
+        k = k + 1
+      }
+    }
+  }
+  out
+}
+
+// An integer-literal init: `N`, `-N` or `0 - N`; `neg` asks for a negative one.
+function intInit(init: string, neg: boolean): boolean {
+  let i = 0
+  let isNeg = false
+  if startsWith(init, "0 - ") {
+    i = 4
+    isNeg = true
+  } else if startsWith(init, "-") {
+    i = 1
+    isNeg = true
+  }
+  if i >= init.length { return false }
+  while i < init.length {
+    if init[i] < 48 || init[i] > 57 { return false }
+    i = i + 1
+  }
+  !neg || isNeg
+}
+
+// The last non-space byte of `s` before `i`, or -1.
+function prevByte(s: string, i: i32): i32 {
+  let k = i - 1
+  while k >= 0 && isSp(s[k]) { k = k - 1 }
+  if k < 0 { return -1 }
+  s[k]
+}
+
+// The index of the first non-space byte of `s` at or after `j`.
+function nextAt(s: string, j: i32): i32 {
+  let k = j
+  while k < s.length && isSp(s[k]) { k = k + 1 }
+  k
+}
+
+// Whether the occurrence of a name at `[i, j)` of `ln` reads it as an id: an index
+// (`[NAME]`, `nodeAt(NAME)`, `tyAt(NAME)`) or an `==`/`!=` against a non-literal operand.
+function idUseAt(ln: string, i: i32, j: i32): boolean {
+  const pb = prevByte(ln, i)
+  const n = nextAt(ln, j)
+  let nb = -1
+  if n < ln.length { nb = ln[n] }
+  if pb == 91 && nb == 93 { return true }
+  if pb == 40 && nb == 41 {
+    let k = i - 1
+    while k >= 0 && isSp(ln[k]) { k = k - 1 }
+    const e = k
+    while k > 0 && isIdChar(ln[k - 1]) { k = k - 1 }
+    const callee = ln.slice(k, e)
+    if callee == "nodeAt" || callee == "tyAt" { return true }
+  }
+  if n + 1 < ln.length && (ln[n] == 61 || ln[n] == 33) && ln[n + 1] == 61 {
+    const o = nextAt(ln, n + 2)
+    if o < ln.length && (isIdStart(ln[o]) || ln[o] == 40) { return true }
+  }
+  let k = i - 1
+  while k >= 0 && isSp(ln[k]) { k = k - 1 }
+  if k >= 1 && ln[k] == 61 && (ln[k - 1] == 61 || ln[k - 1] == 33) {
+    const b = prevByte(ln, k - 1)
+    if b >= 0 && (isIdChar(b) || b == 41 || b == 93) { return true }
+  }
+  false
+}
+
+// For each declaration, whether some line of `srcs` reads it as an id (`idUseAt`). Only the
+// rows `want` marks are looked for.
+function idReadRows(
+  srcs: Src[],
+  ixOf: Map<string, i32>,
+  want: boolean[],
+): boolean[] {
+  const out: boolean[] = []
+  for _w in want { out.push(false) }
+  for s in srcs {
+    for raw in s.lines {
+      if startsWith(lstripWs(raw), "//") || declLead(raw) { continue }
+      let ln = raw
+      const cut = ln.indexOf("//")
+      if cut >= 0 { ln = ln.slice(0, cut) }
+      let i = 0
+      while i < ln.length {
+        if !isIdChar(ln[i]) {
+          i = i + 1
+          continue
+        }
+        let j = i
+        while j < ln.length && isIdChar(ln[j]) { j = j + 1 }
+        if isIdStart(ln[i]) && (i == 0 || ln[i - 1] != 46) {
+          const ix = ixOf[ln.slice(i, j)]
+          if ix != null && want[ix] && !out[ix] && idUseAt(ln, i, j) {
+            out[ix] = true
+          }
+        }
+        i = j
+      }
+    }
+  }
+  out
+}
+
+// Whether `guard` holds for the declaration `d` (see GUARDED).
+function guardHolds(
+  d: Decl,
+  guard: string,
+  srcs: Src[],
+  decls: Decl[],
+): boolean {
+  let src = srcs[0]
+  for s in srcs {
+    if s.file == d.file { src = s }
+  }
+  if guard == "length" {
+    for ln in src.lines {
+      if ln.indexOf(d.name + " != ") >= 0 && ln.indexOf(".length") >= 0 {
+        return true
+      }
+    }
+    return false
+  }
+  let isKey = false
+  for k in decls {
+    if k.name == guard && isMemoInit(k.init) { isKey = true }
+  }
+  if !isKey { return false }
+  for ln in src.lines {
+    if ln.indexOf("Moved") < 0 { continue }
+    if (
+      ln.indexOf("(" + guard + ",") >= 0
+      || ln.indexOf("(" + guard + ")") >= 0
+    ) {
+      return true
+    }
+  }
+  false
+}
+
 // One assignment the scan found: which declaration, which function, and whether it clears.
 type Write = { ix: i32, fn: string, clear: boolean }
 
@@ -336,6 +611,8 @@ type Audit = {
   writes: i32[],
   assigned: string[][],
   sides: string[][],
+  index: boolean[],
+  guards: string[],
 }
 
 function addUnique(xs: string[], x: string) {
@@ -438,6 +715,11 @@ function audit(without: string): Audit {
   for side in sides {
     for x in side { addUnique(frame, x) }
   }
+  const proRoots: string[] = []
+  for p in PROLOGUE { proRoots.push(p) }
+  for p in DRIVERS { proRoots.push(p) }
+  const prologue = closureOf(proRoots, srcs)
+  const pass = closureOf(passRoots(srcs), srcs)
   const kinds: string[] = []
   let k = 0
   while k < decls.length {
@@ -446,11 +728,44 @@ function audit(without: string): Audit {
     let kind = "NEVER"
     if h.length > 0 { kind = "inner" }
     if anyIn(h, frame) { kind = "frame" }
-    if anyIn(h, PASS) { kind = "pass" }
-    if anyIn(h, PROLOGUE) { kind = "prologue" }
+    if anyIn(h, pass) { kind = "pass" }
+    if anyIn(h, prologue) { kind = "prologue" }
     if kind == "NEVER" && inList(INSTANCE, decls[k].name) { kind = "instance" }
     kinds.push(kind)
     k = k + 1
+  }
+  // An index-shaped register: an inner integer whose init is negative or that some line reads
+  // as an id. Nothing per program puts it back, so a stale id names the next program's node.
+  const intRow: boolean[] = []
+  k = 0
+  while k < decls.length {
+    intRow.push(kinds[k] == "inner" && intInit(decls[k].init, false))
+    k = k + 1
+  }
+  const idRead = idReadRows(srcs, ixOf, intRow)
+  const index: boolean[] = []
+  const guards: string[] = []
+  k = 0
+  while k < decls.length {
+    index.push(intRow[k] && (intInit(decls[k].init, true) || idRead[k]))
+    guards.push("")
+    k = k + 1
+  }
+  for g in GUARDED {
+    const parts = split(g, ":")
+    const gi = ixOf[parts[0]]
+    if gi == null {
+      die("GUARDED names no emitter declaration: " + parts[0], 2)
+      continue
+    }
+    if !index[gi] {
+      die("GUARDED names no inner index-shaped register: " + parts[0], 2)
+    }
+    if !guardHolds(decls[gi], parts[1], srcs, decls) {
+      const d = decls[gi]
+      die("GUARDED \{parts[0]}: no \{parts[1]} guard in compiler/\{d.file}", 2)
+    }
+    guards[gi] = parts[1]
   }
   {
     decls: decls,
@@ -459,6 +774,8 @@ function audit(without: string): Audit {
     writes: writes,
     assigned: assigned,
     sides: sides,
+    index: index,
+    guards: guards,
   }
 }
 
@@ -494,6 +811,11 @@ function sortedIx(a: Audit, pred: (i32) => boolean): i32[] {
   }
   sort(ixs, (x: i32, y: i32): boolean => a.decls[x].name < a.decls[y].name)
   ixs
+}
+
+// The index-shaped inner rows no GUARDED entry covers: what `--check` refuses beside NEVER.
+function unguarded(a: Audit): i32[] {
+  sortedIx(a, (i: i32): boolean => a.index[i] && a.guards[i].length == 0)
 }
 
 function yesNo(b: boolean): string {
@@ -564,6 +886,19 @@ function report(a: Audit, names: boolean) {
     print("  \{nm} \{d.file}:\{ln} init=\{ini} writes=\{a.writes[i]}")
   }
 
+  const idx = sortedIx(a, (i: i32): boolean => a.index[i])
+  const open = unguarded(a)
+  print(
+    "\nINDEX-SHAPED, CLEARED ONLY INSIDE AN INNER FUNCTION (\{idx.length}, \{open.length} unguarded) — a stale id aliases the next program's node",
+  )
+  for i in idx {
+    const d = a.decls[i]
+    let g = a.guards[i]
+    if g.length == 0 { g = "UNGUARDED" }
+    const nm = padEnd(d.name, 24, " ")
+    print("  \{nm} \{d.file}:\{d.line} \{g}")
+  }
+
   if names {
     print("\nEVERY MUTABLE, with its clear sites")
     const all = sortedIx(a, (_i: i32): boolean => true)
@@ -603,7 +938,9 @@ function main(args: readonly string[]) {
   const a = audit(flagValue(args, "--without-reset", ""))
   if hasFlag(args, "--check") {
     const never = sortedIx(a, (i: i32): boolean => a.kinds[i] == "NEVER")
+    const open = unguarded(a)
     const line = "never-cleared emitter state \{never.length} of \{a.decls.length} mutables"
+    const iline = "unguarded inner index registers \{open.length}"
     if never.length > 0 {
       print("emitter state invariant BROKEN: " + line)
       print(
@@ -613,10 +950,22 @@ function main(args: readonly string[]) {
         const d = a.decls[i]
         print("  \{d.name} \{d.file}:\{d.line}")
       }
+    }
+    if open.length > 0 {
+      print("emitter state invariant BROKEN: " + iline)
+      print(
+        "An integer register holding a node index or other per-program id, cleared only inside an inner function, keeps the last program's id on a shared instance (D11770).\nReset it in its module's per-program reset, or name it in GUARDED with the memo key or length that rebuilds it:",
+      )
+      for i in open {
+        const d = a.decls[i]
+        print("  \{d.name} \{d.file}:\{d.line}")
+      }
+    }
+    if never.length > 0 || open.length > 0 {
       exit(1)
       return 0
     }
-    print(line)
+    print(line + "; " + iline)
     return 0
   }
   report(a, hasFlag(args, "--names"))
