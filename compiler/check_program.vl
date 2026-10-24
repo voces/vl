@@ -612,6 +612,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  cStructTyIxs,
   ctxKeepsLitUnion,
   demangleMsg,
   genAppNameOfTy,
@@ -626,6 +627,7 @@ import {
   objFieldType,
   primNameStr,
   softenLitTy,
+  structNameOfTy,
   tyArrayElemIx,
   tyAt,
   tyEq,
@@ -634,6 +636,7 @@ import {
   tyIsPrimNamed,
   tyIsTwinRecordUnion,
   tyNameAtoms,
+  tyReachesCycle,
   tySame,
   tyToEmitName,
   tyToEmitNameAt,
@@ -1635,6 +1638,15 @@ export function canonUnionMembersInto(
   out: i32[],
   atoms: string[],
 ): boolean {
+  canonUnionMembersWalk(ty, out, atoms, true)
+}
+
+function canonUnionMembersWalk(
+  ty: i32,
+  out: i32[],
+  atoms: string[],
+  dedupe: boolean,
+): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const leaves: i32[] = []
   canonUnionLeaves(ty, leaves)
@@ -1692,7 +1704,7 @@ export function canonUnionMembersInto(
       }
       let dup = false
       let k = 0
-      while k < seen.length {
+      while dedupe && k < seen.length {
         if seen[k] == r && (!twin || seenTy[k] == lt) { dup = true }
         k = k + 1
       }
@@ -1706,6 +1718,87 @@ export function canonUnionMembersInto(
   for t in tys { out.push(t) }
   for a in seen { atoms.push(a) }
   true
+}
+
+// A box row's members for union `ty` into `out` (-1 for `null`) and `atoms`: canon's, repeats
+// kept (columns are positional), a function arm parenthesised, a literal-only union per literal
+// at its base scalar. False on a member with no render, one reaching a cycle (canon unrolls it),
+// or a list of a record with a same-shape twin (D3503).
+export function boxRowMembersInto(
+  ty: i32,
+  out: i32[],
+  atoms: string[],
+): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const tys: i32[] = []
+  const texts: string[] = []
+  const leaves: i32[] = []
+  canonUnionLeaves(ty, leaves)
+  for l in leaves {
+    if l >= 0 && (tyReachesCycle(l) || listOfTwinRecord(l)) { return false }
+  }
+  let litOnly = true
+  for l in leaves {
+    if l >= 0 && !canonLeafIsLit(l) { litOnly = false }
+  }
+  if litOnly {
+    const lits: i32[] = []
+    boxRowLeaves(ty, lits)
+    for l in lits { tys.push(softenLitTy(l)) }
+    for t in tys {
+      if t < 0 {
+        texts.push("null")
+      } else {
+        const nom = tyToNominalName(t)
+        if nom == "" { return false }
+        texts.push(canonEmitNameAt(nom, RC_UNION_MEM))
+      }
+    }
+  } else if !canonUnionMembersWalk(ty, tys, texts, false) {
+    return false
+  }
+  let i = 0
+  while i < tys.length {
+    let r = texts[i]
+    if tys[i] >= 0 && tyAt(tys[i]) is TyFunc { r = "(" + r + ")" }
+    out.push(tys[i])
+    atoms.push(r)
+    i = i + 1
+  }
+  true
+}
+
+// Whether `ty` is a list, at any depth, of a declared record another declared record matches.
+function listOfTwinRecord(ty: i32): boolean {
+  let e = ty
+  while e >= 0 && tyAt(e) is TyArray { e = tyArrayElemIx(e) }
+  if e == ty || e < 0 || structNameOfTy(e) == "" { return false }
+  for s in cStructTyIxs {
+    if s != e && tyEq(s, e) { return true }
+  }
+  false
+}
+
+// `boxRowMembersInto`'s walk: `canonUnionLeaves` with a literal union taken member by member.
+function boxRowLeaves(ty: i32, out: i32[]) {
+  if ty < 0 {
+    out.push(-1)
+    return 0
+  }
+  const t = tyAt(ty)
+  match t {
+    TyNullable => {
+      if t.nInner >= 0 { boxRowLeaves(t.nInner, out) }
+      out.push(-1)
+    }
+    TyUnion => {
+      for m in t.uMembers { boxRowLeaves(m, out) }
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      out.push(ty)
+    }
+  }
+  0
 }
 
 // `canonUnionMemberTysOf`'s walk: a nullable's inner then its `null`, a union's members in

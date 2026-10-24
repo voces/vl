@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 16 retired, 5 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; the registry's own split disagrees with canonical members in 2,573 files, so minting by type changes box tags; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a cycle-reaching, twin-list or unrendered member; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -1519,19 +1519,54 @@ What each slice changes:
     by name. A re-probe over 16,641 files: of those 26, `unionSpellingOfTy` agrees with the render
     in 18, differs in 3 and declines on a record member in 9. The canon key text differs in 7, and
     in 1 no row exists, so the render is the name minted.
-  - Left: the registry's own `recordUnMemTys`, `unionSetAtomsOf` and `unionSetMemberCount`.
-    They split a row's set spelling in box-tag order. A probe compared that split with
-    `canonUnionMembersInto` of the row's `unTyIx` over 16,641 files, 7,290 of which reach it:
-    - the member count differs in 2,573 files;
-    - where the counts match, the member types differ in 3,334, the atom spellings in 167, and
-      `null`'s position in 62.
+  - Landed, the step-5 ABI change: a row records its members from its type's canonical members,
+    not from a split of its set spelling. Box tags change with it. The split had differed from
+    `canonUnionMembersInto` of the row's `unTyIx` in member count in 2,573 of 7,290 files and,
+    where the counts matched, in member types in 3,334, atom spellings in 167 and `null`'s
+    position in 62. Each disagreement family was ablated and decided:
+    - **A literal-only union** (2,574 files, a count that differed by one): canon collapses a
+      run of literals to its alias, while the box stores each literal at its base scalar. The
+      row takes the literals one by one, softened (`softenLitTy`).
+    - **Repeats** (15 files): canon's deduplication is turned off for a row. Box tags are
+      positional, and a member set is never deduplicated.
+    - **A function arm** keeps its group parens, which the atom readers key on.
+    - **A member that reaches a cycle**: canon spells a recursive arm unrolled, and an unrolled
+      atom's field row never closes, so the compiler recursed without end. A re-minted arm
+      reaches the cycle without reaching itself, so the test is `tyReachesCycle`, not
+      `tyReachesSelf`. These rows fall back to the split.
+    - **A list of a record with a same-shape twin** (`Rec2[]|Rec[]|null`): the row's `unTyIx` is
+      the parse of a spelling that merged the two (D3503), so it falls back to the split.
+    - **Everything else**, the spelling, `null`-position, member-type and alias families: canon's
+      members are used, and the output is identical or runs the same.
 
-    Minting from canonical members would therefore change box-tag order and arity. It is the
-    step-5 ABI change itself, not a swap that leaves output identical.
+    The writer is `boxRowMembersInto` (`check_program`). Over the self-compile and 16,647 files,
+    rows took canon's members in 15,955 events in 7,272 files. They fell back in 180 events in 48
+    files, and every row had a `unTyIx`. The fallbacks are:
+    - recursive aliases and recursive record unions, the bulk;
+    - the three twin-list rows;
+    - two rows whose member has no nominal render: `((T)=>void)|string` in a generic body, and
+      the record pair `A|Sq2`.
 
-    Using the row type's members only where an atom has no type gains nothing: every such row
-    has `unTyIx` -1. Where both answer, they agree in 23,333 events and differ in 186, each a
-    literal against its widened type.
+    Measured on the change:
+    - difftree `--identity`: 21 of 16,534 files differ. They are four generics cases and 17 d3140
+      named cells, and each runs with master's output. The disassembly shows renumbered tag
+      constants, and dispatch arms reordered with them.
+    - The distilled corpus moved 0 cells.
+    - rep-fuzz is exact.
+    - The capability probes are unchanged at 198 of 209.
+    - diderven builds byte-identical.
+
+    `unionSetAtomsOf` and `unionSetMemberCount` already answer from the row whenever `set` is a
+    row's own set, so they now answer canon's members. Their split answers only for a set no row
+    records. `recordUnMemTys` keeps the split as its fallback. Three changes retire it:
+    - canon renders a cycle-reaching arm by its alias name;
+    - `mintInlineUnion` records the registered type rather than a spelling's parse;
+    - a generic body's row is no longer minted.
+  - Done: 1 parse. `markRefArrayArmsOf` interns nothing for an uncovered row. With rows minted
+    from canon, covered rows answer 108,341 events in 7,289 files. One file reaches the
+    fallback, with 6 events, each answering false: the generic-body row `((T)=>void)|string` in
+    `closures/generic-written-into-function-or-string-union-slot.vl`. The `#anon0[]|i32[]` row
+    the fallback was kept for is now covered.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
   `structIndexOfLet` answer by type.
 
