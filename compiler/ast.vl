@@ -2593,9 +2593,13 @@ export function getDeclExported(fnIx: i32): boolean {
 // The `export function`/`let`/`const` declarations the parser saw, by node: the parser drops
 // the keyword, and a caller in another module or the host may consume what one returns.
 let exportDeclNodes: {[i32]: boolean} = Map()
+// The same nodes in add order, so a bank reads a module's rows off this list rather than
+// probing the map at every node of its range.
+let exportDeclOrder: i32[] = []
 
 export function exportDeclAdd(ix: i32) {
   exportDeclNodes[ix] = true
+  exportDeclOrder.push(ix)
   ix
 }
 
@@ -2624,6 +2628,7 @@ export function getDeclReset() {
   getDeclNodes = []
   getDeclExps = []
   exportDeclNodes = Map()
+  exportDeclOrder = []
   valueIfNodes = []
   brkValSeen = false
   lblBlkSeen = false
@@ -3997,11 +4002,7 @@ function pbMvPush(dst: i32[], xs: i32[], lo: i32, hi: i32, d: i32) {
 export function pbInts(xs: i32[], from: i32): i32[] {
   if from >= xs.length { return [] }
   const out: i32[] = __array_new__(xs.length - from, 0)
-  let i = from
-  while i < xs.length {
-    out[i - from] = xs[i]
-    i = i + 1
-  }
+  __array_copy__(out, 0, xs, from, xs.length - from)
   out
 }
 
@@ -4024,6 +4025,14 @@ function pbBools(xs: boolean[], from: i32): boolean[] {
     i = i + 1
   }
   out
+}
+
+// `dst` with bank column `xs` appended moved by `d`, as `pbMvPush` would leave it; an empty
+// `dst` with no move takes a copy, since `pbSideTake` already proved the rows in range.
+function pbMvCat(dst: i32[], xs: i32[], hi: i32, d: i32): i32[] {
+  if dst.length == 0 && d == 0 { return pbInts(xs, 0) }
+  pbMvPush(dst, xs, 0, hi, d)
+  dst
 }
 
 function pbIntPush(dst: i32[], xs: i32[]) {
@@ -4078,6 +4087,7 @@ export function pbSideOpen(): i32[] {
     dgSpanIdx.length,
     dgCodeIdx.length,
     tsStack.length,
+    exportDeclOrder.length,
   ]
 }
 
@@ -4085,6 +4095,33 @@ export function pbSideOpen(): i32[] {
 function pbGrew(len: i32, open: i32) {
   if len < open { pbBad = true }
   0
+}
+
+// The exported declarations in `[nb, ne)`, ascending and moved by `-nb`: read off the rows
+// added since `from` when those are ascending and in range, else by probing every node.
+function pbExportsIn(from: i32, nb: i32, ne: i32): i32[] {
+  const exps: i32[] = []
+  let k = from
+  while k < exportDeclOrder.length {
+    const x = exportDeclOrder[k]
+    const n = exps.length
+    if x < nb || x >= ne || (n > 0 && exps[n - 1] >= x - nb) {
+      return pbExportsScan(nb, ne)
+    }
+    exps.push(x - nb)
+    k = k + 1
+  }
+  exps
+}
+
+function pbExportsScan(nb: i32, ne: i32): i32[] {
+  const exps: i32[] = []
+  let i = nb
+  while i < ne {
+    if exportDeclNodes[i] ?? false { exps.push(i - nb) }
+    i = i + 1
+  }
+  exps
 }
 
 // The side-table rows the parse since `pbSideOpen` (`o`) appended, relative to its ranges.
@@ -4113,12 +4150,7 @@ export function pbSideTake(o: i32[]): PbSide {
   if !dntOn { dntFrom = declNameTok.length }
   let tplFrom = nb
   if !tplOn { tplFrom = tplHole.length }
-  const exps: i32[] = []
-  let i = nb
-  while i < ne {
-    if exportDeclNodes[i] ?? false { exps.push(i - nb) }
-    i = i + 1
-  }
+  const exps = pbExportsIn(o[30], nb, ne)
   const exPB: i32[] = []
   const exPN: i32[] = []
   const exP: string[] = []
@@ -4228,14 +4260,18 @@ export function pbSidePut(s: PbSide, nb: i32, nn: i32, tb: i32, nt: i32) {
   pbMvPush(tsKidStart, s.tsS, 0, nk + 1, kb)
   pbIntPush(tsKidCount, s.tsC)
   pbMvPush(tsKids, s.tsKd, 0, ns, sb)
-  pbMvPush(nodeToks, s.ntok, 0, nt, tb)
+  nodeToks = pbMvCat(nodeToks, s.ntok, nt, tb)
   if s.dntOn {
     while declNameTok.length < nb { declNameTok.push(-1) }
-    pbMvPush(declNameTok, s.dnt, 0, nt, tb)
+    declNameTok = pbMvCat(declNameTok, s.dnt, nt, tb)
   }
   if s.tplOn {
     while tplHole.length < nb { tplHole.push(0) }
-    pbIntPush(tplHole, s.tpl)
+    if tplHole.length == 0 {
+      tplHole = pbInts(s.tpl, 0)
+    } else {
+      pbIntPush(tplHole, s.tpl)
+    }
   }
   pbMvPush(annTsNode, s.annN, 0, nn, nb)
   pbMvPush(annTsRoot, s.annR, 0, ns, sb)
@@ -4263,7 +4299,7 @@ export function pbSidePut(s: PbSide, nb: i32, nn: i32, tb: i32, nt: i32) {
   pbMvPush(braceNameStmts, s.bns, 0, nn, nb)
   let i = 0
   while i < s.exps.length {
-    exportDeclNodes[s.exps[i] + nb] = true
+    exportDeclAdd(s.exps[i] + nb)
     i = i + 1
   }
   pbMvPush(recDupField, s.rdf, 0, nn, nb)
