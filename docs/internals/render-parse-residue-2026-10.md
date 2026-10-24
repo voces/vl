@@ -129,8 +129,8 @@ the slice retires.
 | C3 | shape-intern walkers take field types (landed: 11 retired, 5 left and reclassed D: each is a key the walk parses back, which goes with the type-keyed shape interner) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
-| D1 | ref-list slot keyed by type (landed: 12 retired, 18 left; the `rlMapElemValSlot` fall-through waits on D8) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
-| D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
+| D1 | ref-list slot keyed by type (landed: 13 retired, 17 left; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; re-probed at fec5cd698: the `fill`, `.map` result and `string\|null` renders name rows not minted yet, and the rest are producers and grammar predicates) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
+| D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; re-checked at fec5cd698: D1's retired reader unblocks none, and the rest waits on a ref-list mint keyed by type) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
@@ -1153,12 +1153,30 @@ What each slice changes:
     is reached in 61 files and answers "" in all 61, and its originating fixture is now served
     by an earlier arm, so no program shows what a typed answer must equal. In 19 of the 61 the
     name has no recorded member set. `refArrElemNameIf`'s D2 entry goes with this caller.
+  - Done, byte-identical: 1 parse. `rlMapElemValSlot`'s fall-through parsed the element
+    spelling for its value name and found the mv slot by it. The ref-list mint now records the mv
+    slot a map element's value took (`rlElemMvSlot`, beside `rlElemMapKey`), and the reader
+    returns that column when the typed twin `rlElemMapValMvSlotAt` misses. The typed twin alone
+    missed in `a000044`, a map of `{r: N}` with `N = 1 | 2`, whose mv slot was minted from the
+    rendered `{r:i32}`. Over the self-compile and 16,651 fixture and corpus files, the recorded
+    slot agreed with the spelling's in all 115 files that reach the fall-through (274 events),
+    including `a000044`. The identity diff over 16,539 files finds no differing module, and the
+    seed grows 106 bytes.
+  - Re-probed at fec5cd698, over the self-compile and 16,651 files, against the stored name of
+    the row `rlSlotOfTy` keys by the same type:
+    - `refListElemNameOfCall`'s `fill` render: 6 files, 4 differ. In all 4 the row does not exist
+      yet (`i32[]`, `string[]`, `{[string]:i32}`, `{count:i32,symbol:i32}`), because the
+      caller interns it under this name.
+    - `mfListResultElemName`: 6 files, 4 differ. Rows not minted yet (`f64[]`, `{a:i32}[]`,
+      `i32[][]`), a closure element stored as `((i32)=>i32)`, and in
+      `list-element-narrowing-callback-and-loop-runs.vl` the typed lookup lands on `i32[]`
+      where the spelling names `S[]`.
+    - `synthEmptyListAnn`'s `string|null` element has no ref-list row (3 of 3 files reaching
+      it): the render is the annotation text it synthesizes.
+
+    All three render the name the caller then mints a row under, so they go with a ref-list
+    mint keyed by type, not with a typed lookup.
   - Left elsewhere:
-    - `synthEmptyListAnn`'s `string|null` element has no ref-list row (3 of 4 files).
-    - `rlMapElemValSlot`'s fall-through is live in 115 files. Its typed twin,
-      `rlElemMapValMvSlotAt`, agrees in 114 and misses in `a000044`, a map of `{r: N}` with
-      `N = 1 | 2`. That mv slot was minted from the rendered `{r:i32}`, so it does not record the
-      held value type, and the swap turns the cell into an invalid module. It waits on D8.
     - The producers (`collectARefArrayAnn`, `ensureRefElemTy`, `forceCloListTypeOf`) mint the
       rows the typed lookup reads.
     - The nine `emit_base` grammar predicates go when their name-only callers in D2 and C5 take
@@ -1209,6 +1227,10 @@ What each slice changes:
 
     So the ten ladder-internal entries (`refArrShapeKindGo`, `nameIsRefArrayGo`,
     `refElemArrName` and `nameIsNulRefList`) are the last of D2 to go.
+  - Re-checked at fec5cd698, after D1 retired `rlMapElemValSlot`'s fall-through: that reader
+    called none of the 15, so none moves. Every ladder caller still wants an element name to
+    mint or find a name-keyed ref-list row, and D1's re-probe shows the typed lookup cannot stand
+    in for the mint. The next step for both slices is one ref-list mint keyed by type.
 - **D3.** The mono instance key and the `monoAnnPinName` ladder take the pin's type. Most of the
   slice is this one seam, and it carries 15 of the 52 D renders.
   - Done: the instance is keyed by type as well as by spelling. When the spelled key misses,
