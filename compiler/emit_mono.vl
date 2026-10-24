@@ -13508,9 +13508,9 @@ function monoCoerceAliasOfWrittenLet(
     if lf[1] < 0 { return false }
     const d = nodeAt(lf[1])
     if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return false }
-    if d.letKw != "const" && monoLetWrittenIn(lf) { return false }
     const iv = unwrapParen(d.letInit)
     if iv < 0 || !(nodeAt(iv) is Ident) { return false }
+    if d.letKw != "const" && monoLetWrittenIn(lf) { return false }
     if monoCoerceWrittenLetTys(iv, lf[0], tname, tys) { return true }
     ax = iv
     fr = lf[0]
@@ -17985,7 +17985,8 @@ function monoContainerElemTy(t: i32): i32 {
 // instances each function a write stores at its slot's (D4579). A slot pinned at none or at two,
 // or a stored container that is no literal, leaves the map alone.
 function monoPinMapValues(d: LetDecl, at: i32, ctx: i32): i32 {
-  if d.letInit < 0 || !monoLetWritesClosed(d, at, ctx) { return 0 }
+  if d.letInit < 0 || monoOpenMapValTy(d.letInit) < 0 { return 0 }
+  if !monoLetWritesClosed(d, at, ctx) { return 0 }
   const spell: string[] = []
   const nt = monoPinMapSlot(d.letInit, at, ctx, "", spell)
   if nt < 0 { return monoStoredSlotDecline(nt) }
@@ -18108,6 +18109,18 @@ function monoLetWriteRhsTyRec(w: i32, ctx: i32, rec: boolean): i32 {
   monoLetTyIx(b)
 }
 
+// The value type of the map (no set) the expression `mx` takes, when that type is open; -1
+// otherwise.
+function monoOpenMapValTy(mx: i32): i32 {
+  const rt = nodeTyIxOf(mx)
+  if rt < 0 || rt >= T.tys.length { return -1 }
+  const mt = tyAt(rt)
+  if !(mt is TyMap) || mt.mSet != 0 { return -1 }
+  const vty = mt.mVal
+  if vty < 0 || vty >= T.tys.length || !monoTyOpen(vty) { return -1 }
+  vty
+}
+
 // The map type the map expression `mx` takes, the initializer of the `const` declared at `at` or,
 // with `fld`, that binding's field `fld` (D9062), as `monoPinMapValues` gives it, with its
 // spelling pushed onto `spell`; its writes are instanced and its reads typed. -1 when the map is
@@ -18121,12 +18134,10 @@ function monoPinMapSlot(
 ): i32 {
   const d = nodeAt(at)
   if !(d is LetDecl) { return -1 }
-  const rt = nodeTyIxOf(mx)
-  if rt < 0 || rt >= T.tys.length { return -1 }
-  const mt = tyAt(rt)
-  if !(mt is TyMap) || mt.mSet != 0 { return -1 }
-  const vty = mt.mVal
-  if vty < 0 || vty >= T.tys.length || !monoTyOpen(vty) { return -1 }
+  const vty = monoOpenMapValTy(mx)
+  if vty < 0 { return -1 }
+  const mt = tyAt(nodeTyIxOf(mx))
+  if !(mt is TyMap) { return -1 }
   if monoMapValueUnpinnedCall(d.letName, fld, ctx, at) { return -1 }
   const lf: i32[] = [ctx, at]
   const stored = monoMapStoredValues(at, lf, fld)
@@ -19259,10 +19270,11 @@ function monoAliasCellRead(at: i32, ctx: i32): i32[] {
     if lf[1] < 0 { return none }
     const d = nodeAt(lf[1])
     if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return none }
-    if d.letKw != "const" && monoLetWrittenIn(lf) { return none }
     const iv = unwrapParen(d.letInit)
     if iv < 0 { return none }
     const cn = monoCellReadName(iv)
+    if cn == "" && !(nodeAt(iv) is Ident) { return none }
+    if d.letKw != "const" && monoLetWrittenIn(lf) { return none }
     if cn != "" {
       if !monoReadsGeneratedCell(iv, lf[0]) { return none }
       const out: i32[] = [iv, lf[0]]
@@ -24259,7 +24271,6 @@ function monoPinTyParamComposite(
 // is itself non-generic, so a direct by-name call (which passes the null env a
 // non-capturing callee wants) is valid. Anything else keeps the per-element `call_ref`.
 function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
-  if !exprIsClosure(argIx, ctx) { return "" }
   const ax = unwrapParen(argIx)
   if ax < 0 { return "" }
   const an = nodeAt(ax)
@@ -24274,6 +24285,7 @@ function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
     fe = fnIndexOfInScopeAt(sidOfNode(ax), an.identName, ctx, ax)
   }
   if fe < 0 || fe >= fnStmts.length { return "" }
+  if !exprIsClosure(argIx, ctx) { return "" }
   if captureCountOf(fe) > 0 { return "" }
   if fe < monoGen.length {
     if monoGen[fe] == 1 { return "" }
@@ -27215,9 +27227,13 @@ function monoBindingAtPin(lf: i32[], nDecl: i32): i32 {
   for key in ["n:", "c:"] {
     for i in monoWritesOf(key, lf[1]) {
       const nd = nodeAt(i)
-      const wf = monoLetWriteFrame(lf, i)
-      if nd is BinExpr && wf.length == 1 {
-        if monoLamValueFe(nd.binRight, wf[0]) >= 0 { lam = true }
+      // Locating the write's frame walks the program, so a value that names no lambda and a
+      // binding already known to hold one skip it.
+      if !lam && nd is BinExpr && monoValueMayNameLam(nd.binRight) {
+        const wf = monoLetWriteFrame(lf, i)
+        if wf.length == 1 && monoLamValueFe(nd.binRight, wf[0]) >= 0 {
+          lam = true
+        }
       }
     }
   }
