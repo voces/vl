@@ -119,10 +119,10 @@ the slice retires.
 
 | slice | name | entries | A / C / D | renders / parses | files |
 | --- | --- | --- | --- | --- | --- |
-| A1 | shape-row typed twins | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
+| A1 | shape-row typed twins (landed: 0 retired, 14 left; re-probed at 2401febe6: callers with no type, typed rungs that differ, and the class C alias parameter) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
 | A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
-| A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
+| A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, 13 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted) | 13 | 0 / 13 / 0 | 0 / 13 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
@@ -155,6 +155,14 @@ What each slice changes:
   rows are class C, because a generic alias parameter is not a `TyVar` in the arena. The
   `rlElemNicheNullable` twin regressed D4721, so that row stays. Each row's `status` has the
   probe counts.
+
+  Re-probed at 2401febe6, still no parse retired. Every site is still reached by a caller with no
+  type: `mvValKindOfNameTy` in 7 files, `nulRefMapValInnerOfTy` in 3, `mapValKindLowerable` in 1,
+  and `nulScalarListKind` through `forceAnnLeafReps`. Where the callers are typed, two of the
+  `mvValKindOfNameTy` rungs do not agree with the arena. Its func rung differs in 31 files, on
+  hole and generic fn values stored in maps, and its lit-union rung differs in 1. Moving those
+  rungs changes the rep, so it is not a refactor. The next step is the producers: the mv slot
+  and the generic-application arguments need to bank a type.
 - **A2.** These `emit_mono` predicates test the type they hold instead of rendering it.
   - Done, byte-identical: `monoModuleLetTyIs` and `monoModuleDupPin` compare the site's type
     with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
@@ -179,16 +187,24 @@ What each slice changes:
     typed, but its cut is the pin name it pushes. `internArmShapeAt` needs a declared-vs-inline
     answer the arena does not give, since both are a `TyObj`. Each row's `status` has the
     probe counts.
-- **A4.** `resolveShapeToNominal` on a rendered type becomes `shapeNominalOfTy`. The
-  signature-key sites that still render read `sigKeyOfTy`, which needs widening to cover them.
-  Landed for 2 parses: `cboxElemName` tests `TyArray`, and `recordedParamPinName`'s nullable
-  arm resolves under the null on the arena, which moves its render to B. The arena names two
-  witnesses' `{r:i32}|null` pin `Circle|null` where the name path did not, with the emitted
-  wasm byte-identical over every `tests/**/*.vl` and the distilled corpus. The other 6 stay,
-  and each row's `next` says why. `listUnionEmitName` renders a scalar list member as its
-  product. `resolveShapeToNominal` keeps `listUnionEmitName` and two `emit_rewrite` sites as
-  callers (D7 deleted `setAtomSpelling`). The four signature-key parses serve callers in
-  `emit_collect`, `emit_classify` and `emit_lit_atoms` that pass no type.
+- **A4.** Done: all 9 entries are closed, 7 parses retired and 2 renders moved to B.
+  - `cboxElemName` tests `TyArray`, and `recordedParamPinName`'s nullable arm resolves under
+    the null on the arena, which moves its render to B (2 parses). The arena names two
+    witnesses' `{r:i32}|null` pin `Circle|null` where the name path did not, with the emitted
+    wasm byte-identical over every `tests/**/*.vl` and the distilled corpus.
+  - C5 retired `cloNameSigKeyTy`'s nullable-closure cut and its arrow test (2 parses).
+  - `resolveShapeToNominal` is deleted (1 parse). Its two `emit_rewrite` callers ask
+    `shapeNominalOr(ctxTy, ctx)`, which keeps the render unless `declNominalOfTy` (the
+    arena's `shapeNominalOfTy`, less a literal's `#anon` row) names a declaration.
+    `listUnionEmitName` asks `declNominalOfTy` of each member and renders only a member it does
+    not name, so that render is the product and moves to B. A probe of old against new over
+    16,634 files found 3 where the arena names a declared `P[]` / `Circle[]` that the name path
+    left as `{x:i32}[]` / `{r:i32}[]`; the emitted wasm is byte-identical over 16,523 files.
+  - `unionArmSigKeyTy` and `cloNameSigKeyTy` drop their `annArrowAt` guard (2 parses). Each
+    guarded a call to `annSigKeyTy`, whose `annFnDecompose` already answers `""` with no
+    top-level arrow, so the guard repeated the parse. The name fallback that remains is
+    `annFnDecompose`'s own entry (C1). Its callers in `emit_collect`, `emit_classify` and
+    `emit_lit_atoms` still pass no type there.
 - **A5.** Atom-kind, closure-result-forcing, union-ref-arm and coalesce tests read the union row's
   member columns, or `valueAtomKindOfTy`, instead of `splitUnionAtoms`. Landed for 1 render and
   3 parses. The coalesce element kind asks `valueAtomKindOfTy` of the operand's non-null type.

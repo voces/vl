@@ -734,7 +734,7 @@ The ordered pass table — see the pass-manager block comment above
    before the shape passes, so the union's box + variants intern for the
    return. THE `collectU` EDGE IS STILL REQUIRED, but no longer for the reason this line
    used to give: arm 1 read the union registry (`isUName`) and now asks the rung instead.
-   The edge survives via `resolveShapeToNominal`, which the two whole-span-shape arms call
+   The edge survives via `shapeNominalOr`, which the two whole-span-shape arms call
    and which reads `uVariants`. Stated so a later slice does not read arm 1's conversion as
    licence to drop the edge.
  · synthNulListRetAnns pins a NAMED un-annotated function's inferred
