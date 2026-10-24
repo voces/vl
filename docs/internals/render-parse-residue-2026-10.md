@@ -854,9 +854,25 @@ What each slice changes:
       where the name declines.
     - `checkArrName` disagrees only on numeric literal-union arrays (`D[]`, `type D = 1 | 2`),
       which render `i32[]` but have no scalar list kind by type.
-    - Untouched by constraint: emit_classify (2197, 16858, 18870, 18984, 18990) and
-      emit_mono (9595) call the grammar entries. `nameIsNulLitUnionList` is still called at
-      emit_classify:18990.
+    - Untouched by constraint: emit_mono (9595) calls the grammar entries.
+  - Landed: the five emit_classify callers ask the type. The same probe, over the
+    self-compile and 16,633 files:
+
+    | caller | agree | disagree | no type | now asks |
+    | --- | --- | --- | --- | --- |
+    | `exprNullableList`, map read (`nameIsI32Array`) | 1,947 (3,351) | 0 | 0 | `tyScalarListKind(mvValTyIxAt)` |
+    | `letIsArray`, uncovered annotation | 92 (269) | 0 | 0 | `tyScalarListKind` of the annotation |
+    | `exprNulStrArray`, narrowed binding (`nameIsNulStrList`) | 148 (1,392) | 0 | 0 | `tyScalarBackedListKind` of the narrowed node |
+    | `letIsStringArray`, uncovered annotation | 98 (294) | 0 | 9 (363) | `tyScalarListKind` of the annotation |
+    | `letIsStringArray`, `(K \| null)[]` reject | 98 (294) | 0 | 1 (3) | deleted |
+
+    - Every no-type event is a synthesized `#anon0[]`/`#anon1[]` (or `#anon0[]|i32[]`)
+      annotation where the name also answered false.
+    - The `(K | null)[]` reject repeated `annIsNulLitUnionArray` four lines above it, so it is
+      deleted rather than retyped.
+    - No ledger row retires and the census stays at 64 / 150: the removed calls were of the
+      `nameIs*` wrappers, which keep name-only callers in `emit_base`, `emit_shape_rows`,
+      `emit_collect`, `emit_mv_slots` and `emit_sig_tokens`.
     - `genTyParamArr`, `scalarListRepOfName`, `refArrShapeKindGo` and `refArrElemNameGo` read
       type-parameter grammar or name-keyed ladders, and their callers hold names only.
     - The census count is unchanged (154). The removed calls were of the `nameIs*` wrappers,

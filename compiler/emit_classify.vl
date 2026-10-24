@@ -297,11 +297,7 @@ import {
   nameIsBareMap,
   nameIsF32Array,
   nameIsF64Array,
-  nameIsI32Array,
   nameIsI64Array,
-  nameIsNulLitUnionList,
-  nameIsNulStrList,
-  nameIsStringArray,
   nameIsU8Array,
   nameNamesFunction,
   nulCloFlag,
@@ -1010,6 +1006,8 @@ import {
   rlSlotOfTy,
   sFieldElemKeyKindAt,
   sFieldIndex,
+  tyScalarBackedListKind,
+  tyScalarListKind,
 } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
@@ -2191,13 +2189,12 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
     // The map read is the same niche one container over (D1039): a read of a list-valued
     // map yields `i32[] | null` — a miss is the null — and the vals element is already
     // `(ref null $lTypeIdx)`. One arm covers the inline `if m[k] != null` and, through
-    // `letIsNulListInfer`, the un-annotated binding; `nameIsI32Array` is rep-wide on purpose.
+    // `letIsNulListInfer`, the un-annotated binding; any value on the i32 list's backing counts.
     const mvSh = mapShapeOfExpr(e.idxArr, fnIx)
     if mvSh >= 0 && mvSh < mvValName.length {
-      if nameIsI32Array(mvValName[mvSh]) { return true }
-      // D1107 — the value's own `| null`, which the name test cannot see: `mvValName` banks
-      // the declared spelling, so `{[string]: i32[] | null}` reads `"i32[] | null"` and
-      // `nameIsI32Array` declines it, while `globalCellKind` reads the element kind. Asked
+      if tyScalarListKind(mvValTyIxAt(mvSh)) == "list" { return true }
+      // D1107 — the value's own `| null`, which the test above declines (an `i32[] | null`
+      // value is not itself an array), while `globalCellKind` reads the element kind. Asked
       // of the element kind here too, so the cell and the read come from one home.
       if mvNulListValKind(mvSh) == "nullist" { return true }
     }
@@ -16853,10 +16850,7 @@ export function letIsArray(letIx: i32, fnIx: i32) {
       } else {
         // Kept for the shapes the arena leg declines (an inline litunion element, the
         // `(boolean|null)[]`/`(K|null)[]` niches) — unreached here is corpus-unreachable, not dead.
-        const lt = nodeAt(d.letType)
-        if lt is TypeRef {
-          if nameIsI32Array(lt.tyName) { return true }
-        }
+        if tyScalarListKind(nodeTyIxOf(d.letType)) == "list" { return true }
       }
     }
     return exprArray(d.letInit, fnIx)
@@ -18867,7 +18861,11 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
       }
       // A union binding narrowed to the `(string | null)[]` arm reads unboxed as the
       // string list whose ELEMENT stays `(ref null)` — the same nullable read discipline.
-      if nameIsNulStrList(narrowVariantFor(e.identName)) { return true }
+      if narrowSlotOf(e.identName) >= 0 {
+        if tyScalarBackedListKind(nodeTyIxOf(exprIx)) == "strlist" {
+          return true
+        }
+      }
       // A local/global binding (or a rebind chain `const t0 = g`) annotated
       // `(string | null)[]` — or `(string | null)[] | null`, narrowed via `t0 != null`.
       if identBindingNulStrList(e.identName, fnIx, 4) { return true }
@@ -18967,27 +18965,26 @@ export function letIsStringArray(letIx: i32, fnIx: i32) {
       // #1852, no string expression can reach here wrongly). Ahead of `annRepKindOf`, not
       // beside the name arms it mirrors: a covered annotation skips the name-arm block entirely.
       if tyIsLitUnionArray(nodeTyIxOf(d.letType)) { return false }
-      // Arena-first: a covered annotation answers both `nameIsStringArray` and the
-      // authoritative `nameIsRefArray` reject; the uncovered `(K|null)[]` niche keeps the name arm.
+      // Arena-first: a covered annotation answers both the string-list test and the
+      // authoritative ref-list reject; an uncovered one asks the annotation's type below.
       const k = annRepKindOf(d.letType)
       if k != null {
         if k == "strlist" { return true }
         if k == "reflist" { return false }
       } else {
-        // The `(K | null)[]` reject, structurally, must lead the name arms: the inline spelling
-        // of the same type renders as `(string | null)[]` after canon, matching the string niche.
+        // The `(K | null)[]` reject, authoritative over a string-first init literal (#1563), must
+        // lead the string arm.
         if annIsNulLitUnionArray(d.letType) { return false }
         // Live and asymmetric with its sibling `letIsI32List`: forcing this arm false uniquely
         // loses a corpus row where the arena legs above don't reach.
         const lt = nodeAt(d.letType)
         if lt is TypeRef {
-          if nameIsStringArray(lt.tyName) { return true }
+          if tyScalarListKind(nodeTyIxOf(d.letType)) == "strlist" {
+            return true
+          }
           // A ref-array annotation is authoritative (see `letIsF64Array`) — `annBareRefArrSlot`
           // answers the intern-state question for spellings `annRepKindOf` leaves uncovered.
           if annBareRefArrSlot(d.letType) >= 0 { return false }
-          // A `(K | null)[]` annotation is authoritative over a string-first init literal — kept
-          // because both arena legs return false-as-silence on an uncovered node, not "no". #1563.
-          if nameIsNulLitUnionList(lt.tyName) { return false }
         }
       }
     }
