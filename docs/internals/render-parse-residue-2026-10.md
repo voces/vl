@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a cycle-reaching, twin-list or unrendered member; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -1562,6 +1562,26 @@ What each slice changes:
     - canon renders a cycle-reaching arm by its alias name;
     - `mintInlineUnion` records the registered type rather than a spelling's parse;
     - a generic body's row is no longer minted.
+  - Narrowed: a cycle-reaching member takes canon's members when it reaches the cycle through a
+    declared name at once: it is a struct or a union alias, or a list or map of one. A one-member
+    alias body (`type WMap = {[string]: W}`) still declines, since the spelling names it and the
+    arena member does not. An answer probe over the self-compile and 16,648 files:
+    - Of the 180 fallback events in 48 files, 158 in 40 files now take canon's members. Their
+      non-null atoms match the split in every event, and the types match wherever the atoms do.
+    - 22 events in 13 files still fall back: recursive anonymous record unions that canon unrolls
+      (`{v:i32,next:Node|null}|{e:i32}|null`, the `#lu` Node variants), the twin lists (D3503),
+      the generic body `((T)=>void)|string`, the generic application `Box<Node>`, `{kind:"a",
+      cb:(Ev)=>i32}|…`, `string|{[string]:Arr[]}`, re-minted `null|f64|{[string]:J}` and
+      `{[string]:V}|V[]|f64|null`, and the alias-body row `f64|string|WMap`.
+    - difftree `--identity`: 2 of 16,536 files differ (`unions/pop-union-box-element.vl`,
+      `unions/twice-narrowed-alias-list-arm.vl`). Both run with master's output; the disassembly
+      renumbers tag constants by one, because a recursive alias's `null` is now its last member.
+    - Measured for the next step, `mintInlineUnion`: the registered type (`declTyIxOfName`)
+      equals the parsed `sty` in 1,623 events and is hole-equal in 1,151 more; it differs in 45
+      events in 32 files, on map-member unions (`{[i32]:boolean}|string`), the recursive Json
+      aliases, twin lists and `Circle|string`. `unionSetAtomsOf`'s split (37,066 events with no
+      row; 1,250 disagree with a row on member order or spelling) and `unionSetMemberCount`'s
+      (1,242,650 events, none typed) are not freed: their callers hold no type.
   - Done: 1 parse. `markRefArrayArmsOf` interns nothing for an uncovered row. With rows minted
     from canon, covered rows answer 108,341 events in 7,289 files. One file reaches the
     fallback, with 6 events, each answering false: the generic-body row `((T)=>void)|string` in
