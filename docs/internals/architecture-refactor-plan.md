@@ -154,7 +154,7 @@ order, subject to the one-writer rule.
 | --- | --- | --- |
 | T1 | **Done.** The host process ABI: `std:process` (`runProgram`, `exit`) and `std:env` (`getEnv`) shipped with their host imports; see ROADMAP's "Host ABI for VL scripts". | — |
 | T2 | L11 the VL way: per-file budgets run under `vl check --budget`. **Done.** See [T2 log](#t2-log). | none |
-| T3 | Dogfood the Python scripts in VL. **In progress.** Last: the last `scripts/*.py` tools ported and deleted. Remaining Python in gate rows includes the ratchets. See [T3 log](#t3-log). | T1 |
+| T3 | Dogfood the Python scripts in VL. **Done.** No tracked `.py` file is left, and the `no-python` row (`scripts/no-python.vl`, in `gate.sh` and CI) refuses a new one or a `python` invocation in a script. See [T3 log](#t3-log). | T1 |
 | T4 | L10: the `-O` optimizer. **Done:** R1–R8 run in the compiler, and R9 serves the same requests from the JS hosts. See [T4 log](#t4-log). | owner decision 3 below |
 | T5 | L12: the remaining LSP features. **Done:** every seed-backed feature lives in `lsp/src/features.ts`; `server.ts` is transport. See [T5 log](#t5-log). | A7 |
 | T6 | Check CPU: a CI run proves gate rows. **In progress.** Last: `scripts/ci-proof.sh` and `GATE_CI_PROOF`. The queue audit skips the rows that a `vl-queue/` push run proved on the same tree, seed, deno and rustc. Next: the queue pushes its candidate (the vl-tools proposal in the PR), then the audit reuses CI's proven seed. See [T6 log](#t6-log). | none |
@@ -1663,7 +1663,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 
 ### T3 log
 
-- **In progress.** `check-filed-witnesses.vl` and `distilled/regress.vl` are ported and run their gate rows; `check-filed-witnesses.py` and `scripts/inventory/*.py` are deleted (the row grammar is `scripts/lib/inventory.vl`, the queue `scripts/inventory/ls.vl`); `regress.py`, `index.py`, `redistil.py` and `gradecensus.py` are deleted for `index.vl`, `redistil.vl` and `census/gradecensus.vl`, which share `scripts/lib/corpus.vl` and `scripts/lib/census-grade.vl`; `cellmap.py` is deleted, its files read and written through `loadCells`/`dumpCells`.
+- `check-filed-witnesses.vl` and `distilled/regress.vl` are ported and run their gate rows; `check-filed-witnesses.py` and `scripts/inventory/*.py` are deleted (the row grammar is `scripts/lib/inventory.vl`, the queue `scripts/inventory/ls.vl`); `regress.py`, `index.py`, `redistil.py` and `gradecensus.py` are deleted for `index.vl`, `redistil.vl` and `census/gradecensus.vl`, which share `scripts/lib/corpus.vl` and `scripts/lib/census-grade.vl`; `cellmap.py` is deleted, its files read and written through `loadCells`/`dumpCells`.
 - `plumb-shape-cost.vl` (#3610) is the third: it runs the `plumb-shape cost` row in `gate.sh` and ci-native, and its port test replayed one recorded set of readings through the Python, byte-identical in report, exit code and baseline file for every outcome, and agreed on a real-tree `--check`.
 - Its CPU is serial by design, so it has no fan-out; it reads rusage through GNU `time`, sets a child's directory and environment through `env -C`, and hashes through `sha256sum`, the three `dogfood:` rows in ROADMAP.md on `runProgram` and digests.
 - Its control workload is `scripts/perf/plumb-shape-control.vl`, which times differently from the Python's, so the baseline's CPU fields need one `--write-baseline` with the VL tool on a quiet box before CPU is graded again; fuel and RSS are unaffected.
@@ -1675,7 +1675,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - `scripts/silent-sweep/` is down to three `.py` files from 55: the census readers `delta`, `coverage`, `siblings`, `rescue`, `families` and `d243/mkset` are `census/*.vl` over a shared `scripts/lib/census-read.vl`, byte-identical to the Python on two real census blocks and pinned by `tests/vl_census_readers_test.ts`, and the 46 one-shot grid generators, ablators and the 2026-08 sweep's `REPRODUCE.md` Python are deleted, their READMEs kept and dated.
 - The census generators `gencensus`, `mkmatrix` and `sabcensus` are `census/*.vl` too, pinned by `tests/vl_census_generators_test.ts`, so `scripts/silent-sweep/` has no Python.
 - The last `scripts/*.py` tools are ported and deleted the same way, each run beside its Python and pinned by a test: `sentinel-census`, `wasm-runner-census`, `twin-agreement`, the four wasm fixture generators (over `scripts/lib/wasm-cases.vl`), `emit-refusal-sites`, `codemods/label-at`, and `ladder-census` and `rep-classifier-census` (over `scripts/lib/ladder-walk.vl`, which `ladder-sets.vl` now shares).
-- Remaining Python in gate rows includes the ratchets.
+- **Done** (2026-10-24): `git ls-files` lists no `.py` file, the ratchets run under `vl check --budget` (T2), and `scripts/no-python.vl` holds the line in `gate.sh` and CI.
 - Each gap found is filed as a `dogfood:` row.
 
 ### T4 log
