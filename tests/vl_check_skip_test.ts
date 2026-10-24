@@ -53,6 +53,7 @@ type Exports = {
   ifaceHashArm(on: number): number;
   ifaceHashDrop(mask: number): number;
   ifaceHashCount(): number;
+  ifaceHashOf(i: number, w: number): number;
   ifaceHashKeyLen(i: number): number;
   ifaceHashKeyAt(i: number, j: number): number;
   checkSkipArm(on: number): number;
@@ -1014,6 +1015,29 @@ const CASES: Case[] = [
     libUses: 'export function tl(n: i32): string { return "v\\{n}" }\n',
     uses: 'import "std:fmt"\nconst tm = 3\nprint("m\\{tm}")\n',
   },
+  {
+    // A body `is` against a recursive union asks the second pass about main's map delivery.
+    name: "a lib body starts testing a recursive union main delivers a map to",
+    want: "decline",
+    why: "pass",
+    from: "{ return 0 }",
+    to: "{\n  if r is Cfg { return r.port }\n  return 0\n}",
+    libUses: "export type Json = null | boolean | f64 | string | Json[] | { [string]: Json }\n" +
+      "type Cfg = { port: i32, host: string | null }\n" +
+      "export function jd(r: Json): i32 { return 0 }\n",
+    uses: 'import { jd, Json } from "./lib"\nconst jm: { [string]: Json } = Map()\nprint(jd(jm))\n',
+  },
+  {
+    // The re-export's target moves, so main's import resolves to another function.
+    name: "a re-export main imports names another lib function",
+    want: "decline",
+    why: "interface",
+    at: "rx.vl",
+    from: "area as",
+    to: "spare as",
+    extra: { "rx.vl": 'export { area as foo } from "./lib"\n' },
+    uses: 'import { foo } from "./rx"\nprint(foo(2))\n',
+  },
 ];
 
 const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
@@ -1194,6 +1218,18 @@ Deno.test({
     if (alone.served !== 0 || REASON[alone.reason] !== "demand") {
       throw new Error(`want IH_NO_CROSS alone to decline \`demand\`, got ${REASON[alone.reason]}`);
     }
+    // `IH_NO_IMPORT_MAP` hides a moved re-export from the resolved guard; the reach row's own
+    // change still declines it, one guard later.
+    const rx = CASES.find((c) => c.name.startsWith("a re-export main imports"))!;
+    const late = grade(rx, true, masked(p, 262144)).got;
+    if (late.served !== 0 || REASON[late.reason] !== "decor") {
+      throw new Error(`want IH_NO_IMPORT_MAP to decline \`decor\`, got ${REASON[late.reason]}`);
+    }
+    // A bank read under another mask is no bank: its hashes were taken with other ingredients.
+    const unmasked = check(masked(p, 0).warm, graphs(moved, false)[0]);
+    if (unmasked.served !== 0 || REASON[unmasked.reason] !== "no bank") {
+      throw new Error(`want the mask-262144 bank unread at mask 0, got ${REASON[unmasked.reason]}`);
+    }
   },
 });
 
@@ -1201,25 +1237,35 @@ Deno.test({
   name: "a second edit on top of a served check is served from the refreshed bank",
   ignore: !ENABLED,
   fn() {
-    const [g0, g1] = graphs(CASES[0], true);
+    // Main's self-function error carries data, and a served module's readings are carried, so
+    // every step is compared with the whole check's rows and with its hashes.
+    const uses = "function get(self: {[i32]: i32}, k: i32): i32 { k }\n";
+    const [g0, g1] = graphs({ ...CASES[0], uses }, true);
     const g2 = { ...g1, "lib.vl": g1["lib.vl"].replace("print(3)", "print(5)") };
+    // A mid edit after a lib edit, so mid's reach of lib is the one the served check carried.
+    const g3 = { ...g2, "mid.vl": g2["mid.vl"].replace("+ 1", "+ 2") };
     const warm = instance(true);
+    const plain = instance(false);
+    const hashes = (e: Exports) => {
+      const out: number[] = [];
+      for (let i = 0; i < e.ifaceHashCount(); i++) {
+        for (let w = 0; w < 9; w++) out.push(e.ifaceHashOf(i, w));
+      }
+      return out.join(",");
+    };
     check(warm, g0);
-    check(warm, g1);
-    const got = check(warm, g2);
-    const back = check(warm, g0);
-    const want2 = check(instance(true), g2);
-    const want0 = check(instance(true), g0);
-    if (got.served === 0 || back.served === 0) {
-      throw new Error(`want both re-checks served, got ${got.served} and ${back.served}`);
-    }
-    if (!same(got.diags, want2.diags) || !same(back.diags, want0.diags)) {
-      throw new Error(
-        `want the whole checks' diagnostics, got [${got.diags.join(" | ")}] / [${
-          back.diags.join(" | ")
-        }], want [${want2.diags.join(" | ")}] / [${want0.diags.join(" | ")}]`,
-      );
-    }
+    [g1, g2, g3, g0].forEach((g, i) => {
+      const got = check(warm, g);
+      const want = check(plain, g);
+      const held = hashes(warm) === hashes(plain);
+      if (got.served === 0 || !same(got.diags, want.diags) || !held) {
+        throw new Error(
+          `want step ${i + 1} served with the whole check's rows and hashes, got ${got.served}` +
+            ` served (${REASON[got.reason]}), [${got.diags.join(" | ")}] against` +
+            ` [${want.diags.join(" | ")}], hashes ${held ? "equal" : "differ"}`,
+        );
+      }
+    });
   },
 });
 
@@ -1267,12 +1313,17 @@ Deno.test({
   ignore: !ENABLED,
   fn() {
     // `prefer-interpolation` judges a chain opening with a parameter only from the typed `+`
-    // links, so lib's chain is reported by a paired lint and not by an unpaired one.
+    // links, so lib's chain is reported by a paired lint and not by an unpaired one; main's
+    // chain is in a served module, whose links the served check carries from the bank.
     const lib = `export function greet(n: string): string { return n + " a" + " b" + " c" }
 function quiet(): void { print(3) }
 export function noise(): void { quiet() }
 `;
-    const g0: Graph = { "main.vl": `import { greet } from "./lib"\nprint(greet("x"))\n`, "lib.vl": lib };
+    const main = `import { greet } from "./lib"
+function shout(n: string): string { return n + " !" + " ?" + " ." }
+print(greet(shout("x")))
+`;
+    const g0: Graph = { "main.vl": main, "lib.vl": lib };
     const g1 = { ...g0, "lib.vl": lib.replace("print(3)", "print(4)") };
     const warm = instance(true);
     check(warm, g0);
