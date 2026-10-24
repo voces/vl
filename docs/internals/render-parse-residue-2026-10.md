@@ -44,8 +44,8 @@ worked carries a `status` field as well, saying what moved and why the rest stay
 - `nameIsRefArray` with a type in hand is still **D**. The ref-list kind ladder answers through
   the struct and union tables by spelling, and its arena twin `tyElemIsRefListElem` admits more
   than it does (L6 log, 2026-10-20).
-- `structIndexOfLet`'s nullable rung is **D**, because every typed struct lookup disagrees with
-  the spelling on inline shapes; `structRowOfTy` comes closest (D6).
+- `structIndexOfLet`'s nullable rung was **D**, because every typed struct lookup of the time
+  disagreed with the spelling on inline shapes. D6 retired it with `structIndexOfNullPartTy`.
 
 ## Totals
 
@@ -134,7 +134,7 @@ the slice retires.
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; 5 retired, 18 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; probed: the atom tests and the uncovered-row fallback have atoms with no type, the rest are the registry's own split and the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
-| D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
+| D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 6 retired, 1 to B and since deleted, 4 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left; every mv slot banks a type, the mint classifies by it, 0 retired) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
@@ -1278,14 +1278,23 @@ What each slice changes:
     whose own render and type are the record's: 2,141 and 0 (`variantRowOfTy` alone differs in 1,
     an arm adopted by shape, D4668). The 8,273 files with no banked type have no row by spelling
     either. difftree `--identity` found 0 of 16,450 files differ.
-  - Left: `structIndexOfLet`'s nullable rung. It differs from `structRowOfTy` in 5 files, from
-    `structIndexOfTy` in 48 and from `repRowOfTyStruct` in 59: the type finds a row for a variant
-    arm (`Circle | null`) the spelling does not, picks a twin row, and finds none for a
-    literal-field shape.
-  - Left: the 3 renders. `internJoinedRecordRow`, `mintUnionFieldObjRow` and `internArmShapeRow`
-    key the shape interner, which interns by spelling (D34 also withholds the arm's type).
-    `mintUnionFieldObjRow`'s `structIndexOfTypeName(nm) < 0` test differs from `structRowOfTy` in
-    14 files and from `repRowOfTyStruct` in 6, so not even its decision moves.
+  - Done: `structIndexOfLet`'s nullable rung (1 parse). It asks `structIndexOfNullPartTy` of the
+    annotation's type: the non-null part's declared struct by `structNameOfTy`, which is none
+    for a variant arm, as by spelling. Otherwise it asks `joinRowScanOfTyMemo` over a record's
+    field types. The earlier blockers were `structIndexOfTy` missing inline shapes (48 files) and
+    `structRowOfTy` finding a row for the arm `Circle | null`. A probe over the self-compile and
+    16,635 files compared the binding's final row, after the next rung and the initializer.
+    6,247 files reached it and 0 differed. 8 files had no annotation type.
+  - Done: `internJoinedRecordRow`'s render. Its arm walk descends the type
+    (`internArmShapeOfTy`), and the deep intern goes through `internShapeDeepOfTy`, whose render
+    is C3's key. The typed walk and the render walk agreed in 98 of 98 files, and neither minted
+    an arm row there.
+  - difftree `--identity` found 0 of 16,524 files differ, 0 uncompared, and the fixpoint equal.
+  - Left: 2 renders. `mintUnionFieldObjRow` and `internArmShapeRow` key the shape interner, which
+    interns by spelling (D34 also withholds the arm's type). `mintUnionFieldObjRow`'s
+    `structIndexOfTypeName(nm) < 0` test differs from `structRowOfTy` in 14 files and from
+    `repRowOfTyStruct` in 6. The declared-name-then-field-scan reader that retired the let rung
+    differs in 17 of 128 files, in both directions, so not even its decision moves.
   - Left: the 6 parses in `mvValNamesCompat` and `shapeFieldTypeCompatK`, inside the name-keyed
     resolver. They go with `structIndexOfTypeName`, not one by one.
   - Banked, nothing retired: the callers that hold the shape's type ask the field-set scan over
