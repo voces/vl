@@ -125,7 +125,7 @@ the slice retires.
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, then the 3 in `monoAnnHasTyParam`, 5 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted; `monoAnnHasTyParam` asks the annotation node) | 5 | 0 / 5 / 0 | 0 / 5 | `emit_base` |
-| C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
+| C2 | instance cell signatures typed (landed: 2 retired, 3 left; the arrow tests wait on constructor producers that build signature text with no type, and the render is a synthesized TypeRef's name) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 10 retired, 6 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
@@ -701,10 +701,20 @@ What each slice changes:
   shaped too, so both `nameIsArray` entries retire (D3 leaves 19, down from 21). Site A's fallback count did
   not move: **398 before and 398 after** on this probe, which also tags the self-compile. These
   three producers were not where those events come from.
-- **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
-  sites whose cell spelling is a function type. Every producer of that spelling is text
-  (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSigTys`), so the change cannot
-  stay inside `emit_mono`. It follows C1.
+- **C2.** Landed after C1: 2 retired, 3 left. A probe over the self-compile and 16,641 files
+  (0 uncompared) tagged every arrow test and split the events at `monoCoerceFnValueTys` by
+  whether `expTy` is a function type.
+  - Retired: 2 guards that could not fire. `monoCoerceAliasOfCell` repeated the first test of
+    `monoCoerceWrittenCell` on the same string, and `monoCellConcreteTake` is reached only
+    after that test, which stripping null or parentheses cannot undo (22 events, all arrows).
+  - Left: the arrow tests in `monoCoerceWrittenCell` and `monoCoerceWrittenLetTys`. 5,409
+    arrow events carry no arena type, because the constructor producers (`monoSigFnTyName`,
+    `monoSeedCallSigTys`, `monoSlotPinNameTys`, `monoPlacePinNameTys`) build the spelling as
+    text. 138 events in 23 files carry a function type the test declines (a sigkey `=>i>i`,
+    `((i32)=>i32)`, a union of closures), so a typed test would change behaviour there.
+    `expTy` cannot carry the type, because `monoCoerceChoiceBinding` and `monoInstanceFor`
+    already read it.
+  - Left: `monoSigFnTyNameAt`'s render, which is a synthesized TypeRef's `tyName`.
 - **C3.** The `emit_shape_intern` walkers take the field type alongside the field text. A probe
   over the self-compile and 16,820 fixture and corpus files compared each site's spelling
   answer with a typed twin. Counts are files.
