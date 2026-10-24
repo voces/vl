@@ -2015,8 +2015,8 @@ fn engine_cache_tag(engine: &Engine) -> String {
 /// no file to read at startup). The two live in different directories and are never
 /// compared, so they need not agree, and this one does not: it is FNV-1a over 8-byte
 /// WORDS in four independent lanes, because the byte-at-a-time form is one serial
-/// multiply chain and costs ~2 ms over the 1.8 MB seed on EVERY `vl` invocation
-/// (measured; `docs/internals/perf-opportunities-2026-09.md` item 4 has the table).
+/// multiply chain (measured; `docs/internals/perf-opportunities-2026-09.md` item 4).
+/// A warm run does not compute it at all: `seed_identity` reads it from the stat memo.
 ///
 /// It only has to be stable and collision-free across seeds, never cryptographic: a
 /// collision costs one wrong-cache deserialize, which `cached_module` already falls
@@ -2552,20 +2552,30 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
         // Cranelift recompile: a `cp` between worktrees, a `fetch-seed.sh`, a CI cache
         // restore. Content keys have no freshness question to ask (different bytes ⇒
         // different file), so those all HIT, and two seeds can be alternated without
-        // evicting each other. Price: one read + hash of the ~1.8 MB seed per
-        // invocation, measured in `docs/internals/perf-opportunities-2026-09.md` item 4.
+        // evicting each other. The key comes from `seed_identity`, so a warm run reads
+        // the seed's stat memo instead of the seed; the bytes are read only to compile.
         CompilerSource::Path(compiler_path) => {
-            let bytes = seed_bytes(compiler_path).map_err(|e| {
-                Error::from(e).context(format!(
+            let loading = || {
+                format!(
                     "loading compiler module `{compiler_path}` (build it with: scripts/refresh-compiler.sh)"
-                ))
-            })?;
-            let sidecar = std::path::PathBuf::from(format!(
-                "{compiler_path}.{}.{tag}.cwasm",
-                seed_content_key(&bytes)
-            ));
+                )
+            };
+            let ids =
+                seed_identity(compiler_path).map_err(|e| Error::from(e).context(loading()))?;
+            let sidecar =
+                std::path::PathBuf::from(format!("{compiler_path}.{}.{tag}.cwasm", ids.key));
             let hit = sidecar.exists();
             let module = cached_module(engine, Some(&sidecar), hit, || {
+                let bytes =
+                    seed_bytes(compiler_path).map_err(|e| Error::from(e).context(loading()))?;
+                // The memo vouched for the file as it was when it was stat'ed; bytes that
+                // hash differently were written since, and `compiler_hash` may already
+                // have answered for the old ones. Dropping the memo lets the next run
+                // resolve the identity from the bytes.
+                if seed_content_key(&bytes) != ids.key {
+                    let _ = std::fs::remove_file(format!("{compiler_path}.key"));
+                    bail!("the compiler seed `{compiler_path}` changed while this run was loading it; run it again");
+                }
                 Module::from_binary(engine, &bytes).map_err(|e| {
                     e.context(format!(
                         "loading compiler module `{compiler_path}` (build it with: scripts/refresh-compiler.sh)"
@@ -3367,20 +3377,72 @@ fn staged_root_and_cwd() -> (String, String) {
     )
 }
 
+/// One read of the seed file: its bytes, plus the stat and the clock taken just BEFORE the
+/// read, which are what `write_seed_memo` needs to prove the bytes belong to that stat.
+#[derive(Clone)]
+struct SeedRead {
+    bytes: Arc<Vec<u8>>,
+    stamp: Option<SeedStamp>,
+    at: std::time::SystemTime,
+}
+
 /// The seed file's bytes, read ONCE per process and path: `load_compiler_module` compiles
 /// these and `compiler_hash` hashes these, so a seed replaced on disk mid-run (another
 /// shell's `refresh-compiler.sh`) cannot file one seed's output under the other's key.
-fn seed_bytes(path: &str) -> std::io::Result<Arc<Vec<u8>>> {
-    static SEED: Mutex<Option<(String, Arc<Vec<u8>>)>> = Mutex::new(None);
+fn seed_read(path: &str) -> std::io::Result<SeedRead> {
+    static SEED: Mutex<Option<(String, SeedRead)>> = Mutex::new(None);
     let mut slot = SEED.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((p, bytes)) = slot.as_ref() {
+    if let Some((p, read)) = slot.as_ref() {
         if p == path {
-            return Ok(bytes.clone());
+            return Ok(read.clone());
         }
     }
-    let bytes = Arc::new(std::fs::read(path)?);
-    *slot = Some((path.to_string(), bytes.clone()));
-    Ok(bytes)
+    let at = std::time::SystemTime::now();
+    let stamp = seed_stamp(path);
+    let read = SeedRead {
+        bytes: Arc::new(std::fs::read(path)?),
+        stamp,
+        at,
+    };
+    *slot = Some((path.to_string(), read.clone()));
+    Ok(read)
+}
+
+fn seed_bytes(path: &str) -> std::io::Result<Arc<Vec<u8>>> {
+    seed_read(path).map(|r| r.bytes)
+}
+
+/// What a seed IS to the two caches keyed on it: `key` names its `.cwasm` sidecar
+/// (`seed_content_key`), and `sha`, when already known, is `compiler_hash`'s answer.
+#[derive(Clone)]
+struct SeedIds {
+    key: String,
+    sha: Option<[u8; 32]>,
+}
+
+/// The seed's identity, resolved ONCE per process and path. A valid `<seed>.key` memo
+/// answers it without reading the seed; otherwise the seed is read and hashed, and the
+/// memo is rewritten for the next process. DECISIONS.md, "The seed's identity is
+/// memoised by its stat".
+fn seed_identity(path: &str) -> std::io::Result<SeedIds> {
+    static IDS: Mutex<Option<(String, SeedIds)>> = Mutex::new(None);
+    let mut slot = IDS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((p, ids)) = slot.as_ref() {
+        if p == path {
+            return Ok(ids.clone());
+        }
+    }
+    let ids = match read_seed_memo(path) {
+        Some(ids) => ids,
+        None => {
+            let read = seed_read(path)?;
+            let key = seed_content_key(&read.bytes);
+            let sha = write_seed_memo(path, &read, &key);
+            SeedIds { key, sha }
+        }
+    };
+    *slot = Some((path.to_string(), ids.clone()));
+    Ok(ids)
 }
 
 /// The SHA-256 of the seed bytes this process compiles with — the compile cache's compiler
@@ -3389,8 +3451,114 @@ fn compiler_hash(source: &CompilerSource) -> Option<[u8; 32]> {
     static HASH: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
     *HASH.get_or_init(|| match source {
         CompilerSource::Embedded(bytes) => Some(sha256(bytes)),
-        CompilerSource::Path(p) => seed_bytes(p).ok().map(|b| sha256(&b)),
+        CompilerSource::Path(p) => match seed_identity(p).ok()?.sha {
+            Some(sha) => Some(sha),
+            None => seed_bytes(p).ok().map(|b| sha256(&b)),
+        },
     })
+}
+
+/// Everything about the seed file that a rewrite of its content changes: a write moves
+/// ctime (which no caller can set), a replacement moves the inode, a copy the inode or
+/// device. Unix only; elsewhere there is no stamp, so no memo is read or written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SeedStamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+fn seed_stamp(path: &str) -> Option<SeedStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    if !m.is_file() || m.ctime() <= 0 {
+        return None;
+    }
+    Some(SeedStamp {
+        dev: m.dev(),
+        ino: m.ino(),
+        size: m.size(),
+        mtime: (m.mtime(), m.mtime_nsec()),
+        ctime: (m.ctime(), m.ctime_nsec()),
+    })
+}
+
+#[cfg(not(unix))]
+fn seed_stamp(_path: &str) -> Option<SeedStamp> {
+    None
+}
+
+const SEED_MEMO_FORMAT: &str = "vlseedkey1";
+
+/// A memo line's stamp fields, in the order `read_seed_memo` compares them.
+fn render_seed_stamp(s: &SeedStamp) -> String {
+    format!(
+        "{} {} {} {} {} {} {}",
+        s.dev, s.ino, s.size, s.mtime.0, s.mtime.1, s.ctime.0, s.ctime.1
+    )
+}
+
+/// The memo's identity when every stamp field matches the seed's stat NOW, else `None`:
+/// a missing, malformed or foreign-format memo, or one taken against other bytes.
+fn read_seed_memo(path: &str) -> Option<SeedIds> {
+    let stamp = seed_stamp(path)?;
+    let text = std::fs::read_to_string(format!("{path}.key")).ok()?;
+    let fields: Vec<&str> = text.strip_suffix('\n')?.split(' ').collect();
+    let [format, stamp_fields @ .., key, sha] = fields.as_slice() else {
+        return None;
+    };
+    let is_hex = |s: &str, n: usize| {
+        s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if *format != SEED_MEMO_FORMAT
+        || stamp_fields.join(" ") != render_seed_stamp(&stamp)
+        || !is_hex(key, 16)
+        || !is_hex(sha, 64)
+    {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    for (i, b) in digest.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&sha[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(SeedIds {
+        key: key.to_string(),
+        sha: Some(digest),
+    })
+}
+
+/// Record `key` and the bytes' SHA-256 against the stamp taken before `read`, and return
+/// that SHA-256 — only when the stat is unchanged after the read, and the read began at
+/// least two seconds after the seed's last change, so no write can have landed inside the
+/// same timestamp tick unseen. Otherwise `None` and no memo. Best-effort and atomic.
+fn write_seed_memo(path: &str, read: &SeedRead, key: &str) -> Option<[u8; 32]> {
+    let before = read.stamp?;
+    if seed_stamp(path)? != before {
+        return None;
+    }
+    let began = read
+        .at
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    if began < before.ctime.0 + 2 {
+        return None;
+    }
+    let sha = sha256(&read.bytes);
+    let line = format!(
+        "{SEED_MEMO_FORMAT} {} {key} {}\n",
+        render_seed_stamp(&before),
+        hex(&sha)
+    );
+    let memo = format!("{path}.key");
+    let tmp = format!("{memo}.{}.tmp", std::process::id());
+    if std::fs::write(&tmp, line).is_ok() && std::fs::rename(&tmp, &memo).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Some(sha)
 }
 
 /// command-queue pump.
