@@ -126,7 +126,7 @@ the slice retires.
 | A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left, because a generic body's target has no row and no pinned type) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, then the 3 in `monoAnnHasTyParam`, 5 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted; `monoAnnHasTyParam` asks the annotation node; the 5 left re-probed per site, none swaps) | 5 | 0 / 5 / 0 | 0 / 5 | `emit_base` |
 | C2 | instance cell signatures typed (landed: 2 retired, 3 left; the arrow tests wait on constructor producers that build signature text with no type, and the render is a synthesized TypeRef's name) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
-| C3 | shape-intern walkers take field types (landed: 10 retired, 6 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
+| C3 | shape-intern walkers take field types (landed: 11 retired, 5 left and reclassed D: each is a key the walk parses back, which goes with the type-keyed shape interner) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 12 retired, 18 left; the `rlMapElemValSlot` fall-through waits on D8) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
@@ -849,6 +849,21 @@ What each slice changes:
   - Left after it: 6. The nullable peels still differ by key (233 and 11 files). Their no-type
     reaches fell from 40 to 25 files at `internShapeDeepTy`'s peel, and the map-value
     recursion's to 136. The four key producers are unchanged.
+  - Done in a fourth landing: 1 parse, over the self-compile and 16,648 files. The value-union
+    arm loop in `internShapeDeepTy` reads its arm spellings from the row it has just
+    registered (`unionSetAtomsOf`), not by splitting the name. The row is found under the name
+    in all 60 files that reach it, so the split fallback never fires, and the arrow answer per
+    arm agrees in 59 of 59. The arm lists differ in 1 file, `permuted-object-closure-arms.vl`,
+    whose two permuted closure arms are one recorded atom. difftree --identity over the 60
+    files found 0 of 59 built differ.
+  - Left after it: 5, reclassed **D**. A fifth probe kept the earlier counts: the deep
+    nullable peel differs in 235 files and 1,855 reach it with no type, the map value differs
+    in 1,390 and 137 reach it with no type, the fn-type peel differs in 11, and the element
+    peel differs in 0, but its base name still decides declared record against inline shape.
+    Each is a key that the walk parses back (method rule 3, so not **B**): the render every
+    row is filed under, the two peeled spellings, the map-value spelling, and the base name.
+    They go when the inline-shape interner (`internInlineShapeTy`, `registerValueUnionNameAB`,
+    `gaeEnsure`) is keyed by type.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
   already holds. Landed for 1 render and 2 parses: `elemIsLitUnion` became `tyIsLitUnion` of
   the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal
