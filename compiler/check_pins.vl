@@ -3,6 +3,8 @@
 // solver finds and applies; this file decides when a re-check runs, when a pending rewrite is
 // declined, and the order refusals are reported in. It also holds D3817's policy, which reads
 // what the parameter solve saw of an uncalled entry export.
+// Last, over a program with no error, it rewrites each deep `is` site to call a generated walker
+// and checks the program once more.
 import {
   BinExpr,
   Block,
@@ -38,7 +40,12 @@ import { checkProgramPass } from "./check_program"
 import { luSpell } from "./check_annot_resolve"
 import { tErr } from "./check_relate_core"
 import { lbiSymTypes } from "./check_decl_scan"
-import { identFlushPending, recordClosedHoles } from "./check_side_rows"
+import {
+  identFlushPending,
+  jwSiteNode,
+  recordClosedHoles,
+} from "./check_side_rows"
+import { jwExpand } from "./json_walk"
 import {
   declIsExportedFn,
   expObsPinAt,
@@ -79,10 +86,10 @@ import {
   lbiPending,
   lbiReset,
 } from "./check_num_lit_state"
-import { tyEq, tyToStrUser } from "./check_types"
+import { T, tyEq, tyToStrUser } from "./check_types"
 import { fnDeclIx } from "./check_write_scan"
 import { demangleName } from "./check_suggest"
-import { symFlushPending } from "./check_sym_occ"
+import { jwSetGenTokStart, symFlushPending } from "./check_sym_occ"
 import { wsDecline, wsReset, wsStep } from "./check_width"
 
 // The re-checking solvers, in the order the driver runs them after the first walk: an uncalled
@@ -93,19 +100,36 @@ type PinPhase = "expParam" | "width" | "literal"
 // Whether this check undid an adoption over a refusal, which may be outside the adopting module.
 export let pinAdoptUndid = false
 
+// Whether this check expanded its deep `is` sites and checked the program again, which leaves
+// no site recorded; a bank of the check cannot replay that pass.
+export let pinDeepIsRan = false
+// Staged by `pinDeepIsHold` for the next `checkProgram` only; `pinDeepIsOff` is that check's copy.
+let pinDeepIsHeld = false
+let pinDeepIsOff = false
+
+// Keeps the next check from expanding deep `is` sites: a check of part of a module graph, whose
+// caller declines it and checks the whole graph when a site is recorded.
+export function pinDeepIsHold() {
+  pinDeepIsHeld = true
+  0
+}
+
 // The checker's entry point; `initChecker()` must have run first. A literal binding whose uses
 // give it another type than its default is re-checked with that type written as its annotation;
 // the refusals of bindings no type satisfies are reported by the last pass, and an empty-list
 // hole still open after it closes to its `i32` element.
 export function checkProgram(rootIx: i32) {
   expInfReset()
+  pinDeepIsRan = false
+  pinDeepIsOff = pinDeepIsHeld
+  pinDeepIsHeld = false
   checkProgramResumed(rootIx)
 }
 
 // `checkProgram` over a tree an earlier check of the same program already pinned, keeping
 // D3817's rows: its annotations are written into the tree, so a fresh solve would infer nothing
 // and lose both its hints and the pins the redundancy lint reads (D5490).
-export function checkProgramResumed(rootIx: i32) {
+function checkProgramResumed(rootIx: i32) {
   pinAdoptUndid = false
   expObsReset()
   lbiReset()
@@ -120,6 +144,22 @@ export function checkProgramResumed(rootIx: i32) {
   if wsDecline() { checkProgramAgain(rootIx) }
   pinReport()
   recordClosedHoles()
+  pinDeepIs(rootIx)
+}
+
+// The last stage, once per check and only over a program the walk found no error in: a deep
+// `is` over a JSON-shaped union is rewritten to call generated walkers (D1035), and the program
+// is checked again with its pins already written, so pass 1's D3817 rows stand (D5490).
+function pinDeepIs(rootIx: i32) {
+  if pinDeepIsRan || pinDeepIsOff || jwSiteNode.length == 0 { return 0 }
+  if P.diags.length > 0 || T.diags.length > 0 { return 0 }
+  pinDeepIsRan = true
+  const genTok = jwExpand(rootIx)
+  if genTok < 0 { return 0 }
+  checkRestart()
+  // After the restart, which clears it: the style tier reports nothing about generated code.
+  jwSetGenTokStart(genTok)
+  checkProgramResumed(rootIx)
 }
 
 // The most re-checks a phase pays. A forwarding chain gains one link a width round, and a chain
