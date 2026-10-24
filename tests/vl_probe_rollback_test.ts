@@ -10,6 +10,7 @@
 //   clean    — the same program with the rollback intact moves no table there.
 //   disarmed — no rows at all.
 //   leaks    — programs that each showed one site leaving rows behind now move nothing.
+//   classes  — every keyed map a probe can reach has a class and a reason (no seed needed).
 //
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores.
 //
@@ -147,6 +148,89 @@ Deno.test({
       throw new Error(`want no table moved, got:\n  ${bad.join("\n  ")}`);
     }
   },
+});
+
+// Every module-level keyed map a quiet probe can reach is classified in
+// `scripts/probe-map-classes.tsv`, so a new one fails here until someone says why a probe may
+// leave it standing (ARCHITECTURE §4.3). The reach is the import closure of the probe sites.
+const CLASSES = new Set([
+  "undo",
+  "node-column",
+  "table-index",
+  "type-column",
+  "memo",
+  "rewrite",
+  "probe-result",
+  "held",
+  "unwritten",
+]);
+const MAP_DECL =
+  /^(?:export )?(?:let|const) ([A-Za-z0-9_]+)(?:: \{\[[^=]*)? = Map\(\)/;
+
+const probeReachMaps = () => {
+  const dir = new URL("../compiler/", import.meta.url);
+  const read = (m: string) => {
+    try {
+      return Deno.readTextFileSync(new URL(`${m}.vl`, dir));
+    } catch {
+      return undefined;
+    }
+  };
+  const todo = [...Deno.readDirSync(dir)]
+    .filter((e) => e.name.endsWith(".vl"))
+    .map((e) => e.name.slice(0, -3))
+    .filter((m) => read(m)!.includes("prbEnter()"));
+  const seen = new Map<string, string>();
+  while (todo.length > 0) {
+    const m = todo.pop()!;
+    if (seen.has(m)) continue;
+    const src = read(m);
+    if (src === undefined) continue;
+    seen.set(m, src);
+    for (const x of src.matchAll(/from "\.\/([A-Za-z0-9_]+)"/g)) {
+      todo.push(x[1]);
+    }
+  }
+  const out: string[] = [];
+  for (const [m, src] of seen) {
+    for (const l of src.split("\n")) {
+      const d = MAP_DECL.exec(l);
+      if (d) out.push(`${m}:${d[1]}`);
+    }
+  }
+  return out.sort();
+};
+
+Deno.test("probe rollback: every map a probe reaches is classified", () => {
+  const rows = new Map<string, [string, string]>();
+  const bad: string[] = [];
+  const tsv = Deno.readTextFileSync(
+    new URL("../scripts/probe-map-classes.tsv", import.meta.url),
+  );
+  for (const l of tsv.split("\n")) {
+    if (l === "" || l.startsWith("#")) continue;
+    const [k, c, why] = l.split("\t");
+    if (!CLASSES.has(c)) bad.push(`${k}: unknown class ${c}`);
+    if (!why) bad.push(`${k}: no reason`);
+    if (rows.has(k)) bad.push(`${k}: classified twice`);
+    rows.set(k, [c, why]);
+  }
+  const reach = probeReachMaps();
+  for (const k of reach) {
+    if (!rows.has(k)) bad.push(`${k}: unclassified (add a row)`);
+  }
+  for (const k of rows.keys()) {
+    if (!reach.includes(k)) bad.push(`${k}: stale row (no such map in reach)`);
+  }
+  const undo = [...rows].filter(([, [c]]) => c === "undo")
+    .map(([k]) => k.split(":")[1]).sort().join(",");
+  const want = [...KEYED_MAPS].sort().join(",");
+  if (undo !== want) bad.push(`undo rows: want ${want}, got ${undo}`);
+  if (bad.length > 0) {
+    throw new Error(
+      `want every reached map classified, got:\n  ${bad.join("\n  ")}`,
+    );
+  }
 });
 
 Deno.test({
