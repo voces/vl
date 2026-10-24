@@ -130,6 +130,20 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   reaches that the SEARCH helpers do not is a non-equatable element (a map element runs
   through `concat` and refuses at `indexOf`), and that is the fact the export's doc
   comment now carries.
+- **`some`/`every` are the predicate twins of `includes`, named the JS way** (diderven
+  DV-1204: `ids.some((i) => i == id)` was a hand loop with a flag). The JS names win over
+  `any`/`all` because the core `map`/`filter` and the rest of this module (`includes`,
+  `indexOf`, `reduce`) already are JS's, and a consumer reaching for `.some` should find it;
+  `.any`/`.all` on a list answer `did you mean '.some'`/`'.every'` (`check_suggest.vl`'s
+  list spelling table). `any` is also the checker's own spelling of an unresolved type in
+  several messages. `self` is `readonly T[]`, like `concat`'s, since nothing is written:
+  `includes` takes `T[]` and so refuses a read-only list, a limitation not worth copying.
+  The length is re-read each step, so a predicate that pops cannot index past the end (and
+  one that always pushes and never decides does not terminate). Not added with them: `find`/
+  `findIndex` — a predicate `findIndex` is the twin of `indexOf` and would be the next
+  natural export, but no consumer has asked, and `find` needs a `T | null` return that a
+  nullable element type cannot distinguish from a miss. Fixtures:
+  `tests/cases/std/array-some-every.vl`, `ufcs-not-imported-some-every.vl`.
 - **`u8[]` is outside the surface at every spelling, and it is a CHECKER error** — `T`
   ranges over value types and `u8` is storage, so a `u8[]` is not an instantiation of
   `T[]`. `tests/cases/std/error-u8-array-generic.vl` runs the pair side by side.
