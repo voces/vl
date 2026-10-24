@@ -4936,9 +4936,89 @@ function holeSlotFixedJudge(
         }
       }
     }
+    const j = holeLamMisfitAt(d, pts, inst)
+    if j >= 0 {
+      tErr(holeLamMisfitMsg(nm, pts, d, j, k < vals.length - nW), ats[k])
+      return true
+    }
     k = k + 1
   }
   false
+}
+
+// The first parameter the lambda `d`, which leaves another parameter un-annotated, annotates
+// with a type other than the generic's instance `inst` takes there, or, `inst` being -1, one the
+// argument type at its position in `pts` is not assignable to; -1 when none (D12217).
+function holeLamMisfitAt(d: i32, pts: i32[], inst: i32): i32 {
+  if d < 0 || d >= P.nodes.length || (fvaDone[d] ?? false) { return -1 }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnName != "" || f.fnTyParams.length > 0 { return -1 }
+  if f.fnParams.length != pts.length { return -1 }
+  let open = false
+  for pi in f.fnParams {
+    const p = nodeAt(pi)
+    if !(p is Param) || p.parRest == 1 || p.parOpt == 1 { return -1 }
+    if p.parType < 0 { open = true }
+  }
+  if !open { return -1 }
+  const t = nodeTyOf(d)
+  if t < 0 || t >= T.tys.length { return -1 }
+  const ft = tyAt(t)
+  if !(ft is TyFunc) || ft.fnParamTypes.length != pts.length { return -1 }
+  let its: i32[] = []
+  if inst >= 0 && inst < T.tys.length {
+    const it = tyAt(inst)
+    if it is TyFunc && it.fnParamTypes.length == pts.length {
+      its = it.fnParamTypes
+    }
+  }
+  let j = 0
+  while j < pts.length {
+    const p = nodeAt(f.fnParams[j])
+    const want = ft.fnParamTypes[j]
+    if (
+      p is Param
+      && p.parType >= 0
+      && want >= 0
+      && want < T.tys.length
+      && pts[j] >= 0
+      && pts[j] < T.tys.length
+      && !tyHasTyVar(want)
+      && !tyHasHole(want)
+      && !tyHasTyVar(pts[j])
+      && !tyHasHole(pts[j])
+    ) {
+      if its.length > 0 && !tySame(its[j], want) { return j }
+      if its.length == 0 && !assignable(pts[j], want) { return j }
+    }
+    j = j + 1
+  }
+  -1
+}
+
+// The `holeLamMisfitAt` refusal: the lambda `d`, written (or, `stored`, held by a literal) to
+// the place `nm` names, annotates parameter `j` with a type a call through it at `pts` does not pass.
+function holeLamMisfitMsg(
+  nm: string,
+  pts: i32[],
+  d: i32,
+  j: i32,
+  stored: boolean,
+): string {
+  const f = nodeAt(d)
+  let want = ""
+  if f is FuncDecl {
+    const t = nodeTyOf(d)
+    if t >= 0 && t < T.tys.length {
+      const ft = tyAt(t)
+      if ft is TyFunc { want = tyToStr(ft.fnParamTypes[j]) }
+    }
+  }
+  holeFixedMisfitHead(nm, pts, d, stored)
+    + " runs it, and it takes `"
+    + want
+    + "` at parameter "
+    + i32ToStr(j + 1)
 }
 
 // Whether the fixed function type `ft` has the signature of the generic's instance `inst`, the
@@ -4984,11 +5064,13 @@ function holeGenInstTy(gen: i32, pts: i32[]): i32 {
   it
 }
 
-// The function type of the value `v`, a name holding the declaration `d`, when `d` declares no
-// type parameter and annotates every parameter; -1 otherwise, and for any value but a name.
+// The function type of the value `v`, a name holding the declaration `d` or the written lambda
+// `d` itself, when `d` declares no type parameter and annotates every parameter; -1 otherwise,
+// and for an adapter the checker put in place of a delivered generic (D12217).
 function holeFixedFnTyOf(v: i32, d: i32): i32 {
   const vx = parenPeelIx(v)
-  if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) { return -1 }
+  if vx < 0 || vx >= P.nodes.length { return -1 }
+  if !(nodeAt(vx) is Ident) && (vx != d || (fvaDone[vx] ?? false)) { return -1 }
   if d < 0 || d >= P.nodes.length { return -1 }
   const f = nodeAt(d)
   if !(f is FuncDecl) || f.fnTyParams.length > 0 { return -1 }
@@ -5013,6 +5095,16 @@ function holeFixedMisfitMsg(
   vt: i32,
   stored: boolean,
 ): string {
+  holeFixedMisfitHead(nm, pts, d, stored) + " runs it, and it is " + tyToStr(vt)
+}
+
+// What both misfit refusals open with: the write of `d` to `nm`, and the call types `pts`.
+function holeFixedMisfitHead(
+  nm: string,
+  pts: i32[],
+  d: i32,
+  stored: boolean,
+): string {
   let verb = "write "
   let into = " to "
   if stored {
@@ -5034,8 +5126,6 @@ function holeFixedMisfitMsg(
     + nm
     + ": a call through it at "
     + ps
-    + " runs it, and it is "
-    + tyToStr(vt)
 }
 
 // How a diagnostic names the place `path` under `nm`: `'r.f'`, or an element of `'xs'`.
