@@ -14,7 +14,7 @@ import {
 import { nominalStructNameOfTy } from "./check_emit_queries"
 import { nodeTyPinIxOf, pinnedHoleTyOf } from "./check_hole_pins"
 import { nodeArrayElemTyIx, nodeTyIxOf } from "./check_node_tys"
-import { MAP_KEY_STR } from "./check_ty_rep"
+import { MAP_KEY_STR, tyIsI32SentinelNullable } from "./check_ty_rep"
 import {
   PrimName,
   T,
@@ -874,4 +874,73 @@ export function tyPrimLeafElemName(ty: i32): PrimName | null {
     if el is TyPrim { return el.primName }
   }
   null
+}
+
+// The list `VKind` an ARRAY type over a bare `TyPrim` LEAF reps as — `i32`/`boolean` share
+// the one i32-list backing, every other leaf has its own — or `null` for any other element
+// (or any non-array). The ARENA twin of the `nameIs*Array` ladder, written once for the
+// positions that hold a TYPE and no annotation node to run the name ladder over.
+export function tyPrimLeafListKind(ty: i32): VKind | null {
+  const n = tyPrimLeafElemName(ty)
+  // Exhaustive over `PrimName | null` and `_`-less (D1898 made the nullable litunion
+  // matchable): `null` is "no list backing", a real answer, for the three prims the list
+  // layer has no backing for and for the `null` a non-array or non-prim element yields.
+  match n {
+    "i32" | "boolean" => {
+      return "list"
+    }
+    "string" => {
+      return "strlist"
+    }
+    "f64" => {
+      return "f64list"
+    }
+    "i64" => {
+      return "i64list"
+    }
+    "f32" => {
+      return "f32list"
+    }
+    "u8" => {
+      return "u8list"
+    }
+    "void" | "null" | "never" | "v128" | null => {
+      // No list backing for these element types, nor for a non-array/non-prim element.
+    }
+  }
+  null
+}
+
+// The scalar-list wrapper kind of an array type whose element rides a scalar list's backing
+// without being a `TyPrim` — `"list"` for a literal-union `K[]` and its nullable niches (the
+// i32 list), `"strlist"` for the `(string | null)[]` ref niche — else `null`. The arena fold
+// of the same identity the name-side ladders have long used: all these wrappers are one heap type.
+export function tyScalarBackedListKind(tyIx: i32): VKind | null {
+  if tyIx < 0 { return null }
+  const t = tyAt(tyIx)
+  if t is TyArray {
+    if t.aElem < 0 { return null }
+    if tyIsLitUnion(t.aElem) { return "list" }
+    // The two i32-sentinel niches, through the shared predicate `==`/`+` also read — the
+    // answer set is unchanged, only the three homes deciding "one i32 cell" collapse to one. D101.
+    if tyIsI32SentinelNullable(t.aElem) { return "list" }
+    const el = tyAt(t.aElem)
+    if el is TyNullable && el.nInner >= 0 {
+      const inner = tyAt(el.nInner)
+      if inner is TyPrim {
+        if inner.primName == "string" { return "strlist" }
+      }
+    }
+  }
+  null
+}
+
+// The scalar list `VKind` an array type reps as, or `null` for any other type: the
+// scalar-backed niches first, then `null[]` on the i32 list (D4671), then the `TyPrim`
+// leaves — the typed question `nameIsI32Array` ("list") and `nameIsStringArray` ("strlist") ask.
+export function tyScalarListKind(ty: i32): VKind | null {
+  const sbk = tyScalarBackedListKind(ty)
+  if sbk != null { return sbk }
+  if tyPrimLeafElemName(ty) == "null" { return "list" }
+  tyPrimLeafListKind(ty)
 }

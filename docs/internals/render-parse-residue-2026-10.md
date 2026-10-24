@@ -128,7 +128,7 @@ the slice retires.
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
-| C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
+| C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function and written-let pins typed; 2 retired, 21 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
@@ -772,6 +772,38 @@ What each slice changes:
     pin union. They fall when `nameIsI32Array`, `nameIsStringArray` and
     `parenUnionArrElemName` lose their name-only callers, not before. `nameIsStrLitSet`
     falls with them.
+  - Landed: the string-list callers that hold a type ask it. `tyScalarListKind` (in
+    `emit_struct_order`) answers `nameIsI32Array`'s and `nameIsStringArray`'s question from an
+    array type. A probe compared the typed and the name answer per caller over the
+    self-compile and 16,629 files. Counts are files, with events in brackets.
+
+    | caller | agree | disagree | no type | outcome |
+    | --- | --- | --- | --- | --- |
+    | `tyAnnRefListKind`, string list | 10,649 (557,974) | 0 | 0 | typed |
+    | `collectATypeRef`, closure-return rung | 1,026 (10,538) | 0 | 0 | typed |
+    | `mvShapeOfValNameArmTyGo`, string list | 604 (2,613) | 0 | 0 | typed |
+    | `tyAnnRefListKind`, niche-list name legs | 10,593 | 0 | 1 | deleted |
+    | `collectATypeRef`, TypeRef rung, string list | 11,843 | 15 (23) | 180 | name |
+    | `checkArrName` (`nameIsI32Array`) | 1,587 | 36 (136) | 1 | name |
+    | `rlElemStoredName`, i32 list | 4,495 | 5 | 2,885 | name |
+    | `rlElemStoredName`, string list | 4,403 | 1 | 2,797 | name |
+
+    - `tyAnnRefListKind`'s `nameIsNulBoolList` and `nameIsNulLitUnionList` legs are deleted.
+      Every `(boolean | null)[]` and `(K | null)[]` spelling returns earlier, at every
+      position a witness tried (parameter, return, field, global, closure, nested function,
+      generic body, alias). The legs never answered true in 547,962 events. Their three
+      untyped events spell `#anon0[]|i32[]`.
+    - The TypeRef rung's typed answer says string list on type-parameter arrays (`T[]`)
+      where the name declines.
+    - `checkArrName` disagrees only on numeric literal-union arrays (`D[]`, `type D = 1 | 2`),
+      which render `i32[]` but have no scalar list kind by type.
+    - Untouched by constraint: emit_classify (2197, 16858, 18870, 18984, 18990) and
+      emit_mono (9595) call the grammar entries. `nameIsNulLitUnionList` is still called at
+      emit_classify:18990.
+    - `genTyParamArr`, `scalarListRepOfName`, `refArrShapeKindGo` and `refArrElemNameGo` read
+      type-parameter grammar or name-keyed ladders, and their callers hold names only.
+    - The census count is unchanged (154). The removed calls were of the `nameIs*` wrappers,
+      not of the parsers the census counts.
 - **D1.** `rlSlotByName`, `rlSlotOfArrName` and the `refListElemNameOf*` family key the ref-list
   slot by element type. This turns most of the B key producers into dead code. A probe compared
   the spelling's name with the row that `rlSlotOfTy` keys by the node's element type, at fifteen
