@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; re-probed: the atom tests agree wherever atoms are typed, but `emit_mono`'s name-only pins register rows with no type; the registry's own split disagrees with canonical members in 2,573 files, so minting by type changes box tags; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; re-probed: the atom tests agree wherever atoms are typed, but `emit_mono`'s name-only pins register rows with no type; the literal-arm, return and tpSub pins now pass their type, which leaves 240 untyped events in 79 files, all from the two param pins, whose type exists only after the binding they feed; the registry's own split disagrees with canonical members in 2,573 files, so minting by type changes box tags; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 7 retired, 11 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -1407,8 +1407,42 @@ What each slice changes:
       `K` are literal unions and that `i32[][]`, `P[]` and `CN<…>` are arrays.
     - The fallback has 1 file and 3 events, none with a member type.
 
-    These retire when those pins pass the type they pinned. That is `emit_mono`'s pin seam (D3,
-    D4), not this lane.
+    These retire when those pins pass the type they pinned.
+  - Landed: three of the five pins pass their type. The pins are the literal-arm pin
+    (`nodeTyIxOf`), the rsC return pin and the tpSub pin. The return pin passes the declared
+    return under `monoShBindingOf`'s binding (`monoRetPinUnionTy`). `monoRegisterPinUnion`
+    registers exactly the type it is given, so an armed shadow cannot change what is
+    registered. Over the self-compile and 16,641 files:
+    - The untyped-atom events fall from 373 in 152 files to 240 in 79.
+    - Typed events are 7,596 in 2,529 files.
+    - The `markRefArrayArmsOf` fallback is unchanged at 1 file and 3 events.
+
+    difftree `--identity` found 3 of 16,529 files differ, and each runs with output identical to
+    master:
+    - `nullable-union-of-two-same-shape-record-lists.vl` loses one unused struct type, because
+      the typed pin adopts the existing row.
+    - `pin-union-param-binds-open-member.vl` changes a tag constant from 0 to 2 and swaps the
+      order of the dispatch arms.
+    - `print-record-box-narrowed-past-record.vl` renumbers its tags by one, because one fewer
+      variant is minted.
+
+    The distilled corpus moved 0 cells.
+
+    No entry retires yet. Every remaining untyped event comes from the two `monoPinMintedUnion`
+    param pins, `monoRegisterPinUnion(pc, -1)` and `monoRegisterPinUnion(c, -1)`. They are
+    blocked for three reasons:
+    - **The type does not exist yet.** These pins feed `pinnedTyIx`, which the instance binding
+      is built from. The post-binding type therefore exists only after `monoMakeInstanceParams`
+      returns.
+    - **The earlier types are wrong.** The type known before the binding differs from the
+      post-binding type in 5 events in 3 files (`{[i32]:boolean}|null` against
+      `{[i32]:boolean}|string|null`). In 70 events it is a single member type. The type resolved
+      from the pin name differs in 17 events in 7 files (a Set against `{[K]:boolean}`).
+    - **The callers are outside this lane.** `isVariantBoxUnionAtoms` is called only from
+      `emit_collect`, with atoms, so taking types needs those three callers changed.
+      `mintInlineUnion`, also in `emit_collect`, records `unTyIx` from the site identity rather
+      than the registered type. A typed pin's row therefore has no type when its name does not
+      resolve.
   - Done: 2 renders. `cloCallParamUnionName` no longer has a render rung: past the alias and
     nominal rungs the lifted lambda's own pin answers. 5 files reach the old rung, all with an
     empty render that already fell through to that pin. `njStash` names the union by
@@ -1430,6 +1464,10 @@ What each slice changes:
 
     Minting from canonical members would therefore change box-tag order and arity. It is the
     step-5 ABI change itself, not a swap that leaves output identical.
+
+    Using the row type's members only where an atom has no type gains nothing: every such row
+    has `unTyIx` -1. Where both answer, they agree in 23,333 events and differ in 186, each a
+    literal against its widened type.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
   `structIndexOfLet` answer by type.
 
