@@ -123,7 +123,7 @@ the slice retires.
 | A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
-| A5 | union-atom and atom-kind twins (landed: 4 retired, 8 left; the 3 `emit_base` entries re-probed after C1 and left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
+| A5 | union-atom and atom-kind twins (landed: 4 retired, 8 left; the 3 `emit_base` entries re-probed after C1 and left, and again after `unionTakesAtomAsStrOf` was deleted) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, 13 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted) | 13 | 0 / 13 / 0 | 0 / 13 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
@@ -241,9 +241,23 @@ What each slice changes:
     coerce gates (`unionTakesAtomAsStr`, `unionHasValueAtom`) agree with a walk of the target's
     interned set wherever one exists. In 23 files the target has no row or set, and
     `emitUnionCoerce` holds only its name. The param, assignment, `??` and `if`-join callers
-    each differ from `tyTakesAtomAsStr` in one file. `unionTakesAtomAsStrOf`'s three callers
-    agree with a set walk everywhere, but switching them deletes a wrapper in
-    `emit_union_registry`, which D5 holds.
+    each differ from `tyTakesAtomAsStr` in one file. `unionTakesAtomAsStrOf` is deleted: its
+    three `wasmEmit` callers ask `msSetTakesAtomAsStr` of the row's interned set (11, 10 and 64
+    files, 0 differed; the 4 with no set answered false both ways), and difftree `--identity`
+    found 0 of 16,523 files differ. That leaves `unionTakesAtomAsStr` with five callers, so both
+    of its entries stay:
+    - The coerce gate in `emitUnionCoerceValueAtom` agrees with the target's set wherever one
+      exists (3,003 `emitUnionBoxArg` files, 1,428 global, 149 let, 161 `??` and the rest). Its
+      22 set-less files all arrive through `emitUnionBoxArg`, whose 29 callers pass a name only,
+      and the gate decides the output in one of them
+      (`error-nul-literal-union-element-into-box-list`, `K | null | i32`). Serving them means
+      threading a type through those 29 callers first.
+    - The four `emit_fn_scans` callers hold an annotation's TypeRef or an expression. Probed
+      against `msSetTakesAtomAsStr` of the type's set, they differ in 842 (param), 39
+      (assignment), 21 (`??`) and 27 (`if`-join) files. The disagreeing sets read
+      `string | string`: the type of a literal-union parameter such as `K` or a
+      `CaseMap` instance, whose free slice holds each literal as a `string`. A typed answer here
+      needs the declared union, not its widened members.
 - **C1.** The checker banks per-call bind types; `monoBindCols` is L1's producer. Then
   `monoSubstAnn`, `monoBindOf` and their kin bind by type. Landed for the 5 parses of the two
   pre-bind predicates. `monoAnnIsOpenUnion` and `monoUnionLeavesOpenFree` are gone, and
