@@ -563,8 +563,10 @@ import {
   holeNulStringPinTyOf,
   mapTyScalarBoxKind,
   monoExactSubRowOf,
+  nodeTyInOf,
   pinSubAt,
   pinSubOperandTyOf,
+  pinnedParamTyAt,
   tyCanonKey,
   tySameSet,
   tySameSpelled,
@@ -7884,8 +7886,8 @@ function monoBindExplicitTyArgs(
       }
       tvN.push(typarams[i])
       tvV.push(nm)
-      // A literal argument's binding is its softened spelling, which the type does not say.
-      if lit == "" && at >= 0 && !tyHasTyVar(at) { monoTvTyLast(tvN, tvT, at) }
+      // A lone string literal binds at its own literal type, the type its spelling names.
+      if at >= 0 && !tyHasTyVar(at) { monoTvTyLast(tvN, tvT, at) }
       const one: string[] = [typarams[i]]
       if !monoParamsMention(params, one) {
         extra = extra + typarams[i] + "=" + nm + ";"
@@ -21071,6 +21073,7 @@ function monoPreBindPastEmptyLit(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ) {
   const seen: {[string]: i32} = Map()
   let i = 0
@@ -21080,7 +21083,17 @@ function monoPreBindPastEmptyLit(
       // arena-tick exempt: a local dedupe map, not the arena.
       seen[tp] = 1
       if monoBindOf(tvN, tvV, tp) == "" && monoArgIsEmptyLit(args[i]) {
-        monoBindFromLaterArg(tp, i + 1, params, args, typarams, ctx, tvN, tvV)
+        monoBindFromLaterArg(
+          tp,
+          i + 1,
+          params,
+          args,
+          typarams,
+          ctx,
+          tvN,
+          tvV,
+          tvT,
+        )
       }
     }
     i = i + 1
@@ -21099,6 +21112,7 @@ function monoBindFromLaterArg(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ) {
   let j = from
   while j < args.length && j < params.length {
@@ -21112,12 +21126,16 @@ function monoBindFromLaterArg(
         const an = monoArgPinName(args[j], ctx)
         if an == "" { return 0 }
         let bind = an
+        const pinTy = monoArgPinTyIx(args[j], ctx)
+        let bindTy = monoArgClosedTyIn(args[j], ctx, pinTy)
         if annj != tp {
-          if !nameIsArray(an) { return 0 }
+          if !monoTyIsArrayShaped(bindTy, pinTy) { return 0 }
           bind = listElemNameOf(an)
+          bindTy = tyArrayElemIx(bindTy)
         }
         tvN.push(tp)
         tvV.push(bind)
+        monoTvTyLast(tvN, tvT, bindTy)
         return 0
       }
     }
@@ -23082,7 +23100,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
       if monoCallGenFnToTyParamArrow(params, args, fn.fnTyParams, ctx) {
         monoPreBindNonArrowArgs(fn, params, args, ctx, tvN, tvV, tvT, declTys)
       }
-      monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV)
+      monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV, tvT)
       if monoTwoListArgFail(fn, params, args, ctx) < 0 { return -1 }
       monoPreBindPastUnionRest(
         params,
@@ -23466,6 +23484,25 @@ function monoPinHoleParam(
   0
 }
 
+// The closed type of argument `ax` inside function `ctx`: `pinTy`, its pin type, where that is
+// closed, else its type read at the instance `ctx` (an instance parameter's pin, then the
+// instance's bindings through `nodeTyInOf`). -1 where none of them closes it.
+function monoArgClosedTyIn(ax: i32, ctx: i32, pinTy: i32): i32 {
+  if pinTy >= 0 && pinTy < T.tys.length && !tyHasTyVar(pinTy) { return pinTy }
+  const pp = pinnedParamTyAt(ax, ctx, 4)
+  if pp >= 0 && pp < T.tys.length && !tyHasTyVar(pp) { return pp }
+  const t = nodeTyInOf(unwrapParen(ax), ctx)
+  if t >= 0 && t < T.tys.length && !tyHasTyVar(t) { return t }
+  -1
+}
+
+// Whether an argument is a list by its type: `closedTy` where `monoArgClosedTyIn` closed it, else
+// the shape of its open pin type `openTy` (an empty `[]` stays `T[]` at every instance).
+function monoTyIsArrayShaped(closedTy: i32, openTy: i32): boolean {
+  const t = if closedTy >= 0 { closedTy } else { openTy }
+  t >= 0 && t < T.tys.length && tyAt(t) is TyArray
+}
+
 // `monoInstantiateCall`'s pin for the annotated parameter `p`, the `i`th of `fn`'s, given
 // argument `args[i]`: binds the type parameters the annotation rides into `tvN`/`tvV` and pushes
 // the parameter's pin onto `pinned` and its arena type onto `pinTys`, `decl` the declaration whose
@@ -23576,12 +23613,12 @@ function monoPinAnnotatedParam(
     let bind = an2
     let bindTy = if an2Ty >= 0 && !tyHasTyVar(an2Ty) { an2Ty } else { -1 }
     if ann != tp {
-      // `T[]` param: the argument must be an array (by its closed type, by its spelling where
-      // the type is open), and its element binds `T`. The binding is the UNGROUPED element: a
-      // bare `T` param pins it verbatim and `(S|null)` is a spelling nothing interns; every `[]`
-      // put back on it goes through `arrElemSuffixed` (D1896).
-      const isArr = if bindTy >= 0 { tyAt(bindTy) is TyArray } else { nameIsArray(an2) }
-      if !isArr {
+      // `T[]` param: the argument is a list by its type, read at the instance `ctx` where its own
+      // is open, and its UNGROUPED element binds `T`, regrouped by `arrElemSuffixed` (D1896). The
+      // element stays open, so binds by the pin's spelling alone, only for an empty `[]` (its
+      // literal default) or a hole-typed function list that no instance closes.
+      bindTy = monoArgClosedTyIn(args[i], ctx, an2Ty)
+      if !monoTyIsArrayShaped(bindTy, an2Ty) {
         return emitFail(
           "emitProgram: monomorphize: expected an array argument for `"
             + p.parName
@@ -23810,8 +23847,8 @@ function monoPushPins(
 }
 
 // Appends each binding of `tvN` to `hN`/`hT` at its type in `tvT`; a binding pushed by spelling
-// alone (`monoBindFromLaterArg`, a softened literal type argument, a `T[]` argument whose type is
-// open) at the type its spelling names, and not at all when it names none.
+// alone (an argument whose type stays open at the instance) at the type its spelling names, and
+// not at all when it names none.
 function monoBoundTys(
   tvN: string[],
   tvV: string[],

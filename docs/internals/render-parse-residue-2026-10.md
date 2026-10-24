@@ -131,7 +131,7 @@ the slice retires.
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`; 2 retired, 21 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type; 4 retired, 19 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 13 retired, 8 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -602,10 +602,26 @@ What each slice changes:
   `nameToTy` of their spelling. The `T[]` arm of `monoPinAnnotatedParam` decides by the closed
   argument type wherever one exists, and agrees with `nameIsArray` in all 1,218 of those
   decisions. The other 145 have an open type (`_`, for example
-  `generics/loop-var-forwarded-through-generic.vl`) and keep the spelling. Three producers still
-  push a spelling with no type: `monoBindFromLaterArg`, a softened literal type argument, and a
-  `T[]` argument whose type is open. So neither `nameIsArray` entry retires, and the
-  render-parse count is unchanged.
+  `generics/loop-var-forwarded-through-generic.vl`) and keep the spelling.
+
+  **The three spelling-only producers carry a type.** `monoArgClosedTyIn` reads an argument's
+  type inside the calling instance: its pin type where closed, else the instance parameter's
+  pin, else the node's type at the instance's bindings. The same probe, over the same 16,897
+  files, counted the following:
+  * Later-argument bindings (`monoBindFromLaterArg`): 3 of 3 closed, and all 3 agree with
+    `nameToTy` of their spelling.
+  * Softened literal type arguments: 2 of 2 carry their literal type, and both agree.
+  * Open `T[]` arguments: 135 of 145 closed, and all 135 agree.
+  * The other 10 stay open, in 4 files. Seven are an empty `[]` at an open `T[]`, which pins
+    at its literal default (`generics/tail-join-locals-and-empty-list-arg.vl`). Three are a
+    hole-typed function list at `((_) => _)[]`
+    (`closures/hole-fn-list-row-index-alias-and-generic-arg.vl`). No instance closes their
+    element, so it still binds by the pin's spelling.
+
+  List-ness is now decided by the type's shape (`monoTyIsArrayShaped`), and an open `T[]` is
+  shaped too, so both `nameIsArray` entries retire (D3 leaves 19, down from 21). Site A's fallback count did
+  not move: **398 before and 398 after** on this probe, which also tags the self-compile. These
+  three producers were not where those events come from.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSigTys`), so the change cannot
