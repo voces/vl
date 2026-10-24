@@ -24,6 +24,7 @@ import {
   LetDecl,
   MatchExpr,
   Member,
+  Node,
   NullLit,
   NumLit,
   ObjLit,
@@ -4491,22 +4492,45 @@ export function fsAfterParse(): i32 {
 }
 
 // The names some `=` or an exported `let` writes, how often each name is declared, and the
-// one binding or named function declaring it, for `fsConstLets`, which builds them only for a
-// parse holding a `let` that can qualify.
+// one binding or named function declaring it, for `fsConstLets`. Only the names in `clNeed`
+// are recorded; a walk that reaches another name notes it in `clMissed` and answers false.
 let clWritten: {[string]: boolean} = Map()
 let clDecls: {[string]: i32} = Map()
 let clLet: {[string]: i32} = Map()
+let clNeed: {[string]: boolean} = Map()
+let clMissed: string[] = []
 
 // An un-annotated, unexported `let` that no `=` anywhere writes by name, holding a lambda or a
 // name that is a function for good, is spelled `const`, so every reader that follows a `const`
 // to a function follows it too (D6472).
 function fsConstLets(): i32 {
   const cands: i32[] = []
+  const names: string[] = []
+  const decls: i32[] = []
+  const asg: string[] = []
   let i = 0
   while i < fsParseLen {
     const n = nodeAt(i)
-    if n is LetDecl && n.letKw == "let" && n.letType < 0 && n.letInit >= 0 {
-      if fsMayHoldFixedFn(n.letInit) { cands.push(i) }
+    if n is LetDecl {
+      if n.letName != "" {
+        names.push(n.letName)
+        decls.push(i)
+      }
+      if n.letKw == "let" && n.letType < 0 && n.letInit >= 0 {
+        if fsMayHoldFixedFn(n.letInit) { cands.push(i) }
+      }
+    } else if n is Param {
+      if n.parName != "" {
+        names.push(n.parName)
+        decls.push(-1)
+      }
+    } else if n is FuncDecl {
+      if n.fnName != "" {
+        names.push(n.fnName)
+        decls.push(i)
+      }
+    } else {
+      clNoteWrite(n, asg)
     }
     i = i + 1
   }
@@ -4514,26 +4538,24 @@ function fsConstLets(): i32 {
   clWritten = Map()
   clDecls = Map()
   clLet = Map()
-  i = 0
-  while i < fsParseLen {
-    const n = nodeAt(i)
-    if n is BinExpr && n.binOp == "=" {
-      const l = nodeAt(n.binLeft)
-      if l is Ident { clWritten[l.identName] = true }
+  clNeed = Map()
+  let fresh: string[] = []
+  for c in cands {
+    const cd = nodeAt(c)
+    if cd is LetDecl {
+      fresh.push(cd.letName)
+      const v = nodeAt(fsParenPeel(cd.letInit))
+      if v is Ident { fresh.push(v.identName) }
     }
-    let nm = ""
-    if n is LetDecl {
-      nm = n.letName
-      clLet[nm] = i
-    } else if n is Param {
-      nm = n.parName
-    } else if n is FuncDecl {
-      nm = n.fnName
-      if nm != "" { clLet[nm] = i }
-    }
-    if nm != "" { clDecls[nm] = (clDecls[nm] ?? 0) + 1 }
-    i = i + 1
   }
+  let alive: i32[] = []
+  while fresh.length > 0 {
+    clRecord(fresh, names, decls, asg)
+    clMissed = []
+    alive = fsConstAlive(cands)
+    fresh = clMissed
+  }
+  if alive.length == 0 { return 0 }
   let t = 0
   while t + 2 < P.toks.length {
     if P.toks[t].kind == "EXPORT" && P.toks[t + 1].kind == "LET" {
@@ -4541,6 +4563,26 @@ function fsConstLets(): i32 {
     }
     t = t + 1
   }
+  for c in fsConstAlive(alive) {
+    const cd = nodeAt(c)
+    if cd is LetDecl { cd.letKw = "const" }
+  }
+  0
+}
+
+// Notes in `asg` the name the `=` `n` writes, when its target is a bare name; every node kind
+// that declares no name reaches here, and only an assignment writes one.
+function clNoteWrite(n: Node, asg: string[]): i32 {
+  if n is BinExpr && n.binOp == "=" {
+    const l = nodeAt(n.binLeft)
+    if l is Ident { asg.push(l.identName) }
+  }
+  0
+}
+
+// The candidates in `cands` that no `=` writes by name and whose value `fsFixedFnValue` fixes.
+function fsConstAlive(cands: i32[]): i32[] {
+  const out: i32[] = []
   for c in cands {
     const n = nodeAt(c)
     if (
@@ -4548,8 +4590,39 @@ function fsConstLets(): i32 {
       && !(clWritten[n.letName] ?? false)
       && fsFixedFnValue(n.letInit, 0)
     ) {
-      n.letKw = "const"
+      out.push(c)
     }
+  }
+  out
+}
+
+// Records the `=` writes, declaration count and declaring node of each name in `fresh` not yet
+// in `clNeed`. `names[k]` is declared by node `decls[k]` (-1 for a parameter, which counts but
+// is never the declaring node), and `asg` holds every `=` target name.
+function clRecord(
+  fresh: string[],
+  names: string[],
+  decls: i32[],
+  asg: string[],
+): i32 {
+  const add: {[string]: boolean} = Map()
+  for nm in fresh {
+    if !(clNeed[nm] ?? false) {
+      clNeed[nm] = true
+      add[nm] = true
+    }
+  }
+  for nm in asg {
+    if add[nm] ?? false { clWritten[nm] = true }
+  }
+  let k = 0
+  while k < names.length {
+    const nm = names[k]
+    if add[nm] ?? false {
+      clDecls[nm] = (clDecls[nm] ?? 0) + 1
+      if decls[k] >= 0 { clLet[nm] = decls[k] }
+    }
+    k = k + 1
   }
   0
 }
@@ -4570,6 +4643,10 @@ function fsFixedFnValue(v: i32, depth: i32): boolean {
   if n is FuncDecl { return n.fnName == "" }
   if !(n is Ident) || depth > 16 { return false }
   const nm = n.identName
+  if !(clNeed[nm] ?? false) {
+    clMissed.push(nm)
+    return false
+  }
   if (clDecls[nm] ?? 0) != 1 || (clWritten[nm] ?? false) { return false }
   const d = clLet[nm] ?? -1
   if d < 0 { return false }
