@@ -185,6 +185,18 @@ import {
 } from "./check_state"
 import { Tok as LexTok, TokKind, tokenize } from "./lexer"
 import {
+  vcDgCol,
+  vcDgEnd,
+  vcDgFind,
+  vcDgIdx,
+  vcDgLine,
+  vcDgMod,
+  vcDgPush,
+  vcLoadMod,
+  vcLoadToks,
+  vcParseBlocked,
+} from "./tok_load"
+import {
   P,
   TPL_RENDER_LOCAL,
   TS_APP,
@@ -198,7 +210,6 @@ import {
   TS_OBJ,
   TS_PAREN,
   annTsOf,
-  arenaEpochBump,
   arenaEpochNow,
   callHasTyArgs,
   callNever,
@@ -209,7 +220,6 @@ import {
   declGpParamsOf,
   declNameTok,
   declNameTokOf,
-  dgAllLossless,
   dgCodeOf,
   dgLosslessReset,
   dgSpanEndTok,
@@ -338,9 +348,10 @@ import {
 } from "./symbols"
 import {
   checkProgram,
-  checkProgramResumed,
   expInfSetEntryStd,
   pinAdoptUndid,
+  pinDeepIsHold,
+  pinDeepIsRan,
 } from "./check_pins"
 import { wsRefusalUndid } from "./check_width"
 import { demangleSpelling, nameIdentChar, skipQuotedName } from "./tyname"
@@ -379,12 +390,6 @@ import {
   isReservedIntrinsicName,
 } from "./check_intrinsics"
 import { isBuiltinTyName } from "./check_suggest"
-import {
-  jwGenerateSource,
-  jwRestoreMangling,
-  jwRewriteAll,
-  jwSplice,
-} from "./json_walk"
 import {
   expInfCount,
   expInfMsgAt,
@@ -479,7 +484,6 @@ import {
   symUfcsScanNameLen,
   symUfcsScanTokAt,
 } from "./check_query"
-import { jwSetGenTokStart } from "./check_sym_occ"
 import {
   lint,
   lintCodeAt,
@@ -556,39 +560,14 @@ function vcSource(): string {
   if cpAccEmpty(vcAcc) { return vcSrcStr }
   cpAccString(vcAcc)
 }
-// Source positions (and owning module) for `P.diags` entries with no token anchor:
-// lex diagnostics and module-resolution diagnostics (emitted before any tokens load).
-// Keyed by the diagnostic's `P.diags` index, so tokenless and token-anchored entries
-// interleave freely; `diagLine`/`diagCol`/`diagEndCol`/`diagModule` consult it first.
-let vcDgIdx: i32[] = []
-let vcDgLine: i32[] = []
-let vcDgCol: i32[] = []
-// The 0-based exclusive end column of the entry's span, on `vcDgLine`. Without it,
-// every lex and module-resolution diagnostic (which have no token anchor to derive a
-// width from) would render as a single-column caret regardless of how much source it
-// covers. Equal to `vcDgCol` for an entry with no span (the point rendering).
-let vcDgEnd: i32[] = []
-let vcDgMod: i32[] = []
 // How many of `P.diags`' LEADING entries the module order/validate phase produced
 // (an unresolvable specifier, an import cycle). `modCompile` runs that phase before a
 // token is loaded and returns straight after, so its findings are always a prefix —
 // which is what lets `diagStage` call them `import` rather than `parse`.
 let modResolveDiagN = 0
-// The module whose source `vcLoadToks` is currently loading — a lex diag's
-// owner. The modCompile parse loop sets it per module; 0 elsewhere.
-let vcLoadMod = 0
-// The side-table slot for `P.diags` index `i`, or -1 (a token-anchored diag).
-function vcDgFind(i: i32): i32 {
-  let k = 0
-  while k < vcDgIdx.length {
-    if vcDgIdx[k] == i { return k }
-    k = k + 1
-  }
-  -1
-}
-// Clears the index-keyed `P.diags` side tables — the tokenless-diag position table
-// above and the parser's lossless column — in one home for the seven entry points
-// that must stay in lockstep. A stale lossless entry claims a different program's
+// Clears the index-keyed `P.diags` side tables — the tokenless-diag position table in
+// `tok_load.vl` and the parser's lossless column — in one home for the seven entry
+// points that must stay in lockstep. A stale lossless entry claims a different program's
 // diagnostic is lossless, the direction that wrongly lets the checker proceed.
 function vcDgReset() {
   vcDgIdx = []
@@ -599,22 +578,6 @@ function vcDgReset() {
   vcLoadMod = 0
   modResolveDiagN = 0
   dgLosslessReset()
-  0
-}
-
-// ── the stage-1 lossless-recovery gate ─────────────────────────────────────────
-// Whether the pipeline must stop at the parse stage: any parse diagnostic that is
-// not a lossless recovery's, since a lossless-recovered AST is exactly what the
-// user wrote — one lossy recovery anywhere in the file restores the bail.
-function vcParseBlocked(): boolean { P.diags.length > 0 && !dgAllLossless() }
-// Record one tokenless diagnostic's position, owner and span, keyed on the
-// `P.diags` index it is about to occupy. The caller pushes the `P.diags` entry.
-function vcDgPush(idx: i32, line: i32, col: i32, endCol: i32, mod: i32) {
-  vcDgIdx.push(idx)
-  vcDgLine.push(line)
-  vcDgCol.push(col)
-  vcDgEnd.push(endCol)
-  vcDgMod.push(mod)
   0
 }
 
@@ -1001,55 +964,6 @@ function modCacheBound(): i32 {
   0
 }
 
-function vcLoadToks(src: string): i32 {
-  const r = tokenize(src)
-  // The doc table is derived from this same lex and is cleared with the stream it
-  // describes: an empty `P.toks` is the first load of a compile, and module mode then
-  // accumulates one module per call the way the token stream itself does.
-  if P.toks.length == 0 {
-    docCmtLine = []
-    docCmtText = []
-    docCmtMod = []
-  }
-  const toks = r.tokens
-  const dst = P.toks
-  const n = toks.length
-  let i = 0
-  while i < n {
-    dst.push(toks[i])
-    i = i + 1
-  }
-  // Folds the lexer's diagnostics into the parse-stage store so a lex error (an empty
-  // or multi-char char literal) is rejected at the parse stage, mirroring the host's
-  // `checkOnly`. A lex diag has no token to anchor at; its real source position (and
-  // owning module) rides in the index-keyed `vcDg*` side table instead.
-  let d = 0
-  while d < r.diags.length {
-    vcDgPush(
-      P.diags.length,
-      r.diags[d].line,
-      r.diags[d].col,
-      r.diags[d].endCol,
-      vcLoadMod,
-    )
-    P.diags.push({ msg: r.diags[d].msg, at: -1 })
-    d = d + 1
-  }
-  // A `///` on a line of its own documents whatever follows it (`symDocAt`); a trailing
-  // one comments the code beside it and is dropped, so `const x = 1 /// n` documents
-  // nothing.
-  let cm = 0
-  while cm < r.comments.length {
-    const c = r.comments[cm]
-    if c.doc && !c.trailing {
-      docCmtLine.push(c.line)
-      docCmtText.push(c.text)
-      docCmtMod.push(vcLoadMod)
-    }
-    cm = cm + 1
-  }
-  P.toks.length
-}
 // The entry source and the stream the lexer produced from it, held by reference: the bank
 // is `P.toks` itself, never a second copy, so banking allocates nothing and keeps no extra
 // stream alive for the collector to walk. `vcEtLen` is the length the lexer left, and only
@@ -1078,7 +992,7 @@ function vcEtDrop(): i32 {
 }
 // `vcLoadToks` for the entry source, through the bank above: `tokenize` is a pure function
 // of its source, so a later pass over the same bytes takes the array back instead of
-// re-lexing. Both sides need an empty `P.toks`. The pop drops `jwSecondPass`'s generated
+// re-lexing. Both sides need an empty `P.toks`. The pop drops the deep-`is` stage's generated
 // tail, the one thing appended after a bank.
 function vcLoadToksEntry(src: string): i32 {
   vcEpDrop()
@@ -1160,53 +1074,6 @@ function vcEpReplay(src: string): i32 {
   while tplHole.length > vcEpTplN { tplHole.pop() }
   while recDupField.length > vcEpDupN { recDupField.pop() }
   vcEpRoot
-}
-// ── deep `is` over a `Json` value — the second check pass (D1035) ────────────
-// `r is T` for a json-shape `T` not one of the union's arms is a runtime shape walk
-// the checker cannot lower: pass 1 records the sites, this pass generates one
-// predicate/builder per target as VL source and re-checks. No deep `is` means no second pass.
-function jwSecondPass(root: i32): i32 {
-  if jwSiteNode.length == 0 { return 0 }
-  // The pass appends to `P.toks` before it writes a node, so the arena stamp alone would
-  // let a replay read the banked tree off a stream carrying the generated tail.
-  arenaEpochBump()
-  const gen = jwGenerateSource()
-  if gen == "" { return 0 }
-  // The fragment is tokenized ONTO the existing stream (the module pipeline's
-  // own move) and parsed with `P.pos` at its first token, so every node the user
-  // wrote keeps its arena index and the recorded sites stay valid.
-  P.pos = P.toks.length
-  const jwGenTok = P.toks.length
-  vcLoadToks(gen)
-  jwRestoreMangling(jwGenTok)
-  const frag = parseProgram()
-  if vcParseBlocked() { return 1 }
-  if !jwSplice(root, frag) {
-    vcDgPush(P.diags.length, 1, 0, 0, 0)
-    P.diags.push(
-      { msg: "internal: deep `is` walkers could not be spliced", at: -1 },
-    )
-    return 1
-  }
-  // A refusal is already a positioned TYPE error on the offending `is` site; rc 2 is the
-  // type-error rung, exactly as pass 1's own diagnostics take.
-  if jwRewriteAll() > 0 { return 2 }
-  // `canonEmitTypeNames` leaves each annotation spelled in the emitter's vocabulary, where a
-  // union alias member is its flattened member set — a different type to the checker and a
-  // different arm set to the emitter. The re-check below owes the author's spellings, and pass
-  // 2's own sweep re-derives the emit names on the arena the emitter reads (D1744).
-  canonRestoreSpellings()
-  initChecker()
-  // AFTER the reset, not before: `initChecker` clears the walker worklist and this marker
-  // with it. The style tier must not report a finding about code the author never wrote,
-  // and the marker is the first generated token (`jwTokIsGenerated` reads it).
-  jwSetGenTokStart(jwGenTok)
-  expInfSetEntryStd(entryIsStdModule())
-  // Pass 1's D3817 annotations are in the tree now, so its rows are the ones this check owes.
-  checkProgramResumed(root)
-  checkMemSharedOrigin()
-  plusLinksBank()
-  0
 }
 
 // The top-level names a single-source program declared under an ambient function's name, each
@@ -1370,10 +1237,6 @@ function compileSrcOnce(): i32 {
   // makes is that the checker's type errors are reported alongside it, not hidden.
   if P.diags.length > 0 { return 1 }
   if T.diags.length > 0 { return 2 }
-  const jwRc = jwSecondPass(root)
-  if jwRc != 0 { return jwRc }
-  if P.diags.length > 0 { return 1 }
-  if T.diags.length > 0 { return 2 }
   // A single-source program's wasm ABI is its `export`-marked functions and module
   // bindings, staged through the same alias tables a module build fills (public name →
   // target; unmangled here — no merge). Reset first: a PRIOR module compile on this
@@ -1482,13 +1345,6 @@ export function checkSrc(): i32 {
   plusLinksBank()
   // A lossless-recovered file reports BOTH streams and keeps rc 1 — the parse
   // mistake is still the headline error, the type errors ride with it.
-  if P.diags.length > 0 { return 1 }
-  if T.diags.length > 0 { return 2 }
-  // `check` runs the deep-`is` second pass too: a site the rewrite cannot route
-  // is a hard error, and `vl check` must not say yes to a program `vl build`
-  // then refuses.
-  const jwRc = jwSecondPass(root)
-  if jwRc != 0 { return jwRc }
   if P.diags.length > 0 { return 1 }
   if T.diags.length > 0 { return 2 }
   0
@@ -2246,14 +2102,6 @@ export function checkSrcSym(): i32 {
   plusLinksBank()
   // Lossless recovery: the symbol tables ARE populated for the rc-1 result too,
   // so hover / go-to-def / find-refs keep answering across a missing brace.
-  if P.diags.length > 0 { return 1 }
-  if T.diags.length > 0 { return 2 }
-  // The deep-`is` second pass, as `checkSrc` and `modCompile` both run it: this
-  // entry serves the LSP's DIAGNOSTICS, so a site the rewrite cannot route must
-  // refuse here too. Its re-check re-records the symbol tables, which
-  // `initChecker` cleared, so hover still answers over the spliced program.
-  const jwRc = jwSecondPass(root)
-  if jwRc != 0 { return jwRc }
   if P.diags.length > 0 { return 1 }
   if T.diags.length > 0 { return 2 }
   0
@@ -5320,6 +5168,8 @@ function modCompile(emit: i32): i32 {
   expInfSetEntryStd(entryIsStdModule())
   recDelivArm(banking || wiLiveNow)
   crAskArm(banking || wiLiveNow)
+  // A bank-served check settles only without deep `is` sites, so a walker expansion would be spent.
+  if keep.length > 0 { pinDeepIsHold() }
   checkProgram(merged)
   if ifaceHashArmed() && (!wiOwnsIh || skArmed) { ihFinish() }
   checkMemSharedOrigin()
@@ -5333,17 +5183,11 @@ function modCompile(emit: i32): i32 {
   // `compileSrc`, and the rc stays 1 so `vl build` behaves exactly as before.
   if P.diags.length > 0 { return 1 }
   if T.diags.length > 0 {
-    if wiLiveNow && emit == 0 && keep.length == 0 { wiBankWhole(roots) }
+    if wiLiveNow && emit == 0 && keep.length == 0 && !pinDeepIsRan {
+      wiBankWhole(roots)
+    }
     return 2
   }
-  // The deep-`is` second pass, on the merged program: the generated walkers name
-  // their types through `tyToStr`, which renders the mangled declarations
-  // (`Json$m1`) after the merge — so the fragment, parsed after the rename pass,
-  // resolves its identifiers verbatim in the scope rendering put them in.
-  const jwRc = jwSecondPass(merged)
-  if jwRc != 0 { return jwRc }
-  if P.diags.length > 0 { return 1 }
-  if T.diags.length > 0 { return 2 }
   if wiLiveNow && emit == 0 && keep.length == 0 { wiBankWhole(roots) }
   if fsModeOf() == FS_PLAN { return fsPlan(merged) }
   if emit != 0 {
@@ -6323,7 +6167,7 @@ function skAmbCount(inS: boolean[], meets: boolean[]): i32 {
 // (`ihReachOf`). Then `T.diags` becomes the module-ordered merge of the fresh and banked ones.
 function skSettle(inS: boolean[], roots: i32[]): boolean {
   skStage = 1
-  if jwSiteNode.length > 0 { return skDecline(SK_PASS) }
+  if jwSiteNode.length > 0 || pinDeepIsRan { return skDecline(SK_PASS) }
   const freshMod: i32[] = []
   let j = 0
   while j < T.diags.length {
@@ -6535,7 +6379,7 @@ function isWordCode(c: i32): boolean {
 // a whole check.
 function skBankNow(tokEnd: i32, keep: boolean[]): i32 {
   skValid = false
-  if P.diags.length > 0 || jwSiteNode.length > 0 { return 0 }
+  if P.diags.length > 0 || jwSiteNode.length > 0 || pinDeepIsRan { return 0 }
   const pos = skPosOf()
   const dgMod: i32[] = []
   const dgEnd: i32[] = []

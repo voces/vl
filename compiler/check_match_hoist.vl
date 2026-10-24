@@ -111,9 +111,25 @@ export function hoistMatchScrutinees(rootIx: i32) {
 }
 
 // Post-order over the value children, so an inner match is recorded before the one holding it.
+// The node is read once and every kind test below asks that copy.
 function hmsWalk(ix: i32, anc: i32[]) {
-  if ix < 0 || ix >= P.nodes.length || hmsInertLeaf(ix) { return 0 }
-  // An `else if` chain is walked along its spine, each link staying on the path (D1990).
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if hmsInertLeaf(n) { return 0 }
+  if n is IfStmt { return hmsWalkIfChain(ix, anc) }
+  anc.push(ix)
+  hmsWalkEach(nodeValueChildren(ix), anc)
+  anc.pop()
+  if hmsNotedKind(n) {
+    hmsNoteRebindable(n)
+    hmsRecordMatch(ix, anc)
+  }
+  0
+}
+
+// An `else if` chain is walked along its spine, each link staying on the path (D1990). A link
+// is an `if`, which binds no name and is never hoisted, so only the path is restored after.
+function hmsWalkIfChain(ix: i32, anc: i32[]) {
   let cur = ix
   let links = 0
   while cur >= 0 {
@@ -121,29 +137,28 @@ function hmsWalk(ix: i32, anc: i32[]) {
     links = links + 1
     const next = elseIfLink(cur)
     const kids = if next >= 0 { nodeSpineChildren(cur) } else { nodeValueChildren(cur) }
-    let i = 0
-    while i < kids.length {
-      hmsWalk(kids[i], anc)
-      i = i + 1
-    }
+    hmsWalkEach(kids, anc)
     cur = next
   }
   while links > 0 {
-    const node = anc[anc.length - 1]
     anc.pop()
     links = links - 1
-    if hmsNotedKind(node) {
-      hmsNoteRebindable(node)
-      hmsRecordMatch(node, anc)
-    }
+  }
+  0
+}
+
+function hmsWalkEach(kids: i32[], anc: i32[]) {
+  let i = 0
+  while i < kids.length {
+    hmsWalk(kids[i], anc)
+    i = i + 1
   }
   0
 }
 
 // The kinds `hmsNoteRebindable` or `hmsRecordMatch` can act on; every other node is a no-op
 // for both.
-function hmsNotedKind(ix: i32): boolean {
-  const n = nodeAt(ix)
+function hmsNotedKind(n: Node): boolean {
   n is LetDecl
     || n is FuncDecl
     || n is ForRange
@@ -154,8 +169,7 @@ function hmsNotedKind(ix: i32): boolean {
 
 // A name or literal leaf: no value child, binds no name and is never hoisted, so the walk
 // would record nothing at it and leave the path as it found it.
-function hmsInertLeaf(ix: i32): boolean {
-  const n = nodeAt(ix)
+function hmsInertLeaf(n: Node): boolean {
   n is Ident
     || n is NumLit
     || n is StrLit
@@ -204,25 +218,23 @@ function hmsOptRecvComputed(ix: i32): boolean {
   !matchScrutInPlace(ix)
 }
 
-// Records the names node `ix` binds that a later write could rebind: a `let`, a parameter,
+// Records the names node `n` binds that a later write could rebind: a `let`, a parameter,
 // a loop variable. One kind per helper, since each reads a different field.
-function hmsNoteRebindable(ix: i32) {
-  hmsNoteLet(ix)
-  hmsNoteParams(ix)
-  hmsNoteRangeVar(ix)
-  hmsNoteForInVars(ix)
+function hmsNoteRebindable(n: Node) {
+  hmsNoteLet(n)
+  hmsNoteParams(n)
+  hmsNoteRangeVar(n)
+  hmsNoteForInVars(n)
 }
 
-function hmsNoteLet(ix: i32) {
-  const n = nodeAt(ix)
+function hmsNoteLet(n: Node) {
   if n is LetDecl {
     if n.letKw != "const" { hmsRebindable[n.letName] = true }
   }
   0
 }
 
-function hmsNoteParams(ix: i32) {
-  const n = nodeAt(ix)
+function hmsNoteParams(n: Node) {
   if n is FuncDecl {
     let i = 0
     while i < n.fnParams.length {
@@ -237,14 +249,12 @@ function hmsNoteParams(ix: i32) {
   0
 }
 
-function hmsNoteRangeVar(ix: i32) {
-  const n = nodeAt(ix)
+function hmsNoteRangeVar(n: Node) {
   if n is ForRange { hmsRebindable[n.frVar] = true }
   0
 }
 
-function hmsNoteForInVars(ix: i32) {
-  const n = nodeAt(ix)
+function hmsNoteForInVars(n: Node) {
   if n is ForIn {
     hmsRebindable[n.fiVar] = true
     hmsRebindable[n.fiVar2] = true

@@ -1532,9 +1532,10 @@ delivery position of a `T | JsonError` has to be wired before the checker admits
 free.** The walk has to BUILD every target rep — a `string[]`, a struct, a `{[string]: i32}`
 map — and the emitter already knows how to build each of those out of ordinary VL. So the
 checker RECORDS which `is` sites are deep (`typecheck.jsonUnionRootOf` /
-`typecheck.jsonShapeBad`), and `driver.jwSecondPass` generates one pair of functions per
-distinct target as VL SOURCE, parses that fragment onto the same token stream and arena,
-appends its declarations to the program root, rewrites each site into a call, and re-checks:
+`typecheck.jsonShapeBad`), and `check_pins.pinDeepIs`, the last stage of `checkProgram`,
+generates one pair of functions per distinct target as VL SOURCE, parses that fragment onto
+the same token stream and arena, appends its declarations to the program root, rewrites each
+site into a call, and re-checks:
 
     __vlJsonIs_<k>(v: Json): boolean   — the predicate, what `r is T` becomes
     __vlJsonGet_<k>(v: Json): T        — the builder, what the ARM's reads of `r` become

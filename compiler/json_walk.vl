@@ -52,6 +52,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  arenaEpochBump,
   arenaSetNode,
   elseIfLink,
   i32ToStr,
@@ -67,6 +68,8 @@ import {
   nodeValueSpineChildren,
 } from "./ast"
 import { tErr } from "./check_relate_core"
+import { parseProgram } from "./parser"
+import { vcDgPush, vcLoadToks, vcParseBlocked } from "./tok_load"
 import {
   jwSiteNode,
   jwSiteTgt,
@@ -414,7 +417,7 @@ function jwJoin(lines: string[]): string {
 }
 
 // The whole fragment: one predicate + one builder per recorded target.
-export function jwGenerateSource(): string {
+function jwGenerateSource(): string {
   let src = ""
   let k = 0
   while k < jwTgtSpell.length {
@@ -491,7 +494,7 @@ function jwReplaceAll(s: string, from: string, to: string): string {
 
 // Put the `$` back into every token of the generated fragment. `from` is the index the
 // fragment's tokens start at, so nothing the user wrote is touched.
-export function jwRestoreMangling(from: i32): i32 {
+function jwRestoreMangling(from: i32): i32 {
   let i = from
   while i < P.toks.length {
     const tk = P.toks[i]
@@ -813,7 +816,7 @@ function jwRewriteSite(siteIx: i32, k: i32): string {
 // Rewrite every recorded site; returns the number of sites that refused. Each refusal
 // is raised as a positioned type error at its own `is` site rather than returned as a
 // string, because a rewrite refusal is a fact about the program the author wrote.
-export function jwRewriteAll(): i32 {
+function jwRewriteAll(): i32 {
   jwVarCtr = 0
   let bad = 0
   let s = 0
@@ -829,7 +832,7 @@ export function jwRewriteAll(): i32 {
 }
 
 // Append the parsed fragment's declarations to the program root.
-export function jwSplice(root: i32, frag: i32): boolean {
+function jwSplice(root: i32, frag: i32): boolean {
   if root < 0 || frag < 0 { return false }
   const f = nodeAt(frag)
   if f is Program {
@@ -844,4 +847,30 @@ export function jwSplice(root: i32, frag: i32): boolean {
     }
   }
   false
+}
+
+// Generates the walkers for the recorded targets, parses them onto the token stream, splices
+// them into program `root` and rewrites every site; the first generated token, or -1 when there
+// is nothing to generate or a diagnostic stopped it. Every node the author wrote keeps its index.
+export function jwExpand(root: i32): i32 {
+  // The stream grows before the arena does, so a replay must not read the banked tree off it.
+  arenaEpochBump()
+  const gen = jwGenerateSource()
+  if gen == "" { return -1 }
+  P.pos = P.toks.length
+  const genTok = P.toks.length
+  vcLoadToks(gen)
+  jwRestoreMangling(genTok)
+  const frag = parseProgram()
+  if vcParseBlocked() { return -1 }
+  if !jwSplice(root, frag) {
+    vcDgPush(P.diags.length, 1, 0, 0, 0)
+    P.diags.push(
+      { msg: "internal: deep `is` walkers could not be spliced", at: -1 },
+    )
+    return -1
+  }
+  // A refusal is a positioned type error on its own `is` site.
+  if jwRewriteAll() > 0 { return -1 }
+  genTok
 }

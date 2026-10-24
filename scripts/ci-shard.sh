@@ -43,7 +43,7 @@ FUEL_WARM=110
 WEIGHTS='
 selfhost_native_align_test.ts 9
 vl_distilled_tools_test.ts 24
-vl_deep_nesting_test.ts 35
+vl_deep_nesting_test.ts 21
 vl_capability_probes_port_test.ts 14
 vl_day_one_sampler_test.ts 27
 vl_census_generators_test.ts 24

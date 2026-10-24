@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# PART C: what the deep-`is` SECOND PASS costs (#2406). `jwSecondPass`
-# (compiler/driver.vl:660) returns at once when no deep `is` exists, and
+# PART C: what the deep-`is` SECOND PASS costs (#2406). `pinDeepIs`
+# (compiler/check_pins.vl) returns at once when no deep `is` exists, and
 # otherwise generates walker source, re-tokenizes, re-parses and runs
 # `checkProgram` over the WHOLE program a second time. So the price is a
 # doubled typecheck, charged to any file containing one — including in the LSP,
