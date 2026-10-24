@@ -834,12 +834,10 @@ import {
   ifJoinUnionNameIn,
   narrowedClosureOf,
   narrowedClosureTyOf,
+  narrowedIsMap,
+  narrowedIsMapPlace,
   narrowedIsRefArray,
   narrowedIsRefArrayPlace,
-  narrowedMapOf,
-  narrowedMapOfPlace,
-  narrowedMapValTyOf,
-  narrowedMapValTyOfPlace,
   narrowedValueAtomOf,
   nicheReadKindAt,
   nodeJoinRowName,
@@ -8372,7 +8370,7 @@ export function mapReadNarrowedContainer(exprIx: i32, fnIx: i32): boolean {
   const mrs = mapReadNarrowableSlot(exprIx, fnIx)
   if mrs < 0 { return false }
   if mvValKind[mrs] != MVK_UNION { return false }
-  if narrowedMapOfPlace(exprIx) != "" { return true }
+  if narrowedIsMapPlace(exprIx) { return true }
   narrowedIsRefArrayPlace(exprIx)
 }
 
@@ -9137,7 +9135,7 @@ function litElseNarrow(objIx: i32, variant: string): boolean {
           i = i + 1
         }
         if hit == 1 && surv >= 0 {
-          const nm = litElseSurvName(surv)
+          const nm = litElseSurvName(uty, surv)
           if nm != "" {
             pushNarrowRep(key, nm, surv, -1)
             return true
@@ -15111,7 +15109,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       if mk >= 0 && mk != 6 { return false }
       // The container arms of the same narrowing (D1014), as the Index arm above.
       if narrowedIsRefArrayPlace(exprIx) { return false }
-      if narrowedMapOfPlace(exprIx) != "" { return false }
+      if narrowedIsMapPlace(exprIx) { return false }
       // D209 — the other end of the read: an un-narrowed read the read site unboxes is not a
       // union value here either, asked with the same predicate that site uses, so the consumer
       // boxes exactly what the read delivered.
@@ -15307,7 +15305,7 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // this way reads unboxed to the map struct, but `exprUnion` keeps answering true for it,
   // so `emitUnionCoerce` hands the unboxed map to a destination typed at the union —
   // invalid wasm at six delivery positions.
-  if narrowedMapOf(e.identName) != "" { return false }
+  if narrowedIsMap(e.identName) { return false }
   if paramUnion(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
     return true
   }
@@ -15350,7 +15348,7 @@ function exprUnionIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
     // unboxes. Without them an un-annotated rebind under the narrow took the union-box
     // cell while the init emitted the unboxed wrapper — invalid wasm.
     if narrowedIsRefArrayPlace(exprIx) { return false }
-    if narrowedMapOfPlace(exprIx) != "" { return false }
+    if narrowedIsMapPlace(exprIx) { return false }
     return rlElemKindTbl[slot] == RLK_UNION
   }
   // A bare `m[k]` over a union-valued map yields the value union box — unless the cell is
@@ -15909,7 +15907,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       if narrowedValueAtomOf(e.identName) != "" { return "" }
       if nicheReadKindAt(unwrapParen(exprIx), e.identName) >= 0 { return "" }
       if narrowedIsRefArray(e.identName) { return "" }
-      if narrowedMapOf(e.identName) != "" { return "" }
+      if narrowedIsMap(e.identName) { return "" }
       // The sid-taking twin, off the node's own column: `sidOfNode` of this Ident is `sidOf` of
       // its name by that column's contract, so the id is read rather than the spelling re-interned.
       return unionNameOfIdentAt(
@@ -19686,7 +19684,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
     Ident => {
       // A union binding narrowed to a map arm unboxes to the map struct ref, so it is a map in
       // the narrowed branch — checked first, ahead of its declared type.
-      if narrowedMapOf(e.identName) != "" { return true }
+      if narrowedIsMap(e.identName) { return true }
       if paramMap(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
         return true
       }
@@ -19709,14 +19707,14 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       // map member/index ops on it route to the existing map lowering.
       // A union-box field narrowed to a map arm unboxes to the map struct ref — the Ident
       // arm's rule at the one receiver shape that never had it. D1014.
-      if narrowedMapOfPlace(exprIx) != "" { return true }
+      if narrowedIsMapPlace(exprIx) { return true }
       if memFieldTypeCode(exprIx, fnIx) == FC_MAP { return true }
       if exprNullableMap(exprIx, fnIx) { return true }
     }
     Index => {
       // A union-box ELEMENT whose index PLACE is narrowed to a MAP arm (`if xs[0] is {[string]:
       // K}`) — the index twin of the Member arm above (D1014).
-      if narrowedMapOfPlace(exprIx) != "" { return true }
+      if narrowedIsMapPlace(exprIx) { return true }
       // `scopes[i]` over a map ref list yields a Map ref, per-slot; a bare `outer[k]` over a
       // nested map likewise yields the inner Map.
       if exprRefArray(e.idxArr, fnIx) {
@@ -19955,6 +19953,15 @@ function letMapDestShape(letIx: i32, fnIx: i32): i32 {
   -1
 }
 
+// The mv slot of the map arm the narrowing of `key` binds: the banked map type's shape, else
+// the arm spelling's, which a complement at a generic pin leaves with no single type. Callers
+// gate on `narrowedIsMap` first.
+export function narrowedMapShapeOf(key: string): i32 {
+  const mt = mapTyPeel(narrowSlotTy(narrowSlotOf(key)))
+  if mt >= 0 { return mapArmShapeOfTy(mt) }
+  mvSlotOfMapNameTy(narrowVariantFor(key), -1)
+}
+
 // `mapShapeOfExpr` of a composition map read (a nested-map read, or a list-of-maps element)
 // yielding a typed-value map; `-1`, the mono map, otherwise.
 function mapShapeOfComposition(exprIx: i32, fnIx: i32): i32 {
@@ -19968,9 +19975,8 @@ function mapShapeOfComposition(exprIx: i32, fnIx: i32): i32 {
 function mapShapeOfMember(exprIx: i32, e: Member, fnIx: i32): i32 {
   // The member path's own narrowing to a map arm (D1014): its shape is the arm's value
   // type, ahead of the receiver-narrowing arm below (which would fall to the mono `-1`).
-  const mpP = narrowedMapOfPlace(exprIx)
-  if mpP != "" {
-    return mvSlotOfMapNameTy(mpP, narrowedMapValTyOfPlace(exprIx))
+  if narrowedIsMapPlace(exprIx) {
+    return narrowedMapShapeOf(placeNarrowKeyOf(exprIx))
   }
   if memIsNarrowed(exprIx) {
     const nvi = memNarrowVariantIndex(exprIx)
@@ -20078,12 +20084,9 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     return mapMonoShapeOfKey(ckK)
   }
   if e is Ident {
-    // A union binding narrowed to a map arm resolves its shape from the arm's value type,
-    // read off the same narrow-stack row as the arm spelling, checked first ahead of declaredMap/paramMap.
-    const nm = narrowedMapOf(e.identName)
-    if nm != "" {
-      return mvSlotOfMapNameTy(nm, narrowedMapValTyOf(e.identName))
-    }
+    // A union binding narrowed to a map arm resolves its shape from the arm the narrowing
+    // banks, checked first ahead of declaredMap/paramMap.
+    if narrowedIsMap(e.identName) { return narrowedMapShapeOf(e.identName) }
     const gms = identReadsGlobal(sidOfNode(exprIx), exprIx)
     if !gms && declaredMap(e.identName) {
       const slot = declaredSlotOf(e.identName)
@@ -20156,9 +20159,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   // The index place's own narrowing to a map arm (D1014) — ahead of the composition read
   // below, whose answer describes the cell rather than the narrowed arm.
   if e is Index {
-    const mpI = narrowedMapOfPlace(exprIx)
-    if mpI != "" {
-      return mvSlotOfMapNameTy(mpI, narrowedMapValTyOfPlace(exprIx))
+    if narrowedIsMapPlace(exprIx) {
+      return narrowedMapShapeOf(placeNarrowKeyOf(exprIx))
     }
   }
   // A composition map read yielding a typed-value map (a nested-map read, or a list-of-maps

@@ -135,7 +135,7 @@ the slice retires.
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; probed: the atom tests and the uncovered-row fallback have atoms with no type, the rest are the registry's own split and the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
-| D7 | narrowing store banks a type (landed: 6 retired, 1 to B and since deleted, 4 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
+| D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left; every mv slot banks a type, the mint classifies by it, 0 retired) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
@@ -1398,8 +1398,8 @@ What each slice changes:
       The print readers were reached in 1 file and agreed; the complement, less and cell
       readers were reached in 0.
     - Identity sweep with the typed producer: 16,509 files, 11,651 built, 0 differ.
-  - Left: one producer whose text readers still read, and one retired below.
-    - `litElseSurvName`'s render. With a placeholder for the value-atom arm, 0 of 16,509
+  - Two producers whose text readers still read, both retired below.
+    - `litElseSurvName`'s render, before it was retired. With a placeholder for the value-atom arm, 0 of 16,509
       files differ, but the closure survivor still reads the text:
       `tests/cases/literal-unions/else-survivor-non-literal-arm.vl` (new; the sweep population
       had no such case) fails with `call to unknown function`, through `narrowedValueAtomOf`
@@ -1472,8 +1472,27 @@ What each slice changes:
         `removeAtomFromSet` now passes a type, and
         `tests/cases/unions/narrowed-null-reassign-subtracts.vl` holds the witness. Its
         member-field face is an older master defect, filed as D11160.
-  - `narrowedMapOf`'s render is the mv slot's key, so it goes with D8. `emit_mv_slots`' `cnVariant`
-    copies the text too; that file is the shape-row lane's.
+  - Done: 1 render. `litElseSurvName`'s value-atom survivor is spelled by the union's member
+    set: the one atom of `msKeepTy(msSetOfTyAny(uty), surv)`, else "". A struct survivor keeps
+    its nominal name, which the row-identity readers above key on.
+    - A probe over the self-compile and 16,639 files (0 uncompared) compared the render with the
+      set's atom. It was reached in 12 files, 327 events, and differed in 5 events, all in the
+      control `else-survivor-non-literal-arm.vl`: a closure survivor, rendered `()=>i32` and
+      spelled `(()=>i32)` by the set. The closure readers parse either spelling, and the control
+      still prints `2`, `4`, `2.5`.
+  - Done: 1 render. `narrowedMapOf` became `narrowedIsMap`, a boolean, and `narrowedMapOfPlace`
+    `narrowedIsMapPlace`. Every gate only compared the name with `""`. The three shape readers in
+    `emit_classify` and `wasmEmit`'s unbox ask `narrowedMapShapeOf`, which takes the banked map
+    type's `mapArmShapeOfTy` and falls back to the arm spelling's mv slot only when the slot
+    banks no type (a complement at a generic pin). `narrowedMapValTyOf` and its place twin had no
+    callers left and are deleted.
+    - Probe, same population: the D1864 render rung was reached in 2 files, 367 events, and the
+      rendered name was always a bare map, so the boolean agrees. The shape answers agreed in all
+      reaches: the ident reader 79 files, 10,844 events; the member reader 1 file, 77 events; the
+      index reader 2 files, 184 events.
+    - Identity sweep: the 92 reaching files, then 16,529 files (11,669 built), 0 differ, and the fixpoint is
+      identical.
+  - `emit_mv_slots`' `cnVariant` copies the narrowing text; that file is the shape-row lane's.
 
   The `narrowVariantFor` readers, by what they need from the slot:
 
