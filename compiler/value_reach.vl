@@ -91,6 +91,12 @@ let vrStmts: i32[] = []
 export let vrLits: i32[] = []
 let vrInst = false
 let vrExact = false
+// Whether a lambda's result and a write into a fresh literal's field or element are followed;
+// only the checker's question asks, so the monomorphizer's and fn_split's answers stay put.
+let vrFollow = false
+
+// Follows a lambda's result and a write into a fresh literal for the question `vrReset` started.
+export function vrSetFollow() { vrFollow = true }
 
 // Starts a new question over the module statements `stmts`, whose values are dropped. With
 // `inst` an instance function answers by its template's reads; with `exact` every call answered
@@ -107,6 +113,7 @@ export function vrReset(stmts: i32[], inst: boolean, exact: boolean) {
   vrLits = []
   vrInst = inst
   vrExact = exact
+  vrFollow = false
   0
 }
 
@@ -455,6 +462,15 @@ function vrFnValue(f0: i32, path: string): i32[] {
     if retVoidAnnFlag(fn.fnRet) != 0 { return out }
     return vrLost()
   }
+  // A lambda's result reaches what the result of each call its value reaches does.
+  if fn.fnName == "" && vrFollow {
+    const cs = vrCalls(f, "")
+    if vrLostIn(cs) { return vrLost() }
+    for c in cs {
+      if !vrJoin(out, vrCalls(c, path)) { return vrLost() }
+    }
+    return out
+  }
   if (
     fn.fnName == ""
     || monoNameIsExported(fn.fnName)
@@ -522,6 +538,15 @@ function vrBin(n: BinExpr, p: i32, x: i32, path: string): i32[] {
   if n.binOp != "=" { return vrLost() }
   if x == n.binLeft { return out }
   const t = unwrapParen(n.binLeft)
+  if t >= 0 && vrFollow && !(nodeAt(t) is Ident) {
+    const pre: string[] = [path]
+    const d0 = vrPlaceRoot(t, pre)
+    if d0 < 0 { return vrLost() }
+    if !vrJoin(out, vrDecl(d0, pre[0])) || !vrJoin(out, vrCalls(p, path)) {
+      return vrLost()
+    }
+    return out
+  }
   if t < 0 || !(nodeAt(t) is Ident) { return vrLost() }
   const d = identDeclOf(t)
   if d < 0 || d >= P.nodes.length { return vrLost() }
@@ -537,6 +562,36 @@ function vrBin(n: BinExpr, p: i32, x: i32, path: string): i32[] {
     return vrLost()
   }
   out
+}
+
+// The un-annotated `let` whose field or element the place `t` names, when it is bound to a fresh
+// list, record or `Map()`, with `pre[0]` prefixed by that step; -1 otherwise. One step only: a
+// literal nested in it may be another binding's storage.
+function vrPlaceRoot(t: i32, pre: string[]): i32 {
+  const n = nodeAt(t)
+  let x = -1
+  let step = ""
+  if n is Member {
+    step = "f:" + n.memProp + ","
+    x = unwrapParen(n.memObj)
+  } else if n is Index {
+    step = "e,"
+    x = unwrapParen(n.idxArr)
+  }
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  const init = nodeAt(unwrapParen(dn.letInit))
+  let fresh = init is ObjLit || init is ArrayLit
+  if init is Call && init.callArgs.length == 0 {
+    const cf = nodeAt(unwrapParen(init.callFn))
+    fresh = cf is Ident && cf.identName == "Map" && identDeclOf(init.callFn) < 0
+  }
+  if !fresh { return -1 }
+  pre[0] = step + pre[0]
+  d
 }
 
 // The `Call` arm of `vrStep` for an argument: none when its parameter is declared a closed type
