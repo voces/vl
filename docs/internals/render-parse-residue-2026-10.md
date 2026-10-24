@@ -119,7 +119,7 @@ the slice retires.
 
 | slice | name | entries | A / C / D | renders / parses | files |
 | --- | --- | --- | --- | --- | --- |
-| A1 | shape-row typed twins | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
+| A1 | shape-row typed twins (landed: 0 retired, 14 left; re-probed at 2401febe6: callers with no type, typed rungs that differ, and the class C alias parameter) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
 | A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
@@ -155,6 +155,14 @@ What each slice changes:
   rows are class C, because a generic alias parameter is not a `TyVar` in the arena. The
   `rlElemNicheNullable` twin regressed D4721, so that row stays. Each row's `status` has the
   probe counts.
+
+  Re-probed at 2401febe6, still no parse retired. Every site is still reached by a caller with no
+  type: `mvValKindOfNameTy` in 7 files, `nulRefMapValInnerOfTy` in 3, `mapValKindLowerable` in 1,
+  and `nulScalarListKind` through `forceAnnLeafReps`. Where the callers are typed, two of the
+  `mvValKindOfNameTy` rungs do not agree with the arena. Its func rung differs in 31 files, on
+  hole and generic fn values stored in maps, and its lit-union rung differs in 1. Moving those
+  rungs changes the rep, so it is not a refactor. The next step is the producers: the mv slot
+  and the generic-application arguments need to bank a type.
 - **A2.** These `emit_mono` predicates test the type they hold instead of rendering it.
   - Done, byte-identical: `monoModuleLetTyIs` and `monoModuleDupPin` compare the site's type
     with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
