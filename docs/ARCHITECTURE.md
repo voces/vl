@@ -56,8 +56,8 @@ modules.
 `compiler/lexer.vl`, `tokenize(source): LexResult`.
 
 - **In:** source text. **Out:** a token array and lexical diagnostics. The lexer returns its own
-  `Tok` record (`lexer.vl`: `kind`, `text`, `start`, `line`, `col`); `ast.vl` declares a second
-  `Tok` with a sixth field, a known duplicate ([§7](#7-known-deviations)).
+  `Tok` record (`lexer.vl`: `kind`, `text`, `start`, `line`, `col`), which `ast.vl` re-exports
+  as the parser's token.
 - **Contract:** every character of the source is covered by a token or trivia; `Tok.start` is an
   offset into the source and `line`/`col` its position, and every later diagnostic span is
   built from them.
@@ -143,7 +143,7 @@ Detail: `docs/internals/check-reject-audit-2026-09.md`, `docs/internals/open-rul
 `emitProgram` (`emit_sections.vl`) is the emitter's driver. It runs a **declared pass table**,
 then `emitModule`:
 
-1. **The pass table** is a dependency-ordered list of 46 rows, each `"<pass> > <prerequisite>…"`.
+1. **The pass table** is a dependency-ordered list of 48 rows, each `"<pass> > <prerequisite>…"`.
    The loop in `emitProgram` reads each row (`passRowName`), refuses to run one whose
    prerequisites have not all run (`passNeedsMet`, an `emitFail` naming the reordered pass),
    dispatches it by name (`runEmitPass`), and bumps `emitPassGen` (`memoPassAdvance`, `memo.vl`) so a cross-pass memo cannot
@@ -479,25 +479,21 @@ Detail: `docs/internals/cli-design.md`, `docs/internals/test-runner-design.md`,
 
 ## 7. Known deviations
 
-Each line is a place the tree does not meet a contract above, measured on 2026-10-19 at
-`3fbefe6d6`. The item it links to has the numbers, the proposed fix and its first PR. Remove a
+Each line is a place the tree does not meet a contract above, measured on 2026-10-24 at
+`a6493b71f`. The item it links to has the numbers, the proposed fix and its first PR. Remove a
 line in the PR that closes it. The order in which they are closed is
 [`internals/architecture-refactor-plan.md`](internals/architecture-refactor-plan.md).
 
 | contract | deviation | item |
 | --- | --- | --- |
-| §3.5, §4.1 | The checker banks each generic call's binding (`callBindTyOf`, `check_bind_rows.vl`), but the emitter still rebuilds it for most uses (`monoArgTyName`, 9 call sites; `bindGenWalk`, 11 in the emitter), and an instance node's checker type is the generic's. Some of the monomorphizer's lists are still keyed by name. | [L1](internals/code-quality-2026-10.md#L1) |
-| §2.4, §3.4, §4.1 | The emitter answers type questions by rendering and re-parsing the spelling: **83** `tyToEmitName` calls and **228** type-string parses stand in `scripts/render-parse-budget-baseline.json` (2026-10-22, `c1bcc6474`). Of those, 21 / 22 are the product (a key, a diagnostic, a recorded TypeRef text), which is the proposed floor; the rest are classified and sliced in [render-parse-residue-2026-10.md](internals/render-parse-residue-2026-10.md). Rep classifiers read two producers for one answer (arena with name, spelling, table or frame). | [L2](internals/code-quality-2026-10.md#L2) |
+| §3.5, §4.1 | The checker banks each generic call's binding (`callBindTyOf`, `check_bind_rows.vl`), but the emitter still rebuilds it for most uses (`monoArgTyName`, 9 call sites; `bindGenWalk`, 14 in the emitter), and an instance node's checker type is the generic's. Some of the monomorphizer's lists are still keyed by name. | [L1](internals/code-quality-2026-10.md#L1) |
+| §2.4, §3.4, §4.1 | The emitter answers type questions by rendering and re-parsing the spelling: **58** `tyToEmitName` calls and **117** type-string parses stand in `scripts/render-parse-budget-baseline.json` (2026-10-24, `a6493b71f`). Of those, 21 / 22 are the product (a key, a diagnostic, a recorded TypeRef text), which is the proposed floor; the rest are classified and sliced in [render-parse-residue-2026-10.md](internals/render-parse-residue-2026-10.md). Rep classifiers read two producers for one answer (arena with name, spelling, table or frame). | [L2](internals/code-quality-2026-10.md#L2) |
 | §2.4, §4.2 | The emitter decides legality. The emitter has 745 `emitFail` / `emitFailAt` sites (`scripts/emit-refusal-sites.vl`, 2026-10-24); a hand classification of the 676 there were at `5d4cd14dc` found 140 legality-worded. The `checkTopLevel` row is a no-op (`passCheckTopLevel`) and is not a deviation. | [L3](internals/code-quality-2026-10.md#L3) |
-| §2.1 | The lexer and `ast.vl` each declare a `Tok` record. | [S-c](internals/code-quality-2026-10.md#small-items) |
-| §3.1, §4.5 | Table reads whose index may be a sentinel and is not tested: **147** `sentinel-index-unguarded` findings over the compiler graph, held by `scripts/sentinel-budget-baseline.json`, a ratchet that may only fall. A finding is not a bug; a seeded sample graded most UNDECIDED. | `docs/internals/sentinel-index-lint.md` |
-| §4.5 | Ladders over a closed kind set with a bare default: **110** `kind-ladder-incomplete` and **2** `kind-ladder-split` findings over the compiler graph, held by `scripts/ladder-budget-baseline.json`. | `docs/internals/kind-ladder-lint.md` |
 | §4.3 | The seven quiet probes share one `checkRollback` and each site names its own family set; the census finds only `cstrProbeBefore`'s constraint rows left, which it keeps by design (D3062). Of the 104 keyed maps a probe writes, `tpIfJoinAt`, `tpIfOkAt` and `dJoinRelayed` roll back through an undo log (`check_map_undo.vl`) and 29 more keep only entries no output reads. The other 72 are memos, solver results and declaration indices that a later pass reads after the rollback: restoring 67 of them at every rollback, in four groups, changes 3,292, 52, 1 and 1 of 16,534 programs (2026-10-24, `cfd99f293`; L4 log). | [L4](internals/code-quality-2026-10.md#L4) |
-| §3.3, §4.1 | Emitter registries are keyed by spelling: 49 module-scope `{[string]: i32}` maps against 31 `{[i32]: i32}` in `emit_*.vl` and `wasmEmit.vl`, and an inline union's registry row, its key (`canonUnionKeyOfName`) and its box tags are its name (`registerInlineUnionAt`, `mintInlineUnion`). Type equality has eight exported notions (`tyEq`, `tyEqSameHoles`, `tyEqNoneIsMap`, `tySame`, `tySameSet`, `tySameSpelled`, `tySameAnonRow`, `repCanonId`). The union-key licence is gated by `tests/vl_union_key_licence_test.ts`. | [L6](internals/code-quality-2026-10.md#L6) |
+| §3.3, §4.1 | Emitter registries are keyed by spelling: 56 module-scope `{[string]: i32}` maps against 41 `{[i32]: i32}` in `emit_*.vl` and `wasmEmit.vl`, and an inline union's registry row, its key (`canonUnionKeyOfName`) and its box tags are its name (`registerInlineUnionAt`, `mintInlineUnion`). Type equality has eight exported notions (`tyEq`, `tyEqSameHoles`, `tyEqNoneIsMap`, `tySame`, `tySameSet`, `tySameSpelled`, `tySameAnonRow`, `repCanonId`). The union-key licence is gated by `tests/vl_union_key_licence_test.ts`. | [L6](internals/code-quality-2026-10.md#L6) |
 | §4.7 | Expected types reach the expression emitter through module globals (the `pending*` seeds in `emit_state.vl`, and `pendingLitUnion`). Every boundary builds an `ExpCtx` and restores the caller's on every exit, and the globals are written only by `expCtxApply` and `expCtxReset`, except `collectA`'s reset of `pendingNulRefHeap`. | [L7](internals/code-quality-2026-10.md#L7) |
-| §6 | The host's exit codes are bare literals: `main.rs` has 19 `std::process::exit(<n>)` calls (18 of `2`, one of `1`), and names only `EXIT_COMPILER_BUG`, which `tests/cli_host_tables_test.ts` holds to `cli.vl`'s `CliExit`. | [S-i](internals/code-quality-2026-10.md#small-items) |
-| §4.6 | On a development build the seed resolves from the working directory and std from the executable's tree. | owner ruling pending (September row 19, [status](internals/code-quality-2026-10.md#september-status)) |
 | §2.4 | The emitter dispatches its pass table by string name through an if-ladder (`runEmitPass`). | [S-h](internals/code-quality-2026-10.md#small-items) |
+| §4.6 | On a development build the seed resolves from the working directory and std from the executable's tree. | owner ruling pending (September row 19, [status](internals/code-quality-2026-10.md#september-status)) |
 
 Two placements in §2 differ from how the phases are often described, and are the contract, not
 deviations: monomorphization is a pass inside the emitter's pass table, not a phase between the
