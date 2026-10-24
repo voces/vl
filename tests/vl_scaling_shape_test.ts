@@ -186,7 +186,7 @@ const genUnions = (n: number, k: number): string => {
   for (let i = 0; i < n; i++) {
     const t = i % m;
     o.push(`let u${i}: U${t} = { p${t}: ${i % 97} }`, `if u${i} is A${t} { acc = acc + u${i}.p${t} }`);
-    fill(o, i, 6);
+    fill(o, i, 1);
   }
   o.push("print(acc)");
   return o.join("\n") + "\n";
@@ -778,17 +778,13 @@ axis("literal-union sets", 2.5, "A literal-union lookup is scanning the union re
 axis("types", 2.8, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
-// The pair moved 800 -> 2,400 because at 800 the cheap arm ran 0.16 s under a 0.25 s floor:
-// the floor was the denominator, so the reading was an absolute budget and a constant-factor
-// regression was invisible. At 2,400 the cheap arm is 0.6 to 1.2 s, 2.4 to 3.2x the floor, so
-// the reading is a ratio again — median 1.28 to 1.40 over 44 interleaved rounds spanning load
-// 22 to 235, against master's 1.42 to 1.48 beside it. The arms have converged, so the bar is
-// the family default (fuel reads 1.88); the pre-#2630 compiler — still carrying the scans
-// since taken off this axis — read 4.42 here on CPU.
+// D11270's pair, at one filler statement per use: six fillers diluted the per-union cost to
+// a 2.31 reading while the compiler was quadratic in distinct unions (4.06 at one). With the
+// union-row, root-declaration and variant-twin scans indexed it reads 1.66 in fuel.
 axis(
   "unions",
   2.5,
-  "No frame is above 5% on this axis any more — profile the many arm before naming a cause.",
+  "A per-union ask is scanning the union registry — `unRowOfCanon` (emit_rep.vl), `declaredStructUnionMembers` (check_nj_join.vl), `buildVariantTwins` (emit_union_atoms.vl) or `variantRowOfTy` (emit_mv_slots.vl, still a scan).",
   (d) => twoFiles(d, genUnions(2400, 1), genUnions(2400, 20)),
 );
 

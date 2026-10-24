@@ -264,6 +264,7 @@ import {
 import { unNameAdoptTyKeyRow, unTyKeyPushRow } from "./emit_union_tykey"
 import { variantSig } from "./emit_variant_sig"
 import { i32ListHas } from "./listutil"
+import { memoKeyNew, memoPassMoved } from "./memo"
 import { strContains } from "./strutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
 import { nameIsMapOpen, nameIsParenOpen } from "./tyname"
@@ -805,19 +806,37 @@ function rlMintMapKey(kind: i32, rlTy: i32, men: string): i32 {
 // lay out alike, else `i`. Canon spells a self-referential arm once rolled and once unrolled
 // (`next: Node | null`, `next: <Node's members> | null`), keyed apart while denoting one type;
 // unfolded, they mint two heap types for one arm (D4615).
-function variantUnrolledTwin(i: i32, sigIds: i32[]): i32 {
+function variantUnrolledTwin(i: i32, sigFirst: i32, sigNext: i32[]): i32 {
   const ti = uVarTyIx[i]
   if ti < 0 { return i }
-  let d = 0
-  while d < i {
-    if sigIds[d] == sigIds[i] && uVarTwin[d] == d && uVarTyIx[d] >= 0 {
+  let d = sigFirst
+  while d >= 0 && d < i {
+    if uVarTwin[d] == d && uVarTyIx[d] >= 0 {
       if variantFieldLayoutEq(d, i) == 1 && tyEqSoftLits(uVarTyIx[d], ti) {
         return d
       }
     }
-    d = d + 1
+    d = sigNext[d]
   }
   i
+}
+
+// Chains rows `0..keys.length` by equal key in ascending order: `next[r]` is the following row
+// with `keys[r]`, or -1, and `first` maps a key to its lowest row. A negative key is left out.
+function twinChain(keys: i32[], first: {[i32]: i32}, next: i32[]) {
+  const last: {[i32]: i32} = Map()
+  let r = 0
+  while r < keys.length {
+    next.push(-1)
+    const k = keys[r]
+    if k >= 0 {
+      const p = last[k] ?? (-1)
+      if p < 0 { first[k] = r } else { next[p] = r }
+      last[k] = r
+    }
+    r = r + 1
+  }
+  0
 }
 
 // Populates `uVarTwin` (parallel to `uVariants`): `uVarTwin[i]` is the smallest earlier
@@ -830,50 +849,56 @@ export function buildVariantTwins() {
   // equality-preserving on the text, so `sigIds[d] == sigIds[i]` decides exactly what
   // comparing the two strings decided, and the memo is asked once a row rather than once a pair.
   const sigIds: i32[] = []
-  // The union each row belongs to: a shared tag is a fact about one union's arms, so the
-  // fold below never joins arms of two unions (D2155).
-  const owners: i32[] = []
   let i = 0
   while i < uVariants.length {
     keys.push(repNameCanonId(uVariants[i]))
     sigIds.push(sidOf(variantSig(i)))
-    owners.push(unionOfVariant(i))
     i = i + 1
   }
+  // Each row is compared only with the earlier rows sharing its key or signature, in
+  // ascending order, so the first hit is still the smallest twin (D11270).
+  const keyFirst: {[i32]: i32} = Map()
+  const keyNext: i32[] = []
+  twinChain(keys, keyFirst, keyNext)
+  const sigFirst: {[i32]: i32} = Map()
+  const sigNext: i32[] = []
+  twinChain(sigIds, sigFirst, sigNext)
   uVarTwin = []
   i = 0
   while i < uVariants.length {
     let rep = i
     if keys[i] >= 0 {
-      let j = 0
-      while j < i {
-        if keys[j] == keys[i] && variantFieldLayoutEq(j, i) == 1 {
+      let j = keyFirst[keys[i]] ?? (-1)
+      while j >= 0 && j < i {
+        if variantFieldLayoutEq(j, i) == 1 {
           rep = j
           j = i // stop at the first (smallest) twin
+        } else {
+          j = keyNext[j]
         }
-        j = j + 1
       }
     }
     // D1023's arms fold here too: the canon key preserves each arm's literal set, so two
     // arms with different literals key differently and miss the guard above, even though
     // `assignTags` already ranked them one tag (same field-name signature). A shared tag with
     // two heap types is not a representation — the other arm's `ref.cast` would trap.
+    const sf = sigFirst[sigIds[i]] ?? (-1)
     if rep == i {
-      const sigI = sigIds[i]
-      let d = 0
-      while d < i {
+      let d = sf
+      while d >= 0 && d < i {
+        // A shared tag is a fact about one union's arms, so arms of two unions never fold (D2155).
         if (
-          sigIds[d] == sigI
-          && owners[d] == owners[i]
+          unionOfVariant(d) == unionOfVariant(i)
           && variantLitDiscriminable(d, i)
         ) {
           rep = d
           d = i // the smallest such row, matching the guard above
+        } else {
+          d = sigNext[d]
         }
-        d = d + 1
       }
     }
-    if rep == i { rep = variantUnrolledTwin(i, sigIds) }
+    if rep == i { rep = variantUnrolledTwin(i, sf, sigNext) }
     uVarTwin.push(rep)
     i = i + 1
   }
@@ -2084,16 +2109,42 @@ export function ifExprNliName(ifIx: i32) {
   nm
 }
 
-// The per-union table index that OWNS global variant `vi` (the union whose variant
+// The per-union table index that OWNS global variant `vi` (the first union whose variant
 // slice contains it), or -1. Mirrors the `structIndexByName`-style resolver.
 export function unionOfVariant(vi: i32) {
-  let u = 0
-  while u < unNames.length {
-    const start = unVarStart[u]
-    if vi >= start && vi < start + unVarCount[u] { return u }
-    u = u + 1
+  if vi < 0 { return -1 }
+  uovSync()
+  if vi >= uovOwner.length { return -1 }
+  uovOwner[vi]
+}
+
+// `unionOfVariant`'s index over the union rows below `uovUpTo`. A row's slice is fixed once its
+// count is pushed, except that an empty slice may adopt an earlier row's, whose variants that
+// row already owns; `collectU` refills the rows from empty, so the pass generation is the key.
+let uovOwner: i32[] = []
+let uovUpTo = 0
+const uovKey = memoKeyNew(1)
+function uovSync() {
+  let rows = unNames.length
+  if unVarStart.length < rows { rows = unVarStart.length }
+  if unVarCount.length < rows { rows = unVarCount.length }
+  if memoPassMoved(uovKey, 0) || rows < uovUpTo {
+    uovOwner = []
+    uovUpTo = 0
   }
-  -1
+  while uovUpTo < rows {
+    const start = unVarStart[uovUpTo]
+    const end = start + unVarCount[uovUpTo]
+    while uovOwner.length < end { uovOwner.push(-1) }
+    let vi = start
+    if vi < 0 { vi = 0 }
+    while vi < end {
+      if uovOwner[vi] < 0 { uovOwner[vi] = uovUpTo }
+      vi = vi + 1
+    }
+    uovUpTo = uovUpTo + 1
+  }
+  0
 }
 
 // The only writer of `uVariants`, so its sid index cannot drift from it: the row is

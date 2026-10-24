@@ -19,6 +19,7 @@ import {
   NullLit,
   P,
   UnionDecl,
+  arenaEpochNow,
   nodeAt,
   nodeChildren,
 } from "./ast"
@@ -89,7 +90,13 @@ export let njHeldNodes: {[i32]: boolean} = Map()
 // (`structUnionRetName`). The floor must accept exactly the unions the emitter can lower, all
 // members named, so it uses the same predicate as the export.
 export let gRootStmts: i32[] = []
-export function gRootStmtsSet(v: i32[]) { gRootStmts = v }
+export function gRootStmtsSet(v: i32[]) {
+  gRootStmts = v
+  gRootStmtsGen = gRootStmtsGen + 1
+}
+
+// Every assignment of `gRootStmts`, which its length alone does not show.
+let gRootStmtsGen = 0
 
 // Is `ix` one of the program's own top-level statements? `gRootStmts` is the `Program` node's
 // statement list, stamped at the head of `checkProgram`, so this is the exact population the
@@ -423,37 +430,70 @@ export function unionAliasMembers(name: string) {
 // anything else. Needed since `tyToNameGo`'s `TyObj` arm has no nominal rung — it
 // renders a member as an anonymous shape, unrelated to the real declared structs.
 export function declaredStructUnionMembers(name: string) {
-  let si = 0
-  while si < gRootStmts.length {
-    const s = nodeAt(gRootStmts[si])
-    if s is UnionDecl {
-      if s.udName == name {
-        const vs = s.udVariants
-        if vs.length < 2 { return "" }
-        let out = ""
-        let i = 0
-        while i < vs.length {
-          const m = vs[i]
-          if m != "null" {
-            const mi = cUserTypes[m] ?? (-1)
-            if mi < 0 { return "" }
-            const mt = tyAt(mi)
-            if mt is TyObj {} else { return "" }
-          }
-          if i > 0 { out = out + "|" }
-          out = out + m
-          i = i + 1
-        }
-        // The join's own atom width, for the caller that reads `tyNameAtoms` after a
-        // flatten: one atom per member, since each is a bare name.
-        tyNameAtoms = vs.length
-        return out
+  const si = rootUnionDeclAt(name)
+  if si < 0 { return "" }
+  const s = nodeAt(gRootStmts[si])
+  if s is UnionDecl {
+    const vs = s.udVariants
+    if vs.length < 2 { return "" }
+    let out = ""
+    let i = 0
+    while i < vs.length {
+      const m = vs[i]
+      if m != "null" {
+        const mi = cUserTypes[m] ?? (-1)
+        if mi < 0 { return "" }
+        const mt = tyAt(mi)
+        if mt is TyObj {} else { return "" }
       }
+      if i > 0 { out = out + "|" }
+      out = out + m
+      i = i + 1
     }
-    si = si + 1
+    // The join's own atom width, for the caller that reads `tyNameAtoms` after a
+    // flatten: one atom per member, since each is a bare name.
+    tyNameAtoms = vs.length
+    return out
   }
   ""
 }
+
+// The position in `gRootStmts` of the first `UnionDecl` named `name`, or -1. Indexed once per
+// statement list and arena generation; a stale entry is caught by re-reading its slot, and
+// then the list is scanned as before.
+function rootUnionDeclAt(name: string): i32 {
+  let moved = memoMoved(rudKey, 0, gRootStmtsGen)
+  moved = memoMoved(rudKey, 1, gRootStmts.length) || moved
+  moved = memoMoved(rudKey, 2, arenaEpochNow()) || moved
+  if moved {
+    rudAt = Map()
+    let i = gRootStmts.length - 1
+    while i >= 0 {
+      const s = nodeAt(gRootStmts[i])
+      if s is UnionDecl { rudAt[s.udName] = i }
+      i = i - 1
+    }
+  }
+  const at = rudAt[name] ?? (-1)
+  if at < 0 { return -1 }
+  const s = nodeAt(gRootStmts[at])
+  if s is UnionDecl {
+    if s.udName == name { return at }
+  }
+  let si = 0
+  while si < gRootStmts.length {
+    const t = nodeAt(gRootStmts[si])
+    if t is UnionDecl {
+      if t.udName == name { return si }
+    }
+    si = si + 1
+  }
+  -1
+}
+
+let rudAt: {[string]: i32} = Map()
+
+const rudKey = memoKeyNew(3)
 
 // ── the union registry's rep key, minted here and nowhere else (`registry-by-type-id.md`
 // §3) ── neither existing key works: an arena index is not an identity, and `repCanonId`
@@ -698,5 +738,5 @@ export function njJoinReset() {
   njGateMemo = Map()
   njHeldNodes = Map()
   njFnIx = -1
-  gRootStmts = []
+  gRootStmtsSet([])
 }
