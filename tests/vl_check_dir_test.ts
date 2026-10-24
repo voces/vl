@@ -175,7 +175,7 @@ Deno.test({
         [dir],
         [dir, "--json"],
         [dir, "--severity", "info", "--json"],
-        [dir, "--concise", "--include-imports"],
+        [dir, "--concise", "--skip-imports"],
         ["--batch", "--json", ...named],
       ];
       const run = async (args: string[], jobs: string) => {
@@ -357,8 +357,8 @@ Deno.test({
       if (!r.err.includes("[check] served: roots=1 ")) {
         throw new Error(`want b.vl served from a.vl's check, got:\n${r.err}`);
       }
-      if (want.length !== 2 || JSON.stringify(own(r.err)) !== JSON.stringify(want) || r.code !== 0) {
-        throw new Error(`want b.vl's warning then a.vl's:\n${want.join("\n")}\ngot ${r.code}:\n${r.err}`);
+      if (want.length !== 3 || JSON.stringify(own(r.err)) !== JSON.stringify(want) || r.code !== 0) {
+        throw new Error(`want b.vl's report then a.vl's (its own and b.vl's):\n${want.join("\n")}\ngot ${r.code}:\n${r.err}`);
       }
     } finally {
       await Deno.remove(dir, { recursive: true });

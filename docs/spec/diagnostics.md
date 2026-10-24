@@ -171,10 +171,11 @@ print(x)   // prints 3
 > it reads "Found 0 errors, 1 warning. (failing at severity warning)".
 
 **D4.2** A file named on the command line reports its whole module graph's errors, each
-labelled with the module it sits in. Its imports' findings are withheld, and the summary
-counts them: "(1 import diagnostic hidden — --include-imports shows them)".
-`--include-imports` shows them. Findings inside `std:` modules are withheld the same way
-and shown by `--include-std`. An error inside `std:` is always shown.
+labelled with the module it sits in. The findings of the modules it imports by a relative
+path are reported with its own; `--skip-imports` does not lint those modules. A module
+imported by a prefixed specifier (`std:` today) is not linted, and the run says so:
+"(std: modules not linted — --include-std lints them)". `--include-std` lints `std:`
+modules. An error inside any module is always shown.
 
 **D4.3** `vl run` reports errors and no findings.
 

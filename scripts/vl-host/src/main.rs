@@ -704,14 +704,14 @@ hints only for the file(s) you name, unless asked for (below).
                       first, and an edit that stops the file building is
                       declined. Annotations on exported declarations are API
                       and are never removed.
-  {c}--include-imports{r}   Report warnings and hints inside the modules a named file
-                      imports too. Without it they are withheld (a count is
-                      printed); each module reports its own when checked.
-                      std: stays hidden unless --include-std is also passed.
-  {c}--include-std{r}       Report warnings and hints inside imported std: modules
-                      too. Without it they are withheld (a count is printed) —
-                      nothing in std is yours to fix. std ERRORS are always
-                      shown: one means the toolchain itself is broken.
+  {c}--skip-imports{r}      Do not lint the modules a named file imports by a
+                      relative path; by default their warnings and hints are
+                      reported with the file's own. Their ERRORS are always
+                      shown. (--include-imports undoes it.)
+  {c}--include-std{r}       Lint imported std: modules too. Without it a module
+                      imported by a prefixed specifier (std:) is not linted —
+                      nothing in std is yours to fix — and a note says so. std
+                      ERRORS are always shown: one means the toolchain is broken.
   {c}--exclude{r} <glob>    Skip matching paths, and the warnings and hints of a
                       matching import (repeatable; also --exclude=<glob>)
   {c}--color={r}<when>      always | never | auto (default: color iff stdout is a
