@@ -50,6 +50,7 @@ after, on one seed.
 | R6c | the inline-record step's rewrite: new types, bodies and body moves (`compiler/opt_inline_scan.vl`, `optInlineRewrite`); the default, its Rust deleted (R6d) | retired (`$VL_OPT_INLINE`) | the step's module bytes and body moves under `both`, the `$VL_INLINE_EXPLAIN` lines, the built module, and the `--source-map` file |
 | R7 | the list-flattening step: its scan, cost rule, rewrite and explain lines (`compiler/opt_inline_scan.vl`, `optInlineFlatScan`, `optInlineFlatStep`); the default, its Rust deleted | retired (`$VL_OPT_FLAT`) | `$VL_OPT_FLAT_DUMP`, the multi-value step's output, the `$VL_INLINE_EXPLAIN` lines, and the built module |
 | R8 | the chain itself: the steps' order, their skips, the body-move composition and the roundtrip checks (`compiler/opt_pipe.vl`, `optPipeStart`); the host makes one call and answers requests | none (a host built before against the one after) | every dump, explain line and source map above, under each step's flags and faults |
+| R9 | the JavaScript hosts answer the same requests (`compiler/optHost.ts`, binaryen.js); no compiler change | none (native `vl build -O` against the JS host) | the module bytes, at `-O` and `-O3`, with `--names` and `--low-memory-unused` |
 
 The order is cheapest-first by what each needs: R1 and R2 only read; R3 rewrites one custom
 section; R5 to R7 rewrite bodies and need R4. A rung's default switches, and its Rust is
@@ -596,3 +597,39 @@ either side; a hand A/B of a fixture under it, under `VL_OPT_ROUNDTRIP=bogus` an
 fault with both explain variables set gives the same exit status, module and stderr on both
 hosts. `plumb-shape-cost` reads the same guest fuel on both hosts (8,653,308,342 main,
 6,249,248,346 tail) and peak RSS 0.3 to 0.7 MB higher, inside its bar.
+
+## R9, the JavaScript hosts
+
+The Deno and playground hosts run `-O` through `compiler/optHost.ts`, a leaf adapter with no
+compiler logic: `optimizeModule` stages the emitted bytes, calls `optStripSrc` and
+`optPipeStart` on a seed instance of its own, and answers each request with binaryen.js (pinned
+130, as the native host's `wasm-opt`). VALIDATE is `new WebAssembly.Module`, VALIDATE_INPUT is
+`WebAssembly.validate`, WASM_OPT and DONE's argv run through `runWasmOpt`, MOVES and the DUMP
+requests are answered 0, and ERROR throws. The compile itself is the checker's `setOptimized`,
+as `vl build -O` sets it.
+
+`runWasmOpt` reproduces `wasm-opt`'s CLI over binaryen.js: `-g`, `--closed-world`,
+`--low-memory-unused`, `--always-inline-max-function-size` and `--skip-pass=` apply to the
+whole run; each `-O<n>` runs the passes queued before it and then the default pipeline at its
+own levels (`-O` is 2/1, `-O<n>` is n/0), and a pass after it runs at that level;
+`--no-inline=` is a pass argument; and when any `-O` ran, the binary is written from optimised
+StackIR, as the CLI does. Without that last one 5 of the first 6 modules differed by 3 to 8
+bytes. A flag the compiler never emits is refused.
+
+The JS hosts do not serve `--source-map` under `-O` (no MOVES remap) or the dump files, and
+the `$VL_*` option bits are whatever the caller passes; the playground's `-O` switch builds as
+`vl build -O --names` does.
+
+Native `vl build` (the pinned `wasm-opt`) against the JS host, byte for byte:
+
+| population | modules | identical | differ |
+| --- | ---: | ---: | ---: |
+| every `tests/fixtures/opt-*/*.vl` (71 programs), `-O` and `-O3` | 142 | 142 | 0 |
+| escape, multi-value and flattening fixtures, `--names` | 42 | 42 | 0 |
+| those and `opt-loop`, `--low-memory-unused=4096` | 48 | 48 | 0 |
+| every 40th of `tests/cases/**/*.vl` that native builds, `-O` and `-O3` | 250 | 250 | 0 |
+
+`tests/vl_opt_js_host_test.ts` holds six programs (four fixtures and two that import std) under
+four variants, and turning off the StackIR write reds it. It needs binaryen.js from
+`node_modules`, so ci-native, which has none, skips it, and the merge queue runs it.
+`playground/verify.ts` runs an `-O` and an `-O3` build through the bundled playground.

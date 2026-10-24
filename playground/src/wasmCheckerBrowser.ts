@@ -36,6 +36,7 @@ import { SEED_NAME } from "./generated/seedName.ts";
 // undefined for sibling imports.
 
 let checker: WasmChecker | undefined;
+let seedModule: WebAssembly.Module | undefined;
 let loadOnce: Promise<WasmChecker | undefined> | undefined;
 
 /**
@@ -51,6 +52,7 @@ export const loadBrowserChecker = (): Promise<WasmChecker | undefined> => {
       if (!res.ok) return undefined;
       const bytes = new Uint8Array(await res.arrayBuffer());
       const module = await WebAssembly.compile(bytes);
+      seedModule = module;
       const instance = await WebAssembly.instantiate(module, {});
       const exports = instance.exports as unknown as Exports;
       checker = createWasmChecker(() => exports, wrapStdReader);
@@ -60,4 +62,14 @@ export const loadBrowserChecker = (): Promise<WasmChecker | undefined> => {
     }
   })();
   return loadOnce;
+};
+
+/**
+ * A new instance of the loaded seed, for a step that must own one: an `-O` Run's
+ * `optimizeModule` (`compiler/optHost.ts`), as native `vl build` runs its chain on a fresh
+ * compiler. Undefined until `loadBrowserChecker` has resolved a seed.
+ */
+export const freshSeed = async (): Promise<Record<string, unknown> | undefined> => {
+  if (seedModule === undefined) return undefined;
+  return (await WebAssembly.instantiate(seedModule, {})).exports;
 };

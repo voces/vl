@@ -410,6 +410,12 @@ export type WasmChecker = {
    */
   setEmitNames: (on: boolean) => void;
   /**
+   * Compile the NEXT `compile` for `-O` (`setOptimized` on the seed): the emitter keeps map
+   * stores inline, where binaryen can scalarise them. Its bytes go on to `optimizeModule`
+   * (`compiler/optHost.ts`). A no-op on a seed that predates the export.
+   */
+  setOptimized: (on: boolean) => void;
+  /**
    * Go-to-definition (Stage 2): the declaring span for the binding under
    * (`line`, `character`) (both 0-based, LSP), or undefined when the cursor is
    * off any tracked binding (or the seed predates the symbol exports).
@@ -2182,6 +2188,12 @@ export const createWasmChecker = (
     exp.setEmitNames(on ? 1 : 0);
   };
 
+  const setOptimized = (on: boolean): void => {
+    const exp = instantiate();
+    if (exp === undefined || typeof exp.setOptimized !== "function") return;
+    exp.setOptimized(on ? 1 : 0);
+  };
+
   const compile = async (
     source: string,
     entryKey: string,
@@ -2496,6 +2508,7 @@ export const createWasmChecker = (
     check,
     compile,
     setEmitNames,
+    setOptimized,
     definitionAt,
     referencesAt,
     referencesInEntry,
