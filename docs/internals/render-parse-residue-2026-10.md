@@ -131,7 +131,7 @@ the slice retires.
 | C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 12 retired, 18 left; the `rlMapElemValSlot` fall-through waits on D8) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; 5 retired, 18 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; re-probed: the atom tests agree wherever atoms are typed, but `emit_mono`'s name-only pins register rows with no type; the registry's own split disagrees with canonical members in 2,573 files, so minting by type changes box tags; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -1252,6 +1252,56 @@ What each slice changes:
     names `#anon` rows and record names where the type renders the inline shape.
     `unionParamPinName`'s render agreed with the literal `string` in only 2 events in 1 file,
     and no control reaches it, so it stays. 18 entries are left.
+  - Done: two renders are constants of the type that reaches them. The renders were deleted,
+    and the seed is byte-identical.
+    - `unionParamPinName`: `tyIsLitUnion` admits only string literals, and at the root
+      `tyToEmitName` drops their inline set and renders each member `string`.
+    - The hole nullable-string pin in `monoArgTyName`: `holeNulStringPinTyOf` answers only
+      `string | null` over the primitive.
+
+    An answer probe over 16,641 files plus the self-compile matched each old render to its
+    constant: in 1 file (2 events) and in 11 files (17 events), with 0 disagreements.
+    difftree --identity found 0 of 16,529 files differ. The ratchet falls from 60 to 58 renders.
+  - Left, measured: the other 16 entries. The same probe recorded each producer's spelling.
+    Where a spelling reached `monoMakeInstance` as a pin, the probe compared it with a render
+    of the pin's banked type, which is what C1 step 3 would render. Counts are files, then
+    events.
+
+    | producer | reach | mint: agree | differs | no banked type |
+    | --- | --- | --- | --- | --- |
+    | `monoAnnPinName` list test | 3,361 / 10,098, no type at any | | | |
+    | `monoNulAnnName` | 281 / 939, no type at any | | | |
+    | `monoCompositeListAnnName` | 316 / 1,151, no type at any | | | |
+    | `monoPinWidened` | 54 / 432, no type at any | | | |
+    | `monoPinAnnSpelling` | 962 / 3,503 | 1,629 | 14 / 21 | 8 / 28 |
+    | `monoConcreteFnPinName` | 393 / 2,817 | 172 | 3 / 5 | 1 / 1 |
+    | `monoArgTyName` niche pin | 588 / 1,026 | 1,024 | 1 / 2 | 0 |
+    | `monoAnnPinNameOfTy` | 398 / 597 | 585 | 2 / 2 | 0 |
+    | `monoPinLamAtTys` | 12 / 43 | 55 | 1 / 1 | 0 |
+    | `monoLamPinName` | 12 / 50 | 93 | 0 | 0 |
+    | `monoArgTyName` nullable function | 4 / 17 | 17 | 0 | 0 |
+    | `monoArgLitUnionPin` | 1 / 1 | 1 | 0 | 0 |
+    | `monoNulUnionPinName` | 1 / 8 | never a pin verbatim | | |
+    | `monoSubstAnonShapes` | 1 / 2, annotation text | | | |
+    | `monoI32AtomPinName` fallback | 0 non-empty | | | |
+
+    The mint columns count by spelling, so a spelling that two producers share is credited to
+    the one that wrote it last.
+
+    Two blockers come out of this table:
+    - The four ladder rungs take a spelling and hold no type, so they move only when the
+      ladder takes one.
+    - Among the producers, a render at the mint would change the key wherever it differs:
+      - an empty render of a function or function-list pin;
+      - `string|null` pinned where the type renders `null`;
+      - `K|null` where it renders `string`;
+      - member order (`i64|string`);
+      - record width (`{x:i32}`).
+
+      So C1 step 3 is an allow-diff step and needs those pins typed first.
+
+    `monoArgLitUnionPin` cannot become a constant, because a list of literals keeps its inline
+    spelling. 16 entries are left.
 - **D4.** `monoRegisterPinUnion` and `canonUnionKeyOfName` register a narrowed pin's union by its
   type.
   - Probed and blocked: no entry retired. A side-by-side probe read the spelling and the type at
