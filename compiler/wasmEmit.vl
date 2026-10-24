@@ -542,26 +542,9 @@ import {
   mvValKind,
   mvValName,
   narrowTop,
-  nulStrReadStaysRaw,
   optRecvSlot,
   optRecvStagedIx,
   optRecvStagedSet,
-  pendingF32,
-  pendingF64,
-  pendingI64,
-  pendingListKind,
-  pendingListSlot,
-  pendingMapSlot,
-  pendingNulBool,
-  pendingNulClosure,
-  pendingNulList,
-  pendingNulLitUnion,
-  pendingNulNone,
-  pendingNulRefHeap,
-  pendingNulString,
-  pendingRawNullRead,
-  pendingStructIdx,
-  pendingVariantIdx,
   pushScratchBase,
   raUsed,
   rlBackIdx,
@@ -1066,6 +1049,7 @@ import {
   exprIsNullLike,
   ifChainAllBareNull,
   ifLinkYieldsNull,
+  ifListArmValueIx,
   isRecvStashSlot,
   listPayloadStashSlot,
   litAtomCastSlot,
@@ -1102,7 +1086,6 @@ import {
   internAtom,
   localSlotIsLitAtom,
   nulAtomWidenTexts,
-  pendingLitUnion,
   uFieldStorageSlot,
   variantFieldMayOmit,
 } from "./emit_lit_atoms"
@@ -19977,6 +19960,16 @@ function emitCondExpr(body: u8[], ix: i32, fnIx: i32) {
   rc
 }
 
+// `ifExprRefKind` at a destination record `destStruct` (-1 for none): an object-literal then
+// arm has no struct row of its own, so it builds at the destination's.
+function ifExprRefKindAt(ifIx: i32, fnIx: i32, destStruct: i32): VKind | null {
+  const rk = ifExprRefKind(ifIx, fnIx)
+  if rk != null || destStruct < 0 { return rk }
+  const tv = ifListArmValueIx(ifIx)
+  if tv >= 0 && nodeAt(tv) is ObjLit { return "struct" }
+  null
+}
+
 // Lower an if-expression (`if c then a else b` in value position) onto `body`: cond,
 // `if (result <kind>)`, the then-arm value, else the else-arm value (an `else if` chain
 // recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
@@ -20003,10 +19996,13 @@ function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
     if iun != "" {
       how = 3
     } else {
-      rk = ifExprRefKind(ifIx, fnIx)
+      const dest = expCtxHere()
+      rk = ifExprRefKindAt(ifIx, fnIx, dest.structIdx)
       if rk != null {
         how = 4
-        rslot = ifExprRefSlot(ifIx, fnIx, rk)
+        let destList = -1
+        if dest.listKind == LBK_REF_AT_SLOT { destList = dest.listSlot }
+        rslot = ifExprRefSlot(ifIx, fnIx, rk, dest.structIdx, destList)
       } else {
         vt = ifExprValtype(ifIx, fnIx)
       }
@@ -33814,11 +33810,11 @@ export function emitUserGlobalSet(gi: i32) {
 // site risks a leaked seed. `ExpCtx` makes it explicit — a site snapshots the ambient
 // seeds (`expCtxHere`), overrides what it knows, and hands it to `emitExprExpect`.
 export type ExpCtx = {
-  listKind: i32,        // pendingListKind — what an empty `[]` builds
+  listKind: i32,        // pendingListKind — what an empty `[]` builds (an `LBK_*` code)
   listSlot: i32,        // pendingListSlot — WHICH ref-list element type
   structIdx: i32,       // pendingStructIdx — the struct an ObjLit must build
   variantIdx: i32,      // pendingVariantIdx — bare variant an ObjLit must build
-  mapSlot: i32,         // pendingMapSlot — the map shape a `Map()` builds
+  mapSlot: i32,         // pendingMapSlot — the map shape a `Map()` builds; -1 mono, -2 a Set
   wantI64: boolean,     // pendingI64 — a NumLit lowers as i64.const
   wantF32: boolean,     // pendingF32 — a NumLit lowers as f32.const
   wantF64: boolean,     // pendingF64 — an integer NumLit lowers as f64.const
@@ -33832,6 +33828,32 @@ export type ExpCtx = {
   rawNullRead: boolean, // pendingRawNullRead — a nullable read stays the RAW ref
   litUnion: i32,        // pendingLitUnion — a member StrLit lowers as its atom id
 }
+
+// The current context's transport, private to this module: written only by `expCtxApply` and
+// `expCtxReset`, and read by the expressions that consume a seed. Each is the `ExpCtx` field
+// named beside it above, at that field's default.
+let pendingListKind = 0
+let pendingListSlot = 0
+let pendingStructIdx = -1
+let pendingVariantIdx = -1
+let pendingMapSlot = -1
+let pendingI64 = false
+let pendingF32 = false
+let pendingF64 = false
+let pendingNulBool = false
+let pendingNulLitUnion = false
+let pendingNulString = false
+let pendingNulClosure = false
+let pendingNulList = false
+let pendingNulNone = false
+let pendingNulRefHeap = -1
+let pendingRawNullRead = false
+let pendingLitUnion: i32 = 0
+
+// Whether a `string | null` read stays the raw nullable ref rather than recovering with
+// `ref.as_non_null`: under a null test (`rawNullRead`) or a nullable-string target
+// (`nulString`), where recovering would trap. The reads and the `??` block type both ask it.
+function nulStrReadStaysRaw() { pendingRawNullRead || pendingNulString }
 
 // The current pending seeds as an explicit context — the BASE every site starts
 // from (exact ambient semantics), overriding only the fields it knows.

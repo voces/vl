@@ -885,7 +885,6 @@ import {
   LBK_I32_LIST,
   LBK_I64_LIST,
   LBK_REF,
-  LBK_REF_AT_SLOT,
   LBK_STR_LIST,
   LBK_U8_LIST,
   MVK_CLOSURE,
@@ -968,9 +967,6 @@ import {
   narrowTys,
   narrowVariants,
   nestedNameBySid,
-  pendingListKind,
-  pendingListSlot,
-  pendingStructIdx,
   rlElemKindTbl,
   rlElemName,
   rlElemNullable,
@@ -6944,12 +6940,6 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   // a ref value (D1668). Ahead of the struct rung for the reason the nullable half says.
   if exprVariantIndex(tv, fnIx) >= 0 { return "variant" }
   if structIndexOfExpr(tv, fnIx) >= 0 { return "struct" }
-  // An object literal arm in a struct-typed context (return / binding seeds
-  // `pendingStructIdx`) has no self-derivable struct index.
-  const tn = nodeAt(tv)
-  if tn is ObjLit {
-    if pendingStructIdx >= 0 { return "struct" }
-  }
   // A join whose deciding arm is itself nullable (D1560): every predicate above is
   // non-null, so a `T | null`-returning arm answers no to all of them and would otherwise
   // fall to the scalar path. Same kind order as the ladder above.
@@ -6981,9 +6971,15 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
 
 // The `fbValtype` slot (second arg) for a ref-typed if-expression join of `kind`: the
 // struct table index (kind 1) or the ref-list wrapper slot (kind 5); the other ref kinds
-// ignore the slot. Prefers the pending context seed (a struct/list return or binding)
-// over the then-arm's own derivation.
-export function ifExprRefSlot(ifIx: i32, fnIx: i32, kind: VKind) {
+// ignore the slot. `destStruct` and `destListSlot` are the destination's record and ref-list
+// row, -1 for none; a destination is preferred over the then-arm's own derivation.
+export function ifExprRefSlot(
+  ifIx: i32,
+  fnIx: i32,
+  kind: VKind,
+  destStruct: i32,
+  destListSlot: i32,
+) {
   // The arm that carries the rep (D1560) — the same one `ifExprRefKind` classified from, so
   // a kind and its slot are never read off two different arms.
   const tv = ifRepArmValueIx(ifIx)
@@ -7001,23 +6997,23 @@ export function ifExprRefSlot(ifIx: i32, fnIx: i32, kind: VKind) {
       // An object-literal arm under a struct destination builds at the destination's row, as
       // the literal does outside an `if`; its own shape can name an anonymous twin whose
       // union-valued field (`{ f: A | B }` for `Sx = { f: B | string }`) is stored differently.
-      if pendingStructIdx >= 0 && nodeAt(unwrapParen(tv)) is ObjLit {
-        return pendingStructIdx
+      if destStruct >= 0 && nodeAt(unwrapParen(tv)) is ObjLit {
+        return destStruct
       }
       // With no destination, a join of records into a wider one builds at the join's own row.
       const jrow = joinedRecordRowOf(ifIx)
       if jrow >= 0 { return jrow }
       const si = structIndexOfExpr(tv, fnIx)
       if si >= 0 { return si }
-      if pendingStructIdx >= 0 { return pendingStructIdx }
+      if destStruct >= 0 { return destStruct }
       // Then arm is `null` with no binding seed — resolve the struct from the checker's
       // nullable join type instead, so the arm rep and nullable blocktype find the layout.
       const inn = nodeNulStructInnerName(ifIx)
       if inn != "" { return structIndexOfTypeName(inn) }
-      return pendingStructIdx
+      return destStruct
     }
     "reflist" => {
-      if pendingListKind == LBK_REF_AT_SLOT { return pendingListSlot }
+      if destListSlot >= 0 { return destListSlot }
       const hs = emptyArrHoleElemSlot(tv)
       if hs >= 0 { return hs }
       return refListSlotOfExpr(tv, fnIx)
@@ -17079,7 +17075,7 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     // An if-expression's element is its join's row, the one its blocktype names (D2210).
     IfStmt => {
       if ifExprRefKind(exprIx, fnIx) != "reflist" { return "" }
-      const ifs = ifExprRefSlot(exprIx, fnIx, "reflist")
+      const ifs = ifExprRefSlot(exprIx, fnIx, "reflist", -1, -1)
       if ifs < 0 || ifs >= rlElemName.length { return "" }
       return rlElemName[ifs]
     }
