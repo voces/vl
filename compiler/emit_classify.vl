@@ -1486,22 +1486,49 @@ function fieldClosureFeOf(si: i32, prop: string) {
 // type: literals of one row may hold closures of different signatures. -1 when none has it.
 function fieldClosureFeOfWant(si: i32, prop: string, want: i32) {
   if si < 0 { return -1 }
-  let ai = 0
-  while ai < P.nodes.length {
-    const an = nodeAt(ai)
-    if an is ObjLit {
-      if structIndexOfObj(ai) == si {
-        const fv = objFieldVal(ai, prop)
-        const ffe = fieldValueFeOf(fv)
-        if ffe >= 0 {
-          if want < 0 || tyEq(nodeTyIxOf(fnStmts[ffe]), want) { return ffe }
-          if fieldValueTakesFnTy(fv, want) { return ffe }
-        }
+  for ai in objLitSlotsNow() {
+    if nodeAt(ai) is ObjLit && structIndexOfObj(ai) == si {
+      const fv = objFieldVal(ai, prop)
+      const ffe = fieldValueFeOf(fv)
+      if ffe >= 0 {
+        if want < 0 || tyEq(nodeTyIxOf(fnStmts[ffe]), want) { return ffe }
+        if fieldValueTakesFnTy(fv, want) { return ffe }
       }
     }
-    ai = ai + 1
   }
   -1
+}
+
+// Every `ObjLit` slot of the arena in ascending order. What a node IS changes only by a push
+// (the length) or an in-place replacement (the epoch): an append extends the list, a
+// replacement rebuilds it. Reset per program.
+let objLitSlots: i32[] = []
+let olsIxLen: i32 = -1
+let olsIxEpoch: i32 = -1
+
+function objLitSlotsReset() {
+  objLitSlots = []
+  olsIxLen = -1
+  olsIxEpoch = -1
+  0
+}
+
+function objLitSlotsNow(): i32[] {
+  if P.nodes.length == olsIxLen && olsIxEpoch == arenaEpochNow() {
+    return objLitSlots
+  }
+  let i = olsIxLen
+  if olsIxEpoch != arenaEpochNow() || i < 0 || i > P.nodes.length {
+    objLitSlots = []
+    i = 0
+  }
+  while i < P.nodes.length {
+    if nodeAt(i) is ObjLit { objLitSlots.push(i) }
+    i = i + 1
+  }
+  olsIxLen = P.nodes.length
+  olsIxEpoch = arenaEpochNow()
+  objLitSlots
 }
 
 // Whether the function a field value `fv` names, which the checker left open, has function type
@@ -7047,6 +7074,11 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
   if tyKindOf(nodeTyIxOf(exprIx)) == TK_I64 {
     return true // typed-IR fast path (see exprIsF64)
   }
+  // A literal is none of the `??`, `min`/`max` shapes asked next; its lexeme decides.
+  const lit = nodeAt(exprIx)
+  if lit is NumLit {
+    return !numLexIsFloat(lit.numText) && !numLexFitsI32(lit.numText)
+  }
   // Over a `null`-typed LHS a `??` is its default, at the default's rep (D4550).
   const cnnK = coalesceNulNoneDefaultIx(exprIx, fnIx)
   if cnnK >= 0 { return exprIsI64(cnnK, fnIx) }
@@ -7520,6 +7552,9 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   // Typed-IR fast path (additive — only turns false into true, so the syntactic derivation
   // below still applies to a node with no recorded type, e.g. a monomorphized instance body).
   if tyKindOf(nodeTyIxOf(exprIx)) == TK_F64 { return true }
+  // A literal is none of the `??`, `min`/`max` shapes asked next; its lexeme decides.
+  const lit = nodeAt(exprIx)
+  if lit is NumLit { return numLexIsFloat(lit.numText) }
   // Over a `null`-typed LHS a `??` is its default, at the default's rep (D4550).
   const cnnK = coalesceNulNoneDefaultIx(exprIx, fnIx)
   if cnnK >= 0 { return exprIsF64(cnnK, fnIx) }
@@ -11592,8 +11627,18 @@ export function arrLitNumKind(arrIx: i32, fnIx: i32): i32 {
     let anyI64 = false
     let i = 0
     while i < a.arrElems.length && !(anyF64 && anyI64) {
-      if !anyI64 && exprIsI64(a.arrElems[i], fnIx) { anyI64 = true }
-      if !anyF64 && exprIsF64(a.arrElems[i], fnIx) { anyF64 = true }
+      const el = a.arrElems[i]
+      const n = if el >= 0 { nodeAt(el) } else { null }
+      if n is NumLit {
+        // `exprIsI64` and `exprIsF64` over a literal, sharing one read of its lexeme.
+        const k = tyKindOf(nodeTyIxOf(el))
+        const fl = numLexIsFloat(n.numText)
+        if fl || k == TK_F64 { anyF64 = true }
+        if k == TK_I64 || (!fl && !numLexFitsI32(n.numText)) { anyI64 = true }
+      } else {
+        if !anyI64 && exprIsI64(el, fnIx) { anyI64 = true }
+        if !anyF64 && exprIsF64(el, fnIx) { anyF64 = true }
+      }
       i = i + 1
     }
     if anyF64 && !anyI64 { return ALK_F64 }
@@ -21803,6 +21848,7 @@ export function mfCallbackFe(cbIx: i32, fnIx: i32) {
 // their declared values at compile start. Each is balanced or written before it is read on
 // every path that returns; a trap inside a query leaves a depth above 0 and stales its memo.
 export function classifyStateReset() {
+  capCalleeIx = -1
   capFrame = -1
   capInitAsk = false
   gckDepth = 0
@@ -21810,6 +21856,9 @@ export function classifyStateReset() {
   lrDepth = 0
   narrowChasedInit = -1
   narrowDropWin = []
+  rsSibHit = -1
+  sioApartObj = -1
   classifyLitHoleReset()
+  objLitSlotsReset()
   0
 }
