@@ -124,14 +124,14 @@ the slice retires.
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
-| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites B, C and D bind by type, site A blocked on typed fn-flow pins) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
+| C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, 13 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted) | 13 | 0 / 13 / 0 | 0 / 13 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, hole-function and written-let pins typed; 2 retired, 21 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed; 2 retired, 21 wait on site B's spelling pins) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 13 retired, 8 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -562,8 +562,35 @@ What each slice changes:
     - One builds a single `h` where master built two for the same `T`.
     - The others are within 8 bytes.
 
-  Site A still calls `monoBindFromAnn`, so its 4 entries stay. They wait on a typed fn-flow
-  pin (D3). The other 8 walker entries stay on spellings that come from the same text pins.
+  **Site A binds by type, and `monoBindFromAnn` is deleted.** `monoInstanceFor` binds through
+  `monoBindArenaFullTys`, and the result must satisfy `tyEq` after `substTyDeepOf`. A binding
+  that leaves a TyVar declines. The coerce callers now pass typed pins:
+  `monoSlotPinNameTys`, `monoPlacePinNameTys`, `monoCellPinNameTys`, an instance's parameter
+  types, and `monoFnTyParamTys` of the destination type. A caller that holds only a spelling
+  falls back to `nameToTy`. The probe compared site A's typed binding with `monoBindFromAnn`
+  over the reach set, counting files.
+
+  | step | files compared | agree | disagree |
+  | --- | --- | --- | --- |
+  | typed pins at the hole-function and written-let callers | 250 | 248 | 4 (6 events) |
+  | plus the `nameToTy` fallback | 330 | 326 | 4 (7 events) |
+  | typed pins at the coerce callers | 328 | 328 | 0 |
+
+  The 4 disagreeing files were run on both compilers. Each builds byte-identical to master and
+  prints its expected output. So the disagreement does not reach the output. The 4 files are
+  `closures/generic-fn-as-list-callback-result.vl`,
+  `closures/hof-written-let-in-record-field-called-with-fn.vl`,
+  `closures/hole-fn-list-to-hole-param-calling-element.vl` and
+  `generics/generic-fn-to-hole-param-instanced-at-its-calls.vl`.
+
+  **Blocked: pins with no typed producer.** About 443 events still reach site A as a spelling
+  and resolve through the `nameToTy` fallback. Site B produces 275 of them, from its
+  `tvN`/`tvV` spellings: the `monoHandWrittenLet` prefix (130 events, 4 files) and
+  `monoPinTyParamComposite` (145 events, 17 files). Choice bindings that key by a cell name
+  account for 100 events in 4 files. The other 68 are scattered across ten small paths,
+  among them `monoSlotSigName` (21 events, 14 files) and wide `monoTysFnName` pins (4 events,
+  1 file). They move when site B carries a `tvT` beside each spelling. The other 8 walker
+  entries are blocked on the same spellings. Retired at site A: 4 (`monoBindFromAnn`, C1).
   Retired: 1 (`monoArgBindSpelling`, D3).
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
