@@ -2,16 +2,17 @@
 // `checkSkipArm` in `compiler/driver.vl`).
 //
 // Each case is a three-module graph (main imports lib and mid, mid imports lib) and one edit.
-// An armed instance checks the base graph, then the edited one, serving what it can from the
-// bank; a fresh armed instance checks the edited graph with nothing banked; an unarmed one checks
-// it the default way. Graded:
-//   * SOUND: the served check's diagnostics equal the fresh check's row for row (module, span,
-//     code, data, message, order) and the unarmed check's as a set, with the same exit code; a
-//     build on the served instance afterwards is byte-identical to one on a fresh instance.
+// An armed instance, its bank emptied by `checkSkipArm(1)`, checks the base graph, then the
+// edited one, serving what it can from the bank; an unarmed instance checks the edited graph the
+// default way. One instance of each serves every case, as the LSP's does. Graded:
+//   * SOUND: the served check's diagnostics equal the unarmed check's listed by `diagOrderKey`
+//     (module, span, code, data, message), with the same exit code, and are themselves in that
+//     order, as are the armed base check's; for the `BUILT` cases a build on the served instance
+//     afterwards is byte-identical to one on a fresh instance, and differs from the base build.
 //   * CONTROLS: each case says whether the check must serve a module or must decline, and why,
 //     so a bank that never serves (sound and useless) or always serves cannot pass.
-//   * MUTATION: with inferred types dropped from the interface hash, the inferred-return edit is
-//     served and its diagnostics differ, so the suite can see an unsound skip.
+//   * MUTATION: each interface-hash ingredient dropped serves a witness unsoundly, so the suite
+//     can see an unsound skip.
 // Every case runs twice, with main clean and with main carrying its own type errors, so a
 // banked diagnostic is replayed as well as an empty bank.
 //
@@ -1035,39 +1036,52 @@ const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
 
 const same = (a: string[], b: string[]) => a.join("\n") === b.join("\n");
 
-// The served check against a fresh one and, listed by `diagOrderKey`, an unarmed one, as
-// failure lines; `reordered` when the unarmed rows were in another order before that listing.
+// An armed instance and an unarmed one; `masked` drops `drop` from both one's later hashes.
+type Pair = { warm: Exports; plain: Exports };
+const pairOf = (): Pair => ({ warm: instance(true), plain: instance(false) });
+const masked = (p: Pair, drop: number): Pair => {
+  p.warm.ifaceHashDrop(drop);
+  p.plain.ifaceHashDrop(drop);
+  return p;
+};
+
+// The served check against an unarmed one listed by `diagOrderKey`, as failure lines;
+// `reordered` when the unarmed rows were in another order before that listing.
 const grade = (
   c: Case,
   bad: boolean,
-  drop = 0,
-): { fails: string[]; got: Result; reordered: boolean; warm: Exports; after: Graph } => {
+  p: Pair,
+): { fails: string[]; got: Result; reordered: boolean; before: Graph; after: Graph } => {
   const [before, after] = graphs(c, bad);
   const tag = `${c.name}${bad ? " (main with errors)" : ""}`;
   const fails: string[] = [];
-  const warm = instance(true, drop);
-  const first = check(warm, before);
+  p.warm.checkSkipArm(1);
+  const first = check(p.warm, before);
   if (first.reason !== 1) fails.push(`${tag}: the first check found a bank`);
-  const got = check(warm, after);
-  const fresh = check(instance(true, drop), after);
-  const plain = check(instance(false, drop), after);
-  if (fresh.reason !== 1 || fresh.served !== 0) {
-    fails.push(`${tag}: a fresh instance served from a bank`);
+  if (!same(first.canon, first.diags)) {
+    fails.push(`${tag}: the armed whole check listed [${first.diags.join(" | ")}] out of order`);
   }
-  if (got.rc !== fresh.rc || !same(got.diags, fresh.diags)) {
+  const got = check(p.warm, after);
+  const plain = check(p.plain, after);
+  if (plain.rc !== got.rc || !same(plain.canon, got.diags) || !same(got.canon, got.diags)) {
     fails.push(
-      `${tag}: served rc ${got.rc} [${got.diags.join(" | ")}], whole rc ${fresh.rc} [${
-        fresh.diags.join(" | ")
+      `${tag}: served rc ${got.rc} [${got.diags.join(" | ")}], unarmed rc ${plain.rc} in order [${
+        plain.canon.join(" | ")
       }]`,
     );
   }
-  if (plain.rc !== got.rc || !same(plain.canon, got.diags) || !same(got.canon, got.diags)) {
-    fails.push(
-      `${tag}: served [${got.diags.join(" | ")}], unarmed in order [${plain.canon.join(" | ")}]`,
-    );
-  }
-  return { fails, got, reordered: !same(plain.diags, plain.canon), warm, after };
+  return { fails, got, reordered: !same(plain.diags, plain.canon), before, after };
 };
+
+// The cases whose served instance also builds: one served, one declined and rerun.
+const BUILT = new Set([
+  "body-only edit",
+  "a generic main takes as a value from a module S only imports",
+]);
+const bytesEq = (a: Uint8Array | number, b: Uint8Array | number) =>
+  typeof a === "number" || typeof b === "number"
+    ? a === b
+    : a.length === b.length && a.every((x, i) => x === b[i]);
 
 Deno.test({
   name: "a served module check gives the whole check's diagnostics and build",
@@ -1076,12 +1090,10 @@ Deno.test({
     const fails: string[] = [];
     const table: string[] = [];
     let reordered = 0;
+    const p = pairOf();
     for (const c of CASES) {
-      // The clean grade's armed instance, left holding its served check of the edited graph.
-      let served: { warm: Exports; after: Graph } | undefined;
       for (const bad of [false, true]) {
-        const { fails: f, got, reordered: r, warm, after } = grade(c, bad);
-        if (!bad) served = { warm, after };
+        const { fails: f, got, reordered: r, before, after } = grade(c, bad, p);
         fails.push(...f);
         if (r) reordered++;
         const why = REASON[got.reason] ?? `${got.reason}`;
@@ -1098,14 +1110,18 @@ Deno.test({
         if (want === "decline" && wantWhy && why !== wantWhy) {
           fails.push(`${tag}: want declined for ${wantWhy}, got ${why}`);
         }
+        if (bad || !BUILT.has(c.name)) continue;
+        // A build after the clean check is the build a fresh instance makes, and the edit
+        // reaches the bytes, so the comparison can see a build that read the bank.
+        const fresh = instance(true);
+        const b = build(fresh, after);
+        if (!bytesEq(build(p.warm, after), b)) {
+          fails.push(`${c.name}: the build after a module check differs from a fresh build`);
+        }
+        if (bytesEq(build(fresh, before), b)) {
+          fails.push(`${c.name}: want the edit to change the build, got the same bytes`);
+        }
       }
-      // A build after the served check is the build a fresh instance makes.
-      const a = build(served!.warm, served!.after);
-      const b = build(instance(true), served!.after);
-      const eq = typeof a === "number" || typeof b === "number"
-        ? a === b
-        : a.length === b.length && a.every((x, i) => x === b[i]);
-      if (!eq) fails.push(`${c.name}: the build after a served check differs from a fresh build`);
     }
     if (Deno.env.get("VL_CHECK_SKIP_TABLE")) {
       console.log(`${table.join("\n")}\n${reordered} unarmed checks listed in another order`);
@@ -1163,8 +1179,9 @@ Deno.test({
       // the reach below the origin dropped; dropping the reach alone still declines `demand`.
       ["a generic called from a module S only imports, over a moved closure", 134217728 | 8192],
     ];
+    const p = pairOf();
     for (const [name, mask] of witness) {
-      const { fails, got } = grade(CASES.find((c) => c.name === name)!, false, mask);
+      const { fails, got } = grade(CASES.find((c) => c.name === name)!, false, masked(p, mask));
       if (got.served === 0 || fails.length === 0) {
         throw new Error(
           `want mask ${mask} to serve \`${name}\` unsoundly, got ${got.served} served` +
@@ -1173,7 +1190,7 @@ Deno.test({
       }
     }
     const moved = CASES.find((c) => c.name.endsWith("over a moved closure"))!;
-    const alone = grade(moved, false, 8192).got;
+    const alone = grade(moved, false, masked(p, 8192)).got;
     if (alone.served !== 0 || REASON[alone.reason] !== "demand") {
       throw new Error(`want IH_NO_CROSS alone to decline \`demand\`, got ${REASON[alone.reason]}`);
     }
