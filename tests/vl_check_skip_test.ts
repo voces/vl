@@ -1041,7 +1041,7 @@ const grade = (
   c: Case,
   bad: boolean,
   drop = 0,
-): { fails: string[]; got: Result; reordered: boolean } => {
+): { fails: string[]; got: Result; reordered: boolean; warm: Exports; after: Graph } => {
   const [before, after] = graphs(c, bad);
   const tag = `${c.name}${bad ? " (main with errors)" : ""}`;
   const fails: string[] = [];
@@ -1066,7 +1066,7 @@ const grade = (
       `${tag}: served [${got.diags.join(" | ")}], unarmed in order [${plain.canon.join(" | ")}]`,
     );
   }
-  return { fails, got, reordered: !same(plain.diags, plain.canon) };
+  return { fails, got, reordered: !same(plain.diags, plain.canon), warm, after };
 };
 
 Deno.test({
@@ -1077,8 +1077,11 @@ Deno.test({
     const table: string[] = [];
     let reordered = 0;
     for (const c of CASES) {
+      // The clean grade's armed instance, left holding its served check of the edited graph.
+      let served: { warm: Exports; after: Graph } | undefined;
       for (const bad of [false, true]) {
-        const { fails: f, got, reordered: r } = grade(c, bad);
+        const { fails: f, got, reordered: r, warm, after } = grade(c, bad);
+        if (!bad) served = { warm, after };
         fails.push(...f);
         if (r) reordered++;
         const why = REASON[got.reason] ?? `${got.reason}`;
@@ -1097,12 +1100,8 @@ Deno.test({
         }
       }
       // A build after the served check is the build a fresh instance makes.
-      const [before, after] = graphs(c, false);
-      const warm = instance(true);
-      check(warm, before);
-      check(warm, after);
-      const a = build(warm, after);
-      const b = build(instance(true), after);
+      const a = build(served!.warm, served!.after);
+      const b = build(instance(true), served!.after);
       const eq = typeof a === "number" || typeof b === "number"
         ? a === b
         : a.length === b.length && a.every((x, i) => x === b[i]);
