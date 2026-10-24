@@ -24,6 +24,7 @@
 //
 // @test-timing native
 
+import { builtScript } from "./support/builtScript.ts";
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const SCRIPT = `${ROOT}/scripts/emitter-state-audit.vl`;
@@ -47,7 +48,7 @@ const OPEN = new Map([
 
 const audit = async (args: string[]): Promise<{ code: number; out: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: ["run", SCRIPT, "--compiler", COMPILER, "--", ...args],
+    args: ["run", await builtScript(SCRIPT, { cwd: ROOT }), "--", ...args],
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",

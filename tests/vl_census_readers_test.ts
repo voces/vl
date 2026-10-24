@@ -15,6 +15,7 @@
 //
 // @test-timing native
 
+import { builtScript } from "./support/builtScript.ts";
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -114,7 +115,9 @@ Deno.test({
         const { code, stdout } = await new Deno.Command(VL, {
           args: [
             "run",
-            `${ROOT}/scripts/silent-sweep/census/${c.tool}.vl`,
+            await builtScript(`${ROOT}/scripts/silent-sweep/census/${c.tool}.vl`, {
+              compiler: null,
+            }),
             "--",
             ...c.args,
           ],
