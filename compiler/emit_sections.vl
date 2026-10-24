@@ -4,16 +4,10 @@
 // model, per-function code emission, the opt-in name section). Sits above `wasmEmit.vl`, calling down into it for every statement/expression body.
 
 import {
-  nodeScalarBaseIs,
   nodeTyHasRepTyVar,
-  nodeTyIsArrayish,
-  nodeTyIsLitUnionAlias,
   nodeTyIsNulLitUnion,
   nodeTyIsNulString,
-  nodeTyIsNullType,
   nodeTyIsStringPrim,
-  nodeTyIsStructish,
-  nodeTyIsUnionish,
   nodeTyIxOf,
   nodeTyPrimName,
 } from "./check_node_tys"
@@ -26,13 +20,7 @@ import {
 } from "./check_getter_effects"
 import { refViewSrcTys } from "./check_ref_list_view"
 import { lbiArenaReset } from "./check_num_lit_state"
-import {
-  PrimName,
-  T,
-  TyLit,
-  tyLitMemberTexts,
-  tyPrimNameOf,
-} from "./check_types"
+import { T, TyLit, tyLitMemberTexts } from "./check_types"
 import {
   ATOMIC_SIG_CMPXCHG,
   ATOMIC_SIG_FENCE,
@@ -156,15 +144,11 @@ import {
   isRecvStageReset,
   litUtf8,
   monoIsCopyReset,
-  nulCloFlag,
   plCacheBust,
   quoteLex,
   resetParentLetCache,
-  retNulListFlag,
-  retNulStringFlag,
   sidResetParentLet,
   strToCps,
-  tyIsFuncType,
   tyIsNulBool,
   unwrapParen,
 } from "./emit_base"
@@ -786,7 +770,6 @@ import {
   fnRetNullBearing,
   fnUnionLetSinkOk,
   mapAnnShape,
-  nulScalarListKindOfNode,
   nulVariantIndexOf,
   paramStructIdxOf,
   repLadderABSweep,
@@ -794,7 +777,6 @@ import {
   retMapFlag,
   retNulMapFlag,
   retNulRefArrFlag,
-  retNulRefFlag,
   retNulVariantFlag,
   retRefArrFlag,
   retStructRowIndex,
@@ -972,7 +954,6 @@ import {
 import { strListHas } from "./listutil"
 import { strContains } from "./strutil"
 import { memoCompileReset, memoPassAdvance } from "./memo"
-import { numLitUnionHasBase } from "./tyquery"
 import { MAP_KEY_I32, MAP_KEY_I64, MAP_KEY_STR } from "./check_ty_rep"
 
 // Host opt-in for the name section (see `gEmitNames`). The driver does NOT call
@@ -1111,138 +1092,46 @@ function buildLocals(fnIx: i32) {
   emitFail("emitProgram: not a function declaration")
 }
 
-// Verify every parameter of the FuncDecl at `fnIx` is typed `i32` — the only type
-// this slice emits. Returns 0 on success or -1 (via `emitFail`) otherwise.
-function checkParams(fnIx: i32) {
+// Refuses, as an internal error, a parameter of the function at `fnIx` that has no valtype:
+// an annotation naming a type parameter no instance bound, or one with no checker type that
+// lowers to no valtype. Every parameter type the checker accepts lowers, so only a
+// monomorphizer defect reaches either (D5001). Returns 0, or -1 via `emitFail`.
+function paramValtypeFloor(fnIx: i32) {
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
-    const params = fn.fnParams
-    let pi = 0
-    while pi < params.length {
-      const p = nodeAt(params[pi])
+    for pix in fn.fnParams {
+      const p = nodeAt(pix)
       if p is Param {
-        if p.parType < 0 {
-          // An un-annotated parameter — a contextually-inferred callback literal
-          // (`xs.map(function(n) n * 2)`). The checker has already pinned its type from the receiver;
-          // this emitter's default kind for a missing annotation is i32 (`vtKindOfType(-1)` → 0), the only inferred-param receiver element kind in scope. Accepted as-is.
-          pi = pi + 1
-          continue
-        }
-        const ty = nodeAt(p.parType)
-        if ty is TypeRef {
-          // The parameter valtype ladder. `nodeTyHasRepTyVar` comes first because every rung below
-          // answers yes about a constructor over an unbound type parameter (D426); the checker's
-          // uninferable-type-parameter rule refuses every call that would leave one here.
-          if nodeTyHasRepTyVar(p.parType) {
+        if p.parType >= 0 {
+          const ty = nodeAt(p.parType)
+          if ty is TypeRef && nodeTyHasRepTyVar(p.parType) {
             return emitFail(
               "emitProgram: internal: parameter `"
                 + ty.tyName
                 + "` names a type parameter no call binds — the checker's uninferable-type-parameter rule should have refused the call",
             )
-          } else if nodeTyIsNullType(p.parType) {
-            // accepted — the `null` unit type, the `nullref` cell (`"nulnone"`, D4550)
-          } else if tyIsFuncType(p.parType) {
-            // a function-typed (closure fat-pointer) param — kind 14
-          } else if nulCloFlag(p.parType) == 1 {
-            // A nullable function-value param (`((i32) => i32) | null`, kind 19): its `=>` sits nested,
-            // so `tyIsFuncType` (top-level-arrow only) does not match it; accept it here explicitly, as `vtKindOfType` already maps it to kind 19.
-          } else if retNulRefFlag(p.parType) == 1 {
-            // accepted — a `(ref null $S)` param
-          } else if retNulListFlag(p.parType) == 1 {
-            // accepted — a `(ref null $lTypeIdx)` param (`i32[] | null`, kind 15)
-          } else if nulScalarListKindOfNode(p.parType) != null {
-            // accepted — a DISTINCT-backing nullable scalar-list param (`i64[] | null` etc.):
-            // a `(ref null $wrapper)` cell over the leaf list's own wrapper heap type
-            // (`fbValtype` nulstrlist/nulf64list/nuli64list/nulf32list arms).
-          } else if retNulRefArrFlag(p.parType) == 1 {
-            // accepted — a `(ref null $wrapper)` NULLABLE ref-array param (`<ref-array> | null`, kind 18):
-            // its `vtKindOfType` is `"nulreflist"` and `paramStructIdxOf` resolves the inner wrapper slot.
-            // (The array rung below once rejected the `| null`-suffixed NAME; it asks the type
-            // now (#1609), but this rung still claims the shape first and the note stands.)
-          } else if tyIsNulBool(p.parType) {
-            // accepted — a `boolean | null` NICHE param (the i32 sentinel 0/1/2)
-          } else if retNulStringFlag(p.parType) == 1 {
-            // accepted — a `string | null` param (`(ref null $sTypeIdx)`, kind 16)
-          } else if retMapFlag(p.parType) == 1 {
-            // Accepted — a string-keyed map param (kind 6, `(ref $mapStruct)`). The mv shape crosses the
-            // boundary (`paramStructIdxOf` → `mapAnnShape`): -1 for a mono i32/boolean map, its slot for a
-            // string-valued one. A struct/f64/i64-valued map is not yet supported — `retMapFlag` returns 0, falling through to the reject below.
-          } else if retNulMapFlag(p.parType) == 1 {
-            // accepted — a NULLABLE map param (`{[string]: V} | null`, kind `nulmap`): the
-            // same shape over a `(ref null $mapStruct)` cell. The `!= null` narrow
-            // (`ref.is_null`) and the narrowed ops (`t["k"]` / `t["k"] ?? d`) recover the
-            // non-null ref at the receiver — the checker proved every such read guarded.
-          } else if nodeTyIsLitUnionAlias(p.parType) {
-            // accepted — a literal-union param is an i32-backed interned atom (kind 0).
-          } else if nodeTyIsNulLitUnion(p.parType) {
-            // Accepted — a `K | null` niche param is the i32 atom with the spare `-1` = null (kind 0).
-            // The five scalar rungs below stay on the name (a deliberate decline, B102): a numeric
-            // literal-union param renders as `f64` after canon softening, so the spelling accepts it here
-            // while the arena sees a `TyUnion` of `TyLit`s and rejects — the softened name is the right answer, since a numeric litunion param is lowered as its base scalar.
-          } else if numLitUnionHasBase(nodeTyIxOf(p.parType)) {
-            // Accepted — a numeric literal-union param (`1 | 2`, `type Z = 1 | 2`) is lowered as its base
-            // scalar, matching what canon's softened spelling reported to the scalar rungs below. Stated
-            // from the arena here (`numLitUnionBaseName` reads the `TyUnion` of `TyLit`s structurally, not
-            // a rendering), which lets those rungs stop reading `ty.tyName` — without it, a numeric litunion param falls through to the reject once the spelling stops answering for it (B102).
-          } else if paramScalarIs(p.parType, ty.tyName, "v128") {
-            // accepted — a SIMD vector param (a `new v128` brand such as `F32x4`), the 0x7b valtype
-          } else if !paramScalarIs(p.parType, ty.tyName, "i32") {
-            if !paramScalarIs(p.parType, ty.tyName, "i64") {
-              // i64 rides the 0x7e valtype (Slice 1)
-              if !paramScalarIs(p.parType, ty.tyName, "f64") {
-                // f64 rides the 0x7c valtype (Slice 3)
-                if !paramScalarIs(p.parType, ty.tyName, "f32") {
-                  // f32 rides the 0x7d valtype (Slice 5)
-                  if !paramScalarIs(p.parType, ty.tyName, "boolean") {
-                    // The arena, not the registry. `isSName` tested a name-keyed struct registry with known
-                    // gaps — generic instances (`Box<i32>`) and `#anon0` inline shapes resolving to an empty `{}`.
-                    // The question here is "does this param take a struct ref", which needs shape, not identity;
-                    // removing `isSName` outright breaks no corpus file.
-                    if !nodeTyIsStructish(p.parType) {
-                      // The arena, and nothing else. `isUName` tested a registry keyed by the union's spelling;
-                      // replaced by `nodeTyIsUnionish` plus a spelling-tree read for a small remainder, which
-                      // is gone too: the struct rung above moved onto the arena, and a same-shape union
-                      // collapses to a `TyObj`, so the struct rung claims both files before this one is reached.
-                      if !nodeTyIsUnionish(p.parType) {
-                        // The variant rung is gone. It asked `variantIndexOf(ty.tyName)` — the last rendered-name
-                        // lookup in the emitter — and had resisted two prior conversion attempts as unconvertible.
-                        // It needed no converting: a variant's recorded type is a `TyObj`, so the struct rung above
-                        // now claims every variant param before this point is reached; neutralising it breaks zero corpus files.
-                        if true {
-                          // The arena, not the trailing `]`. `nameIsArray` tested the rendering's last character,
-                          // which also matched a union whose last arm is an array. The union rung above now claims
-                          // those boxes from the type, so this can be the strict `TyArray` question it always meant;
-                          // removing `nameIsArray` breaks none of the corpus files that reach this rung.
-                          if !nodeTyIsArrayish(p.parType) {
-                            // The arena, not the spelling. `nameIsString` read canon's softened rendering, which reports
-                            // `string` for three different arena shapes: a `TyPrim`, a single-member `TyLit` (which reps
-                            // as its base), and an inline string-literal union (the alias form is claimed earlier by
-                            // `nodeTyIsLitUnionAlias`). `nodeScalarBaseIs` states that collapse from the type instead.
-                            if !nodeScalarBaseIs(p.parType, "string") {
-                              return emitFail(
-                                "emitProgram: internal: a parameter type the valtype ladder has no rung for — every parameter type the checker accepts has one above",
-                              )
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
           }
-        } else {
-          return emitFail("emitProgram: parameter type is not a type name")
+          if paramTyUnlowered(pix, p.parType) {
+            return emitFail(
+              "emitProgram: internal: a parameter type the valtype ladder has no rung for — every parameter type the checker accepts has one",
+            )
+          }
         }
-      } else {
-        return emitFail("emitProgram: malformed parameter")
       }
-      pi = pi + 1
     }
-    return 0
   }
-  emitFail("emitProgram: not a function declaration")
+  0
+}
+
+// Whether the annotation `tyIx` of parameter `pix` carries no checker type and falls to
+// `vtKindOfType`'s `i32` default without spelling an `i32`-backed type.
+function paramTyUnlowered(pix: i32, tyIx: i32): boolean {
+  if nodeTyIxOf(tyIx) >= 0 { return false }
+  if vtKindOfParam(pix) != "i32" { return false }
+  if tyIsNulBool(tyIx) || nodeTyIsNulLitUnion(tyIx) { return false }
+  const t = nodeAt(tyIx)
+  if t is TypeRef { return t.tyName != "i32" && t.tyName != "boolean" }
+  true
 }
 
 // ── locals-vector emission (derived, never separately counted) ──
@@ -1435,6 +1324,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     const savedCapNarrow = capNarrowSeed(fnPos)
     // Collect + validate declared locals BEFORE lowering, so identifier resolution
     // and the locals vector both see the full per-function set.
+    if paramValtypeFloor(fnIx) < 0 { return -1 }
     if buildLocals(fnIx) < 0 { return -1 }
     // Re-banks the declaration-site narrowing of the frames declared inside this body, now that
     // this frame's local table exists — the only point at which a guard over a function-scope
@@ -7701,16 +7591,6 @@ function scanPrintCallIntrinsic(pscan: i32, name: string, nArgs: i32) {
   saw
 }
 
-// Every function's parameters must be i32 or the struct type before we commit.
-function checkFnParams() {
-  let i = 0
-  while i < fnStmts.length {
-    if checkParams(fnStmts[i]) < 0 { return -1 }
-    i = i + 1
-  }
-  0
-}
-
 // The passes that may memoise `captureNamesOf`'s walk (D2017): each either leaves the arena and
 // the tables `capScan` reads alone, or reports every edit that mints no node through
 // `capMemoNoteEdit`. A pass joins only once that is true of everything it calls.
@@ -7779,7 +7659,6 @@ function runEmitPass(name: string, stmts: i32[], rootIx: i32) {
   if name == "collectCloSigs" { return collectCloSigs() }
   if name == "scanPrintUse" { return scanPrintUse() }
   if name == "initGuardScan" { return initGuardScan() }
-  if name == "checkFnParams" { return checkFnParams() }
   if name == "capCacheBuild" { return capCacheBuild() }
   if name == "auditRecordJoinLeaves" { return auditRecordJoinLeaves() }
   if name == "capNarrowBuild" { return capNarrowBuild() }
@@ -8010,7 +7889,6 @@ function emitPassTable(): string[] {
     "collectCloSigs > collectMapFilterUse collectFnValUse",
     "initGuardScan > monomorphize synthParamAnnots synthVoidTwins synthExternValues synthRecEqCores",
     "scanPrintUse > monomorphize synthParamAnnots initGuardScan",
-    "checkFnParams > monomorphize synthParamAnnots",
     "capCacheBuild > monomorphize synthParamAnnots",
     "synthCaptureEmptyListAnns > collectA#2 capCacheBuild",
     "auditRecordJoinLeaves > collectA#2 buildFnMap#2 capCacheBuild",
@@ -10608,21 +10486,4 @@ function writeCodeSection(codePayload: ByteRope) {
     sp = sp + 1
   }
   0
-}
-
-// The scalar name of the param annotation at `tyNodeIx`, from the arena where the checker
-// recorded a `TyPrim` and from the spelling only where it did not. The arena is primary, the
-// spelling the documented remainder: `nodeTyPrimName` answers "" both for "not a prim" and
-// "no recorded type" (real here — a generic original's param has no recorded arena type). The decision form of `paramScalarName` compares prim-name atoms rather than the widened name text.
-function paramScalarIs(
-  tyNodeIx: i32,
-  spelled: string,
-  want: PrimName,
-): boolean {
-  const pn = tyPrimNameOf(nodeTyIxOf(tyNodeIx))
-  if pn != null { return pn == want }
-  // The arena HAS a type and it is not a `TyPrim` — an ANSWER, not a gap, so every scalar
-  // rung must miss (the `paramScalarName` header's own rule, preserved).
-  if nodeTyIxOf(tyNodeIx) >= 0 { return false }
-  spelled == want
 }
