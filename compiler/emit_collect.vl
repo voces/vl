@@ -7517,6 +7517,21 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
   // floor refuses a rep it can name (D1725). Monotone, so a redundant reservation is inert.
   forceScalarListRep(nodeTyArrayElemPinRepName(i))
 }
+// The inner type of annotation `annIx`'s nullable list element (`(boolean | null)[]`), or -1.
+// A union or record inner is not a niche: it boxes, or rides the record's own row.
+function annNicheNulElemInner(annIx: i32): i32 {
+  const et = annRefArrElemRow(annIx)
+  if et < 0 { return -1 }
+  const t = tyAt(et)
+  if t is TyNullable {
+    if t.nInner < 0 { return -1 }
+    const it = tyAt(t.nInner)
+    if it is TyUnion || it is TyObj { return -1 }
+    return t.nInner
+  }
+  -1
+}
+
 // `collectATypeRef`'s ref-list arm: a `S[]`/`N[]` annotation, or its nullable `S[] | null`,
 // forces the wrapper and backing of the non-null ref-array name and banks the interned row on
 // node `i`. Returns 0, or -1 once a niche-nullable element with no list rep has failed loudly.
@@ -7541,11 +7556,11 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
   // has no list rep: the box lowering would emit the element's raw value. Reject cleanly.
   // A value-union element and a struct or heterogeneous element box as usual.
   if raKind == RLK_UNION {
-    const renNul = nullablePartOf(ren)
-    if !isValueUnionName(ren) && renNul != "" {
+    const nicheTy = annNicheNulElemInner(i)
+    if nicheTy >= 0 && !isValueUnionName(ren) {
       return emitFail(
         "emitProgram: a nullable-"
-          + renNul
+          + tyToStr(nicheTy)
           + " list element has no rep; use a non-null element type",
       )
     }
@@ -8117,7 +8132,7 @@ export function collectAnnShapes() {
       }
       // Ahead of the intern, which codes each field: an arm-typed field needs the arm's own
       // row to exist before `armFieldStructRow` is asked for it (D1672).
-      internArmFieldShape(tn.tyName)
+      internArmFieldShapeTy(root, 0)
       internShapeDeepTy(tn.tyName, root)
     }
     ti = ti + 1
@@ -12384,48 +12399,27 @@ export function collectGenAliasShapes() {
   0
 }
 
-// Interns the own canonical render of the union arm a field type names (`g: Circle`,
-// `g: Circle | null`), so `armFieldStructRow` has a row to answer with. A no-op for every
-// other spelling; see the call site for why it is demand-driven and costs no heap type.
-function internArmFieldShape(fdNm: string) { internArmShapeAt(fdNm, 0) }
-
-// The composition peel, mirroring `internShapeDeepTy`'s: grouping parens, a trailing `| null`,
-// trailing `[]` runs, and a map value, to any depth. An arm reached through a container needs
-// its row for the same reason a bare one does — `{[string]: Circle[]}` is the map-and-list
-// dual of `g: Circle`. Depth-bounded: a bug in one of the cuts must not recurse forever.
-function internArmShapeAt(nm: string, depth: i32) {
-  if depth > 8 { return 0 }
-  if nm == "" { return 0 }
-  const base = nonNulBaseOf(nm)
-  if base != nm { return internArmShapeAt(base, depth + 1) }
-  if nameIsArray(nm) { return internArmShapeAt(arrElemNameRaw(nm), depth + 1) }
-  const mv = mapValNameOf(nm)
-  if mv != "" { return internArmShapeAt(mv, depth + 1) }
-  // An INLINE shape names its fields' arms exactly as a `TypeDecl` does, so it earns the
-  // same descent: without it `const w: {f: P} = …` codes the field 15 over a row nothing
-  // mints (D1672).
-  if nameIsShapeSpanEnds(nm) { return internArmShapeFieldsAt(nm, depth) }
-  internArmShapeOf(nm)
-}
-
-// The inline-shape descent of the peel above, split out so the field arrays are local to it.
-function internArmShapeFieldsAt(nm: string, depth: i32) {
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  let fi = 0
-  while fi < ftexts.length {
-    internArmShapeAt(ftexts[fi], depth + 1)
-    fi = fi + 1
+// Interns the row of the union arm a field or annotation type names (`g: Circle`,
+// `g: Circle | null`), through a nullable's inner type, a list's element, a map's value and an
+// inline record's fields (D1672), so `armFieldStructRow` has a row to answer with. A declared
+// record is a leaf, as its name is. A no-op for a type with no arm, and costs no heap type.
+function internArmFieldShapeTy(ty: i32, depth: i32) {
+  if depth > 8 || ty < 0 || ty >= T.tys.length { return 0 }
+  const t = tyAt(ty)
+  if t is TyNullable { return internArmFieldShapeTy(t.nInner, depth + 1) }
+  if t is TyArray { return internArmFieldShapeTy(t.aElem, depth + 1) }
+  if t is TyMap { return internArmFieldShapeTy(t.mVal, depth + 1) }
+  if t is TyObj {
+    if structNameOfTy(ty) == "" {
+      for f in t.objFieldTypes { internArmFieldShapeTy(f, depth + 1) }
+      return 0
+    }
   }
-  0
+  internArmShapeRow(variantRowOfTy(ty))
 }
 
-function internArmShapeOf(nm: string) { internArmShapeRow(variantIndexOf(nm)) }
-
-// `internArmShapeAt` over the type `ty` rather than its render: a nullable's inner type, a
-// list's element, a map's value and a record's field types are descended, as the render spells
-// a record by its shape; any other type mints the arm row that carries it.
+// `internArmFieldShapeTy` with a declared record's fields descended too, for a join whose
+// record is spelled by its shape; any other type mints the arm row that carries it.
 function internArmShapeOfTy(ty: i32, depth: i32) {
   if depth > 8 || ty < 0 || ty >= T.tys.length { return 0 }
   const t = tyAt(ty)
@@ -12507,21 +12501,21 @@ function collectNestedFieldShapes(stmts: i32[]) {
           // (`armFieldStructRow`); interning the arm's own render mints it at no extra heap
           // type. First, because the nested-shape intern below asks `armFieldStructRow` about
           // its OWN fields' arms and the struct table is otherwise still empty (D1707).
-          internArmFieldShape(tyNameOf(fnode.fdType))
-          if ownsRow {
-            // `internShapeDeepTy` peels composition wrappers and descends a map field's value, so a
-            // declared nullable-map field's value struct interns before `collectS` codes the field.
-            let fdRoot = -1
-            const fdNm = tyNameOf(fnode.fdType)
-            if !nameMentionsGenAliasParam(fdNm) {
-              if canonRewroteNode(fnode.fdType) {
-                fdRoot = canonTyIxOf(fnode.fdType)
-              } else {
-                fdRoot = nodeTyIxOf(fnode.fdType)
-              }
+          const fdNm = tyNameOf(fnode.fdType)
+          let fdRoot = -1
+          if !nameMentionsGenAliasParam(fdNm) {
+            if canonRewroteNode(fnode.fdType) {
+              fdRoot = canonTyIxOf(fnode.fdType)
+            } else {
+              fdRoot = nodeTyIxOf(fnode.fdType)
             }
-            internShapeDeepTy(tyNameOf(fnode.fdType), fdRoot)
+            internArmFieldShapeTy(fdRoot, 0)
+          } else {
+            internArmFieldShapeTy(declAnnTyOf(fnode.fdType), 0)
           }
+          // `internShapeDeepTy` peels composition wrappers and descends a map field's value, so a
+          // declared nullable-map field's value struct interns before `collectS` codes the field.
+          if ownsRow { internShapeDeepTy(fdNm, fdRoot) }
         }
         fi = fi + 1
       }
