@@ -18,6 +18,7 @@
 // A node written over several LINES spans them: `endLine` rides the report beside `endCol`,
 // which counts from it. `endLine` is emitted only where it differs from `line`, so a row
 // that declares none is also asserting the field is absent.
+import { checkBatch } from "./support/checkBatch.ts";
 import { filePath } from "./support/filePath.ts";
 const ROOT = filePath(new URL("..", import.meta.url)).replace(/[\\/]$/, "");
 const VL = `${ROOT}/scripts/vl-host/target/release/vl${
@@ -465,26 +466,10 @@ const GRID: Row[] = [
   },
 ];
 
-const jsonDiags = async (file: string): Promise<Diag[]> => {
-  const { stdout, stderr } = await new Deno.Command(VL, {
-    args: ["check", file, "--json", "--compiler", COMPILER],
-    stdout: "piped",
-    stderr: "piped",
-    // The host resolves `std:` from the BINARY's checkout, and a worktree's
-    // binary is a symlink into the main repo — pin std to THIS tree.
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` },
-  }).output();
-  const out = new TextDecoder().decode(stdout).trim();
-  try {
-    return JSON.parse(out) as Diag[];
-  } catch {
-    throw new Error(
-      `${file}: --json stdout is not JSON: ${out}\n${
-        new TextDecoder().decode(stderr)
-      }`,
-    );
-  }
-};
+// Every file's `vl check --json` diagnostics, in the order given, from ONE process: each
+// case is its own file, graded exactly as a lone check would grade it.
+const jsonDiags = async (files: string[]): Promise<Diag[][]> =>
+  (await checkBatch(files)).map((r) => r.diagnostics);
 
 // A MERGED PROGRAM'S ANCHOR IS RESOLVED INSIDE ITS OWN MODULE, and no single two-module
 // program can prove it. `tokIndexAt` binary-searches `P.toks` for a byte offset, a merge
@@ -504,14 +489,20 @@ Deno.test({
       const bad: string[] = [];
       // `for i in 0 to -1 {` — `to` is the 12th column, and the line is the 3rd.
       const entry = 'import { d0 } from "./dep"\n\nfor i in 0 to -1 {\n  print(d0(i))\n}\n';
+      const entries: string[] = [];
       for (let n = 1; n <= TO_ANCHOR_DEPS; n++) {
         let dep = "";
         for (let i = 0; i < n; i++) {
           dep += `export function d${i}(a: i32): i32 { a + ${i + 1} }\n`;
         }
-        await Deno.writeTextFile(`${dir}/dep.vl`, dep);
-        await Deno.writeTextFile(`${dir}/entry.vl`, entry);
-        const diags = await jsonDiags(`${dir}/entry.vl`);
+        await Deno.mkdir(`${dir}/${n}`);
+        await Deno.writeTextFile(`${dir}/${n}/dep.vl`, dep);
+        await Deno.writeTextFile(`${dir}/${n}/entry.vl`, entry);
+        entries.push(`${dir}/${n}/entry.vl`);
+      }
+      const all = await jsonDiags(entries);
+      for (let n = 1; n <= TO_ANCHOR_DEPS; n++) {
+        const diags = all[n - 1];
         const d = diags.find((x) => x.message.includes("this range never runs"));
         if (!d) {
           bad.push(`dep=${n}: no range diagnostic — got ${diags.length}`);
@@ -543,10 +534,16 @@ Deno.test({
     const dir = await Deno.makeTempDir({ prefix: "vl_diag_span_" });
     try {
       const bad: string[] = [];
-      for (const row of GRID) {
-        const file = `${dir}/span.vl`;
-        await Deno.writeTextFile(file, row.src);
-        const diags = await jsonDiags(file);
+      const files: string[] = [];
+      for (let i = 0; i < GRID.length; i++) {
+        await Deno.mkdir(`${dir}/${i}`);
+        await Deno.writeTextFile(`${dir}/${i}/span.vl`, GRID[i].src);
+        files.push(`${dir}/${i}/span.vl`);
+      }
+      const all = await jsonDiags(files);
+      for (let i = 0; i < GRID.length; i++) {
+        const row = GRID[i];
+        const diags = all[i];
         const want = row.sev ?? "error";
         const d = diags.find((x) =>
           x.severity === want && x.message.includes(row.frag)
