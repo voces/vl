@@ -18,6 +18,9 @@ import {
   LetDecl,
   P,
   Param,
+  arenaEditBumpCount,
+  arenaEditCount,
+  arenaEditSlotAt,
   arenaNoteRefWrite,
   nodeAt,
 } from "./ast"
@@ -62,6 +65,9 @@ export function sidText(id: i32) {
 // node field, because the arena index is what every pass already threads.
 const SID_UNFILLED = -2
 let sidNode: i32[] = []
+// How far `sidNode` has consumed the arena's edit log: a slot replaced since is refilled.
+let sidLogPos = 0
+let sidLogBumps = 0
 
 // R4 — `sidNode[ix]` must equal `sidOf` of the node's name now, or an identifier resolves to
 // the wrong symbol silently. A lazy slot holds until a name is rewritten in place; every such
@@ -202,6 +208,7 @@ export function identFromDecl(newIx: i32, declIx: i32) {
 export function sidOfNode(ix: i32) {
   if ix < 0 { return -1 }
   if ix >= P.nodes.length { return -1 }
+  if arenaEditBumpCount() != sidLogBumps { sidSyncEdits() }
   while sidNode.length <= ix { sidNode.push(SID_UNFILLED) }
   const cur = sidNode[ix]
   if cur != SID_UNFILLED { return cur }
@@ -217,6 +224,33 @@ export function sidOfNode(ix: i32) {
   s
 }
 
+// Retire the slots `arenaSetNode` / `arenaReplaceNode` rewrote since the last read; when a
+// log reset falls in between, the logged positions miss some bumps, so drop every slot.
+function sidSyncEdits() {
+  const n = arenaEditCount()
+  const bumps = arenaEditBumpCount()
+  if n >= sidLogPos && n - sidLogPos == bumps - sidLogBumps {
+    let i = sidLogPos
+    while i < n {
+      const s = arenaEditSlotAt(i)
+      if s >= 0 && s < sidNode.length { sidNode[s] = SID_UNFILLED }
+      i = i + 1
+    }
+  } else {
+    sidNode = []
+  }
+  sidLogPos = n
+  sidLogBumps = bumps
+  0
+}
+
+// Drop the carrier's rows from arena index `n` on: the arena popped them and may reuse the
+// indices for different nodes.
+export function sidNodeTruncate(n: i32) {
+  while sidNode.length > n { sidNode.pop() }
+  0
+}
+
 // Per-compile reset (R2), called wherever `P.nodes = []` is: the carrier is keyed by
 // arena index, so a reset arena reusing an index reads the previous program's answer.
 // Every sid-keyed table must be dropped with it — the driver pairs each `sidReset()`
@@ -225,8 +259,15 @@ export function sidReset() {
   sidMap = Map()
   sidTexts = []
   sidNode = []
+  sidLogPos = arenaEditCount()
+  sidLogBumps = arenaEditBumpCount()
+  sidEpoch = sidEpoch + 1
   0
 }
+
+// Advances at every `sidReset`, so a sid-indexed cache outside the driver's reset pairing can
+// stamp its rows and drop them once the ids are re-minted. Advance, never reset.
+export let sidEpoch = 0
 
 // R6 — a name→index map becomes a sid-indexed dense array (a bounds check and a load,
 // against a hash and a probe) over an id space dense from 0. Sized at its map's build
