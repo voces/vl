@@ -51,7 +51,6 @@ import { nodeRepTyIxOf } from "./check_core_state"
 import { covarValueWriteState } from "./check_covar_write"
 import { nodeTyIsNulBoolList, nodeTyIxOf } from "./check_node_tys"
 import { numLitUnionArrayBaseName, numUnionMembersOf } from "./check_num_lits"
-import { tyIsI32SentinelNullable } from "./check_ty_rep"
 import {
   PrimName,
   T,
@@ -72,9 +71,6 @@ import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
 import { objLitNameCands, sScanLim, structIndexOfTy } from "./emit_atom_kinds"
 import {
   nameIsF32Array,
-  nameIsNulBoolList,
-  nameIsNulLitUnionList,
-  nameIsStringArray,
   nameIsU8Array,
   parentLetOf,
   parentLetOwnerOf,
@@ -162,6 +158,11 @@ import {
 import { memoGenNew } from "./memo"
 import { sidArrGet, sidArrPut, sidOf, sidOfNode, sidText } from "./symbols"
 import { nonNullTy, tyIsU8ArrayTy } from "./tyquery"
+export {
+  tyPrimLeafListKind,
+  tyScalarBackedListKind,
+  tyScalarListKind,
+} from "./emit_struct_order"
 
 // The `__array_new__(n, fill)` element kind read off the DESTINATION — the checker's recorded
 // type for the call, the same source `arrNewDefaultKind` reads below. `"none"` where that type
@@ -224,24 +225,13 @@ export function tyAnnRefListKind(tyIx: i32) {
     if annIsNulLitUnionArray(tyIx) { return LBK_NUL_LIT_UNION_LIST }
     const lt = nodeAt(tyIx)
     if lt is TypeRef {
-      // Stays on the name — a decline with evidence (B79): `nodeTyArrayElemRepName(tyIx) ==
-      // "string"` looks like a swap-in but is silent on a `TyParam` element
-      // (`generics/type-param-shadows-alias-funcdecl.vl`), and dual-run confirms the arena
-      // never answers `string` where the name declines, so the disjunct would move nothing.
-      if nameIsStringArray(lt.tyName) { return LBK_STR_LIST }
+      // A `string[]` or `(string | null)[]` annotation: the string list (kind 3).
+      if tyScalarListKind(nodeTyIxOf(tyIx)) == "strlist" { return LBK_STR_LIST }
       // A `(boolean | null)[]` annotation (kind 8): an i32-backed list with the boolean
       // sentinel niche (`null → 2`), so an all-`null` `[null]` builds the i32 wrapper.
-      // Checked before the scalar-array arms. The arena (`nodeTyIsNulBoolList`) and name
-      // (`nameIsNulBoolList`) legs agree everywhere dual-run; the name stays for uncovered nodes.
+      // A `(K | null)[]` spelling, flattened or not, has already returned above, and an
+      // annotation without a recorded type is never one of these niche lists.
       if nodeTyIsNulBoolList(tyIx) { return LBK_NUL_BOOL_LIST }
-      if nodeTyIxOf(tyIx) < 0 && nameIsNulBoolList(lt.tyName) {
-        return LBK_NUL_BOOL_LIST
-      }
-      // A `(K | null)[]` annotation (kind 9): an i32-backed atom list with the litunion
-      // sentinel niche (`null → -1`). Do not delete on a zero-row sabotage (B75): the
-      // similar-looking `annIsNulLitUnionArray` only recognizes the `TyNullable`-element
-      // spelling, not the checker's flattened `"a" | "b" | null` union form; this catches both.
-      if nameIsNulLitUnionList(lt.tyName) { return LBK_NUL_LIT_UNION_LIST }
       // An `f64[]` annotation: an empty `[]` builds the f64-list wrapper (kind 4).
       if tyIsF64Array(nodeTyIxOf(tyIx)) { return LBK_F64_LIST }
       // An `i64[]` annotation: an empty `[]` builds the i64-list wrapper (kind 6).
@@ -281,41 +271,6 @@ export function emptyArrHoleKind(exprIx: i32): VKind | null {
   const ax = emptyArrLitIxOf(exprIx)
   if ax < 0 { return null }
   tyListRepKind(nodeTyIxOf(ax), emptyArrHoleElemSlot(exprIx))
-}
-
-// The list `VKind` an ARRAY type over a bare `TyPrim` LEAF reps as — `i32`/`boolean` share
-// the one i32-list backing, every other leaf has its own — or `null` for any other element
-// (or any non-array). The ARENA twin of the `nameIs*Array` ladder, written once for the
-// positions that hold a TYPE and no annotation node to run the name ladder over.
-export function tyPrimLeafListKind(ty: i32): VKind | null {
-  const n = tyPrimLeafElemName(ty)
-  // Exhaustive over `PrimName | null` and `_`-less (D1898 made the nullable litunion
-  // matchable): `null` is "no list backing", a real answer, for the three prims the list
-  // layer has no backing for and for the `null` a non-array or non-prim element yields.
-  match n {
-    "i32" | "boolean" => {
-      return "list"
-    }
-    "string" => {
-      return "strlist"
-    }
-    "f64" => {
-      return "f64list"
-    }
-    "i64" => {
-      return "i64list"
-    }
-    "f32" => {
-      return "f32list"
-    }
-    "u8" => {
-      return "u8list"
-    }
-    "void" | "null" | "never" | "v128" | null => {
-      // No list backing for these element types, nor for a non-array/non-prim element.
-    }
-  }
-  null
 }
 
 // True if `ty` is an array over a bare `TyPrim` element — the guard that keeps a leaf
@@ -1624,30 +1579,6 @@ export function letAnnVariantIdx(letIx: i32) {
 
 // Parallel to the i32/string-array families: decide whether an expression / param / local
 // produces an `f64[]` list. Drives the index-read dispatch and the f64-list cell kind (`12`).
-
-// The scalar-list wrapper kind of an array type whose element rides a scalar list's backing
-// without being a `TyPrim` — `"list"` for a literal-union `K[]` and its nullable niches (the
-// i32 list), `"strlist"` for the `(string | null)[]` ref niche — else `null`. The arena fold
-// of the same identity the name-side ladders have long used: all these wrappers are one heap type.
-export function tyScalarBackedListKind(tyIx: i32): VKind | null {
-  if tyIx < 0 { return null }
-  const t = tyAt(tyIx)
-  if t is TyArray {
-    if t.aElem < 0 { return null }
-    if tyIsLitUnion(t.aElem) { return "list" }
-    // The two i32-sentinel niches, through the shared predicate `==`/`+` also read — the
-    // answer set is unchanged, only the three homes deciding "one i32 cell" collapse to one. D101.
-    if tyIsI32SentinelNullable(t.aElem) { return "list" }
-    const el = tyAt(t.aElem)
-    if el is TyNullable && el.nInner >= 0 {
-      const inner = tyAt(el.nInner)
-      if inner is TyPrim {
-        if inner.primName == "string" { return "strlist" }
-      }
-    }
-  }
-  null
-}
 
 // How a `%` node votes on the `__f64_rem__` reservation, in the vocabulary `scanPrintUse`
 // needs: 1 = float (the helper must exist), 0 = definitely integer, -1 = the checker recorded
