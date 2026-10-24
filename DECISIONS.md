@@ -6295,6 +6295,61 @@ rounds), so #4563's environment setting adds nothing on top of it. A cold cell c
 box loses wall, because four workers each compiling serially leave cores idle that the global pool
 used to fill. In the gate, rows compete for CPU, so the gate does not see that wall loss.
 
+## The seed's identity is memoised by its stat (2026-10-23)
+
+Every `vl` process names the seed's `.cwasm` sidecar by the seed's content key
+(`<seed>.<key>.<engine tag>.cwasm`). Until this change it got that key by reading the whole
+5.7 MB seed and hashing it, on every start, before deserializing a sidecar that does not need
+the bytes at all. On a tiny `vl check`, that read and hash was about 4.8 of 19 ms of CPU
+(`VL_PROFILE`-style CPU marks, 30 runs, load about 21). The read alone was 3.5 ms in `strace`,
+copying the file into a fresh anonymous mapping.
+
+`seed_identity` (`scripts/vl-host/src/main.rs`) now reads `<seed>.key` first. It is one line:
+the seed's device, inode, size, mtime and ctime (with nanoseconds), then the content key and
+the seed's SHA-256. When every stat field matches the file as it is now, the process takes the
+key and the SHA-256 from the memo and never opens the seed. The SHA-256 is `compiler_hash`'s
+answer, so the compile cache keys off the same identity the sidecar was chosen by. Any
+mismatch, a missing or malformed memo, or a non-Unix host takes the old read-and-hash path,
+which then rewrites the memo.
+
+**Why stat, and why ctime.** A write to the file moves its ctime, and no user call can set
+ctime back, so restoring the mtime (`touch -d`) does not hide an edit. A rename-over or a copy
+gives a new inode. A memo copied along with its seed (`cp -p`) records the old inode. So a memo
+can go stale only by no longer matching. The one gap is a write landing in the same timestamp
+tick as the stat that made the memo, the problem git calls "racy clean". It is closed the way
+git closes it: a memo is written only when the read began at least two seconds after the
+seed's last ctime, and the stat after the read equals the one before it. A seed that was just
+rebuilt therefore pays the read for two seconds, then stops paying it.
+
+**Why the bytes are still checked when they are read.** The memo is believed when the stat
+matches. If the sidecar is then missing or will not deserialize, the host reads the seed to
+compile it, and checks that the bytes' key is the one the memo named. If it is not, the file
+changed between the stat and the read, and `compiler_hash` may already have answered for the
+old bytes. So the run stops loudly ("changed while this run was loading it") and deletes the
+memo, and the next run recovers. Without the check, a forged or torn memo would compile the
+new bytes into a sidecar named for other bytes.
+
+**Why not drop the content key for a stat key.** The sidecars stay content-keyed, so a
+byte-identical seed copied between worktrees or restored by CI still hits its sidecars (see
+the sidecar comment in `load_compiler_module`). The memo only skips the hashing; it does not
+change what the cache is keyed by.
+
+**What it bought.** Interleaved, against the same tree's host built with the same profile,
+task-clock:
+
+| workload | before | after |
+| --- | --- | --- |
+| tiny `vl check`, 200 runs per arm in 10 rounds, load 8–16 | 16.12 ms | 11.83 ms |
+| tiny `vl run`, the same | 15.77 ms | 12.70 ms |
+| `filed witnesses` row, `WITNESS_CACHE=0`, 1,012 `vl` processes, 3 pairs, load 4–14 | 91.0 CPU-s (median) | 84.9 |
+| `ci-native` row, 4,021 `vl` processes, 5 pairs, load 8–28 | 745.9 CPU-s (median) | 729.7 |
+
+On both rows the gain is about the process count times the 3–4 ms saved per process, and on
+ci-native it is within the row's run-to-run spread. Per-process fixed cost is a small share of
+these rows: 4,021 × about 16 ms is under a tenth of ci-native's CPU. What is left of a tiny
+process is mostly wasmtime deserializing the sidecar (about 8.7 ms, most of it hashing the
+module's types into the engine's type registry), which the host does not control.
+
 ## std ships inside the binary; a pin is one file; development overrides are explicit and announced (owner question 2026-09-03) — D1573/D1574, BUILT
 
 The owner asked whether `vl` should distribute with std baked in. It should, and the reason is
