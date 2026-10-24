@@ -92,8 +92,8 @@ no new concatenation point):
    import specifier" diagnostic.
 2. **Order + validate** (at compile, once the host closed the graph): DFS from
    entry over resolved imports with a loading-set ⇒ dependency-first order +
-   `Import cycle detected through "spec" (module \`key\`)`; missing-marked keys
-   ⇒ `Cannot resolve import "spec" (no module \`key\`)`; imported name not in
+   `Import cycle detected through "spec" (module "key")`; missing-marked keys
+   ⇒ `Cannot resolve import "spec" (no module "key")`; imported name not in
    the dep's export set ⇒ `"name" is not exported by "spec"` (message texts
    match `modules.ts` — the corpus `@error`s substring them).
 3. **Parse** each module in dependency-first order into the SHARED arena

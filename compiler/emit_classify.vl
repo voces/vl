@@ -19916,88 +19916,171 @@ function letMapDestShape(letIx: i32, fnIx: i32): i32 {
     }
     if !bare { return -1 }
     const nm = d.letName
+    if lmdIndexReady() {
+      for i in lmdCands[nm] ?? [] {
+        const r = letMapDestAt(i, nm, fnIx)
+        if r >= 0 { return r }
+      }
+      return -1
+    }
     let i = 0
     while i < P.nodes.length {
-      const nd = nodeAt(i)
-      // (a) `dst[k] = nm`
-      match nd {
-        BinExpr => {
-          if nd.binOp == "=" {
-            const rhs = nodeAt(unwrapParen(nd.binRight))
-            if rhs is Ident {
-              if rhs.identName == nm {
-                const lhs = nodeAt(unwrapParen(nd.binLeft))
-                if lhs is Index {
-                  const os = mapShapeOfExpr(lhs.idxArr, fnIx)
-                  if os >= 0 {
-                    if mvValIsMap(os) {
-                      const inner = rlElemMapValMvSlot(mvRlSlot[os])
-                      if inner >= 0 { return inner }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-        // (b) `const c: {[string]: V}[] = [nm]`  ·  (c) `const c: W = { f: nm }`
-        LetDecl => {
-          if nd.letType >= 0 && nd.letInit >= 0 {
-            const dini = nodeAt(unwrapParen(nd.letInit))
-            match dini {
-              ArrayLit => {
-                let ei = 0
-                while ei < dini.arrElems.length {
-                  const el = nodeAt(unwrapParen(dini.arrElems[ei]))
-                  if el is Ident {
-                    if el.identName == nm {
-                      const rs = letAnnRefListSlot(i)
-                      if rs >= 0 && rs < rlElemKindTbl.length {
-                        if rlElemKindTbl[rs] == RLK_MAP {
-                          const iv = rlElemMapValMvSlot(rs)
-                          if iv >= 0 { return iv }
-                        }
-                      }
-                    }
-                  }
-                  ei = ei + 1
-                }
-              }
-              ObjLit => {
-                const dsi = letAnnStructIdx(i)
-                if dsi >= 0 {
-                  let fj = 0
-                  while fj < dini.objFields.length {
-                    const ff = nodeAt(dini.objFields[fj])
-                    if ff is FieldInit {
-                      const fv = nodeAt(unwrapParen(ff.fiValue))
-                      if fv is Ident {
-                        if fv.identName == nm {
-                          const fi2 = sFieldIndex(dsi, ff.fiName)
-                          if fi2 >= 0 {
-                            const fc = sFieldTypeAt(dsi, fi2)
-                            if fc == FC_MAP || fc == FC_NUL_MAP {
-                              const fs = sFieldMapShape(dsi, fi2)
-                              if fs >= 0 { return fs }
-                            }
-                          }
-                        }
-                      }
-                    }
-                    fj = fj + 1
-                  }
-                }
-              }
-              // No other initializer names a map destination shape.
-              NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
-            }
-          }
-        }
-        // No other initializer names a map destination shape.
-        NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
-      }
+      const r = letMapDestAt(i, nm, fnIx)
+      if r >= 0 { return r }
       i = i + 1
     }
+  }
+  -1
+}
+
+// Per name, in arena order, the nodes `letMapDestAt` can answer for a binding of that name:
+// an assignment whose value is the name, or an annotated `let` whose list or record literal
+// holds it. Built once the arena is final and extended over appended nodes; an in-place edit
+// or a rename rebuilds it.
+let lmdCands: {[string]: i32[]} = Map()
+let lmdLen = 0
+const lmdGenKey = memoKeyNew(3)
+
+// Whether `lmdCands` covers the arena; false before the arena is final.
+function lmdIndexReady(): boolean {
+  if !emitPhaseReached("arenaFinal") { return false }
+  let moved = memoMoved(lmdGenKey, 0, emitRootIx)
+  moved = memoMoved(lmdGenKey, 1, arenaEpochNow()) || moved
+  moved = memoMoved(lmdGenKey, 2, arenaRefWritesNow()) || moved
+  if moved || lmdLen > P.nodes.length {
+    lmdCands = Map()
+    lmdLen = 0
+  }
+  while lmdLen < P.nodes.length {
+    lmdNoteNode(lmdLen)
+    lmdLen = lmdLen + 1
+  }
+  true
+}
+
+// Lists node `i` under every name `letMapDestAt` could match it for.
+function lmdNoteNode(i: i32) {
+  const nd = nodeAt(i)
+  match nd {
+    BinExpr => {
+      if nd.binOp == "=" { lmdNoteName(i, nd.binRight) }
+    }
+    LetDecl => {
+      if nd.letType >= 0 && nd.letInit >= 0 {
+        const dini = nodeAt(unwrapParen(nd.letInit))
+        match dini {
+          ArrayLit => {
+            for e in dini.arrElems { lmdNoteName(i, e) }
+          }
+          ObjLit => {
+            for f in dini.objFields {
+              const ff = nodeAt(f)
+              if ff is FieldInit { lmdNoteName(i, ff.fiValue) }
+            }
+          }
+          // No other initializer names a map destination shape.
+          NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+        }
+      }
+    }
+    // No other node names a map destination shape.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
+  0
+}
+
+// Lists node `i` under the name the value at `vIx` reads, once, when it is an identifier.
+function lmdNoteName(i: i32, vIx: i32) {
+  const v = nodeAt(unwrapParen(vIx))
+  if v is Ident {
+    const xs = lmdCands[v.identName] ?? []
+    if xs.length == 0 || xs[xs.length - 1] != i {
+      xs.push(i)
+      lmdCands[v.identName] = xs
+    }
+  }
+  0
+}
+
+// The map shape node `i` gives a binding named `nm` as its destination, or -1.
+function letMapDestAt(i: i32, nm: string, fnIx: i32): i32 {
+  const nd = nodeAt(i)
+  // (a) `dst[k] = nm`
+  match nd {
+    BinExpr => {
+      if nd.binOp == "=" {
+        const rhs = nodeAt(unwrapParen(nd.binRight))
+        if rhs is Ident {
+          if rhs.identName == nm {
+            const lhs = nodeAt(unwrapParen(nd.binLeft))
+            if lhs is Index {
+              const os = mapShapeOfExpr(lhs.idxArr, fnIx)
+              if os >= 0 {
+                if mvValIsMap(os) {
+                  const inner = rlElemMapValMvSlot(mvRlSlot[os])
+                  if inner >= 0 { return inner }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    // (b) `const c: {[string]: V}[] = [nm]`  ·  (c) `const c: W = { f: nm }`
+    LetDecl => {
+      if nd.letType >= 0 && nd.letInit >= 0 {
+        const dini = nodeAt(unwrapParen(nd.letInit))
+        match dini {
+          ArrayLit => {
+            let ei = 0
+            while ei < dini.arrElems.length {
+              const el = nodeAt(unwrapParen(dini.arrElems[ei]))
+              if el is Ident {
+                if el.identName == nm {
+                  const rs = letAnnRefListSlot(i)
+                  if rs >= 0 && rs < rlElemKindTbl.length {
+                    if rlElemKindTbl[rs] == RLK_MAP {
+                      const iv = rlElemMapValMvSlot(rs)
+                      if iv >= 0 { return iv }
+                    }
+                  }
+                }
+              }
+              ei = ei + 1
+            }
+          }
+          ObjLit => {
+            const dsi = letAnnStructIdx(i)
+            if dsi >= 0 {
+              let fj = 0
+              while fj < dini.objFields.length {
+                const ff = nodeAt(dini.objFields[fj])
+                if ff is FieldInit {
+                  const fv = nodeAt(unwrapParen(ff.fiValue))
+                  if fv is Ident {
+                    if fv.identName == nm {
+                      const fi2 = sFieldIndex(dsi, ff.fiName)
+                      if fi2 >= 0 {
+                        const fc = sFieldTypeAt(dsi, fi2)
+                        if fc == FC_MAP || fc == FC_NUL_MAP {
+                          const fs = sFieldMapShape(dsi, fi2)
+                          if fs >= 0 { return fs }
+                        }
+                      }
+                    }
+                  }
+                }
+                fj = fj + 1
+              }
+            }
+          }
+          // No other initializer names a map destination shape.
+          NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+        }
+      }
+    }
+    // No other initializer names a map destination shape.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
