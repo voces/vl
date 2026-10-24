@@ -129,7 +129,7 @@ the slice retires.
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
-| D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
+| D1 | ref-list slot keyed by type (landed: 12 retired, 18 left; the `rlMapElemValSlot` fall-through waits on D8) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; 5 retired, 18 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
@@ -980,10 +980,14 @@ What each slice changes:
   - Left in `emit_classify`: the arms where the typed lookup misses or names another row.
     - Some rows do not exist yet, because the caller interns them under the name: `fill` and
       the `.map` result (`mfListResultElemName`).
-    - The struct-list mv arm finds the same slot under a structural name in 24 of 206 files, and
-      callers intern under that name.
     - Taken whole, `refListSlotOfExpr`'s answer differs from the typed slot in 1,475 of the
       4,319 files that reach it. The spelling does not stand for one type-keyed row.
+  - Done, 0 differing modules: 1 parse. The struct-list mv arm of `refListElemNameOfExpr`
+    returns the stored name of the row `mvValInnerRlSlotAt` keys by the value's element type.
+    206 of 16,639 files reach it. The slot agrees in 205, and in 24 the name is the row's own
+    (`Circle`, `#anon0`) where the spelling was structural. The caller's by-name lookup lands on
+    the same slot. In `b020615` the spelling found no row and the type finds one. The identity
+    diff over 16,529 files finds no differing module.
   - Done, 0 differing files: 1 parse. The nullable ref-array parameter arm's gate in
     `refListElemNameOfIdent` asks `annNulRefArrSlot` of the annotation node, so a mono
     instance's grouped `(i32[][]|null)` needs no peel. 21 files reach it, the spelling's gate
@@ -1003,7 +1007,10 @@ What each slice changes:
     name has no recorded member set. `refArrElemNameIf`'s D2 entry goes with this caller.
   - Left elsewhere:
     - `synthEmptyListAnn`'s `string|null` element has no ref-list row (3 of 4 files).
-    - `rlMapElemValSlot`'s fall-through is live in 115 files.
+    - `rlMapElemValSlot`'s fall-through is live in 115 files. Its typed twin,
+      `rlElemMapValMvSlotAt`, agrees in 114 and misses in `a000044`, a map of `{r: N}` with
+      `N = 1 | 2`. That mv slot was minted from the rendered `{r:i32}`, so it does not record the
+      held value type, and the swap turns the cell into an invalid module. It waits on D8.
     - The producers (`collectARefArrayAnn`, `ensureRefElemTy`, `forceCloListTypeOf`) mint the
       rows the typed lookup reads.
     - The nine `emit_base` grammar predicates go when their name-only callers in D2 and C5 take
