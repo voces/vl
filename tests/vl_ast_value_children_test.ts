@@ -81,10 +81,10 @@ const nodeKinds = (src: string): string[] => {
     .split("|").map((s) => s.trim()).filter((s) => s.length > 0);
 };
 
-// One function's body, by brace matching from its declaration line.
+// One function's body, exported or not, by brace matching from its declaration line.
 const bodyOf = (src: string, name: string): string => {
-  const at = src.indexOf(`export function ${name}(`);
-  assert(at >= 0, `compiler/ast.vl: no \`export function ${name}(\``);
+  const at = src.indexOf(`function ${name}(`);
+  assert(at >= 0, `compiler/ast.vl: no \`function ${name}(\``);
   const open = src.indexOf("{", at);
   let depth = 0;
   for (let i = open; i < src.length; i++) {
@@ -166,15 +166,16 @@ const ladder = (body: string): { arms: Map<string, string[]>; tail: string } => 
 
 const AST = read("compiler/ast.vl");
 const KINDS = nodeKinds(AST);
-const CHILDREN = ladder(bodyOf(AST, "nodeChildren"));
+// `nodeChildren` reads the node and hands it to `nodeKidsOf`, which holds the arm table.
+const CHILDREN = ladder(bodyOf(AST, "nodeKidsOf"));
 const VALUES = ladder(bodyOf(AST, "nodeValueChildren"));
 
 const show = (xs: string[]): string => `[${xs.join(", ")}]`;
 
 Deno.test("ast: `nodeValueChildren` delegates its default to `nodeChildren`", () => {
   assert(
-    VALUES.tail === "nodeChildren(ix)",
-    `nodeValueChildren's default must be \`nodeChildren(ix)\` — the delegation is what ` +
+    VALUES.tail === "nodeKidsOf(n)",
+    `nodeValueChildren's default must be \`nodeKidsOf(n)\`, nodeChildren's arm table — the delegation is what ` +
       `makes 32 kinds inherit one arm table; got \`${VALUES.tail}\``,
   );
   assert(
