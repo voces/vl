@@ -96,7 +96,12 @@ import { recFnDeclByName } from "./check_scopes"
 import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
 import { inferRetFnKey } from "./check_side_rows"
 import { recordClonedCallRetire } from "./check_asg_rows"
-import { isVarTyIxOf, recordClonedIsVarTyIx } from "./check_list_union"
+import {
+  isVarTyIxOf,
+  luIsTyOf,
+  luIsTyPut,
+  recordClonedIsVarTyIx,
+} from "./check_list_union"
 import { blockLastStmt } from "./check_if_value"
 import { HD_COAL, hdKindIs } from "./check_hole_pins"
 import { joinArmIsLit } from "./check_nj_join"
@@ -301,6 +306,7 @@ import {
   monoAnnHasTyParam,
   monoBindOf,
   monoDeclAnnName,
+  monoIsCopyNote,
   monoIsGenericDecl,
   monoSubstAnn,
   monoTyParamOf,
@@ -2331,7 +2337,10 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
               tyNameOf(acfn.fnRet),
               acfn.fnTyParams,
             )
-            if arn != "" && !monoAnnHasTyParam(arn, acfn.fnTyParams) {
+            if (
+              arn != ""
+              && !monoAnnHasTyParam(acfn.fnRet, -1, acfn.fnTyParams)
+            ) {
               return arn
             }
           } else {
@@ -2927,7 +2936,7 @@ function monoSubstLetType(
   if letType < 0 { return letType }
   const tn = nodeAt(letType)
   if tn is TypeRef {
-    if monoAnnMentionsTyParam(letType, tn.tyName, typarams) {
+    if monoAnnMentionsTyParam(letType, typarams) {
       monoNicheNulListCheck(letType, typarams, tvN, tvV, bN, bT, -1)
       const sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
       if sub != "" && sub != tn.tyName {
@@ -4318,7 +4327,7 @@ function monoCollCtorAnn(
         name = monoTyArgCallRetName(f.identName, tas)
       }
       if name == "" { return -1 }
-      if !monoAnnHasTyParam(name, typarams) { return -1 }
+      if !monoAnnHasTyParam(-1, nodeTyIxOf(ix), typarams) { return -1 }
       const sub = monoSubstAnn(name, typarams, tvN, tvV)
       if sub == "" { return -1 }
       return synthTypeRefTy(sub, c.pos, -1)
@@ -4826,7 +4835,7 @@ function monoSubstAnnNode(
     // The RAW spelling where a type parameter is shadowed by a declared alias — the same
     // read every other substitution site in this file takes, for `monoDeclAnnName`'s reason.
     const ann = monoDeclAnnName(pty, tn.tyName, typarams)
-    if monoAnnHasTyParam(ann, typarams) {
+    if monoAnnHasTyParam(pty, -1, typarams) {
       const sub = monoSubstAnn(ann, typarams, tvN, tvV)
       // -2, not -1: the annotation does name a type parameter and the substitution
       // produced no new spelling for it, which the caller must tell apart from an
@@ -6458,7 +6467,7 @@ function monoNodeNamesTyParam(ix: i32, typarams: string[]) {
   if typarams.length == 0 { return false }
   const n = nodeAt(ix)
   if n is IsExpr {
-    if monoAnnHasTyParam(n.isVariant, typarams) { return true }
+    if monoAnnHasTyParam(ix, isVarTyIxOf(ix), typarams) { return true }
   }
   if n is Member {
     const mo = nodeAt(n.memObj)
@@ -6503,15 +6512,13 @@ function monoLamNodeIsTemplateCore(fnIx: i32, typarams: string[]) {
       const p = nodeAt(ps[i])
       if p is Param {
         if p.parType >= 0 {
-          const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
-          if monoAnnHasTyParam(ann, typarams) { return true }
+          if monoAnnHasTyParam(p.parType, -1, typarams) { return true }
         }
       }
       i = i + 1
     }
     if fn.fnRet >= 0 {
-      const rann = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), typarams)
-      if monoAnnHasTyParam(rann, typarams) { return true }
+      if monoAnnHasTyParam(fn.fnRet, -1, typarams) { return true }
     }
     // D943 — a capture is part of a lambda's effective signature, and the two checks above
     // read only the written one: `show: () => string` inside `mk<T>` takes no parameter and
@@ -7066,6 +7073,9 @@ function monoReIsExpr(ix: i32, io: i32) {
   if n is IsExpr {
     const nx = monoMkIsExprLike(ix, io, n.isVariant)
     recordClonedIsVarTyIx(nx, isVarTyIxOf(ix))
+    const lu = luIsTyOf(ix)
+    if lu >= 0 { luIsTyPut(nx, lu) }
+    monoIsCopyNote(nx, ix)
     return nx
   }
   ix
@@ -7993,7 +8003,7 @@ function monoListIsUnhandable(ix: i32, names: string[], body: i32): boolean {
       && tyAt(kTy) is TyArray
       && rTy >= 0
       && rTy < T.tys.length
-      && monoAnnHasTyParam(tyToStr(rTy), names)
+      && monoAnnHasTyParam(-1, rTy, names)
     ) {
       const r = nodeAt(unwrapParen(n.isObj))
       if r is Member && narrowRegionReads(body, ix, r.memProp, true) == 2 {
@@ -8160,7 +8170,7 @@ function monoTyParamCallReaches(
 // argument naming one, or an argument whose type is unknown or has a type variable.
 function monoCallMayBind(callIx: i32, args: i32[], names: string[]): boolean {
   for ta in callTyArgsOf(callIx) {
-    if monoAnnHasTyParam(tyNameOf(ta), names) { return true }
+    if monoAnnHasTyParam(ta, -1, names) { return true }
   }
   for a in args {
     const at = nodeTyIxOf(a)
@@ -8169,12 +8179,11 @@ function monoCallMayBind(callIx: i32, args: i32[], names: string[]): boolean {
   false
 }
 
-// Binds each of `typarams` that `ann`, the annotation of `params[at]`, names and the argument
+// Binds each of `typarams` that the annotation of `params[at]` names and the argument
 // left unbound: to the checker's binding at `callIx` (`{ v: 1.5 }` for `CN<T> | null`), else to
 // the default (`V[] | string` called with a string, D4913). One another parameter names, or that
 // reaches a spelling the default would answer, stays unbound.
 function monoDefaultAnnTyParams(
-  ann: string,
   typarams: string[],
   tvN: string[],
   tvV: string[],
@@ -8190,12 +8199,17 @@ function monoDefaultAnnTyParams(
     if k != at { others.push(params[k]) }
     k = k + 1
   }
+  let atAnn = -1
+  if params[at] >= 0 {
+    const pa = nodeAt(params[at])
+    if pa is Param { atAnn = pa.parType }
+  }
   for tp in typarams {
     const one: string[] = [tp]
     const seen: i32[] = []
     if (
       monoBindOf(tvN, tvV, tp) == ""
-      && monoAnnHasTyParam(ann, one)
+      && monoAnnHasTyParam(atAnn, -1, one)
       && !monoParamsMention(others, one)
       && !monoTyParamReachesSpelling(body, one, seen)
     ) {
@@ -8250,7 +8264,7 @@ function monoParamsMention(params: i32[], typarams: string[]): boolean {
     const p = nodeAt(params[i])
     if p is Param {
       if p.parType >= 0 {
-        if monoAnnHasTyParam(tyNameOf(p.parType), typarams) { return true }
+        if monoAnnHasTyParam(p.parType, -1, typarams) { return true }
       }
     }
     i = i + 1
@@ -9357,7 +9371,7 @@ function monoFoldTyParamLayout(
       // `monoAnnHasTyParam`-then-`monoSubstAnn` contract every other substitution site keeps.
       // A concrete `is {v: i32}` must return verbatim: `monoSubstAnn`'s object arm rebuilds a
       // shape spelling from its parts, and a rebuilt spelling is a second intern key.
-      if monoAnnHasTyParam(n.isVariant, typarams) {
+      if monoAnnHasTyParam(ix, isVarTyIxOf(ix), typarams) {
         const sub = monoSubstAnn(n.isVariant, typarams, tvN, tvV)
         if sub != "" && sub != n.isVariant {
           return monoSubstIsExpr(ix, io, sub)
@@ -10657,7 +10671,7 @@ function monoMakeInstanceRetAnn(
     // The parameter pin's rule, applied to the RETURN for the same reason: a shadowed
     // return annotation is canon'd out of the arena before this read.
     const rn = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), tps)
-    if monoAnnHasTyParam(rn, tps) {
+    if monoAnnHasTyParam(fn.fnRet, -1, tps) {
       const rs = monoSubstAnn(rn, tps, tvN, tvV)
       if rs == "" {
         emitFail(
@@ -12450,7 +12464,7 @@ function monoInstanceSubstRet(
   tvV: string[],
 ): string {
   const rs = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), fn.fnTyParams)
-  if monoAnnHasTyParam(rs, fn.fnTyParams) {
+  if monoAnnHasTyParam(fn.fnRet, -1, fn.fnTyParams) {
     return monoSubstAnn(rs, fn.fnTyParams, tvN, tvV)
   }
   rs
@@ -12551,7 +12565,7 @@ function monoInstanceFor(
             tyNameOf(p.parType),
             fn.fnTyParams,
           )
-          if monoAnnHasTyParam(ann, fn.fnTyParams) {
+          if monoAnnHasTyParam(p.parType, -1, fn.fnTyParams) {
             if pinTys[i] < 0 { return 0 }
             monoBindArenaFullTys(
               monoParamPatTy(params, i, declTys),
@@ -12581,12 +12595,7 @@ function monoInstanceFor(
       const pv = nodeAt(params[v])
       if pv is Param {
         if pv.parType >= 0 {
-          const annV = monoDeclAnnName(
-            pv.parType,
-            tyNameOf(pv.parType),
-            fn.fnTyParams,
-          )
-          if monoAnnHasTyParam(annV, fn.fnTyParams) {
+          if monoAnnHasTyParam(pv.parType, -1, fn.fnTyParams) {
             const pat = monoParamPatTy(params, v, declTys)
             const sub = substTyDeepOf(pat, tvN, tvT, own)
             if sub < 0 || tyHasTyVar(sub) || !tyEq(sub, pinTys[v]) { return 0 }
@@ -20045,8 +20054,7 @@ function monoFnParamAnnRidesTyParam(fe: i32, i: i32) {
   const fn = nodeAt(declIx)
   if fn is FuncDecl {
     if fn.fnTyParams.length == 0 { return false }
-    const ann = monoDeclAnnName(pty, tyNameOf(pty), fn.fnTyParams)
-    return monoAnnHasTyParam(ann, fn.fnTyParams)
+    return monoAnnHasTyParam(pty, -1, fn.fnTyParams)
   }
   false
 }
@@ -20888,7 +20896,10 @@ function monoCallGenFnToTyParamArrow(
     if p is Param {
       if p.parType >= 0 {
         const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
-        if monoAnnIsFnSlot(p.parType) && monoAnnHasTyParam(ann, typarams) {
+        if (
+          monoAnnIsFnSlot(p.parType)
+          && monoAnnHasTyParam(p.parType, -1, typarams)
+        ) {
           const ax = unwrapParen(args[i])
           if ax >= 0 {
             const av = nodeAt(ax)
@@ -20905,7 +20916,10 @@ function monoCallGenFnToTyParamArrow(
           }
         }
         // A list of functions riding the type parameters, handed a literal of generics (D3913).
-        if nameIsClosureArray(ann) && monoAnnHasTyParam(ann, typarams) {
+        if (
+          nameIsClosureArray(ann)
+          && monoAnnHasTyParam(p.parType, -1, typarams)
+        ) {
           if monoLitHoldsGenericFn(args[i], 0) { return true }
         }
       }
@@ -21293,7 +21307,10 @@ function monoPreBindPastUnionRest(
     if p is Param {
       if p.parType >= 0 {
         ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
-        if nodeTyIsFunc(p.parType) || !monoAnnHasTyParam(ann, typarams) {
+        if (
+          nodeTyIsFunc(p.parType)
+          || !monoAnnHasTyParam(p.parType, -1, typarams)
+        ) {
           ann = ""
         }
         const pt = nodeTyIxOf(p.parType)
@@ -21461,12 +21478,10 @@ function monoCalleeHasTyParamArrow(origFe: i32): boolean {
       const p = nodeAt(fn.fnParams[i])
       if p is Param {
         if p.parType >= 0 {
-          const ann = monoDeclAnnName(
-            p.parType,
-            tyNameOf(p.parType),
-            fn.fnTyParams,
-          )
-          if nodeTyIsFunc(p.parType) && monoAnnHasTyParam(ann, fn.fnTyParams) {
+          if (
+            nodeTyIsFunc(p.parType)
+            && monoAnnHasTyParam(p.parType, -1, fn.fnTyParams)
+          ) {
             return true
           }
         }
@@ -21482,9 +21497,8 @@ function monoParamIsTyParamList(pIx: i32, typarams: string[]): boolean {
   const p = nodeAt(pIx)
   if p is Param {
     if p.parType < 0 { return false }
-    const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
     return monoTyIsList(nodeTyIxOf(p.parType))
-      && monoAnnHasTyParam(ann, typarams)
+      && monoAnnHasTyParam(p.parType, -1, typarams)
   }
   false
 }
@@ -23260,11 +23274,6 @@ function monoPreBindNonArrowArgs(
     const pbp = nodeAt(params[pb])
     if pbp is Param {
       if pbp.parType >= 0 {
-        const pbAnn = monoDeclAnnName(
-          pbp.parType,
-          tyNameOf(pbp.parType),
-          fn.fnTyParams,
-        )
         // The ARROW parameters are the ones whose binding is in question; every other
         // annotation reads its type off the argument the call actually passes, except a literal
         // of generics, which takes the type the others bind (D10250).
@@ -23272,7 +23281,7 @@ function monoPreBindNonArrowArgs(
           !monoAnnIsFnSlot(pbp.parType)
           && !monoLitHoldsGenericFn(args[pb], 0)
         ) {
-          if monoAnnHasTyParam(pbAnn, fn.fnTyParams) {
+          if monoAnnHasTyParam(pbp.parType, -1, fn.fnTyParams) {
             monoBindArenaFullTys(
               monoParamPatTy(params, pb, declTys),
               monoExactPinTyOf(monoArgPinTyIx(args[pb], ctx), ctx),
@@ -23311,12 +23320,7 @@ function monoDefaultTyParamsOnlyGenFns(
         const p = nodeAt(params[i])
         if p is Param {
           if p.parType >= 0 {
-            const ann = monoDeclAnnName(
-              p.parType,
-              tyNameOf(p.parType),
-              fn.fnTyParams,
-            )
-            if monoAnnHasTyParam(ann, one) {
+            if monoAnnHasTyParam(p.parType, -1, one) {
               named = named + 1
               if !monoAnnIsFnSlot(p.parType) || !monoArgIsGenFn(args[i], ctx) {
                 open = false
@@ -23358,10 +23362,7 @@ function monoRetMentions(fn: FuncDecl, typarams: string[]): boolean {
     const rt = inferRetTyIxOf(fn.fnName)
     return rt < 0 || tyHasTyVar(rt)
   }
-  monoAnnHasTyParam(
-    monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), fn.fnTyParams),
-    typarams,
-  )
+  monoAnnHasTyParam(fn.fnRet, -1, typarams)
 }
 
 // Refuses an argument of two list types at a type-parameter list parameter of `fn`: -1, else 0.
@@ -23572,7 +23573,7 @@ function monoPinAnnotatedParam(
     // A composite annotation riding type params (`Box<T>`): bind them by
     // matching the pattern against the argument's concrete type name, then
     // pin the substituted annotation. A concrete annotation pins unchanged.
-    if monoAnnHasTyParam(ann, fn.fnTyParams) {
+    if monoAnnHasTyParam(p.parType, -1, fn.fnTyParams) {
       const cr = monoPinTyParamComposite(
         p,
         fn,
@@ -24208,7 +24209,6 @@ function monoPinTyParamComposite(
   }
   if monoAnnIsUnion(p.parType) {
     monoDefaultAnnTyParams(
-      ann,
       fn.fnTyParams,
       tvN,
       tvV,
@@ -29265,18 +29265,13 @@ function monoIdentNameOf(ix: i32): string {
   ""
 }
 
-// Does the annotation node `ix` mention any of `typarams`? The parser's spelling tree
-// answers where it survives, and the string form where it does not. `tsMentionsAnyName`
-// visits every kid of every node, so it cannot have a missing arm; `monoAnnHasTyParam`
-// re-parses the render and needs one arm per shape, a missing one being silent.
-
-// The name form stays for nodes with no tree: `annTsOf` answers -1 once
-// `canonEmitTypeNames` rewrites a name in place, and answering false there would skip the
-// substitution and let the type parameter survive into the instance.
-function monoAnnMentionsTyParam(ix: i32, ann: string, typarams: string[]) {
+// Does the annotation node `ix` mention any of `typarams`? The parser's spelling tree answers
+// where it survives; where canon rewrote the name in place, `monoAnnHasTyParam` asks the node's
+// type, since answering false there would let the type parameter survive into the instance.
+function monoAnnMentionsTyParam(ix: i32, typarams: string[]) {
   const root = annTsOf(ix)
   if root >= 0 { return tsMentionsAnyName(root, typarams) }
-  monoAnnHasTyParam(ann, typarams)
+  monoAnnHasTyParam(ix, -1, typarams)
 }
 
 // The spelling of a list type whose innermost element is a record, by that record's row name

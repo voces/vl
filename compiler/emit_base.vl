@@ -16,7 +16,7 @@ import {
   nodeTyPrimName,
   nodeTyWidenedRepName,
 } from "./check_node_tys"
-import { declAnnRawTyName } from "./check_gen_alias_anns"
+import { declAnnRawTsOf, declAnnRawTyName } from "./check_gen_alias_anns"
 import { litUnionPreserve, partIsStrLitSet } from "./check_lit_union_spell"
 import { inferRetTyIxOf } from "./check_infer_ret"
 import {
@@ -32,9 +32,11 @@ import {
   tyAt,
   tyIsLitUnion,
   tyIsNulStringRep,
+  tyMentionsTyVarNamed,
   tyNulInnerIsPrim,
 } from "./check_types"
 import { sidArrGet, sidArrPut, sidLookup, sidOf, sidOfNode } from "./symbols"
+import { luIsTyOf } from "./check_list_union"
 // ── the type-name grammars this file calls, homed in `tyname.vl` ──
 // A leaf with zero imports; this file binds them for its own calls and republishes
 // none — every emitter module asks the home directly. The layering is one-directional:
@@ -108,14 +110,19 @@ import {
   RetStmt,
   Spread,
   StrLit,
+  TS_ARR,
   TypeDecl,
   TypeRef,
   Unary,
   UnionDecl,
   WhileStmt,
+  annTsOf,
   nodeAt,
   nodeChildren,
   nodeValueChildren,
+  tsKind,
+  tsMentionsAnyName,
+  tsText,
 } from "./ast"
 import { hexVal } from "./strutil"
 import {
@@ -3115,26 +3122,21 @@ function gaeLiveParams(
   }
   0
 }
-// Would the substitution below change this field's type name — does the annotation reach a
-// live type parameter anywhere in its structure? Published so the one other caller
-// (`emit_collect.gaeDeclFieldTyName`) asks this instead of re-deriving it: two copies of this
-// question would be two answers. It replaces a gate that read only the array grammar, so a parameter behind any other constructor (`Id | null`, `{a: Id}`) would otherwise report no substitution and intern the alias's body type instead of the bound argument.
-export function gaeAnnHasParam(tn: string, pnames: string[]) {
-  const lp: string[] = []
-  const la: string[] = []
-  gaeLiveParams(pnames, pnames, lp, la)
-  monoAnnHasTyParam(arrLeafNameOf(tn), lp)
-}
-// Substitutes a declared type-parameter name in a field's type name with the application's
-// argument name, through the type's structure (`T` → `i32`, `{a: T}` → `{a: i32}`) — via the
-// shared `monoSubstAnn` walk, not a hand-rolled ladder (a missed rung interns the alias's body
-// type instead of the argument). Not an optimisation: an annotation reaching no live parameter must return verbatim, or a one-character spelling drift becomes a second intern key for one type.
-export function gaeApplyFieldTy(tn: string, pnames: string[], args: string[]) {
+// Substitutes a declared type-parameter name in field annotation `node`'s type name `tn` with
+// the application's argument name, through the type's structure (`T` → `i32`, `{a: T}` →
+// `{a: i32}`) via the shared `monoSubstAnn` walk. An annotation naming no live parameter
+// returns `tn` verbatim, so one type never gains a second intern key from a spelling drift.
+export function gaeApplyFieldTy(
+  tn: string,
+  pnames: string[],
+  args: string[],
+  node: i32,
+) {
+  if !monoAnnHasTyParam(node, -1, pnames) { return tn }
   const lp: string[] = []
   const la: string[] = []
   gaeLiveParams(pnames, args, lp, la)
   const leaf = arrLeafNameOf(tn)
-  if !monoAnnHasTyParam(leaf, lp) { return tn }
   const s = monoSubstAnn(leaf, lp, lp, la)
   // "" is `monoSubstAnn`'s UNBOUND answer, which cannot arise here — every name in `lp`
   // is bound by construction — so this and the unchanged-leaf test are the
@@ -3575,90 +3577,88 @@ export function monoBindOf(tvN: string[], tvV: string[], tp: string) {
   }
   ""
 }
-// Does the annotation name reach a declared type param — bare (`T`), array-of at any
-// dimension, a union member, a generic-alias application argument, an object shape's field
-// type, a function's parameter or result, or any of those under a paren or `[]` run? The arm
-// list is `monoSubstAnn`'s, in the same order, by contract: an arm here that substitution lacks reports a parameter it then fails to replace, and the reverse leaves substitution unreached.
-export function monoAnnHasTyParam(ann: string, typarams: string[]) {
-  if monoTyParamOf(ann, typarams) != "" { return true }
-  // A top-level UNION (`T | null`, `T | i32`). `splitUnionAtoms` is depth- and
-  // quote-aware and stops at a top-level `=>`, so a function type whose RESULT is a
-  // union stays one atom and falls through to the function arm below.
-  if unionMemberCount(ann) > 1 {
-    // Counts before cutting (B278): the split otherwise runs unconditionally though its result is
-    // needed only for a 2+-member union. `unionMemberCount` equals the split's length at every one
-    // of these sites, so counting first is the same answer for strictly less work on the common single-member case.
-    const uatoms: string[] = []
-    splitUnionAtoms(ann, uatoms)
-    let u = 0
-    while u < uatoms.length {
-      if monoAnnHasTyParam(uatoms[u], typarams) { return true }
-      u = u + 1
-    }
-    return false
+// The parser's spelling tree for the check type of each `IsExpr` monomorphization re-minted,
+// keyed by the copy: a copy keeps its source's spelling but has no tree of its own.
+let monoIsCopyTs: {[i32]: i32} = Map()
+
+// The type with type variables each emitter-minted `TypeRef` spells, keyed by the node, where
+// the node itself records no type so that each instance resolves the spelling afresh.
+let monoAnnOpenTy: {[i32]: i32} = Map()
+
+// Empties the copy-tree and open-type columns for a new program.
+export function monoIsCopyReset() {
+  monoIsCopyTs = Map()
+  monoAnnOpenTy = Map()
+  0
+}
+
+// Records that minted `TypeRef` `tr` spells `ty`, a type naming type variables.
+export function monoAnnOpenTyNote(tr: i32, ty: i32) {
+  monoAnnOpenTy.set(tr, ty)
+  0
+}
+
+// The type-variable-bearing type minted `TypeRef` `ix` spells, or -1.
+export function monoAnnOpenTyOf(ix: i32): i32 { monoAnnOpenTy[ix] ?? -1 }
+
+// Records that `IsExpr` `copy` re-mints `src` with the same check-type spelling.
+export function monoIsCopyNote(copy: i32, src: i32) {
+  const t = monoIsTsOf(src)
+  if t >= 0 { monoIsCopyTs.set(copy, t) }
+  0
+}
+
+// The spelling tree of `IsExpr` `ix`'s check type: its own, else its source's when it is a
+// re-minted copy; -1 when neither exists.
+export function monoIsTsOf(ix: i32): i32 {
+  const t = annTsOf(ix)
+  if t >= 0 { return t }
+  monoIsCopyTs[ix] ?? -1
+}
+
+// Does type `ty` name one of `typarams` anywhere in its structure? A primitive-spelled
+// parameter (`gaeParamShadowed`) binds nothing and never counts; false for a hole.
+export function monoTyMentionsTyParam(ty: i32, typarams: string[]): boolean {
+  if ty < 0 { return false }
+  for tp in typarams {
+    if !gaeParamShadowed(tp) && tyMentionsTyVarNamed(ty, tp, 64) { return true }
   }
-  // A map annotation (`{[string]: T}`). This predicate and `monoSubstAnn` need the same arm as
-  // one pair: with no arm here the substitution is never attempted, so a generic returning a
-  // map keeps the original annotation and the parameter survives into the instance as a
-  // nominal name — check-clean, then a runtime type mismatch. The value only: a map key is `string`/`i32` by construction, so a parameter cannot reach that position.
-  if nameIsMap(ann) {
-    const mval = mapValNameOf(ann)
-    if mval != "" {
-      if monoAnnHasTyParam(mval, typarams) { return true }
-    }
-  }
-  const parts: string[] = []
-  if annGenAppDecompose(ann, parts) != "" {
-    let i = 0
-    while i < parts.length {
-      if monoAnnHasTyParam(parts[i], typarams) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  const onames: string[] = []
-  const otexts: string[] = []
-  const okind = annObjFieldSplit(ann, onames, otexts)
-  if okind == 0 { return false }
-  if okind > 0 {
-    let j = 0
-    while j < onames.length {
-      if onames[j] != "" {
-        if monoAnnHasTyParam(otexts[j], typarams) { return true }
-      }
-      j = j + 1
-    }
-  }
-  // A function-type annotation `(p1, p2) => ret` (a closure param/return): a type param may
-  // ride any parameter or the result, so recurse into each, parallel to `monoSubstAnn`'s
-  // function-type branch. Without this, a generic closure param `f: (A, T) => A` reads as concrete and keeps its un-substituted annotation.
-  const fparts: string[] = []
-  const fret = annFnDecompose(ann, fparts)
-  if fret != "" {
-    let fi = 0
-    while fi < fparts.length {
-      if monoAnnHasTyParam(fparts[fi], typarams) { return true }
-      fi = fi + 1
-    }
-    if monoAnnHasTyParam(fret, typarams) { return true }
-  }
-  // A GROUPING paren around the whole (`(T | null)` — the form a composite element wears
-  // under a `[]`). Below the function arm, so a top-level function type is claimed there
-  // first; `peelGroupParens` answers a non-parenthesized name with itself.
-  const pk = peelGroupParens(ann)
-  if pk != ann { return monoAnnHasTyParam(pk, typarams) }
-  // The `[]` run over a composite element (`(T | null)[]`, `{a: T}[]`, `T[][]`, `Box<T>[]`) —
-  // last, peeling the whole run in one step, since every arm above claims a name by its
-  // outermost constructor. Kept out of `monoTyParamOf`: that branch answers with exactly one
-  // `[]` rung from a boolean, so a `T[][]` pattern routed there would substitute to a one-dimensional name and silently drop a parameter dimension.
-  const leaf = arrLeafNameOf(ann)
-  if leaf != ann { return monoAnnHasTyParam(leaf, typarams) }
   false
 }
+
+// Does the annotation at node `ix` (a `TypeRef`, or an `IsExpr`'s check type) name one of
+// `typarams`? Read from its tree as declared before canon, else its live tree, else a type: an
+// `is` test's spelled type, else `ty`, else a minted node's open type, else the node's own.
+// `ix` -1 asks of `ty` alone.
+export function monoAnnHasTyParam(
+  ix: i32,
+  ty: i32,
+  typarams: string[],
+): boolean {
+  if ix < 0 { return monoTyMentionsTyParam(ty, typarams) }
+  const live: string[] = []
+  for tp in typarams {
+    if !gaeParamShadowed(tp) { live.push(tp) }
+  }
+  const raw = declAnnRawTsOf(ix)
+  if raw >= 0 && tsMentionsAnyName(raw, live) { return true }
+  const ts = monoIsTsOf(ix)
+  if ts >= 0 { return tsMentionsAnyName(ts, live) }
+  if nodeAt(ix) is IsExpr {
+    const lu = luIsTyOf(ix)
+    if lu >= 0 { return monoTyMentionsTyParam(lu, typarams) }
+    return monoTyMentionsTyParam(ty, typarams)
+  }
+  let t = ty
+  if t < 0 { t = monoAnnOpenTyOf(ix) }
+  if t < 0 { t = nodeTyIxOf(ix) }
+  monoTyMentionsTyParam(t, typarams)
+}
+
 // The annotation name to read for a generic function's parameter or return: the arena's
-// canon'd spelling, except where the annotation is itself a type parameter — there, the
-// declared one. `canonEmitTypeNames` has no scope, so `type Id = i32` alongside
-// `function ident<Id>(v: Id): Id` would resolve the parameter to `i32`, disagreeing with the checker; the gate is `monoAnnHasTyParam` on the raw spelling, carrying the primitive-shadow guard through `monoTyParamOf`.
+// canon'd spelling, except where the annotation names a type parameter — there, the declared
+// one. `canonEmitTypeNames` has no scope, so `type Id = i32` alongside
+// `function ident<Id>(v: Id): Id` would resolve the parameter to `i32`, disagreeing with the checker.
 export function monoDeclAnnName(
   nodeIx: i32,
   canoned: string,
@@ -3666,7 +3666,12 @@ export function monoDeclAnnName(
 ) {
   const raw = declAnnRawTyName(nodeIx)
   if raw == "" { return canoned }
-  if !monoAnnHasTyParam(raw, typarams) { return canoned }
+  // A read-only view keeps the canon'd spelling: the parameter ladders spell no raw `readonly`.
+  const rt = declAnnRawTsOf(nodeIx)
+  if rt >= 0 && tsKind[rt] == TS_ARR && tsText[rt] == "readonly" {
+    return canoned
+  }
+  if !monoAnnHasTyParam(nodeIx, -1, typarams) { return canoned }
   raw
 }
 

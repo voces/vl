@@ -124,7 +124,7 @@ the slice retires.
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
-| C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, 13 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted) | 13 | 0 / 13 / 0 | 0 / 13 | `emit_base` |
+| C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, then the 3 in `monoAnnHasTyParam`, 5 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted; `monoAnnHasTyParam` asks the annotation node) | 5 | 0 / 5 / 0 | 0 / 5 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 10 retired, 6 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
@@ -275,8 +275,22 @@ What each slice changes:
   391 and 392 of 393 events. The one disagreement already had its type argument bound
   explicitly. difftree `--identity` found 0 of 16,437 files differ.
 
-  The other 12 entries are in `annFnDecompose`, `monoTyParamOf`, `monoAnnHasTyParam`,
-  `monoSubstAnn` and `monoBindFromAnn`. These walkers PRODUCE spellings: the `tvV` binding,
+  **`monoAnnHasTyParam` binds by type.** It is a yes/no question and produces no spelling, so
+  its 3 entries left ahead of the walkers. It takes the annotation node and reads the pre-canon
+  declared tree (`declAnnRawTsOf`), then the live tree, then a type. For an `is` test copied
+  per instance that is the source's tree (`monoIsTsOf`) or the type the list-union rewrite
+  spelled (`luIsTyOf`). For a minted let `TypeRef`, it is the open type (`monoAnnOpenTyOf`).
+  An answer-probe over 16,641 files and the self-compile disagreed at two sites only:
+  - **`monoDeclAnnName` on `readonly T[]`, 10 files.** The old walk had no readonly arm. Handing
+    back the raw spelling reached the valtype ladder's floor, so a read-only root keeps the
+    canon'd spelling.
+  - **`monoListIsUnhandable`'s receiver type, 2 files.** The typed answer is right, and output
+    did not change.
+
+  difftree `--identity` found 0 of 16,529 files differ.
+
+  The other entries are in `annFnDecompose`, `monoTyParamOf` and `monoSubstAnn`, and
+  originally in `monoAnnHasTyParam` and `monoBindFromAnn`. These walkers PRODUCE spellings: the `tvV` binding,
   and the substituted annotation that becomes the instance's TypeRef text and key. The typed
   answer exists beside each one. The probe compared it at each site over `tests/**` and the
   distilled corpus, rendering it with `tyToEmitName`; a spelling that did not match was
