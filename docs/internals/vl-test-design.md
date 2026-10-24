@@ -328,7 +328,7 @@ argument 1: expected () -> void, got () -> i32
 
 `tests/vl_test_runner_test.ts` drives the real binary over
 `tests/fixtures/vl-test/` (green, failing, trapping, non-compiling) and
-`tests/fixtures/vl-test-parallel/` (four ~250 ms tests), asserting the report
+`tests/fixtures/vl-test-parallel/` (four ~80 ms tests), asserting the report
 text, all three exit codes, isolation-after-trap, `-t`, discovery (including that
 a plain `.vl` and a bare `test.vl` are NOT collected and `node_modules` is not
 walked), and that files are really SCHEDULED concurrently.

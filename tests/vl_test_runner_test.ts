@@ -731,7 +731,7 @@ Deno.test({
     "vl-test: files run in PARALLEL — the schedule itself, not a wall-clock proxy",
   ignore: !ENABLED,
   fn: async () => {
-    // Four files, one ~250 ms test each, stamped per file by the host under
+    // Four files, one ~80 ms test each, stamped per file by the host under
     // `$VL_TEST_TRACE=1` (see `test_trace_stamp`). The assertion is two-sided and
     // reads the SCHEDULE: `--jobs 4` must run all four concurrently, `--jobs 1`
     // must run them one at a time.
@@ -877,8 +877,9 @@ Deno.test({
   fn: async () => {
     // A pool worker runs the compiler seed, whose engine sizes its wasm stack for
     // the thread `main` runs on. Too small a native stack under it would ABORT the
-    // process where the wasm should trap, so: on the normal stack an 8,000-deep
-    // expression (enough to abort a default-stack worker) compiles in a worker, and under `VL_SEED_STACK=default` (the
+    // process where the wasm should trap, so: on the normal stack 8,000 nested blocks
+    // (enough to abort a default-stack worker, and cheaper to compile than as many
+    // parentheses) compile in a worker, and under `VL_SEED_STACK=default` (the
     // small-stack fallback) pooled and serial both trap into the same banner.
     const dir = await makeTempDir({ prefix: "vl_test_deep_" });
     try {
@@ -886,7 +887,9 @@ Deno.test({
       await Deno.writeTextFile(
         `${dir}/deep.test.vl`,
         'import { expect, it, toEqual } from "std:test"\n' +
-          `const x = ${"(".repeat(n)}1${")".repeat(n)}\n` +
+          "function f(): i32 {\n  let acc = 0\n  " +
+          "{ acc = acc + 1 ".repeat(n) + "} ".repeat(n) +
+          `\n  acc\n}\nconst x = f() - ${n - 1}\n` +
           'it("deep", () => { expect(x).toEqual(1) })\n',
       );
       await Deno.writeTextFile(
