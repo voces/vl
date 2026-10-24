@@ -776,6 +776,8 @@ tests continue in a fresh instance.
                       Compiles are also capped by available memory; --jobs 1
                       compiles every file in one compiler, one at a time
   {c}--exclude{r} <glob>    Skip matching files (repeatable; also --exclude=<glob>)
+  {c}--show-output{r}       Print what a PASSING test printed too (a failing
+                      test's output is always shown)
   {c}--color={r}<when>      always | never | auto (default), for the RUNNER's own
                       report; a test's captured output is always plain
   {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)

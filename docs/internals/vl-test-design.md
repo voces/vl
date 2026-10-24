@@ -296,10 +296,9 @@ argument 1: expected () -> void, got () -> i32
    `() => i32` closure in a `(() => void)[]` needs a real coercion at the store,
    with the call site dropping the result. Worth doing — every user meets this —
    but it is emitter work, not runner work.
-2. **f64 has no failure rendering.** `std:fmt` defers shortest-round-trip
-   f64→string (std-design D4), so `vltShow` renders an f64 operand as `<f64>` and
-   the matcher `print`s both values instead, which the runner captures as the
-   test's output. Closes when `std:fmt` grows the renderer.
+2. **f64 has no failure rendering.** CLOSED (diderven DV-902): `vltShow` renders
+   an f64 operand through `std:fmt`'s `toString`, so the message reads
+   `expected 0.5 to equal 1` and nothing is echoed into the captured output.
 3. **No per-test timings in the report.** The charter's sample output carries
    them. Omitted deliberately in v1 so the report is byte-deterministic and the
    meta-test can assert it whole; wasmtime epoch interruption (which the
@@ -307,7 +306,9 @@ argument 1: expected () -> void, got () -> i32
    TIMEOUTS land, and timings ride in with it.
 4. **No `--no-capture`, no `dot`/`json` reporters, no watch mode.** All charter
    follow-ups; the capture is already structural (per-instance sink), so
-   `--no-capture` is a host-side streaming switch when wanted.
+   `--no-capture` is a host-side streaming switch when wanted. `--show-output`
+   (diderven DV-903) covers the common half: it prints a PASSING test's captured
+   output under its `ok` line, in the same block a failure uses.
 5. **`beforeAll`/`afterAll` are absent.** `beforeEach`/`afterEach` ship;
    file-level one-shot setup is expressible today as module top-level code,
    which runs once at instantiation.
