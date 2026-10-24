@@ -28,34 +28,58 @@ export function cpCount(s: string) {
   n
 }
 
-// A host-fed code-point stream, held as strings of at most `CP_CHUNK` code points
-// plus an unflushed tail. One `i32[]` over a whole source outgrows the engine's
-// largest single allocation (64 MiB, 16M code points) long before the source string
-// itself does (D1975).
-export type CpAcc = { tail: i32[], chunks: string[] }
+// A host-fed code-point stream, held as strings of at most `CP_CHUNK` bytes plus an
+// unflushed tail of UTF-8 bytes, encoded as each code point arrives so a flush is one
+// copy. One list over a whole source outgrows the engine's largest single allocation
+// (64 MiB) long before the source string itself does (D1975).
+export type CpAcc = { tail: u8[], chunks: string[] }
 const CP_CHUNK = 1048576
 
 export function cpAccNew(): CpAcc { { tail: [], chunks: [] } }
 
 export function cpAccPush(a: CpAcc, cp: i32) {
-  a.tail.push(cp)
+  if cp >= 0 && cp < 128 { a.tail.push(cp) } else { cpAccPushWide(a.tail, cp) }
   if a.tail.length >= CP_CHUNK { cpAccFlush(a) }
+}
+
+// Appends the bytes encoding `c`, the replacement character when it has no encoding, as `fromCodePoint` does.
+function cpAccPushWide(t: u8[], c: i32) {
+  let cp = c
+  if cp < 0 || cp > 1114111 || (cp >= 55296 && cp <= 57343) { cp = 65533 }
+  if cp < 128 {
+    t.push(cp)
+  } else if cp < 2048 {
+    t.push(192 | (cp >> 6))
+    t.push(128 | (cp & 63))
+  } else if cp < 65536 {
+    t.push(224 | (cp >> 12))
+    t.push(128 | ((cp >> 6) & 63))
+    t.push(128 | (cp & 63))
+  } else {
+    t.push(240 | (cp >> 18))
+    t.push(128 | ((cp >> 12) & 63))
+    t.push(128 | ((cp >> 6) & 63))
+    t.push(128 | (cp & 63))
+  }
 }
 
 // Appends the `count` UTF-32LE code points the host staged at linear memory 0 — the
 // `<name>Load` half of the host's `StrIn` ABI (`driver.srcLoad`).
 export function cpAccLoad(a: CpAcc, count: i32) {
+  const t = a.tail
   let i = 0
   while i < count {
-    cpAccPush(a, __load_i32__(i * 4))
+    const cp = __load_i32__(i * 4)
+    if cp >= 0 && cp < 128 { t.push(cp) } else { cpAccPushWide(t, cp) }
     i = i + 1
   }
+  if t.length >= CP_CHUNK { cpAccFlush(a) }
 }
 
 function cpAccFlush(a: CpAcc) {
-  const cps = a.tail
-  if cps.length == 0 { return }
-  a.chunks.push(fromCodePoints(cps))
+  const bs = a.tail
+  if bs.length == 0 { return }
+  a.chunks.push(__str_from_bytes__(bs, 0, bs.length))
   a.tail = []
 }
 
