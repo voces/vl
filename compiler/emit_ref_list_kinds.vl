@@ -42,11 +42,10 @@ import {
   UnionDecl,
   WhileStmt,
   arenaEpochNow,
-  elseIfLink,
   i32ToStr,
   nodeAt,
   nodeChildren,
-  nodeSpineChildren,
+  nodeChildrenPush,
 } from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
 import { covarValueWriteState } from "./check_covar_write"
@@ -1119,39 +1118,45 @@ function dsgNoteChild(c: i32, ix: i32, frame: i32) {
   dsgNoteIdent(c, ix, frame)
 }
 
+// The work-list entry that closes a `FuncDecl`'s subtree in `dsgWalk`: it pops `dsgStack`.
+const DSG_POP = -2
+
 // One pre-order pass over the program filling the index. It descends where `dsScopeWalk`
-// prunes and drops the site at its row instead, so the one pass answers for every name.
-function dsgWalk(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = nodeAt(ix)
-  let pushed = false
-  if ix != dsgRoot {
-    if n is FuncDecl {
-      dsgStack.push(ix)
-      pushed = true
+// prunes and drops the site at its row instead, so the one pass answers for every name. Each
+// node notes every child before any is walked; an explicit work list keeps an `else if` chain
+// or a deep body off the call stack (D1990) and allocates nothing per node.
+function dsgWalk(root: i32) {
+  const work: i32[] = [root]
+  while work.length > 0 {
+    const ix = work.pop()
+    if ix == DSG_POP {
+      dsgStack.pop()
+    } else if ix >= 0 && ix < P.nodes.length {
+      if ix != dsgRoot && nodeAt(ix) is FuncDecl {
+        dsgStack.push(ix)
+        work.push(DSG_POP)
+      }
+      let frame = -1
+      if dsgStack.length > 0 { frame = dsgStack[dsgStack.length - 1] }
+      const base = work.length
+      nodeChildrenPush(ix, work)
+      let k = base
+      while k < work.length {
+        dsgNoteChild(work[k], ix, frame)
+        k = k + 1
+      }
+      // Reversed in place, so the first child is the next one popped.
+      let lo = base
+      let hi = work.length - 1
+      while lo < hi {
+        const t = work[lo]
+        work[lo] = work[hi]
+        work[hi] = t
+        lo = lo + 1
+        hi = hi - 1
+      }
     }
   }
-  let frame = -1
-  if dsgStack.length > 0 { frame = dsgStack[dsgStack.length - 1] }
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990); each link
-  // still notes every child, the next link included, before walking its own.
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeChildren(cur)
-    let k = 0
-    while k < kids.length {
-      dsgNoteChild(kids[k], cur, frame)
-      k = k + 1
-    }
-    const walk = nodeSpineChildren(cur)
-    k = 0
-    while k < walk.length {
-      dsgWalk(walk[k])
-      k = k + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  if pushed { dsgStack.pop() }
   0
 }
 
