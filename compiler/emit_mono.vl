@@ -2851,17 +2851,36 @@ function monoFnDeclaresLambda(slot: i32): boolean {
   fnChildHead[slot] >= 0
 }
 
-// Refuses an instance whose `(T | null)[]` annotation binds `T` where `T | null` is a niche
-// rather than a box or a nullable reference: a literal-union or function element, or a
-// record holding such a list read through a lambda. Those read the template's rep (D2525).
+// The type parameter `T` of a list type `(T | null)[]`, or "" for any other type.
+function monoNulParamListTp(at: i32): string {
+  if at < 0 || at >= T.tys.length { return "" }
+  const a = tyAt(at)
+  if a is TyArray {
+    if a.aElem < 0 || a.aElem >= T.tys.length { return "" }
+    const e = tyAt(a.aElem)
+    if e is TyNullable {
+      if e.nInner < 0 || e.nInner >= T.tys.length { return "" }
+      const v = tyAt(e.nInner)
+      if v is TyVar { return v.tvName }
+    }
+  }
+  ""
+}
+
+// Refuses a `(T | null)[]` annotation whose `T` binds to a literal union, a function, or a
+// record holding such a list read through a lambda: those read the template's rep (D2525).
+// `bN`/`bT` bind type parameters to arena types; one they leave unbound binds by walking
+// `annNode` against `pinTy` (-1 when none).
 function monoNicheNulListCheck(
-  ann: string,
+  annNode: i32,
   typarams: string[],
   tvN: string[],
   tvV: string[],
+  bN: string[],
+  bT: i32[],
+  pinTy: i32,
 ) {
-  if !nameIsArray(ann) { return 0 }
-  const tp = nullablePartOf(normTypeAtom(arrElemNameRaw(ann)))
+  const tp = monoNulParamListTp(nodeTyIxOf(annNode))
   if tp == "" { return 0 }
   let isParam = false
   let i = 0
@@ -2872,9 +2891,16 @@ function monoNicheNulListCheck(
   if !isParam { return 0 }
   const b = normTypeAtom(monoBindOf(tvN, tvV, tp))
   if b == "" { return 0 }
+  let bt = monoBindTyOf(bN, bT, tp)
+  if bt < 0 && pinTy >= 0 {
+    const pN: string[] = []
+    const pT: i32[] = []
+    bindGenWalk(nodeTyIxOf(annNode), pinTy, pN, pT)
+    bt = monoBindTyOf(pN, pT, tp)
+  }
   if (
-    nameIsLitUnionType(b)
-    || annArrowAt(b) >= 0
+    tyIsLitUnion(bt)
+    || tyIxIsFunc(bt)
     || (monoCurHasLam && gaeAppHasNulParamListField(b))
   ) {
     return emitFail(
@@ -2902,7 +2928,7 @@ function monoSubstLetType(
   const tn = nodeAt(letType)
   if tn is TypeRef {
     if monoAnnMentionsTyParam(letType, tn.tyName, typarams) {
-      monoNicheNulListCheck(tn.tyName, typarams, tvN, tvV)
+      monoNicheNulListCheck(letType, typarams, tvN, tvV, bN, bT, -1)
       const sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
       if sub != "" && sub != tn.tyName {
         // The substituted type, not a re-parse of the substituted name; the name handed
@@ -10484,7 +10510,15 @@ function monoMakeInstanceParams(
         if pinned[pj] == tyNameOf(p3.parType) {
           nt = p3.parType
         } else {
-          monoNicheNulListCheck(tyNameOf(p3.parType), tps, tvN, tvV)
+          monoNicheNulListCheck(
+            p3.parType,
+            tps,
+            tvN,
+            tvV,
+            exBN,
+            exBT,
+            pinTys[pj],
+          )
           // The argument's type is one member of a union parameter; the explicit type
           // arguments substituted through the annotation name the union itself (D2679).
           let gateTy = pinTys[pj]
@@ -11609,7 +11643,7 @@ function monoMakeInstanceRet(
   // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
   // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
   let nret = fn.fnRet
-  if nret >= 0 { monoNicheNulListCheck(tyNameOf(nret), tps, tvN, tvV) }
+  if nret >= 0 { monoNicheNulListCheck(nret, tps, tvN, tvV, letBN, letBT, -1) }
   nret = monoMakeInstanceRetAnn(fn, nret, tps, tvN, tvV, letBN, letBT, pinTys)
   if nret < -1 { return -2 }
   const twoOut: i32[] = []
