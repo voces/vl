@@ -119,7 +119,7 @@ the slice retires.
 
 | slice | name | entries | A / C / D | renders / parses | files |
 | --- | --- | --- | --- | --- | --- |
-| A1 | shape-row typed twins (landed: 1 retired, 13 left; re-probed at 27fc385d1: callers with no type, typed rungs that differ, and the class C alias parameter; func and lit-union rungs listed as the next rep change) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
+| A1 | shape-row typed twins (landed: 2 retired, 12 left; re-probed at 9a8510d7a with the inventory witnesses: callers with no type, typed rungs that differ, and the class C alias parameter; func and lit-union rungs listed as the next rep change) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
 | A2 | emit_mono typed tests (landed: 7 retired, 1 to B, 1 left; the arrow test waits on one hole pin with no type) | 1 | 0 / 1 / 0 | 0 / 1 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 8 retired, 4 left; re-probed at c3b2de16e: `fieldElemHintOf` typed, the arm-shape walk differs at 221 reaches) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
@@ -195,6 +195,20 @@ What each slice changes:
     179 files and differs in 13.
   - `rlElemNicheNullable`: the rl type answers non-nullable where the spelling has `| null`,
     in 195 files.
+
+  Re-probed at 9a8510d7a over the self-compile, 16,643 files and the 3,749 inventory witnesses.
+  One parse retired: the closure return's lit-union rung reaches no caller without a type, so it
+  reads `tyNulFuncInner`'s result type. The other 12 stay:
+  - `nulRefMapValInnerOfTy` agrees where typed but gets no type in 2 files, and
+    `mapValKindLowerable` in its 1 file.
+  - `mvValKindOfNameTy`: the lit-union rung differs in 1 file and has no type in 4; the func
+    rung differs in 31 files and 32 witnesses.
+  - `nulScalarListKind` has no type through `forceAnnLeafReps` (192 files) and the field-code
+    caller (1,008).
+  - `genTyParamArr`/`genTyParamNulArr`: no node type in 178 files, differ in 11 and 1.
+  - `rlElemNicheNullable` differs in 5 files, down from 195: a generic `T` banked as the element
+    type, and `(i32)=>i32|null`, a nullable closure to the spelling but a closure returning
+    `i32 | null` to the arena.
 - **A2.** These `emit_mono` predicates test the type they hold instead of rendering it.
   - Done, byte-identical: `monoModuleLetTyIs` and `monoModuleDupPin` compare the site's type
     with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
