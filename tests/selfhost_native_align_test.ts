@@ -9,8 +9,9 @@
 // produces IDENTICAL behavior:
 //
 //   • RUN         `vl run <case>`         → stdout lines EQUAL the file's `@log`
-//                                           directives, AND `vl check <case>`
-//                                           exits 0 (the front end accepts it).
+//                                           directives. (A false check refusal of a
+//                                           running case is the V8 face's and
+//                                           `regress.vl`'s to catch, on the same seed.)
 //   • TRAP        `vl run <case>`         → exits NONZERO with a wasm runtime trap.
 //   • REJECT      `vl check <case>`       → exits NONZERO, rejected at the parse/type
 //                                           STAGE (an invalid program is caught by the
@@ -32,8 +33,9 @@
 // WHAT RUNS BY DEFAULT IS THE HOST-FACE SUBSET of what discovery finds (`hostFaceReason`):
 // the V8 face grades the whole corpus over the same seed bytes, so this face asserts the
 // cases that reach the host, wasmtime or the batch CLIs, plus a stratum per directory and
-// tier. The subset is selected by rule, so a new case under a host directory or importing a
-// host module is covered without an edit. `VL_NATIVE_ALIGN_FULL=1` asserts every case.
+// tier and, per tier, one case importing each `std:` module the corpus imports. The subset
+// is selected by rule, so a new case under a host directory or importing a host module is
+// covered without an edit. `VL_NATIVE_ALIGN_FULL=1` asserts every case.
 //
 // SCOPE (matches the corpus directives the native binary can already adjudicate):
 // `@run`/`@log` runtime parity, `@trap` trap-and-exit, and `@check`/`@error`
@@ -43,7 +45,7 @@
 // so a warning-only case is adjudicated for its ACCEPT verdict alone.
 //
 // NOTHING HERE SPAWNS ONE PROCESS PER CASE. `vl run --batch` runs the RUN/TRAP tiers
-// in waves and `vl check --batch --json` checks every tier's `vl check` leg in waves —
+// in waves and `vl check --batch --json` checks the check tiers in waves —
 // both because the per-invocation floor (process + two wasmtime engine builds + the
 // multi-MB seed) dominates the compiling, 77% of it for the check leg
 // (`docs/internals/test-timing-2026-09.md` §5a). The per-case TESTS are untouched: each
@@ -292,22 +294,33 @@ for (const rel of [...walkVl(CASES)].sort()) {
 // the exclusions always see every case.
 const FULL = Deno.env.get("VL_NATIVE_ALIGN_FULL") === "1";
 
-/** Directories whose cases are about a host or engine surface, kept whole. */
-const HOST_DIRS = new Set([
-  "atomics", // wasmtime's threads proposal
-  "extern", // host-supplied extern values
-  "intrinsics", // host imports beside the pure intrinsics
-  "lexer", // parse-stage rejects
-  "memory", // linear memory, under wasmtime's limits
-  "parser", // parse-stage rejects
-  "simd", // wasmtime's simd proposal
-  "std", // std resolution through the host, and the host-backed modules
-  "traps", // the host's trap rendering
-]);
+/**
+ * Directories whose cases are about a host or engine surface: kept whole, or only in the
+ * tiers that reach that surface.
+ */
+const HOST_DIRS: Record<string, "all" | Tier[]> = {
+  atomics: "all", // wasmtime's threads proposal
+  extern: "all", // host-supplied extern values
+  intrinsics: "all", // host imports beside the pure intrinsics
+  lexer: ["reject", "accept"], // the stage a parse refusal is graded at
+  memory: "all", // linear memory, under wasmtime's limits
+  parser: ["reject", "accept"], // the stage a parse refusal is graded at
+  simd: "all", // wasmtime's simd proposal
+  std: ["trap", "reject", "accept"], // the host's std reader, and its rendering of a std trap
+  traps: "all", // the host's trap rendering
+};
+const hostDir = (rel: string, tier: Tier): boolean => {
+  const d = HOST_DIRS[rel.split("/")[0]];
+  return d === "all" || (d !== undefined && d.includes(tier));
+};
 
 /** A case (or a file of its module) that imports a host-backed module or a host intrinsic. */
 const HOST_SOURCE =
   /^\s*\/\/\s*@skip\b|"std:(?:args|env|fs|process|test)"|__(?:args|env|fs|proc)_[a-z_]+__/m;
+
+/** The `std:` modules a case's sources import by name. */
+const stdImports = (rel: string): string[] =>
+  caseSources(rel).flatMap((f) => [...src(f).matchAll(/"std:([a-z0-9_]+)"/g)].map((m) => m[1]));
 
 /**
  * Named cases, each with the reason no rule above selects it. A case that ever grades
@@ -356,7 +369,7 @@ const caseSources = (rel: string): string[] => {
 /** Why the default run asserts `rel`, or null when only the full run does. */
 const hostFaceReason = (rel: string, tier: Tier, rank: number): string | null => {
   if (rel in HOST_NAMED) return HOST_NAMED[rel];
-  if (HOST_DIRS.has(rel.split("/")[0])) return "host directory";
+  if (hostDir(rel, tier)) return "host directory";
   if (caseSources(rel).some((f) => HOST_SOURCE.test(src(f)))) return "host source";
   // Every emit-reject case: the only tier the `--codegen` batch leg grades.
   if (tier === "emit-reject") return "emit-reject tier";
@@ -367,12 +380,23 @@ const hostFaceReason = (rel: string, tier: Tier, rank: number): string | null =>
 if (!FULL) {
   for (const tier of Object.keys(TIERS) as Tier[]) {
     const seen = new Map<string, number>();
-    TIERS[tier] = TIERS[tier].filter((rel) => {
+    const all = TIERS[tier];
+    const keep = new Set(all.filter((rel) => {
       const dir = rel.split("/")[0];
       const rank = seen.get(dir) ?? 0;
       seen.set(dir, rank + 1);
       return hostFaceReason(rel, tier, rank) !== null;
-    });
+    }));
+    // Every `std:` module a tier imports anywhere is imported by one asserted case of that
+    // tier, so the host resolves each module the corpus reaches.
+    const stdHeld = new Set([...keep].flatMap(stdImports));
+    for (const rel of all) {
+      const fresh = stdImports(rel).filter((m) => !stdHeld.has(m));
+      if (fresh.length === 0) continue;
+      keep.add(rel);
+      for (const m of fresh) stdHeld.add(m);
+    }
+    TIERS[tier] = all.filter((rel) => keep.has(rel));
   }
 }
 /** Named cases discovery does not place in a tier: moved, renamed, deleted, or excluded. */
@@ -497,10 +521,10 @@ const runOne = async (rel: string): Promise<BatchResult> => {
 };
 
 // ── The `vl check` legs, BATCHED ──────────────────────────────────────────────
-// Every tier ends in a `vl check` (or `vl check --codegen`) of one case, and each is
-// independent of every other. They used to be one spawn each — ~2,989 processes, of
-// which 77% was the process + engine + seed floor and only 23% the compiling
-// (`docs/internals/test-timing-2026-09.md` §5a). `vl check --batch --json` takes a file
+// Each ACCEPT, REJECT and EMIT-REJECT case ends in a `vl check` (or `vl check --codegen`)
+// of one case, and each is independent of every other. They used to be one spawn each —
+// ~2,989 processes, of which 77% was the process + engine + seed floor and only 23% the
+// compiling (`docs/internals/test-timing-2026-09.md` §5a). `vl check --batch --json` takes a file
 // LIST and writes one `{file, exit, diagnostics}` record per input, so the floor is
 // paid once per WAVE instead of once per case.
 //
@@ -525,13 +549,12 @@ const runOne = async (rel: string): Promise<BatchResult> => {
 const CHECK_LEG = (tier: Tier): "check" | "codegen" =>
   tier === "emit-reject" ? "codegen" : "check";
 const CHECK_LEGS: Record<"check" | "codegen", string[]> = { check: [], codegen: [] };
-for (const tier of ["run", "accept", "reject", "emit-reject"] as Tier[]) {
-  CHECK_LEGS[CHECK_LEG(tier)].push(...TIERS[tier]);
-}
+const CHECKED_TIERS: Tier[] = ["accept", "reject", "emit-reject"];
+for (const tier of CHECKED_TIERS) CHECK_LEGS[CHECK_LEG(tier)].push(...TIERS[tier]);
 // The exclusion tripwires re-run the same assertion over their case, so the batch has
-// to carry them too. A TRAP-tier exclusion has no `vl check` leg at all.
+// to carry them too. A RUN- or TRAP-tier exclusion has no `vl check` leg at all.
 for (const { rel, tier } of EXCLUDED) {
-  if (tier !== "trap") CHECK_LEGS[CHECK_LEG(tier)].push(rel);
+  if (CHECKED_TIERS.includes(tier)) CHECK_LEGS[CHECK_LEG(tier)].push(rel);
 }
 
 /** Round-robin into at most `SPAWN_JOBS` waves, so long and short cases mix evenly. */
@@ -716,8 +739,7 @@ const emitRejectDivergence = async (rel: string): Promise<string | null> => {
 const tierDivergence = async (rel: string, tier: Tier): Promise<string | null> => {
   switch (tier) {
     case "run":
-      return runDivergence(rel, await runOne(rel)) ??
-        await checkCleanDivergence(rel);
+      return runDivergence(rel, await runOne(rel));
     case "trap":
       return trapDivergence(await runOne(rel));
     case "reject":
@@ -755,11 +777,10 @@ Deno.test({
 
 for (const rel of TIERS.run) {
   Deno.test({
-    name: `native-align run: ${rel} — vl run stdout == @log, vl check clean`,
+    name: `native-align run: ${rel} — vl run stdout == @log`,
     ignore: !ENABLED,
     fn: async () => {
-      const why = runDivergence(rel, (await batchResults()).get(rel)!) ??
-        await checkCleanDivergence(rel);
+      const why = runDivergence(rel, (await batchResults()).get(rel)!);
       if (why) throw new Error(`${rel}: ${why}`);
     },
   });
