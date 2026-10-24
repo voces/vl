@@ -131,7 +131,7 @@ the slice retires.
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type; 4 retired, 19 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; 5 retired, 18 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 13 retired, 8 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -1103,6 +1103,23 @@ What each slice changes:
     The first and the last need the pin's own type rather than the argument's, which is C1
     step 3's per-instance render. The other two would change the instance's spelled key, so
     each would move a registry row and its box tags (see D4). The 22 entries keep their status.
+  - Measured, the sharing risk: keying an instance by its ARGUMENT's type alone would split
+    instances. A probe compared the spelled key with the argument's type at every key lookup
+    over 16,634 files plus the self-compile: in 1,546 files (8,178 events) one key held one
+    argument type, and in 51 files (98 events) one spelled key was shared by arguments of
+    different types. So the typed key stays the clone's resolved pin type, behind the spelled
+    lookup, and no sharing changed in this step.
+  - Done: `monoArgTyNameProjected`'s field-argument rung finds a nullable receiver's record from
+    its recorded type's non-null part, at the instance's pin when the type names a parameter,
+    instead of peeling `|null` off the receiver's spelling. It agreed with the spelled peel in
+    8 of 8 files that reach it (15 of 15 events) over the 1,680-file reach set and the
+    self-compile, with `tests/cases/inference/hole-param-nullable-self-ref-field-arg.vl` as the
+    control. One parse retired; difftree --identity found 0 files differ.
+  - Left, measured: the indexed-element rung (`nameIsArray(arrTy)`) is not the typed element's
+    pin. The element's recorded type, spelled as a pin, disagrees in 121 of 140 files: the rung
+    names `#anon` rows and record names where the type renders the inline shape.
+    `unionParamPinName`'s render agreed with the literal `string` in only 2 events in 1 file,
+    and no control reaches it, so it stays. 18 entries are left.
 - **D4.** `monoRegisterPinUnion` and `canonUnionKeyOfName` register a narrowed pin's union by its
   type.
   - Probed and blocked: no entry retired. A side-by-side probe read the spelling and the type at
