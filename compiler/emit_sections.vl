@@ -179,6 +179,7 @@ import {
 } from "./emit_query"
 import {
   AS_FAIL_DOMS,
+  ByteChunk,
   ByteRope,
   INIT_REACH_NEVER,
   LBK_I32_LIST,
@@ -260,6 +261,8 @@ import {
   ctrlDepth,
   curBuf,
   declSlotByNode,
+  dfeCallee,
+  dfeOn,
   dupScanActive,
   dupSlotBias,
   dupSlotMore,
@@ -6670,9 +6673,9 @@ function emitModule(_stmts: i32[]) {
     seekChunk: 0,
     seekBase: 0,
   }
-  if buildCodePayload(codePayload, n, hasStart, memFn, nHelpers) < 0 {
-    return -1
-  }
+  const built = buildCodePayload(codePayload, n, hasStart, memFn, nHelpers)
+  dfeOn = false
+  if built < 0 { return -1 }
   // The global section is framed first: it sits after the function section in the rope, so
   // placing it does not move the chunk the function section is placed before.
   frameGlobalSection()
@@ -10175,6 +10178,7 @@ function buildCodePayload(
   wTarget(codePrev)
   ropePush(codePayload, countHead)
   const rowsAt = emitFnSpanStart.length
+  dfeArm()
   // Each entry renders into a buffer of its own and joins the payload as one chunk, so no
   // buffer holds more than one function (D1976). `rows` marks the span rows the entry is
   // about to bank, entry-relative until `placeCodeEntry` moves them onto the payload.
@@ -10364,6 +10368,7 @@ function buildCodePayload(
     )
     tci = tci + 1
   }
+  dfeFlush(codePayload, n)
   if nSet + cloThunkFes.length > 0 {
     rewriteCodeCount(codePayload, fixedN + nSet + cloThunkFes.length, rowsAt)
   }
@@ -10392,8 +10397,124 @@ function rewriteCodeCount(codePayload: ByteRope, count: i32, rowsAt: i32) {
   0
 }
 
-// Append one rendered code entry to `code` and bank its whole-body span row. The rows
-// banked since `rows` are relative to `entry`, so they move by the entry's payload offset.
+// The code entries rendered while `dfeOn` holds them back, in function-index order: the
+// rendered bytes, the span rows `[rowLo, rowHi)` the render banked, the `dfeCallee` range its
+// calls wrote, and the arguments passed to `placeCodeEntry`.
+let dfeBuf: ByteChunk[] = []
+let dfeRowLo: i32[] = []
+let dfeRowHi: i32[] = []
+let dfeEdgeLo: i32[] = []
+let dfeEdgeHi: i32[] = []
+let dfeNode: i32[] = []
+let dfePos: i32[] = []
+let dfeKind: i32[] = []
+let dfeTag: string[] = []
+// Where the next held entry's calls begin in `dfeCallee`.
+let dfeEdgeAt = 0
+
+// Start holding code entries back and recording calls. Off in an armed relocation build,
+// whose units another module may call by symbol.
+function dfeArm() {
+  dfeOn = !RELOC_ARMED
+  dfeCallee = []
+  dfeEdgeAt = 0
+  dfeBuf = []
+  dfeRowLo = []
+  dfeRowHi = []
+  dfeEdgeLo = []
+  dfeEdgeHi = []
+  dfeNode = []
+  dfePos = []
+  dfeKind = []
+  dfeTag = []
+  0
+}
+
+// Place every held entry, replacing each function no root reaches by an `unreachable` body
+// so no index moves. Roots: the start and init functions, the exports, and every function
+// whose address is taken (with its thunk); a function is reached through a call one writes.
+function dfeFlush(code: ByteRope, n: i32) {
+  if !dfeOn { return 0 }
+  dfeOn = false
+  const nE = dfeBuf.length
+  const live: i32[] = []
+  const work: i32[] = []
+  let e = 0
+  while e < nE {
+    live.push(0)
+    if dfeKind[e] == 4 { dfeMark(live, work, e) }
+    e = e + 1
+  }
+  for x in exportTargetSlots() { dfeMark(live, work, x) }
+  let fe = 0
+  while fe < n {
+    if fnAddrTakenAt(fe) {
+      dfeMark(live, work, fe)
+      dfeMark(live, work, tableEntryFnIdx(fe) - gImports)
+    }
+    fe = fe + 1
+  }
+  while work.length > 0 {
+    const at = work.pop() ?? -1
+    if at >= 0 {
+      let k = dfeEdgeLo[at]
+      while k < dfeEdgeHi[at] {
+        dfeMark(live, work, dfeCallee[k] - gImports)
+        k = k + 1
+      }
+    }
+  }
+  e = 0
+  while e < nE {
+    if live[e] == 1 {
+      placeCodeEntryRows(
+        code,
+        dfeBuf[e].b,
+        dfeRowLo[e],
+        dfeRowHi[e],
+        dfeNode[e],
+        dfePos[e],
+        dfeKind[e],
+        dfeTag[e],
+      )
+    } else {
+      // The rows banked inside the dropped body name bytes that are gone: empty them.
+      let r = dfeRowLo[e]
+      while r < dfeRowHi[e] {
+        emitFnSpanStart[r] = 0
+        emitFnSpanEnd[r] = 0
+        r = r + 1
+      }
+      const stub: u8[] = [3, 0, 0, 0x0b] // size 3: no locals, unreachable, end
+      placeCodeEntryRows(
+        code,
+        stub,
+        dfeRowHi[e],
+        dfeRowHi[e],
+        dfeNode[e],
+        dfePos[e],
+        dfeKind[e],
+        dfeTag[e],
+      )
+    }
+    e = e + 1
+  }
+  dfeBuf = []
+  dfeCallee = []
+  0
+}
+
+// Mark held entry `e` live and queue its calls, once. An index outside the held entries (an
+// import, or a sentinel) names no body here.
+function dfeMark(live: i32[], work: i32[], e: i32) {
+  if e < 0 || e >= live.length || live[e] == 1 { return 0 }
+  live[e] = 1
+  work.push(e)
+  0
+}
+
+// Append one rendered code entry to `code` and bank its whole-body span row, or hold it back
+// for `dfeFlush` while `dfeOn`. The rows banked since `rows` are relative to `entry`.
 function placeCodeEntry(
   code: ByteRope,
   entry: u8[],
@@ -10403,9 +10524,46 @@ function placeCodeEntry(
   kind: i32,
   tag: string,
 ) {
+  if dfeOn {
+    dfeBuf.push({ b: entry })
+    dfeRowLo.push(rows)
+    dfeRowHi.push(emitFnSpanStart.length)
+    dfeEdgeLo.push(dfeEdgeAt)
+    dfeEdgeHi.push(dfeCallee.length)
+    dfeEdgeAt = dfeCallee.length
+    dfeNode.push(node)
+    dfePos.push(pos)
+    dfeKind.push(kind)
+    dfeTag.push(tag)
+    return 0
+  }
+  placeCodeEntryRows(
+    code,
+    entry,
+    rows,
+    emitFnSpanStart.length,
+    node,
+    pos,
+    kind,
+    tag,
+  )
+}
+
+// Append `entry` to `code`, move its span rows `[rows, rowsEnd)` by its payload offset, and
+// bank its whole-body row.
+function placeCodeEntryRows(
+  code: ByteRope,
+  entry: u8[],
+  rows: i32,
+  rowsEnd: i32,
+  node: i32,
+  pos: i32,
+  kind: i32,
+  tag: string,
+) {
   const at = code.len
   let r = rows
-  while r < emitFnSpanStart.length {
+  while r < rowsEnd {
     emitFnSpanStart[r] = emitFnSpanStart[r] + at
     emitFnSpanEnd[r] = emitFnSpanEnd[r] + at
     r = r + 1

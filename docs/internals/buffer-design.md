@@ -2058,12 +2058,15 @@ are not an absence of checking — they are the checks being one frame down, ins
 which the same table's `call` column shows being called once per access. There is no rung, and no
 shape, at which the count falls.
 
-The counts are module-wide within loops, so the `call` and `sget` columns at `none` also carry every
-loop-bearing function `std:buffer` defines, whether the kernel reaches it or not — `storeBytes` and
-`loadBytes` add 3 to the `call` column of every row there and `window`'s trap message 1 more, and nothing to `sget`: their copy loops
-call only a linear-memory intrinsic, which keeps the list-header hoist (`bulk-copy-design.md` §E4).
-The `trap` column above is unaffected, and so is every
-`-O`/`-O3` cell, because those rungs delete what nothing calls.
+The counts are module-wide within loops, and since a plain build writes an `unreachable` stub for
+every function no root reaches (DECISIONS.md, "A plain build drops the functions no root reaches"),
+the `none` column counts only what the kernel reaches, as the optimized columns always did. Before
+that, every `none` cell also carried the loops of `std:buffer` functions the kernel never calls —
+`storeBytes` and `loadBytes` (+1 trap, +1 call each), `window`'s trap message and the
+`__utf8_cplen__` helper (+1 call each): +2 trap and +4 call on every row, nothing to `sget`. That
+move came out of all sixteen `none` cells at once and left every `-O`/`-O3` cell where it was,
+because those rungs had already deleted the same functions. The kernels' own functions disassemble
+byte-identically before and after.
 
 The transition is worth knowing for reading a `-O` disassembly: at `-O` binaryen inlines the VOID
 setter but not the f32-returning getter, so half the check appears in the loop and half stays in a
