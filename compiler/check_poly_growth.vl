@@ -1,0 +1,257 @@
+// `check_poly_growth.vl` — generic recursion that grows its type argument (D2721).
+// Each call to a generic function records, per type parameter it binds, which of the caller's
+// type parameters the bound type mentions and whether one sits inside a list, map, record or
+// function type. A cycle of such bindings through a growing one has no finite set of
+// instances, so monomorphization cannot build it. Only a cycle a non-generic body or the module
+// reaches is refused: one nothing calls is never instantiated. `pgrReset` clears every table per
+// pass.
+
+import {
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyAt,
+} from "./check_types"
+import { tyVarOwnerOf } from "./check_hole_pins"
+import { i32ListHas } from "./listutil"
+import { strContains } from "./strutil"
+
+// Whether each named body's owner key is generic: a `<T>` list or an un-annotated parameter.
+let pgrOwnerGeneric: {[string]: boolean} = Map()
+// One row per direct call: the calling body's owner key ("" at module scope) and the callee's.
+let pgrCallFrom: string[] = []
+let pgrCallTo: string[] = []
+// One row per type-parameter binding: the caller's parameter node and the callee's, keyed
+// `owner + "|" + name`, whether the bound type grows the caller's, and the call node.
+let pgrEdgeFrom: string[] = []
+let pgrEdgeTo: string[] = []
+let pgrEdgeGrow: boolean[] = []
+let pgrEdgeSite: i32[] = []
+let pgrEdgeCaller: string[] = []
+let pgrEdgeCallee: string[] = []
+let pgrEdgeFromName: string[] = []
+let pgrEdgeToName: string[] = []
+// The type variables one `pgrCollect` walk found, whether each sits nested, and its budget.
+let pgrSeenTy: i32[] = []
+let pgrSeenNested: boolean[] = []
+let pgrBudget = 0
+
+// Clears the tables for a new pass.
+export function pgrReset() {
+  pgrOwnerGeneric = Map()
+  pgrCallFrom = []
+  pgrCallTo = []
+  pgrEdgeFrom = []
+  pgrEdgeTo = []
+  pgrEdgeGrow = []
+  pgrEdgeSite = []
+  pgrEdgeCaller = []
+  pgrEdgeCallee = []
+  pgrEdgeFromName = []
+  pgrEdgeToName = []
+  0
+}
+
+// Notes that the body owned by `owner` is checked, and whether it is generic.
+export function pgrNoteBody(owner: string, generic: boolean) {
+  if owner != "" { pgrOwnerGeneric[owner] = generic }
+  0
+}
+
+// Records a call from the body owned by `caller` to `callee`, which bound each name in `names`
+// to the type at the same index of `tys`, at call node `site`.
+export function pgrNoteCall(
+  caller: string,
+  callee: string,
+  calleeName: string,
+  names: string[],
+  tys: i32[],
+  site: i32,
+) {
+  pgrCallFrom.push(caller)
+  pgrCallTo.push(callee)
+  let i = 0
+  while i < names.length && i < tys.length {
+    pgrSeenTy = []
+    pgrSeenNested = []
+    pgrBudget = 4096
+    pgrCollect(tys[i], false, 32)
+    let k = 0
+    while k < pgrSeenTy.length {
+      const tv = tyAt(pgrSeenTy[k])
+      // A body's own `<T>` is minted before its owner is entered, so it reads as unowned there.
+      let owner = tyVarOwnerOf(pgrSeenTy[k])
+      if owner == "" { owner = caller }
+      if tv is TyVar && owner != "" {
+        pgrEdgeFrom.push(pgrKey(owner, tv.tvName))
+        pgrEdgeTo.push(pgrKey(callee, names[i]))
+        pgrEdgeGrow.push(pgrSeenNested[k])
+        pgrEdgeSite.push(site)
+        pgrEdgeCaller.push(caller)
+        pgrEdgeCallee.push(calleeName)
+        pgrEdgeFromName.push(tv.tvName)
+        pgrEdgeToName.push(names[i])
+      }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Notes each type variable `ty` mentions; `nested` once below a list, map, record or function.
+// A union or nullable is transparent, since its members flatten rather than grow.
+function pgrCollect(ty: i32, nested: boolean, depth: i32) {
+  if ty < 0 || depth <= 0 || pgrBudget <= 0 { return 0 }
+  pgrBudget = pgrBudget - 1
+  const t = tyAt(ty)
+  match t {
+    TyVar => pgrSeen(ty, nested)
+    TyArray => pgrCollect(t.aElem, true, depth - 1)
+    TyNullable => pgrCollect(t.nInner, nested, depth - 1)
+    TyNeg => pgrCollect(t.negTy, nested, depth - 1)
+    TyMap => {
+      pgrCollect(t.mKey, true, depth - 1)
+      pgrCollect(t.mVal, true, depth - 1)
+    }
+    TyObj => {
+      for f in t.objFieldTypes { pgrCollect(f, true, depth - 1) }
+      0
+    }
+    TyFunc => {
+      for p in t.fnParamTypes { pgrCollect(p, true, depth - 1) }
+      pgrCollect(t.fnRet, true, depth - 1)
+    }
+    TyUnion => {
+      for m in t.uMembers { pgrCollect(m, nested, depth - 1) }
+      0
+    }
+    TyPrim => 0
+    TyErr => 0
+    TyLit => 0
+  }
+}
+
+// Records type variable `ty`, nested or not; a nested sighting wins over a bare one.
+function pgrSeen(ty: i32, nested: boolean) {
+  let i = 0
+  while i < pgrSeenTy.length {
+    if pgrSeenTy[i] == ty {
+      if nested { pgrSeenNested[i] = true }
+      return 0
+    }
+    i = i + 1
+  }
+  pgrSeenTy.push(ty)
+  pgrSeenNested.push(nested)
+  0
+}
+
+// The bodies a non-generic body or the module reaches through direct calls.
+function pgrReachable(): {[string]: boolean} {
+  const r: {[string]: boolean} = Map()
+  r[""] = true
+  for k in pgrOwnerGeneric.keys() {
+    if !(pgrOwnerGeneric[k] ?? true) && !strContains(k, "#") { r[k] = true }
+  }
+  let grew = true
+  while grew {
+    grew = false
+    let i = 0
+    while i < pgrCallFrom.length {
+      if (r[pgrCallFrom[i]] ?? false) && !(r[pgrCallTo[i]] ?? false) {
+        r[pgrCallTo[i]] = true
+        grew = true
+      }
+      i = i + 1
+    }
+  }
+  r
+}
+
+// Whether type-parameter node `from` leads to `to` through recorded bindings.
+function pgrLeadsTo(from: string, to: string): boolean {
+  if from == to { return true }
+  const seen: {[string]: boolean} = Map()
+  const work: string[] = [from]
+  seen[from] = true
+  while work.length > 0 {
+    const at = work[work.length - 1]
+    work.pop()
+    let i = 0
+    while i < pgrEdgeFrom.length {
+      if pgrEdgeFrom[i] == at {
+        const nx = pgrEdgeTo[i]
+        if nx == to { return true }
+        if !(seen[nx] ?? false) {
+          seen[nx] = true
+          work.push(nx)
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The call sites to refuse, each with its sentence, written into `sites` and `msgs`: a growing
+// binding, in a reachable body, whose callee's parameter leads back to the one it grew.
+export function pgrRefusals(sites: i32[], msgs: string[]) {
+  if pgrEdgeFrom.length == 0 { return 0 }
+  const reach = pgrReachable()
+  let i = 0
+  while i < pgrEdgeFrom.length {
+    if (
+      pgrEdgeGrow[i]
+      && (reach[pgrEdgeCaller[i]] ?? false)
+      && !i32ListHas(sites, pgrEdgeSite[i])
+      && pgrLeadsTo(pgrEdgeTo[i], pgrEdgeFrom[i])
+    ) {
+      sites.push(pgrEdgeSite[i])
+      msgs.push(
+        "this call to `"
+          + pgrEdgeCallee[i]
+          + "` binds "
+          + pgrTpText(pgrEdgeToName[i])
+          + pgrGrewFrom(pgrEdgeFrom[i], pgrEdgeTo[i], pgrEdgeFromName[i])
+          + ", so every level of the recursion needs a new instance and there is no finite set of them to compile; recurse at the same type parameters",
+      )
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The sentence's middle: what the bound type is built from, and how the calls return to it.
+function pgrGrewFrom(from: string, to: string, fromName: string): string {
+  if from == to { return " to a type built from itself" }
+  " to a type built from "
+    + pgrTpText(fromName)
+    + ", and the calls lead back to bind "
+    + pgrTpText(fromName)
+    + " again"
+}
+
+// The graph node of type parameter `name` of the body owned by `owner`: an un-annotated
+// parameter's hole name already names its function, so it is its own key.
+function pgrKey(owner: string, name: string): string {
+  if name.length > 0 && name.charCodeAt(0) == 63 { return name }
+  owner + "|" + name
+}
+
+// How a sentence names type parameter `name`; a hole `?f.0` reads as an un-annotated parameter.
+function pgrTpText(name: string): string {
+  if name.length == 0 || name.charCodeAt(0) != 63 { return "`" + name + "`" }
+  let dot = name.length - 1
+  while dot > 1 && name.charCodeAt(dot) != 46 { dot = dot - 1 }
+  if dot <= 1 { return "an un-annotated parameter's type" }
+  "the type of an un-annotated parameter of `" + name.slice(1, dot) + "`"
+}
