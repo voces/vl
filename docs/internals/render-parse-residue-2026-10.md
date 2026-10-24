@@ -123,7 +123,7 @@ the slice retires.
 | A2 | emit_mono typed tests (landed: 7 retired, 1 to B, 1 left; the arrow test waits on one hole pin with no type) | 1 | 0 / 1 / 0 | 0 / 1 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 8 retired, 4 left; re-probed at c3b2de16e: `fieldElemHintOf` typed, the arm-shape walk differs at 221 reaches) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
-| A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
+| A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left, because a generic body's target has no row and no pinned type) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, then the 3 in `monoAnnHasTyParam`, 5 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted; `monoAnnHasTyParam` asks the annotation node) | 5 | 0 / 5 / 0 | 0 / 5 | `emit_base` |
 | C2 | instance cell signatures typed (landed: 2 retired, 3 left; the arrow tests wait on constructor producers that build signature text with no type, and the render is a synthesized TypeRef's name) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 10 retired, 6 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
@@ -261,10 +261,20 @@ What each slice changes:
   - The two closure-result walkers intern by spelling (`mvShapeOfMapName`, `ensureRefElem`),
     and a closure position inside one TypeRef has no node, so a typed walk would need a render
     to rebuild the key. They wait on D8's mv slot and D1's ref-list slot keyed by type.
-  - `monoStaticIsResult`'s typed compare answers differently in 2 files. Re-probed after C1
-    step 3: the spelling compare was reached in 58 files and was never true.
-  - `atomsHaveValueAtom` (`unionHasValueAtom`'s parse of the row's atoms) in `emit_base`.
-    `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` are deleted. Their callers went over in
+  - `monoStaticIsResult`'s typed compare answers differently in 2 files. The spelling compare
+    is reached in 59 files and is never true there, but it is live for an alias of a
+    primitive (`type N = i32` at an `i32` pin). Both differing files test a record that is
+    structurally equal to the pin's but declared under another name (D3870), and only the
+    spelling carries that name. Skipping records loses `x is P` at a `P` pin, and
+    `structNameOfTy` still differs in 1 file.
+  - `atomsHaveValueAtom` (`unionHasValueAtom`'s parse of the row's atoms) in `emit_base`. A
+    gate on the target's member set agreed in all 3,310 files that reach it, and difftree
+    `--identity` found 0 files differ. D3618's filed witness reaches it inside a generic body,
+    where the target `boolean|string` has no row and its arena type is the unsubstituted
+    `A | B | null`. Neither answers, and a false answer turned the trap into invalid wasm. It
+    waits on the pin-substituted target type (C1).
+
+  `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` are deleted. Their callers went over in
     steps, each probed old against new over `tests/**`, the distilled corpus and the
     self-compile:
     - The inferred return reads `inferRetTyIxOf`, and the `(A | B)[]` binding reads its

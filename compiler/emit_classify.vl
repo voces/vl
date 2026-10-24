@@ -63,6 +63,7 @@ import {
   memberCallRungOf,
   nodeAt,
   nodeChildren,
+  nodeChildrenPush,
   nodeSpineChildren,
   spreadArgOf,
   stmtAlwaysExits,
@@ -17849,6 +17850,11 @@ function rsElemListDestSlotGo(letIx: i32, fnIx: i32, own: i32): i32 {
 // its function, and each function's nested ones. `rsDoneLet` is 1 at a binding already asked;
 // `rsMemoTouched` and `rsRetTouched` name the per-binding and per-function entries written.
 let rsIxRoot: i32 = -1
+// The walk's identifiers and their names in visit order; `rsOccEnsure` links the chains from
+// them at the first query, so an index no query reads costs only its walk.
+let rsIdents: i32[] = []
+let rsIdentNames: string[] = []
+let rsOccReady = false
 let rsIxLen: i32 = -1
 let rsIxEpoch: i32 = -1
 let rsMemoTouched: i32[] = []
@@ -17871,6 +17877,9 @@ let rsRetSeenL: i32[] = []
 // Drops the use index, beside the global-destination index it mirrors.
 export function rsResetUseIx() {
   rsIxRoot = -1
+  rsIdents = []
+  rsIdentNames = []
+  rsOccReady = false
   rsIxLen = -1
   rsIxEpoch = -1
   rsMemoTouched = []
@@ -17907,26 +17916,28 @@ function rsIxReady(): boolean {
   }
   rsResetUseIx()
   const n = P.nodes.length
-  let i = 0
-  while i < n {
-    rsPar.push(-1)
-    rsFrame.push(-1)
-    rsOccNext.push(-1)
-    rsFnOccNext.push(-1)
-    rsFnKidHead.push(-1)
-    rsFnKidNext.push(-1)
-    rsDoneLet.push(0)
-    rsLetDst.push(-2)
-    rsRetSeenE.push(-1)
-    rsRetSeenL.push(-1)
-    i = i + 1
-  }
+  rsPar = __array_new__(n, -1)
+  rsFrame = __array_new__(n, -1)
+  rsOccNext = __array_new__(n, -1)
+  rsFnOccNext = __array_new__(n, -1)
+  rsFnKidHead = __array_new__(n, -1)
+  rsFnKidNext = __array_new__(n, -1)
+  rsDoneLet = __array_new__(n, 0)
+  rsLetDst = __array_new__(n, -2)
+  rsRetSeenE = __array_new__(n, -1)
+  rsRetSeenL = __array_new__(n, -1)
   const stack: i32[] = [emitRootIx]
+  const kids: i32[] = []
   while stack.length > 0 {
     const x = stack.pop() ?? -1
+    const nx = nodeAt(x)
     let inner = rsFrame[x]
-    if nodeAt(x) is FuncDecl { inner = x }
-    const kids = nodeChildren(x)
+    if nx is FuncDecl { inner = x }
+    if nx is Ident {
+      rsIdents.push(x)
+      rsIdentNames.push(nx.identName)
+    }
+    nodeChildrenPush(x, kids)
     let k = 0
     while k < kids.length {
       const c = kids[k]
@@ -17935,7 +17946,7 @@ function rsIxReady(): boolean {
           rsPar[c] = x
           rsFrame[c] = inner
           stack.push(c)
-          if nodeAt(c) is FuncDecl && inner >= 0 {
+          if inner >= 0 && nodeAt(c) is FuncDecl {
             rsFnKidNext[c] = rsFnKidHead[inner]
             rsFnKidHead[inner] = c
           }
@@ -17943,19 +17954,30 @@ function rsIxReady(): boolean {
       }
       k = k + 1
     }
-    const nd = nodeAt(x)
-    if nd is Ident {
-      rsOccNext[x] = rsOccHead[nd.identName] ?? -1
-      rsOccHead[nd.identName] = x
-      const key = rsFnKey(nd.identName, rsFrame[x])
-      rsFnOccNext[x] = rsFnOccHead[key] ?? -1
-      rsFnOccHead[key] = x
-    }
+    while kids.length > 0 { kids.pop() }
   }
   rsIxRoot = emitRootIx
   rsIxLen = n
   rsIxEpoch = arenaEpochNow()
   true
+}
+
+// Links the identifier chains over `rsIdents`, in the walk's order, once per index.
+function rsOccEnsure() {
+  if rsOccReady { return 0 }
+  rsOccReady = true
+  let i = 0
+  while i < rsIdents.length {
+    const x = rsIdents[i]
+    const nm = rsIdentNames[i]
+    rsOccNext[x] = rsOccHead[nm] ?? -1
+    rsOccHead[nm] = x
+    const key = rsFnKey(nm, rsFrame[x])
+    rsFnOccNext[x] = rsFnOccHead[key] ?? -1
+    rsFnOccHead[key] = x
+    i = i + 1
+  }
+  0
 }
 
 // Extend the index over an arena that only grew (D3740): with no slot rewritten, no node the root
@@ -18015,6 +18037,7 @@ function rsQuery(w: RsWalk): i32 {
 // one reads the program's.
 function rsUsesOf(w: RsWalk, depth: i32): i32 {
   if depth > 32 { return -1 }
+  rsOccEnsure()
   if w.rwScope < 0 || w.rwScope >= rsFrame.length { return -1 }
   let home = rsFrame[w.rwScope]
   if nodeAt(w.rwScope) is FuncDecl { home = w.rwScope }
