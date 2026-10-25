@@ -1079,7 +1079,9 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   retires the `done()` wart — `beforeEach(() => { hits = hits + 1 })` failing
   with `expected () => void, got () => i32` — without disturbing the
   assignment-is-an-expression rule below, which is what produces the `i32`.
-  (#1435, ROADMAP `:746`)
+  (#1435, ROADMAP `:746`) (d) covers every written annotation, a result
+  annotation included: a written `T | void` parameter, binding, field or result
+  is refused, pointing to `T | null` (owner, 2026-10-24, D12467).
 
 - **Variance and exactness: inferred, with no annotation surface in v1.**
   Parameters are Inexact by default and values Exact (A8); `Readable`/

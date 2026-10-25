@@ -10,15 +10,19 @@ import {
   FieldInit,
   FuncDecl,
   Ident,
+  LetDecl,
   ObjLit,
   P,
+  Param,
   Spread,
   nodeAt,
+  nodeChildrenPush,
 } from "./ast"
 import { ctnLitInitOf } from "./check_ctn_lit_bind"
+import { a20RetWalk } from "./check_nj_gate"
 import { nodeTyIxOf, nodeTyOf } from "./check_node_tys"
 import { parenPeelIx } from "./check_places"
-import { lookupFnDeclNode } from "./check_scopes"
+import { lookupDepth, lookupFnDeclNode } from "./check_scopes"
 import { tyHasTyVar } from "./tyquery"
 import { T, TyFunc, tyAt, tyContainsList } from "./check_types"
 import {
@@ -231,12 +235,69 @@ function callResultIsInferred(ix: i32): boolean {
       if fd >= 0 {
         const f = nodeAt(fd)
         if f is FuncDecl {
-          if f.fnRet < 0 { return true }
+          if f.fnRet < 0 { return !noRetFnRelaysList(fd, e) }
           if f.fnTyParams.length > 0 && fnDeclRetHasTyVar(fd) {
             return !callPassesList(e)
           }
         }
       }
+    }
+  }
+  false
+}
+
+// Whether the function at `fd`, which declares no result, hands call `c` back an existing list:
+// some value it returns names a parameter `c` passes a list to, or a module-level binding that
+// is not a literal `const` (D2194). A name its body declares is judged as inferred.
+export function noRetFnRelaysList(fd: i32, c: Call): boolean {
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || lookupDepth(f.fnName) != 0 { return false }
+  const vals: i32[] = []
+  a20RetWalk(f.fnBody, true, vals)
+  for v in vals {
+    const x = nodeAt(parenPeelIx(v))
+    if x is Ident {
+      const nm = x.identName
+      if fnParamNamed(f.fnParams, nm) {
+        if callPassesList(c) { return true }
+      } else if (
+        !subtreeDeclares(f.fnBody, nm)
+        && lookupDepth(nm) == 0
+        && ctnLitInitOf(nm) < 0
+      ) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Whether a parameter in `params` is named `nm`.
+function fnParamNamed(params: i32[], nm: string): boolean {
+  for p in params {
+    const pn = nodeAt(p)
+    if pn is Param {
+      if pn.parName == nm { return true }
+    }
+  }
+  false
+}
+
+// Whether a `let`, `const`, function or parameter under `ix` declares `nm`.
+function subtreeDeclares(ix: i32, nm: string): boolean {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = todo.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = nodeAt(at)
+      if n is LetDecl {
+        if n.letName == nm { return true }
+      } else if n is FuncDecl {
+        if n.fnName == nm { return true }
+      } else if n is Param {
+        if n.parName == nm { return true }
+      }
+      nodeChildrenPush(at, todo)
     }
   }
   false
