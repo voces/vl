@@ -1594,6 +1594,34 @@ What each slice changes:
       fallback's real leaf). Until all seven agree, `arrRefSlotOf` keeps the name, and the
       `let` tail and `refListSlotOfExpr` have more disagreements than it does. The census and
       the render-parse budget do not move.
+  - L2 stage 8 moves `arrRefSlotOf` onto the typed row (`arrLitRowSlotIn`), and its by-name
+    pick is deleted. The typed side is stage 7's plus one rule for each class:
+    - Delivery rows: the element's committed annotation (`arrLitCommitAnn`, recorded beside
+      `arrLitCommitName` by `scanArrLitCommit`, D163), then the nominal row the name arm used
+      (`arrLitNominalRowTy`, the type half of `shapeNominalOfTy`).
+    - Nested lists: the literal's own element type in its frame (`nodeTyInOf`) when the lead
+      is a list.
+    - `Set` elements: the boolean-valued map twin a set list is minted under.
+    - Literal and generic signatures: each parameter softened to its scalar, and the result
+      softened unless it is a literal-union alias (the rule `tyNameFunc` spells). A list of
+      number literals is the list of their scalar.
+    - Tagged union with `null`, and a recursive `(f64|K[])[]`: when no row is keyed like the
+      type, the first row whose element is the same type (`tySame`) or renders as it (`tyEq`;
+      a literal is its own arena entry, so `tySame` alone missed the row).
+    The probe over the 1,403 reaching files then differs in 3 files (3 events), with 0 that
+    have no type:
+    - `d362al_isect_unionmem` and `d362in_isect_unionmem`: two `AB` rows, one minted under
+      the intersection's one-member union and one under the struct's own record. The name
+      picks the first, the type picks the record's.
+    - `callback-pin-nested-record-list`: `[[a]]` with `a: A` takes `A[]`, where the name took
+      the same-shaped `{x:i32}[]`.
+    All three print what master prints, and the built modules are byte-identical.
+    - The `let` tail and `refListSlotOfExpr` stay on the name. Their sites are in
+      `emit_classify`, which `emit_value_sites` imports, so the typed lookup cannot be
+      reached from there without moving it below the core.
+    - difftree `--identity`: 0 of 16,687 files differ (11,795 built), and the fixpoint
+      identity holds. The census and the render-parse budget do not move (53 renders, 86
+      parses), since the deleted pick parsed no spelling the census counts.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
