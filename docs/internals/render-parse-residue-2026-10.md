@@ -213,7 +213,7 @@ the slice retires.
 | D5 | union registry by type (step 5 remainder) (landed: 18 retired, 3 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; re-probed at 84b98d149, none retired; at 2aef21b94 the D4930 alias `shareFieldUnionRow` is deleted, since no reach file needs the alias or its row; the `recordUnMemTys` fallback rows carry a type that loses a member or unrolls a cycle, and the `unionSetAtomsOf` and `unionSetMemberCount` splits are reached by callers with no type; probed per caller at b66b5b5f8: no count from the caller's type matches the spelling count, because one alias type is spelled by name at one call and expanded at another, so none retired) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired; at 84b98d149 the typed-beside legs of `mvValNamesCompat` are reached by no event) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
-| D8 | mv, closure-sig and field-companion slots by type (landed: 16 retired, 1 left and 2 reclassified C; the parameter signature token asks the arena type, probed over the self-compile and 16,798 files at 19,750 events with 0 differing; the result token and a value call's union name ask the arena type and the render is deleted; the mv arm signature and arm hint ask the value type, the arm mint's literal-union field asks the field's type, and the map annotation shape names its value by type; the mv mint and find both key by the value type's declared name, and the mint key asks the held map type at every caller, the annotation sites and union arms included, and a value the arena cannot name (an unbound type parameter) has no slot; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149 and re-probed since: the field companion's render is the name its readers rebuild the box under, and no typed name agrees with it) | 19 | 0 / 6 / 13 | 4 / 15 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
+| D8 | mv, closure-sig and field-companion slots by type (landed: 17 retired, 0 left and 2 reclassified C; the parameter signature token asks the arena type, probed over the self-compile and 16,798 files at 19,750 events with 0 differing; the result token and a value call's union name ask the arena type and the render is deleted; the mv arm signature and arm hint ask the value type, the arm mint's literal-union field asks the field's type, and the map annotation shape names its value by type; the mv mint and find both key by the value type's declared name, and the mint key asks the held map type at every caller, the annotation sites and union arms included, and a value the arena cannot name (an unbound type parameter) has no slot; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; a member read's narrowed field box asks the field's arena type and the stored companion's, and its render is deleted) | 19 | 0 / 6 / 13 | 4 / 15 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
 slice that retires them in the same change. For example, A3's one C entry is a rung of the same
@@ -2207,7 +2207,8 @@ What each slice changes:
       `unionHasValueAtom`. Per site, these are the call sites where a set with no row is split
       most often:
       - `unionSetAtomsOf`:
-        - `memReadBoxNames` (`emit_classify`): 22,705 events in 428 files.
+        - `memReadBoxNames` (`emit_classify`): 22,705 events in 428 files. Since replaced by
+          `memReadBoxPlan`, which splits both types by `canonUnionMembersInto`.
         - `unionSetAtomsOfTy`'s last rung: 5,008 events in 1,078 files.
         - The `emit_mono` pin readers at four sites: 1,928, 1,287, 1,286 and 1,000 events.
           These are in L1's file.
@@ -2224,7 +2225,8 @@ What each slice changes:
       hold a type: `memReadBoxNames` for its own field (`own`, the 22,705 events), and also
       `canonAtomsOfTy`, `mvCanonValNameTy`, `unionSetAtomsOfTy` and `internShapeDeepTyGo`. Neither
       function retires until the readers with only a spelling ask by type too. Those are
-      `memReadBoxNames` for its stored field (`phys`), `narrowSlotAtomsInto`,
+      `narrowSlotAtomsInto` (`memReadBoxNames`, which split its stored field too, now asks
+      the stored companion's type),
       `unionMemberCountOfName`, `nameIsRefArrayGo` and the `emit_mono` pin readers.
   - Probed `unionSetMemberCount` per caller at `b66b5b5f8` (#4777's head), over the self-compile
     and 16,781 files, none retired. At every call the probe compared the spelling count with
@@ -2541,9 +2543,12 @@ What each slice changes:
     literal-union field type, and it answered `""` every time. The self-compile does not reach
     it. difftree `--identity` against `34f51ca46`: the fixpoint identity holds, and of
     16,534 files (11,684 built) 0 differ and 0 are uncompared.
-  - Left: the field companion. `sFieldElemTyIx` already banks its type, but the readers key by
-    the name. `memReadBoxNames` is reached in 1,089, and its render is not the member-set text in 421.
-    Comparing member-set ids there decides differently in 166.
+  - Done: the field companion. `memReadBoxNames` is replaced by `memReadBoxPlan`, which
+    splits the field's own type and the stored companion's type (`sFieldElemTyIxAt`) into
+    canonical members (`canonUnionMembersInto`) and returns the own type when the box is
+    rebuilt. `emitMem` retags by the two types, and `memReadBoxNarrowName` spells the own
+    type by `unionSpellingOfTy` for the `??` arm and `memberUnionFieldNameRead`. See the
+    stage entry below for the probe.
   - Left: `annRefListSlot`. `rlSlotOfTy` misses the slot the spelling finds in 72 files at the
     parameter call and 6 at the result call: nested ref lists, lists of map-valued records, and
     inline records the spelling adopts. That waits on D1.
@@ -2672,6 +2677,26 @@ What each slice changes:
     the render at 2,244, and the name of the row the field type keys agrees at 422 (8 files).
     Both decline a union with a record, closure or list member, and both decline a field whose
     type is no union.
+  - Retired: `memReadBoxNames` (ledger 52). The re-probe above counted the wrong population.
+    Of the 28,450 reads where the render differs from the stored companion, the name reaches a
+    reader only when the read rebuilds the box (the plan answers 1) or refuses it as ambiguous
+    (2). Probed over the self-compile and 16,805 files, 0 uncompared:
+
+    | probe | files | events agree | differ |
+    | --- | --- | --- | --- |
+    | the decision with the own side typed | 676 | 28,450 | 0 |
+    | the decision with both sides typed | 676 | 28,450 | 0 |
+    | the name by `unionSpellingOfTy`, where it reaches a reader | 3 | 276 | 0 |
+    | the name by member set, there | 3 | 276 | 0 |
+    | the name of the row the type keys, there | 3 | 276 | 0 |
+    | the read type is the own field type, there | 3 | 276 | 0 |
+    | the stored side by `unionSpellingOfTy`, there | 3 | 276 | 0 |
+
+    The three files are the D3006 fixtures under `tests/cases/objects/`. The decision splits
+    both types by `canonUnionMembersInto`; `emitMem` retags by the two types, and the `??`
+    arm keeps the name-based retag over the typed spelling, because its stored side can be a
+    variant field with no struct type. difftree `--identity`: the fixpoint identity holds, and
+    of 16,693 files (11,801 built) 0 differ and 0 are uncompared.
   - Left, not probed: the products. These are the signature-ladder
     renders, `cloArmTagOfTy`'s render, which the link
     step reads as the `clo:` key. The mv slot stays keyed by spelling,
@@ -2806,7 +2831,9 @@ What each slice changes:
 
     Re-checked at `84b98d149`, none retired: `memReadBoxNames`'s render is also the name
     `memReadBoxNarrowName` hands its three readers, which rebuild the box under it, so a
-    member-set compare by `msSetOfTy` would still leave the render in place.
+    member-set compare by `msSetOfTy` would still leave the render in place. Since retired:
+    the readers take the own field type, or its typed spelling, which agrees wherever the
+    name reaches one.
 
 **Order.** The five A slices and C4 can start today. C1 waits on L1's bind columns. D1 and D2
 come before C3, because C3's walkers feed the ref-list slots. D3 and D4 share the pin seam, and D4 lands after D3 and D5.
