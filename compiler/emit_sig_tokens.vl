@@ -23,8 +23,9 @@ import {
   nodeTyIxOf,
   tyIsNulI32List,
 } from "./check_node_tys"
-import { MAP_KEY_I32, MAP_KEY_STR } from "./check_ty_rep"
+import { MAP_KEY_I32, MAP_KEY_STR, mapKeyKindOfTy } from "./check_ty_rep"
 import {
+  PrimName,
   T,
   TY_I32,
   TY_NEVER,
@@ -41,6 +42,8 @@ import {
   TyUnion,
   TyVar,
   litUnionAliasNameOfTy,
+  litUnionInlineNameOfTy,
+  oneStrLitSpelling,
   structNameOfTy,
   tyArrayElemIx,
   tyAt,
@@ -48,13 +51,19 @@ import {
   tyEmitNameKey,
   tyEmitNameNonEmpty,
   tyEq,
+  tyEqSoftLits,
   tyIsLitUnion,
   tyIsNullableLitUnion,
   tyReachesSelf,
   tySame,
   tyToEmitName,
 } from "./check_types"
-import { sFieldTypeAt, sScanLim, structIndexByName } from "./emit_atom_kinds"
+import {
+  sFieldTypeAt,
+  sScanLim,
+  structIndexByName,
+  structRowRecordingTy,
+} from "./emit_atom_kinds"
 import {
   PL_READ_UNPLACED,
   annFnDecompose,
@@ -109,6 +118,7 @@ import {
   anonLeafParamRowOf,
   nulBaseStructRow,
   nulScalarListCodeKind,
+  nulScalarListKindOfTy,
   retStructRowIndex,
   retVariantFlag,
 } from "./emit_nullable_rets"
@@ -122,11 +132,14 @@ import {
   repSigTokHasSlot,
   repSigTokOfKind,
   repSlotOfTy,
+  unRowOfKey,
   unRowOfKeyId,
 } from "./emit_rep"
 import {
   deepDeclRecName,
   fnElemNominalName,
+  joinRowScanOfTyMemo,
+  mvSlotOfMapKeyKTys,
   mvSlotOfMapNameTys,
   nulScalarListKind,
   repSigNulVariantTok,
@@ -163,6 +176,8 @@ import {
   sFieldNames,
   sFieldStart,
   sNames,
+  sTyIx,
+  uVarTyIx,
   uVariants,
   unTyIx,
 } from "./emit_state"
@@ -185,12 +200,27 @@ import {
 import {
   isUNameDeclAB,
   softKeyOrNameKey,
+  softUnionKeyTextOfTyIn,
   unionMemberSetOf,
 } from "./emit_union_registry"
 import { strListHas } from "./listutil"
 import { strContains } from "./strutil"
 import { mapSpellKeyEnd, mapSpellKeyName } from "./tyname"
-import { flattenVariantsInto, tyMapValOfHeld, tyPeelNul } from "./tyquery"
+import {
+  flattenVariantsInto,
+  isNullTy,
+  nonNullTy,
+  tyEmitElemNulPrimOf,
+  tyEmitElemPrimOf,
+  tyEmitPrimOf,
+  tyIsArray,
+  tyMapValOfHeld,
+  tyPeelNul,
+  tyStepElem,
+} from "./tyquery"
+import { canonUnionKeyOfName, canonUnionKeyOfText } from "./check_nj_join"
+import { nameIsWholeSpanShape } from "./emit_field_codes"
+import { tyReachesFuncD } from "./emit_obj_lit_fits"
 
 // The niche twin of `mvListValKind` — the nullable `VKind` a `{[K]: T[] | null}` value binds,
 // or null when the value is not a list. Composed on `mvListValKind` so the element-kind to rep
@@ -971,9 +1001,8 @@ export function sigParamTokOfTy(pty: i32): string {
   }
   if sigUnionParamIsBox(pty) { return repSigTokOfKind("union") }
   if sigTyIsNulFunc(pty) { return repSigTokOfKind("nulclosure") }
-  const pnm = tyToEmitName(pty)
-  if pnm == "" { return "" }
-  const pk = annParamKindTy(pnm, pty)
+  if !annTyHasName(pty) { return "" }
+  const pk = annParamKindOfTy(pty)
   if pk != "" { return pk }
   sigRepTokOfTy(pty)
 }
@@ -1906,4 +1935,280 @@ function annIsSpelledInlineShape(ix: i32, nm: string): boolean {
   const root = annTsOf(ix)
   if root >= 0 { return tsKind[root] == TS_OBJ }
   nameIsShapeSpanEnds(nm)
+}
+
+// Whether `ty` has an emit render: false where `tyToEmitName` spells "".
+function annTyHasName(ty: i32): boolean {
+  if ty < 0 { return false }
+  tyEmitNameNonEmpty(ty) != 0
+}
+
+// `annParamKindTy` asked of the arena type `ty` alone, rung for rung.
+function annParamKindOfTy(ty0: i32): string {
+  const p = tyEmitPrimOf(ty0)
+  if p == "i32" || p == "boolean" { return repSigTokOfKind("i32") }
+  if p == "f64" { return repSigTokOfKind("f64") }
+  if p == "i64" { return repSigTokOfKind("i64") }
+  if p == "f32" { return repSigTokOfKind("f32") }
+  if p == "v128" { return repSigTokOfKind("v128") }
+  if annTyIsLitUnion(ty0) { return repSigTokOfKind("i32") }
+  if annTyHasUnionRow(ty0) { return repSigTokOfKind("union") }
+  if p == "string" { return repSigTokOfKind("str") }
+  const ty = annTwinCollapse(ty0)
+  if ty < 0 { return "" }
+  // A union of twin records keys the row its shared shape names, else its own box.
+  if ty != ty0 && !tyIsArray(ty0) && unRowOfKey(ty0) >= 0 {
+    const tsi = annStructRowByShape(ty)
+    if tsi >= 0 { return repSigSlotTokOfKind("struct", tsi) }
+    const tvi = annVariantRowByShape(ty)
+    if tvi >= 0 { return repSigVariantTok(tvi) }
+    return repSigTokOfKind("union")
+  }
+  const sk = annScalarListRepOfTy(ty)
+  if sk != null { return repSigTokOfKind(sk) }
+  const nsk = annNulListKindOfTy(ty)
+  if nsk != null { return repSigTokOfKind(nsk) }
+  const si = annStructRowOfTy(ty)
+  if si >= 0 { return repSigSlotTokOfKind("struct", si) }
+  const vti = annVariantRowOfTy(ty)
+  if vti >= 0 { return repSigVariantTok(vti) }
+  const rs = annRefListSlot(ty)
+  if rs >= 0 { return repSigSlotTokOfKind("reflist", rs) }
+  const mt = tyAt(ty)
+  if mt is TyMap {
+    return repSigSlotTokOfKind(
+      "map",
+      mvSlotOfMapKeyKTys(mapKeyKindOfTy(mt.mKey), -1, mt.mVal),
+    )
+  }
+  if mt is TyFunc { return repSigTokOfKind("closure") }
+  const uslot: i32[] = [-1]
+  const uk = annUnionSigKindOfTy(ty, uslot)
+  if repSigTokHasSlot(uk) { return repSigSlotTokOfKind(uk, uslot[0]) }
+  if uk != null { return repSigTokOfKind(uk) }
+  ""
+}
+
+// Whether a registered union row carries `ty`'s softened key, or, for a primitive with none, its
+// primitive name's key.
+function annTyHasUnionRow(ty: i32): boolean {
+  let k = canonUnionKeyOfText(softUnionKeyTextOfTyIn(ty, []))
+  if k < 0 {
+    const p = tyEmitPrimOf(ty)
+    if p != null { k = canonUnionKeyOfName(p) }
+  }
+  k >= 0 && unRowOfKeyId(k) >= 0
+}
+
+// The first struct row named by a record shape whose recorded type is structurally `ty`, the
+// row a lookup by `ty`'s structural spelling finds; -1 for none or a non-record.
+function annStructRowByShape(ty: i32): i32 { annShapeRowMemo(ty, 0) }
+
+// The variant row a lookup by `ty`'s structural spelling finds (the first row named by a record
+// shape whose arm type is structurally `ty`), else `ty`'s own arm row; -1 for none.
+function annVariantRowOfTy(ty: i32): i32 {
+  const shp = annVariantRowByShape(ty)
+  if shp >= 0 { return shp }
+  variantRowOfTy(ty)
+}
+
+// The first variant row named by a record shape whose arm type is structurally `ty`; -1 for none
+// or a non-record.
+function annVariantRowByShape(ty: i32): i32 { annShapeRowMemo(ty, 1) }
+
+// `annShapeRowGo` over the struct (`tbl` 0) or variant (1) table, each answer stamped by the
+// `tyRegGenNow` read before computing it.
+function annShapeRowMemo(ty: i32, tbl: i32): i32 {
+  if ty < 0 || !(tyAt(ty) is TyObj) { return -1 }
+  const slot = ty * 2 + tbl
+  const gen = tyRegGenNow()
+  if slot < asrGen.length && asrGen[slot] == gen { return asrRow[slot] }
+  const r = annShapeRowGo(ty, tbl)
+  if tyRegGenNow() == gen {
+    while asrGen.length <= slot {
+      asrGen.push(-1)
+      asrRow.push(-1)
+    }
+    asrGen[slot] = gen
+    asrRow[slot] = r
+  }
+  r
+}
+
+const asrGen: i32[] = []
+const asrRow: i32[] = []
+
+// The first row of table `tbl` (0 structs, 1 variants) named by a whole record shape whose type
+// is `ty` up to lone literals, as a lookup by `ty`'s spelling finds it; -1 for none.
+function annShapeRowGo(ty: i32, tbl: i32): i32 {
+  let lim = sNames.length
+  if lim > sTyIx.length { lim = sTyIx.length }
+  if tbl == 1 {
+    lim = uVariants.length
+    if lim > uVarTyIx.length { lim = uVarTyIx.length }
+  }
+  let i = 0
+  while i < lim {
+    let rt = -1
+    let nm = ""
+    if tbl == 0 {
+      rt = sTyIx[i]
+      nm = sNames[i]
+    } else {
+      rt = uVarTyIx[i]
+      nm = uVariants[i]
+    }
+    if (
+      rt >= 0
+      && tyAt(rt) is TyObj
+      && nameIsWholeSpanShape(nm)
+      && tyEqSoftLits(rt, ty)
+    ) {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The one member a union denotes where its render spells one type: a list union's member with
+// a primitive element (`i32[] | K[]` is `i32[]`), or the first of members all structurally equal.
+// Any other `ty` is itself.
+function annTwinCollapse(ty: i32): i32 {
+  if ty < 0 { return ty }
+  const t = tyAt(ty)
+  if !(t is TyUnion) || t.uMembers.length == 0 { return ty }
+  const m0 = t.uMembers[0]
+  if tyIsArray(ty) {
+    for m in t.uMembers {
+      const el = tyStepElem(m)
+      if el >= 0 && tyAt(el) is TyPrim { return m }
+    }
+    return m0
+  }
+  for m in t.uMembers {
+    if !tyEq(m, m0) { return ty }
+  }
+  m0
+}
+
+// The scalar-element list rep list `ty` rides, as `scalarListRepOfName` reads its render.
+function annScalarListRepOfTy(ty: i32): VKind | null {
+  if !tyIsArray(ty) { return null }
+  const el = tyStepElem(ty)
+  if el < 0 { return null }
+  if (
+    litUnionAliasNameOfTy(el) != ""
+    || litUnionInlineNameOfTy(el) != ""
+    || oneStrLitSpelling(el) != ""
+    || tyIsNullableLitUnion(el)
+  ) {
+    return "list"
+  }
+  const p = tyEmitElemPrimOf(ty)
+  if p == "u8" { return "u8list" }
+  if p == "i32" || p == "boolean" || p == "null" { return "list" }
+  if p == "string" { return "strlist" }
+  if p == "f64" { return "f64list" }
+  if p == "i64" { return "i64list" }
+  if p == "f32" { return "f32list" }
+  if tyEmitElemNulPrimOf(ty, "boolean") != 0 { return "list" }
+  if tyEmitElemNulPrimOf(ty, "string") != 0 { return "strlist" }
+  null
+}
+
+// `annNulListKind` asked of `ty` alone.
+function annNulListKindOfTy(ty: i32): VKind | null {
+  if tyIsNulI32List(ty) { return "nullist" }
+  const inner = nonNullTy(ty)
+  if inner < 0 || inner == ty { return null }
+  nulScalarListKindOfTy(inner)
+}
+
+// The struct row a non-nullable record `ty` keys: a shape-named row of its type, its own row, its
+// declared name's row, then its rep slot and, undeclared, the field-set scan; -1 for none.
+function annStructRowOfTy(ty: i32): i32 {
+  if ty < 0 || tyAt(ty) is TyNullable { return -1 }
+  const shp = annStructRowByShape(ty)
+  if shp >= 0 { return shp }
+  const own = structRowRecordingTy(ty)
+  if own >= 0 { return own }
+  if !(tyAt(ty) is TyObj) { return -1 }
+  const dn = structNameOfTy(ty)
+  if dn != "" {
+    const dr = structIndexByName(dn)
+    if dr >= 0 { return dr }
+    return repRowOfTyStruct(ty, sScanLim())
+  }
+  const kr = repRowOfTyStruct(ty, sScanLim())
+  if kr >= 0 { return kr }
+  joinRowScanOfTyMemo(ty)
+}
+
+// The members of union or nullable `ty`, nested unions and nullables flattened.
+function annFlatMembers(ty: i32, out: i32[], nulOut: i32[], depth: i32) {
+  if ty < 0 || depth <= 0 { return }
+  const t = tyAt(ty)
+  if t is TyUnion {
+    for m in t.uMembers { annFlatMembers(m, out, nulOut, depth - 1) }
+    return
+  }
+  if t is TyNullable {
+    annFlatMembers(t.nInner, out, nulOut, depth - 1)
+    nulOut[0] = 1
+    return
+  }
+  if isNullTy(ty) {
+    nulOut[0] = 1
+    return
+  }
+  for m in out {
+    if tyEq(m, ty) { return }
+  }
+  out.push(ty)
+}
+
+// `annUnionSigKind` asked of `ty` alone.
+function annUnionSigKindOfTy(ty: i32, slotOut: i32[]): VKind | null {
+  const nonNull: i32[] = []
+  const nul: i32[] = [0]
+  annFlatMembers(ty, nonNull, nul, 8)
+  if nonNull.length >= 2 { return "union" }
+  if nul[0] == 0 || nonNull.length != 1 { return null }
+  const x = nonNull[0]
+  if annScalarListRepOfTy(x) == "list" { return "nullist" }
+  const nrs = annRefListSlot(x)
+  if nrs == -2 { return null }
+  if nrs >= 0 {
+    slotOut[0] = nrs
+    return "nulreflist"
+  }
+  const msi = annStructRowOfTy(x)
+  if msi >= 0 {
+    slotOut[0] = msi
+    return "nulstruct"
+  }
+  const mvi = annVariantRowOfTy(x)
+  if mvi >= 0 {
+    slotOut[0] = repVariantSlotRep(mvi)
+    return "nulvariant"
+  }
+  if tyReachesFuncD(x, 16) { return "nulclosure" }
+  annNulPrimSigKind(tyEmitPrimOf(x))
+}
+
+// The `$fnsig` kind of `p | null` for a primitive `p`: the string niche, the box for a numeric
+// scalar, else null (no primitive at all, or one outside the value-call ABI).
+function annNulPrimSigKind(p: PrimName | null): VKind | null {
+  if p == null { return null }
+  match p {
+    "string" => {
+      return "nulstr"
+    }
+    "i32" | "i64" | "f64" | "f32" | "v128" => {
+      return "union"
+    }
+    "boolean" | "void" | "null" | "never" | "u8" => {}
+  }
+  null
 }
