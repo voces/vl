@@ -442,10 +442,8 @@ import {
   declaredNulMap,
   declaredString,
   frameChainBindsName,
-  gatedListRep,
   isScalarBackedListRep,
   letMapKeyKind,
-  listRepOfMf,
   lrGen,
   lrMemoFn,
   lrMemoGen,
@@ -8234,8 +8232,9 @@ function pushDiscrimNarrow(
 ): boolean {
   const pn = nodeAt(placeIx)
   if !(pn is Member) { return false }
-  const root = nodeAt(unwrapParen(pn.memObj))
-  if !(root is Ident) { return false }
+  const objIx = unwrapParen(pn.memObj)
+  const key = discrimRecvKey(objIx, fnIx)
+  if key == "" { return false }
   let dTy = isParentTyIxOf(condIx)
   if elseArm { dTy = isParentElseTyIxOf(condIx) }
   if dTy < 0 { return false }
@@ -8254,11 +8253,7 @@ function pushDiscrimNarrow(
   // cast-failure trap: an arena type can carry more than one nominal name (an alias fold
   // can make two distinct unions structurally identical), so `nominalStructNameOfTy` can
   // answer a name from the wrong union, casting the box to the wrong variant heap type.
-  const setTxt = currentStructNarrowSetAt(
-    root.identName,
-    fnIx,
-    unwrapParen(pn.memObj),
-  )
+  const setTxt = discrimRecvSet(key, objIx, fnIx)
   if setTxt == "" { return false }
   const atoms: string[] = []
   unionSetAtomsOf(setTxt, atoms)
@@ -8269,8 +8264,27 @@ function pushDiscrimNarrow(
     ai = ai + 1
   }
   if !found { return false }
-  pushNarrowRep(root.identName, dNm, dTy, -1)
+  pushNarrowRep(key, dNm, dTy, -1)
   true
+}
+
+// The narrowing key of a discriminant test's receiver: a name, or a member path whose field
+// holds a union box (the key `narrowIsThen`'s member arm pushes), else "" (D12473).
+function discrimRecvKey(objIx: i32, fnIx: i32): string {
+  const r = nodeAt(objIx)
+  if r is Ident { return r.identName }
+  if memberUnionFieldNameRead(objIx, fnIx) == "" { return "" }
+  memberPathKeyOf(objIx)
+}
+
+// The member set receiver `key` (node `objIx`) holds now: its innermost narrowing, else its
+// declared union's full set. "" when it is not a union.
+function discrimRecvSet(key: string, objIx: i32, fnIx: i32): string {
+  const r = nodeAt(objIx)
+  if r is Ident { return currentStructNarrowSetAt(key, fnIx, objIx) }
+  const slot = narrowSlotOf(key)
+  if slot >= 0 { return narrowVariants[slot] }
+  unionMemberSetOf(memberUnionFieldNameRead(objIx, fnIx))
 }
 
 // The union a union-box list at slot `slot` holds when the list's own type is `listTy`. Slots
@@ -19390,13 +19404,13 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
     }
   }
   if valueUnionBoxList(exprIx, fnIx) { return "reflist" }
-  // The column answers every node it covers at a type an instance binds; the shape rungs
-  // below are asked only where it does not.
+  // The column answers every node it covers at a type an instance binds; at an open type it
+  // is asked again below, after the arena's own answer.
   const cd = listColumnDesc(exprIx, fnIx)
   if cd.rdCovered == 1 && listRepFamilyOf(exprIx, fnIx) != "" {
     return listOfColumn(cd)
   }
-  const s = syntacticListRep(exprIx, fnIx)
+  const s = columnListRepOfRead(exprIx, fnIx)
   match a {
     "f64list" => {
       if s != "f32list" { return a }
@@ -19404,7 +19418,7 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
     "list" => {
       if s == null { return a }
     }
-    // Every other arena answer is returned above; a null one takes the shape rung's.
+    // Every other arena answer is returned above; a null one takes the column's.
     "i32" | "struct" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {}
   }
   s
@@ -19478,59 +19492,20 @@ function tyMayInstUnion(raw: i32): boolean {
   }
 }
 
-// `exprListRep`'s answer from the expression's shape alone, for a node the column does not
-// cover or whose instance is still being chosen. Only an array literal has a shape rung; every
-// other list-bearing read, a name's and a field's included, reads the column.
-function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
+// `exprListRep`'s last rung: the column at the node, a grouped read's through its parens, for a
+// node the earlier rungs leave. Every list-bearing expression reads it, so a list rep is always
+// its type's; any other node has none.
+function columnListRepOfRead(exprIx: i32, fnIx: i32): VKind | null {
   const e = nodeAt(exprIx)
   match e {
-    ArrayLit => {
-      return arrLitListRep(exprIx, fnIx)
-    }
-    // A parenthesised read falls back to the column, as the rungs below do.
     Paren => {
       return exprListRep(e.parInner, fnIx) ?? columnListRep(exprIx, fnIx)
     }
-    Ident | Member => {
+    ArrayLit | Ident | Member | IfStmt | Call | Index | BinExpr | OptMember => {
       return columnListRep(exprIx, fnIx)
     }
-    // No other expression has a syntactic list rep.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
-  }
-  // An if-expression, call, index, operator or `?.` read has no shape rung: it reads the column.
-  if e is IfStmt || e is Call || e is Index || e is BinExpr || e is OptMember {
-    return columnListRep(exprIx, fnIx)
-  }
-  null
-}
-
-// The list rep an array literal builds: an element-pinned empty literal's hole, a spread's
-// source rep, then its elements' kind. Any other literal of non-ref elements is the i32 list.
-function arrLitListRep(exprIx: i32, fnIx: i32): VKind | null {
-  const a = nodeAt(exprIx)
-  if a is ArrayLit {
-    const hk = gatedListRep(emptyArrHoleKind(exprIx), "empty-hole")
-    if hk != null { return hk }
-    // An empty literal has no element to classify, so its rep is the checked one at its
-    // instance: the destination's or the hole's, a ref list's included.
-    if a.arrElems.length == 0 {
-      const ck = columnListRep(exprIx, fnIx)
-      if ck != null { return ck }
-    }
-    if hasSpreadItem(a.arrElems) {
-      const sk = listRepOfMf(spreadDestKind(exprIx, fnIx))
-      const gk = gatedListRep(sk, "spread")
-      if gk != null { return gk }
-      if arrLitIsRef(exprIx) { return "reflist" }
-      return null
-    }
-    if arrLitIsRef(exprIx) { return "reflist" }
-    if arrLitIsStr(exprIx, fnIx) { return "strlist" }
-    if arrLitIsF32(exprIx, fnIx) { return "f32list" }
-    const nk = arrLitNumKind(exprIx, fnIx)
-    if nk == ALK_I64 { return "i64list" }
-    if nk == ALK_F64 { return "f64list" }
-    return "list"
+    // Every other expression answers no list here.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   null
 }
