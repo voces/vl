@@ -118,7 +118,9 @@ the slices below record each retirement, the last two being row 280 (`forceCloRe
 `annArrowAt`, #4764) and `nulLitUnionInnerName`'s 2 parses (#4768). The second was in B, so the
 conditional key producers are now 3 renders and 10 parses, and the D1/D5/D8 stopping point is 23
 renders and 11 parses. D1's `rlMintNameOfTy` (#4772) and D5's `shareFieldUnionRow` (1 render
-each) have since retired, so the baseline reads **53 renders and 92 parses**.
+each) and D1's `rlSlotOfArrNameTy` (row 245, 1 parse, #4775) have since retired, so the baseline
+reads **53 renders and 91 parses** (`ea2c435a3`). `rlMintNameOfTy` was in B, so the conditional
+key producers are 2 renders and 10 parses and the stopping point is 22 renders and 11 parses.
 
 ### Per file
 
