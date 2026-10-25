@@ -6,6 +6,7 @@ import {
   ArrayLit,
   Block,
   Call,
+  ForIn,
   FuncDecl,
   Ident,
   Index,
@@ -52,6 +53,7 @@ import {
   holeFnArgUnionRetTy,
   holeLambdaDefers,
   holeLambdaSeedTy,
+  moveElemArgCstrs,
   validateArgCstrs,
   validateBmCstrs,
   validateLetCstrs,
@@ -377,6 +379,7 @@ import {
   fnDeclIx,
 } from "./check_write_scan"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import { identDeclOf } from "./symbols"
 import {
   isNullTy,
   isVoidTy,
@@ -1966,6 +1969,7 @@ function callFtyPinCstrs(
   validateNestCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
   validateIsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
   validateArgCstrs(vNames, vTys, ix, cstrCallee, dhNames, dhArgNode)
+  forElemArgCstrs(n.callFn, ft, vNames, vTys)
   // The declared return rides the same pin: the body's mismatch check is vacuous under
   // a hole, and this is the first position that knows the instance (D551).
   validateRetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
@@ -2851,6 +2855,45 @@ function checkOptCallNode(n: Call, ix: i32, cfn: OptMember): i32 {
   }
   noteOptCallRet(ix, rt, "")
   rt
+}
+
+// A call through a `for` variable `c` over a list literal is typed at one element's signature
+// `ft`: every other named element binds its own holes to what `ft`'s bind to at the same parameter
+// under `vNames`/`vTys`, and moves its demands out to the caller's holes (D12701).
+function forElemArgCstrs(c: i32, ft: TyFunc, vNames: string[], vTys: i32[]) {
+  const x = parenPeelIx(c)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return 0 }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const fi = nodeAt(d)
+  if !(fi is ForIn) { return 0 }
+  const lit = nodeAt(parenPeelIx(fi.fiIter))
+  if !(lit is ArrayLit) { return 0 }
+  for e in lit.arrElems {
+    const el = nodeAt(parenPeelIx(e))
+    const decl = if el is Ident { lookupFnDeclNode(el.identName) } else { -1 }
+    const t = if decl >= 0 { nodeTyOf(decl) } else { -1 }
+    const et = if t >= 0 && t < T.tys.length { tyAt(t) } else { tyAt(TY_ERR) }
+    if et is TyFunc && et.fnParamTypes.length == ft.fnParamTypes.length {
+      const bn: string[] = []
+      const bt: i32[] = []
+      let j = 0
+      while j < ft.fnParamTypes.length {
+        const p0 = tyAt(ft.fnParamTypes[j])
+        const pe = tyAt(et.fnParamTypes[j])
+        if p0 is TyVar && pe is TyVar && pe.tvName != p0.tvName {
+          const k = strListIndexOf(vNames, p0.tvName)
+          if k >= 0 {
+            bn.push(pe.tvName)
+            bt.push(vTys[k])
+          }
+        }
+        j = j + 1
+      }
+      if bn.length > 0 { moveElemArgCstrs(bn, bt, decl) }
+    }
+  }
+  0
 }
 
 // The type of the function `xs[k]` names when `xs` is a literal `const` list, `k` an integer
