@@ -1676,9 +1676,9 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - `distilled/`: 89 of 10,395 differ, 87 a different module and 2 from rc 0 to rc 1.
     - The 136 `field access receiver is not a struct` failures of the first probe no longer reproduce. The traps and the new refusals do, so it is not landed and entries 173, 177, 178, 181 and 182 stay.
   - Checks:
-    - difftree `--identity` against master's seed (before the rebase onto 7555916e3): the fixpoint identity holds; of 16,569 files (11,694 built), 0 differ and 0 are uncompared.
+    - difftree `--identity` against master `7555916e3`'s seed: the fixpoint identity holds; of 16,575 files (11,700 built), 0 differ and 0 are uncompared.
     - Rep-fuzz is exact.
-    - Seed 5,819,973 → 5,820,563 bytes (+590).
+    - Seed 5,820,402 → 5,820,992 bytes (+590) against master `7555916e3`.
   - No `emit_mono.vl` or `check_*.vl` edit. Render-parse holds. None filed.
 
 ### L10 log
