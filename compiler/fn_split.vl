@@ -135,8 +135,9 @@ let pcwCallFn: string[] = []
 let pcwNames: string[][] = []
 let prIdent: i32[] = []
 let prName: string[] = []
-// Call `plCall` through the variable of `for` loop `plFor` calls the element of list copy
-// `plList` at the loop's index `plIdx` instead, naming the index when the loop does not (D10791).
+// Call `plCall` through the name element binder `plFor` binds (`fsElemBinder`) calls the element
+// of list copy `plList` at the binder's index `plIdx` instead, naming the index when the binder
+// does not (D10791, D12704).
 let plCall: i32[] = []
 let plFor: i32[] = []
 let plList: string[] = []
@@ -1918,7 +1919,7 @@ function fsPlanLists(): i32 {
           pmList.push(copy)
         }
       }
-      // A loop's variable called at this type reads the copy at the loop's index.
+      // A loop's variable or an element `const` called at this type reads the copy at its index.
       i = 0
       while i < fcCallee.length {
         const fr = fcRead[i]
@@ -1928,9 +1929,9 @@ function fsPlanLists(): i32 {
           && fsListBase(identDeclOf(fr)) == d
         ) {
           plCall.push(fsParent[fcCallee[i]])
-          plFor.push(fsParent[fr])
+          plFor.push(fsElemBinder(fr))
           plList.push(copy)
-          plIdx.push("i$l" + i32ToStr(fsParent[fr]))
+          plIdx.push("i$l" + i32ToStr(fsElemBinder(fr)))
         }
         i = i + 1
       }
@@ -1991,22 +1992,16 @@ function fsListReadKey(r: i32): string {
   ""
 }
 
-// Pushes onto `lanes` the types the calls through the variable of the `for` loop that iterates
-// list read `r` take, when `r` is that loop's iterable and every read of the variable is a call
-// in the loop's own function, each recorded one at one type (D10791, D12703).
+// Pushes onto `lanes` the types the calls through the name the element binder of list read `r`
+// binds take, when every read of the name is a call in the binder's own function, each recorded
+// one at one type (D10791, D12703, D12704).
 function fsLoopLanes(r: i32, lanes: string[]): boolean {
-  const p = fsParent[r]
+  const p = fsElemBinder(r)
   if p < 0 { return false }
-  const pn = nodeAt(p)
-  if !(pn is ForIn) || pn.fiIter != r { return false }
+  const nm = fsBinderName(p)
   for x in fsIdents {
     const xn = nodeAt(x)
-    if (
-      x != p
-      && identDeclOf(x) == p
-      && xn is Ident
-      && xn.identName == pn.fiVar
-    ) {
+    if (x != p && identDeclOf(x) == p && xn is Ident && xn.identName == nm) {
       const c = fsParent[x]
       if c < 0 || !fsCallsVia(c, x) { return false }
       let i = 0
@@ -2021,25 +2016,69 @@ function fsLoopLanes(r: i32, lanes: string[]): boolean {
   true
 }
 
-// Applies `plCall[i]`: its callee becomes `plList[i][plIdx[i]]`, and its loop names that index.
-// -1 when `i` is no planned lane, its nodes are not a call and a loop, or the loop names another
-// index.
+// Applies `plCall[i]`: its callee becomes `plList[i][plIdx[i]]`, and its binder names that index.
+// -1 when `i` is no planned lane, its nodes are not a call and a binder, or the index cannot be
+// named.
 function fsApplyLoopLane(i: i32): i32 {
-  if i < 0 || i >= plCall.length { return -1 }
+  if i < 0 || i >= plCall.length || plFor[i] < 0 { return -1 }
   const c = nodeAt(plCall[i])
   const l = nodeAt(plFor[i])
-  if !(c is Call) || !(l is ForIn) || c.callFn < 0 { return -1 }
+  if !(c is Call) || c.callFn < 0 { return -1 }
   P.pos = nodeToks[plCall[i]] + 1
   const pos = nodeAt(c.callFn).pos
-  if l.fiVar2 == "" { l.fiVar2 = plIdx[i] }
-  if (
-    l.fiVar2 != plIdx[i]
-    && fsLoopIndexCopy(l.fiBody, l.fiVar2, plIdx[i], pos) < 0
-  ) {
+  if l is ForIn {
+    if l.fiVar2 == "" { l.fiVar2 = plIdx[i] }
+    if (
+      l.fiVar2 != plIdx[i]
+      && fsLoopIndexCopy(l.fiBody, l.fiVar2, plIdx[i], pos) < 0
+    ) {
+      return -1
+    }
+  } else if fsBindIndexCopy(plFor[i], plIdx[i], pos) < 0 {
     return -1
   }
   c.callFn = mkIndex(mkIdent(plList[i], pos), mkIdent(plIdx[i], pos), pos)
   0
+}
+
+// Makes element `const` `d`, `const f = xs[e]`, read `xs[copy]` after a `const copy = e` before
+// it, so a lane reads the element the binding took; once per binding. -1 for another node.
+function fsBindIndexCopy(d: i32, copy: string, pos: i32): i32 {
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
+  const ix = nodeAt(dn.letInit)
+  if !(ix is Index) { return -1 }
+  const e = nodeAt(ix.idxIndex)
+  if e is Ident && e.identName == copy { return 0 }
+  const v = ix.idxIndex
+  ix.idxIndex = mkIdent(copy, pos)
+  fsInsertBefore(d, mkLet("const", copy, -1, v, pos))
+}
+
+// The element binder of list read `r`: the `for` loop iterating `r`, or the un-annotated `const`
+// an element read `r[e]` initializes; -1 for neither.
+function fsElemBinder(r: i32): i32 {
+  const p = if r >= 0 { fsParent[r] } else { -1 }
+  if p < 0 { return -1 }
+  const pn = nodeAt(p)
+  if pn is ForIn { return if pn.fiIter == r { p } else { -1 } }
+  if !(pn is Index) || pn.idxArr != r { return -1 }
+  const d = fsParent[p]
+  if d < 0 { return -1 }
+  const dn = nodeAt(d)
+  if dn is LetDecl && dn.letKw == "const" && dn.letType < 0 && dn.letInit == p {
+    return d
+  }
+  -1
+}
+
+// The name element binder `b` binds. Any node but the two `fsElemBinder` returns binds none, and
+// answers a phrase no identifier can equal.
+function fsBinderName(b: i32): string {
+  const bn = nodeAt(b)
+  if bn is ForIn { return bn.fiVar }
+  if bn is LetDecl { return bn.letName }
+  "not a for loop or a const binding"
 }
 
 // Makes loop body `body` start with `const copy = idx`, so a lane reads the loop's own index
@@ -2092,7 +2131,7 @@ function fsListAliasRead(r: i32): boolean {
 }
 
 // Whether list read `r` can read a copy of the list: a `for` iterable, the list of an element
-// read that is called, or the list of a `.length` read.
+// read that is called or that an element `const` binds, or the list of a `.length` read.
 function fsListReadCopies(r: i32): boolean {
   const p = fsParent[r]
   if p < 0 { return false }
@@ -2100,12 +2139,14 @@ function fsListReadCopies(r: i32): boolean {
   if pn is ForIn { return pn.fiIter == r }
   if pn is Member { return pn.memObj == r && pn.memProp == "length" }
   if !(pn is Index) || pn.idxArr != r { return false }
+  if fsElemBinder(r) >= 0 { return true }
   const c = fsParent[p]
   c >= 0 && fsCallsVia(c, p)
 }
 
-// Whether list read `r` is the receiver of a `.push` statement whose arguments are each a name
-// or a pure choice of names, so that pushing them again onto a copy pushes the same functions.
+// Whether list read `r` is the receiver of a `.push` statement whose arguments are each a name,
+// a lambda or a pure choice of names, so that pushing them again onto a copy pushes the same
+// functions.
 function fsListPushRead(r: i32): boolean {
   const m = fsParent[r]
   if m < 0 { return false }
@@ -2118,7 +2159,11 @@ function fsListPushRead(r: i32): boolean {
   const cn = nodeAt(c)
   if !(cn is Call) || cn.callArgs.length == 0 { return false }
   for a in cn.callArgs {
-    if !(nodeAt(fsParenPeel(a)) is Ident) && !fsPureChoice(a, 0) {
+    if (
+      !(nodeAt(fsParenPeel(a)) is Ident)
+      && !fsIsLambdaLit(a)
+      && !fsPureChoice(a, 0)
+    ) {
       return false
     }
   }
