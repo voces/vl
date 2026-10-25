@@ -1701,6 +1701,15 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - Rep-fuzz is exact.
     - Seed 5,820,402 → 5,821,121 bytes (+719) against master `7555916e3`.
   - No `emit_mono.vl` or `check_*.vl` edit. Render-parse holds. None filed.
+- **2026-10-24, step 6: the member-set compare and the five arm readers ask by type. Byte-identical; `unionSetArmTys` deleted.**
+  - `unionMemberSetsCompat(site, a, tyA, b, tyB)` finds each side's row through `unionRowKeyAB` and compares the rows' member columns. It falls back to the rows' recorded spellings, then to the name's member set, only where a side has no row. Callers pass the type each side holds: `anonValueFitsField`'s boxed and union arms (98, 99, the value node's type and the field row's type), the shape-row fit's union field (100, both field rows' types), and `shapeFieldTypeCompatK` (101, the field's element type; its key text has no type).
+  - The five `unionSetArmTys` callers ask `unionSetArmTysAB` with the union's own type: `markMapUnionArms` (102) and `markRefArrayArms` (103) at the inline and declared mints (`mintTyIx`, the declaration's type) and the map-value union (`kindTy`); `unionHasMapArmSlot` (104), `unionHasAtomLeafArm` (105, through `refArrBoxTagOf`) and `mapBoxTagOf` (106) with the destination union's type, threaded from `emitUnionCoerceUnder` (`uTy`), `emitUnionBoxArgGo` (`unionTy`) and the `??` map join's pinned result type. No code calls `unionSetArmTys`, so it is deleted.
+  - Shadow (`VL_REP_SHADOW=1`) over `tests/cases` and `distilled/`, events (files): 98 agree 88 (7); 99 agree 422 (13), differ 4 (1), name-only 4 (1); 100 agree 184 (4); 101 agree 72 and no-ty 72 (18), the no-ty half being the key text; 102 agree 63,137 (5,071), differ 381 (26), name-only 22,292 (14), neither 2 (1); 103 agree 8,131 (5,037), differ 3 (2), name-only 4 (2); 104 agree 287 (112), name-only 13 (13), no-ty 6 (2); 105 agree 5 (1); 106 agree 102 (35), name-only 1, no-ty 2 (1). Every differ reach emits the same module.
+  - Checks:
+    - difftree `--identity` against master's seed: the fixpoint identity holds; of 16,588 files (11,704 built), 0 differ and 0 are uncompared.
+    - Rep-fuzz is exact.
+    - Seed 5,824,201 → 5,824,942 bytes (+741).
+  - Render-parse holds at 55 / 112: these readers compared text keys, which the census does not count. The inline-shape interner by type stays as the step 6 entry above left it. None filed.
 
 ### L10 log
 
