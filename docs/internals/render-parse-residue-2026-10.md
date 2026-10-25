@@ -129,8 +129,8 @@ the slice retires.
 | C3 | shape-intern walkers take field types (landed: 11 retired, 5 left and reclassed D: each is a key the walk parses back, which goes with the type-keyed shape interner) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
-| D1 | ref-list slot keyed by type (landed: 13 retired, 17 left; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; re-probed at fec5cd698: the `fill`, `.map` result and `string\|null` renders name rows not minted yet, and the rest are producers and grammar predicates) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
-| D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; re-checked at fec5cd698: D1's retired reader unblocks none, and the rest waits on a ref-list mint keyed by type) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
+| D1 | ref-list slot keyed by type (landed: 16 retired, 14 left; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; the `fill`, `.map` result and `string\|null` renders ask the ref-list mint keyed by type for its key (`rlMintNameOfTy`, class B); the rest are producers and grammar predicates, and `forceCloListTypeOf`'s typed key differs in 23 files) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
+| D2 | ref-list kind ladder by type (landed: 8 retired, 14 left; `refArrElemNameIf` is deleted, its last caller reading its arm's element row by type; the ladder internals still have name callers that mint by spelling) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer; re-checked at 84b98d149 after #4700: the pins are computed before the instance exists, none retired; re-probed at edc698135 over every pin at the mint: the banked type is the argument's, not the pin's, and differs from the resolved pin type in 371 files, so step 1 is not byte-identical) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5; re-checked at 84b98d149, unchanged) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; the rest is the D4930 alias; re-probed at 84b98d149, none retired: the split fallbacks are reached by callers with no type) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
@@ -1149,10 +1149,11 @@ What each slice changes:
     row. The identity diff over 16,500 files finds one differing module,
     `memory/newtype-struct-reflist-key-population.vl`: two locals of the top-level function
     are declared in the other order, with the same types and code, and it prints the same output.
-  - Left: the fifth caller, `unionClosureArrElemUnion`, holds split union atoms with no node. It
-    is reached in 61 files and answers "" in all 61, and its originating fixture is now served
-    by an earlier arm, so no program shows what a typed answer must equal. In 19 of the 61 the
-    name has no recorded member set. `refArrElemNameIf`'s D2 entry goes with this caller.
+  - Done, 0 differing files: the fifth caller, `unionClosureArrElemUnion`, reads the union's
+    recorded member types and asks each array arm's element row (`rlSlotOfTy`, a union row) in
+    place of splitting atoms and cutting each one's element. Probed old against new over 16,677
+    files: 62 reach it, 0 disagree, and the 4 with no recorded member set answer "" both ways.
+    `refArrElemNameIf` had no other caller and is deleted, with its D2 entry and its B entry.
   - Done, byte-identical: 1 parse. `rlMapElemValSlot`'s fall-through parsed the element
     spelling for its value name and found the mv slot by it. The ref-list mint now records the mv
     slot a map element's value took (`rlElemMvSlot`, beside `rlElemMapKey`), and the reader
@@ -1176,9 +1177,18 @@ What each slice changes:
 
     All three render the name the caller then mints a row under, so they go with a ref-list
     mint keyed by type, not with a typed lookup.
+  - Done, byte-identical: 3 renders. The ref-list mint keyed by type is `rlInternOfTy(ty)`,
+    which interns `ty`'s row under `rlMintNameOfTy(ty)`. That function is the one spelling such a
+    row is stored and looked up under, and its render is a class B key. `collectMapFilterUse`
+    mints through it, and the `fill` arm, `mfListResultElemName` and `synthEmptyListAnn` ask it
+    for the key, so the three D1 renders are gone and one B render replaces them.
   - Left elsewhere:
-    - The producers (`collectARefArrayAnn`, `ensureRefElemTy`, `forceCloListTypeOf`) mint the
-      rows the typed lookup reads.
+    - The producers (`collectARefArrayAnn`, `ensureRefElemTys`, `forceCloListTypeOf`) mint the
+      rows the typed lookup reads. `forceCloListTypeOf` was probed against the mint keyed by
+      type over 16,677 files: the element's render differs from the spelling's cut in 23 of 60
+      files (a declared record renders by shape, `{f:i32}` for `S`, and a grouped closure loses
+      its parens), and a typed `TyArray` gate differs from `nameIsRefArray` in 10 of 131 files.
+      `ensureRefElemTys`'s nested cut keys the inner row by the same spelling, so it stays too.
     - The nine `emit_base` grammar predicates go when their name-only callers in D2 and C5 take
       a type.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
@@ -1231,6 +1241,12 @@ What each slice changes:
     called none of the 15, so none moves. Every ladder caller still wants an element name to
     mint or find a name-keyed ref-list row, and D1's re-probe shows the typed lookup cannot stand
     in for the mint. The next step for both slices is one ref-list mint keyed by type.
+  - Done with the mint keyed by type: 1 parse, `refArrElemNameIf`'s `nameIsRefArray` gate,
+    deleted with the function once `unionClosureArrElemUnion` read its arm's row by type. The
+    other 14 stay: the ladder internals still have name callers (`ensureRefElemTys` derives its
+    kind from the spelling, `collectARefArrayAnn` and `collectATypeRef` mint under the
+    annotation's spelling, and `emit_shape_intern` holds no type), and the three mv-kind sites
+    are still reached through `mvValKindOfName` with no type.
 - **D3.** The mono instance key and the `monoAnnPinName` ladder take the pin's type. Most of the
   slice is this one seam, and it carries 15 of the 52 D renders.
   - Done: the instance is keyed by type as well as by spelling. When the spelled key misses,
