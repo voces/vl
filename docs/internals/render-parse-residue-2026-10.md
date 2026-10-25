@@ -182,7 +182,7 @@ the slice retires.
 | A2 | emit_mono typed tests (done: 8 retired, 1 to B, 0 left; the arrow test reads the pin type once a hole-function argument is pinned at its slot's substituted type) | 1 | 0 / 1 / 0 | 0 / 1 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 11 retired, 1 left; re-probed at 5888be183 with the inventory witnesses: the nullable-element reject and the arm-shape walk typed, `dstPinMapValue`'s cut is the pin name it pushes) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
-| A5 | union-atom and atom-kind twins (landed: 7 retired, 5 left; `forceCloResultListTypes` walks the node's type; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left, because a generic body's target has no row and no pinned type) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
+| A5 | union-atom and atom-kind twins (landed: 8 retired, 4 left; `forceCloResultListTypes` and `forceCloResultMapTypes` walk the node's type; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left, because a generic body's target has no row and no pinned type) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, then the 3 in `monoAnnHasTyParam`, 5 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted; `monoAnnHasTyParam` asks the annotation node; the 5 left re-probed per site, none swaps) | 5 | 0 / 5 / 0 | 0 / 5 | `emit_base` |
 | C2 | instance cell signatures typed (landed: 2 retired, 3 left; the arrow tests wait on constructor producers that build signature text with no type, and the render is a synthesized TypeRef's name) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 11 retired, 5 left and reclassed D: each is a key the walk parses back, which goes with the type-keyed shape interner) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
@@ -195,7 +195,7 @@ the slice retires.
 | D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; the rest is the D4930 alias; re-probed at 84b98d149, none retired: the split fallbacks are reached by callers with no type) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired; at 84b98d149 the typed-beside legs of `mvValNamesCompat` are reached by no event) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
-| D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149: the field companion's render is the name its readers rebuild the box under) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
+| D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; the mv mint key asks the held map type where the caller holds one, the annotation sites and union arms keep the spelling; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149: the field companion's render is the name its readers rebuild the box under) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
 slice that retires them in the same change. For example, A3's one C entry is a rung of the same
@@ -345,12 +345,12 @@ What each slice changes:
   The two ref-array arm tests ask the element union row's `unionMemberTysOf` members.
   `unionHasCollapsedStringMapArm` is deleted with its caller block, which an armed probe reached
   in 0 files. A probe over every `tests/**/*.vl` and the distilled corpus found 0 differing
-  files for each retired site. Five stay:
+  files for each retired site. Four stay:
   - `valueAtomKindOfTy`'s fallback answers declined shapes, and some of those no file reaches.
   - `mapAnnShape`'s value spelling also keys the D8 mv-slot lookups.
-  - `forceCloResultMapTypes` interns by spelling (`mvShapeOfMapName`), and a closure position
-    inside one TypeRef has no node, so a typed walk would need a render to rebuild the key. It
-    waits on D8's mv slot keyed by type.
+  - Retired since, with D8's typed mv key: `forceCloResultMapTypes` walks the node's type as
+    its list dual does, and mints each map result through `mvShapeOfMapHeldTy`. The probe
+    reached it 58 times in 18 files, 0 differing.
   - Its list dual is retired, with D1's `nameIsRefArray` gate. `forceCloResultListTypes` takes
     the node's type and walks each `TyFunc` it holds, itself or as a `TyUnion` member; each
     position forces its scalar-list backing (`tyScalarListKind`) or, when `tyIsRefArray`, its
@@ -2151,6 +2151,25 @@ What each slice changes:
     population differed: the spelling key of `((x: i32) => R) | null` came out empty only when a
     `((x: i32) => i32 | R) | null` stood beside it. Its module is unchanged once lambdas are
     assigned, since the lambda mints the same sig.
+  - Done, 1 parse: the mv mint key, where the caller holds the map's type. `mvShapeOfMapHeldTy`
+    keys the slot by `mapTyMvDeclName` of the held map type (`tyMapHeld` peels a one-member
+    alias and a `| null`): a literal union by its alias, else `tyToNominalNameAt(mv,
+    RC_MAP_VAL)`. The four ref-list mints (`mvRefInner`, `rlElemMapShape`,
+    `ensureRefElemKindTail`, `rlIntern`), the nullable-map annotation in `emit_collect` and
+    `forceCloResultMapTypes` use it. `forceCloResultMapTypes` now walks the node's type like
+    its list dual, so its `annArrowAt` retires; `mvShapeOfMapName`, `cloArmFnTyOf` and
+    `annRetNameOf`'s use there are deleted. A probe over the self-compile and 16,760 files
+    compared the typed key with the spelling's at each site: 14,818 typed events, 0 differ. The
+    spelling stays the key in 141 events in 24 files where the type names no value, mostly a
+    `{[string]: T}` over an unbound type parameter. The emit render (`tyToEmitName`) was tried
+    first and differed in 42,115 of 132,922 `letMapShapeOf` events, because it spells records
+    structurally. The fixpoint seed is 108 bytes smaller.
+  - Left, measured: the annotation sites and the union arms keep the spelling.
+    `mvShapeOfMapNameArmTy` at the bare-map annotation (`emit_collect`) and at `letMapShapeOf`
+    (`emit_classify`) differ from the nominal key in 1,168 of 13,716 and 3,741 of 132,922
+    events: the spelling keeps parens and structural records that name a different slot.
+    `markMapUnionArmsOf` differs in 14 of 48,026, all union atoms. These wait on the mv slot
+    table keyed by the value type rather than by a name.
   - Left, not probed: the products. These are the signature-ladder
     renders, the mv mint key in `mvShapeOfMapNameTys`, `cloArmTagOfTy`'s render, which the link
     step reads as the `clo:` key, and the two D34 entries. The mv slot stays keyed by spelling,
