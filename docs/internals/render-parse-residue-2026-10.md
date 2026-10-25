@@ -121,6 +121,9 @@ renders and 11 parses. D1's `rlMintNameOfTy` (#4772) and D5's `shareFieldUnionRo
 each) and D1's `rlSlotOfArrNameTy` (row 245, 1 parse, #4775) have since retired, so the baseline
 reads **53 renders and 91 parses** (`ea2c435a3`). `rlMintNameOfTy` was in B, so the conditional
 key producers are 2 renders and 10 parses and the stopping point is 22 renders and 11 parses.
+D8's `mvShapeOfMapHeldTy` floor (#4780) and `mapValNameOf` in the mv find (#4783) have retired
+since, 1 parse each, so the baseline reads **53 renders and 89 parses** (`5477fb0cc`). Both were
+in D, so the conditional key producers and the stopping point do not move.
 
 ### Per file
 
