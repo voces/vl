@@ -17,6 +17,7 @@ import {
   nodeTyMapName,
   nodeTyName,
   nodeTyRecord,
+  tyIsNulScalarBox,
 } from "./check_node_tys"
 import { nameIsSpaceFree, tyTopIndexOf } from "./tyname"
 import {
@@ -92,6 +93,7 @@ import {
   tyBearsNull,
   tyEq,
   tyFieldTyOf,
+  tyIsHole,
   tyIsLitUnion,
   tyIsLitUnionOrLit,
   tyIsMap,
@@ -299,10 +301,15 @@ import {
   inferRetRungIsStructElemList,
 } from "./check_ret_names"
 import {
+  HD_FLD,
+  holePinsOfTy,
   nodeTyMapValExcludesNull,
   nodeTyMapValIsLitUnion,
 } from "./check_hole_pins"
 import { opBinFnAtNode, opIdxFnAtNode } from "./check_callee"
+import { mkDerivedHole } from "./check_coal"
+import { optFieldAtPin } from "./check_relate_core"
+import { nonNullNarrowTy } from "./check_type_shape"
 
 // ── dead block tails ──────────────────────────────────────────────────────────────────────────
 
@@ -449,6 +456,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
   identFrom(y, x)
   if x < nodeToks.length && y < nodeToks.length { nodeToks[y] = nodeToks[x] }
   let init = -1
+  let seeded = false
   if nullable {
     init = mkNull("null", pos)
     nodeTyRecord(init, lvTyNull())
@@ -460,14 +468,22 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
       if prim == "i64" { init = mkNum("0", pos) }
     }
     nodeTyRecord(init, cty)
+    if init < 0 && fns.length == 0 {
+      const sr = lvOpenFnSeedRead(x, ty)
+      if sr >= 0 { init = drwRecvClone(sr) }
+      seeded = init >= 0
+    }
   }
   // A spelling naming a type parameter is resolved from its name, as each instance's own is.
   let annTy = cty
   if tyHasTyVar(cty) { annTy = -1 }
   let spellC = spell
   if fns.length > 0 { spellC = lvSpellOf(cty) }
-  const tr = synthTypeRefTy(spellC, pos, annTy)
-  if annTy != cty { monoAnnOpenTyNote(tr, cty) }
+  let tr = -1
+  if !seeded {
+    tr = synthTypeRefTy(spellC, pos, annTy)
+    if annTy != cty { monoAnnOpenTyNote(tr, cty) }
+  }
   const decl = mkLet("let", name, tr, init, pos)
   nodeTyRecord(decl, lvTyVoid())
   if loop is WhileStmt {
@@ -556,6 +572,46 @@ function lvOpenFnExits(x: i32, ty: i32, vals: i32[], idx: i32[]): i32[] {
     idx.push(k)
   }
   fns
+}
+
+// For the loop at `x` whose value of type `ty` is a function of an open signature, the exit whose
+// read seeds the carrier, an un-annotated `let` as a written `let c = f` is (D13082): a function
+// some exit hands over, declared ahead of the loop and outside it. Every exit stores into the
+// carrier before it is read. -1 when no exit names such a function.
+function lvOpenFnSeedRead(x: i32, ty: i32): i32 {
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const body = lvBodyOf(x)
+  if ty < 0 || body < 0 || !tyHasTyVar(ty) || !(tyAt(ty) is TyFunc) {
+    return -1
+  }
+  const vals: i32[] = []
+  lvRewriteBreaks(body, lvLabelOf(x), "", -1, ty, 0, false, vals)
+  const n = nodeAt(x)
+  if n is WhileStmt && n.whileBlk == 1 { vals.push(loopValTailOf(x)) }
+  for v in vals {
+    let u = -1
+    if v >= 0 { u = unwrapParen(v) }
+    if u >= 0 && nodeAt(u) is Ident {
+      const d = identDeclOf(u)
+      if (
+        d >= 0
+        && d < P.nodes.length
+        && lvSeedableDecl(d)
+        && !nodeContains(body, d)
+        && nodeAt(d).pos < n.pos
+      ) {
+        return u
+      }
+    }
+  }
+  -1
+}
+
+// Whether declaration `d` names one function for as long as it is in scope: a function
+// declaration or a `const`.
+function lvSeedableDecl(d: i32): boolean {
+  const dn = nodeAt(d)
+  dn is FuncDecl || (dn is LetDecl && dn.letKw == "const")
 }
 
 // Whether a read under `ix` names a binding declared inside `scope` but outside function `fn`,
@@ -799,6 +855,7 @@ function exitFirstLetsAnnotate() {
         if lvBlockIsOwnValue(lx, lty) { ty = -1 }
         // A choice among open functions resolves at each call, so the binding keeps no type.
         if lvOpenFnExits(lx, lty, [], []).length > 0 { ty = -1 }
+        if lvOpenFnSeedRead(lx, lty) >= 0 { ty = -1 }
         if letNullHoleUnfilled(li) { ty = -1 }
         const filled = letNullHoleFilledTy(li)
         if filled >= 0 { ty = filled }
@@ -1692,8 +1749,10 @@ function drwWalkOptMember(ix: i32, n: OptMember, ctx: i32): i32 {
     nodeTyCarry(omFold, ix)
     return omFold
   }
-  const omFt = recUnionFieldTyOf(nodeTyIxOf(n.omObj), n.omProp, nodeTyIxOf(ix))
-  if omFt >= 0 { return recUnionOptRead(ix, n, omFt) }
+  const omTys: i32[] = []
+  if recUnionReadTys(n.omObj, n.omProp, nodeTyIxOf(ix), omTys) {
+    return recUnionOptRead(ix, n, omTys)
+  }
   return ix
 }
 
@@ -2010,17 +2069,18 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
     const cl = nodeAt(unwrapParen(n.binLeft))
     if cl is OptMember {
       const clTy = nodeTyIxOf(unwrapParen(n.binLeft))
-      const clFt = recUnionFieldTyOf(nodeTyIxOf(cl.omObj), cl.omProp, clTy)
+      const clTys: i32[] = []
       if (
-        clFt >= 0
-        && !tyBearsNull(clFt)
+        recUnionReadTys(cl.omObj, cl.omProp, clTy, clTys)
+        && clTys[2] == 0
         && exprReReadable(unwrapParen(cl.omObj))
       ) {
         const crRecv = drwWalk(cl.omObj, ctx)
         const crIf = recUnionGuard(
           crRecv,
           cl.omProp,
-          clFt,
+          clTys[0],
+          clTys[1],
           drwWalk(n.binRight, ctx),
           n.pos,
         )
@@ -2136,18 +2196,19 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
   return ix
 }
 
-// `if recv != null { recv.prop } else { other }`: the field read, typed `readTy`, takes a
-// fresh receiver at the receiver's non-null type, the type the checker gives the same place
-// under `!= null`. `recv` is a re-readable place; the caller types the result.
+// `if recv != null { recv.prop } else { other }`: the fresh receiver is typed `objTy`, the type
+// the checker gives the same place under `!= null`, and the field read `readTy`. `recv` is a
+// re-readable place; the caller types the result.
 function recUnionGuard(
   recv: i32,
   prop: string,
+  objTy: i32,
   readTy: i32,
   other: i32,
   pos: i32,
 ): i32 {
   const rObj = drwRecvClone(recv)
-  nodeTyRecord(rObj, nonNullTy(nodeTyIxOf(unwrapParen(recv))))
+  nodeTyRecord(rObj, objTy)
   const rRead = mkMember(rObj, prop, pos)
   nodeTyRecord(rRead, readTy)
   const rThen: i32[] = []
@@ -2162,15 +2223,55 @@ function recUnionGuard(
   )
 }
 
-// A bare `r?.f` over a nullable union of records, `ix` the read and `fieldTy` the field's
-// type there: the guarded read with a `null` default, or `ix` unchanged when `r` cannot be
-// read twice. A computed receiver is bound to a name before the checker runs (D5300).
-function recUnionOptRead(ix: i32, n: OptMember, fieldTy: i32): i32 {
+// For `r?.prop` typed `omTy`, `recv` its receiver, read as a record-union field's guarded read:
+// pushes the guard's receiver type, its field type, and 1 when the field admits `null` (else 0)
+// onto `out`. A hole receiver is read at derived holes, so each instance reads its own pin
+// (D13080). False, `out` untouched, when no read of `r` needs the guard.
+function recUnionReadTys(
+  recv: i32,
+  prop: string,
+  omTy: i32,
+  out: i32[],
+): boolean {
+  const recvTy = nodeTyIxOf(recv)
+  const ft = recUnionFieldTyOf(recvTy, prop, omTy)
+  if ft >= 0 {
+    out.push(nonNullTy(nodeTyIxOf(unwrapParen(recv))))
+    out.push(ft)
+    out.push(if tyBearsNull(ft) { 1 } else { 0 })
+    return true
+  }
+  if !tyIsHole(recvTy) { return false }
+  let wants = false
+  let nul = 0
+  for p in holePinsOfTy(recvTy) {
+    if tyHasTyVar(p) { return false }
+    // A boxed `T | null` field has no guarded read over a record union yet (D13280).
+    const pf = optFieldAtPin(nonNullTy(p), prop)
+    if pf < 0 || tyIsNulScalarBox(pf) { return false }
+    if tyBearsNull(pf) { nul = 1 }
+    if recUnionFieldTyOf(p, prop, optFieldAtPin(p, prop)) >= 0 { wants = true }
+  }
+  if !wants { return false }
+  const face = nonNullNarrowTy(recvTy)
+  const fld = mkDerivedHole(HD_FLD, prop, -1, -1, face)
+  if face < 0 || fld < 0 { return false }
+  out.push(face)
+  out.push(fld)
+  out.push(nul)
+  true
+}
+
+// A bare `r?.f` read as `ix`, the guard's types in `tys` (`recUnionReadTys`): the guarded read
+// with a `null` default, or `ix` unchanged when `r` cannot be read twice. A computed receiver is
+// bound to a name before the checker runs (D5300).
+function recUnionOptRead(ix: i32, n: OptMember, tys: i32[]): i32 {
   if !exprReReadable(unwrapParen(n.omObj)) { return ix }
   const g = recUnionGuard(
     n.omObj,
     n.omProp,
-    fieldTy,
+    tys[0],
+    tys[1],
     mkNull("null", n.pos),
     n.pos,
   )
