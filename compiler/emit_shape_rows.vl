@@ -71,10 +71,12 @@ import {
   nameIsInlineLitUnion,
   nameIsLitUnionType,
   nameIsOneStrLit,
+  nulNumLitUnionBaseName,
   valueAtomKind,
 } from "./check_ty_rep"
 import { nameIsNewtypeBrand } from "./check_type_shape"
 import {
+  PrimName,
   T,
   TyArray,
   TyErr,
@@ -91,6 +93,7 @@ import {
   cUserTypesVer,
   litBaseTy,
   litUnionAliasNameOfTy,
+  numLitUnionBaseName,
   structNameOfTy,
   tyArrayElemIx,
   tyAt,
@@ -108,6 +111,7 @@ import {
   tyNestedArrLeafRenders,
   tyNomNameCycled,
   tyNulInnerIsPrim,
+  tySame,
   tyScalarBaseIs,
   tyToEmitName,
   tyToNominalName,
@@ -2746,6 +2750,192 @@ export function refArrElemKind(name: string) {
   RLK_STRUCT
 }
 
+// `refArrElemKind`'s answer read from element type `e` rather than a spelling. -1 when `e` is
+// -1, is stored by value (a scalar, a literal union, a nullable scalar niche), is a type
+// parameter or a union of lists; the caller then asks the spelling, the floor for those.
+export function refListElemKindOfTy(e: i32): i32 {
+  if e < 0 || e >= T.tys.length { return -1 }
+  if tyIsLitUnion(e) || tyIsLitUnionAlias(e) { return -1 }
+  if numLitUnionBaseName(e) != "" { return -1 }
+  if tyDenotesFunc(e) { return RLK_CLOSURE }
+  const et = tyAt(e)
+  match et {
+    TyObj => {
+      return RLK_STRUCT
+    }
+    TyUnion => {
+      return rlUnionElemKindOfTy(et.uMembers)
+    }
+    TyFunc => {
+      return RLK_CLOSURE
+    }
+    TyMap => {
+      return RLK_MAP
+    }
+    TyArray => {
+      return rlInnerListKindOfTy(e, et.aElem)
+    }
+    TyNullable => {
+      return rlNulElemKindOfTy(et.nInner)
+    }
+    TyPrim => {
+      // A scalar element has its own backing wrapper, not a ref-list row.
+    }
+    TyLit => {
+      // A bare literal element is the atom list.
+    }
+    TyVar => {
+      // An unsubstituted type parameter has no element rep until the monomorphizer pins it.
+    }
+    TyNeg => {
+      // A negation is a checker-only refinement, never an element rep.
+    }
+    TyErr => {
+      // The error hole has no rep.
+    }
+  }
+  -1
+}
+
+// The kind of a union element with arms `ms`: arms that are all one type (an alias wrapper,
+// or a degenerate `A | A`) are that type, and any other union is boxed. -1 where every arm is
+// a list: `i32[] | K[]` is one i32 list or a box by how the producer spelled it, not by type.
+function rlUnionElemKindOfTy(ms: i32[]): i32 {
+  if ms.length < 1 { return -1 }
+  let same = true
+  let lists = true
+  for m in ms {
+    if !tySame(m, ms[0]) { same = false }
+    if m < 0 || !(tyAt(m) is TyArray) { lists = false }
+  }
+  if same { return refListElemKindOfTy(ms[0]) }
+  if lists { return -1 }
+  RLK_UNION
+}
+
+// The kind of a list element that is itself list `l` of `a`: the leaf's own wrapper for a
+// scalar or string leaf, else the inner ref list (kind 9) where that list has a row.
+function rlInnerListKindOfTy(l: i32, a: i32): i32 {
+  const sk = rlScalarLeafKindOfTy(a)
+  if sk == -2 { return -1 }
+  if sk >= 0 { return sk }
+  if tyIsRefArray(l) { return RLK_REF_LIST }
+  -1
+}
+
+// The wrapper kind of a scalar or string list leaf `a`; -1 for a leaf stored by reference,
+// and -2 for a numeric niche whose wrapper this does not decide (the caller declines).
+function rlScalarLeafKindOfTy(a: i32): i32 {
+  if a < 0 || a >= T.tys.length { return -1 }
+  if tyIsLitUnion(a) || tyIsLitUnionAlias(a) { return RLK_I32_LIST }
+  const nb = numLitUnionBaseName(a)
+  if nb == "i32" { return RLK_I32_LIST }
+  if nb == "f64" { return RLK_F64_LIST }
+  if nb == "i64" { return RLK_I64_LIST }
+  const nnb = nulNumLitUnionBaseName(a)
+  if nnb == "i32" { return RLK_I32_LIST }
+  if nnb != "" { return -2 }
+  const at = tyAt(a)
+  match at {
+    TyNullable => {
+      // `(boolean | null)` and `(K | null)` ride the i32 list, `(string | null)` the string list.
+      if at.nInner < 0 || !tyIsScalarNicheElem(at.nInner) { return -1 }
+      const it = tyAt(at.nInner)
+      if it is TyPrim {
+        if it.primName == "string" { return RLK_STR_LIST }
+      }
+      return RLK_I32_LIST
+    }
+    TyPrim => {
+      return rlPrimLeafKind(at.primName)
+    }
+    // Stored by reference, or no leaf of a list at all.
+    TyErr | TyObj | TyFunc | TyUnion | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// The list wrapper of a primitive leaf `p`; -1 for one with no list of its own.
+function rlPrimLeafKind(p: PrimName): i32 {
+  match p {
+    "i32" | "boolean" | "null" => {
+      return RLK_I32_LIST
+    }
+    "string" => {
+      return RLK_STR_LIST
+    }
+    "f64" => {
+      return RLK_F64_LIST
+    }
+    "i64" => {
+      return RLK_I64_LIST
+    }
+    "f32" => {
+      return RLK_F32_LIST
+    }
+    "u8" => {
+      return RLK_U8_LIST
+    }
+    "void" | "never" | "v128" => {
+      return -1
+    }
+  }
+}
+
+// The kind of a nullable element `n | null`: the niche of `n`'s own row for a record, list,
+// map or closure, the union box for a value union or a nullable number, and -1 for a
+// nullable scalar niche.
+function rlNulElemKindOfTy(n: i32): i32 {
+  if n < 0 { return -1 }
+  if tyIsScalarNicheElem(n) { return -1 }
+  if tyDenotesFunc(n) { return RLK_CLOSURE }
+  const nt = tyAt(n)
+  match nt {
+    TyObj => {
+      return RLK_STRUCT
+    }
+    TyUnion => {
+      let same = nt.uMembers.length > 0
+      for m in nt.uMembers {
+        if !tySame(m, nt.uMembers[0]) { same = false }
+      }
+      if same { return rlNulElemKindOfTy(nt.uMembers[0]) }
+      return RLK_UNION
+    }
+    TyFunc => {
+      return RLK_CLOSURE
+    }
+    TyMap => {
+      return RLK_MAP
+    }
+    TyArray => {
+      // A nullable list reuses the inner list's own kind as a niche.
+      return rlInnerListKindOfTy(n, nt.aElem)
+    }
+    TyPrim => {
+      // `i32 | null` and its numeric siblings are a value union, boxed.
+      return RLK_UNION
+    }
+    TyNullable => {
+      // A doubly nullable element has no rep of its own.
+    }
+    TyLit => {
+      // A one-literal element is a literal union, subtracted above.
+    }
+    TyVar => {
+      // An unsubstituted type parameter has no element rep until the monomorphizer pins it.
+    }
+    TyNeg => {
+      // A negation is a checker-only refinement, never an element rep.
+    }
+    TyErr => {
+      // The error hole has no rep.
+    }
+  }
+  -1
+}
+
 // Forces the wrapper/backing flags a scalar-list field storage code needs, since a
 // field-only program never builds a `u8[]`/`f64[]`/etc list literal elsewhere.
 export function forceScalarListField(code: i32) {
@@ -3892,13 +4082,15 @@ export function arrLitNestedElemName(arrIx: i32): string {
   ""
 }
 
-// The element kind for `arrLitNestedElemName`'s literal, asked of the one producer the
-// annotation route asks (`refArrElemKind` over `refElemArrName`), so a kind derived here
-// can never differ from the kind the annotation side derives — `rlInternName` banks the
-// first kind against a shared rep key, and a disagreement types one wrapper over another.
+// The element kind for `arrLitNestedElemName`'s literal, asked of the producer the annotation
+// route asks (`refListElemKindOfTy` over the element type), so the two never differ —
+// `rlInternName` banks the first kind against a shared rep key. The spelling is the floor
+// for a literal whose element type is absent or declined.
 export function arrLitNestedElemKind(arrIx: i32): i32 {
   const en = arrLitElemRender(arrIx)
   if en == "" { return RLK_I32_LIST }
+  const k = refListElemKindOfTy(tyArrayElemIx(nodeTyIxOf(arrIx)))
+  if k >= 0 { return k }
   refArrElemKind(refElemArrName(en))
 }
 
@@ -3973,9 +4165,15 @@ function nulRefElemNameOfArrTy(ty: i32): string {
 }
 
 // The element kind for `arrLitNulRefElemName`'s literal, asked of the one producer the
-// annotation route asks, exactly as `arrLitNestedElemKind` is (D1270).
+// annotation route asks, exactly as `arrLitNestedElemKind` is (D1270). A literal with no
+// such name keeps the spelling's answer, which `arrLitNulUnionElemName` reads as its gate.
 export function arrLitNulRefElemKind(arrIx: i32): i32 {
-  refArrElemKind(refElemArrName(arrLitNulRefElemName(arrIx)))
+  const en = arrLitNulRefElemName(arrIx)
+  if en != "" {
+    const k = refListElemKindOfTy(tyArrayElemIx(nodeTyIxOf(arrIx)))
+    if k >= 0 { return k }
+  }
+  refArrElemKind(refElemArrName(en))
 }
 
 // The `arrLitNumKind` answers.
