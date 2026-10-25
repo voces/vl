@@ -38,9 +38,13 @@ commit's.
 | --- | ---: |
 | CAPABILITY, every witness has an open row | 106 (17 by new rows D12450-D12466, 89 by existing rows) |
 | CAPABILITY, but a DESIGN row among the witnesses is not moved | 0 |
-| DESIGN, held at emit as a recorded floor | 3 (`emit_mono.vl:9197`, `emit_mono.vl:9207`, `emit_sections.vl:10209`) |
-| DESIGN, moved to the checker by this lane | 2 (`wasmEmit.vl:27003`, D3483; `emit_mono.vl:9184`) |
+| DESIGN, held at emit as a recorded floor | 1 (`emit_sections.vl:10209`) |
+| DESIGN, moved to the checker by this lane | 4 (`wasmEmit.vl:27003`, D3483; `emit_mono.vl:9184`; `emit_mono.vl:9197` and `emit_mono.vl:9207`, D12470) |
 | total reached | 111 |
+
+The D12470 close re-derived the population on master `1a747b413`. `emit-refusal-sites.vl` reads
+**739 sites** and **618 templates**. That is one site and one template fewer than the 740 and
+619 of `1a747b413` itself, because the two flat-row refusals are now one floor.
 
 The lane moved five rows into the checker, D2689, D3052, D3483, D4052 and D12467, in two rules:
 
@@ -73,7 +77,8 @@ call through a constant list element is typed, in six rules:
 The D1433 rule declines a bare-name object. A bare name's `else` remainder keeps no narrowing
 fact, so re-asking `z.v` at the pin would refuse running programs (24 `d3204` corpus cells). It
 also moves one non-running spelling from emit to check: a literal-discriminant `==` on a member
-path inside a generic body. Its direct spelling is a loud emit reject too, filed as D12473.
+path inside a generic body, filed as D12602. Its direct spelling, D12473, now runs: emit's
+`pushDiscrimNarrow` keys a member path the way `narrowIsThen` does (`discrimRecvKey`).
 
 D2965 had been filed as CAPABILITY, but the question it left open is D1852's ruling. D10893 had
 been graded DESIGN on the premise that the checker owed `cannot infer a type for parameter`.
@@ -89,19 +94,33 @@ that program is now a check reject (`generics/error-size-of-unbound-type-param.v
 
 ## Residue: DESIGN sites still at emit
 
-**Three recorded floors.** A check-clean program reaches each one. The refusal is DESIGN, but
-the fact that decides it exists only after the checker:
+**One recorded floor.** A check-clean program reaches it. The refusal is DESIGN, but the fact
+that decides it exists only after the checker:
 
-- `emit_mono.vl:9197` and `emit_mono.vl:9207`: a flat generic row bound to a non-flat type, or
-  read at a field the bound type lacks. `flat-records-design.md` §11 decides this per instance,
-  at the pin. The pin's `T` is a PHANTOM parameter of `Rows<T>`. The checker resolves `Rows<P>`
-  to the same record as every other `Rows<_>`, so no checker binding of `T` exists to ask. Only
-  the monomorphizer binds `T`, reading the written spelling. That disagreement is a clause-1
-  defect on its own, filed as D12470. A checker that binds phantom parameters would move both
-  sites.
-- `emit_sections.vl:10209`: an export named `memory` in a program that uses linear memory.
-  Whether memory is exported depends on `vl build --import-memory` and on emit's `memUsed`
-  scan of the lowered module. `vl check` sees neither.
+- `emit_sections.vl:10218` (`:10209` at `b861c1d9f`): an export named `memory` in a program
+  that uses linear memory. Measured on master `1a747b413`, with `export function memory()`:
+  - The collision is real without the flag. A program that stores through `std:buffer` passes
+    `vl check` with rc 0, then `vl build` refuses it.
+  - The same program builds under `vl build --import-memory`, since an imported memory is not
+    re-exported. `vl check` takes no link flags (`check: unknown flag --import-memory`), so a
+    checker rule would refuse a program the build accepts.
+  - `memUsed` is set by the lowered module, not by the source the checker reads. An unused
+    `import { Buffer } from "std:buffer"` sets it on its own, and so does a memory use inside a
+    function nothing calls.
+  - Moving the site needs either link flags on `vl check`, a CLI change, or a checker copy of
+    the `memUsed` scan. Without the flag, that copy would refuse what `--import-memory` builds.
+    The site stays at emit. The fixture is `memory/export-memory-name-collision.vl`.
+
+The flat generic rows' two sites (`emit_mono.vl:9197`, `:9207`) moved. The checker now binds a
+phantom alias parameter from the application's argument (`bindGenAppArgs` at the end of
+`bindGenWalk`). A layout read `T.size` in a generic body is recorded as a deferred constraint
+and asked at each call pin, and at each operator site (`[]`, `[]=`, binary operators;
+`validateOpLayoutCstrs`). The probe walk now also visits operators, so an operator declared after
+its use is pre-checked. That closes D12470. The two sites are merged into one internal floor at
+`emit_mono.vl:9198`. Two neighbouring spellings that are type-valid still refuse at
+`monoArgTyFail` and are filed open as CAPABILITY:
+- D12600: the phantom row's argument has no written `Rows<X>` spelling.
+- D12601: the row is forwarded through a generic.
 
 ## Reproduce
 
@@ -150,8 +169,8 @@ the fact that decides it exists only after the checker:
 | `emit_mono.vl:3298` | emitProgram: a join of a `??` with a type parameter drops a member of that parameter at th… | 1 row, 1 fixture, 4 corpus | D2934 | CAPABILITY | new D12453 |
 | `emit_mono.vl:3322` | emitProgram: a join of type parameters pinned at two number types beside a null has no box… | 2 row | D3485 | CAPABILITY | open D3485, D3591 |
 | `emit_mono.vl:9184` | emitProgram: monomorphize: `{}.{}` needs `{}` bound by a parameter — a layout constant is … | 1 probe | probe `flat-layout-const-unbound-type-param` (removed) | DESIGN, moved | `checkRetTyParamBound` (check_node_rules.vl) refuses `T.size` when no parameter names `T`; pins `generics/error-size-of-unbound-type-param.vl`, `generics/size-of-explicit-type-arg.vl` |
-| `emit_mono.vl:9197` | emitProgram: monomorphize: `{}` is bound to `{}`, which is not a `flat` type, so it has no… | 1 fixture | `memory/flat-generic-rows-not-flat-rejected.vl` | DESIGN, recorded floor | §11 of `docs/internals/flat-records-design.md`: the pin binds a phantom `T` of `Rows<T>`, which only the monomorphizer binds (D12470) |
-| `emit_mono.vl:9207` | emitProgram: monomorphize: `flat type {}` (bound to `{}`) has no field '{}' — its layout m… | 1 fixture | `memory/flat-generic-rows-unknown-member-rejected.vl` | DESIGN, recorded floor | the same §11 rule and the same phantom binding, an unknown member of a flat generic row |
+| `emit_mono.vl:9197` | emitProgram: monomorphize: `{}` is bound to `{}`, which is not a `flat` type, so it has no… | 1 fixture | `memory/flat-generic-rows-not-flat-rejected.vl` | DESIGN, moved | closed D12470: `bindGenAppArgs` binds the phantom `T` in the checker and `validateOpLayoutCstrs` (check_demands.vl) asks `T.size` at every call and operator pin; the two sites are one internal floor, pins `memory/flat-generic-rows-not-flat-rejected.vl` (now `@check`), `generics/phantom-alias-param-binds-at-check.vl` |
+| `emit_mono.vl:9207` | emitProgram: monomorphize: `flat type {}` (bound to `{}`) has no field '{}' — its layout m… | 1 fixture | `memory/flat-generic-rows-unknown-member-rejected.vl` | DESIGN, moved | the same rule, an unknown member of a flat generic row; pin `memory/flat-generic-rows-unknown-member-rejected.vl` (now `@check`) |
 | `emit_rewrite.vl:4306` | {} | 2 row, 1 fixture | D2340 | CAPABILITY | open D2340, D3371 |
 | `emit_sections.vl:10209` | emitProgram: this program exports a function named 'memory', but a program that uses linea… | 1 fixture | `memory/export-memory-name-collision.vl` | DESIGN, recorded floor | whether memory is exported depends on `--import-memory` and emit's `memUsed` scan, which `vl check` never sees |
 | `emit_sections.vl:1116` | emitProgram: internal: a parameter type the valtype ladder has no rung for — every paramet… | 2 row | D2735 | CAPABILITY | open D2735, D5001 |

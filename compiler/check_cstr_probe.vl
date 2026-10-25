@@ -1,7 +1,19 @@
 // The constraint pre-pass: indexes generic declarations, each after the candidates its body
 // names, for the call-site constraint probe.
 // Does not import the checker.
-import { FuncDecl, Ident, Member, P, nodeAt, nodeChildren } from "./ast"
+import {
+  BinExpr,
+  FuncDecl,
+  Ident,
+  Index,
+  Member,
+  OP_INDEX_GET,
+  OP_INDEX_SET,
+  P,
+  nodeAt,
+  nodeChildren,
+  opDeclOpOf,
+} from "./ast"
 import { lookup } from "./check_scopes"
 import { TyFunc, tyAt, tyHasHole } from "./check_types"
 import { fnDeclIx } from "./check_write_scan"
@@ -13,6 +25,8 @@ export let cstrCandIx: {[string]: i32} = Map()
 export let cstrCandState: {[string]: i32} = Map()
 export let cstrCandAny = false
 export let cstrCandLeft = 0
+// The candidates that are operator declarations, which a site reaches by its symbol, not a name.
+let cstrCandOps: string[] = []
 
 // Whether top-level declaration `ix` can own a constraint a call site adjudicates: it
 // declares a type parameter, or the hoist left one of its parameters a hole.
@@ -47,12 +61,18 @@ export function cstrProbeWalk(root: i32, order: i32[]): boolean {
       if an is Ident { named = an.identName }
       if an is Member { named = an.memProp }
       if named != "" {
-        const cix = cstrCandIx[named] ?? -1
-        if cix >= 0 {
-          const st = cstrCandState[named] ?? 0
-          if st == 1 { cyc = true }
-          if st == 0 {
-            if cstrProbeVisit(cix, order) { cyc = true }
+        if cstrProbeName(named, order) { cyc = true }
+      }
+      if cstrCandOps.length > 0 {
+        let sym = ""
+        if an is Index { sym = OP_INDEX_GET }
+        if an is BinExpr { sym = an.binOp }
+        if sym != "" {
+          for op in cstrCandOps {
+            const os = opDeclOpOf(op)
+            if os == sym || (sym == OP_INDEX_GET && os == OP_INDEX_SET) {
+              if cstrProbeName(op, order) { cyc = true }
+            }
           }
         }
       }
@@ -60,6 +80,16 @@ export function cstrProbeWalk(root: i32, order: i32[]): boolean {
     }
   }
   cyc
+}
+
+// Visits candidate `named` if it is one and not yet probed; true when it closes a cycle.
+function cstrProbeName(named: string, order: i32[]): boolean {
+  const cix = cstrCandIx[named] ?? -1
+  if cix < 0 { return false }
+  const st = cstrCandState[named] ?? 0
+  if st == 1 { return true }
+  if st == 0 { return cstrProbeVisit(cix, order) }
+  false
 }
 
 // Places candidate `ix` after the candidates its body names.
@@ -82,12 +112,14 @@ export function cstrPrePass(stmts: i32[]) {
   cstrCandState = Map()
   cstrCandAny = false
   cstrCandLeft = 0
+  cstrCandOps = []
   for si in stmts {
     if cstrProbeCandidate(si) {
       const fd = nodeAt(si)
       if fd is FuncDecl {
         if !cstrCandIx.has(fd.fnName) { cstrCandLeft = cstrCandLeft + 1 }
         cstrCandIx[fd.fnName] = si
+        if opDeclOpOf(fd.fnName) != "" { cstrCandOps.push(fd.fnName) }
         cstrCandAny = true
       }
     }
@@ -101,4 +133,5 @@ export function cstrProbeReset() {
   cstrCandState = Map()
   cstrCandAny = false
   cstrCandLeft = 0
+  cstrCandOps = []
 }

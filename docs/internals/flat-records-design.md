@@ -871,21 +871,23 @@ constants themselves per instance, plus a write through the derived address read
 HAND-COMPUTED one (§7.2's discipline). Fold-in-place fails that fixture on the first two
 lines; a checker-side fold cannot compile it at all.
 
-### 11.2 What the checker gives up, stated plainly
+### 11.2 Where the binding is validated: at each call (D12470)
 
-`T.size` is typed without being validated. Whether the binding names a `flat` type, and
-whether that type HAS the member, are questions the checker cannot answer — it sees `T`, not
-`TValue`. Both are answered by the monomorphizer against the instance that got it wrong:
+`T.size` is admitted in the generic body without being validated there — the body sees `T`,
+not `TValue`. The read records a deferred constraint (`MC_LAYOUT_MARK`), and every call,
+index operator or binary operator that instantiates the body re-asks it at the binding the
+call gives `T`; a call from another generic body forwards it to that body's own calls. The
+checker binds a phantom `T` of `Rows<T>` from the application's arguments, as the
+monomorphizer does, so both layers agree on the binding:
 
 ```
-emitProgram: monomorphize: `T` is bound to `Plain`, which is not a `flat` type, so it has no byte layout
-emitProgram: monomorphize: `flat type TValue` (bound to `T`) has no field 'nosuch' — its layout members are `.size` and one offset per declared field
+`T` is bound to `Plain`, which is not a `flat` type, so it has no byte layout for `T.size` (the body of `"[]" for Rows<T>` at the call's argument types)
+`T` is bound to `flat type TValue`, which has no field 'nosuch' — its layout members are `.size` and one offset per declared field (the body of `"[]" for Rows<T>` at the call's argument types)
 ```
 
-This is a **`vl check`-clean, `vl build`-rejected** pair, which this repo otherwise treats as
-a defect class. It is accepted here deliberately and only here: the alternative is rejecting
-every `T.size` in the checker, which is the feature. Both messages name the BINDING, not the
-parameter, because the binding is the thing the programmer chose. Pinned by
+Until D12470 these were monomorphizer refusals on a `vl check`-clean program. Both messages
+name the BINDING, not the parameter, because the binding is the thing the programmer chose.
+The monomorphizer's fold keeps one internal floor for a miss the pin admitted. Pinned by
 `memory/flat-generic-rows-not-flat-rejected.vl` and
 `memory/flat-generic-rows-unknown-member-rejected.vl`.
 
@@ -993,7 +995,7 @@ the BRAND, and §11.3 is the reason.
 | fixture | what it holds |
 | --- | --- |
 | `memory/flat-generic-rows-stride.vl` | one generic operator at TWO strides; the constants per instance; `T.<field>` offsets; a generic accessor calling another generic accessor; every write through the derived address, read back at a hand-computed one |
-| `memory/flat-generic-rows-not-flat-rejected.vl` | the binding is not a `flat` type — loud, at emit, naming the binding |
+| `memory/flat-generic-rows-not-flat-rejected.vl` | the binding is not a `flat` type — refused by `vl check` at the call, naming the binding |
 | `memory/flat-generic-rows-unknown-member-rejected.vl` | the binding is flat and the member is not |
 | `memory/flat-generic-rows-branded.vl` | the brand through a CALL: two records, two strides, addresses verified against hand-computed ones |
 | `memory/flat-generic-rows-branded-bracket.vl` | the same through the BRACKET — §10's shape entire |
