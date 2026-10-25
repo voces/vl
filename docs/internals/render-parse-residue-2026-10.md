@@ -188,7 +188,7 @@ the slice retires.
 | C3 | shape-intern walkers take field types (landed: 11 retired, 5 left and reclassed D: each is a key the walk parses back, which goes with the type-keyed shape interner) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
-| D1 | ref-list slot keyed by type (landed: 16 retired, 14 left; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; the `fill`, `.map` result and `string\|null` renders ask the ref-list mint keyed by type for its key (`rlMintNameOfTy`, class B); the rest are producers and grammar predicates, and `forceCloListTypeOf`'s typed key differs in 23 files) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
+| D1 | ref-list slot keyed by type (landed: 17 retired, 13 left; the producers name their rows by type (`rlRowNameOfTy`) and keep the spelling cut only as the floor for a missing type or a hole; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; the `fill`, `.map` result and `string\|null` renders ask the ref-list mint keyed by type for its key (`rlMintNameOfTy`, class B); the rest are producers and grammar predicates) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 8 retired, 14 left; `refArrElemNameIf` is deleted, its last caller reading its arm's element row by type; the ladder internals still have name callers that mint by spelling) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer; re-checked at 84b98d149 after #4700: the pins are computed before the instance exists, none retired; re-probed at edc698135 over every pin at the mint: the banked type is the argument's, not the pin's, and differs from the resolved pin type in 371 files, so step 1 is not byte-identical) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5; re-checked at 84b98d149, unchanged) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
@@ -1317,6 +1317,13 @@ What each slice changes:
       files (a declared record renders by shape, `{f:i32}` for `S`, and a grouped closure loses
       its parens), and a typed `TyArray` gate differs from `nameIsRefArray` in 10 of 131 files.
       `ensureRefElemTys`'s nested cut keys the inner row by the same spelling, so it stays too.
+    - At a0d8dfeb8 the three producers name their rows by type: `rlRowNameOfTy`, the element
+      type's nominal render with a function type in parentheses, and with a recursive declared
+      union unfolded to its members at the nested cut. `forceCloListTypeOf`'s cut is retired
+      (270 events in 60 files, every one typed). The other two cuts are the floor for a missing
+      type or a hole: `collectARefArrayAnn` 339 of 19,520 events, `ensureRefElemTys` 730 of
+      3,070. difftree `--identity`: 75 of 16,632 files differ, every one a pure reorder of type
+      definitions with the same run outcome.
     - The nine `emit_base` grammar predicates go when their name-only callers in D2 and C5 take
       a type.
   - L2 stage 2 at 38bf5d273, probed over the self-compile and 16,733 files with 0 uncompared:
