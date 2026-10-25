@@ -3,6 +3,7 @@
 // parameter.
 
 import {
+  ArrayLit,
   Block,
   Call,
   FuncDecl,
@@ -11,6 +12,7 @@ import {
   LetDecl,
   Member,
   Node,
+  NumLit,
   OptMember,
   P,
   Param,
@@ -96,6 +98,7 @@ import {
   noteMemCstr,
   notePrintCstr,
 } from "./check_cstr_rows"
+import { ctnLitInitOf } from "./check_ctn_lit_bind"
 import {
   cstrOwnerStack,
   inferQuiet,
@@ -166,7 +169,12 @@ import {
   getterBoundNote,
   getterFnFor,
 } from "./check_getter_effects"
-import { arrDefCallTy, holeCastParamName } from "./check_hole_links"
+import {
+  arrDefCallTy,
+  declParamNameAt,
+  holeCastParamName,
+  holeCastReachedDecls,
+} from "./check_hole_links"
 import {
   HD_ELEM,
   HD_PARAM,
@@ -364,6 +372,7 @@ import {
   cwFrameOfDecl,
   cwLambdaDeclOf,
   cwPeel,
+  cwSlotWrittenValues,
   cwSoleBinderOf,
   fnDeclIx,
 } from "./check_write_scan"
@@ -1746,12 +1755,29 @@ function callFtyHoleParamDemands(
       }
     }
     // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
-    holeCastPinCheck(
-      pHole.tvName,
-      at,
-      holeCastParamName(n.callFn, dParams, i, pHole.tvName),
-    )
+    const hcName = holeCastParamName(n.callFn, dParams, i, pHole.tvName)
+    holeCastPinCheck(pHole.tvName, at, hcName)
+    if hcName == "" { holeCastPinReached(n.callFn, i, at) }
   }
+}
+
+// The parked casts of every function a re-pointed callee binding reaches, each re-asked under
+// its own parameter `i`'s hole and name at the argument type `at` (D3691).
+function holeCastPinReached(callFnIx: i32, i: i32, at: i32) {
+  for d in holeCastReachedDecls(callFnIx) {
+    const f = nodeAt(d)
+    const ft = nodeTyOf(d)
+    if f is FuncDecl && ft >= 0 && ft < T.tys.length {
+      const fty = tyAt(ft)
+      if fty is TyFunc && i < fty.fnParamTypes.length {
+        const ph = tyAt(fty.fnParamTypes[i])
+        if ph is TyVar {
+          holeCastPinCheck(ph.tvName, at, declParamNameAt(f.fnParams, i))
+        }
+      }
+    }
+  }
+  0
 }
 
 // Argument `i` delivered to `expected` under the generic-argument and wider-record flags,
@@ -1844,6 +1870,10 @@ function callFtyPinCstrs(
       if aliasIx >= 0 { cstrCallee = aliasIx }
     }
     cstrWho = cfn.identName
+  }
+  // A call typed through a constant list's element owns that element's constraints only.
+  if cstrCallee == CSTR_NODECL && constListFnElemTy(n.callFn) >= 0 {
+    cstrCallee = constListFnElemDecl(n.callFn)
   }
   // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
   // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
@@ -2424,8 +2454,7 @@ function pinHoleLambdaVals(
       } else if inst >= 0 {
         const nm: string[] = []
         const ty: i32[] = []
-        for v in vNames { nm.push(v) }
-        for t in vTys { ty.push(t) }
+        holeBindsOnly(vNames, vTys, nm, ty)
         holeLambdaBinds(vt, inst, nm, ty)
         judgeHoleLambdaAt(vt, inst, nm, ty, ix)
       }
@@ -2699,8 +2728,7 @@ function holeLambdaDefault(
     if inst >= 0 {
       const nm: string[] = []
       const ty: i32[] = []
-      for v in vNames { nm.push(v) }
-      for t in vTys { ty.push(t) }
+      holeBindsOnly(vNames, vTys, nm, ty)
       holeLambdaBinds(lam, inst, nm, ty)
       const d0 = T.diags.length
       judgeHoleLambdaAt(lam, inst, nm, ty, ix)
@@ -2726,6 +2754,21 @@ function holeLambdaUninferable(lx: i32) {
         return 0
       }
     }
+  }
+  0
+}
+
+// Pushes onto `nm`/`ty` the bindings of `vNames`/`vTys` that name holes. A lambda's body cannot
+// name the callee's declared type parameters, and binding one would substitute every generic
+// that shares its name.
+function holeBindsOnly(vNames: string[], vTys: i32[], nm: string[], ty: i32[]) {
+  let i = 0
+  while i < vNames.length && i < vTys.length {
+    if vNames[i].slice(0, 1) == "?" {
+      nm.push(vNames[i])
+      ty.push(vTys[i])
+    }
+    i = i + 1
   }
   0
 }
@@ -2803,6 +2846,52 @@ function checkOptCallNode(n: Call, ix: i32, cfn: OptMember): i32 {
   rt
 }
 
+// The type of the function `xs[k]` names when `xs` is a literal `const` list, `k` an integer
+// literal and element `k` a hole-typed function's name: the call is judged against the element
+// it reads, not the list's element type (D10893). -1 otherwise.
+function constListFnElemTy(calleeIx: i32): i32 {
+  const d = constListFnElemDecl(calleeIx)
+  if d < 0 { return -1 }
+  const t = nodeTyOf(d)
+  if t >= 0 && t < T.tys.length && tyHasTyVar(t) { return t }
+  -1
+}
+
+// The module-scope declaration element `k` of `xs[k]` names, as `constListFnElemTy` reads it;
+// -1 otherwise, and for a list whose elements are written after its initialiser.
+function constListFnElemDecl(calleeIx: i32): i32 {
+  const c = nodeAt(parenPeelIx(calleeIx))
+  if !(c is Index) { return -1 }
+  const k = nodeAt(c.idxIndex)
+  const a = nodeAt(c.idxArr)
+  if !(k is NumLit) || !(a is Ident) { return -1 }
+  const init = ctnLitInitOf(a.identName)
+  if init < 0 { return -1 }
+  const lit = nodeAt(parenPeelIx(init))
+  if !(lit is ArrayLit) { return -1 }
+  let j = 0
+  while j < lit.arrElems.length {
+    if i32ToStr(j) == k.numText {
+      const el = nodeAt(parenPeelIx(lit.arrElems[j]))
+      if !(el is Ident) || lookupDepth(el.identName) != 0 { return -1 }
+      if listElemsWritten(c.idxArr, a.identName) { return -1 }
+      return lookupFnDeclNode(el.identName)
+    }
+    j = j + 1
+  }
+  -1
+}
+
+// Whether the list `nm` read at `ix` has an element written after its initialiser; true when the
+// write scan cannot place the binding.
+function listElemsWritten(ix: i32, nm: string): boolean {
+  const fr = covarRootFrame(ix)
+  if fr == CW_FR_UNKNOWN { return true }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  cwSlotWrittenValues(nm, fr, ["[]"], vals, ats) != 0
+}
+
 // A call expression, dispatched on the callee's shape: a member callee to
 // `checkMemberCallNode`, a bare identifier to `checkUnimplementedIntrinsicCall` and
 // `checkBuiltinIdentCall`, a function-typed value to `checkCallOnFuncTy`. The type-answering
@@ -2851,7 +2940,14 @@ export function checkCallNode(n: Call, ix: i32) {
   ckCalleeIxSet(savedCallee)
   if fnTy >= 0 && fnTy < T.tys.length {
     const ft = tyAt(fnTy)
-    if ft is TyFunc { return checkCallOnFuncTy(n, ix, cfn, ft) }
+    if ft is TyFunc {
+      const kt = constListFnElemTy(n.callFn)
+      if kt >= 0 {
+        const kf = tyAt(kt)
+        if kf is TyFunc { return checkCallOnFuncTy(n, ix, cfn, kf) }
+      }
+      return checkCallOnFuncTy(n, ix, cfn, ft)
+    }
     if ft is TyErr {
       // A module global called above its declaration, which the hoist could not type: its
       // arguments are still checked on their own, as a hole callee's are (D3899).

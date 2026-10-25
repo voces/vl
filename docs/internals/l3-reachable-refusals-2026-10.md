@@ -36,49 +36,72 @@ commit's.
 
 | grade | sites |
 | --- | ---: |
-| CAPABILITY, every witness has an open row | 100 (17 by new rows D12450-D12466, 83 by existing rows) |
-| CAPABILITY, but a DESIGN row among the witnesses is not moved | 6 |
-| DESIGN, held at emit | 4 |
-| DESIGN, moved to the checker by this lane | 1 (`wasmEmit.vl:27003`, D3483) |
+| CAPABILITY, every witness has an open row | 106 (17 by new rows D12450-D12466, 89 by existing rows) |
+| CAPABILITY, but a DESIGN row among the witnesses is not moved | 0 |
+| DESIGN, held at emit as a recorded floor | 3 (`emit_mono.vl:9197`, `emit_mono.vl:9207`, `emit_sections.vl:10209`) |
+| DESIGN, moved to the checker by this lane | 2 (`wasmEmit.vl:27003`, D3483; `emit_mono.vl:9184`) |
 | total reached | 111 |
 
-The lane moved four rows into the checker, D2689, D3052, D3483 and D4052, in two rules:
+The lane moved five rows into the checker, D2689, D3052, D3483, D4052 and D12467, in two rules:
 
 - `asgTargetIsPlace` (check_operators.vl): an assignment target must be a place.
 - `voidStoreCheck` (check_relate_core.vl, check_annot_resolve.vl): no `void` list element, map
-  key or map value, also as a union member there, in any written annotation or record field. The ruling is DECISIONS.md §"void is a real type" (d).
+  key or map value, and no union with a `void` member, in any written annotation or record
+  field. The ruling is DECISIONS.md §"void is a real type" (d).
 
 Only D3483 had a site of its own in the reached set. D2689, D3052 and D4052 had refused at sites
 that other open rows still reach.
 
-D12467 is graded UNDECIDED, not CAPABILITY. A written top-level `i32 | void` parameter is
-check-clean and reaches `wasmEmit.vl:8101`. Ruling (d) forbids `void | i32` as a stored element.
-It does not say whether a written parameter of that type is legal, so the row waits on that
-question. The site has another open row too, D12100.
+D12467, a written top-level `i32 | void` parameter, was check-clean and reached
+`wasmEmit.vl:8101`. The owner ruled on 2026-10-24 that (d) covers every written `T | void`, a
+parameter, binding, field or result annotation alike, so it is DESIGN and moved:
+`voidStoreCheck` now refuses it and points to `T | null`. The site stays CAPABILITY under its
+other open row, D12100.
+
+The residue pass moved six more DESIGN rows and one site into the checker, and changed how a
+call through a constant list element is typed, in six rules:
+
+| rows | rule | file |
+| --- | --- | --- |
+| D1852, D2965 | a spread literal joining `u8` with another element type, refused once no destination annotation took it (`u8MixLits`) | check_container_lits.vl, check_bind_rows.vl, check_program.vl |
+| D2194 | a function with no result annotation is an inferred list origin only if no returned value relays a parameter's list or a free non-literal global (`noRetFnRelaysList`) | check_list_origin.vl, check_leaf_steps.vl |
+| D1433, D3437 | a nested read off a type-variable-rooted derivation, at a place no narrowing touches, is re-asked at each pin | check_access.vl, check_narrow_paths.vl |
+| D3691 | a call through a binding whose writes all reach functions re-asks each one's parked casts | check_hole_links.vl, check_calls.vl |
+| D10893 | a call of `xs[k]`, `k` a literal index into a literal `const` list, is typed through element `k` when that element is generic (`constListFnElemTy`) | check_calls.vl |
+| `emit_mono.vl:9184` | `T.size` in a body whose parameters never name `T` cannot be inferred; explicit type arguments still fold | check_node_rules.vl, check_fn_lit_sites.vl |
+
+The D1433 rule declines a bare-name object. A bare name's `else` remainder keeps no narrowing
+fact, so re-asking `z.v` at the pin would refuse running programs (24 `d3204` corpus cells). It
+also moves one non-running spelling from emit to check: a literal-discriminant `==` on a member
+path inside a generic body. Its direct spelling is a loud emit reject too, filed as D12473.
+
+D2965 had been filed as CAPABILITY, but the question it left open is D1852's ruling. D10893 had
+been graded DESIGN on the premise that the checker owed `cannot infer a type for parameter`.
+That refusal turned out to be a separate defect, D12471: a lambda judged at one generic's call
+bound every same-named type parameter. With D12471 fixed (`holeBindsOnly`), D10893's witness
+runs, so D10893 was CAPABILITY, and so does its index-0 spelling, which had been a check reject.
+The `constListFnElemTy` rule also closed three CAPABILITY rows, D10892, D10894 and D10895, which
+now run. A residue stays at emit and is filed open as D12472: two different elements called
+through the list, each handed a lambda, where one calls its parameter at two instances. None of the six moved rows had a site of its own: each site is still reached
+by open CAPABILITY rows. The
+probe `flat-layout-const-unbound-type-param` and its `live-sites.json` row are removed, since
+that program is now a check reject (`generics/error-size-of-unbound-type-param.vl`).
 
 ## Residue: DESIGN sites still at emit
 
-**Six DESIGN rows not moved.** Each of these sites is also reached by CAPABILITY rows, and the
-DESIGN rows among them are still graded open:
+**Three recorded floors.** A check-clean program reaches each one. The refusal is DESIGN, but
+the fact that decides it exists only after the checker:
 
-- D10893 at `emit_mono.vl:23115`;
-- D3437 at `wasmEmit.vl:11561`;
-- D1433 at `wasmEmit.vl:11568`;
-- D1852 at `wasmEmit.vl:11779`;
-- D2194 at `wasmEmit.vl:29215`;
-- D3691 at `wasmEmit.vl:36996`.
-
-**Four sites a check-clean program reaches, where the refusal is DESIGN and the fact deciding
-it is per instance:**
-
-- `emit_mono.vl:9184`: `T.size` where no parameter binds `T`. Under the D4551 ruling such a
-  `T` is default-bound, and a default must never be observable, so the checker owes this. The
-  probe `flat-layout-const-unbound-type-param` predates that ruling.
 - `emit_mono.vl:9197` and `emit_mono.vl:9207`: a flat generic row bound to a non-flat type, or
-  read at a field the bound type lacks. `flat-records-design.md` §11 decides this per
-  instance, at the pin.
+  read at a field the bound type lacks. `flat-records-design.md` §11 decides this per instance,
+  at the pin. The pin's `T` is a PHANTOM parameter of `Rows<T>`. The checker resolves `Rows<P>`
+  to the same record as every other `Rows<_>`, so no checker binding of `T` exists to ask. Only
+  the monomorphizer binds `T`, reading the written spelling. That disagreement is a clause-1
+  defect on its own, filed as D12470. A checker that binds phantom parameters would move both
+  sites.
 - `emit_sections.vl:10209`: an export named `memory` in a program that uses linear memory.
-  Whether memory is exported is decided by emit (`memUsed`).
+  Whether memory is exported depends on `vl build --import-memory` and on emit's `memUsed`
+  scan of the lowered module. `vl check` sees neither.
 
 ## Reproduce
 
@@ -115,8 +138,8 @@ it is per instance:**
 | `emit_mono.vl:20604` | emitProgram: a function this call reaches through a list or join is already taken at anoth… | 2 row, 2 fixture | D10791 | CAPABILITY | open D10791, D10792 |
 | `emit_mono.vl:20872` | emitProgram: a generic function is passed to a function value whose parameter type names a… | 2 row, 2 fixture | D3956 | CAPABILITY | open D3956, D10700 |
 | `emit_mono.vl:22721` | emitProgram: monomorphize: a function parameter handed on to `{}` in a call to `{}` is cal… | 1 row | D12218 | CAPABILITY | open D12218 |
-| `emit_mono.vl:23115` | emitProgram: monomorphize: unsupported argument type for `{}` in a call to `{}` | 13 row, 17 corpus | D3038 | CAPABILITY; DESIGN not moved | open D3038, D3325, D3366, D3942, D9762, D9764, D9782, D10010, D10892, D10893, D10895, D10894, D12180 |
-| `emit_mono.vl:23455` | emitProgram: monomorphize: `{}` is called at two instances of the function handed to it in… | 3 fixture | `closures/listed-hole-fn-variable-index-reject.vl` | CAPABILITY | new D12450 |
+| `emit_mono.vl:23115` | emitProgram: monomorphize: unsupported argument type for `{}` in a call to `{}` | 9 row, 17 corpus | D3038 | CAPABILITY | open D3038, D3325, D3366, D3942, D9762, D9764, D9782, D10010, D12180; D10892, D10893, D10894 and D10895 now run |
+| `emit_mono.vl:23455` | emitProgram: monomorphize: `{}` is called at two instances of the function handed to it in… | 3 fixture | `closures/listed-hole-fn-variable-index-reject.vl` | CAPABILITY | new D12450; residue pass D12472 |
 | `emit_mono.vl:23692` | emitProgram: monomorphize: expected an array argument for `{}` in a call to `{}` | 3 row | D2772 | CAPABILITY | open D2772, D3821, D4661 |
 | `emit_mono.vl:23713` | emitProgram: monomorphize: a generic function handed to two parameters of type `{}` in a c… | 1 row, 1 fixture | D12232 | CAPABILITY | open D12232 |
 | `emit_mono.vl:24672` | emitProgram: a call through a chain of more than {} un-annotated aliases of a lambda has n… | 1 row, 1 fixture | D12233 | CAPABILITY | open D12233 |
@@ -126,11 +149,11 @@ it is per instance:**
 | `emit_mono.vl:2905` | emitProgram: a nullable-{} list element has no rep; use a non-null element type | 1 fixture, 1 probe | `generics/error-nullable-type-param-list-niche-litunion.vl` | CAPABILITY | new D12451 |
 | `emit_mono.vl:3298` | emitProgram: a join of a `??` with a type parameter drops a member of that parameter at th… | 1 row, 1 fixture, 4 corpus | D2934 | CAPABILITY | new D12453 |
 | `emit_mono.vl:3322` | emitProgram: a join of type parameters pinned at two number types beside a null has no box… | 2 row | D3485 | CAPABILITY | open D3485, D3591 |
-| `emit_mono.vl:9184` | emitProgram: monomorphize: `{}.{}` needs `{}` bound by a parameter — a layout constant is … | 1 probe | probe `flat-layout-const-unbound-type-param` | DESIGN, held at emit | a layout constant of a type parameter no parameter binds; the D4551 ruling default-binds such a parameter (`monoTyParamReachesSpelling`), and the probe's `Should print 9` predates it |
-| `emit_mono.vl:9197` | emitProgram: monomorphize: `{}` is bound to `{}`, which is not a `flat` type, so it has no… | 1 fixture | `memory/flat-generic-rows-not-flat-rejected.vl` | DESIGN, held at emit | `docs/internals/flat-records-design.md` §11, a flat layout is instance-only |
-| `emit_mono.vl:9207` | emitProgram: monomorphize: `flat type {}` (bound to `{}`) has no field '{}' — its layout m… | 1 fixture | `memory/flat-generic-rows-unknown-member-rejected.vl` | DESIGN, held at emit | the same §11 rule, an unknown member of a flat generic row |
+| `emit_mono.vl:9184` | emitProgram: monomorphize: `{}.{}` needs `{}` bound by a parameter — a layout constant is … | 1 probe | probe `flat-layout-const-unbound-type-param` (removed) | DESIGN, moved | `checkRetTyParamBound` (check_node_rules.vl) refuses `T.size` when no parameter names `T`; pins `generics/error-size-of-unbound-type-param.vl`, `generics/size-of-explicit-type-arg.vl` |
+| `emit_mono.vl:9197` | emitProgram: monomorphize: `{}` is bound to `{}`, which is not a `flat` type, so it has no… | 1 fixture | `memory/flat-generic-rows-not-flat-rejected.vl` | DESIGN, recorded floor | §11 of `docs/internals/flat-records-design.md`: the pin binds a phantom `T` of `Rows<T>`, which only the monomorphizer binds (D12470) |
+| `emit_mono.vl:9207` | emitProgram: monomorphize: `flat type {}` (bound to `{}`) has no field '{}' — its layout m… | 1 fixture | `memory/flat-generic-rows-unknown-member-rejected.vl` | DESIGN, recorded floor | the same §11 rule and the same phantom binding, an unknown member of a flat generic row |
 | `emit_rewrite.vl:4306` | {} | 2 row, 1 fixture | D2340 | CAPABILITY | open D2340, D3371 |
-| `emit_sections.vl:10209` | emitProgram: this program exports a function named 'memory', but a program that uses linea… | 1 fixture | `memory/export-memory-name-collision.vl` | DESIGN, held at emit | an exported name colliding with the memory export; whether memory is exported is an emit fact (`memUsed`) |
+| `emit_sections.vl:10209` | emitProgram: this program exports a function named 'memory', but a program that uses linea… | 1 fixture | `memory/export-memory-name-collision.vl` | DESIGN, recorded floor | whether memory is exported depends on `--import-memory` and emit's `memUsed` scan, which `vl check` never sees |
 | `emit_sections.vl:1116` | emitProgram: internal: a parameter type the valtype ladder has no rung for — every paramet… | 2 row | D2735 | CAPABILITY | open D2735, D5001 |
 | `emit_sections.vl:9810` | emitProgram: module global has no initializer | 3 row | D2020 | CAPABILITY | open D2020, D2655, D3372 |
 | `emit_shape_intern.vl:1652` | emitProgram: a nullable-{} list element has no rep; use a non-null element type | 1 fixture | `generics/error-generic-alias-nullable-param-list-at-app.vl` | CAPABILITY | new D12452 |
@@ -139,9 +162,9 @@ it is per instance:**
 | `emit_value_sites.vl:922` | {} | 1 fixture | `types/error-record-join-lambda-to-generic.vl` | CAPABILITY | new D12454 |
 | `wasmEmit.vl:10653` | emitProgram: literal `is` over a union with no recorded members | 1 row | D4203 | CAPABILITY | open D4203 |
 | `wasmEmit.vl:11551` | {}field access but no struct type declared{} | 4 row, 1 fixture | D1886 | CAPABILITY | open D1886, D2750, D4614, D4645 |
-| `wasmEmit.vl:11561` | {}field access receiver is not a struct{} | 4 row | D3224 | CAPABILITY; DESIGN not moved | open D3224, D3437, D3921, D4266 |
-| `wasmEmit.vl:11568` | {}unknown struct field in field access{} | 2 row | D1433 | CAPABILITY; DESIGN not moved | open D1433, D3431 |
-| `wasmEmit.vl:11779` | emitProgram: a spread whose elements must each be boxed into a union or nullable element h… | 4 row, 1 fixture | D1852 | CAPABILITY; DESIGN not moved | open D1852, D2969, D2965, D2970 |
+| `wasmEmit.vl:11561` | {}field access receiver is not a struct{} | 3 row | D3224 | CAPABILITY | open D3224, D3921, D4266; D3437 moved |
+| `wasmEmit.vl:11568` | {}unknown struct field in field access{} | 1 row | D3431 | CAPABILITY | open D3431; D1433 moved |
+| `wasmEmit.vl:11779` | emitProgram: a spread whose elements must each be boxed into a union or nullable element h… | 2 row | D2969 | CAPABILITY | open D2969, D2970; D1852 and D2965 moved, and their fixture is now a check reject |
 | `wasmEmit.vl:12747` | emitProgram: struct array elements are not supported | 1 row | D2920 | CAPABILITY | open D2920 |
 | `wasmEmit.vl:12806` | emitProgram: a list literal around a generic call whose `??` default is a list of another … | 1 fixture | `generics/error-list-literal-around-coalesce-default-clash.vl` | CAPABILITY | new D12455 |
 | `wasmEmit.vl:13220` | emitProgram: unsupported map value type (no rep for a union-member struct, a nullable list… | 2 row | D10400 | CAPABILITY | open D10400, D12340 |
@@ -176,14 +199,14 @@ it is per instance:**
 | `wasmEmit.vl:2854` | emitProgram: object literal writes a field its union variant does not declare | 1 row, 1 fixture | D4136 | CAPABILITY | open D4136 |
 | `wasmEmit.vl:28651` | emitProgram: unsupported .map/.filter element type | 2 row | D2193 | CAPABILITY | open D2193, D4712 |
 | `wasmEmit.vl:28682` | emitProgram: .map/.filter scratch frame not reserved | 1 row | D10351 | CAPABILITY | open D10351 |
-| `wasmEmit.vl:29215` | emitProgram: covariant list delivery: a {}[] cannot be delivered into a {}[] here. The two… | 2 row | D2194 | CAPABILITY; DESIGN not moved | open D2194, D2215 |
+| `wasmEmit.vl:29215` | emitProgram: covariant list delivery: a {}[] cannot be delivered into a {}[] here. The two… | 1 row | D2215 | CAPABILITY | open D2215; D2194 moved |
 | `wasmEmit.vl:2964` | emitProgram: object literal matches no union variant | 1 row | D4644 | CAPABILITY | open D4644 |
 | `wasmEmit.vl:30326` | emitProgram: a returned string cannot be shown to be a member of the literal union this in… | 1 row, 1 fixture | D4173 | CAPABILITY | open D4173 |
 | `wasmEmit.vl:35808` | emitProgram: literal-union string widening with no members | 5 row | D2213 | CAPABILITY | open D2213, D3228, D3239, D4028, D4885 |
 | `wasmEmit.vl:35840` | emitProgram: literal-union string widening with no members | 278 corpus | corpus `d3290_r4_gE_e0866_letSNw_coal_gen_KN0` | CAPABILITY | new D12464 |
 | `wasmEmit.vl:36550` | emitProgram: a generic function taken as a value reaches no call that fixes its type — ann… | 5 row | D4120 | CAPABILITY | open D4120, D9191, D9722, D10370, D10403 |
 | `wasmEmit.vl:36575` | emitProgram: identifier is not a parameter, local, or global | 1 row | D2621 | CAPABILITY | open D2621 |
-| `wasmEmit.vl:36996` | emitProgram: bare null needs a struct-typed context | 10 row, 1 fixture | D2665 | CAPABILITY; DESIGN not moved | open D2665, D2667, D2889, D2971, D2964, D3131, D3243, D3691, D8880, D10934 |
+| `wasmEmit.vl:36996` | emitProgram: bare null needs a struct-typed context | 9 row, 1 fixture | D2665 | CAPABILITY | open D2665, D2667, D2889, D2971, D2964, D3131, D3243, D8880, D10934; D3691 moved |
 | `wasmEmit.vl:38121` | emitProgram: only an identifier assignment is a value expression | 4 row | D2171 | CAPABILITY | open D2171, D2632; D2689, D3052 moved |
 | `wasmEmit.vl:38385` | emitProgram: the two operands of this list `+` do not resolve to one list rep | 1 row | D4860 | CAPABILITY | open D4860 |
 | `wasmEmit.vl:38511` | emitProgram: struct equality is not supported yet | 2 fixture | `unions/error-arm-struct-equality-mixed.vl` | CAPABILITY | new D12465 |
