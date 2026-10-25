@@ -182,6 +182,7 @@ import {
   nodeAt,
   nodeChildren,
   nodeChildrenPush,
+  nodeContains,
   nodeSpineChildren,
   nodeToks,
   nodeValueSpineChildren,
@@ -437,6 +438,12 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
     lvIfAt(x, loop.whileBody, ty, atStmt)
     return x
   }
+  const label = lvLabelOf(x)
+  const body = lvBodyOf(x)
+  // A choice among functions of an open signature carries the index of the one chosen.
+  const fns = lvOpenFnChoice(x, ty)
+  let cty = ty
+  if fns.length > 0 { cty = TY_I32 }
   // The loop moves to a fresh node, and the if-expression takes its place.
   const y = addNode(loop)
   identFrom(y, x)
@@ -447,47 +454,145 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
     nodeTyRecord(init, lvTyNull())
   } else {
     // A wide scalar binding declares with a zero; the frame's value overwrites it before any read.
-    const prim = tyPrimNameOf(ty)
+    const prim = tyPrimNameOf(cty)
     if prim != null {
       if prim == "f64" || prim == "f32" { init = mkNum("0.0", pos) }
       if prim == "i64" { init = mkNum("0", pos) }
     }
-    nodeTyRecord(init, ty)
+    nodeTyRecord(init, cty)
   }
   // A spelling naming a type parameter is resolved from its name, as each instance's own is.
-  let annTy = ty
-  if tyHasTyVar(ty) { annTy = -1 }
-  const tr = synthTypeRefTy(spell, pos, annTy)
-  if annTy != ty { monoAnnOpenTyNote(tr, ty) }
+  let annTy = cty
+  if tyHasTyVar(cty) { annTy = -1 }
+  let spellC = spell
+  if fns.length > 0 { spellC = lvSpellOf(cty) }
+  const tr = synthTypeRefTy(spellC, pos, annTy)
+  if annTy != cty { monoAnnOpenTyNote(tr, cty) }
   const decl = mkLet("let", name, tr, init, pos)
   nodeTyRecord(decl, lvTyVoid())
-  const rd = mkIdent(name, pos)
-  identFromDecl(rd, decl)
-  nodeTyRecord(rd, ty)
-  let label = ""
-  let body = -1
   if loop is WhileStmt {
-    label = loop.whileLabel
-    body = loop.whileBody
     if !nullable { loop.whileLv = name }
     if loop.whileBlk == 1 {
-      lvRewriteTail(body, loopValTailOf(x), name, decl, ty)
+      lvRewriteTail(body, loopValTailOf(x), name, decl, cty)
     }
-  } else if loop is ForRange {
-    label = loop.frLabel
-    body = loop.frBody
-  } else if loop is ForIn {
-    label = loop.fiLabel
-    body = loop.fiBody
   }
-  lvRewriteBreaks(body, label, name, decl, ty, 0, false)
+  lvRewriteBreaks(body, label, name, decl, cty, 0, false, [])
+  lvChoiceIndex = Map()
   const thenSt: i32[] = []
   thenSt.push(decl)
   thenSt.push(y)
-  thenSt.push(rd)
+  if fns.length > 0 {
+    thenSt.push(lvChoiceOf(fns, name, decl, ty, pos))
+  } else {
+    const rd = mkIdent(name, pos)
+    identFromDecl(rd, decl)
+    nodeTyRecord(rd, ty)
+    thenSt.push(rd)
+  }
   const thenB = mkBlock(thenSt, pos)
   lvIfAt(x, thenB, ty, atStmt)
   y
+}
+
+// Each exit value `lvOpenFnChoice` moved into the choice, to the index `lvAssign` stores instead.
+let lvChoiceIndex: {[i32]: i32} = Map()
+
+// The body of the loop or labelled block at `x`, or -1 for any other node.
+function lvBodyOf(x: i32): i32 {
+  const n = nodeAt(x)
+  if n is WhileStmt { return n.whileBody }
+  if n is ForRange { return n.frBody }
+  if n is ForIn { return n.fiBody }
+  lvNoBody(x)
+}
+
+// Every other kind has no body a `break` leaves.
+function lvNoBody(_ix: i32): i32 { -1 }
+
+// `lvOpenFnExits` for the loop at `x`, noting each exit to store its index, so the carrier is an
+// `i32`; the functions, the first exit naming each moved into the choice.
+function lvOpenFnChoice(x: i32, ty: i32): i32[] {
+  lvChoiceIndex = Map()
+  const vals: i32[] = []
+  const idx: i32[] = []
+  const fns = lvOpenFnExits(x, ty, vals, idx)
+  let i = 0
+  while i < vals.length && fns.length > 0 {
+    const num = mkNum(i32ToStr(idx[i]), nodeAt(vals[i]).pos)
+    nodeTyRecord(num, TY_I32)
+    lvChoiceIndex[vals[i]] = num
+    i = i + 1
+  }
+  fns
+}
+
+// For the loop at `x` whose non-null value of type `ty` is a function of an open signature that
+// every exit hands over as a function declared outside it: those functions, each exit's value
+// pushed onto `vals` and its function's position among them onto `idx` (D7080). Else empty.
+function lvOpenFnExits(x: i32, ty: i32, vals: i32[], idx: i32[]): i32[] {
+  const none: i32[] = []
+  const body = lvBodyOf(x)
+  if ty < 0 || body < 0 || tyBearsNull(ty) || !tyHasTyVar(ty) { return none }
+  if !(tyAt(ty) is TyFunc) { return none }
+  lvRewriteBreaks(body, lvLabelOf(x), "", -1, ty, 0, false, vals)
+  const n = nodeAt(x)
+  if n is WhileStmt && n.whileBlk == 1 {
+    const tail = loopValTailOf(x)
+    if tail < 0 { return none }
+    vals.push(tail)
+  }
+  if vals.length == 0 { return none }
+  const fns: i32[] = []
+  for v in vals {
+    const u = unwrapParen(v)
+    if u < 0 || !(nodeAt(u) is Ident) { return none }
+    const d = identDeclOf(u)
+    if d < 0 || d >= P.nodes.length || !(nodeAt(d) is FuncDecl) { return none }
+    if nodeContains(body, d) { return none }
+    let k = 0
+    while k < fns.length && identDeclOf(fns[k]) != d { k = k + 1 }
+    if k == fns.length { fns.push(u) }
+    idx.push(k)
+  }
+  fns
+}
+
+// The value `if $lv == 0 { f0 } else if … else { fN }` of type `ty`, choosing among `fns` by
+// the index held in the carrier `name` that `decl` declares.
+function lvChoiceOf(
+  fns: i32[],
+  name: string,
+  decl: i32,
+  ty: i32,
+  pos: i32,
+): i32 {
+  let k = fns.length - 1
+  let acc = fns[k]
+  while k > 0 {
+    k = k - 1
+    const rd = mkIdent(name, pos)
+    identFromDecl(rd, decl)
+    nodeTyRecord(rd, TY_I32)
+    const num = mkNum(i32ToStr(k), pos)
+    nodeTyRecord(num, TY_I32)
+    const cond = mkBinary("==", rd, num, pos)
+    nodeTyRecord(cond, lvTyBool())
+    let els = acc
+    if !(nodeAt(acc) is IfStmt) { els = lvChoiceArm(acc, ty, pos) }
+    const w = mkIf(cond, lvChoiceArm(fns[k], ty, pos), els, pos)
+    nodeTyRecord(w, ty)
+    valueIfAdd(w)
+    acc = w
+  }
+  acc
+}
+
+// One arm `{ f }` of a choice, typed `ty`.
+function lvChoiceArm(f: i32, ty: i32, pos: i32): i32 {
+  const st: i32[] = [f]
+  const b = mkBlock(st, pos)
+  nodeTyRecord(b, ty)
+  b
 }
 
 // Whether node `x` is a labelled block whose value, of type `ty`, holds a function of an open
@@ -498,7 +603,16 @@ function lvBlockIsOwnValue(x: i32, ty: i32): boolean {
   const n = nodeAt(x)
   if !(n is WhileStmt) || n.whileBlk != 1 { return false }
   if !tyHasTyVar(ty) || !tyMayHoldFn(ty, 0) { return false }
-  const all = lvRewriteBreaks(n.whileBody, n.whileLabel, "", -1, ty, 0, false)
+  const all = lvRewriteBreaks(
+    n.whileBody,
+    n.whileLabel,
+    "",
+    -1,
+    ty,
+    0,
+    false,
+    [],
+  )
   all == lvTailBreaks(n.whileBody, n.whileLabel, ty, false)
 }
 
@@ -664,14 +778,11 @@ function exitFirstLetsAnnotate() {
       const d = nodeAt(li)
       if d is LetDecl {
         let ty = nodeTyIxOf(d.letInit)
-        if (
-          lvBlockIsOwnValue(
-            unwrapParen(d.letInit),
-            loopValTyOf(unwrapParen(d.letInit)),
-          )
-        ) {
-          ty = -1
-        }
+        const lx = unwrapParen(d.letInit)
+        const lty = loopValTyOf(lx)
+        if lvBlockIsOwnValue(lx, lty) { ty = -1 }
+        // A choice among open functions resolves at each call, so the binding keeps no type.
+        if lvOpenFnExits(lx, lty, [], []).length > 0 { ty = -1 }
         if letNullHoleUnfilled(li) { ty = -1 }
         const filled = letNullHoleFilledTy(li)
         if filled >= 0 { ty = filled }
@@ -692,7 +803,8 @@ function exitFirstLetsAnnotate() {
 
 // `name = v` for the value `v` a loop exit hands over, typed as the checker typed `v`; `decl`
 // declares `name`.
-function lvAssign(name: string, decl: i32, v: i32, ty: i32): i32 {
+function lvAssign(name: string, decl: i32, v0: i32, ty: i32): i32 {
+  const v = lvChoiceIndex[v0] ?? v0
   // An inner loop value rewritten as a statement is a value from here on, so the collect pass
   // must walk its arms for their locals.
   if v >= 0 && nodeAt(v) is IfStmt { valueIfAdd(v) }
@@ -719,8 +831,8 @@ function lvRewriteTail(body: i32, tail: i32, name: string, decl: i32, ty: i32) {
 
 // Rewrites each `break v` under `ix` that leaves the loop labelled `label` (`depth` 0 while no
 // loop or block lies between them) so its value statement stores into `name`, and counts them;
-// `name` "" only counts. A labelled `break` leaves it only while no nearer loop or block takes
-// the same label (`shadow`).
+// `name` "" only counts, pushing each value onto `vals`. A labelled `break` leaves it only while
+// no nearer loop or block takes the same label (`shadow`).
 function lvRewriteBreaks(
   root: i32,
   label: string,
@@ -729,6 +841,7 @@ function lvRewriteBreaks(
   ty: i32,
   depth0: i32,
   shadow0: boolean,
+  vals: i32[],
 ) {
   const todo: i32[] = [root]
   const todoDepth: i32[] = [depth0]
@@ -740,7 +853,16 @@ function lvRewriteBreaks(
     const shadow = todoShadow.pop() ?? false
     if ix >= 0 && ix < P.nodes.length && !(nodeAt(ix) is FuncDecl) {
       found = found
-        + lvRewriteBlockBreaks(ix, label, name, decl, ty, depth, shadow)
+        + lvRewriteBlockBreaks(
+        ix,
+        label,
+        name,
+        decl,
+        ty,
+        depth,
+        shadow,
+        vals,
+      )
       let d = depth
       let sh = shadow
       const inner = lvLabelOf(ix)
@@ -786,6 +908,7 @@ function lvRewriteBlockBreaks(
   ty: i32,
   depth: i32,
   shadow: boolean,
+  vals: i32[],
 ) {
   const n = nodeAt(ix)
   let found = 0
@@ -797,7 +920,11 @@ function lvRewriteBlockBreaks(
         const b = nodeAt(st[j])
         if b is BreakStmt {
           if b.brkHasVal == 1 && lvLeaves(b.brkLabel, label, depth, shadow) {
-            if name != "" { st[j - 1] = lvAssign(name, decl, st[j - 1], ty) }
+            if name != "" {
+              st[j - 1] = lvAssign(name, decl, st[j - 1], ty)
+            } else {
+              vals.push(st[j - 1])
+            }
             found = found + 1
           }
         }
