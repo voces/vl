@@ -7112,6 +7112,12 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
       fbEnd()
       return 0
     }
+    // A chain the hole instance pins non-null is the plain field read, at the field's own rep (D3215).
+    if tyProvesNonNull(nodeTyAt(exprIx, fnIx)) {
+      if emitOptChainValue(body, e.omObj, fnIx, ec) < 0 { return -1 }
+      fbStructGet(sHeapIdx[osi], ofi)
+      return 0
+    }
     return emitFailAt(
       "emitProgram: a standalone `?.` has no rep for this result type — read it through `?? d` or a `!= null` guard",
       exprIx,
@@ -41706,6 +41712,42 @@ function emitCoalesceOptNulRecord(
   return 0
 }
 
+// `p?.f ?? d` over a receiver typed `Arm | null`, laid out at variant row `nvi` rather than a
+// struct row: a hole instance's pin reaches it, where the rewrite that guards a concrete one
+// reads the shared node (D3215). A field whose rep has an `if` blocktype only.
+function emitCoalesceOptNulVariant(
+  body: u8[],
+  e: BinExpr,
+  lhs: OptMember,
+  nvi: i32,
+  fnIx: i32,
+  ec: ExpCtx,
+) {
+  if nvi < 0 || nvi >= uVarHeap.length {
+    return emitFail("emitProgram: `?.` receiver has no union arm row")
+  }
+  const vfi = variantFieldIndex(nvi, lhs.omProp)
+  if vfi < 0 {
+    return emitFail("emitProgram: `?.` field is not on the union arm")
+  }
+  const vCode = variantFieldTypeAt(nvi, vfi)
+  if !optChainFieldCodeOk(vCode) {
+    return emitFail(
+      "emitProgram: `?.` over a nullable union arm has no `if` blocktype for this field's rep",
+    )
+  }
+  if emitOptRecvBase(body, lhs.omObj, fnIx, false, ec) < 0 { return -1 }
+  fbRefIsNull()
+  fbIfForSharedField(vCode)
+  if emitOptChainDefault(body, e.binRight, vCode, fnIx, ec) < 0 { return -1 }
+  fbElse()
+  if emitOptRecvBase(body, lhs.omObj, fnIx, false, ec) < 0 { return -1 }
+  fbRefCast(uVarHeap[nvi])
+  fbStructGet(uVarHeap[nvi], vfi)
+  fbEnd()
+  0
+}
+
 // `m[k]?.f ?? d` over a map whose value row is `omSl`: probe, then the field off the hit's
 // value or the default. Returns -1 on a failure, else 0.
 function emitCoalesceOptMapField(
@@ -41817,6 +41859,12 @@ function emitCoalesceOptMember(
           fnIx,
           ec,
         )
+      }
+    }
+    if exprNullableVariant(lhs.omObj, fnIx) {
+      const nvi = nulVariantIdxOfExpr(lhs.omObj, fnIx)
+      if nvi >= 0 {
+        return emitCoalesceOptNulVariant(body, e, lhs, nvi, fnIx, ec)
       }
     }
     // A nested optional chain `o?.inner?.v ?? d` (niche nullable links): any null link selects
