@@ -17,6 +17,7 @@ import {
   TyUnion,
   TyVar,
   litUnionAliasNameOfTy,
+  structNameOfTy,
   tyArrayElemIx,
   tyAt,
   tyIsLitUnion,
@@ -41,6 +42,7 @@ import { fieldCodeOfListRep } from "./emit_list_rep"
 import { isStructOfTy, mvValLowersTy, variantRowOfTy } from "./emit_mv_slots"
 import { isVariantSpelling, variantIndexOf } from "./emit_narrow_slots"
 import {
+  MV_ARM_NOHINT,
   fieldElemTyIxOfName,
   repCanonId,
   repElemTyOfName,
@@ -586,7 +588,7 @@ export function nestedStructNamesCompat(ta: string, elem: string): boolean {
 // `name` resolves to, field by field in order — the container-element question.
 export function variantIndexOfOwnRender(name: string): i32 {
   if !nameIsShapeOpen(name) { return -1 }
-  variantRowOwnRender(jrOneRecordOf(repElemTyOfName(name)), true)
+  variantRowOwnRender(jrOneRecordOf(repElemTyOfName(name)), true, -1)
 }
 
 // The arm whose own type renders as the record `ty` does — the arm recorded at that record
@@ -594,7 +596,7 @@ export function variantIndexOfOwnRender(name: string): i32 {
 export function variantRowOfOwnRenderTy(tyIn: i32): i32 {
   const ty = jrOneRecordOf(tyIn)
   if ty < 0 { return -1 }
-  variantRowOwnRender(ty, false)
+  variantRowOwnRender(ty, false, -1)
 }
 
 // The arm record `ty` is: the arm recorded at `ty` itself, else the arm whose own render is the
@@ -606,6 +608,36 @@ export function variantRowOfShapeTy(ty: i32): i32 {
   const vi = variantRowOfOwnRenderTy(ty)
   if vi < 0 || vi >= uVarTyIx.length || !tySame(uVarTyIx[vi], ty) { return -1 }
   vi
+}
+
+// The inline arm an anonymous record `ty` is: an arm with no declared name whose type is the
+// same type, which an inline annotation of that arm reaches by shape (D4638). A declared record,
+// or a declared arm of its layout, is not this arm. -1 for none.
+function anonArmRowOfTy(ty: i32): i32 {
+  if structNameOfTy(ty) != "" { return -1 }
+  const r = jrOneRecordOf(ty)
+  if r < 0 { return -1 }
+  variantRowOwnRender(r, false, ty)
+}
+
+// The arm a map value of type `ty` is, or holds through map hops: the arm recorded at the type,
+// else the inline arm an anonymous record is (`anonArmRowOfTy`). -1 for none.
+export function mvArmSigOfShapeTy(ty: i32, depth: i32): i32 {
+  if ty < 0 || depth <= 0 || ty >= T.tys.length { return -1 }
+  const v = variantRowOfTy(ty)
+  if v >= 0 { return v }
+  const an = anonArmRowOfTy(ty)
+  if an >= 0 { return an }
+  const t = tyAt(ty)
+  if t is TyMap { return mvArmSigOfShapeTy(t.mVal, depth - 1) }
+  -1
+}
+
+// The mv slot find's arm hint for a value of type `ty`: `MV_ARM_NOHINT` with no type, else the
+// arm the mint records for it (`mvArmSigOfShapeTy`), or -1 for a type reaching no arm.
+export function mvArmHintOfShapeTy(ty: i32): i32 {
+  if ty < 0 { return MV_ARM_NOHINT }
+  mvArmSigOfShapeTy(ty, 8)
 }
 
 // `isVariantSpelling`, then the arm whose record is the tested record's type spelled by shape:
@@ -623,14 +655,20 @@ export function isVariantSpellingOfShape(variant: string, tyIx: i32): string {
 
 // The one arm scan both keys share: the first arm that is the record `ty` or has its fields in
 // its order, each spelled alike; `exact` also keeps a literal field apart from its base, as the
-// arm's own render does. -1 for none.
-function variantRowOwnRender(ty: i32, exact: boolean): i32 {
+// arm's own render does. `anonOf` >= 0 keeps only an arm with no declared name that is that
+// same type. -1 for none.
+function variantRowOwnRender(ty: i32, exact: boolean, anonOf: i32): i32 {
   if ty < 0 { return -1 }
   let vi = 0
   while vi < uVariants.length {
     if vi < uVarTyIx.length && uVarTyIx[vi] >= 0 {
       const a = uVarTyIx[vi]
-      if a == ty || jrSameFieldSeq(a, ty, 0, exact) { return vi }
+      if (
+        (a == ty || jrSameFieldSeq(a, ty, 0, exact))
+        && (anonOf < 0 || (structNameOfTy(a) == "" && tySame(a, anonOf)))
+      ) {
+        return vi
+      }
     }
     vi = vi + 1
   }
