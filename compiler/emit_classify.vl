@@ -773,6 +773,7 @@ import {
   mvValStructIdxOf,
   mvValVariantOf,
   nulCloFlagAnn,
+  refListElemKindOfTy,
   repSigNulVariantTok,
   repSigVariantTok,
   rlElemInnerSlot,
@@ -787,6 +788,7 @@ import {
   structIndexOfTypeName,
   structIndexOfTypeNameTy,
   structRowOfObjFieldSet,
+  tyIsRefArray,
   uFieldMapShape,
   uFieldTgtStructIdx,
   variantIndexOfTypeName,
@@ -1027,6 +1029,7 @@ import {
   fnInPinnedInstance,
   holeCompositeTyOf,
   holeOperandTyOf,
+  holeRecordTyOf,
   identNameOrEmpty,
   indexCellCurSet,
   indexCellCurSetId,
@@ -1073,6 +1076,7 @@ import {
   paramStruct,
   rlElemMapShape,
   rlMintNameOfTy,
+  rlRowNameOfTy,
   unionClosureArrElemUnion,
   unionMapArmNameTy,
   unionNameOfVariant,
@@ -6094,6 +6098,13 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     ) {
       const ar = repRowOfTyStruct(adopted, sScanLim())
       if ar >= 0 { return ar }
+    }
+    // A hole instance builds the record its own bindings make, which two instances' rows
+    // share field names with and the scan below cannot tell apart (D12920).
+    const hrec = holeRecordTyOf(nodeTyIxOf(objIx), fnIx)
+    if nf > 0 && hrec >= 0 && !tyReachesUnion(hrec, 8) {
+      const hr = repRowOfTyStruct(hrec, sScanLim())
+      if hr >= 0 { return hr }
     }
     // The name-only scan can match several structs at once (a string literal fits both
     // `{f: string}` and litunion-atom `{f: K0}`); ambiguity defers to the checker's recorded type.
@@ -11296,7 +11307,7 @@ function globalKind(initIx: i32): VKind {
     // string list (kind 7); an f64-element literal is the f64 list (kind 12); an
     // i32/empty literal is the i32 list (kind 2). A module-global empty `[]` over a ref
     // type is out of scope (a global ref-list constexpr needs the binding annotation).
-    if arrLitIsRef(initIx) { return "reflist" }
+    if arrLitIsRef(initIx, -1) { return "reflist" }
     if arrLitIsStr(initIx, -1) { return "strlist" }
     const nk = arrLitNumKind(initIx, -1)
     if nk == ALK_F64 { return "f64list" }
@@ -11619,10 +11630,37 @@ export function arrLitUnionElemName(arrIx: i32): string {
   cen
 }
 
-// True if the array literal at `arrIx` has ref elements — its first element is a struct
-// object literal or a union-variant object literal. An empty literal is not detectable
-// here (it has no elements); its kind comes from the binding annotation (`ExpCtx.listKind`).
-export function arrLitIsRef(arrIx: i32) {
+// True if the array literal at `arrIx` has ref elements in function `fnIx` (-1: no frame) —
+// its first element is a struct or variant object literal, or its type there is a ref list.
+// An empty literal is not detectable here; its kind comes from the destination.
+export function arrLitIsRef(arrIx: i32, fnIx: i32) {
+  arrLitIsRefTpl(arrIx) || arrLitFrameRefTy(arrIx, fnIx) >= 0
+}
+
+// The list type literal `arrIx` has in frame `fnIx` when its recorded type names a hole or a
+// type parameter, the frame's binding of it is a ref list with a row name, and the frameless
+// rungs leave the literal to the i32 list. -1 otherwise (D10891).
+export function arrLitFrameRefTy(arrIx: i32, fnIx: i32): i32 {
+  if fnIx < 0 { return -1 }
+  const it = nodeTyInOf(arrIx, fnIx)
+  if it < 0 || it >= T.tys.length || it == nodeTyIxOf(arrIx) { return -1 }
+  const e = tyArrayElemIx(it)
+  if e < 0 || e >= T.tys.length { return -1 }
+  // A union or nullable value box, or a list element, is left to the template's rungs, the
+  // ones that also choose an enclosing list literal's row (D3154).
+  const eT = tyAt(e)
+  if tyIsArray(e) || eT is TyUnion { return -1 }
+  if eT is TyNullable {
+    const ni = eT.nInner
+    if ni < 0 || ni >= T.tys.length || !(tyAt(ni) is TyObj) { return -1 }
+  }
+  if refListElemKindOfTy(e) < 0 || !tyIsRefArray(it) { return -1 }
+  if rlRowNameOfTy(e, false) == "" || arrLitIsRefTpl(arrIx) { return -1 }
+  it
+}
+
+// `arrLitIsRef` read off the literal's own recorded type, the answer every frame shares.
+function arrLitIsRefTpl(arrIx: i32) {
   const a = nodeAt(arrIx)
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
@@ -11642,7 +11680,7 @@ export function arrLitIsRef(arrIx: i32) {
     // a wrapper-heap mismatch between the outer key and the inner literal's own build. A ref
     // inner literal falls through to the arena rung below instead, one level short here.
     if e0 is ArrayLit {
-      if !arrLitIsRef(a.arrElems[0]) { return true }
+      if !arrLitIsRefTpl(a.arrElems[0]) { return true }
     }
     // A checker-typed union element: the kind-2 box list. Last rung, deliberately — every
     // literal that classifies by its first element keeps that classification, so this arm
@@ -11828,7 +11866,7 @@ export function arrLitNestedNumKind(a: ArrayLit, e0x: i32, fnIx: i32): i32 {
 export function arrLitElemNameIn(arrIx: i32, fnIx: i32): string {
   const sn = spreadLitSrcRowName(arrIx, fnIx)
   if sn != "" { return sn }
-  const nm = arrLitElemName(arrIx)
+  const nm = arrLitElemName(arrIx, fnIx)
   if nm != "i32[]" { return nm }
   const pn = arrLitFrameLeafRow(arrIx, fnIx)
   if pn != "" && rlSlotByName(pn) >= 0 { return pn }
@@ -11846,7 +11884,7 @@ export function arrLitFrameLeafRow(arrIx: i32, fnIx: i32): string {
       return ""
     }
     const e0x = arrLitLeadInner(a)
-    if emptyArrLitIxOf(e0x) >= 0 || arrLitIsRef(e0x) { return "" }
+    if emptyArrLitIxOf(e0x) >= 0 || arrLitIsRef(e0x, fnIx) { return "" }
     if arrLitIsStr(e0x, fnIx) { return "string[]" }
     const nk = arrLitNestedNumKind(a, e0x, fnIx)
     if nk == ALK_F64 { return "f64[]" }
@@ -11855,7 +11893,16 @@ export function arrLitFrameLeafRow(arrIx: i32, fnIx: i32): string {
   ""
 }
 
-export function arrLitElemName(arrIx: i32) {
+// The ref-list row name the array literal at `arrIx` keys in function `fnIx` (-1: no frame),
+// or "" when it is no ref list there.
+export function arrLitElemName(arrIx: i32, fnIx: i32): string {
+  const ft = arrLitFrameRefTy(arrIx, fnIx)
+  if ft >= 0 { return rlRowNameOfTy(tyArrayElemIx(ft), false) }
+  arrLitElemNameTpl(arrIx)
+}
+
+// `arrLitElemName` read off the literal's own recorded type, the answer every frame shares.
+function arrLitElemNameTpl(arrIx: i32): string {
   const a = nodeAt(arrIx)
   if a is ArrayLit {
     // A closure-element literal: the parenthesized function-type table key the checker
@@ -11886,7 +11933,7 @@ export function arrLitElemName(arrIx: i32) {
         // below cannot render — they answer one level short, keying a different row than
         // the element actually builds (D702). The arena renders it instead, the same string
         // the annotated spelling interns. Must agree arm for arm with `arrLitElemKind`'s kind-9 rung.
-        if arrLitIsRef(e0x) {
+        if arrLitIsRef(e0x, -1) {
           const rin = arrLitNestedElemName(arrIx)
           if rin != "" { return rin }
         }
