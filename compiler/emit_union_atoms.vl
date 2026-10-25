@@ -41,6 +41,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  cUserTypes,
   litBaseTy,
   litUnionAliasNameOfTy,
   litUnionInlineNameOfTy,
@@ -52,8 +53,10 @@ import {
   tyEqSoftLits,
   tyIsLitUnion,
   tyIxIsFunc,
+  tyReachesCycle,
   tySame,
   tyToEmitName,
+  tyToNominalName,
 } from "./check_types"
 import { anonLeafSupersedeOf, structIndexByName } from "./emit_atom_kinds"
 import {
@@ -643,6 +646,34 @@ export function rlInternOfTy(ty: i32) {
 // The spelling a row minted by `rlInternOfTy(ty)` is stored and looked up under.
 export function rlMintNameOfTy(ty: i32): string { tyToEmitName(ty) }
 
+// The row name an element of type `ty` is stored under: its nominal render, a function type
+// in parentheses. With `unfold`, a recursive declared union renders as its members, the
+// spelling a nested list's inner element is written in. "" when `ty` is -1 or has a hole.
+export function rlRowNameOfTy(ty: i32, unfold: boolean): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const n = tyToNominalName(ty)
+  if n == "" { return "" }
+  const t = tyAt(ty)
+  if t is TyFunc { return "(" + n + ")" }
+  if (
+    !unfold
+    || !(t is TyUnion)
+    || (cUserTypes[n] ?? -1) < 0
+    || !tyReachesCycle(ty)
+  ) {
+    return n
+  }
+  let o = ""
+  for m in t.uMembers {
+    let s = tyToNominalName(m)
+    if s == "" { return n }
+    if tyAt(m) is TyFunc { s = "(" + s + ")" }
+    if o != "" { o = o + "|" }
+    o = o + s
+  }
+  o
+}
+
 // `ensureRefElemTy` with the element's type `kindTy` held apart from the key hint `ty`:
 // `kindTy` only classifies a map element's value, so a caller whose hint is -1 by design
 // still hands over the type it holds. Either may be -1.
@@ -650,10 +681,10 @@ export function ensureRefElemTys(elemName: string, ty: i32, kindTy: i32) {
   if elemName == "" { return -1 }
   const k = refArrElemKind(refElemArrName(elemName))
   if k == RLK_REF_LIST {
-    // The nested recursion carries the row down: when this function's own element is
-    // itself a ref array (kind 9), its inner element is `ty`'s own `aElem`, so the inner
-    // intern needs no re-resolution of the spelling this line cuts.
-    const inm = refArrElemName(elemName)
+    // The inner element's row is named from `kindTy`'s element type; the spelling cut is
+    // the floor for a caller that holds no type, or a type with a hole.
+    let inm = rlRowNameOfTy(tyStepElem(kindTy), true)
+    if inm == "" { inm = refArrElemName(elemName) }
     let inner = tyStepElem(ty)
     if elemNameIsNominal(inm) { inner = -1 }
     ensureRefElemTys(inm, inner, tyStepElem(kindTy))
@@ -1519,7 +1550,11 @@ function forceCloListTypeOf(t: string, tTy: i32) {
     // producer interned, or the read finds no wrapper.
     rlUsed = true
     raUsed = true
-    ensureRefElemTys(refArrElemName(res), -1, tyStepElem(resTy))
+    ensureRefElemTys(
+      rlRowNameOfTy(tyStepElem(resTy), false),
+      -1,
+      tyStepElem(resTy),
+    )
   } else if annArrowAt(res) >= 0 {
     // A curried position (`() => () => f32[]`) recurses into its own positions.
     forceCloResultListTypes(res, resTy)
