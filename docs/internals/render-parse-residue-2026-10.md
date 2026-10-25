@@ -105,7 +105,7 @@ The other 3 renders and 12 parses in B are **conditional key producers**:
 - `rlMintNameOfTy` (D1)
 - `rlCanonLitUnionAtoms` ×4
 - `shapeFieldElemName` ×3
-- `nulLitUnionInnerName` ×2
+- `nulLitUnionInnerName` ×2 (retired: it is deleted, and its callers ask the field's type)
 - `canonLitUnionArms`
 - `iisPushFieldElem`
 - `markRefArrayArmsOf`
@@ -156,9 +156,9 @@ The 43 floor entries fall into five kinds:
 - **Diagnostic renders**: 7. They are in `emit_closure_sites` (4) and `wasmEmit` (3).
 - **Nominal or module spellings**: 3. They are `nominalizePartOfTy`, `nodeMapArmNominalName` and
   `anonMapValName`.
-- **Others**: `nulLitUnionInnerName`, which cuts a key after its callers have already chosen the
-  field code (2 parses), and `cboxElemNeedsParens`, a paren decision for a spelling being built
-  (1 parse).
+- **Others**: `nulLitUnionInnerName`, which cut a key after its callers had already chosen the
+  field code (2 parses, since retired), and `cboxElemNeedsParens`, a paren decision for a
+  spelling being built (1 parse).
 
 The floor is conditional. Once D1 and D2 key the ref-list and mv slots by type, the 18 key
 producers stop being the key. They then become dead or move into the canon renderer, and the floor
@@ -1100,9 +1100,18 @@ What each slice changes:
     through an alias TypeRef is now interned too, and a literal-union argument is named by
     its atom row. `difftree --identity` over the 267 files: 0 differ, 0 uncompared. The walk
     reads the canon column (`fdRowOf`), so a canon-rewritten TypeRef needs no spelling leg.
-  - Left: `nulLitUnionInnerName`. Its `anonMintRowFor` caller holds `leafSet`, a merged
-    spelling from `anonLeafPolyUnionSet` with no type behind it, and the `ftxt` caller in
-    `emit_shape_rows.vl` holds only a field's text.
+  - Done: 2 parses. `nulLitUnionInnerName` is deleted. `shapeFieldElemName` and
+    `fieldRecElemName` ask `nulLitUnionInnerNameOfTy` of the field's arena type, and
+    `fieldRefElemName` now hands `shapeFieldElemName` its row. `anonMintRowFor`'s code-30 leaf
+    reaches code 30 only as `K | null` with `K` the `??` operand's declared atom, so it asks
+    `anonLeafAnnAtomOf` instead of cutting `leafSet`. `shapeFieldTypeCompatK` still passes -1;
+    it holds only a render and is reached only at codes 19 and 29, where the type is not read.
+    Answer-probed over the self-compile and 16,768 files: the leaf agreed in all 3 files. At the
+    field sites the spelling answered a written alias and an inline set two ways, by its hidden
+    alias (`#lu2`) or by its spaced members (`"a" | "b"`), depending on how the field was
+    rendered. The type answers the alias, as `anonFieldElemName` already does, and disagreed
+    in 2 of 14 files at `shapeFieldElemName` and 5 of 35 at `fieldRecElemName`, all of them that
+    choice. `difftree --identity` over 16,656 files: 0 differ, 0 uncompared.
   - Left, re-probed after D7 and D8: the four grammar predicates answered true in as many
     files as before (`nameIsNulString` 231, `nameIsNulBool` 65, `nulLitUnionScan` 121, and
     `nameIsStrLitSet` 266). The callers that reach their true arms are unchanged.

@@ -29,6 +29,7 @@ import {
   TyPrim,
   TyUnion,
   litUnionAliasNameOfTy,
+  litUnionInlineNameOfTy,
   tyAt,
   tyIsLitUnion,
   tyIsNulStringRep,
@@ -36,6 +37,7 @@ import {
   tyNulInnerIsPrim,
 } from "./check_types"
 import { sidArrGet, sidArrPut, sidLookup, sidOf, sidOfNode } from "./symbols"
+import { nulLitUnionPeelTy } from "./tyquery"
 import { luIsTyOf } from "./check_list_union"
 // ── the type-name grammars this file calls, homed in `tyname.vl` ──
 // A leaf with zero imports; this file binds them for its own calls and republishes
@@ -2434,14 +2436,12 @@ export function nameIsNulLitUnionList(name: string) {
 }
 // A nullable literal-union type name — `K | null` / `"a" | "b" | null` (the i32 atom niche):
 // member ids intern >= 0 and the spare value -1 encodes `null`. `canonEmitName` preserves the
-// litunion (`nulLitUnionPreserve`) so members survive here. This is the predicate form of
-// `nulLitUnionInnerName`, the primitive — the niche exists exactly when that has a non-null part to name, so the two cannot disagree.
+// litunion (`nulLitUnionPreserve`) so members survive here. A caller holding the type asks
+// `nulLitUnionInnerNameOfTy` for the non-null part's name instead.
 export function nameIsNulLitUnion(name: string) { nulLitUnionScan(name) }
 
-// The predicate, decided without building anything: `nulLitUnionInnerName` is still the
-// primitive for callers that want the name, but this one only compared that result to "" —
-// allocating a joined string just to test emptiness. Same scanner, same bounds, same
-// top-level `=>` stop as the split; the per-member tests are the same three, in span form, with zero allocations.
+// The predicate, decided without building anything: a two-part `X | null` whose `X` is a
+// literal set, or a top-level `null` beside 2+ quoted members, scanned in span form.
 function nulLitUnionScan(name: string): boolean {
   const b = nullablePartOf(name)
   if b != "" { return nameIsStrLitSet(b) }
@@ -2470,44 +2470,15 @@ function nulLitUnionScan(name: string): boolean {
   }
   hasNull && lits >= 2
 }
-// The one home for the nullable-litunion niche: the non-null part of a nullable-litunion
-// name — the litunion alias (`K` of `K | null`) or the re-joined quoted members of the
-// expanded inline form (`"a" | "b"` of `"a" | "b" | null`). "" when `name` is not a nullable
-// litunion — also the "no" of `nameIsNulLitUnion` above. Decided in one pass over one split: a top-level `null` member, and 2+ non-null members that are all quoted string literals.
-export function nulLitUnionInnerName(name: string) {
-  // Two-part `K | null`: the non-null part is a litunion alias / inline union.
-  const b = nullablePartOf(name)
-  if b != "" {
-    if nameIsStrLitSet(b) { return b }
-    return ""
-  }
-  // Expanded multi-member form `"a" | "b" | null`: a top-level `null` member plus an
-  // all-quoted-literal remainder (2+ members, so `nullablePartOf`'s two-part split missed it).
-  // The literal test rejects on the first unquoted member; reaching that reject before seeing
-  // the `null` member is the same answer, since both conditions are required.
-  const parts: string[] = []
-  splitUnionAtoms(name, parts)
-  let lits = 0
-  let hasNull = false
-  let out = ""
-  let i = 0
-  while i < parts.length {
-    const p = parts[i]
-    if p == "null" {
-      hasNull = true
-    } else {
-      if p.length < 2 { return "" }
-      // The quoted-leaf test at its home (`tyname.nameIsQuotedLeaf`); this site's own
-      // `length < 2` bound stays in front of it.
-      if !nameIsQuotedLeaf(p) { return "" }
-      lits = lits + 1
-      if out == "" { out = p } else { out = out + " | " + p }
-    }
-    i = i + 1
-  }
-  if !hasNull { return "" }
-  if lits < 2 { return "" }
-  out
+// The non-null union name a `K | null` niche of arena type `ty` records: the literal union's
+// alias (a written `K`, or an annotated inline set's hidden one, as the anonymous twin
+// `anonFieldElemName` records), else its inline member spelling. "" when `ty` is not the niche.
+export function nulLitUnionInnerNameOfTy(ty: i32): string {
+  const lt = nulLitUnionPeelTy(ty)
+  if lt < 0 { return "" }
+  const al = litUnionAliasNameOfTy(lt)
+  if al != "" { return al }
+  litUnionInlineNameOfTy(lt)
 }
 // 1 if the type-annotation node at `tyIx` is a nullable function `(fn) | null`, else 0 — the
 // closure dual of `retNulRefFlag`. Purely structural, like its nullable-niche siblings
