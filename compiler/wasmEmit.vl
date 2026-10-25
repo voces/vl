@@ -4461,7 +4461,7 @@ function listFitGrowScan(fnIx: i32) {
         if (
           pushed
           && kind != null
-          && listFitGrowUsesOk(fn.fnBody, -1, r.identName, kTy, false)
+          && listFitGrowUsesOk(fn.fnBody, -1, r.identName, kTy, false, fnIx)
         ) {
           fitGrowName.push(r.identName)
           fitGrowTy.push(kTy)
@@ -4532,13 +4532,16 @@ function listFitGrowUsesOk(
   name: string,
   kTy: i32,
   inner: boolean,
+  fnIx: i32,
 ): boolean {
   if ix < 0 || ix >= P.nodes.length { return true }
   const n = nodeAt(ix)
-  if n is FuncDecl { return listFitGrowUsesOk(n.fnBody, ix, name, kTy, true) }
+  if n is FuncDecl {
+    return listFitGrowUsesOk(n.fnBody, ix, name, kTy, true, fnIx)
+  }
   if n is Ident && n.identName == name {
     if inner { return false }
-    const t = nodeTyIxOf(ix)
+    const t = nodeTyAt(ix, fnIx)
     if t >= 0 && tySame(t, kTy) { return true }
     if par < 0 { return false }
     const p = nodeAt(par)
@@ -4549,7 +4552,7 @@ function listFitGrowUsesOk(
     return p is Member && p.memObj == ix && p.memProp == "length"
   }
   for k in nodeChildren(ix) {
-    if !listFitGrowUsesOk(k, ix, name, kTy, inner) { return false }
+    if !listFitGrowUsesOk(k, ix, name, kTy, inner, fnIx) { return false }
   }
   true
 }
@@ -4819,12 +4822,14 @@ function listNarrowReadDisjoint(
   }
   if body < 0 { return true }
   const r = nodeAt(unwrapParen(recv))
-  if r is Member { return narrowReadsName(body, isIx, r.memProp, true, instTy) }
+  if r is Member {
+    return narrowReadsName(body, isIx, r.memProp, true, instTy, fnIx)
+  }
   if r is Ident {
-    return narrowReadsName(body, isIx, r.identName, false, instTy)
+    return narrowReadsName(body, isIx, r.identName, false, instTy, fnIx)
   }
   // Flow narrows only an identifier or a field; any other receiver names nothing, so no read matches.
-  narrowReadsName(body, isIx, "", false, instTy)
+  narrowReadsName(body, isIx, "", false, instTy, fnIx)
 }
 
 function narrowReadsName(
@@ -4833,9 +4838,10 @@ function narrowReadsName(
   name: string,
   field: boolean,
   instTy: i32,
+  fnIx: i32,
 ): boolean {
   if name == "" { return false }
-  narrowReadDisjointUnder(body, name, field, instTy)
+  narrowReadDisjointUnder(body, name, field, instTy, fnIx)
     || narrowRegionReads(body, isIx, name, field) == 2
 }
 
@@ -4844,12 +4850,13 @@ function narrowReadDisjointUnder(
   name: string,
   field: boolean,
   instTy: i32,
+  fnIx: i32,
 ): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   const n = nodeAt(ix)
   const hit = if field { n is Member && n.memProp == name } else { n is Ident && n.identName == name }
   if hit {
-    const t = nodeTyIxOf(ix)
+    const t = nodeTyAt(ix, fnIx)
     if t >= 0 && listDisjointDepth(instTy, t) >= 1 { return true }
   }
   const kids = nodeChildren(ix)
@@ -4865,7 +4872,9 @@ function narrowReadDisjointUnder(
   }
   let i = 0
   while i < kids.length {
-    if narrowReadDisjointUnder(kids[i], name, field, instTy) { return true }
+    if narrowReadDisjointUnder(kids[i], name, field, instTy, fnIx) {
+      return true
+    }
     i = i + 1
   }
   false
@@ -7009,7 +7018,7 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
         exprIx,
       )
     }
-    const ord = repOfNode(exprIx)
+    const ord = repOfNode(exprIx, fnIx)
 
     // `boolean | null` shares one unconditional i32 blocktype: the sentinel 2 (`null`) and
     // the live 0/1 result are the same valtype, so the two arms below need no cast to join.
@@ -9169,8 +9178,8 @@ function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
   if (
     narrowedStructArmVi(exprIx) < 0
     && !narrowedNulStructArm(exprIx)
-    && !exprTyIsRecord(exprIx, false)
-    && !exprTyIsRecord(exprIx, true)
+    && !exprTyIsRecord(exprIx, false, fnIx)
+    && !exprTyIsRecord(exprIx, true, fnIx)
   ) {
     return false
   }
@@ -9180,9 +9189,9 @@ function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
 // Whether the checker typed `exprIx` as one record, or as `record | null` when `nullable`.
 // A box of that type is a union of same-shape records collapsed to the record (D4989), so
 // its payload is the record itself.
-function exprTyIsRecord(exprIx: i32, nullable: boolean): boolean {
+function exprTyIsRecord(exprIx: i32, nullable: boolean, fnIx: i32): boolean {
   if exprIx < 0 { return false }
-  const ty = nodeTyIxOf(unwrapParen(exprIx))
+  const ty = nodeTyAt(unwrapParen(exprIx), fnIx)
   if nullable { return ty >= 0 && tyIsRecord(nullableInnerOrNone(ty)) }
   tyIsRecord(ty)
 }
@@ -9191,10 +9200,10 @@ function exprTyIsRecord(exprIx: i32, nullable: boolean): boolean {
 // `exprIx` is narrowed to `X | null`. Emitted after the value, so the box is already on the
 // stack. A negative `heapIdx` emits nothing: a destination whose table slot never resolved has
 // no cast target, and `ref.cast -1` would put a garbage heap index in the module.
-function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32) {
+function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
   emitArmUnboxCast(
     heapIdx,
-    narrowedNulStructArm(exprIx) || exprTyIsRecord(exprIx, true),
+    narrowedNulStructArm(exprIx) || exprTyIsRecord(exprIx, true, fnIx),
   )
 }
 
@@ -9219,7 +9228,7 @@ function emitArmDelivery(
 ) {
   const owed = narrowedArmNeedsUnbox(exprIx, fnIx)
   if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
-  if owed && heapIdx >= 0 { emitNarrowedArmUnboxTo(heapIdx, exprIx) }
+  if owed && heapIdx >= 0 { emitNarrowedArmUnboxTo(heapIdx, exprIx, fnIx) }
   0
 }
 
@@ -9264,6 +9273,7 @@ export function emitGlobalInitArmUnbox(gLet: i32, kind: VKind, initIx: i32) {
   emitNarrowedArmUnboxTo(
     armDestHeapOf(kind, globalCellArmIdx(gLet, kind)),
     initIx,
+    -1,
   )
 }
 
@@ -12676,7 +12686,7 @@ function emitArrRefElem(
     // The narrowed-arm unbox at a ref-list element (D1031) — `[s]` of a `Circle[]` under
     // `if s is Circle`. The slot's own element heap is the destination, the same one
     // `rlBackIdx` types the backing array with.
-    if elArmOwed { emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot), e) }
+    if elArmOwed { emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot), e, fnIx) }
   }
   // Read-only covariance at a nested-list element (D791, D965) — `[lv1]` of a
   // `(readonly Shape[])[]`.
@@ -14808,7 +14818,7 @@ function emitMapSetValExpr(
   // Circle` over a `{[string]: Circle}` — targets the vals element's own heap, the same
   // one `mvSlotNullable`'s `ref.null` seed above reads.
   if mvArmOwed && mslot >= 0 {
-    emitNarrowedArmUnboxTo(mvValElemHeapOf(mslot), valIx)
+    emitNarrowedArmUnboxTo(mvValElemHeapOf(mslot), valIx, fnIx)
   }
   // Read-only covariance at the map-value boundary (D791) — `mU["k"] = lv1` over a
   // `{[string]: Shape[]}` — targets the same `mvValInnerRlSlot` row the build seed above
@@ -25829,7 +25839,11 @@ function emitCallRefArg(
       if cnvArg is NullLit { cnvCtx.nulRefHeap = uVarHeap[cnvSlot] }
       if emitExprExpect(body, args[i], fnIx, cnvCtx) < 0 { return -1 }
       if narrowedArmNeedsUnbox(args[i], fnIx) {
-        emitNarrowedArmUnboxTo(armDestHeapOf("nulvariant", cnvSlot), args[i])
+        emitNarrowedArmUnboxTo(
+          armDestHeapOf("nulvariant", cnvSlot),
+          args[i],
+          fnIx,
+        )
       }
     } else if cuNm != "" {
       if emitUnionBoxArg(body, cuNm, -1, args[i], fnIx, ec) < 0 { return -1 }
@@ -25883,6 +25897,7 @@ function emitCallRefArg(
         emitNarrowedArmUnboxTo(
           armDestHeapOf(pkk, sigParamSlotAt(ckey, i)),
           args[i],
+          fnIx,
         )
       }
     } else {
@@ -26234,7 +26249,7 @@ function emitAssignGlobal(
     // the narrowed-arm unbox at the same boundary (D1031) — `gv = s` under `if s is
     // Circle`, between two module globals; `armDestHeapOf` reads the destination pair.
     if !gaCoerced && narrowedArmNeedsUnbox(a.binRight, fnIx) {
-      emitNarrowedArmUnboxTo(armDestHeapOf(gaKind, gaArmIdx), a.binRight)
+      emitNarrowedArmUnboxTo(armDestHeapOf(gaKind, gaArmIdx), a.binRight, fnIx)
     }
     // the nullable-niche recover at the same boundary (D1115) — `g = y` under
     // `if y != null`, into a global whose cell is a non-null ref.
@@ -26476,6 +26491,7 @@ function emitAssignIdent(
       emitNarrowedArmUnboxTo(
         armDestHeapOf(localIsRef[asgSlot], localStructIdx[asgSlot]),
         a.binRight,
+        fnIx,
       )
     }
   }
@@ -26752,9 +26768,14 @@ function emitAssignIndex(
       emitNarrowedArmUnboxTo(
         armDestHeapOf("variant", st.variantIdx),
         a.binRight,
+        fnIx,
       )
     } else if st.structIdx >= 0 {
-      emitNarrowedArmUnboxTo(armDestHeapOf("struct", st.structIdx), a.binRight)
+      emitNarrowedArmUnboxTo(
+        armDestHeapOf("struct", st.structIdx),
+        a.binRight,
+        fnIx,
+      )
     }
   }
   const storeValSlot = listIdxValSlot(st.mfKind, st.slot)
@@ -27677,7 +27698,7 @@ function emitPushOne(
   // the narrowed-arm unbox at the `.push` boundary (D1031) — `xs.push(s)` into a
   // `Circle[]` under `if s is Circle`. The element-literal twin is in `emitArr`; both
   // read the same slot heap, so the two spellings of one store cannot disagree.
-  if pushArmOwed { emitNarrowedArmUnboxTo(ps.armHeap, argIx) }
+  if pushArmOwed { emitNarrowedArmUnboxTo(ps.armHeap, argIx, fnIx) }
   // the read-only covariant copy at the `.push` boundary (D2163)
   if ps.rSlot >= 0 { emitNestedListWidenSite(body, argIx, fnIx, ps.rSlot) }
   // D1197 — the non-null recover `.push` OWED. Eight sibling deliveries of the same
@@ -30459,7 +30480,7 @@ function emitReturnBoundaryWidens(
   // (kind, slot) pair the result valtype is written from.
   if retArmHeap >= 0 && retVi < 0 {
     if narrowedArmNeedsUnbox(retArg, fnIx) {
-      emitNarrowedArmUnboxTo(retArmHeap, retArg)
+      emitNarrowedArmUnboxTo(retArmHeap, retArg, fnIx)
     }
   }
   0
@@ -36498,7 +36519,7 @@ function emitIdentNode(
   }
   // a union binding narrowed to a niche-repped `A | null` reads as that niche, under the same
   // three storage gates as the atom arm above (D2590).
-  const nNk = nicheReadKindAt(exprIx, e.identName)
+  const nNk = nicheReadKindAt(exprIx, e.identName, fnIx)
   if nNk >= 0 {
     if identReadsUnionBox(isid, e.identName, exprIx, fnIx) {
       return emitNarrowedNicheRead(body, exprIx, e.identName, nNk, fnIx, ec)
@@ -38945,6 +38966,7 @@ function emitDirectArgUnbox(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
       emitNarrowedArmUnboxTo(
         armDestHeapOf("nulvariant", cParamNulVariantIdx),
         arg,
+        fnIx,
       )
     }
   }
@@ -38963,7 +38985,11 @@ function emitDirectArgUnbox(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
   // boundary; guarded so the three arms cannot both fire (D1723).
   if cVi < 0 && cParamNulVariantIdx < 0 {
     if narrowedArmNeedsUnbox(arg, fnIx) {
-      emitNarrowedArmUnboxTo(armDestHeapOf(cArgParamKind, cArgParamRow), arg)
+      emitNarrowedArmUnboxTo(
+        armDestHeapOf(cArgParamKind, cArgParamRow),
+        arg,
+        fnIx,
+      )
     }
   }
   0
@@ -39288,6 +39314,7 @@ function emitCapturedCall(
         emitNarrowedArmUnboxTo(
           armDestHeapOf(cpKind, paramStructIdxOf(cps[cai])),
           cargs[cai],
+          fnIx,
         )
       }
     }
@@ -41149,7 +41176,7 @@ function emitCoalesceElemBox(
   // Bounded to a list ELEMENT read on purpose. A struct FIELD whose literal merged onto a
   // declared row of another code has a rep the storage does not honour, and unboxing it there
   // would trade D1411's loud refusal for invalid wasm.
-  const nbRep = repOfNode(e.binLeft)
+  const nbRep = repOfNode(e.binLeft, fnIx)
   if (
     isListElementRead(e.binLeft, fnIx)
     && nbRep.rdKind == "union"

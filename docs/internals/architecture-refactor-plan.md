@@ -608,6 +608,27 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - D12390: `??` over a generic `Map<string, T> | null` with a map default is not read as a map inside the generic (`exprNullableMap`). It is present on master.
   - Fixtures: `closures/call-through-list-element-tail-at-hole-instance.vl`, `maps/generic-map-litunion-value-store-and-read.vl` and `maps/generic-bound-map-field-at-two-map-types.vl`. Each fails on the previous bullet's seed.
   - `regress.vl`: 0 runs → not-runs, 0 → silent, and the 3 D2595 cells move to `runs`. The baseline is rewritten for them. Seed 5,824,422 → 5,824,454 bytes (+32).
+- **2026-10-24, the readers with no `fnIx` take one.** The instance is passed as an argument from the entry points. No emitter global was added: `emitter-state-audit.vl --check` reads 0 never-cleared mutables and 0 unguarded inner index registers.
+  - Moved: the 51 lines with no `fnIx` within one hop now read `nodeTyAt(ix, fnIx)`. They are `repOfNode` and the `nodeRep*` family (`emit_rep.vl`); `exprTyIsRecord`, `nicheReadKindAt`, `placeReadIsNarrowed`, `narrowedValueAtomAt*` and `emitNarrowedArmUnboxTo`; the `letInitTy*` family with `letInitNarrowedAtomKind` and `letInitProjTyIsAtom`; `asBoxLitUnionYieldsAtom`, `asTargetRepsAtom` and `litElse*`; `declRow*Fits`, `anonRowScalarFits`, `objLitFitsRow`, `objNestedFieldCompat` and `objFieldOwnTyOf`; `nodeTyIsBoxRep`; and `listFitGrowUsesOk`, `narrowReadsName` and `narrowReadDisjointUnder`. A caller with no instance (an annotation, such as `annRepKindOf`, or a collect pass) passes `-1`, which is the old read.
+  - Left raw on purpose, each with its reason:
+    - `asExprIsUnionCast` and `asExprNumSrcName`: the scan that reserves the frame reads the raw type, and the lowering has to agree with it.
+    - `asExprOperandIsHole` and `ifJoinIsScalarPrim`: they ask about the raw type by contract.
+    - `memberCallYieldsValue`: it has to agree with the collect-phase `computeVoidFns`.
+    - `initJoinsWiderRecord`: it has to agree with the collect-phase mint (`synthJoinedRecordAnn`, `internJoinedRecordRow`).
+    - `emptyArrHoleKind` and `emptyArrHoleElemName`, the `anonFieldCode` family and the `arrLit*ElemName` family: they feed the row mint, which is L6's.
+    - The annotation readers (`tyAnnRefListKind`, `tyIsFuncType`, `annRefArrSlot`, `nulVariantIndexOf`, `annIsU8Array`, `annIsNulLitUnionArray`, `tyIsNulClosureArrayNode`, `tyIsNulBareMap`, `nodeScalarName`, `arrElemRep`, `annTyNulFlag`, `nodeMapTyIx`): they read a written type node, which is the template's.
+    - `rsCallParamTy`: the rs walk has no instance.
+    - `hfvSync` and `fieldValueTakesFnTy`: they scan the whole arena, not one instance.
+    - `initYieldsNothing` and `lambdaCheckedRetTy`: they run before the bank exists.
+    - `monoArmTailLocalInit` and `monoUnionPinName`: they are in `emit_mono.vl`, which is L3's.
+  - The by-design groups from the last count:
+    - The 32 that ask whether the generic's type is open, or hand it to a re-derivation, ask a question about the template, and the bank holds the instance's answer. `cloArgInstanceMisfits`, `coalHoleMapReadNullTest`, `litFieldBoxedApart` and `emitCoalesceGo` are among them: they hold `fnIx` and still read the open type.
+    - The 3 bank reads (`emit_ty_canon.vl` ×2, `emit_capture_frames.vl`) are the producer that fills the bank and `nodeTyAt`'s own fallback. A bank cannot be filled from itself, and `nodeTyAt` falls back to the raw type where nothing is banked.
+    - The 2 annotation reads (`paramString`, `paramVariantIndex`) read the written annotation, which is the template's.
+    - The 10 lines paired with an interner mint stay with L6.
+  - Gates:
+    - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,827,701 → 5,828,036 bytes (+335).
+    - difftree `--identity` against master's seed: 0 of 16,594 files differ (11,711 built), and the fixpoint is identical.
 
 ### L2 log
 
