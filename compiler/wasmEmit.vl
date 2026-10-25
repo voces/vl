@@ -6173,6 +6173,7 @@ function emitIsTestVariant(
       nd.isVariant,
       isVarTyIxOf(isIx),
       nd.isObj,
+      fnIx,
     ))
     if foldOk {
       if rvi == vi { fbI32Const(1) } else { fbI32Const(0) }
@@ -6185,7 +6186,8 @@ function emitIsTestVariant(
   // A receiver the cross-arm terms re-read is evaluated once when it is not a place.
   let ctSlot = -1
   if (
-    (shared || isFitsAcrossTagRows(nd.isVariant, isVarTyIxOf(isIx), nd.isObj))
+    (shared
+      || isFitsAcrossTagRows(nd.isVariant, isVarTyIxOf(isIx), nd.isObj, fnIx))
     && !unionEqOperandOk(nd.isObj)
   ) {
     ctSlot = sharedFieldRecvSlot()
@@ -6431,7 +6433,7 @@ function emitCrossTagFits(
 ): i32 {
   const rows: i32[] = []
   const kinds: i32[] = []
-  crossTagFitRows(vi, xTy, recv, rows, kinds)
+  crossTagFitRows(vi, xTy, recv, rows, kinds, fnIx)
   let i = 0
   while i < rows.length {
     const yi = rows[i]
@@ -7627,10 +7629,10 @@ function emitUnionNestedListLit(
 // function-typed arms, and taking the arm makes every one of them box under the first arm's tag
 // (D6). The union's own arm is the fallback, for a carrier the checker banked no function type
 // for; a union with one function arm tags the same either way.
-function cloBoxArmTy(exprIx: i32, unionName: string): i32 {
-  const vt = nodeTyIxOf(exprIx)
+function cloBoxArmTy(exprIx: i32, unionName: string, fnIx: i32): i32 {
+  const vt = nodeTyAt(exprIx, fnIx)
   if tyIxIsFunc(vt) { return vt }
-  const bt = nodeTyIxOf(unwrapParen(exprIx))
+  const bt = nodeTyAt(unwrapParen(exprIx), fnIx)
   if tyIxIsFunc(bt) { return bt }
   unionClosureArmTy(unionName)
 }
@@ -8620,7 +8622,7 @@ function emitUnionCoerceList(
   if unionName != "" && exprIsClosure(exprIx, fnIx) {
     const clArm = unionClosureArmName(unionName)
     if clArm != "" {
-      fbI32Rel(RS_TAG, cloArmTagOfTy(cloBoxArmTy(exprIx, unionName)))
+      fbI32Rel(RS_TAG, cloArmTagOfTy(cloBoxArmTy(exprIx, unionName, fnIx)))
       if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, closure fat-pointer ref }
       return 0
@@ -9289,11 +9291,11 @@ function armDestHeapOf(kind: VKind, idx: i32): i32 {
 
 // Whether a box value fitting variant `vi` may be laid out as another arm (D4056), so its payload
 // cannot be cast to `vi`'s struct.
-function variantHasCrossTagFits(vi: i32, exprIx: i32): boolean {
+function variantHasCrossTagFits(vi: i32, exprIx: i32, fnIx: i32): boolean {
   if vi < 0 || vi >= uVarTyIx.length { return false }
   const rows: i32[] = []
   const kinds: i32[] = []
-  crossTagFitRows(vi, uVarTyIx[vi], exprIx, rows, kinds)
+  crossTagFitRows(vi, uVarTyIx[vi], exprIx, rows, kinds, fnIx)
   rows.length > 0
 }
 
@@ -9331,7 +9333,7 @@ export function emitVariantCoerce(
   }
   // A union BOX (a narrowed receiver still boxed at the wasm level): unbox to the variant.
   if exprUnion(exprIx, fnIx) {
-    if variantHasCrossTagFits(vi, exprIx) {
+    if variantHasCrossTagFits(vi, exprIx, fnIx) {
       return emitFailCrossTagDelivery(exprIx, vi)
     }
     if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
@@ -9707,7 +9709,7 @@ function emitUnionConcreteEq(
   // The CONCRETE operand's own arm type, through the very composition the BOX site uses
   // (`cloBoxArmTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
   // actually writes.
-  fbI32Rel(RS_TAG, unionEqTagOfArmTy(eak, cloBoxArmTy(otherIx, uname)))
+  fbI32Rel(RS_TAG, unionEqTagOfArmTy(eak, cloBoxArmTy(otherIx, uname, fnIx)))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
   if eqOnce { fbLocalGet(eqStash) }
@@ -20802,7 +20804,7 @@ function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32, ec: ExpCtx) {
   let rslot = -1
   if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) {
     how = 1
-  } else if ifJoinTypedAtom(ifIx) || nulStrJoinTakesAtom(ifIx, fnIx, ec) {
+  } else if ifJoinTypedAtom(ifIx, fnIx) || nulStrJoinTakesAtom(ifIx, fnIx, ec) {
     // An atom join lowers every arm in the atom context, whatever rep the arm has alone (D2206).
     how = 2
   } else {
@@ -25805,7 +25807,7 @@ function emitCallRefArg(
       cvCtx.variantIdx = cvSlot
       if emitExprExpect(body, args[i], fnIx, cvCtx) < 0 { return -1 }
       if exprUnion(args[i], fnIx) {
-        if variantHasCrossTagFits(cvSlot, args[i]) {
+        if variantHasCrossTagFits(cvSlot, args[i], fnIx) {
           return emitFailCrossTagDelivery(args[i], cvSlot)
         }
         fbStructGet(uBoxIdx, 1)     // 0xfb 0x02 <box ht> field 1: value (anyref)
@@ -30273,7 +30275,7 @@ function retStrWidenOf(
   // inline and named forms rep differently, so this needs its own arm. A named litunion
   // return (`: K`) reps as the interned atom and is claimed by `retLitUnion` above; an
   // un-named one reps as a string ref, so it must widen.
-  if retLitUnionInline(fn.fnRet) {
+  if retLitUnionInline(fn.fnRet, fnIx) {
     if exprIsLitAtom(retArg, fnIx) { retStrWiden = true }
   }
   // A lone string literal result (`: "circle"`) is a string value, so an atom widens (D7445).
@@ -36224,13 +36226,13 @@ function strReppedLitUnionAt(ix: i32, fnIx: i32) {
 // The lexeme (quotes kept) operand `ix` is statically known to be: a string literal, or an
 // expression whose type is exactly one string literal (a bare `"z"`, or a one-member literal
 // union); "" otherwise. A type is the value set, so a one-literal type is one value.
-function staticStrLitLex(ix: i32): string {
+function staticStrLitLex(ix: i32, fnIx: i32): string {
   const u = unwrapParen(ix)
   if u < 0 { return "" }
   const n = nodeAt(u)
   if n is StrLit { return n.strText }
   if nodeHasWideStrLit(u) { return quoteLex(nodeWideStrLitText(u)) }
-  const t = nodeTyIxOf(u)
+  const t = nodeTyAt(u, fnIx)
   if !tyIsOneStrLit(t) { return "" }
   quoteLex(tyLitMemberTexts(t)[0])
 }
@@ -37806,10 +37808,10 @@ function emitF64RemCall(
 // Binaryen 130 folds neither this nor the i64 narrowing below at any level, so the emitter does.
 
 // Whether node `ix` is typed exactly `i64` (`wide`) or `i32` (a paren is its inner node).
-function srTyIs(ix: i32, wide: boolean): boolean {
+function srTyIs(ix: i32, wide: boolean, fnIx: i32): boolean {
   const x = unwrapParen(ix)
   if x < 0 || x >= P.nodes.length { return false }
-  const p = tyPrimNameOf(nodeTyIxOf(x))
+  const p = tyPrimNameOf(nodeTyAt(x, fnIx))
   if wide { return p == "i64" }
   p == "i32"
 }
@@ -37865,7 +37867,9 @@ function srNarrowSource(x: i32, m: i64, w: i32, fnIx: i32): i64[] {
   const e = nodeAt(x)
   if e is AsExpr {
     if w != 32 || e.asMode != "wrap" { return none }
-    if asExprNumCastDomain(x) != "i32" || !srTyIs(x, false) { return none }
+    if asExprNumCastDomain(x) != "i32" || !srTyIs(x, false, fnIx) {
+      return none
+    }
     const z = unwrapParen(e.asObj)
     if z < 0 || z >= P.nodes.length { return none }
     const ze = nodeAt(z)
@@ -37886,7 +37890,9 @@ function srShiftBin(
 ): i64[] {
   const none: i64[] = []
   if e.binOp != ">>>" && e.binOp != ">>" { return none }
-  if !srTyIs(x, w == 64) || !srTyIs(e.binLeft, w == 64) { return none }
+  if !srTyIs(x, w == 64, fnIx) || !srTyIs(e.binLeft, w == 64, fnIx) {
+    return none
+  }
   const k = srShiftConst(e.binRight, w, fnIx)
   if k < 0 { return none }
   if e.binOp == ">>" && !srMaskBelow(m, w - k) { return none }
@@ -37904,7 +37910,7 @@ function srMaskOperands(ix: i32, w: i32, fnIx: i32): i64[] {
   if x < 0 || x >= P.nodes.length { return none }
   const e = nodeAt(x)
   if e is BinExpr {
-    if e.binOp != "&" || !srTyIs(x, w == 64) { return none }
+    if e.binOp != "&" || !srTyIs(x, w == 64, fnIx) { return none }
     const mr = srMaskConst(e.binRight, w, fnIx)
     if mr >= 0 { return [mr, e.binLeft as% i64] }
     const ml = srMaskConst(e.binLeft, w, fnIx)
@@ -37934,7 +37940,9 @@ function srWrappedMask(x: i32, fnIx: i32): i64[] {
   const e = nodeAt(x)
   if e is AsExpr {
     if e.asMode != "wrap" { return none }
-    if asExprNumCastDomain(x) != "i32" || !srTyIs(x, false) { return none }
+    if asExprNumCastDomain(x) != "i32" || !srTyIs(x, false, fnIx) {
+      return none
+    }
     const mo = srMaskOperands(e.asObj, 64, fnIx)
     if mo.length == 0 { return none }
     const src = srShiftSource(mo[1] as% i32, mo[0], 64, fnIx)
@@ -38004,7 +38012,7 @@ function emitShiftMaskFold(
   fnIx: i32,
   ec: ExpCtx,
 ): i32 {
-  if !srTyIs(exprIx, w == 64) { return 1 }
+  if !srTyIs(exprIx, w == 64, fnIx) { return 1 }
   if e.binOp == "&" {
     if w != 32 { return 1 }
     const nsrc = srMaskedSource(exprIx, w, fnIx)
@@ -38279,8 +38287,8 @@ function emitBinLitEq(
   // literal whatever it reads, so beside another such operand the compare folds, and beside an
   // atom it is its interned id. Both operands still evaluate, for their effects (D2156).
   if e.binOp == "==" || e.binOp == "!=" {
-    const slL = staticStrLitLex(e.binLeft)
-    const slR = staticStrLitLex(e.binRight)
+    const slL = staticStrLitLex(e.binLeft, fnIx)
+    const slR = staticStrLitLex(e.binRight, fnIx)
     if slL != "" && slR != "" {
       if emitStaticLitAtom(body, e.binLeft, slL, fnIx, ec) < 0 { return -1 }
       fbDrop()
@@ -38942,7 +38950,7 @@ function emitDirectArgUnbox(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
   }
   if cVi >= 0 {
     if exprUnion(arg, fnIx) {
-      if variantHasCrossTagFits(cVi, arg) {
+      if variantHasCrossTagFits(cVi, arg, fnIx) {
         return emitFailCrossTagDelivery(arg, cVi)
       }
       fbStructGet(uBoxIdx, 1)  // 0xfb 0x02 <box ht> field 1: value (anyref)
