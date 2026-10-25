@@ -259,7 +259,6 @@ import {
   flatListLitWidens,
   instParamAtomFits,
   memIsNarrowed,
-  memNarrowVariantIndex,
   objLitNameCands,
   rowFnFieldFits,
   sFieldElemNameAt,
@@ -505,6 +504,8 @@ import {
   lfFlatAt,
   lfFnAt,
   lfResolveAt,
+  memNarrowVariantIndex,
+  narrowVariantRowFor,
   nodeTyIsBoxRep,
   nodeTyIsNarrowedShape,
   nodeTyIsUnionShaped,
@@ -851,6 +852,7 @@ import {
   startBlockLetOfAt,
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentAt,
+  unionDeclTyIxOfIdentRead,
   unionRetName,
   unionRetOfFnType,
 } from "./emit_start_block"
@@ -1115,7 +1117,7 @@ import {
   unionMemberTysOfAB,
   unionNameHasNullTy,
   unionNameNonNullCountTy,
-  unionRowOf,
+  unionRowKeyAB,
   unionSetAtomsOf,
   unionSetHasNull,
 } from "./emit_union_registry"
@@ -15583,7 +15585,7 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
       if pIx >= 0 && !fnBlockShadowsAt(fnIx, sid, atIx) {
         const p = nodeAt(pIx)
         if p is Param {
-          // The registry-membership test via the canon-keyed index instead of `isUName`'s
+          // The registry-membership test via the canon-keyed index instead of a spelling's
           // linear scan over `unNames`: same question, same name returned, on interned ids.
           // The spelling renders only once the row exists, since a non-union param drops it.
           if unRowOfCanon(annRowOfNode(p.parType)) >= 0 {
@@ -15713,7 +15715,11 @@ export function letUnionNameOf(letIx: i32, fnIx: i32) {
           if letInitBindsNarrowedCell(letIx, fnIx) { return "" }
         }
         // A read narrowed to a smaller box binds that box, as its annotation would (D5921).
-        const nrw = narrowedBoxRenderOf(d.letInit, inf)
+        const nrw = narrowedBoxRenderOf(
+          d.letInit,
+          inf,
+          unionDeclTyIxOfIdentRead(d.letInit, fnIx),
+        )
         if nrw != "" { return nrw }
         return inf
       }
@@ -15728,14 +15734,14 @@ export function letUnionNameOf(letIx: i32, fnIx: i32) {
 // The value union a name, or a narrowed field or element read, at `ix` is narrowed to, when it
 // has fewer variants than the registered union `whole` (the one its binding holds), else "".
 // Box tags are per atom, so the narrowed box is the same value under fewer members.
-function narrowedBoxRenderOf(ix: i32, whole: string): string {
+function narrowedBoxRenderOf(ix: i32, whole: string, wholeTy: i32): string {
   const rx = unwrapParen(ix)
   if rx < 0 { return "" }
   if !(nodeAt(rx) is Ident) && !placeReadIsNarrowed(rx) { return "" }
   const nt = nodeTyIxOf(rx)
   const nrw = valueUnionNameOfTy(nt)
   if nrw == "" { return "" }
-  const u = unionRowOf(whole)
+  const u = unionRowKeyAB(90, whole, wholeTy)
   if u < 0 || u >= unTyIx.length || unTyIx[u] < 0 { return "" }
   if flatVariantCount(nt) >= flatVariantCount(unTyIx[u]) { return "" }
   nrw
@@ -16017,7 +16023,7 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
         if fn.fnRet < 0 {
           const irk = inferRetFnKey(fnStmts[t], callee.identName)
           const im = inferRetNameOf(irk)
-          // A value union or a registered struct union (`isUName`, from this same inferred
+          // A value union or a registered struct union (a union row, from this same inferred
           // name in `collectU`) — either drives narrowing/unboxing as an annotation would.
           if isValueUnionName(im) { return im }
           if im != "" && isUNameAB(18, im, inferRetTyIxOf(irk)) { return im }
@@ -16033,7 +16039,7 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
         const crn = tyNameOf(cfn.fnRet)
         if unRowOfCanon(annRowOfNode(cfn.fnRet)) >= 0 { return crn }
         // A value-union annotated return (`i32 | string`, pinned by `synthRetAnnots`) needs this:
-        // `isUName` covers struct unions only, so this narrowed result would not unbox otherwise. B290.
+        // The struct-union row test covers struct unions only, so this narrowed result would not unbox otherwise. B290.
         if isValueUnionTyOr(annRowOfNode(cfn.fnRet)) == 1 { return crn }
         if cfn.fnRet < 0 {
           const cirk = inferRetFnKey(fnStmts[cfe], cfn.fnName)
@@ -21566,15 +21572,12 @@ function memberIsClosure(objIx: i32, prop: string, fnIx: i32) {
   // type, so read the closure field code off the narrowed variant's own field tables instead.
   const o = nodeAt(unwrapParen(objIx))
   if o is Ident {
-    const nv = narrowVariantFor(o.identName)
-    if nv != "" {
-      const vi = variantIndexOf(nv)
-      if vi >= 0 {
-        const vfi = variantFieldIndex(vi, prop)
-        if vfi >= 0 {
-          const vfc = variantFieldTypeAt(vi, vfi)
-          return vfc == FC_CLOSURE || vfc == FC_NUL_CLOSURE
-        }
+    const vi = narrowVariantRowFor(o.identName)
+    if vi >= 0 {
+      const vfi = variantFieldIndex(vi, prop)
+      if vfi >= 0 {
+        const vfc = variantFieldTypeAt(vi, vfi)
+        return vfc == FC_CLOSURE || vfc == FC_NUL_CLOSURE
       }
     }
   }
