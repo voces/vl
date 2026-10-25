@@ -362,6 +362,7 @@ import {
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
   fnFlowDeclPathAgreedPinTys,
+  fnFlowDeclPathCallPinTyLists,
   fnFlowDeclPathHeldSrcs,
   fnFlowDeclPathOnlyPinCall,
   fnFlowDeclPathOnlyPinCallSkipping,
@@ -20594,7 +20595,7 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
   // call through it did cannot be served by the one value; a `const` list asks for a copy per
   // type (D10701).
   const lr = monoCalleeListRead(n.callFn)
-  if lr >= 0 { fsNoteListCall(lr, identDeclOf(lr), nm) }
+  if lr >= 0 { fsNoteListCall(n.callFn, lr, identDeclOf(lr), nm) }
   for el in elems {
     if monoElemTakenSig.has(el) && monoElemTakenSig[el] != nm {
       if lr >= 0 {
@@ -20760,18 +20761,43 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
   if fx < 0 { return none }
   const f = nodeAt(fx)
   if !(f is FuncDecl) || f.fnParams.length != args.length { return none }
+  // With a function argument named, the element's value parameters bind first at the instance,
+  // so the function parameter's calls that pass one are read at the type it hands (D10700).
+  let named = false
+  for a in args {
+    if monoElemArgNamesFn(a, ctx) { named = true }
+  }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  let i = 0
+  while named && i < args.length {
+    if monoElemArgFns(args[i], ctx).length == 0 {
+      const at = monoElemValArgTy(args[i], ctx)
+      const vt = nodeTyIxOf(f.fnParams[i])
+      if at >= 0 && !tyHasTyVar(at) && vt >= 0 {
+        const tv = tyAt(vt)
+        if tv is TyVar {
+          bNames.push(tv.tvName)
+          bTys.push(at)
+        }
+      }
+    }
+    i = i + 1
+  }
   const pts: i32[] = []
   let j = 0
   while j < args.length {
     let pt = -1
-    let axs = monoParamHeldFns(args[j])
-    if monoNamesDeclaredGeneric(args[j], ctx) || monoIsHoleLamArg(args[j]) {
-      axs = [monoOpenFnArgDecl(args[j])]
-    }
+    const axs = monoElemArgFns(args[j], ctx)
     if axs.length > 0 {
       const qs: i32[] = []
       const noPath: string[] = []
-      if axs[0] >= 0 && fnFlowDeclPathAgreedPinTys(f.fnParams[j], noPath, qs) {
+      if (
+        axs[0] >= 0
+        && (fnFlowDeclPathAgreedPinTys(f.fnParams[j], noPath, qs)
+          || (monoElemArgNamesFn(args[j], ctx)
+          && monoElemPinTysUnder(f.fnParams[j], bNames, bTys, qs)))
+      ) {
         // Every function a parameter can hold is taken at the one instance the pins give.
         for ax in axs {
           const r = monoFnDeclRetAt(ax, qs)
@@ -20786,6 +20812,8 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
         j = j + 1
         continue
       }
+    } else if named {
+      pt = monoElemValArgTy(args[j], ctx)
     } else {
       pt = nodeTyIxOf(unwrapParen(args[j]))
     }
@@ -20794,6 +20822,60 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
     j = j + 1
   }
   pts
+}
+
+// The type value argument `a` has in the function `ctx` walked: its own, else where that is open,
+// the one the instance `ctx` gives it.
+function monoElemValArgTy(a: i32, ctx: i32): i32 {
+  const x = unwrapParen(a)
+  const t = nodeTyIxOf(x)
+  if t < 0 || !tyHasTyVar(t) || ctx < 0 { return t }
+  nodeTyInOf(x, ctx)
+}
+
+// The declared functions argument `a` of a call through elements hands an element's function
+// parameter: what an un-annotated parameter holds, or the generic or hole lambda it names; empty
+// for a value argument.
+function monoElemArgFns(a: i32, ctx: i32): i32[] {
+  if monoElemArgNamesFn(a, ctx) { return [monoOpenFnArgDecl(a)] }
+  monoParamHeldFns(a)
+}
+
+// Whether argument `a` names its function itself, a generic or a hole lambda, rather than a
+// parameter holding one; only such a function is taken at the pins its element's values bind.
+function monoElemArgNamesFn(a: i32, ctx: i32): boolean {
+  monoNamesDeclaredGeneric(a, ctx) || monoIsHoleLamArg(a)
+}
+
+// The one closed parameter list every call of parameter `par` takes once the element's value
+// parameters' holes `bNames` are bound to `bTys`, pushed onto `qs`; false when there is no call,
+// one stays open, or two disagree.
+function monoElemPinTysUnder(
+  par: i32,
+  bNames: string[],
+  bTys: i32[],
+  qs: i32[],
+): boolean {
+  if bNames.length == 0 { return false }
+  const noPath: string[] = []
+  const lists = fnFlowDeclPathCallPinTyLists(par, noPath)
+  if lists.length == 0 { return false }
+  let key = ""
+  let got: i32[] = []
+  for tys in lists {
+    const sub: i32[] = []
+    for t in tys {
+      const st = substTyDeep(t, bNames, bTys)
+      if st < 0 || tyHasTyVar(st) { return false }
+      sub.push(st)
+    }
+    const k = fnFlowPinSigOf(sub)
+    if key != "" && k != key { return false }
+    key = k
+    got = sub
+  }
+  for t in got { qs.push(t) }
+  true
 }
 
 // What call `n`, through list elements or `if` arms, hands as un-annotated parameters or hole
