@@ -207,7 +207,7 @@ the slice retires.
 | D5 | union registry by type (step 5 remainder) (landed: 18 retired, 3 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; re-probed at 84b98d149, none retired; at 2aef21b94 the D4930 alias `shareFieldUnionRow` is deleted, since no reach file needs the alias or its row; the `recordUnMemTys` fallback rows carry a type that loses a member or unrolls a cycle, and the `unionSetAtomsOf` and `unionSetMemberCount` splits are reached by callers with no type; probed per caller at b66b5b5f8: no count from the caller's type matches the spelling count, because one alias type is spelled by name at one call and expanded at another, so none retired) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired; at 84b98d149 the typed-beside legs of `mvValNamesCompat` are reached by no event) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
-| D8 | mv, closure-sig and field-companion slots by type (landed: 10 retired, 8 left; the mv mint and find both key by the value type's declared name, and the mint key asks the held map type at every caller, the annotation sites and union arms included, and a value the arena cannot name (an unbound type parameter) has no slot; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149: the field companion's render is the name its readers rebuild the box under) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
+| D8 | mv, closure-sig and field-companion slots by type (landed: 13 retired, 5 left; the mv arm signature and arm hint ask the value type, the arm mint's literal-union field asks the field's type, and the map annotation shape names its value by type; the mv mint and find both key by the value type's declared name, and the mint key asks the held map type at every caller, the annotation sites and union arms included, and a value the arena cannot name (an unbound type parameter) has no slot; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149: the field companion's render is the name its readers rebuild the box under) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
 slice that retires them in the same change. For example, A3's one C entry is a rung of the same
@@ -1517,6 +1517,41 @@ What each slice changes:
     - The next step is the object class at `arr`. Build a struct-union list literal at the
       destination's arm row by type, so the literal's own shape is never the key. The function
       class waits on the per-site type.
+  - L2 stage 6 at d0a33866f is a probe record only, with no compiler change. It tests the next
+    step stage 5 named: whether a record-element list's row can be found by type at the
+    destination's declared row.
+    - The probe was taken over the self-compile and 16,798 files, with 0 uncompared. It ran at
+      `arrRefSlotOf` (`arr`) and `letRefListSlot`'s tail (`let`), beside the by-name pick.
+      Classes are per differing file: a function example, else a record example, else other.
+    - Plain `rlSlotOfTyOrTwin` first:
+      - `arr`: 192 of 1,403 files differ (309 events). Function 96, record 91, other 5.
+      - `let`: 244 of 2,448 files differ (1,595 events). Function 113, record 103, other 28.
+    - Then a destination-row rule on the typed side. A declared struct or arm keeps its own
+      row. A shape takes the declared struct row whose field set matches it, else the arm row
+      (strict, then widened). If neither matches, it tries the same with a field that fits a
+      nullable or union box. A union of shapes takes a row only when every member lands on the
+      same one.
+      - `arr`: 135 files (247 events). The record class falls from 91 to 34 files.
+      - `let`: 209 files, but events rise from 1,595 to 2,647. The record class falls from 103
+        to 68 files.
+    - No site agrees everywhere, so no reader moves and no helper ships. There are three
+      blocking reasons:
+      - One arena type names different rows at different sites. At `let`'s tail, the name
+        keeps a literal's own row (`{r: null}`, `{r: i32}`). At `arr`, the same types read
+        `Circle` or `Dot`. Any rule that fixes one site moves the other.
+      - Some declared rows share a layout, and then only the delivery picks the row. In 24
+        files, `Dot` (a struct) and `Circle` (an arm) are both `{r: Shape2}`. The name follows
+        the list's later destination (`Circle[]`), and a field-set scan picks the first
+        match. `Ix`/`Jx`, `I`/`J`, a `{r: i32}` pair at depth, and duplicate `AB` rows are
+        the same case. The literal's own type does not record where it is delivered.
+      - In 4 files, the element type is the union of both arms' shapes
+        (`{r: {c2: i32}} | {r: {s2: i32}}`), but the name is one arm, `Circle`. No row by
+        layout matches it.
+    - The next step is to carry the delivery to the reader as a type. That is the list
+      literal's destination row (the D361/D1690 destination rows that `structIndexOfObj`
+      reads by node), held per site. With it, these readers could look up by type. Without
+      it, a mint or lookup keyed by the literal's arena type cannot answer both sites. The
+      census and the render-parse budget do not move.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
@@ -2369,8 +2404,9 @@ What each slice changes:
   | a member set | `currentNarrowSetAt`, `currentStructNarrowSetAt`, `narrowSlotAtomsInto`, `printNarrowKeepsBox`, `printNarrowLiveAtoms`, `indexCellCurSet`, `indexCellCurSlot`, `pushIndexStructComplement`, `pushIndexMapComplement`, `pushIndexMapNullNarrow`, the `narrowIsElse` readers, `forInElemKind`, `njMembersOf`, `njBoxHoldsNull`, `narrowedNicheAtomOf`, `narrowedNulLitAlias` |
   | real text | none |
 - **D8.** The mv-slot, closure-signature and field-companion tables are keyed by type. The
-  `emit_classify` arm mint withholds its type on purpose (D34), so that entry moves only together
-  with the ruling that requires it.
+  `emit_classify` arm mint withholds the row's own type on purpose (D34); its two entries
+  retired anyway, because each asks a type the mint does hand over (the arm's record type, the
+  map's value type).
 
   A probe compared the spelling with the type at nine sites, over the self-compile and 16,803
   fixture and corpus files. Counts are files.
@@ -2471,9 +2507,32 @@ What each slice changes:
     the same function count. With the type indices normalised, the only difference is one to
     three `structref`-taking function types the old seed declared over the structural twin
     slot's map struct and the new one does not; the code is otherwise the same.
+  - Landed, 3 retired: the mv arm signature, the arm hint, the arm mint's literal-union field
+    and the map annotation shape ask the type (ledger 158, 159, 189).
+    - Arm signature and arm hint. `mvArmSigOfName` and `mvArmHintOfTyName` are deleted. The mint
+      and the three finds ask `mvArmSigOfShapeTy` / `mvArmHintOfShapeTy` (`emit_field_codes`),
+      which return the arm recorded at the type. A record with no declared name instead gets the
+      arm with no declared name that is the same type, which is what the spelling found for an
+      inline arm (D4638). The lookup follows map hops.
+    - Narrowing. A first version took any same-type arm (`variantRowOfShapeTy`). It differed in
+      720 of 2,333 files, all a declared struct beside a declared arm of its layout (D48). With
+      the declared-name gate the probe agreed everywhere, typed or not:
+      - the mint's signature: 2,333 files, 10,477 events;
+      - the union-atom find's hint: 2,333 files, 162,121 events;
+      - the op find's hint: 1,691 files, 34,907 events.
+    - Literal-union field. The arm mint still withholds the row's own type (D34). It does hand
+      over the arm's record type as `fieldsTy`, so this question asks the field's type: 2,114 files
+      and 16,009 events agree.
+    - Map annotation shape. `mapAnnShape` names the value from `nodeMapValTyIx` with
+      `mvDeclNameOfValTy`, as the mint names it. The shape agreed in 836 files and 57,129 events,
+      including 14,146 events on uncovered nodes. The names differ in 1,144 events over 21 files,
+      and none of those moves the shape.
+    - The probe population is the self-compile plus 16,792 test and corpus files.
+    - Identity difftree against `d0a33866f`: the fixpoint identity holds, and of 16,686 files
+      (11,794 built) 0 differ and 0 are uncompared.
   - Left, not probed: the products. These are the signature-ladder
     renders, `cloArmTagOfTy`'s render, which the link
-    step reads as the `clo:` key, and the two D34 entries. The mv slot stays keyed by spelling,
+    step reads as the `clo:` key. The mv slot stays keyed by spelling,
     so D2's `mvValKindOfName` callers do not move with it.
   - Banked, nothing retired: the map-value slot's kind questions take the type where the caller
     holds one. `mvSlotOfValNameFindK`, the entry side of `mvValNamesCompat` and
