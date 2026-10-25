@@ -55,7 +55,7 @@ import { wsOrigTyOf } from "./check_demands"
 import { isVarTyIxOf } from "./check_list_union"
 import { i32TyIx } from "./check_leaf_steps"
 import { nodeTyIxOf } from "./check_node_tys"
-import { substTyDeep } from "./check_relate_core"
+import { holeSlotCallRets, substTyDeep } from "./check_relate_core"
 import { T, TyFunc, mkFuncTy, tyAt, tyEq, tyMayHoldFn } from "./check_types"
 import {
   monoAnnHasTyParam,
@@ -539,12 +539,15 @@ function vrBin(n: BinExpr, p: i32, x: i32, path: string): i32[] {
   if x == n.binLeft { return out }
   const t = unwrapParen(n.binLeft)
   if t >= 0 && vrFollow && !(nodeAt(t) is Ident) {
-    const pre: string[] = [path]
-    const d0 = vrPlaceRoot(t, pre)
-    if d0 < 0 { return vrLost() }
-    if !vrJoin(out, vrDecl(d0, pre[0])) || !vrJoin(out, vrCalls(p, path)) {
-      return vrLost()
+    const roots: i32[] = []
+    const paths: string[] = []
+    if !vrPlaceRoots(t, path, roots, paths) { return vrLost() }
+    let i = 0
+    while i < roots.length {
+      if !vrJoin(out, vrDecl(roots[i], paths[i])) { return vrLost() }
+      i = i + 1
     }
+    if !vrJoin(out, vrCalls(p, path)) { return vrLost() }
     return out
   }
   if t < 0 || !(nodeAt(t) is Ident) { return vrLost() }
@@ -564,11 +567,16 @@ function vrBin(n: BinExpr, p: i32, x: i32, path: string): i32[] {
   out
 }
 
-// The un-annotated `let` the place `t` writes into, bound to a fresh list, record or `Map()`
-// whose literal holds a fresh list or record at each step before the last, with `pre[0]`
-// prefixed by the place's steps; -1 otherwise, or when a container on the way may be re-pointed
-// (`vrRepointable`), which would land the write in another binding's storage (D12302).
-function vrPlaceRoot(t: i32, pre: string[]): i32 {
+// Pushes to `roots` each binding whose reads may reach the storage the place `t` writes into, and
+// to `paths` its path to the written slot followed by `path`. False unless each is an un-annotated
+// binding of fresh lists, records or `Map()`s, reached through those literals, a name one holds or
+// a write rebinding one, and no container on the way may be re-pointed (D12332).
+function vrPlaceRoots(
+  t: i32,
+  path: string,
+  roots: i32[],
+  paths: string[],
+): boolean {
   // The steps, the last first.
   const steps: string[] = []
   let x = t
@@ -585,53 +593,136 @@ function vrPlaceRoot(t: i32, pre: string[]): i32 {
       more = false
     }
   }
-  if steps.length == 0 || steps.length > 8 { return -1 }
-  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
-  const d = identDeclOf(x)
-  if d < 0 || d >= P.nodes.length { return -1 }
-  const dn = nodeAt(d)
-  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
-  const iv = unwrapParen(dn.letInit)
-  if iv < 0 || iv >= P.nodes.length { return -1 }
-  const init = nodeAt(iv)
-  let fresh = init is ObjLit || init is ArrayLit
-  if init is Call && init.callArgs.length == 0 {
-    const cf = nodeAt(unwrapParen(init.callFn))
-    fresh = cf is Ident && cf.identName == "Map" && identDeclOf(init.callFn) < 0
+  if steps.length == 0 || steps.length > 8 { return false }
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
+  // The bindings to visit, each with the count of steps left under it.
+  const work: i32[] = [identDeclOf(x)]
+  const left: i32[] = [steps.length]
+  let w = 0
+  while w < work.length {
+    if work.length > 16 { return false }
+    const d = work[w]
+    const n = left[w]
+    w = w + 1
+    if d < 0 || d >= P.nodes.length { return false }
+    const dn = nodeAt(d)
+    if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
+    let p = path
+    let k = 0
+    while k < n {
+      p = steps[k] + p
+      k = k + 1
+    }
+    if !vrRootSeen(roots, paths, d, p) {
+      if vrRepointable(d, n) { return false }
+      roots.push(d)
+      paths.push(p)
+      const vals: i32[] = [dn.letInit]
+      vrRebinds(d, vals)
+      for v in vals {
+        if !vrValueRoots(unwrapParen(v), steps, n, work, left) { return false }
+      }
+    }
   }
-  if !fresh { return -1 }
-  let lits: i32[] = [iv]
-  let k = steps.length - 1
-  while k > 0 {
-    lits = vrLitStep(lits, steps[k])
-    if lits.length == 0 { return -1 }
-    k = k - 1
-  }
-  if vrRepointable(d, steps.length) { return -1 }
-  let p = pre[0]
-  for s in steps { p = s + p }
-  pre[0] = p
-  d
+  true
 }
 
-// The list and record literals the literals `lits` hold at the path step `step`; empty when one
-// of them holds anything else there.
-function vrLitStep(lits: i32[], step: string): i32[] {
+// Whether `roots` and `paths` already pair binding `d` with path `p`.
+function vrRootSeen(roots: i32[], paths: string[], d: i32, p: string): boolean {
+  let i = 0
+  while i < roots.length {
+    if roots[i] == d && paths[i] == p { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Pushes to `vals` the value of each plain write rebinding the binding declared at `d`.
+function vrRebinds(d: i32, vals: i32[]) {
+  for u in vrUses[d] ?? [] {
+    let t = u
+    let p = sidArrGet(vrParent, u)
+    while p >= 0 && nodeAt(p) is Paren {
+      t = p
+      p = sidArrGet(vrParent, p)
+    }
+    if p >= 0 {
+      const pn = nodeAt(p)
+      if pn is BinExpr && pn.binOp == "=" && pn.binLeft == t {
+        vals.push(pn.binRight)
+      }
+    }
+  }
+  0
+}
+
+// Follows the value `v` a binding holds, with `n` of `steps` left under it, to the bindings its
+// written container may belong to, pushed to `work` and `left`; false unless it is a name, or a
+// fresh list, record or `Map()` holding a literal or a name at each step before the last, or a
+// call to a declared function returning only those.
+function vrValueRoots(
+  v: i32,
+  steps: string[],
+  n: i32,
+  work: i32[],
+  left: i32[],
+): boolean {
+  if v < 0 || v >= P.nodes.length { return false }
+  const vn = nodeAt(v)
+  if vn is Ident {
+    work.push(identDeclOf(v))
+    left.push(n)
+    return true
+  }
+  let fresh = vn is ObjLit || vn is ArrayLit
+  if vn is Call && vn.callArgs.length == 0 {
+    const cf = nodeAt(unwrapParen(vn.callFn))
+    fresh = cf is Ident && cf.identName == "Map" && identDeclOf(vn.callFn) < 0
+  }
+  if !fresh && vn is Call {
+    // A declared function's result is followed into each list, record or name it returns (D12370).
+    const rets: i32[] = []
+    if !holeSlotCallRets(vn, rets) || rets.length == 0 { return false }
+    for r in rets {
+      const rv = unwrapParen(r)
+      if rv < 0 || rv >= P.nodes.length { return false }
+      const rn = nodeAt(rv)
+      if !(rn is ObjLit || rn is ArrayLit || rn is Ident) { return false }
+      if !vrValueRoots(rv, steps, n, work, left) { return false }
+    }
+    return true
+  }
+  if !fresh { return false }
+  let lits: i32[] = [v]
+  let k = n - 1
+  while k > 0 {
+    lits = vrLitStep(lits, steps[k], k, work, left)
+    if vrLostIn(lits) { return false }
+    k = k - 1
+  }
+  true
+}
+
+// The list and record literals the literals `lits` hold at the path step `step`, with each name
+// they hold there pushed to `work` with `k` steps left under it; lost when one of them holds
+// anything else there.
+function vrLitStep(
+  lits: i32[],
+  step: string,
+  k: i32,
+  work: i32[],
+  left: i32[],
+): i32[] {
   const out: i32[] = []
-  const none: i32[] = []
   for l in lits {
     const n = nodeAt(l)
     if step == "e," {
-      if !(n is ArrayLit) { return none }
+      if !(n is ArrayLit) { return vrLost() }
       for e in n.arrElems {
-        const v = unwrapParen(e)
-        if v < 0 || !(nodeAt(v) is ObjLit || nodeAt(v) is ArrayLit) {
-          return none
-        }
-        out.push(v)
+        if !vrLitHeld(unwrapParen(e), k, out, work, left) { return vrLost() }
       }
     } else {
-      if !(n is ObjLit) { return none }
+      if !(n is ObjLit) { return vrLost() }
       let v = -1
       for fi in n.objFields {
         const f = nodeAt(fi)
@@ -639,18 +730,42 @@ function vrLitStep(lits: i32[], step: string): i32[] {
           v = unwrapParen(f.fiValue)
         }
       }
-      if v < 0 || !(nodeAt(v) is ObjLit || nodeAt(v) is ArrayLit) {
-        return none
-      }
-      out.push(v)
+      if !vrLitHeld(v, k, out, work, left) { return vrLost() }
     }
   }
   out
 }
 
+// Sorts the value `v` a literal holds on the way to a written place: a list or record literal
+// goes to `out`, a name to `work` with `k` steps left; false for anything else.
+function vrLitHeld(
+  v: i32,
+  k: i32,
+  out: i32[],
+  work: i32[],
+  left: i32[],
+): boolean {
+  if v < 0 || v >= P.nodes.length { return false }
+  const vn = nodeAt(v)
+  match vn {
+    ObjLit | ArrayLit => {
+      out.push(v)
+      return true
+    }
+    Ident => {
+      work.push(identDeclOf(v))
+      left.push(k)
+      return true
+    }
+    // a value whose storage the walk does not model
+    AsExpr | BinExpr | Block | BoolLit | BreakStmt | Call | CharLit | ContinueStmt | ErrExpr | FieldDef | FieldInit | ForIn | ForRange | FuncDecl | IfStmt | ImportDecl | Index | IsExpr | LetDecl | MatchExpr | Member | NullLit | NumLit | OptMember | Param | Paren | Program | RetStmt | Spread | StrLit | TypeDecl | TypeRef | Unary | UnionDecl | WhileStmt => {}
+  }
+  false
+}
+
 // Whether a read of the binding declared at `d` may re-point a container on a place `n` steps
-// under it: it rebinds it, writes or calls a method on a container above the last, or hands one
-// of those to anything else, which could.
+// under it: it writes or calls a method on a container above the last, or hands one of those to
+// anything else, which could. A write rebinding the binding is a root `vrPlaceRoots` follows.
 function vrRepointable(d: i32, n: i32): boolean {
   for u in vrUses[d] ?? [] {
     let cur = u
@@ -677,7 +792,7 @@ function vrRepointable(d: i32, n: i32): boolean {
     } else {
       const pn = nodeAt(p)
       if pn is BinExpr && pn.binOp == "=" && pn.binLeft == cur {
-        if m < n { return true }
+        if m > 0 && m < n { return true }
       } else if pn is Call && pn.callFn == cur && m > 0 {
         if m < n { return true }
       } else if vrHandsOnAbove(m, n) {
