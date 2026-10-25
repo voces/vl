@@ -1517,6 +1517,41 @@ What each slice changes:
     - The next step is the object class at `arr`. Build a struct-union list literal at the
       destination's arm row by type, so the literal's own shape is never the key. The function
       class waits on the per-site type.
+  - L2 stage 6 at d0a33866f is a probe record only, with no compiler change. It tests the next
+    step stage 5 named: whether a record-element list's row can be found by type at the
+    destination's declared row.
+    - The probe was taken over the self-compile and 16,798 files, with 0 uncompared. It ran at
+      `arrRefSlotOf` (`arr`) and `letRefListSlot`'s tail (`let`), beside the by-name pick.
+      Classes are per differing file: a function example, else a record example, else other.
+    - Plain `rlSlotOfTyOrTwin` first:
+      - `arr`: 192 of 1,403 files differ (309 events). Function 96, record 91, other 5.
+      - `let`: 244 of 2,448 files differ (1,595 events). Function 113, record 103, other 28.
+    - Then a destination-row rule on the typed side. A declared struct or arm keeps its own
+      row. A shape takes the declared struct row whose field set matches it, else the arm row
+      (strict, then widened). If neither matches, it tries the same with a field that fits a
+      nullable or union box. A union of shapes takes a row only when every member lands on the
+      same one.
+      - `arr`: 135 files (247 events). The record class falls from 91 to 34 files.
+      - `let`: 209 files, but events rise from 1,595 to 2,647. The record class falls from 103
+        to 68 files.
+    - No site agrees everywhere, so no reader moves and no helper ships. There are three
+      blocking reasons:
+      - One arena type names different rows at different sites. At `let`'s tail, the name
+        keeps a literal's own row (`{r: null}`, `{r: i32}`). At `arr`, the same types read
+        `Circle` or `Dot`. Any rule that fixes one site moves the other.
+      - Some declared rows share a layout, and then only the delivery picks the row. In 24
+        files, `Dot` (a struct) and `Circle` (an arm) are both `{r: Shape2}`. The name follows
+        the list's later destination (`Circle[]`), and a field-set scan picks the first
+        match. `Ix`/`Jx`, `I`/`J`, a `{r: i32}` pair at depth, and duplicate `AB` rows are
+        the same case. The literal's own type does not record where it is delivered.
+      - In 4 files, the element type is the union of both arms' shapes
+        (`{r: {c2: i32}} | {r: {s2: i32}}`), but the name is one arm, `Circle`. No row by
+        layout matches it.
+    - The next step is to carry the delivery to the reader as a type. That is the list
+      literal's destination row (the D361/D1690 destination rows that `structIndexOfObj`
+      reads by node), held per site. With it, these readers could look up by type. Without
+      it, a mint or lookup keyed by the literal's arena type cannot answer both sites. The
+      census and the render-parse budget do not move.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
