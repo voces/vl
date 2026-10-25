@@ -201,7 +201,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 8 retired, 14 left; `refArrElemNameIf` is deleted, its last caller reading its arm's element row by type; the ladder internals still have name callers that mint by spelling) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer; re-checked at 84b98d149 after #4700: the pins are computed before the instance exists, none retired; re-probed at edc698135 over every pin at the mint: the banked type is the argument's, not the pin's, and differs from the resolved pin type in 371 files, so step 1 is not byte-identical) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5; re-checked at 84b98d149, unchanged) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 18 retired, 3 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; re-probed at 84b98d149, none retired; at 2aef21b94 the D4930 alias `shareFieldUnionRow` is deleted, since no reach file needs the alias or its row; the `recordUnMemTys` fallback rows carry a type that loses a member or unrolls a cycle, and the `unionSetAtomsOf` and `unionSetMemberCount` splits are reached by callers with no type) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 18 retired, 3 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; re-probed at 84b98d149, none retired; at 2aef21b94 the D4930 alias `shareFieldUnionRow` is deleted, since no reach file needs the alias or its row; the `recordUnMemTys` fallback rows carry a type that loses a member or unrolls a cycle, and the `unionSetAtomsOf` and `unionSetMemberCount` splits are reached by callers with no type; probed per caller at b66b5b5f8: no count from the caller's type matches the spelling count, because one alias type is spelled by name at one call and expanded at another, so none retired) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired; at 84b98d149 the typed-beside legs of `mvValNamesCompat` are reached by no event) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; the mv mint key asks the held map type at every caller, the annotation sites and union arms included, with the spelling only as the floor for a value the arena cannot name; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149: the field companion's render is the name its readers rebuild the box under) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -1964,6 +1964,46 @@ What each slice changes:
       function retires until the readers with only a spelling ask by type too. Those are
       `memReadBoxNames` for its stored field (`phys`), `narrowSlotAtomsInto`,
       `unionMemberCountOfName`, `nameIsRefArrayGo` and the `emit_mono` pin readers.
+  - Probed `unionSetMemberCount` per caller at `b66b5b5f8` (#4777's head), over the self-compile
+    and 16,781 files, none retired. At every call the probe compared the spelling count with
+    counts taken from the type the caller holds, or the declared type of a union name for
+    `unionMemberCountOfName`. Counts are events.
+    - No count taken from the type alone matches. The same alias type is spelled two ways at
+      one site, so it has two answers. `mvCanonValNameTy` sees `U` spelled by its alias name
+      (count 1) and also expanded as `i32|string` (count 2). Counting the alias's members
+      differs in 44,958 events there, and counting an alias as one atom differs in 140.
+    - The closest rule asks the spelling one question. If the set is the type's alias name,
+      the count is 1. Otherwise it is the type's members, with anonymous nested unions and
+      nullables flattened and a literal union as one atom. That rule still differs at every
+      typed site except two:
+      - `internFuncTypeShapesTyGo`: 7 of 21,281 differ, and the `> 1` test differs in 0.
+      - `mvValKindOfNameTy` through `unionMemberCountOfName`: 2 of 60,352.
+      - `internShapeDeepTyGo`: 7 of 700,315, plus 21,904 with no type.
+      - `canonAtomsOfTy`: 8 of 13,023.
+      - `rlCanonLitUnionAtoms`: 6 of 4,018 at the top and 6 of 30,659 at an element, plus
+        184,146 and 13,800 with no type (the element recursion passes -1).
+      - `monoMakeInstanceRetAnn` (`emit_mono`): 52 of 3,148.
+      - `mvCanonValNameTy`: 1,572 of 182,793.
+    - The differences are spelling choices, not count bugs:
+      - The type and the spelling disagree about a literal. A numeric literal union is spelled
+        `i32` (36 of the first 40 differing files at `mvCanonValNameTy`), and `string|"err"` is
+        held as `string`.
+      - A parenthesised member is one atom in the spelling. `(i32|null)|string` counts 2, and
+        its type has 3 members.
+      - The caller's type is not the spelled type. Examples are `A|B` held as `A`, a monomorph
+        `Item$m…|null` whose type renders empty, and `#lu2|null|string` held as `string|null`.
+    - Three callers hold no type at all:
+      - `nameIsRefArrayGo` (18,836 events in 3,717 files) is a name-keyed memo with 9 callers.
+      - `nulBoxUnionElem` (27 events).
+      - The narrowed-variant reads `printNarrowKeepsBox`, `printNarrowLiveAtoms` and
+        `indexCellCurSlot` (79 events). The slot has no `narrowTys` entry.
+
+    `unionSetMemberCount` stays, and `unionSetAtomsOf` stays with it, because its callers are
+    the same readers plus 31 more. To retire the count, a reader must ask the type the spelling
+    was rendered from: the type before softening, the declared alias when the spelling names it,
+    and a `narrowTys` entry for every narrowed variant. `nameIsRefArray` also needs a type
+    parameter at its 9 callers. Moving only the two callers that agree would leave the parse in
+    place, so none moved.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
   `structIndexOfLet` answer by type.
 
