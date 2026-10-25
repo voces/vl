@@ -177,7 +177,11 @@ import {
   tyIsValueUnionBox,
   valueAtomKind,
 } from "./check_ty_rep"
-import { listDisjointDepth, listIsFitsAcrossReps } from "./check_type_shape"
+import {
+  listDisjointDepth,
+  listIsFitsAcrossReps,
+  nameIsNewtypeBrand,
+} from "./check_type_shape"
 import {
   T,
   TyArray,
@@ -520,6 +524,7 @@ import {
   annBareRefArrElemName,
   annBareRefArrSlot,
   annNulRefArrSlot,
+  arrLitCommitAnnAt,
   arrLitCommitNameAt,
   mvUnionIsScalarNull,
   mvValInnerRlSlotAt,
@@ -757,13 +762,16 @@ import {
   anonCodeIsSelfContained,
   armLayoutAmbiguousAt,
   arrElemIsClosureTy,
+  arrLitArenaElemRow,
   arrLitBoxElem,
   arrLitBoxElemName,
   arrLitElemRender,
   arrLitLeadInner,
+  arrLitLeadIsList,
   arrLitMapElemName,
   arrLitNestedElemName,
   arrLitNominalElemName,
+  arrLitNominalRowTy,
   arrLitNulRefElemName,
   elemRowsCaptureCompat,
   emptyArrLitIxOf,
@@ -784,8 +792,10 @@ import {
   rlElemNulMapValMvSlot,
   rlElemStructRow,
   rlElemVariantRow,
+  rlRowTyOfElem,
   rlSlotByName,
   rlSlotByNameTwin,
+  rlSlotOfRowTy,
   rlSlotOfTyOrTwin,
   sFieldMapShape,
   sFieldRefSlot,
@@ -794,6 +804,7 @@ import {
   structIndexOfTypeNameTy,
   structRowOfObjFieldSet,
   tyIsRefArray,
+  tyMentionsLitOrObj,
   uFieldMapShape,
   uFieldTgtStructIdx,
   variantIndexOfTypeName,
@@ -1085,6 +1096,7 @@ import {
   unionClosureArrElemUnion,
   unionMapArmNameTy,
   unionNameOfVariant,
+  unionOfVariant,
   unionSpellingOfTy,
   valueUnionNameOfTy,
 } from "./emit_union_atoms"
@@ -11839,6 +11851,117 @@ export function arrLitObjElemBoxVariant(arrIx: i32): string {
   }
   ""
 }
+
+// The ref-list row literal `arrIx` builds in frame `fnIx`, found by the element type
+// `arrLitRowTyIn` keys it by, or -1 for none.
+export function arrLitRowSlotIn(arrIx: i32, fnIx: i32): i32 {
+  rlSlotOfRowTy(arrLitRowTyIn(arrIx, fnIx))
+}
+
+// The element type ref-list literal `arrIx` keys its row by in frame `fnIx`, or -1.
+export function arrLitRowTyIn(arrIx: i32, fnIx: i32): i32 {
+  let et = -1
+  const ft = arrLitFrameRefTy(arrIx, fnIx)
+  if ft >= 0 { et = tyArrayElemIx(ft) }
+  if et < 0 { et = arrLitElemHintTy(arrIx) }
+  if et < 0 { et = arrLitObjRowTy(arrIx) }
+  // The element's own committed annotation outranks its recorded shape's row (D163).
+  if et < 0 {
+    const ca = arrLitCommitAnnAt(arrIx)
+    if ca >= 0 { et = annRowOfNode(ca) }
+  }
+  if et < 0 { et = arrLitNominalRowTy(arrIx) }
+  if et < 0 && arrLitLeadIsList(arrIx) {
+    et = tyRefArrElemOf(nodeTyInOf(arrIx, fnIx))
+  }
+  if et < 0 { et = tyRefArrElemOf(nodeRepTyIxOf(arrIx)) }
+  rlRowTyOfElem(et)
+}
+
+// The row type of an object-literal element list's lead element: its struct row, else its
+// arm's row; -1 where the union-box or nullable-element arm owns the answer.
+function arrLitObjRowTy(arrIx: i32): i32 {
+  const a = nodeAt(arrIx)
+  if a is ArrayLit {
+    if a.arrElems.length < 1 || !(nodeAt(a.arrElems[0]) is ObjLit) { return -1 }
+    if arrLitObjElemBoxVariant(arrIx) != "" { return -1 }
+    if arrLitNulRefElemName(arrIx) != "" { return -1 }
+    const si = structIndexOfObj(a.arrElems[0])
+    if si >= 0 && si < sTyIx.length { return sTyIx[si] }
+    if uDeclared {
+      const vi = variantIndexOf(objVariantName(a.arrElems[0]))
+      if vi >= 0 && vi < uVarTyIx.length { return uVarTyIx[vi] }
+    }
+  }
+  -1
+}
+
+// The arena twin of `arrLitElemName`, arm for arm: the row that arm's name denotes, or -1
+// where the arm's answer is deliberately a name. Each arm must use its own source — hinting
+// every arm from the array's arena element disagrees for the two object-literal arms, whose
+// name is a row found in a table, not the array's recorded element.
+export function arrLitElemHintTy(arrIx: i32) {
+  const a = nodeAt(arrIx)
+  if a is ArrayLit {
+    // The closure-element arm is hinted at full agreement under the guard: the row is the
+    // array's own recorded element, but only where the element mentions no literal type and
+    // no object shape (`tyMentionsLitOrObj`), the two classes that disagree.
+    if arrElemIsClosureTy(arrIx) {
+      const cty = arrLitArenaElemRow(arrIx)
+      if cty < 0 { return -1 }
+      if tyMentionsLitOrObj(cty, 0) { return -1 }
+      // A row still carrying a hole is the TEMPLATE's, and the name arm answered through the
+      // hole's pin — hinting the unsubstituted row would key a second one (D1794).
+      if tyHasTyVar(cty) { return -1 }
+      return cty
+    }
+    if a.arrElems.length >= 1 {
+      const e0 = nodeAt(a.arrElems[0])
+      // Arm 2 — the coarse nested-list bucket.
+      if e0 is ArrayLit { return -1 }
+      if e0 is ObjLit {
+        // Must agree arm for arm with the two classifiers above: the hint denotes the row
+        // the name arm picked, so it asks the same predicate. An element resolving to a bare
+        // arm falls past into the struct arm, which declines the hint rather than guess.
+        const vn = arrLitObjElemBoxVariant(arrIx)
+        if vn != "" {
+          // The variant arm, dual-written at full agreement: the name is `unNames[u]`, the
+          // row is that table's own `unTyIx[u]`, resolved from that name at mint.
+          const u = unionOfVariant(variantIndexOf(vn))
+          if u < 0 { return -1 }
+          if u >= unTyIx.length { return -1 }
+          return unTyIx[u]
+        }
+        // The nullable-element arm's twin: the name arm answers the NICHE spelling, and this
+        // DECLINES rather than hand over the non-null struct row below, which would key a
+        // second slot for one wrapper. Declining keys on the name alone, the one string both
+        // the inferred literal and the annotation reach the table with.
+        if arrLitNulRefElemName(arrIx) != "" { return -1 }
+        // The struct arm, at full agreement once two row classes are excluded: `sIsAnonRow`
+        // (`sTyIx` has two producers that disagree for an `#anonN` row), and
+        // `nameIsNewtypeBrand` (the row's name is the brand while `sTyIx[si]` holds the
+        // unbranded base, so `repElemKey` keys the two differently).
+        const si = structIndexOfObj(a.arrElems[0])
+        if si >= 0 {
+          if si >= sTyIx.length { return -1 }
+          if sIsAnonRow(si) { return -1 }
+          if nameIsNewtypeBrand(sNames[si]) { return -1 }
+          return sTyIx[si]
+        }
+        return -1
+      }
+    }
+    // The union-element arm, dual-written at full agreement: `arrLitUnionElemName` is
+    // `nodeArrayElemName` gated by a union row, so its row is the array's own recorded
+    // element, read off `nodeTyIxOf` — the same column that renderer reads.
+    if arrLitUnionElemName(arrIx) != "" { return arrLitArenaElemRow(arrIx) }
+    // The committed-rep arm declines too (D163): its name is a spelling the element
+    // expression committed to, never a row this function looked up, so there is no arena
+    // twin to hand over. The nominal-element arm declines deliberately, for the same reason
+    // — a declined hint costs nothing, a wrong hint is a silently wrong rep key.
+  }
+  -1
+}
 // The one nominal row every object-literal element of `arrIx` denotes, or "" when they do
 // not all denote one row (D361) — the rung `arrLitObjElemBoxVariant` consults before it
 // widens. "The checker recorded a union" and "the elements denote different rows" are two
@@ -17694,12 +17817,6 @@ export function letRefListElemTy(letIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The arena element type of list literal `arrIx` inside function `fnIx`, or -1 — the type
-// beside `arrLitElemNameIn`'s name.
-export function arrLitElemTyIn(arrIx: i32, fnIx: i32): i32 {
-  tyRefArrElemOf(nodeTyInOf(arrIx, fnIx))
-}
-
 // The arena element type of function `fe`'s ref-list return, the type beside its
 // `fRetRArrElem` name, or -1.
 export function fnRetRArrElemTy(fe: i32): i32 {
@@ -17750,10 +17867,7 @@ export function letRecordListDestSlot(letIx: i32, fnIx: i32): i32 {
         if rsIsBuiltRecord(e0) { rsBuiltElemRefuse(letIx, fnIx, ai) }
         return -1
       }
-      const own = rlSlotByNameTwin(
-        arrLitElemNameIn(ai, fnIx),
-        arrLitElemTyIn(ai, fnIx),
-      )
+      const own = arrLitRowSlotIn(ai, fnIx)
       if !rlSlotIsKindList(own, RLK_STRUCT) { return -1 }
       let dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
       if dst < 0 { dst = rsElemListDestSlot(letIx, fnIx, own) }
@@ -17773,10 +17887,7 @@ export function letRecordListDestSlot(letIx: i32, fnIx: i32): i32 {
 // another record of the same field names: its elements are that other row, and a record is
 // shared rather than converted, so no build of the list serves the destination (D2917).
 function rsBuiltElemRefuse(letIx: i32, fnIx: i32, ai: i32) {
-  const own = rlSlotByNameTwin(
-    arrLitElemNameIn(ai, fnIx),
-    arrLitElemTyIn(ai, fnIx),
-  )
+  const own = arrLitRowSlotIn(ai, fnIx)
   if !rlSlotIsKindList(own, RLK_STRUCT) { return 0 }
   if !structNamesTwoRows(rsSlotRow(own)) { return 0 }
   const dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)

@@ -1625,6 +1625,43 @@ What each slice changes:
     - difftree `--identity`: 0 of 16,687 files differ (11,795 built), and the fixpoint
       identity holds. The census and the render-parse budget do not move (53 renders, 86
       parses), since the deleted pick parsed no spelling the census counts.
+  - L2 stage 9 moves the typed row lookup below `emit_value_sites` and switches the two
+    own-row reads in `emit_classify` to it. No module sits below both `emit_classify` and
+    `emit_value_sites` that can hold the whole lookup, because its delivery half reads
+    `emit_classify` tables. So the lookup is split by what it reads:
+    - The type-only half is in `emit_shape_rows`: `rlSlotOfRowTy` (the row keyed like a type,
+      else the first row whose element is the same type or renders as it) and
+      `rlRowTyOfElem` (the closure, `Set` and literal-softening rules from stage 8).
+    - `arrLitRowSlotIn`, `arrLitRowTyIn` and `arrLitElemHintTy` move into `emit_classify`.
+      `emit_value_sites`, `emit_collect` and `wasmEmit` import them from there.
+    - The probe was taken over the self-compile and 16,801 files, with 0 uncompared. Each
+      reader's typed answer was computed beside its name answer:
+      - `letRecordListDestSlot`'s own row: 29 files, 0 differ. Switched.
+      - `rsBuiltElemRefuse`'s own row: 1,370 files, 2 differ
+        (`hole-fn-generic-pushed-list-spread`, closure stub against `((i32)=>i32)`;
+        `spread-copy-keeps-source-record-row`, `J` against `I`). Neither answer passes the
+        struct-row and two-rows tests that follow, so both modules are byte-identical.
+        Switched.
+      - The `letRefListSlot` tail: 2,451 files, 51 differ. It stays on the name. A trial
+        switch was built and graded over the first 40 of them. 23 were byte-identical and
+        17 were not:
+        - Five hole-closure lists stop running, where the type takes the `() => void` stub
+          or no row and the name takes the bound signature.
+        - Two record lists trap in the compiler, where the type takes a same-field row (`J`
+          for `I`, `Circle` for `Shape`).
+        - Ten `d3125_gen_J1_*` cells trap in the compiler, where the type finds an
+          `i32|null` or `f64|null` row and the name finds none.
+      - `refListSlotOfExpr`: 4,552 files, 932 differ. It stays on the name. Most of them are
+        captures and union values that are not lists, where the name declines and the
+        element type of the value names a row.
+    - `arrLitElemTyIn` had no caller left and is deleted. `arrLitElemNameIn` stays for
+      `refListElemNameOfExpr`.
+    - difftree `--identity`: 0 of 16,693 files differ (11,801 built), and the fixpoint
+      identity holds. The census and the render-parse budget do not move (52 renders, 86
+      parses), since neither switched read parsed a spelling.
+    - The next step for the `let` tail is the closure rule: a hole closure's row is its bound
+      signature in the frame, not the stub. The record and nullable classes are each their own
+      rule.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,

@@ -46,6 +46,7 @@ import {
   nodeAt,
 } from "./ast"
 import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
+import { pinResolvedFnTy } from "./check_core_state"
 import { nodeArrayElemName, nominalStructNameOfTy } from "./check_emit_queries"
 import {
   nodeTyMapValIsLitUnion,
@@ -79,6 +80,7 @@ import {
   PrimName,
   RC_MAP_VAL,
   T,
+  TY_VOID,
   TyArray,
   TyErr,
   TyFunc,
@@ -94,13 +96,18 @@ import {
   cUserTypesVer,
   litBaseTy,
   litUnionAliasNameOfTy,
+  mkArrayTy,
+  mkFuncTy,
+  mkMapTy,
   numLitUnionBaseName,
   oneStrLitSpelling,
+  softenLitTy,
   structNameOfTy,
   tyArrayElemIx,
   tyAt,
   tyDeeperThan,
   tyEmitNameNonEmpty,
+  tyEq,
   tyFieldTyOf,
   tyIsFuncArena,
   tyIsLitUnion,
@@ -329,6 +336,7 @@ import {
   rlElemKey,
   rlElemKindTbl,
   rlElemName,
+  rlElemTyIx,
   sAnonOwnTy,
   sFieldCount,
   sFieldElemName,
@@ -4502,6 +4510,81 @@ export function rlSlotOfTyOrTwin(ty: i32): i32 {
   const s = rlSlotOfTy(ty)
   if s >= 0 { return s }
   rlSlotOfTyTwin(ty)
+}
+
+// The ref-list slot whose row is element type `et`: the row keyed like it, else a layout
+// twin's, else the first whose element is the same type or renders as it. -1 for none.
+export function rlSlotOfRowTy(et: i32): i32 {
+  if et < 0 { return -1 }
+  const s = rlSlotOfTyOrTwin(et)
+  if s >= 0 { return s }
+  let i = 0
+  while i < rlElemTyIx.length {
+    if tySame(rlElemTyIx[i], et) || tyEq(rlElemTyIx[i], et) { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Element type `et` at the type its ref-list row is minted under: a closure at its row's
+// signature, a set at its boolean-valued map twin, a list of number literals at their scalar.
+// -1 for no type, or a closure signature that has no row.
+export function rlRowTyOfElem(et: i32): i32 {
+  if et < 0 || et >= T.tys.length { return -1 }
+  const t = tyAt(et)
+  match t {
+    TyFunc => fnElemRowTy(et)
+    TyMap => {
+      if t.mSet == 1 { return mkMapTy(t.mKey, t.mVal, 0) }
+      et
+    }
+    TyArray => {
+      if tyIsLitUnionOrLit(t.aElem) { return et }
+      const se = softenLitTy(t.aElem)
+      if se != t.aElem { return mkArrayTy(se) }
+      et
+    }
+    TyPrim | TyErr | TyObj | TyUnion | TyNullable | TyVar | TyLit | TyNeg => et
+  }
+}
+
+// A closure element's row type: the signature, else at its hole's pin, else the stub
+// `() => void` for one a type variable keeps unrenderable (D1794, D4123).
+function fnElemRowTy(et: i32): i32 {
+  if tyEmitNameNonEmpty(et) != 0 { return fnTySoftenLits(et) }
+  const pin = pinResolvedFnTy(et)
+  if pin >= 0 && tyEmitNameNonEmpty(pin) != 0 { return fnTySoftenLits(pin) }
+  if tyHasTyVar(et) || pin >= 0 { return mkFuncTy([], TY_VOID) }
+  -1
+}
+
+// Function type `ft` at the signature its row is minted under, or `ft` when that is itself:
+// each parameter at its softened scalar, and a result that is no literal-union alias too.
+function fnTySoftenLits(ft: i32): i32 {
+  const t = tyAt(ft)
+  if t is TyFunc {
+    let changed = false
+    const ps: i32[] = []
+    for p in t.fnParamTypes {
+      const sp = softenLitTy(p)
+      if sp != p { changed = true }
+      ps.push(sp)
+    }
+    let r = t.fnRet
+    if !fnRetKeepsAlias(r) { r = softenLitTy(r) }
+    if r != t.fnRet { changed = true }
+    if changed { return mkFuncTy(ps, r) }
+  }
+  ft
+}
+
+// Whether function result `r` keeps its literal-union alias, bare or made nullable, in the
+// row's signature rather than softening to its scalar.
+function fnRetKeepsAlias(r: i32): boolean {
+  if r < 0 || litUnionAliasNameOfTy(r) != "" { return true }
+  const t = tyAt(r)
+  if t is TyNullable { return litUnionAliasNameOfTy(t.nInner) != "" }
+  false
 }
 
 // The shared body: the two name rungs, then `rlSlotOfTyTwin(twinTy)`.
