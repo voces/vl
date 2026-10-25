@@ -13009,8 +13009,20 @@ function monoIfBoundRetAtPin(at: i32, ctx: i32): i32 {
   const fr = if lf[1] >= 0 { lf[0] } else { ctx }
   const g0 = monoFirstArmGenName(iv, fr, 0)
   if g0 < 0 { return 0 }
-  const key = if lf[1] >= 0 { lf[1] } else { g0 }
+  let key = if lf[1] >= 0 { lf[1] } else { g0 }
   const noPath: string[] = []
+  // An inline `if` in an instance body is banked under the template's read, at the same position.
+  const it = monoFrameInstTmpl(ctx)
+  const gn = nodeAt(g0)
+  if (
+    lf[1] < 0
+    && it[1] >= 0
+    && gn is Ident
+    && monoDeclPathPins([fr, key], noPath).length == 0
+  ) {
+    const tr = monoIdentAtPosIn(it[1], gn.identName, gn.pos, 0)
+    if tr >= 0 { key = tr }
+  }
   const cTys: i32[] = []
   const ct = monoSlotPinNameTys(key, noPath, fr, cTys)
   if ct == "" { return monoAskRetCopies(fr, key, noPath, ctx, -1) }
@@ -20573,9 +20585,10 @@ function monoCalleeAnnNode(callee: i32, fnIx: i32): i32 {
 function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
   const elems = monoCalleeElems(n.callFn, ctx)
   if elems.length == 0 { return 0 }
+  const inline = monoForInlineElems(n.callFn)
   const rows: i32[][] = []
   for el in elems {
-    const pts = monoElemParamTys(el, n.callArgs, ctx)
+    const pts = monoElemParamTys(el, n.callArgs, ctx, inline)
     if pts.length != n.callArgs.length { return 0 }
     rows.push(pts)
   }
@@ -20646,6 +20659,29 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
   }
   nodeTyRecord(n.callFn, ft)
   1
+}
+
+// Whether callee `c` is a `for` variable over a list literal written in the loop's header, so
+// each instance of the enclosing function walks its own copy of the elements.
+function monoForInlineElems(c: i32): boolean {
+  const x = unwrapParen(c)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  if !(dn is ForIn) { return false }
+  const it = unwrapParen(dn.fiIter)
+  it >= 0 && it < P.nodes.length && nodeAt(it) is ArrayLit
+}
+
+// Whether callee `c` is a `for` variable over a list literal written in the loop's header with a
+// generic function among its elements (D13100).
+function monoForInlineGenElems(c: i32, ctx: i32): boolean {
+  if !monoForInlineElems(c) { return false }
+  for el in monoCalleeElems(c, ctx) {
+    if monoNamesDeclaredGeneric(el, ctx) { return true }
+  }
+  false
 }
 
 // A callee naming an un-annotated `const` join of functions asks for a copy per call type.
@@ -20753,16 +20789,15 @@ function monoArmTailValue(arm: i32): i32 {
   if v < 0 || v >= P.nodes.length { return v }
   const x = unwrapParen(v)
   if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return v }
-  const d = identDeclOf(x)
+  const d0 = identDeclOf(x)
   const b = nodeAt(arm)
-  if (
-    d < 0
-    || d >= P.nodes.length
-    || !(b is Block)
-    || !i32ListHas(b.blkStmts, d)
-  ) {
-    return v
+  if d0 < 0 || d0 >= P.nodes.length || !(b is Block) { return v }
+  // An instance's copy of the block holds its own copy of a template's `const` the read names.
+  let d = -1
+  for s in b.blkStmts {
+    if d < 0 && (s == d0 || monoSameLetDecl(s, d0)) { d = s }
   }
+  if d < 0 { return v }
   const ld = nodeAt(d)
   if (
     !(ld is LetDecl)
@@ -20836,8 +20871,14 @@ function monoElemFnDecl(el: i32, ctx: i32): i32 {
 
 // The closed parameter types the named function `el` takes called with `args`: a generic
 // argument's at the types the parameter's own calls agree on, -1 for a parameter the body never
-// reads, any other argument's own type; empty when one is open.
-function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
+// reads, any other argument's own type, at the instance `ctx` when `inline` says the elements are
+// its own copy; empty when one is open.
+function monoElemParamTys(
+  el: i32,
+  args: i32[],
+  ctx: i32,
+  inline: boolean,
+): i32[] {
   const none: i32[] = []
   const x = unwrapParen(el)
   if x < 0 || !(nodeAt(x) is Ident || nodeAt(x) is FuncDecl) { return none }
@@ -20897,12 +20938,19 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
           }
           pt = at
         }
+      } else if (
+        monoElemFwdFnFits(args[j], f.fnParams[j], f.fnBody, bNames, bTys, ctx)
+      ) {
+        // A forwarded parameter holds the one instance its frame's own instance receives.
+        pt = monoElemValArgTy(args[j], ctx)
       } else if !monoSubtreeReads(f.fnBody, f.fnParams[j]) {
         pts.push(-1)
         j = j + 1
         continue
       }
-    } else if named {
+    } else if named || inline {
+      // An instance's own copy of the elements reads a value at the type the instance gives it;
+      // elements the instances share stay at the template's type.
       pt = monoElemValArgTy(args[j], ctx)
     } else {
       pt = nodeTyIxOf(unwrapParen(args[j]))
@@ -21013,6 +21061,53 @@ function monoElemPinTysUnder(
   }
   for t in got { qs.push(t) }
   true
+}
+
+// Whether argument `a`, a parameter forwarding the function its frame's instance holds, is closed
+// there at the parameter types every call of element parameter `par` in `body` passes under the
+// element's value binding `bNames`/`bTys`; false when `par` is read any other way (D13102).
+function monoElemFwdFnFits(
+  a: i32,
+  par: i32,
+  body: i32,
+  bNames: string[],
+  bTys: i32[],
+  ctx: i32,
+): boolean {
+  if monoElemArgNamesFn(a, ctx) { return false }
+  const at = monoElemValArgTy(a, ctx)
+  if at < 0 || at >= T.tys.length || !monoTyClosedFn(at) { return false }
+  const ft = tyAt(at)
+  if !(ft is TyFunc) { return false }
+  const want = fnFlowPinSigOf(ft.fnParamTypes)
+  let calls = 0
+  const stack: i32[] = [body]
+  while stack.length > 0 {
+    const x = stack.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Ident && identDeclOf(x) == par { return false }
+      if (
+        n is Call
+        && n.callFn >= 0
+        && nodeAt(n.callFn) is Ident
+        && identDeclOf(n.callFn) == par
+      ) {
+        const sub: i32[] = []
+        for c in n.callArgs {
+          const st = substTyDeep(nodeTyIxOf(unwrapParen(c)), bNames, bTys)
+          if st < 0 || tyHasTyVar(st) { return false }
+          sub.push(st)
+        }
+        if fnFlowPinSigOf(sub) != want { return false }
+        calls = calls + 1
+        for c in n.callArgs { stack.push(c) }
+      } else {
+        for c in nodeChildren(x) { stack.push(c) }
+      }
+    }
+  }
+  calls > 0
 }
 
 // What call `n`, through list elements or `if` arms, hands as un-annotated parameters or hole
@@ -25527,7 +25622,11 @@ function monoWalk(ix: i32, ctx: i32) {
       if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
       let elemsTyped = 0
       const paramArgs = monoElemsParamArgs(n)
-      if monoGenArgAtOpenParam(n, ctx) || paramArgs > 0 {
+      if (
+        monoGenArgAtOpenParam(n, ctx)
+        || paramArgs > 0
+        || monoForInlineGenElems(n.callFn, ctx)
+      ) {
         elemsTyped = monoOpenCallAtElems(n, ctx)
         if elemsTyped < 0 { return -1 }
       }
