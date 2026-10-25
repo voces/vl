@@ -61,7 +61,6 @@ import {
 import { anonLeafSupersedeOf, structIndexByName } from "./emit_atom_kinds"
 import {
   annArrowAt,
-  annFnDecompose,
   annRetNameOf,
   fnLetInitOf,
   mapNameKeyKind,
@@ -88,7 +87,6 @@ import {
 } from "./emit_map_twins"
 import {
   mvValTyIxAt,
-  nonNulBaseOf,
   nulMapInnerName,
   rlElemMapValMvSlotAt,
   tyRefArrElemOf,
@@ -104,7 +102,6 @@ import {
   mvArmSigOfTy,
   mvSlotByValNameKArm,
   mvValArmName,
-  scalarListRepOfName,
   variantRowOfTy,
 } from "./emit_mv_slots"
 import { narrowSlotOf, variantIndexOf } from "./emit_narrow_slots"
@@ -134,7 +131,6 @@ import {
   mvSlotOfMapNameTy,
   mvValArmOfShapeTy,
   mvValKindOfNameTy,
-  nameIsRefArray,
   nulRefMapValInnerOfTy,
   refArrElemKind,
   refArrElemName,
@@ -147,6 +143,7 @@ import {
   sigRowHasNoArmTwin,
   sigRowHasNoTwin,
   structIndexOfTypeNameTy,
+  tyIsRefArray,
   variantFieldLayoutEq,
   variantLitDiscriminable,
   variantStructHeapTwinAt,
@@ -172,6 +169,7 @@ import {
   RLK_STR_LIST,
   RLK_U8_LIST,
   RLK_UNION,
+  VKind,
   aUsed,
   ba8Used,
   cloSigTagNames,
@@ -280,7 +278,6 @@ import {
   tyMapValOfHeld,
   tyPeelNul,
   tyStepElem,
-  tyStepParam,
   tyStepRet,
 } from "./tyquery"
 
@@ -1495,75 +1492,95 @@ export function forceCloResultMapTypes(nm: string, ty: i32) {
   0
 }
 
-// Forces the wrapper/backing types of a scalar-leaf (or string) list reached only as a
-// closure's result or parameter inside composite annotation `nm` of type `ty` (or -1), which
-// no `collectA` branch can see, so a value call would find no list type. The list dual of
-// `forceCloResultMapTypes`; `ty` keys a ref-element list's slot.
-export function forceCloResultListTypes(nm: string, ty: i32) {
-  // Cheap pre-gate (this runs per arena TypeRef): only a name spelling BOTH an arrow
-  // and an array can carry a closure-result list — two substring scans, no allocation.
-  if !strContains(nm, "=>") || !strContains(nm, "[]") { return 0 }
-  const arms: string[] = []
-  unionSetAtomsOf(nm, arms)
-  const fnTy = cloArmFnTyOf(arms, ty)
-  let i = 0
-  while i < arms.length {
-    const a = normTypeAtom(arms[i])
-    // `annRetNameOf`, exactly as in `forceCloResultMapTypes` above: the caller's own opener
-    // test runs first so the one-char reject precedes the depth scan.
-    if nameIsParenOpen(a) {
-      const ret0 = annRetNameOf(a)
-      if ret0 != "" { forceCloListTypeOf(ret0, tyStepRet(fnTy)) }
-      const ps: string[] = []
-      annFnDecompose(a, ps)
-      let pi = 0
-      while pi < ps.length {
-        forceCloListTypeOf(ps[pi], tyStepParam(fnTy, pi, ps.length))
-        pi = pi + 1
+// Forces the backing of scalar list rep `sk`; false when `sk` names none.
+function forceScalarListBacking(sk: VKind | null): boolean {
+  // Exhaustive over `VKind | null` and `_`-less: a new scalar list rep must say what it forces.
+  match sk {
+    "strlist" => {
+      slUsed = true
+      aUsed = true
+    }
+    "f64list" => {
+      fa64Used = true
+    }
+    "i64list" => {
+      ia64Used = true
+    }
+    "f32list" => {
+      fa32Used = true
+    }
+    "u8list" => {
+      ba8Used = true
+    }
+    "list" => {
+      lUsed = true
+      aUsed = true
+    }
+    "i32" | "struct" | "str" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" | null => {
+      // Not a scalar list rep: nothing to force here.
+      return false
+    }
+  }
+  true
+}
+
+// A ref-element list of type `ty`: intern its element row and force the ref-list machinery, as
+// a bare `S[]` annotation's branch does, else a value call keys a signature no producer interned.
+function forceRefListOfTy(ty: i32) {
+  rlUsed = true
+  raUsed = true
+  ensureRefElemTys(rlRowNameOfTy(tyStepElem(ty), false), -1, tyStepElem(ty))
+  0
+}
+
+// Forces the backing of each list reached only as a closure's result or parameter inside an
+// annotation of type `ty` (or -1), which no `collectA` branch can see, so a value call would
+// find no list type. Each function `ty` holds, itself or as a union member, forces its result
+// and parameters; `| null` is peeled at each level. The list dual of `forceCloResultMapTypes`.
+export function forceCloResultListTypes(ty: i32) {
+  const t0 = tyPeelNul(ty)
+  if t0 < 0 { return 0 }
+  const k = tyAt(t0)
+  match k {
+    TyFunc => {
+      forceCloFnPositions(t0)
+    }
+    TyUnion => {
+      let i = 0
+      while i < k.uMembers.length {
+        const m = tyPeelNul(k.uMembers[i])
+        if m >= 0 && tyAt(m) is TyFunc { forceCloFnPositions(m) }
+        i = i + 1
       }
     }
+    TyPrim | TyErr | TyObj | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a closure, nor a union with a closure member: no closure position to force.
+    }
+  }
+  0
+}
+
+// The result and each parameter of function type `fnTy`, forced as one position each.
+function forceCloFnPositions(fnTy: i32) {
+  const k = tyAt(fnTy)
+  if !(k is TyFunc) { return 0 }
+  forceCloListOfTy(k.fnRet)
+  let i = 0
+  while i < k.fnParamTypes.length {
+    forceCloListOfTy(k.fnParamTypes[i])
     i = i + 1
   }
   0
 }
 
-// `forceCloResultListTypes` for one position's type name `t` and its type `tTy` (or -1),
-// both with their `| null` peeled.
-function forceCloListTypeOf(t: string, tTy: i32) {
-  const res = nonNulBaseOf(normTypeAtom(t))
-  const resTy = tyPeelNul(tTy)
-  // The scalar-element backings via the one home (`scalarListRepOfName`).
-  const sk = scalarListRepOfName(res)
-  if sk == "strlist" {
-    slUsed = true
-    aUsed = true
-  } else if sk == "f64list" {
-    fa64Used = true
-  } else if sk == "i64list" {
-    ia64Used = true
-  } else if sk == "f32list" {
-    fa32Used = true
-  } else if sk == "u8list" {
-    ba8Used = true
-  } else if sk == "list" {
-    lUsed = true
-    aUsed = true
-  } else if nameIsRefArray(res) {
-    // A ref-element list: intern its element slot and force the ref-list machinery, exactly
-    // as a bare `S[]` annotation's branch does — else a value call keys a signature no
-    // producer interned, or the read finds no wrapper.
-    rlUsed = true
-    raUsed = true
-    ensureRefElemTys(
-      rlRowNameOfTy(tyStepElem(resTy), false),
-      -1,
-      tyStepElem(resTy),
-    )
-  } else if annArrowAt(res) >= 0 {
-    // A curried position (`() => () => f32[]`) recurses into its own positions.
-    forceCloResultListTypes(res, resTy)
-  }
-  0
+// One closure position of type `ty`: a scalar list forces its backing, a ref list its row, and a
+// function (a curried position) its own positions.
+function forceCloListOfTy(ty: i32) {
+  const r = tyPeelNul(ty)
+  if r < 0 { return 0 }
+  if forceScalarListBacking(tyScalarListKind(r)) { return 0 }
+  if tyIsRefArray(r) { return forceRefListOfTy(r) }
+  forceCloFnPositions(r)
 }
 
 // True if the union member-set `name` has a map arm whose interned map value-slot is `slot`
