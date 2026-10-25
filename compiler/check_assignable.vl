@@ -201,6 +201,7 @@ import {
 import { HD_PARAM, hdKindIs, holePinHeldSet } from "./check_hole_pins"
 import { lbiNoteDelivery } from "./check_lbi_notes"
 import {
+  ACF_CHOICE,
   ACF_COMP,
   ACF_PLAIN,
   SUBST_DECLARED,
@@ -292,8 +293,11 @@ import {
   bindGenWalk,
   fnValVoidCoerce,
   holeChoiceArmsOf,
+  holeFnArgDecl,
   holeGenericParamAt,
+  holeLamRetAt,
   holeLetWritesDisagree,
+  holeLetWritesDisagreeAt,
   holeSlotDeliveryJudge,
   joinLitsFitAt,
   litLeafFitting,
@@ -400,7 +404,7 @@ import {
 import { numUnionConverts, numUnionMinted } from "./check_union_mint"
 import { wideLitByNode } from "./check_wide_lits"
 import { argLitAt, wsSuppress } from "./check_width"
-import { cwFnValueDeclOf, fnDeclIx } from "./check_write_scan"
+import { cwCalleeDeclOf, cwFnValueDeclOf, fnDeclIx } from "./check_write_scan"
 import { numLexIsFloat } from "./emit_bignum"
 import { i32ListEq, strListHas } from "./listutil"
 import { nodePos } from "./fmt_util"
@@ -1970,6 +1974,31 @@ function validateCompArgCstr(
   argFlowErr(rat, rexp, ci, ix)
 }
 
+// The pin of an `ACF_CHOICE` demand `ci`, its call's function type `rat` under this call's
+// bindings: still open, it moves out to the caller's pin; closed, every function the call may
+// run is judged at those types (D13782).
+function validateChoiceCstr(ci: i32, rat: i32, calleeFn: i32) {
+  if ci < 0 || ci >= argCstr.at.length || rat < 0 { return 0 }
+  if tyHasTyVar(rat) {
+    if calleeFn >= 0 && rat != argCstr.at[ci] {
+      noteArgCstrAt(
+        rat,
+        rat,
+        argCstr.who[ci],
+        ACF_CHOICE,
+        argCstr.node[ci],
+        argCstr.call[ci],
+      )
+    }
+    return 0
+  }
+  const ft = tyAt(rat)
+  if !(ft is TyFunc) { return 0 }
+  const none: i32[] = []
+  holeLetWritesDisagreeAt(argCstr.node[ci], ft.fnParamTypes, none)
+  0
+}
+
 // Re-validates every deferred call-argument constraint this call's callee owns
 // (`cstrOwnedBy`), substituting the hole to the call's argument type. A hole that substitutes
 // to another hole is re-recorded under it for the outer call that pins it, and only where the
@@ -2010,6 +2039,11 @@ export function validateArgCstrs(
     }
     if argCstr.form[ci] == ACF_COMP {
       validateCompArgCstr(ci, rat, rexp, bNames, bTys, ix)
+      ci = ci + 1
+      continue
+    }
+    if argCstr.form[ci] == ACF_CHOICE {
+      validateChoiceCstr(ci, rat, calleeFn)
       ci = ci + 1
       continue
     }
@@ -2860,6 +2894,47 @@ export function fvaAdaptEnclosing(
   fvaAdapt(srcExpr, srcTy, dstTy)
 }
 
+// The un-annotated function the value `site` holds: the one a name reads, or the one every
+// value a called function hands back holds; -1 else.
+function fvaHoleDeclOf(site: i32, depth: i32): i32 {
+  const d = holeFnArgDecl(site)
+  if d >= 0 || depth <= 0 { return d }
+  const ix = parenPeelIx(site)
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = nodeAt(ix)
+  if !(n is Call) { return -1 }
+  const cd = cwCalleeDeclOf(n.callFn)
+  if cd < 0 || cd >= P.nodes.length { return -1 }
+  const f = nodeAt(cd)
+  if !(f is FuncDecl) || f.fnBody < 0 { return -1 }
+  const rv: i32[] = []
+  collectRetValues(f.fnBody, rv)
+  let out = -1
+  for v in rv {
+    const vd = fvaHoleDeclOf(v, depth - 1)
+    if vd < 0 || out >= 0 && vd != out { return -1 }
+    out = vd
+  }
+  out
+}
+
+// The type of the un-annotated function value `site` holds, called at closed function type
+// `dt`'s parameters, when its result's rep differs from `dt`'s, so it is delivered through an
+// adapter as its annotated spelling is (D13781); -1 when it does not or is not known there.
+function fvaHoleInstTy(site: i32, dt: i32): i32 {
+  const decl = fvaHoleDeclOf(site, 4)
+  if decl < 0 || dt < 0 || dt >= T.tys.length { return -1 }
+  const d = tyAt(dt)
+  if !(d is TyFunc) { return -1 }
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(decl, dt, noN, noT)
+  if r < 0 || tyReachesHole(r, 8) { return -1 }
+  const inst = mkFuncTy(d.fnParamTypes, widenLitTy(r))
+  if !fvaFnMayDiffer(inst, dt, 8) { return -1 }
+  inst
+}
+
 // Rewrites the function value at `srcExpr`, of type `srcTy`, into an adapter at `dstTy`'s
 // function type, when the two may differ in rep. True when the delivery is settled here,
 // rewritten or refused; false leaves it to the caller unchanged.
@@ -2943,15 +3018,19 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   if tyReachesHole(dt, 8) && !encOk { return false }
+  // The source at the destination's parameters, when it is a hole function that needs boxing.
+  let holeInst = -1
   if !fvaNamesGeneric(pe, parenPeelIx(site)) {
-    // A hole is pinned later, where the value's use decides it.
+    // Any other hole is pinned later, where the value's use decides it.
     if (
       !encOk
       && (fnTyHasHole(srcTy) || tyHasTyVar(srcTy) || tyReachesHole(srcTy, 8))
     ) {
+      holeInst = fvaHoleInstTy(site, dt)
+      if holeInst < 0 { return false }
+    } else if !fvaFnMayDiffer(srcTy, dt, 8) {
       return false
     }
-    if !fvaFnMayDiffer(srcTy, dt, 8) { return false }
   }
   const pos = nodePos(site)
   const params: i32[] = []
@@ -2982,7 +3061,9 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if stable {
     if pe is Ident { callee = luRef(pe.identName, site, pos) }
   } else {
-    const st = fvaAnnot(srcTy, site, pos)
+    let held = srcTy
+    if holeInst >= 0 { held = holeInst }
+    const st = fvaAnnot(held, site, pos)
     if st < 0 {
       fvaRefuse(srcExpr, srcTy, dt, "")
       return true
