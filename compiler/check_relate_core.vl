@@ -4185,6 +4185,85 @@ export function genFnHoleSoleInst(
   inst
 }
 
+// The instances of `vt` at each hole call whose argument demands moved out to hole `vNames[k]`
+// of `calleeFn`, every argument of one call read together (`argCstr.call`), pushed to `out` when
+// new; a call with an argument still open is skipped (D13201).
+export function genFnHoleMovedInsts(
+  vNames: string[],
+  vTys: i32[],
+  k: i32,
+  vt: i32,
+  calleeFn: i32,
+  out: i32[],
+) {
+  if vt < 0 || vt >= T.tys.length || k < 0 || k >= vNames.length { return 0 }
+  const vf = tyAt(vt)
+  if !(vf is TyFunc) { return 0 }
+  const calls: i32[] = []
+  let ci = 0
+  while ci < argCstr.at.length {
+    const c = argCstr.call[ci]
+    if (
+      c >= 0
+      && cstrOwnedBy(argCstr.fn[ci], calleeFn)
+      && argCstr.form[ci] > 0
+      && hdParamOfHole(argCstr.exp[ci], vNames[k]) >= 0
+      && !i32ListHas(calls, c)
+    ) {
+      calls.push(c)
+    }
+    ci = ci + 1
+  }
+  for c in calls {
+    const per: i32[] = []
+    while per.length < vf.fnParamTypes.length { per.push(-1) }
+    let ok = true
+    let cj = 0
+    while cj < argCstr.at.length && ok {
+      if argCstr.call[cj] == c && cstrOwnedBy(argCstr.fn[cj], calleeFn) {
+        const pj = hdParamOfHole(argCstr.exp[cj], vNames[k])
+        if pj >= vf.fnParamTypes.length { ok = false }
+        if pj >= 0 && ok {
+          const rat = substTyDeep(argCstr.at[cj], vNames, vTys)
+          if rat < 0 || tyHasTyVar(rat) || tyIsDeferredJoin(rat) { ok = false }
+          if ok && per[pj] < 0 { per[pj] = rat }
+        }
+      }
+      cj = cj + 1
+    }
+    const oNames: string[] = []
+    const oTys: i32[] = []
+    let j = 0
+    while j < per.length && ok {
+      if per[j] < 0 {
+        ok = false
+      } else {
+        bindGenWalk(vf.fnParamTypes[j], per[j], oNames, oTys)
+      }
+      j = j + 1
+    }
+    const inst = if ok { substTyDeep(vt, oNames, oTys) } else { -1 }
+    if inst >= 0 && !tyHasTyVar(inst) {
+      let seen = false
+      for o in out {
+        if tySame(o, inst) { seen = true }
+      }
+      if !seen { out.push(inst) }
+    }
+  }
+  0
+}
+
+// The parameter index derived hole `exp` names of hole `tv`'s function (`HD_PARAM`), or -1.
+function hdParamOfHole(exp: i32, tv: string): i32 {
+  const row = hdRowOf(exp)
+  if row < 0 || row >= hdKind.length || hdKind[row] != HD_PARAM { return -1 }
+  if hdBase[row] < 0 { return -1 }
+  const bt = tyAt(hdBase[row])
+  if !(bt is TyVar) || bt.tvName != tv { return -1 }
+  hdInner[row]
+}
+
 // Call `ci`'s own instance of `vt`, pushed to `out` when new; the first call to close also
 // binds the shared `gNames`/`gTys`. 1 when closed, 0 while open, -1 when it cannot be read.
 function genFnHoleCallOwn(
