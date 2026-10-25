@@ -268,6 +268,20 @@ What each slice changes:
   - `rlElemNicheNullable` differs in 5 files, down from 195: a generic `T` banked as the element
     type, and `(i32)=>i32|null`, a nullable closure to the spelling but a closure returning
     `i32 | null` to the arena.
+
+  Done at 0ba77bee9: 5 parses. `genTyParamArr` and `genTyParamNulArr` are deleted, and no
+  checker change was needed. The earlier "differ" counts came from comparing at nodes with no
+  array spelling: the generic-alias field node `X`, which carries the last application's type.
+  With the `annSpelledArray` gate the comparison holds over the self-compile and 16,738 files,
+  0 uncompared:
+  - `genTyParamArr`: 675,024 agreeing events and 0 differing. None of the 945 events with no
+    node type answered true by name, so the rung was a subset of `annArrOverTyParam` and is
+    dropped.
+  - `genTyParamNulArr`: 753,395 agreeing events, and 963 with no node type, none true by name.
+    5 events differ, all in `type-param-shadows-alias-funcdecl-array-run.vl`, where canon
+    renamed a `(Id|null)[]` parameter to `(i32|null)[]`. The type still says `TyVar` there.
+    `annNulArrOverTyParam` asks the type, and that file's module is unchanged.
+  - `difftree --identity` over 16,625 files: 0 differ, 0 uncompared.
 - **A2.** These `emit_mono` predicates test the type they hold instead of rendering it.
   - Done, byte-identical: `monoModuleLetTyIs` and `monoModuleDupPin` compare the site's type
     with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
@@ -1073,7 +1087,12 @@ What each slice changes:
     same population: the walk ran in 265 files, the array peel changed the name in 118 and
     the map-value leg found an application in 10. In 4 the application had no arena type at
     all, being an application over the enclosing declaration's own parameter (`I<U>[]`). The
-    blocker is the instance registry keyed by spelling, not this walk.
+    blocker is the instance registry keyed by spelling, not this walk. Re-checked at
+    0ba77bee9: walking the spelling tree (`annTsOf`) down to the `TS_APP` node would only move
+    the parse, because a canon rewrite leaves the tree at -1 and the name walk is still
+    needed then. `nulLitUnionInnerName` stays for the same kind of reason: its
+    `anonMintRowFor` caller holds `leafSet`, a merged spelling from
+    `anonLeafPolyUnionSet` with no type behind it.
   - Left, re-probed after D7 and D8: the four grammar predicates answered true in as many
     files as before (`nameIsNulString` 231, `nameIsNulBool` 65, `nulLitUnionScan` 121, and
     `nameIsStrLitSet` 266). The callers that reach their true arms are unchanged.
