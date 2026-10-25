@@ -47,6 +47,7 @@ import {
   mkFieldInit,
   mkIdent,
   mkIf,
+  mkIndex,
   mkLet,
   mkNum,
   mkParam,
@@ -94,6 +95,10 @@ let fsListAsks: i32[] = []
 let flRead: i32[] = []
 let flDecl: i32[] = []
 let flKey: string[] = []
+// Each `for` variable read `fcCallee` called through list read `fcRead`, with its type `fcKey`.
+let fcCallee: i32[] = []
+let fcRead: i32[] = []
+let fcKey: string[] = []
 let fsAskGrew = false
 // The parse arena's length in the current compile; a node at or past it is minted by the plan.
 let fsParseLen = 0
@@ -128,6 +133,12 @@ let pcwCallFn: string[] = []
 let pcwNames: string[][] = []
 let prIdent: i32[] = []
 let prName: string[] = []
+// Call `plCall` through the variable of `for` loop `plFor` calls the element of list copy
+// `plList` at the loop's index `plIdx` instead, naming the index when the loop does not (D10791).
+let plCall: i32[] = []
+let plFor: i32[] = []
+let plList: string[] = []
+let plIdx: string[] = []
 // A copy of function `pfSrc` named `pfName` goes after the module statement `pfAnchor`.
 let pfSrc: i32[] = []
 let pfAnchor: i32[] = []
@@ -283,6 +294,10 @@ function fsPlanReset(): i32 {
   pcPos = []
   pcFrom = []
   pcTo = []
+  plCall = []
+  plFor = []
+  plList = []
+  plIdx = []
   fsHoleDecline()
   0
 }
@@ -297,6 +312,9 @@ export function fsReset(): i32 {
   flRead = []
   flDecl = []
   flKey = []
+  fcCallee = []
+  fcRead = []
+  fcKey = []
   fsAskGrew = false
   fsPlanReset()
 }
@@ -340,26 +358,54 @@ export function fsAskOpenCall(c: i32): i32 {
   0
 }
 
-// The emitter calls through read `read` of `const` list `decl` at function type `key`; records
-// both parse nodes, for a list later asked by `fsAskList`.
-export function fsNoteListCall(read: i32, decl: i32, key: string): i32 {
-  let d = declOrigOf(decl)
-  if d < 0 { d = decl }
-  if read < 0 || read >= fsParseLen || d < 0 || d >= fsParseLen { return 0 }
+// The emitter calls `callee` through read `read` of `const` list `decl` at function type `key`;
+// records the parse nodes, for a list later asked by `fsAskList`.
+export function fsNoteListCall(
+  callee: i32,
+  read: i32,
+  decl: i32,
+  key: string,
+): i32 {
+  if read < 0 || read >= fsParseLen { return 0 }
+  // A read already noted keeps its list, though a split may have renamed it to a copy.
   let i = 0
   while i < flRead.length {
     if flRead[i] == read {
       if flKey[i] != key { flKey[i] = "!" }
+      const met = fsNoteLoopCallee(fsParenPeel(callee), read, key)
+      if met && hasI32(fsListAsks, flDecl[i]) { fsAskGrew = true }
       return 0
     }
     i = i + 1
   }
+  let d = declOrigOf(decl)
+  if d < 0 { d = decl }
+  if d < 0 || d >= fsParseLen { return 0 }
+  fsNoteLoopCallee(fsParenPeel(callee), read, key)
   flRead.push(read)
   flDecl.push(d)
   flKey.push(key)
   // A call first met once the list is asked, such as one past the first refusal, plans again.
   if hasI32(fsListAsks, d) { fsAskGrew = true }
   0
+}
+
+// Records `for` variable read `c` called through list read `read` at type `key`, "!" for two;
+// true when `c` is first recorded.
+function fsNoteLoopCallee(c: i32, read: i32, key: string): boolean {
+  if c < 0 || c >= fsParseLen || !(nodeAt(c) is Ident) { return false }
+  let i = 0
+  while i < fcCallee.length {
+    if fcCallee[i] == c {
+      if fcKey[i] != key { fcKey[i] = "!" }
+      return false
+    }
+    i = i + 1
+  }
+  fcCallee.push(c)
+  fcRead.push(read)
+  fcKey.push(key)
+  true
 }
 
 // The emitter refuses a call through `const` list `decl` for taking its elements at a second
@@ -1830,6 +1876,22 @@ function fsPlanLists(): i32 {
         }
         i = i + 1
       }
+      // A loop's variable called at this type reads the copy at the loop's index.
+      i = 0
+      while i < fcCallee.length {
+        const fr = fcRead[i]
+        if (
+          fcKey[i] == lanes[k]
+          && fsListReadKey(fr) == "!"
+          && fsListBase(identDeclOf(fr)) == d
+        ) {
+          plCall.push(fsParent[fcCallee[i]])
+          plFor.push(fsParent[fr])
+          plList.push(copy)
+          plIdx.push("i$l" + i32ToStr(fsParent[fr]))
+        }
+        i = i + 1
+      }
       rc = 0
       k = k + 1
     }
@@ -1863,12 +1925,81 @@ function fsListLanes(d: i32): string[] {
   let i = 0
   while i < flRead.length {
     if fsListBase(flDecl[i]) == d {
-      if flKey[i] == "!" { return none }
-      if !hasStr(lanes, flKey[i]) { lanes.push(flKey[i]) }
+      if flKey[i] == "!" {
+        if !fsLoopLanes(flRead[i], lanes) { return none }
+      } else if !hasStr(lanes, flKey[i]) {
+        lanes.push(flKey[i])
+      }
     }
     i = i + 1
   }
   lanes
+}
+
+// The function type list read `r` is noted at, "!" for two; "" when no note names `r`.
+function fsListReadKey(r: i32): string {
+  let i = 0
+  while i < flRead.length {
+    if flRead[i] == r { return flKey[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// Pushes onto `lanes` the types the calls through the variable of the `for` loop that iterates
+// list read `r` take, when `r` is that loop's iterable, the loop names no index, and every read
+// of the variable is a call in the loop's own function, each recorded one at one type (D10791).
+function fsLoopLanes(r: i32, lanes: string[]): boolean {
+  const p = fsParent[r]
+  if p < 0 { return false }
+  const pn = nodeAt(p)
+  if !(pn is ForIn) || pn.fiIter != r || pn.fiVar2 != "" { return false }
+  for x in fsIdents {
+    const xn = nodeAt(x)
+    if (
+      x != p
+      && identDeclOf(x) == p
+      && xn is Ident
+      && xn.identName == pn.fiVar
+    ) {
+      const c = fsParent[x]
+      if c < 0 || !fsCallsVia(c, x) || fsFnBetween(c, p) { return false }
+      let i = 0
+      while i < fcCallee.length && fcCallee[i] != x { i = i + 1 }
+      // A call not yet met keeps the list's own instance until a later round notes it.
+      if i < fcCallee.length {
+        if fcRead[i] != r || fcKey[i] == "!" { return false }
+        if !hasStr(lanes, fcKey[i]) { lanes.push(fcKey[i]) }
+      }
+    }
+  }
+  true
+}
+
+// Applies `plCall[i]`: its callee becomes `plList[i][plIdx[i]]`, and its loop names that index.
+// -1 when `i` is no planned lane, its nodes are not a call and a loop, or the loop names another
+// index.
+function fsApplyLoopLane(i: i32): i32 {
+  if i < 0 || i >= plCall.length { return -1 }
+  const c = nodeAt(plCall[i])
+  const l = nodeAt(plFor[i])
+  if !(c is Call) || !(l is ForIn) || c.callFn < 0 { return -1 }
+  if l.fiVar2 == "" { l.fiVar2 = plIdx[i] }
+  if l.fiVar2 != plIdx[i] { return -1 }
+  P.pos = nodeToks[plCall[i]] + 1
+  const pos = nodeAt(c.callFn).pos
+  c.callFn = mkIndex(mkIdent(plList[i], pos), mkIdent(plIdx[i], pos), pos)
+  0
+}
+
+// Whether a function lies between parse node `x` and its ancestor `top`.
+function fsFnBetween(x: i32, top: i32): boolean {
+  let c = fsParent[x]
+  while c >= 0 && c != top {
+    if nodeAt(c) is FuncDecl { return true }
+    c = fsParent[c]
+  }
+  false
 }
 
 function fsNoLanes(): string[] {
@@ -3426,7 +3557,12 @@ function fsAskOpenCallPars(): i32 {
           while j < f.fnParams.length && j < cn.callArgs.length {
             const a = fsParenPeel(cn.callArgs[j])
             const par = f.fnParams[j]
-            if a >= 0 && nodeAt(a) is Ident && !hasI32(fsAsks, par) {
+            if (
+              a >= 0
+              && nodeAt(a) is Ident
+              && !hasI32(fsAsks, par)
+              && fsAskedArgCalls(a, par)
+            ) {
               fsAsks.push(par)
             }
             j = j + 1
@@ -3436,6 +3572,14 @@ function fsAskOpenCallPars(): i32 {
     }
   }
   0
+}
+
+// Whether name `a` handed to parameter `par` of an asked call is one a split can serve: a
+// function's name, or a value `par`'s reads call through, so a value hole declines nothing (D10700).
+function fsAskedArgCalls(a: i32, par: i32): boolean {
+  const d = identDeclOf(a)
+  if d >= 0 && d < fsParseLen && nodeAt(d) is FuncDecl { return true }
+  fsQuietHoleKeys(par).length > 0
 }
 
 // The parameters at `par`'s position of every function sharing a list literal or a `const`'s
@@ -4784,6 +4928,11 @@ function fsApply(): i32 {
   while i < prIdent.length {
     const n = nodeAt(prIdent[i])
     if n is Ident { n.identName = prName[i] } else { rc = -1 }
+    i = i + 1
+  }
+  i = 0
+  while i < plCall.length {
+    if rc == 0 { rc = fsApplyLoopLane(i) }
     i = i + 1
   }
   i = 0

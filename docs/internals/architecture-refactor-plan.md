@@ -669,6 +669,17 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,837,446 → 5,837,384 bytes (−62).
     - `regress.vl`: 0 runs → not-runs, 0 → silent, no cell changed class.
     - difftree `--identity`: the fixpoint is identical, and 2 of 16,620 files differ (11,729 built). They are the two new fixtures.
+- **2026-10-25, D10700 and D10791 close (clause 2), and D12700–D12705 are filed.**
+  - D10700: a list of hole functions handed a generic function and a frame's hole value. When some argument names a function, `monoElemParamTys` (`emit_mono.vl`) first binds the elements' value parameters at the instance (`monoElemValArgTy`), then reads the function parameter's call pins under that binding (`monoElemPinTysUnder`), so `g(s, s)` picks `add` at the value's type. `fsAskedArgCalls` (`fn_split.vl`) no longer asks the split for a value hole. Ablation: without the `named` gate, value-only element calls claim per-instance cases and conflict on `monoElemTakenSig`.
+  - D10791: one loop variable called at two function types. The split's plan notes each loop callee per read (`fsNoteListCall`, `fsNoteLoopCallee`). The loop keeps its iterable for the first type, and every other type's call reads the list's copy at a loop index (`fsLoopLanes`, `fsApplyLoopLane`). A callee first met after an emit refusal grows the round, so a third call is noted in the next one. A read that an earlier lane renamed to a copy keeps its list.
+  - Residue, each graded as filed: D12700 (clause 1, an indirect-call trap when a second pushed list is called at another type; it blocks D10792), D12701 (a forwarded `h`), D12702 (`inner` called at two value types), D12703 (`for f, i in fs`), D12704 (`const f = fs[i]` called twice) and D12705 (a loop variable called inside a closure). D10792, D10890, D10891 and D7080 stay open: D10792 waits on D12700, D10890 and D10891 are ref-list reps (L6), and D7080 is a labelled-block carrier.
+  - Fixtures: `closures/hole-fn-list-handed-generic-fn-and-value*.vl` (4) and `closures/hole-fn-list-element-called-at-two-fn-types-in-one-loop*.vl` (4; the old `error-` fixture is now a run pin). Each fails on master's seed.
+  - Gates:
+    - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,838,498 → 5,845,632 bytes (+7,134).
+    - Native align, full: 6,240 passed. V8 face `cases_wasm_0`–`3` (before the rebase): 6,216 passed.
+    - `regress.vl`: 0 runs → not-runs, 0 → silent, no cell changed class.
+    - Filed witnesses `--strict`: 3,826 graded, 3,826 as filed, 0 MOVED, 0 not graded.
+    - difftree `--identity`: the fixpoint is identical, and 8 of 16,632 files differ (11,742 built). They are the eight new fixtures, which master refuses at emit.
 
 ### L2 log
 
