@@ -16,6 +16,7 @@ import {
   Param,
   Unary,
   nodeAt,
+  nodeChildrenPush,
 } from "./ast"
 import {
   holePinReadOf,
@@ -103,8 +104,12 @@ import {
   MVK_I64,
   MVK_UNION,
   VKind,
+  emitCurFnIx,
+  emitCurFnPos,
   fnParent,
   fnStmts,
+  instNodeTyIn,
+  instNodeTys,
   mTwinCodes,
   mTwinExtra,
   mTwinShapes,
@@ -117,6 +122,7 @@ import {
   monoHoleSubN,
   monoHoleSubRow,
   monoHoleSubT,
+  monoInstFe,
   monoParamPinTy,
   monoPinSubN,
   monoPinSubOwn,
@@ -1434,7 +1440,54 @@ function exactDerivedPinTyOf(exprIx: i32, fnIx: i32): i32 {
 // The type of node `ix` inside function `fnIx`: its recorded type, or where that names a type
 // parameter or a hole, the binding the instance `fnIx` gives it (a hole's, an exact instance's,
 // then its parameters' pins), else the one pin the program banked. The recorded type otherwise.
+// While function bodies are emitted, an instance's body node reads the type banked for it.
 export function nodeTyInOf(ix: i32, fnIx: i32): i32 {
+  if instNodeTys.length > 0 && fnIx >= 0 {
+    const b = instNodeTyIn(ix, fnStmtsPosOf(fnIx))
+    if b >= 0 { return b }
+  }
+  nodeTyInDerived(ix, fnIx)
+}
+
+// Bank `nodeTyInOf` for every node of every instance's body whose checker type names a type
+// parameter or a hole, at that instance's pins; a node the instance leaves open is not banked.
+// Each instance is derived as the function being emitted, since one node can head two slots.
+// Runs once the passes are done, before the first body is emitted.
+export function bankInstanceNodeTys(): i32 {
+  instNodeTys = Map()
+  const curIx = emitCurFnIx
+  const curPos = emitCurFnPos
+  const stack: i32[] = []
+  let k = 0
+  while k < monoInstFe.length {
+    const pos = monoInstFe[k]
+    k = k + 1
+    if pos < 0 || pos >= fnStmts.length { continue }
+    const fx = fnStmts[pos]
+    emitCurFnIx = fx
+    emitCurFnPos = pos
+    stack.push(fx)
+    while stack.length > 0 {
+      const ix = stack.pop() ?? -1
+      nodeChildrenPush(ix, stack)
+      const raw = nodeTyIxOf(ix)
+      if raw < 0 || raw >= T.tys.length || !tyHasTyVar(raw) { continue }
+      if instNodeTyIn(ix, pos) >= 0 { continue }
+      const t = nodeTyInDerived(ix, fx)
+      if t < 0 { continue }
+      const ps = instNodeTys.get(ix) ?? []
+      ps.push(pos)
+      ps.push(t)
+      instNodeTys.set(ix, ps)
+    }
+  }
+  emitCurFnIx = curIx
+  emitCurFnPos = curPos
+  0
+}
+
+// `nodeTyInOf` derived from the instance rows, not read from the bank.
+function nodeTyInDerived(ix: i32, fnIx: i32): i32 {
   const raw = nodeTyIxOf(ix)
   if raw < 0 || raw >= T.tys.length || !tyHasTyVar(raw) { return raw }
   const aj = apartJoinPinTyOf(ix, fnIx)
