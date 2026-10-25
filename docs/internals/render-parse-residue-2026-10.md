@@ -1082,17 +1082,19 @@ What each slice changes:
     `nested-struct-field-nullable-closure-sig.vl`), where the type agreed, and in no untyped
     file. The whole field code with the typed arm agreed with the old one in all 3,652 files.
     `difftree --identity` over 16,529 files: 0 differ, 0 uncompared.
-  - Left: `gaePeelWrappers` and `collectGenAliasShapes`. They produce the application spelling
-    `gaeEnsure` keys on, and the arena has no node for a generic application. Probed over the
-    same population: the walk ran in 265 files, the array peel changed the name in 118 and
-    the map-value leg found an application in 10. In 4 the application had no arena type at
-    all, being an application over the enclosing declaration's own parameter (`I<U>[]`). The
-    blocker is the instance registry keyed by spelling, not this walk. Re-checked at
-    0ba77bee9: walking the spelling tree (`annTsOf`) down to the `TS_APP` node would only move
-    the parse, because a canon rewrite leaves the tree at -1 and the name walk is still
-    needed then. `nulLitUnionInnerName` stays for the same kind of reason: its
-    `anonMintRowFor` caller holds `leafSet`, a merged spelling from
-    `anonLeafPolyUnionSet` with no type behind it.
+  - Done later: 2 parses. `gaePeelWrappers` is deleted and `collectGenAliasShapes` walks the
+    TypeRef's type: it peels `| null` and `[]` on the type and names the application from the
+    checker's application registry (`genAppNameOfTy`), which keys an application by its arena
+    row. `gaeEnsure` still takes the name. Answer-probed over the self-compile and 16,737
+    files: the walk ran in 267, and the map-value leg agreed in every event. The interned
+    names disagreed in 22 files and the field shapes in 169, in three ways: an application
+    over a type parameter (`Box<T>`) is left to its instances, an application reached
+    through an alias TypeRef is now interned too, and a literal-union argument is named by
+    its atom row. `difftree --identity` over the 267 files: 0 differ, 0 uncompared. The walk
+    reads the canon column (`fdRowOf`), so a canon-rewritten TypeRef needs no spelling leg.
+  - Left: `nulLitUnionInnerName`. Its `anonMintRowFor` caller holds `leafSet`, a merged
+    spelling from `anonLeafPolyUnionSet` with no type behind it, and the `ftxt` caller in
+    `emit_shape_rows.vl` holds only a field's text.
   - Left, re-probed after D7 and D8: the four grammar predicates answered true in as many
     files as before (`nameIsNulString` 231, `nameIsNulBool` 65, `nulLitUnionScan` 121, and
     `nameIsStrLitSet` 266). The callers that reach their true arms are unchanged.
