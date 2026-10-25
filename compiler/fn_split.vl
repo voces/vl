@@ -196,10 +196,10 @@ let pyPars: string[][] = []
 // Call `pmCall`, through a record field, calls function `pmName` directly instead.
 let pmCall: i32[] = []
 let pmName: string[] = []
-// Argument `pnArg` of call `pnCall`, a call returning one of the generics `pnLeaves`, runs once
-// before statement `pnStmt` as a call of copy `pnFn`, its arm index held by `pnSel`; it and the
-// `pnCount - 1` arguments after it each select their generic by that index (D9596). Each copy
-// `pnSrcName` of function `pnSrc` returns the index into `pnSrcLeaves`.
+// Argument `pnArg` of call `pnCall`, a call returning one of `pnLeaves` run as its copy `pnFn` or
+// a choice of names (`pnFn` "", D13360) run as itself, runs once before statement `pnStmt` into
+// arm index `pnSel`; it and the `pnCount - 1` arguments after it select by that index (D9596).
+// Each copy `pnSrcName` of function `pnSrc` returns the index into `pnSrcLeaves`.
 let pnCall: i32[] = []
 let pnArg: i32[] = []
 let pnStmt: i32[] = []
@@ -1138,6 +1138,41 @@ function fsChoiceStmt(c: i32, a: i32): i32 {
   if p >= 0 {
     const pn = nodeAt(p)
     if pn is LetDecl && pn.letInit == c { s = p }
+  }
+  if fsListOwner(s) < 0 { return -1 }
+  s
+}
+
+// `fsChoiceStmt`, a `return` included, for a choice `a` of names (`fsPureChoice` or
+// `fsHoistsChoice`) handed to call `c` (D13360); every argument ahead of it must stay, past any
+// call in its conditions when it has one.
+function fsChoiceArgStmt(c: i32, a: i32): i32 {
+  if (
+    c < 0
+    || c >= P.nodes.length
+    || c >= fsParent.length
+    || a < 0
+    || a >= fsParseLen
+  ) {
+    return -1
+  }
+  const pure = fsPureChoice(a, 0)
+  if !pure && !fsHoistsChoice(a) { return -1 }
+  const cn = nodeAt(c)
+  if !(cn is Call) || hasNamedArgs(cn.callArgNames) { return -1 }
+  let found = false
+  for x in cn.callArgs {
+    if x == a { found = true }
+    if !found && !fsAheadStays(x, !pure) { return -1 }
+  }
+  if !found { return -1 }
+  let s = c
+  const p = fsParent[c]
+  if p >= 0 {
+    const pn = nodeAt(p)
+    if (pn is LetDecl && pn.letInit == c) || (pn is RetStmt && pn.retArg == c) {
+      s = p
+    }
   }
   if fsListOwner(s) < 0 { return -1 }
   s
@@ -3680,6 +3715,7 @@ function fsPlanHoles(): i32 {
             const ret = (nodeAt(a) is Call
               && cp < 0
               && (fsConstRet(a) >= 0 || fsChoiceStmt(c, a) >= 0))
+              || (cp < 0 && fsChoiceArgStmt(c, a) >= 0)
             if !lam && !ret && !(nodeAt(a) is Ident) { return fsHoleDecline() }
             let ad = -1
             if !lam && !ret { ad = identDeclOf(a) }
@@ -4125,6 +4161,11 @@ function fsPlanHoleRewrites(): i32 {
     // itself and then the generic it returns, by name.
     let leaves: string[] = []
     if mi < 0 { leaves = fsChoiceRetLeaves(a) }
+    if mi < 0 && leaves.length == 0 && fsChoiceArgStmt(fsParent[a], a) >= 0 {
+      if fsPlanChoiceArg(a, hdKeys[hi].length) != 0 { return 1 }
+      hi = hi + 1
+      continue
+    }
     if leaves.length > 0 {
       if fsPlanChoiceRet(a, leaves, hdKeys[hi].length) != 0 { return 1 }
       hi = hi + 1
@@ -4327,6 +4368,24 @@ function fsPlanChoiceRet(a: i32, leaves: string[], count: i32): i32 {
   0
 }
 
+// Plans choice argument `a` (`fsChoiceArgStmt`) handed to a parameter split `count` ways: its
+// leaves numbered, it runs once ahead of its statement into an arm index, and each split
+// argument selects by it (D13360).
+function fsPlanChoiceArg(a: i32, count: i32): i32 {
+  const c = fsParent[a]
+  const s = fsChoiceArgStmt(c, a)
+  if s < 0 { return fsHoleDecline() }
+  const none: string[] = []
+  pnCall.push(c)
+  pnArg.push(a)
+  pnStmt.push(s)
+  pnFn.push("")
+  pnSel.push("choice$n" + i32ToStr(a))
+  pnLeaves.push(none)
+  pnCount.push(count)
+  0
+}
+
 // The name of the arm-index copy of the callee of choosing call `a`, returning the index of the
 // one of `leaves` it returns, planned once per callee; "" when `a` runs no declared function.
 function fsPlanArmCopy(a: i32, leaves: string[]): string {
@@ -4362,12 +4421,24 @@ function fsApplyChoiceRets(): i32 {
     const c = nodeAt(pnCall[i])
     const a = pnArg[i]
     const an = nodeAt(a)
-    if !(c is Call) || !(an is Call) || a >= nodeToks.length { return -1 }
-    if an.callFn < 0 || an.callFn >= P.nodes.length { return -1 }
+    if !(c is Call) || a >= nodeToks.length { return -1 }
     P.pos = nodeToks[a] + 1
     const pos = an.pos
-    an.callFn = mkIdent(pnFn[i], nodeAt(an.callFn).pos)
-    const lam = fsChoiceTakesLambda(an)
+    let leaves = pnLeaves[i]
+    let lam = true
+    if an is Call && pnFn[i] != "" {
+      if an.callFn < 0 || an.callFn >= P.nodes.length { return -1 }
+      an.callFn = mkIdent(pnFn[i], nodeAt(an.callFn).pos)
+      lam = fsChoiceTakesLambda(an)
+    } else if pnFn[i] == "" {
+      // A choice argument numbers its own leaves (D13360).
+      lam = !fsPureChoice(a, 0)
+      const names: string[] = []
+      if fsNumberLeaves(a, names, 0) < 0 { return -1 }
+      leaves = names
+    } else {
+      return -1
+    }
     const args: i32[] = []
     let ahead = true
     for x in c.callArgs {
@@ -4381,7 +4452,7 @@ function fsApplyChoiceRets(): i32 {
       } else if x == a {
         let k = 0
         while k < pnCount[i] {
-          args.push(fsSelectArm(pnSel[i], pnLeaves[i], pos))
+          args.push(fsSelectArm(pnSel[i], leaves, pos))
           k = k + 1
         }
       } else {
