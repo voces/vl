@@ -1877,6 +1877,24 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - Rep-fuzz is exact. `regress.vl`: no cell changed class. Filed witnesses `--strict`: 3,820 as filed, 0 moved.
     - Seed 5,838,498 → 5,838,666 bytes (+168).
   - Render-parse holds: no entry retired. D2 and D8 share the mint and were not started. None filed.
+- 2026-10-25, D1 producers: `forceCloListTypeOf`, `ensureRefElemTys` and `collectARefArrayAnn` name their ref-list rows by type through `rlRowNameOfTy`. It uses the nominal render, puts a function type in parentheses, and unfolds a recursive declared union at the nested cut. The spelling cut stays only as the floor for a missing type or a hole.
+  - Blockers:
+    - Null position: the arena carries none, because `annUnionTy` wraps the non-null members in `TyNullable`. The result is a type-definition reorder with identical outcomes.
+    - Closure parens: fixed.
+    - Nominal against shape: fixed by the nominal render.
+    - Module-mangled names: covered by the nominal render.
+    - Recursive alias: unfolded at the nested cut.
+    - Generic hole: the floor.
+    - `closure-value-union-array-struct-elem-list-field.vl`: runs.
+  - Floor, probed over the self-compile and 16,738 files:
+    - `collectARefArrayAnn`: 339 of 19,520 events (35 with no type, 304 with a hole).
+    - `ensureRefElemTys`: 730 of 3,070 (697 with no type, 33 with a hole).
+    - `forceCloListTypeOf`: 0 of 270, so its cut is retired.
+  - Checks:
+    - difftree `--identity`: the fixpoint identity holds. Of 16,632 files, 75 differ, and every one is a pure type-definition reorder with the same run outcome.
+    - Rep-fuzz is exact. `regress.vl`: no cell changed class. Filed witnesses `--strict`: 3,826 as filed, 0 moved.
+    - Seed 5,845,674 → 5,846,757 bytes.
+  - Render-parse 55/98 → 55/97. D2 and D8 not started: the kind ladder still classifies by spelling, and the `forceCloListTypeOf` gate waits on A5. None filed.
 
 ### L10 log
 
