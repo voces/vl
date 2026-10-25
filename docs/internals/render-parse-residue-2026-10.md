@@ -1393,6 +1393,23 @@ What each slice changes:
     called none of the 15, so none moves. Every ladder caller still wants an element name to
     mint or find a name-keyed ref-list row, and D1's re-probe shows the typed lookup cannot stand
     in for the mint. The next step for both slices is one ref-list mint keyed by type.
+  - The ref-list KIND by type, on c245ac563 (#4748): `refListElemKindOfTy` (emit_shape_rows)
+    answers `refArrElemKind`'s question from the element type, with no `_` arm. All four kind
+    callers ask it first: `ensureRefElemTys`, `collectARefArrayAnn`, `arrLitNestedElemKind` and
+    `arrLitNulRefElemKind`. The spelling is the floor where it declines. A probe put old and new
+    side by side over the self-compile and 16,744 fixture and corpus files.
+    - Agree: 24,719 ensure events, 2,067 nested and 4,859 nul-ref.
+    - Inert: 22 annotation events in 11 files, all a nullable record (`{v: T} | null`,
+      `CX<i32> | null`). The spelling said union-box there and struct in `ensureRefElemTys`;
+      the type says struct at both. At the annotation site the kind only gates the niche
+      refusal and the scalar-list flags, which a record element reaches neither of.
+    - Declined, so the spelling floor still answers. In `ensureRefElemTys`: 5,841 events with no
+      type and 136 the classifier declines, which are type parameters and unions of lists
+      (`i32[] | K[]` is one list or a box by how the producer spelled it). At the annotation:
+      35 with no type and 33 declined. The literal sites decline none, and one nameless
+      `A | B | null` nul-ref literal keeps the spelling, which `arrLitNulUnionElemName` gates on.
+    - No entry retires: the ladder is still called as the floor, and every caller still mints a
+      name-keyed row, so the census holds at 55 / 97.
   - Done with the mint keyed by type: 1 parse, `refArrElemNameIf`'s `nameIsRefArray` gate,
     deleted with the function once `unionClosureArrElemUnion` read its arm's row by type. The
     other 14 stay: the ladder internals still have name callers (`ensureRefElemTys` derives its
