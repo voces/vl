@@ -590,6 +590,18 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - difftree `--identity`: the fixpoint is identical, and 0 of 16,569 files differ (11,694 built).
     - `mono-tyaram-grid.sh`: 234 OK, 27 REJECT, 0 BAD.
     - Rep-fuzz is exact.
+- **2026-10-24, the bank is built once the passes settle, and one-hop readers ask it.** `bankInstanceNodeTys()` moves from after monomorphisation to `emitProgramRun`, after `mapTwinSettle()` sets `emitPhase = "arenaFinal"`. Built right after monomorphisation, the bank disagrees with the derived instance type at 14 nodes; built after the passes, at none. So it cannot be built earlier: a reader during the passes still derives (`nodeTyInOf`).
+  - Moved: 32 more lines in 19 files ask `nodeTyAt(ix, fnIx)`. The one-hop readers the last bullet named (`cloBoxArmTy`, `ifJoinIsNulString`, `recvRecordMembers`, `paramTyUnlowered`, `retLitUnionInline`) and the others whose callers hold an instance's `fnIx` take it as a parameter. They include `emit_eq_rows.vl`, `emit_if_arm_values.vl`, `emit_sections.vl`, `emit_variant_sig.vl`, `emit_local_scope.vl`, `emit_narrow_slots.vl` and `emit_query.vl`.
+  - The 105 lines left that read a type holding type parameters inside an instance (#4712's instrumentation, re-run on this head):
+    - 3 are the bank's own reads (`emit_ty_canon.vl` ×2, `emit_capture_frames.vl`).
+    - 32 ask whether the generic's type is open, or hand the type to a re-derivation: `emit_classify.vl` 15, `emit_ty_canon.vl` 5, `wasmEmit.vl` 4, `emit_closure_sites.vl` 3, `emit_lit_atoms.vl` 2, and one each in `emit_value_sites.vl`, `emit_mono.vl` and `emit_if_arm_values.vl`.
+    - 7 change the module when they ask the bank: `mapRecvTyIn`, `coalesceOfNulMapIsMap` with the `??` node it compares against, the map-index narrowing (`pushIndexMapNullNarrow`), `emitRecordFitIs`, the tautology test of `emitIs`, and the two reads of `ifJoinAdaptsScalar` (`wasmEmit.vl`). With the bank, `ifJoinAdaptsScalar` reads an `A | B | null` join at an `f64` pin as one number, so `annotated-join-coalesce-at-pin.vl` boxes in each arm: 9 bytes more, the same `@log` lines. The difftree found it. `mapRecvTyIn` moves in the next bullet. Moving `coalesceOfNulMapIsMap` alone runs no new witness. Its generic spelling is D12390, which fails at `exprNullableMap` before the read is asked.
+    - 10 pair with an interner mint, the ref-list lane's (L6): `emit_shape_rows.vl` 8, `emptyArrHoleKind` and `emptyArrHoleElemName`.
+    - 2 read a parameter's written annotation (`paramString`, `paramVariantIndex`). The annotation is the template's.
+    - 51 have no `fnIx` in scope, and their callers do not have one either. The largest groups are `emit_classify.vl` 11, `emit_ref_list_kinds.vl` 6, `emit_atom_kinds.vl` 5, `emit_base.vl` 5 and `emit_local_scope.vl` 4. The widest readers are `repOfNode` (`emit_rep.vl`, reached from 1,934 files) and `exprTyIsRecord` (`wasmEmit.vl`, 1,853 files). Threading those is a signature change across their callers, not one hop.
+  - Gates:
+    - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,824,201 → 5,824,422 bytes (+221).
+    - difftree `--identity`: the fixpoint is identical, and 0 of 16,588 files differ (11,704 built).
 
 ### L2 log
 
