@@ -474,6 +474,7 @@ import {
   tailPushBlockTail,
   tailPushIfArms,
   tailPushMatchArms,
+  tailValueLeaves,
 } from "./check_unconsumed"
 import {
   fieldJoinKeepsRecordsApart,
@@ -4565,6 +4566,8 @@ export function holeLetWritesDisagreeAt(
   for r in reads {
     if holeIsSlotRead(r) {
       if holeSlotJudge(r, wp, fixed) { return true }
+    } else if holeChoiceArms(r).length > 0 {
+      if holeChoiceJudge(r, wp) { return true }
     } else if holeLetJudge(r, wp) {
       return true
     }
@@ -4572,17 +4575,130 @@ export function holeLetWritesDisagreeAt(
   false
 }
 
-// Whether the value `a` may be read from a list element, a record field or a `for` loop's
-// element, so a call through it runs what that place holds (D9090).
+// Whether the value `a` may be read from a list element, a record field, a `for` loop's
+// element or an `if` / `match` choosing between functions, so a call through it runs what that
+// place holds (D9090, D13740).
 export function holeFnReadsSlot(a: i32): boolean {
   if holeFnArgDecl(a) >= 0 { return false }
   const reads: i32[] = []
   const seen: i32[] = []
   holeLetReadsOf(a, seen, reads)
   for r in reads {
-    if holeIsSlotRead(r) { return true }
+    if holeIsSlotRead(r) || holeChoiceArms(r).length > 0 { return true }
   }
   false
+}
+
+// The un-annotated function or lambda the value arm `v` of a choice names; -1 else.
+function holeChoiceArmDecl(v: i32): i32 {
+  const d = holeFnArgDecl(v)
+  if d >= 0 { return d }
+  const ix = parenPeelIx(v)
+  if ix < 0 || ix >= P.nodes.length || !directHoleDecl(ix) { return -1 }
+  const f = nodeAt(ix)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return -1 }
+  ix
+}
+
+// The value arms of the `if` / `match` at `ix` when there are two or more and each is an
+// un-annotated function or lambda; [] else.
+function holeChoiceArms(ix: i32): i32[] {
+  const none: i32[] = []
+  if ix < 0 || ix >= P.nodes.length { return none }
+  const n = nodeAt(ix)
+  if !(n is IfStmt) && !(n is MatchExpr) { return none }
+  if n is IfStmt && n.ifElse < 0 { return none }
+  const leaves: i32[] = []
+  tailValueLeaves(ix, leaves)
+  if leaves.length < 2 { return none }
+  // In source order: the worklist yields the last arm first.
+  const vs: i32[] = []
+  for v in leaves {
+    if holeChoiceArmDecl(v) < 0 { return none }
+    vs.push(v)
+    let at = vs.length - 1
+    while at > 0 && nodeStartTok(vs[at - 1]) > nodeStartTok(v) {
+      vs[at] = vs[at - 1]
+      at = at - 1
+    }
+    vs[at] = v
+  }
+  vs
+}
+
+// Each arm of every choice between un-annotated functions the value `a` may be read from, in
+// `arms`, and the function it names, in `decls` (D13740).
+export function holeChoiceArmsOf(a: i32, arms: i32[], decls: i32[]) {
+  if holeFnArgDecl(a) >= 0 { return 0 }
+  const reads: i32[] = []
+  const seen: i32[] = []
+  holeLetReadsOf(a, seen, reads)
+  for r in reads {
+    for v in holeChoiceArms(r) {
+      arms.push(v)
+      decls.push(holeChoiceArmDecl(v))
+    }
+  }
+  0
+}
+
+// `holeLetWritesDisagree` for the choice at `ix`: every function an arm names is called at the
+// widened parameter types `wp`, and one whose body gives another result than the first arm's
+// is refused at its arm, as a re-pointed `let`'s second write is (D9003, D13740).
+function holeChoiceJudge(ix: i32, wp: i32[]): boolean {
+  const vs = holeChoiceArms(ix)
+  if vs.length == 0 { return false }
+  const ft = mkFuncTy(wp, TY_I32)
+  const noN: string[] = []
+  const noT: i32[] = []
+  const ds: i32[] = []
+  const rs: i32[] = []
+  for v in vs {
+    const d = holeChoiceArmDecl(v)
+    const r = holeLamRetAt(d, ft, noN, noT)
+    if r < 0 || tyHasTyVar(r) { return false }
+    ds.push(d)
+    rs.push(widenLitTy(r))
+  }
+  let k = 1
+  while k < vs.length {
+    if !tySame(rs[k], rs[0]) {
+      tErr(holeChoiceDisagreeMsg(wp, ds[k], rs[k], ds[0], rs[0]), vs[k])
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+// The `holeChoiceJudge` refusal: function `d` an arm chooses returns `r` at `wp`, where `d0`,
+// the first arm's, returns `r0`.
+function holeChoiceDisagreeMsg(
+  wp: i32[],
+  d: i32,
+  r: i32,
+  d0: i32,
+  r0: i32,
+): string {
+  let ps = "("
+  let j = 0
+  while j < wp.length {
+    if j > 0 { ps = ps + ", " }
+    ps = ps + tyToStr(wp[j])
+    j = j + 1
+  }
+  ps = ps + ")"
+  "cannot choose "
+    + holeDeclName(d)
+    + " here: called at "
+    + ps
+    + " it returns "
+    + tyToStr(r)
+    + ", where "
+    + holeDeclName(d0)
+    + ", also chosen here, returns "
+    + tyToStr(r0)
+    + " — every function a call through the choice may run must return one type"
 }
 
 // Whether read `r` reads a list element, a map value, a record field or a `for` loop's element.
@@ -4611,6 +4727,11 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
     return 0
   }
   seen.push(ix)
+  // A choice between functions is judged arm against arm (D13740).
+  if holeChoiceArms(ix).length > 0 {
+    out.push(ix)
+    return 0
+  }
   const n = nodeAt(ix)
   // A `.get` reads a value of the map, or an element of the list, it is called on (D9311).
   if cwGetRecv(ix) >= 0 {
