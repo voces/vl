@@ -117,7 +117,8 @@ Since this measurement the baseline has fallen to **55 renders and 92 parses** (
 the slices below record each retirement, the last two being row 280 (`forceCloResultMapTypes`'s
 `annArrowAt`, #4764) and `nulLitUnionInnerName`'s 2 parses (#4768). The second was in B, so the
 conditional key producers are now 3 renders and 10 parses, and the D1/D5/D8 stopping point is 23
-renders and 11 parses.
+renders and 11 parses. D1's `rlMintNameOfTy` (#4772) and D5's `shareFieldUnionRow` (1 render
+each) have since retired, so the baseline reads **53 renders and 92 parses**.
 
 ### Per file
 
@@ -198,7 +199,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 8 retired, 14 left; `refArrElemNameIf` is deleted, its last caller reading its arm's element row by type; the ladder internals still have name callers that mint by spelling) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer; re-checked at 84b98d149 after #4700: the pins are computed before the instance exists, none retired; re-probed at edc698135 over every pin at the mint: the banked type is the argument's, not the pin's, and differs from the resolved pin type in 371 files, so step 1 is not byte-identical) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5; re-checked at 84b98d149, unchanged) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; the rest is the D4930 alias; re-probed at 84b98d149, none retired: the split fallbacks are reached by callers with no type) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 18 retired, 3 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; re-probed at 84b98d149, none retired; at 2aef21b94 the D4930 alias `shareFieldUnionRow` is deleted, since no reach file needs the alias or its row; the `recordUnMemTys` fallback rows carry a type that loses a member or unrolls a cycle, and the `unionSetAtomsOf` and `unionSetMemberCount` splits are reached by callers with no type) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired; at 84b98d149 the typed-beside legs of `mvValNamesCompat` are reached by no event) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; the mv mint key asks the held map type at every caller, the annotation sites and union arms included, with the spelling only as the floor for a value the arena cannot name; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149: the field companion's render is the name its readers rebuild the box under) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -1832,12 +1833,18 @@ What each slice changes:
     `valueUnionKeyTextOfTy`; no file reaches it. About 40 hand-written callee shapes and
     numeric-union operands reached neither with a name. difftree `--identity` found 0 of 16,483
     files differ.
-  - Left: `shareFieldUnionRow`, where the render is the registered key. 26 files reach it, and in
-    13 of them the render differs from the canon row's own name (`{x:i32}[]|i32[]` against
-    `P[]|i32[]`). That is the alias D4930 needs, because readers look the structural spelling up
-    by name. A re-probe over 16,641 files: of those 26, `unionSpellingOfTy` agrees with the render
-    in 18, differs in 3 and declines on a record member in 9. The canon key text differs in 7, and
-    in 1 no row exists, so the render is the name minted.
+  - Done: 1 render. `shareFieldUnionRow` is deleted, with the record-literal half of
+    `shareObjLitFieldUnionRows` and the row `mintUnionFieldObjRow` registered under the field's
+    render. An answer probe over the self-compile and 16,778 files: 25 files reach it in 70
+    events. In 43 the render was already bound to the canon row, 26 aliased a structural render
+    onto it (`{x:i32}[]|i32[]` onto `P[]|i32[]`, `{v:i32,next:Node|null}|{e:i32}` onto `Node`),
+    and 1 minted a row of its own (`K|L|i32` in
+    `unions/litunion-nested-union-arm-module-global.vl`). With all three removed, the 25 reach
+    files print the same output with the same exit code, the D4930 fixture included, so on no
+    reach file is the alias or the extra row load-bearing any more. The one module that changes
+    (`unions/one-list-member-union-positions.vl`) loses an unused function type and nothing
+    else. difftree `--identity` found 1 of 16,669 files differ, that one, with the same output
+    and exit code.
   - Landed, the step-5 ABI change: a row records its members from its type's canonical members,
     not from a split of its set spelling. Box tags change with it. The split had differed from
     `canonUnionMembersInto` of the row's `unTyIx` in member count in 2,573 of 7,290 files and,
@@ -1910,6 +1917,51 @@ What each slice changes:
     `recordUnMemTys` still falls back in 22 events in 13 files; `unionSetAtomsOf` splits a set no
     row records in 39,836 events in 4,381 files, and `unionSetMemberCount` counts one in 1,241,275
     events in 11,883. Their callers pass no type.
+  - Re-probed at `2aef21b94` over the self-compile and 16,778 files, after `shareFieldUnionRow`
+    retired, 3 left:
+    - `recordUnMemTys` still falls back in 22 events in 13 files, and every one of those rows has
+      a `unTyIx`. The probe spelled each fallback row's members from its type: each member's
+      nominal render, the walk `boxRowMembersInto` uses but without the declines. It matched the
+      split in 8 events and differed in 14, in 10 files. The type cannot stand in for the split
+      in four families:
+      - In a generic body the arm `(T)=>void` renders as `()`, because `T` is unbound.
+      - For a twin list the row's type is the parse of a merged spelling (D3503).
+        `Rec2[]|null|Rec[]|null`, `Rec2[]|null|Rec[]` and `Rec2[]|Rec[]|null` each read back as
+        `Rec2[]|null`, so a member is lost.
+      - Canon unrolls a recursive anonymous record union one level. For example
+        `{v:i32,next:Node|null}|{e:i32}|null` reads back as
+        `{v:i32,next:{v:i32,next:Node|null}|{e:i32}|null}|{e:i32}|null`. The same happens to the
+        `#lu` and `kind:` variants and to the recursive `J` map alias.
+      - An alias body loses its declared name: `f64|string|WMap$m…` reads back as
+        `f64|string|{[string]:W$m…}`, and `{b:{…}}|{w:i32}` as `Box<Node>|{w:i32}`.
+
+      The split stays until `mintInlineUnion` records the registered type instead of parsing a
+      merged spelling, canon spells a cycle-reaching arm and an alias body by its declared
+      name, and a generic body's row is no longer minted.
+    - `unionSetAtomsOf` and `unionSetMemberCount` are reached from 42 and 11 call sites in 13
+      files, and also through `unionMemberAtomsOf`, `unionMemberCountOfName` and
+      `unionHasValueAtom`. Per site, these are the call sites where a set with no row is split
+      most often:
+      - `unionSetAtomsOf`:
+        - `memReadBoxNames` (`emit_classify`): 22,705 events in 428 files.
+        - `unionSetAtomsOfTy`'s last rung: 5,008 events in 1,078 files.
+        - The `emit_mono` pin readers at four sites: 1,928, 1,287, 1,286 and 1,000 events.
+          These are in L1's file.
+        - `internShapeDeepTyGo`: 1,479 events in 302 files.
+        - `unionRowOrSetArmTys` (`emit_map_twins`): 801 events in 97 files.
+      - `unionSetMemberCount`:
+        - `canonAtomsOfTy`: 12,491 events in 391 files.
+        - `mvCanonValNameTy`: 11,749 events in 124 files.
+        - `unionMemberCountOfName`: 3,106 events in 39 files.
+        - `rlCanonLitUnionAtoms`: 2,681 events in 359 files.
+
+      Most of these readers hold a member-set spelling, built from a pin, a narrowed variant, a
+      map value or a struct field's stored spelling, and no row records that set. Some sites do
+      hold a type: `memReadBoxNames` for its own field (`own`, the 22,705 events), and also
+      `canonAtomsOfTy`, `mvCanonValNameTy`, `unionSetAtomsOfTy` and `internShapeDeepTyGo`. Neither
+      function retires until the readers with only a spelling ask by type too. Those are
+      `memReadBoxNames` for its stored field (`phys`), `narrowSlotAtomsInto`,
+      `unionMemberCountOfName`, `nameIsRefArrayGo` and the `emit_mono` pin readers.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
   `structIndexOfLet` answer by type.
 
