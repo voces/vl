@@ -669,6 +669,8 @@ let monoLamMintedSlots: i32[] = []
 // Every lifted slot a lambda clone took for the instance being built, nested clones included.
 // Never retired, since the instance walks each clone's body once it is registered (D2553).
 let monoLamCloneSlots: i32[] = []
+// The template each lambda clone comes from, by clone node, read for a clone too open to type.
+let monoLamCloneTmpl: {[i32]: i32} = Map()
 
 // The arena shape `monoRebuild`'s two whole-program passes are a pure function of:
 // `P.nodes`, `fnStmts` and `fnParent` grow, and `monoArenaTick` counts what lands IN PLACE,
@@ -5100,6 +5102,8 @@ function monoCloneLambdaSubst(
     if a.fnRet < 0 && blockHasBareReturn(a.fnBody) { cloneRet = -1 }
     const clone = mkFunc(nm, noTP, ps, cloneRet, nbody, a.pos)
     identOrigNote(clone, fnIx)
+    // arena-tick exempt: a clone-to-template side map read only by monoLamTypedTemplate, never by a pass.
+    monoLamCloneTmpl[clone] = fnIx
     // The clone is a value too, typed at this pin where the template's type substitutes.
     const cty = monoPinnedTyOf(fnIx, bN, bT)
     if cty >= 0 && !tyHasTyVar(cty) { nodeTyRecord(clone, cty) }
@@ -8471,6 +8475,14 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
       identFrom(newCallee, n.callFn)
       monoLamCallCallees.push(newCallee)
       lamCall = true
+    } else if monoCalleeElems(n.callFn, -1).length > 0 {
+      // A call through list elements records its callee's type per instance (D12702).
+      newCallee = monoCopyOf(n.callFn, mkIdent(callee.identName, callee.pos))
+      lfNoteMinted(newCallee, n.callFn)
+      nodeTyRecord(
+        newCallee,
+        substTyDeep(nodeTyIxOf(n.callFn), monoCgcHoleN, monoCgcHoleT),
+      )
     }
   } else {
     newCallee = monoCloneGenericCalls(n.callFn)
@@ -20549,7 +20561,7 @@ function monoCalleeAnnNode(callee: i32, fnIx: i32): i32 {
 // and types the callee at the one closed type their parameters' own calls and the arguments'
 // results give it (D7183, D7848). 1 when it typed the callee, 0 when none applies, -1 on a failure.
 function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
-  const elems = monoCalleeElems(n.callFn)
+  const elems = monoCalleeElems(n.callFn, ctx)
   if elems.length == 0 { return 0 }
   const rows: i32[][] = []
   for el in elems {
@@ -20573,8 +20585,16 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
   }
   let ft = -1
   let k = 0
+  const hN: string[] = []
+  const hT: i32[] = []
+  monoOneInstHoleBinds(hN, hT)
   while k < elems.length {
-    const r = monoFnDeclRetAt(monoElemFnDecl(elems[k], ctx), rows[k])
+    const r = monoFnDeclRetAtUnder(
+      monoElemFnDecl(elems[k], ctx),
+      rows[k],
+      hN,
+      hT,
+    )
     if r < 0 { return 0 }
     const et = mkFuncTy(rows[k], r)
     if !monoTyClosedFn(et) { return 0 }
@@ -20663,8 +20683,9 @@ function monoCalleeListRead(c: i32): i32 {
 
 // The function values callee `c` reads: a list literal's through an index, a `for` variable or
 // an element `const`, or an `if`'s, as the callee itself (D7848) or a `const`'s, an `if` element
-// giving each of its arm values; empty for any other callee.
-function monoCalleeElems(c: i32): i32[] {
+// giving each of its arm values; empty for any other callee. A `for` variable read in generic
+// instance `ctx` reads the instance's own copy of the loop's list (-1 for none).
+function monoCalleeElems(c: i32, ctx: i32): i32[] {
   const none: i32[] = []
   const x = unwrapParen(c)
   if x < 0 || x >= P.nodes.length { return none }
@@ -20680,6 +20701,8 @@ function monoCalleeElems(c: i32): i32[] {
   if d < 0 || d >= P.nodes.length { return none }
   const dn = nodeAt(d)
   if dn is ForIn && dn.fiVar == n.identName {
+    const own = nodeAt(monoInstDeclCopy(ctx, d))
+    if own is ForIn { return monoConstListElems(own.fiIter) }
     return monoConstListElems(dn.fiIter)
   }
   if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return none }
@@ -20806,6 +20829,9 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
     }
     i = i + 1
   }
+  // An element nested in a hole function reads that function's parameters at the types its one
+  // instance gives them (D12880).
+  if named { monoOneInstHoleBinds(bNames, bTys) }
   const pts: i32[] = []
   let j = 0
   while j < args.length {
@@ -20844,6 +20870,39 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
     j = j + 1
   }
   pts
+}
+
+// Appends to `bNames`/`bTys` each hole type variable every instance so far binds to one type,
+// and not already bound there; a hole two instances bind apart is left open.
+function monoOneInstHoleBinds(bNames: string[], bTys: i32[]): i32 {
+  const seen: {[string]: i32} = Map()
+  let r = 0
+  while r < monoHoleSubN.length {
+    const ns = monoHoleSubN[r]
+    const ts = monoHoleSubT[r]
+    let k = 0
+    while k < ns.length && k < ts.length {
+      const t = ts[k]
+      const prev = seen.get(ns[k]) ?? -1
+      if t < 0 {
+        seen[ns[k]] = -2
+      } else if prev == -1 {
+        seen[ns[k]] = t
+      } else if prev >= 0 && sigKeyOfTy(prev) != sigKeyOfTy(t) {
+        seen[ns[k]] = -2
+      }
+      k = k + 1
+    }
+    r = r + 1
+  }
+  for nm in seen.keys() {
+    const t = seen.get(nm) ?? -1
+    if t >= 0 && !tyHasTyVar(t) && !monoStrListHas(bNames, nm) {
+      bNames.push(nm)
+      bTys.push(t)
+    }
+  }
+  0
 }
 
 // The type value argument `a` has in the function `ctx` walked: its own, else where that is open,
@@ -20904,7 +20963,7 @@ function monoElemPinTysUnder(
 // lambdas: 2 when a parameter's type still holds a hole, 1 when each such one's is closed or the
 // call hands only lambdas, 0 when it hands none.
 function monoElemsParamArgs(n: Call): i32 {
-  if monoCalleeElems(n.callFn).length == 0 { return 0 }
+  if monoCalleeElems(n.callFn, -1).length == 0 { return 0 }
   let out = 0
   for a in n.callArgs {
     const x = unwrapParen(a)
@@ -22534,7 +22593,25 @@ function monoRecSrcReadOnce(lf: i32[], v: i32): boolean {
 function monoFnDeclRetAt(lx: i32, qs: i32[]): i32 {
   const noN: string[] = []
   const noT: i32[] = []
-  const r = holeLamRetAt(lx, mkFuncTy(qs, i32TyIx()), noN, noT)
+  monoFnDeclRetAtUnder(lx, qs, noN, noT)
+}
+
+// The lambda an instance cloned as `lx` at a type still open, which carries no type of its own;
+// `lx` itself otherwise.
+function monoLamTypedTemplate(lx: i32): i32 {
+  if lx < 0 || nodeTyIxOf(lx) >= 0 { return lx }
+  monoLamCloneTmpl.get(lx) ?? lx
+}
+
+// `monoFnDeclRetAt` with the enclosing holes `bN` bound to `bT`.
+function monoFnDeclRetAtUnder(
+  lx0: i32,
+  qs: i32[],
+  bN: string[],
+  bT: i32[],
+): i32 {
+  const lx = monoLamTypedTemplate(lx0)
+  const r = holeLamRetAt(lx, mkFuncTy(qs, i32TyIx()), bN, bT)
   if r >= 0 { return r }
   monoFnTyRetAt(nodeTyIxOf(lx), qs)
 }
@@ -26612,7 +26689,7 @@ function monoOtherPinFns(callIx: i32, decl: i32, par: i32): i32[] {
   if !monoNameOnlyCalled(dn.fnBody, pn.parName, false) { return none }
   const fx = unwrapParen(c.callFn)
   if fx < 0 || fx >= P.nodes.length { return none }
-  let elems = monoCalleeElems(fx)
+  let elems = monoCalleeElems(fx, -1)
   if !(nodeAt(fx) is Index) {
     const ld = mfrListSrc[fx] ?? -1
     if ld < 0 || ld >= P.nodes.length { return none }
@@ -27799,7 +27876,7 @@ function monoBoundFnListElemsTy(lits: i32[], ctx: i32): i32 {
     for e in l.arrElems {
       const x = unwrapParen(e)
       if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
-      const dx = monoInstLetCopy(ctx, identDeclOf(x))
+      const dx = monoInstDeclCopy(ctx, identDeclOf(x))
       if dx < 0 || dx >= P.nodes.length { return -1 }
       const dn = nodeAt(dx)
       if !(dn is LetDecl) || dn.letKw != "const" || dn.letType < 0 { return -1 }
@@ -27822,21 +27899,32 @@ function monoBoundFnListElemsTy(lits: i32[], ctx: i32): i32 {
   t
 }
 
-// The copy generic instance `fx` took of its template's binding `d` (`monoLetOwnCopy`), which a
-// read the instance shares with its template still resolves to `d`; `d` itself otherwise.
-function monoInstLetCopy(fx: i32, d: i32): i32 {
+// The copy generic instance `fx` took of its template's binding `d` (`monoLetOwnCopy`), or of its
+// `for` loop `d` (`monoCloneGenericCalls`), which a read the instance shares with its template
+// still resolves to `d`; `d` itself otherwise.
+function monoInstDeclCopy(fx: i32, d: i32): i32 {
   if d < 0 || d >= P.nodes.length || !monoFrameIsGenericInstance(fx) {
     return d
   }
-  const dn = nodeAt(d)
-  if !(dn is LetDecl) || monoInstOwns(fx, d) { return d }
+  if monoInstOwns(fx, d) { return d }
   for ix in monoFrameNodes(fx) {
-    const n = nodeAt(ix)
-    if ix != d && n is LetDecl && n.letName == dn.letName && n.pos == dn.pos {
-      return ix
-    }
+    if ix != d && (monoSameLetDecl(ix, d) || monoSameForIn(ix, d)) { return ix }
   }
   d
+}
+
+// Whether `a` and `b` are both bindings of one name at one position.
+function monoSameLetDecl(a: i32, b: i32): boolean {
+  const n = nodeAt(a)
+  const m = nodeAt(b)
+  n is LetDecl && m is LetDecl && n.letName == m.letName && n.pos == m.pos
+}
+
+// Whether `a` and `b` are both `for` loops over one variable at one position.
+function monoSameForIn(a: i32, b: i32): boolean {
+  const n = nodeAt(a)
+  const m = nodeAt(b)
+  n is ForIn && m is ForIn && n.fiVar == m.fiVar && n.pos == m.pos
 }
 
 // Whether node `x` belongs to generic instance `fx`'s own copy of its template's body.
@@ -28540,6 +28628,7 @@ export function monomorphize(stmts: i32[]) {
   monoFieldWrites = Map()
   monoElemWrites = Map()
   monoListStores = Map()
+  monoLamCloneTmpl = Map()
   monoLetWritesSeen = 0
   monoLetWritesExtend()
   // The index follows the table it answers for, at the write and not at a build point:
