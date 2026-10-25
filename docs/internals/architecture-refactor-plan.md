@@ -640,6 +640,22 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,828,036 → 5,828,065 bytes (+29).
     - `regress.vl`: 0 runs → not-runs, 0 → silent, no cell changed class.
     - Filed witnesses `--strict`: D3311, D4088 and D4132 moved to `runs`, and they are re-graded closed.
+- **2026-10-24, D12390 and D12520 close (clause 2), and the instance readers are re-counted: none is left unexplained.**
+  - D12390 has two mechanisms, both in `coalesceOfNulMapIsMap` (`emit_classify.vl`). At a generic's instance the operand's map type and the `??` node's type are equal but are different arena entries, and the read compared them by index. It now compares them with `tySame`. In the un-annotated face (`function hc(v, d, c)`), the operand's type still holds the hole, `{[string]: _} | null`, which the bank does not resolve. There the result is a map when the default's own type is a non-null map. Ablation: the `tySame` change alone runs the generic spellings, and the un-annotated spelling still refuses until the hole arm is added.
+  - D12520: at the instance, `q` is pinned at the inline record `{n: i32}`, which no nominal row reader names, so `exprVariantIndex` answers -1 and the row fold does not fire. `emitIsTestVariant` (`wasmEmit.vl`) now reads the instance's banked receiver type. When it is a closed record that `recArmFitKind` says can never fit the tested arm (`recNeverFitsArm`), the test evaluates the receiver and answers `false`. "Never fits" means the field names differ in either direction, or some shared field shares no value. The annotated face refuses a wider record at check time too. A record whose fields only overlap still reaches the refusal.
+  - The count: #4712's instrumentation re-run on this head, every one of the emitter's 834 `nodeTyIxOf` calls, over 16,727 files with 0 uncompared. 78 lines read a type that holds type parameters while an instance is emitted, and each one is in a by-design group:
+    - 3 are the bank's own reads: `bankInstanceNodeTys`, `nodeTyInDerived` and `nodeTyAt`'s fallback.
+    - 27 ask whether the generic's type is open, or hand it to a re-derivation. They are in `emit_classify.vl` (13), `emit_ty_canon.vl` (4), `wasmEmit.vl` (4), `emit_closure_sites.vl` (3), `emit_lit_atoms.vl` (2) and `emit_value_sites.vl` (1). Every one already holds `fnIx`.
+    - 18 read a written annotation, which is the template's. They are the annotation readers the previous bullet listed, plus `paramString` and `paramVariantIndex`.
+    - 19 feed the row mint, which is L6's: `emit_shape_rows.vl` 8, `emptyArrHoleKind`, `emptyArrHoleElemName`, and 9 lines in the `anonFieldCode` family.
+    - 11 are left raw on purpose, for the reasons the previous bullet gives: `asExprIsUnionCast`, `asExprOperandIsHole`, `asExprNumSrcName`, `ifJoinIsScalarPrim`, `memberCallYieldsValue`, `initJoinsWiderRecord`, `hfvSync`, `fieldValueTakesFnTy`, `lambdaCheckedRetTy`, `initYieldsNothing` and `rsCallParamTy`.
+  - So no instance reader is left with no `fnIx` and no reason. The groups the log last counted were 51 / 32 / 3 / 2 / 10. The 51 were threaded in the bullet before last, and no line in `emit_mono.vl` reads an open type inside an instance any more. The reader half of L1 is done. What keeps L1 open is its per-call binding rows: D10700, D10791, D10792, D10890, D10891 and D7080, each graded as filed.
+  - Fixtures: `generics/coalesce-nullable-generic-map-default.vl` and `unions/is-other-member-over-hole-bound-from-field-read.vl`. Each has an un-annotated spelling and a second delivery position, and each fails on master's seed.
+  - Gates:
+    - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,834,743 → 5,834,913 bytes (+170).
+    - `regress.vl`: 0 runs → not-runs, 0 → silent, no cell changed class.
+    - Filed witnesses `--strict`: 3,813 graded, 3,813 as filed, 0 MOVED, 0 not graded.
+    - difftree `--identity`: the fixpoint is identical, and 2 of 16,616 files differ (11,726 built). They are the two new fixtures, which master refuses at emit.
 
 ### L2 log
 
