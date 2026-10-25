@@ -1403,6 +1403,44 @@ What each slice changes:
       exit on the master seed and the candidate. In each the annotation side of a `$fnsig` key
       now names the slot the AST side (`retTokOfTy`, already `rlSlotOfTy`) names, so the module
       carries one duplicate function type fewer. The fixpoint identity holds.
+  - L2 stage 3 at d63e667e7, probed over the self-compile and 16,788 files with 0 uncompared.
+    Each by-name call was run beside `rlSlotOfTyOrTwin` of the type it already held, and the
+    count is the files that reach the site:
+    - Done (no parse): `rlSlotByNameTy` is deleted. The field-slot readers key by the field's
+      recorded element type. `variantFieldRefSlot` agrees in 175 files, and its 2,497 typeless
+      events found no row by name either. `sFieldRefSlot` agrees in 2,054 files, but keeps the
+      stored-name read for a field with no recorded type. That read finds a row in 4 files:
+      `#anon` rows of an empty list literal (`record-lit-empty-list-field`,
+      `empty-list-field-pinned-by-push`, `alias-inline-record-list-field`) and `T|K` in
+      `declared-return-holds-litunion-beside-type-param`.
+    - Done: 13 callers that held a struct or variant field now call those readers, or call
+      `rlSlotOfTyOrTwin` directly. Not one of them differs in any file:
+      - `exprEmittedRefListSlot`'s field reads, `?.` included
+      - `eqgFieldRefSlot`
+      - the struct- and variant-field fill loops in `emit_collect`
+      - `variantRefListFieldSlot`
+      - the two field-init scans in `emit_classify`
+      - the four `.map` result arms (struct, closure-sig struct, variant and union)
+      The union arm agrees in 352 files and the struct arm in 57.
+    - Left on the name: the function-return sites. These are `fRetRArrElem` (classify 1410),
+      `emit_sections`' signature row, `wasmEmit`'s returned-closure row and the
+      `emit_closure_sites` return. A closure element type has no row of its own by type, so
+      `((i32)=>i32)` and `i64|i32` are found only by name. Some of these names also come with
+      no type.
+    - Left on the name: the expression sites whose element type is the expression's own.
+      There the typed pick differs, because the expression's type is a literal or narrowed
+      type rather than the annotation's. Counts are differing files of reaching files:
+      - `refListSlotOfExpr` and its strict twin (classify 17614): 1,007 of 5,368
+      - `wasmEmit` 12658: 189 of 1,417
+      - classify 17721: 244 of 2,590
+      - classify 17768: 104 of 1,391
+      - `emit_closure_sites` 325: 448 of 1,060, most with an empty name
+      - smaller sites: classify 17590, 17594 and 17745, value_sites 1733, collect 1390
+    - Left, agreeing but not in this group: `emit_obj_lit_fits` 1183 (864 files), value_sites
+      1705 (420, a parameter's annotation), and classify 2483 and 3773, collect 1346 and 1358
+      (11 files or fewer). These are the next candidates.
+    - The census does not move (54 renders, 91 parses), since no moved line parsed. difftree
+      `--identity`: 0 of 16,675 files differ, and the fixpoint identity holds.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
