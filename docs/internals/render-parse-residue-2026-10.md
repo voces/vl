@@ -871,6 +871,22 @@ What each slice changes:
     `internShapeDeepTy` ↔ `internShapeArms` recursion through re-rendered arm types, 3 newly
     refuse to emit, and 1 changes its error text. Of 10,395 `distilled/` cells 89 differ (2 from
     rc 0 to rc 1). Entries 173, 177, 178, 181 and 182 stay.
+  - Re-probed again 2026-10-24 to find the recursion. It is a recursive alias
+    (`type J = null | f64 | JO`, `type JO = {[string]: J}`): the name walk stops at the leaf
+    `J`, but the render of `J`'s type expands it, the map value's type is `J` again, and the
+    walk never reaches a leaf. A guard that renders a type only on first entry, and walks the
+    spelling handed down when the type is already being walked, ends it: 0 of 6,457
+    `tests/cases` files trap, against 39 on the unguarded seed. The guard does not make the
+    change landable. difftree `--identity` still finds 235 of 16,588 files differ, including
+    the self-compile, with 7 fewer modules built (11,697 against 11,704). The 3 new emit
+    refusals and the 1 changed error text are the same files as before. `regress.vl` moves 2
+    classes (13 census cells) from runs to loud emit reject, and 3 cells
+    (`mty_ret_shapefn_*`) from loud emit reject to runs. The refusals come from the key, not
+    from the recursion. In `closures/closure-param-struct-field-union-arena-walk.vl`, the
+    render spells the field `A | B` with both records expanded, so the narrowed `x is A`
+    read finds no struct. This was read off the render rules and not ablated. Even with a
+    landable walk, the four parse entries would stay: 1,855 files reach the nullable peel with
+    no type, so the spelling parse is still the only answer there. All five go with D6.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
   already holds. Landed for 1 render and 2 parses: `elemIsLitUnion` became `tyIsLitUnion` of
   the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal
