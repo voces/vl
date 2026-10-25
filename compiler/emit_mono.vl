@@ -1078,23 +1078,34 @@ function monoAnnIsCloPin(annIx: i32) {
   tyNulFuncInner(nodeTyIxOf(annIx)) >= 0
 }
 
-// The type-annotation node of a binding of `fnIx` whose annotation is already a
-// monomorphized function-value pin, or -1. The node rather than the name, because both
-// halves of the pin live on it: `tyNameOf` is the instance-key spelling and `nodeTyIxOf`
-// the `TyFunc` the outer instantiation banked. Param before local; a forwarder has both.
+// The annotation node of a binding of `fnIx` already pinned to a monomorphized function value,
+// or -1; the node carries both halves (`tyNameOf` key, `nodeTyIxOf` banked `TyFunc`). Param
+// before local. A name `fnIx` does not bind is a capture, read at the nearest enclosing frame
+// that binds it (D13660).
 function monoCloPinAnnNodeOf(identName: string, fnIx: i32): i32 {
-  if fnIx < 0 { return -1 }
-  const ptn = paramTypeNode(fnIx, identName)
-  if monoAnnIsCloPin(ptn) { return ptn }
-  const ctxFn = nodeAt(fnIx)
-  if ctxFn is FuncDecl {
-    const li = parentLetOf(ctxFn.fnBody, identName)
-    if li >= 0 {
-      const ld = nodeAt(li)
-      if ld is LetDecl {
-        if monoAnnIsCloPin(ld.letType) { return ld.letType }
+  let fx = fnIx
+  let steps = 0
+  while fx >= 0 && steps < 64 {
+    const ptn = paramTypeNode(fx, identName)
+    if monoAnnIsCloPin(ptn) { return ptn }
+    const ctxFn = nodeAt(fx)
+    let li = -1
+    if ctxFn is FuncDecl {
+      li = parentLetOf(ctxFn.fnBody, identName)
+      if li >= 0 {
+        const ld = nodeAt(li)
+        if ld is LetDecl {
+          if monoAnnIsCloPin(ld.letType) { return ld.letType }
+        }
       }
     }
+    if li >= 0 || paramIndexOf(fx, identName) >= 0 { return -1 }
+    const pp = fnStmtsPosOf(fx)
+    if pp < 0 || pp >= fnParent.length { return -1 }
+    const up = fnParent[pp]
+    if up < 0 || up >= fnStmts.length { return -1 }
+    fx = fnStmts[up]
+    steps = steps + 1
   }
   -1
 }
@@ -1542,6 +1553,37 @@ function monoCapturedParamPin(name: string, fnIx: i32): string {
         if pt is TypeRef { return monoAnnPinName(pt.tyName) }
         return ""
       }
+    }
+    steps = steps + 1
+  }
+  ""
+}
+
+// The function-value pin of the un-annotated `let` a closure at `fnIx` captures as `name`, read at
+// the frame declaring it as a read there would be, or "" for a parameter, an annotated binding or
+// a pin that is not a function value's (D13660).
+function monoCapturedLetFnPin(name: string, fnIx: i32): string {
+  if fnIx < 0 { return "" }
+  const own = nodeAt(fnIx)
+  if !(own is FuncDecl) || paramIndexOf(fnIx, name) >= 0 { return "" }
+  if parentLetOf(own.fnBody, name) >= 0 { return "" }
+  let pp = fnStmtsPosOf(fnIx)
+  let steps = 0
+  while pp >= 0 && pp < fnParent.length && steps < 64 {
+    pp = fnParent[pp]
+    if pp < 0 || pp >= fnStmts.length { return "" }
+    const fx = fnStmts[pp]
+    const fn = nodeAt(fx)
+    if fn is FuncDecl {
+      const li = parentLetOf(fn.fnBody, name)
+      if li >= 0 {
+        const ld = nodeAt(li)
+        if !(ld is LetDecl) || ld.letType >= 0 || ld.letInit < 0 { return "" }
+        const pin = monoArgTyName(ld.letInit, fx)
+        if sigKeyPinPayload(pin) == "" { return "" }
+        return pin
+      }
+      if paramIndexOf(fx, name) >= 0 { return "" }
     }
     steps = steps + 1
   }
@@ -2621,8 +2663,10 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
     // a pin that cannot name the signature must not fall through to the i32 catch-all.
     const ak = sigKeyOfTy(nodeTyAt(cax, fnIx))
     if ak != "" { return "=>" + ak }
-    // Last: the pin an instance's OWN binding already carries (a generic forwarder).
+    // Last: the pin an instance's OWN binding already carries (a generic forwarder), or the
+    // one an enclosing frame's un-annotated binding of a captured name pins at.
     if cloPinNode >= 0 { return tyNameOf(cloPinNode) }
+    if ce is Ident { return monoCapturedLetFnPin(ce.identName, fnIx) }
     return ""
   }
   // An if-expression whose join is still a type parameter and whose then arm's value is a
@@ -11857,13 +11901,22 @@ function monoMakeInstanceWalk(
   if walked < 0 { return -1 }
   // A clone's body is walked beside its instance's: its generic calls are its own copies,
   // and the template's walk pinned the template's (D2553).
-  let lci = 0
-  while lci < lamClones.length {
-    const ls = lamClones[lci]
-    if ls >= 0 && ls < fnStmts.length {
-      if monoWalkFnBody(fnStmts[ls]) < 0 { return -1 }
+  // A clone still generic in its own parameters goes last, and only while no walk has
+  // instantiated it: walking it renames in place the calls its instances copy (D13660).
+  let pass = 0
+  while pass < 2 {
+    let lci = 0
+    while lci < lamClones.length {
+      const ls = lamClones[lci]
+      if ls >= 0 && ls < fnStmts.length {
+        const gen = ls < monoGen.length && monoGen[ls] == 1
+        if gen == (pass == 1) && !(gen && monoInstantiatedAny(ls)) {
+          if monoWalkFnBody(fnStmts[ls]) < 0 { return -1 }
+        }
+      }
+      lci = lci + 1
     }
-    lci = lci + 1
+    pass = pass + 1
   }
   if monoRebuild() < 0 { return -1 }
   0
