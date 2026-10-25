@@ -201,7 +201,7 @@ the slice retires.
 | D5 | union registry by type (step 5 remainder) (landed: 17 retired, 4 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; rows record their type's canonical members, so box tags follow canon, and fall back to the split only for a member reaching a cycle by no declared name, a twin list or an unrendered member; the rest is the D4930 alias; re-probed at 84b98d149, none retired: the split fallbacks are reached by callers with no type) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired; at 84b98d149 the typed-beside legs of `mvValNamesCompat` are reached by no event) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
-| D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; the mv mint key asks the held map type where the caller holds one, the annotation sites and union arms keep the spelling; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149: the field companion's render is the name its readers rebuild the box under) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
+| D8 | mv, closure-sig and field-companion slots by type (landed: 8 retired, 10 left; the mv mint key asks the held map type at every caller, the annotation sites and union arms included, with the spelling only as the floor for a value the arena cannot name; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type; the field companion's inline arm could never answer and is deleted; re-checked at 84b98d149: the field companion's render is the name its readers rebuild the box under) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
 slice that retires them in the same change. For example, A3's one C entry is a rung of the same
@@ -2179,14 +2179,23 @@ What each slice changes:
     `{[string]: T}` over an unbound type parameter. The emit render (`tyToEmitName`) was tried
     first and differed in 42,115 of 132,922 `letMapShapeOf` events, because it spells records
     structurally. The fixpoint seed is 108 bytes smaller.
-  - Left, measured: the annotation sites and the union arms keep the spelling.
-    `mvShapeOfMapNameArmTy` at the bare-map annotation (`emit_collect`) and at `letMapShapeOf`
-    (`emit_classify`) differ from the nominal key in 1,168 of 13,716 and 3,741 of 132,922
-    events: the spelling keeps parens and structural records that name a different slot.
-    `markMapUnionArmsOf` differs in 14 of 48,026, all union atoms. These wait on the mv slot
-    table keyed by the value type rather than by a name.
+  - Landed, nothing retired: the annotation sites and the union arms key the mv slot by the held
+    map type too. The bare-map annotation (`emit_collect`), `letMapShapeOf` (`emit_classify`)
+    and `markMapUnionArmsOf` call `mvShapeOfMapHeldTy`; `mvShapeOfMapNameArmTy` and
+    `mvShapeOfMapNameTys` are deleted. `mapTyMvDeclName` keeps a lone string literal (`"circle"`)
+    rather than the nominal namer's `string` (D7446). The key KIND still follows the spelling
+    when there is one: a hole-face `Map()` in `literal-unions/litunion-atom-map-key.vl` has the
+    arena type `{[K]: i32}` (an i32 hash, D1748) while its spelling and its map ops say
+    `{[string]: i32}`; 14 key-kind events in 3 files disagree. The key NAME differs from the
+    spelling in 5,551 of 205,825 events over 338 files: structural records against their
+    nominal name, grouped function values, an alias against its expansion, and recursive mono
+    aliases. The slot table finds by value type first, so these reach the same slot; the
+    identity difftree and the distilled corpus show no behaviour change. The floor is still the
+    spelling (`mapValNameOf(mapName)`) for a value the arena cannot name: 566 events, 522 of
+    them the `-3` sentinel and 44 a slot, all a value over an unbound type parameter except one
+    held map with no type. So the parse stays.
   - Left, not probed: the products. These are the signature-ladder
-    renders, the mv mint key in `mvShapeOfMapNameTys`, `cloArmTagOfTy`'s render, which the link
+    renders, the mv floor in `mvShapeOfMapHeldTy`, `cloArmTagOfTy`'s render, which the link
     step reads as the `clo:` key, and the two D34 entries. The mv slot stays keyed by spelling,
     so D2's `mvValKindOfName` callers do not move with it.
   - Banked, nothing retired: the map-value slot's kind questions take the type where the caller
@@ -2298,7 +2307,7 @@ What each slice changes:
       the four files in "Left, by file" other than the two step 5 closed and the arm mint).
     - `mapValKindLowerable` under the D34 arm mint: 1 file, 5 reaches.
 
-    So no parse retires yet. `nulMapInnerName` and the mv mint key in `mvShapeOfMapNameTys`
+    So no parse retires yet. `nulMapInnerName` and the mv floor in `mvShapeOfMapHeldTy`
     stay too: the first is a string utility with name-only callers, and the slot is still found
     and minted under the spelling. The two typed rungs of `mvValKindOfNameTy` that disagree with
     the spelling are the next deliberate change, each a rep change rather than a refactor:
@@ -2316,7 +2325,7 @@ What each slice changes:
     After steps 2 and 4 and the arm mint, nothing calls `mvValKindOfNameTy` without a type.
     The three rungs, `mapValKindLowerable` and `mvValKindOfName` can then go. That retires the
     D2 entries at 450, 709 and 649 and the A1 entry at 469. Keying `mvValName` by type, and the
-    mint key in `mvShapeOfMapNameTys`, come after that.
+    floor in `mvShapeOfMapHeldTy`, come after that.
 
     Re-checked at `84b98d149`, none retired: `memReadBoxNames`'s render is also the name
     `memReadBoxNarrowName` hands its three readers, which rebuild the box under it, so a
