@@ -50,6 +50,7 @@ import { getterFnFor } from "./check_getter_effects"
 import {
   HD_ELEMV,
   HD_FLD,
+  HD_OFLD,
   hdRootTy,
   hdRowOf,
   tyIsWriteLandRead,
@@ -87,6 +88,7 @@ import {
 } from "./check_narrow_flow"
 import {
   MC_NULL_READ_MARK,
+  MC_OPT_READ_MARK,
   crNoteLoopRead,
   holeRemainderEndedSure,
   narrowingEndedAt,
@@ -105,7 +107,7 @@ import {
 import { symMem } from "./check_sym_occ"
 import { tpBoundOfName } from "./check_tp_bound"
 import { mapKeyTySupported } from "./check_ty_rep"
-import { holeMemberTy } from "./check_type_shape"
+import { holeMemberTy, nonNullNarrowTy } from "./check_type_shape"
 import {
   T,
   TY_ERR,
@@ -124,6 +126,7 @@ import {
   tyAt,
   tyBuiltinIndexable,
   tyIsDeclaredParam,
+  tyIsHole,
   tyIsLitUnion,
   tyMutEpoch,
   tyToStr,
@@ -428,6 +431,32 @@ function checkMemberHoleTy(n: Member, ix: i32, ot: TyVar, objTy: i32): i32 {
   }
   -1
 }
+// `?.prop` off an inference hole or an unbounded type parameter `baseTy`: the read is re-asked
+// at each pin (`HD_OFLD`), and the chain's guard is the field of the hole's non-null face, so a
+// following `.` reads it as the direct chain does (D3215). -1 for a bounded parameter.
+function optMemberHoleTy(
+  n: OptMember,
+  ix: i32,
+  bt: TyVar,
+  recv: i32,
+  baseTy: i32,
+  wasNullable: boolean,
+): i32 {
+  const open = bt.tvName.length > 0 && bt.tvName[0] == '?'
+  if !open && tpBoundOfName(bt.tvName) >= 0 { return -1 }
+  let mark = MC_OPT_READ_MARK
+  if n.omDot { mark = "" }
+  noteMemCstr(baseTy, mark + n.omProp, ix, false)
+  let base = baseTy
+  if tyIsHole(recv) { base = recv }
+  const h = mkDerivedHole(HD_OFLD, n.omProp, -1, -1, base)
+  if h < 0 { return -1 }
+  const g = mkDerivedHole(HD_FLD, n.omProp, -1, -1, nonNullNarrowTy(baseTy))
+  omGuardSet(ix, g)
+  if wasNullable && base == baseTy { return symMem(ix, mkNullableTy(h)) }
+  symMem(ix, h)
+}
+
 // ── index `a[i]` ────────────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `Index` arm (C3: thin the dispatcher).
@@ -761,6 +790,10 @@ export function checkOptMemberNode(n: OptMember, ix: i32) {
       if wasNullable { return symMem(ix, mkNullableTy(osf)) }
       return symMem(ix, osf)
     }
+  }
+  if bt is TyVar {
+    const oh = optMemberHoleTy(n, ix, bt, recv, baseTy, wasNullable)
+    if oh >= 0 { return oh }
   }
   omGuardSet(-1, -1)
   // A nullable receiver here is not "a non-object" — it is an object-less base behind a
