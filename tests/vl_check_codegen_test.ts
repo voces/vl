@@ -92,18 +92,18 @@ const check = async (
   }
 };
 
-// Type-checks cleanly, fails the emitter (a closure whose result struct carries a
-// nullable REF-list field has no lowerable rep, so the call's sig never interns).
-// (The former `{ v: i32, xs: i64[] | null }` struct spelling lowers since the four
-// distinct-backing nullable scalar-list FIELD codes 31-34 landed.)
+// Type-checks cleanly, fails the emitter: an un-annotated Map whose value is a call's
+// record result carrying a function field has no map-value rep (D12340). Swap in another
+// live emit refusal when that row closes.
 const EMIT_ERROR_SRC =
-  `function makeIt(): (i32) => {f: (i32 | null)[] | null} {\n` +
-  `  return (q0) => ({ f: [1, 2] })\n` +
-  `}\n` +
+  `function dbl(a) { return a * 2 }\n` +
+  `function mk(g) { return { f: g } }\n` +
+  `// D12340\n` +
   `function useIt() {\n` +
-  `  const v: (i32) => {f: (i32 | null)[] | null} = makeIt()\n` +
-  `  const s = v(1)\n` +
-  `  print(0)\n` +
+  `  const m = Map()\n` +
+  `  m.set("b", mk(dbl))\n` +
+  `  const r = m.get("b")\n` +
+  `  if r != null { print(r.f(3)) }\n` +
   `}\n` +
   `useIt()\n`;
 
