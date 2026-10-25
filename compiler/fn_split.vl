@@ -42,6 +42,7 @@ import {
   declNameTokOf,
   hasNamedArgs,
   i32ToStr,
+  labelBlockValue,
   mkBinary,
   mkBlock,
   mkCall,
@@ -1143,9 +1144,9 @@ function fsChoiceStmt(c: i32, a: i32): i32 {
   s
 }
 
-// `fsChoiceStmt`, a `return` included, for a choice `a` of names (`fsPureChoice` or
-// `fsHoistsChoice`) handed to call `c` (D13360); every argument ahead of it must stay, past any
-// call in its conditions when it has one.
+// The statement a choice `a` of names (`fsPureChoice` or `fsHoistsChoice`) handed to call `c`
+// can run before (D13360): every argument ahead of it stays or binds ahead of it in order
+// (`fsAheadHoists`), and `c` reaches that statement through `fsChoiceStmtOf`; -1 otherwise.
 function fsChoiceArgStmt(c: i32, a: i32): i32 {
   if (
     c < 0
@@ -1163,19 +1164,115 @@ function fsChoiceArgStmt(c: i32, a: i32): i32 {
   let found = false
   for x in cn.callArgs {
     if x == a { found = true }
-    if !found && !fsAheadStays(x, !pure) { return -1 }
+    if !found && !fsAheadStays(x, !pure) && !fsAheadHoists(x) { return -1 }
   }
   if !found { return -1 }
-  let s = c
-  const p = fsParent[c]
-  if p >= 0 {
+  fsChoiceStmtOf(c, pure, pure && !fsChoiceMayTrap(a, 0))
+}
+
+// The statement holding expression `c`, when running a choice (`pure` or calling) before that
+// statement changes nothing: each enclosing expression runs `c` once whenever it runs, after
+// only what `fsChoiceAheadOk` admits. `lazy` admits the right side of `&&`, `||` and `??`, for
+// a pure choice that cannot trap. -1 otherwise (D13462).
+function fsChoiceStmtOf(c: i32, pure: boolean, lazy: boolean): i32 {
+  let x = c
+  let hops = 0
+  while x >= 0 && x < fsParent.length && hops < 64 {
+    const p = fsParent[x]
+    if p < 0 || p >= fsParseLen { return -1 }
     const pn = nodeAt(p)
-    if (pn is LetDecl && pn.letInit == c) || (pn is RetStmt && pn.retArg == c) {
-      s = p
-    }
+    if (pn is Block || pn is Program) && hasI32(fsStmtsOf(p), x) { return x }
+    if !fsRunsChildFirst(p, x, pure, lazy) { return -1 }
+    x = p
+    hops = hops + 1
   }
-  if fsListOwner(s) < 0 { return -1 }
-  s
+  -1
+}
+
+// Whether node `p` evaluates its child `x` once whenever `p` runs, after only what
+// `fsChoiceAheadOk` admits; `lazy` admits a short-circuit's right side.
+function fsRunsChildFirst(
+  p: i32,
+  x: i32,
+  pure: boolean,
+  lazy: boolean,
+): boolean {
+  const pn = nodeAt(p)
+  if pn is Paren || pn is Unary || pn is LetDecl || pn is RetStmt {
+    return true
+  }
+  if pn is Member { return pn.memObj == x }
+  if pn is IfStmt { return pn.ifCond == x }
+  if pn is ForIn { return pn.fiIter == x }
+  if pn is MatchExpr { return pn.matchScrut == x }
+  if pn is FieldInit { return pn.fiValue == x }
+  if pn is Index { return pn.idxArr == x || fsChoiceAheadOk(pn.idxArr, pure) }
+  if pn is BinExpr {
+    if pn.binLeft == x { return pn.binOp != "=" }
+    const lz = pn.binOp == "&&" || pn.binOp == "||" || pn.binOp == "??"
+    if pn.binOp == "=" { return nodeAt(pn.binLeft) is Ident }
+    return (lazy || !lz) && fsChoiceAheadOk(pn.binLeft, pure)
+  }
+  if pn is Call {
+    if pn.callFn == x || !fsCalleeStays(pn.callFn) { return false }
+    for y in pn.callArgs {
+      if y == x { return true }
+      if !fsChoiceAheadOk(y, pure) { return false }
+    }
+    return false
+  }
+  if pn is ArrayLit {
+    for y in pn.arrElems {
+      if y == x { return true }
+      if !fsChoiceAheadOk(y, pure) { return false }
+    }
+    return false
+  }
+  if pn is ObjLit {
+    // A record literal may run its fields in layout order, so every other field is ahead.
+    for y in pn.objFields {
+      const yn = nodeAt(y)
+      if y != x && (!(yn is FieldInit) || !fsChoiceAheadOk(yn.fiValue, pure)) {
+        return false
+      }
+    }
+    return true
+  }
+  fsExcluded(
+    0,
+    "a node that may run its child conditionally, repeatedly or late",
+  )
+    != 0
+}
+
+// Whether `y`, which the source runs ahead of a choice now run before its statement, sees and
+// changes nothing that move can: for a `pure` choice it calls and writes nothing
+// (`fsPureRead`), else it is a literal or a function's name.
+function fsChoiceAheadOk(y: i32, pure: boolean): boolean {
+  if y < 0 || y >= fsParseLen { return false }
+  if pure { return fsPureRead(y, 0) }
+  fsAheadStays(y, true)
+}
+
+// Whether callee `f` is a name, or a member of a name, so it runs nothing ahead of its arguments.
+function fsCalleeStays(f: i32): boolean {
+  if f < 0 || f >= fsParseLen { return false }
+  const n = nodeAt(f)
+  if n is Ident { return true }
+  n is Member && nodeAt(n.memObj) is Ident
+}
+
+// Whether pure choice `v` reads an element or divides, which may trap when run where the source
+// would not have run it.
+function fsChoiceMayTrap(v: i32, depth: i32): boolean {
+  if v < 0 || v >= P.nodes.length || depth > 64 { return true }
+  const n = nodeAt(v)
+  if n is Index { return true }
+  if n is BinExpr && (n.binOp == "/" || n.binOp == "%") { return true }
+  for k in nodeChildren(v) {
+    if fsChoiceMayTrap(k, depth + 1) { return true }
+  }
+  false
 }
 
 // Whether choosing call `an` is passed a lambda literal, which may write a `const`'s contents or
@@ -1306,13 +1403,16 @@ function fsIsLambdaLit(a: i32): boolean {
   f is FuncDecl && f.fnName == ""
 }
 
-// `a` with its parentheses removed.
+// `a` with its parentheses removed, and a labelled block that only breaks out with a value
+// (`labelBlockValue`) read as that value (D13461).
 function fsParenPeel(a: i32): i32 {
   let x = a
   while x >= 0 && x < P.nodes.length {
     const n = nodeAt(x)
-    if !(n is Paren) { return x }
-    x = n.parInner
+    const v = labelBlockValue(x)
+    if v >= 0 { x = v }
+    else if n is Paren { x = n.parInner }
+    else { return x }
   }
   x
 }
