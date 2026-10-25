@@ -22,17 +22,17 @@ module-level binding whose name carries a generation marker (`Epoch`, `Gen`, `Le
 `Seen`, `Root`, `Stamp`, `Head`), finds every guard that compares one, and fails if a stamp
 appears that `scripts/memo-generation-rows.json` does not classify or a row's anchor has been reworded away. On
 2026-09-05: **121 stamp variables, 34 read by a guard, 27 rows**; on 2026-10-06 (lane CT):
-**229 stamp variables, 47 read by a guard, 51 rows.**
+**229 stamp variables, 47 read by a guard, 51 rows**; the file now holds 76 rows.
 `tests/vl_memo_generation_test.ts` runs it on every PR, so a new memo cannot join the
 tree ungraded.
 
 | verdict | rows | what it means |
 | --- | --- | --- |
-| `pass-stamped` | 10 | the key reads `emitPassGen`, or a phase flag that is one |
-| `no-refined-input` | 9 | every table its value reads is push-only or reset wholesale |
+| `pass-stamped` | 12 | the key reads `emitPassGen`, or a phase flag that is one |
+| `no-refined-input` | 13 | every table its value reads is push-only or reset wholesale |
 | `resume-reseeds` | 2 | a resume bank that writes the refined columns back before reusing them |
-| `not-a-memo` | 10 | a visit mark or a per-row flag — no cached ANSWER to go stale |
-| `probe` | 21 | safety is measured, not argued |
+| `not-a-memo` | 16 | a visit mark or a per-row flag — no cached ANSWER to go stale |
+| `probe` | 33 | safety is measured, not argued |
 
 ### The rows
 

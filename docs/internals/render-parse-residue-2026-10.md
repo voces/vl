@@ -127,6 +127,9 @@ in D, so the conditional key producers and the stopping point do not move.
 D8's mv arm signature and hint, the arm mint's literal-union field and the map annotation shape
 (#4790) have retired since: 3 parses, so the baseline reads **53 renders and 86 parses**
 (`d0a33866f`). All were in D, so the conditional key producers and the stopping point do not move.
+D8's parameter signature token (#4794) and result signature token with a value call's union name
+(#4800) have retired since: 1 render each, so the baseline reads **51 renders and 86 parses**
+(`6973623e6`). Both were in D, so the conditional key producers and the stopping point do not move.
 
 ### Per file
 
