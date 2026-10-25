@@ -106,6 +106,7 @@ import { blockLastStmt } from "./check_if_value"
 import { HD_COAL, hdKindIs } from "./check_hole_pins"
 import { joinArmIsLit } from "./check_nj_join"
 import {
+  callBindAgreedHoles,
   callBindHas,
   callBindTyOf,
   holeFnSplitHas,
@@ -12768,7 +12769,16 @@ function monoCoerceFnValueTys(
       // An arm's VALUE is its LAST statement, so that is the only position the expected type reaches.
       const bs = e.blkStmts
       if bs.length == 0 { return 0 }
-      return monoCoerceFnValueTys(bs[bs.length - 1], tname, ctx, expTy, delTys)
+      const tail = bs[bs.length - 1]
+      const tv = monoArmTailValue(exprIx)
+      if tv == tail {
+        return monoCoerceFnValueTys(tail, tname, ctx, expTy, delTys)
+      }
+      // A tail reading the block's own `const` delivers its initialiser, and both take its type.
+      if monoCoerceFnValueTys(tv, tname, ctx, expTy, delTys) < 0 { return -1 }
+      monoRetypeChoiceRead(tv, unwrapParen(tail))
+      monoRetypeChoiceRead(tv, identDeclOf(unwrapParen(tail)))
+      return 0
     }
     Ident => {
       // A bare function name, or a value binding holding a generic function (`const add =
@@ -12899,8 +12909,8 @@ function monoValueNamesGenOrInst(v: i32, ctx: i32, depth: i32): boolean {
   const tn = monoArmEndsNever(n.ifThen)
   const en = monoArmEndsNever(n.ifElse)
   if tn && en { return false }
-  const tv = ifArmValueExpr(n.ifThen)
-  const ev = ifArmValueExpr(n.ifElse)
+  const tv = monoArmTailValue(n.ifThen)
+  const ev = monoArmTailValue(n.ifElse)
   const ta = if tv >= 0 { tv } else { n.ifThen }
   const ea = if ev >= 0 { ev } else { n.ifElse }
   (tn || monoValueNamesGenOrInst(ta, ctx, depth + 1))
@@ -12918,7 +12928,7 @@ function monoArmEndsNever(arm: i32): boolean {
 // Whether `if` arm `arm` (a block, or an `else if`) names declared generics in its value.
 function monoArmNamesGenerics(arm: i32, ctx: i32, depth: i32): boolean {
   if arm < 0 { return false }
-  const tv = ifArmValueExpr(arm)
+  const tv = monoArmTailValue(arm)
   monoValueNamesGenerics(if tv >= 0 { tv } else { arm }, ctx, depth)
 }
 
@@ -13262,7 +13272,7 @@ function monoFirstArmGenName(v: i32, ctx: i32, depth: i32): i32 {
   if x < 0 || depth > MONO_ALIAS_CHAIN_MAX { return -1 }
   const n = nodeAt(x)
   if n is IfStmt {
-    const tv = ifArmValueExpr(n.ifThen)
+    const tv = monoArmTailValue(n.ifThen)
     return monoFirstArmGenName(
       if tv >= 0 { tv } else { n.ifThen },
       ctx,
@@ -20730,10 +20740,39 @@ function monoPushArmValues(v: i32, out: i32[]): boolean {
   if i.ifElse < 0 { return false }
   for arm in [i.ifThen, i.ifElse] {
     // An `else if` arm is the nested `if` itself, with no block around it.
-    const a = if nodeAt(arm) is IfStmt { arm } else { ifArmValueExpr(arm) }
+    const a = if nodeAt(arm) is IfStmt { arm } else { monoArmTailValue(arm) }
     if a < 0 || !monoPushArmValues(a, out) { return false }
   }
   true
+}
+
+// The value arm block `arm` gives: its last statement, or where that reads an un-annotated
+// `const` the block itself declares, that `const`'s initialiser (D12840).
+function monoArmTailValue(arm: i32): i32 {
+  const v = ifArmValueExpr(arm)
+  if v < 0 || v >= P.nodes.length { return v }
+  const x = unwrapParen(v)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return v }
+  const d = identDeclOf(x)
+  const b = nodeAt(arm)
+  if (
+    d < 0
+    || d >= P.nodes.length
+    || !(b is Block)
+    || !i32ListHas(b.blkStmts, d)
+  ) {
+    return v
+  }
+  const ld = nodeAt(d)
+  if (
+    !(ld is LetDecl)
+    || ld.letKw != "const"
+    || ld.letType >= 0
+    || ld.letInit < 0
+  ) {
+    return v
+  }
+  ld.letInit
 }
 
 // The elements of list literal `v`, or of the un-annotated `const` one `v` names, through
@@ -20806,11 +20845,14 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
   if fx < 0 { return none }
   const f = nodeAt(fx)
   if !(f is FuncDecl) || f.fnParams.length != args.length { return none }
-  // With a function argument named, the element's value parameters bind first at the instance,
-  // so the function parameter's calls that pass one are read at the type it hands (D10700).
+  // With a function argument named or forwarded, the element's value parameters bind first at
+  // the instance, so the function parameter's calls that pass one are read at the type it hands
+  // (D10700); a forwarded one's pins are still read without that binding (D12701).
   let named = false
   for a in args {
-    if monoElemArgNamesFn(a, ctx) { named = true }
+    if monoElemArgNamesFn(a, ctx) || monoParamHeldFns(a).length > 0 {
+      named = true
+    }
   }
   const bNames: string[] = []
   const bTys: i32[] = []
@@ -20872,8 +20914,9 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
   pts
 }
 
-// Appends to `bNames`/`bTys` each hole type variable every instance so far binds to one type,
-// and not already bound there; a hole two instances bind apart is left open.
+// Appends to `bNames`/`bTys` each hole type variable every instance binds to one type, and not
+// already bound there: the instances so far, else the type every call agrees on. A hole two
+// instances or two calls bind apart is left open.
 function monoOneInstHoleBinds(bNames: string[], bTys: i32[]): i32 {
   const seen: {[string]: i32} = Map()
   let r = 0
@@ -20901,6 +20944,19 @@ function monoOneInstHoleBinds(bNames: string[], bTys: i32[]): i32 {
       bNames.push(nm)
       bTys.push(t)
     }
+  }
+  // A hole no instance has bound yet takes the type every call of its function binds it to, so
+  // an instance the walk reaches later binds it too (D12940).
+  const cN: string[] = []
+  const cT: i32[] = []
+  callBindAgreedHoles(cN, cT)
+  let c = 0
+  while c < cN.length {
+    if !seen.has(cN[c]) && !monoStrListHas(bNames, cN[c]) {
+      bNames.push(cN[c])
+      bTys.push(cT[c])
+    }
+    c = c + 1
   }
   0
 }
