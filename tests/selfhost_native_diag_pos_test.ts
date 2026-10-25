@@ -191,8 +191,7 @@ Deno.test({
   name: "native-diag-pos: EMIT-stage failure anchors at the failing function's name",
   ignore: !ENABLED,
   fn: async () => {
-    // A closure whose result struct carries a nullable REF-list field
-    // (`{f: (i32 | null)[] | null}`) has no lowerable rep — the call `v(1)` inside
+    // A Map whose value is `mk(dbl)`'s record result has no map-value rep (D12340), so
     // `useIt` (line 4) fails at the EMIT stage. The diagnostic anchors at the
     // enclosing function's NAME token (`useIt`, col 8 0-based, printed 1-based as 4:10), not
     // positionless (line 0) as before — so a build/playground/LSP consumer can
@@ -203,13 +202,14 @@ Deno.test({
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
         path,
-        "function makeIt(): (i32) => {f: (i32 | null)[] | null} {\n" +
-          "  return (q0) => ({ f: [1, 2] })\n" +
-          "}\n" +
+        "function dbl(a) { return a * 2 }\n" +
+          "function mk(g) { return { f: g } }\n" +
+          "// D12340\n" +
           "function useIt() {\n" +
-          "  const v: (i32) => {f: (i32 | null)[] | null} = makeIt()\n" +
-          "  const s = v(1)\n" +
-          "  print(0)\n" +
+          "  const m = Map()\n" +
+          "  m.set(\"b\", mk(dbl))\n" +
+          "  const r = m.get(\"b\")\n" +
+          "  if r != null { print(r.f(3)) }\n" +
           "}\n" +
           "useIt()\n",
       );
