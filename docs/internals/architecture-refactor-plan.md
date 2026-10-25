@@ -602,6 +602,12 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - Gates:
     - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,824,201 → 5,824,422 bytes (+221).
     - difftree `--identity`: the fixpoint is identical, and 0 of 16,588 files differ (11,704 built).
+- **2026-10-24, D2595, D3412 and D12300 close (clause 1), and D12390 is filed (clause 2).**
+  - `mapRecvTyIn` (`emit_ty_canon.vl`) asks `nodeTyAt` for the receiver. A map built in a generic at a literal-union `T` now stores and reads its value slot at one rep. D2595's three named cells go from check-clean invalid wasm to running `n`. D3412, a map field bound in a generic at two map types, prints the atom rather than its id. The filed-witness grader found that close.
+  - D12300's filed diagnosis named the wrong read. At the instance, `cloCallSigKey` already answers the instance's key. What returned nothing was `cloArrCallRetKind` (`emit_classify.vl`), which `exprString` and its siblings ask about a call through an element. It took the return kind only from the slot's own signature key, and an instance's list of hole lambdas has none. It now falls back to `cloCallSigKey`, so the tail is a value and the instance's return is inferred from it.
+  - D12390: `??` over a generic `Map<string, T> | null` with a map default is not read as a map inside the generic (`exprNullableMap`). It is present on master.
+  - Fixtures: `closures/call-through-list-element-tail-at-hole-instance.vl`, `maps/generic-map-litunion-value-store-and-read.vl` and `maps/generic-bound-map-field-at-two-map-types.vl`. Each fails on the previous bullet's seed.
+  - `regress.vl`: 0 runs → not-runs, 0 → silent, and the 3 D2595 cells move to `runs`. The baseline is rewritten for them. Seed 5,824,422 → 5,824,454 bytes (+32).
 
 ### L2 log
 
