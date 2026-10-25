@@ -4233,8 +4233,14 @@ function fsPlanHoleRewrites(): i32 {
           } else if cks.length == 1 {
             fsRename(r, hsSlot(si, cks[0]))
           } else if cks.length == 0 && qi >= 0 {
+            // A key of the elements' list that no element this call reaches calls is handed
+            // the first slot, which nothing there calls (D13520).
             const names: string[] = []
-            for qk in hsKeys[qi] { names.push(hsSlot(si, qk)) }
+            for qk in hsKeys[qi] {
+              names.push(
+                if eqs.length > 0 && !hasStr(ks, qk) { "" } else { hsSlot(si, qk) },
+              )
+            }
             fsHoleHandOut(c, r, names, hsSlotNames(qi))
           } else if cks.length == 0 {
             let dk = fsFixedDeliveryKey(r, q)
@@ -5038,9 +5044,9 @@ let clLet: {[string]: i32} = Map()
 let clNeed: {[string]: boolean} = Map()
 let clMissed: string[] = []
 
-// An un-annotated, unexported `let` that no `=` anywhere writes by name, holding a lambda or a
-// name that is a function for good, is spelled `const`, so every reader that follows a `const`
-// to a function follows it too (D6472).
+// An un-annotated, unexported `let` that no `=` anywhere writes by name, holding a lambda, a
+// name that is a function for good, or a list literal of those, is spelled `const`, so every
+// reader that follows a `const` to a function or its list follows it too (D6472, D13521).
 function fsConstLets(): i32 {
   const cands: i32[] = []
   const names: string[] = []
@@ -5084,6 +5090,12 @@ function fsConstLets(): i32 {
       fresh.push(cd.letName)
       const v = nodeAt(fsParenPeel(cd.letInit))
       if v is Ident { fresh.push(v.identName) }
+      if v is ArrayLit {
+        for e in v.arrElems {
+          const en = nodeAt(fsParenPeel(e))
+          if en is Ident { fresh.push(en.identName) }
+        }
+      }
     }
   }
   let alive: i32[] = []
@@ -5126,12 +5138,23 @@ function fsConstAlive(cands: i32[]): i32[] {
     if (
       n is LetDecl
       && !(clWritten[n.letName] ?? false)
-      && fsFixedFnValue(n.letInit, 0)
+      && (fsFixedFnValue(n.letInit, 0) || fsFixedFnList(n.letInit))
     ) {
       out.push(c)
     }
   }
   out
+}
+
+// Whether `v` is a non-empty list literal whose every element `fsFixedFnValue` fixes.
+function fsFixedFnList(v: i32): boolean {
+  const n = nodeAt(fsParenPeel(v))
+  if !(n is ArrayLit) || n.arrElems.length == 0 { return false }
+  let ok = true
+  for e in n.arrElems {
+    if !fsFixedFnValue(e, 0) { ok = false }
+  }
+  ok
 }
 
 // Records the `=` writes, declaration count and declaring node of each name in `fresh` not yet
@@ -5165,8 +5188,22 @@ function clRecord(
   0
 }
 
-// Whether `fsFixedFnValue` of `v` can hold: `v` is a lambda or a name, parentheses aside.
+// Whether `fsFixedFnValue` of `v`, or `fsFixedFnList`, can hold: `v` is a lambda, a name or a
+// non-empty list literal of those, parentheses aside.
 function fsMayHoldFixedFn(v: i32): boolean {
+  const x = fsParenPeel(v)
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if !(n is ArrayLit) { return fsMayBeFixedFn(x) }
+  if n.arrElems.length == 0 { return false }
+  for e in n.arrElems {
+    if !fsMayBeFixedFn(e) { return false }
+  }
+  true
+}
+
+// Whether `v` is a lambda or a name, parentheses aside.
+function fsMayBeFixedFn(v: i32): boolean {
   const x = fsParenPeel(v)
   if x < 0 || x >= P.nodes.length { return false }
   const n = nodeAt(x)
