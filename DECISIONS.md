@@ -3863,8 +3863,8 @@ refused whether its element changes storage (`i32[]` into `f64[]`, which would b
 or keeps it (`C[]` into `(C | null)[]`, which would share the list and let a `null` reach the
 `C[]`, D2161), and the refusal says so and names both fixes: declare the destination
 `readonly (C | null)[]` for a read-only view, or copy with `.map((x): C | null => x)`. The
-`.map` copy is not offered for a nullable union-arm or nullable-list element, which `.map` cannot
-build yet (D2193).
+`.map` copy is not offered for a nullable-list element, which `.map` cannot build yet (D12901);
+a nullable union-arm element took the copy when D2193 closed.
 
 **A `readonly` destination keeps the converting copy for now.** `i32[]` into `readonly f64[]`
 and `Circle[]` into `readonly Shape[]` still lower as the D965/D791 element-converting copy,
