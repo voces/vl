@@ -680,6 +680,17 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - `regress.vl`: 0 runs → not-runs, 0 → silent, no cell changed class.
     - Filed witnesses `--strict`: 3,826 graded, 3,826 as filed, 0 MOVED, 0 not graded.
     - difftree `--identity`: the fixpoint is identical, and 8 of 16,632 files differ (11,742 built). They are the eight new fixtures, which master refuses at emit.
+- **2026-10-25, D12700 (clause 1), D10792, D12703 and D12705 (clause 2) close, and D12800 is filed.**
+  - D12700: a value pushed or index-written into an un-annotated `const` list literal kept the instance its function was first taken at, so a loop over that list called the wrong signature and trapped. Those values are now part of the list's elements (`monoListStores`, noted by `monoLetWritesExtend`; read by `monoConstListElems`, `emit_mono.vl`), so they are instanced at the list's own call type. Writes through a `const` alias and inside a function count too (`monoConstListBase`).
+  - D10792: a `.push` statement onto an asked list is repeated on every copy (`fsListPushRead`, `fsApplyPushMirror`, `fn_split.vl`). An element choosing by a condition that calls runs that condition once, before the list, as an arm index that the list and each copy select the element by (`fsApplyListHoist`, `fsListHoistSelect`), so the condition runs once, as written.
+  - D12703: a loop that names its index starts its body with a `const` copy of the index, and a call at another type reads its copy of the list there, so a binding in the body that shadows the index cannot capture it (`fsLoopIndexCopy`). D12705: `fsLoopLanes` no longer declines a closure between the call and the loop; the closure captures the index as it captures the variable, including when it escapes the loop.
+  - Open: D12701 and D12702 are a generic forwarded through a frame and an `inner` instanced at two value types. They share no mechanism with these. D12704 (`const f = fs[i]` called twice) would need the split to lane a binding of an element, not a loop variable. D12800, filed here, is a hole lambda pushed onto the list: `vl check` accepts it, then emit refuses with `call to unknown function`, while the same lambda as a literal element is a check reject.
+  - Fixtures, each failing on master's seed `a0d8dfeb8`: `closures/hole-fn-list-pushed-element-run-at-other-list-type.vl`, `…-element-written-in-function-run-at-other-list-type.vl`, `…-pushed-called-at-two-fn-types.vl` (the old `error-` pin, now a run pin), `…-pushed-in-function-through-alias-called-at-two-fn-types.vl`, `…-choice-element-with-call-called-at-two-fn-types.vl`, `…-element-called-at-two-fn-types-in-indexed-loop.vl` and `…-element-called-at-two-fn-types-in-loop-closure.vl`.
+  - Gates:
+    - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,845,674 → 5,852,338 bytes (+6,664).
+    - `regress.vl`: 0 `runs → not-runs` and 0 `→ silent`; no cell changes class.
+    - Filed witnesses `--strict` over both inventories: the four closed rows move as closed, and D12800 grades as filed.
+    - difftree `--identity` (local): 16,638 files and 11,749 built. 82 differ in bytes. Of those, 75 print the same output with the same exit code on both seeds, and the other 7 are the new fixtures, which run here and fail on master.
 
 ### L2 log
 

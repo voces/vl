@@ -44,11 +44,13 @@ import {
   i32ToStr,
   mkBinary,
   mkBlock,
+  mkCall,
   mkFieldInit,
   mkIdent,
   mkIf,
   mkIndex,
   mkLet,
+  mkMember,
   mkNum,
   mkParam,
   mkTypeRef,
@@ -139,6 +141,17 @@ let plCall: i32[] = []
 let plFor: i32[] = []
 let plList: string[] = []
 let plIdx: string[] = []
+// The `.push` statement `pmStmt` on an asked list is followed by the same push onto its copy
+// `pmList` (D10792).
+let pmStmt: i32[] = []
+let pmList: string[] = []
+// Element `lhAt` of the asked list declared by `lhDecl`, a choice whose condition calls or
+// writes, runs once before the list as arm index `lhName`, and the list and each copy select
+// that element's leaves `lhLeaves` by it (D10792).
+let lhDecl: i32[] = []
+let lhAt: i32[] = []
+let lhName: string[] = []
+let lhLeaves: string[][] = []
 // A copy of function `pfSrc` named `pfName` goes after the module statement `pfAnchor`.
 let pfSrc: i32[] = []
 let pfAnchor: i32[] = []
@@ -298,6 +311,12 @@ function fsPlanReset(): i32 {
   plFor = []
   plList = []
   plIdx = []
+  pmStmt = []
+  pmList = []
+  lhDecl = []
+  lhAt = []
+  lhName = []
+  lhLeaves = []
   fsHoleDecline()
   0
 }
@@ -1850,7 +1869,7 @@ export function fsPlan(root: i32): i32 {
 // Each asked list (`fsAskList`) takes a `const` copy per function type its calls take past the
 // first, and each call's read of it, or of a `const` alias of it, reads its type's copy. A read
 // other than as a `for` iterable, a called element, its `.length` or an alias's value, or an
-// element other than a name or a pure choice, declines that list. 0 with a plan, 1 with none.
+// element other than a name or a choice of names, declines that list. 0 with a plan, 1 with none.
 function fsPlanLists(): i32 {
   let rc = 1
   const done: i32[] = []
@@ -1859,6 +1878,21 @@ function fsPlanLists(): i32 {
     const lanes = if d >= 0 && !hasI32(done, d) { fsListLanes(d) } else { fsNoLanes() }
     if d >= 0 { done.push(d) }
     const dn = nodeAt(if d >= 0 { d } else { a })
+    // An element whose choice calls or writes runs once, before the list, as an arm index.
+    if dn is LetDecl && lanes.length > 1 {
+      const l = nodeAt(fsParenPeel(dn.letInit))
+      if l is ArrayLit {
+        let j = 0
+        while j < l.arrElems.length {
+          if fsHoistsChoice(l.arrElems[j]) {
+            lhDecl.push(d)
+            lhAt.push(j)
+            lhName.push(dn.letName + "$c" + i32ToStr(l.arrElems[j]))
+          }
+          j = j + 1
+        }
+      }
+    }
     let k = 1
     while dn is LetDecl && k < lanes.length {
       const copy = dn.letName + "$l" + i32ToStr(d) + "_" + i32ToStr(k)
@@ -1875,6 +1909,14 @@ function fsPlanLists(): i32 {
           prName.push(copy)
         }
         i = i + 1
+      }
+      // A push onto the list pushes the same value onto the copy.
+      for r in fsIdents {
+        const rd = identDeclOf(r)
+        if rd >= 0 && fsListBase(rd) == d && fsListPushRead(r) {
+          pmStmt.push(fsParent[fsParent[r]])
+          pmList.push(copy)
+        }
       }
       // A loop's variable called at this type reads the copy at the loop's index.
       i = 0
@@ -1908,7 +1950,9 @@ function fsListLanes(d: i32): string[] {
   const l = nodeAt(fsParenPeel(dn.letInit))
   if !(l is ArrayLit) { return none }
   for e in l.arrElems {
-    if !(nodeAt(e) is Ident) && !fsPureChoice(e, 0) { return none }
+    if !(nodeAt(e) is Ident) && !fsPureChoice(e, 0) && !fsHoistsChoice(e) {
+      return none
+    }
   }
   for r in fsIdents {
     const rd = identDeclOf(r)
@@ -1917,6 +1961,7 @@ function fsListLanes(d: i32): string[] {
       && fsListBase(rd) == d
       && !fsListReadCopies(r)
       && !fsListAliasRead(r)
+      && !fsListPushRead(r)
     ) {
       return none
     }
@@ -1947,13 +1992,13 @@ function fsListReadKey(r: i32): string {
 }
 
 // Pushes onto `lanes` the types the calls through the variable of the `for` loop that iterates
-// list read `r` take, when `r` is that loop's iterable, the loop names no index, and every read
-// of the variable is a call in the loop's own function, each recorded one at one type (D10791).
+// list read `r` take, when `r` is that loop's iterable and every read of the variable is a call
+// in the loop's own function, each recorded one at one type (D10791, D12703).
 function fsLoopLanes(r: i32, lanes: string[]): boolean {
   const p = fsParent[r]
   if p < 0 { return false }
   const pn = nodeAt(p)
-  if !(pn is ForIn) || pn.fiIter != r || pn.fiVar2 != "" { return false }
+  if !(pn is ForIn) || pn.fiIter != r { return false }
   for x in fsIdents {
     const xn = nodeAt(x)
     if (
@@ -1963,7 +2008,7 @@ function fsLoopLanes(r: i32, lanes: string[]): boolean {
       && xn.identName == pn.fiVar
     ) {
       const c = fsParent[x]
-      if c < 0 || !fsCallsVia(c, x) || fsFnBetween(c, p) { return false }
+      if c < 0 || !fsCallsVia(c, x) { return false }
       let i = 0
       while i < fcCallee.length && fcCallee[i] != x { i = i + 1 }
       // A call not yet met keeps the list's own instance until a later round notes it.
@@ -1984,22 +2029,32 @@ function fsApplyLoopLane(i: i32): i32 {
   const c = nodeAt(plCall[i])
   const l = nodeAt(plFor[i])
   if !(c is Call) || !(l is ForIn) || c.callFn < 0 { return -1 }
-  if l.fiVar2 == "" { l.fiVar2 = plIdx[i] }
-  if l.fiVar2 != plIdx[i] { return -1 }
   P.pos = nodeToks[plCall[i]] + 1
   const pos = nodeAt(c.callFn).pos
+  if l.fiVar2 == "" { l.fiVar2 = plIdx[i] }
+  if (
+    l.fiVar2 != plIdx[i]
+    && fsLoopIndexCopy(l.fiBody, l.fiVar2, plIdx[i], pos) < 0
+  ) {
+    return -1
+  }
   c.callFn = mkIndex(mkIdent(plList[i], pos), mkIdent(plIdx[i], pos), pos)
   0
 }
 
-// Whether a function lies between parse node `x` and its ancestor `top`.
-function fsFnBetween(x: i32, top: i32): boolean {
-  let c = fsParent[x]
-  while c >= 0 && c != top {
-    if nodeAt(c) is FuncDecl { return true }
-    c = fsParent[c]
+// Makes loop body `body` start with `const copy = idx`, so a lane reads the loop's own index
+// under a name the body cannot shadow; once per body. -1 when the body holds no statements.
+function fsLoopIndexCopy(body: i32, idx: string, copy: string, pos: i32): i32 {
+  const bn = nodeAt(body)
+  if !(bn is Block) { return -1 }
+  if bn.blkStmts.length > 0 {
+    const s0 = nodeAt(bn.blkStmts[0])
+    if s0 is LetDecl && s0.letName == copy { return 0 }
   }
-  false
+  const out: i32[] = [mkLet("const", copy, -1, mkIdent(idx, pos), pos)]
+  for s in bn.blkStmts { out.push(s) }
+  bn.blkStmts = out
+  0
 }
 
 function fsNoLanes(): string[] {
@@ -2047,6 +2102,86 @@ function fsListReadCopies(r: i32): boolean {
   if !(pn is Index) || pn.idxArr != r { return false }
   const c = fsParent[p]
   c >= 0 && fsCallsVia(c, p)
+}
+
+// Whether list read `r` is the receiver of a `.push` statement whose arguments are each a name
+// or a pure choice of names, so that pushing them again onto a copy pushes the same functions.
+function fsListPushRead(r: i32): boolean {
+  const m = fsParent[r]
+  if m < 0 { return false }
+  const mn = nodeAt(m)
+  if !(mn is Member) || mn.memObj != r || mn.memProp != "push" { return false }
+  const c = fsParent[m]
+  if c < 0 || !fsCallsVia(c, m) { return false }
+  const s = fsParent[c]
+  if s < 0 || !hasI32(fsStmtsOf(s), c) { return false }
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callArgs.length == 0 { return false }
+  for a in cn.callArgs {
+    if !(nodeAt(fsParenPeel(a)) is Ident) && !fsPureChoice(a, 0) {
+      return false
+    }
+  }
+  true
+}
+
+// Applies `pmStmt[i]`: the same push onto copy `pmList[i]` follows it. -1 when it is no push.
+function fsApplyPushMirror(i: i32): i32 {
+  if i < 0 || i >= pmStmt.length || i >= pmList.length { return -1 }
+  const c = nodeAt(pmStmt[i])
+  if !(c is Call) { return -1 }
+  P.pos = nodeToks[pmStmt[i]] + 1
+  const pos = c.pos
+  const args: i32[] = []
+  for a in c.callArgs {
+    const v = fsValueNode(fsParenPeel(a), "")
+    if v < 0 { return -1 }
+    args.push(v)
+  }
+  P.pos = nodeToks[pmStmt[i]] + 1
+  const call = mkCall(mkMember(mkIdent(pmList[i], pos), "push", pos), args, pos)
+  fsInsertAfter(pmStmt[i], call)
+}
+
+// Applies hoist `i`: the element's choice, its leaves numbered, becomes the `const` arm index
+// `lhName[i]` before the list, and the element selects its leaves by it. -1 when it cannot.
+function fsApplyListHoist(i: i32): i32 {
+  const names: string[] = []
+  lhLeaves.push(names)
+  if i < 0 || i >= lhDecl.length || i >= lhAt.length || i >= lhName.length {
+    return -1
+  }
+  const d = nodeAt(lhDecl[i])
+  if !(d is LetDecl) { return -1 }
+  const l = nodeAt(fsParenPeel(d.letInit))
+  if !(l is ArrayLit) || lhAt[i] >= l.arrElems.length { return -1 }
+  const c = l.arrElems[lhAt[i]]
+  if c < 0 || c >= nodeToks.length { return -1 }
+  P.pos = nodeToks[c] + 1
+  const pos = nodeAt(c).pos
+  if fsNumberLeaves(c, names, 0) < 0 { return -1 }
+  const sel = fsSelectArm(lhName[i], names, pos)
+  if sel < 0 { return -1 }
+  l.arrElems[lhAt[i]] = sel
+  fsInsertBefore(lhDecl[i], mkLet("const", lhName[i], -1, c, pos))
+}
+
+// Makes copy `v` of the list declared by `a` select each hoisted element by its arm index, as
+// the list does. -1 when `v` is not a list holding that element.
+function fsListHoistSelect(a: i32, v: i32): i32 {
+  let i = 0
+  while i < lhDecl.length {
+    if lhDecl[i] == a {
+      if v < 0 || i >= lhLeaves.length { return -1 }
+      const l = nodeAt(v)
+      if !(l is ArrayLit) || lhAt[i] >= l.arrElems.length { return -1 }
+      const sel = fsSelectArm(lhName[i], lhLeaves[i], l.pos)
+      if sel < 0 { return -1 }
+      l.arrElems[lhAt[i]] = sel
+    }
+    i = i + 1
+  }
+  0
 }
 
 // Plans the asks other than lists; 0 with a plan, 1 when there is nothing it can split.
@@ -4936,6 +5071,11 @@ function fsApply(): i32 {
     i = i + 1
   }
   i = 0
+  while i < pmStmt.length {
+    if rc == 0 { rc = fsApplyPushMirror(i) }
+    i = i + 1
+  }
+  i = 0
   while i < psPar.length {
     const p = nodeAt(psPar[i])
     const f = nodeAt(psFn[i])
@@ -5040,6 +5180,11 @@ function fsApply(): i32 {
     i = i + 1
   }
   i = 0
+  while i < lhDecl.length {
+    if rc == 0 { rc = fsApplyListHoist(i) }
+    i = i + 1
+  }
+  i = 0
   while i < pdAnchor.length {
     if rc == 0 {
       const a = pdAnchor[i]
@@ -5053,6 +5198,7 @@ function fsApply(): i32 {
         if v < 0 { v = -2 }
       } else {
         v = fsValueNode(pdValSrc[i], pdValName[i])
+        if fsListHoistSelect(a, v) < 0 { v = -2 }
       }
       let ty = -1
       // A lane of a binding whose type parameter is stripped is un-annotated too (D6761).

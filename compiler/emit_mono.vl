@@ -20701,30 +20701,38 @@ function monoPushArmValues(v: i32, out: i32[]): boolean {
 }
 
 // The elements of list literal `v`, or of the un-annotated `const` one `v` names, through
-// further such `const`s naming it (D7844); empty otherwise.
+// further such `const`s naming it (D7844), and the function names the program stores into that
+// `const`'s list (D12700); empty otherwise.
 function monoConstListElems(v: i32): i32[] {
   const none: i32[] = []
-  let lx = unwrapParen(v)
+  const lx = unwrapParen(v)
   if lx < 0 || lx >= P.nodes.length { return none }
-  const seen: i32[] = []
-  while nodeAt(lx) is Ident {
-    const d = identDeclOf(lx)
-    if d < 0 || d >= P.nodes.length || i32ListHas(seen, d) { return none }
-    seen.push(d)
-    const dn = nodeAt(d)
-    if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 {
-      return none
-    }
-    lx = unwrapParen(dn.letInit)
-    if lx < 0 || lx >= P.nodes.length { return none }
-  }
-  const l = nodeAt(lx)
+  const b = monoConstListBase(lx)
+  const ln = if b >= 0 { nodeAt(b) } else { nodeAt(lx) }
+  const l = if ln is LetDecl { nodeAt(unwrapParen(ln.letInit)) } else { ln }
   if !(l is ArrayLit) { return none }
   const out: i32[] = []
   for e in l.arrElems {
     if !monoPushArmValues(e, out) { return none }
   }
+  if b >= 0 {
+    monoLetWritesExtend()
+    for s in monoListStores.get(monoDeclCanon(b)) ?? none {
+      const vals: i32[] = []
+      if monoPushArmValues(s, vals) && monoAllIdents(vals) {
+        for x in vals { out.push(x) }
+      }
+    }
+  }
   out
+}
+
+// Whether every node of `xs` is an identifier.
+function monoAllIdents(xs: i32[]): boolean {
+  for x in xs {
+    if !(nodeAt(x) is Ident) { return false }
+  }
+  true
 }
 
 // The function type a call through each list or join element node coerces it to, by node.
@@ -25162,6 +25170,9 @@ let monoDeclWrites: {[i32]: i32[]} = Map()
 let monoCellWrites: {[i32]: i32[]} = Map()
 let monoFieldWrites: {[i32]: i32[]} = Map()
 let monoElemWrites: {[i32]: i32[]} = Map()
+// The values stored into an un-annotated `const` list literal, by the declaration
+// (`monoDeclCanon`) holding the literal: `.push` arguments and `d[k] = v` values.
+let monoListStores: {[i32]: i32[]} = Map()
 let monoLetWritesSeen = 0
 // Every declaration written, in the order of its first write: `d` for `monoDeclWrites`, `-1 - d`
 // for `monoCellWrites`.
@@ -25204,12 +25215,48 @@ function monoLetWritesExtend() {
           }
         }
         monoElemWriteNote(wn.binLeft, i)
+        if tg is Index { monoListStoreNote(tg.idxArr, wn.binRight) }
+      }
+    } else if wn is Call && wn.callFn >= 0 {
+      const cf = nodeAt(wn.callFn)
+      if cf is Member && cf.memProp == "push" {
+        for a in wn.callArgs { monoListStoreNote(cf.memObj, a) }
       }
     }
     i = i + 1
   }
   monoLetWritesSeen = P.nodes.length
   0
+}
+
+// Banks value `v` stored into list `recv` in `monoListStores` when `recv` names, through
+// un-annotated `const` aliases, the `const` a list literal initializes.
+function monoListStoreNote(recv: i32, v: i32) {
+  const b = monoConstListBase(recv)
+  if b < 0 { return 0 }
+  const k = monoDeclCanon(b)
+  const wl = monoListStores.get(k) ?? []
+  wl.push(v)
+  monoListStores.set(k, wl)
+  0
+}
+
+// The un-annotated `const` holding the list literal `v` names through further such `const`s, or
+// -1 when `v` names none.
+function monoConstListBase(v: i32): i32 {
+  let lx = unwrapParen(v)
+  let hops = 0
+  let d = -1
+  while lx >= 0 && lx < P.nodes.length && nodeAt(lx) is Ident && hops < 16 {
+    d = identDeclOf(lx)
+    if d < 0 || d >= P.nodes.length { return -1 }
+    const dn = nodeAt(d)
+    if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
+    lx = unwrapParen(dn.letInit)
+    hops = hops + 1
+  }
+  if lx < 0 || lx >= P.nodes.length || !(nodeAt(lx) is ArrayLit) { return -1 }
+  d
 }
 
 // Banks write `i` to target `lhs` in `monoElemWrites` when `lhs` is `d[k]`: `d[0] = v` counts
@@ -28478,6 +28525,7 @@ export function monomorphize(stmts: i32[]) {
   monoCellWrites = Map()
   monoFieldWrites = Map()
   monoElemWrites = Map()
+  monoListStores = Map()
   monoLetWritesSeen = 0
   monoLetWritesExtend()
   // The index follows the table it answers for, at the write and not at a build point:
