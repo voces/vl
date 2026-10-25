@@ -1552,6 +1552,48 @@ What each slice changes:
       reads by node), held per site. With it, these readers could look up by type. Without
       it, a mint or lookup keyed by the literal's arena type cannot answer both sites. The
       census and the render-parse budget do not move.
+  - L2 stage 7 at d0a33866f is a probe record only, with no compiler change. It tests whether
+    `arrRefSlotOf` can take its row from a type each arm of `arrLitElemNameIn` resolves,
+    built from tables the emitter already keeps rather than a new per-node one.
+    - The probe was taken over the self-compile and 16,798 files, with 0 uncompared. 1,403
+      files reach the site (2,400 events).
+    - `arrLitElemHintTy` alone answers in 649 files and disagrees in 2. It declines in 794
+      files (1,309 events). The declined arms are mostly map-element lists, hole closures,
+      nested scalar lists, nullable elements, `#anon` rows and union arms.
+    - The typed side, built up one arm at a time:
+      - the frame's element type (`arrLitFrameRefTy`), else the hint, else the delivered
+        element type (`nodeRepTyIxOf`); 196 files differ (321 events);
+      - plus the closure rule from `nodeArrayElemName`: the hole's pin, else the stub
+        `() => void` for a signature with a type variable; 43 files (58 events);
+      - plus the object element's struct row (`sTyIx`, including `#anon` rows), else its
+        arm's row (`uVarTyIx`), except where the nullable-element arm applies; 27 files
+        (40 events);
+      - plus the stub when the pin itself renders nothing; 19 files (25 events).
+      Map-element lists, the largest declined class, agree with the delivered type in every
+      file. Reading the element type from `arrLitElemTyIn` instead of `nodeRepTyIxOf` gives
+      20 files (26 events).
+    - No reader moves, because 19 files still differ. They fall into seven classes, and no one
+      rule closes more than one of them:
+      - Delivery rows, 7 files: the name follows the destination (`Yl`, `Circle`, `#anon0`,
+        `#anon1`, `{x:i32}[]`, `(f64|K[])[]`). The literal's own type names another row
+        (`Yf`, `{r:i32}`, `{f:(i32)=>i32}`, `A[]`, `K[]`). This is stage 6's wall.
+      - A nested list whose name is the `i32[]` fallback while the element type is `string`,
+        `boolean`, `K[]` or `f64[]`, 4 files (the `bool-…-key-apart`, `one-list-member-…` and
+        `typaram-list-union-…` fixtures).
+      - `Set<string>` and `Set<i32>` elements, 2 files: the name is `{[K]:boolean}`, and no
+        row is keyed by the `Set` type.
+      - Literal-typed signatures, 2 files: `() => "ab"` against the widened `(()=>string)`.
+      - Generic signatures inside an instance, 2 files: `(LI$m…) => LI$m…` against the
+        name's `((string)=>LI$m…)`.
+      - Duplicate `AB` rows of one intersection, 2 files: the two answers name two rows with
+        the same name.
+      - A tagged union with `null` and no typed row, 1 file
+        (`inferred-return-lone-literal-arm.vl`).
+    - The next step is still the per-site delivery. The other six classes each need their own
+      type rule (literal widening inside a signature, a `Set` row keyed by type, the nested
+      fallback's real leaf). Until all seven agree, `arrRefSlotOf` keeps the name, and the
+      `let` tail and `refListSlotOfExpr` have more disagreements than it does. The census and
+      the render-parse budget do not move.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
