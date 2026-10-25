@@ -631,7 +631,12 @@ import {
 // names)` and registered before the body is walked so a recursive self-call at the
 // same shape hits the registry.
 
-import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import {
+  i32ListHas,
+  i32ListIndexOf,
+  strListHas,
+  strListIndexOf,
+} from "./listutil"
 import { strContains } from "./strutil"
 import {
   flattenVariantsInto,
@@ -20611,13 +20616,15 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     if pts.length != n.callArgs.length { return 0 }
     rows.push(pts)
   }
-  // A parameter an element never reads takes the type a sibling's calls give it.
+  // A parameter an element never reads takes the type a sibling's calls give it, else the type
+  // another position handed the same read takes, since the two hold one value (D13200).
   let j = 0
   while j < n.callArgs.length {
     let fill = -1
     for pts in rows {
       if pts[j] >= 0 { fill = pts[j] }
     }
+    if fill < 0 { fill = monoSameReadArgTy(n.callArgs, rows, j) }
     if fill < 0 { return 0 }
     for pts in rows {
       // arena-tick exempt: a local list of parameter types, not an arena row.
@@ -20685,6 +20692,26 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
   }
   nodeTyRecord(n.callFn, ft)
   1
+}
+
+// The type some element takes at a position other than `j` whose argument reads the declaration
+// `args[j]` reads, or -1.
+function monoSameReadArgTy(args: i32[], rows: i32[][], j: i32): i32 {
+  const ax = unwrapParen(args[j])
+  if ax < 0 || ax >= P.nodes.length || !(nodeAt(ax) is Ident) { return -1 }
+  const d = identDeclOf(ax)
+  if d < 0 { return -1 }
+  let k = 0
+  while k < args.length {
+    const kx = unwrapParen(args[k])
+    if k != j && kx >= 0 && nodeAt(kx) is Ident && identDeclOf(kx) == d {
+      for pts in rows {
+        if pts[k] >= 0 { return pts[k] }
+      }
+    }
+    k = k + 1
+  }
+  -1
 }
 
 // Whether callee `c` is a `for` variable over a list literal written in the loop's header, so
@@ -23004,6 +23031,95 @@ function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32, ctx: i32): i32 {
   bt
 }
 
+// The pin for named generic `args[i]` handed to hole `params[i]` of `fn` that the body only
+// calls directly, at one argument type list: the generic instanced at those types read in frame
+// `ctx`, where the checker's binding stays open on the caller's own holes (D13260). "" otherwise.
+function monoHoleGenFnFramePin(
+  fn: FuncDecl,
+  params: i32[],
+  args: i32[],
+  i: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  const ax = unwrapParen(args[i])
+  if ax < 0 || !(nodeAt(ax) is Ident) || !monoCalleeIsGeneric(ax) { return "" }
+  const vt = nodeTyIxOf(ax)
+  if vt < 0 || vt >= T.tys.length || !tyHasTyVar(vt) { return "" }
+  const vf = tyAt(vt)
+  if !(vf is TyFunc) { return "" }
+  const ps = monoHoleFrameCallTys(fn, params, args, i, ctx)
+  if ps.length != vf.fnParamTypes.length || ps.length == 0 { return "" }
+  const gN: string[] = []
+  const gT: i32[] = []
+  let j = 0
+  while j < ps.length {
+    bindGenWalk(vf.fnParamTypes[j], ps[j], gN, gT)
+    j = j + 1
+  }
+  const inst = substTyDeep(vt, gN, gT)
+  if !monoTyConcreteFn(inst) { return "" }
+  const bt = genFnHoleBodyRet(vt, inst)
+  if !monoTyConcreteFn(bt) { return "" }
+  monoFnPinAt(args[i], ctx, bt, -1, tyOut)
+}
+
+// The closed argument types every call of hole `params[i]` in `fn`'s body takes, a read of one
+// of `fn`'s parameters typed by its argument in `args` inside frame `ctx`. Empty where a call's
+// argument stays open or is a literal, two calls disagree, or the hole is read other than as a
+// callee.
+function monoHoleFrameCallTys(
+  fn: FuncDecl,
+  params: i32[],
+  args: i32[],
+  i: i32,
+  ctx: i32,
+): i32[] {
+  const none: i32[] = []
+  let out: i32[] = []
+  let seen = false
+  const stack: i32[] = [fn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const n = nodeAt(ix)
+    if n is Ident && identDeclOf(ix) == params[i] { return none }
+    let callsHole = false
+    if n is Call {
+      const cf = unwrapParen(n.callFn)
+      callsHole = cf >= 0 && nodeAt(cf) is Ident && identDeclOf(cf) == params[i]
+    }
+    if n is Call && callsHole {
+      const tys: i32[] = []
+      for a in n.callArgs {
+        const ex = unwrapParen(a)
+        if ex < 0 { return none }
+        let t = -1
+        const k = if nodeAt(ex) is Ident { i32ListIndexOf(params, identDeclOf(ex)) } else { -1 }
+        if k >= 0 && k < args.length {
+          t = monoArgClosedTyIn(args[k], ctx, -1)
+        } else {
+          t = nodeTyIxOf(ex)
+        }
+        if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyHasLitDeep(t, 8) {
+          return none
+        }
+        tys.push(t)
+        stack.push(a)
+      }
+      if !seen {
+        out = tys
+        seen = true
+      } else if !monoI32sSame(out, tys) {
+        return none
+      }
+    } else {
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  out
+}
+
 // Whether parameter `pIx` of `fn`, handed the parameter read `argIx` pinned at function type
 // `pinTy`, is called in `fn`'s body with a closed argument the pin's parameter does not take, as
 // a recursion handing two such parameters back in swapped positions does (D6202).
@@ -23894,6 +24010,11 @@ function monoPinHoleParam(
     if an == "" && monoHoleGenTwoPins {
       return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
     }
+  }
+  if an == "" {
+    const frTy: i32[] = [0 - 1]
+    an = monoHoleGenFnFramePin(fn, params, args, i, ctx, frTy)
+    if an != "" { anTy = frTy[0] }
   }
   if an == "" {
     const cpTy: i32[] = [0 - 1]
