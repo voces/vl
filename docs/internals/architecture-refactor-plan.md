@@ -629,6 +629,18 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - Gates:
     - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,827,701 → 5,828,036 bytes (+335).
     - difftree `--identity` against master's seed: 0 of 16,594 files differ (11,711 built), and the fixpoint is identical.
+- **2026-10-24, the six reads whose bank answer changes the module ask the bank. D4088, D4132 (clause 1) and D3311 (clause 2) close, and D12520 is filed (clause 2).** Each read was moved alone and the difftree ran over all 16,594 files. 8 files change, and every one prints the same output. For each, the instance's module was compared with the annotated face of the same program.
+  - `coalesceOfNulMapIsMap` (both reads): no module changes. It moves for agreement with its sibling `exprNullableMap`. D12390 still fails before the read is asked.
+  - `pushIndexMapNullNarrow`: `literal-unions/coalesce-hole-join-arg.vl` and the three `d3127_r2_g1_*_call_hole` named cells add 1 byte each, a `ref.as_non_null` on the map cell read in the `!= null` branch. The instance's module is the same as the one for `function use(p: R)`, so the bank is right.
+  - `emitRecordFitIs`: `generics/pin-exact-key-record-member-order.vl` adds 26 bytes, the `a == 1 || a == 2` field test, because its instance binds `L` to `{a: i32}`. On the generic's open type the rung found no field to test. So `l<L>(u: L | null) { u is {a: 1 | 2} }` at an `{a: i32}` holding `1` answered `false` where the annotated face answers `true`. That closes D4088 and D4132, the same mechanism filed twice. The is-is-structural ruling (D3885) decides the right answer.
+  - `emitIs`'s tautology test (`isOpTy`; the tested type `isTsTy` is the written one): `generics/pin-exact-key-set-and-its-map.vl` loses 6 bytes, a null test inside a `match`'s `_` arm, where the instance's type is already non-null. `unions/inferred-string-list-is-atom-list.vl` loses 86 bytes, the element loop of `a is K[]` in an instance whose list is `K[]`. Probes at `null` and at a list outside `K` keep their answers. It also closes D3311: at the instance a hole bound from a union member's field read is that member, so `q is O` is the tautology rather than a union-tag read. D12520 is the complement: `q is P` at the same instance can never match, and it still reaches the union-tag rung and refuses. The annotated face refuses it at check time.
+  - `ifJoinAdaptsScalar` (both reads): the `pn` read changes nothing. The leaf read makes `generics/annotated-join-coalesce-at-pin.vl` 9 bytes larger, because the `A | B | null` join at an `f64` pin boxes in each arm. That is the module the annotated `f64 | null` spelling builds, so the bank is right here too.
+  - No read stays. The by-design groups are listed in the previous bullet.
+  - Fixtures: `generics/record-field-literal-is-at-generic-instance.vl` and `unions/is-member-over-hole-bound-from-field-read.vl`. Each fails on the previous bullet's seed.
+  - Gates:
+    - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,828,036 → 5,828,065 bytes (+29).
+    - `regress.vl`: 0 runs → not-runs, 0 → silent, no cell changed class.
+    - Filed witnesses `--strict`: D3311, D4088 and D4132 moved to `runs`, and they are re-graded closed.
 
 ### L2 log
 
