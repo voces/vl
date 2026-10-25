@@ -1470,6 +1470,50 @@ What each slice changes:
       resolved type and an object literal's row by its destination.
     - The census does not move (53 renders, 89 parses), since no moved line parsed. difftree
       `--identity`: 0 of 16,680 files differ (11,788 built), and the fixpoint identity holds.
+  - L2 stage 5 at ca7a4730e is a probe record only, with no compiler change. It tests whether
+    a hole-function list's row can be found by type.
+    - The probe was taken over the self-compile and 16,792 files, with 0 uncompared. Three
+      sites ran the by-name pick beside `rlSlotOfTyOrTwin`:
+      - `refListSlotOfExpr` (`rlx`)
+      - `letRefListSlot`'s tail (`let`)
+      - `wasmEmit`'s `arrRefSlotOf` (`arr`)
+    - First, the typed side was given the function-row name's own rule from
+      `nodeArrayElemName`'s `TyFunc` arm:
+      - a renderable signature stays as it is;
+      - else the signature at its hole's pin (`pinResolvedFnTy`, D1794);
+      - else, for a signature that still holds a type variable, the stub `() => void` (D4123).
+      Differing files of reaching files, before and after:
+      - `let`: 210 to 123 of 2,427 (events 1,279 to 711)
+      - `rlx`: 294 to 212 of 4,506 (events 10,775 to 6,985)
+      - `arr`: 189 to 108 of 1,400 (events 300 to 125)
+    - No site agrees everywhere, so no reader moves. The mint is not changed either. One hole
+      type maps to different rows at different sites. Examples:
+      - `(T) => T` is `((i32)=>i32)` at one call of a list of `id` and the stub at another
+        (D10082).
+      - `(U) => void` is the instance's `((i32)=>void)` or `((boolean)=>void)`.
+      So no single row keyed by the arena type can answer both. The name carries the site's
+      own resolution: a binding's stored row, a frame pin, or a sibling's type. A type-keyed
+      reader would first need that per-site type, not a different mint.
+    - What remains, from up to three examples per differing file:
+      - `rlx`: hole types (241 of 315 examples), almost all of the shape above. The rest are
+        set-as-map (`Set<string>` read as `{[string]:boolean}`), literal and narrowed element
+        types (`N | null`, `f64 | 2`, `{kind: string, …}`), and declared or layout twins.
+      - `arr`: no hole types are left. Of 115 examples, 87 are a struct-union element list.
+        There the name reads the destination's arm row (`Circle`, `Dot`) and the literal
+        holds its own shape (`{r: null}`, `{r: i32}`, or the union of both arms). This is the
+        object class.
+      - `arr`, the remainder:
+        - 9 written-let closures called in two instances, where the name keeps the template's
+          stub and the type is the instance's `(i32) => void`
+        - 5 literal-typed signatures (`() => "ab"` against `(()=>string)`)
+        - 4 `#anon` rows minted from a hole record (`{f: (_) => _}`) whose reader holds the
+          resolved `{f: (i32) => i32}`
+      - `let`: the same classes, at 13 hole, 7 `#anon`, 9 stub and 5 literal examples. The
+        other 99 are mostly (88) the destination-row object class.
+    - D7846's witness still grades `runs` as filed.
+    - The next step is the object class at `arr`. Build a struct-union list literal at the
+      destination's arm row by type, so the literal's own shape is never the key. The function
+      class waits on the per-site type.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
