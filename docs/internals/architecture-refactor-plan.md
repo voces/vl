@@ -837,6 +837,22 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - `difftree.sh --identity`: fixpoint identical, 2 of 16,591 files differ (11,705 built, 0 uncompared), each one an `@error` fixture of this change;
     - `regress.vl`: 0 runs → not-runs;
     - `check-filed-witnesses --strict`: 3,805 graded, all as filed.
+- 2026-10-24, the DESIGN residue: D1852, D2194, D1433, D3437, D3691 and D12467 moved to the checker; D10893 re-graded CAPABILITY and runs. Census: `docs/internals/l3-reachable-refusals-2026-10.md` §residue pass.
+  - Moved, DESIGN:
+    - `u8MixLits` refuses a spread literal joining `u8` with another element type that no destination annotation takes (D1852, and D2965 under its ruling).
+    - `noRetFnRelaysList` stops a function with no result annotation from being an inferred list origin when a returned value relays a parameter's list or a free global (D2194).
+    - A nested read off a type-variable-rooted derivation, at a place no narrowing touches, is re-asked at each pin (D1433, D3437). A bare-name object is declined, because its `else` remainder keeps no fact.
+    - A call through a binding whose writes all reach functions re-asks each one's parked casts (D3691).
+    - `T.size` with `T` named by no parameter cannot be inferred (`emit_mono.vl` 9184's site; probe `flat-layout-const-unbound-type-param` removed).
+    - A written `T | void` parameter, binding, field or result is refused, pointing to `T | null` (D12467, owner ruling; DECISIONS.md §"`void` is a real type" (d)).
+  - D10893 and D12471: a lambda judged at one generic's call bound every same-named type parameter of another (`holeBindsOnly`, D12471, filed closed). With that fixed, D10893 runs: a call of `xs[k]` through a constant list whose element `k` is a module-scope generic is typed through that element (`constListFnElemTy`). D10892, D10894 and D10895 run too. Filed open: D12472 (two elements each called with a lambda, one at two instances), D12473 (a literal-discriminant `==` on a member path, not narrowed at emit).
+  - Held at emit as floors: `emit_mono.vl` 9197 and 9207 (a flat generic row's phantom `T`, which only the monomorphizer binds; the disagreement is filed as D12470, clause 1) and `emit_sections.vl` 10209 (the `memory` export depends on `--import-memory` and emit's `memUsed`).
+  - Results against master `59cb5d9c1`:
+    - `emit-refusal-sites.vl` reads 740 before and after;
+    - seed fixpoint 5,834,394 bytes (+6,693 over its base `4e8c0207c` before the rebase);
+    - `difftree.sh --identity`: fixpoint identical, 14 of 16,611 files differ (11,721 built, 0 uncompared). Twelve are fixtures of this change. `closures/hole-fn-list-calls-at-different-types-indexed.vl` is a new module, typed through each element, and still runs. `functions/error-bare-return-with-valued-return.vl` gains the `T | null` hint;
+    - `regress.vl`: 0 runs → not-runs, no cell changed class;
+    - `check-filed-witnesses --strict`: 3,810 graded, all as filed.
 
 ### L4 log
 
