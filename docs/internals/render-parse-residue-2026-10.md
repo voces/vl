@@ -864,6 +864,13 @@ What each slice changes:
     row is filed under, the two peeled spellings, the map-value spelling, and the base name.
     They go when the inline-shape interner (`internInlineShapeTy`, `registerValueUnionNameAB`,
     `gaeEnsure`) is keyed by type.
+  - Re-probed 2026-10-24 on L6 step 6 (`internShapeDeepTy` and `internFuncTypeShapesTy` walk
+    `tyToEmitName(ty)` whenever they hold a type), not landed. The first probe's 136 `field
+    access receiver is not a struct` failures are gone, but of 6,174 `tests/cases` files 205
+    differ: 129 build a different module, 72 trap with `call stack exhausted` in the
+    `internShapeDeepTy` ↔ `internShapeArms` recursion through re-rendered arm types, 3 newly
+    refuse to emit, and 1 changes its error text. Of 10,395 `distilled/` cells 89 differ (2 from
+    rc 0 to rc 1). Entries 173, 177, 178, 181 and 182 stay.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
   already holds. Landed for 1 render and 2 parses: `elemIsLitUnion` became `tyIsLitUnion` of
   the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal
@@ -1837,7 +1844,8 @@ What each slice changes:
       lose their struct row (`field access receiver is not a struct`): `variantIndexOf` in
       `emit_atom_kinds`, `memberIsClosure` and `emitNarrowedMem` read it as a row identity.
       It moves when those ask `variantRowOfTy(narrowSlotTy(i))` first, and the closure reader
-      takes the slot's type.
+      takes the slot's type. The first half landed 2026-10-24 (L6 step 6,
+      `narrowVariantRowFor`): the three row-identity readers ask the slot's type first.
       - Measured 2026-10-23: the closure reader cannot take the type without
         `narrowedValueAtomOf` (`emit_start_block`) answering from the type too. With
         `identIsBoundClosure`, `exprIsClosure` and the callee's signature key reading the
