@@ -1441,6 +1441,35 @@ What each slice changes:
       (11 files or fewer). These are the next candidates.
     - The census does not move (54 renders, 91 parses), since no moved line parsed. difftree
       `--identity`: 0 of 16,675 files differ, and the fixpoint identity holds.
+  - L2 stage 4 at 6fa5bc493, probed over the self-compile and the test and corpus files:
+    - Done: the six sites stage 3 found agreeing now read `rlSlotOfTyOrTwin` of the type they
+      held. These are `emptyArrHoleElemSlot` and `fnRetNulRefArraySlotSid` in `emit_obj_lit_fits`
+      (the latter is what `nulRefArrayInnerSlot` in classify now calls), `fnAssignRetSlot` in
+      classify, the parameter arm of `exprEmittedRefListSlot` in `emit_value_sites`, and both
+      `synthEmptyListAnn` gates in `emit_collect`. `emptyArrHoleElemSlot` also drops its name
+      gate: in the 4,296 files where the name was "", the typed pick was -1 as well.
+    - Step 2, the expression sites, does not move. Every gated disagreement is a different
+      key, not a missing type. Counts are differing files of reaching files: the `rlx` ident
+      arm 264 of 3,922, `let` 210 of 2,427, array ref 189 of 1,400, record ref 104 of 964,
+      `emit_closure_sites` with an empty name 419 of 440. The classes:
+      - function: the row is minted under a call-resolved spelling such as `((i32)=>i32)`,
+        and the arena type still holds a hole. This is the largest class.
+      - object: a nominal or destination row against a literal shape, `#anon` rows, and
+        clone or template swaps.
+      - union and map: `i64|i32` and `{[string]:boolean}` have no row keyed by type.
+      - nullable and generic: a template against its instance.
+      Widening the literal type changed nothing. Resolving holes with `pinnedHoleTyOf` cut the
+      ident arm to 218 files (6,332 of 9,242 events) and the record arm to 97, and left the
+      array arm at 189. What remains in the ident arm is mostly function rows (263 of 315
+      example events) for hole-function lists (D7846), whose row is named by per-call
+      resolution that the pin does not reach.
+    - Step 3: the `rlSlotByNameTwin`/`rlSlotByNameK` family cannot be deleted yet. Four uses
+      stay on it: the function-return sites, the expression sites above, the constant-name
+      lookups (`string[]`, `f64[]`, `i64[]` in classify and collect), and the name gate where
+      "" means no ref list. It narrows when a hole-function list's row is minted by its
+      resolved type and an object literal's row by its destination.
+    - The census does not move (53 renders, 89 parses), since no moved line parsed. difftree
+      `--identity`: 0 of 16,680 files differ (11,788 built), and the fixpoint identity holds.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
