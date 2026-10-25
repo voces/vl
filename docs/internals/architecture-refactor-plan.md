@@ -656,6 +656,18 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - `regress.vl`: 0 runs → not-runs, 0 → silent, no cell changed class.
     - Filed witnesses `--strict`: 3,813 graded, 3,813 as filed, 0 MOVED, 0 not graded.
     - difftree `--identity`: the fixpoint is identical, and 2 of 16,616 files differ (11,726 built). They are the two new fixtures, which master refuses at emit.
+- **2026-10-25, D12472 closes (clause 2). The other per-call binding rows were re-graded and stay open.**
+  - D12472: the split plan was already right. The applied compile failed in the CHECKER, with `cannot infer a type for parameter`, because the copy of a lambda handed to `apply2`'s never-called slot took no unread default (D5934). `callFtyArgSeedTy` found the hole owner only for an identifier callee. `holeArgOwner` (`check_calls.vl`) also answers the element `xs[k]` reads in a constant list (`constListFnElemDecl`, D10893). This also fixes the by-name `const add = …` spelling and a two-parameter spelling, which master refused at check.
+  - D10700 stays open. Ablation: drop `h` → still refuses; a literal for `k` → still refuses; `for f in [apply2, apply3] { f(add, 0.5) }` at module scope → still refuses; direct calls → run. Its parts are a list call, a generic `add` handed to it, and an element that calls `g` both at `i32, i32` and at its own hole `s`. The split keys carry `_` for `s`, and the two elements split to different keys, so the list call needs `add` instanced per element and per key. That is the per-element instance D10791/D10792 also need (one list read called at two function types). It is not the unread-default mechanism.
+  - D10890 (clause 1, a `.map` over nullable records read through `ref.as_non_null`), D10891 (a `.map` over a hole instance's record list has no ref-list row) and D7080 (a labelled-block carrier made after `vl check`) each have their own mechanism, and none is touched here. The (c) literal is still blocked by the shadow disagreements the D4891 bullet counts.
+  - Fixtures:
+    - `functions/lambda-through-const-list-elements-unread-slot.vl` holds the witness and a two-lambda spelling.
+    - `functions/lambda-through-const-list-elements-unread-slot-by-name.vl` hands the lambda by name.
+    - Both fail on master's seed.
+  - Gates:
+    - `refresh-compiler.sh` twice: the fixpoint holds. Seed 5,837,446 → 5,837,384 bytes (−62).
+    - `regress.vl`: 0 runs → not-runs, 0 → silent, no cell changed class.
+    - difftree `--identity`: the fixpoint is identical, and 2 of 16,620 files differ (11,729 built). They are the two new fixtures.
 
 ### L2 log
 
