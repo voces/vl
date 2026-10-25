@@ -29,6 +29,7 @@ import {
   valueAtomKind,
 } from "./check_ty_rep"
 import {
+  RC_MAP_VAL,
   T,
   TyArray,
   TyErr,
@@ -57,20 +58,17 @@ import {
   tySame,
   tyToEmitName,
   tyToNominalName,
+  tyToNominalNameAt,
 } from "./check_types"
 import { anonLeafSupersedeOf, structIndexByName } from "./emit_atom_kinds"
 import {
-  annArrowAt,
-  annRetNameOf,
   fnLetInitOf,
   mapNameKeyKind,
   mapShapeFoldSet,
   mapValNameOf,
-  nameIsBareMap,
   nameIsF64Array,
   nameIsI64Array,
   nameIsMap,
-  normTypeAtom,
   parentLetOf,
   tyNameOf,
   unwrapParen,
@@ -268,12 +266,12 @@ import { unNameAdoptTyKeyRow, unTyKeyPushRow } from "./emit_union_tykey"
 import { variantSig } from "./emit_variant_sig"
 import { i32ListHas } from "./listutil"
 import { memoKeyNew, memoPassMoved } from "./memo"
-import { strContains } from "./strutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
-import { nameIsMapOpen, nameIsParenOpen } from "./tyname"
+import { nameIsMapOpen } from "./tyname"
 import {
   isNullTy,
   nulLitUnionPeelTy,
+  tyMapHeld,
   tyMapValOf,
   tyMapValOfHeld,
   tyPeelNul,
@@ -281,18 +279,39 @@ import {
   tyStepRet,
 } from "./tyquery"
 
-// The mv shape of a bare map spelling — `mvShapeOfValNameTys` of the map's value. One home, so
-// that getting from `{[string]: V}` to its value rep is decided once rather than at each call
-// site. This is also the one place the key enters the mv layer: every other resolver takes it
-// as an argument, so an i32-keyed map's value interns against the i32 key rep untaught.
-export function mvShapeOfMapName(mapName: string) {
-  mvShapeOfMapNameTys(mapName, -1, -1)
+// The mv-slot key of map type `mapTy`'s value as a declaration spells it: a literal union by its
+// alias, else the value's nominal name in the map-value position. "" for a non-map or a value
+// the arena cannot name, such as an unbound type parameter.
+export function mapTyMvDeclName(mapTy: i32): string {
+  const mv = tyMapValOf(mapTy)
+  if mv < 0 { return "" }
+  const lu = litUnionAliasNameOfTy(mv)
+  if lu != "" { return lu }
+  tyToNominalNameAt(mv, RC_MAP_VAL)
 }
 
-// `mvShapeOfMapName` plus the map value's arena type as the caller's node recorded it (D34).
-// It answers the arm question inside the mint, AND stands in for the row the value name would
-// resolve to: a RECURSIVE alias reaches here already rendered, so slicing its value out of the
-// spelling mints an unrolled anonymous twin of the declared type instead of finding it (D1865).
+// The mv shape of the map held as `heldTy` (bare, nullable or through a one-member alias),
+// keyed by its value's declared name and key kind. `armTy`/`valTy` are as for
+// `mvShapeOfMapNameTys`. Spelling `mapName` keys only a map whose value has no such name.
+export function mvShapeOfMapHeldTy(
+  mapName: string,
+  heldTy: i32,
+  armTy: i32,
+  valTy: i32,
+) {
+  const m = tyMapHeld(heldTy)
+  const vn = mapTyMvDeclName(m)
+  if vn == "" {
+    if mapName == "" { return -3 }
+    return mvShapeOfMapNameTys(mapName, armTy, valTy)
+  }
+  mvShapeOfMapValKey(vn, tyMapKeyKind(m), armTy, valTy)
+}
+
+// The mv shape of map spelling `mapName`, whose value's arena type the caller's node recorded as
+// `armTy` (D34). The type stands in for the row the value name would resolve to: a recursive
+// alias arrives rendered, and slicing its value out of the spelling would mint an unrolled
+// anonymous twin of the declared type instead of finding it (D1865).
 export function mvShapeOfMapNameArmTy(mapName: string, armTy: i32) {
   mvShapeOfMapNameTys(mapName, armTy, armTy)
 }
@@ -301,8 +320,18 @@ export function mvShapeOfMapNameArmTy(mapName: string, armTy: i32) {
 // `valTy` only classifies the value (whether it admits `null`), so it never changes the key a
 // slot is found or minted under. -1 when the caller holds no type.
 export function mvShapeOfMapNameTys(mapName: string, armTy: i32, valTy: i32) {
-  const ki = mapNameKeyKind(mapName)
-  const sh = mvShapeOfValNameTys(mapValNameOf(mapName), ki, armTy, armTy, valTy)
+  mvShapeOfMapValKey(
+    mapValNameOf(mapName),
+    mapNameKeyKind(mapName),
+    armTy,
+    valTy,
+  )
+}
+
+// The mv shape of a map whose value is keyed `valName` under key kind `ki`: the value's slot,
+// or the mono sentinel of `ki` for a value that needs none.
+function mvShapeOfMapValKey(valName: string, ki: i32, armTy: i32, valTy: i32) {
+  const sh = mvShapeOfValNameTys(valName, ki, armTy, armTy, valTy)
   // A mono value — i32, boolean, a literal-union atom or a nullable atom — rides the shared
   // i32 `vals` list and needs no per-value struct, so it is the `-1` string-keyed or `-4`
   // i32-keyed sentinel every value-blind classifier already reads as the mono rep.
@@ -312,7 +341,7 @@ export function mvShapeOfMapNameTys(mapName: string, armTy: i32, valTy: i32) {
 
 // The mv shape of the map type the checker recorded on node `ix` — the intern-side twin of
 // the `nodeTyIsMap` fall-through in `mapShapeOfExpr`, and the mint an un-annotated map has no
-// other route to. The rung order is `mvShapeOfMapName`'s, read off the node. Fronted with
+// other route to. The rung order is the spelling mint's, read off the node. Fronted with
 // `nodeMapValTyIx` only to find a deep declared record's slot, never to mint one.
 export function mvShapeOfMapNodeTy(ix: i32) {
   if !nodeTyIsMap(ix) { return -1 }
@@ -492,7 +521,7 @@ function mvShapeOfValNameArmTyGo(
     aUsed = true
     if nameIsMap(bare) {
       mUsed = true
-      mvShapeOfMapNameTys(bare, -1, tyMapValOfHeld(kindTy))
+      mvShapeOfMapHeldTy(bare, kindTy, -1, tyMapValOfHeld(kindTy))
     }
     // `bare`'s arena type: the value's own, or its non-null member's for a niche-nullable
     // value, and -1 where `bare` is not the spelling the find resolved.
@@ -617,7 +646,7 @@ export function rlElemMapShape(slot: i32): i32 {
   if enn != "" { en = enn }
   let ety = -1
   if slot >= 0 && slot < rlElemTyIx.length { ety = rlElemTyIx[slot] }
-  mvShapeOfMapNameTys(en, -1, tyMapValOfHeld(ety))
+  mvShapeOfMapHeldTy(en, ety, -1, tyMapValOfHeld(ety))
 }
 
 // Intern the ref-list slot whose element type is `elemName`, recursively interning a
@@ -713,8 +742,9 @@ function ensureRefElemKindTail(elemName: string, k: i32, ty: i32, kindTy: i32) {
     // The element's own arena row carries the map value, so a RECURSIVE alias element
     // resolves to the declared type rather than the unrolled anonymous twin its rendered
     // spelling would mint (D1865). `-1` in, `-1` through: the unhinted call is unmoved.
-    mvShapeOfMapNameTys(
+    mvShapeOfMapHeldTy(
       mve,
+      kindTy,
       tyMapValOf(unMemPeelAliasWrapper(ty)),
       tyMapValOfHeld(kindTy),
     )
@@ -829,7 +859,7 @@ export function rlInternNameTy(name: string, kind: i32, tyIn: i32) {
   // the emit pass. Minting it HERE is what makes the two passes read one answer (D1786).
   if kind == RLK_MAP {
     const rlIx = rlElemMvSlot.length - 1
-    const msh = mvShapeOfMapNameTys(men, -1, tyMapValOfHeld(rlTy))
+    const msh = mvShapeOfMapHeldTy(men, rlTy, -1, tyMapValOfHeld(rlTy))
     if msh >= 0 { rlElemMvSlot[rlIx] = msh }
   }
   rlElemName.length - 1
@@ -1423,73 +1453,48 @@ function markMapUnionArmsOf(atoms: string[], mems: i32[], cov: boolean) {
   0
 }
 
-// The function type of the one closure arm among `arms`, read off `ty`, the type they spell:
-// `ty` itself, its `| null` inner, or its one function member. -1 when either side holds two
-// closure arms, since nothing pairs them, or when `ty` is a hole.
-function cloArmFnTyOf(arms: string[], ty: i32): i32 {
-  let parens = 0
-  let ai = 0
-  while ai < arms.length {
-    if nameIsParenOpen(normTypeAtom(arms[ai])) { parens = parens + 1 }
-    ai = ai + 1
-  }
-  if parens != 1 { return -1 }
-  const t0 = tyPeelNul(ty)
-  if t0 < 0 || t0 >= T.tys.length { return -1 }
-  const k = tyAt(t0)
-  if k is TyFunc { return t0 }
-  if !(k is TyUnion) { return -1 }
-  let found = -1
-  let i = 0
-  while i < k.uMembers.length {
-    const m = tyPeelNul(k.uMembers[i])
-    if m >= 0 && m < T.tys.length && tyAt(m) is TyFunc {
-      if found >= 0 { return -1 }
-      found = m
-    }
-    i = i + 1
-  }
-  found
-}
+// Forces the shared map machinery and interns the mv value slot of each map reached only as a
+// closure result inside an annotation of type `ty` (or -1), which no `collectA` branch can see,
+// so its call-result map ops would find no map type. Each function `ty` holds, itself or as a
+// union member, forces its result; `| null` is peeled and a curried result is followed.
+export function forceCloResultMapTypes(ty: i32) { forceCloMapTypesGo(ty, 8) }
 
-// Forces the shared map machinery and interns the mv value slot of a map reached only as a
-// closure result inside composite annotation `nm` of type `ty` (or -1), which no `collectA`
-// branch can see, so its call-result map ops would find no map type. Self-gating: a name with
-// no arrow or map forces nothing; `ty` only classifies the result map's value.
-export function forceCloResultMapTypes(nm: string, ty: i32) {
-  // Cheap pre-gate (this runs per arena TypeRef): only a name spelling BOTH an
-  // arrow and a map can carry a closure-result map — two substring scans, no
-  // allocation, before the arm split allocates anything.
-  if !strContains(nm, "=>") || !strContains(nm, "{[") { return 0 }
-  const arms: string[] = []
-  unionSetAtomsOf(nm, arms)
-  const fnTy = cloArmFnTyOf(arms, ty)
-  let i = 0
-  while i < arms.length {
-    const a = normTypeAtom(arms[i])
-    // `annRetNameOf` is the `annArrowAt` + slice pair, and its own opener test now runs
-    // first so the one-char reject precedes the depth scan — a strict work reduction, since
-    // `annArrowAt` skips an arm that cannot pass instead of running on it.
-    if nameIsParenOpen(a) {
-      const ret0 = annRetNameOf(a)
-      if ret0 != "" {
-        let res = normTypeAtom(ret0)
-        const rn = nulMapInnerName(res)
-        if rn != "" { res = rn }
-        if nameIsBareMap(res) {
-          mUsed = true
-          lUsed = true
-          aUsed = true
-          mvShapeOfMapNameTys(res, -1, tyMapValOfHeld(tyStepRet(fnTy)))
-        } else if annArrowAt(res) >= 0 {
-          // A curried result (`() => () => {[string]: V}`) recurses to ITS result.
-          forceCloResultMapTypes(res, tyPeelNul(tyStepRet(fnTy)))
-        }
+// `forceCloResultMapTypes` at most `depth` curried results deep, so a recursive function alias ends.
+function forceCloMapTypesGo(ty: i32, depth: i32) {
+  if depth <= 0 { return 0 }
+  const t0 = tyPeelNul(ty)
+  if t0 < 0 { return 0 }
+  const k = tyAt(t0)
+  match k {
+    TyFunc => {
+      forceCloMapResult(t0, depth)
+    }
+    TyUnion => {
+      let i = 0
+      while i < k.uMembers.length {
+        const m = tyPeelNul(k.uMembers[i])
+        if m >= 0 && tyAt(m) is TyFunc { forceCloMapResult(m, depth) }
+        i = i + 1
       }
     }
-    i = i + 1
+    TyPrim | TyErr | TyObj | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a closure, nor a union with a closure member: no closure result to force.
+    }
   }
   0
+}
+
+// The result of function type `fnTy`: a map, bare or nullable, forces the map machinery and
+// interns its value slot; a function (a curried result) forces its own result.
+function forceCloMapResult(fnTy: i32, depth: i32) {
+  const ret = tyStepRet(fnTy)
+  const r = tyPeelNul(ret)
+  if r < 0 { return 0 }
+  if tyMapHeld(r) < 0 { return forceCloMapTypesGo(r, depth - 1) }
+  mUsed = true
+  lUsed = true
+  aUsed = true
+  mvShapeOfMapHeldTy("", r, -1, tyMapValOfHeld(ret))
 }
 
 // Forces the backing of scalar list rep `sk`; false when `sk` names none.
