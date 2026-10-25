@@ -113,6 +113,12 @@ The other 3 renders and 12 parses in B are **conditional key producers**:
 They stay the product until the registry they key is keyed by type. The ratchet can stop at 23
 renders and 13 parses only if D1, D5 and D8 are declared out of scope.
 
+Since this measurement the baseline has fallen to **55 renders and 92 parses** (`f5c657662`);
+the slices below record each retirement, the last two being row 280 (`forceCloResultMapTypes`'s
+`annArrowAt`, #4764) and `nulLitUnionInnerName`'s 2 parses (#4768). The second was in B, so the
+conditional key producers are now 3 renders and 10 parses, and the D1/D5/D8 stopping point is 23
+renders and 11 parses.
+
 ### Per file
 
 Each cell gives renders / parses.
