@@ -17290,6 +17290,10 @@ function refListElemNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
     }
     // Bound-guarded like the other reads in this function: `mfResultSlotOf` clamps a miss to
     // 0 rather than -1, so an unbounded `rlElemName[ms]` traps the compiler on an empty table. D227.
+    // A nullable-record `.map` result names its own `| null` row even before it is interned,
+    // which a function's inferred return asks for (D12820).
+    const nrt = mfNulRecMapElemTy(exprIx, fnIx)
+    if nrt >= 0 { return rlMintNameOfTy(nrt) }
     const ms = mfResultSlotOf(exprIx, fnIx)
     if ms >= 0 && ms < rlElemName.length { return rlElemName[ms] }
     const mrn = mfStructResultRowName(exprIx, fnIx)
@@ -21695,6 +21699,9 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
       if c.callArgs.length == 1 {
         // A list-returning callback maps to a ref list of that list's wrapper (D4870).
         if mfListResultElemTy(callIx, fnIx) >= 0 { return "ref" }
+        // A call typed as a list of a nullable record, a union's arm included, is a ref list
+        // of that type's own row, whatever kind the callback's return is classified as (D12820).
+        if mfNulRecResultElemTy(callIx, fnIx) >= 0 { return "ref" }
         const fe = mfCallbackFe(c.callArgs[0], fnIx)
         if fe < 0 {
           // A closure-value callback (`xs.map(f)`, `f` a function-typed param/binding) — its result
@@ -21783,14 +21790,13 @@ export function mfNulRecResultElemTy(callIx: i32, fnIx: i32): i32 {
   et
 }
 
-// The ref-list row of a nullable-record `.map` result, or -1 when the call is not one or
-// no row is interned for its element.
-function mfNulRecResultSlot(callIx: i32, fnIx: i32): i32 {
+// `mfNulRecResultElemTy` of a `.map` call only; -1 for any other call.
+function mfNulRecMapElemTy(callIx: i32, fnIx: i32): i32 {
   const c = nodeAt(callIx)
   if !(c is Call) || c.callFn < 0 { return -1 }
   const callee = nodeAt(c.callFn)
   if !(callee is Member) || callee.memProp != "map" { return -1 }
-  rlSlotOfTy(mfNulRecResultElemTy(callIx, fnIx))
+  mfNulRecResultElemTy(callIx, fnIx)
 }
 
 // `mfListResultElemTy` rendered as the ref-list row key; "" when it answers -1.
@@ -21827,9 +21833,10 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
         if lt >= 0 { return rlSlotOfTy(lt) }
         const fe = mfCallbackFe(c.callArgs[0], fnIx)
         // A nullable-record result keeps its `| null` in the row, so its elements read
-        // nullable; the struct row below would recover each one non-null (D10890).
-        const nrs = mfNulRecResultSlot(callIx, fnIx)
-        if nrs >= 0 { return nrs }
+        // nullable; the struct row below would recover each one non-null (D10890). Its row,
+        // or -1 before `collectMapFilterUse` interns it, never the struct's (D12820).
+        const nrt = mfNulRecResultElemTy(callIx, fnIx)
+        if nrt >= 0 { return rlSlotOfTy(nrt) }
         if fe >= 0 && cloRetIsStructRow(fe) {
           const si = cloRetValSlot(fe)
           if si >= 0 && si < sNames.length {
