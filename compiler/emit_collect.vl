@@ -619,6 +619,7 @@ import {
   anonFieldElemName,
   arrLitElemName,
   arrLitFrameLeafRow,
+  arrLitFrameRefTy,
   arrLitIsF32,
   arrLitIsRef,
   arrLitIsStr,
@@ -910,6 +911,7 @@ import {
 import {
   forRangeStepIsConst,
   holeOperandTyOf,
+  holeRecordTyOf,
   mapReadScalarBoxKindTy,
   pinSubOperandTyOf,
   restoreNarrow,
@@ -7210,7 +7212,7 @@ function collectHoleElemListPair(elemIx: i32, fnIx: i32) {
 function collectFrameLeafRow(ix: i32, fnIx: i32) {
   const pn = arrLitFrameLeafRow(ix, fnIx)
   if pn == "" || rlSlotByName(pn) >= 0 { return 0 }
-  if arrLitElemName(ix) != "i32[]" { return 0 }
+  if arrLitElemName(ix, fnIx) != "i32[]" { return 0 }
   let k = RLK_STR_LIST
   if pn == "f64[]" {
     k = RLK_F64_LIST
@@ -7228,13 +7230,28 @@ function collectFrameLeafRow(ix: i32, fnIx: i32) {
   0
 }
 
+// The row of list type `listTy`, which a list literal is only in its own frame
+// (`arrLitFrameRefTy`); -1 is no such literal. The frameless walk sees only the template's
+// list (D10891).
+function collectFrameRefRow(listTy: i32) {
+  if listTy < 0 { return 0 }
+  rlUsed = true
+  raUsed = true
+  const e = tyArrayElemIx(listTy)
+  ensureRefElemTys(rlRowNameOfTy(e, false), e, e)
+  0
+}
+
 // Every frame-sensitive collection site lexically inside one body, not descending into a
 // nested `FuncDecl` — that has its own `fnStmts` row and is walked as its own body.
 function arrNewFrameWalk(ix: i32, fnIx: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = nodeAt(ix)
   if n is FuncDecl { return 0 }
-  if n is ArrayLit { collectFrameLeafRow(ix, fnIx) }
+  if n is ArrayLit {
+    collectFrameLeafRow(ix, fnIx)
+    collectFrameRefRow(arrLitFrameRefTy(ix, fnIx))
+  }
   if n is ArrayLit {
     // A list literal over a parameter pinned to the softened `string` builds a string list, and
     // only the frame can see that pin: `collectA` asks this frameless, reserves the i32 pair and
@@ -7242,7 +7259,7 @@ function arrNewFrameWalk(ix: i32, fnIx: i32) {
     if arrLitIsStr(ix, fnIx) {
       slUsed = true
       aUsed = true
-    } else if n.arrElems.length > 0 && !arrLitIsRef(ix) {
+    } else if n.arrElems.length > 0 && !arrLitIsRef(ix, fnIx) {
       // The frame can also take the string answer away: a local closure's call is not a
       // same-named nested function of another frame, so its scalar pair is reserved (D2386).
       const nk = arrLitNumKind(ix, fnIx)
@@ -7443,10 +7460,10 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
     // comes off the arena in one rung, so a sixth element kind needs no fifth rescue here.
     forceScalarListRep(nodeTyArrayElemRepName(i))
   }
-  if arrLitIsRef(i) {
+  if arrLitIsRef(i, -1) {
     rlUsed = true
     raUsed = true
-    const elemKind = arrLitElemKind(i)
+    const elemKind = arrLitElemKind(i, -1)
     rElemKind = elemKind
     // A ref inner list (kind 9) interns inner-first through `ensureRefElemTy`, exactly as the
     // empty-literal arm above and the annotated spelling do: the outer element's heap is the
@@ -7454,16 +7471,16 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
     // since the first-element rung answers 4/6/7/8 for a nested `ArrayLit`.
     if elemKind == RLK_REF_LIST {
       ensureRefElemTys(
-        arrLitElemName(i),
+        arrLitElemName(i, -1),
         arrLitElemHintTy(i),
         tyStepElem(nodeTyIxOf(i)),
       )
     } else {
       // Hinted with the arm-for-arm arena twin. -1 on every arm whose answer is a
       // NAME by design or by measurement, which is exactly today's unhinted call.
-      rlInternNameTy(arrLitElemName(i), elemKind, arrLitElemHintTy(i))
+      rlInternNameTy(arrLitElemName(i, -1), elemKind, arrLitElemHintTy(i))
       // Asked once more, after the intern above, and read by every flag rung below.
-      const kAfter = arrLitElemKind(i)
+      const kAfter = arrLitElemKind(i, -1)
       // A nested `[[…]]` literal's elements are i32-list wrappers — force the
       // i32 list + raw array types for them. A string / f64 / i64 leaf (kinds
       // 6/7/8, the self-classified nested literal) forces ITS inner list's
@@ -8446,7 +8463,8 @@ function pinCtorRowServes(objIx: i32, fnIx: i32, lt: i32): boolean {
 }
 
 // The recorded type `lt` of record literal `objIx` with each type-parameter field at its value's
-// pin in instance `fnIx`, or -1 when a field holds a parameter some other way or has no pin.
+// pin in instance `fnIx` (a hole instance substituting any other field), or -1 when a field
+// holds a parameter some other way or has no pin.
 function pinSubstObjLitTy(objIx: i32, fnIx: i32, lt: i32): i32 {
   const o = nodeAt(objIx)
   if !(o is ObjLit) { return -1 }
@@ -8464,7 +8482,7 @@ function pinSubstObjLitTy(objIx: i32, fnIx: i32, lt: i32): i32 {
           bNames.push(fty.tvName)
           bTys.push(pin)
         } else if tyHasTyVar(ft) {
-          return -1
+          return holeRecordTyOf(lt, fnIx)
         }
       }
     }
@@ -8537,6 +8555,8 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
           // An exact instance binds a parameter no argument's pin names, as `T` in `v: T[] | i32[]`
           // read at its complement (D4888).
           if ps < 0 { ps = exactOperandTyOf(objIx, fnIx) }
+          // A hole function's instance binds its holes only in its own substitution (D12920).
+          if ps < 0 { ps = holeRecordTyOf(lt, fnIx) }
           if ps >= 0 { internShapeDeepOfTy(ps) }
           return 0
         }
