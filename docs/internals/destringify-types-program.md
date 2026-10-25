@@ -52092,7 +52092,7 @@ Corpus A/B 0 diffs; the rung now answers **72 of the 106** files that reach the 
 from 64.
 
 The 34 that still render are unions, nullables, and struct values — the first two by the -3
-guard above, the third by the interner-progress wall (B170) that `structIndexByValName` sits
+guard above, the third by the interner-progress wall (B170) that `structIndexOfTypeName` sits
 behind. Same three causes as the struct site, which is the point: the two consumers are
 different code with the same remainder.
 
@@ -52485,7 +52485,7 @@ never measured, so this pass measured it before porting anything:
 suggests.** The union arms are the intricate ones — the `-3` guard above the kind dispatch, the
 nullable-ref inner, the atom niches — so reading the code makes unions look like the work. The
 census says a struct-valued map is, and the ladder lowers that by looking the RENDERED value
-name up in the struct table (`structIndexByValName`). That is a registry question the arena
+name up in the struct table (`structIndexOfTypeName`). That is a registry question the arena
 answers directly with `isStructOfTy`.
 
 0 diffs across 1,947 files; the gate now answers **79 of 106**, up from 72.
@@ -55721,7 +55721,7 @@ counter exactly. The broken instrument had said 8,111.
 
 | site | calls | files | share |
 | --- | ---: | ---: | ---: |
-| `structIndexByValName` (a one-line wrapper) | 1442 | 92 | 23.6% |
+| `structIndexOfTypeName` (a one-line wrapper) | 1442 | 92 | 23.6% |
 | `retNulRefFlag` | 1235 | 153 | 20.2% |
 | `nulBaseStructRow` | 1088 | 111 | **removed in B243** |
 | `annParamKind` | 934 | 6 | 15.3% |
@@ -55760,9 +55760,9 @@ annotation's base a struct?" of a rendered name. All three now ask the arena. Th
 survives in each only where the arena has no `TyNullable` recorded at all — 10, 10 and 11 reaches
 respectively, which is the honest floor of this question rather than a target.
 
-## B245 — the `structIndexByValName` block, refused where it looked easiest
+## B245 — the `structIndexOfTypeName` block, refused where it looked easiest
 
-B244's corrected census left `structIndexByValName` as the largest remaining
+B244's corrected census left `structIndexOfTypeName` as the largest remaining
 `structIndexOfTypeName` consumer (1,442 calls). It has three call sites:
 
 | site | calls | files |
@@ -55785,7 +55785,7 @@ Dual-written, it fails on both counts:
 
 The hint is missing at 91% of reaches, and where it exists it is wrong five times out of six
 (`{f:i64}`, `{f:K0}`, `{f:(i32)=>string}` — inline shapes whose `rowTy` is not the row
-`structIndexByValName` finds by field-set match).
+`structIndexOfTypeName` finds by field-set match).
 
 **A hint that is both mostly absent and mostly wrong is a refusal, not a partial win.** Recorded
 here so the next reader does not re-derive it from the fact that `structIndexOfTy` exists — the
@@ -55882,7 +55882,7 @@ noty=0), but the guard encodes the distinction rather than the corpus. Same reas
 
 | block | calls | status |
 | --- | ---: | --- |
-| `structIndexByValName` (3 sites) | 1,442 | REFUSED — hint absent at 91% and wrong 35/41 where present (B245) |
+| `structIndexOfTypeName` (3 sites) | 1,442 | REFUSED — hint absent at 91% and wrong 35/41 where present (B245) |
 | `annParamKind` | 934 | REFUSED — `$fnsig` ABI key, the spelling IS the identity (B246) |
 | `annRetKind` | 729 | REFUSED — same |
 | `shapeElemDeclaredStructIdx` | 236 | REFUSED — documented NODE-LESS caller |
@@ -55944,7 +55944,7 @@ inputs), and four sites under 30 calls each.
 
 | block | calls | status |
 | --- | ---: | --- |
-| `structIndexByValName` | 1442 | refused (B245) |
+| `structIndexOfTypeName` | 1442 | refused (B245) |
 | `annParamKind` / `annRetKind` | 1731 | refused — ABI key (B246) |
 | `shapeElemDeclaredStructIdx` | 236 | refused — node-less |
 | `fieldRefElemName` / `fieldTypeCode` | 151 | **refused — `sTyRow` partial (here)** |
