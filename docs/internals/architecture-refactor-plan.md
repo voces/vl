@@ -809,6 +809,28 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - Floors re-graded: the exported-generic floor and the wasmEmit function-value signature floor have no filed check-clean witness left; the written-lambda floor is reached only by D12330, and the list floor only by D12330, D9500 and D9720, all CAPABILITY. The 6 UNDECIDED sites have no witness graded DESIGN.
   - Fixtures under `functions/`: `error-exported-generic-written-through-shared-field-uncalled.vl`, `error-exported-generic-written-through-alias-uncalled.vl`, `error-exported-generic-written-through-shared-element-uncalled.vl`, `exported-generic-written-through-shared-container-called.vl`, `error-exported-generic-written-into-returned-record-uncalled.vl`, `error-exported-generic-written-through-returned-holder-uncalled.vl`, `exported-generic-written-into-returned-record-called.vl`; under `closures/`, `error-generic-list-written-lambda-return-misfit-in-generic-body.vl`, `error-generic-list-written-open-lambda-return-misfit-in-generic-body.vl`, `error-generic-field-written-lambda-return-misfit-in-generic-body.vl`, `error-generic-list-written-named-fn-return-misfit-in-generic-body.vl`, `generic-list-written-lambda-return-fits-in-generic-body.vl`, `uncalled-hole-lambda-stored-runs.vl`.
   - Results against master `cc39be3fc`: `emit-refusal-sites.vl` reads 740 before and after. Seed fixpoint 5,819,973 to 5,823,053 bytes (+3,080). `difftree.sh --identity`: fixpoint identical, 10 of 16,582 files differ (11,698 built, 0 uncompared), each one a fixture of this change (nine `@error` and `uncalled-hole-lambda-stored-runs.vl`). `regress.vl`: 0 runs → not-runs. `check-filed-witnesses --strict`: 3,786 graded, all as filed.
+- 2026-10-24, the reachable-refusal census; D2689, D3052, D3483 and D4052 moved to the checker; D12450-D12467 filed. Census: `docs/internals/l3-reachable-refusals-2026-10.md`.
+  - Census: every one of the 740 `emitFail` sites was tagged with its location in an instrumented seed. 787 witnesses were built on it: corpus emit rejects, `@emit-error` fixtures, capability probes, and inventory rows grading `emit_reject`. 587 of them reach emit with `vl check` rc 0, at **111 sites**.
+  - Grades by site:
+    - 100 CAPABILITY, each with an open row;
+    - 6 CAPABILITY sites where a DESIGN row has not moved;
+    - 4 DESIGN held at emit;
+    - 1 DESIGN moved.
+  - Moved, DESIGN:
+    - `asgTargetIsPlace` (check_operators.vl) refuses an assignment or prefix `++`/`--` whose target is not a variable, field or element (D2689, D3052, D3483).
+    - `voidStoreCheck` (check_relate_core.vl) refuses a written `void` list element, map key or map value (D4052). The rule is DECISIONS.md §"`void` is a real type" (d).
+    - Each was a loud emit reject, and is now a loud check reject.
+  - Filed, CAPABILITY: D12450-D12466. These are 17 sites with no open row. Each witness was re-run verbatim, and each row names a running neighbour. Filed, UNDECIDED: D12467. A written top-level `i32 | void` parameter is check-clean, and ruling (d) does not cover it.
+  - Residue, not done:
+    - six DESIGN rows still refuse at emit: D10893, D3437, D1433, D1852, D2194 and D3691;
+    - four reached DESIGN sites are decided per instance and stay at emit: `emit_mono.vl` 9184 (`T.size` with `T` unbound), 9197 and 9207 (flat generic rows), and `emit_sections.vl` 10209 (the `memory` export).
+  - Fixtures: `operators/error-assignment-target-not-a-place.vl`, `operators/assignment-places-run.vl` and `types/error-void-stored-in-container.vl`.
+  - Results against master `b861c1d9f`:
+    - `emit-refusal-sites.vl` reads 740 before and after;
+    - seed fixpoint 5,824,201 to 5,826,702 bytes (+2,501);
+    - `difftree.sh --identity`: fixpoint identical, 2 of 16,591 files differ (11,705 built, 0 uncompared), each one an `@error` fixture of this change;
+    - `regress.vl`: 0 runs → not-runs;
+    - `check-filed-witnesses --strict`: 3,805 graded, all as filed.
 
 ### L4 log
 
