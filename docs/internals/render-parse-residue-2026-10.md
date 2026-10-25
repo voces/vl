@@ -887,6 +887,31 @@ What each slice changes:
     read finds no struct. This was read off the render rules and not ablated. Even with a
     landable walk, the four parse entries would stay: 1,855 files reach the nullable peel with
     no type, so the spelling parse is still the only answer there. All five go with D6.
+  - Re-probed a third time 2026-10-24 with the walk keyed by declaration: under the same
+    render-once guard, `internShapeDeepTy` and `internFuncTypeShapesTy` walk
+    `tyToNominalName(ty)`, which keeps a declared record's and a union alias's name. difftree
+    `--identity` over 16,588 files (not the self-compile) finds 91 differ: 88 build a
+    different module and 3 go from rc 0 to rc 1 (`unions/generic-join-record-pin-is-arm.vl`
+    and `unions/inferred-list-union-return-into-field.vl` with `object literal matches no
+    union variant`, `unions/union-field-literal-row-positions.vl` with `ref valtype with no
+    interned shape`). The first ablates to a generic `if` joining a declared record with an
+    `i32`, its result stored in a record literal's field; an annotated `R | i32` return, a
+    non-generic function, or no record literal each runs on both seeds. The blocker is the
+    leaf: `internInlineShapeTy` files every struct and union row under the spelling the walk
+    hands it, and the readers spell the same type structurally. Any render the walk adopts
+    moves those keys, so the leaf rows and their readers have to be keyed by type first.
+  - The reach with no type, measured with `answer-probe` over 16,700 files plus the
+    self-compile on the base seed, in files (events): `internShapeDeepTy`'s entry 2,123
+    (31,065), its nullable peel 25 (193), its map value 136 (889), `internShapeArms`'s shape
+    arm 80 (628), the inline-shape field recorder 1,737 (19,929); of the external roots, the
+    type-name walk 451 (3,519), the field-default walk 262 (356) and the global-array element
+    field 69 (1,780). `structElemArrayLowerable` (11 files) and the fn-type peel (93) are
+    always reached with a type. The census counts a parse even under a `ty < 0` guard, so
+    entries 173, 177, 178, 181 and 182 leave only when every one of these reaches is typed.
+  - Landed, byte-identical: `internShapeArms` hands a shape arm the member type its union's
+    own type gives (`unionMemberTysOfAB`) where the spelling's row does not cover it; before,
+    only the closure arm got it. difftree `--identity` 0 of 16,594 differ, and the candidate
+    compiles itself to itself.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
   already holds. Landed for 1 render and 2 parses: `elemIsLitUnion` became `tyIsLitUnion` of
   the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal

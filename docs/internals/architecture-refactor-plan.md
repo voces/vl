@@ -1750,6 +1750,17 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - Rep-fuzz is exact.
     - Seed 5,824,201 → 5,824,942 bytes (+741).
   - Render-parse holds at 55 / 112: these readers compared text keys, which the census does not count. The inline-shape interner by type stays as the step 6 entry above left it. None filed.
+- **2026-10-24, D6 (the inline-shape interner by type) re-probed keyed by declaration; not landable, one typed hand-over landed.**
+  - The probe walks `tyToNominalName(ty)` under the render-once guard, so a declared record and a union alias keep their names. difftree `--identity` over 16,588 files: 91 differ, 88 a different module and 3 from rc 0 to rc 1 (`unions/generic-join-record-pin-is-arm.vl`, `unions/inferred-list-union-return-into-field.vl`, `unions/union-field-literal-row-positions.vl`). The structural render's guard moved 235.
+  - The first refusal ablates to a generic `if` joining a declared record with an `i32`, stored in a record literal's field; each ingredient alone runs on both seeds.
+  - The blocker is the leaf. `internInlineShapeTy` files struct and union rows under the spelling it is handed and the readers spell the same type structurally, so any render the walk adopts moves keys. The leaf rows and their readers are keyed by type first; then the walk can drop its parses.
+  - The reaches with no type, files (events), over 16,700 files plus the self-compile: the walk's entry 2,123 (31,065), its nullable peel 25 (193), its map value 136 (889), the shape arm 80 (628), the field recorder 1,737 (19,929), and the external roots 451, 262 and 69. Entries 173, 177, 178, 181 and 182 stay; the full table is in render-parse-residue-2026-10.md under slice C3.
+  - Landed: `internShapeArms` hands a shape arm the member type `unionMemberTysOfAB` gives where the spelling's row does not cover it (before, only the closure arm got it).
+  - Checks:
+    - difftree `--identity` against master's seed: the fixpoint identity holds; of 16,594 files (11,711 built), 0 differ and 0 are uncompared.
+    - Rep-fuzz is exact. `regress.vl`: no cell changed class. Filed witnesses `--strict`: 3,806 as filed, 0 moved.
+    - Seed 5,827,701 bytes, the same size as without the change.
+  - Render-parse holds at 55 / 112. None filed.
 
 ### L10 log
 
