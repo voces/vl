@@ -1731,6 +1731,77 @@ What each slice changes:
       builds it.
     - The census and the render-parse budget do not move (50 renders, 86 parses), since the
       deleted pick parsed no spelling the census counts.
+  - L2 stage 11 switches `refListSlotOfExpr`, and with it `refListSlotOfExprStrict`, to
+    slots and types (`refListSlotOfExprRule`). Part of the by-name pick stays, for the classes
+    listed below.
+    - The plain switch was probed beside the by-name pick over the self-compile and the
+      corpus, with 0 events where either side had no type:
+
+      | expression | files | agree | differ | events agree | events differ |
+      | --- | --- | --- | --- | --- | --- |
+      | identifier | 3,975 | 3,865 | 861 | 289,787 | 39,806 |
+      | call | 1,429 | 1,403 | 71 | 32,771 | 28,204 |
+      | member | 280 | 275 | 18 | 28,228 | 658 |
+      | index | 215 | 211 | 16 | 9,262 | 493 |
+      | list literal | 458 | 454 | 6 | 9,038 | 27 |
+      | binary | 171 | 171 | 0 | 1,930 | 0 |
+      | `if` | 15 | 15 | 0 | 334 | 0 |
+      | `?.` | 1 | 1 | 0 | 2 | 0 |
+
+      Every disagreement was a `reflist` read. Most were the "not a list" class the stage 10
+      note names: map-element, number-union and nullable-scalar lists, where the name declines
+      and the element type names a row. Taken plainly, the switch changed the output of 189
+      of the 921 difftree files that reach it. In the `d3125_gen_*` cells, a typed name read
+      naming a row its binding never had moved a loud refusal to a different one.
+    - **A name read takes the row its binding stores** (`refListSlotOfIdent`). It walks the
+      rungs of `refListElemNameOfIdent` in the same order and returns the slot each binding
+      keeps: a fit arm's or narrowed arm's row off its type, a local's `localStructIdx`, a
+      param's annotation row (`paramRefArraySlot`), a declared local's (`declaredRefArraySlot`),
+      a capture's, and a global cell's (`letAnnRefListSlot`, `letRefListSlot`). Probed on the
+      delivered half, the binding slot and the name round trip agreed in all 60,825 events
+      over 1,520 files. It also declines wherever the binding is not a list, which is the rule
+      the "not a list" class needed.
+    - **A value whose row its producer or spelling chose keeps the by-name pick**
+      (`refListRowIsChosen`). That covers the four `letInitDeliversRow` cases, plus:
+      - a list literal,
+      - an element read (`xs[i]`),
+      - an element with a type variable,
+      - a literal-union element,
+      - a narrowed place.
+      Each of these broke a build when it took the type:
+      - A list literal `[{a: 7, b: 1}]` delivered to `L | i32` keeps the first of two rows
+        spelled `AB`, the one the union member was built at. Two `d362*_isect_unionmem` cells
+        refused.
+      - `[mkCfg()]` under a `Json` destination has no row. Typed, it built invalid wasm
+        (`deep-is-json-shape-walk`).
+      - A nested literal `A[][]` takes its element's nominal row (`callback-pin-nested-record-list`).
+      - A literal-union element `(9000000000 | 1 | 9000000001)` keys a row only by its
+        spelling `i64|i32` (`captured-copy-of-mixed-width-litunion-list` refused).
+      - An index or narrowed place under `type K = f64 | K[]` reads `f64|K[]` where the type
+        keys `K`, which is a second row of the same type (`narrowed-place-arm-delivery`).
+      - A hole closure's element names no row in the frame it is read in
+        (`hole-fn-nested-list-map-row-call`).
+    - Every other value takes `rlSlotOfRowTy(rlRowTyOfElem(et))`.
+    - difftree `--identity`: 2 of 16,716 files differ (11,812 built), and the fixpoint holds.
+      `list-element-narrowing-row-copy-runs` and `list-element-narrowing-callback-and-loop-runs`
+      read a global `K[][]` cell at the row it is declared at (slot 2). The name had found an
+      earlier row with the same spelling. The code is identical except for one unused local,
+      and both programs print the same output under both seeds. The un-annotated spelling
+      shows no disagreement.
+    - One row closes. D2857's inline read of a cast (`(nb(false) as! i32[][])[0][0]`) now
+      runs: the cast's value takes its element type's row, and the name family has no `as!`
+      arm. `as-bang-nested-list-arm-inline-index.vl` pins it at every delivery position. It
+      was written after the difftree run, which is why the run does not list it.
+    - **Residue: the classes above still read `refListElemNameOfExpr`.** They need slot walks
+      the tables do not yet keep:
+      - a call's result row, which is stored only as a name (`fRetRArrElem`);
+      - a literal's row from its elements' nominal rows;
+      - an element read's inner row, chosen among same-type rows.
+      `rlSlotByNameTwin` still runs on that path, and in the global rung of
+      `refListSlotOfIdent` (`globalRefArrayName`), which also has no stored slot. No helper was
+      left without a caller: `arrLitElemNameIn` and `refListElemNameOfExpr` both serve the kept
+      classes. `paramRefArrayName` and `declaredRefArrayName` now derive from their slot twins.
+    - The census and the render-parse budget do not move (50 renders, 86 parses).
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,

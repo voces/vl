@@ -614,6 +614,7 @@ import {
   atomNarrowOp,
   boxNarrowAtomFor,
   declaredRefArrayName,
+  declaredRefArraySlot,
   emptyArrHoleElemSlot,
   exprReReadable,
   fieldNamesSig,
@@ -631,6 +632,7 @@ import {
   ovnNextOf,
   paramNulRefArray,
   paramRefArrayName,
+  paramRefArraySlot,
   recordListSlotOfNode,
   sharedFieldArmAtomKind,
   sharedFieldArmConverts,
@@ -1178,6 +1180,7 @@ import {
   tyHoldsNumbersApart,
   tyIsArray,
   tyIsF32ArrayTy,
+  tyIsLitUnionLike,
   tyIsU8ArrayTy,
   tyLitSetMemberLexes,
   tyMapValOf,
@@ -17665,6 +17668,90 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   return ""
 }
 
+// The ref-list row expression `exprIx` holds, or -1 when it holds none: a name read takes its
+// binding's row, and a value of a row-typed element its element type's row. A value whose row
+// its producer or spelling chose (a literal, an element read, a delivered call, a hole, a
+// literal-union element, a narrowed place) reads the row its element name selects.
+function refListSlotOfExprRule(exprIx: i32, fnIx: i32): i32 {
+  const et = tyRefArrElemOf(nodeTyInOf(exprIx, fnIx))
+  const ai = unwrapParen(exprIx)
+  if ai < 0 { return -1 }
+  const n = nodeAt(ai)
+  if n is Ident { return refListSlotOfIdent(n, ai, fnIx) }
+  if refListRowIsChosen(ai, et, fnIx) {
+    return rlSlotByNameTwin(refListElemNameOfExpr(exprIx, fnIx), et)
+  }
+  rlSlotOfRowTy(rlRowTyOfElem(et))
+}
+
+// Whether a non-name value holds the row its producer or spelling chose, not its type's.
+function refListRowIsChosen(ai: i32, et: i32, fnIx: i32): boolean {
+  const n = nodeAt(ai)
+  if n is ArrayLit || n is Index || letInitDeliversRow(ai, et, fnIx) {
+    return true
+  }
+  if et >= 0 && (tyHasTyVar(et) || tyIsLitUnionLike(et, 8)) { return true }
+  narrowedIsRefArrayPlace(ai)
+}
+
+// A slot read off a ref-list table, or -1 when it names no row.
+function rlRowOrNone(s: i32): i32 {
+  if s >= 0 && s < rlElemName.length { return s }
+  -1
+}
+
+// The row a name read `e` holds, the slot its binding stores: a narrowed arm, a param, a
+// local, a capture or a global, nullable ref arrays answering their inner list. -1 else.
+function refListSlotOfIdent(e: Ident, exprIx: i32, fnIx: i32): i32 {
+  const fat = listFitArmTyOf(exprIx, fnIx)
+  if fat >= 0 {
+    const fa = tyAt(fat)
+    const fsl = if fa is TyArray { rlSlotOfTy(fa.aElem) } else { -1 }
+    if rlRowOrNone(fsl) >= 0 { return fsl }
+  }
+  if narrowedIsRefArray(e.identName) {
+    return rlRowOrNone(
+      rlSlotOfTy(tyRefArrElemOf(instanceTyOf(nodeTyIxOf(exprIx), fnIx))),
+    )
+  }
+  const rdg = identReadsGlobal(sidOfNode(exprIx), exprIx)
+  if !rdg && declaredKind(e.identName) == "nulreflist" {
+    const sl18 = declaredSlotOf(e.identName)
+    if sl18 >= 0 {
+      const is18 = rlRowOrNone(localStructIdx[sl18])
+      if is18 >= 0 { return is18 }
+    }
+  }
+  if (
+    paramNulRefArray(fnIx, e.identName)
+    && paramReadAt(fnIx, e.identName, exprIx)
+  ) {
+    const pn18 = paramTypeNodeAt(fnIx, e.identName, exprIx)
+    if annNulRefArrSlot(pn18) >= 0 {
+      return rlRowOrNone(rlSlotOfTy(tyRefArrElemOf(nodeTyIxOf(pn18))))
+    }
+  }
+  const ps = paramRefArraySlot(fnIx, e.identName)
+  if ps >= 0 && paramReadAt(fnIx, e.identName, exprIx) { return ps }
+  const ds = if rdg { -1 } else { declaredRefArraySlot(e.identName) }
+  if ds >= 0 { return ds }
+  const cn = rlRowOrNone(capturedRefListSlot(fnIx, e.identName))
+  if cn >= 0 { return cn }
+  if globalIsNulRefArraySid(fnIx, sidOfNode(exprIx), exprIx) {
+    const g18 = globalLetOfIn(fnIx, e.identName, exprIx)
+    const gs18 = rlRowOrNone(letAnnRefListSlot(g18))
+    if gs18 >= 0 { return gs18 }
+  }
+  const grl = globalLetOfIn(fnIx, e.identName, exprIx)
+  if grl >= 0 && globalCellKind(grl) == "reflist" {
+    const grs = rlRowOrNone(letRefListSlot(grl, -1))
+    if grs >= 0 { return grs }
+  }
+  const gra = globalRefArrayName(fnIx, e.identName)
+  if gra != "" { return rlSlotByNameTwin(gra, -1) }
+  rlRowOrNone(recordListSlotOfNode(exprIx, fnIx))
+}
+
 // The ref-list element name a field read `e` yields, through the same receiver rungs as
 // `memFieldTypeCode`: a narrowed place, a union arm, a struct, or a struct union whose
 // members all record one element name. "" when the field is not a ref list.
@@ -17765,8 +17852,7 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
 // the element type does not resolve. Slot 0 is a real row, so an unresolved read must not
 // borrow it: every caller tests the result before indexing a backing/wrapper/element table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
-  const nm = refListElemNameOfExpr(exprIx, fnIx)
-  const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
+  const s = refListSlotOfExprRule(exprIx, fnIx)
   if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "call") }
   if s < 0 {
     if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "CLAMPED") }
