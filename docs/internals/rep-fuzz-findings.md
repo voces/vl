@@ -716,7 +716,7 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   interning): `internShapeDeep` (the `collectAnnShapes` per-TypeRef interner) peeled paren / nullable /
   array / functype wrappers to reach a buried inline shape but had NO map arm — the whole map is ONE
   TypeRef name, so `internInlineShape` no-op'd on it and the value's struct shape never entered `sNames`.
-  The mv-slot interner (`mvShapeOfValName` → `structIndexByValName`) then found no struct and rejected
+  The mv-slot interner (`mvShapeOfValName` → `structIndexOfTypeName`) then found no struct and rejected
   (kind -3). A `{f: i64}` / `{a:i32,f:f64,z:i32}` value "worked" only by luck — its STORE LITERAL
   (`{f: 5000000000}`) self-collected via `collectAnonShapes`; an f32 field written from a variable
   (`{f: v}`) or a map field (`{f: inner}`) codes -1 in `anonFieldCode`, so neither path interned it.

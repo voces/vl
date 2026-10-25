@@ -130,6 +130,9 @@ D8's mv arm signature and hint, the arm mint's literal-union field and the map a
 D8's parameter signature token (#4794) and result signature token with a value call's union name
 (#4800) have retired since: 1 render each, so the baseline reads **51 renders and 86 parses**
 (`6973623e6`). Both were in D, so the conditional key producers and the stopping point do not move.
+D8's member read box (#4803) has retired since: 1 render, so the baseline reads **50 renders and 86 parses**
+(`46e8112f6`). D8 is complete (17 retired, 0 left, 2 reclassified C); it was in D, so the conditional key
+producers and the stopping point do not move.
 
 ### Per file
 
