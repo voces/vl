@@ -23033,7 +23033,8 @@ function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32, ctx: i32): i32 {
 
 // The pin for named generic `args[i]` handed to hole `params[i]` of `fn` that the body only
 // calls directly, at one argument type list: the generic instanced at those types read in frame
-// `ctx`, where the checker's binding stays open on the caller's own holes (D13260). "" otherwise.
+// `ctx`, where the checker's binding stays open on the caller's own holes (D13260), or an `if`
+// whose every arm's generic instances there at one type (D13620). "" otherwise.
 function monoHoleGenFnFramePin(
   fn: FuncDecl,
   params: i32[],
@@ -23043,13 +23044,41 @@ function monoHoleGenFnFramePin(
   tyOut: i32[],
 ): string {
   const ax = unwrapParen(args[i])
-  if ax < 0 || !(nodeAt(ax) is Ident) || !monoCalleeIsGeneric(ax) { return "" }
-  const vt = nodeTyIxOf(ax)
-  if vt < 0 || vt >= T.tys.length || !tyHasTyVar(vt) { return "" }
-  const vf = tyAt(vt)
-  if !(vf is TyFunc) { return "" }
+  if ax < 0 { return "" }
+  const an = nodeAt(ax)
+  if !(an is IfStmt) && !(an is Ident && monoCalleeIsGeneric(ax)) { return "" }
   const ps = monoHoleFrameCallTys(fn, params, args, i, ctx)
-  if ps.length != vf.fnParamTypes.length || ps.length == 0 { return "" }
+  if ps.length == 0 { return "" }
+  const bt = monoFramePinTyOf(ax, ps, 0)
+  if bt < 0 { return "" }
+  monoFnPinAt(args[i], ctx, bt, -1, tyOut)
+}
+
+// The closed type generic read `v` takes called at argument types `ps`, or, for an `if`, the one
+// type every arm that hands on a value takes; -1 when one does not close or two arms differ.
+function monoFramePinTyOf(v: i32, ps: i32[], depth: i32): i32 {
+  const x = unwrapParen(v)
+  if x < 0 || depth > MONO_ALIAS_CHAIN_MAX { return -1 }
+  const n = nodeAt(x)
+  if n is IfStmt {
+    if n.ifElse < 0 { return -1 }
+    let bt = -1
+    for arm in [n.ifThen, n.ifElse] {
+      if !monoArmEndsNever(arm) {
+        const tv = monoArmTailValue(arm)
+        const av = if tv >= 0 { tv } else { arm }
+        const t = monoFramePinTyOf(av, ps, depth + 1)
+        if t < 0 || (bt >= 0 && sigKeyOfTy(t) != sigKeyOfTy(bt)) { return -1 }
+        bt = t
+      }
+    }
+    return bt
+  }
+  if !(n is Ident) || !monoCalleeIsGeneric(x) { return -1 }
+  const vt = nodeTyIxOf(x)
+  if vt < 0 || vt >= T.tys.length || !tyHasTyVar(vt) { return -1 }
+  const vf = tyAt(vt)
+  if !(vf is TyFunc) || ps.length != vf.fnParamTypes.length { return -1 }
   const gN: string[] = []
   const gT: i32[] = []
   let j = 0
@@ -23058,10 +23087,10 @@ function monoHoleGenFnFramePin(
     j = j + 1
   }
   const inst = substTyDeep(vt, gN, gT)
-  if !monoTyConcreteFn(inst) { return "" }
+  if !monoTyConcreteFn(inst) { return -1 }
   const bt = genFnHoleBodyRet(vt, inst)
-  if !monoTyConcreteFn(bt) { return "" }
-  monoFnPinAt(args[i], ctx, bt, -1, tyOut)
+  if !monoTyConcreteFn(bt) { return -1 }
+  bt
 }
 
 // The closed argument types every call of hole `params[i]` in `fn`'s body takes, a read of one
