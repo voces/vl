@@ -208,6 +208,7 @@ import {
   tyIsLitUnion,
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
+  tyIsMap,
   tyIsNewtypeBrand,
   tyIsNulValueUnionBox,
   tyIsNullableLitUnion,
@@ -435,7 +436,7 @@ import {
   spreadLitScalarElem,
   spreadSrcBoxAtom,
 } from "./emit_if_arm_values"
-import { declaredI64, numBoxExpr } from "./emit_join_records"
+import { declaredI64, numBoxExpr, recordFieldTy } from "./emit_join_records"
 import {
   arenaRepOf,
   arrLitHasSpread,
@@ -563,6 +564,7 @@ import {
 import {
   annIsNulStrListDeep,
   annValtypeSlotOf,
+  annVariantRowOf,
   anonLeafParamRowOf,
   arrNewFillAnnKind,
   asgValueIsFunc,
@@ -823,6 +825,7 @@ import {
   sigKeyRetSlot,
   structFieldIsClosure,
   unRowOfFlatMembers,
+  vkIsBoxedRefElem,
   vkIsPlainList,
   vkNulNicheOf,
 } from "./emit_sig_tokens"
@@ -832,6 +835,7 @@ import {
   coalesceResultUnionName,
   declaredUnion,
   ifJoinUnionNameIn,
+  letUnionTyIxOf,
   narrowedClosureOf,
   narrowedClosureTyOf,
   narrowedIsMap,
@@ -853,6 +857,7 @@ import {
   unionDeclTyIxOfIdentRead,
   unionRetName,
   unionRetOfFnType,
+  unionTyIxOfIdentAt,
 } from "./emit_start_block"
 import {
   FC_CLOSURE,
@@ -1349,7 +1354,7 @@ export function cloRetValSlot(fe: i32) {
         return anonLeafRetRowOf(fnStmts[fe], retStructRowIndex(fn.fnRet))
       }
       // A `: Cat` annotated variant result — the slot is the variant index.
-      if k == "variant" { return variantIndexOf(tyNameOf(fn.fnRet)) }
+      if k == "variant" { return annVariantRowOf(fn.fnRet) }
       // A `: Circle | null` annotated result — the slot is the variant index under the
       // null, since `retStructIndex` has no row for a variant.
       if k == "nulvariant" { return nulVariantIndexOf(fn.fnRet) }
@@ -3824,7 +3829,12 @@ export function asgReadNarrowTy(asgIx: i32, fnIx: i32): i32 {
   const un = unionNameOfIdentAt(sidOfNode(t), fnIx, t)
   if un == "" { return -1 }
   if !isValueUnionName(un) { return -1 }
-  if msSoleMemberTy(asgReadNarrowSet(un, at)) < 0 { return -1 }
+  if (
+    msSoleMemberTy(asgReadNarrowSet(identUnionTyAt(sidOfNode(t), fnIx, t), at))
+    < 0
+  ) {
+    return -1
+  }
   at
 }
 
@@ -3887,7 +3897,14 @@ export function asgReadNullInnerTy(asgIx: i32, fnIx: i32): i32 {
   if !(nodeAt(t) is Ident) { return -1 }
   const un = unionNameOfIdentAt(sidOfNode(t), fnIx, t)
   if un == "" { return -1 }
-  if msSoleMemberTy(asgReadNarrowSet(un, inner)) < 0 { return -1 }
+  if (
+    msSoleMemberTy(
+      asgReadNarrowSet(identUnionTyAt(sidOfNode(t), fnIx, t), inner),
+    )
+    < 0
+  ) {
+    return -1
+  }
   inner
 }
 
@@ -6572,6 +6589,19 @@ export function memberUnionFieldNameRead(memIx: i32, fnIx: i32) {
   armFieldUnionName(memIx, fnIx)
 }
 
+// The declared type of the record field the Member `memIx` reads or writes, or -1 — the
+// union `memberUnionFieldNameRead` names, asked of the receiver's record type.
+export function memberUnionFieldTy(memIx: i32, fnIx: i32): i32 {
+  const m = nodeAt(unwrapParen(memIx))
+  if m is Member {
+    const rt = nodeTyAt(m.memObj, fnIx)
+    if rt < 0 { return -1 }
+    const r = tyAt(rt)
+    if r is TyObj { return recordFieldTy(r, m.memProp) }
+  }
+  -1
+}
+
 // ── the read/consumer channel predicate ──────────────────────────────────────
 // An un-narrowed code-16 field read's delivered atom, or -1 when the box comes back
 // unchanged. Asked by both the read site and every consumer so the two cannot disagree:
@@ -8310,16 +8340,27 @@ export function rlUnionNameOfTy(slot: i32, listTy: i32): string {
 // — the one gate every index narrowing channel asks before minting a key, so the push side
 // and the read side cannot disagree about which cells hold a box.
 export function indexElemUnionName(idxIx: i32, fnIx: i32) {
+  const slot = indexElemUnionSlot(idxIx, fnIx)
+  if slot < 0 { return "" }
+  rlElemName[slot]
+}
+
+// `indexElemUnionName`'s element union as a type, or -1.
+export function indexElemUnionTy(idxIx: i32, fnIx: i32): i32 {
+  rlElemTyIxAt(indexElemUnionSlot(idxIx, fnIx))
+}
+
+function indexElemUnionSlot(idxIx: i32, fnIx: i32): i32 {
   const e = nodeAt(unwrapParen(idxIx))
   if e is Index {
     if exprRefArray(e.idxArr, fnIx) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot >= 0 && slot < rlElemKindTbl.length {
-        if rlElemKindTbl[slot] == RLK_UNION { return rlElemName[slot] }
+        if rlElemKindTbl[slot] == RLK_UNION { return slot }
       }
     }
   }
-  ""
+  -1
 }
 
 // The arena type of a nullable-ref-array index read `xs[0]` less its `| null` —
@@ -9584,11 +9625,7 @@ function pgJoinNarrow(stmtIx: i32, fnIx: i32) {
     // `stmtIx`, the guard's own node: every join name's binding (if any) precedes this `if`
     // in the same block, so it is a valid stand-in for "the position right after the guard".
     if (
-      !pushNarrowWriteReNarrow(
-        jn,
-        jt,
-        unionNameOfIdentAt(sidOf(jn), fnIx, stmtIx),
-      )
+      !pushNarrowWriteReNarrow(jn, jt, identUnionTyAt(sidOf(jn), fnIx, stmtIx))
     ) {
       // A PATH key resolves no union NAME here — the join has only the key string, and the
       // field's own spelling lives at the write. Push the arena type instead, which is what
@@ -9706,7 +9743,11 @@ function pgAssignIdentNarrow(
     // Retire first: reading at the declaration is the right answer whenever the banked
     // type names no single member, and the push below only sharpens it.
     retireNarrowFor(tgt.identName)
-    pushNarrowWriteReNarrow(tgt.identName, asgNarTy, un)
+    pushNarrowWriteReNarrow(
+      tgt.identName,
+      asgNarTy,
+      identUnionTyAt(sidOfNode(lhsIx), fnIx, lhsIx),
+    )
   } else if (
     un != ""
     && isValueUnionName(un)
@@ -9746,11 +9787,7 @@ function pgAssignMemberNarrow(
       // …and then the written member, the path twin of the Ident arm's push: the checker
       // re-narrows a path the same way it re-narrows a name, so the reads after the write
       // must lower at the same member here too (D1847).
-      pushNarrowWriteReNarrow(
-        mtk,
-        asgNarTy,
-        memberUnionFieldNameRead(lhsIx, fnIx),
-      )
+      pushNarrowWriteReNarrow(mtk, asgNarTy, memberUnionFieldTy(lhsIx, fnIx))
     }
   }
   0
@@ -9780,7 +9817,7 @@ function pgAssignIndexNarrow(
       // The index twin of the member push above (D1847). A map cell names no element
       // union, so it pushes the member's type, as an `is` test of the cell does (D2610).
       if (
-        !pushNarrowWriteReNarrow(itk, asgNarTy, indexElemUnionName(lhsIx, fnIx))
+        !pushNarrowWriteReNarrow(itk, asgNarTy, indexElemUnionTy(lhsIx, fnIx))
       ) {
         pushNarrowWrittenTy(itk, asgNarTy)
       }
@@ -9809,15 +9846,20 @@ function tvWriteNarrow(tgtIx: i32, rhsIx: i32, dcl: i32, fnIx: i32) {
   const tgt = nodeAt(tgtIx)
   let key = ""
   let un = ""
+  let unTy = -1
   if tgt is Ident {
     key = tgt.identName
-    if uDeclared { un = unionNameOfIdentAt(sidOfNode(tgtIx), fnIx, tgtIx) }
+    if uDeclared {
+      un = unionNameOfIdentAt(sidOfNode(tgtIx), fnIx, tgtIx)
+      unTy = identUnionTyAt(sidOfNode(tgtIx), fnIx, tgtIx)
+    }
   } else if tgt is Member {
     key = memberPathKeyOf(tgtIx)
-    un = memberUnionFieldNameRead(tgtIx, fnIx)
+    unTy = memberUnionFieldTy(tgtIx, fnIx)
   } else if tgt is Index {
     key = indexPathKeyOf(tgtIx)
     un = indexElemUnionName(tgtIx, fnIx)
+    unTy = indexElemUnionTy(tgtIx, fnIx)
   }
   if key == "" { return 0 }
   retireNarrowForIndexCells(key)
@@ -9832,7 +9874,7 @@ function tvWriteNarrow(tgtIx: i32, rhsIx: i32, dcl: i32, fnIx: i32) {
     if fp < 0 { return 0 }
     const hl = tvWriteLandTy(fp, nodeTyIxOf(unwrapParen(rhsIx)))
     if hl < 0 || hl == fp { return 0 }
-    if !pushNarrowWriteReNarrow(key, hl, un) { pushNarrowWrittenTy(key, hl) }
+    if !pushNarrowWriteReNarrow(key, hl, unTy) { pushNarrowWrittenTy(key, hl) }
     return 0
   }
   const pin = instanceOperandTyOf(rhsIx, fnIx)
@@ -9851,7 +9893,9 @@ function tvWriteNarrow(tgtIx: i32, rhsIx: i32, dcl: i32, fnIx: i32) {
     }
     return 0
   }
-  if !pushNarrowWriteReNarrow(key, land, un) { pushNarrowWrittenTy(key, land) }
+  if !pushNarrowWriteReNarrow(key, land, unTy) {
+    pushNarrowWrittenTy(key, land)
+  }
   0
 }
 
@@ -14662,6 +14706,30 @@ function capturedUnionName(fnIx: i32, name: string) {
   ""
 }
 
+// `capturedUnionName`'s type: the parent frame's binding's, or -1 (a captured loop variable
+// has no declaration to read one from).
+function capturedUnionTyIx(fnIx: i32, name: string): i32 {
+  if capturedKindOf(fnIx, name) != "union" { return -1 }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return -1 }
+  const b = parentBindingOf(fe, name)
+  if b < 0 { return -1 }
+  const bn = nodeAt(b)
+  if bn is Param { return annRowOfNode(bn.parType) }
+  const par = fnParent[fe]
+  if par < 0 { return -1 }
+  letUnionTyIxOf(b, fnStmts[par])
+}
+
+// The union type the ident `sid` read at `atIx` is declared or inferred at — the binding
+// `unionNameOfIdentAt` names, as a type: a capture's from its own frame, else the binding's
+// annotation or initializer. -1 for a loop variable, which has no binding node.
+export function identUnionTyAt(sid: i32, fnIx: i32, atIx: i32): i32 {
+  const c = capturedUnionTyIx(fnIx, sidText(sid))
+  if c >= 0 { return c }
+  unionTyIxOfIdentAt(sid, fnIx, atIx)
+}
+
 export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = nodeAt(exprIx)
@@ -16428,18 +16496,18 @@ function pushNarrowComplement(
 
 // The reads-only rule's emit half: an accepted write re-narrows its bare-name target to the
 // member the checker banked at the assignment node, so the reads after it lower at that
-// member's rep rather than at the retired narrowing's. True when the push happened; a
-// caller whose write named no single member retires instead (D1736).
+// member's rep rather than at the retired narrowing's, keyed by the declared type `unTy`.
+// True when the push happened; a caller whose write named no single member retires (D1736).
 export function pushNarrowWriteReNarrow(
   name: string,
   ty: i32,
-  un: string,
+  unTy: i32,
 ): boolean {
-  if ty < 0 || un == "" { return false }
+  if ty < 0 || msSetOfTy(unTy) < 0 { return false }
   // The DECLARED set, never the live narrowing's: the write is checked against the
   // declaration, so the member it lands on is one of the declaration's. An `is`-pinned slot
   // carries no set at all (`pushNarrowIs` banks a type), which is the common case here.
-  const r = asgReadNarrowSet(un, ty)
+  const r = asgReadNarrowSet(unTy, ty)
   // A literal member has no row in the set pool, so it lands as an `is` test of it would (D4200).
   if r < 0 { return pushNarrowLitMember(name, ty) }
   const txt = msTextOf(r)
@@ -21702,6 +21770,9 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
         // A call typed as a list of a nullable record, a union's arm included, is a ref list
         // of that type's own row, whatever kind the callback's return is classified as (D12820).
         if mfNulRecResultElemTy(callIx, fnIx) >= 0 { return "ref" }
+        // A call typed `u8[]` builds the packed byte list; its callback's return reads as an
+        // `i32`, which would pick the plain list (D12902).
+        if tyIsU8ArrayTy(nodeTyInOf(callIx, fnIx)) { return "u8" }
         const fe = mfCallbackFe(c.callArgs[0], fnIx)
         if fe < 0 {
           // A closure-value callback (`xs.map(f)`, `f` a function-typed param/binding) — its result
@@ -21752,9 +21823,9 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
   null
 }
 
-// The element type of a `.map` whose callback returns a list or a function, so its result is a
-// ref list of that list's wrapper or of closures; -1 when the callback returns neither or the
-// call's element is not a concrete list or function type.
+// The element type of a `.map` whose callback returns a list, a function, a nullable list, a
+// map, a nullable map or a nullable closure, so its result is a ref list at that element's row;
+// -1 when the callback returns none of these or the call's element is not that concrete type.
 export function mfListResultElemTy(callIx: i32, fnIx: i32): i32 {
   const c = nodeAt(callIx)
   if c is Call {
@@ -21765,7 +21836,14 @@ export function mfListResultElemTy(callIx: i32, fnIx: i32): i32 {
       const fe = mfCallbackFe(c.callArgs[0], fnIx)
       // A closure-value callback has no lifted function to ask; its call's type decides.
       const vk = if fe >= 0 { cloRetValKind(fe) } else { null }
-      if fe >= 0 && !vkIsPlainList(vk) && vk != "closure" { return -1 }
+      if (
+        fe >= 0
+        && !vkIsPlainList(vk)
+        && vk != "closure"
+        && !vkIsBoxedRefElem(vk)
+      ) {
+        return -1
+      }
       let et = iterElemPinTy(callIx, fnIx)
       if et < 0 {
         const rt = tyRefArrElemOf(nodeTyIxOf(callIx))
@@ -21775,6 +21853,17 @@ export function mfListResultElemTy(callIx: i32, fnIx: i32): i32 {
       // A function-returning callback maps to a ref list of closures (D9171).
       if vk == "closure" { return if tyIsFuncArena(et) { et } else { -1 } }
       if tyAt(et) is TyArray { return et }
+      // A nullable list, a map, a nullable map or a nullable closure is a ref-list element
+      // read at its own `et` row (D12901).
+      if fe >= 0 && !vkIsBoxedRefElem(vk) { return -1 }
+      if tyIsMap(et) { return et }
+      const nt = tyAt(et)
+      if nt is TyNullable {
+        if nt.nInner >= 0 && nt.nInner < T.tys.length {
+          const it = tyAt(nt.nInner)
+          if it is TyArray || it is TyMap || it is TyFunc { return et }
+        }
+      }
     }
   }
   -1
