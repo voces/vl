@@ -1385,6 +1385,21 @@ What each slice changes:
       89 files and 716 in 152, mostly a type parameter's list (`(T|null)[]`, `((T)=>void)[]`).
       `collectARefArrayAnn`'s `| null` peel feeds only those floors, and its test agrees with
       `tyIsNulRefArray` at every one of 19,587 events.
+  - L2 stage 2 at 247fb2679, probed over the self-compile and 16,781 files with 0 uncompared:
+    - Done (1 parse): `rlSlotOfArrNameTy` is deleted. `annRefListSlot` takes only the list
+      type and reads `rlSlotOfTyOrTwin` of its element: `rlSlotOfTy`, then the layout twin
+      (`rlSlotOfTyTwin`). That twin rung settles the literal-element cases (`{r: null}` for
+      `Circle`), and the typed pick still differs from the name pick in 17 of 629 files
+      (27 events): 4 literal-union or pre-widening element types the name found by their
+      softened spelling, 9 declared or layout twins, 2 recursive aliases unfolded to their
+      members, and 2 rows only the type finds.
+    - Done: `rlElemInnerSlot`'s by-name fall-through goes. It ran only after the typed rung
+      missed, and answered -1 at all 33 events in 8 files.
+    - difftree `--identity`: 5 of 16,669 files differ (`recursive-alias-nested-list-copied-with-map`
+      and distilled cells a092549, a094061, a094925, a095357), each with the same run output and
+      exit on the master seed and the candidate. In each the annotation side of a `$fnsig` key
+      now names the slot the AST side (`retTokOfTy`, already `rlSlotOfTy`) names, so the module
+      carries one duplicate function type fewer. The fixpoint identity holds.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
