@@ -60,6 +60,59 @@ worked carries a `status` field as well, saying what moved and why the rest stay
 **The proposed floor is 21 renders and 22 parses.** The work that remains is 62 renders and 206
 parses.
 
+### Re-measured at 38bf5d273 (2026-10-25)
+
+The census reads **55 renders and 105 parses**, which is 160 entries. Every live entry matches a
+row in the ledger that has not been retired. The census now also skips a parser's `<parser>Go`
+ladder, as it already skipped the parser's body. That dropped `refArrElemNameGo` (4 parses) and
+`nameIsRefArrayGo` (1 parse). Each of those has one caller, its parser. A re-read of the B rows
+moved these entries:
+
+- **To B:** `monoSigFnTyNameAt` and `cloSigNameOfTy`. The first is recorded through
+  `synthTypeRefTy(text, -1, ty)`. The second is the `clo:` link key, which is compared only for
+  equality.
+- **From B to D:** each of these keys or decides while the type is in hand.
+  - `recordedParamPinName`, `nominalizePartOfTy` and `nodeMapArmNominalName` go to D3.
+  - `nulRefElemEmitName` goes to D2.
+  - `mvValInnerRlSlot` and `rlSlotOfArrNameTy` go to D1.
+  - `mvSlotOfMapNameTys` goes to D8.
+  - `refArrElemKeyDeferred` goes to D6.
+- **From A to D:** `dstPinMapValue` goes to D3 and `mapAnnShape` to D8.
+- **From C to D:** `collectGenAliasShapes` and `gaePeelWrappers`. Both wait on the generic-alias
+  instance registry being keyed by type.
+- **From D to C:** `nonNulBaseOf`, `nulMapInnerName` and `mvValIsRefList`. These are string
+  utilities whose callers hold only a name.
+
+| class | renders | parses | entries |
+| --- | --- | --- | --- |
+| A: decides | 2 | 9 | 11 |
+| B: key | 23 | 13 | 36 |
+| C: no type | 0 | 27 | 27 |
+| D: blocked on L6 | 30 | 56 | 86 |
+| **total** | **55** | **105** | **160** |
+
+**The measured floor is 20 renders and 1 parse:**
+
+- 7 diagnostic renders.
+- 12 TypeRef texts recorded beside their type.
+- The `clo:` link key.
+- `cboxElemNeedsParens`.
+
+The other 3 renders and 12 parses in B are **conditional key producers**:
+
+- `anonMapValName` (D8)
+- `listUnionEmitName` (D5)
+- `rlMintNameOfTy` (D1)
+- `rlCanonLitUnionAtoms` ×4
+- `shapeFieldElemName` ×3
+- `nulLitUnionInnerName` ×2
+- `canonLitUnionArms`
+- `iisPushFieldElem`
+- `markRefArrayArmsOf`
+
+They stay the product until the registry they key is keyed by type. The ratchet can stop at 23
+renders and 13 parses only if D1, D5 and D8 are declared out of scope.
+
 ### Per file
 
 Each cell gives renders / parses.
@@ -111,6 +164,12 @@ The floor is conditional. Once D1 and D2 key the ref-list and mv slots by type, 
 producers stop being the key. They then become dead or move into the canon renderer, and the floor
 falls toward the 20 diagnostic, TypeRef-text and nominal renders. Until those slices land, these
 entries are the product.
+
+This list is the classification at `c1bcc6474`. The re-measure at 38bf5d273 (under Totals)
+supersedes it. B is now 36 entries: 20 renders and 1 parse are the true floor, and 3 renders and
+12 parses are conditional key producers. `refArrElemNameGo` left with the census's `Go`
+exemption. `rlSlotOfArrName`'s typed composer `rlSlotOfArrNameTy` is D1, and
+`nominalizePartOfTy` and `nodeMapArmNominalName` are D3.
 
 ## Remaining work: 18 slices
 
@@ -1239,6 +1298,23 @@ What each slice changes:
       `ensureRefElemTys`'s nested cut keys the inner row by the same spelling, so it stays too.
     - The nine `emit_base` grammar predicates go when their name-only callers in D2 and C5 take
       a type.
+  - L2 stage 2 at 38bf5d273, probed over the self-compile and 16,733 files with 0 uncompared:
+    - Done, byte-identical (1 parse): `mvValInnerRlSlot` is deleted. Its by-name fall-through
+      answered -1 at all 4,518 events in 1,255 files, and its callers read
+      `mvValInnerRlSlotAt`.
+    - Done, byte-identical (1 parse): `annRefListSlot`'s gate asks `tyIsRefArray(ty)`, and the
+      `annUnionSigKind` caller passes `tyPeelNul(ty)`. It differs in 2 of 4,007 files, both
+      false before and true now, at `{v:i32,next:null}[]` and `{kind:string,r:i32}[]`. Both
+      callers test only `rs >= 0`. difftree `--identity` found 0 of 16,620 files differ.
+    - Left: `rlSlotOfArrNameTy`. The typed lookup picks another row in 35 of 633 files (49
+      events), because twin rows hold the same key. Examples are `{[string]:{r:{[string]:i32}}}[]`,
+      `{r:i32}[][]` and `({n:i32}|null)[]`.
+    - Left: the producers. `collectARefArrayAnn`'s nullable test agrees with
+      `tyIsNulRefArray(fdRowOf(i))` everywhere, but it still peels the spelling that feeds the
+      key. The element key differs from `rlMintNameOfTy` of the element row in 2,089 of 3,618
+      files, and `ensureRefElemTys`'s cut differs in 215 of 509. Two things cause this: a
+      declared record renders by shape, and a grouped closure loses its parens. So these wait on
+      the registry being keyed by type, or on a mint name that keeps nominals.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
@@ -2178,9 +2254,10 @@ first read, I re-read samples of each class against the source:
 
 These were not settled by reading the code. Each needs a probe before its slice relies on it.
 
-- **`refArrElemNameGo` is B, but its key is parsed back.** An uncounted
-  `strContains(.., "=>")` in `emit_fns_scans` re-parses the key. That is an A outside the census's
-  callee set, and the ratchet cannot see it.
+- **`refArrElemName`'s key is parsed back.** An uncounted `strContains(.., "=>")` in
+  `emit_fns_scans` re-parses the key. That is an A outside the census's callee set, so the ratchet
+  cannot see it. Since 38bf5d273 the census also skips the `refArrElemNameGo` body, as part of the
+  parser.
 - **`monoNicheNulListCheck` (A)** assumes the typed binding reaches it. A control has to show
   that.
 - **`unionHasCollapsedStringMapArm` (A)** is dead according to its own comment. Whether it is dead

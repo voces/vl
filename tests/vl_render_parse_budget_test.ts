@@ -4,8 +4,8 @@
 // type-string parsers in the emitter. A counter that stopped seeing calls would
 // still pass `--check` (counts may only fall), so this grades a miniature emitter
 // module under `--root`: the real calls are listed, and a call in a comment, a
-// name in a string, a parser's own declaration, a parser's body, a renderer's body
-// (`tyToEmitNameAt`) and a file outside the emitter are not. The committed tree against its
+// name in a string, a parser's own declaration, a parser's body or its `<parser>Go`
+// ladder, a renderer's body (`tyToEmitNameAt`) and a file outside the emitter are not. The committed tree against its
 // baseline is the `render-parse budget` row of scripts/gate.sh and its own step in ci.yml.
 //
 // @test-timing native
@@ -34,6 +34,7 @@ const census = async (args: string[]): Promise<{ code: number; out: string }> =>
 const EMIT = `export function nameIsArray(name: string) {
   splitUnionAtoms(name, [])
 }
+function nameIsArrayGo(name: string) { nullablePartOf(name) }
 
 function kindOf(t: i32) {
   // nameIsArray(tyToEmitName(t)) in a comment is not a call
@@ -63,11 +64,11 @@ Deno.test({
       const r = await census(["--list", "--root", dir]);
       const got = r.out.trim().split(/\r?\n/).filter((l) => l);
       const want = [
-        "compiler/emit_x.vl:8  kindOf  nameIsArray",
-        "compiler/emit_x.vl:8  kindOf  tyToEmitName",
-        "compiler/emit_x.vl:14  emitCast  tyToEmitName",
-        "compiler/emit_x.vl:15  emitCast  nullablePartOf",
+        "compiler/emit_x.vl:9  kindOf  nameIsArray",
+        "compiler/emit_x.vl:9  kindOf  tyToEmitName",
         "compiler/emit_x.vl:15  emitCast  tyToEmitName",
+        "compiler/emit_x.vl:16  emitCast  nullablePartOf",
+        "compiler/emit_x.vl:16  emitCast  tyToEmitName",
       ];
       if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(want)) {
         throw new Error(`rc ${r.code}: want ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
