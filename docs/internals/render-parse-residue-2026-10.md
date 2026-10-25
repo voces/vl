@@ -1668,6 +1668,69 @@ What each slice changes:
     - The next step for the `let` tail is the closure rule: a hole closure's row is its bound
       signature in the frame, not the stub. The record and nullable classes are each their own
       rule.
+  - L2 stage 10 switches the `letRefListSlot` tail to the type and deletes its by-name pick.
+    The three classes stage 9 found each have a rule. In all three the element type does not
+    decide the row, because the value already has one. So an un-annotated `let` binds the row
+    its initializer delivers, read through `refListSlotOfExpr`. That holds in four cases
+    (`letInitDeliversRow`):
+    - A closure element whose signature holds a type variable (the hole class). The row is
+      the bound signature where the value was made: the source binding's row or the callee's
+      result row. The hole itself has no pin in the `let`'s frame, so the type reaches only
+      the `() => void` stub or no row.
+    - A record element (the same-field class). The row is the nominal row the value is
+      delivered at, such as the destination's `Shape` for an alias of a list built for
+      `Shape[]`. It is never a layout twin the field set also matches (`Circle`, or `J` for
+      `I`).
+    - A list literal with a spread. The copy keeps its source's row.
+    - A call to a named function (the nullable-scalar class). The row is the callee's own
+      result row. The `d3125_gen_*` cells call an un-annotated identity inside a generic
+      function. The callee's result is no ref list at its rep, so there is no row, and the
+      name path found none for that reason. The checker's `i32 | null` element type names a
+      row the value is never built at, and taking it gave invalid wasm.
+    Every other `let` takes the type's answer. A list literal takes `arrLitRowSlotIn`. Any
+    other initializer takes `rlSlotOfRowTy(rlRowTyOfElem(et))`.
+    - The probe was taken over the self-compile and 16,805 files, with 0 uncompared. It ran
+      beside the old by-name pick:
+
+      | init | files | agree | differ |
+      | --- | --- | --- | --- |
+      | identifier | 1,024 | 1,023 | 13 |
+      | call | 962 | 962 | 13 |
+      | list literal | 1,241 | 1,241 | 0 |
+      | member | 128 | 128 | 0 |
+      | binary | 208 | 208 | 0 |
+      | index | 71 | 71 | 0 |
+      | `if` | 35 | 35 | 0 |
+      | annotated | 5 | 3 | 2 |
+
+      16 files differ, down from 52 at stage 9. Each one was built under master's seed and
+      the candidate, and all 16 are byte-identical:
+      - 12 map-element lists (`{[string]: Circle}[]` and friends). The type finds the row
+        where the name declines.
+      - `map-boxed-ref-element-result`, which is the same kind.
+      - `captured-copy-of-mixed-width-litunion-list`. There the name finds `i64|i32` and the
+        type finds no row.
+      - Two annotated inline records of closures. There the name finds `#anon1`, and the type
+        finds `R` or no row.
+    - Before the four rules, the plain switch differed in 52 files. Graded, 26 of them changed
+      build outcome:
+      - 4 hole-closure lists refused.
+      - 2 record lists built invalid wasm.
+      - 20 `d3125_gen_*` cells went from a loud refusal to invalid wasm.
+      With the rules, all 52 are byte-identical, or both seeds fail them the same way.
+    - The rules leave the delivered case on `refListSlotOfExpr`, which still reads the name
+      family. Its switch is a separate slice (932 differing files at stage 9). This tail no
+      longer calls `rlSlotByNameTwin` itself.
+    - One row moves. D2857's un-annotated binding (`const u = nb(false) as! i32[][]`) now
+      runs. Its element type keys the `i32[]` row, where the name family has no `as!` arm.
+      `as-bang-nested-list-arm-unannotated.vl` pins it, and the row is narrowed to the inline
+      index, which still refuses. No file in the probe population had a cast initializer,
+      which is why no probe event recorded the change.
+    - difftree `--identity`: 1 of 16,694 files differs (11,802 built), and the fixpoint
+      identity holds. The one file is that new fixture: master refuses it and the candidate
+      builds it.
+    - The census and the render-parse budget do not move (50 renders, 86 parses), since the
+      deleted pick parsed no spelling the census counts.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
