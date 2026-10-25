@@ -564,35 +564,133 @@ function vrBin(n: BinExpr, p: i32, x: i32, path: string): i32[] {
   out
 }
 
-// The un-annotated `let` whose field or element the place `t` names, when it is bound to a fresh
-// list, record or `Map()`, with `pre[0]` prefixed by that step; -1 otherwise. One step only: a
-// literal nested in it may be another binding's storage.
+// The un-annotated `let` the place `t` writes into, bound to a fresh list, record or `Map()`
+// whose literal holds a fresh list or record at each step before the last, with `pre[0]`
+// prefixed by the place's steps; -1 otherwise, or when a container on the way may be re-pointed
+// (`vrRepointable`), which would land the write in another binding's storage (D12302).
 function vrPlaceRoot(t: i32, pre: string[]): i32 {
-  const n = nodeAt(t)
-  let x = -1
-  let step = ""
-  if n is Member {
-    step = "f:" + n.memProp + ","
-    x = unwrapParen(n.memObj)
-  } else if n is Index {
-    step = "e,"
-    x = unwrapParen(n.idxArr)
+  // The steps, the last first.
+  const steps: string[] = []
+  let x = t
+  let more = true
+  while more && x >= 0 && x < P.nodes.length && steps.length <= 8 {
+    const n = nodeAt(x)
+    if n is Member {
+      steps.push("f:" + n.memProp + ",")
+      x = unwrapParen(n.memObj)
+    } else if n is Index {
+      steps.push("e,")
+      x = unwrapParen(n.idxArr)
+    } else {
+      more = false
+    }
   }
+  if steps.length == 0 || steps.length > 8 { return -1 }
   if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return -1 }
   const dn = nodeAt(d)
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
-  const init = nodeAt(unwrapParen(dn.letInit))
+  const iv = unwrapParen(dn.letInit)
+  if iv < 0 || iv >= P.nodes.length { return -1 }
+  const init = nodeAt(iv)
   let fresh = init is ObjLit || init is ArrayLit
   if init is Call && init.callArgs.length == 0 {
     const cf = nodeAt(unwrapParen(init.callFn))
     fresh = cf is Ident && cf.identName == "Map" && identDeclOf(init.callFn) < 0
   }
   if !fresh { return -1 }
-  pre[0] = step + pre[0]
+  let lits: i32[] = [iv]
+  let k = steps.length - 1
+  while k > 0 {
+    lits = vrLitStep(lits, steps[k])
+    if lits.length == 0 { return -1 }
+    k = k - 1
+  }
+  if vrRepointable(d, steps.length) { return -1 }
+  let p = pre[0]
+  for s in steps { p = s + p }
+  pre[0] = p
   d
 }
+
+// The list and record literals the literals `lits` hold at the path step `step`; empty when one
+// of them holds anything else there.
+function vrLitStep(lits: i32[], step: string): i32[] {
+  const out: i32[] = []
+  const none: i32[] = []
+  for l in lits {
+    const n = nodeAt(l)
+    if step == "e," {
+      if !(n is ArrayLit) { return none }
+      for e in n.arrElems {
+        const v = unwrapParen(e)
+        if v < 0 || !(nodeAt(v) is ObjLit || nodeAt(v) is ArrayLit) {
+          return none
+        }
+        out.push(v)
+      }
+    } else {
+      if !(n is ObjLit) { return none }
+      let v = -1
+      for fi in n.objFields {
+        const f = nodeAt(fi)
+        if f is FieldInit && "f:" + f.fiName + "," == step {
+          v = unwrapParen(f.fiValue)
+        }
+      }
+      if v < 0 || !(nodeAt(v) is ObjLit || nodeAt(v) is ArrayLit) {
+        return none
+      }
+      out.push(v)
+    }
+  }
+  out
+}
+
+// Whether a read of the binding declared at `d` may re-point a container on a place `n` steps
+// under it: it rebinds it, writes or calls a method on a container above the last, or hands one
+// of those to anything else, which could.
+function vrRepointable(d: i32, n: i32): boolean {
+  for u in vrUses[d] ?? [] {
+    let cur = u
+    let m = 0
+    let p = sidArrGet(vrParent, cur)
+    let more = true
+    while more && p >= 0 {
+      const pn = nodeAt(p)
+      if pn is Paren {
+        cur = p
+      } else if pn is Member && pn.memObj == cur {
+        cur = p
+        m = m + 1
+      } else if pn is Index && pn.idxArr == cur {
+        cur = p
+        m = m + 1
+      } else {
+        more = false
+      }
+      if more { p = sidArrGet(vrParent, cur) }
+    }
+    if p < 0 {
+      if vrHandsOnAbove(m, n) { return true }
+    } else {
+      const pn = nodeAt(p)
+      if pn is BinExpr && pn.binOp == "=" && pn.binLeft == cur {
+        if m < n { return true }
+      } else if pn is Call && pn.callFn == cur && m > 0 {
+        if m < n { return true }
+      } else if vrHandsOnAbove(m, n) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Whether a read handing on the container `m` steps under the binding reaches above the last
+// container of an `n`-step place, so whatever receives it could re-point one.
+function vrHandsOnAbove(m: i32, n: i32): boolean { m < n - 1 }
 
 // The `Call` arm of `vrStep` for an argument: none when its parameter is declared a closed type
 // no function fits (D6471); the calls its reads reach when it takes its argument's own type
