@@ -7,6 +7,27 @@ measurement, its proposed shape and its first PR. This plan owns what neither of
 **the order, the dependencies, how a step is accepted, and where each item stands.** It does not
 restate measurements; follow the links.
 
+## Redirected, 2026-10-25: one producer per fact
+
+The owner stopped shape-by-shape fixing: L1's closes were filing about one new row each, so
+the family never shrank. The program now follows the seven-step migration in
+[architecture-target-2026-10.md](architecture-target-2026-10.md) §3. The checker elaborates
+each instance once and puts a function value's identity in its type, and the emitter only
+lowers. That migration replaces the L1, L2 and ExpCtx parts of this plan wherever they
+disagree.
+
+- **Scoreboard:** the speed of `vl check`, `vl run` and `vl build` (diderven check and build
+  fuel, plumb-shape cost, L2 self-compile fuel), plus leanness (compiler lines, seed bytes,
+  special-case helper counts). The baselines are in §4.1 of that document. Rows close as a
+  side effect.
+- **No loss of language function, inference first:** no step may require an annotation.
+- **Every step deletes code,** and its proof is the same each time:
+  - an unchanged difftree, apart from the intended movers;
+  - no `runs → not-runs`;
+  - the fuel readings above.
+- **Paused:** no targeted L1 lanes and no new per-class L2 rules. L6's render-parse work
+  continues on its own.
+
 ## When the program is done
 
 - Every row of ARCHITECTURE.md §7 is gone, except rows that wait on an owner ruling and say so.
