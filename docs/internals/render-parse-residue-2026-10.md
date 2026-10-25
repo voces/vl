@@ -182,13 +182,13 @@ the slice retires.
 | A2 | emit_mono typed tests (done: 8 retired, 1 to B, 0 left; the arrow test reads the pin type once a hole-function argument is pinned at its slot's substituted type) | 1 | 0 / 1 / 0 | 0 / 1 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 11 retired, 1 left; re-probed at 5888be183 with the inventory witnesses: the nullable-element reject and the arm-shape walk typed, `dstPinMapValue`'s cut is the pin name it pushes) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
-| A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left, because a generic body's target has no row and no pinned type) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
+| A5 | union-atom and atom-kind twins (landed: 7 retired, 5 left; `forceCloResultListTypes` walks the node's type; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left, because a generic body's target has no row and no pinned type) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, then the 3 in `monoAnnHasTyParam`, 5 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted; `monoAnnHasTyParam` asks the annotation node; the 5 left re-probed per site, none swaps) | 5 | 0 / 5 / 0 | 0 / 5 | `emit_base` |
 | C2 | instance cell signatures typed (landed: 2 retired, 3 left; the arrow tests wait on constructor producers that build signature text with no type, and the render is a synthesized TypeRef's name) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 11 retired, 5 left and reclassed D: each is a key the walk parses back, which goes with the type-keyed shape interner) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
-| D1 | ref-list slot keyed by type (landed: 17 retired, 13 left; the producers name their rows by type (`rlRowNameOfTy`) and keep the spelling cut only as the floor for a missing type or a hole; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; the `fill`, `.map` result and `string\|null` renders ask the ref-list mint keyed by type for its key (`rlMintNameOfTy`, class B); the rest are producers and grammar predicates) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
+| D1 | ref-list slot keyed by type (landed: 18 retired, 12 left; the producers name their rows by type (`rlRowNameOfTy`) and keep the spelling cut only as the floor for a missing type or a hole; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; the `fill`, `.map` result and `string\|null` renders ask the ref-list mint keyed by type for its key (`rlMintNameOfTy`, class B); the rest are producers and grammar predicates) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 8 retired, 14 left; `refArrElemNameIf` is deleted, its last caller reading its arm's element row by type; the ladder internals still have name callers that mint by spelling) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer; re-checked at 84b98d149 after #4700: the pins are computed before the instance exists, none retired; re-probed at edc698135 over every pin at the mint: the banked type is the argument's, not the pin's, and differs from the resolved pin type in 371 files, so step 1 is not byte-identical) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5; re-checked at 84b98d149, unchanged) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
@@ -345,12 +345,20 @@ What each slice changes:
   The two ref-array arm tests ask the element union row's `unionMemberTysOf` members.
   `unionHasCollapsedStringMapArm` is deleted with its caller block, which an armed probe reached
   in 0 files. A probe over every `tests/**/*.vl` and the distilled corpus found 0 differing
-  files for each retired site. Six stay:
+  files for each retired site. Five stay:
   - `valueAtomKindOfTy`'s fallback answers declined shapes, and some of those no file reaches.
   - `mapAnnShape`'s value spelling also keys the D8 mv-slot lookups.
-  - The two closure-result walkers intern by spelling (`mvShapeOfMapName`, `ensureRefElem`),
-    and a closure position inside one TypeRef has no node, so a typed walk would need a render
-    to rebuild the key. They wait on D8's mv slot and D1's ref-list slot keyed by type.
+  - `forceCloResultMapTypes` interns by spelling (`mvShapeOfMapName`), and a closure position
+    inside one TypeRef has no node, so a typed walk would need a render to rebuild the key. It
+    waits on D8's mv slot keyed by type.
+  - Its list dual is retired, with D1's `nameIsRefArray` gate. `forceCloResultListTypes` takes
+    the node's type and walks each `TyFunc` it holds, itself or as a `TyUnion` member; each
+    position forces its scalar-list backing (`tyScalarListKind`) or, when `tyIsRefArray`, its
+    ref row by `rlRowNameOfTy`, and a curried position recurses on its `TyFunc`. The probe over
+    the self-compile and 16,757 files reached it 1,004 times in 115 files, every one typed, so
+    no spelling floor is kept. 497 events agree. In 507 the type walk forces a backing or row
+    the spelling missed, mostly a synthesized signature TypeRef (`=>a>i`) with no `[]` to cut.
+    difftree over the 115 files: 0 differ.
   - `monoStaticIsResult`'s typed compare answers differently in 2 files. The spelling compare
     is reached in 59 files and is never true there, but it is live for an alias of a
     primitive (`type N = i32` at an `i32` pin). Both differing files test a record that is
