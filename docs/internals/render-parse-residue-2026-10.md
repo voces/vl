@@ -102,7 +102,7 @@ The other 3 renders and 12 parses in B are **conditional key producers**:
 
 - `anonMapValName` (D8)
 - `listUnionEmitName` (D5)
-- `rlMintNameOfTy` (D1)
+- `rlMintNameOfTy` (D1) (retired: it is the nominal row name `rlRowNameOfTy` gives)
 - `rlCanonLitUnionAtoms` ×4
 - `shapeFieldElemName` ×3
 - `nulLitUnionInnerName` ×2 (retired: it is deleted, and its callers ask the field's type)
@@ -194,7 +194,7 @@ the slice retires.
 | C3 | shape-intern walkers take field types (landed: 11 retired, 5 left and reclassed D: each is a key the walk parses back, which goes with the type-keyed shape interner) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 8 retired, 9 left; re-probed after D7 and D8: the niche ladders still wait on the grammar entries' D2, D8 and emit_mono callers, and the generic-alias walk on a type-keyed instance registry; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
-| D1 | ref-list slot keyed by type (landed: 18 retired, 12 left; the producers name their rows by type (`rlRowNameOfTy`) and keep the spelling cut only as the floor for a missing type or a hole; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; the `fill`, `.map` result and `string\|null` renders ask the ref-list mint keyed by type for its key (`rlMintNameOfTy`, class B); the rest are producers and grammar predicates) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
+| D1 | ref-list slot keyed by type (landed: 18 retired, 12 left; the producers name their rows by type (`rlRowNameOfTy`) and keep the spelling cut only as the floor for a missing type or a hole; the `rlMapElemValSlot` fall-through reads the mv slot its row's mint recorded; the `fill`, `.map` result and `string\|null` renders ask the ref-list mint keyed by type for its key (`rlMintNameOfTy`, whose class B render is retired: it names the row nominally, as `rlRowNameOfTy` does); the rest are producers and grammar predicates) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 8 retired, 14 left; `refArrElemNameIf` is deleted, its last caller reading its arm's element row by type; the ladder internals still have name callers that mint by spelling) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer; re-checked at 84b98d149 after #4700: the pins are computed before the instance exists, none retired; re-probed at edc698135 over every pin at the mint: the banked type is the argument's, not the pin's, and differs from the resolved pin type in 371 files, so step 1 is not byte-identical) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5; re-checked at 84b98d149, unchanged) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
@@ -1366,6 +1366,25 @@ What each slice changes:
       files, and `ensureRefElemTys`'s cut differs in 215 of 509. Two things cause this: a
       declared record renders by shape, and a grouped closure loses its parens. So these wait on
       the registry being keyed by type, or on a mint name that keeps nominals.
+  - L2 stage 2 at 1b0f55762, probed over the self-compile and 16,772 files with 0 uncompared:
+    - Done (1 render, class B): `rlMintNameOfTy` is `rlRowNameOfTy(ty, false)`, the nominal
+      render, so the mint keyed by type keeps a declared record's name and a function type's
+      parens. The names differ in 8 of the 21 files that reach it (`{r:i32}` against `C`,
+      `(i32)=>i32` against `((i32)=>i32)`), every one a row whose key already matched.
+      difftree `--identity`: 0 of 16,666 files differ, and the fixpoint identity holds.
+    - Moved, no entry retired: `arrLitNestedElemKind` and `arrLitNulRefElemKind` drop their
+      spelling floor (`refArrElemKind(refElemArrName(en))`), which no file reached. That leaves
+      `ensureRefElemTys` as `refElemArrName`'s one caller. Its floor answers 5,987 events in
+      1,050 files, almost all from callers that hand over no type.
+    - Left: `rlSlotOfArrNameTy`. The typed lookup picks another row in 37 of 628 files, and in
+      most the caller's type is not the one the spelling names. It is a literal element type
+      (`{r: null}` where the annotation names `Circle`), a narrowed member of a union annotation,
+      or a declared or layout twin of the spelled row. A better twin pick cannot fix that. It
+      goes when `annRefListSlot` and `rlElemInnerSlot` hold the annotation's own element type.
+    - Left: the floors in `collectARefArrayAnn` and `ensureRefElemTys`. They answer 339 events in
+      89 files and 716 in 152, mostly a type parameter's list (`(T|null)[]`, `((T)=>void)[]`).
+      `collectARefArrayAnn`'s `| null` peel feeds only those floors, and its test agrees with
+      `tyIsNulRefArray` at every one of 19,587 events.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
   `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
   every record and every nested list, with no row. So the slice added a narrower twin,
