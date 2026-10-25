@@ -1359,6 +1359,7 @@ import {
   unionMemberAtomsOf,
   unionMemberSetOf,
   unionMemberTysOf,
+  unionRowKeyAB,
   unionRowOf,
   unionSetAtomsOf,
   unionSetHasNull,
@@ -7753,10 +7754,12 @@ function emitCoalesceMapJoin(
   )
 }
 
-// Whether `unionName` is a box-represented union (a non-null value atom beside another
-// member) that has no registry row, so no arm of it can be tagged.
-function unionBoxHasNoRow(unionName: string): boolean {
-  if unionName == "" || unionRowOf(unionName) >= 0 { return false }
+// Whether `unionName`, typed `unionTy` (-1 when unknown), is a box-represented union (a non-null
+// value atom beside another member) that has no registry row, so no arm of it can be tagged.
+function unionBoxHasNoRow(unionName: string, unionTy: i32): boolean {
+  if unionName == "" || unionRowKeyAB(84, unionName, unionTy) >= 0 {
+    return false
+  }
   const atoms: string[] = []
   unionSetAtomsOf(unionName, atoms)
   if atoms.length < 2 { return false }
@@ -8348,6 +8351,7 @@ function emitUnionCoerceUnder(
     body,
     unionName,
     unionNameIn,
+    unionTy,
     exprIx,
     fnIx,
     ec,
@@ -8389,7 +8393,7 @@ function emitUnionCoerceRecord(
     // below picks the first field-name-set match across all unions, which can land on another
     // union's arm sharing the names — two nested-struct arms differing only in the nested
     // layout collide onto the first arm's tag. A single-union program resolves either way.
-    const ctxVi = unionArmVariantForObj(unionName, bareIx, fnIx)
+    const ctxVi = unionArmVariantForObj(unionName, uTy, bareIx, fnIx)
     if ctxVi >= 0 { return emitUnionBoxAs(body, bareIx, ctxVi, fnIx, ec) }
     // When the literal matches a union variant, box it as that variant directly rather than
     // routing through `emitExpr` — whose `structIndexOfObj` re-inference mis-resolves a
@@ -8405,7 +8409,7 @@ function emitUnionCoerceRecord(
   // where the box wants the variant struct. Re-box it against the matched arm
   // (`emitStructExprAsVariantBox`). Gated on the heaps differing, so a deduped shape is raw.
   if unionName != "" && exprStruct(exprIx, fnIx) {
-    const rbVi = unionArmVariantForStructExpr(unionName, exprIx, fnIx)
+    const rbVi = unionArmVariantForStructExpr(unionName, uTy, exprIx, fnIx)
     if rbVi >= 0 {
       const rbSsi = structIndexOfExpr(exprIx, fnIx)
       if rbSsi >= 0 {
@@ -8425,7 +8429,7 @@ function emitUnionCoerceRecord(
   }
   if exprStruct(exprIx, fnIx) {
     // With no row the record arm has no tag, and a raw record ref is no box (D3519).
-    if unionBoxHasNoRow(unionName) {
+    if unionBoxHasNoRow(unionName, uTy) {
       return emitFailAt(
         "emitProgram: a record value delivered into a union box this program never registered has no tag",
         exprIx,
@@ -39675,6 +39679,7 @@ function refAtomElemName(k: i32): string {
 // tagged with an atom the union does not have is valid wasm whose `is` test is silently false.
 function coalNicheBoxTag(
   joinSet: string,
+  joinTy: i32,
   lhsIx: i32,
   heapIx: i32,
   fnIx: i32,
@@ -39692,7 +39697,7 @@ function coalNicheBoxTag(
     if !unionHasAtomTy(joinSet, en, ak != 2) { return -1 }
     return scalarTagOfKind(ak)
   }
-  const vi = unionArmVariantWithHeap(joinSet, heapIx)
+  const vi = unionArmVariantWithHeap(joinSet, joinTy, heapIx)
   if vi >= 0 && vi < uTags.length { return uTags[vi] }
   -1
 }
@@ -39722,6 +39727,7 @@ function emitUnionBoxNulNiche(
   body: u8[],
   unionName: string,
   unionKey: string,
+  unionTy: i32,
   exprIx: i32,
   fnIx: i32,
   ec: ExpCtx,
@@ -39756,6 +39762,7 @@ function emitUnionBoxNulNiche(
   }
   const nnTag = coalNicheBoxTag(
     unionName,
+    unionTy,
     nnIx,
     nulNicheValueHeap(nnIx, fnIx),
     fnIx,
@@ -39785,13 +39792,20 @@ function emitUnionBoxNulNiche(
 // nor a resolvable arm of `joinSet` passes RAW through the box coercion, and a bare
 // `(ref $struct)` under a box blocktype is invalid wasm. Only that shape can, so only it is
 // asked; every other default either boxes or takes its own loud reject (D1720).
-function coalJoinDefaultBoxes(joinSet: string, defIx: i32, fnIx: i32): boolean {
+function coalJoinDefaultBoxes(
+  joinSet: string,
+  joinTy: i32,
+  defIx: i32,
+  fnIx: i32,
+): boolean {
   const d = nodeAt(unwrapParen(defIx))
   if d is ObjLit { return true }
   // A default that is itself a box (a nested join) is already the box rep.
   if exprUnion(defIx, fnIx) { return true }
   if !exprStruct(defIx, fnIx) { return true }
-  if unionArmVariantForStructExpr(joinSet, defIx, fnIx) >= 0 { return true }
+  if unionArmVariantForStructExpr(joinSet, joinTy, defIx, fnIx) >= 0 {
+    return true
+  }
   exprVariantIndex(defIx, fnIx) >= 0
 }
 
@@ -39811,14 +39825,21 @@ function emitCoalesceNulRefJoin(
   const joinN = coalesceResultUnionName(exprIx)
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
-  const tag = coalNicheBoxTag(joinSet, unwrapParen(e.binLeft), heapIx, fnIx)
+  const joinTy = nodeTyPinIxOf(exprIx)
+  const tag = coalNicheBoxTag(
+    joinSet,
+    joinTy,
+    unwrapParen(e.binLeft),
+    heapIx,
+    fnIx,
+  )
   if tag < 0 {
     return emitFailAt(
       "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
       exprIx,
     )
   }
-  if !coalJoinDefaultBoxes(joinSet, e.binRight, fnIx) {
+  if !coalJoinDefaultBoxes(joinSet, joinTy, e.binRight, fnIx) {
     return emitFailAt(
       "emitProgram: `??` default names no arm of the union its result is",
       exprIx,
@@ -39863,6 +39884,7 @@ function emitCoalesceNulBoolJoin(
   const joinN = coalesceResultUnionName(exprIx)
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
+  const joinTy = nodeTyPinIxOf(exprIx)
   const bvb = vbHeapIdxOfKind(1)
   if bvb < 0 || !unionHasAtomTy(joinSet, "boolean", false) {
     return emitFailAt(
@@ -39870,7 +39892,7 @@ function emitCoalesceNulBoolJoin(
       exprIx,
     )
   }
-  if !coalJoinDefaultBoxes(joinSet, e.binRight, fnIx) {
+  if !coalJoinDefaultBoxes(joinSet, joinTy, e.binRight, fnIx) {
     return emitFailAt(
       "emitProgram: `??` default names no arm of the union its result is",
       exprIx,
