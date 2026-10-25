@@ -42062,9 +42062,66 @@ function emitCoalesceNullableRefs(
   }
   const armIf = coalNullArmIf(e, exprIx)
   if armIf >= 0 { return emitExpr(body, armIf, fnIx, ec) }
+  // A record union's shared `scalar | null` field reads as its box (D13280).
+  const fk = coalBoxFieldScalarKind(lhsIx, fnIx)
+  if fk >= 0 {
+    return emitCoalesceBoxFieldScalar(body, e, exprIx, fk, fnIx, ec)
+  }
   emitFail(
     "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
   )
+}
+
+// The scalar atom kind of the `scalar | null` box the field read `lhsIx` yields, read off the
+// box's own member set so a hole instance answers too; -1 for any other operand.
+function coalBoxFieldScalarKind(lhsIx: i32, fnIx: i32): i32 {
+  if lhsIx < 0 || !(nodeAt(lhsIx) is Member) || !exprUnion(lhsIx, fnIx) {
+    return -1
+  }
+  const un = memberUnionFieldNameRead(lhsIx, fnIx)
+  if un == "" { return -1 }
+  const sid = msSetOfNameTy(un, nodeTyAt(lhsIx, fnIx))
+  if !unionHasAtomK(sid, un, "null", nullValKind()) { return -1 }
+  const k = unionResidualSoloKindOfSet(sid)
+  if nulBoxScalarValtype(k) < 0 || vbHeapIdxOfKind(k) < 0 { return -1 }
+  k
+}
+
+// `f ?? d` over a field read `f` yielding a `scalar | null` box of atom kind `fk`: the box is
+// read once, its tag decides, and the present arm unboxes and widens to the `??`'s own scalar.
+function emitCoalesceBoxFieldScalar(
+  body: u8[],
+  e: BinExpr,
+  exprIx: i32,
+  fk: i32,
+  fnIx: i32,
+  ec: ExpCtx,
+) {
+  let rk = coalResultKindOf(exprIx, fnIx)
+  if rk < 0 { rk = fk }
+  if rk != fk && !coalWidens(fk, rk) {
+    return emitFail(
+      "emitProgram: `??` over a nullable value-box field has no conversion to its result",
+    )
+  }
+  const slot = sharedFieldRecvSlot()
+  if emitExpr(body, e.binLeft, fnIx, ec) < 0 { return -1 }
+  fbLocalSet(slot)
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(71) // 0x47 i32.ne — present?
+  fbIf(nulBoxScalarValtype(rk))
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
+  const vb = vbHeapIdxOfKind(fk)
+  fbRefCast(vb)
+  fbStructGet(vb, 0)
+  if coalWidenUnboxed(fk, rk) < 0 { return -1 }
+  fbElse()
+  if emitCoalesceScalarDefault(body, e.binRight, rk, fnIx, ec) < 0 { return -1 }
+  fbEnd()
+  0
 }
 
 // `if c { d } else { a ?? d }` for `(if c { null } else { a }) ?? d`, and its mirror, which is
