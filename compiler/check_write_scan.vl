@@ -1457,24 +1457,160 @@ export function cwSlotWrittenValues(
   if bd < 0 { return -1 }
   const bn = nodeAt(bd)
   if !(bn is LetDecl) { return -1 }
-  if !cwSlotDescend(bn.letInit, path, 0, -1, vals, ats) { return -1 }
+  const inits = [bn.letInit]
+  cwSlotValuesFrom(nm, fr, bn.letInit, inits, path, vals, ats)
+}
+
+// `cwSlotWrittenValues` for the `let` (`nm`, `fr`) whose initialiser `init` stores the values
+// `inits`: a call's returned values, when the call returns a fresh list or record.
+export function cwSlotValuesFrom(
+  nm: string,
+  fr: i32,
+  init: i32,
+  inits: i32[],
+  path: string[],
+  vals: i32[],
+  ats: i32[],
+): i32 {
+  for v in inits {
+    if !cwSlotDescend(v, path, 0, -1, vals, ats) { return -1 }
+  }
   const nBound = vals.length
   for v in cwBindingWrittenValues(nm, fr) {
-    if v != bn.letInit && !cwSlotDescend(v, path, 0, -1, vals, ats) {
-      return -1
-    }
+    if v != init && !cwSlotDescend(v, path, 0, -1, vals, ats) { return -1 }
   }
+  if !cwSlotWritesInto(nm, fr, path, vals, ats, 0) { return -1 }
+  vals.length - nBound
+}
+
+// Add what each write through a handle on the container (`nm`, `fr`), or on a list or record
+// literal holding it, stores at `path` (D12239); false when one is not a literal's part.
+function cwSlotWritesInto(
+  nm: string,
+  fr: i32,
+  path: string[],
+  vals: i32[],
+  ats: i32[],
+  depth: i32,
+): boolean {
+  if depth > 8 { return false }
   const names: string[] = []
   const frs: i32[] = []
   cwContainerAliases(nm, fr, names, frs)
   let i = 0
   while i < names.length {
     if i == 0 || cwSlotHandle(names[i], frs[i]) {
-      if !cwSlotWritesThrough(names[i], frs[i], path, vals, ats) { return -1 }
+      if !cwSlotWritesThrough(names[i], frs[i], path, vals, ats) {
+        return false
+      }
+      if !cwSlotHeldWrites(names[i], frs[i], path, vals, ats, depth) {
+        return false
+      }
     }
     i = i + 1
   }
-  vals.length - nBound
+  true
+}
+
+// `cwSlotWritesInto` at each `let` whose literal holds the name (`nm`, `fr`) as an element or
+// field value, at the literal's path to it followed by `path`.
+function cwSlotHeldWrites(
+  nm: string,
+  fr: i32,
+  path: string[],
+  vals: i32[],
+  ats: i32[],
+  depth: i32,
+): boolean {
+  const ow = cwOccWalk(nm, fr)
+  while cwOccNext(ow) {
+    const r = ow.row
+    const u = cwIxNode[r]
+    if (
+      cwIxKind[r] == CW_OCC_USE
+      && cwIxFr[r] == fr
+      && u >= 0
+      && u < cwIxUpKind.length
+    ) {
+      const k = cwIxUpKind[u]
+      let fld = ""
+      if k == CW_UP_ELEM { fld = CW_ELEM_FLD }
+      if k == CW_UP_FIELD { fld = cwFieldNameOf(cwIxUpAux[u]) }
+      const on: string[] = []
+      const of: i32[] = []
+      const op: string[] = []
+      if fld != "" && cwLitOwners(cwIxUp[u], fld, on, of, op, 0) {
+        let j = 0
+        while j < on.length {
+          const steps = cwSplitPath(op[j])
+          // A write re-pointing the place that held the name stores another container there.
+          if !cwSlotRepointed(on[j], of[j], steps) {
+            for s in path { steps.push(s) }
+            if !cwSlotWritesInto(on[j], of[j], steps, vals, ats, depth + 1) {
+              return false
+            }
+          }
+          j = j + 1
+        }
+      }
+    }
+  }
+  true
+}
+
+// Whether a write through a handle on the container (`nm`, `fr`) stores at `held` or at a
+// place holding it.
+function cwSlotRepointed(nm: string, fr: i32, held: string[]): boolean {
+  const names: string[] = []
+  const frs: i32[] = []
+  cwContainerAliases(nm, fr, names, frs)
+  let i = 0
+  while i < names.length {
+    if i == 0 || cwSlotHandle(names[i], frs[i]) {
+      const ow = cwOccWalk(names[i], frs[i])
+      while cwOccNext(ow) {
+        const r = ow.row
+        if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == frs[i] {
+          let top = cwIxNode[r]
+          while (
+            top >= 0
+            && top < cwIxUpKind.length
+            && cwIxUpKind[top] == CW_UP_OBJ
+          ) {
+            top = cwIxUp[top]
+          }
+          const lp: string[] = []
+          if (
+            top >= 0
+            && top < cwIxUpKind.length
+            && cwIxUpKind[top] == CW_UP_ASG_LHS
+            && cwSlotPath(top, lp) >= 0
+            && lp.length > 0
+            && cwPathPrefix(lp, held)
+          ) {
+            return true
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The steps of a path key `cwJoinPath` spelled.
+function cwSplitPath(p: string): string[] {
+  const out: string[] = []
+  let at = 0
+  let i = 0
+  while i <= p.length {
+    if i == p.length || p.slice(i, i + 1) == "." {
+      if i > at { out.push(p.slice(at, i)) }
+      at = i + 1
+    }
+    i = i + 1
+  }
+  out
 }
 
 // The identifier the `let` (`nm`, `fr`) is bound once to when it names another `let`, or -1.

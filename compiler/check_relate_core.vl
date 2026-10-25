@@ -113,7 +113,14 @@ import {
   recordJoinMinted,
   recordJoinMintedSet,
 } from "./check_core_state"
-import { argCstr, binCstr, cvNow, printCstr } from "./check_cstr_rows"
+import {
+  argCstr,
+  binCstr,
+  cstrOwnerTop,
+  cvNow,
+  noteArgCstr,
+  printCstr,
+} from "./check_cstr_rows"
 import {
   inferQuiet,
   lamCheckDepth,
@@ -183,6 +190,7 @@ import {
 } from "./check_inline_lit_union"
 import {
   ACF_COMP,
+  ACF_EXACT,
   ACF_TPL,
   OP_AS,
   OP_BNOT,
@@ -500,6 +508,7 @@ import {
   cwParamArgs,
   cwPeel,
   cwSlotPath,
+  cwSlotValuesFrom,
   cwSlotWrittenValues,
   cwSoleBinderOf,
   fnDeclIx,
@@ -3900,6 +3909,7 @@ export function argCstrFits(rat: i32, rexp: i32, form: i32) {
   if form > 0 { return !holeArgScalarRefused(rat, rexp) }
   // Decided by its node at the pin (`validateCompArgCstr`); a type alone would refuse a literal.
   if form == ACF_COMP { return true }
+  if form == ACF_EXACT { return tySame(widenLitTy(rat), rexp) }
   assignable(rat, rexp)
 }
 
@@ -4433,6 +4443,9 @@ export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
   holeLetWritesDisagreeAt(a, pts, pts)
 }
 
+// Whether the slot judges record each parameter check against a type variable as a demand.
+let holeSlotDeferring = false
+
 // `holeLetWritesDisagree`, judging each fixed-type function a slot holds at `fixed` (D10120);
 // an empty `fixed` judges none.
 export function holeLetWritesDisagreeAt(
@@ -4442,13 +4455,26 @@ export function holeLetWritesDisagreeAt(
 ): boolean {
   if inferQuiet || holeFnArgDecl(a) >= 0 { return false }
   const wp: i32[] = []
+  let open = false
   for pt in pts {
-    if pt < 0 || tyHasTyVar(pt) { return false }
+    if pt < 0 { return false }
+    if tyHasTyVar(pt) { open = true }
     wp.push(widenLitTy(pt))
   }
   const reads: i32[] = []
   const seen: i32[] = []
   holeLetReadsOf(a, seen, reads)
+  // A type variable among `pts` is the enclosing generic's: its parameter checks wait for the
+  // pin as demands, as a direct call of the written lambda's do (D12238).
+  if open {
+    if cstrOwnerTop() < 0 { return false }
+    holeSlotDeferring = true
+    for r in reads {
+      if holeIsSlotRead(r) { holeSlotJudge(r, wp, fixed) }
+    }
+    holeSlotDeferring = false
+    return false
+  }
   for r in reads {
     if holeIsSlotRead(r) {
       if holeSlotJudge(r, wp, fixed) { return true }
@@ -4638,8 +4664,10 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   if fr == CW_FR_UNKNOWN { return false }
   const bd = cwSoleBinderOf(rn.identName, fr)
   if bd < 0 || bd >= P.nodes.length { return false }
-  // A parameter's list is each call's argument, judged one call at a time (D9280).
+  // A parameter's list is each call's argument, judged one call at a time (D9280); deferring,
+  // each call's delivery to the parameter's own type judges it instead.
   if nodeAt(bd) is Param {
+    if holeSlotDeferring { return false }
     const args: i32[] = []
     if cwElemCallbackRecv(bd) >= 0 || !cwParamArgs(bd, args) { return false }
     for v in args {
@@ -4649,16 +4677,33 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   }
   if !(nodeAt(bd) is LetDecl) { return false }
   const init = parenPeelIx(cwBoundInitOf(rn.identName, fr))
+  const rets: i32[] = []
+  let called = false
   if init >= 0 && init < P.nodes.length {
     const cn = nodeAt(init)
     if cn is Call && holeSlotRetJudge(cn, rn.identName, path, wp, pts, 0) {
       return true
     }
+    if cn is Call { called = holeSlotCallRets(cn, rets) }
   }
   const vals: i32[] = []
   const ats: i32[] = []
-  const nW = cwSlotWrittenValues(rn.identName, fr, path, vals, ats)
-  holeSlotValsJudge(holeSlotName(rn.identName, path), vals, ats, nW, wp, pts)
+  // A list or record a call returns holds the call's returned values and what is written to it.
+  let nW = -1
+  if called {
+    nW = cwSlotValuesFrom(rn.identName, fr, init, rets, path, vals, ats)
+  } else {
+    nW = cwSlotWrittenValues(rn.identName, fr, path, vals, ats)
+  }
+  holeSlotValsJudge(
+    holeSlotName(rn.identName, path),
+    holeSlotSpell(rn.identName, path),
+    vals,
+    ats,
+    nW,
+    wp,
+    pts,
+  )
 }
 
 // The root of the place `root` and `p0` name, its steps in `out`, followed through each binding
@@ -4708,7 +4753,15 @@ function holeSlotArgJudge(
       vals.push(e)
       ats.push(e)
     }
-    return holeSlotValsJudge(holeSlotName(pNm, path), vals, ats, 0, wp, pts)
+    return holeSlotValsJudge(
+      holeSlotName(pNm, path),
+      holeSlotSpell(pNm, path),
+      vals,
+      ats,
+      0,
+      wp,
+      pts,
+    )
   }
   if depth > 8 { return false }
   if n is Call { return holeSlotRetJudge(n, pNm, path, wp, pts, depth) }
@@ -4743,7 +4796,15 @@ function holeSlotArgJudge(
   }
   if !(nodeAt(bd) is LetDecl) { return false }
   const nW = cwSlotWrittenValues(n.identName, fr, path, vals, ats)
-  holeSlotValsJudge(holeSlotName(n.identName, path), vals, ats, nW, wp, pts)
+  holeSlotValsJudge(
+    holeSlotName(n.identName, path),
+    holeSlotSpell(n.identName, path),
+    vals,
+    ats,
+    nW,
+    wp,
+    pts,
+  )
 }
 
 // Refuses a fixed-type function written to an element of the list `v`, whose type `srcTy` holds
@@ -4804,6 +4865,17 @@ function holeSlotRetJudge(
   pts: i32[],
   depth: i32,
 ): boolean {
+  const rv: i32[] = []
+  if !holeSlotCallRets(c, rv) { return false }
+  for r in rv {
+    if holeSlotArgJudge(r, pNm, path, wp, pts, depth + 1) { return true }
+  }
+  false
+}
+
+// Adds to `out` each value the top-level function declaring no type parameter that `c` calls
+// returns; false when `c` calls anything else.
+function holeSlotCallRets(c: Call, out: i32[]): boolean {
   if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
   const cf = nodeAt(parenPeelIx(c.callFn))
   if !(cf is Ident) { return false }
@@ -4815,18 +4887,15 @@ function holeSlotRetJudge(
   if !(fd is FuncDecl) || fd.fnTyParams.length > 0 || fd.fnBody < 0 {
     return false
   }
-  const rv: i32[] = []
-  collectRetValues(fd.fnBody, rv)
-  for r in rv {
-    if holeSlotArgJudge(r, pNm, path, wp, pts, depth + 1) { return true }
-  }
-  false
+  collectRetValues(fd.fnBody, out)
+  true
 }
 
 // Refuses the first function among `vals` (stored at `ats`, the last `nW` of them by a write)
-// whose result at `wp` differs from the one stored first, naming the place `nm`.
+// whose result at `wp` differs from the one stored first, naming the place `nm` (spelled `sp`).
 function holeSlotValsJudge(
   nm: string,
+  sp: string,
   vals: i32[],
   ats: i32[],
   nW: i32,
@@ -4848,10 +4917,11 @@ function holeSlotValsJudge(
     i = i + 1
   }
   if kv.length < vals.length {
-    return holeSlotValsJudge(nm, kv, ka, kw, wp, pts)
+    return holeSlotValsJudge(nm, sp, kv, ka, kw, wp, pts)
   }
   if vals.length < 2 { return false }
-  if holeSlotFixedJudge(nm, vals, ats, nW, pts) { return true }
+  if holeSlotFixedJudge(nm, sp, vals, ats, nW, pts) { return true }
+  if holeSlotDeferring { return false }
   const ft = mkFuncTy(wp, TY_I32)
   const noN: string[] = []
   const noT: i32[] = []
@@ -4899,9 +4969,11 @@ function holeSlotValsJudge(
 
 // Refuses the first function with fixed parameter types among `vals` (stored at `ats`, the last
 // `nW` by a write) that a call at the argument types `pts` cannot pass, when the place also
-// holds a generic function, which the call instances at those types (D10120).
+// holds a generic function, which the call instances at those types (D10120). Deferring, a check
+// against a type variable is demanded of the pin under the place's spelling `sp` instead.
 function holeSlotFixedJudge(
   nm: string,
+  sp: string,
   vals: i32[],
   ats: i32[],
   nW: i32,
@@ -4924,10 +4996,20 @@ function holeSlotFixedJudge(
     if vt >= 0 && vt < T.tys.length {
       const ft = tyAt(vt)
       if ft is TyFunc && ft.fnParamTypes.length == pts.length {
-        let misfit = !holeFixedSameSig(ft, inst)
+        let misfit = !holeSlotDeferring && !holeFixedSameSig(ft, inst)
         let j = 0
         while j < pts.length {
-          if !assignable(pts[j], ft.fnParamTypes[j]) { misfit = true }
+          if holeSlotDeferring && tyHasTyVar(pts[j]) {
+            noteArgCstr(
+              pts[j],
+              ft.fnParamTypes[j],
+              sp,
+              holeDeferForm(gen, j),
+              -1,
+            )
+          } else if !assignable(pts[j], ft.fnParamTypes[j]) {
+            misfit = true
+          }
           j = j + 1
         }
         if misfit {
@@ -4936,7 +5018,7 @@ function holeSlotFixedJudge(
         }
       }
     }
-    const j = holeLamMisfitAt(d, pts, inst)
+    const j = holeLamMisfitAt(d, pts, inst, gen, sp)
     if j >= 0 {
       tErr(holeLamMisfitMsg(nm, pts, d, j, k < vals.length - nW), ats[k])
       return true
@@ -4948,8 +5030,15 @@ function holeSlotFixedJudge(
 
 // The first parameter the lambda `d`, which leaves another parameter un-annotated, annotates
 // with a type other than the generic's instance `inst` takes there, or, `inst` being -1, one the
-// argument type at its position in `pts` is not assignable to; -1 when none (D12217).
-function holeLamMisfitAt(d: i32, pts: i32[], inst: i32): i32 {
+// argument type at its position in `pts` is not assignable to; -1 when none (D12217). Deferring,
+// a parameter against a type variable is demanded of the pin under `sp`, as the generic `gen` asks.
+function holeLamMisfitAt(
+  d: i32,
+  pts: i32[],
+  inst: i32,
+  gen: i32,
+  sp: string,
+): i32 {
   if d < 0 || d >= P.nodes.length || (fvaDone[d] ?? false) { return -1 }
   const f = nodeAt(d)
   if !(f is FuncDecl) || f.fnName != "" || f.fnTyParams.length > 0 { return -1 }
@@ -4976,8 +5065,7 @@ function holeLamMisfitAt(d: i32, pts: i32[], inst: i32): i32 {
   while j < pts.length {
     const p = nodeAt(f.fnParams[j])
     const want = ft.fnParamTypes[j]
-    if (
-      p is Param
+    const ann = p is Param
       && p.parType >= 0
       && want >= 0
       && want < T.tys.length
@@ -4985,9 +5073,9 @@ function holeLamMisfitAt(d: i32, pts: i32[], inst: i32): i32 {
       && pts[j] < T.tys.length
       && !tyHasTyVar(want)
       && !tyHasHole(want)
-      && !tyHasTyVar(pts[j])
-      && !tyHasHole(pts[j])
-    ) {
+    if ann && holeSlotDeferring && tyHasTyVar(pts[j]) {
+      noteArgCstr(pts[j], want, sp, holeDeferForm(gen, j), -1)
+    } else if ann && !tyHasTyVar(pts[j]) && !tyHasHole(pts[j]) {
       if its.length > 0 && !tySame(its[j], want) { return j }
       if its.length == 0 && !assignable(pts[j], want) { return j }
     }
@@ -5035,6 +5123,21 @@ function holeFixedSameSig(ft: TyFunc, inst: i32): boolean {
     j = j + 1
   }
   tySame(widenLitTy(it.fnRet), widenLitTy(ft.fnRet))
+}
+
+// The demand a deferred check of parameter `j` of a function sharing a place with the generic
+// `gen` records: exact where `gen` takes a bare type variable, which its instance binds to the
+// argument's own type, and assignable otherwise.
+function holeDeferForm(gen: i32, j: i32): i32 {
+  const f = nodeAt(gen)
+  if !(f is FuncDecl) || f.fnName == "" { return ACF_PLAIN }
+  const gt = lookup(f.fnName)
+  if gt < 0 || gt >= T.tys.length { return ACF_PLAIN }
+  const g = tyAt(gt)
+  if !(g is TyFunc) || j < 0 || j >= g.fnParamTypes.length { return ACF_PLAIN }
+  const pj = g.fnParamTypes[j]
+  if pj >= 0 && pj < T.tys.length && tyAt(pj) is TyVar { return ACF_EXACT }
+  ACF_PLAIN
 }
 
 // The function type the generic `gen` is instanced at by a call at `pts`, or -1 when a type it
@@ -5139,6 +5242,15 @@ function holeSlotName(nm: string, path: string[]): string {
   const last = path[path.length - 1]
   if last == "[]" { return "an element of '" + s + "'" }
   "'" + s + "." + last + "'"
+}
+
+// The place `path` under `nm` as a callee spelling: `r.f`, or `xs[_]` for an element.
+function holeSlotSpell(nm: string, path: string[]): string {
+  let s = nm
+  for st in path {
+    if st == "[]" { s = s + "[_]" } else { s = s + "." + st }
+  }
+  s
 }
 
 // The `holeLetWritesDisagree` refusal: function `d` written (or, `stored`, held by a literal) to
