@@ -14,6 +14,7 @@ import {
   BreakStmt,
   Call,
   CharLit,
+  ContinueStmt,
   FieldInit,
   ForIn,
   FuncDecl,
@@ -36,6 +37,7 @@ import {
   StrLit,
   TypeRef,
   Unary,
+  WhileStmt,
   binderNameAt,
   callHasTyArgs,
   clearAnnTs,
@@ -45,6 +47,8 @@ import {
   labelBlockValue,
   mkBinary,
   mkBlock,
+  mkBool,
+  mkBreakVal,
   mkCall,
   mkFieldInit,
   mkIdent,
@@ -55,8 +59,10 @@ import {
   mkNum,
   mkParam,
   mkTypeRef,
+  mkWhile,
   nodeAt,
   nodeChildren,
+  nodeChildrenPush,
   nodeToks,
   orderArgsByParamNames,
 } from "./ast"
@@ -208,6 +214,12 @@ let pnFn: string[] = []
 let pnSel: string[] = []
 let pnLeaves: string[][] = []
 let pnCount: i32[] = []
+// Each `pnAheadKid` child of the matching `pnAheadPar` node is bound to a `const` before the
+// choice, in order; `pnWrap` is the node whose child `pnStmt` becomes a labelled block holding
+// those bindings, -1 when `pnStmt` is a statement already (D13541, D13542).
+let pnAheadPar: i32[][] = []
+let pnAheadKid: i32[][] = []
+let pnWrap: i32[] = []
 let pnSrc: i32[] = []
 let pnSrcName: string[] = []
 let pnSrcLeaves: string[][] = []
@@ -257,6 +269,9 @@ function fsPlanReset(): i32 {
   pnSel = []
   pnLeaves = []
   pnCount = []
+  pnAheadPar = []
+  pnAheadKid = []
+  pnWrap = []
   pnSrc = []
   pnSrcName = []
   pnSrcLeaves = []
@@ -443,6 +458,7 @@ export function fsAskList(decl: i32): i32 {
 // The emitter refuses declaration `d` for wanting two signatures; records its parse node.
 export function fsAsk(d: i32): i32 {
   let o = declOrigOf(d)
+  if o < 0 { o = fsParseReadOf(d) }
   if o < 0 { o = d }
   if o < 0 || o >= fsParseLen { return 0 }
   for a in fsAsks {
@@ -451,6 +467,32 @@ export function fsAsk(d: i32): i32 {
   fsAsks.push(o)
   fsAskGrew = true
   0
+}
+
+// The parse read behind identifier `d` of a generic instance's copy: the one with its name and
+// position resolving to the same declaration, else -1 (D13540).
+function fsParseReadOf(d: i32): i32 {
+  if d < fsParseLen || d >= P.nodes.length { return -1 }
+  const n = nodeAt(d)
+  if !(n is Ident) { return -1 }
+  const dd = identDeclOf(d)
+  if dd < 0 { return -1 }
+  let want = declOrigOf(dd)
+  if want < 0 { want = dd }
+  let i = 0
+  while i < fsParseLen {
+    const m = nodeAt(i)
+    if (
+      m is Ident
+      && m.pos == n.pos
+      && m.identName == n.identName
+      && identDeclOf(i) == want
+    ) {
+      return i
+    }
+    i = i + 1
+  }
+  -1
 }
 
 // The emitter refuses parameter `par` for binding its type parameter to a second generic
@@ -1111,9 +1153,10 @@ function fsChoiceRetLeaves(c: i32): string[] {
 
 // The statement choice-returning call `a` (`fsChoiceRetLeaves`), an argument of call `c`, can run
 // before: `c` is that statement or the value it binds, names no argument, and every argument
-// ahead of `a` stays (`fsAheadStays`) or is bound ahead of it in order (`fsAheadHoists`); -1
-// otherwise.
+// ahead of `a` stays (`fsAheadStays`) or is bound ahead of it in order (`fsAheadHoists`), as
+// `fsAheadKid` lists; -1 otherwise.
 function fsChoiceStmt(c: i32, a: i32): i32 {
+  fsAheadClear()
   if (
     c < 0
     || c >= P.nodes.length
@@ -1132,7 +1175,10 @@ function fsChoiceStmt(c: i32, a: i32): i32 {
   const lam = fsChoiceTakesLambda(an)
   for x in cn.callArgs {
     if x == a { break }
-    if !fsAheadStays(x, lam) && !fsAheadHoists(x) { return -1 }
+    if !fsAheadStays(x, lam) {
+      if !fsAheadHoists(x) { return -1 }
+      fsAheadNote(c, x, 0)
+    }
   }
   let s = c
   const p = fsParent[c]
@@ -1144,10 +1190,45 @@ function fsChoiceStmt(c: i32, a: i32): i32 {
   s
 }
 
+// What the last `fsChoiceStmt` or `fsChoiceArgStmt` binds ahead of its choice: child
+// `fsAheadKid` of `fsAheadPar`, `fsAheadLvl` nodes above the choice's call; the objects of the
+// callees on the way up (`fsAheadObj`); and the node its statement is wrapped in (`pnWrap`).
+let fsAheadPar: i32[] = []
+let fsAheadKid: i32[] = []
+let fsAheadLvl: i32[] = []
+let fsAheadObj: i32[] = []
+let fsWrapIn = -1
+
+function fsAheadClear(): i32 {
+  fsAheadPar = []
+  fsAheadKid = []
+  fsAheadLvl = []
+  fsAheadObj = []
+  fsWrapIn = -1
+  0
+}
+
+// Notes child `x` of `p`, which the source runs ahead of the choice, `lvl` nodes above its call.
+function fsAheadNote(p: i32, x: i32, lvl: i32): i32 {
+  fsAheadPar.push(p)
+  fsAheadKid.push(x)
+  fsAheadLvl.push(lvl)
+  0
+}
+
+// Notes what callee `f` reads before its arguments run: the object of a member, else nothing.
+function fsCalleeNote(f: i32): i32 {
+  const n = nodeAt(f)
+  if n is Member { fsAheadObj.push(n.memObj) }
+  0
+}
+
 // The statement a choice `a` of names (`fsPureChoice` or `fsHoistsChoice`) handed to call `c`
-// can run before (D13360): every argument ahead of it stays or binds ahead of it in order
-// (`fsAheadHoists`), and `c` reaches that statement through `fsChoiceStmtOf`; -1 otherwise.
+// can run before (D13360), with what the source runs ahead of it either staying or bound to a
+// `const` ahead of it in order (`fsAheadBind`, D13541); -1 otherwise. In a `while` condition or
+// a short-circuit's right side, that statement is wrapped in a labelled block there (D13542).
 function fsChoiceArgStmt(c: i32, a: i32): i32 {
+  fsAheadClear()
   if (
     c < 0
     || c >= P.nodes.length
@@ -1164,16 +1245,19 @@ function fsChoiceArgStmt(c: i32, a: i32): i32 {
   let found = false
   for x in cn.callArgs {
     if x == a { found = true }
-    if !found && !fsAheadStays(x, !pure) && !fsAheadHoists(x) { return -1 }
+    if !found { fsAheadNote(c, x, 0) }
   }
   if !found { return -1 }
-  fsChoiceStmtOf(c, pure, pure && !fsChoiceMayTrap(a, 0))
+  fsCalleeNote(cn.callFn)
+  const s = fsChoiceStmtOf(c, pure, pure && !fsChoiceMayTrap(a, 0))
+  if s < 0 || !fsAheadBind(pure) { return -1 }
+  s
 }
 
-// The statement holding expression `c`, when running a choice (`pure` or calling) before that
-// statement changes nothing: each enclosing expression runs `c` once whenever it runs, after
-// only what `fsChoiceAheadOk` admits. `lazy` admits the right side of `&&`, `||` and `??`, for
-// a pure choice that cannot trap. -1 otherwise (D13462).
+// The statement holding `c` that a choice (`pure` or calling) may run before, each enclosing
+// expression running `c` once and noting what it runs first (`fsAheadNote`); `lazy` admits a
+// short-circuit's right side while nothing noted binds. A `while` condition or a right side not
+// admitted is returned itself, `fsWrapIn` naming its parent. -1 otherwise (D13462).
 function fsChoiceStmtOf(c: i32, pure: boolean, lazy: boolean): i32 {
   let x = c
   let hops = 0
@@ -1182,21 +1266,49 @@ function fsChoiceStmtOf(c: i32, pure: boolean, lazy: boolean): i32 {
     if p < 0 || p >= fsParseLen { return -1 }
     const pn = nodeAt(p)
     if (pn is Block || pn is Program) && hasI32(fsStmtsOf(p), x) { return x }
-    if !fsRunsChildFirst(p, x, pure, lazy) { return -1 }
+    if fsWrapsChild(p, x, lazy && fsAheadAllKeep(pure)) {
+      if fsLoopExit(x) { return -1 }
+      fsWrapIn = p
+      return x
+    }
+    if !fsRunsChildFirst(p, x, hops + 1) { return -1 }
     x = p
     hops = hops + 1
   }
   -1
 }
 
-// Whether node `p` evaluates its child `x` once whenever `p` runs, after only what
-// `fsChoiceAheadOk` admits; `lazy` admits a short-circuit's right side.
-function fsRunsChildFirst(
-  p: i32,
-  x: i32,
-  pure: boolean,
-  lazy: boolean,
-): boolean {
+// Whether node `p` runs child `x` repeatedly or conditionally, as a `while` condition or, unless
+// `lazy`, a short-circuit's right side, so a choice in `x` runs where `x` does.
+function fsWrapsChild(p: i32, x: i32, lazy: boolean): boolean {
+  const pn = nodeAt(p)
+  if pn is WhileStmt { return pn.whileBlk == 0 && pn.whileCond == x }
+  if pn is BinExpr && pn.binRight == x && !lazy {
+    return pn.binOp == "&&" || pn.binOp == "||" || pn.binOp == "??"
+  }
+  fsExcluded(0, "a node that runs its child once whenever it runs, or never")
+    == 1
+}
+
+// Whether expression `x` holds a `break` or `continue` naming no label, which a labelled block
+// wrapped around `x` would change the target of.
+function fsLoopExit(x: i32): boolean {
+  const stack: i32[] = [x]
+  while stack.length > 0 {
+    const k = stack.pop()
+    if k >= 0 && k < P.nodes.length {
+      const n = nodeAt(k)
+      if n is BreakStmt && n.brkLabel == "" { return true }
+      if n is ContinueStmt && n.contLabel == "" { return true }
+      nodeChildrenPush(k, stack)
+    }
+  }
+  false
+}
+
+// Whether node `p` evaluates its child `x` once whenever `p` runs, noting each child it runs
+// first (`fsAheadNote`) at `lvl`. A short-circuit's right side counts; `fsWrapsChild` decides it.
+function fsRunsChildFirst(p: i32, x: i32, lvl: i32): boolean {
   const pn = nodeAt(p)
   if pn is Paren || pn is Unary || pn is LetDecl || pn is RetStmt {
     return true
@@ -1206,43 +1318,122 @@ function fsRunsChildFirst(
   if pn is ForIn { return pn.fiIter == x }
   if pn is MatchExpr { return pn.matchScrut == x }
   if pn is FieldInit { return pn.fiValue == x }
-  if pn is Index { return pn.idxArr == x || fsChoiceAheadOk(pn.idxArr, pure) }
+  if pn is Index {
+    if pn.idxArr == x { return true }
+    fsAheadNote(p, pn.idxArr, lvl)
+    return pn.idxIndex == x
+  }
   if pn is BinExpr {
     if pn.binLeft == x { return pn.binOp != "=" }
-    const lz = pn.binOp == "&&" || pn.binOp == "||" || pn.binOp == "??"
     if pn.binOp == "=" { return nodeAt(pn.binLeft) is Ident }
-    return (lazy || !lz) && fsChoiceAheadOk(pn.binLeft, pure)
+    fsAheadNote(p, pn.binLeft, lvl)
+    return true
   }
   if pn is Call {
     if pn.callFn == x || !fsCalleeStays(pn.callFn) { return false }
+    fsCalleeNote(pn.callFn)
     for y in pn.callArgs {
       if y == x { return true }
-      if !fsChoiceAheadOk(y, pure) { return false }
+      fsAheadNote(p, y, lvl)
     }
     return false
   }
   if pn is ArrayLit {
     for y in pn.arrElems {
       if y == x { return true }
-      if !fsChoiceAheadOk(y, pure) { return false }
+      fsAheadNote(p, y, lvl)
     }
     return false
   }
   if pn is ObjLit {
-    // A record literal may run its fields in layout order, so every other field is ahead.
+    // A record literal runs its fields in source order.
     for y in pn.objFields {
+      if y == x { return true }
       const yn = nodeAt(y)
-      if y != x && (!(yn is FieldInit) || !fsChoiceAheadOk(yn.fiValue, pure)) {
-        return false
-      }
+      if !(yn is FieldInit) { return false }
+      fsAheadNote(y, yn.fiValue, lvl)
     }
-    return true
+    return false
   }
   fsExcluded(
     0,
     "a node that may run its child conditionally, repeatedly or late",
   )
     != 0
+}
+
+// Whether every noted expression may stay where it is (`fsAheadKeeps`).
+function fsAheadAllKeep(pure: boolean): boolean {
+  let k = 0
+  while k < fsAheadKid.length {
+    if !fsAheadKeeps(fsAheadKid[k], fsAheadLvl[k], pure) { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Whether `y`, noted `lvl` nodes above the choice's call, may stay where it is once the choice
+// runs first: at the call itself as `fsAheadStays` says, above it as `fsChoiceAheadOk` says.
+function fsAheadKeeps(y: i32, lvl: i32, pure: boolean): boolean {
+  if lvl == 0 { return fsAheadStays(y, !pure) }
+  fsChoiceAheadOk(y, pure)
+}
+
+// Narrows the noted expressions to those bound ahead of the choice, outer ones first, which is
+// the order the source runs them. Each one that may not stay binds, and once one that binds may
+// call, every one but a literal or a function's name does, and every callee object noted must
+// stay. false when one that must bind cannot (`fsAheadHoists`, `fsCallHoists`).
+function fsAheadBind(pure: boolean): boolean {
+  let top = 0
+  for l in fsAheadLvl {
+    if l > top { top = l }
+  }
+  const par: i32[] = []
+  const kid: i32[] = []
+  const keep: boolean[] = []
+  let calls = false
+  let l = top
+  while l >= 0 {
+    let k = 0
+    while k < fsAheadKid.length {
+      if fsAheadLvl[k] == l {
+        const y = fsAheadKid[k]
+        const ok = fsAheadKeeps(y, l, pure)
+        if !ok && !fsPureRead(y, 0) { calls = true }
+        par.push(fsAheadPar[k])
+        kid.push(y)
+        keep.push(ok)
+      }
+      k = k + 1
+    }
+    l = l - 1
+  }
+  const outPar: i32[] = []
+  const outKid: i32[] = []
+  let k = 0
+  while k < kid.length {
+    const y = kid[k]
+    if !keep[k] || (calls && !fsAheadStays(y, true)) {
+      if !fsAheadHoists(y) && !fsCallHoists(y) { return false }
+      outPar.push(par[k])
+      outKid.push(y)
+    }
+    k = k + 1
+  }
+  if calls {
+    for o in fsAheadObj {
+      if !fsAheadStays(o, false) { return false }
+    }
+  }
+  fsAheadPar = outPar
+  fsAheadKid = outKid
+  true
+}
+
+// Whether `y` calls a name or a member of a name, which a `const` binds as it is (D13541).
+function fsCallHoists(y: i32): boolean {
+  const n = nodeAt(y)
+  n is Call && fsCalleeStays(n.callFn)
 }
 
 // Whether `y`, which the source runs ahead of a choice now run before its statement, sees and
@@ -4485,6 +4676,14 @@ function fsPlanChoiceRet(a: i32, leaves: string[], count: i32): i32 {
   pnSel.push(f.fnName + "$n" + i32ToStr(a))
   pnLeaves.push(leaves)
   pnCount.push(count)
+  fsPlanAheads()
+}
+
+// Records what the last `fsChoiceStmt` or `fsChoiceArgStmt` binds ahead and wraps in.
+function fsPlanAheads(): i32 {
+  pnAheadPar.push(fsAheadPar)
+  pnAheadKid.push(fsAheadKid)
+  pnWrap.push(fsWrapIn)
   0
 }
 
@@ -4503,7 +4702,7 @@ function fsPlanChoiceArg(a: i32, count: i32): i32 {
   pnSel.push("choice$n" + i32ToStr(a))
   pnLeaves.push(none)
   pnCount.push(count)
-  0
+  fsPlanAheads()
 }
 
 // The name of the arm-index copy of the callee of choosing call `a`, returning the index of the
@@ -4525,19 +4724,18 @@ function fsPlanArmCopy(a: i32, leaves: string[]): string {
 // Mints each arm-index copy `fsPlanArmCopy` planned, then runs each planned call once into
 // its arm index binding and hands every split argument a choice by that index. -1 when it cannot.
 function fsApplyChoiceRets(): i32 {
-  let i = 0
-  while i < pnSrc.length {
-    const f = reparseFuncDeclAt(fsFirstTok(pnSrc[i]))
+  let si = 0
+  while si < pnSrc.length {
+    const f = reparseFuncDeclAt(fsFirstTok(pnSrc[si]))
     if f < 0 { return -1 }
     const fn = nodeAt(f)
     if !(fn is FuncDecl) { return -1 }
-    fn.fnName = pnSrcName[i]
-    if fsNumberRets(fn.fnBody, pnSrcLeaves[i]) != 0 { return -1 }
-    if fsInsertAfter(pnSrc[i], f) != 0 { return -1 }
-    i = i + 1
+    fn.fnName = pnSrcName[si]
+    if fsNumberRets(fn.fnBody, pnSrcLeaves[si]) != 0 { return -1 }
+    if fsInsertAfter(pnSrc[si], f) != 0 { return -1 }
+    si = si + 1
   }
-  i = 0
-  while i < pnCall.length {
+  for i in fsChoiceOrder() {
     const c = nodeAt(pnCall[i])
     const a = pnArg[i]
     const an = nodeAt(a)
@@ -4545,35 +4743,39 @@ function fsApplyChoiceRets(): i32 {
     P.pos = nodeToks[a] + 1
     const pos = an.pos
     let leaves = pnLeaves[i]
-    let lam = true
     if an is Call && pnFn[i] != "" {
       if an.callFn < 0 || an.callFn >= P.nodes.length { return -1 }
       an.callFn = mkIdent(pnFn[i], nodeAt(an.callFn).pos)
-      lam = fsChoiceTakesLambda(an)
     } else if pnFn[i] == "" {
       // A choice argument numbers its own leaves (D13360).
-      lam = !fsPureChoice(a, 0)
       const names: string[] = []
       if fsNumberLeaves(a, names, 0) < 0 { return -1 }
       leaves = names
     } else {
       return -1
     }
-    const args: i32[] = []
-    let ahead = true
-    for x in c.callArgs {
-      if x == a { ahead = false }
-      if ahead && !fsAheadStays(x, lam) {
-        const tmp = pnSel[i] + "$a" + i32ToStr(args.length)
-        if fsInsertBefore(pnStmt[i], mkLet("const", tmp, -1, x, pos)) != 0 {
+    const s = pnStmt[i]
+    const o = if pnWrap[i] >= 0 { fsWrapChild(pnWrap[i], s, pnSel[i], pos) } else { fsListOwner(s) }
+    if o < 0 { return -1 }
+    // What runs ahead of the choice binds first, in order; one an earlier choice bound is gone.
+    let k = 0
+    while k < pnAheadKid[i].length {
+      const y = pnAheadKid[i][k]
+      const tmp = pnSel[i] + fsAheadSuffix(c.callArgs, y, k)
+      if fsSetChild(pnAheadPar[i][k], y, mkIdent(tmp, pos)) == 0 {
+        if fsInsertBeforeIn(o, s, mkLet("const", tmp, -1, y, pos)) != 0 {
           return -1
         }
-        args.push(mkIdent(tmp, pos))
-      } else if x == a {
-        let k = 0
-        while k < pnCount[i] {
+      }
+      k = k + 1
+    }
+    const args: i32[] = []
+    for x in c.callArgs {
+      if x == a {
+        let n = 0
+        while n < pnCount[i] {
           args.push(fsSelectArm(pnSel[i], leaves, pos))
-          k = k + 1
+          n = n + 1
         }
       } else {
         args.push(x)
@@ -4586,12 +4788,93 @@ function fsApplyChoiceRets(): i32 {
       for _x in args { nms.push("") }
       c.callArgNames = nms
     }
-    if fsInsertBefore(pnStmt[i], mkLet("const", pnSel[i], -1, a, pos)) != 0 {
+    if fsInsertBeforeIn(o, s, mkLet("const", pnSel[i], -1, a, pos)) != 0 {
       return -1
+    }
+  }
+  0
+}
+
+// The planned choices in the order the source runs them, by their position, so one bound
+// ahead of another's statement binds after that one's choice.
+function fsChoiceOrder(): i32[] {
+  const out: i32[] = []
+  let i = 0
+  while i < pnArg.length {
+    out.push(i)
+    let j = out.length - 1
+    while j > 0 && nodeAt(pnArg[out[j - 1]]).pos > nodeAt(pnArg[i]).pos {
+      out[j] = out[j - 1]
+      out[j - 1] = i
+      j = j - 1
     }
     i = i + 1
   }
-  0
+  out
+}
+
+// The suffix naming the `k`th binding ahead of a choice: `$a` and its index among the choice
+// call's arguments `args` when it is one of them, else `$o` and `k`.
+function fsAheadSuffix(args: i32[], y: i32, k: i32): string {
+  let j = 0
+  while j < args.length {
+    if args[j] == y { return "$a" + i32ToStr(j) }
+    j = j + 1
+  }
+  "$o" + i32ToStr(k)
+}
+
+// Replaces child `old` of node `p`, in a place `fsRunsChildFirst` or `fsWrapsChild` notes, by
+// `nw`. -1 when `old` is not such a child of `p`.
+function fsSetChild(p: i32, old: i32, nw: i32): i32 {
+  const pn = nodeAt(p)
+  if pn is Call { return fsSetIn(pn.callArgs, old, nw) }
+  if pn is ArrayLit { return fsSetIn(pn.arrElems, old, nw) }
+  if pn is FieldInit && pn.fiValue == old {
+    pn.fiValue = nw
+    return 0
+  }
+  if pn is Index && pn.idxArr == old {
+    pn.idxArr = nw
+    return 0
+  }
+  if pn is BinExpr && pn.binLeft == old {
+    pn.binLeft = nw
+    return 0
+  }
+  if pn is BinExpr && pn.binRight == old {
+    pn.binRight = nw
+    return 0
+  }
+  if pn is WhileStmt && pn.whileCond == old {
+    pn.whileCond = nw
+    return 0
+  }
+  fsExcluded(-1, "a node no ahead binding or wrapped choice is a child of")
+}
+
+// Replaces element `old` of `xs` by `nw`. -1 when `xs` does not hold `old`.
+function fsSetIn(xs: i32[], old: i32, nw: i32): i32 {
+  let j = 0
+  while j < xs.length {
+    if xs[j] == old {
+      xs[j] = nw
+      return 0
+    }
+    j = j + 1
+  }
+  -1
+}
+
+// Wraps child `x` of `p` in a labelled block `@<sel>$b { x; break @<sel>$b }` handing out its
+// value, so what is inserted before `x` there runs each time `p` runs `x`. Returns the block's
+// body, which holds `x`, or -1.
+function fsWrapChild(p: i32, x: i32, sel: string, pos: i32): i32 {
+  const lbl = sel + "$b"
+  const b = mkBlock([x, mkBreakVal("break", lbl, pos, 1)], pos)
+  const w = mkWhile(mkBool(1, pos), b, lbl, pos, 1)
+  if fsSetChild(p, x, w) != 0 { return -1 }
+  b
 }
 
 // Replaces, in body `b` of an arm-index copy, each `return` of a name in `leaves` by its index
@@ -5278,7 +5561,11 @@ function fsInsertAfter(anchor: i32, x: i32): i32 {
 
 // Inserts `x` before `anchor` in its statement list. -1 when it cannot.
 function fsInsertBefore(anchor: i32, x: i32): i32 {
-  const o = fsListOwner(anchor)
+  fsInsertBeforeIn(fsListOwner(anchor), anchor, x)
+}
+
+// Inserts `x` before `anchor` in the statement list of `o`. -1 when it cannot.
+function fsInsertBeforeIn(o: i32, anchor: i32, x: i32): i32 {
   if o < 0 { return -1 }
   const out: i32[] = []
   for s in fsStmtsOf(o) {
