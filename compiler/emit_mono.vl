@@ -364,6 +364,7 @@ import {
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
   fnFlowDeclPathAgreedPinTys,
+  fnFlowDeclPathAgreedPinTysSkipping,
   fnFlowDeclPathCallPinTyLists,
   fnFlowDeclPathHeldSrcs,
   fnFlowDeclPathOnlyPinCall,
@@ -20604,8 +20605,9 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
   if elems.length == 0 { return 0 }
   const inline = monoForInlineElems(n.callFn)
   const rows: i32[][] = []
+  const own: i32[] = []
   for el in elems {
-    const pts = monoElemParamTys(el, n.callArgs, ctx, inline)
+    const pts = monoElemParamTys(el, elems, n.callArgs, ctx, inline, own)
     if pts.length != n.callArgs.length { return 0 }
     rows.push(pts)
   }
@@ -20638,7 +20640,14 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     if r < 0 { return 0 }
     const et = mkFuncTy(rows[k], r)
     if !monoTyClosedFn(et) { return 0 }
-    if ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft) { return 0 }
+    // Elements typed from their own pins alone must agree on a function argument's parameter
+    // types too, which the ABI key does not read.
+    if (
+      ft >= 0
+      && (sigKeyOfTy(et) != sigKeyOfTy(ft) || (own.length > 0 && !tySame(et, ft)))
+    ) {
+      return 0
+    }
     ft = et
     k = k + 1
   }
@@ -20886,15 +20895,17 @@ function monoElemFnDecl(el: i32, ctx: i32): i32 {
   monoOpenFnArgDecl(el)
 }
 
-// The closed parameter types the named function `el` takes called with `args`: a generic
-// argument's at the types the parameter's own calls agree on, -1 for a parameter the body never
-// reads, any other argument's own type, at the instance `ctx` when `inline` says the elements are
-// its own copy; empty when one is open.
+// The closed parameter types the named function `el` takes called with `args` (at instance `ctx`
+// when `inline`): a generic argument's at the types its calls agree on, else its own calls apart
+// from other `elems`' with 1 pushed on `own` (D13202); -1 for a parameter the body never reads,
+// any other argument's own type; empty when one is open.
 function monoElemParamTys(
   el: i32,
+  elems: i32[],
   args: i32[],
   ctx: i32,
   inline: boolean,
+  own: i32[],
 ): i32[] {
   const none: i32[] = []
   const x = unwrapParen(el)
@@ -20932,6 +20943,11 @@ function monoElemParamTys(
   // An element nested in a hole function reads that function's parameters at the types its one
   // instance gives them (D12880).
   if named { monoOneInstHoleBinds(bNames, bTys) }
+  const sibs: i32[] = []
+  for e in elems {
+    const ex = monoElemFnDecl(unwrapParen(e), ctx)
+    if ex >= 0 && ex != fx && !i32ListHas(sibs, ex) { sibs.push(ex) }
+  }
   const pts: i32[] = []
   let j = 0
   while j < args.length {
@@ -20939,13 +20955,16 @@ function monoElemParamTys(
     const axs = monoElemArgFns(args[j], ctx)
     if axs.length > 0 {
       const qs: i32[] = []
-      const noPath: string[] = []
-      if (
-        axs[0] >= 0
-        && (fnFlowDeclPathAgreedPinTys(f.fnParams[j], noPath, qs)
-          || (monoElemArgNamesFn(args[j], ctx)
-          && monoElemPinTysUnder(f.fnParams[j], bNames, bTys, qs)))
-      ) {
+      const noSkip: i32[] = []
+      const p = f.fnParams[j]
+      // When the shared slot's pins disagree, this element's own are read without its siblings'.
+      let got = axs[0] >= 0
+        && monoElemFnPinTys(p, args[j], bNames, bTys, noSkip, ctx, qs)
+      if axs[0] >= 0 && !got {
+        got = monoElemFnPinTys(p, args[j], bNames, bTys, sibs, ctx, qs)
+        if got { own.push(1) }
+      }
+      if got {
         // Every function a parameter can hold is taken at the one instance the pins give.
         for ax in axs {
           const r = monoFnDeclRetAt(ax, qs)
@@ -21049,18 +21068,42 @@ function monoElemArgNamesFn(a: i32, ctx: i32): boolean {
   monoNamesDeclaredGeneric(a, ctx) || monoIsHoleLamArg(a)
 }
 
+// The one instance list element parameter `par`, handed `arg`, takes from the pins not taken in
+// the functions `skip`: the pins' agreed types, or under the element's value bindings, pushed
+// onto `qs` only when one of them answers.
+function monoElemFnPinTys(
+  par: i32,
+  arg: i32,
+  bNames: string[],
+  bTys: i32[],
+  skip: i32[],
+  ctx: i32,
+  qs: i32[],
+): boolean {
+  const noPath: string[] = []
+  const got: i32[] = []
+  const ok = fnFlowDeclPathAgreedPinTysSkipping(par, noPath, skip, got)
+    || (monoElemArgNamesFn(arg, ctx)
+    && monoElemPinTysUnder(par, bNames, bTys, skip, got))
+  if ok {
+    for t in got { qs.push(t) }
+  }
+  ok
+}
+
 // The one closed parameter list every call of parameter `par` takes once the element's value
-// parameters' holes `bNames` are bound to `bTys`, pushed onto `qs`; false when there is no call,
-// one stays open, or two disagree.
+// parameters' holes `bNames` are bound to `bTys`, pushed onto `qs`, the calls made in the sibling
+// elements `skip` left out; false when there is no call, one stays open, or two disagree.
 function monoElemPinTysUnder(
   par: i32,
   bNames: string[],
   bTys: i32[],
+  skip: i32[],
   qs: i32[],
 ): boolean {
   if bNames.length == 0 { return false }
   const noPath: string[] = []
-  const lists = fnFlowDeclPathCallPinTyLists(par, noPath)
+  const lists = fnFlowDeclPathCallPinTyLists(par, noPath, skip)
   if lists.length == 0 { return false }
   let key = ""
   let got: i32[] = []
