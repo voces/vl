@@ -49,7 +49,7 @@ import {
   matchPatRefused,
   v128NestReported,
 } from "./check_core_state"
-import { noteNestCstr } from "./check_cstr_rows"
+import { MC_LAYOUT_MARK, noteMemCstr, noteNestCstr } from "./check_cstr_rows"
 import { inferQuiet, tpEnvNames, tpEnvTyOfName, tpEnvTys } from "./check_cursor"
 import { matchPatNamesType } from "./check_decl_scan"
 import { flatWhyNot } from "./check_diag_text"
@@ -342,11 +342,14 @@ export function flatMemberFold(n: Member, ix: i32) {
   if obj is Ident {
     const nm = obj.identName
     if lookup(nm) >= 0 { return 0 }
-    // A live type parameter (`T.size`): the layout isn't knowable here, since `T` is
-    // abstract for the checker's one pass over a generic body, so the fold defers to the
-    // monomorphizer, which rewrites this node once per instance. The member's type is `i32`
-    // under every binding; whether the binding names a usable `flat` type is checked there instead.
-    if tpEnvTyOfName(nm) >= 0 { return 3 }
+    // A live type parameter (`T.size`): the fold defers to the monomorphizer, which rewrites
+    // this node once per instance. The member is an `i32` under every binding, and each call
+    // re-asks whether its binding has the member (`flatLayoutPinMsg`).
+    const tpTy = tpEnvTyOfName(nm)
+    if tpTy >= 0 {
+      noteMemCstr(tpTy, MC_LAYOUT_MARK + nm + "." + n.memProp, ix, false)
+      return 3
+    }
     const d = flatIndexOf(nm)
     if d < 0 {
       if (cUserTypes[nm] ?? -1) >= 0 {
@@ -382,6 +385,40 @@ export function flatMemberFold(n: Member, ix: i32) {
     return 1
   }
   0
+}
+
+// The refusal a call owes for layout constant `tvProp` (`T.member`, after `MC_LAYOUT_MARK`) when
+// it binds `T` to `recv`: "" for a sized `flat` type with that member, or for a rejected one,
+// whose error is already on the page.
+export function flatLayoutPinMsg(recv: i32, tvProp: string): string {
+  const dot = tvProp.indexOf(".")
+  if dot < 0 { return "" }
+  const tv = tvProp.slice(0, dot)
+  const prop = tvProp.slice(dot + 1, tvProp.length)
+  let d = 0
+  while d < flNames.length {
+    if (cUserTypes[flNames[d]] ?? -1) == recv {
+      if flSizes[d] < 0 { return "" }
+      if flatConstOf(d, prop) >= 0 { return "" }
+      return "`"
+        + tv
+        + "` is bound to `flat type "
+        + flNames[d]
+        + "`, which has no field '"
+        + prop
+        + "' — its layout members are `.size` and one offset per declared field"
+    }
+    d = d + 1
+  }
+  "`"
+    + tv
+    + "` is bound to `"
+    + tyToStr(recv)
+    + "`, which is not a `flat` type, so it has no byte layout for `"
+    + tv
+    + "."
+    + prop
+    + "`"
 }
 
 // ── nominal newtypes ──
