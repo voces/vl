@@ -1930,7 +1930,7 @@ function structIndexOfRecordTy(ty: i32): i32 {
 
 // `joinRowScanOfTy`'s field-set match, each answer stamped by the `tyRegGenNow` read before
 // computing it.
-function joinRowScanOfTyMemo(ty: i32): i32 {
+export function joinRowScanOfTyMemo(ty: i32): i32 {
   const gen = tyRegGenNow()
   if ty < jrsGen.length && jrsGen[ty] == gen { return jrsRow[ty] }
   const r = joinRowScanOfTy(ty)
@@ -4176,24 +4176,35 @@ export const ALK_I64 = 2
 // `arrLitElemName`, and `arrLitElemKind` must agree on (D40). Gated on a `TyObj` element:
 // `shapeNominalOfTy` recurses through `TyArray` and would misname a nested list otherwise.
 export function arrLitNominalElemName(arrIx: i32): string {
+  const et = arrLitNominalElemTy(arrIx)
+  if et < 0 { return "" }
+  shapeNominalOfTy(et)
+}
+
+// `arrLitNominalElemName`'s answer as the row's arena type, or -1.
+export function arrLitNominalRowTy(arrIx: i32): i32 {
+  const et = arrLitNominalElemTy(arrIx)
+  if et < 0 { return -1 }
+  shapeNominalRowTyOf(et)
+}
+
+// The recorded record element of list literal `arrIx` whose lead is no object, list or
+// function literal, or -1.
+function arrLitNominalElemTy(arrIx: i32): i32 {
   const a = nodeAt(arrIx)
   if a is ArrayLit {
-    if a.arrElems.length < 1 { return "" }
+    if a.arrElems.length < 1 { return -1 }
     const e0 = nodeAt(a.arrElems[0])
-    if e0 is ObjLit { return "" }
-    if e0 is ArrayLit { return "" }
-    if e0 is FuncDecl { return "" }
+    if e0 is ObjLit || e0 is ArrayLit || e0 is FuncDecl { return -1 }
     const aty = nodeTyIxOf(arrIx)
-    if aty < 0 { return "" }
+    if aty < 0 { return -1 }
     const at = tyAt(aty)
     if at is TyArray {
-      if at.aElem < 0 { return "" }
-      const el = tyAt(at.aElem)
-      if !(el is TyObj) { return "" }
-      return shapeNominalOfTy(at.aElem)
+      if at.aElem < 0 || !(tyAt(at.aElem) is TyObj) { return -1 }
+      return at.aElem
     }
   }
-  ""
+  -1
 }
 
 // The inner literal of a list-of-lists literal whose leaf keys the element: the first element,
@@ -5311,9 +5322,13 @@ export function mvSlotOfMapNameTys(
   valTy: i32,
   kindTy: i32,
 ): i32 {
+  mvSlotOfMapKeyKTys(mapNameKeyKind(mapName), valTy, kindTy)
+}
+
+// `mvSlotOfMapNameTys` for a map whose key kind (`MAP_KEY_*`) is `ki`.
+export function mvSlotOfMapKeyKTys(ki: i32, valTy: i32, kindTy: i32): i32 {
   const vn = mvDeclNameOfValTy(kindTy)
   if vn == "" { return -3 }
-  const ki = mapNameKeyKind(mapName)
   const sl = mvSlotOfMapValNameOrMonoKTys(vn, ki, valTy, kindTy)
   if sl == -1 { return mapMonoShapeOfKey(ki) }
   sl
@@ -5357,6 +5372,10 @@ function mvSlotOfMapValNameOrMonoKTys(
 export let sktGen: i32[] = []
 export let sktKey: string[] = []
 
+// `annShapeRowMemo`'s answers by type id and table, stamped as `sktGen` is.
+export let asrGen: i32[] = []
+export let asrRow: i32[] = []
+
 // The registry generation `sitnMemo` last read.
 const trgReadGenKey = memoKeyNew(1)
 
@@ -5376,6 +5395,8 @@ export function tyRegMemoReset() {
   jrsRow = []
   sktGen = []
   sktKey = []
+  asrGen = []
+  asrRow = []
   0
 }
 
@@ -5416,23 +5437,41 @@ export function shapeNominalOfTy(ty: i32): string {
     if inner == "" { return "" }
     return inner + "[]"
   }
+  const r = shapeNominalRowOf(ty)
+  if r >= 0 { return sNames[r] }
+  if r < -1 { return uVariants[-2 - r] }
+  ""
+}
+
+// The arena type of the declared struct or variant row record type `ty` resolves to, by
+// `shapeNominalOfTy`'s rungs, or -1 when none does or the row carries no type.
+export function shapeNominalRowTyOf(ty: i32): i32 {
+  const r = shapeNominalRowOf(ty)
+  if r >= 0 && r < sTyIx.length { return sTyIx[r] }
+  if r < -1 && -2 - r < uVarTyIx.length { return uVarTyIx[-2 - r] }
+  -1
+}
+
+// The row record type `ty` resolves to: a struct row, `-2 - v` for variant row `v`, or -1.
+function shapeNominalRowOf(ty: i32): i32 {
+  if ty < 0 { return -1 }
   const si = structIndexOfTy(ty)
-  if si >= 0 { return sNames[si] }
+  if si >= 0 { return si }
   // The arena's variant rung, the exact complement of the struct rung above — both answer by
   // declaration identity. Without it, a union arm beside a same-layout struct order-collided. D33.
   const av = variantRowOfTy(ty)
-  if av >= 0 { return uVariants[av] }
+  if av >= 0 { return -2 - av }
   const fs = structRowOfObjFieldSetK(ty, false)
-  if fs >= 0 { return sNames[fs] }
+  if fs >= 0 { return fs }
   const vr = variantRowOfObjFieldSetK(ty, false)
-  if vr >= 0 { return uVariants[vr] }
+  if vr >= 0 { return -2 - vr }
   // The widened passes, both tables, below both strict ones (D733): a widened struct match
   // must not outrank a strict variant one, so the two scans are called at separate levels.
   const fw = structRowOfObjFieldSetK(ty, true)
-  if fw >= 0 { return sNames[fw] }
+  if fw >= 0 { return fw }
   const vw = variantRowOfObjFieldSetK(ty, true)
-  if vw >= 0 { return uVariants[vw] }
-  ""
+  if vw >= 0 { return -2 - vw }
+  -1
 }
 
 // Whether no other scanned row may match the render of row `si`'s record: none has its field
