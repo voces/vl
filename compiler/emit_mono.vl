@@ -20603,6 +20603,13 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     }
   }
   for el in elems {
+    // A hole lambda element is pinned in place at the call's type, as a delivered literal is.
+    if monoLamLitTake(el, nm, ctx) != 0 {
+      return emitFailAt(
+        "emitProgram: a lambda this call reaches through a list cannot take the call's function type",
+        el,
+      )
+    }
     if monoCoerceFnValueName(el, nm, ctx, ft) < 0 { return -1 }
     // arena-tick exempt: read only by this check, never by the four rebuild passes.
     monoElemTakenSig[el] = nm
@@ -20622,8 +20629,8 @@ function monoAskJoinBinding(c: i32): i32 {
   fsAsk(d)
 }
 
-// The identifier callee `c` reads its list through, as the indexed list or a `for` variable's
-// iterable, when it names an un-annotated `const`; -1 otherwise.
+// The identifier callee `c` reads its list through, as the indexed list, a `for` variable's
+// iterable or an element `const`'s list, when it names an un-annotated `const`; -1 otherwise.
 function monoCalleeListRead(c: i32): i32 {
   const x = unwrapParen(c)
   if x < 0 || x >= P.nodes.length { return -1 }
@@ -20635,6 +20642,15 @@ function monoCalleeListRead(c: i32): i32 {
     if d >= 0 && d < P.nodes.length {
       const dn = nodeAt(d)
       if dn is ForIn && dn.fiVar == n.identName { r = unwrapParen(dn.fiIter) }
+      if (
+        dn is LetDecl
+        && dn.letKw == "const"
+        && dn.letType < 0
+        && dn.letInit >= 0
+      ) {
+        const ix = nodeAt(dn.letInit)
+        if ix is Index { r = unwrapParen(ix.idxArr) }
+      }
     }
   }
   if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return -1 }
@@ -20645,9 +20661,9 @@ function monoCalleeListRead(c: i32): i32 {
   r
 }
 
-// The function values callee `c` reads: a list literal's through an index or a `for` variable,
-// or an `if`'s, as the callee itself (D7848) or a `const`'s, an `if` element giving each of its
-// arm values; empty for any other callee.
+// The function values callee `c` reads: a list literal's through an index, a `for` variable or
+// an element `const`, or an `if`'s, as the callee itself (D7848) or a `const`'s, an `if` element
+// giving each of its arm values; empty for any other callee.
 function monoCalleeElems(c: i32): i32[] {
   const none: i32[] = []
   const x = unwrapParen(c)
@@ -20668,7 +20684,11 @@ function monoCalleeElems(c: i32): i32[] {
   }
   if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return none }
   const ix = unwrapParen(dn.letInit)
-  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is IfStmt) { return none }
+  if ix < 0 || ix >= P.nodes.length { return none }
+  // A `const` bound to an element read holds that list's elements (D12704).
+  const ixn = nodeAt(ix)
+  if ixn is Index { return monoConstListElems(ixn.idxArr) }
+  if !(ixn is IfStmt) { return none }
   const out: i32[] = []
   if !monoPushArmValues(ix, out) { return none }
   out
@@ -20712,7 +20732,7 @@ function monoConstListElems(v: i32): i32[] {
     monoLetWritesExtend()
     for s in monoListStores.get(monoDeclCanon(b)) ?? none {
       const vals: i32[] = []
-      if monoPushArmValues(s, vals) && monoAllIdents(vals) {
+      if monoPushArmValues(s, vals) && monoAllFnValues(vals) {
         for x in vals { out.push(x) }
       }
     }
@@ -20720,10 +20740,11 @@ function monoConstListElems(v: i32): i32[] {
   out
 }
 
-// Whether every node of `xs` is an identifier.
-function monoAllIdents(xs: i32[]): boolean {
+// Whether every node of `xs` is an identifier or a function literal.
+function monoAllFnValues(xs: i32[]): boolean {
   for x in xs {
-    if !(nodeAt(x) is Ident) { return false }
+    const n = nodeAt(x)
+    if !(n is Ident) && !(n is FuncDecl) { return false }
   }
   true
 }
@@ -20757,7 +20778,7 @@ function monoElemFnDecl(el: i32, ctx: i32): i32 {
 function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
   const none: i32[] = []
   const x = unwrapParen(el)
-  if x < 0 || !(nodeAt(x) is Ident) { return none }
+  if x < 0 || !(nodeAt(x) is Ident || nodeAt(x) is FuncDecl) { return none }
   const fx = monoElemFnDecl(x, ctx)
   if fx < 0 { return none }
   const f = nodeAt(fx)
