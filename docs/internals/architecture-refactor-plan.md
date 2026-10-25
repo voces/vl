@@ -1852,6 +1852,20 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - Rep-fuzz is exact. `regress.vl`: no cell changed class. Filed witnesses `--strict`: 3,806 as filed, 0 moved.
     - Seed 5,827,701 bytes, the same size as without the change.
   - Render-parse holds at 55 / 112. None filed.
+- **2026-10-25, D1 (the ref-list slot by type): the element key is unique by type at every depth; the producers stay on the name.**
+  - Landed: under the `elem` key, a shape record whose canonical type is one sole declared struct keys as that struct (`repSlotOfElemTy`, `emit_rep.vl`). So `C[]` and `{v: i32}[]` find one ref-list row nested as well as at the top, where `rlInternNameTy` already redirected the twin. Union member sets are untouched.
+  - A/B (answer probe, 16,738 files plus the self-compile): the nested cut in `ensureRefElemTys` disagrees with `rlSlotOfTy` in 4 files, down from 12. `rlSlotOfArrNameTy` (37 files) and `collectARefArrayAnn` (10) do not move. Their name and their type are two different types (an annotation against the inferred literal, or a hole), not two rows for one type.
+  - The producers cannot mint by type. Typed `forceCloListTypeOf` (`rlInternOfTy`) is check-clean invalid wasm on `closures/closure-value-union-array-struct-elem-list-field.vl` (`expected (ref null $15), found (ref $22)`). A mint name from `tyToNominalName` still differs from the stored spelling: in `collectARefArrayAnn` it differs in 501 of 3,617 files, in `ensureRefElemTys` in 204 of 508, and in `forceCloListTypeOf` in 4 of 60. The causes:
+    - A union with `null` placed elsewhere (`Circle|null|string` against `Circle|string|null`). The box tags are positional, so this is a different row.
+    - Nominal against shape, in both directions.
+    - A generic hole that renders empty (`(T)=>void`).
+    - A module-mangled struct name.
+    - Closure grouping parens, which are cosmetic.
+  - Checks:
+    - difftree `--identity` against master's seed: the fixpoint identity holds. Of 16,625 files (11,734 built), 39 differ and 0 are uncompared. Each of the 39 has the same run outcome on both seeds.
+    - Rep-fuzz is exact. `regress.vl`: no cell changed class. Filed witnesses `--strict`: 3,820 as filed, 0 moved.
+    - Seed 5,838,498 → 5,838,666 bytes (+168).
+  - Render-parse holds: no entry retired. D2 and D8 share the mint and were not started. None filed.
 
 ### L10 log
 
