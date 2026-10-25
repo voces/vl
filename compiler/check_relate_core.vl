@@ -191,6 +191,7 @@ import {
 import {
   ACF_COMP,
   ACF_EXACT,
+  ACF_EXACT_RET,
   ACF_TPL,
   OP_AS,
   OP_BNOT,
@@ -3909,7 +3910,9 @@ export function argCstrFits(rat: i32, rexp: i32, form: i32) {
   if form > 0 { return !holeArgScalarRefused(rat, rexp) }
   // Decided by its node at the pin (`validateCompArgCstr`); a type alone would refuse a literal.
   if form == ACF_COMP { return true }
-  if form == ACF_EXACT { return tySame(widenLitTy(rat), rexp) }
+  if form == ACF_EXACT || form == ACF_EXACT_RET {
+    return tySame(widenLitTy(rat), rexp)
+  }
   assignable(rat, rexp)
 }
 
@@ -4875,7 +4878,7 @@ function holeSlotRetJudge(
 
 // Adds to `out` each value the top-level function declaring no type parameter that `c` calls
 // returns; false when `c` calls anything else.
-function holeSlotCallRets(c: Call, out: i32[]): boolean {
+export function holeSlotCallRets(c: Call, out: i32[]): boolean {
   if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
   const cf = nodeAt(parenPeelIx(c.callFn))
   if !(cf is Ident) { return false }
@@ -5012,6 +5015,9 @@ function holeSlotFixedJudge(
           }
           j = j + 1
         }
+        if holeSlotDeferring && holeRetDeferMisfit(gen, pts, ft.fnRet, sp) {
+          misfit = true
+        }
         if misfit {
           tErr(holeFixedMisfitMsg(nm, pts, d, vt, k < vals.length - nW), ats[k])
           return true
@@ -5028,10 +5034,10 @@ function holeSlotFixedJudge(
   false
 }
 
-// The first parameter the lambda `d`, which leaves another parameter un-annotated, annotates
-// with a type other than the generic's instance `inst` takes there, or, `inst` being -1, one the
-// argument type at its position in `pts` is not assignable to; -1 when none (D12217). Deferring,
-// a parameter against a type variable is demanded of the pin under `sp`, as the generic `gen` asks.
+// The first parameter the lambda `d` annotates with a type other than the instance `inst` takes
+// there (`inst` -1: one `pts` does not fit), `pts.length` for a closed result other than the
+// instance's, -1 when none (D12217). Deferring, a check against a type variable is
+// demanded of the pin under `sp`, as the generic `gen` asks.
 function holeLamMisfitAt(
   d: i32,
   pts: i32[],
@@ -5081,7 +5087,64 @@ function holeLamMisfitAt(
     }
     j = j + 1
   }
+  // A closed result is the instance's, as a fixed function's is (D12331).
+  const r = ft.fnRet
+  if r < 0 || r >= T.tys.length || tyHasTyVar(r) || tyHasHole(r) { return -1 }
+  if holeSlotDeferring {
+    if holeRetDeferMisfit(gen, pts, r, sp) { return pts.length }
+  } else if inst >= 0 && inst < T.tys.length {
+    const it = tyAt(inst)
+    if it is TyFunc && !tySame(widenLitTy(it.fnRet), widenLitTy(r)) {
+      return pts.length
+    }
+  }
   -1
+}
+
+// Deferring, whether a function returning the closed type `ret`, in a place with the generic
+// `gen` a call at `pts` runs, returns other than the generic's instance would; a result still
+// carrying the enclosing generic's type variable is demanded of the pin under `sp` (D12331).
+function holeRetDeferMisfit(
+  gen: i32,
+  pts: i32[],
+  ret: i32,
+  sp: string,
+): boolean {
+  if ret < 0 || ret >= T.tys.length || tyHasTyVar(ret) || tyHasHole(ret) {
+    return false
+  }
+  const want = holeGenRetAt(gen, pts)
+  if want < 0 || want >= T.tys.length || tyHasInferHole(want, 0) {
+    return false
+  }
+  const r = widenLitTy(ret)
+  if tyHasTyVar(want) {
+    noteArgCstr(want, r, sp, ACF_EXACT_RET, -1)
+    return false
+  }
+  !tySame(widenLitTy(want), r)
+}
+
+// The result the generic `gen` gives a call at `pts`, which may carry the enclosing generic's
+// type variables; -1 when one of its own type parameters no parameter binds.
+function holeGenRetAt(gen: i32, pts: i32[]): i32 {
+  const f = nodeAt(gen)
+  if !(f is FuncDecl) || f.fnName == "" { return -1 }
+  const gt = lookup(f.fnName)
+  if gt < 0 || gt >= T.tys.length { return -1 }
+  const g = tyAt(gt)
+  if !(g is TyFunc) || g.fnParamTypes.length != pts.length { return -1 }
+  const bn: string[] = []
+  const bt: i32[] = []
+  let j = 0
+  while j < pts.length {
+    const pt = pts[j]
+    if pt < 0 || pt >= T.tys.length || tyHasInferHole(pt, 0) { return -1 }
+    bindGenWalk(g.fnParamTypes[j], widenLitTy(pt), bn, bt)
+    j = j + 1
+  }
+  if bn.length < f.fnTyParams.length { return -1 }
+  substTyDeep(g.fnRet, bn, bt)
 }
 
 // The `holeLamMisfitAt` refusal: the lambda `d`, written (or, `stored`, held by a literal) to
@@ -5095,18 +5158,24 @@ function holeLamMisfitMsg(
 ): string {
   const f = nodeAt(d)
   let want = ""
+  let ret = false
   if f is FuncDecl {
     const t = nodeTyOf(d)
     if t >= 0 && t < T.tys.length {
       const ft = tyAt(t)
-      if ft is TyFunc { want = tyToStr(ft.fnParamTypes[j]) }
+      if ft is TyFunc {
+        ret = j >= ft.fnParamTypes.length
+        if ret {
+          want = tyToStr(widenLitTy(ft.fnRet))
+        } else {
+          want = tyToStr(ft.fnParamTypes[j])
+        }
+      }
     }
   }
-  holeFixedMisfitHead(nm, pts, d, stored)
-    + " runs it, and it takes `"
-    + want
-    + "` at parameter "
-    + i32ToStr(j + 1)
+  const head = holeFixedMisfitHead(nm, pts, d, stored)
+  if ret { return head + " runs it, and it returns `" + want + "`" }
+  head + " runs it, and it takes `" + want + "` at parameter " + i32ToStr(j + 1)
 }
 
 // Whether the fixed function type `ft` has the signature of the generic's instance `inst`, the
