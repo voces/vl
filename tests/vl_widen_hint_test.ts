@@ -123,8 +123,7 @@ const CASES: Case[] = [
     show: nnV,
     out: "true",
   },
-  // `.map` into a nullable union arm builds (D2193); into a nullable list it does not
-  // (D12901), so it is not offered.
+  // `.map` into a nullable union arm builds (D2193), and into a nullable list (D12901).
   {
     dst: "(Circle | null)[]",
     val: "rs",
@@ -135,7 +134,7 @@ const CASES: Case[] = [
   {
     dst: "(i32[] | null)[]",
     val: "nss",
-    want: ["readonly"],
+    want: ["readonly", "map"],
     show: "const e = w[0]\nif e != null { print(e[0]) }",
     out: "1",
   },

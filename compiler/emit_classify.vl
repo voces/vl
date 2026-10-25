@@ -208,6 +208,7 @@ import {
   tyIsLitUnion,
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
+  tyIsMap,
   tyIsNewtypeBrand,
   tyIsNulValueUnionBox,
   tyIsNullableLitUnion,
@@ -563,6 +564,7 @@ import {
 import {
   annIsNulStrListDeep,
   annValtypeSlotOf,
+  annVariantRowOf,
   anonLeafParamRowOf,
   arrNewFillAnnKind,
   asgValueIsFunc,
@@ -823,6 +825,7 @@ import {
   sigKeyRetSlot,
   structFieldIsClosure,
   unRowOfFlatMembers,
+  vkIsBoxedRefElem,
   vkIsPlainList,
   vkNulNicheOf,
 } from "./emit_sig_tokens"
@@ -1349,7 +1352,7 @@ export function cloRetValSlot(fe: i32) {
         return anonLeafRetRowOf(fnStmts[fe], retStructRowIndex(fn.fnRet))
       }
       // A `: Cat` annotated variant result — the slot is the variant index.
-      if k == "variant" { return variantIndexOf(tyNameOf(fn.fnRet)) }
+      if k == "variant" { return annVariantRowOf(fn.fnRet) }
       // A `: Circle | null` annotated result — the slot is the variant index under the
       // null, since `retStructIndex` has no row for a variant.
       if k == "nulvariant" { return nulVariantIndexOf(fn.fnRet) }
@@ -21702,6 +21705,9 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
         // A call typed as a list of a nullable record, a union's arm included, is a ref list
         // of that type's own row, whatever kind the callback's return is classified as (D12820).
         if mfNulRecResultElemTy(callIx, fnIx) >= 0 { return "ref" }
+        // A call typed `u8[]` builds the packed byte list; its callback's return reads as an
+        // `i32`, which would pick the plain list (D12902).
+        if tyIsU8ArrayTy(nodeTyInOf(callIx, fnIx)) { return "u8" }
         const fe = mfCallbackFe(c.callArgs[0], fnIx)
         if fe < 0 {
           // A closure-value callback (`xs.map(f)`, `f` a function-typed param/binding) — its result
@@ -21752,9 +21758,9 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
   null
 }
 
-// The element type of a `.map` whose callback returns a list or a function, so its result is a
-// ref list of that list's wrapper or of closures; -1 when the callback returns neither or the
-// call's element is not a concrete list or function type.
+// The element type of a `.map` whose callback returns a list, a function, a nullable list, a
+// map, a nullable map or a nullable closure, so its result is a ref list at that element's row;
+// -1 when the callback returns none of these or the call's element is not that concrete type.
 export function mfListResultElemTy(callIx: i32, fnIx: i32): i32 {
   const c = nodeAt(callIx)
   if c is Call {
@@ -21765,7 +21771,14 @@ export function mfListResultElemTy(callIx: i32, fnIx: i32): i32 {
       const fe = mfCallbackFe(c.callArgs[0], fnIx)
       // A closure-value callback has no lifted function to ask; its call's type decides.
       const vk = if fe >= 0 { cloRetValKind(fe) } else { null }
-      if fe >= 0 && !vkIsPlainList(vk) && vk != "closure" { return -1 }
+      if (
+        fe >= 0
+        && !vkIsPlainList(vk)
+        && vk != "closure"
+        && !vkIsBoxedRefElem(vk)
+      ) {
+        return -1
+      }
       let et = iterElemPinTy(callIx, fnIx)
       if et < 0 {
         const rt = tyRefArrElemOf(nodeTyIxOf(callIx))
@@ -21775,6 +21788,17 @@ export function mfListResultElemTy(callIx: i32, fnIx: i32): i32 {
       // A function-returning callback maps to a ref list of closures (D9171).
       if vk == "closure" { return if tyIsFuncArena(et) { et } else { -1 } }
       if tyAt(et) is TyArray { return et }
+      // A nullable list, a map, a nullable map or a nullable closure is a ref-list element
+      // read at its own `et` row (D12901).
+      if fe >= 0 && !vkIsBoxedRefElem(vk) { return -1 }
+      if tyIsMap(et) { return et }
+      const nt = tyAt(et)
+      if nt is TyNullable {
+        if nt.nInner >= 0 && nt.nInner < T.tys.length {
+          const it = tyAt(nt.nInner)
+          if it is TyArray || it is TyMap || it is TyFunc { return et }
+        }
+      }
     }
   }
   -1
