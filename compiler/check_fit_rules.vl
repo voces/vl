@@ -103,6 +103,7 @@ import {
 } from "./check_diag_text"
 import { joinWantAt } from "./check_expected"
 import {
+  blockLastStmt,
   f32ArmPlainTy,
   f32JoinRevert,
   ifArmGivesNoValue,
@@ -3962,10 +3963,9 @@ function mapUnboxRecordLit(
 // Stamps the context (destination) type `dstTy` onto a literal source `srcExpr` (recursively,
 // into `ObjLit` fields / `ArrayLit` elements) into the `nodeRepTyIx` sidecar, at arena-pure
 // adoption sites — reads only `T.tys`/`P.nodes`, writes only `nodeRepTyIx`. Nullable wrappers
-// are peeled; a destination deeper than 16 declines, to avoid unbounded recursion.
+// are peeled; `depth` bounds the walk, which a recursive record does not.
 export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
   if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
-  if tyDeeperThan(dstTy, 16) { return 0 }
   let dtix = dstTy
   let peel = true
   while peel {
@@ -4054,8 +4054,33 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       }
       return 0
     }
+    // A `null` at a nullable record is that record's null, stamped with the record.
+    NullLit => {
+      if !(d is TyObj) { return 0 }
+      while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
+      nodeRepTyIx[srcExpr] = dtix
+      return 1
+    }
+    // A value `if`, `match` or block delivers each arm's value to the same destination.
+    IfStmt => {
+      if e.ifElse < 0 { return 0 }
+      const a = recordRepTyAdopt(blockLastStmt(e.ifThen), dtix, depth - 1)
+      const b = if nodeAt(e.ifElse) is IfStmt { recordRepTyAdopt(e.ifElse, dtix, depth - 1) } else { recordRepTyAdopt(blockLastStmt(e.ifElse), dtix, depth - 1) }
+      return if a > 0 || b > 0 { 1 } else { 0 }
+    }
+    Block => {
+      return recordRepTyAdopt(blockLastStmt(srcExpr), dtix, depth - 1)
+    }
+    MatchExpr => {
+      let any = 0
+      for b in e.matchBodies {
+        const v = if b >= 0 && nodeAt(b) is Block { blockLastStmt(b) } else { b }
+        if recordRepTyAdopt(v, dtix, depth - 1) > 0 { any = 1 }
+      }
+      return any
+    }
     // no other source is a literal shape to stamp
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {}
   }
   0
 }

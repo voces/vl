@@ -62,6 +62,7 @@ import {
   nodeAt,
   spreadArgOf,
 } from "./ast"
+import { blockLastStmt } from "./check_if_value"
 import {
   fvaAnnot,
   fvaRefuse,
@@ -1412,8 +1413,10 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // stays at its own type. Writes only `nodeRepTyIx`.
   const rtStamp = !inferQuiet
     && srcExpr >= 0
-    && (tyReachesEmptyHole(srcTy, 8) || tyReachesUnion(dstTy, 8))
-  if rtStamp && repStampableLit(srcExpr) {
+    && (tyReachesEmptyHole(srcTy, 8)
+    || tyReachesUnion(dstTy, 8)
+    || litAtRecordDst(srcExpr, dstTy))
+  if rtStamp && repStampableLit(srcExpr, 8) {
     const q = inferQuiet
     inferQuiet = true
     const sOk = assignableExpr(srcExpr, srcTy, dstTy)
@@ -3142,8 +3145,49 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   true
 }
 
-// Whether `x`, past parentheses, is an object or array literal: the sources a rep stamp can adopt.
-function repStampableLit(x: i32): boolean {
+// Whether a record, list or `null` literal `x` meets a closed destination that holds a record
+// through nullables and lists: a fresh literal has one storage type, its destination's (D3339).
+export function litAtRecordDst(x: i32, dstTy: i32): boolean {
+  if dstTy < 0 || tyHasTyVar(dstTy) { return false }
+  if !repStampableLit(x, 8) { return false }
+  let t = dstTy
+  let k = 0
+  while k < 8 && t >= 0 {
+    const d = tyAt(t)
+    if d is TyObj { return true }
+    if d is TyNullable { t = d.nInner }
+    else if d is TyArray { t = d.aElem }
+    else { return false }
+    k = k + 1
+  }
+  false
+}
+
+// Whether `x`, past parentheses, is a record, list or `null` literal, or a value `if`, `match` or
+// block one of whose arms is: the sources a rep stamp can adopt.
+function repStampableLit(x: i32, depth: i32): boolean {
+  if x < 0 || depth <= 0 { return false }
   const pk = nodeAt(parenPeelIx(x))
-  pk is ObjLit || pk is ArrayLit
+  match pk {
+    ObjLit | ArrayLit | NullLit => {
+      return true
+    }
+    IfStmt => {
+      if pk.ifElse < 0 { return false }
+      return repStampableLit(blockLastStmt(pk.ifThen), depth - 1)
+        || repStampableLit(pk.ifElse, depth - 1)
+    }
+    Block => {
+      return repStampableLit(blockLastStmt(parenPeelIx(x)), depth - 1)
+    }
+    MatchExpr => {
+      for b in pk.matchBodies {
+        if repStampableLit(b, depth - 1) { return true }
+      }
+      return false
+    }
+    _ => {
+      return false
+    }
+  }
 }

@@ -2730,23 +2730,12 @@ function emitStartGlobalInit(
         }
       } else {
         const entryCtx = expCtxHere(ec)
-        const sc = emitStartGlobalSeedCtx(gst, g, gck, ec)
-        if (
-          emitStartGlobalInitValue(
-            bodyExpr,
-            exprPrev,
-            gst,
-            g,
-            gck,
-            sc.variantIdx,
-            ec,
-          )
-          < 0
-        ) {
+        emitStartGlobalSeedCtx(gst, g, gck, ec)
+        if (emitStartGlobalInitValue(bodyExpr, exprPrev, gst, g, gck, ec) < 0) {
           return -1
         }
-        // Back to idle, keeping the caller's null reps for a closure and a list. The variant
-        // and ref-heap seeds must clear too: `emitNullLitNode` does not consume them, so a left
+        // Back to idle, keeping the caller's null reps for a closure and a list. The ref-heap
+        // seed must clear too: `emitNullLitNode` does not consume them, so a left
         // armed one retypes the next global's bare `null` into the wrong cell (D1563).
         const idle = expCtxHere(ec)
         idle.nulBool = false
@@ -2755,8 +2744,6 @@ function emitStartGlobalInit(
         idle.nulClosure = entryCtx.nulClosure
         idle.nulList = entryCtx.nulList
         idle.mapSlot = -1
-        idle.structIdx = -1
-        idle.variantIdx = -1
         idle.listKind = LBK_I32_LIST
         idle.listSlot = 0
         idle.litUnion = 0
@@ -2793,9 +2780,8 @@ function emitStartGlobalInit(
 }
 
 // `emitStartGlobalInit`'s seeding step for global statement `gst` (its `LetDecl` `g`, cell kind
-// `gck`): applies the expression context its initializer lowers under — shape, struct, variant,
-// null rep and list build — and returns the seeded context, whose `variantIdx` the value step
-// reads.
+// `gck`): applies the expression context its initializer lowers under — shape, null rep and list
+// build.
 function emitStartGlobalSeedCtx(gst: i32, g: LetDecl, gck: VKind, ec: ExpCtx) {
   // A map global's start-fn init seeds the map SHAPE (mirrors the
   // local-`let` seeding) so `Map()` builds THIS global's map struct.
@@ -2808,24 +2794,12 @@ function emitStartGlobalSeedCtx(gst: i32, g: LetDecl, gck: VKind, ec: ExpCtx) {
     sc.mapSlot = gnmShape
     sc.nulRefHeap = mapTypeIdxOf(gnmShape)
   }
-  // A struct / nullable-struct cell seeds the struct context so a bare
-  // `null` init lowers as `ref.null $S` and a literal builds THIS
-  // global's annotated struct (mirrors the const-path seeding).
-  if gck == "struct" || gck == "nulstruct" {
-    sc.structIdx = globalCellStructIdx(gst)
-  }
-  // The kind-8 variant twin of that seed, for the non-const init path (a variant global whose
-  // initializer is a call, another global, or any other non-constexpr): the literal — or the
-  // value the start fn stores — builds the bare variant struct the cell is declared with.
+  // A promoted `const c: Circle | null` that becomes a start-function local lowers a bare `null`
+  // init as that variant's own typed null.
   if gck == "nulvariant" {
-    // The promoted-binding mirror of the cell path's nullable-variant seed: a top-level
-    // `const c: Circle | null` that becomes a start-function local still needs the variant
-    // context, so an object-literal init builds `uVarHeap[vi]` and a bare `null` init lowers as that variant's own typed null.
     const gnvi = globalCellStructIdx(gst)
-    sc.variantIdx = gnvi
     if gnvi >= 0 && gnvi < uVarHeap.length { sc.nulRefHeap = uVarHeap[gnvi] }
   }
-  if gck == "variant" { sc.variantIdx = globalCellStructIdx(gst) }
   // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
   // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
   sc.nulBool = letIsNulBoolAnn(gst)
@@ -2874,11 +2848,11 @@ function emitStartGlobalSeedCtx(gst: i32, g: LetDecl, gck: VKind, ec: ExpCtx) {
     }
   }
   expCtxApply(cellCtx, ec)
-  sc
+  0
 }
 
 // `emitStartGlobalInit`'s value step for global statement `gst` (its `LetDecl` `g`, cell kind
-// `gck`, seeded variant `svi`): emits the initializer into `bodyExpr` by the cell's coercion. On
+// `gck`): emits the initializer into `bodyExpr` by the cell's coercion. On
 // failure restores the writer to `exprPrev` and returns -1, else 0.
 function emitStartGlobalInitValue(
   bodyExpr: u8[],
@@ -2886,9 +2860,10 @@ function emitStartGlobalInitValue(
   gst: i32,
   g: LetDecl,
   gck: VKind,
-  svi: i32,
   ec: ExpCtx,
 ) {
+  let svi = -1
+  if gck == "variant" { svi = globalCellStructIdx(gst) }
   // A union cell (kind 4) coerces a raw init value into the box (`let w: string | i32 = n`
   // boxes the i32 read); a union-valued init passes through unchanged. The box-typed
   // position: a union global's cell is always the box (unlike `buildLocals`), so a
@@ -9923,28 +9898,15 @@ function emitConstCellInit(buf: u8[], gi: i32, ec: ExpCtx): i32 {
   const g = nodeAt(globalStmts[gi])
   if g is LetDecl {
     const gcSaved = expCtxHere(ec)
-    // The init must build the cell's wasm type: `ExpCtx.structIdx` seeds an `ObjLit` to the
-    // annotated struct, `ExpCtx.listKind`/`ExpCtx.listSlot` an empty `[]` to its list.
+    // The init must build the cell's wasm type: `ExpCtx.listKind`/`ExpCtx.listSlot` seed an
+    // empty `[]` to its list.
     const gck = globalCellKind(globalStmts[gi])
     const gcs = globalCellStructIdx(globalStmts[gi])
     const sc = expCtxHere(ec)
-    if gck == "struct" { sc.structIdx = gcs }
-    // A variant cell seeds the variant context, so the literal builds the bare variant struct.
-    // Bounded, because `gcs` is a variant index only where `globalCellStructIdx` found one; its
-    // last rung falls through to `structIndexOfExpr`, another table's index entirely.
-    if gck == "variant" {
-      if gcs >= 0 && gcs < uVarHeap.length { sc.variantIdx = gcs }
-    }
-    // A nullable-struct cell seeds the same struct context: a bare `null` init lowers as
-    // `ref.null $S` (a valid constexpr), a struct literal as that struct.
-    if gck == "nulstruct" { sc.structIdx = gcs }
-    // A nullable-variant cell seeds the variant context and its own typed null, bounded for the
-    // same reason as its non-null sibling.
-    if gck == "nulvariant" {
-      if gcs >= 0 && gcs < uVarHeap.length {
-        sc.variantIdx = gcs
-        sc.nulRefHeap = uVarHeap[gcs]
-      }
+    // A nullable-variant cell seeds its own typed null; `gcs` is a variant index only where
+    // `globalCellStructIdx` found one.
+    if gck == "nulvariant" && gcs >= 0 && gcs < uVarHeap.length {
+      sc.nulRefHeap = uVarHeap[gcs]
     }
     const gcLb = letListBuild(globalStmts[gi], -1)
     sc.listKind = gcLb.lbKind
