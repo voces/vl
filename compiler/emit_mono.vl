@@ -582,6 +582,7 @@ import {
 import {
   elabAliasNote,
   elabBodyDeclNote,
+  elabCallParamTy,
   elabDemand,
   elabKeyAt,
   elabRetOf,
@@ -21275,6 +21276,118 @@ function monoFnPinAt(
   nm
 }
 
+// The pin of argument `args[i]` of call `callIx` (in frame `ctx`) whose type the checker left
+// open, at `t`, the closed type the elaboration answers its parameter with: a literal the checker
+// copied per type takes its copy there (D5880), anything else is delivered by `monoElabDeliver`;
+// "" when `t` is no answer or the argument is not one it reaches.
+function monoElabPin(callIx: i32, args: i32[], i: i32, t: i32, ctx: i32): string {
+  const x = unwrapParen(args[i])
+  if x < 0 || t < 0 || t >= T.tys.length || tyHasTyVar(t) { return "" }
+  const cps = holeLitCopiesOf(x)
+  if cps.length > 0 { return monoElabLitCopy(callIx, args, i, cps, t, ctx) }
+  if !monoTyOpen(nodeTyIxOf(x)) { return "" }
+  if !monoElabDeliver(x, t, ctx, false, false) { return "" }
+  monoElabDeliver(x, t, ctx, false, true)
+  if tyAt(t) is TyFunc {
+    const sk = sigKeyOfTy(t)
+    if sk != "" { return "=>" + sk }
+    const an = monoArgFnTypeName(x, ctx)
+    if an != "" { return an }
+    return monoConcreteFnTyName(t)
+  }
+  if !monoTyOpen(nodeTyIxOf(x)) { return monoArgPinName(x, ctx) }
+  monoI32AtomPinName(t)
+}
+
+// The copy among `cps` of literal `args[i]` the checker pinned at `t`, put in its place in call
+// `callIx`, and its pin; "" when no copy is pinned there.
+function monoElabLitCopy(
+  callIx: i32,
+  args: i32[],
+  i: i32,
+  cps: i32[],
+  t: i32,
+  ctx: i32,
+): string {
+  const c = nodeAt(callIx)
+  if !(c is Call) { return "" }
+  let k = 0
+  while k < c.callArgs.length && c.callArgs[k] != args[i] { k = k + 1 }
+  if k >= c.callArgs.length { return "" }
+  for cp in cps {
+    const pt = holeLitPinOf(cp)
+    if pt >= 0 && tySameSpelled(pt, t, TY_WALK_DEPTH) {
+      const nm = monoArgPinName(cp, ctx)
+      if nm == "" { return "" }
+      c.callArgs[k] = cp
+      args[i] = cp
+      monoArenaTouch()
+      return nm
+    }
+  }
+  ""
+}
+
+// Whether `x` takes closed type `t`: a function value there, or a list or record literal of
+// values or closed bindings' reads, each part at its own slot's type; with `go`, delivers each
+// function value there and retypes each literal the checker left open. A literal inside a
+// generic's instance shares the node and is not retyped, so a value in one (`inst`) is not
+// reached.
+function monoElabDeliver(
+  ax: i32,
+  t: i32,
+  ctx: i32,
+  inst: boolean,
+  go: boolean,
+): boolean {
+  const x = unwrapParen(ax)
+  if x < 0 || x >= P.nodes.length || t < 0 || t >= T.tys.length { return false }
+  const xt = nodeTyIxOf(x)
+  if !monoTyOpen(xt) { return true }
+  const n = nodeAt(x)
+  const tt = tyAt(t)
+  if tt is TyFunc {
+    const nm = monoConcreteFnTyName(t)
+    if nm == "" || inst { return false }
+    if go && n is FuncDecl { monoLamLitTake(x, nm, ctx) }
+    if go && !(n is FuncDecl) { monoCoerceFnValueName(x, nm, ctx, t) }
+    return true
+  }
+  const li = inst || monoFrameIsGenericInstance(ctx)
+  if n is ArrayLit && tt is TyArray {
+    for e in n.arrElems {
+      if !monoElabDeliver(e, tt.aElem, ctx, li, go) { return false }
+    }
+    if go && !li { nodeTyRecord(x, t) }
+    return true
+  }
+  if !(n is ArrayLit) && !(n is ObjLit) {
+    const bt = monoClosedReadTy(x, ctx, false)
+    if bt >= 0 && tySameSpelled(bt, t, TY_WALK_DEPTH) {
+      if go && !li { nodeTyRecord(x, bt) }
+      return true
+    }
+    return false
+  }
+  if !(n is ObjLit) || !(tt is TyObj) { return false }
+  for fi in n.objFields {
+    const f = nodeAt(fi)
+    if !(f is FieldInit) { return false }
+    let k = 0
+    while k < tt.objFieldNames.length && tt.objFieldNames[k] != f.fiName { k = k + 1 }
+    if k >= tt.objFieldTypes.length { return false }
+    if !monoElabDeliver(f.fiValue, tt.objFieldTypes[k], ctx, li, go) { return false }
+  }
+  if go && !li {
+    monoSupersededObjTys.push(xt)
+    nodeTyRecord(x, t)
+    // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
+    monoGradualObjList.push(x)
+    monoArenaTouch()
+  }
+  true
+}
+
 // Each hole lambda literal handed to the one call pinning the slot of `d` open takes the parameter
 // type of `bt`, the concrete function type that call is delivered at (D6543).
 function monoPinOpenCallLams(d: i32, bt: i32) {
@@ -23183,15 +23296,11 @@ function monoPinHoleParam(
       return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
     }
   }
+  // The elaboration's answer for the parameter at the call's template, where it closes.
   if an == "" {
-    const frTy: i32[] = [0 - 1]
-    an = monoHoleGenFnFramePin(fn, params, args, i, ctx, frTy)
-    if an != "" { anTy = frTy[0] }
-  }
-  if an == "" {
-    const cpTy: i32[] = [0 - 1]
-    an = monoHoleLitCopyPin(callIx, oDecl, args, i, ctx, cpTy)
-    anTy = cpTy[0]
+    const et = elabCallParamTy(monoCallTplOf(callIx), i)
+    an = monoElabPin(callIx, args, i, et, ctx)
+    if an != "" { anTy = et }
   }
   if an == "" {
     const llTy: i32[] = [0 - 1]
@@ -23202,11 +23311,6 @@ function monoPinHoleParam(
     const flTy: i32[] = [0 - 1]
     an = monoOpenFnListPin(oDecl, callIx, args[i], i, ctx, flTy)
     anTy = flTy[0]
-  }
-  if an == "" {
-    const rlTy: i32[] = [0 - 1]
-    an = monoOpenFnRecListPin(oDecl, callIx, args[i], i, ctx, rlTy)
-    anTy = rlTy[0]
   }
   if an == "" {
     const rsTy: i32[] = [0 - 1]
@@ -23226,11 +23330,6 @@ function monoPinHoleParam(
     if anTy < 0 { anTy = monoHoleFnPinTy(args[i], ctx, an) }
   }
   if an == "" {
-    const lamTy: i32[] = [0 - 1]
-    an = monoHoleLamArgPin(callIx, oDecl, args, i, ctx, lamTy)
-    if an != "" { anTy = lamTy[0] }
-  }
-  if an == "" {
     const pinTy: i32[] = [0 - 1]
     an = monoOpenFnFlowPin(
       args[i],
@@ -23244,11 +23343,6 @@ function monoPinHoleParam(
     const rowTy: i32[] = [0 - 1]
     an = monoPinnedListElemPin(args[i], rowTy)
     anTy = rowTy[0]
-  }
-  if an == "" {
-    const ocTy: i32[] = [0 - 1]
-    an = monoHoleLamOwnCallsPin(callIx, oDecl, args, i, ctx, ocTy)
-    anTy = ocTy[0]
   }
   if an == "" {
     // A name handed through an identity call into a binding can take a slot per type.
