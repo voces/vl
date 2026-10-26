@@ -1113,6 +1113,29 @@ axis(
   (d) => twoFiles(d, genNarrowedGlobals(600, true), genNarrowedGlobals(600, false)),
 );
 
+// A CALL CYCLE UNDER A NARROWED PATH. `k` functions each calling the next at two sites, the last
+// writing `o.v`, called under `o.v != null`. Only where the last one recurses differs: back to `f0`,
+// so every function is on one cycle, or into itself. Fuel reads 1.004; master `6eae61d51` read 22.2,
+// from `fnWriteFreePaths` re-walking every member of an open cycle once per path to it, 2^k walks.
+const genWriteCycle = (k: number, cycle: boolean): string => {
+  const o = ["type R = {v: i32 | null}", "const o: R = {v: 1}"];
+  for (let i = 0; i < k - 1; i++) {
+    o.push(`function f${i}(n: i32): i32 {`, "  if n <= 0 { return 0 }", `  f${i + 1}(n - 1) + f${i + 1}(n - 2)`, "}");
+  }
+  o.push(`function f${k - 1}(n: i32): i32 {`, "  o.v = 2", "  if n <= 0 { return 0 }");
+  o.push(`  f${cycle ? 0 : k - 1}(n - 1)`, "}");
+  o.push("function main(): i32 {", "  if o.v != null {", "    const r = f0(3)");
+  o.push("    if o.v != null { return o.v + r }", "  }", "  0", "}", "print(main())");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "call cycle under a narrowed path",
+  2.0,
+  "A write-effect summary on a cycle through a frame still open is being recomputed per path to it instead of kept provisional until the cycle closes — `weCycleHit` / `weProvisional` (compiler/check_write_effects.vl).",
+  (d) => twoFiles(d, genWriteCycle(14, true), genWriteCycle(14, false)),
+);
+
 // UN-ANNOTATED CALLBACK LAMBDAS. `n` lambdas `(g) => g(out)`, each called once with a
 // function, either all in one function over one list or one per function. A list handed to an
 // un-annotated parameter used as the callee asks which function each call of the lambda passes
