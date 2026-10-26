@@ -758,7 +758,6 @@ import {
   relSkew,
 } from "./emit_reloc"
 import {
-  anonLeafSupersedeOf,
   fnHasUnannotatedParam,
   listGetIdxReReadable,
   memIsNarrowed,
@@ -1122,7 +1121,6 @@ import {
   tyRefArrElemOf,
 } from "./emit_map_value_slots"
 import {
-  anonLeafRetMovedOf,
   mvListValKind,
   mvValIsMap,
   refPushScratchBaseFor,
@@ -1188,6 +1186,9 @@ import {
   sharedFieldArmConverts,
   sharedFieldArmLitTexts,
   sharedFieldArmNulStr,
+  sharedFieldArmNull,
+  sharedFieldArmStructTag,
+  sharedFieldPlanHasNull,
   unionArmVariantWithHeap,
 } from "./emit_obj_lit_fits"
 import {
@@ -1332,6 +1333,7 @@ import {
   listIdxWrapSlot,
   mapI32KeyLocal,
   mapI64KeyLocal,
+  memReadCheckerAtomKind,
   mfCallbackLocal,
   mfDstLocalFor,
   mfSrcLocalFor,
@@ -10894,6 +10896,14 @@ function sharedFieldPlanDispatchable(
   fis: i32[],
 ): boolean {
   if sharedFieldCodeDispatchable(code) { return true }
+  // A `boolean | null` read is the niche's one `i32` (`sharedFieldNulBoolPlan`).
+  if code == FC_NUL_BOOL { return true }
+  // A `string | null` read is the nullable string ref (`sharedFieldNulStrPlan`).
+  if code == FC_NUL_STR { return aUsed }
+  // An atom-set read with `null` members is one `i32` (`sharedFieldLitSetPlan`).
+  if code == FC_NUL_LIT_UNION && sharedFieldPlanHasNull(vis, fis) {
+    return true
+  }
   if (
     code == FC_STR
     || code == FC_I32
@@ -10968,6 +10978,21 @@ function emitSharedFieldArm(
   if vi < 0 || vi >= uVarHeap.length {
     return emitFail("emitProgram: a shared field read names no member row")
   }
+  // A `null` member of an atom-set read is the atom slot's `-1`.
+  if code == FC_NUL_LIT_UNION && sharedFieldArmNull(vi, fi) {
+    fbI32Const(0 - 1)
+    return 0
+  }
+  // A `null` member of a `boolean | null` read is the niche's sentinel `2`.
+  if code == FC_NUL_BOOL && sharedFieldArmNull(vi, fi) {
+    fbI32Const(2)
+    return 0
+  }
+  // A read the checker narrowed past `null` never reaches a `null` member.
+  if (code == FC_I32 || code == FC_STR) && sharedFieldArmNull(vi, fi) {
+    fbUnreachable()
+    return 0
+  }
   const converts = sharedFieldArmConverts(code, vi, fi)
   let texts = sharedFieldArmLitTexts(vi, fi)
   if converts && code == FC_I32 {
@@ -10996,9 +11021,21 @@ function emitSharedFieldArm(
     return r
   }
   const boxes = sharedFieldReadBoxes(code, vi, fi)
+  if boxes && sharedFieldArmNull(vi, fi) {
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    return 0
+  }
   const bk = sharedFieldArmAtomKind(vi, fi)
   const nulStr = boxes && bk < 0 && sharedFieldArmNulStr(vi, fi)
-  if boxes && !nulStr { fbI32Rel(RS_TAG, scalarTagOfKind(bk)) }
+  // A record field rides the box under the read union's arm built at the record's own row.
+  let recTag = -1
+  if boxes && bk < 0 && !nulStr {
+    recTag = sharedFieldArmStructTag(vi, fi, readIx)
+  }
+  if recTag >= 0 { fbI32Rel(RS_TAG, recTag) }
+  else if boxes && !nulStr { fbI32Rel(RS_TAG, scalarTagOfKind(bk)) }
   if emitSharedFieldRecv(body, recvIx, fnIx, slot, ec) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   fbRefCast(uVarHeap[vi])
@@ -11030,6 +11067,10 @@ function emitSharedFieldArm(
   if boxes {
     if atomKindNeedsValueBox(bk) { fbStructNew(vbHeapIdxOfKind(bk)) }
     fbStructNew(uBoxIdx)
+  }
+  // A `string | null` member read where a narrowing excluded `null` holds a string.
+  if code == FC_STR && variantFieldTypeAt(vi, fi) == FC_NUL_STR {
+    fbRefAsNonNull()
   }
   0
 }
@@ -11204,7 +11245,13 @@ function sharedFieldTysIdentical(vis: i32[], fis: i32[]): boolean {
 // `fbIfForSharedField` for a plan `sharedFieldPlanDispatchable` admitted: a reference field's
 // blocktype is its member's storage valtype, written by `pushFieldStorage`.
 function fbIfForSharedPlan(code: i32, vi: i32, fi: i32) {
-  if sharedFieldCodeDispatchable(code) { return fbIfForSharedField(code) }
+  if (
+    sharedFieldCodeDispatchable(code)
+    || code == FC_NUL_LIT_UNION
+    || code == FC_NUL_BOOL
+  ) {
+    return fbIfForSharedField(code)
+  }
   fbOpenIf()
   pushFieldStorage(code, uFieldStorageSlot(vi, fi))
 }
@@ -11612,6 +11659,11 @@ function emitMemSharedRead(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx): i32 {
       // A boxed read whose path is narrowed to one atom delivers that atom, as a code-16
       // field's does.
       if sharedFieldAnyArmBoxes(shCode, shVis, shFis) {
+        // A read the checker typed as one atom (a null test narrowed the path) delivers it.
+        if narrowedValueAtomOf(memberPathKeyOf(memIx)) == "" {
+          const shAk = memReadCheckerAtomKind(memIx)
+          if shAk >= 0 { return emitUnboxToAtomKind(shAk) }
+        }
         return emitUnionFieldNarrowUnbox(memIx, fnIx)
       }
       return 0
@@ -30195,13 +30247,12 @@ function inferredRetVariantIdx(fnPos: i32): i32 {
   -1
 }
 
-// Seed `ctx` from the result type of function `fn` (at `fnIx`, `fnStmts` position `fnPos`,
+// Seed `ctx` from the result type of function `fn` (at `fnStmts` position `fnPos`,
 // -1 when annotated) for the return value `retArg`: struct, variant, map and list seeds of
 // the annotated and inferred spellings. Returns the narrowed-arm unbox's destination heap, or -1.
 function emitReturnSeedCtx(
   fn: FuncDecl,
   retArg: i32,
-  fnIx: i32,
   fnPos: i32,
   ctx: ExpCtx,
 ): i32 {
@@ -30210,14 +30261,6 @@ function emitReturnSeedCtx(
   if rsi >= 0 {
     if retTRFlag(fn.fnRet) == 1 { ctx.structIdx = rsi }
     if retNulRefFlag(fn.fnRet) == 1 { ctx.structIdx = rsi }
-    // D911 — the `??` merge redirect, on the returned value: the signature moved to the
-    // merged row (gated on `anonLeafRetMovedOf`, a field-set row another function can
-    // also resolve to), so without this the callee hands a narrow `struct.new` back
-    // through a merged `(result (ref $merged))`. The three call sites read one kind so they cannot drift.
-    const rvk = vtKindOfType(fn.fnRet)
-    if rvk == "struct" || rvk == "nulstruct" {
-      if anonLeafRetMovedOf(fnIx) { ctx.structIdx = anonLeafSupersedeOf(rsi) }
-    }
   }
   // A `: Cat` variant return: seed the variant index so a `return { … }` object literal
   // builds the bare variant struct (kind 8) instead of boxing into the union.
@@ -30268,18 +30311,13 @@ function emitReturnSeedCtx(
   // D887 — an inferred nullable-struct return seeds the same struct context the
   // annotated `: {r: i32} | null` spelling seeds through `retNulRefFlag` above, so the
   // bare `return null` lowers as `ref.null $S` rather than reaching `emitNullLitNode`
-  // with no context. The `??`-merge redirect rides along, or caller and callee disagree at the seam.
+  // with no context.
   if fn.fnRet < 0 {
     if fnPos >= 0 && fnPos < fRetKind.length {
       if fRetKind[fnPos] == "nulstruct" {
         if fnPos < fRetStructIdx.length {
           const nsi = fRetStructIdx[fnPos]
-          if nsi >= 0 {
-            ctx.structIdx = nsi
-            if anonLeafRetMovedOf(fnIx) {
-              ctx.structIdx = anonLeafSupersedeOf(nsi)
-            }
-          }
+          if nsi >= 0 { ctx.structIdx = nsi }
         }
       }
       // Its variant twin, the inferred half of the annotated `nulvariant` seed above: the
@@ -30889,9 +30927,7 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32, ec: ExpCtx) {
       )
     }
   }
-  if fn is FuncDecl {
-    retArmHeap = emitReturnSeedCtx(fn, retArg, fnIx, fnPos, ctx)
-  }
+  if fn is FuncDecl { retArmHeap = emitReturnSeedCtx(fn, retArg, fnPos, ctx) }
   // the result's ref-list row, for the read-only-covariance widening (D791): the
   // annotation's row, or — for an un-annotated function — `criClassify`'s recorded
   // `("reflist", slot)`, the same pair `emitOneFuncType` reads for the result valtype.
@@ -31311,11 +31347,7 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
     return 0
   }
   if retNulRefFlag(r) == 1 {
-    // D911 — the `??` merge redirect, on the fall-through null: an empty callee body has
-    // no returned value to move, so its whole result is this `ref.null`, which at the
-    // narrow row is `(ref null $narrow)` under a `(result (ref null $merged))`.
-    let rsi = retNulRefIndex(r)
-    if anonLeafRetMovedOf(fnIx) { rsi = anonLeafSupersedeOf(rsi) }
+    const rsi = retNulRefIndex(r)
     if rsi >= 0 && rsi < sHeapIdx.length {
       fbRefNull(sHeapIdx[rsi])
       return 0
@@ -31324,6 +31356,14 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   if retNulMapFlag(r) == 1 {
     fbRefNull(mapTypeIdxOf(mapAnnShape(r))) // the nullable map struct
     return 0
+  }
+  // A record that is also a union's member is that member's variant struct, nullable.
+  if retNulVariantFlag(r) == 1 {
+    const nvi = nulVariantIndexOf(r)
+    if nvi >= 0 && nvi < uVarHeap.length {
+      fbRefNull(uVarHeap[nvi])
+      return 0
+    }
   }
   if retNulListFlag(r) == 1 {
     fbRefNull(lTypeIdx)
@@ -40159,6 +40199,16 @@ function emitCoalesceNulRefCtx(
   // `br_on_non_null` branches with the raw ref it tested, so the boxed shape is its own arm.
   if coalesceNicheJoinsToBox(exprIx, fnIx) {
     return emitCoalesceNulRefJoin(body, e, exprIx, heapIx, lhsCtx, fnIx, ec)
+  }
+  // A union of records with no row, as two instances of one generic record make, has no box.
+  if (
+    tyIsStructBearingUnion(nodeTyIxOf(exprIx))
+    && !coalesceResultIsBox(exprIx)
+  ) {
+    return emitFailAt(
+      "emitProgram: this `??` joins records into a union that has no box yet, as a union of two instances of one generic record does not",
+      exprIx,
+    )
   }
   if coalListDefaultClash(e, fnIx) {
     return emitFailAt(

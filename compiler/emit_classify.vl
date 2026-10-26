@@ -253,8 +253,6 @@ import {
   plusChainHasStrLit,
 } from "./emit_anon_fields"
 import {
-  anonLeafJoinRowOf,
-  anonLeafSupersedeOf,
   anonRowScalarFits,
   atomFieldTakesStr,
   declRowFieldKindFits,
@@ -354,8 +352,6 @@ import {
   BC_LEAF,
   BC_STR,
   BtKind,
-  anonLeafFeDeclNode,
-  anonLeafFnRowsMovedOf,
   bcGet,
   bcOpen,
   bcPut,
@@ -535,8 +531,6 @@ import {
   tyRefArrElemOf,
 } from "./emit_map_value_slots"
 import {
-  anonLeafRetMovedOf,
-  anonLeafRetRowOf,
   capNarrowRecord,
   cnModLoopIter,
   cnModLoopIterOf,
@@ -571,7 +565,6 @@ import {
   annIsNulStrListDeep,
   annValtypeSlotOf,
   annVariantRowOf,
-  anonLeafParamRowOf,
   arrNewFillAnnKind,
   asgValueIsFunc,
   assignTargetSpills,
@@ -635,9 +628,14 @@ import {
   sharedFieldArmAtomKind,
   sharedFieldArmConverts,
   sharedFieldArmLitTexts,
+  sharedFieldArmNull,
   sharedFieldArmsBoxable,
   sharedFieldLitSetPlan,
+  sharedFieldNulBoolPlan,
+  sharedFieldNulStrPlan,
   sharedFieldPlanLitTy,
+  sharedFieldStructBoxName,
+  sharedFieldStructBoxPlan,
   sharedPlanBoxName,
   sharedPlanBoxesSome,
   sharedPlanOneBoxName,
@@ -930,9 +928,6 @@ import {
   RLK_U8_LIST,
   RLK_UNION,
   VKind,
-  anonLeafCloBindFn,
-  anonLeafCloBindName,
-  anonLeafCloSlotFn,
   capCountTbl,
   capNamesFlat,
   capStartTbl,
@@ -1367,11 +1362,7 @@ export function cloRetValSlot(fe: i32) {
     if fn.fnRet >= 0 {
       const k = vtKindOfType(fn.fnRet)
       if k == "struct" || k == "nulstruct" {
-        // D911 — the `??` merge redirect. A module holding any function value gives every
-        // eligible function an env-leading `$fnsig`, and this slot is both that pool entry's
-        // interning key and its emitted result valtype, so an unmoved row here declares
-        // `(result (ref null $narrow))` beside a function functype of the merged row.
-        return anonLeafRetRowOf(fnStmts[fe], retStructRowIndex(fn.fnRet))
+        return retStructRowIndex(fn.fnRet)
       }
       // A `: Cat` annotated variant result — the slot is the variant index.
       if k == "variant" { return annVariantRowOf(fn.fnRet) }
@@ -1395,11 +1386,9 @@ export function cloRetValSlot(fe: i32) {
     const cvi = cbRetVariantIdx(fe)
     if cvi >= 0 { return cvi }
     const srk = fRetKind[fe]
-    // D911 — the same redirect on the inferred half: the two halves of one signature must
-    // not learn the merge separately.
     match srk {
       "struct" | "nulstruct" => {
-        return anonLeafRetRowOf(fnStmts[fe], fRetStructIdx[fe])
+        return fRetStructIdx[fe]
       }
       // The inferred concrete-variant result, from the same companion column — the twin of
       // `emitOneFuncType`'s inferred `variant` arm — and its nullable twin (D1562): every
@@ -2861,20 +2850,14 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
 }
 
 // The base struct index of a nullable-struct `LetDecl`: the annotation's base, or the
-// initializer's resolved struct. The annotated leg takes the same `??` merge redirect the
-// map's value slot takes (D842) — `anonLeafSupersedeOf` answers `si` unchanged for every row
-// outside a merge family, so it is one bounds-checked array read everywhere else.
+// initializer's resolved struct.
 export function nulRefStructIdxOfLet(letIx: i32, fnIx: i32) {
   const d = nodeAt(letIx)
   if d is LetDecl {
     if d.letType >= 0 {
       const ri = retNulRefIndex(d.letType)
-      if ri >= 0 { return anonLeafSupersedeOf(ri) }
+      if ri >= 0 { return ri }
     }
-    // The init leg is deliberately not redirected: an un-annotated nullable-struct binding
-    // takes its row from the callee's return, and no `??` family can have superseded that row
-    // — the join reader sees a declaration whose initializer is a call, not a literal, so the
-    // merge never runs. It becomes live only with a reader that sees into a callee (D861).
     return structIndexOfExpr(d.letInit, fnIx)
   }
   -1
@@ -4809,11 +4792,9 @@ export function captureValStructIdx(fe: i32, name: string) {
     return -1
   }
   const bn = nodeAt(b)
-  // D891 — a captured parameter whose slot the `??` merge moved reads its env field at the
-  // merged row too. The third resolver of the same owner; see `anonLeafParamRowOf`.
   match bn {
     Param => {
-      return anonLeafParamRowOf(b, annValtypeSlotOf(bn.parType))
+      return annValtypeSlotOf(bn.parType)
     }
     LetDecl => {
       if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
@@ -4930,50 +4911,6 @@ export function cnWalkFrame(fe: i32) {
   }
   capComputeNamesOf(fe)
   0
-}
-
-// D940 — the `$fnsig` key a closure-typed parameter's slot must use, or "". Non-empty only
-// where `anonLeafCloSlotMark` proved the slot receives exactly one function and the merge
-// moved that function's rows. The kind tokens are identical either way and only the struct
-// slot digits move, so what changes is the heap type the `call_indirect` checks against.
-export function anonLeafCloSlotSigKey(pIx: i32): string {
-  if pIx < 0 { return "" }
-  if pIx >= anonLeafCloSlotFn.length { return "" }
-  anonLeafMovedFnSigKey(anonLeafCloSlotFn[pIx])
-}
-
-// D1090 — the same answer at a binding. `anonLeafCloBindName` and `anonLeafCloBindFn` hold
-// only bindings written with a function the merge moved, so "" here means this binding is not
-// one of them and the annotation arms downstream get their turn unchanged.
-function anonLeafCloBindSigKey(name: string): string {
-  let i = 0
-  while i < anonLeafCloBindName.length {
-    if anonLeafCloBindName[i] == name {
-      return anonLeafMovedFnSigKey(anonLeafCloBindFn[i])
-    }
-    i = i + 1
-  }
-  ""
-}
-
-// The `$fnsig` key the function named `nm` actually interned, or "" — the half
-// `anonLeafCloSlotSigKey` and `anonLeafCloBindSigKey` share.
-function anonLeafMovedFnSigKey(nm: string): string {
-  if nm == "" { return "" }
-  let fe = 0
-  while fe < fnStmts.length {
-    const fd = nodeAt(fnStmts[fe])
-    if fd is FuncDecl {
-      if fd.fnName == nm {
-        const k = cloSigKeyExt(fe)
-        // An un-interned key is one nothing can `call_indirect` at; keep the annotation's.
-        if k != "" && cloSigPosOfKey(k) >= 0 { return k }
-        return ""
-      }
-    }
-    fe = fe + 1
-  }
-  ""
 }
 
 // The mv slot of a `m[k]` or `m[k] ?? d` read over a struct-list-valued map, else -1. The hook
@@ -6047,7 +5984,7 @@ function pinRowFits(objIx: i32, si: i32, fnIx: i32, exact: boolean): boolean {
 }
 
 export function structIndexOfObjCtx(objIx: i32, fnIx: i32) {
-  const own = anonLeafJoinRowOf(objIx, structIndexOfObjCtxMemo(objIx, fnIx))
+  const own = structIndexOfObjCtxMemo(objIx, fnIx)
   const dst = objLitBindDestRow(objIx, own)
   if dst >= 0 { return dst }
   own
@@ -6587,7 +6524,10 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
         bvis,
         bfis,
       )
-      if bcode == FC_UNION && sharedPlanBoxesSome(bvis, bfis) {
+      const sbn = sharedFieldStructBoxName(bvis, bfis, memIx)
+      if bcode == FC_UNION && sbn != "" {
+        return sbn
+      } else if bcode == FC_UNION && sharedPlanBoxesSome(bvis, bfis) {
         // A join holding `null` is a nullable row, and names its box as a union row does (D13361).
         if nodeTyIsUnionRow(memIx) || nodeTyIsNullable(memIx) {
           const bn = valueUnionNameOfTy(nodeTyPinIxOf(memIx))
@@ -7838,73 +7778,11 @@ export function localCloPinFieldTail(callFnIx: i32, fnIx: i32): i32 {
   unwrapParen(tx)
 }
 
-// D1100 — the lifted function a call hands back, or -1: `pick()(…)` where `pick`'s body
-// returns a bare function name. The callee-position twin of `fieldClosureFeOfRecv` and
-// `anonLeafArrElemFe`. One hop, deliberately: an arena-scanning resolver here stalled the
-// compiler's own self-compile, so this reads the `FuncDecl` and its one return, O(1).
-export function anonLeafRetCallFe(calleeIx: i32): i32 {
-  const ix = unwrapParen(calleeIx)
-  if ix < 0 { return -1 }
-  const e = nodeAt(ix)
-  if e is Call {
-    const inner = nodeAt(unwrapParen(e.callFn))
-    if inner is Ident {
-      const t = anonLeafFeDeclNode(fnIndexOfNode(unwrapParen(e.callFn)))
-      if t >= 0 {
-        const rx = fnRetExprOf(t)
-        if rx >= 0 { return fieldValueFeOf(unwrapParen(rx)) }
-      }
-    }
-  }
-  -1
-}
-
-// D1100 — the `$fnsig` an indexed closure-array call must use when the array holds a function
-// whose rows a `??` merge moved: `cloArrSlotSigKey` reads the slot element's declared (pre-
-// move) name, which then keys nothing interned. "" when the array's elements don't all name
-// the same function (two functions in one slot share only one wasm signature by accident).
-function anonLeafArrElemSigKey(arrIx: i32, fnIx: i32): string {
-  const fe = anonLeafArrElemFe(arrIx, fnIx)
-  if fe < 0 { return "" }
-  // Gated on the move, so every other indexed closure call keeps `cloArrSlotSigKey`'s
-  // element-name route byte for byte.
-  if !anonLeafFnRowsMovedOf(anonLeafFeDeclNode(fe)) { return "" }
-  const k = cloSigKeyExt(fe)
-  // An un-interned key is one nothing can `call_indirect` at — the same refusal
-  // `anonLeafMovedFnSigKey` makes, for the same reason.
-  if k != "" && cloSigPosOfKey(k) >= 0 { return k }
-  ""
-}
-
-// The one lifted function every element of the array behind `arrIx` holds, or -1 — the
-// closure-array twin of `fieldClosureFeOfRecv`. Two different functions in one slot answer
-// -1: a ref-list slot is one wasm signature, and they agree only by accident (D1100).
-export function anonLeafArrElemFe(arrIx: i32, fnIx: i32): i32 {
-  const li = anonLeafArrLitOf(arrIx, fnIx)
-  if li < 0 { return -1 }
-  const a = nodeAt(li)
-  if a is ArrayLit {
-    const els = a.arrElems
-    if els.length == 0 { return -1 }
-    let fe = -1
-    let i = 0
-    while i < els.length {
-      const ei = fieldValueFeOf(unwrapParen(els[i]))
-      if ei < 0 { return -1 }
-      if fe < 0 { fe = ei }
-      if fe != ei { return -1 }
-      i = i + 1
-    }
-    return fe
-  }
-  -1
-}
-
 // The interned `$fnsig` key every element of the array literal behind `arrIx` shares, each a
 // lambda literal, or "" when any element is not one or two keys differ. Literals only: a
 // named element resolves by name, and two frames' same-named functions share it.
-function anonLeafArrElemSelfKey(arrIx: i32, fnIx: i32): string {
-  const li = anonLeafArrLitOf(arrIx, fnIx)
+function cloArrElemSelfKey(arrIx: i32, fnIx: i32): string {
+  const li = cloArrLitOf(arrIx, fnIx)
   if li < 0 { return "" }
   const a = nodeAt(li)
   if a is ArrayLit {
@@ -7929,18 +7807,18 @@ function anonLeafArrElemSelfKey(arrIx: i32, fnIx: i32): string {
 // The `ArrayLit` node an indexed callee's receiver resolves to — the literal itself, or the
 // initializer of the binding that names it. -1 for anything this cannot follow, which is the
 // answer that keeps every other indexed closure call on `cloArrSlotSigKey`'s route.
-function anonLeafArrLitOf(arrIx: i32, fnIx: i32): i32 {
+function cloArrLitOf(arrIx: i32, fnIx: i32): i32 {
   const ix = unwrapParen(arrIx)
   if ix < 0 { return -1 }
   const e = nodeAt(ix)
   if e is ArrayLit { return ix }
-  anonLeafArrBindingLitOf(ix, fnIx)
+  cloArrBindingLitOf(ix, fnIx)
 }
 
-// The array literal a BINDING's initializer is — the one hop `anonLeafArrLitOf`'s own arm
+// The array literal a BINDING's initializer is — the one hop `cloArrLitOf`'s own arm
 // does not cover, and that ladder's default. -1 for a name this cannot follow: a parameter,
 // a global built elsewhere, an initializer that is not a literal.
-function anonLeafArrBindingLitOf(ix: i32, fnIx: i32): i32 {
+function cloArrBindingLitOf(ix: i32, fnIx: i32): i32 {
   const e = nodeAt(ix)
   if e is Ident {
     let li = -1
@@ -8045,13 +7923,6 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
         if mfn is FuncDecl { mfArity = mfn.fnParams.length }
         if mfArity == c.callArgs.length {
           const mfk = cloSigKeyExt(mfe)
-          // D1100 — a moved function's own key is authoritative, ahead of the divergence
-          // override below: the field holds a function whose rows a `??` merge moved, so its
-          // interned `$fnsig` is what the table entry carries, while the callee node's arena
-          // type is the field's pre-move declared arrow.
-          if anonLeafFnRowsMovedOf(anonLeafFeDeclNode(mfe)) {
-            if mfk != "" && cloSigPosOfKey(mfk) >= 0 { return mfk }
-          }
           // The arity guard alone can't split same-arity twin fields that dedup to one row:
           // verify against the checker-typed callee when it's a proven function type — a
           // divergent key means the syntactic resolve aliased the twin, and the typed key is
@@ -8070,18 +7941,6 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
             }
           }
           return mfk
-        }
-      }
-    }
-    // D1100 — the callee is a call that hands a `??`-moved function back (`pick()(…)`): its
-    // own `$fnsig` is what the table entry carries, while the general fallback below would key
-    // the pre-move declared arrow. Gated on the move, so any other returned closure is unaffected.
-    if cre is Call {
-      const rfe = anonLeafRetCallFe(c.callFn)
-      if rfe >= 0 {
-        if anonLeafFnRowsMovedOf(anonLeafFeDeclNode(rfe)) {
-          const rk = cloSigKeyExt(rfe)
-          if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
         }
       }
     }
@@ -8166,15 +8025,10 @@ function cloIndexCalleeSigKey(ix: i32, tyIx: i32, fnIx: i32): string {
   const cre = nodeAt(ix)
   if cre is Index {
     if exprRefArray(cre.idxArr, fnIx) {
-      // D1100 — the moved-row override, ahead of the slot's own key: `cloArrSlotSigKey`
-      // reads the declaration's (pre-move) spelling, which names the wrong functype after a
-      // merge moves the element function's rows. "" outside such a family.
-      const ek = anonLeafArrElemSigKey(cre.idxArr, fnIx)
-      if ek != "" { return ek }
       // A literal whose elements are lifted lambdas of one signature is keyed by it, as a
       // lambda called in place is: the slot's name-rendered key disagrees with it at a
       // literal union or a niche (D2552).
-      const efk = anonLeafArrElemSelfKey(cre.idxArr, fnIx)
+      const efk = cloArrElemSelfKey(cre.idxArr, fnIx)
       if efk != "" { return efk }
       // An element read at the instance's type parameters (D7142).
       const ik = cloInstanceSigKey(tyIx, fnIx)
@@ -11599,7 +11453,7 @@ export function globalCellStructIdx(letIx: i32) {
       // a variant by construction (the struct table doesn't hold one).
       const avi = letAnnVariantIdx(letIx)
       if avi >= 0 { return avi }
-      return globalNulRefSupersede(letIx, structIndexOfLet(letIx, -1))
+      return structIndexOfLet(letIx, -1)
     }
     // A kind-8 VARIANT cell's slot is the VARIANT index, not a struct row — paired with
     // `globalKind`'s variant arm, which decides the kind this slot is read beside.
@@ -11615,20 +11469,9 @@ export function globalCellStructIdx(letIx: i32) {
     // KIND does.
     const gnvi = nulVariantIdxOfExpr(d.letInit, -1)
     if gnvi >= 0 { return gnvi }
-    // Not redirected, for `nulRefStructIdxOfLet`'s reason: an un-annotated nullable-struct
-    // global takes its row from the callee's return, which no `??` family can supersede.
     return structIndexOfExpr(d.letInit, -1)
   }
   -1
-}
-
-// D842 — the module-scope twin of `nulRefStructIdxOfLet`'s redirect, gated on the cell
-// kind since this resolver serves three of them: a `??` merge supersedes the row a
-// nullable-struct cell holds, never a plain `const x: R = {…}` global's own layout.
-function globalNulRefSupersede(letIx: i32, si: i32): i32 {
-  if si < 0 { return si }
-  if globalCellKind(letIx) != "nulstruct" { return si }
-  anonLeafSupersedeOf(si)
 }
 
 // The registered union the checker typed this array literal's element as, or "" — the one
@@ -13419,7 +13262,8 @@ function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
     let ai = 0
     while ai < avis.length {
       const conv = sharedFieldArmConverts(FC_I32, avis[ai], afis[ai])
-      if !conv && !variantFieldIsLitUnion(avis[ai], afis[ai]) {
+      const nul = sharedFieldArmNull(avis[ai], afis[ai])
+      if !conv && !nul && !variantFieldIsLitUnion(avis[ai], afis[ai]) {
         allAtom = false
       }
       ai = ai + 1
@@ -14754,14 +14598,7 @@ function fnRetStructIndexSid(sid: i32, name: string, fnIx: i32, at: i32) {
   // the same gate a misreading consumer already carries.
   const k = d.rdKind
   if k != "struct" && k != "nulstruct" { return -1 }
-  // D871 — the same redirect the map's value slot and the local's cell take: the row the
-  // return annotation names is the row the `??` family superseded, and the callee's returned
-  // literal is minted at the merged row instead. Safe under the four-namespace slot since the
-  // kind gate above already establishes this one is a struct-table row.
-  const i = fnIndexOfInScopeAt(sid, name, fnIx, at)
-  if i < 0 || i >= fnStmts.length { return d.rdSlot }
-  if !anonLeafRetMovedOf(fnStmts[i]) { return d.rdSlot }
-  anonLeafSupersedeOf(d.rdSlot)
+  d.rdSlot
 }
 
 // The struct table index of a module global `name` (from its annotation/initializer),
@@ -14779,7 +14616,7 @@ function globalStructIndexSid(fnIx: i32, sid: i32, atIx: i32) {
   // gives: this reader and `emitGlobalSection`'s cell must not drift, since the section writes
   // a superseded nullable-struct cell at the merged row and each site resolves the row
   // separately — skipping the redirect at either lets a `??`-merged global mismatch its cell's layout.
-  globalNulRefSupersede(li, structIndexOfLet(li, -1))
+  structIndexOfLet(li, -1)
 }
 
 // The struct table index of a captured struct-ref variable `name` of the capturing lifted
@@ -15089,41 +14926,8 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
       const cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
       if cfe >= 0 {
         if fRetKind[cfe] == "struct" || fRetKind[cfe] == "nulstruct" {
-          // D1100 — through the `??` merge's return-row redirect: the field holds a
-          // function whose return row the merge moved, so the call yields the merged row
-          // while `fRetStructIdx` still names the declaration's. `anonLeafRetRowOf` is `si`
-          // unchanged for every field closure outside such a family.
-          return anonLeafRetRowOf(anonLeafFeDeclNode(cfe), fRetStructIdx[cfe])
+          return fRetStructIdx[cfe]
         }
-      }
-    }
-  }
-  // D1100 — a call that hands the function back (`pick()({r: 4})`), same shape as the
-  // indexed arm below: only where the redirect moves the row.
-  if callee is Call {
-    const rfe = anonLeafRetCallFe(e.callFn)
-    if rfe >= 0 && rfe < fRetKind.length && rfe < fRetStructIdx.length {
-      if fRetKind[rfe] == "struct" || fRetKind[rfe] == "nulstruct" {
-        const rrr = anonLeafRetRowOf(
-          anonLeafFeDeclNode(rfe),
-          fRetStructIdx[rfe],
-        )
-        if rrr != fRetStructIdx[rfe] { return rrr }
-      }
-    }
-  }
-  // D1100 — an indexed closure-array call whose element is a function the `??` merge moved.
-  // Only where the redirect actually moves the row, so every other indexed closure call
-  // keeps the fallbacks below.
-  if callee is Index {
-    const efe = anonLeafArrElemFe(callee.idxArr, fnIx)
-    if efe >= 0 && efe < fRetKind.length && efe < fRetStructIdx.length {
-      if fRetKind[efe] == "struct" || fRetKind[efe] == "nulstruct" {
-        const err = anonLeafRetRowOf(
-          anonLeafFeDeclNode(efe),
-          fRetStructIdx[efe],
-        )
-        if err != fRetStructIdx[efe] { return err }
       }
     }
   }
@@ -15315,13 +15119,20 @@ function structIndexOfMemberExpr(e: Member, exprIx: i32, fnIx: i32): i32 {
   }
   // A shared read over an un-narrowed struct union: the one row every member's field
   // targets, the layout the dispatch's result is typed at (D3562).
-  if pvi < 0 { return sharedFieldTgtStructIdx(e.memObj, e.memProp, fnIx) }
+  if pvi < 0 {
+    return sharedFieldTgtStructIdx(e.memObj, e.memProp, exprIx, fnIx)
+  }
   -1
 }
 
-// The struct row a shared field read over a struct union yields, or -1 unless every member
-// stores the field as a nested struct of one row.
-function sharedFieldTgtStructIdx(recvIx: i32, prop: string, fnIx: i32): i32 {
+// The struct row the shared field read `readIx` over a struct union yields, or -1 unless every
+// member it reads stores the field as a nested struct of one row.
+function sharedFieldTgtStructIdx(
+  recvIx: i32,
+  prop: string,
+  readIx: i32,
+  fnIx: i32,
+): i32 {
   // The common receiver, a list or a string, is no union: answered off its recorded type.
   const rt = nodeTyAt(unwrapParen(recvIx), fnIx)
   if rt >= 0 && rt < T.tys.length {
@@ -15330,7 +15141,7 @@ function sharedFieldTgtStructIdx(recvIx: i32, prop: string, fnIx: i32): i32 {
   }
   const vis: i32[] = []
   const fis: i32[] = []
-  if sharedUnionFieldPlan(recvIx, prop, -1, fnIx, vis, fis) != FC_STRUCT {
+  if sharedUnionFieldPlan(recvIx, prop, readIx, fnIx, vis, fis) != FC_STRUCT {
     return -1
   }
   const r0 = uFieldTgtStructIdx(vis[0], fis[0])
@@ -16639,6 +16450,13 @@ function memberUnionReadKind(exprIx: i32, fnIx: i32) {
       if d >= 0 { return d }
       return -2
     }
+    // A shared read boxing its members' differing atoms, narrowed to one (`emitMem`'s twin).
+    if narrowTop > 0 {
+      const sa = narrowedValueAtomOf(memberPathKeyOf(exprIx))
+      if sa != "" && memberFieldCode(exprIx, fnIx) == FC_UNION {
+        return valueAtomKind(sa)
+      }
+    }
   }
   -3
 }
@@ -17024,14 +16842,65 @@ export function sharedUnionFieldPlan(
     outFis.push(fi)
     i = i + 1
   }
+  if (
+    !mixed
+    && code == FC_STRUCT
+    && sharedFieldNarrowedArms(readIx, outVis, outFis)
+  ) {
+    return code
+  }
   if outVis.length < 2 { return -1 }
+  // Records stored at different rows read as the box of the union the read is typed as.
+  if (
+    !mixed
+    && code == FC_STRUCT
+    && sharedFieldStructBoxPlan(outVis, outFis, readIx)
+  ) {
+    return FC_UNION
+  }
   if mixed {
     const lit = sharedFieldLitSetPlan(outVis, outFis, readIx)
     if lit >= 0 { return lit }
+    const nb = sharedFieldNulBoolPlan(outVis, outFis, readIx)
+    if nb >= 0 { return nb }
+    const ns = sharedFieldNulStrPlan(outVis, outFis, readIx)
+    if ns >= 0 { return ns }
     if !sharedFieldArmsBoxable(outVis, outFis) { return -1 }
     return FC_UNION
   }
   code
+}
+
+// Whether the record field read `readIx` is narrowed to one record (`if w.c is C`), keeping in
+// `vis`/`fis` only the members whose field stores that record; the `is` test read the box tag,
+// so no other member reaches the read. False, the plan untouched, when no member stores it.
+function sharedFieldNarrowedArms(readIx: i32, vis: i32[], fis: i32[]): boolean {
+  if readIx < 0 || narrowTop == 0 { return false }
+  const pk = placeNarrowKeyOf(readIx)
+  if pk == "" { return false }
+  const nt = narrowSlotTy(narrowSlotOf(pk))
+  if nt < 0 || nt >= T.tys.length || !(tyAt(nt) is TyObj) { return false }
+  const kv: i32[] = []
+  const kf: i32[] = []
+  let i = 0
+  while i < vis.length {
+    const si = uFieldTgtStructIdx(vis[i], fis[i])
+    if si >= 0 && si < sTyIx.length && tySame(sTyIx[si], nt) {
+      kv.push(vis[i])
+      kf.push(fis[i])
+    }
+    i = i + 1
+  }
+  if kv.length == 0 || kv.length == vis.length { return false }
+  while vis.length > 0 { vis.pop() }
+  while fis.length > 0 { fis.pop() }
+  let j = 0
+  while j < kv.length {
+    vis.push(kv[j])
+    fis.push(kf[j])
+    j = j + 1
+  }
+  true
 }
 
 // The opcode narrowing the field read at `memIx` back to the `i32` or `f32` the checker typed it,
@@ -18075,10 +17944,6 @@ function objLitBindDestRowGo(objIx: i32, own: i32): i32 {
     if dst < 0 || rsSameRow(dst, own) || !rsRowNamesObjLit(dst, objIx) {
       return -1
     }
-    // A row a `??` merge moved is read at the merged row, which a checked type does not name.
-    if anonLeafSupersedeOf(dst) != dst || anonLeafSupersedeOf(own) != own {
-      return -1
-    }
     const wd: RsWalk = {
       rwScope: scopeIx,
       rwOwnLet: li,
@@ -18206,7 +18071,6 @@ function rsElemListDestSlotGo(letIx: i32, fnIx: i32, own: i32): i32 {
     const dty = rsElemDestTy(bad)
     const drow = structIdxOfElemTy(dty)
     if drow < 0 || rsSameRow(drow, w.rwRow) { return -1 }
-    if anonLeafSupersedeOf(drow) != drow { return -1 }
     const ai = unwrapParen(d.letInit)
     if ai < 0 || ai >= P.nodes.length { return -1 }
     const ini = nodeAt(ai)
@@ -21424,10 +21288,6 @@ function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32): string {
     if lk != "" { return lk }
     const pk = paramCloSigKey(fnIx, name)
     if pk != "" { return pk }
-    // The binding's twin of that answer (D1090), ahead of the annotation arms: a `??` merge
-    // can move the rows of the one function this binding ever holds.
-    const bk = anonLeafCloBindSigKey(name)
-    if bk != "" { return bk }
   }
   // One intern for the three resolutions below (design R3's shape (b)): `identFnTypeAnnName`,
   // `identClosureFe` and `identCopySource` each ask the same identifier against the same tables.
@@ -21626,8 +21486,6 @@ function loopVarCloSigKey(name: string, fnIx: i32) {
     return cloArrSlotSigKey(mvRlSlot[mvs])
   }
   if !exprRefArray(iter, fnIx) { return "" }
-  const ek = anonLeafArrElemSigKey(iter, fnIx)
-  if ek != "" { return ek }
   arrSlotSigKeyOf(iter, fnIx)
 }
 
@@ -21743,10 +21601,6 @@ function paramCloSigKey(fnIx: i32, name: string) {
       const p = nodeAt(params[i])
       if p is Param {
         if p.parName == name {
-          // The moved callee's own key wins over the annotation's (D940): a `??` merge can
-          // move the rows of the one function this slot ever receives.
-          const mvk = anonLeafCloSlotSigKey(params[i])
-          if mvk != "" { return mvk }
           if p.parType >= 0 {
             // A monomorphized closure-pinned param announces itself in the pin column, which
             // also carries the `$fnsig` key — read where it lives, not by prefix-testing the name.
