@@ -5077,7 +5077,8 @@ function emitListFitLoop(
   0
 }
 
-// Whether the scalar element on the stack is a member of `lexes`, leaving 0/1.
+// Whether the scalar element on the stack is a member of `lexes` (for `nonnull`, once per
+// entry, whether it is not null), leaving 0/1.
 function emitListFitElem(
   body: u8[],
   scalarKind: MfKind,
@@ -5091,7 +5092,10 @@ function emitListFitElem(
   let i = 0
   while i < lexes.length {
     fbLocalGet(eL)
-    if leafKind == "str" {
+    if leafKind == "nonnull" {
+      fbRefIsNull()
+      fbI32Eqz()
+    } else if leafKind == "str" {
       fbRefAsNonNull()
       if emitStrEqLit(body, mkStr(quoteLex(lexes[i]), -1), fnIx, ec) < 0 {
         return -1
@@ -5420,6 +5424,10 @@ function emitListIsAcrossReps(
           && atomArmSlots(a, chkDepth, slots)
         ) {
           k = LIST_ARM_ATOMS
+        } else if isNullTy(tyArrayElemIx(chk)) && !isNullTy(tyArrayElemIx(a)) {
+          k = LIST_ARM_NULLS
+        } else if listArmIsNullableStrs(a, chk) {
+          k = LIST_ARM_NONNULL
         } else {
           return 0
         }
@@ -5433,12 +5441,18 @@ function emitListIsAcrossReps(
         wraps.push(listArmWrapOfTy(a))
         slotsAt.push(slots)
       } else if fits[j] != k {
-        // Only `L` itself and an arm whose atoms may fit `L` share a tag, and the atom test
-        // answers for both.
-        if k == LIST_ARM_ATOMS && fits[j] == LIST_ARM_OWN {
+        // Only `L` itself and an arm whose elements may fit `L` share a tag, and the element
+        // test answers for both.
+        const elemK = k == LIST_ARM_ATOMS
+          || k == LIST_ARM_NULLS
+          || k == LIST_ARM_NONNULL
+        const elemJ = (fits[j] == LIST_ARM_ATOMS
+          || fits[j] == LIST_ARM_NULLS
+          || fits[j] == LIST_ARM_NONNULL)
+        if elemK && fits[j] == LIST_ARM_OWN {
           fits[j] = k
           slotsAt[j] = slots
-        } else if !(k == LIST_ARM_OWN && fits[j] == LIST_ARM_ATOMS) {
+        } else if !(k == LIST_ARM_OWN && elemJ) {
           return 0
         }
       }
@@ -5485,6 +5499,46 @@ function emitListIsAcrossReps(
         fbRefCast(wraps[i])
         fbStructGet(wraps[i], 1) // len
         fbI32Eqz()
+      } else if k == LIST_ARM_NULLS {
+        if emitUnionPayloadUnbox(body, 7) < 0 { return -1 }
+        const nulls = ["2"]
+        if (
+          emitListFitLoop(
+            body,
+            [],
+            0,
+            false,
+            "i32",
+            "i32",
+            "i32",
+            nulls,
+            fnIx,
+            ec,
+          )
+          < 0
+        ) {
+          return -1
+        }
+      } else if k == LIST_ARM_NONNULL {
+        if emitUnionPayloadUnbox(body, 9) < 0 { return -1 }
+        const one = [""]
+        if (
+          emitListFitLoop(
+            body,
+            [],
+            0,
+            false,
+            "str",
+            "str",
+            "nonnull",
+            one,
+            fnIx,
+            ec,
+          )
+          < 0
+        ) {
+          return -1
+        }
       } else {
         const str = k == LIST_ARM_STRS
         const slots = slotsAt[i]
@@ -5532,11 +5586,25 @@ function emitListIsAcrossReps(
 }
 
 // How `emitListIsAcrossReps` tests one tag: by the tag alone (`L`, or an arm every element of
-// which fits), a `string[]` arm's strings, an empty disjoint-rep arm, or an atom arm's atoms.
+// which fits), a `string[]` arm's strings, an empty disjoint-rep arm, an atom arm's atoms, a
+// `(boolean | null)[]` arm tested as `null[]` (every element the null sentinel 2), or a
+// `(string | null)[]` arm tested as `string[]` (no element null).
 const LIST_ARM_OWN = 1
 const LIST_ARM_STRS = 2
 const LIST_ARM_EMPTY = 3
 const LIST_ARM_ATOMS = 4
+const LIST_ARM_NULLS = 5
+const LIST_ARM_NONNULL = 6
+
+// Whether list arm `a` is `(string | null)[]` and `chk` is `string[]`, so the two share the
+// string list's tag and an `a` value fits `chk` exactly when no element is null.
+function listArmIsNullableStrs(a: i32, chk: i32): boolean {
+  const ae = tyArrayElemIx(a)
+  const ce = tyArrayElemIx(chk)
+  if ae < 0 || ce < 0 || tyPrimNameOf(ce) != "string" { return false }
+  const an = nonNullTy(ae)
+  an != ae && tyPrimNameOf(an) == "string"
+}
 
 // The innermost element type of list type `ty`, below every list layer.
 function listLeafTyOf(ty: i32): i32 {
