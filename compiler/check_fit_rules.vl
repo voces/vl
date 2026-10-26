@@ -408,6 +408,7 @@ import {
   cUserTypes,
   cVariantMemberTyIxSet,
   cVariantMemberTyIxs,
+  genAppRowOf,
   litBaseTy,
   litUnionAliasNameOfTy,
   mkArrayTy,
@@ -416,6 +417,7 @@ import {
   mkNullableTy,
   nwTyIxs,
   objFieldType,
+  structNameOfTy,
   tyAllMaps,
   tyAmong,
   tyArrayElemIx,
@@ -3964,20 +3966,38 @@ function mapUnboxRecordLit(
   0
 }
 
-// Whether a record, list or `null` literal `x` meets a destination that holds a record through
-// nullables and lists: a fresh literal has one storage type, its destination's (D3339). A
-// type parameter in it stays open, bound per instance.
+// Whether a record, list or `null` literal `x` of another type meets a destination `dstTy`
+// that holds a record through nullables and lists: a fresh literal has one storage type, its
+// destination's (D3339). A type parameter in it stays open, bound per instance. An anonymous
+// destination of the literal's own shape is already its storage, so it is not stamped.
 export function litAtRecordDst(x: i32, dstTy: i32): boolean {
-  if dstTy < 0 || tyHasInferHole(dstTy, 0) { return false }
-  if !repStampableLit(x, 8) { return false }
+  if dstTy < 0 || tyHasInferHole(dstTy, 0) || !repStampableLit(x, 8) {
+    return false
+  }
+  const own = nodeTyIxOf(parenPeelIx(x))
+  if own == dstTy { return false }
+  if structNameOfTy(dstTy) == "" && genAppRowOf(dstTy) < 0 && tyEq(own, dstTy) {
+    return false
+  }
   let t = dstTy
   let k = 0
   while k < 8 && t >= 0 {
     const d = tyAt(t)
-    if d is TyObj || d is TyVar { return true }
-    if d is TyNullable { t = d.nInner }
-    else if d is TyArray { t = d.aElem }
-    else { return false }
+    match d {
+      TyObj | TyVar => {
+        return true
+      }
+      TyNullable => {
+        t = d.nInner
+      }
+      TyArray => {
+        t = d.aElem
+      }
+      // no other type holds a record a literal is built at
+      TyPrim | TyErr | TyFunc | TyUnion | TyMap | TyLit | TyNeg => {
+        return false
+      }
+    }
     k = k + 1
   }
   false
@@ -4126,9 +4146,8 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
     // A value `if`, `match` or block delivers each arm's value to the same destination.
     IfStmt => {
       if e.ifElse < 0 { return 0 }
-      const a = recordRepTyAdopt(blockLastStmt(e.ifThen), dtix, depth - 1)
-      const b = if nodeAt(e.ifElse) is IfStmt { recordRepTyAdopt(e.ifElse, dtix, depth - 1) } else { recordRepTyAdopt(blockLastStmt(e.ifElse), dtix, depth - 1) }
-      return if a > 0 || b > 0 { 1 } else { 0 }
+      const a = recordRepTyAdopt(e.ifThen, dtix, depth)
+      return a | recordRepTyAdopt(e.ifElse, dtix, depth)
     }
     Block => {
       return recordRepTyAdopt(blockLastStmt(srcExpr), dtix, depth - 1)
@@ -4136,8 +4155,7 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
     MatchExpr => {
       let any = 0
       for b in e.matchBodies {
-        const v = if b >= 0 && nodeAt(b) is Block { blockLastStmt(b) } else { b }
-        if recordRepTyAdopt(v, dtix, depth - 1) > 0 { any = 1 }
+        any = any | recordRepTyAdopt(b, dtix, depth - 1)
       }
       return any
     }
