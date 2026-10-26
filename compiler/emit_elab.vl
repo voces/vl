@@ -77,6 +77,7 @@ import {
   monoLamCloneTmpl,
 } from "./emit_state"
 import { tyHasTyVar } from "./tyquery"
+import { i32ListHas } from "./listutil"
 import { nodeSrc } from "./symbols"
 
 // The instances: declaration, binding names and types, and the canonical key.
@@ -407,6 +408,23 @@ export function elabDemand(
   elabDemandFrom(decl0, names0, tys0, pTys, top, call)
 }
 
+// The declaration node `ix` holds as its singleton `Fn#d` at the instance being walked, or -1.
+export function elabReadFnId(ix: i32): i32 {
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  if top < -1 { return -1 }
+  const t = if top >= 0 { elabNodeTy(ix, top) } else { nodeTyIxOf(ix) }
+  if t < 0 { return -1 }
+  elabFnIdOf(t)
+}
+
+// The declaration whose instance template call `ix` reaches from the instance being walked, or -1.
+export function elabCallDecl(ix: i32): i32 {
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  if top < -1 { return -1 }
+  const k = elabCallInstFrom(ix, top)
+  if k < 0 { -1 } else { ekDecl[k] }
+}
+
 // `elabDemand` under instance `from` (the root when -1) for template call `call` (-1 for none).
 // A parameter the call's own instance binds to a function value its body reaches at two instances
 // keeps that `Fn#d` binding: no one closed type holds it, and a closed pin is only its rep.
@@ -424,6 +442,7 @@ function elabDemandFrom(
   const sig = if decl >= 0 { nodeTyIxOf(decl) } else { -1 }
   const byId: boolean[] = []
   const ck = if call >= 0 { elabCallInstFrom(call, from) } else { -1 }
+  if ck >= 0 && ekDecl[ck] == decl { return ck }
   if ck >= 0 && ekDecl[ck] == decl && sig >= 0 && sig < T.tys.length {
     const f = tyAt(sig)
     if f is TyFunc {
@@ -433,7 +452,7 @@ function elabDemandFrom(
         if bt >= 0 && tyHasTyVar(bt) { elabFnIdsIn(bt, ds, 0) }
         let id = false
         for d in ds {
-          if elabReachedOf(ck, d) < -1 { id = true }
+          if elabReachedOf(ck, d).length > 1 { id = true }
         }
         if id { bindGenWalk(pt, bt, names, tys) }
         byId.push(id)
@@ -946,10 +965,10 @@ function elabFnIdsIn(t: i32, ds: i32[], depth: i32) {
   0
 }
 
-// The one instance of `d` reached from instance `k`'s body, directly or through the instances it
-// reaches; -1 when none is, -2 when two are.
-function elabReachedOf(k: i32, d: i32): i32 {
-  let found = -1
+// The instances of `d` reached from instance `k`'s body, directly or through the instances it
+// reaches, each once, in the order they were reached.
+function elabReachedOf(k: i32, d: i32): i32[] {
+  const found: i32[] = []
   const seen: {[i32]: boolean} = Map()
   const work: i32[] = [k]
   while work.length > 0 {
@@ -957,10 +976,7 @@ function elabReachedOf(k: i32, d: i32): i32 {
     if a < 0 || a >= ekReach.length || (seen[a] ?? false) { continue }
     seen[a] = true
     for r in ekReach[a] {
-      if ekDecl[r] == d {
-        if found >= 0 && found != r { return 0 - 2 }
-        found = r
-      }
+      if ekDecl[r] == d && !i32ListHas(found, r) { found.push(r) }
       work.push(r)
     }
   }
@@ -977,8 +993,9 @@ export function elabOutTy(t: i32, k: i32): i32 {
   const names: string[] = []
   const tys: i32[] = []
   for d in ds {
-    const r = elabReachedOf(k, d)
-    if r < 0 { return -1 }
+    const rs = elabReachedOf(k, d)
+    if rs.length == 0 { return -1 }
+    const r = rs[0]
     let i = 0
     while i < ekNames[r].length {
       names.push(ekNames[r][i])

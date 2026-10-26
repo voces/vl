@@ -585,6 +585,8 @@ import {
   elabCallParamTy,
   elabDemand,
   elabKeyAt,
+  elabCallDecl,
+  elabReadFnId,
   elabRetOf,
   elabSlotNote,
   elabTpDefaultsReset,
@@ -7166,7 +7168,17 @@ function monoNameIsParamOnChain(name: string, fx: i32): boolean {
 // The template slot of the generic function the flow table says read `at` names through its
 // aliases (`fnFlowReadGenFn`); -1 for none.
 function monoReadGenFnFe(at: i32): i32 {
-  const d = fnFlowReadGenFn(at)
+  let d = fnFlowReadGenFn(at)
+  if d < 0 { d = elabReadFnId(at) }
+  monoGenFeOfDecl(d)
+}
+
+// The template slot of the generic whose instance call `ix` reaches in the elaboration; -1 for
+// none.
+function monoElabCallFe(ix: i32): i32 { monoGenFeOfDecl(elabCallDecl(monoCallTplOf(ix))) }
+
+// The template slot of generic declaration `d`, or -1.
+function monoGenFeOfDecl(d: i32): i32 {
   if d < 0 { return -1 }
   const fe = fnStmtsPosOf(d)
   if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 { return -1 }
@@ -10238,21 +10250,7 @@ function monoMakeInstanceHit(
             keepCallRef = true
           }
         }
-        if !keepCallRef {
-          if (
-            cal.identName != monoInstName[k]
-            && !i32ListHas(monoNoRename, calleeIx)
-          ) {
-            monoAliasCallNote(calleeIx)
-            collectANoteIdentRename(cal.identName)
-            cal.identName = monoInstName[k]
-            monoArenaTouch()
-            // R4 writer 5 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
-            let instDecl = fnStmts[monoInstFe[k]]
-            if identAuditDrop == IDENT_DROP_MONO_CALLEE { instDecl = -1 }
-            sidNoteNodeName(calleeIx, instDecl)
-          }
-        }
+        if !keepCallRef { monoRenameCallee(calleeIx, monoInstName[k], monoInstFe[k]) }
       }
       // A value use reaching an instance a direct call already built. The call path
       // spells an i32 pin as the hole it is, leaving the value floor to reject a
@@ -10743,17 +10741,25 @@ function monoMakeInstanceLater(
     const actx = fnStmts[callFrame]
     monoRenameGenAliasInit(calleeIx, actx, fn.fnName, instName)
   }
-  // R4 writer 6 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
-  if cal2 is Ident && !i32ListHas(monoNoRename, calleeIx) {
-    monoAliasCallNote(calleeIx)
-    collectANoteIdentRename(cal2.identName)
-    cal2.identName = instName
-    monoArenaTouch()
-    let instDecl = fnStmts[instFe]
-    if identAuditDrop == IDENT_DROP_MONO_CALLEE { instDecl = -1 }
-    sidNoteNodeName(calleeIx, instDecl)
-  }
+  monoRenameCallee(calleeIx, instName, instFe)
   instFe
+}
+
+// Points call callee `calleeIx`, when a name not in `monoNoRename`, at instance `instFe` by its
+// name `instName`. R4 writer 6 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
+function monoRenameCallee(calleeIx: i32, instName: string, instFe: i32) {
+  const cal = nodeAt(calleeIx)
+  if !(cal is Ident) || cal.identName == instName || i32ListHas(monoNoRename, calleeIx) {
+    return 0
+  }
+  monoAliasCallNote(calleeIx)
+  collectANoteIdentRename(cal.identName)
+  cal.identName = instName
+  monoArenaTouch()
+  let instDecl = fnStmts[instFe]
+  if identAuditDrop == IDENT_DROP_MONO_CALLEE { instDecl = -1 }
+  sidNoteNodeName(calleeIx, instDecl)
+  0
 }
 
 // The instance's return annotation node: its template's checked signature substituted through the
@@ -11069,6 +11075,8 @@ function monoMakeInstanceFirst(
   fnStmts[origFe] = nfn
   monoArenaTouch()
   monoLamCallByName(calleeIx, origFe, instName)
+  // A call through a value naming the generic calls the instance it builds.
+  if calleeIx >= 0 && !criFnIsAnonLambda(origFe) { monoRenameCallee(calleeIx, instName, origFe) }
   0
 }
 
@@ -20990,61 +20998,12 @@ function monoParamIsTyParamList(pIx: i32, typarams: string[]): boolean {
   false
 }
 
-// The one place a generic `argIx` handed to hole `pIx` of call `callIx` gets its signature: the
-// checker's binding, else the generic instanced at the one flow pin of its read past the call
-// (D5612), delivered concretely so the callee can forward it. "" when none closes; `tyOut[0]`
-// takes the pin's type. Two pins ask for a parameter per pin and set `monoHoleGenTwoPins` (D6280).
-let monoHoleGenTwoPins = false
-// Whether that read's flow slot holds two pins, whoever's calls took them.
-let monoHoleGenManyPins = false
-function monoHoleGenFnPin(
-  callIx: i32,
-  pIx: i32,
-  argIx: i32,
-  ctx: i32,
-  tyOut: i32[],
-): string {
-  monoHoleGenTwoPins = false
-  monoHoleGenManyPins = false
-  const bt = monoHoleGenFnTy(callIx, pIx, argIx, ctx)
-  const fl = monoHoleGenFnFlowDecl(argIx, ctx)
-  if bt >= 0 {
-    // The checker's binding stands; the open function values its pin call hands on still take
-    // that binding's parameter types (D6532).
-    const an = monoFnPinAt(argIx, ctx, bt, -1, tyOut)
-    if an != "" && fl[1] >= 0 { monoPinOpenCallLams(fl[1], bt) }
-    return an
-  }
-  let ft = monoHoleGenFnFlowTy(argIx, fl)
-  if ft < 0 { ft = monoChoiceArmFlowTy(argIx, ctx, 0) }
-  if ft < 0 {
-    ft = monoListSrcElemTy(argIx)
-    if ft >= 0 {
-      const ePath: string[] = ["e"]
-      monoRetypePinCalls(mfrListSrc[unwrapParen(argIx)] ?? -1, ePath)
-    }
-  }
-  // The plan decides whether the hole is called at two types; the flow pins may stop at a
-  // recursive forward before they reach both (D6091).
-  if ft < 0 && fl[1] >= 0 {
-    fsAsk(pIx)
-    const noPath: string[] = []
-    monoHoleGenManyPins = monoDeclPathPins(fl, noPath).length > 1
-    monoHoleGenTwoPins = monoHoleGenManyPins
-      && monoHoleOwnCallsDiffer(fl[1], pIx)
-  }
-  // A choice of generics no one pin closes asks the plan for a parameter per type, each handed
-  // the choice's arm by one evaluation of it (D13360).
+// A choice of generics `argIx` handed to hole `pIx` asks the plan for a parameter per type, each
+// handed the choice's arm by one evaluation of it (D13360).
+function monoHoleChoiceAsk(pIx: i32, argIx: i32, ctx: i32) {
   const ax = unwrapParen(argIx)
-  if (
-    ft < 0
-    && ax >= 0
-    && nodeAt(ax) is IfStmt
-    && monoValueNamesGenerics(ax, ctx, 0)
-  ) {
-    fsAsk(pIx)
-  }
-  monoFnPinAt(argIx, ctx, ft, fl[1], tyOut)
+  if ax >= 0 && nodeAt(ax) is IfStmt && monoValueNamesGenerics(ax, ctx, 0) { fsAsk(pIx) }
+  0
 }
 
 // For an `if` argument `argIx` read in frame `ctx`, every arm naming a generic, the closed type
@@ -22938,14 +22897,7 @@ function monoPinHoleParam(
       args[i],
     )
   }
-  if an == "" {
-    const pinTy: i32[] = [0 - 1]
-    an = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
-    anTy = pinTy[0]
-    if an == "" && monoHoleGenTwoPins {
-      return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
-    }
-  }
+  if an == "" { monoHoleChoiceAsk(params[i], args[i], ctx) }
   // The elaboration's answer for the parameter at the call's template, where it closes.
   if an == "" {
     const et = elabCallParamTy(monoCallTplOf(callIx), i)
@@ -23081,13 +23033,7 @@ function monoPinAnnotatedParam(
     let an2Ty = -1
     let genPin = false
     if ann == tp {
-      const pinTy: i32[] = [0 - 1]
-      an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
-      an2Ty = pinTy[0]
-      if an2 == "" && monoHoleGenTwoPins {
-        return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
-      }
-      genPin = an2 != ""
+      monoHoleChoiceAsk(params[i], args[i], ctx)
       // A list or record literal takes the elaboration's answer for the parameter, where it
       // closes; any other argument is pinned by what it holds.
       const ax = unwrapParen(args[i])
@@ -23102,13 +23048,9 @@ function monoPinAnnotatedParam(
       }
       // A type parameter only this parameter names binds where an un-annotated one would (D6910).
       if an2 == "" && monoBindOf(tvN, tvV, tp) == "" {
+        const pinTy: i32[] = [0 - 1]
         an2 = monoInertParamStubPin(decl, args[i], pinTy)
         an2Ty = pinTy[0]
-      }
-      if an2 == "" && monoHoleGenManyPins {
-        // The plan gives a parameter handed to closed function types one per type (D6741).
-        fsAsk(params[i])
-        monoHoleManyPinsFail(p.parName, fn.fnName)
       }
     }
     if an2 == "" { an2 = monoArgPinName(args[i], ctx) }
@@ -25202,6 +25144,7 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
     if afe < 0 { afe = monoCapturedLamFe(n.callFn, ctx) }
     // A chain of aliases ending at a generic function by name is a call to it (D3894).
     if afe < 0 { afe = monoReadGenFnFe(n.callFn) }
+    if afe < 0 { afe = monoElabCallFe(ix) }
     if afe < 0 {
       afe = monoAliasLamFe(n.callFn, ctx, false)
       // The call would be re-spelled to the lambda's own name, which a parameter or local
