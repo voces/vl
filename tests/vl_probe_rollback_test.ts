@@ -150,6 +150,27 @@ Deno.test({
   },
 });
 
+// A re-ask nested in `assignableExpr` during an instance's elaboration re-check is a quiet probe of
+// its own: it bumps `quietDepth`, so `stampsStand()` refuses it and no rep stamp leaks from it.
+// With the bump removed this program sends the compiler into unbounded recursion.
+const NESTED_REASK = "generics/generic-complement-list-union-positions.vl";
+
+Deno.test({
+  name: "probe rollback: a re-ask inside an instance's re-check stamps nothing",
+  ignore,
+  fn() {
+    const src = Deno.readTextFileSync(
+      new URL(`./cases/${NESTED_REASK}`, import.meta.url),
+    );
+    const moved = [...rows(src, 1, 0, true)].filter(([k]) =>
+      !k.endsWith("| ran")
+    );
+    if (moved.length > 0) {
+      throw new Error(`want no table moved, got: ${show(new Map(moved))}`);
+    }
+  },
+});
+
 // Every module-level keyed map a quiet probe can reach is classified in
 // `scripts/probe-map-classes.tsv`, so a new one fails here until someone says why a probe may
 // leave it standing (ARCHITECTURE §4.3). The reach is the import closure of the probe sites.
