@@ -71,6 +71,7 @@ import { EqCmpKind, eqCoreKindOfTyToken } from "./check_ty_relate"
 import {
   T,
   TyArray,
+  TyLit,
   TyMap,
   TyObj,
   TyUnion,
@@ -771,7 +772,6 @@ import {
   sFieldTgtStructIdx,
   sFieldTypeAt,
   uFieldElemTyIxAt,
-  valueAtomKindOfTy,
   variantFieldElemName,
   variantFieldIsLitUnion,
   variantFieldIsLitUnionArray,
@@ -1366,7 +1366,6 @@ import {
   printPlanPinNull,
   removeAtomFromSet,
   tyBoxTakesAtomAsStr,
-  unMemAtomKind,
   unMemIsMap,
   unMemIsRefElemArray,
   unionArmsOf,
@@ -1431,6 +1430,7 @@ import {
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
   atomEqOpcodeOfKind,
+  boxTagOfTy,
   declTyIxOfName,
   mapShapeKeyInt,
   mapShapeKeyKind,
@@ -3258,14 +3258,25 @@ function boxArmKindOfTy(k: i32, armTy: i32): i32 {
   k
 }
 
+// The box tag `isArmTagOfTy` tests `ity` by, or -1 for none: a list of numeric literals
+// (`K[]` where `type K = 0 | 1`) shares the `i32[]` tag, so its fit is an element test (D4778).
+function scalarArmKindOfTy(ity: i32): i32 {
+  const t = tyAt(ity)
+  if t is TyArray {
+    if numLitUnionBaseTy(t.aElem) >= 0 { return -1 }
+  }
+  boxTagOfTy(ity)
+}
+
 // The union-box tag the type `ity` claims as a value-union arm, or -1 when it claims none
 // (a struct variant, a literal, an un-interned shape). A bare function-type arm tags on
 // its interned signature slot rather than the flat kind-11 value-atom tag — kind 11 alone
 // would make `x is F` true for a value built through any function-typed arm.
 function isArmTagOfTy(ity: i32): i32 {
   if ity < 0 { return -1 }
-  let ak = unMemAtomKind(ity)
-
+  // A literal (`"err"`, `3`, `1 | 2`) is tested by its value, which no tag alone decides.
+  if tyAt(ity) is TyLit || numLitUnionBaseTy(ity) >= 0 { return -1 }
+  const ak = scalarArmKindOfTy(ity)
   if ak == 11 { return cloArmTagOfTy(ity) }
   if ak == 7 && vbAtomListUsed && tyIsAtomLeafList(ity) {
     return atomListArmTag()
@@ -3275,7 +3286,6 @@ function isArmTagOfTy(ity: i32): i32 {
     if vbBoolListTop < 0 { return -1 }
     return scalarTagOfKind(18)
   }
-  ak = boxArmKindOfTy(ak, ity)
   if ak >= 0 { return scalarTagOfKind(ak) }
 
   // A map type no box arm registered claims no tag (-1): a nullable single map is a niche whose
@@ -5657,7 +5667,7 @@ function atomArmSlots(a: i32, depth: i32, slots: i32[]): boolean {
 
 // The wrapper heap type list arm `a` rides a box's payload in, or -1.
 function listArmWrapOfTy(a: i32): i32 {
-  const lw = listWrapHeapOfKind(unMemAtomKind(a))
+  const lw = listWrapHeapOfKind(boxTagOfTy(a))
   if lw >= 0 { return lw }
   if !unMemIsRefElemArray(a) { return -1 }
   const sl = rlSlotOfTy(tyRefArrElemOf(a))
@@ -7135,7 +7145,10 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
     // `boolean | null` shares one unconditional i32 blocktype: the sentinel 2 (`null`) and
     // the live 0/1 result are the same valtype, so the two arms below need no cast to join.
     // `K | null` is the same shape over the literal union's atom, `-1` its null.
-    if ord.rdKind == "i32" && (ord.rdNul == 2 || ord.rdNul == 3) {
+    if (
+      (ord.rdKind == "nulbool" && ord.rdNul == 2)
+      || (ord.rdKind == "i32" && ord.rdNul == 3)
+    ) {
       if emitOptChainIsNull(body, exprIx, fnIx, ec) < 0 { return -1 }
       fbIf(127)
       if ord.rdNul == 2 { fbI32Const(2) } else { fbI32Const(0 - 1) }
@@ -20748,8 +20761,8 @@ function boxAtomRetagKind(p: string, to: string[], from: string[]): i32 {
 // as `toTy`: under `fromTy`'s tag, the box in `unionAsBoxSlot` is rebuilt under `toTy`'s with its
 // payload converted; the arm is left open on its `else`.
 function emitWidenRetagArm(fromTy: i32, toTy: i32) {
-  const fk = valueAtomKindOfTy(fromTy)
-  const tk = valueAtomKindOfTy(toTy)
+  const fk = boxTagOfTy(fromTy)
+  const tk = boxTagOfTy(toTy)
   const conv = widenConvOpOfKinds(fk, tk)
   const vb = vbHeapIdxOfKind(tk)
   if conv < 0 || vb < 0 {
@@ -22864,7 +22877,7 @@ function emitAsBoxToLitUnion(
   let texts = tyNumLitMemberTexts(tty)
   let k = 2
   if texts.length > 0 {
-    k = unMemAtomKind(numLitUnionBaseTy(tty))
+    k = boxTagOfTy(numLitUnionBaseTy(tty))
   } else {
     texts = tyLitMemberTexts(tty)
   }
@@ -22978,7 +22991,7 @@ function emitAsUnionCast(
   // A map arm's payload is its map struct ref, recovered by the heap cast its shape names.
   let mapHeap = -1
   if !subUnion {
-    ak = unMemAtomKind(tty)
+    ak = boxTagOfTy(tty)
     armVi = wantVis[0]
     if armVi < 0 && ak < 0 && unMemIsMap(tty) {
       mapHeap = mapTypeIdxOf(mapShapeFoldSet(mapArmShapeOfTy(tty)))
@@ -23140,7 +23153,7 @@ function emitAsNumLitScalar(
   if e.asMode == "null" { tty = tyPeelNul(tty) }
   const base = numLitUnionBaseTy(tty)
   const texts = tyNumLitMemberTexts(tty)
-  const k = unMemAtomKind(base)
+  const k = boxTagOfTy(base)
   if texts.length == 0 || (k != 0 && k != 3) {
     return emitFail(
       "emitProgram: `as "
@@ -40344,7 +40357,7 @@ function coalWidens(from: i32, to: i32): boolean {
 
 // The checker's atom kind for the `??` at `exprIx`, -1 when it is not a value atom or is null.
 function coalResultKindOf(exprIx: i32, fnIx: i32): i32 {
-  const k = valueAtomKindOfTy(coalResultTyOf(exprIx, fnIx))
+  const k = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
   if k == nullValKind() { return -1 }
   k
 }
@@ -40444,7 +40457,7 @@ function emitCoalesceBoxRuntime(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  const bk = valueAtomKindOfTy(nodeTyIxOf(exprIx))
+  const bk = boxTagOfTy(nodeTyIxOf(exprIx))
   const bVt = nulBoxScalarValtype(bk)
   const bVb = vbHeapIdxOfKind(bk)
   let bNm = ""
@@ -40505,7 +40518,7 @@ function emitOptCoalesceBoxLeaf(
   // result is then the leaf's `T | null` with the null removed.
   let rTy = nodeTyIxOf(exprIx)
   if rTy < 0 { rTy = tyPeelNul(nodeTyIxOf(lhsIx)) }
-  const bk = valueAtomKindOfTy(rTy)
+  const bk = boxTagOfTy(rTy)
   const bVt = nulBoxScalarValtype(bk)
   if bNm == "" && bVt < 0 {
     return emitFail(
@@ -40514,7 +40527,7 @@ function emitOptCoalesceBoxLeaf(
   }
   // The box holds the FIELD's scalar; a default that widens the result (`?? 2.5` over an
   // `i32 | null` field) converts it after the unbox.
-  const fk = valueAtomKindOfTy(tyPeelNul(nodeTyIxOf(lhsIx)))
+  const fk = boxTagOfTy(tyPeelNul(nodeTyIxOf(lhsIx)))
   const fVb = vbHeapIdxOfKind(fk)
   if bNm == "" && (fVb < 0 || !scalarKindWidens(fk, bk)) {
     return emitFail(
@@ -40707,7 +40720,7 @@ function coalNarrowedReRead(ix: i32, fnIx: i32): i32 {
   const l = nodeAt(ix)
   // A field or element read the test narrows to one atom reads at it, as the checker types it.
   if !tyIsLitUnion(nn) {
-    const nk = valueAtomKindOfTy(nn)
+    const nk = boxTagOfTy(nn)
     if l is Ident || nk < 0 || nk == 6 { return ix }
   }
   let cp = -1
@@ -41241,7 +41254,7 @@ function emitCoalesceValUnionIdent(
   // that. `cak` still drives the unbox, since the box holds the operand's own atom;
   // the widen below carries it up to the result (D1699).
   let cRk = cak
-  const cRkN = valueAtomKindOfTy(coalResultTyOf(exprIx, fnIx))
+  const cRkN = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
   if cRkN >= 0 && cRkN != nullValKind() { cRk = cRkN }
   if emitExpr(body, e.binLeft, fnIx, ec) < 0 {
     return -1 // the box
@@ -41285,8 +41298,8 @@ function emitCoalesceElemBox(
     // The box holds the element's own atom, unboxed at that kind and widened to the result's,
     // which a wider default makes wider (D3795). The result is read at the instance's pin,
     // since a generic body records its `??` at the hole (D3744).
-    const nbKind = valueAtomKindOfTy(coalResultTyOf(exprIx, fnIx))
-    const nbElem = valueAtomKindOfTy(nonNullTy(nodeTyIxOf(e.binLeft)))
+    const nbKind = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
+    const nbElem = boxTagOfTy(nonNullTy(nodeTyIxOf(e.binLeft)))
     const nbVt = nulBoxScalarValtype(nbKind)
     const nbVb = vbHeapIdxOfKind(nbElem)
     if (
@@ -41401,7 +41414,7 @@ function emitCoalesceCallStash(
           const kResN = coalResultBoxName(exprIx, fnIx)
           const kResTy = coalResultTyOf(exprIx, fnIx)
           let kRk = kak
-          const kRkN = valueAtomKindOfTy(kResTy)
+          const kRkN = boxTagOfTy(kResTy)
           if kRkN >= 0 && kRkN != nullValKind() { kRk = kRkN }
           // A union result keeps the box — the default is coerced into the RESULT union, and
           // the stash already holds the operand's, whose tags are program-global.
@@ -41632,7 +41645,7 @@ function emitCoalesceUnionField(
           // The result kind is the checker's, as at the ident and call arms: a wider default
           // widens the whole `??` (D1699, D10060).
           let mRk = mak
-          const mRkN = valueAtomKindOfTy(coalResultTyOf(exprIx, fnIx))
+          const mRkN = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
           if mRkN >= 0 && mRkN != nullValKind() { mRk = mRkN }
           if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx, ec) < 0 {
             return -1
