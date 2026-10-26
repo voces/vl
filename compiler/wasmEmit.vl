@@ -27,7 +27,7 @@ import {
 } from "./check_node_tys"
 import { fsAsk, fsAskCallee } from "./fn_split"
 import { keyHasPrefix } from "./check_places"
-import { litRepTyAt } from "./emit_elab"
+import { elabKeyAt, litRepTyAt } from "./emit_elab"
 import { canonUnionMembersInto } from "./check_program"
 import { numCastCanFail, numUnionMembersOf } from "./check_num_lits"
 import { intMatchHeadAt, matchScrutAt } from "./check_match_heads"
@@ -1199,6 +1199,7 @@ import {
   unionArmVariantWithHeap,
 } from "./emit_obj_lit_fits"
 import {
+  ListBuild,
   emptyArrHoleBuildKind,
   emptyArrHoleBuildSlot,
   emptyArrUnionArmBuildKind,
@@ -1207,6 +1208,7 @@ import {
   fieldCodeScalarListBuildKind,
   letAnnRefListKind,
   listBuildKindOfVKind,
+  listBuildOfTy,
   refElemListBuildKind,
   rlWidenAllowed,
   rlWidenVariantOf,
@@ -1393,6 +1395,7 @@ import {
   holeBindsFunc,
   identNameIsLiveBound,
   letListBuild,
+  letListDestLit,
   listFitShadowRow,
   litAtomWidenTexts,
   mapExactHeldTyOf,
@@ -8694,6 +8697,17 @@ function emitUnionCoerceList(
   if unionName != "" && exprRefArray(exprIx, fnIx) {
     return emitUnionCoerceRefArray(body, unionName, uTy, exprIx, fnIx, ec)
   }
+  // A list literal the checker typed as a ref-list arm builds there (`emitArr`), so it boxes
+  // under that arm's tag even where its elements alone read as scalars (`[null]`).
+  const atSlot = arrLitRefSlotAtTy(bareIx, fnIx, ec)
+  if unionName != "" && unionHasRefArrayArmSlot(unionName, atSlot) {
+    const atTag = refArrBoxTagOf(exprIx, fnIx, atSlot, unionName, uTy)
+    if atTag < 0 { return emitFail("emitProgram: boolean list arm has no tag") }
+    fbI32Rel(RS_TAG, atTag)
+    if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
+    fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
+    return 0
+  }
   // An array literal whose element is a map (`[m]`) flowing into a union with an array-of-map
   // arm: the arm's reflist element is the map type, but a map-valued literal element is
   // invisible to `exprRefArray` and `arrLitElemName`, which resolve an inline-struct element and
@@ -12380,11 +12394,77 @@ function arrLitHoldsNulStr(elems: i32[], fnIx: i32): boolean {
 
 // Lower an array literal `[e, e, ...]` onto `body` as a growable list value: the elements in
 // source order, `array.new_fixed` for the backing, then `count` twice for len and cap and
-// `struct.new` for the wrapper; an empty `[]` shares its type's empty backing. The caller's
-// context is restored on every exit.
+// `struct.new` for the wrapper; an empty `[]` shares its type's empty backing. Built at the
+// checker's type for it unless `arrKeepsThread` keeps the caller's pair; context restored on exit.
+let arrSpreadDepth = 0
 function emitArr(body: u8[], arrIx: i32, fnIx: i32, ec: ExpCtx) {
   const saved = expCtxHere(ec)
-  expCtxLeave(saved, emitArrUnder(body, arrIx, fnIx, ec, ec), ec)
+  const ty = litRepTyAt(arrIx, fnIx)
+  const tb = listBuildOfTy(ty)
+  const fam = arrKeepsThread(arrIx, fnIx, ty, tb, ec)
+  if fam == 0 && tb != null { expCtxSetListBuild(tb.lbKind, tb.lbSlot, ec) }
+  const a = nodeAt(arrIx)
+  const spread = a is ArrayLit && hasSpreadItem(a.arrElems)
+  if spread { arrSpreadDepth = arrSpreadDepth + 1 }
+  const r = emitArrUnder(body, arrIx, fnIx, ec, ec)
+  if spread { arrSpreadDepth = arrSpreadDepth - 1 }
+  expCtxLeave(saved, r, ec)
+}
+
+// Which family keeps the caller's pair over literal `arrIx`'s type `tb`, 0 for none: 1 a binding
+// paired from a later destination, 2 a spread or untyped literal, 3 a generic or hole instance
+// (the type is the body's), 4 an unthreaded record-union list (rows the type does not name).
+function arrKeepsThread(
+  arrIx: i32,
+  fnIx: i32,
+  ty: i32,
+  tb: ListBuild | null,
+  ec: ExpCtx,
+): i32 {
+  if (letListDestLit[arrIx] ?? 0) == 1 { return 1 }
+  const a = nodeAt(arrIx)
+  if tb == null || arrSpreadDepth > 0 { return 2 }
+  if a is ArrayLit {
+    if hasSpreadItem(a.arrElems) { return 2 }
+  }
+  if (
+    elabKeyAt(fnIx) != 0 - 1
+    && (tb.lbKind != ec.listKind || tb.lbSlot != ec.listSlot)
+  ) {
+    return 3
+  }
+  if (
+    tb.lbKind == LBK_UNION
+    && ec.listKind == LBK_I32_LIST
+    && recordUnionList(ty)
+  ) {
+    return 4
+  }
+  0
+}
+
+// The ref-list row list literal `arrIx` builds at its checker type under `ec`, -1 where it
+// is no literal, its type names no ref-list row, or a family keeps the caller's pair.
+function arrLitRefSlotAtTy(arrIx: i32, fnIx: i32, ec: ExpCtx): i32 {
+  if !(nodeAt(arrIx) is ArrayLit) { return -1 }
+  const ty = litRepTyAt(arrIx, fnIx)
+  const tb = listBuildOfTy(ty)
+  if tb == null || arrKeepsThread(arrIx, fnIx, ty, tb, ec) != 0 { return -1 }
+  if tb.lbKind != LBK_REF && tb.lbKind != LBK_UNION { return -1 }
+  tb.lbSlot
+}
+
+// Whether `t` is a list whose element is a union of records only.
+function recordUnionList(t: i32): boolean {
+  if t < 0 { return false }
+  const l = tyAt(t)
+  if !(l is TyArray) || l.aElem < 0 { return false }
+  const u = tyAt(l.aElem)
+  if !(u is TyUnion) { return false }
+  for m in u.uMembers {
+    if m < 0 || !(tyAt(m) is TyObj) { return false }
+  }
+  true
 }
 
 // The packed `u8[]` arm of `emitArrUnder`: each element as a plain i32 truncated into the
@@ -35271,6 +35351,7 @@ export function expCtxApply(c: ExpCtx, ec: ExpCtx) {
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
   arrNewFillDepth = 0
+  arrSpreadDepth = 0
   eqStashL = -1
   eqStashR = -1
   gForIterLit = -1
