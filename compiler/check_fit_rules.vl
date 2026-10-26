@@ -3964,6 +3964,55 @@ function mapUnboxRecordLit(
   0
 }
 
+// Whether a record, list or `null` literal `x` meets a destination that holds a record through
+// nullables and lists: a fresh literal has one storage type, its destination's (D3339). A
+// type parameter in it stays open, bound per instance.
+export function litAtRecordDst(x: i32, dstTy: i32): boolean {
+  if dstTy < 0 || tyHasInferHole(dstTy, 0) { return false }
+  if !repStampableLit(x, 8) { return false }
+  let t = dstTy
+  let k = 0
+  while k < 8 && t >= 0 {
+    const d = tyAt(t)
+    if d is TyObj || d is TyVar { return true }
+    if d is TyNullable { t = d.nInner }
+    else if d is TyArray { t = d.aElem }
+    else { return false }
+    k = k + 1
+  }
+  false
+}
+
+// Whether `x`, past parentheses, is a record, list or `null` literal, or a value `if`, `match` or
+// block one of whose arms is: the sources a rep stamp can adopt.
+export function repStampableLit(x: i32, depth: i32): boolean {
+  if x < 0 || depth <= 0 { return false }
+  const pk = nodeAt(parenPeelIx(x))
+  match pk {
+    ObjLit | ArrayLit | NullLit => {
+      return true
+    }
+    IfStmt => {
+      if pk.ifElse < 0 { return false }
+      return repStampableLit(blockLastStmt(pk.ifThen), depth - 1)
+        || repStampableLit(pk.ifElse, depth - 1)
+    }
+    Block => {
+      return repStampableLit(blockLastStmt(parenPeelIx(x)), depth - 1)
+    }
+    MatchExpr => {
+      for b in pk.matchBodies {
+        if repStampableLit(b, depth - 1) { return true }
+      }
+      return false
+    }
+    // no other expression is built at the type it is delivered to
+    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {
+      return false
+    }
+  }
+}
+
 // Stamps the context (destination) type `dstTy` onto a literal source `srcExpr` (recursively,
 // into `ObjLit` fields / `ArrayLit` elements) into the `nodeRepTyIx` sidecar, at arena-pure
 // adoption sites — reads only `T.tys`/`P.nodes`, writes only `nodeRepTyIx`. Nullable wrappers
@@ -4033,7 +4082,13 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
         TyArray => {
           let i = 0
           while i < e.arrElems.length {
-            recordRepTyAdopt(e.arrElems[i], d.aElem, depth - 1)
+            // A spread element's source list is delivered to the whole list's type.
+            const el = nodeAt(e.arrElems[i])
+            if el is Spread {
+              recordRepTyAdopt(el.spdArg, dtix, depth - 1)
+            } else {
+              recordRepTyAdopt(e.arrElems[i], d.aElem, depth - 1)
+            }
             i = i + 1
           }
           while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
