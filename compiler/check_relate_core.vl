@@ -5,7 +5,13 @@
 // checker (an operator's pending return, a `??` default) it calls `checkerForceFn`, which
 // `checkProgramPass` installs.
 
-import { elabCapOn, elabFnJoinTy, elabHolePinNote } from "./check_elab_cap"
+import {
+  elabCapOn,
+  elabFnJoinTy,
+  elabFnLetMembers,
+  elabFnSetOf,
+  elabHolePinNote,
+} from "./check_elab_cap"
 import {
   ArrayLit,
   BinExpr,
@@ -2128,9 +2134,9 @@ function joinObjFieldwise(a: i32, b: i32): i32 {
 }
 
 // The return-inference join, for `noteInferredRet` alone — not the general `joinTys`. A hole must
-// not collapse here: it is permissively assignable both ways, so the mutual-assignability collapse
-// picks one side and drops the other. Keeping both as a deferred join hands the choice to the call
-// site; such a join has no runtime shape, so every path to the emitter must collapse it again.
+// not collapse here (it is assignable both ways, so the collapse would drop a side): both stay as
+// a deferred join for the call site, which every path to the emitter collapses again. Function
+// values of two different sets join at a fresh index (`elabFnJoinTy`).
 export function joinRetTys(a: i32, b: i32) {
   if a < 0 { return b }
   if b < 0 { return a }
@@ -2141,7 +2147,7 @@ export function joinRetTys(a: i32, b: i32) {
     njApartSet(njApartRet)
     const j = joinTys(a, b)
     tpApartConcreteSet(saved)
-    return j
+    return elabFnJoinTy(j, a, b)
   }
   const kept: i32[] = []
   flattenVariantsInto(a, kept)
@@ -4658,7 +4664,11 @@ export function holeChoiceWaits(a: i32, pts: i32[]) {
   const seen: i32[] = []
   holeLetReadsOf(a, seen, reads)
   for r in reads {
-    if holeChoiceArms(r).length > 0 || holeFnArgDecls(r).length > 1 {
+    if (
+      holeChoiceArms(r).length > 0
+      || holeFnArgDecls(r).length > 1
+      || holeSetMembers(r).length > 1
+    ) {
       const ct = mkFuncTy(wp, TY_I32)
       noteArgCstr(ct, ct, "", ACF_CHOICE, a)
       return 0
@@ -4704,6 +4714,8 @@ export function holeLetWritesDisagreeAt(
       if holeSlotJudge(r, wp, fixed) { return true }
     } else if holeChoiceArms(r).length > 0 {
       if holeChoiceJudge(r, wp) { return true }
+    } else if holeSetMembers(r).length > 1 {
+      if holeSetJudge(r, wp) { return true }
     } else if holeLetJudge(r, wp) {
       return true
     }
@@ -4712,15 +4724,22 @@ export function holeLetWritesDisagreeAt(
 }
 
 // Whether the value `a` may be read from a list element, a record field, a `for` loop's
-// element or an `if` / `match` choosing between functions, so a call through it runs what that
-// place holds (D9090, D13740).
+// element, an `if` / `match` choosing between functions, a call returning one of several or a
+// re-pointed `let`, so a call through it runs what that place holds (D9090, D13966).
 export function holeFnReadsSlot(a: i32): boolean {
   if holeFnArgDecl(a) >= 0 { return false }
   const reads: i32[] = []
   const seen: i32[] = []
   holeLetReadsOf(a, seen, reads)
   for r in reads {
-    if holeIsSlotRead(r) || holeChoiceArms(r).length > 0 { return true }
+    if (
+      holeIsSlotRead(r)
+      || holeChoiceArms(r).length > 0
+      || holeSetMembers(r).length > 1
+      || holeFnArgDecls(r).length > 1
+    ) {
+      return true
+    }
   }
   false
 }
@@ -4807,6 +4826,65 @@ function holeChoiceJudge(ix: i32, wp: i32[]): boolean {
   false
 }
 
+// The un-annotated functions the call at `ix` may return, from its result type's member set,
+// when there are two or more and each is one `holeChoiceJudge` can judge; [] else.
+function holeSetMembers(ix: i32): i32[] {
+  const none: i32[] = []
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Call) { return none }
+  const ds = elabFnSetOf(nodeTyIxOf(ix))
+  if ds.length < 2 { return none }
+  for d in ds {
+    if d < 0 || d >= P.nodes.length || !directHoleDecl(d) { return none }
+    const f = nodeAt(d)
+    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return none }
+  }
+  ds
+}
+
+// `holeChoiceJudge` for the call at `ix` whose result joins functions: each member is called at
+// `wp`, and one giving another result than the first is refused at the return naming it.
+function holeSetJudge(ix: i32, wp: i32[]): boolean {
+  const ds = holeSetMembers(ix)
+  if ds.length < 2 { return false }
+  const ft = mkFuncTy(wp, TY_I32)
+  const noN: string[] = []
+  const noT: i32[] = []
+  const rs: i32[] = []
+  for d in ds {
+    const r = holeLamRetAt(d, ft, noN, noT)
+    if r < 0 || tyHasTyVar(r) { return false }
+    rs.push(widenLitTy(r))
+  }
+  let k = 1
+  while k < ds.length {
+    if !tySame(rs[k], rs[0]) {
+      tErr(
+        holeChoiceDisagreeMsg(wp, ds[k], rs[k], ds[0], rs[0]),
+        holeSetSite(ix, ds[k]),
+      )
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+// The return value of the function the call at `ix` runs that names function `d`, else `ix`.
+function holeSetSite(ix: i32, d: i32): i32 {
+  const n = nodeAt(ix)
+  if !(n is Call) { return ix }
+  const c = cwCalleeDeclOf(n.callFn)
+  if c < 0 || c >= P.nodes.length { return ix }
+  const f = nodeAt(c)
+  if !(f is FuncDecl) || f.fnBody < 0 { return ix }
+  const rv: i32[] = []
+  collectRetValues(f.fnBody, rv)
+  for v in rv {
+    if cwHeldFnOf(v) == d { return v }
+  }
+  ix
+}
+
 // The `holeChoiceJudge` refusal: function `d` an arm chooses returns `r` at `wp`, where `d0`,
 // the first arm's, returns `r0`.
 function holeChoiceDisagreeMsg(
@@ -4875,6 +4953,11 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
     return 0
   }
   if n is Call {
+    // A call whose result is a join of functions is judged member against member.
+    if holeSetMembers(ix).length > 1 {
+      out.push(ix)
+      return 0
+    }
     const d = cwCalleeDeclOf(n.callFn)
     if d < 0 || d >= P.nodes.length { return 0 }
     const f = nodeAt(d)
@@ -4937,14 +5020,21 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
 
 // `holeLetWritesDisagree` for the `let` read at `ix`, at the widened parameter types `wp`.
 function holeLetJudge(ix: i32, wp: i32[]): boolean {
-  const ds = holeFnArgDecls(ix)
-  if ds.length < 2 { return false }
   const n = nodeAt(ix)
   let nm = ""
   if n is Ident { nm = n.identName }
   const fr = covarRootFrame(ix)
   const bd = cwSoleBinderOf(nm, fr)
   if bd < 0 || !(nodeAt(bd) is LetDecl) { return false }
+  // Every function the binding may hold, from its initialiser and each write (`elabFnLetMembers`).
+  const ds = elabFnLetMembers(bd, nm)
+  if ds.length < 2 { return false }
+  for d in ds {
+    const f = nodeAt(d)
+    if !directHoleDecl(d) || !(f is FuncDecl) || f.fnTyParams.length > 0 {
+      return false
+    }
+  }
   const ft = mkFuncTy(wp, TY_I32)
   const noN: string[] = []
   const noT: i32[] = []
