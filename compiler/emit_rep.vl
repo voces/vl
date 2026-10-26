@@ -113,6 +113,9 @@ import {
   cUserTypes,
   cUserTypesVer,
   litBaseTy,
+  litUnionAliasNameOfTy,
+  litUnionAliasOfLitTexts,
+  litUnionInlineNameOfTy,
   numLitUnionBaseTy,
   oneListUnionRender,
   primNameStr,
@@ -121,9 +124,20 @@ import {
   tyIsNullableLitUnion,
   tyIxIsVariantMember,
   tyMutEpoch,
+  tyToEmitName,
 } from "./check_types"
 import { sidOf } from "./symbols"
-import { tyHasTyVar, tyMapValOf, tyStepElem } from "./tyquery"
+import {
+  isNullTy,
+  primNameOf,
+  tyEmitElemNulPrimOf,
+  tyEmitElemPrimOf,
+  tyEmitNamesOf,
+  tyEmitPrimOf,
+  tyHasTyVar,
+  tyMapValOf,
+  tyStepElem,
+} from "./tyquery"
 import {
   memoGenAdvance,
   memoKeyClear,
@@ -139,6 +153,7 @@ import {
   mapKeyKindOfTy,
   tyIsValueUnionBox,
   valueAtomKind,
+  valueRowKind,
 } from "./check_ty_rep"
 
 // One struct per classified type. `rdCovered` is 1 when the rep derives structurally, 0 when
@@ -293,9 +308,12 @@ export function repSigTokOfKind(kind: VKind | null): string {
       // The `null` type itself: a nullref, slot-free.
       return "Z"
     }
-    "nulbool" | null => {
-      // No token: `boolean | null` crosses as its i32 valtype (`i`), and `null` is the
-      // caller having no kind at all.
+    "nulbool" => {
+      // `boolean | null` crosses as its i32 valtype.
+      return "i"
+    }
+    null => {
+      // The caller has no kind at all.
       return ""
     }
   }
@@ -2778,6 +2796,229 @@ export function repOfTy(ty: i32): RepDesc {
   td
 }
 
+// The box tag of a value of type `ty` inside a union box: 0 i32, 1 boolean, 2 string, 3 i64,
+// 4 f64, 5 f32, 6 null, 7 i32 list, 8 f64 list, 9 string list, 10 i64 list, 11 closure, 12 f32
+// list, 13 byte list, 14 v128, 17 boolean list, 18 `null[]`; -1 when no single atom. It differs
+// from `repOfTy` for a literal union, which is an i32 value but a string ref inside a box.
+export function boxTagOfTy(ty: i32): i32 {
+  const k = btOfTy(ty)
+  if k != -2 { return k }
+  valueAtomKind(tyToEmitName(ty))
+}
+
+// `boxTagOfTy`'s decision, or -2 where only the render decides: a union whose members share
+// a list or closure tag that several spellings carry (D4320).
+function btOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  for s in btSeen {
+    // A revisited ancestor is a recursive alias, never one atom.
+    if s == ty { return -1 }
+  }
+  btSeen.push(ty)
+  const r = btGo(ty)
+  btSeen.pop()
+  r
+}
+
+// The ancestor stack of `btOfTy`.
+const btSeen: i32[] = []
+
+function btGo(ty: i32): i32 {
+  const t = tyAt(ty)
+  // Exhaustive over `Ty` and `_`-less: every arena shape says which tag it boxes under.
+  match t {
+    TyPrim => {
+      return btOfPrim(t.primName)
+    }
+    TyFunc => {
+      return 11
+    }
+    TyLit => {
+      // A string literal rides the box as its string; a numeric or boolean one as its base.
+      return btOfTy(litBaseTy(t))
+    }
+    TyArray => {
+      return btOfList(ty, t.aElem)
+    }
+    TyUnion => {
+      // A numeric literal union boxes as its base scalar, a string one as its member string.
+      const nb = numLitUnionBaseTy(ty)
+      if nb >= 0 { return btOfTy(nb) }
+      if tyIsLitUnion(ty) { return 2 }
+      const p = tyEmitPrimOf(ty)
+      if p != null { return btOfPrim(p) }
+      return btOfUnion(t.uMembers)
+    }
+    TyObj | TyMap | TyNullable | TyVar | TyNeg | TyErr => {
+      // A shape, a map and a `T | null` are never one atom; the rest have no value.
+      return -1
+    }
+  }
+}
+
+// The tag of a primitive, -1 for one with no value or no box arm of its own.
+function btOfPrim(p: PrimName | null): i32 {
+  if p == null { return -1 }
+  match p {
+    "i32" => {
+      return 0
+    }
+    "boolean" => {
+      return 1
+    }
+    "string" => {
+      return 2
+    }
+    "i64" => {
+      return 3
+    }
+    "f64" => {
+      return 4
+    }
+    "f32" => {
+      return 5
+    }
+    "null" => {
+      return 6
+    }
+    "v128" => {
+      return 14
+    }
+    "void" | "never" | "u8" => {
+      return -1
+    }
+  }
+}
+
+// The tag of the list `p[]`, -1 for an element with no list arm of its own.
+function btOfPrimList(p: PrimName | null): i32 {
+  if p == null { return -1 }
+  match p {
+    "i32" => {
+      return 7
+    }
+    "boolean" => {
+      return 17
+    }
+    "f64" => {
+      return 8
+    }
+    "string" => {
+      return 9
+    }
+    "i64" => {
+      return 10
+    }
+    "f32" => {
+      return 12
+    }
+    "u8" => {
+      return 13
+    }
+    "null" => {
+      return 18
+    }
+    "void" | "never" | "v128" => {
+      return -1
+    }
+  }
+}
+
+// The tag of list `arr` with element `e`: its element backing's list, so a literal-union or
+// nullable-boolean element rides the i32 list and a nullable string the string list.
+function btOfList(arr: i32, e: i32): i32 {
+  if e >= 0 {
+    if tyIsI32LeafElem(e) {
+      if primNameOf(e) == "boolean" { return 17 }
+      if primNameOf(e) == "null" { return 18 }
+      const et = tyAt(e)
+      if et is TyNullable && primNameOf(et.nInner) == "boolean" { return 18 }
+      return 7
+    }
+    const ep = primNameOf(e)
+    if ep == "f64" || ep == "i64" || ep == "f32" || ep == "u8" || ep == "null" {
+      return btOfPrimList(ep)
+    }
+    if tyIsStrLeafElem(e) { return 9 }
+  }
+  const k = valueRowKind(arr)
+  if k != -2 { return k }
+  const p = tyEmitElemPrimOf(arr)
+  if p != null { return btOfPrimList(p) }
+  if tyEmitElemNulPrimOf(arr, "boolean") != 0 { return 18 }
+  if tyEmitElemNulPrimOf(arr, "string") != 0 { return 9 }
+  const el = tyStepElem(arr)
+  if el < 0 { return -1 }
+  // A quoted literal run with a null, or its alias with one, is the atom list.
+  if litUnionInlineNameOfTy(el) != "" { return 7 }
+  const lt = tyAt(el)
+  // Exhaustive over `Ty` and `_`-less: every element shape says whether it is an atom list.
+  match lt {
+    TyNullable => {
+      const inr = lt.nInner
+      if inr < 0 { return -1 }
+      if litUnionAliasNameOfTy(inr) != "" || litUnionInlineNameOfTy(inr) != "" {
+        return 7
+      }
+      const it = tyAt(inr)
+      if it is TyUnion || it is TyNullable { return -2 }
+      // Any other inner beside the null is not one of the three nullable-element lists.
+      return -1
+    }
+    TyUnion => {
+      return -2
+    }
+    TyPrim | TyLit | TyObj | TyArray | TyMap | TyFunc | TyVar | TyNeg | TyErr => {
+      // A shape, list, map or function element, or an element with no value.
+      return -1
+    }
+  }
+}
+
+// The tag of a union no primitive spells: its members' one shared tag, else -1.
+function btOfUnion(ms: i32[]): i32 {
+  if ms.length == 0 { return -1 }
+  // Two string literals beside a non-null member spell their registered alias, an extra part.
+  const texts: string[] = []
+  let nonLit = false
+  for m in ms {
+    const mt = tyAt(m)
+    if mt is TyLit {
+      if mt.litKind == "str" { texts.push(mt.litText) }
+    } else if !isNullTy(m) {
+      nonLit = true
+    }
+  }
+  if nonLit && texts.length >= 2 && litUnionAliasOfLitTexts(texts) != "" {
+    return -1
+  }
+  let kind = -3
+  for m in ms {
+    let mk = -1
+    const mt = tyAt(m)
+    if litUnionAliasNameOfTy(m) != "" {
+      mk = -1
+    } else if mt is TyFunc {
+      // A function member is grouped, so its spelling never ends in `[]`.
+      if tyEmitNamesOf(m) { mk = 11 }
+    } else if mt is TyUnion {
+      return -2
+    } else {
+      mk = btOfTy(m)
+      if mk == -2 { return -2 }
+    }
+    if mk == -1 { return -1 }
+    if kind == -3 { kind = mk }
+    else if kind != mk { return -1 }
+  }
+  // One spelling per tag, except the atom list, the string list, the nullable boolean list
+  // and the closure, each of which several spellings share (D4320).
+  if ms.length > 1 && (kind == 7 || kind == 9 || kind == 11 || kind == 18) {
+    return -2
+  }
+  kind
+}
+
 // The value kind arena type `ty` crosses a `$fnsig` as: `repOfTy`'s where it covers `ty`, else
 // the rep tree's, and `nulnone` for the `null` type, which holds no tree leaf of its own.
 // null when the rep layer has no rep for `ty`.
@@ -2833,7 +3074,8 @@ function repOfTyFlat(ty: i32): RepDesc {
       if t.uMembers.length == 1 {
         const m = tyAt(t.uMembers[0])
         if m is TyObj { return repMk("struct", 0, "") }
-        return repUncovered()
+        // Any other one-member union (a recursive alias's `rest | null`) is its member.
+        return repOfTyFlat(t.uMembers[0])
       }
       // Lists that all spell one list are that list: the first member a rep covers decides.
       if oneListUnionRender(ty) != "" {
@@ -2856,15 +3098,15 @@ function repOfTyFlat(ty: i32): RepDesc {
       return repOfArray(t.aElem)
     }
     TyMap => {
-      return repOfMap(t.mKey, t.mVal, t.mSet)
+      return repOfMap(t.mVal, t.mSet)
     }
     TyVar => {
       // A generic type PARAMETER — the monomorphizer instantiates it, and the
       // INSTANCE is what this query is asked about.
     }
     TyLit => {
-      // A bare literal type — canon widens it to its base scalar (or folds it
-      // into its enclosing litunion), so no rep is decided here.
+      // A bare literal type is stored as its base scalar: `"x"` is a string ref, `3` an i32.
+      return repOfTyFlat(litBaseTy(t))
     }
     TyErr => {
       // The error/unknown hole — a rejected program never reaches emit.
@@ -2931,7 +3173,10 @@ function repOfNullable(inner: i32): RepDesc {
       return repOfNullableArray(it.aElem)
     }
     TyMap => {
-      // The niche-exempt `{[string]: T} | null` — legacy owns it.
+      // `M | null` — the `(ref null $mapStruct)` niche.
+      if repOfMap(it.mVal, it.mSet).rdCovered == 1 {
+        return repMk("nulmap", 1, "")
+      }
     }
     TyNullable => {
       // A doubled nullable — canon flattens it before emit.
@@ -2967,8 +3212,8 @@ function repNulObjKind(objTy: i32): VKind {
 function repOfNullablePrim(pn: PrimName): RepDesc {
   // `string | null` — the nullable raw-array ref niche.
   if pn == "string" { return repMk("nulstr", 1, "") }
-  // `boolean | null` — the i32 sentinel-2 niche; the VALTYPE is plain i32.
-  if pn == "boolean" { return repMk("i32", 2, "") }
+  // `boolean | null` — the i32 sentinel-2 niche, whose valtype is plain i32.
+  if pn == "boolean" { return repMk("nulbool", 2, "") }
   // A nullable SCALAR has no spare value to niche into — it boxes as a value union
   // whose `null` is a member atom.
   if pn == "i32" || pn == "i64" || pn == "f64" || pn == "f32" || pn == "v128" {
@@ -3268,71 +3513,11 @@ function repOfNulElemArray(elem: i32, inner: i32): RepDesc {
   repUncovered()
 }
 
-// A string-keyed map (or Set): the mono `$mapStruct` values (i32/boolean/aliased
-// litunion), plus the scalar/string typed values the mv interner supports
-// unconditionally, and the composite families with gate-free admission (closures,
-// arrays, nested maps, null-free unions). Struct values and nullable values stay uncovered — the slot layer still owns those gates.
-function repOfMap(mKey: i32, mVal: i32, mSet: i32): RepDesc {
-  if mKey >= 0 {
-    const kt = tyAt(mKey)
-    if kt is TyPrim {
-      if kt.primName == "string" {
-        // A Set is internally a boolean-valued map — always the mono shape.
-        if mSet == 1 { return repMk("map", 0, "") }
-        if mVal >= 0 {
-          const vt = tyAt(mVal)
-          if vt is TyPrim {
-            if vt.primName == "i32" || vt.primName == "boolean" {
-              return repMk("map", 0, "")
-            }
-            // Scalar/string typed values (`{[string]: f64}`, ...): mv kinds 3/10/11/13, all
-            // already admitted as `"map"` by the ladder's `retMapFlag` gate, so the descriptor
-            // decides identically. The value's own rep (scalar vals list vs string-ref list) is the mv-slot layer's, not the kind's.
-            if (
-              vt.primName == "string"
-              || vt.primName == "i64"
-              || vt.primName == "f64"
-              || vt.primName == "f32"
-            ) {
-              return repMk("map", 0, "")
-            }
-          }
-          // A string-literal-union value is the interned i32 atom, so the map is the mono
-          // i32 map.
-          if tyIsLitUnion(mVal) { return repMk("map", 0, "") }
-          // Composite values whose ladder admission is unconditional — a function value, an
-          // array value, and a nested map value — each map to an mv kind with no name-domain
-          // gate, so the descriptor decides identically. A struct value stays uncovered
-          // (`structIndexOfTypeName` is an intern-state gate the arena cannot mirror), and so does a nullable value (the -3 remainder, where the un-repped list/closure niches live).
-          if vt is TyFunc { return repMk("map", 0, "") }
-          if vt is TyArray { return repMk("map", 0, "") }
-          if vt is TyMap { return repMk("map", 0, "") }
-          // A union value with 2+ members and no null-ish member (`{[string]: i32 |
-          // string}`, a map-member arm): the ladder's kind-2 arm admits it by member count
-          // alone. A pure litunion is the atom/mono family (aliased covered above, inline
-          // uncovered); a null member routes through the nullable-union block whose -3 remainder the arena does not re-derive — both stay uncovered here.
-          if vt is TyUnion {
-            const ms = vt.uMembers
-            if ms.length >= 2 && !tyIsLitUnion(mVal) {
-              let vHasNull = false
-              let vi = 0
-              while vi < ms.length {
-                const vm = tyAt(ms[vi])
-                if vm is TyPrim {
-                  if vm.primName == "null" { vHasNull = true }
-                } else if vm is TyNullable {
-                  vHasNull = true
-                }
-                vi = vi + 1
-              }
-              if !vHasNull { return repMk("map", 0, "") }
-            }
-          }
-        }
-      }
-    }
-  }
-  repUncovered()
+// A map or Set is the `$mapStruct` ref whatever its key and value; which `$mapStruct` (the mv
+// slot) is the slot layer's. A value still a hole has no type to rep yet.
+function repOfMap(mVal: i32, mSet: i32): RepDesc {
+  if mSet != 1 && mVal < 0 { return repUncovered() }
+  repMk("map", 0, "")
 }
 
 // `repOf` for an AST node (an annotation/expression the checker recorded a type
@@ -3778,7 +3963,7 @@ function rtGo(ty: i32): i32 {
       return rtCompleteChild(ix, rtGo(t.aElem), ty)
     }
     TyMap => {
-      return rtOfMap(ty, t.mKey, t.mVal, t.mSet)
+      return rtOfMap(ty, t.mVal, t.mSet)
     }
     TyNeg => {
       return rtLeafOf("unsup", 0, "neg", ty)
@@ -3788,14 +3973,14 @@ function rtGo(ty: i32): i32 {
       // INSTANCE gets the tree.
     }
     TyLit => {
-      // A bare literal type — canon widens it to its base scalar, so no tree
-      // policy is settled here.
+      // A bare literal type is stored as its base scalar.
+      return rtGo(litBaseTy(t))
     }
     TyErr => {
       // The error/unknown hole — a rejected program never reaches emit.
     }
   }
-  // The three empty arms above land here: none has a standalone rep of its own,
+  // The two empty arms above land here: none has a standalone rep of its own,
   // so each becomes the STABLE `leaf:unnarrowable` coverage bucket.
   rtLeafOf("unsup", 0, "leaf:unnarrowable", ty)
 }
@@ -3893,7 +4078,10 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
       // member's own index agrees since variant-member registration is arity-aware (#920 irregularity (a)): a single-member decl never marks its member a variant.
       return rtOfObjAs(ty, members[0], 0, m.objFieldTypes)
     }
-    return rtLeafOf("unsup", 0, "union:single-nonobj", ty)
+    // Any other one-member union is its member.
+    const k1 = rtGo(members[0])
+    rtByTyPut(ty, k1)
+    return k1
   }
   // Lists that all spell one list are that list: the first member with a flat kind decides.
   if oneListUnionRender(ty) != "" {
@@ -3967,16 +4155,8 @@ function rtOfNullable(ty: i32, inner: i32): i32 {
   rtCompleteChild(ix, rtGo(inner), ty)
 }
 
-function rtOfMap(ty: i32, mKey: i32, mVal: i32, mSet: i32): i32 {
-  let keyOk = 0
-  if mKey >= 0 {
-    const kt = tyAt(mKey)
-    if kt is TyPrim {
-      if kt.primName == "string" { keyOk = 1 }
-    }
-  }
-  // Only string-keyed maps have a rep (the grammar's `Map(val)`).
-  if keyOk == 0 { return rtLeafOf("unsup", 0, "map:key", ty) }
+function rtOfMap(ty: i32, mVal: i32, mSet: i32): i32 {
+  // Every key kind stores in the same `$mapStruct` family; the key list is the slot's.
   if mSet != 1 && mVal < 0 { return rtLeafOf("unsup", 0, "map:val-hole", ty) }
   const ix = rtAlloc("map", ty, 0, -1, "", -1)
   rtByTyPut(ty, ix)
@@ -4140,9 +4320,10 @@ function rtNulNicheElemName(elem: i32): string {
 
 function rtNulVKind(ix: i32): VKind | null {
   const d = rtDisc[ix]
-  // The i32-sentinel niches (`boolean | null`, litunion `K | null`) keep the
-  // plain i32 valtype; the boxed discipline is the value-union box itself.
-  if d == 2 || d == 3 { return "i32" }
+  // `boolean | null` is its own kind over an i32 valtype; a litunion `K | null` keeps the plain
+  // i32 atom; the boxed discipline is the value-union box itself.
+  if d == 2 { return "nulbool" }
+  if d == 3 { return "i32" }
   if d == 4 { return "union" }
   if d != 1 { return null }
   const inner = rtChild[ix]
