@@ -103,7 +103,6 @@ import {
 } from "./check_diag_text"
 import { joinWantAt } from "./check_expected"
 import {
-  blockLastStmt,
   f32ArmPlainTy,
   f32JoinRevert,
   ifArmGivesNoValue,
@@ -424,6 +423,7 @@ import {
   tyAmong,
   tyArrayElemIx,
   tyAt,
+  tyChildrenOf,
   tyDeeperThan,
   tyEq,
   tyEqSameHoles,
@@ -3985,48 +3985,19 @@ function holeOfDecl(o: string, d: i32): boolean {
 // Whether `t` holds an inference hole that neither the function being checked nor one of its
 // parameters owns: such a hole is bound by a call into another function, not by this instance.
 function holeOutsideFn(t: i32, depth: i32): boolean {
-  if t < 0 || t >= T.tys.length || depth > 8 { return false }
-  const d = tyAt(t)
-  match d {
-    TyVar => {
-      if !tyHasInferHole(t, 0) { return false }
-      const o = tyVarOwnerOf(t)
-      return o != curFnOwner
-        && !holeOfDecl(o, curFnDeclIx)
-        && !holeOfDecl(o, cstrOwnerTop())
-    }
-    TyArray => {
-      return holeOutsideFn(d.aElem, depth + 1)
-    }
-    TyNullable => {
-      return holeOutsideFn(d.nInner, depth + 1)
-    }
-    TyMap => {
-      return holeOutsideFn(d.mKey, depth + 1)
-        || holeOutsideFn(d.mVal, depth + 1)
-    }
-    TyObj => {
-      for ft in d.objFieldTypes {
-        if holeOutsideFn(ft, depth + 1) { return true }
-      }
-      return false
-    }
-    TyFunc => {
-      for pt in d.fnParamTypes {
-        if holeOutsideFn(pt, depth + 1) { return true }
-      }
-      return holeOutsideFn(d.fnRet, depth + 1)
-    }
-    TyUnion => {
-      for m in d.uMembers {
-        if holeOutsideFn(m, depth + 1) { return true }
-      }
-      return false
-    }
-    TyPrim | TyErr | TyLit | TyNeg => {
-      return false
-    }
+  if depth > 8 || !tyHasInferHole(t, 0) { return false }
+  if tyAt(t) is TyVar {
+    const o = tyVarOwnerOf(t)
+    return o != curFnOwner
+      && !holeOfDecl(o, curFnDeclIx)
+      && !holeOfDecl(o, cstrOwnerTop())
   }
+  const kids: i32[] = []
+  tyChildrenOf(t, kids)
+  for k in kids {
+    if holeOutsideFn(k, depth + 1) { return true }
+  }
+  false
 }
 
 // Whether a record, list or `null` literal `x` of another type meets a destination `dstTy`
@@ -4035,7 +4006,7 @@ function holeOutsideFn(t: i32, depth: i32): boolean {
 // inference hole of the enclosing function (`holeOutsideFn`). An anonymous destination of the
 // literal's own shape is already its storage, so it is not stamped.
 export function litAtRecordDst(x: i32, dstTy: i32): boolean {
-  if dstTy < 0 || !repStampableLit(x, 8) || holeOutsideFn(dstTy, 0) {
+  if dstTy < 0 || !repStampableLit(x) || holeOutsideFn(dstTy, 0) {
     return false
   }
   const own = nodeTyIxOf(parenPeelIx(x))
@@ -4069,32 +4040,12 @@ export function litAtRecordDst(x: i32, dstTy: i32): boolean {
 
 // Whether `x`, past parentheses, is a record, list or `null` literal, or a value `if`, `match` or
 // block one of whose arms is: the sources a rep stamp can adopt.
-export function repStampableLit(x: i32, depth: i32): boolean {
-  if x < 0 || depth <= 0 { return false }
-  const pk = nodeAt(parenPeelIx(x))
-  match pk {
-    ObjLit | ArrayLit | NullLit => {
-      return true
-    }
-    IfStmt => {
-      if pk.ifElse < 0 { return false }
-      return repStampableLit(blockLastStmt(pk.ifThen), depth - 1)
-        || repStampableLit(pk.ifElse, depth - 1)
-    }
-    Block => {
-      return repStampableLit(blockLastStmt(parenPeelIx(x)), depth - 1)
-    }
-    MatchExpr => {
-      for b in pk.matchBodies {
-        if repStampableLit(b, depth - 1) { return true }
-      }
-      return false
-    }
-    // no other expression is built at the type it is delivered to
-    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {
-      return false
-    }
+export function repStampableLit(x: i32): boolean {
+  for l in valueTailLeaves(x) {
+    const n = nodeAt(l)
+    if n is ObjLit || n is ArrayLit || n is NullLit { return true }
   }
+  false
 }
 
 // Stamps the destination type `dstTy` onto literal `srcExpr` (recursively, into `ObjLit` fields /
@@ -4207,18 +4158,10 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       return 1
     }
     // A value `if`, `match` or block delivers each arm's value to the same destination.
-    IfStmt => {
-      if e.ifElse < 0 { return 0 }
-      const a = recordRepTyAdopt(e.ifThen, dtix, depth)
-      return a | recordRepTyAdopt(e.ifElse, dtix, depth)
-    }
-    Block => {
-      return recordRepTyAdopt(blockLastStmt(srcExpr), dtix, depth - 1)
-    }
-    MatchExpr => {
+    IfStmt | Block | MatchExpr => {
       let any = 0
-      for b in e.matchBodies {
-        any = any | recordRepTyAdopt(b, dtix, depth - 1)
+      for l in valueTailLeaves(srcExpr) {
+        if l != srcExpr { any = any | recordRepTyAdopt(l, dtix, depth - 1) }
       }
       return any
     }
