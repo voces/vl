@@ -1055,6 +1055,7 @@ import {
 import {
   chainHasPrelude,
   exprIsNullLike,
+  fnTagIdSlot,
   ifChainAllBareNull,
   ifLinkYieldsNull,
   ifListArmValueIx,
@@ -1442,12 +1443,20 @@ import {
   repOfTy,
   repRowOfTyStruct,
   repScanLim,
+  repSigKindOfTy,
+  repSlotOfTy,
   sFieldElemTyIxAt,
   scalarTagOfKind,
   tyDenotesFunc,
   valBlockTypeOfKind,
   vbHeapIdxOfKind,
 } from "./emit_rep"
+import {
+  fnTagCallArms,
+  fnTagCallSetOf,
+  fnTagLeafId,
+  fnTagMembers,
+} from "./check_elab_cap"
 import {
   genericFnValueRejectMsg,
   monoAliasDeclOf,
@@ -20837,6 +20846,16 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
     if isRecvStagedNonNull { fbRefAsNonNull() }
     return 0
   }
+  // A tagged function set's value is its member's id, and a call through one dispatches on it.
+  const tagLeaf = fnTagLeafId(exprIx)
+  if tagLeaf >= 0 {
+    fbI32Const(tagLeaf)
+    return 0
+  }
+  const tagArms = fnTagCallArms(exprIx)
+  if tagArms.length > 0 {
+    return emitFnTagDispatch(body, exprIx, tagArms, fnIx)
+  }
   if exprIx == lmaValNode {
     const lmaArg = lmaValArg
     lmaValNode = -1
@@ -25022,6 +25041,61 @@ function emitCall(body: u8[], callIx: i32, fnIx: i32, ec: ExpCtx) {
   if r < 0 { return r }
   if callIsNever(callIx) && !callIsTrapIntrinsic(callIx) { fbUnreachable() }
   r
+}
+
+// A call through a tagged function set (`fnTagDecide`): the callee is the i32 id of the member
+// it holds, tested against each member's id in turn to make that member's own direct call. The
+// last member takes the remaining id. Members giving different results box them into the call's
+// union.
+function emitFnTagDispatch(body: u8[], callIx: i32, arms: i32[], fnIx: i32) {
+  const c = nodeAt(callIx)
+  if !(c is Call) { return emitFail("emitProgram: expected a call") }
+  const ds = fnTagMembers(fnTagCallSetOf(callIx))
+  if ds.length != arms.length {
+    return emitFail("emitProgram: a dispatch lost a member")
+  }
+  if emitExpr(body, c.callFn, fnIx, expCtxDefault()) < 0 { return -1 }
+  const slot = fnTagIdSlot()
+  fbLocalSet(slot)
+  const ty = nodeTyIxOf(callIx)
+  const kind = repSigKindOfTy(ty)
+  if kind == null {
+    return emitFail(
+      "emitProgram: a call through a function set has a result with no rep",
+    )
+  }
+  const boxed = kind == "union"
+  let rslot = -1
+  if kind == "struct" || kind == "nulstruct" { rslot = repSlotOfTy(ty) }
+  if kind == "reflist" || kind == "nulreflist" { rslot = rlSlotOfTy(ty) }
+  const un = if boxed { unionNameOfExpr(callIx, fnIx) } else { "" }
+  let k = 0
+  while k < arms.length {
+    const last = k == arms.length - 1
+    if !last {
+      fbLocalGet(slot)
+      fbI32Const(ds[k])
+      fbI32Bin(70) // 0x46 i32.eq
+      fbOpenIf()
+      fbValtype(kind, rslot)
+    }
+    let rc = 0
+    if boxed {
+      rc = emitUnionBoxArg(body, un, ty, arms[k], fnIx, expCtxDefault())
+    } else {
+      rc = emitExpr(body, arms[k], fnIx, expCtxDefault())
+    }
+    if rc < 0 { return -1 }
+    if !last { fbElse() }
+    k = k + 1
+  }
+  k = 0
+  while k < arms.length - 1 {
+    fbEnd()
+    k = k + 1
+  }
+  tailCallIdx = -1
+  0
 }
 
 function callIsTrapIntrinsic(callIx: i32) {
@@ -32391,6 +32465,12 @@ function emitCallStmt(body: u8[], s: Call, stmtIx: i32, fnIx: i32, ec: ExpCtx) {
   // `Call` whose `callFn` is a `Member`). A bare top-level call statement (a function
   // call whose value is discarded) is out of scope.
   if s.callFn < 0 { return -1 }
+  const tagArms = fnTagCallArms(stmtIx)
+  if tagArms.length > 0 {
+    if emitFnTagDispatch(body, stmtIx, tagArms, fnIx) < 0 { return -1 }
+    fbDrop()
+    return 0
+  }
   const callee = nodeAt(s.callFn)
   if callee is Member {
     // A `.push` STATEMENT discards the new length — emit the append with no value (D1592),

@@ -1,0 +1,418 @@
+// Which sets of functions a value holds as the i32 id of its member rather than as a closure
+// (D3975). A set is tagged when some call through it needs a member's own instance, and every
+// node carrying it is a place the emitter can lower as an id: a name of a member, a binding, a
+// return, an `if`/`match` arm, or the callee of a call through it. A call through a tagged set
+// dispatches on the id to a direct call of each member, which this pass builds.
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  mkCallN,
+  mkIdent,
+  nodeAt,
+  nodeChildrenPush,
+} from "./ast"
+import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
+import { fnDeclIx } from "./check_write_scan"
+import { tailValueLeaves } from "./check_unconsumed"
+import { collectRetValues } from "./check_nj_join"
+import { rcwInferredRetTy } from "./check_rcw"
+import { tErr } from "./check_relate_core"
+import { i32ListHas } from "./listutil"
+import { identDeclOf, identSet } from "./symbols"
+import {
+  elabFnIdOf,
+  fnTagArmsOf,
+  fnTagArmsSet,
+  fnTagCallKeyOf,
+  fnTagCallMsgAtOf,
+  fnTagCallMsgOf,
+  fnTagCallRsOf,
+  fnTagCallSetOf,
+  fnTagCallSplits,
+  fnTagCalls,
+  fnTagMark,
+  fnTagMembers,
+  fnTagRetMark,
+  fnTagSetIsTagged,
+  fnTagSetOfTy,
+  fnTagUndecide,
+} from "./check_elab_cap"
+
+// Decides every set from scratch over the program at `rootIx`, then raises the refusal each
+// call through a set left a closure owes.
+export function fnTagDecide(rootIx: i32) {
+  fnTagUndecide()
+  const calls = fnTagCalls()
+  const seen: i32[] = []
+  for c in calls {
+    const s = fnTagCallSetOf(c)
+    if s >= 0 && !i32ListHas(seen, s) {
+      seen.push(s)
+      if ftCandidate(s, calls) { ftTry(rootIx, s, calls) }
+    }
+  }
+  for c in calls {
+    const msg = fnTagCallMsgOf(c)
+    if msg != "" && !fnTagSetIsTagged(fnTagCallSetOf(c)) {
+      tErr(msg, fnTagCallMsgAtOf(c))
+    }
+  }
+  0
+}
+
+// Whether set `s` needs its members' own instances: a call through it splits, or two calls
+// reach it at different parameter types.
+function ftCandidate(s: i32, calls: i32[]): boolean {
+  let key = ""
+  let any = false
+  for c in calls {
+    if fnTagCallSetOf(c) == s {
+      if fnTagCallSplits(c) { return true }
+      const k = fnTagCallKeyOf(c)
+      if !any {
+        any = true
+        key = k
+      } else if k != key {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Tags set `s` when every node carrying it is a place an id can stand, and builds each call's
+// member calls.
+function ftTry(rootIx: i32, s: i32, calls: i32[]) {
+  const ds = fnTagMembers(s)
+  const leaves: i32[] = []
+  const ids: i32[] = []
+  if !ftScan(rootIx, s, ds, leaves, ids) { return 0 }
+  // A member call names the member as its leaves do, so each member needs one.
+  const leafTy: i32[] = []
+  for d in ds {
+    let t = -1
+    let k = 0
+    while k < leaves.length && t < 0 {
+      if ids[k] == d { t = nodeTyIxOf(leaves[k]) }
+      k = k + 1
+    }
+    if t < 0 { return 0 }
+    leafTy.push(t)
+  }
+  for c in calls {
+    if fnTagCallSetOf(c) == s && !ftPlainArgs(c) { return 0 }
+  }
+  fnTagMark(s, leaves, ids)
+  const r = nodeAt(rootIx)
+  if r is Program {
+    for d in r.progStmts {
+      if nodeAt(d) is FuncDecl && ftRetCarries(d, s) { fnTagRetMark(d) }
+    }
+  }
+  for c in calls {
+    if fnTagCallSetOf(c) == s { ftBuildArms(c, ds, leafTy) }
+  }
+  0
+}
+
+// Builds, or re-types, the direct call of each member of `ds` at call `c`'s arguments.
+function ftBuildArms(c: i32, ds: i32[], leafTy: i32[]) {
+  const rs = fnTagCallRsOf(c)
+  let arms = fnTagArmsOf(c)
+  const cn = nodeAt(c)
+  if !(cn is Call) { return 0 }
+  if arms.length != ds.length {
+    arms = []
+    for d in ds {
+      const f = nodeAt(d)
+      let nm = ""
+      if f is FuncDecl { nm = f.fnName }
+      const id = mkIdent(nm, cn.pos)
+      identSet(id, d)
+      arms.push(mkCallN(id, cn.callArgs, cn.callArgNames, cn.pos))
+    }
+    fnTagArmsSet(c, arms)
+  }
+  let k = 0
+  while k < arms.length {
+    const an = nodeAt(arms[k])
+    if an is Call { nodeTySetGrow(an.callFn, leafTy[k]) }
+    nodeTySetGrow(arms[k], if k < rs.length { rs[k] } else { nodeTyIxOf(c) })
+    k = k + 1
+  }
+  0
+}
+
+// Whether call `c`'s arguments are safe to evaluate in each member call: none holds a call, a
+// function, a literal that allocates, an assignment, or a block.
+function ftPlainArgs(c: i32): boolean {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return false }
+  const todo: i32[] = []
+  for a in cn.callArgs { todo.push(a) }
+  while todo.length > 0 {
+    const x = todo.pop()
+    if x < 0 || x >= P.nodes.length { return false }
+    const n = nodeAt(x)
+    match n {
+      Ident | NumLit | StrLit | BoolLit => {}
+      Unary | Paren | Member => {
+        nodeChildrenPush(x, todo)
+      }
+      BinExpr => {
+        if n.binOp == "=" || n.binCompound != "" { return false }
+        nodeChildrenPush(x, todo)
+      }
+      // Anything else may call, allocate, bind or loop.
+      CharLit | NullLit | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {
+        return false
+      }
+    }
+  }
+  true
+}
+
+// Whether the result type of function `f` carries set `s`.
+function ftRetCarries(f: i32, s: i32): boolean {
+  if f < 0 { return false }
+  fnTagSetOfTy(rcwInferredRetTy(f)) == s
+}
+
+// Whether node `x` carries set `s`.
+function ftIsS(x: i32, s: i32): boolean {
+  x >= 0 && fnTagSetOfTy(nodeTyIxOf(x)) == s
+}
+
+// Walks the program for every node carrying set `s`, pushing each member name it reaches to
+// `leaves` with the member it names to `ids`; false at the first node an id cannot stand at.
+function ftScan(
+  rootIx: i32,
+  s: i32,
+  ds: i32[],
+  leaves: i32[],
+  ids: i32[],
+): boolean {
+  const xs: i32[] = [rootIx]
+  const ps: i32[] = [-1]
+  const gs: i32[] = [-1]
+  const fs: i32[] = [-1]
+  while xs.length > 0 {
+    const x = xs.pop()
+    const p = ps.pop() ?? -1
+    const g = gs.pop() ?? -1
+    let fn = fs.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if ftIsS(x, s) {
+        if !ftFnOk(fn, rootIx) || !ftNodeOk(x, s, ds, leaves, ids) {
+          return false
+        }
+        if !ftCtxOk(x, p, g, fn, s) { return false }
+      }
+      const n = nodeAt(x)
+      if n is FuncDecl { fn = x }
+      const kids: i32[] = []
+      nodeChildrenPush(x, kids)
+      for k in kids {
+        xs.push(k)
+        ps.push(x)
+        gs.push(p)
+        fs.push(fn)
+      }
+    }
+  }
+  true
+}
+
+// Whether a node of a tagged set may sit in function `fn`: the program's top level, or a
+// named top-level function with no type parameters whose every parameter is annotated.
+function ftFnOk(fn: i32, rootIx: i32): boolean {
+  if fn < 0 { return true }
+  const f = nodeAt(fn)
+  if !(f is FuncDecl) || f.fnName == "" || f.fnTyParams.length > 0 {
+    return false
+  }
+  const r = nodeAt(rootIx)
+  if !(r is Program) || !i32ListHas(r.progStmts, fn) { return false }
+  for pi in f.fnParams {
+    const pn = nodeAt(pi)
+    if !(pn is Param) || pn.parType < 0 { return false }
+  }
+  true
+}
+
+// Whether node `x`, carrying set `s`, is a kind an id can be, recording the member names whose
+// values it is made of.
+function ftNodeOk(
+  x: i32,
+  s: i32,
+  ds: i32[],
+  leaves: i32[],
+  ids: i32[],
+): boolean {
+  const n = nodeAt(x)
+  match n {
+    Ident => {
+      const d = ftLeafMember(x, ds)
+      if d >= 0 && !i32ListHas(leaves, x) {
+        leaves.push(x)
+        ids.push(d)
+      }
+      return true
+    }
+    LetDecl | Paren | Block => {
+      return true
+    }
+    Call => {
+      if fnTagCallSetOf(x) == s { return true }
+      const d = ftNamedFn(n.callFn)
+      if d < 0 || !ftRetCarries(d, s) { return false }
+      const f = nodeAt(d)
+      if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+      const vs: i32[] = []
+      collectRetValues(f.fnBody, vs)
+      return ftValuesOk(vs, s, ds, leaves, ids)
+    }
+    IfStmt => {
+      if n.ifElse < 0 { return false }
+      const vs: i32[] = []
+      tailValueLeaves(x, vs)
+      return ftValuesOk(vs, s, ds, leaves, ids)
+    }
+    MatchExpr => {
+      const vs: i32[] = []
+      tailValueLeaves(x, vs)
+      return ftValuesOk(vs, s, ds, leaves, ids)
+    }
+    // No other node of a set's type is lowered as an id.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | ErrExpr | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {
+      return false
+    }
+  }
+}
+
+// Whether each value in `vs` carries set `s` itself or names one of its members `ds`; the
+// member names go to `leaves`, once each.
+function ftValuesOk(
+  vs: i32[],
+  s: i32,
+  ds: i32[],
+  leaves: i32[],
+  ids: i32[],
+): boolean {
+  for v in vs {
+    if !ftIsS(v, s) {
+      const d = ftLeafMember(v, ds)
+      if d < 0 { return false }
+      if !i32ListHas(leaves, v) {
+        leaves.push(v)
+        ids.push(d)
+      }
+    }
+  }
+  true
+}
+
+// The member of `ds` the name at `v` reads, or -1.
+function ftLeafMember(v: i32, ds: i32[]): i32 {
+  const d = ftNamedFn(v)
+  if d < 0 || !i32ListHas(ds, d) { return -1 }
+  d
+}
+
+// The top-level function the name at `v` reads, or -1 when it is no name of one.
+function ftNamedFn(v: i32): i32 {
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const n = nodeAt(v)
+  if !(n is Ident) { return -1 }
+  const d = fnDeclIx[n.identName] ?? -1
+  if d < 0 { return -1 }
+  const r = identDeclOf(v)
+  if r >= 0 && r != d { return -1 }
+  if r < 0 && elabFnIdOf(nodeTyIxOf(v)) != d { return -1 }
+  d
+}
+
+// Whether node `x` of set `s`, the child of `p` (itself the child of `g`) inside function `fn`,
+// sits where its value is a binding, a return, an arm, or a callee through `s`.
+function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
+  if p < 0 { return false }
+  const pn = nodeAt(p)
+  match pn {
+    Program | Paren => {
+      return true
+    }
+    Call => {
+      return pn.callFn == x && fnTagCallSetOf(p) == s
+    }
+    // A binding's annotation delivers the value to a declared function type, a closure.
+    LetDecl => {
+      return pn.letInit == x && pn.letType < 0
+    }
+    RetStmt => {
+      return ftRetCarries(fn, s)
+    }
+    IfStmt => {
+      return x != pn.ifCond && ftIsS(p, s)
+    }
+    MatchExpr => {
+      return x != pn.matchScrut && i32ListHas(pn.matchBodies, x) && ftIsS(p, s)
+    }
+    Block => {
+      const st = pn.blkStmts
+      if st.length == 0 || st[st.length - 1] != x { return true }
+      if ftIsS(p, s) { return true }
+      if g >= 0 {
+        const gn = nodeAt(g)
+        if (gn is IfStmt || gn is MatchExpr) && ftIsS(g, s) { return true }
+        if gn is FuncDecl && gn.fnBody == p && ftRetCarries(g, s) {
+          return true
+        }
+      }
+      return false
+    }
+    FuncDecl => {
+      return pn.fnBody == x && ftRetCarries(p, s)
+    }
+    // Any other parent reads the value as a closure.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | ErrExpr | Param | TypeRef | WhileStmt | BreakStmt | ContinueStmt | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {
+      return false
+    }
+  }
+}
