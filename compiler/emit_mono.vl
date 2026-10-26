@@ -589,6 +589,7 @@ import {
   elabSlotNote,
   elabTpDefaultsReset,
   elabTpDefaultsSet,
+  elabWalkKidRet,
   elabWalkPop,
   elabWalkPush,
   elabWalkTy,
@@ -3900,14 +3901,13 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
   let st = monoSubstInst(ty, bN, bT)
   if (st < 0 || tyHasTyVar(st)) && monoPinHoleN.length > 0 {
     // A hole instance's list literal, element read and call of a function value are typed at
-    // its holes, which `bN` does not name (D3066). A literal or read takes the instance's
-    // elaboration; a value call keeps the holes' join, which its lambda's body is built at
-    // (D3616). A method's result is the receiver's to answer.
+    // its holes, which `bN` does not name (D3066): the instance's elaboration answers, and the
+    // holes' binding where it has none. A method's result is the receiver's to answer.
     const hn = nodeAt(unwrapParen(ix))
     let byHole = hn is ArrayLit || hn is Index
     if hn is Call { byHole = monoCallsFnValue(unwrapParen(ix), 0) }
     if byHole {
-      st = if hn is Call { -1 } else { elabWalkTy(ix) }
+      st = elabWalkTy(ix)
       if st < 0 {
         const jN: string[] = []
         const jT: i32[] = []
@@ -5242,21 +5242,27 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32, bN: string[], bT: i32[]) {
     && tyBearsNull(kept)
   if nulJoin && isNullTy(rty) { rty = nonNullTy(kept) }
   if rty >= 0 && tyHasTyVar(rty) {
-    let rs = monoSubstInst(rty, bN, bT)
-    if rs >= 0 && tyHasTyVar(rs) {
-      const rr = monoLamReachParamTy(fnIx, -1, bN, bT)
-      if rr >= 0 { rs = rr }
+    // The instance's elaboration types the lambda at its holes; the binding is the fallback
+    // where it has no instance.
+    const er = monoLamElabRet(fnIx)
+    let rs = er
+    if rs < 0 {
+      rs = monoSubstInst(rty, bN, bT)
+      if rs >= 0 && tyHasTyVar(rs) {
+        const rr = monoLamReachParamTy(fnIx, -1, bN, bT)
+        if rr >= 0 { rs = rr }
+      }
+      if monoRetReadsHoleParam(rex, fnIx) { rs = monoHoleTy(rs) }
+      if nulJoin && rs >= 0 && !tyHasTyVar(rs) { rs = mkNullableTy(rs) }
     }
-    if monoRetReadsHoleParam(rex, fnIx) { rs = monoHoleTy(rs) }
-    if nulJoin && rs >= 0 && !tyHasTyVar(rs) { rs = mkNullableTy(rs) }
     if rs >= 0 && rs != rty {
-      const litGate = rex < 0 && monoTyHasLitMember(rs) && !keptJoin
+      const litGate = rex < 0 && monoTyHasLitMember(rs) && !keptJoin && er < 0
       if !tyHasTyVar(rs) && !litGate {
         const rnm = monoPinAnnSpelling(rs)
         // The box a kept-apart join returns is registered here, as an instance return's is.
         if (
           rnm != ""
-          && (keptJoin || nulJoin)
+          && (keptJoin || nulJoin || er >= 0)
           && monoTyIsUnionOrNulUnion(rs)
           && !monoTyHoldsRefArm(rs)
         ) {
@@ -5267,6 +5273,20 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32, bN: string[], bT: i32[]) {
     }
   }
   nret
+}
+
+// Lambda `fnIx`'s return at the hole instance being built, closed, from the instance's
+// elaboration, else the one its own instances there agree on; -1 outside one or when open.
+function monoLamElabRet(fnIx: i32): i32 {
+  if monoPinHoleN.length == 0 { return -1 }
+  const et = elabWalkTy(fnIx)
+  if et >= 0 {
+    const ft = tyAt(et)
+    if ft is TyFunc {
+      if ft.fnRet >= 0 && !tyHasTyVar(ft.fnRet) { return ft.fnRet }
+    }
+  }
+  elabWalkKidRet(fnIx)
 }
 
 // `monoCloneLambdaSubst`'s last step: lifts `clone`, the instance of the lambda template `a`
@@ -6981,10 +7001,12 @@ let monoProgLamNames: string[] = []
 let monoCgcHoleN: string[] = []
 let monoCgcHoleT: i32[] = []
 
-// The type a copied call through a lambda binding answers at this instance: its recorded type
-// substituted through the instance's binding, then its holes; the recorded type when a
-// variable stays.
-function monoLamCallTy(t: i32): i32 {
+// The type copied call `ix` through a lambda binding answers at this instance: the instance's
+// elaboration at a hole instance, else its recorded type `t` substituted through the binding,
+// then its holes; `t` when a variable stays.
+function monoLamCallTy(ix: i32, t: i32): i32 {
+  const e = if monoCgcHoleN.length > 0 { elabWalkTy(ix) } else { -1 }
+  if e >= 0 { return e }
   if t < 0 || !tyHasTyVar(t) { return t }
   const st = monoHoleTy(monoSubstInst(t, monoCgcBN, monoCgcBT))
   if st < 0 || tyHasTyVar(st) { return t }
@@ -8349,7 +8371,7 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
   if cellCall && nodeTyIxOf(ix) >= 0 { nodeTyRecord(nc, nodeTyIxOf(ix)) }
   if lamCall {
     // A value call is typed by its own record, which the copy carries (D2854).
-    const lt = monoLamCallTy(nodeTyIxOf(ix))
+    const lt = monoLamCallTy(ix, nodeTyIxOf(ix))
     if lt >= 0 { nodeTyRecord(nc, lt) }
   }
   if tas.length > 0 {
@@ -8524,7 +8546,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
         // A value nothing calls stays one in each instance's copy (D9590).
         if i32ListHas(monoInertValues, ix) { monoInertValues.push(vi) }
         if i32ListHas(monoInertCalled, ix) { monoInertCalled.push(vi) }
-        const vt = monoLamCallTy(nodeTyIxOf(ix))
+        const vt = monoLamCallTy(ix, nodeTyIxOf(ix))
         if vt >= 0 { nodeTyRecord(vi, vt) }
         return vi
       }
