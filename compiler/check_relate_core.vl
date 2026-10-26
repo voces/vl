@@ -11,6 +11,10 @@ import {
   elabFnLetMembers,
   elabFnSetOf,
   elabHolePinNote,
+  fnTagCallNote,
+  fnTagCallRefusal,
+  fnTagMembers,
+  fnTagSetOfTy,
 } from "./check_elab_cap"
 import {
   ArrayLit,
@@ -4858,15 +4862,87 @@ function holeSetJudge(ix: i32, wp: i32[]): boolean {
   let k = 1
   while k < ds.length {
     if !tySame(rs[k], rs[0]) {
-      tErr(
-        holeChoiceDisagreeMsg(wp, ds[k], rs[k], ds[0], rs[0]),
-        holeSetSite(ix, ds[k]),
-      )
+      const msg = holeChoiceDisagreeMsg(wp, ds[k], rs[k], ds[0], rs[0])
+      // A call that may dispatch on the member it holds owes this only if its set stays a
+      // closure, which the last pass decides (`fnTagDecide`); a held question records nothing.
+      if holeSetCallAt >= 0 && !inferQuiet {
+        if !holePinHeld {
+          fnTagCallRefusal(holeSetCallAt, msg, holeSetSite(ix, ds[k]))
+        }
+        return false
+      }
+      tErr(msg, holeSetSite(ix, ds[k]))
       return true
     }
     k = k + 1
   }
   false
+}
+
+// The call through a set whose disagreement `holeSetJudge` records rather than refuses, or -1.
+let holeSetCallAt = -1
+
+// The type of the call at `ix` through callee `callFn` at parameter types `pts` when the
+// callee's value is one of a set of two or more un-annotated functions: the join of each one's
+// result there. Records the call for `fnTagDecide` and returns -1 when the callee is no such
+// value or a result stays open.
+export function holeSetCallRet(ix: i32, callFn: i32, pts: i32[]): i32 {
+  const cx = parenPeelIx(callFn)
+  if cx < 0 || cx >= P.nodes.length { return -1 }
+  const s = fnTagSetOfTy(nodeTyIxOf(cx))
+  const ds = fnTagMembers(s)
+  if ds.length < 2 { return -1 }
+  for d in ds {
+    if d < 0 || d >= P.nodes.length || !directHoleDecl(d) { return -1 }
+    const f = nodeAt(d)
+    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return -1 }
+  }
+  const wp: i32[] = []
+  let key = ""
+  for pt in pts {
+    if pt < 0 || tyHasTyVar(pt) { return -1 }
+    const w = widenLitTy(pt)
+    wp.push(w)
+    key = key + tyToStr(w) + ","
+  }
+  const ft = mkFuncTy(wp, TY_I32)
+  const noN: string[] = []
+  const noT: i32[] = []
+  let r = -1
+  let r0 = -1
+  let split = false
+  const rs: i32[] = []
+  for d in ds {
+    const rd = holeLamRetAt(d, ft, noN, noT)
+    if rd < 0 || tyHasTyVar(rd) { return -1 }
+    const w = widenLitTy(rd)
+    rs.push(w)
+    if r0 < 0 {
+      r0 = w
+      r = w
+    } else if !tySame(w, r0) {
+      split = true
+      r = joinRetTys(r, w)
+    }
+  }
+  if !inferQuiet && !holePinHeld { fnTagCallNote(ix, s, key, split, rs) }
+  r
+}
+
+// Runs `holeLetWritesDisagreeAt` for the call at `ix`, recording rather than refusing a
+// disagreement among a set's members when `deferSet` holds.
+export function holeLetWritesDisagreeCall(
+  ix: i32,
+  a: i32,
+  pts: i32[],
+  fixed: i32[],
+  deferSet: boolean,
+): boolean {
+  const was = holeSetCallAt
+  holeSetCallAt = if deferSet { ix } else { -1 }
+  const r = holeLetWritesDisagreeAt(a, pts, fixed)
+  holeSetCallAt = was
+  r
 }
 
 // The return value of the function the call at `ix` runs that names function `d`, else `ix`.
