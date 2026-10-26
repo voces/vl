@@ -344,7 +344,7 @@ import {
   parentBindingFrameOf,
   parentBindingOf,
 } from "./emit_capture_frames"
-import { elabAsgOf, elabNodeTyAt, litRepTyAt } from "./emit_elab"
+import { ekDecl, elabAsgOf, elabNodeTyAt, litRepTyAt } from "./emit_elab"
 import {
   BC_F32,
   BC_F64,
@@ -1142,10 +1142,12 @@ import {
 import { isFitsAcrossTagRows, variantFieldIndex } from "./emit_variant_sig"
 import { strListHas } from "./listutil"
 import {
+  emitPassGen,
   memoGenAdvance,
   memoGenNew,
   memoKeyNew,
   memoMoved,
+  memoMoved3,
   memoPassMoved,
 } from "./memo"
 import {
@@ -3250,23 +3252,91 @@ export function identReadAtomKindAt(ix: i32, fnIx: i32): i32 {
   if rx < 0 || rx == storageReadIx { return -1 }
   if identCellVKind(rx, fnIx) != "union" { return -1 }
   const pt = asgReReadPinAt(rx, fnIx)
-  const k = readAtomKindOfTy(if pt >= 0 { pt } else { nodeTyAt(rx, fnIx) })
+  if pt >= 0 { readAtomAgreed(rx, pt, fnIx) } else { readTypeVerdict(rx, fnIx) }
+}
+
+// The atom type `t` is, when the instance's elaboration of `rx` names the same one, else -1: a
+// pinned hole can make the read wider than the generic body's type.
+function readAtomAgreed(rx: i32, t: i32, fnIx: i32): i32 {
+  const k = readAtomKindOfTy(t)
   if k < 0 || k == 6 { return -1 }
-  // An instance unboxes only where its elaboration agrees: a pinned hole can make the read wider
-  // than the generic body's type.
   const et = elabNodeTyAt(rx, fnIx)
   if et >= 0 && readAtomKindOfTy(et) != k { return -1 }
-  if pt >= 0 { return k }
-  // A read narrows only below its binding: where the checker typed the read as its `let` is
-  // typed, no narrowing applies and a box cell is one the checker disagrees with.
-  const savedLocal = identLetIsModuleLocal
-  const li = identLetOfAt(sidOfNode(rx), fnIx, rx)
-  identLetIsModuleLocal = savedLocal
+  k
+}
+
+// The atom the read `rx` is typed as below its binding, from types alone, or -1: where the
+// checker typed the read as its `let` is typed, no narrowing applies.
+function readTypeVerdictGo(rx: i32, fnIx: i32): i32 {
+  const k = readAtomAgreed(rx, nodeTyAt(rx, fnIx), fnIx)
+  if k < 0 { return -1 }
+  const li = readBindingLetOf(rx, fnIx)
   if li < 0 { return k }
   const rt = nodeTyIxOf(rx)
   if rt >= 0 && tySame(rt, nodeTyIxOf(li)) { return -1 }
   if readAtomKindOfTy(letBindTyAt(li, fnIx)) == k { return -1 }
   k
+}
+
+// `readTypeVerdictGo` remembered per resolver-bound, non-generic read, for the function asking
+// and the raw types of the read and its declaration; every classifier rung asks it of one read.
+const rtvGen = memoGenNew(0)
+const rtvKey = memoKeyNew(4)
+const rtvStamp: i32[] = []
+const rtvFn: i32[] = []
+const rtvRaw: i32[] = []
+const rtvDeclRaw: i32[] = []
+const rtvVal: i32[] = []
+function readTypeVerdict(rx: i32, fnIx: i32): i32 {
+  const di = identDeclOf(rx)
+  if di < 0 { return readTypeVerdictGo(rx, fnIx) }
+  let moved = memoMoved3(rtvKey, emitPassGen, tyMutEpoch, ekDecl.length)
+  moved = memoMoved(
+    rtvKey,
+    3,
+    if emitPhaseReached("arenaFinal") { 1 } else { 0 },
+  )
+    || moved
+  if moved { memoGenAdvance(rtvGen) }
+  const raw = nodeTyIxOf(rx)
+  const draw = nodeTyIxOf(di)
+  // A generic body's read answers per instance, which `fnIx` alone does not name.
+  if raw < 0 || draw < 0 || tyHasTyVar(raw) || tyHasTyVar(draw) {
+    return readTypeVerdictGo(rx, fnIx)
+  }
+  if rx < rtvStamp.length {
+    if (
+      rtvStamp[rx] == rtvGen.at
+      && rtvFn[rx] == fnIx
+      && rtvRaw[rx] == raw
+      && rtvDeclRaw[rx] == draw
+    ) {
+      return rtvVal[rx]
+    }
+  }
+  const v = readTypeVerdictGo(rx, fnIx)
+  while rtvStamp.length <= rx {
+    rtvStamp.push(-1)
+    rtvFn.push(-1)
+    rtvRaw.push(-1)
+    rtvDeclRaw.push(-1)
+    rtvVal.push(-1)
+  }
+  rtvStamp[rx] = rtvGen.at
+  rtvFn[rx] = fnIx
+  rtvRaw[rx] = raw
+  rtvDeclRaw[rx] = draw
+  rtvVal[rx] = v
+  v
+}
+
+// The `let` the read `rx` denotes: the resolver's declaration when it bound one (-1 for a
+// parameter), else the scope walk's answer for a read the resolver never saw (a clone).
+function readBindingLetOf(rx: i32, fnIx: i32): i32 {
+  const savedLocal = identLetIsModuleLocal
+  const li = identLetOfAt(sidOfNode(rx), fnIx, rx)
+  identLetIsModuleLocal = savedLocal
+  li
 }
 
 // The type binding `li` holds at function `fnIx`: its own, else a `const`'s initializer's (the
