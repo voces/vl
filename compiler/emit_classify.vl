@@ -54,7 +54,6 @@ import {
   arenaRefWritesNow,
   arithRegionSeen,
   callIsNever,
-  elseIfLink,
   externLinkOf,
   externRetIsVoid,
   fnTpBoundOf,
@@ -64,7 +63,6 @@ import {
   nodeAt,
   nodeChildren,
   nodeChildrenPush,
-  nodeSpineChildren,
   spreadArgOf,
   stmtAlwaysExits,
   ufcsAliasAtSite,
@@ -84,7 +82,6 @@ import {
   mapUnboxTyOf,
   nodeRepTyIxOf,
 } from "./check_core_state"
-import { covarDeclFrame } from "./check_covar_write"
 import { condNarrowDropOf } from "./check_cr_walk"
 import { nodeTyIsUnionAlias } from "./check_decl_scan"
 import {
@@ -666,7 +663,6 @@ import {
   paramTypeNode,
 } from "./emit_query"
 import {
-  DS_CALLEE_UNBOUND,
   RsWalk,
   TK_F32,
   TK_F64,
@@ -675,31 +671,18 @@ import {
   arenaListRep,
   arrNewDestKind,
   destLetOf,
-  dsCalleeParamSlot,
-  dsRebindsName,
   dsScopeRootOf,
-  dsgFrame,
-  dsgHead,
-  dsgNext,
-  dsgNode,
-  dsgReady,
   emptyArrHoleKind,
-  fnParamKindListSlot,
-  fnTyParamKindListSlot,
   letAnnRefListKind,
-  letAnnStructIdx,
   letAnnVariantIdx,
   letBoundName,
-  mapValKindListSlot,
   objLitNamesTwoRows,
   rlInnerKindListSlot,
   rlSlotIsKindList,
-  rlWidenAllowed,
   rlWidenVariantOf,
   rsAliasOf,
   rsAnnLetInitIs,
   rsBlockBindsBefore,
-  rsBuiltElemFail,
   rsCallParamTy,
   rsFirstBuiltElem,
   rsFnKey,
@@ -721,7 +704,6 @@ import {
   rsPlaceStoreTy,
   rsQueryGen,
   rsRowNamesObjLit,
-  rsRowsDiffer,
   rsSameRow,
   rsSlotIsRow,
   rsSlotRow,
@@ -729,8 +711,6 @@ import {
   rsTyIsRecord,
   rsTyIsRow,
   rsWalkAt,
-  structNamesTwoRows,
-  tyAnnRefListKind,
   tyKindOf,
   tyPrimLeafListKind,
 } from "./emit_ref_list_kinds"
@@ -17430,9 +17410,6 @@ export function fnRetRefArrayNameSid(
 function globalRefArrayName(fnIx: i32, name: string) {
   const li = globalLetOfIn(fnIx, name, -1)
   if li < 0 { return "" }
-  // The row the cell holds when a declared destination re-seated the literal (D2881).
-  const rs = letRecordListDestSlot(li, -1)
-  if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
   letRefListElemName(li, -1)
 }
 
@@ -18023,13 +18000,25 @@ export function letRefListSlot(letIx: i32, fnIx: i32) {
       if a >= 0 { return a }
     }
   }
-  // The destination an un-annotated list literal never had (D381) — see
-  // `letRefListDestSlot`. The local's cell and the literal's build read one answer.
-  const dsl = letRefListDestSlot(letIx, fnIx)
-  if dsl >= 0 { return dsl }
-  const rsl = letRecordListDestSlot(letIx, fnIx)
-  if rsl >= 0 { return rsl }
+  const ul = letInitUnionListTy(letIx, fnIx)
+  if ul >= 0 { return rlSlotOfTy(tyArrayElemIx(ul)) }
   letTailRowSlot(letIx, fnIx)
+}
+
+// The union list an un-annotated list literal binding is built at, where the checker stamped
+// its literal of records with one (D853); -1 otherwise.
+export function letInitUnionListTy(letIx: i32, fnIx: i32): i32 {
+  const d = nodeAt(letIx)
+  if !(d is LetDecl) { return -1 }
+  if d.letType >= 0 || d.letInit < 0 { return -1 }
+  const ai = unwrapParen(d.letInit)
+  if ai < 0 || !(nodeAt(ai) is ArrayLit) { return -1 }
+  const own = tyArrayElemIx(nodeTyIxOf(ai))
+  if own < 0 || !(tyAt(own) is TyObj) { return -1 }
+  const lt = nonNullTy(litRepTyAt(ai, fnIx))
+  const et = if lt >= 0 { tyArrayElemIx(lt) } else { -1 }
+  if et < 0 || !(tyAt(et) is TyUnion) { return -1 }
+  lt
 }
 
 // The row a `let` with no destination binds: for an un-annotated one, the initializer's
@@ -18076,98 +18065,6 @@ function letInitDeliversRow(ai: i32, et: i32, fnIx: i32): boolean {
   const t = tyAt(et)
   if t is TyFunc { return tyHasTyVar(et) }
   t is TyObj
-}
-
-// The record row a declared destination names for an un-annotated list of object literals
-// whose own elements would pick another row, or -1. The literal is built at the destination's
-// row so the one list both handles hold is the one the destination reads (D2881).
-export function letRecordListDestSlot(letIx: i32, fnIx: i32): i32 {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 || d.letInit < 0 { return -1 }
-    const ai = unwrapParen(d.letInit)
-    if ai < 0 { return -1 }
-    const ini = nodeAt(ai)
-    if ini is ArrayLit {
-      if ini.arrElems.length < 1 { return -1 }
-      const e0 = unwrapParen(ini.arrElems[0])
-      if e0 < 0 { return -1 }
-      if !objLitNamesTwoRows(e0) {
-        if rsIsBuiltRecord(e0) { rsBuiltElemRefuse(letIx, fnIx, ai) }
-        return -1
-      }
-      const own = arrLitRowSlotIn(ai, fnIx)
-      if !rlSlotIsKindList(own, RLK_STRUCT) { return -1 }
-      let dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
-      if dst < 0 { dst = rsElemListDestSlot(letIx, fnIx, own) }
-      if dst < 0 || dst == own { return -1 }
-      if rsRowsDiffer(dst, own) {
-        const built = rsFirstBuiltElem(ini.arrElems)
-        if built >= 0 { rsBuiltElemFail(built, dst) }
-        rsNarrowUseRefuse(letIx, fnIx, d.letName, dst)
-      }
-      return dst
-    }
-  }
-  -1
-}
-
-// A list literal led by an already-built record, bound where a declared destination names
-// another record of the same field names: its elements are that other row, and a record is
-// shared rather than converted, so no build of the list serves the destination (D2917).
-function rsBuiltElemRefuse(letIx: i32, fnIx: i32, ai: i32) {
-  const own = arrLitRowSlotIn(ai, fnIx)
-  if !rlSlotIsKindList(own, RLK_STRUCT) { return 0 }
-  if !structNamesTwoRows(rsSlotRow(own)) { return 0 }
-  const dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
-  if dst < 0 || !rsRowsDiffer(dst, own) { return 0 }
-  const ini = nodeAt(ai)
-  if ini is ArrayLit {
-    const built = rsFirstBuiltElem(ini.arrElems)
-    if built >= 0 { rsBuiltElemFail(built, dst) }
-  }
-  0
-}
-
-// A list re-seated at a destination's record row (D2881) is still typed with its own
-// elements' record, so a use that hands the list or an element on at that type delivers the
-// destination's row where the other is expected. The first such use is refused here rather
-// than built as an invalid module (D2914); `rsUseSafe` names the uses that convert.
-function rsNarrowUseRefuse(letIx: i32, fnIx: i32, nm: string, dst: i32) {
-  if !rsIxReady() { return 0 }
-  if letIx < 0 || letIx >= rsDoneLet.length { return 0 }
-  if rsDoneLet[letIx] != 0 { return 0 }
-  rsDoneLet[letIx] = 1
-  rsMemoTouched.push(letIx)
-  const scopeIx = dsScopeRootOf(letIx, nm, fnIx)
-  if scopeIx < 0 { return 0 }
-  const w: RsWalk = {
-    rwScope: scopeIx,
-    rwOwnLet: letIx,
-    rwName: nm,
-    rwElem: false,
-    rwRow: rsSlotRow(dst),
-    rwList: nm,
-    rwHome: rsFrameOf(letIx),
-    rwCall: false,
-  }
-  rsSibHit = -1
-  const bad = rsQuery(w)
-  if bad < 0 { return 0 }
-  if bad == rsSibHit { return rsBuiltElemFail(bad, dst) }
-  let elem = "the declared element"
-  if dst >= 0 && dst < rlElemName.length { elem = rlElemName[dst] }
-  emitFailAt(
-    "emitProgram: this list is built as `"
-      + elem
-      + "[]` for a declared destination, and is handed on here at its own element type; one "
-      + "list has one element storage and a record is shared, not converted, so the program "
-      + "is type-valid but cannot build. Declare the list as `"
-      + elem
-      + "[]`, or build a second literal for this use",
-    bad,
-  )
-  0
 }
 
 // The struct row an un-annotated binding of the object literal at `objIx` is built at, or -1
@@ -18327,70 +18224,10 @@ function rsElemDestTy(vx: i32): i32 {
   ty
 }
 
-// The record-list slot an un-annotated list of object literals is built at when no list
-// destination names one but an element is handed to a declared record of the literal's field
-// names (D2933), or -1. Such a list with no interned list of that record is refused.
-function rsElemListDestSlot(letIx: i32, fnIx: i32, own: i32): i32 {
-  if !rsIxReady() { return -1 }
-  if letIx < 0 || letIx >= rsLetDst.length { return -1 }
-  if rsLetDst[letIx] != -2 { return rsLetDst[letIx] }
-  rsLetDst[letIx] = -1
-  rsMemoTouched.push(letIx)
-  const r = rsElemListDestSlotGo(letIx, fnIx, own)
-  if letIx < rsLetDst.length {
-    rsLetDst[letIx] = r
-    rsMemoTouched.push(letIx)
-  }
-  r
-}
-
-function rsElemListDestSlotGo(letIx: i32, fnIx: i32, own: i32): i32 {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    const scopeIx = dsScopeRootOf(letIx, d.letName, fnIx)
-    if scopeIx < 0 { return -1 }
-    const w: RsWalk = {
-      rwScope: scopeIx,
-      rwOwnLet: letIx,
-      rwName: d.letName,
-      rwElem: false,
-      rwRow: rsSlotRow(own),
-      rwList: d.letName,
-      rwHome: rsFrameOf(letIx),
-      rwCall: false,
-    }
-    const bad = rsQuery(w)
-    if bad < 0 { return -1 }
-    const dty = rsElemDestTy(bad)
-    const drow = structIdxOfElemTy(dty)
-    if drow < 0 || rsSameRow(drow, w.rwRow) { return -1 }
-    const ai = unwrapParen(d.letInit)
-    if ai < 0 || ai >= P.nodes.length { return -1 }
-    const ini = nodeAt(ai)
-    if ini is ArrayLit {
-      if ini.arrElems.length < 1 { return -1 }
-      const e0 = unwrapParen(ini.arrElems[0])
-      if e0 < 0 || !rsRowNamesObjLit(drow, e0) { return -1 }
-    }
-    const slot = rlSlotOfTy(dty)
-    if rlSlotIsKindList(slot, RLK_STRUCT) && rsSameRow(rsSlotRow(slot), drow) {
-      return slot
-    }
-    emitFailAt(
-      "emitProgram: an element of this list is handed on here to a record type of the same "
-        + "field names that stores them differently, and the list is built at its own "
-        + "element type; a record is shared, not converted, so the program is type-valid but "
-        + "cannot build. Declare the list with this use's element type",
-      bad,
-    )
-  }
-  -1
-}
-
 // The use index `rsUsesOf` reads, built once per final arena like `dsgReady`'s: each node's first
 // parent from the root and its function, each identifier chained by name program-wide and within
-// its function, and each function's nested ones. `rsDoneLet` is 1 at a binding already asked;
-// `rsMemoTouched` and `rsRetTouched` name the per-binding and per-function entries written.
+// its function, and each function's nested ones. `rsRetTouched` names the per-function entries
+// written.
 let rsIxRoot: i32 = -1
 // The walk's identifiers and their names in visit order; `rsOccEnsure` links the chains from
 // them at the first query, so an index no query reads costs only its walk.
@@ -18399,7 +18236,6 @@ let rsIdentNames: string[] = []
 let rsOccReady = false
 let rsIxLen: i32 = -1
 let rsIxEpoch: i32 = -1
-let rsMemoTouched: i32[] = []
 let rsRetTouched: i32[] = []
 let rsPar: i32[] = []
 let rsFrame: i32[] = []
@@ -18409,11 +18245,9 @@ let rsFnOccNext: i32[] = []
 let rsFnOccHead: {[string]: i32} = Map()
 let rsFnKidHead: i32[] = []
 let rsFnKidNext: i32[] = []
-let rsDoneLet: i32[] = []
 let rsRecRow: i32[] = []
 let rsRecTouched: i32[] = []
 let rsRecVer: i32 = -1
-let rsLetDst: i32[] = []
 let rsRetSeenE: i32[] = []
 let rsRetSeenL: i32[] = []
 // Drops the use index, beside the global-destination index it mirrors.
@@ -18424,7 +18258,6 @@ export function rsResetUseIx() {
   rsOccReady = false
   rsIxLen = -1
   rsIxEpoch = -1
-  rsMemoTouched = []
   rsRetTouched = []
   rsPar = []
   rsFrame = []
@@ -18434,11 +18267,9 @@ export function rsResetUseIx() {
   rsFnOccHead = Map()
   rsFnKidHead = []
   rsFnKidNext = []
-  rsDoneLet = []
   rsRecRow = []
   rsRecTouched = []
   rsRecVer = -1
-  rsLetDst = []
   rsRetSeenE = []
   rsRetSeenL = []
   0
@@ -18464,8 +18295,6 @@ function rsIxReady(): boolean {
   rsFnOccNext = __array_new__(n, -1)
   rsFnKidHead = __array_new__(n, -1)
   rsFnKidNext = __array_new__(n, -1)
-  rsDoneLet = __array_new__(n, 0)
-  rsLetDst = __array_new__(n, -2)
   rsRetSeenE = __array_new__(n, -1)
   rsRetSeenL = __array_new__(n, -1)
   const stack: i32[] = [emitRootIx]
@@ -18524,19 +18353,9 @@ function rsOccEnsure() {
 
 // Extend the index over an arena that only grew (D3740): with no slot rewritten, no node the root
 // reaches leads to an appended one except a late annotation pin, which no query starts at or
-// climbs through. The per-binding answers are dropped as a rebuild drops them.
+// climbs through. The per-function answers are dropped as a rebuild drops them.
 function rsIxGrow(): boolean {
   let i = 0
-  while i < rsMemoTouched.length {
-    const x = rsMemoTouched[i]
-    if x >= 0 && x < rsDoneLet.length && x < rsLetDst.length {
-      rsDoneLet[x] = 0
-      rsLetDst[x] = -2
-    }
-    i = i + 1
-  }
-  rsMemoTouched = []
-  i = 0
   while i < rsRetTouched.length {
     const f = rsRetTouched[i]
     if f >= 0 && f < rsRetSeenE.length && f < rsRetSeenL.length {
@@ -18557,8 +18376,6 @@ function rsIxGrow(): boolean {
     rsFnOccNext.push(-1)
     rsFnKidHead.push(-1)
     rsFnKidNext.push(-1)
-    rsDoneLet.push(0)
-    rsLetDst.push(-2)
     rsRetSeenE.push(-1)
     rsRetSeenL.push(-1)
     k = k + 1
@@ -19070,322 +18887,8 @@ function rsElemAssignSafe(vx: i32, x: string, fr: i32, w: RsWalk): i32 {
   -1
 }
 
-// The ref-list slot the binding's declared destination names, or -1. An un-annotated list
-// literal types itself from its own elements with no lookahead, so binding it into a
-// declared union-element destination leaves two list types for one list at `vl check` rc 0;
-// only the destination can settle it. Kind 2 only — a kind-1 destination is a different question. D381.
-export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
-  const box = letRefListDestSlotK(letIx, fnIx, 2)
-  // Two destinations of different element kinds are a loud reject, not a slot pick (D411):
-  // a list value has one element rep, so whichever slot wins the other store mismatches.
-  if box >= 0 {
-    const k1 = letRefListDestSlotK(letIx, fnIx, 1)
-    if k1 >= 0 {
-      // The answer the earlier refusal didn't have: build at the plain-struct row and let the
-      // union-box destination take a copy, gated on the write scan against exactly that risk. D791.
-      if rlWidenAllowed(letBoundName(letIx), covarDeclFrame(letIx), k1, box) {
-        return k1
-      }
-      emitFailAt(
-        "emitProgram: one un-annotated list literal is bound to TWO declared destinations "
-          + "whose elements are stored differently (a union-box element list and a "
-          + "plain-struct element list); a list value has one element storage, so annotate "
-          + "the literal at the type it must be, or build a second literal for the second "
-          + "destination",
-        letIx,
-      )
-    }
-  }
-  box
-}
-
-// The kind-parameterised scan (D411). `want` 2 is the union box; `want` 1 is the plain
-// struct-row element list, asked by the conflict detector above and by
-// `letRecordListDestSlot`, which re-seats a literal whose own row differs (D2881).
-export function letRefListDestSlotK(letIx: i32, fnIx: i32, want: i32): i32 {
-  // O(1) necessary condition keeping the O(arena) scan off most programs: a module declaring
-  // no union has no union-box row.
-  if want == RLK_UNION && !uDeclared { return -1 }
-  if letIx < 0 { return -1 }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    // An annotated binding already names its own slot, and a passthrough init names the
-    // slot it copies — only a literal has an element inference for a destination to correct.
-    if d.letType >= 0 { return -1 }
-    if d.letInit < 0 { return -1 }
-    const ini = nodeAt(unwrapParen(d.letInit))
-    if ini is ArrayLit {
-      // An EMPTY `[]` is already destination-typed through `ExpCtx.listKind` /
-      // `emptyArrHoleKind`; it has no element inference to correct.
-      if ini.arrElems.length < 1 { return -1 }
-    } else {
-      return -1
-    }
-    const nm = d.letName
-    // The binding's own scope (D661): a name-matched whole-arena scan reads two same-named
-    // bindings in different scopes as one with two destinations, and wrongly refuses both.
-    const scopeIx = dsScopeRootOf(letIx, nm, fnIx)
-    if scopeIx >= 0 {
-      // A global's scope is the whole program, and the walk re-reads every function body once
-      // per binding; `dsgDestSlot` answers all of them off one pass over the same nodes.
-      if scopeIx == emitRootIx && dsgReady() {
-        return dsgDestSlot(nm, fnIx, want)
-      }
-      return dsScopeWalk(scopeIx, scopeIx, letIx, nm, fnIx, want)
-    }
-    let i = 0
-    while i < P.nodes.length {
-      const rs = dsDestSlotAt(i, nm, fnIx, want)
-      if rs >= 0 { return rs }
-      i = i + 1
-    }
-  }
-  -1
-}
-
-// The seven destination forms, asked of one arena node — `letRefListDestSlotK`'s loop body,
-// lifted so the scoped walk, the whole-arena fallback and the global index ask one question.
-// A form added here that reads its name deeper than `dsgNoteChild` looks is invisible at a
-// `Program` root, where `dsgDestSlot` chooses which nodes this is asked of.
-function dsDestSlotAt(i: i32, nm: string, fnIx: i32, want: i32): i32 {
-  const nd = nodeAt(i)
-  match nd {
-    LetDecl => {
-      if nd.letType >= 0 && nd.letInit >= 0 {
-        const dini = nodeAt(unwrapParen(nd.letInit))
-        // (a) `const c: Shape[] = nm`
-        if dini is Ident {
-          if dini.identName == nm {
-            const rs = letAnnDestKindListSlot(i, want)
-            if rs >= 0 { return rs }
-          }
-        }
-        // (b) `const c: Shape[][] = [nm]` — the annotation's ref-list element is
-        // itself a ref list (kind 9); its INNER slot is the one this binding must be.
-        if dini is ArrayLit {
-          let ei = 0
-          while ei < dini.arrElems.length {
-            const el = nodeAt(unwrapParen(dini.arrElems[ei]))
-            if el is Ident {
-              if el.identName == nm {
-                const iv = rlInnerKindListSlot(letAnnRefListSlot(i), want)
-                if iv >= 0 { return iv }
-              }
-            }
-            ei = ei + 1
-          }
-        }
-        // (f) `const w: W = { f: nm }` — the declared struct FIELD.
-        if dini is ObjLit {
-          const dsi = letAnnStructIdx(i)
-          if dsi >= 0 {
-            let fj = 0
-            while fj < dini.objFields.length {
-              const ff = nodeAt(dini.objFields[fj])
-              if ff is FieldInit {
-                const fv = nodeAt(unwrapParen(ff.fiValue))
-                if fv is Ident {
-                  if fv.identName == nm {
-                    const fi2 = sFieldIndex(dsi, ff.fiName)
-                    if fi2 >= 0 {
-                      const rs = sFieldRefSlot(dsi, fi2)
-                      if rlSlotIsKindList(rs, want) { return rs }
-                    }
-                  }
-                }
-              }
-              fj = fj + 1
-            }
-          }
-        }
-      }
-    }
-    // `c[k] = nm` over a declared `{[string]: Shape[]}` — the map value's own ref-list slot.
-    BinExpr => {
-      if nd.binOp == "=" {
-        const rhs = nodeAt(unwrapParen(nd.binRight))
-        if rhs is Ident {
-          if rhs.identName == nm {
-            const lhs = nodeAt(unwrapParen(nd.binLeft))
-            if lhs is Index {
-              const mapN = nodeAt(unwrapParen(lhs.idxArr))
-              if mapN is Ident {
-                const iv = mapValKindListSlot(mapN.identName, fnIx, want)
-                if iv >= 0 { return iv }
-              }
-            }
-            // `c = nm` — the assignment into an already-declared binding, which form (a)
-            // cannot see: the destination's annotation is on a `LetDecl` with its own init.
-            if lhs is Ident {
-              const li = destLetOf(lhs.identName, fnIx)
-              if li >= 0 {
-                const rs = letAnnDestKindListSlot(li, want)
-                if rs >= 0 { return rs }
-              }
-            }
-          }
-        }
-      }
-    }
-    // (d) `take(nm)` into a `take(c: Shape[])` parameter, or a lambda's `k(nm)`. The callee's
-    // checked function type answers first: it has already resolved a shadowing parameter, an
-    // alias of an alias and a field callee, none of which a name can (D2704).
-    Call => {
-      const cft = nodeTyAt(nd.callFn, fnIx)
-      if cft >= 0 && cft < T.tys.length && tyAt(cft) is TyFunc {
-        let ti = 0
-        while ti < nd.callArgs.length {
-          const targ = nodeAt(unwrapParen(nd.callArgs[ti]))
-          if targ is Ident {
-            if targ.identName == nm {
-              const ts = fnTyParamKindListSlot(cft, ti, want)
-              if ts >= 0 { return ts }
-            }
-          }
-          ti = ti + 1
-        }
-        return -1
-      }
-      if nd.callFn < 0 { return -1 }
-      const callee = nodeAt(nd.callFn)
-      if callee is Ident {
-        let ai = 0
-        while ai < nd.callArgs.length {
-          const arg = nodeAt(unwrapParen(nd.callArgs[ai]))
-          if arg is Ident {
-            if arg.identName == nm {
-              // A binding in scope shadows a top-level function of its name, so it is asked first.
-              const bs = dsCalleeParamSlot(callee.identName, i, fnIx, ai, want)
-              if bs >= 0 { return bs }
-              if bs == DS_CALLEE_UNBOUND {
-                const rs = fnParamKindListSlot(callee.identName, ai, want)
-                if rs >= 0 { return rs }
-              }
-            }
-          }
-          ai = ai + 1
-        }
-      }
-    }
-    // `return nm` from a function whose return annotation is a box list — the annotation comes
-    // from the enclosing function (`fnIx`), not the scan.
-    RetStmt => {
-      if nd.retArg >= 0 {
-        const rv = nodeAt(unwrapParen(nd.retArg))
-        if rv is Ident {
-          if rv.identName == nm {
-            if fnIx >= 0 {
-              const fnd = nodeAt(fnIx)
-              if fnd is FuncDecl {
-                if tyAnnRefListKind(fnd.fnRet) == want {
-                  const rs = tyAnnRefListSlot(fnd.fnRet)
-                  if rlSlotIsKindList(rs, want) { return rs }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    // No other node is a destructuring destination slot.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
-  }
-  -1
-}
-
-// The scoped destination walk (D661): `alcWalk`'s shape, but descends into a nested function
-// (unless it rebinds the name), since a capturing nested function is part of the binding's
-// scope. The frame threaded down is the destination's, not the binding's (D661A) — three of
-// `dsDestSlotAt`'s seven forms read `fnIx` themselves and would otherwise ask the wrong function.
-function dsScopeWalk(
-  ix: i32,
-  scopeIx: i32,
-  ownLet: i32,
-  nm: string,
-  fnIx: i32,
-  want: i32,
-): i32 {
-  if ix < 0 || ix >= P.nodes.length { return -1 }
-  const n = nodeAt(ix)
-  let frame = fnIx
-  if ix != scopeIx {
-    if n is FuncDecl {
-      if dsRebindsName(ix, nm) { return -1 }
-      frame = ix
-    }
-    if n is Block {
-      return dsBlockWalk(n.blkStmts, scopeIx, ownLet, nm, frame, want)
-    }
-  }
-  const here = dsDestSlotAt(ix, nm, frame, want)
-  if here >= 0 { return here }
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-  let cur = ix
-  while cur >= 0 {
-    if cur != ix {
-      const linkHere = dsDestSlotAt(cur, nm, frame, want)
-      if linkHere >= 0 { return linkHere }
-    }
-    const kids = nodeSpineChildren(cur)
-    let k = 0
-    while k < kids.length {
-      const rs = dsScopeWalk(kids[k], scopeIx, ownLet, nm, frame, want)
-      if rs >= 0 { return rs }
-      k = k + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  -1
-}
-
-// `dsScopeWalk` over a nested block's statements, up to a `let` other than `ownLet` that
-// rebinds `nm`: the statements after it read that binding, and only its initializer reads
-// this one (D2704).
-function dsBlockWalk(
-  stmts: i32[],
-  scopeIx: i32,
-  ownLet: i32,
-  nm: string,
-  fnIx: i32,
-  want: i32,
-): i32 {
-  let k = 0
-  while k < stmts.length {
-    const st = nodeAt(stmts[k])
-    if st is LetDecl {
-      if st.letName == nm && stmts[k] != ownLet {
-        return dsScopeWalk(st.letInit, scopeIx, ownLet, nm, fnIx, want)
-      }
-    }
-    const rs = dsScopeWalk(stmts[k], scopeIx, ownLet, nm, fnIx, want)
-    if rs >= 0 { return rs }
-    k = k + 1
-  }
-  -1
-}
-
-// The slot `dsScopeWalk` would reach first for the global `nm`, read off the index. The same
-// reader in the same order over a superset of the nodes that can answer it, so the two agree
-// by construction; a row's -1 frame takes the asking call's own.
-function dsgDestSlot(nm: string, fnIx: i32, want: i32): i32 {
-  let r = sidArrGet(dsgHead, sidOf(nm))
-  while r >= 0 {
-    let frame = dsgFrame[r]
-    if frame < 0 { frame = fnIx }
-    // The stamp pins the arena a row names, so this bound holds; read it anyway, because a
-    // stamp that stopped holding would be a compiler trap rather than a wrong slot.
-    const nd = dsgNode[r]
-    if nd >= 0 && nd < P.nodes.length {
-      const rs = dsDestSlotAt(nd, nm, frame, want)
-      if rs >= 0 { return rs }
-    }
-    r = dsgNext[r]
-  }
-  -1
-}
-
 // The ref-list slot of element kind `want` that a `LetDecl`'s annotation names, or -1 —
-// the destination test forms (a), (b) and (g) of `letRefListDestSlot` all reduce to it.
+// the annotated-destination test the record-list rows reduce to.
 function letAnnDestKindListSlot(letIx: i32, want: i32): i32 {
   if letAnnRefListKind(letIx) != want { return -1 }
   const rs = letAnnRefListSlot(letIx)

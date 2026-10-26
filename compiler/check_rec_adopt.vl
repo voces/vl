@@ -14,10 +14,17 @@ import {
   recAdOrigFn,
   recAdOrigName,
   recAdOrigTy,
+  recAdOwn,
   recAdPinDecl,
   recAdPinSpell,
   recAdPinTy,
   recAdRaising,
+  recAdSetAt,
+  recAdSetDecl,
+  recAdSetDst,
+  recAdSetElem,
+  recAdSetGrp,
+  recAdSetWhole,
   recAdWhole,
 } from "./check_rec_adopt_rows"
 import {
@@ -41,30 +48,87 @@ import {
   objFieldType,
   tyAt,
   tyNomNameCycled,
+  tySame,
   tyToNominalName,
   tyToStr,
 } from "./check_types"
 import { i32ListHas } from "./listutil"
 
+// Move each settled delivery into the demands unless a binding it closes is closed at another
+// record by some call: then no delivery of either call adopts, the bindings stay open, and each
+// instance reads them at its own type.
+function recAdSettle() {
+  const bad: {[i32]: boolean} = Map()
+  let changed = true
+  while changed {
+    changed = false
+    let i = 0
+    while i < recAdSetDecl.length {
+      let j = i + 1
+      while j < recAdSetDecl.length {
+        if recAdSetDecl[i] == recAdSetDecl[j] {
+          const bi = bad.has(recAdSetGrp[i])
+          const bj = bad.has(recAdSetGrp[j])
+          const differ = recAdSetElem[i] != recAdSetElem[j]
+            || !fieldStorageEq(
+            recAdSetDst[i],
+            recAdSetDst[j],
+            REC_STORE_DEPTH,
+          )
+          const wi = recAdSetWhole[i]
+          const wj = recAdSetWhole[j]
+          const wDiffer = (wi < 0) != (wj < 0)
+            || wi >= 0 && !fieldStorageEq(wi, wj, REC_STORE_DEPTH)
+          if (differ || wDiffer || bi || bj) && !(bi && bj) {
+            bad[recAdSetGrp[i]] = true
+            bad[recAdSetGrp[j]] = true
+            changed = true
+          }
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+  }
+  let k = 0
+  while k < recAdSetDecl.length {
+    if !bad.has(recAdSetGrp[k]) {
+      recAdDecl.push(recAdSetDecl[k])
+      recAdOwn.push(recAdSetDst[k])
+      recAdDst.push(recAdSetDst[k])
+      recAdElem.push(recAdSetElem[k])
+      recAdWhole.push(recAdSetWhole[k])
+      recAdAt.push(recAdSetAt[k])
+    }
+    k = k + 1
+  }
+  0
+}
+
 // Decide each binding's type: the one record every demand shares a storage with, or a refusal
 // naming two that disagree. A binding delivered both whole and by element takes one list type.
 export function recAdSolve() {
+  recAdSettle()
   let i = 0
   while i < recAdDecl.length {
     const decl = recAdDecl[i]
     if !i32ListHas(recAdPinDecl, decl) && !pinRefusedAt("recAd", decl) {
       let bad = -1
-      let j = i + 1
+      let j = 0
       while j < recAdDecl.length && bad < 0 {
-        if recAdDecl[j] == decl {
-          if !fieldStorageEq(recAdDst[i], recAdDst[j], REC_STORE_DEPTH) {
-            bad = j
-          }
-        }
+        if j != i && recAdDecl[j] == decl && !recAdDstAgree(i, j) { bad = j }
         j = j + 1
       }
       if bad >= 0 {
-        if nodeAt(decl) is LetDecl { recAdConflict(decl, i, bad) }
+        // A union list adopted two ways is no adoption: each delivery is a copy.
+        if (
+          nodeAt(decl) is LetDecl
+          && bad > i
+          && !recAdUnionDst(i)
+          && !recAdUnionDst(bad)
+        ) {
+          recAdConflict(decl, i, bad)
+        }
       } else {
         let ann = tyToStr(recAdDst[i])
         let spell = recAdSpell(recAdDst[i], ann)
@@ -84,6 +148,16 @@ export function recAdSolve() {
   }
   0
 }
+
+// Whether demands `i` and `j` adopt one type: a union list only itself, records by storage.
+function recAdDstAgree(i: i32, j: i32): boolean {
+  if recAdUnionDst(i) || recAdUnionDst(j) {
+    return tySame(recAdDst[i], recAdDst[j])
+  }
+  fieldStorageEq(recAdDst[i], recAdDst[j], REC_STORE_DEPTH)
+}
+
+function recAdUnionDst(i: i32): boolean { tyAt(recAdDst[i]) is TyUnion }
 
 // A binding whose adoption a re-check undid is built at `dst` and keeps its own type. Where
 // `dst` keeps two of a union field's numbers as one, no read at that type can tell which it
