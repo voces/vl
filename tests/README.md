@@ -23,6 +23,7 @@ of each row, backticked, `*` = any run of characters).
 | `lsp_*_test.ts` | Editor features (hover, completion, rename, inlay hints, semantic tokens) | `lsp suites (ci list)` for the seed-backed ones, else `deno task test` | `checks`, "Editor features on the wasm compiler", else `ci` |
 | `playground_*_test.ts` | The browser playground's LSP, completion, trap frames and theme | as `lsp_*` | as `lsp_*` |
 | `ci_*_test.ts` | The CI wiring itself: shard partition, seed-backed coverage of ci.yml's lists, the docs-only doc-reader list, which jobs a queue-gated push may skip | `deno task test` | `ci` |
+| `roadmap_*_test.ts` | `ROADMAP.md` and `docs/roadmap/` stay an index of open work: no closed `D<id>`, no done marker, no effort estimate, no broken link. Reads files only | `deno task test` | `ci`, and its docs-only step |
 | `cli_*_test.ts`, `budget_*_test.ts`, `keyword_*_test.ts`, `module_*_test.ts`, `std_*_test.ts`, `tests_*_test.ts` | Single-file cross-checks of one table or one vocabulary against its twin (CLI vs host, budget targets, keywords, module gate, embedded std, this index) | `deno task test` | `ci` |
 
 `deno task test` (`deno.json`) runs every file in `tests/` that the other rows do not claim.
