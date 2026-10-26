@@ -85,9 +85,8 @@ import {
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { cwFnValueDeclOf } from "./check_write_scan"
-import { recSolePinArg } from "./check_record_origins"
-import { recFnDeclByName } from "./check_scopes"
-import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
+import { tyLeavesDisjoint } from "./check_type_shape"
+import { REC_REBUILT_DEPTH, recRebuiltRetRow } from "./check_bind_adopt"
 import { inferRetFnKey } from "./check_side_rows"
 import { recordClonedCallRetire } from "./check_asg_rows"
 import {
@@ -582,8 +581,10 @@ import {
 import {
   elabAliasNote,
   elabBodyDeclNote,
+  elabCallInstWant,
   elabCallParamTy,
   elabDemand,
+  elabInstSpelling,
   elabKeyAt,
   elabRetOf,
   elabSlotNote,
@@ -2290,55 +2291,9 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
 // or an argument-free call of a function answering here, and all share that row, else "". The
 // checked result still names the literal's own type, which is not the build (D8020, D8202).
 function monoRebuiltLitRetName(fd: i32): string {
-  const row = monoRebuiltLitRetRow(fd, MONO_REBUILT_DEPTH)
+  const row = recRebuiltRetRow(fd, REC_REBUILT_DEPTH)
   if row < 0 { return "" }
   monoRetRowName(row)
-}
-
-const MONO_REBUILT_DEPTH = 8
-
-// `monoRebuiltLitRetName`'s row, or -1.
-function monoRebuiltLitRetRow(fd: i32, depth: i32): i32 {
-  let row = -1
-  for lf in recFnValueLeaves(fd) {
-    const rt = monoRebuiltLeafRow(lf, depth)
-    if rt < 0 || (row >= 0 && rt != row) { return -1 }
-    row = rt
-  }
-  row
-}
-
-// The row value `lf` is built at when it is a rebuilt literal, an identity over one, or an
-// argument-free call of an inferred function whose results are; -1 otherwise.
-function monoRebuiltLeafRow(lf: i32, depth: i32): i32 {
-  const lp = unwrapParen(lf)
-  if lp < 0 || lp >= P.nodes.length || depth <= 0 { return -1 }
-  const n = nodeAt(lp)
-  if n is ObjLit {
-    const rt = nodeRepTyIxOf(lp)
-    if rt < 0 || rt == nodeTyIxOf(lp) || !(tyAt(rt) is TyObj) { return -1 }
-    return rt
-  }
-  const sp = recSolePinArg(lp)
-  if sp >= 0 { return monoRebuiltLeafRow(sp, depth - 1) }
-  if (
-    n is Call
-    && n.callArgs.length == 0
-    && n.callFn >= 0
-    && n.callFn < P.nodes.length
-  ) {
-    const cn = nodeAt(n.callFn)
-    if cn is Ident {
-      const cd = recFnDeclByName(cn.identName)
-      if cd >= 0 && cd < P.nodes.length {
-        const f = nodeAt(cd)
-        if f is FuncDecl && f.fnRet < 0 && f.fnTyParams.length == 0 {
-          return monoRebuiltLitRetRow(cd, depth - 1)
-        }
-      }
-    }
-  }
-  -1
 }
 
 // The binding rungs of `monoArgTyName`: a call argument's callee return, then an `Ident`
@@ -11231,6 +11186,27 @@ function monoSigPinHeadTy(pin: string, t: i32): i32 {
 // Typed instance key → the registry key of the instance first minted under it.
 let monoTypedKeys: {[string]: string} = Map()
 
+// Registry key → the instance its function is elaborated at, and its parameter pins.
+let monoKeyEk: {[string]: i32} = Map()
+let monoKeyPins: {[string]: i32[]} = Map()
+
+// `key`, or `key` marked with the elaboration template call `call` is answered with when the
+// function registered under `key` is elaborated otherwise: two calls share one emitted function
+// only when their reps and their elaborations agree.
+function monoElabSplitKey(key: string, origFe: i32, call: i32): string {
+  const ek = monoKeyEk[key] ?? -1
+  if ek < 0 || call < 0 { return key }
+  const want = elabCallInstWant(
+    monoOrigNode[origFe],
+    call,
+    monoKeyPins[key] ?? [],
+  )
+  if want < 0 { return key }
+  const ws = elabInstSpelling(want)
+  if ws == elabInstSpelling(ek) { return key }
+  key + "~" + ws
+}
+
 // Instance fe → its parameters' types as the clone resolved them (`monoMakeInstanceLetTyCol`).
 let monoInstParamTyCol: {[i32]: i32[]} = Map()
 
@@ -11349,6 +11325,9 @@ function monoMakeInstanceGo(
     )
     // arena-tick exempt: a fresh instance key record, read by the registry, never by a pass.
     if retWiden != "" { k.key = k.key + "=>" + retWiden }
+    const tplCall = if makeCall >= 0 { monoCallTplOf(makeCall) } else { -1 }
+    // arena-tick exempt: the same fresh key record, marked per elaboration for the registry.
+    k.key = monoElabSplitKey(k.key, origFe, tplCall)
     monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
     if (
@@ -11387,7 +11366,10 @@ function monoMakeInstanceGo(
     // dropping the clone's staged writes.
     const typedKey = monoTypedInstKey(k, pinned, pinKinds, pinTys, pinnedTyIx)
     const typedHit = monoTypedKeys.get(typedKey) ?? ""
-    if typedHit != "" {
+    if (
+      typedHit != ""
+      && monoElabSplitKey(typedHit, origFe, tplCall) == typedHit
+    ) {
       monoShPendFlush(shAt, [], [], [], [])
       if (
         monoMakeInstanceHit(
@@ -11435,8 +11417,7 @@ function monoMakeInstanceGo(
     const ekN: string[] = []
     const ekT: i32[] = []
     monoJoinBinding(ekN0, ekT0, k.exSubN, k.exSubT, ekN, ekT)
-    const ekCall = if makeCall >= 0 { monoCallTplOf(makeCall) } else { -1 }
-    const ek = elabDemand(monoOrigNode[origFe], ekN, ekT, pinnedTyIx, ekCall)
+    const ek = elabDemand(monoOrigNode[origFe], ekN, ekT, pinnedTyIx, tplCall)
     // Everything this build mints is demanded under this instance.
     elabWalkPush(ek)
     if makeCall >= 0 && makeCall == monoOpenLamOwner {
@@ -11527,6 +11508,9 @@ function monoMakeInstanceGo(
       holeT,
     )
     elabSlotNote(instFe, ek)
+    // arena-tick exempt: read only by monoElabSplitKey, never by the four rebuild passes
+    monoKeyEk[k.key] = ek
+    monoKeyPins[k.key] = pinnedTyIx
     monoNoteOpenArgs(calleeIx, instFe)
     if monoRebuild() < 0 { return elabWalkPop() - 1 }
     const walked = monoMakeInstanceWalk(fn, origFe, nfn, calleeIx, lamClones)
@@ -27574,6 +27558,8 @@ export function monomorphize(stmts: i32[]) {
   fnPosIndexDrop()
   monoKeys = []
   monoTypedKeys = Map()
+  monoKeyEk = Map()
+  monoKeyPins = Map()
   monoInstParamTyCol = Map()
   monoInstOrig = []
   monoInstName = []

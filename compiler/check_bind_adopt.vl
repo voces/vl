@@ -1,0 +1,142 @@
+// A generic call's bind row taken at the record its argument is built at. Where record adoption
+// builds an argument at its delivery's record rather than at its own type, each type variable
+// that argument alone bound takes the delivered record, so the call's instance is the one the
+// argument is built at and the emitter reads it rather than re-deriving it (D8202).
+import { Call, FuncDecl, Ident, ObjLit, P, nodeAt } from "./ast"
+import {
+  callBindCount,
+  callBindIxAt,
+  callBindNamesAt,
+  callBindTysAt,
+  callBindTysSet,
+} from "./check_bind_rows"
+import { nodeRepTyIxOf } from "./check_core_state"
+import { elabCallDeclOf } from "./check_elab_cap"
+import { nodeTyIxOf } from "./check_node_tys"
+import { parenPeelIx } from "./check_places"
+import { recSolePinArg } from "./check_record_origins"
+import { assignable, bindGenWalk } from "./check_relate_core"
+import { recFnDeclByName } from "./check_scopes"
+import { recFnValueLeaves } from "./check_type_shape"
+import { T, TyFunc, TyObj, tyAt, tyHasHole, tySame } from "./check_types"
+
+// How many sole-pin identities and argument-free calls a rebuilt literal is followed through.
+export const REC_REBUILT_DEPTH = 8
+
+// Re-keys every bind row at its arguments' adopted records. Run once the check has settled.
+export function callBindAdoptRekey() {
+  let r = 0
+  const n = callBindCount()
+  while r < n {
+    const tys = cbaRow(callBindIxAt(r), callBindNamesAt(r), callBindTysAt(r))
+    if tys.length > 0 { callBindTysSet(r, tys) }
+    r = r + 1
+  }
+  0
+}
+
+// Row `names`/`tys0` of call `ix` with each name an argument alone bound replaced by what it
+// binds at the argument's adopted record, when that is closed and takes the old binding; [] when
+// nothing changes.
+function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
+  if ix < 0 || ix >= P.nodes.length { return [] }
+  const cn = nodeAt(ix)
+  const decl = elabCallDeclOf(ix)
+  if !(cn is Call) || decl < 0 || decl >= P.nodes.length { return [] }
+  const sig = nodeTyIxOf(decl)
+  if sig < 0 || sig >= T.tys.length { return [] }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || f.fnParamTypes.length != cn.callArgs.length { return [] }
+  const tys: i32[] = []
+  let moved = false
+  for t in tys0 { tys.push(t) }
+  let i = 0
+  while i < cn.callArgs.length {
+    const a = cn.callArgs[i]
+    const own = nodeTyIxOf(a)
+    let rt = nodeRepTyIxOf(a)
+    if rt == own { rt = recRebuiltLeafRow(a, REC_REBUILT_DEPTH) }
+    if rt >= 0 && rt != own && rt < T.tys.length && tyAt(rt) is TyObj {
+      const dN: string[] = []
+      const dT: i32[] = []
+      bindGenWalk(f.fnParamTypes[i], rt, dN, dT)
+      const oN: string[] = []
+      const oT: i32[] = []
+      bindGenWalk(f.fnParamTypes[i], own, oN, oT)
+      let j = 0
+      while j < dN.length {
+        let q = 0
+        while q < names.length {
+          if (
+            names[q] == dN[j]
+            && cbaBoundTo(oN, oT, dN[j], tys0[q])
+            && !tyHasHole(dT[j])
+            && assignable(tys0[q], dT[j])
+          ) {
+            tys[q] = dT[j]
+            moved = true
+          }
+          q = q + 1
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  if moved { tys } else { [] }
+}
+
+// Whether `oN`/`oT` binds `name` to `cur`: the binding came from this argument's own type.
+function cbaBoundTo(oN: string[], oT: i32[], name: string, cur: i32): boolean {
+  let i = 0
+  while i < oN.length {
+    if oN[i] == name { return oT[i] == cur || tySame(oT[i], cur) }
+    i = i + 1
+  }
+  false
+}
+
+// The record an inferred-result function's values are all built at, where each is a rebuilt
+// literal, a sole-pin identity over one, or an argument-free call of such a function; else -1.
+export function recRebuiltRetRow(fd: i32, depth: i32): i32 {
+  let row = -1
+  for lf in recFnValueLeaves(fd) {
+    const rt = recRebuiltLeafRow(lf, depth)
+    if rt < 0 || (row >= 0 && rt != row) { return -1 }
+    row = rt
+  }
+  row
+}
+
+// The record value `lf` is built at when it is an object literal adopted at another record, an
+// identity over one, or an argument-free call of an inferred function whose results are; else -1.
+export function recRebuiltLeafRow(lf: i32, depth: i32): i32 {
+  const lp = parenPeelIx(lf)
+  if lp < 0 || lp >= P.nodes.length || depth <= 0 { return -1 }
+  const n = nodeAt(lp)
+  if n is ObjLit {
+    const rt = nodeRepTyIxOf(lp)
+    if rt < 0 || rt == nodeTyIxOf(lp) || !(tyAt(rt) is TyObj) { return -1 }
+    return rt
+  }
+  const sp = recSolePinArg(lp)
+  if sp >= 0 { return recRebuiltLeafRow(sp, depth - 1) }
+  if (
+    n is Call
+    && n.callArgs.length == 0
+    && n.callFn >= 0
+    && n.callFn < P.nodes.length
+  ) {
+    const cn = nodeAt(n.callFn)
+    if cn is Ident {
+      const cd = recFnDeclByName(cn.identName)
+      if cd >= 0 && cd < P.nodes.length {
+        const f = nodeAt(cd)
+        if f is FuncDecl && f.fnRet < 0 && f.fnTyParams.length == 0 {
+          return recRebuiltRetRow(cd, depth - 1)
+        }
+      }
+    }
+  }
+  -1
+}

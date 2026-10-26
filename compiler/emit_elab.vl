@@ -47,7 +47,12 @@ import { holePinHeldSet } from "./check_hole_pins"
 import { njFnIx, njFnIxSet } from "./check_nj_join"
 import { nodeTyIxOf } from "./check_node_tys"
 import { nodeRepTyIx, nodeRepTyIxOf } from "./check_core_state"
-import { bindGenWalk, substTyDeep, widenLitTy } from "./check_relate_core"
+import {
+  assignable,
+  bindGenWalk,
+  substTyDeep,
+  widenLitTy,
+} from "./check_relate_core"
 import { pushScope } from "./check_narrow_paths"
 import { popScope } from "./check_narrow_flow"
 import {
@@ -65,6 +70,7 @@ import {
   TyUnion,
   TyVar,
   tyAt,
+  tyHasHole,
   tyMentionsTyVarNamed,
   tyToStructStr,
 } from "./check_types"
@@ -430,9 +436,10 @@ export function elabDemand(
   elabDemandFrom(decl0, names0, tys0, pTys, top, call)
 }
 
-// `elabDemand` under instance `from` (the root when -1) for template call `call` (-1 for none).
-// A parameter the call's own instance binds to a function value its body reaches at two instances
-// keeps that `Fn#d` binding: no one closed type holds it, and a closed pin is only its rep.
+// `elabDemand` under instance `from` (the root when -1) for template call `call` (-1 for none),
+// answered with the call's checker instance where `elabCkUsable` and the pins allow. Otherwise a
+// parameter the call's instance binds to a function value its body reaches at two instances keeps
+// that `Fn#d` binding: no one closed type holds it, and a closed pin is only its rep.
 function elabDemandFrom(
   decl0: i32,
   names0: string[],
@@ -463,6 +470,13 @@ function elabDemandFrom(
       }
     }
   }
+  if elabCkUsable(decl, call, from) >= 0 && elabCkTakesPins(ck, sig, pTys) {
+    elabReachNote(from, ck, -1)
+    const n1 = ekDecl.length
+    if !ekDone[ck] { elabOne(ck) }
+    elabSettle(n1)
+    return ck
+  }
   let i = 0
   while i < names0.length && i < tys0.length {
     names.push(names0[i])
@@ -487,6 +501,55 @@ function elabDemandFrom(
   if k >= 0 && !ekDone[k] { elabOne(k) }
   elabSettle(n0)
   k
+}
+
+// The checker's instance of `decl` that call `call` reaches from instance `from`, when a demand
+// answers with it: its bindings carry no function value and no hole. Else -1.
+function elabCkUsable(decl: i32, call: i32, from: i32): i32 {
+  if call < 0 || decl < 0 { return -1 }
+  const ck = elabCallInstFrom(call, from)
+  if ck < 0 || ekDecl[ck] != decl { return -1 }
+  for t in ekTys[ck] {
+    if t < 0 || t >= T.tys.length || tyHasHole(t) { return -1 }
+    const ds: i32[] = []
+    elabFnIdsIn(t, ds, 0)
+    if ds.length > 0 { return -1 }
+  }
+  ck
+}
+
+// Whether each closed parameter pin in `pTys` is assignable to instance `ck`'s parameter of
+// signature `sig`: a pin the instance cannot take keeps the pin's own instance.
+function elabCkTakesPins(ck: i32, sig: i32, pTys: i32[]): boolean {
+  if sig < 0 || sig >= T.tys.length { return false }
+  const f = tyAt(sig)
+  if !(f is TyFunc) { return false }
+  let p = 0
+  while p < f.fnParamTypes.length && p < pTys.length {
+    if elabTyClosed(pTys[p], 0) {
+      const bt = substTyDeep(f.fnParamTypes[p], ekNames[ck], ekTys[ck])
+      if bt < 0 || !assignable(pTys[p], bt) { return false }
+    }
+    p = p + 1
+  }
+  true
+}
+
+// The checker's instance call `call` is elaborated at under the instance being walked, when a
+// demand with parameter pins `pTys` answers with it; else -1.
+export function elabCallInstWant(decl0: i32, call: i32, pTys: i32[]): i32 {
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const decl = elabSrcDecl(decl0)
+  if top < -1 || decl < 0 { return -1 }
+  const ck = elabCkUsable(decl, call, top)
+  if ck < 0 || !elabCkTakesPins(ck, nodeTyIxOf(decl), pTys) { return -1 }
+  ck
+}
+
+// Instance `k`'s elaboration, spelled without its parent: two instances it agrees on check alike.
+export function elabInstSpelling(k: i32): string {
+  if k < 0 || k >= ekDecl.length { return "" }
+  elabKeyOf(ekDecl[k], ekNames[k], ekTys[k])
 }
 
 // Emitted function slot → the instance it is, or -2 for one no demand keyed.
