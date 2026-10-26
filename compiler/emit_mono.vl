@@ -591,6 +591,7 @@ import {
   elabTpDefaultsSet,
   elabWalkPop,
   elabWalkPush,
+  elabWalkTy,
 } from "./emit_elab"
 import {
   isUNameDeclAB,
@@ -3043,7 +3044,7 @@ function monoPushedListAnn(init: i32, bN: string[], bT: i32[]): i32 {
   const rt = nodeTyIxOf(u)
   if rt < 0 || rt >= T.tys.length || !tyHasTyVar(rt) { return -1 }
   if monoListLeaf(rt)[1] == 0 { return -1 }
-  let sj = monoHoleTy(rt)
+  let sj = monoHoleNodeTy(u, rt)
   if bN.length > 0 { sj = monoSubstInst(sj, bN, bT) }
   if sj < 0 || sj >= T.tys.length || tyHasTyVar(sj) { return -1 }
   const sl = monoListLeaf(sj)
@@ -3078,7 +3079,7 @@ function monoStoredMapAnn(init: i32, bN: string[], bT: i32[]): i32 {
   const rt = nodeTyIxOf(u)
   if rt < 0 || rt >= T.tys.length || !tyHasTyVar(rt) { return -1 }
   if !(tyAt(rt) is TyMap) { return -1 }
-  let sj = monoHoleTy(rt)
+  let sj = monoHoleNodeTy(u, rt)
   if bN.length > 0 { sj = monoSubstInst(sj, bN, bT) }
   if sj < 0 || sj >= T.tys.length || tyHasTyVar(sj) { return -1 }
   const nm = monoPinAnnSpelling(sj)
@@ -3469,6 +3470,8 @@ function monoArmPinsLitUnion(v: i32, bN: string[], bT: i32[]): boolean {
 function monoHoleJoinPinTy(at: i32, bN: string[], bT: i32[]): i32 {
   const p = monoPinnedTyOf(at, bN, bT)
   if (p >= 0 && !tyHasTyVar(p)) || monoPinHoleN.length == 0 { return p }
+  const e = elabWalkTy(at)
+  if e >= 0 { return e }
   const jN: string[] = []
   const jT: i32[] = []
   monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
@@ -3897,15 +3900,19 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
   let st = monoSubstInst(ty, bN, bT)
   if (st < 0 || tyHasTyVar(st)) && monoPinHoleN.length > 0 {
     // A hole instance's list literal, element read and call of a function value are typed at
-    // its holes, which `bN` does not name (D3066). A method's result is the receiver's to answer.
+    // its holes, which `bN` does not name: their type is the instance's elaboration's (D3066). A
+    // method's result is the receiver's to answer.
     const hn = nodeAt(unwrapParen(ix))
     let byHole = hn is ArrayLit || hn is Index
     if hn is Call { byHole = monoCallsFnValue(unwrapParen(ix), 0) }
     if byHole {
-      const jN: string[] = []
-      const jT: i32[] = []
-      monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
-      st = monoSubstInst(ty, jN, jT)
+      st = elabWalkTy(ix)
+      if st < 0 {
+        const jN: string[] = []
+        const jT: i32[] = []
+        monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
+        st = monoSubstInst(ty, jN, jT)
+      }
       // A record list's rows are the literal's own, which a pin re-type does not collect.
       if monoListElemHoldsObj(st) { return ty }
     }
@@ -4306,7 +4313,7 @@ function monoHoleListLitAnn(initIx: i32): i32 {
   if ix < 0 || !(nodeAt(ix) is ArrayLit) { return -1 }
   const t = nodeTyIxOf(ix)
   if t < 0 || !tyHasTyVar(t) { return -1 }
-  const ht = substTyDeep(t, monoCgcHoleN, monoCgcHoleT)
+  const ht = monoHoleNodeTy(ix, t)
   if ht < 0 || tyHasTyVar(ht) { return -1 }
   const lt = tyAt(ht)
   if !(lt is TyArray) || lt.aElem < 0 { return -1 }
@@ -4351,7 +4358,7 @@ function monoHoleIterLitCopy(iterIx: i32): i32 {
   const n = nodeAt(ix)
   if n is ArrayLit {
     const nx = monoCopyOf(ix, mkArrayLit(n.arrElems, n.pos))
-    nodeTyRecord(nx, substTyDeep(nodeTyIxOf(ix), monoCgcHoleN, monoCgcHoleT))
+    nodeTyRecord(nx, monoHoleNodeTy(ix, nodeTyIxOf(ix)))
     monoHoleListLitTy = -1
     return nx
   }
@@ -6973,12 +6980,14 @@ let monoProgLamNames: string[] = []
 let monoCgcHoleN: string[] = []
 let monoCgcHoleT: i32[] = []
 
-// The type a copied call through a lambda binding answers at this instance: its recorded type
-// substituted through the instance's binding, then its holes; the recorded type when a
+// The type copied node `ix` through a lambda binding answers at this instance: its recorded type
+// substituted through the instance's binding, else the elaboration's; the recorded type when a
 // variable stays.
-function monoLamCallTy(t: i32): i32 {
+function monoLamCallTy(ix: i32): i32 {
+  const t = nodeTyIxOf(ix)
   if t < 0 || !tyHasTyVar(t) { return t }
-  const st = monoHoleTy(monoSubstInst(t, monoCgcBN, monoCgcBT))
+  let st = monoSubstInst(t, monoCgcBN, monoCgcBT)
+  if st >= 0 && tyHasTyVar(st) { st = monoHoleNodeTy(ix, st) }
   if st < 0 || tyHasTyVar(st) { return t }
   st
 }
@@ -7071,6 +7080,13 @@ let monoCgcHoleParams: string[] = []
 function monoHoleTy(t: i32): i32 {
   if t < 0 || !tyHasTyVar(t) || monoCgcHoleN.length == 0 { return t }
   substTyDeep(t, monoCgcHoleN, monoCgcHoleT)
+}
+
+// Node `ix`'s type at the hole instance being built: the elaboration's, else its recorded type `t`
+// through the instance's holes where the elaboration has no instance for the node.
+function monoHoleNodeTy(ix: i32, t: i32): i32 {
+  const e = elabWalkTy(ix)
+  if e >= 0 { e } else { monoHoleTy(t) }
 }
 
 // The names of the un-annotated parameters in `params` that `body` binds nowhere again.
@@ -8137,7 +8153,7 @@ function monoCloneGenericCalls(ix: i32) {
 function monoCgcTplTy(ix: i32): i32 {
   const t = nodeTyIxOf(ix)
   if t >= 0 && tyHasTyVar(t) && monoCgcHoleN.length > 0 {
-    const ht = substTyDeep(t, monoCgcHoleN, monoCgcHoleT)
+    const ht = monoHoleNodeTy(ix, t)
     if ht >= 0 && !tyHasTyVar(ht) { return ht }
   }
   t
@@ -8308,10 +8324,7 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
       // A call through list elements records its callee's type per instance (D12702).
       newCallee = monoCopyOf(n.callFn, mkIdent(callee.identName, callee.pos))
       lfNoteMinted(newCallee, n.callFn)
-      nodeTyRecord(
-        newCallee,
-        substTyDeep(nodeTyIxOf(n.callFn), monoCgcHoleN, monoCgcHoleT),
-      )
+      nodeTyRecord(newCallee, monoHoleNodeTy(n.callFn, nodeTyIxOf(n.callFn)))
     }
   } else {
     newCallee = monoCloneGenericCalls(n.callFn)
@@ -8337,7 +8350,7 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
   if cellCall && nodeTyIxOf(ix) >= 0 { nodeTyRecord(nc, nodeTyIxOf(ix)) }
   if lamCall {
     // A value call is typed by its own record, which the copy carries (D2854).
-    const lt = monoLamCallTy(nodeTyIxOf(ix))
+    const lt = monoLamCallTy(ix)
     if lt >= 0 { nodeTyRecord(nc, lt) }
   }
   if tas.length > 0 {
@@ -8512,7 +8525,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
         // A value nothing calls stays one in each instance's copy (D9590).
         if i32ListHas(monoInertValues, ix) { monoInertValues.push(vi) }
         if i32ListHas(monoInertCalled, ix) { monoInertCalled.push(vi) }
-        const vt = monoLamCallTy(nodeTyIxOf(ix))
+        const vt = monoLamCallTy(ix)
         if vt >= 0 { nodeTyRecord(vi, vt) }
         return vi
       }
