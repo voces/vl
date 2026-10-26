@@ -22784,6 +22784,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
               pinTys,
             )
             if hr < 0 { return hr }
+            if hr > 0 { return 0 }
           } else {
             const pr = monoPinAnnotatedParam(
               p,
@@ -23037,8 +23038,8 @@ function monoPinHoleParam(
     }
   }
   // The elaboration's answer for the parameter at the call's template, where it closes.
+  const et = elabCallParamTy(monoCallTplOf(callIx), i)
   if an == "" {
-    const et = elabCallParamTy(monoCallTplOf(callIx), i)
     an = monoElabPin(callIx, args, i, et, ctx)
     if an != "" { anTy = et }
   }
@@ -23052,10 +23053,21 @@ function monoPinHoleParam(
     an = monoInertParamStubPin(oDecl, args[i], inTy)
     anTy = inTy[0]
   }
+  let guessed = false
   if an == "" {
     an = monoArgPinName(args[i], ctx)
-    // An open row keys and rechecks its instance at the types its functions are pinned at.
-    if an != "" { anTy = monoOpenRowPinnedTy(fn, i, callIx, args[i]) }
+    // The rep cascade's `i32` floor is a guess for a value the checker left open: it pins at
+    // the type this frame's instance closes it to, or the elaboration's, or not at all.
+    const openTy = if an == "i32" { monoArgOpenValueTy(args[i], ctx, et) } else { 0 - 2 }
+    if openTy > -2 {
+      an = ""
+      if openTy >= 0 { an = monoI32AtomPinName(openTy) }
+      guessed = an == ""
+      if an != "" { anTy = openTy }
+    } else if an != "" {
+      // An open row keys and rechecks its instance at the types its functions are pinned at.
+      anTy = monoOpenRowPinnedTy(fn, i, callIx, args[i])
+    }
     // A hole function's `=>` pin is typed at the closed signature its rep key names.
     if anTy < 0 { anTy = monoHoleFnPinTy(args[i], ctx, an) }
   }
@@ -23074,6 +23086,9 @@ function monoPinHoleParam(
     an = monoPinnedListElemPin(args[i], rowTy)
     anTy = rowTy[0]
   }
+  // An argument open in this frame at a call no instance elaborates at a closed type: no
+  // instance is demanded here.
+  if an == "" && guessed { return 1 }
   if an == "" {
     // A name handed through an identity call into a binding can take a slot per type.
     if nodeAt(args[i]) is Ident {
@@ -23095,6 +23110,20 @@ function monoPinHoleParam(
     return monoHoleManyPinsFail(p.parName, fn.fnName)
   }
   0
+}
+
+// For argument `ax` the checker typed open and holding no function: the closed type frame `ctx`
+// reads it at, else `et` where closed, else -1. -2 for any other argument. Both reads are needed:
+// inside a generic instance its pins close an argument the callee's elaboration leaves open.
+function monoArgOpenValueTy(ax: i32, ctx: i32, et: i32): i32 {
+  const x = unwrapParen(ax)
+  if x < 0 || nodeAt(x) is FuncDecl { return 0 - 2 }
+  const own = nodeTyIxOf(x)
+  if !monoTyOpen(own) || tyMayHoldFn(own, 0) { return 0 - 2 }
+  let ct = monoArgClosedTyIn(ax, ctx, -1)
+  if ct < 0 && et >= 0 && et < T.tys.length && !tyHasTyVar(et) { ct = et }
+  if ct >= 0 && tyMayHoldFn(ct, 0) { return 0 - 2 }
+  ct
 }
 
 // The closed type of argument `ax` inside function `ctx`: `pinTy`, its pin type, where that is
