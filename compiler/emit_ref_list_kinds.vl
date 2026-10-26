@@ -64,6 +64,7 @@ import {
   TyUnion,
   numLitUnionBaseTy,
   tyAt,
+  tyHasInferHole,
   tyIsLitUnion,
   tyIsLitUnionArray,
 } from "./check_types"
@@ -112,7 +113,10 @@ import {
   emptyArrLitIxOf,
   rlElemInnerSlot,
   rlElemStructRow,
+  rlRowTyOfElem,
+  rlSlotOfRowTy,
   structIndexOfTypeNameTy,
+  tyIsNulLitUnionArr,
 } from "./emit_shape_rows"
 import { identBindingNoLocal, nameFreeToModule } from "./emit_sig_tokens"
 import {
@@ -157,7 +161,7 @@ import {
 } from "./emit_struct_order"
 import { memoGenNew } from "./memo"
 import { sidArrGet, sidArrPut, sidOf, sidOfNode, sidText } from "./symbols"
-import { nonNullTy, tyIsU8ArrayTy } from "./tyquery"
+import { nonNullTy, tyHasTyVar, tyIsU8ArrayTy } from "./tyquery"
 export {
   tyPrimLeafListKind,
   tyScalarBackedListKind,
@@ -262,6 +266,43 @@ function tyListRepKind(ty: i32, rowSlot: i32): VKind | null {
   if tyPrimLeafElem(ty) { return null }
   if rowSlot >= 0 { return "reflist" }
   null
+}
+
+// The build pair a list literal whose closed type is `ty` (a `| null` peeled) demands: its
+// backing code and its ref-list row (0 for none). `null` where `ty` is no closed array type or
+// names no list rep, an element still a type variable or an inference hole being the live case.
+export function listBuildOfTy(ty: i32): ListBuild | null {
+  const at = nonNullTy(ty)
+  if at < 0 || at >= T.tys.length { return null }
+  const t = tyAt(at)
+  if !(t is TyArray) { return null }
+  if tyHasTyVar(at) || tyHasInferHole(at, 0) { return null }
+  if tyIsNulLitUnionArr(at) { return listBuildAt(LBK_NUL_LIT_UNION_LIST, 0) }
+  if tyIsLitUnionArray(at) { return listBuildAt(LBK_I32_LIST, 0) }
+  const nlab = numLitUnionArrayBaseName(at)
+  if nlab == "f64" { return listBuildAt(LBK_F64_LIST, 0) }
+  if nlab == "i64" { return listBuildAt(LBK_I64_LIST, 0) }
+  if nlab != "" { return listBuildAt(LBK_I32_LIST, 0) }
+  if t.aElem >= 0 {
+    const et = tyAt(t.aElem)
+    if et is TyNullable && et.nInner >= 0 {
+      const inner = tyAt(et.nInner)
+      if inner is TyPrim && inner.primName == "boolean" {
+        return listBuildAt(LBK_NUL_BOOL_LIST, 0)
+      }
+    }
+  }
+  const slot0 = rlSlotOfTy(t.aElem)
+  const slot = if slot0 >= 0 { slot0 } else { rlSlotOfRowTy(rlRowTyOfElem(t.aElem)) }
+  const k = tyListRepKind(at, slot)
+  if k == null { return null }
+  if k == "reflist" && slot < 0 { return null }
+  listBuildAt(listBuildKindOfVKind(k, slot), if slot < 0 { 0 } else { slot })
+}
+
+function listBuildAt(kind: i32, slot: i32): ListBuild {
+  const b: ListBuild = { lbKind: kind, lbSlot: slot }
+  b
 }
 
 // The `VKind` an empty `[]`'s recorded array type reps as, or `null` when this is not an
