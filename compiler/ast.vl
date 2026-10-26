@@ -777,6 +777,21 @@ export function tsMkKids(kind: i32, text: string, kids: i32[]) {
   tsKind.length - 1
 }
 
+// The tree of a list of `el`: `el[]`, grouped when `el` is a union, intersection or function
+// type, which the `[]` would otherwise bind into. -1 stays -1.
+export function tsListOf(el: i32) {
+  if el < 0 { return -1 }
+  let k = el
+  if tsGroupsAsKid(el) { k = tsMkKids(TS_PAREN, "", [el]) }
+  tsMkKids(TS_ARR, "", [k])
+}
+
+// Whether tree `ix` needs grouping parens to stand as one operand of `|`, `&` or `[]`.
+function tsGroupsAsKid(ix: i32): boolean {
+  const k = tsKind[ix]
+  k == TS_UNION || k == TS_ISECT || k == TS_FUNC
+}
+
 // Take the finished root a type producer left on the stack. Every producer
 // pushes exactly one node — the error arm pushes `TS_ERR` — so this is total on
 // a producer's return; the `-1` guard is the same "never trap on a misaligned
@@ -1591,60 +1606,67 @@ export function tsReset() {
   0
 }
 
+// The tree `ix` with every type-position leaf naming one of `names` replaced by the parallel
+// tree of `reps`, grouped in a `TS_PAREN` where it stands as an operand. Unchanged
+// subtrees are shared. -1 when a map key would be replaced by anything but a name.
+export function tsSubstTree(ix: i32, names: string[], reps: i32[]): i32 {
+  tsSubstGo(ix, names, reps, true)
+}
+
+function tsSubstGo(ix: i32, names: string[], reps: i32[], top: boolean): i32 {
+  if ix < 0 { return -1 }
+  const k = tsKind[ix]
+  if k == TS_NAME {
+    const r = tsRepOf(tsText[ix], names, reps)
+    if r < 0 { return ix }
+    if !top && tsGroupsAsKid(r) { return tsMkKids(TS_PAREN, "", [r]) }
+    return r
+  }
+  let text = tsText[ix]
+  if k == TS_MAP {
+    const r = tsRepOf(text, names, reps)
+    if r >= 0 {
+      if tsKind[r] != TS_NAME { return -1 }
+      text = tsText[r]
+    }
+  }
+  const start = tsKidStart[ix]
+  const cnt = tsKidCount[ix]
+  const kids: i32[] = []
+  let changed = text != tsText[ix]
+  let i = 0
+  while i < cnt {
+    const old = tsKids[start + i]
+    const nk = tsSubstGo(old, names, reps, false)
+    if nk < 0 && old >= 0 { return -1 }
+    if nk != old { changed = true }
+    kids.push(nk)
+    i = i + 1
+  }
+  if !changed { return ix }
+  tsMkKids(k, text, kids)
+}
+
+// The tree `reps` holds for the type name `leaf`, or -1 when `names` does not name it.
+function tsRepOf(leaf: string, names: string[], reps: i32[]): i32 {
+  let i = 0
+  while i < names.length && i < reps.length {
+    if names[i] == leaf { return reps[i] }
+    i = i + 1
+  }
+  -1
+}
+
 // Render a spelling node back to the synthetic type name the parser built from it — arm
 // for arm, the exact concatenations of `parseTypeName` / `parseTypeIsect` /
 // `parseTypeAtom`, so `tsToName(annTsOf(ix))` reproduces `TypeRef.tyName` character for
 // character. This is the tree's write-back; -1 renders "", the parser's recovery answer.
 export function tsToName(ix: i32): string {
-  const none: string[] = []
-  tsToNameGo(ix, none, none, true)
-}
-
-// `tsToName` with every type-position leaf naming one of `names` replaced by the parallel
-// entry of `reps`. A field name, a method name or a string-literal member is never such a
-// leaf, so only types are replaced.
-export function tsToNameSubst(
-  ix: i32,
-  names: string[],
-  reps: string[],
-): string {
-  tsToNameGo(ix, names, reps, true)
-}
-
-// A replaced leaf is grouped when it is a union, an intersection or a function type and
-// does not stand for the whole spelling, so `T[]` at `T = A | B` stays one element.
-function tsSubstLeaf(
-  leaf: string,
-  names: string[],
-  reps: string[],
-  top: boolean,
-): string {
-  let i = 0
-  while i < names.length && i < reps.length {
-    if names[i] == leaf {
-      const r = reps[i]
-      if top { return r }
-      if r.includes("|") || r.includes("&") || r.includes("=>") {
-        return "(" + r + ")"
-      }
-      return r
-    }
-    i = i + 1
-  }
-  leaf
-}
-
-function tsToNameGo(
-  ix: i32,
-  names: string[],
-  reps: string[],
-  top: boolean,
-): string {
   if ix < 0 { return "" }
   const k = tsKind[ix]
   const start = tsKidStart[ix]
   const cnt = tsKidCount[ix]
-  if k == TS_NAME { return tsSubstLeaf(tsText[ix], names, reps, top) }
+  if k == TS_NAME { return tsText[ix] }
   if k == TS_LITSTR { return tsText[ix] }
   if k == TS_LITNUM { return tsText[ix] }
   if k == TS_NULL { return "null" }
@@ -1653,21 +1675,15 @@ function tsToNameGo(
     // A read-only list view marks the `[]` node it binds, so the marker rides that suffix
     // and an inner array keeps its own spelling.
     if tsText[ix] == "readonly" {
-      return "readonly " + tsToNameGo(tsKids[start], names, reps, false) + "[]"
+      return "readonly " + tsToName(tsKids[start]) + "[]"
     }
-    return tsToNameGo(tsKids[start], names, reps, false) + "[]"
+    return tsToName(tsKids[start]) + "[]"
   }
-  if k == TS_NEG { return "!" + tsToNameGo(tsKids[start], names, reps, false) }
+  if k == TS_NEG { return "!" + tsToName(tsKids[start]) }
   if k == TS_MAP {
-    return "{["
-      + tsSubstLeaf(tsText[ix], names, reps, true)
-      + "]:"
-      + tsToNameGo(tsKids[start], names, reps, false)
-      + "}"
+    return "{[" + tsText[ix] + "]:" + tsToName(tsKids[start]) + "}"
   }
-  if k == TS_FIELD {
-    return tsText[ix] + ":" + tsToNameGo(tsKids[start], names, reps, false)
-  }
+  if k == TS_FIELD { return tsText[ix] + ":" + tsToName(tsKids[start]) }
   if (
     k == TS_APP
     || k == TS_PAREN
@@ -1684,23 +1700,16 @@ function tsToNameGo(
     let i = 0
     while i < last {
       if i > 0 { inner = inner + "," }
-      inner = inner + tsToNameGo(tsKids[start + i], names, reps, false)
+      inner = inner + tsToName(tsKids[start + i])
       i = i + 1
     }
     if k == TS_APP { return tsText[ix] + "<" + inner + ">" }
     if k == TS_PAREN { return "(" + inner + ")" }
     if k == TS_OBJ { return "{" + inner + "}" }
     if k == TS_METHOD {
-      return tsText[ix]
-        + "("
-        + inner
-        + "):"
-        + tsToNameGo(tsKids[start + cnt - 1], names, reps, false)
+      return tsText[ix] + "(" + inner + "):" + tsToName(tsKids[start + cnt - 1])
     }
-    return "("
-      + inner
-      + ")=>"
-      + tsToNameGo(tsKids[start + cnt - 1], names, reps, false)
+    return "(" + inner + ")=>" + tsToName(tsKids[start + cnt - 1])
   }
   // `TS_UNION` / `TS_ISECT` — the members joined by their own separator.
   let sep = "|"
@@ -1709,7 +1718,7 @@ function tsToNameGo(
   let i = 0
   while i < cnt {
     if i > 0 { out = out + sep }
-    out = out + tsToNameGo(tsKids[start + i], names, reps, false)
+    out = out + tsToName(tsKids[start + i])
     i = i + 1
   }
   out
