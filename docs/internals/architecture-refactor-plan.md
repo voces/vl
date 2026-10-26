@@ -851,7 +851,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - `joinRowOfTy` (#3620) now decides every joined record off its type: 111 → 110.
 - `mapTyValKindLowerable`, `fieldBoxSetConflict`, the discriminant's arm lookup and `armFieldDeferredRowOk` (#3631) followed: 110 → 106.
 - `valueAtomKindOfTy` still renders a union of members that share a list or closure rep (D4320).
-- Next: `armFieldUnionName`, `listUnionEmitName`, `memReadBoxNames` (each waits on union-registry-by-key step 5).
+- These three sites waited on union-registry-by-key step 5, which is done (last PR #4708). Re-graded at `e28da576c`, none still waits on it: `armFieldUnionName` renders nothing (its names come from the row tables and `valueUnionNameOfTy`); `listUnionEmitName`'s one `tyToEmitName` renders only a member no declaration names, and the render is its output, not a decision (class B in [render-parse-residue-2026-10.md](render-parse-residue-2026-10.md)); `memReadBoxNames` is deleted, replaced by `memReadBoxPlan` (#4803).
 - Stage 3 (D3): a per-node checked-rep column, read by the literal-union classifiers (#3672) and the nullable-niche classifiers (#3680).
 - `repOfNullable` covers union-arm and nullable-litunion-element niches, so the nullable niche family is fully on the column (#3683, D3c).
 - The column gains a pin-aware read, and the generic share of the list oracle falls (#3690, cause 1: LEFT-ONLY −60%).

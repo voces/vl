@@ -528,12 +528,16 @@ A later step is added: the elaboration moves into check with an error channel, w
 
 **Container adoption, slice 2: map values (#4827).** A `Map()` held by a list or record literal adopts its delivery. `letMapDestShape` stays.
 
-**Increment 3, slice 3 (#4829).** An open call's lambdas are pinned under the instance the call builds, so each lambda's elaboration instance has that instance as its parent.
+**Increment 3, slice 3 (#4829, #4830).** An open call's lambdas are pinned under the instance the call builds, so each lambda's elaboration instance has that instance as its parent (3a). A demanded instance then settles the instances its own demand enqueues (`elabSettle`), and an anonymous lambda's hole name keys on its node at every stage, so the hole-function binding has one producer; the two bridge readers are deleted (3b). Binding fallbacks over gc.list go 11 → 7: lamcall 1, operand 5, pinned 1. The root-seeded instance (`k0`, with the hole function still open) stays, because two readers still reach it: `elabDemandFrom`'s reached-at-two-instances test, and a template lambda body's emission, which has no demand key. Slice (ii) answers both, then drops the seeding.
 
-**Open after #4829.** These are the forward items, in order within each line:
-- increment 3: delete the binding fallback, the D6210 rung and `holeFnSplit*`;
-- container adoption, the rest: delete the emitter's name scan (`structIndexOfObjCtxGo`, the `anonMintLiteral` reuse), `letMapDestShape`, `rlElemKindTbl` (5b) and 5a's residue hints;
-- step 6, narrowing produced once, is in progress;
+**Step 6, slice 1: Ident reads (#4831).** Identifier value reads and list-op receivers unbox at the checker's type (`identReadAtomKindAt`), once per read, and the `??` desugar, the assignment re-read and the type-guard operand produce typed reads. The narrowing stack (`pushNarrow*`, `emit_narrow_slots.vl`, `capNarrowBuild`, `criWalkBlock`'s replay) is still read by field reads, captures, the `is`/`match` arms and the struct/variant narrowers; each family follows as its own slice, and the deletions land with the last reader. D4884 stays open: in a generic instance the resolver's declaration is not the instance's binding. D2451 now loads then traps, which is the checker's defect.
+
+**Container adoption, slice 3: map list values (#4832).** Map adoption peels map levels and one list level, then lands the record, so a `Map()` of record lists pins its binding and the list binding its values came from follows. The emitter's `letMapDestShape` index is deleted; `letMapShapeOf` reads the pinned annotation. Two undelivered `Map()`s that mix rows (`{r: {c2: 1}}` or `{r: null}` beside `{r: i32}`) are check rejects from the first write's inference, not adoption gaps.
+
+**Open after #4832.** These are the forward items, in order within each line:
+- increment 3: drop the root-seeded instance (slice (ii)), then delete the binding fallback, the D6210 rung and `holeFnSplit*`;
+- container adoption, the rest: delete the emitter's name scan (`structIndexOfObjCtxGo`, the `anonMintLiteral` reuse; bypassing it lost 29 `runs` when measured), `rlElemKindTbl` (5b) and 5a's residue hints;
+- step 6: the field, capture, `is`/`match` and struct/variant reader families, then the narrowing stack;
 - move the elaboration into check with an error channel, which deletes `pinHoleLambdaArg`;
 - importer-demand tracking for the check-skip (cross-module adoption ruling). An importer's wider delivery pins a library's literal-only binding, so the skip declines every edit to that library until importer demand is tracked (`incremental-compilation-design.md`).
 
