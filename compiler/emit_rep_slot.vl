@@ -1,0 +1,154 @@
+// `emit_rep_slot.vl` — the table slot a value of a type is stored under, and the `$fnsig`
+// token that a parameter or a result of that type keys. The kind is `repOfTy`'s answer and
+// the slot is `repSlotOfKind`'s, so a signature token has no producer of its own.
+
+import { mapKeyKindOfTy } from "./check_ty_rep"
+import {
+  T,
+  TyMap,
+  TyObj,
+  TyPrim,
+  structNameOfTy,
+  tyAt,
+  tyEqSoftLits,
+} from "./check_types"
+import {
+  sScanLim,
+  structIndexOfTy,
+  structRowRecordingTy,
+} from "./emit_atom_kinds"
+import { nameIsWholeSpanShape } from "./emit_field_codes"
+import { tyRefArrElemOf } from "./emit_map_value_slots"
+import { variantRowOfTy } from "./emit_mv_slots"
+import {
+  repRowOfTyStruct,
+  repSigKindOfTy,
+  repSigSlotTokOfKind,
+  repSigTokHasSlot,
+  repSigTokOfKind,
+} from "./emit_rep"
+import {
+  asrGen,
+  asrRow,
+  joinRowScanOfTyMemo,
+  mvSlotOfMapKeyKTys,
+  repVariantSlotRep,
+  rlSlotOfTyOrTwin,
+  tyRegGenNow,
+} from "./emit_shape_rows"
+import { VKind, sNames, sTyIx } from "./emit_state"
+import { tyPeelNul } from "./tyquery"
+
+// The table slot a value of type `ty` with rep kind `kind` is stored under: a struct row, a
+// folded variant row, a ref-list row or a map shape. A nullable kind reads its inner type's.
+// A map shape may be negative (a mono shape), so test the answer with `repSlotIsRow`.
+export function repSlotOfKind(kind: VKind | null, ty: i32): i32 {
+  const none = if kind == "map" || kind == "nulmap" { -3 } else { -1 }
+  if ty < 0 || ty >= T.tys.length || !repSigTokHasSlot(kind) { return none }
+  const inner = tyPeelNul(ty)
+  if inner < 0 { return none }
+  if kind == "struct" || kind == "nulstruct" { return repStructRowOfTy(inner) }
+  if kind == "variant" || kind == "nulvariant" {
+    return repVariantSlotRep(variantRowOfTy(inner))
+  }
+  if kind == "reflist" || kind == "nulreflist" {
+    return rlSlotOfTyOrTwin(tyRefArrElemOf(inner))
+  }
+  repMapSlotOfTy(inner)
+}
+
+// The map shape a map type `ty` is stored under, or -3 when `ty` is not a map.
+function repMapSlotOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -3 }
+  const t = tyAt(ty)
+  if t is TyMap {
+    return mvSlotOfMapKeyKTys(mapKeyKindOfTy(t.mKey), -1, t.mVal)
+  }
+  -3
+}
+
+// Whether `repSlotOfKind`'s answer `slot` for `kind` names a row rather than none.
+export function repSlotIsRow(kind: VKind | null, slot: i32): boolean {
+  if kind == "map" || kind == "nulmap" { return slot != -3 }
+  slot >= 0
+}
+
+// The `$fnsig` token of a parameter of type `ty`, or "" when its rep has none or no row holds it.
+export function repSigTokOfTy(ty: i32): string {
+  const k = repSigKindOfTy(ty)
+  if !repSigTokHasSlot(k) { return repSigTokOfKind(k) }
+  const s = repSlotOfKind(k, ty)
+  if !repSlotIsRow(k, s) { return "" }
+  repSigSlotTokOfKind(k, s)
+}
+
+// The `$fnsig` token of a result of type `ty`: `>` and its parameter token, `>v` for `void`
+// and for `never` (whose callee leaves nothing), or "" when its rep has none.
+export function repSigRetTokOfTy(ty: i32): string {
+  if ty >= 0 && ty < T.tys.length {
+    const t = tyAt(ty)
+    if t is TyPrim && (t.primName == "void" || t.primName == "never") {
+      return ">v"
+    }
+  }
+  const tok = repSigTokOfTy(ty)
+  if tok == "" { return "" }
+  ">" + tok
+}
+
+// The struct row a record `ty` is stored under: a row spelled by its shape, the row recording
+// it, its declared name's row, then its rep row and, undeclared, the field-set scan; -1 for none.
+function repStructRowOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const shp = repStructRowByShape(ty)
+  if shp >= 0 { return shp }
+  const own = structRowRecordingTy(ty)
+  if own >= 0 { return own }
+  if !(tyAt(ty) is TyObj) { return -1 }
+  if structNameOfTy(ty) != "" {
+    const dr = structIndexOfTy(ty)
+    if dr >= 0 { return dr }
+    return repRowOfTyStruct(ty, sScanLim())
+  }
+  const kr = repRowOfTyStruct(ty, sScanLim())
+  if kr >= 0 { return kr }
+  joinRowScanOfTyMemo(ty)
+}
+
+// The first struct row named by a record shape whose type is structurally `ty`, or -1, each
+// answer stamped by the `tyRegGenNow` read before computing it.
+function repStructRowByShape(ty: i32): i32 {
+  if !(tyAt(ty) is TyObj) { return -1 }
+  const slot = ty
+  const gen = tyRegGenNow()
+  if slot < asrGen.length && asrGen[slot] == gen { return asrRow[slot] }
+  const r = repStructRowByShapeGo(ty)
+  if tyRegGenNow() == gen {
+    while asrGen.length <= slot {
+      asrGen.push(-1)
+      asrRow.push(-1)
+    }
+    asrGen[slot] = gen
+    asrRow[slot] = r
+  }
+  r
+}
+
+function repStructRowByShapeGo(ty: i32): i32 {
+  let lim = sNames.length
+  if lim > sTyIx.length { lim = sTyIx.length }
+  let i = 0
+  while i < lim {
+    const rt = sTyIx[i]
+    if (
+      rt >= 0
+      && tyAt(rt) is TyObj
+      && nameIsWholeSpanShape(sNames[i])
+      && tyEqSoftLits(rt, ty)
+    ) {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
