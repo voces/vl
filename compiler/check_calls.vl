@@ -6,6 +6,7 @@ import {
   ArrayLit,
   Block,
   Call,
+  FieldInit,
   ForIn,
   FuncDecl,
   Ident,
@@ -14,6 +15,7 @@ import {
   Member,
   Node,
   NumLit,
+  ObjLit,
   OptMember,
   P,
   Param,
@@ -74,6 +76,7 @@ import { builtinMethodNamesOf } from "./check_callee"
 import {
   coalDefHole,
   coalPinTy,
+  hdFldName,
   mkDerivedHole,
   noteCastArgDest,
 } from "./check_coal"
@@ -282,6 +285,8 @@ import {
   tErrUnsupported,
 } from "./check_relate_core"
 import { valueUnionRetName } from "./check_ret_names"
+import { recHeldDecl, recHeldLit } from "./check_rec_fresh"
+import { recAdPushSettled, recAdSetGroup } from "./check_rec_rows"
 import { pgrNoteCall } from "./check_poly_growth"
 import {
   calleeDeclParams,
@@ -350,6 +355,7 @@ import {
   mkArrayTy,
   mkMapTy,
   mkNullableTy,
+  mkObjTy,
   objFieldType,
   tyArrayElemIx,
   tyAt,
@@ -2379,6 +2385,19 @@ function judgeFnArgHoleCalls(
         holeOpenCallsWait(a, vNames, wTys, k, vTys[k], calleeFn)
       }
     }
+    if an is ObjLit || an is ArrayLit || an is Ident || an is Index {
+      const k = strListIndexOf(vNames, dhNames[j])
+      if (
+        k >= 0
+        && (an is ObjLit || an is ArrayLit || holeRecDecls(a).length > 0)
+      ) {
+        if wTys.length == 0 {
+          for t in vTys { wTys.push(t) }
+          instGenFnHolePins(vNames, wTys, calleeFn)
+        }
+        judgeHoleFieldCalls(a, vNames, wTys, k, calleeFn)
+      }
+    }
     let gNames: string[] = []
     if an is Ident {
       gNames = [an.identName]
@@ -2415,6 +2434,150 @@ function judgeFnArgHoleCalls(
       }
     }
     j = j + 1
+  }
+  0
+}
+
+// The bindings argument `a` reads, or that `a` indexes, through un-annotated bindings that hold
+// only their initializer, when the last holds an object literal (or, indexed, a list literal).
+function holeRecDecls(a: i32): i32[] {
+  const out: i32[] = []
+  if a < 0 || a >= P.nodes.length { return out }
+  const an = nodeAt(a)
+  let x = if an is Index { parenPeelIx(an.idxArr) } else { a }
+  while x >= 0 && x < P.nodes.length && nodeAt(x) is Ident && out.length < 16 {
+    const d = recHeldDecl(x)
+    if d < 0 { break }
+    out.push(d)
+    x = parenPeelIx(recHeldLit(x))
+  }
+  const ok = x >= 0
+    && x < P.nodes.length
+    && (nodeAt(x) is ArrayLit || !(an is Index) && nodeAt(x) is ObjLit)
+  if !ok { return [] }
+  out
+}
+
+// The object literals argument `a` hands hole `base`, each with the name of the hole it fills:
+// `a` itself, a list literal's elements (the hole its reads give), or those `holeRecDecls`' last
+// binding holds.
+function holeRecSrcs(a: i32, base: string, srcs: i32[], bases: string[]) {
+  if a < 0 || a >= P.nodes.length { return 0 }
+  const an = nodeAt(a)
+  if an is ObjLit {
+    srcs.push(a)
+    bases.push(base)
+    return 0
+  }
+  if an is ArrayLit {
+    for e in an.arrElems {
+      const pe = parenPeelIx(e)
+      if pe >= 0 && pe < P.nodes.length && nodeAt(pe) is ObjLit {
+        srcs.push(pe)
+        bases.push("?elemv." + base)
+      }
+    }
+    return 0
+  }
+  const ds = holeRecDecls(a)
+  if ds.length == 0 { return 0 }
+  const dn = nodeAt(ds[ds.length - 1])
+  const init = if dn is LetDecl { parenPeelIx(dn.letInit) } else { -1 }
+  if init < 0 || init >= P.nodes.length { return 0 }
+  if !(an is Index) { return holeRecSrcs(init, base, srcs, bases) }
+  const iv = nodeAt(init)
+  if iv is ArrayLit {
+    for e in iv.arrElems {
+      const pe = parenPeelIx(e)
+      if pe >= 0 && pe < P.nodes.length && nodeAt(pe) is ObjLit {
+        srcs.push(pe)
+        bases.push(base)
+      }
+    }
+  }
+  0
+}
+
+// A field of the records argument `a` hands hole `vNames[k]`, holding a function with
+// un-annotated parameters, is judged at the instance the callee's calls through that field ask,
+// as the function handed directly is; when each such field asks one, `a` adopts the record at
+// those instances, so it is built at the type those calls read (D13969).
+function judgeHoleFieldCalls(
+  a: i32,
+  vNames: string[],
+  wTys: i32[],
+  k: i32,
+  calleeFn: i32,
+) {
+  const srcs: i32[] = []
+  const bases: string[] = []
+  holeRecSrcs(a, vNames[k], srcs, bases)
+  if srcs.length == 0 { return 0 }
+  const rt0 = nonNullTy(nodeTyOf(srcs[0]))
+  if rt0 < 0 || rt0 >= T.tys.length { return 0 }
+  const ro = tyAt(rt0)
+  if !(ro is TyObj) { return 0 }
+  const fTys: i32[] = []
+  for t in ro.objFieldTypes { fTys.push(t) }
+  const set: boolean[] = []
+  for _t in ro.objFieldTypes { set.push(false) }
+  let nSet = 0
+  let agree = true
+  const d0 = T.diags.length
+  let si = 0
+  while si < srcs.length {
+    const src = srcs[si]
+    const base = bases[si]
+    si = si + 1
+    const sn = nodeAt(src)
+    const fields = if sn is ObjLit { sn.objFields } else { [] }
+    for fx in fields {
+      const f = nodeAt(fx)
+      if !(f is FieldInit) { continue }
+      const fi = strListIndexOf(ro.objFieldNames, f.fiName)
+      const v = parenPeelIx(f.fiValue)
+      if fi < 0 || v < 0 || v >= P.nodes.length { continue }
+      const vn = nodeAt(v)
+      if !(vn is Ident) { continue }
+      const d = fnDeclIx[vn.identName] ?? -1
+      const vt = nodeTyOf(v)
+      if d < 0 || d >= P.nodes.length || !(nodeAt(d) is FuncDecl) { continue }
+      if vt < 0 || !(tyAt(vt) is TyFunc) || !tyHasTyVar(vt) { continue }
+      const names: string[] = []
+      for nm in vNames { names.push(nm) }
+      names.push(hdFldName(f.fiName, base))
+      const tys: i32[] = []
+      for t in wTys { tys.push(t) }
+      tys.push(vt)
+      const insts: i32[] = []
+      genFnHoleCallInsts(names, tys, vNames.length, vt, calleeFn, insts)
+      genFnHoleMovedInsts(names, tys, vNames.length, vt, calleeFn, insts)
+      for inst in insts {
+        if T.diags.length == d0 { holeDeclCstrsAt(v, d, vt, inst) }
+      }
+      if insts.length > 1 {
+        agree = false
+      } else if insts.length == 1 && !set[fi] {
+        fTys[fi] = insts[0]
+        set[fi] = true
+        nSet = nSet + 1
+      } else if insts.length == 1 && !tySame(fTys[fi], insts[0]) {
+        agree = false
+      }
+    }
+  }
+  if !agree || nSet == 0 || T.diags.length > d0 { return 0 }
+  const rt = mkObjTy(ro.objFieldNames, fTys)
+  const an = nodeAt(a)
+  if an is ObjLit {
+    adoptLitAt(a, rt)
+  } else if an is ArrayLit {
+    adoptLitAt(a, mkArrayTy(rt))
+  } else {
+    const g = recAdSetGroup()
+    for d in holeRecDecls(a) {
+      recAdPushSettled(d, rt, an is Index || bases[0] != vNames[k], a, g)
+    }
   }
   0
 }
