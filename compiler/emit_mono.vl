@@ -49,11 +49,11 @@ import {
   holePinReadOf,
   joinPinnedArmLit,
   joinPinnedArmTys,
-  monoInferListElem,
-  monoInferLocalScalar,
-  monoInferRetExprTy,
   monoInferRetSetListTy,
-  monoInferRetSetUnionName,
+  monoListLocalName,
+  monoRetExprName,
+  monoRetSetUnionNameOf,
+  monoScalarLocalName,
   nominalStructNameOfTy,
   nulRecListNominalName,
   nulRecNominalName,
@@ -64,6 +64,7 @@ import {
   tpIfJoinPinTy,
 } from "./check_emit_queries"
 import {
+  a20CollectRets,
   bindOf,
   fusedMapReadRecvIx,
   i32TyIx,
@@ -590,6 +591,9 @@ import {
   elabBodyDeclNote,
   elabDemand,
   elabKeyAt,
+  elabLocalTy,
+  elabNodeDead,
+  elabNodeTy,
   elabSlotNote,
   elabTpDefaultsReset,
   elabTpDefaultsSet,
@@ -10844,6 +10848,7 @@ function monoMakeInstanceRetAnn(
 function monoMakeInstanceRetExpr(
   fn: FuncDecl,
   origFe: i32,
+  ek: i32,
   nret: i32,
   params: i32[],
   pinned: string[],
@@ -10968,10 +10973,8 @@ function monoMakeInstanceRetExpr(
           // is built from a non-trivial expression. Re-check the body for this shape
           // so the checker's own list-element inference resolves the local.
           const listTyIx: i32[] = []
-          let listTy = monoInferListElem(
-            monoOrigNode[origFe],
-            pinnedTyIx,
-            rxe.identName,
+          let listTy = monoListLocalName(
+            elabLocalTy(ek, rxe.identName, true),
             listTyIx,
           )
           let ltIx = -1
@@ -11003,10 +11006,8 @@ function monoMakeInstanceRetExpr(
             // hole-pinned param. The return-kind inference runs before locals are
             // collected. "" for i32 / boolean / composite.
             const scTyIx: i32[] = []
-            const scTy = monoInferLocalScalar(
-              monoOrigNode[origFe],
-              pinnedTyIx,
-              rxe.identName,
+            const scTy = monoScalarLocalName(
+              elabLocalTy(ek, rxe.identName, false),
               scTyIx,
             )
             if scTy != "" {
@@ -11025,6 +11026,7 @@ function monoMakeInstanceRetExpr(
   monoMakeInstanceRetJoin(
     fn,
     origFe,
+    ek,
     nret,
     holeN,
     holeT,
@@ -11147,6 +11149,7 @@ function monoRetOfListMethod(
 function monoMakeInstanceRetJoin(
   fn: FuncDecl,
   origFe: i32,
+  ek: i32,
   nret: i32,
   holeN: string[],
   holeT: i32[],
@@ -11161,12 +11164,8 @@ function monoMakeInstanceRetJoin(
   // Last, so every arm above keeps its answer.
   if nret < 0 {
     const reTyIx: i32[] = []
-    const reTy = monoInferRetExprTy(
-      monoOrigNode[origFe],
-      pinnedTyIx,
-      letBN,
-      letBT,
-      fnRetExprOf(monoOrigNode[origFe]),
+    const reTy = monoRetExprName(
+      monoRetTyAt(fnRetExprOf(monoOrigNode[origFe]), ek),
       reTyIx,
     )
     if reTy != "" {
@@ -11238,7 +11237,7 @@ function monoMakeInstanceRetJoin(
     }
     let jun = ""
     if sharedRep < 0 {
-      jun = monoInferRetSetUnionName(jDecl, pinnedTyIx, letBN, letBT, jTy)
+      jun = monoRetSetRead(jDecl, ek, jTy)
       // A list of records has no value atom, so the union is spelled by each list's row (D2782).
       if jun == "" && twoListTy >= 0 {
         jun = monoListUnionRowName(twoListTy)
@@ -11273,6 +11272,26 @@ function monoMakeInstanceRetJoin(
   }
   twoOut.push(twoListTy)
   nret
+}
+
+// Returned expression `r`'s type at instance `ek`; -1 in an arm the instance makes dead.
+function monoRetTyAt(r: i32, ek: i32): i32 {
+  if elabNodeDead(r, ek) { return -1 }
+  elabNodeTy(r, ek)
+}
+
+// The union an un-annotated return set of `decl` joins to at instance `ek`, handing its type
+// out beside it; "" when the returns do not join to one the instance can name.
+function monoRetSetRead(decl: i32, ek: i32, outTy: i32[]): string {
+  if decl < 0 { return "" }
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) { return "" }
+  const rets: i32[] = []
+  a20CollectRets(dn.fnBody, rets)
+  if rets.length < 2 { return "" }
+  const rts: i32[] = []
+  for r in rets { rts.push(monoRetTyAt(r, ek)) }
+  monoRetSetUnionNameOf(decl, rets, rts, outTy)
 }
 
 // The return pins read off the template's checked signature, last of the return rungs: a
@@ -11739,6 +11758,7 @@ function monoMakeInstanceLater(
 function monoMakeInstanceRet(
   fn: FuncDecl,
   origFe: i32,
+  ek: i32,
   params: i32[],
   pinned: string[],
   pinKinds: i32[],
@@ -11767,6 +11787,7 @@ function monoMakeInstanceRet(
   nret = monoMakeInstanceRetExpr(
     fn,
     origFe,
+    ek,
     nret,
     params,
     pinned,
@@ -12427,6 +12448,7 @@ function monoMakeInstanceGo(
     const nret = monoMakeInstanceRet(
       fn,
       origFe,
+      ek,
       params,
       pinned,
       pinKinds,

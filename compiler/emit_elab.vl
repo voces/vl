@@ -11,6 +11,7 @@ import {
   elabCallN,
   elabCallT,
   elabCapBegin,
+  elabCapDeadIx,
   elabCapEnd,
   elabCapKey,
   elabCapKeySet,
@@ -37,13 +38,24 @@ import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
 import { monoRecheckEnd } from "./check_demands"
 import { cbExpMark, cbExpTruncate } from "./check_expected"
 import { RB_ALL, checkMark, checkRollback } from "./check_rollback"
+import { UM_ASG_NAR_TY, UM_ASG_TV_WRITE, undoKeysSince } from "./check_map_undo"
+import { asgNarTyIxOf, asgTvWriteOf } from "./check_asg_rows"
+import { monoLocalDeclTy } from "./check_leaf_steps"
+import { lookup } from "./check_scopes"
 import { holePinHeldSet } from "./check_hole_pins"
 import { njFnIx, njFnIxSet } from "./check_nj_join"
 import { nodeTyIxOf } from "./check_node_tys"
 import { bindGenWalk, substTyDeep, widenLitTy } from "./check_relate_core"
 import { pushScope } from "./check_narrow_paths"
 import { popScope } from "./check_narrow_flow"
-import { T, TY_ERR, TyFunc, tyAt, tyMentionsTyVarNamed, tyToStructStr } from "./check_types"
+import {
+  T,
+  TY_ERR,
+  TyFunc,
+  tyAt,
+  tyMentionsTyVarNamed,
+  tyToStructStr,
+} from "./check_types"
 import {
   bodyRebuiltFrom,
   fnParent,
@@ -67,6 +79,19 @@ export let elabNodeTys: {[i32]: i32[]} = Map()
 // The type the checker left on each node, taken before the emitter's passes rewrite any body; a
 // node the emitter has since retyped, or minted, reads none.
 let elabGenTy: i32[] = []
+
+// The instances under which each node sits in the arm of a test the instance makes dead.
+let elabDeadKs: {[i32]: i32[]} = Map()
+
+// Each assignment's write banks at each instance that wrote them, by node: the instance, its
+// `asgNarTyIxOf` and its `asgTvWriteOf` (0 or 1), three to a write.
+let elabAsgRows: {[i32]: i32[]} = Map()
+
+// Each instance's body-level locals once its statements are checked: the name, the type its
+// slot holds (`monoLocalDeclTy`) and the type a read there sees.
+let elabLocN: string[][] = []
+let elabLocDecl: i32[][] = []
+let elabLocRead: i32[][] = []
 
 // The cap past which an instance is not enqueued: polymorphic recursion grows without bound.
 const ELAB_MAX_KEYS = 20000
@@ -263,7 +288,11 @@ function elabParamsClosed(decl: i32, names: string[], tys: i32[]): boolean {
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) { return false }
   const marks: i32[] = []
-  for t in tys { marks.push(if t >= 0 && t < T.tys.length && tyHasTyVar(t) { TY_ERR } else { t }) }
+  for t in tys {
+    marks.push(
+      if t >= 0 && t < T.tys.length && tyHasTyVar(t) { TY_ERR } else { t },
+    )
+  }
   const held = holePinHeldSet(true)
   let open = false
   for p in dn.fnParams {
@@ -275,7 +304,9 @@ function elabParamsClosed(decl: i32, names: string[], tys: i32[]): boolean {
   const sig = nodeTyIxOf(decl)
   if !open && dn.fnTyParams.length > 0 && sig >= 0 && sig < T.tys.length {
     const f = tyAt(sig)
-    if f is TyFunc { open = !elabTyClosed(substTyDeep(f.fnRet, names, marks), 0) }
+    if f is TyFunc {
+      open = !elabTyClosed(substTyDeep(f.fnRet, names, marks), 0)
+    }
   }
   holePinHeldSet(held)
   !open
@@ -342,14 +373,25 @@ export function elabWalkPop() {
 
 // The instance of emitted declaration `decl0` at `names0`/`tys0` and parameter types `pTys`,
 // found or checked now under the instance being walked; -1 when none can be.
-export function elabDemand(decl0: i32, names0: string[], tys0: i32[], pTys: i32[]): i32 {
+export function elabDemand(
+  decl0: i32,
+  names0: string[],
+  tys0: i32[],
+  pTys: i32[],
+): i32 {
   const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
   if top < -1 { return -1 }
   elabDemandFrom(decl0, names0, tys0, pTys, top)
 }
 
 // `elabDemand` under instance `from`, or at the root when it is -1.
-function elabDemandFrom(decl0: i32, names0: string[], tys0: i32[], pTys: i32[], from: i32): i32 {
+function elabDemandFrom(
+  decl0: i32,
+  names0: string[],
+  tys0: i32[],
+  pTys: i32[],
+  from: i32,
+): i32 {
   const decl = elabSrcDecl(decl0)
   const names: string[] = []
   const tys: i32[] = []
@@ -365,7 +407,9 @@ function elabDemandFrom(decl0: i32, names0: string[], tys0: i32[], pTys: i32[], 
     if f is TyFunc {
       let p = 0
       while p < f.fnParamTypes.length && p < pTys.length {
-        if elabTyClosed(pTys[p], 0) { bindGenWalk(f.fnParamTypes[p], pTys[p], names, tys) }
+        if elabTyClosed(pTys[p], 0) {
+          bindGenWalk(f.fnParamTypes[p], pTys[p], names, tys)
+        }
         p = p + 1
       }
     }
@@ -431,8 +475,10 @@ function elabOne(k: i32) {
   const cbm = cbExpMark()
   const em = checkMark()
   const sv = monoRecheckBegin(decl, pTys, names, tys)
+  elabLocalsBank(k)
   elabCapEnd()
   if sv != null { monoRecheckEnd(sv) }
+  elabAsgBank(k, em.undo)
   checkRollback(em, RB_ALL)
   cbExpTruncate(cbm)
   elabCapKeySet(savedKey)
@@ -449,6 +495,11 @@ function elabOne(k: i32) {
     ps.push(elabCapTy[ix] ?? -1)
     elabNodeTys[ix] = ps
   }
+  for ix in elabCapDeadIx.keys() {
+    const ds = elabDeadKs[ix] ?? []
+    ds.push(k)
+    elabDeadKs[ix] = ds
+  }
   // The body's closed calls are instances too.
   let c = 0
   while c < elabCallIx.length {
@@ -456,6 +507,55 @@ function elabOne(k: i32) {
       elabEnqueue(elabCallD[c], elabCallN[c], elabCallT[c], k)
     }
     c = c + 1
+  }
+  0
+}
+
+// Banks instance `k`'s body-level locals from the scope its re-check leaves open.
+function elabLocalsBank(k: i32) {
+  while elabLocN.length <= k {
+    elabLocN.push([])
+    elabLocDecl.push([])
+    elabLocRead.push([])
+  }
+  const top = T.scopes.length - 1
+  if top < 0 { return 0 }
+  for nm in T.scopes[top].keys() {
+    elabLocN[k].push(nm)
+    elabLocDecl[k].push(monoLocalDeclTy(nm))
+    elabLocRead[k].push(lookup(nm))
+  }
+  0
+}
+
+// Local `name`'s type at the end of instance `k`'s body: the type its slot holds when `slot`,
+// else the type a read there sees; -1 when `k` has no such local.
+export function elabLocalTy(k: i32, name: string, slot: boolean): i32 {
+  if k < 0 || k >= elabLocN.length { return -1 }
+  let i = 0
+  while i < elabLocN[k].length {
+    if elabLocN[k][i] == name {
+      return if slot { elabLocDecl[k][i] } else { elabLocRead[k][i] }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Banks the assignment write banks instance `k` logged since undo row `undo`, before its rollback
+// puts them back.
+function elabAsgBank(k: i32, undo: i32) {
+  const keys = undoKeysSince(undo, UM_ASG_NAR_TY)
+  for x in undoKeysSince(undo, UM_ASG_TV_WRITE) { keys.push(x) }
+  const seen: {[i32]: boolean} = Map()
+  for ix in keys {
+    if seen[ix] ?? false { continue }
+    seen[ix] = true
+    const ps = elabAsgRows[ix] ?? []
+    ps.push(k)
+    ps.push(asgNarTyIxOf(ix))
+    ps.push(if asgTvWriteOf(ix) { 1 } else { 0 })
+    elabAsgRows[ix] = ps
   }
   0
 }
@@ -476,6 +576,11 @@ export function elabRun() {
   elabSlotKeys = Map()
   elabNodeTys = Map()
   elabGenTy = []
+  elabDeadKs = Map()
+  elabAsgRows = Map()
+  elabLocN = []
+  elabLocDecl = []
+  elabLocRead = []
   let g = 0
   while g < P.nodes.length {
     elabGenTy.push(nodeTyIxOf(g))
@@ -509,13 +614,43 @@ function elabTyIn(ix: i32, k: i32): i32 {
     src = nodeSrc[ix] ?? -1
     ps = elabNodeTys[src] ?? []
   }
-  if ps.length > 0 && (src < 0 || src >= elabGenTy.length || elabGenTy[src] != nodeTyIxOf(ix)) { return -2 }
+  if (
+    ps.length > 0
+    && (src < 0 || src >= elabGenTy.length || elabGenTy[src] != nodeTyIxOf(ix))
+  ) {
+    return -2
+  }
   let i = 0
   while i + 1 < ps.length {
     if ps[i] == k { return ps[i + 1] }
     i = i + 2
   }
   -1
+}
+
+// Whether node `ix` (or the node it copies) sits at instance `k` in the arm of a test `k` makes dead.
+export function elabNodeDead(ix: i32, k: i32): boolean {
+  let ds = elabDeadKs[ix] ?? []
+  if ds.length == 0 { ds = elabDeadKs[nodeSrc[ix] ?? -1] ?? [] }
+  for d in ds {
+    if d == k { return true }
+  }
+  false
+}
+
+// The write banks of assignment `ix` (or the node it copies) at the instance emitted function
+// `fnIx` is, as `[asgNarTyIxOf, asgTvWriteOf]`; empty when that instance wrote neither.
+export function elabAsgOf(ix: i32, fnIx: i32): i32[] {
+  let ps = elabAsgRows[ix] ?? []
+  if ps.length == 0 { ps = elabAsgRows[nodeSrc[ix] ?? -1] ?? [] }
+  if ps.length == 0 { return [] }
+  const k = elabKeyAt(fnIx)
+  let i = 0
+  while i + 2 < ps.length {
+    if ps[i] == k { return [ps[i + 1], ps[i + 2]] }
+    i = i + 3
+  }
+  []
 }
 
 // The closed type of node `ix` at instance `k`: what the elaboration recorded, else (a node it
@@ -540,7 +675,6 @@ export function elabNodeTy(ix: i32, k: i32): i32 {
   s
 }
 
-
 // Node `ix`'s type at the instance `fnIx` is, or -1 where its elaboration leaves it open. A
 // module-scope argument the callee's type parameters type reads at the instance the call reaches.
 export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
@@ -552,9 +686,7 @@ export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
 // The worklist key emitted function `fnIx` is: the nearest demanded slot up its lift chain, then
 // each declaration emitted in place below it resolved to its one instance under that key. -1 at
 // the root, -2 under a slot no demand keyed, -3 where an in-place declaration has several.
-export function elabKeyAt(fnIx: i32): i32 {
-  elabKeyAtPos(fnStmtsPosOf(fnIx))
-}
+export function elabKeyAt(fnIx: i32): i32 { elabKeyAtPos(fnStmtsPosOf(fnIx)) }
 
 export function elabKeyAtPos(pos0: i32): i32 {
   let pos = pos0

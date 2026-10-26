@@ -31,10 +31,6 @@ import {
   njPinFn,
   objPinTyIx,
   pinResolvedFnTy,
-  retWatchArm,
-  retWatchDeadDiags,
-  retWatchDisarm,
-  retWatchTy,
 } from "./check_core_state"
 import {
   HD_BINOP,
@@ -63,7 +59,6 @@ import {
   bindOf,
   callPinFnTy,
   listLitFresh,
-  monoLocalDeclTy,
   monoRetScalarKind,
   njApartSet,
   nomLitRelax,
@@ -74,7 +69,6 @@ import { tpIfJoinAt } from "./check_tp_join"
 import { njFnReached } from "./check_nj_gate"
 import { armLit, gRootStmts, njFnGated, njJoinMayPart } from "./check_nj_join"
 import { nodeTyIx, nodeTyIxOf, nodeTySet } from "./check_node_tys"
-import { lbiKeepName } from "./check_num_lit_state"
 import { ovChooseMsg } from "./check_overload"
 import { pinRefusedAt } from "./check_pin_refusals"
 import {
@@ -138,9 +132,6 @@ import {
 } from "./check_types"
 import { binArithPinTy, tyIsNumUnion } from "./check_union_mint"
 import { i32ListHas } from "./listutil"
-import { monoRecheckBegin } from "./check_assignable"
-import { checkNode } from "./typecheck"
-import { monoRecheckEnd } from "./check_demands"
 import { nominalDeclAtOfObj, nullableRetName } from "./check_fit_rules"
 import {
   assignable,
@@ -924,94 +915,40 @@ export function nodeUnionName(ix: i32) {
   ""
 }
 
-// Monomorphic body inference: lifts the element-hole ceiling for an un-annotated param by
-// re-checking the shared body with each param bound to `paramTyIxs` (arena indices), fully
-// isolated (`inferQuiet`, every append-only table truncated back). Returns the resolved list
-// type name of `localName`, or "" when it is not an inferred list or stays generic.
-export function monoInferListElem(
-  declIx: i32,
-  paramTyIxs: i32[],
-  localName: string,
-  outTy: i32[],
-) {
-  const noTpN: string[] = []
-  const noTpT: i32[] = []
-  const sv = monoRecheckBegin(declIx, paramTyIxs, noTpN, noTpT)
-  if sv == null { return "" }
-  // Read the resolved local: a fully-pinned `T[]` (element not a `TyVar`) renders its
-  // list type name; anything else (not a list, or still generic) yields "".
-  let listName = ""
-  const lt = monoLocalDeclTy(localName)
-  if lt >= 0 {
-    const ltt = tyAt(lt)
-    if ltt is TyArray {
-      if ltt.aElem >= 0 {
-        const el = tyAt(ltt.aElem)
-        if !(el is TyVar) {
-          listName = tyToStructStr(lt)
-          // Hands the arena row out beside the render: `lt` IS the list type, and without this
-          // the caller would re-run `nameToTy` on the print, minting a duplicate for composite spellings.
-          outTy.push(lt)
-        }
-      }
+// The list type name an un-annotated `return <local>` takes from the local's type `lt` at the
+// instance, handing `lt` out beside it: a list whose element is no type variable; "" otherwise.
+export function monoListLocalName(lt: i32, outTy: i32[]): string {
+  if lt < 0 || lt >= T.tys.length { return "" }
+  const ltt = tyAt(lt)
+  if ltt is TyArray {
+    if ltt.aElem >= 0 && !(tyAt(ltt.aElem) is TyVar) {
+      outTy.push(lt)
+      return tyToStructStr(lt)
     }
   }
-  monoRecheckEnd(sv)
-  listName
+  ""
 }
 
-// The scalar sibling of `monoInferListElem`: re-checks the body with params pinned to
-// `paramTyIxs` and reads local `localName`'s resolved type, returning its prim name when it
-// settles on a concrete non-i32 scalar (`string`/`f64`/`i64`/`f32`), else "". Lets the
-// monomorphizer type an un-annotated `return <local>` whose typed-IR the checker left stale.
-export function monoInferLocalScalar(
-  declIx: i32,
-  paramTyIxs: i32[],
-  localName: string,
-  outTy: i32[],
-) {
-  const noTpN: string[] = []
-  const noTpT: i32[] = []
-  const sv = monoRecheckBegin(declIx, paramTyIxs, noTpN, noTpT)
-  if sv == null { return "" }
-  // Read the resolved local: a concrete non-i32 scalar prim renders its name; anything else
-  // (i32/boolean/non-scalar/still-generic) yields "", leaving the inferred-return path untouched.
-  let scalarName = ""
-  const lt = lookup(localName)
-  if lt >= 0 {
-    const ltt = tyAt(lt)
-    if ltt is TyPrim {
-      const pn = ltt.primName
-      if monoRetScalarKind(pn) {
-        scalarName = pn
-        // Hands the arena row out alongside the name: without it, the caller would re-run
-        // `nameToTy` on the rendered name to get back the row already held here.
-        outTy.push(lt)
-      }
+// The scalar an un-annotated `return <local>` takes from the local's type `lt` at the instance,
+// handing `lt` out beside it: a `string`, `f64`, `i64` or `f32`; "" for anything else.
+export function monoScalarLocalName(lt: i32, outTy: i32[]): string {
+  if lt < 0 || lt >= T.tys.length { return "" }
+  const ltt = tyAt(lt)
+  if ltt is TyPrim {
+    if monoRetScalarKind(ltt.primName) {
+      outTy.push(lt)
+      return ltt.primName
     }
   }
-  monoRecheckEnd(sv)
-  scalarName
+  ""
 }
 
-// D592 — the un-annotated return's own type, asked of the expression rather than guessed from
-// its shape. Without an annotation, `monoMakeInstance` walked a hand-written whitelist of
-// return-expression shapes; anything outside it kept the functype result at the `"i32"`
-// default. Filtered to the reps that default gets wrong; a still-generic or error type answers "".
-export function monoInferRetExprTy(
-  declIx: i32,
-  paramTyIxs: i32[],
-  tpNames: string[],
-  tpTys: i32[],
-  retIx: i32,
-  outTy: i32[],
-) {
-  if retIx < 0 { return "" }
-  const sv = monoRecheckBegin(declIx, paramTyIxs, tpNames, tpTys)
-  if sv == null { return "" }
+// The name an un-annotated return of type `rt` at the instance is annotated by, handing `rt` out
+// beside it: a non-i32 scalar, a struct, a list or a number union; "" for what the i32 default
+// already gets right, a still-open type or an error.
+export function monoRetExprName(rt: i32, outTy: i32[]): string {
   let retName = ""
-  const rt = checkRetAlone(retIx)
-  if rt >= 0 {
+  if rt >= 0 && rt < T.tys.length {
     if rt != TY_VOID && rt != TY_ERR && !tyHasHole(rt) {
       const rtt = tyAt(rt)
       if rtt is TyPrim {
@@ -1038,62 +975,26 @@ export function monoInferRetExprTy(
       }
     }
   }
-  monoRecheckEnd(sv)
   retName
 }
 
-// A return re-checked after the body's scopes have closed. A name in it can resolve to an outer
-// literal `const` an inner binding shadowed, so a `const` read stays a name rather than being
-// rewritten in place into the literal, which would change what the instance returns (D10165).
-function checkRetAlone(ix: i32): i32 {
-  lbiKeepName = lbiKeepName + 1
-  const t = checkNode(ix)
-  lbiKeepName = lbiKeepName - 1
-  t
-}
-
-// Whether a return's reading under its statements' narrowing, `seen`, replaces `bare`, the node
-// re-checked alone. A return the pin cannot type alone sits in an arm the pin makes dead and
-// keeps the bare reading.
-function retSeenNarrows(bare: i32, seen: i32): boolean {
-  seen >= 0 && seen != bare && bare != TY_ERR
-}
-
-// D1521 — the whole return set at this pin, joined, in the emitter's union vocabulary.
-// `monoInferRetExprTy`'s sibling: same isolation, same render-inside-it rule, but reads every
-// valued return instead of the singular one. The pin makes the answer legitimate, so the
-// name-keyed table must not hold it — one function differs across calls by its pinned types.
-export function monoInferRetSetUnionName(
+// The union name the returns `rets` of declaration `declIx`, typed `rts` at the instance, join
+// to, handing the joined type out beside it; "" when one is open or erroneous, or the join is
+// no union of two or more members.
+export function monoRetSetUnionNameOf(
   declIx: i32,
-  paramTyIxs: i32[],
-  tpNames: string[],
-  tpTys: i32[],
+  rets: i32[],
+  rts: i32[],
   outTy: i32[],
-) {
-  if declIx < 0 { return "" }
-  const dn0 = nodeAt(declIx)
-  if !(dn0 is FuncDecl) { return "" }
-  const rets: i32[] = []
-  a20CollectRets(dn0.fnBody, rets)
-  if rets.length < 2 { return "" }
-  // Each return is read as the body's statements typed it, under the narrowing in force there.
-  // A return in the arm of a test the pin makes dead keeps its bare reading, and a re-check
-  // that raised anywhere else keeps every bare reading.
-  retWatchArm(rets)
-  const d0 = T.diags.length
-  const sv = monoRecheckBegin(declIx, paramTyIxs, tpNames, tpTys)
-  const seen: i32[] = if T.diags.length - d0 == retWatchDeadDiags { retWatchTy } else { [] }
-  retWatchDisarm()
-  if sv == null { return "" }
+): string {
   let joined = -1
   let ok = true
   // Runtime returns join apart at the pin as they do in the body (`inferRetJoin`).
   let accLit = true
   let accFixed = false
   let i = 0
-  while i < rets.length {
-    let rt = checkRetAlone(rets[i])
-    if i < seen.length && retSeenNarrows(rt, seen[i]) { rt = seen[i] }
+  while i < rets.length && i < rts.length {
+    const rt = rts[i]
     if rt < 0 || rt == TY_VOID || rt == TY_ERR || tyHasHole(rt) {
       ok = false
     } else if joined < 0 {
@@ -1111,8 +1012,15 @@ export function monoInferRetSetUnionName(
     }
     i = i + 1
   }
+  if !ok { return "" }
+  monoUnionRetName(joined, outTy)
+}
+
+// The name the emitter spells union `joined` by as a return, handing `joined` out beside it; ""
+// when it is no union of two or more members, or one the emitter has no spelling for.
+export function monoUnionRetName(joined: i32, outTy: i32[]): string {
   let name = ""
-  if ok && joined >= 0 {
+  if joined >= 0 && joined < T.tys.length {
     const jt = tyAt(joined)
     if jt is TyUnion {
       if jt.uMembers.length >= 2 {
@@ -1123,13 +1031,12 @@ export function monoInferRetSetUnionName(
       }
     }
   }
-  monoRecheckEnd(sv)
   name
 }
 
 // The list type the whole return set joins to at this pin when its returns disagree (`[2]`
 // beside `[1.5]` is an `f64[]`), or a union of list types when they join to no one list;
-// -1 otherwise. `monoInferRetSetUnionName`'s list twin (D2745).
+// -1 otherwise. the union name's list twin (D2745).
 export function monoInferRetSetListTy(
   declIx: i32,
   _paramTyIxs: i32[],
