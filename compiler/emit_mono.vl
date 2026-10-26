@@ -10063,6 +10063,11 @@ export function monoStateReset() {
   monoInstRetWidenTy = 0 - 1
   monoLastInstFe = 0 - 1
   monoMakeCallIx = 0 - 1
+  monoOpenLamD = []
+  monoOpenLamT = []
+  monoOpenLamDefer = 0 - 1
+  monoOpenLamOwner = 0 - 1
+  monoOpenLamMark = 0
   monoPinArmBN = []
   monoPinArmBT = []
   monoPinCtx = -1
@@ -11434,6 +11439,10 @@ function monoMakeInstanceGo(
     const ek = elabDemand(monoOrigNode[origFe], ekN, ekT, pinnedTyIx, ekCall)
     // Everything this build mints is demanded under this instance.
     elabWalkPush(ek)
+    if makeCall >= 0 && makeCall == monoOpenLamOwner {
+      monoOpenLamOwner = -1
+      monoOpenLamFlush(monoOpenLamMark)
+    }
     if fn.fnRet >= 0 {
       monoNicheNulListCheck(fn.fnRet, k.tps, tvN, tvV, letBN, letBT)
     }
@@ -21046,7 +21055,7 @@ function monoHoleGenFnPin(
     // The checker's binding stands; the open function values its pin call hands on still take
     // that binding's parameter types (D6532).
     const an = monoFnPinAt(argIx, ctx, bt, -1, tyOut)
-    if an != "" && fl[1] >= 0 { monoPinOpenCallLams(fl[1], bt) }
+    if an != "" && fl[1] >= 0 { monoPinOpenCallLamsAt(fl[1], bt) }
     return an
   }
   let ft = monoHoleGenFnFlowTy(argIx, fl)
@@ -21210,7 +21219,7 @@ function monoFnPinAt(
   if flowDecl >= 0 {
     const noPath: string[] = []
     monoRetypePinCalls(flowDecl, noPath)
-    monoPinOpenCallLams(flowDecl, bt)
+    monoPinOpenCallLamsAt(flowDecl, bt)
   }
   // arena-tick exempt: a caller-owned out-parameter, not the arena.
   tyOut[0] = bt
@@ -21387,6 +21396,39 @@ function monoElabDeliver(
     monoArenaTouch()
   }
   true
+}
+
+// The open-call lambda pins a call's hole parameters hand on, queued while the call pins so each
+// lambda's instance is demanded under the instance the call builds: flushed once that instance is
+// demanded, or when the call returns without one. `Defer` is the call queuing, -1 for none.
+let monoOpenLamD: i32[] = []
+let monoOpenLamT: i32[] = []
+let monoOpenLamDefer = 0 - 1
+let monoOpenLamOwner = 0 - 1
+let monoOpenLamMark = 0
+
+// `monoPinOpenCallLams`, queued while a call is pinning its parameters.
+function monoPinOpenCallLamsAt(d: i32, bt: i32) {
+  if monoOpenLamDefer < 0 { return monoPinOpenCallLams(d, bt) }
+  monoOpenLamD.push(d)
+  monoOpenLamT.push(bt)
+  0
+}
+
+// Pins the queued entries from `mark` on, in queue order, and drops them.
+function monoOpenLamFlush(mark: i32) {
+  const ds: i32[] = []
+  const ts: i32[] = []
+  while monoOpenLamD.length > mark {
+    ds.push(monoOpenLamD.pop() ?? -1)
+    ts.push(monoOpenLamT.pop() ?? -1)
+  }
+  let i = ds.length - 1
+  while i >= 0 {
+    monoPinOpenCallLams(ds[i], ts[i])
+    i = i - 1
+  }
+  0
 }
 
 // Each hole lambda literal handed to the one call pinning the slot of `d` open takes the parameter
@@ -22650,6 +22692,23 @@ function monoHoleTwoPinsFail(argIx: i32, par: string, callee: string): i32 {
 let monoDestPinOff = false
 
 function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
+  const svDefer = monoOpenLamDefer
+  const svOwner = monoOpenLamOwner
+  const svMark = monoOpenLamMark
+  monoOpenLamDefer = callIx
+  monoOpenLamMark = monoOpenLamD.length
+  const mark = monoOpenLamMark
+  const r = monoInstantiateCallIn(origFe, callIx, ctx)
+  monoOpenLamDefer = -1
+  monoOpenLamOwner = -1
+  monoOpenLamFlush(mark)
+  monoOpenLamDefer = svDefer
+  monoOpenLamOwner = svOwner
+  monoOpenLamMark = svMark
+  r
+}
+
+function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
   const c = nodeAt(callIx)
   const fn = nodeAt(monoOrigNode[origFe])
   if c is Call {
@@ -22781,6 +22840,8 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
       }
       monoCallFrameSlot = monoNestedCallFrame(origFe, ctx)
       monoMakeCallIx = callIx
+      monoOpenLamOwner = callIx
+      monoOpenLamDefer = -1
       return monoMakeInstance(
         origFe,
         pinned,
