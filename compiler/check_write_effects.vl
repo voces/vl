@@ -401,8 +401,8 @@ let weShapeSums: {[string]: WeSet} = Map()
 // missing `f`'s own writes, so caching it would answer a later query with too small a summary.
 let weCut = 0
 
-// Shape summaries on a cycle through a frame still open, with the shallowest open depth each
-// reached, so each is computed once instead of once per path to it. A frame whose walk reached no
+// Shape and free-variable summaries on a cycle through a frame still open, with the shallowest
+// open depth each reached, so each is computed once instead of once per path to it. A frame whose walk reached no
 // shallower open frame is complete (the first pass of a ⊥-cut cycle is the fixpoint for the key
 // that closes it), so it is cached, and the cycle's provisional entries are settled with it.
 let weProvSlot: {[string]: i32} = Map()
@@ -625,12 +625,16 @@ export function fnWriteFreePaths(fnIx: i32): WeSet {
   // so it is the hot shape rather than an incidental one.
   const weHit = weSums[key]
   if weHit != null { return weHit }
-  if weIsOpen(key) { return weCycleSet() }
+  const cyc = weCycleHit(key)
+  if cyc != null { return cyc }
   const fd = nodeAt(fnIx)
   if fd is FuncDecl {
     const bound: string[] = []
     fnBoundNames(fnIx, bound)
-    const cutBefore = weCut
+    const depth = weOpen.length
+    const lowBefore = weLow
+    const provMark = weProvKeys.length
+    weLow = WE_NO_LOW
     weOpen.push(key)
     weRoots.push(fd.fnBody)
     const into = weAccNew(true)
@@ -638,7 +642,16 @@ export function fnWriteFreePaths(fnIx: i32): WeSet {
     if weScanFree(into, fd.fnBody, bound) { acc = weSetOf(into) }
     weRoots.pop()
     weOpen.pop()
-    weCache(key, acc, cutBefore)
+    const low = weLow
+    weLow = lowBefore
+    if weProvisional(key, acc, depth, low) { return acc }
+    // A callee's free writes are the caller's unchanged, so every member of the cycle has `acc`.
+    while weProvKeys.length > provMark {
+      weSums[weProvKeys.pop() ?? ""] = acc
+      weProvSums.pop()
+      weProvLows.pop()
+    }
+    weSums[key] = acc
     return acc
   }
   weOpaqueSet
@@ -736,18 +749,8 @@ export function fnWriteShapes(fnIx: i32): WeSet {
     weUnresAt(weUnresWit[key] ?? -1)
     return uhit
   }
-  const oi = weOpenIndex(key)
-  if oi >= 0 {
-    if oi < weLow { weLow = oi }
-    if weCycleOpaque() { return weOpaqueSet }
-    return weEmptySet
-  }
-  const ps = weProvSlot[key] ?? -1
-  if ps >= 0 && ps < weProvKeys.length && weProvKeys[ps] == key {
-    if weProvLows[ps] < weLow { weLow = weProvLows[ps] }
-    weCut = weCut + 1
-    return weProvSums[ps]
-  }
+  const cyc = weCycleHit(key)
+  if cyc != null { return cyc }
   if weProbing {
     const w = weUnresWit[key] ?? -1
     if weWitLive(w) {
@@ -792,15 +795,7 @@ export function fnWriteShapes(fnIx: i32): WeSet {
     const low = weLow
     weLow = lowBefore
     const settled = weUnres == unresBefore
-    if low < depth {
-      // On a cycle through a frame still open: complete only once that frame is.
-      if low < weLow { weLow = low }
-      weProvSlot[key] = weProvKeys.length
-      weProvKeys.push(key)
-      weProvSums.push(acc)
-      weProvLows.push(low)
-      return acc
-    }
+    if weProvisional(key, acc, depth, low) { return acc }
     weSettleCycle(provMark, acc, settled, wit)
     if settled {
       weShapeSums[key] = acc
@@ -814,6 +809,35 @@ export function fnWriteShapes(fnIx: i32): WeSet {
     return acc
   }
   weOpaqueSet
+}
+
+// The answer for `key` when it is on the cycle being walked, open higher in the recursion or
+// provisional under a frame still open, lowering `weLow` to the depth it reaches; null otherwise.
+function weCycleHit(key: string): WeSet | null {
+  const oi = weOpenIndex(key)
+  if oi >= 0 {
+    if oi < weLow { weLow = oi }
+    return weCycleSet()
+  }
+  const ps = weProvSlot[key] ?? -1
+  if ps >= 0 && ps < weProvKeys.length && weProvKeys[ps] == key {
+    if weProvLows[ps] < weLow { weLow = weProvLows[ps] }
+    weCut = weCut + 1
+    return weProvSums[ps]
+  }
+  null
+}
+
+// Record `acc` provisional when the frame at `depth` reached the shallower open depth `low`: it is
+// complete only once that frame is. False when the frame is complete now.
+function weProvisional(key: string, acc: WeSet, depth: i32, low: i32): boolean {
+  if low >= depth { return false }
+  if low < weLow { weLow = low }
+  weProvSlot[key] = weProvKeys.length
+  weProvKeys.push(key)
+  weProvSums.push(acc)
+  weProvLows.push(low)
+  true
 }
 
 // Retire the provisional summaries recorded since `mark`: the cycle they sat on closed at a frame
