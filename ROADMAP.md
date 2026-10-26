@@ -108,7 +108,13 @@ units: **hours** · **half-day** · **days**.
 - Plan: [`docs/internals/architecture-refactor-plan.md`](docs/internals/architecture-refactor-plan.md),
   which gives the order, dependencies, acceptance rules and status of L1–L14 and Track T.
 - Measurements and the shape of each item: `docs/internals/code-quality-2026-10.md`.
-- The migration follows [`docs/internals/architecture-target-2026-10.md`](docs/internals/architecture-target-2026-10.md) §3. Step 5.0 (joins typed and stored once) landed. In progress: steps 1–3 (one elaboration worklist), step 5a and L6.
+- The migration follows [`docs/internals/architecture-target-2026-10.md`](docs/internals/architecture-target-2026-10.md) §3. Step 5.0 (joins typed and stored once), step 5a (`structIdx`/`variantIdx` deleted) and increments 1 and 2 of the steps 1–3 elaboration worklist landed. L6 has no conversion left that deletes code without first changing a caller, so its remainder goes with steps 2–7 (target §4.3).
+- In progress: steps 1–3, increment 3 (Decision 5's key fixes and the `Fn#d` direct-call fold, as one PR; target §3.1).
+- Next:
+  - **Container adoption.** An un-annotated carrier (`const lv1 = [{r: null}]`, or `Map()` plus key writes) delivered to a declared type adopts it, with `recAdPushDecl` extended to container element types. This deletes the emitter's name scan (`structIndexOfObjCtxGo`, `anonMintLiteral` reuse), `letMapDestShape` (D203) and 5a's two residue hints. Removing the name match alone moves 75 classes, 3,017 census cells, from `runs` to invalid wasm.
+  - **Move the elaboration into check, with an error channel** (target §2.1). It runs after check today and rolls its errors back, so `pinHoleLambdaArg` has to stay as a check-time diagnostic; this step deletes it.
+  - **Importer-demand tracking for the check-skip.** Since step 5a, an importer's wider delivery pins a library's literal-only binding, so the library's interface row moves and the check-skip declines every edit to that library. Tracking what importers demand (the cross-module adoption ruling's stated machinery) would let it skip them again.
+  - **The corpus oracle missed a `runs → not-runs`.** On a 5a candidate seed, `cases_wasm_2` graded `tests/cases/literal-unions/nullable-atom-chain-joins-string-literal-at-sink.vl` `ok` while native `vl run --compiler <seed>` refused it (`emitProgram: literal-union string widening with no members`, rc 1, span on comment line 37). That seed is deleted and the case runs on master, so there is no gradeable witness yet; one can be rebuilt by applying the default after the call's binding in `adoptArgLits`. The wrong span is a second defect.
 
 ### Modernization program (owner, 2026-09-02)
 

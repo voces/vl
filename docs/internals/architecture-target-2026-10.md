@@ -469,7 +469,7 @@ Each step lands only when its deletion lands with it. A shadow that only adds co
 - **Scoreboard:** emit_classify ↓, seed ↓.
 
 Steps 1, 2, 3 and 4 are strictly ordered (1–3 land as one, §3.1). Step 5 starts with 5.0, and step 7 needs steps 4 and 5.
-L6 render-parse (§4.3) continues independently.
+Moving the elaboration into check, with an error channel, is a later step (§3.1). L6's remainder falls to steps 2–7 (§4.3).
 
 ### 3.1 Findings and decisions from the first landings, 2026-10-25
 
@@ -489,6 +489,33 @@ L6 render-parse (§4.3) continues independently.
 Step 5 therefore starts after step 5.0, not after step 1.
 
 **5.0 landed (#4816).** L2 fuel −1.04%, diderven build fuel −1.15%, diderven check fuel +1.63% (join typing moved into the checker), seed −0.63%; generated code byte-identical on diderven, heregeat and plumb. Residue, counted: `recShapePassArg` handles only `T → T` generics, and general bidirectional call inference replaces it; two anonLeaf no-op stubs in emit_mono go with the elaboration landing; `recAdOwn` is written and never read. D13902 filed.
+
+The findings below are from 2026-10-26.
+
+**5a landed (#4818).** `ExpCtx`'s `structIdx` and `variantIdx` are deleted, and their readers take the checker's adoption stamps. 897 census cells move to `runs` (445 each in e007218 and e007220, and 7 named), and D3037, D3386, D3458, D4135 and D4644 close. Compiler net −21 lines, seed +941 bytes, diderven check fuel +0.47% and build fuel −1.07%, L2 fuel +0.07%. A wider, field-dropping delivery now pins a literal-only binding at its delivered type (cross-module adoption ruling, 2026-10-07 B), so an importer's pin moves the library's interface row and the check-skip declines `interface`. That is sound, and it costs a re-check on every edit to such a library; importer-demand tracking, the machinery the ruling names, would let the skip serve them again.
+
+**Increments 1 and 2 of the worklist landed (#4819, #4821).** Mono's hole-parameter pins come from the per-instance elaboration (`emit_elab.vl`, `check_elab_cap.vl`), and eight pin rungs are deleted: `monoHoleGenFnFramePin`, `monoHoleLitCopyPin`, `monoOpenFnRecListPin`, `monoHoleLamArgPin` and `monoHoleLamOwnCallsPin` in increment 1, then `monoHoleLeafLitPin`, `monoOpenFnListPin` and `monoOpenFnNestedListPin`. Increment 1 closes ten rows and moves 9 classes to `runs`, with none lost; increment 2 is identity-difftree clean (0 of 11,832) and partly closes D3038. Rulings taken while landing them:
+- a leaf literal is typed contextually at its delivery in the substituted body;
+- a built-in goes through call elaboration like any other call;
+- a hole function nothing calls has no instance, and takes the D4551 default;
+- `??` over a hole is open.
+
+**Decision 4: an instance's boundary is the template's.**
+- An instance's boundary is the template's checked signature with the instance's bindings substituted, and the body's result is delivered into it. Inference at the instance never re-joins what the template typed, and the mono return ladder is deleted.
+- There is one join: a join of two types neither adapts to is their union, existing containers included (record covariance A, numeric join ruling). The direct `if b { return [2.5] } q` over `q: i32[]` was refused on master while its generic and hole spellings ran.
+- A parameter typed by the callee's use is an instance output. A lambda argument binds as `Fn#d`, and a fresh literal argument as its site, inferred like a local first-use literal. The caller's own uses type a binding before any key is formed.
+
+**Decision 5: when a function-valued parameter keys by `Fn#d`.** A function-valued parameter keys by its signature when that signature is closed, and by `Fn#d` only when it is open (a hole function or a lambda). `Fn#d` is a singleton type carried through literals, bindings, returns and fields. Its rep is the uniform closure, and a call through it is a direct call to the demanded instance. A join of `Fn#`s erases to the common signature when the demands agree; otherwise today's refusal stays, and its residue is a tagged sum. Backward propagation was rejected because it rebuilds the pin ladder.
+
+**Increment 3 lands with Decision 5's key fixes.** `pinHoleLambdaArg` is a check-time diagnostic, not a pin. Stubbing it moves 0 run outputs over 6,596 cases and loses one type error (`error-hole-lambda-delivery-demands.vl`). Deleting it would turn two type errors into build-time refusals (clause 2). The elaboration runs after check, from emit_sections, and rolls its errors back, so it cannot own that diagnosis yet. So increment 3 is one PR:
+- an open-signature function parameter keys by `Fn#L`;
+- the re-check sees `Fn#L`;
+- a function value's enclosing instance is its creator;
+- and the `Fn#d` direct-call fold.
+
+A later step is added: the elaboration moves into check with an error channel, which is §2.1's target, and deletes `pinHoleLambdaArg`.
+
+**The write-summary channels are linear on call cycles (#4820, #4822).** Both were exponential in a cycle under a narrowed path: `vl check compiler/fn_split.vl` took over 300 s on the increment 1 seed. Free-variable summaries now stay provisional while a cycle is open (5.1 s), and the parameter channel settles a cycle once per strongly connected component (its scaling axis 32.1× → 1.04×). Both are perf and soundness exceptions to "every step deletes code": compiler +71 lines for #4822.
 
 ---
 
@@ -528,10 +555,16 @@ Step 5 therefore starts after step 5.0, not after step 1.
 "↑ small" on check fuel means work moved from emit into check. The step's proof is that check plus build
 falls on diderven.
 
-### 4.3 L6 render-parse is converging, and is not part of this
+### 4.3 L6 render-parse: done as a lane, the rest goes with the steps
 
 The render/parse budget went 128/386 on 10-11 to 50/86 on 10-25 across 141 commits, with one same-day
-revert. Its floor is measured at 20/1, D8 is complete (#4803), and it files no new family rows. Keep it.
+revert. Its floor is measured at 20/1, D8 is complete (#4803), and it files no new family rows.
+
+As a separate lane, L6 is done for now (2026-10-26). At 50/86, no conversion is left that deletes code
+without first changing a caller in emit_collect, emit_mono, emit_classify, emit_obj_lit_fits or
+emit_nullable_rets: those callers pass -1 or a name, and the shape-text walkers carry no per-field type.
+The rest falls to steps 2–7, as types are threaded from the elaboration and, in step 7, registries are
+keyed by type.
 
 ---
 
