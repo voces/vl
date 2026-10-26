@@ -156,6 +156,7 @@ import {
   isParentTyIxSet,
   narIfEndsSet,
   narListDeclReadsSet,
+  nodeRepTyIx,
   shiftCountNodes,
   topUnannotFns,
   voidRetRwBlk,
@@ -342,7 +343,6 @@ import {
   ctorExprOf,
   externGlobalSig,
   gcIsLitSteps,
-  letJoinCandidatesSet,
   ljwTailSplit,
   ljwWalked,
   ljwWalkedSet,
@@ -469,6 +469,8 @@ import {
 import {
   REC_DELIV_KEPT,
   REC_DELIV_OWN,
+  recAdApartAtPin,
+  recAdOpen,
   recDelivOn,
   recDelivPush,
   recKeptAt,
@@ -484,6 +486,7 @@ import {
   recOwnSrcSet,
   recPendAt,
   recPendDstTy,
+  recPendJudge,
   recPendReset,
   recPendSrc,
   recPendSrcTy,
@@ -566,13 +569,7 @@ import {
   oneListUnionAliasName,
   transparentMemberEmitName,
 } from "./check_ty_rep"
-import {
-  nonNullTy,
-  primNameOf,
-  tyHasTyVar,
-  tyReachesHole,
-  tyStepElem,
-} from "./tyquery"
+import { nonNullTy, primNameOf, tyHasTyVar, tyStepElem } from "./tyquery"
 import {
   elemHasZero,
   partsHaveNull,
@@ -754,6 +751,7 @@ import {
   annotResolve,
   assignable,
   dupNameErr,
+  memberStorageDiffers,
   nameToTy,
   opSelfFnKeyFor,
   tErr,
@@ -3280,8 +3278,8 @@ function ljwRefuse(src: i32, dst: i32, build: i32, hint: string, at: i32) {
 }
 
 // Refuses a spread or list `+` operand `op` copied into a list of element `de` when a level
-// BELOW the copied one is stored differently: the copy converts its own level's scalars
-// (D965), but an element list would have to be copied too (D4861).
+// BELOW the copied one is stored differently, from the member it fits when `de` is a union:
+// the copy converts its own level's scalars (D965), but an element list would be copied too (D4861).
 function ljwCopiedLevelCheck(at: i32, op: i32, de: i32) {
   const p = cwPeel(op)
   if p < 0 || p >= P.nodes.length || de < 0 || de >= T.tys.length { return 0 }
@@ -3301,9 +3299,17 @@ function ljwCopiedLevelCheck(at: i32, op: i32, de: i32) {
   const lt = nonNullTy(nodeTyOf(p))
   if lt < 0 || lt >= T.tys.length { return 0 }
   const se = tyStepElem(lt)
-  if se < 0 || !listJoinStorageDiffers(se, de, 8) { return 0 }
+  if se < 0 || !memberStorageDiffers(se, de) { return 0 }
   ljwReported.push(p)
   ljwRefuse(nonNullTy(se), nonNullTy(de), sourceBuildTy(mkArrayTy(de)), "", p)
+}
+
+// Whether the list literal `at` is built at the list destination it is delivered to. That
+// delivery judges its elements, so they are not delivered again into the join of themselves.
+function rcwListBuiltAtDest(at: i32): boolean {
+  if at < 0 || at >= nodeRepTyIx.length { return false }
+  const r = nodeRepTyIx[at]
+  r >= 0 && r < T.tys.length && tyAt(r) is TyArray
 }
 
 // Walk the join sites the occurrence index collected.
@@ -3315,7 +3321,7 @@ function rcwPendJoins() {
     const n = nodeAt(at)
     const jt = nodeTyOf(at)
     if n is ArrayLit {
-      if jt >= 0 && jt < T.tys.length {
+      if jt >= 0 && jt < T.tys.length && !rcwListBuiltAtDest(at) {
         const at2 = tyAt(jt)
         if at2 is TyArray {
           let e = 0
@@ -3553,7 +3559,7 @@ function recWidenWalk(expr: i32, src: i32, dst: i32, depth: i32): boolean {
   if src < 0 || dst < 0 || depth <= 0 { return false }
   if src >= T.tys.length || dst >= T.tys.length { return false }
   if src == dst { return false }
-  if tyReachesHole(src, 8) || tyReachesHole(dst, 8) { return false }
+  if recAdOpen(src) || recAdOpen(dst) { return false }
   const x = recOriginExpr(expr)
   // A value `if`, `match` or block delivers each of its tails, each judged by its own origin.
   if x >= 0 && recIsJoin(x) {
@@ -3656,10 +3662,20 @@ function recWidenWalk(expr: i32, src: i32, dst: i32, depth: i32): boolean {
   }
 }
 
+// Whether `src` delivered as `dst` names the enclosing generic's type parameters and is stored
+// apart at some pin of it: the walk reads a type parameter as stored like anything.
+function recAdTemplatePair(src: i32, dst: i32): boolean {
+  (tyHasTyVar(src) || tyHasTyVar(dst))
+    && !recAdOpen(src)
+    && !recAdOpen(dst)
+    && recAdApartAtPin(src, dst)
+}
+
 // Judge every queued delivery, and note the ones that adopt a binding or function.
 function recRunPending() {
   let i = 0
   while i < recPendSrc.length {
+    recPendJudge(i)
     recAdoptMapNote(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i])
     // The types alone first: a pair no existing value could be refused at needs no origin.
     if recWidenWalk(-1, recPendSrcTy[i], recPendDstTy[i], 12) {
@@ -3671,6 +3687,9 @@ function recRunPending() {
         objShapeAdapterlessErr(recPendAt[i], recPendSrcTy[i], recPendDstTy[i])
       }
       shapeAdaptRecStorageSet(false)
+      recAdoptNote(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i])
+    } else if recAdTemplatePair(recPendSrcTy[i], recPendDstTy[i]) {
+      // A generic's own types, stored apart at some pin: each pin's re-check judges the value.
       recAdoptNote(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i])
     } else {
       recAdoptUnionList(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i])
@@ -4192,7 +4211,6 @@ export function checkProgramPass(rootIx: i32) {
   // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
   nodeTyIx = []
   nodeTyWrites = nodeTyWrites + 1
-  letJoinCandidatesSet([])
   isVarTyIxSet([])
   isParentTyIxSet([])
   isParentElseTyIxSet([])

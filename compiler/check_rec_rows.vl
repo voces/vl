@@ -11,7 +11,6 @@ import {
   P,
   arenaSetNode,
   i32ToStr,
-  mkTypeRef,
   nodeAt,
 } from "./ast"
 import {
@@ -44,11 +43,14 @@ import {
 import { i32ListHas } from "./listutil"
 import {
   T,
+  TY_I32,
+  TY_STR,
   TyArray,
   TyMap,
   TyObj,
   TyUnion,
   tyAt,
+  tyHasInferHole,
   tyHoldsObj,
   tySame,
 } from "./check_types"
@@ -58,7 +60,10 @@ import {
   cwIxUpKind,
   cwPeelValue,
 } from "./check_write_scan"
-import { nonNulTyOf, tyReachesHole } from "./tyquery"
+import { nonNulTyOf, tyHasTyVar, tyReachesHole, tyTvsAmong } from "./tyquery"
+import { tpEnvNames } from "./check_cursor"
+import { substTyDeep } from "./check_relate_core"
+import { parseTypeSpelling } from "./parser"
 import {
   REC_STORE_DEPTH,
   fieldStorageEq,
@@ -76,6 +81,10 @@ export let recPendSrcTy: i32[] = []
 export let recPendDstTy: i32[] = []
 export let recPendAt: i32[] = []
 export let recPendSeen: {[string]: boolean} = Map()
+// The type parameters in scope at each queued delivery, and those of the one being judged.
+let recPendTps: string[][] = []
+let recAdJudgeTps: string[] = []
+let recAdJudging = false
 
 // Drop every queued delivery: at a pass's start, and once the pass has judged them.
 export function recPendReset() {
@@ -83,7 +92,50 @@ export function recPendReset() {
   recPendSrcTy = []
   recPendDstTy = []
   recPendAt = []
+  recPendTps = []
   recPendSeen = Map()
+  recPendJudge(-1)
+}
+
+// Judge queued delivery `i` in the scope it is queued in; -1 returns to the checker's own.
+export function recPendJudge(i: i32) {
+  recAdJudging = i >= 0 && i < recPendTps.length
+  recAdJudgeTps = if recAdJudging { recPendTps[i] } else { [] }
+  0
+}
+
+// The type parameters in scope where the delivery being judged is raised.
+function recAdScope(): string[] {
+  if recAdJudging { recAdJudgeTps } else { tpEnvNames }
+}
+
+// Whether no adoption can be decided at `ty`: it is a hole, reaches an inference hole, or names
+// a type variable no generic enclosing the delivery binds.
+export function recAdOpen(ty: i32): boolean {
+  ty < 0
+    || ty >= T.tys.length
+    || tyHasInferHole(ty, 0)
+    || !tyTvsAmong(ty, recAdScope(), 0)
+}
+
+// Whether `own` and `dst` store some part differently at some pin of the enclosing generic: with
+// every type parameter bound to `i32`, or to `string`. Without one, at their own types.
+export function recAdApartAtPin(own: i32, dst: i32): boolean {
+  if !tyHasTyVar(own) && !tyHasTyVar(dst) {
+    return !fieldStorageEq(own, dst, REC_STORE_DEPTH)
+  }
+  recAdApartAt(own, dst, TY_I32) || recAdApartAt(own, dst, TY_STR)
+}
+
+function recAdApartAt(own: i32, dst: i32, pin: i32): boolean {
+  const names = recAdScope()
+  const tys: i32[] = []
+  for _ in names { tys.push(pin) }
+  !fieldStorageEq(
+    substTyDeep(own, names, tys),
+    substTyDeep(dst, names, tys),
+    REC_STORE_DEPTH,
+  )
 }
 
 // Queue one delivery, when both types hold a record.
@@ -97,6 +149,9 @@ export function recPend(srcExpr: i32, srcTy: i32, dstTy: i32, at: i32) {
   recPendSrcTy.push(srcTy)
   recPendDstTy.push(dstTy)
   recPendAt.push(at)
+  const tps: string[] = []
+  for nm in tpEnvNames { tps.push(nm) }
+  recPendTps.push(tps)
   0
 }
 
@@ -233,9 +288,9 @@ export function recAdPushDecl(
   if !(tyAt(own) is TyObj) { return 0 }
   const dst = recAdLanding(own, dstIn)
   if dst < 0 || dst >= T.tys.length || !(tyAt(dst) is TyObj) { return 0 }
-  if tyReachesHole(own, 8) || tyReachesHole(dst, 8) { return 0 }
+  if recAdOpen(own) || recAdOpen(dst) { return 0 }
   if !objFieldNameSetsEq(own, dst) { return 0 }
-  if fieldStorageEq(own, dst, REC_STORE_DEPTH) { return 0 }
+  if !recAdApartAtPin(own, dst) { return 0 }
   if decl < 0 { return 0 }
   const wide = recNumChanges(own, dst, REC_STORE_DEPTH)
   if nodeAt(decl) is FuncDecl {
@@ -394,13 +449,22 @@ function recAdKeep(d: i32, n: Node, name: string, isFn: boolean, ty: string) {
   0
 }
 
+// The annotation `spell` parses to at the declaration `d`, as a written one would; -1, and `d`
+// never adopts, when the renderer's spelling is no annotation the parser reads.
+function recAdPinAnn(d: i32, spell: string, pos: i32): i32 {
+  const ann = parseTypeSpelling(spell, pos)
+  if ann < 0 { recAdNoAdopt[d] = true }
+  ann
+}
+
 // Write `ty`, spelled `spell`, as the annotation of the binding declared at `d`, when it is one.
 function recAdPinLet(d: i32, ty: string, spell: string) {
   const n = nodeAt(d)
   if n is LetDecl {
+    const ann = recAdPinAnn(d, spell, n.pos)
+    if ann < 0 { return 0 }
     recAdKeep(d, n, n.letName, false, ty)
     recAdPinned[d] = true
-    const ann = mkTypeRef(spell, n.pos)
     const nn: Node = {
       letKw: n.letKw,
       letName: n.letName,
@@ -417,8 +481,9 @@ function recAdPinLet(d: i32, ty: string, spell: string) {
 function recAdPinFn(d: i32, ty: string, spell: string) {
   const n = nodeAt(d)
   if n is FuncDecl {
+    const ann = recAdPinAnn(d, spell, n.pos)
+    if ann < 0 { return 0 }
     recAdKeep(d, n, n.fnName, true, ty)
-    const ann = mkTypeRef(spell, n.pos)
     const nn: Node = {
       fnName: n.fnName,
       fnTyParams: n.fnTyParams,
