@@ -183,7 +183,9 @@ import {
   covarTwoUnionsErr,
   covarWriteThroughErr,
   listFieldWidenDst,
-  litAtRecordDst,
+  listLitExactArm,
+  listLitExactMember,
+  litAtDstStorage,
   litElemSrcTy,
   nomLitAdopts,
   objLitUndeclaredErr,
@@ -1362,6 +1364,44 @@ function assignableLitExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   false
 }
 
+// The list member of union `dstTy` that the list literal `srcExpr` is delivered to: its own type
+// if a member, else the first list member it fits, looking through `| null` and nested unions;
+// -1 where `srcExpr` is no list literal or no member takes it. Asked quietly, records nothing.
+function listArmOfUnionFit(srcExpr: i32, srcTy: i32, dstTy: i32): i32 {
+  if !(nodeAt(parenPeelIx(srcExpr)) is ArrayLit) { return -1 }
+  const own = listArmIn(srcExpr, srcTy, dstTy, true, 6)
+  if own >= 0 { return own }
+  const ex = listLitExactArm(dstTy, srcExpr)
+  if ex >= 0 { return ex }
+  listArmIn(srcExpr, srcTy, dstTy, false, 6)
+}
+
+// One pass of `listArmOfUnionFit`: `exact` asks for `srcTy` itself, else the first list member
+// `srcExpr` fits. `depth` bounds the walk through nested unions.
+function listArmIn(
+  srcExpr: i32,
+  srcTy: i32,
+  dstTy: i32,
+  exact: boolean,
+  depth: i32,
+): i32 {
+  const d = nonNullTy(dstTy)
+  if depth <= 0 || d < 0 { return -1 }
+  const u = tyAt(d)
+  if !(u is TyUnion) { return -1 }
+  for m in u.uMembers {
+    if m >= 0 {
+      if exact && m == srcTy { return m }
+      if !exact && tyAt(m) is TyArray && assignableExpr(srcExpr, srcTy, m) {
+        return m
+      }
+      const inner = listArmIn(srcExpr, srcTy, m, exact, depth - 1)
+      if inner >= 0 { return inner }
+    }
+  }
+  -1
+}
+
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
   nolNoteDelivery(srcExpr, dstTy)
@@ -1418,13 +1458,14 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     && srcExpr >= 0
     && (tyReachesEmptyHole(srcTy, 8)
     || tyReachesUnion(dstTy, 8)
-    || litAtRecordDst(srcExpr, dstTy))
+    || litAtDstStorage(srcExpr, dstTy))
   if rtStamp && repStampableLit(srcExpr) {
     const q = inferQuiet
     inferQuiet = true
     const sOk = assignableExpr(srcExpr, srcTy, dstTy)
+    const at = if sOk { listArmOfUnionFit(srcExpr, srcTy, dstTy) } else { -1 }
     inferQuiet = q
-    if sOk { recordRepTyAdopt(srcExpr, dstTy, 6) }
+    if sOk { recordRepTyAdopt(srcExpr, if at >= 0 { at } else { dstTy }, 6) }
   }
   // The flow hook for the un-annotated-parameter solve. It sits above the `assignable`
   // short-circuit because a hole source always returns there, so this is the only point in the
@@ -1716,34 +1757,35 @@ function assignableArrLitElems(
   return ok
 }
 
-// An array literal delivered into the union `d`: the first list arm it adapts into
-// element-wise is recorded on the literal. False when no arm adapts.
+// An array literal delivered into the union `d`: the list arm whose elements it has exactly,
+// else the first it adapts into, is recorded on the literal (`[1, 2]` into `f64[] | i32[]` is
+// an `i32[]`). False when no arm adapts.
 function assignableArrLitUnion(srcExpr: i32, srcTy: i32, d: TyUnion): boolean {
-  const members = d.uMembers
-  let mi = 0
-  while mi < members.length {
-    const mt = tyAt(members[mi])
-    if mt is TyArray {
-      // An `f32[]` arm adopts like any other list arm: the f32-list value atom
-      // (kind 12) gives the box a real rep, and the emitter's coerce re-encodes
-      // the literal's f64-classified elements at f32 (`coerceListKind` 7).
-      bareBraceSpecSet(bareBraceSpec + 1)
-      const armOk = assignableExpr(srcExpr, srcTy, members[mi])
-      bareBraceSpecSet(bareBraceSpec - 1)
-      if armOk {
-        if !inferQuiet {
-          while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
-          nodeTySet(srcExpr, members[mi])
-          // Rep sidecar: record the concrete array arm, recursing into elements, so the row
-          // resolver keys the arm the checker picked.
-          recordRepTyAdopt(srcExpr, members[mi], 6)
-        }
-        return true
-      }
+  const ex = listLitExactMember(d.uMembers, srcExpr)
+  if ex >= 0 && assignableArrLitArm(srcExpr, srcTy, ex) { return true }
+  for m in d.uMembers {
+    if m >= 0 && tyAt(m) is TyArray && assignableArrLitArm(srcExpr, srcTy, m) {
+      return true
     }
-    mi = mi + 1
   }
   false
+}
+
+// Delivers list literal `srcExpr` to list arm `m`, recording the arm as its type where it fits.
+function assignableArrLitArm(srcExpr: i32, srcTy: i32, m: i32): boolean {
+  // An `f32[]` arm adopts like any other list arm: the f32-list value atom (kind 12) gives the
+  // box a real rep, and the emitter's coerce re-encodes the literal's f64 elements at f32.
+  bareBraceSpecSet(bareBraceSpec + 1)
+  const armOk = assignableExpr(srcExpr, srcTy, m)
+  bareBraceSpecSet(bareBraceSpec - 1)
+  if armOk && !inferQuiet {
+    while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+    nodeTySet(srcExpr, m)
+    // Rep sidecar: record the concrete array arm, recursing into elements, so the row
+    // resolver keys the arm the checker picked.
+    recordRepTyAdopt(srcExpr, m, 6)
+  }
+  armOk
 }
 
 // ── the top-level split lives in `tyname.tyTopLevelSplit` ───────────────────
