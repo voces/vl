@@ -21,10 +21,14 @@ disagree.
   special-case helper counts). The baselines are in §4.1 of that document. Rows close as a
   side effect.
 - **No loss of language function, inference first:** no step may require an annotation.
-- **Every step deletes code,** and its proof is the same each time:
+- **A step lands when it loses no `runs` and is a sound move toward the target** (owner,
+  2026-10-26: line count is not a bar). Lines, seed bytes and fuel are reported as side
+  effects, not landing criteria; the CI gates (seed +3%, plumb-shape, scaling shape) still
+  apply. Its proof is the same each time:
   - an unchanged difftree, apart from the intended movers;
   - no `runs → not-runs`;
-  - the fuel readings above.
+  - the fuel readings above, reported.
+- **Increments and slices land in slices:** each slice is its own PR with its own proof.
 - **Paused:** no targeted L1 lanes and no new per-class L2 rules. L6's render-parse work
   continues on its own.
 

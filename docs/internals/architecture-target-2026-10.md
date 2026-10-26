@@ -376,7 +376,7 @@ rule and the call rule are written once.
 
 ---
 
-## 3. Migration, ordered. Every step deletes code.
+## 3. Migration, ordered
 
 Every step uses the same proofs, run on a quiet box:
 - **difftree** over the 16.6k-file population: byte-identical except the files listed as intended movers;
@@ -385,7 +385,10 @@ Every step uses the same proofs, run on a quiet box:
 - **diderven `vl check` and `vl build` fuel**;
 - **`plumb-shape-cost --check`**.
 
-Each step lands only when its deletion lands with it. A shadow that only adds code is not a step.
+A step lands when it loses no `runs` and is a sound move toward the target (owner, 2026-10-26: line
+count is not a bar). Lines, seed bytes and fuel are reported side effects, not landing criteria; the CI
+gates (seed +3%, plumb-shape cost, scaling shape) still apply. Each step names what it deletes, and a
+step may land in slices, each with its own proof.
 
 **Step 1. The checker banks per-instance node types; the emitter's substitution ladder goes.**
 - **Change:** the checker re-checks each body in mono's existing instance list (`monoInstFe`) under that
@@ -515,11 +518,17 @@ The findings below are from 2026-10-26.
 
 A later step is added: the elaboration moves into check with an error channel, which is §2.1's target, and deletes `pinHoleLambdaArg`.
 
-**The write-summary channels are linear on call cycles (#4820, #4822).** Both were exponential in a cycle under a narrowed path: `vl check compiler/fn_split.vl` took over 300 s on the increment 1 seed. Free-variable summaries now stay provisional while a cycle is open (5.1 s), and the parameter channel settles a cycle once per strongly connected component (its scaling axis 32.1× → 1.04×). Both are perf and soundness exceptions to "every step deletes code": compiler +71 lines for #4822.
+**The write-summary channels are linear on call cycles (#4820, #4822).** Both were exponential in a cycle under a narrowed path: `vl check compiler/fn_split.vl` took over 300 s on the increment 1 seed. Free-variable summaries now stay provisional while a cycle is open (5.1 s), and the parameter channel settles a cycle once per strongly connected component (its scaling axis 32.1× → 1.04×). Both are perf and soundness fixes that add code: compiler +71 lines for #4822.
+
+**Container adoption, slice 1: list elements (#4824).** A record literal in a list is built at the row the checker stamps, and an unrelated refused read no longer undoes a list binding's adoption (the undo is per binding). D2215 closes (runs, prints 99); D3036 moves from invalid wasm to a loud emit reject (5b residue). The D5342 guard narrows the emitter's name scan (`fieldStorageEq`) rather than deleting it. Residue: map values (slice 2), `letMapDestShape`, the name scan (bypassing it loses 29 `runs`), and `rlElemKindTbl` (5b).
+
+**Increment 3, slice 1 (#4825).** Mono reads a hole instance's literal and read types from the elaboration (`elabWalkTy`), falling back to the hole binding where it has none; 8 `d3281_join_hole` cells move from emit reject to `runs`. Value calls (`monoPinnedTyOf`, `monoLamCallTy`) stay on the binding until lambda bodies get an elaboration instance, so D3616 stays open. The lambda-body producer gap was caught by preflight through D3616; the corpus had no cell for it. Planned order: the `Fn#d` root binding and the lambda instance key (slice 2), value calls read the elaboration, then the fallback, the D6210 rung and `holeFnSplit*` are deleted. Slice 2 landed as #4826: a hole instance's lambdas and value calls read its elaboration, with the binding as the fallback, and D3616 closes.
 
 ---
 
 ## 4. Scoreboard
+
+The scoreboard reports side effects of the migration; it is not a landing criterion (§3).
 
 ### 4.1 Baselines (76a3eb8fd)
 
