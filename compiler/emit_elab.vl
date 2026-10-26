@@ -143,6 +143,9 @@ function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
 
 // The instance enclosing instance `k`'s body, -1 at the root.
 export let ekParent: i32[] = []
+// Each instance's open function-typed parameters bound to the one function value its call hands
+// them: [parameter, declaration, the instance that created the value, its type], four a row.
+let ekFnPar: i32[][] = []
 
 // Whether `d` has instances of its own: a type parameter, or a parameter typed by a type variable.
 // A return that is open only through a nested function value does not count.
@@ -176,9 +179,57 @@ function elabParentFor(d: i32, from: i32): i32 {
     e = elabEncl.get(e) ?? -1
     guard = guard + 1
   }
-  if anyOpen { return 0 - 2 }
+  if anyOpen { return elabCreatorOf(d, from) }
   -1
 }
+// The instance that created function value `d` as a parameter binding on `from`'s chain, or -2.
+function elabCreatorOf(d: i32, from: i32): i32 {
+  let a = from
+  let guard = 0
+  while a >= 0 && a < ekFnPar.length && guard < 64 {
+    const fp = ekFnPar[a]
+    let i = 0
+    while i + 3 < fp.length {
+      if fp[i + 1] == d { return fp[i + 2] }
+      i = i + 4
+    }
+    a = ekParent[a]
+    guard = guard + 1
+  }
+  0 - 2
+}
+
+// The open function-typed parameters of `decl` that call `call`, read at instance `from`, hands one
+// function value: rows as `ekFnPar` holds them.
+function elabFnArgs(decl: i32, call: i32, from: i32): i32[] {
+  const out: i32[] = []
+  if call < 0 { return out }
+  const cn = nodeAt(call)
+  const dn = nodeAt(decl)
+  if !(cn is Call) || !(dn is FuncDecl) || cn.callArgs.length != dn.fnParams.length {
+    return out
+  }
+  let p = 0
+  while p < dn.fnParams.length {
+    const pt = nodeTyIxOf(dn.fnParams[p])
+    if pt >= 0 && pt < T.tys.length && tyAt(pt) is TyFunc && tyHasTyVar(pt) {
+      const a = cn.callArgs[p]
+      let t = if from >= 0 { elabTyIn(a, from) } else { -1 }
+      if elabFnIdOf(t) < 0 { t = if a < elabGenTy.length { elabGenTy[a] } else { -1 } }
+      const d = elabFnIdOf(t)
+      const cp = if d >= 0 { elabParentFor(d, from) } else { 0 - 2 }
+      if d >= 0 && cp >= -1 {
+        out.push(p)
+        out.push(d)
+        out.push(cp)
+        out.push(t)
+      }
+    }
+    p = p + 1
+  }
+  out
+}
+
 let elabHoleCur = 0
 
 // Enqueues the hole-pin rows recorded since the last drain.
@@ -191,6 +242,7 @@ function elabDrainHoleRows() {
         elabHoleRowN[r],
         elabHoleRowT[r],
         elabHoleRowFrom[r],
+        -1,
       )
       elabReachNote(elabHoleRowFrom[r], k, -1)
     }
@@ -335,14 +387,27 @@ function elabParamsClosed(decl: i32, names: string[], tys: i32[]): boolean {
 }
 
 // Enqueues the instance of `decl` at `names0`/`tys0`; answers its key, or -1.
-function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
+// A parameter call `call` hands a function value to keys that value and the instance that made it.
+function elabEnqueue(
+  decl: i32,
+  names0: string[],
+  tys0: i32[],
+  from: i32,
+  call: i32,
+): i32 {
   if decl < 0 || !(nodeAt(decl) is FuncDecl) { return -1 }
   const names: string[] = []
   const tys: i32[] = []
   if !elabCanon(decl, names0, tys0, names, tys) { return -1 }
   const parent = elabParentFor(decl, from)
   if parent == 0 - 2 { return -1 }
-  const key = i32ToStr(parent) + "^" + elabKeyOf(decl, names, tys)
+  const fp = elabFnArgs(decl, call, from)
+  let key = i32ToStr(parent) + "^" + elabKeyOf(decl, names, tys)
+  let f = 0
+  while f + 3 < fp.length {
+    key = key + "(" + i32ToStr(fp[f]) + ")=Fn#" + i32ToStr(fp[f + 1]) + "@" + i32ToStr(fp[f + 2]) + ";"
+    f = f + 4
+  }
   const have = ekIndex[key] ?? -1
   if have >= 0 { return have }
   if ekDecl.length >= ELAB_MAX_KEYS { return -1 }
@@ -374,6 +439,7 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   ekNames.push(fn)
   ekTys.push(ft)
   ekParent.push(parent)
+  ekFnPar.push(fp)
   ekDone.push(false)
   ekReach.push([])
   k
@@ -425,9 +491,45 @@ export function elabCallDecl(ix: i32): i32 {
   if k < 0 { -1 } else { ekDecl[k] }
 }
 
+// The function declarations each parameter of instance `ck` carries as `Fn#d` while its type
+// stays open, one list per parameter.
+function elabParamFnIds(ck: i32): i32[][] {
+  const out: i32[][] = []
+  const sig = nodeTyIxOf(ekDecl[ck])
+  if sig < 0 || sig >= T.tys.length { return out }
+  const f = tyAt(sig)
+  if f is TyFunc {
+    for pt in f.fnParamTypes {
+      const bt = substTyDeep(pt, ekNames[ck], ekTys[ck])
+      const ds: i32[] = []
+      if bt >= 0 && tyHasTyVar(bt) { elabFnIdsIn(bt, ds, 0) }
+      out.push(ds)
+    }
+  }
+  out
+}
+
+// The function values the open parameters of the instance template call `call` reaches from the
+// instance being walked hold, as a key suffix: "" when they hold none.
+export function elabCallFnKey(call: i32): string {
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  if top < -1 || call < 0 { return "" }
+  const ck = elabCallInstFrom(call, top)
+  if ck < 0 { return "" }
+  let s = ""
+  let p = 0
+  for ds in elabParamFnIds(ck) {
+    for d in ds {
+      s = s + "(" + i32ToStr(p) + ")" + i32ToStr(d) + "@" + i32ToStr(elabCreatorOf(d, ck)) + ";"
+    }
+    p = p + 1
+  }
+  if s == "" { "" } else { "~fn" + s }
+}
+
 // `elabDemand` under instance `from` (the root when -1) for template call `call` (-1 for none).
-// A parameter the call's own instance binds to a function value its body reaches at two instances
-// keeps that `Fn#d` binding: no one closed type holds it, and a closed pin is only its rep.
+// A parameter the call's own instance binds to a function value keeps that `Fn#d` binding: its
+// identity is the instance's, and a closed pin is only its rep.
 function elabDemandFrom(
   decl0: i32,
   names0: string[],
@@ -442,20 +544,19 @@ function elabDemandFrom(
   const sig = if decl >= 0 { nodeTyIxOf(decl) } else { -1 }
   const byId: boolean[] = []
   const ck = if call >= 0 { elabCallInstFrom(call, from) } else { -1 }
-  if ck >= 0 && ekDecl[ck] == decl { return ck }
   if ck >= 0 && ekDecl[ck] == decl && sig >= 0 && sig < T.tys.length {
     const f = tyAt(sig)
     if f is TyFunc {
-      for pt in f.fnParamTypes {
-        const bt = substTyDeep(pt, ekNames[ck], ekTys[ck])
-        const ds: i32[] = []
-        if bt >= 0 && tyHasTyVar(bt) { elabFnIdsIn(bt, ds, 0) }
-        let id = false
-        for d in ds {
-          if elabReachedOf(ck, d).length > 1 { id = true }
+      const ids = elabParamFnIds(ck)
+      let p = 0
+      while p < f.fnParamTypes.length && p < ids.length {
+        const id = ids[p].length > 0
+        if id {
+          const pt = f.fnParamTypes[p]
+          bindGenWalk(pt, substTyDeep(pt, ekNames[ck], ekTys[ck]), names, tys)
         }
-        if id { bindGenWalk(pt, bt, names, tys) }
         byId.push(id)
+        p = p + 1
       }
     }
   }
@@ -477,7 +578,7 @@ function elabDemandFrom(
       }
     }
   }
-  const k = elabEnqueue(decl, names, tys, from)
+  const k = elabEnqueue(decl, names, tys, from, call)
   elabReachNote(from, k, -1)
   if k >= 0 && !ekDone[k] { elabOne(k) }
   k
@@ -508,6 +609,12 @@ function elabOne(k: i32) {
     }
     if pt >= 0 { pt = substTyDeep(pt, names, tys) }
     pTys.push(pt)
+  }
+  // A parameter bound to one function value reads as that value's own type.
+  let f = 0
+  while f + 3 < ekFnPar[k].length {
+    if ekFnPar[k][f] < pTys.length { pTys[ekFnPar[k][f]] = ekFnPar[k][f + 3] }
+    f = f + 4
   }
   let ret = TY_ERR
   const ft = nodeTyIxOf(decl)
@@ -574,7 +681,7 @@ function elabOne(k: i32) {
       for x in elabCallT[c] { ct.push(x) }
     }
     if tysClosed(ct) {
-      elabReachNote(k, elabEnqueue(elabCallD[c], cn, ct, k), elabCallIx[c])
+      elabReachNote(k, elabEnqueue(elabCallD[c], cn, ct, k, elabCallIx[c]), elabCallIx[c])
     }
     c = c + 1
   }
@@ -660,6 +767,7 @@ export function elabRun() {
   ekIndex = Map()
   ekKids = Map()
   ekParent = []
+  ekFnPar = []
   ekReach = []
   elabCallKeys = Map()
   elabLitArg = Map()
@@ -690,7 +798,7 @@ export function elabRun() {
       const ix = callBindIxAt(r)
       elabReachNote(
         -1,
-        elabEnqueue(elabCallDeclOf(ix), callBindNamesAt(r), tys, -1),
+        elabEnqueue(elabCallDeclOf(ix), callBindNamesAt(r), tys, -1, ix),
         ix,
       )
     }
@@ -994,7 +1102,7 @@ export function elabOutTy(t: i32, k: i32): i32 {
   const tys: i32[] = []
   for d in ds {
     const rs = elabReachedOf(k, d)
-    if rs.length == 0 { return -1 }
+    if rs.length != 1 { return -1 }
     const r = rs[0]
     let i = 0
     while i < ekNames[r].length {
