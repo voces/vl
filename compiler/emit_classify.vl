@@ -845,6 +845,8 @@ import {
   vkNulNicheOf,
 } from "./emit_sig_tokens"
 import {
+  RC_MAP,
+  RC_REF_LIST,
   coalesceChainLeftmost,
   coalesceResultIsBox,
   coalesceResultUnionName,
@@ -853,10 +855,6 @@ import {
   letUnionTyIxOf,
   narrowedClosureOf,
   narrowedClosureTyOf,
-  narrowedIsMap,
-  narrowedIsMapPlace,
-  narrowedIsRefArray,
-  narrowedIsRefArrayPlace,
   nicheReadKindAt,
   nodeJoinRowName,
   nodeMixedUnionName,
@@ -866,6 +864,7 @@ import {
   paramUnion,
   paramUnionRetName,
   readAtomKindOfTy,
+  readContainerKindOfTy,
   startBlockLetOfAt,
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentAt,
@@ -3273,7 +3272,7 @@ export function pathReadAtomKind(ix: i32, fnIx: i32): i32 {
 
 // True when every record arm of the receiver type `rt` declares field `prop` at atom `k`; a
 // receiver that is not a union asks `tyFieldTyOf`, which declines every kind but a record.
-function recvFieldIsAtom(rt: i32, prop: string, k: i32): boolean {
+function recvFieldReadsAs(rt: i32, prop: string, k: i32): boolean {
   if rt < 0 { return false }
   const p = tyPeelNul(rt)
   if p < 0 || p >= T.tys.length { return false }
@@ -3284,7 +3283,7 @@ function recvFieldIsAtom(rt: i32, prop: string, k: i32): boolean {
     while i < r.uMembers.length {
       const m = r.uMembers[i]
       if m >= 0 && tyAt(m) is TyObj {
-        if !recvFieldIsAtom(m, prop, k) { return false }
+        if !recvFieldReadsAs(m, prop, k) { return false }
         seen = true
       }
       i = i + 1
@@ -3292,7 +3291,86 @@ function recvFieldIsAtom(rt: i32, prop: string, k: i32): boolean {
     return seen
   }
   const ft = tyFieldTyOf(p, prop)
-  ft >= 0 && readAtomKindOfTy(ft) == k
+  ft >= 0 && readShapeKindOfTy(ft) == k
+}
+
+// The atom or container (`readContainerKindOfTy`) a slot declared at `ty` reads as; a nullable
+// container counts as that container, since its read is the ref, not a box.
+function readShapeKindOfTy(ty: i32): i32 {
+  const a = readAtomKindOfTy(ty)
+  if a >= 0 { return a }
+  const c = readContainerKindOfTy(tyPeelNul(ty))
+  if c > 0 { c } else { -1 }
+}
+
+// The container (`readContainerKindOfTy`) `t` is, when the instance's elaboration of `rx` names
+// the same one, else 0.
+function readContainerAgreed(rx: i32, t: i32, fnIx: i32): i32 {
+  const k = readContainerKindOfTy(t)
+  if k == 0 { return 0 }
+  const et = elabNodeTyAt(rx, fnIx)
+  if et >= 0 && readContainerKindOfTy(et) != k { return 0 }
+  k
+}
+
+// The checked type the read `rx` has here: the value an assignment just stored when it re-reads
+// its target, else its own.
+function readTyHere(rx: i32, fnIx: i32): i32 {
+  const pt = asgReReadPinAt(rx, fnIx)
+  if pt >= 0 { pt } else { nodeTyAt(rx, fnIx) }
+}
+
+// The container the identifier read at `ix` unboxes to (`RC_REF_LIST` or `RC_MAP`), or 0 when
+// it reads its cell as stored: the cell is a union box and the checker typed this read as a
+// ref-element list or a map its binding's type is not.
+export function identReadContainerAt(ix: i32, fnIx: i32): i32 {
+  if !uDeclared { return 0 }
+  const rx = unwrapParen(ix)
+  if rx < 0 || rx == storageReadIx { return 0 }
+  const k = readContainerAgreed(rx, readTyHere(rx, fnIx), fnIx)
+  if k == 0 { return 0 }
+  if identCellVKind(rx, fnIx) != "union" { return 0 }
+  const li = readBindingLetOf(rx, fnIx)
+  if li >= 0 && readShapeKindOfTy(letBindTyAt(li, fnIx)) == k { return 0 }
+  k
+}
+
+// The container a field, element or map-value read `ix` unboxes to, or 0: the checker typed
+// it as a ref-element list or a map that the slot's declared type is not already.
+export function placeReadContainerAt(ix: i32, fnIx: i32): i32 {
+  const rx = unwrapParen(ix)
+  if rx < 0 || rx == storageReadIx { return 0 }
+  const k = readContainerAgreed(rx, nodeTyAt(rx, fnIx), fnIx)
+  if k == 0 { return 0 }
+  const e = nodeAt(rx)
+  if e is Member {
+    if recvFieldReadsAs(nodeTyAt(e.memObj, fnIx), e.memProp, k) { return 0 }
+    return k
+  }
+  indexReadContainerAt(rx, k, fnIx)
+}
+
+// `k` when `rx` is an element or map-value read whose slot is a union box (its declared element
+// has no atom or container shape of its own), else 0 for every other read.
+function indexReadContainerAt(rx: i32, k: i32, fnIx: i32): i32 {
+  const e = nodeAt(rx)
+  if !(e is Index) { return 0 }
+  const rt = nodeTyAt(e.idxArr, fnIx)
+  if rt < 0 { return 0 }
+  const pt = tyPeelNul(rt)
+  if pt < 0 || pt >= T.tys.length { return 0 }
+  const r = tyAt(pt)
+  let dt = -1
+  if r is TyArray { dt = r.aElem }
+  if r is TyMap { dt = r.mVal }
+  if dt < 0 || readShapeKindOfTy(dt) >= 0 { return 0 }
+  k
+}
+
+// The map shape (`mapShapeOfExpr`) of a read a container verdict answered `RC_MAP` for.
+export function readMapArmShapeAt(ix: i32, fnIx: i32): i32 {
+  const rx = unwrapParen(ix)
+  mapArmShapeOfTy(mapTyPeel(readTyHere(rx, fnIx)))
 }
 
 // The atom a field read `o.f` is narrowed to below the field's declared type, or -1: a read
@@ -3302,7 +3380,7 @@ export function memNarrowAtomKind(memIx: i32, fnIx: i32): i32 {
   if m is Member {
     const k = pathReadAtomKind(memIx, fnIx)
     if k < 0 { return -1 }
-    if recvFieldIsAtom(nodeTyAt(m.memObj, fnIx), m.memProp, k) { return -1 }
+    if recvFieldReadsAs(nodeTyAt(m.memObj, fnIx), m.memProp, k) { return -1 }
     return k
   }
   -1
@@ -8606,8 +8684,7 @@ export function mapReadNarrowedContainer(exprIx: i32, fnIx: i32): boolean {
   const mrs = mapReadNarrowableSlot(exprIx, fnIx)
   if mrs < 0 { return false }
   if mvValKind[mrs] != MVK_UNION { return false }
-  if narrowedIsMapPlace(exprIx) { return true }
-  narrowedIsRefArrayPlace(exprIx)
+  placeReadContainerAt(exprIx, fnIx) > 0
 }
 
 // Push the narrowing for a map index place `m[1] is T` — the map twin of the ref-list
@@ -15496,8 +15573,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       const mk = valueAtomKind(mAtom)
       if mk >= 0 && mk != 6 { return false }
       // The container arms of the same narrowing (D1014), as the Index arm above.
-      if narrowedIsRefArrayPlace(exprIx) { return false }
-      if narrowedIsMapPlace(exprIx) { return false }
+      if placeReadContainerAt(exprIx, fnIx) > 0 { return false }
       // D209 — the other end of the read: an un-narrowed read the read site unboxes is not a
       // union value here either, asked with the same predicate that site uses, so the consumer
       // boxes exactly what the read delivered.
@@ -15690,12 +15766,11 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // wrapper: in this scope it is a list, not a union value — the ref-array twin of the
   // scalar-atom rule above. Without it a rebind under the narrow classified as a union
   // box while the init emitted the unboxed wrapper ref — invalid wasm.
-  if narrowedIsRefArray(e.identName) { return false }
+  if identReadContainerAt(exprIx, fnIx) > 0 { return false }
   // D1029 — and the map arm, the third member of the same rule: a map binding narrowed
   // this way reads unboxed to the map struct, but `exprUnion` keeps answering true for it,
   // so `emitUnionCoerce` hands the unboxed map to a destination typed at the union —
   // invalid wasm at six delivery positions.
-  if narrowedIsMap(e.identName) { return false }
   if paramUnion(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
     return true
   }
@@ -15737,8 +15812,7 @@ function exprUnionIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
     // ref-array or map for the same reason the atom rule above exists, since the read
     // unboxes. Without them an un-annotated rebind under the narrow took the union-box
     // cell while the init emitted the unboxed wrapper — invalid wasm.
-    if narrowedIsRefArrayPlace(exprIx) { return false }
-    if narrowedIsMapPlace(exprIx) { return false }
+    if placeReadContainerAt(exprIx, fnIx) > 0 { return false }
     return rlElemKindTbl[slot] == RLK_UNION
   }
   // A bare `m[k]` over a union-valued map yields the value union box — unless the cell is
@@ -16287,8 +16361,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       if nicheReadKindAt(unwrapParen(exprIx), e.identName, fnIx) >= 0 {
         return ""
       }
-      if narrowedIsRefArray(e.identName) { return "" }
-      if narrowedIsMap(e.identName) { return "" }
+      if identReadContainerAt(exprIx, fnIx) > 0 { return "" }
       // The sid-taking twin, off the node's own column: `sidOfNode` of this Ident is `sidOf` of
       // its name by that column's contract, so the id is read rather than the spelling re-interned.
       return unionNameOfIdentAt(
@@ -17678,7 +17751,7 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   }
   // A union binding NARROWED to a ref-element array arm (`if x is S[]` then `x[i]`): the row
   // keyed by the arm's element at this instance's pins, the wrapper the narrowed read casts to.
-  if narrowedIsRefArray(e.identName) {
+  if identReadContainerAt(exprIx, fnIx) == RC_REF_LIST {
     return refListElemNameOfInstTy(exprIx, fnIx)
   }
   // A read the resolver bound to a module global is no same-named local of this frame (D9681).
@@ -17740,7 +17813,9 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
 function refListElemNameOfMember(e: Member, exprIx: i32, fnIx: i32): string {
   // The member path's own narrowing first (D1014): a narrowed ref-element arm names the
   // arm's element, ahead of the receiver-narrowing arm below (a different question).
-  if narrowedIsRefArrayPlace(exprIx) { return refListElemNameOfNodeTy(exprIx) }
+  if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST {
+    return refListElemNameOfNodeTy(exprIx)
+  }
   // A `recv.field` ref-list field read — the field's element name from the receiver's
   // struct / narrowed variant.
   // A narrowing that names no variant (a place narrowed to a plain struct) falls through to
@@ -17796,7 +17871,9 @@ function refListElemNameOfMember(e: Member, exprIx: i32, fnIx: i32): string {
 function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   // The index place's own narrowing to a ref-array arm (D1014) — distinct from the
   // nullable-niche narrowing below it, which peels a `| null` off the cell's own name.
-  if narrowedIsRefArrayPlace(exprIx) { return refListElemNameOfNodeTy(exprIx) }
+  if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST {
+    return refListElemNameOfNodeTy(exprIx)
+  }
   // A narrowed index over a nullable-ref-array element resolves via `nulRefArrayInnerSlot`,
   // gated on the ref-array shape so an unrelated nullable-string cell can't borrow the row. D451.
   if indexElemNulRefArraySlot(unwrapParen(exprIx), fnIx) >= 0 {
@@ -20134,7 +20211,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
     Ident => {
       // A union binding narrowed to a map arm unboxes to the map struct ref, so it is a map in
       // the narrowed branch — checked first, ahead of its declared type.
-      if narrowedIsMap(e.identName) { return true }
+      if identReadContainerAt(exprIx, fnIx) == RC_MAP { return true }
       if paramMap(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
         return true
       }
@@ -20157,14 +20234,14 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       // map member/index ops on it route to the existing map lowering.
       // A union-box field narrowed to a map arm unboxes to the map struct ref — the Ident
       // arm's rule at the one receiver shape that never had it. D1014.
-      if narrowedIsMapPlace(exprIx) { return true }
+      if placeReadContainerAt(exprIx, fnIx) == RC_MAP { return true }
       if memFieldTypeCode(exprIx, fnIx) == FC_MAP { return true }
       if exprNullableMap(exprIx, fnIx) { return true }
     }
     Index => {
       // A union-box ELEMENT whose index PLACE is narrowed to a MAP arm (`if xs[0] is {[string]:
       // K}`) — the index twin of the Member arm above (D1014).
-      if narrowedIsMapPlace(exprIx) { return true }
+      if placeReadContainerAt(exprIx, fnIx) == RC_MAP { return true }
       // `scopes[i]` over a map ref list yields a Map ref, per-slot; a bare `outer[k]` over a
       // nested map likewise yields the inner Map.
       if exprRefArray(e.idxArr, fnIx) {
@@ -20291,15 +20368,6 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
   -1
 }
 
-// The mv slot of the map arm the narrowing of `key` binds: the banked map type's shape, else
-// the arm spelling's, which a complement at a generic pin leaves with no single type. Callers
-// gate on `narrowedIsMap` first.
-export function narrowedMapShapeOf(key: string): i32 {
-  const mt = mapTyPeel(narrowSlotTy(narrowSlotOf(key)))
-  if mt >= 0 { return mapArmShapeOfTy(mt) }
-  mvSlotOfMapNameTy(narrowVariantFor(key), -1)
-}
-
 // `mapShapeOfExpr` of a composition map read (a nested-map read, or a list-of-maps element)
 // yielding a typed-value map; `-1`, the mono map, otherwise.
 function mapShapeOfComposition(exprIx: i32, fnIx: i32): i32 {
@@ -20313,8 +20381,8 @@ function mapShapeOfComposition(exprIx: i32, fnIx: i32): i32 {
 function mapShapeOfMember(exprIx: i32, e: Member, fnIx: i32): i32 {
   // The member path's own narrowing to a map arm (D1014): its shape is the arm's value
   // type, ahead of the receiver-narrowing arm below (which would fall to the mono `-1`).
-  if narrowedIsMapPlace(exprIx) {
-    return narrowedMapShapeOf(placeNarrowKeyOf(exprIx))
+  if placeReadContainerAt(exprIx, fnIx) == RC_MAP {
+    return readMapArmShapeAt(exprIx, fnIx)
   }
   if memIsNarrowed(exprIx) {
     const nvi = memNarrowVariantIndex(exprIx)
@@ -20424,7 +20492,9 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   if e is Ident {
     // A union binding narrowed to a map arm resolves its shape from the arm the narrowing
     // banks, checked first ahead of declaredMap/paramMap.
-    if narrowedIsMap(e.identName) { return narrowedMapShapeOf(e.identName) }
+    if identReadContainerAt(exprIx, fnIx) == RC_MAP {
+      return readMapArmShapeAt(exprIx, fnIx)
+    }
     const gms = identReadsGlobal(sidOfNode(exprIx), exprIx)
     if !gms && declaredMap(e.identName) {
       const slot = declaredSlotOf(e.identName)
@@ -20497,8 +20567,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   // The index place's own narrowing to a map arm (D1014) — ahead of the composition read
   // below, whose answer describes the cell rather than the narrowed arm.
   if e is Index {
-    if narrowedIsMapPlace(exprIx) {
-      return narrowedMapShapeOf(placeNarrowKeyOf(exprIx))
+    if placeReadContainerAt(exprIx, fnIx) == RC_MAP {
+      return readMapArmShapeAt(exprIx, fnIx)
     }
   }
   // A composition map read yielding a typed-value map (a nested-map read, or a list-of-maps
