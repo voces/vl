@@ -906,7 +906,7 @@ axis(
 // A 12-level record whose every level holds the one below twice, so its spelling doubles per
 // level, against the same 12 levels holding it once beside an i32, through each position that
 // rendered it: a map of nullable functions over it, a list literal of them, and the record
-// built from inferred locals. Fuel reads 3.75; master `23ac8244a` read 31.3 (D9771, D9810, D9840).
+// built from inferred locals. Fuel reads 3.73; master `23ac8244a` read 31.3 (D9771, D9810, D9840).
 const genDiamond = (n: number, diamond: boolean): string => {
   const r = (a: string, b: string) => (diamond ? a : b);
   const o = ["type A0 = {x: i32}"];
@@ -933,7 +933,7 @@ axis(
 
 // The same 12-level diamond against its chain, through one use each: function type aliases
 // over it as record fields, `==` and `!=` over it, the same with a list and a nullable leaf,
-// and an un-annotated `Map()` holding it. Fuel reads 1.17, 3.42, 3.43 and 1.30; master
+// and an un-annotated `Map()` holding it. Fuel reads 1.17, 3.41, 3.42 and 1.30; master
 // `0f0face1e` read 366, 88.5, 151 and, at depth 8, 36.5.
 type DiamondUse = "fnAlias" | "eq" | "eqListLeaf" | "inferredMap";
 const genDiamondUse = (use: DiamondUse, n: number, diamond: boolean): string => {
