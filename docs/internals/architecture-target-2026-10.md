@@ -467,6 +467,8 @@ step may land in slices, each with its own proof.
   - the twin-row helpers;
   - the syntax side of the 56 twins;
   - the type-blind classifiers in emit_classify (199 functions, 7,762 lines, as the ceiling).
+- **Absorbs:** the rep-descriptor campaign (`rep-descriptor-campaign.md`), the `vtKindOfType`
+  annotation ladder, the return-kind family and the slot layer.
 - VKind becomes derived from the rep descriptor.
 - **Closes:** family E (9 open), the same-shape rows (D12465's 65 cells among them), and the L2 §7 deviation.
 - **Scoreboard:** emit_classify ↓, seed ↓.
@@ -523,6 +525,17 @@ A later step is added: the elaboration moves into check with an error channel, w
 **Container adoption, slice 1: list elements (#4824).** A record literal in a list is built at the row the checker stamps, and an unrelated refused read no longer undoes a list binding's adoption (the undo is per binding). D2215 closes (runs, prints 99); D3036 moves from invalid wasm to a loud emit reject (5b residue). The D5342 guard narrows the emitter's name scan (`fieldStorageEq`) rather than deleting it. Residue: map values (slice 2), `letMapDestShape`, the name scan (bypassing it loses 29 `runs`), and `rlElemKindTbl` (5b).
 
 **Increment 3, slice 1 (#4825).** Mono reads a hole instance's literal and read types from the elaboration (`elabWalkTy`), falling back to the hole binding where it has none; 8 `d3281_join_hole` cells move from emit reject to `runs`. Value calls (`monoPinnedTyOf`, `monoLamCallTy`) stay on the binding until lambda bodies get an elaboration instance, so D3616 stays open. The lambda-body producer gap was caught by preflight through D3616; the corpus had no cell for it. Planned order: the `Fn#d` root binding and the lambda instance key (slice 2), value calls read the elaboration, then the fallback, the D6210 rung and `holeFnSplit*` are deleted. Slice 2 landed as #4826: a hole instance's lambdas and value calls read its elaboration, with the binding as the fallback, and D3616 closes.
+
+**Container adoption, slice 2: map values (#4827).** A `Map()` held by a list or record literal adopts its delivery. `letMapDestShape` stays.
+
+**Increment 3, slice 3 (#4829).** An open call's lambdas are pinned under the instance the call builds, so each lambda's elaboration instance has that instance as its parent.
+
+**Open after #4829.** These are the forward items, in order within each line:
+- increment 3: delete the binding fallback, the D6210 rung and `holeFnSplit*`;
+- container adoption, the rest: delete the emitter's name scan (`structIndexOfObjCtxGo`, the `anonMintLiteral` reuse), `letMapDestShape`, `rlElemKindTbl` (5b) and 5a's residue hints;
+- step 6, narrowing produced once, is in progress;
+- move the elaboration into check with an error channel, which deletes `pinHoleLambdaArg`;
+- importer-demand tracking for the check-skip (cross-module adoption ruling). An importer's wider delivery pins a library's literal-only binding, so the skip declines every edit to that library until importer demand is tracked (`incremental-compilation-design.md`).
 
 ---
 

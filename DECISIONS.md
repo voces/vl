@@ -10846,3 +10846,15 @@ witness prints `RA`, though the open-`T` instance is still minted.
 **Off when relocations are armed.** A scratch build with `RELOC_ARMED` flipped records body
 offsets for per-module artifacts (docs/internals/s5-per-module-artifacts.md), and a stub would
 move them. Such a build emits every body as before.
+
+## Initialization order: a read before the initializer is an error, and the goal is a compile error (owner ruling, 2026-09-26)
+
+**The rule.** Reading a module global before its initializer ran is a clear runtime error, and so
+is a write (D2652, D2653, D2654): `g` read before its initializer ran (file:line), via f. A direct
+top-level spelling of the write is a check error. **The goal** is a compile error wherever
+init-before-read is not statically guaranteed. Initializers are also reordered at compile time
+wherever that preserves behaviour, for globals and for locals.
+
+**Where it stands.** The runtime guard is built. Its reachability pass, `initGuardScan`, is the
+analysis the compile error starts from. An uninitialized module `let` (D2655) is still open
+beside it.

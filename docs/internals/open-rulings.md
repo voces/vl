@@ -1526,6 +1526,76 @@ where it happens.
 is the confusion a type exists to catch, and nothing outside A7's own grids and fixtures uses
 it. (b) without (c) leaves no short explicit spelling.
 
+## E. Pending asks with no section above — one line each
+
+These were listed in `ROADMAP.md` with no section here. Each line states the question it owes and
+where its brief lives. A line grows into a full section, in A–D, when someone writes its options and
+a recommendation. The spec's own questions are in `docs/spec/OPEN-QUESTIONS.md`.
+
+**Language surface**
+
+- **B8, user-defined iteration.** No iterator-protocol decision is recorded. Brief:
+  `docs/internals/collections-representation-design.md`.
+- **B13, callable records.** Is a `"()"`-named member callable? This is a surface decision.
+- **B13a, multi-index `m[i, j]`.** Does a single bracket take several index arguments,
+  including over B14's free index operators? Low priority.
+- **B14, `p.method` as a bound value.** Is `c.area` a bound value or a call? This is a surface
+  decision. Brief: `docs/internals/property-access-design.md`.
+- **B17, a discarded non-void call result.** Is it refused or linted, and what is the escape
+  hatch's spelling (`_ = work()`)?
+- **A4, open-world negation tracking.** Is it built at all? The clause-1 half is DESIGN: a written
+  negation type is refused in every annotation position.
+- **A9, `readonly` record fields.** What is the readable/writable variance surface? Briefs:
+  `docs/internals/design-review-getters-effects-2026-09/`.
+- **A17, `never`.** Does `never` enter the surface vocabulary? What wasm result does a `never`
+  function declare? Do `const x = loop(1)` and a diverging `while true` count as non-returning?
+- **A14, generic newtypes and opaque identity.** Giving a newtype a runtime tag reverses the
+  erasure design. Brief: `docs/internals/newtype-design.md`.
+- **A10, const generics.** No grammar or semantics is recorded for a value type parameter.
+- **A13, a `"+"`-named struct field.** Is such a field spellable? Today it is a parse error.
+- **H4.1, a `u8` value type.** Brief: `docs/internals/selfhost-gaps.md` §H4.1.
+- **A-destructure.** Object, array and parameter destructuring (`const { x, y } = p`,
+  `function f({ x, y }: Pt)`). List destructuring is bounded by the no-tuples ruling.
+- **A15, reference identity and equality.** The owner ruled this on 2026-09-01 (DECISIONS.md), but
+  it is unbuilt, and a later diagnostic tells users "VL has no `===`". The owner reconfirms the
+  ruling before it is built.
+
+**Json**
+
+- **S4.** Does `j as T` propagate `JsonError { kind: "shape", path }`? The runtime half exists, and
+  this is its only blocker. Briefs: `docs/json-design.md` and DECISIONS.md.
+- **serde OQ-2, OQ-3 and OQ-4.** These cover union-arm wire-index order, NaN in VLB and a canonical
+  sorted-map mode. Full briefs with recommendations are in `docs/serde-design.md`.
+
+**std and host ABI**
+
+- **Reopen buffer-design O5.** Should a `memory.grow` epoch global let a host detect a detached
+  view? Brief: `docs/internals/buffer-design.md` §B5 and its O5 question.
+- **buffer-design O8.** Should `__store_string__` and `__log_string__` be deleted or lowered?
+- **`Buf` memory safety.** `Buf` is a forgeable structural record (`std/buffer.vl`), and
+  buffer-design.md §L2b has the one-word `new` newtype fix. Is it fixed or accepted? Either way it
+  goes through std-api-reviewer.
+- **Remove `utf8Length`.** It equals `.length`, so this is a breaking std removal that goes through
+  std-api-reviewer. Brief: `docs/internals/utf8-byte-ready.md`.
+- **Concurrent children.** `runProgram` waits for its child. Does `std:process` grow a
+  spawn-and-wait pair, or a batch `runPrograms(cmds, jobs)`, or does `xargs -P` stay the idiom?
+- **A child's env and cwd.** Does `runProgram` take an options record (`env`, `cwd`), or does
+  spawning `env` stay the idiom?
+- **A child's resource use.** Does the result grow CPU and peak-RSS fields from `wait4`, or does a
+  separate measured-run call exist?
+- **A digest in std.** Does `std:hash` grow `sha256(bytes)`, or does spawning `sha256sum` stay?
+- **A wall clock in std.** Does a `std:time` module arrive with a wall-clock read and a date
+  formatter, or does spawning `date` stay?
+
+**Tooling and distribution**
+
+- **C5, publish.** This covers the release tag and the brew tap.
+- **F5, the name.** Is it VL or Vital? Whichever is chosen is applied consistently.
+- **C-incremental Q2 and Q3.** These are the compile-cache default and the `--watch` surface.
+  Brief: `docs/internals/incremental-compilation-design.md`.
+- **J2.** Which runner hosts the surviving JS-side tests, Node or another?
+- **`--strip-locations` for release builds.** It was recommended on 2026-09-01 and never ruled.
+
 ## Dismissed — filed as owner rulings, verified NOT open
 
 Kept so the same 22 are not re-swept. `ALREADY-RULED` = the answer exists elsewhere; `SHIPPED` = the code already does it; `STALE-PREMISE` = the question rests on something no longer true; `NOT-AN-OWNER-CALL` = ordinary work, or a measurement settles it.
