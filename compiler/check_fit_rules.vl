@@ -255,6 +255,7 @@ import {
   recAdPushDecl,
   recAdPushMapDecl,
   recDelivPush,
+  recPend,
   recPendDstTy,
   recPendSrc,
 } from "./check_rec_rows"
@@ -1745,6 +1746,23 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   true
 }
 
+// The reads an inferred function `fd` returns when every value leaf names a local binding and
+// `call` is its one call site, so the bindings are built at `call`'s destination; else empty.
+function recReturnedBindings(fd: i32, call: i32): i32[] {
+  const out: i32[] = []
+  cwIxBuild()
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length != 1 || sites[0] != call * 2 {
+    return out
+  }
+  for lf in recFnValueLeaves(fd) {
+    const lp = cwPeelValue(lf)
+    if lp < 0 || lp >= P.nodes.length || !(nodeAt(lp) is Ident) { return [] }
+    out.push(lp)
+  }
+  out
+}
+
 // Whether call sites `sites` (`rcwCallSites`) are `call` and calls each queued for a delivery
 // that lands a record of `own` on one of `dst`'s field storage, or queued for none, so one build
 // serves them all (D8201). A call queued for none is served only when it is read for a field
@@ -2119,6 +2137,16 @@ export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     }
     return 0
   }
+  // A call is delivered as the bindings its function returns.
+  if e is Call && dt is TyMap {
+    const fd = recInferredFnOf(p)
+    if fd >= 0 {
+      for b in recReturnedBindings(fd, p) {
+        recAdoptMapNote(b, nodeTyIxOf(b), dstTy)
+      }
+    }
+    return 0
+  }
   if !(e is Ident) { return 0 }
   const decl = recFreshMapDeclOf(p)
   if decl < 0 { return 0 }
@@ -2155,9 +2183,9 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if pd >= 0 {
         return recAdPushDecl(pd, srcTy, nonNulTyOf(dstTy), false, p)
       }
-      // One holding a call is delivered as the call is (D8140).
+      // One holding a call or an element read is delivered as that origin is (D8140).
       const oc = recBindOrigin(p)
-      if oc >= 0 && oc != p && nodeAt(oc) is Call {
+      if oc >= 0 && oc != p && (nodeAt(oc) is Call || nodeAt(oc) is Index) {
         return recAdoptNote(oc, nodeTyIxOf(oc), dstTy)
       }
       return 0
@@ -2190,6 +2218,14 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   }
   if e is Call {
     const fd = recInferredFnOf(p)
+    // A list result is delivered as the bindings its function returns.
+    const sl = nonNulTyOf(srcTy)
+    if fd >= 0 && sl >= 0 && tyAt(sl) is TyArray {
+      for b in recReturnedBindings(fd, p) {
+        recAdoptNote(b, nodeTyIxOf(b), dstTy)
+      }
+      return 0
+    }
     if fd >= 0 {
       // A union member has no adoption of a call result, so one built at a declared row is
       // refused there (D8141).
@@ -4000,6 +4036,23 @@ function mapUnboxRecordLit(
 // holds: every typed delivery of a literal, a join arm included, stamps through here.
 export function adoptLitAt(x: i32, dstTy: i32) {
   if litAtRecordDst(x, dstTy) { recordRepTyAdopt(x, dstTy, 6) }
+  0
+}
+
+// Delivers the join arm `x` to the join's type `dstTy`: each literal it ends in, through nested
+// joins, is stamped, and each read of a binding is queued, so a binding holding a literal adopts.
+export function adoptArmAt(x: i32, dstTy: i32) {
+  adoptLitAt(x, dstTy)
+  if x < 0 || x >= P.nodes.length { return 0 }
+  const leaves: i32[] = []
+  tailValueLeaves(x, leaves)
+  for lf in leaves {
+    if lf != x { adoptLitAt(lf, dstTy) }
+    const p = cwPeelValue(lf)
+    if p >= 0 && p < P.nodes.length && nodeAt(p) is Ident {
+      recPend(p, nodeTyIxOf(p), dstTy, p)
+    }
+  }
   0
 }
 
