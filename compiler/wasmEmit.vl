@@ -902,6 +902,7 @@ import {
   letInfersF32,
   letInitTyIsNarrowedArm,
   letInitTyIsNarrowedNulArm,
+  letInitUnionListTy,
   letIsF64,
   letIsI64,
   letIsMap,
@@ -1201,6 +1202,7 @@ import {
 } from "./emit_obj_lit_fits"
 import {
   ListBuild,
+  destLetOf,
   emptyArrHoleBuildKind,
   emptyArrHoleBuildSlot,
   emptyArrUnionArmBuildKind,
@@ -1211,6 +1213,7 @@ import {
   listBuildKindOfVKind,
   listBuildOfTy,
   refElemListBuildKind,
+  rlBoxIntoRowList,
   rlWidenAllowed,
   rlWidenVariantOf,
   tyAnnRefListKind,
@@ -1396,7 +1399,6 @@ import {
   holeBindsFunc,
   identNameIsLiveBound,
   letListBuild,
-  letListDestLit,
   listFitShadowRow,
   litAtomWidenTexts,
   mapExactHeldTyOf,
@@ -12420,9 +12422,9 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32, ec: ExpCtx) {
   expCtxLeave(saved, r, ec)
 }
 
-// Which family keeps the caller's pair over literal `arrIx`'s type `tb`, 0 for none: 1 a binding
-// paired from a later destination, 2 a spread or untyped literal, 3 a generic or hole instance
-// (the type is the body's), 4 an unthreaded record-union list (rows the type does not name).
+// Which family keeps the caller's pair over literal `arrIx`'s type `tb`, 0 for none: 2 a spread
+// or untyped literal, 3 a generic or hole instance (the type is the body's), 4 an unthreaded
+// record-union list (rows the type does not name).
 function arrKeepsThread(
   arrIx: i32,
   fnIx: i32,
@@ -12430,7 +12432,6 @@ function arrKeepsThread(
   tb: ListBuild | null,
   ec: ExpCtx,
 ): i32 {
-  if (letListDestLit[arrIx] ?? 0) == 1 { return 1 }
   const a = nodeAt(arrIx)
   if tb == null || arrSpreadDepth > 0 { return 2 }
   if a is ArrayLit {
@@ -29500,10 +29501,18 @@ function emitRefListWidenDeclined(
   false
 }
 
+// Whether `srcIx` names a binding whose record-literal list the checker built at a union list.
+function identBuiltAtUnionList(srcIx: i32): boolean {
+  if !(nodeAt(unwrapParen(srcIx)) is Ident) { return false }
+  const fr = covarRootFrame(srcIx)
+  const li = destLetOf(covarRootName(srcIx), fr)
+  li >= 0 && letInitUnionListTy(li, fr) >= 0
+}
+
 // The delivery-site half: a value just emitted at ref-list slot `srcSlot` is being
 // delivered into a `dstSlot` destination. Widen it in place when the pair is widenable
 // and the whole-program write scan licenses it; a widenable pair the scan declines is a
-// loud refusal, since no other lowering exists. One predicate, one emitter, asked at every delivery — the seven ways VL spells "this list flows there" are `letRefListDestSlot`'s own list.
+// loud refusal, since no other lowering exists. One predicate, one emitter, every delivery.
 export function emitRefListWidenSite(
   body: u8[],
   srcIx: i32,
@@ -29515,6 +29524,17 @@ export function emitRefListWidenSite(
   listWidenRetagRowsOf(srcIx, rtFrom, rtTo)
   if rtFrom.length > 0 {
     return emitRefListRetagSite(srcIx, srcSlot, dstSlot, rtFrom, rtTo)
+  }
+  // A list two unions alias is built at union boxes (D853), which no record list can hold.
+  if rlBoxIntoRowList(srcSlot, dstSlot) && identBuiltAtUnionList(srcIx) {
+    emitFailAt(
+      "emitProgram: list delivery: this list is built as a list of union boxes, because it "
+        + "is also delivered as two different unions, so it cannot also be delivered as a "
+        + rlWidenElemName(dstSlot)
+        + "[]. Copy it for this use",
+      srcIx,
+    )
+    return false
   }
   // Not a widenable pair: the same slot, or two element reps with no conversion between
   // them. The common case at every delivery, and nothing is owed.
