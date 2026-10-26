@@ -488,6 +488,8 @@ L6 render-parse (§4.3) continues independently.
 
 Step 5 therefore starts after step 5.0, not after step 1.
 
+**5.0 landed (#4816).** L2 fuel −1.04%, diderven build fuel −1.15%, diderven check fuel +1.63% (join typing moved into the checker), seed −0.63%; generated code byte-identical on diderven, heregeat and plumb. Residue, counted: `recShapePassArg` handles only `T → T` generics, and general bidirectional call inference replaces it; two anonLeaf no-op stubs in emit_mono go with the elaboration landing; `recAdOwn` is written and never read. D13902 filed.
+
 ---
 
 ## 4. Scoreboard
