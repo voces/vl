@@ -3,7 +3,6 @@
 // and the reports a pass flushes. It sits above `typecheck.vl`, which never calls it.
 import {
   Call,
-  FuncDecl,
   LetDecl,
   Member,
   P,
@@ -55,11 +54,8 @@ import {
 } from "./check_hole_pins"
 import { intrinsicNameRefusal } from "./check_intrinsics"
 import {
-  a20CollectRets,
   bindOf,
   callPinFnTy,
-  listLitFresh,
-  monoRetScalarKind,
   njApartSet,
   nomLitRelax,
   rejoinDropSubsumed,
@@ -67,7 +63,7 @@ import {
 import { recordClonedIsVarTyIx } from "./check_list_union"
 import { tpIfJoinAt } from "./check_tp_join"
 import { njFnReached } from "./check_nj_gate"
-import { armLit, gRootStmts, njFnGated, njJoinMayPart } from "./check_nj_join"
+import { gRootStmts, njJoinMayPart } from "./check_nj_join"
 import { nodeTyIx, nodeTyIxOf, nodeTySet } from "./check_node_tys"
 import { ovChooseMsg } from "./check_overload"
 import { pinRefusedAt } from "./check_pin_refusals"
@@ -116,13 +112,11 @@ import {
   tyArrayElemIx,
   tyAt,
   tyFieldTyOf,
-  tyHasHole,
   tyIsHole,
   tyIsLitUnion,
   tyIsTwinRecordUnion,
   tyMutEpoch,
   tyNestedArrLeafRenders,
-  tySame,
   tyToEmitName,
   tyToNominalName,
   tyToStructStr,
@@ -130,7 +124,7 @@ import {
   tyVarRenames,
   unionAliasDeclNameOfTy,
 } from "./check_types"
-import { binArithPinTy, tyIsNumUnion } from "./check_union_mint"
+import { binArithPinTy } from "./check_union_mint"
 import { i32ListHas } from "./listutil"
 import { nominalDeclAtOfObj, nullableRetName } from "./check_fit_rules"
 import {
@@ -138,7 +132,6 @@ import {
   bindGenUnionArm,
   bindGenWalk,
   coalJoinAtPin,
-  joinKeepingStorage,
   joinTys,
   nameToTy,
   optFieldAtPin,
@@ -368,7 +361,11 @@ function holeBinOpReadAt(
   if hdField[row] == "+" && concatsAsStr(op) { return TY_STR }
   const ans = hdInner[row]
   if ans == hdBase[row] {
-    return binArithPinTy(hdField[row], op, hdAlt[row], hdAltAdopts[row])
+    let alt = hdAlt[row]
+    if alt >= 0 && tyIsHole(alt) {
+      alt = holePinReadAt(alt, bNames, bTys, depth + 1)
+    }
+    return binArithPinTy(hdField[row], op, alt, hdAltAdopts[row])
   }
   if ans < 0 || ans >= T.tys.length { return -1 }
   if !tyHasTyVar(ans) { return ans }
@@ -913,186 +910,4 @@ export function nodeUnionName(ix: i32) {
     TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   ""
-}
-
-// The list type name an un-annotated `return <local>` takes from the local's type `lt` at the
-// instance, handing `lt` out beside it: a list whose element is no type variable; "" otherwise.
-export function monoListLocalName(lt: i32, outTy: i32[]): string {
-  if lt < 0 || lt >= T.tys.length { return "" }
-  const ltt = tyAt(lt)
-  if ltt is TyArray {
-    if ltt.aElem >= 0 && !(tyAt(ltt.aElem) is TyVar) {
-      outTy.push(lt)
-      return tyToStructStr(lt)
-    }
-  }
-  ""
-}
-
-// The scalar an un-annotated `return <local>` takes from the local's type `lt` at the instance,
-// handing `lt` out beside it: a `string`, `f64`, `i64` or `f32`; "" for anything else.
-export function monoScalarLocalName(lt: i32, outTy: i32[]): string {
-  if lt < 0 || lt >= T.tys.length { return "" }
-  const ltt = tyAt(lt)
-  if ltt is TyPrim {
-    if monoRetScalarKind(ltt.primName) {
-      outTy.push(lt)
-      return ltt.primName
-    }
-  }
-  ""
-}
-
-// The name an un-annotated return of type `rt` at the instance is annotated by, handing `rt` out
-// beside it: a non-i32 scalar, a struct, a list or a number union; "" for what the i32 default
-// already gets right, a still-open type or an error.
-export function monoRetExprName(rt: i32, outTy: i32[]): string {
-  let retName = ""
-  if rt >= 0 && rt < T.tys.length {
-    if rt != TY_VOID && rt != TY_ERR && !tyHasHole(rt) {
-      const rtt = tyAt(rt)
-      if rtt is TyPrim {
-        if monoRetScalarKind(rtt.primName) {
-          retName = rtt.primName
-          outTy.push(rt)
-        }
-      }
-      // The struct arm: a struct is no more the i32 default than a `string` is. The render
-      // stays inside the isolation; what is printed here is not what gets minted (`monoRetRowName`).
-      if rtt is TyObj {
-        retName = tyToStructStr(rt)
-        outTy.push(rt)
-      }
-      // A list is no more the i32 default either: `[x]` at `T := f64[]` is `f64[][]` (D2300).
-      if rtt is TyArray {
-        retName = tyToEmitName(rt)
-        if retName != "" { outTy.push(rt) }
-      }
-      // Nor is a union of numbers, the box an operator over a join of the pins yields.
-      if tyIsNumUnion(rt) {
-        retName = valueUnionRetName(rt)
-        if retName != "" { outTy.push(rt) }
-      }
-    }
-  }
-  retName
-}
-
-// The union name the returns `rets` of declaration `declIx`, typed `rts` at the instance, join
-// to, handing the joined type out beside it; "" when one is open or erroneous, or the join is
-// no union of two or more members.
-export function monoRetSetUnionNameOf(
-  declIx: i32,
-  rets: i32[],
-  rts: i32[],
-  outTy: i32[],
-): string {
-  let joined = -1
-  let ok = true
-  // Runtime returns join apart at the pin as they do in the body (`inferRetJoin`).
-  let accLit = true
-  let accFixed = false
-  let i = 0
-  while i < rets.length && i < rts.length {
-    const rt = rts[i]
-    if rt < 0 || rt == TY_VOID || rt == TY_ERR || tyHasHole(rt) {
-      ok = false
-    } else if joined < 0 {
-      joined = rt
-      accLit = armLit(rt, rets[i])
-      accFixed = !listLitFresh(rets[i])
-    } else {
-      const lit = armLit(rt, rets[i])
-      const fixed = !listLitFresh(rets[i])
-      njApartSet(!accLit && !lit && !njFnGated(declIx))
-      joined = joinKeepingStorage(joined, accFixed, rt, fixed)
-      njApartSet(false)
-      accLit = accLit && lit
-      accFixed = accFixed || fixed
-    }
-    i = i + 1
-  }
-  if !ok { return "" }
-  monoUnionRetName(joined, outTy)
-}
-
-// The name the emitter spells union `joined` by as a return, handing `joined` out beside it; ""
-// when it is no union of two or more members, or one the emitter has no spelling for.
-export function monoUnionRetName(joined: i32, outTy: i32[]): string {
-  let name = ""
-  if joined >= 0 && joined < T.tys.length {
-    const jt = tyAt(joined)
-    if jt is TyUnion {
-      if jt.uMembers.length >= 2 {
-        name = valueUnionRetName(joined)
-        if name == "" { name = structUnionRetName(joined, gRootStmts) }
-        if name == "" { name = variantBoxUnionRetName(joined) }
-        if name != "" { outTy.push(joined) }
-      }
-    }
-  }
-  name
-}
-
-// The list type the whole return set joins to at this pin when its returns disagree (`[2]`
-// beside `[1.5]` is an `f64[]`), or a union of list types when they join to no one list;
-// -1 otherwise. the union name's list twin (D2745).
-export function monoInferRetSetListTy(
-  declIx: i32,
-  _paramTyIxs: i32[],
-  tpNames: string[],
-  tpTys: i32[],
-): i32 {
-  if declIx < 0 { return -1 }
-  const dn0 = nodeAt(declIx)
-  if !(dn0 is FuncDecl) { return -1 }
-  const rets: i32[] = []
-  a20CollectRets(dn0.fnBody, rets)
-  if rets.length < 2 { return -1 }
-  let joined = -1
-  let first = -1
-  let differ = false
-  let ok = true
-  let accFixed = false
-  let i = 0
-  while i < rets.length {
-    // The template's recorded type read at this pin; a recheck would bank the pin's facts.
-    let rt = nodeTyIxOf(rets[i])
-    if rt >= 0 && tyHasTyVar(rt) { rt = substTyDeep(rt, tpNames, tpTys) }
-    if rt >= 0 && tyHasTyVar(rt) { rt = -1 }
-    if rt < 0 || rt == TY_VOID || rt == TY_ERR || tyHasHole(rt) {
-      ok = false
-    } else if joined < 0 {
-      joined = rt
-      first = rt
-      accFixed = !listLitFresh(rets[i])
-    } else {
-      if !tySame(rt, first) { differ = true }
-      const fixed = !listLitFresh(rets[i])
-      joined = joinKeepingStorage(joined, accFixed, rt, fixed)
-      accFixed = accFixed || fixed
-    }
-    i = i + 1
-  }
-  if !ok || !differ || joined < 0 || joined >= T.tys.length { return -1 }
-  const jt = tyAt(joined)
-  match jt {
-    TyArray => {
-      return joined
-    }
-    TyUnion => {
-      if jt.uMembers.length < 2 { return -1 }
-      let m = 0
-      while m < jt.uMembers.length {
-        const mt = jt.uMembers[m]
-        if mt < 0 || mt >= T.tys.length { return -1 }
-        if !(tyAt(mt) is TyArray) { return -1 }
-        m = m + 1
-      }
-      return joined
-    }
-    TyPrim | TyErr | TyObj | TyFunc | TyMap | TyVar | TyLit | TyNeg | TyNullable => {
-      return -1
-    }
-  }
 }

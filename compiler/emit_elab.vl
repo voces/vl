@@ -3,8 +3,7 @@
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
 import { FuncDecl, P, Param, i32ToStr, nodeAt } from "./ast"
-import { monoRecheckOpen } from "./check_assignable"
-import { fnDeclBodyRet } from "./check_fn_decl"
+import { monoRecheckBegin } from "./check_assignable"
 import {
   elabCallD,
   elabCallDeclOf,
@@ -41,11 +40,12 @@ import { cbExpMark, cbExpTruncate } from "./check_expected"
 import { RB_ALL, checkMark, checkRollback } from "./check_rollback"
 import { UM_ASG_NAR_TY, UM_ASG_TV_WRITE, undoKeysSince } from "./check_map_undo"
 import { asgNarTyIxOf, asgTvWriteOf } from "./check_asg_rows"
-import { monoLocalDeclTy } from "./check_leaf_steps"
+import { bindOf, monoLocalDeclTy } from "./check_leaf_steps"
 import { lookup } from "./check_scopes"
 import { holePinHeldSet } from "./check_hole_pins"
 import { njFnIx, njFnIxSet } from "./check_nj_join"
 import { nodeTyIxOf } from "./check_node_tys"
+import { nodeRepTyIx } from "./check_core_state"
 import { bindGenWalk, substTyDeep, widenLitTy } from "./check_relate_core"
 import { pushScope } from "./check_narrow_paths"
 import { popScope } from "./check_narrow_flow"
@@ -125,8 +125,6 @@ function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
 
 // The instance enclosing instance `k`'s body, -1 at the root.
 export let ekParent: i32[] = []
-// Each instance's result: its substituted annotation, or what its returns infer; -1 unchecked.
-let ekRet: i32[] = []
 
 // Whether `d` has instances of its own: a type parameter, or a parameter typed by a type variable.
 // A return that is open only through a nested function value does not count.
@@ -229,8 +227,10 @@ function elabOwnName(decl: i32, name: string): boolean {
 // declaration declaring it, so a demand made after the rename keys the instance one made before.
 let elabAliasOf: {[string]: string} = Map()
 let elabAliasDecl: {[string]: i32} = Map()
+let elabAliases: string[] = []
 
 export function elabAliasNote(alias: string, name: string, declarer: i32) {
+  if !elabAliasOf.has(alias) { elabAliases.push(alias) }
   elabAliasOf[alias] = name
   elabAliasDecl[alias] = elabSrcDecl(declarer)
   0
@@ -356,7 +356,6 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   ekTys.push(ft)
   ekParent.push(parent)
   ekDone.push(false)
-  ekRet.push(-1)
   k
 }
 
@@ -449,9 +448,8 @@ function elabOne(k: i32) {
     if pt >= 0 { pt = substTyDeep(pt, names, tys) }
     pTys.push(pt)
   }
-  // An un-annotated return is the instance's own to infer; an annotated one is substituted.
-  let ret = if dn.fnRet < 0 { -2 } else { TY_ERR }
-  const ft = if dn.fnRet < 0 { -1 } else { nodeTyIxOf(decl) }
+  let ret = TY_ERR
+  const ft = nodeTyIxOf(decl)
   if ft >= 0 && ft < T.tys.length {
     const f = tyAt(ft)
     if f is TyFunc {
@@ -459,8 +457,10 @@ function elabOne(k: i32) {
       if r >= 0 && !tyHasTyVar(r) { ret = r }
     }
   }
+  const savedRet = T.curRet
   const savedFn = curFnDeclIx
   const savedNj = njFnIx
+  T.curRet = ret
   curFnDeclIx = decl
   cstrOwnerStack.push(decl)
   // A nested declaration's free names resolve against what its enclosing instance saw.
@@ -477,8 +477,7 @@ function elabOne(k: i32) {
   elabCapBegin(quietDepth + 1)
   const cbm = cbExpMark()
   const em = checkMark()
-  const sv = monoRecheckOpen(decl, pTys, names, tys)
-  if sv != null { ekRet[k] = fnDeclBodyRet(decl, pTys, ret) }
+  const sv = monoRecheckBegin(decl, pTys, names, tys)
   elabLocalsBank(k)
   elabCapEnd()
   if sv != null { monoRecheckEnd(sv) }
@@ -490,6 +489,7 @@ function elabOne(k: i32) {
   cstrOwnerStack.pop()
   curFnDeclIx = savedFn
   njFnIxSet(savedNj)
+  T.curRet = savedRet
   // Bank the body's types under `k`.
   for ix in elabCapTy.keys() {
     if ix >= elabGenTy.length { continue }
@@ -531,20 +531,6 @@ function elabLocalsBank(k: i32) {
   0
 }
 
-// Local `name`'s type at the end of instance `k`'s body: the type its slot holds when `slot`,
-// else the type a read there sees; -1 when `k` has no such local.
-export function elabLocalTy(k: i32, name: string, slot: boolean): i32 {
-  if k < 0 || k >= elabLocN.length { return -1 }
-  let i = 0
-  while i < elabLocN[k].length {
-    if elabLocN[k][i] == name {
-      return if slot { elabLocDecl[k][i] } else { elabLocRead[k][i] }
-    }
-    i = i + 1
-  }
-  -1
-}
-
 // Banks the assignment write banks instance `k` logged since undo row `undo`, before its rollback
 // puts them back.
 function elabAsgBank(k: i32, undo: i32) {
@@ -573,9 +559,9 @@ export function elabRun() {
   ekParent = []
   elabAliasOf = Map()
   elabAliasDecl = Map()
+  elabAliases = []
   elabHoleCur = 0
   ekDone = []
-  ekRet = []
   elabWalkKeys = []
   elabSlotKeys = Map()
   elabNodeTys = Map()
@@ -632,16 +618,6 @@ function elabTyIn(ix: i32, k: i32): i32 {
   -1
 }
 
-// Whether node `ix` (or the node it copies) sits at instance `k` in the arm of a test `k` makes dead.
-export function elabNodeDead(ix: i32, k: i32): boolean {
-  let ds = elabDeadKs[ix] ?? []
-  if ds.length == 0 { ds = elabDeadKs[nodeSrc[ix] ?? -1] ?? [] }
-  for d in ds {
-    if d == k { return true }
-  }
-  false
-}
-
 // The write banks of assignment `ix` (or the node it copies) at the instance emitted function
 // `fnIx` is, as `[asgNarTyIxOf, asgTvWriteOf]`; empty when that instance wrote neither.
 export function elabAsgOf(ix: i32, fnIx: i32): i32[] {
@@ -669,30 +645,67 @@ export function elabNodeTy(ix: i32, k: i32): i32 {
     // A part still unknown (an empty literal its later writes type) reads the generic type.
     if open { raw = t }
   }
-  if raw < 0 || raw >= T.tys.length || k < 0 || k >= ekNames.length {
-    return -1
+  elabSubstClosed(raw, k)
+}
+
+// Type `t` under instance `k`'s binding, or -1 where that does not close.
+function elabSubstClosed(t: i32, k: i32): i32 {
+  if t < 0 || t >= T.tys.length || k < 0 || k >= ekNames.length { return -1 }
+  let names = ekNames[k]
+  let tys = ekTys[k]
+  // A row a shadow rename moved to an alias reads the binding of the name it stands for, at
+  // the instance of the alias's declarer on `k`'s chain.
+  if elabAliases.length > 0 {
+    names = names.slice(0)
+    tys = tys.slice(0)
+    let kk = k
+    while kk >= 0 && kk < ekDecl.length {
+      for a in elabAliases {
+        if (elabAliasDecl.get(a) ?? -1) == ekDecl[kk] {
+          names.push(a)
+          tys.push(bindOf(ekNames[kk], ekTys[kk], elabAliasOf[a] ?? a))
+        }
+      }
+      kk = ekParent[kk]
+    }
   }
-  const s = substTyDeep(raw, ekNames[k], ekTys[k])
-  if s < 0 || s >= T.tys.length || tyHasTyVar(s) || !elabTyClosed(s, 0) {
+  const s = substTyDeep(t, names, tys)
+  if (
+    s < 0
+    || s >= T.tys.length
+    || s == TY_ERR
+    || tyHasTyVar(s)
+    || !elabTyClosed(s, 0)
+  ) {
     return -1
   }
   s
 }
 
-// Instance `k`'s result type, -1 when it is unknown or still open.
-export function elabRetOf(k: i32): i32 {
-  if k < 0 || k >= ekRet.length { return -1 }
-  const r = ekRet[k]
-  if (
-    r < 0
-    || r >= T.tys.length
-    || r == TY_ERR
-    || tyHasTyVar(r)
-    || !elabTyClosed(r, 0)
-  ) {
-    return -1
+// The type a fresh literal at node `ix` (or the node it copies) is built at in the instance
+// emitted function `fnIx` is: its `repOf` stamp under that instance's binding. -1 where the node
+// carries no stamp, sits at no instance, or the stamp does not close.
+export function elabRepTyAt(ix: i32, fnIx: i32): i32 {
+  if ix < 0 { return -1 }
+  let s = if ix < nodeRepTyIx.length { nodeRepTyIx[ix] } else { -1 }
+  if s < 0 {
+    const src = nodeSrc[ix] ?? -1
+    if src >= 0 && src < nodeRepTyIx.length { s = nodeRepTyIx[src] }
   }
-  r
+  if s < 0 { return -1 }
+  if !tyHasTyVar(s) { return s }
+  elabSubstClosed(s, elabKeyAt(fnIx))
+}
+
+// Instance `k`'s result: its template's checked return with `k`'s binding substituted, -1 where
+// that does not close.
+export function elabRetOf(k: i32): i32 {
+  if k < 0 || k >= ekDecl.length { return -1 }
+  const ft = nodeTyIxOf(ekDecl[k])
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const f = tyAt(ft)
+  if !(f is TyFunc) { return -1 }
+  elabSubstClosed(f.fnRet, k)
 }
 
 // Node `ix`'s type at the instance `fnIx` is, or -1 where its elaboration leaves it open. A
@@ -751,7 +764,7 @@ function elabBodyRoot(b: i32): i32 {
   cur
 }
 
-// The source declaration emitted declaration `d` copies: the one whose body its body was rebuilt
+// The source declaration emitted declaration `d` copies: the one its body is rebuilt
 // from, else its lambda template's, else `d`.
 function elabSrcDecl(d: i32): i32 {
   if d < 0 || d >= P.nodes.length { return -1 }
