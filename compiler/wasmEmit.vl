@@ -793,6 +793,8 @@ import {
   asExprLitAtomCast,
   asExprLitAtomYieldsAtom,
   asExprNumLitScalarCast,
+  asgReReadEnter,
+  asgReReadLeave,
   asgReadNode,
   asgReadUnwidenOp,
   assignTargetReReads,
@@ -888,6 +890,7 @@ import {
   identLetOfAt,
   identNameIsBoundAt,
   identNameIsUserBound,
+  identReadAtomKindAt,
   ifExprRefKind,
   ifExprRefSlot,
   indexElemUnionName,
@@ -953,6 +956,8 @@ import {
   spreadSrcAtomTexts,
   spreadSrcBoxes,
   stmtIsTailValue,
+  storageReadEnter,
+  storageReadLeave,
   structIndexOfExpr,
   structIndexOfObj,
   structIndexOfObjCtx,
@@ -5319,7 +5324,9 @@ function emitIs(body: u8[], isIx: i32, fnIx: i32, ec: ExpCtx) {
     // write the narrowing does not see (an alias, an escaped closure) is then answered (D2447).
     const masked = maskNarrowFor(isNarrowMaskKey(nd0.isObj, fnIx))
     if masked.length > 0 {
+      const sMark = storageReadEnter(nd0.isObj)
       const r = emitIsTest(body, isIx, fnIx, ec)
+      storageReadLeave(sMark)
       unmaskNarrow(masked)
       return r
     }
@@ -27176,7 +27183,7 @@ function identReadIsUnionUnbox(exprIx: i32, name: string, fnIx: i32) {
 // it must be staged through `emitExpr` (which runs the unbox) like a global/field/index
 // receiver — else `.push`/`.clear` `struct.get`s the raw box, invalid wasm.
 function listOpRecvNarrowedUnion(objIx: i32, name: string, fnIx: i32) {
-  if narrowedValueAtomOf(name) == "" && !narrowedIsRefArray(name) {
+  if identReadAtomKindAt(objIx, fnIx) < 0 && !narrowedIsRefArray(name) {
     return false
   }
   // the slot test is load-bearing: `callPopBits` reserves the scratch frame off
@@ -36349,43 +36356,26 @@ function emitIdentNode(
     }
   }
   // the narrowed-arm unboxes come first (each sourcing its box through
-  // `emitUnionBoxPush`, whose capture leg reads the env field raw). A value-union binding
-  // narrowed to one scalar atom reads unboxed: push the box, recover the `anyref`
+  // `emitUnionBoxPush`, whose capture leg reads the env field raw). A union-box cell the
+  // checker typed this read as one atom of reads unboxed: push the box, recover the `anyref`
   // payload, cast it, and read the value-box field — `if u is i32 { print(u) }` yields the raw i32.
-  const vAtom = narrowedValueAtomOf(e.identName)
-  if vAtom != "" {
-    // the narrowed atom's ABI code, derived once for both reads below.
-    const vak = valueAtomKind(vAtom)
-    const vSet = unionNameOfIdentAt(isid, fnIx, exprIx)
-    if vSet != "" {
-      // D947 — a dead generic narrow reads `unreachable`, not a value box: a type
-      // parameter narrowed to an impossible arm type-checks, so the arm is
-      // constant-false there and would otherwise read a box that is not there.
-      // Bounded to generic functions, since a type parameter is never rebound inside an instance.
-      if fnHasTyParams(fnIx) {
-        if !unionSetHasAtom(vSet, vAtom) {
-          fbUnreachable()
-          return 0
-        }
+  const vak = identReadAtomKindAt(exprIx, fnIx)
+  if vak >= 0 {
+    // D947 — a dead generic narrow reads `unreachable`, not a value box: a type
+    // parameter narrowed to an impossible arm type-checks, so the arm is
+    // constant-false there and would otherwise read a box that is not there.
+    if fnHasTyParams(fnIx) {
+      const vSet = unionNameOfIdentAt(isid, fnIx, exprIx)
+      const vAtom = valueAtomNameOfKind(vak)
+      if vSet != "" && vAtom != "" && !unionSetHasAtom(vSet, vAtom) {
+        fbUnreachable()
+        return 0
       }
-      return emitValueUnionUnboxRead(body, e.identName, vak, fnIx, ec)
     }
-    // the capture storage class's gate. The name question above resolves a binding in THIS
-    // frame; a capture's binding is in another one, so it answers "" while the read is
-    // narrowed. `capturedIsUnionBox` asks the rep instead — see its own comment.
-    if capturedIsUnionBox(fnIx, e.identName) {
-      return emitValueUnionUnboxRead(body, e.identName, vak, fnIx, ec)
-    }
-    // the typed-IR net behind the syntactic miss, carried by all three narrowed-arm
-    // reads here: some bindings hold the box without producing a `unionNameOfIdent`
-    // render, so the syntactic gate misses and the unbox is skipped, pushing the raw box
-    // where the arm's rep belongs — invalid wasm.
-    if identChainTyBoxedUnion(e.identName, fnIx, 4) {
-      return emitValueUnionUnboxRead(body, e.identName, vak, fnIx, ec)
-    }
+    return emitValueUnionUnboxRead(body, e.identName, vak, fnIx, ec)
   }
-  // a union binding narrowed to a niche-repped `A | null` reads as that niche, under the same
-  // three storage gates as the atom arm above (D2590).
+  // a union binding narrowed to a niche-repped `A | null` reads as that niche, under the
+  // storage gates `identReadsUnionBox` names (D2590).
   const nNk = nicheReadKindAt(exprIx, e.identName, fnIx)
   if nNk >= 0 {
     if identReadsUnionBox(isid, e.identName, exprIx, fnIx) {
@@ -37969,7 +37959,9 @@ function emitAsgValue(
   // The re-read yields the value just stored, so it is never a read before init (D2652).
   const savedGuardOff = initGuardOff
   initGuardOff = true
+  const asgMark = asgReReadEnter(asgIx)
   const asgRc = emitExpr(body, a.binLeft, fnIx, ec)
+  asgReReadLeave(asgMark)
   initGuardOff = savedGuardOff
   if asgTop >= 0 { restoreNarrow(asgTop) }
   if asgRc >= 0 && unwidenOp >= 0 { wU8(unwidenOp) }

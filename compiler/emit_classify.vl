@@ -344,7 +344,7 @@ import {
   parentBindingFrameOf,
   parentBindingOf,
 } from "./emit_capture_frames"
-import { elabAsgOf, litRepTyAt } from "./emit_elab"
+import { elabAsgOf, elabNodeTyAt, litRepTyAt } from "./emit_elab"
 import {
   BC_F32,
   BC_F64,
@@ -866,6 +866,7 @@ import {
   nodeVariantUnionName,
   paramUnion,
   paramUnionRetName,
+  readAtomKindOfTy,
   startBlockLetOfAt,
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentAt,
@@ -3234,47 +3235,103 @@ function letInitCopiesBox(letIx: i32, fnIx: i32, depth: i32): boolean {
   const sd = nodeAt(src)
   if !(sd is LetDecl) { return false }
   if sd.letType >= 0 { return letAnnIsUnion(src) }
-  if exprUnionOfLetInit(sd.letInit, fnIx) && !exprIsLitAtom(sd.letInit, fnIx) {
+  if exprUnion(sd.letInit, fnIx) && !exprIsLitAtom(sd.letInit, fnIx) {
     return true
   }
   if letInitLoopElemKind(src, fnIx) == "union" { return true }
   letInitCopiesBox(src, fnIx, depth - 1)
 }
 
-// The `let` initializer a classifier is asked about from the binding's reads, or -1.
-let narrowChasedInit = -1
-
-// `exprUnion` of `let` initializer `init`, asked from the binding's reads: the initializer is
-// judged at its declaration, not under a narrowing live where the binding is read (D9750).
-function exprUnionOfLetInit(init: i32, fnIx: i32): boolean {
-  const saved = narrowChasedInit
-  narrowChasedInit = unwrapParen(init)
-  const r = exprUnion(init, fnIx)
-  narrowChasedInit = saved
-  r
+// The value-atom kind the identifier read at `ix` unboxes to, or -1 when it reads its cell as
+// stored: the cell is a union box and the checker typed this read as one atom of it.
+export function identReadAtomKindAt(ix: i32, fnIx: i32): i32 {
+  if !uDeclared { return -1 }
+  const rx = unwrapParen(ix)
+  if rx < 0 || rx == storageReadIx { return -1 }
+  if identCellVKind(rx, fnIx) != "union" { return -1 }
+  const pt = asgReReadPinAt(rx, fnIx)
+  const k = readAtomKindOfTy(if pt >= 0 { pt } else { nodeTyAt(rx, fnIx) })
+  if k < 0 || k == 6 { return -1 }
+  // An instance unboxes only where its elaboration agrees: a pinned hole can make the read wider
+  // than the generic body's type.
+  const et = elabNodeTyAt(rx, fnIx)
+  if et >= 0 && readAtomKindOfTy(et) != k { return -1 }
+  if pt >= 0 { return k }
+  // A read narrows only below its binding: where the checker typed the read as its `let` is
+  // typed, no narrowing applies and a box cell is one the checker disagrees with.
+  const savedLocal = identLetIsModuleLocal
+  const li = identLetOfAt(sidOfNode(rx), fnIx, rx)
+  identLetIsModuleLocal = savedLocal
+  if li < 0 { return k }
+  const rt = nodeTyIxOf(rx)
+  if rt >= 0 && tySame(rt, nodeTyIxOf(li)) { return -1 }
+  if readAtomKindOfTy(letBindTyAt(li, fnIx)) == k { return -1 }
+  k
 }
 
-// `narrowedValueAtomOf` for the read at node `ix` of `name`. A chased initializer
-// (`narrowChasedInit`) sits at its declaration, not at the position the live table describes,
-// so there it is narrowed only where the checker did not type it as a value union (D9750).
-function narrowedValueAtomAt(ix: i32, name: string, fnIx: i32): string {
-  if ix != narrowChasedInit { return narrowedValueAtomOf(name) }
-  narrowedValueAtomAtDecl(ix, name, fnIx)
+// The type binding `li` holds at function `fnIx`: its own, else a `const`'s initializer's (the
+// instance's elaboration first) when no user wrote its annotation (a synthesized one has no
+// source position); -1 when unknown.
+function letBindTyAt(li: i32, fnIx: i32): i32 {
+  if li < 0 { return -1 }
+  const t = nodeTyAt(li, fnIx)
+  if t >= 0 { return t }
+  const d = nodeAt(li)
+  if d is LetDecl {
+    if d.letKw == "const" && (d.letType < 0 || nodeAt(d.letType).pos < 0) {
+      const et = elabNodeTyAt(d.letInit, fnIx)
+      return if et >= 0 { et } else { nodeTyAt(d.letInit, fnIx) }
+    }
+  }
+  -1
 }
 
-// `narrowedValueAtomOf` of the initializer read `ix` of `name`, judged at its declaration.
-function narrowedValueAtomAtDecl(ix: i32, name: string, fnIx: i32): string {
-  const a = narrowedValueAtomOf(name)
-  if a == "" { return "" }
-  if valueUnionNameOfTy(nodeTyAt(ix, fnIx)) != "" { return "" }
-  a
+// The type the target `rx` of the assignment whose value is being lowered re-reads at, the value
+// just stored; -1 for any other read.
+function asgReReadPinAt(rx: i32, fnIx: i32): i32 {
+  if asgReReadIx < 0 { return -1 }
+  const a = nodeAt(asgReReadIx)
+  if !(a is BinExpr) { return -1 }
+  if unwrapParen(a.binLeft) != rx { return -1 }
+  asgReReadTy(asgReReadIx, fnIx)
+}
+
+// The assignment whose target `emitAsgValue` is re-reading for its value, or -1.
+let asgReReadIx = -1
+
+// Mark `asgIx` as the assignment whose target is being re-read; returns the mark to restore.
+export function asgReReadEnter(asgIx: i32): i32 {
+  const saved = asgReReadIx
+  asgReReadIx = asgIx
+  saved
+}
+
+export function asgReReadLeave(saved: i32) { asgReReadIx = saved }
+
+// The operand a type guard is testing at its storage, or -1: that read is the box, unnarrowed.
+let storageReadIx = -1
+
+// Mark `ix` as read at its storage; returns the mark to restore.
+export function storageReadEnter(ix: i32): i32 {
+  const saved = storageReadIx
+  storageReadIx = unwrapParen(ix)
+  saved
+}
+
+export function storageReadLeave(saved: i32) { storageReadIx = saved }
+
+// The type the re-read of assignment `asgIx`'s target yields where the cell is wider than the
+// value: the member the checker typed the value at, or -1 when the cell's own type is the answer.
+export function asgReReadTy(asgIx: i32, fnIx: i32): i32 {
+  if asgReadNarrows(asgIx, fnIx) { return asgReadNarrowTy(asgIx, fnIx) }
+  asgReadNullInnerTy(asgIx, fnIx)
 }
 
 // Whether an un-annotated binding's initializer `init` is the union box: `exprUnion`, or a
 // read of a `for-in` variable over box elements, which has no declaration for a classifier
 // run outside its frame's emission (a capture's env field) to read (D3135).
 function letInitIsBox(init: i32, fnIx: i32): boolean {
-  if exprUnionOfLetInit(init, fnIx) { return true }
+  if exprUnion(init, fnIx) { return true }
   const ix = unwrapParen(init)
   if ix < 0 { return false }
   const e = nodeAt(ix)
@@ -15489,7 +15546,7 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // A value-union ident narrowed to one scalar atom (`if u is i32 { … u … }`) reads
   // unboxed in this scope: the host's narrowing types it as the member, not the union.
   // A sub-union narrowing (2+ atoms) keeps the box.
-  if narrowedValueAtomAt(exprIx, e.identName, fnIx) != "" { return false }
+  if identReadAtomKindAt(exprIx, fnIx) >= 0 { return false }
   // …and one narrowed to a niche-repped `A | null`, which the read converts (D2590).
   if nicheReadKindAt(exprIx, e.identName, fnIx) >= 0 { return false }
   // A union binding narrowed to a ref-element array arm reads unboxed to the reflist
@@ -15690,10 +15747,7 @@ export function letIsUnion(letIx: i32, fnIx: i32) {
     // The init's union-ness applies only when no annotation pinned the cell: an explicit
     // non-union annotation unboxes the narrowed atom into the concrete type instead of boxing.
     if d.letType < 0 {
-      if (
-        exprUnionOfLetInit(d.letInit, fnIx)
-        && !exprIsLitAtom(d.letInit, fnIx)
-      ) {
+      if (exprUnion(d.letInit, fnIx) && !exprIsLitAtom(d.letInit, fnIx)) {
         return true
       }
       // A walk variable read at a type that is itself the box, asked outside the frame (D3139).
@@ -15839,24 +15893,6 @@ function forInIterUnionElemName(iterIx: i32, fnIx: i32) {
   rlElemName[slot]
 }
 
-// `unionNameOfExpr` of a `let` initializer. A bare ident the checker typed as a value union there
-// is one, whatever the live narrowing of its name says: that table describes the position being
-// lowered, not the declaration (D9750).
-function unionNameOfLetInit(initIx: i32, fnIx: i32): string {
-  const ini = unwrapParen(initIx)
-  if ini < 0 || ini >= P.nodes.length { return unionNameOfExpr(initIx, fnIx) }
-  const n = nodeAt(ini)
-  if n is Ident {
-    if (
-      narrowedValueAtomOf(n.identName) != ""
-      && narrowedValueAtomAtDecl(ini, n.identName, fnIx) == ""
-    ) {
-      return unionNameOfIdentAt(sidOfNode(ini), fnIx, ini)
-    }
-  }
-  unionNameOfExpr(initIx, fnIx)
-}
-
 // The union name of a `LetDecl`: its annotation when that names a union, else the
 // union its (un-annotated) initializer produces (`const r = pick(true)`).
 export function letUnionNameOf(letIx: i32, fnIx: i32) {
@@ -15867,7 +15903,7 @@ export function letUnionNameOf(letIx: i32, fnIx: i32) {
     // same side of the test, since an annotation naming no union row discards the spelling.
     if unRowOfCanon(annRowOfNode(d.letType)) >= 0 { return tyNameOf(d.letType) }
     if d.letType < 0 {
-      const inf = unionNameOfLetInit(d.letInit, fnIx)
+      const inf = unionNameOfExpr(d.letInit, fnIx)
       if inf != "" {
         // A narrowed read bound at its niche or arm cell is no box, whatever it reads (D3133).
         if nodeTyIsNarrowedShape(unwrapParen(d.letInit), fnIx) {
@@ -16110,7 +16146,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     Ident => {
       // The ident arm declines the same three narrows `exprUnion`'s ident arm does (scalar atom,
       // ref array, map): a rebind under a narrow must not still be named a union here. D1252.
-      if narrowedValueAtomOf(e.identName) != "" { return "" }
+      if identReadAtomKindAt(exprIx, fnIx) >= 0 { return "" }
       if nicheReadKindAt(unwrapParen(exprIx), e.identName, fnIx) >= 0 {
         return ""
       }
@@ -16403,8 +16439,8 @@ function letInitNarrowedAtomKind(letIx: i32, fnIx: i32): i32 {
     if d.letType < 0 && d.letInit >= 0 {
       const ini = nodeAt(d.letInit)
       if ini is Ident {
-        const a = narrowedValueAtomAtDecl(d.letInit, ini.identName, fnIx)
-        if a != "" { return valueAtomKind(a) }
+        const a = identReadAtomKindAt(d.letInit, fnIx)
+        if a >= 0 { return a }
       }
     }
   }
@@ -16425,8 +16461,8 @@ export function unionIdentReadKind(exprIx: i32, fnIx: i32) {
   const e = nodeAt(exprIx)
   if e is Ident {
     if unionNameOfIdentAt(sidOfNode(exprIx), fnIx, exprIx) != "" {
-      const a = narrowedValueAtomOf(e.identName)
-      if a != "" { return valueAtomKind(a) }
+      const a = identReadAtomKindAt(exprIx, fnIx)
+      if a >= 0 { return a }
       // An un-annotated binding whose init is itself a narrowed ident inherits that one level
       // of narrowing only (deeper would inherit someone else's), else `exprString` sees a box. D1013.
       // The binding is the one the resolver bound this read to, where it bound one.
@@ -22206,7 +22242,8 @@ export function classifyStateReset() {
   gckDepth = 0
   irkDepth = 0
   lrDepth = 0
-  narrowChasedInit = -1
+  asgReReadIx = -1
+  storageReadIx = -1
   narrowDropWin = []
   rsSibHit = -1
   sioApartObj = -1
