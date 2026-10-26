@@ -16,21 +16,17 @@ import {
   Param,
   Unary,
   nodeAt,
-  nodeChildrenPush,
 } from "./ast"
-import {
-  holePinReadOf,
-  joinPinnedArmLit,
-  tpIfJoinPinTy,
-} from "./check_emit_queries"
+import { holePinReadOf, joinPinnedArmLit } from "./check_emit_queries"
 import { isJoinHoleUnion } from "./check_core_state"
 import { narrowKeyRoot } from "./check_getter_effects"
 import { nodeTyPinIxOf } from "./check_hole_pins"
+import { elabNodeTyAt } from "./emit_elab"
 import { condRhsRetiredOf, fusedMapReadRecvIx } from "./check_leaf_steps"
 import { isVarTyIxOf } from "./check_list_union"
 import { cmpLitNodeOf } from "./check_match_desugar"
 import { nodeTyIsNullable, nodeTyIxOf } from "./check_node_tys"
-import { tpIfJoinAt, tyIsTpJoinUnion } from "./check_tp_join"
+import { tyIsTpJoinUnion } from "./check_tp_join"
 import { mapValSoftBase } from "./check_ty_relate"
 import { MAP_KEY_I32, MAP_KEY_I64, isValueUnionName } from "./check_ty_rep"
 import {
@@ -74,7 +70,6 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { fnStmtsPosOf, modLoopHolding, nodeTyAt } from "./emit_capture_frames"
-import { listUnionSharedRep } from "./emit_fn_ret_kinds"
 import { vkListClass } from "./emit_list_rep"
 import { mvUnionIsScalarNull } from "./emit_map_value_slots"
 import { mapMonoShapeOfKey, mvSlotOfValTyK } from "./emit_mv_slots"
@@ -104,17 +99,12 @@ import {
   MVK_I64,
   MVK_UNION,
   VKind,
-  emitCurFnIx,
-  emitCurFnPos,
   fnParent,
   fnStmts,
-  instNodeTyIn,
-  instNodeTys,
   mTwinCodes,
   mTwinExtra,
   mTwinShapes,
   mTwinTys,
-  monoArgInstFe,
   monoExactSubN,
   monoExactSubOwn,
   monoExactSubRow,
@@ -122,7 +112,6 @@ import {
   monoHoleSubN,
   monoHoleSubRow,
   monoHoleSubT,
-  monoInstFe,
   monoParamPinTy,
   monoPinSubN,
   monoPinSubOwn,
@@ -1415,143 +1404,19 @@ export function mapRecvTyIn(recvIx: i32, fnIx: i32): i32 {
   if tyAt(own) is TyMap { return own }
   // Only a hole's read has a pin to ask.
   if !(tyAt(own) is TyVar) { return -1 }
-  const h = holeOperandTyOf(r, fnIx)
-  if tyIsMapAt(h) { return h }
-  const x = exactDerivedPinTyOf(r, fnIx)
-  if tyIsMapAt(x) { return x }
-  const p = nodeTyPinIxOf(r)
-  if tyIsMapAt(p) { return p }
+  const t = nodeTyInOf(r, fnIx)
+  if tyIsMapAt(t) { return t }
   -1
 }
 
-// A read `exprIx` records as a hole derived off a type parameter, at the binding of the exact
-// instance `fnIx`; -1 outside one, in a lambda lifted inside it, or where the read is unresolved.
-function exactDerivedPinTyOf(exprIx: i32, fnIx: i32): i32 {
-  if monoExactSubN.length == 0 || fnIx < 0 { return -1 }
-  const row = monoExactSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
-  if row < 0 || row >= monoExactSubN.length { return -1 }
-  const ty = nodeTyIxOf(exprIx)
-  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyVar) { return -1 }
-  const b = holePinReadOf(ty, monoExactSubN[row], monoExactSubT[row])
-  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
-  b
-}
-
-// The type of node `ix` inside function `fnIx`: its recorded type, or where that names a type
-// parameter or a hole, the binding the instance `fnIx` gives it (a hole's, an exact instance's,
-// then its parameters' pins), else the one pin the program banked. The recorded type otherwise.
-// While function bodies are emitted, an instance's body node reads the type banked for it.
+// The type of node `ix` inside function `fnIx`: its recorded type where that is closed, else the
+// type the elaboration records for it at `fnIx`'s instance, else the one pin the program banked. Every instance shares the generic's body nodes, so `fnIx` is what tells them apart.
 export function nodeTyInOf(ix: i32, fnIx: i32): i32 {
-  if instNodeTys.length > 0 && fnIx >= 0 {
-    const b = instNodeTyIn(ix, fnStmtsPosOf(fnIx))
-    if b >= 0 { return b }
-  }
-  nodeTyInDerived(ix, fnIx)
-}
-
-// Bank `nodeTyInOf` for every node of every instance's body whose checker type names a type
-// parameter or a hole, at that instance's pins; a node the instance leaves open is not banked.
-// Each instance is derived as the function being emitted, since one node can head two slots.
-// Runs once the passes are done, before the first module section is emitted.
-export function bankInstanceNodeTys(): i32 {
-  instNodeTys = Map()
-  const curIx = emitCurFnIx
-  const curPos = emitCurFnPos
-  const stack: i32[] = []
-  let k = 0
-  while k < monoInstFe.length {
-    const pos = monoInstFe[k]
-    k = k + 1
-    if pos < 0 || pos >= fnStmts.length { continue }
-    const fx = fnStmts[pos]
-    emitCurFnIx = fx
-    emitCurFnPos = pos
-    stack.push(fx)
-    while stack.length > 0 {
-      const ix = stack.pop() ?? -1
-      nodeChildrenPush(ix, stack)
-      const raw = nodeTyIxOf(ix)
-      if raw < 0 || raw >= T.tys.length || !tyHasTyVar(raw) { continue }
-      if instNodeTyIn(ix, pos) >= 0 { continue }
-      const t = nodeTyInDerived(ix, fx)
-      if t < 0 { continue }
-      const ps = instNodeTys.get(ix) ?? []
-      ps.push(pos)
-      ps.push(t)
-      instNodeTys.set(ix, ps)
-    }
-  }
-  emitCurFnIx = curIx
-  emitCurFnPos = curPos
-  0
-}
-
-// `nodeTyInOf` derived from the instance rows, not read from the bank.
-function nodeTyInDerived(ix: i32, fnIx: i32): i32 {
   const raw = nodeTyIxOf(ix)
   if raw < 0 || raw >= T.tys.length || !tyHasTyVar(raw) { return raw }
-  const aj = apartJoinPinTyOf(ix, fnIx)
-  if aj >= 0 { return aj }
-  const h = holeOperandTyOf(ix, fnIx)
-  if h >= 0 { return h }
-  const hc = holeCompositeTyOf(raw, fnIx)
-  if hc >= 0 { return hc }
-  const x = exactDerivedPinTyOf(ix, fnIx)
-  if x >= 0 { return x }
-  const s = pinSubOperandTyOf(raw, fnIx)
-  if s >= 0 { return s }
-  const c = instanceChainTyOf(raw, fnIx)
-  if c >= 0 { return c }
-  const a = argInstTyOf(ix, raw)
-  if a >= 0 { return a }
+  const t = elabNodeTyAt(ix, fnIx)
+  if t >= 0 { return t }
   nodeTyPinIxOf(ix)
-}
-
-// A module-scope call argument whose type `raw` names the callee's type variables, read at the
-// pins (then the exact bindings) of the instance that call reaches; -1 where none closes it.
-function argInstTyOf(ix: i32, raw: i32): i32 {
-  if monoArgInstFe.length == 0 || !monoArgInstFe.has(ix) { return -1 }
-  const pos = monoArgInstFe.get(ix) ?? -1
-  let cur = raw
-  const pr = monoPinSubRow.get(pos) ?? -1
-  if pr >= 0 && pr < monoPinSubN.length {
-    cur = pinSubAt(cur, pr)
-    if cur < 0 { return -1 }
-  }
-  const xr = monoExactSubRow.get(pos) ?? -1
-  if tyHasTyVar(cur) && xr >= 0 && xr < monoExactSubN.length {
-    cur = exactSubAt(cur, xr)
-    if cur < 0 { return -1 }
-  }
-  if cur >= T.tys.length || tyHasTyVar(cur) { return -1 }
-  cur
-}
-
-// `ty` read through every instance `fnIx` is, or is lifted inside, innermost first: a type
-// parameter at its instance's pin, then each hole at the first hole instance binding them all.
-// -1 where a variable stays unbound. So a nested function reads its enclosing instance's holes.
-function instanceChainTyOf(ty: i32, fnIx: i32): i32 {
-  if fnIx < 0 || monoHoleSubN.length == 0 { return -1 }
-  let pos = fnStmtsPosOf(fnIx)
-  let guard = 0
-  let cur = ty
-  while pos >= 0 && guard <= fnStmts.length {
-    const pr = monoPinSubRow.get(pos) ?? -1
-    if pr >= 0 && pr < monoPinSubN.length {
-      const st = pinSubAt(cur, pr)
-      if st < 0 { return -1 }
-      cur = st
-    }
-    const hr = monoHoleSubRow.get(pos) ?? -1
-    if hr >= 0 && hr < monoHoleSubN.length {
-      const h = holeTyRead(cur, monoHoleSubN[hr], monoHoleSubT[hr], 0)
-      if h >= 0 { return h }
-    }
-    if pos >= fnParent.length { return -1 }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  -1
 }
 
 // Whether an open `ty` inside `fnIx` has no instance binding to be read at: `fnIx`'s chain holds
@@ -1590,20 +1455,6 @@ export function instanceBindsNothingClosed(ty: i32, fnIx: i32): boolean {
     guard = guard + 1
   }
   rows == 0 || (cur != ty && tyHasTyVar(cur))
-}
-
-// The union of lists an if or `match` join at `ix` stays at the pins of instance `fnIx`, where
-// the template recorded one arm's list; -1 elsewhere, and where every member shares one
-// scalar list's storage, which the instance builds as that list (D2832).
-function apartJoinPinTyOf(ix: i32, fnIx: i32): i32 {
-  if tpIfJoinAt.length == 0 || monoPinSubN.length == 0 || !tpIfJoinAt.has(ix) {
-    return -1
-  }
-  const row = monoPinSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
-  if row < 0 || row >= monoPinSubN.length { return -1 }
-  const sj = tpIfJoinPinTy(ix, monoPinSubN[row], monoPinSubT[row])
-  if sj < 0 || listUnionSharedRep(sj) >= 0 { return -1 }
-  sj
 }
 
 // A list or nullable type `ty` over holes, read at the bindings of the hole instance `fnIx`:

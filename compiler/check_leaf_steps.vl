@@ -91,7 +91,7 @@ import {
   npKillSure,
 } from "./check_capture_rows"
 import { crNoNames } from "./check_capture_walks"
-import { coalPinTy, mkBinOpHole, mkDerivedHole } from "./check_coal"
+import { coalPinTy, hdMint, mkBinOpHole, mkDerivedHole } from "./check_coal"
 import {
   CV_UFCS,
   argCstr,
@@ -122,10 +122,8 @@ import {
   HOLE_REBASE_MAX,
   hdAlt,
   hdAltAdopts,
-  hdBase,
   hdDepthOf,
   hdField,
-  hdInner,
   hdKind,
   tyIsTvWriteOf,
 } from "./check_hole_pins"
@@ -198,6 +196,7 @@ import {
   escJoinIx,
   escJoinTy,
   escJoinWho,
+  tpJoinCarry,
   unionHasDeclaredParam,
 } from "./check_tp_join"
 import {
@@ -2005,27 +2004,22 @@ export function mkGuardedRetTy(t: i32) {
 
 // Re-bases derivation `row` onto the hole its base resolved to: "field `bar` of `<hInner>`"
 // under a binding `<hInner> := <hOuter>` is "field `bar` of `<hOuter>`" — the same read, now
-// named by the caller's hole. Returning the re-based hole (not -1) lets a constraint recorded
-// inside a generic body survive the hop out and be re-validated when the caller's hole pins.
-export function rebaseDerivedHole(row: i32, innerTy: i32) {
+// named by the caller's hole, so a constraint recorded in a generic body is re-validated when
+// the caller's hole pins. `inner` is the row's operand under the same binding.
+export function rebaseDerivedHole(row: i32, innerTy: i32, inner: i32) {
   if innerTy < 0 { return -1 }
   if row < 0 || row >= hdKind.length { return -1 }
   const it = tyAt(innerTy)
   if it is TyVar {
     if hdDepthOf(innerTy) >= HOLE_REBASE_MAX { return -1 }
-    // An operator answer naming its operand moves with it, or a nested pin reads the old hole.
-    let inner = hdInner[row]
-    if hdKind[row] == HD_BINOP {
-      if inner == hdBase[row] { inner = innerTy }
-      return mkBinOpHole(
-        hdField[row],
-        inner,
-        hdAlt[row],
-        hdAltAdopts[row],
-        innerTy,
-      )
-    }
-    return mkDerivedHole(hdKind[row], hdField[row], inner, hdAlt[row], innerTy)
+    return hdMint(
+      hdKind[row],
+      hdField[row],
+      inner,
+      hdAlt[row],
+      hdAltAdopts[row],
+      innerTy,
+    )
   }
   -1
 }
@@ -2701,13 +2695,6 @@ export function monoLocalDeclTy(name: string) {
   lookup(name)
 }
 
-// The prim names an un-annotated return cannot ride the i32 default for. `i32`, `boolean` and
-// `u8` are the i32 valtype the un-annotated functype already defaults to, so naming them here
-// would mint an annotation that changes nothing but the emitted bytes.
-export function monoRetScalarKind(pn: string): boolean {
-  pn == "string" || pn == "f64" || pn == "i64" || pn == "f32"
-}
-
 // A binary operator's result type, deferred to the pin when the body cannot decide it
 // (D532). The gate is the exact precondition of the correction, not a heuristic: the hole can
 // resolve to anything but `bTy` only through a declared top-level `self`-function named for
@@ -2725,11 +2712,17 @@ export function mkBinOpRetTy(
   // whole — an overload has no second answer for a form the direct spelling doesn't lower either.
   if n.binCompound != "" { return bTy }
   const op = n.binOp
-  // Arithmetic answering a hole operand is that operand at its base scalar once pinned, so a
-  // literal-set pin does not hold a result outside the set (D9560), and at an `i64` or `f64`
-  // operand `wide` beside it the pin computes at that operand's width (D9631).
+  // Arithmetic over a hole operand answers per member of its join, each at its base scalar once
+  // pinned: a literal-set pin holds no result outside the set, and beside a wider `wide` operand
+  // the pin computes at that width (D9631).
   if binArithOp(op) && tyIsHole(bTy) {
-    const ad = mkBinOpHole(op, bTy, wide, adopts, bTy)
+    const pm = mkBinOpPerMember(op, lt, wide, adopts)
+    if pm >= 0 { return pm }
+  }
+  if binArithOp(op) && tyIsHole(bTy) {
+    let alt = wide
+    if alt == bTy { alt = lt }
+    const ad = mkBinOpHole(op, bTy, alt, adopts, bTy)
     if ad >= 0 { return ad }
   }
   if !tyIsHole(lt) { return bTy }
@@ -2749,6 +2742,24 @@ export function mkBinOpRetTy(
   const d = mkDerivedHole(HD_BINOP, op, bTy, -1, lt)
   if d < 0 { return bTy }
   d
+}
+
+// The join of arithmetic `op` over each member of `u`, a union of type variables only; -1 for
+// any other operand.
+function mkBinOpPerMember(op: string, u: i32, wide: i32, adopts: boolean): i32 {
+  if u < 0 || u >= T.tys.length { return -1 }
+  const ut = tyAt(u)
+  if !(ut is TyUnion) { return -1 }
+  const ms: i32[] = []
+  for m in ut.uMembers {
+    if m < 0 || m >= T.tys.length || !(tyAt(m) is TyVar) { return -1 }
+    const d = mkBinOpHole(op, m, wide, adopts, m)
+    if d < 0 { return -1 }
+    ms.push(d)
+  }
+  const r = mkUnionTy(ms)
+  tpJoinCarry(u, r)
+  r
 }
 
 // Why a scrutinee is refused: a `match` needs a closed member SET to be complete over, or an

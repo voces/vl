@@ -5,6 +5,7 @@
 // checker (an operator's pending return, a `??` default) it calls `checkerForceFn`, which
 // `checkProgramPass` installs.
 
+import { elabCapOn, elabHolePinNote } from "./check_elab_cap"
 import {
   ArrayLit,
   BinExpr,
@@ -93,7 +94,7 @@ import { crMisuseNote } from "./check_call_retire"
 import { opIdxFns, opIdxOps } from "./check_callee"
 import { crLostAny, crLostNote } from "./check_capture_loss"
 import { crRdRet } from "./check_capture_rows"
-import { chPendGiven, chPendNodes, chPendTys } from "./check_coal"
+import { chPendGiven, chPendNodes, chPendTys, mkBinOpHole } from "./check_coal"
 import {
   apartHoleJoins,
   argPinChecking,
@@ -126,6 +127,7 @@ import {
   inferQuiet,
   lamCheckDepth,
   lamRefoldDepth,
+  quietDepth,
   tpEnvNames,
   tpEnvTyOfName,
   tpEnvTys,
@@ -405,6 +407,7 @@ import {
   T,
   TY_BOOL,
   TY_ERR,
+  TY_F64,
   TY_I32,
   TY_I64,
   TY_NEVER,
@@ -1961,8 +1964,10 @@ export function binCstrPairRefusal(ci: i32, clt: i32, crt: i32): string {
   if n.binOp != binCstr.op[ci] { return "" }
   const savedQuiet = inferQuiet
   inferQuiet = true
+  quietDepth = quietDepth + 1
   const refusal = numBinPairRefusal(n, clt, crt)
   inferQuiet = savedQuiet
+  quietDepth = quietDepth - 1
   refusal
 }
 
@@ -1988,7 +1993,7 @@ export function joinArmLit(a: i32, aLit: boolean, b: i32, bLit: boolean): i32 {
   }
   const apart = !aLit && !bLit && !njJoinGated(a, b, false)
   njApartSet(apart)
-  const j = joinArmTys(a, b)
+  const j = keepListStorage(a, !aLit, b, !bLit, joinArmTys(a, b))
   njApartSet(false)
   if apart { markTpJoinApart(j) }
   j
@@ -6566,6 +6571,7 @@ function argPinRecheck(name: string, ty: i32, owner: string) {
 // unless a `tySame` pin is already there. Never banked from a quiet probe or a destination probe
 // (`holePinHeld`), whose tables do not stand. The collapse (`HOLE_PIN_CONFLICT`) is derived on read.
 function notePinnedHole(name: string, ty: i32, owner: string) {
+  if !holePinHeld && (elabCapOn || !inferQuiet) { elabHolePinNote(name, ty) }
   if inferQuiet || holePinHeld { return 0 }
   if ty < 0 { return 0 }
   argPinRecheck(name, ty, owner)
@@ -6580,6 +6586,21 @@ function notePinnedHole(name: string, ty: i32, owner: string) {
   s.push(ty)
   holePinSet[key] = s
   0
+}
+
+// Derivation `row` re-based onto hole `base` under the binding that resolved it: the operand
+// type the row carries beside its base moves with the same binding (`HD_PARAM`'s is an index).
+function rebaseHoleUnder(
+  row: i32,
+  base: i32,
+  bNames: string[],
+  bTys: i32[],
+): i32 {
+  const i = hdInner[row]
+  if hdKind[row] == HD_PARAM || i < 0 || !tyHasTyVar(i) {
+    return rebaseDerivedHole(row, base, i)
+  }
+  rebaseDerivedHole(row, base, substTyDeep(i, bNames, bTys))
 }
 
 // `substHoleTyReal`, banking the answer for a DERIVED hole under its own name the way the
@@ -6678,7 +6699,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     if gInner < 0 || gAlt < 0 { return -1 }
     const gPin = substHoleTy(hdBase[row], bNames, bTys)
     if gPin < 0 { return -1 }
-    if tyIsHole(gPin) { return rebaseDerivedHole(row, gPin) }
+    if tyIsHole(gPin) { return rebaseHoleUnder(row, gPin, bNames, bTys) }
     if assignable(gPin, gAlt) { return gInner }
     // A union pin with a member of the tested type reaches the branch too, so its return is a
     // member of the call's type, as the annotated parameter's is (D3094).
@@ -6692,7 +6713,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     if nAlt < 0 { return -1 }
     const nPin = substHoleTy(hdBase[row], bNames, bTys)
     if nPin < 0 { return -1 }
-    if tyIsHole(nPin) { return rebaseDerivedHole(row, nPin) }
+    if tyIsHole(nPin) { return rebaseHoleUnder(row, nPin, bNames, bTys) }
     const nRest = subtractTy(nPin, nAlt)
     if nRest >= 0 { return nRest }
     return nPin
@@ -6702,7 +6723,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   if kind == HD_COAL {
     const cPin = substHoleTy(hdBase[row], bNames, bTys)
     if cPin < 0 { return -1 }
-    if tyIsHole(cPin) { return rebaseDerivedHole(row, cPin) }
+    if tyIsHole(cPin) { return rebaseHoleUnder(row, cPin, bNames, bTys) }
     // A declared parameter's pin that cannot be null leaves the default dead, as the concrete
     // `??` types it; a hole's keeps the join its instance lowers (D2951).
     if coalDeadAtPin(row, cPin) { return cPin }
@@ -6712,7 +6733,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   if kind == HD_COALD {
     const dPin = substHoleTy(hdBase[row], bNames, bTys)
     if dPin < 0 { return -1 }
-    if tyIsHole(dPin) { return rebaseDerivedHole(row, dPin) }
+    if tyIsHole(dPin) { return rebaseHoleUnder(row, dPin, bNames, bTys) }
     const dFace = substTyDeep(hdInner[row], bNames, bTys)
     if dFace < 0 || tyHasHole(dFace) { return -1 }
     if assignable(dPin, dFace) { return dFace }
@@ -6722,19 +6743,19 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   if kind == HD_TVW {
     const wPin = substHoleTy(hdBase[row], bNames, bTys)
     if wPin < 0 { return -1 }
-    if tyIsHole(wPin) { return rebaseDerivedHole(row, wPin) }
+    if tyIsHole(wPin) { return rebaseHoleUnder(row, wPin, bNames, bTys) }
     return tvWriteLandTy(hdInner[row], wPin)
   }
   if kind == HD_HWR {
     const hPin = substHoleTy(hdBase[row], bNames, bTys)
     if hPin < 0 { return -1 }
-    if tyIsHole(hPin) { return rebaseDerivedHole(row, hPin) }
+    if tyIsHole(hPin) { return rebaseHoleUnder(row, hPin, bNames, bTys) }
     return writeMemberTy(hPin, hdInner[row])
   }
   if kind == HD_OFLD {
     const oPin = substHoleTy(hdBase[row], bNames, bTys)
     if oPin < 0 { return -1 }
-    if tyIsHole(oPin) { return rebaseDerivedHole(row, oPin) }
+    if tyIsHole(oPin) { return rebaseHoleUnder(row, oPin, bNames, bTys) }
     return optFieldAtPin(oPin, hdField[row])
   }
   if kind == HD_RET {
@@ -6754,7 +6775,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
           return it.fnRet
         }
       }
-      return rebaseDerivedHole(row, inner)
+      return rebaseHoleUnder(row, inner, bNames, bTys)
     }
     return -1
   }
@@ -6768,14 +6789,32 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
       if pj >= 0 && pj < itP.fnParamTypes.length { return itP.fnParamTypes[pj] }
       return -1
     }
-    return rebaseDerivedHole(row, innerP)
+    return rebaseHoleUnder(row, innerP, bNames, bTys)
   }
   // A deferred binary-op result (`mkBinOpRetTy`): an object pin with a `self`-function
   // overload takes the overload's return type; every other pin keeps the body's own answer, mirroring `checkBinExprNode`'s dispatch arm exactly, including its `is TyObj` gate.
   if kind == HD_BINOP {
     const innerB = substHoleTy(hdBase[row], bNames, bTys)
     if innerB < 0 { return -1 }
-    if tyIsHole(innerB) { return rebaseDerivedHole(row, innerB) }
+    // A hole operand beside it pins with the same binding.
+    let bAlt = hdAlt[row]
+    if bAlt >= 0 && tyHasTyVar(bAlt) { bAlt = substTyDeep(bAlt, bNames, bTys) }
+    if tyIsHole(innerB) {
+      if bAlt == hdAlt[row] {
+        return rebaseHoleUnder(row, innerB, bNames, bTys)
+      }
+      let rInner = hdInner[row]
+      if rInner == hdBase[row] { rInner = innerB }
+      return mkBinOpHole(hdField[row], rInner, bAlt, hdAltAdopts[row], innerB)
+    }
+    // The other operand still open: the answer is its pin beside this one's.
+    if tyIsHole(bAlt) && hdInner[row] == hdBase[row] {
+      if innerB == TY_I32 || innerB == TY_I64 || innerB == TY_F64 {
+        let w = innerB
+        if w == TY_I32 { w = -1 }
+        return mkBinOpHole(hdField[row], bAlt, w, hdAltAdopts[row], bAlt)
+      }
+    }
     const dTy = objOpSelfDispatchTy(hdField[row], innerB)
     if dTy >= 0 { return dTy }
     // A pinned operand that concatenates as a string makes `+` a concat, whose result is
@@ -6793,18 +6832,13 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
       const bv = tyAt(bInner)
       if bv is TyVar {
         if substNestMode == SUBST_ALL || substBindsNestRow(bInner, bv.tvName) {
-          return binArithPinTy(
-            hdField[row],
-            innerB,
-            hdAlt[row],
-            hdAltAdopts[row],
-          )
+          return binArithPinTy(hdField[row], innerB, bAlt, hdAltAdopts[row])
         }
       }
     }
     const bAns = substTyDeep(bInner, bNames, bTys)
     if bInner == hdBase[row] {
-      return binArithPinTy(hdField[row], bAns, hdAlt[row], hdAltAdopts[row])
+      return binArithPinTy(hdField[row], bAns, bAlt, hdAltAdopts[row])
     }
     return bAns
   }
@@ -6827,7 +6861,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
       if itE is TyPrim {
         if itE.primName == "string" { return TY_I32 }
       }
-      return rebaseDerivedHole(row, innerE)
+      return rebaseHoleUnder(row, innerE, bNames, bTys)
     }
     return -1
   }
@@ -6841,7 +6875,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
       const f = objFieldType(it2, hdField[row])
       if f >= 0 { return f }
     }
-    return rebaseDerivedHole(row, inner2)
+    return rebaseHoleUnder(row, inner2, bNames, bTys)
   }
   -1
 }
@@ -7309,20 +7343,41 @@ function rejoinMembers(ms: i32[], fixed: boolean[]): i32 {
 
 // The join of `a` and `b`, or the two apart when it collapsed onto a list that a side stored as
 // built (`aFixed`, `bFixed`) keeps differently: only a fresh list literal is built at a join (D4862).
-export function joinKeepingStorage(
+function joinKeepingStorage(
   a: i32,
   aFixed: boolean,
   b: i32,
   bFixed: boolean,
 ): i32 {
-  const j = joinTys(a, b)
+  keepListStorage(a, aFixed, b, bFixed, joinTys(a, b))
+}
+
+// `j`, the join of `a` and `b`, or the two apart where `joinKeepingStorage` keeps them so.
+export function keepListStorage(
+  a: i32,
+  aFixed: boolean,
+  b: i32,
+  bFixed: boolean,
+  j: i32,
+): i32 {
+  if j < 0 { return j }
   if (
-    (aFixed && listJoinStorageDiffers(a, j, 8))
-    || (bFixed && listJoinStorageDiffers(b, j, 8))
+    (aFixed && memberStorageDiffers(a, j))
+    || (bFixed && memberStorageDiffers(b, j))
   ) {
     return joinVariantTys(a, b)
   }
   j
+}
+
+// Whether a list among the members of `t` would be stored differently held as `j`.
+function memberStorageDiffers(t: i32, j: i32): boolean {
+  const ms: i32[] = []
+  flattenVariantsInto(t, ms)
+  for m in ms {
+    if listJoinStorageDiffers(m, j, 8) { return true }
+  }
+  false
 }
 
 // The members of the return join at row `key` at this pin, one return value at a time: each
