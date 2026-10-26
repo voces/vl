@@ -1,7 +1,7 @@
 // The write-effect summaries: which cells a call may write through each parameter
 // (`fnWriteEffects`), the write shapes a body applies to what it is handed (`fnWriteShapes`) and
-// the free variables it writes (`fnWriteFreePaths`), with the cycle cut and the provisional rows
-// that settle a recursive cycle once. Also the call tests the narrowing kill asks: whether a
+// the free variables it writes (`fnWriteFreePaths`), each settled once per strongly connected
+// component of the call graph. Also the call tests the narrowing kill asks: whether a
 // callee is unresolved, or may run a function it is handed. A callee is resolved through
 // `./check_callee`; the checker pushes nothing here and reads only the summaries. `weReset` clears
 // them per program, and `weUnresDrop` drops the ones that read an untyped node when a body is
@@ -395,20 +395,16 @@ let weOpen: string[] = []
 // The shape summaries (`fnWriteShapes`), keyed `"<fn-node-ix>#shape"`.
 let weShapeSums: {[string]: WeSet} = Map()
 
-// Counts cycles cut during the walk, so a provisional summary is not cached. Cutting a cycle at ⊥
-// and iterating is the least fixpoint of a may-write analysis, and for the key queried the first
-// pass already reaches it. An inner key on the cycle does not: `g` computed while `f` is open is
-// missing `f`'s own writes, so caching it would answer a later query with too small a summary.
-let weCut = 0
-
-// Shape and free-variable summaries on a cycle through a frame still open, with the shallowest
-// open depth each reached, so each is computed once instead of once per path to it. A frame whose walk reached no
-// shallower open frame is complete (the first pass of a ⊥-cut cycle is the fixpoint for the key
-// that closes it), so it is cached, and the cycle's provisional entries are settled with it.
+// The call graph's strongly connected components, found on the fly (Tarjan): a summary whose walk
+// reached a frame still open is provisional, kept with the shallowest open depth it reached, and
+// answers every later ask on its cycle. The frame that closes the cycle settles every member: shape
+// and free summaries take its own, the parameter channel iterates each member to its fixpoint.
 let weProvSlot: {[string]: i32} = Map()
 let weProvKeys: string[] = []
 let weProvSums: WeSet[] = []
 let weProvLows: i32[] = []
+let weProvFn: i32[] = []
+let weProvArg: i32[] = []
 let weLow = 1073741824
 const WE_NO_LOW = 1073741824
 
@@ -417,40 +413,90 @@ const WE_NO_LOW = 1073741824
 let weUnresSums: {[string]: WeSet} = Map()
 let weUnresAny = false
 
-// Answer a recursive cycle opaque instead of ⊥ — the strictly-fail-closed reading. It is sound but
+// Answer a recursive cycle opaque instead of ⊥, the strictly-fail-closed reading. It is sound but
 // costs every read-only recursive callee, newly rejecting correct programs of that one shape where
-// the fixpoint rejects none. Kept as a switch, the conservative fallback if the fixpoint argument
-// above is ever found wanting.
+// the fixpoint rejects none. Kept as a switch, the conservative fallback.
 const ALIAS_CYCLE_OPAQUE = false
 
-// The write-effect summary of parameter `paramIx` of the `FuncDecl` at `fnIx`.
+// The write-effect summary of parameter `paramIx` of the `FuncDecl` at `fnIx`. On a cycle every
+// member is re-walked until none grows; a path handed on extended (`p.next`) to a member of the same
+// component is widened to that path itself, which covers every depth the recursion can reach and
+// keeps the summary independent of which member is asked first.
 export function fnWriteEffects(fnIx: i32, paramIx: i32): WeSet {
   crAskDecl(CR_ASK_EFFECTS, fnIx, paramIx)
   const key = i32ToStr(fnIx) + "#" + i32ToStr(paramIx)
   // One probe, not two — see `fnWriteFreePaths` for the note.
   const weHit = weSums[key]
   if weHit != null { return weHit }
-  if weIsOpen(key) { return weCycleSet() }
+  const cyc = weCycleHit(key)
+  if cyc != null { return cyc }
+  const depth = weOpen.length
+  const lowBefore = weLow
+  const provMark = weProvKeys.length
+  weLow = WE_NO_LOW
+  weOpen.push(key)
+  const acc = weEffectsWalk(fnIx, paramIx)
+  weOpen.pop()
+  const low = weLow
+  weLow = lowBefore
+  if weProvisional(key, acc, depth, low, fnIx, paramIx) { return acc }
+  if low == WE_NO_LOW {
+    weSums[key] = acc
+    return acc
+  }
+  weProvPush(key, acc, depth, fnIx, paramIx)
+  weEffectsRounds(provMark)
+  let out = acc
+  while weProvKeys.length > provMark {
+    const s = weProvSums[weProvSums.length - 1]
+    const k = weProvPop()
+    weSums[k] = s
+    if k == key { out = s }
+  }
+  out
+}
+
+// One walk of the body of `fnIx` for the writes through parameter `paramIx`.
+function weEffectsWalk(fnIx: i32, paramIx: i32): WeSet {
   const fd = nodeAt(fnIx)
   if fd is FuncDecl {
     const ps = fd.fnParams
     if paramIx >= 0 && paramIx < ps.length {
       const p = nodeAt(ps[paramIx])
       if p is Param {
-        const cutBefore = weCut
-        weOpen.push(key)
         weRoots.push(fd.fnBody)
         const into = weAccNew(true)
         let acc = weOpaqueSet
         if weScan(into, fd.fnBody, p.parName) { acc = weSetOf(into) }
         weRoots.pop()
-        weOpen.pop()
-        weCache(key, acc, cutBefore)
         return acc
       }
     }
   }
   weOpaqueSet
+}
+
+// Re-walk every member of the component recorded since `mark` against the others' current
+// summaries until none grows. Each round only adds parts, and the parts a component can reach are
+// finite, so this stops.
+function weEffectsRounds(mark: i32) {
+  const lowBefore = weLow
+  let changed = true
+  while changed {
+    changed = false
+    let j = mark
+    while j < weProvKeys.length {
+      const s = weEffectsWalk(weProvFn[j], weProvArg[j])
+      const old = weProvSums[j]
+      if s.opaque != old.opaque || s.parts.length != old.parts.length {
+        weProvSums[j] = s
+        changed = true
+      }
+      j = j + 1
+    }
+  }
+  weLow = lowBefore
+  0
 }
 
 // Whether a summary for `key` is already being computed higher in the recursion.
@@ -463,23 +509,16 @@ function weIsOpen(key: string) {
   false
 }
 
-// Whether a cut cycle answers opaque: false for the fixpoint reading (⊥), true for the strict one.
-function weCycleOpaque(): boolean {
-  weCut = weCut + 1
-  ALIAS_CYCLE_OPAQUE
+// Whether `key` is on the component being walked: open, or provisional under a frame still open.
+function weOnCycle(key: string): boolean {
+  if weOpenIndex(key) >= 0 { return true }
+  const ps = weProvSlot[key] ?? -1
+  ps >= 0 && ps < weProvKeys.length && weProvKeys[ps] == key
 }
 
 function weCycleSet(): WeSet {
-  if weCycleOpaque() { return weOpaqueSet }
+  if ALIAS_CYCLE_OPAQUE { return weOpaqueSet }
   weEmptySet
-}
-
-// Cache a summary unless it is provisional — computed with a cycle cut while another summary is
-// still open, which is the one case the first pass leaves too small.
-function weCache(key: string, acc: WeSet, cutBefore: i32) {
-  if weCut != cutBefore && weOpen.length > 0 { return 0 }
-  weSums[key] = acc
-  0
 }
 
 // Add the field sub-paths a subtree may write through the parameter named `pname`; false for
@@ -594,7 +633,16 @@ function argEffectsOn(
       }
       const sum = fnWriteEffects(declIx, i)
       if sum.opaque { return false }
-      for id in sum.parts { weAccPart(acc, below + wePartText[id]) }
+      if (
+        below != ""
+        && sum.parts.length > 0
+        && weOnCycle(i32ToStr(declIx) + "#" + i32ToStr(i))
+      ) {
+        // A path extended around a cycle has no bound; the extension itself covers every one.
+        weAccPart(acc, below.slice(0, below.length - 1))
+      } else {
+        for id in sum.parts { weAccPart(acc, below + wePartText[id]) }
+      }
     }
     i = i + 1
   }
@@ -644,13 +692,9 @@ export function fnWriteFreePaths(fnIx: i32): WeSet {
     weOpen.pop()
     const low = weLow
     weLow = lowBefore
-    if weProvisional(key, acc, depth, low) { return acc }
+    if weProvisional(key, acc, depth, low, -1, -1) { return acc }
     // A callee's free writes are the caller's unchanged, so every member of the cycle has `acc`.
-    while weProvKeys.length > provMark {
-      weSums[weProvKeys.pop() ?? ""] = acc
-      weProvSums.pop()
-      weProvLows.pop()
-    }
+    while weProvKeys.length > provMark { weSums[weProvPop()] = acc }
     weSums[key] = acc
     return acc
   }
@@ -795,7 +839,7 @@ export function fnWriteShapes(fnIx: i32): WeSet {
     const low = weLow
     weLow = lowBefore
     const settled = weUnres == unresBefore
-    if weProvisional(key, acc, depth, low) { return acc }
+    if weProvisional(key, acc, depth, low, -1, -1) { return acc }
     weSettleCycle(provMark, acc, settled, wit)
     if settled {
       weShapeSums[key] = acc
@@ -822,7 +866,6 @@ function weCycleHit(key: string): WeSet | null {
   const ps = weProvSlot[key] ?? -1
   if ps >= 0 && ps < weProvKeys.length && weProvKeys[ps] == key {
     if weProvLows[ps] < weLow { weLow = weProvLows[ps] }
-    weCut = weCut + 1
     return weProvSums[ps]
   }
   null
@@ -830,14 +873,44 @@ function weCycleHit(key: string): WeSet | null {
 
 // Record `acc` provisional when the frame at `depth` reached the shallower open depth `low`: it is
 // complete only once that frame is. False when the frame is complete now.
-function weProvisional(key: string, acc: WeSet, depth: i32, low: i32): boolean {
+function weProvisional(
+  key: string,
+  acc: WeSet,
+  depth: i32,
+  low: i32,
+  fnIx: i32,
+  paramIx: i32,
+): boolean {
   if low >= depth { return false }
   if low < weLow { weLow = low }
+  weProvPush(key, acc, low, fnIx, paramIx)
+  true
+}
+
+// Record `key` on the component being walked; `fnIx` and `paramIx` name a parameter summary's walk.
+function weProvPush(
+  key: string,
+  acc: WeSet,
+  low: i32,
+  fnIx: i32,
+  paramIx: i32,
+) {
   weProvSlot[key] = weProvKeys.length
   weProvKeys.push(key)
   weProvSums.push(acc)
   weProvLows.push(low)
-  true
+  weProvFn.push(fnIx)
+  weProvArg.push(paramIx)
+  0
+}
+
+// Drop the last entry recorded on the component, answering its key.
+function weProvPop(): string {
+  weProvSums.pop()
+  weProvLows.pop()
+  weProvFn.pop()
+  weProvArg.pop()
+  weProvKeys.pop() ?? ""
 }
 
 // Retire the provisional summaries recorded since `mark`: the cycle they sat on closed at a frame
@@ -846,10 +919,8 @@ function weProvisional(key: string, acc: WeSet, depth: i32, low: i32): boolean {
 // again.
 function weSettleCycle(mark: i32, acc: WeSet, settled: boolean, wit: i32) {
   while weProvKeys.length > mark {
-    const k = weProvKeys.pop() ?? ""
-    const pv = weProvSums.pop()
-    const pvAt = if pv != null { pv.at } else { true }
-    weProvLows.pop()
+    const pvAt = weProvSums[weProvSums.length - 1].at
+    const k = weProvPop()
     if settled && !pvAt && !acc.at { weShapeSums[k] = acc }
     else if !settled { weUnresWit[k] = wit }
   }
@@ -1298,8 +1369,9 @@ export function weReset() {
   weProvKeys = []
   weProvSums = []
   weProvLows = []
+  weProvFn = []
+  weProvArg = []
   weLow = WE_NO_LOW
   weOpen = []
-  weCut = 0
   0
 }
