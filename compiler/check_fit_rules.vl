@@ -94,7 +94,7 @@ import {
   covarWriteThrough,
 } from "./check_covar_write"
 import { cstrOwnerTop } from "./check_cstr_rows"
-import { inferQuiet, quietDepth } from "./check_cursor"
+import { curFnDeclIx, inferQuiet, quietDepth } from "./check_cursor"
 import { boundObjRootOf } from "./check_decl_scan"
 import {
   boundText,
@@ -200,6 +200,7 @@ import {
   f32LitTailsAdopt,
   floatLitTails,
   litTreeAdoptDst,
+  valueJoinAt,
   valueTailLeaves,
   valueTailSplit,
 } from "./check_num_adopt"
@@ -235,6 +236,7 @@ import {
   recAdForced,
   recAdForcedDecl,
   recAdNoAdopt,
+  recAdPinInit,
   recAdRaising,
   recAdWidth,
 } from "./check_rec_adopt_rows"
@@ -328,10 +330,12 @@ import {
   isvalTok,
   isvalType,
 } from "./check_state"
-import { joinClashMsg, joinClashMsgSet } from "./check_subst"
+import { curFnOwner, joinClashMsg, joinClashMsgSet } from "./check_subst"
+import { tyVarOwnerOf } from "./check_hole_pins"
 import { demangleName } from "./check_suggest"
 import { placeElemTy, tpBoundOfName } from "./check_tp_bound"
 import {
+  holeNameIsParamOf,
   joinByWant,
   markTpJoinApart,
   sameDeclaredTyParam,
@@ -406,6 +410,7 @@ import {
   cUserTypes,
   cVariantMemberTyIxSet,
   cVariantMemberTyIxs,
+  genAppRowOf,
   litBaseTy,
   litUnionAliasNameOfTy,
   mkArrayTy,
@@ -414,14 +419,17 @@ import {
   mkNullableTy,
   nwTyIxs,
   objFieldType,
+  structNameOfTy,
   tyAllMaps,
   tyAmong,
   tyArrayElemIx,
   tyAt,
+  tyChildrenOf,
   tyDeeperThan,
   tyEq,
   tyEqSameHoles,
   tyHasHole,
+  tyHasInferHole,
   tyHasMapMember,
   tyHoldsListUnion,
   tyHoldsObj,
@@ -2805,6 +2813,8 @@ function objShapeAdapterless(
           if objFieldNameSetsEq(src, dst) {
             return objShapeSameNamesAdapts(srcExpr, src, dst, cx)
           }
+          // A pinned binding's literal runs the initializer of a field it drops.
+          if recAdPinInit && litShapeDropSrcExpr(cx) { return false }
           // The width lift (D622): a `Wide` flowing into a `Narrow` whose fields are the first
           // of `Wide`'s, in the canonical layout order with identical types, needs no
           // conversion — `emitTypeSection` declares a `(sub)` edge, only at a `direct` position.
@@ -3862,9 +3872,7 @@ export function recordMapUnbox(
 // value `if`, `match` or block, and the left operand of a `??`, each at its own type.
 function recordMapRetagTails(srcExpr: i32, dstTy: i32, depth: i32) {
   if !tyHasMapMember(dstTy, 8) { return 0 }
-  const spine: i32[] = []
-  const leaves: i32[] = []
-  valueTailSplit(srcExpr, spine, leaves)
+  const leaves = valueTailLeaves(srcExpr)
   let i = 0
   while i < leaves.length {
     const lf = leaves[i]
@@ -3959,13 +3967,100 @@ function mapUnboxRecordLit(
   0
 }
 
-// Stamps the context (destination) type `dstTy` onto a literal source `srcExpr` (recursively,
-// into `ObjLit` fields / `ArrayLit` elements) into the `nodeRepTyIx` sidecar, at arena-pure
-// adoption sites — reads only `T.tys`/`P.nodes`, writes only `nodeRepTyIx`. Nullable wrappers
-// are peeled; a destination deeper than 16 declines, to avoid unbounded recursion.
+// Delivers the fresh literal `x` to `dstTy`, stamping it with that type where `litAtRecordDst`
+// holds: every typed delivery of a literal, a join arm included, stamps through here.
+export function adoptLitAt(x: i32, dstTy: i32) {
+  if litAtRecordDst(x, dstTy) { recordRepTyAdopt(x, dstTy, 6) }
+  0
+}
+
+// Whether hole owner `o` is a parameter hole of declaration `d`.
+function holeOfDecl(o: string, d: i32): boolean {
+  if d < 0 { return false }
+  const fd = nodeAt(d)
+  fd is FuncDecl && holeNameIsParamOf(o, fd.fnName, d, fd.fnParams.length)
+}
+
+// Whether `t` holds an inference hole that neither the function being checked nor one of its
+// parameters owns: such a hole is bound by a call into another function, not by this instance.
+function holeOutsideFn(t: i32, depth: i32): boolean {
+  if depth > 8 || !tyHasInferHole(t, 0) { return false }
+  if tyAt(t) is TyVar {
+    const o = tyVarOwnerOf(t)
+    return o != curFnOwner
+      && !holeOfDecl(o, curFnDeclIx)
+      && !holeOfDecl(o, cstrOwnerTop())
+  }
+  const kids: i32[] = []
+  tyChildrenOf(t, kids)
+  for k in kids {
+    if holeOutsideFn(k, depth + 1) { return true }
+  }
+  false
+}
+
+// Whether a record, list or `null` literal `x` of another type meets a destination `dstTy`
+// holding a record through nullables and lists: a fresh literal is stored as its destination
+// (D3339). A type parameter, or a hole outside the literal's function, stays open; an anonymous
+// destination of the literal's own shape is already its storage, so it is not stamped.
+export function litAtRecordDst(x: i32, dstTy: i32): boolean {
+  if dstTy < 0 || x < 0 || !repStampableLit(x) || holeOutsideFn(dstTy, 0) {
+    return false
+  }
+  const own = nodeTyIxOf(parenPeelIx(x))
+  if own == dstTy { return false }
+  if structNameOfTy(dstTy) == "" && genAppRowOf(dstTy) < 0 && tyEq(own, dstTy) {
+    return false
+  }
+  let t = dstTy
+  let k = 0
+  while k < 8 && t >= 0 {
+    const d = tyAt(t)
+    match d {
+      TyObj | TyVar => {
+        return true
+      }
+      TyNullable => {
+        t = d.nInner
+      }
+      TyArray => {
+        t = d.aElem
+      }
+      // no other type holds a record a literal is built at
+      TyPrim | TyErr | TyFunc | TyUnion | TyMap | TyLit | TyNeg => {
+        return false
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+// Whether `x`, past parentheses, is a record, list or `null` literal, or a value `if`, `match` or
+// block one of whose arms is: the sources a rep stamp can adopt.
+export function repStampableLit(x: i32): boolean {
+  const leaves = if valueJoinAt(x) < 0 { [parenPeelIx(x)] } else { valueTailLeaves(x) }
+  for l in leaves {
+    const n = nodeAt(l)
+    if n is ObjLit || n is ArrayLit || n is NullLit { return true }
+  }
+  false
+}
+
+// Records `t` as the type node `ix` is built at; 1.
+function repStamp(ix: i32, t: i32): i32 {
+  while nodeRepTyIx.length <= ix { nodeRepTyIx.push(-1) }
+  nodeRepTyIx[ix] = t
+  1
+}
+
+// Stamps the destination type `dstTy` onto literal `srcExpr` (recursively, into `ObjLit` fields /
+// `ArrayLit` elements) in the `nodeRepTyIx` sidecar. Nullable wrappers are peeled; `depth` bounds
+// the walk, which a recursive record does not. A pin's re-check stamps nothing: its literal is a
+// generic body's node, shared by every instance.
 export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
   if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
-  if tyDeeperThan(dstTy, 16) { return 0 }
+  if litPinN.length > 0 { return 0 }
   let dtix = dstTy
   let peel = true
   while peel {
@@ -3984,9 +4079,7 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
   match e {
     Paren => {
       recordRepTyAdopt(e.parInner, dtix, depth)
-      while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
-      nodeRepTyIx[srcExpr] = dtix
-      return 1
+      return repStamp(srcExpr, dtix)
     }
     ObjLit => {
       match d {
@@ -4007,9 +4100,7 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
             }
             k = k + 1
           }
-          while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
-          nodeRepTyIx[srcExpr] = dtix
-          return 1
+          return repStamp(srcExpr, dtix)
         }
         // An `ObjLit` whose destination is a union: recurse against the first member whose
         // field-name set corresponds and that the literal's own type fits, else the first whose
@@ -4029,12 +4120,16 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
         TyArray => {
           let i = 0
           while i < e.arrElems.length {
-            recordRepTyAdopt(e.arrElems[i], d.aElem, depth - 1)
+            // A spread element's source list is delivered to the whole list's type.
+            const el = nodeAt(e.arrElems[i])
+            if el is Spread {
+              recordRepTyAdopt(el.spdArg, dtix, depth - 1)
+            } else {
+              recordRepTyAdopt(e.arrElems[i], d.aElem, depth - 1)
+            }
             i = i + 1
           }
-          while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
-          nodeRepTyIx[srcExpr] = dtix
-          return 1
+          return repStamp(srcExpr, dtix)
         }
         // An array literal boxed into a union arm — recurse against the first array member.
         TyUnion => {
@@ -4054,8 +4149,22 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       }
       return 0
     }
+    // A `null` at a nullable record is that record's null, stamped with the record, or with the
+    // type parameter an instance binds.
+    NullLit => {
+      if !(d is TyObj) && !(d is TyVar) { return 0 }
+      return repStamp(srcExpr, dtix)
+    }
+    // A value `if`, `match` or block delivers each arm's value to the same destination.
+    IfStmt | Block | MatchExpr => {
+      let any = 0
+      for l in valueTailLeaves(srcExpr) {
+        if l != srcExpr { any = any | recordRepTyAdopt(l, dtix, depth - 1) }
+      }
+      return any
+    }
     // no other source is a literal shape to stamp
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {}
   }
   0
 }

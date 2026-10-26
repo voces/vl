@@ -1835,12 +1835,18 @@ under which the declining case serves wrongly:
 | --- | --- | --- | --- |
 | occurrences in S | "a served call is a second site of a fresh builder" | "a lib call stops being a second site of a fresh builder"; "lib gains a value use named like lib2's builder" (D6750) | 1073741824 on both |
 | declaring statement | "lib edits elsewhere while main keeps lib's builder" | "lib's builder leaf becomes a binding" | 65536 |
-| kept and own split | "a lib call stops delivering a fresh builder to a wider record" | "lib hands on a kept binding main delivers to a wider record" (D6751) | -2147483648 |
+| kept and own split | "a lib call stops delivering a fresh builder to a wider record" | "lib hands on a kept builder main delivers to a wider record" (D6751) | -2147483648 with 1073741824 |
 
 - D6750 is an occurrence that only shares the builder's name. The site count is syntactic, so
   it moves the count.
 - D6751 was unsound on master: a kept delivery in main and an own one in lib, with lib's
   interface unchanged.
+- D6751's own program now uses a binding, not a builder. Main's wider delivery pins `pk` at
+  main's type, so lib's interface renders `pk`'s type. The reach declines it as `interface`,
+  and the mask that serves it wrongly is `IH_NO_TYPES` (8). Only a function is still kept, so
+  the split's witness is the builder twin, "lib hands on a kept builder main delivers to a
+  wider record". The occurrence guard (1073741824) declines that case by itself, so its mask
+  drops both guards.
 - The `READ` flag is not a mask. Without it, "a lib call stops being a second site" served
   main's stale refusal, because the refusal kept nothing.
 - "a lib call starts delivering a fresh builder to a wider record" now declines `interface`

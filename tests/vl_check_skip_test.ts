@@ -928,15 +928,26 @@ const CASES: Case[] = [
     uses: 'import { mk } from "./lib2"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
   {
-    // D6751: lib starts handing on, at its own type, a binding main's delivery keeps.
-    name: "lib hands on a kept binding main delivers to a wider record",
+    // D6751: main's wider delivery pins lib's literal binding at main's type, so lib checked
+    // alone renders the binding at its own type and the reach declines.
+    name: "lib hands on a binding main delivers to a wider record",
     want: "decline",
-    why: "fresh",
+    why: "interface",
     badWhy: "decor",
     from: "function quiet",
     to: "export function hand(): void { let w = { f: 1, g: { h: 1, k: 2 } }; w = q2; print(w.f) }\nfunction quiet",
     libUses: "export const pk = { f: 4, g: { h: 1, k: 2 } }\nconst q2 = pk\n",
     uses: 'import { pk } from "./lib"\nlet vk = { f: 1.5, g: { h: 1 } }\nvk = pk\nprint(vk.f)\n',
+  },
+  {
+    // A builder main's wider delivery keeps: lib's new own delivery is what main's refusal reads.
+    name: "lib hands on a kept builder main delivers to a wider record",
+    want: "decline",
+    why: "fresh",
+    from: "function quiet",
+    to: "export function hand(): void { let w = { f: 1 }; w = mk(); print(w.f) }\nfunction quiet",
+    libUses: "export function mk() { { f: 4 } }\n",
+    uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
   {
     // Lib is in S only as mid's import, and a generic main calls from it closes over nothing moved.
@@ -1209,7 +1220,10 @@ Deno.test({
       ["lib's builder leaf becomes a binding", 65536],
       ["lib gains a value use named like lib2's builder", 1073741824],
       ["a lib call stops being a second site of a fresh builder", 1073741824],
-      ["lib hands on a kept binding main delivers to a wider record", -2147483648],
+      // With `SK_NO_FRESH_OCC` too: lib's new site of `mk` alone declines it at stage 0.
+      ["lib hands on a kept builder main delivers to a wider record", 1073741824 | -2147483648],
+      // `IH_NO_TYPES` hides the type main's delivery pins a lib binding at.
+      ["lib hands on a binding main delivers to a wider record", 8],
       // `SK_NO_KEPT_SRC | IH_NO_CROSS` keeps a bank across a generic whose closure moved, with
       // the reach below the origin dropped; dropping the reach alone still declines `demand`.
       ["a generic called from a module S only imports, over a moved closure", 134217728 | 8192],
