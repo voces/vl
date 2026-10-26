@@ -857,7 +857,6 @@ import {
   narrowedIsMapPlace,
   narrowedIsRefArray,
   narrowedIsRefArrayPlace,
-  narrowedValueAtomOf,
   nicheReadKindAt,
   nodeJoinRowName,
   nodeMixedUnionName,
@@ -3263,6 +3262,69 @@ function readAtomAgreed(rx: i32, t: i32, fnIx: i32): i32 {
   const et = elabNodeTyAt(rx, fnIx)
   if et >= 0 && readAtomKindOfTy(et) != k { return -1 }
   k
+}
+
+// The atom the checker typed the path read `ix` (a field, element or map value) as, or -1.
+export function pathReadAtomKind(ix: i32, fnIx: i32): i32 {
+  const rx = unwrapParen(ix)
+  if rx == storageReadIx { return -1 }
+  readAtomAgreed(rx, nodeTyAt(rx, fnIx), fnIx)
+}
+
+// True when every record arm of the receiver type `rt` declares field `prop` at atom `k`; a
+// receiver that is not a union asks `tyFieldTyOf`, which declines every kind but a record.
+function recvFieldIsAtom(rt: i32, prop: string, k: i32): boolean {
+  if rt < 0 { return false }
+  const p = tyPeelNul(rt)
+  if p < 0 || p >= T.tys.length { return false }
+  const r = tyAt(p)
+  if r is TyUnion {
+    let seen = false
+    let i = 0
+    while i < r.uMembers.length {
+      const m = r.uMembers[i]
+      if m >= 0 && tyAt(m) is TyObj {
+        if !recvFieldIsAtom(m, prop, k) { return false }
+        seen = true
+      }
+      i = i + 1
+    }
+    return seen
+  }
+  const ft = tyFieldTyOf(p, prop)
+  ft >= 0 && readAtomKindOfTy(ft) == k
+}
+
+// The atom a field read `o.f` is narrowed to below the field's declared type, or -1: a read
+// typed as every receiver arm declares the field narrows nothing.
+export function memNarrowAtomKind(memIx: i32, fnIx: i32): i32 {
+  const m = nodeAt(unwrapParen(memIx))
+  if m is Member {
+    const k = pathReadAtomKind(memIx, fnIx)
+    if k < 0 { return -1 }
+    if recvFieldIsAtom(nodeTyAt(m.memObj, fnIx), m.memProp, k) { return -1 }
+    return k
+  }
+  -1
+}
+
+// The atom an element or map-value read `a[i]` is narrowed to below the receiver's element
+// or value type, or -1.
+export function idxNarrowAtomKind(idxIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(unwrapParen(idxIx))
+  if e is Index {
+    const rt = nodeTyAt(e.idxArr, fnIx)
+    if rt < 0 { return -1 }
+    const r = tyAt(tyPeelNul(rt))
+    let dt = -1
+    if r is TyArray { dt = r.aElem }
+    if r is TyMap { dt = r.mVal }
+    if dt < 0 { return -1 }
+    const k = pathReadAtomKind(idxIx, fnIx)
+    if k < 0 || readAtomKindOfTy(dt) == k { return -1 }
+    return k
+  }
+  -1
 }
 
 // The atom the read `rx` is typed as below its binding, from types alone, or -1: where the
@@ -6740,7 +6802,7 @@ export function memReadUnboxAtomKind(memIx: i32, fnIx: i32): i32 {
 export function memReadBoxedAtomKind(memIx: i32, fnIx: i32): i32 {
   const un0 = memberUnionFieldNameRead(memIx, fnIx)
   if un0 == "" { return -1 }
-  if narrowedValueAtomOf(memberPathKeyOf(memIx)) != "" { return -1 }
+  if memNarrowAtomKind(memIx, fnIx) >= 0 { return -1 }
   const cty = nodeTyAt(memIx, fnIx)
   if cty < 0 { return -1 }
   const t = tyAt(cty)
@@ -8524,9 +8586,7 @@ export function mapReadNarrowedAtomKind(exprIx: i32, fnIx: i32) {
   const mrs = mapReadNarrowableSlot(exprIx, fnIx)
   if mrs < 0 { return -1 }
   if mvValKind[mrs] != MVK_UNION { return -1 }
-  const a = narrowedValueAtomOf(indexPathKeyOf(exprIx))
-  if a == "" { return -1 }
-  const ak = valueAtomKind(a)
+  const ak = idxNarrowAtomKind(exprIx, fnIx)
   if ak < 0 || ak == 6 { return -1 }
   ak
 }
@@ -16579,18 +16639,16 @@ function memberUnionReadKind(exprIx: i32, fnIx: i32) {
   const e = nodeAt(exprIx)
   if e is Member {
     if memberUnionFieldNameRead(exprIx, fnIx) != "" {
-      const a = narrowedValueAtomOf(memberPathKeyOf(exprIx))
-      if a != "" { return valueAtomKind(a) }
+      const a = memNarrowAtomKind(exprIx, fnIx)
+      if a >= 0 { return a }
       const d = memReadUnboxAtomKind(exprIx, fnIx)
       if d >= 0 { return d }
       return -2
     }
-    // A shared read boxing its members' differing atoms, narrowed to one (`emitMem`'s twin).
-    if narrowTop > 0 {
-      const sa = narrowedValueAtomOf(memberPathKeyOf(exprIx))
-      if sa != "" && memberFieldCode(exprIx, fnIx) == FC_UNION {
-        return valueAtomKind(sa)
-      }
+    // A shared read delivering a box, typed as one atom (`emitMemSharedRead`'s twin).
+    if memberFieldCode(exprIx, fnIx) == FC_UNION {
+      const sa = pathReadAtomKind(exprIx, fnIx)
+      if sa >= 0 { return sa }
     }
   }
   -3
@@ -16604,8 +16662,8 @@ export function indexUnionReadKind(exprIx: i32, fnIx: i32) {
   const e = nodeAt(exprIx)
   if e is Index {
     if indexElemUnionName(exprIx, fnIx) != "" {
-      const a = narrowedValueAtomOf(indexPathKeyOf(exprIx))
-      if a != "" { return valueAtomKind(a) }
+      const a = idxNarrowAtomKind(exprIx, fnIx)
+      if a >= 0 { return a }
       return -2
     }
     // A union-valued map's bare read is the same box a union-element cell is (D1025), and a
