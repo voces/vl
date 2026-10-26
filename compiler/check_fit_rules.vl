@@ -254,6 +254,7 @@ import {
   recAdLandingList,
   recAdPushDecl,
   recAdPushMapDecl,
+  recAdPushUnionList,
   recDelivPush,
   recPend,
   recPendDstTy,
@@ -433,7 +434,6 @@ import {
   tyHasHole,
   tyHasInferHole,
   tyHasMapMember,
-  tyHoldsListUnion,
   tyHoldsObj,
   tyIsHole,
   tyIsLitUnion,
@@ -919,7 +919,7 @@ export function tpIfCmpNode(ix: i32, t: i32) {
   const tpl = nodeTyIx[ix]
   if tpl < 0 || tpIfJoinAt.has(ix) { return 0 }
   const wt = widenLitTy(t)
-  if wt == tpl || !tyHoldsListUnion(wt, 0) { return 0 }
+  if wt == tpl || !tyReachesUnion(wt, 6) { return 0 }
   let st = tpl
   if tyHasTyVar(tpl) {
     const n = nodeAt(ix)
@@ -2154,6 +2154,46 @@ export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   recAdPushMapDecl(decl, srcTy, nonNulTyOf(dstTy), p)
 }
 
+// Note a delivery of the literal list binding `srcExpr` (a list of records) as a list of a
+// record union, which it adopts. True when it noted one.
+export function recAdoptUnionList(
+  srcExpr: i32,
+  srcTy: i32,
+  dstTy: i32,
+): boolean {
+  const p = cwPeelValue(srcExpr)
+  if p < 0 || p >= P.nodes.length { return false }
+  const e = nodeAt(p)
+  // A list literal delivers each element as the destination's element.
+  if e is ArrayLit {
+    const de = tyArrayElemIx(nonNulTyOf(dstTy))
+    if de < 0 { return false }
+    let any = false
+    for el in e.arrElems {
+      if !(nodeAt(el) is Spread) && recAdoptUnionList(el, nodeTyIxOf(el), de) {
+        any = true
+      }
+    }
+    return any
+  }
+  if !(e is Ident) { return false }
+  const decl = recFreshDeclOf(p)
+  if decl < 0 || !(nodeAt(parenPeelIx(recDeclInit(decl))) is ArrayLit) {
+    return false
+  }
+  const de = tyArrayElemIx(recAdLandingList(nonNulTyOf(dstTy)))
+  if de < 0 || !(tyAt(de) is TyUnion) { return false }
+  recAdPushUnionList(decl, tyArrayElemIx(srcTy), de, p)
+  // Its literal is built at the first such list, which a disagreeing later one aliases (D853).
+  const lit = parenPeelIx(recDeclInit(decl))
+  const was = if lit < nodeRepTyIx.length { nodeRepTyIx[lit] } else { -1 }
+  const wasEl = if was >= 0 { tyArrayElemIx(was) } else { -1 }
+  if !recAdNoAdopt.has(decl) && (wasEl < 0 || !(tyAt(wasEl) is TyUnion)) {
+    adoptLitAt(lit, recAdLandingList(nonNulTyOf(dstTy)))
+  }
+  true
+}
+
 // Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
 // element of a literal list binding, to a record that stores a field differently.
 export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
@@ -2193,6 +2233,7 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     }
     const iv = nodeAt(parenPeelIx(recDeclInit(decl)))
     if iv is ArrayLit {
+      if recAdoptUnionList(srcExpr, srcTy, dstTy) { return 0 }
       return recAdPushDecl(
         decl,
         tyArrayElemIx(srcTy),
