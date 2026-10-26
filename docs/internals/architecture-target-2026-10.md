@@ -468,8 +468,25 @@ Each step lands only when its deletion lands with it. A shadow that only adds co
 - **Closes:** family E (9 open), the same-shape rows (D12465's 65 cells among them), and the L2 §7 deviation.
 - **Scoreboard:** emit_classify ↓, seed ↓.
 
-Steps 1, 2, 3 and 4 are strictly ordered. Step 5 can start after step 1, and step 7 needs steps 4 and 5.
+Steps 1, 2, 3 and 4 are strictly ordered (1–3 land as one, §3.1). Step 5 starts with 5.0, and step 7 needs steps 4 and 5.
 L6 render-parse (§4.3) continues independently.
+
+### 3.1 Findings and decisions from the first landings, 2026-10-25
+
+**Steps 1–3 are one mechanism.** Step 1 as written was refuted by measurement (11,546 instances over 7,482 programs). The emitter asks for types before any bank could be filled: 195,415 asks, 44,518 from functions nested inside an instance and 72,379 from program-level pins with no instance. And about a third of mono's instance set comes from emit-side work through function values and deliveries (1,166 from function values, 425 from lambdas, 301 from direct calls with no candidate), which no check-time call site can key without the function's identity. So:
+- one elaboration worklist runs after check and before emit; it covers nested functions, keyed by the enclosing instance, and the program as the root instance;
+- a singleton `Fn#d` is a legal closed type argument in an instance key, and a delivery into a declared function-typed slot is a demand;
+- joins wait for step 4, and are counted until then.
+
+**The record is the checked type.** Storing `widenLitTy(t)` matched the ladder, and a separate storage-type table moved nothing, so it was deleted. Narrowing stays a separate record (step 6).
+
+**The worklist replaces mono's re-check in the same landing.** Beside mono's per-instance re-check, the worklist cost +0.71% L2 fuel, +0.80% diderven build fuel and +20% peak live memory, +0.65% of it with every hook off. Mono reads worklist entries, and the `instNodeTys` bank goes with the re-check.
+
+**Step 5's first field group needs the join typed first.** Reading the checker's contextual type instead of `structIdx`/`variantIdx` lost 169 programs over 2,879 files. Every loss is a row the emitter's anonLeaf pass (emit_collect.vl and five neighbours) mints by merging the records that meet at a join, then moves onto locals, params, globals, closures and function results, across functions. The checker never gives any value that type. Its own join is wrong as well: `a ?? { r: 1.5 }` over an existing `{r: i32}` is typed `{r: f64}`, widening an existing record in place (D13900), and a join refuses once its type is declared elsewhere (D13901). So step 5 begins with:
+- **5.0 Joins typed and stored once.** The checker types a join by the rulings: a fresh literal adapts, and each binding adopts all-or-nothing (D3339 A). An existing record is never widened or copied (record covariance A), and runtime numerics of different types join as a union (numeric join ruling). Storage is `repOf` of that type. The merged-row minting in the emitter is deleted, not moved: a merge across functions would be a second producer of storage. Its acceptance set is the 169 programs.
+- 5a–5d then follow as listed.
+
+Step 5 therefore starts after step 5.0, not after step 1.
 
 ---
 
