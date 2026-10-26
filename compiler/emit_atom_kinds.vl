@@ -48,7 +48,7 @@ import { isVarTyIxOf } from "./check_list_union"
 import { nodeTyIxOf } from "./check_node_tys"
 import { nodeTyAt } from "./emit_capture_frames"
 import { holeFnArgRetAtParams } from "./check_relate_core"
-import { nomErasedTyIx, valueAtomKind, valueRowKind } from "./check_ty_rep"
+import { nomErasedTyIx } from "./check_ty_rep"
 import {
   PrimName,
   T,
@@ -64,9 +64,6 @@ import {
   TyUnion,
   TyVar,
   litBaseTy,
-  litUnionAliasNameOfTy,
-  litUnionAliasOfLitTexts,
-  litUnionInlineNameOfTy,
   numLitUnionBaseTy,
   tyAt,
   tyEq,
@@ -77,7 +74,7 @@ import {
   tyIsLitUnionOrLit,
   tyLitMemberTexts,
   tyPrimNameOf,
-  tyToEmitName,
+  tySame,
 } from "./check_types"
 import {
   objFieldVal,
@@ -121,16 +118,7 @@ import { memoKeyNew, memoPassMoved } from "./memo"
 import { strContains } from "./strutil"
 import { hashMixPair } from "./hash_mix"
 import { recFitNarrowedFields } from "./check_fit_rules"
-import {
-  isNullTy,
-  nonNullTy,
-  tyEmitElemNulPrimOf,
-  tyEmitElemPrimOf,
-  tyEmitNamesOf,
-  tyEmitPrimOf,
-  tyHasTyVar,
-  tyStepElem,
-} from "./tyquery"
+import { nonNullTy, tyHasTyVar } from "./tyquery"
 
 // The wasm-type code (`0` i32, `3` string, `4` i32-list, `5` ref-list) of struct `si`'s
 // field at field index `fi`.
@@ -196,19 +184,46 @@ export function structTyMarkAliasable(ty: i32) {
   0
 }
 
-// Records that a minted arena type `ty`, and any arena index of its shape, denotes row `row`, a
-// shape deduplicated onto a row interned for an earlier, rep-equal type. A row recording `ty`
-// itself takes precedence; among aliases the first wins. Any other type keeps its name path,
-// since two rep-equal declared shapes may need distinct rows (D3124).
+// Records that arena type `ty`, deduplicated onto row `row`, denotes it: by exact id, and by
+// canonical id when marked aliasable. An earlier record wins. A type whose function fields differ
+// from the row's own keeps its name path, since one closure signature lays out both yet each pins
+// its own instance (D3124).
 export function structTyIxAlias(ty: i32, row: i32) {
-  if ty < 0 || row < 0 || ty >= sTyAliasable.length || !sTyAliasable[ty] {
-    return 0
-  }
+  if ty < 0 || row < 0 { return 0 }
+  const aliasable = ty < sTyAliasable.length && sTyAliasable[ty]
+  if !aliasable && !tyFnFieldsAgree(ty, structRowOwnTy(row)) { return 0 }
   while sTyAlias.length <= ty { sTyAlias.push(-1) }
   if sTyAlias[ty] < 0 { sTyAlias[ty] = row }
+  if !aliasable { return 0 }
   const ck = repCanonId(ty)
   if ck >= 0 && !sTyCanonAlias.has(ck) { sTyCanonAlias[ck] = row }
   0
+}
+
+// The arena type row `row` denotes: its recorded type, else a literal row's own. -1 for none.
+function structRowOwnTy(row: i32): i32 {
+  if row < sTyIx.length && sTyIx[row] >= 0 { return sTyIx[row] }
+  sAnonOwnTy.get(row) ?? -1
+}
+
+// Whether records `a` and `b` agree on the type of every function field of `a`. True when either
+// is not a record or a field is missing, since nothing then tells the two apart.
+function tyFnFieldsAgree(a: i32, b: i32): boolean {
+  if a == b || a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length {
+    return true
+  }
+  const o = tyAt(a)
+  if !(o is TyObj) { return true }
+  let k = 0
+  while k < o.objFieldNames.length {
+    const ft = o.objFieldTypes[k]
+    if ft >= 0 && tyAt(nonNullTy(ft)) is TyFunc {
+      const bt = tyFieldTyOf(b, o.objFieldNames[k])
+      if bt >= 0 && !tySame(ft, bt) { return false }
+    }
+    k = k + 1
+  }
+  true
 }
 
 // The struct-table row for an arena type — `structIndexByName`'s arena-input twin,
@@ -570,8 +585,69 @@ function fnFieldTyFits(lt: i32, rt: i32): boolean {
   if !(tyAt(lt) is TyFunc) { return true }
   const rf = nonNullTy(rt)
   if rf < 0 || !(tyAt(rf) is TyFunc) { return true }
-  if tyHasTyVar(lt) || tyHasTyVar(rf) { return true }
+  if tyHasTyVar(rf) { return true }
+  if tyHasTyVar(lt) { return tyVarsCanBind(lt, rf, [], []) }
   tyEq(lt, rf)
+}
+
+// Whether some binding of the type variables in `lt` makes it `rt`: each variable names one type
+// throughout, so `(T) => T` is no `(i32) => f64`. Refutation only past functions and variables.
+function tyVarsCanBind(lt: i32, rt: i32, names: string[], tys: i32[]): boolean {
+  if lt < 0 || rt < 0 || lt >= T.tys.length || rt >= T.tys.length {
+    return true
+  }
+  if !tyHasTyVar(lt) { return tyEq(lt, rt) }
+  const l = tyAt(lt)
+  let ok = true
+  match l {
+    TyVar => {
+      ok = tyVarBinds(l.tvName, rt, names, tys)
+    }
+    TyFunc => {
+      ok = fnTyVarsCanBind(l, rt, names, tys)
+    }
+    // A variable under any other kind is not refuted here.
+    TyErr | TyPrim | TyObj | TyUnion | TyNullable | TyArray | TyMap | TyLit | TyNeg => {}
+  }
+  ok
+}
+
+// Binds variable `name` to `rt` in the parallel `names`/`tys`, or tests it against its binding.
+function tyVarBinds(
+  name: string,
+  rt: i32,
+  names: string[],
+  tys: i32[],
+): boolean {
+  let i = 0
+  while i < names.length {
+    if names[i] == name { return tyEq(tys[i], rt) }
+    i = i + 1
+  }
+  names.push(name)
+  tys.push(rt)
+  true
+}
+
+// `tyVarsCanBind` for function type `l`: `rt` is a function of as many parameters, each and the
+// result bindable under the one binding.
+function fnTyVarsCanBind(
+  l: TyFunc,
+  rt: i32,
+  names: string[],
+  tys: i32[],
+): boolean {
+  const r = tyAt(rt)
+  if !(r is TyFunc) { return false }
+  if l.fnParamTypes.length != r.fnParamTypes.length { return false }
+  let k = 0
+  while k < l.fnParamTypes.length {
+    if !tyVarsCanBind(l.fnParamTypes[k], r.fnParamTypes[k], names, tys) {
+      return false
+    }
+    k = k + 1
+  }
+  tyVarsCanBind(l.fnRet, r.fnRet, names, tys)
 }
 
 // Whether the un-annotated function field value `fv` (typed `lt`, with holes) gives the result of
@@ -1063,220 +1139,6 @@ export function listGetStagesOperand(ix: i32): boolean {
   if !optRecvReReadable(callee.memObj) { return true }
   if c.callArgs.length != 1 { return false }
   !listGetIdxReReadable(c.callArgs[0])
-}
-// `valueAtomKind` of a type's render, read off the type. One shape still asks the spelling: a
-// union of two or more members that share a list or closure kind whose spelling that kind
-// does not fix (`i32[] | K[]`, two function types), since the render keeps one part only when
-// the members spell alike (D4320); and a list element union this does not walk.
-export function valueAtomKindOfTy(ty: i32): i32 {
-  const k = vakOfTy(ty)
-  if k != -2 { return k }
-  valueAtomKind(tyToEmitName(ty))
-}
-
-// `valueAtomKindOfTy`'s decision, or -2 for "ask the spelling".
-function vakOfTy(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  for s in vakSeen {
-    // A revisited ancestor spells an alias name or nothing, neither of them an atom.
-    if s == ty { return -1 }
-  }
-  vakSeen.push(ty)
-  const r = vakGo(ty)
-  vakSeen.pop()
-  r
-}
-
-// The ancestor stack of `vakOfTy`: the renderer's cycle guard, mirrored.
-const vakSeen: i32[] = []
-
-// The atom kind of a primitive's own spelling, -1 for one that is not a value atom.
-function vakOfPrim(p: PrimName | null): i32 {
-  if p == null { return -1 }
-  match p {
-    "i32" => {
-      return 0
-    }
-    "boolean" => {
-      return 1
-    }
-    "string" => {
-      return 2
-    }
-    "i64" => {
-      return 3
-    }
-    "f64" => {
-      return 4
-    }
-    "f32" => {
-      return 5
-    }
-    "null" => {
-      return 6
-    }
-    "v128" => {
-      return 14
-    }
-    "void" | "never" | "u8" => {
-      return -1
-    }
-  }
-}
-
-// The atom kind of the list spelling `p[]`, -1 for one that is not a value atom.
-function vakOfPrimList(p: PrimName | null): i32 {
-  if p == null { return -1 }
-  match p {
-    "i32" => {
-      return 7
-    }
-    "boolean" => {
-      return 17
-    }
-    "f64" => {
-      return 8
-    }
-    "string" => {
-      return 9
-    }
-    "i64" => {
-      return 10
-    }
-    "f32" => {
-      return 12
-    }
-    "u8" => {
-      return 13
-    }
-    "null" => {
-      return 18
-    }
-    "void" | "never" | "v128" => {
-      return -1
-    }
-  }
-}
-
-function vakGo(ty: i32): i32 {
-  const t = tyAt(ty)
-  // Exhaustive over `Ty` and `_`-less: every arena shape says what its render reads as.
-  match t {
-    TyPrim => {
-      return valueRowKind(ty)
-    }
-    TyObj | TyMap | TyNullable => {
-      // A shape, a map and a `T | null` are never one value atom.
-      return -1
-    }
-    TyLit => {
-      return vakOfPrim(tyEmitPrimOf(ty))
-    }
-    TyVar | TyNeg | TyErr => {
-      // No spelling at all.
-      return -1
-    }
-    TyFunc => {
-      // A result that is a list or a union can end the spelling in `[]`, which the list cuts read.
-      if t.fnRet >= 0 {
-        const rt = tyAt(t.fnRet)
-        if rt is TyArray || rt is TyUnion { return -2 }
-      }
-      if tyEmitNamesOf(ty) { return 11 }
-      return -1
-    }
-    TyArray => {
-      const k = valueRowKind(ty)
-      if k != -2 { return k }
-      return vakOfListElem(ty)
-    }
-    TyUnion => {
-      const p = tyEmitPrimOf(ty)
-      if p != null { return vakOfPrim(p) }
-      return vakOfUnion(t.uMembers)
-    }
-  }
-}
-
-// The atom kind of list `arr` whose element the arena row does not classify, by the element's
-// spelling inside the list's render, or -2 for an element union this does not walk.
-function vakOfListElem(arr: i32): i32 {
-  const p = tyEmitElemPrimOf(arr)
-  if p != null { return vakOfPrimList(p) }
-  if tyEmitElemNulPrimOf(arr, "boolean") != 0 { return 18 }
-  if tyEmitElemNulPrimOf(arr, "string") != 0 { return 9 }
-  const el = tyStepElem(arr)
-  if el < 0 { return -1 }
-  // A quoted literal run with a null, or its alias with one, is the atom list.
-  if litUnionInlineNameOfTy(el) != "" { return 7 }
-  const e = tyAt(el)
-  // Exhaustive over `Ty` and `_`-less: every element shape says whether it is an atom list.
-  match e {
-    TyNullable => {
-      const inr = e.nInner
-      if inr < 0 { return -1 }
-      if litUnionAliasNameOfTy(inr) != "" || litUnionInlineNameOfTy(inr) != "" {
-        return 7
-      }
-      const it = tyAt(inr)
-      if it is TyUnion || it is TyNullable { return -2 }
-      // A function, any other primitive, a shape, a list or a map beside the null is not one
-      // of the three nullable-element lists.
-      return -1
-    }
-    TyUnion => {
-      return -2
-    }
-    TyPrim | TyLit | TyObj | TyArray | TyMap | TyFunc | TyVar | TyNeg | TyErr => {
-      // A shape, list, map or function element, or an element with no spelling.
-      return -1
-    }
-  }
-}
-
-// The atom kind of a union no primitive spells, from its members' kinds: one part when every
-// member spells alike, else several parts, which are never one atom.
-function vakOfUnion(ms: i32[]): i32 {
-  if ms.length == 0 { return -1 }
-  // Two string literals beside a non-null member spell their registered alias, an extra part.
-  const texts: string[] = []
-  let nonLit = false
-  for m in ms {
-    const mt = tyAt(m)
-    if mt is TyLit {
-      if mt.litKind == "str" { texts.push(mt.litText) }
-    } else if !isNullTy(m) {
-      nonLit = true
-    }
-  }
-  if nonLit && texts.length >= 2 && litUnionAliasOfLitTexts(texts) != "" {
-    return -1
-  }
-  let kind = -3
-  for m in ms {
-    let mk = -1
-    const mt = tyAt(m)
-    if litUnionAliasNameOfTy(m) != "" {
-      mk = -1
-    } else if mt is TyFunc {
-      // A function member is grouped, so its spelling never ends in `[]`.
-      if tyEmitNamesOf(m) { mk = 11 }
-    } else if mt is TyUnion {
-      return -2
-    } else {
-      mk = vakOfTy(m)
-      if mk == -2 { return -2 }
-    }
-    if mk == -1 { return -1 }
-    if kind == -3 { kind = mk }
-    else if kind != mk { return -1 }
-  }
-  // One spelling per kind, except the atom list, the string list, the nullable boolean list
-  // and the closure, each of which several spellings share (D4320).
-  if ms.length > 1 && (kind == 7 || kind == 9 || kind == 11 || kind == 18) {
-    return -2
-  }
-  kind
 }
 
 // True if the member access at `memIx` reads a field of a currently-narrowed union receiver

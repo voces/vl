@@ -115,8 +115,8 @@ bad=$(awk -F'\t' '$2 != "success" {print $3 " " $2}' <<< "$jobs" | head -3)
 [ -z "$bad" ] || refuse "run $id: $(tr '\n' ',' <<< "$bad")"
 for j in "${JOBS[@]}"; do
   name=${j%=*}; want=${j#*=}
-  if [ "$want" = 1 ]; then n=$(awk -F'\t' -v n="$name" '$3 == n' <<< "$jobs" | wc -l)
-  else n=$(awk -F'\t' -v n="$name (" 'index($3, n) == 1' <<< "$jobs" | wc -l); fi
+  if [ "$want" = 1 ]; then n=$(awk -F'\t' -v n="$name" '$3 == n' <<< "$jobs" | wc -l | tr -d ' ')
+  else n=$(awk -F'\t' -v n="$name (" 'index($3, n) == 1' <<< "$jobs" | wc -l | tr -d ' '); fi
   [ "$n" -eq "$want" ] || refuse "run $id has $n '$name' jobs, ci.yml runs $want"
 done
 
@@ -125,7 +125,7 @@ pid=$(awk -F'\t' '$3 == "ci-proof" {print $1}' <<< "$jobs")
 # A job log carries the runner's colour codes, which gh refuses to print without the flag.
 lines=$(gh api "repos/$REPO/actions/jobs/$pid/logs" --allow-escape-sequences 2>/dev/null | grep -oE "$PROOF_RE" | sort -u)
 [ -n "$lines" ] || refuse "run $id's ci-proof job printed no proof line"
-[ "$(wc -l <<< "$lines")" -eq 1 ] || refuse "run $id's ci-proof job printed $(wc -l <<< "$lines") different proof lines"
+[ "$(wc -l <<< "$lines")" -eq 1 ] || refuse "run $id's ci-proof job printed $(wc -l <<< "$lines" | tr -d " ") different proof lines"
 read -r _ _ ptree _ pseed _ prustc <<< "$lines"
 [ "$ptree" = "$tree" ] || refuse "run $id graded tree ${ptree:0:9}, this checkout ${tree:0:9}"
 [ "$pseed" = "$seed" ] || refuse "run $id graded seed ${pseed:0:12}, this checkout's is ${seed:0:12}"
