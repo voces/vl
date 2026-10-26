@@ -86,7 +86,8 @@ print(k("s"))
 `;
 
 // An un-annotated parameter called as a method: the instance mono picks fits no binding the
-// table holds, and the closure's result flows back through a function value (D3925).
+// table holds, and the closure's result flows back through a function value (D3925). The
+// instance carries its template's checked `void` result, so only the template is undecided.
 const H05 = `export function click(b) {
   b.onClick()
 }
@@ -118,7 +119,7 @@ const CASES: [string, string, number, string][] = [
     H05,
     0,
     "disagree: instance fits no binding | direct call | click=1; " +
-    "undecided: return through a function value | return | click=2",
+    "undecided: return through a function value | return | click=1",
   ],
   [
     "M01B",

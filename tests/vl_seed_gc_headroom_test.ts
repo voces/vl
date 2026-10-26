@@ -7,9 +7,9 @@
 // collection leaving more than 75% of a semispace live (`SeedGcHeadroom`,
 // scripts/vl-host/src/main.rs; docs/internals/perf/gc-heap-policy-2026-09.md §4).
 //
-// The workload is `vl check compiler/check_narrow_flow.vl` at the default 256 MiB first heap: its
-// live set peaks near 130 MB, past the 96 MiB the policy grows at. Measured when this landed:
-// 7 collections with the policy, 40 under `$VL_COMPILE_GC_GROW=off`. Three bounds: the default
+// The workload is `vl check compiler/emit_shape_rows.vl` at the default 256 MiB first heap: its
+// live set peaks near 250 MB, past the 96 MiB the policy grows at. Measured when it was chosen:
+// 6 collections with the policy, 46 under `$VL_COMPILE_GC_GROW=off`. Three bounds: the default
 // collects at least once (a dead counter reads 0) and at most `MAX_DEFAULT`; the policy switched
 // off collects more than `MAX_DEFAULT`, the red control run in the same test; and off collects at
 // least `MIN_SPREAD` times as often, so a workload that drifts out of the band fails here.
@@ -29,11 +29,11 @@ if (!ENABLED) {
   );
 }
 
-const TARGET = `${ROOT}/compiler/check_narrow_flow.vl`;
+const TARGET = `${ROOT}/compiler/emit_shape_rows.vl`;
 
-// 7 at the time of writing; loose so a compiler change that moves the live set cannot red it.
+// 6 at the time of writing; loose so a compiler change that moves the live set cannot red it.
 const MAX_DEFAULT = 20;
-// 42 / 7 at the time of writing.
+// 46 / 6 at the time of writing.
 const MIN_SPREAD = 3;
 
 async function collections(grow: string, label: string): Promise<number> {
