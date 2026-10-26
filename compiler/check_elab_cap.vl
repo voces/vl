@@ -13,6 +13,7 @@ import {
 } from "./check_scopes"
 import {
   T,
+  Ty,
   TyArray,
   TyErr,
   TyFunc,
@@ -365,34 +366,116 @@ function elabTyClosedOwn(t: i32, depth: i32, own: i32[]): boolean {
   }
 }
 
-// The declaration or lambda a function type is the singleton type of (`Fn#d`), by type index:
-// a read of a function declaration's name or a lambda literal types its value at an index only
-// that function has. -2 where two functions met at one index.
-export let elabFnIdTy: {[i32]: i32} = Map()
+// The finite set of declarations or lambdas a function type's values may be, by type index, as
+// an id into `fnSets`: a read of a function's name or a lambda literal types its value at an
+// index only that function has (its singleton `Fn#d`), and a join of two sets is a fresh index.
+export let elabFnSetTy: {[i32]: i32} = Map()
+// Each interned set, its members ascending; `fnSetByKey` finds one by its spelling.
+let fnSets: i32[][] = []
+let fnSetByKey: {[string]: i32} = Map()
+// The fresh index each joined pair of function types took, by `a,b`.
+let fnJoinMemo: {[string]: i32} = Map()
 
-// Whether a value of function type `t` read now still decides `t`'s singleton. Only an open
-// signature needs one, since a closed one keys an instance by its spelling, and a quiet probe's
-// types do not stand.
+// Whether a value of function type `t` read now still decides `t`'s set. Only an open signature
+// needs one, since a closed one keys an instance by its spelling, and a quiet probe's types do
+// not stand.
 export function elabFnValWanted(t: i32): boolean {
   if inferQuiet && !elabCapLive() { return false }
-  if t < 0 || (elabFnIdTy[t] ?? -1) == -2 { return false }
+  if t < 0 { return false }
   tyHasTyVar(t)
+}
+
+// The id of the set holding `ms`, which is ascending and duplicate-free.
+function fnSetIntern(ms: i32[]): i32 {
+  let key = ""
+  for m in ms { key = key + i32ToStr(m) + "," }
+  const have = fnSetByKey[key] ?? -1
+  if have >= 0 { return have }
+  fnSets.push(ms)
+  fnSetByKey[key] = fnSets.length - 1
+  fnSets.length - 1
+}
+
+// The members of sets `a` and `b` (either -1 for none), ascending and once each.
+function fnSetUnion(a: i32, b: i32): i32[] {
+  const out: i32[] = []
+  const xs = if a >= 0 { fnSets[a] } else { out }
+  const ys = if b >= 0 { fnSets[b] } else { out }
+  let i = 0
+  let j = 0
+  const ms: i32[] = []
+  while i < xs.length || j < ys.length {
+    if j >= ys.length || (i < xs.length && xs[i] < ys[j]) {
+      ms.push(xs[i])
+      i = i + 1
+    } else if i >= xs.length || ys[j] < xs[i] {
+      ms.push(ys[j])
+      j = j + 1
+    } else {
+      ms.push(xs[i])
+      i = i + 1
+      j = j + 1
+    }
+  }
+  ms
 }
 
 // Notes a value of function type `t` as one of function `d`, the declaration or lambda it reads.
 export function elabFnValNote(t: i32, d: i32) {
   if d < 0 || !elabFnValWanted(t) { return 0 }
-  const have = elabFnIdTy[t] ?? -1
-  if have == -1 { elabFnIdTy[t] = d }
-  else if have != d { elabFnIdTy[t] = -2 }
+  const one: i32[] = [d]
+  elabFnSetTy[t] = fnSetIntern(
+    fnSetUnion(elabFnSetTy[t] ?? -1, fnSetIntern(one)),
+  )
   0
+}
+
+// The functions a value of type `t` may be, ascending; [] when `t` carries no set.
+export function elabFnSetOf(t: i32): i32[] {
+  const none: i32[] = []
+  const s = elabFnSetTy[t] ?? -1
+  if s < 0 { return none }
+  fnSets[s]
 }
 
 // The function `t` is the singleton type of, or -1.
 export function elabFnIdOf(t: i32): i32 {
-  const d = elabFnIdTy[t] ?? -1
-  if d < 0 { return -1 }
-  d
+  const ms = elabFnSetOf(t)
+  if ms.length != 1 { return -1 }
+  ms[0]
+}
+
+// The type a join of function types `a` and `b` into `j` gives its value: `j` itself when both
+// carry one set, else a fresh index with `j`'s signature, holding the union when each side
+// carries a set and none when one side may be any function, so `j`'s own set is not widened.
+export function elabFnJoinTy(j: i32, a: i32, b: i32): i32 {
+  if j < 0 || j >= T.tys.length { return j }
+  const jf = T.tys[j]
+  if !(jf is TyFunc) { return j }
+  const sa = elabFnSetTy[a] ?? -1
+  const sb = elabFnSetTy[b] ?? -1
+  if sa < 0 && sb < 0 { return j }
+  if sa == sb && (elabFnSetTy[j] ?? -1) == sa { return j }
+  const key = i32ToStr(a) + "," + i32ToStr(b)
+  const memo = fnJoinMemo[key] ?? -1
+  if memo >= 0 && memo < T.tys.length {
+    const mf = T.tys[memo]
+    if (
+      mf is TyFunc
+      && mf.fnRet == jf.fnRet
+      && mf.fnParamTypes == jf.fnParamTypes
+    ) {
+      return memo
+    }
+  }
+  const ps: i32[] = []
+  for p in jf.fnParamTypes { ps.push(p) }
+  const g: Ty = { fnParamTypes: ps, fnRet: jf.fnRet }
+  T.tys.push(g)
+  const fresh = T.tys.length - 1
+  if sa >= 0 && sb >= 0 { elabFnSetTy[fresh] = fnSetIntern(fnSetUnion(sa, sb)) }
+  fnJoinMemo[key] = fresh
+  fresh
 }
 
 // The function a call through callee node `callFn` reaches by its value's singleton type, or -1.
@@ -425,6 +508,9 @@ export function elabCapReset() {
   elabHoleRowFrom = []
   elabHoleRowN = []
   elabHoleRowT = []
-  elabFnIdTy = Map()
+  elabFnSetTy = Map()
+  fnSets = []
+  fnSetByKey = Map()
+  fnJoinMemo = Map()
   0
 }
