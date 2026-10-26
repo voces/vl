@@ -181,6 +181,7 @@ import {
   cexDeliver,
   covarTwoUnionsErr,
   covarWriteThroughErr,
+  listFieldWidenDst,
   litElemSrcTy,
   nomLitAdopts,
   objLitUndeclaredErr,
@@ -189,7 +190,6 @@ import {
   radixLitAdoptDst,
   rcwPend,
   recAdForce,
-  recordListFieldWidenAdopt,
   recordMapUnbox,
   recordRepTyAdopt,
 } from "./check_fit_rules"
@@ -386,6 +386,7 @@ import {
   tyArrayElemIx,
   tyAt,
   tyHasHole,
+  tyHasNullHole,
   tyIsHole,
   tyIsLitUnion,
   tyIsNewtypeBrand,
@@ -1382,26 +1383,41 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // `assignable`'s `TyFunc` case (`genericFnAssignable`), so it governs nested positions like an
   // array element too, not just this expression-level entry.
   recordElemRepArrayLit(srcExpr, dstTy, 6)
-  recordNullHoleObjAdopt(srcExpr, dstTy, 6)
-  recordListFieldWidenAdopt(srcExpr, dstTy)
+  // Only a delivery that holds builds the literal at its destination: one refused (`{r: 1.5}`
+  // or `{r: null}` meeting `{r: i32}` in a join) stays at its own type.
+  const lwd = listFieldWidenDst(srcExpr, dstTy)
+  const nh = !inferQuiet
+    && srcExpr >= 0
+    && tyHasNullHole(nodeTyIxOf(srcExpr), 6)
+  if lwd >= 0 || nh {
+    const q = inferQuiet
+    inferQuiet = true
+    const dOk = assignableExpr(srcExpr, srcTy, dstTy)
+    inferQuiet = q
+    if dOk {
+      recordNullHoleObjAdopt(srcExpr, dstTy, 6)
+      if lwd >= 0 { recordRepTyAdopt(srcExpr, lwd, 6) }
+    }
+  }
   // A hex / binary / octal literal is a bit pattern of the destination's width, and this seam is
   // where every binding / argument / return / field / element / store position delivers one.
   if srcTy == TY_I32 && litTreeAdoptDst(parenPeelIx(srcExpr), dstTy) >= 0 {
     return true
   }
   if radixLitAdoptDst(srcExpr, dstTy) == 2 { return true }
-  // Rep sidecar: an ObjLit/ArrayLit whose source type reaches an unresolved empty-collection hole
-  // (`{nodes: []}`, `{m: Map()}`) is plainly `assignable` to its concrete destination, so the
-  // short-circuit below returns before the adoption block. Record the destination here so the
-  // emitter's row resolver keys the element-resolved shape. Writes only `nodeRepTyIx`.
-  if !inferQuiet && srcExpr >= 0 && tyReachesEmptyHole(srcTy, 8) {
-    recordRepTyAdopt(srcExpr, dstTy, 6)
-  } else if !inferQuiet && srcExpr >= 0 && tyReachesUnion(dstTy, 8) {
-    // Union-softening adoption (see `tyReachesUnion`): an ObjLit/ArrayLit whose field value
-    // narrowed a destination union field leaves the recorded rep type softened, mis-resolving a
-    // same-fieldset twin. Re-stamp the destination rep so the emitter's structural row resolver
-    // keys the union-bearing shape. Writes only `nodeRepTyIx`.
-    recordRepTyAdopt(srcExpr, dstTy, 6)
+  // Rep sidecar: an ObjLit/ArrayLit reaching an unresolved empty-collection hole (`{nodes: []}`)
+  // or a destination union is stamped with the destination so the emitter keys that shape. Only
+  // a delivery that holds is stamped: a refused one (`{r: null}` meeting `{r: K}` in a join)
+  // stays at its own type. Writes only `nodeRepTyIx`.
+  const rtStamp = !inferQuiet
+    && srcExpr >= 0
+    && (tyReachesEmptyHole(srcTy, 8) || tyReachesUnion(dstTy, 8))
+  if rtStamp && repStampableLit(srcExpr) {
+    const q = inferQuiet
+    inferQuiet = true
+    const sOk = assignableExpr(srcExpr, srcTy, dstTy)
+    inferQuiet = q
+    if sOk { recordRepTyAdopt(srcExpr, dstTy, 6) }
   }
   // The flow hook for the un-annotated-parameter solve. It sits above the `assignable`
   // short-circuit because a hole source always returns there, so this is the only point in the
@@ -3110,4 +3126,10 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     fvaRefuse(site, srcTy, dt, why)
   }
   true
+}
+
+// Whether `x`, past parentheses, is an object or array literal: the sources a rep stamp can adopt.
+function repStampableLit(x: i32): boolean {
+  const pk = nodeAt(parenPeelIx(x))
+  pk is ObjLit || pk is ArrayLit
 }

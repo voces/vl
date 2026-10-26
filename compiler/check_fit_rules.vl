@@ -158,7 +158,11 @@ import {
   sourceBuildTy,
   viewifyLists,
 } from "./check_leaf_steps"
-import { LW_INFERRED, listOriginExpr } from "./check_list_origin"
+import {
+  LW_INFERRED,
+  exprIsCollCtorCall,
+  listOriginExpr,
+} from "./check_list_origin"
 import {
   isVarTyIxOf,
   monoRecheckDepth,
@@ -230,12 +234,15 @@ import {
   recAdDecl,
   recAdForced,
   recAdForcedDecl,
+  recAdNoAdopt,
   recAdRaising,
   recAdWidth,
 } from "./check_rec_adopt_rows"
 import {
   recBindOrigin,
   recFreshDeclOf,
+  recFreshMapDeclOf,
+  recHeldLit,
   recInferredFnOf,
   recOriginExpr,
   recPassLitDeclOf,
@@ -244,6 +251,7 @@ import {
   REC_DELIV_READ,
   recAdLandingList,
   recAdPushDecl,
+  recAdPushMapDecl,
   recDelivPush,
   recPendDstTy,
   recPendSrc,
@@ -252,8 +260,11 @@ import {
   recAtPinnedArg,
   recCoalesceOperands,
   recDeclInit,
+  recIndexBase,
   recIsJoin,
+  recLeafEscapes,
   recPassThroughArg,
+  recShapePassArg,
   recSolePinArg,
 } from "./check_record_origins"
 import {
@@ -396,7 +407,9 @@ import {
   cVariantMemberTyIxs,
   litBaseTy,
   litUnionAliasNameOfTy,
+  mkArrayTy,
   mkFuncTy,
+  mkMapTy,
   mkNullableTy,
   nwTyIxs,
   objFieldType,
@@ -963,23 +976,23 @@ export function openParamJoinOf(tyIx: i32): i32 {
   res
 }
 
-// Record the destination record on a record literal delivered where a field's type differs
-// from its own (`{ k: [1, 2] }` into `{ k: f64[] }`), so the emitter builds the literal at the
-// destination's row and not at another row that shares its field names (D2437).
-export function recordListFieldWidenAdopt(srcExpr: i32, dstTy: i32) {
-  if inferQuiet || srcExpr < 0 || dstTy < 0 { return 0 }
-  if tyDeeperThan(dstTy, 16) { return 0 }
+// The destination record a record literal delivered where a field's type differs from its own
+// (`{ k: [1, 2] }` into `{ k: f64[] }`) is built at, so the emitter takes the destination's row
+// and not another row that shares its field names (D2437); -1 when there is none.
+export function listFieldWidenDst(srcExpr: i32, dstTy: i32): i32 {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 { return -1 }
+  if tyDeeperThan(dstTy, 16) { return -1 }
   let dtix = dstTy
   const dN = tyAt(dtix)
   if dN is TyNullable { dtix = dN.nInner }
-  if dtix < 0 { return 0 }
+  if dtix < 0 { return -1 }
   const d = tyAt(dtix)
   const e = nodeAt(parenPeelIx(srcExpr))
-  if !(d is TyObj) { return 0 }
+  if !(d is TyObj) { return -1 }
   // A union-bearing destination is the union-softening stamp's, in `assignableExpr`.
-  if tyReachesUnion(dtix, 8) { return 0 }
+  if tyReachesUnion(dtix, 8) { return -1 }
   if e is ObjLit {
-    if e.objFields.length != d.objFieldNames.length { return 0 }
+    if e.objFields.length != d.objFieldNames.length { return -1 }
     let differs = false
     let k = 0
     while k < e.objFields.length {
@@ -991,18 +1004,18 @@ export function recordListFieldWidenAdopt(srcExpr: i32, dstTy: i32) {
           if d.objFieldNames[j] == f.fiName { dj = j }
           j = j + 1
         }
-        if dj < 0 { return 0 }
+        if dj < 0 { return -1 }
         const own = nodeTyIxOf(f.fiValue)
-        if own < 0 { return 0 }
+        if own < 0 { return -1 }
         if !tyEq(own, d.objFieldTypes[dj]) { differs = true }
       } else {
-        return 0
+        return -1
       }
       k = k + 1
     }
-    if differs { return recordRepTyAdopt(srcExpr, dtix, 6) }
+    if differs { return dtix }
   }
-  0
+  -1
 }
 
 // D581 — the element's source type for the array-literal recursion, and the one place this function
@@ -2060,6 +2073,18 @@ function recLitFits(lit: i32, dst: i32, depth: i32): boolean {
 // every use sees it. A re-check that refuses anything but the adopted value handed on whole
 // undoes it, unless it changed a number's width (DECISIONS.md "Record covariance").
 
+// A `Map()` binding `srcExpr` delivered as a map of the same key adopts the record its values
+// are delivered as, as a list literal binding's elements do: a `Map()` is built at the type it
+// flows into.
+export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcTy < 0 || dstTy < 0 { return 0 }
+  const p = cwPeelValue(srcExpr)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return 0 }
+  const decl = recFreshMapDeclOf(p)
+  if decl < 0 { return 0 }
+  recAdPushMapDecl(decl, srcTy, nonNulTyOf(dstTy), p)
+}
+
 // Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
 // element of a literal list binding, to a record that stores a field differently.
 export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
@@ -2115,12 +2140,13 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     const bn = nodeAt(b)
     if bn is Ident {
       const decl = recFreshDeclOf(b)
-      if decl < 0 { return 0 }
-      const iv = nodeAt(parenPeelIx(recDeclInit(decl)))
-      if iv is ArrayLit {
+      if decl >= 0 && nodeAt(parenPeelIx(recDeclInit(decl))) is ArrayLit {
         return recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), true, p)
       }
     }
+    // A map's value is delivered as its map is, at the value's destination.
+    if recMapReadDeliver(p, dstTy) { return 0 }
+    if bn is Ident && recFreshDeclOf(b) < 0 { return 0 }
   }
   if e is Call {
     const fd = recInferredFnOf(p)
@@ -4336,4 +4362,136 @@ export function recFitNarrowedFields(
   }
   if names.length == 0 { return 0 }
   1
+}
+
+// Whether a value `x` yields may be a record that already exists: a leaf of it (through `if`,
+// `match` and block tails) whose origin is not an object literal, `null`, or a value read from a
+// `Map()` binding that may still adopt the record it is delivered as.
+export function recJoinFixed(x: i32): boolean {
+  const leaves: i32[] = []
+  tailValueLeaves(x, leaves)
+  for l in leaves {
+    const o = recOriginExpr(l)
+    if o >= 0 && o < P.nodes.length {
+      const e = nodeAt(o)
+      if !(e is ObjLit) && !(e is NullLit) && !recMapReadFresh(o) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Is `o` an element read of a map whose every value is built where it is delivered?
+export function recMapReadFresh(o: i32): boolean {
+  const b = recIndexBase(o)
+  b >= 0 && recMapIsAt(b) && recMapDeliver(b, -1, 16, false)
+}
+
+// Deliver `o`, an element read of such a map, as a `dstTy`: the map is delivered as a map of it,
+// and every `Map()` binding it may be adopts its part. False, adopting nothing, otherwise.
+export function recMapReadDeliver(o: i32, dstTy: i32): boolean {
+  const b = recIndexBase(o)
+  if b < 0 || !recMapIsAt(b) || !recMapDeliver(b, -1, 16, false) {
+    return false
+  }
+  recMapDeliver(b, recContainerDst(b, dstTy), 16, true)
+}
+
+// Is the container `b` a map?
+function recMapIsAt(b: i32): boolean {
+  const bt = nonNulTyOf(nodeTyIxOf(b))
+  bt >= 0 && bt < T.tys.length && tyAt(bt) is TyMap
+}
+
+// Can every value the container `x` may be take the type it is delivered as: a `Map()`, a list
+// literal, or a `Map()` binding that may still adopt, reached through aliases, joins, element
+// reads, same-shape generic calls and calls of functions with no declared result. With `apply`,
+// each such binding adopts its part of `dst`, the container type `x` is delivered as.
+function recMapDeliver(x: i32, dst: i32, depth: i32, apply: boolean): boolean {
+  if depth <= 0 { return false }
+  const p = cwPeelValue(x)
+  if p < 0 || p >= P.nodes.length { return false }
+  if exprIsCollCtorCall(p) { return true }
+  const e = nodeAt(p)
+  if e is Ident {
+    const d = recFreshMapDeclOf(p)
+    if d >= 0 {
+      if recAdNoAdopt.has(d) { return false }
+      if apply { recMapDeclDeliver(d, p, dst) }
+      return true
+    }
+    const held = recHeldLit(p)
+    if held < 0 { return false }
+    return recMapDeliver(held, dst, depth - 1, apply)
+  }
+  if e is ArrayLit {
+    const ed = if dst >= 0 { tyArrayElemIx(nonNulTyOf(dst)) } else { -1 }
+    for el in e.arrElems {
+      if nodeAt(el) is Spread || !recMapDeliver(el, ed, depth - 1, apply) {
+        return false
+      }
+    }
+    return true
+  }
+  if recIsJoin(p) {
+    const leaves: i32[] = []
+    tailValueLeaves(p, leaves)
+    for lf in leaves {
+      if !recMapDeliver(lf, dst, depth - 1, apply) { return false }
+    }
+    return true
+  }
+  const co = recCoalesceOperands(p)
+  if co.length == 2 {
+    return recMapDeliver(co[0], dst, depth - 1, apply)
+      && recMapDeliver(co[1], dst, depth - 1, apply)
+  }
+  const ib = recIndexBase(p)
+  if ib >= 0 {
+    return recMapDeliver(ib, recContainerDst(ib, dst), depth - 1, apply)
+  }
+  const pa = recShapePassArg(p)
+  if pa >= 0 { return recMapDeliver(pa, dst, depth - 1, apply) }
+  const fd = recInferredFnOf(p)
+  if fd < 0 { return false }
+  for lf in recFnValueLeaves(fd) {
+    // A local the function also hands elsewhere is shared, so it is not built here.
+    if recLeafEscapes(lf) || !recMapDeliver(lf, dst, depth - 1, apply) {
+      return false
+    }
+  }
+  true
+}
+
+// The `Map()` binding `d`, read at `at`, adopts the map type `dst`.
+function recMapDeclDeliver(d: i32, at: i32, dst: i32) {
+  const mt = nodeTyIxOf(at)
+  if dst < 0 || mt < 0 || mt >= T.tys.length { return 0 }
+  if tyAt(mt) is TyMap && tyAt(dst) is TyMap {
+    recAdPushMapDecl(d, mt, dst, at)
+  }
+  0
+}
+
+// The type the container `b` is delivered as when an element read out of it is delivered as
+// `dst`: a map of the same key, or a list, holding it. -1 for -1 or any other container.
+function recContainerDst(b: i32, dst: i32): i32 {
+  const v = nonNulTyOf(dst)
+  if v < 0 || v >= T.tys.length { return -1 }
+  const bt = nonNulTyOf(nodeTyIxOf(b))
+  if bt < 0 || bt >= T.tys.length { return -1 }
+  const c = tyAt(bt)
+  match c {
+    TyMap => {
+      return mkMapTy(c.mKey, v, c.mSet)
+    }
+    TyArray => {
+      return mkArrayTy(v)
+    }
+    // No other container is read by element here.
+    TyObj | TyFunc | TyPrim | TyErr | TyVar | TyLit | TyNeg | TyNullable | TyUnion => {
+      return -1
+    }
+  }
 }

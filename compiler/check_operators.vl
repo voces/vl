@@ -32,6 +32,8 @@ import {
 } from "./check_asg_rows"
 import { assignableExpr } from "./check_assignable"
 import { recordCollapsedIsAt } from "./check_bind_rows"
+import { recOriginExpr } from "./check_rec_fresh"
+import { recPend } from "./check_rec_rows"
 import { strLitRecvTy } from "./check_builtin_methods"
 import {
   opBinBank,
@@ -113,6 +115,8 @@ import {
   litSetMeetTy,
   radixLitAdoptPeer64,
   recFitMeetTy,
+  recJoinFixed,
+  recMapReadFresh,
   recordContainedIsAt,
   strLitSetsDisjoint,
 } from "./check_fit_rules"
@@ -232,6 +236,7 @@ import {
   joinTys,
   nameToTyAt,
   nhFillLinked,
+  njFixSet,
   numScalarMixMsg,
   numUnionBinTy,
   opSelfFnKeyFor,
@@ -916,7 +921,14 @@ function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     // When the default fits the non-null LHS type (with contextual coercion), the `??` result
     // IS that LHS type, not `joinTys`' LUB — which would widen a litunion field to `string`.
     if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
-    return joinTys(innerFull, rt)
+    // An existing record on either side is never widened in place: the join keeps it as a
+    // member (record covariance A).
+    njFixSet(recJoinFixed(n.binLeft), recJoinFixed(n.binRight))
+    const jt = joinTys(innerFull, rt)
+    // A value read from a `Map()` binding is delivered at the join, which its binding adopts.
+    coalPendMapRead(n.binLeft, innerFull, jt)
+    coalPendMapRead(n.binRight, rt, jt)
+    return jt
   }
   // A hole left operand defers the whole tail above to the pin (`HD_COAL`): answering `lt` kept
   // the null `??` removed (D1693). The default is kept unwidened, so a pin whose non-null face
@@ -929,6 +941,14 @@ function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     return cd
   }
   return lt
+}
+
+// Queue operand `x` (a `ty`) as delivered at the `??` result `jt` when it reads a `Map()`
+// binding's value, so the binding is built at that result's record.
+function coalPendMapRead(x: i32, ty: i32, jt: i32) {
+  if jt < 0 || ty == jt { return 0 }
+  if !recMapReadFresh(recOriginExpr(x)) { return 0 }
+  recPend(x, ty, jt, x)
 }
 
 // Whether `ix` reads a function the split plan gave a parameter. The check before the plan

@@ -1661,11 +1661,46 @@ function tyMembersWithin(x: i32, u: i32): boolean {
   true
 }
 
+// Whether the next `joinTys`'s first and second operands may be records that already exist;
+// read and cleared at its entry, like `njApart`.
+let njFixA = false
+let njFixB = false
+export function njFixSet(a: boolean, b: boolean) {
+  njFixA = a
+  njFixB = b
+}
+
+// Set while `joinVariantTys` must keep same-field records as separate members.
+let njNoFieldwise = false
+
+// Whether some record member of `s` is not a member of `d`: joining an existing `s` at `d`
+// would widen it in place.
+function joinWidensRec(s: i32, d: i32): boolean {
+  const ss: i32[] = []
+  flattenVariantsInto(s, ss)
+  const ds: i32[] = []
+  flattenVariantsInto(d, ds)
+  for m in ss {
+    if m >= 0 && tyAt(m) is TyObj {
+      let hit = false
+      for k in ds {
+        if k == m || sameVariantTy(k, m) { hit = true }
+      }
+      if !hit { return true }
+    }
+  }
+  false
+}
+
 // The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
-// mutually-assignable types collapse to the wider; otherwise a two-member union.
+// mutually-assignable types collapse to the wider; otherwise a two-member union. An operand
+// marked existing (`njFixSet`) is never widened: its record members stay members of the join.
 export function joinTys(a: i32, b: i32) {
   const apart = njApart
   njApartSet(false)
+  const fixA = njFixA
+  const fixB = njFixB
+  njFixSet(false, false)
   if a < 0 { return b }
   if b < 0 { return a }
   // A primitive joined with itself is itself: no rule below holds for a pair that is no
@@ -1742,9 +1777,25 @@ export function joinTys(a: i32, b: i32) {
   }
   const cf = holeFnBesideClosedJoin(a, b)
   if cf >= 0 { return cf }
-  if assignable(b, a) && !joinWidensMap(b, a) { return a }
-  if assignable(a, b) && !joinWidensMap(a, b) { return b }
-  joinVariantTys(a, b)
+  if (
+    assignable(b, a)
+    && !joinWidensMap(b, a)
+    && !(fixB && joinWidensRec(b, a))
+  ) {
+    return a
+  }
+  if (
+    assignable(a, b)
+    && !joinWidensMap(a, b)
+    && !(fixA && joinWidensRec(a, b))
+  ) {
+    return b
+  }
+  if !fixA && !fixB { return joinVariantTys(a, b) }
+  njNoFieldwise = true
+  const kept = joinVariantTys(a, b)
+  njNoFieldwise = false
+  kept
 }
 
 // The join of a function type over inference holes and a closed one that fits it either
@@ -2001,7 +2052,7 @@ export function joinVariantTys(a: i32, b: i32) {
       while j < kept.length {
         if kept[j] == v { dup = true }
         if sameVariantTy(kept[j], v) { dup = true }
-        if !dup {
+        if !dup && !njNoFieldwise {
           const fw = joinObjFieldwise(kept[j], v)
           if fw >= 0 {
             kept[j] = fw
