@@ -1,0 +1,430 @@
+// `check_elab_cap.vl` — what one elaboration records while it re-checks an instance body: each
+// node's type at the instance, and each call's closed bindings. Recording is live only at the
+// elaboration's own quiet depth, so a probe nested inside the body records nothing.
+
+import { FuncDecl, i32ToStr, nodeAt } from "./ast"
+import { inferQuiet, quietDepth } from "./check_cursor"
+import {
+  constScopes,
+  declare,
+  fnAliasScopes,
+  fnDeclScopes,
+  scopeDepthsOf,
+} from "./check_scopes"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+} from "./check_types"
+import { tyHasTyVar } from "./tyquery"
+import { nodeTyIxOf } from "./check_node_tys"
+import { fnDeclIx } from "./check_write_scan"
+import { weDigits } from "./check_write_effects"
+import { hdBase, hdRowOf } from "./check_hole_pins"
+
+// Whether an elaboration is recording, and the quiet depth it records at.
+export let elabCapOn = false
+export let elabCapQuiet = 0
+
+// Node → type, for the elaboration in progress.
+export let elabCapTy: {[i32]: i32} = Map()
+
+// The calls the elaboration in progress bound: call node, its binding names and types.
+export let elabCallIx: i32[] = []
+export let elabCallN: string[][] = []
+export let elabCallT: i32[][] = []
+export let elabCallD: i32[] = []
+
+// How many arms of a test the instance makes dead enclose the check now, the nodes recorded
+// inside one, and the diagnostics raised outside every one.
+export let elabCapDead = 0
+export let elabCapDeadIx: {[i32]: boolean} = Map()
+export let elabCapDeadDiags = 0
+
+// Whether a record made now belongs to the elaboration in progress.
+export function elabCapLive(): boolean {
+  elabCapOn && quietDepth == elabCapQuiet
+}
+
+// Opens recording at quiet depth `depth` with empty tables.
+export function elabCapBegin(depth: i32) {
+  elabCapOn = true
+  elabCapQuiet = depth
+  elabCapTy = Map()
+  elabCapDead = 0
+  elabCapDeadIx = Map()
+  elabCapDeadDiags = 0
+  elabCallIx = []
+  elabCallN = []
+  elabCallT = []
+  elabCallD = []
+  0
+}
+
+export function elabCapEnd() {
+  elabCapOn = false
+  0
+}
+
+// Records node `ix` at type `t`; a later record of the node wins.
+export function elabCapNote(ix: i32, t: i32) {
+  if ix < 0 { return 0 }
+  elabCapTy[ix] = t
+  if elabCapDead > 0 { elabCapDeadIx[ix] = true }
+  0
+}
+
+// Enters the arm of a test the instance makes dead; whether it is the outermost one.
+export function elabCapDeadEnter(): boolean {
+  elabCapDead = elabCapDead + 1
+  elabCapDead == 1
+}
+
+// Leaves that arm; the outermost counts the diagnostics raised since `d0` as dead ones.
+export function elabCapDeadLeave(outer: boolean, d0: i32) {
+  elabCapDead = elabCapDead - 1
+  if outer { elabCapDeadDiags = elabCapDeadDiags + T.diags.length - d0 }
+  0
+}
+
+// Records call `ix`'s bindings.
+export function elabCallNote(ix: i32, names: string[], tys: i32[]) {
+  const nm: string[] = []
+  const ty: i32[] = []
+  let i = 0
+  while i < names.length && i < tys.length {
+    nm.push(names[i])
+    ty.push(tys[i])
+    i = i + 1
+  }
+  elabCallIx.push(ix)
+  elabCallN.push(nm)
+  elabCallT.push(ty)
+  elabCallD.push(elabCallDecl[ix] ?? -1)
+  0
+}
+
+// Each generic call's callee declaration, by call node, as the checker resolved it.
+export let elabCallDecl: {[i32]: i32} = Map()
+
+export function elabCallDeclNote(ix: i32, decl: i32) {
+  if ix >= 0 { elabCallDecl[ix] = decl }
+  0
+}
+
+export function elabCallDeclOf(ix: i32): i32 { elabCallDecl[ix] ?? -1 }
+
+// The elaboration key whose body is being re-checked, -1 in the generic pass.
+export let elabCapKey = -1
+export function elabCapKeySet(k: i32) {
+  elabCapKey = k
+  0
+}
+
+// Each nested declaration's enclosing declaration, -1 at module scope, from the generic pass.
+export let elabEncl: {[i32]: i32} = Map()
+
+// The bindings visible where an open nested declaration is checked, by `<key>|<decl>`: what a
+// re-check of its body at an instance declares around it, since its free names resolve there.
+export let elabSnapIx: {[string]: i32} = Map()
+export let elabSnapNames: string[][] = []
+export let elabSnapTys: i32[][] = []
+export let elabSnapConst: i32[][] = []
+export let elabSnapFnDecl: i32[][] = []
+export let elabSnapFnAlias: i32[][] = []
+
+export function elabSnapKey(k: i32, decl: i32): string {
+  i32ToStr(k) + "|" + i32ToStr(decl)
+}
+
+// Notes nested declaration `decl` (checked under `enclDecl`), and when its signature `paramTys`
+// or its type parameters are open, the bindings visible around it.
+export function elabNestNote(
+  decl: i32,
+  enclDecl: i32,
+  nTyParams: i32,
+  paramTys: i32[],
+) {
+  const live = elabCapLive()
+  if !live && inferQuiet { return 0 }
+  if !live { elabEncl[decl] = enclDecl }
+  let open = nTyParams > 0
+  for p in paramTys {
+    if p >= 0 && p < T.tys.length && tyHasTyVar(p) { open = true }
+  }
+  if !open { return 0 }
+  const key = elabSnapKey(if live { elabCapKey } else { -1 }, decl)
+  const names: string[] = []
+  const tys: i32[] = []
+  const cs: i32[] = []
+  const fds: i32[] = []
+  const fas: i32[] = []
+  let d = 1
+  while d < T.scopes.length {
+    for nm in T.scopes[d].keys() {
+      const ds = scopeDepthsOf[nm]
+      if ds != null && ds.length > 0 && ds[ds.length - 1] == d {
+        names.push(nm)
+        tys.push(T.scopes[d][nm] ?? -1)
+        cs.push(
+          if d < constScopes.length { constScopes[d][nm] ?? -1 } else { -1 },
+        )
+        fds.push(
+          if d < fnDeclScopes.length { fnDeclScopes[d][nm] ?? -1 } else { -1 },
+        )
+        fas.push(
+          if d < fnAliasScopes.length { fnAliasScopes[d][nm] ?? -1 } else { -1 },
+        )
+      }
+    }
+    d = d + 1
+  }
+  const have = elabSnapIx[key] ?? -1
+  if have >= 0 {
+    elabSnapNames[have] = names
+    elabSnapTys[have] = tys
+    elabSnapConst[have] = cs
+    elabSnapFnDecl[have] = fds
+    elabSnapFnAlias[have] = fas
+    return 0
+  }
+  elabSnapIx[key] = elabSnapNames.length
+  elabSnapNames.push(names)
+  elabSnapTys.push(tys)
+  elabSnapConst.push(cs)
+  elabSnapFnDecl.push(fds)
+  elabSnapFnAlias.push(fas)
+  0
+}
+
+// Declares snapshot `s` into the innermost frame.
+export function elabSnapDeclare(s: i32) {
+  const top = T.scopes.length - 1
+  let i = 0
+  while i < elabSnapNames[s].length {
+    const nm = elabSnapNames[s][i]
+    declare(nm, elabSnapTys[s][i])
+    if elabSnapConst[s][i] >= 0 && top < constScopes.length {
+      constScopes[top][nm] = elabSnapConst[s][i]
+    }
+    if elabSnapFnDecl[s][i] >= 0 && top < fnDeclScopes.length {
+      fnDeclScopes[top][nm] = elabSnapFnDecl[s][i]
+    }
+    if elabSnapFnAlias[s][i] >= 0 && top < fnAliasScopes.length {
+      fnAliasScopes[top][nm] = elabSnapFnAlias[s][i]
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The declaration whose parameter hole `name` is, or -1 (`paramHoleName`'s three spellings).
+export function elabHoleDeclOf(name: string): i32 {
+  if name.length < 2 || name[0] != '?' { return -1 }
+  let dot = name.length - 1
+  while dot > 0 && name[dot] != '.' { dot = dot - 1 }
+  if dot <= 1 { return -1 }
+  if name.slice(0, 3) == "?#L" { return weDigits(name.slice(3, dot)) }
+  if name[1] == '#' { return -1 }
+  let at = dot - 1
+  while at > 1 && name[at] != '@' { at = at - 1 }
+  if at > 1 { return weDigits(name.slice(at + 1, dot)) }
+  fnDeclIx[name.slice(1, dot)] ?? -1
+}
+
+// The closed pins a hole took outside a call (a delivery into a function-typed destination),
+// grouped per declaration: consecutive pins of one declaration's holes are one instance.
+export let elabHoleRowDecl: i32[] = []
+export let elabHoleRowFrom: i32[] = []
+export let elabHoleRowN: string[][] = []
+export let elabHoleRowT: i32[][] = []
+
+export function elabHolePinNote(name: string, ty: i32) {
+  const live = elabCapLive()
+  if !live && inferQuiet { return 0 }
+  if !elabTyClosed(ty, 0) { return 0 }
+  const d = elabHoleDeclOf(name)
+  if d < 0 { return 0 }
+  const from = if live { elabCapKey } else { -1 }
+  const last = elabHoleRowDecl.length - 1
+  if last >= 0 && elabHoleRowDecl[last] == d && elabHoleRowFrom[last] == from {
+    let dup = false
+    for nm in elabHoleRowN[last] {
+      if nm == name { dup = true }
+    }
+    if !dup {
+      elabHoleRowN[last].push(name)
+      elabHoleRowT[last].push(ty)
+      return 0
+    }
+  }
+  elabHoleRowDecl.push(d)
+  elabHoleRowFrom.push(from)
+  elabHoleRowN.push([name])
+  elabHoleRowT.push([ty])
+  0
+}
+
+// Whether `t` is a closed, fully resolved type: no type variable and no pending return anywhere.
+export function elabTyClosed(t: i32, depth: i32): boolean {
+  elabTyClosedOwn(t, depth, [])
+}
+
+// Whether type variable `name` is a type parameter or a hole of a declaration in `own`.
+function elabOwnedBy(own: i32[], name: string): boolean {
+  const hd = elabHoleDeclOf(name)
+  for d in own {
+    if d == hd { return true }
+    const n = nodeAt(d)
+    if n is FuncDecl {
+      for tp in n.fnTyParams {
+        if tp == name { return true }
+      }
+    }
+  }
+  false
+}
+
+// The name of the hole a derived hole (an operator's pending answer, a field of a hole) derives
+// from at its root, so it is owned where that hole is; a plain type variable's own name.
+function elabHoleRootName(t: i32): string {
+  let r = t
+  let n = 0
+  while hdRowOf(r) >= 0 && n < 64 {
+    r = hdBase[hdRowOf(r)]
+    n = n + 1
+  }
+  const x = T.tys[r]
+  if x is TyVar { return x.tvName }
+  ""
+}
+
+// `elabTyClosed`, where a type variable of a declaration in `own` counts as closed.
+function elabTyClosedOwn(t: i32, depth: i32, own: i32[]): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  if depth > 16 { return true }
+  const x = T.tys[t]
+  match x {
+    TyVar => {
+      return elabOwnedBy(own, elabHoleRootName(t))
+    }
+    TyArray => {
+      return elabTyClosedOwn(x.aElem, depth + 1, own)
+    }
+    TyNullable => {
+      return elabTyClosedOwn(x.nInner, depth + 1, own)
+    }
+    TyMap => {
+      return elabTyClosedOwn(x.mKey, depth + 1, own)
+        && elabTyClosedOwn(x.mVal, depth + 1, own)
+    }
+    TyObj => {
+      for ft in x.objFieldTypes {
+        if !elabTyClosedOwn(ft, depth + 1, own) { return false }
+      }
+      return true
+    }
+    TyFunc => {
+      // A function value is its singleton `Fn#d` when its signature is closed but for d's own type
+      // parameters and holes, at any depth.
+      const d = elabFnIdOf(t)
+      if d >= 0 && nodeAt(d) is FuncDecl {
+        let has = false
+        for o in own {
+          if o == d { has = true }
+        }
+        if !has {
+          const own2 = own.slice(0, own.length)
+          own2.push(d)
+          if elabTyClosedOwn(t, depth + 1, own2) { return true }
+        }
+      }
+      for pt in x.fnParamTypes {
+        if !elabTyClosedOwn(pt, depth + 1, own) { return false }
+      }
+      return elabTyClosedOwn(x.fnRet, depth + 1, own)
+    }
+    TyUnion => {
+      for m in x.uMembers {
+        if !elabTyClosedOwn(m, depth + 1, own) { return false }
+      }
+      return true
+    }
+    TyPrim | TyErr | TyLit | TyNeg => {
+      return true
+    }
+  }
+}
+
+// The declaration or lambda a function type is the singleton type of (`Fn#d`), by type index:
+// a read of a function declaration's name or a lambda literal types its value at an index only
+// that function has. -2 where two functions met at one index.
+export let elabFnIdTy: {[i32]: i32} = Map()
+
+// Whether a value of function type `t` read now still decides `t`'s singleton. Only an open
+// signature needs one, since a closed one keys an instance by its spelling, and a quiet probe's
+// types do not stand.
+export function elabFnValWanted(t: i32): boolean {
+  if inferQuiet && !elabCapLive() { return false }
+  if t < 0 || (elabFnIdTy[t] ?? -1) == -2 { return false }
+  tyHasTyVar(t)
+}
+
+// Notes a value of function type `t` as one of function `d`, the declaration or lambda it reads.
+export function elabFnValNote(t: i32, d: i32) {
+  if d < 0 || !elabFnValWanted(t) { return 0 }
+  const have = elabFnIdTy[t] ?? -1
+  if have == -1 { elabFnIdTy[t] = d }
+  else if have != d { elabFnIdTy[t] = -2 }
+  0
+}
+
+// The function `t` is the singleton type of, or -1.
+export function elabFnIdOf(t: i32): i32 {
+  const d = elabFnIdTy[t] ?? -1
+  if d < 0 { return -1 }
+  d
+}
+
+// The function a call through callee node `callFn` reaches by its value's singleton type, or -1.
+export function elabCalleeFnId(callFn: i32): i32 {
+  let t = -1
+  if elabCapLive() { t = elabCapTy[callFn] ?? -1 }
+  if t < 0 { t = nodeTyIxOf(callFn) }
+  elabFnIdOf(t)
+}
+
+// Clears every per-program elaboration table; a compile's rounds each start from none.
+export function elabCapReset() {
+  elabCapOn = false
+  elabCapQuiet = 0
+  elabCapTy = Map()
+  elabCallIx = []
+  elabCallN = []
+  elabCallT = []
+  elabCallD = []
+  elabCallDecl = Map()
+  elabCapKey = -1
+  elabEncl = Map()
+  elabSnapIx = Map()
+  elabSnapNames = []
+  elabSnapTys = []
+  elabSnapConst = []
+  elabSnapFnDecl = []
+  elabSnapFnAlias = []
+  elabHoleRowDecl = []
+  elabHoleRowFrom = []
+  elabHoleRowN = []
+  elabHoleRowT = []
+  elabFnIdTy = Map()
+  0
+}
