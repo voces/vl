@@ -1136,6 +1136,28 @@ axis(
   (d) => twoFiles(d, genWriteCycle(14, true), genWriteCycle(14, false)),
 );
 
+// The same cycle threading a PARAMETER `p` instead of writing a module binding, so the summary
+// asked is `fnWriteEffects`. Master `23330b74d` re-walked each member once per path to it.
+const genParamWriteCycle = (k: number, cycle: boolean): string => {
+  const o = ["type R = {v: i32 | null}"];
+  for (let i = 0; i < k - 1; i++) {
+    o.push(`function f${i}(p: R, n: i32): i32 {`, "  if n <= 0 { return 0 }");
+    o.push(`  f${i + 1}(p, n - 1) + f${i + 1}(p, n - 2)`, "}");
+  }
+  o.push(`function f${k - 1}(p: R, n: i32): i32 {`, "  p.v = 2", "  if n <= 0 { return 0 }");
+  o.push(`  f${cycle ? 0 : k - 1}(p, n - 1)`, "}");
+  o.push("function main(): i32 {", "  const o: R = {v: 1}", "  if o.v != null {", "    const r = f0(o, 3)");
+  o.push("    if o.v != null { return o.v + r }", "  }", "  0", "}", "print(main())");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "parameter call cycle under a narrowed path",
+  2.0,
+  "A parameter write summary on a cycle is being recomputed per path to it instead of iterated once over its component — `fnWriteEffects` / `weEffectsRounds` (compiler/check_write_effects.vl).",
+  (d) => twoFiles(d, genParamWriteCycle(14, true), genParamWriteCycle(14, false)),
+);
+
 // UN-ANNOTATED CALLBACK LAMBDAS. `n` lambdas `(g) => g(out)`, each called once with a
 // function, either all in one function over one list or one per function. A list handed to an
 // un-annotated parameter used as the callee asks which function each call of the lambda passes
