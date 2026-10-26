@@ -2,7 +2,16 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
-import { Call, FuncDecl, P, Param, i32ToStr, nodeAt } from "./ast"
+import {
+  Call,
+  FuncDecl,
+  P,
+  Param,
+  elseIfLink,
+  i32ToStr,
+  nodeAt,
+  nodeSpineChildren,
+} from "./ast"
 import { monoRecheckBegin } from "./check_assignable"
 import { recKeptFnDstOf } from "./check_rec_rows"
 import {
@@ -33,6 +42,7 @@ import {
   callBindCount,
   callBindIxAt,
   callBindNamesAt,
+  callBindRowOf,
   callBindTysAt,
 } from "./check_bind_rows"
 import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
@@ -117,34 +127,94 @@ const ELAB_MAX_KEYS = 20000
 
 function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
   // Sorted by name, so two calls binding the same names in another order share a key.
-  const ord: i32[] = []
-  let i = 0
-  while i < names.length {
-    let j = ord.length
-    ord.push(i)
-    while j > 0 && names[ord[j - 1]] > names[i] {
-      ord[j] = ord[j - 1]
-      j = j - 1
-    }
-    ord[j] = i
-    i = i + 1
-  }
   let k = ""
-  for o in ord {
+  for o in elabNameOrder(names) {
     if o < tys.length {
-      // A function value stands for itself only while its type is not closed on its own, at
-      // any depth: a list of one is keyed by the functions it holds.
-      const fd = if tyHasTyVar(tys[o]) { elabFnIdOf(tys[o]) } else { -1 }
-      let r = if fd >= 0 { "Fn#" + i32ToStr(fd) } else { tyToStructStr(tys[o]) }
-      if fd < 0 && tyHasTyVar(tys[o]) {
-        const ds: i32[] = []
-        elabFnIdsIn(tys[o], ds, 0)
-        for d in ds { r = r + "#" + i32ToStr(d) }
-      }
-      k = k + names[o] + "=" + r + ";"
+      k = k + names[o] + "=" + elabBindStr(tys[o], false) + ";"
     }
   }
   i32ToStr(decl) + "|" + k
+}
+
+// One binding's spelling in a key; `canon` spells each union's members in sorted order.
+function elabBindStr(t: i32, canon: boolean): string {
+  // A function value stands for itself only while its type is not closed on its own, at any
+  // depth: a list of one is keyed by the functions it holds.
+  const fd = if tyHasTyVar(t) { elabFnIdOf(t) } else { -1 }
+  if fd >= 0 { return "Fn#" + i32ToStr(fd) }
+  let r = if canon { elabCanonStr(t, ELAB_CANON_DEPTH) } else { tyToStructStr(t) }
+  if tyHasTyVar(t) {
+    const ds: i32[] = []
+    elabFnIdsIn(t, ds, 0)
+    for d in ds { r = r + "#" + i32ToStr(d) }
+  }
+  r
+}
+
+const ELAB_CANON_DEPTH = 16
+
+// Type `t` spelled structurally with every union's members sorted, so two orders of one union
+// spell alike; past `depth` levels, its plain structural spelling.
+function elabCanonStr(t: i32, depth: i32): string {
+  if t < 0 || t >= T.tys.length || depth <= 0 { return tyToStructStr(t) }
+  const ty = tyAt(t)
+  match ty {
+    TyUnion => {
+      const ms: string[] = []
+      for m in ty.uMembers {
+        const s = elabCanonStr(m, depth - 1)
+        let j = ms.length
+        ms.push(s)
+        while j > 0 && ms[j - 1] > s {
+          ms[j] = ms[j - 1]
+          j = j - 1
+        }
+        ms[j] = s
+      }
+      let r = "("
+      let i = 0
+      while i < ms.length {
+        if i > 0 { r = r + "|" }
+        r = r + ms[i]
+        i = i + 1
+      }
+      r + ")"
+    }
+    TyArray => {
+      const ro = if ty.aRead != 0 { "readonly " } else { "" }
+      "(" + ro + elabCanonStr(ty.aElem, depth - 1) + ")[]"
+    }
+    TyNullable => "(" + elabCanonStr(ty.nInner, depth - 1) + ")?"
+    TyMap => {
+      const kind = if ty.mSet != 0 { "set" } else { "map" }
+      kind
+        + "{"
+        + elabCanonStr(ty.mKey, depth - 1)
+        + ":"
+        + elabCanonStr(ty.mVal, depth - 1)
+        + "}"
+    }
+    TyObj => {
+      let r = "{"
+      let i = 0
+      while i < ty.objFieldNames.length && i < ty.objFieldTypes.length {
+        r = r
+          + ty.objFieldNames[i]
+          + ":"
+          + elabCanonStr(ty.objFieldTypes[i], depth - 1)
+          + ","
+        i = i + 1
+      }
+      r + "}"
+    }
+    TyFunc => {
+      let r = "fn("
+      for p in ty.fnParamTypes { r = r + elabCanonStr(p, depth - 1) + "," }
+      r + ")=>" + elabCanonStr(ty.fnRet, depth - 1)
+    }
+    TyNeg => "!(" + elabCanonStr(ty.negTy, depth - 1) + ")"
+    TyPrim | TyErr | TyVar | TyLit => tyToStructStr(t)
+  }
 }
 
 // The instance enclosing instance `k`'s body, -1 at the root.
@@ -549,10 +619,84 @@ export function elabCallInstWant(decl0: i32, call: i32, pTys: i32[]): i32 {
   ck
 }
 
-// Instance `k`'s elaboration, spelled without its parent: two instances it agrees on check alike.
+// Instance `k`'s elaboration, spelled without its parent: the bindings of the type variables its
+// declaration reads, each once and with union members in sorted order. Two instances it agrees
+// on check alike.
 export function elabInstSpelling(k: i32): string {
   if k < 0 || k >= ekDecl.length { return "" }
-  elabKeyOf(ekDecl[k], ekNames[k], ekTys[k])
+  const decl = ekDecl[k]
+  const names: string[] = []
+  const tys: i32[] = []
+  let i = 0
+  while i < ekNames[k].length && i < ekTys[k].length {
+    const nm = ekNames[k][i]
+    let has = false
+    for x in names {
+      if x == nm { has = true }
+    }
+    if !has && elabDeclReads(decl, nm) {
+      names.push(nm)
+      tys.push(ekTys[k][i])
+    }
+    i = i + 1
+  }
+  let r = i32ToStr(decl) + "|"
+  for o in elabNameOrder(names) {
+    r = r + names[o] + "=" + elabBindStr(tys[o], true) + ";"
+  }
+  r
+}
+
+// The indices of `names` in sorted order.
+function elabNameOrder(names: string[]): i32[] {
+  const ord: i32[] = []
+  let i = 0
+  while i < names.length {
+    let j = ord.length
+    ord.push(i)
+    while j > 0 && names[ord[j - 1]] > names[i] {
+      ord[j] = ord[j - 1]
+      j = j - 1
+    }
+    ord[j] = i
+    i = i + 1
+  }
+  ord
+}
+
+// `elabDeclReads` by `decl|name`, for one elaboration run.
+let elabReadsMemo: {[string]: boolean} = Map()
+
+// Whether declaration `decl` reads type variable `name`: its own, its signature's, or one a node
+// type or a call's bind row in its subtree names, nested declarations included.
+function elabDeclReads(decl: i32, name: string): boolean {
+  if elabOwnName(decl, name) || elabSigReads(decl, name) { return true }
+  const key = i32ToStr(decl) + "|" + name
+  const have = elabReadsMemo.get(key)
+  if have != null { return have }
+  const r = elabSubtreeReads(decl, name)
+  elabReadsMemo[key] = r
+  r
+}
+
+// Whether a node in the subtree at `ix` has a type, or a bind row, naming type variable `name`.
+function elabSubtreeReads(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  let cur = ix
+  while cur >= 0 {
+    if tyMentionsTyVarNamed(nodeTyIxOf(cur), name, 16) { return true }
+    const row = callBindRowOf(cur)
+    if row >= 0 {
+      for t in callBindTysAt(row) {
+        if tyMentionsTyVarNamed(t, name, 16) { return true }
+      }
+    }
+    for kid in nodeSpineChildren(cur) {
+      if elabSubtreeReads(kid, name) { return true }
+    }
+    cur = elseIfLink(cur)
+  }
+  false
 }
 
 // Emitted function slot → the instance it is, or -2 for one no demand keyed.
@@ -733,6 +877,7 @@ export function elabRun() {
   ekKids = Map()
   ekParent = []
   ekReach = []
+  elabReadsMemo = Map()
   elabCallKeys = Map()
   elabLitArg = Map()
   elabAliasOf = Map()
