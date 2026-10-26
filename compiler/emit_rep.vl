@@ -3085,9 +3085,11 @@ function repOfTyFlat(ty: i32): RepDesc {
         }
         return repUncovered()
       }
-      // A `{tag, value}` value/struct union box. (Numeric literal unions —
-      // `0 | 1` — are neither litunion-atoms nor boxes; they canon-collapse to
-      // their base scalar and stay with the name ladder.)
+      // A numeric literal union (`0 | 1`) is stored as its base scalar.
+      const nb = numLitUnionBaseTy(ty)
+      if nb >= 0 { return repOfTyFlat(nb) }
+      if unionHasOpenMember(t.uMembers) { return repUncovered() }
+      // A `{tag, value}` value/struct union box.
       if tyIsValueUnionBox(ty) { return repMk("union", 0, "") }
       return repUncovered()
     }
@@ -3129,6 +3131,7 @@ function repOfPrim(pn: PrimName): RepDesc {
   if pn == "f64" { return repMk("f64", 0, "") }
   if pn == "f32" { return repMk("f32", 0, "") }
   if pn == "string" { return repMk("str", 0, "") }
+  if pn == "v128" { return repMk("v128", 0, "") }
   if pn == "void" { return repMk("i32", 0, "") }
   // `null` (and any future prim) — no standalone rep.
   repUncovered()
@@ -3161,6 +3164,9 @@ function repOfNullable(inner: i32): RepDesc {
       if tyIsLitUnion(inner) { return repAtomMk(3) }
       // `(A | B) | null` — the box already has a null member atom.
       if tyIsValueUnionBox(inner) { return repMk("union", 4, "") }
+      // A numeric literal union made nullable is its base scalar made nullable.
+      const nb = numLitUnionBaseTy(inner)
+      if nb >= 0 { return repOfNullable(nb) }
       // Lists that all spell one list: that list's nullable, as the first covered member reps it.
       if oneListUnionRender(inner) != "" {
         for m in it.uMembers {
@@ -4094,6 +4100,9 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
     }
     return rtLeafOf("unsup", 0, "union:unclassified", ty)
   }
+  if unionHasOpenMember(members) {
+    return rtLeafOf("unsup", 0, "union:open", ty)
+  }
   if tyIsValueUnionBox(ty) {
     const ix = rtAlloc("box", ty, 0, -1, "", -1)
     rtByTyPut(ty, ix)
@@ -4106,8 +4115,13 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
     rtSetKids(ix, kids)
     return rtComplete(ix, ty)
   }
-  // Numeric literal unions (`0 | 1`) canon-collapse to their base scalar and
-  // never classify here; anything else is a policy gap, stated loudly.
+  // A numeric literal union (`0 | 1`) is its base scalar; anything else is a policy gap.
+  const nb = numLitUnionBaseTy(ty)
+  if nb >= 0 {
+    const bk = rtGo(nb)
+    rtByTyPut(ty, bk)
+    return bk
+  }
   rtLeafOf("unsup", 0, "union:unclassified", ty)
 }
 
@@ -4133,6 +4147,9 @@ function rtNulDiscOf(inner: i32): i32 {
       // Any string-literal-union inner, aliased or inline, takes the atom sentinel.
       if tyIsLitUnion(inner) { return 3 }
       if tyIsValueUnionBox(inner) { return 4 }
+      // A numeric literal union takes its base scalar's discipline.
+      const nb = numLitUnionBaseTy(inner)
+      if nb >= 0 { return rtNulDiscOf(nb) }
       // Lists that all spell one list take a list's discipline.
       if oneListUnionRender(inner) != "" { return 1 }
       if it.uMembers.length == 1 {
@@ -4797,3 +4814,14 @@ export function repShadowReasonLen(i: i32) { repShadowReasonNames[i].length }
 export function repShadowReasonAt(i: i32, j: i32) { repShadowReasonNames[i][j] }
 
 export function repShadowReasonN(i: i32) { repShadowReasonCounts[i] }
+
+// Whether a union member other than a function still holds a type parameter: such a union has
+// no box tag until it is bound, while a function member is the closure whatever its parameter.
+function unionHasOpenMember(members: i32[]): boolean {
+  for m in members {
+    if m >= 0 && m < T.tys.length && !(tyAt(m) is TyFunc) && tyHasTyVar(m) {
+      return true
+    }
+  }
+  false
+}
