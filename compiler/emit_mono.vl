@@ -289,6 +289,7 @@ import {
   identFrom,
   identFromDecl,
   identOrigNote,
+  nodeSrcNote,
   sidArrGet,
   sidArrPut,
   sidLookup,
@@ -442,6 +443,7 @@ import {
   monoInstName,
   monoInstOrig,
   monoKeys,
+  monoLamCloneTmpl,
   monoLamPinned,
   monoLamShared,
   monoOrigNode,
@@ -584,6 +586,17 @@ import {
   tySameSpelled,
 } from "./emit_ty_canon"
 import {
+  elabAliasNote,
+  elabBodyDeclNote,
+  elabDemand,
+  elabKeyAt,
+  elabSlotNote,
+  elabTpDefaultsReset,
+  elabTpDefaultsSet,
+  elabWalkPop,
+  elabWalkPush,
+} from "./emit_elab"
+import {
   isUNameDeclAB,
   unABOn,
   unNameBound,
@@ -676,8 +689,6 @@ let monoLamMintedSlots: i32[] = []
 // Every lifted slot a lambda clone took for the instance being built, nested clones included.
 // Never retired, since the instance walks each clone's body once it is registered (D2553).
 let monoLamCloneSlots: i32[] = []
-// The template each lambda clone comes from, by clone node, read for a clone too open to type.
-let monoLamCloneTmpl: {[i32]: i32} = Map()
 
 // The arena shape `monoRebuild`'s two whole-program passes are a pure function of:
 // `P.nodes`, `fnStmts` and `fnParent` grow, and `monoArenaTick` counts what lands IN PLACE,
@@ -7778,6 +7789,7 @@ function monoShadowRenameDecl(d: i32, inner: i32, name: string): i32 {
   }
   const alias = name + "__sh" + i32ToStr(d)
   for r in own { tyVarRenameRow(r, alias) }
+  elabAliasNote(alias, name, fnStmts[d])
   monoShAliasSlot.push(d)
   monoShAliasName.push(name)
   monoShAliasTo.push(alias)
@@ -8017,6 +8029,36 @@ function monoBindExplicitTyArgs(
 // of it, and an `is` arm reading it at another type reads an empty list, so no read tells (D4911;
 // DECISIONS.md §"An unbound type parameter defaults at the call").
 const MONO_UNBOUND_TY_PARAM_DEFAULT = "i32"
+
+// Records, for the elaboration, each generic declaration's type parameters an inferred call that
+// leaves them unbound defaults, by `monoDefaultUnboundTyParams`'s rule (D4551).
+export function monoElabDefaultsPrime() {
+  elabTpDefaultsReset()
+  const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
+  let d = 0
+  while d < P.nodes.length {
+    const fn = nodeAt(d)
+    if fn is FuncDecl {
+      elabBodyDeclNote(d, fn.fnBody)
+      if fn.fnTyParams.length > 0 {
+        const out: string[] = []
+        for tp in fn.fnTyParams {
+          const one: string[] = [tp]
+          const seen: i32[] = []
+          if (
+            !monoParamsMention(fn.fnParams, one)
+            && !monoTyParamReachesSpelling(fn.fnBody, one, seen)
+          ) {
+            out.push(tp)
+          }
+        }
+        if out.length > 0 { elabTpDefaultsSet(d, out, dt) }
+      }
+    }
+    d = d + 1
+  }
+  0
+}
 
 // Binds each of `typarams` that is still unbound in `tvN`, that no annotation in `params` names
 // and that reaches no spelling the default would answer (`monoTyParamReachesSpelling`) to the
@@ -12378,6 +12420,16 @@ function monoMakeInstanceGo(
     const holeN: string[] = []
     const holeT: i32[] = []
     monoHoleBinding(origFe, params, letTyCol, holeN, holeT)
+    // The worklist instance this one is: demanded here, its body checked once at this binding.
+    const ekN0: string[] = []
+    const ekT0: i32[] = []
+    monoJoinBinding(letBN, letBT, holeN, holeT, ekN0, ekT0)
+    const ekN: string[] = []
+    const ekT: i32[] = []
+    monoJoinBinding(ekN0, ekT0, k.exSubN, k.exSubT, ekN, ekT)
+    const ek = elabDemand(monoOrigNode[origFe], ekN, ekT, pinnedTyIx)
+    // Everything this build mints is demanded under this instance.
+    elabWalkPush(ek)
     // The hole-built return local the body clone annotates (name, type, row) and the two-list type.
     const retOutS: string[] = []
     const retOutIx: i32[] = []
@@ -12401,7 +12453,7 @@ function monoMakeInstanceGo(
       retOutS,
       retOutIx,
     )
-    if nret < -1 { return -1 }
+    if nret < -1 { return elabWalkPop() - 1 }
     const nretW = if retWiden != "" { synthTypeRefTy(retWiden, -1, retWidenTy) } else { nret }
     const twoListTy = retOutIx[1]
     let instName = fn.fnName
@@ -12462,7 +12514,7 @@ function monoMakeInstanceGo(
       instName,
       first,
     )
-    if instFe < 0 { return -1 }
+    if instFe < 0 { return elabWalkPop() - 1 }
     monoInstParamTyCol.set(instFe, letTyCol)
     // REGISTER before walking the body, so a recursive self-call at the same
     // shape resolves here instead of recursing (the host's discipline).
@@ -12480,9 +12532,12 @@ function monoMakeInstanceGo(
       holeN,
       holeT,
     )
+    elabSlotNote(instFe, ek)
     monoNoteOpenArgs(calleeIx, instFe)
-    if monoRebuild() < 0 { return -1 }
-    return monoMakeInstanceWalk(fn, origFe, nfn, calleeIx, lamClones)
+    if monoRebuild() < 0 { return elabWalkPop() - 1 }
+    const walked = monoMakeInstanceWalk(fn, origFe, nfn, calleeIx, lamClones)
+    elabWalkPop()
+    return walked
   }
   0
 }
@@ -25143,6 +25198,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
 
 // `copy`, a fresh node standing for `orig`, after it takes `orig`'s binding identity.
 function monoCopyOf(orig: i32, copy: i32) {
+  nodeSrcNote(copy, orig)
   identFrom(copy, orig)
   copy
 }
@@ -26469,6 +26525,14 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
 // `RetStmt` arm has nothing to read; the value of a body block is its last statement,
 // which is what `monoCoerceFnValueName`'s `Block` arm walks to.
 function monoWalkFnBody(fnIx: i32) {
+  // What the body demands is demanded under the instance it is.
+  elabWalkPush(elabKeyAt(fnIx))
+  const r = monoWalkFnBodyIn(fnIx)
+  elabWalkPop()
+  r
+}
+
+function monoWalkFnBodyIn(fnIx: i32) {
   const fn = nodeAt(fnIx)
   if !vrIndexed(fnIx) {
     const one: i32[] = [fnIx]
