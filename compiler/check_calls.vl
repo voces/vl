@@ -20,6 +20,7 @@ import {
   P,
   Param,
   RetStmt,
+  Spread,
   TypeRef,
   annTsOf,
   callHasTyArgs,
@@ -279,13 +280,18 @@ import {
   holeLetWritesDisagreeCall,
   holeRetTyOf,
   holeSetCallRet,
+  holeSlotCallRets,
   judgeHoleCallOps,
   substTyDeep,
   tErr,
   tErrUnsupported,
 } from "./check_relate_core"
 import { valueUnionRetName } from "./check_ret_names"
-import { recHeldDecl, recHeldLit } from "./check_rec_fresh"
+import {
+  recFreshDeclOf,
+  recFreshMapDeclOf,
+  recHeldLit,
+} from "./check_rec_fresh"
 import { recAdPushSettled, recAdSetGroup } from "./check_rec_rows"
 import { pgrNoteCall } from "./check_poly_growth"
 import {
@@ -348,11 +354,13 @@ import {
   TyArray,
   TyErr,
   TyFunc,
+  TyMap,
   TyNullable,
   TyObj,
   TyUnion,
   TyVar,
   mkArrayTy,
+  mkArrayViewTy,
   mkMapTy,
   mkNullableTy,
   mkObjTy,
@@ -387,8 +395,10 @@ import {
   cwBoundOnce,
   cwFnDeclOf,
   cwFrameOfDecl,
+  cwGetRecv,
   cwLambdaDeclOf,
   cwPeel,
+  cwSlotPath,
   cwSlotWrittenValues,
   cwSoleBinderOf,
   fnDeclIx,
@@ -2069,6 +2079,10 @@ function callFtyPinCstrs(
       holeChoiceArmCstrsAt(n.callFn, pts)
       holeChoiceWaits(n.callFn, pts)
     }
+    if cfn is Member && T.diags.length == dBeforeC {
+      const inst = substTyDeep(nodeTyOf(n.callFn), vNames, vTys)
+      holeFieldCallAdopt(cfn.memObj, cfn.memProp, inst, ix)
+    }
   }
   if cfn is Ident {
     let hd = namedFn
@@ -2385,12 +2399,9 @@ function judgeFnArgHoleCalls(
         holeOpenCallsWait(a, vNames, wTys, k, vTys[k], calleeFn)
       }
     }
-    if an is ObjLit || an is ArrayLit || an is Ident || an is Index {
+    if holeFieldRecOf(a) >= 0 {
       const k = strListIndexOf(vNames, dhNames[j])
-      if (
-        k >= 0
-        && (an is ObjLit || an is ArrayLit || holeRecDecls(a).length > 0)
-      ) {
+      if k >= 0 {
         if wTys.length == 0 {
           for t in vTys { wTys.push(t) }
           instGenFnHolePins(vNames, wTys, calleeFn)
@@ -2438,70 +2449,309 @@ function judgeFnArgHoleCalls(
   0
 }
 
-// The bindings argument `a` reads, or that `a` indexes, through un-annotated bindings that hold
-// only their initializer, when the last holds an object literal (or, indexed, a list literal).
-function holeRecDecls(a: i32): i32[] {
-  const out: i32[] = []
-  if a < 0 || a >= P.nodes.length { return out }
-  const an = nodeAt(a)
-  let x = if an is Index { parenPeelIx(an.idxArr) } else { a }
-  while x >= 0 && x < P.nodes.length && nodeAt(x) is Ident && out.length < 16 {
-    const d = recHeldDecl(x)
-    if d < 0 { break }
-    out.push(d)
-    x = parenPeelIx(recHeldLit(x))
+// Where the records a place holds come from: each fresh binding that holds them (`decls`, the
+// record at `dPaths` from it), each fresh literal no binding holds (`lits`, at `lPaths`), and
+// every object literal among the records (`recs`).
+type HoleRecSrcs = {
+  decls: i32[],
+  dPaths: string[][],
+  lits: i32[],
+  lPaths: string[][],
+  recs: i32[],
+}
+
+// The steps of `path` from `k` on.
+function stepsFrom(path: string[], k: i32): string[] {
+  const out: string[] = []
+  let i = k
+  while i < path.length {
+    out.push(path[i])
+    i = i + 1
   }
-  const ok = x >= 0
-    && x < P.nodes.length
-    && (nodeAt(x) is ArrayLit || !(an is Index) && nodeAt(x) is ObjLit)
-  if !ok { return [] }
   out
 }
 
-// The object literals argument `a` hands hole `base`, each with the name of the hole it fills:
-// `a` itself, a list literal's elements (the hole its reads give), or those `holeRecDecls`' last
-// binding holds.
-function holeRecSrcs(a: i32, base: string, srcs: i32[], bases: string[]) {
-  if a < 0 || a >= P.nodes.length { return 0 }
-  const an = nodeAt(a)
-  if an is ObjLit {
-    srcs.push(a)
-    bases.push(base)
-    return 0
+// Add to `s` the sources of the records the value `x` holds at `path`, under a binding that
+// fixes a literal's type when `held`; false when one is not a literal, a fresh binding, an
+// annotated one or a declared function's result.
+function holeRecSrcsOf(
+  x: i32,
+  path: string[],
+  held: boolean,
+  s: HoleRecSrcs,
+  depth: i32,
+): boolean {
+  if depth > 16 { return false }
+  const v = cwPeel(x)
+  if v < 0 || v >= P.nodes.length { return false }
+  const n = nodeAt(v)
+  if n is ObjLit || n is ArrayLit {
+    if !held {
+      s.lits.push(v)
+      s.lPaths.push(path)
+    }
+    return holeRecLitSrcs(v, path, s, depth)
   }
-  if an is ArrayLit {
-    for e in an.arrElems {
-      const pe = parenPeelIx(e)
-      if pe >= 0 && pe < P.nodes.length && nodeAt(pe) is ObjLit {
-        srcs.push(pe)
-        bases.push("?elemv." + base)
+  if n is Call && cwGetRecv(v) < 0 {
+    const rets: i32[] = []
+    if !holeSlotCallRets(n, rets) || rets.length == 0 { return false }
+    for r in rets {
+      if !holeRecSrcsOf(r, path, false, s, depth + 1) { return false }
+    }
+    return true
+  }
+  const full: string[] = []
+  const root = cwSlotPath(v, full)
+  if root < 0 { return false }
+  for st in path { full.push(st) }
+  holeRecBindSrcs(root, full, s, depth)
+}
+
+// `holeRecSrcsOf` of the list or object literal `v`, held by the literal itself.
+function holeRecLitSrcs(
+  v: i32,
+  path: string[],
+  s: HoleRecSrcs,
+  depth: i32,
+): boolean {
+  const n = nodeAt(v)
+  if path.length == 0 {
+    if !(n is ObjLit) { return false }
+    if !i32ListHas(s.recs, v) { s.recs.push(v) }
+    return true
+  }
+  const rest = stepsFrom(path, 1)
+  if path[0] == "[]" {
+    if !(n is ArrayLit) { return false }
+    for el in n.arrElems {
+      if nodeAt(cwPeel(el)) is Spread { return false }
+      if !holeRecSrcsOf(el, rest, true, s, depth + 1) { return false }
+    }
+    return true
+  }
+  if !(n is ObjLit) { return false }
+  for f in n.objFields {
+    const fi = nodeAt(f)
+    if fi is FieldInit && fi.fiName == path[0] {
+      return holeRecSrcsOf(fi.fiValue, rest, true, s, depth + 1)
+    }
+  }
+  false
+}
+
+// `holeRecSrcsOf` of the binding the read `root` names, at the steps `full` from it: a fresh
+// literal or `Map()` binding is a source, with every value written into it on the way to the
+// records; one bound once to another value reads that value's sources.
+function holeRecBindSrcs(
+  root: i32,
+  full: string[],
+  s: HoleRecSrcs,
+  depth: i32,
+): boolean {
+  const rn = nodeAt(root)
+  if !(rn is Ident) { return false }
+  let d = recFreshDeclOf(root)
+  if d < 0 { d = recFreshMapDeclOf(root) }
+  const fr = covarRootFrame(root)
+  if fr == CW_FR_UNKNOWN { return false }
+  if d < 0 {
+    const init = recHeldLit(root)
+    if init >= 0 { return holeRecSrcsOf(init, full, false, s, depth + 1) }
+    const bd = cwSoleBinderOf(rn.identName, fr)
+    if bd < 0 || bd >= P.nodes.length { return false }
+    const bn = nodeAt(bd)
+    return bn is LetDecl && bn.letType >= 0
+  }
+  let k = 0
+  while k < s.decls.length {
+    if s.decls[k] == d && strListEq(s.dPaths[k], full) { return true }
+    k = k + 1
+  }
+  s.decls.push(d)
+  s.dPaths.push(full)
+  if full.length == 0 {
+    return holeRecLitSrcs(cwPeel(recHeldLit(root)), full, s, depth)
+  }
+  let l = 1
+  while l <= full.length {
+    const at: string[] = []
+    let i = 0
+    while i < l {
+      at.push(full[i])
+      i = i + 1
+    }
+    const vals: i32[] = []
+    const ats: i32[] = []
+    if cwSlotWrittenValues(rn.identName, fr, at, vals, ats) < 0 { return false }
+    for w in vals {
+      const wv = cwPeel(w)
+      const named = wv >= 0 && wv < P.nodes.length && nodeAt(wv) is Ident
+      // A binding holding a call's result has the callee's type, which no pin of it rebuilds.
+      if (
+        l == full.length
+        && wv >= 0
+        && wv < P.nodes.length
+        && nodeAt(wv) is Call
+        && cwGetRecv(wv) < 0
+      ) {
+        return false
+      }
+      if named || l == full.length {
+        if !holeRecSrcsOf(w, stepsFrom(full, l), true, s, depth + 1) {
+          return false
+        }
       }
     }
-    return 0
+    l = l + 1
   }
-  const ds = holeRecDecls(a)
-  if ds.length == 0 { return 0 }
-  const dn = nodeAt(ds[ds.length - 1])
-  const init = if dn is LetDecl { parenPeelIx(dn.letInit) } else { -1 }
-  if init < 0 || init >= P.nodes.length { return 0 }
-  if !(an is Index) { return holeRecSrcs(init, base, srcs, bases) }
-  const iv = nodeAt(init)
-  if iv is ArrayLit {
-    for e in iv.arrElems {
-      const pe = parenPeelIx(e)
-      if pe >= 0 && pe < P.nodes.length && nodeAt(pe) is ObjLit {
-        srcs.push(pe)
-        bases.push(base)
-      }
+  true
+}
+
+// Whether `a` and `b` hold the same steps.
+function strListEq(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The type `t` with the record at the steps of `path` from `i` replaced by `rt`; -1 when a step
+// is not a field of a record, an element of a list or a value of a map.
+function holeSlotTyWith(t: i32, path: string[], i: i32, rt: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const ty = tyAt(t)
+  if ty is TyNullable {
+    const inner = holeSlotTyWith(ty.nInner, path, i, rt)
+    if inner < 0 { return -1 }
+    return mkNullableTy(inner)
+  }
+  if i >= path.length {
+    if ty is TyObj { return rt }
+    return -1
+  }
+  if path[i] == "[]" {
+    if ty is TyArray {
+      const e = holeSlotTyWith(ty.aElem, path, i + 1, rt)
+      if e < 0 { return -1 }
+      if ty.aRead == 1 { return mkArrayViewTy(e) }
+      return mkArrayTy(e)
     }
+    if ty is TyMap {
+      const mv = holeSlotTyWith(ty.mVal, path, i + 1, rt)
+      if mv < 0 { return -1 }
+      return mkMapTy(ty.mKey, mv, ty.mSet)
+    }
+    return -1
+  }
+  if !(ty is TyObj) { return -1 }
+  const fi = strListIndexOf(ty.objFieldNames, path[i])
+  if fi < 0 { return -1 }
+  const sub = holeSlotTyWith(ty.objFieldTypes[fi], path, i + 1, rt)
+  if sub < 0 { return -1 }
+  const tys: i32[] = []
+  for ft in ty.objFieldTypes { tys.push(ft) }
+  tys[fi] = sub
+  mkObjTy(ty.objFieldNames, tys)
+}
+
+// Builds the records of `s` as `rt`: each binding is pinned at its own type with them replaced,
+// queued under judged call `grp`, and each literal adopts that type. Nothing when one type
+// cannot be built.
+function holeRecAdopt(s: HoleRecSrcs, rt: i32, at: i32, grp: i32) {
+  if rt < 0 || tyHasTyVar(rt) || tyReachesHole(rt, 8) { return 0 }
+  const dTys: i32[] = []
+  let i = 0
+  while i < s.decls.length {
+    const w = holeSlotTyWith(nodeTyOf(s.decls[i]), s.dPaths[i], 0, rt)
+    if w < 0 { return 0 }
+    dTys.push(w)
+    i = i + 1
+  }
+  const lTys: i32[] = []
+  i = 0
+  while i < s.lits.length {
+    const w = holeSlotTyWith(nodeTyOf(s.lits[i]), s.lPaths[i], 0, rt)
+    if w < 0 { return 0 }
+    lTys.push(w)
+    i = i + 1
+  }
+  i = 0
+  while i < s.decls.length {
+    recAdPushSettled(s.decls[i], dTys[i], at, grp)
+    i = i + 1
+  }
+  i = 0
+  while i < s.lits.length {
+    adoptLitAt(s.lits[i], lTys[i])
+    i = i + 1
   }
   0
 }
 
+// A field call `recv.field(...)` through an un-annotated function, at closed instance `inst`:
+// the records `recv` holds are built with that field at `inst`, so every source of them shares
+// the row the call reads (D13969).
+function holeFieldCallAdopt(recv: i32, field: string, inst: i32, at: i32) {
+  if inferQuiet || recv < 0 || recv >= P.nodes.length { return 0 }
+  if inst < 0 || !(tyAt(inst) is TyFunc) || tyHasTyVar(inst) { return 0 }
+  const rty = nonNullTy(nodeTyOf(recv))
+  if rty < 0 || rty >= T.tys.length { return 0 }
+  const ro = tyAt(rty)
+  if !(ro is TyObj) { return 0 }
+  const fi = strListIndexOf(ro.objFieldNames, field)
+  if fi < 0 || !fnTyTakesHole(ro.objFieldTypes[fi]) { return 0 }
+  const tys: i32[] = []
+  for ft in ro.objFieldTypes { tys.push(ft) }
+  tys[fi] = inst
+  const s: HoleRecSrcs = {
+    decls: [],
+    dPaths: [],
+    lits: [],
+    lPaths: [],
+    recs: [],
+  }
+  if !holeRecSrcsOf(recv, [], false, s, 0) { return 0 }
+  holeRecAdopt(s, mkObjTy(ro.objFieldNames, tys), at, recAdSetGroup())
+}
+
+// Whether `ft` is a function type with a parameter an inference hole still types, not a declared
+// type parameter.
+function fnTyTakesHole(ft: i32): boolean {
+  if ft < 0 || ft >= T.tys.length { return false }
+  const f = tyAt(ft)
+  if !(f is TyFunc) { return false }
+  for p in f.fnParamTypes {
+    if p >= 0 && p < T.tys.length {
+      const pv = tyAt(p)
+      if pv is TyVar && namesAllHoles([pv.tvName]) { return true }
+    }
+  }
+  false
+}
+
+// The record argument `a` hands, or that each element of a list argument is, when one of its
+// fields holds a function with un-annotated parameters; -1 otherwise.
+function holeFieldRecOf(a: i32): i32 {
+  let t = nonNullTy(nodeTyOf(a))
+  if t < 0 || t >= T.tys.length { return -1 }
+  const tl = tyAt(t)
+  if tl is TyArray { t = nonNullTy(tl.aElem) }
+  if t < 0 || t >= T.tys.length { return -1 }
+  const ro = tyAt(t)
+  if !(ro is TyObj) { return -1 }
+  for ft in ro.objFieldTypes {
+    if fnTyTakesHole(ft) { return t }
+  }
+  -1
+}
+
 // A field of the records argument `a` hands hole `vNames[k]`, holding a function with
 // un-annotated parameters, is judged at the instance the callee's calls through that field ask,
-// as the function handed directly is; when each such field asks one, `a` adopts the record at
-// those instances, so it is built at the type those calls read (D13969).
+// as the function handed directly is; when each such field asks one, the records are built at
+// those instances, so every source of them has the type those calls read (D13969).
 function judgeHoleFieldCalls(
   a: i32,
   vNames: string[],
@@ -2509,14 +2759,25 @@ function judgeHoleFieldCalls(
   k: i32,
   calleeFn: i32,
 ) {
-  const srcs: i32[] = []
-  const bases: string[] = []
-  holeRecSrcs(a, vNames[k], srcs, bases)
-  if srcs.length == 0 { return 0 }
-  const rt0 = nonNullTy(nodeTyOf(srcs[0]))
-  if rt0 < 0 || rt0 >= T.tys.length { return 0 }
+  const rt0 = holeFieldRecOf(a)
+  if rt0 < 0 { return 0 }
   const ro = tyAt(rt0)
   if !(ro is TyObj) { return 0 }
+  let path: string[] = []
+  let base = vNames[k]
+  const at0 = nonNullTy(nodeTyOf(a))
+  if at0 >= 0 && tyAt(at0) is TyArray {
+    path = ["[]"]
+    base = "?elemv." + base
+  }
+  const s: HoleRecSrcs = {
+    decls: [],
+    dPaths: [],
+    lits: [],
+    lPaths: [],
+    recs: [],
+  }
+  if !holeRecSrcsOf(a, path, false, s, 0) || s.recs.length == 0 { return 0 }
   const fTys: i32[] = []
   for t in ro.objFieldTypes { fTys.push(t) }
   const set: boolean[] = []
@@ -2524,11 +2785,7 @@ function judgeHoleFieldCalls(
   let nSet = 0
   let agree = true
   const d0 = T.diags.length
-  let si = 0
-  while si < srcs.length {
-    const src = srcs[si]
-    const base = bases[si]
-    si = si + 1
+  for src in s.recs {
     const sn = nodeAt(src)
     const fields = if sn is ObjLit { sn.objFields } else { [] }
     for fx in fields {
@@ -2567,19 +2824,7 @@ function judgeHoleFieldCalls(
     }
   }
   if !agree || nSet == 0 || T.diags.length > d0 { return 0 }
-  const rt = mkObjTy(ro.objFieldNames, fTys)
-  const an = nodeAt(a)
-  if an is ObjLit {
-    adoptLitAt(a, rt)
-  } else if an is ArrayLit {
-    adoptLitAt(a, mkArrayTy(rt))
-  } else {
-    const g = recAdSetGroup()
-    for d in holeRecDecls(a) {
-      recAdPushSettled(d, rt, an is Index || bases[0] != vNames[k], a, g)
-    }
-  }
-  0
+  holeRecAdopt(s, mkObjTy(ro.objFieldNames, fTys), a, recAdSetGroup())
 }
 
 // Refuses, at argument `a`, generic function `fnName` handed through callee `via`, which reads
