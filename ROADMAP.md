@@ -108,7 +108,7 @@ units: **hours** · **half-day** · **days**.
 - Plan: [`docs/internals/architecture-refactor-plan.md`](docs/internals/architecture-refactor-plan.md),
   which gives the order, dependencies, acceptance rules and status of L1–L14 and Track T.
 - Measurements and the shape of each item: `docs/internals/code-quality-2026-10.md`.
-- In progress: L1 (lane SC), L2 and L6. Ready to brief: A1, A3, A5 and C3's first PR.
+- The migration follows [`docs/internals/architecture-target-2026-10.md`](docs/internals/architecture-target-2026-10.md) §3. Step 5.0 (joins typed and stored once) landed. In progress: steps 1–3 (one elaboration worklist), step 5a and L6.
 
 ### Modernization program (owner, 2026-09-02)
 
