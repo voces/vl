@@ -268,7 +268,6 @@ import {
   litLexIsMember,
   loopStackFind,
   mapShapeFoldSet,
-  memberPathKeyOf,
   nulCloFlag,
   objFieldSrcOrder,
   objFieldSrcPairs,
@@ -891,6 +890,7 @@ import {
   identNameIsBoundAt,
   identNameIsUserBound,
   identReadAtomKindAt,
+  idxNarrowAtomKind,
   ifExprRefKind,
   ifExprRefSlot,
   indexElemUnionName,
@@ -918,6 +918,7 @@ import {
   mapReadNarrowedContainer,
   mapRetExprShape,
   mapShapeOfExpr,
+  memNarrowAtomKind,
   memReadBoxNarrowName,
   memReadBoxNarrowTy,
   memReadBoxedAtomKind,
@@ -939,6 +940,7 @@ import {
   objVariantName,
   objVariantNameCtx,
   optChainStructIdxOf,
+  pathReadAtomKind,
   placeNicheAtomKind,
   preStmtNarrow,
   pushPostGuardNarrow,
@@ -1246,7 +1248,6 @@ import {
   narrowedIsMapPlace,
   narrowedIsRefArray,
   narrowedIsRefArrayPlace,
-  narrowedValueAtomOf,
   nicheReadKindAt,
   nicheReadStashSlot,
   nodeJoinRowName,
@@ -11287,16 +11288,16 @@ function emitSharedFieldRecv(
 // `struct.get` produced the box — the plain struct table, the arm's `uVarHeap` row, or the
 // nullable form of the same — but the unbox after it is one sequence.
 
-// `narrowedValueAtomOf`, not the raw `narrowVariantFor` and `valueAtomKind` pair: a litunion-alias
-// narrow must unbox as the string ref the box stores its member as, which is the ident read
-// discipline. An un-narrowed read yields the box unchanged, so a "" atom emits nothing.
+// The atom is the checker's type for the read (`memNarrowAtomKind`): a litunion-alias narrow
+// unboxes as the string ref the box stores its member as, which is the ident read discipline.
+// A read typed as the field's declared type narrows nothing and yields the box unchanged.
 function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
   // The CONTAINER arms of the same narrowing (`if n.v is K[]`, `if n.v is {[string]: K}`) —
   // disjoint from the value atom below, which answers "" for both (D1014).
   const mCon = emitPlaceNarrowContainerUnbox(memIx, fnIx)
   if mCon != 0 { return mCon - 1 }
-  const mAtom = narrowedValueAtomOf(memberPathKeyOf(memIx))
-  if mAtom == "" {
+  const mAtom = memNarrowAtomKind(memIx, fnIx)
+  if mAtom < 0 {
     // D209 — the un-narrowed read the checker typed as a bare atom. The box is the adoption's
     // rep, not the program's: `structIndexOfObjCtx` takes a declared row for an un-annotated
     // literal, so the field is code 16 while the checker never widened the value. Deliver the
@@ -11321,7 +11322,7 @@ function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
   // The narrowed atom's ABI code decides both arms, exactly as it does at the variant-field twin
   // of this read (`emitNarrowedMem`, the same three instructions and the same two arms) — one
   // derivation, not a spelling compare beside a second `vbHeapIdxOfKind`.
-  emitUnboxToAtomKind(valueAtomKind(mAtom))
+  emitUnboxToAtomKind(mAtom)
 }
 
 // D927 — the tag-dispatched unbox: one arm per atom the box can hold, each converted to the
@@ -11661,14 +11662,15 @@ function emitMemSharedRead(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx): i32 {
         fbEnd()
         se = se + 1
       }
-      // A boxed read whose path is narrowed to one atom delivers that atom, as a code-16
-      // field's does.
+      // A plan that boxes, or whose every arm stores the box, delivers a box whatever the
+      // receiver's arms declare, so a read the checker typed as one atom unboxes to it.
+      if shCode == FC_UNION {
+        const shK = pathReadAtomKind(memIx, fnIx)
+        if shK >= 0 { return emitUnboxToAtomKind(shK) }
+      }
       if sharedFieldAnyArmBoxes(shCode, shVis, shFis) {
-        // A read the checker typed as one atom (a null test narrowed the path) delivers it.
-        if narrowedValueAtomOf(memberPathKeyOf(memIx)) == "" {
-          const shAk = memReadCheckerAtomKind(memIx)
-          if shAk >= 0 { return emitUnboxToAtomKind(shAk) }
-        }
+        const shAk = memReadCheckerAtomKind(memIx)
+        if shAk >= 0 { return emitUnboxToAtomKind(shAk) }
         return emitUnionFieldNarrowUnbox(memIx, fnIx)
       }
       return 0
@@ -11727,8 +11729,7 @@ function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx): i32 {
     }
     // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
     // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
-    // ident read; an un-narrowed read is the box. `narrowedValueAtomOf` rather than the raw pair,
-    // so a litunion-alias narrow unboxes as the string ref the box stores its member as.
+    // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
     if sFieldTypeAt(si, idx) == FC_UNION {
       if memReadBoxAmbiguous(memIx, fnIx) { return emitBoxAmbiguousFail(memIx) }
       const own = memReadBoxNarrowTy(memIx, fnIx)
@@ -17018,12 +17019,9 @@ function emitIndexRefList(
   // invalid wasm. Routed through the shared `emitUnionUnboxTail`, not an open-coded unbox.
   const iCon = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
   if iCon != 0 { return iCon - 1 }
-  const iuAtom = narrowedValueAtomOf(indexPathKeyOf(idxIx))
-  if iuAtom != "" {
-    if indexElemUnionName(idxIx, fnIx) != "" {
-      const iuk = valueAtomKind(iuAtom)
-      if iuk >= 0 && iuk != nullValKind() { return emitUnionUnboxTail(iuk) }
-    }
+  if indexElemUnionName(idxIx, fnIx) != "" {
+    const iuk = idxNarrowAtomKind(idxIx, fnIx)
+    if iuk >= 0 && iuk != nullValKind() { return emitUnionUnboxTail(iuk) }
   }
   0
 }
@@ -40445,8 +40443,9 @@ function coalRetypedDeadJoinIf(
   ifIx
 }
 
-// A copy of the name, field or map read `ix` typed at its literal union without `null`, or `ix`
-// itself when its type, an instance's own for a hole, is no declared `K | null` atom niche.
+// A copy of the name, field or map read `ix` typed without `null` (a literal union, or one atom
+// for a field or element read), or `ix` itself when its type, an instance's own for a hole, is
+// neither.
 function coalNarrowedReRead(ix: i32, fnIx: i32): i32 {
   let lt = nodeTyAt(ix, fnIx)
   if lt >= 0 && lt < T.tys.length && tyAt(lt) is TyVar {
@@ -40454,8 +40453,13 @@ function coalNarrowedReRead(ix: i32, fnIx: i32): i32 {
   }
   if lt < 0 || lt >= T.tys.length || tyAt(lt) is TyVar { return ix }
   const nn = tyPeelNul(lt)
-  if nn == lt || !tyIsLitUnion(nn) { return ix }
+  if nn == lt { return ix }
   const l = nodeAt(ix)
+  // A field or element read the test narrows to one atom reads at it, as the checker types it.
+  if !tyIsLitUnion(nn) {
+    const nk = valueAtomKindOfTy(nn)
+    if l is Ident || nk < 0 || nk == 6 { return ix }
+  }
   let cp = -1
   if l is Member { cp = mkMember(l.memObj, l.memProp, l.pos) }
   if l is Index { cp = mkIndex(l.idxArr, l.idxIndex, l.pos) }
