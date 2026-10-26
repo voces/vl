@@ -890,6 +890,7 @@ import {
   identNameIsBoundAt,
   identNameIsUserBound,
   identReadAtomKindAt,
+  identReadContainerAt,
   idxNarrowAtomKind,
   ifExprRefKind,
   ifExprRefSlot,
@@ -931,7 +932,6 @@ import {
   mfResultKindOf,
   mfResultSlotOf,
   minMaxKind,
-  narrowedMapShapeOf,
   nulLitAtomTexts,
   nulMapShapeOf,
   nulRefStructIdxOfLet,
@@ -942,6 +942,7 @@ import {
   optChainStructIdxOf,
   pathReadAtomKind,
   placeNicheAtomKind,
+  placeReadContainerAt,
   preStmtNarrow,
   pushPostGuardNarrow,
   refListSlotOfExpr,
@@ -1237,16 +1238,14 @@ import {
 } from "./emit_sig_tokens"
 import {
   NICHE_NUL_LIT,
+  RC_MAP,
+  RC_REF_LIST,
   coalesceResultIsBox,
   coalesceResultUnionName,
   ifJoinUnionNameIn,
   letUnionDeclTyIxOf,
   narrowDropsNull,
   narrowExcludesNull,
-  narrowedIsMap,
-  narrowedIsMapPlace,
-  narrowedIsRefArray,
-  narrowedIsRefArrayPlace,
   nicheReadKindAt,
   nicheReadStashSlot,
   nodeJoinRowName,
@@ -7404,7 +7403,8 @@ function emitUnionUnboxTail(ak: i32) {
 // functions `forInElemKind`, `emitIndex` and `emitMapPrep` type themselves against, so a
 // delivery casting to a different row than the consumer expects is not expressible here.
 function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
-  if narrowedIsRefArrayPlace(exprIx) {
+  const con = placeReadContainerAt(exprIx, fnIx)
+  if con == RC_REF_LIST {
     const slot = refListSlotOfExprStrict(exprIx, fnIx)
     if slot < 0 || slot >= rlWrapIdx.length {
       return emitFail(
@@ -7415,7 +7415,7 @@ function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
     emitListPayloadCast(rlWrapIdx[slot])
     return 1
   }
-  if narrowedIsMapPlace(exprIx) {
+  if con == RC_MAP {
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
     // `mapShapeOfExpr` answers the mono sentinel -1 for an atom-valued map exactly as the
     // name resolver does, and `mapTypeIdxOf(-1)` is the shared `$mStructIdx` — so the miss
@@ -7426,23 +7426,20 @@ function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
   0
 }
 
-// Recover the reflist wrapper ref a union binding narrowed to a ref-element array arm holds
-// (`x[i]` or `x.length` under `if x is S[]`): push the box, read its `anyref` value (field 1),
-// `ref.cast` it to the arm's reflist wrapper heap. The result is the `(ref $rlWrap)` the normal
-// indexing and `.length` machinery consumes, where `emitUnionCoerce` stored it.
+// Recover the reflist wrapper ref a union binding read as a ref-element list holds (`x[i]` or
+// `x.length` under `if x is S[]`): push the box, read its `anyref` value (field 1), `ref.cast`
+// it to the wrapper of the row the read's consumer types itself against.
 function emitRefArrayUnionUnboxRead(
   body: u8[],
   name: string,
+  exprIx: i32,
   fnIx: i32,
   ec: ExpCtx,
 ) {
   if emitUnionBoxPush(body, name, fnIx, ec) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  // Destringify D-ISTY: the arm's reflist slot comes from the TYPE the narrowing
-  // banked (`is S[]` recorded `S[]`'s arena index), not from slicing the element
-  // spelling back out of the rendered arm name and re-resolving it.
-  const slot = rlSlotOfTy(tyRefArrElemOf(narrowedArmTyOf(name)))
-  if slot < 0 {
+  const slot = refListSlotOfExprStrict(exprIx, fnIx)
+  if slot < 0 || slot >= rlWrapIdx.length {
     return emitFail("emitProgram: narrowed ref-array arm has no reflist slot")
   }
   emitListPayloadCast(rlWrapIdx[slot])
@@ -7483,13 +7480,14 @@ function emitListPayloadCast(wrap: i32) {
 function emitMapUnionUnboxRead(
   body: u8[],
   name: string,
+  exprIx: i32,
   fnIx: i32,
   ec: ExpCtx,
 ) {
   if emitUnionBoxPush(body, name, fnIx, ec) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   // The arm's map-value slot, the one `mapShapeOfExpr` types this read's consumer against.
-  fbRefCast(mapTypeIdxOf(narrowedMapShapeOf(name))) // the payload IS the map struct ref
+  fbRefCast(mapTypeIdxOf(mapShapeOfExpr(exprIx, fnIx))) // the payload IS the map struct ref
   0
 }
 
@@ -27180,7 +27178,10 @@ function identReadIsUnionUnbox(exprIx: i32, name: string, fnIx: i32) {
 // it must be staged through `emitExpr` (which runs the unbox) like a global/field/index
 // receiver — else `.push`/`.clear` `struct.get`s the raw box, invalid wasm.
 function listOpRecvNarrowedUnion(objIx: i32, name: string, fnIx: i32) {
-  if identReadAtomKindAt(objIx, fnIx) < 0 && !narrowedIsRefArray(name) {
+  if (
+    identReadAtomKindAt(objIx, fnIx) < 0
+    && identReadContainerAt(objIx, fnIx) != RC_REF_LIST
+  ) {
     return false
   }
   // the slot test is load-bearing: `callPopBits` reserves the scratch frame off
@@ -36382,22 +36383,23 @@ function emitIdentNode(
   // a union binding narrowed to a ref-element array arm reads unboxed to the reflist
   // wrapper: push the box, recover the anyref payload, `ref.cast` to the arm's wrapper —
   // the ref-array analogue of the scalar unbox above, so indexing/`.length` see the list.
-  if narrowedIsRefArray(e.identName) {
+  const iCon = identReadContainerAt(exprIx, fnIx)
+  if iCon == RC_REF_LIST {
     if identReadsUnionBox(isid, e.identName, exprIx, fnIx) {
-      return emitRefArrayUnionUnboxRead(body, e.identName, fnIx, ec)
+      return emitRefArrayUnionUnboxRead(body, e.identName, exprIx, fnIx, ec)
     }
   }
   // a union binding narrowed to a map arm reads unboxed to the map struct ref: push the
   // box, recover the anyref payload, `ref.cast` to the arm's map struct — the map
   // analogue of the ref-array unbox above, so `emitMapPrep` sees the map ref directly.
-  if narrowedIsMap(e.identName) {
+  if iCon == RC_MAP {
     // the same three gates as the value-atom arm above, the typed-IR net over the map-arm chain.
     if (
       unionNameOfIdentAt(isid, fnIx, exprIx) != ""
       || capturedIsUnionBox(fnIx, e.identName)
       || identChainTyMapArmUnion(e.identName, fnIx, 4)
     ) {
-      return emitMapUnionUnboxRead(body, e.identName, fnIx, ec)
+      return emitMapUnionUnboxRead(body, e.identName, exprIx, fnIx, ec)
     }
   }
   // a captured variable (a free var of a capturing lifted function): read it from the
