@@ -2046,14 +2046,15 @@ function emitFieldListWidenSite(
 // Lower an object literal `{ f: v, … }` onto `body`: build the struct of its recorded type
 // (its destination's, when the checker adopted one), push each field in declared order, then
 // `struct.new`. A nullable field may be omitted (`emitOmittedFieldNull`); any other must match.
-function emitObj(body: u8[], objIx: i32, fnIx: i32, ec: ExpCtx) {
+// `row` >= 0 is a container's struct row the literal is built at instead.
+function emitObj(body: u8[], objIx: i32, fnIx: i32, row: i32, ec: ExpCtx) {
   if !sDeclared {
     return emitFail("emitProgram: object literal but no struct type declared")
   }
   if objIx < 0 { return -1 }
   const o = nodeAt(objIx)
   if o is ObjLit {
-    const si = structIndexOfObjCtx(objIx, fnIx)
+    const si = if row >= 0 { row } else { structIndexOfObjCtx(objIx, fnIx) }
     if si < 0 {
       return emitFail(
         "emitProgram: object literal field count does not match struct",
@@ -12756,7 +12757,8 @@ function emitArrRefElem(
     if emitVariantCoerce(body, elemVariantIdx, e, fnIx, ec) < 0 { return -1 }
   } else {
     const elArmOwed = narrowedArmNeedsUnbox(e, fnIx)
-    if emitExprExpect(body, e, fnIx, elCtx) < 0 { return -1 }
+    const elemRow = if rlElemKindTbl[rslot] == RLK_STRUCT { rlElemLitStructRow(rslot) } else { -1 }
+    if emitContainerLit(body, e, fnIx, elemRow, elCtx) < 0 { return -1 }
     // The narrowed-arm unbox at a ref-list element (D1031) — `[s]` of a `Circle[]` under
     // `if s is Circle`. The slot's own element heap is the destination, the same one
     // `rlBackIdx` types the backing array with.
@@ -14860,7 +14862,8 @@ function emitMapSetValExpr(
     if exprIsLitAtom(valIx, fnIx) { return emitStrValue(body, valIx, fnIx, ec) }
   }
   const mvArmOwed = narrowedArmNeedsUnbox(valIx, fnIx)
-  if emitExprExpect(body, valIx, fnIx, svCtx) < 0 { return -1 }
+  const svRow = if mslot >= 0 && mvValKind[mslot] == MVK_STRUCT && mvValVariantOf(mslot) < 0 { mvValStructIdxOf(mslot) } else { -1 }
+  if emitContainerLit(body, valIx, fnIx, svRow, svCtx) < 0 { return -1 }
   // The narrowed-arm unbox at the map-value boundary (D1031) — `m[k] = s` under `if s is
   // Circle` over a `{[string]: Circle}` — targets the vals element's own heap, the same
   // one `mvSlotNullable`'s `ref.null` seed above reads.
@@ -20781,7 +20784,7 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   if e is Call { return emitCallNode(body, e, exprIx, fnIx, ec) }
   if e is IsExpr { return emitIs(body, exprIx, fnIx, ec) }
   if e is NullLit { return emitNullLitNode(body, e, exprIx, fnIx, ctx, ec) }
-  if e is ObjLit { return emitObjLitNode(body, e, exprIx, fnIx, ec) }
+  if e is ObjLit { return emitObjLitNode(body, e, exprIx, fnIx, -1, ec) }
   if e is StrLit {
     // A literal-union MEMBER in atom context (`ctx.litUnion`) lowers as its interned i32 id.
     if ctx.litUnion == 1 {
@@ -36916,11 +36919,28 @@ function emitNullBySeed(
   return emitFail("emitProgram: bare null needs a struct-typed context")
 }
 
+// A list element or map value `x`, an object literal among them built at the container's struct
+// `row` where that is >= 0: residue of a container slot the checker has not stamped.
+function emitContainerLit(
+  body: u8[],
+  x: i32,
+  fnIx: i32,
+  row: i32,
+  ctx: ExpCtx,
+) {
+  const n = nodeAt(x)
+  if n is ObjLit && row >= 0 {
+    return emitObjLitNode(body, n, x, fnIx, row, expCtxHere(ctx))
+  }
+  emitExprExpect(body, x, fnIx, ctx)
+}
+
 function emitObjLitNode(
   body: u8[],
   _e: ObjLit,
   exprIx: i32,
   fnIx: i32,
+  row: i32,
   ec: ExpCtx,
 ) {
   // A literal the checker built at a concrete variant, or one unadopted whose field set names a
@@ -36933,9 +36953,11 @@ function emitObjLitNode(
   // A literal whose field-set matches a STANDALONE struct constructs that struct
   // directly (even alongside a union — `ast.vl`'s `Tok`/`Diag` coexist with `Node`).
   // Otherwise, in a union program, it is a union variant: box it `{tag, value}`.
-  if structIndexOfObj(exprIx) >= 0 { return emitObj(body, exprIx, fnIx, ec) }
+  if structIndexOfObj(exprIx) >= 0 {
+    return emitObj(body, exprIx, fnIx, row, ec)
+  }
   if uDeclared { return emitUnionBox(body, exprIx, fnIx, ec) }
-  return emitObj(body, exprIx, fnIx, ec)
+  return emitObj(body, exprIx, fnIx, row, ec)
 }
 
 function emitMemberNode(
