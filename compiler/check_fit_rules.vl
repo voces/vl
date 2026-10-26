@@ -186,7 +186,7 @@ import {
   litWide64Push,
   litWide64SetAt,
 } from "./check_literals"
-import { strLitViewOf } from "./check_match_desugar"
+import { litTyOfExpr, strLitViewOf } from "./check_match_desugar"
 import { narDeclaredTy } from "./check_nar_bank"
 import {
   armLit,
@@ -436,6 +436,7 @@ import {
   tyHoldsListUnion,
   tyHoldsObj,
   tyIsHole,
+  tyIsLitUnion,
   tyIsNulI32BackedListInner,
   tyIsPrimNamed,
   tyIxIsView,
@@ -4032,10 +4033,10 @@ function mapUnboxRecordLit(
   0
 }
 
-// Delivers the fresh literal `x` to `dstTy`, stamping it with that type where `litAtRecordDst`
+// Delivers the fresh literal `x` to `dstTy`, stamping it with that type where `litAtDstStorage`
 // holds: every typed delivery of a literal, a join arm included, stamps through here.
 export function adoptLitAt(x: i32, dstTy: i32) {
-  if litAtRecordDst(x, dstTy) { recordRepTyAdopt(x, dstTy, 6) }
+  if litAtDstStorage(x, dstTy) { recordRepTyAdopt(x, dstTy, 6) }
   0
 }
 
@@ -4082,10 +4083,10 @@ function holeOutsideFn(t: i32, depth: i32): boolean {
 }
 
 // Whether a record, list or `null` literal `x` of another type meets a destination `dstTy`
-// holding a record through nullables and lists: a fresh literal is stored as its destination
+// holding a record through nullables, or any list: a fresh literal is stored as its destination
 // (D3339). A type parameter, or a hole outside the literal's function, stays open; an anonymous
 // destination of the literal's own shape is already its storage, so it is not stamped.
-export function litAtRecordDst(x: i32, dstTy: i32): boolean {
+export function litAtDstStorage(x: i32, dstTy: i32): boolean {
   if dstTy < 0 || x < 0 || !repStampableLit(x) || holeOutsideFn(dstTy, 0) {
     return false
   }
@@ -4096,6 +4097,7 @@ export function litAtRecordDst(x: i32, dstTy: i32): boolean {
   }
   let t = dstTy
   let k = 0
+  let viaList = false
   while k < 8 && t >= 0 {
     const d = tyAt(t)
     match d {
@@ -4106,10 +4108,15 @@ export function litAtRecordDst(x: i32, dstTy: i32): boolean {
         t = d.nInner
       }
       TyArray => {
+        viaList = true
         t = d.aElem
       }
-      // no other type holds a record a literal is built at
-      TyPrim | TyErr | TyFunc | TyUnion | TyMap | TyLit | TyNeg => {
+      // a list of any other element is built at its destination's element storage
+      TyPrim | TyUnion | TyMap | TyLit => {
+        return viaList
+      }
+      // no other type is a storage a literal is built at
+      TyErr | TyFunc | TyNeg => {
         return false
       }
     }
@@ -4134,6 +4141,106 @@ function repStamp(ix: i32, t: i32): i32 {
   while nodeRepTyIx.length <= ix { nodeRepTyIx.push(-1) }
   nodeRepTyIx[ix] = t
   1
+}
+
+// The list member of union `u` the array literal `ix` is built at: the first whose element type
+// each element has exactly, else the first each element fits, else the first list member, looking
+// through `| null` and nested unions (a recursive alias's union holds itself that way); -1 for none.
+function listLitUnionArm(u: i32, ix: i32): i32 {
+  const own = listLitExactArm(u, ix)
+  if own >= 0 { return own }
+  const fit = listMemberIn(u, ix, 1, 6)
+  if fit >= 0 { return fit }
+  listMemberIn(u, ix, 2, 6)
+}
+
+// The list member of union `u` array literal `ix` has exactly: its own type, else the first
+// whose element type each element has, looking through `| null` and nested unions; -1 for none.
+export function listLitExactArm(u: i32, ix: i32): i32 {
+  const self = listMemberIn(u, ix, 3, 6)
+  if self >= 0 { return self }
+  listMemberIn(u, ix, 0, 6)
+}
+
+// One pass of `listLitUnionArm`: `mode` 3 asks for the literal's own type, 0 a member its
+// elements have exactly, 1 one they fit, 2 any.
+function listMemberIn(u: i32, ix: i32, mode: i32, depth: i32): i32 {
+  const d = nonNullTy(u)
+  if depth <= 0 || d < 0 { return -1 }
+  const t = tyAt(d)
+  if !(t is TyUnion) { return -1 }
+  for m in t.uMembers {
+    if m >= 0 {
+      if tyAt(m) is TyArray {
+        if (
+          mode == 2
+          || ((mode == 3 || mode == 0) && tyEq(nodeTyIxOf(parenPeelIx(ix)), m))
+        ) {
+          return m
+        }
+        if mode != 3 && arrLitFitsList(ix, m, mode == 0, depth) { return m }
+      }
+      const inner = listMemberIn(m, ix, mode, depth - 1)
+      if inner >= 0 { return inner }
+    }
+  }
+  -1
+}
+
+// The list member of `ms` that array literal `ix` has exactly: its own type, else the first whose
+// element type each element has; -1 for none.
+export function listLitExactMember(ms: i32[], ix: i32): i32 {
+  const own = nodeTyIxOf(parenPeelIx(ix))
+  for m in ms {
+    if m >= 0 && tyAt(m) is TyArray && tyEq(own, m) { return m }
+  }
+  for m in ms {
+    if m >= 0 && tyAt(m) is TyArray && arrLitFitsList(ix, m, true, 6) {
+      return m
+    }
+  }
+  -1
+}
+
+// Whether every element of array literal `ix` fits list type `m`'s element: a list literal by the
+// same test one level down, any other element by its own type, equal to it where `exact`.
+function arrLitFitsList(ix: i32, m: i32, exact: boolean, depth: i32): boolean {
+  const e = nodeAt(parenPeelIx(ix))
+  const w = tyAt(m)
+  if depth <= 0 || !(e is ArrayLit) || !(w is TyArray) { return false }
+  const we = nonNullTy(w.aElem)
+  for el0 in e.arrElems {
+    const sp = nodeAt(el0)
+    const el = if sp is Spread { sp.spdArg } else { parenPeelIx(el0) }
+    const want = if sp is Spread { m } else { w.aElem }
+    const own = nodeTyIxOf(el)
+    if (
+      !(sp is Spread)
+      && nodeAt(el) is ArrayLit
+      && we >= 0
+      && tyAt(we) is TyArray
+    ) {
+      if !arrLitFitsList(el, we, exact, depth - 1) { return false }
+    } else if (
+      !(sp is Spread)
+      && nodeAt(el) is ArrayLit
+      && we >= 0
+      && tyAt(we) is TyUnion
+    ) {
+      if listMemberIn(we, el, if exact { 0 } else { 1 }, depth - 1) < 0 {
+        return false
+      }
+    } else {
+      const lt = if sp is Spread { -1 } else { litTyOfExpr(el) }
+      const viaLit = lt >= 0
+        && assignable(lt, want)
+        && (!exact || tyIsLitUnion(want))
+      const viaOwn = own >= 0
+        && (if exact { tyEq(own, want) } else { assignable(own, want) })
+      if !viaLit && !viaOwn { return false }
+    }
+  }
+  true
 }
 
 // Stamps the destination type `dstTy` onto literal `srcExpr` (recursively, into `ObjLit` fields /
@@ -4213,17 +4320,10 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
           }
           return repStamp(srcExpr, dtix)
         }
-        // An array literal boxed into a union arm — recurse against the first array member.
+        // An array literal boxed into a union arm: recurse against the list member it is built at.
         TyUnion => {
-          const members = d.uMembers
-          let mi = 0
-          while mi < members.length {
-            const mt = tyAt(members[mi])
-            if mt is TyArray {
-              return recordRepTyAdopt(srcExpr, members[mi], depth)
-            }
-            mi = mi + 1
-          }
+          const am = listLitUnionArm(dtix, srcExpr)
+          if am >= 0 { return recordRepTyAdopt(srcExpr, am, depth) }
           return 0
         }
         // no other destination adopts an array literal
