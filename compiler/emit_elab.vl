@@ -4,6 +4,7 @@
 
 import { Call, FuncDecl, P, Param, i32ToStr, nodeAt } from "./ast"
 import { monoRecheckBegin } from "./check_assignable"
+import { recKeptFnDstOf } from "./check_rec_rows"
 import {
   elabCallD,
   elabCallDeclOf,
@@ -399,36 +400,58 @@ export function elabDemand(
   names0: string[],
   tys0: i32[],
   pTys: i32[],
+  call: i32,
 ): i32 {
   const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
   if top < -1 { return -1 }
-  elabDemandFrom(decl0, names0, tys0, pTys, top)
+  elabDemandFrom(decl0, names0, tys0, pTys, top, call)
 }
 
-// `elabDemand` under instance `from`, or at the root when it is -1.
+// `elabDemand` under instance `from` (the root when -1) for template call `call` (-1 for none).
+// A parameter the call's own instance binds to a function value its body reaches at two instances
+// keeps that `Fn#d` binding: no one closed type holds it, and a closed pin is only its rep.
 function elabDemandFrom(
   decl0: i32,
   names0: string[],
   tys0: i32[],
   pTys: i32[],
   from: i32,
+  call: i32,
 ): i32 {
   const decl = elabSrcDecl(decl0)
   const names: string[] = []
   const tys: i32[] = []
+  const sig = if decl >= 0 { nodeTyIxOf(decl) } else { -1 }
+  const byId: boolean[] = []
+  const ck = if call >= 0 { elabCallInstFrom(call, from) } else { -1 }
+  if ck >= 0 && ekDecl[ck] == decl && sig >= 0 && sig < T.tys.length {
+    const f = tyAt(sig)
+    if f is TyFunc {
+      for pt in f.fnParamTypes {
+        const bt = substTyDeep(pt, ekNames[ck], ekTys[ck])
+        const ds: i32[] = []
+        if bt >= 0 && tyHasTyVar(bt) { elabFnIdsIn(bt, ds, 0) }
+        let id = false
+        for d in ds {
+          if elabReachedOf(ck, d) < -1 { id = true }
+        }
+        if id { bindGenWalk(pt, bt, names, tys) }
+        byId.push(id)
+      }
+    }
+  }
   let i = 0
   while i < names0.length && i < tys0.length {
     names.push(names0[i])
     tys.push(tys0[i])
     i = i + 1
   }
-  const sig = if decl >= 0 { nodeTyIxOf(decl) } else { -1 }
   if sig >= 0 && sig < T.tys.length {
     const f = tyAt(sig)
     if f is TyFunc {
       let p = 0
       while p < f.fnParamTypes.length && p < pTys.length {
-        if elabTyClosed(pTys[p], 0) {
+        if elabTyClosed(pTys[p], 0) && !(p < byId.length && byId[p]) {
           bindGenWalk(f.fnParamTypes[p], pTys[p], names, tys)
         }
         p = p + 1
@@ -709,7 +732,7 @@ export function elabNodeTy(ix: i32, k: i32): i32 {
   let raw = nodeTyIxOf(ix)
   if t >= 0 && t < T.tys.length {
     const open = tyHasTyVar(t)
-    if !open && elabTyClosed(t, 0) { return t }
+    if elabTyClosed(t, 0) { return t }
     // A part still unknown (an empty literal its later writes type) reads the generic type.
     if open { raw = t }
   }
@@ -738,27 +761,24 @@ function elabSubstClosed(t: i32, k: i32): i32 {
     }
   }
   const s = substTyDeep(t, names, tys)
-  if (
-    s < 0
-    || s >= T.tys.length
-    || s == TY_ERR
-    || tyHasTyVar(s)
-    || !elabTyClosed(s, 0)
-  ) {
+  if (s < 0 || s >= T.tys.length || s == TY_ERR || !elabTyClosed(s, 0)) {
     return -1
   }
   s
 }
 
-// Instance `k`'s result: its template's checked return with `k`'s binding substituted, -1 where
-// that does not close.
+// Instance `k`'s result: its template's checked return with `k`'s binding substituted, or the
+// wider record a kept delivery builds that result as; -1 where it does not close.
 export function elabRetOf(k: i32): i32 {
   if k < 0 || k >= ekDecl.length { return -1 }
   const ft = nodeTyIxOf(ekDecl[k])
   if ft < 0 || ft >= T.tys.length { return -1 }
   const f = tyAt(ft)
   if !(f is TyFunc) { return -1 }
-  elabSubstClosed(f.fnRet, k)
+  const r = elabSubstClosed(f.fnRet, k)
+  if r < 0 { return -1 }
+  const kd = recKeptFnDstOf(ekDecl[k], r)
+  if kd >= 0 { kd } else { r }
 }
 
 // Node `ix`'s type at the instance `fnIx` is, or -1 where its elaboration leaves it open. A
@@ -955,6 +975,17 @@ export function elabOutTy(t: i32, k: i32): i32 {
 // walked, its function values taking the instances its body reaches; -1 where that does not close.
 export function elabCallParamTy(ix: i32, i: i32): i32 {
   const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const k = elabCallInstFrom(ix, from)
+  if k < 0 { return -1 }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || i >= dn.fnParams.length { return -1 }
+  const pt = nodeTyIxOf(dn.fnParams[i])
+  if pt < 0 { return -1 }
+  elabOutTy(substTyDeep(pt, ekNames[k], ekTys[k]), k)
+}
+
+// The instance call `ix` reaches from instance `from`'s body (the root when -1), or -1.
+function elabCallInstFrom(ix: i32, from: i32): i32 {
   const ks = elabCallKeys[ix] ?? []
   let k = -1
   let j = 0
@@ -962,10 +993,5 @@ export function elabCallParamTy(ix: i32, i: i32): i32 {
     if ks[j] == from { k = ks[j + 1] }
     j = j + 2
   }
-  if k < 0 { return -1 }
-  const dn = nodeAt(ekDecl[k])
-  if !(dn is FuncDecl) || i >= dn.fnParams.length { return -1 }
-  const pt = nodeTyIxOf(dn.fnParams[i])
-  if pt < 0 { return -1 }
-  elabOutTy(substTyDeep(pt, ekNames[k], ekTys[k]), k)
+  k
 }

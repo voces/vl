@@ -4115,7 +4115,8 @@ let monoCallTpl: {[i32]: i32} = Map()
 
 function monoNoteCallTpl(ix: i32, nx: i32) {
   if nx != ix && ix >= 0 && nx >= 0 && nodeAt(nx) is Call {
-    // arena-tick exempt: a clone-to-template side map read only by monoHoleGenFnTy, never by a pass.
+    // arena-tick exempt: a clone-to-template side map read by lookups of the checker's and the
+    // elaboration's per-call rows, never by a pass.
     monoCallTpl[nx] = monoCallTplOf(ix)
   }
   0
@@ -7615,6 +7616,8 @@ function monoShAliasBind(origFe: i32, ns: string[], ts: i32[]) {
 // The enclosing-frame instance `monoInstantiate` hands `monoMakeInstance` for a capturing nested
 // generic called from it, consumed (and cleared) where the key is built; -1 for none.
 let monoCallFrameSlot = 0 - 1
+// The call node the next `monoMakeInstance` builds for, or -1; consumed by it.
+let monoMakeCallIx = 0 - 1
 // Callee identifiers resolved through a `let` alias chain: their calls are never re-spelled to
 // the lambda's instance, since the alias may hold another value at run time (D3849).
 let monoNoRename: i32[] = []
@@ -11270,6 +11273,8 @@ function monoMakeInstanceGo(
 ) {
   const callFrame = monoCallFrameSlot
   monoCallFrameSlot = -1
+  const makeCall = monoMakeCallIx
+  monoMakeCallIx = -1
   const retWiden = monoInstRetWidenName
   const retWidenTy = monoInstRetWidenTy
   monoInstRetWidenName = ""
@@ -11382,7 +11387,8 @@ function monoMakeInstanceGo(
     const ekN: string[] = []
     const ekT: i32[] = []
     monoJoinBinding(ekN0, ekT0, k.exSubN, k.exSubT, ekN, ekT)
-    const ek = elabDemand(monoOrigNode[origFe], ekN, ekT, pinnedTyIx)
+    const ekCall = if makeCall >= 0 { monoCallTplOf(makeCall) } else { -1 }
+    const ek = elabDemand(monoOrigNode[origFe], ekN, ekT, pinnedTyIx, ekCall)
     // Everything this build mints is demanded under this instance.
     elabWalkPush(ek)
     if fn.fnRet >= 0 {
@@ -21189,7 +21195,13 @@ function monoElabPin(
   if cps.length > 0 { return monoElabLitCopy(callIx, args, i, cps, t, ctx) }
   if !monoTyOpen(nodeTyIxOf(x)) { return "" }
   if !monoElabDeliver(x, t, ctx, false, false) { return "" }
-  monoElabDeliver(x, t, ctx, false, true)
+  if nodeAt(x) is FuncDecl && tyAt(t) is TyFunc {
+    if !monoElabLamArg(callIx, args, i, monoConcreteFnTyName(t), ctx) {
+      return ""
+    }
+  } else {
+    monoElabDeliver(x, t, ctx, false, true)
+  }
   if tyAt(t) is TyFunc {
     const sk = sigKeyOfTy(t)
     if sk != "" { return "=>" + sk }
@@ -21199,6 +21211,25 @@ function monoElabPin(
   }
   if !monoTyOpen(nodeTyIxOf(x)) { return monoArgPinName(x, ctx) }
   monoI32AtomPinName(t)
+}
+
+// Hole lambda literal `args[i]` of call `callIx` delivered at function type `ann`: one wanted
+// at two types takes an instance per type, which replaces it in the call and in `args`; false
+// when it is refused.
+function monoElabLamArg(
+  callIx: i32,
+  args: i32[],
+  i: i32,
+  ann: string,
+  ctx: i32,
+): boolean {
+  const c = nodeAt(callIx)
+  if !(c is Call) { return false }
+  let k = 0
+  while k < c.callArgs.length && c.callArgs[k] != args[i] { k = k + 1 }
+  if monoDeliverLamLit(args[i], ann, ctx, callIx) != 0 { return false }
+  if k < c.callArgs.length { args[i] = c.callArgs[k] }
+  true
 }
 
 // The copy among `cps` of literal `args[i]` the checker pinned at `t`, put in its place in call
@@ -22755,6 +22786,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         li = li + 1
       }
       monoCallFrameSlot = monoNestedCallFrame(origFe, ctx)
+      monoMakeCallIx = callIx
       return monoMakeInstance(
         origFe,
         pinned,
