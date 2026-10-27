@@ -270,6 +270,7 @@ import {
   recAdPushDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
+  recBuildHoldsElems,
   recBuildPassAt,
   recBuildPush,
   recDelivPush,
@@ -439,6 +440,7 @@ import {
   mkLitTy,
   mkMapTy,
   mkNullableTy,
+  mkObjTy,
   nwTyIxs,
   objFieldType,
   structNameOfTy,
@@ -481,6 +483,7 @@ import {
   CW_UP_ARG,
   CW_UP_ASG_LHS,
   CW_UP_CALLEE,
+  CW_UP_FIELD,
   CW_UP_LETINIT,
   CW_UP_OBJ,
   covarRootFrame,
@@ -490,6 +493,7 @@ import {
   cwIxKind,
   cwIxNode,
   cwIxUp,
+  cwIxUpAux,
   cwIxUpKind,
   cwOccNext,
   cwOccWalk,
@@ -2288,12 +2292,13 @@ function recMapStoredValues(d: i32): i32[] {
   const out: i32[] = []
   const dn = nodeAt(d)
   if !(dn is LetDecl) { return out }
+  const fld = dn.letInit >= 0 && nodeAt(cwPeelValue(dn.letInit)) is ObjLit
   cwIxBuild()
   const ow = cwOccWalk(dn.letName, cwFrameOfDecl(d))
   while cwOccNext(ow) {
     const u = cwIxNode[ow.row]
     if cwIxKind[ow.row] == CW_OCC_USE && u >= 0 && u < cwIxUpKind.length {
-      const v = recMapStoreValueAt(u)
+      const v = recMapStoreValueAt(u, fld)
       if v >= 0 { out.push(v) }
     }
   }
@@ -2302,7 +2307,7 @@ function recMapStoredValues(d: i32): i32[] {
 
 // The value the use `u` of a map binding stores, when it is the receiver of `u[k] = v` or of
 // `u.set(k, v)`; -1 otherwise.
-function recMapStoreValueAt(u: i32): i32 {
+function recMapStoreValueAt(u: i32, fld: boolean): i32 {
   if (
     u < 0
     || u >= cwIxUpKind.length
@@ -2322,15 +2327,18 @@ function recMapStoreValueAt(u: i32): i32 {
   }
   const a = cwIxUp[p]
   if a < 0 || a >= P.nodes.length { return -1 }
-  if cwIxUpKind[p] == CW_UP_ASG_LHS { return recMapIndexStoreValue(p, a) }
+  if cwIxUpKind[p] == CW_UP_ASG_LHS { return recMapIndexStoreValue(p, a, fld) }
   if cwIxUpKind[p] == CW_UP_CALLEE { return recMapSetStoreValue(p, a) }
   -1
 }
 
-// The right side of the assignment `a` whose target is the index `p`; -1 when it is not one.
-function recMapIndexStoreValue(p: i32, a: i32): i32 {
+// The right side of the assignment `a` whose target is `p`: an index, or with `fld` a field;
+// -1 when it is not one.
+function recMapIndexStoreValue(p: i32, a: i32, fld: boolean): i32 {
   const an = nodeAt(a)
-  if nodeAt(p) is Index && an is BinExpr { return an.binRight }
+  const pn = nodeAt(p)
+  const target = if fld { pn is Member } else { pn is Index }
+  if target && an is BinExpr { return an.binRight }
   -1
 }
 
@@ -2346,20 +2354,142 @@ function recMapSetStoreValue(p: i32, a: i32): i32 {
 }
 
 // Build the container binding `md`'s values (`recStoreDeclOf`) where every stored value a kept
-// delivery builds is built, and refuse each one not built there, or every one when they land apart.
+// delivery builds is built, a record's field by field, and refuse each one not built there, or
+// every one when they land apart.
 export function recStoresAgree(md: i32) {
   const vs = recStoredValues(md)
-  for v in vs { recBuildPush(md, nodeTyIxOf(v), recMapStoreKeptDst(v), true) }
+  const own = recStoreRecTy(md)
+  if own < 0 {
+    for v in vs { recBuildPush(md, nodeTyIxOf(v), recMapStoreKeptDst(v), true) }
+  } else {
+    recBuildPush(md, own, recFieldsBuiltTy(own, vs), false)
+  }
   const bt = recBuildPassAt(md)
   for v in vs {
     const kd = recMapStoreKeptDst(v)
-    const at = if bt >= 0 { bt } else { kd }
+    const st = if own < 0 { bt } else { recFieldRebuiltTy(own, bt, recStoreFieldOf(v)) }
+    const at = if st >= 0 { st } else { kd }
     const lit = nodeAt(v) is ObjLit
-    const built = bt >= 0
-      && (lit || (kd >= 0 && fieldStorageEq(kd, bt, REC_STORE_DEPTH)))
+    const built = st >= 0
+      && (lit || (kd >= 0 && fieldStorageEq(kd, st, REC_STORE_DEPTH)))
     if !built && at >= 0 { recRefuseAtOwnRow(v, nodeTyIxOf(v), at) }
   }
   0
+}
+
+// The record type of the object literal the container binding `md` holds, else -1.
+function recStoreRecTy(md: i32): i32 {
+  const dn = nodeAt(md)
+  if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
+  const v = cwPeelValue(dn.letInit)
+  if v < 0 || !(nodeAt(v) is ObjLit) { return -1 }
+  const t = nodeTyIxOf(v)
+  if t >= 0 && tyAt(t) is TyObj { t } else { -1 }
+}
+
+// The record `own` with each field a stored value in `vs` is built at elsewhere retyped to that
+// build; -1 where none is, or two values of one field are built at different storages.
+function recFieldsBuiltTy(own: i32, vs: i32[]): i32 {
+  const ot = tyAt(own)
+  if !(ot is TyObj) { return -1 }
+  const tys: i32[] = []
+  for f in ot.objFieldTypes { tys.push(f) }
+  let moved = false
+  for v in vs {
+    const kd = recMapStoreKeptDst(v)
+    const name = recStoreFieldOf(v)
+    let i = ot.objFieldNames.length - 1
+    while i >= 0 && ot.objFieldNames[i] != name { i = i - 1 }
+    if kd >= 0 && i >= 0 {
+      const was = tys[i] != ot.objFieldTypes[i]
+      if was && !fieldStorageEq(tys[i], kd, REC_STORE_DEPTH) { return -1 }
+      tys[i] = kd
+      moved = true
+    }
+  }
+  if moved { mkObjTy(ot.objFieldNames, tys) } else { -1 }
+}
+
+// Field `name` of the build `bt` of the record `own`, where it stores differently from `own`'s;
+// else -1.
+function recFieldRebuiltTy(own: i32, bt: i32, name: string): i32 {
+  if bt < 0 || own < 0 || name == "" { return -1 }
+  const btT = tyAt(bt)
+  const ownT = tyAt(own)
+  if !(btT is TyObj) || !(ownT is TyObj) { return -1 }
+  const f = objFieldType(btT, name)
+  const o = objFieldType(ownT, name)
+  if f < 0 || o < 0 || fieldStorageEq(f, o, REC_STORE_DEPTH) { -1 } else { f }
+}
+
+// The field the value `v` is stored into: its name in an object literal, or `w.name = v`; else "".
+function recStoreFieldOf(v: i32): string {
+  if v < 0 || v >= cwIxUp.length { return "" }
+  const a = cwIxUp[v]
+  if a < 0 || a >= P.nodes.length { return "" }
+  if cwIxUpKind[v] == CW_UP_FIELD {
+    const fi = nodeAt(cwIxUpAux[v])
+    return if fi is FieldInit { fi.fiName } else { "" }
+  }
+  const an = nodeAt(a)
+  if an is BinExpr && an.binRight == v {
+    const l = nodeAt(an.binLeft)
+    if l is Member { return l.memProp }
+  }
+  ""
+}
+
+// Refuse the own-storage delivery `u` of a container its stores build (`recStoresAgree`), or of
+// a value read out of one, where the build stores a field differently from `u`'s own type.
+export function recBuiltReadRefuse(u: i32) {
+  const p = cwPeelValue(u)
+  if p < 0 || p >= P.nodes.length { return 0 }
+  const own = nodeTyIxOf(p)
+  const et = recBuiltElemOf(p)
+  if et >= 0 && own >= 0 {
+    const ot = tyAt(own)
+    const oe = if ot is TyArray { ot.aElem } else if ot is TyMap { ot.mVal } else { -1 }
+    if oe >= 0 { recRefuseAtOwnRow(p, nonNullTy(oe), et) }
+    return 0
+  }
+  const bt = recBuiltReadTy(p)
+  if bt < 0 || own < 0 { return 0 }
+  if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
+    recRefuseAtOwnRow(p, nonNullTy(own), nonNullTy(bt))
+  }
+  0
+}
+
+// The element record the stores into the list or map binding `x` names build, else -1.
+function recBuiltElemOf(x: i32): i32 {
+  const d = recHeldDecl(x)
+  if d < 0 || !recBuildHoldsElems(d) { -1 } else { recBuildPassAt(d) }
+}
+
+// The record a container's build gives the read `x`: an element by index or `.get`, a field of
+// one, or a record binding's own build; else -1.
+function recBuiltReadTy(x: i32): i32 {
+  const n = nodeAt(x)
+  if n is BinExpr {
+    return if n.binOp == "??" { recBuiltReadTy(cwPeelValue(n.binLeft)) } else { -1 }
+  }
+  if n is Index { return recBuiltElemOf(cwPeelValue(n.idxArr)) }
+  if n is Call {
+    if n.callArgs.length != 1 || n.callFn < 0 { return -1 }
+    const f = nodeAt(n.callFn)
+    if f is Member && f.memProp == "get" {
+      return recBuiltElemOf(cwPeelValue(f.memObj))
+    }
+    return -1
+  }
+  if n is Member {
+    const o = recBuiltReadTy(cwPeelValue(n.memObj))
+    if o < 0 { return -1 }
+    const ot = tyAt(nonNullTy(o))
+    return if ot is TyObj { objFieldType(ot, n.memProp) } else { -1 }
+  }
+  const d = recHeldDecl(x)
+  if d < 0 || recBuildHoldsElems(d) { -1 } else { recBuildPassAt(d) }
 }
 
 // The storage a kept delivery builds the stored value `v` at, else -1.
@@ -2372,19 +2502,28 @@ function recMapStoreKeptDst(v: i32): i32 {
 }
 
 // The un-annotated container binding the value `v` is stored into: a `Map()` by `m[k] = v` or
-// `m.set(k, v)`, or a list literal's binding by being its element or by `xs[i] = v`; else -1.
+// `m.set(k, v)`, a list literal's binding by being its element or by `xs[i] = v`, or a record
+// literal's by being a field's value or by `w.f = v`; else -1.
 export function recStoreDeclOf(v: i32): i32 {
   if v < 0 || v >= cwIxUp.length { return -1 }
   const a = cwIxUp[v]
   if a < 0 || a >= P.nodes.length { return -1 }
   const an = nodeAt(a)
-  if an is ArrayLit { return recListLitDeclOf(a) }
+  if an is ArrayLit || (an is ObjLit && cwIxUpKind[v] == CW_UP_FIELD) {
+    return recLitDeclOf(a)
+  }
   let recv = -1
   let set = false
+  let fld = false
   if an is BinExpr {
     if an.binOp == "=" && an.binCompound == "" && an.binRight == v {
       const l = nodeAt(an.binLeft)
-      if l is Index { recv = l.idxArr }
+      if l is Index {
+        recv = l.idxArr
+      } else if l is Member {
+        recv = l.memObj
+        fld = true
+      }
     }
   } else if an is Call {
     if an.callArgs.length == 2 && an.callArgs[1] == v && an.callFn >= 0 {
@@ -2396,22 +2535,24 @@ export function recStoreDeclOf(v: i32): i32 {
     }
   }
   if recv < 0 { return -1 }
-  const d = recFreshMapDeclOf(recv)
+  const d = if fld { -1 } else { recFreshMapDeclOf(recv) }
   if d >= 0 {
     const dn = nodeAt(d)
     return if dn is LetDecl && dn.letType < 0 { d } else { -1 }
   }
   const hl = recHeldLit(recv)
   if set || hl < 0 { return -1 }
-  recListLitDeclOf(cwPeelValue(hl))
+  const lit = cwPeelValue(hl)
+  if lit < 0 || (nodeAt(lit) is ObjLit) != fld { return -1 }
+  recLitDeclOf(lit)
 }
 
-// The un-annotated binding the list literal `a` initializes, else -1.
-function recListLitDeclOf(a: i32): i32 {
+// The un-annotated binding the list or record literal `a` initializes, else -1.
+function recLitDeclOf(a: i32): i32 {
   if a < 0 || a >= cwIxUpKind.length || cwIxUpKind[a] != CW_UP_LETINIT {
     return -1
   }
-  if !(nodeAt(a) is ArrayLit) { return -1 }
+  if !(nodeAt(a) is ArrayLit || nodeAt(a) is ObjLit) { return -1 }
   const d = cwIxUp[a]
   if d < 0 || d >= P.nodes.length { return -1 }
   const dn = nodeAt(d)
@@ -2426,6 +2567,11 @@ function recStoredValues(d: i32): i32[] {
     const a = nodeAt(cwPeelValue(dn.letInit))
     if a is ArrayLit {
       for e in a.arrElems { out.push(e) }
+    } else if a is ObjLit {
+      for fi in a.objFields {
+        const fn = nodeAt(fi)
+        if fn is FieldInit { out.push(fn.fiValue) }
+      }
     }
   }
   out
