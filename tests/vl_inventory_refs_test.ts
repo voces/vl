@@ -55,14 +55,15 @@ const SCAN_EXT = /\.(md|vl|ts|py|sh|rs|yml)$/;
 // THE SUFFIX IS PART OF THE ID. `### D1009-N` and `### D1009` are two rows, and reading the
 // first as `D1009` reported a duplicate that does not exist — the same widening
 // the witness grader's row heading needed, for the same reason.
-const HEAD = /^#{2,4}\s+(D\d{1,4}(?:-?[A-Za-z][A-Za-z0-9]*)?)\b/;
-// A cited id. Word-bounded on both sides so `D1042` matches and `AD10`, `D1042x` do not.
-const CITE = /(?<![A-Za-z0-9_])D(\d{1,4})(?![0-9A-Za-z_])/g;
+const HEAD = /^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?)\b/;
+// A cited id, of any digit count (ids are five digits now). Word-bounded on both
+// sides so `D1042` matches and `AD10`, `D1042x` do not.
+const CITE = /(?<![A-Za-z0-9_])D(\d+)(?![0-9A-Za-z_])/g;
 // An id deliberately mentioned before its row exists — the D1230 citations landed one PR
 // ahead of the row. Scoped to the file that carries it, and it must be REMOVED when the row
 // lands: a marker naming an existing row fails below, so this cannot rot into a permanent
 // exemption the way a bare allowlist does.
-const UNFILED_MARK = /unfiled:\s*(D\d{1,4})/g;
+const UNFILED_MARK = /unfiled:\s*(D\d+)/g;
 
 // NOT ROW IDS AT ALL — and that is now the ONLY reason an entry may be here. This list
 // landed holding nine: three numbers that were never row ids, and six ids that shipped work
