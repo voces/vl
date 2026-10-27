@@ -1201,12 +1201,12 @@ export function externRetAt(k: i32): string {
   extRets[k]
 }
 
-// True when link row `k` is a result-less import: declared `: void`, or declared with no
-// return type (refused by the checker, and lowered the same way so the refusal stays the only
-// diagnostic). False for `-1`, so a caller may pass `externLinkOf`'s miss straight in.
+// True when link row `k` is a result-less import: declared `: void` or `: never`, or declared
+// with no return type (refused by the checker, and lowered the same way so the refusal stays the
+// only diagnostic). False for `-1`, so a caller may pass `externLinkOf`'s miss straight in.
 export function externRetIsVoid(k: i32): boolean {
   if k < 0 || k >= extRets.length { return false }
-  extRets[k] == "" || extRets[k] == "void"
+  extRets[k] == "" || extRets[k] == "void" || extRets[k] == "never"
 }
 
 // The parameter count of link row `k`, or -1 out of range — which every caller treats as
@@ -3223,10 +3223,10 @@ export function i32ToStr(n: i32) {
   out
 }
 
-// True if control never falls out of statement `ix` to its next sibling: the one rule the
-// checker's narrowing and definite assignment, the emitter and the lint share (D1970). A block
-// exits once any statement does; an `if` needs an `else` and both arms exiting; a `match`, every
-// arm; a call, when its type is `never` (D1972). A loop never does: a `break` leaves only the loop.
+// True if control never falls out of statement `ix`: the one rule narrowing, definite assignment,
+// return totality, the emitter and the lint share. A block exits once any statement does; an `if`
+// needs an `else` and both arms exiting; a `match`, every arm; a call, when its type is `never`;
+// a `while true` or a labelled block, when no `break` leaves it.
 export function stmtAlwaysExits(ix: i32): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   const s = nodeAt(ix)
@@ -3238,6 +3238,14 @@ export function stmtAlwaysExits(ix: i32): boolean {
     return true
   } else if s is ContinueStmt {
     return true
+  } else if s is WhileStmt {
+    // A labelled block is left by its name alone; its body's bare `break` leaves an outer loop.
+    if s.whileBlk == 1 {
+      return stmtAlwaysExits(s.whileBody)
+        && !breakLeaves(s.whileBody, s.whileLabel, false)
+    }
+    return condLitTrue(s.whileCond)
+      && !breakLeaves(s.whileBody, s.whileLabel, true)
   } else if s is Block {
     const st = s.blkStmts
     let i = 0
@@ -3278,6 +3286,52 @@ export function stmtAlwaysExits(ix: i32): boolean {
     }
     return true
   }
+  false
+}
+
+// Whether a `break` under `root` leaves the loop or labelled block whose body it is: a
+// `break @label`, or with `bare`, a bare one outside any nested loop. A function is a boundary.
+export function breakLeaves(root: i32, label: string, bare: boolean): boolean {
+  const todo: i32[] = [root]
+  const inLoop: boolean[] = [false]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    const nested = inLoop.pop() ?? true
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is BreakStmt {
+        if n.brkLabel == "" {
+          if bare && !nested { return true }
+        } else if n.brkLabel == label {
+          return true
+        }
+      }
+      if !(n is FuncDecl) {
+        let inner = nested || n is ForRange || n is ForIn
+        if n is WhileStmt { inner = inner || n.whileBlk == 0 }
+        const kids = nodeChildren(ix)
+        let i = 0
+        while i < kids.length {
+          todo.push(kids[i])
+          inLoop.push(inner)
+          i = i + 1
+        }
+      }
+    }
+  }
+  false
+}
+
+// Whether the condition at `ix` is the literal `true` (through parentheses).
+export function condLitTrue(ix: i32): boolean {
+  let c = ix
+  while c >= 0 && nodeAt(c) is Paren {
+    const pn = nodeAt(c)
+    if pn is Paren { c = pn.parInner }
+  }
+  if c < 0 { return false }
+  const b = nodeAt(c)
+  if b is BoolLit { return b.boolVal == 1 }
   false
 }
 

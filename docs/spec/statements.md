@@ -653,10 +653,11 @@ function f(): i32 {
 print(f())   // prints 1
 ```
 
-**S8.2** A call to `__trap__()`, or to a function whose declared return type is `never`,
-ends its path. Code after it is unreachable, and a path that ends in it needs no `return`.
-`never` is legal only as a function's declared return type, and a `never` function must end
-every path in such a call.
+**S8.2** A call to `__trap__()`, or to a function whose result is `never` (a declaration, an
+`extern function` or a function-typed value), ends its path, and so does a `while true` that no
+`break` leaves. Code after it is unreachable, and a path that ends in it needs no `return`.
+`never` is legal only as a result (T1.5), and a `never` function must end every path in such
+a call or loop.
 
 ```vl
 function fail(msg: string): never { __trap__(msg) }
