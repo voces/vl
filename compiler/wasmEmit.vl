@@ -41,6 +41,7 @@ import {
   condProvenTrue,
   mapUnboxTyOf,
   narListReadsDecl,
+  recCopyTyOf,
 } from "./check_core_state"
 import {
   nodeTyProvesNonNull,
@@ -778,6 +779,7 @@ import {
   sFieldRowTyAt,
   sFieldTgtStructIdx,
   sFieldTypeAt,
+  structIndexOfTy,
   uFieldElemTyIxAt,
   variantFieldElemName,
   variantFieldIsLitUnion,
@@ -2905,47 +2907,160 @@ function emitStructExprAsVariantBox(
   // boundary — so neither hands one on unchecked.
   if guardVariantFieldSpan(vi, "emitStructExprAsVariantBox") < 0 { return -1 }
   if vi < 0 { return -1 }
-  const cnt = uFieldCount[vi]
-  // a re-readable source (or a single-field variant) re-emits the source once per field; a
-  // non-re-readable multi-field source (a call) must instead stash into `variantReboxSlot`.
-  const reReadable = cnt == 1 || exprReReadable(unwrapParen(exprIx))
+  const names: string[] = []
+  const codes: i32[] = []
+  variantRowFields(vi, names, codes)
+  fbI32Rel(RS_TAG, uTags[vi])
+  if emitRecCopy(body, exprIx, ssi, uVarHeap[vi], names, codes, fnIx, ec) < 0 {
+    return -1
+  }
+  fbStructNew(uBoxIdx)
+  0
+}
+
+// The node `emitRecCopy` is reading its fields from, so the re-entry emits the record itself.
+let recCopyHeld = -1
+
+// A fresh record at the heap `dHeap`, whose fields are `dNames` stored as `dCodes`, built from
+// the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
+// (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`.
+function emitRecCopy(
+  body: u8[],
+  exprIx: i32,
+  ssi: i32,
+  dHeap: i32,
+  dNames: string[],
+  dCodes: i32[],
+  fnIx: i32,
+  ec: ExpCtx,
+): i32 {
+  const held = recCopyHeld
+  recCopyHeld = exprIx
+  const r = emitRecCopyFields(body, exprIx, ssi, dNames, dCodes, fnIx, ec)
+  recCopyHeld = held
+  if r < 0 { return -1 }
+  fbStructNew(dHeap)
+  0
+}
+
+// `emitRecCopy`'s field loop, with `exprIx` held so each read emits the record itself.
+function emitRecCopyFields(
+  body: u8[],
+  exprIx: i32,
+  ssi: i32,
+  dNames: string[],
+  dCodes: i32[],
+  fnIx: i32,
+  ec: ExpCtx,
+): i32 {
+  if ssi < 0 || ssi >= sHeapIdx.length {
+    return emitFailAt(
+      "emitProgram: a record copied at its delivery has no row",
+      exprIx,
+    )
+  }
+  const sHeap = sHeapIdx[ssi]
+  const reReadable = dNames.length == 1 || exprReReadable(unwrapParen(exprIx))
   if !reReadable {
     if !fnUsesVariantRebox {
       return emitFail(
-        "emitProgram: a multi-field struct value from a call cannot be boxed into a variant-box union (rebox scratch slot unreserved)",
+        "emitProgram: a multi-field record from a call is copied with no scratch slot reserved",
       )
     }
     if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
     fbLocalSet(variantReboxSlot)
   }
-  fbI32Rel(RS_TAG, uTags[vi])
-  const start = uFieldStart[vi]
   let fj = 0
-  while fj < cnt {
-    const sfi = sFieldIndex(ssi, uFieldNames[start + fj])
+  while fj < dNames.length {
+    const sfi = sFieldIndex(ssi, dNames[fj])
     if sfi < 0 {
-      return emitFail(
-        "emitProgram: struct value is missing a union-variant field",
+      return emitFailAt(
+        "emitProgram: a copied record lacks a field of its destination",
+        exprIx,
       )
     }
-    if ssi < 0 { return -1 }
     if reReadable {
       if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
     } else {
       fbLocalGet(variantReboxSlot)
-      fbRefCast(sHeapIdx[ssi])
+      fbRefCast(sHeap)
     }
-    fbStructGet(sHeapIdx[ssi], sfi)
-    // A field stored as a narrower number than the arm's is converted (`i32` into `f64`).
+    fbStructGet(sHeap, sfi)
     const sk = fieldCodeNumKind(sFieldTypeAt(ssi, sfi))
-    const vk = fieldCodeNumKind(uFieldTypes[start + fj])
+    const vk = fieldCodeNumKind(dCodes[fj])
     if sk >= 0 && vk >= 0 && sk != vk {
       if njConvert(sk, vk) < 0 { return -1 }
     }
     fj = fj + 1
   }
-  fbStructNew(uVarHeap[vi])
-  fbStructNew(uBoxIdx)
+  0
+}
+
+// The row a delivery of `exprIx` copies its record into (`recCopyTyOf`): a struct row, `-2 - vi`
+// for the variant row `vi` of an arm type, or -1 when the record is already built there or no
+// copy is recorded.
+function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
+  const dst = recCopyTyOf(exprIx)
+  if dst < 0 || exprIx == recCopyHeld || !exprStruct(exprIx, fnIx) { return -1 }
+  const ssi = structIndexOfExpr(exprIx, fnIx)
+  if ssi < 0 || ssi >= sHeapIdx.length { return -1 }
+  const vi = variantRowOfTy(dst)
+  if vi >= 0 && vi < uVarHeap.length {
+    if uVarHeap[vi] == sHeapIdx[ssi] { return -1 }
+    return -2 - vi
+  }
+  const dsi = structIndexOfTy(dst)
+  if dsi < 0 || dsi >= sHeapIdx.length || sHeapIdx[dsi] == sHeapIdx[ssi] {
+    return -1
+  }
+  dsi
+}
+
+// `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`).
+function emitRecCopyInto(
+  body: u8[],
+  exprIx: i32,
+  row: i32,
+  fnIx: i32,
+  ec: ExpCtx,
+): i32 {
+  const names: string[] = []
+  const codes: i32[] = []
+  const ssi = structIndexOfExpr(exprIx, fnIx)
+  if row <= -2 {
+    const vi = -2 - row
+    if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
+    variantRowFields(vi, names, codes)
+    return emitRecCopy(body, exprIx, ssi, uVarHeap[vi], names, codes, fnIx, ec)
+  }
+  if (
+    row < 0
+    || row >= sHeapIdx.length
+    || row >= sFieldCount.length
+    || row >= sFieldStart.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a record copied at its delivery has no row",
+      exprIx,
+    )
+  }
+  let fj = 0
+  while fj < sFieldCount[row] {
+    names.push(sFieldNames[sFieldStart[row] + fj])
+    codes.push(sFieldTypeAt(row, fj))
+    fj = fj + 1
+  }
+  emitRecCopy(body, exprIx, ssi, sHeapIdx[row], names, codes, fnIx, ec)
+}
+
+// Pushes variant row `vi`'s field names and codes onto `names` and `codes`, in layout order.
+function variantRowFields(vi: i32, names: string[], codes: i32[]) {
+  let fj = 0
+  while fj < uFieldCount[vi] {
+    names.push(uFieldNames[uFieldStart[vi] + fj])
+    codes.push(uFieldTypes[uFieldStart[vi] + fj])
+    fj = fj + 1
+  }
   0
 }
 
@@ -20617,6 +20732,8 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
       return emitMapRetag(body, exprIx, rtFrom, rtTo, wtFrom, wtTo, fnIx, ec)
     }
   }
+  const rcRow = recCopyRowAt(exprIx, fnIx)
+  if rcRow != -1 { return emitRecCopyInto(body, exprIx, rcRow, fnIx, ec) }
   // The context the nearest enclosing boundary applied, handed to every consumer below.
   const ctx = ec
   // A string-repped literal union reaching an atom-typed destination narrows to its
@@ -34564,6 +34681,7 @@ export function wasmEmitStateReset() {
   lmaValArg = -1
   lmaValNode = -1
   mapUnboxHeld = -1
+  recCopyHeld = -1
   mfSrcSlot = -1
   mfSvDst = -1
   negGuardCond = -1
