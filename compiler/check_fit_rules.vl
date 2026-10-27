@@ -66,6 +66,7 @@ import {
 } from "./check_bind_rows"
 import { nodeLineOf } from "./check_capture_loss"
 import {
+  ambientCtorCalls,
   apartHoleJoins,
   checkerForceFn,
   cohKeys,
@@ -78,6 +79,7 @@ import {
   inferObservedSet,
   mapUnboxTyIx,
   nodeRepTyIx,
+  setCtorKeys,
 } from "./check_core_state"
 import {
   rcwIsRefTy,
@@ -1766,9 +1768,9 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   true
 }
 
-// What an inferred function `fd` returns when `call` is its one call site, each a literal or
-// the binding read that last reached it (`recFnValueOrigins`), so each is built at
-// `call`'s destination; empty when some value is neither.
+// What an inferred function `fd` returns when `call` is its one call site, each a fresh literal
+// (`freshLitValue`) or the binding read that last reached it (`recFnValueOrigins`), so each is
+// built at `call`'s destination; empty when some value is neither.
 function recReturnedOrigins(fd: i32, call: i32): i32[] {
   const out: i32[] = []
   cwIxBuild()
@@ -1782,9 +1784,8 @@ function recReturnedOrigins(fd: i32, call: i32): i32[] {
   while i < origins.length {
     const o = origins[i]
     if o < 0 { return [] }
-    const n = nodeAt(o)
     if via[i] >= 0 { out.push(via[i]) }
-    else if n is Ident || n is ArrayLit || n is ObjLit { out.push(o) }
+    else if nodeAt(o) is Ident || freshLitValue(o) { out.push(o) }
     else { return [] }
     i = i + 1
   }
@@ -4249,8 +4250,8 @@ function holeOutsideFn(t: i32, depth: i32): boolean {
   false
 }
 
-// Whether a record, list or `null` literal `x` of another type meets a destination `dstTy`
-// holding a record through nullables, or any list: a fresh literal is stored as its destination
+// Whether a fresh value `x` (`freshLitValue`) of another type meets a destination `dstTy`
+// holding a record through nullables, a map it is, or any list: it is stored as its destination
 // (D3339). A type parameter, or a hole outside the literal's function, stays open; an anonymous
 // destination of the literal's own shape is already its storage, so it is not stamped.
 export function litAtDstStorage(x: i32, dstTy: i32): boolean {
@@ -4278,8 +4279,12 @@ export function litAtDstStorage(x: i32, dstTy: i32): boolean {
         viaList = true
         t = d.aElem
       }
+      // a fresh map is built as the map it meets
+      TyMap => {
+        return viaList || (own >= 0 && tyAt(own) is TyMap)
+      }
       // a list of any other element is built at its destination's element storage
-      TyPrim | TyUnion | TyMap | TyLit => {
+      TyPrim | TyUnion | TyLit => {
         return viaList
       }
       // no other type is a storage a literal is built at
@@ -4292,15 +4297,40 @@ export function litAtDstStorage(x: i32, dstTy: i32): boolean {
   false
 }
 
-// Whether `x`, past parentheses, is a record, list or `null` literal, or a value `if`, `match` or
+// Whether `x`, past parentheses, is a fresh value (`freshLitValue`), or a value `if`, `match` or
 // block one of whose arms is: the sources a rep stamp can adopt.
 export function repStampableLit(x: i32): boolean {
   const leaves = if valueJoinAt(x) < 0 { [parenPeelIx(x)] } else { valueTailLeaves(x) }
   for l in leaves {
-    const n = nodeAt(l)
-    if n is ObjLit || n is ArrayLit || n is NullLit { return true }
+    if freshLitValue(l) && !freshSetCall(l) { return true }
   }
   false
+}
+
+// Whether node `x` evaluates to a fresh, un-aliased value, so it may be built as its
+// destination (D3339): a record, list or `null` literal, or a call the checker resolved to the
+// ambient `Map` or `Set` constructor. A user's own `Map` is not one.
+export function freshLitValue(x: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  n is ObjLit || n is ArrayLit || n is NullLit || ambientCtorCalls.has(x)
+}
+
+// Whether node `x` is a call the checker resolved to the ambient `Set` constructor.
+function freshSetCall(x: i32): boolean { ambientCtorCalls[x] ?? false }
+
+// Records `key` as the element a `Set()` call `ix` whose own element is still a hole is built
+// with, outside an elaboration; 0. A Set is not stamped whole (D14228).
+function setCtorKeyNote(ix: i32, key: i32): i32 {
+  if elabCapLive() || key < 0 || key >= T.tys.length || tyAt(key) is TyVar {
+    return 0
+  }
+  const own = nodeTyIxOf(ix)
+  const ot = if own >= 0 && own < T.tys.length { T.tys[own] } else { null }
+  if ot is TyMap && (ot.mKey < 0 || tyAt(ot.mKey) is TyVar) {
+    setCtorKeys[ix] = key
+  }
+  0
 }
 
 // Records `t` as the type node `ix` is built at, in the elaboration in progress when one is
@@ -4517,8 +4547,14 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       }
       return any
     }
+    // A fresh `Map()` or `Set()` is built as the map it is delivered to.
+    Call => {
+      if !(d is TyMap) || !freshLitValue(srcExpr) { return 0 }
+      if freshSetCall(srcExpr) { return setCtorKeyNote(srcExpr, d.mKey) }
+      return repStamp(srcExpr, dtix)
+    }
     // no other source is a literal shape to stamp
-    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {}
+    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | BinExpr | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {}
   }
   0
 }
