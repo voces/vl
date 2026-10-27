@@ -815,6 +815,27 @@ const CASES: Case[] = [
       'import { be, qe } from "./lib"\nfunction ue(): i32 {\n  if be.w != null {\n    qe()\n    const ke: i32 = be.w\n    return ke\n  }\n  return 0\n}\nprint(ue())\n',
   },
   {
+    name: "a callee's write moves onto a list cell main narrowed",
+    want: "decline",
+    why: "interface",
+    from: "bh[0] = 1",
+    to: "bk[0] = null",
+    libUses:
+      "export let bk: (i32 | null)[] = [1]\nconst bh: {[i32]: i32} = Map()\nexport function qk(): void { bh[0] = 1 }\n",
+    uses:
+      'import { bk, qk } from "./lib"\nif bk[0] != null {\n  qk()\n  const kk: i32 = bk[0]\n  print(kk)\n}\n',
+  },
+  {
+    name: "a callee's write moves between tables no served narrowing tests",
+    want: "serve",
+    from: "tb[1] = 1",
+    to: "tc.push(1)",
+    libUses:
+      "export let bt: { w: i32 | null } = { w: 1 }\nconst tb: {[i32]: i32} = Map()\nconst tc: i32[] = []\nexport function qt(): void { tb[1] = 1 }\n",
+    uses:
+      'import { bt, qt } from "./lib"\nif bt.w != null {\n  qt()\n  const kt: i32 = bt.w\n  print(kt)\n}\n',
+  },
+  {
     name: "a callee's argument write moves to the narrowed field",
     want: "decline",
     why: "ambient",

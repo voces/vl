@@ -21,10 +21,13 @@ import {
   CR_ASK_EFFECTS,
   CR_ASK_FREE,
   CR_ASK_ONLY_CALLED,
+  CR_ASK_SHAPES,
   crAliasWr,
   crAskDecl,
+  crAskOn,
   crAskPop,
   crAskPush,
+  crAskUse,
   crOpCall,
   crRdIx,
   crRdRet,
@@ -95,8 +98,14 @@ export function isIdentNamed(ix: i32, name: string): boolean {
 }
 
 // The answer to a banked write question (`crAskQs`) about the declaration `d`: a verdict
-// ("y"/"n", "?" opaque, "@" or "-" a set that does or does not call a parameter), then the set.
-export function crAskAnswer(kind: i32, d: i32, p: i32): string[] {
+// ("y"/"n", "?" opaque, "@" or "-" a set that does or does not call a parameter), then the
+// parts of the set some narrowing test in `uses` (`crAskUses`) could hit.
+export function crAskAnswer(
+  kind: i32,
+  d: i32,
+  p: i32,
+  uses: {[string]: boolean},
+): string[] {
   if kind == CR_ASK_ONLY_CALLED {
     if crParamOnlyCalled(d, p) { return ["y"] }
     return ["n"]
@@ -105,8 +114,93 @@ export function crAskAnswer(kind: i32, d: i32, p: i32): string[] {
   if s.opaque { return ["?"] }
   const out = ["-"]
   if s.at { out[0] = "@" }
-  for id in s.parts { out.push(crAskPartText(wePartTextOf(id))) }
+  for id in s.parts {
+    const w = crAskPartText(wePartTextOf(id))
+    if crAskPartUsed(kind, w, uses) { out.push(w) }
+  }
   out
+}
+
+// Record that a narrowing of the place keyed `key` tested a call's write shapes: its root, and
+// each step under the kind of cell it reads (`a` list, `m` map, "" either), as `shapesHitKey`
+// matches them; a subscript step also under "[".
+export function crAskUseShape(key: string, steps: string[], tags: string[]) {
+  if !crAskOn { return 0 }
+  crAskUse("r" + placeRootOf(key))
+  let s = 0
+  while s < steps.length {
+    const st = steps[s]
+    let k = ""
+    if s < tags.length && tags[s].length > 1 { k = tags[s].slice(1, 2) }
+    crAskUse("s" + st + "\t" + k)
+    if st.length > 0 && st[0] == '[' { crAskUse("s[\t" + k) }
+    s = s + 1
+  }
+  0
+}
+
+// Record a narrowing test of a call's write paths against the place key or sub-path `p`: every
+// run of its steps, since a summary's part may be handed on under a prefix (`a.` + part).
+export function crAskUsePath(p: string) {
+  if !crAskOn { return 0 }
+  const cuts: i32[] = [0]
+  let i = 1
+  while i < p.length {
+    if p[i] == '.' || p[i] == '[' { cuts.push(i) }
+    i = i + 1
+  }
+  cuts.push(p.length)
+  let a = 0
+  while a + 1 < cuts.length {
+    let from = cuts[a]
+    if from < p.length && p[from] == '.' { from = from + 1 }
+    let b = a + 1
+    while b < cuts.length {
+      crAskUse("p" + p.slice(from, cuts[b]))
+      b = b + 1
+    }
+    a = a + 1
+  }
+  0
+}
+
+// Whether the spelled part `w` of a `kind` summary could hit a test recorded in `uses`.
+function crAskPartUsed(
+  kind: i32,
+  w: string,
+  uses: {[string]: boolean},
+): boolean {
+  if w.length == 0 || w[0] == '@' { return true }
+  if kind != CR_ASK_SHAPES { return uses.has("p" + w) }
+  if w[0] == '=' { return uses.has("r" + w.slice(1, w.length)) }
+  const appends = w[0] == '+'
+  let s = w
+  if appends || w[0] == '-' { s = s.slice(1, s.length) }
+  let k = ""
+  let h = s.length - 2
+  while h >= 0 && !(s[h] == ']' && s[h + 1] == '#') { h = h - 1 }
+  if h >= 0 {
+    if h + 3 <= s.length { k = s.slice(h + 2, h + 3) }
+    s = s.slice(0, h + 1)
+  }
+  if appends { return crAskStepUsed(LIST_EVERY_STEP, k, uses) }
+  if crAskStepUsed(s, k, uses) { return true }
+  if s.length > 0 && s[0] == '[' && crAskStepUsed(LIST_EVERY_STEP, k, uses) {
+    return true
+  }
+  s == "[]" && crAskStepUsed("[", k, uses)
+}
+
+// Whether step `st` is recorded under a cell kind that may alias kind `k` ("" aliases any).
+function crAskStepUsed(
+  st: string,
+  k: string,
+  uses: {[string]: boolean},
+): boolean {
+  const pre = "s" + st + "\t"
+  if uses.has(pre) { return true }
+  if k != "" { return uses.has(pre + k) }
+  uses.has(pre + "a") || uses.has(pre + "m")
 }
 
 // A part's spelling with each cell tag's element type (`#a<T>`, `#m<V>`) spelled out.
