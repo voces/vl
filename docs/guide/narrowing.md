@@ -120,11 +120,14 @@ The one rule (`stmtAlwaysExits`) serves the post-guard narrowing, definite assig
 (`let y: i32; if c { y = 1 } else { fail("no") }; y + 1`), the unreachable-code lint and the
 emitter, which follows each such call with `unreachable` so it can stand in any value position.
 
-- `never` is spelled **only** as a function's declared return type. It has no values, so a
-  parameter, field or binding annotation of `never` is refused.
-- A `: never` body must end every path in another never-returning call; falling off the end, or a
-  `return` of anything else, is a check error (`fail` is declared `never` but can return). A `while true` body
-  does not count yet (D1973).
+- `never` is spelled **only** as a result: a function's or an `extern function`'s declared return
+  type, or a function type's (`onErr: (string) => never`). It has no values, so a parameter,
+  field or binding annotation of `never` is refused.
+- A path also ends at a `while true` that no `break` leaves, and after an `if` whose ELSE arm
+  ends, the code below reads the then arm's facts, as it reads the else arm's after a guard.
+- A `: never` body must end every path in another never-returning call or such a loop; falling
+  off the end, or a `return` of anything else, is a check error (`fail` is declared `never` but
+  can return).
 - **Inference never produces `never`.** A function that only traps but carries no annotation
   infers `void`, and a call to it does not end a path — the annotation is the contract. A
   never-returning tail contributes nothing to an inferred return, so
