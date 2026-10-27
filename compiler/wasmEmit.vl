@@ -69,6 +69,7 @@ import { covarRootFreshLocal, covarValueWriteState } from "./check_covar_write"
 import { EqCmpKind, eqCoreKindOfTyToken } from "./check_ty_relate"
 import {
   T,
+  TY_NULL,
   TyArray,
   TyLit,
   TyMap,
@@ -1224,6 +1225,8 @@ import {
   rlWidenAllowed,
   rlWidenVariantOf,
   tyAnnRefListKind,
+  tyIsRecordUnion,
+  tyRecordUnionSplit,
 } from "./emit_ref_list_kinds"
 import { internInlineShapeTy } from "./emit_shape_intern"
 import {
@@ -1510,12 +1513,14 @@ import {
   gHelpAsFail,
   gHelpInitFail,
   gInitAny,
+  gInitAt,
   gInitFnReach,
   gInitGIdx,
   gInitGLocs,
   gInitGNames,
   gInitGuard,
   gInitProgIdx,
+  gInitRank,
   gInitReaders,
   gInitStartOrd,
   globalStmtOrd,
@@ -12471,30 +12476,23 @@ function arrLitHoldsNulStr(elems: i32[], fnIx: i32): boolean {
 // Lower an array literal `[e, e, ...]` onto `body` as a growable list value: the elements in
 // source order, `array.new_fixed` for the backing, then `count` twice for len and cap and
 // `struct.new` for the wrapper; an empty `[]` shares its type's empty backing. Built at the
-// checker's type for it unless `arrKeepsThread` keeps the caller's pair; context restored on exit.
+// checker's type for it unless it has none or `unionListKeepsThread`; context restored on exit.
 function emitArr(body: u8[], arrIx: i32, fnIx: i32, ec: ExpCtx) {
   const saved = expCtxHere(ec)
   const ty = litRepTyAt(arrIx, fnIx)
   const tb = listBuildOfTy(ty)
-  const fam = arrKeepsThread(ty, tb, ec)
-  if fam == 0 && tb != null { expCtxSetListBuild(tb.lbKind, tb.lbSlot, ec) }
+  if tb != null && !unionListKeepsThread(ty, tb, ec) {
+    expCtxSetListBuild(tb.lbKind, tb.lbSlot, ec)
+  }
   elabSpreadNote(arrIx)
   const r = emitArrUnder(body, arrIx, fnIx, ec, ec)
   expCtxLeave(saved, r, ec)
 }
 
-// Which family keeps the caller's pair over a literal of type `ty` built as `tb`, 0 for none: 2
-// an untyped literal, 4 an unthreaded record-union list.
-function arrKeepsThread(ty: i32, tb: ListBuild | null, ec: ExpCtx): i32 {
-  if tb == null { return 2 }
-  if (
-    tb.lbKind == LBK_UNION
-    && ec.listKind == LBK_I32_LIST
-    && recordUnionList(ty)
-  ) {
-    return 4
-  }
-  0
+// Whether an unthreaded literal of type `ty`, built as `tb`, keeps the caller's pair: a union
+// list whose record members share one field-name set builds at its first element's row.
+function unionListKeepsThread(ty: i32, tb: ListBuild, ec: ExpCtx): boolean {
+  tb.lbKind == LBK_UNION && ec.listKind == LBK_I32_LIST && recordUnionList(ty)
 }
 
 // The ref-list row list literal `arrIx` builds at its checker type under `ec`, -1 where it
@@ -12503,22 +12501,17 @@ function arrLitRefSlotAtTy(arrIx: i32, fnIx: i32, ec: ExpCtx): i32 {
   if !(nodeAt(arrIx) is ArrayLit) { return -1 }
   const ty = litRepTyAt(arrIx, fnIx)
   const tb = listBuildOfTy(ty)
-  if tb == null || arrKeepsThread(ty, tb, ec) != 0 { return -1 }
+  if tb == null || unionListKeepsThread(ty, tb, ec) { return -1 }
   if tb.lbKind != LBK_REF && tb.lbKind != LBK_UNION { return -1 }
   tb.lbSlot
 }
 
-// Whether `t` is a list whose element is a union of records only.
+// Whether `t` is a list whose element is a union of records sharing one field-name set.
 function recordUnionList(t: i32): boolean {
   if t < 0 { return false }
   const l = tyAt(t)
   if !(l is TyArray) || l.aElem < 0 { return false }
-  const u = tyAt(l.aElem)
-  if !(u is TyUnion) { return false }
-  for m in u.uMembers {
-    if m < 0 || !(tyAt(m) is TyObj) { return false }
-  }
-  true
+  tyIsRecordUnion(l.aElem) && !tyRecordUnionSplit(l.aElem)
 }
 
 // The packed `u8[]` arm of `emitArrUnder`: each element as a plain i32 truncated into the
@@ -25732,6 +25725,7 @@ function emitCallCoreUserFn(
       const iiRc = emitIntIntr(body, callIx, fnIx, callee.identName, ec)
       if iiRc != NUM_INTR_NONE { return iiRc }
     }
+    if nodeTyAt(c.callFn, fnIx) == TY_NULL { return emitNullCalleeCall() }
     return emitFail("emitProgram: call to unknown function")
   }
   // A lambda-lifted function takes its captures as parameters (SP-037).
@@ -25928,6 +25922,13 @@ function emitCallCoreIdent(
   return emitCallCoreUserFn(body, callIx, c, callee, fnIx, ec)
 }
 
+// A call through a value this instance types `null` itself, which a guard leaves dead: the
+// stack-polymorphic `unreachable` stands in for its result (D3197).
+function emitNullCalleeCall(): i32 {
+  fbUnreachable()
+  0
+}
+
 // Node shapes read: Call { callFn: i32, callArgs: i32[] }, callee Ident { identName }.
 function emitCallCore(body: u8[], callIx: i32, fnIx: i32, ec: ExpCtx) {
   const c = nodeAt(callIx)
@@ -25961,6 +25962,7 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32, ec: ExpCtx) {
         callIx,
       )
     }
+    if nodeTyAt(c.callFn, fnIx) == TY_NULL { return emitNullCalleeCall() }
     return emitFail("emitProgram: callee is not a function name")
   }
   emitFail("emitProgram: expected a call expression")
@@ -35190,20 +35192,33 @@ function initFnReachOf(p: i32): i32 {
   best
 }
 
-// Whether a read (a write, when `write`) of guarded global `gi` at the cursor can run before its initializer: in the
-// start function, at or before the declaration's own position; in a function body, when top-level
-// code at or before that position can call it, or when no top-level code names it at all.
+// Whether a read (a write, when `write`) of guarded global `gi` at the cursor can run before it
+// holds its value: in the start function, at or before its declaration (the checker orders the
+// rest); in a function body, when top-level code at or before `gInitAt[gi]` can call it, or when
+// no top-level code names it at all.
 function initGuardNeeded(gi: i32, write: boolean): boolean {
   if !gInitAny || initGuardOff { return false }
   if gi < 0 || gi >= gInitGuard.length || gi >= globalStmtOrd.length {
     return false
   }
   if gInitGuard[gi] != 1 && !(write && gInitGuard[gi] == 2) { return false }
-  const at = globalStmtOrd[gi]
-  if gPromoInStart { return gInitStartOrd >= 0 && gInitStartOrd <= at }
-  if emitCurFnPos < 0 { return false }
+  // No initializer runs later to overwrite an early write.
+  const d = nodeAt(globalStmts[gi])
+  if d is LetDecl {
+    if write && d.letInit < 0 { return false }
+  }
+  if gPromoInStart {
+    return gInitStartOrd >= 0 && gInitStartOrd <= globalStmtOrd[gi]
+  }
+  if emitCurFnPos < 0 || gi >= gInitAt.length { return false }
   const r = initFnReachOf(emitCurFnPos)
-  r == INIT_REACH_NEVER || r <= at
+  r == INIT_REACH_NEVER || r <= gInitAt[gi]
+}
+
+// The value the progress cell holds once global `gi` has its value: one past its rank.
+export function initGuardValue(gi: i32): i32 {
+  if gi < 0 || gi >= gInitRank.length { return gi + 1 }
+  gInitRank[gi] + 1
 }
 
 // The source name of the function being lowered, for the guard's `via` clause: its declared
@@ -35294,7 +35309,7 @@ function emitInitGuard(gi: i32, verb: string) {
     return emitFail("emitProgram: read-before-init guard with no progress cell")
   }
   fbGlobalGet(gInitProgIdx)
-  fbI32RelOf(RS_GUARD, gi, gi + 1 + relSkew(RS_GUARD))
+  fbI32RelOf(RS_GUARD, gi, initGuardValue(gi) + relSkew(RS_GUARD))
   fbI32Bin(72)          // 0x48 i32.lt_s
   fbIf(64)              // 0x40 void
   fbI32RelOf(RS_GNAME, gi, initGuardGlobalRow(gi) + relSkew(RS_GNAME))
