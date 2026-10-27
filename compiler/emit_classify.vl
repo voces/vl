@@ -236,6 +236,7 @@ import {
   tySame,
   tyScalarBaseIs,
 } from "./check_types"
+import { cexLitPeel } from "./check_num_lits"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
 import { covarRootFrame, cwLambdaDeclOf } from "./check_write_scan"
 import {
@@ -3127,7 +3128,8 @@ function fnAssignRetTarget(fe: i32): i32 {
         }
         const a = nodeAt(unwrapParen(tailx))
         if a is BinExpr {
-          if a.binOp == "=" {
+          // A number literal's value is the literal itself (`asgLitWidth`), not the cell.
+          if a.binOp == "=" && cexLitPeel(a.binRight) < 0 {
             // A re-read narrowed to one member yields that member, not the cell.
             if asgReadNarrowTy(unwrapParen(tailx), fnStmts[fe]) >= 0 {
               return -1
@@ -4131,6 +4133,7 @@ export function asgReadNarrowTy(asgIx: i32, fnIx: i32): i32 {
 // the lowering re-reads, or its right side when that re-read is narrowed to the member the
 // right side has (`asgReadNarrows`).
 export function asgReadNode(asgIx: i32, fnIx: i32): i32 {
+  if asgLitWidth(asgIx, fnIx) != "" { return asgIx }
   const a = nodeAt(asgIx)
   if a is BinExpr {
     if asgReadNarrows(asgIx, fnIx) { return a.binRight }
@@ -4138,6 +4141,23 @@ export function asgReadNode(asgIx: i32, fnIx: i32): i32 {
     return a.binLeft
   }
   asgIx
+}
+
+// The width of the checker's type of assignment `asgIx` when its value is its right side's
+// number literal rather than a re-read of the cell: a name or closure-cell target that is not
+// the function's result cell, at a numeric type. The value is that literal, built where it is
+// read; else "".
+export function asgLitWidth(asgIx: i32, fnIx: i32): string {
+  if asgIx < 0 || asgIx >= P.nodes.length { return "" }
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return "" }
+  if a.binOp != "=" || a.binCompound != "" { return "" }
+  if cexLitPeel(a.binRight) < 0 { return "" }
+  const lhs = unwrapParen(a.binLeft)
+  if lhs < 0 || lhs >= P.nodes.length { return "" }
+  if !(nodeAt(lhs) is Ident) && (cboxStoreCells[lhs] ?? 0) != 1 { return "" }
+  if asgIsCellTail(asgIx, fnIx) { return "" }
+  numLitTyWidth(asgIx, fnIx)
 }
 
 // The opcode taking the re-read of a widening assignment's target cell back to its right
@@ -13416,7 +13436,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
 function asgCellOf(ix: i32, fnIx: i32): i32 {
   const e = nodeAt(ix)
   if e is BinExpr {
-    if e.binOp == "=" {
+    if e.binOp == "=" && asgLitWidth(ix, fnIx) == "" {
       const t = unwrapParen(e.binLeft)
       if t < 0 { return -1 }
       if nodeAt(t) is Ident { return asgReadNode(ix, fnIx) }
@@ -15122,7 +15142,9 @@ function exprUnionBin(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
   // states for the functype. Delegated to the target rather than re-derived, since the
   // value this node leaves on the stack is `emitExpr` of that target. Without it a tail
   // assignment over a nullable box cell struct.new'd the box as a scalar payload — invalid wasm.
-  if e.binOp == "=" { return exprUnion(asgReadNode(exprIx, fnIx), fnIx) }
+  if e.binOp == "=" && asgLitWidth(exprIx, fnIx) == "" {
+    return exprUnion(asgReadNode(exprIx, fnIx), fnIx)
+  }
   false
 }
 
@@ -16873,7 +16895,11 @@ function refListElemNameOfExprRaw(exprIx: i32, fnIx: i32) {
       return refListElemNameOfExpr(e.parInner, fnIx)
     }
     BinExpr => {
-      if e.binOp == "=" && assignTargetReReads(exprIx, fnIx) {
+      if (
+        e.binOp == "="
+        && assignTargetReReads(exprIx, fnIx)
+        && asgLitWidth(exprIx, fnIx) == ""
+      ) {
         return refListElemNameOfExpr(asgReadNode(exprIx, fnIx), fnIx)
       }
     }

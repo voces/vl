@@ -19,6 +19,7 @@ import {
   nodeTyName,
   nodeTyRecord,
 } from "./check_node_tys"
+import { cexLitPeel } from "./check_num_lits"
 import { nameIsSpaceFree, tyTopIndexOf } from "./tyname"
 import {
   deadTailBlks,
@@ -179,7 +180,6 @@ import {
   mkOptMember,
   mkParam,
   mkStr,
-  mkUnary,
   nodeAt,
   nodeChildren,
   nodeChildrenPush,
@@ -2678,15 +2678,26 @@ function asvMoves(asgIx: i32): boolean {
   spilled || !asvMayWrite(a.binRight)
 }
 
+// True when `ix` is a number literal, or a plain write whose value is one (`gi = 14`).
+function asvLitValue(ix: i32): boolean {
+  const n = nodeAt(unwrapParen(ix))
+  if n is BinExpr && n.binOp == "=" && n.binCompound == "" {
+    return asvLitValue(n.binRight)
+  }
+  cexLitPeel(ix) >= 0
+}
+
 // `asvMoves`'s half that reads only the write at `asgIx`: a plain write to a name whose
 // storage type is not the value's, where neither is a literal-union atom or holds a type
-// variable, and the value is not a bare `null`.
+// variable, and the value is neither a bare `null` nor a number literal.
 function asvTypeMoves(asgIx: i32): boolean {
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
   if a.binOp != "=" || a.binCompound != "" { return false }
   if !(nodeAt(a.binLeft) is Ident) { return false }
   if nodeAt(unwrapParen(a.binRight)) is NullLit { return false }
+  // A number literal's value is built where it is read (`asgLitWidth`), so it stays in place.
+  if asvLitValue(a.binRight) { return false }
   const lt = asgStoreTyOf(asgIx)
   const vt = nodeTyIxOf(asgIx)
   if lt < 0 || vt < 0 || tySame(lt, vt) { return false }
@@ -2841,33 +2852,10 @@ function asvWalkWrite(ix: i32, n: BinExpr, out: i32[], isValue: boolean): i32 {
   n.binRight = asvWalk(n.binRight, out, true)
   if asvStop || !isValue || !asvMoves(ix) { return ix }
   if asvTopLet { asvStop = true }
-  // A literal keeps its store, which may encode it at the place's width (`2.5` into `f32`),
-  // and is yielded as a copy at the value's type, as D2285's tail does.
-  const lit = asvLitCopy(n.binRight)
-  if lit >= 0 {
-    nodeTyRecord(lit, nodeTyIxOf(ix))
-    out.push(ix)
-    return lit
-  }
   const v = spillLocal(n.binRight, ix, "nv", out, n.pos)
   n.binRight = v
   out.push(ix)
   spillRead(v)
-}
-
-// `cboxLitCopy`, and a negated number literal too; -1 for any other node.
-function asvLitCopy(ix: i32): i32 {
-  const u = unwrapParen(ix)
-  if u < 0 { return -1 }
-  const n = nodeAt(u)
-  if n is Unary {
-    if n.unOp != "-" { return -1 }
-    const inner = cboxLitCopy(n.unArg)
-    if inner < 0 { return -1 }
-    nodeTyCarry(inner, n.unArg)
-    return mkUnary("-", inner, n.pos)
-  }
-  cboxLitCopy(u)
 }
 
 // The statement at `ix` with its leading value-position writes moved onto `out`: a binding's
