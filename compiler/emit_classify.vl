@@ -401,8 +401,7 @@ import {
   fcrFnStack,
   fcrInFlight,
   fcrRecvStack,
-  fnCheckedRetIsMapUnion,
-  fnCheckedRetMapKind,
+  fnCheckedRetTy,
   fnHasParamSid,
   fnInMonoInstance,
   frameLetOf,
@@ -473,23 +472,15 @@ import {
 } from "./emit_lit_atoms"
 import {
   LF_UNPLACED,
-  armAssignTarget,
-  armTailStmtOf,
   asNulStructRow,
-  asgCellLetOf,
-  asgOfArmTail,
   asgReadNarrowSet,
-  asgSameCell,
   asgUnwidenPrim,
   criFnIsAnonLambda,
   declaredNulString,
   fnIndexOfInScopeAt,
   fnIndexOfInScopeSid,
-  fnParamNodeOf,
   fnPosOnScopeChain,
-  ifTailFirstAssignTarget,
   initIsNestedStructFieldRead,
-  letDeclTypeName,
   letInitHoleKind,
   letInitProjKind,
   letInitTyNulArmRow,
@@ -506,7 +497,6 @@ import {
   readLoopNodeOf,
   repABRetWord,
   repOfFnSlot,
-  tailHoldsAsg,
   tailIsF64NoLocal,
 } from "./emit_local_scope"
 import {
@@ -581,7 +571,6 @@ import {
   nulScalarListKindOfTy,
   nulVariantIndexOf,
   paramMapShape,
-  paramStructIdxOf,
   repABNote,
   retMapFlight,
   retMapInFlight,
@@ -590,11 +579,8 @@ import {
   retNulVariantFlag,
   retStructRowIndex,
   structIdxOfElemName,
-  tailAssignFlight,
-  tailAssignInFlight,
   tailSelfFnIx,
   tyAnnRefListSlot,
-  vtKindOfParam,
   vtKindOfType,
 } from "./emit_nullable_rets"
 import {
@@ -1260,12 +1246,6 @@ export function cloRetValKind(fe: i32): VKind | null {
       return vtKindOfType(fn.fnRet)
     }
     if fnReturnsClosure(fe) { return "closure" }
-    // An implicit return that is an assignment yields the target cell. Consulted ahead of
-    // the variant-collapse arm so the `$fnsig` and the function's own functype are minted
-    // from one fact: over a union global, `cbRetVariantIdx` would name the collapsed
-    // variant here while `emitTypeSection` emits the union box.
-    const cloArk = fnAssignRetKind(fe)
-    if cloArk != null { return cloArk }
     // A callback collapsing to one concrete variant is typed as that variant, so the
     // `$fnsig` result is the variant struct, not the union box. Checked before the
     // `"union"` kind, which the emitter's syntactic inference also stores.
@@ -1316,9 +1296,6 @@ export function cloRetValSlot(fe: i32) {
       if k == "map" || k == "nulmap" { return mapAnnShape(fn.fnRet) }
       return -1
     }
-    // The slot half of `cloRetValKind`'s assignment-cell arm, read from the same cell,
-    // ahead of the variant-collapse slot for the same reason the kind is.
-    if fnAssignRetKind(fe) != null { return fnAssignRetSlot(fe) }
     // A collapsed-to-one-variant inferred result — the variant index.
     const cvi = cbRetVariantIdx(fe)
     if cvi >= 0 { return cvi }
@@ -1334,15 +1311,8 @@ export function cloRetValSlot(fe: i32) {
       "variant" | "nulvariant" => {
         return fRetStructIdx[fe]
       }
-      // An inferred map return — the map shape from the return expression
-      // (`mapRetExprShape`, capture-aware), so the `$fnsig` result matches the returned
-      // map value's own `$mapStruct`.
-      "map" => {
-        const mrx = fnRetExprOf(fnStmts[fe])
-        if mrx >= 0 { return mapRetExprShape(mrx, fe) }
-      }
-      // An inferred nullable-map return — the slot the function's own functype result reads.
-      "nulmap" => {
+      // An inferred map or nullable-map return — the slot the function's own functype result reads.
+      "map" | "nulmap" => {
         return inferredRetMapSlot(fe)
       }
       // An inferred ref-list return — its element name (`fRetRArrElem`, set by the
@@ -3097,53 +3067,6 @@ export function retCapturedMapShape(fe: i32, rx: i32): i32 {
   -3
 }
 
-// The target `Ident` node that function `fe`'s implicit return assigns to, or -1: `fe` is
-// un-annotated and its body's last statement is `<name> = <rhs>`. The one place that decides
-// which assignment is the implicit return. The target and not the rhs, because the `=` arm
-// lowers store-then-re-read, so the value left on the stack is the target cell's rep.
-function fnAssignRetTarget(fe: i32): i32 {
-  if fe < 0 || fe >= fnStmts.length { return -1 }
-  const fn = nodeAt(fnStmts[fe])
-  if fn is FuncDecl {
-    // An annotated return already drives the functype from its annotation — leave it alone.
-    if fn.fnRet >= 0 { return -1 }
-    if fn.fnBody < 0 { return -1 }
-    const b = nodeAt(fn.fnBody)
-    if b is Block {
-      const st = b.blkStmts
-      if st.length > 0 {
-        // The tail statement, and for the explicit spelling `return (g = e)` the returned
-        // expression inside it. Both reach `emitBinExprNode`'s `=` arm and both become the
-        // function's result, so both take the cell's answer.
-        let tailx = st[st.length - 1]
-        const ts = nodeAt(tailx)
-        // A tail `if` whose arms each end in an assignment is the same implicit return split
-        // across branches: every arm pushes its own target cell's rep. `ifTailAssignTarget`
-        // joins them to one representative target, minted only when every arm's target cell
-        // has the same result identity, so the dispatch below stays a plain cell answer.
-        if ts is IfStmt { return ifTailAssignTargetGuarded(tailx, fe) }
-        if ts is RetStmt {
-          if ts.retArg < 0 { return -1 }
-          tailx = ts.retArg
-        }
-        const a = nodeAt(unwrapParen(tailx))
-        if a is BinExpr {
-          // A number literal's value is the literal itself (`asgLitWidth`), not the cell.
-          if a.binOp == "=" && cexLitPeel(a.binRight) < 0 {
-            // A re-read narrowed to one member yields that member, not the cell.
-            if asgReadNarrowTy(unwrapParen(tailx), fnStmts[fe]) >= 0 {
-              return -1
-            }
-            const tx = unwrapParen(a.binLeft)
-            if tx >= 0 && nodeAt(tx) is Ident { return tx }
-          }
-        }
-      }
-    }
-  }
-  -1
-}
-
 // The predicate half of that pair, gated on the init being the union box: without the gate a
 // bare variant-valued init would take this rung instead of `letIsVariant`'s, which reads the
 // same row from the rep and owes no unbox.
@@ -3832,248 +3755,8 @@ export function letCellKind(letIx: i32, fnIx: i32): VKind {
   "i32"
 }
 
-// The `fbValtype` kind of target `tx`'s cell inside function `fnIx`, or `null` when no
-// storage class claims the name. `null` means exactly one thing — there is no such cell —
-// and never "this kind is unwelcome": a declined kind falls to `emitFunctionSection`'s `i32`
-// default over a body pushing a ref, which is check-clean invalid wasm (D27).
-function fnAssignCellKind(fnIx: i32, tx: i32): VKind | null {
-  if tx < 0 { return null }
-  const nm = identNameOrEmpty(tx)
-  const li = asgCellLetOf(fnIx, tx)
-  if li >= 0 { return letCellKind(li, fnIx) }
-  const pi = fnParamNodeOf(fnIx, nm)
-  if pi >= 0 { return vtKindOfParam(pi) }
-  const gi = globalLetOfIn(fnIx, nm, tx)
-  if gi < 0 { return null }
-  globalCellKind(gi)
-}
-
-// The struct-table index of target `tx`'s cell inside function `fnIx`, or -1 — the raw
-// per-class answer, ungated on the kind (`fnAssignRetSlot` applies the kind gate).
-function fnAssignCellSlot(fnIx: i32, tx: i32) {
-  if tx < 0 { return -1 }
-  const nm = identNameOrEmpty(tx)
-  const li = asgCellLetOf(fnIx, tx)
-  if li >= 0 { return structIndexOfLet(li, fnIx) }
-  const pi = fnParamNodeOf(fnIx, nm)
-  if pi >= 0 { return paramStructIdxOf(pi) }
-  const gi = globalLetOfIn(fnIx, nm, tx)
-  if gi < 0 { return -1 }
-  globalCellStructIdx(gi)
-}
-
-// The map shape of target `tx`'s cell inside function `fnIx` at cell kind `k`, or -1 — the
-// payload column a `map` or `nulmap` result valtype needs, as `fnAssignCellSlot` is the one
-// a struct needs. A wrong shape names the mono `$mapStruct` over a ref-valued map. Read from
-// the same binding the kind came from, per storage class, like every other column here.
-function fnAssignCellMapShape(fnIx: i32, tx: i32, k: VKind) {
-  if tx < 0 { return -1 }
-  const nm = identNameOrEmpty(tx)
-  if fnIx < 0 { return -1 }
-  const fn = nodeAt(fnIx)
-  if fn is FuncDecl {
-    const li = bodyLetReadAt(fn.fnBody, nm, tx)
-    if li >= 0 {
-      if k == "nulmap" { return nulMapShapeOf(li, fnIx) }
-      return letMapShapeOf(li, fnIx)
-    }
-    const pi = fnParamNodeOf(fnIx, nm)
-    if pi >= 0 { return paramMapShape(fnIx, nm) }
-  }
-  const gi = globalLetOfIn(fnIx, nm, tx)
-  if gi < 0 { return -1 }
-  if k == "nulmap" { return nulMapShapeOf(gi, -1) }
-  letMapShapeOf(gi, -1)
-}
-
-// The declared type spelling of target `tx`'s cell inside function `fnIx`, or "" — the
-// column `VKind` cannot supply. A literal-union cell, a plain `i32` cell and a `boolean`
-// cell are all `"i32"` to `fbValtype`, yet `v: K` and `w: i32` are different result types
-// and the checker joins two arms assigning to them into a union box.
-function fnAssignCellTypeName(fnIx: i32, tx: i32) {
-  if tx < 0 { return "" }
-  const nm = identNameOrEmpty(tx)
-  const li = asgCellLetOf(fnIx, tx)
-  if li >= 0 { return letDeclTypeName(li) }
-  const pi = fnParamNodeOf(fnIx, nm)
-  if pi >= 0 {
-    const p = nodeAt(pi)
-    if p is Param { return tyNameOf(p.parType) }
-  }
-  const gi = globalLetOfIn(fnIx, nm, tx)
-  if gi < 0 { return "" }
-  letDeclTypeName(gi)
-}
-
-// The ref-list element type-name of target `tx`'s cell inside function `fnIx`, or "".
-function fnAssignCellElem(fnIx: i32, tx: i32) {
-  if tx < 0 { return "" }
-  const nm = identNameOrEmpty(tx)
-  const li = asgCellLetOf(fnIx, tx)
-  if li >= 0 { return letRefListElemName(li, fnIx) }
-  const pi = fnParamNodeOf(fnIx, nm)
-  if pi >= 0 {
-    const p = nodeAt(pi)
-    if p is Param { return annBareRefArrElemName(p.parType) }
-  }
-  const gi = globalLetOfIn(fnIx, nm, tx)
-  if gi < 0 { return "" }
-  letRefListElemName(gi, -1)
-}
-
-// True if the two targets resolve, inside function `fnIx`, to the same result identity:
-// kind, struct slot, ref-list element and declared type spelling. A target no storage class
-// claims never agrees. Two un-annotated cells carry "" for the spelling and are separated by
-// the other three columns alone, `letInitCellKind` being their one home.
-function fnAssignCellEq(fnIx: i32, a: i32, b: i32) {
-  const ka = fnAssignCellKind(fnIx, a)
-  const kb = fnAssignCellKind(fnIx, b)
-  if ka == null { return false }
-  if kb == null { return false }
-  if ka != kb { return false }
-  if fnAssignCellColumnsEq(fnIx, a, b) { return true }
-  // Two map cells also agree on one shape, one spelled and one inferred (D2662). `-3` is a
-  // value type with no rep, which names no shape to agree on.
-  if ka == "map" || ka == "nulmap" {
-    const sa = fnAssignCellMapShape(fnIx, a, ka)
-    if sa == -3 { return false }
-    return sa == fnAssignCellMapShape(fnIx, b, kb)
-  }
-  false
-}
-
-// The struct slot, ref-list element and declared spelling of two same-kind cells all agree.
-function fnAssignCellColumnsEq(fnIx: i32, a: i32, b: i32) {
-  if fnAssignCellSlot(fnIx, a) != fnAssignCellSlot(fnIx, b) { return false }
-  if fnAssignCellElem(fnIx, a) != fnAssignCellElem(fnIx, b) { return false }
-  fnAssignCellTypeName(fnIx, a) == fnAssignCellTypeName(fnIx, b)
-}
-
-// True if the arm block at `blockIx` ends in an assignment whose target cell agrees with
-// `t0`'s; a nested tail `if` recurses through every one of its own arms.
-function ifTailArmAgrees(blockIx: i32, fnIx: i32, t0: i32) {
-  const t = armTailStmtOf(blockIx)
-  if t < 0 { return false }
-  const tn = nodeAt(t)
-  if tn is IfStmt { return ifTailArmsAgree(t, fnIx, t0) }
-  const tx = armAssignTarget(t)
-  if tx < 0 { return false }
-  if asgSameCell(fnIx, tx, t0) { return true }
-  fnAssignCellEq(fnIx, tx, t0)
-}
-
-// True if every arm of the tail `if` at `ifIx` ends in an assignment agreeing with `t0`.
-// An `if` with no else declines: the false path falls through with no value, so the
-// function's result is the checker's nullable join and not any arm's cell.
-function ifTailArmsAgree(ifIx: i32, fnIx: i32, t0: i32) {
-  const s = nodeAt(ifIx)
-  if s is IfStmt {
-    if s.ifElse < 0 { return false }
-    if !ifTailArmAgrees(s.ifThen, fnIx, t0) { return false }
-    const els = nodeAt(s.ifElse)
-    if els is Block { return ifTailArmAgrees(s.ifElse, fnIx, t0) }
-    // `else if`: a lone nested `IfStmt`, which must carry its own final `else`.
-    return ifTailArmsAgree(s.ifElse, fnIx, t0)
-  }
-  false
-}
-
-// `ifTailAssignTarget` for function `fe`, declining with -1 on re-entry: comparing two arms'
-// cells can ask for a cell whose initializer calls `fe` itself, whose kind needs this answer
-// (D2662). Re-entered, that cell's map shape comes from the checked type of its call.
-function ifTailAssignTargetGuarded(ifIx: i32, fe: i32): i32 {
-  if fe < 0 || fe >= fnStmts.length || tailAssignInFlight(fe) { return -1 }
-  tailAssignFlight.push(fe)
-  const t = ifTailAssignTarget(ifIx, fnStmts[fe])
-  tailAssignFlight.pop()
-  t
-}
-
-// The one representative arm-tail assignment target of the tail `if` at `ifIx`, or -1 — the
-// join. Minted only when every arm's target cell agrees with the first arm's, so the target
-// stands for all of them and the `fnAssignRet*` columns read off it as off a straight tail.
-function ifTailAssignTarget(ifIx: i32, fnIx: i32): i32 {
-  const t0 = ifTailFirstAssignTarget(ifIx)
-  if t0 < 0 { return -1 }
-  if !ifTailArmsAgree(ifIx, fnIx, t0) { return -1 }
-  // Every arm re-read at one and the same member: the result is that member, not the cell.
-  if ifTailNarrowTy(ifIx, fnIx) >= 0 { return -1 }
-  t0
-}
-
-// The one member every arm-tail assignment of the tail `if` at `ifIx` is re-read at
-// (`asgReadNarrowTy`), or -1 when an arm is not narrowed or two arms name different members.
-function ifTailNarrowTy(ifIx: i32, fnIx: i32): i32 {
-  const s = nodeAt(ifIx)
-  if s is IfStmt {
-    if s.ifElse < 0 { return -1 }
-    const a = armNarrowTy(s.ifThen, fnIx)
-    if a < 0 { return -1 }
-    let b = -1
-    const els = nodeAt(s.ifElse)
-    if els is IfStmt {
-      b = ifTailNarrowTy(s.ifElse, fnIx)
-    } else {
-      b = armNarrowTy(s.ifElse, fnIx)
-    }
-    if b < 0 { return -1 }
-    if !tySame(a, b) { return -1 }
-    return a
-  }
-  -1
-}
-
-// `ifTailNarrowTy`'s answer for one arm block: its tail assignment's, or a nested tail `if`'s.
-function armNarrowTy(blockIx: i32, fnIx: i32): i32 {
-  const t = armTailStmtOf(blockIx)
-  if t < 0 { return -1 }
-  if nodeAt(t) is IfStmt { return ifTailNarrowTy(t, fnIx) }
-  asgReadNarrowTy(asgOfArmTail(t), fnIx)
-}
-
-// The authoritative result `VKind` of function `fe` when its implicit return is an assignment
-// — a straight-line tail, an explicit `return (v = e)`, or a tail `if` whose arms all assign
-// to agreeing cells — else `null`. Exported because `emitReturnValue` needs the same answer
-// for its `nulstr` seed: one fact, two readers, or functype and value disagree.
-export function fnAssignRetKind(fe: i32): VKind | null {
-  // Arms assigning two map types return their union's box, not either cell (D2666).
-  if fnCheckedRetIsMapUnion(fe) { return null }
-  const tx = fnAssignRetTarget(fe)
-  if tx < 0 {
-    // Re-entered from its own arm join: the checked return, never the provisional stored kind.
-    if tailAssignInFlight(fe) { return fnCheckedRetMapKind(fe) }
-    return null
-  }
-  fnAssignCellKind(fnStmts[fe], tx)
-}
-
-// The result-valtype slot beside `fnAssignRetKind`'s answer — the struct-table index for a
-// struct cell, the ref-list wrapper slot for a ref-list cell, -1 for the kinds needing none.
-// Gated on the kind and read from the same binding the kind came from. The ref-list arm is
-// reached only through `cloRetValSlot`, which routes the whole assignment-cell answer here.
-export function fnAssignRetSlot(fe: i32) {
-  const k = fnAssignRetKind(fe)
-  if k == null { return -1 }
-  if k == "reflist" {
-    if fnAssignRetElemName(fe) == "" { return -1 }
-    return rlSlotOfTyOrTwin(fnRetRArrElemTy(fe))
-  }
-  // A map cell's slot is its value shape, not a struct index. Naming the kind without the
-  // shape points the cell at the mono map, so this arm has to sit beside the `map` and
-  // `nulmap` kinds rather than after them.
-  if k == "map" || k == "nulmap" {
-    if fe < 0 { return -1 }
-    return fnAssignCellMapShape(fnStmts[fe], fnAssignRetTarget(fe), k)
-  }
-  if k != "struct" && k != "nulstruct" { return -1 }
-  if fe < 0 { return -1 }
-  fnAssignCellSlot(fnStmts[fe], fnAssignRetTarget(fe))
-}
-
-// The map shape beside an inferred `map` or `nulmap` result valtype — the assignment cell's
-// shape when the implicit return is an assignment, else the return expression's. The cell
-// rung comes first because the expression rung is unreachable for an if-arm tail:
-// `fnRetExprOf` reads the body's last statement, which is the `if`, and answers -1 (D30).
+// The map shape beside an inferred `map` or `nulmap` result valtype: the return expression's,
+// else the checker's return type's for a tail `fnRetExprOf` does not reach (a tail `if`, D30).
 export function inferredRetMapSlot(ti: i32) {
   retMapFlight.push(ti)
   const sh = inferredRetMapSlotCore(ti)
@@ -4082,19 +3765,15 @@ export function inferredRetMapSlot(ti: i32) {
 }
 
 function inferredRetMapSlotCore(ti: i32) {
-  const ark = fnAssignRetKind(ti)
-  if ark == "map" || ark == "nulmap" { return fnAssignRetSlot(ti) }
   if ti < 0 { return -1 }
   const mrx = fnRetExprOf(fnStmts[ti])
   if mrx >= 0 { return mapRetExprShape(mrx, ti) }
+  const crt = fnCheckedRetTy(ti)
+  if crt >= 0 {
+    const csh = mapShapeOfTyPeeled(crt)
+    if csh != -3 { return csh }
+  }
   -1
-}
-
-// The ref-list element type-name beside `fnAssignRetKind`'s `reflist` answer — the column
-// `emit_sections`' inferred-return arm turns into the result's wrapper slot. Same binding,
-// same three storage classes, same order.
-export function fnAssignRetElemName(fe: i32) {
-  fnAssignCellElem(fnStmts[fe], fnAssignRetTarget(fe))
 }
 
 // The member type the value of assignment `asgIx` reads back at when its target is a name
@@ -4136,11 +3815,24 @@ export function asgReadNode(asgIx: i32, fnIx: i32): i32 {
   if asgLitWidth(asgIx, fnIx) != "" { return asgIx }
   const a = nodeAt(asgIx)
   if a is BinExpr {
+    if asgYieldsNullLit(asgIx) { return a.binRight }
     if asgReadNarrows(asgIx, fnIx) { return a.binRight }
     if asgReadUnwidenOp(asgIx, fnIx) >= 0 { return a.binRight }
     return a.binLeft
   }
   asgIx
+}
+
+// True if assignment `asgIx` writes the `null` literal and the checker typed its value `null`:
+// the value is that literal, not a re-read of the wider cell.
+export function asgYieldsNullLit(asgIx: i32): boolean {
+  if asgIx < 0 || asgIx >= P.nodes.length { return false }
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return false }
+  if a.binOp != "=" || a.binCompound != "" { return false }
+  const r = unwrapParen(a.binRight)
+  if r < 0 || !(nodeAt(r) is NullLit) { return false }
+  tyPrimNameOf(nodeTyIxOf(asgIx)) == "null"
 }
 
 // The width of the checker's type of assignment `asgIx` when its value is its right side's
@@ -4156,7 +3848,6 @@ export function asgLitWidth(asgIx: i32, fnIx: i32): string {
   const lhs = unwrapParen(a.binLeft)
   if lhs < 0 || lhs >= P.nodes.length { return "" }
   if !(nodeAt(lhs) is Ident) && (cboxStoreCells[lhs] ?? 0) != 1 { return "" }
-  if asgIsCellTail(asgIx, fnIx) { return "" }
   numLitTyWidth(asgIx, fnIx)
 }
 
@@ -4167,7 +3858,6 @@ export function asgReadUnwidenOp(asgIx: i32, fnIx: i32): i32 {
   const vt = nodeTyIxOf(asgIx)
   const st = asgStoreTyOf(asgIx)
   if vt < 0 || st < 0 { return -1 }
-  if asgIsCellTail(asgIx, fnIx) { return -1 }
   const stT = tyAt(st)
   if stT is TyNullable {
     // A scalar widened into a nullable box is re-read under its inner member's narrowing.
@@ -4198,7 +3888,6 @@ export function asgReadNullInnerTy(asgIx: i32, fnIx: i32): i32 {
   if inner < 0 || tySame(inner, vt) { return -1 }
   if tyPrimNameOf(inner) == null { return -1 }
   if asgUnwidenPrim(vt, inner) < 0 { return -1 }
-  if asgIsCellTail(asgIx, fnIx) { return -1 }
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return -1 }
   const t = unwrapParen(a.binLeft)
@@ -4220,20 +3909,7 @@ export function asgReadNullInnerTy(asgIx: i32, fnIx: i32): i32 {
 // True if the re-read of assignment `asgIx`'s target is lowered narrowed: the value has one
 // member's type (`asgReadNarrowTy`) and is not a tail whose function returns the cell.
 export function asgReadNarrows(asgIx: i32, fnIx: i32): boolean {
-  if asgReadNarrowTy(asgIx, fnIx) < 0 { return false }
-  !asgIsCellTail(asgIx, fnIx)
-}
-
-// True if assignment `asgIx` is an implicit return of function `fnIx` whose result is the
-// target cell (`fnAssignRetKind`): a tail `if` whose arms name different members keeps
-// the box, so its arms re-read the cell unnarrowed.
-function asgIsCellTail(asgIx: i32, fnIx: i32): boolean {
-  const fe = fnStmtsPosOf(fnIx)
-  if fe < 0 { return false }
-  if fnAssignRetKind(fe) == null { return false }
-  const fn = nodeAt(fnIx)
-  if fn is FuncDecl { return tailHoldsAsg(armTailStmtOf(fn.fnBody), asgIx) }
-  false
+  asgReadNarrowTy(asgIx, fnIx) >= 0
 }
 
 // Look up the wasm function index for `name`, or -1 if no such top-level function
@@ -10647,9 +10323,7 @@ function fnRetMapShapeAt(sid: i32, callIx: i32) {
     const fn = nodeAt(fnStmts[fe])
     if fn is FuncDecl {
       if fn.fnRet >= 0 { return mapAnnShape(fn.fnRet) }
-      if retMapInFlight(fe) || tailAssignInFlight(fe) {
-        return mapRecordedCallShape(callIx)
-      }
+      if retMapInFlight(fe) { return mapRecordedCallShape(callIx) }
       return inferredRetMapSlot(fe)
     }
   }
@@ -15138,10 +14812,9 @@ function exprUnionBin(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
     // A niche joined to a default of another type is the box the lowering builds (D2373).
     if coalesceNicheJoinsToBox(exprIx, fnIx) { return true }
   }
-  // D1589 — an assignment's value is its target cell, the rule `fnAssignRetKind` already
-  // states for the functype. Delegated to the target rather than re-derived, since the
-  // value this node leaves on the stack is `emitExpr` of that target. Without it a tail
-  // assignment over a nullable box cell struct.new'd the box as a scalar payload — invalid wasm.
+  // D1589 — an assignment's value is the node `asgReadNode` names, since the value this node
+  // leaves on the stack is `emitExpr` of it. Without it a tail assignment over a nullable box
+  // cell struct.new'd the box as a scalar payload — invalid wasm.
   if e.binOp == "=" && asgLitWidth(exprIx, fnIx) == "" {
     return exprUnion(asgReadNode(exprIx, fnIx), fnIx)
   }

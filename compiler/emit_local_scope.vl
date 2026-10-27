@@ -50,7 +50,6 @@ import {
   nodeTyIsPureLitUnion,
   nodeTyIxOf,
 } from "./check_node_tys"
-import { cexLitPeel } from "./check_num_lits"
 import { tyIsValueUnionBox } from "./check_ty_rep"
 import {
   PrimName,
@@ -76,7 +75,6 @@ import {
   parentLoopCoversAt,
   parentLoopVarOf,
   placeNarrowKeyOf,
-  tyNameOf,
   unwrapParen,
 } from "./emit_base"
 import {
@@ -128,7 +126,7 @@ import {
   nestedNameBySid,
 } from "./emit_state"
 import { declaredKind, declaredSlotOf } from "./emit_struct_order"
-import { holeOperandTyOf, identNameOrEmpty } from "./emit_ty_canon"
+import { holeOperandTyOf } from "./emit_ty_canon"
 import {
   msKeepTy,
   msSetOfTy,
@@ -493,98 +491,6 @@ export function letInitHoleKind(letIx: i32, fnIx: i32): VKind {
   "i32"
 }
 
-// ── the assignment target cell ─────────────────────────────────────────────────────
-// The storage-class dispatch itself: the body `let` in scope at the target `Ident` node `tx`,
-// then a parameter, then a module global — the emitter's own order, so a shadowing binding
-// answers for the cell stored into (D3237), through the resolver deciding its valtype.
-
-// The body `let` assignment target `tx` of function `fnIx` stores into, or -1.
-export function asgCellLetOf(fnIx: i32, tx: i32): i32 {
-  const fn = nodeAt(fnIx)
-  if fn is FuncDecl {
-    return bodyLetReadAt(fn.fnBody, identNameOrEmpty(tx), tx)
-  }
-  -1
-}
-
-// The declared type spelling of the `LetDecl` at `letIx`, or "" when un-annotated, its kind
-// then coming from the initializer through `letInitCellKind`.
-export function letDeclTypeName(letIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return tyNameOf(d.letType) }
-  }
-  ""
-}
-
-// ── the if-arm join ────────────────────────────────────────────────────────────────
-// Two arms join exactly when their target cells have the same result identity: the same
-// guarded kind, struct-table slot, ref-list element name and declared type spelling. Not a
-// widening join: the lowering is store-then-re-read per arm with no coercion site between.
-
-// The tail statement of an if-arm block, or -1 for an empty arm or a non-block arm.
-export function armTailStmtOf(blockIx: i32) {
-  const b = nodeAt(blockIx)
-  if b is Block {
-    const st = b.blkStmts
-    if st.length > 0 { return st[st.length - 1] }
-  }
-  -1
-}
-
-// The target `Ident` node an arm-tail statement assigns to, or -1, unwrapped as
-// `fnAssignRetTarget` unwraps a straight tail. An index or member target answers -1 (its value
-// form is not lowered), and so does a number-literal right side, whose value is the literal at
-// its own type and not the cell (D14490).
-export function armAssignTarget(stmtIx: i32): i32 {
-  if stmtIx < 0 { return -1 }
-  let tx = stmtIx
-  const ts = nodeAt(tx)
-  if ts is RetStmt {
-    if ts.retArg < 0 { return -1 }
-    tx = ts.retArg
-  }
-  const a = nodeAt(unwrapParen(tx))
-  if a is BinExpr {
-    if a.binOp == "=" && cexLitPeel(a.binRight) < 0 {
-      const t = unwrapParen(a.binLeft)
-      if t >= 0 && nodeAt(t) is Ident { return t }
-    }
-  }
-  -1
-}
-
-// The assignment node of an arm-tail statement, seen through a `return` and parentheses.
-export function asgOfArmTail(stmtIx: i32): i32 {
-  const ts = nodeAt(stmtIx)
-  if ts is RetStmt { return unwrapParen(ts.retArg) }
-  unwrapParen(stmtIx)
-}
-
-// The leftmost arm-tail assignment target under the tail `if` at `ifIx` — the candidate the
-// other arms are compared against. -1 when the then-arm's tail is not an assignment. A
-// nested tail `if` in the then-arm recurses to its own first arm.
-export function ifTailFirstAssignTarget(ifIx: i32): i32 {
-  const s = nodeAt(ifIx)
-  if s is IfStmt {
-    const t = armTailStmtOf(s.ifThen)
-    if t < 0 { return -1 }
-    const tn = nodeAt(t)
-    if tn is IfStmt { return ifTailFirstAssignTarget(t) }
-    return armAssignTarget(t)
-  }
-  -1
-}
-
-// Whether targets `a` and `b` of function `fnIx` store into one cell: the same body `let`, or,
-// with no `let` in scope at either, one name's parameter or global.
-export function asgSameCell(fnIx: i32, a: i32, b: i32): boolean {
-  const la = asgCellLetOf(fnIx, a)
-  if la != asgCellLetOf(fnIx, b) { return false }
-  if la >= 0 { return true }
-  identNameOrEmpty(a) == identNameOrEmpty(b)
-}
-
 // The node whose rep the value of assignment `asgIx` has: its right side, or its target where
 // the checker typed the assignment at the target's type rather than the right side's, a
 // literal built at the place's type.
@@ -643,19 +549,6 @@ function unwidenI32From(sn: PrimName): i32 {
       return -1
     }
   }
-}
-
-// True if the tail statement `t`, or an arm tail of it when it is an `if`, is `asgIx`.
-export function tailHoldsAsg(t: i32, asgIx: i32): boolean {
-  if t < 0 { return false }
-  const tn = nodeAt(t)
-  if tn is IfStmt {
-    if tailHoldsAsg(armTailStmtOf(tn.ifThen), asgIx) { return true }
-    if tn.ifElse < 0 { return false }
-    if nodeAt(tn.ifElse) is IfStmt { return tailHoldsAsg(tn.ifElse, asgIx) }
-    return tailHoldsAsg(armTailStmtOf(tn.ifElse), asgIx)
-  }
-  asgOfArmTail(t) == asgIx
 }
 
 // True if lifted function `i` is an anonymous lambda with no source name. It restricts the
