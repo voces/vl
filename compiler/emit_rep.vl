@@ -120,6 +120,7 @@ import {
   oneListUnionRender,
   primNameStr,
   tyAt,
+  tyEqSameHoles,
   tyIsLitUnion,
   tyIsNullableLitUnion,
   tyIxIsVariantMember,
@@ -503,6 +504,110 @@ function repKeyFoldsLeafList(mode: RepKeyMode): boolean {
 
 export function repCanonKey(ty: i32): string { repKeyOf(ty, "canon") }
 
+// The back-edge depth at which a walk with `stack` folds `ty`, or 0: the nearest entry that is
+// `ty` or that `ty` unrolls, so a recursive type and each unrolling of it key as one tree.
+function repFoldDepth(stack: i32[], ty: i32): i32 {
+  let si = stack.length - 1
+  while si >= 0 {
+    if stack[si] == ty { return stack.length - si }
+    si = si - 1
+  }
+  if !tyReachesCycle(ty) { return 0 }
+  si = stack.length - 1
+  while si >= 0 {
+    if tyUnrollsTo(ty, stack[si]) { return stack.length - si }
+    si = si - 1
+  }
+  0
+}
+
+// Whether `ty` and `anc` are one recursive type, either rolled or unrolled: both reach a cycle
+// and render equal at every depth, holes exact. False for an acyclic type, which no strict
+// ancestor of it can equal.
+export function tyUnrollsTo(ty: i32, anc: i32): boolean {
+  if ty == anc { return true }
+  if ty < 0 || anc < 0 || ty >= T.tys.length || anc >= T.tys.length {
+    return false
+  }
+  if !tyReachesCycle(ty) || !tyReachesCycle(anc) { return false }
+  if tyHeadCode(ty) != tyHeadCode(anc) { return false }
+  tyEqSameHoles(ty, anc)
+}
+
+// The arena variant of `ty` as a number, a record's also counting its fields, so two types with
+// different codes cannot be equal.
+function tyHeadCode(ty: i32): i32 {
+  const t = tyAt(ty)
+  match t {
+    TyPrim => 0
+    TyErr => 1
+    TyFunc => 2
+    TyUnion => 3
+    TyNullable => 4
+    TyArray => 5
+    TyMap => 6
+    TyVar => 7
+    TyLit => 8
+    TyNeg => 9
+    TyObj => 10 + t.objFieldNames.length
+  }
+}
+
+// Per arena index: 0 unknown, 1 acyclic, 2 reaches a cycle, 3 on the walk's path. Synced with
+// the checker's `tyMutEpoch`, as the key memo is.
+let rcMemo: i32[] = []
+let rcEpoch = -1
+
+// Whether some type reachable from `ty` reaches itself again.
+function tyReachesCycle(ty: i32): boolean {
+  if rcEpoch != tyMutEpoch {
+    rcEpoch = tyMutEpoch
+    rcMemo = []
+  }
+  rcGo(ty) == 2
+}
+
+function rcGo(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return 1 }
+  while rcMemo.length <= ty { rcMemo.push(0) }
+  const m = rcMemo[ty]
+  if m == 3 { return 2 }
+  if m != 0 { return m }
+  rcMemo[ty] = 3
+  const r = rcKids(ty)
+  rcMemo[ty] = r
+  r
+}
+
+// `rcGo` over the types `ty` is built from: 2 when any of them reaches a cycle.
+function rcKids(ty: i32): i32 {
+  const t = tyAt(ty)
+  let r = 1
+  if t is TyObj {
+    for f in t.objFieldTypes {
+      if rcGo(f) == 2 { r = 2 }
+    }
+  } else if t is TyArray {
+    r = rcGo(t.aElem)
+  } else if t is TyNullable {
+    r = rcGo(t.nInner)
+  } else if t is TyUnion {
+    for u in t.uMembers {
+      if rcGo(u) == 2 { r = 2 }
+    }
+  } else if t is TyMap {
+    if rcGo(t.mKey) == 2 || rcGo(t.mVal) == 2 { r = 2 }
+  } else if t is TyFunc {
+    for p in t.fnParamTypes {
+      if rcGo(p) == 2 { r = 2 }
+    }
+    if rcGo(t.fnRet) == 2 { r = 2 }
+  } else if t is TyNeg {
+    r = rcGo(t.negTy)
+  }
+  r
+}
+
 // The one entry every key render recurses through. Each mode owns its cycle stack, and
 // `canon` and `elem` a depth-0 memo: a back-edge is a function of the caller's depth, so only
 // a top-of-recursion answer is banked. A render past any sane size collapses to a sentinel
@@ -510,11 +615,8 @@ export function repCanonKey(ty: i32): string { repKeyOf(ty, "canon") }
 function repKeyOf(ty: i32, mode: RepKeyMode): string {
   if ty < 0 { return "!" }
   const stack = repKeyStackOf(mode)
-  let si = stack.length - 1
-  while si >= 0 {
-    if stack[si] == ty { return "#" + i32ToStr(stack.length - si) }
-    si = si - 1
-  }
+  const fd = repFoldDepth(stack, ty)
+  if fd > 0 { return "#" + i32ToStr(fd) }
   const top = stack.length == 0
   if top {
     const hit = repKeyMemoGet(ty, mode)
@@ -1355,16 +1457,12 @@ function repMvValId(ty: i32): i32 { repIdOf(ty, "mv") }
 function repIdOf(ty: i32, mode: RepKeyMode): i32 {
   if ty < 0 { return hcIntern(HC_ERRTY, hcNoArgs, 1) }
   const stack = hcStackOf(mode)
-  let si = stack.length - 1
-  while si >= 0 {
-    if stack[si] == ty {
-      const d = stack.length - si
-      const a: i32[] = []
-      a.push(d)
-      hcImpure = hcImpure + 1
-      return hcIntern(HC_BACK, a, 1 + hcDigits(d))
-    }
-    si = si - 1
+  const d = repFoldDepth(stack, ty)
+  if d > 0 {
+    const a: i32[] = []
+    a.push(d)
+    hcImpure = hcImpure + 1
+    return hcIntern(HC_BACK, a, 1 + hcDigits(d))
   }
   const top = stack.length == 0
   const hit = hcMemoGet(ty, mode)
@@ -3616,6 +3714,8 @@ export function repReset() {
   repKeyMemo = []
   repKeyMemoEpoch = -1
   repSlotRepEpoch = -1
+  rcMemo = []
+  rcEpoch = -1
   repSlotByDecl = []
   repSlotKeySi = []
   repSlotKeyN = []
