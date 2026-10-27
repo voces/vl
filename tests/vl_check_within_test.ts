@@ -234,7 +234,7 @@ const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { wrap(
 // Mask bits, as `WI_NO_*` in `compiler/driver.vl` numbers them.
 const NO_ENTRY = 1, NO_DEMAND = 2, NO_WRITER = 8, NO_AMBIENT = 16, NO_RENDER = 128;
 const NO_ADOPTED = 256, NO_DIAG_NAMES = 4096, NO_OUTSIDE = 8192, NO_INERT_OUT = 16384;
-const NO_LIT_ORDER = 32768, NO_ARENA = 64;
+const NO_LIT_ORDER = 32768, NO_ARENA = 64, NO_ASKS = 32;
 const LOOSE_ARGS = 65536, LOOSE_GETTER = 131072, LOOSE_SETTLED = 262144, LOOSE_CALLS = 524288;
 
 // G builds a `J` from an inferred builder; main declares a record of the literal's own storage.
@@ -590,7 +590,9 @@ const CASES: Case[] = [
     },
     target: "lib.vl",
     want: "ambient",
-    mask: NO_AMBIENT,
+    // `g`'s summary also asks a write question of the operator outside G, which the asks guard
+    // declines; dropping both is what serves the outside operator unsoundly.
+    mask: NO_AMBIENT | NO_ASKS,
   },
   {
     name: "a push G makes on a list an outside body types declines its target on demand",
