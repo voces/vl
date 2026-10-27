@@ -82,10 +82,16 @@ import {
   scopeNames,
   scopeStackPop,
   scopeStackPush,
+  uVarMemPos,
   uVarSTwin,
   uVarTyIx,
   uVarTyIxResets,
   uVariants,
+  unMemTyCount,
+  unMemTyStart,
+  unMemTys,
+  unVarCount,
+  unVarStart,
 } from "./emit_state"
 import { strListHas } from "./listutil"
 import { memoKeyNew, memoMoved, memoPassMoved } from "./memo"
@@ -330,7 +336,7 @@ export function mvValLowersTy(ty: i32): i32 {
       // union arm, since `collectS` skips a `type X = {…}` that is a union member, so the arm has
       // a `uVariants` row and no `sNames` one. This gate and the interner must not drift —
       // teaching only the interner leaves an arm-valued map's return at the mono i32 valtype.
-      if variantRowOfTy(ty) >= 0 { return 1 }
+      if armRowOfRecordTyShim(ty) >= 0 { return 1 }
     }
     TyNullable => {
       // A nullable value with a single ref inner is a lowering branch, not a rejecting one: only a
@@ -527,7 +533,7 @@ export function armLayoutContestedAt(vi: i32): boolean {
 // The tri-state arm hint a caller's recorded value type produces (D48): `MV_ARM_NOHINT` when
 // there is no type to ask, else the type's arm signature — the arm's declaration row, or -1
 // for a resolved type that reaches no arm. Only the second may refuse an arm's slot. Nominal
-// at every rung, and `mvArmSigOfTy` rather than `variantRowOfTy` so a map hop is followed.
+// at every rung, and `mvArmSigOfTy` rather than `armRowOfRecordTyShim` so a map hop is followed.
 export function mvArmHintOfTy(ty: i32): i32 {
   if ty < 0 { return MV_ARM_NOHINT }
   mvArmSigOfTy(ty)
@@ -551,11 +557,11 @@ export function mvSlotOfValTyK(valTy: i32, keyK: i32): i32 {
 
 // The arm signature of a map-value type: the variant row the value is, or — one container
 // further out — the row its transitive map value is, or -1 for a resolved type reaching no
-// arm (D93). `variantRowOfTy` alone cannot answer the second, so `{[string]: Circle}` and
+// arm (D93). `armRowOfRecordTyShim` alone cannot answer the second, so `{[string]: Circle}` and
 // `{[string]: Dot}` would share one slot. Nominal at every depth, so an anonymous value stays -1.
 export function mvArmSigOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
-  const v = variantRowOfTy(ty)
+  const v = armRowOfRecordTyShim(ty)
   if v >= 0 { return v }
   mvDeepArmOfTy(ty, 8)
 }
@@ -565,7 +571,7 @@ export function mvArmSigOfTy(ty: i32): i32 {
 // asked of the type: every name this layer holds is a render, so an arm arrives spelled
 // `{r:i32}` and `structIndexOfTypeName` would accept it as the inline-shape row.
 export function mvValArmName(ty: i32): string {
-  const vr = variantRowOfTy(ty)
+  const vr = armRowOfRecordTyShim(ty)
   if vr < 0 { return "" }
   if vr >= uVariants.length { return "" }
   uVariants[vr]
@@ -594,7 +600,7 @@ function mvDeepArmOfTy(ty: i32, depth: i32): i32 {
   if depth <= 0 { return -1 }
   const t = tyAt(ty)
   if t is TyMap {
-    const v = variantRowOfTy(t.mVal)
+    const v = armRowOfRecordTyShim(t.mVal)
     if v >= 0 { return v }
     return mvDeepArmOfTy(t.mVal, depth - 1)
   }
@@ -627,7 +633,7 @@ function mvDeepDeclOfTy(ty: i32, depth: i32): i32 {
   if depth <= 0 { return 0 }
   const t = tyAt(ty)
   if t is TyMap {
-    if variantRowOfTy(t.mVal) >= 0 { return 1 }
+    if armRowOfRecordTyShim(t.mVal) >= 0 { return 1 }
     if structIndexOfTy(t.mVal) >= 0 { return 1 }
     return mvDeepDeclOfTy(t.mVal, depth - 1)
   }
@@ -669,11 +675,42 @@ export function isStructOfTy(ty: i32): boolean {
   false
 }
 
-// The variant registry asked of the arena — the row index whose arm type is `ty`, or -1.
-// Variants are nominal: two variants with the same field set are different variants, so
-// there is no structural fallback here. A query-side hazard: `nodeTyIxOf(paramTypeNode(...))`
-// for a union-annotated param hands back the first arm, not the union.
-export function variantRowOfTy(ty: i32): i32 {
+// The variant row minted at member position `pos` of union row `u`, or -1 when that member is
+// no struct arm. A variant's identity is its position in a union row, not its record type.
+export function variantRowAt(u: i32, pos: i32): i32 {
+  if u < 0 || pos < 0 || u >= unVarStart.length || u >= unVarCount.length {
+    return -1
+  }
+  let vi = unVarStart[u]
+  while vi < unVarStart[u] + unVarCount[u] && vi < uVarMemPos.length {
+    if uVarMemPos[vi] == pos { return vi }
+    vi = vi + 1
+  }
+  -1
+}
+
+// The variant row of the first member of union row `u` whose recorded type is `ty`, or -1: the
+// arm's identity read through its position in that row, never through the type alone.
+export function variantRowInRowOfTy(u: i32, ty: i32): i32 {
+  if u < 0 || ty < 0 || u >= unMemTyStart.length || u >= unMemTyCount.length {
+    return -1
+  }
+  let p = 0
+  while p < unMemTyCount[u] && unMemTyStart[u] + p < unMemTys.length {
+    if unMemTys[unMemTyStart[u] + p] == ty {
+      const vi = variantRowAt(u, p)
+      if vi >= 0 { return vi }
+    }
+    p = p + 1
+  }
+  -1
+}
+
+// The first variant row whose arm type is the bare record `ty`, or -1: the shim every reader
+// that holds a type rather than a union row position asks, and the deletion target (D14552).
+// A query-side hazard: `nodeTyIxOf(paramTypeNode(...))` for a union-annotated param hands
+// back the first arm, not the union.
+export function armRowOfRecordTyShim(ty: i32): i32 {
   if ty < 0 { return -1 }
   // No structural rung: two variants with the same field set are different variants, and a
   // `tySame` fallback here would match the first of them for both. Variants are nominal,
@@ -686,12 +723,12 @@ export function variantRowOfTy(ty: i32): i32 {
 // The variant row a value of record type `ty` whose rep is `variant` is stored under: the row
 // recorded at `ty`, else the first arm of its shape, which a structural twin is; -1 for none.
 export function variantRowOfRepTy(ty: i32): i32 {
-  const vr = variantRowOfTy(ty)
+  const vr = armRowOfRecordTyShim(ty)
   if vr >= 0 { return vr }
   repVariantShapeRowOf(ty)
 }
 
-// `variantRowOfTy`'s index: arm type to the first `uVarTyIx` row carrying it, over rows below
+// `armRowOfRecordTyShim`'s index: arm type to the first `uVarTyIx` row carrying it, over rows below
 // `vrIxUpTo`. Rows are only appended between resets, so it extends in place; a reset of the
 // table or a new pass rebuilds it (D11320).
 let vrIxFirst: {[i32]: i32} = Map()

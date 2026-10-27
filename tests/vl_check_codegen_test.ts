@@ -272,7 +272,7 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // layout — IS CLOSED (#1944), and it went the way its two predecessors did: the rule the fix
 // needed was already written and simply not consulted. `shapeNominalOfTy` maps a structural
 // shape back to a nominal NAME over four rungs, and only ONE was nominal by construction
-// (`structIndexOfTy`, the struct-table arena sidecar). Its twin — `variantRowOfTy`, matching
+// (`structIndexOfTy`, the struct-table arena sidecar). Its twin — `armRowOfRecordTyShim`, matching
 // `uVarTyIx[i] == ty`, the arm DECLARATION's own identity — existed, was documented as
 // correct, and was not asked. Below it sat two STRUCTURAL field-set scans, one per table, and
 // a layout twin is claimed by both, so their fixed order was the whole answer. Probed on the
