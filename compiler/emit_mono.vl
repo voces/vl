@@ -679,7 +679,14 @@ import {
   tyIsTpJoinUnion,
 } from "./check_tp_join"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
-import { fnTagCallArms, fnTagCallCopy, fnTagTyIsTagged } from "./check_elab_cap"
+import {
+  fnTagArmsAt,
+  fnTagCallArms,
+  fnTagCallCopy,
+  fnTagCallSetOf,
+  fnTagSetOfTy,
+  fnTagTyIsTagged,
+} from "./check_elab_cap"
 
 // D943 — the lifted slots `monoPinBodyLambdas` minted for the instance being built. A
 // clone's `fnParent` cannot be set at clone time (its own `FuncDecl` does not exist
@@ -4224,9 +4231,11 @@ function monoNoteCallTpl(ix: i32, nx: i32) {
     // arena-tick exempt: a clone-to-template side map read by lookups of the checker's and the
     // elaboration's per-call rows, never by a pass.
     monoCallTpl[nx] = monoCallTplOf(ix)
-    const tArms = fnTagCallArms(ix)
+    const cn = nodeAt(ix)
+    const tSet = if cn is Call { monoTagSetAt(ix, cn.callFn) } else { -1 }
+    const tArms = fnTagArmsAt(ix, tSet)
     if tArms.length > 0 && fnTagCallArms(nx).length == 0 {
-      fnTagCallCopy(nx, ix, tArms)
+      fnTagCallCopy(nx, ix, tSet, tArms)
     }
   }
   0
@@ -8294,6 +8303,17 @@ function monoParamsMention(params: i32[], typarams: string[]): boolean {
   false
 }
 
+// The tagged set call `ix` dispatches through in the instance being walked: the one its callee
+// carries there when the checker built that set's member calls, -1 when the instance types the
+// callee with none, and the one it is noted at outside an instance.
+function monoTagSetAt(ix: i32, callFn: i32): i32 {
+  const t = elabWalkTy(callFn)
+  if t < 0 { return fnTagCallSetOf(ix) }
+  const s = fnTagSetOfTy(t)
+  if s >= 0 && fnTagArmsAt(ix, s).length > 0 { return s }
+  -1
+}
+
 // Give an instance its own copy of every direct call to a generic or to a hole lambda's
 // binding — the `Call` node and its callee `Ident` — so the per-instance rename lands on nodes
 // no sibling instance can see; one shared `Ident` let the last shape to instantiate win
@@ -8505,8 +8525,16 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
     }
   }
   let changed = newCallee != n.callFn
-  // A tagged call's member calls are each a generic call of this instance too.
-  const tagArms = fnTagCallArms(ix)
+  // A tagged call's member calls are each a generic call of this instance too, at the set its
+  // callee carries in this instance.
+  const tagSet = monoTagSetAt(ix, n.callFn)
+  const tagArms = fnTagArmsAt(ix, tagSet)
+  if (
+    tagSet != fnTagCallSetOf(ix)
+    && tagArms.length + fnTagCallArms(ix).length > 0
+  ) {
+    changed = true
+  }
   const nArms: i32[] = []
   for ta in tagArms {
     const na = monoCloneGenericCalls(ta)
@@ -8524,7 +8552,7 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
   const tas = callTyArgsOf(ix)
   if !changed && tas.length == 0 { return ix }
   const nc = monoRemintCall(ix, newCallee, nargs)
-  if tagArms.length > 0 { fnTagCallCopy(nc, ix, nArms) }
+  if tagArms.length > 0 { fnTagCallCopy(nc, ix, tagSet, nArms) }
   // A call through a copied cell read keeps the call's recorded type.
   if cellCall && nodeTyIxOf(ix) >= 0 { nodeTyRecord(nc, nodeTyIxOf(ix)) }
   if lamCall {
@@ -9647,6 +9675,22 @@ function monoSigPinDiscrim(pin: string, tyIx: i32): string {
   "=" + tyCanonKey(tyIx, TY_WALK_DEPTH)
 }
 
+// A pin holding a tagged function set keys apart from a closure of the same signature: its value
+// is a member's id, and its calls go to each member directly.
+function monoSetPinDiscrim(tyIx: i32): string {
+  if !fnTagTyIsTagged(tyIx) { return "" }
+  "#set" + i32ToStr(fnTagSetOfTy(tyIx))
+}
+
+// The type of argument `ax` where it is a tagged function set, else -1.
+function monoArgTaggedSetTy(ax: i32): i32 {
+  const x = unwrapParen(ax)
+  if x < 0 { return -1 }
+  const t = nodeTyIxOf(x)
+  if !fnTagTyIsTagged(t) { return -1 }
+  t
+}
+
 // The registry name of pinned type `st`'s box: its emitter spelling, canon'd as a union name.
 function monoPinUnionNameOfTy(st: i32): string {
   monoPinUnionName(tyToEmitName(st))
@@ -10357,6 +10401,7 @@ function monoKeyPinSeg(
       + heads[pk]
       + monoAnonPinDiscrim(pinned[pk], pinTys[pk])
       + monoSigPinDiscrim(pinned[pk], pinTys[pk])
+      + monoSetPinDiscrim(pinTys[pk])
       + ","
     pk = pk + 1
   }
@@ -10552,6 +10597,10 @@ function monoMakeInstanceParams(
           if pinTys[pj] >= 0 { monoParamPinTy.set(nt, pinTys[pj]) }
           synthed = true
         }
+      } else if fnTagTyIsTagged(pinTys[pj]) {
+        // A tagged set's parameter is the set itself, not a closure of its signature.
+        nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
+        synthed = true
       } else if annotateI32 || pinned[pj] != "i32" {
         nt = monoSynthPinRef(pinned[pj], pinTys[pj])
         // The pin name renders inline literal members as `string`; a union box holding them
@@ -23245,6 +23294,13 @@ function monoPinHoleParam(
   // A parameter the checker already decided is not a hole, so the instance
   // pins the parameter's own type. `recordedParamPinName` is that one answer,
   // shared with `synthParamAnnots`; "" keeps the argument-derived pin.
+  // A tagged function set is handed on as itself: the instance calls each member directly.
+  const setTy = monoArgTaggedSetTy(args[i])
+  if setTy >= 0 {
+    pinned.push(tyToStr(setTy))
+    pinTys.push(setTy)
+    return 0
+  }
   let an = recordedParamPinName(params[i])
   let anTy = -1
   // A literal handed to a parameter the body's own annotation decides delivers its open

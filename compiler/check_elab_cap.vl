@@ -2,7 +2,18 @@
 // node's type at the instance, and each call's closed bindings. Recording is live only at the
 // elaboration's own quiet depth, so a probe nested inside the body records nothing.
 
-import { FuncDecl, LetDecl, i32ToStr, nodeAt } from "./ast"
+import {
+  Call,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  LetDecl,
+  MatchExpr,
+  P,
+  Paren,
+  i32ToStr,
+  nodeAt,
+} from "./ast"
 import { inferQuiet, quietDepth } from "./check_cursor"
 import {
   constScopes,
@@ -28,7 +39,7 @@ import {
 } from "./check_types"
 import { tyHasTyVar } from "./tyquery"
 import { i32ListHas } from "./listutil"
-import { nodeSrc } from "./symbols"
+import { identDeclOf, nodeSrc } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
 import { cwLetFnTargets, fnDeclIx } from "./check_write_scan"
 import { weDigits } from "./check_write_effects"
@@ -306,7 +317,7 @@ function elabOwnedBy(own: i32[], name: string): boolean {
 
 // The name of the hole a derived hole (an operator's pending answer, a field of a hole) derives
 // from at its root, so it is owned where that hole is; a plain type variable's own name.
-function elabHoleRootName(t: i32): string {
+export function elabHoleRootName(t: i32): string {
   let r = t
   let n = 0
   while hdRowOf(r) >= 0 && n < 64 {
@@ -344,20 +355,21 @@ function elabTyClosedOwn(t: i32, depth: i32, own: i32[]): boolean {
       return true
     }
     TyFunc => {
-      // A function value is its singleton `Fn#d` when its signature is closed but for d's own type
-      // parameters and holes, at any depth.
+      // A function value is its singleton `Fn#d`, or the id of a tagged set's member, when its
+      // signature is closed but for its members' own type parameters and holes, at any depth.
       const d = elabFnIdOf(t)
-      if d >= 0 && nodeAt(d) is FuncDecl {
-        let has = false
-        for o in own {
-          if o == d { has = true }
-        }
-        if !has {
-          const own2 = own.slice(0, own.length)
-          own2.push(d)
-          if elabTyClosedOwn(t, depth + 1, own2) { return true }
+      let ds: i32[] = []
+      if d >= 0 { ds = [d] }
+      else if fnTagTyIsTagged(t) { ds = elabFnSetOf(t) }
+      let fresh = false
+      const own2 = own.slice(0, own.length)
+      for m in ds {
+        if nodeAt(m) is FuncDecl && !i32ListHas(own, m) {
+          own2.push(m)
+          fresh = true
         }
       }
+      if fresh && elabTyClosedOwn(t, depth + 1, own2) { return true }
       for pt in x.fnParamTypes {
         if !elabTyClosedOwn(pt, depth + 1, own) { return false }
       }
@@ -605,6 +617,24 @@ let fnTagLeaf: {[i32]: i32} = Map()
 let fnTagRet: {[i32]: boolean} = Map()
 // By call node: a direct call of each member at the call's arguments, in set order.
 let fnTagArms: {[i32]: i32[]} = Map()
+// By call node and set id: the member calls of a generic call whose instances see another tagged
+// set than the one its first note recorded.
+let fnTagArmsBy: {[string]: i32[]} = Map()
+
+// Whether call `ix` names the one member of set `s` by its own name: a direct call, not a call
+// through a value of the set.
+function fnTagSelfCall(ix: i32, s: i32): boolean {
+  const c = nodeAt(ix)
+  if !(c is Call) { return false }
+  const ds = fnTagMembers(s)
+  if ds.length != 1 || c.callFn < 0 || c.callFn >= P.nodes.length {
+    return false
+  }
+  const n = nodeAt(c.callFn)
+  const f = nodeAt(ds[0])
+  if !(n is Ident) || !(f is FuncDecl) { return false }
+  n.identName == f.fnName
+}
 
 // Notes the call `ix` through a value of set `s` at parameter types spelled `key`, `split`
 // when its members give it different results; clears any refusal an earlier pass recorded.
@@ -615,6 +645,7 @@ export function fnTagCallNote(
   split: boolean,
   rs: i32[],
 ) {
+  if fnTagSelfCall(ix, s) { return 0 }
   if !fnTagCallSet.has(ix) { fnTagCallIxs.push(ix) }
   fnTagCallSet[ix] = s
   fnTagCallKey[ix] = key
@@ -659,16 +690,44 @@ export function fnTagSetOfTy(t: i32): i32 {
   elabFnSetTy[t] ?? -1
 }
 
-// Whether a value of type `t` holds one of two or more functions, chosen where it is made, none
-// of which declares type parameters.
+// Whether a value of type `t` holds one of two or more declared functions, chosen where it is made.
 export function fnTagChoiceOfTy(t: i32): boolean {
   const ds = fnTagMembers(fnTagSetOfTy(t))
   if ds.length < 2 { return false }
   for d in ds {
     const f = nodeAt(d)
-    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+    if !(f is FuncDecl) { return false }
   }
   true
+}
+
+// Whether the value at `site`, of type `t`, is a choice: one of two or more declared functions,
+// or a one-member `if` or `match`, directly or through the `const` or `let` it initialises.
+export function fnTagChoiceAt(site: i32, t: i32): boolean {
+  if fnTagChoiceOfTy(t) { return true }
+  const ds = fnTagMembers(fnTagSetOfTy(t))
+  if ds.length != 1 || !(nodeAt(ds[0]) is FuncDecl) { return false }
+  let x = fnTagPeel(site)
+  if x < 0 { return false }
+  const n = nodeAt(x)
+  if n is Ident {
+    const ld = identDeclOf(x)
+    if ld < 0 { return false }
+    const l = nodeAt(ld)
+    if !(l is LetDecl) { return false }
+    x = fnTagPeel(l.letInit)
+  }
+  if x < 0 { return false }
+  const v = nodeAt(x)
+  v is IfStmt || v is MatchExpr
+}
+
+// The node `ix` names through parentheses.
+function fnTagPeel(ix: i32): i32 {
+  if ix < 0 { return ix }
+  const e = nodeAt(ix)
+  if e is Paren { return fnTagPeel(e.parInner) }
+  ix
 }
 
 // A choice delivered where a closed function type is expected is built there as a closure over
@@ -683,6 +742,16 @@ let fnTagEtaRan = false
 let fnLetWide: i32[] = []
 let fnLetWideAt: i32[] = []
 let fnLetVeto: i32[] = []
+
+// Forgets every fact keyed by a type index, which a restart of the check re-mints from an empty
+// arena: a stale entry would give another type a set.
+export function fnTyFactsReset() {
+  elabFnSetTy = Map()
+  fnJoinMemo = Map()
+  fnLetWide = []
+  fnLetWideAt = []
+  0
+}
 
 // Forgets the sites of an earlier program; once per `checkProgram`.
 export function fnTagEtaReset() {
@@ -764,10 +833,26 @@ export function fnTagCallArms(ix: i32): i32[] {
   fnTagArms[ix] ?? none
 }
 
-// The member calls already built for call `ix`; [] for none.
-export function fnTagArmsOf(ix: i32): i32[] {
+function fnTagArmsKey(ix: i32, s: i32): string {
+  i32ToStr(ix) + "," + i32ToStr(s)
+}
+
+// The member calls built for call `ix` at tagged set `s`; [] for none, or when `s` is untagged.
+export function fnTagArmsAt(ix: i32, s: i32): i32[] {
   const none: i32[] = []
-  fnTagArms[ix] ?? none
+  if s < 0 || !fnTagSetIsTagged(s) { return none }
+  if s == fnTagCallSetOf(ix) { return fnTagArms[ix] ?? none }
+  fnTagArmsBy[fnTagArmsKey(ix, s)] ?? none
+}
+
+// Records the member calls `arms` call `ix` dispatches between at set `s`.
+export function fnTagArmsAtSet(ix: i32, s: i32, arms: i32[]) {
+  if s == fnTagCallSetOf(ix) {
+    fnTagArms[ix] = arms
+  } else {
+    fnTagArmsBy[fnTagArmsKey(ix, s)] = arms
+  }
+  0
 }
 
 // Records set `s` as tagged, with leaf `leaves[k]` naming member `ids[k]`.
@@ -790,17 +875,16 @@ export function fnTagRetMark(d: i32) {
 // Whether function declaration `d` returns the id of a tagged set's member.
 export function fnTagRetIsTagged(d: i32): boolean { fnTagRet[d] ?? false }
 
-// Records the member calls `arms` call `ix` dispatches between.
-export function fnTagArmsSet(ix: i32, arms: i32[]) {
-  fnTagArms[ix] = arms
-  0
-}
-
-// Records call `nc`, an instance's copy of tagged call `tpl`, as dispatching between `arms`.
-export function fnTagCallCopy(nc: i32, tpl: i32, arms: i32[]) {
-  const s = fnTagCallSetOf(tpl)
+// Records call `nc`, an instance's copy of tagged call `tpl` at set `s`, as dispatching between
+// `arms`; a set other than the one `tpl` is noted at is the instance's own, with no split.
+export function fnTagCallCopy(nc: i32, tpl: i32, s: i32, arms: i32[]) {
   if s < 0 { return 0 }
   const none: i32[] = []
+  if s != fnTagCallSetOf(tpl) {
+    fnTagCallNote(nc, s, "", false, none)
+    fnTagArms[nc] = arms
+    return 0
+  }
   fnTagCallNote(
     nc,
     s,
@@ -858,5 +942,6 @@ export function elabCapReset() {
   fnTagLeaf = Map()
   fnTagRet = Map()
   fnTagArms = Map()
+  fnTagArmsBy = Map()
   0
 }
