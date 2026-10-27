@@ -133,9 +133,13 @@ import {
   narBankPushFrame,
   narBankRowsOf,
   narDeclaredTy,
-  narFnEpoch,
 } from "./check_nar_bank"
-import { SCOPE_EOF, symScopePush, symSpanPush } from "./check_sym_occ"
+import {
+  SCOPE_EOF,
+  symResolve,
+  symScopePush,
+  symSpanPush,
+} from "./check_sym_occ"
 import { calleeNameOf } from "./check_callee"
 import {
   crCallBenign,
@@ -153,8 +157,35 @@ import {
 // that scope pushed; bare-name narrowings ride the scope chain instead. `npInvBy` is the
 // invalidation slot, written in place, since a shadowing push would resurrect the narrowing.
 export let npKeys: string[] = []
-export function npKeysPop(): string | null { npKeys.pop() }
-export function npKeysPush(v: string) { npKeys.push(v) }
+export function npKeysPop(): string | null {
+  npRoot.pop()
+  npKeys.pop()
+}
+export function npKeysPush(v: string) {
+  npRoot.push(npRootOf(v))
+  npKeys.push(v)
+}
+
+// Per slot, the declaration the key's root name resolves to at the push: a slot answers a
+// key only while the root still resolves there, so an inner binding of the name hides it.
+export let npRoot: i32[] = []
+
+function npRootOf(key: string): i32 { symResolve(placeRootOf(key)) }
+
+// The innermost slot at or above `base` narrowing `key` at the binding its root names now, or -1.
+// The root resolves on the first spelling hit only, since most walks have none.
+export function npSlotOf(key: string, base: i32): i32 {
+  let root = -2
+  let i = npKeys.length - 1
+  while i >= base {
+    if npKeys[i] == key {
+      if root == -2 { root = npRootOf(key) }
+      if npRoot[i] == root { return i }
+    }
+    i = i - 1
+  }
+  -1
+}
 
 export let npTys: i32[] = []
 export function npTysPop() {
@@ -340,33 +371,6 @@ export function narIpApply(f: IfChk, j: i32, undo: boolean) {
   0
 }
 
-// A declaration `at` of `name` in an inner block: every live path narrowing rooted at the outer
-// binding stops answering until the block ends, which an invalidated overlay entry says (D3285).
-export function narShadowPaths(name: string, at: i32) {
-  const n0 = npKeys.length
-  const nl = name.length
-  let i = 0
-  while i < n0 {
-    const k = npKeys[i]
-    if (
-      k.length > nl
-      && (k[nl] == '.' || k[nl] == '[')
-      && k.slice(0, nl) == name
-      && narrowedPathIx(k) == i
-    ) {
-      npKeys.push(k)
-      npTys.push(npTys[i])
-      npInvBy.push(at)
-      npEpochs.push(narFnEpoch)
-      npSettle.push(-2)
-      npCapBy.push(-1)
-      npAsg.push(0)
-    }
-    i = i + 1
-  }
-  0
-}
-
 // Replace the rows of each key the `if` whose rows start at `mark` joined by its summary row, at
 // the `if`'s own statement depth. An enclosing join then folds one row per key per `if`, which
 // keeps the ledger linear in the function however deep the nesting.
@@ -470,14 +474,7 @@ export function narWriteStorage(name: string): i32 {
 // The overlay slot of the innermost narrowing of `key`, or -1 when no live scope narrowed it. The
 // single walk the three overlay questions share — the type, the invalidator, and how the slot
 // sits relative to a loop barrier.
-export function narrowedPathIx(key: string) {
-  let i = npKeys.length - 1
-  while i >= 0 {
-    if npKeys[i] == key { return i }
-    i = i - 1
-  }
-  -1
-}
+export function narrowedPathIx(key: string) { npSlotOf(key, 0) }
 
 // `narrowedPathTy` without the capture question, for reading a prefix's type while a call's
 // write summary is being matched — which that question itself asks.
@@ -1292,23 +1289,22 @@ export function noteHoleArgNullRead(name: string, at: i32, ix: i32) {
   0
 }
 
+// The innermost slot this function pushed narrowing `key` at the binding it names now, or -1.
+function npFnSlotOf(key: string): i32 {
+  let base = crFnNpBase()
+  if base < 0 { base = 0 }
+  npSlotOf(key, base)
+}
+
 // Whether the place at node `place` is not a narrowing this function ended by a verdict a pin
 // could overturn. A place never narrowed, or narrowed and still live, answers true.
 function killedNarrowingSure(place: i32): boolean {
   if place < 0 || place >= P.nodes.length { return true }
   const key = placeKeyOf(place)
   if key == "" { return true }
-  let s = npKeys.length - 1
-  let base = crFnNpBase()
-  if base < 0 { base = 0 }
-  while s >= base {
-    if npKeys[s] == key {
-      if npInvBy[s] < 0 { return true }
-      return npKillSure[i32ToStr(npInvBy[s]) + "|" + key] ?? false
-    }
-    s = s - 1
-  }
-  true
+  const s = npFnSlotOf(key)
+  if s < 0 || npInvBy[s] < 0 { return true }
+  npKillSure[i32ToStr(npInvBy[s]) + "|" + key] ?? false
 }
 
 // Whether a write or a call ended the innermost narrowing of the place `place` in this
@@ -1316,28 +1312,14 @@ function killedNarrowingSure(place: i32): boolean {
 export function narrowingEndedAt(place: i32): boolean {
   const key = placeKeyOf(place)
   if key == "" { return false }
-  let s = npKeys.length - 1
-  let base = crFnNpBase()
-  if base < 0 { base = 0 }
-  while s >= base {
-    if npKeys[s] == key { return npInvBy[s] >= 0 }
-    s = s - 1
-  }
-  false
+  const s = npFnSlotOf(key)
+  s >= 0 && npInvBy[s] >= 0
 }
 
 // Whether any narrowing of the place `place`, live or ended, is recorded in this function.
 export function placeIsNarrowed(place: i32): boolean {
   const key = placeKeyOf(place)
-  if key == "" { return false }
-  let s = npKeys.length - 1
-  let base = crFnNpBase()
-  if base < 0 { base = 0 }
-  while s >= base {
-    if npKeys[s] == key { return true }
-    s = s - 1
-  }
-  false
+  key != "" && npFnSlotOf(key) >= 0
 }
 
 // Whether the innermost narrowing of the place `place` in this function is the remainder of an
@@ -1346,22 +1328,13 @@ export function placeIsNarrowed(place: i32): boolean {
 export function holeRemainderEndedSure(place: i32): boolean {
   const key = placeKeyOf(place)
   if key == "" { return false }
-  let s = npKeys.length - 1
-  let base = crFnNpBase()
-  if base < 0 { base = 0 }
-  while s >= base {
-    if npKeys[s] == key {
-      const by = npInvBy[s]
-      if by < 0 { return false }
-      if (holeElseTested[key + "|" + i32ToStr(npTys[s])] ?? -1) < 0 {
-        return false
-      }
-      if crAliasWr[by] ?? false { return true }
-      return npKillSure[i32ToStr(by) + "|" + key] ?? false
-    }
-    s = s - 1
-  }
-  false
+  const s = npFnSlotOf(key)
+  if s < 0 { return false }
+  const by = npInvBy[s]
+  if by < 0 { return false }
+  if (holeElseTested[key + "|" + i32ToStr(npTys[s])] ?? -1) < 0 { return false }
+  if crAliasWr[by] ?? false { return true }
+  npKillSure[i32ToStr(by) + "|" + key] ?? false
 }
 
 // One `if` link's checker state, carried from its head (condition, narrowing, then arm) to its
@@ -1405,6 +1378,7 @@ export type IfChk = {
 export function narPathsReset() {
   holeElseTested = Map()
   npKeys = []
+  npRoot = []
   npTys = []
   npInvBy = []
   narIpScope = []
