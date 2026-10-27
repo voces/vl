@@ -11117,3 +11117,43 @@ field read narrows back exactly, but nothing emitted that narrowing, and master 
 `exprIsI64` read the adopted struct; the read site keeps the literal at its own row instead. The
 D81/D139 destination pin (`synthDstPinAnn`) is measured for deletion rather than given a guard,
 because a guarded pin is still a second producer of the destination's rep.
+
+## A variant is a position in a union row, and union rows are keyed by member reps (ruling, D14551)
+
+Under structural records (D3870) a plain `{r: i32}` and a union's arm of the same shape are one
+type with two reps, so variant-ness cannot be a property of a record node or of a type. It is a
+property of a POSITION in a union row: variant identity is (union row, member position), minted
+by one producer (`mintVariantRows`) and read through `variantRowAt`/`variantRowInRowOfTy` where a
+row is in hand. Union rows are keyed by their members' reps (`repOf`), not their types. The
+earlier re-parse of a row's spelling made fresh nodes, a hidden second producer of position
+identity; readers that hold only a bare record type go through one named shim until each is
+migrated (D14552).
+
+## A binding or an inferred return that reads a later-decided list element is refused (ruling, D14497, D14560)
+
+An un-annotated binding whose initializer's type depends on an open-list element (`[]` or
+`__array_new_default__`) decided LATER in source order, by a `push` or store below it, is a DESIGN
+refusal at the binding: the type would depend on code the reader has not reached (TypeScript
+refuses the same shape as an evolving-array implicit `any`). An inferred RETURN is a commitment
+site exactly like a binding, with the same predicate and refusal; it is never inferred `void` from
+an unresolved read. Consumption in place (an operator, a compare, `??`, `print`) is not refused: it
+resolves through one read column after the last pin, re-deriving one level of parent, with no
+dependency walk.
+
+## The binder is the only identifier resolver (ruling, #4995)
+
+After B0 one walk writes `identDeclOf`, and nothing else resolves an identifier: the scope-stack
+compare, the pending-use queue and the by-name write fallback are deleted. A name→decl map that
+survives (the node-less flow, function-key and name-list callers) is a transitional second
+resolver and not an end state; B2 deletes it. A new Ident minted after binding takes its decl from
+its source (`identFrom`), never from a name.
+
+## Under $VL_FUEL a multi-root check runs in one instance (ruling, D14561)
+
+Guest fuel is a measuring instrument, so a reading must be a count of the work and not of the
+schedule. A pooled `vl check <dir>` serves some roots from a worker's memo, and which roots depends
+on the order workers pick them up, so the summed fuel differed on every run (diderven `check src`:
+three different totals across three runs). Under `$VL_FUEL` the root pool is off and the roots run
+in one instance, as `vl test`'s compile pool already did; one predicate, `compile_pool_allowed`,
+gates both pools. The unpooled reading is a different, larger number than any pooled one, so a
+baseline taken from a pooled run is re-measured, not compared.
