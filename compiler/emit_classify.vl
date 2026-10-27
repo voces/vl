@@ -198,7 +198,6 @@ import {
   litBaseTy,
   litUnionAliasNameOfTy,
   mkFuncTy,
-  mkNullableTyOf,
   numLitUnionBaseTy,
   oneListUnionRender,
   primNameStr,
@@ -329,7 +328,14 @@ import {
   parentBindingFrameOf,
   parentBindingOf,
 } from "./emit_capture_frames"
-import { ekDecl, elabAsgOf, elabNodeTyAt, litRepTyAt } from "./emit_elab"
+import {
+  ekDecl,
+  elabAsgOf,
+  elabKeyAt,
+  elabKeyReadsDefault,
+  elabNodeTyAt,
+  litRepTyAt,
+} from "./emit_elab"
 import {
   BC_F32,
   BC_F64,
@@ -474,15 +480,8 @@ import {
   initIsNestedStructFieldRead,
   letDeclTypeName,
   letInitHoleKind,
-  letInitIsNestedStructField,
   letInitProjKind,
-  letInitProjMapShape,
-  letInitTyIsFunc,
-  letInitTyIsNulFunc,
-  letInitTyIsNulValueUnion,
-  letInitTyIsStruct,
   letInitTyNulArmRow,
-  letInitTyStructRow,
   letInitTyVariantRow,
   lfCloneOnChain,
   lfFlatAt,
@@ -631,7 +630,6 @@ import {
   letInfStrListByUse,
   letIsF32,
   letIsNulBoolAnn,
-  letIsNulClosure,
   letIsNulList,
   letIsSet,
   paramIndexOf,
@@ -759,7 +757,6 @@ import {
   letAnnIsUnion,
   mfI32ResultOrColumn,
   mvNulListValKind,
-  nulStructRowOfNodeTy,
   optChainLeafNulListKind,
   outerFrameBinds,
   paramStructIndex,
@@ -3558,88 +3555,20 @@ function letInitTyNarrowedScalarKind(letIx: i32, fnIx: i32): VKind | null {
   null
 }
 
-// Does the binding at `letIx` take its value from a `??` whose niche operand joins to the
-// union box? The binding-side twin of the lowering's own gate, so the slot and the value
-// agree about the rep.
-export function letInitJoinsToUnionBox(letIx: i32, fnIx: i32): boolean {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letInit < 0 { return false }
-    return coalesceNicheJoinsToBox(unwrapParen(d.letInit), fnIx)
-  }
-  false
-}
-
-// The `fbValtype` kind an un-annotated binding's initializer decides, through the same
-// per-`let` predicates `collectLocals` types the binding with and in the same order — the one
-// home of that ladder, shared by `captureValKind` and `letCellKind`. `"i32"` when no arm
-// claims it. A missing nullable arm types the env field at the non-null kind (D21).
+// The `fbValtype` kind an un-annotated binding's initializer decides when its checked type
+// names no rep (`letBindRepClaims` declined), shared by `captureValKind` and `letCellKind`.
+// `"i32"` when no arm claims it. A missing nullable arm types the env field at the non-null
+// kind (D21).
 function letInitCellKind(letIx: i32, fnIx: i32): VKind {
-  // A never-filled `let x = null` is the `null` type, cell `nullref` — first, as in
-  // `collectLocals` (D1576). This is what types a captured such binding's env field; without
-  // it the field is an i32 holding 0 and the lambda reads a present value out of it.
+  // A never-filled `let x = null` is the `null` type, cell `nullref` (D1576). Without it the
+  // env field is an i32 holding 0 and the lambda reads a present value out of it.
   if letIsNulNone(letIx, fnIx) { return "nulnone" }
-  // A literal-union binding is an i32-backed interned atom, not a value-union box — first,
-  // ahead of `letIsVariant`, `letIsUnion` and `letIsString`.
+  // A literal-union binding is an i32-backed interned atom, not a value-union box.
   if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return "i32" }
-  // The `K | null` niche: the same i32 atom with the spare `-1` for null. Before
-  // `letIsNulString`, since a litunion softens to `string`.
+  // The `K | null` niche: the same i32 atom with the spare `-1` for null.
   if letNulLitUnion(letIx, fnIx) { return "i32" }
-  // A `??` niche JOIN binds the union BOX. Ahead of every rung below, since those read the
-  // OPERAND's rep and give the slot its niche — a bare `(ref $S)` holding a box (D1714).
-  if letInitJoinsToUnionBox(letIx, fnIx) { return "union" }
-  // An un-annotated binding of a NARROWED arm (D1741): the init hands over the union box and
-  // the checker typed the binding at the arm, so the cell is the arm and the boundary unboxes.
-  // Above every rung reading the init's own rep, each of which would give the cell a box that
-  // the consumers all read as the arm; below the `??` join, whose result IS the box.
-  if letInitTyIsNarrowedArm(letIx, fnIx) { return "variant" }
-  if letInitTyIsNarrowedNulArm(letIx, fnIx) { return "nulvariant" }
-  if letInitTyIsNarrowedLit(letIx, fnIx) { return "str" }
-  if letInitTyIsNarrowedNulStr(letIx, fnIx) { return "nulstr" }
   const nsk = letInitTyNarrowedScalarKind(letIx, fnIx)
   if nsk != null { return nsk }
-  // A nullable map, before `letIsMap`, whose `(ref $mapStruct)` cell cannot hold null.
-  if letIsNulMap(letIx, fnIx) { return "nulmap" }
-  // A bare `const t = m[k]` read of a list- or nested-map-valued map binds the value's
-  // established nullable kind, a union-valued one the shared box. Both before `letIsMap`.
-  const nmrK = letNulMapReadValKind(letIx, fnIx)
-  if nmrK != null { return nmrK }
-  if letNulMapReadUnionBox(letIx, fnIx) { return "union" }
-  // The LIST twin of the rung above, and it has to be frame-blind for the reason
-  // `letInitIsLitAtom` is: `letPopUnionBoxElem` resolves the receiver's ref-list slot through
-  // the ambient locals, and this ladder types a CAPTURE while the capturing frame's are
-  // loaded, where the parent's receiver resolves to nothing (D1883).
-  if letInitTyIsNulValueUnion(letIx, fnIx) { return "union" }
-  if letIsMap(letIx, fnIx) { return "map" }
-  // The nullable variant niche, before `nulstruct`: `collectS` refuses a variant its own
-  // struct row, so the two cannot share an index space.
-  if letIsNulVariant(letIx, fnIx) { return "nulvariant" }
-  if letIsNulRef(letIx, fnIx) { return "nulstruct" }
-  // The nullable lists, each before its non-null twin.
-  if letIsNulListInfer(letIx, fnIx) { return "nullist" }
-  const nulSLK = letNulScalarListKind(letIx, fnIx)
-  if nulSLK != null { return nulSLK }
-  if (
-    letIsStringArray(letIx, fnIx)
-    && !letIsUnion(letIx, fnIx)
-    && !letIsNulRefArray(letIx, fnIx)
-  ) {
-    return "strlist"
-  }
-  if (
-    letIsU8Array(letIx, fnIx)
-    && !letIsUnion(letIx, fnIx)
-    && !letIsNulRefArray(letIx, fnIx)
-  ) {
-    return "u8list"
-  }
-  if (
-    letIsF32Array(letIx, fnIx)
-    && !letIsUnion(letIx, fnIx)
-    && !letIsNulRefArray(letIx, fnIx)
-  ) {
-    return "f32list"
-  }
   if (
     letIsF64Array(letIx, fnIx)
     && !letIsUnion(letIx, fnIx)
@@ -3647,69 +3576,27 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   ) {
     return "f64list"
   }
-  if (
-    letIsI64Array(letIx, fnIx)
-    && !letIsUnion(letIx, fnIx)
-    && !letIsNulRefArray(letIx, fnIx)
-  ) {
-    return "i64list"
-  }
-  if letIsNulRefArray(letIx, fnIx) { return "nulreflist" }
   if letIsRefArray(letIx, fnIx) && !letIsUnion(letIx, fnIx) { return "reflist" }
-  // The nullable closure fat-pointer, before `letIsUnion` (the `fn | null` annotation reads
-  // as a union name) and before the non-null closure.
-  if (
-    letIsNulClosure(letIx, fnIx)
-    || letInfersNulClosure(letIx, fnIx)
-    || letInitTyIsNulFunc(letIx, fnIx)
-  ) {
-    return "nulclosure"
-  }
-  if letIsVariant(letIx, fnIx) { return "variant" }
   if letIsUnion(letIx, fnIx) { return "union" }
   if letIsStruct(letIx, fnIx) {
-    // Mirrored from `collectLocals`' own struct arm (D51): where the struct table has no row
-    // for the literal's field set and a union arm is the only claimant, the kind is
-    // `"variant"`. The kind selects the table — `fbValtype` reads `sHeapIdx` for a struct
-    // and `uVarHeap` for a variant — so the flip has to happen here or the slot is wrong.
+    // Mirrored from `collectLocals`' own struct arm (D14441): where the struct table has no
+    // row for the literal's field set and a union arm is the only claimant, the kind is
+    // `"variant"`, since the kind selects the table `fbValtype` reads the slot from.
     if structIndexOfLet(letIx, fnIx) < 0 {
       if letObjLitVariantIdx(letIx, fnIx) >= 0 { return "variant" }
     }
     return "struct"
   }
-  // A nested-struct FIELD read reads back `(ref null $S)` — the lowering folds `inner: S`
-  // and `inner: S | null` onto one code-15 hop — so its cell is the NULLABLE struct, ahead
-  // of the bare rung the `Index` projection takes (D1476).
-  if letInitIsNestedStructField(letIx) { return "nulstruct" }
-
-  // The arena rung: a PROJECTION commits no rep the syntactic ladder reads, and the checker
-  // recorded the type. Paired with `captureValStructIdx`'s own, since a kind whose slot
-  // stays -1 is a different refusal rather than half a fix.
-  if letInitTyIsStruct(letIx, fnIx) { return "struct" }
-  // The rest of that rung's family, one derivation for every rep the struct arm does not
-  // reach — a union box, a map, and the scalars and lists below whose answer it repeats.
-  // An atom is `letInitIsLitAtom`'s to claim, as it is in `collectLocals`: a projection typed
-  // as a string literal union that commits no atom is the string it reads (D5432).
+  // A projection commits no rep the syntactic ladder reads, and the checker recorded the
+  // type. An atom is `letInitIsLitAtom`'s to claim: a projection typed as a string literal
+  // union that commits no atom is the string it reads (D5432).
   const projK = letInitProjKind(letIx)
   if projK != null && !(projK == "i32" && letInitProjTyIsAtom(letIx, fnIx)) {
     return projK
   }
-  if letIsArray(letIx, fnIx) { return "list" }
-  if letIsNulString(letIx, fnIx) { return "nulstr" }
   if letIsString(letIx, fnIx) { return "str" }
-  if letIsI64(letIx, fnIx) { return "i64" }
-  if letInfersV128(letIx, fnIx) { return "v128" }
-  if letIsF32(letIx) || letInfersF32(letIx, fnIx) { return "f32" }
   if letIsF64(letIx, fnIx) { return "f64" }
   if letIsClosure(letIx, fnIx) { return "closure" }
-  // The arena rung beside it: a field, element or map read yields a function value the
-  // syntactic predicates cannot resolve during a pass that runs before the locals registry
-  // is built, and the checker already recorded a `TyFunc` for it. Structural, so a func
-  // ARRAY and a NULLABLE closure are excluded and only the plain rep claims (D1621).
-  if letInitTyIsFunc(letIx) { return "closure" }
-  // The `boolean | null` niche — a plain i32 to `fbValtype`, but a dedicated kind so the
-  // sentinel-2 rep is reachable and a later `x = null` stays valid.
-  if letNulBool(letIx, fnIx) { return "nulbool" }
   letInitHoleKind(letIx, fnIx)
 }
 
@@ -3758,27 +3645,11 @@ function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
   // The checker's record solve builds the binding at another record's storage.
   const rb = recBuildTyOf(letIx)
   if rb >= 0 { return rb }
-  // A literal no record row claims is stored as the union arm its fields name (D14441).
-  const avt = letVariantHeldTy(letIx, init, fnIx)
-  if avt >= 0 { return avt }
   const held = letLitHeldTy(init, fnIx)
   if held >= 0 { return held }
   const called = letCallHeldTy(init)
   if called >= 0 { return called }
   letNamedHeldTy(letIx, init, fnIx)
-}
-
-// The union arm the initializer `init` of binding `letIx` is stored as, where the emitter's variant
-// rule answers one, `| null` when the binding's type is nullable; -1 otherwise (D14441).
-function letVariantHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
-  let vi = letObjLitVariantIdx(letIx, fnIx)
-  if vi < 0 { vi = exprVariantIndex(init, fnIx) }
-  if vi < 0 || vi >= uVarTyIx.length || uVarTyIx[vi] < 0 { return -1 }
-  const own = nodeTyAt(letIx, fnIx)
-  if own >= 0 && own < T.tys.length && tyAt(own) is TyNullable {
-    return mkNullableTyOf(uVarTyIx[vi])
-  }
-  uVarTyIx[vi]
 }
 
 // The type the binding `init` names holds, where it holds only a literal built at another type than
@@ -3863,18 +3734,37 @@ function letMapCtorAtomKey(letIx: i32, ty: i32): boolean {
 
 // Whether binding `letIx`'s cell is the rep of the type it holds: that type answers a rep,
 // and the binding is not a never-filled `null`, a literal-union atom or its `K | null` niche,
-// whose cells the binding's own spelling decides. A type holding a type variable names no
-// rep: the value's row is the one its initializer delivers.
+// whose cells the binding's own spelling decides. A type holding a type variable, other than a
+// function type, names no rep: the value's row is the one its initializer delivers.
 export function letBindRepClaims(letIx: i32, fnIx: i32): boolean {
   if letIsNulNone(letIx, fnIx) { return false }
   if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return false }
   if letNulLitUnion(letIx, fnIx) { return false }
   const ty = letBindTy(letIx, fnIx)
-  if ty < 0 || tyHasTyVar(ty) || tyHasTyVar(letBindTy(letIx, -1)) {
+  if ty < 0 { return false }
+  // A function value's cell is the closure rep whatever its type variables bind to; a list or
+  // record of one is not, since its row names the signature.
+  if tyHasTyVar(ty) {
+    const t0 = tyAt(ty)
+    const inner = if t0 is TyNullable { t0.nInner } else { ty }
+    if !tyIsFuncArena(inner) { return false }
+  }
+  // A parameter the D4551 default bound is a guess at the value, not its type.
+  if fnIx >= 0 && elabKeyReadsDefault(elabKeyAt(fnIx), letBindTy(letIx, -1)) {
     return false
   }
   if letMapCtorAtomKey(letIx, ty) { return false }
-  repOfNodeAt(letIx, ty).rdCovered == 1
+  const rd = repOfNodeAt(letIx, ty)
+  if rd.rdCovered != 1 { return false }
+  // A row kind whose type has no row names no cell.
+  const k = rd.rdKind
+  const rowed = (k == "struct"
+    || k == "nulstruct"
+    || k == "variant"
+    || k == "nulvariant"
+    || k == "reflist"
+    || k == "nulreflist")
+  !rowed || repSlotOfKind(k, ty) >= 0
 }
 
 // The rep of binding `letIx`'s cell, read off the type it holds.
@@ -5165,35 +5055,12 @@ export function captureValStructIdx(fe: i32, name: string) {
         // un-annotated arm makes, and for the same reason: `letIsMap`, `letIsNulRef` and
         // `letIsRefArray` all forward `pf` to `P.nodes[pf]`.
         const pf = parentBindingFrameArenaOf(fe, name)
-        // The kind-specific companion index, arm for arm with `letInitCellKind` and with the
-        // slot arguments `collectLocals` passes `addLocalName` for the same bindings. A kind
-        // without its slot is a loud reject and not a fallback: `fbValtype`'s bounds guard
-        // turns a -1 on any ref kind into `ref valtype with no interned shape` (D21).
-        if letInitTyIsNarrowedArm(b, pf) { return letInitTyVariantRow(b, pf) }
-        if letInitTyIsNarrowedNulArm(b, pf) { return letInitTyNulArmRow(b, pf) }
-        if letIsNulMap(b, pf) { return nulMapShapeOf(b, pf) }
-        if letNulMapReadValKind(b, pf) != null {
-          return letNulMapReadSlotArg(b, pf)
-        }
-        if letIsMap(b, pf) { return letMapShapeOf(b, pf) }
-        if letIsNulVariant(b, pf) { return nulVariantIdxOfLet(b, pf) }
-        if letIsNulRef(b, pf) {
-          const nri = nulRefStructIdxOfLet(b, pf)
-          if nri >= 0 { return nri }
-          // A copy of a narrowed module-block binding has no syntactic row; the checker's recorded
-          // type names the row its cell is declared at (D6730).
-          if letInitTyIsStruct(b, pf) { return letInitTyStructRow(b, pf) }
-          return nulStructRowOfNodeTy(bn.letInit)
-        }
-        if letIsNulRefArray(b, pf) { return nulRefArrayInnerSlotOfLet(b, pf) }
+        // The companion index of `letInitCellKind`'s ref kinds, arm for arm. A kind without
+        // its slot is a loud reject and not a fallback: `fbValtype`'s bounds guard turns a -1
+        // on any ref kind into `ref valtype with no interned shape` (D21).
         if letIsRefArray(b, pf) && !letIsUnion(b, pf) {
           return letRefListSlot(b, pf)
         }
-        if letIsVariant(b, pf) { return variantIndexOfLet(b, pf) }
-        // The struct rung is a `letIs*` classifier like every rung above it (D731):
-        // `letInitCellKind` types this env field `"struct"` for every struct-valued initializer,
-        // so a slot column answering only for a bare object literal leaves the pair
-        // (`"struct"`, -1). `structIndexOfLet` is the ladder `collectLocals` runs one class over.
         if letIsStruct(b, pf) {
           const csi = structIndexOfLet(b, pf)
           if csi < 0 {
@@ -5202,20 +5069,6 @@ export function captureValStructIdx(fe: i32, name: string) {
           }
           return csi
         }
-        // The arena rung's companion, paired with `letInitCellKind`'s: a projection
-        // initialiser's struct row comes from the type the checker recorded, since
-        // `structIndexOfLet` reads a spelling the projection does not carry (D1476).
-        if letInitTyIsStruct(b, pf) { return letInitTyStructRow(b, pf) }
-        // The NULLABLE twin of that rung, paired with `letInitProjKind`'s `nulstruct` answer: a
-        // `box.f: S | null` projection whose receiver no syntactic rung resolves (an un-annotated
-        // module-block binding, D1636) takes its inner row from the recorded `S | null` type.
-        // Without it the kind is `nulstruct` and its slot stays -1 — half a pair (D1933).
-        const nsr = nulStructRowOfNodeTy(bn.letInit)
-        if nsr >= 0 { return nsr }
-        // Its map twin, paired with `letInitProjKind`'s own map arm: a `"map"` cell whose
-        // shape stays -1 is the mono map, which is a different layout and not half a fix.
-        const pms = letInitProjMapShape(b)
-        if pms != -1 { return pms }
       }
     }
     // No other binding has a captured slot.
