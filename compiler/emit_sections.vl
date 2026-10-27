@@ -24,6 +24,7 @@ import {
 } from "./check_getter_effects"
 import { refViewSrcTys } from "./check_ref_list_view"
 import { lbiArenaReset } from "./check_num_lit_state"
+import { cexLitPeel } from "./check_num_lits"
 import { T, TyLit, tyLitMemberTexts } from "./check_types"
 import {
   ATOMIC_SIG_CMPXCHG,
@@ -7334,6 +7335,15 @@ function scanPrintReset() {
   0
 }
 
+// Flag the scalar width node `ix` is built at, as its literal value.
+function scanPrintLitWidth(ix: i32, saw: PrintScanSaw) {
+  const w = numLitTyWidth(ix, -1)
+  if w == "f64" { saw.sawF64 = true }
+  if w == "f32" { saw.sawF32 = true }
+  if w == "i64" { saw.sawI64Ann = true }
+  0
+}
+
 // Detects `print(...)`/memory-intrinsic use anywhere in the program: any print pulls in the
 // 4-import print family (imports shift every local function's wasm index, so this is decided
 // up front). "Any print" is the property, not the spelling `print(` — three constructs lower
@@ -7352,6 +7362,8 @@ function scanPrintUse() {
     sawFloatRem: false,
     sawRemUnknown: false,
   }
+  const litAsgs: i32[] = []
+  const stmtDropped: Map<i32, boolean> = Map()
   while pscan < P.nodes.length {
     const pn = nodeAt(pscan)
     // A map an `is` or `as` names joins its struct's tag family even where no union arm is
@@ -7472,11 +7484,27 @@ function scanPrintUse() {
     // A literal flags the width it is built at, so `print(0xDEAD_BEEF)` pulls in the
     // `__print_i64__` import even with no `i64` annotation.
     // A literal the check never typed is a constant tree's folded-away operand, built nowhere.
-    if pn is NumLit {
-      const w = numLitTyWidth(pscan, -1)
-      if w == "f64" { saw.sawF64 = true }
-      if w == "f32" { saw.sawF32 = true }
-      if w == "i64" { saw.sawI64Ann = true }
+    if pn is NumLit { scanPrintLitWidth(pscan, saw) }
+    // So does an assignment whose value is a number literal and is read, built at the
+    // assignment's own type; a top-level statement or a block's non-last one is never read.
+    if pn is BinExpr {
+      if (
+        pn.binOp == "="
+        && pn.binCompound == ""
+        && cexLitPeel(pn.binRight) >= 0
+      ) {
+        litAsgs.push(pscan)
+      }
+    }
+    if pn is Block {
+      let k = 0
+      while k + 1 < pn.blkStmts.length {
+        stmtDropped.set(unwrapParen(pn.blkStmts[k]), true)
+        k = k + 1
+      }
+    }
+    if pn is Program {
+      for ps in pn.progStmts { stmtDropped.set(unwrapParen(ps), true) }
     }
     // An explicit `x as T` cast target rides as a string field (`asTy`), not a `TypeRef` node, so
     // the annotation scan above misses it. Flag its scalar directly, or `print(x as i64)`/`print(x as f64)` would route to an undeclared import.
@@ -7496,6 +7524,9 @@ function scanPrintUse() {
       }
     }
     pscan = pscan + 1
+  }
+  for a in litAsgs {
+    if !(stmtDropped.get(a) ?? false) { scanPrintLitWidth(a, saw) }
   }
   // D1586 — the float-remainder helper. A `%` with no recorded type is only counted when
   // the module mentions a float somewhere, which is what keeps an integer-only program's
