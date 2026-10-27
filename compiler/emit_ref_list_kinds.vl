@@ -41,7 +41,6 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
-  i32ToStr,
   nodeAt,
 } from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
@@ -66,12 +65,10 @@ import {
   tyIsLitUnionArray,
 } from "./check_types"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
-import { objLitNameCands, sScanLim } from "./emit_atom_kinds"
 import {
   nameIsF32Array,
   nameIsU8Array,
   parentLetOf,
-  parentLetOwnerOf,
   unwrapParen,
 } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
@@ -84,8 +81,6 @@ import {
 import {
   annRefArrSlot,
   nonNulBaseOf,
-  rlElemStructIdxAt,
-  structIdxOfElemTy,
   tyRefArrElemOf,
 } from "./emit_map_value_slots"
 import { globalLetOf, variantIndexOf } from "./emit_narrow_slots"
@@ -93,16 +88,14 @@ import {
   nulScalarListBuildKind,
   nulVariantIndexOf,
   repABNote,
-  structIdxOfElemName,
 } from "./emit_nullable_rets"
 import { emptyArrHoleElemSlot } from "./emit_obj_lit_fits"
-import { letInfStrListByUse, paramIndexOf } from "./emit_query"
+import { letInfStrListByUse } from "./emit_query"
 import { RepDesc, repOfTy, repShadowOn, repStructSlotsTwin } from "./emit_rep"
 import { repSlotOfKind } from "./emit_rep_slot"
 import {
   annIsNulLitUnionArray,
   emptyArrLitIxOf,
-  rlElemInnerSlot,
   rlElemStructRow,
   tyIsNulLitUnionArr,
 } from "./emit_shape_rows"
@@ -119,17 +112,14 @@ import {
   LBK_U8_LIST,
   LBK_UNION,
   RLK_CLOSURE,
-  RLK_REF_LIST,
   RLK_STRUCT,
   RLK_UNION,
   VKind,
-  emitRootIx,
   rlElemKindTbl,
   rlElemName,
   rlElemNullable,
   rlWrAns,
   rlWrSlots,
-  sFieldCount,
   sHeapIdx,
   uVarHeap,
 } from "./emit_state"
@@ -137,12 +127,9 @@ import {
   ArrNewKind,
   arrNewKindOfListVKind,
   rlSlotOfTy,
-  sFieldIndex,
   tyIsRefListElemTy,
   tyPrimLeafElemName,
 } from "./emit_struct_order"
-import { memoGenNew } from "./memo"
-import { sidOfNode } from "./symbols"
 import { isNullTy, nonNullTy, tyHasTyVar, tyIsU8ArrayTy } from "./tyquery"
 export {
   tyPrimLeafListKind,
@@ -565,218 +552,12 @@ export function rlWidenAllowed(
   covarValueWriteState(rootName, rootFrame) == 0
 }
 
-// The first element of a list literal that is neither an object literal nor `null`, or -1: a
-// record some other expression already built, at a row of its own, which a re-seated list
-// cannot hold.
-export function rsFirstBuiltElem(elems: i32[]): i32 {
-  let k = 0
-  while k < elems.length {
-    const e = unwrapParen(elems[k])
-    if e >= 0 && rsIsBuiltRecord(e) { return e }
-    k = k + 1
-  }
-  -1
-}
-
-// Whether the element at `e` is neither an object literal nor `null`.
-export function rsIsBuiltRecord(e: i32): boolean {
-  const n = nodeAt(e)
-  if n is ObjLit { return false }
-  !(n is NullLit)
-}
-
-// Whether the node at `li` is an annotated `let` whose initializer is `x`.
-export function rsAnnLetInitIs(li: i32, x: i32): boolean {
-  if li < 0 { return false }
-  const d = nodeAt(li)
-  if d is LetDecl {
-    if d.letType >= 0 && d.letInit >= 0 { return unwrapParen(d.letInit) == x }
-  }
-  false
-}
-
-// Whether struct row `si` has exactly the field names of the object literal at `objIx`.
-export function rsRowNamesObjLit(si: i32, objIx: i32): boolean {
-  const o = nodeAt(objIx)
-  if o is ObjLit {
-    if si >= sFieldCount.length || sFieldCount[si] != o.objFields.length {
-      return false
-    }
-    let k = 0
-    while k < o.objFields.length {
-      const f = nodeAt(o.objFields[k])
-      if f is FieldInit {
-        if sFieldIndex(si, f.fiName) < 0 { return false }
-      } else {
-        return false
-      }
-      k = k + 1
-    }
-    return true
-  }
-  false
-}
-
-// One question `rsUsesOf` asks of a scope: the uses of `rwName`, which names the re-seated
-// list, one element of it (`rwElem`), or a function whose calls return one (`rwCall`), bound by
-// `rwOwnLet` and stored at struct row `rwRow`; `rwList` is the list's own name and `rwHome` the
-// function binding it, -1 at the top level.
-export type RsWalk = {
-  rwScope: i32,
-  rwOwnLet: i32,
-  rwName: string,
-  rwElem: boolean,
-  rwRow: i32,
-  rwList: string,
-  rwHome: i32,
-  rwCall: boolean,
-}
-
-export const rsQueryGen = memoGenNew(0)
-
-// The key of `nm`'s identifier chain within function `fr` (-1 the top level).
-export function rsFnKey(nm: string, fr: i32): string { nm + "@" + i32ToStr(fr) }
-
-// Whether the node at `p`, an ancestor below the scope reached through its child `cur`,
-// leaves the name bound to `w`'s binding.
-export function rsLevelKeeps(p: i32, cur: i32, w: RsWalk): boolean {
-  if nodeAt(p) is FuncDecl { return !dsRebindsName(p, w.rwName) }
-  rsForKeeps(p, cur, w) && rsBlockKeeps(p, cur, w)
-}
-
-// `rsLevelKeeps` at a `for`: its body reads the loop variables, not an outer binding.
-function rsForKeeps(p: i32, cur: i32, w: RsWalk): boolean {
-  const n = nodeAt(p)
-  if n is ForIn {
-    if cur == n.fiBody { return n.fiVar != w.rwName && n.fiVar2 != w.rwName }
-  }
-  true
-}
-
-// `rsLevelKeeps` at a block: a `let` of the name before `cur` rebinds it.
-function rsBlockKeeps(p: i32, cur: i32, w: RsWalk): boolean {
-  const n = nodeAt(p)
-  if n is Block { return !rsBlockBindsBefore(n.blkStmts, cur, w.rwName, -1) }
-  true
-}
-
-// Whether a `let` of `nm` other than `own` stands before statement `cur` in `stmts`.
-export function rsBlockBindsBefore(
-  stmts: i32[],
-  cur: i32,
-  nm: string,
-  own: i32,
-): boolean {
-  let k = 0
-  while k < stmts.length && stmts[k] != cur {
-    const st = nodeAt(stmts[k])
-    if st is LetDecl {
-      if st.letName == nm && stmts[k] != own { return true }
-    }
-    k = k + 1
-  }
-  false
-}
-
-// Whether statement `a` comes before statement `b` in `stmts`.
-export function rsStmtBefore(stmts: i32[], a: i32, b: i32): boolean {
-  let k = 0
-  while k < stmts.length {
-    if stmts[k] == a { return true }
-    if stmts[k] == b { return false }
-    k = k + 1
-  }
-  false
-}
-
-// `w` asked of the name `nm` bound by `own` in `scope`, naming the list or (`elem`) an element.
-export function rsWalkAt(
-  w: RsWalk,
-  scope: i32,
-  own: i32,
-  nm: string,
-  elem: boolean,
-): RsWalk {
-  const e: RsWalk = {
-    rwScope: scope,
-    rwOwnLet: own,
-    rwName: nm,
-    rwElem: elem,
-    rwRow: w.rwRow,
-    rwList: w.rwList,
-    rwHome: w.rwHome,
-    rwCall: false,
-  }
-  e
-}
-
-// The loop variable of a `for` at `par` iterating the list at `o`, or "".
-export function rsForVarOver(o: i32, par: i32, w: RsWalk): string {
-  if w.rwElem { return "" }
-  const fi = nodeAt(par)
-  if fi is ForIn {
-    if unwrapParen(fi.fiIter) == o { return fi.fiVar }
-  }
-  ""
-}
-
-// The un-annotated binding that takes the use at `o` as the same value under another name —
-// `const x = il`, `const x = il[k]`, or `const y = x` for an element `x` — or -1.
-export function rsAliasOf(o: i32, par: i32, gp: i32, w: RsWalk): i32 {
-  if rsLetInitIs(par, o) { return par }
-  if !w.rwElem && rsIndexOfName(par, w.rwName) && rsLetInitIs(gp, par) {
-    return gp
-  }
-  -1
-}
-
 // Whether the node at `li` is an un-annotated `let` whose initializer is `x`.
 export function rsLetInitIs(li: i32, x: i32): boolean {
   if li < 0 { return false }
   const d = nodeAt(li)
   if d is LetDecl {
     if d.letType < 0 && d.letInit >= 0 { return unwrapParen(d.letInit) == x }
-  }
-  false
-}
-
-// The name the identifier at `x` reads, or "" when `x` is not an identifier.
-export function rsIdentName(x: i32): string {
-  if x < 0 || x >= P.nodes.length { return "" }
-  const n = nodeAt(x)
-  if n is Ident { return n.identName }
-  ""
-}
-
-// Whether the node at `x` is an index read `nm[k]`.
-export function rsIndexOfName(x: i32, nm: string): boolean {
-  if x < 0 { return false }
-  const n = nodeAt(x)
-  if n is Index { return rsIdentName(unwrapParen(n.idxArr)) == nm }
-  false
-}
-
-// Whether the callee at `cx` is `nm.push`, which stores into the re-seated storage itself.
-export function rsIsPushOnto(cx: i32, nm: string): boolean {
-  const c = unwrapParen(cx)
-  if c < 0 { return false }
-  const m = nodeAt(c)
-  if m is Member {
-    return m.memProp == "push" && rsIdentName(unwrapParen(m.memObj)) == nm
-  }
-  false
-}
-
-// Whether function `fr` declares a return other than the re-seated row (`list`: a list of it);
-// an inferred return takes the storage's own row.
-export function rsFnRetDeclaredNot(fr: i32, list: boolean, w: RsWalk): boolean {
-  if fr < 0 { return false }
-  const fd = nodeAt(fr)
-  if fd is FuncDecl {
-    if fd.fnRet < 0 { return false }
-    const rt = nodeTyIxOf(fd.fnRet)
-    if list { return !rsTyIsRow(tyRefArrElemOf(rt), w) }
-    return !rsTyIsRow(rt, w)
   }
   false
 }
@@ -790,14 +571,6 @@ export function rsFnRetTy(fr: i32): i32 {
   -1
 }
 
-// Whether `ix`, under parent `par`, is a statement of function `fr`'s own body block.
-export function rsIsBodyStmtOf(ix: i32, par: i32, fr: i32): boolean {
-  if fr < 0 || fr >= P.nodes.length || ix < 0 { return false }
-  const fd = nodeAt(fr)
-  if fd is FuncDecl { return par == fd.fnBody || unwrapParen(fd.fnBody) == ix }
-  false
-}
-
 // Whether arena type `ty` is a record, `| null` peeled.
 export function rsTyIsRecord(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
@@ -806,214 +579,10 @@ export function rsTyIsRecord(ty: i32): boolean {
   t is TyObj
 }
 
-// Whether function `fr` has no declared return type.
-export function rsFnRetInferred(fr: i32): boolean {
-  if fr < 0 { return false }
-  const fd = nodeAt(fr)
-  if fd is FuncDecl { return fd.fnRet < 0 }
-  false
-}
-
-// The type a store `place = v` in function `fr` delivers its value at: an element's or a
-// field's (a map's read type carries a `| null` every caller peels), or a bare name's declared
-// one, a parameter's or an annotated binding's (D2990). -1 for an un-annotated binding.
-export function rsPlaceStoreTy(p: BinExpr, fr: i32): i32 {
-  const lx = unwrapParen(p.binLeft)
-  if lx < 0 || lx >= P.nodes.length { return -1 }
-  const l = nodeAt(lx)
-  if l is Ident {
-    if paramIndexOf(fr, l.identName) < 0 {
-      const li = destLetOf(l.identName, fr)
-      if li < 0 || rsLetUnannotated(li) { return -1 }
-    }
-  }
-  nodeTyIxOf(lx)
-}
-
-// The object literal the un-annotated binding at `li` is initialised with, or -1.
-export function rsLetLitInit(li: i32): i32 {
-  if li < 0 || li >= P.nodes.length { return -1 }
-  const d = nodeAt(li)
-  if d is LetDecl {
-    if d.letType >= 0 || d.letInit < 0 { return -1 }
-    const ini = unwrapParen(d.letInit)
-    if ini >= 0 && nodeAt(ini) is ObjLit { return ini }
-  }
-  -1
-}
-
-// The checked type of the parameter the argument `argIx` of call `c` is passed to, or -1. A
-// `.push` stores its argument as the receiver list's element.
-export function rsCallParamTy(c: Call, argIx: i32): i32 {
-  const cf = nodeAt(unwrapParen(c.callFn))
-  if cf is Member {
-    if cf.memProp == "push" {
-      return tyRefArrElemOf(nodeTyIxOf(unwrapParen(cf.memObj)))
-    }
-    // `m.set(k, v)` stores `v` at the map's value type, as `m[k] = v` does (D3195).
-    if cf.memProp == "set" && c.callArgs.length == 2 {
-      const mt = nonNullTy(nodeTyIxOf(unwrapParen(cf.memObj)))
-      if mt >= 0 && mt < T.tys.length {
-        const m = tyAt(mt)
-        if m is TyMap {
-          if m.mSet != 0 || unwrapParen(c.callArgs[1]) != argIx { return -1 }
-          return m.mVal
-        }
-      }
-    }
-  }
-  const ft = nodeTyIxOf(c.callFn)
-  if ft < 0 || ft >= T.tys.length { return -1 }
-  const t = tyAt(ft)
-  if t is TyFunc {
-    let k = 0
-    while k < c.callArgs.length {
-      if unwrapParen(c.callArgs[k]) == argIx {
-        if k < t.fnParamTypes.length { return t.fnParamTypes[k] }
-        return -1
-      }
-      k = k + 1
-    }
-  }
-  -1
-}
-
-// Whether the value at `ix`, whose parent node is `par`, is what function `fr` returns:
-// a `return` operand or the tail of its body.
-export function rsIsReturned(ix: i32, par: i32, fr: i32): boolean {
-  if fr < 0 { return false }
-  if nodeAt(par) is RetStmt { return true }
-  const fd = nodeAt(fr)
-  if fd is FuncDecl {
-    if par == fr { return unwrapParen(fd.fnBody) == ix }
-    if par == fd.fnBody { return rsIsLastStmt(par, ix) }
-  }
-  false
-}
-
-// Whether the node at `ix` is a `let` or `const` with no annotation.
-export function rsLetUnannotated(ix: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const d = nodeAt(ix)
-  if d is LetDecl { return d.letType < 0 }
-  false
-}
-
-// Whether `ix` is the last statement of the block at `bx`.
-export function rsIsLastStmt(bx: i32, ix: i32): boolean {
-  const b = nodeAt(bx)
-  if b is Block {
-    const n = b.blkStmts.length
-    return n > 0 && unwrapParen(b.blkStmts[n - 1]) == ix
-  }
-  false
-}
-
-// The struct row a ref-list slot's element is, `| null` peeled, or -1.
-export function rsSlotRow(slot: i32): i32 {
-  if slot < 0 || slot >= rlElemName.length { return -1 }
-  const a = rlElemStructIdxAt(slot)
-  if a >= 0 { return a }
-  structIdxOfElemName(rlElemName[slot])
-}
-
 // Whether struct rows `a` and `b` share one heap type.
 export function rsSameRow(a: i32, b: i32): boolean {
   if a < 0 || b < 0 { return false }
   repStructSlotsTwin(a, b) == 1
-}
-
-// Whether ref-list `slot` holds the re-seated row, nullable or not.
-export function rsSlotIsRow(slot: i32, w: RsWalk): boolean {
-  rsSameRow(rsSlotRow(slot), w.rwRow)
-}
-
-// Whether arena type `ty` is the re-seated row, nullable or not.
-export function rsTyIsRow(ty: i32, w: RsWalk): boolean {
-  if ty < 0 { return false }
-  rsSameRow(structIdxOfElemTy(ty), w.rwRow)
-}
-
-// Whether two or more struct rows carry exactly the field names of the object literal at `ix`:
-// with one, the row the literal picks is the only one a destination can name either.
-export function objLitNamesTwoRows(ix: i32): boolean {
-  const o = nodeAt(ix)
-  if o is ObjLit {
-    const nf = o.objFields.length
-    let hits = 0
-    const cands = objLitNameCands(o, sScanLim())
-    let ci = 0
-    while ci < cands.length {
-      const si = cands[ci]
-      if sFieldCount[si] == nf {
-        let ok = true
-        let k = 0
-        while k < nf && ok {
-          const f = nodeAt(o.objFields[k])
-          if f is FieldInit {
-            if sFieldIndex(si, f.fiName) < 0 { ok = false }
-          } else {
-            ok = false
-          }
-          k = k + 1
-        }
-        if ok { hits = hits + 1 }
-        if hits >= 2 { return true }
-      }
-      ci = ci + 1
-    }
-  }
-  false
-}
-
-// The bound `LetDecl`'s own name, or "" out of range / not a let.
-export function letBoundName(letIx: i32): string {
-  if letIx < 0 || letIx >= P.nodes.length { return "" }
-  const d = nodeAt(letIx)
-  if d is LetDecl { return d.letName }
-  ""
-}
-
-// The scope a name-matched destination scan has to stay inside (D661), as an arena index to
-// start the walk at, or -1 when this binding's scope is not knowable here. A local's first
-// binding walks the body, a later same-named one the block holding it (D2685), a global the
-// program; otherwise decline, keeping the whole-arena scan rather than miss a destination.
-export function dsScopeRootOf(letIx: i32, nm: string, fnIx: i32): i32 {
-  if fnIx >= 0 {
-    const fn = nodeAt(fnIx)
-    if fn is FuncDecl {
-      if parentLetOf(fn.fnBody, nm) == letIx { return fn.fnBody }
-      const own = parentLetOwnerOf(fn.fnBody, sidOfNode(letIx), letIx)
-      if own >= 0 { return own }
-    }
-  }
-  if globalLetOf(nm) == letIx {
-    if emitRootIx >= 0 {
-      const r = nodeAt(emitRootIx)
-      if r is Program { return emitRootIx }
-    }
-  }
-  -1
-}
-
-// Does the nested function at `fIx` rebind `nm`? Then its body's uses of the name denote its
-// own binding, never the one being classified, so the walk must not enter it. Both binding
-// forms a function introduces — a `const nm = …` anywhere in the body, and a parameter named
-// `nm` — since either alone leaks.
-export function dsRebindsName(fIx: i32, nm: string): boolean {
-  const fn = nodeAt(fIx)
-  if fn is FuncDecl {
-    if parentLetOf(fn.fnBody, nm) >= 0 { return true }
-    let i = 0
-    while i < fn.fnParams.length {
-      const p = nodeAt(fn.fnParams[i])
-      if p is Param {
-        if p.parName == nm { return true }
-      }
-      i = i + 1
-    }
-  }
-  false
 }
 
 // The `LetDecl` a destination NAME resolves to — the enclosing function's own binding
@@ -1027,18 +596,6 @@ export function destLetOf(name: string, fnIx: i32): i32 {
     }
   }
   globalLetOf(name)
-}
-
-// The ref-list slot of element kind `want` NESTED inside `slot`, or -1: a list-of-lists
-// row (element kind 9) holds its inner list's slot, and that inner list is the destination
-// forms (b) and (c) hand this binding.
-export function rlInnerKindListSlot(slot: i32, want: i32): i32 {
-  if slot < 0 { return -1 }
-  if slot >= rlElemKindTbl.length { return -1 }
-  if rlElemKindTbl[slot] != RLK_REF_LIST { return -1 }
-  const iv = rlElemInnerSlot(slot)
-  if rlSlotIsKindList(iv, want) { return iv }
-  -1
 }
 
 // True when `slot` is a live ref-list row whose element kind is `want` — 2 is the union box,

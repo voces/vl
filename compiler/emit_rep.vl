@@ -53,6 +53,7 @@ import {
   mvValArmSig,
   mvValName,
   mvValTyIx,
+  sAnonOwnTy,
   sFieldCount,
   sFieldElemKeyKind,
   sFieldElemName,
@@ -447,6 +448,7 @@ function repKeyMemoSync() {
     // The identity twin's memo shares this generation exactly — one sync, two columns,
     // so the two can never disagree about which generation they are in.
     hcCanonMemo = []
+    hcRowMemo = []
   }
   0
 }
@@ -474,17 +476,17 @@ function repFieldLitAsSet(ty: i32): i32[] {
   out
 }
 
-// Which equivalence a rep key renders. `canon` is the full structural key; `elem` is the
-// ref-list element key, which folds the i32- and string-backed leaf lists to one token each and
-// keeps a declared struct nominal; `mv` is the map-value key, nominal like `elem` but with no
-// leaf fold, since `i32[]`, `boolean[]` and `K[]` are distinct mv rows.
-type RepKeyMode = "canon" | "elem" | "mv"
+// Which equivalence a rep key renders: `canon` the full structural key; `elem` the ref-list
+// element key (leaf lists folded to one token each, a declared struct nominal); `mv` the map-value
+// key, nominal with no leaf fold; `row` is `canon` with every function type keyed as its one
+// closure cell, which is a struct row's identity.
+type RepKeyMode = "canon" | "elem" | "mv" | "row"
 
 // Whether `mode` is the full structural key: it expands a declared struct, softens a
 // literal-union field to its base, and keys a bare literal as its base scalar.
 function repKeyIsCanon(mode: RepKeyMode): boolean {
   match mode {
-    "canon" => {
+    "canon" | "row" => {
       return true
     }
     "elem" | "mv" => {
@@ -499,7 +501,7 @@ function repKeyFoldsLeafList(mode: RepKeyMode): boolean {
     "elem" => {
       return true
     }
-    "canon" | "mv" => {
+    "canon" | "mv" | "row" => {
       return false
     }
   }
@@ -646,6 +648,9 @@ function repKeyStackOf(mode: RepKeyMode): i32[] {
     "mv" => {
       return repMvKeyStack
     }
+    "row" => {
+      return repRowKeyStack
+    }
   }
 }
 
@@ -662,7 +667,7 @@ function repKeyMemoGet(ty: i32, mode: RepKeyMode): string {
       if ty < repElemMemo.length { return repElemMemo[ty] }
       return ""
     }
-    "mv" => {
+    "mv" | "row" => {
       return ""
     }
   }
@@ -678,7 +683,7 @@ function repKeyMemoPut(ty: i32, mode: RepKeyMode, s: string) {
       while repElemMemo.length <= ty { repElemMemo.push("") }
       repElemMemo[ty] = s
     }
-    "mv" => {}
+    "mv" | "row" => {}
   }
   0
 }
@@ -730,6 +735,7 @@ function repKeyGo(ty: i32, mode: RepKeyMode): string {
       return repKeyUnion(t.uMembers, mode)
     }
     TyFunc => {
+      if mode == "row" { return "=>" }
       let s = "("
       let i = 0
       while i < t.fnParamTypes.length {
@@ -966,6 +972,7 @@ export function repMvValKey(ty: i32): string { repKeyOf(ty, "mv") }
 
 // Cycle guard (de Bruijn back-edges), mirroring `repElemKeyStack`.
 const repMvKeyStack: i32[] = []
+const repRowKeyStack: i32[] = []
 
 // Record the arena type of the map value name just pushed onto `mvValName`, padded
 // with -1 so a site that skips this self-heals to uncovered. `rowTy` is the caller's
@@ -1294,6 +1301,7 @@ export function hcReset() {
   // restarts mid-compile. The two ty->id memos hold ids as values and the slot cache
   // holds them as indices; both would index the previous space's rows if not cleared here.
   hcCanonMemo = []
+  hcRowMemo = []
   hcElemMemo = []
   hcMvMemo = []
   hcImpure = 0
@@ -1443,8 +1451,15 @@ let hcElemMemo: i32[] = []
 const hcElemStack: i32[] = []
 let hcMvMemo: i32[] = []
 const hcMvStack: i32[] = []
+let hcRowMemo: i32[] = []
+const hcRowStack: i32[] = []
 
 export function repCanonId(ty: i32): i32 { repIdOf(ty, "canon") }
+
+// A struct row's identity: the canonical id with every function type keyed as the closure cell
+// it is stored as, so records apart only in a function field's type share one row. The row's
+// reader takes that field's type from the position, never from the row.
+export function repRowId(ty: i32): i32 { repIdOf(ty, "row") }
 
 export function repElemId(ty: i32): i32 { repIdOf(ty, "elem") }
 
@@ -1515,6 +1530,9 @@ function hcStackOf(mode: RepKeyMode): i32[] {
     "mv" => {
       return hcMvStack
     }
+    "row" => {
+      return hcRowStack
+    }
   }
 }
 
@@ -1537,6 +1555,11 @@ function hcMemoGet(ty: i32, mode: RepKeyMode): i32 {
       if ty < hcMvMemo.length { return hcMvMemo[ty] }
       return -1
     }
+    "row" => {
+      repKeyMemoSync()
+      if ty < hcRowMemo.length { return hcRowMemo[ty] }
+      return -1
+    }
   }
 }
 
@@ -1554,6 +1577,10 @@ function hcMemoPut(ty: i32, mode: RepKeyMode, r: i32) {
       while hcMvMemo.length <= ty { hcMvMemo.push(-1) }
       hcMvMemo[ty] = r
     }
+    "row" => {
+      while hcRowMemo.length <= ty { hcRowMemo.push(-1) }
+      hcRowMemo[ty] = r
+    }
   }
   0
 }
@@ -1568,7 +1595,7 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
       return hcPrimId(t.primName)
     }
     TyObj => {
-      if repKeyIsCanon(mode) { return hcCanonObjId(t) }
+      if repKeyIsCanon(mode) { return hcCanonObjId(t, mode) }
       const ds = repSlotOfElemTy(ty, mode)
       if ds >= 0 {
         const a: i32[] = []
@@ -1610,6 +1637,7 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
       return hcUnionId(t.uMembers, mode)
     }
     TyFunc => {
+      if mode == "row" { return hcIntern(HC_FUNC, hcNoArgs, 2) }
       // `"(" + join(",", params) + ")=>" + ret` — ONE for the open paren; the closer is
       // inside the `")=>"` added below, so starting at 2 double-counts it.
       const a: i32[] = []
@@ -1664,7 +1692,7 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
 // `{a: i32, b: string}` and `{b: string, a: i32}` are one type and keying them by declaration
 // order minted two heap types for one shape. Field names are unique, so ordering by sid is a
 // bijection: it can merge twins and never collide distinct types.
-function hcCanonObjId(t: TyObj): i32 {
+function hcCanonObjId(t: TyObj, mode: RepKeyMode): i32 {
   const sortedSid: i32[] = []
   const sortedIx: i32[] = []
   let si2 = 0
@@ -1691,15 +1719,39 @@ function hcCanonObjId(t: TyObj): i32 {
   let i = 0
   while i < sortedIx.length {
     const fx = sortedIx[i]
-    const ft = repCanonFieldTy(t.objFieldTypes[fx])
+    const ft = hcRowFieldTy(repCanonFieldTy(t.objFieldTypes[fx]), mode)
     const asSet = repFieldLitAsSet(ft)
-    const c = if asSet.length > 0 { hcUnionId(asSet, "canon") } else { repIdOf(ft, "canon") }
+    const fm = hcRowFieldMode(ft, mode)
+    const c = if asSet.length > 0 { hcUnionId(asSet, fm) } else { repIdOf(ft, fm) }
     a.push(sortedSid[i])
     a.push(c)
     len = len + t.objFieldNames[fx].length + 1 + hcLenOf(c) + 1
     i = i + 1
   }
   hcIntern(HC_OBJ, a, len)
+}
+
+// The type a record field is keyed by: a row keys a nullable record field as the record, since
+// the field holds a nullable reference to it either way.
+function hcRowFieldTy(ft: i32, mode: RepKeyMode): i32 {
+  if mode != "row" || ft < 0 || ft >= T.tys.length { return ft }
+  const t = tyAt(ft)
+  if t is TyNullable {
+    if t.nInner >= 0 && t.nInner < T.tys.length && tyAt(t.nInner) is TyObj {
+      return t.nInner
+    }
+  }
+  ft
+}
+
+// The mode a record field is keyed in: a row keys its own fields, and a nested record's or a
+// union's, as a row, but a list's or a map's element by its canonical type, since a container's
+// value slot is interned per element type.
+function hcRowFieldMode(ft: i32, mode: RepKeyMode): RepKeyMode {
+  if mode != "row" || ft < 0 || ft >= T.tys.length { return mode }
+  const t = tyAt(ft)
+  if t is TyArray || t is TyMap { return "canon" }
+  mode
 }
 
 // The union arm of the identity walk: `repKeyUnion`'s mix-widening, over ids.
@@ -2395,6 +2447,10 @@ export function recordUnMemTys(set: string) {
 // two rungs and fall-through, unchanged.
 function slotCanonId(si: i32): i32 {
   if si < 0 || si >= sNames.length { return -1 }
+  // A literal's row whose recorded context still names a hole is keyed by the literal's own
+  // record type, the one its fields are stored as.
+  const ot = sAnonOwnTy.get(si) ?? -1
+  if ot >= 0 && tyAt(ot) is TyObj { return repRowId(ot) }
   // Rung 1 — the arena-index sidecar (`sTyIx`, recorded at every row mint), consulted
   // first (destringify D-SLOTARENA): this row's type is known structurally, and it
   // covers the `#anon` literal rows the name path cannot resolve at all. Confirm-only —
@@ -2403,7 +2459,7 @@ function slotCanonId(si: i32): i32 {
     const dix = sTyIx[si]
     if dix >= 0 {
       const dt = tyAt(dix)
-      if dt is TyObj { return repCanonId(dix) }
+      if dt is TyObj { return repRowId(dix) }
     }
   }
   // Rung 2 — the name ladder, for a row the sidecar does not cover: a mint site that
@@ -2420,7 +2476,7 @@ function slotCanonId(si: i32): i32 {
   if di >= 0 {
     const t = tyAt(di)
     if !(t is TyObj) { return -1 }
-    return repCanonId(di)
+    return repRowId(di)
   }
   // Neither rung: a synthetic `#anon` row the D0 recorder could not type, or an
   // unresolvable spelling. -1 is the legacy never-merged behaviour ("" before step 3).
@@ -2691,7 +2747,7 @@ export function repRowOfTyStruct(repTyIx: i32, lim: i32): i32 {
   if repTyIx < 0 { return -1 }
   const t = tyAt(repTyIx)
   if !(t is TyObj) { return -1 }
-  const key = repCanonId(repTyIx)
+  const key = repRowId(repTyIx)
   if key < 0 { return -1 }
   scnSync()
   let bound = lim

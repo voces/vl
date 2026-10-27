@@ -2,6 +2,7 @@
 // may be built at another storage, and the deliveries an adopted pin keeps.
 // Does not import the checker.
 import {
+  ArrayLit,
   Call,
   FuncDecl,
   Ident,
@@ -223,6 +224,96 @@ export function recKeptFnDstOf(decl: i32, own: i32): i32 {
   -1
 }
 
+// This pass's bindings whose adoption a re-check undid, each with a record a delivery builds it
+// as, and the last pass's, read by the emitter.
+let recBuildPassDecl: i32[] = []
+let recBuildPassDst: i32[] = []
+let recBuildDecl: i32[] = []
+let recBuildDst: i32[] = []
+
+// Replace the last pass's built-elsewhere bindings with this pass's, and empty this pass's.
+export function recBuildNote() {
+  recBuildDecl = recBuildPassDecl
+  recBuildDst = recBuildPassDst
+  recBuildPassDecl = []
+  recBuildPassDst = []
+  0
+}
+
+// Record that the binding `decl`, typed `own`, keeps its type and is built as `dstIn`'s record,
+// when the two have one set of field names and store a field differently. With `elem`, `decl`
+// holds a list literal and the records are its elements'.
+export function recBuildPush(decl: i32, own: i32, dstIn: i32, elem: boolean) {
+  if (
+    decl < 0
+    || own < 0
+    || dstIn < 0
+    || own >= T.tys.length
+    || dstIn >= T.tys.length
+  ) {
+    return 0
+  }
+  if !(nodeAt(decl) is LetDecl) || recBuildHoldsElems(decl) != elem { return 0 }
+  if !(tyAt(own) is TyObj) { return 0 }
+  const dst = recAdLanding(own, dstIn)
+  if dst < 0 || dst >= T.tys.length || !(tyAt(dst) is TyObj) { return 0 }
+  if tyReachesHole(own, 8) || tyReachesHole(dst, 8) { return 0 }
+  if (
+    !objFieldNameSetsEq(own, dst)
+    || fieldStorageEq(own, dst, REC_STORE_DEPTH)
+  ) {
+    return 0
+  }
+  recBuildPassDecl.push(decl)
+  recBuildPassDst.push(dst)
+  0
+}
+
+// Whether the binding `decl` is initialised with a list literal or a `Map()`, whose elements or
+// values are what its builds record; false for any other node.
+function recBuildHoldsElems(decl: i32): boolean {
+  if decl < 0 || decl >= P.nodes.length { return false }
+  const d = nodeAt(decl)
+  if !(d is LetDecl) || d.letInit < 0 { return false }
+  const iv = cwPeelValue(d.letInit)
+  if iv < 0 || iv >= P.nodes.length { return false }
+  const n = nodeAt(iv)
+  if n is ArrayLit { return true }
+  if !(n is Call) || n.callArgs.length != 0 || n.callFn < 0 { return false }
+  const f = nodeAt(n.callFn)
+  f is Ident && f.identName == "Map"
+}
+
+// The record the un-annotated binding `decl` of an object literal is built as, where a delivery
+// to a record that stores a field differently keeps its own type and every such delivery agrees
+// on the storage; else -1. Decided before any instance is elaborated: a use at a type parameter
+// follows it.
+export function recBuildTyOf(decl: i32): i32 {
+  if recBuildHoldsElems(decl) { return -1 }
+  recBuildAt(decl)
+}
+
+// `recBuildTyOf` for a binding of a list literal or a `Map()`: the record its elements or values
+// are built as.
+export function recBuildElemTyOf(decl: i32): i32 {
+  if !recBuildHoldsElems(decl) { return -1 }
+  recBuildAt(decl)
+}
+
+// The one storage every recorded build of `decl` agrees on, else -1.
+function recBuildAt(decl: i32): i32 {
+  let r = -1
+  let k = 0
+  while k < recBuildDecl.length {
+    if recBuildDecl[k] == decl {
+      if r < 0 { r = recBuildDst[k] }
+      else if !fieldStorageEq(r, recBuildDst[k], REC_STORE_DEPTH) { return -1 }
+    }
+    k = k + 1
+  }
+  r
+}
+
 // While on, each delivery of a fresh value the solve judged: the value's declared name and
 // declaration, the delivery, and a REC_DELIV_* flag: built at another storage (kept), at its
 // own, or a delivery whose judgement read the value's site count.
@@ -321,6 +412,7 @@ export function recAdPushDecl(
     return 0
   }
   if recAdNoAdopt.has(decl) {
+    recBuildPush(decl, own, dst, elem)
     recAdMergeRefuse(decl, own, dst, elem, at)
     return 0
   }
