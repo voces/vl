@@ -37,6 +37,7 @@ import {
   mkBreak,
   mkCall,
   mkForIn,
+  mkIdent,
   mkIf,
   mkIndex,
   mkMember,
@@ -297,7 +298,7 @@ import {
 } from "./check_types"
 import { breakValueAt } from "./check_unconsumed"
 import { fnDeclIx } from "./check_write_scan"
-import { sidOfNode } from "./symbols"
+import { identFromDecl, identRedirectLoop, sidOfNode } from "./symbols"
 import {
   isNeverTy,
   isNulBoolTy,
@@ -1034,18 +1035,25 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
 function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
   if !luAllSpell(iterTy, ms) || luTs(elem) < 0 { return -1 }
   const pos = n.pos
-  const recv = "$lu" + i32ToStr(ix)
-  const ctr = "$li" + i32ToStr(ix)
+  const recv = luDecl("const", "$lu" + i32ToStr(ix), iterTy, n.fiIter, ix, pos)
+  const ctr = luDecl(
+    "let",
+    "$li" + i32ToStr(ix),
+    -1,
+    luAt(mkNum("0", pos), ix),
+    ix,
+    pos,
+  )
   let at = n.fiVar2
   if at == "" { at = "$lk" + i32ToStr(ix) }
   const outer: i32[] = []
-  outer.push(luDecl("const", recv, iterTy, n.fiIter, ix, pos))
-  outer.push(luDecl("let", ctr, -1, luAt(mkNum("0", pos), ix), ix, pos))
+  outer.push(recv)
+  outer.push(ctr)
   const lenCond = luAt(
     mkBinary(
       ">=",
       luRef(ctr, ix, pos),
-      valueIfAdd(luChain(ms, 0, recv, "", -1, ix, pos)),
+      valueIfAdd(luChain(ms, 0, recv, -1, -1, ix, pos)),
       pos,
     ),
     ix,
@@ -1062,10 +1070,11 @@ function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
     ix,
   )
   loop.push(luAt(mkBinary("=", luRef(ctr, ix, pos), inc, pos), ix))
-  const val = valueIfAdd(luChain(ms, 0, recv, at, elem, ix, pos))
+  const val = valueIfAdd(luChain(ms, 0, recv, atDecl, elem, ix, pos))
   const vDecl = luDecl("let", n.fiVar, elem, val, ix, pos)
   luDeclPosPut(vDecl, n.fiIter)
   loop.push(vDecl)
+  identRedirectLoop(ix, n.fiVar2, vDecl, atDecl)
   const bn = nodeAt(n.fiBody)
   if bn is Block {
     let i = 0
@@ -1120,19 +1129,27 @@ function lmForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[]): i32 {
   }
   const val = lmValTy(ms)
   if val < 0 || luTs(val) < 0 { return -1 }
-  const recv = "$lm" + i32ToStr(ix)
-  const vals = "$lv" + i32ToStr(ix)
+  const recv = luDecl("const", "$lm" + i32ToStr(ix), iterTy, n.fiIter, ix, pos)
   const at = "$lj" + i32ToStr(ix)
   const outer: i32[] = []
-  outer.push(luDecl("const", recv, iterTy, n.fiIter, ix, pos))
+  outer.push(recv)
   const vcall = mkCall(
     luAt(mkMember(luRef(recv, ix, pos), "values", pos), ix),
     none,
     pos,
   )
-  outer.push(luDecl("const", vals, -1, luAt(vcall, ix), ix, pos))
+  const vals = luDecl(
+    "const",
+    "$lv" + i32ToStr(ix),
+    -1,
+    luAt(vcall, ix),
+    ix,
+    pos,
+  )
+  outer.push(vals)
   const loop: i32[] = []
-  const rd = luAt(mkIndex(luRef(vals, ix, pos), luRef(at, ix, pos), pos), ix)
+  const atRef = luAt(mkIdent(at, pos), ix)
+  const rd = luAt(mkIndex(luRef(vals, ix, pos), atRef, pos), ix)
   const vDecl = luDecl("let", n.fiVar2, val, rd, ix, pos)
   luDeclPosPut(vDecl, n.fiIter)
   loop.push(vDecl)
@@ -1148,9 +1165,13 @@ function lmForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[]): i32 {
     pos,
   )
   const body = luAt(mkBlock(loop, pos), ix)
-  outer.push(
-    luAt(mkForIn(n.fiVar, at, luAt(kcall, ix), body, n.fiLabel, pos), ix),
+  const fl = luAt(
+    mkForIn(n.fiVar, at, luAt(kcall, ix), body, n.fiLabel, pos),
+    ix,
   )
+  outer.push(fl)
+  identFromDecl(atRef, fl)
+  identRedirectLoop(ix, n.fiVar2, fl, vDecl)
   const once = luAt(mkBool(1, -1), ix)
   const w: Node = {
     ifCond: once,

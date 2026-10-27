@@ -1,0 +1,247 @@
+// The lexical binder: one walk before checking that resolves every `Ident` to the declaration
+// it names, into `identDeclOf`. Name resolution is its own phase, so no checker step depends
+// on the scope stack to say which binding a name means. The rules are the language's: a block
+// binding is visible from its declaration on, a function's name from before its body, the
+// module frame from everywhere, and a parameter default reads the module frame.
+import {
+  Block,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  P,
+  Param,
+  Program,
+  binderNameAt,
+  matchPatValueName,
+  nodeAt,
+  nodeChildrenPush,
+} from "./ast"
+import {
+  IDENT_BUILTIN,
+  IDENT_DROP_FN_DECL,
+  identAuditDrop,
+  identSet,
+  sidOf,
+} from "./symbols"
+
+// The innermost declaration of each name by sid (-1 none), the module frame's last
+// declaration of each, and the undo log a frame's close replays.
+let bdCur: i32[] = []
+let bdMod: i32[] = []
+let bdLogSid: i32[] = []
+let bdLogPrev: i32[] = []
+let bdKids: i32[] = []
+
+// Binds every identifier under the program `rootIx`.
+export function bindProgram(rootIx: i32) {
+  bdCur = []
+  bdMod = []
+  bdLogSid = []
+  bdLogPrev = []
+  bdKids = []
+  if rootIx < 0 || rootIx >= P.nodes.length { return 0 }
+  const r = nodeAt(rootIx)
+  if r is Program {
+    for s in r.progStmts { bdModuleNote(s) }
+  }
+  bdWalk(rootIx)
+  0
+}
+
+function bdModuleNote(s: i32) {
+  if s < 0 || s >= P.nodes.length { return 0 }
+  const nm = binderNameAt(s)
+  if nm == "" || bdFnDropped(s) { return 0 }
+  bdPut(bdMod, sidOf(nm), s)
+  0
+}
+
+// The audit's must-fire control leaves a function's name unbound, as the checker's site does.
+function bdFnDropped(s: i32) {
+  if identAuditDrop != IDENT_DROP_FN_DECL || s < 0 || s >= P.nodes.length {
+    return false
+  }
+  nodeAt(s) is FuncDecl
+}
+
+function bdPut(a: i32[], sid: i32, v: i32) {
+  while a.length <= sid { a.push(-1) }
+  a[sid] = v
+  0
+}
+
+function bdGet(a: i32[], sid: i32) {
+  if sid < 0 || sid >= a.length { return -1 }
+  a[sid]
+}
+
+// Declares `name` as `decl` in the innermost frame.
+function bdDeclare(name: string, decl: i32) {
+  const sid = sidOf(name)
+  bdLogSid.push(sid)
+  bdLogPrev.push(bdGet(bdCur, sid))
+  bdPut(bdCur, sid, decl)
+  0
+}
+
+// Closes the frame opened when the log stood at `mark`.
+function bdClose(mark: i32) {
+  while bdLogSid.length > mark {
+    const top = bdLogSid.length - 1
+    bdPut(bdCur, bdLogSid[top], bdLogPrev[top])
+    bdLogSid.pop()
+    bdLogPrev.pop()
+  }
+  0
+}
+
+// The declaration `name` names where it stands, else the module frame's, else a builtin.
+function bdResolve(name: string, moduleOnly: boolean) {
+  const sid = sidOf(name)
+  if !moduleOnly {
+    const d = bdGet(bdCur, sid)
+    if d >= 0 { return d }
+  }
+  const m = bdGet(bdMod, sid)
+  if m >= 0 { return m }
+  IDENT_BUILTIN
+}
+
+function bdWalk(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is Ident { return identSet(ix, bdResolve(n.identName, false)) }
+  if n is Block {
+    const mark = bdLogSid.length
+    for s in n.blkStmts { bdWalk(s) }
+    return bdClose(mark)
+  }
+  if n is LetDecl {
+    bdWalk(n.letInit)
+    return bdDeclare(n.letName, ix)
+  }
+  if n is FuncDecl { return bdFunc(n, ix) }
+  if n is ForRange {
+    bdWalk(n.frFrom)
+    bdWalk(n.frTo)
+    bdWalk(n.frStep)
+    const mark = bdLogSid.length
+    bdDeclare(n.frVar, ix)
+    bdWalk(n.frBody)
+    return bdClose(mark)
+  }
+  if n is ForIn {
+    bdWalk(n.fiIter)
+    const mark = bdLogSid.length
+    bdDeclare(n.fiVar, ix)
+    if n.fiVar2 != "" { bdDeclare(n.fiVar2, ix) }
+    bdWalk(n.fiBody)
+    return bdClose(mark)
+  }
+  if n is MatchExpr { return bdMatch(n) }
+  if n is IfStmt { return bdIfChain(ix) }
+  bdKidsWalk(ix)
+}
+
+// An `else if` chain, walked link by link rather than recursed, so its depth costs no stack.
+function bdIfChain(ix: i32) {
+  let at = ix
+  while at >= 0 && at < P.nodes.length {
+    const n = nodeAt(at)
+    if !(n is IfStmt) { return bdWalk(at) }
+    bdWalk(n.ifCond)
+    bdWalk(n.ifThen)
+    at = n.ifElse
+  }
+  0
+}
+
+// Every child of `ix`, through the shared stack.
+function bdKidsWalk(ix: i32) {
+  const base = bdKids.length
+  const k = nodeChildrenPush(ix, bdKids)
+  let i = 0
+  while i < k {
+    bdWalk(bdKids[base + i])
+    i = i + 1
+  }
+  while bdKids.length > base { bdKids.pop() }
+  0
+}
+
+// A function's name binds where it stands, before its body, so a self-call resolves; its
+// parameters bind in its own frame.
+function bdFunc(n: FuncDecl, ix: i32) {
+  if n.fnName != "" && !bdFnDropped(ix) { bdDeclare(n.fnName, ix) }
+  const mark = bdLogSid.length
+  for p in n.fnParams { bdParam(p) }
+  bdWalk(n.fnBody)
+  bdClose(mark)
+}
+
+// A parameter default is substituted at each call site and may name only a module binding.
+function bdParam(p: i32) {
+  if p < 0 || p >= P.nodes.length { return 0 }
+  const pn = nodeAt(p)
+  if pn is Param {
+    if pn.parDefault >= 0 && pn.parDefault < P.nodes.length {
+      const d = nodeAt(pn.parDefault)
+      if d is Ident {
+        identSet(pn.parDefault, bdResolve(d.identName, true))
+      } else {
+        bdWalk(pn.parDefault)
+      }
+    }
+    if identAuditDrop != IDENT_DROP_FN_DECL { bdDeclare(pn.parName, p) }
+  }
+  0
+}
+
+// A single-pattern arm's payload clause binds into that arm's body alone.
+// A name pattern holds what its name resolves to, so the constant read the checker may turn
+// it into keeps that answer; a name resolving to nothing stays a type pattern.
+function bdPatName(p: i32) {
+  const pn = nodeAt(p)
+  if pn is IsExpr {
+    if pn.isVariant == "null" { return 0 }
+    const d = bdResolve(matchPatValueName(p, pn.isVariant), false)
+    if d != IDENT_BUILTIN { identSet(p, d) }
+  }
+  0
+}
+
+function bdMatch(n: MatchExpr) {
+  bdWalk(n.matchScrut)
+  for p in n.matchPats {
+    bdWalk(p)
+    bdPatName(p)
+  }
+  let k = 0
+  while k < n.matchArmStart.length {
+    const start = n.matchArmStart[k]
+    const mark = bdLogSid.length
+    let j = 0
+    while j < n.matchArmCount[k] {
+      if start + j < n.matchBinds.length {
+        const bx = n.matchBinds[start + j]
+        if bx >= 0 && bx < P.nodes.length {
+          const b = nodeAt(bx)
+          if b is Block {
+            for s in b.blkStmts { bdWalk(s) }
+          }
+        }
+      }
+      if n.matchArmCount[k] != 1 { bdClose(mark) }
+      j = j + 1
+    }
+    if k < n.matchBodies.length { bdWalk(n.matchBodies[k]) }
+    bdClose(mark)
+    k = k + 1
+  }
+  0
+}
