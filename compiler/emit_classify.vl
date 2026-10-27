@@ -237,6 +237,7 @@ import {
   tyPrimNameOf,
   tySame,
   tyScalarBaseIs,
+  tyScalarBasePrim,
 } from "./check_types"
 import { cexLitPeel } from "./check_num_lits"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
@@ -352,8 +353,6 @@ import {
   litRepUnionAt,
 } from "./emit_elab"
 import {
-  BC_F64,
-  BC_I64,
   BC_LEAF,
   BC_STR,
   BtKind,
@@ -366,11 +365,9 @@ import {
   cloArrSlotSigKey,
   cloCallCalleeFnTy,
   cloCallResultLitUnion,
-  declaredF64,
   exprIsFloatLit,
   fnHasParamNamed,
   mfResKindFromSigRet,
-  nodeTyIsV128,
   sigTakesParams,
 } from "./emit_closure_callee"
 import {
@@ -438,7 +435,7 @@ import {
   spreadLitScalarElem,
   spreadSrcBoxAtom,
 } from "./emit_if_arm_values"
-import { declaredI64, numBoxExpr, recordFieldTy } from "./emit_join_records"
+import { numBoxExpr, recordFieldTy } from "./emit_join_records"
 import {
   arenaRepOf,
   arrLitHasSpread,
@@ -633,8 +630,6 @@ import {
   letIsSet,
   paramIndexOf,
   paramIsClosure,
-  paramIsF64,
-  paramIsI64,
   paramMap,
   paramNulClosure,
   paramNulList,
@@ -642,9 +637,6 @@ import {
   paramTypeNode,
 } from "./emit_query"
 import {
-  TK_F32,
-  TK_F64,
-  TK_I64,
   TK_STR,
   arenaListRep,
   arrNewDestKind,
@@ -1043,7 +1035,6 @@ import {
   msSubTyAlike,
   msTextOf,
   narrowSlotTy,
-  removeAtomFromSet,
   removeAtomFromSetOf,
   removeAtomIdOf,
   removeAtomRestOf,
@@ -1093,7 +1084,6 @@ import {
   tyAdmitsNull,
   tyEmitPrimOf,
   tyHasTyVar,
-  tyHoldsNumbersApart,
   tyIsArray,
   tyIsF32ArrayTy,
   tyIsU8ArrayTy,
@@ -6259,215 +6249,9 @@ export function ifExprRefSlot(
   -1
 }
 
-// True if the module global `name` is an i64 cell.
-function globalIsI64Sid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  globalReadAsk(sid, li, 1)
-}
-
-// The unboxed scalar atom kind of a value-union null-coalesce `lhs ?? d` (`lhs` an ident
-// or call yielding `T | null` with one non-null scalar atom): the result of `??` is that
-// atom, so `print`-routing and numeric coercion classify it by the atom. -1 when the
-// expression is not such a `??`, or the union keeps 2+ non-null atoms (still a box).
-function coalesceAtomKind(exprIx: i32, fnIx: i32) {
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is BinExpr {
-    if e.binOp == "??" {
-      // A default of another number type joins apart: the result is the box, never an atom,
-      // at the instance's join where the `??` records only its hole (D9701).
-      const hrt = holeOperandTyOf(exprIx, fnIx)
-      if hrt >= 0 && numUnionMinted && tyHoldsNumbersApart(hrt) { return -1 }
-      // The RESULT's own atom, asked first: a wider default widens the whole expression, so
-      // the operand's residual below is right for the common case and not for that one. A
-      // union result is not an atom and falls through, which is the box arm's (D1699/D1702).
-      const crt = coalResultTyOf(exprIx, fnIx)
-      if numUnionMinted && numBoxExpr(unwrapParen(exprIx), crt) { return -1 }
-      const crk = boxTagOfTy(crt)
-      if crk >= 0 && crk != 6 { return crk }
-      const nm = unionNameOfExpr(e.binLeft, fnIx)
-      if nm != "" {
-        if isValueUnionName(nm) && unionSetHasNull(nm) {
-          const k = valueAtomKind(
-            removeAtomFromSet(
-              nm,
-              "null",
-              nodeTyAt(unwrapParen(e.binLeft), fnIx),
-            ),
-          )
-          if k >= 0 && k != 6 { return k }
-        }
-      }
-    }
-  }
-  -1
-}
-
-// True if evaluating the expression at `exprIx` yields an i64 — a reference to an
-// i64 param/local/global, or a parenthesized such. Drives the `print` import choice
-// (`__print_i64__`, import 4). Arithmetic/calls returning i64 are Slice 2; here only
-// the direct-reference forms (the Slice-1 `print(x)` shape) classify as i64.
+// True if evaluating `exprIx` yields an i64 scalar (see `exprScalarWidth`).
 export function exprIsI64(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  if tyKindOf(nodeTyAt(exprIx, fnIx)) == TK_I64 {
-    return true // typed-IR fast path (see exprIsF64)
-  }
-  // A literal is none of the `??`, `min`/`max` shapes asked next; its width decides.
-  if nodeAt(exprIx) is NumLit { return numLitWidth(exprIx, fnIx) == "i64" }
-  // Over a `null`-typed LHS a `??` is its default, at the default's rep (D4550).
-  const cnnK = coalesceNulNoneDefaultIx(exprIx, fnIx)
-  if cnnK >= 0 { return exprIsI64(cnnK, fnIx) }
-  // An intrinsic `min` / `max` takes its operands' width, instance by instance.
-  const mmk = minMaxKind(exprIx, fnIx)
-  if mmk != "" { return mmk == "i64" }
-  if coalesceAtomKind(exprIx, fnIx) == 3 { return true }
-  // `m[k] ?? d` over an i64-valued map yields an i64 (the value type).
-  const cmi = coalesceMvSlot(exprIx, fnIx)
-  if cmi >= 0 {
-    if mvValKind[cmi] == MVK_I64 { return true }
-  }
-  const e = nodeAt(exprIx)
-  // An explicit `x as T` cast has exactly its target rep (see exprIsF64).
-  match e {
-    AsExpr => {
-      return e.asTy == "i64"
-    }
-    Paren => {
-      return exprIsI64(e.parInner, fnIx)
-    }
-    // A field read `s.x` whose struct field is an i64 slot (code 23) yields an i64.
-    Member => {
-      return memFieldTypeCode(exprIx, fnIx) == FC_I64
-        && memReadNarrowOp(exprIx, fnIx) < 0
-    }
-    // A bare `m[k]` read over an i64-valued map yields an i64.
-    Index => {
-      // A union-box cell narrowed to one atom reads as that atom (see `indexUnionReadKind`).
-      const iuk = indexUnionReadKind(exprIx, fnIx)
-      if iuk != -3 { return iuk == 3 }
-      // An indexed read of an i64 list (`xs[i]` over `i64[]`) is an i64 — the syntactic dual of
-      // `exprIsF64`'s Index case. Needed for a synthetic `c[0]` (e.g. a captured-mutation box) that
-      // carries no checker-recorded type for the typed-IR fast path above.
-      if exprI64Array(e.idxArr, fnIx) { return true }
-      const mri = mapReadMvSlot(exprIx, fnIx)
-      if mri >= 0 {
-        if mvValKind[mri] == MVK_I64 { return true }
-      }
-    }
-    Ident => {
-      // A value-union ident classifies by its narrowed atom (the read unboxes to that rep);
-      // an un-narrowed union ident is the box, never a scalar.
-      const uk = unionIdentReadKind(exprIx, fnIx)
-      if uk != -3 { return uk == 3 }
-      if (
-        paramIsI64(fnIx, e.identName)
-        && paramReadAt(fnIx, e.identName, exprIx)
-      ) {
-        return true
-      }
-      if declaredI64(e.identName) { return true }
-      // A captured i64 — same field/read agreement `exprIsF64`'s arm carries: without it
-      // the read widens through `i64.extend_i32_s` over a slot the env already types i64.
-      if capturedKindOf(fnIx, e.identName) == "i64" { return true }
-      return globalIsI64Sid(fnIx, sidOfNode(exprIx), exprIx)
-    }
-    // An arithmetic/bitwise/shift op yields i64 when either operand is i64 (the i32 side
-    // widens). Comparisons and logical connectives produce an i32 bool even over i64
-    // operands, so they are not i64.
-    BinExpr => {
-      // A numeric union is a box whatever its members, never one scalar width.
-      if numUnionMinted && numBoxExpr(exprIx, nodeTyAt(exprIx, fnIx)) {
-        return false
-      }
-      // Arithmetic over a hole this instance pins at a two-width literal set is `i64` (D9523),
-      // and over an `i64` pin beside an `f64` operand computes at `f64` (D9631).
-      const hk = tyKindOf(holeOperandTyOf(exprIx, fnIx))
-      if hk == TK_I64 { return true }
-      if hk == TK_F64 { return false }
-      const op = e.binOp
-      if (
-        op == "+"
-        || op == "-"
-        || op == "*"
-        || op == "/"
-        || op == "%"
-        || op == "&"
-        || op == "|"
-        || op == "^"
-        || op == "<<"
-        || op == ">>"
-        || op == ">>>"
-      ) {
-        const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_I64) } else { -2 }
-        if m >= 0 { return m == 1 }
-        const r = exprIsI64(e.binLeft, fnIx) || exprIsI64(e.binRight, fnIx)
-        if m != -2 { bcPutB(m, exprIx, fnIx, BC_I64, r) }
-        return r
-      }
-      return false
-    }
-    // Unary negation `-x` / bitwise NOT `~x` preserve the operand's i64-ness (`!` is a bool,
-    // never i64; `p+`/`p-` ride their operand but are statement-level).
-    Unary => {
-      // A numeric union is a box whatever its members, never one scalar width.
-      if numUnionMinted && numBoxExpr(exprIx, nodeTyAt(exprIx, fnIx)) {
-        return false
-      }
-      if e.unOp == "-" && tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_I64 {
-        return true
-      }
-      if e.unOp == "-" || e.unOp == "~" {
-        // A negated literal is one constant at the negation's own type (`-2147483648` is i32).
-        if e.unOp == "-" && nodeAt(unwrapParen(e.unArg)) is NumLit {
-          const nw = numLitTyWidth(exprIx, fnIx)
-          if nw != "" { return nw == "i64" }
-        }
-        return exprIsI64(e.unArg, fnIx)
-      }
-      return false
-    }
-    // A call to an i64-returning function yields i64.
-    Call => {
-      // An indexed closure call `fs[i](x)` whose element signature returns i64.
-      if cloArrCallRetKind(exprIx, fnIx) == "i64" { return true }
-      if e.callFn < 0 { return false }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        const target = fnIndexOfInScopeAt(
-          sidOfNode(e.callFn),
-          callee.identName,
-          fnIx,
-          e.callFn,
-        )
-        if target >= 0 { return repOfFnSlot(target).rdKind == "i64" }
-        // An i64-returning function value (a binding / `(…) => i64` param callee).
-        if calleeReturnsI64At(sidOfNode(e.callFn), fnIx, e.callFn) {
-          return true
-        }
-        // A value the generic body shares, typed at a hole this instance pins (D3117).
-        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_I64
-      }
-      // An i64-returning field-closure call (`o.f(x)` over an `(…) => i64` field).
-      if callee is Member {
-        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "i64" }
-        // Through a field no closure literal of that signature reaches (D3203).
-        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_I64
-      }
-      return false
-    }
-    // A value-position if-expression is i64 when either arm's value is i64.
-    IfStmt => {
-      // A numeric union is a box whatever its members, never one scalar width.
-      if numUnionMinted && numBoxExpr(exprIx, nodeTyAt(exprIx, fnIx)) {
-        return false
-      }
-      return ifExprArmIsKind(exprIx, fnIx, "i64")
-    }
-    // No other expression yields an i64.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
+  exprScalarWidth(exprIx, fnIx) == "i64"
 }
 
 // True if the un-annotated `LetDecl` at `letIx` should infer an f32 slot — its initializer
@@ -6484,49 +6268,10 @@ export function letInfersF32(letIx: i32, fnIx: i32) {
   false
 }
 
-// True if evaluating `exprIx` yields a v128 SIMD vector (a `new v128` brand such as `F32x4` is
-// one): the checker's recorded type first, then the leaves a rewrite minted without one — a
-// brand cast, a param/local/capture/global so typed, a call (a dispatched `a + b` is one) to a
-// v128-returning function, and an if-expression with a vector arm. Mirrors `exprIsF32`.
+// True if evaluating `exprIx` yields a v128 vector, a `new v128` brand included (see
+// `exprScalarWidth`).
 export function exprIsV128(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  if nodeTyAt(exprIx, fnIx) >= 0 { return nodeTyIsV128(exprIx, fnIx) }
-  const e = nodeAt(exprIx)
-  if e is AsExpr { return e.asTy == "v128" }
-  if e is Paren { return exprIsV128(e.parInner, fnIx) }
-  if e is Ident {
-    if retV128Flag(paramTypeNodeAt(fnIx, e.identName, exprIx)) == 1 {
-      return true
-    }
-    if declaredKind(e.identName) == "v128" { return true }
-    if capturedKindOf(fnIx, e.identName) == "v128" { return true }
-    const gli = globalLetOfSidIn(fnIx, sidOfNode(exprIx), exprIx)
-    if gli >= 0 { return letInfersV128(gli, -1) }
-    return false
-  }
-  if e is Call {
-    if e.callFn < 0 { return false }
-    const callee = nodeAt(e.callFn)
-    if callee is Ident {
-      const target = fnIndexOfInScopeAt(
-        sidOfNode(e.callFn),
-        callee.identName,
-        fnIx,
-        e.callFn,
-      )
-      if target >= 0 { return repOfFnSlot(target).rdKind == "v128" }
-    }
-    return false
-  }
-  if e is IfStmt {
-    if e.ifElse < 0 { return false }
-    if exprIsV128(ifArmValueExpr(e.ifThen), fnIx) { return true }
-    const els = nodeAt(e.ifElse)
-    if els is IfStmt { return exprIsV128(e.ifElse, fnIx) }
-    return exprIsV128(ifArmValueExpr(e.ifElse), fnIx)
-  }
-  // Every other kind carries no vector of its own: only a recorded type could name one.
-  nodeTyIsV128(exprIx, fnIx)
+  exprScalarWidth(exprIx, fnIx) == "v128"
 }
 
 // True if the `LetDecl` at `letIx` binds a v128 — annotated with `v128` or a brand over it, or
@@ -6599,15 +6344,64 @@ export function binMixHardF64(leftIx: i32, rightIx: i32, fnIx: i32) {
   exprHasHardF64(rightIx, fnIx)
 }
 
-// True if evaluating `exprIx` yields an f32 scalar: its recorded type, a literal or literal
-// union peeled to its base, is `f32`. A number literal is the width it is built at, which a
-// literal typed at a nullable union picks from its members. A numeric union is a box.
+// The scalar width evaluating `exprIx` yields: its type at instance `fnIx` peeled to one base
+// scalar, else "" (a numeric union is a box). A direct call yields its callee slot's result, a `??`
+// what its lowering yields, and a number literal its built width; where the type names no scalar,
+// a parameter read yields its instance's declared type and a function-value call its signature's.
+export function exprScalarWidth(exprIx: i32, fnIx: i32): string {
+  if exprIx < 0 { return "" }
+  const n = nodeAt(exprIx)
+  if n is NumLit { return numLitWidth(exprIx, fnIx) }
+  if n is Call && n.callFn >= 0 {
+    const callee = nodeAt(n.callFn)
+    if callee is Ident {
+      const fe = fnIndexOfInScopeAt(
+        sidOfNode(n.callFn),
+        callee.identName,
+        fnIx,
+        n.callFn,
+      )
+      if fe >= 0 { return scalarKindWidth(repOfFnSlot(fe).rdKind) }
+    }
+  }
+  if n is BinExpr && n.binOp == "??" {
+    const ct = coalResultTyOf(exprIx, fnIx)
+    if numUnionMinted && numBoxExpr(exprIx, ct) { return "" }
+    return tyScalarBasePrim(ct) ?? ""
+  }
+  let ty = nodeTyAt(exprIx, fnIx)
+  if n is Ident && ty >= 0 && tyHasTyVar(ty) {
+    const pt = nodeTyIxOf(paramTypeNodeAt(fnIx, n.identName, exprIx))
+    if pt >= 0 && !tyHasTyVar(pt) { ty = pt }
+  }
+  if numUnionMinted && numBoxExpr(exprIx, ty) { return "" }
+  const w: string = tyScalarBasePrim(ty) ?? ""
+  if w != "" || !(n is Call) { return w }
+  scalarKindWidth(cloCallResultKind(n, exprIx, fnIx))
+}
+
+// `k` where it names a scalar width, else "".
+function scalarKindWidth(k: string): string {
+  if k == "i32" || k == "i64" || k == "f32" || k == "f64" || k == "v128" {
+    k
+  } else {
+    ""
+  }
+}
+
+// The result kind of the signature function-value call `n` at `exprIx` is called at; "" where
+// its callee is not a function value or its signature does not resolve.
+function cloCallResultKind(n: Call, exprIx: i32, fnIx: i32): string {
+  if n.callFn < 0 { return "" }
+  if nodeAt(n.callFn) is Ident {
+    return calleeRetKindAt(sidOfNode(n.callFn), fnIx, n.callFn) ?? ""
+  }
+  cloArrCallRetKind(exprIx, fnIx) ?? cloValueCallRetKind(exprIx, fnIx) ?? ""
+}
+
+// True if evaluating `exprIx` yields an f32 scalar (see `exprScalarWidth`).
 export function exprIsF32(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  if nodeAt(exprIx) is NumLit { return numLitWidth(exprIx, fnIx) == "f32" }
-  const ty = nodeTyAt(exprIx, fnIx)
-  if numUnionMinted && numBoxExpr(exprIx, ty) { return false }
-  tyScalarBaseIs(ty, "f32")
+  exprScalarWidth(exprIx, fnIx) == "f32"
 }
 
 // True if a value-position if-expression (`ifIx`) carries the numeric rep named by `kind`:
@@ -6636,166 +6430,9 @@ function armValueIsKind(exprIx: i32, fnIx: i32, kind: BtKind) {
   }
 }
 
-// True if the module global `name` is an f64 cell.
-function globalIsF64Sid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  globalReadAsk(sid, li, 0)
-}
-
-// True if evaluating `exprIx` yields an f64: a float `.` literal, a reference to an f64
-// param/local/global, f64 arithmetic (either operand f64 — the i32 side widens via
-// `f64.convert_i32_s`), unary `-`/parens over such, or a call to an f64-returning function.
-// Drives the `print` import choice (`__print_f64__`) and the per-operand opcode selection.
+// True if evaluating `exprIx` yields an f64 scalar (see `exprScalarWidth`).
 export function exprIsF64(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  // Typed-IR fast path (additive — only turns false into true, so the syntactic derivation
-  // below still applies to a node with no recorded type, e.g. a monomorphized instance body).
-  if tyKindOf(nodeTyAt(exprIx, fnIx)) == TK_F64 { return true }
-  // A literal is none of the `??`, `min`/`max` shapes asked next; its width decides.
-  if nodeAt(exprIx) is NumLit { return numLitWidth(exprIx, fnIx) == "f64" }
-  // Over a `null`-typed LHS a `??` is its default, at the default's rep (D4550).
-  const cnnK = coalesceNulNoneDefaultIx(exprIx, fnIx)
-  if cnnK >= 0 { return exprIsF64(cnnK, fnIx) }
-  // An intrinsic `min` / `max` takes its operands' width, instance by instance.
-  const mmk = minMaxKind(exprIx, fnIx)
-  if mmk != "" { return mmk == "f64" }
-  if coalesceAtomKind(exprIx, fnIx) == 4 { return true }
-  // `m[k] ?? d` / `m.get(k) ?? d` over an f64-valued map yields an f64 (the value type).
-  const cmf = coalesceMvSlot(exprIx, fnIx)
-  if cmf >= 0 {
-    if mvValKind[cmf] == MVK_F64 { return true }
-  }
-  const e = nodeAt(exprIx)
-  // An explicit `x as T` cast has exactly its target rep — classify syntactically
-  // (robust where `nodeTyIx` is absent, e.g. a monomorphized body).
-  match e {
-    AsExpr => {
-      return e.asTy == "f64"
-    }
-    Paren => {
-      return exprIsF64(e.parInner, fnIx)
-    }
-    // An index read into an `f64[]` yields an f64 element — so it routes to `__print_f64__`
-    // and participates in f64 arithmetic. A bare `m[k]` read over an f64-valued map likewise yields an f64.
-    Index => {
-      const iuk = indexUnionReadKind(exprIx, fnIx)
-      if iuk != -3 { return iuk == 4 }
-      if exprF64Array(e.idxArr, fnIx) { return true }
-      const mrs = mapReadMvSlot(exprIx, fnIx)
-      if mrs >= 0 {
-        if mvValKind[mrs] == MVK_F64 { return true }
-      }
-      return false
-    }
-    Ident => {
-      // A value-union ident classifies by its narrowed atom (see exprIsI64).
-      const uk = unionIdentReadKind(exprIx, fnIx)
-      if uk != -3 { return uk == 4 }
-      if (
-        paramIsF64(fnIx, e.identName)
-        && paramReadAt(fnIx, e.identName, exprIx)
-      ) {
-        return true
-      }
-      if declaredF64(e.identName) { return true }
-      // A captured f64: the env field is typed by `captureValKind`, so the read must classify
-      // by the same answer or the two disagree and widen through `f64.convert_i32_s` over a
-      // slot that already holds an f64 (`vl check`-clean invalid wasm).
-      if capturedKindOf(fnIx, e.identName) == "f64" { return true }
-      return globalIsF64Sid(fnIx, sidOfNode(exprIx), exprIx)
-    }
-    // Arithmetic yields f64 when either operand is f64. Comparisons and logical connectives
-    // produce an i32 bool even over f64 operands, so they are not f64. `%` is here because
-    // float remainder has a form (D1586) and its result is the dividend's width.
-    BinExpr => {
-      // A numeric union is a box whatever its members, never one scalar width.
-      if numUnionMinted && numBoxExpr(exprIx, nodeTyAt(exprIx, fnIx)) {
-        return false
-      }
-      const op = e.binOp
-      if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
-        const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_F64) } else { -2 }
-        if m >= 0 { return m == 1 }
-        const r = exprIsF64(e.binLeft, fnIx) || exprIsF64(e.binRight, fnIx)
-        if m != -2 { bcPutB(m, exprIx, fnIx, BC_F64, r) }
-        return r
-      }
-      // `xs.get(i) ?? d` over an f64 list yields an f64 (the fused checked read);
-      // the default `d` shares the element type, so classify by the right side.
-      if op == "??" {
-        const lhs = nodeAt(unwrapParen(e.binLeft))
-        if lhs is Call {
-          if lhs.callFn < 0 { return false }
-          const lcallee = nodeAt(lhs.callFn)
-          if lcallee is Member {
-            if lcallee.memProp == "get" || lcallee.memProp == "pop" {
-              if exprF64Array(lcallee.memObj, fnIx) { return true }
-            }
-          }
-        }
-        return false
-      }
-      return false
-    }
-    // Unary negation `-x` preserves f64-ness (`~` is integer-only; `!` is bool).
-    Unary => {
-      // A numeric union is a box whatever its members, never one scalar width.
-      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
-        return false
-      }
-      if e.unOp == "-" { return exprIsF64(e.unArg, fnIx) }
-      return false
-    }
-    Call => {
-      // An indexed closure call `fs[i](x)` whose element signature returns f64.
-      if cloArrCallRetKind(exprIx, fnIx) == "f64" { return true }
-      if e.callFn < 0 { return false }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        const target = fnIndexOfInScopeAt(
-          sidOfNode(e.callFn),
-          callee.identName,
-          fnIx,
-          e.callFn,
-        )
-        if target >= 0 { return repOfFnSlot(target).rdKind == "f64" }
-        // A function-value (closure) callee returning f64 — its result routes as f64.
-        if calleeReturnsF64At(sidOfNode(e.callFn), fnIx, e.callFn) {
-          return true
-        }
-        // A value the generic body shares, typed at a hole this instance pins to `f64` (D3117).
-        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F64
-      }
-      // A field-closure call `t.op(x)` whose field function returns f64.
-      if callee is Member {
-        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if ffe >= 0 { return cloRetKindOf(ffe) == "f64" }
-        // Through a field no closure literal of that signature reaches (D3203).
-        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F64
-      }
-      return false
-    }
-    // A field read `p.x` whose struct field is an f64 slot (code 17) yields an f64.
-    Member => {
-      return memFieldTypeCode(exprIx, fnIx) == FC_F64
-        && memReadNarrowOp(exprIx, fnIx) < 0
-    }
-    // A value-position if-expression is f64 when either arm's value is f64 (the branch-join
-    // widens to f64); an `else if` chain recurses through the else slot. A join the checker typed
-    // `f32` is one whose float literal arms adopted an f32 destination, and stays f32 (D2619).
-    IfStmt => {
-      // A numeric union is a box whatever its members, never one scalar width.
-      if numUnionMinted && numBoxExpr(exprIx, nodeTyAt(exprIx, fnIx)) {
-        return false
-      }
-      if tyKindOf(nodeTyAt(exprIx, fnIx)) == TK_F32 { return false }
-      return ifExprArmIsKind(exprIx, fnIx, "f64")
-    }
-    // No other expression yields an f64.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
+  exprScalarWidth(exprIx, fnIx) == "f64"
 }
 
 // The tail of the lambda a call's callee `callFnIx` names, when it is a `const` of instance
@@ -19335,14 +18972,6 @@ function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32): string {
   calleeNodeSigKey(atIx, fnIx)
 }
 
-// True if the function-VALUE callee at `sid` (in scope of `fnIx`) returns f64 — its resolved
-// `$fnsig` key's result kind is `"f64"`. Drives the closure-call RESULT classification
-// (print routing, numeric-context coercion), the value-call analogue of `fRetF64` for a
-// named function. `atIx` is the callee's own arena node (D2316).
-function calleeReturnsF64At(sid: i32, fnIx: i32, atIx: i32) {
-  calleeRetKindAt(sid, fnIx, atIx) == "f64"
-}
-
 // True if the function-VALUE callee at `sid` returns void — its resolved `$fnsig` key has no
 // result. POSITIONED at the callee's own arena node, which is what picks among sibling
 // module-scope blocks binding one closure name: unpositioned, the module rung declines on the
@@ -19427,14 +19056,6 @@ function sigArityIsElemOf(key: string, listTy: i32): boolean {
 // (binding cell, print routing). `atIx` is the callee's own arena node (D2316).
 function calleeReturnsStringAt(sid: i32, fnIx: i32, atIx: i32) {
   calleeRetKindAt(sid, fnIx, atIx) == "str"
-}
-
-// True if the function-VALUE callee at `sid` (in scope of `fnIx`) returns i64 — its resolved
-// `$fnsig` key's result kind is `"i64"`. The value-call analogue of `fRetI64` for a named
-// function — drives the closure-call RESULT's i64 typing (print routing, numeric-context
-// coercion). `atIx` is the callee's own arena node (D2316).
-function calleeReturnsI64At(sid: i32, fnIx: i32, atIx: i32) {
-  calleeRetKindAt(sid, fnIx, atIx) == "i64"
 }
 
 // The struct-table index a function-value callee at `sid` (in scope of `fnIx`) returns, or
