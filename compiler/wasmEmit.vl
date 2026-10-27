@@ -21835,21 +21835,27 @@ function widenClassifyExpr(exprIx: i32, fnIx: i32) {
   exprIx
 }
 
-// Builds the number literal at `exprIx` (parens and minuses peeled) as one `<w>.const` at the
-// width `w` its consumer names; -2 when `exprIx` is no literal. One literal node can be built at
-// several widths (a numeric-union member's arithmetic, a fresh-record call's field), so no one
-// checker type carries this; re-encoding keeps a hex literal past I32_MAX the value it spells.
+// Builds the number literal at `exprIx` (parens and minuses peeled) as one `<w>.const`; -2 when
+// `exprIx` is no literal. `w` is the checker's type of the position reading it, for a literal node
+// read at several widths: a numeric-union member's operator, or a numeric operator's operand.
+// Re-encoding keeps a hex literal past I32_MAX the value it spells.
 function emitNumLitAs(exprIx: i32, w: string): i32 {
   if cexLitPeel(exprIx) < 0 { return -2 }
   emitSignedNumLitAt(unwrapParen(exprIx), w)
 }
 
-// Emit the expression at `exprIx` as an i64 value: a bare integer literal lowers directly
-// as `i64.const`, an expression that already yields i64 emits as-is, and
-// any other i32 source is emitted then sign-extended (`i64.extend_i32_s`). A literal or a
-// negated one takes the width this call names, whatever its own type: a box operand has none.
+// A literal in the body of a generic or hole instance, which the checker typed once at its
+// template, is built at the width `w` its delivery widens to; -2 for any other node. Everywhere
+// else a literal is built at its own checker type.
+function emitInstLitAs(exprIx: i32, w: string, fnIx: i32): i32 {
+  if cexLitPeel(exprIx) < 0 || !fnInPinnedInstance(fnIx) { return -2 }
+  emitSignedNumLitAt(unwrapParen(exprIx), w)
+}
+
+// Emit the expression at `exprIx` as an i64 value: an expression that already yields i64 emits
+// as-is, and any other i32 source is emitted then sign-extended (`i64.extend_i32_s`).
 export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
-  const lit = emitNumLitAs(exprIx, "i64")
+  const lit = emitInstLitAs(exprIx, "i64", fnIx)
   if lit != -2 { return lit }
   const inner = unwrapParen(exprIx)
   const rw64 = asgRadixWidePrim(inner, fnIx)
@@ -21893,8 +21899,7 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
     }
   }
   if exprIsF64(f64Cls, fnIx) { return emitExpr(body, exprIx, fnIx, ec) }
-  // Checked before the i64 branch so a big literal stays one `f64.const` too.
-  const lit = emitNumLitAs(exprIx, "f64")
+  const lit = emitInstLitAs(exprIx, "f64", fnIx)
   if lit != -2 { return lit }
   // An i64 source converts (signed) to f64.
   if exprIsI64(f64Cls, fnIx) {
@@ -21912,14 +21917,11 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   0
 }
 
-// Emit the expression at `exprIx` as an f32 value: already-f32 emits as-is; a bare
-// (possibly signed) numeric literal lowers directly as `f32.const`, re-encoded at single
-// precision and never demoted from f64; otherwise an i32 expression converts with
-// `f32.convert_i32_s`. An i32 variable never reaches the convert path unliterally — the checker rejects i32→f32 as lossy above 2^24, so only an exactness-gated literal takes it.
+// Emit the expression at `exprIx` as an f32 value: already-f32 emits as-is; otherwise an i32
+// expression converts with `f32.convert_i32_s`. The checker refuses an i32 variable into f32
+// (lossy above 2^24), so only an exactness-gated literal takes the convert.
 export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
-  // One `f32.const` is also a constexpr, unlike `i32.const` + convert, so it can reach a
-  // `const` global's f32 field.
-  const lit = emitNumLitAs(exprIx, "f32")
+  const lit = emitInstLitAs(exprIx, "f32", fnIx)
   if lit != -2 { return lit }
   const rw32f = asgRadixWidePrim(unwrapParen(exprIx), fnIx)
   if rw32f != "" { return emitAsgRadixAs(body, exprIx, rw32f, "f32", fnIx, ec) }
@@ -36276,15 +36278,9 @@ function njKindOfExpr(ix: i32, fnIx: i32): i32 {
   0
 }
 
-// Pushes one side of the current dispatch at kind `p`, the side holding member type `m`.
-function njPushSide(
-  body: u8[],
-  left: boolean,
-  m: i32,
-  p: i32,
-  fnIx: i32,
-  ec: ExpCtx,
-) {
+// Pushes one side of the current dispatch at kind `p`, the side holding member type `m`; a
+// literal side is built at `p`, the dispatch member's width.
+function njPushSide(left: boolean, m: i32, p: i32) {
   let slot = njRSlot
   let isU = njRUnion
   let ix = njRIx
@@ -36293,7 +36289,9 @@ function njPushSide(
     isU = njLUnion
     ix = njLIx
   }
-  if slot == -2 { return emitExprAsKind(body, ix, p, fnIx, ec) }
+  if slot == -2 {
+    return emitNumLitAs(ix, primNameStr(tyPrimNameOf(numPrimTyOfKind(p))))
+  }
   fbLocalGet(slot)
   const mk = njKindOfTy(m)
   if isU {
@@ -36312,7 +36310,7 @@ function njTagTest(slot: i32, k: i32) {
 
 // One member pair of the current binary dispatch: both sides at the pair's type, the operator,
 // and the pair's value boxed when the result is a union.
-function njPair(body: u8[], a: i32, b: i32, fnIx: i32, ec: ExpCtx) {
+function njPair(a: i32, b: i32) {
   const n = nodeAt(njBin)
   if !(n is BinExpr) {
     return emitFail("emitProgram: numeric union dispatch lost its operator")
@@ -36331,9 +36329,9 @@ function njPair(body: u8[], a: i32, b: i32, fnIx: i32, ec: ExpCtx) {
       "emitProgram: a float '%' reached the emitter with no __f64_rem__ helper reserved",
     )
   }
-  if njPushSide(body, true, a, p, fnIx, ec) < 0 { return -1 }
+  if njPushSide(true, a, p) < 0 { return -1 }
   if fRem && p == 5 { fbF64PromoteF32() }
-  if njPushSide(body, false, b, p, fnIx, ec) < 0 { return -1 }
+  if njPushSide(false, b, p) < 0 { return -1 }
   if fRem {
     if p == 5 { fbF64PromoteF32() }
     fbCall(gHelpF64Rem)
@@ -36360,31 +36358,27 @@ function njPair(body: u8[], a: i32, b: i32, fnIx: i32, ec: ExpCtx) {
 }
 
 // The right side's dispatch under left member `a`, from right member `j` on.
-function njArmR(body: u8[], a: i32, j: i32, fnIx: i32, ec: ExpCtx) {
-  if !njRUnion || j == njRTys.length - 1 {
-    return njPair(body, a, njRTys[j], fnIx, ec)
-  }
+function njArmR(a: i32, j: i32) {
+  if !njRUnion || j == njRTys.length - 1 { return njPair(a, njRTys[j]) }
   njTagTest(njRSlot, njKindOfTy(njRTys[j]))
   fbOpenIf()
   fbValtype(njBlockKind, -1)
-  if njPair(body, a, njRTys[j], fnIx, ec) < 0 { return -1 }
+  if njPair(a, njRTys[j]) < 0 { return -1 }
   fbElse()
-  if njArmR(body, a, j + 1, fnIx, ec) < 0 { return -1 }
+  if njArmR(a, j + 1) < 0 { return -1 }
   fbEnd()
   0
 }
 
 // The left side's dispatch from left member `i` on; the last member is the bare `else`.
-function njArmL(body: u8[], i: i32, fnIx: i32, ec: ExpCtx) {
-  if !njLUnion || i == njLTys.length - 1 {
-    return njArmR(body, njLTys[i], 0, fnIx, ec)
-  }
+function njArmL(i: i32) {
+  if !njLUnion || i == njLTys.length - 1 { return njArmR(njLTys[i], 0) }
   njTagTest(njLSlot, njKindOfTy(njLTys[i]))
   fbOpenIf()
   fbValtype(njBlockKind, -1)
-  if njArmR(body, njLTys[i], 0, fnIx, ec) < 0 { return -1 }
+  if njArmR(njLTys[i], 0) < 0 { return -1 }
   fbElse()
-  if njArmL(body, i + 1, fnIx, ec) < 0 { return -1 }
+  if njArmL(i + 1) < 0 { return -1 }
   fbEnd()
   0
 }
@@ -36495,7 +36489,7 @@ function emitNumUnionBin(
       )
     }
   }
-  njArmL(body, 0, fnIx, ec)
+  njArmL(0)
 }
 
 // The distinct kinds the member pairs of the current dispatch compute at, in first-seen order;
@@ -37491,6 +37485,23 @@ function emitBinRefOps(
   return emitBinNumeric(body, e, exprIx, fnIx, ec)
 }
 
+// An operand of a numeric operator at the operator's width `w`: a literal is built there, so a
+// literal node read at two widths (a const's initializer under a desugared match arm) is right at
+// each; anything else widens to `w`.
+function emitBinOperandAs(
+  body: u8[],
+  ix: i32,
+  w: string,
+  fnIx: i32,
+  ec: ExpCtx,
+) {
+  const lit = emitNumLitAs(ix, w)
+  if lit != -2 { return lit }
+  if w == "f32" { return emitExprAsF32(body, ix, fnIx, ec) }
+  if w == "f64" { return emitExprAsF64(body, ix, fnIx, ec) }
+  emitExprAsI64(body, ix, fnIx, ec)
+}
+
 // `emitBinExprNode`'s numeric tail: a numeric union per member, then the f32, f64, i64 and
 // i32 operators, each operand coerced to the operator's width.
 function emitBinNumeric(
@@ -37532,8 +37543,8 @@ function emitBinNumeric(
     if opcF32 < 0 {
       return emitFail("emitProgram: operator '" + e.binOp + "' has no f32 form")
     }
-    if emitExprAsF32(body, e.binLeft, fnIx, ec) < 0 { return -1 }
-    if emitExprAsF32(body, e.binRight, fnIx, ec) < 0 { return -1 }
+    if emitBinOperandAs(body, e.binLeft, "f32", fnIx, ec) < 0 { return -1 }
+    if emitBinOperandAs(body, e.binRight, "f32", fnIx, ec) < 0 { return -1 }
     fbI32Bin(opcF32)
     return 0
   }
@@ -37554,8 +37565,8 @@ function emitBinNumeric(
     if opcF < 0 {
       return emitFail("emitProgram: operator '" + e.binOp + "' has no f64 form")
     }
-    if emitExprAsF64(body, e.binLeft, fnIx, ec) < 0 { return -1 }
-    if emitExprAsF64(body, e.binRight, fnIx, ec) < 0 { return -1 }
+    if emitBinOperandAs(body, e.binLeft, "f64", fnIx, ec) < 0 { return -1 }
+    if emitBinOperandAs(body, e.binRight, "f64", fnIx, ec) < 0 { return -1 }
     fbI32Bin(opcF)
     return 0
   }
@@ -37567,8 +37578,8 @@ function emitBinNumeric(
     if sr64 <= 0 { return sr64 }
     const opc64 = binOpcodeI64(e.binOp)
     if opc64 >= 0 {
-      if emitExprAsI64(body, e.binLeft, fnIx, ec) < 0 { return -1 }
-      if emitExprAsI64(body, e.binRight, fnIx, ec) < 0 { return -1 }
+      if emitBinOperandAs(body, e.binLeft, "i64", fnIx, ec) < 0 { return -1 }
+      if emitBinOperandAs(body, e.binRight, "i64", fnIx, ec) < 0 { return -1 }
       fbI32Bin(opc64)
       return 0
     }
