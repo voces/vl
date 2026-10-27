@@ -218,8 +218,6 @@ import {
   blockHasValuedReturn,
   exprIsIfStmt,
   ifArmValueExpr,
-  letIsF32,
-  letIsNulClosure,
   nliScanStmts,
 } from "./emit_query"
 import {
@@ -631,44 +629,20 @@ import {
   letBindRep,
   letBindRepClaims,
   letBindRepSlot,
-  letInfersF32,
-  letInfersNulClosure,
-  letInfersV128,
   letInitIsLitAtom,
-  letInitJoinsToUnionBox,
-  letInitTyIsNarrowedArm,
-  letInitTyIsNarrowedNulArm,
-  letIsArray,
   letIsClosure,
-  letIsF32Array,
-  letIsF64,
-  letIsF64Array,
-  letIsI64,
-  letIsI64Array,
   letIsMap,
-  letIsNulListInfer,
-  letIsNulMap,
   letIsNulNone,
-  letIsNulRef,
   letIsNulRefArray,
-  letIsNulString,
   letIsNulVariant,
   letIsRefArray,
   letIsString,
   letIsStringArray,
   letIsStruct,
-  letIsU8Array,
   letIsUnion,
-  letIsVariant,
   letMapShapeOf,
-  letNulBool,
   letNulLitUnion,
-  letNulMapReadSlotArg,
-  letNulMapReadUnionBox,
-  letNulMapReadValKind,
-  letNulScalarListKind,
   letObjLitVariantIdx,
-  letPopUnionBoxElem,
   letRefListSlot,
   mapShapeOfExpr,
   mapUnionResultRow,
@@ -678,9 +652,6 @@ import {
   mfRecvKindOf,
   mfResultKindOf,
   mfResultSlotOf,
-  nulMapShapeOf,
-  nulRefArrayInnerSlotOfLet,
-  nulRefStructIdxOfLet,
   nulVariantIdxOfLet,
   objVariantName,
   objVariantNameCtx,
@@ -697,7 +668,6 @@ import {
   structIndexOfObj,
   structIndexOfObjCtx,
   unionNameOfExpr,
-  variantIndexOfLet,
 } from "./emit_classify"
 import { bcOpen, bcSpineEnter, bcSpineLeave } from "./emit_closure_callee"
 import {
@@ -749,11 +719,7 @@ import {
   letIsLitUnion,
   shapeFieldElemRow,
 } from "./emit_lit_atoms"
-import {
-  letInitTyNulArmRow,
-  letInitTyVariantRow,
-  retLocalLetOfBlock,
-} from "./emit_local_scope"
+import { retLocalLetOfBlock } from "./emit_local_scope"
 import {
   mapTwinDropSlots,
   variantFirstLayoutDisagreeField,
@@ -4422,85 +4388,18 @@ function letLocalSlot(stmtIx: i32, s: LetDecl, fnIx: i32) {
     if slot >= 0 { localLitUnion[slot] = 1 }
   } else if letBindRepClaims(stmtIx, fnIx) {
     slot = letRepSlot(stmtIx, s, fnIx)
-  } else if letInitJoinsToUnionBox(stmtIx, fnIx) {
-    // A `??` whose nullable-ref operand JOINS with a default of another type: the result
-    // is the union box, so the slot is the box. Ahead of every arm below, which read the
-    // OPERAND's rep and would declare the niche's own ref (D1714).
-    slot = addLocalName(s.letName, "union", -1)
-  } else if letInitTyIsNarrowedArm(stmtIx, fnIx) {
-    // An un-annotated binding of a NARROWED arm (D1741): the init hands over the union
-    // box and the checker types the binding at the arm, so the cell is the arm and the
-    // binding boundary unboxes into it. Above every arm reading the init's own rep,
-    // each of which would give the cell a box every consumer then reads as the arm.
-    slot = addLocalName(s.letName, "variant", letInitTyVariantRow(stmtIx, fnIx))
-  } else if letInitTyIsNarrowedNulArm(stmtIx, fnIx) {
-    // Its `X | null` twin (D3107): the box narrowed to a nullable arm binds the niche.
-    slot = addLocalName(
-      s.letName,
-      "nulvariant",
-      letInitTyNulArmRow(stmtIx, fnIx),
-    )
-  } else if letIsNulMap(stmtIx, fnIx) {
-    // A nullable map local (kind `nulmap`), before `letIsMap`: a nullable init or
-    // annotation must not collapse to `"map"`, whose `(ref $mapStruct)` cell cannot hold
-    // `null`. Its `localStructIdx` carries the same map shape as the non-null map.
-    slot = addLocalName(s.letName, "nulmap", nulMapShapeOf(stmtIx, fnIx))
-  } else if letNulMapReadValKind(stmtIx, fnIx) != null {
-    // A bare `const t = m[k]` read of a list- or nested-map-valued map (`V | null`): binds
-    // the value's established nullable local kind, the same kinds a direct `V | null`
-    // annotation produces, so the narrow and read machinery lowers unchanged. Before the
-    // union-read guard and the non-null kinds, so a later narrow sees the nullable cell.
-    const nmrK = letNulMapReadValKind(stmtIx, fnIx)
-    if nmrK != null {
-      slot = addLocalName(s.letName, nmrK, letNulMapReadSlotArg(stmtIx, fnIx))
-    }
-  } else if letNulMapReadUnionBox(stmtIx, fnIx) {
-    // A bare `const t = m[k]` read of a union-valued map (mv kind 2): `V | null` binds the
-    // established `A | B | null` rep, the shared box itself, with `null` riding as the
-    // null-tagged atom. Beside the kind-6 arm for the same ladder-order reason.
-    slot = addLocalName(s.letName, "union", -1)
   } else if letIsMap(stmtIx, fnIx) {
-    // The kind-6 parallel slot carries the map shape: `-2` for a `Set()` binding, an mv
-    // slot for a ref-valued map, `-1` for the mono i32 map. After the bare-map-read arm,
-    // whose nested-map value is `{[string]:V} | null` and would else be claimed here as a
-    // non-null map local, storing the nullable element into a non-null cell.
+    // A `Map()` keyed by a literal union, whose constructor builds it string-keyed where the
+    // key type's rep is the atom (D14229): the shape comes from the readers, not the type.
     slot = addLocalName(s.letName, "map", letMapShapeOf(stmtIx, fnIx))
-  } else if letPopUnionBoxElem(stmtIx, fnIx) {
-    // A `.pop()` / `.get(i)` over a value-union ref list: `T | null` is the box with
-    // `null` as its tag, the same rep the union-valued map read binds. Before every
-    // nullable-niche arm below, none of which claims it, and before the i32 default,
-    // which stored a `(ref null $uBox)` into an i32 cell.
-    slot = addLocalName(s.letName, "union", -1)
   } else if letIsNulVariant(stmtIx, fnIx) {
-    // Nullable union variant (`Circle | null`, kind `nulvariant`) — the
-    // `(ref null $uVarHeap[vi])` niche. Before the `nulstruct` arm below: the two are
-    // disjoint at the producer, but a variant has no struct row for
-    // `nulRefStructIdxOfLet` to find, since `collectS` skips it.
+    // A nullable record the emitter adopts into a union arm's niche, where its own type has no
+    // row (D14441).
     slot = addLocalName(
       s.letName,
       "nulvariant",
       nulVariantIdxOfLet(stmtIx, fnIx),
     )
-  } else if letIsNulRef(stmtIx, fnIx) {
-    // Nullable struct (`S | null`, code 9): annotation first, else the initializer's
-    // nullable-returning call. Before the struct case, so a nullable init does not
-    // collapse to the non-null kind 1.
-    slot = addLocalName(
-      s.letName,
-      "nulstruct",
-      nulRefStructIdxOfLet(stmtIx, fnIx),
-    )
-  } else if letIsNulListInfer(stmtIx, fnIx) {
-    // Nullable i32 list (`i32[] | null`, kind 15), before the array case: `letIsArray`'s
-    // init fallback would otherwise claim the binding as a non-null kind 2, and a later
-    // `xs = null` write would be invalid.
-    slot = addLocalName(s.letName, "nullist", -1)
-  } else if letNulScalarListKind(stmtIx, fnIx) != null {
-    // A distinct-backing nullable scalar list local (`string[]|null`, `f64[]|null`,
-    // `i64[]|null`, `f32[]|null`): its own `(ref null $wrapper)` slot, before the non-null
-    // scalar-list arms whose init fallback would else claim a bare list value non-null.
-    const nulSLK = letNulScalarListKind(stmtIx, fnIx)
-    if nulSLK != null { slot = addLocalName(s.letName, nulSLK, -1) }
   } else {
     slot = letLocalSlotList(stmtIx, s, fnIx)
   }
@@ -4515,95 +4414,32 @@ function letRepSlot(stmtIx: i32, s: LetDecl, fnIx: i32): i32 {
   slot
 }
 
-// `letLocalSlot`'s list and closure rungs, in ladder order; falls on to the value rungs.
+// `letLocalSlot`'s list rungs, for a list whose type names no row; falls on to the value rungs.
 // Returns the slot, or what `letLocalSlotValue` returns.
 function letLocalSlotList(stmtIx: i32, s: LetDecl, fnIx: i32) {
   let slot = -1
-  // The scalar-list checks gate on `!letIsUnion`: a `f64[] | string` binding whose init
-  // is a bare list literal would otherwise let `letIsF64Array`'s init fallback claim it
-  // as an f64 list instead of the value-union box. A plain `f64[]` is not a union name.
   if (
     letIsStringArray(stmtIx, fnIx)
     && !letIsUnion(stmtIx, fnIx)
     && !letIsNulRefArray(stmtIx, fnIx)
   ) {
-    // The `!letIsNulRefArray` gate: a nullable union-element ref-array binding whose init
-    // is a bare string-list literal would otherwise be claimed as a plain string list by
-    // the init fallback, storing the union-box list into a string-list-wrapper local. The
-    // scalar-list siblings below carry the same gate.
+    // A string list whose element type is a union the rep does not cover.
     slot = addLocalName(s.letName, "strlist", -1)
-  } else if (
-    letIsU8Array(stmtIx, fnIx)
-    && !letIsUnion(stmtIx, fnIx)
-    && !letIsNulRefArray(stmtIx, fnIx)
-  ) {
-    // Packed byte-list local (`let b: u8[] = …`) — `(ref $bl8TypeIdx)`. Sits with the
-    // scalar-list arms and carries their two gates for the same reasons.
-    slot = addLocalName(s.letName, "u8list", -1)
-  } else if (
-    letIsF32Array(stmtIx, fnIx)
-    && !letIsUnion(stmtIx, fnIx)
-    && !letIsNulRefArray(stmtIx, fnIx)
-  ) {
-    // Scalar-f32-element list local (`let xs: f32[] = …`), kind 21 — `(ref $fl32TypeIdx)`.
-    // Before the f64 case: an `f32[]` annotation over a float-literal init would else be
-    // claimed by `letIsF64Array`'s init fallback, since a `[1.5]` is `exprF64Array`.
-    slot = addLocalName(s.letName, "f32list", -1)
-  } else if (
-    letIsF64Array(stmtIx, fnIx)
-    && !letIsUnion(stmtIx, fnIx)
-    && !letIsNulRefArray(stmtIx, fnIx)
-  ) {
-    // Scalar-f64-element list local (`let xs: f64[] = …`, or a float-literal array init),
-    // kind 12 — its cell is `(ref $fl64TypeIdx)`.
-    slot = addLocalName(s.letName, "f64list", -1)
-  } else if (
-    letIsI64Array(stmtIx, fnIx)
-    && !letIsUnion(stmtIx, fnIx)
-    && !letIsNulRefArray(stmtIx, fnIx)
-  ) {
-    // Scalar-i64-element list local (`let xs: i64[] = …`), kind 20 — `(ref $il64TypeIdx)`.
-    slot = addLocalName(s.letName, "i64list", -1)
-  } else if letIsNulRefArray(stmtIx, fnIx) {
-    // A nullable ref-array local (`i32[][] | null`, kind 18), before the non-null
-    // ref-array case: its init `v[i]` over a `(<ref-array>|null)[]` would otherwise be
-    // claimed as a non-null kind 5. Stores the inner ref-list slot in `localStructIdx`.
-    slot = addLocalName(
-      s.letName,
-      "nulreflist",
-      nulRefArrayInnerSlotOfLet(stmtIx, fnIx),
-    )
   } else if letIsRefArray(stmtIx, fnIx) && !letIsUnion(stmtIx, fnIx) {
-    // The `!letIsUnion` gate mirrors the scalar-list branches above: a union-annotated
-    // local whose init is a ref array (`const p: S[] | i64 = xs`) is a union-box local
-    // (kind 4), not a reflist local, since the init coerces into the box. Without the gate
-    // the ref-array init wins the reflist valtype and the boxed store is invalid wasm.
+    // A list of generic function values, or of an instance's lambda (D14501): its row is
+    // the one its initializer delivers. A union-annotated binding is the box instead.
     slot = addLocalName(s.letName, "reflist", letRefListSlot(stmtIx, fnIx))
-  } else if (
-    letIsNulClosure(stmtIx, fnIx)
-    || letInfersNulClosure(stmtIx, fnIx)
-  ) {
-    // A nullable function-value local (kind 19), or an un-annotated `const f = m[k]` over
-    // a function-valued map, since a bare map read is nullable. Its cell is the nullable
-    // closure fat pointer `(ref null $cloStructIdx)`. Before `letIsUnion`, which reads the
-    // `fn | null` annotation as a union name, and before the non-null closure (kind 14).
-    slot = addLocalName(s.letName, "nulclosure", -1)
   } else {
     slot = letLocalSlotValue(stmtIx, s, fnIx)
   }
   slot
 }
 
-// `letLocalSlot`'s variant, struct and scalar rungs and the i32 default, in ladder order.
+// `letLocalSlot`'s union, struct, string and closure rungs and the i32 default, in ladder order.
 // Returns the slot, -2 when the i32 default rejects the binding, or -3 from the struct rung.
 function letLocalSlotValue(stmtIx: i32, s: LetDecl, fnIx: i32) {
   let slot = -1
-  if letIsVariant(stmtIx, fnIx) {
-    // A concrete union-variant local (`const c: Cat = …`), kind 8 — its cell is the
-    // variant struct ref `(ref $(uVarHeap[vi]))`. Before `letIsUnion` and `letIsStruct`:
-    // a variant name is neither the union box nor a standalone struct.
-    slot = addLocalName(s.letName, "variant", variantIndexOfLet(stmtIx, fnIx))
-  } else if letIsUnion(stmtIx, fnIx) {
+  if letIsUnion(stmtIx, fnIx) {
     slot = addLocalName(s.letName, "union", -1)
   } else if letIsStruct(stmtIx, fnIx) {
     // `letIsStruct` also matches via the init object literal's field-name set, so an
@@ -4618,8 +4454,7 @@ function letLocalSlotValue(stmtIx: i32, s: LetDecl, fnIx: i32) {
     }
     // The local half of D51, which `criClassify`'s return rung alone cannot see: `const c
     // = { r: n }` beside `type Shape = Circle | Sq` has no struct row for its field set,
-    // so `letIsVariant` declines and the pair `("struct", -1)` reached `fbValtype`'s
-    // guard. Gated on the `-1`, so it can only fire on a pair that is a loud reject.
+    // so the literal is adopted into the arm's variant row (D14441).
     const lsi = structIndexOfLet(stmtIx, fnIx)
     const lov = letObjLitVariantIdx(stmtIx, fnIx)
     if lsi < 0 && lov >= 0 {
@@ -4627,46 +4462,11 @@ function letLocalSlotValue(stmtIx: i32, s: LetDecl, fnIx: i32) {
     } else {
       slot = addLocalName(s.letName, "struct", lsi)
     }
-  } else if letIsArray(stmtIx, fnIx) {
-    slot = addLocalName(s.letName, "list", -1)
-  } else if letIsNulString(stmtIx, fnIx) {
-    // Nullable string (`string | null`, kind 16), before the string case so a nullable
-    // annotation or init does not collapse to the non-null kind 3, after which a later
-    // `x = null` write would be invalid.
-    slot = addLocalName(s.letName, "nulstr", -1)
   } else if letIsString(stmtIx, fnIx) {
     slot = addLocalName(s.letName, "str", -1)
-  } else if letIsI64(stmtIx, fnIx) {
-    // Scalar i64 local (`let x: i64 = …`, kind 10, valtype 0x7e). Bypasses
-    // `checkLocalI32`, which rejects a non-i32 annotation; the init literal lowers as
-    // `i64.const` in `emitStmt`'s LetDecl path.
-    slot = addLocalName(s.letName, "i64", -1)
-  } else if letInfersV128(stmtIx, fnIx) {
-    // A v128 SIMD-vector local (kind `v128`, valtype 0x7b), annotated (`: F32x4`) or
-    // inferred from a vector init; `emitLetDeclStmt`'s default arm stores it with a
-    // plain `local.set`.
-    slot = addLocalName(s.letName, "v128", -1)
-  } else if letIsF32(stmtIx) || letInfersF32(stmtIx, fnIx) {
-    // Scalar f32 local (`let x: f32 = …`, kind 13, valtype 0x7d), or an un-annotated
-    // `let y = <f32 expr>` — the f32 dual of the init fallback `letIsF64` and `letIsI64`
-    // carry. An annotated float literal lowers as `f32.const`; an inferred f32 init is
-    // already an f32 value. A bare un-annotated float literal stays f64.
-    slot = addLocalName(s.letName, "f32", -1)
-  } else if letIsF64(stmtIx, fnIx) {
-    // Scalar f64 local (`let x: f64 = …`, or an un-annotated `.` literal init), kind 11,
-    // valtype 0x7c. Bypasses `checkLocalI32`; the init literal lowers as `f64.const` in
-    // `emitStmt`'s LetDecl path.
-    slot = addLocalName(s.letName, "f64", -1)
   } else if letIsClosure(stmtIx, fnIx) {
-    // A function-value local (`const f = function(...)...` or `const g = namedFn`), kind
-    // 14 — its cell is the closure fat-pointer struct `(ref $cloStructIdx)`.
+    // A function value whose type reads a parameter the D4551 default bound.
     slot = addLocalName(s.letName, "closure", -1)
-  } else if letNulBool(stmtIx, fnIx) {
-    // `boolean | null` niche local (kind 17): the cell is a plain i32 holding 0 or 1, with
-    // the spare value 2 encoding `null`, so `fbValtype` renders it i32. A dedicated kind so
-    // `checkLocalI32` does not reject the annotation and the if-binding emit routes it to
-    // the sentinel-2 rep; a later `x = null` consults `exprNulBool`, not the slot kind.
-    slot = addLocalName(s.letName, "nulbool", -1)
   } else {
     if checkLocalI32(stmtIx) < 0 { return -2 }
     slot = addLocalName(s.letName, "i32", -1)

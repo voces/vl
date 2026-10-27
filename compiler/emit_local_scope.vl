@@ -44,15 +44,13 @@ import {
   nodeAt,
 } from "./ast"
 import {
-  nodeTyIsFunc,
   nodeTyIsMap,
   nodeTyIsNulScalarBox,
   nodeTyIsNullable,
   nodeTyIsPureLitUnion,
   nodeTyIxOf,
 } from "./check_node_tys"
-import { fnTagTyIsTagged } from "./check_elab_cap"
-import { isValueUnionTyOr, tyIsValueUnionBox } from "./check_ty_rep"
+import { tyIsValueUnionBox } from "./check_ty_rep"
 import {
   PrimName,
   TyNullable,
@@ -97,19 +95,12 @@ import {
   narrowVariantFor,
   variantIndexOf,
 } from "./emit_narrow_slots"
-import { nulVariantIndexOf, structRowOfTy } from "./emit_nullable_rets"
+import { nulVariantIndexOf } from "./emit_nullable_rets"
 import { paramIndexOf, paramIsF64 } from "./emit_query"
-import {
-  RepDesc,
-  nodeRepIs,
-  repDescNone,
-  repDescRet,
-  repOfTy,
-} from "./emit_rep"
+import { RepDesc, repDescNone, repDescRet, repOfTy } from "./emit_rep"
 import {
   annRepKindOf,
   emptyArrLitIxOf,
-  mapFindShapeOfNodeTy,
   mapNodeValKindLowerable,
 } from "./emit_shape_rows"
 import {
@@ -336,31 +327,6 @@ export function fnParamNodeOf(fnIx: i32, name: string) {
   -1
 }
 
-// Whether an un-annotated binding's initializer carries a `TyFunc` in the arena — the
-// checker's own answer, for the spellings `letIsClosure`'s syntactic ladder cannot reach.
-export function letInitTyIsFunc(letIx: i32): boolean {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letInit < 0 { return false }
-    // A tagged set's value is the i32 id of its member, not a closure.
-    return nodeTyIsFunc(d.letInit) && !fnTagTyIsTagged(nodeTyIxOf(d.letInit))
-  }
-  false
-}
-
-// Whether an un-annotated binding's initializer carries a registered STRUCT in the arena —
-// the checker's own answer for the projection spellings (`xs[0]`, `box.it`) that commit no
-// rep the `letIs*` ladder can read. Shared by the kind and its slot so the two agree (D1476).
-export function letInitTyIsStruct(letIx: i32, fnIx: i32): boolean {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return false }
-    if d.letInit < 0 { return false }
-    return isStructOfTy(nodeTyAt(d.letInit, fnIx))
-  }
-  false
-}
-
 // Whether the initializer is a nested-struct FIELD read — the one projection shape whose slot
 // is nullable, so a cell over it is `nulstruct` and not `struct` (D1476). Annotation-blind:
 // the field's storage is what it is, and the capture classifier asks this of an ANNOTATED
@@ -373,16 +339,6 @@ export function initIsNestedStructFieldRead(letIx: i32): boolean {
     if e is Member { return isStructOfTy(nodeTyIxOf(d.letInit)) }
   }
   false
-}
-
-// The `letInitCellKind` rung's own entry: UN-annotated only, since an annotated binding's cell
-// is the annotation's and this ladder never sees one.
-export function letInitIsNestedStructField(letIx: i32): boolean {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return false }
-  }
-  initIsNestedStructFieldRead(letIx)
 }
 
 // An un-annotated binding's PROJECTION initializer node, or -1 — an index or a field read,
@@ -420,30 +376,6 @@ export function letInitProjKind(letIx: i32): VKind | null {
   if rk != null { return rk }
   if nodeTyIsMap(ini) { return "map" }
   null
-}
-
-// That map arm's companion — the mv slot the recorded value type names, a FIND and never a
-// mint. Gated on the KIND its twin answers, not on which of that twin's two rungs answered:
-// the descriptor covers a nested map and not a struct-valued shallow one, and a `"map"` cell
-// whose shape stays -1 is the mono map, a different layout (D1772).
-export function letInitProjMapShape(letIx: i32): i32 {
-  const ini = letInitProjNode(letIx)
-  if ini < 0 { return -1 }
-  if letInitProjKind(letIx) != "map" { return -1 }
-  if nodeTyIsMap(ini) { return mapFindShapeOfNodeTy(ini) }
-  -1
-}
-
-// The struct row that rung names, or -1 — the companion index `fbValtype` reads for a
-// `"struct"` cell.
-export function letInitTyStructRow(letIx: i32, fnIx: i32): i32 {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return -1 }
-    if d.letInit < 0 { return -1 }
-    return structRowOfTy(nodeTyAt(d.letInit, fnIx))
-  }
-  -1
 }
 
 // The variant row the checker recorded for an UN-annotated binding's initializer, or -1 —
@@ -532,39 +464,6 @@ export function letInitTyNulArmRow(letIx: i32, fnIx: i32): i32 {
     if tt is TyNullable { return nulArmRowOfTy(tt.nInner) }
   }
   -1
-}
-
-// The nullable twin: the initializer carries a `TyNullable` over a `TyFunc`, which a bare
-// `const t = m[k]` read of a function-valued map is and no syntactic arm claims (D1621).
-export function letInitTyIsNulFunc(letIx: i32, fnIx: i32): boolean {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letInit < 0 { return false }
-    return nodeRepIs(d.letInit, "nulclosure", fnIx)
-  }
-  false
-}
-
-// True when an un-annotated binding's initializer records a `T | null` whose `T` is a value
-// UNION — the box rep, `null` riding as its tag. Asked of the arena alone, so it needs no
-// frame. `isValueUnionTyOr` is the row twin of `isValueUnionName`, which answers on a spelling
-// and so declines an alias; the inner must be a real `TyUnion`, keeping `i32 | null` out.
-export function letInitTyIsNulValueUnion(letIx: i32, fnIx: i32): boolean {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return false }
-    if d.letInit < 0 { return false }
-    const t = nodeTyAt(unwrapParen(d.letInit), fnIx)
-    if t < 0 { return false }
-    const tt = tyAt(t)
-    if tt is TyNullable {
-      if tt.nInner < 0 { return false }
-      if tyIsLitUnion(tt.nInner) { return false }
-      const it = tyAt(tt.nInner)
-      if it is TyUnion { return isValueUnionTyOr(t) == 1 }
-    }
-  }
-  false
 }
 
 // The last rung of `letInitCellKind`: an initializer the generic body shares, typed at a hole
