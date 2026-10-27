@@ -54,10 +54,12 @@ import { valueTailSplit } from "./check_num_adopt"
 import { collectRetValues } from "./check_nj_join"
 import { rcwInferredRetTy } from "./check_rcw"
 import { tErr } from "./check_relate_core"
-import { T, TyFunc, tyAt } from "./check_types"
+import { T, TyArray, TyFunc, tyAt } from "./check_types"
 import { parenPeelIx } from "./check_places"
 import { lpExitsOf } from "./check_if_value"
 import { i32ListHas } from "./listutil"
+import { fnTupOpenFn } from "./check_fn_tuple"
+import { fnDeclParent } from "./check_decl_scan"
 import { identDeclOf, identSet } from "./symbols"
 import {
   elabFnIdOf,
@@ -336,7 +338,12 @@ function ftScan(
           }
         }
       }
+      // A list holding the set's ids is read by index only, outside an instance body.
+      if ftHolds(x, s) && (ftInOpenFn(fn) || !ftHoldCtxOk(x, p)) {
+        return false
+      }
       const n = nodeAt(x)
+      if n is ArrayLit && !ftLitJoin(x, n, s, ds, leaves, ids) { return false }
       if n is FuncDecl {
         fn = x
         ok = if ftClosedLambda(n) { ok } else { ftFnOk(x, rootIx) }
@@ -459,8 +466,12 @@ function ftNodeOk(
     BinExpr => {
       return ftIsStore(n) && ftIsS(n.binRight, s)
     }
+    // An element read of a list holding the set's ids is one of them.
+    Index => {
+      return true
+    }
     // No other node of a set's type is lowered as an id.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Member | OptMember | ErrExpr | FuncDecl | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ImportDecl | Spread => {
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Member | OptMember | ErrExpr | FuncDecl | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ImportDecl | Spread => {
       return false
     }
   }
@@ -685,9 +696,80 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       if i32ListHas(pn.fnParams, x) { return true }
       return pn.fnBody == x && ftRetCarries(p, s)
     }
+    // A list literal holds the id as its element.
+    ArrayLit => {
+      return true
+    }
     // Any other parent reads the value as a closure.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | ErrExpr | TypeRef | BreakStmt | ContinueStmt | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | ErrExpr | TypeRef | BreakStmt | ContinueStmt | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {
       return false
     }
   }
+}
+
+// Whether list literal `x` joins every element into set `s`, the set its element type carries.
+function ftLitJoin(
+  x: i32,
+  n: ArrayLit,
+  s: i32,
+  ds: i32[],
+  leaves: i32[],
+  ids: i32[],
+): boolean {
+  const lt = nodeTyIxOf(x)
+  if lt < 0 || lt >= T.tys.length { return true }
+  const at = tyAt(lt)
+  if !(at is TyArray) || fnTagSetOfTy(at.aElem) != s { return true }
+  for el in n.arrElems {
+    if !ftIsS(el, s) && !ftJoinAt(el, at.aElem, s, ds, leaves, ids) {
+      return false
+    }
+  }
+  true
+}
+
+// Whether node `x` is a list whose element carries set `s`.
+function ftHolds(x: i32, s: i32): boolean {
+  if x < 0 { return false }
+  const t = nodeTyIxOf(x)
+  if t < 0 || t >= T.tys.length { return false }
+  const a = tyAt(t)
+  if a is TyArray { return fnTagSetOfTy(a.aElem) == s }
+  false
+}
+
+// Whether list `x` of a set's ids, the child of `p`, sits where its ids are only read by index.
+function ftHoldCtxOk(x: i32, p: i32): boolean {
+  const n = nodeAt(x)
+  if n is LetDecl { return n.letType < 0 }
+  if !(n is ArrayLit || n is Ident || n is Paren) || p < 0 { return false }
+  const pn = nodeAt(p)
+  match pn {
+    LetDecl => {
+      return pn.letInit == x && pn.letType < 0
+    }
+    Paren => {
+      return true
+    }
+    Index => {
+      return pn.idxArr == x
+    }
+    // Any other parent delivers the list somewhere that reads it as a list of closures.
+    Program | Call | RetStmt | IfStmt | MatchExpr | Block | Param | WhileStmt | BinExpr | FuncDecl | ArrayLit | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | ErrExpr | TypeRef | BreakStmt | ContinueStmt | FieldDef | TypeDecl | FieldInit | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread => {
+      return false
+    }
+  }
+}
+
+// Whether function `fn`, or one it sits inside, is an instance body; such a list stays untagged
+// until the instance mints its own set (D14430).
+function ftInOpenFn(fn: i32): boolean {
+  let f = fn
+  let hops = 0
+  while f >= 0 && hops < 64 {
+    if fnTupOpenFn(f) { return true }
+    f = fnDeclParent[f] ?? -1
+    hops = hops + 1
+  }
+  false
 }
