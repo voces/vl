@@ -85,6 +85,8 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  genAppRowOf,
+  structNameOfTy,
   tyAt,
   tyEq,
   tyHasHole,
@@ -786,11 +788,20 @@ function elabOne(k: i32) {
     ps.push(elabCapTy[ix] ?? -1)
     elabNodeTys[ix] = ps
   }
-  // A stamp that only repeats the literal's own type there names no destination: not banked.
+  // A stamp that only repeats the literal's own anonymous type there names no destination: not
+  // banked; a named or generic-application record is a row of its own.
   for ix in elabCapRep.keys() {
     const rt = elabCapRep[ix] ?? -1
     const own = elabCapTy[ix] ?? -1
-    if rt < 0 || (own >= 0 && tyEq(rt, own)) { continue }
+    if (
+      rt < 0
+      || (own >= 0
+        && tyEq(rt, own)
+        && structNameOfTy(rt) == ""
+        && genAppRowOf(rt) < 0)
+    ) {
+      continue
+    }
     const rs = elabNodeReps[ix] ?? []
     rs.push(k)
     rs.push(rt)
@@ -1057,12 +1068,12 @@ export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
 
 // The type literal `ix` (or the node it copies) is built at in the instance emitted function
 // `fnIx` is: the stamp that instance's elaboration made, else the parameter its call's instance
-// closes, else its stamp under that instance's binding, else its own type there; -1 where none
-// closes.
+// closes, else its own closed stamp, else the type that instance checked it at (`litRepTyIn`),
+// else its own type under that binding; -1 where none closes.
 export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   if ix < 0 { return -1 }
   const k = elabKeyAt(fnIx)
-  const r = elabNodeRep(ix, k)
+  const r = elabPairIn(elabNodeReps, ix, k)
   if r >= 0 { return r }
   const pa = elabArgTyAt(ix, k, 0)
   if pa >= 0 { return pa }
@@ -1075,7 +1086,7 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   const src = if s < 0 { nodeSrc[ix] ?? -1 } else { -1 }
   if src >= 0 && src < nodeRepTyIx.length { s = nodeRepTyIx[src] }
   if s >= 0 && s < T.tys.length && !tyHasTyVar(s) { return s }
-  const c = if s >= 0 && s < T.tys.length { elabSubstClosed(s, k) } else { -1 }
+  const c = litRepTyIn(ix, k)
   if c >= 0 { return c }
   const t = nodeRepTyIxOf(ix)
   if t < 0 || !tyHasTyVar(t) { return t }
@@ -1135,18 +1146,16 @@ export function elabSpreadNote(a: i32) {
   0
 }
 
-// The closed types instances build literal `ix` at: the stamp each one's elaboration made, else
-// its stamp under that instance's binding, else its own type there. Each instance that records
-// the literal contributes at most one.
+// The closed types instances build literal `ix` (or the node it copies) at: what each one's
+// elaboration gave it (`litRepTyIn`), else its own type there. Each instance that records the
+// literal contributes at most one.
 export function elabLitInstTys(ix: i32): i32[] {
   const out: i32[] = []
-  const ps = elabNodeTys[ix] ?? []
-  const s = if ix >= 0 && ix < nodeRepTyIx.length { nodeRepTyIx[ix] } else { -1 }
-  const open = s >= 0 && s < T.tys.length && tyHasTyVar(s)
+  let ps = elabNodeTys[ix] ?? []
+  if ps.length == 0 { ps = elabNodeTys[nodeSrc[ix] ?? -1] ?? [] }
   let i = 0
   while i + 1 < ps.length {
-    let t = elabNodeRep(ix, ps[i])
-    if t < 0 && open { t = elabSubstClosed(s, ps[i]) }
+    let t = litRepTyIn(ix, ps[i])
     if t < 0 { t = elabNodeTy(ix, ps[i]) }
     if t >= 0 { out.push(t) }
     i = i + 2
@@ -1383,12 +1392,25 @@ function elabCallInstFrom(ix: i32, from: i32): i32 {
   k
 }
 
-// The type instance `k`'s elaboration stamped literal `ix` (or the node it copies) to be built
-// at; -1 when it stamped none.
-function elabNodeRep(ix: i32, k: i32): i32 {
+// The type instance `k` builds literal `ix` (or the node it copies) at: the stamp its
+// elaboration made, else, for a literal whose own type names a type parameter, the closed type
+// that elaboration checked it at; -1 for none.
+function litRepTyIn(ix: i32, k: i32): i32 {
   if k < 0 { return -1 }
-  let rs = elabNodeReps[ix] ?? []
-  if rs.length == 0 { rs = elabNodeReps[nodeSrc[ix] ?? -1] ?? [] }
+  const s = elabPairIn(elabNodeReps, ix, k)
+  if s >= 0 { return s }
+  const own = nodeTyIxOf(ix)
+  if own >= 0 && own < T.tys.length && !tyHasTyVar(own) { return -1 }
+  const t = elabPairIn(elabNodeTys, ix, k)
+  if t >= 0 && t < T.tys.length && !tyHasTyVar(t) { t } else { -1 }
+}
+
+// Instance `k`'s entry for node `ix` (or the node it copies) in a `[key, type, ...]` bank; -1
+// for none.
+function elabPairIn(bank: {[i32]: i32[]}, ix: i32, k: i32): i32 {
+  if k < 0 { return -1 }
+  let rs = bank[ix] ?? []
+  if rs.length == 0 { rs = bank[nodeSrc[ix] ?? -1] ?? [] }
   let i = 0
   while i + 1 < rs.length {
     if rs[i] == k { return rs[i + 1] }
