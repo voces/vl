@@ -510,6 +510,7 @@ import {
   uFieldTypes,
   uTags,
   uVarHeap,
+  uVarMemPos,
   uVarTwin,
   uVarTyIx,
   uVarTyIxResets,
@@ -735,13 +736,13 @@ import {
 } from "./emit_map_value_slots"
 import {
   armLayoutContestedAt,
+  armRowOfRecordTyShim,
   markMapKeyUsed,
   scopeBind,
   scopePop,
   scopePush,
   scopeUnbind,
   uVarSTwinAt,
-  variantRowOfTy,
 } from "./emit_mv_slots"
 import {
   addLocalName,
@@ -1502,7 +1503,7 @@ function mapLeafValTy(ty: i32): i32 {
 // programs wherever a layout twin is declared: a half-pinned chain is worse than an un-pinned
 // one, which rides the arm/twin conflation the mv and ref-list layers still carry.
 function pinArmDeepUncontestedTy(ty: i32): boolean {
-  const row = variantRowOfTy(mapLeafValTy(ty))
+  const row = armRowOfRecordTyShim(mapLeafValTy(ty))
   if row < 0 { return false }
   !armLayoutContestedAt(row)
 }
@@ -1524,7 +1525,7 @@ function armPinAnnName(tyIx: i32) {
   // reaches, read off the annotation's arena type.
   const mvT = tyMapValOf(annRowOfNode(tyIx))
   if mvT >= 0 {
-    if variantRowOfTy(mvT) >= 0 { return tyNameOf(tyIx) }
+    if armRowOfRecordTyShim(mvT) >= 0 { return tyNameOf(tyIx) }
     // …and at every depth, not one (D156).
     if pinArmDeepUncontestedTy(mvT) { return tyNameOf(tyIx) }
   }
@@ -1669,7 +1670,7 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
 function alcNamesArm(name: string, ann: i32): boolean {
   if name == "" { return false }
   if variantIndexOf(name) >= 0 { return true }
-  variantRowOfTy(mapLeafValTy(annRowOfNode(ann))) >= 0
+  armRowOfRecordTyShim(mapLeafValTy(annRowOfNode(ann))) >= 0
 }
 
 // The spelling of the annotation node `ann`, or "" for none.
@@ -7400,7 +7401,7 @@ function collectAnonShapes() {
             // The arm-shape mint an ANONYMOUS holder owes: `collectNestedFieldShapes` interns
             // the row a DECLARED `f: P` field stores through, read off the annotation, and an
             // inferred holder has none — so the field took no code and the literal no row (D1672).
-            internArmShapeRow(variantRowOfTy(nodeTyIxOf(pf.fiValue)))
+            internArmShapeRow(armRowOfRecordTyShim(nodeTyIxOf(pf.fiValue)))
             const pv = unwrapParen(pf.fiValue)
             if pv >= 0 && pv < nestOwner.length {
               const pvn = nodeAt(pv)
@@ -8051,7 +8052,7 @@ function internArmFieldShapeTy(ty: i32, depth: i32) {
       return 0
     }
   }
-  internArmShapeRow(variantRowOfTy(ty))
+  internArmShapeRow(armRowOfRecordTyShim(ty))
 }
 
 // `internArmFieldShapeTy` with a declared record's fields descended too, for a join whose
@@ -8066,11 +8067,11 @@ function internArmShapeOfTy(ty: i32, depth: i32) {
     for f in t.objFieldTypes { internArmShapeOfTy(f, depth + 1) }
     return 0
   }
-  internArmShapeRow(variantRowOfTy(ty))
+  internArmShapeRow(armRowOfRecordTyShim(ty))
 }
 
 // The mint itself, keyed on the variant ROW: a declared field type reaches it by name, an
-// anonymous literal's field value by the arena type of the value (`variantRowOfTy`).
+// anonymous literal's field value by the arena type of the value (`armRowOfRecordTyShim`).
 function internArmShapeRow(vi: i32) {
   if vi < 0 { return 0 }
   if vi >= uVarTyIx.length { return 0 }
@@ -9232,31 +9233,9 @@ function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
     atomTys.push(unMemTys[uMemBase + uMemI])
     uMemI = uMemI + 1
   }
-  unVarStart.push(uVariants.length)
-  // Only struct members occupy variant slots; a `null` rides the tag and a value-atom tags
-  // via `scalarTagOfKind` into the shared value boxes.
-  let nStructs = 0
-  let cnt = 0
-  while cnt < atoms.length {
-    if atoms[cnt] != "null" {
-      if isStructAtom(stmts, atoms[cnt]) { nStructs = nStructs + 1 }
-    }
-    cnt = cnt + 1
-  }
-  unVarCount.push(nStructs)
-  let vi = 0
-  while vi < atoms.length {
-    if atoms[vi] != "null" {
-      if isStructAtom(stmts, atoms[vi]) {
-        uVariantsPush(atoms[vi])
-        // The row `recordUnMemTys` already resolved, from this very atom — reusing it avoids
-        // re-running the whole name-to-row ladder for an answer already in the parallel column.
-        uVarTyIx.push(atomTys[vi])
-        if collectVariantFields(stmts, atoms[vi], atomTys[vi]) < 0 { return -1 }
-      }
-    }
-    vi = vi + 1
-  }
+  const atomPos: i32[] = []
+  while atomPos.length < atoms.length { atomPos.push(atomPos.length) }
+  if mintVariantRows(stmts, atoms, atomTys, atomPos) < 0 { return -1 }
   // A mixed union's scalar members box like a value union's — interns their per-rep value
   // boxes (a no-op for an all-struct union).
   markValueUnionAtoms(name, mintTyIx)
@@ -10305,6 +10284,7 @@ function collectUReset() {
   uVariants = []
   uVariantRowBySid = []
   uVarTyIx = []
+  uVarMemPos = []
   uVarTyIxResets = uVarTyIxResets + 1
   cloSigTagNames = []
   uFieldNames = []
@@ -10339,15 +10319,10 @@ function unionDeclStructAlias(s: UnionDecl): string {
   shape
 }
 
-// The arena type of the declared union's arm `vs[vi]`: the row member spelled alike at the same
-// occurrence, since twin arms that differ only in a numeric tag share one spelling. An arm the
-// row does not spell (an expanded alias) resolves its own name.
-function declVariantTyIx(
-  vs: string[],
-  vi: i32,
-  atoms: string[],
-  tys: i32[],
-): i32 {
+// The row member position of the declared union's arm `vs[vi]`: the member spelled alike at the
+// same occurrence, since twin arms that differ only in a numeric tag share one spelling. -1 for
+// an arm the row does not spell (an expanded alias), which resolves its own name.
+function declVariantPos(vs: string[], vi: i32, atoms: string[]): i32 {
   let nth = 0
   let j = 0
   while j < vi {
@@ -10357,12 +10332,42 @@ function declVariantTyIx(
   let k = 0
   while k < atoms.length {
     if atoms[k] == vs[vi] {
-      if nth == 0 { return tys[k] }
+      if nth == 0 { return k }
       nth = nth - 1
     }
     k = k + 1
   }
-  declTyIxOfName(vs[vi])
+  -1
+}
+
+// The one producer of variant rows: the newest union row's variant slice, one row per struct
+// member `names[i]` at arena type `tys[i]` and row member position `pos[i]`. A variant's
+// identity is that position, never its record type (D14552). 0, or -1 once failed.
+function mintVariantRows(
+  stmts: i32[],
+  names: string[],
+  tys: i32[],
+  pos: i32[],
+): i32 {
+  unVarStart.push(uVariants.length)
+  // Only struct members occupy variant slots; a `null` rides the tag and a value-atom tags
+  // via `scalarTagOfKind` into the shared value boxes.
+  let nStructs = 0
+  for n in names {
+    if n != "null" && isStructAtom(stmts, n) { nStructs = nStructs + 1 }
+  }
+  unVarCount.push(nStructs)
+  let i = 0
+  while i < names.length {
+    if names[i] != "null" && isStructAtom(stmts, names[i]) {
+      uVariantsPush(names[i])
+      uVarTyIx.push(tys[i])
+      uVarMemPos.push(pos[i])
+      if collectVariantFields(stmts, names[i], tys[i]) < 0 { return -1 }
+    }
+    i = i + 1
+  }
+  0
 }
 
 // Register the declared union `s` (at statement `stmtIx`): its row, member set and key, its
@@ -10437,32 +10442,16 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
     unKey.length - 1,
   )
   unTyKeyPushRow()
-  unVarStart.push(uVariants.length)
-  // Only struct variants get a variant struct + fields; an atom member of a mixed union
-  // boxes through the shared value boxes instead, as the inline-annotation path does.
-  let nStructs = 0
-  let nc = 0
-  while nc < vs.length {
-    if vs[nc] != "null" {
-      if isStructAtom(stmts, vs[nc]) { nStructs = nStructs + 1 }
-    }
-    nc = nc + 1
+  const vTys: i32[] = []
+  const vPos: i32[] = []
+  while vPos.length < vs.length {
+    const k = declVariantPos(vs, vPos.length, memAtoms)
+    vTys.push(if k >= 0 { memTys[k] } else { declTyIxOfName(vs[vPos.length]) })
+    vPos.push(k)
   }
-  unVarCount.push(nStructs)
-  let vi = 0
-  while vi < vs.length {
-    if vs[vi] != "null" {
-      if isStructAtom(stmts, vs[vi]) {
-        uVariantsPush(vs[vi])
-        const vty = declVariantTyIx(vs, vi, memAtoms, memTys)
-        uVarTyIx.push(vty)
-        if collectVariantFields(stmts, vs[vi], vty) < 0 { return -1 }
-      }
-    }
-    vi = vi + 1
-  }
+  if mintVariantRows(stmts, vs, vTys, vPos) < 0 { return -1 }
   // A one-member declaration over an inline union shares that union's slice (D1492).
-  if vs.length == 1 && nStructs == 0 {
+  if vs.length == 1 && unVarCount[unVarCount.length - 1] == 0 {
     unVarSliceAdoptKeySibling(unNames.length - 1)
   }
   // A MIXED union's scalar members intern their per-rep value boxes (no-op for an
