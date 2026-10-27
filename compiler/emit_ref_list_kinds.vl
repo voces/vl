@@ -58,6 +58,8 @@ import {
   TyObj,
   TyPrim,
   TyUnion,
+  litBaseTy,
+  mkNullableTy,
   numLitUnionBaseTy,
   tyAt,
   tyHasInferHole,
@@ -72,12 +74,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
-import {
-  arrLitHasSpread,
-  isScalarBackedListRep,
-  listRepOfFieldCode,
-  rlElemListRep,
-} from "./emit_list_rep"
+import { arrLitHasSpread } from "./emit_list_rep"
 import {
   annRefArrSlot,
   nonNulBaseOf,
@@ -97,6 +94,7 @@ import {
   annIsNulLitUnionArray,
   emptyArrLitIxOf,
   rlElemStructRow,
+  rlSlotOfTyOrTwin,
   tyIsNulLitUnionArr,
 } from "./emit_shape_rows"
 import {
@@ -127,10 +125,18 @@ import {
   ArrNewKind,
   arrNewKindOfListVKind,
   rlSlotOfTy,
+  rlSlotOfUnionMembers,
   tyIsRefListElemTy,
   tyPrimLeafElemName,
 } from "./emit_struct_order"
-import { isNullTy, nonNullTy, tyHasTyVar, tyIsU8ArrayTy } from "./tyquery"
+import {
+  flattenVariantsInto,
+  isNullTy,
+  isNumericPrimTy,
+  nonNullTy,
+  tyHasTyVar,
+  tyIsU8ArrayTy,
+} from "./tyquery"
 export {
   tyPrimLeafListKind,
   tyScalarBackedListKind,
@@ -154,23 +160,8 @@ export function arrNewDestKind(callIx: i32): ArrNewKind {
   "none"
 }
 
-// The `ExpCtx.listKind` an ELEMENT of ref-list row `slot` builds at, or `-1` where the element
-// is not a list at all and the caller's own seed stands. A kind-9 (ref inner list) element
-// pairs it with `rlElemInnerSlot`. An element left on the OUTER list's threading is built at
-// the outer pair's heap types instead of its own (D1629).
-export function refElemListBuildKind(slot: i32): i32 {
-  if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
-  const k = rlElemListRep(rlElemKindTbl[slot])
-  if k == null { return -1 }
-  // An inner ref list builds at code 5 through its own row, which the caller pairs with it.
-  if k == "reflist" { return LBK_REF_AT_SLOT }
-  listBuildKindOfVKind(k, -1)
-}
-
-// The `ExpCtx.listKind` a type-annotation node at `tyIx` names (1 = struct/map ref list,
-// 2 = union box ref list, 3 = string list), or 0 when it isn't a list annotation. Shared
-// by the let/return/call-arg/global seeding so each position threads the same
-// annotation-derived list context into `emitArr`, not a first-element guess.
+// The list build code a type-annotation node at `tyIx` names (1 = struct/map ref list,
+// 2 = union box ref list, 3 = string list), or 0 when it isn't a list annotation.
 export function tyAnnRefListKind(tyIx: i32) {
   if tyIx >= 0 {
     // The annotation's element row, `| null`-tolerant exactly as the intern arm that
@@ -265,7 +256,8 @@ export function listBuildOfTy(ty: i32): ListBuild | null {
   }
   const k = repOfTy(at).rdKind
   if k == "list" { return listBuildAt(LBK_I32_LIST, 0) }
-  const slot = repSlotOfKind(k, at)
+  const rs = repSlotOfKind(k, at)
+  const slot = if rs < 0 && k == "reflist" { numBoxElemSlot(t.aElem) } else { rs }
   if k == "reflist" {
     if slot < 0 { return null }
     return listBuildAt(listBuildKindOfVKind(k, slot), slot)
@@ -273,6 +265,38 @@ export function listBuildOfTy(ty: i32): ListBuild | null {
   const lk = listBuildKindOfVKind(k, slot)
   if lk == LBK_I32_LIST { return null }
   listBuildAt(lk, 0)
+}
+
+// The ref-list row of a box of numbers `et` whose members include literals: the row of its
+// members at their bases, in order and each once (`1 | 9000000000` at `i32|i64`); -1 for none.
+function numBoxElemSlot(et: i32): i32 {
+  if et < 0 || et >= T.tys.length { return -1 }
+  const vs: i32[] = []
+  flattenVariantsInto(et, vs)
+  const out: i32[] = []
+  let lit = false
+  for v in vs {
+    if v < 0 { return -1 }
+    const vt = tyAt(v)
+    let b = v
+    if vt is TyLit {
+      if vt.litKind != "int" { return -1 }
+      b = litBaseTy(vt)
+      lit = true
+    } else if !isNumericPrimTy(v) && !isNullTy(v) {
+      return -1
+    }
+    let seen = false
+    for o in out {
+      if o == b { seen = true }
+    }
+    if !seen { out.push(b) }
+  }
+  if !lit || out.length < 2 { return -1 }
+  if out.length == 2 && isNullTy(out[1]) {
+    return rlSlotOfTyOrTwin(mkNullableTy(out[0]))
+  }
+  rlSlotOfUnionMembers(out)
 }
 
 // Whether element type `et` is a union of two or more records.
@@ -306,10 +330,9 @@ export function emptyArrHoleKind(exprIx: i32): VKind | null {
 // scalar name, and a bare scalar is not a ref-list key: matching one would be a coincidence.
 function tyPrimLeafElem(ty: i32) { tyPrimLeafElemName(ty) != null }
 
-// The `ExpCtx.listKind` build vocabulary a list `VKind` + its ref-list ROW demand — the
-// same 0/1/2/3/4/5/6/7/10 alphabet `tyAnnRefListKind` produces from an ANNOTATION node and
-// `seedFieldListBuild` from a FIELD code. `0` (the i32-list default) for every kind that is
-// not a distinct-backing list, which is also the correct seed for the i32-backed ones.
+// The list build code (`LBK_*`) a list `VKind` + its ref-list ROW demand, the alphabet
+// `tyAnnRefListKind` produces from an ANNOTATION node. `0` (the i32-list default) for every
+// kind that is not a distinct-backing list, which is also right for the i32-backed ones.
 export function listBuildKindOfVKind(kind: VKind | null, slot: i32) {
   // Exhaustive over `VKind` and `_`-less, `null` included: `0` is the i32 list's build code,
   // a real answer, so a new list rep has to name its own rather than inherit it.
@@ -346,7 +369,7 @@ export function listBuildKindOfVKind(kind: VKind | null, slot: i32) {
   }
 }
 
-// The `ExpCtx.listKind` / `ExpCtx.listSlot` pair an empty `[]` hole demands of `emitArr`.
+// The list build code an empty `[]` hole demands of `emitArr`.
 export function emptyArrHoleBuildKind(exprIx: i32) {
   listBuildKindOfVKind(emptyArrHoleKind(exprIx), emptyArrHoleElemSlot(exprIx))
 }
@@ -369,14 +392,7 @@ export function emptyArrUnionArmKind(exprIx: i32): VKind | null {
   tyListRepKind(nodeRepTyIxOf(ax), emptyArrUnionArmSlot(exprIx))
 }
 
-// The `ExpCtx.listKind` that builds the adopted arm's backing.
-export function emptyArrUnionArmBuildKind(exprIx: i32) {
-  listBuildKindOfVKind(
-    emptyArrUnionArmKind(exprIx),
-    emptyArrUnionArmSlot(exprIx),
-  )
-}
-
+// The ref-list row an empty `[]` hole builds at: its element's row, or 0 for a scalar list.
 export function emptyArrHoleBuildSlot(exprIx: i32) {
   const s = emptyArrHoleElemSlot(exprIx)
   if s < 0 { return 0 }
@@ -606,17 +622,13 @@ export function rlSlotIsKindList(slot: i32, want: i32): boolean {
   rlElemKindTbl[slot] == want
 }
 
-// The `ExpCtx.listKind` code and `ExpCtx.listSlot` table slot a `LetDecl`'s list initializer
-// builds with. One record, resolved once: the binding's cell and its literal's build must read
-// one answer or the module is invalid at a different offset. `letRefListSlot` is the cell's half.
+// A list literal's build: the `LBK_*` code and the ref-list row it builds at.
 export type ListBuild = { lbKind: i32, lbSlot: i32 }
 
 // The ref-list element kind a `LetDecl`'s ANNOTATION declares (`S[]` → 1, `N[]` → 2),
 // or `0` when it is not a ref-array annotation. Types an empty `[]` initializer
 // (a non-empty literal types itself from its elements).
 export function letAnnRefListKind(letIx: i32) {
-  // `ExpCtx.listKind` semantics: 1 = struct/map ref list, 2 = union box, 3 = string list.
-  // Delegates to `tyAnnRefListKind` so the let/return/call-arg/global seeds agree.
   const d = nodeAt(letIx)
   if d is LetDecl {
     const k = tyAnnRefListKind(d.letType)
@@ -828,14 +840,6 @@ function tyKindOfDesc(tyIx: i32): i32 {
 // recognize an f64 list the SYNTACTIC predicates miss (e.g. an `f64[]`-returning call, which
 // `calleeRetKind` doesn't map to a list kind) without a bespoke per-position predicate.
 function tyIsF64Array(tyIx: i32) { tyKindOf(tyIx) == TK_F64_LIST }
-
-// The `ExpCtx.listKind` a literal stored into a field of code `code` builds at, when the field
-// is a non-null list over a distinct scalar backing; -1 for every other field code.
-export function fieldCodeScalarListBuildKind(code: i32): i32 {
-  const k = listRepOfFieldCode(code)
-  if !isScalarBackedListRep(k) { return -1 }
-  listBuildKindOfVKind(k, -1)
-}
 
 // The scalar list rep the recorded type `pin` of `exprIx` names, in `tyKindOf`'s vocabulary,
 // read off its descriptor `rd`. The i32 list is read off the unpinned type, and never for a
