@@ -98,13 +98,12 @@ import {
 import { emptyArrHoleElemSlot } from "./emit_obj_lit_fits"
 import { letInfStrListByUse, paramIndexOf } from "./emit_query"
 import { RepDesc, repOfTy, repShadowOn, repStructSlotsTwin } from "./emit_rep"
+import { repSlotOfKind } from "./emit_rep_slot"
 import {
   annIsNulLitUnionArray,
   emptyArrLitIxOf,
   rlElemInnerSlot,
   rlElemStructRow,
-  rlRowTyOfElem,
-  rlSlotOfRowTy,
   tyIsNulLitUnionArr,
 } from "./emit_shape_rows"
 import {
@@ -142,9 +141,10 @@ import {
   tyIsRefListElemTy,
   tyPrimLeafElemName,
 } from "./emit_struct_order"
+import { strListHas } from "./listutil"
 import { memoGenNew } from "./memo"
 import { sidOfNode } from "./symbols"
-import { nonNullTy, tyHasTyVar, tyIsU8ArrayTy } from "./tyquery"
+import { isNullTy, nonNullTy, tyHasTyVar, tyIsU8ArrayTy } from "./tyquery"
 export {
   tyPrimLeafListKind,
   tyScalarBackedListKind,
@@ -252,8 +252,9 @@ function tyListRepKind(ty: i32, rowSlot: i32): VKind | null {
 }
 
 // The build pair a list literal whose closed type is `ty` (a `| null` peeled) demands: its
-// backing code and its ref-list row (0 for none). `null` where `ty` is no closed array type or
-// names no list rep, an element still a type variable or an inference hole being the live case.
+// backing code and ref-list row (0 for none), read off `repOfTy` and `repSlotOfKind`. `null`
+// where `ty` is no closed array type or names no list rep: an element still a type variable or
+// a hole, or a `null[]`, whose row is its destination's.
 export function listBuildOfTy(ty: i32): ListBuild | null {
   const at = nonNullTy(ty)
   if at < 0 || at >= T.tys.length { return null }
@@ -266,6 +267,7 @@ export function listBuildOfTy(ty: i32): ListBuild | null {
   if nlab == "f64" { return listBuildAt(LBK_F64_LIST, 0) }
   if nlab == "i64" { return listBuildAt(LBK_I64_LIST, 0) }
   if nlab != "" { return listBuildAt(LBK_I32_LIST, 0) }
+  if isNullTy(t.aElem) { return null }
   if t.aElem >= 0 {
     const et = tyAt(t.aElem)
     if et is TyNullable && et.nInner >= 0 {
@@ -275,12 +277,55 @@ export function listBuildOfTy(ty: i32): ListBuild | null {
       }
     }
   }
-  const slot0 = rlSlotOfTy(t.aElem)
-  const slot = if slot0 >= 0 { slot0 } else { rlSlotOfRowTy(rlRowTyOfElem(t.aElem)) }
-  const k = tyListRepKind(at, slot)
-  if k == null { return null }
-  if k == "reflist" && slot < 0 { return null }
-  listBuildAt(listBuildKindOfVKind(k, slot), if slot < 0 { 0 } else { slot })
+  const k = repOfTy(at).rdKind
+  if k == "list" { return listBuildAt(LBK_I32_LIST, 0) }
+  const slot = repSlotOfKind(k, at)
+  if k == "reflist" {
+    if slot < 0 { return null }
+    return listBuildAt(listBuildKindOfVKind(k, slot), slot)
+  }
+  const lk = listBuildKindOfVKind(k, slot)
+  if lk == LBK_I32_LIST { return null }
+  listBuildAt(lk, 0)
+}
+
+// Whether element type `et` is a union of two or more records.
+export function tyIsRecordUnion(et: i32): boolean {
+  if et < 0 || et >= T.tys.length { return false }
+  const u = tyAt(et)
+  if !(u is TyUnion) || u.uMembers.length < 2 { return false }
+  for m in u.uMembers {
+    if m < 0 || !(tyAt(m) is TyObj) { return false }
+  }
+  true
+}
+
+// Whether element type `et` is a union of records that do not all have one field-name set, so
+// no single struct row holds every member and a list of it is a list of union boxes.
+export function tyRecordUnionSplit(et: i32): boolean {
+  if et < 0 || et >= T.tys.length { return false }
+  const u = tyAt(et)
+  if !(u is TyUnion) || u.uMembers.length < 2 { return false }
+  let first: string[] = []
+  let split = false
+  let i = 0
+  for m in u.uMembers {
+    if m < 0 { return false }
+    const o = tyAt(m)
+    if !(o is TyObj) { return false }
+    if i == 0 { first = o.objFieldNames }
+    else if !sameNameSet(first, o.objFieldNames) { split = true }
+    i = i + 1
+  }
+  split
+}
+
+function sameNameSet(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  for n in a {
+    if !strListHas(b, n) { return false }
+  }
+  true
 }
 
 function listBuildAt(kind: i32, slot: i32): ListBuild {

@@ -67,6 +67,7 @@ import {
   uFieldElemName,
   uFieldElemTyIx,
   uVarTyIx,
+  uVarTyIxResets,
   uVariants,
   unKeyFirstRow,
   unMemAtomIds,
@@ -112,10 +113,12 @@ import {
   TyVar,
   cUserTypes,
   cUserTypesVer,
+  cVariantMemberTyIxs,
   litBaseTy,
   litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
   litUnionInlineNameOfTy,
+  nomNameOfTy,
   numLitUnionBaseTy,
   oneListUnionRender,
   primNameStr,
@@ -3118,12 +3121,9 @@ function btOfUnion(ms: i32[]): i32 {
 }
 
 // The value kind arena type `ty` crosses a `$fnsig` as: `repOfTy`'s where it covers `ty`, else
-// the rep tree's, and `nulnone` for the `null` type, which holds no tree leaf of its own.
-// null when the rep layer has no rep for `ty`.
+// the rep tree's. null when the rep layer has no rep for `ty`.
 export function repSigKindOfTy(ty: i32): VKind | null {
   if ty < 0 || ty >= T.tys.length { return null }
-  const t = tyAt(ty)
-  if t is TyPrim && t.primName == "null" { return "nulnone" }
   const d = repOfTy(ty)
   if d.rdCovered != 0 { return d.rdKind }
   repTreeVKind(repTreeOfTy(ty))
@@ -3154,7 +3154,7 @@ function repOfTyFlat(ty: i32): RepDesc {
       // A union-VARIANT member is the concrete variant struct ref (its slot is a
       // variant index, not a struct-table index); any other object shape is a
       // standalone struct ref.
-      if tyIxIsVariantMember(ty) { return repMk("variant", 0, "") }
+      if repTyIsVariant(ty) { return repMk("variant", 0, "") }
       const d = repMk("struct", 0, "")
       d.rdSlot = repSlotOfTy(ty)
       return d
@@ -3231,7 +3231,9 @@ function repOfPrim(pn: PrimName): RepDesc {
   if pn == "string" { return repMk("str", 0, "") }
   if pn == "v128" { return repMk("v128", 0, "") }
   if pn == "void" { return repMk("i32", 0, "") }
-  // `null` (and any future prim) — no standalone rep.
+  // The `null` type itself is a nullref, slot-free (D4550).
+  if pn == "null" { return repMk("nulnone", 1, "") }
+  // Any future prim has no standalone rep.
   repUncovered()
 }
 
@@ -3239,7 +3241,8 @@ function repOfPrim(pn: PrimName): RepDesc {
 // disciplines exist (see `rdNul`), one per inner rep family. Exhaustive over
 // `Ty` and `_`-less, so a new arena variant must say which discipline it takes.
 function repOfNullable(inner: i32): RepDesc {
-  if inner < 0 { return repUncovered() }
+  // No inner type is known (`const x = null`), so only `null` reaches it: the `null` type's cell.
+  if inner < 0 { return repMk("nulnone", 1, "") }
   const it = tyAt(inner)
   match it {
     TyPrim => {
@@ -3260,6 +3263,9 @@ function repOfNullable(inner: i32): RepDesc {
     TyUnion => {
       // `K | null` over a litunion — the i32 atom with the -1 null sentinel.
       if tyIsLitUnion(inner) { return repAtomMk(3) }
+      // A one-member union is its member made nullable; a self-referential alias with a `null`
+      // arm (`Json`) interns as `TyUnion[TyNullable(rest)]`, which already holds the `null`.
+      if it.uMembers.length == 1 { return repOfNullable(it.uMembers[0]) }
       // `(A | B) | null` — the box already has a null member atom.
       if tyIsValueUnionBox(inner) { return repMk("union", 4, "") }
       // A numeric literal union made nullable is its base scalar made nullable.
@@ -3283,9 +3289,14 @@ function repOfNullable(inner: i32): RepDesc {
       }
     }
     TyNullable => {
-      // A doubled nullable — canon flattens it before emit.
+      // A doubled nullable is the single one.
+      return repOfNullable(it.nInner)
     }
     TyVar => {
+      // An inference hole nothing filled holds only `null`, so it is the `null` type's cell.
+      if it.tvName.length > 0 && it.tvName[0] == '?' {
+        return repMk("nulnone", 1, "")
+      }
       // A generic parameter made nullable — the instance is what is asked about.
     }
     TyErr => {
@@ -3300,16 +3311,110 @@ function repOfNullable(inner: i32): RepDesc {
 
 // The niche of `S | null` for object type `S`: `nulvariant`, the `(ref null $uVarHeap[vi])`
 // niche, when `S` is a union arm the variant table registered and no declared struct row
-// claims it (`std:fs`'s `IoError` has both); else `nulstruct`. Shared by the flat and tree sides.
+// claims it (`std:fs`'s `IoError` has both); else `nulstruct`. A twin of a variant row's shape
+// is that row (D3870); a shape only the checker's member set holds has no row and stays a struct.
 function repNulObjKind(objTy: i32): VKind {
-  if !tyIxIsVariantMember(objTy) { return "nulstruct" }
-  if repSlotOfTyDecl(objTy) >= 0 { return "nulstruct" }
-  let i = 0
-  while i < uVarTyIx.length {
-    if uVarTyIx[i] == objTy { return "nulvariant" }
-    i = i + 1
+  if tyIxIsVariantMember(objTy) && repSlotOfTyDecl(objTy) < 0 {
+    let i = 0
+    while i < uVarTyIx.length {
+      if uVarTyIx[i] == objTy { return "nulvariant" }
+      i = i + 1
+    }
   }
+  const r = repVariantShapeRowOf(objTy)
+  if r >= 0 { return "nulvariant" }
   "nulstruct"
+}
+
+// Whether record type `ty` is a union arm: the checker registered a member of its shape, or a
+// variant row has its shape. Records are structural (D3870), so an instance, inferred or
+// twin spelling of an arm is that arm. A `new` record, and a declared struct with its own row,
+// match by index alone. Every variant-or-struct reader in the rep layer asks this.
+export function repTyIsVariant(ty: i32): boolean {
+  if tyIxIsVariantMember(ty) { return true }
+  repVariantShapeHas(ty, 3)
+}
+
+// Whether a canonical shape equal to `ty`'s is registered: bit 1 by the checker's member set,
+// bit 2 by the emit variant table; `bits` selects which sources count.
+function repVariantShapeHas(ty: i32, bits: i32): boolean {
+  if !rvsShapeMatches(ty) { return false }
+  rvsSync()
+  const c = repCanonId(ty)
+  const b = rvsBits[c]
+  b != null && (b & bits) != 0 && repSlotOfTyDecl(ty) < 0
+}
+
+// The first variant row whose arm has `ty`'s canonical shape, or -1: the row behind
+// `repTyIsVariant`'s shape answer, so a slot reader finds the row that chose the kind.
+export function repVariantShapeRowOf(ty: i32): i32 {
+  if !rvsShapeMatches(ty) { return -1 }
+  rvsSync()
+  const r = rvsRow[repCanonId(ty)] ?? (-1)
+  if r < 0 || repSlotOfTyDecl(ty) >= 0 { return -1 }
+  r
+}
+
+// Whether record type `ty` may be an arm by shape: a record that is not a `new` brand. A declared
+// struct with a row of its own is excluded by each caller, after a shape hit.
+function rvsShapeMatches(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  tyAt(ty) is TyObj && nomNameOfTy(ty) == ""
+}
+
+// Canonical shape id → source bits of the registered variant members, extended in place as
+// the checker's list and the variant table grow; rebuilt when either is reset or the arena
+// generation moves.
+let rvsBits: {[i32]: i32} = Map()
+
+// Canonical shape id → the first variant row carrying it.
+let rvsRow: {[i32]: i32} = Map()
+
+let rvsChkUpTo = 0
+
+let rvsRowUpTo = 0
+
+const rvsKey = memoKeyNew(4)
+
+function rvsSync() {
+  let moved = memoMoved3(rvsKey, tyMutEpoch, cUserTypesVer, uVarTyIxResets)
+  moved = memoPassMoved(rvsKey, 3) || moved
+  if (
+    moved
+    || cVariantMemberTyIxs.length < rvsChkUpTo
+    || uVarTyIx.length < rvsRowUpTo
+  ) {
+    rvsBits = Map()
+    rvsRow = Map()
+    rvsChkUpTo = 0
+    rvsRowUpTo = 0
+    repTreeDrop()
+  }
+  while rvsChkUpTo < cVariantMemberTyIxs.length {
+    rvsAdd(cVariantMemberTyIxs[rvsChkUpTo], 1)
+    rvsChkUpTo = rvsChkUpTo + 1
+  }
+  while rvsRowUpTo < uVarTyIx.length {
+    const rc = rvsAdd(uVarTyIx[rvsRowUpTo], 2)
+    if rc >= 0 && rvsRow[rc] == null { rvsRow[rc] = rvsRowUpTo }
+    rvsRowUpTo = rvsRowUpTo + 1
+  }
+  0
+}
+
+// Sets `bit` for `ty`'s canonical shape; that shape's id, or -1 for no structural record.
+function rvsAdd(ty: i32, bit: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  if !(tyAt(ty) is TyObj) || nomNameOfTy(ty) != "" { return -1 }
+  const c = repCanonId(ty)
+  let b = 0
+  const hit = rvsBits[c]
+  if hit != null { b = hit }
+  if (b | bit) != b {
+    rvsBits[c] = b | bit
+    repTreeDrop()
+  }
+  c
 }
 
 // `T | null` over a primitive `T`, by name.
@@ -3366,9 +3471,7 @@ function repOfNullableArray(elem: i32): RepDesc {
     // `({…} | null)[] | null` — the plain struct ref list already holds the element
     // nulls, so the cell is the `nulreflist` niche, exactly like `S[][] | null`.
     if eit is TyObj {
-      if !tyIxIsVariantMember(et.nInner) {
-        return repMk("nulreflist", 1, "struct")
-      }
+      if !repTyIsVariant(et.nInner) { return repMk("nulreflist", 1, "struct") }
     }
   }
   // Any other ref list (`S[] | null`, `S[][] | null`, a closure or box list) is its `nulreflist` niche.
@@ -3900,10 +4003,11 @@ function repTreeDrop() {
 }
 
 // Lifetime: generation-stamped on the checker axes of the flat layer's memos
-// (`tyMutEpoch`, `cUserTypesVer`); any bump drops the whole tree, conservative like
+// (`tyMutEpoch`, `cUserTypesVer`) and the variant shapes (`rvsSync` drops it); any bump drops the whole tree, conservative like
 // the key memo. `sNames.length` is deliberately not an axis, since the authority
 // projections never consult `rtSlot` and slot interning happens constantly during emit. Building is lazy; a returned node index is valid only until the next mutation.
 function rtSync() {
+  rvsSync()
   if (rtEpoch == tyMutEpoch && rtUserVer == cUserTypesVer) { return 0 }
   rtKind = []
   rtDisc = []
@@ -4139,7 +4243,7 @@ function rtOfObj(ty: i32, fieldTys: i32[]): i32 {
   // variant index, not the struct table — the discriminator keeps the two
   // apart through hash-consing.
   let disc = 0
-  if tyIxIsVariantMember(ty) { disc = 1 }
+  if repTyIsVariant(ty) { disc = 1 }
   rtOfObjAs(ty, ty, disc, fieldTys)
 }
 
