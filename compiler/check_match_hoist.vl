@@ -38,6 +38,7 @@ import {
   StrLit,
   Unary,
   WhileStmt,
+  addNode,
   adoptNodeTok,
   arenaSetNode,
   elseIfLink,
@@ -46,9 +47,12 @@ import {
   mkBool,
   mkIdent,
   mkIf,
+  mkIndex,
   mkLet,
+  mkMember,
   mkNull,
   mkOptMember,
+  mkParen,
   nodeAt,
   nodeSpineChildren,
   nodeValueChildren,
@@ -60,6 +64,8 @@ import { placeKeyOf } from "./check_places"
 // The matches found by the walk, innermost first, each beside a copy of its ancestor path.
 let hmsMatches: i32[] = []
 let hmsPaths: i32[][] = []
+// The matches whose scrutinee is a place, read again at every arm rather than bound.
+let hmsPlaceMatches: i32[] = []
 // Every name the program can rebind — a `let`, a parameter, a loop variable — by spelling.
 let hmsRebindable: {[string]: boolean} = Map()
 
@@ -90,10 +96,13 @@ function matchLeafIsLitOrLambda(ix: i32): boolean {
     || n is FuncDecl
 }
 
-// Binds every computed scrutinee under `rootIx` (see the section head). Returns the count.
+// Binds every computed scrutinee under `rootIx` (see the section head), then gives each arm
+// test and payload read of every bound or place scrutinee its own read node (D14538). Returns
+// the count bound.
 export function hoistMatchScrutinees(rootIx: i32) {
   hmsMatches = []
   hmsPaths = []
+  hmsPlaceMatches = []
   hmsRebindable = Map()
   const anc: i32[] = []
   hmsWalk(rootIx, anc)
@@ -104,10 +113,23 @@ export function hoistMatchScrutinees(rootIx: i32) {
     else if hmsBindOptInPlace(hmsMatches[k], hmsPaths[k]) { done = done + 1 }
     k = k + 1
   }
+  for m in hmsPlaceMatches { hmsSplitPlaceReads(m) }
   hmsMatches = []
   hmsPaths = []
+  hmsPlaceMatches = []
   hmsRebindable = Map()
   done
+}
+
+// Points match `m`'s arm tests and payload reads at copies of its place scrutinee.
+function hmsSplitPlaceReads(m: i32) {
+  const n = nodeAt(m)
+  if n is MatchExpr {
+    if placeKeyOf(n.matchScrut) != "" {
+      hmsPointArms(n, n.matchScrut, n.matchScrut)
+    }
+  }
+  0
 }
 
 // Post-order over the value children, so an inner match is recorded before the one holding it.
@@ -179,8 +201,13 @@ function hmsInertLeaf(n: Node): boolean {
 }
 
 // Records match `ix` with a copy of its ancestor path when its scrutinee is computed, and a
-// `?.` read whose receiver is computed and no link of a longer chain.
+// `?.` read whose receiver is computed and no link of a longer chain; a match whose scrutinee
+// is in place is recorded apart, for its arm reads to be split.
 function hmsRecordMatch(ix: i32, anc: i32[]) {
+  const n = nodeAt(ix)
+  if n is MatchExpr {
+    if matchScrutInPlace(n.matchScrut) { hmsPlaceMatches.push(ix) }
+  }
   if hmsHoistable(ix) {
     const path: i32[] = []
     let j = 0
@@ -581,7 +608,8 @@ function hmsBind(m: i32) {
 }
 
 // Mints `const $scrut<m> = <scrutinee>` and points match `m` — its scrutinee, its type
-// patterns and its payload reads — at the binding instead. Returns the declaration, or -1.
+// patterns and its payload reads, each through a read of its own — at the binding instead.
+// Returns the declaration, or -1.
 function hmsBindMatch(m: i32) {
   const n = nodeAt(m)
   if n is MatchExpr {
@@ -592,29 +620,7 @@ function hmsBindMatch(m: i32) {
     adoptNodeTok(decl, scrut)
     const ref = mkIdent(name, sp)
     adoptNodeTok(ref, scrut)
-    let pi = 0
-    while pi < n.matchPats.length {
-      const pat = n.matchPats[pi]
-      const pn = nodeAt(pat)
-      if pn is IsExpr {
-        if pn.isObj == scrut {
-          const np: Node = {
-            isObj: ref,
-            isVariant: pn.isVariant,
-            pos: pn.pos,
-            isNeg: pn.isNeg,
-          }
-          arenaSetNode(pat, np)
-        }
-      }
-      pi = pi + 1
-    }
-    let bi = 0
-    while bi < n.matchBinds.length {
-      const bx = n.matchBinds[bi]
-      if bx >= 0 { hmsRedirectBinds(bx, scrut, ref) }
-      bi = bi + 1
-    }
+    hmsPointArms(n, scrut, ref)
     const nm: Node = {
       matchScrut: ref,
       matchPats: n.matchPats,
@@ -630,29 +636,95 @@ function hmsBindMatch(m: i32) {
   -1
 }
 
-// Points each payload `const x = <scrut>.p.x` of clause block `bx` at `to` instead of `from`.
-function hmsRedirectBinds(bx: i32, from: i32, to: i32) {
+// Points every type pattern of match `n` testing node `from`, and every payload read rooted at
+// it, at a read of the place `src`: the first pattern at `src` itself, which keeps the
+// scrutinee in the lowered chain (D14539), and every later one at a fresh copy, so no two reads
+// share a node and a per-node fact (a read's type, its narrowing) is the read's own.
+function hmsPointArms(n: MatchExpr, from: i32, src: i32) {
+  let first = true
+  for pat in n.matchPats {
+    const pn = nodeAt(pat)
+    if pn is IsExpr {
+      if pn.isObj == from {
+        let read = src
+        if !first { read = hmsCopyRead(src) }
+        first = false
+        const np: Node = {
+          isObj: read,
+          isVariant: pn.isVariant,
+          pos: pn.pos,
+          isNeg: pn.isNeg,
+        }
+        arenaSetNode(pat, np)
+      }
+    }
+  }
+  for bx in n.matchBinds {
+    if bx >= 0 { hmsRedirectBinds(bx, from, src) }
+  }
+  0
+}
+
+// Points each payload `const x = <scrut>.p.x` of clause block `bx` at a copy of `src` instead
+// of `from`.
+function hmsRedirectBinds(bx: i32, from: i32, src: i32) {
   const lets = nodeValueChildren(bx)
   let i = 0
   while i < lets.length {
     const d = nodeAt(lets[i])
-    if d is LetDecl { hmsRedirectRoot(d.letInit, from, to) }
+    if d is LetDecl { hmsRedirectRoot(d.letInit, from, src) }
     i = i + 1
   }
   0
 }
 
-// Re-roots the member chain at `ix` from node `from` onto node `to`.
-function hmsRedirectRoot(ix: i32, from: i32, to: i32) {
+// Re-roots the member chain at `ix` from node `from` onto a copy of `src`.
+function hmsRedirectRoot(ix: i32, from: i32, src: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = nodeAt(ix)
   if n is Member {
     if n.memObj == from {
-      const nm: Node = { memObj: to, memProp: n.memProp, pos: n.pos }
+      const nm: Node = {
+        memObj: hmsCopyRead(src),
+        memProp: n.memProp,
+        pos: n.pos,
+      }
       arenaSetNode(ix, nm)
       return 0
     }
-    return hmsRedirectRoot(n.memObj, from, to)
+    return hmsRedirectRoot(n.memObj, from, src)
   }
   0
+}
+
+// A new node reading the place `ix` reads: a name, a field, a `?.` link or a literal subscript
+// copied link by link, each keeping its source's position and token. Any other node is
+// returned as it is, as a scrutinee read again at every arm only when it is such a place.
+function hmsCopyRead(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return ix }
+  const n = nodeAt(ix)
+  let c = ix
+  if n is Ident {
+    c = mkIdent(n.identName, n.pos)
+  } else if n is Paren {
+    c = mkParen(hmsCopyRead(n.parInner), n.pos)
+  } else if n is Member {
+    c = mkMember(hmsCopyRead(n.memObj), n.memProp, n.pos)
+  } else if n is OptMember {
+    c = mkOptMember(hmsCopyRead(n.omObj), n.omProp, n.omDot, n.pos)
+  } else if n is Index {
+    c = mkIndex(hmsCopyRead(n.idxArr), hmsCopyLeaf(n.idxIndex), n.pos)
+  }
+  if c != ix { adoptNodeTok(c, ix) }
+  c
+}
+
+// A copy of the literal subscript `ix`, or `ix` itself when it is not a number or string.
+function hmsCopyLeaf(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return ix }
+  const n = nodeAt(ix)
+  if !(n is NumLit || n is StrLit) { return ix }
+  const c = addNode(n)
+  adoptNodeTok(c, ix)
+  c
 }
