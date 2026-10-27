@@ -310,7 +310,7 @@ import {
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
-import { numLexFitsI32, numLexIs2Pow31, numLexIsFloat } from "./emit_bignum"
+import { numLexIs2Pow31, numLexIsFloat } from "./emit_bignum"
 import {
   capBind,
   capMemoEdits,
@@ -330,6 +330,7 @@ import {
   nfdWalkLeave,
   nodeRepTyAt,
   nodeTyAt,
+  numLitWidth,
   parentBindingFrameArenaOf,
   parentBindingFrameAt,
   parentBindingFrameOf,
@@ -6589,11 +6590,8 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
   if tyKindOf(nodeTyAt(exprIx, fnIx)) == TK_I64 {
     return true // typed-IR fast path (see exprIsF64)
   }
-  // A literal is none of the `??`, `min`/`max` shapes asked next; its lexeme decides.
-  const lit = nodeAt(exprIx)
-  if lit is NumLit {
-    return !numLexIsFloat(lit.numText) && !numLexFitsI32(lit.numText)
-  }
+  // A literal is none of the `??`, `min`/`max` shapes asked next; its width decides.
+  if nodeAt(exprIx) is NumLit { return numLitWidth(exprIx, fnIx) == "i64" }
   // Over a `null`-typed LHS a `??` is its default, at the default's rep (D4550).
   const cnnK = coalesceNulNoneDefaultIx(exprIx, fnIx)
   if cnnK >= 0 { return exprIsI64(cnnK, fnIx) }
@@ -6633,13 +6631,6 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
       if mri >= 0 {
         if mvValKind[mri] == MVK_I64 { return true }
       }
-    }
-    // A bare integer literal past the i32 range is typed i64 by the checker (the host's
-    // `defaultIntegerType` magnitude rule) and lowers as `i64.const`, so it classifies as
-    // i64 here too (a float `.` literal is f64, never i64).
-    NumLit => {
-      if numLexIsFloat(e.numText) { return false }
-      return !numLexFitsI32(e.numText)
     }
     Ident => {
       // A value-union ident classifies by its narrowed atom (the read unboxes to that rep);
@@ -6758,7 +6749,7 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
       return ifExprArmIsKind(exprIx, fnIx, "i64")
     }
     // No other expression yields an i64.
-    StrLit | CharLit | BoolLit | NullLit | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+    NumLit | StrLit | CharLit | BoolLit | NullLit | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -7068,9 +7059,8 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   // Typed-IR fast path (additive — only turns false into true, so the syntactic derivation
   // below still applies to a node with no recorded type, e.g. a monomorphized instance body).
   if tyKindOf(nodeTyAt(exprIx, fnIx)) == TK_F64 { return true }
-  // A literal is none of the `??`, `min`/`max` shapes asked next; its lexeme decides.
-  const lit = nodeAt(exprIx)
-  if lit is NumLit { return numLexIsFloat(lit.numText) }
+  // A literal is none of the `??`, `min`/`max` shapes asked next; its width decides.
+  if nodeAt(exprIx) is NumLit { return numLitWidth(exprIx, fnIx) == "f64" }
   // Over a `null`-typed LHS a `??` is its default, at the default's rep (D4550).
   const cnnK = coalesceNulNoneDefaultIx(exprIx, fnIx)
   if cnnK >= 0 { return exprIsF64(cnnK, fnIx) }
@@ -7089,9 +7079,6 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   match e {
     AsExpr => {
       return e.asTy == "f64"
-    }
-    NumLit => {
-      return numLexIsFloat(e.numText)
     }
     Paren => {
       return exprIsF64(e.parInner, fnIx)
@@ -7213,7 +7200,7 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
       return ifExprArmIsKind(exprIx, fnIx, "f64")
     }
     // No other expression yields an f64.
-    StrLit | CharLit | BoolLit | NullLit | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+    NumLit | StrLit | CharLit | BoolLit | NullLit | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -10643,7 +10630,7 @@ function globalKind(initIx: i32): VKind {
   // An un-annotated float `.` literal init (`const a = 1.5`) is an f64 cell (kind 11),
   // lowered as `f64.const`. Bare integer globals stay kind 0.
   if e is NumLit {
-    if numLexIsFloat(e.numText) { return "f64" }
+    if numLitWidth(initIx, -1) == "f64" { return "f64" }
   }
   if e is ObjLit {
     // A literal matching a standalone struct is that struct ref (kind 1) — even in a
@@ -11138,11 +11125,9 @@ export function arrLitNumKind(arrIx: i32, fnIx: i32): i32 {
       const el = a.arrElems[i]
       const n = if el >= 0 { nodeAt(el) } else { null }
       if n is NumLit {
-        // `exprIsI64` and `exprIsF64` over a literal, sharing one read of its lexeme.
-        const k = tyKindOf(nodeTyIxOf(el))
-        const fl = numLexIsFloat(n.numText)
-        if fl || k == TK_F64 { anyF64 = true }
-        if k == TK_I64 || (!fl && !numLexFitsI32(n.numText)) { anyI64 = true }
+        const w = numLitWidth(el, fnIx)
+        if w == "f64" || w == "f32" { anyF64 = true }
+        if w == "i64" { anyI64 = true }
       } else {
         if !anyI64 && exprIsI64(el, fnIx) { anyI64 = true }
         if !anyF64 && exprIsF64(el, fnIx) { anyF64 = true }
@@ -11655,26 +11640,12 @@ function arrLitRefListRow(a: ArrayLit): i32 {
 function anonFieldCodeSyn(valIx: i32) {
   const e = nodeAt(valIx)
   match e {
+    // A literal field is a slot of the width the literal is built at.
     NumLit => {
-      // A float `.` literal field is an f64 slot (code 17) — unless the context adopted an
-      // f32 slot (`objRetWidenAdopt`'s f32-field arm): code 24, re-encoding exactly at the
-      // field store.
-      if numLexIsFloat(e.numText) {
-        if tyKindOf(nodeTyIxOf(valIx)) == TK_F32 { return FC_F32 }
-        return FC_F64
-      }
-      // An i64-magnitude literal field is an i64 slot (code 23) — an i32-coded shape would
-      // `struct.new` the i64 operand into an i32 field, invalid wasm (a lambda-returning
-      // `{f: i64}` hole; an annotated return shape already codes 23 via `fieldTypeCode`).
-      if !numLexFitsI32(e.numText) { return FC_I64 }
-      // A small int literal whose context adopted a wider slot (`objRetWidenAdopt`, a lambda
-      // returning `{f: 5}` against `() => {f: i64}`): code the wide slot, since the literal
-      // re-encodes at the field store. Without the f32 rung, `anonValueFitsField` reads an
-      // integer literal in an f32 field as a plain i32 against the f32 slot.
-      const tk = tyKindOf(nodeTyIxOf(valIx))
-      if tk == TK_I64 { return FC_I64 }
-      if tk == TK_F64 { return FC_F64 }
-      if tk == TK_F32 { return FC_F32 }
+      const w = numLitWidth(valIx, -1)
+      if w == "i64" { return FC_I64 }
+      if w == "f64" { return FC_F64 }
+      if w == "f32" { return FC_F32 }
       return FC_I32
     }
     BoolLit => {
@@ -11727,8 +11698,9 @@ function anonFieldCodeSyn(valIx: i32) {
           while i < e.arrElems.length {
             const ae = nodeAt(e.arrElems[i])
             if ae is NumLit {
-              if numLexIsFloat(ae.numText) { anyFloat = true }
-              else if !numLexFitsI32(ae.numText) { anyI64 = true }
+              const w = numLitWidth(e.arrElems[i], -1)
+              if w == "f64" || w == "f32" { anyFloat = true }
+              else if w == "i64" { anyI64 = true }
             } else {
               anyRuntime = true
             }
@@ -19136,7 +19108,7 @@ export function letIsF64(letIx: i32, fnIx: i32) {
     }
     if d.letInit >= 0 {
       const ie = nodeAt(d.letInit)
-      if ie is NumLit { return numLexIsFloat(ie.numText) }
+      if ie is NumLit { return numLitWidth(d.letInit, fnIx) == "f64" }
       // An f32 init is not an f64 binding — this predicate is the binding-level answer every
       // read site reaches, and without it an inferred-f32 global answered "f64" wrongly.
       if exprIsF32(d.letInit, fnIx) { return false }
