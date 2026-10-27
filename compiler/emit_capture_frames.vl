@@ -6,6 +6,7 @@ import {
   ForIn,
   ForRange,
   FuncDecl,
+  Ident,
   IfStmt,
   LetDecl,
   NumLit,
@@ -14,6 +15,7 @@ import {
   Program,
   WhileStmt,
   elseIfLink,
+  loopVarLoop,
   nodeAt,
   nodeSpineChildren,
 } from "./ast"
@@ -49,7 +51,7 @@ import {
 export { fnStmtsPosOf } from "./emit_state"
 import { memoKeyNew } from "./memo"
 import { tyHasTyVar } from "./tyquery"
-import { nodeSrc, sidArrGet, sidOf } from "./symbols"
+import { identDeclOf, nodeSrc, sidArrGet, sidOf, sidOfNode } from "./symbols"
 
 // The `fnStmts` position of a lifted function named `name` whose parent frame is the `fnStmts`
 // position `pp`, or -1 when that frame declares no such function. Visits `pp`'s children in
@@ -185,63 +187,60 @@ export function moduleLoopEnclosing(fe: i32, name: string): i32 {
   ) {
     at = fnStmts[fnInstOrigin[fe]]
   }
-  frameLoopAt(emitRootIx, name, at)
+  frameLoopAt(emitRootIx, sidOf(name), at)
 }
 
-// The innermost loop of frame body `body` (a function's, or the `Program`) binding `name` whose
-// body holds node `at`, or -1. Off the cached plan's post-order ranges; a node appended past the
-// body after parsing (a rewrite's) is outside every range, so it is found by walking (D3139).
-export function frameLoopAt(body: i32, name: string, at: i32): i32 {
+// The innermost loop of frame body `body` (a function's, or the `Program`) binding a variable of
+// name `sid` whose body holds node `at`, or -1. Off the cached plan's post-order ranges; a node
+// appended past the body after parsing (a rewrite's) is outside every range, so it is walked.
+export function frameLoopAt(body: i32, sid: i32, at: i32): i32 {
   if body < 0 { return -1 }
-  const lp = parentLoopAt(body, sidOf(name), at)
+  const lp = parentLoopAt(body, sid, at)
   if lp >= 0 || at < body { return lp }
   const b = nodeAt(body)
   if b is Program {
     const stmts = b.progStmts
     let i = 0
     while i < stmts.length {
-      const hit = modLoopHolding(stmts[i], name, at)
+      const hit = modLoopHolding(stmts[i], sid, at)
       if hit >= 0 { return hit }
       i = i + 1
     }
     return -1
   }
-  modLoopHolding(body, name, at)
+  modLoopHolding(body, sid, at)
 }
 
-// `moduleLoopEnclosing`'s walk over one module-scope statement: the innermost loop binding
-// `name` whose body contains node `at`, or -1. Stops at a `FuncDecl`, which is its own frame.
-export function modLoopHolding(ix: i32, name: string, at: i32): i32 {
+// `frameLoopAt`'s walk over one statement: the innermost loop declaring a variable of name `sid`
+// whose body contains node `at`, or -1. Stops at a `FuncDecl`, which is its own frame.
+export function modLoopHolding(ix: i32, sid: i32, at: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const st = nodeAt(ix)
   if st is ForIn {
-    const inner = modLoopHolding(st.fiBody, name, at)
+    const inner = modLoopHolding(st.fiBody, sid, at)
     if inner >= 0 { return inner }
-    if (
-      (st.fiVar == name || st.fiVar2 == name)
-      && nodeSubtreeHas(st.fiBody, at)
-    ) {
-      return ix
-    }
+    const binds = sidOfNode(st.fiDecl1) == sid
+      || (st.fiDecl2 >= 0 && sidOfNode(st.fiDecl2) == sid)
+    if binds && nodeSubtreeHas(st.fiBody, at) { return ix }
     return -1
   }
   if st is ForRange {
-    const inner = modLoopHolding(st.frBody, name, at)
+    const inner = modLoopHolding(st.frBody, sid, at)
     if inner >= 0 { return inner }
-    if st.frVar == name && nodeSubtreeHas(st.frBody, at) { return ix }
+    if sidOfNode(ix) == sid && nodeSubtreeHas(st.frBody, at) { return ix }
     return -1
   }
-  if st is WhileStmt { return modLoopHolding(st.whileBody, name, at) }
+  if st is WhileStmt { return modLoopHolding(st.whileBody, sid, at) }
   if st is IfStmt {
-    const th = modLoopHolding(st.ifThen, name, at)
+    const th = modLoopHolding(st.ifThen, sid, at)
     if th >= 0 { return th }
-    return modLoopHolding(st.ifElse, name, at)
+    return modLoopHolding(st.ifElse, sid, at)
   }
   if st is Block {
     const kids = st.blkStmts
     let i = 0
     while i < kids.length {
-      const hit = modLoopHolding(kids[i], name, at)
+      const hit = modLoopHolding(kids[i], sid, at)
       if hit >= 0 { return hit }
       i = i + 1
     }
@@ -254,6 +253,40 @@ export function modLoopHolding(ix: i32, name: string, at: i32): i32 {
 // frame. A `FuncDecl` is its own frame, whose loops bind its own locals, and every other kind
 // holds no statement that could be a module-scope `for`.
 function modLoopNoneHere(): i32 { -1 }
+
+// The `for … in` loop of frame body `body` holding the read `ix` whose first variable `ix` names,
+// or -1. A copy of a loop shares its declarations, so a function instance finds its own copy.
+// Walks the body, so a read an instance shares with its template is found too.
+export function frameElemLoopOfRead(body: i32, ix: i32): i32 {
+  const d = readLoopVarDecl(ix)
+  if d < 0 { return -1 }
+  loopOfFirstVar(modLoopHolding(body, sidOfNode(d), ix), d)
+}
+
+// `frameElemLoopOfRead` off the frame's cached loop plan, for a read the frame body itself holds.
+export function frameElemLoopAtRead(body: i32, ix: i32): i32 {
+  const d = readLoopVarDecl(ix)
+  if d < 0 { return -1 }
+  loopOfFirstVar(frameLoopAt(body, sidOfNode(d), ix), d)
+}
+
+// The loop-variable declaration the read `ix` names, or -1.
+function readLoopVarDecl(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
+  const d = identDeclOf(ix)
+  if loopVarLoop(d) < 0 { return -1 }
+  d
+}
+
+// `lp` when it is a `for … in` loop whose first variable is declaration `d`, or -1.
+function loopOfFirstVar(lp: i32, d: i32): i32 {
+  if lp < 0 { return -1 }
+  const l = nodeAt(lp)
+  if l is ForIn {
+    if l.fiDecl1 == d { return lp }
+  }
+  -1
+}
 
 // True when node `at` is `ix` or one of its descendants.
 export function nodeSubtreeHas(ix: i32, at: i32): boolean {
@@ -429,7 +462,7 @@ export function captureLoopNodeOf(fe: i32, name: string): i32 {
 export function frameLoopEnclosing(fe: i32, body: i32, name: string): i32 {
   const at = captureDeclAt(fe)
   if at >= 0 {
-    const hit = frameLoopAt(body, name, at)
+    const hit = frameLoopAt(body, sidOf(name), at)
     if hit >= 0 { return hit }
   }
   parentLoopVarOf(body, name)
@@ -442,11 +475,11 @@ export function frameLetAt(body: i32, name: string, at: i32): i32 {
   if at < 0 { return parentLetOf(body, name) }
   const sid = sidOf(name)
   const li = parentLetOfAt(body, sid, at)
-  const lp = frameLoopAt(body, name, at)
+  const lp = frameLoopAt(body, sid, at)
   if lp < 0 { return li }
   if li < 0 { return -1 }
   // A `let` inside the loop shadows its variable; one outside it is shadowed.
-  if frameLoopAt(body, name, li) == lp { return li }
+  if frameLoopAt(body, sid, li) == lp { return li }
   -1
 }
 

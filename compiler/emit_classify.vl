@@ -326,6 +326,7 @@ import {
   capturedBindingFrameOf,
   copyReadIsUnnarrowed,
   fnStmtsPosOf,
+  frameElemLoopOfRead,
   frameLoopEnclosing,
   moduleLoopEnclosing,
   nestedFnDeclaredIn,
@@ -972,7 +973,6 @@ import {
   litElseSurvName,
   litEqRecv,
   litEqVariant,
-  loopVarForIn,
   mapArmShapeOfTy,
   mapCbDeclRetPinTy,
   mapKeyElemVKind,
@@ -3088,7 +3088,7 @@ function letInitLoopElemKind(letIx: i32, fnIx: i32): VKind | null {
     const ix = unwrapParen(d.letInit)
     if ix < 0 { return null }
     const e = nodeAt(ix)
-    if e is Ident { return readLoopElemKind(ix, e.identName, fnIx) }
+    if e is Ident { return readLoopElemKind(ix, fnIx) }
   }
   null
 }
@@ -3404,20 +3404,20 @@ function letInitIsBox(init: i32, fnIx: i32): boolean {
   const ix = unwrapParen(init)
   if ix < 0 { return false }
   const e = nodeAt(ix)
-  if e is Ident { return readIsLoopBox(ix, e.identName, fnIx) }
+  if e is Ident { return readIsLoopBox(ix, fnIx) }
   false
 }
 
-// Whether the read `ix` of `name` in frame `fnIx` (-1 the module) is a `for-in` variable over
+// Whether the read `ix` in frame `fnIx` (-1 the module) is a `for-in` variable over
 // value-union-box elements.
-function readIsLoopBox(ix: i32, name: string, fnIx: i32): boolean {
-  readLoopElemKind(ix, name, fnIx) == "union"
+function readIsLoopBox(ix: i32, fnIx: i32): boolean {
+  readLoopElemKind(ix, fnIx) == "union"
 }
 
-// The element kind of the `for-in` loop whose variable the read `ix` of `name` in frame `fnIx`
+// The element kind of the `for-in` loop whose variable the read `ix` in frame `fnIx`
 // (-1 the module) is, or null.
-function readLoopElemKind(ix: i32, name: string, fnIx: i32): VKind | null {
-  const lp = readLoopNodeOf(ix, name, fnIx)
+function readLoopElemKind(ix: i32, fnIx: i32): VKind | null {
+  const lp = readLoopNodeOf(ix, fnIx)
   if lp < 0 { return null }
   const ln = nodeAt(lp)
   if ln is ForIn { return forInElemKind(frameBlindIter(ln.fiIter, fnIx), fnIx) }
@@ -10264,7 +10264,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
         }
       }
       // …and one asked outside its frame's emission, found by its loop (D3169).
-      if readLoopVarIsLitAtom(unwrapParen(exprIx), e.identName, fnIx) {
+      if readLoopVarIsLitAtom(unwrapParen(exprIx), fnIx) {
         return nodeRepIsNulAtom(exprIx, fnIx)
       }
       return false
@@ -11689,10 +11689,10 @@ export function forInVarIsLitAtom(
   false
 }
 
-// Whether the read `ix` of `name` in frame `fnIx` is a `for-in` element variable holding an
+// Whether the read `ix` in frame `fnIx` is a `for-in` element variable holding an
 // atom, found by the loop enclosing the read (D3169).
-function readLoopVarIsLitAtom(ix: i32, name: string, fnIx: i32): boolean {
-  const lp = readLoopNodeOf(ix, name, fnIx)
+function readLoopVarIsLitAtom(ix: i32, fnIx: i32): boolean {
+  const lp = readLoopNodeOf(ix, fnIx)
   if lp < 0 { return false }
   const ln = nodeAt(lp)
   if ln is ForIn {
@@ -12382,9 +12382,7 @@ function exprIsLitAtomIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   const fli = frameLetOf(fnIx, e.identName, unwrapParen(exprIx))
   if fli >= 0 { return bindingIsLitAtom(fli, fnIx) }
   // A walk variable asked outside its frame's emission, which has no slot to read yet.
-  if readLoopVarIsLitAtom(unwrapParen(exprIx), e.identName, fnIx) {
-    return true
-  }
+  if readLoopVarIsLitAtom(unwrapParen(exprIx), fnIx) { return true }
   false
 }
 
@@ -12890,7 +12888,7 @@ export function loopVarElemPinTyOf(exprIx: i32, fnIx: i32): i32 {
   if fn is FuncDecl {
     if paramIndexOf(fnIx, identNameOrEmpty(ix)) >= 0 { return -1 }
     if parentLetOf(fn.fnBody, identNameOrEmpty(ix)) >= 0 { return -1 }
-    const lp = loopVarForIn(ix, fn.fnBody)
+    const lp = frameElemLoopOfRead(fn.fnBody, ix)
     if lp < 0 { return -1 }
     const fl = nodeAt(lp)
     if fl is ForIn { return iterElemPinTy(fl.fiIter, fnIx) }
@@ -12901,7 +12899,7 @@ export function loopVarElemPinTyOf(exprIx: i32, fnIx: i32): i32 {
 // Whether Ident `ix` is a for-in loop variable of body `bodyIx` whose list holds `i32` cells, not
 // the string refs a literal of strings builds (D2983).
 function loopVarReadIsAtom(ix: i32, bodyIx: i32, fnIx: i32): boolean {
-  const lp = loopVarForIn(ix, bodyIx)
+  const lp = frameElemLoopOfRead(bodyIx, ix)
   if lp < 0 { return false }
   const fl = nodeAt(lp)
   if fl is ForIn {
@@ -14934,7 +14932,7 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
       // its own, so its member set comes from the iterable's union-box element type instead.
       const flv = forInLoopVarUnionName(name, fnIx)
       if flv != "" { return flv }
-      const rlf = readLoopUnionName(atIx, name, fnIx)
+      const rlf = readLoopUnionName(atIx, fnIx)
       if rlf != "" { return rlf }
     }
   }
@@ -14943,7 +14941,7 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
   if fnIx < 0 {
     const slv = forInLoopVarUnionName(name, -1)
     if slv != "" { return slv }
-    const rlm = readLoopUnionName(atIx, name, -1)
+    const rlm = readLoopUnionName(atIx, -1)
     if rlm != "" { return rlm }
   }
   // A captured union box resolves its member set from the parent frame's binding — a
@@ -14988,12 +14986,12 @@ function forInPairUnionElemName(iterIx: i32, fnIx: i32) {
   rlElemName[slot]
 }
 
-// The member set of the walk variable read at `atIx` as `name` in frame `fnIx`, found by the
+// The member set of the walk variable read at `atIx` in frame `fnIx`, found by the
 // loop enclosing the read: the answer a classifier typing a capture needs while no slot of the
 // walking frame is live, which `forInLoopVarUnionName` reads (D2523).
-function readLoopUnionName(atIx: i32, name: string, fnIx: i32): string {
+function readLoopUnionName(atIx: i32, fnIx: i32): string {
   if atIx < 0 { return "" }
-  const lp = readLoopNodeOf(atIx, name, fnIx)
+  const lp = readLoopNodeOf(atIx, fnIx)
   if lp < 0 { return "" }
   const ln = nodeAt(lp)
   if ln is ForIn {
