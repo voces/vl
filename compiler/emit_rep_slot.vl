@@ -2,13 +2,19 @@
 // token that a parameter or a result of that type keys. The kind is `repOfTy`'s answer and
 // the slot is `repSlotOfKind`'s, so a signature token has no producer of its own.
 
+import { canonUnionMemberTysOf } from "./check_program"
 import { mapKeyKindOfTy } from "./check_ty_rep"
 import { setShapeOfTy } from "./emit_base"
 import {
   T,
+  TyLit,
   TyMap,
+  TyNullable,
   TyObj,
   TyPrim,
+  TyUnion,
+  mkNullableTy,
+  softenLitTy,
   structNameOfTy,
   tyAt,
   tyEqSoftLits,
@@ -39,8 +45,9 @@ import {
   rlSlotOfTyOrTwin,
   tyRegGenNow,
 } from "./emit_shape_rows"
+import { rlSlotOfUnionMembers } from "./emit_struct_order"
 import { VKind, sNames, sTyIx } from "./emit_state"
-import { tyPeelNul } from "./tyquery"
+import { intLitUnionBasesOf, tyPeelNul } from "./tyquery"
 
 // The table slot a value of type `ty` with rep kind `kind` is stored under: a struct row, a
 // folded variant row, a ref-list row (else its element's row type's) or a map shape. A
@@ -59,9 +66,61 @@ export function repSlotOfKind(kind: VKind | null, ty: i32): i32 {
     const e = tyRefArrElemOf(inner)
     const s = rlSlotOfTyOrTwin(e)
     if s >= 0 { return s }
-    return rlSlotOfRowTy(rlRowTyOfElem(e))
+    const r = rlSlotOfRowTy(rlRowTyOfElem(e))
+    if r >= 0 { return r }
+    return rlSlotOfCanonElem(e)
   }
   repMapSlotOfTy(inner)
+}
+
+// The ref-list slot of element `e` keyed at its canonical spelling: integer literals of two
+// widths at their bases' union, a literal or one-base literal union at its base, a union at its
+// canonical members (one of them alone, a lone one beside `null` its nullable).
+// -1 when no row holds that spelling.
+function rlSlotOfCanonElem(e: i32): i32 {
+  const bases = intLitUnionBasesOf(e)
+  if bases.length > 0 { return rlSlotOfUnionMembers(bases) }
+  const c = rlCanonElemTy(e)
+  if c >= 0 && c != e { return rlSlotOfTyOrTwin(c) }
+  if c != -2 { return -1 }
+  const tys: i32[] = []
+  if !canonUnionMemberTysOf(e, tys) { return -1 }
+  rlSlotOfUnionMembers(tys)
+}
+
+// Element `e` at its canonical type, `e` itself when canon spells it so, or -2 for a union of
+// two or more non-null canonical members, which has no single type to stand for it.
+function rlCanonElemTy(e: i32): i32 {
+  if e < 0 || e >= T.tys.length { return e }
+  const t = tyAt(e)
+  if t is TyLit { return softenLitTy(e) }
+  if t is TyUnion {
+    const sl = softenLitTy(e)
+    if sl != e { return sl }
+  }
+  if t is TyNullable {
+    const i = rlCanonElemTy(t.nInner)
+    if i < 0 || i == t.nInner { return e }
+    return mkNullableTy(i)
+  }
+  if !(t is TyUnion) { return e }
+  const tys: i32[] = []
+  if !canonUnionMemberTysOf(e, tys) { return e }
+  let one = -1
+  let n = 0
+  let nul = false
+  for m in tys {
+    if m < 0 { nul = true } else {
+      one = m
+      n = n + 1
+    }
+  }
+  if n != 1 {
+    if nul { return e }
+    return -2
+  }
+  if nul { return mkNullableTy(one) }
+  one
 }
 
 // The map shape a map type `ty` is stored under: a Set's flavour by its key, else the slot its

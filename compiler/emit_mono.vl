@@ -19466,6 +19466,7 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = tyAt(rt)
   if !(lt is TyArray) || lt.aElem < 0 || tyHasTyVar(lt.aElem) { return 0 }
+  monoRecordPinnedRecv(m.memObj, rt, ctx, 0)
   if lam {
     monoListCbLamAt(a, lt.aElem, ctx)
     // A `.map` whose lambda returns a function gives a list of that function's type (D9171).
@@ -19529,6 +19530,22 @@ function monoOpenFnListLitTy(recv: i32, ctx: i32): i32 {
 // read through a binding initialised from another, a list element, a map value or a record
 // field, every value written there agreeing (D9173, D9502); -1 when none is found.
 function monoPinnedListAnnTy(recv: i32): i32 { monoPinnedAnnTyAt(recv, 0) }
+
+// Records the pinned list type `t` on a receiver read `recv` and on each un-annotated binding it
+// reads through, where the checker left them open, so a binding holds the type it is called at.
+function monoRecordPinnedRecv(recv: i32, t: i32, wf: i32, depth: i32) {
+  const x = unwrapParen(recv)
+  if x < 0 || x >= P.nodes.length || depth > 8 || !(nodeAt(x) is Ident) { return 0 }
+  monoRecordOpen(x, t, wf)
+  if x != recv { monoRecordOpen(recv, t, wf) }
+  const dl = identDeclOf(x)
+  if dl < 0 || dl >= P.nodes.length { return 0 }
+  const d = nodeAt(dl)
+  if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return 0 }
+  if !monoTyOpen(nodeTyIxOf(dl)) { return 0 }
+  monoRecordOpen(dl, t, wf)
+  monoRecordPinnedRecv(d.letInit, t, wf, depth + 1)
+}
 
 function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
   const x = unwrapParen(recv)
@@ -27923,7 +27940,61 @@ export function monomorphize(stmts: i32[]) {
   const prc = monoPruneTemplates(nDecl)
   if prc < 0 { return prc }
   monoRetSettle()
+  monoBindingsAdoptInits()
   prc
+}
+
+// Records on each un-annotated binding the walk left open the closed type its initializer was
+// given, so a binding's type is the type of the value it holds.
+function monoBindingsAdoptInits() {
+  let i = 0
+  while i < P.nodes.length {
+    const d = nodeAt(i)
+    if d is LetDecl {
+      if d.letType < 0 && d.letInit >= 0 {
+        const bt = nodeTyIxOf(i)
+        const it = monoInitHeldTy(d.letInit)
+        if (
+          bt >= 0
+          && it >= 0
+          && tyHasTyVar(bt)
+          && !tyHasTyVar(it)
+          && monoSameTyCtor(bt, it)
+        ) {
+          nodeTyRecord(i, it)
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The type initializer `init` was given, or for a read of a binding this pass already closed, and
+// the checker left open, that binding's type, recorded on the read.
+function monoInitHeldTy(init: i32): i32 {
+  const it = nodeTyIxOf(init)
+  if it < 0 || !tyHasTyVar(it) { return it }
+  const x = unwrapParen(init)
+  if x < 0 || !(nodeAt(x) is Ident) { return it }
+  const dl = identDeclOf(x)
+  if dl < 0 || dl >= P.nodes.length || !(nodeAt(dl) is LetDecl) { return it }
+  const dt = nodeTyIxOf(dl)
+  if dt < 0 || tyHasTyVar(dt) || !monoSameTyCtor(it, dt) { return it }
+  nodeTyRecord(x, dt)
+  if x != init { nodeTyRecord(init, dt) }
+  dt
+}
+
+// Whether types `a` and `b` have the same outermost constructor.
+function monoSameTyCtor(a: i32, b: i32): boolean {
+  const x = tyAt(a)
+  const y = tyAt(b)
+  (x is TyArray && y is TyArray)
+    || (x is TyFunc && y is TyFunc)
+    || (x is TyMap && y is TyMap)
+    || (x is TyNullable && y is TyNullable)
+    || (x is TyObj && y is TyObj)
 }
 
 // `monomorphize`'s last stage, over the first `nDecl` slots: retypes the cells an instantiated
