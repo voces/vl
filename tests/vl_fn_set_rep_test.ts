@@ -2,10 +2,11 @@
 //
 // A set of un-annotated functions is lowered to an i32 member id only when a call goes through
 // it, and that call then calls each member directly, at one call type or at several. A set that
-// is only delivered to a declared function type or stored in a list must cost exactly what it
-// did before the id lowering existed. This pins that by building each such program against the
-// same program with the selector's result annotated as a function type, which forces the
-// closure, and requiring the two modules to be BYTE-IDENTICAL and to call through the table.
+// is only delivered to a declared function type, directly or out of a list, must cost
+// exactly what it did before the id lowering existed. This pins that by building each such
+// program against the same program with the selector's result annotated as a function type,
+// which forces the closure, and requiring the two modules to be BYTE-IDENTICAL and to call
+// through the table.
 // Programs that call through the set are the controls: they must make no indirect call, or the
 // check is not seeing the lowering.
 //
@@ -14,17 +15,28 @@
 //
 // @test-timing native
 
-import { binaryen, COMPILER, exists, nativeEnv, VL, wasmDis } from "./support/tree.ts";
+import {
+  binaryen,
+  COMPILER,
+  exists,
+  nativeEnv,
+  VL,
+  wasmDis,
+} from "./support/tree.ts";
 
 const ENABLED = exists(VL) && exists(COMPILER) && exists(binaryen("wasm-dis"));
-if (!ENABLED) console.warn("[fn-set-rep] skipped — missing vl, the seed or binaryen");
+if (!ENABLED) {
+  console.warn("[fn-set-rep] skipped — missing vl, the seed or binaryen");
+}
 
 const MEMBERS = [
   "function inc(a) { return a + 1 }",
   "function dbl(a) { return a * 2 }",
 ];
 const sel = (annotated: boolean) => [
-  annotated ? "function sel(c: boolean): (a: i32) => i32 {" : "function sel(c: boolean) {",
+  annotated
+    ? "function sel(c: boolean): (a: i32) => i32 {"
+    : "function sel(c: boolean) {",
   "  if c { return inc }",
   "  return dbl",
   "}",
@@ -36,21 +48,31 @@ const BODIES: Record<string, string[]> = {
     "function ap(f: (x: i32) => i32, x: i32) { return f(x) }",
     "print(ap(sel(false), 3))",
   ],
-  storedInList: [
+  storedInListDelivered: [
+    "function ap(f: (x: i32) => i32, x: i32) { return f(x) }",
+    "const fs = [sel(true), sel(false)]",
+    "print(ap(fs[0], 3))",
+  ],
+};
+// Called through the set at one type and at two; only the un-annotated spelling of the second
+// type-checks. A call through a set calls each member directly whatever the call count or set
+// size, and a call through a list element is a call through the set, so calledAtOneType and
+// calledThroughListElement dispatch by design and are graded with the controls, not the bodies.
+const CONTROLS: Record<string, string[]> = {
+  calledAtOneType: ["const g = sel(false)", "print(g(3))"],
+  calledAtTwoTypes: ["const g = sel(false)", "print(g(3))", "print(g(2.5))"],
+  calledThroughListElement: [
     "const fs = [sel(true), sel(false)]",
     "print(fs[0](3))",
     "print(fs[1](3))",
   ],
 };
-// Called through the set at one type and at two; only the un-annotated spelling of the second
-// type-checks. A call through a set calls each member directly whatever the call count or set
-// size, so calledAtOneType dispatches by design and is graded with the controls, not the bodies.
-const CONTROLS: Record<string, string[]> = {
-  calledAtOneType: ["const g = sel(false)", "print(g(3))"],
-  calledAtTwoTypes: ["const g = sel(false)", "print(g(3))", "print(g(2.5))"],
-};
 
-const build = async (dir: string, name: string, lines: string[]): Promise<Uint8Array> => {
+const build = async (
+  dir: string,
+  name: string,
+  lines: string[],
+): Promise<Uint8Array> => {
   const src = `${dir}/${name}.vl`;
   const out = `${dir}/${name}.wasm`;
   Deno.writeTextFileSync(src, lines.join("\n") + "\n");
@@ -61,7 +83,9 @@ const build = async (dir: string, name: string, lines: string[]): Promise<Uint8A
     stderr: "piped",
   }).output();
   if (!p.success) {
-    throw new Error(`vl build ${name} failed: ${new TextDecoder().decode(p.stderr)}`);
+    throw new Error(
+      `vl build ${name} failed: ${new TextDecoder().decode(p.stderr)}`,
+    );
   }
   return Deno.readFileSync(out);
 };
@@ -69,21 +93,31 @@ const build = async (dir: string, name: string, lines: string[]): Promise<Uint8A
 const indirectCalls = async (dir: string, name: string): Promise<number> => {
   const p = await wasmDis([`${dir}/${name}.wasm`]);
   if (!p.success) throw new Error(`wasm-dis ${name} failed`);
-  return new TextDecoder().decode(p.stdout).split(/call_indirect|call_ref/).length - 1;
+  return new TextDecoder().decode(p.stdout).split(/call_indirect|call_ref/)
+    .length - 1;
 };
 
 const sameBytes = (a: Uint8Array, b: Uint8Array): boolean =>
   a.length === b.length && a.every((x, i) => x === b[i]);
 
 Deno.test({
-  name: "fn-set rep: a set with no dispatching call is the closure its annotation forces",
+  name:
+    "fn-set rep: a set with no dispatching call is the closure its annotation forces",
   ignore: !ENABLED,
   fn: async () => {
     const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
     try {
       for (const [name, body] of Object.entries(BODIES)) {
-        const bare = await build(dir, name, [...MEMBERS, ...sel(false), ...body]);
-        const ann = await build(dir, name + "Ann", [...MEMBERS, ...sel(true), ...body]);
+        const bare = await build(dir, name, [
+          ...MEMBERS,
+          ...sel(false),
+          ...body,
+        ]);
+        const ann = await build(dir, name + "Ann", [
+          ...MEMBERS,
+          ...sel(true),
+          ...body,
+        ]);
         if (!sameBytes(bare, ann)) {
           throw new Error(
             `${name}: want byte-identical modules, got ${bare.length} bytes against the ` +
@@ -91,13 +125,19 @@ Deno.test({
           );
         }
         if (await indirectCalls(dir, name) === 0) {
-          throw new Error(`${name}: want a call through the closure, got no indirect call`);
+          throw new Error(
+            `${name}: want a call through the closure, got no indirect call`,
+          );
         }
       }
       for (const [name, body] of Object.entries(CONTROLS)) {
         await build(dir, name, [...MEMBERS, ...sel(false), ...body]);
         const n = await indirectCalls(dir, name);
-        if (n !== 0) throw new Error(`${name}: want a dispatch with no indirect call, got ${n}`);
+        if (n !== 0) {
+          throw new Error(
+            `${name}: want a dispatch with no indirect call, got ${n}`,
+          );
+        }
       }
     } finally {
       Deno.removeSync(dir, { recursive: true });
