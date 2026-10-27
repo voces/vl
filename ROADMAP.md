@@ -45,7 +45,7 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 2. **Clause-1 defects:** D13960 (a wider record list spread into a narrower rest parameter is
    check-clean invalid wasm). For the rest, run `ls.vl -- --status open` and grep for `clause 1`.
 3. **Initialization order** (DECISIONS.md, "Initialization order"). Make init-before-read a compile
-   error and reorder initializers. D2655 is open beside it.
+   error and reorder initializers. D14360 is open beside it.
 4. **Generated-code performance:**
    - print imports only when reachable;
    - B-range (D4000);
