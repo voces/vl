@@ -79,6 +79,7 @@ import {
   inferObservedSet,
   mapUnboxTyIx,
   nodeRepTyIx,
+  recCopyTyIx,
   setCtorKeys,
 } from "./check_core_state"
 import {
@@ -1839,7 +1840,7 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
       if !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
     } else if (
       c == call
-      || !recNullWidened(own, dst)
+      || !recNullWidened(own, dst, mapped)
       || (!mapped && (recQueuedReaches(c, own) || !recReadInPlace(c)))
     ) {
       return false
@@ -1848,10 +1849,11 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   hasCall
 }
 
-// Whether the record `dst` stores each field of the record `own` as `own` does, as that type
-// or null, or as `i64` where `own` holds `i32`, which a field read narrows back exactly. An
-// `f64` widening is excluded: a field read of it changes value (D8302).
-function recNullWidened(own: i32, dst: i32): boolean {
+// Whether the record `dst` stores each field of the record `own` as `own` does, or as that
+// type or null, or, where `stored` (the record is held in a container built at `dst`), as `i64`
+// where `own` holds `i32`. A field read of a widened number must have the checker's type, so
+// the record is otherwise built at its own row and its delivery copies (D8302).
+function recNullWidened(own: i32, dst: i32, stored: boolean): boolean {
   const o = tyAt(own)
   const d = tyAt(dst)
   if o is TyObj && d is TyObj {
@@ -1865,8 +1867,8 @@ function recNullWidened(own: i32, dst: i32): boolean {
         const at = if inner < 0 { df } else { inner }
         if (
           !fieldStorageEq(of, at, REC_STORE_DEPTH)
-          && !(of == TY_I32 && at == TY_I64)
           && !(of == TY_NULL && inner >= 0)
+          && !(stored && of == TY_I32 && at == TY_I64)
         ) {
           return false
         }
@@ -4503,6 +4505,77 @@ export function recordInferRetNullOnly(key: string, er: i32): boolean {
   // `TY_NULL`, not `er`: the hole's `er` has no inner a downstream read could take.
   recordInferRet(key, "null", TY_NULL, 1, IR_REC_NULL_ONLY)
   true
+}
+
+// Records `dstTy` at each value `srcExpr` delivers when its record stores a number otherwise
+// than the destination's record does: the emitter builds a fresh record there, converting each
+// number. Only number fields may differ, and a literal is built at its destination instead.
+export function recordRecCopy(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  recCopyAt(srcExpr, srcTy, dstTy, REC_STORE_DEPTH)
+}
+
+// `recordRecCopy` to `depth` literals deep: a fresh object or list literal is built at the
+// destination, so the copy is recorded on its fields and elements instead.
+function recCopyAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
+  const dst = nonNulTyOf(dstTy)
+  if srcExpr < 0 || srcTy < 0 || dst < 0 || srcTy >= T.tys.length || depth < 0 {
+    return 0
+  }
+  const dt = tyAt(dst)
+  for lf in valueTailLeaves(srcExpr) {
+    if lf < 0 { continue }
+    const ln = nodeAt(parenPeelIx(lf))
+    if ln is ObjLit {
+      if dt is TyObj {
+        for fx in ln.objFields {
+          const fi = nodeAt(fx)
+          if fi is FieldInit {
+            const df = objFieldType(dt, fi.fiName)
+            if df >= 0 {
+              recCopyAt(fi.fiValue, nodeTyOf(fi.fiValue), df, depth - 1)
+            }
+          }
+        }
+      }
+    } else if ln is ArrayLit {
+      if dt is TyArray {
+        for ex in ln.arrElems {
+          if !(nodeAt(ex) is Spread) {
+            recCopyAt(ex, nodeTyOf(ex), dt.aElem, depth - 1)
+          }
+        }
+      }
+    } else if recCopyConverts(srcTy, dst) {
+      while recCopyTyIx.length <= lf { recCopyTyIx.push(-1) }
+      recCopyTyIx[lf] = dst
+    }
+  }
+  0
+}
+
+// Whether the record `dst` stores some field of the record `src` as another number class, and
+// every other field as `src` stores it.
+function recCopyConverts(src: i32, dst: i32): boolean {
+  const s = tyAt(src)
+  const d = tyAt(dst)
+  if !(s is TyObj) || !(d is TyObj) { return false }
+  let converts = false
+  let i = 0
+  while i < d.objFieldNames.length {
+    const sf = objFieldType(s, d.objFieldNames[i])
+    const df = d.objFieldTypes[i]
+    if sf < 0 { return false }
+    const sc = recNumClass(sf)
+    const dc = recNumClass(df)
+    if sc != "" && dc != "" && sc != dc {
+      if nonNulTyOf(sf) != sf || nonNulTyOf(df) != df { return false }
+      converts = true
+    } else if !fieldStorageEq(sf, df, REC_STORE_DEPTH) {
+      return false
+    }
+    i = i + 1
+  }
+  converts
 }
 
 // Records `dstTy` for a delivery of `srcExpr` whose type `srcTy` is a union of maps and whose
