@@ -593,6 +593,7 @@ import {
   elabKeyAt,
   elabRetOf,
   elabSlotNote,
+  elabStampAt,
   elabTpDefaultsReset,
   elabTpDefaultsSet,
   elabWalkKidRet,
@@ -8515,7 +8516,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
         if iv is Ident {
           ci = mkIdent(iv.identName, iv.pos)
           lfNoteMinted(ci, n.letInit)
-          identFrom(ci, n.letInit)
+          monoCopyOf(n.letInit, ci)
         }
       }
       if ci == n.letInit { return ix }
@@ -8644,7 +8645,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
       ) {
         const vi = mkIdent(n.identName, n.pos)
         lfNoteMinted(vi, ix)
-        identFrom(vi, ix)
+        monoCopyOf(ix, vi)
         // A value nothing calls stays one in each instance's copy (D9590).
         if i32ListHas(monoInertValues, ix) { monoInertValues.push(vi) }
         if i32ListHas(monoInertCalled, ix) { monoInertCalled.push(vi) }
@@ -11928,6 +11929,10 @@ function monoInstanceFor(
 // flow table pins that slot at in frame `ctx`; a nested literal reads its own slots instead.
 function monoCoerceLitPart(v: i32, lit: i32, path: string[], ctx: i32) {
   const tys: i32[] = []
+  const st = elabStampAt(unwrapParen(v), ctx)
+  if monoTyClosedFn(st) {
+    return monoCoerceFnValueTys(v, monoConcreteFnTyName(st), ctx, st, tys)
+  }
   const nm = monoSlotPinNameTys(lit, path, ctx, tys)
   if nm == "" && !monoFlowIsLit(unwrapParen(v)) { return 0 }
   monoCoerceFnValueTys(v, nm, ctx, -1, tys)
@@ -12379,21 +12384,10 @@ function monoCoerceChoiceBinding(
   if lf[1] < 0 { return 0 }
   const d = nodeAt(lf[1])
   if !(d is LetDecl) { return 0 }
-  let ct = tname
-  let xt = expTy
-  let et = if monoTyConcreteFn(expTy) { expTy } else { nameToTy(tname) }
-  let pTys = delTys
-  // A delivery that leaves the type open takes the flow table's one pin of the binding.
-  if !monoTyConcreteFn(et) {
-    const pnTys: i32[] = []
-    const pn = monoSlotPinNameTys(lf[1], [], lf[0], pnTys)
-    if pn != "" {
-      pTys = pnTys
-      ct = pn
-      xt = -1
-      et = nameToTy(pn)
-    }
-  }
+  const ct = tname
+  const xt = expTy
+  const et = if monoTyConcreteFn(expTy) { expTy } else { nameToTy(tname) }
+  const pTys = delTys
   const iv = unwrapParen(d.letInit)
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
   const seen = monoChoiceBindNote(
@@ -12560,8 +12554,8 @@ function monoFirstArmGenName(v: i32, ctx: i32, depth: i32): i32 {
 }
 
 // For call `ix` in frame `ctx` through a written, un-annotated `let`: coerces the generic
-// functions its initializer and writes name at the one signature the flow table pins the binding
-// at, else at the instance this call takes; -1 when another call takes another type (refused).
+// functions its initializer and writes name at the instance this call takes; -1 when another call
+// takes another type (refused).
 function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
   const n = nodeAt(ix)
   if !(n is Call) { return 0 }
@@ -12571,14 +12565,16 @@ function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
   if !(d is LetDecl) { return 0 }
   const g0 = monoFirstArmGenName(d.letInit, lf[0], 0)
   const dTys: i32[] = []
-  let ct = monoSlotPinNameTys(lf[1], [], lf[0], dTys)
-  // With no single pin the call takes the instance its arguments make of the seed; the call is
-  // never renamed to it, since a write may have replaced the value.
-  if ct == "" {
-    ct = monoSeedCallSigTys(monoLetSeedGenFe(d.letInit, lf[0]), ix, ctx, dTys)
-    if ct == "!" { return -1 }
-    if ct == "" { return 0 }
-  }
+  // The call takes the instance its arguments make of the seed; the call is never renamed to it,
+  // since a write may have replaced the value.
+  const ct = monoSeedCallSigTys(
+    monoLetSeedGenFe(d.letInit, lf[0]),
+    ix,
+    ctx,
+    dTys,
+  )
+  if ct == "!" { return -1 }
+  if ct == "" { return 0 }
   const prev = monoSigCallRet
   monoSigCallRet = nodeTyIxOf(ix)
   monoCellSigByCall = true
