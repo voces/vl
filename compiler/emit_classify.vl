@@ -179,7 +179,9 @@ import {
   listDisjointDepth,
   listIsFitsAcrossReps,
   nameIsNewtypeBrand,
+  recFnValueLeaves,
 } from "./check_type_shape"
+import { recFreshDeclOf, recInferredFnOf } from "./check_rec_fresh"
 import {
   T,
   TyArray,
@@ -196,6 +198,7 @@ import {
   litBaseTy,
   litUnionAliasNameOfTy,
   mkFuncTy,
+  mkNullableTyOf,
   numLitUnionBaseTy,
   oneListUnionRender,
   primNameStr,
@@ -218,6 +221,7 @@ import {
   tyIsOneStrLit,
   tyIsRecord,
   tyLitMemberTexts,
+  tyLitUnionHashesI32,
   tyMutEpoch,
   tyNulInnerIsPrim,
   tyNumScalarBaseName,
@@ -678,6 +682,7 @@ import {
   tyIsI32LeafElem,
   unRowOfKey,
 } from "./emit_rep"
+import { repSlotOfKind } from "./emit_rep_slot"
 import { nameFieldCodeTy } from "./emit_shape_intern"
 import {
   ALK_F64,
@@ -3715,11 +3720,180 @@ function letInitProjTyIsAtom(letIx: i32, fnIx: i32): boolean {
   false
 }
 
+// The type binding `letIx` holds inside `fnIx`: its annotation's, else its own.
+export function letBindTy(letIx: i32, fnIx: i32): i32 {
+  const d = nodeAt(letIx)
+  if d is LetDecl {
+    if d.letType >= 0 {
+      const at = nodeTyAt(d.letType, fnIx)
+      if at >= 0 { return at }
+    } else {
+      const held = letHeldTyOf(letIx, d.letInit, fnIx)
+      if held >= 0 { return held }
+      // A `??` re-asked at an instance types its join there, not in the template (D3252).
+      const ci = unwrapParen(d.letInit)
+      const cn = if ci >= 0 { nodeAt(ci) } else { null }
+      if fnIx >= 0 && cn is BinExpr && cn.binOp == "??" {
+        const ct = nodeTyAt(ci, fnIx)
+        if ct >= 0 && !tyHasTyVar(ct) { return ct }
+      }
+    }
+  }
+  nodeTyAt(letIx, fnIx)
+}
+
+// The record, union arm or list the un-annotated binding `letIx` of `init` is stored as where that
+// is another type than its own, else -1. A scalar binding holds its own type, so the rungs, which
+// build whole-program indices to answer, are not asked of one.
+function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
+  const own = nodeTyIxOf(letIx)
+  if (
+    own >= 0
+    && own < T.tys.length
+    && tyAt(own) is TyPrim
+    && !tyIsNullUnit(own)
+  ) {
+    return -1
+  }
+  // The checker's record solve builds the binding at another record's storage.
+  const rb = recBuildTyOf(letIx)
+  if rb >= 0 { return rb }
+  // A literal no record row claims is stored as the union arm its fields name (D14441).
+  const avt = letVariantHeldTy(letIx, init, fnIx)
+  if avt >= 0 { return avt }
+  const held = letLitHeldTy(init, fnIx)
+  if held >= 0 { return held }
+  const called = letCallHeldTy(init)
+  if called >= 0 { return called }
+  letNamedHeldTy(letIx, init, fnIx)
+}
+
+// The union arm the initializer `init` of binding `letIx` is stored as, where the emitter's variant
+// rule answers one, `| null` when the binding's type is nullable; -1 otherwise (D14441).
+function letVariantHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
+  let vi = letObjLitVariantIdx(letIx, fnIx)
+  if vi < 0 { vi = exprVariantIndex(init, fnIx) }
+  if vi < 0 || vi >= uVarTyIx.length || uVarTyIx[vi] < 0 { return -1 }
+  const own = nodeTyAt(letIx, fnIx)
+  if own >= 0 && own < T.tys.length && tyAt(own) is TyNullable {
+    return mkNullableTyOf(uVarTyIx[vi])
+  }
+  uVarTyIx[vi]
+}
+
+// The type the binding `init` names holds, where it holds only a literal built at another type than
+// the read's own, or where the read is narrowed to `null`; -1 for any other initializer.
+function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
+  const u = unwrapParen(init)
+  if u < 0 || !(nodeAt(u) is Ident) { return -1 }
+  // A read narrowed to `null` still holds the named cell's nullable value.
+  if tyIsNullUnit(nodeTyIxOf(u)) {
+    const nd = identDeclOf(u)
+    if nd < 0 || nd == letIx || !(nodeAt(nd) is LetDecl) { return -1 }
+    const nt = letBindTy(nd, fnIx)
+    if nt >= 0 && nt < T.tys.length && tyAt(nt) is TyNullable { return nt }
+    return -1
+  }
+  // The resolved declaration answers the type first; whether it holds only its literal is the
+  // costly question, asked last.
+  const bd = identDeclOf(u)
+  if bd < 0 || bd == letIx || !(nodeAt(bd) is LetDecl) { return -1 }
+  const own = nodeTyIxOf(u)
+  const t = letBindTy(bd, fnIx)
+  if own < 0 || own >= T.tys.length || t < 0 || t >= T.tys.length { return -1 }
+  const ot = tyAt(own)
+  const tt = tyAt(t)
+  const same = (ot is TyObj && tt is TyObj) || (ot is TyArray && tt is TyArray)
+  if !same || tySame(t, own) { return -1 }
+  if recFreshDeclOf(u) != bd { return -1 }
+  t
+}
+
+// The record the inferred-result function `init` calls builds every result at, where that is another
+// record than the call's own type; -1 for any other initializer or where its literals disagree.
+function letCallHeldTy(init: i32): i32 {
+  const u = unwrapParen(init)
+  if u < 0 || !(nodeAt(u) is Call) { return -1 }
+  const own = nodeTyIxOf(u)
+  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
+  const fd = recInferredFnOf(u)
+  if fd < 0 { return -1 }
+  let r = -1
+  for lf in recFnValueLeaves(fd) {
+    const l = unwrapParen(lf)
+    if l < 0 || !(nodeAt(l) is ObjLit) { return -1 }
+    const s = litRepTyAt(l, -1)
+    if s < 0 || s >= T.tys.length || !(tyAt(s) is TyObj) { return -1 }
+    if r < 0 { r = s }
+    else if !tySame(r, s) { return -1 }
+  }
+  if r < 0 || tySame(r, own) { return -1 }
+  r
+}
+
+// The closed type a record or list literal `init` is built at, which may be a declared record its
+// fields fit or the list type its destinations agree on rather than its own type; -1 when `init`
+// is not a record literal with fields or a list literal with elements.
+function letLitHeldTy(init: i32, fnIx: i32): i32 {
+  const u = unwrapParen(init)
+  if u < 0 { return -1 }
+  const o = nodeAt(u)
+  const rec = o is ObjLit && o.objFields.length > 0
+  const lst = o is ArrayLit && o.arrElems.length > 0
+  if !rec && !lst { return -1 }
+  const a = litRepTyAt(u, fnIx)
+  if a < 0 || a >= T.tys.length || tyHasTyVar(a) { return -1 }
+  const at = tyAt(a)
+  if (rec && !(at is TyObj)) || (lst && !(at is TyArray)) { return -1 }
+  a
+}
+
+// Whether binding `letIx` of type `ty` is a `Map()` keyed by a literal union, which the
+// constructor builds string-keyed where the key type stores an atom (D14229).
+function letMapCtorAtomKey(letIx: i32, ty: i32): boolean {
+  const d = nodeAt(letIx)
+  if !(d is LetDecl) || d.letInit < 0 { return false }
+  const c = nodeAt(unwrapParen(d.letInit))
+  if !(c is Call) || c.callArgs.length != 0 || c.callFn < 0 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) || f.identName != "Map" { return false }
+  const t = tyAt(ty)
+  t is TyMap && tyLitUnionHashesI32(t.mKey)
+}
+
+// Whether binding `letIx`'s cell is the rep of the type it holds: that type answers a rep,
+// and the binding is not a never-filled `null`, a literal-union atom or its `K | null` niche,
+// whose cells the binding's own spelling decides. A type holding a type variable names no
+// rep: the value's row is the one its initializer delivers.
+export function letBindRepClaims(letIx: i32, fnIx: i32): boolean {
+  if letIsNulNone(letIx, fnIx) { return false }
+  if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return false }
+  if letNulLitUnion(letIx, fnIx) { return false }
+  const ty = letBindTy(letIx, fnIx)
+  if ty < 0 || tyHasTyVar(ty) || tyHasTyVar(letBindTy(letIx, -1)) {
+    return false
+  }
+  if letMapCtorAtomKey(letIx, ty) { return false }
+  repOfNodeAt(letIx, ty).rdCovered == 1
+}
+
+// The rep of binding `letIx`'s cell, read off the type it holds.
+export function letBindRep(letIx: i32, fnIx: i32): RepDesc {
+  repOfNodeAt(letIx, letBindTy(letIx, fnIx))
+}
+
+// The table slot of binding `letIx`'s cell, at its rep's kind.
+export function letBindRepSlot(letIx: i32, fnIx: i32): i32 {
+  const ty = letBindTy(letIx, fnIx)
+  repSlotOfKind(repOfNodeAt(letIx, ty).rdKind, ty)
+}
+
 // The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
 // annotation's kind through the shared annotation ladder, else the initializer's. The local
 // storage class's answer to what `globalCellKind` answers for a module global, kept here
 // because `emit_collect.vl` cannot be imported back into this file.
 export function letCellKind(letIx: i32, fnIx: i32): VKind {
+  if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
   const d = nodeAt(letIx)
   if d is LetDecl {
     if d.letType >= 0 { return vtKindOfType(d.letType) }
@@ -4899,6 +5073,9 @@ export function captureValKind(fe: i32, name: string): VKind {
       return vtKindOfType(bn.parType)
     }
     LetDecl => {
+      // The env field is the local's own cell, so it is read where the local's is.
+      const rpf = parentBindingFrameArenaOf(fe, name)
+      if letBindRepClaims(b, rpf) { return letBindRep(b, rpf).rdKind }
       if bn.letType >= 0 {
         const annK = vtKindOfType(bn.letType)
         // The env field must match the LOCAL's own cell, not re-derive from the annotation:
@@ -4980,6 +5157,8 @@ export function captureValStructIdx(fe: i32, name: string) {
       return annValtypeSlotOf(bn.parType)
     }
     LetDecl => {
+      const rpf = parentBindingFrameArenaOf(fe, name)
+      if letBindRepClaims(b, rpf) { return letBindRepSlot(b, rpf) }
       if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
       if bn.letInit >= 0 {
         // The owning frame as an arena index — the same conversion `captureValKind`'s
@@ -11873,7 +12052,11 @@ export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
       return nodeRepIsAtom(bn.parType, ownerFnIx)
     }
     LetDecl => {
-      return letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx)
+      if letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx) {
+        return true
+      }
+      return letBindRepClaims(bindIx, ownerFnIx)
+        && letBindRep(bindIx, ownerFnIx).rdAtom == 1
     }
     // No other binding is a literal atom.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
