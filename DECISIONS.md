@@ -10909,3 +10909,58 @@ identity. Newtype brands stay distinct types that share a row. Of 21 files with 
 were real twins (declared same-shape records, alias against inline, newtype), and 16 came from a
 lossy name key. Still open: the rep of a polymorphic function value stored as data, today the
 `() => void` stub row.
+
+## The ref-list reroute moves readers first, then the mint and the build together (step 6, 2026-10-27)
+
+Readers reroute first. `listRowOfExpr` and deleting the RLK_STRUCT redirect moved 0 outcomes over
+tests/cases (#4937), and the field-element reader followed (#4940). The collector's mint and the
+literal's build move together, after holes-close. Of 947 first ref-list literals, 353 are generic
+templates whose stamps name type variables outside any instance, and 324 are timing: the record
+row is not minted yet. Minting from the stamp alone built 12 invalid modules and lost 5 builds,
+because `arrLitRowTyIn` and `arrLitElemKind` still choose the row by name and arm. A mint and a
+build that choose differently are two producers of one row.
+
+## Holes-close lands as producers; the pin callers go in the slice that closes the last cell (2026-10-27)
+
+The 17 cells #4934 left on pins fall into shapes: hole-parameter delivery (6), a built-in method's
+open-result function slot (2), labelled-block values (2), list elements and record fields (slice
+(c)), local and nested members (slice (d)), and 4 untriaged. The first three, with the eta
+type-parameter lift, land as producers while the pin callers (`monoCallIfBound`,
+`monoIfBoundRetAtPin`) stay untouched. No position gate picks which cells take the new path. The
+callers are deleted, unconditionally, in the slice that closes the last cell. A gate that sends
+some positions to the new producer and the rest to the pin is two producers of one fact, and it
+outlives the migration it was meant to stage.
+
+## Building a literal at the width a consumer demands is building, not a fallback (#4939)
+
+`emitNumLitAs(exprIx, w)` builds a literal at the width its consumer names. One literal node is
+built at several widths on purpose: a numeric-union member's arithmetic and a fresh-record call's
+field each ask for their own. The consumer's width is an input to the build, so it is not a
+second producer of the literal's type. A fallback is a read that answers when the fact is missing,
+such as a lexeme default. Those are deleted (#4943, #4945).
+
+## An `#anon` row is keyed by its rep key; a generic template's row serves its instances until slice (c) (#4942)
+
+An `#anon` struct row serves only a record type whose canonical id, which carries a closure
+field's signature, equals its own. Minting by field names and codes gave every closure field one
+code whatever its signature, so `{v, f: () => boolean}` and `{v, f: () => i32}` shared a row and
+only the row's name found the second (D3190, D3191). One exemption stays: a generic body's
+`#anon` row, whose type names a type parameter, still serves each instance. That row is a
+template, not a rep key, and removing the exemption refuses `index/generic-trap.vl` and
+`closures/two-lambda-written-let-in-two-instances.vl`, because instances have no mint of their own
+yet. Slice (c) mints per instance and removes it.
+
+## No "only when no declared row names the shape" interim (#4944)
+
+An interim was proposed for the collector mint: mint from the stamp only when no declared row
+names the literal's shape. It was refused as a position gate. It chooses the producer by a
+condition outside the value's own type, which is what the holes-close ruling refuses, and it would
+leave the name-chosen row as a second producer beside the stamp.
+
+## The call-result slot takes the rep the callee builds (the next target, 2026-10-27)
+
+Deleting `recReadInPlace` was deferred in #4944. Deleting it moved 9 cells of the
+unlanded-call-beside-call-into-wider-record matrix loud→silent, and minting from the stamp did not
+clear them. The residue is the call-result slot: a binding, capture or `Map` value holding a call
+result is typed at the declared row by name, while the callee builds at another row
+(`recKeptFnDstOf`). The slot takes the rep the callee builds. `recReadInPlace` goes after that.
