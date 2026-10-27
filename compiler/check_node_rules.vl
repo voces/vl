@@ -13,6 +13,7 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  Index,
   IsExpr,
   LetDecl,
   MC_RUNG_FIELD,
@@ -78,7 +79,8 @@ import {
   pgUpTys,
 } from "./check_core_state"
 import { noteNestCstr } from "./check_cstr_rows"
-import { inferQuiet, tpEnvNames } from "./check_cursor"
+import { oerDeclWaits, oerSourceRead } from "./check_asg_rows"
+import { curFnDeclIx, inferQuiet, tpEnvNames } from "./check_cursor"
 import { boundObjRootOf, v128Seen } from "./check_decl_scan"
 import {
   daJoinArms,
@@ -945,6 +947,68 @@ function simdLaneLitCheck(nm: string, argIx: i32, max: i32) {
   0
 }
 
+// How many declarations `refuseOpenElemDecl` has refused; a body that grew it reported the cause.
+export let oerDeclRefusals = 0
+
+// Refuses a declaration inferring its type from `ix`, checked to `ty`, when that waits on an
+// undecided open element (`oerDeclWaits`): `lead` says what takes the type and `own` names the
+// annotation that would decide it. False, with nothing reported, when the declaration does not wait.
+export function refuseOpenElemDecl(
+  ix: i32,
+  ty: i32,
+  lead: string,
+  own: string,
+  at: i32,
+): boolean {
+  if !oerDeclWaits(ix, ty) { return false }
+  let list = "a list"
+  const readIx = oerSourceRead(ix)
+  if readIx >= 0 {
+    const r = nodeAt(readIx)
+    if r is Index {
+      const recv = nodeAt(parenPeelIx(r.idxArr))
+      if recv is Ident { list = "'" + recv.identName + "'" }
+    }
+  }
+  tErr(
+    lead
+      + " an element of "
+      + list
+      + " whose type is not decided yet; annotate "
+      + list
+      + " or "
+      + own,
+    at,
+  )
+  oerDeclRefusals = oerDeclRefusals + 1
+  true
+}
+
+// `refuseOpenElemDecl` for a value the function being inferred returns, naming that function.
+export function refuseOpenElemRet(ix: i32, ty: i32, at: i32): boolean {
+  let name = ""
+  if curFnDeclIx >= 0 {
+    const f = nodeAt(curFnDeclIx)
+    if f is FuncDecl { name = f.fnName }
+  }
+  if name == "" {
+    return refuseOpenElemDecl(
+      ix,
+      ty,
+      "this function returns a value taken from",
+      "its return type",
+      at,
+    )
+  }
+  refuseOpenElemDecl(
+    ix,
+    ty,
+    "'" + name + "' returns a value taken from",
+    name + "'s return type",
+    at,
+  )
+}
+
 // Record a type a PENDING body produced (a `return e` or the trailing expression):
 // the first CONCRETE type wins; an error type only notes that something err-ish
 // flowed back (an in-cycle call), which distinguishes "void body" from "no basis".
@@ -1211,7 +1275,11 @@ function ifTailLeaveElse(
       if el.isLink { noteInferRetValue(n.ifElse, el.ty) }
       noteInferRetWitness(elseIx, el.ty)
       const seedElse = ifArmValTy(n.ifElse, el.ty)
-      noteInferredSeed(seedElse, armLit(seedElse, n.ifElse))
+      if refuseOpenElemRet(elseIx, el.ty, n.ifElse) {
+        noteInferredRet(TY_ERR)
+      } else {
+        noteInferredSeed(seedElse, armLit(seedElse, n.ifElse))
+      }
     }
   }
   const daElseSid: i32[] = []
