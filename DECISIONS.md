@@ -9822,8 +9822,8 @@ ran. A join row naming a name a closure writes is renamed to that name's cell (D
 
 **A fact is about a binding, not a name.** A ledger row records the binding its key's root
 resolved to (`narClobDecl`, `narBindDepthOf`), so an inner block's `let x` neither feeds nor
-retires the outer `x`'s join. An inner declaration or a parameter of the root invalidates the
-outer binding's path overlays for its scope (`narShadowPaths`), and the emitter pushes a shadow
+retires the outer `x`'s join. A path overlay slot records the declaration its root resolved to
+(`npRoot`), so any inner binding of the root hides it for its scope (D14541), and the emitter pushes a shadow
 entry that hides the outer narrowings until the block ends (`shadowNarrowFor`). The respelling
 pass that renames a captured binding renames its join rows with it. A call that may write a
 place leaves its row on its path even when a sibling arm already retired the name in place, so
