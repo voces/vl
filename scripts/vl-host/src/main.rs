@@ -8095,21 +8095,12 @@ fn memory_headroom() -> Option<u64> {
     }
 }
 
-/// Whether this pump may stage a compile pool. Not under `$VL_FUEL` or a guest profile:
-/// both instruments read ONE store, and a pool would move the compile out of it.
-fn test_pool_allowed() -> bool {
+/// Whether this pump may stage `vl test`'s compile pool or `vl check`'s root pool. Not under
+/// `$VL_FUEL` or a guest profile: both instruments read ONE store, and a pool's cost depends
+/// on which roots its schedule gives each worker, so it would read differently on each run.
+fn compile_pool_allowed() -> bool {
     !guest_fuel_on() && guest_profile_path().is_none()
 }
-
-/// Whether `vl check` may stage its root pool. Not under a guest profile, which samples
-/// ONE store; under `$VL_FUEL` it may, because each worker's fuel is added to the run's
-/// total (`CHECK_POOL_FUEL`), so the count describes the schedule a plain run uses.
-fn check_pool_allowed() -> bool {
-    guest_profile_path().is_none()
-}
-
-/// The fuel every retired `vl check` pool worker burned, for the run's `[fuel]` line.
-static CHECK_POOL_FUEL: AtomicU64 = AtomicU64::new(0);
 
 /// `wiStat`'s reasons in its order, then the import-free checks `wiModStat` adds.
 const CHECK_STAT_NAMES: [&str; 11] = [
@@ -8155,14 +8146,9 @@ fn print_check_trace(store: &mut Store<()>, inst: &Instance) {
     eprint!("{rows}");
 }
 
-/// Add one instance's serving counts and burned fuel to the run's totals. A seed without
-/// `wiModStat` adds no counts.
-fn harvest_check_instance(store: &mut Store<()>, inst: &Instance, pooled: bool) {
-    if pooled && guest_fuel_on() {
-        if let Ok(left) = store.get_fuel() {
-            CHECK_POOL_FUEL.fetch_add(u64::MAX - left, Ordering::Relaxed);
-        }
-    }
+/// Add one instance's serving counts to the run's totals. A seed without `wiModStat` adds
+/// no counts.
+fn harvest_check_instance(store: &mut Store<()>, inst: &Instance) {
     if !check_stats_on() {
         return;
     }
@@ -8185,17 +8171,17 @@ fn harvest_check_instance(store: &mut Store<()>, inst: &Instance, pooled: bool) 
     }
 }
 
-/// `vl check`'s run totals on stderr: under `$VL_FUEL=1`, `[fuel] guest: <n>` over the
-/// parent and every pool worker; under `$VL_CHECK_STATS=1`, one `[check]` line per reason
-/// with its roots and module checks, then the module-check total.
+/// `vl check`'s run totals on stderr: under `$VL_FUEL=1`, `[fuel] guest: <n>` of the one
+/// instance that checked every root, read before the serving counts are asked for; under
+/// `$VL_CHECK_STATS=1`, one `[check]` line per reason with its roots and module checks,
+/// then the module-check total.
 fn report_check_run(store: &mut Store<()>, inst: &Instance) {
-    harvest_check_instance(store, inst, false);
     if guest_fuel_on() {
         if let Ok(left) = store.get_fuel() {
-            let total = (u64::MAX - left) + CHECK_POOL_FUEL.load(Ordering::Relaxed);
-            eprintln!("[fuel] guest: {total}");
+            eprintln!("[fuel] guest: {}", u64::MAX - left);
         }
     }
+    harvest_check_instance(store, inst);
     if check_stats_on() {
         let totals = CHECK_STATS.lock().unwrap();
         let mut checked = 0;
@@ -8601,7 +8587,7 @@ fn check_roots_pooled(
             let (payload, keep) = outcome.unwrap_or((None, false));
             if !keep {
                 if let Some(mut w) = worker.take() {
-                    harvest_check_instance(&mut w.store, &w.inst, true);
+                    harvest_check_instance(&mut w.store, &w.inst);
                 }
             }
             if test_trace_on() {
@@ -8613,7 +8599,7 @@ fn check_roots_pooled(
             *slots[i].lock().unwrap() = payload;
         }
         if let Some(mut w) = worker.take() {
-            harvest_check_instance(&mut w.store, &w.inst, true);
+            harvest_check_instance(&mut w.store, &w.inst);
         }
     };
     std::thread::scope(|scope| {
@@ -9567,13 +9553,13 @@ fn pump_session(
     let keep_dir = keep_modules_dir(&mut store, &inst)?;
     // `vl test`'s compile pool. A seed without the export compiles every test file in
     // this one instance, as before the pool existed.
-    if test_pool_allowed() {
+    if compile_pool_allowed() {
         if let Ok(stage) = inst.get_typed_func::<i32, i32>(&mut store, "cliTestPoolStage") {
             stage.call(&mut store, 1)?;
         }
     }
     // `vl check`'s root pool, the same way: a seed without it checks every root here.
-    if check_pool_allowed() {
+    if compile_pool_allowed() {
         if let Ok(stage) = inst.get_typed_func::<(i32, i32), i32>(&mut store, "cliCheckPoolStage")
         {
             stage.call(&mut store, (1, -1))?;
