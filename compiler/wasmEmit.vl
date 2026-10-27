@@ -101,6 +101,7 @@ import {
   tySame,
   tyScalarBasePrim,
   tyToEmitName,
+  tyToStr,
 } from "./check_types"
 import {
   ATOMIC_SIG_CMPXCHG,
@@ -5430,7 +5431,6 @@ function emitListIsAcrossReps(
   }
   const chkTag = isArmTagOfTy(chk)
   const chkLeaf = listLeafTyOf(chk)
-  const chkDepth = if tyIsLitUnion(chkLeaf) { atomLeafListDepthOfTy(chk) } else { -1 }
   const tags: i32[] = []
   const fits: i32[] = []
   const wraps: i32[] = []
@@ -5446,18 +5446,9 @@ function emitListIsAcrossReps(
       if k == 0 {
         if t != chkTag {
           k = LIST_ARM_EMPTY
-        } else if (
-          chkDepth >= 0
-          && atomLeafListDepthOfTy(a) == chkDepth
-          && atomArmSlots(a, chkDepth, slots)
-        ) {
-          k = LIST_ARM_ATOMS
-        } else if isNullTy(tyArrayElemIx(chk)) && !isNullTy(tyArrayElemIx(a)) {
-          k = LIST_ARM_NULLS
-        } else if listArmIsNullableStrs(a, chk) {
-          k = LIST_ARM_NONNULL
         } else {
-          return 0
+          k = listArmSharedTagFit(a, chk, slots)
+          if k == 0 { return 0 }
         }
       }
       if tySame(a, chk) { own = true } else { other = true }
@@ -5623,6 +5614,23 @@ const LIST_ARM_EMPTY = 3
 const LIST_ARM_ATOMS = 4
 const LIST_ARM_NULLS = 5
 const LIST_ARM_NONNULL = 6
+
+// How `emitListIsAcrossReps` tests list arm `a` against `chk` when the two share one tag and
+// rep: by `a`'s atoms (filling `slots`), by null elements, by no null element, or 0 when no
+// element test tells them apart.
+function listArmSharedTagFit(a: i32, chk: i32, slots: i32[]): i32 {
+  if tyIsLitUnion(listLeafTyOf(chk)) {
+    const d = atomLeafListDepthOfTy(chk)
+    if d >= 0 && atomLeafListDepthOfTy(a) == d && atomArmSlots(a, d, slots) {
+      return LIST_ARM_ATOMS
+    }
+  }
+  if isNullTy(tyArrayElemIx(chk)) && !isNullTy(tyArrayElemIx(a)) {
+    return LIST_ARM_NULLS
+  }
+  if listArmIsNullableStrs(a, chk) { return LIST_ARM_NONNULL }
+  0
+}
 
 // Whether list arm `a` is `(string | null)[]` and `chk` is `string[]`, so the two share the
 // string list's tag and an `a` value fits `chk` exactly when no element is null.
@@ -7959,6 +7967,50 @@ function unionBoxHasNoRow(unionName: string, unionTy: i32): boolean {
   false
 }
 
+// Whether `x is chk` answers right for a value of arm `other` boxed under `chk`'s tag: every
+// such value fits `chk`, or the list test reads the elements (`emitListIsAcrossReps`).
+function armTagTestHolds(chk: i32, other: i32): boolean {
+  if tyFitKind(other, chk) == 1 { return true }
+  if tyArrayElemIx(chk) < 0 || tyArrayElemIx(other) < 0 { return false }
+  if listArmFitAcrossReps(other, chk) != 0 { return true }
+  listArmSharedTagFit(other, chk, []) != 0
+}
+
+// The refusal for a box into the union typed `unionTy` (else row `unionName`) where two members
+// claim one box tag (`isArmTagOfTy`) and an `is` over one would answer wrong for the other; ""
+// when none do. Record and literal members are tagged elsewhere.
+function unionArmTagClash(unionName: string, unionTy: i32): string {
+  const mems: i32[] = []
+  if unionTy >= 0 && tyAt(unionTy) is TyUnion {
+    flattenVariantsInto(unionTy, mems)
+  } else if !unionMemberTysOf(unionName, mems) {
+    return ""
+  }
+  const tags: i32[] = []
+  for m in mems { tags.push(isArmTagOfTy(m)) }
+  let i = 0
+  while i < mems.length {
+    let j = i + 1
+    while j < mems.length {
+      if (
+        tags[i] >= 0
+        && tags[i] == tags[j]
+        && (!armTagTestHolds(mems[i], mems[j])
+          || !armTagTestHolds(mems[j], mems[i]))
+      ) {
+        return "emitProgram: union members `"
+          + tyToStr(mems[i])
+          + "` and `"
+          + tyToStr(mems[j])
+          + "` share one box tag, so `is` could not tell them apart"
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  ""
+}
+
 // Coerces the value of `exprIx` into the box of union `unionNameIn`. The caller's context is
 // restored on every exit.
 export function emitUnionCoerce(
@@ -8505,6 +8557,8 @@ function emitUnionCoerceUnder(
   let unionName = unionNameIn
   const ums = unionMemberSetOf(unionName)
   if ums != "" { unionName = ums }
+  const clash = unionArmTagClash(unionName, unionTy)
+  if clash != "" { return emitFailAt(clash, exprIx) }
   const bareIx = unwrapParen(exprIx)
   if bareIx < 0 { return -1 }
   const bare = nodeAt(bareIx)

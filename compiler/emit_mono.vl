@@ -28,6 +28,7 @@ import {
   nodeTyNestedElemIsBoolPrim,
   nodeTyRecord,
   nodeTyWidenedRepTy,
+  tyIsUnionish,
 } from "./check_node_tys"
 import { nodePos, trimWs } from "./fmt_util"
 import {
@@ -151,6 +152,7 @@ import {
   tyBearsNull,
   tyEq,
   tyFieldTyOf,
+  tyHoldsObj,
   tyIsLitUnion,
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
@@ -469,6 +471,7 @@ import {
   sFieldTypeAt,
   sScanLim,
   structIndexByName,
+  structRowRecordingTy,
   structTyAliasableReset,
   structTyMarkAliasable,
 } from "./emit_atom_kinds"
@@ -648,6 +651,7 @@ import {
   tyExcludesNull,
   tyHasTyVar,
   tyHasTyVarWasCapped,
+  tyIsArray,
   tyIsNumericBox,
   tyMapValOf,
   tyReachesHole,
@@ -1803,6 +1807,56 @@ function monoAnnPinNameOfTy(ty: i32): string {
   monoAnnPinName(tyToEmitName(ty))
 }
 
+// The pin of closed checker type `ty`, its alias and nominal identity kept: a litunion by
+// its alias or kept spelling, a record or nullable record by its declared name, a union by
+// its registry row, else the annotation ladder over its render.
+function monoClosedTyPin(ty: i32): string {
+  const n = monoClosedTyName(ty)
+  if n != "" { return n }
+  monoI32AtomPinName(ty)
+}
+
+// `monoClosedTyPin` less its render fallback: "" when no declared name or row spells `ty`.
+function monoClosedTyName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const lu = monoLitUnionPinOfTy(ty)
+  if lu != "" { return lu }
+  const t = tyAt(ty)
+  match t {
+    TyObj => {
+      const si = structRowRecordingTy(ty)
+      if si < 0 || si >= sNames.length || sNames[si].slice(0, 1) == "#" {
+        return ""
+      }
+      return monoAnnPinName(sNames[si])
+    }
+    TyUnion | TyNullable => {
+      if !tyIsUnionish(ty) { return "" }
+      const ur = unRowOfCanon(ty)
+      if ur >= 0 && ur < unNames.length {
+        const un = monoAnnPinName(unNames[ur])
+        if un != "" { return un }
+      }
+      if t is TyNullable {
+        const inm = monoClosedTyName(t.nInner)
+        if inm != "" { return monoAnnPinName(inm + "|null") }
+      }
+      return ""
+    }
+    TyArray => {
+      const en = monoClosedTyName(t.aElem)
+      if en == "" { return "" }
+      if strContains(en, "|") && !tyIsArray(t.aElem) {
+        return monoAnnPinName("(" + en + ")[]")
+      }
+      return monoAnnPinName(en + "[]")
+    }
+    // A scalar, function, map or open type has no declared name to keep.
+    TyPrim | TyErr | TyFunc | TyMap | TyVar | TyLit | TyNeg => {}
+  }
+  ""
+}
+
 // The union pin of a `??` at `ix` whose recorded join is a value union, or "".
 function monoCoalJoinPinName(ix: i32): string {
   if ix < 0 { return "" }
@@ -2148,10 +2202,14 @@ function monoTyMutual(a: i32, b: i32): boolean {
 
 // The pin a litunion or litunion-list argument `ix` takes, "" for any other argument.
 function monoArgLitUnionPin(ix: i32, fnIx: i32): string {
-  // A declared litunion argument pins the parameter to the alias, ahead of the string and
-  // scalar arms. For a litunion the spelling is the rep, and `litUnionAliasNameOfTy` names
-  // the alias. Without this arm the pin loses the type entirely.
-  const luTy = nodeTyAt(unwrapParen(ix), fnIx)
+  monoLitUnionPinOfTy(nodeTyAt(unwrapParen(ix), fnIx))
+}
+
+// The pin of litunion or litunion-list type `luTy`, "" for any other type.
+function monoLitUnionPinOfTy(luTy: i32): string {
+  // A declared litunion pins the parameter to the alias, ahead of the string and scalar
+  // arms. For a litunion the spelling is the rep, and `litUnionAliasNameOfTy` names the
+  // alias. Without this arm the pin loses the type entirely.
   const luAl = litUnionAliasNameOfTy(luTy)
   if luAl != "" { return luAl }
   // The array sibling, and it has to sit here: the collection arms spell a litunion array by
@@ -21217,7 +21275,15 @@ function monoElabPin(
   if x < 0 || t < 0 || t >= T.tys.length || tyHasTyVar(t) { return "" }
   const cps = holeLitCopiesOf(x)
   if cps.length > 0 { return monoElabLitCopy(callIx, args, i, cps, t, ctx) }
-  if !monoTyOpen(nodeTyIxOf(x)) || !monoElabDeliver(x, t, ctx, false, false) {
+  if !monoTyOpen(nodeTyIxOf(x)) {
+    const fresh = monoElabFreshLitPin(x, t)
+    if fresh != "" { return fresh }
+    const cn = monoClosedTyName(t)
+    if cn != "" { return cn }
+    if tyMayHoldFn(t, 0) || tyHoldsObj(t, 8) || tyIsUnionish(t) { return "" }
+    return monoI32AtomPinName(t)
+  }
+  if !monoElabDeliver(x, t, ctx, false, false) {
     return monoElabFreshLitPin(x, t)
   }
   if nodeAt(x) is FuncDecl && tyAt(t) is TyFunc {
@@ -21234,8 +21300,7 @@ function monoElabPin(
     if an != "" { return an }
     return monoConcreteFnTyName(t)
   }
-  if !monoTyOpen(nodeTyIxOf(x)) { return monoArgPinName(x, ctx) }
-  monoI32AtomPinName(t)
+  monoClosedTyPin(t)
 }
 
 // The pin of list or record literal `x` passed straight to a parameter the elaboration closes
@@ -23032,6 +23097,8 @@ function monoPinHoleParam(
   }
   let guessed = false
   if an == "" {
+    // Kept for what a closed elaboration does not record: a function's `=>` key, an `#anon`
+    // row, the declared name of a record argument, and a value no delivery reaches.
     an = monoArgPinName(args[i], ctx)
     // The rep cascade's `i32` floor is a guess for a value the checker left open: it pins at
     // the type this frame's instance closes it to, or the elaboration's, or not at all.
