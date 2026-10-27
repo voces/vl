@@ -1819,9 +1819,9 @@ function recFnReturns(fd: i32): i32[] {
 }
 
 // Whether call sites `sites` are `call` and calls each landing `own` on `dst`'s field storage,
-// queued for none, or stored into a `Map()` (`recMapStoresAgree`), so one build serves them all
-// (D8201). One queued for none is read for a field, and `dst` widens a field no further than
-// `recNullWidened` reads back exactly (D8302).
+// queued for none, or stored into a container (`recHeldStored`, `recStoresAgree`), so one build
+// serves them all (D8201). One queued for none is read for a field, and `dst` widens a field no
+// further than `recNullWidened` reads back exactly (D8302).
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
@@ -1829,7 +1829,7 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     if s % 2 != 0 { return false }
     const c = s / 2
     if c == call { hasCall = true }
-    const mapped = recMapStoreDeclOf(c) >= 0
+    const mapped = recHeldStored(c)
     const at = if mapped { -1 } else { recQueuedLandingOf(c, own) }
     if at >= 0 {
       if !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
@@ -2345,10 +2345,10 @@ function recMapSetStoreValue(p: i32, a: i32): i32 {
   -1
 }
 
-// Build the `Map()` binding `md`'s values where every stored value a kept delivery builds is
-// built, and refuse each stored value not built there, or every one when they land apart.
-export function recMapStoresAgree(md: i32) {
-  const vs = recMapStoredValues(md)
+// Build the container binding `md`'s values (`recStoreDeclOf`) where every stored value a kept
+// delivery builds is built, and refuse each one not built there, or every one when they land apart.
+export function recStoresAgree(md: i32) {
+  const vs = recStoredValues(md)
   for v in vs { recBuildPush(md, nodeTyIxOf(v), recMapStoreKeptDst(v), true) }
   const bt = recBuildPassAt(md)
   for v in vs {
@@ -2371,14 +2371,16 @@ function recMapStoreKeptDst(v: i32): i32 {
   if k >= 0 && k < recKeptDst.length { recKeptDst[k] } else { -1 }
 }
 
-// The un-annotated `Map()` binding the value `v` is stored into by `m[k] = v` or
-// `m.set(k, v)`; -1 when `v` is not such a store's value.
-export function recMapStoreDeclOf(v: i32): i32 {
+// The un-annotated container binding the value `v` is stored into: a `Map()` by `m[k] = v` or
+// `m.set(k, v)`, or a list literal's binding by being its element or by `xs[i] = v`; else -1.
+export function recStoreDeclOf(v: i32): i32 {
   if v < 0 || v >= cwIxUp.length { return -1 }
   const a = cwIxUp[v]
   if a < 0 || a >= P.nodes.length { return -1 }
   const an = nodeAt(a)
+  if an is ArrayLit { return recListLitDeclOf(a) }
   let recv = -1
+  let set = false
   if an is BinExpr {
     if an.binOp == "=" && an.binCompound == "" && an.binRight == v {
       const l = nodeAt(an.binLeft)
@@ -2387,15 +2389,108 @@ export function recMapStoreDeclOf(v: i32): i32 {
   } else if an is Call {
     if an.callArgs.length == 2 && an.callArgs[1] == v && an.callFn >= 0 {
       const f = nodeAt(an.callFn)
-      if f is Member && f.memProp == "set" { recv = f.memObj }
+      if f is Member && f.memProp == "set" {
+        recv = f.memObj
+        set = true
+      }
     }
   }
   if recv < 0 { return -1 }
   const d = recFreshMapDeclOf(recv)
-  if d < 0 { return -1 }
+  if d >= 0 {
+    const dn = nodeAt(d)
+    return if dn is LetDecl && dn.letType < 0 { d } else { -1 }
+  }
+  const hl = recHeldLit(recv)
+  if set || hl < 0 { return -1 }
+  recListLitDeclOf(cwPeelValue(hl))
+}
+
+// The un-annotated binding the list literal `a` initializes, else -1.
+function recListLitDeclOf(a: i32): i32 {
+  if a < 0 || a >= cwIxUpKind.length || cwIxUpKind[a] != CW_UP_LETINIT {
+    return -1
+  }
+  if !(nodeAt(a) is ArrayLit) { return -1 }
+  const d = cwIxUp[a]
+  if d < 0 || d >= P.nodes.length { return -1 }
   const dn = nodeAt(d)
-  if dn is LetDecl && dn.letType < 0 { return d }
-  -1
+  if dn is LetDecl && dn.letType < 0 { d } else { -1 }
+}
+
+// The values stored into the container binding `d` (`recStoreDeclOf`).
+function recStoredValues(d: i32): i32[] {
+  const out = recMapStoredValues(d)
+  const dn = nodeAt(d)
+  if dn is LetDecl && dn.letInit >= 0 {
+    const a = nodeAt(cwPeelValue(dn.letInit))
+    if a is ArrayLit {
+      for e in a.arrElems { out.push(e) }
+    }
+  }
+  out
+}
+
+// Whether the value of call `c` is stored into a container (`recStoreDeclOf`), directly or
+// through an un-annotated `const` whose every use is such a store or a field read.
+function recHeldStored(c: i32): boolean {
+  if recStoreDeclOf(c) >= 0 { return true }
+  if c >= cwIxUpKind.length || cwIxUpKind[c] != CW_UP_LETINIT { return false }
+  const d = cwIxUp[c]
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letKw != "const" { return false }
+  let stored = false
+  const ow = cwOccWalk(dn.letName, cwFrameOfDecl(d))
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if recStoreDeclOf(u) >= 0 { stored = true }
+      else if !recFieldRead(u) { return false }
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
+      return false
+    }
+  }
+  stored
+}
+
+// Appends to `out` each container a kept function's call is stored into (`recHeldStored`).
+export function recKeptStoreDecls(out: i32[]) {
+  cwIxBuild()
+  let k = 0
+  while k < recKeptDecl.length {
+    const fd = recKeptDecl[k]
+    const sites: i32[] = []
+    if nodeAt(fd) is FuncDecl && rcwCallSites(fd, sites) < 0 {
+      for s in sites {
+        if s % 2 == 0 { recHeldStoreDecls(s / 2, out) }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Appends to `out` the containers `recHeldStored` finds the call `c` stored into.
+function recHeldStoreDecls(c: i32, out: i32[]) {
+  if !recHeldStored(c) { return 0 }
+  const md = recStoreDeclOf(c)
+  if md >= 0 {
+    out.push(md)
+    return 0
+  }
+  const d = cwIxUp[c]
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) { return 0 }
+  const ow = cwOccWalk(dn.letName, cwFrameOfDecl(d))
+  while cwOccNext(ow) {
+    if cwIxKind[ow.row] == CW_OCC_USE {
+      const ud = recStoreDeclOf(cwIxNode[ow.row])
+      if ud >= 0 { out.push(ud) }
+    }
+  }
+  0
 }
 
 // Note a delivery of the literal list binding `srcExpr` (a list of records) as a list of a
