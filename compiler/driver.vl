@@ -311,6 +311,8 @@ import {
   ifaceHashArm,
   ifaceHashArmed,
   ifaceHashOf,
+  ihAmbEntries,
+  ihAmbEntryMeets,
   ihAmbientIndex,
   ihAmbientIndexArena,
   ihAmbientIndexParse,
@@ -5256,6 +5258,8 @@ let skWr: {[string]: i32} = Map()
 // parts a narrowing test in `skUse` could hit; both unioned like `skAsk`.
 let skQs: SkQ[] = []
 let skUse: {[string]: boolean} = Map()
+// Each module's ambient statements (`ihAmbEntries`), by module key.
+let skAmb: {[string]: string[][]} = Map()
 let skMask = 0
 let skPlus: {[i32]: i32}[] = []
 let skStrIdx: {[i32]: i32}[] = []
@@ -5288,6 +5292,7 @@ type SkBank = {
   bWr: {[string]: i32},
   bQs: SkQ[],
   bUse: {[string]: boolean},
+  bAmb: {[string]: string[][]},
   bMask: i32,
   bPlus: {[i32]: i32}[],
   bStrIdx: {[i32]: i32}[],
@@ -5335,6 +5340,7 @@ function skSelect(): i32 {
         bWr: skWr,
         bQs: skQs,
         bUse: skUse,
+        bAmb: skAmb,
         bMask: skMask,
         bPlus: skPlus,
         bStrIdx: skStrIdx,
@@ -5367,6 +5373,7 @@ function skSelect(): i32 {
       skWr = b.bWr
       skQs = b.bQs
       skUse = b.bUse
+      skAmb = b.bAmb
       skMask = b.bMask
       skPlus = b.bPlus
       skStrIdx = b.bStrIdx
@@ -5669,9 +5676,9 @@ function skPlan(roots: i32[], tokEnd: i32): boolean[] {
 }
 
 // Before the check of S, the guards S's tokens decide, cheapest first, so such a decline costs
-// one whole check: every served module's imports resolve as banked and S's ambient statements
-// kept their tokens; no served module holds an ambient statement S's tokens meet; and, when a
-// served module holds a banked diagnostic, S kept every declaration's spelling and token position.
+// one whole check: no ambient statement of S that moved meets a served module; every served
+// module's imports resolve as banked; no served module holds an ambient statement S's tokens meet;
+// and, when a served module holds a banked diagnostic, S kept every declaration and token position.
 function skEarly(inS: boolean[], tokEnd: i32): boolean {
   skStage = 0
   let anyS = false
@@ -5689,7 +5696,12 @@ function skEarly(inS: boolean[], tokEnd: i32): boolean {
     if !inS[sd] && ifaceHashOf(sd, 8) != skHash[base + 8] { resolved = false }
     sd = sd + 1
   }
-  if skAmbMoved > 0 { return skDecline(SK_AMBIENT) }
+  let indexed = false
+  if skAmbMoved > 0 {
+    ihAmbientIndexParse()
+    indexed = true
+    if skAmbMeets(inS) { return skDecline(SK_AMBIENT) }
+  }
   if !resolved { return skDecline(SK_IFACE) }
   if skFreshBanked(inS) { return skDecline(SK_FRESH) }
   if skWriterMoved(inS, skAsk, true) { return skDecline(SK_WRITER) }
@@ -5716,7 +5728,7 @@ function skEarly(inS: boolean[], tokEnd: i32): boolean {
     }
   }
   if anyS {
-    ihAmbientIndexParse()
+    if !indexed { ihAmbientIndexParse() }
     const meets = ihAmbientMeetsIn(inS, false, false, false, true)
     if skAmbCount(inS, meets) > 0 { return skDecline(SK_AMBIENT) }
   }
@@ -5735,6 +5747,75 @@ function skEarly(inS: boolean[], tokEnd: i32): boolean {
     }
   }
   true
+}
+
+// Whether a served module's check may read an ambient statement of S that moved since the bank,
+// on either side: one a served module's tokens meet (`ihAmbEntryMeets`), or any once a served
+// module holds a banked diagnostic, which may suggest a near name. A module's statements that
+// kept their entries but not their order all count as moved.
+function skAmbMeets(inS: boolean[]): boolean {
+  const served: boolean[] = []
+  for x in inS { served.push(!x) }
+  for q in skDgMod {
+    const m = modIndexOfKey(skKeys[q])
+    if m < 0 || !inS[m] { return true }
+  }
+  const now = ihAmbEntries()
+  let sd = 0
+  while sd < modKeys.length && sd < now.length {
+    const base = (skKeyIx[modKeys[sd]] ?? -1) * SK_READINGS
+    if inS[sd] && base >= 0 && ifaceHashOf(sd, 6) != skHash[base + 6] {
+      const old = skAmb[modKeys[sd]]
+      if old == null { return true }
+      for e in skAmbDiff(old, now[sd]) {
+        if ihAmbEntryMeets(e, served) { return true }
+      }
+    }
+    sd = sd + 1
+  }
+  false
+}
+
+// The entries of `a` not in `b` and of `b` not in `a`, or all of both when there are none.
+function skAmbDiff(a: string[][], b: string[][]): string[][] {
+  const out: string[][] = []
+  for e in a {
+    if !skAmbHas(b, e) { out.push(e) }
+  }
+  for e in b {
+    if !skAmbHas(a, e) { out.push(e) }
+  }
+  if out.length > 0 { return out }
+  for e in a { out.push(e) }
+  for e in b { out.push(e) }
+  out
+}
+
+function skAmbHas(es: string[][], e: string[]): boolean {
+  for x in es {
+    if x.length == e.length {
+      let same = true
+      let i = 0
+      while same && i < x.length {
+        if x[i] != e[i] { same = false }
+        i = i + 1
+      }
+      if same { return true }
+    }
+  }
+  false
+}
+
+// Every module's ambient statements, by module key, for the next check's `skAmbMeets`.
+function skAmbNow(): {[string]: string[][]} {
+  const out: {[string]: string[][]} = Map()
+  const now = ihAmbEntries()
+  let m = 0
+  while m < modKeys.length && m < now.length {
+    out[modKeys[m]] = now[m]
+    m = m + 1
+  }
+  out
 }
 
 // Whether S's tokens may move the adoption of a fresh value a served module delivers: its
@@ -6525,6 +6606,7 @@ function skBankNow(tokEnd: i32, keep: boolean[]): i32 {
   for a in skAsk { askKeys.push(a.slice(1, a.length)) }
   skWr = ihWriterDigests(askKeys, [], [])
   skUse = skUsesNow(keep)
+  skAmb = skAmbNow()
   skQs = skQsNow(keep)
   skKeyIx = ix
   skEntry = modKeys[0]
