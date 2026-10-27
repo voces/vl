@@ -734,3 +734,10 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   The tail unit's `-O` CPU on a quiet box: 4.5 s with neither fix, 2.0 s with D2335 alone,
   1.4 s with both. A host built before D2336 is graded on neither `skip_ssa` nor the tail
   unit's `-O` CPU (it has no size rule to apply) until rebuilt, except under `--require-fuel`.
+
+**Multi-file fuel is a count only at `VL_JOBS=1`.** Diderven's `vl check src` read
+52,398,402,517 three times at one job, and 54–56 billion, varying run to run, at the default.
+`parallel_map_stack`'s shared cursor hands files to per-worker instances, and each worker pays
+its own setup and accumulated state: about 4–7% more guest work at the default parallelism. The
+compile cache is not the cause; the variance is the same with caches off or cold. Grade a
+multi-file fuel reading at `VL_JOBS=1` with caches off.

@@ -40,7 +40,7 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 ## Next, in order
 
 1. **The architecture migration**, in [target §3](docs/internals/architecture-target-2026-10.md)
-   order. The forward items after the latest landings are in §3.1, "Open after #4832". Status is in
+   order. The forward items after the latest landings are in §3.1, "Open after #4933". Status is in
    [the plan](docs/internals/architecture-refactor-plan.md).
 2. **Clause-1 defects:** D13960 (a wider record list spread into a narrower rest parameter is
    check-clean invalid wasm). For the rest, run `ls.vl -- --status open` and grep for `clause 1`.
@@ -114,7 +114,7 @@ Each consumer keeps its own list. Re-run an ask before scheduling it.
 - **C-incremental**, in [`incremental-compilation-design.md`](docs/internals/incremental-compilation-design.md):
   - S5 is in progress, S3 `--watch` and S6 are not started, and S4 is ongoing;
   - Q2 and Q3 wait on the owner;
-  - importer-demand tracking for the check-skip.
+  - the check-skip's residual declines (27 of 30 replayed commits served).
 - **C-extern-read.** `vl run` refuses every declared extern global, even one that only an imported
   module declares and nothing reads. The goal is to refuse only a global that reachable code reads or
   writes.
