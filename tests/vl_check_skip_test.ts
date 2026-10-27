@@ -1060,6 +1060,27 @@ const CASES: Case[] = [
     libUses: 'function luq(): void {\n  const u: "x" | "y" | null = null\n  print(1)\n}\n',
     uses: 'const l0: "#lu0" = "c"\n',
   },
+  {
+    // A shape summary memoised while rig's bodies were still being typed is not what the
+    // finished check answers (D14460), so a trailing comment on defs must not move it.
+    name: "a trailing comment on a module whose import holds a write-shape question",
+    want: "serve",
+    badWhy: "decor",
+    at: "defs.vl",
+    from: "export const RIG_BOAR = 0",
+    to: "export const RIG_BOAR = 0\n// a trailing note",
+    extra: {
+      "rig.vl": "export type Key = { fn: f64, ff: f64 }\nexport const PART_LEG = 3\n" +
+        "export type View = { side: boolean }\n" +
+        "export type Gait = { cycle: f64, gait: f64, stride: f64 }\n" +
+        "function lerp(a: f64, b: f64, t: f64) { a + (b - a) * t }\n" +
+        "export function pose(v: View, k: Key, g: Gait): i32 {\n  leg(v, 0, k, g, 0.5, 0.5, 0)\n  0\n}\n" +
+        "function leg(v: View, i: i32, k: Key, g: Gait, amp: f64, run: f64, s: i32) {\n" +
+        "  const extra = [k.fn, k.ff][i]\n  const fold = min(1.0, g.gait) * lerp(0.15, 0.28, run)\n}\n",
+      "defs.vl": 'import { View, PART_LEG } from "./rig"\nexport const RIG_BOAR = 0\n',
+    },
+    uses: 'import { Buffer } from "std:buffer"\nimport { RIG_BOAR } from "./defs"\nprint(RIG_BOAR)\n',
+  },
 ];
 
 const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
