@@ -9503,13 +9503,12 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
 // flat `uFieldNames`/`uFieldStart`/`uFieldCount`/`uFieldTypes` table (declaration order = wasm
 // field index). The struct must exist among the top-level statements and every field must
 // carry a code, else fails loudly. Returns 0, or -1 (via `emitFail`).
-function collectVariantFields(stmts: i32[], name: string) {
+function collectVariantFields(stmts: i32[], name: string, ty: i32) {
   // An inline-shape variant (`{x:i32}` inside `{x:i32}|{y:i32}`) carries its
   // fields in its own text — parse them (the annotation-shape field grammar)
-  // instead of looking for a TypeDecl.
-  if nameIsShapeSpanEnds(name) {
-    return collectShapeVariantFields(name, declTyIxOfName(name))
-  }
+  // instead of looking for a TypeDecl. `ty` is the arm's own type, whose literal fields the
+  // text spells as their base.
+  if nameIsShapeSpanEnds(name) { return collectShapeVariantFields(name, ty) }
   // The declaration this variant names, from the index `collectU` built — the forward scan
   // this replaces took the FIRST `TypeDecl` spelling `name` and the index records the same
   // one. A miss is the refusal at the tail, reached the same way an exhausted scan reached it.
@@ -10240,7 +10239,7 @@ function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
         // The row `recordUnMemTys` already resolved, from this very atom — reusing it avoids
         // re-running the whole name-to-row ladder for an answer already in the parallel column.
         uVarTyIx.push(atomTys[vi])
-        if collectVariantFields(stmts, atoms[vi]) < 0 { return -1 }
+        if collectVariantFields(stmts, atoms[vi], atomTys[vi]) < 0 { return -1 }
       }
     }
     vi = vi + 1
@@ -11327,6 +11326,32 @@ function unionDeclStructAlias(s: UnionDecl): string {
   shape
 }
 
+// The arena type of the declared union's arm `vs[vi]`: the row member spelled alike at the same
+// occurrence, since twin arms that differ only in a numeric tag share one spelling. An arm the
+// row does not spell (an expanded alias) resolves its own name.
+function declVariantTyIx(
+  vs: string[],
+  vi: i32,
+  atoms: string[],
+  tys: i32[],
+): i32 {
+  let nth = 0
+  let j = 0
+  while j < vi {
+    if vs[j] == vs[vi] { nth = nth + 1 }
+    j = j + 1
+  }
+  let k = 0
+  while k < atoms.length {
+    if atoms[k] == vs[vi] {
+      if nth == 0 { return tys[k] }
+      nth = nth - 1
+    }
+    k = k + 1
+  }
+  declTyIxOfName(vs[vi])
+}
+
 // Register the declared union `s` (at statement `stmtIx`): its row, member set and key, its
 // struct variants and their fields, and the value boxes, ref-array and map arms its members
 // need. A struct alias or an alias that denotes one member or one list gets no row. Returns 0,
@@ -11376,6 +11401,19 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   }
   unMemberSet.push(udSet)
   recordUnMemTys(udSet) // D-UNION foundation
+  // The row just recorded, snapshotted before any registration below can append: a variant's
+  // type is its arm's, never a re-parse of its spelling, which drops a numeric tag (D14540).
+  const memAtoms: string[] = []
+  const memTys: i32[] = []
+  const uRow = unNames.length - 1
+  const uMemN = unMemTyCount[uRow]
+  const uMemBase = unMemAtoms.length - uMemN
+  let uMemI = 0
+  while uMemI < uMemN {
+    memAtoms.push(unMemAtoms[uMemBase + uMemI])
+    memTys.push(unMemTys[uMemBase + uMemI])
+    uMemI = uMemI + 1
+  }
   // Keyed on the declared type; the set this row records (its tag slice is positional over
   // `udSet`) keys it as well.
   unKeyPushOfTy(declTyIxOfName(s.udName), udSet)
@@ -11403,8 +11441,9 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
     if vs[vi] != "null" {
       if isStructAtom(stmts, vs[vi]) {
         uVariantsPush(vs[vi])
-        uVarTyIx.push(declTyIxOfName(vs[vi]))
-        if collectVariantFields(stmts, vs[vi]) < 0 { return -1 }
+        const vty = declVariantTyIx(vs, vi, memAtoms, memTys)
+        uVarTyIx.push(vty)
+        if collectVariantFields(stmts, vs[vi], vty) < 0 { return -1 }
       }
     }
     vi = vi + 1

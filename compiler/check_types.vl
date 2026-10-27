@@ -120,11 +120,10 @@ export type TyVar = { tvName: string }
 // literal type: `floatLitTypeMsg` refuses one where it is written.
 export type LitKind = "str" | "int"
 
-// A literal type: a single-inhabitant type (`"a"`, `0`), the member unit of a literal union.
-// `litText` is the raw characters between the quotes for "str" (escapes unresolved —
-// annotation and literal expression carry the same raw lexeme, so membership compares
-// consistently), the canonical integer lexeme for "int".
-export type TyLit = { litKind: LitKind, litText: string }
+// A literal type (`"a"`, `0`), interned by `mkLitTy`. `litText` is the raw text between the
+// quotes for "str", the canonical integer lexeme for "int". `litWide` marks the form a `const`
+// infers, widened to its base where it is stored somewhere reassignable (`litRegularTy`).
+export type TyLit = { litKind: LitKind, litText: string, litWide: boolean }
 
 // A negation `!T` — "anything but `T`". Almost always consumed by `intersectTy`
 // (`A & !B` subtracts); a residual standalone negation accepts any source not assignable
@@ -4622,12 +4621,53 @@ export function canonIntLexeme(t: string) {
   i32ToStr(v)
 }
 
+// The literal type of `kind` and `text`, interned, so one literal is one arena index (D14540).
 export function mkLitTy(kind: LitKind, text: string) {
   let canon = text
   if kind == "int" { canon = canonIntLexeme(text) }
-  const t: Ty = { litKind: kind, litText: canon }
-  addTy(t)
+  internLitTy(kind, canon, false)
 }
+
+// The one producer of `TyLit` rows, keyed on kind, canonical text and the widening bit.
+function internLitTy(kind: LitKind, canon: string, wide: boolean): i32 {
+  let key = kind + ":" + canon
+  if wide { key = "w" + key }
+  const hit = litTyIntern.get(key) ?? -1
+  if hit >= 0 { return hit }
+  if wide { wideLitMinted = true }
+  const t: Ty = { litKind: kind, litText: canon, litWide: wide }
+  const ix = addTy(t)
+  litTyIntern.set(key, ix)
+  ix
+}
+
+// `ty` with its widening bit set to `wide` when it is a literal type, else `ty` itself.
+export function litWithWide(ty: i32, wide: boolean): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const t = tyAt(ty)
+  if t is TyLit {
+    if t.litWide == wide { return ty }
+    return internLitTy(t.litKind, t.litText, wide)
+  }
+  ty
+}
+
+// The declared form of `ty`: a widening literal's twin without the bit; any other type itself.
+export function litRegularTy(ty: i32): i32 { litWithWide(ty, false) }
+
+// Whether `ty` is a widening literal: a `const` inferred it and nobody declared it.
+export function isWideLitTy(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  if t is TyLit { return t.litWide }
+  false
+}
+
+// The arena index of each literal type, by its `internLitTy` key; reset with the arena.
+export let litTyIntern: {[string]: i32} = Map()
+
+// Whether this arena holds any widening literal; `widenLitTy` skips its walk when not.
+export let wideLitMinted = false
 
 // The arena type of one literal-member lexeme — `"a"` → the `str` literal type, `0x10` → `int`
 // — or -1 when `name` is not a literal member (a float lexeme is none: `floatLitTypeMsg`). The one home for
