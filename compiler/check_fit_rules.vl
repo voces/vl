@@ -316,7 +316,7 @@ import {
   recordListWidenRetag,
   unionElemMemberWidens,
 } from "./check_retag_rows"
-import { lookup } from "./check_scopes"
+import { lookup, recFnDeclByName } from "./check_scopes"
 import {
   mapDeliveryRecordedSet,
   noteScalarView,
@@ -2150,7 +2150,17 @@ export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   }
   if !(e is Ident) { return 0 }
   const decl = recFreshMapDeclOf(p)
-  if decl < 0 { return 0 }
+  if decl < 0 {
+    // A list literal binding is delivered as its literal is.
+    const ld = recFreshDeclOf(p)
+    if ld >= 0 && dt is TyArray {
+      const li = parenPeelIx(recDeclInit(ld))
+      if li >= 0 && nodeAt(li) is ArrayLit {
+        recAdoptMapNote(li, nodeTyIxOf(li), dstTy)
+      }
+    }
+    return 0
+  }
   recAdPushMapDecl(decl, srcTy, nonNulTyOf(dstTy), p)
 }
 
@@ -2254,6 +2264,13 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         return recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), true, p)
       }
     }
+    // An element of a list literal, or of a call handing one back, is delivered as the list is.
+    if bn is ArrayLit {
+      const dn = nonNulTyOf(dstTy)
+      if dn >= 0 { recAdoptNote(b, nodeTyIxOf(b), mkArrayTy(dn)) }
+      return 0
+    }
+    if bn is Call && recAdParamListArgs(b, nonNulTyOf(dstTy)) { return 0 }
     // A map's value is delivered as its map is, at the value's destination.
     if recMapReadDeliver(p, dstTy) { return 0 }
     if bn is Ident && recFreshDeclOf(b) < 0 { return 0 }
@@ -2398,6 +2415,48 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     recAdNoteFields(p, d)
   }
   0
+}
+
+// A call to a generic declared to return `T[]`: an element of its result can only be a value one
+// of its `T` or `T[]` arguments brought, so each such argument is delivered at the element's
+// destination `d`. False for any other call.
+function recAdParamListArgs(call: i32, d: i32): boolean {
+  const c = nodeAt(call)
+  if d < 0 { return false }
+  if c is Call && c.callFn >= 0 {
+    const cn = nodeAt(c.callFn)
+    if cn is Ident {
+      const fd = recFnDeclByName(cn.identName)
+      if fd < 0 { return false }
+      const f = nodeAt(fd)
+      if f is FuncDecl {
+        if f.fnRet < 0 { return false }
+        const rt = nodeAt(f.fnRet)
+        if rt is TypeRef {
+          for tp in f.fnTyParams {
+            if rt.tyName == tp + "[]" {
+              let i = 0
+              while i < f.fnParams.length && i < c.callArgs.length {
+                const pn = nodeAt(f.fnParams[i])
+                if pn is Param && pn.parType >= 0 {
+                  const pt = nodeAt(pn.parType)
+                  const a = c.callArgs[i]
+                  if pt is TypeRef && pt.tyName == rt.tyName {
+                    recAdoptNote(a, nodeTyIxOf(a), mkArrayTy(d))
+                  } else if pt is TypeRef && pt.tyName == tp {
+                    recAdoptNote(a, nodeTyIxOf(a), d)
+                  }
+                }
+                i = i + 1
+              }
+              return true
+            }
+          }
+        }
+      }
+    }
+  }
+  false
 }
 
 // `recAdoptNote` for each field of the object literal `lit` delivered as the record `d`.
