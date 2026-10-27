@@ -270,8 +270,11 @@ import {
   recAdPushDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
+  recBuildPassAt,
   recBuildPush,
   recDelivPush,
+  recKeptDecl,
+  recKeptDst,
   recKeptFnPush,
   recPend,
   recPendDstTy,
@@ -1815,10 +1818,10 @@ function recFnReturns(fd: i32): i32[] {
   out
 }
 
-// Whether call sites `sites` (`rcwCallSites`) are `call` and calls each queued for a delivery
-// that lands a record or list of `own` on `dst`'s field storage, or queued for none, so one
-// build serves them all (D8201). A call queued for none is served only when it is read for a
-// field and `dst` widens a field no further than `recNullWidened` reads back exactly (D8302).
+// Whether call sites `sites` are `call` and calls each landing `own` on `dst`'s field storage,
+// queued for none, or stored into a `Map()` (`recMapStoresAgree`), so one build serves them all
+// (D8201). One queued for none is read for a field, and `dst` widens a field no further than
+// `recNullWidened` reads back exactly (D8302).
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
@@ -1826,14 +1829,14 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     if s % 2 != 0 { return false }
     const c = s / 2
     if c == call { hasCall = true }
-    const at = recQueuedLandingOf(c, own)
+    const mapped = recMapStoreDeclOf(c) >= 0
+    const at = if mapped { -1 } else { recQueuedLandingOf(c, own) }
     if at >= 0 {
       if !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
     } else if (
       c == call
       || !recNullWidened(own, dst)
-      || recQueuedReaches(c, own)
-      || !recReadInPlace(c)
+      || (!mapped && (recQueuedReaches(c, own) || !recReadInPlace(c)))
     ) {
       return false
     }
@@ -2339,6 +2342,59 @@ function recMapSetStoreValue(p: i32, a: i32): i32 {
   if pn is Member && an is Call {
     if pn.memProp == "set" && an.callArgs.length == 2 { return an.callArgs[1] }
   }
+  -1
+}
+
+// Build the `Map()` binding `md`'s values where every stored value a kept delivery builds is
+// built, and refuse each stored value not built there, or every one when they land apart.
+export function recMapStoresAgree(md: i32) {
+  const vs = recMapStoredValues(md)
+  for v in vs { recBuildPush(md, nodeTyIxOf(v), recMapStoreKeptDst(v), true) }
+  const bt = recBuildPassAt(md)
+  for v in vs {
+    const kd = recMapStoreKeptDst(v)
+    const at = if bt >= 0 { bt } else { kd }
+    const lit = nodeAt(v) is ObjLit
+    const built = bt >= 0
+      && (lit || (kd >= 0 && fieldStorageEq(kd, bt, REC_STORE_DEPTH)))
+    if !built && at >= 0 { recRefuseAtOwnRow(v, nodeTyIxOf(v), at) }
+  }
+  0
+}
+
+// The storage a kept delivery builds the stored value `v` at, else -1.
+function recMapStoreKeptDst(v: i32): i32 {
+  const d = recFreshOriginDecl(cwPeelValue(v), 6)
+  if d < 0 { return -1 }
+  let k = recKeptDecl.length - 1
+  while k >= 0 && recKeptDecl[k] != d { k = k - 1 }
+  if k >= 0 && k < recKeptDst.length { recKeptDst[k] } else { -1 }
+}
+
+// The un-annotated `Map()` binding the value `v` is stored into by `m[k] = v` or
+// `m.set(k, v)`; -1 when `v` is not such a store's value.
+export function recMapStoreDeclOf(v: i32): i32 {
+  if v < 0 || v >= cwIxUp.length { return -1 }
+  const a = cwIxUp[v]
+  if a < 0 || a >= P.nodes.length { return -1 }
+  const an = nodeAt(a)
+  let recv = -1
+  if an is BinExpr {
+    if an.binOp == "=" && an.binCompound == "" && an.binRight == v {
+      const l = nodeAt(an.binLeft)
+      if l is Index { recv = l.idxArr }
+    }
+  } else if an is Call {
+    if an.callArgs.length == 2 && an.callArgs[1] == v && an.callFn >= 0 {
+      const f = nodeAt(an.callFn)
+      if f is Member && f.memProp == "set" { recv = f.memObj }
+    }
+  }
+  if recv < 0 { return -1 }
+  const d = recFreshMapDeclOf(recv)
+  if d < 0 { return -1 }
+  const dn = nodeAt(d)
+  if dn is LetDecl && dn.letType < 0 { return d }
   -1
 }
 

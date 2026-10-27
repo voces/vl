@@ -204,6 +204,7 @@ import {
   litUnionAliasNameOfTy,
   mkArrayTy,
   mkFuncTy,
+  mkNullableTy,
   numLitUnionBaseTy,
   oneListUnionRender,
   primNameStr,
@@ -3661,7 +3662,27 @@ function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
   if held >= 0 { return held }
   const called = letCallHeldTy(init)
   if called >= 0 { return called }
+  const mread = letMapReadHeldTy(init)
+  if mread >= 0 { return mread }
   letNamedHeldTy(letIx, init, fnIx)
+}
+
+// The nullable record a read `m[k]` or `m.get(k)` of a `Map()` binding holds, where the checker
+// builds that map's values at another record (`recBuildElemTyOf`); -1 for any other initializer.
+function letMapReadHeldTy(init: i32): i32 {
+  const u = unwrapParen(init)
+  if u < 0 { return -1 }
+  const n = nodeAt(u)
+  let recv = -1
+  if n is Index { recv = n.idxArr }
+  if n is Call && n.callArgs.length == 1 && n.callFn >= 0 {
+    const f = nodeAt(n.callFn)
+    if f is Member && f.memProp == "get" { recv = f.memObj }
+  }
+  if recv < 0 || !(nodeAt(recv) is Ident) { return -1 }
+  const et = recBuildElemTyOf(identDeclOf(recv))
+  if et < 0 { return -1 }
+  mkNullableTy(et)
 }
 
 // The type the binding `init` names holds, where it holds only a literal built at another type than
@@ -3682,13 +3703,18 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   const bd = identDeclOf(u)
   if bd < 0 || bd == letIx || !(nodeAt(bd) is LetDecl) { return -1 }
   const own = nodeTyIxOf(u)
-  const t = letBindTy(bd, fnIx)
-  if own < 0 || own >= T.tys.length || t < 0 || t >= T.tys.length { return -1 }
+  const t0 = letBindTy(bd, fnIx)
+  if own < 0 || own >= T.tys.length || t0 < 0 || t0 >= T.tys.length {
+    return -1
+  }
   const ot = tyAt(own)
+  // A read narrowed past `null` holds the named cell's non-null record.
+  const t = if ot is TyObj && tyAt(t0) is TyNullable { tyPeelNul(t0) } else { t0 }
+  if t < 0 || t >= T.tys.length { return -1 }
   const tt = tyAt(t)
   const same = (ot is TyObj && tt is TyObj) || (ot is TyArray && tt is TyArray)
   if !same || tySame(t, own) { return -1 }
-  if recFreshDeclOf(u) != bd { return -1 }
+  if recFreshDeclOf(u) != bd && t == t0 { return -1 }
   t
 }
 
@@ -17404,8 +17430,8 @@ export function objLitBindDestRow(objIx: i32, own: i32): i32 {
 
 // The struct row the object literal at `objIx`, an un-annotated binding's initializer, is built
 // at by the checker's record solve (`recBuildTyOf`), or an element of a list literal that is one,
-// or a value stored by `m[k] = {...}` into such a `Map()` (`recBuildElemTyOf`); -1 to keep its
-// own type's row.
+// or a value `m[k] = {...}` or `m.set(k, {...})` stores into such a `Map()` (`recBuildElemTyOf`);
+// -1 to keep its own type's row.
 export function recBuildRowOf(objIx: i32): i32 {
   if objIx < 0 || !rsIxReady() { return -1 }
   const li = rsUp(objIx)
@@ -17422,6 +17448,20 @@ export function recBuildRowOf(objIx: i32): i32 {
     const tn = nodeAt(pn.binLeft)
     if !(tn is Index) || !(nodeAt(tn.idxArr) is Ident) { return -1 }
     const et = recBuildElemTyOf(identDeclOf(tn.idxArr))
+    if et < 0 { return -1 }
+    return structIdxOfElemTy(et)
+  }
+  if (
+    pn is Call
+    && pn.callArgs.length == 2
+    && pn.callArgs[1] == objIx
+    && pn.callFn >= 0
+  ) {
+    const f = nodeAt(pn.callFn)
+    if !(f is Member) || f.memProp != "set" || !(nodeAt(f.memObj) is Ident) {
+      return -1
+    }
+    const et = recBuildElemTyOf(identDeclOf(f.memObj))
     if et < 0 { return -1 }
     return structIdxOfElemTy(et)
   }
