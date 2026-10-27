@@ -76,6 +76,10 @@ import { covarRootFreshLocal, covarValueWriteState } from "./check_covar_write"
 import { EqCmpKind, eqCoreKindOfTyToken } from "./check_ty_relate"
 import {
   T,
+  TY_F32,
+  TY_F64,
+  TY_I32,
+  TY_I64,
   TY_NULL,
   TyArray,
   TyLit,
@@ -37669,8 +37673,34 @@ function emitBinOperandAs(
   emitExprAsI64(body, ix, fnIx, ec)
 }
 
-// `emitBinExprNode`'s numeric tail: a numeric union per member, then the f32, f64, i64 and
-// i32 operators, each operand coerced to the operator's width.
+// The scalar type an operand of a numeric operator has to the checker: its recorded type, a
+// literal or literal union peeled to its base.
+function binOperandScalarTy(ix: i32, fnIx: i32): i32 {
+  const t = nodeTyAt(ix, fnIx)
+  const p = tyScalarBasePrim(t)
+  const scalars: i32[] = [TY_I32, TY_I64, TY_F32, TY_F64]
+  let k = 0
+  while k < scalars.length {
+    if p != null && tyPrimNameOf(scalars[k]) == p { return scalars[k] }
+    k = k + 1
+  }
+  t
+}
+
+// The width a scalar numeric operator works at: the checker's pair rule over its operands
+// (`numPairOpTy`), or `i32` when an operand has no scalar type.
+function binNumWidth(e: BinExpr, fnIx: i32): string {
+  const t = numPairOpTy(
+    e,
+    binOperandScalarTy(e.binLeft, fnIx),
+    binOperandScalarTy(e.binRight, fnIx),
+  )
+  if t < 0 { return "i32" }
+  tyScalarBasePrim(t) ?? "i32"
+}
+
+// `emitBinExprNode`'s numeric tail: a numeric union per member, else the operator at the
+// checker's width (`binNumWidth`), each operand built or widened there.
 function emitBinNumeric(
   body: u8[],
   e: BinExpr,
@@ -37682,16 +37712,8 @@ function emitBinNumeric(
   if numUnionMinted && njDispatches(e, fnIx) {
     return emitNumUnionBin(body, e, exprIx, fnIx, ec)
   }
-  // Wide-scalar slices (f32, then f64, then i64 — one shape, three widths): if either operand
-  // is of the width, emit that width's instruction and coerce the other first
-  // (`emitExprAsF32`/`AsF64`/`AsI64`), covering both arithmetic and comparisons. The order is
-  // load-bearing — f32 first because a float literal is `exprIsF64` too (`x + 4.0` with `x: f32` must route to f32), then f64, then i64.
-  const lF32 = exprIsF32(e.binLeft, fnIx)
-  const rF32 = exprIsF32(e.binRight, fnIx)
-  // A GENUINE (non-literal) f64 operand makes the op f64 — the f32 side widens (`f32 + f64var`),
-  // so route to the f64 slice below instead of demoting the f64 here (which trapped). A float
-  // literal still adapts DOWN to the f32 operand, so `f32 + 1.0` stays on the f32 slice.
-  if (lF32 || rF32) && !binMixHardF64(e.binLeft, e.binRight, fnIx) {
+  const w = binNumWidth(e, fnIx)
+  if w == "f32" {
     // float remainder at f32 rides the f64 helper (D1586): an f32 operand is exact in f64,
     // the remainder of two f32-representable values is itself f32-representable, and every
     // step of the helper is exact — so promote / call / demote loses nothing. A second
@@ -37715,10 +37737,7 @@ function emitBinNumeric(
     fbI32Bin(opcF32)
     return 0
   }
-  // Slice 3 — f64.
-  const lF64 = exprIsF64(e.binLeft, fnIx)
-  const rF64 = exprIsF64(e.binRight, fnIx)
-  if lF64 || rF64 {
+  if w == "f64" {
     // float remainder — the one f64 operator with no instruction, so it calls the shared
     // `__f64_rem__` helper instead of taking an opcode from the table below (D1586).
     if e.binOp == "%" {
@@ -37737,10 +37756,7 @@ function emitBinNumeric(
     fbI32Bin(opcF)
     return 0
   }
-  // Slice 2 — i64 (also bitwise / shift).
-  const lI64 = exprIsI64(e.binLeft, fnIx)
-  const rI64 = exprIsI64(e.binRight, fnIx)
-  if lI64 || rI64 {
+  if w == "i64" {
     const sr64 = emitShiftMaskFold(body, e, exprIx, 64, fnIx, ec)
     if sr64 <= 0 { return sr64 }
     const opc64 = binOpcodeI64(e.binOp)
