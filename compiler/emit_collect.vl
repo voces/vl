@@ -102,7 +102,6 @@ import {
   tyIsMap,
   tyIsNulStringRep,
   tyIsOneStrLit,
-  tyIsTwinRecordUnion,
   tyLitMemberTexts,
   tyMembersDistinctRecords,
   tyNomNameCycled,
@@ -896,7 +895,6 @@ import {
 } from "./emit_union_atoms"
 import { mfRecordDst, mfRecordSrc } from "./emit_union_casts"
 import {
-  unNameAdoptKeyRow,
   unNameAdoptTyKeyRow,
   unRowOfTyKey,
   unTyKeyPushRow,
@@ -904,7 +902,6 @@ import {
   unTyKeySiteTag,
 } from "./emit_union_tykey"
 import {
-  isUKeyAB,
   isUNameAB,
   isUNameDeclAB,
   isUNameKeyAB,
@@ -915,7 +912,6 @@ import {
   unNameBound,
   unRowOfCanon,
   unRowOfKeyOrMembers,
-  unSiteOnSoftKey,
   unVarSliceAdoptKeySibling,
   unionAtomTysOf,
   unionMemberAtomsOf,
@@ -8981,12 +8977,7 @@ function registerInlineUnionGo(
     return 0
   }
   if ty < 0 && sty >= 0 { softKeyProbeNoTy(site, name, sty, stmts) }
-  if ty < 0 && sty >= 0 && unSiteOnSoftKey(site) {
-    const sk = softKeyOrNameKey(name, sty, stmts)
-    if isUKeyAB(site, name, sk) && unNameAdoptKeyRow(name, sk) { return 0 }
-  } else if isUNameKeyAB(site, name, ty) && unNameAdoptTyKeyRow(name, ty) {
-    return 0
-  }
+  if isUNameKeyAB(site, name, ty) && unNameAdoptTyKeyRow(name, ty) { return 0 }
   // A value union (`i32 | null`, `i32 | f64`) registers the name alone: its members are scalar
   // atoms riding shared value boxes, so it owns no variant structs and its slice is empty.
   if isValueUnionName(name) || nameIsLitUnionArmValueUnion(name) {
@@ -9013,7 +9004,26 @@ function registerInlineUnionGo(
   const mtys: i32[] = []
   unionAtomTysOf(sty, matoms, mtys)
   if !isVariantBoxUnionAtoms(stmts, matoms, mtys) { return 0 }
-  mintInlineUnion(stmts, name, ty)
+  // The row records the arena type its registrar holds; only the spelling family re-parses.
+  if !unSiteMintsFromSpelling(site) {
+    if ty < 0 {
+      return emitFail(
+        "emitProgram: inline union row has no arena type at registrar site "
+          + i32ToStr(site),
+      )
+    }
+    return mintInlineUnion(stmts, name, ty)
+  }
+  let mty = declTyIxOfName(name)
+  if mty < 0 { mty = ty }
+  mintInlineUnion(stmts, name, mty)
+}
+
+// Whether a row minted at `site` takes its arena type from its spelling's re-parse: an
+// annotation (41, 42) and the spelling registrar (46), whose held type keeps generic-application
+// and alias heads that render apart from the row's name (D14551).
+function unSiteMintsFromSpelling(site: i32): boolean {
+  site == 41 || site == 42 || site == 46
 }
 
 // Whether arena type `ty` is a union or a `| null`: the element or result a collection or a
@@ -9035,7 +9045,7 @@ function registerInlineUnionOfChild(stmts: i32[], cty: i32, site: i32): i32 {
   const nm = arenaEmitName(cty)
   if nm == "" { return 0 }
   riuOpenTys.push(cty)
-  const r = registerInlineUnionAt(stmts, nm, site, -1, cty)
+  const r = registerInlineUnionAt(stmts, nm, site, cty, cty)
   riuOpenTys.pop()
   r
 }
@@ -9118,7 +9128,7 @@ function registerCloResultUnion(stmts: i32[], rt: i32): i32 {
   const res = arenaEmitName(rt)
   if res == "" { return -2 }
   if isValueUnionName(res) || tyIsMapMemberUnion(rt) {
-    return registerInlineUnionAt(stmts, res, 34, -1, rt)
+    return registerInlineUnionAt(stmts, res, 34, rt, rt)
   }
   // A variant-box union result: the contextual pin covers it once registered, so the
   // annotated named-fn path lowers it; an arm the box still rejects stays loud.
@@ -9127,7 +9137,7 @@ function registerCloResultUnion(stmts: i32[], rt: i32): i32 {
   const raTys: i32[] = []
   unionAtomTysOf(rt, ra, raTys)
   if isVariantBoxUnionAtoms(stmts, ra, raTys) {
-    return registerInlineUnionAt(stmts, res, 35, -1, rt)
+    return registerInlineUnionAt(stmts, res, 35, rt, rt)
   }
   -2
 }
@@ -9192,22 +9202,15 @@ function registerAtomSubUnion(stmts: i32[], at: i32): i32 {
 // closure or a union that the outer union's own registration reaches.
 function atomHoldsNoSubUnion(): i32 { 0 }
 
-// `registerInlineUnionAt`'s mint: records `name` as a union row (its arena type from the
-// declaration, else `ty`), its struct variants and their fields, and the value, ref-array and
-// map arms' shapes. Returns 0, or -1 once failed.
+// `registerInlineUnionAt`'s mint: records `name` as a union row of arena type `ty`, its struct
+// variants and their fields, and the value, ref-array and map arms' shapes. Returns 0, or -1
+// once failed.
 function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
   // The arms' field unions must already be registered before this point — an interleaved
   // registration would corrupt this union's variant slice — which the arena-driven walk guarantees.
   uDeclared = true
   unNamesPush(name)
-  // B-1 step 1: resolve ONCE at mint, like `sTyIx` — from the name, else from the arena index
-  // the caller holds. An INFERRED union has no declaration for `declTyIxOfName` to find, so its
-  // row would carry -1 and `unRowOfCanon`, the one reader keyed on the arena rather than the
-  // spelling, could never match it (D1709).
-  let mintTyIx = declTyIxOfName(name)
-  if mintTyIx < 0 { mintTyIx = ty }
-  // Twin lone-literal arms render as one repeated shape, which re-parses to one record.
-  if ty >= 0 && tyIsTwinRecordUnion(ty) { mintTyIx = ty }
+  const mintTyIx = ty
   unTyIx.push(mintTyIx)
   unDeclIx.push(-1) // inline union: no declaration node
   unMemberSet.push(name)
@@ -9820,7 +9823,7 @@ function registerInferRetNominalUnion(stmts: i32[], nm: string, row: i32) {
   // A genuine union spelling the arena walk left unregistered is the anonymous-nominal
   // residual; a single-atom name has no top-level union to register.
   if inferRetAtomCountAt(row) >= 2 {
-    return registerInlineUnionAt(stmts, nm, 44, -1, rty)
+    return registerInlineUnionAt(stmts, nm, 44, rty, rty)
   }
   0
 }
@@ -10149,7 +10152,7 @@ export function collectU(stmts: i32[]) {
         const aety = arrLitElemTyIxOf(iau)
         if !(isUNameAB(24, aeu, aety) && unNameAdoptTyKeyRow(aeu, aety)) {
           if collectTyMembersReach(stmts, aety, 15, false) < 0 { return -1 }
-          if registerInlineUnionAt(stmts, aeu, 45, -1, aety) < 0 { return -1 }
+          if registerInlineUnionAt(stmts, aeu, 45, aety, aety) < 0 { return -1 }
         }
       }
       // The row above is named by the softened render, which dedupes and widens the members,
