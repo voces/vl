@@ -29,6 +29,10 @@ import {
   asgStripTys,
   asgStripTysPush,
   asgStripTysSetAt,
+  oerAsgDst,
+  oerBank,
+  oerIsPending,
+  oerNodes,
 } from "./check_asg_rows"
 import { assignableExpr } from "./check_assignable"
 import { recordCollapsedIsAt } from "./check_bind_rows"
@@ -84,7 +88,6 @@ import {
   daWriteTarget,
 } from "./check_definite"
 import {
-  arrDefOperandElemPeek,
   castConstDecide,
   castPropagationFits,
   cnhNullNote,
@@ -172,6 +175,7 @@ import { NAR_KIND_ASG, noteNarShadow } from "./check_nar_bank"
 import { isAsgNarrowedName } from "./check_nar_written"
 import {
   applyNarrows,
+  arrDefPinHoleElem,
   asgReadElemPin,
   asgYieldsPlaceTy,
   calleeWritePrePin,
@@ -198,7 +202,7 @@ import {
   fsbNoteStore,
   voidValueSlotErr,
 } from "./check_node_rules"
-import { nodeTyIxOf } from "./check_node_tys"
+import { nodeTyIxOf, nodeTySet } from "./check_node_tys"
 import {
   binLitShape,
   binShiftOp,
@@ -331,9 +335,11 @@ import {
   tyIsNumUnion,
 } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
+import { arrDefRowServed } from "./check_hole_links"
 import { fnDeclIx } from "./check_write_scan"
 import { identDeclOf, sidOfNode } from "./symbols"
 import {
+  arrElemValueTy,
   isLitBearing,
   isNullTy,
   isNumeric,
@@ -484,8 +490,13 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
 // recorded only when `!inferQuiet`, and a nested binary could have overwritten a module slot.
 export function checkBinExprNode(n: BinExpr, ix: i32) {
   const ltOut: i32[] = []
-  const bTy = checkBinExprNodeReal(n, ix, ltOut)
+  binRetTy(n, ix, checkBinExprNodeReal(n, ix, ltOut), ltOut)
+}
+
+// `checkBinExprNode`'s answer from the operator rules' type `bTy` and their `ltOut`.
+function binRetTy(n: BinExpr, ix: i32, bTy: i32, ltOut: i32[]) {
   if ltOut.length == 0 { return bTy }
+  if bTy < 0 && oerIsPending(ix) { return -1 }
   if n.binOp == "+" && !inferQuiet { plusLinkRecord(ix, ltOut[0]) }
   let wide = -1
   if ltOut.length > 1 { wide = ltOut[1] }
@@ -1435,13 +1446,7 @@ function binCheckLeftOperand(n: BinExpr, op: string): i32 {
   let lt = checkNodeHook(n.binLeft)
   daWriteTarget = savedWriteTarget
   getWriteTargetSet(savedGetWrite)
-  // An unpinned intrinsic element answers with the default it will get (D1566), except under
-  // `=`, whose Index case pins the element from the RHS instead — answering here would pre-empt that.
   if op != "=" {
-    if lt < 0 {
-      const peekL = arrDefOperandElemPeek(n.binLeft)
-      if peekL >= 0 { lt = peekL }
-    }
     // An operator reads a `const`'s literal as the `string` it is; the literal itself is
     // `nodeWideStrLitText`'s to answer, so no operator rule changes for it (D2157). A compare
     // decides once both sides are known (`eqKeepsWideLit`).
@@ -1510,12 +1515,6 @@ function binRefineOperands(
 ): boolean {
   let lt = sides[0]
   let rt = sides[1]
-  // The right operand takes the same answer, for the same reason: without it, an operator's
-  // annotated face runs while the un-annotated one is check-clean invalid wasm (D1566).
-  if rt < 0 {
-    const peekR = arrDefOperandElemPeek(n.binRight)
-    if peekR >= 0 { rt = peekR }
-  }
   if op == "==" || op == "!=" {
     if constLitNeverMeets(n.binLeft, lt, n.binRight, rt, op, ix) { return true }
     const keepL = eqKeepsWideLit(lt, rt)
@@ -1604,14 +1603,51 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   if op == "in" { return checkInOpNode(n, ix) }
   if op == "&&" || op == "||" { return checkLogicalBinNode(n, ix) }
   const savedLbiTgt = lbiWriteTgt
-  let lt = binCheckLeftOperand(n, op)
+  const lt = binCheckLeftOperand(n, op)
   ltOut.push(lt)
-  let rt = binCheckRightOperand(n, ix, op, lt, savedLbiTgt)
+  const rt = binCheckRightOperand(n, ix, op, lt, savedLbiTgt)
+  binTyOfSides(n, ix, lt, rt, ltOut)
+}
+
+// Whether `n` (at `ix`) waits on an open element operand: banked, and answered -1 until the last
+// pin (a compare answers boolean meanwhile and is only re-graded then).
+function binWaitsOnOpenElem(n: BinExpr, ix: i32, lt: i32, rt: i32): boolean {
+  const op = n.binOp
+  if op == "=" { return false }
+  const lp = lt < 0 && oerIsPending(n.binLeft)
+  const rp = rt < 0 && oerIsPending(n.binRight)
+  if !lp && !rp { return false }
+  oerBank(ix, !numCmpOp(op), inferQuiet)
+  true
+}
+
+// The value type store `n` (at `ix`) is checked with: `rt`, or, for a value that waits on an open
+// element, the place's storage type, which `resolveOpenElemReads` grades the pinned value against.
+function binAsgPendingRt(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
+  if rt >= 0 || !oerIsPending(n.binRight) { return rt }
+  let dst = writeStorageTy(n.binLeft)
+  if dst < 0 { dst = lt }
+  if dst < 0 || dst == TY_ERR { return rt }
+  oerAsgDst[ix] = dst
+  oerBank(ix, false, inferQuiet)
+  dst
+}
+
+// The type of `n` (at `ix`) over operand types `lt`/`rt`: the operator rules after both operands
+// are checked. Run at the check, and again by `resolveOpenElemReads` once an open operand is pinned.
+function binTyOfSides(n: BinExpr, ix: i32, lt0: i32, rt0: i32, ltOut: i32[]) {
+  const op = n.binOp
+  let lt = lt0
+  let rt = rt0
   const sides: i32[] = [lt, rt]
   if op != "=" {
     if binRefineOperands(n, ix, op, sides, ltOut) { return TY_BOOL }
     lt = sides[0]
     rt = sides[1]
+    if binWaitsOnOpenElem(n, ix, lt, rt) {
+      if numCmpOp(op) { return TY_BOOL }
+      return -1
+    }
   }
   if op == "??" { rt = binCoalesceDefaultTy(n, ix, lt, rt) }
   // Assignment is excluded: its destination is `assignableExpr`'s, which pins the narrowing
@@ -1667,7 +1703,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     return binNumUnionOpTy(n, ix, op, lt, rt)
   }
   // Assignment: RHS must be assignable to the LHS's (already-bound) type.
-  if op == "=" { return checkAssignBinNode(n, ix, lt, rt) }
+  if op == "=" {
+    return checkAssignBinNode(n, ix, lt, binAsgPendingRt(n, ix, lt, rt))
+  }
   // An unpinned element hole is `-1`, and every arm below indexes `T.tys` with it — guarded
   // here, below both the `=` arm's own pin and the operand peek, rather than trapping (D1462).
   if lt < 0 { return TY_ERR }
@@ -1932,13 +1970,19 @@ export function checkUnaryNode(n: Unary, ix: i32) {
     }
     return arg
   }
-  // The negation of an unpinned intrinsic element takes the default its binary siblings
-  // take (D1566), asked here (not above `!`) since `!a[0]` is admitted over an open operand today.
-  let arg2 = arg
-  if arg2 < 0 {
-    const peekU = arrDefOperandElemPeek(n.unArg)
-    if peekU >= 0 { arg2 = peekU }
+  // The negation of an open element waits for its pin as its binary siblings do, asked here
+  // (not above `!`) since `!a[0]` is admitted over an open operand today.
+  if arg < 0 && oerIsPending(n.unArg) {
+    oerBank(ix, true, inferQuiet)
+    return -1
   }
+  unTyOfArg(n, ix, arg)
+}
+
+// The type of unary `-`/`~` `n` (at `ix`) over operand type `arg`. Run at the check, and again
+// by `resolveOpenElemReads` once an open operand is pinned.
+function unTyOfArg(n: Unary, ix: i32, arg: i32) {
+  let arg2 = arg
   // A hole operand is numeric only at a pin that says so; the pin re-asks it (`OP_NEG`, or
   // `OP_BNOT` for `~`, which a float pin cannot satisfy).
   if arg2 >= 0 && !(tyAt(arg2) is TyPrim) && tyHasHole(arg2) {
@@ -2102,4 +2146,63 @@ export function checkIsExprNode(n: IsExpr, ix: i32) {
     }
   }
   return TY_BOOL
+}
+
+// Gives each banked open-element read its row's pinned element, then each operator over
+// one the type its rules give the resolved operands: one pass in bank order, which puts every
+// node after the nodes it reads (D14497). A row no pin reached leaves its readers at -1.
+export function resolveOpenElemReads() {
+  let i = 0
+  while i < oerNodes.length {
+    const ix = oerNodes[i]
+    const e = nodeAt(ix)
+    if e is Index {
+      const row = nodeTyIxOf(e.idxArr)
+      if row >= 0 && arrDefRowServed(row) { arrDefPinHoleElem(row) }
+      if row >= 0 {
+        const t = tyAt(row)
+        if t is TyArray {
+          if t.aElem >= 0 { nodeTySet(ix, arrElemValueTy(t.aElem)) }
+        }
+      }
+    } else if e is BinExpr && e.binOp == "=" {
+      const dst = oerAsgDst[ix] ?? -1
+      const rt = oerOperandTy(e.binRight)
+      if dst >= 0 && rt >= 0 && !assignable(rt, dst) {
+        tErr(letAssignMsg(e.binRight, rt, dst, "", -1), e.binRight)
+      }
+    } else if e is BinExpr {
+      const lt = oerOperandTy(e.binLeft)
+      const rt = oerOperandTy(e.binRight)
+      if lt >= 0 && rt >= 0 {
+        const ltOut: i32[] = [lt]
+        nodeTySet(
+          ix,
+          binRetTy(e, ix, binTyOfSides(e, ix, lt, rt, ltOut), ltOut),
+        )
+      }
+    } else if e is Unary {
+      const at = oerOperandTy(e.unArg)
+      if at >= 0 { nodeTySet(ix, unTyOfArg(e, ix, at)) }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The resolved type of operand `ix`, which the parentheses around it take too.
+function oerOperandTy(ix: i32): i32 {
+  const inner = parenPeelIx(ix)
+  const t = nodeTyIxOf(inner)
+  let cur = ix
+  while cur != inner && cur >= 0 {
+    const p = nodeAt(cur)
+    if p is Paren {
+      if t >= 0 { nodeTySet(cur, t) }
+      cur = p.parInner
+    } else {
+      cur = inner
+    }
+  }
+  t
 }
