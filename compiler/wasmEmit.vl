@@ -878,7 +878,6 @@ import {
   fnIndexOf,
   fnIndexOfAt,
   fnIndexOfNode,
-  fnRetExprOf,
   fnRetRArrElemTy,
   fnReturnsLitAtom,
   forInElemKind,
@@ -913,10 +912,8 @@ import {
   letInitUnionListTy,
   letIsF64,
   letIsI64,
-  letIsMap,
   letIsNulNone,
   letIsNulString,
-  letMapShapeOf,
   letNulBool,
   letNulLitUnion,
   letNulMapReadUnionBox,
@@ -926,7 +923,6 @@ import {
   mapReadNarrowableSlot,
   mapReadNarrowedAtomKind,
   mapReadNarrowedContainer,
-  mapRetExprShape,
   mapShapeOfExpr,
   memNarrowAtomKind,
   memReadBoxNarrowName,
@@ -1143,7 +1139,6 @@ import {
 } from "./emit_map_value_slots"
 import {
   mvListValKind,
-  mvValIsMap,
   refPushScratchBaseFor,
   scopeBind,
   scopePop,
@@ -1178,7 +1173,6 @@ import {
   nulScalarListKindOfNode,
   nulVariantIndexOf,
   paramStructIdxOf,
-  retMapFlag,
   retNulMapFlag,
   retNulRefArrFlag,
   retNulRefFlag,
@@ -1232,7 +1226,7 @@ import { internInlineShapeTy } from "./emit_shape_intern"
 import {
   ALK_F64,
   ALK_I64,
-  mvInnerMapShape,
+  mapCtorShapeOf,
   mvSlotNullable,
   mvValStructIdxOf,
   mvValVariantOf,
@@ -1318,7 +1312,6 @@ import {
   mapShapeOfTyPeeled,
   mapValueTyOf,
   nliNameOf,
-  rlElemMapShape,
   unionArmTyOfAtom,
   unionClosureArmName,
   unionClosureArmTy,
@@ -1952,16 +1945,9 @@ function emitStructFieldValueUnder(
       if nraF is NullLit { c.nulRefHeap = rlWrapIdx[fslot28] }
     }
   } else if scode == FC_NUL_MAP {
-    // a `Map()` value builds this field's own value-typed map struct (the map seed, as
-    // code 19); a bare `null` refs the same map struct.
-    const mslot29 = sFieldMapShape(si, fi)
-    c.mapSlot = mslot29
-    c.nulRefHeap = mapTypeIdxOf(mslot29)
+    // a bare `null` refs this field's own value-typed map struct.
+    c.nulRefHeap = mapTypeIdxOf(sFieldMapShape(si, fi))
   }
-
-  // a code-19 field seeds the map shape so a `Map()` value constructs this field's own
-  // value-typed map struct, not the mono string-keyed map.
-  if scode == FC_MAP { c.mapSlot = sFieldMapShape(si, fi) }
   expCtxApply(c, ec)
 
   if scode == FC_UNION {
@@ -2747,14 +2733,10 @@ function emitVariantFieldValueUnder(
     const vnslV = nodeAt(unwrapParen(valIx))
     if vnslV is NullLit { c.nulRefHeap = nulScalarListFieldWrapHeap(vcode) }
   } else if vcode == FC_NUL_MAP {
-    const vmslot29 = uFieldMapShape(vi, fj)
-    c.mapSlot = vmslot29
-    c.nulRefHeap = mapTypeIdxOf(vmslot29)
+    c.nulRefHeap = mapTypeIdxOf(uFieldMapShape(vi, fj))
   } else if fieldCodeScalarListBuildKind(vcode) >= 0 {
     c.listKind = fieldCodeScalarListBuildKind(vcode)
   }
-
-  if vcode == FC_MAP { c.mapSlot = uFieldMapShape(vi, fj) }
   expCtxApply(c, ec)
 
   if vcode == FC_F64 {
@@ -12946,11 +12928,6 @@ function emitArrRefElem(
   const elLK = refElemListBuildKind(rslot)
   if elLK >= 0 { elCtx.listKind = elLK }
   if elemNest == RLK_REF_LIST { elCtx.listSlot = nestInnerSlot }
-  // A map element (kind 3): a `Map()` element builds this element's map struct — the
-  // literal twin of the `.push` and indexed-assign seed in `refElemValueCtx`, and the
-  // site the whole list-of-maps family runs through. Unseeded, the element `Map()` builds
-  // the mono map struct into a backing typed to the element's own struct.
-  if elemNest == RLK_MAP { elCtx.mapSlot = rlElemMapShape(rslot) }
   const elIsBareNull = nodeAt(unwrapParen(e)) is NullLit
   if elIsBareNull { arrRefNullSeed(elCtx, rslot, elemNest, nestInnerSlot) }
   if elemVariantIdx >= 0 && rlElemNullable[rslot] != 1 {
@@ -13540,11 +13517,13 @@ function failMapValueType() {
 
 // Construct an EMPTY map `Map()` onto `body`: two empty lists (each `array.new_fixed`
 // count 0, wrapped `{ backing, len=0, cap=0 }`), boxed into the map struct.
-function emitMapNew(_body: u8[], ec: ExpCtx) {
+function emitMapNew(exprIx: i32, fnIx: i32) {
   if !mUsed { return emitFail("emitProgram: Map() but map type not collected") }
-  // The binding-seeded map SHAPE (consumed here): -1/-2 build the mono map; an mv
-  // slot >= 0 builds THIS value type's map struct over its ref vals list.
-  let slot = expCtxTakeMapSlot(ec)
+  // The shape of the map type the call is stamped with (D14226), keyed as its receivers key it
+  // (D14229): -1/-2 the mono map, an mv slot >= 0 THIS value type's map struct. A call whose
+  // type still holds a hole has no stamp, and builds as its binding's receivers read it.
+  const mt = litRepTyAt(exprIx, fnIx)
+  let slot = if mt >= 0 { mapCtorShapeOf(exprIx, mt) } else { mapShapeOfExpr(exprIx, fnIx) }
   if slot == -3 { return failMapValueType() }
   if slot == -2 { slot = -1 }
   if slot == -5 { slot = -4 }
@@ -13730,11 +13709,6 @@ function emitMapValDefault(
   if isScalarBackedListRep(lvk) {
     dfCtx.listKind = listBuildKindOfVKind(lvk, -1)
   }
-  // A nested-map value (`{[K]: {[K2]: V}}`) seeds `dfCtx.mapSlot` via `mvInnerMapShape`,
-  // matching `emitMapSetV`'s store boundary — store and default write into the same vals
-  // cell, so an unseeded `Map()` default would build the ambient mono map struct into a
-  // slot typed for the inner map: invalid wasm.
-  if mvValIsMap(mslot) { dfCtx.mapSlot = mvInnerMapShape(mslot) }
   // A bare `null` default (`m[k] ?? null` typing `S | null`) lowers as `ref.null <elem>`,
   // whether or not the slot's value type is itself nullable (D2247).
   if mvSlotNullable(mslot) || defExprNullable(defIx) {
@@ -15050,11 +15024,6 @@ function emitMapSetValExpr(
     svCtx.nulRefHeap = mvValElemHeapOf(mslot)
     if mvValKind[mslot] == MVK_STR { svCtx.nulString = true }
   }
-  // A nested-map value seeds `svCtx.mapSlot` (mirroring `emitMapValDefault`'s read-side
-  // seed) so a `Map()` value `struct.new`s the map struct this slot's vals element is
-  // typed to, not the ambient mono one. The seed must land in the context, not a global:
-  // `emitExprExpect` overwrites the whole context from its own snapshot.
-  if mvValIsMap(mslot) { svCtx.mapSlot = mvInnerMapShape(mslot) }
   // A literal-union atom stored into a string-valued map widens to its member string: the
   // vals element is `(ref null $aTypeIdx)` while the atom's rep is an i32 id, so without
   // this the store is a type mismatch — invalid wasm. Gated on `!atomVal`, since an
@@ -26440,10 +26409,7 @@ function emitAssignGlobal(
     gaCtx.listKind = letAnnRefListKind(gLet)
     gaCtx.listSlot = letAnnRefListSlot(gLet)
     // an empty-`[]`-initialized `S[] | null` global's mono-i32-list misread is
-    // `exprArray`/`exprRefArray`'s bug in `emit_classify.vl`, not these seeds'. A
-    // map-typed global seeds the map shape, so a bare `Map()` RHS constructs this
-    // binding's map struct instead of the shared mono one.
-    if exprMap(lhsIx, fnIx) { gaCtx.mapSlot = mapShapeOfExpr(lhsIx, fnIx) }
+    // `exprArray`/`exprRefArray`'s bug in `emit_classify.vl`, not these seeds'.
     expCtxApply(gaCtx, ec)
     // a union-typed global (kind 4) coerces a raw assigned value into the box; three
     // shapes are not that: a literal-union global's cell is a plain `(mut i32)` atom,
@@ -26655,10 +26621,7 @@ function emitAssignIdent(
   }
   const idx = localIndexOf(fnIx, target.identName)
   if idx < 0 { return emitAssignGlobal(body, a, lhsIx, fnIx, ec) }
-  // a map-typed local seeds the map shape for a bare `Map()` RHS, exactly as the
-  // global arm above.
   const laCtx = expCtxHere(ec)
-  if exprMap(lhsIx, fnIx) { laCtx.mapSlot = mapShapeOfExpr(lhsIx, fnIx) }
   // the list seeds a local target needs, keyed off the target expression
   // (`exprListCellBuildKind`) since a declared local has no `LetDecl` left to read and
   // a param never had one — else a list-literal RHS builds the default i32 list into a
@@ -27275,10 +27238,6 @@ function emitAssignMember(
   if seedFieldListBuild(fsCtx, fscode, sFieldRefSlot(si, fieldIdx)) < 0 {
     return -1
   }
-  // A MAP-typed field (code 19) seeds the map SHAPE — the write twin of `emitObj`'s
-  // construct-side seed, carrying the same defect the ident arms above describe.
-  fsCtx.mapSlot = -1
-  if fscode == FC_MAP { fsCtx.mapSlot = sFieldMapShape(si, fieldIdx) }
   expCtxApply(fsCtx, ec)
   if (
     emitStructFieldStoreValue(body, si, fieldIdx, fscode, a.binRight, fnIx, ec)
@@ -27372,11 +27331,6 @@ function refElemValueCtx(rslot: i32, ec: ExpCtx): ExpCtx {
     // A nullable-MAP element (kind 3): `ref.null` of the element's own map struct.
     if k == RLK_MAP { c.nulRefHeap = rlElemHeap[rslot] }
   }
-  // a map element (kind 3): a `Map()` value builds the element's own map struct, not the
-  // ambient one — else `xs.push(Map())` over `{[string]: V}[]` `struct.new`s the mono map
-  // into a backing typed to the element's struct, invalid wasm. Inert for a non-`Map()`
-  // value; only `emitMapNew` reads and clears the seed.
-  if k == RLK_MAP { c.mapSlot = rlElemMapShape(rslot) }
   c
 }
 
@@ -30467,16 +30421,10 @@ function emitReturnSeedCtx(
         const nvr = fRetStructIdx[fnPos]
         if nvr >= 0 && nvr < uVarHeap.length { ctx.nulRefHeap = uVarHeap[nvr] }
       }
-      // D937 — the nullable-map twin of the arm above: the seed is `ec.nulRefHeap`, with
-      // `ec.mapSlot` seeded beside it so a returned `Map()` builds the same struct
-      // the bare `null` is typed against.
+      // D956 — the nullable-map twin of the arm above: a bare `return null` is typed at the
+      // map's own value slot, as a `{[string]: string} | null` return needs.
       if fRetKind[fnPos] == "nulmap" {
-        // D956 — the map's own value slot, not the mono `$mapStruct` D937 assumed: a
-        // `{[string]: string} | null` return needs its own slot, from the same home that
-        // also seeds the constructor inside the body.
-        const nmSlot = inferredRetMapSlot(fnPos)
-        ctx.mapSlot = nmSlot
-        ctx.nulRefHeap = mapTypeIdxOf(nmSlot)
+        ctx.nulRefHeap = mapTypeIdxOf(inferredRetMapSlot(fnPos))
       }
     }
   }
@@ -30555,8 +30503,6 @@ function emitReturnPlainValue(
   retNulRefArrHeap: i32,
   retNulMap: boolean,
   retNulMapShape: i32,
-  retMap: boolean,
-  retMapShape: i32,
   retNulSLKind: VKind | null,
   retLitUnion: boolean,
   retNulLitUnion: boolean,
@@ -30574,17 +30520,9 @@ function emitReturnPlainValue(
       retCtx.nulRefHeap = retNulRefArrHeap
     }
   }
-  // A nulmap return: a `return null` is `ref.null $mapStruct` (`nulRefHeap`), a `return Map()`
-  // builds THIS map's struct (`mapSlot`). A `return m` (a map variable) self-identifies and
-  // subtypes the nullable result.
-  if retNulMap {
-    retCtx.nulRefHeap = mapTypeIdxOf(retNulMapShape)
-    retCtx.mapSlot = retNulMapShape
-  }
-  // a bare map return: a `return Map()` builds this map's own `$mapStruct`, the same
-  // seed the let/global/field constructor sites thread — else the constructor reads the
-  // ambient `ec.mapSlot` (the mono i32 map) while the functype declares the value-typed struct.
-  if retMap { retCtx.mapSlot = retMapShape }
+  // A nulmap return: a `return null` is `ref.null $mapStruct` (`nulRefHeap`). A `return m` (a
+  // map variable) self-identifies and subtypes the nullable result.
+  if retNulMap { retCtx.nulRefHeap = mapTypeIdxOf(retNulMapShape) }
   // A DISTINCT-backing nullable scalar list return: a `return [x]` builds the leaf list
   // (`listKind`, which subtypes the nullable result), a `return null` is `ref.null $wrapper`.
   if retNulSLKind != null {
@@ -30728,9 +30666,6 @@ type RetFlags = {
   // `{[string]: V} | null`: a `return null` is `ref.null` of this map shape's struct.
   retNulMap: boolean,
   retNulMapShape: i32,
-  // `{[string]: V}`: a `return Map()` builds this shape's `$mapStruct`, not the mono one.
-  retMap: boolean,
-  retMapShape: i32,
   retNulSLKind: VKind | null,
   retLitUnion: boolean,
   retNulLitUnion: boolean,
@@ -30850,23 +30785,6 @@ function retFlagsSeedNiches(
     rf.retNulMap = true
     rf.retNulMapShape = mapAnnShape(fn.fnRet)
   }
-  if retMapFlag(fn.fnRet) == 1 {
-    rf.retMap = true
-    rf.retMapShape = mapAnnShape(fn.fnRet)
-  }
-  // the inferred dual of the arm above: an un-annotated map return (`function mk() {
-  // return Map() }`) has no annotation for `retMapFlag` to read, so a bare `Map()` would
-  // build the mono struct while the functype declares the value-typed one. The shape
-  // comes from the same chokepoint the result valtype does (`mapRetExprShape`).
-  if fn.fnRet < 0 && fnPos >= 0 {
-    if fRetKind[fnPos] == "map" {
-      const imrx = fnRetExprOf(fnIx)
-      if imrx >= 0 {
-        rf.retMap = true
-        rf.retMapShape = mapRetExprShape(imrx, fnPos)
-      }
-    }
-  }
   rf.retNulSLKind = nulScalarListKindOfNode(fn.fnRet)
   if nodeTyIsLitUnionAlias(fn.fnRet) { rf.retLitUnion = true }
   // A synthesized `: K` (a lambda pinned at its alias) is typed at the alias's copy, which
@@ -30930,8 +30848,6 @@ function emitReturnValueTail(
     retNulRefArrHeap: -1,
     retNulMap: false,
     retNulMapShape: -1,
-    retMap: false,
-    retMapShape: -1,
     retNulSLKind: null,
     retLitUnion: false,
     retNulLitUnion: false,
@@ -30993,8 +30909,6 @@ function emitReturnValueTail(
         rf.retNulRefArrHeap,
         rf.retNulMap,
         rf.retNulMapShape,
-        rf.retMap,
-        rf.retMapShape,
         rf.retNulSLKind,
         rf.retLitUnion,
         rf.retNulLitUnion,
@@ -31782,14 +31696,11 @@ function emitLetDeclStmt(
   // but an actual null value never lowered).
   const letNulList15 = localIsRef[slot] == "nullist"
   const ctx = letInitCtxOf(s, stmtIx, fnIx, slot, ec)
-  // A NULLABLE map binding (`let m: {[string]: V} | null = …`, slot kind `nulmap`): a `Map()` init
-  // builds THIS map's struct (`ec.mapSlot` = the shape), and a bare `null` init lowers as
-  // `ref.null $mapStruct` (`ec.nulRefHeap` = the map heap type, the generic ref-null seed). The
-  // map twin of the kind-9 nulstruct seed `letInitCtxOf` makes.
+  // A NULLABLE map binding (`let m: {[string]: V} | null = …`, slot kind `nulmap`): a bare `null`
+  // init lowers as `ref.null $mapStruct` (`ec.nulRefHeap` = the map heap type). The map twin of
+  // the kind-9 nulstruct seed `letInitCtxOf` makes.
   if localIsRef[slot] == "nulmap" {
-    const nmShape = nulMapShapeOf(stmtIx, fnIx)
-    ctx.mapSlot = nmShape
-    ctx.nulRefHeap = mapTypeIdxOf(nmShape)
+    ctx.nulRefHeap = mapTypeIdxOf(nulMapShapeOf(stmtIx, fnIx))
   }
   // The init emits under `ctx`; every exit below restores the caller's context.
   const saved = expCtxHere(ec)
@@ -31993,9 +31904,6 @@ function letInitCtxOf(
   if ctx.listKind == LBK_I32_LIST && letInfStrListByUseV(stmtIx, fnIx) {
     ctx.listKind = LBK_STR_LIST
   }
-  // A map-typed binding seeds the map SHAPE so a `Map()` initializer constructs
-  // THIS binding's map struct (mono, or the annotation's ref-valued mv slot).
-  if letIsMap(stmtIx, fnIx) { ctx.mapSlot = letMapShapeOf(stmtIx, fnIx) }
   ctx
 }
 
@@ -35355,7 +35263,6 @@ export function emitUserGlobalSet(gi: i32) {
 export type ExpCtx = {
   listKind: i32,        // what an empty `[]` builds (an `LBK_*` code)
   listSlot: i32,        // WHICH ref-list element type
-  mapSlot: i32,         // the map shape a `Map()` builds; -1 mono, -2 a Set
   wantI64: boolean,     // a NumLit lowers as i64.const
   wantF32: boolean,     // a NumLit lowers as f32.const
   wantF64: boolean,     // an integer NumLit lowers as f64.const
@@ -35375,7 +35282,6 @@ export function expCtxDefault(): ExpCtx {
   const c: ExpCtx = {
     listKind: 0,
     listSlot: 0,
-    mapSlot: -1,
     wantI64: false,
     wantF32: false,
     wantF64: false,
@@ -35402,7 +35308,6 @@ export function expCtxHere(ec: ExpCtx): ExpCtx {
   const c: ExpCtx = {
     listKind: ec.listKind,
     listSlot: ec.listSlot,
-    mapSlot: ec.mapSlot,
     wantI64: ec.wantI64,
     wantF32: ec.wantF32,
     wantF64: ec.wantF64,
@@ -35425,7 +35330,6 @@ export function expCtxHere(ec: ExpCtx): ExpCtx {
 function expCtxSeedValueArg(c: ExpCtx, pk: VKind | null, slot: i32) {
   c.listKind = listBuildKindOfVKind(pk, slot)
   c.listSlot = 0
-  c.mapSlot = -1
   c.wantI64 = false
   // A `null`-typed parameter takes a bare `null` as `ref.null none` (D4550).
   c.nulNone = pk == "nulnone"
@@ -35438,10 +35342,7 @@ function expCtxSeedValueArg(c: ExpCtx, pk: VKind | null, slot: i32) {
       c.listKind = listBuildKindOfVKind("reflist", slot)
       if slot >= 0 { c.listSlot = slot }
     }
-    "map" | "nulmap" => {
-      c.mapSlot = slot
-    }
-    "struct" | "nulstruct" | "variant" | "nulvariant" | "strlist" | "f64list" | "i64list" | "f32list" | "u8list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "list" | "nullist" | "i32" | "str" | "union" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulnone" | null => {
+    "map" | "nulmap" | "struct" | "nulstruct" | "variant" | "nulvariant" | "strlist" | "f64list" | "i64list" | "f32list" | "u8list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "list" | "nullist" | "i32" | "str" | "union" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulnone" | null => {
       // No other kind carries a container slot a literal argument builds at.
     }
   }
@@ -35476,7 +35377,6 @@ function seedParamArgShape(paramIx: i32, ec: ExpCtx) {
 export function expCtxApply(c: ExpCtx, ec: ExpCtx) {
   ec.listKind = c.listKind
   ec.listSlot = c.listSlot
-  ec.mapSlot = c.mapSlot
   ec.wantI64 = c.wantI64
   ec.wantF32 = c.wantF32
   ec.wantF64 = c.wantF64
@@ -35641,15 +35541,6 @@ function expCtxSetListBuild(kind: i32, slot: i32, ec: ExpCtx) {
   c.listSlot = slot
   expCtxApply(c, ec)
   0
-}
-
-// Consumes the map-shape seed a `Map()` builds: returns it and resets it to -1.
-function expCtxTakeMapSlot(ec: ExpCtx): i32 {
-  const c = expCtxHere(ec)
-  const was = c.mapSlot
-  c.mapSlot = -1
-  expCtxApply(c, ec)
-  was
 }
 
 // Consumes the heap a bare `null` refs: returns it and resets it to -1.
@@ -36990,7 +36881,7 @@ function emitCallNode(body: u8[], e: Call, exprIx: i32, fnIx: i32, ec: ExpCtx) {
     // of calling it. A real constructor resolves to no function, so the lookup separates them.
     if fnIndexOfNode(e.callFn) < 0 {
       if callee.identName == "Map" || callee.identName == "Set" {
-        return emitMapNew(body, ec)
+        return emitMapNew(exprIx, fnIx)
       }
     }
   }
@@ -38947,7 +38838,6 @@ function emitDirectCallArgsUnder(
   argBase.listKind = LBK_I32_LIST
   argBase.listSlot = 0
   argBase.wantI64 = false
-  argBase.mapSlot = -1
   let i = 0
   while i < args.length {
     expCtxApply(argBase, ec)
@@ -39233,11 +39123,6 @@ function directArgSeedsOf(target: i32, i: i32, ac: ExpCtx): DirectArgSeeds {
       // map-value argument is a variable that self-identifies its shape (`exprMap`), so it ignores
       // the seed.
       if cpK == "nulmap" { ac.nulRefHeap = mapTypeIdxOf(cpRow) }
-      // D1223 — the `Map()` constructor's shape at the argument boundary, the seed its
-      // sibling deliveries all have (`emitLetDeclStmt`'s annotation, `emitAssign`'s global
-      // cell, `emitReturnValue`'s `retMap` arm). Without it `take(Map())` read the ambient -1
-      // (the mono i32 map) while the param slot is the value-typed map struct: check-clean invalid wasm for every non-mono value type.
-      if cpK == "map" || cpK == "nulmap" { ac.mapSlot = cpRow }
       cRecoverKind = cpK
       if cpK == "variant" { cVi = cpRow }
       if cpK == "union" {
@@ -42141,14 +42026,12 @@ function emitCoalesceNullableRefs(
     let cms = mapShapeOfExpr(e.binLeft, fnIx)
     if cms == -3 { cms = mapShapeOfTyPeeled(nodeTyIxOf(e.binLeft)) }
     if cms != -3 {
-      const mDefCtx = expCtxHere(ec)
-      mDefCtx.mapSlot = cms
       return emitCoalesceNulRef(
         body,
         e,
         exprIx,
         mapTypeIdxOf(cms),
-        mDefCtx,
+        expCtxHere(ec),
         fnIx,
         ec,
       )
