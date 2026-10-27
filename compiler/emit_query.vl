@@ -57,6 +57,7 @@ import {
   nodeChildren,
 } from "./ast"
 import { numLexIs2Pow31, numLexIsFloat, parseI64Pair } from "./emit_bignum"
+import { cexLitPeel, intLitIsNegated } from "./check_num_lits"
 import {
   ALLOC_LIT_CHUNK,
   isConstInit,
@@ -614,7 +615,7 @@ function constFoldExpr(ix: i32, wide: boolean, budget: i32): ConstFold {
   if (wide && tn != "i64") || (!wide && tn != "i32") { return cfNo() }
   if e is Ident { return constFoldIdent(ix, wide, budget) }
   if e is Unary {
-    if constFoldNegLit(ix) >= 0 { return constFoldNegLitAt(ix, wide) }
+    if cexLitPeel(ix) >= 0 { return constFoldLitAt(ix, wide) }
     const a = constFoldExpr(e.unArg, wide, budget - 1)
     if !a.cfOk { return a }
     if e.unOp == "-" {
@@ -649,14 +650,12 @@ function constFoldCast(
   // A literal operand, negated or not, is converted from its full magnitude, as the emitter
   // builds it at the cast's source width.
   let from = nodeTyPrimName(e.asObj)
-  const lit = nodeAt(unwrapParen(e.asObj))
-  if lit is NumLit { from = "i64" }
-  const neg = constFoldNegLit(e.asObj)
-  if neg >= 0 { from = "i64" }
+  const lit = cexLitPeel(e.asObj) >= 0
+  if lit { from = "i64" }
   if from != "i32" && from != "i64" { return cfNo() }
   let a = cfNo()
-  if neg >= 0 {
-    a = cfStep(constFoldNegLitAt(e.asObj, from == "i64"))
+  if lit {
+    a = cfStep(constFoldLitAt(e.asObj, from == "i64"))
   } else {
     a = cfStep(constFoldExpr(e.asObj, from == "i64", budget - 1))
   }
@@ -667,19 +666,6 @@ function constFoldCast(
   lo
 }
 
-// The literal under `ix` when `ix` is `-` of an integer literal, through parentheses, else -1.
-function constFoldNegLit(ix: i32): i32 {
-  const u = nodeAt(unwrapParen(ix))
-  if u is Unary {
-    if u.unOp != "-" { return -1 }
-    const k = unwrapParen(u.unArg)
-    if k < 0 || k >= P.nodes.length { return -1 }
-    const lit = nodeAt(k)
-    if lit is NumLit { return k }
-  }
-  -1
-}
-
 // Whether the integer literal at `ix` is an i64: the emitter builds it as `i64.const`, and a
 // `-` in front of it negates that value, not its low 32 bits.
 function constFoldLitWide(ix: i32): boolean {
@@ -687,21 +673,20 @@ function constFoldLitWide(ix: i32): boolean {
   numLitWidth(ix, -1) == "i64"
 }
 
-// `-literal` at `ix` folded at i64 when `wide`: the negated literal's full value, which at i32
-// is refused unless it fits (`-2147483648` does).
-function constFoldNegLitAt(ix: i32, wide: boolean): ConstFold {
-  const k = constFoldNegLit(ix)
+// The literal under parentheses and minuses at `ix`, folded at i64 when `wide`: its full value,
+// signed, which at i32 is refused for an i64 literal unless the negation fits (`-2147483648`).
+function constFoldLitAt(ix: i32, wide: boolean): ConstFold {
+  const k = cexLitPeel(ix)
   if k < 0 { return cfNo() }
   const lit = nodeAt(k)
-  if lit is NumLit {
-    if !wide && constFoldLitWide(k) && !numLexIs2Pow31(lit.numText) {
-      return cfNo()
-    }
-    const a = constFoldLit(lit.numText, true)
-    if !a.cfOk { return a }
-    return constFoldWrap((0 as i64) - a.cfV, wide, 2)
+  if !(lit is NumLit) { return cfNo() }
+  const neg = intLitIsNegated(ix)
+  if !wide && constFoldLitWide(k) && !(neg && numLexIs2Pow31(lit.numText)) {
+    return cfNo()
   }
-  cfNo()
+  const a = constFoldLit(lit.numText, true)
+  if !a.cfOk || !neg { return constFoldWrap(a.cfV, wide, 2) }
+  constFoldWrap((0 as i64) - a.cfV, wide, 2)
 }
 
 // `a` with one more visited node charged to it.
