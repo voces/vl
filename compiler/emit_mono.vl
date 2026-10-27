@@ -5647,6 +5647,9 @@ function monoPinBodyLambdasRaw(
   if n is BinExpr && n.binOp == "??" && monoPinHoleN.length > 0 {
     monoHoleCoalUnion(ix)
   }
+  if n is BinExpr && n.binOp == "??" {
+    rb = monoPinCoalListDefault(ix, rb, bN, bT)
+  }
   if sink { rb = monoPinCoalJoin(ix, rb, bN, bT) }
   if numUnionMinted { rb = monoNumUnionOpPin(ix, rb, bN, bT) }
   rb
@@ -5880,6 +5883,45 @@ function monoHoleCoalUnion(ix: i32) {
   const name = valueUnionRetName(j)
   if name == "" { return 0 }
   monoRegisterPinUnion(name, j)
+}
+
+// A `??` at `ix`, rebuilt as `rb`, whose default is an open list literal: a copy whose default
+// is built at the pinned operand's non-null list type, so both arms are one list row. `rb`
+// unchanged where the operand's pinned type is not a closed list.
+function monoPinCoalListDefault(
+  ix: i32,
+  rb: i32,
+  bN: string[],
+  bT: i32[],
+): i32 {
+  const n = nodeAt(ix)
+  const r = nodeAt(rb)
+  if !(n is BinExpr) || !(r is BinExpr) { return rb }
+  if n.binCompound != "" || r.binCompound != "" { return rb }
+  const rx = r.binRight
+  if rx < 0 || !(nodeAt(rx) is ArrayLit) || !monoTyOpen(nodeTyIxOf(rx)) {
+    return rb
+  }
+  const lt = nodeTyIxOf(n.binLeft)
+  if lt < 0 || lt >= T.tys.length { return rb }
+  let pl = monoPinArmSubst(lt, bN, bT)
+  if pl < 0 && monoPinHoleN.length > 0 {
+    // An operand typed at the instance's holes, which `bN` does not name.
+    const jN: string[] = []
+    const jT: i32[] = []
+    monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
+    pl = monoSubstInst(lt, jN, jT)
+  }
+  if pl < 0 || pl >= T.tys.length || tyHasTyVar(pl) { return rb }
+  const pnn = nonNullTy(pl)
+  if pnn < 0 || pnn >= T.tys.length || !(tyAt(pnn) is TyArray) { return rb }
+  const nr = monoExprRemake(rx, monoExprKids(rx))
+  if nr == rx { return rb }
+  monoPinRecordTy(nr, pnn)
+  const nb = monoExprRemake(rb, [r.binLeft, nr])
+  if nb == rb { return rb }
+  nodeTyCarry(nb, rb)
+  nb
 }
 
 // `monoIfArmsPinJoin` for a `??` at `ix`, rebuilt as `rb`: where its sides' pinned types join
@@ -17896,6 +17938,9 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
       if monoIsMapValueRead(unwrapParen(n.binLeft), d.letName, fld, ctx, at) {
         if monoTyOpen(rty) || sigKeyOfTy(rty) == sigKeyOfTy(ft) {
           nodeTyRecord(ix, ft)
+          // An open list literal fallback is built at the value it stands in for.
+          const rx = unwrapParen(n.binRight)
+          if rx >= 0 && nodeAt(rx) is ArrayLit { monoRecordOpen(rx, ft, ctx) }
         } else if monoFnValueAgreesAt(n.binRight, ft) {
           nodeTyRecord(ix, ft)
           nodeTyRecord(n.binRight, ft)
@@ -22530,6 +22575,20 @@ function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
   nm
 }
 
+// Types the list literal `x` handed to the stub pin `st`, and each row literal of it, at the
+// pin's lists, so each builds at the row the parameter reads.
+function monoStubListRecord(x: i32, st: i32, ctx: i32) {
+  const ax = unwrapParen(x)
+  if ax < 0 || st < 0 || !(nodeAt(ax) is ArrayLit) { return 0 }
+  monoRecordOpen(ax, st, ctx)
+  const al = nodeAt(ax)
+  const it = tyArrayElemIx(st)
+  if al is ArrayLit && it >= 0 && tyAt(it) is TyArray {
+    for e in al.arrElems { monoRecordOpen(unwrapParen(e), it, ctx) }
+  }
+  0
+}
+
 // Appends to `fes` each hole function value `v` can be, and to `at` the name reading it: `v`
 // names one, is an un-annotated `const` binding whose initializer can only be such, is an `if`
 // whose arms can only be such, or calls a function every value it returns can be (D6911). False
@@ -23217,6 +23276,7 @@ function monoPinHoleParam(
     const inTy: i32[] = [0 - 1]
     an = monoInertParamStubPin(oDecl, args[i], inTy)
     anTy = inTy[0]
+    if an != "" { monoStubListRecord(args[i], anTy, ctx) }
   }
   let guessed = false
   if an == "" {

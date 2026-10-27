@@ -170,16 +170,15 @@ Measure:
 
 The row names `letListBuildKind` and `letListBuildSlot`; #2567 merged both into
 `letListBuild`, which returns a `ListBuild`. Re-measured 2026-09-06 over a self-compile
-profile: **1.58% inclusive**, not the ~16% the row still schedules against, so the
-epoch-stamped memo it calls step 2 is worth under two points.
+profile: **1.58% inclusive**, not the ~16% the row still schedules against. Step 5b
+slice 11 (D14225) then took the walk off every binding: a list literal builds at the type
+the checker stamped on it, and `letListBuild` is read only for a nullable ref-array
+binding's null-arm slot, too rarely to leave a frame in the profile.
 
 Measure:
 
-    kind: profile-incl
-    what: letListBuild
-    filed: 1.6
-    tol: 1.5
-    dir: both
+    kind: none
+    why: step 5b slice 11 (D14225) took the walk off every binding (list literals build at their stamp); only a nullable ref-array binding's null-arm slot still reads it
 
 ### row 8 — `nodeChildren`'s allocation
 
