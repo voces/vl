@@ -305,12 +305,12 @@ import {
   ifaceHashArm,
   ifaceHashArmed,
   ifaceHashOf,
-  ihAmbientFv,
-  ihAmbientFvArena,
   ihAmbientIndex,
+  ihAmbientIndexArena,
+  ihAmbientIndexParse,
   ihAmbientLoose,
-  ihAmbientMeets,
   ihAmbientMeetsIn,
+  ihAmbientNear,
   ihAmbientScan,
   ihAmbientWhy,
   ihBegin,
@@ -383,7 +383,7 @@ import {
   discLeafTokAt,
 } from "./check_discarded"
 import { isBuiltinCallName } from "./check_getter_effects"
-import { T, TDiag, demangleMsg, tyIsPrimIx } from "./check_types"
+import { T, TDiag, demangleMsg, nearNamesRead, tyIsPrimIx } from "./check_types"
 import { lookup } from "./check_scopes"
 import {
   fsIntrinsicCount,
@@ -5519,6 +5519,8 @@ const SK_NO_FRESH_SPLIT = -2147483648
 const SK_NO_WRITER = 16
 // Mask bit: the bodies a served module's call may run are not compared (shares IH_NO_CALLEES).
 const SK_NO_EFFECT = 2048
+// Mask bit: stage 1 reads no row or error of S for an outside type's name or a literal union.
+const SK_NO_AMB_ROWS = 32768
 const SK_KEPT = 1
 const SK_OWN = 2
 const SK_UNATTRIBUTED = "?"
@@ -5704,8 +5706,8 @@ function skEarly(inS: boolean[], tokEnd: i32): boolean {
     }
   }
   if anyS {
-    ihAmbientFv(inS)
-    const meets = ihAmbientMeets(false)
+    ihAmbientIndexParse()
+    const meets = ihAmbientMeetsIn(inS, false, false, false, true)
     if skAmbCount(inS, meets) > 0 { return skDecline(SK_AMBIENT) }
   }
   if cites {
@@ -6185,14 +6187,25 @@ function skSettle(inS: boolean[], roots: i32[]): boolean {
   for name in skInferred {
     if !ihPlainBinding(name) { return skDecline(SK_DEMAND) }
   }
-  // The words `skEarly` read, with the arena's field names; a diagnostic renders any type.
+  // The index `skEarly` read, with the arena's records; a type's name meets only when a row or
+  // error of S renders a type declared outside S, and an error may suggest a near name.
   let anyS = false
   for x in inS {
     if x { anyS = true }
   }
   if anyS {
-    ihAmbientFvArena()
-    if skAmbCount(inS, ihAmbientMeets(T.diags.length > 0)) > 0 {
+    ihAmbientIndexArena()
+    const dirty = T.diags.length > 0
+    const read = (ihMask() & SK_NO_AMB_ROWS) == 0
+    wiDiagTexts()
+    wiRowTextsIn(inS)
+    const rows = read && (wiDiagNamesOut(inS) || wiRowsIn(inS))
+    const meets = ihAmbientMeetsIn(inS, dirty, true, rows, !rows)
+    if skAmbCount(inS, meets) > 0 { return skDecline(SK_AMBIENT) }
+    if read && (wiLitRowsIn(inS) || wiLitDiagsIn(inS)) {
+      return skDecline(SK_AMBIENT)
+    }
+    if dirty && nearNamesRead && skAmbCount(inS, ihAmbientNear()) > 0 {
       return skDecline(SK_AMBIENT)
     }
   }
@@ -6877,14 +6890,13 @@ function wiBankWhole(roots: i32[]): i32 {
 // with no merge spelling left in it, and holds a position no other error holds, since the
 // report orders errors at one position by their check order.
 function wiDiagsPlaced(): boolean {
-  wiDiagMods = []
-  wiDiagMsgs = []
+  wiDiagTexts()
   const seen: {[string]: boolean} = Map()
   let j = 0
-  while j < T.diags.length {
-    const m = skDiagMod(j)
+  while j < wiDiagMods.length {
+    const m = wiDiagMods[j]
     if m < 0 { return false }
-    const msg = vcDiagMsg(P.diags.length + j)
+    const msg = wiDiagMsgs[j]
     if strContains(msg, "#") || strContains(msg, "$") { return false }
     const at = i32ToStr(m)
       + ":"
@@ -6893,11 +6905,22 @@ function wiDiagsPlaced(): boolean {
       + i32ToStr(T.diags[j].tcol)
     if seen.has(at) { return false }
     seen[at] = true
-    wiDiagMods.push(m)
-    wiDiagMsgs.push(msg)
     j = j + 1
   }
   true
+}
+
+// Each type error of this check: its module (-1 when it has none) and its rendered message.
+function wiDiagTexts(): i32 {
+  wiDiagMods = []
+  wiDiagMsgs = []
+  let j = 0
+  while j < T.diags.length {
+    wiDiagMods.push(skDiagMod(j))
+    wiDiagMsgs.push(vcDiagMsg(P.diags.length + j))
+    j = j + 1
+  }
+  0
 }
 
 // Whether an error message names a type declared outside `inG`, the one way an outside
@@ -6906,8 +6929,9 @@ function wiDiagNamesOut(inG: boolean[]): boolean {
   let k = 0
   while k < wiDiagMsgs.length {
     const msg = wiDiagMsgs[k]
+    const m = wiDiagMods[k]
     k = k + 1
-    if !inG[wiDiagMods[k - 1]] { continue }
+    if m < 0 || m >= inG.length || !inG[m] { continue }
     const w = wiWordOut(msg, inG)
     if w != "" {
       wiCulpritName = "(error names " + w + ")"
@@ -7045,7 +7069,10 @@ function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
       wiCulprit = WI_ANY
       return WI_AMBIENT
     }
-    wiRowTexts(t)
+    const only: boolean[] = []
+    for _ in modKeys { only.push(false) }
+    only[t] = true
+    wiRowTextsIn(only)
     const named = (wiMask & WI_NO_RENDER) == 0 && wiRowsIn(inG)
     const meets = ihAmbientMeetsIn(
       inG,
@@ -7064,7 +7091,10 @@ function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
       }
       m = m + 1
     }
-    if (wiMask & WI_NO_LIT_ORDER) == 0 && wiLitOrderIn(inG) {
+    if (
+      (wiMask & WI_NO_LIT_ORDER) == 0
+      && (wiLitRowsIn(inG) || wiDirtyNow && wiLitDiagsIn(inG))
+    ) {
       wiCulprit = WI_ANY
       return WI_AMBIENT
     }
@@ -7073,28 +7103,28 @@ function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
   WI_SERVED
 }
 
-// The report rows of module `t`: each row's stream and the text it renders types into.
-function wiRowTexts(t: i32): i32 {
+// The report rows of the modules in `inG`: each row's stream and the text it renders types into.
+function wiRowTextsIn(inG: boolean[]): i32 {
   wiRowKind = []
   wiRowText = []
   let i = 0
   while i < redunCount() {
-    if redunModuleAt(i) == t { wiRowAdd("redun", redunTypeAt(i)) }
+    if wiModIn(redunModuleAt(i), inG) { wiRowAdd("redun", redunTypeAt(i)) }
     i = i + 1
   }
   i = 0
   while i < rcoalCount() {
-    if rcoalModuleAt(i) == t { wiRowAdd("rcoal", rcoalMsgAt(i)) }
+    if wiModIn(rcoalModuleAt(i), inG) { wiRowAdd("rcoal", rcoalMsgAt(i)) }
     i = i + 1
   }
   i = 0
   while i < isvalCount() {
-    if isvalModuleAt(i) == t { wiRowAdd("isval", isvalMsgAt(i)) }
+    if wiModIn(isvalModuleAt(i), inG) { wiRowAdd("isval", isvalMsgAt(i)) }
     i = i + 1
   }
   i = 0
   while i < expInfCount() {
-    if expInfModuleAt(i) == t {
+    if wiModIn(expInfModuleAt(i), inG) {
       wiRowAdd("expInf", expInfMsgAt(i) + " " + expInfTypeAt(i))
     }
     i = i + 1
@@ -7102,12 +7132,16 @@ function wiRowTexts(t: i32): i32 {
   0
 }
 
+function wiModIn(m: i32, inG: boolean[]): boolean {
+  m >= 0 && m < inG.length && inG[m]
+}
+
 function wiRowAdd(kind: string, text: string): void {
   wiRowKind.push(kind)
   wiRowText.push(text)
 }
 
-// Whether a row `wiRowTexts` read renders a type that may read otherwise in the root's own check:
+// Whether a row `wiRowTextsIn` read renders a type that may read otherwise in the root's own check:
 // one still holding a merge spelling, or naming a type a module outside `inG` declares. The
 // root's own check holds a subset of the declarations, so any other word renders the same.
 function wiRowsIn(inG: boolean[]): boolean {
@@ -7185,8 +7219,8 @@ function wiLitOrdered(s: string, inG: boolean[]): boolean {
   false
 }
 
-// Whether a row `wiRowTexts` read, or an error placed in `inG`, renders a string literal union.
-function wiLitOrderIn(inG: boolean[]): boolean {
+// Whether a row `wiRowTextsIn` read renders a string literal union.
+function wiLitRowsIn(inG: boolean[]): boolean {
   let i = 0
   while i < wiRowText.length {
     if wiLitOrdered(wiRowText[i], inG) {
@@ -7195,10 +7229,14 @@ function wiLitOrderIn(inG: boolean[]): boolean {
     }
     i = i + 1
   }
-  if !wiDirtyNow { return false }
-  i = 0
+  false
+}
+
+// Whether an error `wiDiagTexts` read, placed in `inG`, renders a string literal union.
+function wiLitDiagsIn(inG: boolean[]): boolean {
+  let i = 0
   while i < wiDiagMsgs.length && i < wiDiagMods.length {
-    if inG[wiDiagMods[i]] && wiLitOrdered(wiDiagMsgs[i], inG) {
+    if wiModIn(wiDiagMods[i], inG) && wiLitOrdered(wiDiagMsgs[i], inG) {
       wiCulpritName = "(literal union in error)"
       return true
     }

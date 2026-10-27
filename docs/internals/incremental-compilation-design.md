@@ -2221,6 +2221,82 @@ So the artifact needs five things from codegen:
 None of this exists yet. Items 1 and 2 are the precondition for caching anything, and §3.2's
 per-phase table names which phases are importer-independent.
 
+**S5 step 14: one served-ambient test, keyed on what S's check consumed** (`ihAmbientMeetsIn`
+and `ihAmbientNear` in `compiler/iface_hash.vl`; `skEarly` and `skSettle` in
+`compiler/driver.vl`; `nearNamesRead` in `compiler/check_types.vl`)
+
+Through step 13, `skEarly` and the first stage of `skSettle` used the coarse test from step 8
+(`ihAmbientFv`, `ihAmbientMeets`). Under that test, a NAME key met whenever S spelled the name,
+and any diagnostic in S met every statement (RENDER). The `vl check <dir>` path (`wiGuard`)
+already used the finer `ihAmbientMeetsIn`. Both stages now use it, and the coarse path is
+deleted:
+
+- `ihAmbientFv`, `ihAmbientFvArena`, `ihAmbientMeets`, `ihFv`, `ihSets`, `ihSetsAny` and
+  `ihSetAdd`;
+- the RENDER mask bit.
+
+`ihAmbientIndex` is split in two. `ihAmbientIndexParse` runs at stage 0, before the arena
+exists. `ihAmbientIndexArena` runs after the check of S.
+
+*What each stage consumes.*
+
+- Stage 0 calls `ihAmbientMeetsIn(inS, false, false, false, true)`. Wild statements, getters
+  and FIELDS keys count. A method call does not count, because it needs a dirty check. A
+  type's name does not count, because it needs a row.
+- Stage 1 counts a type's name only when an error or a hint row of S names a type declared
+  outside S. This is the wi path's test (`wiDiagNamesOut`, `wiRowsIn`), generalised from one
+  root to a module set; `wiRowTextsIn` and `wiDiagTexts` serve both callers. Stage 1 also
+  declines when such an error or row renders a string literal union (`wiLitRowsIn`,
+  `wiLitDiagsIn`).
+- Stage 1 declines when a dirty check offered a near-name suggestion from the program's own
+  declarations (`nearNamesRead`, which `tySuggestFor` and `methodSuggestFrom` set) and a served
+  module holds an ambient statement. This is the one RENDER case that is sound to keep. A
+  check of S alone lacks the outside declaration, so it cannot offer that name. Deleting
+  the guard outright is unsound on the suite's "a lib method typo is near a private main
+  self-function".
+
+*Masks* (`vl_check_skip_test.ts` holds a witness for each):
+
+| bit | drops | witness |
+| --- | --- | --- |
+| `IH_NO_AMB_NEAR` (4194304) | the near-name guard | a lib method typo is near a private main self-function |
+| `SK_NO_AMB_ROWS` (32768) | stage 1's name and literal-union rows test | lib's error renders a literal union a private main alias names |
+| `IH_NO_AMB_RECV \| IH_NO_AMB_NEAR` | a method call meeting a dirty check | the getter case |
+
+The NAME half of `SK_NO_AMB_ROWS` has no unsound witness. A lib that renders `Pt` against
+main's private `Pt` declines with the mask clear and stays sound with the mask set. It is
+kept as a conservative guard.
+
+*Replay* over the 30 first-parent commits ending at 7e8296bd2, on the compiler graph. Each
+served check is graded against a fresh check, on its rc and diagnostics and on every hint
+row (`redun`, `rcoal`, `isval`, `expInf`), compared byte for byte per module:
+
+| | before | after |
+| --- | --- | --- |
+| served | 5 | 11 |
+| unsound | 0 | 0 |
+| `ambient`, a served module meets S | 9 | 0 |
+| `ambient`, an S statement moved | 4 | 4 |
+| `interface` | 9 | 12 |
+| no-op edits that still decline | 12 | 1 (`interface`) |
+
+Three edits are not in the compiler graph, so the rows cover 27 edits. Of the nine edits a
+served module met, six now serve and three decline `interface`.
+
+The four remaining `ambient` declines are all S's own ambient statements moving (reading 6),
+and no served module meets the check. On 6f7dcdd8e, the statement that moved is
+`emitLinkSection` (`emit_link.vl`). Its parameter spells `{ names: string[], globals: i32[] }`,
+so the whole function is ambient, and the edit changed its body. The other three move whole
+functions in `wasmEmit.vl`, `emit_sections.vl`, `emit_rep.vl` and `emit_ref_list_kinds.vl` in
+the same way. A finer reading 6, which would hash a function's signature spellings rather
+than its body, is the next cut.
+
+A served check renders no hint rows for a module it did not re-check. Over the replay,
+1,002 module row sets were absent for that reason (37,397 rows). The row sets of the
+modules it did re-check, 7,082 of them, matched the fresh check exactly. Today no reader is
+affected: the LSP is the only caller that arms the skip, and it reads diagnostics only. A
+caller that reads rows from a served check would need the rows banked with the module.
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.
