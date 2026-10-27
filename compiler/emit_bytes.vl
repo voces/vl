@@ -82,6 +82,7 @@ import {
   fa32TypeIdx,
   fa64TypeIdx,
   fbEagerScratch,
+  fbFrameLocals,
   fbFrameParams,
   fbRunsWritten,
   fbScratchCur,
@@ -149,6 +150,7 @@ import {
   listIdxScratchBase,
   localIsRef,
   localStructIdx,
+  localUnset,
   mI32Used,
   mI64Used,
   mStructI32Idx,
@@ -543,6 +545,7 @@ export function ropeAt(r: ByteRope, i: i32): i32 {
 export function fbLocalGet(i: i32) {
   wU8(OP_LOCAL_GET) // 0x20 local.get
   wULEB(i)
+  if fbLocalIsUnsetRef(i - fbFrameParams) { fbRefAsNonNull() }
   0
 }
 export function fbLocalSet(i: i32) {
@@ -556,7 +559,27 @@ export function fbLocalSet(i: i32) {
 export function fbLocalTee(i: i32) {
   wU8(OP_LOCAL_TEE) // 0x22 local.tee
   wULEB(i)
+  if fbLocalIsUnsetRef(i - fbFrameParams) { fbRefAsNonNull() }
   0
+}
+// Whether declared local `li` is a non-null ref cell whose `let` has no initializer
+// (`localUnset`): it is declared nullable, and `fbLocalGet`/`fbLocalTee` assert non-null.
+function fbLocalIsUnsetRef(li: i32): boolean {
+  if li < 0 || li >= fbFrameLocals || li >= localUnset.length { return false }
+  if li >= localIsRef.length { return false }
+  localUnset[li] == 1 && vkIsNonNullRef(localIsRef[li])
+}
+// Whether `fbValtype` writes kind `k` as a non-null ref (`0x64`), the cells wasm cannot
+// default. Exhaustive and `_`-less, so a new kind has to say which it is.
+function vkIsNonNullRef(k: VKind): boolean {
+  match k {
+    "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "f64list" | "closure" | "i64list" | "f32list" | "u8list" => {
+      return true
+    }
+    "i32" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {
+      return false
+    }
+  }
 }
 // global.get / global.set: 0x23/0x24 <globalidx-uleb>.
 export function fbGlobalGet(i: i32) {
@@ -1465,6 +1488,7 @@ export function fbReserve(n: i32) {
 export function fbBeginFunc(nParams: i32, nLocals: i32) {
   fbScratchCur = nParams + nLocals
   fbFrameParams = nParams
+  fbFrameLocals = nLocals
   fbReservePushFrames()
   fbReserveCollectionFrames()
   fbReserveListOpFrames()
@@ -1472,6 +1496,12 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   fbResetLazyFrame()
   fbEagerScratch = fbScratchCur - nParams - nLocals
   fbScratchCur
+}
+// Closes the frame `fbBeginFunc` opened, so a runtime helper emitted after it, which opens
+// none, reads no declared local of it (`fbLocalIsUnsetRef`).
+export function fbEndFunc() {
+  fbFrameLocals = 0
+  0
 }
 // `fbBeginFunc`'s list-push frames: one 4-slot quad per pushed element rep this function
 // uses, the typed ref-push frames in `fnRefPushSlots` order.
@@ -2453,7 +2483,12 @@ export function fbEmitLocalsVec(body: u8[], nLocals: i32) {
   // Declared locals (struct / list / string / ref-list ref or i32 — see `fbValtype`).
   let li = 0
   while li < nLocals {
-    fbLocalRun(localIsRef[li], localStructIdx[li])
+    if fbLocalIsUnsetRef(li) {
+      fbRun()
+      fbValtypeNullable(localIsRef[li], localStructIdx[li])
+    } else {
+      fbLocalRun(localIsRef[li], localStructIdx[li])
+    }
     li = li + 1
   }
   fbEmitPushMapFrames()
