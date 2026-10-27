@@ -11,10 +11,12 @@ import {
   elabFnLetMembers,
   elabFnSetOf,
   elabHolePinNote,
+  fnLetIsWide,
   fnTagCallNote,
   fnTagCallRefusal,
   fnTagMembers,
   fnTagSetOfTy,
+  fnTagTyIsTagged,
 } from "./check_elab_cap"
 import {
   ArrayLit,
@@ -134,6 +136,7 @@ import {
   printCstr,
 } from "./check_cstr_rows"
 import {
+  curFnDeclIx,
   inferQuiet,
   lamCheckDepth,
   lamRefoldDepth,
@@ -4746,7 +4749,8 @@ export function holeLetWritesDisagreeAt(
       if holeSlotJudge(r, wp, fixed) { return true }
     } else if holeChoiceArms(r).length > 0 {
       if holeChoiceJudge(r, wp) { return true }
-    } else if holeSetMembers(r).length > 1 {
+    } else if holeSetMembers(r).length > 1 && !fnLetIsWide(nodeTyIxOf(r)) {
+      // A written `let` read here is judged by its writes, below.
       if holeSetJudge(r, wp) { return true }
     } else if holeLetJudge(r, wp) {
       return true
@@ -4919,29 +4923,37 @@ export function holeSetCallRet(ix: i32, callFn: i32, pts: i32[]): i32 {
   if cx < 0 || cx >= P.nodes.length { return -1 }
   const s = fnTagSetOfTy(nodeTyIxOf(cx))
   const ds = fnTagMembers(s)
-  if ds.length < 2 { return -1 }
+  if ds.length == 0 { return -1 }
   for d in ds {
-    if d < 0 || d >= P.nodes.length || !directHoleDecl(d) { return -1 }
-    const f = nodeAt(d)
-    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return -1 }
+    if !setMemberDecl(d) { return -1 }
   }
   const wp: i32[] = []
   let key = ""
+  let open = false
   for pt in pts {
-    if pt < 0 || tyHasTyVar(pt) { return -1 }
+    if pt < 0 { return -1 }
+    if tyHasTyVar(pt) {
+      // An open function type is a hole function handed on, which no instance closes.
+      if curFnDeclIx < 0 || tyAt(pt) is TyFunc { return -1 }
+      open = true
+    }
     const w = widenLitTy(pt)
     wp.push(w)
     key = key + tyToStr(w) + ","
   }
+  // A call at a type parameter is decided here and typed at each instance of its function.
+  if open {
+    const none: i32[] = []
+    if !inferQuiet && !holePinHeld { fnTagCallNote(ix, s, key, false, none) }
+    return -1
+  }
   const ft = mkFuncTy(wp, TY_I32)
-  const noN: string[] = []
-  const noT: i32[] = []
   let r = -1
   let r0 = -1
   let split = false
   const rs: i32[] = []
   for d in ds {
-    const rd = holeLamRetAt(d, ft, noN, noT)
+    const rd = setMemberRetAt(d, ft)
     if rd < 0 || tyHasTyVar(rd) { return -1 }
     const w = widenLitTy(rd)
     rs.push(w)
@@ -4955,6 +4967,40 @@ export function holeSetCallRet(ix: i32, callFn: i32, pts: i32[]): i32 {
   }
   if !inferQuiet && !holePinHeld { fnTagCallNote(ix, s, key, split, rs) }
   r
+}
+
+// Whether `d` is a function a set's call can call directly at the call's own arguments: an
+// un-annotated function, or a generic one with a declared result.
+function setMemberDecl(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) { return false }
+  directHoleDecl(d) || (f.fnTyParams.length > 0 && f.fnRet >= 0)
+}
+
+// What set member `d` returns at function type `ft`'s parameters, as its direct call there does;
+// -1 when that stays open.
+function setMemberRetAt(d: i32, ft: i32): i32 {
+  const noN: string[] = []
+  const noT: i32[] = []
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnRet < 0 { return holeLamRetAt(d, ft, noN, noT) }
+  const sig = nodeTyOf(d)
+  if sig < 0 || sig >= T.tys.length || ft < 0 || ft >= T.tys.length {
+    return -1
+  }
+  const sf = tyAt(sig)
+  const pc = tyAt(ft)
+  if !(sf is TyFunc) || !(pc is TyFunc) { return -1 }
+  if sf.fnParamTypes.length != pc.fnParamTypes.length { return -1 }
+  const hN: string[] = []
+  const hT: i32[] = []
+  let k = 0
+  while k < pc.fnParamTypes.length {
+    bindGenWalk(sf.fnParamTypes[k], pc.fnParamTypes[k], hN, hT)
+    k = k + 1
+  }
+  substTyDeep(sf.fnRet, hN, hT)
 }
 
 // Runs `holeLetWritesDisagreeAt` for the call at `ix`, recording rather than refusing a
@@ -7665,6 +7711,8 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     return tyIx
   }
   if substOnSeenStack(tyIx) || substSkipsForeignSig(tyIx) { return tyIx }
+  // A tagged set is an id: its signature names its members' own parameters, never the instance's.
+  if t is TyFunc && fnTagTyIsTagged(tyIx) { return tyIx }
   stSeenStackPush(tyIx)
   let res = tyIx
   if t is TyArray {
