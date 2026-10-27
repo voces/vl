@@ -1,7 +1,7 @@
 // Assignment rows: the type each name target stores and reads at, the open element row of a
 // store, and the source/destination stacks an assignability walk keeps against recursion.
 // Emptied by `asgRowsReset`. Does not import the checker.
-import { ArrayLit, BinExpr, Index, ObjLit, P, nodeAt } from "./ast"
+import { ArrayLit, BinExpr, Index, ObjLit, P, Unary, nodeAt } from "./ast"
 import { TyArray, tyAt } from "./check_types"
 import { parenPeelIx } from "./check_places"
 import {
@@ -71,6 +71,68 @@ export function asgOpenElemRowOf(tgtIx: i32) {
     if t is TyArray {
       if t.aElem < 0 { return at }
     }
+  }
+  -1
+}
+
+// Reads of an open list element, and the operators over them, whose type a later pin decides
+// (D14497): banked in check order, so every node follows the nodes it reads, and given their
+// type once by `resolveOpenElemReads` after the last pin. `oerPend` holds the operators that
+// answered -1 for that reason. Emptied by `asgRowsReset`.
+export let oerNodes: i32[] = []
+let oerSeen: {[i32]: boolean} = Map()
+let oerPend: {[i32]: boolean} = Map()
+// By store node, the place type a store of such a value is graded against once it is pinned.
+export let oerAsgDst: {[i32]: i32} = Map()
+
+// Whether `ix` is a read of an element whose row is still open.
+export function oerIsOpenRead(ix: i32): boolean {
+  if ix < 0 { return false }
+  const e = nodeAt(ix)
+  if !(e is Index) { return false }
+  const at = nodeTyIxOf(e.idxArr)
+  if at < 0 { return false }
+  const t = tyAt(at)
+  if t is TyArray { return t.aElem < 0 }
+  false
+}
+
+// Whether expression `ix`, parentheses peeled, answers -1 only because an element it reads is
+// still open.
+export function oerIsPending(ix: i32): boolean {
+  if ix < 0 { return false }
+  const p = parenPeelIx(ix)
+  oerIsOpenRead(p) || (oerPend[p] ?? false)
+}
+
+// Banks node `ix` for resolution; `pend` marks an operator that answered -1 for its operand.
+export function oerBank(ix: i32, pend: boolean, quiet: boolean) {
+  if pend { oerPend[ix] = true }
+  if quiet || (oerSeen[ix] ?? false) { return 0 }
+  oerSeen[ix] = true
+  oerNodes.push(ix)
+  0
+}
+
+// The open read pending expression `ix` takes its type from, or -1.
+export function oerSourceRead(ix: i32): i32 {
+  let cur = parenPeelIx(ix)
+  let hops = 0
+  while hops < 64 {
+    if cur < 0 || cur >= P.nodes.length { return -1 }
+    if oerIsOpenRead(cur) { return cur }
+    if !(oerPend[cur] ?? false) { return -1 }
+    const e = nodeAt(cur)
+    let next = -1
+    if e is BinExpr {
+      next = parenPeelIx(e.binLeft)
+      if !oerIsPending(next) { next = parenPeelIx(e.binRight) }
+    } else if e is Unary {
+      next = parenPeelIx(e.unArg)
+    }
+    if next < 0 { return -1 }
+    cur = next
+    hops = hops + 1
   }
   -1
 }
@@ -228,6 +290,10 @@ export function asgBanksUndo(undo: i32) {
 }
 
 export function asgRowsReset() {
+  oerNodes = []
+  oerSeen = Map()
+  oerPend = Map()
+  oerAsgDst = Map()
   bgSrcStack = []
   bgDstStack = []
   asgStoreTys = []
