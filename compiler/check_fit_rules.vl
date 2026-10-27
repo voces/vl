@@ -255,6 +255,7 @@ import {
   recFreshDeclOf,
   recFreshMapDeclOf,
   recFreshOriginDecl,
+  recHeldCallOrigin,
   recHeldDecl,
   recHeldLit,
   recInferredFnOf,
@@ -1778,12 +1779,17 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
 // (`freshLitValue`) or the binding read that last reached it (`recFnValueOrigins`), so each is
 // built at `call`'s destination; empty when some value is neither.
 function recReturnedOrigins(fd: i32, call: i32): i32[] {
-  const out: i32[] = []
   cwIxBuild()
   const sites: i32[] = []
   if rcwCallSites(fd, sites) >= 0 || sites.length != 1 || sites[0] != call * 2 {
-    return out
+    return []
   }
+  recFnReturns(fd)
+}
+
+// `recReturnedOrigins` for every call of `fd` alike: what each of them is handed back.
+function recFnReturns(fd: i32): i32[] {
+  const out: i32[] = []
   const via: i32[] = []
   const origins = recFnValueOrigins(fd, via)
   let i = 0
@@ -1842,6 +1848,7 @@ function recNullWidened(own: i32, dst: i32): boolean {
         if (
           !fieldStorageEq(of, at, REC_STORE_DEPTH)
           && !(of == TY_I32 && at == TY_I64)
+          && !(of == TY_NULL && inner >= 0)
         ) {
           return false
         }
@@ -2180,11 +2187,12 @@ export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     }
     return 0
   }
-  // A call is delivered as the bindings its function returns.
-  if e is Call && dt is TyMap {
+  // A call is delivered as the bindings its function returns. Adopting one retypes the result
+  // at every call, so the re-check judges the other calls too.
+  if e is Call && (dt is TyMap || dt is TyArray) {
     const fd = recInferredFnOf(p)
     if fd >= 0 {
-      const os = recReturnedOrigins(fd, p)
+      const os = recFnReturns(fd)
       let reads = true
       for b in os {
         if !(nodeAt(b) is Ident) { reads = false }
@@ -2206,6 +2214,9 @@ export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         recAdoptMapNote(li, nodeTyIxOf(li), dstTy)
       }
     }
+    // One holding a call is delivered as the call is.
+    const oc = recHeldCallOrigin(p)
+    if oc >= 0 { recAdoptMapNote(oc, nodeTyIxOf(oc), dstTy) }
     return 0
   }
   recAdPushMapDecl(decl, srcTy, nonNulTyOf(dstTy), p)
@@ -2282,10 +2293,8 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         return recAdPushDecl(pd, srcTy, nonNulTyOf(dstTy), false, p)
       }
       // One holding a call or an element read is delivered as that origin is (D8140).
-      const oc = recBindOrigin(p)
-      if oc >= 0 && oc != p && (nodeAt(oc) is Call || nodeAt(oc) is Index) {
-        return recAdoptNote(oc, nodeTyIxOf(oc), dstTy)
-      }
+      const oc = recHeldCallOrigin(p)
+      if oc >= 0 { return recAdoptNote(oc, nodeTyIxOf(oc), dstTy) }
       // One aliasing a literal binding keeps its type, and the literal is built at the record.
       const od = recFreshOriginDecl(p, 6)
       if (
