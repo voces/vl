@@ -191,7 +191,7 @@ Deno.test({
   name: "native-diag-pos: EMIT-stage failure anchors at the failing function's name",
   ignore: !ENABLED,
   fn: async () => {
-    // A Map whose value is `mk(dbl)`'s record result has no map-value rep (D12340), so
+    // `is` over a literal-union list arm has no interned arm representation (D14041), so
     // `useIt` (line 4) fails at the EMIT stage. The diagnostic anchors at the
     // enclosing function's NAME token (`useIt`, col 8 0-based, printed 1-based as 4:10), not
     // positionless (line 0) as before — so a build/playground/LSP consumer can
@@ -202,16 +202,14 @@ Deno.test({
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
         path,
-        "function dbl(a) { return a * 2 }\n" +
-          "function mk(g) { return { f: g } }\n" +
-          "// D12340\n" +
-          "function useIt() {\n" +
-          "  const m = Map()\n" +
-          "  m.set(\"b\", mk(dbl))\n" +
-          "  const r = m.get(\"b\")\n" +
-          "  if r != null { print(r.f(3)) }\n" +
+        "type K = 0 | 1\n" +
+          "// D14041\n" +
+          "const z = 9\n" +
+          "function useIt(x: K[] | string) {\n" +
+          "  if x is K[] { print(x[0]) } else { print(z) }\n" +
           "}\n" +
-          "useIt()\n",
+          "useIt([1])\n" +
+          "useIt(\"s\")\n",
       );
       const r = await build(path);
       if (r.code === 0) throw new Error("expected emit-stage rejection, got exit 0");

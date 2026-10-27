@@ -81,18 +81,16 @@ Deno.test({ name: "playground-run: an EMIT-stage failure yields a POSITIONED err
   // Diagnostics pane — which the Run verdict points at — rendered nothing. Now the
   // diagnostic anchors at the failing function's declaration (`useIt`, line 4 →
   // LSP 0-based line 3), so the pane has a real location to show.
-  // The un-lowerable shape is D12340's: a Map whose value is a call's record result
-  // with a function field has no map-value rep.
-  const src = "function dbl(a) { return a * 2 }\n" +
-    "function mk(g) { return { f: g } }\n" +
-    "// D12340\n" +
-    "function useIt() {\n" +
-    "  const m = Map()\n" +
-    "  m.set(\"b\", mk(dbl))\n" +
-    "  const r = m.get(\"b\")\n" +
-    "  if r != null { print(r.f(3)) }\n" +
+  // The un-lowerable shape is D14041's: `is` over a literal-union list arm has no
+  // interned arm representation.
+  const src = "type K = 0 | 1\n" +
+    "// D14041\n" +
+    "const z = 9\n" +
+    "function useIt(x: K[] | string) {\n" +
+    "  if x is K[] { print(x[0]) } else { print(z) }\n" +
     "}\n" +
-    "useIt()\n";
+    "useIt([1])\n" +
+    "useIt(\"s\")\n";
   const { bytes, diagnostics } = await seedChecker().compile(src, "main.vl", noSiblings);
   if (bytes !== undefined) throw new Error("expected no bytes for an emit-stage failure");
   const errors = diagnostics.filter((d) => d.severity === "error");

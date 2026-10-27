@@ -246,6 +246,7 @@ import {
   recBindOrigin,
   recFreshDeclOf,
   recFreshMapDeclOf,
+  recFreshOriginDecl,
   recHeldLit,
   recInferredFnOf,
   recOriginExpr,
@@ -257,6 +258,7 @@ import {
   recAdPushDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
+  recBuildPush,
   recDelivPush,
   recPend,
   recPendDstTy,
@@ -1716,11 +1718,14 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   if leaves.length == 0 { return false }
   const lits: i32[] = []
   const calls: i32[] = []
+  const binds: i32[] = []
   for lf in leaves {
     const lp = cwPeel(lf)
     const ll = recLeafLitOf(lp, dst)
     if ll >= 0 {
       lits.push(ll)
+    } else if recLeafLitBinding(lp) {
+      binds.push(lp)
     } else if (
       lp != call
       && recInferredFnOf(lp) >= 0
@@ -1744,7 +1749,20 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   for ll in lits { recordRepTyAdopt(ll, dst, 6) }
   // A leaf calling another such function hands the destination on to it (D8143).
   for cl in calls { recAdoptNote(cl, nodeTyIxOf(cl), dst) }
+  // A leaf naming a literal binding keeps its type, and both are built at `dst`.
+  for b in binds {
+    const bd = recFreshDeclOf(b)
+    recBuildPush(bd, nodeTyIxOf(b), dst, false)
+    recordRepTyAdopt(parenPeelIx(recDeclInit(bd)), dst, 6)
+  }
   true
+}
+
+// Whether the result leaf `lp` reads a binding initialised with an object literal.
+function recLeafLitBinding(lp: i32): boolean {
+  if lp < 0 || lp >= P.nodes.length || !(nodeAt(lp) is Ident) { return false }
+  const d = recFreshDeclOf(lp)
+  d >= 0 && nodeAt(parenPeelIx(recDeclInit(d))) is ObjLit
 }
 
 // The reads an inferred function `fd` returns when every value leaf names a local binding and
@@ -1938,6 +1956,9 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
   }
   const e = nodeAt(p)
   const dt = tyAt(d)
+  // A binding holding only the call lands where its read does.
+  const bo = if e is Ident { recBindOrigin(p) } else { -1 }
+  if bo == c { return recAdLanding(own, d) }
   if e is ObjLit && dt is TyObj {
     let i = 0
     while i < dt.objFieldNames.length {
@@ -2238,6 +2259,15 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       const oc = recBindOrigin(p)
       if oc >= 0 && oc != p && (nodeAt(oc) is Call || nodeAt(oc) is Index) {
         return recAdoptNote(oc, nodeTyIxOf(oc), dstTy)
+      }
+      // One aliasing a literal binding keeps its type, and the literal is built at the record.
+      const od = recFreshOriginDecl(p, 6)
+      if (
+        od >= 0
+        && nodeAt(od) is LetDecl
+        && nodeAt(parenPeelIx(recDeclInit(od))) is ObjLit
+      ) {
+        recBuildPush(od, srcTy, nonNulTyOf(dstTy), false)
       }
       return 0
     }

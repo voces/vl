@@ -184,7 +184,6 @@ import {
   mapNameKeyKind,
   mapValNameOf,
   monoAnnHasTyParam,
-  monoIsGenericDecl,
   nameIsBareMap,
   nameIsClosureArrayTy,
   nameIsF32Array,
@@ -196,7 +195,6 @@ import {
   nameIsString,
   nameIsStringArray,
   nameIsU8Array,
-  nameNamesFunction,
   nodeIsTypeDecl,
   normTypeAtom,
   noteFuncName,
@@ -487,6 +485,8 @@ import {
   sFieldStart,
   sFieldTypes,
   sHeapIdx,
+  sLitMintFn,
+  sLitMintRow,
   sNames,
   sRowDecl,
   sTwin,
@@ -575,7 +575,6 @@ import { RS_TAG, relSkew } from "./emit_reloc"
 import {
   anonFieldElemKeyKind,
   anonMapFieldDestAdmits,
-  tyHasLitDeep,
 } from "./emit_anon_fields"
 import {
   sFieldElemNameAt,
@@ -680,7 +679,6 @@ import {
   nulRefArrayInnerSlotOfLet,
   nulRefStructIdxOfLet,
   nulVariantIdxOfLet,
-  objLitRowIsApartFallback,
   objVariantName,
   objVariantNameCtx,
   pinnedValTyOf,
@@ -8491,7 +8489,7 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
       } else if repRowOfTyStruct(lt, sScanLim()) < 0 {
         // A row matched only by field names is another type's, the template's say: the
         // instance's closed type gets its own, minted from the literal and keyed by the type.
-        anonMintRowFor(objIx)
+        anonMintRowFor(objIx, fnIx)
       }
     }
     return 0
@@ -8550,12 +8548,7 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
   if bNames.length == 0 { return 0 }
   const st = substTyDeep(lt, bNames, bTys)
   if st < 0 || tyHasTyVar(st) { return 0 }
-  // A declared row the instance can only read apart is no row for this literal (D8682).
-  if objLitRowIsApartFallback(objIx, fnIx) {
-    internOwnShapeOfTy(st)
-  } else {
-    internShapeDeepOfTy(st)
-  }
+  internOwnShapeOfTy(st)
   0
 }
 
@@ -8600,7 +8593,6 @@ function collectAnonShapes() {
   // D391 — `anonNestPolyPremint` mints the polymorphic nested rows first, before any owner
   // row exists, so the owner scan below can tell the owners apart.
   anonNestPolyPremint(nestOwner)
-  anonGenArgBuilt = false
   // A holder whose empty-list field a later push pinned to a record keys that field by the
   // record's row, so it mints after every other literal has minted its row (D2640).
   const late: i32[] = []
@@ -8658,7 +8650,7 @@ function anonMintLiteral(ai: i32, nestOwner: i32[]) {
     structIndexOfObj(ai) < 0
     && (objVariantName(ai) == "" || anonNestNeedsRow(ai, nestOwner))
   ) {
-    anonMintRowFor(ai)
+    anonMintRowFor(ai, 0 - 1)
   }
   0
 }
@@ -8734,103 +8726,15 @@ function anonEmptyListElemIsObj(ty: i32): boolean {
   false
 }
 
-// The object literals a call to a generic function receives by name, directly or through the
-// `const` it reads; a shadowing local's call is marked too, which only declines (D3123).
-let anonGenArgLit: {[i32]: boolean} = Map()
-let anonGenArgBuilt = false
-
-// Fills `anonGenArgLit` once per program, on the first map field that could need it: most
-// programs mint no such field, and three arena walks cost them fuel for nothing (D3123).
-function anonGenArgBuild() {
-  if anonGenArgBuilt { return 0 }
-  anonGenArgBuilt = true
-  anonGenArgLit = Map()
-  const genFns: {[string]: boolean} = Map()
-  let gi = 0
-  while gi < P.nodes.length {
-    const gd = nodeAt(gi)
-    if gd is FuncDecl {
-      if monoIsGenericDecl(gi) { genFns[gd.fnName] = true }
-    }
-    gi = gi + 1
-  }
-  const genVia: {[string]: boolean} = Map()
-  gi = 0
-  while genFns.length > 0 && gi < P.nodes.length {
-    const gc = nodeAt(gi)
-    if gc is Call && gc.callFn >= 0 {
-      const gcf = nodeAt(gc.callFn)
-      if gcf is Ident {
-        if genFns[gcf.identName] ?? false {
-          anonGenArgMarkArgs(gc.callArgs, genVia)
-        }
-      }
-    }
-    gi = gi + 1
-  }
-  gi = 0
-  while genVia.length > 0 && gi < P.nodes.length {
-    const gl = nodeAt(gi)
-    if gl is LetDecl {
-      if (genVia[gl.letName] ?? false) && gl.letInit >= 0 {
-        const gli = unwrapParen(gl.letInit)
-        if gli >= 0 && nodeAt(gli) is ObjLit { anonGenArgLit[gli] = true }
-      }
-    }
-    gi = gi + 1
-  }
-  0
-}
-
-// Marks each object-literal argument, and records each name argument for its `const`.
-function anonGenArgMarkArgs(args: i32[], viaName: {[string]: boolean}) {
-  let k = 0
-  while k < args.length {
-    const ax = unwrapParen(args[k])
-    if ax >= 0 {
-      const a = nodeAt(ax)
-      match a {
-        ObjLit => {
-          anonGenArgLit[ax] = true
-        }
-        Ident => {
-          viaName[a.identName] = true
-        }
-        // No other argument is an anonymous literal or a name that can carry one.
-        NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
-      }
-    }
-    k = k + 1
-  }
-  0
-}
-
 // Mint one anonymous struct row for the object literal at `objIx`. The body of
 // `collectAnonShapes`' main loop, extracted so the pre-mint pass mints a row the same
 // way rather than through a second copy of it — two mints that disagree would put two
 // different layouts under one `#anonN` key.
-function anonMintRowFor(objIx: i32) {
+function anonMintRowFor(objIx: i32, fnIx: i32) {
   const an = nodeAt(objIx)
   if an is ObjLit {
     const ai = objIx
     const fields = an.objFields
-    // A literal with a function-valued field classifies its plain-ident fields as i32 (the host
-    // types them exactly); one with none leaves idents unclassifiable, matching the pinned annotation.
-    let hasFnField = false
-    let ffi = 0
-    while ffi < fields.length {
-      const ff = nodeAt(fields[ffi])
-      if ff is FieldInit {
-        // (Direct node checks, not `fieldValueFeOf` — `fnStmts` is not yet
-        // populated when `collectS`/`collectAnonShapes` run.)
-        const fv = nodeAt(ff.fiValue)
-        if fv is FuncDecl { hasFnField = true }
-        if fv is Ident {
-          if nameNamesFunction(fv.identName) { hasFnField = true }
-        }
-      }
-      ffi = ffi + 1
-    }
     const codes: i32[] = []
     const names: string[] = []
     const elemNames: string[] = []
@@ -8842,25 +8746,10 @@ function anonMintRowFor(objIx: i32) {
       if f is FieldInit {
         let code = anonFieldCode(f.fiValue)
         if code == FC_MAP && !anonMapFieldDestAdmits(ai, f.fiName) { code = -1 }
-        // A generic call pins its argument's row at the spelled shape, which softens a
-        // literal the row keeps, so such a map field stays uncoded (D3123).
-        if (
-          code == FC_MAP
-          && tyHasLitDeep(nodeTyIxOf(unwrapParen(f.fiValue)), 8)
-        ) {
-          anonGenArgBuild()
-          if anonGenArgLit.get(ai) ?? false { code = -1 }
-        }
         // D672 — a joined owner's field is a union box, not a nested ref: where two owner literals
         // disagree at a nested field and something joins them, the code is 16 (`anonNestPolyUnionName` gates it, "" elsewhere).
         const boxU = anonNestPolyUnionName(ai, f.fiName, unwrapParen(f.fiValue))
         if boxU != "" { code = FC_UNION }
-        if code < 0 && hasFnField {
-          const iv = nodeAt(f.fiValue)
-          if iv is Ident {
-            if !nameNamesFunction(iv.identName) { code = FC_I32 }
-          }
-        }
         if code < 0 { ok = false }
         codes.push(code)
         names.push(f.fiName)
@@ -8882,6 +8771,8 @@ function anonMintRowFor(objIx: i32) {
       sNames.push("#anon" + i32ToStr(sNames.length))
       recordSRowDeclOfName(sNames[sNames.length - 1])
       recordSTyIx(anonRowTyIx(ai))
+      sLitMintRow.set(ai, sNames.length - 1)
+      sLitMintFn.set(ai, fnIx)
       const ownTy = anonRowOwnTyIx(ai)
       if ownTy >= 0 {
         sAnonOwnTy.set(sNames.length - 1, ownTy)
@@ -8949,7 +8840,7 @@ function anonNestPolyPremint(nestOwner: i32[]) {
             && !anonNestFieldMono(ow, fname, xi)
             && anonNestPolyUnionName(ow, fname, xi) == ""
           ) {
-            anonMintRowFor(xi)
+            anonMintRowFor(xi, 0 - 1)
           }
         }
       }
@@ -9562,6 +9453,8 @@ function structTableReset() {
   sRowDecl = []
   sTyIx = []
   sAnonOwnTy = Map()
+  sLitMintRow = Map()
+  sLitMintFn = Map()
   sFieldNames = []
   sFieldStart = []
   sFieldCount = []
