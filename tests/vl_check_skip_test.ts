@@ -1082,6 +1082,26 @@ const CASES: Case[] = [
     },
     uses: 'import { Buffer } from "std:buffer"\nimport { RIG_BOAR } from "./defs"\nprint(RIG_BOAR)\n',
   },
+  {
+    // Lib's error renders a literal union by its members, and a whole check, which also holds
+    // main's alias for that set, renders it by the alias's name.
+    name: "lib's error renders a literal union a private main alias names",
+    want: "decline",
+    why: "ambient",
+    from: "print(3)",
+    to: "print(4)",
+    libUses: 'const e: "a" | "b" = "a"\nconst b2: boolean = e\n',
+    uses: 'type AB = "a" | "b"\n',
+  },
+  {
+    // Lib's error offers no near name, so main's private declarations cannot reach its text.
+    name: "lib's error offers no name and main declares a private self-function",
+    want: "serve",
+    from: "print(3)",
+    to: "print(4)",
+    libUses: "const b3: boolean = 1\n",
+    uses: "function zzq(self: string): i32 { 1 }\n",
+  },
 ];
 
 const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
@@ -1219,13 +1239,14 @@ Deno.test({
       ["a private lib type spells main's literal record", 16384],
       ["main's private type spells a lib body literal's record", 16384],
       // Each narrowing of `IH_NO_AMBIENT` loses its own case when its key is dropped:
-      // `IH_NO_AMB_FIELDS`, `IH_NO_AMB_GENERIC`, `IH_NO_AMB_RENDER`, and
-      // `IH_NO_AMB_RECV | IH_NO_AMB_RENDER` (the getter's read is itself a lib diagnostic).
+      // `IH_NO_AMB_FIELDS`, `IH_NO_AMB_GENERIC`, `IH_NO_AMB_NEAR`, `SK_NO_AMB_ROWS`, and
+      // `IH_NO_AMB_RECV | IH_NO_AMB_NEAR` (the getter's read is itself a lib diagnostic).
       ["main's private type spells a lib body literal's record", 524288],
       ["a lib generic application spells main's literal record", 8388608],
       // `IH_NO_AMB_SHADOW` reads `Map<…>` as the built-in even where a module declares `Map`.
       ["a lib application of a declared Map spells main's literal record", 67108864],
       ["a lib method typo is near a private main self-function", 4194304],
+      ["lib's error renders a literal union a private main alias names", 32768],
       ["main declares a getter on a lib type lib reads", 2097152 | 4194304],
       // `SK_NO_EFFECT` keeps a bank whose write questions about a callee answer differently.
       ["a callee's write moves to the narrowed field", 2048],

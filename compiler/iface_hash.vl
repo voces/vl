@@ -76,7 +76,7 @@ const IH_NO_IMPORT_MAP = 262144
 const IH_NO_AMB_FIELDS = 524288
 const IH_NO_AMB_NAMES = 1048576
 const IH_NO_AMB_RECV = 2097152
-const IH_NO_AMB_RENDER = 4194304
+const IH_NO_AMB_NEAR = 4194304
 const IH_NO_AMB_GENERIC = 8388608
 const IH_NO_REACH_TOKENS = 16777216
 const IH_NO_AMB_ARENA = 33554432
@@ -134,7 +134,7 @@ let ihStAmb: boolean[] = []
 // Ambient keys, per statement `ihAkSt[k]`: a declared name, a method's or getter's name, one
 // record level's field names, or the `new` type an operator takes, as `ihAkW[ihAkLo[k],
 // ihAkHi[k])`. An ambient statement that no key bounds is wild. `ihDeclsOf` holds each type
-// name's declarations, `ihFv` the words `ihAmbientFv` read.
+// name's declarations.
 const IH_AK_NAME = 0
 const IH_AK_RECV = 1
 const IH_AK_FIELDS = 2
@@ -157,10 +157,6 @@ let ihAkShape: i32[] = []
 // any other type, or [] when the key is no declaration's.
 let ihAkTys: string[][] = []
 let ihDeclsOf: {[string]: i32[]} = Map()
-let ihFv: {[string]: boolean} = Map()
-// The field-name sets the check of S builds, by `ihSetName`; `ihSetsAny` when one repeats a name.
-let ihSets: {[string]: boolean} = Map()
-let ihSetsAny = false
 // Object literals: statement `ihLitSt[k]` builds one whose field-name set is `ihLitKey[k]`,
 // with `ihLitRep[k]` when it repeats a name.
 let ihLitSt: i32[] = []
@@ -624,12 +620,6 @@ function ihHasRepeat(ws: string[]): boolean {
     i = i + 1
   }
   false
-}
-
-// Adds one field-name set the check of S builds.
-function ihSetAdd(ws: string[]): void {
-  if ihHasRepeat(ws) { ihSetsAny = true }
-  ihSets[ihSetName(ws)] = true
 }
 
 // A declared type's name without its parameters or its block-scope suffix.
@@ -1097,40 +1087,6 @@ function ihWildUnkeyed(): i32 {
   0
 }
 
-// Before `ihAmbientMeets`, from the modules `inS`: the words their statements spell, every token
-// and the text of every quoted one, and the field-name set of each of their object literals.
-export function ihAmbientFv(inS: boolean[]): i32 {
-  ihFv = Map()
-  ihSets = Map()
-  ihSetsAny = false
-  let k = 0
-  while k < ihLitSt.length {
-    const m = ihStMod[ihLitSt[k]]
-    if m >= 0 && m < inS.length && inS[m] {
-      if ihLitRep[k] { ihSetsAny = true }
-      ihSets[ihLitKey[k]] = true
-    }
-    k = k + 1
-  }
-  let s = 0
-  while s < ihStMod.length {
-    const m = ihStMod[s]
-    if m >= 0 && m < inS.length && inS[m] {
-      let t = ihStLo[s]
-      while t < ihStHi[s] && t < P.toks.length {
-        const w = P.toks[t].text
-        ihFv[w] = true
-        if w.length >= 2 && (w[0] == '"' || w[0] == '\'') {
-          ihFv[w.slice(1, w.length - 1)] = true
-        }
-        t = t + 1
-      }
-    }
-    s = s + 1
-  }
-  0
-}
-
 function ihLitNames(fs: i32[]): string[] {
   const ws: string[] = []
   for f in fs {
@@ -1142,63 +1098,23 @@ function ihLitNames(fs: i32[]): string[] {
   ws
 }
 
-// After the check, to the sets `ihAmbientFv` read: the field-name set of every record type the
-// check's arena holds.
-export function ihAmbientFvArena(): i32 {
-  if ihOn(IH_NO_AMB_ARENA) { return 0 }
-  for ty in T.tys {
-    if ty is TyObj { ihSetAdd(ty.objFieldNames) }
-  }
-  0
-}
-
-// Per module: whether one of its ambient statements may change a check of the modules
-// `ihAmbientFv` read, which then holds diagnostics when `diags`. A statement may when it is
-// wild, when the check spells its name, or when the check builds a record with exactly the
-// field names of one of its levels.
-export function ihAmbientMeets(diags: boolean): boolean[] {
+// Per module: whether it holds an ambient statement, the declarations an error of a check that
+// left the module out may miss as a near-name suggestion.
+export function ihAmbientNear(): boolean[] {
   const out: boolean[] = []
-  let d = 0
-  while d < ihKeys.length {
-    out.push(false)
-    d = d + 1
-  }
-  if ihOn(IH_NO_AMBIENT) { return out }
+  for _ in ihKeys { out.push(false) }
+  if ihOn(IH_NO_AMBIENT) || ihOn(IH_NO_AMB_NEAR) { return out }
   let s = 0
   while s < ihStMod.length {
     const m = ihStMod[s]
-    if ihStAmb[s] && m >= 0 && m < out.length {
-      if ihStWild[s] || (diags && !ihOn(IH_NO_AMB_RENDER)) { out[m] = true }
-    }
+    if ihStAmb[s] && m >= 0 && m < out.length { out[m] = true }
     s = s + 1
-  }
-  let k = 0
-  while k < ihAkSt.length {
-    const m = ihStMod[ihAkSt[k]]
-    if m >= 0 && m < out.length && !out[m] {
-      const kind = ihAkKind[k]
-      let all = true
-      if kind == IH_AK_FIELDS {
-        all = ihSetsAny || ihSets.has(ihAkName[k])
-      } else {
-        let w = ihAkLo[k]
-        while w < ihAkHi[k] {
-          if !ihFv.has(ihAkW[w]) { all = false }
-          w = w + 1
-        }
-      }
-      if kind == IH_AK_NAME && ihOn(IH_NO_AMB_NAMES) { all = false }
-      if kind == IH_AK_RECV && ihOn(IH_NO_AMB_RECV) { all = false }
-      if kind == IH_AK_FIELDS && ihOn(IH_NO_AMB_FIELDS) { all = false }
-      if all { out[m] = true }
-    }
-    k = k + 1
   }
   out
 }
 
 // The words, literal field sets and record types of the whole check, by module, so many module
-// sets can each be asked `ihAmbientMeets`'s question without reading their tokens again.
+// sets can each be asked `ihAmbientMeetsIn`'s question without reading their tokens again.
 type IhIndex = {
   xWord: {[string]: i32[]},
   xMember: {[string]: i32[]},
@@ -1251,8 +1167,8 @@ function ihIxPush(rows: i32[], m: i32): void {
   if rows.length == 0 || rows[rows.length - 1] != m { rows.push(m) }
 }
 
-// After the check: index it for `ihAmbientMeetsIn`.
-export function ihAmbientIndex(): i32 {
+// Index the parse for `ihAmbientMeetsIn` without the arena, which a check that has not run lacks.
+export function ihAmbientIndexParse(): i32 {
   const ix = ihIndexEmpty()
   let d = 0
   while d < ihKeys.length {
@@ -1337,8 +1253,19 @@ export function ihAmbientIndex(): i32 {
     }
     s = s + 1
   }
-  if !ihOn(IH_NO_AMB_ARENA) { ihIxArena(ix) }
   ihIx = ix
+  0
+}
+
+// After the check: index it for `ihAmbientMeetsIn`, the arena's records with the parse.
+export function ihAmbientIndex(): i32 {
+  ihAmbientIndexParse()
+  ihAmbientIndexArena()
+}
+
+// After `ihAmbientIndexParse` and the check it indexes: add the records the check's arena holds.
+export function ihAmbientIndexArena(): i32 {
+  if !ihOn(IH_NO_AMB_ARENA) { ihIxArena(ihIx) }
   0
 }
 
@@ -1603,10 +1530,10 @@ function ihIxHolds(a: i32, inS: boolean[]): boolean {
   ihIxIn(ihIx.xArenaM[a], inS) && ihIxSpells(ihIx.xArenaW[a], inS)
 }
 
-// `ihAmbientMeets` over a check of `inS`: a getter meets after `.` or `?.`, a method call only
-// when the check is `dirty` (a clean one resolved each call inside `inS`), a type's name only
-// with `rows`, since only a row renders one. With `arena`, a record also counts when `inS` holds
-// and spells it; with `twin`, a declaration adds nothing when `inS` declares its shape.
+// Per module, whether an ambient statement of it meets a check of `inS`: a wild one always, a
+// getter after `.` or `?.`, a method call only when `dirty`, a type's name only with `rows`. With
+// `arena`, a record also counts when `inS` holds and spells it; with `twin`, a declaration adds
+// nothing when `inS` declares its shape.
 export function ihAmbientMeetsIn(
   inS: boolean[],
   dirty: boolean,
