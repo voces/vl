@@ -5,7 +5,9 @@
 import {
   ArrayLit,
   Call,
+  FieldInit,
   FuncDecl,
+  ObjLit,
   P,
   Param,
   Paren,
@@ -17,7 +19,9 @@ import {
   nodeSpineChildren,
 } from "./ast"
 import { monoRecheckBegin } from "./check_assignable"
-import { recKeptFnDstOf } from "./check_rec_rows"
+import { recKeptFnDecl, recKeptFnDstOf } from "./check_rec_rows"
+import { recInferredFnOf } from "./check_rec_fresh"
+import { parenPeelIx } from "./check_places"
 import {
   elabCallD,
   elabCallDeclOf,
@@ -87,6 +91,8 @@ import {
   TyUnion,
   TyVar,
   genAppRowOf,
+  mkArrayTy,
+  mkObjTy,
   structNameOfTy,
   tyAt,
   tyEq,
@@ -94,6 +100,7 @@ import {
   tyHasInferHole,
   tyMentionsErr,
   tyMentionsTyVarNamed,
+  tySame,
   tyToStructStr,
 } from "./check_types"
 import {
@@ -104,7 +111,7 @@ import {
   monoArgInstFe,
   monoLamCloneTmpl,
 } from "./emit_state"
-import { tyHasTyVar } from "./tyquery"
+import { nonNulTyOf, tyHasTyVar } from "./tyquery"
 import { nodeSrc } from "./symbols"
 
 // The instances: declaration, binding names and types, and the canonical key.
@@ -967,6 +974,7 @@ export function elabRun() {
   elabLitArg = Map()
   elabArgInner = Map()
   elabSpreadInner = Map()
+  litKeptMemo = Map()
   elabAliasOf = Map()
   elabAliasDecl = Map()
   elabAliases = []
@@ -986,6 +994,14 @@ export function elabRun() {
   while g < P.nodes.length {
     elabGenTy.push(nodeTyIxOf(g))
     g = g + 1
+  }
+  // A value holding a kept function's result is stamped with the type it is built as.
+  if recKeptFnDecl.length > 0 {
+    g = 0
+    while g < P.nodes.length {
+      litKeptStamp(g)
+      g = g + 1
+    }
   }
   let r = 0
   const n = callBindCount()
@@ -1157,6 +1173,77 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   -1
 }
 
+// The type value `ix` is built as from what it holds, where a kept function's result (`recKeptFnDstOf`)
+// is under it: that call's record, a list literal whose every element is such, or a record literal
+// with such a field. -1 where nothing under it is, or a list literal mixes it with other elements.
+function litKeptRepOf(ix: i32, depth: i32): i32 {
+  if recKeptFnDecl.length == 0 || depth <= 0 || ix < 0 { return -1 }
+  const m = litKeptMemo[ix] ?? -2
+  if m != -2 { return m }
+  const r = litKeptRepFrom(ix, depth)
+  litKeptMemo[ix] = r
+  r
+}
+
+// `litKeptRepOf`, unmemoised.
+function litKeptRepFrom(ix: i32, depth: i32): i32 {
+  const p = parenPeelIx(ix)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = nodeAt(p)
+  if n is Call {
+    const fd = recInferredFnOf(p)
+    if fd < 0 { return -1 }
+    return recKeptFnDstOf(fd, nonNulTyOf(nodeTyIxOf(p)))
+  }
+  if n is ArrayLit {
+    let r = -1
+    for e in n.arrElems {
+      const er = litKeptRepOf(e, depth - 1)
+      if er < 0 || (r >= 0 && !tySame(r, er)) { return -1 }
+      r = er
+    }
+    return if r >= 0 { mkArrayTy(r) } else { -1 }
+  }
+  litKeptObjRep(p, depth)
+}
+
+// `litKeptRepOf` at a record literal `p`: its own type with each field holding a kept result
+// retyped to that result's, or -1 where `p` is no record literal or no field holds one.
+function litKeptObjRep(p: i32, depth: i32): i32 {
+  const n = nodeAt(p)
+  if n is ObjLit {
+    const own = nonNulTyOf(nodeRepTyIxOf(p))
+    const o = if own >= 0 && own < T.tys.length { T.tys[own] } else { null }
+    if !(o is TyObj) { return -1 }
+    const tys = o.objFieldTypes.slice(0)
+    let any = false
+    for f in n.objFields {
+      const fi = nodeAt(f)
+      if !(fi is FieldInit) { return -1 }
+      const fr = litKeptRepOf(fi.fiValue, depth - 1)
+      let at = 0
+      while at < o.objFieldNames.length && o.objFieldNames[at] != fi.fiName {
+        at = at + 1
+      }
+      if fr >= 0 && at < tys.length {
+        tys[at] = fr
+        any = true
+      }
+    }
+    return if any { mkObjTy(o.objFieldNames, tys) } else { -1 }
+  }
+  -1
+}
+
+// Stamps node `x` with the type `litKeptRepOf` builds it as, where that is one.
+function litKeptStamp(x: i32): i32 {
+  const r = litKeptRepOf(x, 8)
+  if r < 0 { return 0 }
+  while nodeRepTyIx.length <= x { nodeRepTyIx.push(-1) }
+  nodeRepTyIx[x] = r
+  1
+}
+
 // The type instance `k` delivers literal argument `ix` (or the node it copies) into: the parameter
 // its call's instance closes, or for a list nested in one, that list's element; -1 where none.
 function elabArgTyAt(ix: i32, k: i32, depth: i32): i32 {
@@ -1311,6 +1398,9 @@ let elabArgInner: {[i32]: i32} = Map()
 // Each list literal a spread-bearing list literal holds → that holder times two, plus one for a
 // spread operand.
 let elabSpreadInner: {[i32]: i32} = Map()
+
+// `litKeptRepOf`'s answers since the last `elabRun`.
+let litKeptMemo: {[i32]: i32} = Map()
 
 // Notes that instance `from`'s body (the root when -1) reached instance `k`, through call `ix`
 // where that is >= 0.
