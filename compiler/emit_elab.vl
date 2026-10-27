@@ -4,9 +4,12 @@
 
 import {
   ArrayLit,
+  BinExpr,
   Call,
   FieldInit,
   FuncDecl,
+  Index,
+  LetDecl,
   ObjLit,
   P,
   Param,
@@ -19,7 +22,15 @@ import {
   nodeSpineChildren,
 } from "./ast"
 import { monoRecheckBegin } from "./check_assignable"
-import { recKeptFnDecl, recKeptFnDstOf } from "./check_rec_rows"
+import {
+  recBuildCount,
+  recBuildTable,
+  recBuildTyIn,
+  recKeptFnDecl,
+  recKeptFnDstOf,
+} from "./check_rec_rows"
+import { cwPeelValue } from "./check_write_scan"
+import { recordRepTyAdopt } from "./check_fit_rules"
 import { recInferredFnOf } from "./check_rec_fresh"
 import { parenPeelIx } from "./check_places"
 import {
@@ -112,7 +123,7 @@ import {
   monoLamCloneTmpl,
 } from "./emit_state"
 import { nonNulTyOf, tyHasTyVar } from "./tyquery"
-import { nodeSrc } from "./symbols"
+import { identDeclOf, nodeSrc } from "./symbols"
 
 // The instances: declaration, binding names and types, and the canonical key.
 export let ekDecl: i32[] = []
@@ -995,11 +1006,15 @@ export function elabRun() {
     elabGenTy.push(nodeTyIxOf(g))
     g = g + 1
   }
-  // A value holding a kept function's result is stamped with the type it is built as.
-  if recKeptFnDecl.length > 0 {
+  // A value holding a kept function's result, and a literal the record solve builds at another
+  // record, is stamped with the type it is built as.
+  if recKeptFnDecl.length > 0 || recBuildCount() > 0 {
+    const bt = recBuildTable()
     g = 0
     while g < P.nodes.length {
       litKeptStamp(g)
+      litBuildStampLet(g, bt)
+      litBuildStampStore(g, bt)
       g = g + 1
     }
   }
@@ -1235,13 +1250,60 @@ function litKeptObjRep(p: i32, depth: i32): i32 {
   -1
 }
 
+// Stamps the record literal an un-annotated binding `x` holds with the record the solve builds
+// it at (`recBuildTyOf`), or each record element of the list literal it holds and that list with
+// the element's record (`recBuildElemTyOf`), both read from `bt` (`recBuildTable`); 0 where `x`
+// is no such binding.
+function litBuildStampLet(x: i32, bt: Map<i32, i32>): i32 {
+  const d = nodeAt(x)
+  if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return 0 }
+  const v = cwPeelValue(d.letInit)
+  if v < 0 || v >= P.nodes.length { return 0 }
+  const t = recBuildTyIn(bt, x, false)
+  if t >= 0 {
+    return if nodeAt(v) is ObjLit { recordRepTyAdopt(v, t, 8) } else { 0 }
+  }
+  const et = recBuildTyIn(bt, x, true)
+  const a = nodeAt(v)
+  if et < 0 || !(a is ArrayLit) { return 0 }
+  for e in a.arrElems {
+    if !(nodeAt(e) is ObjLit) { return 0 }
+  }
+  recordRepTyAdopt(v, mkArrayTy(et), 8)
+}
+
+// Stamps a record stored by `m[k] = {...}` into a binding `litBuildStampLet` stamps with that
+// binding's element record; 0 where `x` is no such store.
+function litBuildStampStore(x: i32, bt: Map<i32, i32>): i32 {
+  const d = nodeAt(x)
+  if !(d is BinExpr) || d.binOp != "=" || !(nodeAt(d.binRight) is ObjLit) {
+    return 0
+  }
+  const b = indexBaseOf(d.binLeft)
+  if b < 0 { return 0 }
+  const et = recBuildTyIn(bt, identDeclOf(b), true)
+  if et < 0 { return 0 }
+  recordRepTyAdopt(d.binRight, et, 8)
+}
+
+// The list an index place `x` reads, or -1 where `x` is not an index.
+function indexBaseOf(x: i32): i32 {
+  const l = nodeAt(x)
+  if l is Index { l.idxArr } else { -1 }
+}
+
+// Records `t` as the type node `x` is built at; 1.
+function repStampNode(x: i32, t: i32): i32 {
+  while nodeRepTyIx.length <= x { nodeRepTyIx.push(-1) }
+  nodeRepTyIx[x] = t
+  1
+}
+
 // Stamps node `x` with the type `litKeptRepOf` builds it as, where that is one.
 function litKeptStamp(x: i32): i32 {
   const r = litKeptRepOf(x, 8)
   if r < 0 { return 0 }
-  while nodeRepTyIx.length <= x { nodeRepTyIx.push(-1) }
-  nodeRepTyIx[x] = r
-  1
+  repStampNode(x, r)
 }
 
 // The type instance `k` delivers literal argument `ix` (or the node it copies) into: the parameter
