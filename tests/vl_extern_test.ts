@@ -338,6 +338,36 @@ Deno.test({
 });
 
 Deno.test({
+  name: "extern: a `: never` extern is a result-less import, and a call that returns traps (D2027)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_extern_never_" });
+    try {
+      await Deno.writeTextFile(
+        `${dir}/a.vl`,
+        "export function exit(code: i32): void {\n  print(code * 10)\n}\n",
+      );
+      const logs: string[] = [];
+      const { imports } = vlHostImports(logs);
+      const a = new WebAssembly.Instance(await buildModule(`${dir}/a.vl`), { imports });
+      const mod = await buildModule(`${CASES}/never-result.vl`);
+      // A result list on the import would make linking the `: void` export a LinkError.
+      let trapped = "";
+      try {
+        new WebAssembly.Instance(mod, { imports, extern: { exit: a.exports.exit } });
+      } catch (e) {
+        trapped = e instanceof WebAssembly.RuntimeError ? "trap" : `other: ${e}`;
+      }
+      if (trapped !== "trap" || logs.join(",") !== "2,yes!,20") {
+        throw new Error(`want logs 2,yes!,20 then a trap, got ${logs.join(",")} / ${trapped}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "extern: a module-scope loop variable spelled like an extern is the variable, not the import",
   ignore: !ENABLED,
   fn: async () => {

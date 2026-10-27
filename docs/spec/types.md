@@ -81,9 +81,10 @@ const v = f()   // refused: cannot bind the void result of 'v'
 > `void | T` written in an annotation. The first two then fail at build time, and the
 > union is refused only when it is read (D4052; the inferred face, D1993, is refused at the binding).
 
-**T1.5** `never` has no values. It may be written only as a function's declared return
-type. A `never` function must end every path in another never-returning call, such as
-`__trap__(msg)`. A call to one ends the path it is on, so a branch that calls it does not
+**T1.5** `never` has no values. It may be written only as a result: a function's or an
+`extern function`'s declared return type, or the result of a function type
+(`(string) => never`). A `never` function must end every path in another never-returning call,
+such as `__trap__(msg)`, or in a `while true` that no `break` leaves. A call to one ends the path it is on, so a branch that calls it does not
 contribute to the type of an `if` or `match`.
 
 ```vl
