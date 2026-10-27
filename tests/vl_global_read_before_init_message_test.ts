@@ -81,6 +81,28 @@ const CASES: [string, string][] = [
     "globals/mutate-folded-let-record-field-traps.vl",
     "`g` read before its initializer ran (line 11), via w\n",
   ],
+  // A `let` with no initializer holds its value after the first statement that assigns it on
+  // every path (D14360).
+  [
+    "globals/read-before-assign-scalar-traps.vl",
+    "`i` read before its initializer ran (line 6), via readI\n",
+  ],
+  [
+    "globals/read-before-assign-string-traps.vl",
+    "`s` read before its initializer ran (line 6), via readS\n",
+  ],
+  [
+    "globals/read-before-assign-from-initializer-traps.vl",
+    "`n` read before its initializer ran (line 5), via rd\n",
+  ],
+  [
+    "globals/read-before-assign-past-guarded-global-traps.vl",
+    "`n` read before its initializer ran (line 10), via rd\n",
+  ],
+  [
+    "globals/read-unassigned-at-top-level-traps.vl",
+    "`n` read before its initializer ran (line 5), via rd\n",
+  ],
   // D30's recursion witness: it must still compile, and running it now writes early.
   [
     "maps/inferred-map-return-recursion-write-before-init.vl",

@@ -383,13 +383,18 @@ import {
   gImportMemory,
   gImports,
   gInitAny,
+  gInitAt,
+  gInitAtNode,
   gInitFnReach,
   gInitGIdx,
   gInitGLocs,
   gInitGNames,
   gInitGuard,
   gInitMods,
+  gInitOrder,
+  gInitProgAfter,
   gInitProgIdx,
+  gInitRank,
   gInitReaders,
   gInitStartOrd,
   gInitialMemPages,
@@ -946,6 +951,7 @@ import {
   expCtxDefault,
   expCtxForCell,
   expCtxHere,
+  initGuardValue,
   maFoldCandidateCount,
   mapSetFnBody,
   mapSetFuncType,
@@ -960,6 +966,7 @@ import { strListHas } from "./listutil"
 import { strContains } from "./strutil"
 import { memoCompileReset, memoPassAdvance } from "./memo"
 import { MAP_KEY_I32, MAP_KEY_I64, MAP_KEY_STR } from "./check_ty_rep"
+import { daTopAssignedAt } from "./check_definite"
 
 // Host opt-in for the name section (see `gEmitNames`). The driver does NOT call
 // this, so every golden/fixpoint emit leaves names OFF; only the native tool
@@ -2538,6 +2545,17 @@ function emitInitFnCode(out: u8[], k: i32, ec: ExpCtx) {
   rc
 }
 
+// Advances the progress cell past every guarded global whose value top-level position `ord`
+// settles (D2652): the one with the highest rank there, so the cell only ever rises.
+function emitInitProgressAt(ord: i32) {
+  if gInitProgIdx < 0 { return 0 }
+  const gi = gInitProgAfter[ord] ?? -1
+  if gi < 0 { return 0 }
+  fbI32RelOf(RS_GUARD, gi, initGuardValue(gi) + relSkew(RS_GUARD))
+  fbGlobalSet(gInitProgIdx)
+  0
+}
+
 // The body both entries above share, over the nodes `startWalkWindows` set: the whole start
 // when `k` is -1, else init function `k`, which runs no pool fill and keeps the narrowing
 // its predecessor left. Frames exactly as `emitFuncCode` does.
@@ -2629,12 +2647,7 @@ function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
       )
       if gArmKept >= 0 { stmtArmScopeClose(gArmKept) }
       if gInitRc < 0 { return gInitRc }
-      // A guarded global's initializer has run (a folded one, at its declaration): advance the
-      // progress cell past it.
-      if gi < gInitGuard.length && gInitGuard[gi] >= 1 && gInitProgIdx >= 0 {
-        fbI32RelOf(RS_GUARD, gi, gi + 1 + relSkew(RS_GUARD))
-        fbGlobalSet(gInitProgIdx)
-      }
+      emitInitProgressAt(globalStmtOrd[gi])
       // The row the D1594 diagnostic reads: this initializer's own byte range, so an
       // offset inside it names the `const`/`let` rather than the whole start function.
       // A global whose init did not run here contributes no bytes and no row.
@@ -2652,6 +2665,7 @@ function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
         return -1
       }
       pushPostGuardNarrow(startStmts[si], -1)
+      emitInitProgressAt(startStmtOrd[si])
       if bodyExpr.length > sSpanAt {
         bankFnSpan(startStmts[si], -1, sSpanAt, bodyExpr.length, 1, "")
       }
@@ -7088,14 +7102,14 @@ function igWalk(
   0
 }
 
-// Whether global `gi`'s initializer builds a record or a list: an early read of one reaches the
-// object itself, and a mutation through it would outlive the declaration. Any other initializer
-// produces its value only when it runs in the start function (`globalRunsInStartFn`), or is a
-// folded constant expression, which keeps the guard its start-function store had.
+// Whether global `gi`'s value arrives only at run time, or its initializer builds a record or
+// list (an early read reaches the object itself): one with no initializer gets it from its first
+// assignment, a start-function initializer when it runs (`globalRunsInStartFn`), and a folded
+// constant expression keeps the guard its start-function store had.
 function igInitAllocates(gi: i32): boolean {
   if gi < 0 || gi >= globalStmts.length { return false }
   const init = igLetInit(globalStmts[gi])
-  if init < 0 { return false }
+  if init < 0 { return globalIsNonConst(globalStmts[gi]) }
   const e = nodeAt(unwrapParen(init))
   if e is ArrayLit { return true }
   if e is ObjLit { return true }
@@ -7123,6 +7137,7 @@ function initGuardScan(): i32 {
   gInitAny = false
   gInitProgIdx = -1
   gInitStartOrd = -1
+  initAtCompute()
   let anyCand = false
   let gi = 0
   while gi < globalStmts.length {
@@ -7161,6 +7176,7 @@ function initGuardScan(): i32 {
   const shadow: IgShadow = { names: [], live: shadowLive }
   gi = 0
   let si = 0
+  let oc = 0
   while gi < globalStmts.length || si < startStmts.length {
     let takeGlobal = gi < globalStmts.length
     if takeGlobal && si < startStmts.length {
@@ -7182,24 +7198,88 @@ function initGuardScan(): i32 {
         igWalk(fnStmts[wp], ord, shadow, seen, head, next, work)
       }
     }
-    if takeGlobal {
-      const g = nodeAt(node)
-      if g is LetDecl {
-        const bits = seen[g.letName] ?? 0
-        const early = (bits & 1) != 0
-        if early && igInitAllocates(gi) {
-          gInitGuard[gi] = 1
-          gInitAny = true
-        } else if (g.letKw == "let" && g.letInit >= 0 && (bits & 2) != 0) {
-          // A folded `let` holds its value from instantiation, so only a write can precede it.
-          gInitGuard[gi] = 2
-          gInitAny = true
-        }
-      }
-      gi = gi + 1
-    } else {
-      si = si + 1
+    while oc < gInitOrder.length && gInitAt[gInitOrder[oc]] <= ord {
+      igSettle(gInitOrder[oc], seen)
+      oc = oc + 1
     }
+    if takeGlobal { gi = gi + 1 } else { si = si + 1 }
+  }
+  while oc < gInitOrder.length {
+    igSettle(gInitOrder[oc], seen)
+    oc = oc + 1
+  }
+  for g in gInitOrder {
+    if gInitGuard[g] >= 1 && gInitAt[g] != INIT_REACH_NEVER {
+      gInitProgAfter[gInitAt[g]] = g
+    }
+  }
+  0
+}
+
+// Decides global `gi`'s guard once top-level code up to `gInitAt[gi]` has been walked: 1 when a
+// name `seen` holds read it before then and its value arrives only at run time, 2 when a folded
+// `let` is assigned before then, since it holds its value from instantiation.
+function igSettle(gi: i32, seen: Map<string, i32>) {
+  if gi < 0 || gi >= globalStmts.length || gi >= gInitGuard.length { return 0 }
+  const g = nodeAt(globalStmts[gi])
+  if g is LetDecl {
+    const bits = seen[g.letName] ?? 0
+    if (bits & 1) != 0 && igInitAllocates(gi) {
+      gInitGuard[gi] = 1
+      gInitAny = true
+    } else if (g.letKw == "let" && g.letInit >= 0 && (bits & 2) != 0) {
+      gInitGuard[gi] = 2
+      gInitAny = true
+    }
+  }
+  0
+}
+
+// Fills `gInitAt`, `gInitAtNode`, `gInitOrder` and `gInitRank`. A binding with no initializer
+// takes the position of the statement `daTopAssignedAt` names for it.
+function initAtCompute() {
+  gInitAt = []
+  gInitAtNode = []
+  gInitOrder = []
+  gInitRank = []
+  gInitProgAfter = Map()
+  const ordOf: Map<i32, i32> = Map()
+  let si = 0
+  while si < startStmts.length && si < startStmtOrd.length {
+    ordOf[startStmts[si]] = startStmtOrd[si]
+    si = si + 1
+  }
+  let gi = 0
+  while gi < globalStmts.length && gi < globalStmtOrd.length {
+    ordOf[globalStmts[gi]] = globalStmtOrd[gi]
+    gi = gi + 1
+  }
+  gi = 0
+  while gi < globalStmts.length {
+    let node = globalStmts[gi]
+    let at = ordOf[node] ?? INIT_REACH_NEVER
+    if igLetInit(node) < 0 && globalIsNonConst(node) {
+      node = daTopAssignedAt[globalStmts[gi]] ?? globalStmts[gi]
+      at = ordOf[node] ?? INIT_REACH_NEVER
+      if node == globalStmts[gi] { at = INIT_REACH_NEVER }
+    }
+    gInitAt.push(at)
+    gInitAtNode.push(node)
+    gInitRank.push(0)
+    // By position, then declaration order: only the bindings with no initializer move.
+    gInitOrder.push(gi)
+    let k = gInitOrder.length - 1
+    while k > 0 && gInitAt[gInitOrder[k - 1]] > at {
+      gInitOrder[k] = gInitOrder[k - 1]
+      k = k - 1
+    }
+    gInitOrder[k] = gi
+    gi = gi + 1
+  }
+  let r = 0
+  while r < gInitOrder.length {
+    gInitRank[gInitOrder[r]] = r
+    r = r + 1
   }
   0
 }
