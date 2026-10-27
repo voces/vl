@@ -11026,3 +11026,23 @@ when they land apart each store refuses at its own row. #4953 had built this for
 D14509 and D14518 were the same mechanism at a list element and through a binding. Keeping a
 map-only rule beside a list rule would be two producers of one fact. No per-instance rep carrier
 was needed.
+
+## A function value in a container keeps its set's one rep — (γ)
+
+A function-value set has one rep, the tag decided from the final check (D14427). (γ) lets a
+container element (a list or record literal, an index, a member) reach the direct-call tag rule,
+so the element carries that rep and a write into the container joins the set. Two other answers
+were refused. Per-tuple instancing of the binding (P) gives each call tuple its own copy of the
+list, so a write through one name is not seen through another: it breaks aliasing. A rep that
+depends on which set the element holds (R) is a second rep for one value, which every reader
+would then have to choose between. Fixed-storage destinations keep the clause-2 refusal (D14532).
+
+## A narrowed read's storage fact has one writer
+
+The checker's `nodeTyAt` gives a narrowed read its narrowed type, so the only thing the emit
+narrowing stack still knows is that the read was cut from a wider declared rep. That fact is a
+node table, `narrowedFromTy[readIx]`, written once where the narrowing is applied, read by node
+and never by name or path key, and reset with the per-check node facts. The emitter does not
+rebuild it by walking the place: that walk is the stack under another name, and the stack's
+place key already missed reads the checker proves (18 over 5,707 fixtures, #4965). Two writers of
+one fact disagree exactly where one of them has a hole.
