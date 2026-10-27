@@ -11,41 +11,17 @@ import {
   AsExpr,
   BinExpr,
   Block,
-  BoolLit,
-  BreakStmt,
   Call,
-  CharLit,
-  ContinueStmt,
-  ErrExpr,
-  FieldDef,
   FieldInit,
-  ForIn,
-  ForRange,
   FuncDecl,
   Ident,
-  IfStmt,
-  ImportDecl,
   Index,
-  IsExpr,
   LetDecl,
-  MatchExpr,
-  Member,
-  NullLit,
   NumLit,
   ObjLit,
-  OptMember,
   P,
-  Param,
   Paren,
-  Program,
-  RetStmt,
-  Spread,
-  StrLit,
-  TypeDecl,
-  TypeRef,
   Unary,
-  UnionDecl,
-  WhileStmt,
   declHasExportKw,
   i32ToStr,
   nodeAt,
@@ -112,13 +88,6 @@ import {
   parseI32,
 } from "./emit_bignum"
 
-// Is `ix` a numeric literal, possibly negated or parenthesised?
-export function exprIsNumLit(ix: i32): boolean {
-  const e = nodeAt(parenPeelIx(ix))
-  if e is Unary { return e.unOp == "-" && exprIsNumLit(e.unArg) }
-  e is NumLit
-}
-
 // Is `ix` a `let`/`const` with no annotation whose initializer is a numeric literal, a
 // non-empty list literal of them, or a record literal with a numeric-literal field?
 export function letDeclIsUnannotNumLit(ix: i32): boolean {
@@ -130,7 +99,7 @@ export function letDeclIsUnannotNumLit(ix: i32): boolean {
       for fi in iv.objFields {
         const f = nodeAt(fi)
         if f is FieldInit {
-          if exprIsNumLit(f.fiValue) { return true }
+          if cexLitPeel(f.fiValue) >= 0 { return true }
         }
       }
       return false
@@ -138,11 +107,11 @@ export function letDeclIsUnannotNumLit(ix: i32): boolean {
     if iv is ArrayLit {
       if iv.arrElems.length == 0 { return false }
       for el in iv.arrElems {
-        if !exprIsNumLit(el) { return false }
+        if cexLitPeel(el) < 0 { return false }
       }
       return true
     }
-    return exprIsNumLit(n.letInit)
+    return cexLitPeel(n.letInit) >= 0
   }
   false
 }
@@ -366,7 +335,8 @@ export function cexNamesNone(): i32 { 0 }
 // A constant tree holds no other node; anything else has no position to give.
 export function cexPosNone(): i32 { 0 }
 
-// The integer literal node under parentheses and negations at `ix`, or -1.
+// The number literal under parentheses and negations at `ix`, or -1. The one answer to "is this
+// a number literal": negation is exact, so a negated literal is a literal wherever the bare one is.
 export function cexLitPeel(ix: i32): i32 {
   if ix < 0 { return -1 }
   const e = nodeAt(ix)
@@ -690,7 +660,7 @@ export function numLitCallStoresNonLit(
   }
   let i = from
   while i < c.callArgs.length {
-    if !exprIsNumLit(c.callArgs[i]) { return true }
+    if cexLitPeel(c.callArgs[i]) < 0 { return true }
     i = i + 1
   }
   false
@@ -735,7 +705,7 @@ export function numLitAnnotNote(
 }
 
 // The source text of numeric literal `ix`, possibly negated once or parenthesised; `…` for any
-// other shape, which `exprIsNumLit` callers never pass.
+// other shape, which `cexLitPeel` callers never pass.
 export function numLitText(ix: i32): string {
   const e = nodeAt(parenPeelIx(ix))
   let neg = ""
@@ -810,7 +780,7 @@ export function numLitValuesFit(ix: i32, ty: string): boolean {
     }
     return true
   }
-  if !exprIsNumLit(ix) { return true }
+  if cexLitPeel(ix) < 0 { return true }
   let t = numLitText(ix)
   if t.length > 0 && t[0] == '-' { t = t.slice(1, t.length) }
   let base = 10.0
@@ -908,57 +878,27 @@ export function numLitIsFnTail(c: i32, p: i32, par: {[i32]: i32}): boolean {
   false
 }
 
-// Is the expression at `ix`, peeling parens, a float number literal — one spelled with a `.` or
-// with a scientific exponent? A float literal is polymorphic across the float types: it types f64
-// by default but re-encodes exactly into an f32 slot, so it is accepted there and the demote a
-// general f64 value would need is never performed. Integer literals ride the widening lattice.
+// Is `ix` a float literal (`cexLitPeel`), spelled with a `.` or an exponent, that f32 holds? It
+// types f64 but re-encodes into an f32 slot, so no demote is performed; one that overflows f32
+// would encode ±infinity there and gets no grant. Integer literals ride the widening lattice.
 export function isFloatLitExpr(ix: i32) {
-  if ix < 0 { return false }
-  const e = nodeAt(ix)
-  match e {
-    Paren => {
-      return isFloatLitExpr(e.parInner)
-    }
-    // A unary minus over a float literal (`-1.5`) is still a float literal — negation is exact in
-    // IEEE-754, so it re-encodes at f32 and flows into any f32 position the positive literal would.
-    // Without this a leading `-` makes the value a plain f64 expression, rejected as a lossy demote.
-    Unary => {
-      if e.unOp == "-" { return isFloatLitExpr(e.unArg) }
-    }
-    // A literal whose magnitude overflows f32 does not re-encode at f32 — it would encode ±infinity
-    // — so it gets no f32 grant and takes the normal f64-into-f32 lossy-demote rejection at the flow
-    // site.
-    NumLit => {
-      if !numLexIsFloat(e.numText) { return false }
-      return !f32LitOverflows(e.numText)
-    }
-    // no other expression is a float literal
-    StrLit | CharLit | BoolLit | NullLit | Ident | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  const lix = cexLitPeel(ix)
+  if lix < 0 { return false }
+  const e = nodeAt(lix)
+  if e is NumLit {
+    return numLexIsFloat(e.numText) && !f32LitOverflows(e.numText)
   }
   false
 }
 
-// The lexeme of the INTEGER literal at `ix`, peeling parens and a unary sign, or "" when the
-// expression is not one. One walk for both float grants, so f32 and f64 cannot drift apart on
-// what counts as a literal. A char literal is excluded — a code point in a float slot is a
-// category confusion — and the sign is dropped because exactness is symmetric.
+// The lexeme of the integer literal at `ix` (`cexLitPeel`), or "" when the expression is not one.
+// A char literal is excluded — a code point in a float slot is a category confusion — and the
+// sign is dropped because exactness is symmetric.
 export function intLitLexemeOf(ix: i32): string {
-  if ix < 0 { return "" }
-  const e = nodeAt(ix)
-  match e {
-    Paren => {
-      return intLitLexemeOf(e.parInner)
-    }
-    Unary => {
-      if e.unOp == "-" { return intLitLexemeOf(e.unArg) }
-    }
-    NumLit => {
-      if numLexIsFloat(e.numText) { return "" }
-      return e.numText
-    }
-    // no other expression is an integer literal
-    StrLit | CharLit | BoolLit | NullLit | Ident | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
-  }
+  const lix = cexLitPeel(ix)
+  if lix < 0 { return "" }
+  const e = nodeAt(lix)
+  if e is NumLit && !numLexIsFloat(e.numText) { return e.numText }
   ""
 }
 
