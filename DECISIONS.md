@@ -10964,3 +10964,65 @@ unlanded-call-beside-call-into-wider-record matrix loud→silent, and minting fr
 clear them. The residue is the call-result slot: a binding, capture or `Map` value holding a call
 result is typed at the declared row by name, while the callee builds at another row
 (`recKeptFnDstOf`). The slot takes the rep the callee builds. `recReadInPlace` goes after that.
+
+## A readonly list is covariant only over elements that need no conversion (#4948) — D14514
+
+D14514 was filed as a capability gap: `Small[]` delivered at `readonly Circle[]`, where the two
+records store a field differently, is refused. It is re-graded DESIGN. A record is shared, not
+copied, so a view cannot re-store its fields. The single delivery refuses the same way, and the
+two-row delivery is D8301's refusal. The defect was the hints: they offered `readonly Circle[]` and
+`.map((x): Circle => x)`, and both refuse. The hint now rebuilds the element from the
+destination's field list (`.map((x): Circle => { r: x.r })`), which runs, and the refusal stays.
+
+## (c) is about function values in un-annotated containers, not instances (ruling, 2026-10-27)
+
+Slice (c) was scoped as instances failing to close their holes. Measured, the open-type events are
+function values in un-annotated containers outside any instance (about 99%); holes are about 1%.
+The ruling takes (δ) and (α), so c-1 folds into c-3. The checker records the SET of call tuples that reach an element. With one
+tuple, the closed element type is stamped on the binding and the pin is deleted there. Tuples that
+disagree (`xs[0](2); xs[0]("s")`) stay on the pin, counted and listed. Their direction is (γ), one
+closure per tuple; (α) is (γ)'s one-tuple case, not a separate rung.
+
+## c-3 stamps the one-tuple case; many-tuple lists are the next slice (ruling, 2026-10-27)
+
+About 29 of 89 open-type files have two or more call tuples: 16 capture cells and about 13
+generic or hole function lists. c-3 builds the call-tuple set as the checker fact and stamps the
+one-tuple case (about 60 files). The pin stays only for the many-tuple files, which are listed.
+The capture cells go to the let-write join slice. (γ) for many-tuple lists is the slice after
+c-3, and that slice deletes the pin.
+
+## The impure else-if's nested join is the let-write join slice's (2026-10-27)
+
+The holes-close probe's untriaged `fn-choice-bound-impure-else-if` is a nested join that carries a
+set at another set's join tail; the singleton deferral rule covers member names only. It is an
+extension of the join rule, so it is grouped with the let-write join slice, not with (c). Its row
+is filed on the branch that carries that slice.
+
+## An instance's type and its rep are separate facts (c-2 ruling, 2026-10-27) — D14515 kind 1
+
+D14515's kind 1 (a call result reaching a hole parameter) is produced by `callBindAdoptRekey`
+(D8202), which makes the rep row the instance's TYPE binding. That row is never checked against
+the body, and the quiet elaboration re-check swallows the ill-typed operator it admits. Direction
+(a): the instance stays at the checker's binding, the parameter's pin is its rep, and lets and
+returns that copy it take that rep. The rekey is deleted as a type producer, and D8202's
+instance-at-row route goes with it. It changes reps, so it runs the rep-fuzz gate, and it is
+sequenced after c-3.
+
+## A literal is built at the width of the position that reads it (ruling, 2026-10-27)
+
+This states the rule behind "Building a literal at the width a consumer demands is building". The
+producer of a literal's built width is the checker's type of the position that consumes it (a
+numeric-union dispatch member, a `const` reference's delivered type), not one node type per
+literal. `emitNumLitAs(w)` stays the per-use builder only while every caller takes `w` from a
+checker type; a caller that computes `w` itself is the defect. #4952 typed the record-field case,
+and a probe against the consumer's checker type leaves 11 files.
+
+## A value stored into an un-annotated container is that container's build (#4954)
+
+One rule serves lists and maps: a `Map()` store, a list-literal element and an index store into a
+list-literal binding all contribute the stored value's build, directly or through a `const` that
+only stores the value or reads a field of it. When the builds agree they are the container's row;
+when they land apart each store refuses at its own row. #4953 had built this for maps alone, and
+D14509 and D14518 were the same mechanism at a list element and through a binding. Keeping a
+map-only rule beside a list rule would be two producers of one fact. No per-instance rep carrier
+was needed.
