@@ -84,6 +84,7 @@ import {
 } from "./check_relate_core"
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
+import { unionTyIxOfIdentAt } from "./emit_start_block"
 import { cwFnValueDeclOf } from "./check_write_scan"
 import { tyLeavesDisjoint } from "./check_type_shape"
 import { REC_REBUILT_DEPTH, recRebuiltRetRow } from "./check_bind_adopt"
@@ -570,6 +571,7 @@ import {
   exactBindWalk,
   exactSubAt,
   holeNulStringPinTyOf,
+  instanceBindsNothingClosed,
   mapTyScalarBoxKind,
   monoExactSubRowOf,
   nodeTyInOf,
@@ -1409,12 +1411,20 @@ function monoUnionPinNameOfTy(ty: i32): string {
   if ur >= 0 && ur < unNames.length { return monoAnnPinName(unNames[ur]) }
   // An inferred value union nothing spells (an if-expression argument's join) has no row
   // until a pin mints one, as a binding of the same join registers its own (D2824).
-  const vn = valueUnionRetName(ty)
-  if vn != "" && monoRegisterPinUnion(vn, ty) >= 0 {
+  const vn = monoRegisterValueUnion(ty)
+  if vn != "" {
     const vr = monoAnnPinName(vn)
     if vr != "" { return vr }
   }
   monoNulUnionPinName(ty)
+}
+
+// Registers the row of value union `ty`, returning its name, or "" when it is no value union or
+// registering it failed.
+function monoRegisterValueUnion(ty: i32): string {
+  const vn = valueUnionRetName(ty)
+  if vn == "" || monoRegisterPinUnion(vn, ty) < 0 { return "" }
+  vn
 }
 
 // The `T | null` half of the question above, and the one arm whose pin the membership list
@@ -1831,7 +1841,11 @@ function monoClosedTyName(ty: i32): string {
       return monoAnnPinName(sNames[si])
     }
     TyUnion | TyNullable => {
-      if !tyIsUnionish(ty) { return "" }
+      // A union of non-literal members is its flattened members in order, which its render
+      // spells; an alias row matched by member set names another union's tags (D3129).
+      if !tyIsUnionish(ty) || (t is TyUnion && !monoUnionHasLitMember(ty)) {
+        return ""
+      }
       const ur = unRowOfCanon(ty)
       if ur >= 0 && ur < unNames.length {
         const un = monoAnnPinName(unNames[ur])
@@ -1891,11 +1905,6 @@ function monoIdentReadsValue(ix: i32): boolean {
   !(nodeAt(d) is FuncDecl)
 }
 
-// Whether `ty` is a list whose type still names a type variable or a hole.
-function monoTyIsOpenList(ty: i32): boolean {
-  ty >= 0 && ty < T.tys.length && tyAt(ty) is TyArray && tyHasTyVar(ty)
-}
-
 // The rep rungs of `monoArgTyName`, after every binding and projection arm declined: the
 // argument's own recorded type, then the collection, union, record and scalar cascades.
 // `cax` is `ix` with its grouping parens peeled. "" is the loud floor, `"i32"` the last rung.
@@ -1916,11 +1925,6 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
       const ealRow = structRowOfObjFieldSet(ealEl)
       if ealRow >= 0 { return sNames[ealRow] + "[]" }
       if ealEl >= 0 { return "" }
-    }
-    // At an open list its type variable is bound by no element, so it takes the unbound
-    // default's list, as a parameter no argument names does (D12581).
-    if ealN.arrElems.length == 0 && monoTyIsOpenList(nodeTyIxOf(cax)) {
-      return MONO_UNBOUND_TY_PARAM_DEFAULT + "[]"
     }
   }
   // A map or Set argument pins its param as that map — the whole `{[K]:V}` spelling an
@@ -2528,7 +2532,82 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
   monoArgTyNameProjected(ix, fnIx, cax)
 }
 
+// The pin argument `ix` binds its parameter at, at instance `fnIx`: its closed type's, else
+// the cascade's for a type that does not decide it.
 export function monoArgTyName(ix: i32, fnIx: i32) {
+  const tp = monoArgClosedPin(ix, fnIx)
+  if tp != "" { return tp }
+  monoArgTyNameCascade(ix, fnIx)
+}
+
+// The pin of argument `ix` read from its closed type at instance `fnIx`, or "" where the type
+// does not decide it, which the decline tests by the type's kind.
+function monoArgClosedPin(ix: i32, fnIx: i32): string {
+  const cax = unwrapParen(ix)
+  if cax < 0 || cax >= P.nodes.length { return "" }
+  let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
+  if t < 0 { t = monoUnboundDefaultTy(nodeTyAt(cax, fnIx), fnIx) }
+  if t < 0 || t >= T.tys.length { return "" }
+  // Declined: record build row (a4cf's row-key fact), `=>`/#anon (a4cf), narrowed read (aa0c K).
+  if tyHoldsObj(t, 8) || tyMayHoldFn(t, 0) || monoReadIsNarrowed(cax, fnIx) {
+    return ""
+  }
+  // A union of numeric literals is its base scalar, which is how its values are stored.
+  if tyAt(t) is TyUnion {
+    const nb = numLitUnionBaseName(t)
+    if nb != "" { return nb }
+  }
+  // A value union nothing spells gets its row here, which the instance's boxes read tags from.
+  if tyIsUnionish(t) && unRowOfCanon(t) < 0 { monoRegisterValueUnion(t) }
+  monoClosedTyPin(t)
+}
+
+// The unbound-parameter default's list for a list type `ty` whose element is a type variable no
+// instance on `fnIx`'s chain binds to a closed type (D12581); else -1.
+function monoUnboundDefaultTy(ty: i32, fnIx: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const a = tyAt(ty)
+  if !(a is TyArray) || a.aElem < 0 || a.aElem >= T.tys.length { return -1 }
+  const el = tyAt(a.aElem)
+  if !(el is TyVar) || !instanceBindsNothingClosed(ty, fnIx) { return -1 }
+  const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
+  if dt < 0 { return -1 }
+  const nm: string[] = [el.tvName]
+  const tv: i32[] = [dt]
+  const s = substTyDeep(ty, nm, tv)
+  if s < 0 || s >= T.tys.length || tyHasTyVar(s) { return -1 }
+  s
+}
+
+// Whether `ix` reads a place at a type other than the one the place holds: a binding, field or
+// element whose held type is union-shaped and differs from the type recorded at the read.
+function monoReadIsNarrowed(ix: i32, fnIx: i32): boolean {
+  const rt = nodeTyAt(ix, fnIx)
+  if rt < 0 || rt >= T.tys.length { return false }
+  const held = monoPlaceHeldTy(ix, fnIx)
+  if held < 0 || held >= T.tys.length { return false }
+  if !(tyAt(held) is TyUnion || tyAt(held) is TyNullable) { return false }
+  !tySame(held, rt)
+}
+
+// The type the place `ix` reads holds: a binding's declared or initializer type, a field's type
+// on its receiver, a list element's type; -1 for an expression that is not a place.
+function monoPlaceHeldTy(ix: i32, fnIx: i32): i32 {
+  const n = nodeAt(ix)
+  if n is Ident { return unionTyIxOfIdentAt(sidOfNode(ix), fnIx, ix) }
+  if n is Member { return tyFieldTyOf(nodeTyAt(n.memObj, fnIx), n.memProp) }
+  monoElemPlaceHeldTy(ix, fnIx)
+}
+
+// The element type the list an `xs[i]` read indexes holds; -1 for any other expression.
+function monoElemPlaceHeldTy(ix: i32, fnIx: i32): i32 {
+  const n = nodeAt(ix)
+  if n is Index { return tyArrayElemIx(nodeTyAt(n.idxArr, fnIx)) }
+  -1
+}
+
+// The binding, projection and rep rungs, for an argument whose type does not decide its pin.
+function monoArgTyNameCascade(ix: i32, fnIx: i32) {
   const cax = unwrapParen(ix)
   // A literal the checker retyped at a hole parameter's demand pins at that type (D5840).
   const hlp = holeLitPinOf(cax)
