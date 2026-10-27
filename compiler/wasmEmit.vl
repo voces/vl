@@ -30,7 +30,12 @@ import { fsAsk, fsAskCallee } from "./fn_split"
 import { keyHasPrefix } from "./check_places"
 import { elabSpreadNote, elabSpreadRunNote, litRepTyAt } from "./emit_elab"
 import { canonUnionMembersInto } from "./check_program"
-import { numCastCanFail, numUnionMembersOf } from "./check_num_lits"
+import {
+  cexLitPeel,
+  intLitIsNegated,
+  numCastCanFail,
+  numUnionMembersOf,
+} from "./check_num_lits"
 import { intMatchHeadAt, matchScrutAt } from "./check_match_heads"
 import {
   condProvenTrue,
@@ -9029,21 +9034,11 @@ function ifJoinAdaptsScalar(ifIx: i32, fnIx: i32): boolean {
   let widens = false
   for lf in valueTailLeaves(ifIx) {
     if tyPrimNameOf(nodeTyAt(lf, fnIx)) != pn {
-      if nodeIsNumLitLeaf(lf) { return false }
+      if cexLitPeel(lf) >= 0 { return false }
       widens = true
     }
   }
   widens
-}
-
-// Whether `ix` is a number literal, or `-` over one, through parens.
-function nodeIsNumLitLeaf(ix: i32): boolean {
-  const n = nodeAt(unwrapParen(ix))
-  if n is Unary {
-    if n.unOp != "-" { return false }
-    return nodeAt(unwrapParen(n.unArg)) is NumLit
-  }
-  n is NumLit
 }
 
 // One link of `emitUnionIfValue`: 0 or -1 as that function returns, or 1 when the else is another `if`
@@ -21845,7 +21840,7 @@ function widenClassifyExpr(exprIx: i32, fnIx: i32) {
 // several widths (a numeric-union member's arithmetic, a fresh-record call's field), so no one
 // checker type carries this; re-encoding keeps a hex literal past I32_MAX the value it spells.
 function emitNumLitAs(exprIx: i32, w: string): i32 {
-  if signedNumLitText(exprIx) == "" { return -2 }
+  if cexLitPeel(exprIx) < 0 { return -2 }
   emitSignedNumLitAt(unwrapParen(exprIx), w)
 }
 
@@ -21915,37 +21910,6 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
   fbF64ConvertI32S()
   0
-}
-
-// The decimal text of a (possibly signed) numeric literal at `exprIx`, sign folded into
-// the text, or "" when the expression is not a literal. Peels grouping parens and any
-// number of unary minuses, matching the checker's peel exactly — granting more shapes
-// than the emitter recognizes is invalid wasm. The iteration bound guards a malformed arena, not a semantic limit.
-function signedNumLitText(exprIx: i32) {
-  let ix = unwrapParen(exprIx)
-  let neg = false
-  let guard = 0
-  while guard < 64 {
-    if ix < 0 { return "" }
-    const nd = nodeAt(ix)
-    match nd {
-      Unary => {
-        if nd.unOp != "-" { return "" }
-        neg = !neg
-        ix = unwrapParen(nd.unArg)
-      }
-      NumLit => {
-        if neg { return "-" + nd.numText }
-        return nd.numText
-      }
-      // Any other node is not a signed literal.
-      StrLit | CharLit | BoolLit | NullLit | Ident | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {
-        return ""
-      }
-    }
-    guard = guard + 1
-  }
-  ""
 }
 
 // Emit the expression at `exprIx` as an f32 value: already-f32 emits as-is; a bare
@@ -32552,13 +32516,8 @@ function emitForRangeStmt(
   // refuses an out-of-range step, so the refusals here are backstops.
   let stepK = 1
   if s.frStep >= 0 && !dynStep {
-    let litIx = s.frStep
-    let neg = false
-    const st = nodeAt(s.frStep)
-    if st is Unary {
-      litIx = st.unArg
-      neg = true
-    }
+    const litIx = cexLitPeel(s.frStep)
+    const neg = intLitIsNegated(s.frStep)
     let folded = false
     if litIx >= 0 {
       const lit = nodeAt(litIx)
@@ -33089,15 +33048,12 @@ function rangeStaticTrips(n: ForRange, fnIx: i32) {
 function rangeConstIs(ix: i32, fnIx: i32): boolean {
   const x = unwrapParen(ix)
   if x < 0 || x >= P.nodes.length { return false }
-  const e = nodeAt(x)
-  if e is NumLit {
-    return !numLexIsFloat(e.numText) && numLexFitsI32(e.numText)
-  }
-  if e is Unary {
-    if e.unOp != "-" { return false }
-    const inner = nodeAt(unwrapParen(e.unArg))
-    if inner is NumLit { return rangeConstIs(e.unArg, fnIx) }
-    return false
+  const k = cexLitPeel(x)
+  if k >= 0 {
+    const lit = nodeAt(k)
+    if lit is NumLit {
+      return !numLexIsFloat(lit.numText) && numLexFitsI32(lit.numText)
+    }
   }
   // Any other kind has a value only as the name of a module `const` bound to one of the above.
   const init = rangeConstInitOf(x, fnIx)
@@ -33109,9 +33065,14 @@ function rangeConstIs(ix: i32, fnIx: i32): boolean {
 function rangeConstVal(ix: i32, fnIx: i32): i32 {
   const x = unwrapParen(ix)
   if x < 0 || x >= P.nodes.length { return 0 }
-  const e = nodeAt(x)
-  if e is NumLit { return parseI32(e.numText) }
-  if e is Unary { return 0 - rangeConstVal(e.unArg, fnIx) }
+  const k = cexLitPeel(x)
+  if k >= 0 {
+    const lit = nodeAt(k)
+    if lit is NumLit {
+      const v = parseI32(lit.numText)
+      return if intLitIsNegated(x) { 0 - v } else { v }
+    }
+  }
   // Any other kind is the name of a module `const`, as `rangeConstIs` accepted it.
   rangeConstVal(rangeConstInitOf(x, fnIx), -1)
 }
@@ -36306,7 +36267,7 @@ function njStash(
     fbLocalSet(bs)
     return bs
   }
-  if signedNumLitText(ix) != "" { return -2 }
+  if cexLitPeel(ix) >= 0 { return -2 }
   const k = njKindOfExpr(ix, fnIx)
   if emitExprAsKind(body, ix, k, fnIx, ec) < 0 { return -1 }
   const ss = njSlot(27, njMfKind(k), key)
