@@ -1548,37 +1548,6 @@ function monoCapturedParamPin(name: string, fnIx: i32): string {
   ""
 }
 
-// The function-value pin of the un-annotated `let` a closure at `fnIx` captures as `name`, read at
-// the frame declaring it as a read there would be, or "" for a parameter, an annotated binding or
-// a pin that is not a function value's (D13660).
-function monoCapturedLetFnPin(name: string, fnIx: i32): string {
-  if fnIx < 0 { return "" }
-  const own = nodeAt(fnIx)
-  if !(own is FuncDecl) || paramIndexOf(fnIx, name) >= 0 { return "" }
-  if parentLetOf(own.fnBody, name) >= 0 { return "" }
-  let pp = fnStmtsPosOf(fnIx)
-  let steps = 0
-  while pp >= 0 && pp < fnParent.length && steps < 64 {
-    pp = fnParent[pp]
-    if pp < 0 || pp >= fnStmts.length { return "" }
-    const fx = fnStmts[pp]
-    const fn = nodeAt(fx)
-    if fn is FuncDecl {
-      const li = parentLetOf(fn.fnBody, name)
-      if li >= 0 {
-        const ld = nodeAt(li)
-        if !(ld is LetDecl) || ld.letType >= 0 || ld.letInit < 0 { return "" }
-        const pin = monoArgTyName(ld.letInit, fx)
-        if sigKeyPinPayload(pin) == "" { return "" }
-        return pin
-      }
-      if paramIndexOf(fx, name) >= 0 { return "" }
-    }
-    steps = steps + 1
-  }
-  ""
-}
-
 // Whether shape spelling `sp` resolves to no row or to an anonymous one. A declared record
 // sharing its field names can claim it by the lenient field-set scan, and then the instance
 // would read the argument at that record's layout (D3123).
@@ -2548,10 +2517,9 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
   let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
   if t < 0 { t = monoUnboundDefaultTy(nodeTyAt(cax, fnIx), fnIx) }
   if t < 0 || t >= T.tys.length { return "" }
-  // Declined: record build row (a4cf's row-key fact), `=>`/#anon (a4cf), narrowed read (aa0c K).
-  if tyHoldsObj(t, 8) || tyMayHoldFn(t, 0) || monoReadIsNarrowed(cax, fnIx) {
-    return ""
-  }
+  // Declined: record build row (a4cf's row-key fact), narrowed read (aa0c K).
+  if tyHoldsObj(t, 8) || monoReadIsNarrowed(cax, fnIx) { return "" }
+  if tyMayHoldFn(t, 0) { return monoFnTyPin(t) }
   // A union of numeric literals is its base scalar, which is how its values are stored.
   if tyAt(t) is TyUnion {
     const nb = numLitUnionBaseName(t)
@@ -2560,6 +2528,19 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
   // A value union nothing spells gets its row here, which the instance's boxes read tags from.
   if tyIsUnionish(t) && unRowOfCanon(t) < 0 { monoRegisterValueUnion(t) }
   monoClosedTyPin(t)
+}
+
+// The pin of closed function-bearing type `ty`: a function by its `$fnsig` key, a nullable
+// function by its render, a container of them through `monoClosedTyPin`; "" when the key has
+// no token for a part.
+function monoFnTyPin(ty: i32): string {
+  if tyAt(ty) is TyFunc {
+    const k = sigKeyOfTy(ty)
+    if k == "" { return "" }
+    return "=>" + k
+  }
+  if tyNulFuncInner(ty) >= 0 { return tyToEmitName(ty) }
+  monoClosedTyPin(ty)
 }
 
 // The unbound-parameter default's list for a list type `ty` whose element is a type variable no
@@ -2650,7 +2631,7 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
     const nluElName = monoI32AtomPinName(nluEl)
     if nluElName != "" { return arrElemSuffixed(nluElName) }
   }
-  // The third channel, read before both arms below because both need it: an instance's
+  // The third channel, read here because the function-value arm below needs it: an instance's
   // own `x: T` parameter or `const y: T = x` local carries the pin as its annotation, and
   // neither other channel can see it. This is what a generic forwarder hands its inner call.
   const cloPinNode = monoCloPinAnnNodeOfExpr(cax, fnIx)
@@ -2680,20 +2661,6 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
         if ncq != "" { return ncq }
       }
     }
-  }
-  // A nullable function value (kind 19), before the bare-closure arm below and pinned
-  // differently on purpose: a bare closure pins the `$fnsig` marker, while
-  // `((i32) => i32) | null` is a parameter annotation the emitter already lowers end to
-  // end. `tyToEmitName` groups the arrow, which is what makes the pin round-trip.
-  let nulFnTy = nodeTyAt(cax, fnIx)
-  // A forwarder's own binding again: its node carries `T`, its annotation carries the pin,
-  // and for a nullable closure that pin is already the spelling this arm returns.
-  if tyNulFuncInner(nulFnTy) < 0 && cloPinNode >= 0 {
-    nulFnTy = nodeTyIxOf(cloPinNode)
-  }
-  if tyNulFuncInner(nulFnTy) >= 0 {
-    const nulFnName = tyToEmitName(nulFnTy)
-    if nulFnName != "" { return nulFnName }
   }
   // The arena asks the closure question, because `exprIsClosure` cannot ask it here: that
   // predicate resolves through tables `buildLocals` fills post-mono. `nodeTyIsFunc` is the
@@ -2729,10 +2696,8 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
     // a pin that cannot name the signature must not fall through to the i32 catch-all.
     const ak = sigKeyOfTy(nodeTyAt(cax, fnIx))
     if ak != "" { return "=>" + ak }
-    // Last: the pin an instance's OWN binding already carries (a generic forwarder), or the
-    // one an enclosing frame's un-annotated binding of a captured name pins at.
+    // Last: the pin an instance's OWN binding already carries (a generic forwarder).
     if cloPinNode >= 0 { return tyNameOf(cloPinNode) }
-    if ce is Ident { return monoCapturedLetFnPin(ce.identName, fnIx) }
     return ""
   }
   // An if-expression whose join is still a type parameter and whose then arm's value is a
