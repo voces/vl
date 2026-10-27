@@ -21,6 +21,7 @@ import {
   LetDecl,
   Node,
   OptMember,
+  P,
   Paren,
   RetStmt,
   TypeRef,
@@ -102,7 +103,6 @@ import { letDeclFnPut, tsMapKeyNodeOf, wrDstDeclPut } from "./check_decl_scan"
 import {
   daAddNode,
   daMark,
-  daMarkAssigned,
   daMarkAssignedNode,
   daRelease,
   daRollbackTo,
@@ -298,7 +298,7 @@ import {
 } from "./check_types"
 import { breakValueAt } from "./check_unconsumed"
 import { fnDeclIx } from "./check_write_scan"
-import { identFromDecl, identRedirectLoop, sidOfNode } from "./symbols"
+import { identFromDecl, identRedirect, sidOfNode } from "./symbols"
 import {
   isNeverTy,
   isNulBoolTy,
@@ -1074,7 +1074,10 @@ function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
   const vDecl = luDecl("let", n.fiVar, elem, val, ix, pos)
   luDeclPosPut(vDecl, n.fiIter)
   loop.push(vDecl)
-  identRedirectLoop(ix, n.fiVar2, vDecl, atDecl)
+  const lmoved: {[i32]: i32} = Map()
+  lmoved[n.fiDecl1] = vDecl
+  if n.fiDecl2 >= 0 { lmoved[n.fiDecl2] = atDecl }
+  identRedirect(lmoved)
   const bn = nodeAt(n.fiBody)
   if bn is Block {
     let i = 0
@@ -1118,6 +1121,8 @@ function lmForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[]): i32 {
     const fw: Node = {
       fiVar: n.fiVar,
       fiVar2: n.fiVar2,
+      fiDecl1: n.fiDecl1,
+      fiDecl2: n.fiDecl2,
       fiIter: keys,
       fiBody: n.fiBody,
       fiLabel: n.fiLabel,
@@ -1170,8 +1175,14 @@ function lmForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[]): i32 {
     ix,
   )
   outer.push(fl)
-  identFromDecl(atRef, fl)
-  identRedirectLoop(ix, n.fiVar2, fl, vDecl)
+  if fl < 0 || fl >= P.nodes.length { return -1 }
+  const fln = nodeAt(fl)
+  if !(fln is ForIn) { return -1 }
+  identFromDecl(atRef, fln.fiDecl2)
+  const mmoved: {[i32]: i32} = Map()
+  mmoved[n.fiDecl1] = fln.fiDecl1
+  mmoved[n.fiDecl2] = vDecl
+  identRedirect(mmoved)
   const once = luAt(mkBool(1, -1), ix)
   const w: Node = {
     ifCond: once,
@@ -1368,8 +1379,8 @@ export function checkForInNode(n: ForIn, ix: i32) {
   // See ForRange: a `for` body re-executes with nothing to re-establish a narrowing.
   pushReBarrier(crLoopRdSlots.length)
   pushScope(ix)
-  declareSid(sidOfNode(ix), n.fiVar, elemTy)
-  symDecl(n.fiVar, ix, elemTy, 0)
+  declareSid(sidOfNode(n.fiDecl1), n.fiVar, elemTy)
+  symDecl(n.fiVar, n.fiDecl1, elemTy, 0)
   // Every element read under an element-only narrowing fits its leaf: a write in the loop that
   // may leave it ended it before the loop (`crLoopPreRetire`).
   efLeaf[ix] = -1
@@ -1380,14 +1391,14 @@ export function checkForInNode(n: ForIn, ix: i32) {
   }
   if n.fiVar2 != "" {
     declare(n.fiVar2, elem2Ty)
-    symDecl(n.fiVar2, ix, elem2Ty, 0)
+    symDecl(n.fiVar2, n.fiDecl2, elem2Ty, 0)
   }
   // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
   const daFiMark = daMark()
   // See ForRange: clear the loop var from the dead-zone for the body so it can't
   // collide with a shadowed, still-uninitialized module global of the same name.
-  daMarkAssignedNode(ix)
-  if n.fiVar2 != "" { daMarkAssigned(n.fiVar2) }
+  daMarkAssignedNode(n.fiDecl1)
+  if n.fiDecl2 >= 0 { daMarkAssignedNode(n.fiDecl2) }
   markValDiscard(n.fiBody)
   lpPush(n.fiLabel)
   checkNodeHook(n.fiBody)

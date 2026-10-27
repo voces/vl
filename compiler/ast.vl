@@ -142,11 +142,16 @@ export type ForRange = {
 export type ForIn = {
   fiVar: string,
   fiVar2: string,
+  fiDecl1: i32,
+  fiDecl2: i32,
   fiIter: i32,
   fiBody: i32,
   fiLabel: string,
   pos: i32,
 } // [l:] for v[, i] in arr { body }
+// A `for` loop variable's declaration: slot 0 or 1 of loop `lvLoop`, whose `fiVar` or `fiVar2`
+// spells it. Clones of the loop share it; the loop node itself declares nothing.
+export type LoopVar = { lvLoop: i32, lvSlot: i32, pos: i32 }
 // `match scrut { pat => body … }` — exhaustive value dispatch. Arm `i` matches one of
 // `matchPats[matchArmStart[i] .. +matchArmCount[i]]` and runs `matchBodies[i]`.
 // `matchBinds` is parallel to `matchPats`, not the arms: entry `p` is that pattern's
@@ -268,7 +273,8 @@ export type Node = NumLit |
   ForIn |
   MatchExpr |
   ImportDecl |
-  Spread
+  Spread |
+  LoopVar
 
 // A parse diagnostic: a message plus the token index it is raised at. VL has no
 // exceptions, so errors accumulate rather than throw.
@@ -1979,6 +1985,8 @@ export function binderNameAt(ix: i32) {
   if pn != "" { return pn }
   const ln = letNameAt(ix)
   if ln != "" { return ln }
+  const vn = loopVarName(ix)
+  if vn != "" { return vn }
   fnDeclNameAt(ix)
 }
 
@@ -3012,15 +3020,76 @@ export function mkForIn(
   label: string,
   pos: i32,
 ) {
-  const n: Node = {
+  const n: ForIn = {
     fiVar: v,
     fiVar2: v2,
+    fiDecl1: -1,
+    fiDecl2: -1,
     fiIter: iter,
     fiBody: body,
     fiLabel: label,
     pos: pos,
   }
+  const ix = addNode(n)
+  n.fiDecl1 = mkLoopVar(ix, 0, pos)
+  if v2 != "" { n.fiDecl2 = mkLoopVar(ix, 1, pos) }
+  ix
+}
+
+// A copy of loop `n` over `iter` and `body`, declaring the same variables `n` does.
+export function mkForInCopy(n: ForIn, iter: i32, body: i32) {
+  const c: Node = {
+    fiVar: n.fiVar,
+    fiVar2: n.fiVar2,
+    fiDecl1: n.fiDecl1,
+    fiDecl2: n.fiDecl2,
+    fiIter: iter,
+    fiBody: body,
+    fiLabel: n.fiLabel,
+    pos: n.pos,
+  }
+  addNode(c)
+}
+
+// The declaration of slot `slot` (0 or 1) of loop `loop`.
+export function mkLoopVar(loop: i32, slot: i32, pos: i32) {
+  const n: Node = { lvLoop: loop, lvSlot: slot, pos: pos }
   addNode(n)
+}
+
+// Points the variable declarations of `for` loop `loop` at it, for a loop a rewrite moved to a new
+// node; any other node is left as it is.
+export function loopVarsMoveTo(loop: i32) {
+  if loop < 0 || loop >= P.nodes.length { return 0 }
+  const l = nodeAt(loop)
+  if !(l is ForIn) { return 0 }
+  for d in [l.fiDecl1, l.fiDecl2] {
+    if d >= 0 && d < P.nodes.length {
+      const n = nodeAt(d)
+      if n is LoopVar { n.lvLoop = loop }
+    }
+  }
+  0
+}
+
+// The name loop-variable declaration `d` binds, or "" when `d` is no `LoopVar`.
+export function loopVarName(d: i32): string {
+  if d < 0 || d >= P.nodes.length { return "" }
+  const n = nodeAt(d)
+  if !(n is LoopVar) || n.lvLoop < 0 || n.lvLoop >= P.nodes.length { return "" }
+  const l = nodeAt(n.lvLoop)
+  if !(l is ForIn) { return "" }
+  if n.lvSlot == 1 { return l.fiVar2 }
+  l.fiVar
+}
+
+// The `for` loop declaration `d` names a variable of, or -1 when `d` is no `LoopVar`. Copies of a
+// loop share its declarations, so this is the loop the parser built.
+export function loopVarLoop(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const n = nodeAt(d)
+  if !(n is LoopVar) { return -1 }
+  n.lvLoop
 }
 
 export function mkMatch(
@@ -3388,14 +3457,22 @@ export function nodeChildren(ix: i32) {
   nodeKidsOf(nodeAt(ix))
 }
 
-// Whether node `target` is `ix` or lies under it.
+// Whether node `target` is `ix` or lies under it; a loop variable lies where its loop does.
 export function nodeContains(ix: i32, target: i32): boolean {
+  if ix == target { return ix >= 0 && ix < P.nodes.length }
+  const lp = loopVarLoop(target)
+  if lp >= 0 { return nodeContainsAt(ix, lp) }
+  nodeContainsAt(ix, target)
+}
+
+// `nodeContains` over the syntax tree alone.
+function nodeContainsAt(ix: i32, target: i32): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   if ix == target { return true }
   const kids = nodeChildren(ix)
   let i = 0
   while i < kids.length {
-    if nodeContains(kids[i], target) { return true }
+    if nodeContainsAt(kids[i], target) { return true }
     i = i + 1
   }
   false
@@ -3479,6 +3556,9 @@ function nodeKidsOf(n: Node): i32[] {
     Spread => {
       const out: i32[] = [n.spdArg]
       return out
+    }
+    LoopVar => {
+      return nodeNoKids
     }
     ObjLit => {
       return n.objFields
@@ -3632,6 +3712,9 @@ function nodeKidsPush(ix: i32, out: i32[], spine: boolean): i32 {
     Spread => {
       out.push(n.spdArg)
       return 1
+    }
+    LoopVar => {
+      return 0
     }
     ObjLit => {
       return pushAll(out, n.objFields)

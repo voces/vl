@@ -354,10 +354,12 @@ Deno.test({
   fn() {
     const a = audit(L1, DROP_LOOP_MOVE);
     compiles("l1", a);
-    for (const id of ["x", "i"]) {
+    // A `for … in` variable is its own declaration, left naming the node its loop moved from; a
+    // `for` range loop is its variable's declaration, and the moved-from node is now the `if`.
+    for (const [id, kind] of [["x", "LoopVar"], ["i", "IfStmt"]]) {
       if (
         !a.rows.some((r) =>
-          r.startsWith("resolved to a non-declaration (IfStmt): ") &&
+          r.startsWith(`resolved to a non-declaration (${kind}): `) &&
           r.includes(`'${id}'`)
         )
       ) {
