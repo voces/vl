@@ -18,7 +18,6 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
-  Index,
   LetDecl,
   Node,
   OptMember,
@@ -59,7 +58,6 @@ import {
   luTs,
   mapKeyUnsupportedErr,
 } from "./check_annot_resolve"
-import { oerIsPending, oerSourceRead } from "./check_asg_rows"
 import { assignableExpr } from "./check_assignable"
 import {
   collapsedTy,
@@ -229,6 +227,8 @@ import {
   fsbMark,
   noteInferredRet,
   noteInferredSeed,
+  refuseOpenElemDecl,
+  refuseOpenElemRet,
   voidValueSlotErr,
 } from "./check_node_rules"
 import { nodeTyIx, nodeTySet } from "./check_node_tys"
@@ -455,26 +455,6 @@ function letDeclMarkLitBindings(n: LetDecl, ix: i32, bound: i32) {
   0
 }
 
-// The refusal of an un-annotated binding whose initializer reads open element `readIx`: a later
-// statement decides that element, and a binding commits its type here.
-function laterElemBindMsg(name: string, readIx: i32): string {
-  let list = "a list"
-  const r = nodeAt(readIx)
-  if r is Index {
-    const recv = nodeAt(parenPeelIx(r.idxArr))
-    if recv is Ident { list = "'" + recv.identName + "'" }
-  }
-  "'"
-    + name
-    + "' takes its type from an element of "
-    + list
-    + " whose type is not decided yet; annotate "
-    + list
-    + " or '"
-    + name
-    + "'"
-}
-
 export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if curFnDeclIx >= 0 { letDeclFnPut(ix, curFnDeclIx) }
   if n.letInit >= 0 { wrDstDeclPut(n.letInit, ix) }
@@ -504,9 +484,15 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     if initTy >= 0 { letDeclGradeAnnotated(n, ix, annot, initTy) }
   } else if initTy >= 0 {
     bound = elabFnLetTy(ix, n.letName, letDeclInferredBound(n, ix, initTy))
-  } else if oerIsPending(n.letInit) {
-    tErr(laterElemBindMsg(n.letName, oerSourceRead(n.letInit)), ix)
-  } else {
+  } else if (
+    !refuseOpenElemDecl(
+      n.letInit,
+      initTy,
+      "'" + n.letName + "' takes its type from",
+      "'" + n.letName + "'",
+      ix,
+    )
+  ) {
     tErr("'" + n.letName + "' needs a type annotation or initializer", ix)
   }
   // Same-scope redeclaration (B16): a second `let`/`const` of a name already bound in the
@@ -823,7 +809,11 @@ function ifSeedThenRet(n: IfStmt, guardRows: i32[], thenIx: i32, thenTy: i32) {
   // the sibling arm's shape, and the join is a third arena row (D1591).
   noteInferRetWitness(thenIx, thenTy)
   const seedThen = ifArmValTy(n.ifThen, thenTy)
-  noteInferredSeed(seedThen, armLit(seedThen, n.ifThen))
+  if refuseOpenElemRet(thenIx, thenTy, thenIx) {
+    noteInferredRet(TY_ERR)
+  } else {
+    noteInferredSeed(seedThen, armLit(seedThen, n.ifThen))
+  }
   if guardedRet { guardAltStackPop() }
   0
 }
@@ -1485,6 +1475,13 @@ export function checkRetStmtNode(n: RetStmt, ix: i32) {
     const cbArg = cycleBreakCount
     const rArgTy = checkNodeHook(n.retArg)
     inRetArgSet(savedInRetArg)
+    // A value read from an undecided element decides the return no more than a binding's type:
+    // refused, and noted as an error so the function infers no `void` from it.
+    if refuseOpenElemRet(n.retArg, rArgTy, ix) {
+      fnSawValueRetSet(true)
+      noteInferredRet(TY_ERR)
+      return TY_VOID
+    }
     // `return <void expr>` evaluates the expression and returns nothing, so it is a void
     // return; the function's finish refuses it if the function returns a value. A void that is
     // only a recursive cycle's provisional answer is still a value return position (D2635).
