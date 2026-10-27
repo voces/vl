@@ -1651,16 +1651,23 @@ function recBuiltAtDeclared(at: i32, srcTy: i32, dstTy: i32): boolean {
   recRefuseAtOwnRow(at, own, dst)
 }
 
-// Refuse delivering `at`, a record of `own` built at its own row, onto `dst`'s storage; true.
+// Refuse delivering `at`, a record or list of `own` built at its own row, onto `dst`'s storage;
+// a list is refused as a container that never widens. True.
 function recRefuseAtOwnRow(at: i32, own: i32, dst: i32): boolean {
+  const isList = tyAt(own) is TyArray
   shapeAdaptSrcTySet(own)
   shapeAdaptDstTySet(dst)
   shapeAdaptSrcExprSet(at)
-  shapeAdaptElemPairSet(false)
+  shapeAdaptElemPairSet(isList)
   shapeAdaptWidthFieldSet(false)
-  shapeAdaptRecStorageSet(true)
-  shapeAdaptRecStorageFieldSet(recStorageFieldOf(own, dst))
+  shapeAdaptNulCopySet(false)
+  shapeAdaptNestedCopySet(false)
+  shapeAdaptMapSharedSet(false)
+  shapeAdaptRecFieldSet(false)
+  shapeAdaptRecStorageSet(!isList)
+  if !isList { shapeAdaptRecStorageFieldSet(recStorageFieldOf(own, dst)) }
   objShapeAdapterlessErr(at, own, dst)
+  shapeAdaptElemPairSet(false)
   shapeAdaptRecStorageSet(false)
   true
 }
@@ -1929,10 +1936,15 @@ function recSolePinChain(p: i32, po: i32): boolean {
   false
 }
 
-// Whether some call of `fd` has a queued delivery landing its record of `own` on a field storage
-// other than both `dst`'s and its own.
+// Whether some call of `fd` has a queued delivery landing its record or list of `own` on a field
+// storage other than both `dst`'s and its own.
 function recSitesLandApart(fd: i32, own: i32, dst: i32): boolean {
-  if own < 0 || !(tyAt(own) is TyObj) || !(tyAt(dst) is TyObj) { return false }
+  if own < 0 || dst < 0 { return false }
+  const o = tyAt(own)
+  const d = tyAt(dst)
+  if !((o is TyObj && d is TyObj) || (o is TyArray && d is TyArray)) {
+    return false
+  }
   const sites: i32[] = []
   if rcwCallSites(fd, sites) >= 0 { return false }
   for s in sites {
@@ -2446,6 +2458,11 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     if fd >= 0 && sl >= 0 && tyAt(sl) is TyArray {
       const dl = recAdLandingList(nonNulTyOf(dstTy))
       const os = recReturnedOrigins(fd, p, sl, dl)
+      // One body builds one list, so calls landing it on two storages refuse (D8301).
+      if os.length == 0 && recSitesLandApart(fd, sl, dl) {
+        recRefuseAtOwnRow(p, sl, dl)
+        return 0
+      }
       let bare = os.length > 0
       let reads = true
       for b in os {
