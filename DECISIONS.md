@@ -10856,5 +10856,56 @@ init-before-read is not statically guaranteed. Initializers are also reordered a
 wherever that preserves behaviour, for globals and for locals.
 
 **Where it stands.** The runtime guard is built. Its reachability pass, `initGuardScan`, is the
-analysis the compile error starts from. An uninitialized module `let` (D2655) is still open
-beside it.
+analysis the compile error starts from. A module `let` with no initializer gets a nullable zero
+cell (#4891, D2655 closed), and its guard sits at the first top-level statement after which every
+path has assigned it (#4897, D14360). That position is per statement, so a function that reads
+the binding, called later inside the statement that assigns it, traps (D14361, open).
+
+## A finite function set is represented by a tag (step 4 S5, 2026-10-26)
+
+A function value whose member set is finite is an i32 program-wide function id, and a call
+through it is a tag-compare chain of direct calls. Delivery to a declared function type, a list
+store or a single-type call keeps the closure rep, so the annotated and un-annotated spellings
+build the same bytes. Lambdas and thunks are out of scope. `tests/vl_fn_set_rep_test.ts`.
+
+## A function-value set escapes as a lambda (step 4 S3a, 2026-10-26)
+
+Where a finite set escapes into a closed slot (an argument to a declared function-type
+parameter, an annotated write, an element, a field), the checker eta-expands it at the slot's
+signature. The set value is evaluated once and captured, and the emitter sees an ordinary
+lambda. An open slot takes the per-instance path.
+
+## A literal-holding list binding adopts its delivery, all or nothing (owner rulings applied, 2026-10-26)
+
+A list binding that holds only literals, or an argless `Map()`, delivered to a wider type adopts
+that type, all or nothing. This is the record covariance ruling and D3339 (A) applied to lists.
+An existing list is still refused by covariance. Swapping the type alone, without the adoption,
+lost `runs` in 196 classes (3,424 cells), which is why the emitter's destination lookahead was
+retired in favour of the checker's stamp.
+
+## Two instances share a function when rep and elaboration agree (#4839)
+
+Two instances of one generic share a wasm function when their rep and their elaboration are the
+same; otherwise the instance is minted as `key~spelling`. The checker never joins instances. An
+instance's spelling names only the type variables its declaration reads (#4843).
+
+## A record literal's row is settled by the checker (container adoption, 2026-10-26)
+
+The emitter's name scan (`structIndexOfObjCtxGo`) is not moved into the mint. The scan decides at
+mint time, and moving it recovered none of 26 fixtures. The checker settles a literal's field
+type at the node, and the mint reads the checker's per-instance type; the scan is deleted after
+that.
+
+## Kept-function adoption is build-only, and a rep derives from reps (#4922)
+
+Adopting a kept function's result never writes its return type, because that would act at a
+distance on every other caller. A container's element rep derives from the element's rep stamp,
+not from a walk back up to the kept call.
+
+## Ref-list rows are keyed by rep (#4929)
+
+A ref-list row is identified by its rep key, which is layout identity, not arena or type
+identity. Newtype brands stay distinct types that share a row. Of 21 files with twin rows, 5
+were real twins (declared same-shape records, alias against inline, newtype), and 16 came from a
+lossy name key. Still open: the rep of a polymorphic function value stored as data, today the
+`() => void` stub row.
