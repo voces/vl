@@ -3,6 +3,7 @@
 // back-edge or a capture (`cr*`). Callers in the core checker record and query; nothing here
 // checks an expression.
 
+import { identTyOf } from "./check_scopes"
 import {
   ArrayLit,
   AsExpr,
@@ -465,6 +466,8 @@ import {
   lookupFnDeclNode,
   scopeDeclLog,
   scopeDepthsOf,
+  scopeFramePop,
+  scopeTyAt,
 } from "./check_scopes"
 import {
   narDefChain,
@@ -680,7 +683,7 @@ export function narIpRedoArm(lo: i32, hi: i32) {
     const was = narIpOld[j]
     if narIpScope[j] {
       const name = narIpName[j]
-      const now = T.scopes[at][name] ?? -1
+      const now = scopeTyAt(at, name)
       if now == narIpNew[j] || (now >= 0 && assignable(now, was)) {
         narSetScope(at, name, was)
       }
@@ -895,7 +898,7 @@ function narRetireLayers(name: string, now: i32, store: i32) {
   while j >= 0 {
     const d = ds[j]
     if d < base || d < bar || crFirstBank(name, d) < 0 { return 0 }
-    const t = T.scopes[d][name] ?? -1
+    const t = scopeTyAt(d, name)
     if t >= 0 && !assignable(now, t) { narSetScope(d, name, store) }
     j = j - 1
   }
@@ -1690,7 +1693,7 @@ function writesHoleField(tgtIx: i32): boolean {
   else if tn is Index { recv = tn.idxArr }
   else { return false }
   const on = nodeAt(recv)
-  if on is Ident { return tyIsHole(lookup(on.identName)) }
+  if on is Ident { return tyIsHole(identTyOf(recv, on.identName)) }
   const noNames: string[] = []
   const noTys: i32[] = []
   if tyIsHole(placeCurTy(recv, noNames, noTys)) { return true }
@@ -1750,7 +1753,7 @@ function retireAliasedNarrowings(
       narClobKeysPush(k)
       narClobTysPush(-1)
       narClobPrevPush(-1)
-      narClobDepthsPush(T.scopes.length)
+      narClobDepthsPush(T.frames.length)
       narClobRetiredPush(2)
       narClobBindPush(-1)
       narClobDeclPush(-1)
@@ -1767,7 +1770,7 @@ function retireAliasedNarrowings(
         narClobKeysPush(k)
         narClobTysPush(-1)
         narClobPrevPush(npTys[i])
-        narClobDepthsPush(T.scopes.length)
+        narClobDepthsPush(T.frames.length)
         narClobRetiredPush(2)
         narClobBindPush(-1)
         narClobDeclPush(-1)
@@ -1928,7 +1931,7 @@ export function retireNarrowingsForWrite(
     rt = asgLitRhsTy(atIx, pst, rt)
     if tyAdmitsNull(pst) && !narWrittenPath(tgtKey) {
       narWrNames.push(tgtKey)
-      narWrDepths.push(T.scopes.length - 1)
+      narWrDepths.push(T.frames.length - 1)
     }
   }
   let i = 0
@@ -2052,7 +2055,7 @@ function narClobUnderWrite(i: i32, tgtKey: string) {
     narClobKeysPush(npKeys[i])
     narClobTysPush(-1)
     narClobPrevPush(kprev)
-    narClobDepthsPush(T.scopes.length)
+    narClobDepthsPush(T.frames.length)
     narClobRetiredPush(2)
     narClobBindPush(-1)
     narClobDeclPush(-1)
@@ -2093,7 +2096,7 @@ function narClobPathWrite(
     narClobKeysPush(tgtKey)
     narClobTysPush(endTy)
     narClobPrevPush(prePathTy)
-    narClobDepthsPush(T.scopes.length)
+    narClobDepthsPush(T.frames.length)
     let prtd = 0
     if pathRetired { prtd = 1 }
     narClobRetiredPush(prtd)
@@ -2104,7 +2107,7 @@ function narClobPathWrite(
     narClobKeysPush(tgtKey)
     narClobTysPush(pathReTy)
     narClobPrevPush(placeStoreTy(tgtIx))
-    narClobDepthsPush(T.scopes.length)
+    narClobDepthsPush(T.frames.length)
     narClobRetiredPush(0)
     narClobBindPush(-1)
     narClobDeclPush(narKeyBind(tgtKey))
@@ -2118,7 +2121,7 @@ function narClobPathWrite(
       narClobKeysPush(tgtKey)
       narClobTysPush(writeMemberTy(fst, rt))
       narClobPrevPush(fst)
-      narClobDepthsPush(T.scopes.length)
+      narClobDepthsPush(T.frames.length)
       narClobRetiredPush(1)
       narClobBindPush(-1)
       narClobDeclPush(narKeyBind(tgtKey))
@@ -2151,7 +2154,7 @@ function retireIndexedNarrowings(tgtIx: i32, rt: i32, atIx: i32) {
       narClobKeysPush(npKeys[r])
       narClobTysPush(-1)
       narClobPrevPush(rprev)
-      narClobDepthsPush(T.scopes.length)
+      narClobDepthsPush(T.frames.length)
       narClobRetiredPush(2)
       narClobBindPush(-1)
       narClobDeclPush(-1)
@@ -2235,7 +2238,7 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       } else {
         narClobPrevPush(pre)
       }
-      narClobDepthsPush(T.scopes.length)
+      narClobDepthsPush(T.frames.length)
       let rtd = 0
       if retires { rtd = 1 }
       narClobRetiredPush(rtd)
@@ -3217,7 +3220,7 @@ function crLoopPathPreRetire(loopIx: i32) {
         narClobKeysPush(npKeys[s])
         narClobTysPush(-1)
         narClobPrevPush(npTys[s])
-        narClobDepthsPush(T.scopes.length)
+        narClobDepthsPush(T.frames.length)
         narClobRetiredPush(2)
         narClobBindPush(-1)
         narClobDeclPush(-1)
@@ -3580,7 +3583,7 @@ function placeCurTy(ix: i32, names: string[], tys: i32[]) {
       return placeCurTy(n.parInner, names, tys)
     }
     Ident => {
-      return lookup(n.identName)
+      return identTyOf(ix, n.identName)
     }
     Member => {
       return placeFieldTy(placeCurTy(n.memObj, names, tys), n.memProp, false)
@@ -4130,29 +4133,23 @@ export function applyNarrows(names: string[], tys: i32[]) {
 
 // Leave the innermost scope, unwinding what it pushed.
 export function popScope() {
-  flushUninferred(T.scopes.length - 1)
+  flushUninferred(T.frames.length - 1)
   while (
     crWideDepths.length > 0
-    && crWideDepths[crWideDepths.length - 1] >= T.scopes.length - 1
+    && crWideDepths[crWideDepths.length - 1] >= T.frames.length - 1
   ) {
     crWideDepths.pop()
     crWideNames.pop()
   }
-  crPopSoleTo(T.scopes.length - 1)
-  if narWrNames.length > 0 { narWrPopTo(T.scopes.length - 1) }
-  if T.scopes.length > 0 {
-    for k in T.scopes[T.scopes.length - 1] {
-      const ds = scopeDepthsOf[k]
-      if ds != null { ds.pop() }
-    }
-  }
-  T.scopes.pop()
+  crPopSoleTo(T.frames.length - 1)
+  if narWrNames.length > 0 { narWrPopTo(T.frames.length - 1) }
+  scopeFramePop()
   constScopes.pop()
   fnDeclScopes.pop()
   fnAliasScopes.pop()
   // The collapsed-binding marks go with the frame their bindings did (D1048). One length test
   // when the list is empty, which is nearly every program.
-  collBindPopTo(T.scopes.length)
+  collBindPopTo(T.frames.length)
   if npFrames.length > 0 {
     const base = npFrames[npFrames.length - 1]
     npFramesPop()

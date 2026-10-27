@@ -264,8 +264,7 @@ import {
 import { valueUnionRetName } from "./check_ret_names"
 import {
   constScopes,
-  declare,
-  declareSid,
+  declareDecl,
   fnAliasScopes,
   lookup,
   lookupFnAliasNode,
@@ -300,7 +299,7 @@ import {
 } from "./check_types"
 import { breakValueAt } from "./check_unconsumed"
 import { fnDeclIx } from "./check_write_scan"
-import { identFromDecl, identRedirect, sidOfNode } from "./symbols"
+import { identFromDecl, identRedirect } from "./symbols"
 import {
   isNeverTy,
   isNulBoolTy,
@@ -442,16 +441,16 @@ function letDeclNoteFnAlias(n: LetDecl) {
 // index and a function literal, each at the innermost scope.
 function letDeclMarkLitBindings(n: LetDecl, ix: i32, bound: i32) {
   if letDeclIsUnannotObjLit(ix) {
-    markObjLitBinding(n.letName, T.scopes.length - 1)
+    markObjLitBinding(n.letName, T.frames.length - 1)
   }
   if letDeclIsUnannotCtnLit(ix) {
-    markCtnLitBinding(n.letName, T.scopes.length - 1, n.letInit)
+    markCtnLitBinding(n.letName, T.frames.length - 1, n.letInit)
   }
   if numLitBindCandidateTy(bound) {
-    markNumLitBinding(n.letName, T.scopes.length - 1, ix)
+    markNumLitBinding(n.letName, T.frames.length - 1, ix)
   }
-  lbiMark(n.letName, T.scopes.length - 1, ix, bound)
-  markFnLitBinding(n.letName, T.scopes.length - 1, ix)
+  lbiMark(n.letName, T.frames.length - 1, ix, bound)
+  markFnLitBinding(n.letName, T.frames.length - 1, ix)
   0
 }
 
@@ -497,26 +496,26 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   }
   // Same-scope redeclaration (B16): a second `let`/`const` of a name already bound in the
   // innermost frame errors; shadowing an outer name in a nested block is legal.
-  const dtop = T.scopes.length - 1
+  const dtop = T.frames.length - 1
   // A module global is pre-declared by the pass-1.5 hoist, so its own pass-2 declaration
   // would falsely trip the same-frame check — skip it there (top-level dups are caught in the hoist).
   const preHoisted = dtop == 0 && (moduleGlobals[n.letName] ?? false)
   if crWidenedInTop(n.letName) {
     crUnwidenTop(n.letName)
-  } else if !preHoisted && T.scopes[dtop].has(n.letName) {
+  } else if !preHoisted && T.frames[dtop].has(n.letName) {
     tErr("redeclared " + n.letName, ix)
   }
   // The same reservation the `function` path enforces: a `const` of the emitter-intrinsic name
   // is called through the inline arm exactly like `function`, so the lambda never runs.
   checkNotEmitterIntrinsic(n.letName, ix)
-  declareSid(sidOfNode(ix), n.letName, bound)
+  declareDecl(ix, n.letName, bound)
   if recAdOrigDecl.length > 0 && (recAdPinned[ix] ?? false) {
     recAdBound.push(bound)
   }
   crNoteSoleRef(n, ix)
   getLetBank(ix, bound)
   if !preHoisted { letDeclMarkLitBindings(n, ix, bound) }
-  fsbMark(n.letName, T.scopes.length - 1, ix, bound)
+  fsbMark(n.letName, T.frames.length - 1, ix, bound)
   letDeclMarkCollapsed(n, la.collapsedHere)
   letDeclNoteFnAlias(n)
   symDecl(n.letName, ix, bound, 0)
@@ -922,7 +921,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   const clobMark = narClobKeys.length
   // Where its places stood on entry, for a key the join first meets inside an arm (`narHeadTy`).
   const ipMark = narIpAt.length
-  const headDepth = T.scopes.length
+  const headDepth = T.frames.length
   const headNp = npKeys.length
   // An `if`/`else` in value position is an expression whose value is the join of its branch
   // tail values — capture whether THIS `if` sits in the function's return-tail position.
@@ -958,7 +957,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   const guardedRet = ifEnterThenArm(ifTail, tnNames, tnTys, guardRows)
   // The arm's OWN statement depth: its block pushes one scope, so a write recorded at exactly
   // this depth runs whenever the arm does and a deeper one is conditional (D1846).
-  const thenOwnDepth = T.scopes.length + 1
+  const thenOwnDepth = T.frames.length + 1
   const thenLo = narClobKeys.length
   const thenIpLo = narIpAt.length
   const rwOuter = rwDead && elabCapDeadEnter()
@@ -1002,7 +1001,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   const daHasElse = n.ifElse >= 0
   if daHasElse {
     ifEnterElseArm(n, ifTail, enNames, enTys)
-    elseOwnDepth = T.scopes.length + 1
+    elseOwnDepth = T.frames.length + 1
     elseLo = narClobKeys.length
   }
   return {
@@ -1315,7 +1314,7 @@ export function checkForRangeNode(n: ForRange, ix: i32) {
   // narrowing live here predates it — see `pushReBarrier`.
   pushReBarrier(crLoopRdSlots.length)
   pushScope(ix)
-  declareSid(sidOfNode(ix), n.frVar, TY_I32)
+  declareDecl(ix, n.frVar, TY_I32)
   symDecl(n.frVar, ix, TY_I32, 0)
   // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
   const daFrMark = daMark()
@@ -1393,7 +1392,7 @@ export function checkForInNode(n: ForIn, ix: i32) {
   // See ForRange: a `for` body re-executes with nothing to re-establish a narrowing.
   pushReBarrier(crLoopRdSlots.length)
   pushScope(ix)
-  declareSid(sidOfNode(n.fiDecl1), n.fiVar, elemTy)
+  declareDecl(n.fiDecl1, n.fiVar, elemTy)
   symDecl(n.fiVar, n.fiDecl1, elemTy, 0)
   // Every element read under an element-only narrowing fits its leaf: a write in the loop that
   // may leave it ended it before the loop (`crLoopPreRetire`).
@@ -1404,7 +1403,7 @@ export function checkForInNode(n: ForIn, ix: i32) {
     narrowFreshBinding(n.fiVar, ix)
   }
   if n.fiVar2 != "" {
-    declare(n.fiVar2, elem2Ty)
+    declareDecl(n.fiDecl2, n.fiVar2, elem2Ty)
     symDecl(n.fiVar2, n.fiDecl2, elem2Ty, 0)
   }
   // Loop body may run zero times — see `WhileStmt` (A-definite-assign).

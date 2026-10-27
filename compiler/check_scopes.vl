@@ -1,16 +1,16 @@
 // `check_scopes.vl` — the checker's scope chain and the queries that resolve a name through it.
-// `T.scopes` holds each frame's name-to-type map; beside it run the inverted chain
-// (`scopeDepthsOf`, a name's binding depths) and three parallel per-frame tables: which names
-// are `const`, which name a `FuncDecl`, and which alias one. `declare` binds a name in the
-// innermost frame; `lookup`, `lookupDepth` and the `*DeclOf`/`lookupFn*` queries read the
-// innermost binding, so shadowing holds. The checker pushes and pops the frames and resets
-// the tables.
+// Each frame of `T.frames` maps a name it binds to an entry of the binding log, and the entry
+// holds the slot the name binds (its declaration) and the type at that layer, so a declaration's
+// type is one array read. Beside it run the inverted chain (`scopeDepthsOf`) and three parallel
+// per-frame tables: which names are `const`, which name a `FuncDecl`, and which alias one.
+// `declareDecl` binds a declaration, `declare` re-binds a visible name for flow, and the
+// checker pushes and pops the frames and resets the tables.
 
-import { FuncDecl, Ident, nodeAt } from "./ast"
+import { FuncDecl, Ident, P, nodeAt } from "./ast"
 import { modSuffixOf } from "./modid"
 import { demangleName } from "./check_suggest"
 import { T } from "./check_types"
-import { sidEpoch, sidOfNode } from "./symbols"
+import { IDENT_BUILTIN, identDeclOf, sidEpoch, sidOfNode } from "./symbols"
 import {
   CW_OCC_FDECL,
   cwIxBuild,
@@ -21,7 +21,7 @@ import {
   fnDeclIx,
 } from "./check_write_scan"
 
-// The const-binding chain, parallel to `T.scopes`: each frame records which of its names carry
+// The const-binding chain, parallel to `T.frames`: each frame records which of its names carry
 // `const` — an immutable name, not immutable data, so a field write through a const stays
 // legal. Kept module-level rather than a `Checker` field so the exported struct shape is
 // unchanged.
@@ -33,35 +33,263 @@ export let moduleConstDecl: {[string]: i32} = Map()
 
 // The scope chain inverted: for each name, the depths of the frames binding it, outermost first,
 // so the innermost binding is the last entry. `declare` and `popScope` keep it in step with
-// `T.scopes`, and a lookup reads one entry instead of walking every frame (D2190).
+// `T.frames`, and a lookup reads one entry instead of walking every frame (D2190).
 export let scopeDepthsOf: {[string]: i32[]} = Map()
 // Every name whose `scopeDepthsOf` entry gained a depth, in order, for a cache that must see it.
 export let scopeDeclLog: string[] = []
 
-// The function-declaration chain, parallel to `T.scopes`: each frame records the arena node of
+// The function-declaration chain, parallel to `T.frames`: each frame records the arena node of
 // every `FuncDecl` declared in it. `fnDeclIx` answers that for top-level functions only; this
 // answers it for a nested one too, under the scope chain's shadowing rule, which is what a call
 // needs to recover the callee's parameter list and the defaults a call site may omit.
 export let fnDeclScopes: {[string]: i32}[] = []
 
-// The function-alias chain, parallel to `T.scopes`: for a binding whose initializer is a bare
+// The function-alias chain, parallel to `T.frames`: for a binding whose initializer is a bare
 // ident naming a declared function (`const f = addT`), the arena node of that declaration.
 // `fnDeclScopes` deliberately answers -1 there, a function value keeping the exact-arity gate a
 // value call has. Its one consumer is constraint ownership; a closure parameter is left out.
 export let fnAliasScopes: {[string]: i32}[] = []
 
-// The (name, depth) bindings `scopeHideEnter` took out of `scopeDepthsOf`, innermost window last.
+// The binding log. Entry `e` binds slot `envLogSlot[e]` (a declaration node, or an ambient slot
+// `-2 - k` for a binding no declaration makes) at frame `envLogDepth[e]` with type `envLogTy[e]`;
+// `envLogPrev[e]` is the slot's next-outer live entry. A hidden entry is out of its slot's chain.
+let envLogSlot: i32[] = []
+let envLogTy: i32[] = []
+let envLogPrev: i32[] = []
+let envLogDepth: i32[] = []
+let envLogHid: boolean[] = []
+// Each frame's first log entry, and each slot's innermost live entry (-1 none).
+let envFrameBase: i32[] = []
+let envDeclTop: i32[] = []
+let envAmbTop: i32[] = []
+// Each ambient intrinsic's slot by name: what a builtin `Ident`, which names no declaration, reads.
+let envAmbOf: {[string]: i32} = Map()
+
+// The (name, depth) bindings `scopeHideEnter` took out of `scopeDepthsOf`, innermost window last,
+// with the log entry each one unlinked.
 export let scopeHidName: string[] = []
 export let scopeHidDepth: i32[] = []
+let scopeHidEntry: i32[] = []
+
+// Empties the scope chain and every table beside it, for a new program.
+export function scopesReset() {
+  T.frames = []
+  scopeDepthsOf = Map()
+  scopeDepthsBySidReset()
+  scopeDeclLog = []
+  scopeHidName = []
+  scopeHidDepth = []
+  scopeHidEntry = []
+  envLogSlot = []
+  envLogTy = []
+  envLogPrev = []
+  envLogDepth = []
+  envLogHid = []
+  envFrameBase = []
+  envDeclTop = []
+  envAmbTop = []
+  envAmbOf = Map()
+  0
+}
+
+// Opens a frame of the scope chain; the parallel tables are pushed by the caller.
+export function scopeFramePush() {
+  T.frames.push(Map())
+  envFrameBase.push(envLogSlot.length)
+  0
+}
+
+// Closes the innermost frame: its names leave `scopeDepthsOf` and each slot it bound returns to
+// its outer entry.
+export function scopeFramePop() {
+  const top = T.frames.length - 1
+  if top < 0 { return 0 }
+  for k in T.frames[top] {
+    const ds = scopeDepthsOf[k]
+    if ds != null { ds.pop() }
+  }
+  const base = envFrameBase[top]
+  while envLogSlot.length > base {
+    const e = envLogSlot.length - 1
+    if !envLogHid[e] { envUnlink(e) }
+    envLogSlot.pop()
+    envLogTy.pop()
+    envLogPrev.pop()
+    envLogDepth.pop()
+    envLogHid.pop()
+  }
+  T.frames.pop()
+  envFrameBase.pop()
+  0
+}
+
+function envSlotTop(s: i32) {
+  if s >= 0 {
+    if s < envDeclTop.length { return envDeclTop[s] }
+    return -1
+  }
+  const k = -2 - s
+  if k >= 0 && k < envAmbTop.length { return envAmbTop[k] }
+  -1
+}
+
+// Resizes the declaration-indexed top table to cover `s`: at least the arena, and at least twice
+// its own length, in one allocation, so the table never grows one node at a time.
+function envDeclTopGrow(s: i32) {
+  let n = P.nodes.length
+  if n <= s { n = s + 1 }
+  if n < 2 * envDeclTop.length { n = 2 * envDeclTop.length }
+  const t: i32[] = __array_new__(n, -1)
+  __array_copy__(t, 0, envDeclTop, 0, envDeclTop.length)
+  envDeclTop = t
+  0
+}
+
+function envSlotTopSet(s: i32, e: i32) {
+  if s >= 0 {
+    if s >= envDeclTop.length { envDeclTopGrow(s) }
+    envDeclTop[s] = e
+    return 0
+  }
+  const k = -2 - s
+  if k >= 0 && k < envAmbTop.length { envAmbTop[k] = e }
+  0
+}
+
+// Takes entry `e` out of its slot's chain.
+function envUnlink(e: i32) {
+  const s = envLogSlot[e]
+  const top = envSlotTop(s)
+  if top == e { return envSlotTopSet(s, envLogPrev[e]) }
+  let at = top
+  while at >= 0 && envLogPrev[at] != e { at = envLogPrev[at] }
+  if at >= 0 { envLogPrev[at] = envLogPrev[e] }
+  0
+}
+
+// Makes entry `e` its slot's innermost.
+function envLink(e: i32) {
+  const s = envLogSlot[e]
+  envLogPrev[e] = envSlotTop(s)
+  envSlotTopSet(s, e)
+}
+
+function envMintAmbient() {
+  envAmbTop.push(-1)
+  -1 - envAmbTop.length
+}
+
+// Binds `name` in the innermost frame to slot `s` at type `ty`; a name the frame already binds
+// keeps its entry, re-pointed at `s`, unless both are declarations: a redeclaration leaves the
+// first one bound, so a read the binder resolves to either still has its type.
+function envBind(s: i32, name: string, ty: i32) {
+  const top = T.frames.length - 1
+  const fr = T.frames[top]
+  const had = fr[name] ?? -1
+  if had >= 0 && !(s >= 0 && envLogSlot[had] >= 0 && envLogSlot[had] != s) {
+    envLogTy[had] = ty
+    if envLogSlot[had] == s || envLogHid[had] {
+      envLogSlot[had] = s
+      return 0
+    }
+    envUnlink(had)
+    envLogSlot[had] = s
+    return envLink(had)
+  }
+  const e = envLogSlot.length
+  envLogSlot.push(s)
+  envLogTy.push(ty)
+  envLogPrev.push(-1)
+  envLogDepth.push(top)
+  envLogHid.push(false)
+  envLink(e)
+  fr[name] = e
+  0
+}
+
+// The type declaration `decl` is bound at in the innermost frame binding it, or -1 when no live
+// frame binds it. This is how a node that holds its declaration reads a type.
+export function declTyOf(decl: i32) {
+  const e = envSlotTop(decl)
+  if e < 0 { return -1 }
+  envLogTy[e]
+}
+
+// The frame depth of `decl`'s innermost binding, or -1.
+export function declDepthOf(decl: i32) {
+  const e = envSlotTop(decl)
+  if e < 0 { return -1 }
+  envLogDepth[e]
+}
+
+// The slot the `Ident` `ix`, spelled `name`, reads through: its declaration, else the ambient
+// intrinsic of its name when the binder found none, else -1.
+function identSlotOf(ix: i32, name: string) {
+  const d = identDeclOf(ix)
+  if d >= 0 { return d }
+  if d != IDENT_BUILTIN { return -1 }
+  const s = envAmbOf[name] ?? -1
+  if s >= -1 { return -1 }
+  s
+}
+
+// The type the `Ident` `ix`, spelled `name`, reads, or -1 when nothing live binds it.
+export function identTyOf(ix: i32, name: string) {
+  const s = identSlotOf(ix, name)
+  if s == -1 { return -1 }
+  declTyOf(s)
+}
+
+// The frame depth the `Ident` `ix`, spelled `name`, resolves at, or -1.
+export function identDepthOf(ix: i32, name: string) {
+  const s = identSlotOf(ix, name)
+  if s == -1 { return -1 }
+  declDepthOf(s)
+}
+
+// The slot `name`'s innermost visible binding holds, or -1. This is a second resolver of the
+// fact the binder records per `Ident`, kept only for the by-name flow writes and queries until
+// B2 retires them (D14544); a node that holds an `Ident` or a declaration never reads it.
+export function envDeclOfNameForFlow(name: string) {
+  const d = lookupDepth(name)
+  if d < 0 { return -1 }
+  const e = T.frames[d][name] ?? -1
+  if e < 0 { return -1 }
+  envLogSlot[e]
+}
+
+// The type `name` holds in frame `d`, or -1 when that frame does not bind it.
+export function scopeTyAt(d: i32, name: string) {
+  if d < 0 || d >= T.frames.length { return -1 }
+  const e = T.frames[d][name] ?? -1
+  if e < 0 { return -1 }
+  envLogTy[e]
+}
+
+// Rebinds `name` in frame `d` to `ty` in place; a frame that does not bind it is left alone.
+export function scopeTySetAt(d: i32, name: string, ty: i32) {
+  if d < 0 || d >= T.frames.length { return 0 }
+  const e = T.frames[d][name] ?? -1
+  if e >= 0 { envLogTy[e] = ty }
+  0
+}
+
+// The slot `name` binds in frame `d`, or -1.
+export function scopeSlotAt(d: i32, name: string) {
+  if d < 0 || d >= T.frames.length { return -1 }
+  const e = T.frames[d][name] ?? -1
+  if e < 0 { return -1 }
+  envLogSlot[e]
+}
 
 // Hides every binding above the module frame from name lookup until `scopeHideLeave`, and answers
 // the mark to hand it. A top-level function's body is checked under this, so a forward callee
 // inferred inside a caller resolves its free names at module scope, not the caller's (D5650).
 export function scopeHideEnter(): i32 {
   const mark = scopeHidName.length
-  let d = T.scopes.length - 1
+  let d = T.frames.length - 1
   while d >= 1 {
-    for k in T.scopes[d] {
+    for k in T.frames[d] {
       const ds = scopeDepthsOf[k]
       if ds != null {
         let j = ds.length - 1
@@ -72,8 +300,14 @@ export function scopeHideEnter(): i32 {
             j = j + 1
           }
           ds.pop()
+          const e = T.frames[d][k] ?? -1
+          if e >= 0 && !envLogHid[e] {
+            envUnlink(e)
+            envLogHid[e] = true
+          }
           scopeHidName.push(k)
           scopeHidDepth.push(d)
+          scopeHidEntry.push(e)
         }
       }
     }
@@ -90,7 +324,12 @@ export function scopeHideLeave(mark: i32) {
     const k = scopeHidName[i]
     scopeDeclLog.push(k)
     const d = scopeHidDepth[i]
-    if d < T.scopes.length && T.scopes[d].has(k) {
+    if d < T.frames.length && T.frames[d].has(k) {
+      const e = scopeHidEntry[i]
+      if e >= 0 && (T.frames[d][k] ?? -1) == e && envLogHid[e] {
+        envLogHid[e] = false
+        envLink(e)
+      }
       const ds = scopeDepthsOf[k]
       if ds == null {
         scopeDepthsOf[k] = [d]
@@ -114,6 +353,7 @@ export function scopeHideLeave(mark: i32) {
     }
     scopeHidName.pop()
     scopeHidDepth.pop()
+    scopeHidEntry.pop()
     i = i - 1
   }
   0
@@ -166,13 +406,6 @@ export function lookupDepthSid(sid: i32, name: string) {
   ds[ds.length - 1]
 }
 
-// `lookup(name)` where `sid` is `name`'s interned id.
-export function lookupSid(sid: i32, name: string) {
-  const i = lookupDepthSid(sid, name)
-  if i < 0 { return -1 }
-  T.scopes[i][name] ?? -1
-}
-
 // True if `name` resolves (innermost-first) to a `const` binding.
 export function isConstName(name: string) {
   const i = lookupDepth(name)
@@ -187,51 +420,70 @@ export function isConstNameSid(sid: i32, name: string) {
   false
 }
 
-// Bind `name` to type-arena index `ty` in the innermost scope.
-export function declare(name: string, ty: i32) {
-  const top = T.scopes.length - 1
-  if !T.scopes[top].has(name) {
-    const ds = scopeDepthsOf[name]
-    if ds == null { scopeDepthsOf[name] = [top] } else { ds.push(top) }
-    scopeDeclLog.push(name)
-  }
-  T.scopes[top][name] = ty
-  0
-}
-
-// `declare(name, ty)` where `sid` is `name`'s interned id: the depth row is read through the id
-// view, so a fresh binding pays no `scopeDepthsOf` probe once the name has a row.
-export function declareSid(sid: i32, name: string, ty: i32) {
-  if sid < 0 { return declare(name, ty) }
-  const top = T.scopes.length - 1
-  const fr = T.scopes[top]
-  if !fr.has(name) {
+// Records a fresh binding of `name` in the innermost frame in `scopeDepthsOf`, through the id
+// view when `sid` is known; a name the frame already binds is left as it is.
+function scopeDepthNote(sid: i32, name: string) {
+  const top = T.frames.length - 1
+  if T.frames[top].has(name) { return 0 }
+  if sid >= 0 {
     if sdEpoch != sidEpoch { scopeDepthsBySidReset() }
     if sid < sdHave.length && sdHave[sid] {
       sdDepths[sid].push(top)
-    } else {
-      let ds: i32[] = SD_FILL
-      const had = scopeDepthsOf[name]
-      if had == null {
-        ds = [top]
-        scopeDepthsOf[name] = ds
-      } else {
-        had.push(top)
-        ds = had
-      }
-      while sdHave.length <= sid {
-        sdHave.push(false)
-        sdDepths.push(SD_FILL)
-      }
-      sdDepths[sid] = ds
-      sdHave[sid] = true
+      scopeDeclLog.push(name)
+      return 0
     }
-    scopeDeclLog.push(name)
   }
-  fr[name] = ty
+  let ds: i32[] = SD_FILL
+  const had = scopeDepthsOf[name]
+  if had == null {
+    ds = [top]
+    scopeDepthsOf[name] = ds
+  } else {
+    had.push(top)
+    ds = had
+  }
+  if sid >= 0 {
+    while sdHave.length <= sid {
+      sdHave.push(false)
+      sdDepths.push(SD_FILL)
+    }
+    sdDepths[sid] = ds
+    sdHave[sid] = true
+  }
+  scopeDeclLog.push(name)
   0
 }
 
+// Binds declaration `decl`, spelled `name`, to `ty` in the innermost frame.
+export function declareDecl(decl: i32, name: string, ty: i32) {
+  if decl < 0 { return declare(name, ty) }
+  scopeDepthNote(sidOfNode(decl), name)
+  envBind(decl, name, ty)
+}
+
+// Binds the ambient intrinsic `name`, which no declaration makes, to `ty` in the innermost frame.
+export function declareAmbient(name: string, ty: i32) {
+  const s = envMintAmbient()
+  envAmbOf[name] = s
+  scopeDepthNote(-1, name)
+  envBind(s, name, ty)
+}
+
+// Re-binds `name` to `ty` in the innermost frame as a layer over the binding it names now: a
+// narrowing, a widening or a restored snapshot. A name nothing binds gets a slot of its own.
+export function declare(name: string, ty: i32) {
+  const top = T.frames.length - 1
+  let s = scopeSlotAt(top, name)
+  if s == -1 { s = envDeclOfNameForFlow(name) }
+  if s == -1 { return declareAmbient(name, ty) }
+  declareSlot(s, name, ty)
+}
+
+// Binds `name` to slot `s` at `ty` in the innermost frame: `declare` with the slot in hand.
+export function declareSlot(s: i32, name: string, ty: i32) {
+  scopeDepthNote(-1, name)
+  envBind(s, name, ty)
+}
 // Record `nodeIx` as the `FuncDecl` that `name` declares in the current scope.
 export function declareFnDeclNode(name: string, nodeIx: i32) {
   const top = fnDeclScopes.length - 1
@@ -283,7 +535,7 @@ export function lookupFnDeclNodeSid(sid: i32, name: string) {
 export function lookup(name: string) {
   const i = lookupDepth(name)
   if i < 0 { return -1 }
-  T.scopes[i][name] ?? -1
+  scopeTyAt(i, name)
 }
 
 // The declaration of the function `name` names: the one in scope, else the only function of
@@ -345,13 +597,13 @@ export function calleeDeclParams(calleeIx: i32) {
   none
 }
 
-// Is `name` bound at MODULE scope by a `const`? `T.scopes[0]` is the module
+// Is `name` bound at MODULE scope by a `const`? `T.frames[0]` is the module
 // frame, and asking IT rather than walking the chain is the point: a parameter
 // default's names resolve at the DECLARATION, and the declaration's own
 // parameters and locals are exactly what must NOT answer here.
 export function isModuleScopeConst(name: string) {
-  if T.scopes.length == 0 { return false }
-  if !T.scopes[0].has(name) { return false }
+  if T.frames.length == 0 { return false }
+  if !T.frames[0].has(name) { return false }
   if constScopes.length == 0 { return false }
   // Bound, not returned as a bare tail: a member-call cannot be a tail
   // expression (`emitProgram: unsupported member-call statement`).
