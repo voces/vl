@@ -771,6 +771,50 @@ const CASES: Case[] = [
       'import { b5, g5 } from "./lib"\nif b5.w != null {\n  g5()\n  const k5: i32 = b5.w\n  print(k5)\n}\n',
   },
   {
+    name: "a private helper two calls down moves the exported callee's write",
+    want: "decline",
+    why: "interface",
+    from: "bp.h = 1",
+    to: "bp.w = null",
+    libUses:
+      "export let bp: { w: i32 | null, h: i32 } = { w: 1, h: 1 }\nfunction pp(): void { bp.h = 1 }\nfunction mp(): void { pp() }\nexport function qp(): void { mp() }\n",
+    uses:
+      'import { bp, qp } from "./lib"\nif bp.w != null {\n  qp()\n  const kp: i32 = bp.w\n  print(kp)\n}\n',
+  },
+  {
+    name: "a private helper reached through a function value moves the exported callee's write",
+    want: "decline",
+    why: "interface",
+    from: "bv.h = 1",
+    to: "bv.w = null",
+    libUses:
+      "export let bv: { w: i32 | null, h: i32 } = { w: 1, h: 1 }\nfunction pv(): void { bv.h = 1 }\nconst fv: () => void = pv\nexport function qv(): void { fv() }\n",
+    uses:
+      'import { bv, qv } from "./lib"\nif bv.w != null {\n  qv()\n  const kv: i32 = bv.w\n  print(kv)\n}\n',
+  },
+  {
+    name: "a served function's call into lib moves its write",
+    want: "decline",
+    why: "interface",
+    from: "bm.h = 1",
+    to: "bm.w = null",
+    libUses:
+      "export let bm: { w: i32 | null, h: i32 } = { w: 1, h: 1 }\nexport function qm(): void { bm.h = 1 }\n",
+    uses:
+      'import { bm, qm } from "./lib"\nfunction mm(): void { qm() }\nif bm.w != null {\n  mm()\n  const km: i32 = bm.w\n  print(km)\n}\n',
+  },
+  {
+    name: "an exported callee's own body moves its write, asked from inside a served function",
+    want: "decline",
+    why: "interface",
+    from: "be.h = 1",
+    to: "be.w = null",
+    libUses:
+      "export let be: { w: i32 | null, h: i32 } = { w: 1, h: 1 }\nexport function qe(): void {\n  if be.h > 0 { be.h = 1 }\n}\n",
+    uses:
+      'import { be, qe } from "./lib"\nfunction ue(): i32 {\n  if be.w != null {\n    qe()\n    const ke: i32 = be.w\n    return ke\n  }\n  return 0\n}\nprint(ue())\n',
+  },
+  {
     name: "a callee's argument write moves to the narrowed field",
     want: "decline",
     why: "ambient",
@@ -1252,6 +1296,10 @@ Deno.test({
       ["a callee's write moves to the narrowed field", 2048],
       ["a callee's helper write moves to the narrowed field", 2048],
       ["a callee's alias write moves to the narrowed field", 2048],
+      ["a private helper two calls down moves the exported callee's write", 2048],
+      ["a private helper reached through a function value moves the exported callee's write", 2048],
+      ["an exported callee's own body moves its write, asked from inside a served function", 2048],
+      ["a served function's call into lib moves its write", 2048],
       // `SK_NO_WRITER` drops the writer closure of a name a whole-program question asked about.
       ["a private lib lambda starts writing a binding main narrows", 16],
       ["lib starts narrowing a binding a served escaping function writes", 16],
