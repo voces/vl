@@ -9,7 +9,29 @@
 // resets the tables in `initChecker`.
 
 import { numLexBaseAt, numLexFitsI32, numLexIsFloat } from "./emit_bignum"
-import { i32ToStr } from "./ast"
+import {
+  TS_APP,
+  TS_ARR,
+  TS_FIELD,
+  TS_FUNC,
+  TS_LITNUM,
+  TS_LITSTR,
+  TS_MAP,
+  TS_NAME,
+  TS_NEG,
+  TS_NULL,
+  TS_OBJ,
+  TS_PAREN,
+  TS_UNION,
+  i32ToStr,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
+  tsKind,
+  tsLeaf,
+  tsMkKids,
+  tsText,
+} from "./ast"
 import {
   closedQuoteEnd,
   demangleSpelling,
@@ -1037,6 +1059,167 @@ function tyToStrMap(t: TyMap, nominal: boolean): string {
   // The key/value separators sit inside the braces — one atom.
   tyStrAtoms = 1
   "{[" + mk + "]: " + mv + "}"
+}
+
+// The spelling tree of `tyToStr(ix)`: the tree `parseType` builds from that render, built from
+// the type rather than by parsing the string, so a synthesized annotation carries what a written
+// one would. -1 when the render is no annotation: an error, a cycle, a map keyed by no name.
+export function tyToTs(ix: i32): i32 {
+  tyTsBudget = 4096
+  tyTsGo(ix, 0)
+}
+
+// The nodes `tyToTs` may still build, so a shared subtree cannot blow the render up.
+let tyTsBudget = 4096
+
+function tyTsGo(ix: i32, depth: i32): i32 {
+  if ix < 0 { return tsLeaf(TS_NAME, "_") }
+  if depth > 64 || tyTsBudget <= 0 { return -1 }
+  tyTsBudget = tyTsBudget - 1
+  const nn = tyTsNameOf(ix, depth)
+  if nn != -2 { return nn }
+  const t = tyAt(ix)
+  match t {
+    TyPrim => {
+      if t.primName == "null" { return tsLeaf(TS_NULL, "null") }
+      return tsLeaf(TS_NAME, t.primName)
+    }
+    TyErr => {
+      return -1
+    }
+    TyObj => {
+      return tyTsObj(t, depth)
+    }
+    TyFunc => {
+      const kids: i32[] = []
+      for p in t.fnParamTypes {
+        const pk = tyTsGo(p, depth + 1)
+        if pk < 0 { return -1 }
+        kids.push(pk)
+      }
+      const r = tyTsGroupFn(t.fnRet, tyTsGo(t.fnRet, depth + 1))
+      if r < 0 { return -1 }
+      kids.push(r)
+      return tsMkKids(TS_FUNC, "", kids)
+    }
+    TyUnion => {
+      const kids: i32[] = []
+      for m in t.uMembers {
+        const mk = tyTsGroupFn(m, tyTsGo(m, depth + 1))
+        if mk < 0 { return -1 }
+        tyTsJoin(kids, mk)
+      }
+      if kids.length == 1 { return kids[0] }
+      return tsMkKids(TS_UNION, "", kids)
+    }
+    TyNullable => {
+      const kids: i32[] = []
+      const ik = tyTsGroupFn(t.nInner, tyTsGo(t.nInner, depth + 1))
+      if ik < 0 { return -1 }
+      tyTsJoin(kids, ik)
+      kids.push(tsLeaf(TS_NULL, "null"))
+      return tsMkKids(TS_UNION, "", kids)
+    }
+    TyArray => {
+      return tyTsArray(t, depth)
+    }
+    TyMap => {
+      const k = tyTsGo(t.mKey, depth + 1)
+      if k < 0 { return -1 }
+      if t.mSet == 1 { return tsMkKids(TS_APP, "Set", [k]) }
+      if tsKind[k] != TS_NAME { return -1 }
+      const v = tyTsGo(t.mVal, depth + 1)
+      if v < 0 { return -1 }
+      return tsMkKids(TS_MAP, tsText[k], [v])
+    }
+    TyVar => {
+      if t.tvName[0] == '?' { return tsLeaf(TS_NAME, "_") }
+      return tsLeaf(TS_NAME, t.tvName)
+    }
+    TyLit => {
+      if t.litKind == "str" {
+        return tsLeaf(TS_LITSTR, "\"" + t.litText + "\"")
+      }
+      return tsLeaf(TS_LITNUM, t.litText)
+    }
+    TyNeg => {
+      const n = tyTsGo(t.negTy, depth + 1)
+      if n < 0 { return -1 }
+      return tsMkKids(TS_NEG, "", [n])
+    }
+  }
+}
+
+// `tyToStrNameOf`'s tree: a name leaf, or a generic application over its arguments' trees; -2
+// when `ix` renders structurally, -1 when an argument has no tree.
+function tyTsNameOf(ix: i32, depth: i32): i32 {
+  const nwn = nomNameOfTy(ix)
+  if nwn != "" { return tsLeaf(TS_NAME, nwn) }
+  const sdn = structNameOfTy(ix)
+  if sdn != "" { return tsLeaf(TS_NAME, sdn) }
+  if genAppNameOfTy(ix) != "" {
+    const row = genAppRowOf(ix)
+    if row < 0 || row >= gaAppArgCount.length { return -1 }
+    const kids: i32[] = []
+    let a = 0
+    while a < gaAppArgCount[row] {
+      const k = tyTsGo(gaAppArgFlat[gaAppArgStart[row] + a], depth + 1)
+      if k < 0 { return -1 }
+      kids.push(k)
+      a = a + 1
+    }
+    return tsMkKids(TS_APP, gaAppHeads[row], kids)
+  }
+  const udn = unionAliasDeclNameOfTy(ix)
+  if udn != "" { return tsLeaf(TS_NAME, udn) }
+  -2
+}
+
+// `tyToStrObj`'s tree: one field node per field; -1 when a field has no tree.
+function tyTsObj(t: TyObj, depth: i32): i32 {
+  const names = t.objFieldNames
+  const ftys = t.objFieldTypes
+  const kids: i32[] = []
+  let i = 0
+  while i < names.length {
+    const f = tyTsGo(ftys[i], depth + 1)
+    if f < 0 { return -1 }
+    kids.push(tsMkKids(TS_FIELD, names[i], [f]))
+    i = i + 1
+  }
+  tsMkKids(TS_OBJ, "", kids)
+}
+
+// `tyToStrArray`'s tree: a function, union or view element grouped, a view marked `readonly`.
+function tyTsArray(t: TyArray, depth: i32): i32 {
+  let el = tyTsGo(t.aElem, depth + 1)
+  if el < 0 { return -1 }
+  if tyIxIsFunc(t.aElem) || tyIxIsView(t.aElem) || tsKind[el] == TS_UNION {
+    el = tsMkKids(TS_PAREN, "", [el])
+  }
+  const ro = if t.aRead == 1 { "readonly" } else { "" }
+  tsMkKids(TS_ARR, ro, [el])
+}
+
+// Tree `k` of type `ty`, grouped when `ty` is a function type, which a bare `|` or `[]` after
+// it would join; -1 stays -1.
+function tyTsGroupFn(ty: i32, k: i32): i32 {
+  if k < 0 || !tyIxIsFunc(ty) { return k }
+  tsMkKids(TS_PAREN, "", [k])
+}
+
+// Append tree `k` to the union member list `kids`, its own members when it is a union.
+function tyTsJoin(kids: i32[], k: i32) {
+  if tsKind[k] != TS_UNION {
+    kids.push(k)
+    return 0
+  }
+  let i = 0
+  while i < tsKidCount[k] {
+    kids.push(tsKids[tsKidStart[k] + i])
+    i = i + 1
+  }
+  0
 }
 
 // Is arena type `ix` a nullable value-union box — a `TyUnion` with a `null` member and two
