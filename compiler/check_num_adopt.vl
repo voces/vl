@@ -5,15 +5,19 @@ import {
   ArrayLit,
   BinExpr,
   Block,
+  FieldInit,
   IfStmt,
   MatchExpr,
   ObjLit,
   P,
   Paren,
+  Spread,
   Unary,
   nodeAt,
 } from "./ast"
 import { inferQuiet } from "./check_cursor"
+import { elabCapLive, elabCapNote, stampsStand } from "./check_elab_cap"
+import { litPinN } from "./check_literals"
 import { nodeTyIx, nodeTyOf, nodeTySet } from "./check_node_tys"
 import {
   binFloatOperandPair,
@@ -23,6 +27,8 @@ import {
   isF32AdoptingLitExpr,
   isFloatLitExpr,
   litTreeWideTy,
+  numLitDstTy,
+  numLitOwnTy,
   numUnionMembersOf,
 } from "./check_num_lits"
 import { parenPeelIx } from "./check_places"
@@ -37,10 +43,16 @@ import {
 import {
   T,
   TY_BOOL,
+  TyArray,
+  TyLit,
   TyNullable,
+  TyObj,
+  TyPrim,
   TyUnion,
+  objFieldType,
   tyAt,
   tyMapMinted,
+  tyNumScalarBaseName,
   tySame,
   tyWideUnionMinted,
 } from "./check_types"
@@ -275,8 +287,12 @@ function litTreeAdopt(ix: i32, ty: i32): i32 {
   if e is Unary { return litTreeAdopt(e.unArg, ty) }
   if e is BinExpr {
     litTreeAdopt(e.binLeft, ty)
-    // A shift count is not an operand of the result's width; it keeps its own.
-    if binShiftOp(e.binOp) { return ty }
+    // A shift count is no operand of the tree's value, but a literal count is typed at the
+    // width the shift computes at.
+    if binShiftOp(e.binOp) {
+      numLitAdoptDst(e.binRight, ty)
+      return ty
+    }
     return litTreeAdopt(e.binRight, ty)
   }
   litTreeAdoptLeaf(ix, ty)
@@ -358,5 +374,141 @@ function nodeIsValueJoin(ix: i32): boolean {
   n is IfStmt || n is MatchExpr
 }
 
+// A list literal's elements and a value `if` or `match`'s tails take the type `t` they join to,
+// so `[1, 2.5]` holds an f64 `1`.
+export function numLitAdoptJoin(ix: i32, t: i32): i32 {
+  if ix < 0 || t < 0 || !(nodeIsCtorLit(ix) || nodeIsValueJoin(ix)) { return 0 }
+  numLitAdoptDeep(ix, t, 6)
+}
+
 // Clears this module's tables (called from `initChecker`).
 export function numAdoptReset() { litTreeTy = [] }
+
+// A bare literal delivered into a numeric destination, or met by a numeric operand, types at that
+// primitive (`numLitDstTy`), every node from `ix` down to it, so `const a: i64 = 6` and `x * 2`
+// over an `i64` hold an i64 literal; answers the type taken, or -1. A speculative check, and a
+// non-quiet re-validation of a generic template (whose literals every instance shares), stamp nothing.
+export function numLitAdoptDst(ix: i32, dstTy: i32): i32 {
+  if !stampsStand() || litPinN.length > 0 { return -1 }
+  const t = numLitDstTy(ix, dstTy)
+  if t < 0 { return -1 }
+  numLitRetype(ix, t)
+}
+
+// Types the parens and negations from `ix` down to its literal as `t`. Answers `t`.
+function numLitRetype(ix: i32, t: i32): i32 {
+  if inferQuiet {
+    if elabCapLive() { elabCapNote(ix, t) }
+  } else if ix < nodeTyIx.length {
+    nodeTySet(ix, t)
+  }
+  const e = nodeAt(ix)
+  if e is Paren { return numLitRetype(e.parInner, t) }
+  if e is Unary { return numLitRetype(e.unArg, t) }
+  numLitRetypeLeaf(t)
+}
+
+// The literal itself, the one other node `numLitDstTy` admits, ends the walk.
+function numLitRetypeLeaf(t: i32): i32 { t }
+
+// A literal a join widened past its own type (`-1` beside `3000000000`), delivered on its own
+// into a numeric destination it fits, takes that destination instead. Answers whether it did.
+export function numLitReadopt(ix: i32, srcTy: i32, dstTy: i32): boolean {
+  const own = numLitOwnTy(ix)
+  if own < 0 || srcTy == own || !isNumericPrimTy(srcTy) { return false }
+  if numLitDstTy(ix, dstTy) < 0 { return false }
+  numLitAdoptDst(ix, dstTy) >= 0
+}
+
+// `numLitAdoptDst` through what a delivery hands over: every tail of a value `if`, `match` or
+// block, and each element of a list literal and field of a record literal against its own
+// destination, so `const g: i64[] = [7, 8]` holds i64 literals. `depth` bounds the walk.
+export function numLitAdoptDeep(ix: i32, dstTy: i32, depth: i32): i32 {
+  if !stampsStand() || ix < 0 || dstTy < 0 || depth <= 0 { return 0 }
+  // Only a value join or block has tails to split; anything else is its own one part.
+  const at = cwPeel(ix)
+  if valueJoinAt(at) < 0 { return numLitAdoptPart(at, dstTy, depth) }
+  for lf in valueTailLeaves(ix) { numLitAdoptPart(lf, dstTy, depth) }
+  0
+}
+
+// One delivered value of `numLitAdoptDeep`: a literal adopts, a list or record literal walks
+// its parts against the destination's one list or record arm.
+function numLitAdoptPart(ix: i32, dstTy: i32, depth: i32): i32 {
+  if numLitAdoptDst(ix, dstTy) >= 0 { return 0 }
+  const e = nodeAt(ix)
+  if e is ArrayLit {
+    const at = numSoleArm(dstTy, true)
+    if at < 0 { return 0 }
+    const a = tyAt(at)
+    if a is TyArray {
+      for el in e.arrElems {
+        const sp = nodeAt(el)
+        if sp is Spread {
+          numLitAdoptDeep(sp.spdArg, at, depth - 1)
+        } else {
+          numLitAdoptDeep(el, a.aElem, depth - 1)
+        }
+      }
+    }
+    return 0
+  }
+  if e is ObjLit {
+    const ot = numSoleArm(dstTy, false)
+    if ot < 0 { return 0 }
+    const o = tyAt(ot)
+    if o is TyObj {
+      for fx in e.objFields {
+        const f = nodeAt(fx)
+        if f is FieldInit {
+          const ft = objFieldType(o, f.fiName)
+          if ft >= 0 { numLitAdoptDeep(f.fiValue, ft, depth - 1) }
+        }
+      }
+    }
+  }
+  numLitPartOpaque()
+}
+
+// Any other delivered value holds no literal a destination reaches: its own check typed it.
+function numLitPartOpaque(): i32 { 0 }
+
+// The one list (`list`) or record member of `dstTy`, peeling a nullable, or -1 when it has none
+// or several; a list member whose element holds no number is no candidate.
+function numSoleArm(dstTy: i32, list: boolean): i32 {
+  const d = nonNullTy(dstTy)
+  if d < 0 || d >= T.tys.length { return -1 }
+  const t = tyAt(d)
+  if list && t is TyArray { return d }
+  if !list && t is TyObj { return d }
+  if !(t is TyUnion) { return -1 }
+  let one = -1
+  for m0 in t.uMembers {
+    const m = nonNullTy(m0)
+    if m >= 0 && m < T.tys.length {
+      const mt = tyAt(m)
+      if (
+        (list && mt is TyArray && !numNoNumber(mt.aElem))
+        || (!list && mt is TyObj)
+      ) {
+        if one >= 0 { return -1 }
+        one = m
+      }
+    }
+  }
+  one
+}
+
+// Whether every value of `t` is a non-numeric scalar: a `boolean`, a `string` or a literal of one.
+function numNoNumber(t: i32): boolean {
+  const d = nonNullTy(t)
+  if d < 0 || d >= T.tys.length { return false }
+  const x = tyAt(d)
+  if x is TyPrim { return !isNumericPrimTy(d) }
+  if x is TyLit { return tyNumScalarBaseName(d) == "" }
+  if !(x is TyUnion) { return false }
+  for m in x.uMembers {
+    if !numNoNumber(m) { return false }
+  }
+  true
+}

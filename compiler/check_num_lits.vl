@@ -75,6 +75,7 @@ import {
   numLitUnionBaseName,
   primNameStr,
   tyAt,
+  tyNumScalarBaseName,
   tyToStr,
 } from "./check_types"
 import {
@@ -1205,6 +1206,92 @@ export function litTreeWideTy(ix: i32, dstTy: i32): i32 {
   if pn != "f64" && pn != "f32" { return -1 }
   if !litTreeLeavesExact(ix, fty) { return -1 }
   fty
+}
+
+// The numeric primitive a bare literal delivered into `dstTy` takes as its own type: the
+// destination itself, or a union's one numeric member, when the literal holds its value exactly
+// there; -1 when it keeps the type its lexeme implies. Parens and a negation peel.
+export function numLitDstTy(ix: i32, dstTy: i32): i32 {
+  if ix < 0 || dstTy < 0 { return -1 }
+  const lix = cexLitPeel(ix)
+  if lix < 0 { return -1 }
+  const l = nodeAt(lix)
+  if !(l is NumLit) { return -1 }
+  const lex = l.numText
+  const own = if numLexIsFloat(lex) { TY_F64 } else if numLexFitsI32(lex) { TY_I32 } else { TY_I64 }
+  const t = numDstPrim(dstTy, own)
+  if t < 0 { return -1 }
+  if numLexIsFloat(lex) {
+    if t == TY_F64 { return t }
+    if t == TY_F32 && isFloatLitExpr(ix) { return t }
+    return -1
+  }
+  if numLexRadixBits(lex) > 64 { return -1 }
+  if t == TY_I64 { return t }
+  if t == TY_I32 {
+    if numLexFitsI32(lex) { return t } else { return -1 }
+  }
+  if t == TY_F32 {
+    if isExactF32IntLitExpr(ix) { return t } else { return -1 }
+  }
+  if numLexFitsI32(lex) || isExactF64IntLitExpr(ix) { return t }
+  -1
+}
+
+// The type a bare literal (under parens and negations) at `ix` has with no expectation: `f64`
+// for a float lexeme, `i32` when it fits, else `i64`; -1 when `ix` is no such literal.
+export function numLitOwnTy(ix: i32): i32 {
+  const lix = cexLitPeel(ix)
+  if lix < 0 { return -1 }
+  const l = nodeAt(lix)
+  if !(l is NumLit) { return -1 }
+  if numLexIsFloat(l.numText) { TY_F64 }
+  else if numLexFitsI32(l.numText) { TY_I32 }
+  else { TY_I64 }
+}
+
+// The numeric primitive `dstTy` names for a literal of type `own`, peeling a nullable: itself, or
+// of a union `own` when a member, else its one numeric member; -1 for anything else, and for a
+// union holding a literal of `own`, which the literal already is.
+function numDstPrim(dstTy: i32, own: i32): i32 {
+  const d = nonNullTy(dstTy)
+  if d < 0 { return -1 }
+  if isNumericPrimTy(d) { return d }
+  if !(tyAt(d) is TyUnion) { return -1 }
+  const members: i32[] = []
+  flattenVariantsInto(d, members)
+  let one = -1
+  for m in members {
+    if m == own { return own }
+    if (
+      tyNumScalarBaseName(m) != ""
+      && !isNumericPrimTy(m)
+      && numBasePrim(tyNumScalarBaseName(m)) == own
+    ) {
+      return -1
+    }
+    if isNumericPrimTy(m) {
+      if one >= 0 && m != one { one = -2 }
+      else if one != -2 { one = m }
+    }
+  }
+  if one >= 0 { one } else { -1 }
+}
+
+// The width an operator over `t` computes at: its numeric primitive, or the one base a union of
+// number literals reps as; -1 for anything else, a box of several numbers included, whose
+// operation computes member by member.
+export function numJoinPrim(t: i32): i32 {
+  const d = nonNullTy(t)
+  if d < 0 || d >= T.tys.length { return -1 }
+  if isNumericPrimTy(d) { return d }
+  numBasePrim(tyNumScalarBaseName(d))
+}
+
+// The primitive a litunion base name `nm` spells: `i32`, else a wide one `numLitPrimTy` names.
+function numBasePrim(nm: string): i32 {
+  if nm == "i32" { return TY_I32 }
+  numLitPrimTy(nm)
 }
 
 // Whether a literal tree adopts a float destination (`7 / 2` read as 3.5 at an `f64`). Off: an
