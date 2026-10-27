@@ -842,7 +842,6 @@ import {
   capNarrowSeed,
   exprEmittedRefListSlot,
   globalRefListSlot,
-  letListBuild,
 } from "./emit_value_sites"
 import { callBindShadowBegin } from "./call_bind_shadow"
 import {
@@ -950,7 +949,6 @@ import {
   eqHelpReserve,
   expCtxApply,
   expCtxDefault,
-  expCtxForCell,
   expCtxHere,
   initGuardValue,
   maFoldCandidateCount,
@@ -2753,23 +2751,16 @@ function emitStartGlobalInit(
           return -1
         }
       } else {
-        const entryCtx = expCtxHere(ec)
-        emitStartGlobalSeedCtx(gst, g, gck, ec)
+        emitStartGlobalSeedCtx(gst, g, ec)
         if (emitStartGlobalInitValue(bodyExpr, exprPrev, gst, g, gck, ec) < 0) {
           return -1
         }
-        // Back to idle, keeping the caller's null reps for a closure and a list. The ref-heap
-        // seed must clear too: `emitNullLitNode` does not consume them, so a left
-        // armed one retypes the next global's bare `null` into the wrong cell (D1563).
+        // Back to idle: a left armed null seed retypes the next global's bare `null` (D1563).
         const idle = expCtxHere(ec)
         idle.nulBool = false
         idle.nulString = false
-        idle.nulNone = false
-        idle.nulClosure = entryCtx.nulClosure
-        idle.nulList = entryCtx.nulList
         idle.litUnion = 0
         idle.nulLitUnion = false
-        idle.nulRefHeap = -1
         expCtxApply(idle, ec)
         // Read-only covariance at the module-global binding (D822), a delivery form of its own:
         // a global is not a `let`, so no let-side delivery reaches it. A const
@@ -2800,34 +2791,18 @@ function emitStartGlobalInit(
   0
 }
 
-// `emitStartGlobalInit`'s seeding step for global statement `gst` (its `LetDecl` `g`, cell kind
-// `gck`): applies the expression context its initializer lowers under — shape, null rep and list
-// build.
-function emitStartGlobalSeedCtx(gst: i32, g: LetDecl, gck: VKind, ec: ExpCtx) {
+// `emitStartGlobalInit`'s seeding step for global statement `gst` (its `LetDecl` `g`):
+// applies the expression context its initializer lowers under — the niche null reps and atoms.
+function emitStartGlobalSeedCtx(gst: i32, g: LetDecl, ec: ExpCtx) {
   const sc = expCtxHere(ec)
-  // A NULLABLE map global.s start-fn init seeds the null heap: a bare `null` init lowers as
-  // `ref.null $mapStruct`.
-  if gck == "nulmap" { sc.nulRefHeap = mapTypeIdxOf(nulMapShapeOf(gst, -1)) }
-  // A promoted `const c: Circle | null` that becomes a start-function local lowers a bare `null`
-  // init as that variant's own typed null.
-  if gck == "nulvariant" {
-    const gnvi = globalCellStructIdx(gst)
-    if gnvi >= 0 && gnvi < uVarHeap.length { sc.nulRefHeap = uVarHeap[gnvi] }
-  }
   // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
   // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
   sc.nulBool = letIsNulBoolAnn(gst)
   sc.nulString = letIsNulString(gst, -1)
-  // D1576 — a `nulnone` cell (a never-filled module-scope `const x = null`) lowers
-  // its init as `ref.null none`, the one value it can hold. This block, not the
-  // constexpr arm in `emitGlobalSection`, is where every `= null` global's null rep
-  // is decided (a bare `null` is not a WasmGC constexpr).
-  sc.nulNone = gck == "nulnone"
   if letIsLitUnion(gst) { sc.litUnion = 1 }
   // A `K | null` NICHE global's start-fn init: a member literal lowers as
   // its atom id, a bare `null` as the `-1` sentinel — the start-fn twin of
-  // the const-path seeding (a `null` init routes here; un-seeded it drew
-  // the "bare null needs a struct-typed context" loud reject).
+  // the const-path seeding.
   if g.letType >= 0 {
     if nodeTyIsNulLitUnion(g.letType) {
       sc.litUnion = 1
@@ -2841,18 +2816,7 @@ function emitStartGlobalSeedCtx(gst: i32, g: LetDecl, gck: VKind, ec: ExpCtx) {
   // The cell's null rep, by kind (the local-`let` and `global.set`
   // boundaries share the resolver). A bare `null` is never a WasmGC constexpr, so every
   // `= null` global routes here and this is where its null rep is decided.
-  const cellCtx = expCtxForCell(gck, ec)
-  // Kind 18, a nullable ref array (`i32[][] | null`, `S[] | null`): the null is this global's
-  // element wrapper (`rlWrapIdx[slot]`), the same slot the cell's valtype selects. Armed only
-  // when the initializer is a bare `null` (the seed-leak gate the local ladder and the
-  // call-argument boundary both spell): a list-literal init whose element is null must lower that element as `ref.null $S`, and an un-gated seed would retype it to the wrapper instead.
-  if gck == "nulreflist" {
-    const gnraSlot = letListBuild(gst, -1).lbSlot
-    if gnraSlot >= 0 && gnraSlot < rlWrapIdx.length {
-      const gnraInit = nodeAt(unwrapParen(g.letInit))
-      if gnraInit is NullLit { cellCtx.nulRefHeap = rlWrapIdx[gnraSlot] }
-    }
-  }
+  const cellCtx = expCtxHere(ec)
   expCtxApply(cellCtx, ec)
   0
 }
@@ -9963,22 +9927,9 @@ function emitConstCellInit(buf: u8[], gi: i32, ec: ExpCtx): i32 {
   if g is LetDecl {
     const gcSaved = expCtxHere(ec)
     const gck = globalCellKind(globalStmts[gi])
-    const gcs = globalCellStructIdx(globalStmts[gi])
-    const sc = expCtxHere(ec)
-    // A nullable-variant cell seeds its own typed null; `gcs` is a variant index only where
-    // `globalCellStructIdx` found one.
-    if gck == "nulvariant" && gcs >= 0 && gcs < uVarHeap.length {
-      sc.nulRefHeap = uVarHeap[gcs]
-    }
-    expCtxApply(sc, ec)
     // The rungs a cell derives from its kind alone, shared with the local `let`, the
-    // start-function init and the `global.set` arm: the nullable scalar list, nullable-list
-    // and nullable-closure null reps.
-    const cc = expCtxForCell(gck, ec)
-    // A nullable map cell.s bare `null` lowers as `ref.null $mapStruct`, a valid WasmGC constexpr.
-    if gck == "nulmap" {
-      cc.nulRefHeap = mapTypeIdxOf(nulMapShapeOf(globalStmts[gi], -1))
-    }
+    // start-function init and the `global.set` arm.
+    const cc = expCtxHere(ec)
     // A wider numeric cell re-encodes an integer literal directly as `i64.const`/`f32.const`/
     // `f64.const`, so the init stays a constexpr (no convert op).
     cc.wantI64 = (gck == "i64")
