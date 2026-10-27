@@ -303,12 +303,13 @@ import { recAdPushSettled, recAdSetGroup } from "./check_rec_rows"
 import { pgrNoteCall } from "./check_poly_growth"
 import {
   calleeDeclParams,
-  constDeclOf,
+  identConstDeclOf,
+  identDepthOf,
+  identFnAliasOf,
+  identFnDeclOf,
+  identIntrShadowed,
+  identTyOf,
   lookup,
-  lookupDepth,
-  lookupFnAliasNode,
-  lookupFnDeclNode,
-  numIntrShadowed,
 } from "./check_scopes"
 import {
   holeArgLambdaHowOf,
@@ -743,7 +744,7 @@ function checkMemOffsetCall(n: Call, cfn: Ident): i32 {
   const base = memOffsetBaseArity(nm)
   if base < 0 || n.callArgs.length != base + 1 { return -1 }
   if hasNamedArgs(n.callArgNames) { return -1 }
-  if (fnDeclIx[nm] ?? -1) >= 0 || lookupDepth(nm) != 0 { return -1 }
+  if (fnDeclIx[nm] ?? -1) >= 0 || identDepthOf(n.callFn, nm) != 0 { return -1 }
   const ft = tyAt(checkNodeHook(n.callFn))
   if ft is TyFunc {
     const ps = ft.fnParamTypes
@@ -865,7 +866,7 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
   // the checker only has to type them. A user binding of the same name shadows the
   // intrinsic (`numIntrShadowed`), and the emitter gates on the same rule — the
   // intrinsic arm is a fallback for a name the program did not define itself.
-  if !numIntrShadowed(cfn.identName) {
+  if !identIntrShadowed(n.callFn, cfn.identName) {
     const bcTy = bitcastCallTy(cfn.identName, n, ix)
     if bcTy >= 0 { return bcTy }
     const niTy = numIntrCallTy(cfn.identName, n, ix)
@@ -1182,7 +1183,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // Explicit type arguments bind first, so every argument is checked against them.
   const explicitTa = callHasTyArgs(ix)
   if explicitTa {
-    if !bindExplicitTyArgs(cfn, ix, bNames, bTys) { return TY_ERR }
+    if !bindExplicitTyArgs(cfn, n.callFn, ix, bNames, bTys) { return TY_ERR }
   }
   bindCalleeScopeTyParams(cfn, n.callFn, ft, bNames, bTys)
   let dstNames = NO_DST_NAMES
@@ -1245,7 +1246,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // the answer itself is the callee's declaration, not this site's bindings.
   if cfn is Ident {
     let rtpDecl = fnDeclIx[cfn.identName] ?? CSTR_NODECL
-    if rtpDecl == CSTR_NODECL { rtpDecl = lookupFnAliasNode(cfn.identName) }
+    if rtpDecl == CSTR_NODECL { rtpDecl = identFnAliasOf(n.callFn) }
     if !explicitTa {
       checkRetTyParamBound(rtpDecl, cfn.identName, ix, ft.fnRet)
     }
@@ -1348,7 +1349,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // that body's own parameters is kept as a union instead, which its pins re-join (D3589).
   let kept = -1
   if tyIsDeferredJoin(retTy) && !njFnReached(njFnIx) {
-    const keep = (apartHoleJoins.get(retTy) ?? false) || calleeRetDeclared(cfn)
+    const keep = (apartHoleJoins.get(retTy) ?? false)
+      || calleeRetDeclared(cfn, n.callFn)
     kept = keptParamUnion(retTy, keep)
   }
   let cRetTy = kept
@@ -1619,7 +1621,7 @@ function callFtyCheckArg(
     const nl = holeLambdaNodeOf(at)
     if nl >= 0 {
       const owner = holeArgOwner(cfn, n.callFn)
-      if holeParamUse(cfn, owner, params[i], i) == 1 {
+      if holeParamUse(cfn, n.callFn, owner, params[i], i) == 1 {
         noteHoleArgNamed(ix, nl)
       }
     }
@@ -1708,7 +1710,7 @@ function callFtyArgSeedTy(
       if holeLambdaDefers(owner, params[i], bNames, bTys) {
         noteValBindLambda(lx)
       } else {
-        const how = holeParamUse(cfn, owner, params[i], i)
+        const how = holeParamUse(cfn, callFn, owner, params[i], i)
         if how >= 0 {
           noteValBindLambda(lx)
           noteHoleArgLambda(lx, how)
@@ -1909,7 +1911,7 @@ function callFtyPinCstrs(
     // `substTyDeep` matches `TyVar`s by name and `const g = idT  g(structList)` would
     // otherwise report a sibling's refusal.
     if cstrCallee == CSTR_NODECL {
-      const aliasIx = lookupFnAliasNode(cfn.identName)
+      const aliasIx = identFnAliasOf(n.callFn)
       if aliasIx >= 0 { cstrCallee = aliasIx }
     }
     cstrWho = cfn.identName
@@ -1930,8 +1932,8 @@ function callFtyPinCstrs(
   let namedFn = -1
   if cfn is Ident {
     // The declaration the callee names, directly or through an alias.
-    namedFn = lookupFnDeclNode(cfn.identName)
-    if namedFn < 0 { namedFn = lookupFnAliasNode(cfn.identName) }
+    namedFn = identFnDeclOf(n.callFn)
+    if namedFn < 0 { namedFn = identFnAliasOf(n.callFn) }
     if nestParentOf.has(namedFn) { nestCallee = namedFn }
   }
   if nestCallee >= 0 {
@@ -2241,12 +2243,18 @@ function fsbGenFnHolePins(
 
 // How the callee's body uses its hole parameter `holeTy`, the `i`th: 0 when it calls it, 1 when
 // it never reads it, -1 otherwise or for a callee with no declaration in reach.
-function holeParamUse(cfn: Node, owner: i32, holeTy: i32, i: i32): i32 {
+function holeParamUse(
+  cfn: Node,
+  cfnIx: i32,
+  owner: i32,
+  holeTy: i32,
+  i: i32,
+): i32 {
   if holeTy < 0 || !tyIsHole(holeTy) { return -1 }
   const hv = tyAt(holeTy)
   if !(hv is TyVar) { return -1 }
   let decl = owner
-  if decl < 0 && cfn is Ident { decl = lookupFnAliasNode(cfn.identName) }
+  if decl < 0 && cfn is Ident { decl = identFnAliasOf(cfnIx) }
   let scope = CSTR_NODECL
   if owner >= 0 { scope = owner }
   if genFnHoleCalled(hv.tvName, scope) { return 0 }
@@ -2999,7 +3007,7 @@ function holeLambdaSplit(
 function constLambdaOf(cfn: Node, cfnIx: i32): i32 {
   if !(cfn is Ident) { return -1 }
   let f = -1
-  const d = constDeclOf(cfn.identName)
+  const d = identConstDeclOf(cfnIx)
   if d >= 0 && d < P.nodes.length {
     const l = nodeAt(d)
     if l is LetDecl && l.letInit >= 0 { f = parenPeelIx(l.letInit) }
@@ -3088,7 +3096,7 @@ function pinUnreadGenFnArgs(
       let d = -1
       if an is Ident {
         // Named directly, or through a `const` alias of the declaration.
-        d = fnDeclIx[an.identName] ?? lookupFnAliasNode(an.identName)
+        d = fnDeclIx[an.identName] ?? identFnAliasOf(a)
         if d >= 0 && !(nodeAt(d) is FuncDecl) { d = -1 }
       }
       const vt = vTys[k]
@@ -3351,7 +3359,7 @@ function forElemArgCstrs(c: i32, ft: TyFunc, vNames: string[], vTys: i32[]) {
   if !(lit is ArrayLit) { return 0 }
   for e in lit.arrElems {
     const el = nodeAt(parenPeelIx(e))
-    const decl = if el is Ident { lookupFnDeclNode(el.identName) } else { -1 }
+    const decl = if el is Ident { identFnDeclOf(parenPeelIx(e)) } else { -1 }
     const t = if decl >= 0 { nodeTyOf(decl) } else { -1 }
     const et = if t >= 0 && t < T.tys.length { tyAt(t) } else { tyAt(TY_ERR) }
     if et is TyFunc && et.fnParamTypes.length == ft.fnParamTypes.length {
@@ -3384,7 +3392,7 @@ function forIterListLit(it: i32): i32 {
   const n = nodeAt(x)
   if n is ArrayLit { return x }
   if !(n is Ident) { return -1 }
-  const init = parenPeelIx(ctnLitInitOf(n.identName))
+  const init = parenPeelIx(ctnLitInitOf(x, n.identName))
   if init < 0 || init >= P.nodes.length || !(nodeAt(init) is ArrayLit) {
     return -1
   }
@@ -3410,7 +3418,7 @@ function constListFnElemDecl(calleeIx: i32): i32 {
   const k = nodeAt(c.idxIndex)
   const a = nodeAt(c.idxArr)
   if !(k is NumLit) || !(a is Ident) { return -1 }
-  const init = ctnLitInitOf(a.identName)
+  const init = ctnLitInitOf(c.idxArr, a.identName)
   if init < 0 { return -1 }
   const lit = nodeAt(parenPeelIx(init))
   if !(lit is ArrayLit) { return -1 }
@@ -3418,9 +3426,14 @@ function constListFnElemDecl(calleeIx: i32): i32 {
   while j < lit.arrElems.length {
     if i32ToStr(j) == k.numText {
       const el = nodeAt(parenPeelIx(lit.arrElems[j]))
-      if !(el is Ident) || lookupDepth(el.identName) != 0 { return -1 }
+      if (
+        !(el is Ident)
+        || identDepthOf(parenPeelIx(lit.arrElems[j]), el.identName) != 0
+      ) {
+        return -1
+      }
       if listElemsWritten(c.idxArr, a.identName) { return -1 }
-      return lookupFnDeclNode(el.identName)
+      return identFnDeclOf(parenPeelIx(lit.arrElems[j]))
     }
     j = j + 1
   }
@@ -3445,7 +3458,7 @@ export function checkCallNode(n: Call, ix: i32) {
   if n.callFn < 0 { return TY_ERR }
   const cfn = nodeAt(n.callFn)
   if callHasTyArgs(ix) {
-    if !callTyArgsCalleeOk(cfn, ix) { return TY_ERR }
+    if !callTyArgsCalleeOk(cfn, n.callFn, ix) { return TY_ERR }
   }
   if cfn is Member {
     const mt = checkMemberCallNode(n, ix, cfn.memObj, cfn.memProp, -1)
@@ -3458,8 +3471,11 @@ export function checkCallNode(n: Call, ix: i32) {
     if ot >= 0 { return ot }
   }
   if cfn is Ident {
-    checkUnimplementedIntrinsicCall(cfn, ix)
-    if cfn.identName == "__memory_shared__" && lookupDepth(cfn.identName) == 0 {
+    checkUnimplementedIntrinsicCall(cfn, n.callFn, ix)
+    if (
+      cfn.identName == "__memory_shared__"
+      && identDepthOf(n.callFn, cfn.identName) == 0
+    ) {
       memSharedCalls.push(ix)
     }
   }
@@ -3493,7 +3509,7 @@ export function checkCallNode(n: Call, ix: i32) {
     if ft is TyErr {
       // A module global called above its declaration, which the hoist could not type: its
       // arguments are still checked on their own, as a hole callee's are (D3899).
-      if cfn is Ident && globalBeforeDecl(cfn.identName) {
+      if cfn is Ident && globalBeforeDecl(n.callFn, cfn.identName) {
         for ga in n.callArgs { checkNodeHook(ga) }
       }
       return TY_ERR
@@ -3571,7 +3587,7 @@ export function checkCallNode(n: Call, ix: i32) {
 // True when it raised. A program that declares or imports its own `len` never reaches it.
 function foreignLenCall(n: Call, cfn: Ident): boolean {
   if cfn.identName != "len" || n.callArgs.length != 1 { return false }
-  if lookup("len") >= 0 { return false }
+  if identTyOf(n.callFn, "len") >= 0 { return false }
   const at = strLitRecvTy(checkNodeHook(n.callArgs[0]))
   if !strListHas(builtinMethodNamesOf(at), "length") {
     tErr("undeclared identifier 'len'", n.callFn)

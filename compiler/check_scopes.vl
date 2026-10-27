@@ -6,20 +6,12 @@
 // `declareDecl` binds a declaration, `declare` re-binds a visible name for flow, and the
 // checker pushes and pops the frames and resets the tables.
 
-import { FuncDecl, Ident, P, nodeAt } from "./ast"
+import { FuncDecl, Ident, LetDecl, P, nodeAt } from "./ast"
 import { modSuffixOf } from "./modid"
 import { demangleName } from "./check_suggest"
 import { T } from "./check_types"
 import { IDENT_BUILTIN, identDeclOf, sidEpoch, sidOfNode } from "./symbols"
-import {
-  CW_OCC_FDECL,
-  cwIxBuild,
-  cwIxChain,
-  cwIxKind,
-  cwIxNext,
-  cwIxNode,
-  fnDeclIx,
-} from "./check_write_scan"
+import { fnDeclIx } from "./check_write_scan"
 
 // The const-binding chain, parallel to `T.frames`: each frame records which of its names carry
 // `const` — an immutable name, not immutable data, so a field write through a const stays
@@ -64,6 +56,8 @@ let envDeclTop: i32[] = []
 let envAmbTop: i32[] = []
 // Each ambient intrinsic's slot by name: what a builtin `Ident`, which names no declaration, reads.
 let envAmbOf: {[string]: i32} = Map()
+// Each binding that aliases a function declaration (`const f = addT`), by the binding's declaration.
+let fnAliasOfDecl: {[i32]: i32} = Map()
 
 // The (name, depth) bindings `scopeHideEnter` took out of `scopeDepthsOf`, innermost window last,
 // with the log entry each one unlinked.
@@ -89,6 +83,7 @@ export function scopesReset() {
   envDeclTop = []
   envAmbTop = []
   envAmbOf = Map()
+  fnAliasOfDecl = Map()
   0
 }
 
@@ -239,6 +234,12 @@ export function identTyOf(ix: i32, name: string) {
   if s == -1 { return -1 }
   declTyOf(s)
 }
+// The type the ambient intrinsic `name` binds, or -1.
+export function ambientTyOf(name: string) {
+  const s = envAmbOf[name] ?? -1
+  if s >= -1 { return -1 }
+  declTyOf(s)
+}
 
 // The frame depth the `Ident` `ix`, spelled `name`, resolves at, or -1.
 export function identDepthOf(ix: i32, name: string) {
@@ -246,6 +247,49 @@ export function identDepthOf(ix: i32, name: string) {
   if s == -1 { return -1 }
   declDepthOf(s)
 }
+
+// The live binding the `Ident` `ix` reads, or -1 when it reads no declaration or nothing binds it.
+function identLiveDeclOf(ix: i32) {
+  const d = identDeclOf(ix)
+  if d < 0 || declDepthOf(d) < 0 { return -1 }
+  d
+}
+
+// The `FuncDecl` the `Ident` `ix` names, or -1 when it names any other binding.
+export function identFnDeclOf(ix: i32) {
+  const d = identLiveDeclOf(ix)
+  if d >= 0 && nodeAt(d) is FuncDecl { return d }
+  -1
+}
+
+// The `const` declaration the `Ident` `ix` names, or -1 when its binding is not a `const`.
+export function identConstDeclOf(ix: i32) {
+  const d = identLiveDeclOf(ix)
+  if d < 0 { return -1 }
+  const n = nodeAt(d)
+  if n is LetDecl {
+    if n.letKw == "const" { return d }
+  }
+  -1
+}
+
+// Whether the `Ident` `ix` names a live `const` binding.
+export function identIsConst(ix: i32) { identConstDeclOf(ix) >= 0 }
+
+// The function declaration the binding `decl` aliases (`const f = addT`), or -1.
+export function declFnAliasOf(decl: i32) {
+  if decl < 0 { return -1 }
+  fnAliasOfDecl[decl] ?? -1
+}
+
+// Records that the binding `decl` aliases the function declaration `fn`.
+export function declFnAliasSet(decl: i32, fn: i32) {
+  if decl >= 0 { fnAliasOfDecl[decl] = fn }
+  0
+}
+
+// The function declaration the `Ident` `ix`'s live binding aliases, or -1.
+export function identFnAliasOf(ix: i32) { declFnAliasOf(identLiveDeclOf(ix)) }
 
 // The slot `name`'s innermost visible binding holds, or -1. This is a second resolver of the
 // fact the binder records per `Ident`, kept only for the by-name flow writes and queries until
@@ -413,13 +457,6 @@ export function isConstName(name: string) {
   false
 }
 
-// `isConstName(name)` where `sid` is `name`'s interned id.
-export function isConstNameSid(sid: i32, name: string) {
-  const i = lookupDepthSid(sid, name)
-  if i >= 0 && i < constScopes.length { return constScopes[i].has(name) }
-  false
-}
-
 // Records a fresh binding of `name` in the innermost frame in `scopeDepthsOf`, through the id
 // view when `sid` is known; a name the frame already binds is left as it is.
 function scopeDepthNote(sid: i32, name: string) {
@@ -491,15 +528,6 @@ export function declareFnDeclNode(name: string, nodeIx: i32) {
   0
 }
 
-// The declaration a binding of `name` aliases, or -1 — `fnAliasScopes` read under the scope chain's
-// own shadowing rule, exactly like `isConstName` and `lookupFnDeclNode`. Its one consumer is
-// deferred-constraint ownership; see the table's header for why it is separate.
-export function lookupFnAliasNode(name: string) {
-  const i = lookupDepth(name)
-  if i >= 0 && i < fnAliasScopes.length { return fnAliasScopes[i][name] ?? -1 }
-  -1
-}
-
 // The `const` declaration `name` currently resolves to, or -1 when its innermost binding is not a
 // `const`. A module constant the checker has not reached yet answers from its hoist (D3271).
 export function constDeclOf(name: string) {
@@ -523,13 +551,6 @@ export function lookupFnDeclNode(name: string) {
   -1
 }
 
-// `lookupFnDeclNode(name)` where `sid` is `name`'s interned id.
-export function lookupFnDeclNodeSid(sid: i32, name: string) {
-  const i = lookupDepthSid(sid, name)
-  if i >= 0 && i < fnDeclScopes.length { return fnDeclScopes[i][name] ?? -1 }
-  -1
-}
-
 // Look `name` up through the scope chain, innermost first. Returns its type-arena
 // index, or `-1` if undeclared (innermost-wins, so shadowing works).
 export function lookup(name: string) {
@@ -538,22 +559,12 @@ export function lookup(name: string) {
   scopeTyAt(i, name)
 }
 
-// The declaration of the function `name` names: the one in scope, else the only function of
-// that name anywhere (a walk after the pass is out of every function's scope). -1 otherwise.
-export function recFnDeclByName(name: string): i32 {
-  const fd = lookupFnDeclNode(name)
-  if fd >= 0 { return fd }
-  cwIxBuild()
-  let found = -1
-  let r = cwIxChain(name)
-  while r >= 0 {
-    if cwIxKind[r] == CW_OCC_FDECL {
-      if found >= 0 && found != cwIxNode[r] { return -1 }
-      found = cwIxNode[r]
-    }
-    r = cwIxNext[r]
-  }
-  found
+// The `FuncDecl` the binder bound the `Ident` `ix` to, whether or not its scope is open now (a
+// walk after the pass is out of every function's scope), or -1 for any other binding.
+export function identBoundFnDeclOf(ix: i32): i32 {
+  const d = identDeclOf(ix)
+  if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl { return d }
+  -1
 }
 
 // The merged spelling of plain `name` that `fnDeclIx` is keyed on, or "". A merge renames
@@ -588,7 +599,7 @@ export function calleeDeclParams(calleeIx: i32) {
   const none: i32[] = []
   const cf = nodeAt(calleeIx)
   if cf is Ident {
-    const dIx = lookupFnDeclNodeSid(sidOfNode(calleeIx), cf.identName)
+    const dIx = identFnDeclOf(calleeIx)
     if dIx >= 0 {
       const d = nodeAt(dIx)
       if d is FuncDecl { return d.fnParams }
@@ -597,33 +608,15 @@ export function calleeDeclParams(calleeIx: i32) {
   none
 }
 
-// Is `name` bound at MODULE scope by a `const`? `T.frames[0]` is the module
-// frame, and asking IT rather than walking the chain is the point: a parameter
-// default's names resolve at the DECLARATION, and the declaration's own
-// parameters and locals are exactly what must NOT answer here.
-export function isModuleScopeConst(name: string) {
-  if T.frames.length == 0 { return false }
-  if !T.frames[0].has(name) { return false }
-  if constScopes.length == 0 { return false }
-  // Bound, not returned as a bare tail: a member-call cannot be a tail
-  // expression (`emitProgram: unsupported member-call statement`).
-  const isC = constScopes[0].has(name)
-  isC
-}
-
-// Whether `name` is bound by the program — a declared function (hoisted, so a forward
-// reference counts) or any in-scope binding. A user definition wins over the intrinsic of the
-// same name, so adding an intrinsic can never capture a call that already resolves to the
-// program's own function; the emitter reads the same rule off its own function table.
-export function numIntrShadowed(name: string) {
+// Whether the `Ident` `ix` spelled `name` reads a user binding that shadows a numeric intrinsic.
+export function identIntrShadowed(ix: i32, name: string) {
   if (fnDeclIx[name] ?? -1) >= 0 { return true }
-  lookup(name) >= 0
+  identTyOf(ix, name) >= 0
 }
 
 // The module-level `FuncDecl` named `raw` (or its merged `raw$m<m>`), or -1.
 export function moduleFnDeclOf(raw: string, m: i32) {
-  if fnDeclScopes.length == 0 { return -1 }
-  let d = fnDeclScopes[0][raw] ?? -1
-  if d < 0 && m >= 0 { d = fnDeclScopes[0][raw + modSuffixOf(m)] ?? -1 }
+  let d = fnDeclIx[raw] ?? -1
+  if d < 0 && m >= 0 { d = fnDeclIx[raw + modSuffixOf(m)] ?? -1 }
   d
 }
