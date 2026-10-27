@@ -900,9 +900,7 @@ import {
   ifExprRefKind,
   ifExprRefSlot,
   indexElemUnionName,
-  inferredRetMapSlot,
   instanceReadTyOf,
-  letAnnRefListSlot,
   letInfersF32,
   letInitTyIsNarrowedArm,
   letInitTyIsNarrowedNulArm,
@@ -935,7 +933,6 @@ import {
   mfResultSlotOf,
   minMaxKind,
   nulLitAtomTexts,
-  nulMapShapeOf,
   nulRefStructIdxOfLet,
   nulVariantIdxOfExpr,
   objLitVariantIdxNoStructRow,
@@ -1225,8 +1222,6 @@ import {
   rlSlotOfTyOrTwin,
   sFieldMapShape,
   sFieldRefSlot,
-  uFieldMapShape,
-  variantFieldRefSlot,
 } from "./emit_shape_rows"
 import {
   fieldCodeVKind,
@@ -1388,7 +1383,6 @@ import {
   globalNulListCellRead,
   holeBindsFunc,
   identNameIsLiveBound,
-  letListBuild,
   listFitShadowRow,
   litAtomWidenTexts,
   mapExactHeldTyOf,
@@ -1883,8 +1877,6 @@ function emitStructFieldValueUnder(
   ) {
     return 0
   }
-  const c = expCtxHere(ec)
-  c.nulRefHeap = -1
   // The field's ref-list row, which the read-only covariant copy below converts into.
   let fieldRow = 0
   if scode == FC_REF_LIST {
@@ -1897,30 +1889,10 @@ function emitStructFieldValueUnder(
       )
     }
     fieldRow = fslot
-  } else if scode == FC_NUL_I32_LIST {
-    // a bare `null` here becomes `ref.null $lTypeIdx`; a list value ignores this seed.
-    c.nulRefHeap = lTypeIdx
-  } else if isNulScalarListFieldCode(scode) {
-    // gated on a bare `null`: an empty-list element must not consume this seed (it would
-    // store `ref.null $wrapper` into a backing holding `ref.null $elem`).
-    const nslV = nodeAt(unwrapParen(valIx))
-    if nslV is NullLit { c.nulRefHeap = nulScalarListFieldWrapHeap(scode) }
   } else if scode == FC_NUL_REF_LIST {
-    // The null-heap seed is gated on a bare `null` value — ungated, a `[null]` element
-    // would consume it: invalid wasm.
-    let fslot28 = sFieldRefSlot(si, fi)
-    if fslot28 < 0 { fslot28 = 0 }
-    fieldRow = fslot28
-
-    if fslot28 < rlWrapIdx.length {
-      const nraF = nodeAt(unwrapParen(valIx))
-      if nraF is NullLit { c.nulRefHeap = rlWrapIdx[fslot28] }
-    }
-  } else if scode == FC_NUL_MAP {
-    // a bare `null` refs this field's own value-typed map struct.
-    c.nulRefHeap = mapTypeIdxOf(sFieldMapShape(si, fi))
+    const fslot28 = sFieldRefSlot(si, fi)
+    fieldRow = if fslot28 < 0 { 0 } else { fslot28 }
   }
-  expCtxApply(c, ec)
 
   if scode == FC_UNION {
     // coerces a raw scalar/string/null into the box with its atom tag via `emitUnionBoxArg`,
@@ -1963,7 +1935,6 @@ function emitStructFieldValueUnder(
     if emitExprExpect(body, valIx, fnIx, nluCtx) < 0 { return -1 }
   } else if scode == FC_NUL_CLOSURE {
     const ncCtx = expCtxHere(ec)
-    ncCtx.nulClosure = true
     if emitExprExpect(body, valIx, fnIx, ncCtx) < 0 { return -1 }
   } else if scode == FC_NUL_NONE {
     // The `null` unit type's slot holds only `ref.null none`; the value runs for effect (D4671).
@@ -2677,23 +2648,6 @@ function emitVariantFieldValueUnder(
       )
     }
   }
-  const c = expCtxHere(ec)
-  c.nulRefHeap = -1
-  if vcode == FC_NUL_I32_LIST {
-    c.nulRefHeap = lTypeIdx
-  } else if vcode == FC_NUL_REF_LIST {
-    let vslot28 = variantFieldRefSlot(vi, fj)
-    if vslot28 < 0 { vslot28 = 0 }
-    if vslot28 < rlWrapIdx.length { c.nulRefHeap = rlWrapIdx[vslot28] }
-  } else if isNulScalarListFieldCode(vcode) {
-    // A bare `null` written to a nullable scalar-backed list arm field is the field's own
-    // wrapper's null (D1294).
-    const vnslV = nodeAt(unwrapParen(valIx))
-    if vnslV is NullLit { c.nulRefHeap = nulScalarListFieldWrapHeap(vcode) }
-  } else if vcode == FC_NUL_MAP {
-    c.nulRefHeap = mapTypeIdxOf(uFieldMapShape(vi, fj))
-  }
-  expCtxApply(c, ec)
 
   if vcode == FC_F64 {
     if emitExprAsF64(body, valIx, fnIx, ec) < 0 { return -1 }
@@ -2716,7 +2670,6 @@ function emitVariantFieldValueUnder(
     if emitExprExpect(body, valIx, fnIx, vnluCtx) < 0 { return -1 }
   } else if vcode == FC_NUL_CLOSURE {
     const ncCtx = expCtxHere(ec)
-    ncCtx.nulClosure = true
     if emitExprExpect(body, valIx, fnIx, ncCtx) < 0 { return -1 }
   } else if vcode == FC_NUL_NONE {
     if emitNulNoneForEffect(body, valIx, fnIx, ec) < 0 { return -1 }
@@ -8820,7 +8773,7 @@ function nulNoneEqSide(exprIx: i32, fnIx: i32): boolean {
 
 // Evaluate a `null`-typed operand for its effects and drop it, where the answer is already
 // decided. A call and an if-expression have effects; an ident read has none, and emitting one
-// would consume the destination seed (`emitNullBySeed`'s one-shot `ec.nulRefHeap`) the
+// would consume a destination seed (`emitNullBySeed`'s niche `ec.nulBool` / `nulString`) the
 // surviving value still needs. Shared by `??`, the folded null compare, and `print`.
 function emitNulNoneForEffect(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   const ix = unwrapParen(exprIx)
@@ -12702,10 +12655,6 @@ function emitArrRef(
     )
   }
   let i = 0
-  // A kind-9 element is itself a REF list (`Cell[]` of `Cell[][]`, any ref leaf, any depth):
-  // its inner ref-list slot, seeded so each element builds as that inner list (recursively).
-  let nestInnerSlot = -1
-  if elemNest == RLK_REF_LIST { nestInnerSlot = rlElemInnerSlot(rslot) }
   const rc = expCtxHere(ec)
   while i < elems.length {
     // A non-nested-list element list must not hold array elements. Kinds 4/6/7/8 (scalar
@@ -12737,19 +12686,7 @@ function emitArrRef(
         return -1
       }
     } else {
-      if (
-        emitArrRefElem(
-          body,
-          elems[i],
-          fnIx,
-          rslot,
-          elemNest,
-          nestInnerSlot,
-          elemVariantIdx,
-          ec,
-        )
-        < 0
-      ) {
+      if (emitArrRefElem(body, elems[i], fnIx, rslot, elemVariantIdx, ec) < 0) {
         return -1
       }
     }
@@ -12805,22 +12742,17 @@ function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
   rslot
 }
 
-// One non-union element `e` of `emitArrRef`'s list at slot `rslot`, built under its inner
-// list's context (`elemNest`, `nestInnerSlot`) or coerced into the arm `elemVariantIdx`.
-// Returns 0 once the element is on the stack, -1 on failure.
+// One non-union element `e` of `emitArrRef`'s list at slot `rslot`, built as is or coerced
+// into the arm `elemVariantIdx`. Returns 0 once the element is on the stack, -1 on failure.
 function emitArrRefElem(
   body: u8[],
   e: i32,
   fnIx: i32,
   rslot: i32,
-  elemNest: i32,
-  nestInnerSlot: i32,
   elemVariantIdx: i32,
   ec: ExpCtx,
 ) {
   const elCtx = expCtxHere(ec)
-  const elIsBareNull = nodeAt(unwrapParen(e)) is NullLit
-  if elIsBareNull { arrRefNullSeed(elCtx, rslot, elemNest, nestInnerSlot) }
   if elemVariantIdx >= 0 && rlElemNullable[rslot] != 1 {
     // A non-null ARM element takes every value through `emitVariantCoerce`, a join
     // included; the coerce owns the narrowed unbox (D4639).
@@ -12837,41 +12769,6 @@ function emitArrRefElem(
   // `(readonly Shape[])[]`.
   emitNestedListWidenSite(body, e, fnIx, rslot)
   0
-}
-
-// A bare `null` element's seed in `elCtx` for a nullable-niche list at slot `rslot`: kind 4
-// gives `ref.null $lTypeIdx`, kind 9 the inner wrapper, the distinct-backing kinds 6/7/8/10
-// the leaf-list wrapper singleton. Whole-value seeds, so the seed-leak gate applies one level
-// down: a nested list element's own nulls would consume the leaked heap.
-function arrRefNullSeed(
-  elCtx: ExpCtx,
-  rslot: i32,
-  elemNest: i32,
-  nestInnerSlot: i32,
-) {
-  if elemNest == RLK_I32_LIST && rlElemNullable[rslot] == 1 {
-    elCtx.nulList = true
-  }
-  if (
-    elemNest == RLK_REF_LIST
-    && rlElemNullable[rslot] == 1
-    && nestInnerSlot >= 0
-  ) {
-    elCtx.nulRefHeap = rlWrapIdx[nestInnerSlot]
-  }
-  if rlElemNullable[rslot] == 1 {
-    if elemNest == RLK_STR_LIST { elCtx.nulRefHeap = mkListIdx }
-    if elemNest == RLK_F64_LIST { elCtx.nulRefHeap = fl64TypeIdx }
-    if elemNest == RLK_I64_LIST { elCtx.nulRefHeap = il64TypeIdx }
-    if elemNest == RLK_F32_LIST { elCtx.nulRefHeap = fl32TypeIdx }
-    if elemNest == RLK_U8_LIST { elCtx.nulRefHeap = bl8TypeIdx }
-    // A `({[string]: V} | null)[]` element (kind 3 nullable niche) → `ref.null` of
-    // the element's map struct (the slot heap, resolved by the kind-3 passes).
-    if elemNest == RLK_MAP { elCtx.nulRefHeap = rlElemHeap[rslot] }
-    // A `((...) => ...) | null` element (kind 5 nullable niche) → `ref.null` of the
-    // shared closure fat-pointer (the slot heap, `cloStructIdx`).
-    if elemNest == RLK_CLOSURE { elCtx.nulRefHeap = rlElemHeap[rslot] }
-  }
 }
 
 // The default i32-list arm of `emitArrUnder`, including literal-union, nullable-boolean and
@@ -12974,6 +12871,17 @@ function emitArrI32(
   return 0
 }
 
+// Whether a non-empty literal's elements are all bare `null`s, so name no element kind.
+function arrElemsAllNull(elems: i32[]): boolean {
+  if elems.length == 0 { return false }
+  let i = 0
+  while i < elems.length {
+    if !(nodeAt(unwrapParen(elems[i])) is NullLit) { return false }
+    i = i + 1
+  }
+  true
+}
+
 // `emitArr`'s body: it applies each arm's element context and leaves it for the wrapper's
 // exit to undo.
 function emitArrUnder(
@@ -13039,10 +12947,15 @@ function emitArrUnder(
       isI64Lit = false
       isStrLit = false
     }
-    // A string list under a threaded `null` seed is the `(string | null)[]` niche, whose first
-    // element may be a `null` the element probe cannot classify: a literal that records no type
-    // of its own, as the run a variadic `.push` appends, has only the threaded kind (D4553).
-    if lb.lbKind == LBK_STR_LIST && ec.nulString && !isRefLit {
+    // A string-list pair claims a literal whose elements name no kind of their own: a
+    // `(string | null)[]` niche under a threaded `null` seed, as in a run a variadic `.push`
+    // appends (D4553), or an all-`null` run of a spread literal (D2964). An atom literal under
+    // the pair stays an atom list, which the spread converts.
+    if (
+      lb.lbKind == LBK_STR_LIST
+      && !isRefLit
+      && (ec.nulString || arrElemsAllNull(elems))
+    ) {
       isStrLit = true
       isF64Lit = false
       isI64Lit = false
@@ -13586,13 +13499,7 @@ function emitMapValDefault(
       ec,
     )
   }
-  const dfCtx = expCtxHere(ec)
-  // A bare `null` default (`m[k] ?? null` typing `S | null`) lowers as `ref.null <elem>`,
-  // whether or not the slot's value type is itself nullable (D2247).
-  if mvSlotNullable(mslot) || defExprNullable(defIx) {
-    dfCtx.nulRefHeap = mvValElemHeapOf(mslot)
-  }
-  emitExprExpect(body, defIx, fnIx, dfCtx)
+  emitExprExpect(body, defIx, fnIx, expCtxHere(ec))
 }
 
 // True when a `??` DEFAULT is itself nullable — a bare `null` literal or a nullable-typed
@@ -14882,7 +14789,6 @@ function emitMapSetValExpr(
   // preserves it. A non-null value ignores the seed. A `string | null` value read stays the
   // raw nullable ref the element holds rather than recovering non-null, which traps (D2596).
   if mvSlotNullable(mslot) {
-    svCtx.nulRefHeap = mvValElemHeapOf(mslot)
     if mvValKind[mslot] == MVK_STR { svCtx.nulString = true }
   }
   // A literal-union atom stored into a string-valued map widens to its member string: the
@@ -21001,7 +20907,7 @@ function armPreludeScopeOpen(ifIx: i32): boolean {
 // bare `null` there takes, so no arm can pick a blocktype for it (D2227).
 function emitAllNullIf(body: u8[], ifIx: i32, fnIx: i32, ec: ExpCtx) {
   if emitIfForEffect(body, unwrapParen(ifIx), fnIx, ec) < 0 { return -1 }
-  emitNullBySeed(ifIx, fnIx, true, ec, ec)
+  emitNullBySeed(ec)
 }
 
 // Whether node `ix` is a method call `recv.m(…)`.
@@ -21026,10 +20932,6 @@ function emitNulNoneRead(
   raw.nulBool = false
   raw.nulLitUnion = false
   raw.nulString = false
-  raw.nulClosure = false
-  raw.nulList = false
-  raw.nulNone = false
-  raw.nulRefHeap = -1
   raw.litUnion = 0
   expCtxApply(raw, ec)
   let rc = 0
@@ -21048,7 +20950,7 @@ function emitNulNoneRead(
   expCtxApply(outer, ec)
   if rc < 0 { return -1 }
   fbDrop()
-  emitNullBySeed(exprIx, fnIx, true, ctx, ec)
+  emitNullBySeed(ctx)
 }
 
 // Lower a ref-typed if-expression join (string / struct / array) as a value-typed `if`
@@ -25813,7 +25715,7 @@ function emitCallRefArg(
   const pkk = sigParamKindAt(ckey, i)
   expCtxApply(argBase, ec)
   const ac = expCtxHere(ec)
-  expCtxSeedValueArg(ac, pkk)
+  expCtxSeedValueArg(ac)
   // An argument's raw-read seeds are its parameter's alone, as at a direct call (D3816).
   ac.nulString = pkk == "nulstr"
   ac.rawNullRead = false
@@ -25883,19 +25785,15 @@ function emitCallRefArg(
         fbRefCast(uVarHeap[cvSlot]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
       }
     } else if pkk == "nulvariant" {
-      // The niche parameter (D3074), seeded as the direct call's argument rung seeds it:
-      // a `null` is the arm heap's null, an object literal builds the arm, and a value
-      // narrowed out of a box is unboxed to the arm.
+      // The niche parameter (D3074), as the direct call's argument rung builds it: an object
+      // literal builds the arm, and a value narrowed out of a box is unboxed to the arm.
       const cnvSlot = sigParamSlotAt(ckey, i)
       if cnvSlot < 0 || cnvSlot >= uVarHeap.length {
         return emitFail(
           "emitProgram: value-call nullable union-arm parameter has no variant slot",
         )
       }
-      const cnvCtx = expCtxHere(ec)
-      const cnvArg = nodeAt(unwrapParen(args[i]))
-      if cnvArg is NullLit { cnvCtx.nulRefHeap = uVarHeap[cnvSlot] }
-      if emitExprExpect(body, args[i], fnIx, cnvCtx) < 0 { return -1 }
+      if emitExprExpect(body, args[i], fnIx, expCtxHere(ec)) < 0 { return -1 }
       if narrowedArmNeedsUnbox(args[i], fnIx) {
         emitNarrowedArmUnboxTo(
           armDestHeapOf("nulvariant", cnvSlot),
@@ -25918,33 +25816,14 @@ function emitCallRefArg(
       clu == 0
       && (isScalarBackedListRep(pkk) || isNulScalarListKind(pkk))
     ) {
-      const clCtx = expCtxHere(ec)
-      // A bare `null` into a nullable one is that list's own wrapper's null (D2399).
-      if pkk != null && isNulScalarListKind(pkk) {
-        clCtx.nulRefHeap = nulScalarListWrapHeap(pkk)
-      }
-      if emitExprExpect(body, args[i], fnIx, clCtx) < 0 { return -1 }
+      if emitExprExpect(body, args[i], fnIx, expCtxHere(ec)) < 0 { return -1 }
     } else if clu == 0 {
       // The parameter's nullability is assigned from the key, as a direct call assigns it
       // from the declaration: an enclosing position's non-null expectation would otherwise
       // recover a `null` argument into a nullable parameter, a trap (D2552).
       const cuCtx = expCtxHere(ec)
       cuCtx.nulString = pkk == "nulstr"
-      cuCtx.nulClosure = pkk == "nulclosure"
-      cuCtx.nulList = pkk == "nullist"
-      cuCtx.nulNone = pkk == "nulnone"
       cuCtx.nulBool = pkk == "i32" && cloCallParamIsNulBool(callIx, i, fnIx)
-      // A bare `null` into a nullable ref list is its wrapper's null, by the key's slot (D5882).
-      if pkk == "nulreflist" && nodeAt(unwrapParen(args[i])) is NullLit {
-        const crs = sigParamSlotAt(ckey, i)
-        if crs >= 0 && crs < rlWrapIdx.length {
-          cuCtx.nulRefHeap = rlWrapIdx[crs]
-        }
-      }
-      // A bare `null` into a nullable map is that map struct's null, by the key's shape slot.
-      if pkk == "nulmap" && nodeAt(unwrapParen(args[i])) is NullLit {
-        cuCtx.nulRefHeap = mapTypeIdxOf(sigParamSlotAt(ckey, i))
-      }
       if emitExprExpect(body, args[i], fnIx, cuCtx) < 0 { return -1 }
       // A value narrowed out of a box into a struct parameter is unboxed, as the direct
       // call unboxes it (D1723); the slot is the key's, so the cast agrees with the bytes.
@@ -26224,40 +26103,14 @@ function emitAssignGlobal(
       if emitNulNoneForEffect(body, a.binRight, fnIx, ec) < 0 { return -1 }
       fbRefNullNone()
     } else {
-      // a niche `X | null` global seeds its null rep for a bare `null` RHS (the table
-      // at `emitNullLitNode`), mirroring the seed the global's own initializer gets;
-      // a non-null RHS ignores the seed.
-      const gsCtx = expCtxForCell(gaKind, ec)
+      // a non-ref niche `X | null` global seeds its null rep for a bare `null` RHS,
+      // mirroring the seed the global's own initializer gets; a non-null RHS ignores it.
+      const gsCtx = expCtxHere(ec)
       if exprNulBool(lhsIx, fnIx) { gsCtx.nulBool = true }
       if exprNullableString(lhsIx, fnIx) { gsCtx.nulString = true }
-      if exprNulClosure(lhsIx, fnIx) { gsCtx.nulClosure = true }
-      if exprNullableList(lhsIx, fnIx) { gsCtx.nulList = true }
       if exprNulLitUnion(lhsIx, fnIx) {
         gsCtx.nulLitUnion = true
         gsCtx.litUnion = 1
-      }
-      const gaNSK = exprNulScalarListKind(lhsIx, fnIx)
-      if gaNSK != null { gsCtx.nulRefHeap = nulScalarListWrapHeap(gaNSK) }
-      if exprNullableMap(lhsIx, fnIx) {
-        gsCtx.nulRefHeap = mapTypeIdxOf(mapShapeOfExpr(lhsIx, fnIx))
-      }
-      // the `nulvariant` niche (`gv = null` → `ref.null $uVarHeap[vi]`), armed only
-      // for a bare `null` RHS (the #964 seed-leak gate) so a non-null RHS keeps the ambient seed.
-      if gaKind == "nulvariant" {
-        const gnvRhs = nodeAt(unwrapParen(a.binRight))
-        if gnvRhs is NullLit {
-          gsCtx.nulRefHeap = armDestHeapOf(gaKind, gaArmIdx)
-        }
-      }
-      // a kind-18 nullable ref-array global's null is this global's element wrapper
-      // (the annotation's slot), armed only for a bare `null` RHS (the #964 seed-leak gate)
-      // so a `[null]` element takes its own heap type instead.
-      if gaKind == "nulreflist" {
-        const gnraSlot = letAnnRefListSlot(gLet)
-        if gnraSlot >= 0 && gnraSlot < rlWrapIdx.length {
-          const gnraRhs = nodeAt(unwrapParen(a.binRight))
-          if gnraRhs is NullLit { gsCtx.nulRefHeap = rlWrapIdx[gnraSlot] }
-        }
       }
       // a literal-union global (`v = "b"` over `let v: K`): the member RHS lowers as
       // its interned i32 id, not a heap string — the other half of the litunion
@@ -26318,35 +26171,6 @@ function emitAssignLocalSeeded(
   const asCtx = expCtxHere(ec)
   if exprNulBool(lhsIx, fnIx) { asCtx.nulBool = true }
   if exprNullableString(lhsIx, fnIx) { asCtx.nulString = true }
-  if exprNulClosure(lhsIx, fnIx) { asCtx.nulClosure = true }
-  if exprNullableList(lhsIx, fnIx) { asCtx.nulList = true }
-  // A distinct-backing nullable scalar list and a nullable map each need their own seed here
-  // (mirroring `emitLetDeclStmt`'s kind ladder).
-  const asNSK = exprNulScalarListKind(lhsIx, fnIx)
-  if asNSK != null { asCtx.nulRefHeap = nulScalarListWrapHeap(asNSK) }
-  if exprNullableMap(lhsIx, fnIx) {
-    asCtx.nulRefHeap = mapTypeIdxOf(mapShapeOfExpr(lhsIx, fnIx))
-  }
-  // a kind-18 nullable ref-array's null is this binding's inner element wrapper —
-  // the same wrapper the declaration's `= null` seeds (`refListSlotOfExpr` rounds
-  // the ident back to it) — armed only for a bare `null` RHS (the #964 seed-leak
-  // gate), so a `[null]` element still takes its own heap type.
-  if exprNullableRefArray(lhsIx, fnIx) {
-    const asRls = refListSlotOfExpr(lhsIx, fnIx)
-    if asRls >= 0 && asRls < rlWrapIdx.length {
-      const asNraRhs = nodeAt(unwrapParen(a.binRight))
-      if asNraRhs is NullLit { asCtx.nulRefHeap = rlWrapIdx[asRls] }
-    }
-  }
-  // the variant niche (`c: Circle | null`): its null is `ref.null $uVarHeap[vi]`, the
-  // declaration's own heap, armed only for a bare `null` RHS (the #964 leak gate).
-  if exprNullableVariant(lhsIx, fnIx) {
-    const asNvi = nulVariantIdxOfExpr(lhsIx, fnIx)
-    if asNvi >= 0 && asNvi < uVarHeap.length {
-      const asNvRhs = nodeAt(unwrapParen(a.binRight))
-      if asNvRhs is NullLit { asCtx.nulRefHeap = uVarHeap[asNvi] }
-    }
-  }
   // A literal-union local (`k = "b"`): the member RHS lowers as its interned i32 id.
   if exprIsLitAtom(lhsIx, fnIx) { asCtx.litUnion = 1 }
   if emitExprExpect(body, a.binRight, fnIx, asCtx) < 0 { return -1 }
@@ -26542,9 +26366,8 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
       st.unionNm = rlElemName[rslot]
       st.unionTy = rlElemTyIxAt(rslot)
     }
-    // Every element kind whose value emit needs the slot's context — a nested list,
-    // the nullable-CLOSURE niche, a MAP element — through ONE predicate.
-    if rlElemNeedsValueCtx(rslot) { st.nestSlot = rslot }
+    // A nullable element's value emits under the ambient seeds, as `.push`'s does.
+    if rlElemNullable[rslot] == 1 { st.nestSlot = rslot }
   } else if st.isStr {
     // a string list `xs[i] = s`: unwrap to its `(ref null $sTypeIdx)` backing and
     // store the string ref, mirroring `emitIndex`'s string path — else it falls into
@@ -26626,7 +26449,7 @@ function emitIdxStoreValue(
   } else if st.nestSlot >= 0 {
     // A nested-list row store: the RHS builds as the INNER list (inert for a
     // non-literal RHS — an ident/call emits unchanged).
-    const snCtx = refElemValueCtx(st.nestSlot, ec)
+    const snCtx = expCtxHere(ec)
     if emitExprExpect(body, a.binRight, fnIx, snCtx) < 0 { return -1 }
   } else if st.isF64 {
     // The stored value re-encodes at the element valtype (a bare-int / int-literal value
@@ -27021,37 +26844,6 @@ function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32, ec: ExpCtx) {
   }
   emitFail("emitProgram: expected an assignment expression")
 }
-
-// The expected-type context for one element value of the ref-list slot `rslot` — the
-// `.push`/indexed-assign twin of `emitArr`'s per-element seeds: a nullable element seeds the
-// null-element ref. A non-null value reads none of these seeds.
-function refElemValueCtx(rslot: i32, ec: ExpCtx): ExpCtx {
-  const c = expCtxHere(ec)
-  const k = rlElemKindTbl[rslot]
-  if rlElemNullable[rslot] == 1 {
-    if k == RLK_I32_LIST { c.nulList = true }
-    if k == RLK_STR_LIST { c.nulRefHeap = mkListIdx }
-    if k == RLK_F64_LIST { c.nulRefHeap = fl64TypeIdx }
-    if k == RLK_I64_LIST { c.nulRefHeap = il64TypeIdx }
-    if k == RLK_F32_LIST { c.nulRefHeap = fl32TypeIdx }
-    if k == RLK_U8_LIST { c.nulRefHeap = bl8TypeIdx }
-    if k == RLK_REF_LIST {
-      const inner = rlElemInnerSlot(rslot)
-      if inner >= 0 { c.nulRefHeap = rlWrapIdx[inner] }
-    }
-    // A nullable-CLOSURE element (kind 5): a `null` value stores as `ref.null` of the
-    // shared closure fat-pointer (the slot heap, `cloStructIdx`).
-    if k == RLK_CLOSURE { c.nulRefHeap = rlElemHeap[rslot] }
-    // A nullable-MAP element (kind 3): `ref.null` of the element's own map struct.
-    if k == RLK_MAP { c.nulRefHeap = rlElemHeap[rslot] }
-  }
-  c
-}
-
-// Whether a ref-list slot's element-value emit needs `refElemValueCtx` at all: the one
-// predicate the `.push` and indexed-assign boundaries share. Only a nullable element has a
-// null seed to take; every other one reads the ambient seeds.
-function rlElemNeedsValueCtx(rslot: i32) { rlElemNullable[rslot] == 1 }
 
 // Stage a list-op receiver that is not a bare local — a global, a struct field, an index —
 // into the op frame's `recvRef` scratch slot: the one home the evaluate-once rule every
@@ -27528,8 +27320,7 @@ function pushSlotOf(
     // element heap, the same one `rlBackIdx` types the backing with.
     ps.armHeap = rlElemArmHeapOf(rslot)
     ps.destKind = pushDestVKind(rslot)
-    // The same ONE predicate the indexed-assign boundary uses (see there).
-    if rlElemNeedsValueCtx(rslot) { pv.pushNestSlot = rslot }
+    if rlElemNullable[rslot] == 1 { pv.pushNestSlot = rslot }
   } else if pv.isStr {
     if !slUsed {
       emitFail("emitProgram: string .push but string list type not collected")
@@ -27686,7 +27477,7 @@ function emitPushValue(
   } else if pushNestSlot >= 0 {
     // A nested-list element push: the value builds as the INNER list (an inert
     // context for a non-literal value — an ident/call emits unchanged).
-    const pnCtx = refElemValueCtx(pushNestSlot, ec)
+    const pnCtx = expCtxHere(ec)
     if emitExprExpect(body, argIx, fnIx, pnCtx) < 0 { return -1 }
   } else if isLitArr {
     if litPushNeedsDestNarrow(argIx, fnIx) {
@@ -30076,37 +29867,19 @@ function inferredRetVariantIdx(fnPos: i32): i32 {
   -1
 }
 
-// Seed `ctx` from the result type of function `fn` (at `fnStmts` position `fnPos`,
-// -1 when annotated): the struct, variant and map seeds of
-// the annotated and inferred spellings. Returns the narrowed-arm unbox's destination heap, or -1.
-function emitReturnSeedCtx(fn: FuncDecl, fnPos: i32, ctx: ExpCtx): i32 {
+// The narrowed-arm unbox's destination heap for a return of function `fn` (at `fnStmts`
+// position `fnPos`, -1 when annotated), annotated or inferred; -1 when the result owes none.
+function returnArmHeapOf(fn: FuncDecl, fnPos: i32): i32 {
   let retArmHeap = -1
-  // A `: Circle | null` return seeds its niche's heap type, so a bare `return null` lowers as
-  // `ref.null $uVarHeap[vi]` instead of reaching `emitNullLitNode` with no context.
+  // A `: Circle | null` result's niche heap.
   if retNulVariantFlag(fn.fnRet) == 1 {
     const rnvi = nulVariantIndexOf(fn.fnRet)
-    if rnvi >= 0 && rnvi < uVarHeap.length { ctx.nulRefHeap = uVarHeap[rnvi] }
     retArmHeap = armDestHeapOf("nulvariant", rnvi)
   }
   // The kind-9 twin: a `Dot | null` result over a DECLARED struct that is the arm's layout
   // twin. Same slot shape, same unbox owed, a struct row instead of a variant one.
   if retNulRefFlag(fn.fnRet) == 1 {
     retArmHeap = armDestHeapOf("nulstruct", retNulRefIndex(fn.fnRet))
-  }
-  if fn.fnRet < 0 {
-    if fnPos >= 0 && fnPos < fRetKind.length {
-      // The inferred half of the annotated `nulvariant` seed above: the same column the
-      // functype's result heap is read from, so a bare `return null` agrees.
-      if fRetKind[fnPos] == "nulvariant" && fnPos < fRetStructIdx.length {
-        const nvr = fRetStructIdx[fnPos]
-        if nvr >= 0 && nvr < uVarHeap.length { ctx.nulRefHeap = uVarHeap[nvr] }
-      }
-      // D956 — the nullable-map twin of the arm above: a bare `return null` is typed at the
-      // map's own value slot, as a `{[string]: string} | null` return needs.
-      if fRetKind[fnPos] == "nulmap" {
-        ctx.nulRefHeap = mapTypeIdxOf(inferredRetMapSlot(fnPos))
-      }
-    }
   }
   // The plain-struct twin of the two annotated seeds: `function g(): A` returning a narrowed
   // arm of an inferred union, whose arm no seed above can find. The annotation's own rep and
@@ -30178,13 +29951,6 @@ function emitReturnPlainValue(
   fnPos: i32,
   retNulBool: boolean,
   retNulString: boolean,
-  retNulClosure: boolean,
-  retNulList: boolean,
-  retNulRefArr: boolean,
-  retNulRefArrHeap: i32,
-  retNulMap: boolean,
-  retNulMapShape: i32,
-  retNulSLKind: VKind | null,
   retLitUnion: boolean,
   retNulLitUnion: boolean,
   ec: ExpCtx,
@@ -30192,22 +29958,6 @@ function emitReturnPlainValue(
   const retCtx = expCtxHere(ec)
   if retNulBool { retCtx.nulBool = true }
   if retNulString { retCtx.nulString = true }
-  if retNulClosure { retCtx.nulClosure = true }
-  if retNulList { retCtx.nulList = true }
-  // The #964 seed-leak gate (stated in full at `emitObj`'s code-28 arm), at the RETURN
-  // boundary. Witness: `return [null]` of `({f: boolean | null} | null)[] | null`.
-  if retNulRefArr && retNulRefArrHeap >= 0 {
-    if nodeAt(unwrapParen(retArg)) is NullLit {
-      retCtx.nulRefHeap = retNulRefArrHeap
-    }
-  }
-  // A nulmap return: a `return null` is `ref.null $mapStruct` (`nulRefHeap`). A `return m` (a
-  // map variable) self-identifies and subtypes the nullable result.
-  if retNulMap { retCtx.nulRefHeap = mapTypeIdxOf(retNulMapShape) }
-  // A DISTINCT-backing nullable scalar list return: a `return null` is `ref.null $wrapper`.
-  if retNulSLKind != null {
-    retCtx.nulRefHeap = nulScalarListWrapHeap(retNulSLKind)
-  }
   if retLitUnion { retCtx.litUnion = 1 }
   if retNulLitUnion {
     retCtx.nulLitUnion = true
@@ -30338,14 +30088,6 @@ type RetFlags = {
   retI64: boolean,
   retNulBool: boolean,
   retNulString: boolean,
-  retNulClosure: boolean,
-  retNulList: boolean,
-  retNulRefArr: boolean,
-  retNulRefArrHeap: i32,
-  // `{[string]: V} | null`: a `return null` is `ref.null` of this map shape's struct.
-  retNulMap: boolean,
-  retNulMapShape: i32,
-  retNulSLKind: VKind | null,
   retLitUnion: boolean,
   retNulLitUnion: boolean,
   // A literal-union atom returned as `string` widens to its member text.
@@ -30402,8 +30144,8 @@ function retFlagsSeedResult(
   }
   // a literal-union return reads as a union name but is an i32 atom — excluded from the
   // value-union box return, since `emitUnionBoxArg` would `struct.new` the member. A
-  // nullable-closure return is the closure niche, not a value box, routed through
-  // `retNulClosure` in `retFlagsSeedNiches`; a nullable literal union is excluded on the same grounds.
+  // nullable-closure return is the closure niche, not a value box, and takes the plain
+  // arm; a nullable literal union is excluded on the same grounds.
   if retUnionFlag(fn.fnRet) == 1 {
     if (
       !nodeTyIsLitUnionAlias(fn.fnRet)
@@ -30445,26 +30187,6 @@ function retFlagsSeedNiches(
 ) {
   if tyIsNulBool(fn.fnRet) { rf.retNulBool = true }
   if retNulStringFlag(fn.fnRet) == 1 { rf.retNulString = true }
-  // A nullable-closure return (`((i32) => i32) | null`, kind 19): a `return null` lowers
-  // as `ref.null $cloStruct` (the niche), a function value passes through as the fat
-  // pointer widened to the nullable storage — the return analogue of the kind-22 field.
-  if nulCloFlag(fn.fnRet) == 1 { rf.retNulClosure = true }
-  if retNulListFlag(fn.fnRet) == 1 { rf.retNulList = true }
-  // A nullable ref-array return (`<ref-array> | null`, kind 18): a `return [x]` builds the ref
-  // list (which subtypes the nullable wrapper), a `return null` is `ref.null $wrapper` — seed the
-  // inner wrapper heap so the bare-`null` return path types it.
-  if retNulRefArrFlag(fn.fnRet) == 1 {
-    rf.retNulRefArr = true
-    const rlsRet = tyAnnRefListSlot(fn.fnRet)
-    if rlsRet >= 0 && rlsRet < rlWrapIdx.length {
-      rf.retNulRefArrHeap = rlWrapIdx[rlsRet]
-    }
-  }
-  if retNulMapFlag(fn.fnRet) == 1 {
-    rf.retNulMap = true
-    rf.retNulMapShape = mapAnnShape(fn.fnRet)
-  }
-  rf.retNulSLKind = nulScalarListKindOfNode(fn.fnRet)
   if nodeTyIsLitUnionAlias(fn.fnRet) { rf.retLitUnion = true }
   // A synthesized `: K` (a lambda pinned at its alias) is typed at the alias's copy, which
   // the index test above misses and the provenance-reading one does not (D3120).
@@ -30521,13 +30243,6 @@ function emitReturnValueTail(
     retI64: false,
     retNulBool: false,
     retNulString: false,
-    retNulClosure: false,
-    retNulList: false,
-    retNulRefArr: false,
-    retNulRefArrHeap: -1,
-    retNulMap: false,
-    retNulMapShape: -1,
-    retNulSLKind: null,
     retLitUnion: false,
     retNulLitUnion: false,
     retStrWiden: false,
@@ -30582,13 +30297,6 @@ function emitReturnValueTail(
         fnPos,
         rf.retNulBool,
         rf.retNulString,
-        rf.retNulClosure,
-        rf.retNulList,
-        rf.retNulRefArr,
-        rf.retNulRefArrHeap,
-        rf.retNulMap,
-        rf.retNulMapShape,
-        rf.retNulSLKind,
         rf.retLitUnion,
         rf.retNulLitUnion,
         ec,
@@ -30649,7 +30357,7 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32, ec: ExpCtx) {
       )
     }
   }
-  if fn is FuncDecl { retArmHeap = emitReturnSeedCtx(fn, fnPos, ctx) }
+  if fn is FuncDecl { retArmHeap = returnArmHeapOf(fn, fnPos) }
   // the result's ref-list row, for the read-only-covariance widening (D791): the
   // annotation's row, or — for an un-annotated function — `criClassify`'s recorded
   // `("reflist", slot)`, the same pair `emitOneFuncType` reads for the result valtype.
@@ -31369,18 +31077,7 @@ function emitLetDeclStmt(
   // A bare-arm cell's init is delivered by `emitVariantCoerce`, which owns the unbox and the
   // niche recover both, so neither bottom step runs for it.
   const letArmCell = localIsRef[slot] == "variant"
-  // A kind-15 nullable i32-list binding (`i32[] | null = null`): a bare `null` init lowers as
-  // `ref.null $lTypeIdx` (the `ec.nulList` arm), the scalar-list analogue of the kind-18 seed above.
-  // Without this a literal `= null` init fell through to the bare-null error (the type/narrowing worked,
-  // but an actual null value never lowered).
-  const letNulList15 = localIsRef[slot] == "nullist"
-  const ctx = letInitCtxOf(s, stmtIx, fnIx, slot, ec)
-  // A NULLABLE map binding (`let m: {[string]: V} | null = …`, slot kind `nulmap`): a bare `null`
-  // init lowers as `ref.null $mapStruct` (`ec.nulRefHeap` = the map heap type). The map twin of
-  // the kind-9 nulstruct seed `letInitCtxOf` makes.
-  if localIsRef[slot] == "nulmap" {
-    ctx.nulRefHeap = mapTypeIdxOf(nulMapShapeOf(stmtIx, fnIx))
-  }
+  const ctx = letInitCtxOf(ec)
   // The init emits under `ctx`; every exit below restores the caller's context.
   const saved = expCtxHere(ec)
   expCtxApply(ctx, ec)
@@ -31426,7 +31123,6 @@ function emitLetDeclStmt(
       letUNm,
       letAnnNm,
       letArmCell,
-      letNulList15,
       ec,
     )
     < 0
@@ -31459,22 +31155,13 @@ function emitLetInitValue(
   letUNm: string,
   letAnnNm: string,
   letArmCell: boolean,
-  letNulList15: boolean,
   ec: ExpCtx,
 ) {
-  if slotKind == "nulclosure" {
-    // a nullable function-value binding: the slot is `(ref null $cloStruct)`. A bare
-    // `null` init lowers as `ref.null $cloStruct`; a function init stores its closure
-    // ref directly. Takes priority over the union-coerce path, since this is a niche
-    // nullable ref, not a box.
-    const ncCtx = expCtxForCell(slotKind, ec)
-    if emitExprExpect(body, s.letInit, fnIx, ncCtx) < 0 { return -1 }
-  } else if isNulScalarListKind(slotKind) {
-    // A DISTINCT-backing nullable scalar list binding (`string[]|null`, `f64[]|null`,
-    // `i64[]|null`, `f32[]|null`): a bare `null` init lowers as `ref.null $wrapper`
-    // (`nulRefHeap`), and a list value is the leaf list, which subtypes the nullable slot.
-    // Priority over the union-coerce path (the niche is not a box).
-    const nslCtx = expCtxForCell(slotKind, ec)
+  if slotKind == "nulclosure" || isNulScalarListKind(slotKind) {
+    // A nullable function value or distinct-backing scalar list: a niche nullable ref, not a
+    // box, so it takes priority over the union-coerce path. A bare `null` is `ref.null none`
+    // and a value is the leaf ref, each of which subtypes the slot.
+    const nslCtx = expCtxHere(ec)
     if emitExprExpect(body, s.letInit, fnIx, nslCtx) < 0 { return -1 }
   } else if (slotKind == "union" && letNulMapReadUnionBox(stmtIx, fnIx)) {
     // A bare `const t = m[k]` read of a UNION-valued map (kind 2): the binding is the
@@ -31542,35 +31229,17 @@ function emitLetInitValue(
     // init as an atom slot, so nothing widens at the init and each read widens instead.
     if emitStrValue(body, s.letInit, fnIx, ec) < 0 { return -1 }
   } else {
-    if emitLetPlainInit(body, s, stmtIx, slot, fnIx, letNulList15, ec) < 0 {
-      return -1
-    }
+    if emitLetPlainInit(body, s, stmtIx, slot, fnIx, ec) < 0 { return -1 }
   }
   0
 }
 
-// The context a `let` in local `slot` emits its init under: the list, struct, variant and
-// map build seeds its cell and annotation imply, and the null rep a bare `null` init takes.
-function letInitCtxOf(
-  s: LetDecl,
-  stmtIx: i32,
-  fnIx: i32,
-  slot: i32,
-  ec: ExpCtx,
-): ExpCtx {
+// The context a `let` emits its init under: the caller's, less a `K | null` niche, which is
+// the binding's own (seeded on the plain path), never that of a join whose arm prelude this
+// binding is (D5430).
+function letInitCtxOf(ec: ExpCtx): ExpCtx {
   const ctx = expCtxHere(ec)
-  // The `K | null` niche is the binding's own (seeded on the plain path), never that of a join
-  // whose arm prelude this binding is (D5430).
   ctx.nulLitUnion = false
-  // A kind-18 nullable ref-array binding seeds its null arm: the #964 seed-leak gate at the
-  // binding boundary.
-  if localIsRef[slot] == "nulreflist" {
-    const nraSlot = letListBuild(stmtIx, fnIx).lbSlot
-    if nraSlot >= 0 && nraSlot < rlWrapIdx.length {
-      const nraInit = nodeAt(unwrapParen(s.letInit))
-      if nraInit is NullLit { ctx.nulRefHeap = rlWrapIdx[nraSlot] }
-    }
-  }
   ctx
 }
 
@@ -31653,7 +31322,7 @@ function emitLetIfInit(
   1
 }
 
-// A `let`'s init on the plain path, under its niche, atom and nullable-list seeds; a
+// A `let`'s init on the plain path, under its niche and atom seeds; a
 // `const` used as a memory address takes the address fold. Returns -1 on a failure, else 0.
 function emitLetPlainInit(
   body: u8[],
@@ -31661,7 +31330,6 @@ function emitLetPlainInit(
   stmtIx: i32,
   slot: i32,
   fnIx: i32,
-  letNulList15: boolean,
   ec: ExpCtx,
 ) {
   // The enclosing value's seeds come back after, since a binding in an if-arm prelude
@@ -31694,7 +31362,6 @@ function emitLetPlainInit(
     valCtx.litUnion = 1
     valCtx.nulLitUnion = true
   }
-  if letNulList15 { valCtx.nulList = true }
   // An atom cell takes its init as the atom, whatever rep the value is read in.
   if localSlotIsLitAtom(slot) { valCtx.litUnion = 1 }
   expCtxApply(valCtx, ec)
@@ -34936,10 +34603,6 @@ export type ExpCtx = {
   nulBool: boolean,     // a bare `null` is the sentinel 2
   nulLitUnion: boolean, // a bare `null` is the sentinel -1
   nulString: boolean,   // a bare `null` is `ref.null $sTypeIdx`
-  nulClosure: boolean,  // a bare `null` is `ref.null $cloStruct`
-  nulList: boolean,     // a bare `null` is `ref.null $lTypeIdx`
-  nulNone: boolean,     // a bare `null` is `ref.null none`, the GC bottom
-  nulRefHeap: i32,      // heap index a bare `null` refs, -1 none
   rawNullRead: boolean, // a nullable read stays the RAW ref
   litUnion: i32,        // a member StrLit lowers as its atom id
 }
@@ -34953,10 +34616,6 @@ export function expCtxDefault(): ExpCtx {
     nulBool: false,
     nulLitUnion: false,
     nulString: false,
-    nulClosure: false,
-    nulList: false,
-    nulNone: false,
-    nulRefHeap: -1,
     rawNullRead: false,
     litUnion: 0,
   }
@@ -34977,10 +34636,6 @@ export function expCtxHere(ec: ExpCtx): ExpCtx {
     nulBool: ec.nulBool,
     nulLitUnion: ec.nulLitUnion,
     nulString: ec.nulString,
-    nulClosure: ec.nulClosure,
-    nulList: ec.nulList,
-    nulNone: ec.nulNone,
-    nulRefHeap: ec.nulRefHeap,
     rawNullRead: ec.rawNullRead,
     litUnion: ec.litUnion,
   }
@@ -34989,24 +34644,17 @@ export function expCtxHere(ec: ExpCtx): ExpCtx {
 
 // Seeds a value call's argument from its parameter's `$fnsig` kind, replacing the
 // enclosing position's: an `i64` destination's literal width does not reach it.
-function expCtxSeedValueArg(c: ExpCtx, pk: VKind | null) {
+function expCtxSeedValueArg(c: ExpCtx) {
   c.wantI64 = false
-  // A `null`-typed parameter takes a bare `null` as `ref.null none` (D4550).
-  c.nulNone = pk == "nulnone"
   0
 }
 
 // `expCtxSeedValueArg` over the ambient seeds.
-function seedValueArgShape(pk: VKind | null, ec: ExpCtx) {
+function seedValueArgShape(ec: ExpCtx) {
   const c = expCtxHere(ec)
-  expCtxSeedValueArg(c, pk)
+  expCtxSeedValueArg(c)
   expCtxApply(c, ec)
   0
-}
-
-// The same seeds from a declared parameter.
-function seedParamArgShape(paramIx: i32, ec: ExpCtx) {
-  seedValueArgShape(vtKindOfParam(paramIx), ec)
 }
 
 // Copies `c` into `ec` field by field, so a caller holding `ec` sees the new seeds and a
@@ -35018,10 +34666,6 @@ export function expCtxApply(c: ExpCtx, ec: ExpCtx) {
   ec.nulBool = c.nulBool
   ec.nulLitUnion = c.nulLitUnion
   ec.nulString = c.nulString
-  ec.nulClosure = c.nulClosure
-  ec.nulList = c.nulList
-  ec.nulNone = c.nulNone
-  ec.nulRefHeap = c.nulRefHeap
   ec.rawNullRead = c.rawNullRead
   ec.litUnion = c.litUnion
   0
@@ -35146,15 +34790,6 @@ function expCtxSwapLitUnion(atom: i32, ec: ExpCtx): i32 {
   was
 }
 
-// Consumes the heap a bare `null` refs: returns it and resets it to -1.
-function expCtxTakeNulRefHeap(ec: ExpCtx): i32 {
-  const c = expCtxHere(ec)
-  const was = c.nulRefHeap
-  c.nulRefHeap = -1
-  expCtxApply(c, ec)
-  was
-}
-
 // Emit `exprIx` under the expected-type context `ctx`. The emit gets its own copy, so
 // what it consumes reaches neither `ctx` nor the caller's context.
 export function emitExprExpect(
@@ -35164,29 +34799,6 @@ export function emitExprExpect(
   ctx: ExpCtx,
 ) {
   emitExpr(body, exprIx, fnIx, expCtxHere(ctx))
-}
-
-// The cell-seed rungs a boundary derives from a cell's KIND alone, over the ambient seeds:
-// the local `let`, the start-fn global init and the `global.set` arm. Not the CONST cell —
-// its reset clears no null rep, so a seed armed there leaks (D1563). What a boundary reads
-// from its own annotation stays at the caller. Difference table: emitter.md 6.1.1.
-export function expCtxForCell(kind: VKind, ec: ExpCtx): ExpCtx {
-  const c = expCtxHere(ec)
-  // The i32-backed `i32[] | null` (kind 15) and the nullable function value (kind 19): each
-  // lowers a bare `null` as `ref.null` of its own heap type rather than the GC bottom.
-  if kind == "nullist" { c.nulList = true }
-  if kind == "nulclosure" { c.nulClosure = true }
-  expCtxNulScalarList(c, kind)
-  c
-}
-
-// The rest of the kind set, and `expCtxForCell`'s default: the distinct-backing nullable
-// scalar lists take a wrapper heap so a bare `null` refs it, and the resolver hands back -1
-// for every kind it does not name, which leaves the ambient seed standing for the others.
-function expCtxNulScalarList(c: ExpCtx, kind: VKind) {
-  const slh = nulScalarListWrapHeap(kind)
-  if slh >= 0 { c.nulRefHeap = slh }
-  0
 }
 
 // Emit `print(<string expr>)`: stream each code point through `__print_char__`, then one
@@ -36099,12 +35711,8 @@ function emitIdentNode(
   ec: ExpCtx,
 ) {
   // D1576 — a read of a never-filled `let x = null` is the value `null`, so it takes the
-  // destination's null rep from the same table a bare `null` literal does. With no seed
-  // the read is `ref.null none` (`nulNoneOk`'s last resort), the GC bottom and a subtype
-  // of every nullable ref cell.
-  if identCellVKind(exprIx, fnIx) == "nulnone" {
-    return emitNullBySeed(exprIx, fnIx, true, ctx, ec)
-  }
+  // destination's null rep from the same table a bare `null` literal does.
+  if identCellVKind(exprIx, fnIx) == "nulnone" { return emitNullBySeed(ctx) }
   // An `is K[]` arm's read of an empty list of another element (D4911), ahead of the narrowed
   // unboxes, which would cast the receiver's own list to `K[]`.
   const fitSh = listFitShadowRead(e.identName, exprIx, fnIx)
@@ -36571,42 +36179,22 @@ function emitCallNode(body: u8[], e: Call, exprIx: i32, fnIx: i32, ec: ExpCtx) {
   return emitCall(body, exprIx, fnIx, ec)
 }
 
-// the null-rep table: a bare `null` takes the rep the enclosing position seeded (one
-// `ExpCtx` field per `X | null` boundary in this file, each mapped to its sentinel/heap
-// in the arms below). Order is load-bearing: the niche arms come first, or the struct seed would claim them.
+// A bare `null` literal, built at the destination `ctx` seeds.
 function emitNullLitNode(
   _body: u8[],
   _e: NullLit,
-  exprIx: i32,
-  fnIx: i32,
+  _exprIx: i32,
+  _fnIx: i32,
   ctx: ExpCtx,
-  ec: ExpCtx,
+  _ec: ExpCtx,
 ) {
-  emitNullBySeed(exprIx, fnIx, false, ctx, ec)
+  emitNullBySeed(ctx)
 }
 
-// The heap of the record the checker adopted for the `null` at `ix` (its variant's or its
-// struct's) in emitted function `fnIx`, or -1 when it adopted none.
-function nullStampHeap(ix: i32, fnIx: i32): i32 {
-  if ix < 0 { return -1 }
-  const ad = nonNullTy(litRepTyAt(ix, fnIx))
-  if ad < 0 || ad == nodeTyIxOf(ix) { return -1 }
-  const vi = variantRowOfTy(ad)
-  if vi >= 0 { return armDestHeapOf("variant", vi) }
-  armDestHeapOf("struct", repRowOfTyStruct(ad, repScanLim()))
-}
-
-// The table above, asked of a value rather than a literal: `nulNoneOk` is the one caller
-// holding a value whose type is `null` (D1576), changing only the last resort — with no
-// seed, such a read is `ref.null none`. `ec.nulNone` reaches the same answer from a
-// boundary whose cell is `nulnone`.
-function emitNullBySeed(
-  ix: i32,
-  fnIx: i32,
-  nulNoneOk: boolean,
-  ctx: ExpCtx,
-  ec: ExpCtx,
-) {
+// A bare `null`, or a value whose type is `null`, at the destination `ctx` seeds. A
+// `boolean | null`, literal-union or string destination names its own null; every other
+// destination is a nullable ref, and `ref.null none`, the GC bottom, is a subtype of each (D1567).
+function emitNullBySeed(ctx: ExpCtx) {
   if ctx.nulBool {
     fbI32Const(2)
     return 0
@@ -36619,73 +36207,7 @@ function emitNullBySeed(
     fbRefNull(sTypeIdx)
     return 0
   }
-  if ctx.nulClosure {
-    fbRefNull(cloStructIdx)
-    return 0
-  }
-  if ctx.nulList {
-    fbRefNull(lTypeIdx)
-    return 0
-  }
-  // Reset the seed after CONSUMING it, so it never persists past this `null` (a stray
-  // non-(-1) value would mis-type a later bare `null`).
-  if ctx.nulRefHeap >= 0 {
-    const nrh = expCtxTakeNulRefHeap(ec)
-    fbRefNull(nrh)
-    return 0
-  }
-  // A `null` the checker built at a record destination is that record's null, ahead of the
-  // enclosing function's own return below, which a `const c: C | null = null` inside it does
-  // not name (D2564).
-  const sh = nullStampHeap(ix, fnIx)
-  if sh >= 0 {
-    fbRefNull(sh)
-    return 0
-  }
-  // last resort: the enclosing function's own return annotation. Every seed above is set
-  // at a boundary and cleared after it, leaving tail position unserved — an implicit
-  // tail `null` reaches this node with the statement seeds reset, while `return null` is
-  // seeded. Reached only where nothing else claimed the null, so this converts a reject, never re-types a claimed one.
-  if fnIx >= 0 {
-    const nlFn = nodeAt(fnIx)
-    if nlFn is FuncDecl {
-      if nlFn.fnRet >= 0 {
-        const nlVi = nulVariantIndexOf(nlFn.fnRet)
-        if nlVi >= 0 && nlVi < uVarHeap.length {
-          fbRefNull(uVarHeap[nlVi])
-          return 0
-        }
-      }
-    }
-  }
-  // D1567 — the `null` type's own rep, and the table's true last resort: a function whose
-  // every returned value is a bare `null` types `TyPrim:null`, so no boundary seeds
-  // anything. `nullref` is the GC bottom, a subtype of every nullable ref valtype, so it
-  // needs no coercion at any ref destination (`emitDirectCall` converts the i32-repped ones).
-  if fnIx >= 0 {
-    const nnFn = nodeAt(fnIx)
-    if nnFn is FuncDecl {
-      // A return annotated as the `null` unit type is the same cell (D4550).
-      if nnFn.fnRet >= 0 && nodeTyIsNullType(nnFn.fnRet) {
-        fbRefNullNone()
-        return 0
-      }
-      if nnFn.fnRet < 0 {
-        const nnPos = fnStmtsPosOf(fnIx)
-        if nnPos >= 0 && nnPos < fRetKind.length {
-          if fRetKind[nnPos] == "nulnone" {
-            fbRefNullNone()
-            return 0
-          }
-        }
-      }
-    }
-  }
-  if nulNoneOk || ctx.nulNone {
-    fbRefNullNone()
-    return 0
-  }
-  return emitFail("emitProgram: bare null needs a struct-typed context")
+  fbRefNullNone()
 }
 
 function emitObjLitNode(
@@ -37874,10 +37396,7 @@ function emitBinExprNode(
   if e.binOp == "==" || e.binOp == "!=" {
     const uql = nodeAt(unwrapParen(e.binLeft))
     const uqr = nodeAt(unwrapParen(e.binRight))
-    // Both sides bare `null` is static — true by the type alone, no rep needed. Without this,
-    // each operand reaches `emitNullLitNode`, which needs a struct-typed context to pick a
-    // heaptype; with no `T` anywhere, `print(null == null)` hits a loud `bare null needs a
-    // struct-typed context` after a clean `vl check` (D1018).
+    // Both sides bare `null` is static — true by the type alone, no rep needed (D1018).
 
     // Distinct from D20's family, which has a `T | null` and asks about that niche. Here there
     // is no `T`: an unconstrained hole resolves to bare `null`, and `null == null` is true by
@@ -38430,7 +37949,6 @@ function emitDirectCallArgsUnder(
   // position's, or an i32 literal lowers as `f32.const`, a bare `Map()` builds an outer shape
   // (D1223), or a `null` read takes a map value's heap. The parameter's seeds follow below.
   const argBase = expCtxHere(ec)
-  argBase.nulRefHeap = -1
   argBase.wantF32 = false
   argBase.wantF64 = false
   argBase.litUnion = 0
@@ -38495,13 +38013,6 @@ function emitDirectArgValue(
   const cUNm = sd.cUNm
   const cParamNulBool = sd.cParamNulBool
   const cParamNulString = sd.cParamNulString
-  const cParamNulClosure = sd.cParamNulClosure
-  const cParamNulList = sd.cParamNulList
-  const cParamNulNone = sd.cParamNulNone
-  const cParamNulRefArr = sd.cParamNulRefArr
-  const cParamNulRefArrHeap = sd.cParamNulRefArrHeap
-  const cParamNulVariantHeap = sd.cParamNulVariantHeap
-  const cParamNulSLKind = sd.cParamNulSLKind
   const cParamLitUnion = sd.cParamLitUnion
   const cParamNulLitUnion = sd.cParamNulLitUnion
   const cParamStr = sd.cParamStr
@@ -38528,25 +38039,6 @@ function emitDirectArgValue(
     // A raw-read seed is the enclosing null test's or `??` arm's, never the argument's: left
     // set, a narrowed `string | null` reached a `string` parameter unrecovered (D3816).
     argCtx.rawNullRead = false
-    argCtx.nulClosure = cParamNulClosure
-    argCtx.nulList = cParamNulList
-    argCtx.nulNone = cParamNulNone
-    if cParamNulRefArr && cParamNulRefArrHeap >= 0 {
-      // The #964 seed-leak gate (stated in full at `emitObj`'s code-28 arm) at the
-      // ARGUMENT boundary. Witness: `useIt([null])` on a `(S | null)[] | null` param
-      // (fuzz seed 160804094 d5).
-      const nraArg = nodeAt(unwrapParen(arg))
-      if nraArg is NullLit { argCtx.nulRefHeap = cParamNulRefArrHeap }
-    }
-    const argNulSLK = cParamNulSLKind
-    if argNulSLK != null {
-      // A `null` argument is `ref.null $wrapper`, as at a return.
-      argCtx.nulRefHeap = nulScalarListWrapHeap(argNulSLK)
-    }
-    if cParamNulVariantHeap >= 0 && arg >= 0 {
-      const nvArg = nodeAt(arg)
-      if nvArg is NullLit { argCtx.nulRefHeap = cParamNulVariantHeap }
-    }
     if cParamLitUnion { argCtx.litUnion = 1 }
     if cParamNulLitUnion {
       argCtx.litUnion = 1
@@ -38633,14 +38125,7 @@ type DirectArgSeeds = {
   cUTy: i32,
   cParamNulBool: boolean,
   cParamNulString: boolean,
-  cParamNulClosure: boolean,
-  cParamNulList: boolean,
-  cParamNulNone: boolean,
-  cParamNulRefArr: boolean,
-  cParamNulRefArrHeap: i32,
-  cParamNulVariantHeap: i32,
   cParamNulVariantIdx: i32,
-  cParamNulSLKind: VKind | null,
   cParamLitUnion: boolean,
   cParamNulLitUnion: boolean,
   cParamStr: boolean,
@@ -38669,28 +38154,13 @@ function directArgSeedsOf(target: i32, i: i32, ac: ExpCtx): DirectArgSeeds {
   // union NAME carries the atom set for the tag choice.
   let cUNm = ""
   let cUTy = -1
-  // The niche `X | null` param positions. Each seeds the null rep its kind demands (the
-  // table lives at `emitNullLitNode`) and leaves a non-null argument untouched; the two
-  // list niches additionally let a list-value/literal argument build the wrapper it
-  // subtypes. Kinds: 21 boolean, 16 string, 19 fn, 15 `i32[]`, 18 ref-array, and the distinct-backing scalar lists.
+  // The `boolean | null` and `string | null` param positions, whose `null` is not a ref
+  // null: each seeds the null rep its kind names and leaves a non-null argument untouched.
   let cParamNulBool = false
   let cParamNulString = false
-  let cParamNulClosure = false
-  let cParamNulList = false
-  // A `null`-typed param position (D4550): a bare `null` argument is `ref.null none`.
-  let cParamNulNone = false
-  let cParamNulRefArr = false
-  let cParamNulRefArrHeap = -1
-  // A `Circle | null` param position: the heap type a bare `null` ARGUMENT lowers as
-  // (`ref.null $uVarHeap[vi]`), `-1` for none. The variant twin of
-  // `cParamNulRefArrHeap`, and it rides the SAME generic `nulRefHeap` seed.
-  let cParamNulVariantHeap = -1
-  // The other half of that niche: a `Circle | null` slot is `(ref null $uVarHeap[vi])`, so
-  // an object literal in it must build the concrete variant struct rather than fall to
-  // `emitObj`'s union-program default (`struct.new $Circle ; struct.new $uBox`), which is
-  // `vl check`-clean and invalid at load (D22). Four positions seed this pair; this is the argument rung — `emitLetDeclStmt`, `emitReturnValue` and `emitAssign` seed the others.
+  // A `Circle | null` param position's variant row, the narrowed-arm unbox's destination
+  // (D1031); -1 for none.
   let cParamNulVariantIdx = -1
-  let cParamNulSLKind: VKind | null = null
   // A literal-union param position: a member-literal argument lowers as its interned i32 id.
   let cParamLitUnion = false
   let cParamNulLitUnion = false
@@ -38714,11 +38184,6 @@ function directArgSeedsOf(target: i32, i: i32, ac: ExpCtx): DirectArgSeeds {
       cArgParamKind = cpK
       cArgParamRow = cpRow
       if cpK == "str" { cParamStr = true }
-      // A NULLABLE map param position (`{[string]: V} | null`, kind `nulmap`): a `null` argument
-      // lowers as `ref.null $mapStruct` (the generic ref-null seed over THIS map's heap type). A
-      // map-value argument is a variable that self-identifies its shape (`exprMap`), so it ignores
-      // the seed.
-      if cpK == "nulmap" { ac.nulRefHeap = mapTypeIdxOf(cpRow) }
       cRecoverKind = cpK
       if cpK == "variant" { cVi = cpRow }
       if cpK == "union" {
@@ -38740,22 +38205,10 @@ function directArgSeedsOf(target: i32, i: i32, ac: ExpCtx): DirectArgSeeds {
       if cpnb is Param {
         if tyIsNulBool(cpnb.parType) { cParamNulBool = true }
         if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
-        if nulCloFlag(cpnb.parType) == 1 { cParamNulClosure = true }
-        if retNulListFlag(cpnb.parType) == 1 { cParamNulList = true }
-        if nodeTyIsNullType(cpnb.parType) { cParamNulNone = true }
-        cParamNulSLKind = nulScalarListKindOfNode(cpnb.parType)
         if retNulVariantFlag(cpnb.parType) == 1 {
           const cpNvi = nulVariantIndexOf(cpnb.parType)
           if cpNvi >= 0 && cpNvi < uVarHeap.length {
-            cParamNulVariantHeap = uVarHeap[cpNvi]
             cParamNulVariantIdx = cpNvi
-          }
-        }
-        if retNulRefArrFlag(cpnb.parType) == 1 {
-          cParamNulRefArr = true
-          const cpRls = tyAnnRefListSlot(cpnb.parType)
-          if cpRls >= 0 && cpRls < rlWrapIdx.length {
-            cParamNulRefArrHeap = rlWrapIdx[cpRls]
           }
         }
         // the caller'S HALF of the same question the callee's body asks through
@@ -38777,14 +38230,7 @@ function directArgSeedsOf(target: i32, i: i32, ac: ExpCtx): DirectArgSeeds {
     cUTy: cUTy,
     cParamNulBool: cParamNulBool,
     cParamNulString: cParamNulString,
-    cParamNulClosure: cParamNulClosure,
-    cParamNulList: cParamNulList,
-    cParamNulNone: cParamNulNone,
-    cParamNulRefArr: cParamNulRefArr,
-    cParamNulRefArrHeap: cParamNulRefArrHeap,
-    cParamNulVariantHeap: cParamNulVariantHeap,
     cParamNulVariantIdx: cParamNulVariantIdx,
-    cParamNulSLKind: cParamNulSLKind,
     cParamLitUnion: cParamLitUnion,
     cParamNulLitUnion: cParamNulLitUnion,
     cParamStr: cParamStr,
@@ -38883,9 +38329,8 @@ function emitCapturedCall(
     let cpKind: VKind = "i32"
     let cpLit = false
     let cuTy = -1
-    seedValueArgShape(null, ec)
+    seedValueArgShape(ec)
     if cai < cps.length {
-      seedParamArgShape(cps[cai], ec)
       cpKind = vtKindOfParam(cps[cai])
       const cpn = nodeAt(cps[cai])
       if cpn is Param {
@@ -38941,7 +38386,7 @@ function emitCapturedCall(
   capOut.nulString = capSaved.nulString
   capOut.rawNullRead = capSaved.rawNullRead
   expCtxApply(capOut, ec)
-  seedValueArgShape(null, ec)
+  seedValueArgShape(ec)
   callRefDepth = crDepth
   // The target's own interned `$fnsig` — the functype it is actually declared with — so the
   // `call_indirect` below passes the engine's signature check and returns the target's real
@@ -39292,27 +38737,6 @@ function coalesceNulLitUnionArmCtx(ec: ExpCtx): ExpCtx {
   const c = expCtxHere(ec)
   c.nulLitUnion = true
   c.litUnion = 1
-  return c
-}
-
-// The context the default arm of a nullable-collection `??` emits under: a bare `null`
-// default lowers as the matching `ref.null`, keyed off the LHS place whose rep the block type
-// declares.
-
-// `nulList` is the i32-backed family's flag and `nulRefHeap` every other family's wrapper, so
-// `nulCollWrapHeap` supplies the latter directly rather than re-deriving the family.
-function coalesceNulCollArmCtx(
-  lhsIx: i32,
-  wrapIx: i32,
-  fnIx: i32,
-  ec: ExpCtx,
-): ExpCtx {
-  const c = expCtxHere(ec)
-  if exprNullableList(lhsIx, fnIx) {
-    c.nulList = true
-  } else {
-    c.nulRefHeap = wrapIx
-  }
   return c
 }
 
@@ -40535,15 +39959,7 @@ function emitCoalesceNiche(
   // nullable struct below — placed before the sentinel-free ref paths as `emitNulIsNullTest` orders its niches, since the wrapper heap type is what distinguishes the families.
   const cnclw = nulCollWrapHeap(e.binLeft, fnIx)
   if cnclw >= 0 {
-    return emitCoalesceNulRef(
-      body,
-      e,
-      exprIx,
-      cnclw,
-      coalesceNulCollArmCtx(e.binLeft, cnclw, fnIx, ec),
-      fnIx,
-      ec,
-    )
+    return emitCoalesceNulRef(body, e, exprIx, cnclw, expCtxHere(ec), fnIx, ec)
   }
   // `<e> ?? d` over a `string | null` niche (an ident binding, a `string | null` struct field,
   // or a `(string | null)[]` element read): the cell is a `(ref null $sTypeIdx)`, so it takes

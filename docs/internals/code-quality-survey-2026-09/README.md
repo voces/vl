@@ -247,15 +247,18 @@ Measure:
     tol: 0
     dir: at-most
 
-### row 14 — the cell-seed ladder has one resolver
+### row 14 — the cell-seed ladder has no kind-driven rungs left
+
+A cell's `null` builds as `ref.null none` or under its niche seed, so no boundary derives a
+seed from the cell's kind and the one resolver, `expCtxForCell`, is gone.
 
 Measure:
 
     kind: shell
     cmd: grep -rho 'expCtxForCell' compiler/ | wc -l
-    filed: 8
-    tol: 4
-    dir: at-least
+    filed: 0
+    tol: 0
+    dir: at-most
 
 ### row 15 — the longest checker function
 
