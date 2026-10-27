@@ -246,6 +246,8 @@ import {
   recBindOrigin,
   recFreshDeclOf,
   recFreshMapDeclOf,
+  recFreshOriginDecl,
+  recHeldDecl,
   recHeldLit,
   recInferredFnOf,
   recOriginExpr,
@@ -257,7 +259,9 @@ import {
   recAdPushDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
+  recBuildPush,
   recDelivPush,
+  recKeptFnPush,
   recPend,
   recPendDstTy,
   recPendSrc,
@@ -372,6 +376,7 @@ import {
   objTyHasDupField,
   recArmsTagApart,
   recFnValueLeaves,
+  recFnValueOrigins,
   recHasLitLeaf,
   recNeverFits,
   shapeAdaptDstTy,
@@ -1712,15 +1717,20 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   if rcwCallSites(fd, sites) >= 0 || !recSitesLandAt(sites, call, own, dst) {
     return false
   }
-  const leaves = recFnValueLeaves(fd)
+  const via: i32[] = []
+  const leaves = recFnValueOrigins(fd, via)
   if leaves.length == 0 { return false }
   const lits: i32[] = []
+  const litVia: i32[] = []
   const calls: i32[] = []
-  for lf in leaves {
-    const lp = cwPeel(lf)
+  let i = 0
+  while i < leaves.length {
+    const lp = leaves[i]
+    if lp < 0 { return false }
     const ll = recLeafLitOf(lp, dst)
     if ll >= 0 {
       lits.push(ll)
+      litVia.push(via[i])
     } else if (
       lp != call
       && recInferredFnOf(lp) >= 0
@@ -1740,26 +1750,43 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
     } else {
       return false
     }
+    i = i + 1
   }
-  for ll in lits { recordRepTyAdopt(ll, dst, 6) }
+  // A literal read through a binding is built at `dst`, and the binding keeps its type.
+  i = 0
+  while i < lits.length {
+    if litVia[i] >= 0 {
+      recBuildPush(recHeldDecl(litVia[i]), nodeTyIxOf(lits[i]), dst, false)
+    }
+    recordRepTyAdopt(lits[i], dst, 6)
+    i = i + 1
+  }
   // A leaf calling another such function hands the destination on to it (D8143).
   for cl in calls { recAdoptNote(cl, nodeTyIxOf(cl), dst) }
   true
 }
 
-// The reads an inferred function `fd` returns when every value leaf names a local binding and
-// `call` is its one call site, so the bindings are built at `call`'s destination; else empty.
-function recReturnedBindings(fd: i32, call: i32): i32[] {
+// What an inferred function `fd` returns when `call` is its one call site, each a literal or
+// the binding read that last reached it (`recFnValueOrigins`), so each is built at
+// `call`'s destination; empty when some value is neither.
+function recReturnedOrigins(fd: i32, call: i32): i32[] {
   const out: i32[] = []
   cwIxBuild()
   const sites: i32[] = []
   if rcwCallSites(fd, sites) >= 0 || sites.length != 1 || sites[0] != call * 2 {
     return out
   }
-  for lf in recFnValueLeaves(fd) {
-    const lp = cwPeelValue(lf)
-    if lp < 0 || lp >= P.nodes.length || !(nodeAt(lp) is Ident) { return [] }
-    out.push(lp)
+  const via: i32[] = []
+  const origins = recFnValueOrigins(fd, via)
+  let i = 0
+  while i < origins.length {
+    const o = origins[i]
+    if o < 0 { return [] }
+    const n = nodeAt(o)
+    if via[i] >= 0 { out.push(via[i]) }
+    else if n is Ident || n is ArrayLit || n is ObjLit { out.push(o) }
+    else { return [] }
+    i = i + 1
   }
   out
 }
@@ -1767,7 +1794,7 @@ function recReturnedBindings(fd: i32, call: i32): i32[] {
 // Whether call sites `sites` (`rcwCallSites`) are `call` and calls each queued for a delivery
 // that lands a record of `own` on one of `dst`'s field storage, or queued for none, so one build
 // serves them all (D8201). A call queued for none is served only when it is read for a field
-// and `dst` adds no more than `null` to a field (D8302).
+// and `dst` widens a field no further than `recNullWidened` reads back exactly (D8302).
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
@@ -1790,8 +1817,9 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   hasCall
 }
 
-// Whether the record `dst` stores each field of the record `own` as `own` does, or as that
-// type or null. A numeric widening is excluded: a field read of it changes value.
+// Whether the record `dst` stores each field of the record `own` as `own` does, as that type
+// or null, or as `i64` where `own` holds `i32`, which a field read narrows back exactly. An
+// `f64` widening is excluded: a field read of it changes value (D8302).
 function recNullWidened(own: i32, dst: i32): boolean {
   const o = tyAt(own)
   const d = tyAt(dst)
@@ -1803,7 +1831,11 @@ function recNullWidened(own: i32, dst: i32): boolean {
       if df < 0 { return false }
       if !fieldStorageEq(of, df, REC_STORE_DEPTH) {
         const inner = nullableInnerOrNone(df)
-        if inner < 0 || !fieldStorageEq(of, inner, REC_STORE_DEPTH) {
+        const at = if inner < 0 { df } else { inner }
+        if (
+          !fieldStorageEq(of, at, REC_STORE_DEPTH)
+          && !(of == TY_I32 && at == TY_I64)
+        ) {
           return false
         }
       }
@@ -1938,6 +1970,9 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
   }
   const e = nodeAt(p)
   const dt = tyAt(d)
+  // A binding holding only the call lands where its read does.
+  const bo = if e is Ident { recBindOrigin(p) } else { -1 }
+  if bo == c { return recAdLanding(own, d) }
   if e is ObjLit && dt is TyObj {
     let i = 0
     while i < dt.objFieldNames.length {
@@ -2142,8 +2177,13 @@ export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if e is Call && dt is TyMap {
     const fd = recInferredFnOf(p)
     if fd >= 0 {
-      for b in recReturnedBindings(fd, p) {
-        recAdoptMapNote(b, nodeTyIxOf(b), dstTy)
+      const os = recReturnedOrigins(fd, p)
+      let reads = true
+      for b in os {
+        if !(nodeAt(b) is Ident) { reads = false }
+      }
+      if reads {
+        for b in os { recAdoptMapNote(b, nodeTyIxOf(b), dstTy) }
       }
     }
     return 0
@@ -2239,6 +2279,15 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if oc >= 0 && oc != p && (nodeAt(oc) is Call || nodeAt(oc) is Index) {
         return recAdoptNote(oc, nodeTyIxOf(oc), dstTy)
       }
+      // One aliasing a literal binding keeps its type, and the literal is built at the record.
+      const od = recFreshOriginDecl(p, 6)
+      if (
+        od >= 0
+        && nodeAt(od) is LetDecl
+        && nodeAt(parenPeelIx(recDeclInit(od))) is ObjLit
+      ) {
+        recBuildPush(od, srcTy, nonNulTyOf(dstTy), false)
+      }
       return 0
     }
     const iv = nodeAt(parenPeelIx(recDeclInit(decl)))
@@ -2277,11 +2326,24 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   }
   if e is Call {
     const fd = recInferredFnOf(p)
-    // A list result is delivered as the bindings its function returns.
+    // A list result is delivered as the bindings its function returns. Literals it returns bare
+    // are built at the destination list, and so is the result, when every value is one that can
+    // be (D14223); a mix of the two adopts neither.
     const sl = nonNulTyOf(srcTy)
     if fd >= 0 && sl >= 0 && tyAt(sl) is TyArray {
-      for b in recReturnedBindings(fd, p) {
-        recAdoptNote(b, nodeTyIxOf(b), dstTy)
+      const os = recReturnedOrigins(fd, p)
+      const dl = recAdLandingList(nonNulTyOf(dstTy))
+      let bare = os.length > 0
+      let reads = true
+      for b in os {
+        if !(nodeAt(b) is ArrayLit) || !litAtDstStorage(b, dl) { bare = false }
+        if !(nodeAt(b) is Ident) { reads = false }
+      }
+      if bare {
+        for b in os { recordRepTyAdopt(b, dl, 6) }
+        recKeptFnPush(fd, sl, dl, p)
+      } else if reads {
+        for b in os { recAdoptNote(b, nodeTyIxOf(b), dstTy) }
       }
       return 0
     }

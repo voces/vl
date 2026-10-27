@@ -908,12 +908,13 @@ const CASES: Case[] = [
     uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
   {
-    // The builder's declaring statement is an input: a leaf that becomes a binding is kept.
-    name: "lib's builder leaf becomes a binding",
+    // The builder's declaring statement is an input: a leaf that becomes an element read is
+    // kept, where a literal binding leaf is built at the destination as the literal is.
+    name: "lib's builder leaf becomes an element read",
     want: "decline",
     why: "fresh",
     from: "{ { f: 4 } }",
-    to: "{ const t = { f: 4 }; t }",
+    to: "{ const t = [{ f: 4 }]; t[0] }",
     libUses: "export function mk() { { f: 4 } }\n",
     uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
@@ -1238,7 +1239,7 @@ Deno.test({
       ["a defaulted param loses its default", 16777216],
       // `SK_NO_FRESH_BODY` drops a builder's declaring statement, `SK_NO_FRESH_OCC` its
       // occurrences in S, and `SK_NO_FRESH_SPLIT` the kept-or-own split of its deliveries.
-      ["lib's builder leaf becomes a binding", 65536],
+      ["lib's builder leaf becomes an element read", 65536],
       ["lib gains a value use named like lib2's builder", 1073741824],
       ["a lib call stops being a second site of a fresh builder", 1073741824],
       // With `SK_NO_FRESH_OCC` too: lib's new site of `mk` alone declines it at stage 0.

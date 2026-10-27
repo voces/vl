@@ -2,6 +2,7 @@
 // may be built at another storage, and the deliveries an adopted pin keeps.
 // Does not import the checker.
 import {
+  ArrayLit,
   Call,
   FuncDecl,
   Ident,
@@ -187,6 +188,16 @@ export function recKeptAtSet(v: i32[]) { recKeptAt = v }
 export let recKeptOwn: i32[] = []
 export function recKeptOwnSet(v: i32[]) { recKeptOwn = v }
 
+// Keep function `fd`'s result typed `own` and build it as `dst`, for the delivery at `at`.
+export function recKeptFnPush(fd: i32, own: i32, dst: i32, at: i32) {
+  if fd < 0 || own < 0 || dst < 0 || !(nodeAt(fd) is FuncDecl) { return 0 }
+  recKeptDecl.push(fd)
+  recKeptDst.push(dst)
+  recKeptAt.push(at)
+  recKeptOwn.push(own)
+  0
+}
+
 // The last pass's kept functions, read by the emitter: the declaration, the record its result
 // is typed as, and the record the delivery builds it as.
 export let recKeptFnDecl: i32[] = []
@@ -221,6 +232,96 @@ export function recKeptFnDstOf(decl: i32, own: i32): i32 {
     k = k + 1
   }
   -1
+}
+
+// This pass's bindings whose adoption a re-check undid, each with a record a delivery builds it
+// as, and the last pass's, read by the emitter.
+let recBuildPassDecl: i32[] = []
+let recBuildPassDst: i32[] = []
+let recBuildDecl: i32[] = []
+let recBuildDst: i32[] = []
+
+// Replace the last pass's built-elsewhere bindings with this pass's, and empty this pass's.
+export function recBuildNote() {
+  recBuildDecl = recBuildPassDecl
+  recBuildDst = recBuildPassDst
+  recBuildPassDecl = []
+  recBuildPassDst = []
+  0
+}
+
+// Record that the binding `decl`, typed `own`, keeps its type and is built as `dstIn`'s record,
+// when the two have one set of field names and store a field differently. With `elem`, `decl`
+// holds a list literal and the records are its elements'.
+export function recBuildPush(decl: i32, own: i32, dstIn: i32, elem: boolean) {
+  if (
+    decl < 0
+    || own < 0
+    || dstIn < 0
+    || own >= T.tys.length
+    || dstIn >= T.tys.length
+  ) {
+    return 0
+  }
+  if !(nodeAt(decl) is LetDecl) || recBuildHoldsElems(decl) != elem { return 0 }
+  if !(tyAt(own) is TyObj) { return 0 }
+  const dst = recAdLanding(own, dstIn)
+  if dst < 0 || dst >= T.tys.length || !(tyAt(dst) is TyObj) { return 0 }
+  if tyReachesHole(own, 8) || tyReachesHole(dst, 8) { return 0 }
+  if (
+    !objFieldNameSetsEq(own, dst)
+    || fieldStorageEq(own, dst, REC_STORE_DEPTH)
+  ) {
+    return 0
+  }
+  recBuildPassDecl.push(decl)
+  recBuildPassDst.push(dst)
+  0
+}
+
+// Whether the binding `decl` is initialised with a list literal or a `Map()`, whose elements or
+// values are what its builds record; false for any other node.
+function recBuildHoldsElems(decl: i32): boolean {
+  if decl < 0 || decl >= P.nodes.length { return false }
+  const d = nodeAt(decl)
+  if !(d is LetDecl) || d.letInit < 0 { return false }
+  const iv = cwPeelValue(d.letInit)
+  if iv < 0 || iv >= P.nodes.length { return false }
+  const n = nodeAt(iv)
+  if n is ArrayLit { return true }
+  if !(n is Call) || n.callArgs.length != 0 || n.callFn < 0 { return false }
+  const f = nodeAt(n.callFn)
+  f is Ident && f.identName == "Map"
+}
+
+// The record the un-annotated binding `decl` of an object literal is built as, where a delivery
+// to a record that stores a field differently keeps its own type and every such delivery agrees
+// on the storage; else -1. Decided before any instance is elaborated: a use at a type parameter
+// follows it.
+export function recBuildTyOf(decl: i32): i32 {
+  if recBuildHoldsElems(decl) { return -1 }
+  recBuildAt(decl)
+}
+
+// `recBuildTyOf` for a binding of a list literal or a `Map()`: the record its elements or values
+// are built as.
+export function recBuildElemTyOf(decl: i32): i32 {
+  if !recBuildHoldsElems(decl) { return -1 }
+  recBuildAt(decl)
+}
+
+// The one storage every recorded build of `decl` agrees on, else -1.
+function recBuildAt(decl: i32): i32 {
+  let r = -1
+  let k = 0
+  while k < recBuildDecl.length {
+    if recBuildDecl[k] == decl {
+      if r < 0 { r = recBuildDst[k] }
+      else if !fieldStorageEq(r, recBuildDst[k], REC_STORE_DEPTH) { return -1 }
+    }
+    k = k + 1
+  }
+  r
 }
 
 // While on, each delivery of a fresh value the solve judged: the value's declared name and
@@ -276,6 +377,17 @@ export function recDelivPush(decl: i32, at: i32, flag: i32) {
   0
 }
 
+// The record `dstIn` delivers the record `own` as, when the two share field names and neither
+// is open; -1 otherwise.
+function recAdFitDst(own: i32, dstIn: i32): i32 {
+  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
+  const dst = recAdLanding(own, dstIn)
+  if dst < 0 || dst >= T.tys.length || !(tyAt(dst) is TyObj) { return -1 }
+  if recAdOpen(own) || recAdOpen(dst) { return -1 }
+  if !objFieldNameSetsEq(own, dst) { return -1 }
+  dst
+}
+
 // Push one demand on the declaration `decl`: a binding, or a function with no declared result.
 export function recAdPushDecl(
   decl: i32,
@@ -287,11 +399,18 @@ export function recAdPushDecl(
   if own < 0 || dstIn < 0 || own >= T.tys.length || dstIn >= T.tys.length {
     return 0
   }
-  if !(tyAt(own) is TyObj) { return 0 }
-  const dst = recAdLanding(own, dstIn)
-  if dst < 0 || dst >= T.tys.length || !(tyAt(dst) is TyObj) { return 0 }
-  if recAdOpen(own) || recAdOpen(dst) { return 0 }
-  if !objFieldNameSetsEq(own, dst) { return 0 }
+  const ou = tyAt(own)
+  // A list literal of several records adopts when every one of them lands on one record.
+  if ou is TyUnion && elem {
+    const d0 = recAdFitDst(ou.uMembers[0], dstIn)
+    for m in ou.uMembers {
+      if d0 < 0 || recAdFitDst(m, dstIn) != d0 { return 0 }
+    }
+    for m in ou.uMembers { recAdPushDecl(decl, m, dstIn, elem, at) }
+    return 0
+  }
+  const dst = recAdFitDst(own, dstIn)
+  if dst < 0 { return 0 }
   if !recAdApartAtPin(own, dst) { return 0 }
   if decl < 0 { return 0 }
   const wide = recNumChanges(own, dst, REC_STORE_DEPTH)
@@ -303,6 +422,7 @@ export function recAdPushDecl(
     return 0
   }
   if recAdNoAdopt.has(decl) {
+    recBuildPush(decl, own, dst, elem)
     recAdMergeRefuse(decl, own, dst, elem, at)
     return 0
   }

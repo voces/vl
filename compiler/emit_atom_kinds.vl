@@ -64,17 +64,12 @@ import {
   TyUnion,
   TyVar,
   litBaseTy,
-  numLitUnionBaseTy,
   tyAt,
   tyEq,
   tyFieldTyOf,
-  tyIsLitUnion,
-  tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
-  tyLitMemberTexts,
   tyPrimNameOf,
-  tySame,
 } from "./check_types"
 import {
   objFieldVal,
@@ -82,21 +77,17 @@ import {
   unionEqOperandOk,
   unwrapParen,
 } from "./emit_base"
-import { narrowSlotOf, narrowVariantFor } from "./emit_narrow_slots"
+import { narrowVariantFor } from "./emit_narrow_slots"
 import {
   declTyIxOfName,
   repCanonId,
   repNameCanonId,
+  repRowId,
   sFieldElemTyIxAt,
 } from "./emit_rep"
 import {
-  FC_F32_LIST,
-  FC_F64_LIST,
   FC_I32,
   FC_I32_LIST,
-  FC_I64_LIST,
-  FC_STR_LIST,
-  FC_U8_LIST,
   fnStmts,
   narrowTop,
   sAnonOwnTy,
@@ -185,74 +176,16 @@ export function structTyMarkAliasable(ty: i32) {
 }
 
 // Records that arena type `ty`, deduplicated onto row `row`, denotes it: by exact id, and by
-// canonical id when marked aliasable. An earlier record wins. A type whose function fields differ
-// from the row's own keeps its name path, since one closure signature lays out both yet each pins
-// its own instance (D3124).
+// row id (`repRowId`) when marked aliasable. An earlier record wins.
 export function structTyIxAlias(ty: i32, row: i32) {
   if ty < 0 || row < 0 { return 0 }
   const aliasable = ty < sTyAliasable.length && sTyAliasable[ty]
-  if !aliasable && !tyFnFieldsAgree(ty, structRowOwnTy(row)) { return 0 }
   while sTyAlias.length <= ty { sTyAlias.push(-1) }
   if sTyAlias[ty] < 0 { sTyAlias[ty] = row }
   if !aliasable { return 0 }
-  const ck = repCanonId(ty)
+  const ck = repRowId(ty)
   if ck >= 0 && !sTyCanonAlias.has(ck) { sTyCanonAlias[ck] = row }
   0
-}
-
-// Whether row `row` can stand for record `ty`: no closed function field of `ty` is one a declared
-// row leaves naming a type parameter. An anonymous row is not asked: a function type has no
-// binder, so its type variable may be a stored generic function's own (`{f: id}`).
-// Replaced by keying each row on `rowKeyOf`, the canonical closed type.
-export function structRowFnFieldsAgree(ty: i32, row: i32): boolean {
-  const r = structRowOwnTy(row)
-  if (
-    sIsAnonRow(row)
-    || r < 0
-    || r >= T.tys.length
-    || ty < 0
-    || ty >= T.tys.length
-  ) {
-    return true
-  }
-  const o = tyAt(ty)
-  if !(o is TyObj) { return true }
-  let k = 0
-  while k < o.objFieldNames.length {
-    const ft = o.objFieldTypes[k]
-    if ft >= 0 && tyAt(nonNullTy(ft)) is TyFunc && !tyHasTyVar(ft) {
-      const rt = tyFieldTyOf(r, o.objFieldNames[k])
-      if rt >= 0 && tyHasTyVar(rt) { return false }
-    }
-    k = k + 1
-  }
-  true
-}
-
-// The arena type row `row` denotes: its recorded type, else a literal row's own. -1 for none.
-function structRowOwnTy(row: i32): i32 {
-  if row < sTyIx.length && sTyIx[row] >= 0 { return sTyIx[row] }
-  sAnonOwnTy.get(row) ?? -1
-}
-
-// Whether records `a` and `b` agree on the type of every function field of `a`. True when either
-// is not a record or a field is missing, since nothing then tells the two apart.
-function tyFnFieldsAgree(a: i32, b: i32): boolean {
-  if a == b || a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length {
-    return true
-  }
-  const o = tyAt(a)
-  if !(o is TyObj) { return true }
-  let k = 0
-  while k < o.objFieldNames.length {
-    const ft = o.objFieldTypes[k]
-    if ft >= 0 && tyAt(nonNullTy(ft)) is TyFunc {
-      const bt = tyFieldTyOf(b, o.objFieldNames[k])
-      if bt >= 0 && !tySame(ft, bt) { return false }
-    }
-    k = k + 1
-  }
-  true
 }
 
 // The struct-table row for an arena type — `structIndexByName`'s arena-input twin,
@@ -264,7 +197,7 @@ export function structIndexOfTy(ty: i32): i32 {
   if own >= 0 { return own }
   if ty < 0 { return -1 }
   if ty < sTyAlias.length && sTyAlias[ty] >= 0 { return sTyAlias[ty] }
-  const ca = sTyCanonAlias.get(repCanonId(ty)) ?? -1
+  const ca = sTyCanonAlias.get(repRowId(ty)) ?? -1
   if ca >= 0 { return ca }
   // A `new` brand is a second arena index over its base and erases to it at run time, so it
   // denotes the base's row; no row records the brand's own index (D3762).
@@ -790,101 +723,6 @@ function primScalarKindOf(p: PrimName): i32 {
   }
 }
 
-// Is field code `c` a list whose layout its code alone decides: an `i32`, `f64`, `i64`, `f32`,
-// `u8` or `string` list?
-export function fieldCodeIsFlatList(c: i32): boolean {
-  c == FC_I32_LIST
-    || c == FC_STR_LIST
-    || c == FC_F64_LIST
-    || c == FC_I64_LIST
-    || c == FC_F32_LIST
-    || c == FC_U8_LIST
-}
-
-// Code 0 is shared by `i32`, `boolean` and a string literal union's atom, so the code cannot
-// tell them apart: ask the declared row's own field type. Refutes a primitive value against a
-// different primitive or against a string literal set (D2435).
-export function declRowScalarFits(
-  valIx: i32,
-  si: i32,
-  mfi: i32,
-  fnIx: i32,
-): boolean {
-  if si < 0 || si >= sTyIx.length { return true }
-  if mfi < 0 || mfi >= sFieldCount[si] { return true }
-  const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
-  // The anon row's comparator first, so the two readers cannot disagree on a known kind.
-  const fk = code0KindOf(fty)
-  const vk = code0KindOf(nodeTyAt(valIx, fnIx))
-  if fk != 0 && vk != 0 { return fk == vk }
-  const vp = tyPrimNameOf(nodeTyAt(valIx, fnIx))
-  if vp == null || fty < 0 { return true }
-  const fp = tyPrimNameOf(fty)
-  if fp != null { return fp == vp }
-  if tyIsLitUnion(fty) || tyIsLitUnionAlias(fty) {
-    return numLitUnionBaseTy(fty) >= 0
-  }
-  true
-}
-
-// `declRowScalarFits`' anonymous-row twin, symmetric because both sides come from literals:
-// a `boolean`, an `i32` and a string literal set are three code-0 kinds, and two known kinds
-// fit only when equal. A kind this cannot name (a hole, a numeric literal set) stays lenient.
-export function anonRowScalarFits(
-  valIx: i32,
-  si: i32,
-  mfi: i32,
-  fnIx: i32,
-): boolean {
-  if si < 0 || si >= sTyIx.length { return true }
-  if mfi < 0 || mfi >= sFieldCount[si] { return true }
-  const fnm = sFieldNames[sFieldStart[si] + mfi]
-  let fk = code0KindOf(tyFieldTyOf(sTyIx[si], fnm))
-  if fk == 0 { fk = code0KindOf(tyFieldTyOf(sAnonOwnTy.get(si) ?? -1, fnm)) }
-  const vk = code0KindOf(nodeTyAt(valIx, fnIx))
-  // A row recorded at a hole has no field type to ask; its atom companion still says whether
-  // the slot holds a literal set (D2762).
-  if fk == 0 && vk != 0 {
-    return (vk == 3) == (sFieldElemNameAt(si, mfi) != "")
-  }
-  if fk == 0 || vk == 0 { return true }
-  fk == vk
-}
-
-// Whether a parameter of instance `fnIx` read as a field value may be stored in row `si`'s
-// field `mfi`: an `i32` or `boolean` pin takes no literal-set slot, whose reads print a member.
-// The shared literal records the template's hole, so the instance's parameter type says it (D2762).
-export function instParamAtomFits(
-  valIx: i32,
-  si: i32,
-  mfi: i32,
-  fnIx: i32,
-): boolean {
-  if fnIx < 0 { return true }
-  const v = nodeAt(unwrapParen(valIx))
-  if !(v is Ident) { return true }
-  if narrowSlotOf(v.identName) >= 0 { return true }
-  const fd = nodeAt(fnIx)
-  if !(fd is FuncDecl) { return true }
-  let vk = 0
-  let i = 0
-  while i < fd.fnParams.length {
-    const p = nodeAt(fd.fnParams[i])
-    if p is Param {
-      if p.parName == v.identName {
-        if p.parType < 0 {
-          vk = 1
-        } else {
-          vk = code0KindOf(nodeTyIxOf(p.parType))
-        }
-      }
-    }
-    i = i + 1
-  }
-  if vk != 1 && vk != 2 { return true }
-  sFieldElemNameAt(si, mfi) == ""
-}
-
 // The code-0 kind of type `ty`: 1 `i32`, 2 `boolean`, 3 a string literal or literal set, 0
 // for anything else, which no caller refutes on.
 export function code0KindOf(ty: i32): i32 {
@@ -906,34 +744,6 @@ export function code0KindOf(ty: i32): i32 {
   }
   if tyIsLitUnionOrLit(ty) { return 3 }
   0
-}
-
-// Whether the string value at `valIx` is a string literal naming a member of row `si`'s atom
-// field `mfi`; an unknown field type stays lenient, and a non-literal field takes no string.
-export function atomFieldTakesStr(valIx: i32, si: i32, mfi: i32): boolean {
-  if si < 0 || si >= sTyIx.length { return true }
-  if mfi < 0 || mfi >= sFieldCount[si] { return true }
-  const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
-  if fty < 0 { return true }
-  if code0KindOf(fty) != 3 { return false }
-  strLitNamesMember(valIx, tyLitMemberTexts(fty))
-}
-
-// Whether the value at `valIx` is a string literal whose text is one of `texts`. `strText`
-// keeps the quotes a member text drops.
-function strLitNamesMember(valIx: i32, texts: string[]): boolean {
-  const v = nodeAt(unwrapParen(valIx))
-  if v is StrLit {
-    const raw = v.strText
-    if raw.length < 2 { return false }
-    const body = raw.slice(1, raw.length - 1)
-    let i = 0
-    while i < texts.length {
-      if texts[i] == body { return true }
-      i = i + 1
-    }
-  }
-  false
 }
 
 // Whether a nested-record field of type `fty` may share row `si`'s field `fi`: the field's
@@ -960,18 +770,6 @@ export function code0TyFitsRow(fty: i32, si: i32, fi: i32): boolean {
     tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + fi]),
   )
   rk == 0 || rk == tk
-}
-
-// Does an array literal coded `vc` re-encode into a `sc` list by widening each element: an
-// integer literal into an `f64`, `i64`, `f32` or `u8` list, a float one into an `f32` list?
-export function flatListLitWidens(vc: i32, sc: i32): boolean {
-  if vc == FC_I32_LIST {
-    return sc == FC_F64_LIST
-      || sc == FC_I64_LIST
-      || sc == FC_F32_LIST
-      || sc == FC_U8_LIST
-  }
-  vc == FC_F64_LIST && sc == FC_F32_LIST
 }
 
 // An open-addressed pair table, generation-stamped so a new walk costs no clearing: a slot is

@@ -39,9 +39,9 @@
 // class is empty that is now a DECLARED, corpus-CHECKED state (see the standing
 // note and the tripwire) rather than a silent gap.
 //
-// The emit-error fixture (`EMIT_ERROR_SRC`) is a closure whose result struct carries
-// a nullable REF-list field — well-formed as a type (fast path clean), with no
-// lowerable rep, so the emitter rejects. If it graduates, swap in any other shape
+// The emit-error fixture (`EMIT_ERROR_SRC`) is an `is` test over a literal-union list
+// arm — well-formed as a type (fast path clean), with no lowerable rep, so the
+// emitter rejects. If it graduates, swap in any other shape
 // that type-checks clean but emit-errors; that class is not scarce, and unlike
 // `INVALID_MODULE_SRC` the emitter names its own error. (The native emitter reports
 // it with an `error [line:col]` diagnostic plus the `(emit error)` summary marker.
@@ -92,20 +92,18 @@ const check = async (
   }
 };
 
-// Type-checks cleanly, fails the emitter: an un-annotated Map whose value is a call's
-// record result carrying a function field has no map-value rep (D12340). Swap in another
-// live emit refusal when that row closes.
+// Type-checks cleanly, fails the emitter: `is` over a literal-union list arm has no
+// interned arm representation (D14041). Swap in another live emit refusal when that row
+// closes.
 const EMIT_ERROR_SRC =
-  `function dbl(a) { return a * 2 }\n` +
-  `function mk(g) { return { f: g } }\n` +
-  `// D12340\n` +
-  `function useIt() {\n` +
-  `  const m = Map()\n` +
-  `  m.set("b", mk(dbl))\n` +
-  `  const r = m.get("b")\n` +
-  `  if r != null { print(r.f(3)) }\n` +
+  `type K = 0 | 1\n` +
+  `// D14041\n` +
+  `const z = 9\n` +
+  `function useIt(x: K[] | string) {\n` +
+  `  if x is K[] { print(x[0]) } else { print(z) }\n` +
   `}\n` +
-  `useIt()\n`;
+  `useIt([1])\n` +
+  `useIt("s")\n`;
 
 // A normal, fully valid file — passes both the fast and the full path.
 const CLEAN_SRC = `let x = 1\nprint(x)\n`;

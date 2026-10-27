@@ -548,7 +548,7 @@ import {
   synthTypeRefTy,
 } from "./emit_nullable_rets"
 import { tyReachesFuncD } from "./emit_obj_lit_fits"
-import { repRowOfTyStruct } from "./emit_rep"
+import { repRowId, repRowOfTyStruct } from "./emit_rep"
 import {
   gaeAppHasNulParamListField,
   internOwnShapeOfTy,
@@ -665,6 +665,8 @@ import {
   nulNumScalarUnionName,
 } from "./check_ty_rep"
 import { nodeTyPinIxOf, tyIsWriteLandRead } from "./check_hole_pins"
+import { recFreshDeclOf } from "./check_rec_fresh"
+import { recBuildTyOf } from "./check_rec_rows"
 import { valueUnionRetName } from "./check_ret_names"
 import {
   holeNamesTpJoin,
@@ -1696,6 +1698,19 @@ function monoPinKeepsInlineLits(named: i32, arg: i32): boolean {
   lit
 }
 
+// Whether a pin's row spelling `named` denotes another type than the closed record `arg` it
+// stores: the two share the row, which keys a function field by its storage, so the parameter
+// takes the argument's type.
+function monoPinRowNamesOtherTy(named: i32, arg: i32): boolean {
+  if named < 0 || arg < 0 || named >= T.tys.length || arg >= T.tys.length {
+    return false
+  }
+  if !(tyAt(arg) is TyObj) || tyHasTyVar(arg) || tyEq(named, arg) {
+    return false
+  }
+  repRowId(named) == repRowId(arg)
+}
+
 // `ty`'s inner type when it is a filled nullable, else `ty`.
 function monoPeelNullable(ty: i32): i32 {
   const t = tyAt(ty)
@@ -1784,6 +1799,17 @@ function monoI32AtomPinName(ty: i32): string {
 // The annotation ladder's pin for type `ty`, by its render, or "" when no rung takes it.
 function monoAnnPinNameOfTy(ty: i32): string {
   monoAnnPinName(tyToEmitName(ty))
+}
+
+// The pin of a read of an un-annotated literal binding the record solve builds at another
+// record (`recBuildTyOf`): the instance is the one its storage is, else "".
+function monoBuildTyPin(cax: i32): string {
+  if cax < 0 || !(nodeAt(cax) is Ident) { return "" }
+  const d = recFreshDeclOf(cax)
+  if d < 0 { return "" }
+  const bt = recBuildTyOf(d)
+  if bt < 0 { return "" }
+  monoClosedTyPin(bt)
 }
 
 // The pin of closed checker type `ty`, its alias and nominal identity kept: a litunion by
@@ -2333,6 +2359,8 @@ function monoRebuiltLitRetName(fd: i32): string {
 // argument's local, captured, parameter or module binding. "" refuses; falls to
 // `monoArgTyNameProjected` where none answers.
 function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
+  const bp = monoBuildTyPin(cax)
+  if bp != "" { return bp }
   // A call argument whose callee has a concrete return annotation takes that annotation.
   // Needed for a generic call used as an argument (`box(box(7))`): `buildFnMap` is
   // post-mono, so `exprStruct` cannot classify the inner call and the type param would
@@ -9507,8 +9535,8 @@ function monoDeclFnFieldTwin(pin: string, ty: i32): i32 {
 }
 
 // D988 — the key suffix an anonymous-shape pin, or a declared-record twin, needs; "" for every
-// other pin. A hole parameter pins the argument's type name, and two object literals with the
-// same field names share one synthetic row whatever their field types are, so both key the same
+// other pin. A hole parameter pins the argument's row name, a `#` row or an own-shape `{…}` one,
+// and records apart only in a function field's type share one row, so both key the same
 // instance. The canonical key is the right grain — keying on the type index mints per site.
 function monoAnonPinDiscrim(pin: string, tyIx: i32): string {
   if tyIx < 0 { return "" }
@@ -9516,7 +9544,7 @@ function monoAnonPinDiscrim(pin: string, tyIx: i32): string {
     return "=" + tyCanonKey(tyIx, TY_WALK_DEPTH)
   }
   if pin.length < 5 { return "" }
-  if pin[0] != "#"[0] { return "" }
+  if pin[0] != "#"[0] && pin[0] != "{"[0] { return "" }
   const canon = tyCanonKey(tyIx, TY_WALK_DEPTH)
   if canon == "" { return "" }
   "=" + canon
@@ -10441,7 +10469,10 @@ function monoMakeInstanceParams(
         nt = monoSynthPinRef(pinned[pj], pinTys[pj])
         // The pin name renders inline literal members as `string`; a union box holding them
         // keeps the argument's own members, which its narrowed reads are keyed on (D8181).
-        if monoPinKeepsInlineLits(nodeTyIxOf(nt), pinTys[pj]) {
+        if (
+          monoPinKeepsInlineLits(nodeTyIxOf(nt), pinTys[pj])
+          || monoPinRowNamesOtherTy(nodeTyIxOf(nt), pinTys[pj])
+        ) {
           nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
         }
         synthed = true
