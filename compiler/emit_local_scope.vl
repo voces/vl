@@ -44,6 +44,7 @@ import {
   nodeAt,
 } from "./ast"
 import {
+  nodeNarFromOf,
   nodeTyIsMap,
   nodeTyIsNulScalarBox,
   nodeTyIsNullable,
@@ -75,7 +76,6 @@ import {
   parentLetCoversAt,
   parentLoopCoversAt,
   parentLoopVarOf,
-  placeNarrowKeyOf,
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
@@ -90,12 +90,7 @@ import {
 import { bodyLetReadAt, fnHasParamSid } from "./emit_fn_ret_kinds"
 import { frameChainBindsName } from "./emit_list_rep"
 import { isStructOfTy, variantRowOfTy } from "./emit_mv_slots"
-import { variantRowOfShapeTy } from "./emit_field_codes"
-import {
-  narrowSlotOf,
-  narrowVariantFor,
-  variantIndexOf,
-} from "./emit_narrow_slots"
+import { variantRowOfOwnRenderTy, variantRowOfShapeTy } from "./emit_field_codes"
 import { nulVariantIndexOf } from "./emit_nullable_rets"
 import { paramIndexOf, paramIsF64 } from "./emit_query"
 import { RepDesc, repDescNone, repDescRet, repOfTy } from "./emit_rep"
@@ -124,7 +119,6 @@ import {
   lfOriginOf,
   lfSidHead,
   lfSidNext,
-  narrowTop,
   nestedNameBySid,
 } from "./emit_state"
 import { declaredKind, declaredSlotOf } from "./emit_struct_order"
@@ -132,8 +126,7 @@ import { holeOperandTyOf, identNameOrEmpty } from "./emit_ty_canon"
 import {
   msKeepTy,
   msSetOfTy,
-  narrowSlotCutFromBox,
-  narrowSlotTyOf,
+  tyCutFromBox,
 } from "./emit_union_registry"
 import { sidArrGet, sidOfNode } from "./symbols"
 import { tyHasTyVar } from "./tyquery"
@@ -993,29 +986,36 @@ export function nulArmRowOfTy(inner: i32): i32 {
   variantRowOfTy(inner)
 }
 
-// The variant row the active narrowing of `key` (a local name or a place key) binds, or -1.
-// Asks the arm's arena type first, by shape when the narrowing is cut from a union box (D14302),
-// and the narrowed spelling only when no row records it.
-export function narrowVariantRowFor(key: string): i32 {
-  const i = narrowSlotOf(key)
-  if i < 0 { return -1 }
-  const t = narrowSlotTyOf(i)
-  const vr = if narrowSlotCutFromBox(i) { variantRowOfShapeTy(t) } else { variantRowOfTy(t) }
-  if vr >= 0 { return vr }
-  variantIndexOf(narrowVariantFor(key))
+// Whether the checker read `ix` narrowed out of a union box. A cut from `X | null` alone keeps
+// the value's own rep, so it is no narrowed read here.
+function readCutFromBox(ix: i32): boolean {
+  const from = nodeNarFromOf(ix)
+  from >= 0 && tyCutFromBox(from)
 }
 
-// The variant row the Member `memIx`'s receiver is currently narrowed to, or -1. Each
-// receiver resolves its own active narrowing, unwrapped in lock-step with `memIsNarrowed`
-// (D222): a predicate saying "narrowed" beside an index answering -1 is the worse failure.
-export function memNarrowVariantIndex(memIx: i32) {
+// The variant row the checker typed the box-narrowed read `ix` at, or -1: by shape (D14302),
+// else by the arm's own rendering.
+export function narrowedReadRow(ix: i32): i32 {
+  if !readCutFromBox(ix) { return -1 }
+  const t = nodeTyIxOf(ix)
+  if t < 0 { return -1 }
+  const vr = variantRowOfShapeTy(t)
+  if vr >= 0 { return vr }
+  variantRowOfOwnRenderTy(t)
+}
+
+// Whether the member access `memIx` reads a field of a receiver the checker read narrowed out of
+// a box, with the receiver unwrapped as `memNarrowVariantIndex` unwraps it (D222).
+export function memIsNarrowed(memIx: i32): boolean {
   const m = nodeAt(memIx)
-  if m is Member {
-    const recv = nodeAt(unwrapParen(m.memObj))
-    if recv is Ident { return narrowVariantRowFor(recv.identName) }
-    const pk = placeNarrowKeyOf(m.memObj)
-    if pk != "" { return narrowVariantRowFor(pk) }
-  }
+  if m is Member { return readCutFromBox(unwrapParen(m.memObj)) }
+  false
+}
+
+// The variant row the Member `memIx`'s receiver is narrowed to, or -1.
+export function memNarrowVariantIndex(memIx: i32): i32 {
+  const m = nodeAt(memIx)
+  if m is Member { return narrowedReadRow(unwrapParen(m.memObj)) }
   -1
 }
 
@@ -1024,10 +1024,5 @@ export function memNarrowVariantIndex(memIx: i32) {
 // destination typed at the arm recovers the payload itself.
 export function narrowedStructArmVi(exprIx: i32): i32 {
   if exprIx < 0 { return -1 }
-  if narrowTop == 0 { return -1 }
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Ident { return narrowVariantRowFor(e.identName) }
-  const pk = placeNarrowKeyOf(exprIx)
-  if pk != "" { return narrowVariantRowFor(pk) }
-  -1
+  narrowedReadRow(unwrapParen(exprIx))
 }
