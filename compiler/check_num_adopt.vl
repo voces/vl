@@ -8,6 +8,7 @@ import {
   FieldInit,
   IfStmt,
   MatchExpr,
+  NumLit,
   ObjLit,
   P,
   Paren,
@@ -38,7 +39,7 @@ import {
   nonNullTy,
   primNameOf,
   sameNumeric,
-  tyHoldsWideScalar,
+  tyHoldsNonI32Num,
 } from "./tyquery"
 import {
   T,
@@ -342,7 +343,7 @@ export function mapDeliveryMayRecord(
   srcTy: i32,
   dstTy: i32,
 ): boolean {
-  if !tyMapMinted && !(tyWideUnionMinted && tyHoldsWideScalar(dstTy, 8)) {
+  if !tyMapMinted && !(tyWideUnionMinted && tyHoldsNonI32Num(dstTy, 8)) {
     return false
   }
   if srcTy >= 0 && srcTy < T.tys.length {
@@ -375,10 +376,12 @@ function nodeIsValueJoin(ix: i32): boolean {
 }
 
 // A list literal's elements and a value `if` or `match`'s tails take the type `t` they join to,
-// so `[1, 2.5]` holds an f64 `1`.
+// so `[1, 2.5]` holds an f64 `1`. Only a type holding a number other than `i32` moves one.
 export function numLitAdoptJoin(ix: i32, t: i32): i32 {
-  if ix < 0 || t < 0 || !(nodeIsCtorLit(ix) || nodeIsValueJoin(ix)) { return 0 }
-  numLitAdoptDeep(ix, t, 6)
+  if ix < 0 || t < 0 || !stampsStand() || !tyHoldsNonI32Num(t, 8) { return 0 }
+  if nodeAt(ix) is ArrayLit { return numLitAdoptBody(ix, t, 6) }
+  for lf in valueTailLeaves(ix) { numLitAdoptPart(lf, t, 6) }
+  0
 }
 
 // Clears this module's tables (called from `initChecker`).
@@ -424,24 +427,42 @@ export function numLitReadopt(ix: i32, srcTy: i32, dstTy: i32): boolean {
 // block, and each element of a list literal and field of a record literal against its own
 // destination, so `const g: i64[] = [7, 8]` holds i64 literals. `depth` bounds the walk.
 export function numLitAdoptDeep(ix: i32, dstTy: i32, depth: i32): i32 {
-  if !stampsStand() || ix < 0 || dstTy < 0 || depth <= 0 { return 0 }
-  // Only a value join or block has tails to split; anything else is its own one part.
+  if ix < 0 || dstTy < 0 || depth <= 0 { return 0 }
   const at = cwPeel(ix)
-  if valueJoinAt(at) < 0 { return numLitAdoptPart(at, dstTy, depth) }
-  for lf in valueTailLeaves(ix) { numLitAdoptPart(lf, dstTy, depth) }
-  0
+  if at < 0 || at >= P.nodes.length { return 0 }
+  // A value join or block splits into its tails; a literal, a negation, or a list or record
+  // literal is its own one part.
+  const e = nodeAt(at)
+  if e is IfStmt || e is MatchExpr || e is Block {
+    if stampsStand() {
+      for lf in valueTailLeaves(ix) { numLitAdoptPart(lf, dstTy, depth) }
+    }
+    return 0
+  }
+  if e is NumLit || e is Unary || e is ArrayLit || e is ObjLit {
+    if stampsStand() { numLitAdoptPart(at, dstTy, depth) }
+    return 0
+  }
+  numLitPartOpaque()
 }
 
-// One delivered value of `numLitAdoptDeep`: a literal adopts, a list or record literal walks
-// its parts against the destination's one list or record arm.
+// One already-checked delivered value of `numLitAdoptDeep`. One whose recorded type is its
+// destination holds its literals at that width: its own check or join adopted them.
 function numLitAdoptPart(ix: i32, dstTy: i32, depth: i32): i32 {
+  if nodeTyOf(ix) == dstTy { return 0 }
+  numLitAdoptBody(ix, dstTy, depth)
+}
+
+// A literal adopts; a list or record literal walks its parts against the destination's one
+// list or record arm, when that arm holds a number other than `i32`.
+function numLitAdoptBody(ix: i32, dstTy: i32, depth: i32): i32 {
   if numLitAdoptDst(ix, dstTy) >= 0 { return 0 }
   const e = nodeAt(ix)
   if e is ArrayLit {
     const at = numSoleArm(dstTy, true)
     if at < 0 { return 0 }
     const a = tyAt(at)
-    if a is TyArray {
+    if a is TyArray && tyHoldsNonI32Num(a.aElem, 8) {
       for el in e.arrElems {
         const sp = nodeAt(el)
         if sp is Spread {
@@ -457,7 +478,7 @@ function numLitAdoptPart(ix: i32, dstTy: i32, depth: i32): i32 {
     const ot = numSoleArm(dstTy, false)
     if ot < 0 { return 0 }
     const o = tyAt(ot)
-    if o is TyObj {
+    if o is TyObj && tyHoldsNonI32Num(ot, 8) {
       for fx in e.objFields {
         const f = nodeAt(fx)
         if f is FieldInit {
