@@ -61,9 +61,11 @@ import { i32ListHas } from "./listutil"
 import { identDeclOf, identSet } from "./symbols"
 import {
   elabFnIdOf,
+  elabLiveTyOf,
   fnLetIsWide,
-  fnTagArmsOf,
-  fnTagArmsSet,
+  fnTagArmsAt,
+  fnTagArmsAtSet,
+  fnTagCallArms,
   fnTagCallMsgAtOf,
   fnTagCallMsgOf,
   fnTagCallNote,
@@ -88,13 +90,20 @@ export function fnTagDecide(rootIx: i32) {
   ftLeafTys = Map()
   const calls = fnTagCalls()
   ftEscapes = fnTagEscapesTake()
+  // Sets of two or more first: a one-member set whose member is a leaf of one of their joins
+  // follows that set's decision.
   const seen: i32[] = []
-  for c in calls {
-    const s = fnTagCallSetOf(c)
-    if s >= 0 && !i32ListHas(seen, s) {
-      seen.push(s)
-      ftTry(rootIx, s, calls)
+  let pass = 0
+  while pass < 2 {
+    for c in calls {
+      const s = fnTagCallSetOf(c)
+      const one = fnTagMembers(s).length == 1
+      if s >= 0 && one == (pass == 1) && !i32ListHas(seen, s) {
+        seen.push(s)
+        ftTry(rootIx, s, calls)
+      }
     }
+    pass = pass + 1
   }
   // A delivery of a tagged set is built as a closure by the next check.
   for e in ftEscapes {
@@ -156,7 +165,7 @@ function ftTry(rootIx: i32, s: i32, calls: i32[]) {
     }
   }
   for c in calls {
-    if fnTagCallSetOf(c) == s { ftBuildArms(c, ds, leafTy) }
+    if fnTagCallSetOf(c) == s { ftBuildArms(c, s, ds, leafTy) }
   }
   0
 }
@@ -164,31 +173,34 @@ function ftTry(rootIx: i32, s: i32, calls: i32[]) {
 // Each tagged set's member types, as its leaves name them.
 let ftLeafTys: Map<i32, i32[]> = Map()
 
-// Builds the member calls of call `ix`, whose callee carries a tagged set only at the instance
-// being checked; false when it needs none or its arguments cannot be shared by them.
-export function fnTagInstanceCall(ix: i32): boolean {
+// The member calls call `ix` dispatches between at the instance being checked, built for the
+// tagged set its callee carries there; each instance of a generic body may see its own set.
+export function fnTagInstanceArms(ix: i32): i32[] {
+  const none: i32[] = []
   const cn = nodeAt(ix)
-  if !(cn is Call) || fnTagCallSetOf(ix) >= 0 { return false }
+  if !(cn is Call) { return none }
   const cf = parenPeelIx(cn.callFn)
-  if cf < 0 { return false }
+  if cf < 0 { return fnTagCallArms(ix) }
   // A member call names its member.
   const cd = identDeclOf(cf)
-  if cd >= 0 && nodeAt(cd) is FuncDecl { return false }
-  const s = fnTagSetOfTy(nodeTyIxOf(cf))
-  if s < 0 || !fnTagSetIsTagged(s) || !ftPlainArgs(ix) { return false }
+  if cd >= 0 && nodeAt(cd) is FuncDecl { return fnTagCallArms(ix) }
+  const s = fnTagSetOfTy(elabLiveTyOf(cf))
+  if s < 0 || !fnTagSetIsTagged(s) { return fnTagCallArms(ix) }
+  const have = fnTagArmsAt(ix, s)
+  if have.length > 0 { return have }
+  if !ftPlainArgs(ix) { return none }
   const leafTy = ftLeafTys[s] ?? []
   const ds = fnTagMembers(s)
-  if leafTy.length != ds.length { return false }
-  const none: i32[] = []
-  fnTagCallNote(ix, s, "", false, none)
-  ftBuildArms(ix, ds, leafTy)
-  true
+  if leafTy.length != ds.length { return none }
+  if fnTagCallSetOf(ix) < 0 { fnTagCallNote(ix, s, "", false, none) }
+  ftBuildArms(ix, s, ds, leafTy)
+  fnTagArmsAt(ix, s)
 }
 
-// Builds, or re-types, the direct call of each member of `ds` at call `c`'s arguments.
-function ftBuildArms(c: i32, ds: i32[], leafTy: i32[]) {
-  const rs = fnTagCallRsOf(c)
-  let arms = fnTagArmsOf(c)
+// Builds, or re-types, the direct call of each member of `ds`, set `s`, at call `c`'s arguments.
+function ftBuildArms(c: i32, s: i32, ds: i32[], leafTy: i32[]) {
+  const rs: i32[] = if s == fnTagCallSetOf(c) { fnTagCallRsOf(c) } else { [] }
+  let arms = fnTagArmsAt(c, s)
   const cn = nodeAt(c)
   if !(cn is Call) { return 0 }
   if arms.length != ds.length {
@@ -201,7 +213,7 @@ function ftBuildArms(c: i32, ds: i32[], leafTy: i32[]) {
       identSet(id, d)
       arms.push(mkCallN(id, cn.callArgs, cn.callArgNames, cn.pos))
     }
-    fnTagArmsSet(c, arms)
+    fnTagArmsAtSet(c, s, arms)
   }
   let k = 0
   while k < arms.length {
@@ -258,6 +270,20 @@ function ftIsS(x: i32, s: i32): boolean {
   x >= 0 && fnTagSetOfTy(nodeTyIxOf(x)) == s
 }
 
+// The set other than `s` that join `g` carries, when member name `x` is the tail of its block
+// `p`; -1 otherwise. That set's own decision builds the leaf, and its rep is the join's.
+function ftOtherTail(x: i32, p: i32, g: i32, s: i32, ds: i32[]): i32 {
+  if p < 0 || g < 0 || ftLeafMember(x, ds) < 0 { return -1 }
+  const pn = nodeAt(p)
+  const gn = nodeAt(g)
+  if !(pn is Block) || !(gn is IfStmt || gn is MatchExpr) { return -1 }
+  const st = pn.blkStmts
+  if st.length == 0 || st[st.length - 1] != x { return -1 }
+  const o = fnTagSetOfTy(nodeTyIxOf(g))
+  if o == s { return -1 }
+  o
+}
+
 // Walks the program for every node carrying set `s`, pushing each member name it reaches to
 // `leaves` with the member it names to `ids`; false at the first node an id cannot stand at.
 function ftScan(
@@ -285,7 +311,11 @@ function ftScan(
         const cn = nodeAt(p)
         if !(cn is Call) || cn.callFn != x { return false }
       }
-      if ftIsS(x, s) {
+      // A member leaf of another set's join is an id only when that set is tagged too, since
+      // the join and its leaves share one rep.
+      const ot = if ftIsS(x, s) { ftOtherTail(x, p, g, s, ds) } else { -1 }
+      if ot >= 0 && !fnTagSetIsTagged(ot) { return false }
+      if ftIsS(x, s) && ot < 0 {
         if !ok || !ftNodeOk(x, s, ds, leaves, ids) { return false }
         if !ftCtxOk(x, p, g, fn, s) { return false }
         const pn = nodeAt(p)
@@ -394,9 +424,10 @@ function ftNodeOk(
     Paren | Block => {
       return true
     }
-    // An annotated parameter of a set's type is bound by the call that hands it its argument.
+    // A parameter of a set's type is bound by the call that hands it its argument, an
+    // un-annotated one at that call's instance.
     Param => {
-      return n.parType >= 0
+      return true
     }
     // An annotation holds no value.
     TypeRef => {
@@ -554,9 +585,11 @@ function ftNamedFn(v: i32): i32 {
 }
 
 // Whether argument `x` of call `c` binds a parameter of set `s` itself, of a lambda called in
-// place: a binding, as a `let` is.
+// place, or an un-annotated parameter of a named function, whose instance at the call takes the
+// set as that parameter's type: a binding, as a `let` is.
 function ftParamOfSet(c: Call, x: i32, s: i32): boolean {
   const f = parenPeelIx(c.callFn)
+  if ftHoleParamOf(c, x) { return true }
   if f < 0 || !(nodeAt(f) is FuncDecl) { return false }
   const fty = nodeTyIxOf(f)
   if fty < 0 || fty >= T.tys.length { return false }
@@ -565,6 +598,25 @@ function ftParamOfSet(c: Call, x: i32, s: i32): boolean {
   let i = 0
   while i < c.callArgs.length && i < ft.fnParamTypes.length {
     if c.callArgs[i] == x { return fnTagSetOfTy(ft.fnParamTypes[i]) == s }
+    i = i + 1
+  }
+  false
+}
+
+// Whether argument `x` of call `c` binds a positional, un-annotated parameter of the named
+// top-level function `c` calls.
+function ftHoleParamOf(c: Call, x: i32): boolean {
+  const d = ftNamedFn(parenPeelIx(c.callFn))
+  if d < 0 { return false }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) { return false }
+  let i = 0
+  while i < c.callArgs.length && i < f.fnParams.length {
+    if c.callArgs[i] == x {
+      if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
+      const pn = nodeAt(f.fnParams[i])
+      return pn is Param && pn.parType < 0
+    }
     i = i + 1
   }
   false
