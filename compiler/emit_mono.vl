@@ -686,6 +686,8 @@ import {
   fnTagCallArms,
   fnTagCallCopy,
   fnTagCallSetOf,
+  fnTagHoldsTy,
+  fnTagListTy,
   fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
@@ -13655,11 +13657,19 @@ function monoFlowLeafName(g: i32): string {
 function monoFlowReadsNote(ix: i32, lets: i32[], direct: i32[]) {
   const n = nodeAt(ix)
   if n is Index {
-    if nodeAt(unwrapParen(n.idxArr)) is ArrayLit && !mfTagList(n.idxArr) {
+    if (
+      nodeAt(unwrapParen(n.idxArr)) is ArrayLit
+      && !fnTagListTy(nodeTyIxOf(n.idxArr))
+    ) {
       direct.push(ix)
     }
   } else if n is Member {
-    if nodeAt(unwrapParen(n.memObj)) is ObjLit { direct.push(ix) }
+    if (
+      nodeAt(unwrapParen(n.memObj)) is ObjLit
+      && !fnTagHoldsTy(nodeTyIxOf(n.memObj), 4)
+    ) {
+      direct.push(ix)
+    }
   } else if n is Call {
     monoFlowSliceAsSpread(ix, n.pos)
   } else if n is Ident {
@@ -13672,7 +13682,7 @@ function monoFlowReadsNote(ix: i32, lets: i32[], direct: i32[]) {
     }
   } else if n is LetDecl {
     monoFlowReadsName(n.letName)
-    if n.letType < 0 && n.letInit >= 0 && !mfTagList(n.letInit) {
+    if n.letType < 0 && n.letInit >= 0 && !fnTagListTy(nodeTyIxOf(n.letInit)) {
       // arena-tick exempt: a side table of this pass, not the arena
       mfrCand[ix] = true
       lets.push(ix)
@@ -15568,6 +15578,8 @@ function monoFlowInsertAt(xs: i32[], at: i32, v: i32) {
 // Rewrites read node `x` in place to a name read of generic `g`, where that name is in scope;
 // false when it is not.
 function monoFlowReadSet(x: i32, g: i32): boolean {
+  // A read of a tagged set is its member id, which no name read can carry.
+  if fnTagTyIsTagged(nodeTyIxOf(x)) { return false }
   const nm = monoFlowLeafName(g)
   if nm == "" || !monoFlowInScope(x, g) { return false }
   if i32ListHas(mfrKeptIndex, x) && !monoFlowKeepIndex(x) { return false }
@@ -15850,7 +15862,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   if (
     d.letInit < 0
     || monoGeneratedCellElem(d.letInit) >= 0
-    || mfTagList(d.letInit)
+    || fnTagListTy(nodeTyIxOf(d.letInit))
   ) {
     return 0
   }
@@ -16526,6 +16538,13 @@ function monoPinRecordFields(d: LetDecl, at: i32, ctx: i32): i32 {
   for fi in lit.objFields {
     const f = nodeAt(fi)
     if f is FieldInit {
+      // A field holding a tagged set's member id needs no pin.
+      if (
+        fnTagTyIsTagged(nodeTyIxOf(f.fiValue))
+        || fnTagHoldsTy(nodeTyIxOf(f.fiValue), 4)
+      ) {
+        continue
+      }
       if monoPinRecordField(at, f.fiName, f.fiValue, ctx) < 0 { return -1 }
     }
   }
@@ -17784,9 +17803,38 @@ function monoStoredSlotDecline(r: i32): i32 {
   0
 }
 
-// Whether type `t` reaches a type variable or an inference hole.
+// Whether type `t` reaches a type variable or an inference hole outside a tagged function set,
+// whose values are member ids and so need no pin.
 function monoTyOpen(t: i32): boolean {
-  t < 0 || tyHasTyVar(t) || tyReachesHole(t, 16)
+  if t < 0 { return true }
+  if !tyHasTyVar(t) && !tyReachesHole(t, 16) { return false }
+  if !fnTagTyIsTagged(t) && !fnTagHoldsTy(t, 4) { return true }
+  monoTyOpenUntagged(t, 4)
+}
+
+// `monoTyOpen` within a type holding a tagged set: a list or record is open when a part other
+// than the set is, at most `depth` levels deep.
+function monoTyOpenUntagged(t: i32, depth: i32): boolean {
+  if t < 0 { return true }
+  if fnTagTyIsTagged(t) { return false }
+  if !tyHasTyVar(t) && !tyReachesHole(t, 16) { return false }
+  if depth <= 0 { return true }
+  const a = tyAt(t)
+  match a {
+    TyArray => {
+      return monoTyOpenUntagged(a.aElem, depth - 1)
+    }
+    TyObj => {
+      for f in a.objFieldTypes {
+        if monoTyOpenUntagged(f, depth - 1) { return true }
+      }
+      return false
+    }
+    // Any other open kind is open as a whole.
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+      return true
+    }
+  }
 }
 
 // Records `t` as the type of node `x` where the checker left it open, outside a generic's
@@ -18545,10 +18593,9 @@ function monoReachLitTys() {
   0
 }
 
-// The list half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a list whose
-// element is not a tagged set; a tagged set's ids keep the set's one rep.
+// The list half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a list.
 function monoReachListTy(a: i32, t: Ty) {
-  if t is TyArray && !fnTagTyIsTagged(t.aElem) {
+  if t is TyArray {
     const ct = monoReachSlotTy(a, t.aElem, "e,")
     if ct >= 0 { nodeTyRecord(a, mkArrayTy(ct)) }
   }
@@ -18583,8 +18630,10 @@ function monoReachRecTy(a: i32, t: Ty) {
 // The call type literal `a`'s slot at `path`, of open function type `st`, reaches, recorded on
 // each reached callee still open; -1 when the slot is no such function or reaches no one type.
 // A slot whose holes are already pinned keeps its type (-1), and its open callees take the pin.
+// A slot holding a tagged set keeps the set's one rep (-1).
 function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
   if st < 0 || st >= T.tys.length || !(tyAt(st) is TyFunc) { return -1 }
+  if fnTagTyIsTagged(st) { return -1 }
   if !tyHasTyVar(st) { return -1 }
   const pr = pinResolvedFnTy(st)
   const pinned = pr >= 0 && !tyHasTyVar(pr)
@@ -28994,13 +29043,4 @@ function monoRetListRowName(ty: i32): string {
   const rn = monoRetRowName(t)
   if rn == "" { return "" }
   rn + suffix
-}
-
-// Whether node `x` is a list of a tagged set's ids, which no pin re-points.
-function mfTagList(x: i32): boolean {
-  const t = nodeTyIxOf(x)
-  if t < 0 || t >= T.tys.length { return false }
-  const a = tyAt(t)
-  if a is TyArray { return fnTagTyIsTagged(a.aElem) }
-  false
 }
