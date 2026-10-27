@@ -11,6 +11,7 @@ import {
   Member,
   Node,
   TS_NAME,
+  TS_UNION,
   TypeDecl,
   annTsOf,
   arenaReplaceNode,
@@ -32,6 +33,7 @@ import {
   setAnnTs,
   tsKind,
   tsLeaf,
+  tsMkKids,
   tsToName,
 } from "./ast"
 import {
@@ -84,14 +86,7 @@ import {
   recAnnObjs,
   v128NestMsg,
 } from "./check_leaf_steps"
-import {
-  luAnnTyPut,
-  luArrowTight,
-  luAt,
-  luIsTyPut,
-  luPipeTight,
-  luRef,
-} from "./check_list_union"
+import { luAnnTyPut, luAt, luIsTyPut, luRef } from "./check_list_union"
 import { matchConstPatWhy } from "./check_match_desugar"
 import {
   unkTyClash,
@@ -104,10 +99,10 @@ import {
   assignable,
   joinVariantTys,
   mintedAnnTy,
-  nameToTy,
   resolveCallTyArgs,
   tErr,
   tErrUnsupported,
+  tsToTy,
   voidStoreCheck,
   voidStoreRefuse,
 } from "./check_relate_core"
@@ -133,7 +128,6 @@ import {
   tyAt,
   tyEq,
   tySame,
-  tyToEmitName,
   tyToStr,
   tyToStrUser,
   tyToTs,
@@ -646,25 +640,30 @@ export function lmValTy(ms: i32[]): i32 {
   e
 }
 
+// The written union of the map members' value lists, resolved from their trees; -1 when a list
+// has none.
+function lmValsTs(ms: i32[]): i32 {
+  const kids: i32[] = []
+  for m in ms {
+    const a = tyAt(m)
+    if !(a is TyMap) { return -1 }
+    const k = luTs(mkArrayTy(a.mVal))
+    if k < 0 { return -1 }
+    kids.push(k)
+  }
+  if kids.length == 0 { return -1 }
+  const root = if kids.length == 1 { kids[0] } else { tsMkKids(TS_UNION, "", kids) }
+  const mark = T.diags.length
+  const u = tsToTy(root)
+  while T.diags.length > mark { T.diags.pop() }
+  u
+}
+
 // The union of the map members' `.values()` lists, each the member's own value list, as an
 // `is` test on each member then the call would type it; -1 when they have no union.
 export function lmValsTy(ms: i32[]): i32 {
   // A join collapses `V[] | string[]` to one list, where the written union keeps two arms.
-  if luAnyTyVar(ms) {
-    let sp = ""
-    for m in ms {
-      const a = tyAt(m)
-      if !(a is TyMap) { return -1 }
-      const s = luSpell(mkArrayTy(a.mVal))
-      if s == "" { return -1 }
-      if sp != "" { sp = sp + "|" }
-      sp = sp + s
-    }
-    const mark = T.diags.length
-    const u = nameToTy(sp)
-    while T.diags.length > mark { T.diags.pop() }
-    return u
-  }
+  if luAnyTyVar(ms) { return lmValsTs(ms) }
   let e = -1
   for m in ms {
     const a = tyAt(m)
@@ -711,7 +710,7 @@ function lmArm(
   const mt = tyAt(mem)
   if mt is TyMap && (kind == 1 || prop == "get") {
     const own = mkNullableTy(mt.mVal)
-    if luSpell(own) != "" {
+    if luTs(own) >= 0 {
       const otmp = "$lo" + i32ToStr(site)
       stmts.push(luDecl("const", otmp, own, rd, site, pos))
       rd = luRef(otmp, site, pos)
@@ -739,8 +738,7 @@ export function lmChain(
   // A type parameter's map tests its last member too, as `luChain` does.
   const open = luAnyTyVar(ms)
   if k >= ms.length - 1 && !open { return arm }
-  const test = luAt(mkIsExpr(luRef(recv, site, pos), luSpell(ms[k]), pos), site)
-  luIsTyPut(test, ms[k])
+  const test = luIsTest(recv, ms, k, site, pos)
   if k >= ms.length - 1 {
     const tl: i32[] = []
     tl.push(luAt(mkCall(luRef("__trap__", site, pos), [], pos), site))
@@ -750,60 +748,57 @@ export function lmChain(
   luAt(mkIf(test, arm, rest, pos), site)
 }
 
-// The spelling the rewrite names `ty` by in an `is` test or an annotation: the first of its
-// display name and its emit name that resolves back to `ty`, or "" when neither does. A failed
-// resolution's diagnostics are dropped, since the answer is the whole point of asking.
-export function luSpell(ty: i32): string {
-  const dn = luPipeTight(tyToStr(ty))
-  if luSpellsAs(dn, ty) { return dn }
-  const en = tyToEmitName(ty)
-  if en != "" && luSpellsAs(en, ty) { return en }
-  // A function type's display name spaces its arrow, which no annotation name does; its emit
-  // name spells a literal-union parameter by its old base scalar.
-  const an = luArrowTight(dn)
-  if an != dn && luSpellsAs(an, ty) { return an }
-  // A map naming a type parameter has no emit name, and its display name spaces the colon.
-  const tn = fvaTight(dn)
-  if tn != an && luSpellsAs(tn, ty) { return tn }
-  // A union naming a type parameter, whose written form resolves to one member when its lists
-  // meet: spelled for the pin to substitute, and typed through `luAnnTy`.
-  if luUnionSpellsByMember(ty) { return tn }
-  ""
+// The spelling tree the rewrite names `ty` by in an `is` test or an annotation, or -1 when the
+// tree does not resolve back to `ty`. A union naming a type parameter whose members each have a
+// tree keeps its own, since its written form resolves to one member where its lists meet.
+export function luTs(ty: i32): i32 {
+  const root = tyToTs(ty)
+  if root < 0 { return -1 }
+  if luTsSpellsAs(root, ty) || luUnionTsByMember(ty) { return root }
+  -1
 }
 
-// Whether `ty` is a union naming a type parameter each of whose members has a spelling.
-function luUnionSpellsByMember(ty: i32): boolean {
+// Whether tree `root` resolves to `ty`. A failed resolution's diagnostics are dropped, since the
+// answer is the whole point of asking.
+function luTsSpellsAs(root: i32, ty: i32): boolean {
+  const mark = T.diags.length
+  const back = tsToTy(root)
+  while T.diags.length > mark { T.diags.pop() }
+  back >= 0 && (tySame(back, ty) || tyEq(back, ty))
+}
+
+// Whether `ty` is a union naming a type parameter each of whose members has a tree.
+function luUnionTsByMember(ty: i32): boolean {
   if ty < 0 || !tyHasTyVar(ty) { return false }
   const t = tyAt(ty)
   if t is TyUnion {
-    let i = 0
-    while i < t.uMembers.length {
-      if luSpell(t.uMembers[i]) == "" { return false }
-      i = i + 1
+    for m in t.uMembers {
+      if luTs(m) < 0 { return false }
     }
     return true
   }
   false
 }
 
-function luSpellsAs(name: string, ty: i32): boolean {
-  const mark = T.diags.length
-  const back = nameToTy(name)
-  while T.diags.length > mark { T.diags.pop() }
-  back >= 0 && (tySame(back, ty) || tyEq(back, ty))
-}
-
-// Whether the union `u` and each of its members `ms` have a spelling. The receiver's `const`
-// is annotated at `u` itself, since an un-annotated copy of a null-narrowed union reads its
+// Whether the union `u` and each of its members `ms` have a tree. The receiver's `const` is
+// annotated at `u` itself, since an un-annotated copy of a null-narrowed union reads its
 // complement arm at the wrong rep (D2875).
 export function luAllSpell(u: i32, ms: i32[]): boolean {
-  if luSpell(u) == "" { return false }
-  let i = 0
-  while i < ms.length {
-    if luSpell(ms[i]) == "" { return false }
-    i = i + 1
+  if luTs(u) < 0 { return false }
+  for m in ms {
+    if luTs(m) < 0 { return false }
   }
   true
+}
+
+// `recv is <ms[k]>`, the test node carrying member `ms[k]`'s tree and its type.
+function luIsTest(recv: string, ms: i32[], k: i32, site: i32, pos: i32): i32 {
+  const root = luTs(ms[k])
+  const nm = if root >= 0 { tsToName(root) } else { "" }
+  const test = luAt(mkIsExpr(luRef(recv, site, pos), nm, pos), site)
+  if root >= 0 { setAnnTs(test, root) }
+  luIsTyPut(test, ms[k])
+  test
 }
 
 // `kw name[: ann] = init`, where `ann` is a type rendered to its spelling (-1: none).
@@ -858,8 +853,7 @@ export function luChain(
   // narrow it, since the parameter may be the same list at the pin.
   const open = luAnyTyVar(ms)
   if k >= ms.length - 1 && !open { return arm }
-  const test = luAt(mkIsExpr(luRef(recv, site, pos), luSpell(ms[k]), pos), site)
-  luIsTyPut(test, ms[k])
+  const test = luIsTest(recv, ms, k, site, pos)
   if k >= ms.length - 1 {
     const tl: i32[] = []
     tl.push(luAt(mkCall(luRef("__trap__", site, pos), [], pos), site))
@@ -867,39 +861,6 @@ export function luChain(
   }
   const rest = luChain(ms, k + 1, recv, idx, elem, site, pos)
   luAt(mkIf(test, arm, rest, pos), site)
-}
-
-// `s` with the space after each `:` and `,` outside a string literal dropped, the form a record
-// or map annotation's name takes: the emitter reads a map's value type off that name, and a
-// spaced record name pins an instance at a type no shape row answers (D3985).
-function fvaSepTight(s: string): string {
-  let out = ""
-  let inStr = false
-  let i = 0
-  while i < s.length {
-    const c = s[i]
-    out = out + s.slice(i, i + 1)
-    if inStr {
-      if c == '\\' && i + 1 < s.length {
-        out = out + s.slice(i + 1, i + 2)
-        i = i + 1
-      } else if c == '"' {
-        inStr = false
-      }
-    } else if c == '"' {
-      inStr = true
-    } else if (c == ':' || c == ',') && i + 1 < s.length && s[i + 1] == ' ' {
-      i = i + 1
-    }
-    i = i + 1
-  }
-  out
-}
-
-// Display name `s` in an annotation's spacing: tight pipes, separators and arrows. A spaced
-// arrow in a function-element list loses the list's grouping parens in the emit rename (D9970).
-function fvaTight(s: string): string {
-  luArrowTight(fvaSepTight(luPipeTight(s)))
 }
 
 // The annotation node naming `ty` for the adapter, or -1 when it has no spelling. The checker
@@ -910,8 +871,8 @@ export function fvaAnnot(ty: i32, site: i32, pos: i32): i32 {
   // A single literal type is spelled by its base scalar, which it is stored as; the checker
   // reads the literal itself from `luAnnTy`.
   const sty = litPeekBaseTy(ty)
-  const root = if isVoidTy(sty) { tsLeaf(TS_NAME, "void") } else { tyToTs(sty) }
-  if root < 0 || luSpell(sty) == "" { return -1 }
+  const root = if isVoidTy(sty) { tsLeaf(TS_NAME, "void") } else { luTs(sty) }
+  if root < 0 { return -1 }
   const tr = luAt(mkTypeRef(tsToName(root), pos), site)
   setAnnTs(tr, root)
   luAnnTyPut(tr, ty)
