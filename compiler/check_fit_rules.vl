@@ -448,7 +448,7 @@ import {
   tyHasHole,
   tyHasInferHole,
   tyHasMapMember,
-  tyHoldsObj,
+  tyHoldsObjDeep,
   tyIsHole,
   tyIsLitUnion,
   tyIsNulI32BackedListInner,
@@ -473,6 +473,7 @@ import {
   CW_OCC_BIND,
   CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_ASG_LHS,
   CW_UP_CALLEE,
   CW_UP_LETINIT,
   CW_UP_OBJ,
@@ -499,7 +500,7 @@ import {
 } from "./const_exact"
 import { numLexRadixBits } from "./emit_bignum"
 import { nodeLastTok } from "./fmt_util"
-import { strListIndexOf } from "./listutil"
+import { i32ListHas, strListIndexOf } from "./listutil"
 import { nameIsBareIdent, nameIsQuotedLeaf } from "./tyname"
 import {
   flattenVariantsInto,
@@ -2220,6 +2221,81 @@ export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     return 0
   }
   recAdPushMapDecl(decl, srcTy, nonNulTyOf(dstTy), p)
+  // Each value stored into it is delivered as the map's values in the same round, so a chain
+  // of `Map()` bindings settles at once rather than one binding a round (D14506).
+  if !(dt is TyMap) || i32ListHas(recMapFollowing, decl) { return 0 }
+  recMapFollowing.push(decl)
+  for v in recMapStoredValues(decl) {
+    recAdoptMapNote(v, nodeTyIxOf(v), dt.mVal)
+  }
+  recMapFollowing.pop()
+  0
+}
+
+// The `Map()` bindings whose stored values `recAdoptMapNote` is following, so a cycle of stores
+// ends.
+const recMapFollowing: i32[] = []
+
+// The values stored into the `Map()` binding `d` by `m[k] = v` and `m.set(k, v)`.
+function recMapStoredValues(d: i32): i32[] {
+  const out: i32[] = []
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) { return out }
+  cwIxBuild()
+  const ow = cwOccWalk(dn.letName, cwFrameOfDecl(d))
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if cwIxKind[ow.row] == CW_OCC_USE && u >= 0 && u < cwIxUpKind.length {
+      const v = recMapStoreValueAt(u)
+      if v >= 0 { out.push(v) }
+    }
+  }
+  out
+}
+
+// The value the use `u` of a map binding stores, when it is the receiver of `u[k] = v` or of
+// `u.set(k, v)`; -1 otherwise.
+function recMapStoreValueAt(u: i32): i32 {
+  if (
+    u < 0
+    || u >= cwIxUpKind.length
+    || u >= cwIxUp.length
+    || cwIxUpKind[u] != CW_UP_OBJ
+  ) {
+    return -1
+  }
+  const p = cwIxUp[u]
+  if (
+    p < 0
+    || p >= P.nodes.length
+    || p >= cwIxUpKind.length
+    || p >= cwIxUp.length
+  ) {
+    return -1
+  }
+  const a = cwIxUp[p]
+  if a < 0 || a >= P.nodes.length { return -1 }
+  if cwIxUpKind[p] == CW_UP_ASG_LHS { return recMapIndexStoreValue(p, a) }
+  if cwIxUpKind[p] == CW_UP_CALLEE { return recMapSetStoreValue(p, a) }
+  -1
+}
+
+// The right side of the assignment `a` whose target is the index `p`; -1 when it is not one.
+function recMapIndexStoreValue(p: i32, a: i32): i32 {
+  const an = nodeAt(a)
+  if nodeAt(p) is Index && an is BinExpr { return an.binRight }
+  -1
+}
+
+// The value argument of the call `a` whose callee is the member `p`, when that is `.set(k, v)`;
+// -1 otherwise.
+function recMapSetStoreValue(p: i32, a: i32): i32 {
+  const pn = nodeAt(p)
+  const an = nodeAt(a)
+  if pn is Member && an is Call {
+    if pn.memProp == "set" && an.callArgs.length == 2 { return an.callArgs[1] }
+  }
+  -1
 }
 
 // Note a delivery of the literal list binding `srcExpr` (a list of records) as a list of a
@@ -2266,7 +2342,7 @@ export function recAdoptUnionList(
 // element of a literal list binding, to a record that stores a field differently.
 export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if srcTy < 0 || dstTy < 0 || srcTy == dstTy { return 0 }
-  if !tyHoldsObj(srcTy, 8) || !tyHoldsObj(dstTy, 8) { return 0 }
+  if !tyHoldsObjDeep(srcTy) || !tyHoldsObjDeep(dstTy) { return 0 }
   const p = cwPeelValue(srcExpr)
   if p < 0 || p >= P.nodes.length { return 0 }
   const e = nodeAt(p)
@@ -2556,7 +2632,12 @@ function recAdNoteFields(lit: i32, d: i32) {
 // binding adopts the record and the re-check judges its literal there, as its annotated twin's
 // is (D3339). True when it noted such an adoption.
 export function recAdForce(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
-  if srcTy < 0 || dstTy < 0 || !tyHoldsObj(srcTy, 8) || !tyHoldsObj(dstTy, 8) {
+  if (
+    srcTy < 0
+    || dstTy < 0
+    || !tyHoldsObjDeep(srcTy)
+    || !tyHoldsObjDeep(dstTy)
+  ) {
     return false
   }
   const p = cwPeelValue(srcExpr)
