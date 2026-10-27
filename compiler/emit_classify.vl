@@ -75,6 +75,7 @@ import {
 } from "./check_asg_rows"
 import { recBuildElemTyOf, recBuildTyOf } from "./check_rec_rows"
 import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
+import { a20RetWalk } from "./check_nj_gate"
 import {
   externValueSeen,
   isParentElseTyIxOf,
@@ -201,6 +202,7 @@ import {
   TyVar,
   litBaseTy,
   litUnionAliasNameOfTy,
+  mkArrayTy,
   mkFuncTy,
   numLitUnionBaseTy,
   oneListUnionRender,
@@ -266,6 +268,7 @@ import {
   sioMemoVer,
   structIndexByName,
   structIndexOfTy,
+  structRowRecordingTy,
   tyIsRefShaped,
   uFieldElemTyIxAt,
   variantFieldElemName,
@@ -657,6 +660,7 @@ import {
   arrNewDestKind,
   emptyArrHoleKind,
   letAnnVariantIdx,
+  listBuildOfTy,
   rlSlotIsKindList,
   rlWidenVariantOf,
   rsFnRetTy,
@@ -834,8 +838,10 @@ import {
   LBK_I32_LIST,
   LBK_I64_LIST,
   LBK_REF,
+  LBK_REF_AT_SLOT,
   LBK_STR_LIST,
   LBK_U8_LIST,
+  LBK_UNION,
   MVK_CLOSURE,
   MVK_F32,
   MVK_F64,
@@ -16757,6 +16763,107 @@ function refListElemNameOfInstTy(exprIx: i32, fnIx: i32): string {
 // a ref list. Mirrors `exprRefArray`'s receiver shapes, resolving the per-element-
 // type table slot (`refListSlotOfExpr`) at every push / index / `.length` / store site.
 export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
+  const rs = listRowOfExpr(exprIx, fnIx)
+  if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
+  refListElemNameOfExprRaw(exprIx, fnIx)
+}
+// The ref-list row the expression at `exprIx` is built as in function `fnIx`: the row of its
+// rep type (`exprRepTy`), as `listBuildOfTy` builds that type; -1 where it is no ref list.
+export function listRowOfExpr(exprIx: i32, fnIx: i32): i32 {
+  const t = exprRepTy(exprIx, fnIx, 8)
+  if t < 0 { return -1 }
+  const rt = recListRowTy(t)
+  if rt < 0 { return -1 }
+  const lb = listBuildOfTy(rt)
+  if lb == null { return -1 }
+  if (
+    lb.lbKind == LBK_REF
+    || lb.lbKind == LBK_UNION
+    || lb.lbKind == LBK_REF_AT_SLOT
+  ) {
+    return lb.lbSlot
+  }
+  -1
+}
+
+// A list of records `t` as the list of the struct row its element is built at, where the row
+// an alias leads to records another type (`structIndexOfTy`); -1 where no struct row is known
+// for the element yet; `t` itself otherwise.
+function recListRowTy(t: i32): i32 {
+  const a = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if !(a is TyArray) || a.aElem < 0 || !(tyAt(a.aElem) is TyObj) { return t }
+  if structRowRecordingTy(a.aElem) >= 0 { return t }
+  const si = structIndexOfTy(a.aElem)
+  if si < 0 || si >= sTyIx.length || sTyIx[si] < 0 { return -1 }
+  mkArrayTy(sTyIx[si])
+}
+
+// The type the expression at `exprIx` is built as in function `fnIx`: an un-annotated binding's
+// read is its initializer's, an index read the element of its list's, anything else its own
+// stamp (`litRepTyAt`); -1 where none closes or `depth` runs out.
+function exprRepTy(exprIx: i32, fnIx: i32, depth: i32): i32 {
+  if exprIx < 0 || exprIx >= P.nodes.length || depth <= 0 { return -1 }
+  const e = nodeAt(exprIx)
+  if e is Paren { return exprRepTy(e.parInner, fnIx, depth - 1) }
+  if e is Ident {
+    const d = identDeclOf(exprIx)
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if dn is LetDecl && dn.letType < 0 && dn.letInit >= 0 {
+      const r = exprRepTy(dn.letInit, fnIx, depth - 1)
+      if r >= 0 { return r }
+    }
+    return litRepTyAt(exprIx, fnIx)
+  }
+  if e is Index {
+    const b = exprRepTy(e.idxArr, fnIx, depth - 1)
+    const bt = if b >= 0 && b < T.tys.length { T.tys[b] } else { null }
+    if bt is TyArray && bt.aElem >= 0 { return bt.aElem }
+  }
+  // A call is built bottom-up: a plain function's result rep (`fnRetRepTy`), or a list `.map`
+  // over that of its callback.
+  const callee = if e is Call && e.callFn >= 0 && e.callFn < P.nodes.length { nodeAt(e.callFn) } else { null }
+  if e is Call && callee is Ident {
+    const fe = fnIndexOfInScopeAt(
+      sidOfNode(e.callFn),
+      callee.identName,
+      fnIx,
+      e.callFn,
+    )
+    const r = fnRetRepTy(fe, depth)
+    if r >= 0 { return r }
+  }
+  if (
+    e is Call
+    && callee is Member
+    && callee.memProp == "map"
+    && e.callArgs.length == 1
+  ) {
+    const rt = nodeTyIxOf(callee.memObj)
+    const r = if rt >= 0 && rt < T.tys.length && T.tys[rt] is TyArray { fnRetRepTy(mfCallbackFe(e.callArgs[0], fnIx), depth) } else { -1 }
+    if r >= 0 { return mkArrayTy(r) }
+  }
+  litRepTyAt(exprIx, fnIx)
+}
+
+// The rep of what function `fe` (an `fnStmts` index) returns, when its result is inferred and
+// every value it returns has one rep; -1 otherwise (a generic, an annotated return).
+function fnRetRepTy(fe: i32, depth: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const fd = nodeAt(fnStmts[fe])
+  if !(fd is FuncDecl) || fd.fnRet >= 0 || fd.fnTyParams.length > 0 {
+    return -1
+  }
+  const vals: i32[] = []
+  a20RetWalk(fd.fnBody, true, vals)
+  let r = -1
+  for v in vals {
+    const vr = exprRepTy(v, fnStmts[fe], depth - 1)
+    if vr < 0 || (r >= 0 && !tyEq(r, vr)) { return -1 }
+    r = vr
+  }
+  r
+}
+function refListElemNameOfExprRaw(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return "" }
   const e = nodeAt(exprIx)
   match e {
@@ -17125,6 +17232,8 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
 // the element type does not resolve. Slot 0 is a real row, so an unresolved read must not
 // borrow it: every caller tests the result before indexing a backing/wrapper/element table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
+  const rs0 = listRowOfExpr(exprIx, fnIx)
+  if rs0 >= 0 { return rs0 }
   const nm = refListElemNameOfExpr(exprIx, fnIx)
   const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
   if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "call") }
@@ -17224,6 +17333,10 @@ export function fnRetRefListSlot(fe: i32): i32 {
 // code-5 local so `declaredRefArrayName` can recover its element type), or -1.
 export function letRefListSlot(letIx: i32, fnIx: i32) {
   const d = nodeAt(letIx)
+  if d is LetDecl && d.letType < 0 && d.letInit >= 0 {
+    const rr = listRowOfExpr(d.letInit, fnIx)
+    if rr >= 0 { return rr }
+  }
   if d is LetDecl {
     // Guarded by the newtype-brand receipt: a brand is a second arena index over its base's
     // `Ty`, so no structural reader can tell them apart — only `nwTyIxs` can, so it declines here. B123.
