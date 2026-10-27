@@ -1093,13 +1093,11 @@ export function nolLitsSet(v: i32[]) { nolLits = v }
 export let nolTaken: {[i32]: boolean} = Map()
 export function nolTakenSet(v: {[i32]: boolean}) { nolTaken = v }
 
-// The null-only literals some destination other than `null[]` received: each is built at that
+// Whether a destination other than `null[]` received null-only literal `ix`: it is built at that
 // destination's list, never as a `null[]` (`nodeArrayElemIsNullUnit`).
-export let nolTakenOther: {[i32]: boolean} = Map()
-export function nolTakenOtherSet(v: {[i32]: boolean}) { nolTakenOther = v }
-
 export function nolLitTakenOther(ix: i32): boolean {
-  nolTakenOther[ix] ?? false
+  const d = arrLitDestTy(ix)
+  d >= 0 && !nolIsNullList(d)
 }
 
 // A spread list literal whose element joins a `u8` source with another element type (D1852).
@@ -1111,17 +1109,31 @@ export function u8MixLitsSet(v: i32[]) { u8MixLits = v }
 export let nolOperand: {[i32]: boolean} = Map()
 export function nolOperandSet(v: {[i32]: boolean}) { nolOperand = v }
 
-// A list literal whose element joins to a union, and per literal what a delivery outside a
-// speculative check made of it: 1 when only destinations of another concrete union received it,
-// so it boxes into theirs and its own union is never built (D4635); 2 once one wants its own.
+// How many list literals have an element that joins to a union.
 export let ulLitN = 0
 export function ulLitNSet(v: i32) { ulLitN = v }
 
+// Per list literal, the list type every destination outside a speculative check delivered it
+// into, -2 once two of them disagree. Absent for a literal no destination types.
 export let ulTaken: {[i32]: i32} = Map()
 export function ulTakenSet(v: {[i32]: i32}) { ulTaken = v }
 
+// The list type literal `ix`'s destinations agree on, -1 where none does.
+export function arrLitDestTy(ix: i32): i32 {
+  const d = ulTaken[ix] ?? -1
+  if d < 0 { -1 } else { d }
+}
+
+// Whether literal `ix` boxes into its destinations' concrete union, so its own is never built
+// (D4635): they agree on a union element other than the literal's own.
 export function arrLitUnionDestTaken(ix: i32): boolean {
-  (ulTaken[ix] ?? 0) == 1
+  const dt = arrLitDestTy(ix)
+  const own = nodeTyIxOf(ix)
+  if dt < 0 || own < 0 { return false }
+  const d = tyAt(dt)
+  const ot = tyAt(own)
+  if !(d is TyArray) || !(ot is TyArray) || d.aElem < 0 { return false }
+  tyAt(d.aElem) is TyUnion && !tyHasTyVar(d.aElem) && !tySame(ot.aElem, d.aElem)
 }
 
 // Marks each null-only list literal `srcExpr` delivers into `dstTy` as typed, walking the
@@ -1166,14 +1178,13 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
     // A generic parameter's `T[]` pinned at `null` by this very literal names nothing.
     if lbiNoDest && nolIsNullList(dt) { return 0 }
     nolTaken[at] = true
-    if !nolIsNullList(dt) { nolTakenOther[at] = true }
     const dn = nonNullTy(dt)
     let elDt = dt
     if dn >= 0 {
       const d = tyAt(dn)
       if d is TyArray {
         elDt = d.aElem
-        if !inferQuiet && elDt >= 0 { ulNoteDelivery(at, elDt) }
+        if !inferQuiet && elDt >= 0 { ulNoteDelivery(at, dn) }
       }
     }
     for el in e.arrElems {
@@ -1211,18 +1222,13 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
   0
 }
 
-// Records list literal `at` delivered into a list whose element is `elDt`, for `ulTaken`.
-function ulNoteDelivery(at: i32, elDt: i32) {
+// Records list literal `at` delivered into list type `dt`, for `ulTaken`.
+function ulNoteDelivery(at: i32, dt: i32) {
   const own = nodeTyIxOf(at)
-  if own < 0 || !(tyAt(own) is TyArray) || ulTaken[at] == 2 { return 0 }
-  const ot = tyAt(own)
-  if ot is TyArray {
-    if !(tyAt(elDt) is TyUnion) || tyHasTyVar(elDt) || tySame(ot.aElem, elDt) {
-      ulTaken[at] = 2
-    } else {
-      ulTaken[at] = 1
-    }
-  }
+  if own < 0 || !(tyAt(own) is TyArray) { return 0 }
+  const prev = ulTaken[at] ?? -1
+  if prev == -1 { ulTaken[at] = dt }
+  else if prev >= 0 && !tySame(prev, dt) { ulTaken[at] = -2 }
   0
 }
 
