@@ -45,7 +45,7 @@ import {
 } from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
 import { covarValueWriteState } from "./check_covar_write"
-import { nodeTyIsNulBoolList, nodeTyIxOf } from "./check_node_tys"
+import { nodeTyIxOf } from "./check_node_tys"
 import { numLitUnionArrayBaseName, numUnionMembersOf } from "./check_num_lits"
 import {
   PrimName,
@@ -67,19 +67,10 @@ import {
   tyIsLitUnionArray,
 } from "./check_types"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
-import {
-  nameIsF32Array,
-  nameIsU8Array,
-  parentLetOf,
-  unwrapParen,
-} from "./emit_base"
+import { parentLetOf, unwrapParen } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { arrLitHasSpread } from "./emit_list_rep"
-import {
-  annRefArrSlot,
-  nonNulBaseOf,
-  tyRefArrElemOf,
-} from "./emit_map_value_slots"
+import { nonNulBaseOf, tyRefArrElemOf } from "./emit_map_value_slots"
 import { globalLetOf, variantIndexOf } from "./emit_narrow_slots"
 import {
   nulScalarListBuildKind,
@@ -87,11 +78,9 @@ import {
   repABNote,
 } from "./emit_nullable_rets"
 import { emptyArrHoleElemSlot } from "./emit_obj_lit_fits"
-import { letInfStrListByUse } from "./emit_query"
 import { RepDesc, repOfTy, repShadowOn, repStructSlotsTwin } from "./emit_rep"
 import { repSlotOfKind } from "./emit_rep_slot"
 import {
-  annIsNulLitUnionArray,
   emptyArrLitIxOf,
   rlElemStructRow,
   rlSlotOfTyOrTwin,
@@ -160,61 +149,8 @@ export function arrNewDestKind(callIx: i32): ArrNewKind {
   "none"
 }
 
-// The list build code a type-annotation node at `tyIx` names (1 = struct/map ref list,
-// 2 = union box ref list, 3 = string list), or 0 when it isn't a list annotation.
-export function tyAnnRefListKind(tyIx: i32) {
-  if tyIx >= 0 {
-    // The annotation's element row, `| null`-tolerant exactly as the intern arm that
-    // banked it (`ensureRefElem`/`rlInternName`) — read, not re-derived from the rendering.
-    const raK = annRefArrSlot(tyIx)
-    if raK >= 0 && raK < rlElemKindTbl.length {
-      if rlElemKindTbl[raK] == RLK_UNION { return LBK_UNION }
-      if rlElemKindTbl[raK] == RLK_CLOSURE { return LBK_REF_AT_SLOT }
-      return LBK_REF
-    }
-    // An inline literal-union array annotation (`("a" | "b")[]`) seeds no list kind — the
-    // default i32 wrapper. Ahead of the name arm since canon softens the bare inline union
-    // to `string`, which would otherwise seed the string-list build for an atom-i32 cell.
-    if tyIsLitUnionArray(nodeTyIxOf(tyIx)) { return LBK_I32_LIST }
-    // The numeric twin of the arm above: a numeric literal union has no atom (its members
-    // ARE i32/i64/f64 values), so a `K[]` is the base scalar's list — f64 (4), i64 (6), or
-    // the default i32. Ahead of the name arms for the same canon-softening reason: an
-    // empty `[]` would otherwise build the i32 default into an f64/i64 cell.
-    const nlab = numLitUnionArrayBaseName(nodeTyIxOf(tyIx))
-    if nlab == "f64" { return LBK_F64_LIST }
-    if nlab == "i64" { return LBK_I64_LIST }
-    if nlab != "" { return LBK_I32_LIST }
-    // The nullable-element twin (`(("a" | "b") | null)[]`, kind 9), ahead of the name arms
-    // for the same reason: the softened `(string | null)[]` spelling would seed a string list.
-    if annIsNulLitUnionArray(tyIx) { return LBK_NUL_LIT_UNION_LIST }
-    const lt = nodeAt(tyIx)
-    if lt is TypeRef {
-      // A `string[]` or `(string | null)[]` annotation: the string list (kind 3).
-      if tyScalarListKind(nodeTyIxOf(tyIx)) == "strlist" { return LBK_STR_LIST }
-      // A `(boolean | null)[]` annotation (kind 8): an i32-backed list with the boolean
-      // sentinel niche (`null → 2`), so an all-`null` `[null]` builds the i32 wrapper.
-      // A `(K | null)[]` spelling, flattened or not, has already returned above, and an
-      // annotation without a recorded type is never one of these niche lists.
-      if nodeTyIsNulBoolList(tyIx) { return LBK_NUL_BOOL_LIST }
-      // An `f64[]` annotation: an empty `[]` builds the f64-list wrapper (kind 4).
-      if tyIsF64Array(nodeTyIxOf(tyIx)) { return LBK_F64_LIST }
-      // An `i64[]` annotation: an empty `[]` builds the i64-list wrapper (kind 6).
-      if tyIsI64Array(nodeTyIxOf(tyIx)) { return LBK_I64_LIST }
-      // An `f32[]` annotation (kind 7): threads even for a non-empty literal, since a bare
-      // `[1.5]` doesn't self-identify as f32 (it defaults to f64). Stays on the name
-      // deliberately — a kind-based test would be a constant false here (`tyKindOf` never
-      // returns 21), and a kind-based claim would mis-classify a literal-built f64 list as f32.
-      if nameIsF32Array(lt.tyName) { return LBK_F32_LIST }
-      // A `u8[]` annotation (kind 10) — the packed byte list. Threads for a non-empty
-      // literal too: a bare `[1, 2]` types `i32[]`, so the annotation is the only signal.
-      if nameIsU8Array(lt.tyName) { return LBK_U8_LIST }
-    }
-  }
-  LBK_I32_LIST
-}
-
 // The list `VKind` a recorded ARRAY type reps as, given the caller's own ref-list ROW for the
-// element (`-1` for none). Ordered as `tyAnnRefListKind`'s ladder is: non-`TyPrim`-backed
+// element (`-1` for none). Ordered: non-`TyPrim`-backed
 // spellings (litunion, nullable niches) first, then `TyPrim` leaves, then the ref-list row —
 // a `TyPrim` leaf returns on an unmapped element rather than falling into the row lookup.
 function tyListRepKind(ty: i32, rowSlot: i32): VKind | null {
@@ -330,8 +266,8 @@ export function emptyArrHoleKind(exprIx: i32): VKind | null {
 // scalar name, and a bare scalar is not a ref-list key: matching one would be a coincidence.
 function tyPrimLeafElem(ty: i32) { tyPrimLeafElemName(ty) != null }
 
-// The list build code (`LBK_*`) a list `VKind` + its ref-list ROW demand, the alphabet
-// `tyAnnRefListKind` produces from an ANNOTATION node. `0` (the i32-list default) for every
+// The list build code (`LBK_*`, the `ListBuild.lbKind` alphabet) a list `VKind` + its ref-list
+// ROW demand. `0` (the i32-list default) for every
 // kind that is not a distinct-backing list, which is also right for the i32-backed ones.
 export function listBuildKindOfVKind(kind: VKind | null, slot: i32) {
   // Exhaustive over `VKind` and `_`-less, `null` included: `0` is the i32 list's build code,
@@ -625,23 +561,6 @@ export function rlSlotIsKindList(slot: i32, want: i32): boolean {
 // A list literal's build: the `LBK_*` code and the ref-list row it builds at.
 export type ListBuild = { lbKind: i32, lbSlot: i32 }
 
-// The ref-list element kind a `LetDecl`'s ANNOTATION declares (`S[]` → 1, `N[]` → 2),
-// or `0` when it is not a ref-array annotation. Types an empty `[]` initializer
-// (a non-empty literal types itself from its elements).
-export function letAnnRefListKind(letIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    const k = tyAnnRefListKind(d.letType)
-    if k == LBK_I32_LIST {
-      // An un-annotated empty `[]` whose pushes infer a string element seeds the
-      // string-list kind, so the literal builds the string-list wrapper, not the i32 default.
-      if letInfStrListByUse(letIx) { return LBK_STR_LIST }
-    }
-    return k
-  }
-  LBK_I32_LIST
-}
-
 // The union-VARIANT table index a `LetDecl`'s annotation names (`const c: Cat`), or -1.
 export function letAnnVariantIdx(letIx: i32) {
   const d = nodeAt(letIx)
@@ -836,11 +755,6 @@ function tyKindOfDesc(tyIx: i32): i32 {
   -1
 }
 
-// TYPED-IR consumer: is the type the checker recorded for `tyIx` an `f64[]`? Lets the emitter
-// recognize an f64 list the SYNTACTIC predicates miss (e.g. an `f64[]`-returning call, which
-// `calleeRetKind` doesn't map to a list kind) without a bespoke per-position predicate.
-function tyIsF64Array(tyIx: i32) { tyKindOf(tyIx) == TK_F64_LIST }
-
 // The scalar list rep the recorded type `pin` of `exprIx` names, in `tyKindOf`'s vocabulary,
 // read off its descriptor `rd`. The i32 list is read off the unpinned type, and never for a
 // spread literal, whose rep is its source's rather than the type the literal adopted.
@@ -885,10 +799,3 @@ function arrayKindCode(ty: i32, rd: RepDesc): i32 {
   }
   -1
 }
-
-// ── i64-array typedness (the i64 sibling of the f64-array family) ───────────────
-
-// Mirrors the f64 predicates over the i64-list rep (code 20, wrapper `il64TypeIdx`). The
-// typed-IR fast path carries annotated cases; the syntactic fallback covers a
-// monomorphized body whose nodes have no recorded type.
-function tyIsI64Array(tyIx: i32) { tyKindOf(tyIx) == TK_I64_LIST }
