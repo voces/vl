@@ -11090,3 +11090,30 @@ the stack did, the emitter lowers from `nodeTy`. (3) The identifier narrowing st
 into `npKeys`: an identifier is a zero-length path keyed on its declaration. (4) Slice 3 lands
 after the hole STORAGE types (8 files) have a read-only instance-of-storage query. Keeping
 `narrowVariantFor` for those groups was refused: it would be a second producer of the fact.
+
+## One lexical binder writes every identifier's declaration (B0 ruling, aa0c)
+
+Before B1b moves the narrowing store to (decl, suffix) keys, one walk per module, ahead of
+`checkProgramPass`'s checking, writes `identDeclOf` for every `Ident`: module bindings first, so a
+forward function resolves, then nested frames, with the D3608 local-function rule. A narrowing is
+not a binding. The scope-stack resolution the checker does as it goes is a second producer of the
+same fact, and it is late: in the B1b `placeOf` census 56,482 `placeKeyOf` calls read an
+`identDeclOf` not yet written, and 74% of the lagging cases are walk order (a lag of at most one).
+Fixing the walk order site by site would keep
+two producers, so the binder replaces them. It lands as an audit PR, where the binder writes and
+`identResolve` only compares, then a deletion PR. The audit makes every mismatch visible before
+any resolver goes, and the deletion pays back the audit's check fuel. A `for a, b in xs`
+second variable gets its own decl at parse, as its own slice before the deletion, because a
+decl shared by two names forces a by-name pick; the audit may keep that pick, filed as a row
+whose fix is the parse change. A refused match-arm decl keeps the binder's lexical answer.
+
+## A fresh record converts at one delivery point (s12 ruling)
+
+There is no record→record converting copy: a record is a shared reference (D14532). A FRESH
+record delivered into a union arm whose field widths differ is built there by one producer at the
+`ExpCtx` delivery point, with `emitStructExprAsVariantBox` as copy plus box. Every other width
+patch for that delivery goes, not gated: `recNullWidened`'s i32→i64 allowance (D8302) claimed a
+field read narrows back exactly, but nothing emitted that narrowing, and master ran only because
+`exprIsI64` read the adopted struct; the read site keeps the literal at its own row instead. The
+D81/D139 destination pin (`synthDstPinAnn`) is measured for deletion rather than given a guard,
+because a guarded pin is still a second producer of the destination's rep.
