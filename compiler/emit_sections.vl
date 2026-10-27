@@ -1675,14 +1675,13 @@ function promoMark(marks: i32[], ix: i32, val: i32) {
   0
 }
 
-// The cheap half of the safety predicate — the two clauses that read only this binding's own
-// declaration (the reachability clause is `computeGlobalPromotion`'s). P2: the cell kind is a
-// plain numeric scalar, for which `fbValtypeNullable`/`fbValtype` are the same byte, so a
-// start-fn local is a drop-in (a ref cell is nullable but would be a non-null local, not attempted here). P3: the binding has an initializer, since a promoted slot has no other way to get a value.
+// The cheap half of the safety predicate, reading only this binding's own declaration (the
+// reachability clause is `computeGlobalPromotion`'s). P2: the cell kind is a plain numeric
+// scalar, whose `fbValtypeNullable`/`fbValtype` are one byte, so a start-fn local is a drop-in
+// that starts at zero as the cell would, whether or not the binding has an initializer.
 function globalPromotable(gi: i32) {
   const d = nodeAt(globalStmts[gi])
   if d is LetDecl {
-    if d.letInit < 0 { return false }
     // A binding the export section publishes is a wasm global by contract.
     if globalIsExportTarget(gi) { return false }
     const ck = globalCellKind(globalStmts[gi])
@@ -1862,7 +1861,7 @@ function startWalkWindows(w0: i32, w1: i32) {
 
 // Decides, for every top-level binding, whether it lives in a cell or a start-function local,
 // and re-densifies the cell indices around the ones that leave. Runs once, at the top of
-// `emitModule`, after every arena-mutating pass. The safety predicate is P1 here plus P2/P3
+// `emitModule`, after every arena-mutating pass. The safety predicate is P1 here plus P2
 // in `globalPromotable` plus P4: P1 requires an existing top-level statement list (promotion never mints a start function); P4 requires every `Ident` spelling this name to sit inside the top-level region.
 export function computeGlobalPromotion() {
   gPromoInStart = false
@@ -1984,11 +1983,12 @@ function exportGlobalOfTarget(name: string): i32 {
   gi
 }
 
-// Does the binding at `globalStmts` position `gi` have its initializer run by the start
-// function? True for a non-constexpr init (zero-initialized in the cell, the start fn stores
-// the real value) and for a promoted binding (no cell at all, so init becomes the `local.set`
-// that gives the slot its value). `emitModule`'s `hasStart` count, `startFnDetectScratch`'s scan, `emitGlobalSection`'s cell arm, and `emitStartFnCode`'s merge loop must all agree on this.
+// Does the binding at `globalStmts` position `gi` have an initializer the start function
+// runs? True for a non-constexpr init (the start fn stores the zeroed cell's value) and for a
+// promoted binding's (it becomes the slot's `local.set`); false with no initializer. `emitModule`'s `hasStart` count, `startFnDetectScratch`'s scan,
+// `emitGlobalSection`'s cell arm, and `emitStartFnCode`'s merge loop must all agree on this.
 export function globalRunsInStartFn(gi: i32) {
+  if igLetInit(globalStmts[gi]) < 0 { return false }
   if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 { return true }
   globalIsNonConst(globalStmts[gi])
 }
@@ -9771,9 +9771,6 @@ function emitGlobalSection(ec: ExpCtx) {
       }
       const g = nodeAt(globalStmts[gi])
       if g is LetDecl {
-        if g.letInit < 0 {
-          return emitFail("emitProgram: module global has no initializer")
-        }
         if globalIsNonConst(globalStmts[gi]) {
           // A non-constexpr init (a `global.get`+`struct.get`, a reference to another global, a call,
           // etc.) cannot be a WasmGC constant expression. Declare the cell nullable and zero-init it;
