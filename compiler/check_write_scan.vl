@@ -49,6 +49,7 @@ import {
   hasNamedArgs,
   i32ToStr,
   nodeAt,
+  nodeChildrenPush,
   nodeSpineChildrenPush,
 } from "./ast"
 import { identDeclOf, sidLookup, sidOf, sidOfNode } from "./symbols"
@@ -107,6 +108,9 @@ let cwFrParentEpoch = -1
 let cwIxWanted = false
 
 export function cwFrameReset() {
+  cwLexStores = Map()
+  cwLexDone = Map()
+  cwLexBailed = Map()
   cwFrJoins = []
   cwFrRets = []
   cwFrameOf = []
@@ -956,6 +960,14 @@ export function cwFrameOfUse(ix: i32, nm: string): i32 {
   CW_FR_UNKNOWN
 }
 
+// Whether the name `nm` at `ix` is read from a function nested in the one that declares it, a
+// capture; false for a module binding, true where the frames do not model the binder.
+export function cwUseCaptures(ix: i32, nm: string): boolean {
+  if !cwFrameOfOpen(ix) { return true }
+  const fr = cwFrameResolve(cwFrameOf[ix], sidOf(nm))
+  fr != CW_FR_MOD && fr != cwFrameOf[ix]
+}
+
 // Whether the node `ix` has a frame to resolve a name from: the frame walk reached it. A node
 // it has no row for (a rewrite added it) answers the coarsest frame, as an unreached one does.
 function cwFrameOfOpen(ix: i32) {
@@ -1345,6 +1357,127 @@ export function cwFnValueWriteOf(nm: string, fr: i32, decl: i32): i32 {
     }
   }
   -1
+}
+
+// The functions the `let` node `bd`, binding `nm`, may hold: its initialiser and each `nm = v`
+// its own scope resolves to it, ascending; [-1] when one is not a function or a binder this
+// does not model shadows `nm`. Sees the block a name is declared in, which the frames do not.
+export function cwLetFnTargets(bd: i32, nm: string): i32[] {
+  const bad: i32[] = [-1]
+  const n = nodeAt(bd)
+  if !(n is LetDecl) || n.letInit < 0 { return bad }
+  const fr = cwFrameOfUse(bd, nm)
+  if fr == CW_FR_UNKNOWN { return bad }
+  const key = i32ToStr(fr) + "#" + nm
+  if !(cwLexDone.get(key) ?? false) {
+    cwLexDone.set(key, true)
+    cwLexBail = false
+    if fr == CW_FR_MOD {
+      for nd in P.nodes {
+        if nd is Program { cwLexSeq(nd.progStmts, nm, -1) }
+      }
+    } else if fr >= 0 && fr < P.nodes.length {
+      const f = nodeAt(fr)
+      if f is FuncDecl { cwLexWalk(f.fnBody, nm, -1) } else { cwLexBail = true }
+    } else {
+      cwLexBail = true
+    }
+    if cwLexBail { cwLexBailed.set(key, true) }
+  }
+  if cwLexBailed.get(key) ?? false { return bad }
+  const out: i32[] = []
+  if !cwFvAddValue(n.letInit, out) { return bad }
+  const none: i32[] = []
+  for v in cwLexStores[bd] ?? none {
+    if !cwFvAddValue(v, out) { return bad }
+  }
+  out
+}
+
+// By `let` node, the values its scope's `nm = v` writes store; by frame and name, whether that
+// frame has been walked, and whether the walk met a binder it does not model.
+let cwLexStores: Map<i32, i32[]> = Map()
+let cwLexDone: Map<string, boolean> = Map()
+let cwLexBailed: Map<string, boolean> = Map()
+let cwLexBail = false
+
+// Walks statements `xs` in order, `cur` the `let` of `nm` in scope (-1 for another binder).
+function cwLexSeq(xs: i32[], nm: string, cur: i32) {
+  let c = cur
+  for x in xs { c = cwLexWalk(x, nm, c) }
+  0
+}
+
+// Files each `nm = v` under node `ix` against the `let` it resolves to, starting from `cur`;
+// the binding in scope after `ix`.
+function cwLexWalk(ix: i32, nm: string, cur: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return cur }
+  const n = nodeAt(ix)
+  const kids: i32[] = []
+  let inner = cur
+  let after = cur
+  match n {
+    Block => {
+      cwLexSeq(n.blkStmts, nm, cur)
+      return cur
+    }
+    LetDecl => {
+      cwLexWalk(n.letInit, nm, cur)
+      if n.letName == nm { return ix }
+      return cur
+    }
+    FuncDecl => {
+      if n.fnName == nm { after = -1 }
+      for p in n.fnParams {
+        const pn = nodeAt(p)
+        if pn is Param && pn.parName == nm { inner = -1 }
+      }
+      if n.fnName == nm { inner = -1 }
+      cwLexWalk(n.fnBody, nm, inner)
+      return after
+    }
+    ForIn => {
+      cwLexWalk(n.fiIter, nm, cur)
+      if n.fiVar == nm || n.fiVar2 == nm { inner = -1 }
+      cwLexWalk(n.fiBody, nm, inner)
+      return cur
+    }
+    ForRange => {
+      cwLexWalk(n.frFrom, nm, cur)
+      cwLexWalk(n.frTo, nm, cur)
+      cwLexWalk(n.frStep, nm, cur)
+      if n.frVar == nm { inner = -1 }
+      cwLexWalk(n.frBody, nm, inner)
+      return cur
+    }
+    MatchExpr => {
+      // A payload binding enters an arm only once the match is desugared.
+      for b in n.matchBinds {
+        const bn = if b >= 0 { nodeAt(b) } else { null }
+        if bn is Block {
+          for st in bn.blkStmts {
+            const sn = nodeAt(st)
+            if sn is LetDecl && sn.letName == nm { cwLexBail = true }
+          }
+        }
+      }
+      nodeChildrenPush(ix, kids)
+    }
+    BinExpr => {
+      const l = nodeAt(cwPeel(n.binLeft))
+      if n.binOp == "=" && l is Ident && l.identName == nm && cur >= 0 {
+        const have = cwLexStores[cur] ?? []
+        have.push(n.binRight)
+        cwLexStores[cur] = have
+      }
+      nodeChildrenPush(ix, kids)
+    }
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | ErrExpr | Call | Paren | Param | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ImportDecl | Spread => {
+      nodeChildrenPush(ix, kids)
+    }
+  }
+  for k in kids { cwLexWalk(k, nm, cur) }
+  cur
 }
 
 // Every value stored into the binding (`nm`, `fr`): its `let` initialiser and the value of each

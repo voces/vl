@@ -2,7 +2,7 @@
 // node's type at the instance, and each call's closed bindings. Recording is live only at the
 // elaboration's own quiet depth, so a probe nested inside the body records nothing.
 
-import { FuncDecl, i32ToStr, nodeAt } from "./ast"
+import { FuncDecl, LetDecl, i32ToStr, nodeAt } from "./ast"
 import { inferQuiet, quietDepth } from "./check_cursor"
 import {
   constScopes,
@@ -27,13 +27,10 @@ import {
   TyVar,
 } from "./check_types"
 import { tyHasTyVar } from "./tyquery"
+import { i32ListHas } from "./listutil"
+import { nodeSrc } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
-import {
-  CW_FR_UNKNOWN,
-  cwFnValueTargets,
-  cwFrameOfUse,
-  fnDeclIx,
-} from "./check_write_scan"
+import { cwLetFnTargets, fnDeclIx } from "./check_write_scan"
 import { weDigits } from "./check_write_effects"
 import { hdBase, hdRowOf } from "./check_hole_pins"
 
@@ -435,6 +432,17 @@ function fnSetUnion(a: i32, b: i32): i32[] {
   ms
 }
 
+// Whether set `s` holds a function that declares type parameters: a `let` holding one keeps its
+// initializer's generic type, which a write to it is checked against.
+function fnSetHasGeneric(s: i32): boolean {
+  if s < 0 || s >= fnSets.length { return false }
+  for d in fnSets[s] {
+    const f = nodeAt(d)
+    if f is FuncDecl && f.fnTyParams.length > 0 { return true }
+  }
+  false
+}
+
 // Notes a value of function type `t` as one of function `d`, the declaration or lambda it reads.
 export function elabFnValNote(t: i32, d: i32) {
   if d < 0 || !elabFnValWanted(t) { return 0 }
@@ -462,9 +470,10 @@ export function elabFnIdOf(t: i32): i32 {
 
 // The type a join of function types `a` and `b` into `j` gives its value: `j` itself when both
 // carry one set, else a fresh index with `j`'s signature, holding the union when each side
-// carries a set and none when one side may be any function, so `j`'s own set is not widened.
+// carries a set and none when one side may be any function, so `j`'s own set is not widened. A
+// side that is no value yet (-1) leaves `j` as the other side made it.
 export function elabFnJoinTy(j: i32, a: i32, b: i32): i32 {
-  if j < 0 || j >= T.tys.length { return j }
+  if j < 0 || j >= T.tys.length || a < 0 || b < 0 { return j }
   const jf = T.tys[j]
   if !(jf is TyFunc) { return j }
   const sa = elabFnSetTy[a] ?? -1
@@ -494,14 +503,13 @@ export function elabFnJoinTy(j: i32, a: i32, b: i32): i32 {
 }
 
 // The set of every function the `let` node `bd`, binding `nm`, may hold: its initialiser and
-// each value written to it, read from the source; -1 when one of them is not a function.
+// each value its own scope writes to it, read from the source; -1 when one is not a function.
 function fnLetSetOf(bd: i32, nm: string): i32 {
   const have = fnLetSet[bd] ?? -2
   if have != -2 { return have }
   let s = -1
-  const fr = cwFrameOfUse(bd, nm)
-  if fr != CW_FR_UNKNOWN {
-    const ts = cwFnValueTargets(nm, fr)
+  const ts = cwLetFnTargets(bd, nm)
+  if ts.length == 0 || ts[0] >= 0 {
     const ms: i32[] = []
     for t in ts {
       let dup = false
@@ -531,6 +539,37 @@ export function elabFnLetMembers(bd: i32, nm: string): i32[] {
   const s = fnLetSetOf(bd, nm)
   if s < 0 { return none }
   fnSets[s]
+}
+
+// The type a `let` node `bd`, binding `nm` and inferred `t`, gives its reads: `t` carrying the
+// set of every function written to it as well as its initialiser's, as an `if`'s arms join.
+export function elabFnLetTy(bd: i32, nm: string, t: i32): i32 {
+  const n = nodeAt(bd)
+  if !(n is LetDecl) || n.letKw != "let" || t < 0 || t >= T.tys.length {
+    return t
+  }
+  const tf = T.tys[t]
+  if !(tf is TyFunc) { return t }
+  const s = elabFnSetTy[t] ?? -1
+  if s < 0 { return t }
+  if i32ListHas(fnLetVeto, bd) { return t }
+  const w = fnLetSetOf(bd, nm)
+  if w < 0 || w == s || fnSetHasGeneric(s) || fnSetHasGeneric(w) { return t }
+  const key = "let" + i32ToStr(bd) + "," + i32ToStr(t)
+  const memo = fnJoinMemo[key] ?? -1
+  if memo >= 0 && memo < T.tys.length { return memo }
+  const ps: i32[] = []
+  for p in tf.fnParamTypes { ps.push(p) }
+  const g: Ty = { fnParamTypes: ps, fnRet: tf.fnRet }
+  T.tys.push(g)
+  const fresh = T.tys.length - 1
+  elabFnSetTy[fresh] = fnSetIntern(fnSetUnion(s, w))
+  fnJoinMemo[key] = fresh
+  if !fnTagEtaRan {
+    fnLetWide.push(fresh)
+    fnLetWideAt.push(bd)
+  }
+  fresh
 }
 
 // The type node `ix` has in the running instance, while one is recorded, else the type the
@@ -599,9 +638,6 @@ export function fnTagCalls(): i32[] { fnTagCallIxs }
 // The set id call `ix` goes through, or -1.
 export function fnTagCallSetOf(ix: i32): i32 { fnTagCallSet[ix] ?? -1 }
 
-// The spelling of call `ix`'s parameter types.
-export function fnTagCallKeyOf(ix: i32): string { fnTagCallKey[ix] ?? "" }
-
 // Whether call `ix`'s members give it different results.
 export function fnTagCallSplits(ix: i32): boolean {
   fnTagCallSplit[ix] ?? false
@@ -623,6 +659,82 @@ export function fnTagSetOfTy(t: i32): i32 {
   elabFnSetTy[t] ?? -1
 }
 
+// Whether a value of type `t` holds one of two or more functions, chosen where it is made, none
+// of which declares type parameters.
+export function fnTagChoiceOfTy(t: i32): boolean {
+  const ds = fnTagMembers(fnTagSetOfTy(t))
+  if ds.length < 2 { return false }
+  for d in ds {
+    const f = nodeAt(d)
+    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+  }
+  true
+}
+
+// A choice delivered where a closed function type is expected is built there as a closure over
+// the value, chosen once, when its set is tagged: one check notes the sites, and the next builds
+// them (`fnTagEtaAgain`).
+let fnTagEscapes: i32[] = []
+let fnTagEtaSites: i32[] = []
+let fnTagEtaRan = false
+
+// The widened `let` types of this check and their `let` nodes; the `let`s whose widened set the
+// decision left untagged, which the next check gives their initialiser's type.
+let fnLetWide: i32[] = []
+let fnLetWideAt: i32[] = []
+let fnLetVeto: i32[] = []
+
+// Forgets the sites of an earlier program; once per `checkProgram`.
+export function fnTagEtaReset() {
+  fnTagEtaSites = []
+  fnTagEtaRan = false
+  fnTagEscapes = []
+  fnLetWide = []
+  fnLetWideAt = []
+  fnLetVeto = []
+}
+
+// Notes delivery `site` of a choice for the decision that may build it.
+export function fnTagEscapeNote(site: i32) {
+  if !fnTagEtaRan { fnTagEscapes.push(site) }
+}
+
+// The deliveries noted this check, which the decision then forgets.
+export function fnTagEscapesTake(): i32[] {
+  const out = fnTagEscapes
+  fnTagEscapes = []
+  out
+}
+
+// Whether delivery `site` is built as a closure over its value.
+export function fnTagEtaAt(site: i32): boolean {
+  fnTagEtaRan && i32ListHas(fnTagEtaSites, site)
+}
+
+// Asks for delivery `site` to be built; true when it is new.
+export function fnTagEtaWant(site: i32): boolean {
+  if fnTagEtaRan || i32ListHas(fnTagEtaSites, site) { return false }
+  fnTagEtaSites.push(site)
+  true
+}
+
+// Whether `t` is the type a `let` written with other functions than its initialiser gives its reads.
+export function fnLetIsWide(t: i32): boolean { i32ListHas(fnLetWide, t) }
+
+// Whether the program is checked once more, at most once: to build the sites asked for, or to
+// give a `let` whose widened set stayed untagged its initialiser's type.
+export function fnTagEtaAgain(): boolean {
+  if fnTagEtaRan { return false }
+  let i = 0
+  while i < fnLetWide.length && i < fnLetWideAt.length {
+    if !fnTagTyIsTagged(fnLetWide[i]) { fnLetVeto.push(fnLetWideAt[i]) }
+    i = i + 1
+  }
+  if fnTagEtaSites.length == 0 && fnLetVeto.length == 0 { return false }
+  fnTagEtaRan = true
+  true
+}
+
 // The members of set `s`, ascending.
 export function fnTagMembers(s: i32): i32[] {
   const none: i32[] = []
@@ -640,7 +752,9 @@ export function fnTagTyIsTagged(t: i32): boolean {
 export function fnTagSetIsTagged(s: i32): boolean { fnTagged[s] ?? false }
 
 // The member whose id leaf node `ix` emits, or -1.
-export function fnTagLeafId(ix: i32): i32 { fnTagLeaf[ix] ?? -1 }
+export function fnTagLeafId(ix: i32): i32 {
+  fnTagLeaf[ix] ?? (fnTagLeaf[nodeSrc[ix] ?? -1] ?? -1)
+}
 
 // The direct calls call `ix` dispatches between, one per member in set order; [] when its set
 // is not tagged.
@@ -679,6 +793,22 @@ export function fnTagRetIsTagged(d: i32): boolean { fnTagRet[d] ?? false }
 // Records the member calls `arms` call `ix` dispatches between.
 export function fnTagArmsSet(ix: i32, arms: i32[]) {
   fnTagArms[ix] = arms
+  0
+}
+
+// Records call `nc`, an instance's copy of tagged call `tpl`, as dispatching between `arms`.
+export function fnTagCallCopy(nc: i32, tpl: i32, arms: i32[]) {
+  const s = fnTagCallSetOf(tpl)
+  if s < 0 { return 0 }
+  const none: i32[] = []
+  fnTagCallNote(
+    nc,
+    s,
+    fnTagCallKey[tpl] ?? "",
+    fnTagCallSplit[tpl] ?? false,
+    fnTagCallRs[tpl] ?? none,
+  )
+  fnTagArms[nc] = arms
   0
 }
 

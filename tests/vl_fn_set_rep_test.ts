@@ -1,13 +1,13 @@
-// A FUNCTION SET THAT NEEDS NO DISPATCH KEEPS THE CLOSURE REPRESENTATION — D3975.
+// A FUNCTION SET THAT IS NEVER CALLED THROUGH KEEPS THE CLOSURE REPRESENTATION — D3975.
 //
-// A set of un-annotated functions is lowered to an i32 member id only when a call through it
-// dispatches on which member it holds. A set that is delivered to a declared function type,
-// stored in a list, or only ever called at one type must cost exactly what it did before the
-// id lowering existed. This pins that by building each such program against the same program
-// with the selector's result annotated as a function type, which forces the closure, and
-// requiring the two modules to be BYTE-IDENTICAL and to call through the table. A program that
-// does dispatch is the control: it must make no indirect call, or the check is not seeing the
-// lowering.
+// A set of un-annotated functions is lowered to an i32 member id only when a call goes through
+// it, and that call then calls each member directly, at one call type or at several. A set that
+// is only delivered to a declared function type or stored in a list must cost exactly what it
+// did before the id lowering existed. This pins that by building each such program against the
+// same program with the selector's result annotated as a function type, which forces the
+// closure, and requiring the two modules to be BYTE-IDENTICAL and to call through the table.
+// Programs that call through the set are the controls: they must make no indirect call, or the
+// check is not seeing the lowering.
 //
 // GATING: needs the built binary, the seed and binaryen (`node_modules`). A missing
 // prerequisite self-ignores rather than fails, so read the suite's IGNORED COUNT.
@@ -41,10 +41,14 @@ const BODIES: Record<string, string[]> = {
     "print(fs[0](3))",
     "print(fs[1](3))",
   ],
-  calledAtOneType: ["const g = sel(false)", "print(g(3))"],
 };
-// Called at two types, so only the un-annotated spelling type-checks.
-const CONTROL = ["const g = sel(false)", "print(g(3))", "print(g(2.5))"];
+// Called through the set at one type and at two; only the un-annotated spelling of the second
+// type-checks. A call through a set calls each member directly whatever the call count or set
+// size, so calledAtOneType dispatches by design and is graded with the controls, not the bodies.
+const CONTROLS: Record<string, string[]> = {
+  calledAtOneType: ["const g = sel(false)", "print(g(3))"],
+  calledAtTwoTypes: ["const g = sel(false)", "print(g(3))", "print(g(2.5))"],
+};
 
 const build = async (dir: string, name: string, lines: string[]): Promise<Uint8Array> => {
   const src = `${dir}/${name}.vl`;
@@ -90,9 +94,11 @@ Deno.test({
           throw new Error(`${name}: want a call through the closure, got no indirect call`);
         }
       }
-      await build(dir, "control", [...MEMBERS, ...sel(false), ...CONTROL]);
-      const n = await indirectCalls(dir, "control");
-      if (n !== 0) throw new Error(`control: want a dispatch with no indirect call, got ${n}`);
+      for (const [name, body] of Object.entries(CONTROLS)) {
+        await build(dir, name, [...MEMBERS, ...sel(false), ...body]);
+        const n = await indirectCalls(dir, name);
+        if (n !== 0) throw new Error(`${name}: want a dispatch with no indirect call, got ${n}`);
+      }
     } finally {
       Deno.removeSync(dir, { recursive: true });
     }
