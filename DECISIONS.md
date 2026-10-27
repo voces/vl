@@ -11046,3 +11046,47 @@ and never by name or path key, and reset with the per-check node facts. The emit
 rebuild it by walking the place: that walk is the stack under another name, and the stack's
 place key already missed reads the checker proves (18 over 5,707 fixtures, #4965). Two writers of
 one fact disagree exactly where one of them has a hole.
+
+## Literal widening is part of a literal type's identity (ruling, D14540)
+
+`mkLitTy` interns on (kind, text, widening), so a fresh literal and its regular twin are two
+types, as in TypeScript, and `tySame` by arena index agrees with `tyEq` by kind and text. The
+`wideLitTyIxs` side table is deleted, and `litRegularTy` replaces the `litTySame` comparator.
+Interning on (kind, text) alone was tried and broke the L2 build (`TokKind` widened) and three
+`runs`: widening decides what a literal may become, so a key that drops it merges two types that
+behave differently. Two equality relations that disagree about one pair are a second producer of
+"same type".
+
+## An array-new-default element is a body-scoped inference variable (ruling, D14492)
+
+The element of `__array_new_default__` (`aElem = -1`, pinned in place) becomes an inference
+variable in mint's substitution store, scoped to the declaring body. It is not a `?` parameter
+hole, and not a `Ty` variant pointing into a row, which was rejected. The peeked `i32` that
+`arrDefOperandElemPeek` and `asgReadElemPin` record as the read's type is a snapshot that goes
+stale against the final row. Deferred until mint exists.
+
+## Each fresh record delivery builds at its own destination (ruling)
+
+A fresh record delivered into a union destination is built at that destination's rep, so
+`e1.v / 2` is 1. The fixture's 1.5 was a clause-1 wrong value, from reading the built rep where
+the checker's type says otherwise. The checker type of the position is the producer; a delivery
+does not inherit another delivery's rep.
+
+## The mint store is a substitution keyed on (scope, var) (design, a4cf)
+
+Two scopes: the instance scope holds `?` holes and `T`; the declaring-function scope holds
+body-local variables, keyed by that function's node. A lookup in an instance falls back to its
+declaration's scope. One resolver, `nodeTyInOf`, answers both. A solution that mentions `T`
+lives in the instance scope, because it differs per instance and a decl-scope entry would be
+shared by all of them.
+
+## Step 6 slice 3: one scrutinee read node per arm; `narrowVariantFor` stays refused (ruling)
+
+`narrowedFromTy` has one writer, `noteNarrowedRead`, called from `checkNodeDone` and
+`placeTyNote`. A 5,707-fixture compare left 20 differing files, with these answers. (1) The match
+desugar shares one scrutinee node across arms and per-node facts are wrong there, so each arm
+reads its own node, still evaluated once (#4969, #4975). (2) Where the checker narrows more than
+the stack did, the emitter lowers from `nodeTy`. (3) The identifier narrowing store is unified
+into `npKeys`: an identifier is a zero-length path keyed on its declaration. (4) Slice 3 lands
+after the hole STORAGE types (8 files) have a read-only instance-of-storage query. Keeping
+`narrowVariantFor` for those groups was refused: it would be a second producer of the fact.
