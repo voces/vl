@@ -904,6 +904,64 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 - **Increment 3, slice 3b: a demanded instance settles its own lambda kids, under one hole spelling (#4830).** `elabSettle` checks every instance a demand enqueues, from `elabRun` and from `elabDemandFrom`. `paramHoleName` keys an anonymous lambda on its node (`?#L<d>.<i>`) at every stage, so emission's `__lambda_N` rename no longer forks a hole key, and the two bridge readers (`holeParamDecl`'s `own = ""`, `fn_flow_shadow`'s `ffHoleName`) are deleted. Binding fallbacks 9 → 7 (both `lamret` fallbacks gone); identity difftree 0 differ; seed +280 bytes. The root-seeded instance stays until `elabDemandFrom`'s reached-at-two-instances test and template-body emission stop reading it.
 - **Step 6, slice 1: a narrowed identifier read unboxes at the checker's type (#4831; D2453, D3507, D3811, D12102 closed).** `emitIdentNode`, list-op receivers, the four classifier rungs and the value-site readers ask `identReadAtomKindAt` instead of the emitter's narrowing stack, once per read and shared by every reader; the `??` desugar, an assignment's re-read and a type-guard operand now produce typed reads. 897 cells in 9 classes move toward `runs`, none lost. D2451 moves from silently wrong to `loads then traps`: the remaining defect is the checker's. Seed +3,160 bytes, diderven check fuel +0.99%, scaling `narrowed module bindings` 2.470 (bar 2.5).
 - **Container adoption, slice 3: a `Map()` of record lists adopts its delivery, and the list binding its values came from follows (#4832).** Map adoption peels one list level (`recAdPushMapDecl`), so `c[k] = lv` beside a same-shape record type builds at the declared row, and the direct spelling `const m2: {[string]: Circle[]} = c` runs where it was an emit reject. The emitter's `letMapDestShape` name scan and its `lmd*` index are deleted; `letMapShapeOf` reads the checker's stamp. Seed −2,494 bytes. (`tests/cases/maps/map-of-lists-adopts-through-list-binding.vl`)
+- **Step 6, family 2: a narrowed field or element read unboxes at the checker's type (#4835).** 23 corpus classes move to `runs` (#4838 records them).
+- **Step 4, slice 1: a function value carries its member set, and an if/match join of two sets is typed apart (#4836).** `fnSetOf` is a side table on `TyFunc`.
+- **A record literal's row is asked per instance (#4837, #4847; D3036, D3038, D10933, D13962 closed).** Rows are minted at each instance's elaboration type.
+- **Increment 3, D1: mono reads the checker's instance at the adopted rep (#4839).** An instance's elaboration is spelled at the type variables its declaration reads (#4843).
+- **Step 4, slice 2: a re-pointed `let`'s member set is read by `holeLetJudge` (#4840).** It lands without the fresh read head (D7141).
+- **A narrowed list or map read unboxes at the checker's type (#4841).** Diderven build fuel +4.2%.
+- **Step 4, slice 4: a return join of two function sets is typed apart, and the hole judges read a call result's set (#4842).**
+- **A record literal is adopted at the join, comparison or return that delivers it (#4844).**
+- **A labelled block's value carrier is typed as the join of its exits (#4845).**
+- **A generic return join keeps its type-parameter list-literal member apart at every pin (#4846; D13963 closed).**
+- **A `let`'s declaration node records the type it binds (#4848), and so does a declaration a rewrite synthesizes (#4851; D4884 closed).** Declaration/storage agreement 43.3% → 98.1%.
+- **A `null[]` member of a list union rides the `(boolean | null)[]` list's arm (#4849; D13980, D13981, D13982, D13964 closed).** `is null[]` and `is string[]` over shared-tag lists test element-wise.
+- **Step 4, slice 5: a call through a finite function set dispatches on the member it holds (#4850).** A set's rep is an i32 function id; delivery to a declared function type keeps the closure rep. D13740's direct-call spelling runs.
+- **A record field's un-annotated function is judged at the callee's call of that field (#4852).**
+- **Step 5b, slice 1: a list literal is built at the union member the checker stamps on it (#4853; D2166, D2797, D2888, D2889 closed).**
+- **An if-join of a list literal and a type parameter's list takes the open side in either order (#4855; D14000 closed).** A generic if-join re-checks at each pin whatever kind its kept-apart join is (#4856).
+- **Step 5b, slice 2: an un-annotated list binding takes its union list from the checker, and the emitter's destination lookahead is deleted (#4857).** Compiler +183/−1,182; D2750 and D2923 run.
+- **An instance's if-join and record-literal rows read its own rep type (#4858).** A rewrite-minted annotation is read at the instance's type-parameter bindings (#4859; D14080, D3346 closed).
+- **An open argument at a hole parameter pins at its frame or elaboration type, never the cascade's i32 floor (#4860).**
+- **`repOfTy` is the one storage-rep answer and `boxTagOfTy` the one box-tag code (#4862).** Compiler +352/−471.
+- **A deduplicated record shape records its exact type against its row (#4865; D3914, D3440, D4711 closed).**
+- **A list beside a union join is kept apart as it is beside a list (#4867; D14083 closed).** A list literal built at a list destination is not re-delivered into its elements' join (#4868; D13970, D9534 closed).
+- **A generic body's record literal is adopted at its template destination (#4870; D14081 closed).** A match joining lists registers its list union as an if does (#4871; D14085 closed).
+- **An instance's literals read the rep its own re-check stamped (#4873; D10934 closed), and a literal argument reads its parameter from the call's instance (#4876; D14120 closed).** The emitter's forwarder thread is deleted.
+- **A box into a union refuses when two members share a box tag `is` cannot tell apart (#4875).**
+- **A `$fnsig` token is `repOfTy`'s kind and `repSlotOfKind`'s slot (#4877).** Compiler −977/+227.
+- **A closed elaboration pins a hole parameter at its alias, union row or declared record name (#4878; D2946 closed).**
+- **A synthesised annotation carries the spelling tree of the type it names (#4879), and so does a synthesised TypeRef (#4889).**
+- **A list literal nested in a spread is built at its holder's element (#4880), and a spread's plain run and a variadic push's run at the list holding them (#4884; D2971 closed).**
+- **A loop's break values join by the if-and-match rule, through the one join producer (#4881; D14086, D14087 closed).**
+- **Each instance builds a literal at the rep its own check stamped, function-typed fields included (#4882; D14161, D13967 closed).**
+- **A recursive type and each unrolling of it intern as one row (#4883; D3791 closed).**
+- **A ref-typed `let` with no initializer is a nullable wasm local read through `ref.as_non_null` (#4885; D3242 closed).**
+- **A rewritten union test or annotation names its member by a spelling tree, not a string (#4886).**
+- **A never arm is served by the union and variant coercers' floor, and the per-walk guards are deleted (#4887, #4890).** One predicate decides whether a tail is a value or never.
+- **A generic argument reads its pin from its closed type before the binding and rep rungs (#4888; D14200, D3334, D3366, D3952, D10330 closed).** A closed function-typed argument pins from its type (#4892).
+- **A module-scope `let` with no initializer gets a nullable zero cell (#4891; D14281, D2020, D2655, D3372 closed), guarded at the statement after which every path has assigned it (#4897; D14360 resolved).**
+- **A null-typed callee is dead, and list elements adopt as their list (#4893; D13971 closed).**
+- **`repOfTy` answers `null`, recursive aliases, variant twins by shape and generic-application union members (#4894; D2563, D3526, D4567 closed).** `repSlotOfKind` answers a Set's shape and a function-valued or newtype map value's slot (#4900).
+- **A join's tails are delivered to its declared destination before it joins (#4895; D2788 closed).**
+- **A list literal's build pair is read off its closed type's rep (#4896; D14220, D14020 closed).**
+- **One rule decides whether a path ends, and `never` is spellable in every result position (#4898; D1971, D1973, D2025, D2026 closed).** Return totality no longer accepts every `while true`.
+- **A list literal's destinations record one list type (#4899).** A literal binding of several record shapes adopts its record-list destination (#4901; D14222, D14224 closed).
+- **Record literals build at the checker's fact, and the destination walk is deleted (#4902).** Compiler −2,470. One producer serves the fresh literals a function returns (#4904; D14223, D14382, D14383, D14384 closed).
+- **Check-skip: a write summary memoised mid-check is dropped when the check ends (#4906; D14460 closed), and a summary on a call-graph cycle settles per component (#4909).**
+- **A `Map()` call builds at the type the checker stamped on it (#4907; D14226 closed), and so does a list literal or constructor (#4910; D14225 closed).** `ExpCtx` loses `mapSlot`, `listKind` and `listSlot`.
+- **A local's cell is read from one binding type (#4908; D2443, D2452, D2594, D3354, D3392, D3490, D4562, D14440 closed), taken at the instance type inside an instance (#4913).**
+- **A generic function named at a closed function type is built at the checker's stamp, as an identifier (#4911) and as an element, field or return (#4915).**
+- **A list-union rewrite's element chain reads its arms at the instance (#4914; D3357 closed).**
+- **A delivery into a pending destination adopts through one origin-follow (#4916), and a chain of `Map()` bindings settles in one round at any depth (#4920; D14506 closed).**
+- **Check-skip: the served-ambient guard asks only what a check consumed (#4917).** A banked write question names its asker (#4923), a banked answer keeps only the parts a narrowing test could hit (#4926), and stage 0 declines only when a moved ambient statement meets a served module (#4930). 27 of 30 replayed commits are served.
+- **Every null but the three niches is `ref.null none`, and `ExpCtx` loses its ref-null seeds (#4919; D2964, D3243 closed).** Compiler −758.
+- **An annotated read pins the element of the container it reads, map or list (#4921; D14507 closed).** A list-returning function serves every call site that lands where one does (#4922; D14508 closed).
+- **An anonymous arm of an inferred union finds its row by shape (#4924; D14511 closed).**
+- **A numeric literal's width is its own checker type (#4927; D3418, D4877 closed).** The `ExpCtx` width seeds are deleted; #4928 recovers 82% of the check-fuel cost.
+- **A ref-list row is minted and found by its rep key, and layout twins share one row (#4929).**
+- **A value holding a kept function's result is stamped with the type it is built as (#4931).**
+- **A negated number literal is a literal at every check that asks, and a returned record's literal fields must fit (#4932; D14485, D14486 closed).** Every number literal minted after check carries its type (#4933).
 - **Hoisted view accessors `getF32At`/`setF32At`/`getI32At`/`setI32At` (#1890).** 3.23x on the six-column kernel, with every bounds trap intact.
 - **The `Buffer` linear-memory tier (P0.1–P0.4).** A load/store width matrix, bulk memory ops, reinterpret casts, float/int opcode intrinsics, and typed views over `Buffer` (`f32view`/`i32view`, `x[i]`). `std:buffer` has a bump allocator with `bufferMark`/`bufferRelease`.
 - **`flat` record layouts.** Declarations with folded `T.size`/`T.field`, row-address bracket fusion (#1317), `T.size` for type parameters (#1329), and `u8`/`i8`/`u16`/`i16` flat fields (#2999).
