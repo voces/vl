@@ -43,7 +43,11 @@ import { tyHasTyVar } from "./tyquery"
 import { i32ListHas } from "./listutil"
 import { identDeclOf, nodeSrc } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
-import { cwLetFnTargets, fnDeclIx } from "./check_write_scan"
+import {
+  cwLetFnTargets,
+  cwLetSlotFnTargets,
+  fnDeclIx,
+} from "./check_write_scan"
 import { weDigits } from "./check_write_effects"
 import { hdBase, hdRowOf } from "./check_hole_pins"
 
@@ -409,6 +413,7 @@ let fnJoinMemo: {[string]: i32} = Map()
 // By re-pointed `let` node: the set of every function it may hold, or -1 when one is not a
 // function.
 let fnLetSet: {[i32]: i32} = Map()
+let fnSlotSet: {[i32]: i32} = Map()
 
 // Whether a value of function type `t` read now still decides `t`'s set. Only an open signature
 // needs one, since a closed one keys an instance by its spelling, and a quiet probe's types do
@@ -531,25 +536,7 @@ function fnLetSetOf(bd: i32, nm: string): i32 {
   if have != -2 { return have }
   let s = -1
   const ts = cwLetFnTargets(bd, nm)
-  if ts.length == 0 || ts[0] >= 0 {
-    const ms: i32[] = []
-    for t in ts {
-      let dup = false
-      for m in ms {
-        if m == t { dup = true }
-      }
-      if !dup {
-        ms.push(t)
-        let at = ms.length - 1
-        while at > 0 && ms[at - 1] > t {
-          ms[at] = ms[at - 1]
-          at = at - 1
-        }
-        ms[at] = t
-      }
-    }
-    if ms.length > 0 { s = fnSetIntern(ms) }
-  }
+  if ts.length > 0 && ts[0] >= 0 { s = fnSetIntern(fnSetSorted(ts)) }
   fnLetSet[bd] = s
   s
 }
@@ -592,6 +579,74 @@ export function elabFnLetTy(bd: i32, nm: string, t: i32): i32 {
     fnLetWideAt.push(bd)
   }
   fresh
+}
+
+// The type value type `t`, pinned into a slot of the container the receiver node `recv` names,
+// gives that slot: `t` joined with every function the binding's own scope writes into its slots,
+// as a list literal's elements join, so a read before a write sees the same slot type as one after.
+export function elabSlotJoinTy(recv: i32, t: i32): i32 {
+  if recv < 0 || t < 0 || t >= T.tys.length { return t }
+  let r = recv
+  let rn = nodeAt(r)
+  while rn is Paren {
+    r = rn.parInner
+    rn = nodeAt(r)
+  }
+  if !(rn is Ident) { return t }
+  const bd = identDeclOf(r)
+  if bd < 0 || !(nodeAt(bd) is LetDecl) { return t }
+  const tf = T.tys[t]
+  if !(tf is TyFunc) { return t }
+  const s = elabFnSetTy[t] ?? -1
+  if s < 0 || i32ListHas(fnLetVeto, bd) { return t }
+  const w = fnSlotSetOf(bd, rn.identName)
+  if w < 0 || w == s || fnSetHasGeneric(s) || fnSetHasGeneric(w) { return t }
+  const u = fnSetIntern(fnSetUnion(s, w))
+  if u == s { return t }
+  const key = "slot" + i32ToStr(bd) + "," + i32ToStr(t)
+  const memo = fnJoinMemo[key] ?? -1
+  if memo >= 0 && memo < T.tys.length { return memo }
+  const ps: i32[] = []
+  for p in tf.fnParamTypes { ps.push(p) }
+  const g: Ty = { fnParamTypes: ps, fnRet: tf.fnRet }
+  T.tys.push(g)
+  const fresh = T.tys.length - 1
+  elabFnSetTy[fresh] = u
+  fnJoinMemo[key] = fresh
+  if !fnTagEtaRan {
+    fnSlotWide.push(fresh)
+    fnSlotWideAt.push(bd)
+  }
+  fresh
+}
+
+// The set of every function the `let` node `bd`, binding `nm`, writes into its slots; -1 when
+// one is not a function or there is none.
+function fnSlotSetOf(bd: i32, nm: string): i32 {
+  const have = fnSlotSet[bd] ?? -2
+  if have != -2 { return have }
+  let s = -1
+  const ts = cwLetSlotFnTargets(bd, nm)
+  if ts.length > 0 && ts[0] >= 0 { s = fnSetIntern(fnSetSorted(ts)) }
+  fnSlotSet[bd] = s
+  s
+}
+
+// The ids `ts` without repeats, ascending.
+function fnSetSorted(ts: i32[]): i32[] {
+  const ms: i32[] = []
+  for t in ts {
+    if !i32ListHas(ms, t) {
+      ms.push(t)
+      let at = ms.length - 1
+      while at > 0 && ms[at - 1] > t {
+        ms[at] = ms[at - 1]
+        at = at - 1
+      }
+      ms[at] = t
+    }
+  }
+  ms
 }
 
 // The type node `ix` has in the running instance, while one is recorded, else the type the
@@ -747,10 +802,12 @@ let fnTagEscapes: i32[] = []
 let fnTagEtaSites: i32[] = []
 let fnTagEtaRan = false
 
-// The widened `let` types of this check and their `let` nodes; the `let`s whose widened set the
-// decision left untagged, which the next check gives their initialiser's type.
+// The widened `let` and slot types of this check and their `let` nodes; the `let`s whose widened
+// set the decision left untagged, which the next check gives their initialiser's type.
 let fnLetWide: i32[] = []
 let fnLetWideAt: i32[] = []
+let fnSlotWide: i32[] = []
+let fnSlotWideAt: i32[] = []
 let fnLetVeto: i32[] = []
 
 // Forgets every fact keyed by a type index, which a restart of the check re-mints from an empty
@@ -769,6 +826,8 @@ export function fnTyFactsReset() {
   fnJoinMemo = Map()
   fnLetWide = []
   fnLetWideAt = []
+  fnSlotWide = []
+  fnSlotWideAt = []
   0
 }
 
@@ -779,6 +838,8 @@ export function fnTagEtaReset() {
   fnTagEscapes = []
   fnLetWide = []
   fnLetWideAt = []
+  fnSlotWide = []
+  fnSlotWideAt = []
   fnLetVeto = []
 }
 
@@ -818,6 +879,11 @@ export function fnTagEtaAgain(): boolean {
     if !fnTagTyIsTagged(fnLetWide[i]) { fnLetVeto.push(fnLetWideAt[i]) }
     i = i + 1
   }
+  i = 0
+  while i < fnSlotWide.length && i < fnSlotWideAt.length {
+    if !fnTagTyIsTagged(fnSlotWide[i]) { fnLetVeto.push(fnSlotWideAt[i]) }
+    i = i + 1
+  }
   if fnTagEtaSites.length == 0 && fnLetVeto.length == 0 { return false }
   fnTagEtaRan = true
   true
@@ -844,18 +910,29 @@ export function fnTagListTy(t: i32): boolean {
   false
 }
 
-// Whether type `t` holds a tagged set's ids: such a list, or a record with a field that is one
+// Whether type `t` holds a tagged set's ids: such a list or map, or a record with a field that is one
 // or holds one, at most `depth` records deep.
 export function fnTagHoldsTy(t: i32, depth: i32): boolean {
   if depth <= 0 || t < 0 || t >= T.tys.length { return false }
-  if fnTagListTy(t) { return true }
   const o = T.tys[t]
-  if o is TyObj {
-    for f in o.objFieldTypes {
-      if fnTagTyIsTagged(f) || fnTagHoldsTy(f, depth - 1) { return true }
+  match o {
+    TyArray => {
+      return fnTagTyIsTagged(o.aElem)
+    }
+    TyObj => {
+      for f in o.objFieldTypes {
+        if fnTagTyIsTagged(f) || fnTagHoldsTy(f, depth - 1) { return true }
+      }
+      return false
+    }
+    TyMap => {
+      return fnTagTyIsTagged(o.mVal)
+    }
+    // No other kind holds ids as a container.
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return false
     }
   }
-  false
 }
 
 // Whether set `s` is tagged.
@@ -973,6 +1050,7 @@ export function elabCapReset() {
   fnSetByKey = Map()
   fnJoinMemo = Map()
   fnLetSet = Map()
+  fnSlotSet = Map()
   fnTagCallIxs = []
   fnTagCallSet = Map()
   fnTagCallKey = Map()

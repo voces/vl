@@ -366,9 +366,27 @@ function ftScan(
           }
         }
       }
+      // A written slot of a holder of the set's ids stores an id of it, whatever type the slot
+      // read had before the holder's first write pinned it.
+      const st = ftSlotStoreTy(x, p, s)
+      if st >= 0 {
+        const sn = nodeAt(p)
+        if sn is BinExpr && !ftJoinAt(sn.binRight, st, s, ds, leaves, ids) {
+          return false
+        }
+      } else if ftNulOfS(nodeTyIxOf(x), s) && !ftNulOk(x, p, s) {
+        // A map entry of the set's ids is read only through `??` or a `null` test.
+        return false
+      }
       // A list holding the set's ids is read by index only, outside an instance body.
       if ftHolds(x, s) && (ftInOpenFn(fn) || !ftHoldCtxOk(x, p, g, s)) {
         return false
+      }
+      // A value a slot method writes into the holder is an id of the set, as a store's is.
+      for v in ftSlotWrites(x, p, g, s) {
+        if !ftJoinAt(v, ftSlotTyOf(nodeTyIxOf(x), s), s, ds, leaves, ids) {
+          return false
+        }
       }
       const n = nodeAt(x)
       if n is ArrayLit && !ftLitJoin(x, n, s, ds, leaves, ids) { return false }
@@ -490,8 +508,13 @@ function ftNodeOk(
       if lpExitsOf(x).length == 0 { return false }
       return ftJoinOk(x, s, ds, leaves, ids)
     }
-    // A write gives the value it stores.
+    // A write gives the value it stores; `m ?? f` a map entry's id, else what `f` gives.
     BinExpr => {
+      if n.binOp == "??" {
+        if !ftNulOfS(nodeTyIxOf(n.binLeft), s) { return false }
+        return ftIsS(n.binRight, s)
+          || ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
+      }
       return ftIsStore(n) && ftIsS(n.binRight, s)
     }
     // An element read of a list holding the set's ids is one of them.
@@ -680,7 +703,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     Call => {
       if pn.callFn == x { return fnTagCallSetOf(p) == s }
-      return ftParamOfSet(pn, x, s)
+      return ftParamOfSet(pn, x, s) || ftSlotWriteArg(pn, x, s)
     }
     // A binding's annotation delivers the value to a declared function type, a closure.
     LetDecl => {
@@ -718,9 +741,13 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     // A write to a binding of the set stores one of its ids.
     BinExpr => {
+      if pn.binOp == "??" { return pn.binRight == x && ftIsS(p, s) }
       if !ftIsStore(pn) { return false }
       if pn.binLeft == x {
-        return x >= 0 && x < P.nodes.length && nodeAt(x) is Ident
+        if x < 0 || x >= P.nodes.length { return false }
+        const xn = nodeAt(x)
+        if xn is Index { return ftHoldKind(nodeTyIxOf(xn.idxArr), s, 4) == 3 }
+        return xn is Ident
       }
       return pn.binRight == x && ftIsS(pn.binLeft, s)
     }
@@ -771,7 +798,7 @@ function ftHolds(x: i32, s: i32): boolean {
 }
 
 // 1 when type `t` is a list whose element carries set `s`, 2 when it is a record with a field of
-// kind 1 or 2 within `depth` records, else 0.
+// kind 1 or 2 within `depth` records, 3 when it is a map whose value carries `s`, else 0.
 function ftHoldKind(t: i32, s: i32, depth: i32): i32 {
   if depth <= 0 || t < 0 || t >= T.tys.length { return 0 }
   const a = tyAt(t)
@@ -786,9 +813,137 @@ function ftHoldKind(t: i32, s: i32, depth: i32): i32 {
       }
       return 0
     }
-    // No other kind holds a set's ids as a container.
-    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+    TyMap => {
+      if fnTagSetOfTy(a.mVal) == s { return 3 }
       return 0
+    }
+    // No other kind holds a set's ids as a container.
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return 0
+    }
+  }
+}
+
+// Whether type `t` is `V | null` over a `V` of set `s`: what a map of the set's ids reads.
+function ftNulOfS(t: i32, s: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const a = tyAt(t)
+  a is TyNullable && fnTagSetOfTy(a.nInner) == s
+}
+
+// The slot type of the holder `x` indexes when `x` is the target of store `p` and is not itself
+// read at set `s` while the holder's slot is: a map entry, or a slot written before its holder's
+// first write pinned it. -1 otherwise.
+function ftSlotStoreTy(x: i32, p: i32, s: i32): i32 {
+  if x < 0 || p < 0 || ftIsS(x, s) { return -1 }
+  const pn = nodeAt(p)
+  if !(pn is BinExpr && ftIsStore(pn) && pn.binLeft == x) { return -1 }
+  const n = nodeAt(x)
+  if !(n is Index) { return -1 }
+  ftSlotTyOf(nodeTyIxOf(n.idxArr), s)
+}
+
+// The values call `g`, through field read `p` of holder `x` of set `s`, writes into the holder's
+// slots: what `xs.push(v...)` or `m.set(k, v)` stores. Empty for any other read.
+function ftSlotWrites(x: i32, p: i32, g: i32, s: i32): i32[] {
+  const none: i32[] = []
+  if p < 0 || g < 0 { return none }
+  const pn = nodeAt(p)
+  const gn = nodeAt(g)
+  if (
+    !(pn is Member && pn.memObj == x && gn is Call && parenPeelIx(gn.callFn) == p)
+  ) {
+    return none
+  }
+  if !ftSlotOp(pn, x, g, s) { return none }
+  if pn.memProp == "push" { return gn.callArgs }
+  if pn.memProp == "set" && gn.callArgs.length == 2 { return [gn.callArgs[1]] }
+  none
+}
+
+// The slot type of `ht`, a list or map type whose slot carries set `s`; -1 for any other type.
+function ftSlotTyOf(ht: i32, s: i32): i32 {
+  if ht < 0 || ht >= T.tys.length { return -1 }
+  const k = ftHoldKind(ht, s, 1)
+  if k != 1 && k != 3 { return -1 }
+  const h = tyAt(ht)
+  match h {
+    TyArray => {
+      return h.aElem
+    }
+    TyMap => {
+      return h.mVal
+    }
+    // ftHoldKind names a list or a map at kinds 1 and 3.
+    TyObj | TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// Whether `x` is the empty map `Map()`.
+function ftMapNew(x: i32): boolean {
+  if x < 0 { return false }
+  const n = nodeAt(x)
+  if !(n is Call) || n.callArgs.length > 0 || n.callFn < 0 { return false }
+  const f = nodeAt(n.callFn)
+  f is Ident && f.identName == "Map"
+}
+
+// Whether `p`, a field read of holder `x`, names a method a call reads or writes one slot of
+// the holder through: a map's entry methods, or a list's `push`.
+function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
+  if g < 0 || !(nodeAt(g) is Call) { return false }
+  const k = ftHoldKind(nodeTyIxOf(x), s, 4)
+  const op = p.memProp
+  if k == 1 { return op == "push" }
+  k == 3 && (op == "get" || op == "set" || op == "has" || op == "delete")
+}
+
+// Whether argument `x` of call `c` is a value `m.set(k, v)` or `xs.push(v)` stores into a
+// holder of set `s`.
+function ftSlotWriteArg(c: Call, x: i32, s: i32): boolean {
+  const f = parenPeelIx(c.callFn)
+  if f < 0 { return false }
+  const fn = nodeAt(f)
+  if !(fn is Member) { return false }
+  const k = ftHoldKind(nodeTyIxOf(fn.memObj), s, 4)
+  if k == 1 && fn.memProp == "push" { return i32ListHas(c.callArgs, x) }
+  k == 3 && fn.memProp == "set" && c.callArgs.length == 2 && c.callArgs[1] == x
+}
+
+// Whether node `x`, of `V | null` over set `s` and the child of `p`, is a map entry read where
+// only `??` or a `null` test sees it. A binding of an entry would hold a nullable id, which has no
+// rep yet, so it leaves the set untagged (D14432).
+function ftNulOk(x: i32, p: i32, s: i32): boolean {
+  if p < 0 { return false }
+  const n = nodeAt(x)
+  if n is Index {
+    if ftHoldKind(nodeTyIxOf(n.idxArr), s, 4) != 3 { return false }
+  } else if n is Call {
+    const f = parenPeelIx(n.callFn)
+    if f < 0 { return false }
+    const fn = nodeAt(f)
+    if !(fn is Member) || fn.memProp != "get" { return false }
+  } else if !(n is Paren) {
+    return false
+  }
+  const pn = nodeAt(p)
+  match pn {
+    Paren => {
+      return true
+    }
+    BinExpr => {
+      if pn.binOp == "??" { return pn.binLeft == x }
+      if pn.binOp == "==" || pn.binOp == "!=" {
+        const o = if pn.binLeft == x { pn.binRight } else { pn.binLeft }
+        return o >= 0 && nodeAt(o) is NullLit
+      }
+      return false
+    }
+    // Any other parent reads the entry as a value, `null` included, or binds it.
+    LetDecl | Block | Program | Call | RetStmt | IfStmt | MatchExpr | Param | WhileStmt | FuncDecl | ArrayLit | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | Index | ErrExpr | TypeRef | BreakStmt | ContinueStmt | FieldDef | FieldInit | TypeDecl | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread | LoopVar => {
+      return false
     }
   }
 }
@@ -801,7 +956,12 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, s: i32): boolean {
   if n is LetDecl { return n.letType < 0 }
   if n is FieldInit { return ftHolds(p, s) }
   if (
-    !(n is ArrayLit || n is ObjLit || n is Ident || n is Paren || n is Member)
+    !(n is ArrayLit
+      || n is ObjLit
+      || n is Ident
+      || n is Paren
+      || n is Member
+      || ftMapNew(x))
     || p < 0
   ) {
     return false
@@ -815,10 +975,12 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, s: i32): boolean {
       return true
     }
     Index => {
-      return pn.idxArr == x && ftHoldKind(nodeTyIxOf(x), s, 4) == 1
+      const k = ftHoldKind(nodeTyIxOf(x), s, 4)
+      return pn.idxArr == x && (k == 1 || k == 3)
     }
     Member => {
-      return pn.memObj == x && ftHoldKind(nodeTyIxOf(x), s, 4) == 2
+      if pn.memObj != x { return false }
+      return ftHoldKind(nodeTyIxOf(x), s, 4) == 2 || ftSlotOp(pn, x, g, s)
     }
     // The record literal holding the field is a holder itself, checked where it sits.
     FieldInit => {

@@ -111,6 +111,7 @@ let cwIxWanted = false
 
 export function cwFrameReset() {
   cwLexStores = Map()
+  cwLexSlotStores = Map()
   cwLexDone = Map()
   cwLexBailed = Map()
   cwFrJoins = []
@@ -1369,9 +1370,37 @@ export function cwFnValueWriteOf(nm: string, fr: i32, decl: i32): i32 {
 export function cwLetFnTargets(bd: i32, nm: string): i32[] {
   const bad: i32[] = [-1]
   const n = nodeAt(bd)
-  if !(n is LetDecl) || n.letInit < 0 { return bad }
+  if !(n is LetDecl) || !cwLexScopeOk(bd, nm) { return bad }
+  const out: i32[] = []
+  if !cwFvAddValue(n.letInit, out) { return bad }
+  const none: i32[] = []
+  for v in cwLexStores[bd] ?? none {
+    if !cwFvAddValue(v, out) { return bad }
+  }
+  out
+}
+
+// The functions the `let` node `bd`, binding `nm`, has written into its slots by `nm[k] = v`,
+// `nm.push(v)` and `nm.set(k, v)` in its own scope; [-1] when one is not a function or the
+// scope is not modelled.
+export function cwLetSlotFnTargets(bd: i32, nm: string): i32[] {
+  const bad: i32[] = [-1]
+  if !cwLexScopeOk(bd, nm) { return bad }
+  const out: i32[] = []
+  const none: i32[] = []
+  for v in cwLexSlotStores[bd] ?? none {
+    if !cwFvAddValue(v, out) { return bad }
+  }
+  out
+}
+
+// Walks the scope of the initialised `let` node `bd`, binding `nm`, once; false when it has a
+// binder the walk does not model.
+function cwLexScopeOk(bd: i32, nm: string): boolean {
+  const n = nodeAt(bd)
+  if !(n is LetDecl) || n.letInit < 0 { return false }
   const fr = cwFrameOfUse(bd, nm)
-  if fr == CW_FR_UNKNOWN { return bad }
+  if fr == CW_FR_UNKNOWN { return false }
   const key = i32ToStr(fr) + "#" + nm
   if !(cwLexDone.get(key) ?? false) {
     cwLexDone.set(key, true)
@@ -1388,18 +1417,28 @@ export function cwLetFnTargets(bd: i32, nm: string): i32[] {
     }
     if cwLexBail { cwLexBailed.set(key, true) }
   }
-  if cwLexBailed.get(key) ?? false { return bad }
-  const out: i32[] = []
-  if !cwFvAddValue(n.letInit, out) { return bad }
-  const none: i32[] = []
-  for v in cwLexStores[bd] ?? none {
-    if !cwFvAddValue(v, out) { return bad }
-  }
-  out
+  !(cwLexBailed.get(key) ?? false)
 }
 
-// By `let` node, the values its scope's `nm = v` writes store; by frame and name, whether that
-// frame has been walked, and whether the walk met a binder it does not model.
+// Whether node `e`, parentheses peeled, reads the binding the `let` node `bd` declares.
+function cwLexReadsDecl(e: i32, bd: i32): boolean {
+  const v = cwPeel(e)
+  if bd < 0 || v < 0 || v >= P.nodes.length { return false }
+  nodeAt(v) is Ident && identDeclOf(v) == bd
+}
+
+// Files value `v` as written into a slot of the `let` node `bd`.
+function cwLexSlotPush(bd: i32, v: i32) {
+  const have = cwLexSlotStores[bd] ?? []
+  have.push(v)
+  cwLexSlotStores[bd] = have
+  0
+}
+
+// By `let` node, the values its scope's `nm = v` writes store, and the values its slot writes
+// store; by frame and name, whether that frame has been walked, and whether the walk met a
+// binder it does not model.
+let cwLexSlotStores: Map<i32, i32[]> = Map()
 let cwLexStores: Map<i32, i32[]> = Map()
 let cwLexDone: Map<string, boolean> = Map()
 let cwLexBailed: Map<string, boolean> = Map()
@@ -1474,9 +1513,23 @@ function cwLexWalk(ix: i32, nm: string, cur: i32): i32 {
         have.push(n.binRight)
         cwLexStores[cur] = have
       }
+      if n.binOp == "=" && l is Index && cwLexReadsDecl(l.idxArr, cur) {
+        cwLexSlotPush(cur, n.binRight)
+      }
       nodeChildrenPush(ix, kids)
     }
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | ErrExpr | Call | Paren | Param | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ImportDecl | Spread | LoopVar => {
+    Call => {
+      const cf = if n.callFn >= 0 { nodeAt(n.callFn) } else { null }
+      if cf is Member && cwLexReadsDecl(cf.memObj, cur) {
+        if cf.memProp == "push" {
+          for a in n.callArgs { cwLexSlotPush(cur, a) }
+        } else if cf.memProp == "set" && n.callArgs.length == 2 {
+          cwLexSlotPush(cur, n.callArgs[1])
+        }
+      }
+      nodeChildrenPush(ix, kids)
+    }
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | ErrExpr | Paren | Param | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ImportDecl | Spread | LoopVar => {
       nodeChildrenPush(ix, kids)
     }
   }
