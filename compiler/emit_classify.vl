@@ -678,6 +678,7 @@ import {
   tyIsI32LeafElem,
   unRowOfKey,
 } from "./emit_rep"
+import { repSlotOfKind } from "./emit_rep_slot"
 import { nameFieldCodeTy } from "./emit_shape_intern"
 import {
   ALK_F64,
@@ -3715,11 +3716,48 @@ function letInitProjTyIsAtom(letIx: i32, fnIx: i32): boolean {
   false
 }
 
+// The type binding `letIx` holds inside `fnIx`: its annotation's, else its own.
+export function letBindTy(letIx: i32, fnIx: i32): i32 {
+  const d = nodeAt(letIx)
+  if d is LetDecl {
+    if d.letType >= 0 {
+      const at = nodeTyAt(d.letType, fnIx)
+      if at >= 0 { return at }
+    }
+  }
+  nodeTyAt(letIx, fnIx)
+}
+
+// Whether binding `letIx`'s cell is the rep of the type it holds: that type answers a rep,
+// and the binding is not a never-filled `null`, a literal-union atom or its `K | null` niche,
+// whose cells the binding's own spelling decides. A type holding a type variable names no
+// rep: the value's row is the one its initializer delivers.
+export function letBindRepClaims(letIx: i32, fnIx: i32): boolean {
+  if letIsNulNone(letIx, fnIx) { return false }
+  if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return false }
+  if letNulLitUnion(letIx, fnIx) { return false }
+  const ty = letBindTy(letIx, fnIx)
+  if ty < 0 || tyHasTyVar(ty) { return false }
+  repOfNodeAt(letIx, ty).rdCovered == 1
+}
+
+// The rep of binding `letIx`'s cell, read off the type it holds.
+export function letBindRep(letIx: i32, fnIx: i32): RepDesc {
+  repOfNodeAt(letIx, letBindTy(letIx, fnIx))
+}
+
+// The table slot of binding `letIx`'s cell, at its rep's kind.
+export function letBindRepSlot(letIx: i32, fnIx: i32): i32 {
+  const ty = letBindTy(letIx, fnIx)
+  repSlotOfKind(repOfNodeAt(letIx, ty).rdKind, ty)
+}
+
 // The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
 // annotation's kind through the shared annotation ladder, else the initializer's. The local
 // storage class's answer to what `globalCellKind` answers for a module global, kept here
 // because `emit_collect.vl` cannot be imported back into this file.
 export function letCellKind(letIx: i32, fnIx: i32): VKind {
+  if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
   const d = nodeAt(letIx)
   if d is LetDecl {
     if d.letType >= 0 { return vtKindOfType(d.letType) }
@@ -4899,6 +4937,9 @@ export function captureValKind(fe: i32, name: string): VKind {
       return vtKindOfType(bn.parType)
     }
     LetDecl => {
+      // The env field is the local's own cell, so it is read where the local's is.
+      const rpf = parentBindingFrameArenaOf(fe, name)
+      if letBindRepClaims(b, rpf) { return letBindRep(b, rpf).rdKind }
       if bn.letType >= 0 {
         const annK = vtKindOfType(bn.letType)
         // The env field must match the LOCAL's own cell, not re-derive from the annotation:
@@ -4980,6 +5021,8 @@ export function captureValStructIdx(fe: i32, name: string) {
       return annValtypeSlotOf(bn.parType)
     }
     LetDecl => {
+      const rpf = parentBindingFrameArenaOf(fe, name)
+      if letBindRepClaims(b, rpf) { return letBindRepSlot(b, rpf) }
       if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
       if bn.letInit >= 0 {
         // The owning frame as an arena index — the same conversion `captureValKind`'s
@@ -11873,7 +11916,8 @@ export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
       return nodeRepIsAtom(bn.parType, ownerFnIx)
     }
     LetDecl => {
-      return letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx)
+      if letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx) { return true }
+      return letBindRepClaims(bindIx, ownerFnIx) && letBindRep(bindIx, ownerFnIx).rdAtom == 1
     }
     // No other binding is a literal atom.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
