@@ -2412,8 +2412,8 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       return 0
     }
     if bn is Call && recAdParamListArgs(b, nonNulTyOf(dstTy)) { return 0 }
-    // A map's value is delivered as its map is, at the value's destination.
-    if recMapReadDeliver(p, dstTy) { return 0 }
+    // An element of a map or list is delivered as its container is, at the element's destination.
+    if recContainerReadDeliver(p, dstTy) { return 0 }
     if bn is Ident && recFreshDeclOf(b) < 0 { return 0 }
   }
   if e is Call {
@@ -4993,8 +4993,8 @@ export function recFitNarrowedFields(
 }
 
 // Whether a value `x` yields may be a record that already exists: a leaf of it (through `if`,
-// `match` and block tails) whose origin is not an object literal, `null`, or a value read from a
-// `Map()` binding that may still adopt the record it is delivered as.
+// `match` and block tails) whose origin is not an object literal, `null`, or an element read from
+// a map or list whose `Map()` bindings may still adopt the record it is delivered as.
 export function recJoinFixed(x: i32): boolean {
   const leaves: i32[] = []
   tailValueLeaves(x, leaves)
@@ -5002,7 +5002,7 @@ export function recJoinFixed(x: i32): boolean {
     const o = recOriginExpr(l)
     if o >= 0 && o < P.nodes.length {
       const e = nodeAt(o)
-      if !(e is ObjLit) && !(e is NullLit) && !recMapReadFresh(o) {
+      if !(e is ObjLit) && !(e is NullLit) && !recContainerReadFresh(o) {
         return true
       }
     }
@@ -5010,33 +5010,41 @@ export function recJoinFixed(x: i32): boolean {
   false
 }
 
-// Is `o` an element read of a map whose every value is built where it is delivered?
-export function recMapReadFresh(o: i32): boolean {
+// Is `o` an element read of a map or list whose every value is built where it is delivered?
+export function recContainerReadFresh(o: i32): boolean {
   const b = recIndexBase(o)
-  b >= 0 && recMapIsAt(b) && recMapDeliver(b, -1, 16, false)
+  b >= 0 && recContainerIsAt(b) && recContainerDeliver(b, -1, 16, false)
 }
 
-// Deliver `o`, an element read of such a map, as a `dstTy`: the map is delivered as a map of it,
-// and every `Map()` binding it may be adopts its part. False, adopting nothing, otherwise.
-export function recMapReadDeliver(o: i32, dstTy: i32): boolean {
+// Deliver `o`, an element read of such a container, as a `dstTy`: the container is delivered as
+// one holding it, and every `Map()` binding it may be adopts its part. False, adopting nothing,
+// otherwise.
+export function recContainerReadDeliver(o: i32, dstTy: i32): boolean {
   const b = recIndexBase(o)
-  if b < 0 || !recMapIsAt(b) || !recMapDeliver(b, -1, 16, false) {
+  if b < 0 || !recContainerIsAt(b) || !recContainerDeliver(b, -1, 16, false) {
     return false
   }
-  recMapDeliver(b, recContainerDst(b, dstTy), 16, true)
+  recContainerDeliver(b, recContainerDst(b, dstTy), 16, true)
 }
 
-// Is the container `b` a map?
-function recMapIsAt(b: i32): boolean {
+// Is `b` a map or a list?
+function recContainerIsAt(b: i32): boolean {
   const bt = nonNulTyOf(nodeTyIxOf(b))
-  bt >= 0 && bt < T.tys.length && tyAt(bt) is TyMap
+  if bt < 0 || bt >= T.tys.length { return false }
+  const c = tyAt(bt)
+  c is TyMap || c is TyArray
 }
 
 // Can every value the container `x` may be take the type it is delivered as: a `Map()`, a list
 // literal, or a `Map()` binding that may still adopt, reached through aliases, joins, element
 // reads, same-shape generic calls and calls of functions with no declared result. With `apply`,
 // each such binding adopts its part of `dst`, the container type `x` is delivered as.
-function recMapDeliver(x: i32, dst: i32, depth: i32, apply: boolean): boolean {
+function recContainerDeliver(
+  x: i32,
+  dst: i32,
+  depth: i32,
+  apply: boolean,
+): boolean {
   if depth <= 0 { return false }
   const p = cwPeelValue(x)
   if p < 0 || p >= P.nodes.length { return false }
@@ -5051,12 +5059,15 @@ function recMapDeliver(x: i32, dst: i32, depth: i32, apply: boolean): boolean {
     }
     const held = recHeldLit(p)
     if held < 0 { return false }
-    return recMapDeliver(held, dst, depth - 1, apply)
+    return recContainerDeliver(held, dst, depth - 1, apply)
   }
   if e is ArrayLit {
     const ed = if dst >= 0 { tyArrayElemIx(nonNulTyOf(dst)) } else { -1 }
     for el in e.arrElems {
-      if nodeAt(el) is Spread || !recMapDeliver(el, ed, depth - 1, apply) {
+      if (
+        nodeAt(el) is Spread
+        || !recContainerDeliver(el, ed, depth - 1, apply)
+      ) {
         return false
       }
     }
@@ -5066,26 +5077,26 @@ function recMapDeliver(x: i32, dst: i32, depth: i32, apply: boolean): boolean {
     const leaves: i32[] = []
     tailValueLeaves(p, leaves)
     for lf in leaves {
-      if !recMapDeliver(lf, dst, depth - 1, apply) { return false }
+      if !recContainerDeliver(lf, dst, depth - 1, apply) { return false }
     }
     return true
   }
   const co = recCoalesceOperands(p)
   if co.length == 2 {
-    return recMapDeliver(co[0], dst, depth - 1, apply)
-      && recMapDeliver(co[1], dst, depth - 1, apply)
+    return recContainerDeliver(co[0], dst, depth - 1, apply)
+      && recContainerDeliver(co[1], dst, depth - 1, apply)
   }
   const ib = recIndexBase(p)
   if ib >= 0 {
-    return recMapDeliver(ib, recContainerDst(ib, dst), depth - 1, apply)
+    return recContainerDeliver(ib, recContainerDst(ib, dst), depth - 1, apply)
   }
   const pa = recShapePassArg(p)
-  if pa >= 0 { return recMapDeliver(pa, dst, depth - 1, apply) }
+  if pa >= 0 { return recContainerDeliver(pa, dst, depth - 1, apply) }
   const fd = recInferredFnOf(p)
   if fd < 0 { return false }
   for lf in recFnValueLeaves(fd) {
     // A local the function also hands elsewhere is shared, so it is not built here.
-    if recLeafEscapes(lf) || !recMapDeliver(lf, dst, depth - 1, apply) {
+    if recLeafEscapes(lf) || !recContainerDeliver(lf, dst, depth - 1, apply) {
       return false
     }
   }
