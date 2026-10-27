@@ -8348,9 +8348,6 @@ function emitCoerceAtomPayload(
   } else if cak == 4 {
     if emitExprAsF64(body, exprIx, fnIx, ec) < 0 { return -1 }
   } else if cak == 5 {
-    const fc = expCtxHere(ec)
-    fc.wantF32 = true
-    expCtxApply(fc, ec)
     if emitExprAsF32(body, exprIx, fnIx, ec) < 0 { return -1 }
   } else {
     if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
@@ -9577,13 +9574,7 @@ function emitUnionEqOther(
   // becomes its member string (`emitStrValue`), which is the rep the box's string payload is
   // compared against. `emitStrValue` is `emitExpr` for everything that is already a string.
   if k == 2 { return emitStrValue(body, otherIx, fnIx, ec) }
-  if k == 5 {
-    const eqF32 = expCtxSwapF32(true, ec)
-    const eqRc = emitExprAsF32(body, otherIx, fnIx, ec)
-    expCtxSwapF32(eqF32, ec)
-    if eqRc < 0 { return -1 }
-    return 0
-  }
+  if k == 5 { return emitExprAsF32(body, otherIx, fnIx, ec) }
   emitExpr(body, otherIx, fnIx, ec)
 }
 
@@ -10825,12 +10816,7 @@ function emitOptChainDefault(
 ) {
   if code == FC_F64 { return emitExprAsF64(body, dIx, fnIx, ec) }
   if code == FC_I64 { return emitExprAsI64(body, dIx, fnIx, ec) }
-  if code == FC_F32 {
-    const chainF32 = expCtxSwapF32(true, ec)
-    const rc = emitExprAsF32(body, dIx, fnIx, ec)
-    expCtxSwapF32(chainF32, ec)
-    return rc
-  }
+  if code == FC_F32 { return emitExprAsF32(body, dIx, fnIx, ec) }
   emitExpr(body, dIx, fnIx, ec)
 }
 
@@ -16623,7 +16609,6 @@ function loopHoistOpen(
           row = hoistRowOfRecv(rep.idxArr, nm, fnIx)
         }
         if row >= 0 && lhLive[row] == 0 {
-          const savedHF32 = expCtxSwapF32(false, ec)
           if hoistRowIsStr(row) {
             // A raw string's header is `{backing, start, len}` — three reads, because a
             // view's element offset is `start + i` and its bound is `len`, neither
@@ -16648,7 +16633,6 @@ function loopHoistOpen(
             fbStructGet(wrapTy, 1) // field 1: len
             fbLocalSet(lhLen[row])
           }
-          expCtxSwapF32(savedHF32, ec)
           lhLive[row] = 1
           lhOpen.push(row)
           opened = opened + 1
@@ -16834,10 +16818,7 @@ function emitIndexNulScalarList(
 ): i32 {
   if emitExpr(body, nd.idxArr, fnIx, ec) < 0 { return -1 }
   fbRefAsNonNull() // (the `!= null` guard makes this safe)
-  const nslF32 = expCtxSwapF32(false, ec)
-  const nslRc = emitExpr(body, nd.idxIndex, fnIx, ec)
-  expCtxSwapF32(nslF32, ec)
-  if nslRc < 0 { return -1 }
+  if emitExpr(body, nd.idxIndex, fnIx, ec) < 0 { return -1 }
   if nsk == "nulstrlist" {
     emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
     fbArrayGet(mkArrIdx) // 0xfb 0x0b string backing
@@ -16892,14 +16873,7 @@ function emitIndexRefList(
     // recover non-null before `struct.get` (the `if t != null` guard makes this safe).
     if exprNullableRefArray(nd.idxArr, fnIx) { fbRefAsNonNull() }
   }
-  // The index is always i32 — every index arm here clears `ec.wantF32` around it, else
-  // a bare index literal emits as `f32.const`. This matters for an inner read `g[i][j]`
-  // over an `f32[][]`: the outer f32 read leaves `ec.wantF32` set while emitting this
-  // receiver, so the inner `[j]` would otherwise inherit a context that is not its own.
-  const rlIxF32 = expCtxSwapF32(false, ec)
-  const rlIxRc = emitExpr(body, nd.idxIndex, fnIx, ec)
-  expCtxSwapF32(rlIxF32, ec)
-  if rlIxRc < 0 { return -1 }
+  if emitExpr(body, nd.idxIndex, fnIx, ec) < 0 { return -1 }
   // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read. A list that may be
   // a view reads its element through the view's source (D3041).
   if rlHz >= 0 {
@@ -16982,11 +16956,7 @@ function emitIndexScalarList(
   if skHz < 0 {
     if emitExpr(body, nd.idxArr, fnIx, ec) < 0 { return -1 }
   }
-  // The index is always i32 (see `emitIndexRefList`).
-  const ixF32 = expCtxSwapF32(false, ec)
-  const ixRc = emitExpr(body, nd.idxIndex, fnIx, ec)
-  expCtxSwapF32(ixF32, ec)
-  if ixRc < 0 { return -1 }
+  if emitExpr(body, nd.idxIndex, fnIx, ec) < 0 { return -1 }
   // A list that may be a view reads its element through the view's source (D3028).
   const ixSv = svDstOfKind(ek)
   if ixSv >= 0 && skHz < 0 { return emitSvIndexRead(ek, ixSv) }
@@ -21871,17 +21841,6 @@ function widenClassifyExpr(exprIx: i32, fnIx: i32) {
   exprIx
 }
 
-// Emit `ix` with the three wide-scalar literal hints cleared, restoring them after: the
-// one home for "this emit's width is decided here, not by the position above it".
-// `ec.wantI64`/`ec.wantF32`/`ec.wantF64` are a property of one literal position, not the
-// subtree around it — left on, every integer literal inside (an array index, a map key, a `.slice` bound) takes the wide form while its own slot is still i32: `vl check` rc 0, invalid module.
-function emitExprWideCleared(body: u8[], ix: i32, fnIx: i32, ec: ExpCtx) {
-  const saved = expCtxClearWidths(ec)
-  const r = emitExpr(body, ix, fnIx, ec)
-  expCtxRestoreWidths(saved, ec)
-  r
-}
-
 // Whether the node at `ix` is an integer literal, or `-` applied to one (parens peeled).
 function numLitOrNegated(ix: i32): boolean {
   const n = nodeAt(ix)
@@ -21898,19 +21857,14 @@ function numLitOrNegatedLeaf(ix: i32): boolean {
 }
 
 // Emit the expression at `exprIx` as an i64 value: a bare integer literal lowers directly
-// as `i64.const` (`ec.wantI64` set), an expression that already yields i64 emits as-is, and
-// any other i32 source is emitted then sign-extended (`i64.extend_i32_s`). The literal peel
-// runs first so the other two arms can own their own width via `emitExprWideCleared`.
+// as `i64.const`, an expression that already yields i64 emits as-is, and
+// any other i32 source is emitted then sign-extended (`i64.extend_i32_s`). A literal or a
+// negated one takes the width this call names, whatever its own type: a box operand has none.
 export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   // Peel parens to find a bare literal, or a negated one, we can emit directly as i64.const:
   // a hex literal past I32_MAX is an i32 bit pattern, so widening it after would change it.
   const inner = unwrapParen(exprIx)
-  if numLitOrNegated(inner) {
-    const saved = expCtxSwapI64(true, ec)
-    const r = emitExpr(body, inner, fnIx, ec)
-    expCtxSwapI64(saved, ec)
-    return r
-  }
+  if numLitOrNegated(inner) { return emitSignedNumLitAt(inner, "i64") }
   const rw64 = asgRadixWidePrim(inner, fnIx)
   if rw64 != "" { return emitAsgRadixAs(body, inner, rw64, "i64", fnIx, ec) }
   if exprIsI64(widenClassifyExpr(exprIx, fnIx), fnIx) {
@@ -21918,13 +21872,13 @@ export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
     if njBoxWidens(exprIx, fnIx) {
       return emitNumUnionConvert(body, exprIx, 3, fnIx, ec)
     }
-    return emitExprWideCleared(body, exprIx, fnIx, ec)
+    return emitExpr(body, exprIx, fnIx, ec)
   }
   // A numeric union converts at the member it holds; anything else is an i32, sign-extended.
   if njWidensOut(exprIx, fnIx) {
     return emitNumUnionConvert(body, exprIx, 3, fnIx, ec)
   }
-  if emitExprWideCleared(body, exprIx, fnIx, ec) < 0 { return -1 }
+  if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
   fbI64ExtendI32S()
   0
 }
@@ -21953,16 +21907,11 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   }
   if exprIsF64(f64Cls, fnIx) { return emitExpr(body, exprIx, fnIx, ec) }
   // A bare int literal of any radix (optionally negated) re-encodes directly as `f64.const`
-  // under `ec.wantF64`, the rule a const-global init uses — exact, where converting the i32
+  // the rule a const-global init uses — exact, where converting the i32
   // bit pattern of `0xFFFFFFFF` would give -1. Checked before the i64 branch so a big
   // literal stays one `f64.const` too.
   const f64Inner = unwrapParen(exprIx)
-  if numLitOrNegated(f64Inner) {
-    const savedF64 = expCtxSwapF64(true, ec)
-    const r = emitExpr(body, f64Inner, fnIx, ec)
-    expCtxSwapF64(savedF64, ec)
-    return r
-  }
+  if numLitOrNegated(f64Inner) { return emitSignedNumLitAt(f64Inner, "f64") }
   // An i64 source converts (signed) to f64.
   if exprIsI64(f64Cls, fnIx) {
     if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
@@ -22028,19 +21977,18 @@ export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   if rw32f != "" { return emitAsgRadixAs(body, exprIx, rw32f, "f32", fnIx, ec) }
   // An already-f32-valued expression (a variable, an f32 arithmetic / call result) emits
   // directly. An assignment classifies by its target cell (`widenClassifyExpr`), as the
-  // i64/f64 widenings do, and owns its own width (`emitExprWideCleared`) so an f32 seed
-  // reaching here belongs to the position that set it, not the i32 sub-positions inside it.
+  // i64/f64 widenings do.
   if exprIsF32(widenClassifyExpr(exprIx, fnIx), fnIx) {
     if njBoxWidens(exprIx, fnIx) {
       return emitNumUnionConvert(body, exprIx, 5, fnIx, ec)
     }
-    return emitExprWideCleared(body, exprIx, fnIx, ec)
+    return emitExpr(body, exprIx, fnIx, ec)
   }
   // A numeric union converts at the member it holds; anything else is an i32, converted.
   if njWidensOut(exprIx, fnIx) {
     return emitNumUnionConvert(body, exprIx, 5, fnIx, ec)
   }
-  if emitExprWideCleared(body, exprIx, fnIx, ec) < 0 { return -1 }
+  if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
   fbF32ConvertI32S()
   0
 }
@@ -22236,13 +22184,13 @@ function emitNumExactCastFrom(
   if src == "i32" { src = "i64" }
   // Stage the operand ONCE — the test reads it up to three times and it is typically a call.
   if src == "i64" {
-    if emitNumIntrArg(body, e.asObj, 3, fnIx, ec) < 0 { return -1 }
+    if emitExprAsKind(body, e.asObj, 3, fnIx, ec) < 0 { return -1 }
     fbLocalSet(numCastStashSlot(2))
   } else if src == "f32" {
-    if emitNumIntrArg(body, e.asObj, 5, fnIx, ec) < 0 { return -1 }
+    if emitExprAsKind(body, e.asObj, 5, fnIx, ec) < 0 { return -1 }
     fbLocalSet(numCastStashSlot(1))
   } else {
-    if emitNumIntrArg(body, e.asObj, 4, fnIx, ec) < 0 { return -1 }
+    if emitExprAsKind(body, e.asObj, 4, fnIx, ec) < 0 { return -1 }
     fbLocalSet(numCastStashSlot(0))
   }
   const integral = src != "i64" && exprIsIntegralFloat(e.asObj, fnIx)
@@ -22349,7 +22297,7 @@ function emitNumWrapCast(
     )
   }
   // An i64 target is the sign-extend, which the i64 helper already is for both sources.
-  if tgt == "i64" { return emitNumIntrArg(body, obj, 3, fnIx, ec) }
+  if tgt == "i64" { return emitExprAsKind(body, obj, 3, fnIx, ec) }
   // `((y >>> k) & m) as% i32` narrows to i32 ops when the mask stays in the low word.
   const nsrc = srWrappedMask(exprIx, fnIx)
   if nsrc.length > 0 { return srEmitNarrowed(body, nsrc, fnIx, ec) }
@@ -22364,9 +22312,9 @@ function emitNumWrapCast(
   }
   if !folded {
     if exprIsI64(obj, fnIx) {
-      if emitNumIntrArg(body, obj, 3, fnIx, ec) < 0 { return -1 }
+      if emitExprAsKind(body, obj, 3, fnIx, ec) < 0 { return -1 }
       fbI32WrapI64()
-    } else if emitNumIntrArg(body, obj, 0, fnIx, ec) < 0 {
+    } else if emitExprAsKind(body, obj, 0, fnIx, ec) < 0 {
       return -1
     }
   }
@@ -23044,8 +22992,7 @@ function emitHoleNumAsOpt(
 
 // The numeric `x as T` lowering: the operand goes out in its own source rep through the
 // `emitExprAs*` helpers, then one wasm conversion opcode for the pair (float-to-int traps
-// rather than wraps). The width is the cast's, not the delivery position, so
-// `emitNumIntrArg` clears the enclosing wide-scalar context — else a `: f32` binding's `ec.wantF32` would double-widen it.
+// rather than wraps).
 function emitNumPlainCast(
   body: u8[],
   obj: i32,
@@ -23053,20 +23000,20 @@ function emitNumPlainCast(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  if tgt == "f64" { return emitNumIntrArg(body, obj, 4, fnIx, ec) }
+  if tgt == "f64" { return emitExprAsKind(body, obj, 4, fnIx, ec) }
   const src = numCastSrcRepOf(obj, fnIx)
   if tgt == "i64" {
     // i32→i64 widening (and i64→i64 no-op) via the existing helper.
     if src == "i32" || src == "i64" {
-      return emitNumIntrArg(body, obj, 3, fnIx, ec)
+      return emitExprAsKind(body, obj, 3, fnIx, ec)
     }
     // float→i64: TRAPPING truncation toward zero.
     if src == "f32" {
-      if emitNumIntrArg(body, obj, 5, fnIx, ec) < 0 { return -1 }
+      if emitExprAsKind(body, obj, 5, fnIx, ec) < 0 { return -1 }
       fbI64TruncF32S()
       return 0
     }
-    if emitNumIntrArg(body, obj, 4, fnIx, ec) < 0 {
+    if emitExprAsKind(body, obj, 4, fnIx, ec) < 0 {
       return -1 // f64 → i64
     }
     fbI64TruncF64S()
@@ -23075,14 +23022,14 @@ function emitNumPlainCast(
   if tgt == "f32" {
     // i32→f32 (and f32→f32 no-op) via the existing helper (handles literals).
     if src == "i32" || src == "f32" {
-      return emitNumIntrArg(body, obj, 5, fnIx, ec)
+      return emitExprAsKind(body, obj, 5, fnIx, ec)
     }
     if src == "i64" {
-      if emitNumIntrArg(body, obj, 3, fnIx, ec) < 0 { return -1 }
+      if emitExprAsKind(body, obj, 3, fnIx, ec) < 0 { return -1 }
       fbF32ConvertI64S()
       return 0
     }
-    if emitNumIntrArg(body, obj, 4, fnIx, ec) < 0 {
+    if emitExprAsKind(body, obj, 4, fnIx, ec) < 0 {
       return -1 // f64 → f32 demote
     }
     fbF32DemoteF64()
@@ -23090,19 +23037,19 @@ function emitNumPlainCast(
   }
   // tgt == "i32".
   if src == "i32" {
-    return emitNumIntrArg(body, obj, 0, fnIx, ec) // no-op (plain `emitExpr` at kind 0)
+    return emitExprAsKind(body, obj, 0, fnIx, ec) // no-op (plain `emitExpr` at kind 0)
   }
   if src == "i64" {
-    if emitNumIntrArg(body, obj, 3, fnIx, ec) < 0 { return -1 }
+    if emitExprAsKind(body, obj, 3, fnIx, ec) < 0 { return -1 }
     fbI32WrapI64()
     return 0
   }
   if src == "f32" {
-    if emitNumIntrArg(body, obj, 5, fnIx, ec) < 0 { return -1 }
+    if emitExprAsKind(body, obj, 5, fnIx, ec) < 0 { return -1 }
     fbI32TruncF32S()
     return 0
   }
-  if emitNumIntrArg(body, obj, 4, fnIx, ec) < 0 {
+  if emitExprAsKind(body, obj, 4, fnIx, ec) < 0 {
     return -1 // f64 → i32 trunc
   }
   fbI32TruncF64S()
@@ -23297,21 +23244,10 @@ function fbNumOp(op: i32) {
   0
 }
 
-// One operand of a numeric-opcode intrinsic, emitted at the width the operation declares
-// (`k`: the `emitExprAsKind` codes) with the enclosing wide-scalar context cleared. The
-// width comes from the intrinsic's own signature, never the call's position — else an
-// f32-seeding context around a non-f32 operand hits `type mismatch` on a checked program.
-function emitNumIntrArg(body: u8[], ix: i32, k: i32, fnIx: i32, ec: ExpCtx) {
-  const saved = expCtxClearWidths(ec)
-  const r = emitExprAsKind(body, ix, k, fnIx, ec)
-  expCtxRestoreWidths(saved, ec)
-  r
-}
-
 // Lower `f32bits` / `f64bits` / `f32fromBits` / `f64fromBits`: push the argument at
 // the source type, then the one reinterpret instruction. Returns `NUM_INTR_NONE` when
-// `name` is not one of them. The operand takes `emitNumIntrArg` at the bitcast's own
-// width — an enclosing f32 context would otherwise mistype the reinterpret's operand.
+// `name` is not one of them. The operand goes out at the bitcast's own
+// source width.
 function emitBitcastIntr(
   body: u8[],
   callIx: i32,
@@ -23339,18 +23275,18 @@ function emitBitcastIntr(
     }
     const arg = c.callArgs[0]
     if name == "f32bits" {
-      if emitNumIntrArg(body, arg, 5, fnIx, ec) < 0 { return -1 }
+      if emitExprAsKind(body, arg, 5, fnIx, ec) < 0 { return -1 }
       return fbNumOp(OP_I32_REINTERPRET_F32) // 0xbc i32.reinterpret_f32
     }
     if name == "f64bits" {
-      if emitNumIntrArg(body, arg, 4, fnIx, ec) < 0 { return -1 }
+      if emitExprAsKind(body, arg, 4, fnIx, ec) < 0 { return -1 }
       return fbNumOp(OP_I64_REINTERPRET_F64) // 0xbd i64.reinterpret_f64
     }
     if name == "f32fromBits" {
-      if emitNumIntrArg(body, arg, 0, fnIx, ec) < 0 { return -1 }
+      if emitExprAsKind(body, arg, 0, fnIx, ec) < 0 { return -1 }
       return fbNumOp(OP_F32_REINTERPRET_I32) // 0xbe f32.reinterpret_i32
     }
-    if emitNumIntrArg(body, arg, 3, fnIx, ec) < 0 { return -1 }
+    if emitExprAsKind(body, arg, 3, fnIx, ec) < 0 { return -1 }
     return fbNumOp(OP_F64_REINTERPRET_I64) // 0xbf f64.reinterpret_i64
   }
   NUM_INTR_NONE
@@ -23465,15 +23401,12 @@ function emitFloatIntr(
     // operand as both sides, which asks the same question of it.
     const hardF64 = binMixHardF64(args[0], args[args.length - 1], fnIx)
     const useF32 = anyF32 && !hardF64
-    // The chosen width is the OPERATION's, so each operand takes it with the enclosing
-    // wide-scalar context cleared (`emitNumIntrArg`). The f64 arm is the one that
-    // needed it: `nearest(2.5)` under an f32 context lowered `2.5` as `f32.const` and
-    // handed `f64.nearest` an f32.
+    // The chosen width is the OPERATION's, and each operand goes out at it.
     let fiK = 4
     if useF32 { fiK = 5 }
     let j = 0
     while j < args.length {
-      if emitNumIntrArg(body, args[j], fiK, fnIx, ec) < 0 { return -1 }
+      if emitExprAsKind(body, args[j], fiK, fnIx, ec) < 0 { return -1 }
       j = j + 1
     }
     if useF32 { return fbNumOp(opF32) }
@@ -23509,8 +23442,8 @@ function emitIntMinMax(
   const s0 = intMinMaxStashSlot(w)
   const s1 = intMinMaxStashSlot(w + 1)
   if name == "max" { cmp = cmp + 2 }
-  if emitNumIntrArg(body, c.callArgs[0], k, fnIx, ec) < 0 { return -1 }
-  if emitNumIntrArg(body, c.callArgs[1], k, fnIx, ec) < 0 { return -1 }
+  if emitExprAsKind(body, c.callArgs[0], k, fnIx, ec) < 0 { return -1 }
+  if emitExprAsKind(body, c.callArgs[1], k, fnIx, ec) < 0 { return -1 }
   fbLocalSet(s1)
   fbLocalTee(s0)
   fbLocalGet(s1)
@@ -23542,7 +23475,7 @@ function emitIntAbs(
     w = 2
   }
   const s0 = intMinMaxStashSlot(w)
-  if emitNumIntrArg(body, c.callArgs[0], k, fnIx, ec) < 0 { return -1 }
+  if emitExprAsKind(body, c.callArgs[0], k, fnIx, ec) < 0 { return -1 }
   fbLocalSet(s0)
   if wide { fbI64Const(0, 0) } else { fbI32Const(0) }
   fbLocalGet(s0)
@@ -23579,28 +23512,18 @@ function emitIntIntr(
       if exprIsI64(args[i], fnIx) { useI64 = true }
       i = i + 1
     }
-    // The chosen width is the OPERATION's — an i32 op's operand is an i32 whatever the
-    // enclosing position wants — so each one takes `emitNumIntrArg`. Without it
-    // `clz(1) as f32` lowered the `1` as `f32.const` into `i32.clz`.
+    // The chosen width is the OPERATION's: an i32 op's operand is an i32.
     let iiK = 0
     if useI64 { iiK = 3 }
     let j = 0
     while j < args.length {
-      if emitNumIntrArg(body, args[j], iiK, fnIx, ec) < 0 { return -1 }
+      if emitExprAsKind(body, args[j], iiK, fnIx, ec) < 0 { return -1 }
       j = j + 1
     }
     if useI64 { return fbNumOp(intIntrOpI64(name)) }
     return fbNumOp(opI32)
   }
   NUM_INTR_NONE
-}
-
-// One operand of a linear-memory intrinsic, with every wide-scalar context flag cleared:
-// every operand here is an i32 by declaration, so no wide scalar an enclosing position
-// wants may reach it — except the three wide stores' second operand, which takes its own
-// declared width instead. Array intrinsics are excluded: their fill takes the element's own valtype.
-function emitMemIntrinArg(body: u8[], ix: i32, fnIx: i32, ec: ExpCtx) {
-  emitExprWideCleared(body, ix, fnIx, ec)
 }
 
 // The value of an integer literal, of an unshadowed top-level `const` bound to one, or of an
@@ -24077,12 +24000,12 @@ function emitMemAddr(
     const lmaRest = lmaAddrRest
     const lmaK = lmaAddrK
     lmaAddrNode = -1
-    if emitNumIntrArg(body, lmaRest, 3, lmaCallerFn, ec) < 0 { return -1 }
+    if emitExprAsKind(body, lmaRest, 3, lmaCallerFn, ec) < 0 { return -1 }
     fbI32WrapI64()
     return lmaK + off
   }
   if addr < 0 || addr >= P.nodes.length {
-    if emitMemIntrinArg(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
+    if emitExpr(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
     return off
   }
   const whole = memAddrConst(addr, fnIx)
@@ -24107,7 +24030,7 @@ function emitMemAddr(
       const rest = memConstFoldRest(a, fnIx)
       const m = memAddrBound(rest, fnIx)
       if m >= 0 && m + kv + off <= MEM_OFFSET_MAX {
-        if emitMemIntrinArg(body, rest, fnIx, ec) < 0 { return -1 }
+        if emitExpr(body, rest, fnIx, ec) < 0 { return -1 }
         return kv + off
       }
     }
@@ -24118,15 +24041,15 @@ function emitMemAddr(
       const wide = memLowWrapped(addr, fnIx)
       const rest = memLowFoldRest(addr, fnIx)
       if wide >= 0 {
-        if emitNumIntrArg(body, rest, 3, fnIx, ec) < 0 { return -1 }
+        if emitExprAsKind(body, rest, 3, fnIx, ec) < 0 { return -1 }
         fbI32WrapI64()
-      } else if emitMemIntrinArg(body, rest, fnIx, ec) < 0 {
+      } else if emitExpr(body, rest, fnIx, ec) < 0 {
         return -1
       }
       return lk + off
     }
   }
-  if emitMemIntrinArg(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
+  if emitExpr(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
   off
 }
 
@@ -24265,9 +24188,6 @@ function emitLowMemAccessorCall(
         const sFn = lmaCallerFn
         const saved = expCtxHere(ec)
         const lc = expCtxHere(ec)
-        lc.wantF32 = false
-        lc.wantF64 = false
-        lc.wantI64 = false
         lc.litUnion = 0
         lc.nulLitUnion = false
         lmaAddrNode = unwrapParen(ac.callArgs[0])
@@ -24485,7 +24405,7 @@ function simdLaneImm(argIx: i32, max: i32): i32 {
 }
 
 // The SIMD lowering (`simd-design.md` §D6): push the row's operands in order, each at the width
-// its operand shape names (an address or count is a context-cleared i32), then write the one
+// its operand shape names, then write the one
 // 0xFD-prefix instruction with the row's immediates. Lane and shuffle indices are the literals
 // the checker pinned; a drift between the two is a loud emit failure, never a wrong byte.
 function emitSimdIntrinsic(
@@ -24517,11 +24437,11 @@ function emitSimdIntrinsic(
     return 0
   }
   if sig == SIMD_SIG_I_V {
-    if emitMemIntrinArg(body, args[0], fnIx, ec) < 0 { return -1 }
+    if emitExpr(body, args[0], fnIx, ec) < 0 { return -1 }
     return fbSimdOp(op)
   }
   if sig == SIMD_SIG_L_V {
-    if emitNumIntrArg(body, args[0], 3, fnIx, ec) < 0 { return -1 }
+    if emitExprAsKind(body, args[0], 3, fnIx, ec) < 0 { return -1 }
     return fbSimdOp(op)
   }
   if sig == SIMD_SIG_F_V {
@@ -24538,7 +24458,7 @@ function emitSimdIntrinsic(
     return fbSimdOp(op)
   }
   if sig == SIMD_SIG_VI_V {
-    if emitMemIntrinArg(body, args[1], fnIx, ec) < 0 { return -1 }
+    if emitExpr(body, args[1], fnIx, ec) < 0 { return -1 }
     return fbSimdOp(op)
   }
   const max = simdRowLaneMax(row)
@@ -24552,9 +24472,9 @@ function emitSimdIntrinsic(
     )
   }
   if sig == SIMD_SIG_REPL_I {
-    if emitMemIntrinArg(body, args[2], fnIx, ec) < 0 { return -1 }
+    if emitExpr(body, args[2], fnIx, ec) < 0 { return -1 }
   } else if sig == SIMD_SIG_REPL_L {
-    if emitNumIntrArg(body, args[2], 3, fnIx, ec) < 0 { return -1 }
+    if emitExprAsKind(body, args[2], 3, fnIx, ec) < 0 { return -1 }
   } else if sig == SIMD_SIG_REPL_F {
     if emitExprAsF32(body, args[2], fnIx, ec) < 0 { return -1 }
   } else if (
@@ -24637,7 +24557,7 @@ function emitTruncSatIntrinsic(
   }
   let k = 5
   if truncSatFromF64(op) { k = 4 }
-  if emitNumIntrArg(body, c.callArgs[0], k, fnIx, ec) < 0 { return -1 }
+  if emitExprAsKind(body, c.callArgs[0], k, fnIx, ec) < 0 { return -1 }
   wU8(OP_MISC_PREFIX)
   wULEB(op)
   0
@@ -24705,9 +24625,9 @@ function emitAtomicIntrinsic(
     if sig == ATOMIC_SIG_WAIT && k == 2 { wide = true }
     const ak = memCallArg(c, vals + 1, k)
     if wide {
-      if emitNumIntrArg(body, ak, 3, fnIx, ec) < 0 { return -1 }
+      if emitExprAsKind(body, ak, 3, fnIx, ec) < 0 { return -1 }
     } else {
-      if emitMemIntrinArg(body, ak, fnIx, ec) < 0 { return -1 }
+      if emitExpr(body, ak, fnIx, ec) < 0 { return -1 }
     }
     k = k + 1
   }
@@ -25053,15 +24973,12 @@ function emitCallCoreMemStore(
   if memStoreValueIsI32(callee.identName) {
     // `i32.store8` / `i32.store16` take an ordinary i32 and TRUNCATE it, so the
     // value goes through the same spine as the address and as `__store_i32__`'s
-    // own value — no widening helper, and no `ec.wantF32` seed to save.
-    if emitMemIntrinArg(body, msVal, fnIx, ec) < 0 { return -1 }
+    // own value — no widening helper.
+    if emitExpr(body, msVal, fnIx, ec) < 0 { return -1 }
   } else if callee.identName == "__store_i64__" {
     if emitExprAsI64(body, msVal, fnIx, ec) < 0 { return -1 }
   } else if callee.identName == "__store_f32__" {
-    const savedStF32 = expCtxSwapF32(true, ec)
-    const stRc = emitExprAsF32(body, msVal, fnIx, ec)
-    expCtxSwapF32(savedStF32, ec)
-    if stRc < 0 { return -1 }
+    if emitExprAsF32(body, msVal, fnIx, ec) < 0 { return -1 }
   } else {
     if emitExprAsF64(body, msVal, fnIx, ec) < 0 { return -1 }
   }
@@ -25098,9 +25015,9 @@ function emitCallCoreMemBulk(
         + " reached with the wrong argument count — the checker's arity rule refuses it",
     )
   }
-  if emitMemIntrinArg(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
-  if emitMemIntrinArg(body, c.callArgs[1], fnIx, ec) < 0 { return -1 }
-  if emitMemIntrinArg(body, c.callArgs[2], fnIx, ec) < 0 { return -1 }
+  if emitExpr(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
+  if emitExpr(body, c.callArgs[1], fnIx, ec) < 0 { return -1 }
+  if emitExpr(body, c.callArgs[2], fnIx, ec) < 0 { return -1 }
   if callee.identName == "__memory_copy__" {
     // Two memory indices: destination first, then source.
     fbMemBulk(MISC_MEMORY_COPY, 2)
@@ -25145,8 +25062,8 @@ function emitCallCoreLog(body: u8[], c: Call, fnIx: i32, ec: ExpCtx) {
       "emitProgram: internal: __log__ reached with the wrong argument count — the checker's arity rule refuses it",
     )
   }
-  if emitMemIntrinArg(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
-  if emitMemIntrinArg(body, c.callArgs[1], fnIx, ec) < 0 { return -1 }
+  if emitExpr(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
+  if emitExpr(body, c.callArgs[1], fnIx, ec) < 0 { return -1 }
   fbCall(gMemLogIdx)
   return 0
 }
@@ -25190,14 +25107,14 @@ function emitCallCoreHostFloor(
             + " takes a u8[] but the u8 list type was not collected",
         )
       }
-      if emitExprWideCleared(body, c.callArgs[fsA], fnIx, ec) < 0 { return -1 }
+      if emitExpr(body, c.callArgs[fsA], fnIx, ec) < 0 { return -1 }
     } else {
       if fsArgIsI64(fsK, fsA) {
         // Its declared width, as the wide stores' value operand takes: an i32 left
         // on the stack for a plain literal offset would not validate.
         if emitExprAsI64(body, c.callArgs[fsA], fnIx, ec) < 0 { return -1 }
       } else {
-        if emitMemIntrinArg(body, c.callArgs[fsA], fnIx, ec) < 0 { return -1 }
+        if emitExpr(body, c.callArgs[fsA], fnIx, ec) < 0 { return -1 }
       }
     }
     fsA = fsA + 1
@@ -25248,7 +25165,7 @@ function emitCallCoreExtern(
     } else {
       // `i32` and `boolean` alike — a boolean is an i32 at the boundary. The checker
       // refuses every other spelling, so none reaches here.
-      if emitMemIntrinArg(body, c.callArgs[exA], fnIx, ec) < 0 { return -1 }
+      if emitExpr(body, c.callArgs[exA], fnIx, ec) < 0 { return -1 }
     }
     exA = exA + 1
   }
@@ -25437,7 +25354,7 @@ function emitCallCoreIdent(
   if !userBindsName && callee.identName == "__store_i32__" {
     const s32Off = emitMemAddr(body, c, 2, fnIx, "__store_i32__", ec)
     if s32Off < 0 { return -1 }
-    if emitMemIntrinArg(body, memCallArg(c, 2, 1), fnIx, ec) < 0 { return -1 }
+    if emitExpr(body, memCallArg(c, 2, 1), fnIx, ec) < 0 { return -1 }
     fbMemAccess(OP_I32_STORE, 2, s32Off)
     return 0
   }
@@ -25447,14 +25364,12 @@ function emitCallCoreIdent(
     fbMemAccess(OP_I32_LOAD, 2, l32Off)
     return 0
   }
-  // The five other store widths (`buffer-design.md` §C2): push the address (context-
-  // cleared like every memory-intrinsic operand), then the value at its own declared
-  // width — not `emitMemIntrinArg`, since `__store_f64__(0, 1.5)` needs `f64.const
-  // 1.5` — then the opcode at its natural alignment. f32 also seeds `ec.wantF32`.
+  // The five other store widths (`buffer-design.md` §C2): push the address, then the
+  // value at its own declared width, then the opcode at its natural alignment.
   if !userBindsName && nameIsMemStoreIntrinsic(callee.identName) {
     return emitCallCoreMemStore(body, c, callee, fnIx, ec)
   }
-  // the bulk pair (`buffer-design.md` §C3): three i32 operands, all context-cleared
+  // the bulk pair (`buffer-design.md` §C3): three i32 operands
   // (no width dispatch, unlike the store arm), pushed in the instruction's own order,
   // which VL's argument order matches — a mismatched order would mean reordering
   // arbitrary expressions' side effects.
@@ -25500,7 +25415,7 @@ function emitCallCoreIdent(
         "emitProgram: internal: __memory_grow__ reached with the wrong argument count — the checker's arity rule refuses it",
       )
     }
-    if emitMemIntrinArg(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
+    if emitExpr(body, c.callArgs[0], fnIx, ec) < 0 { return -1 }
     fbMemoryGrow()
     return 0
   }
@@ -25715,7 +25630,6 @@ function emitCallRefArg(
   const pkk = sigParamKindAt(ckey, i)
   expCtxApply(argBase, ec)
   const ac = expCtxHere(ec)
-  expCtxSeedValueArg(ac)
   // An argument's raw-read seeds are its parameter's alone, as at a direct call (D3816).
   ac.nulString = pkk == "nulstr"
   ac.rawNullRead = false
@@ -25962,11 +25876,8 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32, ec: ExpCtx) {
     // context must not leak into it — else a bare i32 literal argument under an outer f32/atom
     // context lowers at the wrong valtype for the `call_ref` functype: invalid wasm.
     const argBase = expCtxHere(ec)
-    argBase.wantF32 = false
-    argBase.wantF64 = false
     argBase.litUnion = 0
     argBase.nulLitUnion = false
-    argBase.wantI64 = false
     let i = 0
     while i < args.length {
       if emitCallRefArg(body, callIx, fnIx, ckey, argBase, args, i, ec) < 0 {
@@ -26458,9 +26369,6 @@ function emitIdxStoreValue(
   } else if st.isI64 {
     if emitExprAsI64(body, a.binRight, fnIx, ec) < 0 { return -1 }
   } else if st.isF32 {
-    const stCtx = expCtxHere(ec)
-    stCtx.wantF32 = true
-    expCtxApply(stCtx, ec)
     if emitExprAsF32(body, a.binRight, fnIx, ec) < 0 { return -1 }
   } else if arrElemLitUnionTy(arrIx, fnIx) >= 0 {
     // `xs[i] = "a"` over a literal-union array: the member RHS lowers as its atom id —
@@ -27466,10 +27374,7 @@ function emitPushValue(
     if emitExprAsI64(body, argIx, fnIx, ec) < 0 { return -1 }
   } else if isF32 {
     // an f32-list push coerces/encodes the value as f32 (a float literal re-encodes).
-    const pushF32 = expCtxSwapF32(true, ec)
-    const pushF32Rc = emitExprAsF32(body, argIx, fnIx, ec)
-    expCtxSwapF32(pushF32, ec)
-    if pushF32Rc < 0 { return -1 }
+    if emitExprAsF32(body, argIx, fnIx, ec) < 0 { return -1 }
   } else if pushUnionNm != "" {
     if emitUnionBoxArg(body, pushUnionNm, pv.pushUnionTy, argIx, fnIx, ec) < 0 {
       return -1
@@ -30256,8 +30161,6 @@ function emitReturnValueTail(
     if seeded < 0 { return seeded }
     retFlagsSeedNiches(fn, retArg, fnIx, fnPos, rf)
   }
-  // A float literal in an f32 result lowers as `f32.const`.
-  if rf.retF32 { ctx.wantF32 = true }
   const saved = expCtxHere(ec)
   expCtxApply(ctx, ec)
   if (
@@ -31205,9 +31108,6 @@ function emitLetInitValue(
     // letInfersF32`, so an un-annotated `const g = fv * 1.0` needs the same pair here —
     // else this ladder falls to the f64 arm, whose fallback over-claims a mixed
     // f32/float-literal init and stores an f64 into the f32 slot, invalid wasm.
-    const f32Ctx = expCtxHere(ec)
-    f32Ctx.wantF32 = true
-    expCtxApply(f32Ctx, ec)
     if emitExprAsF32(body, s.letInit, fnIx, ec) < 0 { return -1 }
   } else if letIsF64(stmtIx, fnIx) {
     if emitExprAsF64(body, s.letInit, fnIx, ec) < 0 { return -1 }
@@ -34597,9 +34497,6 @@ export function emitUserGlobalSet(gi: i32) {
 // `emitExpr`. A site copies its caller's context (`expCtxHere`), overrides what it knows,
 // and hands the copy to `emitExprExpect`; the record a compile starts from is `expCtxDefault`.
 export type ExpCtx = {
-  wantI64: boolean,     // a NumLit lowers as i64.const
-  wantF32: boolean,     // a NumLit lowers as f32.const
-  wantF64: boolean,     // an integer NumLit lowers as f64.const
   nulBool: boolean,     // a bare `null` is the sentinel 2
   nulLitUnion: boolean, // a bare `null` is the sentinel -1
   nulString: boolean,   // a bare `null` is `ref.null $sTypeIdx`
@@ -34610,9 +34507,6 @@ export type ExpCtx = {
 // The context no destination has seeded: every field at its inert value.
 export function expCtxDefault(): ExpCtx {
   const c: ExpCtx = {
-    wantI64: false,
-    wantF32: false,
-    wantF64: false,
     nulBool: false,
     nulLitUnion: false,
     nulString: false,
@@ -34630,9 +34524,6 @@ function nulStrReadStaysRaw(ctx: ExpCtx) { ctx.rawNullRead || ctx.nulString }
 // A copy of `ec`, the base a site starts from, overriding only the fields it knows.
 export function expCtxHere(ec: ExpCtx): ExpCtx {
   const c: ExpCtx = {
-    wantI64: ec.wantI64,
-    wantF32: ec.wantF32,
-    wantF64: ec.wantF64,
     nulBool: ec.nulBool,
     nulLitUnion: ec.nulLitUnion,
     nulString: ec.nulString,
@@ -34642,27 +34533,9 @@ export function expCtxHere(ec: ExpCtx): ExpCtx {
   return c
 }
 
-// Seeds a value call's argument from its parameter's `$fnsig` kind, replacing the
-// enclosing position's: an `i64` destination's literal width does not reach it.
-function expCtxSeedValueArg(c: ExpCtx) {
-  c.wantI64 = false
-  0
-}
-
-// `expCtxSeedValueArg` over the ambient seeds.
-function seedValueArgShape(ec: ExpCtx) {
-  const c = expCtxHere(ec)
-  expCtxSeedValueArg(c)
-  expCtxApply(c, ec)
-  0
-}
-
 // Copies `c` into `ec` field by field, so a caller holding `ec` sees the new seeds and a
 // later edit to `c` does not reach it.
 export function expCtxApply(c: ExpCtx, ec: ExpCtx) {
-  ec.wantI64 = c.wantI64
-  ec.wantF32 = c.wantF32
-  ec.wantF64 = c.wantF64
   ec.nulBool = c.nulBool
   ec.nulLitUnion = c.nulLitUnion
   ec.nulString = c.nulString
@@ -34724,60 +34597,6 @@ export function wasmEmitStateReset() {
 function expCtxLeave(saved: ExpCtx, r: i32, ec: ExpCtx): i32 {
   expCtxApply(saved, ec)
   r
-}
-
-// Clears the three numeric-literal widths (i64, f32, f64) over the ambient seeds and returns
-// the context before the clear, for `expCtxRestoreWidths`: the box a union destination
-// builds owns its members' widths, so a widening destination's must not reach it.
-function expCtxClearWidths(ec: ExpCtx): ExpCtx {
-  const saved = expCtxHere(ec)
-  const c = expCtxHere(ec)
-  c.wantI64 = false
-  c.wantF32 = false
-  c.wantF64 = false
-  expCtxApply(c, ec)
-  saved
-}
-
-// Puts back the three widths `expCtxClearWidths` took from `saved`, leaving every other
-// ambient seed as the emit under it left it.
-function expCtxRestoreWidths(saved: ExpCtx, ec: ExpCtx) {
-  const c = expCtxHere(ec)
-  c.wantI64 = saved.wantI64
-  c.wantF32 = saved.wantF32
-  c.wantF64 = saved.wantF64
-  expCtxApply(c, ec)
-  0
-}
-
-// Sets the f32 literal seed to `want` and returns the seed it replaced, for a second call to
-// put back; no other ambient seed is touched.
-function expCtxSwapF32(want: boolean, ec: ExpCtx): boolean {
-  const c = expCtxHere(ec)
-  const was = c.wantF32
-  c.wantF32 = want
-  expCtxApply(c, ec)
-  was
-}
-
-// Sets the i64 literal seed to `want` and returns the seed it replaced; no other ambient seed
-// is touched.
-function expCtxSwapI64(want: boolean, ec: ExpCtx): boolean {
-  const c = expCtxHere(ec)
-  const was = c.wantI64
-  c.wantI64 = want
-  expCtxApply(c, ec)
-  was
-}
-
-// Sets the f64 literal seed to `want` and returns the seed it replaced; no other ambient seed
-// is touched.
-function expCtxSwapF64(want: boolean, ec: ExpCtx): boolean {
-  const c = expCtxHere(ec)
-  const was = c.wantF64
-  c.wantF64 = want
-  expCtxApply(c, ec)
-  was
 }
 
 // Sets the literal-union seed to `atom` and returns the seed it replaced, for a second call to
@@ -35587,70 +35406,62 @@ function eqAtomOperandOk(ix: i32, fnIx: i32) {
   nodeTyIsLitUnion(av)
 }
 
+// The scalar a numeric literal's own type names at instance `fnIx`, or "" where it names none
+// (a box of numbers, whose arms the operator dispatches). The checker's type is the one
+// producer of a literal's width, read as the classifiers (`exprIsF64` and kin) read it.
+function numLitWidthAt(exprIx: i32, fnIx: i32): string {
+  const t = nodeTyAt(exprIx, fnIx)
+  if t < 0 { return "" }
+  const p: string = tyScalarBasePrim(t) ?? ""
+  if p == "i32" || p == "i64" || p == "f32" || p == "f64" { return p }
+  ""
+}
+
+// Lowers the lexeme `text` as one `<w>.const`. A float lexeme is never an integer constant; an
+// integer one with no width named lowers as i32, or i64 past the i32 range.
+function emitNumLexAt(text: string, w: string) {
+  if numLexIsFloat(text) {
+    if w == "f32" { fbF32Const(text) } else { fbF64Const(text) }
+    return 0
+  }
+  if w == "f32" {
+    fbF32Const(text)
+    return 0
+  }
+  if w == "f64" {
+    fbF64Const(text)
+    return 0
+  }
+  if w == "i64" || !numLexFitsI32(text) {
+    const pr = parseI64Pair(text)
+    fbI64Const(pr[0], pr[1])
+    return 0
+  }
+  fbI32Const(parseI32(text))
+  0
+}
+
+// Lowers a literal, or `-` over one (parens peeled), as one `<w>.const` at the width `w` the
+// caller names: re-encoding the lexeme keeps a hex bit pattern past I32_MAX the value it spells.
+function emitSignedNumLitAt(ix: i32, w: string): i32 {
+  const n = nodeAt(ix)
+  if n is NumLit { return emitNumLexAt(n.numText, w) }
+  if n is Unary {
+    const mark = wLen()
+    if emitSignedNumLitAt(unwrapParen(n.unArg), w) < 0 { return -1 }
+    if wNegateConstFrom(mark) { return 0 }
+  }
+  emitFail("emitProgram: a signed literal did not fold to one constant")
+}
+
 function emitNumLitNode(
   _body: u8[],
   e: NumLit,
   exprIx: i32,
   fnIx: i32,
-  ctx: ExpCtx,
+  _ctx: ExpCtx,
 ) {
-  // A FLOAT literal (lexeme carries a `.`) in f32 CONTEXT (`ctx.wantF32` — an `: f32`
-  // binding/param/return) lowers as `f32.const`. Checked before the default f64 path
-  // so a float literal re-encodes at single precision in an f32 slot (never demoted
-  // from f64). Outside f32 context a `.` literal stays f64, unchanged. (Slice 5.)
-  if numLexIsFloat(e.numText) {
-    if ctx.wantF32 {
-      fbF32Const(e.numText)
-      return 0
-    }
-    fbF64Const(e.numText)
-    return 0
-  }
-  // An integer literal in f32 CONTEXT lowers DIRECTLY as `f32.const` (re-encoded at
-  // single precision — `f32Bytes` parses an integer lexeme as `mant/10^0`), so it is a
-  // valid constexpr in a const-global init (a convert op is not). (Slice 5.)
-  if ctx.wantF32 {
-    fbF32Const(e.numText)
-    return 0
-  }
-  // An integer literal in f64 CONTEXT (const-global init) lowers directly as
-  // `f64.const`, keeping the global init a constexpr (`const b: f64 = 5`). (Slice 5.)
-  if ctx.wantF64 {
-    fbF64Const(e.numText)
-    return 0
-  }
-  // An integer literal in i64 CONTEXT (`ctx.wantI64`) lowers as `i64.const` over the
-  // 64-bit (hi, lo) pair parsed from its lexeme — so a value past the i32 range
-  // (`9000000000`, `0xFFFFFFFFFF`) survives. Otherwise the default i32 path is
-  // unchanged (bare integer literals stay i32 — Slice 1 invariant).
-  if ctx.wantI64 {
-    const pr = parseI64Pair(e.numText)
-    fbI64Const(pr[0], pr[1])
-    return 0
-  }
-  // An integer literal past the i32 range is TYPED i64 by the checker (the host's
-  // `defaultIntegerType` magnitude rule), so it lowers as `i64.const` even with no
-  // i64 context — the old default `i32.const` silently wrapped (0xDEAD_BEEF).
-  if !numLexFitsI32(e.numText) {
-    const pr = parseI64Pair(e.numText)
-    fbI64Const(pr[0], pr[1])
-    return 0
-  }
-  // a small int literal whose context adopted a wider slot — the checker recorded i64/f64
-  // on the node (`objRetWidenAdopt`): honor the recorded rep, so the typed-IR fast paths
-  // and the emitted value agree. The checker records a wider numeric on a literal only
-  // when it proved it re-encodable.
-  if exprIsI64(exprIx, fnIx) {
-    const wpr = parseI64Pair(e.numText)
-    fbI64Const(wpr[0], wpr[1])
-    return 0
-  }
-  if exprIsF64(exprIx, fnIx) {
-    fbF64Const(e.numText)
-    return 0
-  }
-  fbI32Const(parseI32(e.numText))
-  return 0
+  emitNumLexAt(e.numText, numLitWidthAt(exprIx, fnIx))
 }
 
 function emitCharLitNode(_body: u8[], e: CharLit, _exprIx: i32, _fnIx: i32) {
@@ -35907,7 +35718,7 @@ function emitUnaryNode(
   e: Unary,
   exprIx: i32,
   fnIx: i32,
-  ctx: ExpCtx,
+  _ctx: ExpCtx,
   ec: ExpCtx,
 ) {
   // Logical not `!a`: a boolean rides in an i32 (0/1), so `i32.eqz` (0x45) maps
@@ -36001,10 +35812,8 @@ function emitUnaryNode(
   // I32_MIN (`parseI32`'s reading, its own negation) rather than as an i64 negation below. A
   // wider const cell's init, or a chain the checker typed i64, is that width, and the fold
   // below serves it.
-  const negWide = ctx.wantI64
-    || ctx.wantF64
-    || ctx.wantF32
-    || nodeNumScalarBaseName(exprIx) == "i64"
+  const negW = numLitWidthAt(exprIx, fnIx)
+  const negWide = negW != "" && negW != "i32"
   if negNode is NumLit && !negWide {
     if !numLexIsFloat(negNode.numText) {
       if numLexIs2Pow31(negNode.numText) {
@@ -36490,9 +36299,7 @@ function njStash(
   ec: ExpCtx,
 ): i32 {
   if isUnion {
-    // A join whose arms are scalars is built as the box here, as a union destination builds it;
-    // the box owns its members' widths, so a widening destination's pending width is cleared.
-    const nsSaved = expCtxClearWidths(ec)
+    // A join whose arms are scalars is built as the box here, as a union destination builds it.
     let sr = 0
     if exprUnion(ix, fnIx) {
       sr = emitExpr(body, ix, fnIx, ec)
@@ -36506,7 +36313,6 @@ function njStash(
         ec,
       )
     }
-    expCtxRestoreWidths(nsSaved, ec)
     if sr < 0 { return -1 }
     const bs = njSlot(26, "i32", key)
     fbLocalSet(bs)
@@ -37164,7 +36970,7 @@ function srPushSource(
 ): i32 {
   const x = src[0] as% i32
   if src[2] == 1 {
-    if emitNumIntrArg(body, x, 3, fnIx, ec) < 0 { return -1 }
+    if emitExprAsKind(body, x, 3, fnIx, ec) < 0 { return -1 }
     fbI32WrapI64()
     return 0
   }
@@ -37944,22 +37750,16 @@ function emitDirectCallArgsUnder(
       lci = lci + 1
     }
   }
-  // Every argument starts from the caller's context with the wide-scalar, litunion,
-  // map and null-heap seeds cleared: each is its parameter's, never the enclosing
-  // position's, or an i32 literal lowers as `f32.const`, a bare `Map()` builds an outer shape
+  // Every argument starts from the caller's context with the litunion, map and null-heap
+  // seeds cleared: each is its parameter's, never the enclosing position's, or a bare `Map()` builds an outer shape
   // (D1223), or a `null` read takes a map value's heap. The parameter's seeds follow below.
   const argBase = expCtxHere(ec)
-  argBase.wantF32 = false
-  argBase.wantF64 = false
   argBase.litUnion = 0
   argBase.nulLitUnion = false
-  argBase.wantI64 = false
   let i = 0
   while i < args.length {
     expCtxApply(argBase, ec)
-    const ac = expCtxHere(ec)
-    const sd = directArgSeedsOf(target, i, ac)
-    expCtxApply(ac, ec)
+    const sd = directArgSeedsOf(target, i)
     // An f64 / f32 param position lowers the argument coerced to that float type
     // (a float literal re-encodes; an i32/i64/f32 source converts via the lattice
     // helper). (Slice 3 f64; Slice 5 f32.)
@@ -37979,8 +37779,6 @@ function emitDirectCallArgsUnder(
       }
     }
     if cParamF32 {
-      ac.wantF32 = true
-      expCtxApply(ac, ec)
       if emitExprAsF32(body, args[i], fnIx, ec) < 0 { return -1 }
       i = i + 1
     } else if cParamF64 {
@@ -38133,9 +37931,8 @@ type DirectArgSeeds = {
   cParamSLKind: VKind | null,
 }
 
-// The seeds of argument `i` of a direct call to `target`, read off its parameter. Also
-// writes the parameter's struct, map, list and i64 build seeds into `ac`.
-function directArgSeedsOf(target: i32, i: i32, ac: ExpCtx): DirectArgSeeds {
+// The seeds of argument `i` of a direct call to `target`, read off its parameter.
+function directArgSeedsOf(target: i32, i: i32): DirectArgSeeds {
   const cFn = nodeAt(fnStmts[target])
   // A variant-typed param position (kind 8): the callee wants the concrete variant struct
   // ref, but a union-valued argument (a narrowed local/param, a union-returning call) is the
@@ -38199,8 +37996,6 @@ function directArgSeedsOf(target: i32, i: i32, ac: ExpCtx): DirectArgSeeds {
         if cpK == "reflist" { cParamRlSlot = tyAnnRefListSlot(cp.parType) }
         cParamSLKind = cpK
       }
-      // An i64 param position lowers an integer-literal argument as `i64.const`.
-      if cpK == "i64" { ac.wantI64 = true }
       const cpnb = nodeAt(cParams[i])
       if cpnb is Param {
         if tyIsNulBool(cpnb.parType) { cParamNulBool = true }
@@ -38329,7 +38124,6 @@ function emitCapturedCall(
     let cpKind: VKind = "i32"
     let cpLit = false
     let cuTy = -1
-    seedValueArgShape(ec)
     if cai < cps.length {
       cpKind = vtKindOfParam(cps[cai])
       const cpn = nodeAt(cps[cai])
@@ -38386,7 +38180,6 @@ function emitCapturedCall(
   capOut.nulString = capSaved.nulString
   capOut.rawNullRead = capSaved.rawNullRead
   expCtxApply(capOut, ec)
-  seedValueArgShape(ec)
   callRefDepth = crDepth
   // The target's own interned `$fnsig` — the functype it is actually declared with — so the
   // `call_indirect` below passes the engine's signature check and returns the target's real
@@ -39347,12 +39140,7 @@ function emitCoalesceScalarDefault(
 ) {
   if kind == 3 { return emitExprAsI64(body, defIx, fnIx, ec) }
   if kind == 4 { return emitExprAsF64(body, defIx, fnIx, ec) }
-  if kind == 5 {
-    const savedF32 = expCtxSwapF32(true, ec)
-    const rcF32 = emitExprAsF32(body, defIx, fnIx, ec)
-    expCtxSwapF32(savedF32, ec)
-    return rcF32
-  }
+  if kind == 5 { return emitExprAsF32(body, defIx, fnIx, ec) }
   emitExpr(body, defIx, fnIx, ec)
 }
 
