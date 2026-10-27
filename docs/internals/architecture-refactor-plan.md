@@ -2501,7 +2501,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - Pooled RSS is 4.29 → 4.79 GB, and serial RSS is equal.
   - Seed +1.25%, L2 fuel +0.52% (0 for the unarmed path).
 - Step 13, D7321:
-  - The check pool reports what it does. `VL_FUEL=1` keeps the pool on and `[fuel] guest:` sums the workers. `VL_CHECK_STATS=1` (or `trace`) prints module checks per reason, and each decline with its culprit.
+  - The check pool reports what it does. `VL_FUEL=1` checks every root in one instance, so its total is the same on every run (D14561). `VL_CHECK_STATS=1` (or `trace`) prints module checks per reason, and each decline with its culprit.
   - On diderven, 52% of the module checks are `unseen`. 110 of its 330 files are imported by no other file, and one shared bank serves 100 roots against 96, so no scheduling change can move this much.
   - `demand` (35%) was all un-annotated exported bindings. `skClosed` now shuts a signed number literal. `wiInitShut` (mask 2048) admits a non-empty list of scalar literals and primitive names, and a call of a closed, non-generic, non-overloaded function with a declared return. Three must-serve cases and two must-decline controls cover it.
   - diderven: 10,527 → 9,602 module checks, 213.8G → 197.3G fuel. Heregeat: 1,327 → 1,319 checks. Output is byte-identical on both copies at 1, 2 and 6 jobs, and on `vl check compiler std scripts`.
