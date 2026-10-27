@@ -4,18 +4,46 @@
 // binding is visible from its declaration on, a function's name from before its body, the
 // module frame from everywhere, and a parameter default reads the module frame.
 import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
+  Index,
   IsExpr,
   LetDecl,
+  LoopVar,
   MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
   P,
   Param,
+  Paren,
   Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
   binderNameAt,
   matchPatValueName,
   nodeAt,
@@ -27,6 +55,7 @@ import {
   identAuditDrop,
   identSet,
   sidOf,
+  sidOfNode,
 } from "./symbols"
 
 // The innermost declaration of each name by sid (-1 none), the module frame's last
@@ -80,9 +109,10 @@ function bdGet(a: i32[], sid: i32) {
   a[sid]
 }
 
-// Declares `name` as `decl` in the innermost frame.
-function bdDeclare(name: string, decl: i32) {
-  const sid = sidOf(name)
+// Declares `decl`'s name as `decl` in the innermost frame.
+function bdDeclare(decl: i32) {
+  const sid = sidOfNode(decl)
+  if sid < 0 { return 0 }
   bdLogSid.push(sid)
   bdLogPrev.push(bdGet(bdCur, sid))
   bdPut(bdCur, sid, decl)
@@ -100,9 +130,8 @@ function bdClose(mark: i32) {
   0
 }
 
-// The declaration `name` names where it stands, else the module frame's, else a builtin.
-function bdResolve(name: string, moduleOnly: boolean) {
-  const sid = sidOf(name)
+// The declaration the name `sid` names where it stands, else the module frame's, else a builtin.
+function bdResolve(sid: i32, moduleOnly: boolean) {
   if !moduleOnly {
     const d = bdGet(bdCur, sid)
     if d >= 0 { return d }
@@ -112,40 +141,111 @@ function bdResolve(name: string, moduleOnly: boolean) {
   IDENT_BUILTIN
 }
 
+// Each kind that holds an identifier walks its slots directly; a declaration kind binds.
 function bdWalk(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = nodeAt(ix)
-  if n is Ident { return identSet(ix, bdResolve(n.identName, false)) }
-  if n is Block {
-    const mark = bdLogSid.length
-    for s in n.blkStmts { bdWalk(s) }
-    return bdClose(mark)
+  match n {
+    Ident => {
+      return identSet(ix, bdResolve(sidOfNode(ix), false))
+    }
+    NumLit | StrLit | TypeRef | CharLit | BoolLit | NullLit | ErrExpr | LoopVar => {
+      return 0
+    }
+    BreakStmt | ContinueStmt | UnionDecl | ImportDecl => {
+      return 0
+    }
+    BinExpr => {
+      bdWalk(n.binLeft)
+      return bdWalk(n.binRight)
+    }
+    Call => {
+      bdWalk(n.callFn)
+      for a in n.callArgs { bdWalk(a) }
+      return 0
+    }
+    Member => {
+      return bdWalk(n.memObj)
+    }
+    Paren => {
+      return bdWalk(n.parInner)
+    }
+    RetStmt => {
+      return bdWalk(n.retArg)
+    }
+    Index => {
+      bdWalk(n.idxArr)
+      return bdWalk(n.idxIndex)
+    }
+    Unary => {
+      return bdWalk(n.unArg)
+    }
+    IsExpr => {
+      return bdWalk(n.isObj)
+    }
+    AsExpr => {
+      return bdWalk(n.asObj)
+    }
+    OptMember => {
+      return bdWalk(n.omObj)
+    }
+    Spread => {
+      return bdWalk(n.spdArg)
+    }
+    FieldInit => {
+      return bdWalk(n.fiValue)
+    }
+    ArrayLit => {
+      for e in n.arrElems { bdWalk(e) }
+      return 0
+    }
+    ObjLit => {
+      for f in n.objFields { bdWalk(f) }
+      return 0
+    }
+    WhileStmt => {
+      bdWalk(n.whileCond)
+      return bdWalk(n.whileBody)
+    }
+    Block => {
+      const mark = bdLogSid.length
+      for s in n.blkStmts { bdWalk(s) }
+      return bdClose(mark)
+    }
+    LetDecl => {
+      bdWalk(n.letInit)
+      return bdDeclare(ix)
+    }
+    FuncDecl => {
+      return bdFunc(n, ix)
+    }
+    ForRange => {
+      bdWalk(n.frFrom)
+      bdWalk(n.frTo)
+      bdWalk(n.frStep)
+      const mark = bdLogSid.length
+      bdDeclare(ix)
+      bdWalk(n.frBody)
+      return bdClose(mark)
+    }
+    ForIn => {
+      bdWalk(n.fiIter)
+      const mark = bdLogSid.length
+      bdDeclare(n.fiDecl1)
+      if n.fiDecl2 >= 0 { bdDeclare(n.fiDecl2) }
+      bdWalk(n.fiBody)
+      return bdClose(mark)
+    }
+    MatchExpr => {
+      return bdMatch(n)
+    }
+    IfStmt => {
+      return bdIfChain(ix)
+    }
+    Param | FieldDef | TypeDecl | Program => {
+      return bdKidsWalk(ix)
+    }
   }
-  if n is LetDecl {
-    bdWalk(n.letInit)
-    return bdDeclare(n.letName, ix)
-  }
-  if n is FuncDecl { return bdFunc(n, ix) }
-  if n is ForRange {
-    bdWalk(n.frFrom)
-    bdWalk(n.frTo)
-    bdWalk(n.frStep)
-    const mark = bdLogSid.length
-    bdDeclare(n.frVar, ix)
-    bdWalk(n.frBody)
-    return bdClose(mark)
-  }
-  if n is ForIn {
-    bdWalk(n.fiIter)
-    const mark = bdLogSid.length
-    bdDeclare(n.fiVar, n.fiDecl1)
-    if n.fiDecl2 >= 0 { bdDeclare(n.fiVar2, n.fiDecl2) }
-    bdWalk(n.fiBody)
-    return bdClose(mark)
-  }
-  if n is MatchExpr { return bdMatch(n) }
-  if n is IfStmt { return bdIfChain(ix) }
-  bdKidsWalk(ix)
 }
 
 // An `else if` chain, walked link by link rather than recursed, so its depth costs no stack.
@@ -177,7 +277,7 @@ function bdKidsWalk(ix: i32) {
 // A function's name binds where it stands, before its body, so a self-call resolves; its
 // parameters bind in its own frame.
 function bdFunc(n: FuncDecl, ix: i32) {
-  if n.fnName != "" && !bdFnDropped(ix) { bdDeclare(n.fnName, ix) }
+  if n.fnName != "" && !bdFnDropped(ix) { bdDeclare(ix) }
   const mark = bdLogSid.length
   for p in n.fnParams { bdParam(p) }
   bdWalk(n.fnBody)
@@ -192,12 +292,12 @@ function bdParam(p: i32) {
     if pn.parDefault >= 0 && pn.parDefault < P.nodes.length {
       const d = nodeAt(pn.parDefault)
       if d is Ident {
-        identSet(pn.parDefault, bdResolve(d.identName, true))
+        identSet(pn.parDefault, bdResolve(sidOfNode(pn.parDefault), true))
       } else {
         bdWalk(pn.parDefault)
       }
     }
-    if identAuditDrop != IDENT_DROP_FN_DECL { bdDeclare(pn.parName, p) }
+    if identAuditDrop != IDENT_DROP_FN_DECL { bdDeclare(p) }
   }
   0
 }
@@ -209,7 +309,7 @@ function bdPatName(p: i32) {
   const pn = nodeAt(p)
   if pn is IsExpr {
     if pn.isVariant == "null" { return 0 }
-    const d = bdResolve(matchPatValueName(p, pn.isVariant), false)
+    const d = bdResolve(sidOf(matchPatValueName(p, pn.isVariant)), false)
     if d != IDENT_BUILTIN { identSet(p, d) }
   }
   0
