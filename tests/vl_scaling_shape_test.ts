@@ -841,11 +841,11 @@ axis(
 
 // D2933's same-name GROWTH pair: 800 functions each re-seating its own `r` against 200, so
 // linear reads 4 and quadratic 16. Fuel reads 3.94 on master `8615a730d` and with the re-seat
-// alike, so the bar is 1.25x that.
+// alike, so the bar is 1.25x that. A scanned build table (`recBuildPassAt`) read 4.86; as a map, 3.97.
 axis(
   "re-seated record literals sharing a name",
   5.0,
-  "A record literal's re-seat (`objLitBindDestRow`, compiler/emit_classify.vl) is reading other functions' identifiers.",
+  "A record literal's re-seat (`objLitBindDestRow`, compiler/emit_classify.vl) or the build table it reads (`recBuildPassAt`, compiler/check_rec_rows.vl) is reading other functions' bindings.",
   (d) => twoFiles(d, genReseatedRecordsFn(800), genReseatedRecordsFn(200)),
 );
 
