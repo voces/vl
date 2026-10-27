@@ -21843,19 +21843,13 @@ function widenClassifyExpr(exprIx: i32, fnIx: i32) {
   exprIx
 }
 
-// Whether the node at `ix` is an integer literal, or `-` applied to one (parens peeled).
-function numLitOrNegated(ix: i32): boolean {
-  const n = nodeAt(ix)
-  if n is Unary {
-    if n.unOp != "-" { return false }
-    return numLitOrNegatedLeaf(unwrapParen(n.unArg))
-  }
-  numLitOrNegatedLeaf(ix)
-}
-function numLitOrNegatedLeaf(ix: i32): boolean {
-  const n = nodeAt(ix)
-  if n is NumLit { return !numLexIsFloat(n.numText) }
-  false
+// Builds the number literal at `exprIx` (parens and minuses peeled) as one `<w>.const` at the
+// width `w` its consumer names; -2 when `exprIx` is no literal. One literal node can be built at
+// several widths (a numeric-union member's arithmetic, a fresh-record call's field), so no one
+// checker type carries this; re-encoding keeps a hex literal past I32_MAX the value it spells.
+function emitNumLitAs(exprIx: i32, w: string): i32 {
+  if signedNumLitText(exprIx) == "" { return -2 }
+  emitSignedNumLitAt(unwrapParen(exprIx), w)
 }
 
 // Emit the expression at `exprIx` as an i64 value: a bare integer literal lowers directly
@@ -21863,11 +21857,9 @@ function numLitOrNegatedLeaf(ix: i32): boolean {
 // any other i32 source is emitted then sign-extended (`i64.extend_i32_s`). A literal or a
 // negated one takes the width this call names, whatever its own type: a box operand has none.
 export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
-  // Build a literal (or a negated one) at i64: one literal node can be built at several widths
-  // (a numeric-union member's arithmetic, a fresh-record call's field), so no one checker type
-  // carries this; re-encoding keeps a hex literal past I32_MAX the value it spells.
+  const lit = emitNumLitAs(exprIx, "i64")
+  if lit != -2 { return lit }
   const inner = unwrapParen(exprIx)
-  if numLitOrNegated(inner) { return emitSignedNumLitAt(inner, "i64") }
   const rw64 = asgRadixWidePrim(inner, fnIx)
   if rw64 != "" { return emitAsgRadixAs(body, inner, rw64, "i64", fnIx, ec) }
   if exprIsI64(widenClassifyExpr(exprIx, fnIx), fnIx) {
@@ -21909,11 +21901,9 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
     }
   }
   if exprIsF64(f64Cls, fnIx) { return emitExpr(body, exprIx, fnIx, ec) }
-  // Build an int literal of any radix (or a negated one) at f64, as the i64 arm does: exact,
-  // where converting the i32 bit pattern of `0xFFFFFFFF` would give -1. Checked before the i64
-  // branch so a big literal stays one `f64.const` too.
-  const f64Inner = unwrapParen(exprIx)
-  if numLitOrNegated(f64Inner) { return emitSignedNumLitAt(f64Inner, "f64") }
+  // Checked before the i64 branch so a big literal stays one `f64.const` too.
+  const lit = emitNumLitAs(exprIx, "f64")
+  if lit != -2 { return lit }
   // An i64 source converts (signed) to f64.
   if exprIsI64(f64Cls, fnIx) {
     if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
@@ -21966,13 +21956,10 @@ function signedNumLitText(exprIx: i32) {
 // precision and never demoted from f64; otherwise an i32 expression converts with
 // `f32.convert_i32_s`. An i32 variable never reaches the convert path unliterally — the checker rejects i32→f32 as lossy above 2^24, so only an exactness-gated literal takes it.
 export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
-  // Build a (possibly negated) literal at f32, as the i64 arm does. One `f32.const` is also a
-  // constexpr, unlike `i32.const` + convert, so it can reach a `const` global's f32 field.
-  const litText = signedNumLitText(exprIx)
-  if litText != "" {
-    fbF32Const(litText)
-    return 0
-  }
+  // One `f32.const` is also a constexpr, unlike `i32.const` + convert, so it can reach a
+  // `const` global's f32 field.
+  const lit = emitNumLitAs(exprIx, "f32")
+  if lit != -2 { return lit }
   const rw32f = asgRadixWidePrim(unwrapParen(exprIx), fnIx)
   if rw32f != "" { return emitAsgRadixAs(body, exprIx, rw32f, "f32", fnIx, ec) }
   // An already-f32-valued expression (a variable, an f32 arithmetic / call result) emits
