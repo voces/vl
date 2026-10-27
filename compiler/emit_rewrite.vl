@@ -250,7 +250,7 @@ import {
   tyIsListUnion,
 } from "./emit_join_records"
 import { asgValueNode } from "./emit_local_scope"
-import { armRowOfRecordTyShim } from "./emit_mv_slots"
+import { armRowOfRecordTyShim } from "./emit_rep"
 import { inferRetNulPinned, synthTypeRefTy } from "./emit_nullable_rets"
 import { exprReReadable } from "./emit_obj_lit_fits"
 import { shapeNominalOfTy, tyStructHasMapField } from "./emit_shape_rows"
@@ -1121,21 +1121,11 @@ function nssCandidate(ix: i32): boolean {
   nssScalarOf(ix) >= 0
 }
 
-// True when node `ix` declares `name` (a shadow the walk does not follow), or is a `match`,
-// which the checker desugars before this pass and so is not expected here.
-function nssDeclares(ix: i32, name: string): boolean {
-  const n = nodeAt(ix)
-  if n is LetDecl { return n.letName == name }
-  if n is Param { return n.parName == name }
-  if n is ForRange { return n.frVar == name }
-  if n is ForIn { return n.fiVar == name || n.fiVar2 == name }
-  if n is FuncDecl { return n.fnName == name }
-  if n is MatchExpr { return true }
-  nssBindsNoName(ix)
+// Whether node `ix` is a read of the `let` at `letIx`.
+function nssReadOf(ix: i32, letIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return false }
+  identDeclOf(ix) == letIx
 }
-
-// Every other node kind binds no name of its own.
-function nssBindsNoName(_ix: i32): boolean { false }
 
 // Classifies every use of the `const` at `letIx`, the statement of block `blk`, and rewrites
 // them and the binding when all qualify.
@@ -1146,7 +1136,6 @@ function nssTry(blk: i32, letIx: i32) {
     if d is LetDecl {
       const s = nssScalarOf(letIx)
       const t = nodeTyIxOf(d.letInit)
-      const name = d.letName
       const st = b.blkStmts
       let at = -1
       let i = 0
@@ -1172,11 +1161,12 @@ function nssTry(blk: i32, letIx: i32) {
         const ix = todo.pop() ?? -1
         const fn = inFn.pop() ?? false
         if ix >= 0 && ix < P.nodes.length {
-          if nssDeclares(ix, name) { return 0 }
           const n = nodeAt(ix)
+          // The checker desugars a `match` before this pass, so one here is not expected.
+          if n is MatchExpr { return 0 }
           let kids = true
           if n is Ident {
-            if n.identName == name {
+            if identDeclOf(ix) == letIx {
               if fn || !tyEq(nodeTyIxOf(ix), s) { return 0 }
               reads.push(ix)
             }
@@ -1185,13 +1175,13 @@ function nssTry(blk: i32, letIx: i32) {
             if op == "==" || op == "!=" {
               let operand = -1
               if (
-                isIdentNamed(n.binLeft, name)
+                nssReadOf(n.binLeft, letIx)
                 && nodeAt(n.binRight) is NullLit
               ) {
                 operand = n.binLeft
               }
               if (
-                isIdentNamed(n.binRight, name)
+                nssReadOf(n.binRight, letIx)
                 && nodeAt(n.binLeft) is NullLit
               ) {
                 operand = n.binRight
@@ -1201,7 +1191,7 @@ function nssTry(blk: i32, letIx: i32) {
                 if op == "==" { abs.push(ix) } else { pres.push(ix) }
                 kids = false
               }
-            } else if op == "??" && isIdentNamed(n.binLeft, name) {
+            } else if op == "??" && nssReadOf(n.binLeft, letIx) {
               if fn || !tyEq(nodeTyIxOf(n.binLeft), t) { return 0 }
               coals.push(ix)
               todo.push(n.binRight)
@@ -1209,7 +1199,7 @@ function nssTry(blk: i32, letIx: i32) {
               kids = false
             }
           } else if n is IsExpr {
-            if isIdentNamed(n.isObj, name) {
+            if nssReadOf(n.isObj, letIx) {
               if fn || !tyEq(nodeTyIxOf(n.isObj), t) { return 0 }
               if n.isVariant == "null" { abs.push(ix) }
               else if n.isVariant == tyToStr(s) { pres.push(ix) }

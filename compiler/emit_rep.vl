@@ -3408,12 +3408,12 @@ function repOfNullable(inner: i32): RepDesc {
 // claims it (`std:fs`'s `IoError` has both); else `nulstruct`. A twin of a variant row's shape
 // is that row (D3870); a shape only the checker's member set holds has no row and stays a struct.
 function repNulObjKind(objTy: i32): VKind {
-  if tyIxIsVariantMember(objTy) && repSlotOfTyDecl(objTy) < 0 {
-    let i = 0
-    while i < uVarTyIx.length {
-      if uVarTyIx[i] == objTy { return "nulvariant" }
-      i = i + 1
-    }
+  if (
+    tyIxIsVariantMember(objTy)
+    && repSlotOfTyDecl(objTy) < 0
+    && armRowOfRecordTyShim(objTy) >= 0
+  ) {
+    return "nulvariant"
   }
   const r = repVariantShapeRowOf(objTy)
   if r >= 0 { return "nulvariant" }
@@ -3447,6 +3447,52 @@ export function repVariantShapeRowOf(ty: i32): i32 {
   const r = rvsRow[repCanonId(ty)] ?? (-1)
   if r < 0 || repSlotOfTyDecl(ty) >= 0 { return -1 }
   r
+}
+
+// The first variant row whose arm type is the bare record `ty`, or -1: the shim every reader
+// that holds a type rather than a union row position asks, and the deletion target (D14552).
+// A query-side hazard: `nodeTyIxOf(paramTypeNode(...))` for a union-annotated param hands
+// back the first arm, not the union.
+export function armRowOfRecordTyShim(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  // No structural rung: two variants with the same field set are different variants, and a
+  // `tySame` fallback here would match the first of them for both. Variants are nominal,
+  // like unions and unlike structs, since their whole purpose is to be told apart. The index
+  // rung is the whole function: `declTyIxOfName` resolves each arm's declaration.
+  vrIxSync()
+  vrIxFirst[ty] ?? (-1)
+}
+
+// The variant row a value of record type `ty` whose rep is `variant` is stored under: the row
+// recorded at `ty`, else the first arm of its shape, which a structural twin is; -1 for none.
+export function variantRowOfRepTy(ty: i32): i32 {
+  const vr = armRowOfRecordTyShim(ty)
+  if vr >= 0 { return vr }
+  repVariantShapeRowOf(ty)
+}
+
+// `armRowOfRecordTyShim`'s index: arm type to the first `uVarTyIx` row carrying it, over rows below
+// `vrIxUpTo`. Rows are only appended between resets, so it extends in place; a reset of the
+// table or a new pass rebuilds it (D11320).
+let vrIxFirst: {[i32]: i32} = Map()
+
+let vrIxUpTo = 0
+
+const vrIxKey = memoKeyNew(2)
+
+function vrIxSync() {
+  let moved = memoMoved(vrIxKey, 0, uVarTyIxResets)
+  moved = memoPassMoved(vrIxKey, 1) || moved
+  if moved || uVarTyIx.length < vrIxUpTo {
+    vrIxFirst = Map()
+    vrIxUpTo = 0
+  }
+  while vrIxUpTo < uVarTyIx.length {
+    const t = uVarTyIx[vrIxUpTo]
+    if !vrIxFirst.has(t) { vrIxFirst[t] = vrIxUpTo }
+    vrIxUpTo = vrIxUpTo + 1
+  }
+  0
 }
 
 // Whether record type `ty` may be an arm by shape: a record that is not a `new` brand. A declared
