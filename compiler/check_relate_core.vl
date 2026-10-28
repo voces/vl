@@ -24,6 +24,7 @@ import {
   fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
+import { mintFactNote, mintScopeAt } from "./check_mint"
 import {
   ArrayLit,
   BinExpr,
@@ -4547,6 +4548,7 @@ function holeCallNodeTy(
   if n is Call && holeParamIndexOfCall(n, vNames, calleeFn) >= 0 {
     const inst = holeCallInstOf(ix, vNames, vTys, calleeFn, depth)
     if inst < 0 { return -1 }
+    mintCallNote(ix, n, vNames, vTys, calleeFn, inst)
     const f = tyAt(inst)
     if f is TyFunc { return f.fnRet }
     return -1
@@ -4568,6 +4570,64 @@ function holeCallNodeTy(
   const t = substTyDeep(nodeTyOf(ix), vNames, vTys)
   if t < 0 || tyHasTyVar(t) || tyIsDeferredJoin(t) { return -1 }
   t
+}
+
+// Whether `mintCallNote` is typing a set's members, whose own calls it does not record.
+let mintNoting = false
+
+// Records call `ix` of a hole parameter of `calleeFn`, typed at `vNames`/`vTys` with instance
+// type `inst`, when that parameter is bound to a function set: the fact `holeSetCallRet` notes
+// for a call outside an instance, kept by instance (`check_mint`, D14430).
+function mintCallNote(
+  ix: i32,
+  n: Call,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  inst: i32,
+) {
+  if mintNoting { return 0 }
+  const k = holeParamIndexOfCall(n, vNames, calleeFn)
+  if k < 0 || k >= vTys.length { return 0 }
+  const s = fnTagSetOfTy(vTys[k])
+  const ds = fnTagMembers(s)
+  if ds.length == 0 { return 0 }
+  for d in ds {
+    if !setMemberDecl(d) { return 0 }
+  }
+  const f = tyAt(inst)
+  if !(f is TyFunc) { return 0 }
+  const wp: i32[] = []
+  let key = ""
+  for pt in f.fnParamTypes {
+    const w = widenLitTy(pt)
+    wp.push(w)
+    key = key + tyToStr(w) + ","
+  }
+  mintNoting = true
+  const ft = mkFuncTy(wp, TY_I32)
+  const rs: i32[] = []
+  let split = false
+  let open = false
+  for d in ds {
+    const rd = setMemberRetAt(d, ft)
+    if rd < 0 || tyHasTyVar(rd) {
+      open = true
+    } else {
+      const w = widenLitTy(rd)
+      if rs.length > 0 && !tySame(w, rs[0]) { split = true }
+      rs.push(w)
+    }
+  }
+  mintNoting = false
+  if open { return 0 }
+  let bk = ""
+  let i = 0
+  while i < vNames.length && i < vTys.length {
+    bk = bk + vNames[i] + "=" + tyToStr(vTys[i]) + ";"
+    i = i + 1
+  }
+  mintFactNote(mintScopeAt(calleeFn, bk), ix, s, key, split, rs)
 }
 
 // The result of direct call `n` of un-annotated function `decl` as its body gives it at the bound
