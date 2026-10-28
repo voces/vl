@@ -401,7 +401,6 @@ import {
   globalIndexOf,
   inferredRetKindCore,
   paramNulMap,
-  paramNulRef,
   paramNulVariant,
   paramReadAt,
   paramTypeNodeAt,
@@ -971,7 +970,6 @@ import {
 } from "./emit_ty_canon"
 import {
   annRowOfNode,
-  declaredNulRef,
   isUNameAnnAB,
   mapShapeOfTyPeeled,
   mvShapeOfMapHeldTy,
@@ -2455,41 +2453,10 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
       return nodeRepIs(exprIx, "nulstruct", fnIx)
         || nodeRepIs(exprIx, "nulvariant", fnIx)
     }
-    Ident => {
-      if (
-        paramNulRef(fnIx, e.identName)
-        && paramReadAt(fnIx, e.identName, exprIx)
-      ) {
-        return true
-      }
-      if declaredNulRef(e.identName) { return true }
-      // A captured nullable struct: the env field is `(ref null $S)`, so classify it nullable,
-      // else `p != null` reads as struct equality. The struct index resolves through
-      // `capturedStructIndex`.
-      if capturedKindOf(fnIx, e.identName) == "nulstruct" { return true }
-      // The frame's own `let`, last for the reason the map arms take it last: every resolver
-      // above speaks for a storage class this one does not.
-      const fns = frameLetOf(fnIx, e.identName, exprIx)
-      if fns >= 0 && letIsNulRef(fns, fnIx) { return true }
-      const gli = globalLetOfSidIn(fnIx, sidOfNode(exprIx), exprIx)
-      if gli >= 0 { return letIsNulRef(gli, -1) }
-      // The module frame's block `let`, which is neither a frame's nor a global: a capture's env
-      // field is typed with no frame current, so only this rung sees its niche (D6730).
-      if frameChainBindsName(fnIx, e.identName) { return false }
-      const mli = moduleLocalLetOfAt(emitRootIx, e.identName, exprIx)
-      if mli >= 0 { return letIsNulRef(mli, -1) }
-      return false
-    }
-    // A nested-struct field read (code 15) is stored `(ref null $S)`: an `S | null` field
-    // genuinely carries null, and a plain `inner: S` field shares the nullable storage, so
-    // the read is nullable-classified and the consumer inserts `ref.as_non_null` before a
-    // chained field access.
-    Member => {
-      if memberFieldCode(exprIx, fnIx) != FC_STRUCT { return false }
-      // A code-15 field whose target is a union arm stores `(ref null $uVarHeap[vi])`, not
-      // `(ref null $S)`, and the variant twin owns it. Declining here keeps the two twins
-      // from both answering yes about one read (D1150).
-      return memberNulVariantRow(exprIx, fnIx) < 0
+    // A read is what its recorded rep says: a narrowed read of a nullable cell, and a plain
+    // `inner: S` field stored `(ref null $S)`, recover at the read (`readOwesNonNullRecover`).
+    Ident | Member => {
+      return exprNulKind(exprIx, fnIx) == "nulstruct"
     }
     // The `?.` spelling of the same read (D1084): `o?.f` over a code-15 field is `S | null`
     // for the second reason as well as the first — the chain itself can be null — so it is
@@ -12083,6 +12050,11 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
       return rlElemKindTbl[slot] == RLK_STRUCT
     }
   }
+  // A field read is a struct when its recorded rep is one, whatever its storage holds.
+  if e is Member {
+    const md = repOfNode(exprIx, fnIx)
+    if md.rdCovered == 1 && md.rdKind == "struct" { return true }
+  }
   // A NULLABLE struct value (`S | null`) participates in the struct machinery
   // (member layout resolution); the field-read path inserts the non-null recover.
   exprNullableStruct(exprIx, fnIx)
@@ -13218,6 +13190,9 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   }
   match e {
     Member => {
+      // A field read is a union box when its recorded rep is one.
+      const urd = repOfNode(exprIx, fnIx)
+      if urd.rdCovered == 1 && urd.rdKind == "union" { return true }
       // A field or cell narrowed to a niche-repped `A | null` reads as that niche (D2590).
       if nicheReadKindAt(exprIx, placeNarrowKeyOf(exprIx), fnIx) >= 0 {
         return false
