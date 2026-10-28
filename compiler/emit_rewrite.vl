@@ -159,6 +159,7 @@ import {
   callSiteLocOf,
   elseIfLink,
   externArityAt,
+  externCount,
   externLinkOf,
   externParamAt,
   externRetAt,
@@ -242,12 +243,7 @@ import {
   unTyIx,
 } from "./emit_state"
 import { capMemoNoteEdit } from "./emit_capture_frames"
-import {
-  exprIsClosure,
-  fnIndexOf,
-  letDeclIsClosureNoLocal,
-  structIndexOfExpr,
-} from "./emit_classify"
+import { exprIsClosure, fnIndexOf, structIndexOfExpr } from "./emit_classify"
 import { nameIsWholeSpanShape } from "./emit_field_codes"
 import {
   fnRetJoinsWiderRecord,
@@ -262,7 +258,6 @@ import { shapeNominalOfTy, tyStructHasMapField } from "./emit_shape_rows"
 import {
   drwFieldClosure,
   listUnionEmitName,
-  nameFreeToModule,
   shapeNominalOr,
 } from "./emit_sig_tokens"
 import { sFieldIndex } from "./emit_struct_order"
@@ -271,7 +266,6 @@ import { eqgCoreAdd, eqgCoresReset, eqgRowIsCyclic } from "./emit_eq_rows"
 import { nliForgetLet } from "./emit_union_atoms"
 import { unRowOfCanon } from "./emit_union_registry"
 import { fnIndexOfInScopeChainAt } from "./emit_value_sites"
-import { paramIsClosure, paramNulClosure } from "./emit_query"
 import {
   IDENT_BUILTIN,
   IDENT_DROP_CBOX_READ,
@@ -1457,14 +1451,6 @@ function drwSelfFnRef(ix: i32, name: string, argc: i32) {
   id
 }
 
-// The closure-typed `let`/`const` names the walk has open, innermost last, truncated when
-// a block ends. This pass runs before `buildLocals`, so the locals registry cannot say
-// which binding a call denotes and the walk's own scope has to (D1602).
-const drwCloNames: string[] = []
-
-// Is a closure `let`/`const` of `name` open at the walk's current point?
-function drwCloShadowed(name: string) { strListHas(drwCloNames, name) }
-
 // Normalizes a direct call to its callee's full arity, appending the declaration's
 // default expressions for the trailing arguments the call omitted — runs before
 // monomorphization, so every later pass sees an ordinary full-arity call and no
@@ -1482,12 +1468,10 @@ export function drwFillDefaults(ix: i32, ctx: i32) {
         n.callFn,
       )
       if fe < 0 { return 0 }
-      // A closure binding of the name is what the call denotes, so the module function's
-      // defaults are not this call's: filling them hands the closure an argument its
-      // signature has no parameter for (D1602).
-      if paramIsClosure(ctx, n.callFn) { return 0 }
-      if paramNulClosure(ctx, n.callFn) { return 0 }
-      if drwCloShadowed(cf.identName) { return 0 }
+      // A call whose callee reads a binding is not the module function's: filling that
+      // function's defaults hands the binding an argument it has no parameter for (D1602).
+      const cd = identDeclOf(n.callFn)
+      if !(cd >= 0 && nodeAt(cd) is FuncDecl) { return 0 }
       const fn = nodeAt(fnStmts[fe])
       if fn is FuncDecl {
         const ps = fn.fnParams
@@ -1704,14 +1688,10 @@ function drwOpCall(call: i32, opIx: i32): i32 {
 }
 
 // `drwWalk`'s block arm: walks block `n`'s statements in order, splicing each compound place's
-// spills in ahead of it, with a closure binding's name live from its declaration to the
-// block's end.
+// spills in ahead of it.
 function drwWalkBlock(n: Block, ctx: i32) {
   const bs = n.blkStmts
   let i2 = 0
-  // A closure binding opens where it is declared and closes with the block, so the
-  // stack grows as the statements are walked and truncates on the way out.
-  const cloMark = drwCloNames.length
   while i2 < bs.length {
     // The spills land ahead of the write and are walked next, as ordinary statements.
     const cpOut: i32[] = []
@@ -1731,15 +1711,10 @@ function drwWalkBlock(n: Block, ctx: i32) {
       capMemoNoteEdit()
       plCacheBust()
     }
-    const bst = nodeAt(bs[i2])
-    if bst is LetDecl {
-      if letDeclIsClosureNoLocal(bs[i2]) { drwCloNames.push(bst.letName) }
-    }
     drwAtStmt = i2 + 1 < bs.length
     bs[i2] = drwBareBlock(drwWalk(bs[i2], ctx))
     i2 = i2 + 1
   }
-  while drwCloNames.length > cloMark { drwCloNames.pop() }
 }
 
 // `drwWalk`'s `if` arm: walks the condition and branches of the `if` at `ix`, following an
@@ -2398,7 +2373,6 @@ export function dispatchRewrite(stmts: i32[]) {
   while fe < fnStmts.length {
     const fn = nodeAt(fnStmts[fe])
     if fn is FuncDecl {
-      drwCloNames.clear()
       const drwBody = drwWalk(fn.fnBody, fnStmts[fe])
       if drwBody != fn.fnBody { bodyRebuiltFrom.set(drwBody, fn.fnBody) }
       fn.fnBody = drwBody
@@ -2658,22 +2632,21 @@ function spillTypeByTarget(decl: i32, rd: i32, t: i32) {
 // differ (`5` into an `f64`), a write on its statement's leading evaluation path moves ahead
 // of the statement as `const v = e; a = v`, and the statement reads `v`.
 
-// The names read, in evaluation order, by operands the walk has already passed; a write the
-// walk moves ahead of them must not change what they read.
-let asvReads: string[] = []
+// The declarations read, in evaluation order, by operands the walk has already passed; a write
+// the walk moves ahead of them must not change what they read.
+let asvReads: i32[] = []
 // Set once the walk passes an operand that it cannot prove the moved write leaves alone.
 let asvStop = false
 // Whether the statement walked is a top-level binding, which has room for one moved write.
 let asvTopLet = false
 
-// Records the operand at `ix` as passed: a name joins `asvReads`, and any operand other than
-// a name or a literal (`exprReReadable` of a leaf) ends the walk.
+// Records the operand at `ix` as passed: a name's declaration joins `asvReads`, and any operand
+// other than a name or a literal (`exprReReadable` of a leaf) ends the walk.
 function asvPassOperand(ix: i32) {
   const u = unwrapParen(ix)
   if u < 0 { return 0 }
-  const n = nodeAt(u)
-  if n is Ident {
-    asvReads.push(n.identName)
+  if nodeAt(u) is Ident {
+    asvReads.push(identDeclOf(u))
     return 0
   }
   if !asvIsLeaf(u) { asvStop = true }
@@ -2712,16 +2685,24 @@ function asvMoves(asgIx: i32): boolean {
   if !asvTypeMoves(asgIx) { return false }
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
-  const t = nodeAt(a.binLeft)
-  if !(t is Ident) { return false }
+  if !(nodeAt(a.binLeft) is Ident) { return false }
+  const td = identDeclOf(a.binLeft)
   let i = 0
   let spilled = true
   while i < asvReads.length {
-    if asvReads[i] == t.identName { return false }
-    if asvReads[i].slice(0, 4) != "asg#" { spilled = false }
+    if asvReads[i] == td { return false }
+    if !asvIsSpill(asvReads[i]) { spilled = false }
     i = i + 1
   }
   spilled || !asvMayWrite(a.binRight)
+}
+
+// Whether declaration `d` is a spill `spillLocal` minted, which no write can reach.
+function asvIsSpill(d: i32): boolean {
+  if d < 0 { return false }
+  const dn = nodeAt(d)
+  if dn is LetDecl { return dn.letName.slice(0, 4) == "asg#" }
+  false
 }
 
 // True when `ix` is a number literal, or a plain write whose value is one (`gi = 14`).
@@ -2791,7 +2772,8 @@ function asvWalk(ix: i32, out: i32[], isValue: boolean): i32 {
       asvPassOperand(callee.memObj)
     } else if callee is Ident {
       // A callee a binding holds is read before the arguments run.
-      if asvIsBound(callee.identName) { asvPassOperand(n.callFn) }
+      const cd = identDeclOf(n.callFn)
+      if cd >= 0 && !(nodeAt(cd) is FuncDecl) { asvPassOperand(n.callFn) }
     } else {
       asvStop = true
     }
@@ -2930,40 +2912,6 @@ function asvStmt(ix: i32, out: i32[]) {
   0
 }
 
-// Every name a `let` or a parameter binds, so a call through a binding reads it; built on
-// the first question, since most programs never ask one.
-let asvBound: {[string]: i32} = Map()
-let asvBoundBuilt = false
-
-// Records the name the `let` at `ix` binds, if it is one.
-function asvNoteLet(ix: i32) {
-  const bn = nodeAt(ix)
-  if bn is LetDecl { asvBound[bn.letName] = 1 }
-  0
-}
-
-// Records the name the parameter at `ix` binds, if it is one.
-function asvNoteParam(ix: i32) {
-  const bn = nodeAt(ix)
-  if bn is Param { asvBound[bn.parName] = 1 }
-  0
-}
-
-// Whether some `let` or parameter binds `name`.
-function asvIsBound(name: string): boolean {
-  if !asvBoundBuilt {
-    asvBoundBuilt = true
-    const n = P.nodes.length
-    let i = 0
-    while i < n {
-      asvNoteLet(i)
-      asvNoteParam(i)
-      i = i + 1
-    }
-  }
-  (asvBound[name] ?? 0) == 1
-}
-
 // Rewrites one statement list, once after every statement is walked (D2872): the moved writes
 // land ahead of their statement. A top-level statement other than a binding takes them inside a
 // bare block of its own, so they stay locals of the start function. A top-level binding moves
@@ -3066,8 +3014,6 @@ function asvChainHasElse(ix: i32): boolean {
 
 // The pass: every statement list in the arena, before collection reads the module's bindings.
 export function assignValueSpill(stmts: i32[]) {
-  asvBound = Map()
-  asvBoundBuilt = false
   const n = P.nodes.length
   // A program whose every write stores its right side's own type has nothing to move.
   if !asgAnyWiderStore() { return 0 }
@@ -5189,24 +5135,14 @@ export function synthVoidTwins(_stmts: i32[]) {
 // A function value is called with its closure env as the leading argument, which a host
 // import does not take. So each extern read other than as a callee gets one capture-free
 // forwarding function `<name>$extv`, a spelling no program can write, and the read is respelled to name it (D2618).
-let extValName: string[] = []
+
+// `extValFe[k]`: the `fnStmts` position of the forwarding function minted for link row `k`, or -1.
 let extValFe: i32[] = []
 
-// The forwarding function minted for the extern named `name`, or -1.
-function externValueFe(name: string): i32 {
-  let i = 0
-  while i < extValName.length {
-    if extValName[i] == name { return extValFe[i] }
-    i = i + 1
-  }
-  -1
-}
-
 export function synthExternValues() {
-  extValName = []
   extValFe = []
-  extvLoopVars = []
   if !externValueSeen() || emitRootIx < 0 { return 0 }
+  while extValFe.length < externCount() { extValFe.push(-1) }
   const root = nodeAt(emitRootIx)
   if root is Program {
     let s = 0
@@ -5225,13 +5161,10 @@ export function synthExternValues() {
   0
 }
 
-// The loop variables of the `for`s of the walked frame the respell walk is inside: each is in
-// scope only in its own loop, which a whole-frame lookup cannot see.
-let extvLoopVars: string[] = []
-
 // Respell every extern read as a value in the subtree at `ix`, which lies in the frame of
 // function node `fnIx` (-1 for the module's statements). A nested function is its own
 // `fnStmts` frame and is not entered; a callee is a call to the import and is left alone.
+// A read means the extern when it resolves to no declaration of the program.
 function extvRespellIn(ix: i32, fnIx: i32) {
   let cur = ix
   while cur >= 0 && cur < P.nodes.length {
@@ -5239,20 +5172,15 @@ function extvRespellIn(ix: i32, fnIx: i32) {
     if n is FuncDecl { return 0 }
     if n is Ident {
       const nm = n.identName
-      if externLinkOf(nm) >= 0 && extvNameFree(fnIx, nm) {
-        if externValueFe(nm) < 0 { synthExternValueFn(nm, n.pos) }
-        if externValueFe(nm) >= 0 {
+      const k = externLinkOf(nm)
+      if k >= 0 && k < extValFe.length && identDeclOf(cur) == IDENT_BUILTIN {
+        if extValFe[k] < 0 { synthExternValueFn(nm, k, n.pos) }
+        if extValFe[k] >= 0 {
           n.identName = nm + "$extv"
-          sidNoteNodeName(cur, fnStmts[externValueFe(nm)])
+          sidNoteNodeName(cur, fnStmts[extValFe[k]])
         }
       }
       return 0
-    }
-    const mark = extvLoopVars.length
-    if n is ForRange { extvLoopVars.push(n.frVar) }
-    if n is ForIn {
-      extvLoopVars.push(n.fiVar)
-      extvLoopVars.push(n.fiVar2)
     }
     let skip = -1
     if n is Call {
@@ -5264,22 +5192,14 @@ function extvRespellIn(ix: i32, fnIx: i32) {
       if kids[k] != skip { extvRespellIn(kids[k], fnIx) }
       k = k + 1
     }
-    while extvLoopVars.length > mark { extvLoopVars.pop() }
     cur = elseIfLink(cur)
   }
   0
 }
 
-// Whether the extern `name` read in the frame of `fnIx` means the extern and not a binding.
-function extvNameFree(fnIx: i32, name: string): boolean {
-  if strListHas(extvLoopVars, name) { return false }
-  nameFreeToModule(fnIx, name)
-}
-
-// Mint `function <name>$extv(a0: P0, …): R { name(a0, …) }` for the extern `name`, from
-// its link row's own parameter and result spellings.
-function synthExternValueFn(name: string, pos: i32) {
-  const k = externLinkOf(name)
+// Mint `function <name>$extv(a0: P0, …): R { name(a0, …) }` for the extern `name` at link row
+// `k`, from that row's own parameter and result spellings.
+function synthExternValueFn(name: string, k: i32, pos: i32) {
   const n = externArityAt(k)
   if n < 0 { return 0 }
   const ps: i32[] = []
@@ -5315,8 +5235,7 @@ function synthExternValueFn(name: string, pos: i32) {
   fnParent.push(-1)
   fnDispNames.push("")
   fnValUsed = true
-  extValName.push(name)
-  extValFe.push(fnStmts.length - 1)
+  extValFe[k] = fnStmts.length - 1
   0
 }
 
