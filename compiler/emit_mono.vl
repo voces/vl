@@ -680,7 +680,7 @@ import {
   tyIsArmedDeferredJoin,
   tyIsTpJoinUnion,
 } from "./check_tp_join"
-import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
+import { binArithOp, numUnionMinted, tyIsNumUnion } from "./check_union_mint"
 import {
   fnTagArmsAt,
   fnTagCallArms,
@@ -3975,8 +3975,33 @@ function monoExprRebuild(ix: i32, kids: i32[], bN: string[], bT: i32[]): i32 {
   }
   if !changed { return ix }
   const nx = monoExprRemake(ix, kids)
-  if nx != ix { monoPinRecordTy(nx, monoPinnedTyOf(ix, bN, bT)) }
+  if nx != ix && nx >= 0 && nx < P.nodes.length {
+    monoPinRecordTy(nx, monoPinnedTyOf(ix, bN, bT))
+    const a = nodeAt(nx)
+    const o = nodeAt(ix)
+    if (
+      a is BinExpr
+      && o is BinExpr
+      && a.binCompound != ""
+      && a.binRight != o.binRight
+    ) {
+      monoPinRecordTy(a.binRight, monoPinnedTyOf(o.binRight, bN, bT))
+    }
+  }
   nx
+}
+
+// Compound assignment `n` reminted over `target` and `value`. Its minted inner operator
+// copies `n`'s, so it answers that node's checked type.
+function monoRemintCompound(n: BinExpr, target: i32, value: i32): i32 {
+  const nc = mkCompoundAssign(n.binCompound, target, value, n.pos)
+  if nc < 0 || nc >= P.nodes.length { return nc }
+  const a = nodeAt(nc)
+  if a is BinExpr {
+    nodeTyCarry(a.binRight, n.binRight)
+    nodeSrcNote(a.binRight, n.binRight)
+  }
+  nc
 }
 
 // Record `ty` as the type rebuilt node `nx` answers. A nullable scalar spelled nowhere
@@ -3989,8 +4014,6 @@ function monoPinRecordTy(nx: i32, ty: i32) {
   0
 }
 
-// The recorded type of `ix` at the instance binding `bN`/`bT`: substituted where that leaves
-// no type variable, else as recorded. -1 when the node has none.
 // The instance's remainder of an `is` else over a type parameter's list (`mkTvElseRemTy`), or -1
 // when `ty` is not one or the instance leaves nothing to subtract.
 function monoElseRemainderAt(ty: i32, bN: string[], bT: i32[]): i32 {
@@ -4004,10 +4027,21 @@ function monoElseRemainderAt(ty: i32, bN: string[], bT: i32[]): i32 {
   subtractTy(sb, sx)
 }
 
+// The recorded type of `ix` at the instance binding `bN`/`bT`: substituted where that leaves
+// no type variable, else as recorded. -1 when the node has none. Arithmetic over a gradual
+// union (`T | i32`) records its concrete view, so the instance's own check answers it.
 function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
   const ty = nodeTyIxOf(ix)
   if ty < 0 || ty >= T.tys.length { return ty }
-  if !tyHasTyVar(ty) { return ty }
+  if !tyHasTyVar(ty) {
+    const an = nodeAt(unwrapParen(ix))
+    let arith = an is Unary && an.unOp == "-"
+    if an is BinExpr { arith = an.binCompound == "" && binArithOp(an.binOp) }
+    if !arith { return ty }
+    const et = elabWalkTy(ix)
+    if et < 0 || et >= T.tys.length || tyHasTyVar(et) { return ty }
+    return et
+  }
   const rem = monoElseRemainderAt(ty, bN, bT)
   if rem >= 0 { return rem }
   let st = monoSubstInst(ty, bN, bT)
@@ -4138,7 +4172,7 @@ function monoExprMake(ix: i32, kids: i32[]): i32 {
         // A compound whose right side a rewrite respelled from `target op value` offers no value
         // kid (`monoExprKids`), so it is kept as it is (D3993).
         if kids.length < 2 { return ix }
-        return mkCompoundAssign(n.binCompound, kids[0], kids[1], n.pos)
+        return monoRemintCompound(n, kids[0], kids[1])
       }
       const nb = mkBinary(n.binOp, kids[0], kids[1], n.pos)
       if n.binRegion != 0 { markArithRegion(nb) }
@@ -8764,7 +8798,7 @@ function monoCloneGenericBinArm(ix: i32, n: BinExpr): i32 {
     if inner is BinExpr {
       const iv = monoCloneGenericCalls(inner.binRight)
       if iv == inner.binRight && ct == n.binLeft { return ix }
-      return mkCompoundAssign(n.binCompound, ct, iv, n.pos)
+      return monoRemintCompound(n, ct, iv)
     }
     return ix
   }
@@ -9299,7 +9333,7 @@ function monoFoldLayoutBin(
     if inner is BinExpr {
       const iv = monoFoldTyParamLayout(inner.binRight, typarams, tvN, tvV)
       if iv == inner.binRight && ct2 == n.binLeft { return ix }
-      return mkCompoundAssign(n.binCompound, ct2, iv, n.pos)
+      return monoRemintCompound(n, ct2, iv)
     }
     return ix
   }
