@@ -32,6 +32,7 @@ import {
   crReadMemo,
   crWideDepths,
   crWideNames,
+  crWideSlots,
 } from "./check_capture_rows"
 import {
   crAssignTarget,
@@ -52,12 +53,19 @@ import {
   NAR_KIND_ASG,
   asgDeclDepths,
   asgDeclFrames,
-  asgDeclKeys,
   asgDeclKinds,
+  asgDeclSlots,
   asgDeclTys,
   narBankRowsOf,
 } from "./check_nar_bank"
-import { declare, lookup, scopeDepthsOf } from "./check_scopes"
+import {
+  declare,
+  envDeclOfNameForFlow,
+  lookup,
+  slotLayerDepth,
+  slotLayerPrev,
+  slotLayerTop,
+} from "./check_scopes"
 import { T } from "./check_types"
 import { crArgMayBeFn, crIsScalarRender } from "./check_write_effects"
 import { strListWith } from "./listutil"
@@ -88,13 +96,8 @@ export function crInfoKey(name: string): string {
 // Whether `name` reads, through its narrowing layers, a binding declared outside every function
 // body being checked or in the body of the current root itself.
 function crNameAtRootLevel(name: string): boolean {
-  const ds = scopeDepthsOf[name]
-  if ds == null || ds.length == 0 { return false }
-  let j = ds.length - 1
-  while j > 0 && (crFirstBank(name, ds[j]) >= 0 || crWidenedAt(name, ds[j])) {
-    j = j - 1
-  }
-  const d = ds[j]
+  const d = crBindDepthOfSlot(envDeclOfNameForFlow(name))
+  if d < 0 { return false }
   let f = crFnBases.length - 1
   while f >= 0 && crFnBases[f] > d { f = f - 1 }
   if f < 0 { return true }
@@ -156,22 +159,22 @@ function crSubtreeBenign(ix: i32, name: string): boolean {
   true
 }
 
-// The first bank row of `name` at depth `d`: the widest type banked there.
-export function crFirstBank(name: string, d: i32): i32 {
+// The first bank row of slot `s` at depth `d`: the widest type banked there.
+export function crFirstBank(s: i32, d: i32): i32 {
   // A row is banked at the scope on top when it is noted, so depth `d`'s rows are its own
   // frame's span (`pushScope`); the whole bank is read only when `d` has no frame.
   const f = d - (T.frames.length - asgDeclFrames.length)
   if f >= 0 && f < asgDeclFrames.length {
-    let hi = asgDeclKeys.length
+    let hi = asgDeclSlots.length
     if f + 1 < asgDeclFrames.length { hi = asgDeclFrames[f + 1] }
     let j = asgDeclFrames[f]
     while j < hi {
-      if asgDeclKeys[j] == name && asgDeclDepths[j] == d { return j }
+      if asgDeclSlots[j] == s && asgDeclDepths[j] == d { return j }
       j = j + 1
     }
     return -1
   }
-  const rows = narBankRowsOf(name)
+  const rows = narBankRowsOf(s)
   let k = 0
   while k < rows.length {
     if asgDeclDepths[rows[k]] == d { return rows[k] }
@@ -188,30 +191,50 @@ export function crDeclareWidened(name: string, wide: i32) {
   declare(name, wide)
   crWideNames.push(name)
   crWideDepths.push(T.frames.length - 1)
+  crWideSlots.push(envDeclOfNameForFlow(name))
   0
 }
 
-export function crWidenedAt(name: string, d: i32): boolean {
-  let i = crWideNames.length - 1
+// Whether slot `s`'s layer at depth `d` is a `crDeclareWidened` binding.
+export function crWidenedAt(s: i32, d: i32): boolean {
+  let i = crWideSlots.length - 1
   while i >= 0 && crWideDepths[i] >= d {
-    if crWideDepths[i] == d && crWideNames[i] == name { return true }
+    if crWideDepths[i] == d && crWideSlots[i] == s { return true }
     i = i - 1
   }
   false
+}
+
+// Whether slot `s`'s layer at depth `d` is a narrowing rather than its declaration.
+export function crIsNarrowLayer(s: i32, d: i32): boolean {
+  crFirstBank(s, d) >= 0 || crWidenedAt(s, d)
+}
+
+// The depth of slot `s`'s declaration under its narrowing layers; the outermost layer when every
+// one is banked, since the declaration's own scope may bank a narrowing too. -1 when unbound.
+export function crBindDepthOfSlot(s: i32): i32 {
+  if s == -1 { return -1 }
+  let e = slotLayerTop(s)
+  if e < 0 { return -1 }
+  while slotLayerPrev(e) >= 0 && crIsNarrowLayer(s, slotLayerDepth(e)) {
+    e = slotLayerPrev(e)
+  }
+  slotLayerDepth(e)
 }
 
 export function crRootCaptureWiden(fnIx: i32) {
   if !inferQuiet { crCapWidenBank[fnIx] = [] }
   const base = crFnBase()
   // Rows sit in scope order, so the first is the outermost: none below `base` means no capture.
-  if asgDeclKeys.length == 0 || asgDeclDepths[0] >= base { return 0 }
+  if asgDeclSlots.length == 0 || asgDeclDepths[0] >= base { return 0 }
   const reads = crBodyReadNames(fnIx)
   let r = 0
   while r < reads.length {
     const nm = reads[r]
-    const i = crInnerRowBelow(nm, base)
-    if i >= 0 && crNameIsModuleTop(nm) {
-      const wide = crOuterWidest(nm, base)
+    const s = envDeclOfNameForFlow(nm)
+    const i = crInnerRowBelow(s, base)
+    if i >= 0 && crNameIsModuleTop(s) {
+      const wide = crOuterWidest(s, base)
       if (
         wide >= 0
         && wide != lookup(nm)
@@ -259,15 +282,15 @@ export function crNameAssignedInRoot(name: string): boolean {
   found
 }
 
-// Whether `name`'s innermost declaration is at module scope, looking through narrowing layers.
-export function crNameIsModuleTop(name: string): boolean {
-  const ds = scopeDepthsOf[name]
-  if ds == null { return false }
-  let j = ds.length - 1
-  while j >= 0 {
-    if ds[j] == 0 { return true }
-    if crFirstBank(name, ds[j]) < 0 { return false }
-    j = j - 1
+// Whether slot `s` is declared at module scope, looking through its narrowing layers.
+export function crNameIsModuleTop(s: i32): boolean {
+  if s == -1 { return false }
+  let e = slotLayerTop(s)
+  while e >= 0 {
+    const d = slotLayerDepth(e)
+    if d == 0 { return true }
+    if crFirstBank(s, d) < 0 { return false }
+    e = slotLayerPrev(e)
   }
   false
 }
@@ -353,9 +376,9 @@ export function crBodyReadNames(fnIx: i32): string[] {
   crReadAcc
 }
 
-// The innermost narrowing bank row of `name` below scope depth `base`, or -1.
-export function crInnerRowBelow(name: string, base: i32): i32 {
-  const rows = narBankRowsOf(name)
+// The innermost narrowing bank row of slot `s` below scope depth `base`, or -1.
+export function crInnerRowBelow(s: i32, base: i32): i32 {
+  const rows = narBankRowsOf(s)
   let r = rows.length - 1
   while r >= 0 {
     if asgDeclDepths[rows[r]] < base { return rows[r] }
@@ -390,19 +413,18 @@ function crReadWalk(ix: i32, pre: string) {
 
 let crReadAcc: string[] = []
 
-// The type `name` reads at under no narrowing, when its innermost binding is a narrowing layer
-// of a function enclosing the one whose body starts at scope depth `base`; -1 otherwise.
-export function crOuterWidest(name: string, base: i32): i32 {
-  const ds = scopeDepthsOf[name]
-  if ds == null || ds.length == 0 { return -1 }
-  if ds[ds.length - 1] >= base { return -1 }
+// The type slot `s` reads at under no narrowing, when its innermost layer is a narrowing of a
+// function enclosing the one whose body starts at scope depth `base`; -1 otherwise.
+export function crOuterWidest(s: i32, base: i32): i32 {
+  if s == -1 { return -1 }
+  let e = slotLayerTop(s)
+  if e < 0 || slotLayerDepth(e) >= base { return -1 }
   let widest = -1
-  let j = ds.length - 1
-  while j >= 0 {
-    const e = crFirstBank(name, ds[j])
-    if e < 0 { return widest }
-    widest = asgDeclTys[e]
-    j = j - 1
+  while e >= 0 {
+    const row = crFirstBank(s, slotLayerDepth(e))
+    if row < 0 { return widest }
+    widest = asgDeclTys[row]
+    e = slotLayerPrev(e)
   }
   widest
 }

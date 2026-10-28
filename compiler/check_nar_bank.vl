@@ -1,13 +1,13 @@
 // `check_nar_bank.vl` — the declared-type bank under a bare-name narrowing. Before a narrowing
-// shadows a binding, `noteNarShadow` banks the type its storage holds, keyed by name, scope depth
+// shadows a binding, `noteNarShadow` banks the type its storage holds, keyed by binding slot, depth
 // and kind (`NAR_KIND_*`), with one frame mark per scope; `narDeclaredTy` answers from the
 // innermost live row. `narBankReset` clears the bank per program, and `narBankPushFrame` and
 // `narBankPopFrame` follow the checker's scopes.
 
-import { lookupDepth } from "./check_scopes"
+import { declDepthOf } from "./check_scopes"
 import { T } from "./check_types"
 
-// Narrowed bare-name bindings: name → its declared type, banked before a narrowing shadows
+// Narrowed bare-name bindings: slot → its declared type, banked before a narrowing shadows
 // it, with per-scope frame marks. Two kinds ride one bank because one question is asked of both
 // — what the storage can hold — and an entry answers only while its own `declare` is the
 // innermost binding. `narFnEpoch` counts bodies checked, so a captured narrowing keeps refusing.
@@ -20,12 +20,12 @@ export const NAR_KIND_GUARD = 1
 export const NAR_KIND_POSTGUARD = 2
 export let narFnEpoch = 0
 
-export let asgDeclKeys: string[] = []
+export let asgDeclSlots: i32[] = []
 export let asgDeclTys: i32[] = []
 export let asgDeclDepths: i32[] = []
 export let asgDeclKinds: i32[] = []
 export let asgDeclEpochs: i32[] = []
-// Whether the bank row's scope already declares the name at the time it is noted: a write in the
+// Whether the bank row's scope already binds the slot at the time it is noted: a write in the
 // block that declares a binding, rather than a narrowing layer over an outer one.
 export let asgDeclOver: boolean[] = []
 export let asgDeclFrames: i32[] = []
@@ -33,23 +33,21 @@ export let asgDeclFrames: i32[] = []
 // which prefix of the bank is the one it last saw.
 export let asgDeclStamps: i32[] = []
 let narBankStampNext = 1
-// Each name's bank rows, in bank order, so a question about one name reads only its own rows.
-let asgDeclRowsOf: {[string]: i32[]} = Map()
+// Each slot's bank rows, in bank order, so a question about one binding reads only its own rows.
+let asgDeclRowsOf: {[i32]: i32[]} = Map()
 const asgNoRows: i32[] = []
 
-// The bank rows of `name`, oldest first; the caller must not change the list.
-export function narBankRowsOf(name: string): i32[] {
-  asgDeclRowsOf[name] ?? asgNoRows
-}
+// The bank rows of slot `s`, oldest first; the caller must not change the list.
+export function narBankRowsOf(s: i32): i32[] { asgDeclRowsOf[s] ?? asgNoRows }
 
-// The declared type banked for narrowed `name`, or -1 when no live entry of a matching kind
-// still shadows the name. `kind` is `NAR_KIND_ASG` / `NAR_KIND_GUARD`, or -1 for either. Entries
+// The declared type banked for narrowed slot `s`, or -1 when no live entry of a matching kind
+// still shadows it. `kind` is `NAR_KIND_ASG` / `NAR_KIND_GUARD`, or -1 for either. Entries
 // of the wrong kind are skipped rather than stopping the walk, so a guard narrowing layered over
 // an assignment narrowing does not hide it from the assignment-kind question.
-export function narDeclaredTy(name: string, kind: i32) {
-  const d = lookupDepth(name)
+export function narDeclaredTy(s: i32, kind: i32) {
+  const d = declDepthOf(s)
   if d < 0 { return -1 }
-  const rows = narBankRowsOf(name)
+  const rows = narBankRowsOf(s)
   let k = rows.length - 1
   while k >= 0 {
     const i = rows[k]
@@ -61,43 +59,42 @@ export function narDeclaredTy(name: string, kind: i32) {
   -1
 }
 
-// The declared type of an assignment-narrowed name, or -1.
-export function asgDeclaredTy(name: string) {
-  narDeclaredTy(name, NAR_KIND_ASG)
-}
+// The declared type of an assignment-narrowed slot, or -1.
+export function asgDeclaredTy(s: i32) { narDeclaredTy(s, NAR_KIND_ASG) }
 
-// Bank `name`'s declared type before a narrowing shadows it, at the scope depth the shadowing
-// `declare` writes to. Idempotent per (name, depth, kind): a second `x = e` must not re-bank the
+// Bank slot `s`'s declared type before a narrowing shadows it, at the scope depth the shadowing
+// `declare` writes to. Idempotent per (slot, depth, kind): a second `x = e` must not re-bank the
 // already-narrowed type as the declaration.
-export function noteNarShadow(name: string, declTy: i32, kind: i32) {
+export function noteNarShadow(s: i32, declTy: i32, kind: i32) {
+  if s == -1 { return 0 }
   const d = T.frames.length - 1
-  const rows = narBankRowsOf(name)
+  const rows = narBankRowsOf(s)
   let k = rows.length - 1
   while k >= 0 {
     const i = rows[k]
     if asgDeclDepths[i] == d && asgDeclKinds[i] == kind { return 0 }
     k = k - 1
   }
-  const own = asgDeclRowsOf[name]
+  const own = asgDeclRowsOf[s]
   if own == null {
-    asgDeclRowsOf[name] = [asgDeclKeys.length]
+    asgDeclRowsOf[s] = [asgDeclSlots.length]
   } else {
-    own.push(asgDeclKeys.length)
+    own.push(asgDeclSlots.length)
   }
-  asgDeclKeys.push(name)
+  asgDeclSlots.push(s)
   asgDeclStamps.push(narBankStampNext)
   narBankStampNext = narBankStampNext + 1
   asgDeclTys.push(declTy)
   asgDeclDepths.push(d)
   asgDeclKinds.push(kind)
   asgDeclEpochs.push(narFnEpoch)
-  asgDeclOver.push(T.frames[d].has(name))
+  asgDeclOver.push(declDepthOf(s) == d)
   0
 }
 
 // Clear the bank and the body count, once per program.
 export function narBankReset() {
-  asgDeclKeys = []
+  asgDeclSlots = []
   asgDeclStamps = []
   asgDeclTys = []
   asgDeclDepths = []
@@ -112,7 +109,7 @@ export function narBankReset() {
 
 // Open a scope's frame: its rows start at the bank's current length.
 export function narBankPushFrame() {
-  asgDeclFrames.push(asgDeclKeys.length)
+  asgDeclFrames.push(asgDeclSlots.length)
   0
 }
 
@@ -121,10 +118,10 @@ export function narBankPopFrame() {
   if asgDeclFrames.length == 0 { return 0 }
   const abase = asgDeclFrames[asgDeclFrames.length - 1]
   asgDeclFrames.pop()
-  while asgDeclKeys.length > abase {
-    const own = asgDeclRowsOf[asgDeclKeys[asgDeclKeys.length - 1]]
+  while asgDeclSlots.length > abase {
+    const own = asgDeclRowsOf[asgDeclSlots[asgDeclSlots.length - 1]]
     if own != null { own.pop() }
-    asgDeclKeys.pop()
+    asgDeclSlots.pop()
     asgDeclStamps.pop()
     asgDeclTys.pop()
     asgDeclDepths.pop()
