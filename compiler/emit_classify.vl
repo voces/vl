@@ -264,8 +264,6 @@ import {
   isBuiltinFnName,
   litLexIsMember,
   mapShapeFoldSet,
-  moduleBindsLoopVar,
-  moduleLocalLetOf,
   moduleLocalLetOfAt,
   nameIsBareMap,
   nameIsF32Array,
@@ -366,6 +364,10 @@ import {
 import {
   bodyLetOfDecl,
   bodyLetOfRead,
+  fnLetOfRead,
+  moduleLocalLetOfRead,
+} from "./emit_base"
+import {
   bodyLetReadAtSid,
   bodyReadLet,
   callsOfCallee,
@@ -420,7 +422,6 @@ import {
   lrMemoGen,
   lrMemoKind,
   lrMemoNul,
-  moduleLocalLetSeenFrom,
   nulListBase,
   paramString,
   popRecvOf,
@@ -486,7 +487,7 @@ import {
   variantRowInRowOfTy,
 } from "./emit_mv_slots"
 import {
-  globalLetOf,
+  globalLetOfDeclRead,
   globalLetOfSid,
   ifJoinTypedAtom,
   variantIndexOf,
@@ -1453,7 +1454,7 @@ function fieldClosureFeOfRecvRaw(recvIx: i32, prop: string, fnIx: i32) {
     let li = -1
     if fnIx >= 0 {
       const fn = nodeAt(fnIx)
-      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+      if fn is FuncDecl { li = bodyLetOfRead(fn.fnBody, unwrapParen(recvIx)) }
     }
     if li < 0 { li = globalLetOfRead(fnIx, unwrapParen(recvIx)) }
     if li >= 0 {
@@ -1809,7 +1810,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
       // that OWNS the binding, so a nested initialiser resolves where it is written.
       const fli = frameLetOf(fnIx, exprIx)
       if fli >= 0 { return nulVariantIdxOfLetIn(fli, fnIx) }
-      const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
+      const mli = moduleLocalLetOfRead(emitRootIx, exprIx)
       if mli >= 0 { return nulVariantIdxOfLetIn(mli, -1) }
     }
     // No other expression carries a nullable variant row.
@@ -8705,7 +8706,7 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
     // does for `exprNulLitUnion`.
     if d < 0 && fnIx >= 0 {
       const dfn = nodeAt(fnIx)
-      if dfn is FuncDecl { d = parentLetOf(dfn.fnBody, e.identName) }
+      if dfn is FuncDecl { d = bodyLetOfRead(dfn.fnBody, unwrapParen(ix)) }
     }
     // A capture's declaration is in the frame that owns it, and classifies there (D7441).
     if d < 0 {
@@ -9491,7 +9492,7 @@ export function holeLitReadIsAtom(exprIx: i32, fnIx: i32, depth: i32): boolean {
     }
     const fn = nodeAt(fnIx)
     if !(fn is FuncDecl) { return false }
-    const li = parentLetOf(fn.fnBody, e.identName)
+    const li = bodyLetOfRead(fn.fnBody, ix)
     if li < 0 { return false }
     const d = nodeAt(li)
     if !(d is LetDecl) { return false }
@@ -9580,7 +9581,7 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
       if pt >= 0 {
         et = tyStepElem(monoParamPinTy.get(pt) ?? nodeTyIxOf(pt))
       } else {
-        const li = parentLetOf(fn.fnBody, n.identName)
+        const li = bodyLetOfRead(fn.fnBody, unwrapParen(iterIx))
         if li >= 0 {
           const d = nodeAt(li)
           if d is LetDecl {
@@ -9726,7 +9727,7 @@ export function valueReadPinTy(ix: i32, fnIx: i32, depth: i32): i32 {
     if pp >= 0 && !tyHasTyVar(pp) { return pp }
     return -1
   }
-  const li = parentLetOf(fn.fnBody, n.identName)
+  const li = bodyLetOfRead(fn.fnBody, rx)
   if li < 0 {
     const lv = loopVarElemPinTyOf(rx, fnIx)
     if lv >= 0 && !tyHasTyVar(lv) { return lv }
@@ -9766,7 +9767,7 @@ export function loopVarElemPinTyOf(exprIx: i32, fnIx: i32): i32 {
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     if paramIndexOf(fnIx, identNameOrEmpty(ix)) >= 0 { return -1 }
-    if parentLetOf(fn.fnBody, identNameOrEmpty(ix)) >= 0 { return -1 }
+    if bodyLetOfRead(fn.fnBody, ix) >= 0 { return -1 }
     const lp = frameElemLoopOfRead(fn.fnBody, ix)
     if lp < 0 { return -1 }
     const fl = nodeAt(lp)
@@ -9784,7 +9785,7 @@ function loopVarReadIsAtom(ix: i32, bodyIx: i32, fnIx: i32): boolean {
   if fl is ForIn {
     const it = nodeAt(unwrapParen(fl.fiIter))
     if it is Ident {
-      const il = parentLetOf(bodyIx, it.identName)
+      const il = bodyLetOfRead(bodyIx, unwrapParen(fl.fiIter))
       if il >= 0 {
         const d = nodeAt(il)
         if d is LetDecl {
@@ -10841,7 +10842,7 @@ function structIndexOfIdentExpr(e: Ident, exprIx: i32, fnIx: i32): i32 {
   // binding is no frame's `fnBody` and no global. Annotated only — an initializer resolves
   // against the frame it is written in, so reading one from outside can name a row other
   // than the local's, while an annotation reads the same anywhere (D1636).
-  const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
+  const mli = moduleLocalLetOfRead(emitRootIx, exprIx)
   if mli >= 0 && globalHasTypeAnn(mli) && !letIsVariant(mli, -1) {
     return structIndexOfLet(mli, -1)
   }
@@ -13838,20 +13839,15 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
 }
 
 // The `exprNulStrArray` binding resolver: whether the LetDecl the read `readIx` names
-// (function-local via `parentLetOf`, else a module global) has an ANNOTATION — directly or
+// (a `let` of the frame, else a module global) has an ANNOTATION — directly or
 // under an outer `| null` — that is a `(string | null)[]` list; an un-annotated rebind
 // (`const t0 = g`) follows its init chain (depth-capped).
 function identBindingNulStrList(readIx: i32, fnIx: i32, depth: i32): boolean {
   if depth <= 0 { return false }
-  const name = sidText(sidOfNode(readIx))
-  let li = -1
-  if fnIx >= 0 {
-    const fn = nodeAt(fnIx)
-    if fn is FuncDecl { li = parentLetOf(fn.fnBody, name) }
-  }
+  let li = fnLetOfRead(fnIx, readIx)
   if li < 0 {
     // A rebind chain ending at a PARAM of the enclosing function (`const t0 = p`).
-    const pt = paramTypeNode(fnIx, name)
+    const pt = paramTypeNodeOfRead(fnIx, readIx)
     if pt >= 0 { return annIsNulStrListDeep(pt) }
     // A module GLOBAL (`const g: (string | null)[] | null = …`) — top-level LetDecls
     // live in `globalStmts` (they emit as wasm globals, not start statements).
@@ -15264,7 +15260,7 @@ export function identIsBoundClosure(readIx: i32, fnIx: i32): boolean {
   if fnIx < 0 || fnIndexOf(name) < 0 { return false }
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
-    const li = parentLetOf(fn.fnBody, name)
+    const li = bodyLetOfRead(fn.fnBody, readIx)
     if li >= 0 && parentLetOwnedBy(fn.fnBody, sidOfNode(li), li) {
       const ld = nodeAt(li)
       if ld is LetDecl {
@@ -16051,12 +16047,16 @@ function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {
         // a bare function NAME, which is all this no-registry predicate can claim.
         return false
       }
-      if moduleBindsLoopVar(emitRootIx, e.identName) { return false }
+      const d = identDeclOf(exprIx)
+      if d >= 0 {
+        const dn = nodeAt(d)
+        if dn is LoopVar || dn is ForRange { return false }
+      }
       // The module is the outermost frame, and the chain above never reaches it (D1542): a
       // top-level lambda's `fnParent` walk ends at -1, missing a module-scope capture.
-      const mll = moduleLocalLetOf(emitRootIx, e.identName)
+      const mll = moduleLocalLetOfRead(emitRootIx, exprIx)
       if mll >= 0 { return letDeclIsClosureNoLocal(mll) }
-      const gcl = globalLetOf(e.identName)
+      const gcl = globalLetOfDeclRead(exprIx)
       if gcl >= 0 { return letDeclIsClosureNoLocal(gcl) }
       return fnIndexOfNode(exprIx) >= 0
     }
@@ -16472,7 +16472,7 @@ export function mfCallbackFe(cbIx: i32, fnIx: i32) {
       let initFn = fnIx
       if fnIx >= 0 {
         const fn = nodeAt(fnIx)
-        if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+        if fn is FuncDecl { li = bodyLetOfRead(fn.fnBody, inner) }
       }
       if li < 0 {
         li = globalLetOfRead(fnIx, inner)
