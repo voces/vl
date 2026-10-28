@@ -868,6 +868,7 @@ import {
   exprMap,
   exprNulBool,
   exprNulClosure,
+  exprNulKind,
   exprNulLitUnion,
   exprNulScalarListKind,
   exprNulStrArray,
@@ -3777,8 +3778,9 @@ function isTestValuePrimName(ity: i32) {
 // `"string"` for the two primitive niches, `"#ref"` for every reference shape, `""` for a
 // receiver the `is`-niche ladder does not claim.
 function nulNicheBaseClass(recvIx: i32, fnIx: i32) {
-  if exprNulBool(recvIx, fnIx) { return "boolean" }
-  if exprNullableString(recvIx, fnIx) { return "string" }
+  const nk = exprNulKind(recvIx, fnIx)
+  if nk == "nulbool" { return "boolean" }
+  if nk == "nulstr" { return "string" }
   if (
     exprNullableRefNiche(recvIx, fnIx)
     || exprNullableMap(recvIx, fnIx)
@@ -6744,6 +6746,14 @@ function emitArmFieldsFit(
   0
 }
 
+// The `string | null` read rule for a field of code `code`, shared by every struct and variant
+// field read and by the ident reads in `emitIdentNode`: a value read recovers the non-null ref.
+// A null test and a nullable-string target keep the raw ref (`nulStrReadStaysRaw`).
+function emitNulStrFieldRecover(code: i32, ec: ExpCtx) {
+  if code == FC_NUL_STR && !nulStrReadStaysRaw(ec) { fbRefAsNonNull() }
+  0
+}
+
 // Lower a narrowed field read `recv.field` where `recv` is narrowed to `narrowVariant` by
 // an enclosing `if recv is Variant`: evaluate the box, `struct.get $box 1`, `ref.cast (ref
 // $variant)` (non-null: a box never is), then `struct.get` the field. Resolves the variant
@@ -6765,6 +6775,7 @@ function emitNarrowedMem(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx) {
     fbStructGet(uBoxIdx, 1)
     fbRefCast(uVarHeap[vi])
     fbStructGet(uVarHeap[vi], idx)
+    emitNulStrFieldRecover(variantFieldTypeAt(vi, idx), ec)
 
     // A value-union field read while the checker types it as one atom unboxes to that atom,
     // through the home the bare-arm twin uses: an index-rooted path has no member key, so
@@ -11606,6 +11617,7 @@ function emitMemVariantRead(
       }
       if emitExpr(body, m0.memObj, fnIx, ec) < 0 { return -1 }
       fbStructGet(uVarHeap[pvi], pvfi) // 0xfb 0x02 <variant struct ht> <field index>
+      emitNulStrFieldRecover(variantFieldTypeAt(pvi, pvfi), ec)
       // A code-16 (value-union box) field of the arm, read while its member PATH is
       // narrowed, unboxes to the narrowed atom — the arm-for-arm twin of the plain
       // struct read below and of `emitNarrowedMem`'s. Without it the box flowed into an
@@ -11629,6 +11641,7 @@ function emitMemVariantRead(
         if emitExpr(body, m0.memObj, fnIx, ec) < 0 { return -1 }
         fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
         fbStructGet(uVarHeap[nvi], nvfi)
+        emitNulStrFieldRecover(variantFieldTypeAt(nvi, nvfi), ec)
         if variantFieldTypeAt(nvi, nvfi) == FC_UNION {
           if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
         }
@@ -11786,16 +11799,7 @@ function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx): i32 {
     fbStructGet(sHeapIdx[si], idx) // 0xfb 0x02 <struct ht> <field index>
     const narrowOp = memReadNarrowOp(memIx, fnIx)
     if narrowOp >= 0 { wU8(narrowOp) }
-    // The `string | null` read rule (field code 20, slot kind 16), shared verbatim by this field
-    // read and the global, param and local ident reads in `emitIdentNode`. A value read recovers
-    // the non-null string ref, the checker having narrowed it non-null at every value read.
-
-    // Exactly two contexts suppress the recovery and keep the raw nullable ref: a null test, which
-    // needs `ref.is_null`, and a nullable-string target, where recovering would `ref.as_non_null`
-    // a legitimately-null value and trap. A `boolean | null` field needs no recovery at all.
-    if sFieldTypeAt(si, idx) == FC_NUL_STR {
-      if !nulStrReadStaysRaw(ec) { fbRefAsNonNull() }
-    }
+    emitNulStrFieldRecover(sFieldTypeAt(si, idx), ec)
     // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
     // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
     // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
@@ -25040,15 +25044,14 @@ function emitCallCorePrint(
   // Asked before `exprString`, which also claims it (the softened render says
   // `string` over a `(ref null $a)` cell) — without the order, a possibly-null ref
   // streams straight into `array.len`, a runtime trap on a `vl check`-clean program.
-  if exprNullableString(c.callArgs[0], fnIx) {
+  const pnk = exprNulKind(c.callArgs[0], fnIx)
+  if pnk == "nulstr" {
     return emitPrintNulString(body, c.callArgs[0], fnIx, ec)
   }
   // the other niche, `boolean | null` (an i32 with sentinel 2): the fallback ladder
   // ends in `__print_bool__`, which renders any non-zero as true — an un-arrested
   // null would print true, silently.
-  if exprNulBool(c.callArgs[0], fnIx) {
-    return emitPrintNulBool(body, c.callArgs[0], fnIx, ec)
-  }
+  if pnk == "nulbool" { return emitPrintNulBool(body, c.callArgs[0], fnIx, ec) }
   // `print(<value-union box>)` dispatches on the box tag and prints the arm the
   // value holds (D712). Asked after the two niche arms — they are niches, not boxes,
   // and `printUnionPlan` declines both — and before `exprString`, on the same
@@ -26158,8 +26161,9 @@ function emitAssignGlobal(
       // a non-ref niche `X | null` global seeds its null rep for a bare `null` RHS,
       // mirroring the seed the global's own initializer gets; a non-null RHS ignores it.
       const gsCtx = expCtxHere(ec)
-      if exprNulBool(lhsIx, fnIx) { gsCtx.nulBool = true }
-      if exprNullableString(lhsIx, fnIx) { gsCtx.nulString = true }
+      const gsk = identCellVKind(lhsIx, fnIx)
+      if gsk == "nulbool" { gsCtx.nulBool = true }
+      if gsk == "nulstr" { gsCtx.nulString = true }
       if exprNulLitUnion(lhsIx, fnIx) {
         gsCtx.nulLitUnion = true
         gsCtx.litUnion = 1
@@ -26219,10 +26223,12 @@ function emitAssignLocalSeeded(
 ) {
   // A NICHE `X | null` local seeds its null rep for a bare `null` RHS, as the global
   // arm above does. A non-null RHS ignores the seed (a boolean is a `BoolLit`, a
-  // function RHS builds the non-null closure value).
+  // function RHS builds the non-null closure value). The cell's kind decides, not the read's: a
+  // narrowed name holds its declared cell.
   const asCtx = expCtxHere(ec)
-  if exprNulBool(lhsIx, fnIx) { asCtx.nulBool = true }
-  if exprNullableString(lhsIx, fnIx) { asCtx.nulString = true }
+  const ack = identCellVKind(lhsIx, fnIx)
+  if ack == "nulbool" { asCtx.nulBool = true }
+  if ack == "nulstr" { asCtx.nulString = true }
   // A literal-union local (`k = "b"`): the member RHS lowers as its interned i32 id.
   if exprIsLitAtom(lhsIx, fnIx) { asCtx.litUnion = 1 }
   if emitExprExpect(body, a.binRight, fnIx, asCtx) < 0 { return -1 }

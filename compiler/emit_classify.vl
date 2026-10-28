@@ -133,7 +133,6 @@ import {
   nodeTyIsFuncArray,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
-  nodeTyIsNulBool,
   nodeTyIsNulLitUnion,
   nodeTyIsNullType,
   nodeTyIsNullable,
@@ -170,9 +169,7 @@ import {
   MAP_KEY_I64,
   isValueUnionName,
   isValueUnionTyOr,
-  mapTyValIsBool,
   mapTyValIsLitUnion,
-  mapTyValIsNulBool,
   mapTyValIsNulLitUnion,
   mapTyValIsNullUnit,
   mapTyValLitUnionTexts,
@@ -231,7 +228,6 @@ import {
   tyLitMemberTexts,
   tyLitUnionHashesI32,
   tyMutEpoch,
-  tyNulInnerIsPrim,
   tyNumScalarBaseName,
   tyPrimNameOf,
   tySame,
@@ -286,7 +282,6 @@ import {
   callOriginOf,
   capIsBound,
   indexPathKeyOf,
-  inferNicheNullByName,
   isBuiltinFnName,
   litLexIsMember,
   mapShapeFoldSet,
@@ -311,7 +306,6 @@ import {
   retV128Flag,
   setShapeOfTy,
   tyIsFuncType,
-  tyIsNulBool,
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
@@ -415,7 +409,6 @@ import {
 } from "./emit_fn_ret_kinds"
 import {
   exprIsNullLit,
-  ifChainYieldsNull,
   ifElseValueIx,
   ifIsChainHeadIn,
   ifJoinIsMapUnion,
@@ -474,7 +467,6 @@ import {
   asgReadNarrowSet,
   asgUnwidenPrim,
   criFnIsAnonLambda,
-  declaredNulString,
   fnIndexOfInScopeAt,
   fnIndexOfInScopeSid,
   fnPosOnScopeChain,
@@ -632,7 +624,6 @@ import {
   paramMap,
   paramNulClosure,
   paramNulList,
-  paramNulString,
   paramTypeNode,
 } from "./emit_query"
 import {
@@ -661,6 +652,7 @@ import {
   nodeRepIsNulAtom,
   nodeTyIsNulScalarBox,
   nodeTyMapKeyIsLitUnion,
+  repOfNode,
   repOfNodeAt,
   repOfTy,
   repRowOfTyStruct,
@@ -2599,16 +2591,6 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
   null
 }
 
-function globalIsNulStringSid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  letIsNulString(li, -1)
-}
-
-function fnRetNulStringSid(sid: i32, name: string, fnIx: i32, at: i32) {
-  repOfNameResult(sid, name, fnIx, at).rdKind == "nulstr"
-}
-
 export function letIsNulString(letIx: i32, fnIx: i32) {
   const d = nodeAt(letIx)
   if d is LetDecl {
@@ -2633,135 +2615,43 @@ export function letIsNulString(letIx: i32, fnIx: i32) {
   false
 }
 
-// True if evaluating the expression at `exprIx` yields a `string | null` ref — a
-// nullable-string param/local/global, or a `: string | null`-returning call. Consulted
-// by the `!= null` `ref.is_null` path and the assignment/return/arg null-seeding.
+// The nullable rep kind of the value at `exprIx` (`nulstr`, `nulbool`, …), or null for a value
+// that is not a nullable niche or a node the checker recorded no type for. A read the checker
+// narrowed to `null` still holds its cell, so the cell's kind answers for it.
+export function exprNulKind(exprIx: i32, fnIx: i32): VKind | null {
+  if exprIx < 0 { return null }
+  const d = repOfNode(exprIx, fnIx)
+  if d.rdCovered != 1 { return null }
+  if d.rdKind == "nulnone" { return nulNoneReadCellKind(exprIx, fnIx) }
+  vkNulKindOf(d.rdKind)
+}
+
+// The kind of the cell a `null`-narrowed read names: a name's cell, or a field's by its code.
+// `nulnone` when the read names no cell, since the value is then the `null` unit itself.
+function nulNoneReadCellKind(exprIx: i32, fnIx: i32): VKind {
+  const ck = identCellVKind(exprIx, fnIx)
+  if ck != null { return ck }
+  const fc = memberFieldCode(unwrapParen(exprIx), fnIx)
+  if fc == FC_NUL_STR { return "nulstr" }
+  if fc == FC_NUL_BOOL { return "nulbool" }
+  "nulnone"
+}
+
+// `k` when it is a nullable niche kind, else null.
+function vkNulKindOf(k: VKind): VKind | null {
+  match k {
+    "nulvariant" | "nulstruct" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {
+      return k
+    }
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "i64" | "f64" | "f64list" | "f32" | "closure" | "i64list" | "f32list" | "u8list" | "v128" => {
+      return null
+    }
+  }
+}
+
+// Whether the value at `exprIx` is a `string | null` ref.
 export function exprNullableString(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  // The typed-IR leg its `exprNulBool` sibling already has, and additive for the same reason:
-  // the checker recorded this node as `string | null`. It recovers the niche for a form the
-  // syntactic arms below cannot trace — an else-less `if` printed directly, whose join is the
-  // niche and which otherwise falls past every arm to the non-null string print (D1766).
-  if nodeRepIs(exprIx, "nulstr", fnIx) { return true }
-  // A value the hole instance `fnIx` is pins at `string | null`, where the recorded type is
-  // the hole's variable: a join of the parameter reads no arm as nullable (D3016).
-  if tyIsNulPrim(holeOperandTyOf(exprIx, fnIx), "string") { return true }
-  // An if-expression whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
-  const nlIfStr = nulIfArmNullableValueIx(exprIx)
-  if nlIfStr >= 0 {
-    if exprNullableString(nlIfStr, fnIx) { return true }
-  }
-  const e = nodeAt(unwrapParen(exprIx))
-  match e {
-    AsExpr => {
-      return nodeRepIs(unwrapParen(exprIx), "nulstr", fnIx)
-    }
-    // A string join any link of which can yield `null` is the `(ref null)` block `emitIfExprRef`
-    // builds, as a generic's `a ?? d` joined with a `K | null` pin is (D3281).
-    IfStmt => {
-      if e.ifElse < 0 { return false }
-      if !ifChainYieldsNull(unwrapParen(exprIx), fnIx) { return false }
-      return ifExprRefKind(unwrapParen(exprIx), fnIx) == "str"
-    }
-    Call => {
-      if e.callFn < 0 { return false }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        if (
-          fnRetNulStringSid(
-            sidOfNode(e.callFn),
-            callee.identName,
-            fnIx,
-            e.callFn,
-          )
-        ) {
-          return true
-        }
-        // A `string | null`-returning function value (a binding, or a `(…) => string | null`
-        // param callee) — its result is the nullable raw array, `>N`.
-        return calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nulstr"
-      }
-      // A `string | null`-returning field-closure call.
-      if callee is Member {
-        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "nulstr" }
-      }
-      // Fallback, scoped to a call: a `string | null`-returning closure value call whose callee
-      // the cases above miss, such as an indexed closure-array element, read off its checked rep.
-      return nodeRepIs(exprIx, "nulstr", fnIx)
-    }
-    Ident => {
-      if (
-        paramNulString(fnIx, e.identName)
-        && paramReadAt(fnIx, e.identName, unwrapParen(exprIx))
-      ) {
-        return true
-      }
-      if declaredNulString(e.identName) { return true }
-      // A captured `string | null`: the env field is the same `(ref null $array)` cell, so it
-      // classifies like the param or local. This is what reconciles the classifier with
-      // `emitCapturedReadRecover`, which recovers off that field under the same gates.
-      if capturedKindOf(fnIx, e.identName) == "nulstr" { return true }
-      return globalIsNulStringSid(
-        fnIx,
-        sidOfNode(unwrapParen(exprIx)),
-        unwrapParen(exprIx),
-      )
-    }
-    // A `string | null` struct field read (`a.v`, code 20) yields a nullable string ref.
-    Member => {
-      return memberFieldCode(exprIx, fnIx) == FC_NUL_STR
-    }
-    // A `?.` over a nullable struct whose leaf field is a string — plain or already nullable —
-    // is `string | null`, the same niche `emitOptMemberValue`'s `nulstr` arm builds. Saying so
-    // here routes `(x?.y) ?? "z"` through the string-niche `??` core and gives `print` and an
-    // un-annotated binding the string rep (D802).
-    OptMember => {
-      const occ = optChainLeafFieldCode(exprIx, fnIx)
-      return occ == FC_STR || occ == FC_NUL_STR
-    }
-    // A bare `m[k]` over a string-valued map is `string | null` — `emitMapGet` yields the
-    // `(ref null)` value unrecovered, the string dual of the bare struct-map read.
-    Index => {
-      const mrs = mapReadMvSlot(exprIx, fnIx)
-      if mrs >= 0 { return mvValKind[mrs] == MVK_STR }
-      // A `(string | null)[]` element read yields `string | null` — the string-ref niche kept
-      // `(ref null $aTypeIdx)` by the dedicated `emitIndex` arm — so `const t = p[i]` binds the
-      // nullable-string kind and `t != null` narrows against it.
-      if exprNulStrArray(e.idxArr, fnIx) { return true }
-    }
-    // A chained `a ?? b` over nullable strings is itself nullable-string when the default `b`
-    // is also nullable — the left-associative `(f() ?? g()) ?? d` shape, where the classifier
-    // sees the nested `??` as `binLeft` before `emitExpr` re-associates it. Keeps print
-    // routing and `exprString` consistent with the emitted rep.
-    BinExpr => {
-      if e.binOp == "??" {
-        // A fused read over a nullable-string-valued map stays `string | null` only when the
-        // default is itself nullable — a non-null default coalesces every null, stored
-        // included, to a non-null string.
-        const cns = coalesceMvSlot(exprIx, fnIx)
-        if cns >= 0 {
-          if (
-            mvValKind[cns] == MVK_STR
-            && coalesceStaysNullable(exprIx, cns, fnIx)
-          ) {
-            return true
-          }
-        }
-        if exprNullableString(e.binLeft, fnIx) {
-          if exprNullableString(e.binRight, fnIx) { return true }
-          // A bare `null` default is nullable too (D801): `exprNullableString` alone answers
-          // only for a default that is itself a nullable string, so `s ?? null` reads as
-          // non-null and the lowering declares a `(ref $aTypeIdx)` block.
-          // `coalesceDefaultNullable` is the one nullability decision every other `??` arm takes.
-          return coalesceDefaultNullable(e.binRight, fnIx)
-        }
-      }
-    }
-    // No other expression is a nullable string.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
+  exprNulKind(exprIx, fnIx) == "nulstr"
 }
 
 // The base struct index of a nullable-struct `LetDecl`: the annotation's base, or the
@@ -9459,144 +9349,9 @@ function cloCallRetTy(callFn: i32, fnIx: i32): i32 {
   tyStepRet(tyPeelNul(nodeTyAt(callFn, fnIx)))
 }
 
-// True if the expression is a NAME (param / local / module global) annotated
-// `boolean|null` — the niche scalar nullable.
+// Whether the value at `exprIx` is the `boolean | null` niche (an i32 with sentinel 2).
 export function exprNulBool(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  // Typed-IR fast path: the checker recorded `boolean | null`, which recovers the niche for a
-  // form the arms below cannot trace (a `(boolean | null)[]` element read) — unless the read
-  // delivers a union box, whose recorded type names a niche it does not hold (D2588).
-  if nodeTyIsNulBool(exprIx) { return !narrowedBoxPlace(exprIx, fnIx) }
-  // …and a node the generic body shares, typed at a hole this instance pins to it (D2921).
-  if tyIsNulPrim(holeOperandTyOf(exprIx, fnIx), "boolean") {
-    return !narrowedBoxPlace(exprIx, fnIx)
-  }
-  // …and a loop variable an instance pins to it (D2983).
-  if tyIsNulPrim(loopVarPinTyOf(exprIx, fnIx), "boolean") {
-    return !narrowedBoxPlace(exprIx, fnIx)
-  }
-  // …and a capture typed at a type parameter its enclosing instance binds to it (D3831).
-  const nbc = nodeAt(unwrapParen(exprIx))
-  if nbc is Ident {
-    if capturedKindOf(fnIx, nbc.identName) != null {
-      if tyIsNulPrim(pinSubOperandTyOf(nodeTyIxOf(exprIx), fnIx), "boolean") {
-        return !narrowedBoxPlace(exprIx, fnIx)
-      }
-    }
-  }
-  // …and an `if` joining a type parameter with `null` its instance pins to it (D10231).
-  if (
-    nbc is IfStmt
-    && tyIsNulPrim(pinSubOperandTyOf(nodeTyIxOf(exprIx), fnIx), "boolean")
-  ) {
-    return true
-  }
-  // An if-EXPRESSION whose arm is ITSELF nullable — see `nulIfArmNullableValueIx` (D1560).
-  const nlIfB = nulIfArmNullableValueIx(exprIx)
-  if nlIfB >= 0 {
-    if exprNulBool(nlIfB, fnIx) { return true }
-  }
-  const e = nodeAt(unwrapParen(exprIx))
-  // A CALL of a function annotated `: boolean | null` — its result is the niche i32.
-  match e {
-    Call => {
-      if e.callFn < 0 { return false }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        const lct = localCloPinFieldTail(e.callFn, fnIx)
-        if lct >= 0 && exprNulBool(lct, fnIx) { return true }
-        const t = fnIndexOfNode(e.callFn)
-        if t >= 0 {
-          const cfn = nodeAt(fnStmts[t])
-          if cfn is FuncDecl {
-            if tyIsNulBool(cfn.fnRet) { return true }
-            // …or an un-annotated function whose return infers to `boolean | null`. Not a type
-            // spelling (D-CLASSGRAM census note): `inferNicheNullByName` publishes a
-            // three-valued tag (`""` / `"boolean|null"` / `"string|null"`), compared by provenance, not shape.
-            if cfn.fnRet < 0 {
-              if (
-                inferNicheNullByName(
-                  inferRetFnKey(fnStmts[t], callee.identName),
-                )
-                == "boolean|null"
-              ) {
-                return true
-              }
-            }
-            return false
-          }
-        }
-        // A call of a closure-typed VALUE (`p()` where `p: () => boolean | null`) — a
-        // param / local / global `fnIndexOf` can't see: read its return-type annotation.
-        if t < 0 && tyNulInnerIsPrim(cloCallRetTy(e.callFn, fnIx), "boolean") {
-          return true
-        }
-      }
-      return false
-    }
-    Ident => {
-      if fnIx >= 0 {
-        const fn = nodeAt(fnIx)
-        if fn is FuncDecl {
-          const params = fn.fnParams
-          let i = 0
-          while i < params.length {
-            const p = nodeAt(params[i])
-            if p is Param {
-              if p.parName == e.identName { return tyIsNulBool(p.parType) }
-            }
-            i = i + 1
-          }
-          const li = parentLetOf(fn.fnBody, e.identName)
-          if li >= 0 { return letNulBool(li, fnIx) }
-        }
-      }
-      const gi = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
-      if gi >= 0 { return letNulBool(gi, -1) }
-      return false
-    }
-    // A bare map read `m[k]` over a `boolean | null`-valued map yields the niche i32 (0/1
-    // with sentinel 2), so an un-annotated `const b = m[k]` narrows with `!= null` against 2.
-    Index => {
-      const nbMt = mapRecvTyIn(e.idxArr, fnIx)
-      if mapTyValIsNulBool(nbMt) { return true }
-      // A plain `boolean` map's read is `boolean | null` too, its miss the same sentinel.
-      if (mapTyValIsBool(nbMt) && !nodeTyProvesNonNull(unwrapParen(exprIx))) {
-        return true
-      }
-      // A `(boolean | null)[]` element no recorded type covers, the capture cell's read, is the
-      // niche until a narrowing excludes null (D2397).
-      if (
-        nodeArrayElemIsNulBool(e.idxArr)
-        && !nodeTyProvesNonNull(unwrapParen(exprIx))
-      ) {
-        return true
-      }
-    }
-    // A `boolean | null` struct FIELD read (`a.v`, code 21) is the niche i32 sentinel.
-    Member => {
-      return memberFieldCode(exprIx, fnIx) == FC_NUL_BOOL
-    }
-    // A chained `a ?? b` over `boolean | null` is itself `boolean | null` when the default
-    // `b` is also nullable — the left-associative `(f() ?? g()) ?? d` shape (see the
-    // `exprNullableString` companion). Keeps `??` print-routing consistent with the rep.
-    BinExpr => {
-      if e.binOp == "??" {
-        if exprNulBool(e.binLeft, fnIx) { return exprNulBool(e.binRight, fnIx) }
-      }
-    }
-    // No other expression reads a nullable-boolean niche.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
-}
-
-// True when `exprIx` is a name, field or cell whose read delivers a value-union box: the
-// narrowed sub-union a condition left it at shares the box's rep, not the sub-union's own.
-function narrowedBoxPlace(exprIx: i32, fnIx: i32): boolean {
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Ident || e is Member || e is Index { return exprUnion(exprIx, fnIx) }
-  false
+  exprNulKind(exprIx, fnIx) == "nulbool"
 }
 
 // A `let`/`const` binding is `boolean | null` if it is so ANNOTATED, or (un-annotated)
@@ -12821,9 +12576,17 @@ export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
     const ck = capturedKindOf(fnIx, e.identName)
     if ck != null { return ck }
     const gl = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
-    if gl >= 0 { return globalCellKind(gl) }
+    if gl >= 0 { return globalReadCellKind(gl) }
   }
   null
+}
+
+// A module global's cell kind as a read sees it. `globalCellKind` lays a `boolean | null`
+// global out as a plain i32 cell; its values still carry the niche sentinel.
+function globalReadCellKind(gl: i32): VKind {
+  const k = globalCellKind(gl)
+  if k == "i32" && letNulBool(gl, -1) { return "nulbool" }
+  k
 }
 
 // D1576 — is this expression's value the `null` type, whose rep is `nullref`? Producers: a
@@ -13071,7 +12834,7 @@ export function letIsVariant(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = nodeAt(d.letType)
       if lt is TypeRef {
-        // Name, not `armRowOfRecordTyShim`: that twin is index-only, answering only for a node that
+        // Name, not an arena-node lookup: that answers only for a node that
         // resolves to the variant's declaration. A second node spelling the same inline shape
         // mints its own arena row and compares unequal, so under-answering here would unbind
         // a variant let — the name stays.

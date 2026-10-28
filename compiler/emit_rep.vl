@@ -1071,7 +1071,7 @@ export function mvSlotOfTyKArm(ty: i32, keyK: i32, armHint: i32): i32 {
   -1
 }
 
-// "No arm hint" — the caller holds no type to ask `armRowOfRecordTyShim` of, so it matches a
+// "No arm hint" — the caller holds no type to ask `repVariantShapeRowOf` of, so it matches a
 // slot of any arm parity. Distinct from -1, which is a RESOLVED "not an arm".
 export const MV_ARM_NOHINT = 0 - 2
 
@@ -3478,16 +3478,7 @@ function repOfNullable(inner: i32): RepDesc {
 // claims it (`std:fs`'s `IoError` has both); else `nulstruct`. A twin of a variant row's shape
 // is that row (D3870); a shape only the checker's member set holds has no row and stays a struct.
 function repNulObjKind(objTy: i32): VKind {
-  if (
-    tyIxIsVariantMember(objTy)
-    && repSlotOfTyDecl(objTy) < 0
-    && armRowOfRecordTyShim(objTy) >= 0
-  ) {
-    return "nulvariant"
-  }
-  const r = repVariantShapeRowOf(objTy)
-  if r >= 0 { return "nulvariant" }
-  "nulstruct"
+  if repVariantShapeRowOf(objTy) >= 0 { "nulvariant" } else { "nulstruct" }
 }
 
 // Whether record type `ty` is a union arm: the checker registered a member of its shape, or a
@@ -3502,7 +3493,9 @@ export function repTyIsVariant(ty: i32): boolean {
 // Whether record type `ty` has the shape of an arm the variant table holds, and no declared
 // struct row of its own: its rep is a variant heap row. The rep question a reader with no union
 // in hand asks, where `repTyIsVariant` also counts the checker's member set.
-export function repTyHasArmShape(ty: i32): boolean { repVariantShapeHas(ty, 2) }
+export function repTyHasArmShape(ty: i32): boolean {
+  repVariantShapeRowOf(ty) >= 0
+}
 
 // Whether a canonical shape equal to `ty`'s is registered: bit 1 by the checker's member set,
 // bit 2 by the emit variant table; `bits` selects which sources count.
@@ -3517,50 +3510,32 @@ function repVariantShapeHas(ty: i32, bits: i32): boolean {
 // The first variant row whose arm has `ty`'s canonical shape, or -1: the row behind
 // `repTyIsVariant`'s shape answer, so a slot reader finds the row that chose the kind.
 export function repVariantShapeRowOf(ty: i32): i32 {
-  if !rvsShapeMatches(ty) { return -1 }
+  if ty < 0 || ty >= T.tys.length { return -1 }
   rvsSync()
-  const r = rvsRow[repCanonId(ty)] ?? (-1)
-  if r < 0 || repSlotOfTyDecl(ty) >= 0 { return -1 }
+  if memoMoved3(rvsAnsKey, rvsBuilds, rvsRowUpTo, sNames.length) {
+    rvsAnsGen = rvsAnsGen + 1
+  }
+  if ty < rvsAnsAt.length && rvsAnsAt[ty] == rvsAnsGen { return rvsAnsRow[ty] }
+  let r = -1
+  if rvsShapeMatches(ty) {
+    r = rvsRow[repCanonId(ty)] ?? (-1)
+    if r >= 0 && repSlotOfTyDecl(ty) >= 0 { r = -1 }
+  }
+  while rvsAnsAt.length <= ty {
+    rvsAnsAt.push(-1)
+    rvsAnsRow.push(-1)
+  }
+  rvsAnsAt[ty] = rvsAnsGen
+  rvsAnsRow[ty] = r
   r
 }
 
-// The first variant row whose arm type is the bare record `ty`, or -1: the shim every reader
-// that holds a type rather than a union row position asks, and the deletion target (D14552).
-// A query-side hazard: `nodeTyIxOf(paramTypeNode(...))` for a union-annotated param hands
-// back the first arm, not the union.
-export function armRowOfRecordTyShim(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  // No structural rung: two variants with the same field set are different variants, and a
-  // `tySame` fallback here would match the first of them for both. Variants are nominal,
-  // like unions and unlike structs, since their whole purpose is to be told apart. The index
-  // rung is the whole function: `declTyIxOfName` resolves each arm's declaration.
-  vrIxSync()
-  vrIxFirst[ty] ?? (-1)
-}
-
-// `armRowOfRecordTyShim`'s index: arm type to the first `uVarTyIx` row carrying it, over rows below
-// `vrIxUpTo`. Rows are only appended between resets, so it extends in place; a reset of the
-// table or a new pass rebuilds it (D11320).
-let vrIxFirst: {[i32]: i32} = Map()
-
-let vrIxUpTo = 0
-
-const vrIxKey = memoKeyNew(2)
-
-function vrIxSync() {
-  let moved = memoMoved(vrIxKey, 0, uVarTyIxResets)
-  moved = memoPassMoved(vrIxKey, 1) || moved
-  if moved || uVarTyIx.length < vrIxUpTo {
-    vrIxFirst = Map()
-    vrIxUpTo = 0
-  }
-  while vrIxUpTo < uVarTyIx.length {
-    const t = uVarTyIx[vrIxUpTo]
-    if !vrIxFirst.has(t) { vrIxFirst[t] = vrIxUpTo }
-    vrIxUpTo = vrIxUpTo + 1
-  }
-  0
-}
+// `repVariantShapeRowOf`'s answer per type, current while `rvsAnsAt[ty]` is `rvsAnsGen`: the
+// generation moves when the shape index is rebuilt or gains a row, or a struct row is added.
+const rvsAnsKey = memoKeyNew(3)
+let rvsAnsGen = 0
+const rvsAnsAt: i32[] = []
+const rvsAnsRow: i32[] = []
 
 // Whether record type `ty` may be an arm by shape: a record that is not a `new` brand. A declared
 // struct with a row of its own is excluded by each caller, after a shape hit.
@@ -3581,6 +3556,9 @@ let rvsChkUpTo = 0
 
 let rvsRowUpTo = 0
 
+// How many times `rvsSync` has rebuilt the index.
+let rvsBuilds = 0
+
 const rvsKey = memoKeyNew(4)
 
 function rvsSync() {
@@ -3595,6 +3573,7 @@ function rvsSync() {
     rvsRow = Map()
     rvsChkUpTo = 0
     rvsRowUpTo = 0
+    rvsBuilds = rvsBuilds + 1
     repTreeDrop()
   }
   while rvsChkUpTo < cVariantMemberTyIxs.length {
