@@ -489,12 +489,6 @@ import {
   mvValKind,
   mvValName,
   mvValTyIx,
-  narrowNames,
-  narrowRetired,
-  narrowSets,
-  narrowTop,
-  narrowTys,
-  narrowVariants,
   nestedNameBySid,
   raUsed,
   reExpName,
@@ -724,12 +718,8 @@ import {
   letNulMapReadUnionBox,
   letUnionNameOf,
   nulMapShapeOf,
-  preStmtNarrow,
-  pushPostGuardNarrow,
   refListSlotOfExpr,
   rsResetUseIx,
-  setNarrowFromCond,
-  setNarrowFromCondElse,
 } from "./emit_classify"
 import { fnSigIdxOfFn, fnSigIsClosure } from "./emit_closure_sites"
 import { rowBoolI32Agree } from "./emit_field_codes"
@@ -772,7 +762,6 @@ import { scopePop, scopePush, scopeUnbind } from "./emit_mv_slots"
 import {
   addLocalName,
   applyPushPopBits,
-  narrowIdxReset,
   recordRefPushSlot,
 } from "./emit_narrow_slots"
 import {
@@ -803,7 +792,6 @@ import {
   typeDeclNameIxReset,
 } from "./emit_shape_rows"
 import { iisReset } from "./emit_shape_intern"
-import { restoreNarrow } from "./emit_ty_canon"
 import { typeOrderReset, typeOrderRun } from "./emit_type_order"
 import {
   mvShapeNestReset,
@@ -821,9 +809,7 @@ import { printPlanReset, unionRegistryABSweep } from "./emit_union_registry"
 import { unTyKeyShadowSweep } from "./emit_union_tykey"
 import {
   auditRecordJoinLeaves,
-  capNarrowBuild,
-  capNarrowRecordFrame,
-  capNarrowSeed,
+  callResultTextsReset,
   exprEmittedRefListSlot,
   globalRefListSlot,
 } from "./emit_value_sites"
@@ -1311,20 +1297,10 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32, ec: ExpCtx) {
     emitCurFnIx = fnIx
     emitCurFnPos = fnPos
     envCacheOpen(fnPos)
-    // Replays the narrowing this frame's closure sits inside, for the whole body —
-    // locals collection included, since a `const t = <captured narrowed read>` is typed from it.
-    // Only a value-union-box capture is seeded, so a function capturing nothing narrowed emits
-    // identical bytes. The depth is restored on the success path; a -1 below fails the entire module, so a leaked depth cannot be observed.
-    const savedCapNarrow = capNarrowSeed(fnPos)
     // Collect + validate declared locals BEFORE lowering, so identifier resolution
     // and the locals vector both see the full per-function set.
     if paramValtypeFloor(fnIx) < 0 { return -1 }
     if buildLocals(fnIx) < 0 { return -1 }
-    // Re-banks the declaration-site narrowing of the frames declared inside this body, now that
-    // this frame's local table exists — the only point at which a guard over a function-scope
-    // local resolves. Bodies emit in `fnStmts` order and a nested frame is collected after its
-    // parent, so the record banks before the nested body that reads it. Gated on `fnNestUsed`: with no nested frame anywhere, the scan is skipped entirely.
-    if fnNestUsed { capNarrowRecordFrame(fnPos) }
 
     // If this function pushes, reserve three scratch locals after the declared ones.
     // `pushScratchBase` is their first wasm index; the inline-push sequence reads
@@ -1419,7 +1395,6 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32, ec: ExpCtx) {
     rebaseStmtSpans(stmtSpanBase, bodyInOut, exprInBody)
     wBytes(body)
     wTarget(outPrev)
-    restoreNarrow(savedCapNarrow)
     return 0
   }
   emitFail("emitProgram: not a function declaration")
@@ -1488,34 +1463,20 @@ function startScanHeaderExpr(exprIx: i32) {
 // Scans a top-level `if` chain: the condition expression plus every arm's block, walking an
 // `else if` chain along its spine so its depth costs no stack (D1990).
 function startScanIf(ifIx: i32) {
-  // The outermost else narrowing restored is the state the nested restores would have left.
-  let elseTop = -1
   let cur = ifIx
   while cur >= 0 {
     const st = nodeAt(cur)
     cur = -1
     if st is IfStmt {
       startScanHeaderExpr(st.ifCond)
-      // Narrow across each arm (mirroring `ifChainHasStrOp` / `emitStmt`): the
-      // then-branch sees the guard's narrowing, the else-branch sees a VALUE
-      // union's complement — so a top-level `if w is string { print(w) }`
-      // reserves the string scratch frame in the start function.
-      const savedTop = narrowTop
-      const narrowed = setNarrowFromCond(st.ifCond, -1)
+      // Each arm is scanned as a block; a narrowed read is typed by the checker.
       startScanBlock(st.ifThen)
-      if narrowed { restoreNarrow(savedTop) }
       if st.ifElse >= 0 {
-        const savedElseTop = narrowTop
-        if setNarrowFromCondElse(st.ifCond, -1) {
-          if elseTop < 0 { elseTop = savedElseTop }
-        }
         const els = nodeAt(st.ifElse)
-        if els is Block { startScanBlock(st.ifElse) }
-        if els is IfStmt { cur = st.ifElse }
+        if els is IfStmt { cur = st.ifElse } else { startScanBlock(st.ifElse) }
       }
     }
   }
-  if elseTop >= 0 { restoreNarrow(elseTop) }
   0
 }
 
@@ -1801,7 +1762,6 @@ function computeInitFns(hasStart: i32) {
   ifW1 = []
   swG1 = 0
   swS1 = 0
-  initNarrowTop = 0
   const order = srcmapLoadOrder()
   if hasStart == 0 || order.length < 2 { return 0 }
   const rank: { [i32]: i32 } = Map()
@@ -2416,9 +2376,6 @@ function emitStartFnCode(out: u8[], n: i32, ec: ExpCtx) {
   0
 }
 
-// The narrowing depth before the first init function, restored after the last.
-let initNarrowTop = 0
-
 // Emits the code entry of init function `k` onto `out`: the top-level nodes of its windows.
 function emitInitFnCode(out: u8[], k: i32, ec: ExpCtx) {
   emitCurFnIx = -1
@@ -2426,9 +2383,7 @@ function emitInitFnCode(out: u8[], k: i32, ec: ExpCtx) {
   startWalkWindows(ifW0[k], ifW1[k])
   fnUsesU8Push = false
   fnUsesMapVals = false
-  if k == 0 { initNarrowTop = narrowTop }
   const rc = emitStartBodyCode(out, k, ec)
-  if k == gInitMods.length - 1 { restoreNarrow(initNarrowTop) }
   rc
 }
 
@@ -2501,10 +2456,6 @@ function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
   // statements, emits the same bytes as before. The emit context is module-level (`fnIx = -1`): identifier reads/writes resolve to globals.
   let gi = swG0
   let si = swS0
-  // Post-statement narrowing for the top-level statement list (the assignment
-  // narrowing of `pushPostGuardNarrow` — a top-level guard `if` cannot
-  // `return`, so only the assignment arm ever fires here). Restored at loop end.
-  const savedStartNarrowTop = narrowTop
   // The promotion context window (G2c): a promoted binding's `local.get`/`local.set` is only
   // meaningful in this frame, so the flag that lets `emitUserGlobalGet`/`emitUserGlobalSet`
   // produce one is armed for exactly the span streaming this body. Every user function body and
@@ -2545,13 +2496,11 @@ function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
     } else {
       emitCurStmtIx = startStmts[si]
       gInitStartOrd = startStmtOrd[si]
-      preStmtNarrow(startStmts[si])
       const sSpanAt = bodyExpr.length
       if emitStmt(bodyExpr, startStmts[si], -1, ec) < 0 {
         wTarget(exprPrev)
         return -1
       }
-      pushPostGuardNarrow(startStmts[si], -1)
       emitInitProgressAt(startStmtOrd[si])
       if bodyExpr.length > sSpanAt {
         bankFnSpan(startStmts[si], -1, sSpanAt, bodyExpr.length, 1, "")
@@ -2568,7 +2517,6 @@ function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
   // inert: a failed body aborts the whole module emit, and `computeGlobalPromotion`
   // clears the flag at the top of the next one.
   gPromoInStart = false
-  if k < 0 { restoreNarrow(savedStartNarrowTop) }
   wTarget(exprPrev)
 
   const body: u8[] = []
@@ -6740,7 +6688,6 @@ type EmitPass = "deadTailDrop"
   | "checkTopLevel"
   | "buildFnMap"
   | "computeVoidFns"
-  | "capNarrowBuild"
   | "computeRetInference"
   | "dispatchRewrite"
   | "captureBoxRewrite"
@@ -6759,7 +6706,6 @@ type EmitPass = "deadTailDrop"
   | "buildFnMap#2"
   | "synthParamAnnots"
   | "computeVoidFns#2"
-  | "capNarrowBuild#2"
   | "synthCaptureReadAnns"
   | "computeRetInference#2"
   | "collectMapFilterUse"
@@ -7539,11 +7485,8 @@ function passKeepsCaptures(name: string): boolean {
   if name == "monomorphize" { return true }
   if name == "computeRetInference" { return true }
   if name == "computeRetInference#2" { return true }
-  // Writes only `fRetVoid` and `tailSelfFnIx`, which no non-recording `capScan` path reads.
-  if name == "computeVoidFns" || name == "computeVoidFns#2" { return true }
-  // A recording walk asks each guard's frame for its captures; unmemoised, that is a walk of
-  // the frame per guard (D5950).
-  name == "capNarrowBuild" || name == "capNarrowBuild#2"
+  // Writes only `fRetVoid` and `tailSelfFnIx`, which no `capScan` path reads.
+  name == "computeVoidFns" || name == "computeVoidFns#2"
 }
 
 // Dispatch one pass-table row, exhaustively over `EmitPass`. Every pass returns an i32 status (< 0 =
@@ -7674,12 +7617,6 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
     "capCacheBuild" => {
       return capCacheBuild()
     }
-    "capNarrowBuild" => {
-      return capNarrowBuild()
-    }
-    "capNarrowBuild#2" => {
-      return capNarrowBuild()
-    }
     "synthCaptureEmptyListAnns" => {
       return synthCaptureEmptyListAnns()
     }
@@ -7739,6 +7676,7 @@ function emitProgramReset(rootIx: i32) {
   tailSelfFnReset()
   monoStateReset()
   classifyStateReset()
+  callResultTextsReset()
   // Must be per-compile, and is not (a filed hazard). `ba8Used` says this module mints the
   // packed-byte heap types; the indices it guards are recomputed every compile, so a
   // single-compile process never disagrees — but the LSP and the wasm test harness drive many
@@ -7849,13 +7787,6 @@ function emitProgramReset(rootIx: i32) {
   emitFnSpanEnd = []
   emitFnSpanKind = []
   emitFnSpanTag = []
-  narrowNames = []
-  narrowVariants = []
-  narrowTys = []
-  narrowSets = []
-  narrowRetired = []
-  narrowTop = 0
-  narrowIdxReset()
   // Back to the start of the timeline: the capture cache is only valid for a FINAL AST, and a
   // phase left by the previous program on a shared instance would arm every later-phase reader
   // over this program's whole pass table. See `EmitPhase`.
@@ -7917,12 +7848,9 @@ function emitPassTable(): PassRow[] {
     { pass: "checkTopLevel", needs: ["collectFns"] },
     { pass: "buildFnMap", needs: ["collectFns"] },
     { pass: "computeVoidFns", needs: ["buildFnMap"] },
-    { pass: "capNarrowBuild", needs: ["buildFnMap"] },
     {
       pass: "computeRetInference",
-      needs: [
-        "buildFnMap", "computeVoidFns", "capNarrowBuild",
-      ],
+      needs: ["buildFnMap", "computeVoidFns"],
     },
     {
       pass: "dispatchRewrite",
@@ -7999,18 +7927,13 @@ function emitPassTable(): PassRow[] {
       needs: ["synthParamAnnots"],
     },
     {
-      pass: "capNarrowBuild#2",
-      needs: ["synthParamAnnots"],
-    },
-    {
       pass: "synthCaptureReadAnns",
       needs: ["synthParamAnnots"],
     },
     {
       pass: "computeRetInference#2",
       needs: [
-        "synthParamAnnots", "computeVoidFns#2", "capNarrowBuild#2",
-        "synthCaptureReadAnns",
+        "synthParamAnnots", "computeVoidFns#2", "synthCaptureReadAnns",
       ],
     },
     {

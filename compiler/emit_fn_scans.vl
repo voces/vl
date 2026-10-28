@@ -132,11 +132,7 @@ import {
   mapReadNarrowableSlot,
   mfRecvKindOf,
   nulVariantIdxOfExpr,
-  preStmtNarrow,
-  pushPostGuardNarrow,
   refListSlotOfExpr,
-  setNarrowFromCond,
-  setNarrowFromCondElse,
   stmtIsTailValue,
   structIndexOfExpr,
   tyIsBareStrLit,
@@ -167,14 +163,7 @@ import {
   gLitUnionUsed,
   pushStagesAtomNarrow,
 } from "./emit_lit_atoms"
-import {
-  PushKind,
-  globalLetOf,
-  maskNarrowFor,
-  narrowKeyOfRead,
-  pushKindBit,
-  unmaskNarrow,
-} from "./emit_narrow_slots"
+import { PushKind, globalLetOf, pushKindBit } from "./emit_narrow_slots"
 import {
   assignTargetSpills,
   fnDeclaresNonVoid,
@@ -208,14 +197,13 @@ import {
   RLK_I32_LIST,
   fnStmts,
   fnUsesCloEq,
-  narrowTop,
   rlElemKindTbl,
   sFieldCount,
   sHeapIdx,
   uDeclared,
 } from "./emit_state"
 import { declaredKind } from "./emit_struct_order"
-import { coalesceRetypedAtomToStr, restoreNarrow } from "./emit_ty_canon"
+import { coalesceRetypedAtomToStr } from "./emit_ty_canon"
 import {
   armPathArenaDeclined,
   nodeTyUnionHasMapArm,
@@ -790,9 +778,7 @@ function fnTailWidensAtomToStr(fnIx: i32) {
   if fnIx < 0 { return false }
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
-    const savedTop = narrowTop
     const hit = tailBlockWidensAtomToStr(fn.fnBody, fnIx)
-    restoreNarrow(savedTop)
     return hit
   }
   false
@@ -809,12 +795,7 @@ function tailBlockWidensAtomToStr(blockIx: i32, fnIx: i32) {
     const n = stmts.length
     if n == 0 { return false }
     let i = 0
-    while i < n - 1 {
-      preStmtNarrow(stmts[i])
-      pushPostGuardNarrow(stmts[i], fnIx)
-      i = i + 1
-    }
-    preStmtNarrow(stmts[n - 1])
+    while i < n - 1 { i = i + 1 }
     return tailStmtWidensAtomToStr(stmts[n - 1], fnIx)
   }
   false
@@ -825,9 +806,7 @@ function tailBlockWidensAtomToStr(blockIx: i32, fnIx: i32) {
 // position; any other tail value statement widens exactly like a `return` of it.
 function tailStmtWidensAtomToStr(stmtIx: i32, fnIx: i32) {
   if nodeAt(stmtIx) is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). The
-    // outermost else narrowing restored is the state the nested restores would have left.
-    let elseTop = -1
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990)..
     let hit = false
     let cur = stmtIx
     while cur >= 0 {
@@ -836,17 +815,10 @@ function tailStmtWidensAtomToStr(stmtIx: i32, fnIx: i32) {
       cur = -1
       if s is IfStmt {
         if lastStmtIsValueIf(at, fnIx) || elseLessNullableTail(at, fnIx) {
-          const savedTop = narrowTop
-          const narrowed = setNarrowFromCond(s.ifCond, fnIx)
           const hitThen = tailBlockWidensAtomToStr(s.ifThen, fnIx)
-          if narrowed { restoreNarrow(savedTop) }
           if hitThen {
             hit = true
           } else if s.ifElse >= 0 {
-            const savedElseTop = narrowTop
-            if setNarrowFromCondElse(s.ifCond, fnIx) {
-              if elseTop < 0 { elseTop = savedElseTop }
-            }
             const els = nodeAt(s.ifElse)
             if els is Block { hit = tailBlockWidensAtomToStr(s.ifElse, fnIx) }
             else if els is IfStmt { cur = s.ifElse }
@@ -855,7 +827,6 @@ function tailStmtWidensAtomToStr(stmtIx: i32, fnIx: i32) {
         }
       }
     }
-    if elseTop >= 0 { restoreNarrow(elseTop) }
     return hit
   }
   if !stmtIsTailValue(stmtIx, fnIx) { return false }
@@ -1084,8 +1055,8 @@ function eqgListKindOfExpr(exprIx: i32, fnIx: i32) {
 }
 
 // `lopK` is this node's own `listOpKindOfBin`, passed in rather than re-derived: every caller
-// holds it. Threaded and not memoised — the answer reads the emitter's live tables and the
-// narrowing stack, so a memo would need a generation key a caller holding the value does not.
+// holds it. Threaded and not memoised — the answer reads the emitter's live tables, so a memo
+// would need a generation key a caller holding the value does not.
 
 // The generic-compare rep of a `==` or `!=` whose operands are both lists of one rep that has
 // no core of its own, or -1. Both must resolve to the same rep and the same ref-list slot, as
@@ -1573,9 +1544,7 @@ function ifChainHasAtomArm(ifIx: i32, fnIx: i32) {
 // else branches and while bodies — the scopes `collectLocals` walks. The wrapper restores the
 // narrowing depth the scan's post-guard pushes may leave behind on an early `true`.
 export function blockHasStrOp(blockIx: i32, fnIx: i32) {
-  const savedGuardTop = narrowTop
   const hit = blockHasStrOpScan(blockIx, fnIx)
-  restoreNarrow(savedGuardTop)
   hit
 }
 
@@ -1585,7 +1554,6 @@ function blockHasStrOpScan(blockIx: i32, fnIx: i32) {
     const stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
-      preStmtNarrow(stmts[i])
       const s = nodeAt(stmts[i])
       if s is LetDecl {
         if exprHasStrOp(s.letInit, fnIx) { return true }
@@ -1643,7 +1611,6 @@ function blockHasStrOpScan(blockIx: i32, fnIx: i32) {
       // Post-guard complement narrowing, mirroring the emit loops, so a string read below a
       // returning guard is detected under the same narrowing the emit applies. The wrapper
       // restores the depth.
-      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
   }
@@ -1654,9 +1621,7 @@ function blockHasStrOpScan(blockIx: i32, fnIx: i32) {
 // `else` block, or recursively a chained `else if`. Mirrors `ifChainPushPopBits`: it walks the
 // whole chain, not just one level.
 function ifChainHasStrOp(ifIx: i32, fnIx: i32) {
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). The
-  // outermost else narrowing restored is the state the nested restores would have left.
-  let elseTop = -1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990)..
   let hit = false
   let cur = ifIx
   while cur >= 0 {
@@ -1666,29 +1631,18 @@ function ifChainHasStrOp(ifIx: i32, fnIx: i32) {
       if exprHasStrOp(s.ifCond, fnIx) {
         hit = true
       } else {
-        // Narrow across the then-branch, mirroring `emitStmt` and `collectLocalsIf`, so a string
-        // op over a narrowed variant field is detected — `exprString` resolves a variant field's
-        // string type only while the receiver's narrowing is active. Save and restore the depth.
-        const savedTop = narrowTop
-        const narrowed = setNarrowFromCond(s.ifCond, fnIx)
         hit = blockHasStrOp(s.ifThen, fnIx)
-        if narrowed { restoreNarrow(savedTop) }
       }
       if !hit && s.ifElse >= 0 {
-        // A value union narrows to the complement set in the else-arm, mirroring `emitStmt`'s
-        // else lowering, so `else { print(v) }` with `v` now `string` is detected as a string
-        // print and reserves the scratch frame.
-        const savedElseTop = narrowTop
-        if setNarrowFromCondElse(s.ifCond, fnIx) {
-          if elseTop < 0 { elseTop = savedElseTop }
-        }
         const els = nodeAt(s.ifElse)
-        if els is Block { hit = blockHasStrOp(s.ifElse, fnIx) }
-        else if els is IfStmt { cur = s.ifElse }
+        if els is IfStmt {
+          cur = s.ifElse
+        } else {
+          hit = blockHasStrOp(s.ifElse, fnIx)
+        }
       }
     }
   }
-  if elseTop >= 0 { restoreNarrow(elseTop) }
   hit
 }
 
@@ -2510,13 +2464,11 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   // A read narrowed to `null` is printed from its box's tag, so the reservation scan and the
   // handler both plan the whole box with the narrowing lifted (D2801).
   if readNarrowedBoxToNull(exprIx, fnIx) {
-    const nnMask = maskNarrowFor(narrowKeyOfRead(exprIx))
     const nnMark = storageReadEnter(exprIx)
     const nnWas = printPlanPinNull(true)
     const nnRc = printUnionPlanCode(exprIx, fnIx, out)
     printPlanPinNull(nnWas)
     storageReadLeave(nnMark)
-    unmaskNarrow(nnMask)
     return nnRc
   }
   if !printUnionRecvIsBox(exprIx, fnIx) { return 0 }

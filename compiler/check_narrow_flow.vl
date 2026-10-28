@@ -59,15 +59,7 @@ import {
   spreadArgOf,
 } from "./ast"
 import { resolveHoleLinks } from "./check_annot_resolve"
-import {
-  asgKeepNarrowSetAt,
-  asgOpenElemRow,
-  asgRhsBuiltAtPlace,
-  clearAsgNarTyIx,
-  oerBank,
-  recordAsgNarTyIx,
-  recordAsgTvWrite,
-} from "./check_asg_rows"
+import { asgOpenElemRow, asgRhsBuiltAtPlace, oerBank } from "./check_asg_rows"
 import { collBindPopTo, lpOn } from "./check_bind_rows"
 import {
   crAskUsePath,
@@ -88,13 +80,11 @@ import {
 } from "./check_callee"
 import { crLostPush, nodeLineOf } from "./check_capture_loss"
 import {
-  crAfterBank,
   crAliasNestDepths,
   crAliasNestSlots,
   crAliasWr,
   crAskOn,
   crAskProg,
-  crBeforeBank,
   crCallSettled,
   crCapLossAny,
   crCapLossBank,
@@ -106,8 +96,6 @@ import {
   crCapRecSlots,
   crCapRecTys,
   crCapWidenBank,
-  crCondDropBank,
-  crCondDropN,
   crFnBases,
   crFnIxs,
   crFnNpBases,
@@ -182,8 +170,6 @@ import {
   inferDroppedTy,
   inferObservedLitSet,
   inferObservedSet,
-  isParentElseTyIx,
-  isParentTyIx,
   lpValSeenSet,
   narChainEndTy,
   narIfEnds,
@@ -314,11 +300,7 @@ import {
   tvWriteTy,
   unresolvedHole,
 } from "./check_leaf_steps"
-import {
-  isTyColCap,
-  luWriteTgt,
-  recordClonedIsVarTyIx,
-} from "./check_list_union"
+import { luWriteTgt, recordClonedIsVarTyIx } from "./check_list_union"
 import { allLitMembers } from "./check_lit_never_msgs"
 import { litMembersBaseTy } from "./check_literals"
 import {
@@ -1973,9 +1955,6 @@ export function retireNarrowingsForWrite(
   preAsgTy: i32,
 ) {
   let rt = rt0
-  // A re-check of the write (a hole body checked again at its pin) answers afresh: the answer
-  // an earlier check banked at the hole's own type is not this one's.
-  clearAsgNarTyIx(atIx)
   const tgtKey = placeKeyOf(tgtIx)
   // Found, not made: most writes are to places no narrowing names, and a push below makes it.
   let tgtPlace = placeAtKey(tgtIx, tgtKey)
@@ -2057,14 +2036,12 @@ export function retireNarrowingsForWrite(
         let pdcl = writeStorageTy(tgtIx)
         if pdcl < 0 { pdcl = placeStoreTy(tgtIx) }
         const prn = writeMemberTy(pdcl, rt)
-        recordAsgNarTyIx(atIx, prn)
         // A map cell reads `T | null` at its declaration, since a read may miss; the write just
         // stored the key, so the reads after it hold the stored type.
         if prn != pdcl || placeIsMapCell(tgtIx) { pathReTy = prn }
         if tvPlaceWrite(pdcl, rt) {
           pathReTy = tvWriteTy(pdcl, rt, -1)
           pathReAsg = true
-          recordAsgTvWrite(atIx, pdcl)
         }
       }
     }
@@ -2078,13 +2055,11 @@ export function retireNarrowingsForWrite(
     if pst >= 0 && tvPlaceWrite(pst, rt) {
       pathReTy = tvWriteTy(pst, rt, -1)
       pathReAsg = true
-      recordAsgTvWrite(atIx, pst)
     } else if pst >= 0 && rt >= 0 && tyAdmitsNull(pst) && !tyAdmitsNull(rt) {
       const nn = nonNullTy(pst)
       if nn >= 0 && !tySame(nn, pst) {
         pathReTy = nn
         pathReAsg = true
-        recordAsgNarTyIx(atIx, nn)
       }
     }
   }
@@ -2096,7 +2071,6 @@ export function retireNarrowingsForWrite(
       // A concrete value reads at the member of the pinned place it lands on.
       if !tyHasHole(rt) && !tyAdmitsNull(rt) && !isNullTy(rt) {
         pathReTy = mkDerivedHole(HD_HWR, "", rt, -1, hst)
-        recordAsgTvWrite(atIx, hst)
       } else {
         pathReTy = holeFieldWriteTy(hst, rt)
       }
@@ -2273,7 +2247,6 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       if guarded {
         rn = writeNarrowAfter(dcl, pre, asgLitRhsTy(atIx, dcl, rt))
         retires = !tySame(rn, pre)
-        if !retires { asgKeepNarrowSetAt(atIx, true) }
         // A kept write ends at the member it kept; a later null test of it is a dead-test
         // warning, not a refusal (DECISIONS.md, "A null test of a value proved non-null").
         keptEnd = rn
@@ -2285,7 +2258,6 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
         rn = tvWriteTy(dcl, rt, pre)
         keptEnd = rn
         retires = pre != rn
-        if guarded { asgKeepNarrowSetAt(atIx, false) }
       } else if retires && !guarded && tyIsTvWriteOf(pre, dcl, -1) {
         // A later write re-narrows from the declaration, as the first write's strip would.
         rn = writeMemberTy(dcl, asgLitRhsTy(atIx, dcl, rt))
@@ -2297,17 +2269,14 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
         if guarded { narRetireLayers(s, rn, dcl) }
         if d >= 0 { narSetScope(d, s, dcl) }
         // The RE-NARROW — the one member of the declaration the written value can be — is a
-        // shadow in the CURRENT block instead, because that is exactly how long the emitter's
-        // own push lives (its `restoreNarrow` unwinds at the same `}`). Banked at the
-        // assignment node so both halves lower the reads after the write alike (D1736).
+        // shadow in the CURRENT block instead, ending at its `}`. Banked at the assignment node
+        // so every read after the write lowers alike (D1736).
         if rn != dcl {
           noteNarShadow(s, dcl, NAR_KIND_GUARD)
           declareSlot(s, rn)
         }
-        recordAsgNarTyIx(atIx, rn)
       }
       // The emitter reads the place at its declaration; the reads' own types carry the pin.
-      if tvWrite { recordAsgTvWrite(atIx, dcl) }
       if guarded && tyAdmitsNull(dcl) { narNoteWritten(s) }
       // A kept write ends at the member of the declaration it stored, when that is narrower
       // than the narrowing it kept (a nullable union's inner member); else at that narrowing.
@@ -2385,7 +2354,6 @@ export function crPathCallRetire(slot: i32, callIx: i32) {
   // A quiet pass types the body before its receivers have types, so a method call there may
   // read as opaque; only the real pass's answer reaches the emitter.
   if inferQuiet { return 0 }
-  crAfterBank[st] = strListWith(crAfterBank[st] ?? crNoNames, npKeys[slot])
   crCallSettled[callIx] = true
   crRetNames.push(npKeys[slot])
   crRetCalls.push(callIx)
@@ -2775,7 +2743,7 @@ function crRetireHidden(hs: i32, ud: i32, callIx: i32, loopIx: i32) {
   }
   // The join row names this binding, which only the joins outside the shadow reach.
   if c >= 0 && st >= 0 {
-    crRetireAt(hs, c, false, st, false, crBindDepthOfSlot(hs))
+    crRetireAt(hs, c, false, false, crBindDepthOfSlot(hs))
   }
   0
 }
@@ -3011,7 +2979,7 @@ export function crNoteCallBare(callIx: i32) {
     const s = slots[i]
     const nm = slotNameOf(s)
     if s != -1 && callMayWrite(callIx, placeBare(s), nm) {
-      crRetire(s, callIx, false, crStmtIxs[crStmtIxs.length - 1])
+      crRetire(s, callIx, false)
     }
     crRetireShadowed(s, callIx, -1)
     i = i + 1
@@ -3299,7 +3267,7 @@ export function crLoopPreRetire(loopIx: i32) {
     if c < 0 && s != -1 && narDeclaredTy(s, -1) >= 0 {
       c = crLoopLeavingWrite(loopIx, s)
     }
-    if c >= 0 { crRetire(s, c, true, loopIx) }
+    if c >= 0 { crRetire(s, c, true) }
     crRetireShadowed(s, -1, loopIx)
     i = i + 1
   }
@@ -3340,10 +3308,6 @@ function crLoopPathPreRetire(loopIx: i32) {
         crRetWideTys.push(-1)
         crRetRoots.push(crCurRoot())
         crRetLoops.push(true)
-        crBeforeBank[loopIx] = strListWith(
-          crBeforeBank[loopIx] ?? crNoNames,
-          npKeys[s],
-        )
         narClobPlacePush(npPlace[s])
         narClobTysPush(-1)
         narClobPrevPush(npTys[s])
@@ -3553,11 +3517,6 @@ function crFilterCond(condIx: i32, places: i32[], tys: i32[], mark: i32) {
       const wc = crFirstWritingCall(condIx, places[i], nm)
       if wc >= 0 {
         keep = false
-        crCondDropBank[condIx] = strListWith(
-          crCondDropBank[condIx] ?? crNoNames,
-          nm,
-        )
-        crCondDropN = crCondDropN + 1
         crRetNames.push(nm)
         crRetCalls.push(wc)
         crRetNarTys.push(tys[i])
@@ -3769,8 +3728,6 @@ function pushDiscrimParentFact(
   fieldTy: i32,
   places: i32[],
   tys: i32[],
-  bankIx: i32,
-  elseBank: boolean,
   mode: DiscrimMode,
 ) {
   if fieldTy < 0 { return 0 }
@@ -3805,20 +3762,6 @@ function pushDiscrimParentFact(
   if kept.length == ms.length { return 0 }
   let res = kept[0]
   if kept.length > 1 { res = mkUnionTy(kept) }
-  // Bank the answer for the emitter's narrowing stack (`isParentTyIxOf` / `isParentElseTyIxOf`),
-  // which cannot re-derive it from the tested spelling. Guarded on the node being in range: an
-  // emitter-synthesized `is` falls past the end and reads -1, which is the "push nothing" answer.
-  if bankIx >= 0 {
-    if elseBank {
-      if bankIx < isTyColCap {
-        while isParentElseTyIx.length <= bankIx { isParentElseTyIx.push(-1) }
-        isParentElseTyIx[bankIx] = res
-      }
-    } else if bankIx < isTyColCap {
-      while isParentTyIx.length <= bankIx { isParentTyIx.push(-1) }
-      isParentTyIx[bankIx] = res
-    }
-  }
   pushNarrowFact(n.memObj, res, places, tys)
 }
 
@@ -3980,15 +3923,7 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
           && listFitNarrowKeepsRep(isCur, tIdx)
         ) {
           pushNarrowFact(isPl, tIdx, places, tys)
-          pushDiscrimParentFact(
-            isPl,
-            tIdx,
-            places,
-            tys,
-            condIx,
-            false,
-            "intersect",
-          )
+          pushDiscrimParentFact(isPl, tIdx, places, tys, "intersect")
         } else if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
           pushElemReadFact(isPl, isCur, tIdx, places, tys)
         }
@@ -4024,15 +3959,7 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         if eqPlace >= 0 {
           const eqTy = litCmpTy(condIx)
           if eqTy >= 0 {
-            pushDiscrimParentFact(
-              eqPlace,
-              eqTy,
-              places,
-              tys,
-              condIx,
-              false,
-              "intersect",
-            )
+            pushDiscrimParentFact(eqPlace, eqTy, places, tys, "intersect")
           }
         }
         pushLitEqFact(condIx, true, places, tys)
@@ -4129,19 +4056,8 @@ function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
             return 0
           }
           pushNarrowFact(isPl, sub, places, tys)
-          // The complement, banked into the else table. `setNarrowFromCondElse` declines to
-          // else-narrow a struct union, so a checker-only complement would type `else { s.w }` clean
-          // for an emitter still seeing the full union — trading an accurate `field 'w' is not on
-          // every member` for an obscure emit reject. Both layers carry it, so they agree.
-          pushDiscrimParentFact(
-            isPl,
-            sub,
-            places,
-            tys,
-            condIx,
-            true,
-            "intersect",
-          )
+          // The complement, so `else { s.w }` reads the field at the members the test leaves.
+          pushDiscrimParentFact(isPl, sub, places, tys, "intersect")
         }
       }
       return 0
@@ -4176,15 +4092,7 @@ function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         if eqPlace >= 0 {
           const eqTy = litCmpTy(condIx)
           if eqTy >= 0 {
-            pushDiscrimParentFact(
-              eqPlace,
-              eqTy,
-              places,
-              tys,
-              condIx,
-              true,
-              "exclude",
-            )
+            pushDiscrimParentFact(eqPlace, eqTy, places, tys, "exclude")
           }
         }
         pushLitEqFact(condIx, false, places, tys)
