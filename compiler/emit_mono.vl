@@ -598,6 +598,7 @@ import {
   elabInstSpelling,
   elabKeyAt,
   elabNarrowedCarry,
+  elabResultAtParams,
   elabRetOf,
   elabSlotNote,
   elabStampAt,
@@ -19704,20 +19705,27 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   if ax < 0 || (!(nodeAt(ax) is Ident) && !choice && !lam) { return 0 }
   // Inside a generic instance the receiver is read at that instance's binding.
   let rt = monoExactPinTyOf(nodeTyIxOf(m.memObj), ctx)
-  // A list of functions the flow pinned is read at the annotation the pin gave it (D9093).
-  // So is one a named function is handed, whose own parameter the flow linked to it (D9761).
-  if (lam || nodeAt(ax) is Ident) && (rt < 0 || tyHasTyVar(rt)) {
-    rt = monoPinnedListAnnTy(m.memObj)
-  }
+  // A list of a tagged set is closed. Another open list of functions the flow pinned is read at
+  // the annotation the pin gave it (D9093), as is one handed a named function its parameter the
+  // flow linked to it (D9761).
+  const open = rt < 0 || tyHasTyVar(rt) && !fnTagListTy(rt)
+  if (lam || nodeAt(ax) is Ident) && open { rt = monoPinnedListAnnTy(m.memObj) }
   // A list literal receiver is read at the type its own element slot is pinned at.
-  if rt < 0 || tyHasTyVar(rt) {
+  if rt < 0 || tyHasTyVar(rt) && !fnTagListTy(rt) {
     const lr = monoOpenFnListLitTy(m.memObj, ctx)
     if lr == -2 { return -1 }
     if lr >= 0 { rt = lr }
   }
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = tyAt(rt)
-  if !(lt is TyArray) || lt.aElem < 0 || tyHasTyVar(lt.aElem) { return 0 }
+  // A tagged set element is closed: the callback's instance takes the set, as a direct call's does.
+  if (
+    !(lt is TyArray)
+    || lt.aElem < 0
+    || tyHasTyVar(lt.aElem) && !fnTagTyIsTagged(lt.aElem)
+  ) {
+    return 0
+  }
   monoRecordPinnedRecv(m.memObj, rt, ctx, 0)
   if lam {
     monoListCbLamAt(a, lt.aElem, ctx)
@@ -19736,9 +19744,20 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   if m.memProp == "map" { r = monoValueRetAt(a, qs, 0) }
   if r < 0 || tyHasTyVar(r) { return 0 }
   const ft = mkFuncTy(qs, r)
-  const fs = monoPinAnnSpelling(ft)
-  if fs == "" { return 0 }
-  if monoCoerceFnValueName(a, fs, ctx, ft) < 0 { return -1 }
+  // A named generic handed a tagged set's elements takes its instance at the set itself, as a
+  // direct call hands it on (`monoPinHoleParam`).
+  if fnTagTyIsTagged(lt.aElem) {
+    const an = nodeAt(ax)
+    if !(an is Ident) { return 0 }
+    const gfe = monoFnFeOfIdent(ax, an.identName, ctx)
+    if gfe < 0 || gfe >= monoGen.length || monoGen[gfe] != 1 { return 0 }
+    const pn: string[] = [tyToStr(lt.aElem)]
+    if monoInstanceFor(gfe, pn, ax, ft, qs) < 0 { return -1 }
+  } else {
+    const fs = monoPinAnnSpelling(ft)
+    if fs == "" { return 0 }
+    if monoCoerceFnValueName(a, fs, ctx, ft) < 0 { return -1 }
+  }
   // A `.map` the checker left open, its element a hole function's, gives a list of that result.
   if m.memProp == "map" && monoTyOpen(nodeTyIxOf(ix)) {
     nodeTyRecord(ix, mkArrayTy(r))
@@ -22405,7 +22424,14 @@ function monoFnDeclRetAtUnder(
   const lx = monoLamTypedTemplate(lx0)
   const r = holeLamRetAt(lx, mkFuncTy(qs, i32TyIx()), bN, bT)
   if r >= 0 { return r }
-  monoFnTyRetAt(nodeTyIxOf(lx), qs)
+  const dr = monoFnTyRetAt(nodeTyIxOf(lx), qs)
+  if dr >= 0 || bN.length > 0 { return dr }
+  // A tagged set argument is called member by member, so the instance the elaboration
+  // checked at it answers.
+  for q in qs {
+    if fnTagTyIsTagged(q) { return elabResultAtParams(lx, qs) }
+  }
+  -1
 }
 
 // The closed result of function type `lt` called at the closed parameter types `qs`, its
