@@ -98,6 +98,7 @@ import {
   crCapRecFns,
   crCapRecHandles,
   crCapRecNames,
+  crCapRecSlots,
   crCapRecTys,
   crCapWidenBank,
   crCondDropBank,
@@ -146,7 +147,8 @@ import {
   crwRoot,
 } from "./check_capture_walks"
 import {
-  crBodyReadNames,
+  crBindDepthOfSlot,
+  crBodyReads,
   crCurRoot,
   crDeclareWidened,
   crFirstBank,
@@ -155,6 +157,7 @@ import {
   crNameIsModuleTop,
   crNameNulledInProgram,
   crOuterWidest,
+  crReadSlot,
   crRootCaptureWiden,
 } from "./check_capture_widen"
 import { mkDerivedHole } from "./check_coal"
@@ -189,7 +192,7 @@ import {
   crInHoleTemplate,
   crLambdaEscapes,
   crLambdaHandle,
-  crLiveNames,
+  crLiveSlots,
   crNameEscapesHere,
   crPathDropRead,
   crPopSoleTo,
@@ -343,7 +346,6 @@ import {
 } from "./check_nar_written"
 import {
   IfChk,
-  crBindDepthOf,
   crCallReaches,
   crChainWidest,
   crFnNpBase,
@@ -461,6 +463,7 @@ import {
   PLACE_NONE,
   placeAt,
   placeAtKey,
+  placeBare,
   placeDecl,
   placeFind,
   placeIntern,
@@ -475,10 +478,9 @@ import {
   constDeclOf,
   constScopes,
   declDepthOf,
+  declIsConst,
   declTyOf,
-  declare,
   declareSlot,
-  envDeclOfNameForFlow,
   fnAliasScopes,
   fnDeclScopes,
   identSlotOf,
@@ -487,12 +489,14 @@ import {
   scopeDeclLog,
   scopeDepthsOf,
   scopeFramePop,
+  scopeSlotAt,
   slotLayerDepth,
   slotLayerPrev,
   slotLayerTop,
   slotLayerTy,
   slotNameOf,
   slotTyAt,
+  slotVisibleOf,
 } from "./check_scopes"
 import {
   narDefChain,
@@ -1764,7 +1768,7 @@ function retireAliasedNarrowings(
     // A receiver no other place refers to cannot be any object on another key's path; a key
     // root no other place refers to cannot be the receiver unless the receiver names it. Both
     // resolve names here, so neither holds for an entry an inner declaration hides (D3307).
-    const hidden = !own && !fam && placeRootHidden(kRoot, npPlace[i])
+    const hidden = !own && !fam && placeRootHidden(npPlace[i])
     const apart = recvFresh && kRoot != recvName && !hidden
     const skip0 = kRoot != recvName && !hidden && crSoleRefHolds(kRoot)
     const keeps = (!hidden
@@ -1818,8 +1822,8 @@ function retireAliasedNarrowings(
 
 // Whether `root`, the root name of the narrowing place `p`, reads another binding here, an
 // inner declaration hiding it, so a by-name test of its root cannot speak for it (D3307).
-function placeRootHidden(root: string, p: i32): boolean {
-  envDeclOfNameForFlow(root) != placeDecl(p)
+function placeRootHidden(p: i32): boolean {
+  slotVisibleOf(placeDecl(p)) != placeDecl(p)
 }
 
 // A narrowed map cell a store through an alias may have written is present either way, so it
@@ -2269,7 +2273,7 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
         // assignment node so both halves lower the reads after the write alike (D1736).
         if rn != dcl {
           noteNarShadow(s, dcl, NAR_KIND_GUARD)
-          declare(nm, rn)
+          declareSlot(s, nm, rn)
         }
         recordAsgNarTyIx(atIx, rn)
       }
@@ -2497,13 +2501,15 @@ export function crLoopReadCheck(slot: i32, callIx: i32) {
 // ── a call that may reassign a narrowed binding ends the narrowing (D2390) ─────────────────
 
 // May the call at `callIx` write the place `p` spelled `key` — a bare name, or a path such as
-// `o.v` or `xs[0]`? A bare name may come as PLACE_NONE and its spelling. Answers true when unsure.
-// DECISIONS.md, "A call that may reassign a narrowed binding ends the narrowing".
+// `o.v` or `xs[0]`? Answers true when unsure. DECISIONS.md, "A call that may reassign a
+// narrowed binding ends the narrowing".
 export function callMayWrite(callIx: i32, p: i32, key: string): boolean {
   if isPathKey(key) { return p < 0 || callInvalidatesNarrowedPath(callIx, p) }
+  const s = placeDecl(p)
+  if s == -1 { return true }
   // Nothing reassigns a `const`, whatever a callee writes under its name (D3019).
-  if isConstName(key) { return false }
-  crCallReaches(callIx, key)
+  if declIsConst(s) { return false }
+  crCallReaches(callIx, s)
 }
 
 export function crStmtLeave() {
@@ -2598,8 +2604,9 @@ export function narListDeliveryErr(
   // A field or subscript place is typed as declared, the narrowing being on its elements alone.
   let decl = srcTy
   if !isPathKey(name) {
-    decl = narDeclaredTy(envDeclOfNameForFlow(name), -1)
-    if decl < 0 { decl = lookup(name) }
+    const ns = slotVisibleOf(placeDecl(npPlace[slot]))
+    decl = narDeclaredTy(ns, -1)
+    if decl < 0 { decl = declTyOf(ns) }
     let r = 0
     while r < rows && decl >= 0 {
       decl = placeElemTy(listUnionWidest(nonNullTy(decl)))
@@ -2705,18 +2712,21 @@ function crRetireShadowed(name: string, callIx: i32, loopIx: i32) {
       ds.pop()
     }
     const st = crStmtHolding(hidden[hidden.length - 1])
+    const hs = scopeSlotAt(ds[ds.length - 1], name)
     let c = callIx
-    if loopIx >= 0 {
+    if hs == -1 {
       c = -1
-      if crMayBeWritten(name) {
-        c = crFirstWritingCall(loopIx, PLACE_NONE, name)
+    } else if loopIx >= 0 {
+      c = -1
+      if crMayBeWritten(hs) {
+        c = crFirstWritingCall(loopIx, placeBare(hs), name)
       }
-    } else if !callMayWrite(c, PLACE_NONE, name) {
+    } else if !callMayWrite(c, placeBare(hs), name) {
       c = -1
     }
     // The join row names this binding, which only the joins outside the shadow reach.
     if c >= 0 && st >= 0 {
-      crRetireAt(name, c, false, st, false, crBindDepthOf(name))
+      crRetireAt(hs, c, false, st, false, crBindDepthOfSlot(hs))
     }
     let k = hidden.length - 1
     while k >= 0 {
@@ -2758,19 +2768,19 @@ export function crCaptureWiden(fnIx: i32) {
   if asgDeclSlots.length == 0 || asgDeclDepths[0] >= base { return 0 }
   let escapes = -1
   // Only a name the body reads needs an answer.
-  const reads = crBodyReadNames(fnIx)
+  const reads = crBodyReads(fnIx)
   let r = 0
   while r < reads.length {
-    const nm = reads[r]
-    const s = envDeclOfNameForFlow(nm)
+    const s = crReadSlot(reads[r])
+    const nm = slotNameOf(s)
     const i = crInnerRowBelow(s, base)
     if i >= 0 {
       const wide = crOuterWidest(s, base)
-      if wide >= 0 && wide != lookup(nm) {
+      if wide >= 0 && wide != declTyOf(s) {
         if inferQuiet && strListHas(prior, nm) {
-          crDeclareWidened(nm, wide)
-        } else if crCaptureLosesNarrowing(fnIx, nm, asgDeclKinds[i], wide) {
-          crDeclareWidened(nm, wide)
+          crDeclareWidened(s, wide)
+        } else if crCaptureLosesNarrowing(fnIx, s, asgDeclKinds[i], wide) {
+          crDeclareWidened(s, wide)
           crCapWidenBank[fnIx] = strListWith(
             crCapWidenBank[fnIx] ?? crNoNames,
             nm,
@@ -2782,21 +2792,21 @@ export function crCaptureWiden(fnIx: i32) {
           crCapLossAny = true
         } else if (
           crElemNarrowLive(s, nm)
-          && !crCallbackKeeps(fnIx, PLACE_NONE, nm)
+          && !crCallbackKeeps(fnIx, placeBare(s), nm)
         ) {
-          crDeclareWidened(nm, wide)
+          crDeclareWidened(s, wide)
           crCapWidenBank[fnIx] = strListWith(
             crCapWidenBank[fnIx] ?? crNoNames,
             nm,
           )
-        } else if crCaptureMayGoStale(fnIx, nm) {
+        } else if crCaptureMayGoStale(fnIx, s) {
           if escapes < 0 { escapes = crLambdaEscapes(fnIx) }
-          const fnWriter = crMayBeWritten(nm)
-          if escapes == 0 && !fnWriter && !crNameAssigned(nm) {
+          const fnWriter = crMayBeWritten(s)
+          if escapes == 0 && !fnWriter && !crNameAssigned(s) {
             // Nothing can change it.
           } else if (
             escapes == 0
-            && !crBodyMayWrite(fnIx, nm)
+            && !crBodyMayWrite(fnIx, s)
             && !crBodyTests(fnIx, nm)
           ) {
             crCapRecDepths.push(crFnBases.length - 1)
@@ -2804,10 +2814,11 @@ export function crCaptureWiden(fnIx: i32) {
             crCapRecHandles.push(hd)
             crCapRecCount[hd] = (crCapRecCount[hd] ?? 0) + 1
             crCapRecNames.push(nm)
-            crCapRecTys.push(lookup(nm))
+            crCapRecSlots.push(s)
+            crCapRecTys.push(declTyOf(s))
             crCapRecFns.push(fnIx)
           } else {
-            crDeclareWidened(nm, wide)
+            crDeclareWidened(s, wide)
             crCapWidenBank[fnIx] = strListWith(
               crCapWidenBank[fnIx] ?? crNoNames,
               nm,
@@ -2821,41 +2832,41 @@ export function crCaptureWiden(fnIx: i32) {
   0
 }
 
-// Whether the nested function `fnIx` may read a captured narrowing of `name` after it stopped
-// holding: some function may write the name, or the name is ever assigned and the nested function
+// Whether the nested function `fnIx` may read a captured narrowing of slot `s` after it stopped
+// holding: some function may write it, or it is ever assigned and the nested function
 // escapes the body making it, so it may run after that assignment (D2462). A callback run inside
 // the call it is handed to cannot.
-function crCaptureMayGoStale(fnIx: i32, name: string): boolean {
-  if crCallbackKeeps(fnIx, PLACE_NONE, name) { return false }
-  if crMayBeWritten(name) { return true }
-  crNameAssigned(name)
+function crCaptureMayGoStale(fnIx: i32, s: i32): boolean {
+  if crCallbackKeeps(fnIx, placeBare(s), slotNameOf(s)) { return false }
+  if crMayBeWritten(s) { return true }
+  crNameAssigned(s)
 }
 
-// Whether a captured narrowing of `name` cannot outlive the capture: the nested function `fnIx`
+// Whether a captured narrowing of slot `s` cannot outlive the capture: the nested function `fnIx`
 // may run after a write that may store `null`, and its body then reads the storage at the
 // declared type (D2529). A guard's narrowing refuses such a write under it, and a callback run
 // inside the call it is handed to runs before any later write, so both are left to D2402.
 function crCaptureLosesNarrowing(
   fnIx: i32,
-  name: string,
+  s: i32,
   kind: i32,
   wide: i32,
 ): boolean {
   if kind == NAR_KIND_GUARD { return false }
-  if crCallbackKeeps(fnIx, PLACE_NONE, name) { return false }
-  if crNameIsModuleTop(envDeclOfNameForFlow(name)) {
-    return crNameNulledInProgram(name)
-  }
+  const name = slotNameOf(s)
+  if crCallbackKeeps(fnIx, placeBare(s), name) { return false }
+  if crNameIsModuleTop(s) { return crNameNulledInProgram(name) }
   // A shared cell of a scalar box is read at the box, so any later write ends it there (D2555).
   crCaptureByRef(crDeclFrameOf(name), name, crTyIsScalarBox(wide))
 }
 
-// Whether running the nested function `fnIx` may itself write `name`.
-function crBodyMayWrite(fnIx: i32, name: string): boolean {
+// Whether running the nested function `fnIx` may itself write slot `s`.
+function crBodyMayWrite(fnIx: i32, s: i32): boolean {
   const fd = nodeAt(fnIx)
   if fd is FuncDecl {
+    const name = slotNameOf(s)
     if crSubtreeAssigns(fd.fnBody, name) { return true }
-    return crFirstWritingCall(fd.fnBody, PLACE_NONE, name) >= 0
+    return crFirstWritingCall(fd.fnBody, placeBare(s), name) >= 0
   }
   true
 }
@@ -2872,9 +2883,10 @@ export function crCapRecCheck(callIx: i32) {
   while r < crCapRecHandles.length {
     if crCapRecHandles[r] == h && crCapRecDepths[r] == crFnBases.length {
       const nm = crCapRecNames[r]
-      if !tySame(lookup(nm), crCapRecTys[r]) {
+      const cs = crCapRecSlots[r]
+      if !tySame(declTyOf(cs), crCapRecTys[r]) {
         let by = "a write"
-        if crMayBeWritten(nm) { by = "a call" }
+        if crMayBeWritten(cs) { by = "a call" }
         tErrCoded(
           "'"
             + h
@@ -2951,24 +2963,26 @@ export function crNoteCallBare(callIx: i32) {
   // A body checked with no statement of its own open (a monomorphization re-check) banks
   // nothing: the open statement is its caller's.
   if crStmtFns[crStmtFns.length - 1] != crFnBases.length { return 0 }
-  const names = crCallCandidates()
+  const slots = crCallCandidates()
   let i = 0
-  while i < names.length {
-    if callMayWrite(callIx, PLACE_NONE, names[i]) {
-      crRetire(names[i], callIx, false, crStmtIxs[crStmtIxs.length - 1])
+  while i < slots.length {
+    const s = slots[i]
+    const nm = slotNameOf(s)
+    if s != -1 && callMayWrite(callIx, placeBare(s), nm) {
+      crRetire(s, callIx, false, crStmtIxs[crStmtIxs.length - 1])
     }
-    crRetireShadowed(names[i], callIx, -1)
+    crRetireShadowed(nm, callIx, -1)
     i = i + 1
   }
   0
 }
 
-// `crLiveNames` less names no call can retire, which `callMayWrite` and `crRetireShadowed`
+// `crLiveSlots` less those no call can retire, which `callMayWrite` and `crRetireShadowed`
 // leave alone: a bare name no nested function of the root writes, bound once, inside the
 // function. Kept per nesting level across calls, so a call costs what changed since the last.
-function crCallCandidates(): string[] {
+function crCallCandidates(): i32[] {
   const root = crCurRoot()
-  if crwRoot != root { return crLiveNames() }
+  if crwRoot != root { return crLiveSlots() }
   let fb0 = -1
   if crFnBases.length > 0 && root != crProgRoot { fb0 = crFnBases[0] }
   const base = crFnBase()
@@ -3010,8 +3024,8 @@ function crCallCandidates(): string[] {
     g = g + 1
   }
   c.log = scopeDeclLog.length
-  const out: string[] = []
-  for nm in c.cands { out.push(nm) }
+  const out: i32[] = []
+  for r in c.candRows { out.push(slotVisibleOf(asgDeclSlots[r])) }
   out
 }
 
@@ -3228,24 +3242,22 @@ export function crLoopPreRetire(loopIx: i32) {
     cbPendClear()
   }
   if asgDeclSlots.length == 0 { return 0 }
-  const names = crLiveNames()
+  const slots = crLiveSlots()
   let i = 0
-  while i < names.length {
+  while i < slots.length {
+    const s = slots[i]
+    const nm = slotNameOf(s)
     let c = -1
-    if crMayBeWritten(names[i]) {
-      c = crFirstWritingCall(loopIx, PLACE_NONE, names[i])
+    if s != -1 && crMayBeWritten(s) {
+      c = crFirstWritingCall(loopIx, placeBare(s), nm)
     }
     // So does a write in the loop that leaves a guard's narrowing (D2609), or a straight-line
     // null strip's: the reads at the loop's top run again after it (D3302).
-    if (
-      c < 0
-      && !isPathKey(names[i])
-      && narDeclaredTy(envDeclOfNameForFlow(names[i]), -1) >= 0
-    ) {
-      c = crLoopLeavingWrite(loopIx, names[i])
+    if c < 0 && s != -1 && narDeclaredTy(s, -1) >= 0 {
+      c = crLoopLeavingWrite(loopIx, s)
     }
-    if c >= 0 { crRetire(names[i], c, true, loopIx) }
-    crRetireShadowed(names[i], -1, loopIx)
+    if c >= 0 { crRetire(s, c, true, loopIx) }
+    crRetireShadowed(nm, -1, loopIx)
     i = i + 1
   }
   0
@@ -3408,18 +3420,18 @@ function loopWriteMayReach(tgt: i32, val: i32, p: i32, pre: i32): boolean {
   !writeLandsWithin(store, vt, pre)
 }
 
-// The first assignment to the bare name `name` in the loop subtree at `ix` whose value, typed
-// before the loop runs, leaves the narrowing `name` holds there, or -1. A value whose type
+// The first assignment to slot `s` by name in the loop subtree at `ix` whose value, typed before
+// the loop runs, leaves the narrowing `s` holds there, or -1. A value whose type
 // needs the loop to decide is left to the write itself, which refuses what the loop's entry
 // type does not admit.
-function crLoopLeavingWrite(ix: i32, name: string): i32 {
+function crLoopLeavingWrite(ix: i32, s: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = nodeAt(ix)
   if n is FuncDecl { return -1 }
   if n is BinExpr {
-    if n.binOp == "=" && placeKeyOf(n.binLeft) == name {
-      const store = narWriteStorage(envDeclOfNameForFlow(name))
-      const pre = lookup(name)
+    if n.binOp == "=" && placeKeyOf(n.binLeft) == slotNameOf(s) {
+      const store = narWriteStorage(s)
+      const pre = declTyOf(s)
       let vt = loopWritePeekTy(n.binRight, store)
       if vt >= 0 && store >= 0 && pre >= 0 {
         if !isLitBearing(store) { vt = litPeekBaseTy(vt) }
@@ -3432,7 +3444,7 @@ function crLoopLeavingWrite(ix: i32, name: string): i32 {
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      const a = crLoopLeavingWrite(kids[k], name)
+      const a = crLoopLeavingWrite(kids[k], s)
       if a >= 0 { return a }
       k = k + 1
     }
@@ -3494,7 +3506,7 @@ function crFilterCond(condIx: i32, places: i32[], tys: i32[], mark: i32) {
   while i < places.length {
     let keep = true
     const nm = placeText(places[i])
-    if crMayBeWritten(nm) {
+    if placeIsPath(places[i]) || crMayBeWritten(placeDecl(places[i])) {
       const wc = crFirstWritingCall(condIx, places[i], nm)
       if wc >= 0 {
         keep = false
@@ -4714,7 +4726,11 @@ export function cbElemNarrowFor(recvIx: i32, cbIx: i32): boolean {
   cbPendClear()
   cbPendAdd(cbIx, nodeTyOf(recvIx), bound)
   cbPendCollect(fd.fnBody, bound)
-  const writes = (!crCallbackKeeps(cbIx, PLACE_NONE, root)
+  const writes = (!crCallbackKeeps(
+    cbIx,
+    placeIntern(placeDecl(key), root, false),
+    root,
+  )
     || crLoopLeavingPathWrite(fd.fnBody, key, leaf) >= 0
     || crFirstElemWritingCall(fd.fnBody, key) >= 0)
   cbPendClear()

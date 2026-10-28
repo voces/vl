@@ -12,6 +12,7 @@ import { demangleName } from "./check_suggest"
 import { T } from "./check_types"
 import {
   IDENT_BUILTIN,
+  declShadowOf,
   identDeclOf,
   sidEpoch,
   sidOfNode,
@@ -56,9 +57,16 @@ let envLogTy: i32[] = []
 let envLogPrev: i32[] = []
 let envLogDepth: i32[] = []
 let envLogHid: boolean[] = []
+// A stack of the log entries whose binding hid a declaration, by entry: the declaration hidden
+// and the shadower it held before, restored when the entry pops. Most bindings hide none.
+let envHideEnt: i32[] = []
+let envHideDecl: i32[] = []
+let envHidePrev: i32[] = []
 // Each frame's first log entry, and each slot's innermost live entry (-1 none).
 let envFrameBase: i32[] = []
 let envDeclTop: i32[] = []
+// Each declaration's innermost bound declaration that hides it (`declShadowOf`), or -1.
+let envShadower: i32[] = []
 let envAmbTop: i32[] = []
 // Each ambient intrinsic's slot by name: what a builtin `Ident`, which names no declaration, reads.
 let envAmbOf: {[string]: i32} = Map()
@@ -87,8 +95,12 @@ export function scopesReset() {
   envLogPrev = []
   envLogDepth = []
   envLogHid = []
+  envHideEnt = []
+  envHideDecl = []
+  envHidePrev = []
   envFrameBase = []
   envDeclTop = []
+  envShadower = []
   envAmbTop = []
   envAmbOf = Map()
   envAmbName = []
@@ -116,6 +128,13 @@ export function scopeFramePop() {
   while envLogSlot.length > base {
     const e = envLogSlot.length - 1
     if !envLogHid[e] { envUnlink(e) }
+    const h = envHideEnt.length - 1
+    if h >= 0 && envHideEnt[h] == e {
+      envShadower[envHideDecl[h]] = envHidePrev[h]
+      envHideEnt.pop()
+      envHideDecl.pop()
+      envHidePrev.pop()
+    }
     envLogSlot.pop()
     envLogTy.pop()
     envLogPrev.pop()
@@ -137,21 +156,20 @@ function envSlotTop(s: i32) {
   -1
 }
 
-// Resizes the declaration-indexed top table to cover `s`: at least the arena, and at least twice
-// its own length, in one allocation, so the table never grows one node at a time.
-function envDeclTopGrow(s: i32) {
+// Declaration-indexed table `a` resized to cover `s`, new rows -1: at least the arena, and at least
+// twice its own length, in one allocation, so a table never grows one node at a time.
+function envGrown(a: i32[], s: i32): i32[] {
   let n = P.nodes.length
   if n <= s { n = s + 1 }
-  if n < 2 * envDeclTop.length { n = 2 * envDeclTop.length }
+  if n < 2 * a.length { n = 2 * a.length }
   const t: i32[] = __array_new__(n, -1)
-  __array_copy__(t, 0, envDeclTop, 0, envDeclTop.length)
-  envDeclTop = t
-  0
+  __array_copy__(t, 0, a, 0, a.length)
+  t
 }
 
 function envSlotTopSet(s: i32, e: i32) {
   if s >= 0 {
-    if s >= envDeclTop.length { envDeclTopGrow(s) }
+    if s >= envDeclTop.length { envDeclTop = envGrown(envDeclTop, s) }
     envDeclTop[s] = e
     return 0
   }
@@ -244,9 +262,48 @@ function envBind(s: i32, name: string, ty: i32) {
   envLogPrev.push(-1)
   envLogDepth.push(top)
   envLogHid.push(false)
+  envHidesNote(s, e)
   envLink(e)
   fr[name] = e
   0
+}
+
+// Notes on entry `e`, being pushed for slot `s`, the declaration its first binding hides, which
+// `s` then shadows until the entry pops.
+function envHidesNote(s: i32, e: i32) {
+  if s < 0 || envSlotTop(s) >= 0 { return 0 }
+  const o = declShadowOf(s)
+  if o < 0 { return 0 }
+  if o >= envShadower.length { envShadower = envGrown(envShadower, o) }
+  envHideEnt.push(e)
+  envHideDecl.push(o)
+  envHidePrev.push(envShadower[o])
+  envShadower[o] = s
+  0
+}
+
+// The binding a read of slot `s`'s name reaches now: `s` itself when bound and unshadowed, else
+// the declaration it hides that is bound, then the innermost bound one hiding that; -1 when none
+// is bound. An ambient slot answers itself.
+export function slotVisibleOf(s: i32) {
+  if s < 0 { return s }
+  let v = s
+  let hops = 0
+  while v >= 0 && envSlotTop(v) < 0 && hops < 64 {
+    v = declShadowOf(v)
+    hops = hops + 1
+  }
+  if v < 0 || envSlotTop(v) < 0 { return -1 }
+  while (
+    v < envShadower.length
+    && envShadower[v] >= 0
+    && envSlotTop(envShadower[v]) >= 0
+    && hops < 128
+  ) {
+    v = envShadower[v]
+    hops = hops + 1
+  }
+  v
 }
 
 // The type declaration `decl` is bound at in the innermost frame binding it, or -1 when no live
@@ -337,17 +394,6 @@ export function declFnAliasSet(decl: i32, fn: i32) {
 
 // The function declaration the `Ident` `ix`'s live binding aliases, or -1.
 export function identFnAliasOf(ix: i32) { declFnAliasOf(identLiveDeclOf(ix)) }
-
-// The slot `name`'s innermost visible binding holds, or -1. This is a second resolver of the
-// fact the binder records per `Ident`, kept only where a flow question holds a place key or a
-// name list and no node: B1b keys those by declaration and B2c deletes this (D14544).
-export function envDeclOfNameForFlow(name: string) {
-  const d = lookupDepth(name)
-  if d < 0 { return -1 }
-  const e = T.frames[d][name] ?? -1
-  if e < 0 { return -1 }
-  envLogSlot[e]
-}
 
 // The type `name` holds in frame `d`, or -1 when that frame does not bind it.
 export function scopeTyAt(d: i32, name: string) {
@@ -489,6 +535,14 @@ export function lookupDepthSid(sid: i32, name: string) {
   ds[ds.length - 1]
 }
 
+// Whether declaration `d` is a `const` binding.
+export function declIsConst(d: i32) {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  if n is LetDecl { return n.letKw == "const" }
+  false
+}
+
 // True if `name` resolves (innermost-first) to a `const` binding.
 export function isConstName(name: string) {
   const i = lookupDepth(name)
@@ -532,7 +586,7 @@ function scopeDepthNote(sid: i32, name: string) {
 
 // Binds declaration `decl`, spelled `name`, to `ty` in the innermost frame.
 export function declareDecl(decl: i32, name: string, ty: i32) {
-  if decl < 0 { return declare(name, ty) }
+  if decl < 0 { return declareAmbient(name, ty) }
   scopeDepthNote(sidOfNode(decl), name)
   envBind(decl, name, ty)
 }
@@ -545,17 +599,8 @@ export function declareAmbient(name: string, ty: i32) {
   envBind(s, name, ty)
 }
 
-// Re-binds `name` to `ty` in the innermost frame as a layer over the binding it names now: a
-// narrowing, a widening or a restored snapshot. A name nothing binds gets a slot of its own.
-export function declare(name: string, ty: i32) {
-  const top = T.frames.length - 1
-  let s = scopeSlotAt(top, name)
-  if s == -1 { s = envDeclOfNameForFlow(name) }
-  if s == -1 { return declareAmbient(name, ty) }
-  declareSlot(s, name, ty)
-}
-
-// Binds `name` to slot `s` at `ty` in the innermost frame: `declare` with the slot in hand.
+// Binds `name` to slot `s` at `ty` in the innermost frame, as a layer over what `s` holds: a
+// narrowing, a widening or a restored snapshot.
 export function declareSlot(s: i32, name: string, ty: i32) {
   scopeDepthNote(-1, name)
   envBind(s, name, ty)
