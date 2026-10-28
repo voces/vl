@@ -60,7 +60,6 @@ import {
   sidLookup,
   sidOf,
   sidOfNode,
-  sidText,
 } from "./symbols"
 import { i32ListHas, i32ListIndexOf } from "./listutil"
 import { demangleName } from "./check_suggest"
@@ -631,8 +630,10 @@ export function cwIxBuild() {
 export type CwOccWalk = { a: i32, u: i32, all: boolean, row: i32 }
 
 // The rows of the binding `d` declares: those resolving to it or to a declaration sharing its
-// frame and name, and the calls that may write it. Every row of its name when `d` has no frame.
+// frame and name, and the calls that may write it. Every row of its name when `d` has no frame
+// or is a key (`cwKeyOfDecl`) standing for every binding of a name.
 export function cwOccWalk(d: i32): CwOccWalk {
+  if d <= -2 { return cwOccWalkAll(-2 - d) }
   if d < 0 || d >= P.nodes.length { return cwOccWalkAll(-1) }
   const sid = sidOfNode(d)
   if cwFrameOfDecl(d) == CW_FR_UNKNOWN { return cwOccWalkAll(sid) }
@@ -645,25 +646,55 @@ export function cwOccWalkUse(p: i32): CwOccWalk {
   cwOccWalk(identDeclOf(p))
 }
 
-// `cwOccWalk` of the declaration frame `fr` files for `nm`, the key an alias set carries.
-export function cwOccWalkAt(nm: string, fr: i32): CwOccWalk {
-  const sid = sidLookup(nm)
-  if fr == CW_FR_UNKNOWN { return cwOccWalkAll(sid) }
-  cwOccWalkOf(cwDeclAt(nm, fr), sid)
+// The key an alias set carries for the binding declaration `d` makes: the first declaration
+// sharing its frame and name, `d` itself where the frame walk filed none, or `-2 - sid` where
+// `d` has no frame, which stands for every binding of the name. -1 for no declaration.
+export function cwKeyOfDecl(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  if cwFrameOfDecl(d) == CW_FR_UNKNOWN { return cwKeyAnyOf(sidOfNode(d)) }
+  const r = cwDeclRepOf(d)
+  if r >= 0 { return r }
+  d
 }
 
-// The first declaration frame `fr` files for `nm`, the one its rows are chained under; -1 when
-// it files none.
-function cwDeclAt(nm: string, fr: i32): i32 {
-  cwBuildFrames()
-  const sid = sidLookup(nm)
-  if fr == CW_FR_UNKNOWN || cwDeclCap == 0 || sid < 0 { return -1 }
-  const s = cwDeclSlotOf(fr, sid)
-  if s < 0 || s >= cwDeclSlotSid.length || s >= cwDeclSlotRep.length {
-    return -1
-  }
-  if cwDeclSlotSid[s] != sid || cwDeclSlotFr[s] != fr { return -1 }
-  cwDeclSlotRep[s]
+// The key of the name the expression `ix` roots at (`covarRootName`), or -1 where it roots at
+// no name.
+export function cwKeyOfRoot(ix: i32): i32 {
+  const p = cwPeelValue(ix)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = nodeAt(p)
+  if !(n is Ident) || n.identName == "" { return -1 }
+  if cwFrameOfUse(p) == CW_FR_UNKNOWN { return cwKeyAnyOf(sidOfNode(p)) }
+  cwKeyOfDecl(identDeclOf(p))
+}
+
+// The key standing for every binding of the interned name `sid`.
+function cwKeyAnyOf(sid: i32): i32 {
+  if sid < 0 { return -1 }
+  -2 - sid
+}
+
+// The interned name of the key `k`, or -1.
+function cwKeySid(k: i32): i32 {
+  if k <= -2 { return -2 - k }
+  if k < 0 || k >= P.nodes.length { return -1 }
+  sidOfNode(k)
+}
+
+// The frame the key `k`'s binding declares into; `CW_FR_UNKNOWN` for a key standing for every
+// binding of a name.
+export function cwKeyFrame(k: i32): i32 {
+  if k < 0 { return CW_FR_UNKNOWN }
+  cwFrameOfDecl(k)
+}
+
+// Whether two keys may name one binding: the same key, or a key standing for every binding of
+// the other's name.
+function cwKeySame(a: i32, b: i32): boolean {
+  if a == b { return true }
+  if a >= -1 && b >= -1 { return false }
+  const s = cwKeySid(a)
+  s >= 0 && s == cwKeySid(b)
 }
 
 function cwOccWalkOf(key: i32, sid: i32): CwOccWalk {
@@ -698,13 +729,13 @@ export function cwOccNext(w: CwOccWalk): boolean {
   true
 }
 
-// Every arena node that is an occurrence of a member of `set` in the kind `kind`. A pair is
-// carried, not a bare name, so a same-named handle in another frame contributes nothing.
-export function cwSetOccs(set: string[], setFr: i32[], kind: i32, out: i32[]) {
+// Every arena node that is an occurrence of a member of `set` in the kind `kind`. A member is
+// a binding's key (`cwKeyOfDecl`), so a same-named handle in another frame contributes nothing.
+export function cwSetOccs(set: i32[], kind: i32, out: i32[]) {
   cwIxBuild()
   let i = 0
   while i < set.length {
-    const ow = cwOccWalkAt(set[i], setFr[i])
+    const ow = cwOccWalk(set[i])
     while cwOccNext(ow) {
       const r = ow.row
       if cwIxKind[r] == kind { out.push(cwIxNode[r]) }
@@ -999,8 +1030,7 @@ export function covarRootFrame(ix: i32): i32 {
 // alias-closure memo and the frames, which read every `Ident` in the arena.
 export function cwArenaSync() {
   if P.nodes.length != cwArenaLen {
-    cwRootNames = []
-    cwRootFrames = []
+    cwRootKeys = []
     cwAnswers = []
     cwSplits = []
     cwWriteAts = []
@@ -1010,13 +1040,10 @@ export function cwArenaSync() {
   0
 }
 
-// The alias-closure memo, keyed by the root name that seeded the analysis. The arena does
-// not change between `check` and `emit`, so the two answers are literally the same row;
-// `cwArenaLen` drops the memo once the monomorphizer clones nodes into it.
-export let cwRootNames: string[] = []
-// Parallel to `cwRootNames`: the frame each memoised root resolved in, so two functions'
-// same-named handles get two rows rather than sharing one answer (D1610/D1611).
-export let cwRootFrames: i32[] = []
+// The alias-closure memo, keyed by the binding key (`cwKeyOfDecl`) of the root that seeded
+// the analysis, so two functions' same-named handles get two rows (D1610/D1611). The arena
+// does not change between `check` and `emit`; `cwArenaLen` drops the memo once it does.
+export let cwRootKeys: i32[] = []
 export let cwAnswers: i32[] = []
 // Parallel to `cwAnswers`: 1 where the alias set demands two element storages
 // (`cwSplitStorage`), 0 otherwise. Meaningful only where the closure actually ran.
@@ -1083,34 +1110,19 @@ function covarRootSid(ix: i32): i32 {
   -1
 }
 
-// Is (`nm`, `fr`) in the alias set? The set carries a frame beside every name, so two
-// same-named handles in different functions are two values (D1610/D1611).
-export function cwHas(
-  set: string[],
-  setFr: i32[],
-  nm: string,
-  fr: i32,
-): boolean {
-  let i = 0
-  while i < set.length {
-    if set[i] == nm {
-      if cwSameFrame(setFr[i], fr) { return true }
-    }
-    i = i + 1
+// Is the binding key `k` in the alias set? A key is per declaration, so two same-named handles
+// in different functions are two values (D1610/D1611).
+export function cwHas(set: i32[], k: i32): boolean {
+  for m in set {
+    if cwKeySame(m, k) { return true }
   }
   false
 }
 
-// Add (`nm`, `fr`) to the set unless it is already there.
-export function cwAdd(
-  set: string[],
-  setFr: i32[],
-  nm: string,
-  fr: i32,
-): boolean {
-  if cwHas(set, setFr, nm, fr) { return false }
-  set.push(nm)
-  setFr.push(fr)
+// Add the binding key `k` to the set unless it is already there; -1 names no binding.
+export function cwAdd(set: i32[], k: i32): boolean {
+  if k == -1 || cwHas(set, k) { return false }
+  set.push(k)
   true
 }
 
@@ -1660,51 +1672,45 @@ export function cwSlotValuesFrom(
     if v != init && !cwSlotDescend(v, path, 0, -1, vals, ats) { return -1 }
   }
   if b < 0 { return -1 }
-  const nm = sidText(sidOfNode(b))
-  if !cwSlotWritesInto(nm, cwFrameOfDecl(b), path, vals, ats, 0) { return -1 }
+  if !cwSlotWritesInto(b, path, vals, ats, 0) { return -1 }
   vals.length - nBound
 }
 
-// Add what each write through a handle on the container (`nm`, `fr`), or on a list or record
-// literal holding it, stores at `path` (D12239); false when one is not a literal's part.
+// Add what each write through a handle on the container keyed `k` (`cwKeyOfDecl`), or on a
+// list or record literal holding it, stores at `path` (D12239); false when one is not a
+// literal's part.
 function cwSlotWritesInto(
-  nm: string,
-  fr: i32,
+  k: i32,
   path: string[],
   vals: i32[],
   ats: i32[],
   depth: i32,
 ): boolean {
   if depth > 8 { return false }
-  const names: string[] = []
-  const frs: i32[] = []
-  cwContainerAliases(nm, fr, names, frs)
+  const keys: i32[] = []
+  cwContainerAliases(k, keys)
   let i = 0
-  while i < names.length {
-    if i == 0 || cwSlotHandle(names[i], frs[i]) {
-      if !cwSlotWritesThrough(names[i], frs[i], path, vals, ats) {
-        return false
-      }
-      if !cwSlotHeldWrites(names[i], frs[i], path, vals, ats, depth) {
-        return false
-      }
+  while i < keys.length {
+    if i == 0 || cwSlotHandle(keys[i]) {
+      if !cwSlotWritesThrough(keys[i], path, vals, ats) { return false }
+      if !cwSlotHeldWrites(keys[i], path, vals, ats, depth) { return false }
     }
     i = i + 1
   }
   true
 }
 
-// `cwSlotWritesInto` at each `let` whose literal holds the name (`nm`, `fr`) as an element or
+// `cwSlotWritesInto` at each `let` whose literal holds the binding keyed `k` as an element or
 // field value, at the literal's path to it followed by `path`.
 function cwSlotHeldWrites(
-  nm: string,
-  fr: i32,
+  k: i32,
   path: string[],
   vals: i32[],
   ats: i32[],
   depth: i32,
 ): boolean {
-  const ow = cwOccWalkAt(nm, fr)
+  const fr = cwKeyFrame(k)
+  const ow = cwOccWalk(k)
   while cwOccNext(ow) {
     const r = ow.row
     const u = cwIxNode[r]
@@ -1714,21 +1720,20 @@ function cwSlotHeldWrites(
       && u >= 0
       && u < cwIxUpKind.length
     ) {
-      const k = cwIxUpKind[u]
+      const uk = cwIxUpKind[u]
       let fld = ""
-      if k == CW_UP_ELEM { fld = CW_ELEM_FLD }
-      if k == CW_UP_FIELD { fld = cwFieldNameOf(cwIxUpAux[u]) }
-      const on: string[] = []
-      const of: i32[] = []
+      if uk == CW_UP_ELEM { fld = CW_ELEM_FLD }
+      if uk == CW_UP_FIELD { fld = cwFieldNameOf(cwIxUpAux[u]) }
+      const on: i32[] = []
       const op: string[] = []
-      if fld != "" && cwLitOwners(cwIxUp[u], fld, on, of, op, 0) {
+      if fld != "" && cwLitOwners(cwIxUp[u], fld, on, op, 0) {
         let j = 0
         while j < on.length {
           const steps = cwSplitPath(op[j])
           // A write re-pointing the place that held the name stores another container there.
-          if !cwSlotRepointed(on[j], of[j], steps) {
+          if !cwSlotRepointed(on[j], steps) {
             for s in path { steps.push(s) }
-            if !cwSlotWritesInto(on[j], of[j], steps, vals, ats, depth + 1) {
+            if !cwSlotWritesInto(on[j], steps, vals, ats, depth + 1) {
               return false
             }
           }
@@ -1740,19 +1745,19 @@ function cwSlotHeldWrites(
   true
 }
 
-// Whether a write through a handle on the container (`nm`, `fr`) stores at `held` or at a
-// place holding it.
-function cwSlotRepointed(nm: string, fr: i32, held: string[]): boolean {
-  const names: string[] = []
-  const frs: i32[] = []
-  cwContainerAliases(nm, fr, names, frs)
+// Whether a write through a handle on the container keyed `k` stores at `held` or at a place
+// holding it.
+function cwSlotRepointed(k: i32, held: string[]): boolean {
+  const keys: i32[] = []
+  cwContainerAliases(k, keys)
   let i = 0
-  while i < names.length {
-    if i == 0 || cwSlotHandle(names[i], frs[i]) {
-      const ow = cwOccWalkAt(names[i], frs[i])
+  while i < keys.length {
+    if i == 0 || cwSlotHandle(keys[i]) {
+      const fr = cwKeyFrame(keys[i])
+      const ow = cwOccWalk(keys[i])
       while cwOccNext(ow) {
         const r = ow.row
-        if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == frs[i] {
+        if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == fr {
           let top = cwIxNode[r]
           while (
             top >= 0
@@ -1810,25 +1815,25 @@ function cwSlotAliasOf(b: i32): i32 {
   init
 }
 
-// Whether a write through the alias (`nm`, `fr`) reaches the list or record it names:
+// Whether a write through the alias keyed `k` reaches the list or record it names:
 // a parameter, or a `let` bound once to another binding.
-function cwSlotHandle(nm: string, fr: i32): boolean {
-  const bd = cwSoleDecl(cwDeclAt(nm, fr))
+function cwSlotHandle(k: i32): boolean {
+  const bd = cwSoleDecl(k)
   if bd < 0 || bd >= P.nodes.length { return false }
   if nodeAt(bd) is Param { return true }
   cwSlotAliasOf(bd) >= 0
 }
 
-// Add to `vals` and `ats` what each write through the name (`nm`, `fr`) stores at `path`;
+// Add to `vals` and `ats` what each write through the binding keyed `k` stores at `path`;
 // false when one stored value is not a literal's part.
 function cwSlotWritesThrough(
-  nm: string,
-  fr: i32,
+  k: i32,
   path: string[],
   vals: i32[],
   ats: i32[],
 ): boolean {
-  const ow = cwOccWalkAt(nm, fr)
+  const fr = cwKeyFrame(k)
+  const ow = cwOccWalk(k)
   while cwOccNext(ow) {
     const r = ow.row
     if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == fr {
@@ -1843,10 +1848,10 @@ function cwSlotWritesThrough(
       }
       if top >= 0 && top < cwIxUpKind.length {
         const up = cwIxUp[top]
-        const k = cwIxUpKind[top]
+        const uk = cwIxUpKind[top]
         const tn = nodeAt(top)
         const lp: string[] = []
-        if k == CW_UP_ASG_LHS && up >= 0 {
+        if uk == CW_UP_ASG_LHS && up >= 0 {
           const an = nodeAt(up)
           if an is BinExpr {
             if (
@@ -1863,7 +1868,7 @@ function cwSlotWritesThrough(
               }
             }
           }
-        } else if k == CW_UP_CALLEE && up >= 0 && tn is Member {
+        } else if uk == CW_UP_CALLEE && up >= 0 && tn is Member {
           // A `push` onto the list holding the place adds an element to it, or a record or list
           // holding it (D9370).
           const c = nodeAt(up)
@@ -2189,24 +2194,21 @@ export function cwCalleeArgOff(callFnIx: i32): i32 {
   1
 }
 
-// The parameter name at position `argIx` of the `FuncDecl` `dIx`, or "" past its parameter
-// list. "" is a decline, not "no parameter" — the caller turns it into the `2` answer.
-export function cwParamNameOfDecl(dIx: i32, argIx: i32): string {
-  if dIx < 0 || dIx >= P.nodes.length { return "" }
+// The `Param` node at position `argIx` of the `FuncDecl` `dIx`, or -1 past its list or at a
+// parameter with no name.
+export function cwParamOfDecl(dIx: i32, argIx: i32): i32 {
+  if dIx < 0 || dIx >= P.nodes.length { return -1 }
   const d = nodeAt(dIx)
   if d is FuncDecl {
-    if argIx < d.fnParams.length {
-      const p = nodeAt(d.fnParams[argIx])
-      if p is Param { return p.parName }
+    if argIx >= 0 && argIx < d.fnParams.length {
+      const pIx = d.fnParams[argIx]
+      const p = nodeAt(pIx)
+      if p is Param {
+        if p.parName != "" { return pIx }
+      }
     }
   }
-  ""
-}
-
-// The parameter a callee EXPRESSION delivers position `argIx` to — the spelling that reaches
-// a declared function and a function value alike.
-export function cwParamNameAt(callFnIx: i32, argIx: i32): string {
-  cwParamNameOfDecl(cwCalleeDeclOf(callFnIx), argIx + cwCalleeArgOff(callFnIx))
+  -1
 }
 
 // The type-annotation node of the parameter at position `argIx` of `FuncDecl` `dIx`, or -1
@@ -2232,37 +2234,24 @@ function cwParamFrame(fnName: string): i32 {
   dIx
 }
 
-// The same, for a callee EXPRESSION — a lambda opens a frame like any other `FuncDecl`.
-export function cwParamFrameAt(callFnIx: i32): i32 {
-  const dIx = cwCalleeDeclOf(callFnIx)
-  if dIx < 0 { return CW_FR_UNKNOWN }
-  dIx
-}
-
-// The parameter an expression consumed as a call ARGUMENT is delivered to, or "" where the
-// consuming call names no callee this can read a parameter list off. The closure's edge and
-// the claim's own test read this one resolver, so neither can outrun the other. D1658.
-export function cwArgParamName(x: i32): string {
-  if x < 0 || x >= cwIxUpKind.length { return "" }
-  if cwIxUpKind[x] != CW_UP_ARG { return "" }
+// The binding key (`cwKeyOfDecl`) of the parameter an expression consumed as a call ARGUMENT
+// is delivered to, or -1 where the consuming call names no callee this can read a parameter
+// list off. The closure's edge and the claim's own test read this one resolver. D1658.
+export function cwArgParamKey(x: i32): i32 {
+  if x < 0 || x >= cwIxUpKind.length { return -1 }
+  if cwIxUpKind[x] != CW_UP_ARG { return -1 }
   const up = cwIxUp[x]
-  if up < 0 || up >= P.nodes.length { return "" }
+  if up < 0 || up >= P.nodes.length { return -1 }
   const n = nodeAt(up)
   if n is Call {
-    if hasNamedArgs(n.callArgNames) { return "" }
-    return cwParamNameAt(n.callFn, cwIxUpAux[x])
+    if hasNamedArgs(n.callArgNames) { return -1 }
+    const pIx = cwParamOfDecl(
+      cwCalleeDeclOf(n.callFn),
+      cwIxUpAux[x] + cwCalleeArgOff(n.callFn),
+    )
+    return cwKeyOfDecl(pIx)
   }
-  ""
-}
-
-// The frame `cwArgParamName`'s parameter declares into, or `CW_FR_UNKNOWN`.
-export function cwArgParamFrame(x: i32): i32 {
-  if x < 0 || x >= cwIxUp.length { return CW_FR_UNKNOWN }
-  const up = cwIxUp[x]
-  if up < 0 || up >= P.nodes.length { return CW_FR_UNKNOWN }
-  const n = nodeAt(up)
-  if n is Call { return cwParamFrameAt(n.callFn) }
-  CW_FR_UNKNOWN
+  -1
 }
 
 // The `flds` entry an ARRAY or MAP escape records. No field name can spell it, so a
@@ -2335,20 +2324,16 @@ function cwEscapeObj(dst: i32): i32 {
   cwIxObj[dst]
 }
 
-// The container's binding name, or "" exactly where this analysis cannot identify it — no
+// The container's binding key, or -1 exactly where this analysis cannot identify it — no
 // name at the root, or a name re-bound in its frame, which would name two containers rather
 // than one. Nothing is then recorded and nothing is claimed.
-export function cwEscapeOwner(dst: i32): string {
+export function cwEscapeKey(dst: i32): i32 {
   const rt = cwProjRootNode(cwEscapeObj(dst))
-  if rt < 0 { return "" }
-  const onm = covarRootName(rt)
-  if onm == "" { return "" }
-  if !cwBoundOnce(cwOccWalkUse(cwPeelValue(rt))) { return "" }
-  onm
-}
-
-export function cwEscapeFrame(dst: i32): i32 {
-  covarRootFrame(cwProjRootNode(cwEscapeObj(dst)))
+  if rt < 0 { return -1 }
+  const k = cwKeyOfRoot(rt)
+  if k == -1 { return -1 }
+  if !cwBoundOnce(cwOccWalkUse(cwPeelValue(rt))) { return -1 }
+  k
 }
 
 // The key the escape is filed under. `elem` forces the element key for a form whose member
@@ -2361,29 +2346,24 @@ function cwEscapeFld(dst: i32, elem: boolean): string {
 
 // —— one container, every name that reaches it (D1658) ——
 // A container bound to a second name, or handed to a function, is still one container, so a
-// read through either is a handle on what it holds. `names`/`frs` collect the closure; the
-// answer is whether every use of every name in it is one this analysis models.
-function cwContainerAliases(
-  nm: string,
-  fr: i32,
-  names: string[],
-  frs: i32[],
-): boolean {
+// read through either is a handle on what it holds. `keys` collects the closure from `k`; the
+// answer is whether every use of every binding in it is one this analysis models.
+function cwContainerAliases(k: i32, keys: i32[]): boolean {
   cwIxBuild()
-  cwAdd(names, frs, nm, fr)
+  cwAdd(keys, k)
   let ok = true
   let i = 0
-  while i < names.length {
+  while i < keys.length {
     // A name bound twice, or re-pointed, names two containers rather than one.
-    if cwBoundOnceSealed(cwOccWalkAt(names[i], frs[i])) < 1 { ok = false }
-    // The set grows by at least one name per name visited or the walk ends, so the bound is
-    // the number of names in the program; a surprise past it declines rather than hangs.
-    if names.length > 256 { return false }
-    const ow = cwOccWalkAt(names[i], frs[i])
+    if cwBoundOnceSealed(cwOccWalk(keys[i])) < 1 { ok = false }
+    // The set grows by at least one binding per binding visited or the walk ends, so the
+    // bound is the number of bindings in the program; a surprise past it declines.
+    if keys.length > 256 { return false }
+    const ow = cwOccWalk(keys[i])
     while cwOccNext(ow) {
       const r = ow.row
       if cwIxKind[r] == CW_OCC_USE {
-        if !cwAliasUse(cwIxNode[r], names, frs) { ok = false }
+        if !cwAliasUse(cwIxNode[r], keys) { ok = false }
       }
     }
     i = i + 1
@@ -2395,7 +2375,7 @@ function cwContainerAliases(
 // what it holds and a comparison yields a boolean, so neither hands the container on; a
 // passthrough binding, a store to a plain name and a call argument each hand it a second
 // name, which joins the closure. Any other form leaves the container unmodelled.
-function cwAliasUse(u: i32, names: string[], frs: i32[]): boolean {
+function cwAliasUse(u: i32, keys: i32[]): boolean {
   if u < 0 || u >= cwIxUpKind.length { return false }
   const k = cwIxUpKind[u]
   if k == CW_UP_OBJ { return true }
@@ -2405,7 +2385,7 @@ function cwAliasUse(u: i32, names: string[], frs: i32[]): boolean {
   if k == CW_UP_LETINIT {
     const d = nodeAt(up)
     if d is LetDecl {
-      cwAdd(names, frs, d.letName, cwFrameOfDecl(up))
+      cwAdd(keys, cwKeyOfDecl(up))
       return true
     }
     return false
@@ -2413,47 +2393,43 @@ function cwAliasUse(u: i32, names: string[], frs: i32[]): boolean {
   if k == CW_UP_ASG_RHS {
     const n = nodeAt(up)
     if n is BinExpr {
-      const ln = covarRootName(n.binLeft)
-      if ln == "" { return false }
-      cwAdd(names, frs, ln, covarRootFrame(n.binLeft))
+      const lk = cwKeyOfRoot(n.binLeft)
+      if lk == -1 { return false }
+      cwAdd(keys, lk)
       // The assignment yields its right side, so a binding, a write or an argument that
       // consumes the assignment is one more handle (D2411).
       const vk = cwIxUpKind[up]
       if vk == CW_UP_LETINIT || vk == CW_UP_ASG_RHS || vk == CW_UP_ARG {
-        return cwAliasUse(up, names, frs)
+        return cwAliasUse(up, keys)
       }
       return true
     }
     return false
   }
   if k == CW_UP_ARG {
-    const pn = cwArgParamName(u)
-    if pn == "" { return false }
-    cwAdd(names, frs, pn, cwArgParamFrame(u))
+    const pk = cwArgParamKey(u)
+    if pk == -1 { return false }
+    cwAdd(keys, pk)
     return true
   }
   false
 }
 
-// File the container `(onm, ofr)` under `fld`, and every name that stands for the same
+// File the container keyed `ok` under `fld`, and every binding that stands for the same
 // container with it. The claim pass reads the same closure, so a container it passes a
 // delivery through is one whose every handle is filed here. D1658.
 export function cwFileEscape(
-  onm: string,
-  ofr: i32,
+  ok: i32,
   fld: string,
-  owners: string[],
-  ownerFrs: i32[],
+  owners: i32[],
   flds: string[],
 ) {
-  const names: string[] = []
-  const frs: i32[] = []
-  cwContainerAliases(onm, ofr, names, frs)
+  const keys: i32[] = []
+  cwContainerAliases(ok, keys)
   let i = 0
-  while i < names.length {
-    if !cwEscapedPairHas(names[i], frs[i], fld, owners, ownerFrs, flds) {
-      owners.push(names[i])
-      ownerFrs.push(frs[i])
+  while i < keys.length {
+    if !cwEscapedPairHas(keys[i], fld, owners, flds) {
+      owners.push(keys[i])
       flds.push(fld)
     }
     i = i + 1
@@ -2471,9 +2447,9 @@ export function cwFieldNameOf(fiIx: i32): string {
 }
 
 // The destination one call of a returning function delivers its result to, added to
-// `names`/`frs`: a binding, a store to a plain name, or the parameter of a further call —
+// `keys`: a binding, a store to a plain name, or the parameter of a further call —
 // `cwGrow`'s own call-result edge. False for a result reaching a name this cannot spell.
-function cwCallDestName(c: i32, names: string[], frs: i32[]): boolean {
+function cwCallDestKey(c: i32, keys: i32[]): boolean {
   if c < 0 || c >= cwIxUpKind.length { return false }
   const k = cwIxUpKind[c]
   const up = cwIxUp[c]
@@ -2481,7 +2457,7 @@ function cwCallDestName(c: i32, names: string[], frs: i32[]): boolean {
   if k == CW_UP_LETINIT {
     const d = nodeAt(up)
     if d is LetDecl {
-      cwAdd(names, frs, d.letName, cwFrameOfDecl(up))
+      cwAdd(keys, cwKeyOfDecl(up))
       return true
     }
     return false
@@ -2489,17 +2465,17 @@ function cwCallDestName(c: i32, names: string[], frs: i32[]): boolean {
   if k == CW_UP_ASG_RHS {
     const n = nodeAt(up)
     if n is BinExpr {
-      const ln = covarRootName(n.binLeft)
-      if ln == "" { return false }
-      cwAdd(names, frs, ln, covarRootFrame(n.binLeft))
+      const lk = cwKeyOfRoot(n.binLeft)
+      if lk == -1 { return false }
+      cwAdd(keys, lk)
       return true
     }
     return false
   }
   if k == CW_UP_ARG {
-    const pn = cwArgParamName(c)
-    if pn == "" { return false }
-    cwAdd(names, frs, pn, cwArgParamFrame(c))
+    const pk = cwArgParamKey(c)
+    if pk == -1 { return false }
+    cwAdd(keys, pk)
     return true
   }
   false
@@ -2508,7 +2484,7 @@ function cwCallDestName(c: i32, names: string[], frs: i32[]): boolean {
 // Every name a call of the function `fnIx` delivers its RESULT to — the containers a literal
 // returned from it is reached through. False where some call hands the result on in a form
 // with no name, which leaves the container unidentified. D1682.
-function cwRetDestNames(fnIx: i32, names: string[], frs: i32[]): boolean {
+function cwRetDestKeys(fnIx: i32, keys: i32[]): boolean {
   if fnIx < 0 || fnIx >= P.nodes.length { return false }
   const f = nodeAt(fnIx)
   if f is FuncDecl {
@@ -2522,7 +2498,7 @@ function cwRetDestNames(fnIx: i32, names: string[], frs: i32[]): boolean {
     let r = cwIxChain(nm)
     while r >= 0 {
       if cwIxKind[r] == CW_OCC_CALL {
-        if !cwCallDestName(cwIxNode[r], names, frs) { ok = false }
+        if !cwCallDestKey(cwIxNode[r], keys) { ok = false }
       }
       r = cwIxNext[r]
     }
@@ -2538,8 +2514,7 @@ function cwRetDestNames(fnIx: i32, names: string[], frs: i32[]): boolean {
 function cwLitOwners(
   lit: i32,
   fld: string,
-  names: string[],
-  frs: i32[],
+  keys: i32[],
   paths: string[],
   depth: i32,
 ): boolean {
@@ -2553,10 +2528,8 @@ function cwLitOwners(
     if up < 0 || up >= P.nodes.length { return false }
     const d = nodeAt(up)
     if d is LetDecl {
-      const ofr = cwFrameOfDecl(up)
       if !cwBoundOnce(cwOccWalk(up)) { return false }
-      names.push(d.letName)
-      frs.push(ofr)
+      keys.push(cwKeyOfDecl(up))
       paths.push(fld)
       return true
     }
@@ -2567,22 +2540,15 @@ function cwLitOwners(
     // inner container's own field for the outer one's. Decline instead.
     const outer = cwJoinPath(cwFieldNameOf(cwIxUpAux[lit]), fld)
     if outer == fld { return false }
-    return cwLitOwners(up, outer, names, frs, paths, depth + 1)
+    return cwLitOwners(up, outer, keys, paths, depth + 1)
   }
   if k == CW_UP_ELEM {
-    return cwLitOwners(
-      up,
-      cwJoinPath(CW_ELEM_FLD, fld),
-      names,
-      frs,
-      paths,
-      depth + 1,
-    )
+    return cwLitOwners(up, cwJoinPath(CW_ELEM_FLD, fld), keys, paths, depth + 1)
   }
   if k == CW_UP_RET {
-    return cwLitRetOwners(cwFrameOfDecl(up), fld, names, frs, paths)
+    return cwLitRetOwners(cwFrameOfDecl(up), fld, keys, paths)
   }
-  if k == CW_UP_TAIL { return cwLitRetOwners(up, fld, names, frs, paths) }
+  if k == CW_UP_TAIL { return cwLitRetOwners(up, fld, keys, paths) }
   false
 }
 
@@ -2591,18 +2557,15 @@ function cwLitOwners(
 function cwLitRetOwners(
   fnIx: i32,
   fld: string,
-  names: string[],
-  frs: i32[],
+  keys: i32[],
   paths: string[],
 ): boolean {
-  const dest: string[] = []
-  const destFr: i32[] = []
-  if !cwRetDestNames(fnIx, dest, destFr) { return false }
+  const dest: i32[] = []
+  if !cwRetDestKeys(fnIx, dest) { return false }
   if dest.length == 0 { return false }
   let i = 0
   while i < dest.length {
-    names.push(dest[i])
-    frs.push(destFr[i])
+    keys.push(dest[i])
     paths.push(fld)
     i = i + 1
   }
@@ -2614,17 +2577,15 @@ function cwLitRetOwners(
 export function cwEscapeByLit(
   lit: i32,
   fld: string,
-  owners: string[],
-  ownerFrs: i32[],
+  owners: i32[],
   flds: string[],
 ) {
-  const names: string[] = []
-  const frs: i32[] = []
+  const keys: i32[] = []
   const paths: string[] = []
-  if !cwLitOwners(lit, fld, names, frs, paths, 0) { return 0 }
+  if !cwLitOwners(lit, fld, keys, paths, 0) { return 0 }
   let i = 0
-  while i < names.length {
-    cwFileEscape(names[i], frs[i], paths[i], owners, ownerFrs, flds)
+  while i < keys.length {
+    cwFileEscape(keys[i], paths[i], owners, flds)
     i = i + 1
   }
   0
@@ -2632,26 +2593,12 @@ export function cwEscapeByLit(
 
 // `w.f = b` / `xs[i] = b` / `m[k] = b` at `i`: the same escape by assignment rather than by a
 // literal, so the value inside is reached by the same `<owner>.<f>` / `<owner>[i]` handle.
-export function cwEscapeByStore(
-  i: i32,
-  owners: string[],
-  ownerFrs: i32[],
-  flds: string[],
-) {
+export function cwEscapeByStore(i: i32, owners: i32[], flds: string[]) {
   const n = nodeAt(i)
   if n is BinExpr {
     const dst = cwPeel(n.binLeft)
-    const onm = cwEscapeOwner(dst)
-    if onm != "" {
-      cwFileEscape(
-        onm,
-        cwEscapeFrame(dst),
-        cwEscapeFld(dst, false),
-        owners,
-        ownerFrs,
-        flds,
-      )
-    }
+    const ok = cwEscapeKey(dst)
+    if ok != -1 { cwFileEscape(ok, cwEscapeFld(dst, false), owners, flds) }
   }
   0
 }
@@ -2660,15 +2607,14 @@ export function cwEscapeByStore(
 // pair, `<owner>[i]` for an element. Such a read is a handle on the value with no name of
 // its own, so the closure and the write scan bind it exactly as they bind a member name.
 export function cwEscapedHandleNodes(
-  owners: string[],
-  ownerFrs: i32[],
+  owners: i32[],
   flds: string[],
   out: i32[],
 ) {
   cwIxBuild()
   let i = 0
   while i < owners.length {
-    const ow = cwOccWalkAt(owners[i], ownerFrs[i])
+    const ow = cwOccWalk(owners[i])
     while cwOccNext(ow) {
       const r = ow.row
       if cwIxKind[r] == CW_OCC_USE {
@@ -2751,8 +2697,7 @@ export function cwBoundOnce(ow: CwOccWalk): boolean {
 // a member name, so `const c = bx.xs` joins `c` and `bx.xs.push(…)` is a write.
 export function cwIsEscapedHandle(
   ix: i32,
-  owners: string[],
-  ownerFrs: i32[],
+  owners: i32[],
   flds: string[],
 ): boolean {
   if flds.length == 0 { return false }
@@ -2762,31 +2707,20 @@ export function cwIsEscapedHandle(
   // The root name itself is not a handle on what it holds, and a chain rooting at anything
   // else — `f().xs`, `{ … }.xs` — names no container this can have filed.
   if rt < 0 || rt == p { return false }
-  cwEscapedPairHas(
-    covarRootName(rt),
-    covarRootFrame(rt),
-    cwProjPath(p),
-    owners,
-    ownerFrs,
-    flds,
-  )
+  cwEscapedPairHas(cwKeyOfRoot(rt), cwProjPath(p), owners, flds)
 }
 
 function cwEscapedPairHas(
-  onm: string,
-  ofr: i32,
+  ok: i32,
   prop: string,
-  owners: string[],
-  ownerFrs: i32[],
+  owners: i32[],
   flds: string[],
 ): boolean {
-  if onm == "" { return false }
+  if ok == -1 { return false }
   let i = 0
   while i < owners.length {
-    if owners[i] == onm {
-      if flds[i] == prop {
-        if cwSameFrame(ownerFrs[i], ofr) { return true }
-      }
+    if flds[i] == prop {
+      if cwKeySame(owners[i], ok) { return true }
     }
     i = i + 1
   }
@@ -2813,9 +2747,9 @@ export function cwFnTailStmt(fnIx: i32): i32 {
 // The `FuncDecl` indices whose return hands a member of `set` back to the caller — the
 // frames whose call result the closure must root at. Costs the set's own occurrences rather
 // than the program's nodes, once per closure round (D1090).
-export function cwRetFrames(set: string[], setFr: i32[], frames: i32[]) {
+export function cwRetFrames(set: i32[], frames: i32[]) {
   const uses: i32[] = []
-  cwSetOccs(set, setFr, CW_OCC_USE, uses)
+  cwSetOccs(set, CW_OCC_USE, uses)
   let i = 0
   while i < uses.length {
     const u = uses[i]
@@ -2902,17 +2836,16 @@ function cwChainSealed(u: i32, path: string): boolean {
   true
 }
 
-// Is (`nm`, `fr`) usable as a container identity for a value held at `path` — every name that
+// Is the binding keyed `k` usable as a container identity for a value held at `path` — every name that
 // reaches it bound once, never re-pointed, used only by projecting, and every intermediate on
 // the path projected through? `cwEscapedFields` files the escaped value under all those names,
 // so a handle the write scan cannot see is a form this declines on. D1628, D1658, D1682.
-function cwContainerSealed(nm: string, fr: i32, path: string): boolean {
-  const names: string[] = []
-  const frs: i32[] = []
-  if !cwContainerAliases(nm, fr, names, frs) { return false }
+function cwContainerSealed(k: i32, path: string): boolean {
+  const keys: i32[] = []
+  if !cwContainerAliases(k, keys) { return false }
   let i = 0
-  while i < names.length {
-    const ow = cwOccWalkAt(names[i], frs[i])
+  while i < keys.length {
+    const ow = cwOccWalk(keys[i])
     while cwOccNext(ow) {
       const r = ow.row
       if cwIxKind[r] == CW_OCC_USE {
@@ -2928,27 +2861,26 @@ function cwContainerSealed(nm: string, fr: i32, path: string): boolean {
 // pass through? `cwLitOwners` is the same walk the escape filing takes, so what the claim
 // passes a delivery through is exactly what the write scan can see. D1628, D1682.
 function cwLitClaimed(lit: i32, fld: string): boolean {
-  const names: string[] = []
-  const frs: i32[] = []
+  const keys: i32[] = []
   const paths: string[] = []
-  if !cwLitOwners(lit, fld, names, frs, paths, 0) { return false }
-  if names.length == 0 { return false }
+  if !cwLitOwners(lit, fld, keys, paths, 0) { return false }
+  if keys.length == 0 { return false }
   let i = 0
-  while i < names.length {
-    if !cwContainerSealed(names[i], frs[i], paths[i]) { return false }
+  while i < keys.length {
+    if !cwContainerSealed(keys[i], paths[i]) { return false }
     i = i + 1
   }
   true
 }
 
 // Is the store destination `dst` a container the delivery into it may be claimed through?
-// The identity guard (`cwEscapeOwner`) plus the seal: `cwEscapedFields` files the handle
-// under the container's own name, so a container reachable under a second name has handles
+// The identity guard (`cwEscapeKey`) plus the seal: `cwEscapedFields` files the handle
+// under the container's own binding, so a container reachable under a second name has handles
 // the write scan would miss. `elem` is `cwEscapeFld`'s own flag for a `push` callee.
 function cwStoreSealed(dst: i32, elem: boolean): boolean {
-  const onm = cwEscapeOwner(dst)
-  if onm == "" { return false }
-  cwContainerSealed(onm, cwEscapeFrame(dst), cwEscapeFld(dst, elem))
+  const ok = cwEscapeKey(dst)
+  if ok == -1 { return false }
+  cwContainerSealed(ok, cwEscapeFld(dst, elem))
 }
 
 // Does every call of `fnIx` deliver its result to a name `cwGrow`'s call-result edge added —
@@ -2968,7 +2900,7 @@ function cwReturnConsumed(fnIx: i32): boolean {
       if cwIxKind[r] == CW_OCC_CALL {
         const c = cwIxNode[r]
         if cwIxHeld[c] == 0 {
-          if cwArgParamName(c) == "" { return false }
+          if cwArgParamKey(c) == -1 { return false }
         }
       }
       r = cwIxNext[r]
@@ -2982,13 +2914,13 @@ function cwReturnConsumed(fnIx: i32): boolean {
 // this test, since a form nobody thought of reads as safe under the other one. The single
 // home of "is this delivery claimed", for every delivery: a second predicate answering the
 // same question is what would let them disagree. Unclaimed is the `2` answer. D852, D1628.
-export function cwClaimed(set: string[], setFr: i32[]): boolean {
+export function cwClaimed(set: i32[]): boolean {
   const idents: i32[] = []
-  cwSetOccs(set, setFr, CW_OCC_USE, idents)
+  cwSetOccs(set, CW_OCC_USE, idents)
   // The frames whose return the closure rooted a call result at AND every call of which
   // delivers into such a destination: those returns are the fourth claimed delivery.
   const retFrames: i32[] = []
-  cwRetFrames(set, setFr, retFrames)
+  cwRetFrames(set, retFrames)
   const retOk: i32[] = []
   let rf = 0
   while rf < retFrames.length {
@@ -3054,19 +2986,13 @@ export function cwProgramHasWrite(): boolean {
 // The write pass over a completed alias set. A write whose receiver roots at a member is a
 // definite hit (1); one rooting at nothing (`m["k"][0] = v`, `f()[0] = v`) could be any list
 // and is a decline (2). An escaped-field receiver (`p.xs.push(…)`, D852) is tested before the decline, since that shape has no name.
-export function cwWrites(
-  set: string[],
-  setFr: i32[],
-  owners: string[],
-  ownerFrs: i32[],
-  flds: string[],
-): i32 {
+export function cwWrites(set: i32[], owners: i32[], flds: string[]): i32 {
   // The EARLIEST write in arena order decides: a decline standing before a definite hit is
   // the answer, so the two lists below merge by node position and not by gather order.
   let at = -1
   let ans = 0
   const uses: i32[] = []
-  cwSetOccs(set, setFr, CW_OCC_USE, uses)
+  cwSetOccs(set, CW_OCC_USE, uses)
   let i = 0
   while i < uses.length {
     const w = cwWriteNodeOf(uses[i])
@@ -3085,7 +3011,7 @@ export function cwWrites(
       at = w2
       ans = 2
       if cwIxWrRecv[j] >= 0 {
-        if cwIsEscapedHandle(cwIxWrRecv[j], owners, ownerFrs, flds) { ans = 1 }
+        if cwIsEscapedHandle(cwIxWrRecv[j], owners, flds) { ans = 1 }
       }
     }
     j = j + 1
@@ -3122,9 +3048,9 @@ function cwWriteNodeOf(u: i32): i32 {
 // write would expose — exists only where one list value is demanded at both a union-box
 // element row and a plain struct row; where every handle is a union it is built at the box
 // and every handle aliases it (D381). Also asks whether any element is read: reading only `a.length` is correct and refusing it is a clause-2 false reject.
-export function cwElemRead(set: string[], setFr: i32[]): boolean {
+export function cwElemRead(set: i32[]): boolean {
   const uses: i32[] = []
-  cwSetOccs(set, setFr, CW_OCC_USE, uses)
+  cwSetOccs(set, CW_OCC_USE, uses)
   let i = 0
   while i < uses.length {
     const u = uses[i]

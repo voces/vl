@@ -186,7 +186,7 @@ const CLASSES = new Set([
   "unwritten",
 ]);
 const MAP_DECL =
-  /^(?:export )?(?:let|const) ([A-Za-z0-9_]+)(?:: \{\[[^=]*)? = Map\(\)/;
+  /^(?:export )?(?:let|const) ([A-Za-z0-9_]+)(?:: (?:\{\[|Map<)[^=]*)? = Map\(\)/;
 
 const probeReachMaps = () => {
   const dir = new URL("../compiler/", import.meta.url);
