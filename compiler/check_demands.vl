@@ -332,6 +332,7 @@ import {
   ovRecvHeads,
   ovRefuseMsg,
   paramIndexOfName,
+  paramsAfterFirst,
   ufcsImportAliasAt,
   ufcsNotImportedData,
   ufcsNotImportedMsg,
@@ -339,7 +340,7 @@ import {
   ufcsNotMethodMsg,
   ufcsRecvExpr,
   ufcsRegistryHas,
-  ufcsSiteFn,
+  ufcsSiteDecl,
 } from "./check_overload"
 import { keyHasPrefix, parenPeelIx, placeKeyOf } from "./check_places"
 import { recOwnPend, recPend } from "./check_rec_rows"
@@ -480,6 +481,12 @@ import {
   stdRecvSpec,
   stdRecvTparams,
 } from "./std_receivers"
+import {
+  fnNodeOfDecl,
+  fnParamsOfDecl,
+  memberDeclOf,
+  methodFnOfDecl,
+} from "./symbols"
 import { nameIsBareIdent } from "./tyname"
 import {
   isNullTy,
@@ -1320,14 +1327,14 @@ export function ufcsMissRaise(
     )
     return true
   }
-  const name = ufcsSiteFn(ix, prop)
-  const kind = ufcsNotMethodKind(name, recvTy, argc)
+  const d = ufcsSiteDecl(ix, prop)
+  const kind = ufcsNotMethodKind(d, recvTy, argc)
   if kind != 0 {
     tErrCodedData(
-      ufcsNotMethodMsg(prop, name, recvTy, argc, kind),
+      ufcsNotMethodMsg(prop, d, recvTy, argc, kind),
       ix,
       CODE_UFCS_NOT_METHOD,
-      ufcsNotMethodData(prop, name, recvTy, kind),
+      ufcsNotMethodData(prop, d, recvTy, kind),
     )
     return true
   }
@@ -1335,19 +1342,20 @@ export function ufcsMissRaise(
 }
 
 // D1570's gate classifier — which arm of the UFCS rule refused `recv.prop(argc args)`, given
-// that `prop` names a function in scope. 0 = no answer, 1 = the `self`-name rule, 2 = the
-// arity range, 3 = the receiver type. Mirrors `ufcsWouldDispatch` arm for arm, and stops
-// where that one stops, since this runs on a call that has already failed.
-function ufcsNotMethodKind(name: string, recvTy: i32, argc: i32) {
-  if (fnDeclIx[name] ?? -1) < 0 { return 0 }
-  const fnTy = declTyOf(fnDeclIx[name] ?? -1)
+// that `prop` names declaration `d`. 0 = no answer, 1 = the `self`-name rule, 2 = the arity
+// range, 3 = the receiver type, 4 = a binding that declares no function. Mirrors
+// `ufcsWouldDispatch` arm for arm, and stops where it stops: the call has already failed.
+function ufcsNotMethodKind(d: i32, recvTy: i32, argc: i32) {
+  if d < 0 { return 0 }
+  if fnNodeOfDecl(d) < 0 { return 4 }
+  const fnTy = declTyOf(d)
   if fnTy < 0 { return 0 }
   const ft = tyAt(fnTy)
   if ft is TyFunc {
     const params = ft.fnParamTypes
     if params.length < 1 { return 1 }
-    if !declFirstParamIsSelf(name) { return 1 }
-    const uDecl = declParamsAfterSelf(name)
+    if methodFnOfDecl(d) < 0 { return 1 }
+    const uDecl = paramsAfterFirst(fnParamsOfDecl(d))
     let uRequired = params.length - 1
     if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
     if argc < uRequired || argc + 1 > params.length { return 2 }
@@ -1363,18 +1371,18 @@ function ufcsNotMethodKind(name: string, recvTy: i32, argc: i32) {
 export function noteUfcsNotMethod(
   memIx: i32,
   prop: string,
-  name: string,
+  callIx: i32,
   recvTy: i32,
   argc: i32,
 ) {
-  let nm = name
-  if (fnDeclIx[nm] ?? -1) < 0 { nm = mergedDeclKeyOf(prop) }
-  const kind = ufcsNotMethodKind(nm, recvTy, argc)
+  let d = memberDeclOf(callIx)
+  if d < 0 { d = fnDeclIx[mergedDeclKeyOf(prop)] ?? -1 }
+  const kind = ufcsNotMethodKind(d, recvTy, argc)
   if kind == 0 { return 0 }
   noteUfcsWhy(
     memIx,
-    ufcsNotMethodMsg(prop, nm, recvTy, argc, kind),
-    ufcsNotMethodData(prop, nm, recvTy, kind),
+    ufcsNotMethodMsg(prop, d, recvTy, argc, kind),
+    ufcsNotMethodData(prop, d, recvTy, kind),
   )
 }
 
@@ -2818,7 +2826,7 @@ export function ufcsMissingImportSpecs(
 ) {
   const specs: string[] = []
   const siteKind = ufcsSiteKind(ix, prop, recvTy, argc)
-  if siteKind == 1 { return "" }
+  if siteKind == 1 || siteKind == 4 { return "" }
   let i = 0
   while i < ufcsImpName.length {
     if ufcsImpName[i] == prop {
@@ -2839,11 +2847,11 @@ export function ufcsMissingImportSpecs(
   out
 }
 
-// D1570's gate kind for `ufcsSiteFn`, or 0 (D3122). A plain function (1) answers ahead of
-// every candidate module, since its author meant it as the method; any kind answers ahead of a
+// D1570's gate kind for `ufcsSiteDecl`, or 0 (D3122). A plain function (1) or a binding (4)
+// answers ahead of every candidate module, since its author meant that name there; any kind answers ahead of a
 // std module the author never mentioned.
 function ufcsSiteKind(ix: i32, prop: string, recvTy: i32, argc: i32) {
-  ufcsNotMethodKind(ufcsSiteFn(ix, prop), recvTy, argc)
+  ufcsNotMethodKind(ufcsSiteDecl(ix, prop), recvTy, argc)
 }
 
 // D3122 — the std catalog's half of `ufcsMissingImportSpecs`: appends to `specs` each std

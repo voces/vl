@@ -11,6 +11,7 @@
 // modules into one arena and renames colliding top-level names; a renamed name is a
 // different string, so it interns to a different id and the merge needs no remap.
 import {
+  Call,
   ForRange,
   FuncDecl,
   Ident,
@@ -18,6 +19,7 @@ import {
   LoopVar,
   P,
   Param,
+  Paren,
   arenaEditBumpCount,
   arenaEditBumps,
   arenaEditCount,
@@ -25,6 +27,7 @@ import {
   arenaNoteRefWrite,
   loopVarName,
   nodeAt,
+  ufcsSiteRoot,
 } from "./ast"
 
 // ── the table ────────────────────────────────────────────────────────────────
@@ -117,6 +120,9 @@ export function identAuditDropSet(site: i32) {
 // Drop both tables; the checker calls this once per full pass, so the last pass's answer stands.
 export function identColReset() {
   identDeclIx = []
+  memberSlot = Map()
+  memberDecl = []
+  memberFn = []
   declOrig = Map()
   identAuditPass = 0
   identWritePass = []
@@ -187,6 +193,8 @@ export function identFrom(newIx: i32, oldIx: i32) {
   identOrigNote(newIx, oldIx)
   if nodeAt(newIx) is Ident { return identSet(newIx, identDeclOf(oldIx)) }
   if oldIx < 0 { return 0 }
+  const md = memberDeclOf(oldIx)
+  if md != -1 { memberRecord(newIx, md, memberMethodOf(oldIx)) }
   const o = declOrigOf(oldIx)
   if o >= 0 { declOrig[newIx] = o } else { declOrig[newIx] = oldIx }
   0
@@ -202,7 +210,128 @@ export function identRedirect(moved: {[i32]: i32}) {
     if to >= 0 { identSet(i, to) }
     i = i + 1
   }
+  let k = 0
+  while k < memberDecl.length {
+    const to = moved[memberDecl[k]] ?? -1
+    if to >= 0 { memberDecl[k] = to }
+    k = k + 1
+  }
   0
+}
+
+// `memberSlot[c]`: the row of member call `c`, or of its member callee, in the columns below.
+// Keyed sparsely, since few nodes are member calls; the rows are dense, so a redirect walks
+// recorded calls only.
+let memberSlot: {[i32]: i32} = Map()
+
+// `memberDecl[r]`: the declaration row `r`'s property names where the call stands, by lexical
+// scope; `IDENT_BUILTIN` declared by no node. One producer for the checker and the emitter, so
+// the two cannot dispatch one call to different functions (D14546).
+let memberDecl: i32[] = []
+
+// `memberFn[r]`: the method `memberDecl[r]` declares when it is recorded, or -1. A lowering pass
+// may replace a binding's initialiser later, so the emitter reads the method from here.
+let memberFn: i32[] = []
+
+// Record that member call `callIx`'s property names declaration `declIx`, on the call and on its
+// member callee, which is the node the write scan holds.
+export function memberDeclSet(callIx: i32, declIx: i32) {
+  memberRecord(callIx, declIx, methodFnOfDecl(declIx))
+}
+
+// `memberDeclSet` with the method `fnIx` already known, as a copy carries it.
+function memberRecord(callIx: i32, declIx: i32, fnIx: i32) {
+  if callIx < 0 || callIx >= P.nodes.length { return 0 }
+  let r = memberSlotRow(callIx)
+  if r < 0 {
+    r = memberDecl.length
+    memberSlot[callIx] = r
+    memberDecl.push(declIx)
+    memberFn.push(fnIx)
+  } else {
+    memberDecl[r] = declIx
+    memberFn[r] = fnIx
+  }
+  const c = nodeAt(callIx)
+  if c is Call { memberRecord(c.callFn, declIx, fnIx) }
+  0
+}
+
+// The row member call `callIx` is recorded at with a declaration, else the row of the call it
+// copies, or -1.
+function memberRowOf(callIx: i32): i32 {
+  const r = memberSlotRow(callIx)
+  if r >= 0 && memberDecl[r] != -1 { return r }
+  memberSlotRow(ufcsSiteRoot(callIx))
+}
+
+// The row recorded for node `ix` since the last reset, or -1.
+function memberSlotRow(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  const r = memberSlot[ix] ?? -1
+  if r < 0 || r >= memberDecl.length { return -1 }
+  r
+}
+
+// The declaration member call `callIx` (or the call it copies) names, `IDENT_BUILTIN`, or -1.
+export function memberDeclOf(callIx: i32) {
+  const r = memberRowOf(callIx)
+  if r < 0 { return -1 }
+  memberDecl[r]
+}
+
+// The method the declaration `memberDeclOf(callIx)` declared when the binder recorded it, or -1.
+export function memberMethodOf(callIx: i32) {
+  const r = memberRowOf(callIx)
+  if r < 0 { return -1 }
+  memberFn[r]
+}
+
+// The function declaration `d` names: `d` itself, or the lambda a binding is initialised with
+// directly; -1 for any other binding. A binding that only has a function type declares none.
+export function fnNodeOfDecl(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if dn is FuncDecl { return d }
+  if !(dn is LetDecl) { return -1 }
+  let f = -1
+  if dn is LetDecl { f = dn.letInit }
+  while f >= 0 && f < P.nodes.length && nodeAt(f) is Paren {
+    const pn = nodeAt(f)
+    if pn is Paren { f = pn.parInner }
+  }
+  if f < 0 || f >= P.nodes.length { return -1 }
+  const fn = nodeAt(f)
+  if fn is FuncDecl {
+    if fn.fnName == "" { return f }
+  }
+  -1
+}
+
+// The function `d` declares when it is a method, one whose first parameter is named `self`, or
+// -1. Names in a function type are documentation, so only a declaration can qualify.
+export function methodFnOfDecl(d: i32): i32 {
+  const f = fnNodeOfDecl(d)
+  if f < 0 { return -1 }
+  const fn = nodeAt(f)
+  if fn is FuncDecl {
+    if fn.fnParams.length == 0 { return -1 }
+    const p0 = nodeAt(fn.fnParams[0])
+    if p0 is Param {
+      if p0.parName == "self" { return f }
+    }
+  }
+  -1
+}
+
+// The parameter nodes of the function declaration `d` names, or the empty list.
+export function fnParamsOfDecl(d: i32): i32[] {
+  const none: i32[] = []
+  const f = fnNodeOfDecl(d)
+  if f < 0 { return none }
+  const fn = nodeAt(f)
+  if fn is FuncDecl { return fn.fnParams }
+  none
 }
 
 // A minted node `newIx` stands for declaration `declIx`, with no old node to copy from.

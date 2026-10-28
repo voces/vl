@@ -13,6 +13,8 @@ import {
   MC_RUNG_BUILTIN,
   MC_RUNG_SELF_FN,
   Member,
+  P,
+  binderNameAt,
   callHasTyArgs,
   callIsRestPacked,
   fillArgDefaults,
@@ -106,7 +108,7 @@ import {
   constrainEmptyExpr,
   rcwPend,
 } from "./check_fit_rules"
-import { CSTR_NODECL, lambdaLastOrder } from "./check_generic_args"
+import { lambdaLastOrder } from "./check_generic_args"
 import { homeModuleOf } from "./check_getter_effects"
 import { declParamNameAt } from "./check_hole_links"
 import { HD_ELEM, HD_ELEMV, tyIsWriteLandRead } from "./check_hole_pins"
@@ -179,7 +181,7 @@ import {
   tErrWant,
   widenLitTy,
 } from "./check_relate_core"
-import { declParamsInScope, lookup } from "./check_scopes"
+import { declTyOf, lookup } from "./check_scopes"
 import { noteArrayWriteDemand } from "./check_subst"
 import { symMemMethod } from "./check_sym_occ"
 import { tpGradualView } from "./check_tp_join"
@@ -221,6 +223,7 @@ import {
   fnDeclParamsOf,
 } from "./check_write_scan"
 import { i32ListHas } from "./listutil"
+import { memberDeclOf, memberDeclSet, methodFnOfDecl } from "./symbols"
 import {
   arrElemValueTy,
   tyHasTyVar,
@@ -249,17 +252,14 @@ function bmArgOk(
   bmArgPred(form, got, want, argIx)
 }
 
-// Runs the pending return inference of the function `name` binds, so its type is complete
-// before a UFCS call reads it. False when `fnTy` is not a function at all.
-function ufcsInferCallee(name: string, fnTy: i32): boolean {
+// Runs the pending return inference of the top-level function `top`, named `name`, so its type
+// is complete before a UFCS call reads it. False when `fnTy` is not a function at all.
+function ufcsInferCallee(name: string, top: i32, fnTy: i32): boolean {
   if fnTy < 0 { return false }
   const preFt = tyAt(fnTy)
   if preFt is TyFunc {
     if preFt.fnRet == -2 {
-      if !onInferStack(name) {
-        const dIx = fnDeclIx[name] ?? -1
-        if dIx >= 0 { checkNodeHook(dIx) }
-      }
+      if !onInferStack(name) && top >= 0 { checkNodeHook(top) }
     }
     return true
   }
@@ -279,7 +279,11 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
   for c in ovSetCands[row] {
     if why == "" && declFirstParamIsSelf(c) {
       const fty = lookup(c)
-      if fty >= 0 && fty < T.tys.length && ufcsInferCallee(c, fty) {
+      if (
+        fty >= 0
+        && fty < T.tys.length
+        && ufcsInferCallee(c, fnDeclIx[c] ?? -1, fty)
+      ) {
         const ft = tyAt(fty)
         if ft is TyFunc {
           const req = fnRequiredArity(fnDeclParamsOf(c))
@@ -439,22 +443,19 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // has already been checked — resolved at this call's own site (D1120), since two merged
   // modules may each export the same-named `self`-function.
   const callee = ufcsCalleeOf(plainName, recvTy, ix)
-  const name = callee.name
   const fnTy = callee.fnTy
-  if fnTy < 0 { return -1 }
-  if !ufcsInferCallee(name, fnTy) { return -1 }
+  if fnTy < 0 || callee.decl < 0 { return -1 }
+  if !ufcsInferCallee(callee.name, callee.top, fnTy) { return -1 }
   const ft = tyAt(fnTy)
   if ft is TyFunc {
     let retTy = ft.fnRet
     if retTy == -2 { retTy = TY_ERR }
     const params = ft.fnParamTypes
     let args = n.callArgs
-    // The `self`-NAME rule, asked here because the REWRITE asks it and the two
-    // must not disagree about what dispatches (see `declFirstParamIsSelf`).
-    if !declFirstParamIsSelf(name) { return -1 }
     // The arity range the direct spelling takes: the receiver fills `self` and the defaults fill
-    // the tail of the declaration the scope chain gives this callee, empty for a binding (D1604).
-    const uDecl = paramsAfterFirst(declParamsInScope(name))
+    // the tail of the callee's declaration, empty for a binding (D1604).
+    const declPs = ufcsDeclParams(callee.decl)
+    const uDecl = paramsAfterFirst(declPs)
     let uRequired = params.length - 1
     // `fnRequiredArity` over the TAIL alone: `self` is never defaulted (it is
     // the receiver), so the tail's own required count IS the answer.
@@ -478,7 +479,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     if args.length < uRequired || args.length + 1 > params.length { return -1 }
     if !assignable(recvTy, params[0]) { return -1 }
     ufcsNoteRecv(n, plainName, recvTy, params[0], ix)
-    const bound = ufcsBindArgs(n, name, params, args, uDecl, ix)
+    const bound = ufcsBindArgs(n, declPs, params, args, uDecl, ix)
     if bound == null { return TY_ERR }
     args = bound
     // Generic dispatch binds the receiver into the `self` param's holes first — a receiver
@@ -489,11 +490,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     if p0 is TyVar {
       if !holeDemandOk(p0.tvName, -1, recvTy) { return -1 }
       // The receiver pins `self` as an argument pins its parameter, casts parked on it included.
-      holeCastPinCheck(
-        p0.tvName,
-        recvTy,
-        declParamNameAt(declParamsInScope(name), 0),
-      )
+      holeCastPinCheck(p0.tvName, recvTy, declParamNameAt(declPs, 0))
     }
     // The receiver is the first argument a literal can be, for the destination's binding.
     const uDst: string[] = []
@@ -505,25 +502,34 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     }
     bindGenWalk(params[0], recvTy, bNames, bTys)
     if ufcsU8RecvRefuses(recvTy, params[0], bNames, bTys, ix) { return TY_ERR }
-    ufcsCheckRecvSeam(n, name, recvTy, params, bNames, bTys)
-    ufcsCheckArgs(name, params, args, uDecl, bNames, bTys)
+    ufcsCheckRecvSeam(n, callee.name, recvTy, params, bNames, bTys)
+    ufcsCheckArgs(callee.name, params, args, uDecl, bNames, bTys)
     if uDst.length > 0 && !inferQuiet {
       dstRetypeLitArgs(uDst, params, uArgs, bNames, bTys)
     }
     // The uninferable-return gate reads the declaration, so `xs.f()` and `f(xs)` answer alike;
     // the receiver is `self`, a parameter like any other for the purpose of binding.
-    checkRetTyParamBound(fnDeclIx[name] ?? CSTR_NODECL, plainName, ix, retTy)
+    checkRetTyParamBound(callee.top, plainName, ix, retTy)
     // The UFCS half of the deferred-constraint re-validation, which lived in the direct-call
     // path alone: `xs.indexOf(nd)` and `indexOf(xs, nd)` are the same call and must answer the
     // same way, so the UFCS spelling needs its own re-validation of the callee's recorded
     // constraints too — the same self-arrives-ahead-of-the-argument-loop asymmetry as above.
     if bNames.length > 0 && (!inferQuiet || elabCapLive()) {
-      elabCallDeclNote(ix, fnDeclIx[name] ?? -1)
+      elabCallDeclNote(ix, callee.top)
       if elabCapLive() { elabCallNote(ix, bNames, bTys) }
     }
     if !inferQuiet {
       if bNames.length > 0 {
-        ufcsRevalidatePins(n, ix, name, plainName, params, args, bNames, bTys)
+        ufcsRevalidatePins(
+          n,
+          ix,
+          callee.top,
+          plainName,
+          params,
+          args,
+          bNames,
+          bTys,
+        )
       }
     }
     if bNames.length > 0 { retTy = substTyDeep(retTy, bNames, bTys) }
@@ -532,10 +538,14 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   -1
 }
 
-// A member call's callee: its merge-mangled function at this site, and that function's type.
+// A member call's callee: the declaration it dispatches to (-1 none), that declaration's name and
+// type, and `top`, the declaration again when it is a top-level function (else -1), which keys
+// the tables the checker files by function.
 type UfcsCallee = {
   name: string,
   fnTy: i32,
+  decl: i32,
+  top: i32,
 }
 
 // Whether the overload row `ovRow` refuses member call `ix` on receiver `recvTy`: with several
@@ -555,6 +565,7 @@ function ufcsOverloadRefuses(
       return true
     }
     ufcsSiteAdd(ix, pick)
+    memberDeclSet(ix, fnDeclIx[pick] ?? -1)
   }
   // A receiver whose element is still open would take it from the callee the name picked.
   if ovRecvOpen(recvTy) {
@@ -571,12 +582,22 @@ function ufcsOverloadRefuses(
   false
 }
 
-// The callee member call `ix` names by `plainName` on receiver `recvTy`: the site's alias,
-// else the receiver type's declaring module's export. `fnTy` is -1 when neither binds one.
+// The callee member call `ix` names by `plainName` on receiver `recvTy`: the declaration the
+// binder recorded for the call's spelling when it declares `self` first, else, for a spelling
+// that binds nothing here, the receiver type's declaring module's export. A spelling bound to
+// anything else shadows, so the call dispatches to nothing.
 function ufcsCalleeOf(plainName: string, recvTy: i32, ix: i32): UfcsCallee {
+  const d = memberDeclOf(ix)
   let name = ufcsAliasAtSite(ix, plainName)
-  let fnTy = lookup(name)
-  if fnTy < 0 || ufcsScopeStepsAside(name, fnTy, recvTy) {
+  let decl = -1
+  let fnTy = -1
+  if d >= 0 {
+    if methodFnOfDecl(d) < 0 { return ufcsCallee(name, -1, -1) }
+    decl = d
+    name = binderNameAt(d)
+    fnTy = declTyOf(d)
+  }
+  if fnTy < 0 || ufcsScopeStepsAside(decl, fnTy, recvTy) {
     // Type-bound fallback (§C, docs/internals/type-bound-ufcs-design.md): the caller's scope
     // binds no such `self`-function, or binds one declared for another type while the receiver
     // is a newtype (§F, D1984), so ask the receiver type's declaring module. Banked on the site
@@ -584,20 +605,39 @@ function ufcsCalleeOf(plainName: string, recvTy: i32, ix: i32): UfcsCallee {
     const hm = homeModuleOf(recvTy)
     if hm >= 0 {
       const tbName = ufcsExportedScopeIn(hm, plainName)
-      if tbName != "" && tbName != name {
-        const tbFn = lookup(tbName)
+      const tbDecl = fnDeclIx[tbName] ?? -1
+      if tbName != "" && tbName != name && methodFnOfDecl(tbDecl) >= 0 {
+        const tbFn = declTyOf(tbDecl)
         if tbFn >= 0 {
           if fnTy < 0 || ufcsSelfAccepts(tbName, tbFn, recvTy) {
             name = tbName
             fnTy = tbFn
+            decl = tbDecl
             ufcsSiteAdd(ix, tbName)
+            memberDeclSet(ix, tbDecl)
           }
         }
       }
     }
   }
-  const c: UfcsCallee = { name: name, fnTy: fnTy }
+  ufcsCallee(name, fnTy, decl)
+}
+
+function ufcsCallee(name: string, fnTy: i32, decl: i32): UfcsCallee {
+  let top = -1
+  if decl >= 0 && (fnDeclIx[name] ?? -1) == decl { top = decl }
+  const c: UfcsCallee = { name: name, fnTy: fnTy, decl: decl, top: top }
   c
+}
+
+// The parameter nodes a member call's arguments bind against: the function declaration
+// `decl`'s, or none for a binding, whose function value carries no names or defaults (D1604).
+function ufcsDeclParams(decl: i32): i32[] {
+  const none: i32[] = []
+  if decl < 0 || decl >= P.nodes.length { return none }
+  const d = nodeAt(decl)
+  if d is FuncDecl { return d.fnParams }
+  none
 }
 
 // The receiver's notes at member call `ix`, once it passed `self`'s gate `selfTy`: the
@@ -626,11 +666,11 @@ function ufcsNoteRecv(
 }
 
 // Member call `ix`'s explicit arguments `args` in parameter order after `self`: named ones
-// ordered against `name`'s declaration, omitted trailing ones padded with its defaults. Null
-// when it reported a refusal.
+// ordered against the declaration's parameters `declPs`, omitted trailing ones padded with its
+// defaults. Null when it reported a refusal.
 function ufcsBindArgs(
   n: Call,
-  name: string,
+  declPs: i32[],
   params: i32[],
   args: i32[],
   uDecl: i32[],
@@ -639,7 +679,7 @@ function ufcsBindArgs(
   // Named arguments bind against the parameter names after `self` (the receiver is an
   // unnamed slot-0 positional), in parameter order — the full list with the receiver unnamed.
   if hasNamedArgs(n.callArgNames) {
-    const uNames = paramNamesOfNodes(declParamsInScope(name))
+    const uNames = paramNamesOfNodes(declPs)
     if uNames.length != params.length {
       tErr(
         "named arguments work only on declared functions, not on a function value",
@@ -696,12 +736,13 @@ function ufcsU8RecvRefuses(
 }
 
 // The pinned half of `ufcsCallTy`'s deferred-constraint re-validation: with the call's
-// bindings `bNames`/`bTys` known, re-asks every constraint the callee `name` recorded, the
-// receiver counted as argument 0 so origins and blame match the direct spelling.
+// bindings `bNames`/`bTys` known, re-asks every constraint the callee's top-level declaration
+// `top` recorded, the receiver counted as argument 0 so origins and blame match the direct
+// spelling.
 function ufcsRevalidatePins(
   n: Call,
   ix: i32,
-  name: string,
+  top: i32,
   plainName: string,
   params: i32[],
   args: i32[],
@@ -717,12 +758,12 @@ function ufcsRevalidatePins(
   holeArgOrigins(params, args, 1, uhNames, uhArgNo, uhArgNode)
   const pinArgs: i32[] = [ufcsRecvExpr(n)]
   for a in args { pinArgs.push(a) }
-  pinBmCstrElems(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, pinArgs)
+  pinBmCstrElems(bNames, bTys, ix, top, pinArgs)
   validateBinCstrs(
     bNames,
     bTys,
     ix,
-    fnDeclIx[name] ?? CSTR_NODECL,
+    top,
     plainName,
     uhNames,
     uhArgNo,
@@ -730,28 +771,21 @@ function ufcsRevalidatePins(
   )
   // The print capability rides the same pin and the same UFCS/direct symmetry as
   // above — `xs.show()` and `show(xs)` must answer the same way (D401).
-  validatePrintCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, plainName)
-  validateNestCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, plainName)
-  validateIsCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, plainName)
+  validatePrintCstrs(bNames, bTys, ix, top, plainName)
+  validateNestCstrs(bNames, bTys, ix, top, plainName)
+  validateIsCstrs(bNames, bTys, ix, top, plainName)
   // A call argument inside the body, at the UFCS half for the same symmetry: `"s".inc()`
   // and `inc("s")` must answer the same way (D2425).
-  validateArgCstrs(
-    bNames,
-    bTys,
-    ix,
-    fnDeclIx[name] ?? CSTR_NODECL,
-    uhNames,
-    uhArgNode,
-  )
+  validateArgCstrs(bNames, bTys, ix, top, uhNames, uhArgNode)
   // The declared return, at the UFCS half for the same symmetry: `p.g()` and `g(p)`
   // must answer the same way, or the method spelling of D551's family stays silent beside a loud direct one.
-  validateRetCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, plainName)
+  validateRetCstrs(bNames, bTys, ix, top, plainName)
   // Every other destination inside the body — a local, a re-assignment, a field or
   // element write — at the UFCS half for the same symmetry (D572).
-  validateLetCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, plainName)
+  validateLetCstrs(bNames, bTys, ix, top, plainName)
   // Every builtin-collection-method argument inside the body, at the UFCS half for the
   // same symmetry (D582).
-  validateBmCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, plainName)
+  validateBmCstrs(bNames, bTys, ix, top, plainName)
   // After the pins above, as the direct spelling does; the receiver is an argument too.
   if n.callFn >= 0 {
     const rcvN = nodeAt(n.callFn)
@@ -768,7 +802,7 @@ function ufcsRevalidatePins(
     bNames,
     bTys,
     ix,
-    fnDeclIx[name] ?? CSTR_NODECL,
+    top,
     plainName,
     uhNames,
     uhArgNo,
@@ -776,7 +810,7 @@ function ufcsRevalidatePins(
   )
   // The receiver of a UFCS `self`-method resolved inside the body, at the UFCS half
   // for the same symmetry (D1005).
-  validateUfcsCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, plainName)
+  validateUfcsCstrs(bNames, bTys, ix, top, plainName)
 }
 
 // `recv.get(k)`, `.has(k)`, `.keys()` or `.values()` over a union of maps whose keys agree,
@@ -969,13 +1003,7 @@ export function checkMemberCallNode(
     )
     // When the name is already in scope, which gate declined (D1570) — banked beside
     // D1230's answer and read after it, since `argc` is known here and raised there.
-    noteUfcsNotMethod(
-      n.callFn,
-      prop,
-      ufcsAliasAtSite(ix, prop),
-      recvTy,
-      n.callArgs.length,
-    )
+    noteUfcsNotMethod(n.callFn, prop, ix, recvTy, n.callArgs.length)
   }
   -1
 }

@@ -4,14 +4,17 @@
 // named-argument and read-only-receiver messages with the data fields (`diagDataField`) a
 // refusal carries. The checker resolves the call and raises the refusal.
 // This module imports `./ast`, `./check_scopes`, `./check_types`, `./tyquery`,
-// `./check_write_scan`, `./fmt_util` and `./listutil`.
+// `./check_write_scan`, `./fmt_util`, `./listutil` and `./symbols`.
 import {
   Call,
-  FuncDecl,
+  ForRange,
+  LetDecl,
+  LoopVar,
   Member,
   OptMember,
   P,
   Param,
+  binderNameAt,
   fnRequiredArity,
   i32ToStr,
   nodeAt,
@@ -29,7 +32,7 @@ import {
   ufcsModOfNode,
   ufcsSpecAlreadyImported,
 } from "./ast"
-import { lookup } from "./check_scopes"
+import { declTyOf, lookup } from "./check_scopes"
 import { tyNamesNominal } from "./tyquery"
 import {
   T,
@@ -62,6 +65,12 @@ import {
   fnDeclParamsOf,
 } from "./check_write_scan"
 import { nodeStartTok } from "./fmt_util"
+import {
+  fnNodeOfDecl,
+  fnParamsOfDecl,
+  memberDeclOf,
+  methodFnOfDecl,
+} from "./symbols"
 import { strListHas } from "./listutil"
 import { modSuffixOf } from "./modid"
 
@@ -234,47 +243,63 @@ export function ufcsNotImportedData(
   out
 }
 
-// The token spelling the first parameter's name in `name`'s declaration, or -1. The
+// The token starting where declaration `d` names its callee's receiver: the first parameter's
+// identifier for a function, the binding itself for anything else; -1 when there is none. The
 // identifier's own start, not the `Param` node's `nodeToks` anchor — that anchor is the
-// annotation's last token, so a rename quick-fix built on it would edit `Cursor`, not `c`.
-// Through `nodeStartTok`, which resolves inside the declaring module (D1652).
-function ufcsDeclParamTok(name: string) {
-  const dIx = fnDeclIx[name] ?? -1
-  if dIx < 0 { return -1 }
-  const d = nodeAt(dIx)
-  if d is FuncDecl {
-    if d.fnParams.length == 0 { return -1 }
-    return nodeStartTok(d.fnParams[0])
-  }
-  -1
+// annotation's last token. Through `nodeStartTok`, which resolves in the declaring module (D1652).
+function ufcsDeclParamTok(d: i32) {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  if fnNodeOfDecl(d) < 0 { return nodeStartTok(d) }
+  const ps = fnParamsOfDecl(d)
+  if ps.length == 0 { return -1 }
+  nodeStartTok(ps[0])
 }
 
-function ufcsDeclParamLine(name: string) {
-  const tk = ufcsDeclParamTok(name)
+function ufcsDeclParamLine(d: i32) {
+  const tk = ufcsDeclParamTok(d)
   if tk >= 0 && tk < P.toks.length { return P.toks[tk].line }
   0
 }
 
-function ufcsDeclParamCol(name: string) {
-  const tk = ufcsDeclParamTok(name)
+function ufcsDeclParamCol(d: i32) {
+  const tk = ufcsDeclParamTok(d)
   if tk >= 0 && tk < P.toks.length { return P.toks[tk].col }
   0
 }
 
-// D1570's sentence, one per gate. The fault is never "no such field" — the function the
-// author wrote exists, in scope, and the compiler knew which rule turned it down — so each
-// sentence names the rule, the offending ingredient, and the edit that fixes it. The
-// `self`-name rule stands; only the diagnostic sent readers to hunt a nonexistent field (glean VL-021).
+// What kind of binding the declaration `d` is, as a sentence names it.
+function ufcsBindingWord(d: i32): string {
+  const dn = nodeAt(d)
+  if dn is LetDecl { return dn.letKw }
+  if dn is Param { return "parameter" }
+  if dn is LoopVar || dn is ForRange { return "loop variable" }
+  "declared binding"
+}
+
+// D1570's sentence, one per gate, for the declaration `d` the call's spelling names. The fault
+// is never "no such field" — the author's binding exists and the compiler knows which rule
+// turned it down — so each sentence names the rule, the ingredient and the edit (glean VL-021).
 export function ufcsNotMethodMsg(
   prop: string,
-  name: string,
+  d: i32,
   recvTy: i32,
   argc: i32,
   kind: i32,
 ) {
-  const plain = demangleMsg(name)
+  const plain = demangleMsg(binderNameAt(d))
+  if kind == 4 {
+    return "`"
+      + prop
+      + "` here names a "
+      + ufcsBindingWord(d)
+      + " at "
+      + i32ToStr(ufcsDeclParamLine(d))
+      + ":"
+      + i32ToStr(ufcsDeclParamCol(d))
+      + ", not a function with a `self` parameter"
+  }
   if kind == 1 {
-    const pns = fnParamNamesOf(name)
+    const pns = paramNamesOfNodes(fnParamsOfDecl(d))
     if pns.length == 0 {
       return "'"
         + prop
@@ -295,9 +320,9 @@ export function ufcsNotMethodMsg(
       + "(…)` directly"
   }
   if kind == 2 {
-    const ft2 = tyAt(lookup(name))
+    const ft2 = tyAt(declTyOf(d))
     if ft2 is TyFunc {
-      const uDecl2 = declParamsAfterSelf(name)
+      const uDecl2 = paramsAfterFirst(fnParamsOfDecl(d))
       let lo = ft2.fnParamTypes.length - 1
       if uDecl2.length == ft2.fnParamTypes.length - 1 {
         lo = fnRequiredArity(uDecl2)
@@ -313,7 +338,7 @@ export function ufcsNotMethodMsg(
         + "(…)` passes the receiver as `self`"
     }
   }
-  const p0Str = ufcsSelfParamStr(name)
+  const p0Str = ufcsSelfParamStr(d)
   "no method '"
     + prop
     + "' for "
@@ -323,15 +348,15 @@ export function ufcsNotMethodMsg(
     + "` takes `self: "
     + p0Str
     + "`"
-    + ufcsReadonlyNote(name, recvTy)
+    + ufcsReadonlyNote(d, recvTy)
 }
 
 // D1570's receiver-type sentence's tail when a read-only list meets a growable `self` list,
 // the one refusal whose reason the two spellings do not show; "" otherwise.
-function ufcsReadonlyNote(name: string, recvTy: i32): string {
+function ufcsReadonlyNote(d: i32, recvTy: i32): string {
   if recvTy < 0 { return "" }
   const rt = tyAt(recvTy)
-  const fnTy = lookup(name)
+  const fnTy = declTyOf(d)
   if fnTy < 0 { return "" }
   const ft = tyAt(fnTy)
   if rt is TyArray && ft is TyFunc && ft.fnParamTypes.length > 0 {
@@ -345,10 +370,10 @@ function ufcsReadonlyNote(name: string, recvTy: i32): string {
   ""
 }
 
-// The rendered type of `name`'s `self` parameter — the half of the receiver-mismatch sentence
+// The rendered type of `d`'s `self` parameter — the half of the receiver-mismatch sentence
 // that says which type it is a method on. "?" only for a callee this ladder never reaches.
-function ufcsSelfParamStr(name: string) {
-  const fnTy = lookup(name)
+function ufcsSelfParamStr(d: i32) {
+  const fnTy = declTyOf(d)
   if fnTy >= 0 {
     const ft = tyAt(fnTy)
     if ft is TyFunc {
@@ -358,27 +383,28 @@ function ufcsSelfParamStr(name: string) {
   "?"
 }
 
-// The machine-readable payload for `CODE_UFCS_NOT_METHOD` (D1570): `reason` names which of
-// the three refusal kinds fired, so a quick-fix can offer the `self`-name rename without
-// parsing the message text; `declLine`/`declCol` locate where that rename lands.
+// The machine-readable payload for `CODE_UFCS_NOT_METHOD` (D1570): `reason` names which
+// refusal kind fired, so a quick-fix can offer the `self`-name rename without parsing the
+// message text; `declLine`/`declCol` locate where that rename lands.
 export function ufcsNotMethodData(
   prop: string,
-  name: string,
+  d: i32,
   recvTy: i32,
   kind: i32,
 ) {
   let reason = "receiver"
   if kind == 1 { reason = "self-name" }
   if kind == 2 { reason = "arity" }
+  if kind == 4 { reason = "binding" }
   let pn = ""
-  const pns = fnParamNamesOf(name)
+  const pns = paramNamesOfNodes(fnParamsOfDecl(d))
   if pns.length > 0 { pn = pns[0] }
   let out = diagDataField("member", prop)
   out = out + diagDataField("recv", demangleMsg(tyToStr(recvTy)))
   out = out + diagDataField("reason", reason)
   out = out + diagDataField("param", pn)
-  out = out + diagDataField("declLine", i32ToStr(ufcsDeclParamLine(name)))
-  out + diagDataField("declCol", i32ToStr(ufcsDeclParamCol(name)))
+  out = out + diagDataField("declLine", i32ToStr(ufcsDeclParamLine(d)))
+  out + diagDataField("declCol", i32ToStr(ufcsDeclParamCol(d)))
 }
 
 // The parameter NAMES of the declaration nodes `ps`, in order, skipping any the parser did not
@@ -405,12 +431,6 @@ export function paramsAfterFirst(ps: i32[]) {
     i = i + 1
   }
   out
-}
-
-// The declared parameter NAMES of the top-level function `name`, or an empty list. By name: for
-// a diagnostic about the free function, never for a call site (`fnDeclParamsOf`).
-function fnParamNamesOf(name: string) {
-  paramNamesOfNodes(fnDeclParamsOf(name))
 }
 
 // The DECLARED parameter nodes of the free `self`-function `name`, MINUS the
@@ -492,6 +512,14 @@ export function ufcsSiteFn(ix: i32, prop: string) {
   nm
 }
 
+// The declaration member call `ix` names as `prop`: the binding its spelling has there, else,
+// for a spelling bound to nothing, the module function `ufcsSiteFn` names; -1 for neither.
+export function ufcsSiteDecl(ix: i32, prop: string): i32 {
+  const d = memberDeclOf(ix)
+  if d >= 0 { return d }
+  fnDeclIx[ufcsSiteFn(ix, prop)] ?? -1
+}
+
 // Whether the graph registry holds a row for `prop` in module `spec` — in which case that
 // row's exact answer stands and the std catalog's row for the same pair is not asked.
 export function ufcsRegistryHas(prop: string, spec: string) {
@@ -522,20 +550,20 @@ function specListQuoted(list: string) {
   out + "\"" + list.slice(start, list.length) + "\""
 }
 
-// Whether the scope's `self`-function `name` steps aside for the receiver's home module: only
+// Whether the scope's `self`-function `decl` steps aside for the receiver's home module: only
 // when the receiver is a newtype and `self` is ANNOTATED with a concrete type that does not
 // name it. Declared names alone decide, so no field or body edit elsewhere re-routes a call
 // (DECISIONS.md §"UFCS is never implicit", D1984); every other scope binding keeps the call.
 export function ufcsScopeStepsAside(
-  name: string,
+  decl: i32,
   fnTy: i32,
   recvTy: i32,
 ): boolean {
   if fnTy < 0 { return false }
   const nom = nomNameOfTy(recvTy)
   if nom == "" { return false }
-  if !declFirstParamIsSelf(name) { return false }
-  const ps = fnDeclParamsOf(name)
+  if methodFnOfDecl(decl) < 0 { return false }
+  const ps = fnParamsOfDecl(decl)
   if ps.length == 0 { return false }
   const p0n = nodeAt(ps[0])
   if p0n is Param {
