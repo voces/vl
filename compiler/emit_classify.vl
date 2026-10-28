@@ -860,7 +860,9 @@ import {
   listIsIdentNames,
   localDeclIx,
   localIsRef,
+  localLoopDecl,
   localLoopIter,
+  localNames,
   localPairIter,
   localStructIdx,
   monoExactSubN,
@@ -3265,14 +3267,16 @@ export function letBindRep(letIx: i32, fnIx: i32): RepDesc {
 
 // Whether binding `letIx`'s cell is the literal-union atom, its `K | null` niche included.
 export function letBindIsAtom(letIx: i32, fnIx: i32): boolean {
-  letBindRepClaims(letIx, fnIx) && letBindRep(letIx, fnIx).rdAtom == 1
+  const r = bindCellFill(letIx, fnIx)
+  if r < 0 || r >= bcClaims.length { return false }
+  bcClaims[r] && bcRep[r].rdAtom == 1
 }
 
 // Whether binding `letIx`'s cell is the `K | null` niche: the atom with `-1` for null.
 export function letBindIsNulAtom(letIx: i32, fnIx: i32): boolean {
-  if !letBindRepClaims(letIx, fnIx) { return false }
-  const rd = letBindRep(letIx, fnIx)
-  rd.rdAtom == 1 && rd.rdNul == 3
+  const r = bindCellFill(letIx, fnIx)
+  if r < 0 || r >= bcClaims.length || !bcClaims[r] { return false }
+  bcRep[r].rdAtom == 1 && bcRep[r].rdNul == 3
 }
 
 // The table slot of binding `letIx`'s cell when `letBindRepClaims` holds, at its rep's kind.
@@ -3287,10 +3291,11 @@ export function letBindRepSlot(letIx: i32, fnIx: i32): i32 {
 }
 
 // ── the binding storage column (D14434) ──────────────────────────────────────
-// One row per binding asked about, holding its latest instance: whether its rep claims the cell,
-// that rep, and its row slot. A row is current while it holds this instance and the
-// `globalCellKind` walk generation.
-let bcRowOf: {[i32]: i32} = Map()
+// One row per (binding, instance) asked about: whether its rep claims the cell, that rep, and
+// its row slot. `bcHead[letIx]` is the binding's first row and `bcNext` the next instance's. A
+// row is current while it holds the `globalCellKind` walk generation.
+let bcHead: i32[] = []
+let bcNext: i32[] = []
 let bcStamp: i32[] = []
 let bcFn: i32[] = []
 let bcClaims: boolean[] = []
@@ -3303,7 +3308,8 @@ let bcGenSeen = 0
 
 // Empties the column; `classifyStateReset` runs it at compile start, with `bcDepth`.
 function bindCellReset() {
-  bcRowOf = Map()
+  bcHead = []
+  bcNext = []
   bcStamp = []
   bcFn = []
   bcClaims = []
@@ -3324,24 +3330,19 @@ function bindCellFill(letIx: i32, fnIx: i32): i32 {
   // A generation that restarted could alias an old stamp, so the column restarts with it.
   if gckGen < bcGenSeen { bindCellReset() }
   bcGenSeen = gckGen
-  const had = bcRowOf[letIx] ?? -1
-  if (
-    had >= 0
-    && had < bcStamp.length
-    && bcStamp[had] == gckGen
-    && bcFn[had] == fnIx
-  ) {
-    return had
-  }
+  const had = bindCellRow(letIx, fnIx)
+  if had >= 0 && bcStamp[had] == gckGen { return had }
   const gen = gckGen
   bcDepth = bcDepth + 1
   const c = bindCellGo(letIx, fnIx)
   bcDepth = bcDepth - 1
   // The walk may have reset the column, so the row is looked up again.
-  let r = bcRowOf[letIx] ?? -1
-  if r < 0 || r >= bcStamp.length {
+  let r = bindCellRow(letIx, fnIx)
+  if r < 0 {
+    while bcHead.length <= letIx { bcHead.push(-1) }
     r = bcStamp.length
-    bcRowOf[letIx] = r
+    bcNext.push(bcHead[letIx])
+    bcHead[letIx] = r
     bcStamp.push(0)
     bcFn.push(-2)
     bcClaims.push(false)
@@ -3358,6 +3359,14 @@ function bindCellFill(letIx: i32, fnIx: i32): i32 {
   bcTy[r] = c.bgTy
   bcSlot[r] = c.bgSlot
   bcSlotHave[r] = c.bgSlotHave
+  r
+}
+
+// Binding `letIx`'s column row for instance `fnIx`, current or not; -1 when it has none.
+function bindCellRow(letIx: i32, fnIx: i32): i32 {
+  if letIx >= bcHead.length { return -1 }
+  let r = bcHead[letIx]
+  while r >= 0 && bcFn[r] != fnIx { r = bcNext[r] }
   r
 }
 
@@ -10448,6 +10457,52 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
       if nodeRepIsAtom(d.letType, fnIx) {
         return exprIsLitAtom(d.letInit, fnIx)
       }
+    }
+  }
+  false
+}
+
+// Whether local `slot` of frame `fnIx` holds an interned atom: the column at the slot's `let`
+// or loop variable; false for a slot with neither.
+export function slotDeclIsLitAtom(slot: i32, fnIx: i32): boolean {
+  if slot < 0 || slot >= localDeclIx.length { return false }
+  const d = localDeclIx[slot]
+  if d >= 0 { return letBindIsAtom(d, fnIx) }
+  const lv = localLoopDecl[slot]
+  lv >= 0 && letBindIsAtom(lv, fnIx)
+}
+
+// Per local of frame `fnIx`, `slotDeclIsLitAtom` for a name bound more than once; false for a
+// name bound once, which the disambiguation index never classes.
+export function slotDeclAtoms(fnIx: i32): boolean[] {
+  const out: boolean[] = []
+  let i = 0
+  while i < localNames.length {
+    const f = lixFirstOf(localNames[i])
+    out.push((f != i || lixNextOf(i) >= 0) && slotDeclIsLitAtom(i, fnIx))
+    i = i + 1
+  }
+  out
+}
+
+// The reservation scan's over-approximation for a shadowed name. `exprIsLitAtom`'s `Ident` arm
+// resolves through `declaredSlotOf`, whose fallback is a first-match scan over `localNames`,
+// and this scan runs with an empty scope stack, so an outer binding wins where emit time binds
+// the inner one. Scan-side only: over-reserving costs locals, under-reserving is invalid wasm.
+export function identShadowMayBeLitAtom(exprIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  if exprIx < 0 { return false }
+  const e = nodeAt(unwrapParen(exprIx))
+  if e is Ident {
+    // Only a name with more than one declared local can be resolved differently by the two
+    // phases; a unique name gets the same answer from both, and claiming it here would reserve
+    // frames for every ordinary string local in the program.
+    const first = lixFirstOf(e.identName)
+    if first < 0 || lixNextOf(first) < 0 { return false }
+    let i = first
+    while i >= 0 {
+      if slotDeclIsLitAtom(i, fnIx) { return true }
+      i = lixNextOf(i)
     }
   }
   false

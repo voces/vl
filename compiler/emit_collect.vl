@@ -407,7 +407,7 @@ import {
   listIsIdentNames,
   localByNode,
   localDeclIx,
-  localLitUnion,
+  localLoopDecl,
   mAllocKind,
   mAllocSlot,
   mI32Used,
@@ -623,7 +623,6 @@ import {
   forInPairIsMapVal,
   forInPairStructIdx,
   forInVarStructIdx,
-  letBindIsAtom,
   letBindRep,
   letBindRepClaims,
   letBindRepSlot,
@@ -3249,11 +3248,9 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
   // Ordered beside the string arm; the two predicates are mutually exclusive.
   if fiEk == "i32" && forInU8Src(s.fiIter, fnIx) { fiLk = "u8list" }
   const fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
-  // Every iterable whose element is an i32 atom (kind 0): a literal-union array, its nullable
-  // element, and a literal-union-keyed MAP, whose bare walk yields its keys. Flagged so the
-  // var is recognized as an atom at print widening, `==` and member compare — a loop var is
-  // the one storage class `exprNulLitUnion` cannot reach, having no `LetDecl` (D1748).
-  if letBindIsAtom(s.fiDecl1, fnIx) && fiSlot >= 0 { localLitUnion[fiSlot] = 1 }
+  // The slot holds the loop variable's declaration, which a scope-less scan asks the column
+  // about (D1748).
+  if fiSlot >= 0 { localLoopDecl[fiSlot] = s.fiDecl1 }
   markLoopVarIter(fiSlot, s.fiIter)
   scopeBind(s.fiVar, fiSlot)
   addLocalName(s.fiVar + "#i", "i32", -1)
@@ -3305,13 +3302,9 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
       fiPk,
       forInPairStructIdx(s.fiIter, fnIx),
     )
-    if forInPairIsMapVal(s.fiIter, fnIx) {
-      markPairVarIter(fiP2, s.fiIter)
-      // A literal-union map VALUE rides the i32 atom like the key arm above, so the value
-      // binding is flagged the same way, or a print reads the atom's index (D2656).
-      if letBindIsAtom(s.fiDecl2, fnIx) {
-        if fiP2 >= 0 && fiP2 < localLitUnion.length { localLitUnion[fiP2] = 1 }
-      }
+    if forInPairIsMapVal(s.fiIter, fnIx) { markPairVarIter(fiP2, s.fiIter) }
+    if fiP2 >= 0 && fiP2 < localLoopDecl.length {
+      localLoopDecl[fiP2] = s.fiDecl2
     }
     scopeBind(s.fiVar2, fiP2)
   }
@@ -3378,8 +3371,8 @@ function letLocalSlot(stmtIx: i32, s: LetDecl, fnIx: i32) {
     // coercion. First in the ladder, since several arms below claim a bare `null`.
     slot = addLocalName(s.letName, "nulnone", -1)
   } else if letBindRepClaims(stmtIx, fnIx) {
-    // A literal-union local is the column's i32 atom, flagged `localLitUnion` so reads widen
-    // it; the column answers it before any rung below can store it as a string or a box.
+    // A literal-union local is the column's i32 atom; the column answers it before any rung
+    // below can store it as a string or a box.
     slot = letRepSlot(stmtIx, s, fnIx)
   } else if letIsMap(stmtIx, fnIx) {
     // A `Map()` keyed by a literal union, whose constructor builds it string-keyed where the
@@ -3401,10 +3394,11 @@ function letLocalSlot(stmtIx: i32, s: LetDecl, fnIx: i32) {
 
 // The slot of a binding whose type answers its rep: that rep's kind, at its type's slot.
 function letRepSlot(stmtIx: i32, s: LetDecl, fnIx: i32): i32 {
-  const rd = letBindRep(stmtIx, fnIx)
-  const slot = addLocalName(s.letName, rd.rdKind, letBindRepSlot(stmtIx, fnIx))
-  if rd.rdAtom == 1 && slot >= 0 { localLitUnion[slot] = 1 }
-  slot
+  addLocalName(
+    s.letName,
+    letBindRep(stmtIx, fnIx).rdKind,
+    letBindRepSlot(stmtIx, fnIx),
+  )
 }
 
 // `letLocalSlot`'s list rungs, for a list whose type names no row; falls on to the value rungs.
