@@ -963,6 +963,8 @@ import {
   placeReadContainerAt,
   preStmtNarrow,
   pushPostGuardNarrow,
+  readCellHoldsNullRef,
+  readOwesNonNullRecover,
   recBuildRowOf,
   refListSlotOfExpr,
   rlUnionNameOfTy,
@@ -16647,14 +16649,10 @@ function hoistScanBlock(ix: i32) {
 // so a row is only minted for a rep whose access path the hoisted guard can actually
 // serve; the nullable arms, checked first exactly as there, decline.
 function hoistRowOfRecv(recvIx: i32, name: string, fnIx: i32) {
-  if exprNulScalarListKind(recvIx, fnIx) != null { return 0 - 1 }
-  // The shared-backing nullable lists (`i32[] | null`, `boolean[] | null`) must also
-  // decline here — `exprNulScalarListKind` above only names the four leaves with a
-  // wrapper heap type, so these would otherwise read the header above the null guard,
-  // and in a loop condition hoist `struct.get` in front of `ref.is_null`: trapping on a null.
-  if exprNullableList(recvIx, fnIx) { return 0 - 1 }
+  // A cell that can hold null declines, however the read narrows: the prologue reads the
+  // header above the null guard, and in a loop condition in front of `ref.is_null`.
+  if readCellHoldsNullRef(recvIx, fnIx) { return 0 - 1 }
   if exprRefArray(recvIx, fnIx) {
-    if exprNullableRefArray(recvIx, fnIx) { return 0 - 1 }
     if !raUsed { return 0 - 1 }
     return listHoistRow(name, "ref", refListSlotOfExpr(recvIx, fnIx))
   }
@@ -20707,6 +20705,13 @@ function emitBoxAtomRetagAtoms(fa: string[], ta: string[], at: i32) {
   0
 }
 
+// A read leaves its recorded rep on the stack: a nullable cell the checker narrowed to its
+// non-null twin recovers here, once, rather than at each consumer.
+function emitReadRecover(exprIx: i32, fnIx: i32) {
+  if readOwesNonNullRecover(exprIx, fnIx) { fbRefAsNonNull() }
+  0
+}
+
 export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   // Stop after a recorded failure: `emitFail` banks the first message and returns -1 but
   // does not halt the pass, so a caller that drops the -1 keeps emitting over invalidated
@@ -20801,7 +20806,10 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
     return 0
   }
   if e is CharLit { return emitCharLitNode(body, e, exprIx, fnIx) }
-  if e is Ident { return emitIdentNode(body, e, exprIx, fnIx, ctx, ec) }
+  if e is Ident {
+    if emitIdentNode(body, e, exprIx, fnIx, ctx, ec) < 0 { return -1 }
+    return emitReadRecover(exprIx, fnIx)
+  }
   if e is Paren { return emitExpr(body, e.parInner, fnIx, ec) }
   if (
     (e is Member || e is Index || callIsMethodAt(exprIx))
@@ -20857,7 +20865,10 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
     }
     return emitIndex(body, exprIx, fnIx, ec)
   }
-  if e is Member { return emitMemberNode(body, e, exprIx, fnIx, ec) }
+  if e is Member {
+    if emitMemberNode(body, e, exprIx, fnIx, ec) < 0 { return -1 }
+    return emitReadRecover(exprIx, fnIx)
+  }
   // A STANDALONE `?.` (one no enclosing `?? d` / null-test pattern consumed) yields its
   // own `F | null` value — see `emitOptMemberValue`.
   if e is OptMember { return emitOptMemberValue(body, exprIx, fnIx, ec) }
