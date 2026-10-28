@@ -298,6 +298,7 @@ import {
   sidNoteNodeName,
   sidOf,
   sidOfNode,
+  sidText,
 } from "./symbols"
 import {
   annArrowAt,
@@ -389,7 +390,7 @@ import {
   fnFlowTableBuild,
   fnFlowWholeSliceRecv,
 } from "./fn_flow_shadow"
-import { ifArmValueExpr, paramIndexOf, paramTypeNode } from "./emit_query"
+import { ifArmValueExpr, paramIndexOf, paramTypeNodeOfRead } from "./emit_query"
 import {
   drwFillDefaults,
   drwMemberDeferred,
@@ -858,23 +859,26 @@ function monoStructAnnName(name: string, isArr: boolean) {
   ""
 }
 
-// Is `name` still the module's binding when read from inside `fnIx` (-1 = module scope)?
-// False when that body binds it or takes a parameter of it — the shadow test, which is not
+// Is the name the read `readIx` spells still the module's binding when read from inside `fnIx`
+// (-1 = module scope)? False when that body binds it or the read is of one of its parameters — the shadow test, which is not
 // the same question as `fnIx >= 0` (D703).
-function monoModuleNameVisible(name: string, fnIx: i32) {
+function monoModuleNameVisible(readIx: i32, fnIx: i32) {
   if fnIx < 0 { return true }
-  if paramTypeNode(fnIx, name) >= 0 { return false }
+  if paramTypeNodeOfRead(fnIx, readIx) >= 0 { return false }
   const shf = nodeAt(fnIx)
-  if shf is FuncDecl { return parentLetOf(shf.fnBody, name) < 0 }
+  if shf is FuncDecl {
+    return parentLetOf(shf.fnBody, sidText(sidOfNode(readIx))) < 0
+  }
   false
 }
 
-// The module-scope `LetDecl` for `name` as seen from `fnIx`, or -1, through
+// The module-scope `LetDecl` the read `readIx` names as seen from `fnIx`, or -1, through
 // `monoProgLetBySid`. Module scope has two storage classes: a top-level block's binding is
 // a start-function local, absent from `monoProgStmts`, so `moduleLocalLetOfUnique` is the
 // other table (D1596).
-function monoModuleLetOf(name: string, fnIx: i32) {
-  if !monoModuleNameVisible(name, fnIx) { return -1 }
+function monoModuleLetOf(readIx: i32, fnIx: i32) {
+  if !monoModuleNameVisible(readIx, fnIx) { return -1 }
+  const name = sidText(sidOfNode(readIx))
   const hit = sidArrGet(monoProgLetBySid, sidLookup(name))
   if hit >= 0 { return hit }
   moduleLocalLetOfUnique(emitRootIx, name)
@@ -917,12 +921,13 @@ function monoModuleLetPin(letIx: i32, fnIx: i32) {
   ""
 }
 
-// The pin for the call site `siteIx` when the module frame binds `name` in more than one
-// block, or "". The first-wins table declines there; the candidate carrying the type the
+// The pin for the call site `siteIx`, a read, when the module frame binds its name in more than
+// one block, or "". The first-wins table declines there; the candidate carrying the type the
 // checker recorded for the site is the one it denotes, and a set of candidates that all pin
 // one spelling has no disagreement left to decline over (D1598).
-function monoModuleDupPin(name: string, fnIx: i32, siteIx: i32) {
-  if !monoModuleNameVisible(name, fnIx) { return "" }
+function monoModuleDupPin(fnIx: i32, siteIx: i32) {
+  if !monoModuleNameVisible(siteIx, fnIx) { return "" }
+  const name = sidText(sidOfNode(siteIx))
   const cands: i32[] = []
   moduleLocalLetAll(emitRootIx, name, cands)
   if cands.length < 2 { return "" }
@@ -1085,11 +1090,12 @@ function monoAnnIsCloPin(annIx: i32) {
 // or -1; the node carries both halves (`tyNameOf` key, `nodeTyIxOf` banked `TyFunc`). Param
 // before local. A name `fnIx` does not bind is a capture, read at the nearest enclosing frame
 // that binds it (D13660).
-function monoCloPinAnnNodeOf(identName: string, fnIx: i32): i32 {
+function monoCloPinAnnNodeOf(readIx: i32, fnIx: i32): i32 {
+  const identName = sidText(sidOfNode(readIx))
   let fx = fnIx
   let steps = 0
   while fx >= 0 && steps < 64 {
-    const ptn = paramTypeNode(fx, identName)
+    const ptn = paramTypeNodeOfRead(fx, readIx)
     if monoAnnIsCloPin(ptn) { return ptn }
     const ctxFn = nodeAt(fx)
     let li = -1
@@ -1118,7 +1124,7 @@ function monoCloPinAnnNodeOf(identName: string, fnIx: i32): i32 {
 function monoCloPinAnnNodeOfExpr(ax: i32, fnIx: i32): i32 {
   if ax < 0 { return -1 }
   const n = nodeAt(ax)
-  if n is Ident { return monoCloPinAnnNodeOf(n.identName, fnIx) }
+  if n is Ident { return monoCloPinAnnNodeOf(ax, fnIx) }
   -1
 }
 
@@ -1545,10 +1551,11 @@ function monoCapturedDestListPin(name: string, fnIx: i32): string {
   ""
 }
 
-// The annotation pin of the enclosing frame's PARAMETER a closure at `fnIx` captures as `name`,
-// or "" once a frame binds it as a local. A lambda lifted out of an instance reads its capture
+// The annotation pin of the enclosing frame's PARAMETER the capture read `readIx` in a closure at
+// `fnIx` reads, or "" once a frame binds its name as a local. A lambda lifted out of an instance reads its capture
 // at the instance's substituted annotation, as a direct call in the instance's body does (D3063).
-function monoCapturedParamPin(name: string, fnIx: i32): string {
+function monoCapturedParamPin(readIx: i32, fnIx: i32): string {
+  const name = sidText(sidOfNode(readIx))
   let pp = fnStmtsPosOf(fnIx)
   let steps = 0
   while pp >= 0 && pp < fnParent.length && steps < 64 {
@@ -1559,7 +1566,7 @@ function monoCapturedParamPin(name: string, fnIx: i32): string {
     if fn is FuncDecl {
       if parentLetOf(fn.fnBody, name) >= 0 { return "" }
       if paramIndexOf(fx, name) >= 0 {
-        const ptn = paramTypeNode(fx, name)
+        const ptn = paramTypeNodeOfRead(fx, readIx)
         if ptn < 0 { return "" }
         const pt = nodeAt(ptn)
         if pt is TypeRef { return monoAnnPinName(pt.tyName) }
@@ -1746,7 +1753,7 @@ function monoParamPinnedNull(ax: i32, fnIx: i32): boolean {
   if ax < 0 || fnIx < 0 { return false }
   const n = nodeAt(ax)
   if !(n is Ident) { return false }
-  const ptn = paramTypeNode(fnIx, n.identName)
+  const ptn = paramTypeNodeOfRead(fnIx, ax)
   if ptn < 0 { return false }
   tyNameOf(ptn) == "null"
 }
@@ -2490,13 +2497,13 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
         if li < 0 && paramIndexOf(fnIx, argN.identName) < 0 {
           const cdp = monoCapturedDestListPin(argN.identName, fnIx)
           if cdp != "" { return cdp }
-          const cpp = monoCapturedParamPin(argN.identName, fnIx)
+          const cpp = monoCapturedParamPin(cax, fnIx)
           if cpp != "" { return cpp }
         }
       }
       // A struct-typed param argument (`g(v)` inside a generic body where `v: P`): same as
       // the annotated-local case — read the param annotation, the locals table being unbuilt.
-      const ptn = paramTypeNode(fnIx, argN.identName)
+      const ptn = paramTypeNodeOfRead(fnIx, cax)
       if ptn >= 0 {
         const pt = nodeAt(ptn)
         if pt is TypeRef {
@@ -2514,7 +2521,7 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
     // function-scoped and every arm above sits behind `fnIx >= 0`, so a generic call whose
     // argument is a top-level binding reaches none of them; `monoModuleLetOf` declines on a
     // shadow test rather than on `fnIx >= 0`, so a global is readable inside a function too.
-    const gli = monoModuleLetOf(argN.identName, fnIx)
+    const gli = monoModuleLetOf(cax, fnIx)
     if gli >= 0 {
       const gd = nodeAt(gli)
       if gd is LetDecl {
@@ -2547,7 +2554,7 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
         }
       }
     } else {
-      const dpn = monoModuleDupPin(argN.identName, fnIx, cax)
+      const dpn = monoModuleDupPin(fnIx, cax)
       if dpn != "" { return dpn }
     }
   }
@@ -2689,13 +2696,13 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
   // neither other channel can see it. This is what a generic forwarder hands its inner call.
   const cloPinNode = monoCloPinAnnNodeOfExpr(cax, fnIx)
   // D941 — the fourth channel, the third one's sibling: the instance's own parameter
-  // annotation (`paramTypeNode`), gated to a generic application. Every other channel asks
+  // annotation (`paramTypeNodeOfRead`), gated to a generic application. Every other channel asks
   // the argument node, and a clone shares its leaf expressions, so a forwarded `e`'s
   // recorded type is still the template's. Placed here because arms below `return ""`.
   if cax >= 0 {
     const gaN = nodeAt(cax)
     if gaN is Ident {
-      const gaPt = paramTypeNode(fnIx, gaN.identName)
+      const gaPt = paramTypeNodeOfRead(fnIx, cax)
       if gaPt >= 0 {
         const gaAnn = tyNameOf(gaPt)
         if annGenAppSpanEnds(gaAnn) { return gaAnn }
@@ -20112,7 +20119,7 @@ function monoCalleeAnnNode(callee: i32, fnIx: i32): i32 {
   if !(c is Ident) { return -1 }
   let li = globalLetOfRead(fnIx, cx)
   if fnIx >= 0 {
-    const ptn = paramTypeNode(fnIx, c.identName)
+    const ptn = paramTypeNodeOfRead(fnIx, cx)
     if ptn >= 0 { return ptn }
     const fn = nodeAt(fnIx)
     if fn is FuncDecl {
@@ -23074,7 +23081,7 @@ function monoLocalCopySrcTy(ax: i32, fnIx: i32): i32 {
   if m is Member {
     const o = nodeAt(unwrapParen(m.memObj))
     if o is Ident {
-      const ptn = paramTypeNode(fnIx, o.identName)
+      const ptn = paramTypeNodeOfRead(fnIx, unwrapParen(m.memObj))
       const pt = if ptn >= 0 { monoAnonParamPinTy.get(ptn) ?? -1 } else { -1 }
       if pt >= 0 { return tyFieldTyOf(pt, m.memProp) }
     }
