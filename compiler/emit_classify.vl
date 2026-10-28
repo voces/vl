@@ -60,6 +60,7 @@ import {
   externRetIsVoid,
   hasSpreadItem,
   i32ToStr,
+  loopVarLoop,
   memberCallRungOf,
   nodeAt,
   nodeChildren,
@@ -300,6 +301,7 @@ import {
   parentLetOwnedBy,
   parentLetOwnerOf,
   parentLetReadAt,
+  parentLoopOfDecl,
   parentLoopVarOf,
   placeNarrowKeyOf,
   pushUniqueAtom,
@@ -317,12 +319,13 @@ import {
   capSibStack,
   capTrailName,
   capTrim,
+  captureLoopNodeOf,
+  captureLoopVarDeclOf,
   captureLoopVarIsPair,
   capturedBindingFrameOf,
   copyReadIsUnnarrowed,
   fnStmtsPosOf,
   frameElemLoopOfRead,
-  frameLoopEnclosing,
   moduleLoopEnclosing,
   nestedFnDeclaredIn,
   nfdWalkEnter,
@@ -3380,6 +3383,7 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
     bgSlot: -1,
     bgSlotHave: false,
   }
+  if loopVarLoop(letIx) >= 0 { return loopVarCellGo(letIx, fnIx) }
   if letIsNulNone(letIx, fnIx) { return no }
   // A literal-union binding is the i32 atom, whatever rep its held type reads as: annotated
   // `: K`, off an atom initialiser, or the `K | null` niche with `-1` for null.
@@ -3429,6 +3433,40 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
   }
   const slot = repSlotOfKind(k, ty)
   { bgClaims: slot >= 0, bgRep: rd, bgTy: ty, bgSlot: slot, bgSlotHave: true }
+}
+
+// Loop variable `d`'s storage answer in frame `fnIx`, off the loop of that frame declaring it:
+// the i32 atom, or its `K | null` niche, when the walk yields one; else no claim.
+function loopVarCellGo(d: i32, fnIx: i32): BindCellGo {
+  let body = emitRootIx
+  if fnIx >= 0 {
+    const fn = nodeAt(fnIx)
+    if fn is FuncDecl { body = fn.fnBody }
+  }
+  let lp = parentLoopOfDecl(body, sidOfNode(d), d)
+  if lp < 0 { lp = loopVarLoop(d) }
+  let atom = false
+  let nul = false
+  const l = nodeAt(lp)
+  if l is ForIn {
+    const it = frameBlindIter(l.fiIter, fnIx)
+    if l.fiDecl2 == d {
+      atom = forInPairVarIsLitAtom(it, fnIx)
+      nul = atom && nodeTyMapValIsNulLitUnion(it)
+    } else {
+      atom = forInVarIsLitAtom(it, fnIx, forInElemKind(it, fnIx))
+      nul = atom
+        && (nodeArrayElemIsNulLitUnion(it)
+        || tyIsNulLitUnionNiche(iterElemPinTy(it, fnIx)))
+    }
+  }
+  {
+    bgClaims: atom,
+    bgRep: if atom { repAtomMk(if nul { 3 } else { 0 }) } else { repDescNone() },
+    bgTy: -1,
+    bgSlot: -1,
+    bgSlotHave: true,
+  }
 }
 
 // The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
@@ -4268,25 +4306,15 @@ function capturedFrameOf(fnIx: i32, name: string): i32 {
 // node, so `captureValKind` would fall to its i32 default whatever the iterated element is.
 // Asked only where `parentBindingOf` declines, which is the right precedence by construction.
 function captureLoopVarIterOf(fe: i32, name: string): i32 {
+  const lp = captureLoopNodeOf(fe, name)
+  if lp < 0 { return -1 }
+  const ln = nodeAt(lp)
+  if !(ln is ForIn) { return -1 }
+  // A module-scope `for` variable is a start-function local, typed with the frame -1 its own
+  // `declareForInLocals` call passes, which is what the callers' frame reads answer.
   const par = parentBindingFrameOf(fe, name)
-  if par < 0 {
-    // A module-scope `for` variable: a start-function local, typed with the frame -1 its
-    // own `declareForInLocals` call passes, which is what the callers' frame reads answer.
-    const mlv = moduleLoopEnclosing(fe, name)
-    if mlv < 0 { return -1 }
-    const mln = nodeAt(mlv)
-    if mln is ForIn { return mln.fiIter }
-    return -1
-  }
-  if par >= fnStmts.length { return -1 }
-  const pfn = nodeAt(fnStmts[par])
-  if pfn is FuncDecl {
-    const lv = frameLoopEnclosing(fe, pfn.fnBody, name)
-    if lv < 0 { return -1 }
-    const ln = nodeAt(lv)
-    if ln is ForIn { return frameBlindIter(ln.fiIter, fnStmts[par]) }
-  }
-  -1
+  if par < 0 { return ln.fiIter }
+  frameBlindIter(ln.fiIter, fnStmts[par])
 }
 
 // The node to classify iterable `it` of frame `fnIx` by outside that frame's emission. A bare
@@ -9280,9 +9308,17 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       // A `let`: the slot the frame being emitted stored it in, else the storage column.
       const nld = readLetDeclOf(e.identName, exprIx, fnIx)
       if nld >= 0 {
-        const nown = readLetOwnerOf(nld, e.identName, fnIx)
+        const nown = readDeclOwnerOf(nld, e.identName, fnIx)
         if letReadSlotLitUnion(e.identName, nld, nown) == 0 { return false }
         return bindingIsNulLitUnion(nld, nown)
+      }
+      // A loop variable: the storage column, at the frame whose loop declares it.
+      const nlv = readLoopVarDeclOf(exprIx)
+      if nlv >= 0 {
+        return bindingIsNulLitUnion(
+          nlv,
+          readDeclOwnerOf(nlv, e.identName, fnIx),
+        )
       }
       if fnIx >= 0 {
         const fn = nodeAt(fnIx)
@@ -9298,16 +9334,6 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
             }
             i = i + 1
           }
-        }
-      }
-      // A for-in loop var over a `(K | null)[]` — the one storage class the channels above
-      // can't reach (no declaration node for an annotation). `declareForInLocals` flags its
-      // slot as the atom; nullability comes from the checker's per-read recorded type.
-      const nluSlot = declaredSlotOf(e.identName)
-      if nluSlot >= 0 && nluSlot < localLitUnion.length {
-        if localLitUnion[nluSlot] == 1 {
-          return nodeRepIsNulAtom(exprIx, fnIx)
-            || tyIsNulLitUnionNiche(loopVarPinTyOf(exprIx, fnIx))
         }
       }
       return false
@@ -10445,8 +10471,11 @@ export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
     LetDecl => {
       return letBindIsAtom(bindIx, ownerFnIx)
     }
+    LoopVar => {
+      return letBindIsAtom(bindIx, ownerFnIx)
+    }
     // No other binding is a literal atom.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -10463,8 +10492,11 @@ function bindingIsNulLitUnion(bindIx: i32, ownerFnIx: i32) {
     LetDecl => {
       return letBindIsNulAtom(bindIx, ownerFnIx)
     }
+    LoopVar => {
+      return letBindIsNulAtom(bindIx, ownerFnIx)
+    }
     // No other binding is a nullable literal union.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -10488,7 +10520,9 @@ function capturedIsLitAtom(fnIx: i32, name: string) {
   }
   const lv = capturedLoopVarName(fe, name, b)
   if lv == "" { return false }
-  capturedLoopVarIsLitAtom(fe, lv)
+  const lvd = captureLoopVarDeclOf(fe, lv)
+  if lvd < 0 { return false }
+  bindingIsLitAtom(lvd, parentBindingFrameArenaOf(fe, lv))
 }
 
 // The loop variable a capture `name` of lifted frame `fe` reads, whose binding is `b`: itself
@@ -10504,13 +10538,9 @@ function capturedLoopVarName(fe: i32, name: string, b: i32): string {
 
 // Whether a `for-in` variable over `iterIx`, walked in frame `fnIx`, holds an interned atom:
 // a literal-union element or its niche, a literal-union map key, or an element that is one only
-// at the instance's pin. `ek` is the iterable's `forInElemKind`. The flag `declareForInLocals`
-// sets, and a capture's reader asks.
-export function forInVarIsLitAtom(
-  iterIx: i32,
-  fnIx: i32,
-  ek: VKind | null,
-): boolean {
+// at the instance's pin. `ek` is the iterable's `forInElemKind`. The loop variable's storage
+// cell (`loopVarCellGo`) is its one reader.
+function forInVarIsLitAtom(iterIx: i32, fnIx: i32, ek: VKind | null): boolean {
   // A string list holds refs whatever literal-union list an `is` narrowed it to (D4916).
   if exprListRep(iterIx, fnIx) == "strlist" { return false }
   if nodeArrayElemIsLitUnion(iterIx) || nodeArrayElemIsNulLitUnion(iterIx) {
@@ -10524,20 +10554,9 @@ export function forInVarIsLitAtom(
 }
 
 // The second name's twin: a map walk's literal-union value (D2656).
-export function forInPairVarIsLitAtom(iterIx: i32, fnIx: i32): boolean {
+function forInPairVarIsLitAtom(iterIx: i32, fnIx: i32): boolean {
   if !forInPairIsMapVal(iterIx, fnIx) { return false }
   nodeTyMapValIsLitUnion(iterIx) || nodeTyMapValIsNulLitUnion(iterIx)
-}
-
-// A captured `for-in` variable `name` of lifted frame `fe`, which has no declaration node for
-// `bindingIsLitAtom` to read: asked of the loop's iterable in the frame that walks it, the loop
-// `captureValKind` types the env field from (D3119).
-function capturedLoopVarIsLitAtom(fe: i32, name: string): boolean {
-  const it = captureLoopVarIterOf(fe, name)
-  if it < 0 { return false }
-  const lvf = parentBindingFrameArenaOf(fe, name)
-  if captureLoopVarIsPair(fe, name) { return forInPairVarIsLitAtom(it, lvf) }
-  forInVarIsLitAtom(it, lvf, forInElemKind(it, lvf))
 }
 
 // The niche dual of `capturedIsLitAtom` — `exprNulLitUnion`'s capture channel. A `K | null`
@@ -10557,15 +10576,9 @@ function capturedIsNulLitUnion(fnIx: i32, name: string) {
   }
   const lv = capturedLoopVarName(fe, name, b)
   if lv == "" { return false }
-  const it = captureLoopVarIterOf(fe, lv)
-  if it < 0 { return false }
-  if captureLoopVarIsPair(fe, lv) {
-    if !forInPairIsMapVal(it, parentBindingFrameArenaOf(fe, lv)) {
-      return false
-    }
-    return nodeTyMapValIsNulLitUnion(it)
-  }
-  nodeArrayElemIsNulLitUnion(it)
+  const lvd = captureLoopVarDeclOf(fe, lv)
+  if lvd < 0 { return false }
+  bindingIsNulLitUnion(lvd, parentBindingFrameArenaOf(fe, lv))
 }
 
 // Does the list LITERAL at `arrIx` lower its elements as interned atoms? A non-literal array
@@ -11192,15 +11205,24 @@ function readLetDeclOf(name: string, exprIx: i32, fnIx: i32): i32 {
   d
 }
 
-// The frame whose body declares a read's `let` `decl` (or a copy minted from it): `fnIx` or
-// the nearest enclosing frame, -1 for a module global or a module-scope block's binding (D14574).
-function readLetOwnerOf(decl: i32, name: string, fnIx: i32): i32 {
+// The loop-variable declaration a name read `exprIx` resolves to, or -1.
+function readLoopVarDeclOf(exprIx: i32): i32 {
+  const u = unwrapParen(exprIx)
+  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is Ident) { return -1 }
+  const d = identDeclOf(u)
+  if loopVarLoop(d) < 0 { return -1 }
+  d
+}
+
+// The frame whose body declares a read's `let` or loop variable `decl` (or a copy minted from
+// it): `fnIx` or the nearest enclosing frame, -1 for a module-scope binding (D14574).
+function readDeclOwnerOf(decl: i32, name: string, fnIx: i32): i32 {
   const sid = sidLookup(name)
   if globalLetOfSid(sid) == decl { return -1 }
   let f = fnIx
   let pos = fnStmtsPosOf(fnIx)
   while f >= 0 {
-    if frameDeclaresLet(f, sid, name, decl) { return f }
+    if frameDeclares(f, sid, name, decl) { return f }
     if pos < 0 || pos >= fnParent.length { return -1 }
     pos = fnParent[pos]
     if pos < 0 || pos >= fnStmts.length { return -1 }
@@ -11209,15 +11231,14 @@ function readLetOwnerOf(decl: i32, name: string, fnIx: i32): i32 {
   -1
 }
 
-// Whether frame `fnIx`'s body holds `let` `decl` of `name`, or the copy an instance minted from it.
-function frameDeclaresLet(
-  fnIx: i32,
-  sid: i32,
-  name: string,
-  decl: i32,
-): boolean {
+// Whether frame `fnIx`'s body holds declaration `decl` of `name`: a `let` or the copy an
+// instance minted from it, or a loop whose variable it is.
+function frameDeclares(fnIx: i32, sid: i32, name: string, decl: i32): boolean {
   const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return false }
+  if loopVarLoop(decl) >= 0 {
+    return parentLoopOfDecl(fn.fnBody, sid, decl) >= 0
+  }
   if parentLetOwnerOf(fn.fnBody, sid, decl) >= 0 { return true }
   const fl = parentLetOf(fn.fnBody, name)
   fl >= 0 && declOrigOf(fl) == decl
@@ -11262,14 +11283,15 @@ function exprIsLitAtomIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // A `let`: the slot the frame being emitted stored it in, else the storage column.
   const ld = readLetDeclOf(e.identName, exprIx, fnIx)
   if ld >= 0 {
-    const owner = readLetOwnerOf(ld, e.identName, fnIx)
+    const owner = readDeclOwnerOf(ld, e.identName, fnIx)
     const sl = letReadSlotLitUnion(e.identName, ld, owner)
     if sl >= 0 { return sl == 1 }
     return bindingIsLitAtom(ld, owner)
   }
-  const slot = declaredSlotOf(e.identName)
-  if slot >= 0 && slot < localLitUnion.length {
-    if localLitUnion[slot] == 1 { return true }
+  // A loop variable: the storage column, at the frame whose loop declares it.
+  const lvd = readLoopVarDeclOf(exprIx)
+  if lvd >= 0 {
+    return bindingIsLitAtom(lvd, readDeclOwnerOf(lvd, e.identName, fnIx))
   }
   const pt = paramTypeNodeAt(fnIx, e.identName, unwrapParen(exprIx))
   if pt >= 0 {
