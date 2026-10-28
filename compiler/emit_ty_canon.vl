@@ -87,6 +87,7 @@ import {
   RepDesc,
   boxTagOfTy,
   mapShapeKeyKind,
+  nulScalarBoxAtomOf,
   repOfNodeAt,
   repOfTy,
   repVariantShapeRowOf,
@@ -152,7 +153,6 @@ import {
 } from "./check_relate_core"
 import {
   flattenVariantsInto,
-  numLitUnionHasBase,
   tyEmitPrimOf,
   tyHasTyVar,
   tyLitSetMemberLexes,
@@ -503,36 +503,6 @@ export function mapKeyElemVKind(sh: i32): VKind {
   "str"
 }
 
-// The value-atom kind a numeric literal union reps as inside the union box — `1 | 2` → 0
-// (i32), `1.5 | 2.5` → 4 (f64) — or -1 otherwise. A numeric litunion is not the `-1`
-// sentinel `K | null` uses: its rep is the number itself (#1866), so no bit pattern is
-// spare, and `{[string]: N}` needs the same conditional box every no-spare scalar needs (D6).
-function numLitUnionBoxKind(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const bn = numLitUnionBaseName(ty)
-  if bn == "i32" { return 0 }
-  if bn == "i64" { return 3 }
-  if bn == "f64" { return 4 }
-  numLitBoxKindNotNumeric(bn)
-}
-
-// `numLitUnionBaseName` answers `i32`, `i64`, `f64` or `""`; the empty name is a type that is
-// not a numeric literal union, which has no box kind.
-function numLitBoxKindNotNumeric(_bn: string): i32 { -1 }
-
-// `numLitUnionBoxKind` asked of a map READ expression inside `fnIx`, from the receiver's type
-// there (`mapRecvTyIn`) — the one place the numeric-litunion rule is applied.
-export function mapReadNumLitBoxKind(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return -1 }
-  const recv = fusedMapReadRecvIx(unwrapParen(exprIx))
-  if recv < 0 { return -1 }
-  const rt = mapRecvTyIn(recv, fnIx)
-  if rt < 0 { return -1 }
-  const r = tyAt(rt)
-  if !(r is TyMap) { return -1 }
-  numLitUnionBoxKind(r.mVal)
-}
-
 // The arena-only twin of `mapReadScalarBoxKind` below: same question, answered from the
 // recorded types alone so it can run in passes with no enclosing function. A twin rather
 // than a default argument: `mapReadScalarBoxKind` resolves its receiver through the
@@ -569,21 +539,9 @@ export function mapTyScalarBoxKind(rt: i32) {
   if rt < 0 || rt >= T.tys.length { return -1 }
   const r = tyAt(rt)
   if !(r is TyMap) { return -1 }
-  const v = r.mVal
-  if v < 0 { return -1 }
-  // Every niche-bearing value carries its own "absent" and must keep today's lowering.
-  if tyIsLitUnion(v) { return -1 }
-  // The numeric litunion has no niche (see `numLitUnionBoxKind` above): it takes the box,
-  // at its base scalar's atom, asked before `tyScalarBaseIs` since the two questions differ.
-  const nlk = numLitUnionBoxKind(v)
-  if nlk >= 0 { return nlk }
-  if numLitUnionHasBase(v) { return -1 }
-  if tyScalarBaseIs(v, "boolean") { return -1 }
-  if tyScalarBaseIs(v, "i32") { return 0 }
-  if tyScalarBaseIs(v, "i64") { return 3 }
-  if tyScalarBaseIs(v, "f64") { return 4 }
-  if tyScalarBaseIs(v, "f32") { return 5 }
-  -1
+  // A miss is the read's `null`, which a niche-bearing value carries itself; a scalar value
+  // with no spare bit takes the box its own nullable reps as.
+  nulScalarBoxAtomOf(r.mVal)
 }
 
 // True when a `m[k] ?? d` read over the map value slot `cns` stays nullable — i.e. the
