@@ -258,7 +258,6 @@ import {
 import {
   fieldKindWidens,
   fieldScalarKindOf,
-  memIsNarrowed,
   sFieldElemNameAt,
   sFieldIsLitUnion,
   sFieldTgtStructIdx,
@@ -5310,7 +5309,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
     }
     // The receiver is a narrowed union arm (`v.f`, `v` narrowed to a struct variant):
     // resolve `f` through the variant field tables.
-    const nvi = memNarrowVariantIndex(memIx)
+    const nvi = memNarrowVariantIndex(memIx, fnIx)
     if nvi >= 0 {
       const vfi = variantFieldIndex(nvi, m.memProp)
       if vfi >= 0 {
@@ -5418,7 +5417,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
     // A shared read whose members store the field at different atoms boxes each one, so the
     // read is the box of the checker's join (`sharedFieldArmsBoxable`). A receiver narrowed to
     // one arm reads that arm's own field instead.
-    if avi < 0 && memNarrowVariantIndex(memIx) < 0 {
+    if avi < 0 && memNarrowVariantIndex(memIx, fnIx) < 0 {
       const bvis: i32[] = []
       const bfis: i32[] = []
       const bcode = sharedUnionFieldPlan(
@@ -11335,10 +11334,9 @@ function exprIsLitAtomIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
 // The variant member read `memIx`'s receiver holds, in the order the field-code twins take
 // it: the narrowing, else a bare variant, else the `Arm | null` niche; -1 for none of them.
 export function memRecvVariantIndex(e: Member, memIx: i32, fnIx: i32): i32 {
-  if !memIsNarrowed(memIx) { return memRecvArmVariantIndex(e.memObj, fnIx) }
-  const vi = memNarrowVariantIndex(memIx)
+  const vi = memNarrowVariantIndex(memIx, fnIx)
   if vi >= 0 { return vi }
-  memRecvNulVariantIndex(e.memObj, fnIx)
+  memRecvArmVariantIndex(e.memObj, fnIx)
 }
 
 function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
@@ -12945,16 +12943,13 @@ function structIndexOfMemberExpr(e: Member, exprIx: i32, fnIx: i32): i32 {
   }
   // A narrowed union member and a variant-typed receiver resolve through the variant
   // field tables — the code-15 twin of `mapShapeOfExpr`'s Member dispatch. Checked after
-  // the struct probe, and only on its receiver miss, so a plain receiver never pays the
-  // narrow-key/variant resolution (`memIsNarrowed` builds a path-key string — hot).
-  if memIsNarrowed(exprIx) {
-    const nvi = memNarrowVariantIndex(exprIx)
-    if nvi >= 0 {
-      const nvfi = variantFieldIndex(nvi, e.memProp)
-      if nvfi >= 0 {
-        if variantFieldTypeAt(nvi, nvfi) == FC_STRUCT {
-          return uFieldTgtStructIdx(nvi, nvfi)
-        }
+  // the struct probe, and only on its receiver miss.
+  const nvi = memNarrowVariantIndex(exprIx, fnIx)
+  if nvi >= 0 {
+    const nvfi = variantFieldIndex(nvi, e.memProp)
+    if nvfi >= 0 {
+      if variantFieldTypeAt(nvi, nvfi) == FC_STRUCT {
+        return uFieldTgtStructIdx(nvi, nvfi)
       }
     }
   }
@@ -14849,9 +14844,7 @@ function memRecvIsRecord(memIx: i32, fnIx: i32): boolean {
   const m = nodeAt(memIx)
   if m is Member {
     // A read the variant tables serve is lowered by `emitMem`'s variant rungs, not its struct one.
-    if memIsNarrowed(memIx) && memNarrowVariantIndex(memIx) >= 0 {
-      return false
-    }
+    if memNarrowVariantIndex(memIx, fnIx) >= 0 { return false }
     if exprVariantIndex(m.memObj, fnIx) >= 0 { return false }
     if memRecvNulVariantIndex(m.memObj, fnIx) >= 0 { return false }
     return rsTyIsRecord(recvCheckedTyOf(unwrapParen(m.memObj), fnIx, 0))
@@ -14969,13 +14962,11 @@ function memFieldTypeCode(memIx: i32, fnIx: i32) {
     // that does not leaves the receiver at its own shape, so it falls through to the rungs
     // below rather than answering -1. A place narrowed to a plain struct is that case, and
     // its `string` field read then classified as an i32 at `print` (D1735).
-    if memIsNarrowed(memIx) {
-      const vi = memNarrowVariantIndex(memIx)
-      if vi >= 0 {
-        const vfi = variantFieldIndex(vi, e.memProp)
-        if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
-        return -1
-      }
+    const vi = memNarrowVariantIndex(memIx, fnIx)
+    if vi >= 0 {
+      const vfi = variantFieldIndex(vi, e.memProp)
+      if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
+      return -1
     }
     // A field read on a variant-typed param `o.field` reads the variant struct's field type
     // directly, off the unboxed param rather than a `narrowName` ident.
@@ -15550,13 +15541,11 @@ function refListElemNameOfMember(e: Member, exprIx: i32, fnIx: i32): string {
   // struct / narrowed variant.
   // A narrowing that names no variant (a place narrowed to a plain struct) falls through to
   // the receiver rungs below, as `memFieldTypeCode` does (D1735).
-  if memIsNarrowed(exprIx) {
-    const vi = memNarrowVariantIndex(exprIx)
-    if vi >= 0 {
-      const vfi = variantFieldIndex(vi, e.memProp)
-      if vfi >= 0 { return uFieldElemName[uFieldStart[vi] + vfi] }
-      return ""
-    }
+  const vi = memNarrowVariantIndex(exprIx, fnIx)
+  if vi >= 0 {
+    const vfi = variantFieldIndex(vi, e.memProp)
+    if vfi >= 0 { return uFieldElemName[uFieldStart[vi] + vfi] }
+    return ""
   }
   // The receiver rungs of `memFieldTypeCode`, arm for arm: a union ARM value (a variant
   // param, local, capture or call) keeps its fields in the variant tables, so a struct-only
@@ -15588,7 +15577,7 @@ function refListElemNameOfMember(e: Member, exprIx: i32, fnIx: i32): string {
     return un0
   }
   // The field read's twin of the Ident arm's last rung (D4930).
-  if memIsNarrowed(exprIx) {
+  if memNarrowVariantIndex(exprIx, fnIx) >= 0 {
     const mrs = recordListSlotOfNode(exprIx, fnIx)
     if mrs >= 0 && mrs < rlElemName.length { return rlElemName[mrs] }
   }
@@ -16907,16 +16896,12 @@ function mapShapeOfMember(exprIx: i32, e: Member, fnIx: i32): i32 {
   if placeReadContainerAt(exprIx, fnIx) == RC_MAP {
     return readMapArmShapeAt(exprIx, fnIx)
   }
-  if memIsNarrowed(exprIx) {
-    const nvi = memNarrowVariantIndex(exprIx)
-    if nvi >= 0 {
-      const nvfi = variantFieldIndex(nvi, e.memProp)
-      if nvfi >= 0 {
-        const nvc = variantFieldTypeAt(nvi, nvfi)
-        if nvc == FC_MAP || nvc == FC_NUL_MAP {
-          return uFieldMapShape(nvi, nvfi)
-        }
-      }
+  const nvi = memNarrowVariantIndex(exprIx, fnIx)
+  if nvi >= 0 {
+    const nvfi = variantFieldIndex(nvi, e.memProp)
+    if nvfi >= 0 {
+      const nvc = variantFieldTypeAt(nvi, nvfi)
+      if nvc == FC_MAP || nvc == FC_NUL_MAP { return uFieldMapShape(nvi, nvfi) }
     }
   }
   const pvi = exprVariantIndex(e.memObj, fnIx)
@@ -17157,13 +17142,11 @@ export function memberFieldCode(memIx: i32, fnIx: i32) {
     // that does not leaves the receiver at its own shape, so it falls through to the rungs
     // below rather than answering -1. A place narrowed to a plain struct is that case, and
     // its `string` field read then classified as an i32 at `print` (D1735).
-    if memIsNarrowed(memIx) {
-      const vi = memNarrowVariantIndex(memIx)
-      if vi >= 0 {
-        const vfi = variantFieldIndex(vi, e.memProp)
-        if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
-        return -1
-      }
+    const vi = memNarrowVariantIndex(memIx, fnIx)
+    if vi >= 0 {
+      const vfi = variantFieldIndex(vi, e.memProp)
+      if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
+      return -1
     }
     const pvi = exprVariantIndex(e.memObj, fnIx)
     if pvi >= 0 {
@@ -17585,12 +17568,8 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       if memReadUnboxAtomKind(exprIx, fnIx) == 11 { return true }
       // A closure field of a narrowed union or variant-typed receiver reads back a closure
       // exactly like a plain struct's, so the call routes to `call_ref`.
-      let mviC = -1
-      if memIsNarrowed(exprIx) {
-        mviC = memNarrowVariantIndex(exprIx)
-      } else {
-        mviC = exprVariantIndex(e.memObj, fnIx)
-      }
+      let mviC = memNarrowVariantIndex(exprIx, fnIx)
+      if mviC < 0 { mviC = exprVariantIndex(e.memObj, fnIx) }
       if mviC >= 0 {
         const mvfiC = variantFieldIndex(mviC, callMemProp(exprIx))
         if mvfiC >= 0 {
