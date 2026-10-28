@@ -29,6 +29,9 @@ let envLogTy: i32[] = []
 let envLogPrev: i32[] = []
 let envLogDepth: i32[] = []
 let envLogHid: boolean[] = []
+// The type the slot's storage holds under entry `e`: its declaration's, which a narrowing or a
+// widening layered over it keeps.
+let envLogStore: i32[] = []
 // A stack of the log entries whose binding hid a declaration, by entry: the declaration hidden
 // and the shadower it held before, restored when the entry pops. Most bindings hide none.
 let envHideEnt: i32[] = []
@@ -58,6 +61,7 @@ export function scopesReset() {
   envLogPrev = []
   envLogDepth = []
   envLogHid = []
+  envLogStore = []
   envHideEnt = []
   envHideDecl = []
   envHidePrev = []
@@ -96,6 +100,7 @@ export function scopeFramePop() {
     envLogPrev.pop()
     envLogDepth.pop()
     envLogHid.pop()
+    envLogStore.pop()
   }
   T.frames.pop()
   0
@@ -202,21 +207,26 @@ function slotBottomDepth(s: i32) {
   envLogDepth[e]
 }
 
-// Binds slot `s` in the innermost frame at type `ty`; a slot the frame already binds keeps its
-// entry and takes the new type.
-function envBind(s: i32, ty: i32) {
+// Binds slot `s` in the innermost frame at type `ty`, its storage at `store`, or at what the
+// layer below holds when `store` is -1; a slot the frame already binds keeps its entry.
+function envBind(s: i32, ty: i32, store: i32) {
   const top = T.frames.length - 1
   const had = envSlotTop(s)
   if had >= 0 && envLogDepth[had] == top {
     envLogTy[had] = ty
+    if store >= 0 { envLogStore[had] = store }
     return 0
   }
+  let st = store
+  if st < 0 && had >= 0 { st = envLogStore[had] }
+  if st < 0 { st = ty }
   const e = envLogSlot.length
   envLogSlot.push(s)
   envLogTy.push(ty)
   envLogPrev.push(-1)
   envLogDepth.push(top)
   envLogHid.push(false)
+  envLogStore.push(st)
   envHidesNote(s, e)
   envLink(e)
   scopeDeclLog.push(s)
@@ -312,8 +322,9 @@ export function declLayerSharedAt(decl: i32, d: i32) {
 }
 
 // The slots bound above the module frame that a read of their name reaches, innermost layer's
-// type beside each, in binding order: what a nested declaration's elaboration re-declares.
-export function scopeVisibleSnapshot(slots: i32[], tys: i32[]) {
+// type and storage type beside each, in binding order: what a nested declaration's elaboration
+// re-declares.
+export function scopeVisibleSnapshot(slots: i32[], tys: i32[], stores: i32[]) {
   if T.frames.length < 2 { return 0 }
   let e = T.frames[1]
   while e < envLogSlot.length {
@@ -321,6 +332,7 @@ export function scopeVisibleSnapshot(slots: i32[], tys: i32[]) {
     if !envLogHid[e] && envSlotTop(s) == e && slotVisibleOf(s) == s {
       slots.push(s)
       tys.push(envLogTy[e])
+      stores.push(envLogStore[e])
     }
     e = e + 1
   }
@@ -359,6 +371,15 @@ export function identTyOf(ix: i32, name: string) {
   if s == -1 { return -1 }
   declTyOf(s)
 }
+// The type the storage the `Ident` `ix` reads holds, before any narrowing layered over it, or -1.
+export function identStoreTyOf(ix: i32, name: string) {
+  const s = identSlotOf(ix, name)
+  if s == -1 { return -1 }
+  const e = envSlotTop(s)
+  if e < 0 { return -1 }
+  envLogStore[e]
+}
+
 // The type the ambient intrinsic `name` binds, or -1.
 export function ambientTyOf(name: string) {
   const s = envAmbOf[name] ?? -1
@@ -474,19 +495,24 @@ export function declIsConst(d: i32) {
 // Binds declaration `decl`, spelled `name`, to `ty` in the innermost frame.
 export function declareDecl(decl: i32, name: string, ty: i32) {
   if decl < 0 { return declareAmbient(name, ty) }
-  envBind(decl, ty)
+  envBind(decl, ty, ty)
 }
 
 // Binds the ambient intrinsic `name`, which no declaration makes, to `ty` in the innermost frame.
 export function declareAmbient(name: string, ty: i32) {
   const s = envMintAmbient(name)
   envAmbOf[name] = s
-  envBind(s, ty)
+  envBind(s, ty, ty)
 }
 
 // Binds slot `s` at `ty` in the innermost frame, as a layer over what `s` holds: a narrowing, a
 // widening or a restored snapshot.
-export function declareSlot(s: i32, ty: i32) { envBind(s, ty) }
+export function declareSlot(s: i32, ty: i32) { envBind(s, ty, -1) }
+
+// `declareSlot` restoring a snapshot layer, at the storage type `store` the snapshot holds.
+export function restoreSlot(s: i32, ty: i32, store: i32) {
+  envBind(s, ty, store)
+}
 
 // The `FuncDecl` the binder bound the `Ident` `ix` to, whether or not its scope is open now (a
 // walk after the pass is out of every function's scope), or -1 for any other binding.
