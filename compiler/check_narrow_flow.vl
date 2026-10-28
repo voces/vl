@@ -133,8 +133,6 @@ import {
   crNameFacedLater,
   crNoNames,
   crwArgCall,
-  crwBindDeclOf,
-  crwBindOf,
   crwEnsure,
   crwGen,
   crwRoot,
@@ -181,13 +179,13 @@ import {
 } from "./check_core_state"
 import {
   crCondRetired,
+  crDeclEscapesHere,
   crEscapesIn,
   crFilterRhsRetired,
   crInHoleTemplate,
   crLambdaEscapes,
   crLambdaHandle,
   crLiveSlots,
-  crNameEscapesHere,
   crPathDropRead,
   crPopSoleTo,
   crStmtHolding,
@@ -589,7 +587,7 @@ import {
   weTargetShape,
 } from "./check_write_effects"
 import { i32ListHas, strListAdd, strListHas, strListWith } from "./listutil"
-import { declOutermostOf, declShadowOf, sidOf } from "./symbols"
+import { declOutermostOf, declShadowOf, identDeclOf, sidOf } from "./symbols"
 import {
   arrElemValueTy,
   isLitBearing,
@@ -2425,7 +2423,7 @@ function crFnEscapesAt(lv: i32, p: i32, key: string): boolean {
   const isRoot = crFnRoots[lv] == fnIx
   if isRoot { return true }
   const h = crLambdaHandle(fnIx)
-  if h == "" { return !crCallbackKeeps(fnIx, p, key) }
+  if h < 0 { return !crCallbackKeeps(fnIx, p, key) }
   let body = crProgRoot
   if lv >= 1 {
     const pf = nodeAt(crFnIxs[lv - 1])
@@ -2440,21 +2438,10 @@ export function crCaptureCallCheck(slot: i32, callIx: i32) {
   const rd = npCapBy[slot]
   if rd < 0 { return 0 }
   // Calling the reader itself runs it now, under the narrowing.
-  crwEnsure(crCurRoot())
-  let own = crwBindOf[rd] ?? ""
-  let ownDecl = crwBindDeclOf[rd] ?? -1
-  const rdn = nodeAt(rd)
-  if rdn is FuncDecl {
-    if rdn.fnName != "" {
-      own = rdn.fnName
-      ownDecl = rd
-    }
-  }
-  if own != "" && calleeNameOf(callIx) == own { return 0 }
+  const own = crLambdaHandle(rd)
+  if own >= 0 && crCalleeDeclOf(callIx) == own { return 0 }
   // Nor can it run later once its only handle has gone out of scope without escaping.
-  if own != "" && declDepthOf(ownDecl) < 0 && !crNameEscapesHere(own) {
-    return 0
-  }
+  if own >= 0 && declDepthOf(own) < 0 && !crDeclEscapesHere(own) { return 0 }
   tErrCoded(
     "'"
       + npKeys[slot]
@@ -2885,13 +2872,12 @@ function crBodyMayWrite(fnIx: i32, s: i32): boolean {
 // still holds the captured type there: a writer may have run since the function's creation.
 export function crCapRecCheck(callIx: i32) {
   if crCapRecHandles.length == 0 { return 0 }
+  const hd = crCalleeDeclOf(callIx)
+  if hd < 0 || (crCapRecCount[hd] ?? 0) <= 0 { return 0 }
   const h = calleeNameOf(callIx)
-  const cn = nodeAt(callIx)
-  if !(cn is Call) || h == "?" { return 0 }
-  if (crCapRecCount[h] ?? 0) <= 0 { return 0 }
   let r = 0
   while r < crCapRecHandles.length {
-    if crCapRecHandles[r] == h && crCapRecDepths[r] == crFnBases.length {
+    if crCapRecHandles[r] == hd && crCapRecDepths[r] == crFnBases.length {
       const nm = crCapRecNames[r]
       const cs = crCapRecSlots[r]
       if !tySame(declTyOf(cs), crCapRecTys[r]) {
@@ -4794,4 +4780,15 @@ export function discardedIfValTy(
   }
   if thenTy != TY_VOID && thenTy != TY_ERR { return mkNullableTy(thenTy) }
   TY_VOID
+}
+
+// The declaration the bare-name callee of call `callIx` reads, or -1.
+function crCalleeDeclOf(callIx: i32): i32 {
+  const cn = nodeAt(callIx)
+  if cn is Call {
+    if cn.callFn >= 0 && nodeAt(cn.callFn) is Ident {
+      return identDeclOf(cn.callFn)
+    }
+  }
+  -1
 }
