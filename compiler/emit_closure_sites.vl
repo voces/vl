@@ -81,10 +81,8 @@ import {
 } from "./check_types"
 import { sFieldTgtStructIdx, sFieldTypeAt } from "./emit_atom_kinds"
 import {
-  PL_READ_UNPLACED,
   objFieldVal,
   parentLetOf,
-  parentLetOfAt,
   tyIsBool,
   tyNameOf,
   unwrapParen,
@@ -150,6 +148,7 @@ import {
   objLitVariantIdxNoStructRow,
   preStmtNarrow,
   pushPostGuardNarrow,
+  readLetDeclOf,
   refListElemNameOfExpr,
   retCapturedMapShape,
   setNarrowFromCond,
@@ -164,7 +163,6 @@ import {
 import { anonParamPinFieldTy } from "./emit_closure_callee"
 import {
   bodyLetReadAtSid,
-  bodyReadLet,
   cloParamTok,
   cloRetIsString,
   cloSigPosOfKey,
@@ -177,9 +175,7 @@ import {
   fnCheckedRetIsUnionBox,
   fnCheckedRetMapKind,
   fnInferredRetLitAtom,
-  frameLetOfLive,
   paramTypeNodeAt,
-  readSidOf,
   retKindIsList,
   stmtPrecedesTail,
 } from "./emit_fn_ret_kinds"
@@ -212,6 +208,8 @@ import {
 } from "./emit_ref_list_kinds"
 import { repSigTokOfKind } from "./emit_rep"
 import { repSigRetTokOfTy, repSigTokOfTy } from "./emit_rep_slot"
+import { globalLetOfSid } from "./emit_narrow_slots"
+import { paramTypeNode } from "./emit_query"
 import { rlSlotByNameTwin, rlSlotsLayoutTwin } from "./emit_shape_rows"
 import {
   annParamKindTy,
@@ -243,11 +241,7 @@ import {
   uDeclared,
   vbAtomListTop,
 } from "./emit_state"
-import {
-  blockBindingHidden,
-  rlSlotOfTy,
-  sFieldIndex,
-} from "./emit_struct_order"
+import { rlSlotOfTy, sFieldIndex } from "./emit_struct_order"
 import {
   holeCaptureTyOf,
   holeOperandTyOf,
@@ -257,7 +251,7 @@ import {
 } from "./emit_ty_canon"
 import { unionStoreAtomKindOfSet } from "./emit_union_casts"
 import { i32ListHas } from "./listutil"
-import { sidOf, sidOfNode } from "./symbols"
+import { identDeclOf, sidOf, sidOfNode } from "./symbols"
 import { arrElemNameRaw } from "./tyname"
 import { primNameOf, tyEmitPrimOf, tyHasTyVar } from "./tyquery"
 
@@ -1727,36 +1721,29 @@ function boundBoolByName(name: string, fnIx: i32, atIx: i32) {
   if fnIx >= 0 {
     const fn = nodeAt(fnIx)
     if fn is FuncDecl {
-      // A read inside the body resolves at its own position, where a `let` in scope shadows a
-      // parameter and one in a block the read is outside does not (D3236). A node with no
-      // such position takes the scope stack (D1597), after the parameters.
-      const bsid = readSidOf(name, atIx)
-      let li = bodyReadLet(fn.fnBody, bsid, atIx)
-      const positioned = li != PL_READ_UNPLACED
-      if !positioned { li = -1 }
-      if li < 0 {
-        const params = fn.fnParams
-        let i = 0
-        while i < params.length {
-          const p = nodeAt(params[i])
-          if p is Param {
-            if p.parName == name { return tyIsBool(p.parType) }
+      // The read's own declaration decides: a parameter takes the frame's own copy of it, whose
+      // type an instance pinned, and a body `let` its annotation or initializer (D3236).
+      let dl = -1
+      if atIx >= 0 && atIx < P.nodes.length { dl = identDeclOf(atIx) }
+      if dl >= 0 && dl < P.nodes.length {
+        const d = nodeAt(dl)
+        if d is Param {
+          const pt = paramTypeNode(fnIx, name)
+          if pt >= 0 { return tyIsBool(pt) }
+          return tyIsBool(d.parType)
+        }
+        if !(d is LetDecl) { return false }
+        if globalLetOfSid(sidOfNode(atIx)) != dl {
+          // An instance's read names the generic's `let`; the frame's own copy is typed at the pin.
+          const li = readLetDeclOf(name, atIx, fnIx)
+          if li >= 0 {
+            const l = nodeAt(li)
+            if l is LetDecl {
+              if l.letType >= 0 { return tyIsBool(l.letType) }
+              return exprIsBool(l.letInit, fnIx)
+            }
           }
-          i = i + 1
-        }
-      }
-      if !positioned {
-        if !blockBindingHidden() && atIx >= 0 {
-          li = parentLetOfAt(fn.fnBody, bsid, atIx)
-        } else {
-          li = frameLetOfLive(fn.fnBody, name)
-        }
-      }
-      if li >= 0 {
-        const d = nodeAt(li)
-        if d is LetDecl {
-          if d.letType >= 0 { return tyIsBool(d.letType) }
-          return exprIsBool(d.letInit, fnIx)
+          return false
         }
       }
     }

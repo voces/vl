@@ -44,7 +44,6 @@ import {
   parentLetOf,
   parentLetOfAt,
   parentLetOfSid,
-  parentLetOwnedBy,
   parentLetOwnerOf,
   parentLetReadAt,
   parentLoopAt,
@@ -58,7 +57,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { fnStmtsPosOf, nodeTyAt } from "./emit_capture_frames"
-import { globalLetOf, slotLetDecl } from "./emit_narrow_slots"
+import { globalLetOf } from "./emit_narrow_slots"
 import {
   paramStructIdxOf,
   retListKindFlag,
@@ -76,7 +75,6 @@ import { repSigNulVariantTok, repSigVariantTok } from "./emit_shape_rows"
 import {
   RLK_UNION,
   VKind,
-  blockLetHidden,
   bodyRebuiltFrom,
   cloSigBase,
   cloSigKeys,
@@ -93,10 +91,8 @@ import {
   monoInstFe,
   monoTwoListRet,
   rlElemKindTbl,
-  scopeFrames,
-  scopeSlotOf,
 } from "./emit_state"
-import { blockBindingHidden, tyPrimLeafElemName } from "./emit_struct_order"
+import { tyPrimLeafElemName } from "./emit_struct_order"
 import { identDeclOf, sidArrGet, sidLookup, sidOf, sidOfNode } from "./symbols"
 import { memCstrMsg } from "./check_demands"
 
@@ -799,68 +795,21 @@ export function bodyLetReadAtSid(bodyIx: i32, sid: i32, atIx: i32): i32 {
   parentLetOfAt(bodyIx, sid, atIx)
 }
 
-// `name` when a read of it at node `atIx` in function `fnIx` can denote the parameter of that
-// name, else "": a `let` or loop variable in scope at the read shadows it. The parameter
-// resolvers take the answer as their name, so a shadowed read finds no parameter (D3293).
-export function paramNameAt(fnIx: i32, name: string, atIx: i32): string {
-  if fnIx < 0 || atIx < 0 { return name }
-  // The frame being emitted keeps a scope stack, which the parameter resolvers already ask.
-  if fnIx == emitCurFnIx && (blockLetHidden || scopeFrames.length > 0) {
-    return name
-  }
-  const sid = readSidOf(name, atIx)
-  if !paramShadowedInBody(fnIx, sid) { return name }
-  const fn = nodeAt(fnIx)
-  if fn is FuncDecl {
-    const r = bodyReadLet(fn.fnBody, sid, atIx)
-    if r == PL_READ_UNPLACED { return name }
-    if r >= 0 || bodyReadInLoop(fn.fnBody, sid, atIx) { return "" }
-  }
-  name
-}
-
-// Whether the read of `name` at node `atIx` in function `fnIx` denotes its parameter of that
-// name, asked once the name is known to be one (`paramNameAt`).
-export function paramReadAt(fnIx: i32, name: string, atIx: i32): boolean {
-  paramNameAt(fnIx, name, atIx) != ""
+// Whether the read at node `atIx` in function `fnIx` denotes the parameter of its name, asked
+// once the name is known to be one: a read whose declaration is not a `Param` denotes a binding
+// of the body that shadows it (D3293). A read with no declaration is the parameter.
+export function paramReadAt(fnIx: i32, atIx: i32): boolean {
+  if fnIx < 0 || atIx < 0 || atIx >= P.nodes.length { return true }
+  const d = identDeclOf(atIx)
+  if d < 0 || d >= P.nodes.length || nodeAt(d) is Param { return true }
+  !paramShadowedInBody(fnIx, sidOfNode(atIx))
 }
 
 // `paramTypeNode` for the read of `name` at node `atIx`: -1 where a binding shadows the parameter.
 export function paramTypeNodeAt(fnIx: i32, name: string, atIx: i32): i32 {
   const pt = paramTypeNode(fnIx, name)
-  if pt < 0 || paramNameAt(fnIx, name, atIx) != "" { return pt }
+  if pt < 0 || paramReadAt(fnIx, atIx) { return pt }
   -1
-}
-
-// The `LetDecl` a read of `name` denotes in the frame whose body is `bodyIx`, or -1.
-// `parentLetOf` answers for the whole body including nested blocks, so where
-// `blockBindingHidden` holds the live binding outranks that name scan and a nested hit that
-// is not live is out of scope. Scope-less passes keep the whole body. D1597.
-export function frameLetOfLive(bodyIx: i32, name: string) {
-  const li = parentLetOf(bodyIx, name)
-  if li < 0 { return -1 }
-  if !blockBindingHidden() { return li }
-  const slot = scopeSlotOf(name)
-  const sd = slotLetDecl(slot)
-  if sd >= 0 { return sd }
-  if parentLetOwnedBy(bodyIx, sidOfNode(li), li) {
-    // The emitted frame's own binding over a module global is off the stack until declared.
-    if frameLetHiddenOverGlobal(bodyIx, name) { return -1 }
-    return li
-  }
-  -1
-}
-
-// True when `bodyIx` is the body being emitted and `name` is a module global: that frame's
-// binding of it is on the scope stack once declared, so a miss there is a read above it (D2664).
-function frameLetHiddenOverGlobal(bodyIx: i32, name: string) {
-  if emitCurFnIx < 0 { return false }
-  const fn = nodeAt(emitCurFnIx)
-  if fn is FuncDecl {
-    if fn.fnBody != bodyIx { return false }
-    return globalLetOf(name) >= 0
-  }
-  false
 }
 
 // True if parameter `name` of `fnIx` is a nullable union variant (`Circle | null`, kind
