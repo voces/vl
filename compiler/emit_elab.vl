@@ -76,6 +76,7 @@ import { UM_ASG_NAR_TY, UM_ASG_TV_WRITE, undoKeysSince } from "./check_map_undo"
 import { asgNarTyIxOf, asgTvWriteOf } from "./check_asg_rows"
 import { argIsLitAggregate, bindOf } from "./check_leaf_steps"
 import { holePinHeldSet } from "./check_hole_pins"
+import { a20RetWalk } from "./check_nj_gate"
 import { njFnIx, njFnIxSet } from "./check_nj_join"
 import { nodeTyIxOf } from "./check_node_tys"
 import { nodeRepTyIx, nodeRepTyIxOf, nodeRepUnionIx } from "./check_core_state"
@@ -1166,11 +1167,42 @@ export function elabRetOf(k: i32): i32 {
 }
 
 // Node `ix`'s type at the instance `fnIx` is, or -1 where its elaboration leaves it open. A
-// module-scope argument the callee's type parameters type reads at the instance the call reaches.
+// module-scope argument the callee's type parameters type reads at the instance the call reaches;
+// outside every instance, a call is the result of the instance it reaches. An un-annotated
+// binding left open holds its initializer's type there.
 export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
   const k = if fnIx >= 0 { elabKeyAt(fnIx) } else { elabKeyAtPos(monoArgInstFe.get(ix) ?? -1) }
-  if k < 0 { return -1 }
-  elabNodeTy(ix, k)
+  const t = if k >= 0 { elabNodeTy(ix, k) } else if k == -1 { elabRootCallTy(ix) } else { -1 }
+  if t >= 0 || ix < 0 || ix >= P.nodes.length { return t }
+  const n = nodeAt(ix)
+  if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
+    return elabNodeTyAt(parenPeelIx(n.letInit), fnIx)
+  }
+  -1
+}
+
+// The result of the instance call `ix` reaches from the root; -1 for any other node.
+function elabRootCallTy(ix: i32): i32 {
+  if ix < 0 || !(nodeAt(ix) is Call) { return -1 }
+  elabResultOf(elabCallInstFrom(ix, -1))
+}
+
+// Instance `k`'s result: `elabRetOf`, else, for a template with no written result, the one type
+// its elaboration gives every value the body yields; -1 where those disagree or stay open.
+function elabResultOf(k: i32): i32 {
+  const r = elabRetOf(k)
+  if r >= 0 || k < 0 { return r }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || dn.fnRet >= 0 || dn.fnBody < 0 { return -1 }
+  const vals: i32[] = []
+  a20RetWalk(dn.fnBody, true, vals)
+  let t = -1
+  for v in vals {
+    const vt = elabNodeTy(v, k)
+    if vt < 0 || (t >= 0 && !tySame(t, vt)) { return -1 }
+    t = vt
+  }
+  t
 }
 
 // The union whose arm literal `ix` (or its copy source) is adopted into in emitted function
