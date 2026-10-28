@@ -663,8 +663,13 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // 98 -> 82 and 51 -> 30, refEq 4 -> 3, `-O3` fns 6 -> 5, bytes 9954 -> 9630 and 3861 -> 3562.
     // `-O` fns 16 -> 17, the same `bnLen` as on `collections/map-string` once the plain build
     // stubs the unreached `bnBitLen`. Bytes 9630 -> 9506, the rest held.
-    O: { bytes: 9506, fns: 17, allocs: 82, indirect: 0, refEq: 3 },
-    O3: { bytes: 3562, fns: 5, allocs: 30, indirect: 0, refEq: 3 },
+    // The string accumulator keys its rows by declaration, so the document builder's `doc`
+    // no longer collides with the tokenizer's `const doc` and both appends accumulate. The two
+    // `ref.eq`s that leave are D2625's site-cache guards in `main` (`backing == cached`), not
+    // `__str_eq__`'s: the map probe keeps its one. `refEq` 3 -> 1 at both rungs, bytes
+    // 9356 -> 9270 and 3554 -> 3452. Timed interleaved: -O 0.726 -> 0.701 s, -O3 0.716 -> 0.720 s (medians).
+    O: { bytes: 9270, fns: 17, allocs: 82, indirect: 0, refEq: 1 },
+    O3: { bytes: 3452, fns: 5, allocs: 30, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
