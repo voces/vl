@@ -861,7 +861,6 @@ import {
   localDeclIx,
   localIsRef,
   localLoopIter,
-  localNames,
   localPairIter,
   localStructIdx,
   monoExactSubN,
@@ -1904,7 +1903,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
       // A declared local carries its variant index in the slot's parallel column, put there
       // by the `declareLocals` ladder — read it back rather than re-deriving from the
       // annotation, which an inferred binding (`const c = x as? Circle`) does not have.
-      const dsl = declaredSlotOf(e.identName)
+      const dsl = declaredSlotOf(exprIx)
       if dsl >= 0 {
         if localIsRef[dsl] == "nulvariant" { return localStructIdx[dsl] }
       }
@@ -10466,30 +10465,16 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
 }
 
 // Whether local `slot` of frame `fnIx` holds an interned atom: the column at the slot's `let`
-// or loop variable; false for a slot with neither.
+// or for-in variable; false for any other slot, a range variable's among them.
 export function slotDeclIsLitAtom(slot: i32, fnIx: i32): boolean {
   if slot < 0 || slot >= localDeclIx.length { return false }
   const d = localDeclIx[slot]
-  d >= 0 && letBindIsAtom(d, fnIx)
+  d >= 0 && !(nodeAt(d) is ForRange) && letBindIsAtom(d, fnIx)
 }
 
-// Per local of frame `fnIx`, `slotDeclIsLitAtom` for a name bound more than once; false for a
-// name bound once, which the disambiguation index never classes.
-export function slotDeclAtoms(fnIx: i32): boolean[] {
-  const out: boolean[] = []
-  let i = 0
-  while i < localNames.length {
-    const f = lixFirstOf(localNames[i])
-    out.push((f != i || lixNextOf(i) >= 0) && slotDeclIsLitAtom(i, fnIx))
-    i = i + 1
-  }
-  out
-}
-
-// The reservation scan's over-approximation for a shadowed name. `exprIsLitAtom`'s `Ident` arm
-// resolves through `declaredSlotOf`, whose fallback is a first-match scan over `localNames`,
-// and this scan runs with an empty scope stack, so an outer binding wins where emit time binds
-// the inner one. Scan-side only: over-reserving costs locals, under-reserving is invalid wasm.
+// The reservation scan's over-approximation for a shadowed name: true when any same-named
+// local of the frame holds an atom, whichever one the read denotes. Scan-side only:
+// over-reserving costs locals, under-reserving is invalid wasm.
 export function identShadowMayBeLitAtom(exprIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   if exprIx < 0 { return false }
@@ -10675,7 +10660,7 @@ function arrElemLitUnionTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
   if depth >= declFallbackDepthCap() { return 0 - 1 }
   const n = nodeAt(unwrapParen(arrIx))
   if n is Ident {
-    const d = bindingDeclInScope(n.identName)
+    const d = bindingDeclInScope(unwrapParen(arrIx))
     if d >= 0 { return declLitUnionTyAt(d, fnIx, depth, true) }
     const pElem = nodeArrayElemTyIx(paramTypeNode(fnIx, n.identName))
     if tyIsLitUnion(pElem) { return pElem }
@@ -10749,7 +10734,7 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   if e is Ident && depth < declFallbackDepthCap() {
     const pt = paramTypeNodeAt(fnIx, e.identName, unwrapParen(ix))
     if pt >= 0 { return nodeNulLitUnionMemberTexts(pt) }
-    let d = bindingDeclInScope(e.identName)
+    let d = bindingDeclInScope(unwrapParen(ix))
     // Outside the emit walk no scope is open, so the body's own declaration answers, as it
     // does for `exprNulLitUnion`.
     if d < 0 && fnIx >= 0 {
@@ -10991,7 +10976,7 @@ function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
     Ident => {
       // A field read names its row's atom field members, as `memberAtomFieldTexts` reads them: a
       // hole parameter's read records the hole, and its pinned row holds the set (D2866).
-      const slot = declaredSlotOf(e.identName)
+      const slot = declaredSlotOf(ix)
       if slot >= 0 {
         // A for-in element loop var IS the array's element, so its members come from the
         // ITERABLE — the one storage class with no declaration node to read, so it is asked
@@ -11006,7 +10991,7 @@ function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
           return 0 - 1
         }
       }
-      const d = bindingDeclInScope(e.identName)
+      const d = bindingDeclInScope(ix)
       if d >= 0 { return declLitUnionTyAt(d, fnIx, depth, false) }
       const pTy = nodeTyIxOf(paramTypeNodeAt(fnIx, e.identName, ix))
       if tyIsLitUnion(pTy) { return pTy }
@@ -11055,7 +11040,7 @@ export function idxRecvIsStrList(arrIx: i32, fnIx: i32) {
   if exprListRep(arrIx, fnIx) == "strlist" { return true }
   const n = nodeAt(unwrapParen(arrIx))
   if n is Ident {
-    const d = bindingDeclInScope(n.identName)
+    const d = bindingDeclInScope(unwrapParen(arrIx))
     if d < 0 { return false }
     const dn = nodeAt(d)
     if dn is LetDecl {
@@ -12028,7 +12013,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
     ) {
       return true
     }
-    if declaredStruct(e.identName) { return true }
+    if declaredStruct(exprIx) { return true }
     // A captured struct: the env field is the struct ref (`captureValKind` sized it that
     // way), so classify it like a struct param/local — the fourth storage class this arm
     // never grew. Without it, a lambda whose body is a bare captured struct minted its
@@ -12106,7 +12091,7 @@ export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
   if e is Ident {
     const pt = paramTypeNodeAt(fnIx, e.identName, unwrapParen(exprIx))
     if pt >= 0 { return vtKindOfType(pt) }
-    const dk = declaredKind(e.identName)
+    const dk = declaredKind(unwrapParen(exprIx))
     if dk != null { return dk }
     const ck = capturedKindOf(fnIx, e.identName)
     if ck != null { return ck }
@@ -12371,7 +12356,7 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     Ident => {
       const pvi = paramVariantIndex(fnIx, e.identName)
       if pvi >= 0 && paramReadAt(fnIx, e.identName, exprIx) { return pvi }
-      const dvi = declaredVariantIndex(e.identName)
+      const dvi = declaredVariantIndex(exprIx)
       if dvi >= 0 { return dvi }
       // The capture leg — the fourth storage class this ladder lacked while its
       // boolean-and-nullable siblings carry it. `captureValKind`/`captureValStructIdx` already
@@ -12907,7 +12892,7 @@ function structIndexOfIdentExpr(e: Ident, exprIx: i32, fnIx: i32): i32 {
   const pi = paramStructIndex(fnIx, e.identName)
   if pi >= 0 && paramReadAt(fnIx, e.identName, exprIx) { return pi }
   if !identReadsGlobal(sidOfNode(exprIx), exprIx) {
-    const di = declaredStructIndex(e.identName)
+    const di = declaredStructIndex(exprIx)
     if di >= 0 { return di }
   }
   const gi = globalStructIndexSid(fnIx, sidOfNode(exprIx), exprIx)
@@ -13387,7 +13372,7 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   if paramUnion(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
     return true
   }
-  if declaredUnion(e.identName) { return true }
+  if declaredUnion(exprIx) { return true }
   if fnIx < 0 && cnModLoopIterOf(e.identName) >= 0 { return true }
   // A CAPTURED union box (`const a: C | D = …; () => … a is C …`): the env field is the union
   // box (kind 4). `capturedUnionName` resolves its member set from the parent binding so `is`
@@ -13400,7 +13385,7 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // While a capture's env field is typed off its initializer from the capturing frame, a
   // parent local with no loaded slot answers from its own declaration, so the field and the
   // parent's cell agree. Only there: elsewhere an unloaded ident may be flow-narrowed (D5332).
-  if capInitAsk && declaredSlotOf(e.identName) < 0 {
+  if capInitAsk && declaredSlotOf(exprIx) < 0 {
     const ud = identDeclOf(exprIx)
     if ud >= 0 && nodeAt(ud) is LetDecl { return letIsUnion(ud, fnIx) }
   }
@@ -13634,7 +13619,7 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
       if li >= 0 { return letUnionNameOf(li, fnIx) }
       // A `for <name> in <(C|S)[]>` loop variable is a kind-4 union box with no `LetDecl` of
       // its own, so its member set comes from the iterable's union-box element type instead.
-      const flv = forInLoopVarUnionName(name, fnIx)
+      const flv = forInLoopVarUnionName(name, atIx, fnIx)
       if flv != "" { return flv }
       const rlf = readLoopUnionName(atIx, fnIx)
       if rlf != "" { return rlf }
@@ -13643,7 +13628,7 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
   // A top-level `for` loop runs in the start function, which has no `FuncDecl` body, so its
   // union-box loop var needs this same `forInLoopVarUnionName` rung to avoid an unboxed read.
   if fnIx < 0 {
-    const slv = forInLoopVarUnionName(name, -1)
+    const slv = forInLoopVarUnionName(name, atIx, -1)
     if slv != "" { return slv }
     const rlm = readLoopUnionName(atIx, -1)
     if rlm != "" { return rlm }
@@ -13663,15 +13648,15 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
 
 // The one home for "which value union does a `for <name> in <iter>` loop variable flow
 // as", from the iterable's union-box element type (there is no declaration node to read).
-// Keyed by the live slot, never the name — two `for` loops in one frame can share a loop-var
-// name while binding different unions, and a name-based scan would hand one the other's type.
-function forInLoopVarUnionName(name: string, fnIx: i32) {
+// Keyed by the slot the read at `atIx` resolves to, never the name — two `for` loops in one
+// frame can share a loop-var name while binding different unions.
+function forInLoopVarUnionName(name: string, atIx: i32, fnIx: i32) {
   if fnIx < 0 {
     const mli = cnModLoopIterOf(name)
     if mli >= 0 { return forInIterUnionElemName(mli, -1) }
   }
-  if declaredKind(name) != "union" { return "" }
-  const slot = declaredSlotOf(name)
+  if declaredKind(atIx) != "union" { return "" }
+  const slot = declaredSlotOf(atIx)
   if slot < 0 || slot >= localLoopIter.length { return "" }
   if slot < localPairIter.length && localPairIter[slot] >= 0 {
     return forInPairUnionElemName(localPairIter[slot], fnIx)
@@ -15529,8 +15514,8 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   const rdg = identReadsGlobal(sidOfNode(exprIx), exprIx)
   // A kind-18 nullable ref-array local stores its INNER ref-list slot in `localStructIdx`; its element
   // name is that inner slot's element name, so `refListSlotOfExpr` round-trips back to the inner slot.
-  if !rdg && declaredKind(e.identName) == "nulreflist" {
-    const sl18 = declaredSlotOf(e.identName)
+  if !rdg && declaredKind(exprIx) == "nulreflist" {
+    const sl18 = declaredSlotOf(exprIx)
     if sl18 >= 0 {
       const is18 = localStructIdx[sl18]
       if is18 >= 0 && is18 < rlElemName.length { return rlElemName[is18] }
@@ -15549,7 +15534,7 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   }
   const pn = paramRefArrayName(fnIx, e.identName)
   if pn != "" && paramReadAt(fnIx, e.identName, exprIx) { return pn }
-  const dn = if rdg { "" } else { declaredRefArrayName(e.identName) }
+  const dn = if rdg { "" } else { declaredRefArrayName(exprIx) }
   if dn != "" { return dn }
   // A captured ref-array's element name is the `rlElemName` of the slot the env field is
   // typed with — the storage-class mirror of `exprRefArray`'s capture arm.
@@ -16357,7 +16342,7 @@ function identReadOutOfScope(exprIx: i32, fnIx: i32) {
   const e = nodeAt(exprIx)
   if !(e is Ident) { return false }
   const n = e.identName
-  if declaredSlotOf(n) >= 0 || paramIndexOf(fnIx, n) >= 0 { return false }
+  if declaredSlotOf(exprIx) >= 0 || paramIndexOf(fnIx, n) >= 0 { return false }
   if capturedKindOf(fnIx, n) != null { return false }
   globalLetOfSidIn(fnIx, sidOfNode(exprIx), exprIx) < 0
 }
@@ -16780,7 +16765,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
         return true
       }
       const gmr = identReadsGlobal(sidOfNode(exprIx), exprIx)
-      if !gmr && declaredMap(e.identName) { return true }
+      if !gmr && declaredMap(exprIx) { return true }
       if globalIsMapSid(fnIx, sidOfNode(exprIx), exprIx) { return true }
       // A captured map variable of a lifted lambda: classify it exactly as a param/local
       // receiver would, so it takes the map-arm boxing in a union-boxed result.
@@ -17054,8 +17039,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       return readMapArmShapeAt(exprIx, fnIx)
     }
     const gms = identReadsGlobal(sidOfNode(exprIx), exprIx)
-    if !gms && declaredMap(e.identName) {
-      const slot = declaredSlotOf(e.identName)
+    if !gms && declaredMap(exprIx) {
+      const slot = declaredSlotOf(exprIx)
       if slot >= 0 { return localStructIdx[slot] }
       return -1
     }
@@ -17066,8 +17051,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     }
     // A nullable map binding narrowed non-null — its shape is the `| null`-stripped value
     // type, resolved from the local slot or the param annotation.
-    if !gms && declaredNulMap(e.identName) {
-      const nslot = declaredSlotOf(e.identName)
+    if !gms && declaredNulMap(exprIx) {
+      const nslot = declaredSlotOf(exprIx)
       if nslot >= 0 { return localStructIdx[nslot] }
       return -1
     }
@@ -17379,14 +17364,14 @@ export function exprString(exprIx: i32, fnIx: i32) {
       // ...unless the locals table slotted this binding as the string ref. The union resolver
       // reads the CHECKER's type, which a hole-armed join records as one arm's; the slot is the
       // rep, so where the two disagree about a binding the emitter itself sized, it wins (D1728).
-      if uk != -3 && !declaredString(e.identName) { return uk == 2 }
+      if uk != -3 && !declaredString(exprIx) { return uk == 2 }
       if (
         paramString(fnIx, e.identName)
         && paramReadAt(fnIx, e.identName, exprIx)
       ) {
         return true
       }
-      if declaredString(e.identName) { return true }
+      if declaredString(exprIx) { return true }
       // A captured string reads as a string ref (kind 3), like a string param/local; `nulstr`
       // too, since `exprNullableString` claims the `!= null` test first and never mis-routes it.
       const csk = capturedKindOf(fnIx, e.identName)
