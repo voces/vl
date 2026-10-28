@@ -372,7 +372,7 @@ function cwIxNote(at: i32) {
     Ident => {
       if cwIxLive(at) {
         const sid = sidOfNode(at)
-        cwIxOcc(sid, at, cwFrameResolve(cwFrameOf[at], sid), CW_OCC_USE)
+        cwIxOcc(sid, at, cwFrameOfUse(at), CW_OCC_USE)
       }
     }
     BinExpr => {
@@ -744,9 +744,7 @@ function cwDeclare(fr: i32, sid: i32) {
   0
 }
 
-// The slot `(fr, sid)` occupies, or the free slot it would take. Reading a free slot back is
-// how `cwFrameDeclares` answers no, so both callers read the slot rather than a boolean; -1
-// while no table is open.
+// The slot `(fr, sid)` occupies, or the free slot it would take; -1 while no table is open.
 function cwDeclSlotOf(fr: i32, sid: i32): i32 {
   let h = hashMixPair(fr, sid) & (cwDeclCap - 1)
   if h < 0 || h >= cwDeclSlotSid.length { return -1 }
@@ -784,18 +782,13 @@ function cwDeclIndex() {
   0
 }
 
-// Does frame `fr` declare `sid`?
-function cwFrameDeclares(fr: i32, sid: i32): boolean {
-  if cwDeclCap == 0 { return false }
-  const s = cwDeclSlotOf(fr, sid)
-  if s < 0 || s >= cwDeclSlotSid.length { return false }
-  if cwDeclSlotSid[s] != sid { return false }
-  cwDeclSlotFr[s] == fr
-}
-
-// How many declarations of `sid` frame `fr` holds, of every binder the frame walk declares.
-function cwFrameDeclCount(fr: i32, sid: i32): i32 {
-  if cwDeclCap == 0 { return 0 }
+// How many declarations share declaration `d`'s frame and name, `d` among them: the emitter
+// gives a body one local per name, so a binding is the declaration's own only when this is 1.
+function cwDeclCount(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const fr = cwFrameOfDecl(d)
+  if fr == CW_FR_UNKNOWN || cwDeclCap == 0 { return 0 }
+  const sid = sidOfNode(d)
   const s = cwDeclSlotOf(fr, sid)
   if s < 0 || s >= cwDeclSlotSid.length { return 0 }
   if cwDeclSlotSid[s] != sid || cwDeclSlotFr[s] != fr { return 0 }
@@ -835,9 +828,10 @@ function cwFrameWalk(ix: i32, fr: i32) {
     ForRange => {
       cwDeclare(fr, sidOfNode(ix))
     }
+    // The element variables are no child of the loop, so their frame is filed here.
     ForIn => {
-      cwDeclare(fr, sidOfNode(n.fiDecl1))
-      if n.fiDecl2 >= 0 { cwDeclare(fr, sidOfNode(n.fiDecl2)) }
+      cwLoopVarDeclare(n.fiDecl1, fr)
+      cwLoopVarDeclare(n.fiDecl2, fr)
     }
     FuncDecl => {
       cwFrJoins.push(ix)
@@ -888,6 +882,12 @@ function cwFrameWalk(ix: i32, fr: i32) {
     }
   }
   0
+}
+
+function cwLoopVarDeclare(d: i32, fr: i32) {
+  if d < 0 || d >= cwFrameOf.length { return 0 }
+  cwFrameOf[d] = fr
+  cwDeclare(fr, sidOfNode(d))
 }
 
 // File `at` as a parent of `k`. The note pass filed each live node's children in arena order,
@@ -964,19 +964,19 @@ export function cwFramedNode(ix: i32): boolean {
   ix < cwFrameOf.length
 }
 
-// The frame the name at `ix` resolves in: walk out from `ix`'s own frame to the first that
-// declares it, module scope last. `CW_FR_UNKNOWN` where nothing does — an undeclared name or a
-// binder this walk does not model — and that matches every frame rather than none.
-export function cwFrameOfUse(ix: i32, nm: string): i32 {
-  if cwFrameOfOpen(ix) { return cwFrameResolve(cwFrameOf[ix], sidOf(nm)) }
-  CW_FR_UNKNOWN
+// The frame that declares what the `Ident` read `ix` names, by the binder. `CW_FR_UNKNOWN` for a
+// built-in, an unresolved name or a declaration the walk did not reach; that matches every
+// frame rather than none.
+export function cwFrameOfUse(ix: i32): i32 {
+  if !cwFrameOfOpen(ix) { return CW_FR_UNKNOWN }
+  cwFrameOfDecl(identDeclOf(ix))
 }
 
-// Whether the name `nm` at `ix` is read from a function nested in the one that declares it, a
+// Whether the read `ix` is from a function nested in the one that declares what it names, a
 // capture; false for a module binding, true where the frames do not model the binder.
-export function cwUseCaptures(ix: i32, nm: string): boolean {
+export function cwUseCaptures(ix: i32): boolean {
   if !cwFrameOfOpen(ix) { return true }
-  const fr = cwFrameResolve(cwFrameOf[ix], sidOf(nm))
+  const fr = cwFrameOfUse(ix)
   fr != CW_FR_MOD && fr != cwFrameOf[ix]
 }
 
@@ -987,17 +987,6 @@ function cwFrameOfOpen(ix: i32) {
   cwBuildFrames()
   if ix >= cwFrameOf.length { return false }
   cwFrameOf[ix] != CW_FR_UNKNOWN
-}
-
-// Walk out from frame `from` to the first that declares the interned name `sid`.
-function cwFrameResolve(from: i32, sid: i32) {
-  let fr = from
-  while fr >= 0 && fr < cwFrameOf.length {
-    if cwFrameDeclares(fr, sid) { return fr }
-    fr = cwFrameUp[fr] ?? CW_FR_MOD
-  }
-  if cwFrameDeclares(CW_FR_MOD, sid) { return CW_FR_MOD }
-  CW_FR_UNKNOWN
 }
 
 // Are two resolved frames the same binding? `CW_FR_UNKNOWN` on either side matches, which is
@@ -1014,9 +1003,7 @@ export function covarRootFrame(ix: i32): i32 {
   const p = cwPeelValue(ix)
   if p < 0 || p >= P.nodes.length { return CW_FR_UNKNOWN }
   const n = nodeAt(p)
-  if n is Ident && cwFrameOfOpen(p) {
-    return cwFrameResolve(cwFrameOf[p], sidOfNode(p))
-  }
+  if n is Ident { return cwFrameOfUse(p) }
   CW_FR_UNKNOWN
 }
 
@@ -1274,17 +1261,31 @@ function cwBoundInitScan(nm: string, fr: i32): i32 {
   -1
 }
 
-// The `LetDecl` or `Param` node that binds `nm` in frame `fr`, or -1 when the frame binds it
-// other than exactly once.
-export function cwSoleBinderOf(nm: string, fr: i32): i32 {
+// The `LetDecl` or `Param` the `Ident` read `ix` names, by the binder, or -1 when it names
+// another declaration or its frame declares the name more than once.
+export function cwSoleBinderAt(ix: i32): i32 {
+  if !cwFrameOfOpen(ix) || !(nodeAt(ix) is Ident) { return -1 }
+  cwSoleDecl(identDeclOf(ix))
+}
+
+// `d` when it is a `LetDecl` or `Param` its frame declares no other of the same name, else -1.
+function cwSoleDecl(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length || cwDeclCount(d) != 1 { return -1 }
+  const n = nodeAt(d)
+  if n is LetDecl || n is Param { return d }
+  -1
+}
+
+// The sole binder of the binding (`nm`, `fr`), read off its declaration row; -1 as above.
+function cwSoleBinderIn(nm: string, fr: i32): i32 {
   if nm == "" { return -1 }
   cwIxBuild()
-  const sid = sidLookup(nm)
-  if sid < 0 || cwFrameDeclCount(fr, sid) != 1 { return -1 }
   const ow = cwOccWalk(nm, fr)
   while cwOccNext(ow) {
     const r = ow.row
-    if cwIxKind[r] == CW_OCC_BIND && cwIxFr[r] == fr { return cwIxNode[r] }
+    if cwIxKind[r] == CW_OCC_BIND && cwIxFr[r] == fr {
+      return cwSoleDecl(cwIxNode[r])
+    }
   }
   -1
 }
@@ -1320,13 +1321,17 @@ function cwFvCollect(nm: string, fr: i32, out: i32[]): boolean {
   const sid = sidLookup(nm)
   if sid < 0 { return false }
   let binds = 0
+  let bd = -1
   const ow = cwOccWalk(nm, fr)
   while cwOccNext(ow) {
     const r = ow.row
     const at = cwIxNode[r]
     const n = nodeAt(at)
     if cwIxKind[r] == CW_OCC_BIND {
-      if cwIxFr[r] == fr { binds = binds + 1 }
+      if cwIxFr[r] == fr {
+        binds = binds + 1
+        bd = at
+      }
       if n is LetDecl {
         if n.letInit >= 0 && !cwFvAddValue(n.letInit, out) { return false }
       } else if n is Param {
@@ -1344,7 +1349,7 @@ function cwFvCollect(nm: string, fr: i32, out: i32[]): boolean {
       }
     }
   }
-  binds > 0 && binds == cwFrameDeclCount(fr, sid)
+  binds > 0 && binds == cwDeclCount(bd)
 }
 
 // The write that stores function `decl` into the binding (`nm`, `fr`): the `let` initialiser
@@ -1406,7 +1411,7 @@ export function cwLetSlotFnTargets(bd: i32, nm: string): i32[] {
 function cwLexScopeOk(bd: i32, nm: string): boolean {
   const n = nodeAt(bd)
   if !(n is LetDecl) || n.letInit < 0 { return false }
-  const fr = cwFrameOfUse(bd, nm)
+  const fr = cwFrameOfDecl(bd)
   if fr == CW_FR_UNKNOWN { return false }
   const key = i32ToStr(fr) + "#" + nm
   if !(cwLexDone.get(key) ?? false) {
@@ -1650,7 +1655,7 @@ export function cwSlotWrittenValues(
     fr = covarRootFrame(up)
     steps = steps + 1
   }
-  const bd = cwSoleBinderOf(nm, fr)
+  const bd = cwSoleBinderIn(nm, fr)
   if bd < 0 { return -1 }
   const bn = nodeAt(bd)
   if !(bn is LetDecl) { return -1 }
@@ -1812,7 +1817,7 @@ function cwSplitPath(p: string): string[] {
 
 // The identifier the `let` (`nm`, `fr`) is bound once to when it names another `let`, or -1.
 function cwSlotAliasOf(nm: string, fr: i32): i32 {
-  const bd = cwSoleBinderOf(nm, fr)
+  const bd = cwSoleBinderIn(nm, fr)
   if bd < 0 || bd >= P.nodes.length || !cwBoundOnce(nm, fr) { return -1 }
   const bn = nodeAt(bd)
   if !(bn is LetDecl) { return -1 }
@@ -1820,9 +1825,7 @@ function cwSlotAliasOf(nm: string, fr: i32): i32 {
   if init < 0 || init >= P.nodes.length || !cwFramedNode(init) { return -1 }
   const inn = nodeAt(init)
   if !(inn is Ident) { return -1 }
-  const ifr = covarRootFrame(init)
-  if ifr == CW_FR_UNKNOWN { return -1 }
-  const ib = cwSoleBinderOf(inn.identName, ifr)
+  const ib = cwSoleBinderAt(init)
   if ib < 0 || ib >= P.nodes.length || !(nodeAt(ib) is LetDecl) { return -1 }
   init
 }
@@ -1830,7 +1833,7 @@ function cwSlotAliasOf(nm: string, fr: i32): i32 {
 // Whether a write through the alias (`nm`, `fr`) reaches the list or record it names:
 // a parameter, or a `let` bound once to another binding.
 function cwSlotHandle(nm: string, fr: i32): boolean {
-  const bd = cwSoleBinderOf(nm, fr)
+  const bd = cwSoleBinderIn(nm, fr)
   if bd < 0 || bd >= P.nodes.length { return false }
   if nodeAt(bd) is Param { return true }
   cwSlotAliasOf(nm, fr) >= 0
@@ -2040,11 +2043,11 @@ function cwFvAddValue(e: i32, out: i32[]): boolean {
 function cwFvAddNamed(v: i32, out: i32[]): boolean {
   const n = nodeAt(v)
   if n is Ident {
-    const vf = cwFrameOfUse(v, n.identName)
+    const vf = cwFrameOfUse(v)
     if vf == CW_FR_UNKNOWN { return false }
     const d = cwFnDeclOf(n.identName)
     if d >= 0 && d < cwFrameOf.length && cwFrameOf[d] == vf {
-      if cwFrameDeclCount(vf, sidLookup(n.identName)) != 1 { return false }
+      if cwDeclCount(d) != 1 { return false }
       if !i32ListHas(out, d) { out.push(d) }
       return true
     }
@@ -2153,9 +2156,7 @@ function cwElemCallbackRecvOfRead(ix: i32): i32 {
   if ix < 0 || ix >= P.nodes.length || !cwFramedNode(ix) { return -1 }
   const n = nodeAt(ix)
   if !(n is Ident) { return -1 }
-  const fr = covarRootFrame(ix)
-  if fr == CW_FR_UNKNOWN { return -1 }
-  cwElemCallbackRecv(cwSoleBinderOf(n.identName, fr))
+  cwElemCallbackRecv(cwSoleBinderAt(ix))
 }
 
 // The `FuncDecl` a callee EXPRESSION resolves to: the declared function its name binds, or
