@@ -32,6 +32,8 @@ import {
   elabSpreadRunNote,
   litRepTyAt,
   readNarrowedStoreAt,
+  storageReadEnter,
+  storageReadLeave,
 } from "./emit_elab"
 import { canonUnionMembersInto } from "./check_program"
 import {
@@ -88,6 +90,7 @@ import {
   TyArray,
   TyLit,
   TyMap,
+  TyNullable,
   TyObj,
   TyUnion,
   TyVar,
@@ -802,6 +805,9 @@ import {
   nodeTyAt,
   numLitTyWidth,
   numLitWidth,
+  readNarrowedBoxToNull,
+  readNarrowedToNull,
+  readNarrowedTyAt,
 } from "./emit_capture_frames"
 import {
   anonRowOwnTyOf,
@@ -851,8 +857,6 @@ import {
   coalesceNulAtomToStr,
   coalesceNulRefNicheOperand,
   coalesceOperandPinNonNull,
-  currentNarrowSetAt,
-  currentNarrowSetIdAt,
   envSlotShift,
   exactOperandTyOf,
   exprArray,
@@ -985,8 +989,6 @@ import {
   spreadSrcAtomTexts,
   spreadSrcBoxes,
   stmtIsTailValue,
-  storageReadEnter,
-  storageReadLeave,
   structIndexOfExpr,
   structIndexOfObjCtx,
   structListPopGetElem,
@@ -1171,9 +1173,7 @@ import {
   ifJoinNarrowsPerArm,
   ifJoinTypedAtom,
   maskNarrowFor,
-  narrowSlotOf,
-  narrowVariantFor,
-  narrowedToNullKey,
+  narrowKeyOfRead,
   unmaskNarrow,
   variantIndexOf,
 } from "./emit_narrow_slots"
@@ -1266,6 +1266,7 @@ import {
   nodeJoinRowName,
   nodeMixedUnionName,
   nulLitMemberTexts,
+  unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentAt,
   unionDeclTyIxOfIdentRead,
 } from "./emit_start_block"
@@ -1365,10 +1366,10 @@ import {
   msHasNull,
   msMemberAtomsOfSet,
   msSetOfNameTy,
+  msSetOfTyAny,
   msSetOfUnion,
   msSetTakesAtomAsStr,
   msSubNull,
-  narrowSlotTyOf,
   printPlanPinNull,
   removeAtomFromSet,
   tyBoxTakesAtomAsStr,
@@ -3101,7 +3102,7 @@ function printArgIsUnclassifiedBox(ax: i32, fnIx: i32): boolean {
 function printArgIsBoxName(ix: i32, fnIx: i32): boolean {
   const n = nodeAt(ix)
   if n is Ident {
-    return narrowedArmTyOf(n.identName) < 0 && identSlotIsUnionBox(fnIx, ix)
+    return narrowedArmTyOf(ix, fnIx) < 0 && identSlotIsUnionBox(fnIx, ix)
   }
   false
 }
@@ -3330,13 +3331,12 @@ function isArmTagOfTy(ity: i32): i32 {
   -1
 }
 
-// The arena type the active narrowing of `name` binds, or -1 when `name` is not narrowed
-// or the narrowing carries no single type. A complement push (`x != null`) carries a
-// member set instead, whose sole surviving member is the bound type.
-function narrowedArmTyOf(name: string): i32 {
-  const i = narrowSlotOf(name)
-  if i < 0 { return -1 }
-  narrowSlotTyOf(i)
+// The one type the checker narrowed the read `ix` to, or -1 when it is not narrowed or is
+// narrowed to a union or a nullable, which the box still holds.
+function narrowedArmTyOf(ix: i32, fnIx: i32): i32 {
+  const t = readNarrowedTyAt(ix, fnIx)
+  if t < 0 || tyIsUnionShaped(t) || tyAt(t) is TyNullable { return -1 }
+  t
 }
 
 // `recv == <numeric literal>` onto `body`, leaving a 0/1 i32 — the scalar value test shared
@@ -9316,7 +9316,7 @@ function emitUnionIfArm(
 function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
   if (
     narrowedStructArmVi(exprIx, fnIx) < 0
-    && !narrowedNulStructArm(exprIx)
+    && !narrowedNulStructArm(exprIx, fnIx)
     && !exprTyIsRecord(exprIx, false, fnIx)
     && !exprTyIsRecord(exprIx, true, fnIx)
   ) {
@@ -9342,7 +9342,7 @@ function exprTyIsRecord(exprIx: i32, nullable: boolean, fnIx: i32): boolean {
 function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
   emitArmUnboxCast(
     heapIdx,
-    narrowedNulStructArm(exprIx) || exprTyIsRecord(exprIx, true, fnIx),
+    narrowedNulStructArm(exprIx, fnIx) || exprTyIsRecord(exprIx, true, fnIx),
   )
 }
 
@@ -24999,19 +24999,24 @@ function emitCallCorePrint(
     (pnNiche != "" && pnNiche != "nulstr")
     || exprNullableMap(c.callArgs[0], fnIx)
   ) {
-    const prMask = maskNarrowFor(narrowedToNullKey(c.callArgs[0]))
+    const prNull = readNarrowedBoxToNull(c.callArgs[0], fnIx)
+    const prKey = if prNull { narrowKeyOfRead(c.callArgs[0]) } else { "" }
+    const prMask = maskNarrowFor(prKey)
+    const prMark = if prNull { storageReadEnter(c.callArgs[0]) } else { -2 }
     const prRc = emitPrintNulRefNiche(body, c.callArgs[0], fnIx, ec)
+    if prNull { storageReadLeave(prMark) }
     unmaskNarrow(prMask)
     return prRc
   }
   // A read the narrowing pins to `null` is printed with the narrowing lifted, so the box's
   // own tag decides: every ladder below would unbox an arm it does not hold (D2801).
-  const pnKey = narrowedToNullKey(c.callArgs[0])
-  if pnKey != "" {
-    const pnMask = maskNarrowFor(pnKey)
+  if readNarrowedBoxToNull(c.callArgs[0], fnIx) {
+    const pnMask = maskNarrowFor(narrowKeyOfRead(c.callArgs[0]))
+    const pnMark = storageReadEnter(c.callArgs[0])
     const pnWas = printPlanPinNull(true)
     const pnRc = emitCallCore(body, callIx, fnIx, ec)
     printPlanPinNull(pnWas)
+    storageReadLeave(pnMark)
     unmaskNarrow(pnMask)
     return pnRc
   }
@@ -31465,7 +31470,7 @@ function emitLetDelivery(
     if letArmHeap >= 0 {
       emitArmUnboxCast(
         letArmHeap,
-        narrowedNulStructArm(s.letInit) || localIsRef[slot] == "nulvariant",
+        narrowedNulStructArm(s.letInit, fnIx) || localIsRef[slot] == "nulvariant",
       )
     }
   }
@@ -36323,12 +36328,7 @@ function njMembersOf(ix: i32, fnIx: i32): i32[] {
   // An instance's parameter can carry no recorded type at all; its box still names the members.
   if t >= 0 && !tyHasTyVar(t) { return none }
   if !exprUnion(ix, fnIx) { return none }
-  let name = unionNameOfExpr(ix, fnIx)
-  // A name an instance narrowed (`!= null`) holds the members its narrowing names.
-  if u is Ident {
-    const nv = narrowVariantFor(u.identName)
-    if nv != "" && nv != "null" { name = nv }
-  }
+  const name = unionNameOfExpr(ix, fnIx)
   if name == "" { return none }
   const out: i32[] = []
   for k in njKindsOfUnionName(name) {
@@ -36582,8 +36582,10 @@ function njBoxHoldsNull(ix: i32, fnIx: i32): boolean {
   if !(u is Ident) { return false }
   const t = nodeTyIxOf(ix)
   if t < 0 || !tyHasTyVar(t) || !exprUnion(ix, fnIx) { return false }
-  const nv = narrowVariantFor(u.identName)
-  if nv != "" && nv != "null" { return false }
+  // A read the checker narrowed past `null` holds none.
+  if readNarrowedStoreAt(ix, fnIx) >= 0 && !readNarrowedToNull(ix, fnIx) {
+    return false
+  }
   const name = unionNameOfExpr(ix, fnIx)
   if name == "" { return false }
   for k in njKindsOfUnionName(name) {
@@ -39651,10 +39653,11 @@ function emitCoalesceGo(
   }
   // A read the narrowing pins to `null` may have been written since the test (a loop, a
   // closure, a call), so the narrowing is lifted and the box tested at run time (D2801).
-  const cnKey = narrowedToNullKey(lhsIx)
-  if cnKey != "" {
-    const cnMask = maskNarrowFor(cnKey)
+  if readNarrowedBoxToNull(lhsIx, fnIx) {
+    const cnMask = maskNarrowFor(narrowKeyOfRead(lhsIx))
+    const cnMark = storageReadEnter(lhsIx)
     const cnRc = emitCoalesceBoxRuntime(body, e, exprIx, fnIx, ec)
+    storageReadLeave(cnMark)
     unmaskNarrow(cnMask)
     return cnRc
   }
@@ -39922,7 +39925,7 @@ function emitCoalesceIdentBox(
     // type). The receiver is a pure name, re-read in the non-null arm.
     const cunm = unionNameOfIdentAt(sidOfNode(lhsIx), fnIx, lhsIx)
     if cunm != "" {
-      const cak = coalValUnionResidualKind(lhs.identName, lhsIx, cunm, fnIx)
+      const cak = coalValUnionResidualKind(lhsIx, cunm, fnIx)
       if cak >= 0 && cak != nullValKind() {
         return emitCoalesceValUnionIdent(
           body,
@@ -39964,15 +39967,10 @@ function emitCoalesceBoolPop(
   0
 }
 
-// The banked ABI code of the one member left when `null` is removed from binding `name`'s
-// value union `cunm` at node `lhsIx`, or -1 when `cunm` is not a value union holding `null`.
-// A negative answer, or the null kind itself, means the arm declines.
-function coalValUnionResidualKind(
-  name: string,
-  lhsIx: i32,
-  cunm: string,
-  fnIx: i32,
-): i32 {
+// The banked ABI code of the one member left when `null` is removed from the read `lhsIx`'s
+// value union `cunm`, or -1 when `cunm` is not a value union holding `null`. A negative
+// answer, or the null kind itself, means the arm declines.
+function coalValUnionResidualKind(lhsIx: i32, cunm: string, fnIx: i32): i32 {
   // D-VALUNION resolves the declared union's set; the narrowing table's id below answers a
   // different question (the set surviving the narrow), so both stay resolved, and the null
   // test is a kind test over the banked codes.
@@ -39983,18 +39981,15 @@ function coalValUnionResidualKind(
   ) {
     return -1
   }
-  // D-SETID: the set arrives as the narrowing table's banked (row, mask) id, so the path from
-  // narrowing table to ABI code never renders a set; the rendered residual is built only
-  // where the bank declines — a narrowed subset spelling it never interned.
-  let cak = unionResidualSoloKindOfSet(currentNarrowSetIdAt(name, fnIx, lhsIx))
+  // A read the checker narrowed is the set of its narrowed type; an unnarrowed one the declared
+  // union's. The rendered residual is built only where the pool covers no set.
+  const nt = readNarrowedTyAt(lhsIx, fnIx)
+  if nt >= 0 { return unionResidualSoloKindOfSet(msSetOfTyAny(nt)) }
+  let cak = unionResidualSoloKindOfSet(
+    msSetOfNameTy(cunm, unionDeclTyIxOfExpr(lhsIx, fnIx)),
+  )
   if cak == -2 {
-    cak = valueAtomKind(
-      removeAtomFromSet(
-        currentNarrowSetAt(name, fnIx, lhsIx),
-        "null",
-        nodeTyIxOf(lhsIx),
-      ),
-    )
+    cak = valueAtomKind(removeAtomFromSet(cunm, "null", nodeTyIxOf(lhsIx)))
   }
   cak
 }
