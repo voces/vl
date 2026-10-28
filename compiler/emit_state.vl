@@ -232,7 +232,7 @@ export let fnIndexBySid: i32[] = []
 // actually names a nested function; for a plain top-level name (the overwhelming
 // common case) it can skip straight to the O(1) `fnIndexOf`. Built in `buildFnMap`.
 export let nestedNameBySid: i32[] = []
-// `globalName's sid → its index in `globalNames`` (FIRST wins), so `globalIndexOf`
+// A global's sid → its `globalStmts` position (FIRST wins), so `globalIndexOf`
 // is O(1) rather than an O(globals) string-compare scan. Built in `collectFns`.
 export let globalIndexBySid: i32[] = []
 // Per-function VOIDNESS (1 = `()->()`: no return annotation, no valued `return`,
@@ -451,10 +451,8 @@ export let fRetKind: VKind[] = []
 export let fRetLitAtom: i32[] = []
 // Module-level globals (G2b): a top-level `let`/`const` lowers to a wasm
 // global, whose index is its position among top-level `LetDecl`s in declaration
-// order. `globalStmts` holds their arena indices in that order, `globalNames` the
-// parallel names; a bare `Ident` matching one reads/writes the global, not a local.
+// order. `globalStmts` holds their arena indices in that order; a bare `Ident` matching one reads/writes the global, not a local.
 export let globalStmts: i32[] = []
-export let globalNames: string[] = []
 // Promotion of a top-level binding to a start-function local (G2c), since `wasm-opt`
 // does not do this itself: `gPromoOk[gi]` marks the `LetDecl` at `globalStmts[gi]` as
 // living in local `gPromoSlot[gi]`. The safety predicate is `globalPromotable`
@@ -480,15 +478,10 @@ export let nliNames: string[] = []
 // point like voidness does: `function outer() { return inner() }` cannot be resolved
 // until inner's own kind is inferred.
 export let criChanged = false
-// A `let`/`const` inside a function body allocates a wasm local after the params
-// (`0..p-1`); the i-th declared local gets `p + i`. Locals are function-scoped, so
-// every `LetDecl`, including ones nested in `if` branches, is collected before any
-// instruction emits. `localNames` holds them in order, rebuilt per function.
-export let localNames: string[] = []
-// Parallel to `localNames`: the i-th declared local's value-type `VKind`, so a
-// ref-typed local gets the correct ref valtype rather than i32. `VKind` is also the
-// wasm-rep kind of a param/global cell and of a function's params/result — the
-// vocabulary `fbValtype` matches to emit a valtype byte.
+// A `let`/`const` in a function body gets wasm local `p + i` after the `p` params. Every
+// `LetDecl`, nested ones included, is collected before any instruction emits, into the
+// `local*` columns below in slot order, rebuilt per function. `VKind` is a local's valtype
+// kind, and also a param/global cell's and a function's params/result (what `fbValtype` reads).
 export type VKind = "i32"
   | "struct"
   | "list"
@@ -538,24 +531,24 @@ export type VKind = "i32"
   | "v128"
 
 export let localIsRef: VKind[] = []
-// Parallel to `localNames`: when the i-th local is a STRUCT ref (`localIsRef[i] == 1`),
+// Parallel to `localIsRef`: when the i-th local is a STRUCT ref (`localIsRef[i] == 1`),
 // `localStructIdx[i]` is its struct table index (so a field read/write on the local
 // resolves to the right heap type + field layout). For non-struct locals the slot is
-// unused (`-1`). Rebuilt alongside `localNames` by `buildLocals`.
+// unused (`-1`). Rebuilt alongside `localIsRef` by `buildLocals`.
 export let localStructIdx: i32[] = []
-// Parallel to `localNames`: `1` when the i-th declared local is a loop variable
+// Parallel to `localIsRef`: `1` when the i-th declared local is a loop variable
 // (a `for` counter or for-in element), whose scope is the loop — the resolution
 // fallback skips these once their loop has closed (`markLoopVarSlot`).
 export let localLoopVar: i32[] = []
-// Parallel to `localNames`: for a for-in element loop variable, the iterable
+// Parallel to `localIsRef`: for a for-in element loop variable, the iterable
 // expression node it iterates; `-1` otherwise. A loop var has no declaration node, so
 // a question answerable only from the iterable must reach it via the slot — keying on
 // the loop-var name instead is a miscompile, since two loops may share a name.
 export let localLoopIter: i32[] = []
-// Parallel to `localNames`: for the SECOND name of a `for k, v in m` map walk, the map
+// Parallel to `localIsRef`: for the SECOND name of a `for k, v in m` map walk, the map
 // expression walked; `-1` otherwise. The value's questions go to the map's vals slot.
 export let localPairIter: i32[] = []
-// Parallel to `localNames`: the declaration node (`LetDecl`, a for-in's `LoopVar`, or the
+// Parallel to `localIsRef`: the declaration node (`LetDecl`, a for-in's `LoopVar`, or the
 // `ForRange` of a range variable) the slot holds; `-1` for an emitter-synthesized temp. A
 // monomorphized instance keeps its only concrete type at the declaration, since every leaf
 // expression node stays shared with the generic body — the slot is the only route to it.
@@ -563,7 +556,7 @@ export let localDeclIx: i32[] = []
 // The slot each declaration of the frame holds, keyed by the declaration and by the one a minted
 // copy stands for; written by `markLocalDecl` alone, so a read resolves through its declaration.
 export let localSlotOfDecl: {[i32]: i32} = Map()
-// Parallel to `localNames`: 1 when the slot's `LetDecl` has no initializer. Wasm counts a
+// Parallel to `localIsRef`: 1 when the slot's `LetDecl` has no initializer. Wasm counts a
 // non-null local as set only inside the block that set it, so such a ref cell is declared
 // nullable and every read of it asserts non-null; the checker orders a write before any read.
 export let localUnset: i32[] = []
@@ -580,7 +573,7 @@ export let collectByNode = 0
 export let exprArmLocalsAny = false
 // Lexical scope stack: wasm locals are function-scoped, but VL `let`s are
 // block-scoped, so two `let s` in disjoint branches need separate slots —
-// `addLocalName` never dedupes by name. `scopeNames`/`scopeSlots` pair (name, slot)
+// `addLocalSlot` never dedupes by name. `scopeNames`/`scopeSlots` pair (name, slot)
 // per live binding; `scopeFrames` marks the length at frame entry so a pop truncates back.
 export let scopeNames: string[] = []
 export let scopeSlots: i32[] = []
