@@ -131,8 +131,10 @@ import { covarWriteThrough } from "./check_covar_write"
 import { cstrCandAny } from "./check_cstr_probe"
 import {
   fnTagChoiceAt,
+  fnTagChoiceOfTy,
   fnTagEscapeNote,
   fnTagEtaAt,
+  fnTagEtaInner,
   stampsStand,
 } from "./check_elab_cap"
 import {
@@ -3050,6 +3052,19 @@ function fvaHoleInstTy(site: i32, dt: i32): i32 {
   inst
 }
 
+// Whether function type `d` is closed but for parameters or a result that are sets of functions,
+// which are closed as a value: each member is instanced at the call through it.
+function fvaSetSlotsClosed(d: TyFunc): boolean {
+  let any = false
+  const slots = d.fnParamTypes.slice(0, d.fnParamTypes.length)
+  slots.push(d.fnRet)
+  for t in slots {
+    if fnTagChoiceOfTy(t) { any = true }
+    else if tyHasTyVar(t) || tyReachesHole(t, 8) { return false }
+  }
+  any
+}
+
 // Rewrites the function value at `srcExpr`, of type `srcTy`, into an adapter at `dstTy`'s
 // function type, when the two may differ in rep. True when the delivery is settled here,
 // rewritten or refused; false leaves it to the caller unchanged.
@@ -3114,8 +3129,9 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   if s.fnRet < 0 || d.fnRet < 0 { return false }
+  const dOpen = !encOk && !fvaSetSlotsClosed(d)
   if (
-    tyHasTyVar(dt) && !encOk
+    tyHasTyVar(dt) && dOpen
     || s.fnParamTypes.length != d.fnParamTypes.length
   ) {
     return false
@@ -3131,12 +3147,14 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if litPinN.length > 0 && fvaNamesGeneric(pe, parenPeelIx(site)) {
     return false
   }
-  if tyReachesHole(dt, 8) && !encOk { return false }
+  if tyReachesHole(dt, 8) && dOpen { return false }
   // The source at the destination's parameters, when it is a hole function that needs boxing.
   let holeInst = -1
   // A value of a set of functions is called through at the destination's parameters, a call
   // each member serves at its own instance, so no one instance of the value is needed.
   const setSrc = fnTagChoiceAt(srcExpr, srcTy)
+  // A destination taking or returning a set is built once the decision has tagged that set.
+  const setDst = fvaSetSlotsClosed(d)
   if !fvaNamesGeneric(pe, parenPeelIx(site)) {
     // Any other hole is pinned later, where the value's use decides it.
     if (
@@ -3147,11 +3165,11 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       if holeInst < 0 && !setSrc { return false }
       // A choice is built here only once the decision has tagged its set.
       if holeInst < 0 && !fnTagEtaAt(site) {
-        fnTagEscapeNote(site)
+        fnTagEscapeNote(site, srcTy)
         return false
       }
-    } else if setSrc && !fnTagEtaAt(site) {
-      fnTagEscapeNote(site)
+    } else if (setSrc || setDst) && !fnTagEtaAt(site) {
+      fnTagEscapeNote(site, if setSrc { srcTy } else { dt })
       return false
     } else if !setSrc && !fvaFnMayDiffer(srcTy, dt, 8) {
       return false
@@ -3162,7 +3180,9 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   const args: i32[] = []
   let i = 0
   while i < d.fnParamTypes.length {
-    const pt = fvaAnnot(d.fnParamTypes[i], site, pos)
+    // A parameter of a set of functions has no spelling; it is annotated by the type itself.
+    const dp = d.fnParamTypes[i]
+    const pt = if fnTagChoiceOfTy(dp) { fvaAnnotMinted(dp, site, pos) } else { fvaAnnot(dp, site, pos) }
     if pt < 0 {
       fvaRefuse(srcExpr, srcTy, dt, "")
       return true
@@ -3171,6 +3191,15 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     const pd = luAt(mkParam(pn, pt, -1, 0, 0, pos), site)
     params.push(pd)
     args.push(luRef(pd, site, pos))
+    // A set passed on to a closed parameter is built there too, by this same check.
+    if (
+      setDst
+      && fnTagChoiceOfTy(dp)
+      && i < s.fnParamTypes.length
+      && s.fnParamTypes[i] != dp
+    ) {
+      fnTagEtaInner(args[i])
+    }
     i = i + 1
   }
   const rt = fvaAnnot(d.fnRet, site, pos)
