@@ -492,6 +492,19 @@ function repKeyIsCanon(mode: RepKeyMode): boolean {
   }
 }
 
+// Whether `mode` keys a Set as its boolean-valued map: the canon keys, and the mv slot key,
+// whose slot is named by the map a Set value is stored as.
+function repKeyFoldsSet(mode: RepKeyMode): boolean {
+  match mode {
+    "canon" | "row" | "mv" => {
+      return true
+    }
+    "elem" => {
+      return false
+    }
+  }
+}
+
 // Whether `mode` folds an i32- or string-backed leaf array to its shared list wrapper.
 function repKeyFoldsLeafList(mode: RepKeyMode): boolean {
   match mode {
@@ -687,6 +700,17 @@ function repKeyMemoPut(ty: i32, mode: RepKeyMode, s: string) {
 
 // The base of a union every member of which is an integer literal of that one base, else -1.
 // Such a union is stored as its base, so a field of it shares the base's element row.
+// The type a map's value keys by: under the canon key a union of one base's integer literals is
+// that base, as the map stores it, so `{[K]: 1 | 2}` keys as `{[K]: i32}` does.
+function repMapValTy(v: i32, mode: RepKeyMode): i32 {
+  if !repKeyIsCanon(mode) || v < 0 || v >= T.tys.length { return v }
+  const vt = tyAt(v)
+  if !(vt is TyUnion) { return v }
+  const b = oneIntLitBaseOf(vt.uMembers)
+  if b >= 0 { return b }
+  v
+}
+
 function oneIntLitBaseOf(ms: i32[]): i32 {
   let b = -1
   for m in ms {
@@ -762,14 +786,14 @@ function repKeyGo(ty: i32, mode: RepKeyMode): string {
     }
     TyMap => {
       let s = "M"
-      // Under the canon key a Set is its `{[K]: boolean}` map: the canon name rewrite erases the
-      // flavour, so a row typed from that name must find the rep of the Set it holds.
-      if t.mSet == 1 && !repKeyIsCanon(mode) { s = "Se" }
+      // Under the canon and mv keys a Set is its `{[K]: boolean}` map: both name the Set by that
+      // map, so a row or slot typed from the name must find the rep of the Set it holds.
+      if t.mSet == 1 && !repKeyFoldsSet(mode) { s = "Se" }
       return s
         + "["
         + repKeyOf(t.mKey, mode)
         + ":"
-        + repKeyOf(t.mVal, mode)
+        + repKeyOf(repMapValTy(t.mVal, mode), mode)
         + "]"
     }
     TyNeg => {
@@ -1650,6 +1674,12 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
       return hcIntern(HC_ARRAY, a, hcLenOf(c) + 2)
     }
     TyNullable => {
+      // A nullable union is the union's flat member set with a `null`, however it is nested.
+      if t.nInner >= 0 && !tyIsLitUnion(t.nInner) && tyAt(t.nInner) is TyUnion {
+        const self: i32[] = []
+        self.push(ty)
+        return hcUnionId(self, mode)
+      }
       const c = repIdOf(t.nInner, mode)
       const a: i32[] = []
       a.push(c)
@@ -1681,14 +1711,14 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
     }
     TyMap => {
       const kc = repIdOf(t.mKey, mode)
-      const vc = repIdOf(t.mVal, mode)
+      const vc = repIdOf(repMapValTy(t.mVal, mode), mode)
       const a: i32[] = []
       a.push(kc)
       a.push(vc)
       let head = 1
       let tag = HC_MAP
-      // The canon id keeps a Set with its boolean-valued map twin, as `repKeyGo` does.
-      if t.mSet == 1 && !repKeyIsCanon(mode) {
+      // The canon and mv ids keep a Set with its boolean-valued map twin, as `repKeyGo` does.
+      if t.mSet == 1 && !repKeyFoldsSet(mode) {
         head = 2
         tag = HC_SET
       }
@@ -1778,8 +1808,21 @@ function hcRowFieldMode(ft: i32, mode: RepKeyMode): RepKeyMode {
   mode
 }
 
-// The union arm of the identity walk: `repKeyUnion`'s mix-widening, over ids.
-function hcUnionId(mems: i32[], mode: RepKeyMode): i32 {
+// The union arm of the identity walk: `repKeyUnion`'s mix-widening, over ids. A member that
+// is itself a non-literal union contributes its members and a nullable one its inner and a
+// `null`, so a union holding an alias union keys as its flat member set does, and a set
+// holding `null` keys as the nullable of the rest, as the nullable arm does.
+function hcUnionId(given: i32[], mode: RepKeyMode): i32 {
+  const mems: i32[] = []
+  if !hcUnionFlatInto(given, mems) { return hcUnionSetId(mems, mode) }
+  const c = if mems.length == 1 { repIdOf(mems[0], mode) } else { hcUnionSetId(mems, mode) }
+  const n: i32[] = []
+  n.push(c)
+  hcIntern(HC_NUL, n, hcLenOf(c) + 1)
+}
+
+// `hcUnionId` over a flat member set holding no `null`.
+function hcUnionSetId(mems: i32[], mode: RepKeyMode): i32 {
   const mixed = repUnionIsMixed(mems)
   const strId = hcPrimId("string")
   const a: i32[] = []
@@ -1821,6 +1864,30 @@ function hcUnionId(mems: i32[], mode: RepKeyMode): i32 {
     ui = ui + 1
   }
   hcIntern(HC_UNION, a, len)
+}
+
+// Appends `mems` to `out` with each non-literal union member replaced by its own members and
+// each nullable one by its inner's. True when a member is nullable.
+function hcUnionFlatInto(mems: i32[], out: i32[]): boolean {
+  let nul = false
+  for m in mems {
+    let flat = false
+    if m >= 0 && !tyIsLitUnion(m) {
+      const mt = tyAt(m)
+      if mt is TyUnion {
+        if hcUnionFlatInto(mt.uMembers, out) { nul = true }
+        flat = true
+      } else if mt is TyNullable && mt.nInner >= 0 {
+        const inner: i32[] = []
+        inner.push(mt.nInner)
+        hcUnionFlatInto(inner, out)
+        nul = true
+        flat = true
+      }
+    }
+    if !flat { out.push(m) }
+  }
+  nul
 }
 
 // Structural heap-type dedup (roadmap Next#1, slot layer): the canonical structural
