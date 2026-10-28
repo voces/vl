@@ -79,6 +79,7 @@ import { identDeclOf, identFromDecl } from "./symbols"
 import {
   elabFnIdOf,
   elabLiveTyOf,
+  elabTyClosed,
   fnLetIsWide,
   fnTagArmsAt,
   fnTagArmsAtSet,
@@ -124,12 +125,17 @@ export function fnTagDecide(rootIx: i32) {
     }
     pass = pass + 1
   }
-  // A one-member set of a non-generic declared function delivered to a closed function type is
-  // called there, through its value.
+  // A set of non-generic declared functions is called through where a function taking or
+  // returning its value is delivered; a value of the set delivered to a closed function type
+  // is the closure built there, unless the set has one member and so needs no dispatch.
   for et in escTys {
+    const own = fnTagSetOfTy(et) >= 0
     for s in ftEscSets(et) {
-      const ms = fnTagMembers(s)
-      if ms.length == 1 && ftPlainDecl(ms[0]) && !i32ListHas(seen, s) {
+      let plain = !own || fnTagMembers(s).length == 1
+      for m in fnTagMembers(s) {
+        if !ftPlainDecl(m) { plain = false }
+      }
+      if plain && !i32ListHas(seen, s) {
         seen.push(s)
         ftTry(rootIx, s, calls)
       }
@@ -360,9 +366,10 @@ function ftScan(
       if ftSigValue(x, s) {
         const cn = nodeAt(p)
         if (
-          !(cn is Call)
-          || cn.callFn != x
-            && (ftArgDstTy(cn, x) != nodeTyIxOf(x) || !ftValueSigned(x))
+          !ftRetAtOwn(x, p, g, fn)
+          && (!(cn is Call)
+            || cn.callFn != x
+            && (ftArgDstTy(cn, x) != nodeTyIxOf(x) || !ftValueSigned(x)))
         ) {
           return false
         }
@@ -436,6 +443,22 @@ function ftSigValue(x: i32, s: i32): boolean {
   ftSigCarries(nodeTyIxOf(x), s, 4)
 }
 
+// Whether `x`, with parent `p` and grandparent `g`, is the value function `fn` returns at
+// `fn`'s own result type, so it is delivered where `fn`'s result is.
+function ftRetAtOwn(x: i32, p: i32, g: i32, fn: i32): boolean {
+  const t = nodeTyIxOf(fn)
+  if p < 0 || t < 0 || t >= T.tys.length || !ftValueSigned(x) { return false }
+  const ft = tyAt(t)
+  if !(ft is TyFunc) || ft.fnRet != nodeTyIxOf(x) { return false }
+  const pn = nodeAt(p)
+  if pn is RetStmt { return pn.retArg == x }
+  const f = nodeAt(fn)
+  if !(pn is Block) || g != fn || !(f is FuncDecl) || f.fnBody != p {
+    return false
+  }
+  pn.blkStmts.length > 0 && pn.blkStmts[pn.blkStmts.length - 1] == x
+}
+
 // Whether function value `x` has one signature to be built at: a function with no type
 // parameters and every parameter declared, or a value that is not a declaration.
 function ftValueSigned(x: i32): boolean {
@@ -445,10 +468,17 @@ function ftValueSigned(x: i32): boolean {
   const f = nodeAt(d)
   if !(f is FuncDecl) || f.fnTyParams.length > 0 { return !(f is FuncDecl) }
   for q in f.fnParams {
-    const pn = nodeAt(q)
-    if !(pn is Param) || pn.parType < 0 { return false }
+    if !ftParamClosed(q) { return false }
   }
   true
+}
+
+// Whether parameter `q` has one type where it is written: declared, or seeded closed by the
+// callback context it is delivered to.
+function ftParamClosed(q: i32): boolean {
+  const pn = nodeAt(q)
+  if !(pn is Param) { return false }
+  pn.parType >= 0 || elabTyClosed(nodeTyIxOf(q), 0)
 }
 
 // Whether node `d` declares a named function with no type parameters.
@@ -509,8 +539,7 @@ function ftSigCarries(t: i32, s: i32, depth: i32): boolean {
 function ftClosedLambda(f: FuncDecl): boolean {
   if f.fnName != "" || f.fnTyParams.length > 0 { return false }
   for p in f.fnParams {
-    const pn = nodeAt(p)
-    if !(pn is Param) || pn.parType < 0 { return false }
+    if !ftParamClosed(p) { return false }
   }
   true
 }
