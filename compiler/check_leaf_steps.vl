@@ -150,7 +150,13 @@ import {
   narFnEpoch,
 } from "./check_nar_bank"
 import {
-  isPathKey,
+  placeFind,
+  placeIsPath,
+  placeOf,
+  placeText,
+  placeWith,
+} from "./check_place_ids"
+import {
   narFitNameOf,
   narrowedPathIx,
   nfNamesPush,
@@ -369,11 +375,11 @@ export const irwMarks: i32[] = []
 // A path's state after a kill no later write replaced: the join cannot narrow over it (D3285).
 export const NAR_UNKNOWN = -3
 
-// The last index of `name` in `names`, or -1.
-export function strListLastIx(names: string[], name: string): i32 {
-  let i = names.length - 1
+// The last index of `v` in `xs`, or -1.
+export function i32ListLastIx(xs: i32[], v: i32): i32 {
+  let i = xs.length - 1
   while i >= 0 {
-    if names[i] == name { return i }
+    if xs[i] == v { return i }
     i = i - 1
   }
   -1
@@ -567,44 +573,46 @@ export function tvWriteTy(dcl: i32, rt: i32, cur: i32): i32 {
   mkDerivedHole(HD_TVW, "", dcl, -1, rt)
 }
 
-// A list `name` declared `declTy` and narrowed to `nt` (`xs is K[]`) holds its narrowing only
+// A list place `p` declared `declTy` and narrowed to `nt` (`xs is K[]`) holds its narrowing only
 // while no element is written wider, so each nesting depth whose element `nt` narrows gets an
-// entry `name[*]…[*]` the path rules end at a store or an append through any alias (D4926).
-export function narFitElems(name: string, declTy: i32, nt: i32) {
+// entry `xs[*]…[*]` the path rules end at a store or an append through any alias (D4926).
+export function narFitElems(p: i32, declTy: i32, nt: i32) {
   const d0 = nonNullTy(declTy)
   if d0 < 0 { return 0 }
   const du = tyAt(d0)
   const mems = if du is TyUnion { du.uMembers } else { [d0] }
   for m in mems {
-    if narFitElemsOf(name, m, nonNullTy(nt)) { return 0 }
+    if narFitElemsOf(p, m, nonNullTy(nt)) { return 0 }
   }
   0
 }
 
 // `narFitElems` against one declared list `d`: pushes the entries and answers true when some
 // depth of `d` holds wider elements than `n`.
-function narFitElemsOf(name: string, d0: i32, n0: i32): boolean {
+function narFitElemsOf(p: i32, d0: i32, n0: i32): boolean {
   let d = d0
   let n = n0
-  const keys: string[] = []
+  const keys: i32[] = []
   const tys: i32[] = []
-  let key = name
+  let key = p
   while d >= 0 && n >= 0 && tyAt(d) is TyArray && tyAt(n) is TyArray {
     const da = tyAt(d)
     const na = tyAt(n)
     if da is TyArray && na is TyArray {
-      key = key + LIST_EVERY_STEP
+      key = placeWith(key, LIST_EVERY_STEP)
       keys.push(key)
       tys.push(na.aElem)
       d = da.aElem
       n = na.aElem
     }
   }
-  if keys.length == 0 || d < 0 || n < 0 || tySame(d, n) { return false }
+  if keys.length == 0 || key < 0 || d < 0 || n < 0 || tySame(d, n) {
+    return false
+  }
   let i = 0
   while i < keys.length {
     nfSlotsPush(npKeys.length)
-    nfNamesPush(name)
+    nfNamesPush(placeText(p))
     npKeysPush(keys[i])
     npTysPush(tys[i])
     npInvByPush(-1)
@@ -662,10 +670,11 @@ export function elemEverySlotOf(base: string): i32 {
   -1
 }
 
-// Whether `name` holds a live element narrowing (`name is K[]`). A function capturing it may run
-// after any element write, which no assignment of `name` marks, so it reads `name` as declared.
-export function crElemNarrowLive(name: string): boolean {
-  const i = narrowedPathIx(name + LIST_EVERY_STEP)
+// Whether `name`, bound at slot `s`, holds a live element narrowing (`name is K[]`). A function
+// capturing it may run after any element write, which no assignment of `name` marks, so it reads
+// `name` as declared.
+export function crElemNarrowLive(s: i32, name: string): boolean {
+  const i = narrowedPathIx(placeFind(s, name + LIST_EVERY_STEP))
   i >= 0 && npInvBy[i] < 0
 }
 
@@ -676,10 +685,10 @@ export function capWidenOf(fnIx: i32): string[] {
 // Whether `crCaptureWiden` decided the nested function `fnIx`, even when it widened nothing.
 export function capWidenDecided(fnIx: i32): boolean { crCapWidenBank.has(fnIx) }
 
-// Whether the element entry `key` stands beside a narrowing of its list's name, so a store or
-// append through that name is checked against the narrowed element.
-export function elemKeyStoresChecked(key: string): boolean {
-  const i = narrowedPathIx(key)
+// Whether the element entry at place `p` stands beside a narrowing of its list's name, so a store
+// or append through that name is checked against the narrowed element.
+export function elemKeyStoresChecked(p: i32): boolean {
+  const i = narrowedPathIx(p)
   i >= 0 && narFitNameOf(i) != ""
 }
 
@@ -848,24 +857,29 @@ export function pushElemReadFact(
   placeIx: i32,
   cur: i32,
   chk: i32,
-  names: string[],
+  places: i32[],
   tys: i32[],
 ) {
-  let key = placeKeyOf(placeIx)
-  if key == "" { return 0 }
   let d = nonNullTy(cur)
   let n = chk
+  let depth = 0
   while d >= 0 && n >= 0 && tyAt(d) is TyArray && tyAt(n) is TyArray {
     const da = tyAt(d)
     const na = tyAt(n)
     if da is TyArray && na is TyArray {
-      key = key + LIST_EVERY_STEP
+      depth = depth + 1
       d = da.aElem
       n = na.aElem
     }
   }
-  if d < 0 || n < 0 || tySame(d, n) || !isPathKey(key) { return 0 }
-  names.push(key)
+  if d < 0 || n < 0 || tySame(d, n) { return 0 }
+  let key = placeOf(placeIx)
+  while depth > 0 && key >= 0 {
+    key = placeWith(key, LIST_EVERY_STEP)
+    depth = depth - 1
+  }
+  if key < 0 || !placeIsPath(key) { return 0 }
+  places.push(key)
   tys.push(n)
   0
 }
@@ -873,13 +887,13 @@ export function pushElemReadFact(
 export function pushNarrowFact(
   placeIx: i32,
   ty: i32,
-  names: string[],
+  places: i32[],
   tys: i32[],
 ) {
   if ty < 0 { return 0 }
-  const key = placeKeyOf(placeIx)
-  if key == "" { return 0 }
-  names.push(key)
+  const p = placeOf(placeIx)
+  if p < 0 { return 0 }
+  places.push(p)
   tys.push(ty)
   0
 }

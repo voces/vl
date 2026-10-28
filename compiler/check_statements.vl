@@ -203,8 +203,7 @@ import {
 import {
   IfChk,
   crLoopRdSlots,
-  isPathKey,
-  narClobKeys,
+  narClobPlace,
   narIpAt,
   npKeys,
   popReBarrier,
@@ -262,6 +261,7 @@ import {
   widenLitTy,
 } from "./check_relate_core"
 import { valueUnionRetName } from "./check_ret_names"
+import { placeNameTy } from "./check_place_ids"
 import {
   constScopes,
   declFnAliasSet,
@@ -269,7 +269,6 @@ import {
   fnAliasScopes,
   identFnAliasOf,
   identFnDeclOf,
-  lookup,
 } from "./check_scopes"
 import {
   notePending,
@@ -770,30 +769,28 @@ export function checkIfStmtNode(ix: i32) {
   res
 }
 
-// Registers the `is`-guard alternatives of the then-narrows `tnNames`/`tnTys` that refine a
+// Registers the `is`-guard alternatives of the then-narrows `tnPlaces`/`tnTys` that refine a
 // hole: a new row goes to both `altRows` and `guardRows`, one a previous pass registered to
 // `guardRows` alone, since the guarded-return marking must fire on every pass.
 function ifNoteGuardAlts(
-  tnNames: string[],
+  tnPlaces: i32[],
   tnTys: i32[],
   altRows: i32[],
   guardRows: i32[],
 ) {
   let ai = 0
-  while ai < tnNames.length {
-    if !isPathKey(tnNames[ai]) {
-      const curIx = lookup(tnNames[ai])
-      if curIx >= 0 {
-        const cur = tyAt(curIx)
-        if cur is TyVar {
-          const row = noteHoleAlt(curIx, cur.tvName, tnTys[ai])
-          if row >= 0 {
-            altRows.push(row)
-            guardRows.push(row)
-          } else {
-            const seen = holeAltRowOf(cur.tvName, tnTys[ai])
-            if seen >= 0 { guardRows.push(seen) }
-          }
+  while ai < tnPlaces.length {
+    const curIx = placeNameTy(tnPlaces[ai])
+    if curIx >= 0 {
+      const cur = tyAt(curIx)
+      if cur is TyVar {
+        const row = noteHoleAlt(curIx, cur.tvName, tnTys[ai])
+        if row >= 0 {
+          altRows.push(row)
+          guardRows.push(row)
+        } else {
+          const seen = holeAltRowOf(cur.tvName, tnTys[ai])
+          if seen >= 0 { guardRows.push(seen) }
         }
       }
     }
@@ -831,18 +828,18 @@ function ifDaArmDelta(daFork: i32, adds: i32[], rems: i32[]) {
   0
 }
 
-// Enters the else arm of `n`: its else-narrows `enNames`/`enTys` in a fresh scope, the
+// Enters the else arm of `n`: its else-narrows `enPlaces`/`enTys` in a fresh scope, the
 // chain-link mark for an `else if`, and the return-tail position `ifTail`.
 function ifEnterElseArm(
   n: IfStmt,
   ifTail: boolean,
-  enNames: string[],
+  enPlaces: i32[],
   enTys: i32[],
 ) {
   if n.ifElse < 0 { return 0 }
-  if enNames.length > 0 {
+  if enPlaces.length > 0 {
     pushScope(-1)
-    applyNarrows(enNames, enTys)
+    applyNarrows(enPlaces, enTys)
   }
   // An `else if` chain: the else node's VALUE is its own branch join, since `blockTailTy`
   // holds only the innermost block's tail and under-joins a mixed chain.
@@ -855,12 +852,12 @@ function ifEnterElseArm(
 }
 
 // Checks the condition of `n`, refusing one that is not boolean, and collects the narrows it
-// makes in the then arm (`tnNames`/`tnTys`) and the else arm (`enNames`/`enTys`).
+// makes in the then arm (`tnPlaces`/`tnTys`) and the else arm (`enPlaces`/`enTys`).
 function ifCheckCondNarrows(
   n: IfStmt,
-  tnNames: string[],
+  tnPlaces: i32[],
   tnTys: i32[],
-  enNames: string[],
+  enPlaces: i32[],
   enTys: i32[],
 ) {
   const condTy = checkNodeHook(n.ifCond)
@@ -869,22 +866,22 @@ function ifCheckCondNarrows(
   }
   // Narrowing over a simple identifier: `is T` refines to the variant, `!= null`/`== null`
   // refine a nullable. Union-complement narrowing after `is T` is deliberately excluded — it missed real errors.
-  collectThenNarrows(n.ifCond, tnNames, tnTys)
-  collectElseNarrows(n.ifCond, enNames, enTys)
+  collectThenNarrows(n.ifCond, tnPlaces, tnTys)
+  collectElseNarrows(n.ifCond, enPlaces, enTys)
   0
 }
 
-// Enters the then arm of one link: its narrows `tnNames`/`tnTys` in a fresh scope and the
+// Enters the then arm of one link: its narrows `tnPlaces`/`tnTys` in a fresh scope and the
 // return-tail position `ifTail`. True when the last of `guardRows` now guards its returns.
 function ifEnterThenArm(
   ifTail: boolean,
-  tnNames: string[],
+  tnPlaces: i32[],
   tnTys: i32[],
   guardRows: i32[],
 ): boolean {
-  if tnNames.length > 0 {
+  if tnPlaces.length > 0 {
     pushScope(-1)
-    applyNarrows(tnNames, tnTys)
+    applyNarrows(tnPlaces, tnTys)
   }
   retTailPosSet(ifTail)
   // Every `return` under this branch is reached only by an argument satisfying the guard's
@@ -921,7 +918,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   pgUpArmIxSet(-1)
   const pgUpMark = pgUpKeys.length
   // What this `if`'s own subtree writes; read by the post-guard leg below (D1736).
-  const clobMark = narClobKeys.length
+  const clobMark = narClobPlace.length
   // Where its places stood on entry, for a key the join first meets inside an arm (`narHeadTy`).
   const ipMark = narIpAt.length
   const headDepth = T.frames.length
@@ -935,18 +932,18 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   const seedLogMark = inferRetLogTy.length
   const seedObsMark = inferObserved
   const seedObsLit = inferObservedLit
-  const tnNames: string[] = []
+  const tnPlaces: i32[] = []
   const tnTys: i32[] = []
-  const enNames: string[] = []
+  const enPlaces: i32[] = []
   const enTys: i32[] = []
   const rwD0 = T.diags.length
-  ifCheckCondNarrows(n, tnNames, tnTys, enNames, enTys)
+  ifCheckCondNarrows(n, tnPlaces, tnTys, enPlaces, enTys)
   // An elaboration marks the arm of a test its instance makes dead.
   const rwDead = elabCapLive() && T.diags.length > rwD0
   // What each tested place held on entry, before either arm's fact: the arm join's start for a
   // path that carries no fact of its own.
-  const tnEnt = narKeysNowTys(tnNames)
-  const enEnt = narKeysNowTys(enNames)
+  const tnEnt = narKeysNowTys(tnPlaces)
+  const enEnt = narKeysNowTys(enPlaces)
   // Definite-assignment fork/join: each branch forks off the if-entry state and they join
   // after — assigned only if assigned on every surviving path; a diverging branch contributes nothing.
   const daFork = daMark()
@@ -956,17 +953,17 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // The rows this guard tests, including ones a previous pass already registered — the
   // guarded-return marking must fire on every pass, since the real pass witnesses the call site.
   const guardRows: i32[] = []
-  ifNoteGuardAlts(tnNames, tnTys, altRows, guardRows)
-  const guardedRet = ifEnterThenArm(ifTail, tnNames, tnTys, guardRows)
+  ifNoteGuardAlts(tnPlaces, tnTys, altRows, guardRows)
+  const guardedRet = ifEnterThenArm(ifTail, tnPlaces, tnTys, guardRows)
   // The arm's OWN statement depth: its block pushes one scope, so a write recorded at exactly
   // this depth runs whenever the arm does and a deeper one is conditional (D1846).
   const thenOwnDepth = T.frames.length + 1
-  const thenLo = narClobKeys.length
+  const thenLo = narClobPlace.length
   const thenIpLo = narIpAt.length
   const rwOuter = rwDead && elabCapDeadEnter()
   ifCheckThenBody(n, ix)
   if rwDead { elabCapDeadLeave(rwOuter, rwD0) }
-  const thenHi = narClobKeys.length
+  const thenHi = narClobPlace.length
   // The guard-clause divergence test, asked once the arm is checked so a `never` call in it is
   // marked (D1972): the post-guard leg, the `else if` hand-up and the emitter's
   // `pushPostGuardNarrow` all ask the same predicate.
@@ -975,7 +972,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   retTailPosSet(false)
   const thenTy = blockTailTy
   const thenIx = blockTailIx
-  if tnNames.length > 0 { popScope() }
+  if tnPlaces.length > 0 { popScope() }
   // No path reaches the else arm, or the code after a then arm that exits, through the then
   // arm: what it retired in place is lifted, and the tail restores it for a fall-through (D6690).
   let thenUndoLo = -1
@@ -1003,9 +1000,9 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   let elseLo = 0
   const daHasElse = n.ifElse >= 0
   if daHasElse {
-    ifEnterElseArm(n, ifTail, enNames, enTys)
+    ifEnterElseArm(n, ifTail, enPlaces, enTys)
     elseOwnDepth = T.frames.length + 1
-    elseLo = narClobKeys.length
+    elseLo = narClobPlace.length
   }
   return {
     ifIx: ix,
@@ -1021,10 +1018,10 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
     seedObsMark: seedObsMark,
     seedObsLit: seedObsLit,
     thenExits: thenExits,
-    tnNames: tnNames,
+    tnPlaces: tnPlaces,
     tnTys: tnTys,
     tnEnt: tnEnt,
-    enNames: enNames,
+    enPlaces: enPlaces,
     enTys: enTys,
     enEnt: enEnt,
     altRows: altRows,
@@ -1228,12 +1225,12 @@ export function checkWhileStmtNode(n: WhileStmt, ix: i32) {
   // the condition proves, for a property path as much as a bare name and an `is T` pin as much
   // as a null strip. What could falsify a path fact mid-body retires it: a write through
   // `retireNarrowingsForWrite`, a call through `noteCallInvalidations` (D1736, D1845).
-  const wnNames: string[] = []
+  const wnPlaces: i32[] = []
   const wnTys: i32[] = []
-  collectThenNarrows(n.whileCond, wnNames, wnTys)
-  if wnNames.length > 0 {
+  collectThenNarrows(n.whileCond, wnPlaces, wnTys)
+  if wnPlaces.length > 0 {
     pushScope(-1)
-    applyNarrows(wnNames, wnTys)
+    applyNarrows(wnPlaces, wnTys)
   }
   const blk = n.whileBlk == 1
   // A labelled block's tail is its value, so its body is discarded only when the block is.
@@ -1256,7 +1253,7 @@ export function checkWhileStmtNode(n: WhileStmt, ix: i32) {
     }
   }
   const res = lpPopResult(ix, tailTy, tailIx, runsOut)
-  if wnNames.length > 0 { popScope() }
+  if wnPlaces.length > 0 { popScope() }
   popReBarrier()
   daRollbackTo(daLoopMark)
   daRelease(daLoopMark)
@@ -1402,8 +1399,8 @@ export function checkForInNode(n: ForIn, ix: i32) {
   efLeaf[ix] = -1
   if it is TyArray {
     const fk = elemOnlyKeyOf(n.fiIter)
-    if fk != "" { elemFactFor(ix, elemRecvPrefix(n.fiIter), fk) }
-    narrowFreshBinding(n.fiVar, ix)
+    if fk >= 0 { elemFactFor(ix, elemRecvPrefix(n.fiIter), fk) }
+    narrowFreshBinding(n.fiDecl1, n.fiVar, ix)
   }
   if n.fiVar2 != "" {
     declareDecl(n.fiDecl2, n.fiVar2, elem2Ty)
