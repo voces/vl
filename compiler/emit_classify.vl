@@ -561,7 +561,6 @@ import {
   retMapInFlight,
   retNulMapFlag,
   retNulRefIndex,
-  retNulVariantFlag,
   retStructRowIndex,
   structIdxOfElemName,
   tailSelfFnIx,
@@ -974,7 +973,6 @@ import {
 import {
   annRowOfNode,
   declaredNulRef,
-  declaredNulVariant,
   isUNameAnnAB,
   mapShapeOfTyPeeled,
   mvShapeOfMapHeldTy,
@@ -1761,13 +1759,15 @@ export function letIsNulVariant(letIx: i32, fnIx: i32) {
 }
 
 // The variant-table index a `Circle | null` binding's `(ref null $uVarHeap[vi])` cell
-// resolves to, or -1 — the `nulvariant` twin of `nulRefStructIdxOfLet`.
+// resolves to, or -1 — the `nulvariant` twin of `nulRefStructIdxOfLet`. A value-union
+// annotation boxes the init at the store, so it holds no niche whatever the init is (D1721).
 export function nulVariantIdxOfLet(letIx: i32, fnIx: i32) {
   const d = nodeAt(letIx)
   if d is LetDecl {
     if d.letType >= 0 {
       const a = nulVariantIndexOf(d.letType)
       if a >= 0 { return a }
+      if letAnnIsUnion(letIx) { return -1 }
     }
     return nulVariantIdxOfExpr(d.letInit, fnIx)
   }
@@ -1792,28 +1792,27 @@ function capturedVariantIndex(fnIx: i32, name: string) {
   capturedCompanionSlot(fnIx, name)
 }
 
-// The variant index behind a nullable-variant expression, or -1 — the initializer half of
-// `nulVariantIdxOfLet` and the index twin of `exprNullableVariant`, arm for arm, each arm
-// reading the resolver that typed that storage class. The kind gate on every arm is the
-// contract: `cloRetValSlot` is polymorphic, so an ungated arm returns a row of another space.
-export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
+// The variant row of the `(ref null $uVarHeap[vi])` niche expression `exprIx` holds, or -1
+// when it holds none. The one producer of the nullable-variant kind and its row:
+// `exprNullableVariant` is this answer `>= 0`. Each arm reads the storage that typed the value,
+// so an arm and its layout twin in another position keep their own rows.
+export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return -1 }
   const e = nodeAt(exprIx)
   match e {
     Paren => {
       return nulVariantIdxOfExpr(e.parInner, fnIx)
     }
-    // The index half of `exprNullableVariant`'s if-expression rung (D1560) — the row comes
-    // from the arm that carries the rep, which is the arm the kind comes from.
+    // An if-expression whose arms join to one nullable rep (D1560): the row comes from the
+    // arm that carries the rep.
     IfStmt => {
+      const nlv = nulIfArmNullableValueIx(exprIx)
+      if nlv < 0 || nulVariantIdxOfExpr(nlv, fnIx) < 0 { return -1 }
       return nulVariantIdxOfExpr(ifRepArmValueIx(exprIx), fnIx)
     }
-    // The index half of the two map rungs in `exprNullableVariant` (D34) — a bare `m[k]` and
-    // an `m[k] ?? d` over an arm-valued map. Same slot and column, so the kind and its
-    // companion index come from one fact.
+    // A nullable variant-element list read (D851), then a bare `m[k]` over an arm-valued map
+    // (D34).
     Index => {
-      // The index half of the nullable variant-element list arm (D851) — same slot, same
-      // kind gate, the column that names the row.
       if exprRefArray(e.idxArr, fnIx) {
         const irls = refListSlotOfExpr(e.idxArr, fnIx)
         if irls >= 0 && irls < rlElemKindTbl.length {
@@ -1829,15 +1828,21 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
       if mri >= 0 { return mvValVariantOf(mri) }
     }
     BinExpr => {
+      // An assignment's value is its target cell (D2603).
+      if e.binOp == "=" {
+        const ar = asgReadNode(exprIx, fnIx)
+        if ar != exprIx { return nulVariantIdxOfExpr(ar, fnIx) }
+      }
+      // `m[k] ?? d` over an arm-valued map stays the niche only while `d` can be null.
       const cri = coalesceMvSlot(exprIx, fnIx)
-      if cri >= 0 { return mvValVariantOf(cri) }
-      // The index half of `exprNullableVariant`'s `??` rung: the left niche's row.
-      if e.binOp == "??" {
-        if !coalesceResultIsBox(exprIx) {
-          if exprNullableVariant(e.binLeft, fnIx) {
-            return nulVariantIdxOfExpr(e.binLeft, fnIx)
-          }
-        }
+      if cri >= 0 {
+        if !coalesceStaysNullable(exprIx, cri, fnIx) { return -1 }
+        return mvValVariantOf(cri)
+      }
+      // A same-arm `p ?? q` stays the left niche while its default is nullable (D2373).
+      if e.binOp == "??" && !coalesceResultIsBox(exprIx) {
+        const lv = nulVariantIdxOfExpr(e.binLeft, fnIx)
+        if lv >= 0 && coalesceDefaultNullable(e.binRight, fnIx) { return lv }
       }
     }
     AsExpr => {
@@ -1876,6 +1881,14 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
       return popArmElemVariantRow(exprIx, fnIx)
     }
     Ident => {
+      // A parameter read typed `Circle | null`.
+      if (
+        paramNulVariant(fnIx, e.identName)
+        && paramReadAt(fnIx, e.identName, exprIx)
+      ) {
+        const pa = nulVariantIndexOf(paramTypeNodeAt(fnIx, e.identName, exprIx))
+        if pa >= 0 { return pa }
+      }
       // A declared local carries its variant index in the slot's parallel column, put there
       // by the `declareLocals` ladder — read it back rather than re-deriving from the
       // annotation, which an inferred binding (`const c = x as? Circle`) does not have.
@@ -1883,18 +1896,12 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
       if dsl >= 0 {
         if localIsRef[dsl] == "nulvariant" { return localStructIdx[dsl] }
       }
-      const pt = paramTypeNodeAt(fnIx, e.identName, exprIx)
-      if pt >= 0 {
-        const pa = nulVariantIndexOf(pt)
-        if pa >= 0 { return pa }
-      }
       // The capture arm of the twin: a `Circle | null` cell read from an enclosing frame's
       // env is the same `(ref null $uVarHeap[vi])` niche.
       const cnv = capturedNulVariantIdx(fnIx, e.identName)
       if cnv >= 0 { return cnv }
-      // The row half of the kind above, from the same let-level resolver: annotation first,
-      // then the initializer, so an annotated global whose niche comes from its init still
-      // names its row (D1672).
+      // A global: annotation first, then the initializer, so an annotated global whose niche
+      // comes from its init still names its row (D1672).
       const gi = globalLetOfIn(fnIx, e.identName, exprIx)
       if gi >= 0 { return nulVariantIdxOfLet(gi, -1) }
       // The frame's own `let`, and the module frame's, last for the reason the rung above them
@@ -12114,162 +12121,11 @@ function asgCellOf(ix: i32, fnIx: i32): i32 {
   -1
 }
 
-// Expression `exprIx` is a nullable union variant — the variant twin of
-// `exprNullableStruct`, kept strict and separate rather than folded into its struct twin,
-// since the two kinds index different heap tables (`uVarHeap` vs `sHeapIdx`). A caller
-// deciding a kind must tell them apart; a null test wants `exprNullableRefNiche` instead.
-export function exprNullableVariant(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  const e = nodeAt(exprIx)
-  match e {
-    Paren => {
-      return exprNullableVariant(e.parInner, fnIx)
-    }
-    // An assignment's value is its target cell, as for `exprNullableStruct` (D2603).
-    BinExpr => {
-      if e.binOp == "=" {
-        const ar = asgReadNode(exprIx, fnIx)
-        if ar != exprIx { return exprNullableVariant(ar, fnIx) }
-      }
-    }
-    // Every other expression is resolved by the rungs below.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  // An if-expression whose arm is itself nullable (`nulIfArmNullableValueIx`, D1560):
-  // without this rung, both faces of an if over an `Arm | null`-returning call floored on
-  // "no interned shape", since the struct fallback claimed a value whose heap lives in
-  // `uVarHeap`.
-  const nlIfV = nulIfArmNullableValueIx(exprIx)
-  if nlIfV >= 0 {
-    if exprNullableVariant(nlIfV, fnIx) { return true }
-  }
-  match e {
-    AsExpr => {
-      return retNulVariantFlag(exprIx) == 1
-    }
-    BinExpr => {
-      // The `??` rung its struct twin has: a same-arm `p ?? q` over the niche stays the niche while
-      // its default is nullable, so a box it is delivered into tests it for null (D2373).
-      if e.binOp == "??" {
-        if coalesceMvSlot(exprIx, fnIx) < 0 && !coalesceResultIsBox(exprIx) {
-          if exprNullableVariant(e.binLeft, fnIx) {
-            return coalesceDefaultNullable(e.binRight, fnIx)
-          }
-        }
-      }
-      // The `m[k] ?? d` dual, gated by the SAME helper the struct twin gates its own with, so
-      // the two cannot disagree about when a coalesce keeps the niche.
-      const crv = coalesceMvSlot(exprIx, fnIx)
-      if crv >= 0 {
-        return mvValVariantOf(crv) >= 0
-          && coalesceStaysNullable(exprIx, crv, fnIx)
-      }
-    }
-    Call => {
-      if e.callFn < 0 { return false }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        // The direct call of a top-level function — the `nulvariant` twin of `fnRetNulRefSid`,
-        // asked of both the stored kind and the callee's annotation. The annotation is
-        // load-bearing: `fRetKind` is seeded before `collectU` fills the variant table, so
-        // `variantIndexOf` answers -1 there and the stored kind is stale for a variant return.
-        const nvfe = fnIndexOfNode(e.callFn)
-        if nvfe >= 0 {
-          if repOfFnSlot(nvfe).rdKind == "nulvariant" { return true }
-          if nvfe < fnStmts.length {
-            const nvfn = nodeAt(fnStmts[nvfe])
-            if nvfn is FuncDecl {
-              if nvfn.fnRet >= 0 {
-                if retNulVariantFlag(nvfn.fnRet) == 1 { return true }
-              }
-            }
-          }
-        }
-        if (
-          calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn)
-          == "nulvariant"
-        ) {
-          return true
-        }
-      }
-      if callee is Member {
-        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "nulvariant" }
-      }
-      return popArmElemVariantRow(exprIx, fnIx) >= 0
-    }
-    Ident => {
-      if (
-        paramNulVariant(fnIx, e.identName)
-        && paramReadAt(fnIx, e.identName, exprIx)
-      ) {
-        return true
-      }
-      if declaredNulVariant(e.identName) { return true }
-      if capturedKindOf(fnIx, e.identName) == "nulvariant" { return true }
-      // The predicate the CELL takes its kind from, both faces: an annotated global whose
-      // annotation names the non-null arm still holds the niche when its initializer is one,
-      // and reading the annotation alone here makes the kind and its reader disagree (D1672).
-      // The struct twin asks `letIsNulRef` of the global for that reason.
-      const gi = globalLetOfIn(fnIx, e.identName, exprIx)
-      if gi >= 0 { return letIsNulVariant(gi, -1) }
-      // The frame's own `let` and the module frame's, arm for arm with `nulVariantIdxOfExpr`'s
-      // legs: a kind without its row is `ref valtype with no interned shape`, so the two land
-      // together (D21). Neither storage class is a global, and the declared-locals table that
-      // would answer speaks only while that frame's body is emitted (D1635).
-      const fli = frameLetOf(fnIx, e.identName, exprIx)
-      if fli >= 0 { return nulVariantOfLetIn(fli, fnIx) }
-      const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
-      if mli >= 0 { return nulVariantOfLetIn(mli, -1) }
-      return false
-    }
-    Member => {
-      // A nested-shape field read whose target is a union arm — the arm this twin never had,
-      // and the reason an un-annotated rebind off such a field bound the struct niche over a
-      // variant heap (D1112). Same code-15 storage the struct twin's `Member` arm classifies
-      // nullable; `memberNulVariantRow` is the one reader of which table owns the target.
-      return memberNulVariantRow(exprIx, fnIx) >= 0
-    }
-    Index => {
-      // An index into a `(Circle | null)[]` whose arm is a union member (D851) — the
-      // nullable twin of `exprVariantIndex`'s own `Index` arm. `refArrShapeKind` interns such
-      // a list kind 1, so both niche classifiers see the same slot; `rlElemVariantRow` says
-      // which table owns the element. Without it an un-annotated binding fell to the struct twin, which has no row for a union arm.
-      if exprRefArray(e.idxArr, fnIx) {
-        // The SAME slot guard the struct twin carries, for the same reason: a narrowed
-        // union-arm rebind receiver classifies `exprRefArray` true with no slot.
-        const nrls = refListSlotOfExpr(e.idxArr, fnIx)
-        if nrls >= 0 && nrls < rlElemKindTbl.length {
-          if rlElemKindTbl[nrls] == RLK_STRUCT {
-            if rlElemVariantRow(nrls) >= 0 {
-              if rlElemIsNulNiche(nrls) { return true }
-            }
-          }
-        }
-      }
-      // A bare `m[k]` over an arm-valued map is `Circle | null` — the vals slot is `(ref null
-      // $uVarHeap[vi])`, unrecovered by the get. This twin lacked the map-read rung
-      // `exprNullableStruct`'s own `Index` arm has (D34): without it, a binding off such a read
-      // bound the struct niche over a variant heap and the narrowed field read floored.
-      const mrv = mapReadMvSlot(exprIx, fnIx)
-      if mrv >= 0 { return mvValVariantOf(mrv) >= 0 }
-    }
-    // No other expression is a nullable variant.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
-}
-
-// Whether a `LetDecl` binds the nullable-variant niche, read in the frame `ownerIx` that
-// owns it — the annotation, else the initializer. The kind half of `nulVariantIdxOfLetIn`,
-// so a frame `let` and a module-frame `let` answer the pair from one ladder.
-function nulVariantOfLetIn(letIx: i32, ownerIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return retNulVariantFlag(d.letType) == 1 }
-    return exprNullableVariant(d.letInit, ownerIx)
-  }
-  false
+// Expression `exprIx` is a nullable union variant: it holds a `(ref null $uVarHeap[vi])`
+// niche, which is `nulVariantIdxOfExpr` naming its row. Strict beside `exprNullableStruct`,
+// since the two kinds index different heap tables; a null test wants `exprNullableRefNiche`.
+export function exprNullableVariant(exprIx: i32, fnIx: i32): boolean {
+  nulVariantIdxOfExpr(exprIx, fnIx) >= 0
 }
 
 // Expression `exprIx` is a nullable ref niche — a nullable struct (kind 9) or a nullable
