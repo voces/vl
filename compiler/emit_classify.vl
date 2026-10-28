@@ -407,7 +407,6 @@ import {
   fnHasParamSid,
   fnInMonoInstance,
   frameLetOf,
-  frameLetOfLive,
   globalIndexOf,
   inferredRetKindCore,
   paramNulMap,
@@ -526,8 +525,6 @@ import {
   globalLetOf,
   globalLetOfSid,
   ifJoinTypedAtom,
-  lixFirstOf,
-  lixNextOf,
   maskNarrowFor,
   narrowElseHold,
   narrowElseLift,
@@ -1668,7 +1665,12 @@ export function identBoundAt(fnIx: i32, sid: i32, atIx: i32) {
     // A `let` in a block the read is outside does not hide the global (D3294).
     const r = bodyReadLet(fnb.fnBody, sid, atIx)
     if r != PL_READ_UNPLACED { return r >= 0 }
-    return frameLetOfLive(fnb.fnBody, name) >= 0
+    // Elsewhere the read's own declaration says whether it is the frame's or the global.
+    if atIx < 0 || sidOfNode(atIx) != sid { return false }
+    const d = identDeclOf(atIx)
+    return d >= 0
+      && globalLetOfSid(sid) != d
+      && declOrigOf(d) != globalLetOfSid(sid)
   }
   false
 }
@@ -1897,10 +1899,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
     }
     Ident => {
       // A parameter read typed `Circle | null`.
-      if (
-        paramNulVariant(fnIx, e.identName)
-        && paramReadAt(fnIx, e.identName, exprIx)
-      ) {
+      if (paramNulVariant(fnIx, e.identName) && paramReadAt(fnIx, exprIx)) {
         const pa = nulVariantIndexOf(paramTypeNodeAt(fnIx, e.identName, exprIx))
         if pa >= 0 { return pa }
       }
@@ -2532,11 +2531,7 @@ export function mapRetExprShape(rx: i32, fe: i32) {
     let li = -1
     const fn = nodeAt(fnIx)
     if fn is FuncDecl { li = bodyLetReadAt(fn.fnBody, e.identName, u) }
-    if (
-      li < 0
-      && paramMap(fnIx, e.identName)
-      && paramReadAt(fnIx, e.identName, u)
-    ) {
+    if (li < 0 && paramMap(fnIx, e.identName) && paramReadAt(fnIx, u)) {
       return paramMapShape(fnIx, e.identName)
     }
     if li >= 0 {
@@ -5062,7 +5057,8 @@ export function localIndexOf(fnIx: i32, ix: i32) {
 }
 
 // The wasm local index frame `fnIx` keeps capture `name` of a function it calls or closes over
-// in, or -1. `name` comes from `captureNamesOf` alone: a capture list holds names, not reads.
+// in, or -1. `name` comes from `captureNamesOf` alone: a capture list holds names, not reads,
+// so this is a named floor until the list carries declarations (D14575).
 export function captureHomeOf(fnIx: i32, name: string) {
   const scoped = scopeSlotOf(name)
   if scoped >= 0 { return declaredIndexAt(fnIx, scoped) }
@@ -11180,14 +11176,14 @@ export function fnReturnsLitAtom(fnIx: i32): boolean {
 // The `LetDecl` a name read resolves to in frame `fnIx`, or -1 when it resolves to anything
 // else. A monomorphized instance's read names the generic's declaration, so the frame's own copy
 // is the slot collected for it, or the frame's binding of the name when the frame is not emitting.
-function readLetDeclOf(name: string, exprIx: i32, fnIx: i32): i32 {
+export function readLetDeclOf(name: string, exprIx: i32, fnIx: i32): i32 {
   const u = unwrapParen(exprIx)
   const d = identDeclOf(u)
   if d < 0 || d >= P.nodes.length { return -1 }
   if !(nodeAt(d) is LetDecl) { return -1 }
   if fnIx < 0 || globalLetOfSid(sidLookup(name)) == d { return d }
   if fnIx == emitCurFnIx {
-    const s = declSlotOfLet(name, d)
+    const s = declaredSlotOf(u)
     if s >= 0 { return localDeclIx[s] }
     return d
   }
@@ -11233,26 +11229,6 @@ function frameDeclares(fnIx: i32, sid: i32, name: string, decl: i32): boolean {
   if parentLetOwnerOf(fn.fnBody, sid, decl) >= 0 { return true }
   const fl = parentLetOf(fn.fnBody, name)
   fl >= 0 && declOrigOf(fl) == decl
-}
-
-// The slot `collectLocals` gave declaration `decl` of `name`, or a copy minted from it, in the
-// frame being emitted; -1 when none is collected yet.
-function declSlotOfLet(name: string, decl: i32): i32 {
-  const s = scopeSlotOf(name)
-  if s >= 0 && slotHoldsDecl(s, decl) { return s }
-  let pos = lixFirstOf(name)
-  while pos >= 0 {
-    if slotHoldsDecl(pos, decl) { return pos }
-    pos = lixNextOf(pos)
-  }
-  -1
-}
-
-// True when slot `s` holds `decl` or a copy minted from it.
-function slotHoldsDecl(s: i32, decl: i32): boolean {
-  if s >= localDeclIx.length { return false }
-  const sd = localDeclIx[s]
-  sd >= 0 && (sd == decl || declOrigOf(sd) == decl)
 }
 
 // True if a name read `e` holds a literal-union atom: a capture, a `let` by the storage chosen
@@ -11499,10 +11475,7 @@ export function holeLitReadIsAtom(exprIx: i32, fnIx: i32, depth: i32): boolean {
   if ix < 0 { return false }
   const e = nodeAt(ix)
   if e is Ident {
-    if (
-      paramIndexOf(fnIx, e.identName) >= 0
-      && paramReadAt(fnIx, e.identName, ix)
-    ) {
+    if (paramIndexOf(fnIx, e.identName) >= 0 && paramReadAt(fnIx, ix)) {
       return false
     }
     const fn = nodeAt(fnIx)
@@ -11960,10 +11933,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
     return nodeTyIsObj(exprIx)
   }
   if e is Ident {
-    if (
-      paramStruct(fnIx, e.identName)
-      && paramReadAt(fnIx, e.identName, exprIx)
-    ) {
+    if (paramStruct(fnIx, e.identName) && paramReadAt(fnIx, exprIx)) {
       return true
     }
     if declaredStruct(exprIx) { return true }
@@ -12308,7 +12278,7 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     }
     Ident => {
       const pvi = paramVariantIndex(fnIx, e.identName)
-      if pvi >= 0 && paramReadAt(fnIx, e.identName, exprIx) { return pvi }
+      if pvi >= 0 && paramReadAt(fnIx, exprIx) { return pvi }
       const dvi = declaredVariantIndex(exprIx)
       if dvi >= 0 { return dvi }
       // The capture leg — the fourth storage class this ladder lacked while its
@@ -12843,7 +12813,7 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
 // or the frame's own `let`. -1 when the binding is not a struct, or is a variant.
 function structIndexOfIdentExpr(e: Ident, exprIx: i32, fnIx: i32): i32 {
   const pi = paramStructIndex(fnIx, e.identName)
-  if pi >= 0 && paramReadAt(fnIx, e.identName, exprIx) { return pi }
+  if pi >= 0 && paramReadAt(fnIx, exprIx) { return pi }
   if !identReadsGlobal(sidOfNode(exprIx), exprIx) {
     const di = declaredStructIndex(exprIx)
     if di >= 0 { return di }
@@ -13322,9 +13292,7 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // this way reads unboxed to the map struct, but `exprUnion` keeps answering true for it,
   // so `emitUnionCoerce` hands the unboxed map to a destination typed at the union —
   // invalid wasm at six delivery positions.
-  if paramUnion(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
-    return true
-  }
+  if paramUnion(fnIx, e.identName) && paramReadAt(fnIx, exprIx) { return true }
   if declaredUnion(exprIx) { return true }
   if fnIx < 0 && cnModLoopIterOf(e.identName) >= 0 { return true }
   // A CAPTURED union box (`const a: C | D = …; () => … a is C …`): the env field is the union
@@ -15473,17 +15441,14 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   }
   // A nulreflist param's inner ref-list element name is the ref-array's element (the
   // `| null`-stripped annotation), so `refListSlotOfExpr` resolves the narrowed inner wrapper.
-  if (
-    paramNulRefArray(fnIx, e.identName)
-    && paramReadAt(fnIx, e.identName, exprIx)
-  ) {
+  if (paramNulRefArray(fnIx, e.identName) && paramReadAt(fnIx, exprIx)) {
     // Asked of the annotation's type: a monomorphized instance's grouped spelling
     // `(i32[][]|null)` is still a nullable ref array there.
     const pn18 = paramTypeNodeAt(fnIx, e.identName, exprIx)
     if annNulRefArrSlot(pn18) >= 0 { return refListElemNameOfNodeTy(pn18) }
   }
   const pn = paramRefArrayName(fnIx, e.identName)
-  if pn != "" && paramReadAt(fnIx, e.identName, exprIx) { return pn }
+  if pn != "" && paramReadAt(fnIx, exprIx) { return pn }
   const dn = if rdg { "" } else { declaredRefArrayName(exprIx) }
   if dn != "" { return dn }
   // A captured ref-array's element name is the `rlElemName` of the slot the env field is
@@ -16709,7 +16674,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       // A union binding narrowed to a map arm unboxes to the map struct ref, so it is a map in
       // the narrowed branch — checked first, ahead of its declared type.
       if identReadContainerAt(exprIx, fnIx) == RC_MAP { return true }
-      if paramMap(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
+      if paramMap(fnIx, e.identName) && paramReadAt(fnIx, exprIx) {
         return true
       }
       const gmr = identReadsGlobal(sidOfNode(exprIx), exprIx)
@@ -16994,7 +16959,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     }
     // A map param's shape is its annotation's value type — so the body's map ops resolve
     // the param's value type, not the mono i32 assumption a bare -1 would force.
-    if paramMap(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
+    if paramMap(fnIx, e.identName) && paramReadAt(fnIx, exprIx) {
       return paramMapShape(fnIx, e.identName)
     }
     // A nullable map binding narrowed non-null — its shape is the `| null`-stripped value
@@ -17004,10 +16969,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       if nslot >= 0 { return localStructIdx[nslot] }
       return -1
     }
-    if (
-      paramNulMap(fnIx, e.identName)
-      && paramReadAt(fnIx, e.identName, exprIx)
-    ) {
+    if (paramNulMap(fnIx, e.identName) && paramReadAt(fnIx, exprIx)) {
       return paramMapShape(fnIx, e.identName)
     }
     // A captured map variable resolves its shape from the parent frame's binding — both a
@@ -17313,10 +17275,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
       // reads the CHECKER's type, which a hole-armed join records as one arm's; the slot is the
       // rep, so where the two disagree about a binding the emitter itself sized, it wins (D1728).
       if uk != -3 && !declaredString(exprIx) { return uk == 2 }
-      if (
-        paramString(fnIx, e.identName)
-        && paramReadAt(fnIx, e.identName, exprIx)
-      ) {
+      if (paramString(fnIx, e.identName) && paramReadAt(fnIx, exprIx)) {
         return true
       }
       if declaredString(exprIx) { return true }

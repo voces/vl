@@ -226,7 +226,6 @@ import {
   ba8Used,
   bankSpanRow,
   bl8TypeIdx,
-  blockLetHidden,
   bodyRebuiltFrom,
   caMvMark,
   caResumeArmed,
@@ -444,7 +443,6 @@ import {
   lTypeIdx,
   lUsed,
   liftWbEnd,
-  localBlockLet,
   localByNode,
   localDeclIx,
   localIsRef,
@@ -805,7 +803,6 @@ import {
   typeDeclNameIxReset,
 } from "./emit_shape_rows"
 import { iisReset } from "./emit_shape_intern"
-import { frameHasBlockLetOverGlobal } from "./emit_struct_order"
 import { restoreNarrow } from "./emit_ty_canon"
 import { typeOrderReset, typeOrderRun } from "./emit_type_order"
 import {
@@ -1072,7 +1069,6 @@ function buildLocals(fnIx: i32) {
   localIsRef = []
   localStructIdx = []
   localLoopVar = []
-  localBlockLet = []
   localLoopIter = []
   localPairIter = []
   localDeclIx = []
@@ -1335,7 +1331,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32, ec: ExpCtx) {
     // `pushScratchBase`+0/+1/+2. Set before `emitStmts` so a `.push` can resolve its scratch
     // slots. One body walk (`blockPushPopBits`) classifies every `.push`/Member-`.pop` receiver once and yields all six kind flags together.
     resetFnScratchFlags()
-    frameScanRun(fnIx)
+    fnDetectScratch(fnIx)
     const nLocals = localNames.length
     // Union-box sink: reserve the shared tag/payload pair when this function's result is the box
     // and it has two or more exits (the return sink), or it binds a union box from an if-expression
@@ -2008,22 +2004,19 @@ function scanStashes(ix: i32, fnIx: i32) {
   if (hit & stashListGet) != 0 { fnUsesListGet = true }
 }
 
-// One scratch-detection sweep of user function `fnIx`'s body. Split from the resets in
-// `emitFuncCode` so `frameScanRun` can re-run it (D1597): every flag it touches is set and never
-// cleared, and every list it appends to dedupes, so the passes OR.
+// The scratch detection of user function `fnIx`'s body, after the resets in `emitFuncCode`.
 function fnDetectScratch(fnIx: i32) {
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     // Declaration-time address fold: a pure recount over `localDeclIx` (already built by
-    // `buildLocals` above), safe to repeat under `frameScanRun`'s re-run.
+    // `buildLocals` above).
     fnMemAddrFoldCount = maFoldCandidateCount(fnIx)
     // ONE body walk (`blockPushPopBits`) classifies every `.push`/Member-`.pop` receiver
     // once and yields all six kind flags together.
     applyPushPopBits(blockPushPopBits(fn.fnBody, fnIx))
     // The list-op scan leads because it also flips `fnUsesStrOp`, and every leg below it
     // asks a predicate whose only effect is a flag that is set and never cleared: a flag
-    // already true has no second answer to give, so its walk is skipped. That is also what
-    // keeps `frameScanRun`'s repeat to the facts a second sweep can still change. D1595.
+    // already true has no second answer to give, so its walk is skipped. D1595.
     leqScanBlock(fn.fnBody, fnIx)
     if !fnUsesStrOp {
       if fnHasStrOp(fnIx) { fnUsesStrOp = true }
@@ -2049,24 +2042,10 @@ function fnDetectScratch(fnIx: i32) {
   0
 }
 
-// Runs a frame's scratch detection (`fnIx < 0`: the start function). One sweep covers every
-// same-named local; a frame whose nested block binds a module global's name takes a second with
-// the block's slots hidden, for the name-keyed readers. Flags only set and lists dedupe, so the
-// extra sweep can only over-reserve. D1597.
-function frameScanRun(fnIx: i32) {
-  if fnIx < 0 { startFnDetectScratch() } else { fnDetectScratch(fnIx) }
-  if frameHasBlockLetOverGlobal() {
-    blockLetHidden = true
-    if fnIx < 0 { startFnDetectScratch() } else { fnDetectScratch(fnIx) }
-    blockLetHidden = false
-  }
-  0
-}
-
 // Clears every start-function scratch flag, then detects the frames its body needs over the
 // non-const global inits and the top-level statements — the start-fn analogue of
 // `emitFuncCode`'s per-function detection, setting the same `fnUses*` flags for the shared frame
-// layout. The resets live here, above `frameScanRun`, which may sweep twice.
+// layout.
 function startFnDetectFrames() {
   // The declaration-time address fold is scoped to a real `FuncDecl` frame
   // (`emitLetDeclStmt` declines it whenever `fnIx < 0`), so the start function always
@@ -2110,7 +2089,7 @@ function startFnDetectFrames() {
   fnListEqGKinds = []
   fnListEqGSlots = []
   fnUsesCloEq = false
-  frameScanRun(-1)
+  startFnDetectScratch()
   0
 }
 
@@ -2169,10 +2148,9 @@ function kidsYieldArmTail(b: i32): boolean {
   false
 }
 
-// One scratch-detection sweep of the start function. A `.push` is a statement-level void call,
-// never in an init value position, so an init's push frames are driven by Member-receiver
-// `.pop`s instead. Split from the resets in `startFnDetectFrames` so `frameScanRun` can re-run
-// it (D1597).
+// The scratch detection of the start function, after the resets in `startFnDetectFrames`. A
+// `.push` is a statement-level void call, never in an init value position, so an init's push
+// frames are driven by Member-receiver `.pop`s instead.
 function startFnDetectScratch() {
   let gi = swG0
   while gi < swG1 {
@@ -2308,7 +2286,6 @@ function collectStartLocals() {
   localIsRef = []
   localStructIdx = []
   localLoopVar = []
-  localBlockLet = []
   localLoopIter = []
   localPairIter = []
   localDeclIx = []
