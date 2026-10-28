@@ -65,7 +65,7 @@ import {
   opDeclOpOf,
 } from "./ast"
 import { symEnabled } from "./check_state"
-import { i32ListHas, strListAdd, strListHas, strListWith } from "./listutil"
+import { i32ListHas, strListHas, strListWith } from "./listutil"
 import { T, TyObj, tyAt, tyIsHole, tyReachesEmptyHole } from "./check_types"
 import { LIST_EVERY_STEP, keyHasPrefix, placeKeyOf } from "./check_places"
 import {
@@ -124,16 +124,20 @@ import {
   crOpOf,
   crwEnsure,
   crwFnHandle,
-  crwFnMentions,
   crwFns,
+  crwKeyText,
+  crwKeysMeet,
   crwMentionsAny,
   crwRoot,
+  crwUseKeyOf,
+  crwUseKeys,
   crwUseKinds,
-  crwUseNames,
   crwWrites,
   crwWritten,
 } from "./check_capture_walks"
-import { cwPeel, fnDeclIx } from "./check_write_scan"
+import { cwKeyOfDecl, cwPeel, fnDeclIx } from "./check_write_scan"
+import { memberDeclOf, sidLookup } from "./symbols"
+import { calleeNameOf } from "./check_callee"
 import { weUnresDrop } from "./check_write_effects"
 import { hdReadNullAsked, hdRowOf } from "./check_hole_pins"
 import { curFnDeclIx, inferQuiet } from "./check_cursor"
@@ -151,7 +155,6 @@ import {
   narDeclaredTy,
 } from "./check_nar_bank"
 import { SCOPE_EOF, symScopePush, symSpanPush } from "./check_sym_occ"
-import { calleeNameOf } from "./check_callee"
 import {
   crBindDepthOfSlot,
   crCallBenign,
@@ -739,7 +742,7 @@ function crInfoOf(s: i32): i32 {
   if hit is i32 { return hit }
   crwEnsure(root)
   let info = 0
-  const handles: string[] = []
+  const handles: i32[] = []
   const reach: boolean[] = []
   let any = false
   let j = 0
@@ -749,7 +752,7 @@ function crInfoOf(s: i32): i32 {
     reach.push(w)
     if w {
       any = true
-      if crwFnHandle[j] != "" { strListAdd(handles, crwFnHandle[j]) }
+      crHandleAdd(handles, crwFnHandle[j])
     }
     j = j + 1
   }
@@ -760,24 +763,22 @@ function crInfoOf(s: i32): i32 {
       changed = false
       let q = 0
       while q < crwFns.length {
-        if !reach[q] && crwMentionsAny(crwFnMentions[q], handles) {
+        if !reach[q] && crwMentionsAny(q, handles) {
           reach[q] = true
           changed = true
-          if crwFnHandle[q] != "" { strListAdd(handles, crwFnHandle[q]) }
+          crHandleAdd(handles, crwFnHandle[q])
         }
         q = q + 1
       }
     }
     let e = 0
     while e < crwFns.length && info == 1 {
-      if reach[e] && crwFnHandle[e] == "" { info = 2 }
+      if reach[e] && crwFnHandle[e] == -1 { info = 2 }
       e = e + 1
     }
     let u = 0
-    while u < crwUseNames.length && info == 1 {
-      if strListHas(handles, crwUseNames[u]) {
-        if crwUseKinds[u] == 0 { info = 2 }
-      }
+    while u < crwUseKeys.length && info == 1 {
+      if crwUseKinds[u] == 0 && crwKeysMeet(handles, crwUseKeys[u]) { info = 2 }
       u = u + 1
     }
   }
@@ -789,14 +790,22 @@ function crInfoOf(s: i32): i32 {
 
 const crNoInfo: {[i32]: i32} = Map()
 
-// The names the calls reaching a writer of slot `s` use, under the current root (`crInfoOf`).
-function crHandlesOf(s: i32): string[] {
-  const hm = crHandleMemo[crCurRoot()]
-  if hm == null { return crNoNames }
-  (hm ?? crNoHandles)[crSlotKey(s)] ?? crNoNames
+// Add binding key `h` to `hs` unless it is there or is no key.
+function crHandleAdd(hs: i32[], h: i32) {
+  if h != -1 && !i32ListHas(hs, h) { hs.push(h) }
+  0
 }
 
-const crNoHandles: {[i32]: string[]} = Map()
+// The keys of the bindings holding a function that can reach a writer of slot `s`, under the
+// current root (`crInfoOf`).
+function crHandlesOf(s: i32): i32[] {
+  const hm = crHandleMemo[crCurRoot()]
+  if hm == null { return crNoKeys }
+  (hm ?? crNoHandles)[crSlotKey(s)] ?? crNoKeys
+}
+
+const crNoKeys: i32[] = []
+const crNoHandles: {[i32]: i32[]} = Map()
 
 // The bare-name half of `callMayWrite`: the call names a function that can reach a writer of
 // slot `s`, or a writer escaped and the call is not one that provably runs none of it. An operator
@@ -861,22 +870,35 @@ function crOpIsReacher(op: string, s: i32): boolean {
   const hs = crHandlesOf(s)
   let i = 0
   while i < hs.length {
-    if hs[i] == op || opDeclOpOf(hs[i]) == op { return true }
+    const nm = crwKeyText(hs[i])
+    if nm == op || opDeclOpOf(nm) == op { return true }
     i = i + 1
   }
   false
 }
 
-// `crCallReaches` for a `Call`: its callee named by a reacher's name (bare or as a method), a
+// `crCallReaches` for a `Call`: its callee naming a reacher's binding (bare or as a method), a
 // function written in place and called at once, or an escape the call does not rule out.
 function crCallNodeReaches(cn: Call, callIx: i32, s: i32): boolean {
   const info = crInfoOf(s)
   if info == 0 { return false }
-  const hs = crHandlesOf(s)
-  const cname = calleeNameOf(callIx)
-  if cname != "?" && strListHas(hs, cname) { return true }
+  if crwKeysMeet(crHandlesOf(s), crCalleeKey(cn, callIx)) { return true }
   if cn.callFn >= 0 && nodeAt(cn.callFn) is FuncDecl { return true }
   info == 2 && !crCallBenign(cn, callIx, slotNameOf(s))
+}
+
+// The key of the binding the callee of call `callIx` names: a bare name's (`crwUseKeyOf`), or for
+// a method call the declaration its spelling recorded, else the key standing for every binding of
+// the method's name. -1 for a callee with no written name (`calleeNameOf`).
+function crCalleeKey(cn: Call, callIx: i32): i32 {
+  const nm = calleeNameOf(callIx)
+  if nm == "?" || cn.callFn < 0 { return -1 }
+  if nodeAt(cn.callFn) is Ident { return crwUseKeyOf(cn.callFn) }
+  const d = memberDeclOf(cn.callFn)
+  if d >= 0 { return cwKeyOfDecl(d) }
+  const sid = sidLookup(nm)
+  if sid < 0 { return -1 }
+  -2 - sid
 }
 
 // The type `name` reads at once every narrowing layer of the current function is gone, or -1
