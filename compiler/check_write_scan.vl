@@ -502,7 +502,8 @@ function cwIxNote(at: i32) {
         }
       }
     }
-    Param => {
+    // A parameter and a loop's variable bind where they stand, as a `let` does.
+    Param | ForRange | LoopVar => {
       cwIxOcc(sidOfNode(at), at, cwFrameOfDecl(at), CW_OCC_BIND)
     }
     OptMember => {
@@ -553,7 +554,7 @@ function cwIxNote(at: i32) {
       }
     }
     // no fact is filed for these kinds
-    CharLit | BoolLit | NullLit | ErrExpr | WhileStmt | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | AsExpr | ForRange | ImportDecl | LoopVar => {}
+    CharLit | BoolLit | NullLit | ErrExpr | WhileStmt | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | AsExpr | ImportDecl => {}
   }
   0
 }
@@ -648,19 +649,25 @@ export function cwOccWalkUse(p: i32): CwOccWalk {
 export function cwOccWalkAt(nm: string, fr: i32): CwOccWalk {
   const sid = sidLookup(nm)
   if fr == CW_FR_UNKNOWN { return cwOccWalkAll(sid) }
-  let key = -1
-  if cwDeclCap > 0 && sid >= 0 {
-    const s = cwDeclSlotOf(fr, sid)
-    if s >= 0 && s < cwDeclSlotSid.length {
-      if cwDeclSlotSid[s] == sid && cwDeclSlotFr[s] == fr {
-        key = cwDeclSlotRep[s]
-      }
-    }
+  cwOccWalkOf(cwDeclAt(nm, fr), sid)
+}
+
+// The first declaration frame `fr` files for `nm`, the one its rows are chained under; -1 when
+// it files none.
+function cwDeclAt(nm: string, fr: i32): i32 {
+  cwBuildFrames()
+  const sid = sidLookup(nm)
+  if fr == CW_FR_UNKNOWN || cwDeclCap == 0 || sid < 0 { return -1 }
+  const s = cwDeclSlotOf(fr, sid)
+  if s < 0 || s >= cwDeclSlotSid.length || s >= cwDeclSlotRep.length {
+    return -1
   }
-  cwOccWalkOf(key, sid)
+  if cwDeclSlotSid[s] != sid || cwDeclSlotFr[s] != fr { return -1 }
+  cwDeclSlotRep[s]
 }
 
 function cwOccWalkOf(key: i32, sid: i32): CwOccWalk {
+  cwIxBuild()
   cwIxDeclEnsure(sid)
   let a = -1
   if key >= 0 && key < cwIxDHead.length { a = cwIxDHead[key] }
@@ -671,6 +678,7 @@ function cwOccWalkOf(key: i32, sid: i32): CwOccWalk {
 }
 
 function cwOccWalkAll(sid: i32): CwOccWalk {
+  cwIxBuild()
   let a = -1
   if sid >= 0 && sid < cwIxHead.length { a = cwIxHead[sid] }
   const w: CwOccWalk = { a: a, u: -1, all: true, row: -1 }
@@ -1225,7 +1233,7 @@ export function cwBoundInitOf(nm: string, fr: i32): i32 {
 }
 
 function cwBoundInitScan(nm: string, fr: i32): i32 {
-  if !cwBoundOnce(nm, fr) { return -1 }
+  if !cwBoundOnce(cwOccWalkAt(nm, fr)) { return -1 }
   const ow = cwOccWalkAt(nm, fr)
   while cwOccNext(ow) {
     const r = ow.row
@@ -1255,20 +1263,6 @@ function cwSoleDecl(d: i32): i32 {
   -1
 }
 
-// The sole binder of the binding (`nm`, `fr`), read off its declaration row; -1 as above.
-function cwSoleBinderIn(nm: string, fr: i32): i32 {
-  if nm == "" { return -1 }
-  cwIxBuild()
-  const ow = cwOccWalkAt(nm, fr)
-  while cwOccNext(ow) {
-    const r = ow.row
-    if cwIxKind[r] == CW_OCC_BIND && cwIxFr[r] == fr {
-      return cwSoleDecl(cwIxNode[r])
-    }
-  }
-  -1
-}
-
 // Every function a call through the binding `nm` of frame `fr` may run: its initialiser and each
 // value assigned to it, where a parameter holds what every call of its function hands it. []
 // when one of them is not a named function or a lambda, or `fr` binds `nm` by another binder.
@@ -1295,7 +1289,7 @@ function cwFvTargetsOf(nm: string, fr: i32): i32[] {
 }
 
 // Add to `out` every value stored into the binding (`nm`, `fr`); false when one is unresolved
-// or the frame has a declaration of `nm` this index files no row for (a `for` variable).
+// or the frame declares `nm` by a loop or by a function, which store no value of their own.
 function cwFvCollect(nm: string, fr: i32, out: i32[]): boolean {
   const sid = sidLookup(nm)
   if sid < 0 { return false }
@@ -1634,7 +1628,7 @@ export function cwSlotWrittenValues(
     fr = covarRootFrame(up)
     steps = steps + 1
   }
-  const bd = cwSoleBinderIn(nm, fr)
+  const bd = cwSoleDecl(cwDeclAt(nm, fr))
   if bd < 0 { return -1 }
   const bn = nodeAt(bd)
   if !(bn is LetDecl) { return -1 }
@@ -1796,8 +1790,8 @@ function cwSplitPath(p: string): string[] {
 
 // The identifier the `let` (`nm`, `fr`) is bound once to when it names another `let`, or -1.
 function cwSlotAliasOf(nm: string, fr: i32): i32 {
-  const bd = cwSoleBinderIn(nm, fr)
-  if bd < 0 || bd >= P.nodes.length || !cwBoundOnce(nm, fr) { return -1 }
+  const bd = cwSoleDecl(cwDeclAt(nm, fr))
+  if bd < 0 || bd >= P.nodes.length || !cwBoundOnce(cwOccWalk(bd)) { return -1 }
   const bn = nodeAt(bd)
   if !(bn is LetDecl) { return -1 }
   const init = cwPeel(bn.letInit)
@@ -1812,7 +1806,7 @@ function cwSlotAliasOf(nm: string, fr: i32): i32 {
 // Whether a write through the alias (`nm`, `fr`) reaches the list or record it names:
 // a parameter, or a `let` bound once to another binding.
 function cwSlotHandle(nm: string, fr: i32): boolean {
-  const bd = cwSoleBinderIn(nm, fr)
+  const bd = cwSoleDecl(cwDeclAt(nm, fr))
   if bd < 0 || bd >= P.nodes.length { return false }
   if nodeAt(bd) is Param { return true }
   cwSlotAliasOf(nm, fr) >= 0
@@ -2345,7 +2339,7 @@ export function cwEscapeOwner(dst: i32): string {
   if rt < 0 { return "" }
   const onm = covarRootName(rt)
   if onm == "" { return "" }
-  if !cwBoundOnce(onm, covarRootFrame(rt)) { return "" }
+  if !cwBoundOnce(cwOccWalkUse(cwPeelValue(rt))) { return "" }
   onm
 }
 
@@ -2377,7 +2371,7 @@ function cwContainerAliases(
   let i = 0
   while i < names.length {
     // A name bound twice, or re-pointed, names two containers rather than one.
-    if cwBoundOnceSealed(names[i], frs[i]) < 1 { ok = false }
+    if cwBoundOnceSealed(cwOccWalkAt(names[i], frs[i])) < 1 { ok = false }
     // The set grows by at least one name per name visited or the walk ends, so the bound is
     // the number of names in the program; a surprise past it declines rather than hangs.
     if names.length > 256 { return false }
@@ -2556,7 +2550,7 @@ function cwLitOwners(
     const d = nodeAt(up)
     if d is LetDecl {
       const ofr = cwFrameOfDecl(up)
-      if !cwBoundOnce(d.letName, ofr) { return false }
+      if !cwBoundOnce(cwOccWalk(up)) { return false }
       names.push(d.letName)
       frs.push(ofr)
       paths.push(fld)
@@ -2705,22 +2699,25 @@ function cwHandleUpChain(u: i32, fld: string, out: i32[]) {
   0
 }
 
-// How usable is `nm` in frame `fr` as a container identity? 0 = not bound exactly once here,
-// or re-pointed by `bx = other`. 1 = a single binding. 2 = that, and every use of it projects
-// — a member read or an index — so the handles on what it holds are exactly the ones
-// `cwIsEscapedHandle` names. Per frame, not program-wide (D1610, D1628).
-function cwBoundOnceSealed(nm: string, fr: i32): i32 {
-  cwIxBuild()
+// How usable is the binding whose rows `ow` walks as a container identity? 0 = not bound
+// exactly once by a `let` or parameter, or re-pointed by `bx = other`. 1 = a single binding.
+// 2 = that, and every use projects, so its handles are the ones `cwIsEscapedHandle` names.
+// Per declaration, not program-wide (D1610).
+function cwBoundOnceSealed(ow: CwOccWalk): i32 {
   let binds = 0
   let uses = 0
   let proj = 0
   // Each projection has one object and each identifier one parent, so counting the two sides
   // is the same answer as marking them, and it fits the one chain walk.
-  const ow = cwOccWalkAt(nm, fr)
   while cwOccNext(ow) {
     const r = ow.row
     if cwIxKind[r] == CW_OCC_ASG { return 0 }
-    if cwIxKind[r] == CW_OCC_BIND { binds = binds + 1 }
+    if cwIxKind[r] == CW_OCC_BIND {
+      // A loop's variable is bound afresh each iteration, so it names no one container.
+      const bn = nodeAt(cwIxNode[r])
+      if !(bn is LetDecl) && !(bn is Param) { return 0 }
+      binds = binds + 1
+    }
     if cwIxKind[r] == CW_OCC_USE {
       uses = uses + 1
       if cwIxIsObj[cwIxNode[r]] == 1 { proj = proj + 1 }
@@ -2739,10 +2736,10 @@ export function cwIxChain(nm: string): i32 {
   cwIxHead[sid]
 }
 
-// Is `nm` bound exactly once in frame `fr`, and never assigned there? The guard that makes a
-// binding name usable as a container identity.
-export function cwBoundOnce(nm: string, fr: i32): boolean {
-  cwBoundOnceSealed(nm, fr) >= 1
+// Is the binding whose rows `ow` walks (`cwOccWalk`, `cwOccWalkUse`) bound exactly once and
+// never assigned? The guard that makes a binding usable as a container identity.
+export function cwBoundOnce(ow: CwOccWalk): boolean {
+  cwBoundOnceSealed(ow) >= 1
 }
 
 // Is `ix` a read of an escaped field (`<owner>.<f>` for a recorded pair)? Such a read is a
