@@ -33,7 +33,6 @@ import {
 import { nulRecListNominalName } from "./check_emit_queries"
 import {
   forInBindTy,
-  identModuleDeclOf,
   lvTyBool,
   lvTyNever,
   lvTyNull,
@@ -310,7 +309,7 @@ import {
   nodeTyMapValExcludesNull,
   nodeTyMapValIsLitUnion,
 } from "./check_hole_pins"
-import { opBinFnAtNode, opIdxFnAtNode } from "./check_callee"
+import { opDeclAtNode } from "./check_callee"
 import { mkDerivedHole } from "./check_coal"
 import { optFieldAtPin } from "./check_relate_core"
 import { nonNullNarrowTy } from "./check_type_shape"
@@ -1441,13 +1440,17 @@ function drwDispatches(ix: i32, name: string, argc: i32): boolean {
   drwSelfFnOf(name, argc) >= 0
 }
 
-// The callee member call `ix` dispatches to: the recorded declaration, else the function `name`.
-function drwSelfFnRef(ix: i32, name: string, argc: i32) {
-  const d = drwSelfDeclAt(ix, argc)
-  if d < 0 { return drwFnRef(name) }
+// The callee of member call `ix`: a minted reference to `d`, the declaration it dispatches to.
+function drwSelfFnRef(ix: i32, d: i32) {
+  const id = drwDeclRef(d)
+  nodeTyCarry(id, memberMethodOf(ix))
+  id
+}
+
+// A minted callee bound to declaration `d`.
+function drwDeclRef(d: i32) {
   const id = mkIdent(binderNameAt(d), -1)
   identFromDecl(id, d)
-  nodeTyCarry(id, memberMethodOf(ix))
   id
 }
 
@@ -1571,16 +1574,6 @@ function drwRecvIsTyParam(recvIx: i32, ctx: i32) {
 // Whether the rewrite left member call `callIx` to each instance (`drwRecvIsTyParam`).
 export function drwMemberDeferred(callIx: i32) {
   memberCallRungOf(callIx) == MC_RUNG_PER_INSTANCE
-}
-
-// A minted callee naming the module function `name`, resolved to its declaration.
-function drwFnRef(name: string) {
-  const id = mkIdent(name, -1)
-  let d = identModuleDeclOf(name)
-  if d < 0 { d = fnDeclNamed(name) }
-  if d < 0 && externLinkOf(name) >= 0 { d = IDENT_BUILTIN }
-  identFromDecl(id, d)
-  id
 }
 
 // `fnDeclNamed`'s index over the `fnStmts` prefix `fdnLen`: name to its one declaration, or -1
@@ -1771,15 +1764,14 @@ function drwFieldRowOf(recv: i32, ctx: i32, name: string): i32 {
 function drwWalkIndex(ix: i32, n: Index, ctx: i32): i32 {
   n.idxArr = drwWalk(n.idxArr, ctx)
   n.idxIndex = drwWalk(n.idxIndex, ctx)
-  // A free `"[]"` operator function: a direct call, resolved by the checker from
-  // the receiver's type and banked on this node — ahead of the closure-field trap
-  // below, mirroring the `a op b` arm's order.
-  const rOp = opIdxFnAtNode(ix)
-  if rOp != "" {
+  // A free `"[]"` operator function: a direct call of the declaration the checker resolved
+  // here — ahead of the closure-field trap below, mirroring the `a op b` arm's order.
+  const rOp = opDeclAtNode(ix)
+  if rOp >= 0 {
     const roargs: i32[] = []
     roargs.push(n.idxArr)
     roargs.push(n.idxIndex)
-    return drwOpCall(mkCall(drwFnRef(rOp), roargs, -1), ix)
+    return drwOpCall(mkCall(drwDeclRef(rOp), roargs, -1), ix)
   }
   // The index read trap: a struct receiver carrying a "[]" closure field.
   if drwFieldClosure(drwFieldRowOf(n.idxArr, ctx, "[]"), "[]") {
@@ -2001,6 +1993,16 @@ function drwWalkMemberCall(
     }
   }
   if ufcs {
+    // The checker records the declaration of every call it types as UFCS, so a call without
+    // one is not a UFCS call to the checker.
+    const ufcsDecl = drwSelfDeclAt(ix, args.length + 1)
+    if ufcsDecl < 0 {
+      emitFailAt(
+        "emitProgram: a member call dispatches with no recorded declaration",
+        ix,
+      )
+      return ix
+    }
     const recvIx = callee.memObj
     args.push(-1)
     let j = args.length - 1
@@ -2023,7 +2025,7 @@ function drwWalkMemberCall(
       }
       nm[0] = ""
     }
-    const ufcsFn = drwSelfFnRef(ix, uName, args.length)
+    const ufcsFn = drwSelfFnRef(ix, ufcsDecl)
     noteCallOrigin(ufcsFn, ix)
     n.callFn = ufcsFn
     arenaNoteRefWrite()
@@ -2043,16 +2045,15 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
       tgt.idxArr = drwWalk(tgt.idxArr, ctx)
       tgt.idxIndex = drwWalk(tgt.idxIndex, ctx)
       n.binRight = drwWalk(n.binRight, ctx)
-      // A free `"[]="` operator function: the checker resolved it by the receiver's
-      // type and banked it on this assignment node, so the rewrite never re-derives
-      // the choice.
-      const wOp = opIdxFnAtNode(ix)
-      if wOp != "" {
+      // A free `"[]="` operator function: a direct call of the declaration the checker
+      // resolved at this assignment node.
+      const wOp = opDeclAtNode(ix)
+      if wOp >= 0 {
         const woargs: i32[] = []
         woargs.push(tgt.idxArr)
         woargs.push(tgt.idxIndex)
         woargs.push(n.binRight)
-        return mkCall(drwFnRef(wOp), woargs, -1)
+        return mkCall(drwDeclRef(wOp), woargs, -1)
       }
       if drwFieldClosure(drwFieldRowOf(tgt.idxArr, ctx, "[]="), "[]=") {
         const wargs: i32[] = []
@@ -2171,16 +2172,15 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
   }
   if drwDispatchOp(n.binOp) {
     const osi = drwFieldRowOf(n.binLeft, ctx, n.binOp)
-    // The checker banked the receiver-keyed operator it resolved (`+@Vec3`); name that
-    // declaration directly — the `a op b` twin of the `"[]"` arm's `opIdxFnAtNode` read.
-    // Empty unless the left operand is a dispatched object, in which case an operator
+    // The declaration of the receiver-keyed operator the checker resolved here, as in the
+    // `"[]"` arm. Absent unless the left operand is a dispatched object, in which case an operator
     // closure field dispatches member-call style below (D1934).
-    const opFn = opBinFnAtNode(ix)
-    if opFn != "" {
+    const opFn = opDeclAtNode(ix)
+    if opFn >= 0 {
       const oargs: i32[] = []
       oargs.push(n.binLeft)
       oargs.push(n.binRight)
-      return drwOpCall(mkCall(drwFnRef(opFn), oargs, -1), ix)
+      return drwOpCall(mkCall(drwDeclRef(opFn), oargs, -1), ix)
     }
     if osi >= 0 {
       if drwFieldClosure(osi, n.binOp) {
@@ -2549,7 +2549,7 @@ function cpReReadable(ix: i32, ctx: i32): boolean {
   if u < 0 { return false }
   const e = nodeAt(u)
   if e is Index {
-    if opIdxFnAtNode(u) != "" { return false }
+    if opDeclAtNode(u) >= 0 { return false }
     if drwFieldClosure(drwFieldRowOf(e.idxArr, ctx, "[]"), "[]") {
       return false
     }
@@ -5221,7 +5221,9 @@ function synthExternValueFn(name: string, k: i32, pos: i32) {
   const rty = synthTypeRefTy(ret, pos, -1)
   const noTyParams: string[] = []
   // The minted nodes postdate the checker, so each carries the type its annotation names.
-  const call = mkCall(drwFnRef(name), args, pos)
+  const host = mkIdent(name, -1)
+  identFromDecl(host, IDENT_BUILTIN)
+  const call = mkCall(host, args, pos)
   recordNodeTyFrom(call, rty)
   const fe = mkFunc(
     name + "$extv",
