@@ -256,9 +256,6 @@ import {
   declSlotByNode,
   dfeCallee,
   dfeOn,
-  dupScanActive,
-  dupSlotBias,
-  dupSlotMore,
   emitCurFnIx,
   emitCurFnPos,
   emitCurStmtIx,
@@ -455,6 +452,7 @@ import {
   localLoopVar,
   localNames,
   localPairIter,
+  localSlotOfDecl,
   localStructIdx,
   localUnset,
   loopBrkDepth,
@@ -734,7 +732,6 @@ import {
   rsResetUseIx,
   setNarrowFromCond,
   setNarrowFromCondElse,
-  slotDeclAtoms,
 } from "./emit_classify"
 import { fnSigIdxOfFn, fnSigIsClosure } from "./emit_closure_sites"
 import { rowBoolI32Agree } from "./emit_field_codes"
@@ -808,16 +805,7 @@ import {
   typeDeclNameIxReset,
 } from "./emit_shape_rows"
 import { iisReset } from "./emit_shape_intern"
-import {
-  dupIndexReset,
-  dupMoreAt,
-  dupPassBegin,
-  dupPassClasses,
-  dupPassSeen,
-  dupScanIndex,
-  frameHasBlockLetOverGlobal,
-  frameHasDupLocalName,
-} from "./emit_struct_order"
+import { frameHasBlockLetOverGlobal } from "./emit_struct_order"
 import { restoreNarrow } from "./emit_ty_canon"
 import { typeOrderReset, typeOrderRun } from "./emit_type_order"
 import {
@@ -1088,6 +1076,7 @@ function buildLocals(fnIx: i32) {
   localLoopIter = []
   localPairIter = []
   localDeclIx = []
+  localSlotOfDecl = Map()
   localUnset = []
   localByNode = []
   declSlotByNode = Map()
@@ -1346,7 +1335,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32, ec: ExpCtx) {
     // `pushScratchBase`+0/+1/+2. Set before `emitStmts` so a `.push` can resolve its scratch
     // slots. One body walk (`blockPushPopBits`) classifies every `.push`/Member-`.pop` receiver once and yields all six kind flags together.
     resetFnScratchFlags()
-    dupScanRun(fnIx)
+    frameScanRun(fnIx)
     const nLocals = localNames.length
     // Union-box sink: reserve the shared tag/payload pair when this function's result is the box
     // and it has two or more exits (the return sink), or it binds a union box from an if-expression
@@ -2019,14 +2008,14 @@ function scanStashes(ix: i32, fnIx: i32) {
   if (hit & stashListGet) != 0 { fnUsesListGet = true }
 }
 
-// One scratch-detection sweep of user function `fnIx`'s body, at whatever same-named-slot bias
-// `dupScanRun` has set. Split from the resets in `emitFuncCode` so it can be re-run per
-// candidate binding of a shadowed name (D1595): every flag it touches is set and never cleared, and every list it appends to dedupes, so the passes OR.
+// One scratch-detection sweep of user function `fnIx`'s body. Split from the resets in
+// `emitFuncCode` so `frameScanRun` can re-run it (D1597): every flag it touches is set and never
+// cleared, and every list it appends to dedupes, so the passes OR.
 function fnDetectScratch(fnIx: i32) {
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     // Declaration-time address fold: a pure recount over `localDeclIx` (already built by
-    // `buildLocals` above), safe to repeat under `dupScanRun`'s re-run.
+    // `buildLocals` above), safe to repeat under `frameScanRun`'s re-run.
     fnMemAddrFoldCount = maFoldCandidateCount(fnIx)
     // ONE body walk (`blockPushPopBits`) classifies every `.push`/Member-`.pop` receiver
     // once and yields all six kind flags together.
@@ -2034,7 +2023,7 @@ function fnDetectScratch(fnIx: i32) {
     // The list-op scan leads because it also flips `fnUsesStrOp`, and every leg below it
     // asks a predicate whose only effect is a flag that is set and never cleared: a flag
     // already true has no second answer to give, so its walk is skipped. That is also what
-    // keeps `dupScanRun`'s per-bias repeat to the facts a new bias can still change. D1595.
+    // keeps `frameScanRun`'s repeat to the facts a second sweep can still change. D1595.
     leqScanBlock(fn.fnBody, fnIx)
     if !fnUsesStrOp {
       if fnHasStrOp(fnIx) { fnUsesStrOp = true }
@@ -2060,65 +2049,12 @@ function fnDetectScratch(fnIx: i32) {
   0
 }
 
-// Runs a frame's scratch detection until every rep class of every same-named local has had its
-// turn; `fnIx < 0` sweeps the start function. The detectors resolve names with the scope stack
-// empty, so a shadowed name is a guess, and the sweep repeats per unvisited class (D2309):
-// over-reserving is safe, under-reserving is invalid wasm.
-function dupScanRun(fnIx: i32) {
-  dupScanActive = frameHasDupLocalName()
-  dupSlotBias = 0
-  dupSlotMore = false
-  if dupScanActive { dupScanIndex(fnIx, slotDeclAtoms(fnIx)) }
-  // Per swept bias: its classes (`width` entries each) and the heads it looked up.
-  let width = 0
-  const swept: i32[] = []
-  const seenOff: i32[] = []
-  const seenHeads: i32[] = []
-  let again = true
-  while again {
-    let twin = -1
-    let cls: i32[] = []
-    if dupScanActive {
-      cls = dupPassClasses(dupSlotBias)
-      width = cls.length
-      twin = sweptTwinOf(swept, width, cls)
-    }
-    // A bias resolving every name to the classes an earlier sweep saw is not re-swept: flags
-    // only set and lists dedupe, so it would add nothing (D2090).
-    if twin < 0 {
-      if dupScanActive { dupPassBegin() }
-      if fnIx < 0 { startFnDetectScratch() } else { fnDetectScratch(fnIx) }
-      if dupScanActive {
-        appendI32s(swept, cls)
-        seenOff.push(seenHeads.length)
-        appendI32s(seenHeads, dupPassSeen())
-      }
-    } else {
-      // The twin looked these names up; at this bias they raise what a sweep would.
-      let k = seenOff[twin]
-      let end = seenHeads.length
-      if twin + 1 < seenOff.length { end = seenOff[twin + 1] }
-      while k < end {
-        if dupMoreAt(seenHeads[k], dupSlotBias) { dupSlotMore = true }
-        k = k + 1
-      }
-    }
-    again = false
-    // The bias can only run past the match count, so `dupSlotMore` falls on its own;
-    // `localNames.length` is the belt-and-braces bound (one pass per slot at most).
-    if dupSlotMore && dupSlotBias + 1 < localNames.length {
-      dupSlotBias = dupSlotBias + 1
-      dupSlotMore = false
-      again = true
-    }
-  }
-  dupScanActive = false
-  dupSlotBias = 0
-  dupSlotMore = false
-  // The second home, not a second slot: the sweep above covers the frame's same-named
-  // slots, and a name a top-level block binds may also be a module global, which no slot
-  // bias reaches. One more sweep with block-scoped slots hidden reserves the frames the
-  // global's rep needs. D1597.
+// Runs a frame's scratch detection (`fnIx < 0`: the start function). One sweep covers every
+// same-named local; a frame whose nested block binds a module global's name takes a second with
+// the block's slots hidden, for the name-keyed readers. Flags only set and lists dedupe, so the
+// extra sweep can only over-reserve. D1597.
+function frameScanRun(fnIx: i32) {
+  if fnIx < 0 { startFnDetectScratch() } else { fnDetectScratch(fnIx) }
   if frameHasBlockLetOverGlobal() {
     blockLetHidden = true
     if fnIx < 0 { startFnDetectScratch() } else { fnDetectScratch(fnIx) }
@@ -2127,34 +2063,10 @@ function dupScanRun(fnIx: i32) {
   0
 }
 
-// Append every entry of `src` onto `dst`, in place.
-function appendI32s(dst: i32[], src: i32[]) {
-  let i = 0
-  while i < src.length {
-    dst.push(src[i])
-    i = i + 1
-  }
-  0
-}
-
-// The index of the swept bias whose classes equal `cls`, or -1. `swept` holds `width` entries
-// per swept bias, in sweep order.
-function sweptTwinOf(swept: i32[], width: i32, cls: i32[]) {
-  if width < 1 { return -1 }
-  let b = 0
-  while (b + 1) * width <= swept.length {
-    let k = 0
-    while k < width && swept[b * width + k] == cls[k] { k = k + 1 }
-    if k == width { return b }
-    b = b + 1
-  }
-  -1
-}
-
 // Clears every start-function scratch flag, then detects the frames its body needs over the
 // non-const global inits and the top-level statements — the start-fn analogue of
-// `emitFuncCode`'s per-function detection. Sets the same `fnUses*` flags so the shared
-// `fbBeginFunc`/`fbEmitLocalsVec` lay out an identical frame. `dupScanRun` may run the sweep (`startFnDetectScratch`) more than once, which is why the resets live here, above the loop.
+// `emitFuncCode`'s per-function detection, setting the same `fnUses*` flags for the shared frame
+// layout. The resets live here, above `frameScanRun`, which may sweep twice.
 function startFnDetectFrames() {
   // The declaration-time address fold is scoped to a real `FuncDecl` frame
   // (`emitLetDeclStmt` declines it whenever `fnIx < 0`), so the start function always
@@ -2198,7 +2110,7 @@ function startFnDetectFrames() {
   fnListEqGKinds = []
   fnListEqGSlots = []
   fnUsesCloEq = false
-  dupScanRun(-1)
+  frameScanRun(-1)
   0
 }
 
@@ -2257,10 +2169,10 @@ function kidsYieldArmTail(b: i32): boolean {
   false
 }
 
-// One scratch-detection sweep of the start function, at whatever same-named-slot bias
-// `dupScanRun` has set. A `.push` is a statement-level void call, never in an init value
-// position, so an init's push frames are driven by Member-receiver `.pop`s instead. Split from
-// the resets in `startFnDetectFrames` so it can be re-run per candidate binding of a shadowed name (D1595).
+// One scratch-detection sweep of the start function. A `.push` is a statement-level void call,
+// never in an init value position, so an init's push frames are driven by Member-receiver
+// `.pop`s instead. Split from the resets in `startFnDetectFrames` so `frameScanRun` can re-run
+// it (D1597).
 function startFnDetectScratch() {
   let gi = swG0
   while gi < swG1 {
@@ -2400,6 +2312,7 @@ function collectStartLocals() {
   localLoopIter = []
   localPairIter = []
   localDeclIx = []
+  localSlotOfDecl = Map()
   localUnset = []
   localByNode = []
   declSlotByNode = Map()
@@ -2422,7 +2335,7 @@ function collectStartLocals() {
       // SHARED with the function-scope walk, for the reason the `ForIn` arm below states:
       // a top-level `for` and an in-function `for` need identical slots. Duplicating it is
       // how a non-constant `step` at module scope emitted against a local nothing declared.
-      declareForRangeLocals(s)
+      declareForRangeLocals(s, startStmts[i])
       if collectLocals(s.frBody, -1) < 0 {
         scopePop()
         return -1
@@ -2558,9 +2471,9 @@ function emitInitProgressAt(ord: i32) {
 // its predecessor left. Frames exactly as `emitFuncCode` does.
 function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
   // Locals first, detection second: the scratch detectors classify expressions through the
-  // declared-locals registry, so it must be populated first — `declaredSlotOf` falls back to the
-  // flat `localNames` scan when no scope frame is active. The start function is synthetic and has
-  // no `FuncDecl` to anchor a failure at; -1 is the honest anchor for a failure with no owning declaration, and a node-anchored caller (`emitFailAt`) overrides it.
+  // declared-locals registry, so it must be populated first. The start function is synthetic
+  // and has no `FuncDecl` to anchor a failure at; -1 is the honest anchor for a failure with no
+  // owning declaration, and a node-anchored caller (`emitFailAt`) overrides it.
   emitCurFnIx = -1
   emitCurFnPos = -1
   // Where THIS body's span rows begin (D1594). The merge loop below banks one row per
@@ -7841,7 +7754,6 @@ function emitProgramReset(rootIx: i32) {
   declStructIndexReset()
   isRecvStageReset()
   monoIsCopyReset()
-  dupIndexReset()
   iisReset()
   mvShapeNestReset()
   printPlanReset()
