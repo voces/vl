@@ -131,7 +131,6 @@ import {
   nodeTyCanonObjName,
   nodeTyIsArrayish,
   nodeTyIsFunc,
-  nodeTyIsFuncArray,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
   nodeTyIsNulLitUnion,
@@ -187,6 +186,7 @@ import {
   recFnValueLeaves,
 } from "./check_type_shape"
 import { recFreshDeclOf, recInferredFnOf } from "./check_rec_fresh"
+import { recSolePinArg } from "./check_record_origins"
 import {
   T,
   TyArray,
@@ -293,8 +293,6 @@ import {
   nameIsBareMap,
   nameIsF32Array,
   nameIsF64Array,
-  nameIsI64Array,
-  nameIsU8Array,
   nameNamesFunction,
   nulCloFlag,
   objFieldVal,
@@ -552,7 +550,6 @@ import {
   isSName,
   mapAnnShape,
   mapRecordedCallShape,
-  nulScalarListKindOfNode,
   nulVariantIndexOf,
   paramMapShape,
   repABNote,
@@ -608,10 +605,7 @@ import {
   firstValuedReturn,
   globalHasTypeAnn,
   ifArmValueExpr,
-  letInfStrListByUse,
-  letIsF32,
   letIsNulBoolAnn,
-  letIsNulList,
   letIsSet,
   paramIndexOf,
   paramIsClosure,
@@ -688,7 +682,6 @@ import {
   mvValInnerMvSlot,
   mvValStructIdxOf,
   mvValVariantOf,
-  nulCloFlagAnn,
   refListElemKindOfTy,
   repSigNulVariantTok,
   repSigVariantTok,
@@ -711,6 +704,7 @@ import {
   tyMentionsLitOrObj,
   uFieldMapShape,
   uFieldTgtStructIdx,
+  unionOfVariant,
   variantIndexOfTypeName,
 } from "./emit_shape_rows"
 import {
@@ -982,7 +976,6 @@ import {
   unionClosureArrElemUnion,
   unionMapArmNameTy,
   unionNameOfVariant,
-  unionOfVariant,
   unionSpellingOfTy,
   valueUnionNameOfTy,
 } from "./emit_union_atoms"
@@ -1911,10 +1904,12 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
       // env is the same `(ref null $uVarHeap[vi])` niche.
       const cnv = capturedNulVariantIdx(fnIx, e.identName)
       if cnv >= 0 { return cnv }
-      // A global: annotation first, then the initializer, so an annotated global whose niche
-      // comes from its init still names its row (D1672).
+      // A global: the row its cell is written at (D1672).
       const gi = globalLetOfIn(fnIx, e.identName, exprIx)
-      if gi >= 0 { return nulVariantIdxOfLet(gi, -1) }
+      if gi >= 0 {
+        if globalCellKind(gi) != "nulvariant" { return -1 }
+        return globalCellStructIdx(gi)
+      }
       // The frame's own `let`, and the module frame's, last for the reason the rung above them
       // is not enough: neither storage class is a global, and the declared-locals table that
       // would answer speaks only while that frame's body is emitted (D1635). Read in the frame
@@ -2021,18 +2016,6 @@ export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
       if placeNicheAtomKind(unwrapParen(d.letInit), fnIx) >= 0 { return false }
       return mvValKind[mrs] == MVK_UNION
     }
-  }
-  false
-}
-
-// A `let` whose initializer is a checked read (`.pop()` / `.get(i)`) over a ref list of
-// value-union boxes: the cell is the box, `null` riding as its tag, so the binding takes the
-// `union` kind rather than falling through to the i32 default (D1825).
-export function letPopUnionBoxElem(letIx: i32, fnIx: i32): boolean {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return false }
-    return popUnionBoxElem(popRefRecvSlot(d.letInit, fnIx))
   }
   false
 }
@@ -2197,32 +2180,6 @@ export function nulRefArrayInnerSlotOfLet(letIx: i32, fnIx: i32) {
     return nulRefArrayInnerSlot(d.letInit, fnIx)
   }
   -1
-}
-
-// Annotation-or-init nullable-i32-list test for a binding: the annotation (`letIsNulList`),
-// else an un-annotated `const t = <nullable-i32-list expr>`. Without the init inference such
-// a binding takes a non-null list kind and `t != null` emits a bare `null` with no list
-// context. Mirrors `letIsNulString`'s init fallback for nullable strings.
-export function letIsNulListInfer(letIx: i32, fnIx: i32) {
-  if letIsNulList(letIx, fnIx) { return true }
-  if letIx < 0 { return false }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType < 0 { return exprNullableList(d.letInit, fnIx) }
-  }
-  false
-}
-
-// The distinct-backing nullable-scalar-list `VKind` of a binding (`const v: string[] | null`),
-// or null — the annotation's `nulScalarListKindOfNode`, else an un-annotated init that yields
-// such a list. Feeds the local-slot and null-seed classification.
-export function letNulScalarListKind(letIx: i32, fnIx: i32): VKind | null {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return nulScalarListKindOfNode(d.letType) }
-    return exprNulScalarListKind(d.letInit, fnIx)
-  }
-  null
 }
 
 // The nullable distinct-backing list kind (`nulstrlist`, `nulf64list`, …) of the value at
@@ -3210,8 +3167,14 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   const tt = tyAt(t)
   const same = (ot is TyObj && tt is TyObj) || (ot is TyArray && tt is TyArray)
   if !same || tySame(t, own) { return -1 }
-  if recFreshDeclOf(u) != bd && t == t0 { return -1 }
+  if recFreshDeclOf(u) != bd && t == t0 && !letHoldsCallBuilt(bd) { return -1 }
   t
+}
+
+// Whether binding `d` holds a call whose results are all built at another record than its type.
+function letHoldsCallBuilt(d: i32): boolean {
+  const n = nodeAt(d)
+  n is LetDecl && n.letType < 0 && letCallHeldTy(n.letInit) >= 0
 }
 
 // The record the inferred-result function `init` calls builds every result at, where that is another
@@ -3221,19 +3184,40 @@ function letCallHeldTy(init: i32): i32 {
   if u < 0 || !(nodeAt(u) is Call) { return -1 }
   const own = nodeTyIxOf(u)
   if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
-  const fd = recInferredFnOf(u)
+  const r = callBuiltTy(u, 8)
+  if r < 0 || tySame(r, own) { return -1 }
+  r
+}
+
+// The record every result of the inferred-result call `u` is built at, through results that are
+// further such calls or a generic identity of one; -1 where a result is anything else or the
+// results disagree.
+function callBuiltTy(x: i32, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const u = solePinPeel(x)
+  const fd = if u >= 0 { recInferredFnOf(u) } else { -1 }
   if fd < 0 { return -1 }
   let r = -1
   for lf in recFnValueLeaves(fd) {
-    const l = unwrapParen(lf)
-    if l < 0 || !(nodeAt(l) is ObjLit) { return -1 }
-    const s = litRepTyAt(l, -1)
+    const l = solePinPeel(lf)
+    if l < 0 { return -1 }
+    const s = if nodeAt(l) is ObjLit { litRepTyAt(l, -1) } else { callBuiltTy(l, depth - 1) }
     if s < 0 || s >= T.tys.length || !(tyAt(s) is TyObj) { return -1 }
     if r < 0 { r = s }
     else if !tySame(r, s) { return -1 }
   }
-  if r < 0 || tySame(r, own) { return -1 }
   r
+}
+
+// The value `x` delivers once each generic identity it passes through (`recSolePinArg`) is peeled.
+function solePinPeel(x: i32): i32 {
+  let l = unwrapParen(x)
+  let hops = 0
+  while l >= 0 && hops < 8 && recSolePinArg(l) >= 0 {
+    l = unwrapParen(recSolePinArg(l))
+    hops = hops + 1
+  }
+  l
 }
 
 // The closed type a record or list literal `init` is built at, which may be a declared record its
@@ -3318,6 +3302,8 @@ export function letBindRepSlot(letIx: i32, fnIx: i32): i32 {
 // because `emit_collect.vl` cannot be imported back into this file.
 export function letCellKind(letIx: i32, fnIx: i32): VKind {
   if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
+  // A map whose type names no rep, in `letLocalSlot`'s order (D14229).
+  if letIsMap(letIx, fnIx) { return "map" }
   const d = nodeAt(letIx)
   if d is LetDecl {
     if d.letType >= 0 { return vtKindOfType(d.letType) }
@@ -5589,19 +5575,6 @@ export function spreadSourcesWidenTo(
     j = j + 1
   }
   true
-}
-
-// Whether the literal at `ix` is a SPREAD literal whose destination rep is the packed byte
-// list. Asked by every classifier that has no `u8` element to recognise, so the cell a
-// binding takes and the backing `emitArrSpread` builds cannot disagree (D1850).
-export function spreadLitIsU8(ix: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = nodeAt(ix)
-  if n is ArrayLit {
-    if !hasSpreadItem(n.arrElems) { return false }
-    return spreadDestKind(ix, -1) == "u8"
-  }
-  false
 }
 
 // The ref-list row a spread literal builds at — 0 for every kind but `"ref"`, where the row is
@@ -9275,108 +9248,6 @@ function fnRetMapShapeAt(sid: i32, callIx: i32) {
   -1
 }
 
-// The `pushVT` `kind` for a module global from its literal INITIALIZER at `initIx`:
-// `1` struct ref, `2` list ref, `3` string ref, else `0` i32. The global's valtype must
-// match the init's wasm type so the constexpr validates; the literal cases are the only
-// ones in scope (a non-literal init fails loudly when `emitExpr` lowers it with `fnIx = -1`).
-function globalKind(initIx: i32): VKind {
-  if initIx < 0 { return "i32" }
-  const e = nodeAt(initIx)
-  // A function-literal init (`const add = function(...)...`) — or a bare reference to a
-  // top-level function name in value position — is a closure fat-pointer cell (kind 14).
-  if e is FuncDecl { return "closure" }
-  if e is Ident {
-    if fnIndexOfNode(initIx) >= 0 { return "closure" }
-  }
-  // An un-annotated float `.` literal init (`const a = 1.5`) is an f64 cell (kind 11),
-  // lowered as `f64.const`. Bare integer globals stay kind 0.
-  if e is NumLit {
-    if numLitWidth(initIx, -1) == "f64" { return "f64" }
-  }
-  if e is ObjLit {
-    // A literal matching a standalone struct is that struct ref (kind 1) — even in a
-    // union program. Otherwise, in a union program it boxes into the union (kind 4).
-    if structIndexOfObj(initIx) >= 0 { return "struct" }
-    // The module-global half of D51, the third storage class of a rule the other two
-    // already carry: `collectLocals` and `criClassify` both ask this same question for
-    // their own storage classes, but a module global asked neither, so `const iv = {r: 7}`
-    // beside `type Shape = Circle | Sq` fell to the union box instead of the bare arm.
-    if objLitVariantIdxNoStructRow(initIx, -1) >= 0 { return "variant" }
-    if uDeclared { return "union" }
-    return "struct"
-  }
-  if e is ArrayLit {
-    // A ref-element array literal is a ref list (kind 5); a string-element literal is the
-    // string list (kind 7); an f64-element literal is the f64 list (kind 12); an
-    // i32/empty literal is the i32 list (kind 2). A module-global empty `[]` over a ref
-    // type is out of scope (a global ref-list constexpr needs the binding annotation).
-    if arrLitIsRef(initIx, -1) { return "reflist" }
-    if arrLitIsStr(initIx, -1) { return "strlist" }
-    const nk = arrLitNumKind(initIx, -1)
-    if nk == ALK_F64 { return "f64list" }
-    if nk == ALK_I64 { return "i64list" }
-    // An f32-element literal is the f32 list, an arm the earlier ladder lacked. After the
-    // f64/i64 arms, so every literal either of them claims keeps its answer.
-    if arrLitIsF32(initIx, -1) { return "f32list" }
-    // The packed byte list, reachable only through a SPREAD: no element spells `u8`, so a
-    // plain literal still falls to the i32 list below and keeps its bytes. Last of the
-    // list arms and before that default, the order `mfRecvKindOf` uses for the same reason
-    // — `u8` and `i32` share an element type and only the backing differs (D1850).
-    if spreadLitIsU8(initIx) { return "u8list" }
-    return "list"
-  }
-  if e is StrLit { return "str" }
-  // A non-literal initializer (a concat, a function call, a reference to another global):
-  // classify via the expression family with no enclosing function (`fnIx = -1`), the same
-  // predicates the local `letIs*` ladder uses. A non-literal evaluating to a function
-  // value is a closure cell (kind 14), checked first; anything i32-producing stays kind 0.
-  if exprIsClosure(initIx, -1) { return "closure" }
-  if exprNullableVariant(initIx, -1) { return "nulvariant" }
-  if exprNullableStruct(initIx, -1) { return "nulstruct" }
-  if exprMap(initIx, -1) { return "map" }
-  if exprString(initIx, -1) { return "str" }
-  if exprStringArray(initIx, -1) { return "strlist" }
-  if exprRefArray(initIx, -1) { return "reflist" }
-  // The arena rung beside it: a call handing back a closure ARRAY types the cell through
-  // the checker's own record, which the syntactic predicate resolves only from a return
-  // ANNOTATION. Structural, so only a `TyFunc` element claims it and every scalar-backed
-  // list keeps its own arm below (D1625).
-  if nodeTyIsFuncArray(initIx) { return "reflist" }
-  if exprF64Array(initIx, -1) { return "f64list" }
-  if exprI64Array(initIx, -1) { return "i64list" }
-  if exprF32Array(initIx, -1) { return "f32list" }
-  // The packed byte list — before `exprArray` below, which would claim any i32-element
-  // list and type the cell as the 4-byte wrapper for a one-byte initializer.
-  if exprU8Array(initIx, -1) { return "u8list" }
-  // A value `if`/`match` whose every arm denotes one union arm is that arm's cell, as the
-  // literal itself is above (D4639).
-  if (
-    nodeIsValueJoin(unwrapParen(initIx))
-    && objLitVariantIdxNoStructRow(initIx, -1) >= 0
-  ) {
-    return "variant"
-  }
-  if exprUnion(initIx, -1) { return "union" }
-  // A concrete-variant init (`const r = mk()` returning a union arm) is the raw variant
-  // ref (kind 8), the module-scope twin of `buildLocals`' variant slot — before
-  // `exprStruct`, which names the standalone struct table a variant has no row in.
-  if exprVariantIndex(initIx, -1) >= 0 { return "variant" }
-  if exprStruct(initIx, -1) { return "struct" }
-  if exprArray(initIx, -1) { return "list" }
-  // A scalar f32 non-literal init (f32 arithmetic, an f32-returning call) — kind 13, the
-  // module-scope analogue of `letIsF32`. Checked before the f64 arm, mirroring
-  // `exprIsF32`'s own dispatch order: `exprIsF64` over-claims a mixed f32/float-literal
-  // init (`fv * 1.0` satisfies both), so f32 must go first or the start-fn's `f32.mul` disagrees.
-  if exprIsV128(initIx, -1) { return "v128" }
-  if exprIsF32(initIx, -1) { return "f32" }
-  // A scalar f64/i64 non-literal init (arithmetic, or an f64-returning call) — kind 11/10,
-  // the module-scope analogue of `letIsF64`/`letIsI64`. May recurse into another global,
-  // terminating for an acyclic program, the same as the `exprString`/`exprStruct` cases above.
-  if exprIsF64(initIx, -1) { return "f64" }
-  if exprIsI64(initIx, -1) { return "i64" }
-  "i32"
-}
-
 let gckDepth = 0
 // `letIsF64` for `q == 0`, `letIsI64` for 1, and `letIsString` or `letIsNulString` for 2, of
 // the global `letIx` that `sid` names, memoised by its ordinal in `globalStmts`.
@@ -9446,133 +9317,14 @@ export function globalCellKind(letIx: i32): VKind {
   k
 }
 
-// The `fbValtype` kind for a module global's cell. When the binding has a type annotation,
-// the kind derives from it via the `letIs*` ladder, so a global agrees with a same-typed
-// local/param/field. Only an un-annotated const global falls back to the literal-
-// initializer kind (`globalKind`); a non-const un-annotated init rides the ladder too.
+// The `fbValtype` kind of a module global's cell: a local's cell kind (`letCellKind`), read
+// in no frame, after the never-filled `null` (D1576) and the v128 vector, which it does not name.
 function globalCellKindGo(letIx: i32): VKind {
   const d = nodeAt(letIx)
   if d is LetDecl {
-    // D1576 — a never-filled `const x = null` at module scope is the `null` type, cell
-    // `nullref`. Checked first, outside the annotation split: the binding has no
-    // annotation by construction, so the un-annotated arm would read the init as i32.
     if letIsNulNone(letIx, -1) { return "nulnone" }
-    // A v128 vector cell (`F32x4`), annotated or inferred from its init — no other rung
-    // claims a vector, and several would misread its init as a ref.
     if letInfersV128(letIx, -1) { return "v128" }
-    if globalHasTypeAnn(letIx) {
-      // A NULLABLE-function global (`let g: ((i32) => i32) | null = inc`) is a nullable
-      // closure cell (kind 19) — checked BEFORE the bare-function kind 14, mirroring
-      // `vtKindOfType` / `fieldTypeCode`: `((i32) => i32) | null` is a nullable function,
-      // whereas `(i32) => i32 | null` is a function returning a nullable.
-      if nulCloFlagAnn(d.letType) == 1 { return "nulclosure" }
-      // A function-typed global (`const g: (i32) => i32 = inc`) is a closure fat-pointer
-      // cell (kind 14), like a function-valued local.
-      if tyIsFuncType(d.letType) { return "closure" }
-      // A `Circle | null` global — the `nulvariant` niche. BEFORE its struct twin for the
-      // ladder's usual reason: `letIsNulRef` falls through an annotation it cannot claim
-      // to the INITIALIZER, and a nullable-variant-returning call answers there.
-      if letIsNulVariant(letIx, -1) { return "nulvariant" }
-      if letIsNulRef(letIx, -1) { return "nulstruct" }
-      // A nullable ref-array global (`(P | null)[] | null`, `S[] | null`) — kind 18, a
-      // `(ref null $rlWrap)` cell over the inner wrapper — before the i32-backed `nullist`.
-      // Mirrors the local ladder's `letIsNulRefArray` arm so a global matches a same-typed local.
-      if letIsNulRefArray(letIx, -1) { return "nulreflist" }
-      if letIsNulList(letIx, -1) { return "nullist" }
-      // A DISTINCT-backing nullable scalar list global (`string[]|null`, `f64[]|null`,
-      // `i64[]|null`, `f32[]|null`): its own `(ref null $wrapper)` cell — BEFORE the non-null
-      // list arms (whose init fallback would else claim a bare list value as a non-null cell).
-      const gNulSL = nulScalarListKindOfNode(d.letType)
-      if gNulSL != null { return gNulSL }
-      // A NULLABLE map global cell (`let g: {[string]: V} | null = …`, kind `nulmap`) — BEFORE
-      // `letIsMap` (a nullable annotation/init must not collapse to the non-null `"map"` cell).
-      if letIsNulMap(letIx, -1) { return "nulmap" }
-      if letIsMap(letIx, -1) { return "map" }
-      // A union-annotated global cell is the box ref (kind 4), exactly as `buildLocals`
-      // classifies a union local — before the struct/string/scalar-list cases. `S | null` /
-      // `boolean | null` never register as union names (they keep their niche kinds above).
-      if letIsLitUnion(letIx) { return "i32" }
-      // A `K | null` niche global (`const g: K0 | null = "404"`) — the i32 atom cell with
-      // the `-1` null sentinel, the nullable twin of the litunion arm above. Before
-      // `letIsString`, whose init fallback would else claim the niche as a string-ref cell.
-      if nodeTyIsNulLitUnion(d.letType) { return "i32" }
-      // A concrete union-variant global (`const g: Cat = {…}`), kind 8 — the bare variant
-      // struct ref. Before `letIsUnion`/`letIsStruct`, mirroring `buildLocals`' own
-      // `letIsVariant` rung: a variant name is neither the union box nor a standalone
-      // struct, since `collectS` keeps a variant's `TypeDecl` out of the struct table.
-      if letAnnVariantIdx(letIx) >= 0 { return "variant" }
-      if letIsUnion(letIx, -1) { return "union" }
-      if letIsStringArray(letIx, -1) { return "strlist" }
-      if letIsRefArray(letIx, -1) { return "reflist" }
-      if letIsU8Array(letIx, -1) { return "u8list" }
-      if letIsF32Array(letIx, -1) { return "f32list" }
-      if letIsF64Array(letIx, -1) { return "f64list" }
-      if letIsI64Array(letIx, -1) { return "i64list" }
-      if letIsStruct(letIx, -1) { return "struct" }
-      if letIsArray(letIx, -1) { return "list" }
-      if letIsNulString(letIx, -1) { return "nulstr" }
-      if letIsString(letIx, -1) { return "str" }
-      if letIsI64(letIx, -1) { return "i64" }
-      if letIsF64(letIx, -1) { return "f64" }
-      if letIsF32(letIx) { return "f32" }
-      return "i32"
-    }
-    // No annotation: a const literal init types itself; a non-const un-annotated init is
-    // out of scope (no annotation to derive from) and `globalKind` returns its best guess.
-    // An atom init is the i32 atom cell, the answer `bindingIsLitAtom` gives every read of
-    // it; `globalKind` reads the init's rendered type and can call a join a string (D2206).
-    if letInitIsLitAtom(letIx, -1) { return "i32" }
-    // A binding of a tagged function set holds its id, and of `T | null` over one its rep's box.
-    if fnTagTyIsTagged(nodeTyIxOf(letIx)) { return "i32" }
-    const gbt = tyAt(letBindTy(letIx, -1))
-    if gbt is TyNullable && fnTagTyIsTagged(gbt.nInner) {
-      return repOfTy(letBindTy(letIx, -1)).rdKind
-    }
-    // A list of a tagged set's ids is the i32 list, by whatever path the binding reaches it.
-    if fnTagListTy(nodeTyIxOf(letIx)) { return "list" }
-    // An empty `[]` whose PUSHES infer a string element is the string list (kind 7).
-    if letInfStrListByUse(letIx) { return "strlist" }
-    // The two nullable cells the un-annotated arm lacked: `const g = mk()` with a
-    // `((i32) => i32) | null` / `i32[] | null` return fell through to `globalKind`'s
-    // `"closure"`/`"i32"` guess, disagreeing with the value the start fn actually stores.
-    // The read sides need no separate widening — `exprNulClosure` and `globalIsNulList` already ask this ladder.
-    if letInfersNulClosure(letIx, -1) { return "nulclosure" }
-    // A bare map read (`const g = m[k]`) at module scope — mirrors the local ladder's
-    // `letNulMapReadValKind` arm (D1040) so a global agrees with a same-typed local's cell
-    // kind. Before `nullist` and the scalar-list arms below, exactly as the local ladder
-    // orders them: this answers the value's nullable kind for every mv value rep at once.
-    const gMapRead = letNulMapReadValKind(letIx, -1)
-    if gMapRead != null { return gMapRead }
-    // A `??` that JOINS to the union box is the box cell whatever niche its operand had. The
-    // two niche rungs below read the OPERAND alone, so a global takes the niche while the
-    // lowering builds the box unless this asks first — the local ladder's own order (D1765).
-    if coalesceNicheJoinsToBox(d.letInit, -1) { return "union" }
-    // A `.pop()` / `.get(i)` over a value-union ref list: `T | null` is the box with `null` as
-    // its tag, the module-scope twin of the local ladder's own arm. Before every nullable-niche
-    // arm below, none of which claims it, and before the i32 default (D1881).
-    if letPopUnionBoxElem(letIx, -1) { return "union" }
-    // D1106 — the kind-18 cell the un-annotated arm lacked: `const r = mk()` with `mk():
-    // S[] | null` fell through to `globalKind`'s i32 guess, so a later `r != null` compare
-    // had no rep to test against. Before `nullist`, exactly as the annotated ladder orders
-    // the two disjoint arms.
-    if letIsNulRefArray(letIx, -1) { return "nulreflist" }
-    if letIsNulListInfer(letIx, -1) { return "nullist" }
-    // A distinct-backing nullable scalar list bound to a call (`const r = mk()`): its own
-    // `(ref null $wrapper)` cell, resolved through the binding (`letNulScalarListKind`)
-    // since there's no annotation node to read. Before the nulmap/union arms and the literal fallback.
-    const gNulSLU = letNulScalarListKind(letIx, -1)
-    if gNulSLU != null { return gNulSLU }
-    // An un-annotated global bound to a `{[string]: V} | null`-returning call carries the
-    // `nulmap` cell as a local would — before the union arm (a nullable map is a niche,
-    // not the box) and the literal-init fallback, whose i32 guess would else conflict.
-    if letIsNulMap(letIx, -1) { return "nulmap" }
-    // An un-annotated global whose init PRODUCES a union (`const a = make(42)` with
-    // a union-returning `make`) carries the box (kind 4), as a local would.
-    if letIsUnion(letIx, -1) { return "union" }
-    // An un-annotated global bound to a `string | null`-returning call (`const r = f()`)
-    // carries the kind-16 nullable-string cell, as a local would.
-    if letIsNulString(letIx, -1) { return "nulstr" }
-    return globalKind(d.letInit)
+    return letCellKind(letIx, -1)
   }
   "i32"
 }
@@ -9584,6 +9336,7 @@ function globalCellKindGo(letIx: i32): VKind {
 export function globalCellStructIdx(letIx: i32) {
   const d = nodeAt(letIx)
   if d is LetDecl {
+    if letBindRepClaims(letIx, -1) { return letBindRepSlot(letIx, -1) }
     if globalHasTypeAnn(letIx) {
       // The annotated twin of the variant leg below: a kind-8 slot IS the variant index,
       // named directly by the annotation. Before `structIndexOfLet`, which answers -1 for
@@ -12226,20 +11979,6 @@ export function exprNulClosure(exprIx: i32, fnIx: i32): boolean {
   exprNulKind(exprIx, fnIx) == "nulclosure"
 }
 
-// True if an UN-annotated `const f = <init>` should infer a NULLABLE-closure (kind 19) slot —
-// its init reads back a nullable closure (a bare `m[k]` over a function-valued map). The
-// annotated form is `letIsNulClosure`; this is its init-driven dual (it lives here, not in
-// `emit_query`, because it consults the wasmEmit-side `exprNulClosure`).
-export function letInfersNulClosure(letIx: i32, fnIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return false }
-    if d.letInit < 0 { return false }
-    return exprNulClosure(d.letInit, fnIx)
-  }
-  false
-}
-
 // True if the `LetDecl` at `letIx` declares a struct-typed local: its annotation names the
 // struct, or its initializer produces one. Picks the local's valtype (`(ref $0)` vs i32) in
 // `collectLocals`.
@@ -12540,11 +12279,8 @@ function globalStructIndexSid(fnIx: i32, sid: i32, atIx: i32) {
   // the same function `emitGlobalSection` writes the cell with, so the two cannot drift.
   const gk = globalCellKind(li)
   if gk != "struct" && gk != "nulstruct" { return -1 }
-  // D842 — the same redirect `globalCellStructIdx` takes, for the reason the block above
-  // gives: this reader and `emitGlobalSection`'s cell must not drift, since the section writes
-  // a superseded nullable-struct cell at the merged row and each site resolves the row
-  // separately — skipping the redirect at either lets a `??`-merged global mismatch its cell's layout.
-  structIndexOfLet(li, -1)
+  // The row the global section writes the cell at (D842), so the two cannot drift.
+  globalCellStructIdx(li)
 }
 
 // The struct table index of a captured struct-ref variable `name` of the capturing lifted
@@ -15081,29 +14817,6 @@ export function exprArray(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "list"
 }
 
-// True if the `LetDecl` at `letIx` declares an array-typed local: its annotation is an
-// array type (`i32[]`), OR its initializer produces an array. Picks the local's
-// valtype (`(ref $aTypeIdx)` vs i32) in `collectLocals`.
-export function letIsArray(letIx: i32, fnIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      // Arena-first: where the checker's arena decides the annotation's rep, this is "is
-      // that rep the i32 list" with no name parse; the arena's uncovered spellings fall through.
-      const k = annRepKindOf(d.letType)
-      if k != null {
-        if k == "list" { return true }
-      } else {
-        // Kept for the shapes the arena leg declines (an inline litunion element, the
-        // `(boolean|null)[]`/`(K|null)[]` niches) — unreached here is corpus-unreachable, not dead.
-        if tyScalarListKind(nodeTyIxOf(d.letType)) == "list" { return true }
-      }
-    }
-    return exprArray(d.letInit, fnIx)
-  }
-  false
-}
-
 // True if `exprIx` evaluates to a ref list: a projection of `exprListRep`.
 export function exprRefArray(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "reflist"
@@ -16193,9 +15906,8 @@ function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
   false
 }
 
-// Usage-driven element inference for an un-annotated empty `[]` local, the richer dual of
-// `letInfStrListByUse` (which only sees a string literal push): also recognizes a push of
-// any string-typed expression, so a build-loop accumulator classifies as `string[]`.
+// Usage-driven element inference for an un-annotated empty `[]` local: a push of any
+// string-typed expression makes a build-loop accumulator classify as `string[]`.
 // `gStrInfLet` guards against the `out.push(out[0])` self-reference cycle.
 export function letInfStrListByUseV(letIx: i32, fnIx: i32) {
   const d = nodeAt(letIx)
@@ -16289,57 +16001,6 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
 // f32 is the checker's weak spot (a float literal types f64), so a recorded `f64[]` yields to
 // the syntactic f32 rungs in `exprListRep`. A bare `[1.5]` literal stays f64; a value is f32[]
 // only when a declared type or an f32 element says so.
-
-// True if the `let`/`const` at `letIx` binds a `u8[]` — the packed byte list, cell
-// `(ref $bl8TypeIdx)` over `(array (mut i8))`. Annotation-only, unlike its f32/f64/i64
-// siblings: a bare array literal always types `i32[]`, so there is no un-annotated
-// expression whose own type is `u8[]` to fall through to.
-export function letIsU8Array(letIx: i32, fnIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      // Arena-first (see `letIsArray`), name as the documented second opinion.
-      const k = annRepKindOf(d.letType)
-      if k != null { return k == "u8list" }
-      const lt = nodeAt(d.letType)
-      if lt is TypeRef { return nameIsU8Array(lt.tyName) }
-    }
-    // Un-annotated: the initializer decides, exactly as the scalar-list siblings — without
-    // this, a `u8[]`-returning call's result stored into an i32-list cell is invalid wasm.
-    return exprU8Array(d.letInit, fnIx)
-  }
-  false
-}
-
-export function letIsF32Array(letIx: i32, fnIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      // Arena-first (see `letIsArray`).
-      const k = annRepKindOf(d.letType)
-      if k != null {
-        if k == "f32list" { return true }
-        if k == "reflist" { return false }
-        // A settled annotation naming a different scalar/ref list is authoritative — the
-        // initializer must not overrule it, or the two wrapper types meet at the store (invalid wasm).
-        if k == "f64list" { return false }
-        if k == "i64list" { return false }
-        if k == "strlist" { return false }
-        if k == "list" { return false }
-      } else {
-        const lt = nodeAt(d.letType)
-        if lt is TypeRef {
-          if nameIsF32Array(lt.tyName) { return true }
-          // A REF-array annotation (`(f32 | null)[]`) is authoritative — see `letIsF64Array`.
-          // ARENA (destringify D-REFARR): the intern-state reading of that reject.
-          if annBareRefArrSlot(d.letType) >= 0 { return false }
-        }
-      }
-    }
-    return exprF32Array(d.letInit, fnIx)
-  }
-  false
-}
 
 // True if the array literal at `arrIx` has f32 elements — every element must be `exprIsF32`,
 // unlike its f64/i64 siblings, which claim on any element. A mixed literal (`[fv, 1]`) is a
@@ -16668,30 +16329,6 @@ function columnListRepOfRead(exprIx: i32, fnIx: i32): VKind | null {
 // True if `exprIx` evaluates to an `f32[]`: a projection of `exprListRep`.
 export function exprF32Array(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "f32list"
-}
-
-export function letIsI64Array(letIx: i32, fnIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      // Arena-first (see `letIsArray`).
-      const k = annRepKindOf(d.letType)
-      if k != null {
-        if k == "i64list" { return true }
-        if k == "reflist" { return false }
-      } else {
-        const lt = nodeAt(d.letType)
-        if lt is TypeRef {
-          if nameIsI64Array(lt.tyName) { return true }
-          // A REF-array annotation (`(i64 | null)[]`) is authoritative — see `letIsF64Array`.
-          // ARENA (destringify D-REFARR): the intern-state reading of that reject.
-          if annBareRefArrSlot(d.letType) >= 0 { return false }
-        }
-      }
-    }
-    return exprI64Array(d.letInit, fnIx)
-  }
-  false
 }
 
 // True if `exprIx` evaluates to an `i64[]`: a projection of `exprListRep`.
