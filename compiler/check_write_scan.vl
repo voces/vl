@@ -48,7 +48,6 @@ import {
   arenaEpochNow,
   elseIfLink,
   hasNamedArgs,
-  i32ToStr,
   loopVarLoop,
   nodeAt,
   nodeChildrenPush,
@@ -61,6 +60,7 @@ import {
   sidLookup,
   sidOf,
   sidOfNode,
+  sidText,
 } from "./symbols"
 import { i32ListHas, i32ListIndexOf } from "./listutil"
 import { demangleName } from "./check_suggest"
@@ -227,13 +227,13 @@ let cwIxDNext: i32[] = []
 let cwIxDHead: i32[] = []
 let cwIxUHead: i32[] = []
 let cwIxDDone: i32[] = []
-// `cwFnValueTargets` memo: `"<frame>#<name>"` to its row in `cwFvSets`, or -2 while that
-// binding is being resolved, so a cycle of bindings declines.
-let cwFvSlot: {[string]: i32} = Map()
+// `cwFnValueTargets` memo: a binding's declaration (`cwBindingOf`) to its row in `cwFvSets`, or
+// -2 while that binding is being resolved, so a cycle of bindings declines.
+let cwFvSlot: {[i32]: i32} = Map()
 let cwFvSets: i32[][] = []
-// `cwBoundInitOf` memo: `"<frame>#<name>"` to its answer, so a binding named at every call of
-// a long body is resolved once.
-let cwBiSlot: {[string]: i32} = Map()
+// `cwBoundInitOf` memo: a binding's declaration to its answer, so a binding named at every call
+// of a long body is resolved once.
+let cwBiSlot: {[i32]: i32} = Map()
 
 function cwIxReset() {
   cwIxHead = []
@@ -1166,12 +1166,12 @@ export function cwFnDeclOf(fnName: string): i32 {
   cwIxFnDecl[sid]
 }
 
-// The lambda `nm` is bound to in frame `fr`, or -1. The binding must be bound exactly once
-// and never re-pointed there, so one parameter list answers for every call through the name;
+// The lambda the binding `b` (`cwBindingOf`) is bound to, or -1. It must be bound exactly once
+// and never re-pointed, so one parameter list answers for every call through the name;
 // a binding initialised with anything else — a function-typed parameter, a call result — has
 // no parameter list in the arena and declines. D1683.
-export function cwLambdaDeclOf(nm: string, fr: i32): i32 {
-  const init = cwBoundInitOf(nm, fr)
+export function cwLambdaDeclOf(b: i32): i32 {
+  const init = cwBoundInitOf(b)
   if init >= 0 && nodeAt(init) is FuncDecl { return init }
   -1
 }
@@ -1194,7 +1194,7 @@ export function cwFnValueDeclOf(a: i32): i32 {
     if dn.letKw == "const" {
       ix = cwPeel(dn.letInit)
     } else {
-      ix = cwBoundInitOf(n.identName, covarRootFrame(ix))
+      ix = cwBoundInitOf(cwBindingOf(ix))
     }
     hops = hops + 1
   }
@@ -1213,34 +1213,48 @@ export function cwHeldFnOf(a: i32): i32 {
     if !(n is Ident) { return -1 }
     const f = fnDeclIx[n.identName] ?? -1
     if f >= 0 { return f }
-    ix = cwBoundInitOf(n.identName, covarRootFrame(ix))
+    ix = cwBoundInitOf(cwBindingOf(ix))
     hops = hops + 1
   }
   -1
 }
 
-// The initialiser, parens peeled, of the binding `nm` bound exactly once in frame `fr` and never
-// re-pointed, or -1.
-export function cwBoundInitOf(nm: string, fr: i32): i32 {
-  if nm == "" { return -1 }
+// The declaration standing for the binding the read `ix` names, the first one its frame files
+// under the name; -1 when the read's frame is not known or files no such declaration.
+export function cwBindingOf(ix: i32): i32 {
+  if covarRootFrame(ix) == CW_FR_UNKNOWN { return -1 }
+  cwDeclRepOf(identDeclOf(cwPeelValue(ix)))
+}
+
+// The first declaration sharing declaration `d`'s frame and name, or -1 when the frame walk
+// filed none for it.
+function cwDeclRepOf(d: i32): i32 {
+  cwBuildFrames()
+  if d < 0 || d >= cwDeclRep.length { return -1 }
+  cwDeclRep[d]
+}
+
+// The initialiser, parens peeled, of the binding `b` (`cwBindingOf`) when it is bound exactly
+// once and never re-pointed, or -1.
+export function cwBoundInitOf(b: i32): i32 {
+  if b < 0 { return -1 }
   cwIxBuild()
-  const key = i32ToStr(fr) + "#" + nm
-  const m = cwBiSlot.get(key)
+  const m = cwBiSlot.get(b)
   if m != null { return m }
-  const init = cwBoundInitScan(nm, fr)
-  cwBiSlot[key] = init
+  const init = cwBoundInitScan(b)
+  cwBiSlot[b] = init
   init
 }
 
-function cwBoundInitScan(nm: string, fr: i32): i32 {
-  if !cwBoundOnce(cwOccWalkAt(nm, fr)) { return -1 }
-  const ow = cwOccWalkAt(nm, fr)
+function cwBoundInitScan(b: i32): i32 {
+  if !cwBoundOnce(cwOccWalk(b)) { return -1 }
+  const ow = cwOccWalk(b)
   while cwOccNext(ow) {
     const r = ow.row
     if cwIxKind[r] == CW_OCC_BIND {
-      const b = nodeAt(cwIxNode[r])
-      if b is LetDecl {
-        const init = cwPeel(b.letInit)
+      const bn = nodeAt(cwIxNode[r])
+      if bn is LetDecl {
+        const init = cwPeel(bn.letInit)
         if init >= 0 && init < P.nodes.length { return init }
       }
     }
@@ -1263,39 +1277,37 @@ function cwSoleDecl(d: i32): i32 {
   -1
 }
 
-// Every function a call through the binding `nm` of frame `fr` may run: its initialiser and each
-// value assigned to it, where a parameter holds what every call of its function hands it. []
-// when one of them is not a named function or a lambda, or `fr` binds `nm` by another binder.
-export function cwFnValueTargets(nm: string, fr: i32): i32[] {
-  const ts = cwFvTargetsOf(nm, fr)
+// Every function a call through the binding `b` (`cwBindingOf`) may run: its initialiser and
+// each value assigned to it, where a parameter holds what every call of its function hands it.
+// [] when one of them is not a named function or a lambda, or a loop or function binds it.
+export function cwFnValueTargets(b: i32): i32[] {
+  const ts = cwFvTargetsOf(b)
   if ts.length == 0 || ts[0] < 0 { return [] }
   ts
 }
 
 // `cwFnValueTargets` with [-1] for a set not known, so a binding no call fills is the empty set.
-function cwFvTargetsOf(nm: string, fr: i32): i32[] {
-  if nm == "" || fr == CW_FR_UNKNOWN { return [-1] }
+function cwFvTargetsOf(b: i32): i32[] {
+  if b < 0 { return [-1] }
   cwIxBuild()
-  const key = i32ToStr(fr) + "#" + nm
-  const s = cwFvSlot[key] ?? -1
+  const s = cwFvSlot[b] ?? -1
   if s >= 0 && s < cwFvSets.length { return cwFvSets[s] }
   if s == -2 { return [-1] }
-  cwFvSlot[key] = -2
+  cwFvSlot[b] = -2
   let out: i32[] = []
-  if !cwFvCollect(nm, fr, out) { out = [-1] }
-  cwFvSlot[key] = cwFvSets.length
+  if !cwFvCollect(b, out) { out = [-1] }
+  cwFvSlot[b] = cwFvSets.length
   cwFvSets.push(out)
   out
 }
 
-// Add to `out` every value stored into the binding (`nm`, `fr`); false when one is unresolved
-// or the frame declares `nm` by a loop or by a function, which store no value of their own.
-function cwFvCollect(nm: string, fr: i32, out: i32[]): boolean {
-  const sid = sidLookup(nm)
-  if sid < 0 { return false }
+// Add to `out` every value stored into the binding `b`; false when one is unresolved or its
+// frame declares the name by a loop or by a function, which store no value of their own.
+function cwFvCollect(b: i32, out: i32[]): boolean {
+  const fr = cwFrameOfDecl(b)
   let binds = 0
   let bd = -1
-  const ow = cwOccWalkAt(nm, fr)
+  const ow = cwOccWalk(b)
   while cwOccNext(ow) {
     const r = ow.row
     const at = cwIxNode[r]
@@ -1325,12 +1337,11 @@ function cwFvCollect(nm: string, fr: i32, out: i32[]): boolean {
   binds > 0 && binds == cwDeclCount(bd)
 }
 
-// The write that stores function `decl` into the binding (`nm`, `fr`): the `let` initialiser
-// or the `nm = v` assignment whose value may be `decl`; -1 when no such write does.
-export function cwFnValueWriteOf(nm: string, fr: i32, decl: i32): i32 {
-  if nm == "" || fr == CW_FR_UNKNOWN { return -1 }
-  cwIxBuild()
-  const ow = cwOccWalkAt(nm, fr)
+// The write that stores function `decl` into the binding `b` (`cwBindingOf`): the `let`
+// initialiser or the `nm = v` assignment whose value may be `decl`; -1 when no such write does.
+export function cwFnValueWriteOf(b: i32, decl: i32): i32 {
+  if b < 0 { return -1 }
+  const ow = cwOccWalk(b)
   while cwOccNext(ow) {
     const r = ow.row
     const at = cwIxNode[r]
@@ -1385,8 +1396,8 @@ function cwLexScopeOk(bd: i32, nm: string): boolean {
   const n = nodeAt(bd)
   if !(n is LetDecl) || n.letInit < 0 { return false }
   const fr = cwFrameOfDecl(bd)
-  if fr == CW_FR_UNKNOWN { return false }
-  const key = i32ToStr(fr) + "#" + nm
+  const key = cwDeclRepOf(bd)
+  if fr == CW_FR_UNKNOWN || key < 0 { return false }
   if !(cwLexDone.get(key) ?? false) {
     cwLexDone.set(key, true)
     cwLexBail = false
@@ -1421,12 +1432,12 @@ function cwLexSlotPush(bd: i32, v: i32) {
 }
 
 // By `let` node, the values its scope's `nm = v` writes store, and the values its slot writes
-// store; by frame and name, whether that frame has been walked, and whether the walk met a
-// binder it does not model.
+// store; by the first declaration of a frame's name, whether that frame has been walked for it,
+// and whether the walk met a binder it does not model.
 let cwLexSlotStores: Map<i32, i32[]> = Map()
 let cwLexStores: Map<i32, i32[]> = Map()
-let cwLexDone: Map<string, boolean> = Map()
-let cwLexBailed: Map<string, boolean> = Map()
+let cwLexDone: Map<i32, boolean> = Map()
+let cwLexBailed: Map<i32, boolean> = Map()
 let cwLexBail = false
 
 // Walks statements `xs` in order, `cur` the `let` of `nm` in scope (-1 for another binder).
@@ -1522,13 +1533,12 @@ function cwLexWalk(ix: i32, nm: string, cur: i32): i32 {
   cur
 }
 
-// Every value stored into the binding (`nm`, `fr`): its `let` initialiser and the value of each
-// `nm = v`; [] for a binding with no index rows.
-export function cwBindingWrittenValues(nm: string, fr: i32): i32[] {
+// Every value stored into the binding `b` (`cwBindingOf`): its `let` initialiser and the value
+// of each `nm = v`; [] for a binding with no index rows.
+export function cwBindingWrittenValues(b: i32): i32[] {
   const out: i32[] = []
-  if nm == "" || fr == CW_FR_UNKNOWN { return out }
-  cwIxBuild()
-  const ow = cwOccWalkAt(nm, fr)
+  if b < 0 { return out }
+  const ow = cwOccWalk(b)
   while cwOccNext(ow) {
     const r = ow.row
     const n = nodeAt(cwIxNode[r])
@@ -1605,42 +1615,37 @@ function cwFreshMap(x: i32): boolean {
   f is Ident && f.identName == "Map" && identDeclOf(cwPeel(c.callFn)) < 0
 }
 
-// Every value stored at `path` under the binding (`nm`, `fr`) in `vals`, each blamed in `ats` on
-// its literal, its `p = v` (at `path` or a prefix) or its `p.push(v)`, through any alias. Returns
-// how many came from a write after the initialiser, or -1 when one is not a literal's part.
+// Every value stored at `path` under the binding `b0` (`cwBindingOf`) in `vals`, each blamed in
+// `ats` on its literal, its `p = v` (at `path` or a prefix) or its `p.push(v)`, through any alias.
+// Returns how many came from a write after the initialiser, or -1 when one is not a literal's part.
 export function cwSlotWrittenValues(
-  nm0: string,
-  fr0: i32,
+  b0: i32,
   path: string[],
   vals: i32[],
   ats: i32[],
 ): i32 {
-  if nm0 == "" || fr0 == CW_FR_UNKNOWN || path.length == 0 { return -1 }
+  if b0 < 0 || path.length == 0 { return -1 }
   // An alias holds the list or record of the binding that initialises it: start from that one.
-  let nm = nm0
-  let fr = fr0
+  let b = b0
   let steps = 0
   while steps < 16 {
-    const up = cwSlotAliasOf(nm, fr)
+    const up = cwSlotAliasOf(b)
     if up < 0 { break }
-    const un = nodeAt(up)
-    if un is Ident { nm = un.identName }
-    fr = covarRootFrame(up)
+    b = cwBindingOf(up)
     steps = steps + 1
   }
-  const bd = cwSoleDecl(cwDeclAt(nm, fr))
+  const bd = cwSoleDecl(b)
   if bd < 0 { return -1 }
   const bn = nodeAt(bd)
   if !(bn is LetDecl) { return -1 }
   const inits = [bn.letInit]
-  cwSlotValuesFrom(nm, fr, bn.letInit, inits, path, vals, ats)
+  cwSlotValuesFrom(b, bn.letInit, inits, path, vals, ats)
 }
 
-// `cwSlotWrittenValues` for the `let` (`nm`, `fr`) whose initialiser `init` stores the values
+// `cwSlotWrittenValues` for the `let` binding `b` whose initialiser `init` stores the values
 // `inits`: a call's returned values, when the call returns a fresh list or record.
 export function cwSlotValuesFrom(
-  nm: string,
-  fr: i32,
+  b: i32,
   init: i32,
   inits: i32[],
   path: string[],
@@ -1651,10 +1656,12 @@ export function cwSlotValuesFrom(
     if !cwSlotDescend(v, path, 0, -1, vals, ats) { return -1 }
   }
   const nBound = vals.length
-  for v in cwBindingWrittenValues(nm, fr) {
+  for v in cwBindingWrittenValues(b) {
     if v != init && !cwSlotDescend(v, path, 0, -1, vals, ats) { return -1 }
   }
-  if !cwSlotWritesInto(nm, fr, path, vals, ats, 0) { return -1 }
+  if b < 0 { return -1 }
+  const nm = sidText(sidOfNode(b))
+  if !cwSlotWritesInto(nm, cwFrameOfDecl(b), path, vals, ats, 0) { return -1 }
   vals.length - nBound
 }
 
@@ -1788,9 +1795,9 @@ function cwSplitPath(p: string): string[] {
   out
 }
 
-// The identifier the `let` (`nm`, `fr`) is bound once to when it names another `let`, or -1.
-function cwSlotAliasOf(nm: string, fr: i32): i32 {
-  const bd = cwSoleDecl(cwDeclAt(nm, fr))
+// The identifier the `let` binding `b` is bound once to when it names another `let`, or -1.
+function cwSlotAliasOf(b: i32): i32 {
+  const bd = cwSoleDecl(b)
   if bd < 0 || bd >= P.nodes.length || !cwBoundOnce(cwOccWalk(bd)) { return -1 }
   const bn = nodeAt(bd)
   if !(bn is LetDecl) { return -1 }
@@ -1809,7 +1816,7 @@ function cwSlotHandle(nm: string, fr: i32): boolean {
   const bd = cwSoleDecl(cwDeclAt(nm, fr))
   if bd < 0 || bd >= P.nodes.length { return false }
   if nodeAt(bd) is Param { return true }
-  cwSlotAliasOf(nm, fr) >= 0
+  cwSlotAliasOf(bd) >= 0
 }
 
 // Add to `vals` and `ats` what each write through the name (`nm`, `fr`) stores at `path`;
@@ -1948,9 +1955,7 @@ function cwSlotDescend(
     return true
   }
   const n = nodeAt(v)
-  if n is Ident {
-    return cwSlotDescendBinding(v, n.identName, path, k, vals, ats)
-  }
+  if n is Ident { return cwSlotDescendBinding(v, path, k, vals, ats) }
   if path[k] == "[]" {
     if cwFreshMap(v) { return true }
     if !(n is ArrayLit) { return false }
@@ -1978,15 +1983,14 @@ let cwDescendDepth = 0
 // `v` is not a framed binding bound once, or the chain of bindings is deeper than 16.
 function cwSlotDescendBinding(
   v: i32,
-  nm: string,
   path: string[],
   k: i32,
   vals: i32[],
   ats: i32[],
 ): boolean {
   if !cwFramedNode(v) || cwDescendDepth >= 16 { return false }
-  const fr = covarRootFrame(v)
-  if fr == CW_FR_UNKNOWN { return false }
+  const b = cwBindingOf(v)
+  if b < 0 { return false }
   const sub: string[] = []
   let i = k
   while i < path.length {
@@ -1994,7 +1998,7 @@ function cwSlotDescendBinding(
     i = i + 1
   }
   cwDescendDepth = cwDescendDepth + 1
-  const got = cwSlotWrittenValues(nm, fr, sub, vals, ats)
+  const got = cwSlotWrittenValues(b, sub, vals, ats)
   cwDescendDepth = cwDescendDepth - 1
   got >= 0
 }
@@ -2024,7 +2028,7 @@ function cwFvAddNamed(v: i32, out: i32[]): boolean {
       if !i32ListHas(out, d) { out.push(d) }
       return true
     }
-    const ts = cwFvTargetsOf(n.identName, vf)
+    const ts = cwFvTargetsOf(cwBindingOf(v))
     if ts.length > 0 && ts[0] < 0 { return false }
     let i = 0
     while i < ts.length {
@@ -2141,7 +2145,7 @@ export function cwCalleeDeclOf(callFnIx: i32): i32 {
   if nm == "" { return cwUfcsDeclOf(callFnIx) }
   const d = cwFnDeclOf(nm)
   if d >= 0 { return d }
-  cwLambdaDeclOf(nm, covarRootFrame(callFnIx))
+  cwLambdaDeclOf(cwBindingOf(callFnIx))
 }
 
 // The declaration a UFCS callee (`xs.f(y)`) reaches: the member's PROPERTY names the free
