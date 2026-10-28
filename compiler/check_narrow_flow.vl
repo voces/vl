@@ -432,6 +432,7 @@ import {
   getSiteBank,
   keyHasPrefix,
   keyIsListEvery,
+  keySteps,
   placeKeyOf,
 } from "./check_places"
 import {
@@ -453,6 +454,8 @@ import {
   placeAt,
   placeAtKey,
   placeBare,
+  placeBelow,
+  placeBelowCell,
   placeDecl,
   placeFind,
   placeIntern,
@@ -518,7 +521,6 @@ import { crTyIsScalarBox } from "./check_ty_rep"
 import {
   holeFieldWriteTy,
   holePlaceFieldTy,
-  keySteps,
   listFitNarrowKeepsRep,
   listIsFitsAcrossReps,
   nonNullNarrowTy,
@@ -1694,22 +1696,21 @@ function placeCellDeclTy(ix: i32): i32 {
   -1
 }
 
-// Does a write to `tgtKey` of a value typed `rt` retire the narrowing `(key, npTy)`? The one home
-// for that question, so the bare-name and property-path sides cannot disagree. An exact match
-// consults `rt` — a write the narrowing still admits keeps it — while a prefix match, in either
-// separator, retires unconditionally. An unkeyable target keys "" and its caller handles it.
-function writeRetiresNarrowing(
-  tgtKey: string,
-  rt: i32,
-  key: string,
-  npTy: i32,
-) {
-  if tgtKey == "" { return false }
-  // A hole admits every write, so its narrowing is retired and re-derived from the value (D3197).
-  if key == tgtKey && tyIsHole(npTy) { return true }
-  if key == tgtKey { return !assignable(rt, npTy) }
-  if keyHasPrefix(key, tgtKey + ".") { return true }
-  keyHasPrefix(key, tgtKey + "[")
+// Does a write to place `tgt` of a value typed `rt` retire the narrowing of place `p` to `npTy`?
+// The one home for that question, so the bare-name and property-path sides cannot disagree. The
+// target's own narrowing consults `rt` (`writeRetiresOwn`), and a place below it retires
+// unconditionally. An unplaced target is PLACE_NONE and its caller handles it.
+function writeRetiresNarrowing(tgt: i32, rt: i32, p: i32, npTy: i32) {
+  if tgt < 0 { return false }
+  if p == tgt { return writeRetiresOwn(rt, npTy) }
+  placeBelow(p, tgt)
+}
+
+// Whether a write of a value typed `rt` retires the narrowing to `npTy` of the place it writes:
+// one the narrowing does not admit. A hole admits every write, so its narrowing is retired and
+// re-derived from the value (D3197).
+function writeRetiresOwn(rt: i32, npTy: i32): boolean {
+  tyIsHole(npTy) || !assignable(rt, npTy)
 }
 
 // Whether the write target at `tgtIx` is a field or a cell of a receiver typed as an inference
@@ -1735,6 +1736,7 @@ function writesHoleField(tgtIx: i32): boolean {
 function retireAliasedNarrowings(
   tgtIx: i32,
   tgtKey: string,
+  tgtPlace: i32,
   rt: i32,
   atIx: i32,
 ) {
@@ -1749,19 +1751,17 @@ function retireAliasedNarrowings(
     const rn = nodeAt(recv)
     if rn is Ident { recvName = rn.identName }
   }
-  let family = ""
-  if tgtKey == "" { family = indexRootKeyOf(tgtIx) }
+  let family = PLACE_NONE
+  if tgtKey == "" { family = indexRootPlaceOf(tgtIx) }
   const recvFresh = recvName != ""
     && crSoleRefHolds(slotVisibleOf(identSlotOf(recv, recvName)))
   const n0 = npKeys.length
   let i = 0
   while i < n0 {
     const k = npKeys[i]
-    const own = tgtKey != ""
-      && (k == tgtKey
-      || keyHasPrefix(k, tgtKey + ".")
-      || keyHasPrefix(k, tgtKey + "["))
-    const fam = family != "" && keyHasPrefix(k, family + "[")
+    const own = tgtPlace >= 0
+      && (npPlace[i] == tgtPlace || placeBelow(npPlace[i], tgtPlace))
+    const fam = placeBelowCell(npPlace[i], family)
     const kRoot = placeRootOf(k)
     // A receiver no other place refers to cannot be any object on another key's path; a key
     // root no other place refers to cannot be the receiver unless the receiver names it. Both
@@ -1943,7 +1943,7 @@ export function retireNarrowingsForWrite(
   const tgtKey = placeKeyOf(tgtIx)
   // Found, not made: most writes are to places no narrowing names, and a push below makes it.
   let tgtPlace = placeAtKey(tgtIx, tgtKey)
-  retireAliasedNarrowings(tgtIx, tgtKey, rt, atIx)
+  retireAliasedNarrowings(tgtIx, tgtKey, tgtPlace, rt, atIx)
   // A variable-index write names no cell and therefore may have hit any of them. `xs[i] = null`
   // keys "" and the loop below would retire nothing at all, which is a soundness hole the moment
   // a narrowing can name a cell. Retire every live narrowing under the receiver; the cell keys
@@ -1987,7 +1987,7 @@ export function retireNarrowingsForWrite(
     // legible: `w.f = mk()` is one statement whose right-hand side is checked first, so an opaque
     // `mk` marks the path and the write would otherwise be reported as the call's. The cause is
     // what `pathRetiredByAssign` reads to decide whether the emitter can see the retirement.
-    let hit = writeRetiresNarrowing(tgtKey, rt, npKeys[i], npTys[i])
+    let hit = writeRetiresNarrowing(tgtPlace, rt, npPlace[i], npTys[i])
     // An enclosing function's narrowing a nested body writes ends where that body is CALLED,
     // which the call rule settles for both halves; the write runs later than this point.
     if i < crFnNpBase() { hit = false }
@@ -2008,7 +2008,7 @@ export function retireNarrowingsForWrite(
         hit = true
       }
     }
-    narClobUnderWrite(i, tgtKey)
+    narClobUnderWrite(i, tgtPlace)
     if hit {
       narSetInv(i, atIx)
       noteKillSure(atIx, npKeys[i])
@@ -2085,15 +2085,11 @@ export function retireNarrowingsForWrite(
   0
 }
 
-// A write to a prefix of narrowing `i`'s key replaces the object the key reads through, so the
-// key is unknown after it on this path, whatever the write stored and whether or not a sibling
+// A write to a place above narrowing `i`'s replaces the object the narrowed place reads through,
+// so it is unknown after it on this path, whatever the write stored and whether or not a sibling
 // arm already ended the narrowing in place (D3319). Pushes that clobber row.
-function narClobUnderWrite(i: i32, tgtKey: string) {
-  if (
-    i >= crFnNpBase()
-    && (keyHasPrefix(npKeys[i], tgtKey + ".")
-      || keyHasPrefix(npKeys[i], tgtKey + "["))
-  ) {
+function narClobUnderWrite(i: i32, tgt: i32) {
+  if i >= crFnNpBase() && placeBelow(npPlace[i], tgt) {
     let kprev = -1
     if npInvBy[i] < 0 { kprev = npTys[i] }
     narClobPlacePush(npPlace[i])
@@ -2165,21 +2161,31 @@ function narClobPathWrite(
   }
 }
 
+// The place of the receiver the index place `ix` subscripts, when one has been made, else
+// PLACE_NONE: a receiver no narrowing is under has no place.
+function indexRootPlaceOf(ix: i32): i32 {
+  const n = nodeAt(peelParenIx(ix))
+  if n is Index { return placeAt(n.idxArr) }
+  PLACE_NONE
+}
+
 // The variable-index arm of `retireNarrowingsForWrite`: a write `atIx` of type `rt` to index
 // place `tgtIx`, whose key is "", retires every live narrowing under the receiver's root.
 // Answers nothing; a receiver with no root key retires none.
 function retireIndexedNarrowings(tgtIx: i32, rt: i32, atIx: i32) {
   const root = indexRootKeyOf(tgtIx)
-  if root == "" { return }
-  const pfx = root + "["
+  const rootPlace = indexRootPlaceOf(tgtIx)
+  if rootPlace < 0 { return }
+  const every = placeFind(placeDecl(rootPlace), root + LIST_EVERY_STEP)
   const depth = elemDepthOf(tgtIx)
   const val = asgRhsIx(atIx)
   let r = 0
   while r < npKeys.length {
     // A store through a list narrowed by name is checked against its narrowed element.
     if (
-      keyHasPrefix(npKeys[r], pfx)
-      && !(keyHasPrefix(npKeys[r], root + LIST_EVERY_STEP) && narFitNameOf(r) != "")
+      placeBelowCell(npPlace[r], rootPlace)
+      && !((npPlace[r] == every || placeBelow(npPlace[r], every))
+        && narFitNameOf(r) != "")
       && !(elemKeyBase(npKeys[r]) == root && elemOnlyStoreKeeps(r, depth, val, rt))
     ) {
       let rprev = -1
@@ -2216,7 +2222,7 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       let rn = writeReNarrowTy(dcl, rt)
       // What the arm join reads a write that kept its narrowing as ending at.
       let keptEnd = rn
-      let retires = writeRetiresNarrowing(nm, rt, nm, pre)
+      let retires = writeRetiresOwn(rt, pre)
       // Under a guard the write re-narrows to what it stored, as a declaration-typed write
       // would, even when the narrowing already admitted it (`5` into an `f64` arm).
       if guarded {
@@ -3342,9 +3348,7 @@ function crLoopLeavingPathWrite(ix: i32, p: i32, pre: i32): i32 {
 function loopWriteMayReach(tgt: i32, val: i32, p: i32, pre: i32): boolean {
   const key = placeText(p)
   const tk = placeKeyOf(tgt)
-  if tk != "" && (keyHasPrefix(key, tk + ".") || keyHasPrefix(key, tk + "[")) {
-    return true
-  }
+  if tk != "" && placeBelow(p, placeAtKey(tgt, tk)) { return true }
   const steps = keySteps(key)
   if steps.length == 0 { return false }
   const last = steps[steps.length - 1]
