@@ -131,6 +131,7 @@ import {
   crStmtScopes,
   crWideDepths,
   crWideNames,
+  crWideSlots,
 } from "./check_capture_rows"
 import {
   crCaptureByRef,
@@ -324,8 +325,8 @@ import {
   NAR_KIND_GUARD,
   NAR_KIND_POSTGUARD,
   asgDeclDepths,
-  asgDeclKeys,
   asgDeclKinds,
+  asgDeclSlots,
   asgDeclStamps,
   narBankPopFrame,
   narDeclaredTy,
@@ -334,9 +335,10 @@ import {
 } from "./check_nar_bank"
 import {
   narNoteWritten,
-  narWrDepths,
-  narWrNames,
+  narWrPathDepths,
+  narWrPaths,
   narWrPopTo,
+  narWrSlots,
   narWrittenPath,
 } from "./check_nar_written"
 import {
@@ -376,10 +378,10 @@ import {
   narGuardSlot,
   narIpApply,
   narIpAt,
-  narIpName,
   narIpNew,
   narIpOld,
   narIpScope,
+  narIpSlot,
   narKeyBind,
   narPathHeldNonNull,
   narSetInv,
@@ -457,16 +459,23 @@ import {
 import {
   constDeclOf,
   constScopes,
+  declDepthOf,
   declare,
+  envDeclOfNameForFlow,
   fnAliasScopes,
   fnDeclScopes,
+  identSlotOf,
   isConstName,
   lookup,
-  lookupDepth,
   scopeDeclLog,
   scopeDepthsOf,
   scopeFramePop,
-  scopeTyAt,
+  slotLayerDepth,
+  slotLayerPrev,
+  slotLayerTop,
+  slotLayerTy,
+  slotNameOf,
+  slotTyAt,
 } from "./check_scopes"
 import {
   narDefChain,
@@ -663,7 +672,7 @@ export function narIpUndoArm(lo: i32, headDepth: i32, headNp: i32) {
     const at = narIpAt[j]
     if narIpScope[j] {
       if at < headDepth && narIpOld[j] >= 0 {
-        narSetScope(at, narIpName[j], narIpOld[j])
+        narSetScope(at, narIpSlot[j], narIpOld[j])
       }
     } else if at < headNp {
       narSetInv(at, narIpOld[j])
@@ -681,10 +690,10 @@ export function narIpRedoArm(lo: i32, hi: i32) {
     const at = narIpAt[j]
     const was = narIpOld[j]
     if narIpScope[j] {
-      const name = narIpName[j]
-      const now = scopeTyAt(at, name)
+      const s = narIpSlot[j]
+      const now = slotTyAt(s, at)
       if now == narIpNew[j] || (now >= 0 && assignable(now, was)) {
-        narSetScope(at, name, was)
+        narSetScope(at, s, was)
       }
     } else if npInvBy[at] == narIpNew[j] || was >= 0 {
       narSetInv(at, was)
@@ -874,7 +883,7 @@ function narInstallJoin(ix: i32, key: string, jt: i32, viaChain: boolean) {
   if cur >= 0 && jt != cur {
     // Banked like the post-guard fall-through, so a write below is checked against storage
     // and a call that may write the name ends it (D2390).
-    noteNarShadow(key, cur, NAR_KIND_POSTGUARD)
+    noteNarShadow(envDeclOfNameForFlow(key), cur, NAR_KIND_POSTGUARD)
     declare(key, jt)
     narFitCompanions(key, cur, jt)
     recordArmJoin(ix, key, jt)
@@ -887,19 +896,17 @@ function narInstallJoin(ix: i32, key: string, jt: i32, viaChain: boolean) {
 
 // Retire in place every narrowing layer of `name` in the current function, inside the loop
 // barrier, that does not admit `now`, the type the write left it at: each reads `store` after.
-function narRetireLayers(name: string, now: i32, store: i32) {
-  const ds = scopeDepthsOf[name]
-  if ds == null { return 0 }
+function narRetireLayers(s: i32, now: i32, store: i32) {
   const base = crFnBase()
   let bar = 0
   if reScopeBases.length > 0 { bar = reScopeBases[reScopeBases.length - 1] }
-  let j = ds.length - 1
-  while j >= 0 {
-    const d = ds[j]
-    if d < base || d < bar || crFirstBank(name, d) < 0 { return 0 }
-    const t = scopeTyAt(d, name)
-    if t >= 0 && !assignable(now, t) { narSetScope(d, name, store) }
-    j = j - 1
+  let e = slotLayerTop(s)
+  while e >= 0 {
+    const d = slotLayerDepth(e)
+    if d < base || d < bar || crFirstBank(s, d) < 0 { return 0 }
+    const t = slotLayerTy(e)
+    if t >= 0 && !assignable(now, t) { narSetScope(d, s, store) }
+    e = slotLayerPrev(e)
   }
   0
 }
@@ -1531,8 +1538,9 @@ export function writeStorageTy(ix: i32) {
       // A guard's write is bounded by a loop barrier, and a nested function that captured the
       // narrowing is checked at each call instead (D2402). An assignment narrowing's is not: its
       // null write in a single-iteration loop is a correct program barring would reject.
-      if narGuardSlot(n.identName) >= 0 { return narWriteStorage(n.identName) }
-      return narDeclaredTy(n.identName, NAR_KIND_ASG)
+      const s = identSlotOf(ix, n.identName)
+      if narGuardSlot(s) >= 0 { return narWriteStorage(s) }
+      return narDeclaredTy(s, NAR_KIND_ASG)
     }
     Member => {
       const key = placeKeyOf(ix)
@@ -1581,10 +1589,11 @@ export function writeLeavesLoopEntry(tgtIx: i32, rt: i32): boolean {
   if rt < 0 { return false }
   const n = nodeAt(tgtIx)
   if n is Ident {
-    if narGuardSlot(n.identName) < 0 { return false }
-    const cap = narWriteStorage(n.identName)
+    const s = identSlotOf(tgtIx, n.identName)
+    if narGuardSlot(s) < 0 { return false }
+    const cap = narWriteStorage(s)
     const depths: i32[] = []
-    const wide = crChainWidest(n.identName, depths)
+    const wide = crChainWidest(s, depths)
     if cap < 0 || wide < 0 || tySame(cap, wide) { return false }
     return !writeLandsWithin(wide, rt, cap)
   }
@@ -1929,8 +1938,8 @@ export function retireNarrowingsForWrite(
     const pst = placeStoreTy(tgtIx)
     rt = asgLitRhsTy(atIx, pst, rt)
     if tyAdmitsNull(pst) && !narWrittenPath(tgtKey) {
-      narWrNames.push(tgtKey)
-      narWrDepths.push(T.frames.length - 1)
+      narWrPaths.push(tgtKey)
+      narWrPathDepths.push(T.frames.length - 1)
     }
   }
   let i = 0
@@ -2169,10 +2178,11 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
   const tn = nodeAt(tgtIx)
   if tn is Ident {
     const nm = tn.identName
-    let dcl = narDeclaredTy(nm, -1)
-    const guarded = dcl >= 0 && narGuardSlot(nm) >= 0
+    const s = identSlotOf(tgtIx, nm)
+    let dcl = narDeclaredTy(s, -1)
+    const guarded = dcl >= 0 && narGuardSlot(s) >= 0
     if guarded {
-      const ws = narWriteStorage(nm)
+      const ws = narWriteStorage(s)
       if ws >= 0 { dcl = ws }
     }
     if dcl >= 0 {
@@ -2206,22 +2216,22 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       if retires {
         // The RETIREMENT goes back in place, so it outlives whatever inner block holds the
         // write: a narrowing the write falsified must not resurrect at that block's `}`.
-        const d = lookupDepth(nm)
-        if guarded { narRetireLayers(nm, rn, dcl) }
-        if d >= 0 { narSetScope(d, nm, dcl) }
+        const d = declDepthOf(s)
+        if guarded { narRetireLayers(s, rn, dcl) }
+        if d >= 0 { narSetScope(d, s, dcl) }
         // The RE-NARROW — the one member of the declaration the written value can be — is a
         // shadow in the CURRENT block instead, because that is exactly how long the emitter's
         // own push lives (its `restoreNarrow` unwinds at the same `}`). Banked at the
         // assignment node so both halves lower the reads after the write alike (D1736).
         if rn != dcl {
-          noteNarShadow(nm, dcl, NAR_KIND_GUARD)
+          noteNarShadow(s, dcl, NAR_KIND_GUARD)
           declare(nm, rn)
         }
         recordAsgNarTyIx(atIx, rn)
       }
       // The emitter reads the place at its declaration; the reads' own types carry the pin.
       if tvWrite { recordAsgTvWrite(atIx, dcl) }
-      if guarded && tyAdmitsNull(dcl) { narNoteWritten(nm) }
+      if guarded && tyAdmitsNull(dcl) { narNoteWritten(s) }
       // A kept write ends at the member of the declaration it stored, when that is narrower
       // than the narrowing it kept (a nullable union's inner member); else at that narrowing.
       if !retires && !guarded { keptEnd = writeMemberTy(dcl, rt) }
@@ -2541,7 +2551,7 @@ export function narListDeliveryErr(
   // A field or subscript place is typed as declared, the narrowing being on its elements alone.
   let decl = srcTy
   if !isPathKey(name) {
-    decl = narDeclaredTy(name, -1)
+    decl = narDeclaredTy(envDeclOfNameForFlow(name), -1)
     if decl < 0 { decl = lookup(name) }
     let r = 0
     while r < rows && decl >= 0 {
@@ -2696,16 +2706,17 @@ export function crCaptureWiden(fnIx: i32) {
     f = f + 1
   }
   const base = crFnBase()
-  if asgDeclKeys.length == 0 || asgDeclDepths[0] >= base { return 0 }
+  if asgDeclSlots.length == 0 || asgDeclDepths[0] >= base { return 0 }
   let escapes = -1
   // Only a name the body reads needs an answer.
   const reads = crBodyReadNames(fnIx)
   let r = 0
   while r < reads.length {
     const nm = reads[r]
-    const i = crInnerRowBelow(nm, base)
+    const s = envDeclOfNameForFlow(nm)
+    const i = crInnerRowBelow(s, base)
     if i >= 0 {
-      const wide = crOuterWidest(nm, base)
+      const wide = crOuterWidest(s, base)
       if wide >= 0 && wide != lookup(nm) {
         if inferQuiet && strListHas(prior, nm) {
           crDeclareWidened(nm, wide)
@@ -2780,7 +2791,9 @@ function crCaptureLosesNarrowing(
 ): boolean {
   if kind == NAR_KIND_GUARD { return false }
   if crCallbackKeeps(fnIx, name) { return false }
-  if crNameIsModuleTop(name) { return crNameNulledInProgram(name) }
+  if crNameIsModuleTop(envDeclOfNameForFlow(name)) {
+    return crNameNulledInProgram(name)
+  }
   // A shared cell of a scalar box is read at the box, so any later write ends it there (D2555).
   crCaptureByRef(crDeclFrameOf(name), name, crTyIsScalarBox(wide))
 }
@@ -2882,7 +2895,7 @@ function crCallbackKeeps(fnIx: i32, key: string): boolean {
 // The bare-name narrowings the call at `callIx` ends — a `Call`, or an operator that dispatched
 // to a declaration. Runs after the call is checked, with the statement holding it still open.
 export function crNoteCallBare(callIx: i32) {
-  if asgDeclKeys.length == 0 || crStmtIxs.length == 0 { return 0 }
+  if asgDeclSlots.length == 0 || crStmtIxs.length == 0 { return 0 }
   // A body checked with no statement of its own open (a monomorphization re-check) banks
   // nothing: the open statement is its caller's.
   if crStmtFns[crStmtFns.length - 1] != crFnBases.length { return 0 }
@@ -2922,8 +2935,8 @@ function crCallCandidates(): string[] {
   }
   ccTruncate(c)
   let i = c.rows
-  while i < asgDeclKeys.length {
-    const nm = asgDeclKeys[i]
+  while i < asgDeclSlots.length {
+    const nm = slotNameOf(asgDeclSlots[i])
     if asgDeclDepths[i] >= base && (c.first[nm] ?? -1) < 0 {
       c.first[nm] = i
       c.names.push(nm)
@@ -2932,7 +2945,7 @@ function crCallCandidates(): string[] {
     }
     i = i + 1
   }
-  c.rows = asgDeclKeys.length
+  c.rows = asgDeclSlots.length
   if c.rows > 0 { c.stamp = asgDeclStamps[c.rows - 1] }
   // A name declared again since may have become one a call retires.
   let g = c.log
@@ -2995,7 +3008,7 @@ function ccFresh(root: i32, fb0: i32, base: i32, rows: i32): CallCands {
 
 // The first bank row at depth `base` or deeper; the bank's depths never fall along it.
 function ccFrameStart(base: i32): i32 {
-  let i = asgDeclKeys.length
+  let i = asgDeclSlots.length
   while i > 0 && asgDeclDepths[i - 1] >= base { i = i - 1 }
   i
 }
@@ -3005,10 +3018,10 @@ function ccFrameStart(base: i32): i32 {
 function ccTruncate(c: CallCands) {
   if c.rows == 0 { return 0 }
   let keep = c.rows
-  if keep > asgDeclKeys.length || asgDeclStamps[keep - 1] != c.stamp {
+  if keep > asgDeclSlots.length || asgDeclStamps[keep - 1] != c.stamp {
     let lo = 0
     let hi = keep
-    if hi > asgDeclKeys.length { hi = asgDeclKeys.length }
+    if hi > asgDeclSlots.length { hi = asgDeclSlots.length }
     while lo < hi {
       const mid = (lo + hi) / 2
       if asgDeclStamps[mid] <= c.stamp { lo = mid + 1 } else { hi = mid }
@@ -3160,7 +3173,7 @@ export function crLoopPreRetire(loopIx: i32) {
     crLoopPathPreRetire(loopIx)
     cbPendClear()
   }
-  if asgDeclKeys.length == 0 { return 0 }
+  if asgDeclSlots.length == 0 { return 0 }
   const names = crLiveNames()
   let i = 0
   while i < names.length {
@@ -3168,7 +3181,11 @@ export function crLoopPreRetire(loopIx: i32) {
     if crMayBeWritten(names[i]) { c = crFirstWritingCall(loopIx, names[i]) }
     // So does a write in the loop that leaves a guard's narrowing (D2609), or a straight-line
     // null strip's: the reads at the loop's top run again after it (D3302).
-    if c < 0 && !isPathKey(names[i]) && narDeclaredTy(names[i], -1) >= 0 {
+    if (
+      c < 0
+      && !isPathKey(names[i])
+      && narDeclaredTy(envDeclOfNameForFlow(names[i]), -1) >= 0
+    ) {
       c = crLoopLeavingWrite(loopIx, names[i])
     }
     if c >= 0 { crRetire(names[i], c, true, loopIx) }
@@ -3344,7 +3361,7 @@ function crLoopLeavingWrite(ix: i32, name: string): i32 {
   if n is FuncDecl { return -1 }
   if n is BinExpr {
     if n.binOp == "=" && placeKeyOf(n.binLeft) == name {
-      const store = narWriteStorage(name)
+      const store = narWriteStorage(envDeclOfNameForFlow(name))
       const pre = lookup(name)
       let vt = loopWritePeekTy(n.binRight, store)
       if vt >= 0 && store >= 0 && pre >= 0 {
@@ -4114,7 +4131,7 @@ export function applyNarrows(names: string[], tys: i32[]) {
       if wasConst { wasDecl = constDeclOf(names[i]) }
       const declTy = lookup(names[i])
       if declTy >= 0 && declTy != tys[i] {
-        noteNarShadow(names[i], declTy, NAR_KIND_GUARD)
+        noteNarShadow(envDeclOfNameForFlow(names[i]), declTy, NAR_KIND_GUARD)
       }
       declare(names[i], tys[i])
       if declTy >= 0 && declTy != tys[i] {
@@ -4139,9 +4156,12 @@ export function popScope() {
   ) {
     crWideDepths.pop()
     crWideNames.pop()
+    crWideSlots.pop()
   }
   crPopSoleTo(T.frames.length - 1)
-  if narWrNames.length > 0 { narWrPopTo(T.frames.length - 1) }
+  if narWrSlots.length > 0 || narWrPaths.length > 0 {
+    narWrPopTo(T.frames.length - 1)
+  }
   scopeFramePop()
   constScopes.pop()
   fnDeclScopes.pop()

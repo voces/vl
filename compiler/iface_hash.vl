@@ -28,7 +28,7 @@ import {
 import { i32ToStr, nodeToks } from "./ast"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
 import { TokKind, isIdPart } from "./lexer"
-import { lookup } from "./check_scopes"
+import { declTyOf } from "./check_scopes"
 import {
   T,
   TyArray,
@@ -101,6 +101,8 @@ let ihStMod: i32[] = []
 let ihStKind: i32[] = []
 let ihStName: string[] = []
 let ihStMerged: string[] = []
+// The declaration a `fn` or `let` row binds, from its own statement node; -1 for any other row.
+let ihStDecl: i32[] = []
 let ihStExported: boolean[] = []
 let ihStTok: i32[] = []
 let ihStSpan: i32[] = []
@@ -265,6 +267,7 @@ export function ihBegin(keys: string[]): i32 {
   ihStKind = []
   ihStName = []
   ihStMerged = []
+  ihStDecl = []
   ihStExported = []
   ihStTok = []
   ihStSpan = []
@@ -535,10 +538,17 @@ export function ihSetLean(on: boolean): i32 {
 }
 
 // Open a statement row of module `m`; `ihTokens` and `ihStClose` complete it.
-function ihStOpen(m: i32, kind: i32, merged: string, exported: boolean) {
+function ihStOpen(
+  m: i32,
+  kind: i32,
+  merged: string,
+  decl: i32,
+  exported: boolean,
+) {
   ihStMod.push(m)
   ihStKind.push(kind)
   ihStMerged.push(merged)
+  ihStDecl.push(decl)
   ihStName.push(ihSourceName(merged))
   ihStExported.push(exported)
   ihStIdLo.push(ihIds.length)
@@ -557,7 +567,7 @@ function ihStClose(cutRet: boolean, cutAny: boolean, body: i32, men: i32) {
 // The tokens `[a, b)` that belong to no top-level statement (an import, a re-export) as a root.
 function ihOrphans(m: i32, a: i32, b: i32, tops: {[string]: boolean}) {
   if a >= b { return 0 }
-  ihStOpen(m, IH_ST_ROOT, "", false)
+  ihStOpen(m, IH_ST_ROOT, "", -1, false)
   ihTokens(a, b, -1, -1, tops)
   ihStClose(false, false, IH_SEED, 0)
   0
@@ -1891,13 +1901,16 @@ export function ihModule(
       ihOrphans(m, at, start, tops)
       let kind = IH_ST_ROOT
       let merged = ""
+      let decl = -1
       if st is FuncDecl {
         kind = IH_ST_FN
         merged = st.fnName
+        decl = sx
       }
       if st is LetDecl {
         kind = IH_ST_LET
         merged = st.letName
+        decl = sx
       }
       if st is TypeDecl {
         kind = IH_ST_TYPE
@@ -1907,7 +1920,7 @@ export function ihModule(
         kind = IH_ST_TYPE
         merged = st.udName
       }
-      ihStOpen(m, kind, merged, isExp[ihSourceName(merged)] ?? false)
+      ihStOpen(m, kind, merged, decl, isExp[ihSourceName(merged)] ?? false)
       let cutLo = -1
       let cutHi = -1
       let cutRet = false
@@ -1993,10 +2006,10 @@ function ihElided(shown: string): boolean {
   false
 }
 
-// Whether the binding `merged`'s checked type is determined by its rendering and holds no
+// Whether the declaration `decl`'s checked type is determined by its rendering and holds no
 // function or type variable, so a dependent's uses of it read nothing but that type.
-export function ihPlainBinding(merged: string): boolean {
-  const ix = lookup(merged)
+export function ihPlainBinding(decl: i32): boolean {
+  const ix = declTyOf(decl)
   if ix < 0 || tyMayHoldFn(ix, 0) || tyHasTyVar(ix) { return false }
   !ihElided(tyToStr(ix))
 }
@@ -2035,7 +2048,7 @@ export function ihFinish(): i32 {
   while s < n {
     let ty = ""
     if ihStKind[s] == IH_ST_FN || ihStKind[s] == IH_ST_LET {
-      const ix = lookup(ihStMerged[s])
+      const ix = declTyOf(ihStDecl[s])
       ty = "?"
       if ix >= 0 { ty = tyToStr(ix) }
     }

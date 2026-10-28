@@ -10,7 +10,13 @@ import { FuncDecl, Ident, LetDecl, P, nodeAt } from "./ast"
 import { modSuffixOf } from "./modid"
 import { demangleName } from "./check_suggest"
 import { T } from "./check_types"
-import { IDENT_BUILTIN, identDeclOf, sidEpoch, sidOfNode } from "./symbols"
+import {
+  IDENT_BUILTIN,
+  identDeclOf,
+  sidEpoch,
+  sidOfNode,
+  sidText,
+} from "./symbols"
 import { fnDeclIx } from "./check_write_scan"
 
 // The const-binding chain, parallel to `T.frames`: each frame records which of its names carry
@@ -56,6 +62,8 @@ let envDeclTop: i32[] = []
 let envAmbTop: i32[] = []
 // Each ambient intrinsic's slot by name: what a builtin `Ident`, which names no declaration, reads.
 let envAmbOf: {[string]: i32} = Map()
+// Each ambient slot's name, by `-2 - s`: an ambient binding has no node to read its name from.
+let envAmbName: string[] = []
 // Each binding that aliases a function declaration (`const f = addT`), by the binding's declaration.
 let fnAliasOfDecl: {[i32]: i32} = Map()
 
@@ -83,6 +91,7 @@ export function scopesReset() {
   envDeclTop = []
   envAmbTop = []
   envAmbOf = Map()
+  envAmbName = []
   fnAliasOfDecl = Map()
   0
 }
@@ -169,9 +178,47 @@ function envLink(e: i32) {
   envSlotTopSet(s, e)
 }
 
-function envMintAmbient() {
+function envMintAmbient(name: string) {
   envAmbTop.push(-1)
+  envAmbName.push(name)
   -1 - envAmbTop.length
+}
+
+// The name slot `s` binds: its declaration's own, or the ambient intrinsic's.
+export function slotNameOf(s: i32): string {
+  if s >= 0 { return sidText(sidOfNode(s)) }
+  const k = -2 - s
+  if k >= 0 && k < envAmbName.length { return envAmbName[k] }
+  ""
+}
+
+// Slot `s`'s innermost live layer (a binding-log entry), or -1; `slotLayerPrev` steps outward,
+// so a walk visits the slot's own layers, deepest first, and never another binding's.
+export function slotLayerTop(s: i32) { envSlotTop(s) }
+export function slotLayerPrev(e: i32) { envLogPrev[e] }
+export function slotLayerDepth(e: i32) { envLogDepth[e] }
+export function slotLayerTy(e: i32) { envLogTy[e] }
+
+// Slot `s`'s layer at frame depth `d`, or -1.
+function slotLayerAt(s: i32, d: i32) {
+  let e = envSlotTop(s)
+  while e >= 0 && envLogDepth[e] > d { e = envLogPrev[e] }
+  if e >= 0 && envLogDepth[e] == d { return e }
+  -1
+}
+
+// The type slot `s` holds in frame `d`, or -1 when that frame does not bind it.
+export function slotTyAt(s: i32, d: i32) {
+  const e = slotLayerAt(s, d)
+  if e < 0 { return -1 }
+  envLogTy[e]
+}
+
+// Rebinds slot `s` in frame `d` to `ty` in place; a frame that does not bind it is left alone.
+export function slotTySetAt(s: i32, d: i32, ty: i32) {
+  const e = slotLayerAt(s, d)
+  if e >= 0 { envLogTy[e] = ty }
+  0
 }
 
 // Binds `name` in the innermost frame to slot `s` at type `ty`; a name the frame already binds
@@ -219,7 +266,7 @@ export function declDepthOf(decl: i32) {
 
 // The slot the `Ident` `ix`, spelled `name`, reads through: its declaration, else the ambient
 // intrinsic of its name when the binder found none, else -1.
-function identSlotOf(ix: i32, name: string) {
+export function identSlotOf(ix: i32, name: string) {
   const d = identDeclOf(ix)
   if d >= 0 { return d }
   if d != IDENT_BUILTIN { return -1 }
@@ -292,8 +339,8 @@ export function declFnAliasSet(decl: i32, fn: i32) {
 export function identFnAliasOf(ix: i32) { declFnAliasOf(identLiveDeclOf(ix)) }
 
 // The slot `name`'s innermost visible binding holds, or -1. This is a second resolver of the
-// fact the binder records per `Ident`, kept only for the by-name flow writes and queries until
-// B2 retires them (D14544); a node that holds an `Ident` or a declaration never reads it.
+// fact the binder records per `Ident`, kept only where a flow question holds a place key or a
+// name list and no node: B1b keys those by declaration and B2c deletes this (D14544).
 export function envDeclOfNameForFlow(name: string) {
   const d = lookupDepth(name)
   if d < 0 { return -1 }
@@ -308,14 +355,6 @@ export function scopeTyAt(d: i32, name: string) {
   const e = T.frames[d][name] ?? -1
   if e < 0 { return -1 }
   envLogTy[e]
-}
-
-// Rebinds `name` in frame `d` to `ty` in place; a frame that does not bind it is left alone.
-export function scopeTySetAt(d: i32, name: string, ty: i32) {
-  if d < 0 || d >= T.frames.length { return 0 }
-  const e = T.frames[d][name] ?? -1
-  if e >= 0 { envLogTy[e] = ty }
-  0
 }
 
 // The slot `name` binds in frame `d`, or -1.
@@ -500,7 +539,7 @@ export function declareDecl(decl: i32, name: string, ty: i32) {
 
 // Binds the ambient intrinsic `name`, which no declaration makes, to `ty` in the innermost frame.
 export function declareAmbient(name: string, ty: i32) {
-  const s = envMintAmbient()
+  const s = envMintAmbient(name)
   envAmbOf[name] = s
   scopeDepthNote(-1, name)
   envBind(s, name, ty)

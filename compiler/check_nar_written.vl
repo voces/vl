@@ -1,44 +1,88 @@
-// Writes under a narrowing: the places a guarded write stored into, dropped as their scope
+// Writes under a narrowing: the bindings a guarded write stored into, dropped as their scope
 // closes.
 // Does not import the checker.
-import { Ident, nodeAt } from "./ast"
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  LoopVar,
+  MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  nodeAt,
+} from "./ast"
 import { asgDeclaredTy } from "./check_nar_bank"
 import { placeKeyOf } from "./check_places"
-import { lookupDepth } from "./check_scopes"
+import { declDepthOf, identSlotOf } from "./check_scopes"
 
-// Bare names a write under a guard stored into, with the scope depth their binding reads at:
+// Binding slots a write under a guard stored into, with the scope depth their binding reads at:
 // their storage may hold `null` again, so a null test of them is a real question, as it is for
 // an assignment's narrowing. Unwound with the scope.
-export let narWrNames: string[] = []
+export let narWrSlots: i32[] = []
 export let narWrDepths: i32[] = []
-
-function narWrittenName(name: string): boolean {
-  const d = lookupDepth(name)
-  if d < 0 { return false }
-  let i = narWrNames.length - 1
-  while i >= 0 {
-    if narWrDepths[i] == d && narWrNames[i] == name { return true }
-    i = i - 1
-  }
-  false
-}
+// The same for a field or cell, by its place key.
+export let narWrPaths: string[] = []
+export let narWrPathDepths: i32[] = []
 
 // Whether a write under a narrowing stored into the place keyed `key` in a scope still open.
 export function narWrittenPath(key: string): boolean {
   if key == "" { return false }
-  let i = narWrNames.length - 1
+  let i = narWrPaths.length - 1
   while i >= 0 {
-    if narWrNames[i] == key { return true }
+    if narWrPaths[i] == key { return true }
     i = i - 1
   }
   false
 }
 
-// Record that a write under a guard stored into `name` (`narWrittenName`).
-export function narNoteWritten(name: string) {
-  const d = lookupDepth(name)
-  if d < 0 || narWrittenName(name) { return 0 }
-  narWrNames.push(name)
+function narWrittenSlot(s: i32): boolean {
+  const d = declDepthOf(s)
+  if d < 0 { return false }
+  let i = narWrSlots.length - 1
+  while i >= 0 {
+    if narWrDepths[i] == d && narWrSlots[i] == s { return true }
+    i = i - 1
+  }
+  false
+}
+
+// Record that a write under a guard stored into slot `s` (`narWrittenSlot`).
+export function narNoteWritten(s: i32) {
+  const d = declDepthOf(s)
+  if d < 0 || narWrittenSlot(s) { return 0 }
+  narWrSlots.push(s)
   narWrDepths.push(d)
   0
 }
@@ -47,35 +91,73 @@ export function narNoteWritten(name: string) {
 export function narWrPopTo(d: i32) {
   let i = 0
   let k = 0
-  while i < narWrNames.length {
+  while i < narWrSlots.length {
     if narWrDepths[i] < d {
-      narWrNames[k] = narWrNames[i]
+      narWrSlots[k] = narWrSlots[i]
       narWrDepths[k] = narWrDepths[i]
       k = k + 1
     }
     i = i + 1
   }
-  while narWrNames.length > k {
-    narWrNames.pop()
+  while narWrSlots.length > k {
+    narWrSlots.pop()
     narWrDepths.pop()
+  }
+  i = 0
+  k = 0
+  while i < narWrPaths.length {
+    if narWrPathDepths[i] < d {
+      narWrPaths[k] = narWrPaths[i]
+      narWrPathDepths[k] = narWrPathDepths[i]
+      k = k + 1
+    }
+    i = i + 1
+  }
+  while narWrPaths.length > k {
+    narWrPaths.pop()
+    narWrPathDepths.pop()
   }
   0
 }
 
 // True when `ix` is a bare name that an assignment narrowed away from a declared type — a place
 // whose storage can still hold null even though its current flow type cannot. The null-test
-// legality question, and nothing else.
-export function isAsgNarrowedName(ix: i32) {
+// legality question, and nothing else. A field or cell is never recorded here.
+export function isAsgNarrowedName(ix: i32): boolean {
   const n = nodeAt(ix)
   if n is Ident {
-    return asgDeclaredTy(n.identName) >= 0 || narWrittenName(n.identName)
+    const s = identSlotOf(ix, n.identName)
+    if s == -1 { return false }
+    return asgDeclaredTy(s) >= 0 || narWrittenSlot(s)
   }
-  // A field or cell keys by its path; any other node keys "", which no write recorded.
-  narWrittenPath(placeKeyOf(ix))
+  // A parenthesised name counts its guarded writes only; a field or cell keys by its path.
+  narWrittenParen(ix) || narWrittenPath(placeKeyOf(ix))
+}
+
+function narWrittenParen(ix: i32): boolean {
+  const n = nodeAt(ix)
+  match n {
+    Paren => {
+      return narWrittenParen(n.parInner)
+    }
+    Ident => {
+      const s = identSlotOf(ix, n.identName)
+      let i = narWrSlots.length - 1
+      while i >= 0 {
+        if narWrSlots[i] == s { return true }
+        i = i - 1
+      }
+    }
+    // A field or cell answers by its path key; any other kind is no place.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Index | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+  }
+  false
 }
 
 // Clears this module's tables (called from `initChecker`).
 export function narWrittenReset() {
-  narWrNames = []
+  narWrSlots = []
   narWrDepths = []
+  narWrPaths = []
+  narWrPathDepths = []
 }

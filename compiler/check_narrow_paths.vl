@@ -3,15 +3,23 @@
 // Emptied by `narPathsReset`. Does not import the checker.
 import {
   constScopes,
+  declDepthOf,
+  envDeclOfNameForFlow,
   fnAliasScopes,
   fnDeclScopes,
+  identSlotOf,
   isConstName,
   lookup,
   lookupDepth,
   scopeDepthsOf,
   scopeFramePush,
-  scopeTyAt,
-  scopeTySetAt,
+  scopeSlotAt,
+  slotLayerDepth,
+  slotLayerPrev,
+  slotLayerTop,
+  slotLayerTy,
+  slotTyAt,
+  slotTySetAt,
 } from "./check_scopes"
 import {
   ArrayLit,
@@ -146,11 +154,13 @@ import {
 } from "./check_sym_occ"
 import { calleeNameOf } from "./check_callee"
 import {
+  crBindDepthOfSlot,
   crCallBenign,
   crCurRoot,
   crFirstBank,
   crFnBase,
   crInfoKey,
+  crIsNarrowLayer,
   crNameAssignedInRoot,
   crWidenedAt,
   crWriteKey,
@@ -302,15 +312,16 @@ export function narClobberedSince(mark: i32, name: string) {
 // The scope depth of the binding `name` resolves to here: the innermost layer that declares it,
 // skipping the layers that only narrow an outer binding (`asgDeclOver`). -1 when undeclared.
 function narBindDepthOf(name: string): i32 {
-  const ds = scopeDepthsOf[name]
-  if ds == null || ds.length == 0 { return -1 }
-  let j = ds.length - 1
-  while j > 0 {
-    const e = crFirstBank(name, ds[j])
-    if e < 0 || asgDeclOver[e] { return ds[j] }
-    j = j - 1
+  const s = envDeclOfNameForFlow(name)
+  if s == -1 { return -1 }
+  let e = slotLayerTop(s)
+  if e < 0 { return -1 }
+  while slotLayerPrev(e) >= 0 {
+    const row = crFirstBank(s, slotLayerDepth(e))
+    if row < 0 || asgDeclOver[row] { return slotLayerDepth(e) }
+    e = slotLayerPrev(e)
   }
-  ds[0]
+  slotLayerDepth(e)
 }
 
 // The binding a place key's root resolves to here (`narBindDepthOf`).
@@ -333,20 +344,20 @@ export let narIpScope: boolean[] = []
 
 export let narIpAt: i32[] = []
 
-export let narIpName: string[] = []
+export let narIpSlot: i32[] = []
 
 export let narIpOld: i32[] = []
 
 export let narIpNew: i32[] = []
 
-// Rebinds `name` at scope depth `d` in place, journalled for `narHeadTy`.
-export function narSetScope(d: i32, name: string, ty: i32) {
+// Rebinds slot `s` at scope depth `d` in place, journalled for `narHeadTy`.
+export function narSetScope(d: i32, s: i32, ty: i32) {
   narIpScope.push(true)
   narIpAt.push(d)
-  narIpName.push(name)
-  narIpOld.push(scopeTyAt(d, name))
+  narIpSlot.push(s)
+  narIpOld.push(slotTyAt(s, d))
   narIpNew.push(ty)
-  scopeTySetAt(d, name, ty)
+  slotTySetAt(s, d, ty)
   0
 }
 
@@ -354,7 +365,7 @@ export function narSetScope(d: i32, name: string, ty: i32) {
 export function narSetInv(i: i32, by: i32) {
   narIpScope.push(false)
   narIpAt.push(i)
-  narIpName.push("")
+  narIpSlot.push(-1)
   narIpOld.push(npInvBy[i])
   narIpNew.push(by)
   npInvBy[i] = by
@@ -368,7 +379,7 @@ export function narIpApply(f: IfChk, j: i32, undo: boolean) {
   if undo { v = narIpOld[j] }
   const at = narIpAt[j]
   if narIpScope[j] {
-    if at < f.headDepth && v >= 0 { scopeTySetAt(at, narIpName[j], v) }
+    if at < f.headDepth && v >= 0 { slotTySetAt(narIpSlot[j], at, v) }
   } else if at < f.headNp {
     npInvBy[at] = v
   }
@@ -431,12 +442,12 @@ export function narCompactIf(
   0
 }
 
-// The bank slot of the live guard or post-guard narrowing of `name`, or -1: the narrowings under
-// which a write the declaration admits is accepted and re-narrows the name.
-export function narGuardSlot(name: string) {
-  const d = lookupDepth(name)
+// The bank row of the live guard or post-guard narrowing of slot `s`, or -1: the narrowings under
+// which a write the declaration admits is accepted and re-narrows the binding.
+export function narGuardSlot(s: i32) {
+  const d = declDepthOf(s)
   if d < 0 { return -1 }
-  const rows = narBankRowsOf(name)
+  const rows = narBankRowsOf(s)
   let r = rows.length - 1
   while r >= 0 {
     const i = rows[r]
@@ -449,28 +460,27 @@ export function narGuardSlot(name: string) {
   -1
 }
 
-// The type a write to the guard-narrowed name `name` is checked against: the widest layer of its
-// narrowing chain in the current function. A loop barrier caps it at the type the name had when
-// the loop began, since the reads before the write run again; -1 when every layer is outside it.
-export function narWriteStorage(name: string): i32 {
-  const ds = scopeDepthsOf[name]
-  if ds == null { return -1 }
+// The type a write to the guard-narrowed slot `s` is checked against: the widest layer of its
+// narrowing chain in the current function. A loop barrier caps it at the type the binding had
+// when the loop began, since the reads before the write run again; -1 when every layer is outside.
+export function narWriteStorage(s: i32): i32 {
+  if s == -1 { return -1 }
   const base = crFnBase()
   let bar = 0
   if reScopeBases.length > 0 { bar = reScopeBases[reScopeBases.length - 1] }
   let widest = -1
-  let j = ds.length - 1
-  while j >= 0 {
-    const d = ds[j]
+  let e = slotLayerTop(s)
+  while e >= 0 {
+    const d = slotLayerDepth(e)
     if d < base { return widest }
-    const e = crFirstBank(name, d)
-    if e < 0 { return widest }
+    const row = crFirstBank(s, d)
+    if row < 0 { return widest }
     if d < bar {
       if widest < 0 { return -1 }
-      return scopeTyAt(d, name)
+      return slotLayerTy(e)
     }
-    widest = asgDeclTys[e]
-    j = j - 1
+    widest = asgDeclTys[row]
+    e = slotLayerPrev(e)
   }
   widest
 }
@@ -557,12 +567,13 @@ export function writeBarredByLoop(ix: i32) {
   const n = nodeAt(ix)
   match n {
     Ident => {
-      if narGuardSlot(n.identName) < 0 { return false }
-      if !narInsideBarrier(lookupDepth(n.identName)) { return true }
+      const s = identSlotOf(ix, n.identName)
+      if narGuardSlot(s) < 0 { return false }
+      if !narInsideBarrier(declDepthOf(s)) { return true }
       // A layer inside the loop over one outside it: the loop's entry type is what refused.
-      const w = narWriteStorage(n.identName)
+      const w = narWriteStorage(s)
       const depths: i32[] = []
-      return w >= 0 && w != crChainWidest(n.identName, depths)
+      return w >= 0 && w != crChainWidest(s, depths)
     }
     Member | Index => {
       const key = placeKeyOf(ix)
@@ -644,7 +655,9 @@ export function crNoteLostName(name: string, ix: i32) {
   if !strListHas(lost, name) { return 0 }
   // Only a captured binding: a local of the same name is the function's own.
   const bd = narBindDepthOf(name)
-  if bd >= crFnBase() && !crWidenedAt(name, bd) { return 0 }
+  if bd >= crFnBase() && !crWidenedAt(envDeclOfNameForFlow(name), bd) {
+    return 0
+  }
   crLostPush(name, ix, fnIx, crFnBases.length, true)
   0
 }
@@ -808,16 +821,15 @@ function crGlobalReaches(callIx: i32, name: string): boolean {
 // function body being checked — a module binding, while the root is a function.
 function crNameIsGlobal(name: string): boolean {
   if crFnBases.length == 0 || crCurRoot() == crProgRoot { return false }
-  const ds = scopeDepthsOf[name]
-  if ds == null { return false }
+  const s = envDeclOfNameForFlow(name)
+  if s == -1 { return false }
   // A narrowing layer, or the declared-type layer `crDeclareWidened` binds, is not a binding.
-  let j = ds.length - 1
-  while j >= 0 {
-    if ds[j] < crFnBases[0] { return true }
-    if crFirstBank(name, ds[j]) < 0 && !crWidenedAt(name, ds[j]) {
-      return false
-    }
-    j = j - 1
+  let e = slotLayerTop(s)
+  while e >= 0 {
+    const d = slotLayerDepth(e)
+    if d < crFnBases[0] { return true }
+    if !crIsNarrowLayer(s, d) { return false }
+    e = slotLayerPrev(e)
   }
   false
 }
@@ -873,20 +885,19 @@ function crCallNodeReaches(cn: Call, callIx: i32, name: string): boolean {
 
 // The type `name` reads at once every narrowing layer of the current function is gone, or -1
 // when the innermost binding is not a narrowing. Fills `depths` with the layers to rewrite.
-export function crChainWidest(name: string, depths: i32[]): i32 {
-  const ds = scopeDepthsOf[name]
-  if ds == null { return -1 }
+export function crChainWidest(s: i32, depths: i32[]): i32 {
+  if s == -1 { return -1 }
   const base = crFnBase()
   let widest = -1
-  let j = ds.length - 1
-  while j >= 0 {
-    const d = ds[j]
+  let e = slotLayerTop(s)
+  while e >= 0 {
+    const d = slotLayerDepth(e)
     if d < base { return widest }
-    const e = crFirstBank(name, d)
-    if e < 0 { return widest }
-    widest = asgDeclTys[e]
+    const row = crFirstBank(s, d)
+    if row < 0 { return widest }
+    widest = asgDeclTys[row]
     depths.push(d)
-    j = j - 1
+    e = slotLayerPrev(e)
   }
   widest
 }
@@ -915,7 +926,8 @@ export function crRetireAt(
   bind: i32,
 ) {
   const depths: i32[] = []
-  const wide = crChainWidest(name, depths)
+  const s = envDeclOfNameForFlow(name)
+  const wide = crChainWidest(s, depths)
   if wide < 0 { return 0 }
   const cur = lookup(name)
   if cur < 0 { return 0 }
@@ -933,7 +945,7 @@ export function crRetireAt(
   }
   let k = 0
   while k < depths.length {
-    narSetScope(depths[k], name, wide)
+    narSetScope(depths[k], s, wide)
     k = k + 1
   }
   // The arm join and the post-guard residual read this row exactly as a retiring write's. Its
@@ -1029,8 +1041,8 @@ export function narFitRetire(slot: i32, atIx: i32, loopIx: i32) {
 }
 
 // Whether the scope layer `d` of `name` is a narrowing rather than a declaration.
-function crIsNarrowLayer(name: string, d: i32): boolean {
-  crFirstBank(name, d) >= 0 || crWidenedAt(name, d)
+function crIsNarrowNameLayer(name: string, d: i32): boolean {
+  crIsNarrowLayer(scopeSlotAt(d, name), d)
 }
 
 // The height of the scope-depth list of `name` down to its innermost binding declared in the
@@ -1041,21 +1053,20 @@ export function crShadowedHeight(name: string, from: i32): i32 {
   if ds == null { return -1 }
   const base = crFnBase()
   let j = from - 1
-  while j >= 0 && ds[j] >= base && crIsNarrowLayer(name, ds[j]) { j = j - 1 }
+  while j >= 0 && ds[j] >= base && crIsNarrowNameLayer(name, ds[j]) {
+    j = j - 1
+  }
   if j < 0 || ds[j] < base { return -1 }
-  while j >= 0 && ds[j] >= base && !crIsNarrowLayer(name, ds[j]) { j = j - 1 }
+  while j >= 0 && ds[j] >= base && !crIsNarrowNameLayer(name, ds[j]) {
+    j = j - 1
+  }
   if j < 0 || ds[j] < base { return -1 }
   j + 1
 }
 
-// The scope depth of the binding `name` reads through its narrowing layers; the outermost layer
-// when every one is banked, since the declaration's own scope may bank a narrowing too.
+// The scope depth of the binding `name` reads through its narrowing layers (`crBindDepthOfSlot`).
 export function crBindDepthOf(name: string): i32 {
-  const ds = scopeDepthsOf[name]
-  if ds == null || ds.length == 0 { return -1 }
-  let j = ds.length - 1
-  while j > 0 && crIsNarrowLayer(name, ds[j]) { j = j - 1 }
-  ds[j]
+  crBindDepthOfSlot(envDeclOfNameForFlow(name))
 }
 
 // Whether `name` is the target of an assignment anywhere in the current root, or anywhere in the
@@ -1237,7 +1248,7 @@ export function retSiteTypedByAnnot(ix: i32, t: i32): boolean {
   if t >= 0 && tyReachesEmptyHole(t, 8) { return true }
   const p = cwPeel(ix)
   if p < 0 || p >= P.nodes.length || curFnDeclIx < 0 { return false }
-  if narDeclaredTy(identNameAt(p), -1) >= 0 { return true }
+  if narDeclaredTy(identSlotAt(p), -1) >= 0 { return true }
   const f = nodeAt(curFnDeclIx)
   const callee = callIdentName(p)
   if callee == "" || !(f is FuncDecl) { return false }
@@ -1250,6 +1261,13 @@ export function identNameAt(ix: i32): string {
   const n = nodeAt(ix)
   if n is Ident { return n.identName }
   ""
+}
+
+// The slot a bare identifier at `ix` reads, or -1.
+function identSlotAt(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if n is Ident { return identSlotOf(ix, n.identName) }
+  -1
 }
 
 // The name a call at `ix` calls when its callee is a bare identifier, or "".
@@ -1387,7 +1405,7 @@ export function narPathsReset() {
   npInvBy = []
   narIpScope = []
   narIpAt = []
-  narIpName = []
+  narIpSlot = []
   narIpOld = []
   narIpNew = []
   npEpochs = []
