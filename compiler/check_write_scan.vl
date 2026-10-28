@@ -204,9 +204,6 @@ export let cwIxUpAux: i32[] = []
 // The note pass's own cursor: how many nodes it has read, so the walk is a grow loop over
 // columns phase one has already sized to the arena.
 let cwIxNotedN = 0
-// Per interned name, the first named `FuncDecl` that declares it, or -1 — the callee
-// resolution the argument and call-result edges key on.
-let cwIxFnDecl: i32[] = []
 // The writes whose receiver roots at no name (`m["k"][0] = v`, `f().push(…)`): the statement
 // node and the receiver expression, or -1 for `__array_copy__`, which names no receiver at
 // all. Set-independent, so the write pass reads them rather than rescanning.
@@ -252,7 +249,6 @@ function cwIxReset() {
   cwIxUpKind = []
   cwIxUpAux = []
   cwIxNotedN = 0
-  cwIxFnDecl = []
   cwIxWrNode = []
   cwIxWrRecv = []
   cwIxAnyWrite = 0
@@ -286,13 +282,15 @@ function cwIxKey(sid: i32, d: i32): i32 {
   r
 }
 
-// The chain key of row `r` of `sid`: the key of the declaration it binds, or the one its read or
-// assigned name resolves to; -1 for a row resolving to no frame, a call among them.
+// The chain key of row `r` of `sid`: the key of the declaration it binds, the one its read or
+// assigned name resolves to, or the function a call's callee name resolves to; -1 for a row
+// resolving to no frame, and for a call of anything else, which may write anything (D2390).
 function cwIxRowKey(r: i32, sid: i32): i32 {
   if r < 0 || r >= cwIxNode.length { return -1 }
-  if cwIxFr[r] == CW_FR_UNKNOWN { return -1 }
   const at = cwIxNode[r]
   const k = cwIxKind[r]
+  if k == CW_OCC_CALL { return cwIxKey(sid, cwCallFnOf(at)) }
+  if cwIxFr[r] == CW_FR_UNKNOWN { return -1 }
   if k == CW_OCC_BIND { return cwIxKey(sid, at) }
   if k == CW_OCC_USE { return cwIxKey(sid, identDeclOf(at)) }
   const n = nodeAt(at)
@@ -358,14 +356,6 @@ function cwIxHold(p: i32) {
   if p < 0 || p >= cwIxHeld.length { return 0 }
   const n = nodeAt(p)
   if n is Call { cwIxHeld[p] = 1 }
-  0
-}
-
-// The FIRST named `FuncDecl` for an interned name wins: a second declaration of the same
-// name answers for nothing, so a callee edge resolves to one frame or to none.
-function cwIxFn(sid: i32, at: i32) {
-  while cwIxFnDecl.length <= sid { cwIxFnDecl.push(-1) }
-  if cwIxFnDecl[sid] < 0 { cwIxFnDecl[sid] = at }
   0
 }
 
@@ -522,7 +512,6 @@ function cwIxNote(at: i32) {
     }
     FuncDecl => {
       if n.fnName != "" {
-        cwIxFn(sidOfNode(at), at)
         cwIxOcc(sidOf(demangleName(n.fnName)), at, CW_FR_UNKNOWN, CW_OCC_FDECL)
       }
       const tail = cwFnTailStmt(at)
@@ -1151,13 +1140,31 @@ export function collMethodKind(p: string): i32 {
   CM_OTHER
 }
 
-// The `FuncDecl` the name `fnName` declares, or -1. Never mints an id: a name the arena
-// does not carry declares nothing.
-export function cwFnDeclOf(fnName: string): i32 {
-  cwIxBuild()
-  const sid = sidLookup(fnName)
-  if sid < 0 || sid >= cwIxFnDecl.length { return -1 }
-  cwIxFnDecl[sid]
+// The `FuncDecl` the name read at `ix` resolves to, parens peeled, or -1 where it resolves to
+// any other binding or to none.
+export function cwFnDeclAt(ix: i32): i32 {
+  const d = identDeclOf(cwPeelValue(ix))
+  if d < 0 || d >= P.nodes.length { return -1 }
+  if nodeAt(d) is FuncDecl { return d }
+  -1
+}
+
+// The function the call `c`'s callee name resolves to, or -1.
+function cwCallFnOf(c: i32): i32 {
+  if c < 0 || c >= P.nodes.length { return -1 }
+  const n = nodeAt(c)
+  if n is Call { return cwFnDeclAt(n.callFn) }
+  -1
+}
+
+// Every call of the function `fnIx`: those whose callee name resolves to it, and the calls of
+// its name whose callee resolves to no function.
+function cwFnCalls(fnIx: i32, out: i32[]) {
+  const ow = cwOccWalk(fnIx)
+  while cwOccNext(ow) {
+    if cwIxKind[ow.row] == CW_OCC_CALL { out.push(cwIxNode[ow.row]) }
+  }
+  0
 }
 
 // The lambda the binding `b` (`cwBindingOf`) is bound to, or -1. It must be bound exactly once
@@ -2011,7 +2018,7 @@ function cwFvAddNamed(v: i32, out: i32[]): boolean {
   if n is Ident {
     const vf = cwFrameOfUse(v)
     if vf == CW_FR_UNKNOWN { return false }
-    const d = cwFnDeclOf(n.identName)
+    const d = cwFnDeclAt(v)
     if d >= 0 && d < cwFrameOf.length && cwFrameOf[d] == vf {
       if cwDeclCount(d) != 1 { return false }
       if !i32ListHas(out, d) { out.push(d) }
@@ -2061,8 +2068,9 @@ export function cwParamArgs(pIx: i32, out: i32[]): boolean {
     if cwIxKind[m] == CW_OCC_MCALL { return false }
     m = cwIxNext[m]
   }
-  let r = cwIxChain(fd.fnName)
-  while r >= 0 {
+  const ow = cwOccWalk(f)
+  while cwOccNext(ow) {
+    const r = ow.row
     if cwIxKind[r] == CW_OCC_USE {
       const u = cwIxNode[r]
       if cwIxUpKind[u] != CW_UP_CALLEE { return false }
@@ -2078,7 +2086,6 @@ export function cwParamArgs(pIx: i32, out: i32[]): boolean {
       else if pn.parDefault >= 0 { out.push(pn.parDefault) }
       else { return false }
     }
-    r = cwIxNext[r]
   }
   true
 }
@@ -2132,7 +2139,7 @@ function cwElemCallbackRecvOfRead(ix: i32): i32 {
 export function cwCalleeDeclOf(callFnIx: i32): i32 {
   const nm = covarRootName(callFnIx)
   if nm == "" { return cwUfcsDeclOf(callFnIx) }
-  const d = cwFnDeclOf(nm)
+  const d = cwFnDeclAt(callFnIx)
   if d >= 0 { return d }
   cwLambdaDeclOf(cwBindingOf(callFnIx))
 }
@@ -2149,7 +2156,7 @@ export function cwUfcsDeclOf(callFnIx: i32): i32 {
     const r = cwRecordedMethodOf(cf)
     if r != -2 { return r }
     if !declFirstParamIsSelf(m.memProp) { return -1 }
-    return cwFnDeclOf(m.memProp)
+    return fnDeclIx[m.memProp] ?? -1
   }
   -1
 }
@@ -2207,15 +2214,6 @@ export function cwParamAnnOfDecl(dIx: i32, argIx: i32): i32 {
     }
   }
   -1
-}
-
-// The `FuncDecl` node of the top-level function `fnName`, or `CW_FR_UNKNOWN`. A parameter
-// declares into the frame its own function opens, so this is the frame the argument edge
-// binds the parameter in.
-function cwParamFrame(fnName: string): i32 {
-  const dIx = cwFnDeclOf(fnName)
-  if dIx < 0 { return CW_FR_UNKNOWN }
-  dIx
 }
 
 // The binding key (`cwKeyOfDecl`) of the parameter an expression consumed as a call ARGUMENT
@@ -2472,19 +2470,12 @@ function cwRetDestKeys(fnIx: i32, keys: i32[]): boolean {
   if fnIx < 0 || fnIx >= P.nodes.length { return false }
   const f = nodeAt(fnIx)
   if f is FuncDecl {
-    const nm = f.fnName
-    if nm == "" { return false }
-    // A name a second declaration answers for resolves to that one, so calls of it are not
-    // this frame's — the same guard the call-result edge takes.
-    if cwParamFrame(nm) != fnIx { return false }
-    cwIxBuild()
+    if f.fnName == "" { return false }
     let ok = true
-    let r = cwIxChain(nm)
-    while r >= 0 {
-      if cwIxKind[r] == CW_OCC_CALL {
-        if !cwCallDestKey(cwIxNode[r], keys) { ok = false }
-      }
-      r = cwIxNext[r]
+    const calls: i32[] = []
+    cwFnCalls(fnIx, calls)
+    for c in calls {
+      if !cwCallDestKey(c, keys) { ok = false }
     }
     return ok
   }
@@ -2756,17 +2747,7 @@ export function cwCallResultNodes(frames: i32[], out: i32[]) {
   while i < frames.length {
     const f = nodeAt(frames[i])
     if f is FuncDecl {
-      if f.fnName != "" {
-        // A name a second declaration answers for resolves to that one, so calls of it
-        // are not this frame's. `cwParamFrame` is the single resolver both sides read.
-        if cwParamFrame(f.fnName) == frames[i] {
-          let r = cwIxChain(f.fnName)
-          while r >= 0 {
-            if cwIxKind[r] == CW_OCC_CALL { out.push(cwIxNode[r]) }
-            r = cwIxNext[r]
-          }
-        }
-      }
+      if f.fnName != "" { cwFnCalls(frames[i], out) }
     }
     i = i + 1
   }
@@ -2783,7 +2764,7 @@ export function cwRecvDeclOf(mIx: i32): i32 {
     const r = cwRecordedMethodOf(mp)
     if r != -2 { return r }
     if !declFirstParamIsSelf(m.omProp) { return -1 }
-    return cwFnDeclOf(m.omProp)
+    return fnDeclIx[m.omProp] ?? -1
   }
   cwUfcsDeclOf(mIx)
 }
@@ -2875,19 +2856,13 @@ function cwReturnConsumed(fnIx: i32): boolean {
   if fnIx < 0 || fnIx >= P.nodes.length { return false }
   const f = nodeAt(fnIx)
   if f is FuncDecl {
-    const nm = f.fnName
-    if nm == "" { return false }
-    if cwParamFrame(nm) != fnIx { return false }
-    cwIxBuild()
-    let r = cwIxChain(nm)
-    while r >= 0 {
-      if cwIxKind[r] == CW_OCC_CALL {
-        const c = cwIxNode[r]
-        if cwIxHeld[c] == 0 {
-          if cwArgParamKey(c) == -1 { return false }
-        }
+    if f.fnName == "" { return false }
+    const calls: i32[] = []
+    cwFnCalls(fnIx, calls)
+    for c in calls {
+      if cwIxHeld[c] == 0 {
+        if cwArgParamKey(c) == -1 { return false }
       }
-      r = cwIxNext[r]
     }
     return true
   }
