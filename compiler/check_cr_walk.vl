@@ -12,6 +12,7 @@ import {
   FuncDecl,
   P,
   Param,
+  binderNameAt,
   elseIfLink,
   nodeAt,
   nodeSpineChildren,
@@ -52,7 +53,7 @@ import {
 import {
   crEscWalk,
   crNoNames,
-  crwBindOf,
+  crwBindDeclOf,
   crwEnsure,
 } from "./check_capture_walks"
 import { asgDeclDepths, asgDeclSlots } from "./check_nar_bank"
@@ -175,14 +176,14 @@ export function crUnwidenTop(name: string) {
   0
 }
 
-// The name a nested function is only ever called by: its own, or the one binding it; "".
-export function crLambdaHandle(fnIx: i32): string {
+// The declaration a nested function is only ever called by: its own, or the binding holding it; -1.
+export function crLambdaHandle(fnIx: i32): i32 {
   const fd = nodeAt(fnIx)
   if fd is FuncDecl {
-    if fd.fnName != "" { return fd.fnName }
+    if fd.fnName != "" { return fnIx }
   }
   crwEnsure(crCurRoot())
-  crwBindOf[fnIx] ?? ""
+  crwBindDeclOf[fnIx] ?? -1
 }
 
 // 1 when the nested function `fnIx` may run anywhere but at a call by its handle in the body of
@@ -190,7 +191,7 @@ export function crLambdaHandle(fnIx: i32): string {
 // body's own callee — stored, passed, returned, reassigned, or called from a nested function.
 export function crLambdaEscapes(fnIx: i32): i32 {
   const h = crLambdaHandle(fnIx)
-  if h == "" { return 1 }
+  if h < 0 { return 1 }
   let body = crProgRoot
   if crFnIxs.length >= 2 {
     const pf = nodeAt(crFnIxs[crFnIxs.length - 2])
@@ -200,29 +201,31 @@ export function crLambdaEscapes(fnIx: i32): i32 {
   0
 }
 
-// Whether `name` is used in `body` other than as its own callee, from one walk per body.
-export function crEscapesIn(body: i32, name: string): boolean {
-  if body == crProgRoot { crAskProg("e", name) }
+// Whether the binding declared at `decl` is read in `body` other than as its own callee, from one
+// walk per body.
+export function crEscapesIn(body: i32, decl: i32): boolean {
+  if body == crProgRoot { crAskProg("e", binderNameAt(decl)) }
   let esc = crEscNames[body]
   if esc == null {
-    const got: {[string]: boolean} = Map()
+    const got: {[i32]: boolean} = Map()
     crEscWalk(body, false, got)
     crEscNames[body] = got
     esc = got
   }
-  (esc ?? crNoEsc).has(name)
+  (esc ?? crNoEsc).has(decl)
 }
 
-const crNoEsc: {[string]: boolean} = Map()
+const crNoEsc: {[i32]: boolean} = Map()
 
-// Whether `name` is used in the body being checked other than as its own callee.
-export function crNameEscapesHere(name: string): boolean {
+// Whether the binding declared at `decl` is read in the body being checked other than as its own
+// callee.
+export function crDeclEscapesHere(decl: i32): boolean {
   let body = crProgRoot
   if crFnIxs.length >= 1 {
     const pf = nodeAt(crFnIxs[crFnIxs.length - 1])
     if pf is FuncDecl { body = pf.fnBody }
   }
-  crEscapesIn(body, name)
+  crEscapesIn(body, decl)
 }
 
 // The node that retired `name` in the right operand of the `&&`/`||` at `opIx`, or -1.
@@ -257,8 +260,7 @@ export function crCondRetired(condIx: i32, name: string): boolean {
 }
 
 // Drop the facts collected since `mark` that the right operand of the `&&`/`||` at `opIx` retired.
-// The emitter retires the same pushes at the same node (`condRhsRetiredOf`), so a re-test in the
-// right operand narrows again in both halves.
+// A re-test in the right operand then narrows again.
 export function crFilterRhsRetired(
   opIx: i32,
   places: i32[],
