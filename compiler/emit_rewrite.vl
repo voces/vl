@@ -151,6 +151,7 @@ import {
   addNode,
   arenaNoteRefWrite,
   arenaSetNode,
+  binderNameAt,
   blockTailIsDead,
   callSiteLocOf,
   elseIfLink,
@@ -271,11 +272,14 @@ import {
   IDENT_BUILTIN,
   IDENT_DROP_CBOX_READ,
   IDENT_DROP_LOOP_MOVE,
+  fnParamsOfDecl,
   identAuditDrop,
   identDeclOf,
   identFrom,
   identFromDecl,
   identRedirect,
+  memberDeclOf,
+  memberMethodOf,
   sidNoteNodeName,
   sidOfNode,
 } from "./symbols"
@@ -1418,6 +1422,36 @@ export function drwSelfFnOf(name: string, argc: i32) {
   -1
 }
 
+// The declaration member call `ix` dispatches to at `argc` total arguments: the method the
+// binder recorded for its spelling when that takes `argc`, else -1; -2 when the spelling
+// recorded none, which leaves the answer to the module function `drwSelfFnOf` names.
+export function drwSelfDeclAt(ix: i32, argc: i32): i32 {
+  const d = memberDeclOf(ix)
+  if d < 0 { return -2 }
+  const f = memberMethodOf(ix)
+  if f < 0 { return -1 }
+  const ps = fnParamsOfDecl(f)
+  if argc > ps.length || argc < fnRequiredArity(ps) { return -1 }
+  d
+}
+
+// Whether member call `ix` dispatches to a `self`-function named `name` at `argc` arguments.
+function drwDispatches(ix: i32, name: string, argc: i32): boolean {
+  const d = drwSelfDeclAt(ix, argc)
+  if d != -2 { return d >= 0 }
+  drwSelfFnOf(name, argc) >= 0
+}
+
+// The callee member call `ix` dispatches to: the recorded declaration, else the function `name`.
+function drwSelfFnRef(ix: i32, name: string, argc: i32) {
+  const d = drwSelfDeclAt(ix, argc)
+  if d < 0 { return drwFnRef(name) }
+  const id = mkIdent(binderNameAt(d), -1)
+  identFromDecl(id, d)
+  nodeTyCarry(id, memberMethodOf(ix))
+  id
+}
+
 // The closure-typed `let`/`const` names the walk has open, innermost last, truncated when
 // a block ends. This pass runs before `buildLocals`, so the locals registry cannot say
 // which binding a call denotes and the walk's own scope has to (D1602).
@@ -1973,12 +2007,12 @@ function drwWalkMemberCall(
   const selfFnRung = memberCallRungOf(ix) == MC_RUNG_SELF_FN
   if si >= 0 && !recvHasField && !builtinRung {
     if sFieldIndex(si, callee.memProp) < 0 || selfFnRung {
-      if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
+      if drwDispatches(ix, uName, args.length + 1) { ufcs = true }
     }
   }
   if si < 0 && !recvHasField && !builtinRung {
     if !exprIsClosure(n.callFn, ctx) {
-      if drwSelfFnOf(uName, args.length + 1) >= 0 {
+      if drwDispatches(ix, uName, args.length + 1) {
         // A type-parameter receiver has no struct row yet, so `si < 0` alone cannot
         // mean "no field, so UFCS": each instance answers for itself.
         if drwRecvIsTyParam(callee.memObj, ctx) {
@@ -2012,7 +2046,7 @@ function drwWalkMemberCall(
       }
       nm[0] = ""
     }
-    const ufcsFn = drwFnRef(uName)
+    const ufcsFn = drwSelfFnRef(ix, uName, args.length)
     noteCallOrigin(ufcsFn, ix)
     n.callFn = ufcsFn
     arenaNoteRefWrite()
@@ -4691,10 +4725,6 @@ let shrLamParams: {[string]: i32} = Map()
 let shrLamFree: {[string]: i32} = Map()
 // The module's top-level bindings and function names, visible from every frame.
 let shrGlobals: {[string]: i32} = Map()
-// Names a call in the unit being respelled spells as a method (`x.name()`): the checker may
-// resolve one to a local binding, and a member name is not an identifier this pass can follow,
-// so a binding of one in that unit is never respelled.
-let shrMethodNames: {[string]: i32} = Map()
 // Per source name, the spelling of its innermost open binding ("" when none is open) and the
 // frame depth that binding belongs to.
 let shrCur: {[string]: string} = Map()
@@ -4783,28 +4813,6 @@ function shrParamShadows(name: string): boolean {
   (shrLamFree[name] ?? 0) == 1 && (shrLamParams[name] ?? 0) == 1
 }
 
-// Records in `shrMethodNames` every name a call under `ix` spells as a method. An `else if`
-// chain is walked along its spine.
-function shrCollectMethods(ix: i32) {
-  let cur = ix
-  while cur >= 0 && cur < P.nodes.length {
-    const n = nodeAt(cur)
-    if n is Call {
-      const cf = nodeAt(unwrapParen(n.callFn))
-      if cf is Member { shrMethodNames[cf.memProp] = 1 }
-      if cf is OptMember { shrMethodNames[cf.omProp] = 1 }
-    }
-    const kids = nodeValueSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      shrCollectMethods(kids[i])
-      i = i + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  0
-}
-
 // A fresh spelling of `name`.
 function shrMint(name: string): string {
   shrSerial = shrSerial + 1
@@ -4817,7 +4825,7 @@ function shrMint(name: string): string {
 // enclosing frame's binding or a module name, or the frame's shared spelling, gets that spelling.
 function shrDeclare(name: string, respell: boolean): string {
   let sp = name
-  if respell && name != "" && (shrMethodNames[name] ?? 0) == 0 {
+  if respell && name != "" {
     const open = (shrCur[name] ?? "") != ""
     if (
       (shrLamNames[name] ?? 0) == 1
@@ -4936,10 +4944,9 @@ function shrWalkFrame(fnIx: i32) {
 }
 
 // Whether parameter `name` of the frame whose body is `body` is seeded into a respelled local:
-// `shrParamShadows` holds, the body is a block to seed, and nothing spells the name as a method.
+// `shrParamShadows` holds and the body is a block to seed.
 function shrParamNeedsSeed(name: string, body: i32): boolean {
   if name == "" || name == "self" { return false }
-  if (shrMethodNames[name] ?? 0) == 1 { return false }
   if !shrParamShadows(name) { return false }
   if body < 0 || body >= P.nodes.length { return false }
   nodeAt(body) is Block
@@ -5063,7 +5070,6 @@ export function shadowRespell(stmts: i32[]) {
     gi = gi + 1
   }
   shrDepth = 0
-  shrMethodNames = Map()
   shrLamNames = Map()
   shrLamAny = false
   shrLamParams = Map()
@@ -5073,7 +5079,6 @@ export function shadowRespell(stmts: i32[]) {
     if nodeAt(stmts[mi]) !is FuncDecl {
       shrCollect(stmts[mi], false)
       shrCollectParams(stmts[mi], [], false)
-      shrCollectMethods(stmts[mi])
     }
     mi = mi + 1
   }
@@ -5104,8 +5109,6 @@ export function shadowRespell(stmts: i32[]) {
       shrLamAny = false
       shrCollect(fn.fnBody, false)
       if shrLamAny {
-        shrMethodNames = Map()
-        shrCollectMethods(fn.fnBody)
         shrCur = Map()
         shrCurDepth = Map()
         shrWalkFrame(stmts[fi])

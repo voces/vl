@@ -241,7 +241,6 @@ import {
   externRenameDecl,
   externReset,
   externSetMod,
-  fnRequiredArity,
   fnTpBoundOf,
   getDeclReset,
   hasNamedArgs,
@@ -725,29 +724,17 @@ let modRwCalleeIx = -1
 let modOvUseIx: i32[] = []
 let modOvUseRow: i32[] = []
 let modOvUseCall: boolean[] = []
-// Registry of every top-level free `self`-function across all modules, keyed by its
-// mangled name with its parameter arity. Since the merge cannot rewrite a `Member`'s
-// `memProp` (a same-named struct field keeps precedence), it records a plain→mangled
-// alias instead. D1044 — two arities per row, since a default makes arity a range.
-let modSelfFnName: string[] = []
-let modSelfFnArity: i32[] = []
-let modSelfFnMinArity: i32[] = []
-// The names in `modSelfFnName`, for `modSelfFnDeclared`.
+// The mangled name of every top-level free `self`-function across all modules, for the
+// module UFCS scope rows (`modBankUfcsScope`).
 let modSelfFnSet: {[string]: boolean} = Map()
 
 function modSelfFnReset() {
-  modSelfFnName = []
-  modSelfFnArity = []
-  modSelfFnMinArity = []
   modSelfFnSet = Map()
   0
 }
 
-// Registers the `self`-function `name` declaring `params`.
-function modSelfFnAdd(name: string, params: i32[]) {
-  modSelfFnName.push(name)
-  modSelfFnArity.push(params.length)
-  modSelfFnMinArity.push(fnRequiredArity(params))
+// Registers the `self`-function `name`.
+function modSelfFnAdd(name: string) {
   modSelfFnSet[name] = true
   0
 }
@@ -1134,9 +1121,7 @@ function ambientRenameSingle(root: i32): i32 {
         if isAmbientFnName(st.fnName) && st.fnParams.length > 0 {
           const p0 = nodeAt(st.fnParams[0])
           if p0 is Param {
-            if p0.parName == "self" {
-              modSelfFnAdd(st.fnName + modSuffixOf(0), st.fnParams)
-            }
+            if p0.parName == "self" { modSelfFnAdd(st.fnName + modSuffixOf(0)) }
           }
         }
       }
@@ -7919,7 +7904,7 @@ function modCollectSelfFns(roots: i32[]): i32 {
                 // because the rename map is built through the same call.
                 const sfBase = modDeclBase(ss[si], st.fnName)
                 const sfMangled = modRenamed(sfBase)
-                modSelfFnAdd(sfMangled, st.fnParams)
+                modSelfFnAdd(sfMangled)
                 // D1230's registry, filled from the one walk that already has
                 // both halves: the module index and its rename map.
                 modNoteUfcsImportCand(m, sfBase, sfMangled)
@@ -7972,25 +7957,7 @@ function modUfcsSpecFromEntry(m: i32): string {
   if modIsStdSpec(key) { return key }
   ""
 }
-// The mangled name of a UFCS `self`-function reachable as `.prop(args)`, matched
-// against the registry with arity = explicit args + 1 (the receiver fills `self`).
-// D1044 — the arity is a range, not a count: a defaulted parameter is reachable
-// both with and without it, matching what `ufcsCallTy`/`drwSelfFnOf` already accept.
-function modSelfFnTarget(prop: string, argc: i32): string {
-  const cand = modRenamed(prop)
-  let i = 0
-  while i < modSelfFnName.length {
-    if modSelfFnName[i] == cand {
-      if argc + 1 >= modSelfFnMinArity[i] && argc + 1 <= modSelfFnArity[i] {
-        return cand
-      }
-    }
-    i = i + 1
-  }
-  ""
-}
-// Is `name` a merged top-level `self`-function? The arity-free half of
-// `modSelfFnTarget`, asked of a rename TARGET rather than of a call.
+// Is `name` a merged top-level `self`-function?
 function modSelfFnDeclared(name: string): boolean {
   modSelfFnSet[name] ?? false
 }
@@ -8083,10 +8050,10 @@ function modOvNoteUse(identIx: i32, callIx: i32, name: string): i32 {
 // the candidates is the answer outright, several leave the choice to the receiver's type.
 // False when `prop` names no set here, so the single-binding path runs unchanged.
 function modOvMemberSite(ix: i32, prop: string): boolean {
-  // A local binding of `prop` is no candidate: a method call resolves among functions only.
+  // A local binding of `prop` shadows the set, as it does a plain call.
   if ovSetMod.length == 0 || modRwMod < 0 { return false }
   const row = ovSetOf(modRwMod, prop)
-  if row < 0 { return false }
+  if row < 0 || strListHas(modShadow, prop) { return false }
   const selfs: string[] = []
   for c in ovSetCands[row] {
     if modSelfFnDeclared(c) { selfs.push(c) }
@@ -8937,17 +8904,17 @@ function modRwExpr(ix: i32): i32 {
       return 0
     }
     Call => {
-      // A UFCS member-call `recv.prop(args)` whose `prop` names a mangled free
-      // `self`-function. The property string on the `Member` is not rewritten, since a
-      // callable field of the same name keeps precedence; records the plain→mangled
-      // alias instead, banked on this node (D1120), not under the plain name.
+      // A member call `recv.prop(args)` keeps its property plain, since a callable field of
+      // the same name keeps precedence; the name `prop` takes here is banked on this node
+      // instead (D1120), so the binder resolves the call's spelling as it would `prop(recv)`.
       if n.callFn >= 0 {
         const cf = nodeAt(n.callFn)
-        if cf is Member {
-          if !modOvMemberSite(ix, cf.memProp) {
-            const target = modSelfFnTarget(cf.memProp, n.callArgs.length)
-            if target != "" { ufcsSiteAdd(ix, target) }
-          }
+        let mp = ""
+        if cf is Member { mp = cf.memProp }
+        if cf is OptMember { mp = cf.omProp }
+        if mp != "" && !modOvMemberSite(ix, mp) {
+          const target = modRenamed(mp)
+          if target != mp { ufcsSiteAdd(ix, target) }
         }
         if cf is Ident {
           modOvNoteUse(n.callFn, ix, cf.identName)
