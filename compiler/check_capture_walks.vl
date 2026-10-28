@@ -1,8 +1,8 @@
 // The closure-capture walks that read syntax only: which names a nested function writes, mentions
 // or lets escape (`crwEnsure`, `crEscWalk`), whether a capture is by reference (`crCaptureByRef`)
-// and which names are ever assigned a value that may be `null` (`crNulledWalk`). The checker
+// and which bindings are ever assigned a value that may be `null` (`crNulledWalk`). The checker
 // resets the tables and asks the questions; nothing here reads the type arena or the scope chain.
-// This module imports `./ast`, `./check_narrow_ends`, `./check_places` and `./listutil`.
+// Writes are keyed by binding, through `./check_write_scan`'s `cwKeyOfRoot`.
 import {
   ArrayLit,
   BinExpr,
@@ -33,25 +33,31 @@ import { crUnParen } from "./check_narrow_ends"
 import { cexLitPeel } from "./check_num_lits"
 import { placeKeyOf } from "./check_places"
 import { i32ListHas, i32ListPlus } from "./listutil"
-import { identDeclOf } from "./symbols"
+import { identDeclOf, sidOfNode } from "./symbols"
+import { CW_FR_MOD, cwKeyFrame, cwKeyOfRoot } from "./check_write_scan"
 
 export const crNoNames: string[] = []
 
 // The writer analysis of root `crwRoot`: its nested functions, each one's binding name ("" when
-// it is not bound by a `const`, a `let`, an assignment or its own name), the names written and
-// mentioned anywhere inside it, and every identifier use in the root with its role.
+// it is not bound by a `const`, a `let`, an assignment or its own name), the bindings written
+// (by `cwKeyOfRoot` key) and names mentioned anywhere inside it, and every identifier use in
+// the root with its role.
 export let crwRoot = -2
 export let crwFns: i32[] = []
 export let crwFnHandle: string[] = []
-export let crwFnWrites: {[string]: boolean}[] = []
+let crwFnWrites: {[i32]: boolean}[] = []
+let crwFnWriteSids: {[i32]: boolean}[] = []
 export let crwFnMentions: {[string]: boolean}[] = []
-// Every key some nested function's `crwFnWrites` holds, and each such key's bare name.
-export let crwAnyWrites: {[string]: boolean} = Map()
+// Every key some nested function's `crwFnWrites` holds, its interned name, and its bare name.
+let crwAnyWrites: {[i32]: boolean} = Map()
+let crwAnyWriteSids: {[i32]: boolean} = Map()
 export let crwAnyWriteBase: {[string]: boolean} = Map()
 // Advanced each time the analysis is rebuilt, so a cache over it can tell it is stale.
 export let crwGen = 0
 export let crwUseNames: string[] = []
 export let crwUseKinds: i32[] = []
+// Per use, the key of the binding an assignment target writes, or -1 for any other use.
+export let crwUseKeys: i32[] = []
 export let crwBound: {[string]: boolean} = Map()
 let crwStack: i32[] = []
 let crwCallee: {[i32]: boolean} = Map()
@@ -59,8 +65,6 @@ let crwAsgLhs: {[i32]: boolean} = Map()
 export let crwBindOf: {[i32]: string} = Map()
 // The declaration of the binding a nested function is held by, beside its name in `crwBindOf`.
 export let crwBindDeclOf: {[i32]: i32} = Map()
-// Assignment targets that resolve to a binding local to a nested function (use kind 3).
-let crwAsgInner: {[i32]: boolean} = Map()
 // A lambda written as a call's argument, mapped to that call.
 export let crwArgCall: {[i32]: i32} = Map()
 
@@ -72,20 +76,21 @@ export function crwEnsure(root: i32) {
   crwFns = []
   crwFnHandle = []
   crwFnWrites = []
+  crwFnWriteSids = []
   crwAnyWrites = Map()
+  crwAnyWriteSids = Map()
   crwAnyWriteBase = Map()
   crwFnMentions = []
   crwUseNames = []
   crwUseKinds = []
+  crwUseKeys = []
   crwBound = Map()
   crwStack = []
   crwCallee = Map()
   crwAsgLhs = Map()
-  crwAsgInner = Map()
   crwBindOf = Map()
   crwBindDeclOf = Map()
   crwArgCall = Map()
-  crsReset()
   if root < 0 || root >= P.nodes.length { return 0 }
   const r = nodeAt(root)
   if r is FuncDecl {
@@ -107,92 +112,60 @@ function crwBindParams(fd: FuncDecl) {
   0
 }
 
-// The declarations a writer walk has in scope, innermost last, each with the depth of the nested
-// function making it (0 for the root's own level). A write resolving to one of depth > 0 cannot
-// reach a binding of the root's level or the module, whatever its name (D3019).
-let crsNames: string[] = []
-let crsDepths: i32[] = []
-// Per entry, the next-inner earlier entry declaring the same name, or -1; `crsTop` maps a name
-// to its innermost entry, so a lookup does not walk the whole stack.
-let crsShadowed: i32[] = []
-let crsTop: {[string]: i32} = Map()
+// Whether the writes `keys`/`sids` (`crKeyAdd`) may write the binding of key `k`: its own key, the
+// key standing for every binding of its name, or for such a key any write of the name.
+export function crKeyHit(
+  keys: {[i32]: boolean},
+  sids: {[i32]: boolean},
+  k: i32,
+): boolean {
+  if k == -1 { return false }
+  if k <= -2 { return sids.has(-2 - k) }
+  keys.has(k) || keys.has(-2 - sidOfNode(k))
+}
 
-export function crsReset() {
-  crsNames = []
-  crsDepths = []
-  crsShadowed = []
-  crsTop = Map()
+// Record a write of the binding of key `k` into `keys`, and its interned name into `sids`.
+export function crKeyAdd(
+  keys: {[i32]: boolean},
+  sids: {[i32]: boolean},
+  k: i32,
+) {
+  if k == -1 { return 0 }
+  keys[k] = true
+  if k <= -2 { sids[-2 - k] = true }
+  else if k < P.nodes.length { sids[sidOfNode(k)] = true }
   0
 }
 
-function crsDeclare(name: string, depth: i32) {
-  crsShadowed.push(crsTop[name] ?? (-1))
-  crsTop[name] = crsNames.length
-  crsNames.push(name)
-  crsDepths.push(depth)
-  0
+// Whether nested function `j` of the root writes the binding of key `k`.
+export function crwWrites(j: i32, k: i32): boolean {
+  crKeyHit(crwFnWrites[j], crwFnWriteSids[j], k)
 }
 
-// Drop the declarations made since `mark`, the height the walk saw on entering a node.
-function crsLeave(mark: i32) {
-  while crsNames.length > mark {
-    const top = crsNames.length - 1
-    crsTop[crsNames[top]] = crsShadowed[top]
-    crsNames.pop()
-    crsDepths.pop()
-    crsShadowed.pop()
-  }
-  0
+// Whether some nested function of the root writes the binding of key `k`.
+export function crwWritten(k: i32): boolean {
+  crKeyHit(crwAnyWrites, crwAnyWriteSids, k)
 }
 
-// The function depth of the declaration `name` resolves to here, or 0 when it resolves to none
-// the walk saw. A declaration the walk does not track (a loop variable, a pattern binding) makes
-// its writes count as the outer binding's, which only ends more narrowings.
-function crsDepthOf(name: string): i32 {
-  const i = crsTop[name] ?? (-1)
-  if i < 0 { return 0 }
-  crsDepths[i]
-}
-
-// The body of the function declared at `ix`, or -1 when `ix` declares none.
-function crFnBodyOf(ix: i32): i32 {
-  const n = nodeAt(ix)
-  if n is FuncDecl { return n.fnBody }
-  -1
-}
-
-// The name the `let`/`const` at `ix` declares, or "" when `ix` declares none.
-function crLetNameOf(ix: i32): string {
-  const n = nodeAt(ix)
-  if n is LetDecl { return n.letName }
-  ""
-}
-
-function crsDeclareFnParams(ix: i32, depth: i32) {
-  const n = nodeAt(ix)
-  if n is FuncDecl { crsDeclareParams(n, depth) }
-  0
-}
-
-// Declare the parameters of a nested function at depth `depth`.
-function crsDeclareParams(fd: FuncDecl, depth: i32) {
-  let i = 0
-  while i < fd.fnParams.length {
-    const p = nodeAt(fd.fnParams[i])
-    if p is Param { crsDeclare(p.parName, depth) }
-    i = i + 1
+// The stack height from which nested functions are inside the frame declaring the binding of
+// key `k`: past that frame's entry, or 0 for the root's own level, the module or no frame.
+function crwDeclHeight(k: i32): i32 {
+  if k < 0 { return 0 }
+  const fr = cwKeyFrame(k)
+  let p = crwStack.length - 1
+  while p >= 0 {
+    if crwFns[crwStack[p]] == fr { return p + 1 }
+    p = p - 1
   }
   0
 }
 
 // One walk of the root. A nested function is recorded on entry, so a use inside it can say
 // which one holds it; a write or mention inside it counts for every function around it too, up
-// to the one declaring the binding it writes. A write to a binding local to a nested function is
-// recorded under `name@` (`crWriteKey`).
+// to the one declaring the binding it writes.
 function crwVisit(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = nodeAt(ix)
-  const mark = crsNames.length
   if n is FuncDecl {
     const j = crwFns.length
     crwFns.push(ix)
@@ -200,23 +173,26 @@ function crwVisit(ix: i32) {
     if h == "" { h = crwBindOf[ix] ?? "" }
     crwFnHandle.push(h)
     crwFnWrites.push(Map())
+    crwFnWriteSids.push(Map())
     crwFnMentions.push(Map())
     if n.fnName != "" { crwBound[n.fnName] = true }
     crwBindParams(n)
     crwStack.push(j)
-    crsDeclareParams(n, crwStack.length)
     crwVisit(n.fnBody)
     crwStack.pop()
-    crsLeave(mark)
     return 0
   }
   if n is Ident {
     let kind = 0
-    if crwAsgLhs[ix] ?? false { kind = 2 }
-    if crwAsgInner[ix] ?? false { kind = 3 }
+    let key = -1
+    if crwAsgLhs[ix] ?? false {
+      kind = 2
+      key = cwKeyOfRoot(ix)
+    }
     if crwCallee[ix] ?? false { kind = 1 }
     crwUseNames.push(n.identName)
     crwUseKinds.push(kind)
+    crwUseKeys.push(key)
     let s = 0
     while s < crwStack.length {
       const f = crwStack[s]
@@ -225,23 +201,17 @@ function crwVisit(ix: i32) {
     }
     return 0
   }
-  let declName = ""
   if n is BinExpr {
     if n.binOp == "=" {
       const l = nodeAt(n.binLeft)
       if l is Ident {
         crwAsgLhs[n.binLeft] = true
-        const d = crsDepthOf(l.identName)
-        let wn = l.identName
-        if d > 0 {
-          crwAsgInner[n.binLeft] = true
-          wn = wn + "@"
-        }
-        let s = d
+        const wk = cwKeyOfRoot(n.binLeft)
+        let s = crwDeclHeight(wk)
         while s < crwStack.length {
           const f = crwStack[s]
-          crwFnWrites[f][wn] = true
-          crwAnyWrites[wn] = true
+          crKeyAdd(crwFnWrites[f], crwFnWriteSids[f], wk)
+          crKeyAdd(crwAnyWrites, crwAnyWriteSids, wk)
           crwAnyWriteBase[l.identName] = true
           s = s + 1
         }
@@ -252,7 +222,6 @@ function crwVisit(ix: i32) {
       }
     }
   } else if n is LetDecl {
-    declName = n.letName
     crwBound[n.letName] = true
     if n.letInit >= 0 {
       if nodeAt(n.letInit) is FuncDecl {
@@ -287,9 +256,6 @@ function crwVisit(ix: i32) {
     }
     cur = elseIfLink(cur)
   }
-  crsLeave(mark)
-  // A declaration is in scope from after its initializer to the end of the enclosing node.
-  if declName != "" { crsDeclare(declName, crwStack.length) }
   0
 }
 
@@ -327,34 +293,29 @@ function crIndexOpOf(ix: i32): string {
   ""
 }
 
-// `depth` counts the functions around `ix`; `crsDepthOf` resolves a target against them.
-export function crNulledWalk(ix: i32, depth: i32) {
+// Record in `crNulledKeys` each assignment under `ix` that may store `null` into a module binding,
+// or into a binding whose frame the write scan does not know.
+export function crNulledWalk(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
-  const tgt = crAssignTarget(ix)
-  if tgt != "" && crsDepthOf(tgt) == 0 {
-    const n = nodeAt(ix)
-    if n is BinExpr {
-      if !crRhsNonNull(n.binRight) { crNulledNames[tgt] = true }
+  const n = nodeAt(ix)
+  if n is BinExpr {
+    if n.binOp == "=" && nodeAt(crUnParen(n.binLeft)) is Ident {
+      const k = cwKeyOfRoot(n.binLeft)
+      if (k <= -2 || cwKeyFrame(k) == CW_FR_MOD) && !crRhsNonNull(n.binRight) {
+        crKeyAdd(crNulledKeys, crNulledSids, k)
+      }
     }
   }
-  const mark = crsNames.length
-  const body = crFnBodyOf(ix)
-  let inner = depth
-  if body >= 0 { inner = depth + 1 }
   let cur = ix
   while cur >= 0 {
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      if kids[k] == body { crsDeclareFnParams(ix, inner) }
-      crNulledWalk(kids[k], inner)
+      crNulledWalk(kids[k])
       k = k + 1
     }
     cur = elseIfLink(cur)
   }
-  crsLeave(mark)
-  const ln = crLetNameOf(ix)
-  if ln != "" { crsDeclare(ln, depth) }
   0
 }
 
@@ -594,7 +555,8 @@ function crbrLoopsMeet(a: i32[], b: i32[], decl: i32[]): boolean {
 export let crByRefMemo: {[string]: boolean} = Map()
 
 export let crMemoDone: {[string]: boolean} = Map()
-export let crNulledNames: {[string]: boolean} = Map()
+export let crNulledKeys: {[i32]: boolean} = Map()
+export let crNulledSids: {[i32]: boolean} = Map()
 export let crNulledBuilt = false
 let crbrOrd = 0
 let crbrFnOrd = -1
