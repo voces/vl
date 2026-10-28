@@ -1710,13 +1710,6 @@ function globalIsMapSid(fnIx: i32, sid: i32, atIx: i32) {
   letIsMap(li, -1)
 }
 
-// True if the global `name` is a nullable map.
-function globalIsNulMapSid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  letIsNulMap(li, -1)
-}
-
 // True if the function `name` returns a nullable struct (`"nulstruct"`).
 function fnRetNulRefSid(sid: i32, name: string, fnIx: i32, at: i32) {
   repOfNameResult(sid, name, fnIx, at).rdKind == "nulstruct"
@@ -16821,23 +16814,8 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
       const mnm = mapReadMvSlot(exprIx, fnIx)
       if mnm >= 0 { return mvValIsMap(mnm) && mvSlotNullable(mnm) }
     }
-    Ident => {
-      if (
-        paramNulMap(fnIx, e.identName)
-        && paramReadAt(fnIx, e.identName, exprIx)
-      ) {
-        return true
-      }
-      if declaredNulMap(e.identName) { return true }
-      // A captured `{[K]: V} | null` cell: the env field carries the same niche, typed by
-      // `captureValKind` off the parent frame's binding.
-      if capturedKindOf(fnIx, e.identName) == "nulmap" { return true }
-      return globalIsNulMapSid(fnIx, sidOfNode(exprIx), exprIx)
-    }
-    Member => {
-      // A `recv.f` read of a NULLABLE map FIELD (`f: {[string]: V} | null`, code 29) yields a
-      // nullable map — `const t = v.f` infers kind `nulmap` and narrows with `if t != null`.
-      return memFieldTypeCode(exprIx, fnIx) == FC_NUL_MAP
+    Ident | Member => {
+      return exprNulKind(exprIx, fnIx) == "nulmap"
     }
     BinExpr => {
       // A read over a nullable-inner-map-valued map yields `map | null` — the fused `?? d` hit
@@ -16871,6 +16849,13 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   false
+}
+
+// A read whose recorded rep is a map cell, nullable or not: a narrowed read recovers non-null at
+// the read, and an un-narrowed one reaches only value positions that take the nullable ref.
+function readRepIsMapCell(exprIx: i32, fnIx: i32): boolean {
+  const rd = repOfNode(exprIx, fnIx)
+  rd.rdCovered == 1 && (rd.rdKind == "map" || rd.rdKind == "nulmap")
 }
 
 // True if evaluating the expression at `exprIx` yields a string-keyed map: the
@@ -16965,9 +16950,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       // arena rather than the declared-locals table, so a cross-frame question answers.
       const fmm = frameLetOf(fnIx, e.identName, exprIx)
       if fmm >= 0 && letIsMap(fmm, fnIx) { return true }
-      // A nullable map binding is a map ref in the narrowed (`!= null`) branch — the checker
-      // proved the map op guarded, and the receiver recovers non-null at the map-op site.
-      return exprNullableMap(exprIx, fnIx)
+      return readRepIsMapCell(exprIx, fnIx)
     }
     Member => {
       // A MAP-typed struct field read (`node.children`, code 19) yields a Map ref —
@@ -16976,7 +16959,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       // arm's rule at the one receiver shape that never had it. D1014.
       if placeReadContainerAt(exprIx, fnIx) == RC_MAP { return true }
       if memFieldTypeCode(exprIx, fnIx) == FC_MAP { return true }
-      if exprNullableMap(exprIx, fnIx) { return true }
+      if readRepIsMapCell(exprIx, fnIx) { return true }
     }
     Index => {
       // A union-box ELEMENT whose index PLACE is narrowed to a MAP arm (`if xs[0] is {[string]:
