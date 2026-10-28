@@ -1,48 +1,7 @@
 // `emit_union_registry.vl` — the union registry's member sets: which atoms and
 // ref-array members a registered union carries, and the member-set interner.
 
-import {
-  ArrayLit,
-  AsExpr,
-  BinExpr,
-  Block,
-  BoolLit,
-  BreakStmt,
-  Call,
-  CharLit,
-  ContinueStmt,
-  ErrExpr,
-  FieldDef,
-  FieldInit,
-  ForIn,
-  ForRange,
-  FuncDecl,
-  Ident,
-  IfStmt,
-  ImportDecl,
-  Index,
-  IsExpr,
-  LetDecl,
-  LoopVar,
-  MatchExpr,
-  Member,
-  NullLit,
-  NumLit,
-  ObjLit,
-  OptMember,
-  Param,
-  Paren,
-  Program,
-  RetStmt,
-  Spread,
-  StrLit,
-  TypeDecl,
-  TypeRef,
-  Unary,
-  UnionDecl,
-  WhileStmt,
-  nodeAt,
-} from "./ast"
+import { readNarrowedTyAt } from "./emit_capture_frames"
 import {
   canonUnionKeyNullAtOfTy,
   canonUnionKeyOfAnnName,
@@ -91,15 +50,8 @@ import {
   tyToNominalNameAt,
   tyToStr,
 } from "./check_types"
-import {
-  atomsHaveValueAtom,
-  indexPathKeyOf,
-  memberPathKeyOf,
-  unionHasAtom,
-  unwrapParen,
-} from "./emit_base"
+import { atomsHaveValueAtom, unionHasAtom } from "./emit_base"
 import { emitFail } from "./emit_bytes"
-import { NARROW_TYPED, narrowSlotOf } from "./emit_narrow_slots"
 import {
   declTyIxOfName,
   msAtomIdOf,
@@ -139,7 +91,6 @@ import {
   msSetWords,
   narrowSets,
   narrowTys,
-  narrowVariants,
   uVariants,
   unKey,
   unKeyAliasRow,
@@ -171,10 +122,6 @@ import {
   primNameOf,
 } from "./tyquery"
 
-// The arena type the narrowing at stack slot `i` binds — see `narrowSlotTy`. Exported for the
-// emitter's narrowed-arm consumers, which ask it of the slot `narrowSlotOf` returned.
-export function narrowSlotTyOf(i: i32): i32 { narrowSlotTy(i) }
-
 // The arena type the narrowing at stack slot `i` binds: the type banked by an `is` push, or —
 // for a complement push — the sole surviving member of its set (`i32 | null` minus `null`
 // binds `i32`). -1 when the slot binds no single type: a two-or-more-member set, a set the
@@ -186,18 +133,13 @@ export function narrowSlotTy(i: i32): i32 {
   msSoleMemberTy(narrowSets[i])
 }
 
-// The non-null member `X` when the narrowing at stack slot `i` leaves exactly `X | null`,
-// read off its member set or its banked nullable type; -1 otherwise.
-export function narrowSlotNulArmTy(i: i32): i32 {
-  if i < 0 || i >= narrowSets.length || i >= narrowTys.length { return -1 }
+// The non-null member `X` when type `t` is exactly `X | null`, -1 otherwise.
+export function nulArmTyOf(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const at = tyAt(t)
+  if at is TyNullable { return at.nInner }
   const tys: i32[] = []
-  if !msMemberTysOfSet(narrowSets[i], tys) {
-    const t = narrowTys[i]
-    if t < 0 || t >= T.tys.length { return -1 }
-    const at = tyAt(t)
-    if at is TyNullable { return at.nInner }
-    flattenVariantsInto(t, tys)
-  }
+  flattenVariantsInto(t, tys)
   if tys.length != 2 { return -1 }
   if isNullTy(tys[0]) && !isNullTy(tys[1]) { return tys[1] }
   if isNullTy(tys[1]) && !isNullTy(tys[0]) { return tys[0] }
@@ -2213,52 +2155,22 @@ export function msSubAtomOrView(s: i32, removed: string): i32 {
 // every arm, appended to `out`, true only when every arm is a value `print` renders on its
 // own. Kinds 0..5 are `print`'s declared scalar/string domain (plus 6 for `null`); kinds
 // 7..13 (lists, closures) are containers with no defined print rendering and decline. D711.
-export function printNarrowKeepsBox(key: string): boolean {
-  const slot = narrowSlotOf(key)
-  if slot < 0 { return true }
-  const nv = narrowVariants[slot]
-  if nv == "" { return true }
-  if nv == NARROW_TYPED { return msMemberCount(narrowSets[slot]) > 1 }
-  // A narrowing to a union ALIAS (`m[k] != null` over `{[string]: U}`) counts U's members (D3511).
-  unionMemberCountOfName(nv) > 1
-}
-
-// The narrowing key of a print argument: a name, a member path or an index path, else "".
-export function printNarrowKey(exprIx: i32): string {
-  const pe = nodeAt(unwrapParen(exprIx))
-  match pe {
-    Ident => {
-      return pe.identName
-    }
-    Member => {
-      return memberPathKeyOf(unwrapParen(exprIx))
-    }
-    Index => {
-      return indexPathKeyOf(unwrapParen(exprIx))
-    }
-    // no other kind is a place a narrowing is keyed on
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  ""
+export function printNarrowKeepsBox(exprIx: i32, fnIx: i32): boolean {
+  const nt = readNarrowedTyAt(exprIx, fnIx)
+  if nt < 0 { return true }
+  const tys: i32[] = []
+  flattenVariantsInto(nt, tys)
+  tys.length > 1
 }
 
 // The members a narrowing to two or more of them leaves a print argument's box holding, into
 // `live`; nothing when it is not so narrowed. A box with a record arm the narrowing excluded
 // prints from these alone (D3231).
-export function printNarrowLiveAtoms(exprIx: i32, live: string[]) {
-  const key = printNarrowKey(exprIx)
-  if key == "" { return 0 }
-  const slot = narrowSlotOf(key)
-  if slot < 0 { return 0 }
-  const nv = narrowVariants[slot]
-  if nv == NARROW_TYPED {
-    if msMemberCount(narrowSets[slot]) >= 2 {
-      msMemberAtomsOfSet(narrowSets[slot], live)
-    }
-    return 0
-  }
-  if nv == "" || unionMemberCountOfName(nv) < 2 { return 0 }
-  unionArmsOfSet(nv, narrowSets[slot], live)
+export function printNarrowLiveAtoms(exprIx: i32, fnIx: i32, live: string[]) {
+  const nt = readNarrowedTyAt(exprIx, fnIx)
+  if nt < 0 { return 0 }
+  const s = msSetOfTyAny(nt)
+  if msMemberCount(s) >= 2 { msMemberAtomsOfSet(s, live) }
   0
 }
 
