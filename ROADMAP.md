@@ -40,7 +40,7 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 ## Next, in order
 
 1. **The architecture migration**, in [target §3](docs/internals/architecture-target-2026-10.md)
-   order. The forward items after the latest landings are in §3.1, "Open after #5024". Status is in
+   order. The forward items after the latest landings are in §3.1, "Open after #5037". Status is in
    [the plan](docs/internals/architecture-refactor-plan.md).
 2. **Clause-1 defects:** D13960 (a wider record list spread into a narrower rest parameter is
    check-clean invalid wasm). For the rest, run `ls.vl -- --status open` and grep for `clause 1`.
