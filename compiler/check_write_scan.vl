@@ -438,7 +438,7 @@ function cwIxNote(at: i32) {
         cwIxNoteIdxWrite(at, cwPeel(n.binLeft))
         const ls = covarRootSid(n.binLeft)
         if ls >= 0 {
-          cwIxOcc(ls, at, covarRootFrame(n.binLeft), CW_OCC_ASG)
+          cwIxOcc(ls, at, cwFrameOfUse(cwPeelValue(n.binLeft)), CW_OCC_ASG)
           cwIxHold(cwPeel(n.binRight))
         }
       }
@@ -690,7 +690,7 @@ export function cwKeyFrame(k: i32): i32 {
 
 // Whether two keys may name one binding: the same key, or a key standing for every binding of
 // the other's name.
-function cwKeySame(a: i32, b: i32): boolean {
+export function cwKeySame(a: i32, b: i32): boolean {
   if a == b { return true }
   if a >= -1 && b >= -1 { return false }
   const s = cwKeySid(a)
@@ -1007,24 +1007,6 @@ function cwFrameOfOpen(ix: i32) {
   cwFrameOf[ix] != CW_FR_UNKNOWN
 }
 
-// Are two resolved frames the same binding? `CW_FR_UNKNOWN` on either side matches, which is
-// what holds an unmodelled binder at the coarsest answer rather than a wrong one.
-export function cwSameFrame(a: i32, b: i32): boolean {
-  if a == CW_FR_UNKNOWN { return true }
-  if b == CW_FR_UNKNOWN { return true }
-  a == b
-}
-
-// The frame a root identifier at `ix` resolves in — the key the alias set carries beside the
-// name, so two same-named handles in different functions are two values.
-export function covarRootFrame(ix: i32): i32 {
-  const p = cwPeelValue(ix)
-  if p < 0 || p >= P.nodes.length { return CW_FR_UNKNOWN }
-  const n = nodeAt(p)
-  if n is Ident { return cwFrameOfUse(p) }
-  CW_FR_UNKNOWN
-}
-
 // The emitter rewrites and the monomorphizer add nodes to the arena after `check`, so an
 // answer computed over the smaller arena describes a program that has since changed: drop the
 // alias-closure memo and the frames, which read every `Ident` in the arena.
@@ -1234,8 +1216,9 @@ export function cwHeldFnOf(a: i32): i32 {
 // The declaration standing for the binding the read `ix` names, the first one its frame files
 // under the name; -1 when the read's frame is not known or files no such declaration.
 export function cwBindingOf(ix: i32): i32 {
-  if covarRootFrame(ix) == CW_FR_UNKNOWN { return -1 }
-  cwDeclRepOf(identDeclOf(cwPeelValue(ix)))
+  const k = cwKeyOfRoot(ix)
+  if k < 0 { return -1 }
+  cwDeclRepOf(k)
 }
 
 // The first declaration sharing declaration `d`'s frame and name, or -1 when the frame walk
@@ -1372,13 +1355,13 @@ export function cwFnValueWriteOf(b: i32, decl: i32): i32 {
   -1
 }
 
-// The functions the `let` node `bd`, binding `nm`, may hold: its initialiser and each `nm = v`
-// its own scope resolves to it, ascending; [-1] when one is not a function or a binder this
-// does not model shadows `nm`. Sees the block a name is declared in, which the frames do not.
-export function cwLetFnTargets(bd: i32, nm: string): i32[] {
+// The functions the `let` node `bd` may hold: its initialiser and each assignment its own scope
+// resolves to it, ascending; [-1] when one is not a function or a binder this does not model
+// shadows its name. Sees the block a name is declared in, which the frames do not.
+export function cwLetFnTargets(bd: i32): i32[] {
   const bad: i32[] = [-1]
   const n = nodeAt(bd)
-  if !(n is LetDecl) || !cwLexScopeOk(bd, nm) { return bad }
+  if !(n is LetDecl) || !cwLexScopeOk(bd) { return bad }
   const out: i32[] = []
   if !cwFvAddValue(n.letInit, out) { return bad }
   const none: i32[] = []
@@ -1388,12 +1371,12 @@ export function cwLetFnTargets(bd: i32, nm: string): i32[] {
   out
 }
 
-// The functions the `let` node `bd`, binding `nm`, has written into its slots by `nm[k] = v`,
-// `nm.push(v)` and `nm.set(k, v)` in its own scope; [-1] when one is not a function or the
+// The functions the `let` node `bd`, binding `x`, has written into its slots by `x[k] = v`,
+// `x.push(v)` and `x.set(k, v)` in its own scope; [-1] when one is not a function or the
 // scope is not modelled.
-export function cwLetSlotFnTargets(bd: i32, nm: string): i32[] {
+export function cwLetSlotFnTargets(bd: i32): i32[] {
   const bad: i32[] = [-1]
-  if !cwLexScopeOk(bd, nm) { return bad }
+  if !cwLexScopeOk(bd) { return bad }
   const out: i32[] = []
   const none: i32[] = []
   for v in cwLexSlotStores[bd] ?? none {
@@ -1402,11 +1385,12 @@ export function cwLetSlotFnTargets(bd: i32, nm: string): i32[] {
   out
 }
 
-// Walks the scope of the initialised `let` node `bd`, binding `nm`, once; false when it has a
+// Walks the scope of the initialised `let` node `bd` for its name once; false when it has a
 // binder the walk does not model.
-function cwLexScopeOk(bd: i32, nm: string): boolean {
+function cwLexScopeOk(bd: i32): boolean {
   const n = nodeAt(bd)
   if !(n is LetDecl) || n.letInit < 0 { return false }
+  const nm = n.letName
   const fr = cwFrameOfDecl(bd)
   const key = cwDeclRepOf(bd)
   if fr == CW_FR_UNKNOWN || key < 0 { return false }
