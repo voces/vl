@@ -1,0 +1,187 @@
+// Interned narrowing places. A place is the declaration its root name binds plus the path
+// `placeKeyOf` spells below it (`""`, `.f`, `[0]`, `[*]`), so two reads name one place exactly
+// when they reach one id, and a same-named inner binding is a different place. The root comes
+// from the binder's record on the root `Ident`, never from a name lookup. Emptied by
+// `placeIdsReset` with the other per-check facts.
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  LoopVar,
+  MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  nodeAt,
+} from "./ast"
+import { placeKeyOf } from "./check_places"
+import { declTyOf, identSlotOf } from "./check_scopes"
+
+export const PLACE_NONE = -1
+
+// Per place: its root's slot, its spelling, whether it lies below the root, and the next place
+// sharing its spelling. `plHead` maps a spelling to the newest place spelled so.
+let plDecl: i32[] = []
+let plText: string[] = []
+let plPath: boolean[] = []
+let plNext: i32[] = []
+let plHead: {[string]: i32} = Map()
+
+export function placeIdsReset() {
+  plDecl = []
+  plText = []
+  plPath = []
+  plNext = []
+  plHead = Map()
+  0
+}
+
+// The place rooted at slot `decl` spelled `text`, or PLACE_NONE when none has been made.
+export function placeFind(decl: i32, text: string): i32 {
+  let p = plHead[text] ?? -1
+  while p >= 0 {
+    if plDecl[p] == decl { return p }
+    p = plNext[p]
+  }
+  PLACE_NONE
+}
+
+// The place rooted at slot `decl` spelled `text`, made on first use; `path` says it lies below
+// the root. A slot of -1 is no place.
+export function placeIntern(decl: i32, text: string, path: boolean): i32 {
+  if decl == -1 || text == "" { return PLACE_NONE }
+  const hit = placeFind(decl, text)
+  if hit >= 0 { return hit }
+  const p = plDecl.length
+  plDecl.push(decl)
+  plText.push(text)
+  plPath.push(path)
+  plNext.push(plHead[text] ?? -1)
+  plHead[text] = p
+  p
+}
+
+// The slot `p`'s root binds, or -1.
+export function placeDecl(p: i32): i32 {
+  if p < 0 || p >= plDecl.length { return -1 }
+  plDecl[p]
+}
+
+// The spelling of `p` (`o.v`, `xs[0]`), for diagnostics and the stores still keyed by spelling.
+export function placeText(p: i32): string {
+  if p < 0 || p >= plText.length { return "" }
+  plText[p]
+}
+
+// Whether `p` lies below its root: a field, a cell or every element rather than the binding.
+export function placeIsPath(p: i32): boolean {
+  if p < 0 || p >= plPath.length { return false }
+  plPath[p]
+}
+
+// What the binding a bare-name place `p` roots at reads here; -1 for a path or no place.
+export function placeNameTy(p: i32): i32 {
+  if p < 0 || p >= plDecl.length || plPath[p] { return -1 }
+  declTyOf(plDecl[p])
+}
+
+// The place one step `step` (`.f`, `[0]`, `[*]`) below `p`.
+export function placeWith(p: i32, step: string): i32 {
+  if p < 0 || p >= plDecl.length { return PLACE_NONE }
+  placeIntern(plDecl[p], plText[p] + step, true)
+}
+
+// The place the expression at `ix` reads, made on first use, or PLACE_NONE.
+export function placeOf(ix: i32): i32 {
+  const text = placeKeyOf(ix)
+  if text == "" { return PLACE_NONE }
+  const root = placeRootIdent(ix)
+  if root < 0 { return PLACE_NONE }
+  const r = nodeAt(root)
+  if r is Ident {
+    return placeIntern(
+      identSlotOf(root, r.identName),
+      text,
+      text != r.identName,
+    )
+  }
+  PLACE_NONE
+}
+
+// The place the expression at `ix` reads when one has been made, else PLACE_NONE. A read asks
+// this: a place never narrowed has no overlay slot to find.
+export function placeAt(ix: i32): i32 { placeAtKey(ix, placeKeyOf(ix)) }
+
+// `placeAt` for a caller already holding `text`, the expression's `placeKeyOf` spelling.
+export function placeAtKey(ix: i32, text: string): i32 {
+  if text == "" { return PLACE_NONE }
+  if (plHead[text] ?? -1) < 0 { return PLACE_NONE }
+  placeFind(placeRootSlotOf(ix), text)
+}
+
+// The slot the root name of the place expression at `ix` binds, or -1.
+export function placeRootSlotOf(ix: i32): i32 {
+  const root = placeRootIdent(ix)
+  if root < 0 { return -1 }
+  const r = nodeAt(root)
+  if r is Ident { return identSlotOf(root, r.identName) }
+  -1
+}
+
+// The `Ident` a place expression hangs from, or -1 when `ix` is no place's spine.
+function placeRootIdent(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = nodeAt(ix)
+  match n {
+    Ident => {
+      return ix
+    }
+    Paren => {
+      return placeRootIdent(n.parInner)
+    }
+    Member => {
+      return placeRootIdent(n.memObj)
+    }
+    OptMember => {
+      return placeRootIdent(n.omObj)
+    }
+    Index => {
+      return placeRootIdent(n.idxArr)
+    }
+    // No other expression continues a place's spine.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+  }
+  -1
+}

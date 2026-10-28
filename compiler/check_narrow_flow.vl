@@ -278,6 +278,7 @@ import {
   elemKeyStoresChecked,
   elemRecvPrefix,
   holeElseRemainderOk,
+  i32ListLastIx,
   keyStepTag,
   mapCopyText,
   narFitElems,
@@ -298,7 +299,6 @@ import {
   shapeAdaptRecStorageField,
   shapeAdaptRecStorageFieldSet,
   shapeAdaptRecStorageSet,
-  strListLastIx,
   tvPlaceWrite,
   tvWriteTy,
   unresolvedHole,
@@ -364,8 +364,8 @@ import {
   narClobDepths,
   narClobDepthsPush,
   narClobHits,
-  narClobKeys,
-  narClobKeysPush,
+  narClobPlace,
+  narClobPlacePush,
   narClobPrev,
   narClobPrevPush,
   narClobRetired,
@@ -382,8 +382,8 @@ import {
   narIpOld,
   narIpScope,
   narIpSlot,
-  narKeyBind,
   narPathHeldNonNull,
+  narPlaceBind,
   narSetInv,
   narSetScope,
   narWriteStorage,
@@ -413,6 +413,7 @@ import {
   npKeys,
   npKeysPop,
   npKeysPush,
+  npPlace,
   npSettlePop,
   npSettlePush,
   npSettleSetAt,
@@ -457,10 +458,26 @@ import {
   writeMemberTy,
 } from "./check_relate_core"
 import {
+  PLACE_NONE,
+  placeAt,
+  placeAtKey,
+  placeDecl,
+  placeFind,
+  placeIntern,
+  placeIsPath,
+  placeNameTy,
+  placeOf,
+  placeRootSlotOf,
+  placeText,
+  placeWith,
+} from "./check_place_ids"
+import {
   constDeclOf,
   constScopes,
   declDepthOf,
+  declTyOf,
   declare,
+  declareSlot,
   envDeclOfNameForFlow,
   fnAliasScopes,
   fnDeclScopes,
@@ -615,27 +632,27 @@ function narFoldRow(cur: i32, i: i32, ownDepth: i32): i32 {
   narJoinTys(cur, narClobTys[i])
 }
 
-// What each place key holds here, parallel to `keys`: the arm join's start for a path through an
-// `if` that carries no condition fact about it. -1 where the key does not resolve.
-export function narKeysNowTys(keys: string[]): i32[] {
+// What each place holds here, parallel to `places`: the arm join's start for a path through an
+// `if` that carries no condition fact about it. -1 where the place does not resolve.
+export function narKeysNowTys(places: i32[]): i32[] {
   const out: i32[] = []
   let i = 0
-  while i < keys.length {
-    out.push(narKeyNowTy(keys[i]))
+  while i < places.length {
+    out.push(narKeyNowTy(places[i]))
     i = i + 1
   }
   out
 }
 
-// What the place `key` reads at here: a bare name's binding, a path's live overlay, else its
+// What the place `p` reads at here: a bare name's binding, a path's live overlay, else its
 // field or cell type off the prefix it hangs from.
-function narKeyNowTy(key: string): i32 {
-  if !isPathKey(key) { return lookup(key) }
-  const ov = narrowedPathTy(key)
+function narKeyNowTy(p: i32): i32 {
+  if !placeIsPath(p) { return declTyOf(placeDecl(p)) }
+  const ov = narrowedPathTy(p)
   if ov >= 0 { return ov }
-  const steps = keySteps(key)
+  const steps = keySteps(placeText(p))
   if steps.length == 0 { return -1 }
-  const pres = keyStepPrefixTys(key, steps)
+  const pres = keyStepPrefixTys(p, steps)
   const last = steps.length - 1
   const pt = pres[last]
   if pt < 0 { return -1 }
@@ -645,15 +662,15 @@ function narKeyNowTy(key: string): i32 {
   placeElemTy(pt)
 }
 
-// What `key` read at the head of the `if` behind `f`: its type now with every in-place write
-// since then undone, then redone. -1 where the key does not resolve.
-function narHeadTy(f: IfChk, key: string): i32 {
+// What place `p` read at the head of the `if` behind `f`: its type now with every in-place
+// write since then undone, then redone. -1 where the place does not resolve.
+function narHeadTy(f: IfChk, p: i32): i32 {
   let j = narIpAt.length - 1
   while j >= f.ipMark {
     narIpApply(f, j, true)
     j = j - 1
   }
-  const t = narKeyNowTy(key)
+  const t = narKeyNowTy(p)
   j = f.ipMark
   while j < narIpAt.length {
     narIpApply(f, j, false)
@@ -713,7 +730,7 @@ export function applyArmJoins(
   thenDiverges: boolean,
   elseDiverges: boolean,
   condIx: i32,
-  sumKeys: string[],
+  sumPlaces: i32[],
   sumTys: i32[],
   sumPrev: i32[],
   sumRet: i32[],
@@ -721,8 +738,8 @@ export function applyArmJoins(
   // Both arms diverging leaves no code below to describe.
   if thenDiverges && elseDiverges { return 0 }
   const ix = f.ifIx
-  const keys: string[] = []
-  const slot: {[string]: i32} = Map()
+  const keys: i32[] = []
+  const slot: {[i32]: i32} = Map()
   const kEnt: i32[] = []
   const kThen: i32[] = []
   const kElse: i32[] = []
@@ -732,21 +749,21 @@ export function applyArmJoins(
   const kElseSeen: boolean[] = []
   // One pass over the subtree's rows, in order, folding each into its key's two paths.
   let i = f.clobMark
-  const end = narClobKeys.length
+  const end = narClobPlace.length
   while i < end {
-    const nm = narClobKeys[i]
-    if narClobHits(i, nm) {
-      let k = slot[nm] ?? -1
+    const pl = narClobPlace[i]
+    if narClobHits(i, pl) {
+      let k = slot[pl] ?? -1
       if k < 0 {
         k = keys.length
-        slot[nm] = k
-        keys.push(nm)
+        slot[pl] = k
+        keys.push(pl)
         // A key the condition tests starts each arm at that arm's fact, from the entry the head
         // saw. Any other key enters both arms at what it held on entry, which a row inside an
         // arm's own narrowing cannot tell (D4198).
-        const ti = strListLastIx(f.tnNames, nm)
-        const ei = strListLastIx(f.enNames, nm)
-        let ent = narHeadTy(f, nm)
+        const ti = i32ListLastIx(f.tnPlaces, pl)
+        const ei = i32ListLastIx(f.enPlaces, pl)
+        let ent = narHeadTy(f, pl)
         if ent < 0 { ent = narClobPrev[i] }
         let ts = ent
         let es = ent
@@ -765,7 +782,7 @@ export function applyArmJoins(
         // A condition fact over a path one arm leaves is the post-guard rule's, not this join's.
         kOk.push(
           ent >= 0
-            && !crCondRetired(condIx, nm)
+            && !crCondRetired(condIx, placeText(pl))
             && !(cond && (thenDiverges || elseDiverges)),
         )
         kRet.push(0)
@@ -794,7 +811,8 @@ export function applyArmJoins(
   }
   let k = 0
   while k < keys.length {
-    const nm = keys[k]
+    const pl = keys[k]
+    const nm = placeText(pl)
     // This pass's answer replaces an earlier check's, which may have been at other types.
     narIfEnds[i32ToStr(ix) + "#" + nm] = -1
     // A path fact over a type variable or a hole meets per instance, and the join is banked
@@ -824,7 +842,7 @@ export function applyArmJoins(
       }
       narNoteChainEnd(ix, nm, jt)
       if jt >= 0 {
-        sumKeys.push(nm)
+        sumPlaces.push(pl)
         sumTys.push(jt)
         sumPrev.push(kEnt[k])
         sumRet.push(kRet[k])
@@ -833,9 +851,9 @@ export function applyArmJoins(
         // emitter's push follows, and only as that statement's whole value.
         if !f.isElseArm {
           if narIfIsStmt(ix) {
-            narInstallJoin(ix, nm, jt, chainEnd >= 0)
+            narInstallJoin(ix, pl, jt, chainEnd >= 0)
           } else {
-            narDeferJoin(ix, nm, jt, chainEnd >= 0)
+            narDeferJoin(ix, pl, jt, chainEnd >= 0)
           }
         }
       }
@@ -858,17 +876,18 @@ function narApplyDeferred(st: i32) {
   0
 }
 
-// Install the join `jt` of `key` for the code below the `if` at `ix`, in the block holding the
-// `if` — the lifetime the emitter's push after the statement has — and bank it for that push.
-function narInstallJoin(ix: i32, key: string, jt: i32, viaChain: boolean) {
-  if isPathKey(key) {
+// Install the join `jt` of place `p` for the code below the `if` at `ix`, in the block holding
+// the `if` — the lifetime the emitter's push after the statement has — and bank it for that push.
+function narInstallJoin(ix: i32, p: i32, jt: i32, viaChain: boolean) {
+  const key = placeText(p)
+  if placeIsPath(p) {
     // Against what the path reads at now, not at entry: an arm's write may have retired the
     // entry narrowing in place. A retired innermost entry is replaced even by an equal join, so
     // the reads and writes below resolve through a live one (D3316).
-    const inner = narrowedPathIx(key)
-    const retired = inner >= 0 && narrowedPathTyRaw(key) < 0
-    if jt != narKeyNowTy(key) || retired {
-      npKeysPush(key)
+    const inner = narrowedPathIx(p)
+    const retired = inner >= 0 && narrowedPathTyRaw(p) < 0
+    if jt != narKeyNowTy(p) || retired {
+      npKeysPush(p)
       npTysPush(jt)
       npInvByPush(-1)
       npEpochsPush(narFnEpoch)
@@ -879,13 +898,14 @@ function narInstallJoin(ix: i32, key: string, jt: i32, viaChain: boolean) {
     }
     return 0
   }
-  const cur = lookup(key)
+  const s = placeDecl(p)
+  const cur = declTyOf(s)
   if cur >= 0 && jt != cur {
     // Banked like the post-guard fall-through, so a write below is checked against storage
     // and a call that may write the name ends it (D2390).
-    noteNarShadow(envDeclOfNameForFlow(key), cur, NAR_KIND_POSTGUARD)
-    declare(key, jt)
-    narFitCompanions(key, cur, jt)
+    noteNarShadow(s, cur, NAR_KIND_POSTGUARD)
+    declareSlot(s, key, jt)
+    narFitCompanions(p, cur, jt)
     recordArmJoin(ix, key, jt)
   } else if viaChain {
     // The `else if` chain's join reaches the emitter only at this statement (D2627).
@@ -1250,27 +1270,27 @@ export function daCheckRead(name: string, at: i32) {
 
 // ── the pin column ───────────────────────────────────────────────────────────
 
-// The innermost narrowed-path overlay entry for `key`, or -1, which means either "never narrowed"
+// The innermost narrowed-path overlay entry for place `p`, or -1, which means either "never narrowed"
 // or "narrowed and since invalidated by an aliasing write or a falsifying assignment". One
 // function answers "is this narrowing in force", so the member read arms and `placeCurTy`'s fact
 // collection cannot disagree: after `clr(o)` a fresh guard re-derives from the declared type.
-export function narrowedPathTy(key: string) {
-  const i = narrowedPathIx(key)
+export function narrowedPathTy(p: i32) {
+  const i = narrowedPathIx(p)
   if i < 0 { return -1 }
   if npInvBy[i] >= 0 { return -1 }
-  if crPathCaptureLost(i, key) { return -1 }
+  if crPathCaptureLost(i, npKeys[i]) { return -1 }
   if i < crFnNpBase() { return writeLandNestedTy(npTys[i]) }
   npTys[i]
 }
 
-// The node that invalidated the innermost narrowing of `key`, or -1 when `key` is narrowed and in
+// The node that invalidated the innermost narrowing of place `p`, or -1 when it is narrowed and in
 // force, or never narrowed at all. The two states `narrowedPathTy` folds into -1 are told apart
 // here, and only for the diagnostic: an unguarded nullable read keeps its existing message, an
 // invalidated one names the call or the write.
-export function narrowedPathInvBy(key: string) {
-  const i = narrowedPathIx(key)
+export function narrowedPathInvBy(p: i32) {
+  const i = narrowedPathIx(p)
   if i < 0 { return -1 }
-  if crPathCaptureLost(i, key) { return -1 }
+  if crPathCaptureLost(i, npKeys[i]) { return -1 }
   npInvBy[i]
 }
 
@@ -1310,18 +1330,19 @@ function shapeStoresWithin(w: string, nar: i32): boolean {
   e >= 0 && !tyIsHole(e) && !tyHasTyVar(e) && assignable(e, nar)
 }
 
-// Whether a function with the write shapes `sum` may write the place keyed `key` through some
-// alias of an object on its path. A store into the key's own last step is harmless when the place
+// Whether a function with the write shapes `sum` may write the place `p` through some alias of
+// an object on its path. A store into the place's own last step is harmless when the place
 // stores exactly the narrowed type: whatever it writes, the narrowing still holds.
-function shapesHitKey(sum: WeSet, key: string): boolean {
+function shapesHitKey(sum: WeSet, p: i32): boolean {
+  const key = placeText(p)
   if crAskOn {
     const st0 = keySteps(key)
-    crAskUseShape(key, st0, keyStepTags(key, st0))
+    crAskUseShape(key, st0, keyStepTags(p, st0))
   }
   if sum.opaque || sum.at { return true }
   if sum.parts.length == 0 { return false }
   const steps = keySteps(key)
-  const tags = keyStepTags(key, steps)
+  const tags = keyStepTags(p, steps)
   const root = placeRootOf(key)
   let lastSafe = -1
   for id in sum.parts {
@@ -1334,10 +1355,10 @@ function shapesHitKey(sum: WeSet, key: string): boolean {
       if shapeHitsStep(w, steps[s], tags[s]) {
         if s < steps.length - 1 || w[0] == '-' { return true }
         if steps[s] == LIST_EVERY_STEP {
-          if !shapeStoresWithin(w, narrowedPathTyRaw(key)) { return true }
+          if !shapeStoresWithin(w, narrowedPathTyRaw(p)) { return true }
         } else if lastSafe < 0 {
           lastSafe = 0
-          if keyStoresNarrowedTy(key) { lastSafe = 1 }
+          if keyStoresNarrowedTy(p) { lastSafe = 1 }
         }
         if lastSafe == 0 { return true }
       }
@@ -1347,12 +1368,12 @@ function shapesHitKey(sum: WeSet, key: string): boolean {
   false
 }
 
-// Per step of `key`, the cell tag of the container a subscript step reads (`cellTagOfTy` of the
-// type its prefix holds, through the narrowings over it), "" for a field step or when unknown.
-function keyStepTags(key: string, steps: string[]): string[] {
-  if keyIsListEvery(key) { return listEveryTags(key, steps) }
+// Per step of place `p`, the cell tag of the container a subscript step reads (`cellTagOfTy` of
+// the type its prefix holds, through the narrowings over it), "" for a field step or when unknown.
+function keyStepTags(p: i32, steps: string[]): string[] {
+  if keyIsListEvery(placeText(p)) { return listEveryTags(p, steps) }
   const out: string[] = []
-  const pres = keyStepPrefixTys(key, steps)
+  const pres = keyStepPrefixTys(p, steps)
   let s = 0
   while s < steps.length {
     out.push(keyStepTag(steps[s], pres[s]))
@@ -1361,33 +1382,35 @@ function keyStepTags(key: string, steps: string[]): string[] {
   out
 }
 
-// Whether the place keyed `key` stores exactly the type its live narrowing reads it at.
-function keyStoresNarrowedTy(key: string): boolean {
-  const slot = narrowedPathIx(key)
+// Whether the place `p` stores exactly the type its live narrowing reads it at.
+function keyStoresNarrowedTy(p: i32): boolean {
+  const slot = narrowedPathIx(p)
   if slot < 0 || narFitSlot(slot) { return false }
   const nar = npTys[slot]
-  const st = keyStoreTy(key)
+  const st = keyStoreTy(p)
   if nar < 0 || st < 0 { return false }
   // Two holes both render `_`, which says nothing about whether they are one type (D3197).
   if tyIsHole(st) || tyIsHole(nar) { return false }
   st == nar || tyToStr(st) == tyToStr(nar)
 }
 
-// The type a store into the place keyed `key` writes: the declared type of its last step, reached
+// The type a store into the place `p` writes: the declared type of its last step, reached
 // through the narrowings in force over its prefixes; -1 when unresolvable.
-function keyStoreTy(key: string): i32 {
+function keyStoreTy(p: i32): i32 {
+  const key = placeText(p)
   const steps = keySteps(key)
   if steps.length == 0 { return -1 }
   let rootLen = 0
   while rootLen < key.length && key[rootLen] != '.' && key[rootLen] != '[' {
     rootLen = rootLen + 1
   }
+  const d = placeDecl(p)
   let pre = key.slice(0, rootLen)
-  let t = lookup(pre)
+  let t = declTyOf(d)
   let s = 0
   while s < steps.length - 1 && t >= 0 {
     pre = pre + steps[s]
-    const ov = narrowedPathTyRaw(pre)
+    const ov = narrowedPathTyRaw(placeFind(d, pre))
     if ov >= 0 {
       t = ov
     } else if steps[s][0] == '.' {
@@ -1405,13 +1428,13 @@ function keyStoreTy(key: string): i32 {
   placeCellStoreTy(t)
 }
 
-// The one place that decides whether the call at `callIx` invalidates the path narrowing keyed
-// `key`. The rule is effect-based: `key` dies only when some argument place of the call is a prefix
-// of `key` and the callee may write, through that parameter, a sub-path that is a prefix of the
-// rest. It fails closed at every edge, and it is keyed on the syntactic argument, so aliases live.
-function callInvalidatesNarrowedPath(callIx: i32, key: string) {
+// The one place that decides whether the call at `callIx` invalidates the path narrowing of place
+// `p`. The rule is effect-based: it dies only when some argument place of the call is a prefix of
+// it and the callee may write, through that parameter, a sub-path that is a prefix of the rest.
+// It fails closed at every edge, and it is keyed on the syntactic argument, so aliases live.
+function callInvalidatesNarrowedPath(callIx: i32, p: i32) {
   const cn = nodeAt(callIx)
-  if cn is Call { return callInvalidatesReal(cn, callIx, key) }
+  if cn is Call { return callInvalidatesReal(cn, callIx, p) }
   // An operator that may dispatch to a declaration is a call of it, its operands the arguments.
   const ds = opSiteDecls(callIx)
   if ds.length == 0 { return false }
@@ -1419,13 +1442,14 @@ function callInvalidatesNarrowedPath(callIx: i32, key: string) {
   let i = 0
   while i < ds.length {
     if ds[i] < 0 { return true }
-    if declWritesPath(ds[i], args, key) { return true }
+    if declWritesPath(ds[i], args, p) { return true }
     i = i + 1
   }
   false
 }
 
-function callInvalidatesReal(cn: Call, callIx: i32, key: string) {
+function callInvalidatesReal(cn: Call, callIx: i32, p: i32) {
+  const key = placeText(p)
   const declIx = callDeclFnIx(cn, callIx)
   // A cell-removing collection method retires that cell's narrowings, and it has to be asked
   // first because it reaches neither leg below: an intrinsic answers `-2` on the next line, and
@@ -1450,11 +1474,11 @@ function callInvalidatesReal(cn: Call, callIx: i32, key: string) {
       }
     }
   }
-  if declIx == -2 && pushKeepsElemOnly(cn, key) { return false }
+  if declIx == -2 && pushKeepsElemOnly(cn, p) { return false }
   // An intrinsic writes only through its own effect on a receiver that may alias the path, and
   // through the function values it is handed and may run.
   if declIx == -2 && !ALIAS_RULE_BROAD {
-    return shapesHitKey(callWriteShapes(cn, callIx), key)
+    return shapesHitKey(callWriteShapes(cn, callIx), p)
   }
   // An opaque callee invalidates every live narrowing, not only the ones rooted at its arguments:
   // a closure that captured the object takes no argument, so an argument-keyed fallback would
@@ -1466,23 +1490,24 @@ function callInvalidatesReal(cn: Call, callIx: i32, key: string) {
     const args = callArgPlaces(cn, callIx)
     let i = 0
     while i < ts.length {
-      if declWritesPath(ts[i], args, key) { return true }
+      if declWritesPath(ts[i], args, p) { return true }
       i = i + 1
     }
     return false
   }
   if declIx < 0 { return true }
-  declWritesPath(declIx, callArgPlaces(cn, callIx), key)
+  declWritesPath(declIx, callArgPlaces(cn, callIx), p)
 }
 
 // Whether the declaration at `declIx`, handed the argument places `args` in parameter order,
-// may write the place keyed `key`: through a free variable, or through an argument.
-function declWritesPath(declIx: i32, args: i32[], key: string): boolean {
+// may write the place `p`: through a free variable, or through an argument.
+function declWritesPath(declIx: i32, args: i32[], p: i32): boolean {
+  const key = placeText(p)
   // The write shapes see every write the name-keyed legs below do — through an argument, a free
   // variable, an alias — and each function value the callee runs is charged at its argument.
   if !ALIAS_RULE_BROAD {
     const sh = declWriteShapes(declIx, args)
-    return shapesHitKey(sh, key)
+    return shapesHitKey(sh, p)
   }
   // Writes through a free variable, which likewise need no argument.
   crAskUsePath(key)
@@ -1543,9 +1568,7 @@ export function writeStorageTy(ix: i32) {
       return narDeclaredTy(s, NAR_KIND_ASG)
     }
     Member => {
-      const key = placeKeyOf(ix)
-      if key == "" { return -1 }
-      const slot = narrowedPathIx(key)
+      const slot = narrowedPathIx(placeAt(ix))
       if slot < 0 { return -1 }
       // An already-retired narrowing still answers, and bailing on `npInvBy[slot] >= 0` here is an
       // ordering bug inside one statement: `lt` is read off the target before the right-hand side is
@@ -1553,10 +1576,10 @@ export function writeStorageTy(ix: i32) {
       // storage never had. A retired narrowing means the place reads at its declared type.
       if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
       if !npInsideBarrier(slot) { return -1 }
-      const noNames: string[] = []
+      const noPlaces: i32[] = []
       const noTys: i32[] = []
       return placeFieldTy(
-        placeCurTy(n.memObj, noNames, noTys),
+        placeCurTy(n.memObj, noPlaces, noTys),
         n.memProp,
         false,
       )
@@ -1566,15 +1589,13 @@ export function writeStorageTy(ix: i32) {
     // it would newly reject `cannot assign null to i32[]` — a working program lost to a rule whose
     // whole point is that it never shrinks what storage holds. Same three guards as the member arm.
     Index => {
-      const key = placeKeyOf(ix)
-      if key == "" { return -1 }
-      const slot = narrowedPathIx(key)
+      const slot = narrowedPathIx(placeAt(ix))
       if slot < 0 { return -1 }
       if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
       if !npInsideBarrier(slot) { return -1 }
-      const noNames: string[] = []
+      const noPlaces: i32[] = []
       const noTys: i32[] = []
-      return placeCellStoreTy(placeCurTy(n.idxArr, noNames, noTys))
+      return placeCellStoreTy(placeCurTy(n.idxArr, noPlaces, noTys))
     }
     // Every other kind is not storage a write can land in.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -1603,9 +1624,7 @@ export function writeLeavesLoopEntry(tgtIx: i32, rt: i32): boolean {
 
 // `writeLeavesLoopEntry` for a field or cell narrowed outside the innermost loop.
 function pathWriteLeavesLoopEntry(tgtIx: i32, rt: i32): boolean {
-  const key = placeKeyOf(tgtIx)
-  if key == "" { return false }
-  const slot = narrowedPathIx(key)
+  const slot = narrowedPathIx(placeAt(tgtIx))
   if slot < 0 || slot >= npKeys.length { return false }
   if npInvBy[slot] >= 0 || npInsideBarrier(slot) { return false }
   const store = placeStoreTy(tgtIx)
@@ -1639,9 +1658,9 @@ function writeLandsWithin(store: i32, rt: i32, cap: i32): boolean {
 function placeIsMapCell(ix: i32): boolean {
   const n = nodeAt(ix)
   if n is Index {
-    const noNames: string[] = []
+    const noPlaces: i32[] = []
     const noTys: i32[] = []
-    const rt = placeCurTy(n.idxArr, noNames, noTys)
+    const rt = placeCurTy(n.idxArr, noPlaces, noTys)
     if rt >= 0 {
       const nt = nonNullTy(rt)
       if nt >= 0 { return tyAt(nt) is TyMap }
@@ -1655,9 +1674,9 @@ function placeIsMapCell(ix: i32): boolean {
 function placeStoreTy(ix: i32): i32 {
   const n = nodeAt(ix)
   if n is Member {
-    const noNames: string[] = []
+    const noPlaces: i32[] = []
     const noTys: i32[] = []
-    return placeFieldTy(placeCurTy(n.memObj, noNames, noTys), n.memProp, false)
+    return placeFieldTy(placeCurTy(n.memObj, noPlaces, noTys), n.memProp, false)
   }
   // A cell's declared type is its container's element; any other node has none.
   placeCellDeclTy(ix)
@@ -1667,9 +1686,9 @@ function placeStoreTy(ix: i32): i32 {
 function placeCellDeclTy(ix: i32): i32 {
   const n = nodeAt(ix)
   if n is Index {
-    const noNames: string[] = []
+    const noPlaces: i32[] = []
     const noTys: i32[] = []
-    return placeCellStoreTy(placeCurTy(n.idxArr, noNames, noTys))
+    return placeCellStoreTy(placeCurTy(n.idxArr, noPlaces, noTys))
   }
   -1
 }
@@ -1702,9 +1721,9 @@ function writesHoleField(tgtIx: i32): boolean {
   else { return false }
   const on = nodeAt(recv)
   if on is Ident { return tyIsHole(identTyOf(recv, on.identName)) }
-  const noNames: string[] = []
+  const noPlaces: i32[] = []
   const noTys: i32[] = []
-  if tyIsHole(placeCurTy(recv, noNames, noTys)) { return true }
+  if tyIsHole(placeCurTy(recv, noPlaces, noTys)) { return true }
   tyIsHole(nodeTyOf(recv))
 }
 
@@ -1745,7 +1764,7 @@ function retireAliasedNarrowings(
     // A receiver no other place refers to cannot be any object on another key's path; a key
     // root no other place refers to cannot be the receiver unless the receiver names it. Both
     // resolve names here, so neither holds for an entry an inner declaration hides (D3307).
-    const hidden = narrowedPathIx(k) != i
+    const hidden = !own && !fam && placeRootHidden(kRoot, npPlace[i])
     const apart = recvFresh && kRoot != recvName && !hidden
     const skip0 = kRoot != recvName && !hidden && crSoleRefHolds(kRoot)
     const keeps = (!hidden
@@ -1754,11 +1773,18 @@ function retireAliasedNarrowings(
       && !fam
       && !apart
       && !keeps
-      && aliasWriteHitsKey(shape, recvTy, skip0, rt, k, npTys[i])
+      && aliasWriteHitsKey(
+      shape,
+      recvTy,
+      skip0,
+      rt,
+      npPlace[i],
+      npTys[i],
+    )
     if hits && npInvBy[i] >= 0 && i >= crFnNpBase() {
       // Already retired, typically by a sibling arm's write: the kill still ends this path,
       // and a merged entry must not hand the fact back (D3285).
-      narClobKeysPush(k)
+      narClobPlacePush(npPlace[i])
       narClobTysPush(-1)
       narClobPrevPush(-1)
       narClobDepthsPush(T.frames.length)
@@ -1775,14 +1801,14 @@ function retireAliasedNarrowings(
         crAliasNestDepths.push(crFnBases.length)
       } else {
         crPathCallRetire(i, atIx)
-        narClobKeysPush(k)
+        narClobPlacePush(npPlace[i])
         narClobTysPush(-1)
         narClobPrevPush(npTys[i])
         narClobDepthsPush(T.frames.length)
         narClobRetiredPush(2)
         narClobBindPush(-1)
         narClobDeclPush(-1)
-        mapCellStaysPresent(k)
+        mapCellStaysPresent(npPlace[i])
       }
     }
     i = i + 1
@@ -1790,19 +1816,25 @@ function retireAliasedNarrowings(
   0
 }
 
+// Whether `root`, the root name of the narrowing place `p`, reads another binding here, an
+// inner declaration hiding it, so a by-name test of its root cannot speak for it (D3307).
+function placeRootHidden(root: string, p: i32): boolean {
+  envDeclOfNameForFlow(root) != placeDecl(p)
+}
+
 // A narrowed map cell a store through an alias may have written is present either way, so it
 // reads the map's value type after, not the map read's `T | null`.
-function mapCellStaysPresent(key: string) {
-  const steps = keySteps(key)
+function mapCellStaysPresent(p: i32) {
+  const steps = keySteps(placeText(p))
   if steps.length == 0 || steps[steps.length - 1][0] != '[' { return 0 }
-  const pres = keyStepPrefixTys(key, steps)
+  const pres = keyStepPrefixTys(p, steps)
   const ct = pres[pres.length - 1]
   if ct < 0 { return 0 }
   const nt = nonNullTy(ct)
   if nt < 0 { return 0 }
   const m = tyAt(nt)
   if m is TyMap {
-    npKeysPush(key)
+    npKeysPush(p)
     npTysPush(m.mVal)
     npInvByPush(-1)
     npEpochsPush(narFnEpoch)
@@ -1814,7 +1846,7 @@ function mapCellStaysPresent(key: string) {
 }
 
 // Whether a write of shape `shape` into an object typed `recvTy`, storing a value typed `rt`,
-// may falsify the narrowing of `key` to `npTy`. A field step matches only a receiver whose type
+// may falsify the narrowing of place `p` to `npTy`. A field step matches only a receiver whose type
 // may be the object's, the first step not at all when `skip0`; a store the narrowed type admits
 // into the key's last step keeps it.
 function aliasWriteHitsKey(
@@ -1822,12 +1854,13 @@ function aliasWriteHitsKey(
   recvTy: i32,
   skip0: boolean,
   rt: i32,
-  key: string,
+  p: i32,
   npTy: i32,
 ): boolean {
+  const key = placeText(p)
   const steps = keySteps(key)
-  const pres = keyStepPrefixTys(key, steps)
-  const tags = keyStepTags(key, steps)
+  const pres = keyStepPrefixTys(p, steps)
+  const tags = keyStepTags(p, steps)
   let s = 0
   while s < steps.length {
     if (
@@ -1854,21 +1887,23 @@ function aliasWriteHitsKey(
   false
 }
 
-// Per step of `key`, the type of the prefix the step reads from, -1 when unresolvable.
-function keyStepPrefixTys(key: string, steps: string[]): i32[] {
+// Per step of place `p`, the type of the prefix the step reads from, -1 when unresolvable.
+function keyStepPrefixTys(p: i32, steps: string[]): i32[] {
+  const key = placeText(p)
+  const d = placeDecl(p)
   const out: i32[] = []
   let rootLen = 0
   while rootLen < key.length && key[rootLen] != '.' && key[rootLen] != '[' {
     rootLen = rootLen + 1
   }
   let pre = key.slice(0, rootLen)
-  let t = lookup(pre)
+  let t = declTyOf(d)
   let s = 0
   while s < steps.length {
     out.push(t)
     if t >= 0 {
       pre = pre + steps[s]
-      const ov = narrowedPathTyRaw(pre)
+      const ov = narrowedPathTyRaw(placeFind(d, pre))
       if ov >= 0 {
         t = ov
       } else if steps[s][0] == '.' {
@@ -1909,6 +1944,8 @@ export function retireNarrowingsForWrite(
   // an earlier check banked at the hole's own type is not this one's.
   clearAsgNarTyIx(atIx)
   const tgtKey = placeKeyOf(tgtIx)
+  // Found, not made: most writes are to places no narrowing names, and a push below makes it.
+  let tgtPlace = placeAtKey(tgtIx, tgtKey)
   retireAliasedNarrowings(tgtIx, tgtKey, rt, atIx)
   // A variable-index write names no cell and therefore may have hit any of them. `xs[i] = null`
   // keys "" and the loop below would retire nothing at all, which is a soundness hole the moment
@@ -1920,7 +1957,7 @@ export function retireNarrowingsForWrite(
   }
   // The path's own live fact before this write: the arm JOIN's entry type, and the tell that a
   // narrowing covers the place at all (D1849).
-  const preSlot = narrowedPathIx(tgtKey)
+  const preSlot = narrowedPathIx(tgtPlace)
   let prePathTy = -1
   if preSlot >= 0 {
     // An entry a WRITE retired still seeds the ledger, at the storage type that write left the
@@ -1959,7 +1996,13 @@ export function retireNarrowingsForWrite(
     if i < crFnNpBase() { hit = false }
     // A write the narrowing admits still re-narrows the place to the member it stored, as it
     // does a bare name (`5` into an `f64` arm of `i32 | f64`).
-    if !hit && i >= crFnNpBase() && npInvBy[i] < 0 && npKeys[i] == tgtKey {
+    if (
+      !hit
+      && i >= crFnNpBase()
+      && npInvBy[i] < 0
+      && tgtPlace >= 0
+      && npPlace[i] == tgtPlace
+    ) {
       const pd = writeStorageTy(tgtIx)
       if pd >= 0 && !tySame(writeNarrowAfter(pd, npTys[i], rt), npTys[i]) {
         hit = true
@@ -1976,7 +2019,7 @@ export function retireNarrowingsForWrite(
       // goes through the prefix rule both sides already apply. Reads-only narrowing states one
       // rule for every receiver, so the path re-narrows to the written member exactly as a bare
       // name does, and reads at its declaration when the write names none (D1736, D1847).
-      if npKeys[i] == tgtKey {
+      if tgtPlace >= 0 && npPlace[i] == tgtPlace {
         pathRetired = true
         let pdcl = writeStorageTy(tgtIx)
         if pdcl < 0 { pdcl = placeStoreTy(tgtIx) }
@@ -1997,7 +2040,7 @@ export function retireNarrowingsForWrite(
   // The assignment narrowing's path twin: a non-null write to a field or list cell no live
   // narrowing covers (none, or one a write, call or alias ended) strips `null` for the code after
   // it, as `x = 5` does a name (D1848, D3316). A map cell's `null` is the miss, so it is left out.
-  if narrowedPathTyRaw(tgtKey) < 0 && pathReTy < 0 && !placeIsMapCell(tgtIx) {
+  if narrowedPathTyRaw(tgtPlace) < 0 && pathReTy < 0 && !placeIsMapCell(tgtIx) {
     const pst = placeStoreTy(tgtIx)
     if pst >= 0 && tvPlaceWrite(pst, rt) {
       pathReTy = tvWriteTy(pst, rt, -1)
@@ -2026,8 +2069,9 @@ export function retireNarrowingsForWrite(
       }
     }
   }
-  if pathReTy >= 0 {
-    npKeysPush(tgtKey)
+  if pathReTy >= 0 && tgtPlace < 0 { tgtPlace = placeOf(tgtIx) }
+  if pathReTy >= 0 && tgtPlace >= 0 {
+    npKeysPush(tgtPlace)
     npTysPush(pathReTy)
     npInvByPush(-1)
     npEpochsPush(narFnEpoch)
@@ -2037,7 +2081,7 @@ export function retireNarrowingsForWrite(
   }
   narClobPathWrite(
     tgtIx,
-    tgtKey,
+    tgtPlace,
     rt,
     preSlot,
     prePathTy,
@@ -2060,7 +2104,7 @@ function narClobUnderWrite(i: i32, tgtKey: string) {
   ) {
     let kprev = -1
     if npInvBy[i] < 0 { kprev = npTys[i] }
-    narClobKeysPush(npKeys[i])
+    narClobPlacePush(npPlace[i])
     narClobTysPush(-1)
     narClobPrevPush(kprev)
     narClobDepthsPush(T.frames.length)
@@ -2070,12 +2114,12 @@ function narClobUnderWrite(i: i32, tgtKey: string) {
   }
 }
 
-// The join row of a write over path `tgtKey`: `prePathTy` is the path's live fact before it,
+// The join row of a write over path place `tgtPlace`: `prePathTy` is the path's live fact before it,
 // `pathReTy` the member it re-narrows to (-1 for none), `pathReAsg` that a null strip made it,
 // and `pathRetired` that the write retired the path's own narrowing. Pushes at most one row.
 function narClobPathWrite(
   tgtIx: i32,
-  tgtKey: string,
+  tgtPlace: i32,
   rt: i32,
   preSlot: i32,
   prePathTy: i32,
@@ -2101,7 +2145,7 @@ function narClobPathWrite(
       }
     }
     if endTy < 0 { endTy = prePathTy }
-    narClobKeysPush(tgtKey)
+    narClobPlacePush(tgtPlace)
     narClobTysPush(endTy)
     narClobPrevPush(prePathTy)
     narClobDepthsPush(T.frames.length)
@@ -2109,16 +2153,16 @@ function narClobPathWrite(
     if pathRetired { prtd = 1 }
     narClobRetiredPush(prtd)
     narClobBindPush(-1)
-    narClobDeclPush(narKeyBind(tgtKey))
+    narClobDeclPush(narPlaceBind(tgtPlace))
   } else if pathReAsg {
     // The null strip of a path no narrowing covered is a path fact the join meets too.
-    narClobKeysPush(tgtKey)
+    narClobPlacePush(tgtPlace)
     narClobTysPush(pathReTy)
     narClobPrevPush(placeStoreTy(tgtIx))
     narClobDepthsPush(T.frames.length)
     narClobRetiredPush(0)
     narClobBindPush(-1)
-    narClobDeclPush(narKeyBind(tgtKey))
+    narClobDeclPush(narPlaceBind(tgtPlace))
   } else {
     // A write over a narrowing a sibling arm or a kill already ended in place still ends this
     // path at the member it stores, and the join must see that (D3315).
@@ -2126,13 +2170,13 @@ function narClobPathWrite(
     // read may miss whatever the write stored.
     const fst = placeStoreTy(tgtIx)
     if fst >= 0 && preSlot >= 0 && !placeIsMapCell(tgtIx) {
-      narClobKeysPush(tgtKey)
+      narClobPlacePush(tgtPlace)
       narClobTysPush(writeMemberTy(fst, rt))
       narClobPrevPush(fst)
       narClobDepthsPush(T.frames.length)
       narClobRetiredPush(1)
       narClobBindPush(-1)
-      narClobDeclPush(narKeyBind(tgtKey))
+      narClobDeclPush(narPlaceBind(tgtPlace))
     }
   }
 }
@@ -2159,7 +2203,7 @@ function retireIndexedNarrowings(tgtIx: i32, rt: i32, atIx: i32) {
       narSetInv(r, atIx)
       noteKillSure(atIx, npKeys[r])
       // Unknown after the write, which an arm join must not merge a fact back over.
-      narClobKeysPush(npKeys[r])
+      narClobPlacePush(npPlace[r])
       narClobTysPush(-1)
       narClobPrevPush(rprev)
       narClobDepthsPush(T.frames.length)
@@ -2240,7 +2284,8 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       // allowed still ENDS at that member, and the first arm's in-place retirement is what
       // makes the second arm's flip look admitted (D1846). Its before-type is the name's as
       // the assignment found it, ahead of the null-strip shadow the assignment itself declared.
-      narClobKeysPush(nm)
+      const np = placeIntern(s, nm, false)
+      narClobPlacePush(np)
       if retires { narClobTysPush(rn) } else { narClobTysPush(keptEnd) }
       if preAsgTy >= 0 {
         narClobPrevPush(preAsgTy)
@@ -2252,7 +2297,7 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       if retires { rtd = 1 }
       narClobRetiredPush(rtd)
       narClobBindPush(-1)
-      narClobDeclPush(narKeyBind(nm))
+      narClobDeclPush(narPlaceBind(np))
     }
   }
 }
@@ -2320,14 +2365,15 @@ export function crPathCallRetire(slot: i32, callIx: i32) {
 
 // A path read under a narrowing an enclosing function made: the nested function may run after
 // a call there has written the path.
-export function crNoteCaptureRead(key: string) {
-  const slot = narrowedPathIx(key)
+export function crNoteCaptureRead(p: i32) {
+  const slot = narrowedPathIx(p)
   if slot < 0 || slot >= crFnNpBase() { return 0 }
+  const key = npKeys[slot]
   // An in-place `map`/`filter` callback of the function that made the narrowing has run by the
   // time any later call does.
   const nf = crFnNpBases.length
   if nf >= 2 && slot >= crFnNpBases[nf - 2] {
-    if crCallbackKeeps(crFnIxs[crFnIxs.length - 1], key) { return 0 }
+    if crCallbackKeeps(crFnIxs[crFnIxs.length - 1], p, key) { return 0 }
   }
   if npCapBy[slot] < 0 { npCapBySetAt(slot, crFnIxs[crFnIxs.length - 1]) }
   0
@@ -2335,9 +2381,11 @@ export function crNoteCaptureRead(key: string) {
 
 // A read of a path whose captured narrowing `crPathCaptureLost` dropped, for the note a refusal
 // of that read gains: the function that dropped it, at the scope depth it is checked in.
-export function crNoteLostRead(key: string, ix: i32) {
-  const slot = narrowedPathIx(key)
-  if slot < 0 || !crPathCaptureLost(slot, key) { return 0 }
+export function crNoteLostRead(p: i32, ix: i32) {
+  const slot = narrowedPathIx(p)
+  if slot < 0 { return 0 }
+  const key = npKeys[slot]
+  if !crPathCaptureLost(slot, key) { return 0 }
   // The emitter replays no narrowing of this path into the body (`capWidenOf`, D3419).
   if crFnIxs.length > 0 {
     const fnIx = crFnIxs[crFnIxs.length - 1]
@@ -2362,7 +2410,7 @@ function crPathCaptureLost(slot: i32, key: string): boolean {
   }
   let lv = crFnNpBases.length - 1
   while lv >= 0 && slot < crFnNpBases[lv] {
-    if crFnEscapesAt(lv, key) { return true }
+    if crFnEscapesAt(lv, npPlace[slot], key) { return true }
     lv = lv - 1
   }
   false
@@ -2370,13 +2418,13 @@ function crPathCaptureLost(slot: i32, key: string): boolean {
 
 // Whether the function checked at level `lv` of `crFnIxs` may run other than by a call of its
 // handle in the body that makes it, or as a callback that runs inside the call it is handed to.
-function crFnEscapesAt(lv: i32, key: string): boolean {
+function crFnEscapesAt(lv: i32, p: i32, key: string): boolean {
   const fnIx = crFnIxs[lv]
   // A top-level function is its own root, and any code of the module may call it.
   const isRoot = crFnRoots[lv] == fnIx
   if isRoot { return true }
   const h = crLambdaHandle(fnIx)
-  if h == "" { return !crCallbackKeeps(fnIx, key) }
+  if h == "" { return !crCallbackKeeps(fnIx, p, key) }
   let body = crProgRoot
   if lv >= 1 {
     const pf = nodeAt(crFnIxs[lv - 1])
@@ -2448,12 +2496,11 @@ export function crLoopReadCheck(slot: i32, callIx: i32) {
 
 // ── a call that may reassign a narrowed binding ends the narrowing (D2390) ─────────────────
 
-// May the call at `callIx` write the place keyed `key` — a bare name, or a path such as `o.v` or
-// `xs[0]`? The one question every narrowing-drop site asks, answering true when unsure, so a
-// finer effects summary can replace the answer without touching a caller. DECISIONS.md, "A call
-// that may reassign a narrowed binding ends the narrowing".
-export function callMayWrite(callIx: i32, key: string): boolean {
-  if isPathKey(key) { return callInvalidatesNarrowedPath(callIx, key) }
+// May the call at `callIx` write the place `p` spelled `key` — a bare name, or a path such as
+// `o.v` or `xs[0]`? A bare name may come as PLACE_NONE and its spelling. Answers true when unsure.
+// DECISIONS.md, "A call that may reassign a narrowed binding ends the narrowing".
+export function callMayWrite(callIx: i32, p: i32, key: string): boolean {
+  if isPathKey(key) { return p < 0 || callInvalidatesNarrowedPath(callIx, p) }
   // Nothing reassigns a `const`, whatever a callee writes under its name (D3019).
   if isConstName(key) { return false }
   crCallReaches(callIx, key)
@@ -2487,25 +2534,25 @@ export function crStmtLeave() {
 // `declTy` or another member of the union `declTy`, so the path rules decide when a write through
 // another place ends `name` too. Members that cannot hold an `nt` need none. A list narrowed by
 // its elements gets `name[*]` per nesting depth instead (`narFitElems`).
-export function narFitCompanions(name: string, declTy: i32, nt: i32) {
+export function narFitCompanions(p: i32, declTy: i32, nt: i32) {
   while nfSlots.length > 0 && nfSlots[nfSlots.length - 1] >= npKeys.length {
     nfSlotsPop()
     nfNamesPop()
   }
   if nt < 0 || declTy < 0 { return 0 }
   const r = tyAt(nt)
-  if r is TyObj { narFitFields(name, declTy, nt, r) }
-  narFitElems(name, declTy, nt)
+  if r is TyObj { narFitFields(p, declTy, nt, r) }
+  narFitElems(p, declTy, nt)
   0
 }
 
-function narFitFields(name: string, declTy: i32, nt: i32, r: TyObj) {
+function narFitFields(p: i32, declTy: i32, nt: i32, r: TyObj) {
   let wide = declTy
   const dt = tyAt(declTy)
   if dt is TyNullable { wide = dt.nInner }
   if wide < 0 { return 0 }
   const u = tyAt(wide)
-  narFitMembers(name, nt, r, if u is TyUnion { u.uMembers } else { [wide] })
+  narFitMembers(p, nt, r, if u is TyUnion { u.uMembers } else { [wide] })
   0
 }
 
@@ -2604,7 +2651,7 @@ function narListDeliveryFields(o: ObjLit, dst: i32): boolean {
 }
 
 // The fields of `r` (the record `nt`) a member of `mems` that holds every `nt` stores wider.
-function narFitMembers(name: string, nt: i32, r: TyObj, mems: i32[]) {
+function narFitMembers(p: i32, nt: i32, r: TyObj, mems: i32[]) {
   let f = 0
   while f < r.objFieldNames.length {
     const ft = r.objFieldTypes[f]
@@ -2627,8 +2674,8 @@ function narFitMembers(name: string, nt: i32, r: TyObj, mems: i32[]) {
     }
     if wider {
       nfSlotsPush(npKeys.length)
-      nfNamesPush(name)
-      npKeysPush(name + "." + r.objFieldNames[f])
+      nfNamesPush(placeText(p))
+      npKeysPush(placeWith(p, "." + r.objFieldNames[f]))
       npTysPush(ft)
       npInvByPush(-1)
       npEpochsPush(narFnEpoch)
@@ -2661,8 +2708,10 @@ function crRetireShadowed(name: string, callIx: i32, loopIx: i32) {
     let c = callIx
     if loopIx >= 0 {
       c = -1
-      if crMayBeWritten(name) { c = crFirstWritingCall(loopIx, name) }
-    } else if !callMayWrite(c, name) {
+      if crMayBeWritten(name) {
+        c = crFirstWritingCall(loopIx, PLACE_NONE, name)
+      }
+    } else if !callMayWrite(c, PLACE_NONE, name) {
       c = -1
     }
     // The join row names this binding, which only the joins outside the shadow reach.
@@ -2731,7 +2780,10 @@ export function crCaptureWiden(fnIx: i32) {
             nm,
           )
           crCapLossAny = true
-        } else if crElemNarrowLive(nm) && !crCallbackKeeps(fnIx, nm) {
+        } else if (
+          crElemNarrowLive(s, nm)
+          && !crCallbackKeeps(fnIx, PLACE_NONE, nm)
+        ) {
           crDeclareWidened(nm, wide)
           crCapWidenBank[fnIx] = strListWith(
             crCapWidenBank[fnIx] ?? crNoNames,
@@ -2774,7 +2826,7 @@ export function crCaptureWiden(fnIx: i32) {
 // escapes the body making it, so it may run after that assignment (D2462). A callback run inside
 // the call it is handed to cannot.
 function crCaptureMayGoStale(fnIx: i32, name: string): boolean {
-  if crCallbackKeeps(fnIx, name) { return false }
+  if crCallbackKeeps(fnIx, PLACE_NONE, name) { return false }
   if crMayBeWritten(name) { return true }
   crNameAssigned(name)
 }
@@ -2790,7 +2842,7 @@ function crCaptureLosesNarrowing(
   wide: i32,
 ): boolean {
   if kind == NAR_KIND_GUARD { return false }
-  if crCallbackKeeps(fnIx, name) { return false }
+  if crCallbackKeeps(fnIx, PLACE_NONE, name) { return false }
   if crNameIsModuleTop(envDeclOfNameForFlow(name)) {
     return crNameNulledInProgram(name)
   }
@@ -2803,7 +2855,7 @@ function crBodyMayWrite(fnIx: i32, name: string): boolean {
   const fd = nodeAt(fnIx)
   if fd is FuncDecl {
     if crSubtreeAssigns(fd.fnBody, name) { return true }
-    return crFirstWritingCall(fd.fnBody, name) >= 0
+    return crFirstWritingCall(fd.fnBody, PLACE_NONE, name) >= 0
   }
   true
 }
@@ -2854,13 +2906,13 @@ export function crCapRecCheck(callIx: i32) {
 // and nothing then writes the place keyed `key`: the callee is an array's `map`/`filter`, or a
 // declaration whose body only ever calls that parameter, and the call reaches no writer. Its
 // own body must neither write `key` nor call what may.
-function crCallbackKeeps(fnIx: i32, key: string): boolean {
+function crCallbackKeeps(fnIx: i32, p: i32, key: string): boolean {
   if fnIx < 0 || fnIx >= P.nodes.length { return false }
   const fd = nodeAt(fnIx)
   if !(fd is FuncDecl) { return false }
   if (
     crSubtreeAssigns(fd.fnBody, key)
-    || crFirstWritingCall(fd.fnBody, key) >= 0
+    || crFirstWritingCall(fd.fnBody, p, key) >= 0
   ) {
     return false
   }
@@ -2887,7 +2939,7 @@ function crCallbackKeeps(fnIx: i32, key: string): boolean {
       i = i + 1
     }
     if at < 0 || !crParamOnlyCalled(d, at) { return false }
-    return !callMayWrite(c, key)
+    return !callMayWrite(c, p, key)
   }
   false
 }
@@ -2902,7 +2954,7 @@ export function crNoteCallBare(callIx: i32) {
   const names = crCallCandidates()
   let i = 0
   while i < names.length {
-    if callMayWrite(callIx, names[i]) {
+    if callMayWrite(callIx, PLACE_NONE, names[i]) {
       crRetire(names[i], callIx, false, crStmtIxs[crStmtIxs.length - 1])
     }
     crRetireShadowed(names[i], callIx, -1)
@@ -3068,19 +3120,19 @@ function ccAddCand(c: CallCands, nm: string, r: i32) {
   0
 }
 
-// The first call in the subtree at `ix` that may write `name`, or -1.
-function crFirstWritingCall(ix: i32, name: string): i32 {
+// The first call in the subtree at `ix` that may write place `p` spelled `name`, or -1.
+function crFirstWritingCall(ix: i32, p: i32, name: string): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = nodeAt(ix)
   if n is Call || crIsDispatchSite(ix) {
-    if callMayWrite(ix, name) { return ix }
+    if callMayWrite(ix, p, name) { return ix }
   }
   let cur = ix
   while cur >= 0 {
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      const c = crFirstWritingCall(kids[k], name)
+      const c = crFirstWritingCall(kids[k], p, name)
       if c >= 0 { return c }
       k = k + 1
     }
@@ -3111,15 +3163,16 @@ function elemOnlyStoreKeeps(
   vt >= 0 && !tyIsHole(vt) && !tyHasTyVar(vt) && assignable(vt, leaf)
 }
 
-// Whether the call `cn` is a `push` of values the element-only entry `key` admits onto a list at
-// its depth (`elemOnlyStoreKeeps`), which keeps the entry.
-function pushKeepsElemOnly(cn: Call, key: string): boolean {
+// Whether the call `cn` is a `push` of values the element-only entry of place `p` admits onto a
+// list at its depth (`elemOnlyStoreKeeps`), which keeps the entry.
+function pushKeepsElemOnly(cn: Call, p: i32): boolean {
+  const key = placeText(p)
   if cn.callFn < 0 { return false }
   const cf = nodeAt(cn.callFn)
   if !(cf is Member) || cn.callArgs.length == 0 || cf.memProp != "push" {
     return false
   }
-  const slot = narrowedPathIx(key)
+  const slot = narrowedPathIx(p)
   const depth = elemDepthOf(cf.memObj)
   if slot < 0 || depth < 0 { return false }
   if elemKeyBase(elemRecvPrefix(cf.memObj)) != elemKeyBase(key) { return false }
@@ -3130,9 +3183,10 @@ function pushKeepsElemOnly(cn: Call, key: string): boolean {
   true
 }
 
-// `crFirstWritingCall` for an element entry `key`: a `push` on a list narrowed by name is
+// `crFirstWritingCall` for the element entry of place `p`: a `push` on a list narrowed by name is
 // checked against its narrowed element, so only its arguments are asked.
-function crFirstElemWritingCall(ix: i32, key: string): i32 {
+function crFirstElemWritingCall(ix: i32, p: i32): i32 {
+  const key = placeText(p)
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = nodeAt(ix)
   let own = false
@@ -3143,20 +3197,20 @@ function crFirstElemWritingCall(ix: i32, key: string): i32 {
       if ro is Ident {
         own = (cf.memProp == "push"
           && key == ro.identName + LIST_EVERY_STEP
-          && elemKeyStoresChecked(key))
+          && elemKeyStoresChecked(p))
       }
     }
-    if !own { own = pushKeepsElemOnly(n, key) }
+    if !own { own = pushKeepsElemOnly(n, p) }
   }
   if !own && (n is Call || crIsDispatchSite(ix)) {
-    if callMayWrite(ix, key) { return ix }
+    if callMayWrite(ix, p, key) { return ix }
   }
   let cur = ix
   while cur >= 0 {
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      const c = crFirstElemWritingCall(kids[k], key)
+      const c = crFirstElemWritingCall(kids[k], p)
       if c >= 0 { return c }
       k = k + 1
     }
@@ -3178,7 +3232,9 @@ export function crLoopPreRetire(loopIx: i32) {
   let i = 0
   while i < names.length {
     let c = -1
-    if crMayBeWritten(names[i]) { c = crFirstWritingCall(loopIx, names[i]) }
+    if crMayBeWritten(names[i]) {
+      c = crFirstWritingCall(loopIx, PLACE_NONE, names[i])
+    }
     // So does a write in the loop that leaves a guard's narrowing (D2609), or a straight-line
     // null strip's: the reads at the loop's top run again after it (D3302).
     if (
@@ -3206,14 +3262,14 @@ function crLoopPathPreRetire(loopIx: i32) {
     if (
       npInvBy[s] < 0
       && npEpochs[s] == narFnEpoch
-      && narrowedPathIx(npKeys[s]) == s
+      && narrowedPathIx(npPlace[s]) == s
     ) {
-      let a = crLoopLeavingPathWrite(loopIx, npKeys[s], npTys[s])
+      let a = crLoopLeavingPathWrite(loopIx, npPlace[s], npTys[s])
       // A `for` over a list reads its next element at the loop's top, after the body's calls,
       // which no read check in the body sees; so an element narrowing a call may end ends here.
       let byCall = false
       if a < 0 && keyIsListEvery(npKeys[s]) {
-        a = crFirstElemWritingCall(loopIx, npKeys[s])
+        a = crFirstElemWritingCall(loopIx, npPlace[s])
         byCall = a >= 0
       }
       if a >= 0 {
@@ -3222,7 +3278,7 @@ function crLoopPathPreRetire(loopIx: i32) {
         noteKillSure(a, npKeys[s])
         npSettleSetAt(s, -1)
         if !byCall { crAliasWr[a] = true }
-        crLoopMapCellPresent(npKeys[s], a)
+        crLoopMapCellPresent(npPlace[s], a)
         crRetNames.push(npKeys[s])
         crRetCalls.push(a)
         crRetNarTys.push(npTys[s])
@@ -3233,7 +3289,7 @@ function crLoopPathPreRetire(loopIx: i32) {
           crBeforeBank[loopIx] ?? crNoNames,
           npKeys[s],
         )
-        narClobKeysPush(npKeys[s])
+        narClobPlacePush(npPlace[s])
         narClobTysPush(-1)
         narClobPrevPush(npTys[s])
         narClobDepthsPush(T.frames.length)
@@ -3249,13 +3305,13 @@ function crLoopPathPreRetire(loopIx: i32) {
 
 // A map cell narrowed before the loop is present, and the loop's writes keep it so: after its
 // narrowing ends it reads the stored type, not the map read's `T | null`.
-function crLoopMapCellPresent(key: string, asgIx: i32) {
+function crLoopMapCellPresent(p: i32, asgIx: i32) {
   const an = nodeAt(asgIx)
   if an is BinExpr {
     if placeIsMapCell(an.binLeft) {
       const st = placeStoreTy(an.binLeft)
       if st >= 0 {
-        npKeysPush(key)
+        npKeysPush(p)
         npTysPush(st)
         npInvByPush(-1)
         npEpochsPush(narFnEpoch)
@@ -3268,14 +3324,14 @@ function crLoopMapCellPresent(key: string, asgIx: i32) {
   0
 }
 
-// The first assignment to the place keyed `key`, narrowed to `pre`, in the loop subtree at `ix`
-// whose value, typed before the loop runs, leaves that narrowing; -1 otherwise.
-function crLoopLeavingPathWrite(ix: i32, key: string, pre: i32): i32 {
+// The first assignment to the place `p`, narrowed to `pre`, in the loop subtree at `ix` whose
+// value, typed before the loop runs, leaves that narrowing; -1 otherwise.
+function crLoopLeavingPathWrite(ix: i32, p: i32, pre: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = nodeAt(ix)
   if n is FuncDecl { return -1 }
   if n is BinExpr {
-    if n.binOp == "=" && placeKeyOf(n.binLeft) == key {
+    if n.binOp == "=" && placeAt(n.binLeft) == p {
       const store = writeStorageTy(n.binLeft)
       let vt = loopWritePeekTy(n.binRight, store)
       if vt >= 0 && store >= 0 {
@@ -3284,7 +3340,7 @@ function crLoopLeavingPathWrite(ix: i32, key: string, pre: i32): i32 {
       }
     } else if (
       n.binOp == "="
-      && loopWriteMayReach(n.binLeft, n.binRight, key, pre)
+      && loopWriteMayReach(n.binLeft, n.binRight, p, pre)
     ) {
       return ix
     }
@@ -3294,7 +3350,7 @@ function crLoopLeavingPathWrite(ix: i32, key: string, pre: i32): i32 {
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      const a = crLoopLeavingPathWrite(kids[k], key, pre)
+      const a = crLoopLeavingPathWrite(kids[k], p, pre)
       if a >= 0 { return a }
       k = k + 1
     }
@@ -3303,11 +3359,12 @@ function crLoopLeavingPathWrite(ix: i32, key: string, pre: i32): i32 {
   -1
 }
 
-// Whether a loop's write to `tgt` of `val` may end the narrowing of `key` to `pre` on the next
+// Whether a loop's write to `tgt` of `val` may end the narrowing of place `p` to `pre` on the next
 // iteration though it names another place: a prefix of the key (`o = …` under `o.f`), a cell of
 // its receiver at a computed index, or a same-named last step through another receiver, which may
 // alias. An unknown value counts as leaving (D3308).
-function loopWriteMayReach(tgt: i32, val: i32, key: string, pre: i32): boolean {
+function loopWriteMayReach(tgt: i32, val: i32, p: i32, pre: i32): boolean {
+  const key = placeText(p)
   const tk = placeKeyOf(tgt)
   if tk != "" && (keyHasPrefix(key, tk + ".") || keyHasPrefix(key, tk + "[")) {
     return true
@@ -3319,7 +3376,7 @@ function loopWriteMayReach(tgt: i32, val: i32, key: string, pre: i32): boolean {
   let same = false
   if t is Member { same = last == "." + t.memProp }
   if t is Index {
-    const ks = narrowedPathIx(key)
+    const ks = narrowedPathIx(p)
     if ks >= 0 && elemOnlyStoreKeeps(ks, elemDepthOf(tgt), val, -1) {
       return false
     }
@@ -3327,7 +3384,7 @@ function loopWriteMayReach(tgt: i32, val: i32, key: string, pre: i32): boolean {
     if last == LIST_EVERY_STEP && steps.length == 1 {
       const ra = nodeAt(peelParenIx(t.idxArr))
       if ra is Ident {
-        if ra.identName == placeRootOf(key) && elemKeyStoresChecked(key) {
+        if ra.identName == placeRootOf(key) && elemKeyStoresChecked(p) {
           return false
         }
       }
@@ -3391,29 +3448,31 @@ function crLoopLeavingWrite(ix: i32, name: string): i32 {
 export function crNoteRhsRetired(
   ix: i32,
   rhs: i32,
-  names: string[],
+  places: i32[],
   tys: i32[],
   npBase: i32,
 ) {
   const out: string[] = []
   let i = 0
-  while i < names.length {
+  while i < places.length {
+    const p = places[i]
+    const nm = placeText(p)
     let by = -1
-    if isPathKey(names[i]) {
+    if placeIsPath(p) {
       let s = npBase
       while s < npKeys.length && by < 0 {
-        if npKeys[s] == names[i] && npInvBy[s] >= 0 { by = npInvBy[s] }
+        if npPlace[s] == p && npInvBy[s] >= 0 { by = npInvBy[s] }
         s = s + 1
       }
-    } else if !crNameFacedLater(names, i) && lookup(names[i]) != tys[i] {
-      by = crFirstAssignOf(rhs, names[i])
-      if by < 0 { by = crFirstWritingCall(rhs, names[i]) }
+    } else if !crNameFacedLater(places, i) && placeNameTy(p) != tys[i] {
+      by = crFirstAssignOf(rhs, nm)
+      if by < 0 { by = crFirstWritingCall(rhs, p, nm) }
       if by < 0 { by = rhs }
     }
     if by >= 0 {
-      strListAdd(out, names[i])
+      strListAdd(out, nm)
       crRhsOps.push(ix)
-      crRhsNames.push(names[i])
+      crRhsNames.push(nm)
       crRhsBys.push(by)
     }
     i = i + 1
@@ -3428,38 +3487,39 @@ export function crNoteRhsRetired(
 
 // Drop the facts collected since `mark` that a call inside the condition may falsify:
 // the test ran before the call. Banked at the condition for the emitter's matching decline.
-function crFilterCond(condIx: i32, names: string[], tys: i32[], mark: i32) {
-  if names.length <= mark { return 0 }
+function crFilterCond(condIx: i32, places: i32[], tys: i32[], mark: i32) {
+  if places.length <= mark { return 0 }
   let w = mark
   let i = mark
-  while i < names.length {
+  while i < places.length {
     let keep = true
-    if crMayBeWritten(names[i]) {
-      const wc = crFirstWritingCall(condIx, names[i])
+    const nm = placeText(places[i])
+    if crMayBeWritten(nm) {
+      const wc = crFirstWritingCall(condIx, places[i], nm)
       if wc >= 0 {
         keep = false
         crCondDropBank[condIx] = strListWith(
           crCondDropBank[condIx] ?? crNoNames,
-          names[i],
+          nm,
         )
         crCondDropN = crCondDropN + 1
-        crRetNames.push(names[i])
+        crRetNames.push(nm)
         crRetCalls.push(wc)
         crRetNarTys.push(tys[i])
-        crRetWideTys.push(lookup(names[i]))
+        crRetWideTys.push(placeNameTy(places[i]))
         crRetRoots.push(crCurRoot())
         crRetLoops.push(false)
       }
     }
     if keep {
-      names[w] = names[i]
+      places[w] = places[i]
       tys[w] = tys[i]
       w = w + 1
     }
     i = i + 1
   }
-  while names.length > w {
-    names.pop()
+  while places.length > w {
+    places.pop()
     tys.pop()
   }
   0
@@ -3518,7 +3578,8 @@ export function crReadHook(name: string, ix: i32): i32 {
 // merely the nullness, because the write is what the reader has to act on — the guard above and
 // the read below are both correct, and only their separation is wrong. An aliasing call and a
 // direct assignment are the two ways a path narrowing dies, and the message says which.
-export function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
+export function pathInvalidatedErr(p: i32, byIx: i32, at: i32) {
+  const key = placeText(p)
   const by = nodeAt(byIx)
   let what = "the assignment"
   let after = "the assignment"
@@ -3530,7 +3591,7 @@ export function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
   }
   // A write that stored a non-null value narrows too (D1848), and is not a guard.
   let cause = "a guard"
-  const slot = narrowedPathIx(key)
+  const slot = narrowedPathIx(p)
   if slot >= 0 && slot < npAsg.length {
     if npAsg[slot] == 1 { cause = "a write of a non-null value" }
   }
@@ -3563,52 +3624,52 @@ export function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
 export function matchRestNarrows(
   scrut: i32,
   removed: i32[],
-  names: string[],
+  places: i32[],
   tys: i32[],
 ) {
   if removed.length == 0 { return 0 }
   const place = asgTestedPlace(scrut)
   if place < 0 || placeHasOptionalHop(place) { return 0 }
-  let cur = placeCurTy(place, names, tys)
+  let cur = placeCurTy(place, places, tys)
   for r in removed {
     if cur < 0 { return 0 }
     cur = subtractTy(cur, r)
   }
-  pushNarrowFact(place, cur, names, tys)
+  pushNarrowFact(place, cur, places, tys)
 }
 
-// A place's current type during fact collection: facts already collected into `names`/`tys`
+// A place's current type during fact collection: facts already collected into `places`/`tys`
 // (innermost-last wins) override the path overlay, which overrides the scope or field lookup, so
 // successive narrowings compose. Read-only — collection must never raise a diagnostic. Parens peel
 // here too (D352), in the tail's own arm, or `(t).v` would key `t.v`, find no fact and answer -1.
-function placeCurTy(ix: i32, names: string[], tys: i32[]) {
-  const key = placeKeyOf(ix)
-  if key != "" {
-    let i = names.length - 1
+function placeCurTy(ix: i32, places: i32[], tys: i32[]) {
+  const p = placeAt(ix)
+  if p >= 0 {
+    let i = places.length - 1
     while i >= 0 {
-      if names[i] == key { return tys[i] }
+      if places[i] == p { return tys[i] }
       i = i - 1
     }
-    const ov = narrowedPathTy(key)
+    const ov = narrowedPathTy(p)
     if ov >= 0 { return ov }
   }
   if ix < 0 { return -1 }
   const n = nodeAt(ix)
   match n {
     Paren => {
-      return placeCurTy(n.parInner, names, tys)
+      return placeCurTy(n.parInner, places, tys)
     }
     Ident => {
       return identTyOf(ix, n.identName)
     }
     Member => {
-      return placeFieldTy(placeCurTy(n.memObj, names, tys), n.memProp, false)
+      return placeFieldTy(placeCurTy(n.memObj, places, tys), n.memProp, false)
     }
     OptMember => {
-      return placeFieldTy(placeCurTy(n.omObj, names, tys), n.omProp, true)
+      return placeFieldTy(placeCurTy(n.omObj, places, tys), n.omProp, true)
     }
     Index => {
-      return placeElemTy(placeCurTy(n.idxArr, names, tys))
+      return placeElemTy(placeCurTy(n.idxArr, places, tys))
     }
     // Every other kind is not a place.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -3651,7 +3712,7 @@ function placeFieldTy(baseTy: i32, prop: string, optional: boolean) {
 function pushDiscrimParentFact(
   placeIx: i32,
   fieldTy: i32,
-  names: string[],
+  places: i32[],
   tys: i32[],
   bankIx: i32,
   elseBank: boolean,
@@ -3661,7 +3722,7 @@ function pushDiscrimParentFact(
   const n = nodeAt(placeIx)
   if !(n is Member) { return 0 }
   if placeHasOptionalHop(placeIx) { return 0 }
-  const recvTy = placeCurTy(n.memObj, names, tys)
+  const recvTy = placeCurTy(n.memObj, places, tys)
   if recvTy < 0 { return 0 }
   const rt = tyAt(recvTy)
   if !(rt is TyUnion) { return 0 }
@@ -3703,25 +3764,25 @@ function pushDiscrimParentFact(
       isParentTyIx[bankIx] = res
     }
   }
-  pushNarrowFact(n.memObj, res, names, tys)
+  pushNarrowFact(n.memObj, res, places, tys)
 }
 
 // For a guard on an optional chain (`x?.y is T`), the truthy branch also implies every `?.`
 // receiver is non-null — push those facts innermost-first, each resolving against an
 // already-narrowed receiver, so the body's regular `x.y` reads resolve. Then branch only.
-function pushOptChainThenFacts(placeIx: i32, names: string[], tys: i32[]) {
+function pushOptChainThenFacts(placeIx: i32, places: i32[], tys: i32[]) {
   const n = nodeAt(placeIx)
   match n {
     Member => {
-      pushOptChainThenFacts(n.memObj, names, tys)
+      pushOptChainThenFacts(n.memObj, places, tys)
       return 0
     }
     OptMember => {
-      pushOptChainThenFacts(n.omObj, names, tys)
-      const cur = placeCurTy(n.omObj, names, tys)
+      pushOptChainThenFacts(n.omObj, places, tys)
+      const cur = placeCurTy(n.omObj, places, tys)
       const inner = nonNullNarrowTy(cur)
       if inner >= 0 && inner != cur {
-        pushNarrowFact(n.omObj, inner, names, tys)
+        pushNarrowFact(n.omObj, inner, places, tys)
       }
       return 0
     }
@@ -3733,19 +3794,14 @@ function pushOptChainThenFacts(placeIx: i32, names: string[], tys: i32[]) {
 
 // `x == L` over a literal union narrows `x` as `x is L` does (Q10): to the literal where the test
 // holds, to the union less the literal where it fails. `holds` names the side being collected.
-function pushLitEqFact(
-  condIx: i32,
-  holds: boolean,
-  names: string[],
-  tys: i32[],
-) {
+function pushLitEqFact(condIx: i32, holds: boolean, places: i32[], tys: i32[]) {
   const lp = litCmpPlace(condIx)
   if lp < 0 { return 0 }
   const lit = litCmpTy(condIx)
   if lit < 0 { return 0 }
   // The tested literal, banked as an `is` node banks its type: the emitter narrows a boxed
   // receiver through the same `is` channel, keyed on this comparison node.
-  if pushLitEqFactAt(asgTestedPlace(lp), lit, holds, names, tys) {
+  if pushLitEqFactAt(asgTestedPlace(lp), lit, holds, places, tys) {
     recordClonedIsVarTyIx(condIx, lit)
   }
   0
@@ -3758,12 +3814,12 @@ function pushLitEqFactAt(
   place: i32,
   lit: i32,
   holds: boolean,
-  names: string[],
+  places: i32[],
   tys: i32[],
 ): boolean {
   if place < 0 || lit < 0 { return false }
   if !holds && placeHasOptionalHop(place) { return false }
-  const cur = placeCurTy(place, names, tys)
+  const cur = placeCurTy(place, places, tys)
   if cur < 0 { return false }
   let base = cur
   const ct = tyAt(cur)
@@ -3773,13 +3829,13 @@ function pushLitEqFactAt(
   if holds {
     const meet = litSetMeetTy(cur, lit)
     if meet >= 0 {
-      pushNarrowFact(place, meet, names, tys)
+      pushNarrowFact(place, meet, places, tys)
     } else if meet == -1 && assignable(lit, base) {
-      pushNarrowFact(place, lit, names, tys)
+      pushNarrowFact(place, lit, places, tys)
     }
     return true
   }
-  pushNarrowFact(place, subtractTy(cur, lit), names, tys)
+  pushNarrowFact(place, subtractTy(cur, lit), places, tys)
   true
 }
 
@@ -3789,10 +3845,10 @@ export function matchValPatFact(
   scrut: i32,
   lit: i32,
   holds: boolean,
-  names: string[],
+  places: i32[],
   tys: i32[],
 ) {
-  pushLitEqFactAt(asgTestedPlace(scrut), lit, holds, names, tys)
+  pushLitEqFactAt(asgTestedPlace(scrut), lit, holds, places, tys)
   0
 }
 
@@ -3812,35 +3868,35 @@ function litSoleHolderIn(u: i32, lit: i32): boolean {
   found
 }
 
-// Collect the narrowings that hold when `cond` is true into the parallel `names`/`tys` arrays,
+// Collect the narrowings that hold when `cond` is true into the parallel `places`/`tys` arrays,
 // keyed by place path: `x != null` strips x's null, `x is T` pins x to T (`is null` pins to the
 // null type), `a && b` contributes both conjuncts, `!(e)` contributes e's false narrowings, and
 // parens recurse. A guard over an optional chain also narrows each `?.` receiver non-null.
-export function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
-  const mark = names.length
-  collectThenNarrowsRaw(condIx, names, tys)
-  crFilterCond(condIx, names, tys, mark)
+export function collectThenNarrows(condIx: i32, places: i32[], tys: i32[]) {
+  const mark = places.length
+  collectThenNarrowsRaw(condIx, places, tys)
+  crFilterCond(condIx, places, tys, mark)
 }
 
-function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
+function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
   const cond = nodeAt(condIx)
   match cond {
     Paren => {
-      return collectThenNarrows(cond.parInner, names, tys)
+      return collectThenNarrows(cond.parInner, places, tys)
     }
     Unary => {
-      if cond.unOp == "!" { return collectElseNarrows(cond.unArg, names, tys) }
+      if cond.unOp == "!" { return collectElseNarrows(cond.unArg, places, tys) }
       return 0
     }
     IsExpr => {
       const isPl = asgTestedPlace(cond.isObj)
-      pushOptChainThenFacts(cond.isObj, names, tys)
+      pushOptChainThenFacts(cond.isObj, places, tys)
       if cond.isVariant == "null" {
-        pushNarrowFact(isPl, TY_NULL, names, tys)
+        pushNarrowFact(isPl, TY_NULL, places, tys)
       } else {
         let tIdx = isTypeTyRead(cond.isVariant, condIx)
         // An overlapping literal set narrows to the overlap, as `checkIsExprNode` tests it.
-        let isCur = placeCurTy(isPl, names, tys)
+        let isCur = placeCurTy(isPl, places, tys)
         // An instance narrows a place its template saw as a bare type parameter as the
         // template did, which is what the emitter builds (D14487).
         if elabCapLive() {
@@ -3858,59 +3914,59 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
           && (recIsFitsAcrossTags(isCur, tIdx) || listIsFitsAcrossReps(isCur, tIdx))
         ) {
           const nn = nonNullNarrowTy(isCur)
-          if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
+          if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, places, tys) }
           // A list that keeps its storage still narrows its element reads (ruling (c), D4928).
           if (
             listIsFitsAcrossReps(isCur, tIdx)
             && recFitNarrowKeepsRep(isCur, tIdx)
           ) {
-            pushElemReadFact(isPl, isCur, tIdx, names, tys)
+            pushElemReadFact(isPl, isCur, tIdx, places, tys)
           }
         } else if tIdx >= 0 && listNarrowsElemsOnly(isCur, tIdx) {
           // A list keeps its declared type and narrows its element reads (ruling (c), D4945).
           const nn = nonNullNarrowTy(isCur)
-          if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
-          pushElemReadFact(isPl, isCur, tIdx, names, tys)
+          if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, places, tys) }
+          pushElemReadFact(isPl, isCur, tIdx, places, tys)
         } else if (
           tIdx >= 0
           && recFitNarrowKeepsRep(isCur, tIdx)
           && listFitNarrowKeepsRep(isCur, tIdx)
         ) {
-          pushNarrowFact(isPl, tIdx, names, tys)
+          pushNarrowFact(isPl, tIdx, places, tys)
           pushDiscrimParentFact(
             isPl,
             tIdx,
-            names,
+            places,
             tys,
             condIx,
             false,
             "intersect",
           )
         } else if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
-          pushElemReadFact(isPl, isCur, tIdx, names, tys)
+          pushElemReadFact(isPl, isCur, tIdx, places, tys)
         }
       }
       return 0
     }
     BinExpr => {
       if cond.binOp == "&&" {
-        const lmark = names.length
-        collectThenNarrows(cond.binLeft, names, tys)
-        crFilterRhsRetired(condIx, names, tys, lmark)
-        collectThenNarrows(cond.binRight, names, tys)
+        const lmark = places.length
+        collectThenNarrows(cond.binLeft, places, tys)
+        crFilterRhsRetired(condIx, places, tys, lmark)
+        collectThenNarrows(cond.binRight, places, tys)
         return 0
       }
       if cond.binOp == "!=" {
         const placeIx = asgTestedPlace(nullCmpPlace(condIx))
         if placeIx >= 0 {
-          pushOptChainThenFacts(placeIx, names, tys)
-          const cur = placeCurTy(placeIx, names, tys)
+          pushOptChainThenFacts(placeIx, places, tys)
+          const cur = placeCurTy(placeIx, places, tys)
           const inner = nonNullNarrowTy(cur)
           if inner >= 0 && inner != cur {
-            pushNarrowFact(placeIx, inner, names, tys)
+            pushNarrowFact(placeIx, inner, places, tys)
           }
         }
-        pushLitEqFact(condIx, false, names, tys)
+        pushLitEqFact(condIx, false, places, tys)
       }
       // `s.kind == "circle"` — the discriminant in the spelling a user reaches for without
       // declaring a tag alias first, since `is KC` needs a name to test against. Only the parent is
@@ -3924,7 +3980,7 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
             pushDiscrimParentFact(
               eqPlace,
               eqTy,
-              names,
+              places,
               tys,
               condIx,
               false,
@@ -3932,7 +3988,7 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
             )
           }
         }
-        pushLitEqFact(condIx, true, names, tys)
+        pushLitEqFact(condIx, true, places, tys)
       }
       return 0
     }
@@ -3941,11 +3997,11 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
     Call => {
       const gArg = guardCallPlace(cond, 1)
       if gArg >= 0 {
-        pushOptChainThenFacts(gArg, names, tys)
-        const gCur = placeCurTy(gArg, names, tys)
+        pushOptChainThenFacts(gArg, places, tys)
+        const gCur = placeCurTy(gArg, places, tys)
         const gInner = nonNullNarrowTy(gCur)
         if gInner >= 0 && gInner != gCur {
-          pushNarrowFact(gArg, gInner, names, tys)
+          pushNarrowFact(gArg, gInner, places, tys)
         }
       }
       return 0
@@ -3979,31 +4035,31 @@ function elseRemainderTy(cur: i32, tIdx: i32): i32 {
 // branch, `x is null` false means non-null, `x is T` false leaves the union complement `U − T`,
 // `a || b` contributes both disjuncts (neither held), `!(e)` contributes e's true narrowings, and
 // parens recurse. A place behind a `?.` hop is never else-narrowed, the chain being possibly null.
-export function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
-  const mark = names.length
-  collectElseNarrowsRaw(condIx, names, tys)
-  crFilterCond(condIx, names, tys, mark)
+export function collectElseNarrows(condIx: i32, places: i32[], tys: i32[]) {
+  const mark = places.length
+  collectElseNarrowsRaw(condIx, places, tys)
+  crFilterCond(condIx, places, tys, mark)
 }
 
-function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
+function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
   const cond = nodeAt(condIx)
   match cond {
     Paren => {
-      return collectElseNarrows(cond.parInner, names, tys)
+      return collectElseNarrows(cond.parInner, places, tys)
     }
     Unary => {
-      if cond.unOp == "!" { return collectThenNarrows(cond.unArg, names, tys) }
+      if cond.unOp == "!" { return collectThenNarrows(cond.unArg, places, tys) }
       return 0
     }
     IsExpr => {
       const isPl = asgTestedPlace(cond.isObj)
       if placeHasOptionalHop(cond.isObj) { return 0 }
-      const cur = placeCurTy(isPl, names, tys)
+      const cur = placeCurTy(isPl, places, tys)
       if cond.isVariant == "null" {
         // The null face of the same hole (D1243), now the shared reader's — see its header.
         const inner = nonNullNarrowTy(cur)
         if inner >= 0 && (inner != cur || narPathHeldNonNull(isPl, inner)) {
-          pushNarrowFact(isPl, inner, names, tys)
+          pushNarrowFact(isPl, inner, places, tys)
         }
       } else {
         const tIdx = isTypeTyRead(cond.isVariant, condIx)
@@ -4022,10 +4078,10 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
           const hk = placeKeyOf(isPl)
           if sub < 0 && tyIsHole(cur) && hk != "" && isPathKey(hk) {
             holeElseTestedSetAt(hk + "|" + i32ToStr(cur), tIdx)
-            pushNarrowFact(isPl, cur, names, tys)
+            pushNarrowFact(isPl, cur, places, tys)
             return 0
           }
-          pushNarrowFact(isPl, sub, names, tys)
+          pushNarrowFact(isPl, sub, places, tys)
           // The complement, banked into the else table. `setNarrowFromCondElse` declines to
           // else-narrow a struct union, so a checker-only complement would type `else { s.w }` clean
           // for an emitter still seeing the full union — trading an accurate `field 'w' is not on
@@ -4033,7 +4089,7 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
           pushDiscrimParentFact(
             isPl,
             sub,
-            names,
+            places,
             tys,
             condIx,
             true,
@@ -4045,23 +4101,23 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
     }
     BinExpr => {
       if cond.binOp == "||" {
-        const lmark = names.length
-        collectElseNarrows(cond.binLeft, names, tys)
-        crFilterRhsRetired(condIx, names, tys, lmark)
-        collectElseNarrows(cond.binRight, names, tys)
+        const lmark = places.length
+        collectElseNarrows(cond.binLeft, places, tys)
+        crFilterRhsRetired(condIx, places, tys, lmark)
+        collectElseNarrows(cond.binRight, places, tys)
         return 0
       }
       if cond.binOp == "==" {
         const placeIx = asgTestedPlace(nullCmpPlace(condIx))
         if placeIx >= 0 {
           if !placeHasOptionalHop(placeIx) {
-            const cur = placeCurTy(placeIx, names, tys)
+            const cur = placeCurTy(placeIx, places, tys)
             const inner = nonNullNarrowTy(cur)
             if (
               inner >= 0
               && (inner != cur || narPathHeldNonNull(placeIx, inner))
             ) {
-              pushNarrowFact(placeIx, inner, names, tys)
+              pushNarrowFact(placeIx, inner, places, tys)
             }
           }
         }
@@ -4076,7 +4132,7 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
             pushDiscrimParentFact(
               eqPlace,
               eqTy,
-              names,
+              places,
               tys,
               condIx,
               true,
@@ -4084,9 +4140,9 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
             )
           }
         }
-        pushLitEqFact(condIx, false, names, tys)
+        pushLitEqFact(condIx, false, places, tys)
       }
-      if cond.binOp == "!=" { pushLitEqFact(condIx, true, names, tys) }
+      if cond.binOp == "!=" { pushLitEqFact(condIx, true, places, tys) }
       return 0
     }
     // Inferred type-guard call: `if absent(p) { … } else { /* p != null */ }` — non-null in the else
@@ -4095,10 +4151,10 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
       const gArg = guardCallPlace(cond, 0)
       if gArg >= 0 {
         if !placeHasOptionalHop(gArg) {
-          const gCur = placeCurTy(gArg, names, tys)
+          const gCur = placeCurTy(gArg, places, tys)
           const gInner = nonNullNarrowTy(gCur)
           if gInner >= 0 && gInner != gCur {
-            pushNarrowFact(gArg, gInner, names, tys)
+            pushNarrowFact(gArg, gInner, places, tys)
           }
         }
       }
@@ -4114,11 +4170,12 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
 // caller pushes a scope first), a property path rides the `npKeys`/`npTys` overlay, whose entries
 // the matching `popScope` unwinds. A bare name's shadow carries its declared type across, banked
 // for `writeStorageTy`, and its constness, without which the `const` reject vanishes in a guard.
-export function applyNarrows(names: string[], tys: i32[]) {
+export function applyNarrows(places: i32[], tys: i32[]) {
   let i = 0
-  while i < names.length {
-    if isPathKey(names[i]) {
-      npKeysPush(names[i])
+  while i < places.length {
+    const p = places[i]
+    if placeIsPath(p) {
+      npKeysPush(p)
       npTysPush(tys[i])
       npInvByPush(-1)
       npEpochsPush(narFnEpoch)
@@ -4126,20 +4183,20 @@ export function applyNarrows(names: string[], tys: i32[]) {
       npCapByPush(-1)
       npAsgPush(0)
     } else {
-      const wasConst = isConstName(names[i])
+      const nm = placeText(p)
+      const s = placeDecl(p)
+      const wasConst = isConstName(nm)
       let wasDecl = -1
-      if wasConst { wasDecl = constDeclOf(names[i]) }
-      const declTy = lookup(names[i])
+      if wasConst { wasDecl = constDeclOf(nm) }
+      const declTy = declTyOf(s)
       if declTy >= 0 && declTy != tys[i] {
-        noteNarShadow(envDeclOfNameForFlow(names[i]), declTy, NAR_KIND_GUARD)
+        noteNarShadow(s, declTy, NAR_KIND_GUARD)
       }
-      declare(names[i], tys[i])
-      if declTy >= 0 && declTy != tys[i] {
-        narFitCompanions(names[i], declTy, tys[i])
-      }
+      declareSlot(s, nm, tys[i])
+      if declTy >= 0 && declTy != tys[i] { narFitCompanions(p, declTy, tys[i]) }
       if wasConst {
         const ctop = constScopes.length - 1
-        if ctop >= 0 { constScopes[ctop][names[i]] = wasDecl }
+        if ctop >= 0 { constScopes[ctop][nm] = wasDecl }
       }
     }
     i = i + 1
@@ -4222,9 +4279,9 @@ function placeRecvTyStep(ix: i32, recv: i32) {
 
 // Records at `ix` the type the place walk reads there, when it reads one.
 function placeTyNote(ix: i32) {
-  const noNames: string[] = []
+  const noPlaces: i32[] = []
   const noTys: i32[] = []
-  const t = placeCurTy(ix, noNames, noTys)
+  const t = placeCurTy(ix, noPlaces, noTys)
   if t >= 0 { nodeTySet(ix, widenLitTy(t)) }
   0
 }
@@ -4486,7 +4543,7 @@ export function ifChainExhausts(ifIx: i32) {
   if pgPreIx == ifIx {
     let pk = 0
     while pk < pgPreKeys.length {
-      if pgPreKeys[pk] == placeName { pty = pgPreTys[pk] }
+      if placeText(pgPreKeys[pk]) == placeName { pty = pgPreTys[pk] }
       pk = pk + 1
     }
   }
@@ -4616,23 +4673,26 @@ export function elemEveryReadTy(ix: i32): i32 {
   if luWriteTgt[ix] ?? false { return -1 }
   const key = elemRecvPrefix(ix)
   if !keyIsListEvery(key) { return -1 }
-  const slot = narrowedPathIx(key)
+  const p = placeFind(placeRootSlotOf(ix), key)
+  const slot = narrowedPathIx(p)
   if slot < 0 || narFitNameOf(slot) != "" { return -1 }
-  const t = narrowedPathTy(key)
-  if t >= 0 { crNoteCaptureRead(key) } else { crPathDropRead(key, ix) }
+  const t = narrowedPathTy(p)
+  if t >= 0 { crNoteCaptureRead(p) } else { crPathDropRead(key, ix) }
   t
 }
 
 // The key (`s[*]`, `m[*][*]`) of the element-only narrowing in force on the list `recvIx` names
 // or of a row of it still a list (`m[0]`), as `s is S[]` over a `string[]` pushes it
-// (`pushElemReadFact`), or "".
-export function elemOnlyKeyOf(recvIx: i32): string {
+// (`pushElemReadFact`), as a place, or PLACE_NONE.
+export function elemOnlyKeyOf(recvIx: i32): i32 {
   const pfx = elemRecvPrefix(recvIx)
-  if pfx == "" { return "" }
+  if pfx == "" { return PLACE_NONE }
   const slot = elemEverySlotOf(elemKeyBase(pfx))
-  if slot < 0 || narFitNameOf(slot) != "" { return "" }
-  const key = npKeys[slot]
-  if key.length <= pfx.length || narrowedPathTy(key) < 0 { return "" }
+  if slot < 0 || narFitNameOf(slot) != "" { return PLACE_NONE }
+  const key = npPlace[slot]
+  if npKeys[slot].length <= pfx.length || narrowedPathTy(key) < 0 {
+    return PLACE_NONE
+  }
   crNoteCaptureRead(key)
   key
 }
@@ -4643,7 +4703,7 @@ export function elemOnlyKeyOf(recvIx: i32): string {
 // out of the leaf nor calls what may, is handed elements that all still fit.
 export function cbElemNarrowFor(recvIx: i32, cbIx: i32): boolean {
   const key = elemOnlyKeyOf(recvIx)
-  if key == "" { return false }
+  if key < 0 { return false }
   const pfx = elemRecvPrefix(recvIx)
   const root = placeRootOf(pfx)
   const fd = nodeAt(cbIx)
@@ -4654,7 +4714,7 @@ export function cbElemNarrowFor(recvIx: i32, cbIx: i32): boolean {
   cbPendClear()
   cbPendAdd(cbIx, nodeTyOf(recvIx), bound)
   cbPendCollect(fd.fnBody, bound)
-  const writes = (!crCallbackKeeps(cbIx, root)
+  const writes = (!crCallbackKeeps(cbIx, PLACE_NONE, root)
     || crLoopLeavingPathWrite(fd.fnBody, key, leaf) >= 0
     || crFirstElemWritingCall(fd.fnBody, key) >= 0)
   cbPendClear()
@@ -4663,28 +4723,30 @@ export function cbElemNarrowFor(recvIx: i32, cbIx: i32): boolean {
 }
 
 // Banks, under `at`, the fact an element of the list `pfx` reads (`elemRecvPrefix`) brings to a
-// fresh binding from the element key `key`: its leaf, and how many element steps it narrows.
-export function elemFactFor(at: i32, pfx: string, key: string): boolean {
+// fresh binding from the element place `key`: its leaf, and how many element steps it narrows.
+export function elemFactFor(at: i32, pfx: string, key: i32): boolean {
   efLeaf[at] = narrowedPathTy(key)
-  efSteps[at] = (key.length - pfx.length) / LIST_EVERY_STEP.length - 1
+  efSteps[at] = (placeText(key).length - pfx.length) / LIST_EVERY_STEP.length
+    - 1
   true
 }
 
-// Narrow the binding `name`, just declared in the current scope, by the fact banked under `at`
-// (`elemFactFor`): the leaf itself at no steps, as a guard would, else every element so deep.
-export function narrowFreshBinding(name: string, at: i32) {
+// Narrow the binding `name` of slot `s`, just declared in the current scope, by the fact banked
+// under `at` (`elemFactFor`): the leaf itself at no steps, as a guard would, else every element.
+export function narrowFreshBinding(s: i32, name: string, at: i32) {
   const leaf = efLeaf[at] ?? -1
   const steps = efSteps[at] ?? -1
   if leaf < 0 || steps < 0 || name == "" { return 0 }
+  let key = placeIntern(s, name, false)
+  if key < 0 { return 0 }
   if steps == 0 {
-    const decl = lookup(name)
+    const decl = declTyOf(s)
     if decl < 0 || tySame(decl, leaf) || !assignable(leaf, decl) { return 0 }
-    return applyNarrows([name], [leaf])
+    return applyNarrows([key], [leaf])
   }
-  let key = name
   let k = 0
   while k < steps {
-    key = key + LIST_EVERY_STEP
+    key = placeWith(key, LIST_EVERY_STEP)
     k = k + 1
   }
   applyNarrows([key], [leaf])

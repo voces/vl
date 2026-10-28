@@ -73,6 +73,14 @@ import { symEnabled } from "./check_state"
 import { i32ListHas, strListAdd, strListHas, strListWith } from "./listutil"
 import { T, TyObj, tyAt, tyIsHole, tyReachesEmptyHole } from "./check_types"
 import { LIST_EVERY_STEP, keyHasPrefix, placeKeyOf } from "./check_places"
+import {
+  placeAt,
+  placeDecl,
+  placeIdsReset,
+  placeIntern,
+  placeIsPath,
+  placeText,
+} from "./check_place_ids"
 import { crLostPopTo, crLostPush } from "./check_capture_loss"
 import {
   crAfterBank,
@@ -130,7 +138,7 @@ import {
   crwUseNames,
 } from "./check_capture_walks"
 import { cwPeel, fnDeclIx } from "./check_write_scan"
-import { placeRootOf, weUnresDrop } from "./check_write_effects"
+import { weUnresDrop } from "./check_write_effects"
 import { hdReadNullAsked, hdRowOf } from "./check_hole_pins"
 import { curFnDeclIx, inferQuiet } from "./check_cursor"
 import { noteMemCstr } from "./check_cstr_rows"
@@ -146,12 +154,7 @@ import {
   narBankRowsOf,
   narDeclaredTy,
 } from "./check_nar_bank"
-import {
-  SCOPE_EOF,
-  symResolve,
-  symScopePush,
-  symSpanPush,
-} from "./check_sym_occ"
+import { SCOPE_EOF, symScopePush, symSpanPush } from "./check_sym_occ"
 import { calleeNameOf } from "./check_callee"
 import {
   crBindDepthOfSlot,
@@ -172,30 +175,24 @@ import {
 // invalidation slot, written in place, since a shadowing push would resurrect the narrowing.
 export let npKeys: string[] = []
 export function npKeysPop(): string | null {
-  npRoot.pop()
+  npPlace.pop()
   npKeys.pop()
 }
-export function npKeysPush(v: string) {
-  npRoot.push(npRootOf(v))
-  npKeys.push(v)
+export function npKeysPush(p: i32) {
+  npPlace.push(p)
+  npKeys.push(placeText(p))
 }
 
-// Per slot, the declaration the key's root name resolves to at the push: a slot answers a
-// key only while the root still resolves there, so an inner binding of the name hides it.
-export let npRoot: i32[] = []
+// Per slot, the place it narrows: a place is rooted at one binding, so an inner binding of the
+// same name is a different place and hides nothing it should not.
+export let npPlace: i32[] = []
 
-function npRootOf(key: string): i32 { symResolve(placeRootOf(key)) }
-
-// The innermost slot at or above `base` narrowing `key` at the binding its root names now, or -1.
-// The root resolves on the first spelling hit only, since most walks have none.
-export function npSlotOf(key: string, base: i32): i32 {
-  let root = -2
-  let i = npKeys.length - 1
+// The innermost slot at or above `base` narrowing place `p`, or -1.
+export function npSlotOf(p: i32, base: i32): i32 {
+  if p < 0 { return -1 }
+  let i = npPlace.length - 1
   while i >= base {
-    if npKeys[i] == key {
-      if root == -2 { root = npRootOf(key) }
-      if npRoot[i] == root { return i }
-    }
+    if npPlace[i] == p { return i }
     i = i - 1
   }
   -1
@@ -256,13 +253,13 @@ export function npFramesPop() {
   0
 }
 
-// Bare names a write re-narrowed AWAY from the narrowing that covered them. A post-guard
+// Places a write re-narrowed AWAY from the narrowing that covered them. A post-guard
 // residual claims the fall-through path holds the else narrowing, and an arm that wrote a
 // different member falsifies exactly that claim — which under the reads-only rule no type
 // check on the write itself can catch (D1736).
-export let narClobKeys: string[] = []
-export function narClobKeysPush(v: string) { narClobKeys.push(v) }
-export function narClobKeysSet(v: string[]) { narClobKeys = v }
+export let narClobPlace: i32[] = []
+export function narClobPlacePush(v: i32) { narClobPlace.push(v) }
+export function narClobPlaceSet(v: i32[]) { narClobPlace = v }
 
 // What each clobbering write left the name at, the type it held just before, and the scope depth
 // it ran at. `checkIfStmtNode` folds them per arm and joins: a write at the arm's OWN depth runs
@@ -291,17 +288,17 @@ export let narClobBind: i32[] = []
 export function narClobBindPush(v: i32) { narClobBind.push(v) }
 export function narClobBindSet(v: i32[]) { narClobBind = v }
 
-// The binding (`narBindDepthOf`) a write row's key resolved to, or -1 for a row about any.
+// The binding (`narPlaceBind`) a write row's place resolved to, or -1 for a row about any.
 export let narClobDecl: i32[] = []
 export function narClobDeclPush(v: i32) { narClobDecl.push(v) }
 export function narClobDeclSet(v: i32[]) { narClobDecl = v }
 
-// Did a write at or after `mark` re-narrow `name` away from its narrowing? `checkIfStmtNode`
+// Did a write at or after `mark` re-narrow place `p` away from its narrowing? `checkIfStmtNode`
 // asks it of its own subtree before handing a residual down (D1736).
-export function narClobberedSince(mark: i32, name: string) {
+export function narClobberedSince(mark: i32, p: i32) {
   let i = mark
-  while i < narClobKeys.length {
-    if narClobHits(i, name) {
+  while i < narClobPlace.length {
+    if narClobHits(i, p) {
       if narClobRetired[i] == 1 { return true }
     }
     i = i + 1
@@ -309,10 +306,9 @@ export function narClobberedSince(mark: i32, name: string) {
   false
 }
 
-// The scope depth of the binding `name` resolves to here: the innermost layer that declares it,
-// skipping the layers that only narrow an outer binding (`asgDeclOver`). -1 when undeclared.
-function narBindDepthOf(name: string): i32 {
-  const s = envDeclOfNameForFlow(name)
+// The scope depth of slot `s`'s binding here: the innermost layer that declares it, skipping
+// the layers that only narrow an outer binding (`asgDeclOver`). -1 when undeclared.
+function narBindDepthOf(s: i32): i32 {
   if s == -1 { return -1 }
   let e = slotLayerTop(s)
   if e < 0 { return -1 }
@@ -324,18 +320,16 @@ function narBindDepthOf(name: string): i32 {
   slotLayerDepth(e)
 }
 
-// The binding a place key's root resolves to here (`narBindDepthOf`).
-export function narKeyBind(key: string): i32 {
-  narBindDepthOf(placeRootOf(key))
-}
+// The binding place `p`'s root resolves to here (`narBindDepthOf`).
+export function narPlaceBind(p: i32): i32 { narBindDepthOf(placeDecl(p)) }
 
-// Whether ledger row `i` is about `name` as it resolves here: a row naming a binding counts only
-// where the name reaches that binding.
-export function narClobHits(i: i32, name: string): boolean {
-  if narClobKeys[i] != name { return false }
+// Whether ledger row `i` is about place `p` as it resolves here: a row naming a binding counts
+// only where the root reaches that binding.
+export function narClobHits(i: i32, p: i32): boolean {
+  if narClobPlace[i] != p { return false }
   // A row about a same-named binding of an inner block is not about this one.
-  if narClobDecl[i] >= 0 && narClobDecl[i] != narKeyBind(name) { return false }
-  narClobBind[i] < 0 || narClobBind[i] == crBindDepthOf(name)
+  if narClobDecl[i] >= 0 && narClobDecl[i] != narPlaceBind(p) { return false }
+  narClobBind[i] < 0 || narClobBind[i] == crBindDepthOfSlot(placeDecl(p))
 }
 
 // The in-place writes a join has to see past: a scope binding retired in place (`atScope`, at
@@ -386,29 +380,29 @@ export function narIpApply(f: IfChk, j: i32, undo: boolean) {
   0
 }
 
-// Replace the rows of each key the `if` whose rows start at `mark` joined by its summary row, at
-// the `if`'s own statement depth. An enclosing join then folds one row per key per `if`, which
-// keeps the ledger linear in the function however deep the nesting.
+// Replace the rows of each place the `if` whose rows start at `mark` joined by its summary row,
+// at the `if`'s own statement depth. An enclosing join then folds one row per place per `if`,
+// which keeps the ledger linear in the function however deep the nesting.
 export function narCompactIf(
   mark: i32,
-  sumKeys: string[],
+  sumPlaces: i32[],
   sumTys: i32[],
   sumPrev: i32[],
   sumRet: i32[],
 ) {
-  if sumKeys.length == 0 { return 0 }
-  const joined: {[string]: boolean} = Map()
+  if sumPlaces.length == 0 { return 0 }
+  const joined: {[i32]: boolean} = Map()
   let s = 0
-  while s < sumKeys.length {
-    joined[sumKeys[s]] = true
+  while s < sumPlaces.length {
+    joined[sumPlaces[s]] = true
     s = s + 1
   }
   let w = mark
   let i = mark
-  while i < narClobKeys.length {
-    const nm = narClobKeys[i]
+  while i < narClobPlace.length {
+    const nm = narClobPlace[i]
     if !((joined[nm] ?? false) && narClobHits(i, nm)) {
-      narClobKeys[w] = nm
+      narClobPlace[w] = nm
       narClobTys[w] = narClobTys[i]
       narClobPrev[w] = narClobPrev[i]
       narClobDepths[w] = narClobDepths[i]
@@ -419,8 +413,8 @@ export function narCompactIf(
     }
     i = i + 1
   }
-  while narClobKeys.length > w {
-    narClobKeys.pop()
+  while narClobPlace.length > w {
+    narClobPlace.pop()
     narClobTys.pop()
     narClobPrev.pop()
     narClobDepths.pop()
@@ -429,14 +423,14 @@ export function narCompactIf(
     narClobDecl.pop()
   }
   s = 0
-  while s < sumKeys.length {
-    narClobKeys.push(sumKeys[s])
+  while s < sumPlaces.length {
+    narClobPlace.push(sumPlaces[s])
     narClobTys.push(sumTys[s])
     narClobPrev.push(sumPrev[s])
     narClobDepths.push(T.frames.length)
     narClobRetired.push(sumRet[s])
     narClobBind.push(-1)
-    narClobDecl.push(narKeyBind(sumKeys[s]))
+    narClobDecl.push(narPlaceBind(sumPlaces[s]))
     s = s + 1
   }
   0
@@ -488,12 +482,12 @@ export function narWriteStorage(s: i32): i32 {
 // The overlay slot of the innermost narrowing of `key`, or -1 when no live scope narrowed it. The
 // single walk the three overlay questions share — the type, the invalidator, and how the slot
 // sits relative to a loop barrier.
-export function narrowedPathIx(key: string) { npSlotOf(key, 0) }
+export function narrowedPathIx(p: i32) { npSlotOf(p, 0) }
 
 // `narrowedPathTy` without the capture question, for reading a prefix's type while a call's
 // write summary is being matched — which that question itself asks.
-export function narrowedPathTyRaw(key: string) {
-  const i = narrowedPathIx(key)
+export function narrowedPathTyRaw(p: i32) {
+  const i = narrowedPathIx(p)
   if i < 0 { return -1 }
   if npInvBy[i] >= 0 { return -1 }
   npTys[i]
@@ -576,9 +570,7 @@ export function writeBarredByLoop(ix: i32) {
       return w >= 0 && w != crChainWidest(s, depths)
     }
     Member | Index => {
-      const key = placeKeyOf(ix)
-      if key == "" { return false }
-      const slot = narrowedPathIx(key)
+      const slot = narrowedPathIx(placeAt(ix))
       if slot < 0 || npInvBy[slot] >= 0 { return false }
       return !npInsideBarrier(slot)
     }
@@ -601,10 +593,10 @@ function npSettledAt(slot: i32): boolean {
   !i32ListHas(crStmtIxs, st)
 }
 
-// The overlay slot a read of `key` resolves through when a call has ended its narrowing and the
+// The overlay slot a read of place `p` resolves through when a call has ended its narrowing and the
 // read may proceed at the declared type, or -1 when the read is refused or not so ended.
-function pathCallSettledSlot(key: string): i32 {
-  const i = narrowedPathIx(key)
+function pathCallSettledSlot(p: i32): i32 {
+  const i = narrowedPathIx(p)
   if i < 0 { return -1 }
   const by = npInvBy[i]
   if by < 0 || pathRetiredByAssign(by) { return -1 }
@@ -612,15 +604,16 @@ function pathCallSettledSlot(key: string): i32 {
   -1
 }
 
-// Whether the read at `ix` of `key`, whose narrowing the node `by` ended, reads the declared
+// Whether the read at `ix` of place `p`, whose narrowing the node `by` ended, reads the declared
 // type. A read a call's retirement let through is remembered for the misuse note.
-export function pathReadsDeclared(key: string, by: i32, ix: i32): boolean {
+export function pathReadsDeclared(p: i32, by: i32, ix: i32): boolean {
   if pathRetiredByAssign(by) { return true }
   // A hole's field reads its own hole after the narrowing ends, which the pin then re-asks (D3197).
-  const hs = narrowedPathIx(key)
+  const hs = narrowedPathIx(p)
   if hs >= 0 && tyIsHole(npTys[hs]) { return true }
-  const slot = pathCallSettledSlot(key)
+  const slot = pathCallSettledSlot(p)
   if slot < 0 { return false }
+  const key = placeText(p)
   let r = crRetNames.length - 1
   while r >= 0 && crStmtIxs.length > 0 {
     if crRetNames[r] == key && crRetCalls[r] == by {
@@ -636,10 +629,10 @@ export function pathReadsDeclared(key: string, by: i32, ix: i32): boolean {
 // A path read under a narrowing made outside an enclosing loop, logged while inside the loop so a
 // call later in the loop that may write the path can find the reads it would falsify on the next
 // iteration.
-export function crNoteLoopRead(key: string, ix: i32) {
+export function crNoteLoopRead(p: i32, ix: i32) {
   if reScopeBases.length <= crFnReBase() { return 0 }
   if ix == crIsObj { return 0 }
-  const slot = narrowedPathIx(key)
+  const slot = narrowedPathIx(p)
   if slot < 0 { return 0 }
   if slot >= reNpBases[reNpBases.length - 1] { return 0 }
   crLoopRdSlots.push(slot)
@@ -654,10 +647,9 @@ export function crNoteLostName(name: string, ix: i32) {
   const lost = crCapLossBank[fnIx] ?? crNoNames
   if !strListHas(lost, name) { return 0 }
   // Only a captured binding: a local of the same name is the function's own.
-  const bd = narBindDepthOf(name)
-  if bd >= crFnBase() && !crWidenedAt(envDeclOfNameForFlow(name), bd) {
-    return 0
-  }
+  const ls = envDeclOfNameForFlow(name)
+  const bd = narBindDepthOf(ls)
+  if bd >= crFnBase() && !crWidenedAt(ls, bd) { return 0 }
   crLostPush(name, ix, fnIx, crFnBases.length, true)
   0
 }
@@ -931,10 +923,11 @@ export function crRetireAt(
   if wide < 0 { return 0 }
   const cur = lookup(name)
   if cur < 0 { return 0 }
+  const pl = placeIntern(s, name, false)
   if cur == wide {
     // Already wide here, typically because a sibling arm retired it in place; the path this
     // call is on still ends wide, and the join has to see that (D3285).
-    narClobKeys.push(name)
+    narClobPlace.push(pl)
     narClobTys.push(wide)
     narClobPrev.push(wide)
     narClobDepths.push(T.frames.length)
@@ -951,7 +944,7 @@ export function crRetireAt(
   // The arm join and the post-guard residual read this row exactly as a retiring write's. Its
   // entry type is the widest, not `cur`: a call in a condition retires a narrowing that only
   // part of the condition held, which is no type the `if` itself begins at.
-  narClobKeys.push(name)
+  narClobPlace.push(pl)
   narClobTys.push(wide)
   narClobPrev.push(wide)
   narClobDepths.push(T.frames.length)
@@ -1129,9 +1122,9 @@ export function pathRetiredByAssign(byIx: i32) {
 // null test restates it as its own fact, so a then arm that retires the overlay in place does not
 // leave the else arm reading at storage while the emitter's else push still narrows (D3318).
 export function narPathHeldNonNull(placeIx: i32, inner: i32): boolean {
-  const key = placeKeyOf(placeIx)
-  if key == "" || !isPathKey(key) { return false }
-  narrowedPathTyRaw(key) == inner
+  const p = placeAt(placeIx)
+  if !placeIsPath(p) { return false }
+  narrowedPathTyRaw(p) == inner
 }
 
 // Whether a narrowing key is a path (`o.v`, `xs[0]`, `o.xs[1].v`) rather than a bare name — which
@@ -1311,47 +1304,39 @@ export function noteHoleArgNullRead(name: string, at: i32, ix: i32) {
   0
 }
 
-// The innermost slot this function pushed narrowing `key` at the binding it names now, or -1.
-function npFnSlotOf(key: string): i32 {
+// The innermost slot this function pushed narrowing the place the node `place` reads, or -1.
+function npFnSlotOf(place: i32): i32 {
   let base = crFnNpBase()
   if base < 0 { base = 0 }
-  npSlotOf(key, base)
+  npSlotOf(placeAt(place), base)
 }
 
 // Whether the place at node `place` is not a narrowing this function ended by a verdict a pin
 // could overturn. A place never narrowed, or narrowed and still live, answers true.
 function killedNarrowingSure(place: i32): boolean {
   if place < 0 || place >= P.nodes.length { return true }
-  const key = placeKeyOf(place)
-  if key == "" { return true }
-  const s = npFnSlotOf(key)
+  const s = npFnSlotOf(place)
   if s < 0 || npInvBy[s] < 0 { return true }
-  npKillSure[i32ToStr(npInvBy[s]) + "|" + key] ?? false
+  npKillSure[i32ToStr(npInvBy[s]) + "|" + npKeys[s]] ?? false
 }
 
 // Whether a write or a call ended the innermost narrowing of the place `place` in this
 // function; false when none covers it.
 export function narrowingEndedAt(place: i32): boolean {
-  const key = placeKeyOf(place)
-  if key == "" { return false }
-  const s = npFnSlotOf(key)
+  const s = npFnSlotOf(place)
   s >= 0 && npInvBy[s] >= 0
 }
 
 // Whether any narrowing of the place `place`, live or ended, is recorded in this function.
-export function placeIsNarrowed(place: i32): boolean {
-  const key = placeKeyOf(place)
-  key != "" && npFnSlotOf(key) >= 0
-}
+export function placeIsNarrowed(place: i32): boolean { npFnSlotOf(place) >= 0 }
 
 // Whether the innermost narrowing of the place `place` in this function is the remainder of an
 // `is` test on a hole (`holeElseTested`) that a write, a call `callKillSure` settles, or a write
 // through an alias ended; false when none covers it.
 export function holeRemainderEndedSure(place: i32): boolean {
-  const key = placeKeyOf(place)
-  if key == "" { return false }
-  const s = npFnSlotOf(key)
+  const s = npFnSlotOf(place)
   if s < 0 { return false }
+  const key = npKeys[s]
   const by = npInvBy[s]
   if by < 0 { return false }
   if (holeElseTested[key + "|" + i32ToStr(npTys[s])] ?? -1) < 0 { return false }
@@ -1375,10 +1360,10 @@ export type IfChk = {
   seedObsMark: i32,
   seedObsLit: boolean,
   thenExits: boolean,
-  tnNames: string[],
+  tnPlaces: i32[],
   tnTys: i32[],
   tnEnt: i32[],
-  enNames: string[],
+  enPlaces: i32[],
   enTys: i32[],
   enEnt: i32[],
   altRows: i32[],
@@ -1398,9 +1383,10 @@ export type IfChk = {
 }
 
 export function narPathsReset() {
+  placeIdsReset()
   holeElseTested = Map()
   npKeys = []
-  npRoot = []
+  npPlace = []
   npTys = []
   npInvBy = []
   narIpScope = []
@@ -1415,7 +1401,7 @@ export function narPathsReset() {
   nfSlots = []
   nfNames = []
   npFrames = []
-  narClobKeys = []
+  narClobPlace = []
   narClobTys = []
   narClobPrev = []
   narClobDepths = []

@@ -189,8 +189,7 @@ import {
 } from "./check_narrow_flow"
 import {
   IfChk,
-  isPathKey,
-  narClobKeys,
+  narClobPlace,
   narClobberedSince,
   narCompactIf,
   npAsgPush,
@@ -227,7 +226,8 @@ import {
   tyParamArmAbsorbs,
   widenLitTy,
 } from "./check_relate_core"
-import { declare, envDeclOfNameForFlow, lookup } from "./check_scopes"
+import { declTyOf, declareSlot } from "./check_scopes"
+import { placeDecl, placeIsPath, placeText } from "./check_place_ids"
 import { recordPgResidualVoid } from "./check_side_rows"
 import { joinClashMsg, joinClashMsgSet } from "./check_subst"
 import { tpBoundOfName } from "./check_tp_bound"
@@ -1261,7 +1261,7 @@ function ifTailLeaveElse(
   }
   if n.ifElse < 0 { return el }
   const enElse = nodeAt(n.ifElse)
-  el.hi = narClobKeys.length
+  el.hi = narClobPlace.length
   el.diverges = elseExits
   pgUpArmIxSet(-1)
   retTailPosSet(false)
@@ -1274,7 +1274,7 @@ function ifTailLeaveElse(
     elseIx = -1
     el.isLink = true
   }
-  if f.enNames.length > 0 { popScope() }
+  if f.enPlaces.length > 0 { popScope() }
   if f.ifTail {
     if el.ty != TY_VOID && el.ty != TY_ERR {
       // A chain link's value is the inner `if` itself.
@@ -1388,7 +1388,7 @@ function checkIfTail(
   const clobMark = f.clobMark
   const ifTail = f.ifTail
   const thenExits = f.thenExits
-  const enNames = f.enNames
+  const enPlaces = f.enPlaces
   const enTys = f.enTys
   const altRows = f.altRows
   const thenTy = f.thenTy
@@ -1428,18 +1428,18 @@ function checkIfTail(
   // The narrowing column's own join, `daJoinArms`'s shape one table over: a name an arm wrote
   // reads below the `if` at the join of what the surviving arms left it at, not at its
   // declaration. Banked at this node so the emitter pushes the same member (D1846).
-  const sumKeys: string[] = []
+  const sumPlaces: i32[] = []
   const sumTys: i32[] = []
   const sumPrev: i32[] = []
   const sumRet: i32[] = []
-  if narClobKeys.length > clobMark {
+  if narClobPlace.length > clobMark {
     applyArmJoins(
       f,
       el.hi,
       daThenDiverges,
       daElseDiverges,
       n.ifCond,
-      sumKeys,
+      sumPlaces,
       sumTys,
       sumPrev,
       sumRet,
@@ -1450,7 +1450,7 @@ function checkIfTail(
   if thenExits {
     ifTailApplyGuards(
       ix,
-      enNames,
+      enPlaces,
       enTys,
       f.thenHi,
       daHasElse,
@@ -1461,7 +1461,7 @@ function checkIfTail(
     // The mirror: an else that always exits leaves the then narrowings standing below (D1971).
     ifTailApplyGuards(
       ix,
-      f.tnNames,
+      f.tnPlaces,
       f.tnTys,
       f.thenLo,
       true,
@@ -1477,7 +1477,7 @@ function checkIfTail(
       pgUpTys.pop()
     }
   }
-  narCompactIf(clobMark, sumKeys, sumTys, sumPrev, sumRet)
+  narCompactIf(clobMark, sumPlaces, sumTys, sumPrev, sumRet)
   f.exits = thenExits && daHasElse && daElseDiverges
   retTailPosSet(ifTail)
   // An `if` with a completing arm that yields no value is a statement: it is `void` as the
@@ -1534,12 +1534,12 @@ function checkIfTail(
 }
 
 // The guard clause of `checkIfTail` at `if` node `ix`, whose then always exits: the false
-// narrowings `enNames`/`enTys` apply to the rest of the block, a chain link hands its own up,
+// narrowings `enPlaces`/`enTys` apply to the rest of the block, a chain link hands its own up,
 // and the hand-ups banked above `pgUpMark` apply in reverse. `elseLo` is the ledger row the else
 // arm opened at: the exiting then arm is on no path that reaches the rest (D6690).
 function ifTailApplyGuards(
   ix: i32,
-  enNames: string[],
+  enPlaces: i32[],
   enTys: i32[],
   elseLo: i32,
   daHasElse: boolean,
@@ -1547,8 +1547,8 @@ function ifTailApplyGuards(
   pgUpMark: i32,
 ) {
   let gi2 = 0
-  while gi2 < enNames.length {
-    const gKey = enNames[gi2]
+  while gi2 < enPlaces.length {
+    const gKey = enPlaces[gi2]
     const gTy = enTys[gi2]
     // From the else arm on, not the condition: a write in the condition that follows a fact's
     // test already dropped that fact (D2589), and one before it is what the test tested.
@@ -1557,7 +1557,7 @@ function ifTailApplyGuards(
       // residual would describe a value the place does not hold. Both halves drop it: the
       // emitter reads `pgResidualVoidOf` at the same node (D1736).
       recordPgResidualVoid(ix)
-    } else if isPathKey(gKey) {
+    } else if placeIsPath(gKey) {
       // Paths keep the no-`else` gate, and an else arm never hands one up either — an
       // `npKeys` entry is retired in place by a call/write inside the arm.
       if !daHasElse && !isElseArm {
@@ -1580,15 +1580,16 @@ function ifTailApplyGuards(
         pgPreKeysSet([])
         pgPreTysSet([])
       }
+      const gs = placeDecl(gKey)
+      const gDecl = declTyOf(gs)
       pgPreKeys.push(gKey)
-      pgPreTys.push(lookup(gKey))
+      pgPreTys.push(gDecl)
       // ...and bank the shadowed declaration under the post-guard kind, so a consumer
       // needing the emitter's union can find it (D1035) — idempotent, banking the widest first.
-      const gDecl = lookup(gKey)
-      noteNarShadow(envDeclOfNameForFlow(gKey), gDecl, NAR_KIND_POSTGUARD)
+      noteNarShadow(gs, gDecl, NAR_KIND_POSTGUARD)
       // One leg for both kinds: a null strip and a union subtraction are the same shadowing
       // `declare` — split only so the strip could skip the subtraction bank, now gone.
-      declare(gKey, gTy)
+      declareSlot(gs, placeText(gKey), gTy)
       if gDecl >= 0 && gDecl != gTy { narFitCompanions(gKey, gDecl, gTy) }
     }
     gi2 = gi2 + 1
@@ -1602,13 +1603,10 @@ function ifTailApplyGuards(
       if narClobberedSince(elseLo, pgUpKeys[pu]) {
         recordPgResidualVoid(ix)
       } else {
-        const upDecl = lookup(pgUpKeys[pu])
-        noteNarShadow(
-          envDeclOfNameForFlow(pgUpKeys[pu]),
-          upDecl,
-          NAR_KIND_POSTGUARD,
-        )
-        declare(pgUpKeys[pu], pgUpTys[pu])
+        const us = placeDecl(pgUpKeys[pu])
+        const upDecl = declTyOf(us)
+        noteNarShadow(us, upDecl, NAR_KIND_POSTGUARD)
+        declareSlot(us, placeText(pgUpKeys[pu]), pgUpTys[pu])
         if upDecl >= 0 && upDecl != pgUpTys[pu] {
           narFitCompanions(pgUpKeys[pu], upDecl, pgUpTys[pu])
         }
