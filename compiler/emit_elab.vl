@@ -19,6 +19,7 @@ import {
   hasSpreadItem,
   i32ToStr,
   nodeAt,
+  nodeContains,
   nodeSpineChildren,
 } from "./ast"
 import { monoRecheckBegin } from "./check_assignable"
@@ -273,8 +274,9 @@ function declOpen(d: i32): boolean {
 }
 
 // The parent key a call from instance `from` gives nested declaration `d`: the nearest enclosing
-// declaration instanced on `from`'s chain, -1 when every enclosing declaration is closed, -2
-// when one is open and not on the chain (the open enclosing instance reaches it instead).
+// declaration instanced on `from`'s chain, -1 when `d` reads none of the type variables open
+// around it, -2 when an enclosing declaration whose type variables `d` reads is open and not on
+// the chain (the open enclosing instance reaches it instead).
 function elabParentFor(d: i32, from: i32): i32 {
   let e = elabEncl.get(d) ?? -1
   let anyOpen = false
@@ -283,16 +285,110 @@ function elabParentFor(d: i32, from: i32): i32 {
     let a = from
     let g2 = 0
     while a >= 0 && g2 < 64 {
-      if ekDecl[a] == e { return a }
+      if ekDecl[a] == e {
+        return if elabReadsChainOf(d, a) || anyOpen { a } else { -1 }
+      }
       a = ekParent[a]
       g2 = g2 + 1
     }
-    if declOpen(e) { anyOpen = true }
+    if declOpen(e) && elabReadsOpenOf(d, e) { anyOpen = true }
     e = elabEncl.get(e) ?? -1
     guard = guard + 1
   }
   if anyOpen { return 0 - 2 }
   -1
+}
+
+// Whether nested declaration `d` reads the type variable `nm` an enclosing declaration binds:
+// where `d` binds `nm` itself, only through a binding declared outside `d` whose type names it.
+function elabReadsOuter(d: i32, nm: string): boolean {
+  if !elabOwnName(d, nm) { return elabDeclReads(d, nm) }
+  const key = i32ToStr(d) + "^" + nm
+  const have = elabReadsMemo.get(key)
+  if have != null { return have }
+  const r = elabCapReads(d, d, nm)
+  elabReadsMemo[key] = r
+  r
+}
+
+// Whether a read in the subtree at `ix` names a binding declared outside `d` whose type names `nm`.
+function elabCapReads(d: i32, ix: i32, nm: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  let cur = ix
+  while cur >= 0 {
+    const dc = identDeclOf(cur)
+    if (
+      dc >= 0
+      && !nodeContains(d, dc)
+      && tyMentionsTyVarNamed(nodeTyIxOf(dc), nm, 16)
+    ) {
+      return true
+    }
+    for kid in nodeSpineChildren(cur) {
+      if elabCapReads(d, kid, nm) { return true }
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Whether nested declaration `d` reads a type variable instance `a`'s substitution binds, or an
+// alias a shadow rename minted for one; a name `d` binds itself shadows the outer one.
+function elabReadsChainOf(d: i32, a: i32): boolean {
+  for nm in ekNames[a] {
+    if elabReadsOuter(d, nm) { return true }
+  }
+  for al in elabAliases {
+    if elabDeclReads(d, al) { return true }
+  }
+  false
+}
+
+// Whether nested declaration `d` reads a type variable open declaration `e` binds: one of its
+// type parameters, or one its parameters' types name.
+function elabReadsOpenOf(d: i32, e: i32): boolean {
+  const n = nodeAt(e)
+  if !(n is FuncDecl) { return false }
+  const names: string[] = []
+  for tp in n.fnTyParams { names.push(tp) }
+  for p in n.fnParams { elabTyVarNamesIn(nodeTyIxOf(p), names, 0) }
+  for nm in names {
+    if elabReadsOuter(d, nm) { return true }
+  }
+  false
+}
+
+// Appends each type variable name type `t` mentions to `out`.
+function elabTyVarNamesIn(t: i32, out: string[], depth: i32) {
+  if t < 0 || t >= T.tys.length || depth > 16 { return 0 }
+  const x = T.tys[t]
+  match x {
+    TyVar => {
+      out.push(x.tvName)
+    }
+    TyArray => {
+      elabTyVarNamesIn(x.aElem, out, depth + 1)
+    }
+    TyNullable => {
+      elabTyVarNamesIn(x.nInner, out, depth + 1)
+    }
+    TyMap => {
+      elabTyVarNamesIn(x.mKey, out, depth + 1)
+      elabTyVarNamesIn(x.mVal, out, depth + 1)
+    }
+    TyObj => {
+      for ft in x.objFieldTypes { elabTyVarNamesIn(ft, out, depth + 1) }
+    }
+    TyFunc => {
+      for pt in x.fnParamTypes { elabTyVarNamesIn(pt, out, depth + 1) }
+      elabTyVarNamesIn(x.fnRet, out, depth + 1)
+    }
+    TyUnion => {
+      for m in x.uMembers { elabTyVarNamesIn(m, out, depth + 1) }
+    }
+    TyPrim | TyErr | TyLit | TyNeg => {}
+  }
+  0
 }
 let elabHoleCur = 0
 
@@ -574,15 +670,28 @@ export function elabWalkNarrowedTy(ix: i32): i32 {
   elabNodeTy(ix, top)
 }
 
+// The instances of nested declaration `d` under instance `k`: those under the parent key
+// `elabParentFor` names, narrowed to the ones `k`'s body reaches when that key holds several.
+function elabKidsAt(d: i32, k: i32): i32[] {
+  const parent = elabParentFor(d, k)
+  if parent < -1 { return [] }
+  const ks = ekKids[i32ToStr(parent) + "^" + i32ToStr(d)] ?? []
+  if ks.length < 2 || k < 0 { return ks }
+  const out: i32[] = []
+  for kd in ks {
+    if elabReaches(k, kd) { out.push(kd) }
+  }
+  if out.length == 0 { return ks }
+  out
+}
+
 // The result nested declaration `d`'s instances under the instance being walked agree on; -1
 // when it has none, they disagree, or one stays open.
 export function elabWalkKidRet(d: i32): i32 {
   const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
   if top < 0 || d < 0 { return -1 }
-  const parent = elabParentFor(d, top)
-  if parent < -1 { return -1 }
   let r = -1
-  for kd in ekKids[i32ToStr(parent) + "^" + i32ToStr(d)] ?? [] {
+  for kd in elabKidsAt(d, top) {
     const kr = elabRetOf(kd)
     if kr < 0 || (r >= 0 && kr != r) { return -1 }
     r = kr
@@ -1488,12 +1597,9 @@ export function elabKeyAtPos(pos0: i32): i32 {
   let i = inPlace.length - 1
   while i >= 0 {
     const d = inPlace[i]
-    const parent = elabParentFor(d, k)
-    if parent >= -1 {
-      const ks = ekKids[i32ToStr(parent) + "^" + i32ToStr(d)] ?? []
-      if ks.length == 1 { k = ks[0] }
-      if ks.length > 1 { return -3 }
-    }
+    const ks = elabKidsAt(d, k)
+    if ks.length == 1 { k = ks[0] }
+    if ks.length > 1 { return -3 }
     i = i - 1
   }
   k
@@ -1605,6 +1711,22 @@ function elabFnIdsIn(t: i32, ds: i32[], depth: i32) {
     TyVar | TyPrim | TyErr | TyLit | TyNeg => {}
   }
   0
+}
+
+// Whether instance `k`'s body reaches instance `t`, directly or through the instances it reaches.
+function elabReaches(k: i32, t: i32): boolean {
+  const seen: {[i32]: boolean} = Map()
+  const work: i32[] = [k]
+  while work.length > 0 {
+    const a = work.pop() ?? -1
+    if a < 0 || a >= ekReach.length || (seen[a] ?? false) { continue }
+    seen[a] = true
+    for r in ekReach[a] {
+      if r == t { return true }
+      work.push(r)
+    }
+  }
+  false
 }
 
 // The one instance of `d` reached from instance `k`'s body, directly or through the instances it
