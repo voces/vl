@@ -639,6 +639,7 @@ import {
   nodeRepIsNulAtom,
   nodeTyIsNulScalarBox,
   nodeTyMapKeyIsLitUnion,
+  repDescNone,
   repOfNode,
   repOfNodeAt,
   repOfTy,
@@ -3255,25 +3256,142 @@ function letMapCtorAtomKey(letIx: i32, ty: i32): boolean {
 // whose cells the binding's own spelling decides. A type holding a type variable, other than a
 // function type, names no rep: the value's row is the one its initializer delivers.
 export function letBindRepClaims(letIx: i32, fnIx: i32): boolean {
-  if letIsNulNone(letIx, fnIx) { return false }
-  if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return false }
-  if letNulLitUnion(letIx, fnIx) { return false }
+  const r = bindCellFill(letIx, fnIx)
+  if r < 0 || r >= bcClaims.length { return false }
+  bcClaims[r]
+}
+
+// The rep of binding `letIx`'s cell when `letBindRepClaims` holds, read off the type it holds.
+export function letBindRep(letIx: i32, fnIx: i32): RepDesc {
+  const r = bindCellFill(letIx, fnIx)
+  if r < 0 || r >= bcRep.length { return repDescNone() }
+  bcRep[r]
+}
+
+// The table slot of binding `letIx`'s cell when `letBindRepClaims` holds, at its rep's kind.
+export function letBindRepSlot(letIx: i32, fnIx: i32): i32 {
+  const r = bindCellFill(letIx, fnIx)
+  if r < 0 || r >= bcSlot.length { return -1 }
+  if !bcSlotHave[r] {
+    bcSlot[r] = repSlotOfKind(bcRep[r].rdKind, bcTy[r])
+    bcSlotHave[r] = true
+  }
+  bcSlot[r]
+}
+
+// ── the binding storage column (D14434) ──────────────────────────────────────
+// One row per binding asked about, holding its latest instance: whether its rep claims the cell,
+// that rep, and its row slot. A row is current while it holds this instance and the
+// `globalCellKind` walk generation.
+let bcRowOf: {[i32]: i32} = Map()
+let bcStamp: i32[] = []
+let bcFn: i32[] = []
+let bcClaims: boolean[] = []
+let bcRep: RepDesc[] = []
+let bcTy: i32[] = []
+let bcSlot: i32[] = []
+let bcSlotHave: boolean[] = []
+let bcDepth = 0
+let bcGenSeen = 0
+
+// Empties the column; `classifyStateReset` runs it at compile start, with `bcDepth`.
+function bindCellReset() {
+  bcRowOf = Map()
+  bcStamp = []
+  bcFn = []
+  bcClaims = []
+  bcRep = []
+  bcTy = []
+  bcSlot = []
+  bcSlotHave = []
+  bcGenSeen = 0
+}
+
+// Fill binding `letIx`'s column row for instance `fnIx` and return the row; -1 when `letIx` is
+// not a node.
+function bindCellFill(letIx: i32, fnIx: i32): i32 {
+  if letIx < 0 || letIx >= P.nodes.length { return -1 }
+  if bcDepth == 0 {
+    if gckStale() { gckDrop() }
+  }
+  // A generation that restarted could alias an old stamp, so the column restarts with it.
+  if gckGen < bcGenSeen { bindCellReset() }
+  bcGenSeen = gckGen
+  const had = bcRowOf[letIx] ?? -1
+  if (
+    had >= 0
+    && had < bcStamp.length
+    && bcStamp[had] == gckGen
+    && bcFn[had] == fnIx
+  ) {
+    return had
+  }
+  const gen = gckGen
+  bcDepth = bcDepth + 1
+  const c = bindCellGo(letIx, fnIx)
+  bcDepth = bcDepth - 1
+  // The walk may have reset the column, so the row is looked up again.
+  let r = bcRowOf[letIx] ?? -1
+  if r < 0 || r >= bcStamp.length {
+    r = bcStamp.length
+    bcRowOf[letIx] = r
+    bcStamp.push(0)
+    bcFn.push(-2)
+    bcClaims.push(false)
+    bcRep.push(c.bgRep)
+    bcTy.push(-1)
+    bcSlot.push(-1)
+    bcSlotHave.push(false)
+  }
+  // A walk that minted rows moved the generation; its answer is served once and not kept.
+  bcStamp[r] = if gckGen == gen { gen } else { 0 }
+  bcFn[r] = fnIx
+  bcClaims[r] = c.bgClaims
+  bcRep[r] = c.bgRep
+  bcTy[r] = c.bgTy
+  bcSlot[r] = c.bgSlot
+  bcSlotHave[r] = c.bgSlotHave
+  r
+}
+
+// One binding's storage answer as `bindCellGo` reads it.
+type BindCellGo = {
+  bgClaims: boolean,
+  bgRep: RepDesc,
+  bgTy: i32,
+  bgSlot: i32,
+  bgSlotHave: boolean,
+}
+
+// Binding `letIx`'s storage answer: whether its cell is its rep's, and the rep, type and slot it
+// read. They are read only once the binding's own spelling has not decided the cell, since
+// reading a slot can mint a row; a refusal before then carries none.
+function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
+  const no: BindCellGo = {
+    bgClaims: false,
+    bgRep: repDescNone(),
+    bgTy: -1,
+    bgSlot: -1,
+    bgSlotHave: false,
+  }
+  if letIsNulNone(letIx, fnIx) { return no }
+  if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return no }
+  if letNulLitUnion(letIx, fnIx) { return no }
   const ty = letBindTy(letIx, fnIx)
-  if ty < 0 { return false }
+  if ty < 0 { return no }
   // A function value's cell is the closure rep whatever its type variables bind to; a list or
   // record of one is not, since its row names the signature.
   if tyHasTyVar(ty) {
     const t0 = tyAt(ty)
     const inner = if t0 is TyNullable { t0.nInner } else { ty }
-    if !tyIsFuncArena(inner) && !fnTagListTy(inner) { return false }
+    if !tyIsFuncArena(inner) && !fnTagListTy(inner) { return no }
   }
   // A parameter the D4551 default bound is a guess at the value, not its type.
   if fnIx >= 0 && elabKeyReadsDefault(elabKeyAt(fnIx), letBindTy(letIx, -1)) {
-    return false
+    return no
   }
-  if letMapCtorAtomKey(letIx, ty) { return false }
+  if letMapCtorAtomKey(letIx, ty) { return no }
   const rd = repOfNodeAt(letIx, ty)
-  if rd.rdCovered != 1 { return false }
   // A row kind whose type has no row names no cell.
   const k = rd.rdKind
   const rowed = (k == "struct"
@@ -3282,18 +3400,17 @@ export function letBindRepClaims(letIx: i32, fnIx: i32): boolean {
     || k == "nulvariant"
     || k == "reflist"
     || k == "nulreflist")
-  !rowed || repSlotOfKind(k, ty) >= 0
-}
-
-// The rep of binding `letIx`'s cell, read off the type it holds.
-export function letBindRep(letIx: i32, fnIx: i32): RepDesc {
-  repOfNodeAt(letIx, letBindTy(letIx, fnIx))
-}
-
-// The table slot of binding `letIx`'s cell, at its rep's kind.
-export function letBindRepSlot(letIx: i32, fnIx: i32): i32 {
-  const ty = letBindTy(letIx, fnIx)
-  repSlotOfKind(repOfNodeAt(letIx, ty).rdKind, ty)
+  if rd.rdCovered != 1 || !rowed {
+    return {
+      bgClaims: rd.rdCovered == 1,
+      bgRep: rd,
+      bgTy: ty,
+      bgSlot: -1,
+      bgSlotHave: false,
+    }
+  }
+  const slot = repSlotOfKind(k, ty)
+  { bgClaims: slot >= 0, bgRep: rd, bgTy: ty, bgSlot: slot, bgSlotHave: true }
 }
 
 // The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
@@ -18564,6 +18681,8 @@ export function classifyStateReset() {
   capFrame = -1
   capInitAsk = false
   gckDepth = 0
+  bcDepth = 0
+  bindCellReset()
   irkDepth = 0
   lrDepth = 0
   asgReReadIx = -1
