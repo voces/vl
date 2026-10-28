@@ -19,24 +19,15 @@ import { nodeSrc } from "./symbols"
 import { elabRun } from "./emit_elab"
 import { isVarTyIxOf } from "./check_list_union"
 import { topLetScalarOf } from "./check_nj_join"
-import {
-  isNumIntrinsicName,
-  nodeTyComparesAsString,
-} from "./check_getter_effects"
+import { nodeTyComparesAsString } from "./check_getter_effects"
 import { refViewSrcTys } from "./check_ref_list_view"
 import { lbiArenaReset } from "./check_num_lit_state"
 import { T, TyLit, tyLitMemberTexts } from "./check_types"
 import {
-  ATOMIC_SIG_CMPXCHG,
   ATOMIC_SIG_FENCE,
-  ATOMIC_SIG_LOAD,
-  ATOMIC_SIG_RMW,
-  SIMD_SIG_LANE_F,
-  SIMD_SIG_LANE_L,
   SIMD_SIG_LOAD,
   SIMD_SIG_STORE,
   atomicRow,
-  atomicRowIsI64,
   atomicRowSig,
   fsArgIsI64,
   fsArgIsU8List,
@@ -53,8 +44,6 @@ import {
   nameIsMemStoreIntrinsic,
   simdRow,
   simdRowSig,
-  truncSatIsI64,
-  truncSatOp,
 } from "./check_intrinsics"
 import {
   REP_SCAL_F32,
@@ -66,7 +55,6 @@ import {
   mvSlotKeyKind,
   nullBoxTag,
   repKindOfSigTok,
-  repMemLoadScalarMask,
   repNodeScalarMask,
   repReset,
   repShadowSweep,
@@ -7216,14 +7204,7 @@ function scanPrintUse() {
     if pn is Call && pn.callFn >= 0 {
       const pcallee = nodeAt(pn.callFn)
       if pcallee is Ident {
-        const pmask = scanPrintCallIntrinsic(
-          pscan,
-          pcallee.identName,
-          pn.callArgs.length,
-        )
-        if (pmask & REP_SCAL_I64) != 0 { saw.sawI64Ann = true }
-        if (pmask & REP_SCAL_F64) != 0 { saw.sawF64 = true }
-        if (pmask & REP_SCAL_F32) != 0 { saw.sawF32 = true }
+        scanPrintCallIntrinsic(pcallee.identName, pn.callArgs.length)
       }
       // `s.bytes()` yields a `u8[]`. It is the one producer of a packed byte list that spells no
       // `u8[]` anywhere — the annotation scan matches a type, and `for b in s.bytes()` has none — so
@@ -7273,11 +7254,10 @@ function scanPrintUse() {
   0
 }
 
-// `scanPrintUse`'s arm for a call at node `pscan` of the identifier `name` with `nArgs`
-// arguments: reserves the imports, memory and helpers the intrinsic it names needs. Returns the
-// `REP_SCAL_*` bits of each wide scalar the call yields that the annotation scan cannot see.
-function scanPrintCallIntrinsic(pscan: i32, name: string, nArgs: i32) {
-  let saw = 0
+// `scanPrintUse`'s arm for a call of the identifier `name` with `nArgs` arguments: reserves the
+// imports, memory and helpers the intrinsic it names needs. The width of a scalar it yields is
+// its call node's recorded type, which the scan reads for every node.
+function scanPrintCallIntrinsic(name: string, nArgs: i32) {
   if name == "print" { gImports = 4 }
   // The linear-memory intrinsics: any store/load forces the module-defined
   // memory; `__log__` additionally forces the synthetic decoder function,
@@ -7288,50 +7268,23 @@ function scanPrintCallIntrinsic(pscan: i32, name: string, nArgs: i32) {
   // nothing to the print-import scan below, and that is a decision: a store consumes a scalar
   // and yields none, so it can never route a `print` to an undeclared import. Membership, not a spelling: a width added to `nameIsMemStoreIntrinsic` forces the memory here the same day.
   if nameIsMemStoreIntrinsic(name) { memUsed = true }
-  // The load-width matrix forces the memory exactly as `__load_i32__` does, and additionally
-  // forces a `__print_*__` import when its result is a wide scalar: `print(__load_f64__(0))`
-  // routes to `__print_f64__` in a program that spells `f64` nowhere, so the annotation scan
-  // below cannot see it. Read off the name (`repMemLoadScalarMask`), which is total.
-  if nameIsMemLoadIntrinsic(name) {
-    memUsed = true
-    const lscal = repMemLoadScalarMask(name)
-    if (lscal & REP_SCAL_I64) != 0 { saw = saw | REP_SCAL_I64 }
-    if (lscal & REP_SCAL_F64) != 0 { saw = saw | REP_SCAL_F64 }
-    if (lscal & REP_SCAL_F32) != 0 { saw = saw | REP_SCAL_F32 }
-  }
+  // The load-width matrix forces the memory exactly as `__load_i32__` does.
+  if nameIsMemLoadIntrinsic(name) { memUsed = true }
   // The bulk pair forces the memory for the same reason, generalised: `memory.copy`/
   // `memory.fill` are instructions on the memory, so a program whose only contact with linear
   // memory is `__memory_fill__(0, 0, 4)` still needs section 5 emitted or the instruction names
   // a memory that does not exist. Both are void, so like the stores they add nothing to the print-import scan below.
   if nameIsMemBulkIntrinsic(name) { memUsed = true }
   // A SIMD load/store forces the module's memory exactly as `__load_i32__` does — a
-  // `v128.load`/`store` names a memory that must exist. A lane read answering an f32 or
-  // an i64 needs that width's print import even in a program that never spells it.
+  // `v128.load`/`store` names a memory that must exist.
   const srow = simdRow(name)
   if srow >= 0 {
     const ssig = simdRowSig(srow)
     if ssig == SIMD_SIG_LOAD || ssig == SIMD_SIG_STORE { memUsed = true }
-    if ssig == SIMD_SIG_LANE_F { saw = saw | REP_SCAL_F32 }
-    if ssig == SIMD_SIG_LANE_L { saw = saw | REP_SCAL_I64 }
   }
-  // A saturating truncation to i64 needs that width's print import.
-  const tsop = truncSatOp(name)
-  if tsop >= 0 && truncSatIsI64(tsop) { saw = saw | REP_SCAL_I64 }
-  // An atomic names the memory like `__load_i32__` (the fence alone does not), and one
-  // answering an i64 needs that width's print import.
+  // An atomic names the memory like `__load_i32__` (the fence alone does not).
   const arow = atomicRow(name)
-  if arow >= 0 {
-    const asig = atomicRowSig(arow)
-    if asig != ATOMIC_SIG_FENCE { memUsed = true }
-    if (
-      atomicRowIsI64(arow)
-      && (asig == ATOMIC_SIG_LOAD
-        || asig == ATOMIC_SIG_RMW
-        || asig == ATOMIC_SIG_CMPXCHG)
-    ) {
-      saw = saw | REP_SCAL_I64
-    }
-  }
+  if arow >= 0 && atomicRowSig(arow) != ATOMIC_SIG_FENCE { memUsed = true }
   // The filesystem floor. Unlike every memory intrinsic above, these are host imports, so a use
   // here reserves a wasm function index — which is exactly why the reservation must happen in
   // this scan rather than at the call site: an extra import shifts every user function's index,
@@ -7341,7 +7294,6 @@ function scanPrintCallIntrinsic(pscan: i32, name: string, nArgs: i32) {
     gImports = 4
     if fslot < gFsUse.length { gFsUse[fslot] = 1 }
     if fsRetIsU8List(fslot) || fsArgIsU8List(fslot, 0) { ba8Used = true }
-    if fsRetIsI64(fslot) { saw = saw | REP_SCAL_I64 }
     // A slot that hands the host a linear-memory ADDRESS forces section 5 exactly as
     // `__memory_size__` below does: a program whose only memory contact is that call
     // would otherwise name a memory that does not exist — and the export the host
@@ -7373,18 +7325,7 @@ function scanPrintCallIntrinsic(pscan: i32, name: string, nArgs: i32) {
     ba8Used = true
     aUsed = true
   }
-  // A numeric-opcode intrinsic yields a scalar the annotation scan below cannot see:
-  // `f64bits(x)` is an i64 and `f32fromBits(b)` an f32 in a program that may spell neither type
-  // anywhere. Read the call's own recorded type, so the print router never routes to an undeclared import.
-  if isNumIntrinsicName(name) {
-    const iscal = repNodeScalarMask(pscan)
-    if iscal >= 0 {
-      if (iscal & REP_SCAL_I64) != 0 { saw = saw | REP_SCAL_I64 }
-      if (iscal & REP_SCAL_F64) != 0 { saw = saw | REP_SCAL_F64 }
-      if (iscal & REP_SCAL_F32) != 0 { saw = saw | REP_SCAL_F32 }
-    }
-  }
-  saw
+  0
 }
 
 // The passes that may memoise `captureNamesOf`'s walk (D2017): each either leaves the arena and
