@@ -46,8 +46,6 @@ import {
   CW_FR_UNKNOWN,
   CW_OCC_BIND,
   CW_OCC_CALL,
-  CW_OCC_FDECL,
-  CW_OCC_MCALL,
   CW_OCC_USE,
   CW_UP_CALLEE,
   CW_UP_LETINIT,
@@ -56,19 +54,20 @@ import {
   cwCalleeDeclOf,
   cwFnTailStmt,
   cwFrameOfUse,
-  cwIxChain,
   cwIxKind,
-  cwIxNext,
   cwIxNode,
   cwIxUp,
   cwIxUpKind,
   cwKeyOfDecl,
   cwKeyOfRoot,
   cwKeySame,
+  cwMethodCalls,
   cwOccNext,
   cwOccWalk,
+  cwOccWalkSpelled,
   cwOccWalkUse,
   cwPeel,
+  cwSelfDeclsNamed,
   cwUfcsDeclOf,
   rcwBlockTail,
 } from "./check_write_scan"
@@ -559,13 +558,10 @@ export function rcwSelfDeclsOf(prop: string, callee: i32): i32[] {
   const out: i32[] = []
   const d0 = cwUfcsDeclOf(callee)
   if d0 >= 0 { out.push(d0) }
-  let r = cwIxChain(demangleName(prop))
-  while r >= 0 {
-    if cwIxKind[r] == CW_OCC_FDECL {
-      const d = cwIxNode[r]
-      if d != d0 && rcwFirstParamIsSelf(d) { out.push(d) }
-    }
-    r = cwIxNext[r]
+  const named: i32[] = []
+  cwSelfDeclsNamed(prop, named)
+  for d in named {
+    if d != d0 { out.push(d) }
   }
   out
 }
@@ -631,7 +627,7 @@ export function rcwCallSites(fnIx: i32, out: i32[]): i32 {
   const fd = nodeAt(fnIx)
   if fd is FuncDecl {
     let nm = fd.fnName
-    let k = -1
+    let decl = fnIx
     if nm == "" {
       if fnIx >= cwIxUpKind.length || cwIxUpKind[fnIx] != CW_UP_LETINIT {
         return fnIx
@@ -639,30 +635,27 @@ export function rcwCallSites(fnIx: i32, out: i32[]): i32 {
       const ld = nodeAt(cwIxUp[fnIx])
       if ld is LetDecl {
         nm = ld.letName
-        k = cwKeyOfDecl(cwIxUp[fnIx])
+        decl = cwIxUp[fnIx]
       } else {
         return fnIx
       }
     }
-    const b1 = rcwNamedCallSites(nm, fnIx, k, out)
+    const b1 = rcwNamedCallSites(nm, fnIx, decl, out)
     if b1 >= 0 { return b1 }
     const plain = demangleName(nm)
     if plain != nm {
-      const b2 = rcwNamedCallSites(plain, fnIx, k, out)
+      const b2 = rcwNamedCallSites(plain, fnIx, decl, out)
       if b2 >= 0 { return b2 }
     }
     if fd.fnName != "" && rcwFirstParamIsSelf(fnIx) {
-      let r = cwIxChain(plain)
-      while r >= 0 {
-        if cwIxKind[r] == CW_OCC_MCALL {
-          const occ = cwIxNode[r]
-          const cn = nodeAt(occ)
-          if cn is Call {
-            const d = cwUfcsDeclOf(cn.callFn)
-            if d < 0 || d == fnIx { out.push(occ * 2 + 1) }
-          }
+      const mcalls: i32[] = []
+      cwMethodCalls(fnIx, mcalls)
+      for occ in mcalls {
+        const cn = nodeAt(occ)
+        if cn is Call {
+          const d = cwUfcsDeclOf(cn.callFn)
+          if d < 0 || d == fnIx { out.push(occ * 2 + 1) }
         }
-        r = cwIxNext[r]
       }
     }
     return -1
@@ -671,11 +664,14 @@ export function rcwCallSites(fnIx: i32, out: i32[]): i32 {
 }
 
 // The calls spelled `nm(…)` that may reach `fnIx` (one resolving elsewhere is skipped, one
-// resolving nowhere kept), or the first read of the name that is not a call. `k` is the binding
-// a lambda is bound to (`cwKeyOfDecl`); -1 for a declared function, whose every read counts.
-function rcwNamedCallSites(nm: string, fnIx: i32, k: i32, out: i32[]): i32 {
-  let r = cwIxChain(nm)
-  while r >= 0 {
+// resolving nowhere kept), or the first read of the declaration `decl` that is not a call:
+// `fnIx` itself, or the `const` a lambda is bound to.
+function rcwNamedCallSites(nm: string, fnIx: i32, decl: i32, out: i32[]): i32 {
+  let k = -1
+  if decl != fnIx { k = cwKeyOfDecl(decl) }
+  const ow = cwOccWalkSpelled(decl, nm)
+  while cwOccNext(ow) {
+    const r = ow.row
     const occ = cwIxNode[r]
     if cwIxKind[r] == CW_OCC_CALL {
       const cn = nodeAt(occ)
@@ -691,7 +687,6 @@ function rcwNamedCallSites(nm: string, fnIx: i32, k: i32, out: i32[]): i32 {
         return occ
       }
     }
-    r = cwIxNext[r]
   }
   -1
 }

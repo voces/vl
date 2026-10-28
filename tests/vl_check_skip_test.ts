@@ -984,7 +984,7 @@ const CASES: Case[] = [
     uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
   {
-    // D6750: an occurrence named like the builder is a site count S's check reads.
+    // D6750: an occurrence named like the builder that resolves elsewhere; the skip declines.
     name: "lib gains a value use named like lib2's builder",
     want: "decline",
     why: "fresh",
@@ -1389,7 +1389,6 @@ Deno.test({
       // `SK_NO_FRESH_BODY` drops a builder's declaring statement, `SK_NO_FRESH_OCC` its
       // occurrences in S, and `SK_NO_FRESH_SPLIT` the kept-or-own split of its deliveries.
       ["lib's builder leaf becomes an element read", 65536],
-      ["lib gains a value use named like lib2's builder", 1073741824],
       ["a lib call stops being a second site of a fresh builder", 1073741824],
       // With `SK_NO_FRESH_OCC` too: lib's new site of `mk` alone declines it at stage 0.
       ["lib hands on a kept builder main delivers to a wider record", 1073741824 | -2147483648],
