@@ -44,7 +44,10 @@ import {
   WhileStmt,
   nodeAt,
 } from "./ast"
+import { elabNarrowedFromAt, elabNodeTyAt } from "./emit_elab"
+import { crossTagFitRows } from "./emit_variant_sig"
 import {
+  narrowedFromTyOf,
   nodeTyIsMap,
   nodeTyIsNullable,
   nodeTyIsPureLitUnion,
@@ -57,6 +60,7 @@ import {
   TyObj,
   TyUnion,
   tyAt,
+  tyHasHole,
   tyIsLitUnion,
   tyIsNullableLitUnion,
   tyPrimNameOf,
@@ -71,7 +75,6 @@ import {
   moduleLocalLetOf,
   parentLetCoversAt,
   parentLoopCoversAt,
-  placeNarrowKeyOf,
   unwrapParen,
 } from "./emit_base"
 import {
@@ -84,7 +87,6 @@ import {
 import { bodyLetReadAt, fnHasParamSid } from "./emit_fn_ret_kinds"
 import { frameChainBindsName } from "./emit_list_rep"
 import { isStructOfTy } from "./emit_mv_slots"
-import { narrowSlotOf } from "./emit_narrow_slots"
 import { nulVariantIndexOf } from "./emit_nullable_rets"
 import { paramIndexOf, paramIsF64 } from "./emit_query"
 import {
@@ -120,14 +122,14 @@ import {
   lfOriginOf,
   lfSidHead,
   lfSidNext,
-  narrowTop,
   nestedNameBySid,
+  uVarTyIx,
 } from "./emit_state"
 import { declaredKind, declaredSlotOf } from "./emit_struct_order"
 import { holeOperandTyOf, variantRowOfShapeTy } from "./emit_ty_canon"
-import { msKeepTy, msSetOfTy, narrowSlotTyOf } from "./emit_union_registry"
+import { msKeepTy, msSetOfTy } from "./emit_union_registry"
 import { sidArrGet, sidOfNode } from "./symbols"
-import { tyHasTyVar } from "./tyquery"
+import { tyHasTyVar, tyIsUnionShaped } from "./tyquery"
 
 // Registry-independent f64-ness of a lifted callback's tail expression: float literals,
 // f64 params, f64 arithmetic over those, and f64-returning named calls. It avoids
@@ -863,37 +865,35 @@ export function nulArmRowOfTy(inner: i32): i32 {
   repVariantShapeRowOf(inner)
 }
 
-// The variant row the active narrowing of `key` (a local name or a place key) binds, or -1: the
-// arm its narrowed type is, by arena identity or by shape (D14302).
-export function narrowVariantRowFor(key: string): i32 {
-  const i = narrowSlotOf(key)
-  if i < 0 { return -1 }
-  variantRowOfShapeTy(narrowSlotTyOf(i))
-}
-
-// The variant row the Member `memIx`'s receiver is currently narrowed to, or -1. Each
-// receiver resolves its own active narrowing, unwrapped in lock-step with `memIsNarrowed`
-// (D222): a predicate saying "narrowed" beside an index answering -1 is the worse failure.
-export function memNarrowVariantIndex(memIx: i32) {
-  const m = nodeAt(memIx)
-  if m is Member {
-    const recv = nodeAt(unwrapParen(m.memObj))
-    if recv is Ident { return narrowVariantRowFor(recv.identName) }
-    const pk = placeNarrowKeyOf(m.memObj)
-    if pk != "" { return narrowVariantRowFor(pk) }
-  }
-  -1
-}
-
-// The variant row an expression is currently narrowed to, or -1, asked of the expression
-// itself rather than of a Member's receiver. A struct arm's read stays `{tag, payload}`, so a
-// destination typed at the arm recovers the payload itself.
-export function narrowedStructArmVi(exprIx: i32): i32 {
+// The variant row the read `exprIx` inside `fnIx` is narrowed to, or -1: the arm its type is,
+// by arena identity or by shape (D14302), when the checker narrowed it out of a union's storage.
+// A struct arm's read stays `{tag, payload}`, so a destination typed at the arm unwraps it. An
+// instance that narrowed the read gives its arm too.
+export function narrowedStructArmVi(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return -1 }
-  if narrowTop == 0 { return -1 }
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Ident { return narrowVariantRowFor(e.identName) }
-  const pk = placeNarrowKeyOf(exprIx)
-  if pk != "" { return narrowVariantRowFor(pk) }
-  -1
+  const r = unwrapParen(exprIx)
+  const el = elabNarrowedFromAt(r, fnIx)
+  const st = if el == -2 { narrowedFromTyOf(r) } else { el }
+  if st < 0 { return -1 }
+  if !tyIsUnionShaped(st) && !tyHasTyVar(st) && !tyHasHole(st) { return -1 }
+  const et = if el >= 0 { elabNodeTyAt(r, fnIx) } else { -1 }
+  variantRowOfShapeTy(if et >= 0 { et } else { nodeTyAt(r, fnIx) })
+}
+
+// The variant row the Member `memIx`'s receiver is narrowed to inside `fnIx`, or -1. A read
+// narrowed out of an instance's type parameter skipped the checker's cross-tag test, so an arm
+// another arm's values may be laid out as names no single variant there (D4056, D14487).
+export function memNarrowVariantIndex(memIx: i32, fnIx: i32) {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return -1 }
+  const vi = narrowedStructArmVi(m.memObj, fnIx)
+  if vi < 0 || vi >= uVarTyIx.length { return vi }
+  const r = unwrapParen(m.memObj)
+  const el = elabNarrowedFromAt(r, fnIx)
+  const st = if el == -2 { narrowedFromTyOf(r) } else { el }
+  if el < 0 && !tyHasTyVar(st) && !tyHasHole(st) { return vi }
+  const rows: i32[] = []
+  const kinds: i32[] = []
+  crossTagFitRows(vi, uVarTyIx[vi], -1, rows, kinds, fnIx)
+  if rows.length > 0 { -1 } else { vi }
 }

@@ -775,7 +775,6 @@ import {
 import {
   fnHasUnannotatedParam,
   listGetIdxReReadable,
-  memIsNarrowed,
   optChainBaseOf,
   optChainStagesRecv,
   optRecvReReadable,
@@ -1265,7 +1264,6 @@ import {
   nodeJoinRowName,
   nodeMixedUnionName,
   nulLitMemberTexts,
-  tyIsUnionShaped,
   unionDeclTyIxOfIdentAt,
   unionDeclTyIxOfIdentRead,
 } from "./emit_start_block"
@@ -1553,6 +1551,7 @@ import {
   tyHoldsNumbersApart,
   tyIntLitWideTexts,
   tyIsNumericBox,
+  tyIsUnionShaped,
   tyLitSetMemberLexes,
   tyMapValOf,
   tyNulLitUnionMemberTexts,
@@ -6063,8 +6062,7 @@ function emitIsTestArmTag(
         // Only a receiver narrowed to a variant of a box, as `emitMem` asks; a nullable record
         // narrowed by `!= null` is the record itself (D8000).
         if (
-          memIsNarrowed(unwrapParen(ndv.isObj))
-          && memNarrowVariantIndex(unwrapParen(ndv.isObj)) >= 0
+          memNarrowVariantIndex(unwrapParen(ndv.isObj), fnIx) >= 0
           && exprUnion(vrecv.memObj, fnIx)
         ) {
           if emitNarrowedMem(body, unwrapParen(ndv.isObj), fnIx, ec) < 0 {
@@ -6761,7 +6759,7 @@ function emitNulStrFieldRecover(code: i32, ec: ExpCtx) {
 function emitNarrowedMem(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx) {
   const m = nodeAt(memIx)
   if m is Member {
-    const vi = memNarrowVariantIndex(memIx)
+    const vi = memNarrowVariantIndex(memIx, fnIx)
     if vi < 0 {
       return emitFail("emitProgram: narrowed receiver names no union variant")
     }
@@ -9326,7 +9324,7 @@ function emitUnionIfArm(
 // anyway. Not a change to `exprUnion`, which would move every narrowed struct receiver.
 function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
   if (
-    narrowedStructArmVi(exprIx) < 0
+    narrowedStructArmVi(exprIx, fnIx) < 0
     && !narrowedNulStructArm(exprIx)
     && !exprTyIsRecord(exprIx, false, fnIx)
     && !exprTyIsRecord(exprIx, true, fnIx)
@@ -11579,25 +11577,13 @@ function memFloorMsg(memIx: i32, dflt: string): string {
 }
 
 function emitMem(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx) {
-  // A field read on a narrowed union identifier downcasts through the box, only where the narrow
-  // names one variant — the whole of what this route can lower.
-
-  // D1083 — a null-complement narrowing (`type U = A | B | null` under `if u != null`) banks the
-  // surviving set as the string `"A | B"`, which `memIsNarrowed` answers true for, so an exact
-  // compare against a table holding `A` and `B` separately refuses a check-clean program. Asking
-  // `memNarrowVariantIndex` lets a multi-variant survivor set reach the dispatch below instead.
-  if memIsNarrowed(memIx) {
-    if memNarrowVariantIndex(memIx) >= 0 {
-      // …and only where the receiver IS a box. A place whose declared type is the ARM
-      // itself carries the bare ref, so its narrowing renames the rep rather than changing
-      // it, and unwrapping would read a box the module never built. The same pairing
-      // `narrowedArmNeedsUnbox` makes on the delivery side (D1734).
-      const m0n = nodeAt(memIx)
-      if m0n is Member {
-        if exprUnion(m0n.memObj, fnIx) {
-          return emitNarrowedMem(body, memIx, fnIx, ec)
-        }
-      }
+  // A field read on a receiver narrowed to one variant downcasts through the box, only where the
+  // receiver IS a box: a place declared at the arm itself carries the bare ref, and unwrapping
+  // would read a box the module never built. `narrowedArmNeedsUnbox` pairs them alike (D1734).
+  const m0n = nodeAt(memIx)
+  if m0n is Member && memNarrowVariantIndex(memIx, fnIx) >= 0 {
+    if exprUnion(m0n.memObj, fnIx) {
+      return emitNarrowedMem(body, memIx, fnIx, ec)
     }
   }
   emitMemVariantRead(body, memIx, fnIx, ec)
@@ -16018,7 +16004,7 @@ function hoistFieldRecvOk(memIx: i32, fnIx: i32): boolean {
   if m is Member {
     const o = m.memObj
     if (
-      memIsNarrowed(memIx)
+      memNarrowVariantIndex(memIx, fnIx) >= 0
       || exprUnion(o, fnIx)
       || exprNullableStruct(o, fnIx)
     ) {
@@ -26810,13 +26796,8 @@ function emitAssignMember(
   // a field write on a narrowed union identifier (`if v is M { v.field = x }`)
   // downcasts through the box like the read path: push the box ref, unbox to the
   // variant struct, push the value, then `struct.set` — mutating the shared arena object.
-  if memIsNarrowed(lhsIx) {
-    const nvi = memNarrowVariantIndex(lhsIx)
-    if nvi < 0 {
-      return emitFail(
-        "emitProgram: narrowed field-assignment receiver names no variant",
-      )
-    }
+  const nvi = memNarrowVariantIndex(lhsIx, fnIx)
+  if nvi >= 0 {
     if lhsIx < 0 { return -1 }
     const nm = nodeAt(lhsIx)
     if nm is Member {
@@ -40374,8 +40355,8 @@ function emitCoalesceCallStash(
 // a union box, or -1: the pairing `emitMem` reads through `emitNarrowedMem`.
 function coalNarrowedBoxArm(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
-  if !(m is Member) || !memIsNarrowed(memIx) { return -1 }
-  const vi = memNarrowVariantIndex(memIx)
+  if !(m is Member) { return -1 }
+  const vi = memNarrowVariantIndex(memIx, fnIx)
   if vi < 0 || !exprUnion(m.memObj, fnIx) { return -1 }
   vi
 }
