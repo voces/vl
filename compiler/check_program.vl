@@ -667,14 +667,12 @@ import {
   CW_UP_RET,
   CW_UP_SPREAD,
   CW_UP_TAIL,
-  covarRootFrame,
   cwBuildFrames,
   cwCalleeDeclOf,
   cwFnTailStmt,
   cwFrJoins,
   cwFrRets,
   cwFrameOf,
-  cwFrameOfDecl,
   cwFrameOfUse,
   cwIxBuild,
   cwIxKind,
@@ -683,8 +681,11 @@ import {
   cwIxUp,
   cwIxUpAux,
   cwIxUpKind,
+  cwKeyFrame,
+  cwKeyOfDecl,
+  cwKeyOfRoot,
   cwOccNext,
-  cwOccWalkAt,
+  cwOccWalk,
   cwPeel,
   fnDeclIx,
   rcwBlockTail,
@@ -2719,9 +2720,7 @@ function rcwValueWrites(v: i32, covs0: string[], depth: i32): boolean {
   if up < 0 || up >= P.nodes.length { return rcwFound(node) }
   const un = nodeAt(up)
   if kind == CW_UP_LETINIT {
-    if un is LetDecl {
-      return rcwNameWrites(un.letName, cwFrameOfDecl(up), covs, depth + 1)
-    }
+    if un is LetDecl { return rcwNameWrites(cwKeyOfDecl(up), covs, depth + 1) }
     return rcwFound(up)
   }
   if kind == CW_UP_ASG_RHS {
@@ -2760,9 +2759,10 @@ function rcwValueWrites(v: i32, covs0: string[], depth: i32): boolean {
     // `[]` slot. Asked of both names, since the loop's collection kind is not known yet here.
     if un is ForIn {
       const ec = rcwUnder(covs, "[]")
-      const fr = cwFrameOfDecl(up)
-      if rcwNameWrites(un.fiVar, fr, ec, depth + 1) { return true }
-      if un.fiVar2 != "" { return rcwNameWrites(un.fiVar2, fr, ec, depth + 1) }
+      if rcwNameWrites(cwKeyOfDecl(un.fiDecl1), ec, depth + 1) { return true }
+      if un.fiVar2 != "" {
+        return rcwNameWrites(cwKeyOfDecl(un.fiDecl2), ec, depth + 1)
+      }
       return false
     }
     return rcwFound(up)
@@ -2864,8 +2864,7 @@ function rcwPlaceWrites(
   const n = nodeAt(p)
   if n is Ident {
     return rcwNameWrites(
-      n.identName,
-      covarRootFrame(p),
+      cwKeyOfRoot(p),
       rcwPrefix(below, covs, false),
       depth + 1,
     )
@@ -3026,7 +3025,11 @@ function rcwParamWrites(
     const pn = nodeAt(fd.fnParams[paramIx])
     if pn is Param {
       rcwCtxPush(d, paramIx, covs)
-      const r = rcwNameWrites(pn.parName, d, covs, depth + 1)
+      const r = rcwNameWrites(
+        cwKeyOfDecl(fd.fnParams[paramIx]),
+        covs,
+        depth + 1,
+      )
       rcwCtxFnPop()
       rcwCtxTvPop()
       rcwCtxNarrowPop()
@@ -3141,34 +3144,28 @@ function rcwReturnWrites(
   res
 }
 
-// Can the binding `name` in frame `fr`, holding a value with the widened slots `covs`, be
+// The memo key of `rcwNameWrites(k, covs, _)` under the current context.
+function rcwNameKey(k: i32, covs: string[]): string {
+  "b#" + i32ToStr(k) + "#" + rcwKey(covs) + rcwCtxKey(cwKeyFrame(k))
+}
+
+// Can the binding keyed `k` (`cwKeyOfDecl`), holding a value with the widened slots `covs`, be
 // written at one of them? Every read of the binding, a captured one included, is a handle.
-function rcwNameWrites(
-  name: string,
-  fr: i32,
-  covs: string[],
-  depth: i32,
-): boolean {
-  if covs.length == 0 { return false }
-  const key = name + "@" + i32ToStr(fr) + "#" + rcwKey(covs) + rcwCtxKey(fr)
+function rcwNameWrites(k: i32, covs: string[], depth: i32): boolean {
+  if covs.length == 0 || k == -1 { return false }
+  const key = rcwNameKey(k, covs)
   const m = rcwMemoGet(key)
   if m != 0 { return m == 2 }
   if rcwSeenCut(key) { return false }
   const cut0 = rcwCut
   // A plain `const b = a` hands `b` exactly these slots; such aliases join a worklist rather
   // than a recursion, so a long chain of them costs no stack.
-  const names: string[] = [name]
-  const frs: i32[] = [fr]
+  const keys: i32[] = [k]
   let res = false
   let i = 0
-  while i < names.length && !res {
+  while i < keys.length && !res {
     if i > 0 {
-      const ak = names[i]
-        + "@"
-        + i32ToStr(frs[i])
-        + "#"
-        + rcwKey(covs)
-        + rcwCtxKey(frs[i])
+      const ak = rcwNameKey(keys[i], covs)
       const am = rcwMemoGet(ak)
       if am == 2 { res = true }
       if am != 0 || rcwSeen.has(ak) {
@@ -3177,18 +3174,14 @@ function rcwNameWrites(
       }
       rcwSeenSetAt(ak, true)
     }
-    const ow = cwOccWalkAt(names[i], frs[i])
+    const ow = cwOccWalk(keys[i])
     while !res && cwOccNext(ow) {
       const r = ow.row
       if cwIxKind[r] == CW_OCC_USE {
         const u = cwIxNode[r]
         const al = rcwPlainAlias(u)
         if al >= 0 {
-          const ld = nodeAt(al)
-          if ld is LetDecl {
-            names.push(ld.letName)
-            frs.push(cwFrameOfDecl(al))
-          }
+          if nodeAt(al) is LetDecl { keys.push(cwKeyOfDecl(al)) }
         } else {
           res = rcwValueWrites(u, covs, depth + 1)
         }
