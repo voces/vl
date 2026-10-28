@@ -44,9 +44,8 @@ import {
   liKinds,
   liSlots,
   listIdxScratchBase,
-  scopeSlotOf,
 } from "./emit_state"
-import { rlSlotOfTy } from "./emit_struct_order"
+import { declaredSlotOf, rlSlotOfTy } from "./emit_struct_order"
 import { holeOperandTyOf, tyIsNulPrim } from "./emit_ty_canon"
 import {
   SCRATCH_BY_BOTH,
@@ -57,6 +56,8 @@ import {
   unionHasAtomKindArm,
 } from "./emit_union_casts"
 import { tyStepElem } from "./tyquery"
+import { identDeclOf } from "./symbols"
+import { letIsCopyOf } from "./emit_fn_ret_kinds"
 
 // ── the element-converting copy's frame slots (D791) ─────────────────────────
 // Four locals: the source wrapper (once), the fresh destination backing, and two i32
@@ -252,43 +253,37 @@ export function spreadDstBackSlot(kind: MfKind, row: i32, seq: i32) {
   scratchSlot(21, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
 }
 
-// The arm block's tail value, seen through to the initializer when the tail names a local of
-// the arm's own prelude that no scope has bound yet: a classifier asked before the arm lowers
-// (a global's cell, say) would otherwise read the name as unbound (D2785).
+// The arm block's tail value, seen through to the initializer when the tail reads a local of
+// the arm's own prelude that has no slot in the frame being emitted: a classifier asked outside
+// that frame (a global's cell, say) would otherwise read the name as unbound (D2785).
 export function armTailValue(blockIx: i32): i32 {
   const tv = ifArmValueExpr(blockIx)
   if tv < 0 { return tv }
   const b = nodeAt(blockIx)
-  if b is Block {
-    let cur = tv
-    let before = b.blkStmts.length - 1
-    let going = true
-    while going {
-      going = false
-      const n = nodeAt(unwrapParen(cur))
-      if n is Ident {
-        if scopeSlotOf(n.identName) < 0 {
-          let i = before - 1
-          while i >= 0 {
-            const d = nodeAt(b.blkStmts[i])
-            if d is LetDecl {
-              if d.letName == n.identName {
-                if d.letInit >= 0 {
-                  cur = d.letInit
-                  before = i
-                  going = true
-                }
-                i = -1
-              }
-            }
-            i = i - 1
-          }
+  if !(b is Block) { return tv }
+  let cur = tv
+  let before = b.blkStmts.length - 1
+  let going = true
+  while going {
+    going = false
+    const un = unwrapParen(cur)
+    const d = if un >= 0 && nodeAt(un) is Ident && declaredSlotOf(un) < 0 { identDeclOf(un) } else { -1 }
+    let i = before - 1
+    while d >= 0 && i >= 0 {
+      const s = b.blkStmts[i]
+      const sn = nodeAt(s)
+      if sn is LetDecl && letIsCopyOf(s, d) {
+        if sn.letInit >= 0 {
+          cur = sn.letInit
+          before = i
+          going = true
         }
+        i = -1
       }
+      i = i - 1
     }
-    return cur
   }
-  tv
+  cur
 }
 
 // The tail value of the if-expression's first arm that is not a bare `null`, following an

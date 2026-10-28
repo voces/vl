@@ -43,10 +43,8 @@ import {
   parentLetAtPos,
   parentLetOf,
   parentLetOfAt,
-  parentLetOfSid,
   parentLetOwnerOf,
   parentLetReadAt,
-  parentLoopAt,
   retF32Flag,
   retF64Flag,
   retI64Flag,
@@ -93,7 +91,13 @@ import {
   rlElemKindTbl,
 } from "./emit_state"
 import { tyPrimLeafElemName } from "./emit_struct_order"
-import { identDeclOf, sidArrGet, sidLookup, sidOf, sidOfNode } from "./symbols"
+import {
+  declOrigOf,
+  identDeclOf,
+  sidArrGet,
+  sidLookup,
+  sidOfNode,
+} from "./symbols"
 import { memCstrMsg } from "./check_demands"
 
 // The `$fnsig` param-spine token for parameter `paramIx` — one token per distinct param
@@ -680,14 +684,6 @@ export function globalIndexOf(name: string) {
   sidArrGet(globalIndexBySid, sidLookup(name))
 }
 
-// The interned id of `name` as read at node `atIx`: the identifier's own carrier when it has one,
-// which is an array read where interning the text is a hash probe.
-export function readSidOf(name: string, atIx: i32): i32 {
-  const s = sidOfNode(atIx)
-  if s >= 0 { return s }
-  sidOf(name)
-}
-
 // Whether one of the `Param` nodes `params` binds `sid`.
 export function fnHasParamSid(params: i32[], sid: i32): boolean {
   if sid < 0 { return false }
@@ -735,18 +731,6 @@ function bodyOriginOf(bodyIx: i32): i32 {
   b
 }
 
-// Whether a loop variable of `sid` is in scope at the read at `atIx` of the body at `bodyIx`,
-// placed as `bodyReadLet` places it; false where the position cannot decide.
-export function bodyReadInLoop(bodyIx: i32, sid: i32, atIx: i32): boolean {
-  if bodyIx < 0 || atIx < 0 || atIx >= bodyIx || emitRootIx < 0 { return false }
-  if bodyIx <= emitRootIx { return parentLoopAt(bodyIx, sid, atIx) >= 0 }
-  const tb = bodyOriginOf(bodyIx)
-  if tb < 0 || atIx >= tb { return false }
-  parentLoopAt(tb, sid, atIx) >= 0
-}
-
-// The `LetDecl` of the body block at `bodyIx` that a read of `name` at node `atIx` denotes, or
-// -1 when the read denotes no body `let`. Where the position cannot decide, by name.
 // Whether `exprIx` is a call or an element read, or a read of a local of frame `fnIx` bound to
 // one: a value typed elsewhere, whose join the instance did not build (D3358).
 export function readIsCallResult(exprIx: i32, fnIx: i32): boolean {
@@ -757,7 +741,7 @@ export function readIsCallResult(exprIx: i32, fnIx: i32): boolean {
   if !(e is Ident) || fnIx < 0 { return false }
   const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return false }
-  const li = bodyLetReadAt(fn.fnBody, e.identName, u)
+  const li = bodyLetOfRead(fn.fnBody, u)
   if li < 0 { return false }
   const d = nodeAt(li)
   if !(d is LetDecl) || d.letInit < 0 { return false }
@@ -765,16 +749,38 @@ export function readIsCallResult(exprIx: i32, fnIx: i32): boolean {
   ie is Call || ie is Index
 }
 
-export function bodyLetReadAt(bodyIx: i32, name: string, atIx: i32): i32 {
-  const sid = readSidOf(name, atIx)
-  let r = PL_READ_UNPLACED
-  if atIx >= 0 && atIx < bodyIx && bodyIx <= emitRootIx {
-    r = parentLetReadAt(bodyIx, sid, atIx)
-  } else {
-    r = bodyReadLet(bodyIx, sid, atIx)
+// The `LetDecl` of the body block at `bodyIx` that the name read at `atIx` denotes, or -1 when
+// its declaration is no `let` of that body: the declaration itself, or the body's copy of it.
+export function bodyLetOfRead(bodyIx: i32, atIx: i32): i32 {
+  if bodyIx < 0 || atIx < 0 { return -1 }
+  bodyLetOfDecl(bodyIx, identDeclOf(unwrapParen(atIx)))
+}
+
+// Whether the `LetDecl` at `letIx` is declaration `d` or a copy of it: one minted from it, or
+// the one a rebuilt body re-declared at its position.
+export function letIsCopyOf(letIx: i32, d: i32): boolean {
+  if letIx == d { return true }
+  if letIx < 0 || d < 0 { return false }
+  if declOrigOf(letIx) == d || declOrigOf(d) == letIx { return true }
+  const a = nodeAt(letIx)
+  const b = nodeAt(d)
+  if a is LetDecl && b is LetDecl {
+    return a.pos >= 0 && a.pos == b.pos && a.letName == b.letName
   }
-  if r != PL_READ_UNPLACED { return r }
-  parentLetOfSid(bodyIx, sid)
+  false
+}
+
+// The `LetDecl` of the body block at `bodyIx` that is declaration `d` or a copy of it, or -1.
+// An instance body shares its template's leaves and re-declares each `let` at its position.
+export function bodyLetOfDecl(bodyIx: i32, d: i32): i32 {
+  if bodyIx < 0 || d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) { return -1 }
+  const sid = sidOfNode(d)
+  if parentLetOwnerOf(bodyIx, sid, d) >= 0 { return d }
+  const o = declOrigOf(d)
+  if o >= 0 && parentLetOwnerOf(bodyIx, sid, o) >= 0 { return o }
+  parentLetAtPos(bodyIx, sid, dn.pos)
 }
 
 // `parentLetOfAt` for a read at `atIx`: where the position decides, a binding must also be in
@@ -805,13 +811,6 @@ export function paramReadAt(fnIx: i32, atIx: i32): boolean {
   !paramShadowedInBody(fnIx, sidOfNode(atIx))
 }
 
-// `paramTypeNode` for the read of `name` at node `atIx`: -1 where a binding shadows the parameter.
-export function paramTypeNodeAt(fnIx: i32, name: string, atIx: i32): i32 {
-  const pt = paramTypeNode(fnIx, name)
-  if pt < 0 || paramReadAt(fnIx, atIx) { return pt }
-  -1
-}
-
 // True if parameter `name` of `fnIx` is a nullable union variant (`Circle | null`, kind
 // `nulvariant`).
 export function paramNulVariant(fnIx: i32, name: string) {
@@ -832,14 +831,14 @@ export function popUnionBoxElem(slot: i32): boolean {
   rlElemKindTbl[slot] == RLK_UNION
 }
 
-// The `LetDecl` a read of `name` at node `atIx` denotes in frame `fnIx`, or -1 — the
-// function-frame twin of `globalLetOfIn`, asked only where the emit-time declared-locals table
-// cannot speak. That table holds the frame being emitted, so `fnIx == emitCurFnIx` already had
-// its answer; the env struct is typed in the type section, with no frame current (D1633).
-export function frameLetOf(fnIx: i32, name: string, atIx: i32) {
+// The `LetDecl` the read at node `atIx` denotes in frame `fnIx`, or -1 — the function-frame
+// twin of `globalLetOfIn`, asked only where the emit-time declared-locals table cannot speak.
+// That table holds the frame being emitted, so `fnIx == emitCurFnIx` already had its answer;
+// the env struct is typed in the type section, with no frame current (D1633).
+export function frameLetOf(fnIx: i32, atIx: i32) {
   if fnIx < 0 { return -1 }
   if fnIx == emitCurFnIx { return -1 }
   const fn = nodeAt(fnIx)
-  if fn is FuncDecl { return bodyLetReadAt(fn.fnBody, name, atIx) }
+  if fn is FuncDecl { return bodyLetOfRead(fn.fnBody, atIx) }
   -1
 }
