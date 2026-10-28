@@ -435,8 +435,8 @@ import {
   declaredNulMap,
   declaredString,
   frameChainBindsName,
-  isScalarBackedListRep,
   letMapKeyKind,
+  listRepOfFieldCode,
   lrGen,
   lrMemoFn,
   lrMemoGen,
@@ -447,7 +447,6 @@ import {
   paramString,
   popRecvOf,
   popTakesElem,
-  rlElemListRep,
   vkListClass,
 } from "./emit_list_rep"
 import {
@@ -497,7 +496,6 @@ import {
   arrLitCommitNameAt,
   mvUnionIsScalarNull,
   mvValInnerRlSlotAt,
-  mvValTyIxAt,
   nonNulBaseOf,
   rlElemIsNulNiche,
   structIdxOfElemTy,
@@ -555,9 +553,7 @@ import {
   isSName,
   mapAnnShape,
   mapRecordedCallShape,
-  nulScalarListCodeKind,
   nulScalarListKindOfNode,
-  nulScalarListKindOfTy,
   nulVariantIndexOf,
   paramMapShape,
   repABNote,
@@ -623,7 +619,6 @@ import {
   paramIsClosure,
   paramMap,
   paramNulClosure,
-  paramNulList,
   paramTypeNode,
 } from "./emit_query"
 import {
@@ -661,7 +656,6 @@ import {
   repSigTokOfKind,
   repVariantShapeRowOf,
   sFieldElemTyIxAt,
-  tyIsI32LeafElem,
   tyIsNulScalarBox,
   unRowOfKey,
 } from "./emit_rep"
@@ -727,8 +721,6 @@ import {
   annSigKeyTy,
   calleeNodeSigKey,
   cloNameSigKeyTy,
-  declaredNulClosure,
-  declaredNulList,
   declaredStruct,
   declaredStructIndex,
   declaredVariantIndex,
@@ -742,7 +734,6 @@ import {
   letAnnIsUnion,
   mfI32ResultOrColumn,
   mvNulListValKind,
-  optChainLeafNulListKind,
   outerFrameBinds,
   paramStructIndex,
   paramVariantIndex,
@@ -798,7 +789,6 @@ import {
   FC_MAP,
   FC_NUL_BOOL,
   FC_NUL_CLOSURE,
-  FC_NUL_I32_LIST,
   FC_NUL_LIT_UNION,
   FC_NUL_MAP,
   FC_NUL_NONE,
@@ -1723,16 +1713,6 @@ function globalIsMapSid(fnIx: i32, sid: i32, atIx: i32) {
   letIsMap(li, -1)
 }
 
-function globalIsNulListSid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  // `letIsNulListInfer`, not the annotation-only `letIsNulList`: an un-annotated global
-  // bound to a nullable-list producer carries the nullable-list cell too, and
-  // `globalCellKind`'s un-annotated arm uses the same predicate, so the read and the cell
-  // agree by construction.
-  letIsNulListInfer(li, -1)
-}
-
 // True if the global `name` is a nullable map.
 function globalIsNulMapSid(fnIx: i32, sid: i32, atIx: i32) {
   const li = globalLetOfSidIn(fnIx, sid, atIx)
@@ -2039,19 +2019,8 @@ export function letPopUnionBoxElem(letIx: i32, fnIx: i32): boolean {
   false
 }
 
-// The ref-list element kind a checked read over a nested list yields, or -1 (D1210).
-// `xs.pop()` over an `i32[][]` is `i32[] | null` to the checker and the popped value is the
-// inner list's wrapper, so each nullable-list classifier claims it at its own element kind.
-// No `rlElemNullable` bit is asked: a pop is nullable by construction.
-function popRefElemKind(exprIx: i32, fnIx: i32): i32 {
-  const slot = popRefRecvSlot(exprIx, fnIx)
-  if slot >= 0 && slot < rlElemKindTbl.length { return rlElemKindTbl[slot] }
-  -1
-}
-
 // The receiver's ref-list slot of a checked read over a nested list, or -1 — the row every
-// question about the read element asks, its kind in `popRefElemKind` and its inner slot in
-// `nulRefArrayInnerSlot`. `.get(i)` counts for the same reason `.pop()` does (D1281): both
+// question about the read element asks, such as its inner slot in `nulRefArrayInnerSlot`. `.get(i)` counts for the same reason `.pop()` does (D1281): both
 // are `T | null` over the same receiver and both yield the inner list's wrapper.
 function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return -1 }
@@ -2086,221 +2055,15 @@ function popArmElemVariantRow(exprIx: i32, fnIx: i32): i32 {
   rlElemVariantRow(slot)
 }
 
-// True if evaluating the expression at `exprIx` yields a nullable i32-list ref — a
-// nullable-list-annotated param, local or global reference, or a `rest: i32[] | null` field
-// read. The nullable-list dual of `exprNullableStruct`: list-op read sites consult it to
-// insert the `ref.as_non_null` recover, which cannot trap since the checker guards the read.
-export function exprNullableList(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  const e = nodeAt(exprIx)
-  if e is Paren { return exprNullableList(e.parInner, fnIx) }
-  // An `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
-  const nlIfL = nulIfArmNullableValueIx(exprIx)
-  if nlIfL >= 0 {
-    if exprNullableList(nlIfL, fnIx) { return true }
-  }
-  // An if-expression with a null arm over an i32-list arm — see `nulArmIfThenValueIx`.
-  // An empty `[]` arm is that list only when its pinned element is `i32` (D2209).
-  const elIfL = nulArmIfThenValueIx(exprIx)
-  if elIfL >= 0 {
-    const elHk = emptyArrHoleKind(elIfL)
-    if elHk != null && elHk != "list" { return false }
-    // A distinct-backing arm is that leaf's niche, which `exprArray` would also claim (D2236).
-    if exprNulScalarListKind(exprIx, fnIx) != null { return false }
-    return exprArray(elIfL, fnIx)
-  }
-  if e is Ident {
-    if (
-      paramNulList(fnIx, e.identName)
-      && paramReadAt(fnIx, e.identName, exprIx)
-    ) {
-      return true
-    }
-    if declaredNulList(e.identName) { return true }
-    // A captured `i32[] | null`: the env field is the same `(ref null $lTypeIdx)` cell, the
-    // list twin of the `nulstr` capture arm and this arm's fourth storage class.
-    if capturedKindOf(fnIx, e.identName) == "nullist" { return true }
-    return globalIsNulListSid(fnIx, sidOfNode(exprIx), exprIx)
-  }
-  if e is Member { return memberFieldCode(exprIx, fnIx) == FC_NUL_I32_LIST }
-  // The `?.` twin of the field read above: `o?.xs` over `o: T | null` has type
-  // `i32[] | null` whatever the field's own nullability, so both list codes answer here
-  // where only the nullable one does for a `.` (D1676).
-  if e is OptMember {
-    const olc = optChainLeafFieldCode(exprIx, fnIx)
-    return olc == FC_I32_LIST || olc == FC_NUL_I32_LIST
-  }
-  // Indexing a `(i32[] | null)[]`, a ref list whose element slot keeps the `| null`, yields
-  // a nullable i32 list: the read leaves `(ref null $lTypeIdx)`, so `if t != null` narrows.
-  if e is Index {
-    if exprRefArray(e.idxArr, fnIx) {
-      const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if slot >= 0 && slot < rlElemNullable.length {
-        if rlElemKindTbl[slot] == RLK_I32_LIST && rlElemNullable[slot] == 1 {
-          return true
-        }
-      }
-    }
-    // The map read is the same niche one container over (D1039): a read of a list-valued
-    // map yields `i32[] | null` — a miss is the null — and the vals element is already
-    // `(ref null $lTypeIdx)`. One arm covers the inline `if m[k] != null` and, through
-    // `letIsNulListInfer`, the un-annotated binding; any value on the i32 list's backing counts.
-    const mvSh = mapShapeOfExpr(e.idxArr, fnIx)
-    if mvSh >= 0 && mvSh < mvValName.length {
-      if tyScalarListKind(mvValTyIxAt(mvSh)) == "list" { return true }
-      // D1107 — the value's own `| null`, which the test above declines (an `i32[] | null`
-      // value is not itself an array), while `globalCellKind` reads the element kind. Asked
-      // of the element kind here too, so the cell and the read come from one home.
-      if mvNulListValKind(mvSh) == "nullist" { return true }
-    }
-  }
-  // A call whose annotated return is `i32[] | null` yields a nullable list, so an
-  // un-annotated `const r = f(…)` infers the nullable-list kind and narrows with
-  // `if r != null`. Mirrors the niche-nullable call inference for bool and string returns.
-  if e is Call {
-    // `xs.pop()` over an `i32[][]` — the member callee the Ident and closure legs below
-    // cannot see (D1210).
-    if popRefElemKind(exprIx, fnIx) == RLK_I32_LIST { return true }
-    if e.callFn < 0 { return false }
-    const callee = nodeAt(e.callFn)
-    if callee is Ident {
-      const target = fnIndexOfNode(e.callFn)
-      if target >= 0 {
-        const fn = nodeAt(fnStmts[target])
-        if fn is FuncDecl {
-          if fn.fnRet >= 0 { return nodeRepIs(fn.fnRet, "nullist", fnIx) }
-        }
-      }
-      // A closure-value call whose resolved sig result is the nullable i32-backed list
-      // (`>o`), so an un-annotated `const t0 = v()` infers the nullable-list kind and
-      // narrows with `if t0 != null`.
-      return calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nullist"
-    }
-    return cloValueCallRetKind(exprIx, fnIx) == "nullist"
-  }
-  // `u as? i32[]` out of a union box yields the arm's list or null.
-  if e is AsExpr {
-    if tyIsI32LeafElem(tyArrayElemIx(asUnionNulArmTy(exprIx, fnIx))) {
-      return true
-    }
-  }
-  // `p ?? d` over the same niche stays `i32[] | null` exactly when the default can still be
-  // null — the consumer half of `emitCoalesce`'s nullable-collection arm. `exprArray` claims
-  // the rep in both halves; only the nullability is this classifier's question.
-  const nlLhs = coalesceNicheLhs(exprIx)
-  if nlLhs >= 0 {
-    if exprNullableList(nlLhs, fnIx) {
-      return coalesceNicheStaysNullable(exprIx, fnIx)
-    }
-  }
-  false
+// Whether the value at `exprIx` is an `i32[] | null` the checker has not narrowed present.
+export function exprNullableList(exprIx: i32, fnIx: i32): boolean {
+  exprNulKind(exprIx, fnIx) == "nullist"
 }
 
-// True if `exprIx` yields a nullable ref-array (`i32[][] | null`) — the ref-array analogue
-// of `exprNullableList`. An `Index` over a `(T[] | null)[]`, a ref list whose element slot
-// keeps the `| null`, reads `(ref null $innerWrapper)`, so `if t != null` narrows.
-export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  const e = nodeAt(exprIx)
-  if e is Paren { return exprNullableRefArray(e.parInner, fnIx) }
-  // An `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
-  const nlIfR = nulIfArmNullableValueIx(exprIx)
-  if nlIfR >= 0 {
-    if exprNullableRefArray(nlIfR, fnIx) { return true }
-  }
-  // An if-expression with a null arm over a ref-array arm — see `nulArmIfThenValueIx`.
-  const elIfR = nulArmIfThenValueIx(exprIx)
-  if elIfR >= 0 { return exprRefArray(elIfR, fnIx) }
-  if e is AsExpr {
-    if unMemIsRefElemArray(asUnionNulArmTy(exprIx, fnIx)) { return true }
-  }
-  if e is Index {
-    // The map read (D1039), the sibling of `exprNullableList`'s map arm, which carries the
-    // reason one arm covers both the inline `if m[k] != null` and the un-annotated binding.
-    const mvSh = mapShapeOfExpr(e.idxArr, fnIx)
-    if mvSh >= 0 && mvSh < mvValName.length {
-      if mvValInnerRlSlotAt(mvSh) >= 0 { return true }
-      // D1107 — the ref twin of the `nullist` rung: a `{[string]: S[] | null}` value name
-      // carries the `| null` the name test cannot read past.
-      if mvNulListValKind(mvSh) == "nulreflist" { return true }
-    }
-  }
-  if e is Ident {
-    if declaredKind(e.identName) == "nulreflist" { return true }
-    // A nulreflist param (`p: i32[][] | null`) — its `!= null` narrow reads the
-    // `(ref null $wrapper)` niche exactly like the local.
-    if (
-      paramNulRefArray(fnIx, e.identName)
-      && paramReadAt(fnIx, e.identName, exprIx)
-    ) {
-      return true
-    }
-    // A captured nulreflist binding, asked of the ladder that typed the env field, so the
-    // `!= null` compare reads the `(ref null $wrapper)` niche instead of falling through to
-    // the non-nullable path, where the bare `null` reaches `emitNullLitNode` with no seed.
-    if capturedKindOf(fnIx, e.identName) == "nulreflist" { return true }
-    // A module-global nulreflist binding, keyed on `globalCellKind` — the cell's own answer
-    // — not on `letIsNulRefArray`, so the read and the cell can never disagree. For an
-    // un-annotated global `letIsNulRefArray` claims it through the initializer while the
-    // cell takes another kind, and that disagreement is invalid wasm; left refused.
-    const gnra = globalLetOfIn(fnIx, e.identName, exprIx)
-    if gnra >= 0 { return globalCellKind(gnra) == "nulreflist" }
-    return false
-  }
-  // A `recv.f` read of a nullable ref-list field (code 28) yields a nullable ref array.
-  if e is Member { return memberFieldCode(exprIx, fnIx) == FC_NUL_REF_LIST }
-  // The `?.` twin of the arm above, one code wider: the receiver's `| null` makes even a
-  // non-nullable ref-list field's read nullable (D1676).
-  if e is OptMember {
-    const orc = optChainLeafFieldCode(exprIx, fnIx)
-    return orc == FC_REF_LIST || orc == FC_NUL_REF_LIST
-  }
-  if e is Index {
-    if exprRefArray(e.idxArr, fnIx) {
-      const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if slot >= 0 && slot < rlElemNullable.length {
-        if rlElemKindTbl[slot] == RLK_REF_LIST && rlElemNullable[slot] == 1 {
-          return true
-        }
-      }
-    }
-  }
-  // A call whose annotated return is `<ref-array> | null` yields a nullable ref array, so an
-  // un-annotated `const t = mk(…)` infers the kind and narrows with `if t != null`. Mirrors
-  // the nullable-i32-list call inference in `exprNullableList`.
-  if e is Call {
-    // `g.pop()` over an `S[][]` — the nested-ref sibling of `exprNullableList`'s pop leg (D1210).
-    if popRefElemKind(exprIx, fnIx) == RLK_REF_LIST { return true }
-    if e.callFn < 0 { return false }
-    const callee = nodeAt(e.callFn)
-    if callee is Ident {
-      if (
-        fnRetNulRefArrayNameSid(
-          sidOfNode(e.callFn),
-          callee.identName,
-          fnIx,
-          e.callFn,
-        )
-        != ""
-      ) {
-        return true
-      }
-    }
-    // A function-value callee whose signature's result is a nullable ref list (D5882).
-    if sigKeyRetKind(cloCallSigKey(exprIx, fnIx)) == "nulreflist" {
-      return true
-    }
-  }
-  // `p ?? d` over the same niche stays `<ref-array> | null` exactly when the default can
-  // still be null — the consumer half of `emitCoalesce`'s nullable-collection arm for the
-  // ref-array family; `exprRefArray` claims the rep in both halves.
-  const nraLhs = coalesceNicheLhs(exprIx)
-  if nraLhs >= 0 {
-    if exprNullableRefArray(nraLhs, fnIx) {
-      return coalesceNicheStaysNullable(exprIx, fnIx)
-    }
-  }
-  false
+// Whether the value at `exprIx` is a ref list (`S[] | null`, `i32[][] | null`) the checker has
+// not narrowed present.
+export function exprNullableRefArray(exprIx: i32, fnIx: i32): boolean {
+  exprNulKind(exprIx, fnIx) == "nulreflist"
 }
 
 // The inner ref-list slot of a nullable ref-array expression — a local stores it in
@@ -2471,123 +2234,11 @@ export function letNulScalarListKind(letIx: i32, fnIx: i32): VKind | null {
   null
 }
 
-// The nullable-scalar-list `VKind` an expression yields, or null — the per-leaf analogue of
-// `exprNullableList`'s call-inference arm (an un-annotated `const r = f()`).
+// The nullable distinct-backing list kind (`nulstrlist`, `nulf64list`, …) of the value at
+// `exprIx`, or null for any other value, a narrowed one included.
 export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
-  if exprIx < 0 { return null }
-  const e = nodeAt(exprIx)
-  if e is Paren { return exprNulScalarListKind(e.parInner, fnIx) }
-  // An `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
-  const nlIfK = nulIfArmNullableValueIx(exprIx)
-  if nlIfK >= 0 {
-    const nlk = exprNulScalarListKind(nlIfK, fnIx)
-    if nlk != null { return nlk }
-  }
-  // An if-expression with a null arm over a distinct-backing scalar-list arm — see
-  // `nulArmIfThenValueIx`. The four leaf kinds in `ifExprRefKind`'s own order.
-  const elIfK = nulArmIfThenValueIx(exprIx)
-  if elIfK >= 0 {
-    if exprStringArray(elIfK, fnIx) { return "nulstrlist" }
-    if exprU8Array(elIfK, fnIx) { return "nulu8list" }
-    if exprF32Array(elIfK, fnIx) { return "nulf32list" }
-    if exprF64Array(elIfK, fnIx) { return "nulf64list" }
-    if exprI64Array(elIfK, fnIx) { return "nuli64list" }
-    return null
-  }
-  // `u as? f64[]` out of a union box: the arm's distinct-backing list or null.
-  if e is AsExpr {
-    const asl = asUnionNulArmTy(exprIx, fnIx)
-    if asl >= 0 { return nulScalarListKindOfTy(asl) }
-  }
-  if e is Index {
-    // The map read (D1039), the sibling of `exprNullableList`'s map arm, which carries the
-    // reason one arm covers both the inline `if m[k] != null` and the un-annotated binding.
-    const mvSh = mapShapeOfExpr(e.idxArr, fnIx)
-    if mvSh >= 0 && mvSh < mvValName.length {
-      // The read's niche is the value type's `| null` twin, asked of the type the slot banks.
-      const slk = nulScalarListKindOfTy(mvValTyIxAt(mvSh))
-      if slk != null { return slk }
-      // D1107 — the element-kind rung, for a value that is already nullable, which the rung
-      // above answers for neither leaf. Same one home as the `nullist` and `nulreflist` siblings.
-      const mvSlk = mvNulListValKind(mvSh)
-      if isNulScalarListKind(mvSlk) { return mvSlk }
-    }
-  }
-  if e is Ident {
-    // A nullable-scalar-list param, a same-kind local (`const t0 = v`), a capture, or a
-    // global cell — the four storage classes a binding of this niche can have.
-    const pk = nulScalarListKindOfNode(
-      paramTypeNodeAt(fnIx, e.identName, exprIx),
-    )
-    if pk != null { return pk }
-    const dk = declaredKind(e.identName)
-    if isNulScalarListKind(dk) { return dk }
-    // A captured leaf-list cell, asked of the ladder that typed the env field, so the read
-    // and the field can never disagree about the wrapper. The `nullist`, `nulreflist` and
-    // `nulvariant` arms of the sibling classifiers are the same rung on other niches.
-    const ck = capturedKindOf(fnIx, e.identName)
-    if isNulScalarListKind(ck) { return ck }
-    const gl = globalLetOfIn(fnIx, e.identName, exprIx)
-    if gl >= 0 { return letNulScalarListKind(gl, fnIx) }
-  }
-  if e is Call {
-    // `xs.pop()` over a `string[][]` / `f64[][]` / `i64[][]` / `f32[][]` — the
-    // distinct-backing siblings of `exprNullableList`'s pop leg (D1210).
-    const pek = rlElemListRep(popRefElemKind(exprIx, fnIx))
-    if isScalarBackedListRep(pek) {
-      if pek != null { return vkNulNicheOf(pek) }
-    }
-    if e.callFn < 0 { return null }
-    const callee = nodeAt(e.callFn)
-    if callee is Ident {
-      const target = fnIndexOfNode(e.callFn)
-      if target >= 0 {
-        const fn = nodeAt(fnStmts[target])
-        if fn is FuncDecl {
-          if fn.fnRet >= 0 { return nulScalarListKindOfNode(fn.fnRet) }
-        }
-      }
-      // A closure-value call whose resolved sig result is one of these niches (D2399).
-      const cvk = calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn)
-      if isNulScalarListKind(cvk) { return cvk }
-    }
-    const ovk = cloValueCallRetKind(exprIx, fnIx)
-    if isNulScalarListKind(ovk) { return ovk }
-  }
-  // A field read of a nullable distinct-backing scalar list (codes 31 to 34) yields the
-  // leaf's `(ref null $wrapper)`, so an un-annotated `const l = s.f` binds the matching
-  // nullable local kind and `l != null` narrows it. The dual of the code-18 `Member` arm.
-  if e is Member { return nulScalarListCodeKind(memberFieldCode(exprIx, fnIx)) }
-  // The `?.` twin of the arm above, one code set wider: the receiver's `| null` makes even a
-  // non-nullable list field's read nullable (D1676).
-  if e is OptMember {
-    return optChainLeafNulListKind(optChainLeafFieldCode(exprIx, fnIx))
-  }
-  // Indexing a `(f64[] | null)[]`, a ref list whose element slot keeps the `| null`, yields
-  // the nullable leaf list: the read leaves `(ref null $wrapper)`, so `if t != null` narrows.
-  // The distinct-backing dual of `exprNullableList`'s `Index` arm.
-  if e is Index {
-    if exprRefArray(e.idxArr, fnIx) {
-      const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if slot >= 0 && slot < rlElemNullable.length {
-        if rlElemNullable[slot] == 1 {
-          const k = rlElemListRep(rlElemKindTbl[slot])
-          if isScalarBackedListRep(k) {
-            if k != null { return vkNulNicheOf(k) }
-          }
-        }
-      }
-    }
-  }
-  // `p ?? d` over the same niche stays the nullable leaf list exactly when the default can
-  // still be null — the consumer half of `emitCoalesce`'s nullable-collection arm for the
-  // distinct-backing family; the non-null half is the leaf list.
-  const nskLhs = coalesceNicheLhs(exprIx)
-  if nskLhs >= 0 {
-    if coalesceNicheStaysNullable(exprIx, fnIx) {
-      return exprNulScalarListKind(nskLhs, fnIx)
-    }
-  }
+  const k = exprNulKind(exprIx, fnIx)
+  if isNulScalarListKind(k) { return k }
   null
 }
 
@@ -2629,12 +2280,87 @@ export function exprNulKind(exprIx: i32, fnIx: i32): VKind | null {
 // The kind of the cell a `null`-narrowed read names: a name's cell, or a field's by its code.
 // `nulnone` when the read names no cell, since the value is then the `null` unit itself.
 function nulNoneReadCellKind(exprIx: i32, fnIx: i32): VKind {
+  const ck = readCellKind(exprIx, fnIx)
+  if ck != null { return ck }
+  "nulnone"
+}
+
+// The kind of the cell a read takes its value from: a name's cell, or a field's storage. A
+// code-15 field is stored nullable whether it is declared `S` or `S | null`. Null for a node
+// that names no cell, or a field whose storage is not a nullable niche.
+function readCellKind(exprIx: i32, fnIx: i32): VKind | null {
   const ck = identCellVKind(exprIx, fnIx)
   if ck != null { return ck }
   const fc = memberFieldCode(unwrapParen(exprIx), fnIx)
   if fc == FC_NUL_STR { return "nulstr" }
   if fc == FC_NUL_BOOL { return "nulbool" }
-  "nulnone"
+  if fc == FC_STRUCT { return "nulstruct" }
+  if fc == FC_NUL_CLOSURE { return "nulclosure" }
+  if fc == FC_NUL_MAP { return "nulmap" }
+  const lk = listRepOfFieldCode(fc)
+  if lk == null { return null }
+  vkNulKindOf(lk)
+}
+
+// Does the read at `exprIx` hold a nullable ref its recorded rep says is present? The checker
+// narrowed it to the cell's non-null twin, so the read recovers and every consumer sees the
+// read's recorded rep. A `string | null` read keeps its own eager rule.
+export function readOwesNonNullRecover(exprIx: i32, fnIx: i32): boolean {
+  const ck = readCellKind(exprIx, fnIx)
+  if ck == null { return false }
+  const tw = vkNonNullRefTwin(ck)
+  if tw == null { return false }
+  const d = repOfNode(exprIx, fnIx)
+  d.rdCovered == 1 && d.rdKind == tw
+}
+
+// Can the cell the read at `exprIx` names hold null, whatever the read narrows to? A
+// question about the storage before any guard, such as a loop prologue's hoisted header.
+export function readCellHoldsNullRef(exprIx: i32, fnIx: i32): boolean {
+  const ck = readCellKind(exprIx, fnIx)
+  ck != null && vkNonNullRefTwin(ck) != null
+}
+
+// The non-null twin of a nullable ref kind, or null for a kind that is not one.
+function vkNonNullRefTwin(k: VKind): VKind | null {
+  match k {
+    "nulvariant" => {
+      return "variant"
+    }
+    "nulstruct" => {
+      return "struct"
+    }
+    "nullist" => {
+      return "list"
+    }
+    "nulreflist" => {
+      return "reflist"
+    }
+    "nulclosure" => {
+      return "closure"
+    }
+    "nulstrlist" => {
+      return "strlist"
+    }
+    "nulf64list" => {
+      return "f64list"
+    }
+    "nuli64list" => {
+      return "i64list"
+    }
+    "nulf32list" => {
+      return "f32list"
+    }
+    "nulu8list" => {
+      return "u8list"
+    }
+    "nulmap" => {
+      return "map"
+    }
+    "nulstr" | "nulbool" | "nulnone" | "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "i64" | "f64" | "f64list" | "f32" | "closure" | "i64list" | "f32list" | "u8list" | "v128" => {
+      return null
+    }
+  }
 }
 
 // `k` when it is a nullable niche kind, else null.
@@ -8960,18 +8686,6 @@ function coalDefaultEndsInHoleMapRead(defIx: i32, fnIx: i32): boolean {
   coalHoleMapReadIx(dix, fnIx)
 }
 
-// The HALF a non-map `??` result lands in — `true` the NULLABLE half, `false` the non-null one
-// (and `false` for a node that is not a `??`, which no caller asks). `coalesceDefaultNullable`
-// stays THE nullability decision; this is only its `??`-node accessor, so a consumer classifier
-// reaches the default without re-deriving its arena index beside `coalesceNicheLhs`.
-function coalesceNicheStaysNullable(exprIx: i32, fnIx: i32) {
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is BinExpr {
-    if e.binOp == "??" { return coalesceDefaultNullable(e.binRight, fnIx) }
-  }
-  false
-}
-
 // True when the default of a `K | null` `??` reps as that niche's own i32 — a bare `null`,
 // an atom place/field/call, another `K | null`, a member literal, or a chain (structural,
 // never banked). A member literal is decided by lexeme membership (`litLexIsMember`),
@@ -12694,98 +12408,10 @@ export function letIsNulNone(letIx: i32, fnIx: i32): boolean {
   false
 }
 
-// True if the expression at `exprIx` is a NULLABLE function value (`fn | null`, kind 19) —
-// currently a kind-19 local ident. Drives the `== null` / `!= null` test (`ref.is_null`)
-// and the narrowed-call recover, the closure analogue of `exprNullableStruct`.
-export function exprNulClosure(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  // The arena rung, ahead of the name-shaped ones: the checker records `TyNullable` over
-  // `TyFunc` for every spelling that yields one, including a call whose callee INFERRED the
-  // niche and so carries no annotation for the ladder below to read. Structural, so nothing
-  // but the nullable-closure rep claims it (D1622).
-  if nodeRepIs(exprIx, "nulclosure", fnIx) { return true }
-  // An if-EXPRESSION whose arm is ITSELF nullable — see `nulIfArmNullableValueIx` (D1560).
-  const nlIfC = nulIfArmNullableValueIx(exprIx)
-  if nlIfC >= 0 {
-    if exprNulClosure(nlIfC, fnIx) { return true }
-  }
-  const ux = unwrapParen(exprIx)
-  if ux < 0 { return false }
-  const e = nodeAt(ux)
-  match e {
-    Ident => {
-      if (
-        paramNulClosure(fnIx, e.identName)
-        && paramReadAt(fnIx, e.identName, ux)
-      ) {
-        return true
-      }
-      if declaredNulClosure(e.identName) { return true }
-      // A CAPTURED `((…) => R) | null` cell — the env field is the same
-      // `(ref null $cloStruct)` fat pointer, typed by `captureValKind`.
-      if capturedKindOf(fnIx, e.identName) == "nulclosure" { return true }
-      // A module-global nullable-closure cell (kind 19).
-      const gl = globalLetOfIn(fnIx, e.identName, ux)
-      if gl >= 0 { return globalCellKind(gl) == "nulclosure" }
-      return false
-    }
-    // A call of a function whose return type is a nullable closure: the result is the kind-19
-    // niche `(ref null $cloStruct)`. A named function reads its `fnRet`; a closure-typed value
-    // callee is answered by the arena rung above. Drives local-kind inference and the
-    // `f != null` compare, the closure analogue of `exprNullableStruct`.
-    Call => {
-      if e.callFn < 0 { return false }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        const t = fnIndexOfNode(e.callFn)
-        if t >= 0 {
-          const cfn = nodeAt(fnStmts[t])
-          if cfn is FuncDecl { return nulCloFlag(cfn.fnRet) == 1 }
-        }
-      }
-      // An indexed closure-array element call, or a struct-field closure call whose resolved
-      // `$fnsig` result is the nullable-closure niche: the result is the kind-19 `(ref null
-      // $cloStruct)`. Uses the same `cloCallSigKey` resolution the call emit casts with, so the
-      // classification and the cast always agree.
-      return sigKeyRetKind(cloCallSigKey(ux, fnIx)) == "nulclosure"
-    }
-    // A nullable-closure struct FIELD read (`recv.op` over a `((i32) => i32) | null` field,
-    // code 22): the raw `(ref null $cloStruct)` — its `!= null` lowers to `ref.is_null` and
-    // the narrowed call recovers non-null (`ref.as_non_null`) at the call site.
-    Member => {
-      return memberFieldCode(ux, fnIx) == FC_NUL_CLOSURE
-    }
-    // A bare `m[k]` over a FUNCTION-valued map (mv kind 14) reads back a NULLABLE closure
-    // `(ref null $cloStruct)` — `const f = m[k]` binds the kind-19 niche, narrowed `if f != null`.
-    Index => {
-      // Indexing a `(((i32) => boolean) | null)[]` (a kind-5 ref list whose element slot keeps
-      // the `| null`) yields a NULLABLE closure — the read left it `(ref null $cloStruct)`, so
-      // `const f = xs[i]; if f != null` narrows. The closure dual of `exprNullableList`'s arm.
-      if exprRefArray(e.idxArr, fnIx) {
-        const slot = refListSlotOfExpr(e.idxArr, fnIx)
-        if slot >= 0 && slot < rlElemNullable.length {
-          if rlElemKindTbl[slot] == RLK_CLOSURE && rlElemNullable[slot] == 1 {
-            return true
-          }
-        }
-      }
-      const mrs = mapReadMvSlot(ux, fnIx)
-      if mrs >= 0 { return mvValKind[mrs] == MVK_CLOSURE }
-    }
-    // A `m[k] ?? d` read over a nullable-closure-valued map stays nullable only when the
-    // default is itself nullable; a non-null default coalesces every null (stored included)
-    // to the non-null closure — the closure dual of `exprNullableStruct`'s coalesce arm.
-    BinExpr => {
-      const cns = coalesceMvSlot(ux, fnIx)
-      if cns >= 0 {
-        return mvValKind[cns] == MVK_CLOSURE
-          && coalesceStaysNullable(ux, cns, fnIx)
-      }
-    }
-    // No other expression is a nullable closure by its own form.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
+// Whether the value at `exprIx` is a function value `fn | null` the checker has not narrowed
+// present.
+export function exprNulClosure(exprIx: i32, fnIx: i32): boolean {
+  exprNulKind(exprIx, fnIx) == "nulclosure"
 }
 
 // True if an UN-annotated `const f = <init>` should infer a NULLABLE-closure (kind 19) slot —
