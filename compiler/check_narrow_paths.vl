@@ -122,16 +122,16 @@ import {
 import {
   crNoNames,
   crOpOf,
-  crwAnyWrites,
   crwEnsure,
   crwFnHandle,
   crwFnMentions,
-  crwFnWrites,
   crwFns,
   crwMentionsAny,
   crwRoot,
   crwUseKinds,
   crwUseNames,
+  crwWrites,
+  crwWritten,
 } from "./check_capture_walks"
 import { cwPeel, fnDeclIx } from "./check_write_scan"
 import { weUnresDrop } from "./check_write_effects"
@@ -158,11 +158,10 @@ import {
   crCurRoot,
   crFirstBank,
   crFnBase,
-  crInfoKey,
   crIsNarrowLayer,
   crNameAssignedInRoot,
+  crSlotKey,
   crWidenedAt,
-  crWriteKey,
 } from "./check_capture_widen"
 
 // Flow-narrowed property paths: a stack of `key → type-arena index` entries (`"o.v" → i32`)
@@ -723,20 +722,20 @@ export function crFnReBase(): i32 {
 // name or mentions a reacher's name; it escapes when it is unbound, or its name is used other
 // than as a callee or an assignment target, inside another reacher or not.
 function crInfoOf(s: i32): i32 {
-  const name = slotNameOf(s)
   const root = crCurRoot()
-  if root == crProgRoot { crAskProg("w", name) }
-  // A name no nested function writes, under either key, has no reacher: the cheap answer.
-  if (
-    root == crwRoot
-    && !crwAnyWrites.has(name)
-    && !crwAnyWrites.has(name + "@")
-  ) {
-    return 0
+  if root == crProgRoot { crAskProg("w", slotNameOf(s)) }
+  const wk = crSlotKey(s)
+  // A binding no nested function writes has no reacher: the cheap answer.
+  if root == crwRoot && !crwWritten(wk) { return 0 }
+  let memo = crInfoMemo[root]
+  if memo == null {
+    const fresh: {[i32]: i32} = Map()
+    crInfoMemo[root] = fresh
+    crHandleMemo[root] = Map()
+    memo = fresh
   }
-  const wk = crWriteKey(s)
-  const key = i32ToStr(root) + "#" + wk
-  const hit = crInfoMemo[key]
+  const m = memo ?? crNoInfo
+  const hit = m[wk]
   if hit is i32 { return hit }
   crwEnsure(root)
   let info = 0
@@ -744,11 +743,9 @@ function crInfoOf(s: i32): i32 {
   const reach: boolean[] = []
   let any = false
   let j = 0
-  if !crwAnyWrites.has(name) && !crwAnyWrites.has(wk) { j = crwFns.length }
+  if !crwWritten(wk) { j = crwFns.length }
   while j < crwFns.length {
-    const fw = crwFnWrites[j]
-    // A binding local to a nested function is written also by writes resolving there.
-    const w = fw.has(name) || fw.has(wk)
+    const w = crwWrites(j, wk)
     reach.push(w)
     if w {
       any = true
@@ -784,10 +781,22 @@ function crInfoOf(s: i32): i32 {
       u = u + 1
     }
   }
-  crInfoMemo[key] = info
-  crHandleMemo[key] = handles
+  m[wk] = info
+  const hm = crHandleMemo[root]
+  if hm != null { hm[wk] = handles }
   info
 }
+
+const crNoInfo: {[i32]: i32} = Map()
+
+// The names the calls reaching a writer of slot `s` use, under the current root (`crInfoOf`).
+function crHandlesOf(s: i32): string[] {
+  const hm = crHandleMemo[crCurRoot()]
+  if hm == null { return crNoNames }
+  (hm ?? crNoHandles)[crSlotKey(s)] ?? crNoNames
+}
+
+const crNoHandles: {[i32]: string[]} = Map()
 
 // The bare-name half of `callMayWrite`: the call names a function that can reach a writer of
 // slot `s`, or a writer escaped and the call is not one that provably runs none of it. An operator
@@ -849,7 +858,7 @@ function crCallReachesInRoot(callIx: i32, s: i32): boolean {
 // Asked of every declaration of `op`, since which one dispatched is the receiver's business.
 function crOpIsReacher(op: string, s: i32): boolean {
   if op == "" { return true }
-  const hs = crHandleMemo[crInfoKey(s)] ?? crNoNames
+  const hs = crHandlesOf(s)
   let i = 0
   while i < hs.length {
     if hs[i] == op || opDeclOpOf(hs[i]) == op { return true }
@@ -863,7 +872,7 @@ function crOpIsReacher(op: string, s: i32): boolean {
 function crCallNodeReaches(cn: Call, callIx: i32, s: i32): boolean {
   const info = crInfoOf(s)
   if info == 0 { return false }
-  const hs = crHandleMemo[crInfoKey(s)] ?? crNoNames
+  const hs = crHandlesOf(s)
   const cname = calleeNameOf(callIx)
   if cname != "?" && strListHas(hs, cname) { return true }
   if cn.callFn >= 0 && nodeAt(cn.callFn) is FuncDecl { return true }

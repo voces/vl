@@ -1,9 +1,9 @@
 // A top-level function's captured narrowings (D2529): `crRootCaptureWiden` rebinds, at its
 // declared type, each module binding the body reads whose narrowing a write elsewhere may end
 // before the function runs. With it go the steps the capture-retire analysis shares: the current
-// root and body base (`crCurRoot`, `crFnBase`), the writer key and memo key of a name, the narrowing
-// bank lookups (`crFirstBank`, `crInnerRowBelow`, `crOuterWidest`), the widened-binding rows, the
-// names a body reads, and whether a call or subtree runs user code (`crCallBenign`,
+// root and body base (`crCurRoot`, `crFnBase`), the writer key of a slot (`crSlotKey`), the
+// narrowing bank lookups (`crFirstBank`, `crInnerRowBelow`, `crOuterWidest`), the widened-binding
+// rows, the names a body reads, and whether a call or subtree runs user code (`crCallBenign`,
 // `crSubtreeBenign`). The checker owns the steps that report; nothing here imports it.
 import {
   BinExpr,
@@ -25,7 +25,6 @@ import {
   crCapLossBank,
   crCapWidenBank,
   crFnBases,
-  crFnIxs,
   crFnRoots,
   crProgRoot,
   crReadLists,
@@ -36,17 +35,18 @@ import {
 } from "./check_capture_rows"
 import {
   crAssignTarget,
+  crKeyHit,
   crNoNames,
   crNodeTok,
   crNulledBuilt,
-  crNulledNames,
+  crNulledKeys,
+  crNulledSids,
   crNulledWalk,
   crRhsNonNull,
-  crsReset,
   crwBound,
   crwEnsure,
+  crwUseKeys,
   crwUseKinds,
-  crwUseNames,
 } from "./check_capture_walks"
 import { inferQuiet } from "./check_cursor"
 import {
@@ -71,6 +71,8 @@ import {
 import { T } from "./check_types"
 import { crArgMayBeFn, crIsScalarRender } from "./check_write_effects"
 import { strListWith } from "./listutil"
+import { sidLookup } from "./symbols"
+import { cwKeyOfDecl, cwKeySame } from "./check_write_scan"
 
 export function crFnBase(): i32 {
   if crFnBases.length == 0 { return 0 }
@@ -82,28 +84,13 @@ export function crCurRoot(): i32 {
   crFnRoots[crFnRoots.length - 1]
 }
 
-// The key the writer analysis answers slot `s` under: its name for a binding of the root's own
-// level or the module, which no write resolving inside a nested function can reach, else
-// `name@`, which also counts those writes. Unsure is `name@`, the answer ending more narrowings.
-export function crWriteKey(s: i32): string {
-  if crSlotAtRootLevel(s) { return slotNameOf(s) }
-  slotNameOf(s) + "@"
-}
-
-// The memo key of `crInfoOf(s)` under the current root.
-export function crInfoKey(s: i32): string {
-  i32ToStr(crCurRoot()) + "#" + crWriteKey(s)
-}
-
-// Whether slot `s` is, under its narrowing layers, a binding declared outside every function
-// body being checked or in the body of the current root itself.
-function crSlotAtRootLevel(s: i32): boolean {
-  const d = crBindDepthOfSlot(s)
-  if d < 0 { return false }
-  let f = crFnBases.length - 1
-  while f >= 0 && crFnBases[f] > d { f = f - 1 }
-  if f < 0 { return true }
-  crFnIxs[f] == crCurRoot()
+// The binding key the writer analysis answers slot `s` under: its declaration's `cwKeyOfDecl`,
+// or for an ambient slot the key standing for every binding of its name.
+export function crSlotKey(s: i32): i32 {
+  if s >= 0 { return cwKeyOfDecl(s) }
+  const sid = sidLookup(slotNameOf(s))
+  if sid < 0 { return -1 }
+  -2 - sid
 }
 
 // A call that runs no user code and whose function-valued arguments, if any, are lambdas written
@@ -263,30 +250,35 @@ export function crRootCaptureWiden(fnIx: i32) {
 function crRootLoses(fnIx: i32, s: i32, kind: i32): boolean {
   if kind != NAR_KIND_ASG { return crNameAssignedInProgram(s) }
   const name = slotNameOf(s)
-  crNameNulledInProgram(name) || !crRootMayKeep(fnIx, name)
+  crNameNulledInProgram(s) || !crRootMayKeep(fnIx, name)
 }
 
-// Whether slot `s`'s name is the target of an assignment in the current root.
+// Whether slot `s`'s binding is the target of an assignment in the current root.
 export function crNameAssignedInRoot(s: i32): boolean {
-  const name = slotNameOf(s)
-  if crCurRoot() == crProgRoot { crAskProg("w", name) }
-  const key = crInfoKey(s)
-  const hit = crAsgMemo[key]
+  const root = crCurRoot()
+  if root == crProgRoot { crAskProg("w", slotNameOf(s)) }
+  const key = crSlotKey(s)
+  let memo = crAsgMemo[root]
+  if memo == null {
+    const fresh: {[i32]: boolean} = Map()
+    crAsgMemo[root] = fresh
+    memo = fresh
+  }
+  const m = memo ?? crNoAsg
+  const hit = m[key]
   if hit is boolean { return hit }
-  crwEnsure(crCurRoot())
-  // A write resolving to a nested function's own binding (kind 3) counts only for such a binding.
-  let inner = 2
-  if crWriteKey(s) != name { inner = 3 }
+  crwEnsure(root)
   let found = false
   let u = 0
-  while u < crwUseNames.length && !found {
-    const k = crwUseKinds[u]
-    if (k == 2 || k == inner) && crwUseNames[u] == name { found = true }
+  while u < crwUseKeys.length && !found {
+    if crwUseKinds[u] == 2 && cwKeySame(crwUseKeys[u], key) { found = true }
     u = u + 1
   }
-  crAsgMemo[key] = found
+  m[key] = found
   found
 }
+
+const crNoAsg: {[i32]: boolean} = Map()
 
 // Whether slot `s` is declared at module scope, looking through its narrowing layers.
 export function crNameIsModuleTop(s: i32): boolean {
@@ -310,15 +302,14 @@ function crNameAssignedInProgram(s: i32): boolean {
 
 // Whether an assignment anywhere in the program may store `null` into the module binding `name`:
 // one whose right side is not a non-null literal, and whose target does not resolve to a binding
-// local to a function. One walk of the program answers every name.
-export function crNameNulledInProgram(name: string): boolean {
-  crAskProg("w", name)
+// local to a function. One walk of the program answers every binding.
+export function crNameNulledInProgram(s: i32): boolean {
+  crAskProg("w", slotNameOf(s))
   if !crNulledBuilt {
     crNulledBuilt = true
-    crsReset()
-    crNulledWalk(crProgRoot, 0)
+    crNulledWalk(crProgRoot)
   }
-  crNulledNames[name] ?? false
+  crKeyHit(crNulledKeys, crNulledSids, crSlotKey(s))
 }
 
 // Whether a top-level function `fnIx` may keep an assignment narrowing of module binding `name`:
