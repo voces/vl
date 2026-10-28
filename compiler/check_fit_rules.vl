@@ -4844,6 +4844,89 @@ export function repStampableLit(x: i32): boolean {
   false
 }
 
+// Whether node `x` delivers a bare `null` literal: itself, a value join's leaf, or a list
+// literal's element at any depth.
+export function deliversNullLit(x: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  if valueJoinAt(x) < 0 {
+    const p = parenPeelIx(x)
+    if p < 0 || p >= P.nodes.length { return false }
+    return nodeAt(p) is NullLit || elemDeliversNullLit(p)
+  }
+  for l in valueTailLeaves(x) {
+    if nodeAt(l) is NullLit || elemDeliversNullLit(l) { return true }
+  }
+  false
+}
+
+// Whether node `x` is a list literal one of whose elements delivers a bare `null`.
+function elemDeliversNullLit(x: i32): boolean {
+  const n = nodeAt(x)
+  if n is ArrayLit {
+    for e in n.arrElems {
+      if deliversNullLit(e) { return true }
+    }
+  }
+  false
+}
+
+// Stamps each bare `null` the value at `x` hands over, among its join leaves or its list
+// elements, with the type it is consumed at: the join's type `ty`, or a list's element type. A
+// leaf a delivery already stamped keeps that stamp, which names its destination.
+export function stampNullLeaves(x: i32, ty: i32) {
+  if x < 0 || ty < 0 || !stampsStand() { return 0 }
+  const n = nodeAt(x)
+  if n is ArrayLit {
+    const et = tyArrayElemIx(ty)
+    if !nullNamesOwnNull(et) { return 0 }
+    for e in n.arrElems { stampNullAt(parenPeelIx(e), et, false) }
+    return 0
+  }
+  if !nullNamesOwnNull(ty) { return 0 }
+  stampNullJoinLeaves(x, ty, false)
+}
+
+// Stamps each bare `null` among the join leaves of `x` with `ty`; `over` replaces a stamp.
+function stampNullJoinLeaves(x: i32, ty: i32, over: boolean) {
+  for l in valueTailLeaves(x) {
+    if l != x { stampNullAt(l, ty, over) }
+  }
+  0
+}
+
+// Stamps a bare `null` an inferred function returns as `v`, itself or among its join leaves, with
+// the function's return type `ret`. A return is a delivery, so it replaces a join's stamp.
+export function stampNullReturn(v: i32, ret: i32) {
+  if v < 0 || ret < 0 || !stampsStand() || !tyAdmitsNull(ret) { return 0 }
+  stampNullAt(parenPeelIx(v), ret, true)
+  stampNullJoinLeaves(v, ret, true)
+}
+
+// Whether a `null` delivered at type `ty` is a null of its own rather than the bottom ref: the
+// `boolean | null` and string-literal-union sentinels, or a `string | null`'s typed null. A type
+// variable answers no: each instance's elaboration stamps at its own types.
+function nullNamesOwnNull(ty: i32): boolean {
+  if ty < 0 || !tyAdmitsNull(ty) { return false }
+  const inner = nonNullTy(ty)
+  if inner < 0 { return false }
+  const pn = primNameOf(inner)
+  pn == "boolean" || pn == "string" || tyIsLitUnion(inner)
+}
+
+// Stamps the node `l` with `ty` when it is a bare `null` and `ty` names a null of its own; a stamp
+// already there stays unless `over`.
+function stampNullAt(l: i32, ty: i32, over: boolean) {
+  if !(nodeAt(l) is NullLit) || !nullNamesOwnNull(ty) { return 0 }
+  if over {
+    return repStamp(l, ty)
+  } else if elabCapLive() {
+    if (elabCapRep[l] ?? -1) >= 0 { return 0 }
+  } else if l < nodeRepTyIx.length && nodeRepTyIx[l] >= 0 {
+    return 0
+  }
+  repStamp(l, ty)
+}
+
 // Whether node `x` evaluates to a fresh, un-aliased value, so it may be built as its
 // destination (D3339): a record, list or `null` literal, or a call the checker resolved to the
 // ambient `Map` or `Set` constructor. A user's own `Map` is not one.
@@ -5087,8 +5170,9 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
     // A `null` at a nullable record is that record's null, stamped with the record, or with the
     // type parameter an instance binds.
     NullLit => {
-      if !(d is TyObj) && !(d is TyVar) { return 0 }
-      return repStamp(srcExpr, dtix)
+      if d is TyObj || d is TyVar { return repStamp(srcExpr, dtix) }
+      if nullNamesOwnNull(dstTy) { return repStamp(srcExpr, dstTy) }
+      return 0
     }
     // A value `if`, `match` or block delivers each arm's value to the same destination.
     IfStmt | Block | MatchExpr => {
