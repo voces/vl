@@ -739,10 +739,12 @@ import {
   lhKind,
   lhLen,
   lhLive,
-  lhName,
   lhOpen,
-  lhScanName,
+  lhProp,
+  lhRoot,
+  lhScanProp,
   lhScanRep,
+  lhScanRoot,
   lhSlot,
   lhStart,
   mapTypeIdxOf,
@@ -751,8 +753,8 @@ import {
   nulScalarListFieldWrapHeap,
   nulScalarListWrapHeap,
   pushFieldStorage,
+  rpDecl,
   rpRow,
-  rpVar,
   urBase,
   urSlot,
   urVal,
@@ -1420,6 +1422,7 @@ import {
   variantFieldIndex,
 } from "./emit_variant_sig"
 import {
+  declOrigOf,
   identDeclOf,
   identFrom,
   memberDeclOf,
@@ -15905,13 +15908,15 @@ function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
 // the arm asking. The rep check is the backstop that makes a classifier disagreement
 // between the prologue and the access decline, rather than read a wrongly-typed local.
 function liveHoistRow(exprIx: i32, kind: MfKind, slot: i32) {
-  const nm = hoistPathName(exprIx)
-  if nm == "" { return 0 - 1 }
+  const d = hoistPathDecl(exprIx)
+  if d < 0 { return 0 - 1 }
+  const p = hoistPathProp(exprIx)
   let k = 0
-  while k < lhName.length {
+  while k < lhRoot.length {
     if (
       lhLive[k] > 0
-      && lhName[k] == nm
+      && lhRoot[k] == d
+      && lhProp[k] == p
       && lhKind[k] == kind
       && lhSlot[k] == slot
     ) {
@@ -15922,27 +15927,38 @@ function liveHoistRow(exprIx: i32, kind: MfKind, slot: i32) {
   0 - 1
 }
 
-// The name a hoist row caches the receiver at `ix` under: a bare identifier's own name, or
-// `b.xs` for a field of one; "" for any other receiver. `.` opens no identifier, so the two
-// forms never collide.
-function hoistPathName(ix: i32): string {
-  if ix < 0 || ix >= P.nodes.length { return "" }
+// The declaration a hoist row caches the receiver at `ix` under, with `hoistPathProp`'s field:
+// a bare identifier's, or the root identifier's of a field `b.xs`; -1 for any other receiver.
+function hoistPathDecl(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 - 1 }
   const e = nodeAt(ix)
-  if e is Member {
-    const root = hoistRootName(e.memObj)
-    if root == "" { return "" }
-    return root + "." + e.memProp
-  }
-  hoistRootName(ix)
+  if e is Member { return hoistRootDecl(e.memObj) }
+  hoistRootDecl(ix)
 }
 
-// The name of the bare identifier at `ix`, or "" for any other node: the one receiver a hoist
-// row keys on by itself, and the only root a field path may have.
-function hoistRootName(ix: i32): string {
+// The field a hoist row caches at `ix`: `xs` for `b.xs`, "" for the binding itself.
+function hoistPathProp(ix: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const e = nodeAt(ix)
-  if e is Ident { return e.identName }
+  if e is Member { return e.memProp }
   ""
+}
+
+// The declaration of the bare identifier at `ix`, or -1 for any other node or an identifier
+// that resolves to none: the only root a hoist row keys on.
+function hoistRootDecl(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 - 1 }
+  const e = nodeAt(ix)
+  if e is Ident { return hoistDeclKey(identDeclOf(ix)) }
+  0 - 1
+}
+
+// Declaration `d` as the one it is minted from, so an instance body's copy and its reads agree.
+function hoistDeclKey(d: i32) {
+  if d < 0 { return d }
+  const o = declOrigOf(d)
+  if o >= 0 { return o }
+  d
 }
 
 // Whether field receiver `memIx` (`b.xs`, `b` an identifier) lowers to one `struct.get` of a
@@ -15994,13 +16010,20 @@ function stmtAssignsProp(ix: i32, prop: string): boolean {
   false
 }
 
-// Find (or mint) the hoist row for `name` at list rep (`kind`, `slot`). Minting
-// takes two slots of the lazy list frame — the backing ref (`liBack` 3, typed as
+// Find (or mint) the hoist row for receiver (`d`, `prop`) at list rep (`kind`, `slot`).
+// Minting takes two slots of the lazy list frame — the backing ref (`liBack` 3, typed as
 // this kind's backing array) and the i32 `len` (`liBack` 4).
-function listHoistRow(name: string, kind: MfKind, slot: i32) {
+function listHoistRow(d: i32, prop: string, kind: MfKind, slot: i32) {
   let k = 0
-  while k < lhName.length {
-    if lhName[k] == name && lhKind[k] == kind && lhSlot[k] == slot { return k }
+  while k < lhRoot.length {
+    if (
+      lhRoot[k] == d
+      && lhProp[k] == prop
+      && lhKind[k] == kind
+      && lhSlot[k] == slot
+    ) {
+      return k
+    }
     k = k + 1
   }
   liKinds.push(kind)
@@ -16011,14 +16034,15 @@ function listHoistRow(name: string, kind: MfKind, slot: i32) {
   liSlots.push(slot)
   liBack.push(4)
   const lSlot = listIdxScratchBase + liKinds.length
-  lhName.push(name)
+  lhRoot.push(d)
+  lhProp.push(prop)
   lhKind.push(kind)
   lhSlot.push(slot)
   lhBack.push(bSlot)
   lhLen.push(lSlot)
   lhStart.push(0 - 1) // a list header has no `start`
   lhLive.push(0)
-  lhName.length - 1
+  lhRoot.length - 1
 }
 
 // A raw-string row is keyed (kind "i32", slot -1) — distinct from the i32-LIST rows, which
@@ -16026,14 +16050,14 @@ function listHoistRow(name: string, kind: MfKind, slot: i32) {
 // `hoistRowIsStr` reads the same pair.
 function hoistRowIsStr(row: i32) { lhKind[row] == "i32" && lhSlot[row] < 0 }
 
-// Find (or mint) the hoist row for raw string binding `name`, minting three slots of the
-// lazy list frame (backing ref, `start`, `len`). Safe because the header is loop-invariant
+// Find (or mint) the hoist row for raw string receiver (`d`, `prop`), minting three slots of
+// the lazy list frame (backing ref, `start`, `len`). Safe because the header is loop-invariant
 // by construction — strings are immutable and there is no string element store — so only a
-// rebinding of the name can invalidate the cache, which `blockReboundsName` already refuses.
-function strHoistRow(name: string) {
+// rebinding of the declaration can invalidate the cache, which `blockRebindsDecl` refuses.
+function strHoistRow(d: i32, prop: string) {
   let k = 0
-  while k < lhName.length {
-    if lhName[k] == name && hoistRowIsStr(k) { return k }
+  while k < lhRoot.length {
+    if lhRoot[k] == d && lhProp[k] == prop && hoistRowIsStr(k) { return k }
     k = k + 1
   }
   liKinds.push("i32")
@@ -16048,14 +16072,15 @@ function strHoistRow(name: string) {
   liSlots.push(0)
   liBack.push(4)
   const slSlot = listIdxScratchBase + liKinds.length
-  lhName.push(name)
+  lhRoot.push(d)
+  lhProp.push(prop)
   lhKind.push("i32")
   lhSlot.push(0 - 1)
   lhBack.push(sbSlot)
   lhLen.push(slSlot)
   lhStart.push(stSlot)
   lhLive.push(0)
-  lhName.length - 1
+  lhRoot.length - 1
 }
 
 // Mint a fresh lazy-list-frame slot typed as list kind `kind`'s backing array — the same
@@ -16376,10 +16401,10 @@ function hoistSafeBlock(ix: i32, fnIx: i32): boolean {
   false
 }
 
-// True when `name` is REBOUND anywhere in the expression at `ix` — only an
-// `name = …` assignment can do that in an expression. Runs over an already
-// whitelisted body, so the enumeration matches `hoistSafeExpr`'s exactly.
-function exprReboundsName(ix: i32, name: string): boolean {
+// True when declaration `d` is assigned anywhere in the expression at `ix` — only an `x = …`
+// rebinds in an expression, and one whose target resolves to no declaration counts. Runs
+// over an already whitelisted body, so the enumeration matches `hoistSafeExpr`'s exactly.
+function exprRebindsDecl(ix: i32, d: i32): boolean {
   if ix < 0 { return false }
   const e = nodeAt(ix)
   match e {
@@ -16387,37 +16412,38 @@ function exprReboundsName(ix: i32, name: string): boolean {
       if e.binOp == "=" {
         const lhs = nodeAt(e.binLeft)
         if lhs is Ident {
-          if lhs.identName == name { return true }
+          const ld = identDeclOf(e.binLeft)
+          if ld < 0 || hoistDeclKey(ld) == d { return true }
         }
       }
-      if exprReboundsName(e.binLeft, name) { return true }
-      return exprReboundsName(e.binRight, name)
+      if exprRebindsDecl(e.binLeft, d) { return true }
+      return exprRebindsDecl(e.binRight, d)
     }
     Unary => {
-      return exprReboundsName(e.unArg, name)
+      return exprRebindsDecl(e.unArg, d)
     }
     Paren => {
-      return exprReboundsName(e.parInner, name)
+      return exprRebindsDecl(e.parInner, d)
     }
     IsExpr => {
-      return exprReboundsName(e.isObj, name)
+      return exprRebindsDecl(e.isObj, d)
     }
     AsExpr => {
-      return exprReboundsName(e.asObj, name)
+      return exprRebindsDecl(e.asObj, d)
     }
     Member => {
-      return exprReboundsName(e.memObj, name)
+      return exprRebindsDecl(e.memObj, d)
     }
     Index => {
-      if exprReboundsName(e.idxArr, name) { return true }
-      return exprReboundsName(e.idxIndex, name)
+      if exprRebindsDecl(e.idxArr, d) { return true }
+      return exprRebindsDecl(e.idxIndex, d)
     }
     Call => {
-      if exprReboundsName(e.callFn, name) { return true }
+      if exprRebindsDecl(e.callFn, d) { return true }
       const args = e.callArgs
       let a = 0
       while a < args.length {
-        if exprReboundsName(args[a], name) { return true }
+        if exprRebindsDecl(args[a], d) { return true }
         a = a + 1
       }
     }
@@ -16427,71 +16453,71 @@ function exprReboundsName(ix: i32, name: string): boolean {
   false
 }
 
-// True when `name` is REBOUND anywhere in the statement at `ix`: a `let`/`const`
-// that shadows it, a loop variable that takes the spelling, or an assignment to
-// it. Any of the three means the body's `name` is not the wrapper the prologue
-// cached.
-function stmtReboundsName(ix: i32, name: string): boolean {
+// True when declaration `d` is declared or assigned anywhere in the statement at `ix`: a
+// `let`/`const` or a loop variable that is `d`, or an assignment to it. Either means the body's
+// `d` is not the wrapper the prologue cached.
+function stmtRebindsDecl(ix: i32, d: i32): boolean {
   if ix < 0 { return false }
   const s = nodeAt(ix)
   if s is LetDecl {
-    if s.letName == name { return true }
-    return exprReboundsName(s.letInit, name)
+    if hoistDeclKey(ix) == d { return true }
+    return exprRebindsDecl(s.letInit, d)
   }
-  if s is RetStmt { return exprReboundsName(s.retArg, name) }
+  if s is RetStmt { return exprRebindsDecl(s.retArg, d) }
   if s is BreakStmt { return false }
   if s is ContinueStmt { return false }
-  if s is Block { return blockReboundsName(ix, name) }
+  if s is Block { return blockRebindsDecl(ix, d) }
   if s is IfStmt {
-    if exprReboundsName(s.ifCond, name) { return true }
-    if stmtReboundsName(s.ifThen, name) { return true }
-    return stmtReboundsName(s.ifElse, name)
+    if exprRebindsDecl(s.ifCond, d) { return true }
+    if stmtRebindsDecl(s.ifThen, d) { return true }
+    return stmtRebindsDecl(s.ifElse, d)
   }
   if s is WhileStmt {
-    if exprReboundsName(s.whileCond, name) { return true }
-    return stmtReboundsName(s.whileBody, name)
+    if exprRebindsDecl(s.whileCond, d) { return true }
+    return stmtRebindsDecl(s.whileBody, d)
   }
   if s is ForRange {
-    if s.frVar == name { return true }
-    if exprReboundsName(s.frFrom, name) { return true }
-    if exprReboundsName(s.frTo, name) { return true }
-    if exprReboundsName(s.frStep, name) { return true }
-    return stmtReboundsName(s.frBody, name)
+    if hoistDeclKey(ix) == d { return true }
+    if exprRebindsDecl(s.frFrom, d) { return true }
+    if exprRebindsDecl(s.frTo, d) { return true }
+    if exprRebindsDecl(s.frStep, d) { return true }
+    return stmtRebindsDecl(s.frBody, d)
   }
   if s is ForIn {
-    if s.fiVar == name { return true }
-    if s.fiVar2 == name { return true }
-    if exprReboundsName(s.fiIter, name) { return true }
-    return stmtReboundsName(s.fiBody, name)
+    if hoistDeclKey(s.fiDecl1) == d || hoistDeclKey(s.fiDecl2) == d {
+      return true
+    }
+    if exprRebindsDecl(s.fiIter, d) { return true }
+    return stmtRebindsDecl(s.fiBody, d)
   }
-  exprReboundsName(ix, name)
+  exprRebindsDecl(ix, d)
 }
 
-function blockReboundsName(ix: i32, name: string): boolean {
+function blockRebindsDecl(ix: i32, d: i32): boolean {
   if ix < 0 { return false }
   const b = nodeAt(ix)
   if b is Block {
     const stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
-      if stmtReboundsName(stmts[i], name) { return true }
+      if stmtRebindsDecl(stmts[i], d) { return true }
       i = i + 1
     }
   }
   false
 }
 
-// Record one index receiver identifier and the `Index` node it is first seen on. The
+// Record one index receiver (`d`, `prop`) and the `Index` node it is first seen on. The
 // representative node is what the rep classifiers are asked about later, so the first
-// sighting is kept — every later sighting of the same spelling in this body names the
-// same binding (the caller has already established the body does not rebind it).
-function hoistScanAdd(name: string, idxIx: i32) {
+// sighting is kept — every later sighting of the same receiver reads the same binding.
+function hoistScanAdd(d: i32, prop: string, idxIx: i32) {
   let i = 0
-  while i < lhScanName.length {
-    if lhScanName[i] == name { return 0 }
+  while i < lhScanRoot.length {
+    if lhScanRoot[i] == d && lhScanProp[i] == prop { return 0 }
     i = i + 1
   }
-  lhScanName.push(name)
+  lhScanRoot.push(d)
+  lhScanProp.push(prop)
   lhScanRep.push(idxIx)
   0
 }
@@ -16502,8 +16528,8 @@ function hoistScanExpr(ix: i32) {
   match e {
     Index => {
       hmIdxSeen = hmIdxSeen + 1
-      const pn = hoistPathName(e.idxArr)
-      if pn != "" { hoistScanAdd(pn, ix) }
+      const pd = hoistPathDecl(e.idxArr)
+      if pd >= 0 { hoistScanAdd(pd, hoistPathProp(e.idxArr), ix) }
       hoistScanExpr(e.idxArr)
       hoistScanExpr(e.idxIndex)
       return 0
@@ -16591,22 +16617,22 @@ function hoistScanBlock(ix: i32) {
 // is not one of the reps the guard hoists. The cascade mirrors `emitIndex`'s own order,
 // so a row is only minted for a rep whose access path the hoisted guard can actually
 // serve; the nullable arms, checked first exactly as there, decline.
-function hoistRowOfRecv(recvIx: i32, name: string, fnIx: i32) {
+function hoistRowOfRecv(recvIx: i32, d: i32, prop: string, fnIx: i32) {
   // A cell that can hold null declines, however the read narrows: the prologue reads the
   // header above the null guard, and in a loop condition in front of `ref.is_null`.
   if readCellHoldsNullRef(recvIx, fnIx) { return 0 - 1 }
   if exprRefArray(recvIx, fnIx) {
     if !raUsed { return 0 - 1 }
-    return listHoistRow(name, "ref", refListSlotOfExpr(recvIx, fnIx))
+    return listHoistRow(d, prop, "ref", refListSlotOfExpr(recvIx, fnIx))
   }
   if exprNulStrArray(recvIx, fnIx) || exprStringArray(recvIx, fnIx) {
     if !slUsed { return 0 - 1 }
-    return listHoistRow(name, "str", 0)
+    return listHoistRow(d, prop, "str", 0)
   }
   const ek = scalarListElemKind(recvIx, fnIx)
   if ek != null {
     if !scalarListUsed(ek) { return 0 - 1 }
-    return listHoistRow(name, listIdxKindOf(ek), 0)
+    return listHoistRow(d, prop, listIdxKindOf(ek), 0)
   }
   // A raw string receiver is checked last, after every list rep, so `exprString` never
   // gets a chance to answer for one. The `| null` niche declines too, for the same reason
@@ -16615,7 +16641,7 @@ function hoistRowOfRecv(recvIx: i32, name: string, fnIx: i32) {
   if exprString(recvIx, fnIx) {
     if !aUsed { return 0 - 1 }
     if exprNullableString(recvIx, fnIx) { return 0 - 1 }
-    return strHoistRow(name)
+    return strHoistRow(d, prop)
   }
   0 - 1
 }
@@ -16646,36 +16672,30 @@ function loopHoistOpen(
   condIx: i32,
   bodyIx: i32,
   fnIx: i32,
-  ownVar: string,
-  ownVar2: string,
+  ownDecl: i32,
+  ownDecl2: i32,
   ec: ExpCtx,
 ) {
   if !hoistSafeExpr(condIx, fnIx) { return 0 }
   if !hoistSafeBlock(bodyIx, fnIx) { return 0 }
-  lhScanName = []
+  lhScanRoot = []
+  lhScanProp = []
   lhScanRep = []
   hoistScanExpr(condIx)
   hoistScanBlock(bodyIx)
+  const own = hoistDeclKey(ownDecl)
+  const own2 = hoistDeclKey(ownDecl2)
   let opened = 0
   let i = 0
-  while i < lhScanName.length {
-    const nm = lhScanName[i]
+  while i < lhScanRoot.length {
     // A field path `b.xs` is held to its root's rebinding, to no write of any `xs` field in
     // the loop, and to a receiver that reads as one plain `struct.get`.
-    let root = nm
-    let prop = ""
+    const root = lhScanRoot[i]
+    const prop = lhScanProp[i]
     const scanned = nodeAt(lhScanRep[i])
-    if scanned is Index {
-      const recv = nodeAt(scanned.idxArr)
-      if recv is Member {
-        const ro = nodeAt(recv.memObj)
-        if ro is Ident { root = ro.identName }
-        prop = recv.memProp
-      }
-    }
-    let ok = root != ownVar && root != ownVar2
-    if ok && exprReboundsName(condIx, root) { ok = false }
-    if ok && blockReboundsName(bodyIx, root) { ok = false }
+    let ok = root != own && root != own2
+    if ok && exprRebindsDecl(condIx, root) { ok = false }
+    if ok && blockRebindsDecl(bodyIx, root) { ok = false }
     if ok && prop != "" {
       if stmtAssignsProp(condIx, prop) || stmtAssignsProp(bodyIx, prop) {
         ok = false
@@ -16691,7 +16711,7 @@ function loopHoistOpen(
         // A view's cached header is its snapshot, refreshed here; a store through an index in
         // the loop would miss it (D3028).
         if !svHoistBlocked(rep.idxArr, fnIx, condIx, bodyIx) {
-          row = hoistRowOfRecv(rep.idxArr, nm, fnIx)
+          row = hoistRowOfRecv(rep.idxArr, root, prop, fnIx)
         }
         if row >= 0 && lhLive[row] == 0 {
           if hoistRowIsStr(row) {
@@ -16729,11 +16749,18 @@ function loopHoistOpen(
   opened
 }
 
-// The live list (not raw-string) hoist row cached for binding `name`, or -1.
-function liveListRowNamed(name: string) {
+// The live list (not raw-string) hoist row cached for receiver (`d`, `prop`), or -1.
+function liveListRowOf(d: i32, prop: string) {
   let k = 0
-  while k < lhName.length {
-    if lhLive[k] > 0 && lhName[k] == name && !hoistRowIsStr(k) { return k }
+  while k < lhRoot.length {
+    if (
+      lhLive[k] > 0
+      && lhRoot[k] == d
+      && lhProp[k] == prop
+      && !hoistRowIsStr(k)
+    ) {
+      return k
+    }
     k = k + 1
   }
   0 - 1
@@ -16751,47 +16778,50 @@ function exprIsNonNegIntLit(ix: i32) {
   false
 }
 
-// The binding whose length bounds a range loop's top, or "": `xs.length` under `until`,
+// The receiver whose length bounds a range loop's top, or -1: `xs.length` under `until`,
 // `xs.length - 1` under `to`. Either way every value the loop variable takes is `< len`.
 function rangeTopLenOf(s: ForRange) {
   let top = s.frTo
   if !s.frExcl {
-    if top < 0 { return "" }
+    if top < 0 { return 0 - 1 }
     const b = nodeAt(top)
     if b is BinExpr {
-      if b.binOp != "-" { return "" }
+      if b.binOp != "-" { return 0 - 1 }
       const one = nodeAt(b.binRight)
       if one is NumLit {
-        if one.numText != "1" { return "" }
+        if one.numText != "1" { return 0 - 1 }
       } else {
-        return ""
+        return 0 - 1
       }
       top = b.binLeft
     } else {
-      return ""
+      return 0 - 1
     }
   }
-  if top < 0 { return "" }
+  if top < 0 { return 0 - 1 }
   const m = nodeAt(top)
   if m is Member {
-    if m.memProp != "length" { return "" }
-    return hoistPathName(m.memObj)
+    if m.memProp != "length" { return 0 - 1 }
+    return m.memObj
   }
-  ""
+  0 - 1
 }
 
 // Open a range proof for `for v in A until xs.length` (or `to xs.length - 1`) with a constant
 // positive step, `A` a non-negative literal, `v` never rebound in the body, and `xs` served by
-// a live hoist row — whose `len` cannot move while the row is live. Returns the count pushed.
-function rangeProofOpen(s: ForRange, stepK: i32, dynStep: boolean) {
+// a live hoist row — whose `len` cannot move while the row is live. `sIx` is the loop, the
+// declaration of `v`. Returns the count pushed.
+function rangeProofOpen(s: ForRange, sIx: i32, stepK: i32, dynStep: boolean) {
   if dynStep || stepK <= 0 { return 0 }
   if !exprIsNonNegIntLit(s.frFrom) { return 0 }
-  const nm = rangeTopLenOf(s)
-  if nm == "" || nm == s.frVar { return 0 }
-  const row = liveListRowNamed(nm)
+  const recv = rangeTopLenOf(s)
+  const d = hoistPathDecl(recv)
+  if d < 0 { return 0 }
+  const row = liveListRowOf(d, hoistPathProp(recv))
   if row < 0 { return 0 }
-  if blockReboundsName(s.frBody, s.frVar) { return 0 }
-  rpVar.push(s.frVar)
+  const v = hoistDeclKey(sIx)
+  if blockRebindsDecl(s.frBody, v) { return 0 }
+  rpDecl.push(v)
   rpRow.push(row)
   1
 }
@@ -16799,7 +16829,7 @@ function rangeProofOpen(s: ForRange, stepK: i32, dynStep: boolean) {
 function rangeProofClose(n: i32) {
   let i = 0
   while i < n {
-    rpVar.pop()
+    rpDecl.pop()
     rpRow.pop()
     i = i + 1
   }
@@ -16811,9 +16841,12 @@ function rangeProvenIndex(row: i32, idxIx: i32) {
   if idxIx < 0 { return false }
   const e = nodeAt(idxIx)
   if e is Ident {
-    let k = rpVar.length - 1
+    const d = identDeclOf(idxIx)
+    if d < 0 { return false }
+    const v = hoistDeclKey(d)
+    let k = rpDecl.length - 1
     while k >= 0 {
-      if rpVar[k] == e.identName { return rpRow[k] == row }
+      if rpDecl[k] == v { return rpRow[k] == row }
       k = k - 1
     }
   }
@@ -30957,7 +30990,7 @@ function emitLetDeclStmt(
   // `let x = <expr>` / `const x = <expr>`: emit the init, then store it into the local's
   // slot. This `LetDecl`'s slot is the next cursor position, not name-resolved (a name
   // lookup would hit an outer same-named binding still in scope here).
-  if cboxIsWriteLet(s.letName) { stubWriteRhs = unwrapParen(s.letInit) }
+  if cboxIsWriteLet(stmtIx) { stubWriteRhs = unwrapParen(s.letInit) }
   const slot = declSlotTake(stmtIx, 1)
   if slot < 0 || slot >= localIsRef.length {
     return emitFailAt(
@@ -32524,8 +32557,8 @@ function emitWhileLoop(
     s.whileCond,
     s.whileBody,
     fnIx,
-    "",
-    "",
+    -1,
+    -1,
     ec,
   )
   if whHoist < 0 { return -1 }
@@ -32633,9 +32666,9 @@ function emitForRangeStmt(
   // anything) and BEFORE the loop variable is bound, so its receiver reads
   // resolve in the enclosing scope. `frVar` itself is never a candidate — the
   // body sees it as a fresh i32 binding.
-  const frHoist = loopHoistOpen(body, -1, s.frBody, fnIx, s.frVar, "", ec)
+  const frHoist = loopHoistOpen(body, -1, s.frBody, fnIx, stmtIx, -1, ec)
   if frHoist < 0 { return -1 }
-  const frProof = rangeProofOpen(s, stepK, dynStep)
+  const frProof = rangeProofOpen(s, stmtIx, stepK, dynStep)
   // Bind the loop var for the body (mirrors the collect pass's scopeBind).
   scopeBind(s.frVar, vSlot)
   const aConst = rangeConstIs(s.frFrom, fnIx)
@@ -33366,7 +33399,15 @@ function emitForInStmt(
     if lp.pCtr >= 0 { fbLocalSet(lp.pCtr) } else { fbLocalSet(pIdx) }
   }
   // The body's own index receivers, as `while` and a range loop hoist theirs.
-  const fiHoist = loopHoistOpen(body, -1, s.fiBody, fnIx, s.fiVar, pairName, ec)
+  const fiHoist = loopHoistOpen(
+    body,
+    -1,
+    s.fiBody,
+    fnIx,
+    s.fiDecl1,
+    s.fiDecl2,
+    ec,
+  )
   if fiHoist < 0 { return -1 }
   scopeBind(s.fiVar, vSlot)
   if hasPair { scopeBind(pairName, pSlot) }
@@ -35598,7 +35639,7 @@ function emitIdentNode(
   if idx < 0 {
     return emitIdentNonLocalRead(body, e, isid, exprIx, fnIx, ctx, ec)
   }
-  emitIdentLocalRead(e, exprIx, idx, fnIx, ctx)
+  emitIdentLocalRead(exprIx, idx, fnIx, ctx)
 }
 
 // Whether a narrowed read of `name` finds the union box it unboxes: a binding of this frame
@@ -35665,15 +35706,9 @@ function emitIdentNonLocalRead(
   )
 }
 
-// A read of `e` (at `exprIx`) from its local `idx`, or an unrolled range variable's constant.
+// The read at `exprIx` from its local `idx`, or an unrolled range variable's constant.
 // Returns 0.
-function emitIdentLocalRead(
-  e: Ident,
-  exprIx: i32,
-  idx: i32,
-  fnIx: i32,
-  ctx: ExpCtx,
-) {
+function emitIdentLocalRead(exprIx: i32, idx: i32, fnIx: i32, ctx: ExpCtx) {
   // A fully unrolled range loop's variable reads as its copy's constant.
   const urAt = unrolledSlotAt(idx)
   if urAt >= 0 {
@@ -35692,7 +35727,7 @@ function emitIdentLocalRead(
   // The `string | null` (kind 16) read rule for a param/local — stated at `emitMem`'s
   // field read. Mirrors the kind-15 list read, which never eagerly recovers.
   if !nulStrReadStaysRaw(ctx) {
-    if paramNulString(fnIx, e.identName) || declaredNulString(exprIx) {
+    if paramNulString(fnIx, exprIx) || declaredNulString(exprIx) {
       fbRefAsNonNull() // 0xd4
     }
   }
