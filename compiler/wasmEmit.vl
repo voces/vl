@@ -549,7 +549,7 @@ import {
   loopContDepth,
   loopContLabel,
   lvFrameDepth,
-  lvFrameName,
+  lvFrameLocal,
   mIntMonoArmUsed,
   mUsed,
   maFoldScratchBase,
@@ -840,6 +840,7 @@ import {
   capCellTargetOf,
   capComputeNamesOf,
   captureCountOf,
+  captureHomeOf,
   captureNamesOf,
   captureValKind,
   capturedKindOf,
@@ -858,6 +859,7 @@ import {
   coalesceNulAtomToStr,
   coalesceNulRefNicheOperand,
   coalesceOperandPinNonNull,
+  declaredIndexAt,
   envSlotShift,
   exactOperandTyOf,
   exprArray,
@@ -2588,7 +2590,7 @@ function emitCaptureSlotRead(fe: i32, envIdx: i32, fi: i32) {
 function emitCaptureRead(_body: u8[], name: string, fnIx: i32, ec: ExpCtx) {
   const cellOf = capCellTargetOf(name)
   if cellOf >= 0 { return emitCloCellRef(_body, cellOf, fnIx, ec) }
-  const idx = localIndexOf(fnIx, name)
+  const idx = captureHomeOf(fnIx, name)
   if idx >= 0 {
     fbLocalGet(idx)
     return 0
@@ -4388,7 +4390,7 @@ function listFitShadowSet(isIx: i32, recvTy: i32, depth: i32, fnIx: i32): i32 {
   const slot = heaps[0]
   const back = heaps[1]
   const wrap = heaps[2]
-  const recvLoc = localIndexOf(fnIx, r.identName)
+  const recvLoc = localIndexOf(fnIx, unwrapParen(nd.isObj))
   if recvLoc < 0 { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
   const grow = listFitGrowRow(r.identName, kTy, fnIx)
   let loc = -1
@@ -4516,7 +4518,7 @@ function listFitGrowEligible(
     if fitGrowName[i] == name && tySame(fitGrowTy[i], kTy) { return false }
     i = i + 1
   }
-  if localIndexOf(fnIx, name) < 0 { return false }
+  if localIndexOf(fnIx, unwrapParen(nd.isObj)) < 0 { return false }
   if exprUnion(nd.isObj, fnIx) || nodeTyIsNullable(nd.isObj) { return false }
   const recvTy = listIsRecvTyOf(nd.isObj, fnIx)
   recvTy >= 0 && listDisjointDepth(recvTy, kTy) == 1
@@ -5361,7 +5363,7 @@ function emitIs(body: u8[], isIx: i32, fnIx: i32, ec: ExpCtx) {
       const isOpTy = nodeTyAt(nd0.isObj, fnIx)
       const isTsTy = isVarTyIxOf(isIx)
       if (
-        localIndexOf(fnIx, tl.identName) >= 0
+        localIndexOf(fnIx, unwrapParen(nd0.isObj)) >= 0
         && isOpTy >= 0
         && isTsTy >= 0
         && !isUnionOfTy(isOpTy)
@@ -5765,7 +5767,7 @@ function listIsStore(
 function listIsStoreBackOf(recv: i32, fnIx: i32): ListIsStore {
   const rn = nodeAt(unwrapParen(recv))
   if rn is Ident {
-    const li = localIndexOf(fnIx, rn.identName)
+    const li = localIndexOf(fnIx, unwrapParen(recv))
     if li >= 0 && identSlotIsUnionBox(fnIx, unwrapParen(recv)) {
       return listIsStore(LIS_LOCAL, li, -1, -1, -1)
     }
@@ -6039,7 +6041,9 @@ function emitIsTestArmTag(
           != ""
         && identSlotIsUnionBox(fnIx, unwrapParen(ndv.isObj))
       ) {
-        if emitUnionBoxPush(body, vrecv.identName, fnIx, ec) < 0 { return -1 }
+        if emitUnionBoxPush(body, unwrapParen(ndv.isObj), fnIx, ec) < 0 {
+          return -1
+        }
         fbStructGet(uBoxIdx, 0)
         fbI32Rel(RS_TAG, armTag)
         fbI32Bin(70)
@@ -7281,11 +7285,14 @@ function fnHasTyParams(fnIx: i32): boolean {
   false
 }
 
-// Push the raw union box ref of binding `name` (a local, param or module global), bypassing
+// Push the raw union box ref of the binding the `Ident` read at `ix` denotes (a local, param,
+// capture or module global), bypassing
 // the narrowed-unbox Ident path so a tag read works even while the binding is narrowed to a
 // single atom — its slot still holds the box, narrowing being type-level only.
-function emitUnionBoxPush(_body: u8[], name: string, fnIx: i32, ec: ExpCtx) {
-  const idx = localIndexOf(fnIx, name)
+function emitUnionBoxPush(_body: u8[], ix: i32, fnIx: i32, ec: ExpCtx) {
+  const rn = nodeAt(ix)
+  const name = if rn is Ident { rn.identName } else { "" }
+  const idx = localIndexOf(fnIx, ix)
   if idx >= 0 {
     fbLocalGet(idx)
   } else {
@@ -7377,18 +7384,18 @@ function atomIsRefKind(k: i32) {
   return listWrapHeapOfKind(k) >= 0
 }
 
-// Lower a narrowed value-union ident read `name` (active narrowing = a single scalar member,
+// Lower the narrowed value-union ident read at `ix` (active narrowing = a single scalar member,
 // arriving as its ABI kind `ak`): push the box, `struct.get $box 1` for the `anyref` payload,
 // then recover the atom's rep — a `ref.cast (ref $sTypeIdx)` for a string payload, stored
 // unboxed, or a `ref.cast (ref $vb)` plus `struct.get $vb 0` for a scalar in its value box.
 function emitValueUnionUnboxRead(
   body: u8[],
-  name: string,
+  ix: i32,
   ak: i32,
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  if emitUnionBoxPush(body, name, fnIx, ec) < 0 { return -1 }
+  if emitUnionBoxPush(body, ix, fnIx, ec) < 0 { return -1 }
   emitUnionUnboxTail(ak)
 }
 
@@ -7553,12 +7560,11 @@ function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
 // it to the wrapper of the row the read's consumer types itself against.
 function emitRefArrayUnionUnboxRead(
   body: u8[],
-  name: string,
   exprIx: i32,
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  if emitUnionBoxPush(body, name, fnIx, ec) < 0 { return -1 }
+  if emitUnionBoxPush(body, exprIx, fnIx, ec) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   const slot = refListSlotOfExprStrict(exprIx, fnIx)
   if slot < 0 || slot >= rlWrapIdx.length {
@@ -7599,14 +7605,8 @@ function emitListPayloadCast(wrap: i32) {
 // under an `is` guard naming the map arm): push the box, read its `anyref` value (field 1),
 // `ref.cast` to the arm's per-value map struct heap (`mapTypeIdxOf`; its key's mono struct for
 // an i32 or atom value). The result is the `(ref $mapStruct)` a bare map binding pushes.
-function emitMapUnionUnboxRead(
-  body: u8[],
-  name: string,
-  exprIx: i32,
-  fnIx: i32,
-  ec: ExpCtx,
-) {
-  if emitUnionBoxPush(body, name, fnIx, ec) < 0 { return -1 }
+function emitMapUnionUnboxRead(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
+  if emitUnionBoxPush(body, exprIx, fnIx, ec) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   // The arm's map-value slot, the one `mapShapeOfExpr` types this read's consumer against.
   fbRefCast(mapTypeIdxOf(mapShapeOfExpr(exprIx, fnIx))) // the payload IS the map struct ref
@@ -16264,7 +16264,7 @@ function hoistSafeMemCall(callIx: i32, fnIx: i32): boolean {
     const callee = nodeAt(c.callFn)
     if callee is Ident {
       const nm = callee.identName
-      if identNameIsUserBound(nm, fnIx) { return false }
+      if identNameIsUserBound(c.callFn, fnIx) { return false }
       if nm == "__store_i32__" { return true }
       if nm == "__load_i32__" { return true }
       if nm == "__memory_size__" { return true }
@@ -18067,7 +18067,7 @@ function strAccAppendOk(binIx: i32, fnIx: i32) {
     const t = nodeAt(unwrapParen(a.binLeft))
     if t is Ident {
       if !saNameQualifies(t.identName) { return false }
-      if localIndexOf(fnIx, t.identName) < 0 {
+      if localIndexOf(fnIx, unwrapParen(a.binLeft)) < 0 {
         if saAccGlobalIdx(t.identName) < 0 { return false }
       }
       return saSelfAppendOk(a.binRight, t.identName, fnIx)
@@ -18085,7 +18085,7 @@ function emitStrAccAppend(body: u8[], binIx: i32, fnIx: i32, ec: ExpCtx) {
   if a is BinExpr {
     const t = nodeAt(unwrapParen(a.binLeft))
     if t is Ident {
-      const slot = localIndexOf(fnIx, t.identName)
+      const slot = localIndexOf(fnIx, unwrapParen(a.binLeft))
       const gIx = saAccGlobalIdx(t.identName)
       const parts: i32[] = []
       strCatParts(a.binRight, fnIx, parts)
@@ -23765,7 +23765,7 @@ function memAddrLoadBound(ix: i32, fnIx: i32): i64 {
     if e.callFn < 0 { return -1 }
     const f = nodeAt(e.callFn)
     if f is Ident {
-      if e.callArgs.length >= 1 && !identNameIsUserBound(f.identName, fnIx) {
+      if e.callArgs.length >= 1 && !identNameIsUserBound(e.callFn, fnIx) {
         if f.identName == "__load_u8__" { return 255 }
         if f.identName == "__load_u16__" { return 65535 }
       }
@@ -23795,7 +23795,7 @@ function zextLoadCallAt(ix: i32, fnIx: i32): i32 {
     const f = nodeAt(e.callFn)
     if f is Ident {
       if zextLoadWidth(f.identName) == 0 { return -1 }
-      if identNameIsUserBound(f.identName, fnIx) { return -1 }
+      if identNameIsUserBound(e.callFn, fnIx) { return -1 }
       return x
     }
   }
@@ -24447,7 +24447,10 @@ function lmaIsIntrinsic(acc: i32, fi: i32): boolean {
     const f = nodeAt(ac.callFn)
     if f is Ident {
       const nm = f.identName
-      if (identNameIsUserBound(nm, fi) || fnIndexOfNode(ac.callFn) >= 0) {
+      if (
+        identNameIsUserBound(ac.callFn, fi)
+        || fnIndexOfNode(ac.callFn) >= 0
+      ) {
         return false
       }
       return (nm == "__load_i32__"
@@ -25485,7 +25488,7 @@ function emitCallCoreIdent(
   const userOwnsName = fnIndexOfNode(c.callFn) >= 0
   // the scope's answer for the dunder intrinsics, whose arms below match the
   // spelling with no declaration lookup at all. See `identNameIsUserBound`.
-  const userBindsName = identNameIsUserBound(callee.identName, fnIx)
+  const userBindsName = identNameIsUserBound(c.callFn, fnIx)
   // `__str_from_bytes__(src, at, count)` (D4784): one call into the helper, which bounds-checks
   // the range against `src`'s length and copies it into an exact-fit string.
   if !userBindsName && callee.identName == "__str_from_bytes__" {
@@ -26256,7 +26259,7 @@ function emitAssignLocalSeeded(
 }
 
 // `emitAssignUnder`'s arm over a name target `x = v`: the string accumulator, a module
-// global, then a local or parameter cell. `target` is `P.nodes[lhsIx]`. Returns 0 lowered,
+// global, then a local or parameter cell, for the `Ident` target at `lhsIx`. Returns 0 lowered,
 // -1 failed.
 function emitAssignIdent(
   body: u8[],
@@ -26264,7 +26267,6 @@ function emitAssignIdent(
   fnIx: i32,
   a: BinExpr,
   lhsIx: i32,
-  target: Ident,
   ec: ExpCtx,
 ) {
   stubWriteRhs = unwrapParen(a.binRight)
@@ -26274,7 +26276,7 @@ function emitAssignIdent(
   if strAccAppendOk(binIx, fnIx) {
     return emitStrAccAppend(body, binIx, fnIx, ec)
   }
-  const idx = localIndexOf(fnIx, target.identName)
+  const idx = localIndexOf(fnIx, lhsIx)
   if idx < 0 { return emitAssignGlobal(body, a, lhsIx, fnIx, ec) }
   // a union-typed local (kind 4) coerces a raw assigned value into the box (`u = 3.5`
   // over `let u: i32 | f64` boxes the f64); a union-valued RHS passes through unchanged.
@@ -26904,7 +26906,7 @@ function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32, ec: ExpCtx) {
     const target = nodeAt(lhsIx)
     strSiteArm(binIx, fnIx)
     if target is Ident {
-      return emitAssignIdent(body, binIx, fnIx, a, lhsIx, target, ec)
+      return emitAssignIdent(body, binIx, fnIx, a, lhsIx, ec)
     }
     if target is Index { return emitAssignIndex(body, fnIx, a, target, ec) }
     if target is Member {
@@ -27009,7 +27011,7 @@ function listOpRecvLocal(
       ) {
         return emitFailAt(LIST_FIT_PUSH_MSG, objIx)
       }
-      const lIdx = localIndexOf(fnIx, recv.identName)
+      const lIdx = localIndexOf(fnIx, objIx)
       if lIdx >= 0 { return lIdx }
       // A captured list ident (D1965) or a module global: the env field or global holds
       // the wrapper ref, so staging it through `emitExpr` mutates that same list in place.
@@ -31010,7 +31012,7 @@ function emitStmtGo(body: u8[], stmtIx: i32, fnIx: i32, ec: ExpCtx) {
   if s is WhileStmt { return emitWhileStmtStmt(body, s, stmtIx, fnIx, ec) }
   if s is ForRange { return emitForRangeStmt(body, s, stmtIx, fnIx, ec) }
   if s is ForIn { return emitForInStmt(body, s, stmtIx, fnIx, ec) }
-  if s is BreakStmt { return emitBreakStmtStmt(body, s, stmtIx, fnIx) }
+  if s is BreakStmt { return emitBreakStmtStmt(body, s, stmtIx) }
   if s is ContinueStmt { return emitContinueStmtStmt(body, s, stmtIx, fnIx) }
   // a bare value expression in non-tail statement position is a discarded value: evaluate
   // it for effect, then drop what it leaves — the same rule the `BinExpr` arm above applies
@@ -31785,7 +31787,7 @@ function emitCallStmtIdent(
   // by spelling, so a diverging slot added there cannot be missed here — every other
   // entry in this ladder is a name, and a name is what a new slot would not carry.
   if fsRetIsVoid(fsIntrinsicSlot(callee.identName)) { dropIt = false }
-  if calleeIsVoidExtern(callee.identName, fnIx) { dropIt = false }
+  if calleeIsVoidExtern(s.callFn, fnIx) { dropIt = false }
   if dropIt {
     // A name a closure binding covers denotes that binding, so the void question is the
     // closure's — the module function of the name lowered no instruction here (D1602).
@@ -32551,7 +32553,7 @@ function emitLabelBlock(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  const lv = lvFrameOpen(s)
+  const lv = lvFrameOpen(s, fnIx)
   if lv < 0 { return -1 }
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.whileLabel)
@@ -32561,17 +32563,17 @@ function emitLabelBlock(
   if rc < 0 { return -1 }
   if lv == 1 {
     if lvTailAssigns(s) {
-      fbLocalGet(localIndexOf(fnIx, s.whileLv))
+      fbLocalGet(lvFrameLocal[lvFrameLocal.length - 1])
     } else {
       fbUnreachable()
     }
   }
-  lvFrameClose(s, lv, fnIx)
+  lvFrameClose(lv)
 }
 
 // Opens the break frame of the `while` or labelled block `s`: typed by its result binding's
 // valtype when a non-null value leaves by `br` (1), else void (0); -1 on failure.
-function lvFrameOpen(s: WhileStmt): i32 {
+function lvFrameOpen(s: WhileStmt, fnIx: i32): i32 {
   if s.whileLv == "" {
     fbBlock(64) // 0x02 block, 0x40 void blocktype
     return 0
@@ -32584,18 +32586,18 @@ function lvFrameOpen(s: WhileStmt): i32 {
   fbOpenBlock()
   fbValtype(localIsRef[slot], localStructIdx[slot])
   lvFrameDepth.push(ctrlDepth)
-  lvFrameName.push(s.whileLv)
+  lvFrameLocal.push(declaredIndexAt(fnIx, slot))
   1
 }
 
 // Closes the frame `lvFrameOpen` returned `lv` for; a typed one stores the value it carries
 // out into the result binding, which initializes that binding at the enclosing level.
-function lvFrameClose(s: WhileStmt, lv: i32, fnIx: i32) {
+function lvFrameClose(lv: i32) {
   fbEnd()
   if lv == 1 {
     lvFrameDepth.pop()
-    lvFrameName.pop()
-    fbLocalSet(localIndexOf(fnIx, s.whileLv))
+    fbLocalSet(lvFrameLocal[lvFrameLocal.length - 1])
+    lvFrameLocal.pop()
   }
   0
 }
@@ -32637,7 +32639,7 @@ function emitWhileLoop(
     ec,
   )
   if whHoist < 0 { return -1 }
-  const whLv = lvFrameOpen(s)
+  const whLv = lvFrameOpen(s, fnIx)
   if whLv < 0 { return -1 }
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.whileLabel)
@@ -32666,7 +32668,7 @@ function emitWhileLoop(
   loopContLabel.pop()
   // A typed frame is left only by a `break v`, so falling out of the loop cannot happen.
   if whLv == 1 { fbUnreachable() }
-  lvFrameClose(s, whLv, fnIx) // 0x0b end (block)
+  lvFrameClose(whLv) // 0x0b end (block)
   loopBrkDepth.pop()
   loopBrkLabel.pop()
   loopHoistClose(whHoist)
@@ -33973,7 +33975,7 @@ function emitForInCopies(
   0
 }
 
-function emitBreakStmtStmt(_body: u8[], s: BreakStmt, _stmtIx: i32, fnIx: i32) {
+function emitBreakStmtStmt(_body: u8[], s: BreakStmt, _stmtIx: i32) {
   // `break [label]`: branch out of a loop's wrapping block, so control resumes after the
   // whole loop. Unlabelled targets the innermost; `break @outer` scans the parallel label
   // stack from the top. A `break` outside any loop or to an unknown label fails loudly, not with a bad `br`.
@@ -33992,7 +33994,7 @@ function emitBreakStmtStmt(_body: u8[], s: BreakStmt, _stmtIx: i32, fnIx: i32) {
     let k = lvFrameDepth.length - 1
     while k >= 0 {
       if lvFrameDepth[k] == blkDepth {
-        fbLocalGet(localIndexOf(fnIx, lvFrameName[k]))
+        fbLocalGet(lvFrameLocal[k])
         k = 0
       }
       k = k - 1
@@ -35696,7 +35698,7 @@ function emitIdentNode(
         return 0
       }
     }
-    return emitValueUnionUnboxRead(body, e.identName, vak, fnIx, ec)
+    return emitValueUnionUnboxRead(body, exprIx, vak, fnIx, ec)
   }
   // a union binding narrowed to a niche-repped `A | null` reads as that niche, under the
   // storage gates `identReadsUnionBox` names (D2590).
@@ -35712,7 +35714,7 @@ function emitIdentNode(
   const iCon = identReadContainerAt(exprIx, fnIx)
   if iCon == RC_REF_LIST {
     if identReadsUnionBox(isid, e.identName, exprIx, fnIx) {
-      return emitRefArrayUnionUnboxRead(body, e.identName, exprIx, fnIx, ec)
+      return emitRefArrayUnionUnboxRead(body, exprIx, fnIx, ec)
     }
   }
   // a union binding narrowed to a map arm reads unboxed to the map struct ref: push the
@@ -35725,7 +35727,7 @@ function emitIdentNode(
       || capturedIsUnionBox(fnIx, e.identName)
       || identChainTyMapArmUnion(e.identName, fnIx, 4)
     ) {
-      return emitMapUnionUnboxRead(body, e.identName, exprIx, fnIx, ec)
+      return emitMapUnionUnboxRead(body, exprIx, fnIx, ec)
     }
   }
   // a captured variable (a free var of a capturing lifted function): read it from the
@@ -35733,7 +35735,7 @@ function emitIdentNode(
   // global paths so a capture shadows nothing. Only fires inside a capturing lifted function.
   if emitCapturedRead(body, e.identName, fnIx, true, ec) == 1 { return 0 }
   // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
-  const idx = localIndexOf(fnIx, e.identName)
+  const idx = localIndexOf(fnIx, exprIx)
   if idx < 0 {
     return emitIdentNonLocalRead(body, e, isid, exprIx, fnIx, ctx, ec)
   }
@@ -38189,7 +38191,7 @@ function emitDirectCallTail(target: i32, fnIx: i32, ctx: ExpCtx) {
     const wbCaps = captureNamesOf(target)
     let wbi = nWb - 1
     while wbi >= 0 {
-      const wbIdx = localIndexOf(fnIx, wbCaps[cloLiftWriteCapAt(target, wbi)])
+      const wbIdx = captureHomeOf(fnIx, wbCaps[cloLiftWriteCapAt(target, wbi)])
       if wbIdx < 0 {
         return emitFail(
           "emitProgram: a lifted call's assigned capture has no home here",
@@ -39933,7 +39935,7 @@ function emitCoalesceIdentBox(
         return emitCoalesceValUnionIdent(
           body,
           e,
-          lhs.identName,
+          lhsIx,
           exprIx,
           cunm,
           cak,
@@ -40010,13 +40012,13 @@ function coalResultBoxName(exprIx: i32, fnIx: i32): string {
   nodeJoinRowName(exprIx, fnIx)
 }
 
-// `x ?? d` over binding `name` of nullable value union `cunm`, whose residual member is kind
+// `x ?? d` over the binding read at `lhsIx`, of nullable value union `cunm`, whose residual member is kind
 // `cak`: a box when the checker typed the `??` as a union, else the scalar at the result's
 // kind. Returns 0, or -1 when an operand fails or the residual is a string.
 function emitCoalesceValUnionIdent(
   body: u8[],
   e: BinExpr,
-  name: string,
+  lhsIx: i32,
   exprIx: i32,
   cunm: string,
   cak: i32,
@@ -40074,7 +40076,7 @@ function emitCoalesceValUnionIdent(
   fbIf(valBlockTypeOfKind(cRk)) // 0x04 if, value blocktype
   if emitExprAsKind(body, e.binRight, cRk, fnIx, ec) < 0 { return -1 }
   fbElse()                      // 0x05 else — present → unbox at the banked code `cak`
-  if emitValueUnionUnboxRead(body, name, cak, fnIx, ec) < 0 { return -1 }
+  if emitValueUnionUnboxRead(body, lhsIx, cak, fnIx, ec) < 0 { return -1 }
   if coalWidenUnboxed(cak, cRk) < 0 { return -1 }
   fbEnd()                       // 0x0b end
   0

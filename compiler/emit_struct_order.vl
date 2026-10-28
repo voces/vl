@@ -1,7 +1,7 @@
 // `emit_struct_order.vl` — the order structs are emitted in, which local a read denotes,
 // and which `array.new` kind and fill a list's element kind takes.
 
-import { Call, nodeAt } from "./ast"
+import { Call, LetDecl, nodeAt } from "./ast"
 import { nominalStructNameOfTy } from "./check_emit_queries"
 import { nodeTyIxOf } from "./check_node_tys"
 import { MAP_KEY_STR, tyIsI32SentinelNullable } from "./check_ty_rep"
@@ -23,12 +23,7 @@ import {
   tyIsLitUnion,
 } from "./check_types"
 import { structPrefixCands } from "./emit_atom_kinds"
-import {
-  globalLetOf,
-  lixFirstOf,
-  lixNextOf,
-  slotLetDecl,
-} from "./emit_narrow_slots"
+import { globalLetOf, slotLetDecl } from "./emit_narrow_slots"
 import {
   declTyIxOfName,
   repElemId,
@@ -39,8 +34,8 @@ import {
   VKind,
   blockLetHidden,
   localBlockLet,
+  localDeclIx,
   localIsRef,
-  localLoopVar,
   localNames,
   localSlotOfDecl,
   rlElemKey,
@@ -55,7 +50,6 @@ import {
   sNames,
   sTwin,
   scopeFrames,
-  scopeSlotOf,
   uFieldElemKeyKind,
   uFieldElemTyIx,
   uFieldStart,
@@ -207,32 +201,6 @@ export function arrNewDefaultKind(callIx: i32): ArrNewKind {
   }
 }
 
-// The declared-local position of `name`: the innermost live lexical binding when the scope
-// stack has one, else the first `localNames` slot of that name as a safety net for the
-// scope-less passes; the flat fallback skips loop-variable slots, whose loop has closed if the
-// scan reaches them.
-export function declaredSlotLive(name: string) {
-  const scoped = scopeSlotOf(name)
-  if scoped >= 0 { return scoped }
-  // `flatScanSkips` states for a block binding what `localLoopVar` states for a loop
-  // variable: a flat hit the scope stack could have answered for is out of scope.
-  let pos = lixFirstOf(name)
-  while pos >= 0 {
-    if localLoopVar[pos] == 0 && !flatScanSkips(pos) { return pos }
-    pos = lixNextOf(pos)
-  }
-  -1
-}
-
-// Does the flat scan have to pass slot `pos` over? True for a block-scoped binding or a loop
-// variable asked while the scope stack is authoritative: every live one resolves through
-// `scopeSlotOf`, so reaching the flat scan means it is out of scope and the name denotes a
-// global or parameter. Scope-less passes keep the whole registry (D9751).
-function flatScanSkips(pos: i32) {
-  if localBlockLet[pos] == 0 && localLoopVar[pos] == 0 { return false }
-  blockBindingHidden()
-}
-
 // Does this frame bind a name in a nested block that a module global also binds? The one
 // condition under which a name-keyed reader in the scope-less detection sweep and the lowering
 // can disagree about which home a read denotes, so `frameScanRun` owes a second sweep. D1597.
@@ -256,15 +224,24 @@ export function bindingDeclInScope(ix: i32): i32 {
 
 // The frame slot the `Ident` read at `ix` denotes, through the declaration the binder resolved it
 // to (or the one a minted copy stands for), or -1 when it denotes no local of the frame being
-// emitted: a parameter, a capture, a global. Exact in every pass, scope stack or none.
+// emitted: a parameter, a capture, a global. Exact in every pass, scope stack or none. A
+// binding's own initializer never denotes it: a parameter's seed reads the parameter.
 export function declaredSlotOf(ix: i32): i32 {
   const d = identDeclOf(ix)
   if d < 0 { return -1 }
-  const s = localSlotOfDecl[d] ?? -1
-  if s >= 0 { return s }
-  const o = declOrigOf(d)
-  if o < 0 { return -1 }
-  localSlotOfDecl[o] ?? -1
+  let s = localSlotOfDecl[d] ?? -1
+  if s < 0 {
+    const o = declOrigOf(d)
+    if o < 0 { return -1 }
+    s = localSlotOfDecl[o] ?? -1
+  }
+  if s < 0 || (localDeclIx[s] ?? -1) == d { return s }
+  const l = slotLetDecl(s)
+  if l >= 0 {
+    const ln = nodeAt(l)
+    if ln is LetDecl && ln.letInit == ix { return -1 }
+  }
+  s
 }
 
 // The `VKind` of the local the `Ident` read at `ix` denotes, or `null` when it denotes none —

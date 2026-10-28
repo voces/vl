@@ -914,7 +914,6 @@ import {
   arrNewDefaultKind,
   bindingDeclInScope,
   declaredKind,
-  declaredSlotLive,
   declaredSlotOf,
   rlElemTyIxAt,
   rlSlotOfTy,
@@ -1655,11 +1654,13 @@ function fieldClosureFeOfInit(initIx: i32, prop: string, fnIx: i32) {
 // `capturedKindOf`, the resolvers the lowering itself uses, so the two cannot disagree (D705).
 export function identBoundAt(fnIx: i32, sid: i32, atIx: i32) {
   const name = sidText(sid)
-  if localIndexOf(fnIx, name) >= 0 { return true }
+  if atIx >= 0 && sidOfNode(atIx) == sid && localIndexOf(fnIx, atIx) >= 0 {
+    return true
+  }
+  if paramIndexOf(fnIx, name) >= 0 { return true }
   if capturedKindOf(fnIx, name) != null { return true }
   // The arena rung, because `localNames` is empty in the global passes: `buildLocals` runs
-  // per function during emission, long after `computeRetInference`. Loop variables are not
-  // asked, since `localIndexOf` skips them and the lowering sends those reads to the global.
+  // per function during emission, long after `computeRetInference`.
   if fnIx < 0 { return false }
   const fnb = nodeAt(fnIx)
   if fnb is FuncDecl {
@@ -3640,20 +3641,23 @@ export function asgReadNarrows(asgIx: i32, fnIx: i32): boolean {
 
 // Look up the wasm function index for `name`, or -1 if no such top-level function
 // exists (an undefined callee — the caller fails loudly).
-export function fnIndexOf(name: string) { fnIndexOfSid(sidLookup(name)) }
+export function fnIndexOf(name: string) { fnIndexOfSid(sidLookup(name), -1) }
 
 // The sid-taking primitive. While a body is lowered, a name some nested function carries
 // resolves through that body's scope chain, since the flat map is first-wins. A sibling
-// frame's nested function under the name of one of this body's params or locals is not that
-// binding: answers -1 (D1966).
-export function fnIndexOfSid(sid: i32) {
+// frame's nested function under the name of one of this body's params, or of the local the
+// read at `atIx` (-1: none) denotes, is not that binding: answers -1 (D1966).
+export function fnIndexOfSid(sid: i32, atIx: i32) {
   if emitCurFnIx >= 0 && sidArrGet(nestedNameBySid, sid) == 1 {
     const name = sidText(sid)
     const fe = fnIndexOfInScopeSid(sid, name, emitCurFnIx)
     if fe >= 0 && fe < fnParent.length && fnParent[fe] >= 0 {
       if (
         !fnPosOnScopeChain(fnParent[fe], emitCurFnPos)
-        && localIndexOf(emitCurFnIx, name) >= 0
+        && ((atIx >= 0
+          && sidOfNode(atIx) == sid
+          && localIndexOf(emitCurFnIx, atIx) >= 0)
+          || paramIndexOf(emitCurFnIx, name) >= 0)
       ) {
         return -1
       }
@@ -3675,7 +3679,7 @@ export function fnIndexOfAt(sid: i32, fnIx: i32, atIx: i32): i32 {
     if hit >= 0 { return hit }
     if hit == -1 { return lfFlatAt(sid) }
   }
-  fnIndexOfSid(sid)
+  fnIndexOfSid(sid, atIx)
 }
 
 // The same rep, reached by NAME: the one home for the walk (#2815's calling frame, #2840's
@@ -3697,7 +3701,7 @@ export function repOfNameResult(
 // a disagreement is one site where a per-pin clone would have adopted its template's rep,
 // which is the whole D1788 family in one measurement.
 function repABNoteNameResult(sid: i32, scoped: i32) {
-  const flat = fnIndexOfSid(sid)
+  const flat = fnIndexOfSid(sid, -1)
   if flat == scoped { return 0 }
   repABNote("nameResult", repABRetWord(flat), repABRetWord(scoped))
 }
@@ -4961,8 +4965,8 @@ export function arrNewNamedKind(callIx: i32, fnIx: i32): ArrNewKind {
 // The wasm local index of the declared-local position `pos` in function `fnIx`, or -1 when
 // `pos` names no local. Declared locals sit after the params, so the index is
 // `envShift + paramCount + pos`. The position-to-index half of declared-local resolution,
-// shared by `declaredIndexOf` and by `localIndexOf`'s scope-stack arm.
-function declaredIndexAt(fnIx: i32, pos: i32) {
+// shared by `localIndexOf`, `captureHomeOf` and the loop-value frames.
+export function declaredIndexAt(fnIx: i32, pos: i32) {
   if pos < 0 { return -1 }
   if fnIx < 0 {
     // Module scope is the start function's body, which has no params, so the local index is
@@ -4973,13 +4977,6 @@ function declaredIndexAt(fnIx: i32, pos: i32) {
   const fn = nodeAt(fnIx)
   if fn is FuncDecl { return envSlotShift(fnIx) + fn.fnParams.length + pos }
   -1
-}
-
-// The wasm local index of declared local `name`, or -1 if it is not a declared
-// local. `declaredSlotLive` resolves the name (innermost live lexical binding, else
-// the loop-var-skipping flat scan); `declaredIndexAt` turns that position into an index.
-function declaredIndexOf(fnIx: i32, name: string) {
-  declaredIndexAt(fnIx, declaredSlotLive(name))
 }
 
 // Whether function `fe` carries the hidden leading `structref env` param: only a function
@@ -5009,8 +5006,11 @@ export function envSlotShift(fnIx: i32) {
 // Scoped to callee position only (a parameter named `__load_i32__` is legal VL); a
 // parameter is the only binding form that can hold such a name, since the checker refuses
 // a `function`/`const`/`let` of an intrinsic spelling. Guards a capture-of-parameter miss (D1087).
-export function identNameIsUserBound(name: string, fnIx: i32): boolean {
-  if localIndexOf(fnIx, name) >= 0 { return true }
+export function identNameIsUserBound(ix: i32, fnIx: i32): boolean {
+  if localIndexOf(fnIx, ix) >= 0 { return true }
+  const n = nodeAt(ix)
+  const name = if n is Ident { n.identName } else { "" }
+  if paramIndexOf(fnIx, name) >= 0 { return true }
   capturedKindOf(fnIx, name) != null
 }
 
@@ -5022,7 +5022,7 @@ export function identNameIsBoundAt(
   fnIx: i32,
   atIx: i32,
 ): boolean {
-  if !identNameIsUserBound(name, fnIx) { return false }
+  if !identNameIsUserBound(atIx, fnIx) { return false }
   if paramIndexOf(fnIx, name) >= 0 { return true }
   if capturedKindOf(fnIx, name) != null { return true }
   if fnIx < 0 || atIx < 0 { return true }
@@ -5038,23 +5038,42 @@ export function identNameIsBoundAt(
 // True when `name` in callee position lowers to a result-less `extern function` import — the
 // scope does not bind the name (a parameter of that spelling wins, as in `emitCall`) and its
 // link row returns void. Such a call leaves nothing on the stack: a statement, never a value.
-export function calleeIsVoidExtern(name: string, fnIx: i32): boolean {
-  if identNameIsUserBound(name, fnIx) { return false }
-  externRetIsVoid(externLinkOf(name))
+export function calleeIsVoidExtern(ix: i32, fnIx: i32): boolean {
+  if identNameIsUserBound(ix, fnIx) { return false }
+  const n = nodeAt(ix)
+  if !(n is Ident) { return false }
+  externRetIsVoid(externLinkOf(n.identName))
 }
 
-// Resolve an identifier `name` to its wasm local index for function `fnIx`: a live lexical
-// binding first, else a param, else a declared local through the flat fallback, or -1. The
-// scope stack outranks the param because a block-scoped local shadowing one gets its own
-// slot; only that hit does, since the flat scan cannot tell a dead binding from a live one.
-export function localIndexOf(fnIx: i32, name: string) {
+// The wasm local index the `Ident` read at `ix` denotes in function `fnIx`, or -1: the slot of
+// the declaration the binder resolved it to, else a param, else a capture a lifted function
+// assigns. A read the binder left unresolved (an emitter-minted one) takes the live scope stack.
+export function localIndexOf(fnIx: i32, ix: i32) {
+  if ix < 0 { return -1 }
+  const n = nodeAt(ix)
+  if !(n is Ident) { return -1 }
+  const slot = declaredSlotOf(ix)
+  if slot >= 0 { return declaredIndexAt(fnIx, slot) }
+  if identDeclOf(ix) < 0 {
+    const scoped = scopeSlotOf(n.identName)
+    if scoped >= 0 { return declaredIndexAt(fnIx, scoped) }
+  }
+  bindingHomeOf(fnIx, n.identName)
+}
+
+// The wasm local index frame `fnIx` keeps capture `name` of a function it calls or closes over
+// in, or -1. `name` comes from `captureNamesOf` alone: a capture list holds names, not reads.
+export function captureHomeOf(fnIx: i32, name: string) {
   const scoped = scopeSlotOf(name)
   if scoped >= 0 { return declaredIndexAt(fnIx, scoped) }
+  bindingHomeOf(fnIx, name)
+}
+
+// A param of `fnIx`, else a capture lifted frame `fnIx` assigns, which is its own param.
+function bindingHomeOf(fnIx: i32, name: string) {
   const pIx = paramIndexOf(fnIx, name)
   if pIx >= 0 { return envSlotShift(fnIx) + pIx }
-  const dIx = declaredIndexOf(fnIx, name)
-  if dIx >= 0 || cloLiftWrName.length == 0 { return dIx }
-  // A capture a lifted function assigns is its own parameter, read and written in place.
+  if cloLiftWrName.length == 0 { return -1 }
   cloLiftWriteSlot(fnStmtsPosOf(fnIx), name)
 }
 
@@ -9067,7 +9086,7 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
         // table rather than by spelling, so a diverging slot added there cannot be missed
         // here — every other entry above is a name, which a new slot would not carry.
         if fsRetIsVoid(fsIntrinsicSlot(callee.identName)) { return false }
-        if calleeIsVoidExtern(callee.identName, fnIx) { return false }
+        if calleeIsVoidExtern(s.callFn, fnIx) { return false }
         if tailSelfFnIx >= 0 && tailCallsSelf(s.callFn, fnIx) { return false }
         const target = fnIndexOfAt(sidOfNode(s.callFn), fnIx, s.callFn)
         // A live closure binding of the name is what the tail denotes, so the voidness is
@@ -17446,7 +17465,7 @@ export function identIsBoundClosure(readIx: i32, fnIx: i32): boolean {
   const name = if rn is Ident { rn.identName } else { "" }
   if paramIsClosure(fnIx, name) { return true }
   if paramNulClosure(fnIx, name) { return true }
-  const slot = declaredSlotLive(name)
+  const slot = declaredSlotOf(readIx)
   if slot >= 0 {
     return localIsRef[slot] == "closure" || localIsRef[slot] == "nulclosure"
   }
@@ -17502,7 +17521,7 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       // closure-celled local — every one calls via `call_ref`, recovered non-null at the call site.
       if identIsBoundClosure(exprIx, fnIx) { return true }
       // A declared local of the name that is not a closure cell denotes no module global.
-      if declaredSlotLive(e.identName) >= 0 { return false }
+      if declaredSlotOf(exprIx) >= 0 { return false }
       // A module-global closure cell — a bare closure (kind 14) or a NULLABLE one (kind 19).
       const gl = globalLetOfIn(fnIx, e.identName, exprIx)
       if gl >= 0 {
