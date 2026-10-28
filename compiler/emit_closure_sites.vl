@@ -129,7 +129,7 @@ import {
   fnIndexOfNode,
   fnRetExprOf,
   fnRetRArrElemTy,
-  globalLetOfIn,
+  globalLetOfRead,
   holeOrCapturedTyOf,
   identClosureFe,
   identClosureFeAt,
@@ -204,7 +204,7 @@ import {
 import { repSigTokOfKind } from "./emit_rep"
 import { repSigRetTokOfTy, repSigTokOfTy } from "./emit_rep_slot"
 import { globalLetOfSid } from "./emit_narrow_slots"
-import { paramTypeNode, paramTypeNodeOfRead } from "./emit_query"
+import { paramTypeNodeOfRead } from "./emit_query"
 import { rlSlotByNameTwin, rlSlotsLayoutTwin } from "./emit_shape_rows"
 import {
   annParamKindTy,
@@ -244,7 +244,7 @@ import {
 } from "./emit_ty_canon"
 import { unionStoreAtomKindOfSet } from "./emit_union_casts"
 import { i32ListHas } from "./listutil"
-import { identDeclOf, sidOf, sidOfNode } from "./symbols"
+import { identDeclOf, sidOf, sidOfNode, sidText } from "./symbols"
 import { arrElemNameRaw } from "./tyname"
 import { primNameOf, tyEmitPrimOf, tyHasTyVar } from "./tyquery"
 
@@ -395,7 +395,7 @@ function recvMakerFnOf(recvIx: i32, fnIx: i32) {
       const fn = nodeAt(fnIx)
       if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
     }
-    if li < 0 { li = globalLetOfIn(fnIx, e.identName, unwrapParen(recvIx)) }
+    if li < 0 { li = globalLetOfRead(fnIx, unwrapParen(recvIx)) }
     if li < 0 { return -1 }
     const d = nodeAt(li)
     if d is LetDecl { initIx = unwrapParen(d.letInit) } else { return -1 }
@@ -1286,7 +1286,7 @@ export function exprIsBool(ix: i32, fnIx: i32) {
       }
       // A plain boolean local/param/global — recovered from the binding's annotation
       // or initializer, since a boolean local registers identically to an i32.
-      if boundBoolByName(e.identName, fnIx, ix) { return true }
+      if boundBoolOfRead(ix, fnIx) { return true }
     }
     BinExpr => {
       const op = e.binOp
@@ -1309,7 +1309,7 @@ export function exprIsBool(ix: i32, fnIx: i32) {
           }
         }
         if lhs is Ident {
-          if identNullableBoolPop(lhs.identName, fnIx) { return true }
+          if identNullableBoolPop(unwrapParen(e.binLeft), fnIx) { return true }
         }
         // A `boolean | null` niche with a boolean default is a boolean, whatever spelled the
         // niche: a hole parameter's pin carries it only as the instance's annotation (D2593).
@@ -1572,7 +1572,7 @@ function listAnnNameOf(ix: i32, fnIx: i32) {
         const fn = nodeAt(fnIx)
         if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
       }
-      if li < 0 { li = globalLetOfIn(fnIx, e.identName, unwrapParen(ix)) }
+      if li < 0 { li = globalLetOfRead(fnIx, unwrapParen(ix)) }
       if li >= 0 {
         const d = nodeAt(li)
         if d is LetDecl {
@@ -1645,7 +1645,7 @@ export function listElemIsBool(arrIx: i32, fnIx: i32) {
       const fn = nodeAt(fnIx)
       if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
     }
-    if li < 0 { li = globalLetOfIn(fnIx, e.identName, inner) }
+    if li < 0 { li = globalLetOfRead(fnIx, inner) }
     if li >= 0 {
       const d = nodeAt(li)
       if d is LetDecl {
@@ -1661,16 +1661,18 @@ export function listElemIsBool(arrIx: i32, fnIx: i32) {
   mfArrElemIsBool(arrIx, fnIx)
 }
 
-// True if `name` is a binding whose initializer is a checked `.pop()` over a
+// True if the read `readIx` names a binding whose initializer is a checked `.pop()` over a
 // BOOLEAN-element list — its i32 cell holds 0/1 or the niche sentinel 2 (`null`),
-// so a later `name ?? d` must compare against 2, not test a ref.
-export function identNullableBoolPop(name: string, fnIx: i32) {
+// so a later `x ?? d` must compare against 2, not test a ref.
+export function identNullableBoolPop(readIx: i32, fnIx: i32) {
   let li = -1
   if fnIx >= 0 {
     const fn = nodeAt(fnIx)
-    if fn is FuncDecl { li = parentLetOf(fn.fnBody, name) }
+    if fn is FuncDecl {
+      li = parentLetOf(fn.fnBody, sidText(sidOfNode(readIx)))
+    }
   }
-  if li < 0 { li = globalLetOfIn(fnIx, name, -1) }
+  if li < 0 { li = globalLetOfRead(fnIx, readIx) }
   if li >= 0 {
     const d = nodeAt(li)
     if d is LetDecl {
@@ -1691,11 +1693,11 @@ export function identNullableBoolPop(name: string, fnIx: i32) {
   false
 }
 
-// True if `name`, read at node `atIx`, resolves (param / local / module global) to a boolean
+// True if the read `atIx` resolves (param / local / module global) to a boolean
 // binding: a `: boolean` annotation, or an un-annotated `const`/`let` with a boolean
 // initializer. A boolean local registers as kind 0 (== i32), so bool-ness must be recovered
 // from the binding here, not the local registry.
-function boundBoolByName(name: string, fnIx: i32, atIx: i32) {
+function boundBoolOfRead(atIx: i32, fnIx: i32) {
   if fnIx >= 0 {
     const fn = nodeAt(fnIx)
     if fn is FuncDecl {
@@ -1706,7 +1708,7 @@ function boundBoolByName(name: string, fnIx: i32, atIx: i32) {
       if dl >= 0 && dl < P.nodes.length {
         const d = nodeAt(dl)
         if d is Param {
-          const pt = paramTypeNode(fnIx, name)
+          const pt = paramTypeNodeOfRead(fnIx, atIx)
           if pt >= 0 { return tyIsBool(pt) }
           return tyIsBool(d.parType)
         }
@@ -1726,7 +1728,7 @@ function boundBoolByName(name: string, fnIx: i32, atIx: i32) {
       }
     }
   }
-  const gi = globalLetOfIn(fnIx, name, atIx)
+  const gi = globalLetOfRead(fnIx, atIx)
   if gi >= 0 {
     const g = nodeAt(gi)
     if g is LetDecl {
@@ -2143,7 +2145,7 @@ function mfArrElemIsBool(arrIx: i32, fnIx: i32) {
       return false
     }
     Ident => {
-      const li = globalLetOfIn(fnIx, e.identName, inner)
+      const li = globalLetOfRead(fnIx, inner)
       if li >= 0 {
         const d = nodeAt(li)
         if d is LetDecl {
