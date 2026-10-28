@@ -564,7 +564,6 @@ import {
   mvRlSlot,
   mvValKind,
   mvValName,
-  narrowTop,
   optRecvSlot,
   optRecvStagedIx,
   optRecvStagedSet,
@@ -973,15 +972,11 @@ import {
   pathReadAtomKind,
   placeNicheAtomKind,
   placeReadContainerAt,
-  preStmtNarrow,
-  pushPostGuardNarrow,
   readCellHoldsNullRef,
   readOwesNonNullRecover,
   recBuildRowOf,
   refListSlotOfExpr,
   rlUnionNameOfTy,
-  setNarrowFromCond,
-  setNarrowFromCondElse,
   sharedUnionFieldPlan,
   spreadBoxingSource,
   spreadDestKind,
@@ -1175,9 +1170,6 @@ import {
   ifJoinArmsAllStrLit,
   ifJoinNarrowsPerArm,
   ifJoinTypedAtom,
-  maskNarrowFor,
-  narrowKeyOfRead,
-  unmaskNarrow,
   variantIndexOf,
 } from "./emit_narrow_slots"
 import {
@@ -1305,7 +1297,6 @@ import {
   mapTwinOneStruct,
   nodeTyInOf,
   pinSubOperandTyOf,
-  restoreNarrow,
   tyMentionsSet,
   tySameSet,
   tySameSpelled,
@@ -1416,7 +1407,6 @@ import {
   narrowedNulLitBoxKey,
   narrowedNulLitPinBoxKey,
   nulNicheRecoverOwed,
-  pushAsgReadNarrow,
   refIfArmNeedsRecordCopy,
   refListSlotOfExprStrict,
   retNeedsNonNullRecover,
@@ -5344,15 +5334,13 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
 function emitIs(body: u8[], isIx: i32, fnIx: i32, ec: ExpCtx) {
   const nd0 = nodeAt(isIx)
   if nd0 is IsExpr {
-    // A narrowed operand is tested at its storage, never trusted: the narrowing is lifted
-    // for the test, so the read is the declared box and the rungs below test its tag. A
-    // write the narrowing does not see (an alias, an escaped closure) is then answered (D2447).
-    const masked = maskNarrowFor(isNarrowMaskKey(nd0.isObj, fnIx))
-    if masked.length > 0 {
+    // A narrowed operand is tested at its storage, never trusted: the read is the declared
+    // box and the rungs below test its tag, so a write the narrowing does not see (an alias,
+    // an escaped closure) is answered (D2447).
+    if isTestsStorage(nd0.isObj, fnIx) {
       const sMark = storageReadEnter(nd0.isObj)
       const r = emitIsTest(body, isIx, fnIx, ec)
       storageReadLeave(sMark)
-      unmaskNarrow(masked)
       return r
     }
     // A frame local no narrowing binds holds its own type in its slot, so where the checker
@@ -5378,18 +5366,17 @@ function emitIs(body: u8[], isIx: i32, fnIx: i32, ec: ExpCtx) {
   emitIsTest(body, isIx, fnIx, ec)
 }
 
-// The narrowing key `emitIs` lifts for operand `recvIx`: a name, or a member or index place,
-// or "" where the storage itself holds the narrowed rep (a capture whose env field is not the
-// union box), which lifting would misread.
-function isNarrowMaskKey(recvIx: i32, fnIx: i32): string {
+// Whether `emitIs` tests operand `recvIx` at its storage: a read the checker narrowed, unless
+// the storage itself holds the narrowed rep (a capture whose env field is not the union box).
+function isTestsStorage(recvIx: i32, fnIx: i32): boolean {
+  if readNarrowedTyAt(recvIx, fnIx) < 0 { return false }
   const r = nodeAt(unwrapParen(recvIx))
   if r is Ident {
     if capturedKindOf(fnIx, r.identName) != null {
-      if !capturedIsUnionBox(fnIx, r.identName) { return "" }
+      return capturedIsUnionBox(fnIx, r.identName)
     }
-    return r.identName
   }
-  placeNarrowKeyOf(recvIx)
+  true
 }
 
 // `x is L` for a list type `L` over a box union with a list arm other than `L`: an arm fits when
@@ -6388,7 +6375,7 @@ function nullInstanceIsResult(isIx: i32, fnIx: i32): i32 {
   if tyAdmitsNull(nlt) { 1 } else { 0 }
 }
 
-// `recv is X` over an operand read at the rep the narrowing stack leaves it. Fixed,
+// `recv is X` over an operand read at its storage rep. Fixed,
 // load-bearing arm order: niche null tests, atom/literal-union membership, box-tag compares,
 // mono-static folds, then the variant tag+discriminant compare. A niche `is` assumes the checker
 // proved the tested shape is the sole non-null member, which monomorphization can break (D950).
@@ -7298,8 +7285,6 @@ function emitUnionBoxPush(_body: u8[], ix: i32, fnIx: i32, ec: ExpCtx) {
   } else {
     // A captured union box: read the field raw out of the env (`recover` false — the box is
     // the field's type, and the unbox every caller appends after this push is the recovery).
-    // The narrowing that makes such a read an unbox is the closure's declaration-site
-    // narrowing, replayed onto the narrowing stack by `capNarrowSeed`.
     if emitCapturedRead(_body, name, fnIx, false, ec) == 1 { return 0 }
     const gIdx = globalIndexOf(name)
     if gIdx < 0 {
@@ -7399,23 +7384,20 @@ function emitValueUnionUnboxRead(
   emitUnionUnboxTail(ak)
 }
 
-// Read the name, field or cell at `exprIx`, narrowed under `key` to `A | null` for `A` of atom
-// kind `ak` (1 boolean, 2 string), as that niche: read once with the narrowing lifted, which
+// Read the name, field or cell at `exprIx`, narrowed to `A | null` for `A` of atom kind `ak`
+// (1 boolean, 2 string), as that niche: read once at its storage, which
 // delivers the union box, park it, and turn its null tag into the niche's null and any other
 // tag into the unboxed payload (D2590).
 function emitNarrowedNicheRead(
   body: u8[],
   exprIx: i32,
-  key: string,
   ak: i32,
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  const masked = maskNarrowFor(key)
   const sMark = storageReadEnter(exprIx)
   const rc = emitExpr(body, exprIx, fnIx, ec)
   storageReadLeave(sMark)
-  unmaskNarrow(masked)
   if rc < 0 { return -1 }
   const st = nicheReadStashSlot()
   fbLocalSet(st)
@@ -8959,22 +8941,16 @@ function emitIfForEffect(body: u8[], ifIx: i32, fnIx: i32, ec: ExpCtx) {
   if s is IfStmt {
     if emitCondExpr(body, s.ifCond, fnIx, ec) < 0 { return -1 }
     fbIf(64) // 0x40 void
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rcT = emitArmForEffect(body, s.ifThen, fnIx, ec)
-    if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
     if s.ifElse >= 0 {
       fbElse()
-      const savedElseTop = narrowTop
-      const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
       let rcE = 0
       if nodeAt(s.ifElse) is IfStmt {
         rcE = emitIfForEffect(body, s.ifElse, fnIx, ec)
       } else {
         rcE = emitArmForEffect(body, s.ifElse, fnIx, ec)
       }
-      if narrowedElse { restoreNarrow(savedElseTop) }
       if rcE < 0 { return -1 }
     }
     fbEnd()
@@ -9209,19 +9185,14 @@ function emitUnionIfValueLink(
     const sg = staticIsGuard(s.ifCond, condStart)
     fbOpenIf()             // 0x04 if
     fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     let rcT = 0
     if sg == 0 {
       rcT = emitDeadValueArm(s.ifThen)
     } else {
       rcT = emitUnionIfArm(body, unionName, unionTy, s.ifThen, fnIx, ec)
     }
-    if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
     fbElse() // 0x05 else
-    const savedElseTop = narrowTop
-    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     let rc = 0
     if noElse {
       fbI32Rel(RS_TAG, nullBoxTag())
@@ -9230,7 +9201,7 @@ function emitUnionIfValueLink(
     } else {
       const els = nodeAt(s.ifElse)
       if els is IfStmt && !ifJoinAdaptsScalar(s.ifElse, fnIx) {
-        if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
+        open.push(-1)
         return 1 // `else if`: the next link, which the caller emits into this open frame
       } else if els is IfStmt {
         rc = emitUnionBoxArg(body, unionName, unionTy, s.ifElse, fnIx, ec)
@@ -9240,7 +9211,6 @@ function emitUnionIfValueLink(
         rc = emitUnionIfArm(body, unionName, unionTy, s.ifElse, fnIx, ec)
       }
     }
-    if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
     fbEnd() // 0x0b end
     return 0
@@ -9567,26 +9537,21 @@ function emitVariantIfValueLink(
     } else {
       fbValtype("variant", vi) // result blocktype: the variant struct `(ref $(uVarHeap[vi]))`
     }
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     let rcT = 0
     if sg == 0 {
       rcT = emitDeadValueArm(s.ifThen)
     } else {
       rcT = emitVariantIfArm(body, vi, s.ifThen, fnIx, ec)
     }
-    if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
     fbElse() // 0x05 else
-    const savedElseTop = narrowTop
-    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     let rc = 0
     if noElse {
       rc = fbRefNullOfKind("variant", vi)
     } else {
       const els = nodeAt(s.ifElse)
       if els is IfStmt {
-        if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
+        open.push(-1)
         return 1 // `else if`: the next link, which the caller emits into this open frame
       } else if sg == 1 {
         rc = emitDeadValueArm(s.ifElse)
@@ -9594,7 +9559,6 @@ function emitVariantIfValueLink(
         rc = emitVariantIfArm(body, vi, s.ifElse, fnIx, ec)
       }
     }
-    if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
     fbEnd() // 0x0b end
     return 0
@@ -20778,7 +20742,7 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   if ctx.nulLitUnion {
     const nlk = narrowedNulLitPinBoxKey(exprIx, fnIx)
     if nlk != "" {
-      return emitNarrowedNicheRead(body, exprIx, nlk, NICHE_NUL_LIT, fnIx, ec)
+      return emitNarrowedNicheRead(body, exprIx, NICHE_NUL_LIT, fnIx, ec)
     }
   }
   const e = nodeAt(exprIx)
@@ -20805,16 +20769,7 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   }
   if e is Member || e is Index {
     const pnk = placeNicheAtomKind(exprIx, fnIx)
-    if pnk >= 0 {
-      return emitNarrowedNicheRead(
-        body,
-        exprIx,
-        placeNarrowKeyOf(exprIx),
-        pnk,
-        fnIx,
-        ec,
-      )
-    }
+    if pnk >= 0 { return emitNarrowedNicheRead(body, exprIx, pnk, fnIx, ec) }
   }
   if e is Unary { return emitUnaryNode(body, e, exprIx, fnIx, ctx, ec) }
   if e is AsExpr { return emitAsCast(body, e, exprIx, fnIx, ec) }
@@ -21184,19 +21139,14 @@ function emitIfExprRefLink(
     } else {
       fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
     }
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     let rcT = 0
     if sg == 0 {
       rcT = emitDeadValueArm(s.ifThen)
     } else {
       rcT = emitRefIfArm(body, s.ifThen, fnIx, kind, slot, nulJoin, ec)
     }
-    if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
     fbElse() // 0x05 else
-    const savedElseTop = narrowTop
-    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     let rc = 0
     if noElse {
       // The synthesized false path: the rep's own null, matching the nullable blocktype
@@ -21206,7 +21156,7 @@ function emitIfExprRefLink(
     } else {
       const els = nodeAt(s.ifElse)
       if els is IfStmt {
-        if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
+        open.push(-1)
         return 1 // `else if`: the next link, which the caller emits into this open frame
       } else if sg == 1 {
         rc = emitDeadValueArm(s.ifElse)
@@ -21214,7 +21164,6 @@ function emitIfExprRefLink(
         rc = emitRefIfArm(body, s.ifElse, fnIx, kind, slot, nulJoin, ec)
       }
     }
-    if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
     fbEnd() // 0x0b end
     return 0
@@ -21233,7 +21182,6 @@ function emitIfExprRefLink(
 // than lowered against slots that belong to something else.
 function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
   scopePush()
-  armNarrowTops.push(narrowTop)
   const b = nodeAt(blockIx)
   if b is Block {
     const stmts = b.blkStmts
@@ -21251,13 +21199,10 @@ function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
     const savedLU = expCtxSwapLitUnion(0, ec)
     let i = 0
     while i + 1 < stmts.length {
-      preStmtNarrow(stmts[i])
       if emitStmtIn(body, stmts, i, fnIx, ec) < 0 {
         expCtxSwapLitUnion(savedLU, ec)
         return -1
       }
-      // A write in the prelude retires what it falsifies, as in any block (D2601).
-      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
     expCtxSwapLitUnion(savedLU, ec)
@@ -21277,16 +21222,8 @@ function armPreludeUnwalkedDecl(blockIx: i32): i32 {
 // return in one expression.
 function emitIfArmClose(rc: i32) {
   scopePop()
-  if armNarrowTops.length > 0 {
-    restoreNarrow(armNarrowTops[armNarrowTops.length - 1])
-    armNarrowTops.pop()
-  }
   rc
 }
-
-// The narrowing depth at each open arm, restored at its close: a prelude's pushes end with the
-// arm, while a retirement it made in place outlives it.
-const armNarrowTops: i32[] = []
 
 // The `emitFail` reason for an if-expression arm with no value on the stack: an empty arm
 // (no value expression at all), a void call (a well-formed expression yielding nothing), or
@@ -21439,26 +21376,21 @@ function emitIfExprAsLink(
     if emitCondExpr(body, s.ifCond, fnIx, ec) < 0 { return -1 }
     const sg = staticIsGuard(s.ifCond, condStart)
     fbIf(kind) // 0x04 if, <kind> result blocktype
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     let rcT = 0
     if sg == 0 {
       rcT = emitDeadValueArm(s.ifThen)
     } else {
       rcT = emitNicheArmValueAs(body, s.ifThen, fnIx, kind, ifIx, ec)
     }
-    if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
     fbElse() // 0x05 else
-    const savedElseTop = narrowTop
-    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     let rc = 0
     if noElseNiche {
       if nodeTyIsNulBool(ifIx) { fbI32Const(2) } else { fbI32Const(0 - 1) }
     } else {
       const els = nodeAt(s.ifElse)
       if els is IfStmt {
-        if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
+        open.push(-1)
         return 1 // `else if`: the next link, which the caller emits into this open frame
       } else if sg == 1 {
         rc = emitDeadValueArm(s.ifElse)
@@ -21466,7 +21398,6 @@ function emitIfExprAsLink(
         rc = emitNicheArmValueAs(body, s.ifElse, fnIx, kind, ifIx, ec)
       }
     }
-    if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
     fbEnd() // 0x0b end
     return 0
@@ -21702,8 +21633,6 @@ function emitNullableIfBindingLink(
   if s is IfStmt {
     if emitCondExpr(body, s.ifCond, fnIx, ec) < 0 { return -1 }
     fbIf(64) // 0x04 if, 0x40 void blocktype
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rc = emitNulArmBlockToLocal(
       body,
       s.ifThen,
@@ -21714,18 +21643,15 @@ function emitNullableIfBindingLink(
       fnIx,
       ec,
     )
-    if narrowed { restoreNarrow(savedTop) }
     if rc < 0 { return -1 }
     fbElse() // 0x05 else
-    const savedElseTop = narrowTop
-    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     let erc = 0
     if s.ifElse < 0 {
       erc = emitNulNullToLocal(body, idx, rep)
     } else {
       const els = nodeAt(s.ifElse)
       if els is IfStmt && !ifJoinAdaptsScalar(s.ifElse, fnIx) {
-        if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
+        open.push(-1)
         return 1 // `else if`: the next link, which the caller emits into this open frame
       } else if els is IfStmt {
         erc = emitNulArmToLocal(
@@ -21751,7 +21677,6 @@ function emitNullableIfBindingLink(
         )
       }
     }
-    if narrowedElse { restoreNarrow(savedElseTop) }
     if erc < 0 { return -1 }
     fbEnd() // 0x0b end
     return 0
@@ -21914,8 +21839,6 @@ function emitUnionIfBindingSinkLink(
   if s is IfStmt {
     if emitCondExpr(body, s.ifCond, fnIx, ec) < 0 { return -1 }
     fbIf(64) // 0x04 if, 0x40 void blocktype
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rc = emitUnionArmBlockToPair(
       body,
       s.ifThen,
@@ -21925,18 +21848,15 @@ function emitUnionIfBindingSinkLink(
       fnIx,
       ec,
     )
-    if narrowed { restoreNarrow(savedTop) }
     if rc < 0 { return -1 }
     fbElse() // 0x05 else
-    const savedElseTop = narrowTop
-    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     let erc = 0
     if s.ifElse < 0 {
       erc = emitUnionNullToPair()
     } else {
       const els = nodeAt(s.ifElse)
       if els is IfStmt && !ifJoinAdaptsScalar(s.ifElse, fnIx) {
-        if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
+        open.push(-1)
         return 1 // `else if`: the next link, which the caller emits into this open frame
       } else if els is IfStmt {
         erc = emitUnionArmToPair(
@@ -21960,7 +21880,6 @@ function emitUnionIfBindingSinkLink(
         )
       }
     }
-    if narrowedElse { restoreNarrow(savedElseTop) }
     if erc < 0 { return -1 }
     fbEnd() // 0x0b end
     return 0
@@ -25004,24 +24923,19 @@ function emitCallCorePrint(
     || exprNullableMap(c.callArgs[0], fnIx)
   ) {
     const prNull = readNarrowedBoxToNull(c.callArgs[0], fnIx)
-    const prKey = if prNull { narrowKeyOfRead(c.callArgs[0]) } else { "" }
-    const prMask = maskNarrowFor(prKey)
     const prMark = if prNull { storageReadEnter(c.callArgs[0]) } else { -2 }
     const prRc = emitPrintNulRefNiche(body, c.callArgs[0], fnIx, ec)
     if prNull { storageReadLeave(prMark) }
-    unmaskNarrow(prMask)
     return prRc
   }
   // A read the narrowing pins to `null` is printed with the narrowing lifted, so the box's
   // own tag decides: every ladder below would unbox an arm it does not hold (D2801).
   if readNarrowedBoxToNull(c.callArgs[0], fnIx) {
-    const pnMask = maskNarrowFor(narrowKeyOfRead(c.callArgs[0]))
     const pnMark = storageReadEnter(c.callArgs[0])
     const pnWas = printPlanPinNull(true)
     const pnRc = emitCallCore(body, callIx, fnIx, ec)
     printPlanPinNull(pnWas)
     storageReadLeave(pnMark)
-    unmaskNarrow(pnMask)
     return pnRc
   }
   const pmk = mapReadScalarBoxKind(c.callArgs[0], fnIx)
@@ -30748,15 +30662,10 @@ function emitUnionRetIfSinkLink(
   if s is IfStmt {
     if emitCondExpr(body, s.ifCond, fnIx, ec) < 0 { return -1 }
     fbIf(64) // 0x04 if, 0x40 void blocktype
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rcT = emitUnionRetIfArm(body, s.ifThen, fnIx, ec)
-    if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
     fbElse() // 0x05 else
     // A VALUE union narrows to the COMPLEMENT set in the else-arm (see `emitStmt`).
-    const savedElseTop = narrowTop
-    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     let rc = 0
     if s.ifElse < 0 {
       // An else-less `if` yields `null` on its missing path (D2040): that path returns the
@@ -30764,12 +30673,11 @@ function emitUnionRetIfSinkLink(
       rc = emitNullForRet(body, fnIx)
       if rc >= 0 { rc = emitUnionRetSink(fnIx) }
     } else if nodeAt(s.ifElse) is IfStmt {
-      if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
+      open.push(-1)
       return 1 // `else if`: the next link, which the caller emits into this open frame
     } else {
       rc = emitUnionRetIfArm(body, s.ifElse, fnIx, ec)
     }
-    if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
     fbEnd() // 0x0b end
     fbUnreachable() // 0x00 — every arm exited; see the header
@@ -31118,9 +31026,8 @@ function emitLetDeclStmt(
     scopeBind(s.letName, slot)
     return 0
   }
-  // Asked BEFORE the init ladder below: an init carrying its own `if` pushes and pops the
-  // narrowing stack, and this boundary's question is about the value it receives. Consumed
-  // beside the two widen sites at the very bottom (D1031). The second disjunct is the cell's
+  // Asked before the init emits, about the value the binding receives. Consumed beside
+  // the two widen sites at the very bottom (D1031). The second disjunct is the cell's
   // own question, so a cell typed at the arm cannot be reached without its unbox.
   const letArmOwed = narrowedArmNeedsUnbox(s.letInit, fnIx)
     || letInitTyIsNarrowedArm(stmtIx, fnIx)
@@ -31466,8 +31373,6 @@ function emitLetDelivery(
   emitScalarListWidenSite(body, s.letInit, fnIx, localIsRef[slot])
   // the narrowed-arm unbox at the binding boundary (D1031): the same shape as the two
   // widen sites above, since the cell's own (kind, slot) pair is the destination.
-  // `letArmOwed` is taken before the init emits, since an init carrying its own `if`
-  // moves the narrowing stack.
   if letArmOwed && !letArmCell {
     const letArmHeap = armDestHeapOf(localIsRef[slot], localStructIdx[slot])
     if letArmHeap >= 0 {
@@ -32384,14 +32289,12 @@ function emitIntSwitch(
 }
 
 // Closes the frames an `else if` chain's links left open, innermost-first, as the recursive
-// emitters' unwinding did: each restores its else narrowing (`open` holds the target, or -1),
-// then — only when `rc` is not a failure — writes its `end` and marks the join unreachable
-// when every arm exited. Returns `rc`.
+// emitters' unwinding did, one per `open` entry: only when `rc` is not a failure, each writes
+// its `end` and marks the join unreachable when every arm exited. Returns `rc`.
 function closeIfChainFrames(open: i32[], rc: i32, unreachable: boolean) {
   let k = open.length
   while k > 0 {
     k = k - 1
-    if open[k] >= 0 { restoreNarrow(open[k]) }
     if rc >= 0 {
       fbEnd() // 0x0b end
       if unreachable { fbUnreachable() }
@@ -32403,8 +32306,7 @@ function closeIfChainFrames(open: i32[], rc: i32, unreachable: boolean) {
 function emitIfStmtStmt(body: u8[], stmtIx: i32, fnIx: i32, ec: ExpCtx) {
   // An `else if` chain is lowered along its spine, so its depth costs no stack (D1990): a link
   // whose else is the next link leaves its `if` frame open, and the open frames close
-  // innermost-first once the chain's last arm is emitted. Each entry is that link's else
-  // narrowing restore target, or -1.
+  // innermost-first once the chain's last arm is emitted. Each entry is one open frame.
   const open: i32[] = []
   // A chain ending a void body is in tail position in every arm (D4681).
   const tail = stmtIx >= 0 && stmtIx == voidTailAt
@@ -32443,10 +32345,7 @@ function emitIfLinkStmt(
   // test holds, so it lowers as the bare `else` — no comparison, no `if` frame. The narrowing
   // still runs, since the arm reads its own member's fields (`condProvenTrue`).
   if s.ifElse < 0 && condProvenTrue(s.ifCond) {
-    const pgTop = narrowTop
-    const pgNar = setNarrowFromCond(s.ifCond, fnIx)
     const pgRc = emitTailArm(body, s.ifThen, fnIx, tail, ec)
-    if pgNar { restoreNarrow(pgTop) }
     return pgRc
   }
   // A bare `{ … }` (lowered to `if true`) and a written `if true` run their arm
@@ -32469,24 +32368,19 @@ function emitIfLinkStmt(
   // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
   // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
   // outer narrowing around the branch so nesting and the else-branch are unaffected.
-  const savedTop = narrowTop
-  const narrowed = setNarrowFromCond(s.ifCond, fnIx)
   if staticGuard != 0 {
     if emitTailArm(body, s.ifThen, fnIx, tail, ec) < 0 { return -1 }
   } else {
     // D932 — the skipped arm's `let`s still own their collect-allocated slots.
     cursorAdvance(cursorSlotsUnder(s.ifThen))
   }
-  if narrowed { restoreNarrow(savedTop) }
   if s.ifElse >= 0 && staticGuard != 1 {
     fbElse() // 0x05 else
     // The then narrowing does not hold in the else-branch, where the guard is false: a value
     // union narrows to the complement set instead (`is T` removes `T`).
-    const savedElseTop = narrowTop
-    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     const els = nodeAt(s.ifElse)
     if els is IfStmt {
-      if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
+      open.push(-1)
       return 1
     }
     if els is Block {
@@ -32494,7 +32388,6 @@ function emitIfLinkStmt(
     } else {
       if emitStmt(body, s.ifElse, fnIx, ec) < 0 { return -1 }
     }
-    if narrowedElse { restoreNarrow(savedElseTop) }
   } else if s.ifElse >= 0 {
     // D932 — the statically-dead else arm, same slot accounting as the then skip.
     cursorAdvance(cursorSlotsUnder(s.ifElse))
@@ -32653,15 +32546,8 @@ function emitWhileLoop(
     fbI32Eqz() // 0x45 i32.eqz (invert: exit if condition was false)
     fbBrIf(1)  // 0x0d br_if, depth 1 = break out of block
   }
-  // the body is a narrowing scope (the checker's `checkWhileStmtNode` narrows it): the
-  // condition is re-tested every iteration, so a `while e != null { … }` body reads `e`
-  // unboxed. Pushed after `loopHoistOpen`, so the once-run hoist prologue sees the
-  // un-narrowed type and never reads a guarded receiver's header before the guard holds.
-  const whSavedTop = narrowTop
-  const whNarrowed = setNarrowFromCond(s.whileCond, fnIx)
   // body statements
   if emitStmts(body, s.whileBody, fnIx, ec) < 0 { return -1 }
-  if whNarrowed { restoreNarrow(whSavedTop) }
   fbBr(0) // 0x0c br, depth 0 = continue loop
   fbEnd() // 0x0b end (loop)
   loopContDepth.pop()
@@ -34050,9 +33936,6 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
     scopePush()
     const stmts = b.blkStmts
     const n = stmts.length
-    // A guard `if` (no else, then-branch always returns) narrows the REST of the
-    // body to the guard's complement (the host's post-early-return flow narrowing).
-    const savedGuardTop = narrowTop
     // void-context discard: in a void function, a value-bearing tail is not the
     // function's result — it lowers through the ordinary statement path (`emitStmt`),
     // which evaluates it for effect and drops what it leaves. Keyed on the function's void
@@ -34064,7 +33947,6 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
     }
     let i = 0
     while i < n {
-      preStmtNarrow(stmts[i])
       const isLast = i == n - 1 && !bodyIsVoid
       // Banked after whichever arm lowers it: an implicit return leaves through
       // `emitReturnExit`, so hooking the plain arm alone missed the tail statement.
@@ -34132,11 +34014,9 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
         }
         i = n
       } else {
-        pushPostGuardNarrow(stmts[i], fnIx)
         i = i + 1
       }
     }
-    restoreNarrow(savedGuardTop)
     scopePop()
     return 0
   }
@@ -34186,15 +34066,12 @@ function emitStmts(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
     // are dropped on exit.
     scopePush()
     const stmts = b.blkStmts
-    // Post-guard complement narrowing (see `emitFuncBody`/`pushPostGuardNarrow`).
-    const savedGuardTop = narrowTop
     let i = 0
     while i < stmts.length {
       // The statement's own byte range, so a trap frame names the line the instruction came
       // from rather than the declaration (ROADMAP row 22). Offsets are relative to `body`;
       // `emitFuncCode` rebases them onto the module with the rest of this frame's rows.
       const stmtAt = body.length
-      preStmtNarrow(stmts[i])
       if emitStmtIn(body, stmts, i, fnIx, ec) < 0 {
         scopePop()
         return -1
@@ -34210,11 +34087,9 @@ function emitStmts(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
         }
         i = stmts.length
       } else {
-        pushPostGuardNarrow(stmts[i], fnIx)
         i = i + 1
       }
     }
-    restoreNarrow(savedGuardTop)
     scopePop()
     return 0
   }
@@ -34233,13 +34108,9 @@ function emitStmtsTail(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
     if n == 0 { return emitFail("emitProgram: empty block in tail position") }
     // A tail-position nested block is its own lexical scope too (mirrors `collectLocals`).
     scopePush()
-    // Post-guard complement narrowing (see `emitFuncBody`/`pushPostGuardNarrow`) —
-    // pushed in the loop, active for the TAIL statement, restored on exit.
-    const savedGuardTop = narrowTop
     let i = 0
     let cut = false
     while i < n - 1 {
-      preStmtNarrow(stmts[i])
       if emitStmtIn(body, stmts, i, fnIx, ec) < 0 {
         scopePop()
         return -1
@@ -34256,7 +34127,6 @@ function emitStmtsTail(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
         cut = true
         i = n - 1
       } else {
-        pushPostGuardNarrow(stmts[i], fnIx)
         i = i + 1
       }
     }
@@ -34264,10 +34134,8 @@ function emitStmtsTail(body: u8[], blockIx: i32, fnIx: i32, ec: ExpCtx) {
     if !cut && blockTailIsDead(stmts) {
       rc = emitDeadTail(body, stmts, fnIx, ec)
     } else if !cut {
-      preStmtNarrow(stmts[n - 1])
       rc = emitStmtTail(body, stmts[n - 1], fnIx, ec)
     }
-    restoreNarrow(savedGuardTop)
     scopePop()
     return rc
   }
@@ -34353,23 +34221,18 @@ function emitIfLinkTail(
   if emitCondExpr(body, s.ifCond, fnIx, ec) < 0 { return -1 }
   const staticGuard = staticIsGuard(s.ifCond, condStart)
   fbIf(64) // 0x04 if, 0x40 void blocktype
-  const savedTop = narrowTop
-  const narrowed = setNarrowFromCond(s.ifCond, fnIx)
   if staticGuard != 0 {
     if emitStmtsTail(body, s.ifThen, fnIx, ec) < 0 { return -1 }
   } else {
     cursorAdvance(cursorSlotsUnder(s.ifThen))
   }
-  if narrowed { restoreNarrow(savedTop) }
   if s.ifElse >= 0 && staticGuard != 1 {
     fbElse() // 0x05 else
     // A VALUE union narrows to the COMPLEMENT set in the else-arm (see emitStmt).
-    const savedElseTop = narrowTop
-    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     const els = nodeAt(s.ifElse)
     if els is IfStmt {
       // `else if`: the next link, still in tail position.
-      if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
+      open.push(-1)
       return 1
     }
     if els is Block {
@@ -34377,7 +34240,6 @@ function emitIfLinkTail(
     } else {
       if emitStmtTail(body, s.ifElse, fnIx, ec) < 0 { return -1 }
     }
-    if narrowedElse { restoreNarrow(savedElseTop) }
   } else if s.ifElse >= 0 {
     cursorAdvance(cursorSlotsUnder(s.ifElse))
   }
@@ -34903,7 +34765,7 @@ function emitPrintNulLitUnion(
   // A `K | null` read out of a wider box converts to the niche first (D7965).
   const nlk = narrowedNulLitPinBoxKey(argIx, fnIx)
   if nlk != "" {
-    if emitNarrowedNicheRead(body, argIx, nlk, NICHE_NUL_LIT, fnIx, ec) < 0 {
+    if emitNarrowedNicheRead(body, argIx, NICHE_NUL_LIT, fnIx, ec) < 0 {
       return -1
     }
     setStrScrI(body, 0)
@@ -35705,7 +35567,7 @@ function emitIdentNode(
   const nNk = nicheReadKindAt(exprIx, fnIx)
   if nNk >= 0 {
     if identReadsUnionBox(isid, e.identName, exprIx, fnIx) {
-      return emitNarrowedNicheRead(body, exprIx, e.identName, nNk, fnIx, ec)
+      return emitNarrowedNicheRead(body, exprIx, nNk, fnIx, ec)
     }
   }
   // a union binding narrowed to a ref-element array arm reads unboxed to the reflist
@@ -37161,8 +37023,6 @@ function emitAsgValue(
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return emitFail("emitProgram: expected an assignment") }
   if emitAssign(body, asgIx, fnIx, ec) < 0 { return -1 }
-  // A box cell re-read at the one member the checker typed the value at (`asgReadNarrowTy`).
-  const asgTop = pushAsgReadNarrow(asgIx, fnIx)
   // The re-read yields the value just stored, so it is never a read before init (D2652).
   const savedGuardOff = initGuardOff
   initGuardOff = true
@@ -37170,7 +37030,6 @@ function emitAsgValue(
   const asgRc = emitExpr(body, a.binLeft, fnIx, ec)
   asgReReadLeave(asgMark)
   initGuardOff = savedGuardOff
-  if asgTop >= 0 { restoreNarrow(asgTop) }
   if asgRc >= 0 && unwidenOp >= 0 { wU8(unwidenOp) }
   asgRc
 }
@@ -37276,29 +37135,22 @@ function emitBinExprNode(
     }
   }
   // Short-circuit `&&`/`||` lower to a value-typed `if` (blocktype 0x7f): `a && b` is `if (a)
-  // { b } else { 0 }`, `a || b` is `if (a) { 1 } else { b }`. The right operand is a narrowing
-  // scope like an `if` arm — `&&` narrows it with `setNarrowFromCond`, `||` with
-  // `setNarrowFromCondElse`; skip that and a value-union box reaches an unnarrowed compare.
+  // { b } else { 0 }`, `a || b` is `if (a) { 1 } else { b }`.
   if e.binOp == "&&" || e.binOp == "||" {
     if emitExpr(body, e.binLeft, fnIx, ec) < 0 {
       return -1 // condition `a`
     }
     fbIf(127) // 0x04 if, 0x7f i32 result-type blocktype (yields an i32)
-    const scTop = narrowTop
     if e.binOp == "&&" {
       // then = b, else = 0
-      const scNarrowed = setNarrowFromCond(e.binLeft, fnIx)
       if emitExpr(body, e.binRight, fnIx, ec) < 0 { return -1 }
-      if scNarrowed { restoreNarrow(scTop) }
       fbElse() // 0x05 else
       fbI32Const(0)
     } else {
       // then = 1, else = b
       fbI32Const(1)
       fbElse() // 0x05 else
-      const scNarrowedElse = setNarrowFromCondElse(e.binLeft, fnIx)
       if emitExpr(body, e.binRight, fnIx, ec) < 0 { return -1 }
-      if scNarrowedElse { restoreNarrow(scTop) }
     }
     fbEnd() // 0x0b end
     return 0
@@ -39659,11 +39511,9 @@ function emitCoalesceGo(
   // A read the narrowing pins to `null` may have been written since the test (a loop, a
   // closure, a call), so the narrowing is lifted and the box tested at run time (D2801).
   if readNarrowedBoxToNull(lhsIx, fnIx) {
-    const cnMask = maskNarrowFor(narrowKeyOfRead(lhsIx))
     const cnMark = storageReadEnter(lhsIx)
     const cnRc = emitCoalesceBoxRuntime(body, e, exprIx, fnIx, ec)
     storageReadLeave(cnMark)
-    unmaskNarrow(cnMask)
     return cnRc
   }
   // A pop under a `.length` test of its receiver yields its element (D3558).

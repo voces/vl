@@ -36,7 +36,7 @@ const EMIT_SECTIONS = `${ROOT}/compiler/emit_sections.vl`;
 
 /** The control: a prologue reset whose clears are the only ones these variables have. */
 const CONTROL_RESET = "classifyStateReset";
-const CONTROL_NAMES = ["capFrame", "gckDepth", "irkDepth", "lrDepth", "narrowDropWin"];
+const CONTROL_NAMES = ["capFrame", "gckDepth", "irkDepth", "lrDepth", "bcDepth"];
 
 /** The index rule's control: the reset whose line D11770 added, and the register it clears. */
 const INDEX_CONTROL_RESET = "wasmEmitStateReset";

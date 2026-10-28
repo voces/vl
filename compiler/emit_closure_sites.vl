@@ -146,13 +146,9 @@ import {
   memberFieldCode,
   mfCallbackFe,
   objLitVariantIdxNoStructRow,
-  preStmtNarrow,
-  pushPostGuardNarrow,
   readLetDeclOf,
   refListElemNameOfExpr,
   retCapturedMapShape,
-  setNarrowFromCond,
-  setNarrowFromCondElse,
   stmtIsTailValue,
   structIndexOfExpr,
   structIndexOfLet,
@@ -234,7 +230,6 @@ import {
   fRetVoid,
   fnNestUsed,
   fnStmts,
-  narrowTop,
   rlElemName,
   sNames,
   sTyIx,
@@ -247,7 +242,6 @@ import {
   holeOperandTyOf,
   nodeTyInOf,
   pinSubOperandTyOf,
-  restoreNarrow,
 } from "./emit_ty_canon"
 import { unionStoreAtomKindOfSet } from "./emit_union_casts"
 import { i32ListHas } from "./listutil"
@@ -504,7 +498,7 @@ export function fnSigIdxOfFn(fe: i32) {
 }
 
 // Classify one valued return expression at `rx0` of the function at `fnStmts` position `i`,
-// under the current narrowing stack — the shared loop body of the narrowing-aware walk.
+// the shared loop body of the return walk.
 export function criClassify(rx0: i32, i: i32) {
   let rx = rx0
   if fnCheckedRetIsMapUnion(i) || fnCheckedRetIsUnionBox(i) {
@@ -969,24 +963,20 @@ function criRetNestedFieldStructIdx(rx: i32, i: i32): i32 {
   -1
 }
 
-// Walk a block's statements classifying every `return <e>` under the same narrowing the
-// emit loops apply: each `if` arm under its condition's then or else narrowing, and a
-// divergent guard narrowing the rest of the block. The stack rewinds at block exit. `tail`
+// Walk a block's statements classifying every `return <e>`, each `if` arm included. `tail`
 // says whether the block's last statement is the function's value: only then is it one.
 export function criWalkBlock(blockIx: i32, i: i32, tail: boolean) {
   if blockIx < 0 { return 0 }
   const b = nodeAt(blockIx)
   if b is Block {
     const stmts = b.blkStmts
-    const savedGuardTop = narrowTop
     let k = 0
     while k < stmts.length {
       // An if-arm's last statement may be a bare tail value rather than an explicit
-      // `return`. For an anonymous lambda, classify it under the arm's active narrowing so a
+      // `return`. For an anonymous lambda, classify it so a
       // value-if union return types from its arms. Lambda-gated to leave named-function
       // inference unchanged; an arm of an `if` that is not itself the tail is a statement.
       const last = k == stmts.length - 1
-      preStmtNarrow(stmts[k])
       if (
         tail
         && last
@@ -996,10 +986,8 @@ export function criWalkBlock(blockIx: i32, i: i32, tail: boolean) {
         criClassify(stmts[k], i)
       }
       criWalkStmt(stmts[k], i, tail && last)
-      pushPostGuardNarrow(stmts[k], fnStmts[i])
       k = k + 1
     }
-    restoreNarrow(savedGuardTop)
     return 0
   }
   criWalkStmt(blockIx, i, tail)
@@ -1014,22 +1002,14 @@ function criWalkStmt(stmtIx: i32, i: i32, tail: boolean) {
       return 0
     }
     IfStmt => {
-      // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). Each
-      // link's else narrowing holds across the links below it; the outermost restore is the state
-      // the nested restores would have left.
-      let elseTop = -1
+      // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
       let cur = stmtIx
       while cur >= 0 {
         const c = nodeAt(cur)
         cur = -1
         if c is IfStmt {
-          const savedTop = narrowTop
-          setNarrowFromCond(c.ifCond, fnStmts[i])
           criWalkBlock(c.ifThen, i, tail)
-          restoreNarrow(savedTop)
           if c.ifElse >= 0 {
-            if elseTop < 0 { elseTop = narrowTop }
-            setNarrowFromCondElse(c.ifCond, fnStmts[i])
             if nodeAt(c.ifElse) is IfStmt {
               cur = c.ifElse
             } else {
@@ -1038,7 +1018,6 @@ function criWalkStmt(stmtIx: i32, i: i32, tail: boolean) {
           }
         }
       }
-      if elseTop >= 0 { restoreNarrow(elseTop) }
       return 0
     }
     WhileStmt => {

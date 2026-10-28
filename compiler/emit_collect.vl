@@ -440,7 +440,6 @@ import {
   mvValStructIdx,
   mvValTyIx,
   mvValVariantIdx,
-  narrowTop,
   nestedNameBySid,
   nliLetIxs,
   nliNames,
@@ -651,12 +650,8 @@ import {
   objVariantNameCtx,
   pinnedValTyOf,
   placeReadIsNarrowed,
-  preStmtNarrow,
-  pushPostGuardNarrow,
   refListElemNameOfExpr,
   refListSlotOfExpr,
-  setNarrowFromCond,
-  setNarrowFromCondElse,
   stmtIsTailValue,
   structIndexOfLet,
   structIndexOfObj,
@@ -855,7 +850,6 @@ import {
   holeRecordTyOf,
   mapReadScalarBoxKindTy,
   pinSubOperandTyOf,
-  restoreNarrow,
   variantRowOfShapeTy,
 } from "./emit_ty_canon"
 import {
@@ -917,7 +911,6 @@ import {
 import {
   arrLitElemKind,
   arrLitInferUnionElemName,
-  capNarrowSeed,
   forInStringSrc,
   forInU8Src,
   letListDestKindConflict,
@@ -3066,13 +3059,8 @@ export function computeRetInference() {
         if fn.fnRet < 0 && fRetVoid[i] == 0 {
           // Classify over every valued return, tail value first, not just the first: a function
           // whose first return is unclassifiable still types from its others, since the checker
-          // proved all returns agree. The walk is narrowing-aware (`criWalkBlock` mirrors the
-          // emit loops' narrowing), so a narrowed `v` classifies as its complement.
+          // proved all returns agree.
           criChanged = false
-          // The classifier's half of the capture-narrowing replay (the emitter's is in
-          // `emitFuncCode`): a closure whose value is a narrowed captured read has to be
-          // classified at the narrowed rep, or its inferred result disagrees with its bytes.
-          const savedCapNarrow = capNarrowSeed(i)
           const fnb = nodeAt(fnStmts[i])
           if fnb is FuncDecl {
             if fnb.fnBody >= 0 {
@@ -3104,7 +3092,6 @@ export function computeRetInference() {
             criWalkBlock(fnb.fnBody, i, true)
             criStructByFnTy(i)
           }
-          restoreNarrow(savedCapNarrow)
           if criChanged { changed = true }
         }
       }
@@ -3472,10 +3459,8 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
     // exit — the same save and restore `emitStmts` carries. Without it a binding below a
     // divergent guard classifies its init un-narrowed, so the slot falls to the i32 default
     // while `wasmEmit`, which does push it, stores the narrowed variant's field into that cell.
-    const savedGuardTop = narrowTop
     let i = 0
     while i < stmts.length {
-      preStmtNarrow(stmts[i])
       const s = nodeAt(stmts[i])
       if s is LetDecl {
         if collectLetLocal(stmts[i], s, fnIx) < 0 { return -1 }
@@ -3544,10 +3529,8 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
       // then-branch always returns narrows the rest of this block, so the bindings below it are
       // classified under the same narrowing the emit applies. The save above restores the depth
       // at block exit.
-      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
-    restoreNarrow(savedGuardTop)
     scopePop()
     return 0
   }
@@ -3954,10 +3937,7 @@ function markArmPrelude(blockIx: i32) {
 export function collectLocalsWhile(whileIx: i32, fnIx: i32) {
   const s = nodeAt(whileIx)
   if s is WhileStmt {
-    const wSavedTop = narrowTop
-    const wNarrowed = setNarrowFromCond(s.whileCond, fnIx)
     const wrc = collectLocals(s.whileBody, fnIx)
-    if wNarrowed { restoreNarrow(wSavedTop) }
     return wrc
   }
   emitFail("emitProgram: collectLocalsWhile: not a while statement")
@@ -3974,7 +3954,6 @@ export function collectLocalsIf(ifIx: i32, fnIx: i32) {
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). Each
   // link's else narrowing holds across the links below it; the outermost one restored is the
   // state the nested restores would have left.
-  let elseTop = -1
   let rc = 0
   let cur = ifIx
   while cur >= 0 {
@@ -3988,26 +3967,18 @@ export function collectLocalsIf(ifIx: i32, fnIx: i32) {
       // `let x = n.arrField` over a narrowed union-variant array field is classified as an
       // array local here: `exprArray` and `memFieldTypeCode` resolve the variant field type
       // only while narrowing is active. Save and restore, so the else branch is unaffected.
-      const savedTop = narrowTop
-      const narrowed = setNarrowFromCond(s.ifCond, fnIx)
       const trc = collectLocals(s.ifThen, fnIx)
-      if narrowed { restoreNarrow(savedTop) }
       if trc < 0 {
         rc = -1
       } else if s.ifElse >= 0 {
         // A union narrows to the complement set in the else arm, mirroring `emitStmt`'s else
         // lowering, so a binding of the narrowed variant's field inside `else { … }` is
         // classified under the narrowing the emit applies.
-        const savedElseTop = narrowTop
-        if setNarrowFromCondElse(s.ifCond, fnIx) {
-          if elseTop < 0 { elseTop = savedElseTop }
-        }
         if nodeAt(s.ifElse) is IfStmt { cur = s.ifElse }
         else if collectLocals(s.ifElse, fnIx) < 0 { rc = -1 }
       }
     }
   }
-  if elseTop >= 0 { restoreNarrow(elseTop) }
   rc
 }
 
@@ -4299,9 +4270,7 @@ function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
 // otherwise record no slot and emit against a local the vector never declared. `startScanIf`
 // (emit_sections.vl) hand-scans a top-level `if`'s condition for the scalar bits, not for this.
 function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990); the
-  // outermost else narrowing restored is the state the nested restores would have left.
-  let elseTop = -1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ifIx
   while cur >= 0 {
     const s = nodeAt(cur)
@@ -4311,15 +4280,8 @@ function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
       // Each arm is walked under its own narrowing, as `emitStmt` lowers it: an arm scanned
       // without its pin classifies a receiver as its whole union, and `.push`, `.pop` and
       // `.clear` find no row at emit time (D1823).
-      const savedTop = narrowTop
-      const narrowed = setNarrowFromCond(s.ifCond, fnIx)
       collectMemberPopRefSlots(s.ifThen, fnIx)
-      if narrowed { restoreNarrow(savedTop) }
       if s.ifElse >= 0 {
-        const savedElseTop = narrowTop
-        if setNarrowFromCondElse(s.ifCond, fnIx) {
-          if elseTop < 0 { elseTop = savedElseTop }
-        }
         if nodeAt(s.ifElse) is IfStmt {
           cur = s.ifElse
         } else {
@@ -4328,7 +4290,6 @@ function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
       }
     }
   }
-  if elseTop >= 0 { restoreNarrow(elseTop) }
   0
 }
 

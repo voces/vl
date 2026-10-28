@@ -4,21 +4,9 @@
 import { ArrayLit, BinExpr, Index, ObjLit, P, Unary, nodeAt } from "./ast"
 import { TyArray, tyAt } from "./check_types"
 import { parenPeelIx } from "./check_places"
-import {
-  crAfterBank,
-  crBeforeBank,
-  crCapWidenBank,
-  crCondDropBank,
-} from "./check_capture_rows"
-import { colAt, nodeTyIxOf } from "./check_node_tys"
-import {
-  UM_ASG_NAR_TY,
-  UM_ASG_TV_WRITE,
-  undoReplayBool,
-  undoReplayCol,
-  undoSetBool,
-  undoSetCol,
-} from "./check_map_undo"
+import { crCapWidenBank } from "./check_capture_rows"
+import { nodeTyIxOf } from "./check_node_tys"
+import {} from "./check_map_undo"
 
 // Cycle-guard stacks for `assignable` over recursive named types: a (src, dst) pair already
 // being compared higher in the recursion is assumed assignable — coinductive, so a
@@ -162,56 +150,11 @@ export function asgStoreTyOf(ix: i32): i32 {
 
 // ── getters (property-access-design.md §D3a) ─────────────────────────────────
 
-// D1736 — the re-narrow sidecar: at an assignment whose accepted write retired the target's
-// narrowing, the type the bare name reads at afterwards. Keyed by the assignment node, sized
-// with `isVarTyIx`, read through `asgNarTyIxOf`; -1 means the read is at the declared type.
-export let asgNarTyIx: i32[] = []
-export function asgNarTyIxSet(v: i32[]) { asgNarTyIx = v }
-
-// Per assignment node, the non-null type a straight-line write's null strip left its bare-name
-// target at, which the emitter needs where that name lives in a capture cell (D3288).
-export let asgStripTys: i32[] = []
-export function asgStripTysPush(v: i32) { asgStripTys.push(v) }
-export function asgStripTysSet(v: i32[]) { asgStripTys = v }
-export function asgStripTysSetAt(k: i32, v: i32) { asgStripTys[k] = v }
-
-export let asgKeepNarrow: {[i32]: boolean} = Map()
-export function asgKeepNarrowSet(v: {[i32]: boolean}) { asgKeepNarrow = v }
-export function asgKeepNarrowSetAt(k: i32, v: boolean) { asgKeepNarrow[k] = v }
-
-// Assignment nodes whose place reads at the member its pin lands on (`HD_TVW`, `HD_HWR`): the
-// emitter retires the place's narrowing there, and a name's pin that excludes null re-narrows it.
-export let asgTvWrite: {[i32]: boolean} = Map()
-export function asgTvWriteSet(v: {[i32]: boolean}) { asgTvWrite = v }
-
-// A monomorphized clone of node `from` answers what `from` did in the three banks above.
+// A monomorphized clone of node `from` answers what `from` did in the capture-widen bank.
 export function recordClonedCallRetire(from: i32, to: i32) {
   if from < 0 || to < 0 { return 0 }
-  const a = crAfterBank[from]
-  if a is string[] { crAfterBank[to] = a }
-  const b = crBeforeBank[from]
-  if b is string[] { crBeforeBank[to] = b }
-  const c = crCondDropBank[from]
-  if c is string[] { crCondDropBank[to] = c }
   const w = crCapWidenBank[from]
   if w is string[] { crCapWidenBank[to] = w }
-  carryAsgBanks(from, to)
-  0
-}
-
-// A clone of assignment `from` answers its write's narrowing banks (`asgNarTyIxOf`,
-// `asgStripTyOf`, `asgKeepsNarrowOf`, `asgTvWriteOf`), which are keyed by node.
-function carryAsgBanks(from: i32, to: i32) {
-  if from < 0 || from >= P.nodes.length { return 0 }
-  const nt = asgNarTyIxOf(from)
-  if nt >= 0 { recordAsgNarTyIx(to, nt) }
-  const st = asgStripTyOf(from)
-  if st >= 0 {
-    while asgStripTys.length <= to { asgStripTys.push(-1) }
-    asgStripTys[to] = st
-  }
-  if asgKeepsNarrowOf(from) { asgKeepNarrow[to] = true }
-  if asgTvWriteOf(from) { undoSetBool(UM_ASG_TV_WRITE, asgTvWrite, to, true) }
   0
 }
 
@@ -235,66 +178,6 @@ function asgNestedRhsBuilt(x: i32): boolean {
   false
 }
 
-// Whether the write at assignment node `ix` into a guard-narrowed bare name kept the narrowing it
-// found, so the reads after it lower at the member they already did.
-export function asgKeepsNarrowOf(ix: i32): boolean {
-  if asgKeepNarrow.length == 0 { return false }
-  asgKeepNarrow[ix] ?? false
-}
-
-// The type the assignment at node `ix` re-narrows its bare-name target to, or -1 when the
-// write retired no narrowing and the reads after it are at the declared type. The emitter's
-// half of the reads-only rule: it pushes the member this names (D1736).
-export function asgNarTyIxOf(ix: i32) { colAt(asgNarTyIx, ix) }
-
-// Whether the place the assignment at node `ix` writes reads at the member its pin lands on:
-// the reads after it carry the pin, not the template's narrowing (D3240).
-export function asgTvWriteOf(ix: i32): boolean {
-  if asgTvWrite.length == 0 { return false }
-  asgTvWrite[ix] ?? false
-}
-
-// The type the assignment at node `ix` null-stripped its bare-name target to, or -1.
-export function asgStripTyOf(ix: i32): i32 {
-  if ix < 0 || ix >= asgStripTys.length { return -1 }
-  asgStripTys[ix]
-}
-
-// Forget both answers banked at assignment node `ix`, before the check that re-derives them.
-export function clearAsgNarTyIx(ix: i32) {
-  if ix >= 0 && ix < asgNarTyIx.length {
-    undoSetCol(UM_ASG_NAR_TY, asgNarTyIx, ix, -1)
-  }
-  if asgKeepNarrow.length > 0 && (asgKeepNarrow[ix] ?? false) {
-    asgKeepNarrow[ix] = false
-  }
-  if asgTvWrite.length > 0 && (asgTvWrite[ix] ?? false) {
-    undoSetBool(UM_ASG_TV_WRITE, asgTvWrite, ix, false)
-  }
-  0
-}
-
-// Bank `asgNarTyIxOf`'s answer at the assignment node.
-export function recordAsgNarTyIx(ix: i32, ty: i32) {
-  if ix < 0 || ty < 0 { return 0 }
-  undoSetCol(UM_ASG_NAR_TY, asgNarTyIx, ix, ty)
-  0
-}
-
-// Bank a write whose reads the pin decides at assignment `ix`, place declared `dcl`.
-export function recordAsgTvWrite(ix: i32, dcl: i32) {
-  recordAsgNarTyIx(ix, dcl)
-  undoSetBool(UM_ASG_TV_WRITE, asgTvWrite, ix, true)
-  0
-}
-
-// Puts back the two write banks a rollback to undo-log row `undo` names (`RB_NODE_BANKS`).
-export function asgBanksUndo(undo: i32) {
-  undoReplayCol(undo, UM_ASG_NAR_TY, asgNarTyIx)
-  asgTvWrite = undoReplayBool(undo, UM_ASG_TV_WRITE, asgTvWrite)
-  0
-}
-
 export function asgRowsReset() {
   oerNodes = []
   oerSeen = Map()
@@ -303,10 +186,6 @@ export function asgRowsReset() {
   bgSrcStack = []
   bgDstStack = []
   asgStoreTys = []
-  asgNarTyIx = []
-  asgStripTys = []
-  asgKeepNarrow = Map()
-  asgTvWrite = Map()
   asgSrcStack = []
   asgDstStack = []
 }

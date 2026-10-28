@@ -1,9 +1,6 @@
-// `emit_mv_slots.vl` — which multi-value slot a value type or arm lowers to, and
-// the narrowing record a capture carries.
+// `emit_mv_slots.vl` — which multi-value slot a value type or arm lowers to, and the
+// lexical scope stack a function body's locals resolve through.
 
-import { FuncDecl, P, nodeAt, nodeChildrenPush } from "./ast"
-import { narrowKeyRoot } from "./check_getter_effects"
-import { capWidenOf } from "./check_leaf_steps"
 import { MAP_KEY_I32, MAP_KEY_I64 } from "./check_ty_rep"
 import {
   TyArray,
@@ -34,13 +31,8 @@ import {
   nameIsU8Array,
 } from "./emit_base"
 import { emitFail } from "./emit_bytes"
-import { fnStmtsPosOf } from "./emit_capture_frames"
 import { rlElemListRep } from "./emit_list_rep"
-import {
-  narrowLiveSlotsUnder,
-  narrowShadowSlot,
-  variantIndexOf,
-} from "./emit_narrow_slots"
+import { variantIndexOf } from "./emit_narrow_slots"
 import {
   MV_ARM_NOHINT,
   mvSlotArmMatches,
@@ -54,27 +46,14 @@ import {
   MVK_REF,
   RLK_MAP,
   VKind,
-  cnFe,
-  cnName,
-  cnSet,
-  cnTy,
-  cnVariant,
   fnRefPushSlots,
-  fnStmts,
   ia64Used,
   mI32Used,
   mI64Used,
-  monoOrigNode,
   mvRlSlot,
   mvValKind,
   mvValName,
   mvValVariantIdx,
-  narrowNames,
-  narrowRetired,
-  narrowSets,
-  narrowTop,
-  narrowTys,
-  narrowVariants,
   refPushBaseBySlot,
   refPushScratchBase,
   rlElemKindTbl,
@@ -93,141 +72,6 @@ import {
   unVarCount,
   unVarStart,
 } from "./emit_state"
-import { strListHas } from "./listutil"
-
-// Bank the narrowing active at the declaration site of the nested function at arena index
-// `fnIx`, for each key whose root the body reads: a free name in `ifree` or a module global in
-// `iglob`. Under nested guards the innermost is appended last, and a replay pushes records in
-// order, so the innermost wins, the same rule `narrowSlotOf` applies to the live stack.
-export function capNarrowRecord(
-  fnIx: i32,
-  ifree: string[],
-  iglob: {[string]: i32},
-) {
-  const fe = fnStmtsPosOf(fnIx)
-  if fe < 0 { return 0 }
-  const widened = capWidenOf(fnIx)
-  const slots = capNarrowSlotsOf(ifree, iglob)
-  let k = 0
-  while k < slots.length {
-    const i = slots[k]
-    const nm = narrowNames[i]
-    // A retired entry is not a declaration-site fact: the closure below the write reads its
-    // capture at the declared rep, the same as the live stack answers for it. Nor is one the
-    // checker widened in this body, since a writer may run before it does (D2402).
-    if !capWidened(widened, nm) && narrowShadowSlot(narrowKeyRoot(nm)) < i {
-      cnFe.push(fe)
-      cnName.push(nm)
-      cnVariant.push(narrowVariants[i])
-      cnTy.push(narrowTys[i])
-      cnSet.push(narrowSets[i])
-    }
-    k = k + 1
-  }
-  0
-}
-
-// The unretired stack slots whose key's root is in `ifree` or set in `iglob`, ascending: from
-// the stack's key indexes while they are few, so a closure costs its own captures' narrowings
-// rather than the whole stack a long frame grows (D5950).
-function capNarrowSlotsOf(ifree: string[], iglob: {[string]: i32}): i32[] {
-  const slots: i32[] = []
-  const seen: {[string]: boolean} = Map()
-  for r in ifree {
-    if !seen.has(r) {
-      seen[r] = true
-      narrowLiveSlotsUnder(r, slots)
-    }
-  }
-  for r in iglob.keys() {
-    if (iglob[r] ?? 0) == 1 && !seen.has(r) {
-      seen[r] = true
-      narrowLiveSlotsUnder(r, slots)
-    }
-  }
-  if slots.length * slots.length <= narrowTop * 4 {
-    let a = 1
-    while a < slots.length {
-      const v = slots[a]
-      let b = a
-      while b > 0 && slots[b - 1] > v {
-        slots[b] = slots[b - 1]
-        b = b - 1
-      }
-      slots[b] = v
-      a = a + 1
-    }
-    return slots
-  }
-  const all: i32[] = []
-  let i = 0
-  while i < narrowTop {
-    const root = narrowKeyRoot(narrowNames[i])
-    if (
-      (strListHas(ifree, root) || (iglob[root] ?? 0) == 1)
-      && narrowRetired[i] == 0
-    ) {
-      all.push(i)
-    }
-    i = i + 1
-  }
-  all
-}
-
-// The module-scope `for` variables whose body the recording walk is inside, innermost last:
-// a start-function local has no slot until the start function emits, which is after every
-// closure written in the loop, so a guard over one resolves its box from here (D3136).
-export const cnModLoopName: string[] = []
-export const cnModLoopIter: i32[] = []
-
-// The iterable of the innermost recorded module loop binding `name` to a box, or -1.
-export function cnModLoopIterOf(name: string): i32 {
-  let i = cnModLoopName.length - 1
-  while i >= 0 {
-    if cnModLoopName[i] == name { return cnModLoopIter[i] }
-    i = i - 1
-  }
-  -1
-}
-
-// Whether narrowing key `key` is one of the `widened` keys: a path whose captured narrowing the
-// checker dropped, or a name, also through its capture cell `v[0]` / `v$cb[0]`.
-function capWidened(widened: string[], key: string): boolean {
-  if widened.length == 0 { return false }
-  if strListHas(widened, key) { return true }
-  let k = key
-  if k.length > 3 && k.slice(k.length - 3, k.length) == "[0]" {
-    k = k.slice(0, k.length - 3)
-  }
-  if k.length > 3 && k.slice(k.length - 3, k.length) == "$cb" {
-    k = k.slice(0, k.length - 3)
-  }
-  strListHas(widened, k)
-}
-
-// Whether the subtree at `ix` holds a `FuncDecl` — the one node a recording `capScan` banks a
-// narrowing at, so a frame whose body holds none records nothing. A worklist, not recursion: a
-// long `else if` chain is that many levels deep and must cost no stack (D1990).
-export function subtreeHasFuncDecl(ix: i32): boolean {
-  const stack: i32[] = [ix]
-  while stack.length > 0 {
-    const cur = stack.pop() ?? -1
-    if cur >= 0 && cur < P.nodes.length {
-      if nodeAt(cur) is FuncDecl { return true }
-      nodeChildrenPush(cur, stack)
-    }
-  }
-  false
-}
-
-// The source node of top-level frame `fe`: the pre-pass original of a slot an instance
-// overwrote, an appended instance's origin's, or the slot's own.
-export function cnFrameOrigin(fe: i32, instOrig: {[i32]: i32}): i32 {
-  if fe < monoOrigNode.length { return monoOrigNode[fe] }
-  const of = instOrig[fe] ?? -1
-  if of >= 0 && of < monoOrigNode.length { return monoOrigNode[of] }
-  fnStmts[fe]
-}
 
 // Enter a new lexical block: remember the current binding count as this frame's
 // boundary. Returns 0.

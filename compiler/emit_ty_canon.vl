@@ -7,28 +7,22 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
-  IsExpr,
   LetDecl,
   MatchExpr,
   NullLit,
-  NumLit,
   Param,
-  Unary,
   nodeAt,
 } from "./ast"
 import { holePinReadOf, joinPinnedArmLit } from "./check_emit_queries"
 import { isJoinHoleUnion } from "./check_core_state"
-import { narrowKeyRoot } from "./check_getter_effects"
 import { nodeTyPinIxOf } from "./check_hole_pins"
 import { elabNodeTyAt } from "./emit_elab"
-import { condRhsRetiredOf, fusedMapReadRecvIx } from "./check_leaf_steps"
-import { isVarTyIxOf } from "./check_list_union"
-import { cmpLitNodeOf } from "./check_match_desugar"
+import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { nodeTyIsNullable, nodeTyIxOf } from "./check_node_tys"
 import { cexLitPeel } from "./check_num_lits"
 import { tyIsTpJoinUnion } from "./check_tp_join"
 import { mapValSoftBase } from "./check_ty_relate"
-import { MAP_KEY_I32, MAP_KEY_I64, isValueUnionName } from "./check_ty_rep"
+import { MAP_KEY_I32, MAP_KEY_I64 } from "./check_ty_rep"
 import {
   T,
   TyArray,
@@ -42,7 +36,6 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
-  litBaseTy,
   mkArrayTy,
   mkArrayViewTy,
   mkNullableTyOf,
@@ -57,35 +50,17 @@ import {
   tyPrimNameOf,
   tySame,
   tyScalarBaseIs,
-  tyToNominalName,
   tyToStr,
 } from "./check_types"
 import { tyOfMembers } from "./check_union_mint"
-import {
-  mapShapeFoldSet,
-  parentLetOf,
-  strLess,
-  subscriptKeyLexemeOf,
-  unwrapParen,
-} from "./emit_base"
+import { mapShapeFoldSet, parentLetOf, strLess, unwrapParen } from "./emit_base"
 import { fnStmtsPosOf, nodeTyAt, readNarrowedTyAt } from "./emit_capture_frames"
 import { vkListClass } from "./emit_list_rep"
 import { mvUnionIsScalarNull } from "./emit_map_value_slots"
 import { mapMonoShapeOfKey, mvSlotOfValTyK } from "./emit_mv_slots"
-import {
-  NARROW_TYPED,
-  narrowElseRestore,
-  narrowPathIdx,
-  narrowRetireSlot,
-  narrowShadowSlot,
-  narrowSlotOf,
-  retireNarrowFor,
-  variantIndexOf,
-} from "./emit_narrow_slots"
 import { ifArmValueExpr, paramTypeNode } from "./emit_query"
 import {
   RepDesc,
-  boxTagOfTy,
   mapShapeKeyKind,
   nulScalarBoxAtomOf,
   repOfNodeAt,
@@ -119,31 +94,10 @@ import {
   monoPinSubRow,
   monoPinSubT,
   mvValKind,
-  narrowNames,
-  narrowRetired,
-  narrowSets,
-  narrowTop,
-  narrowTys,
-  narrowVariants,
   uVarTyIx,
 } from "./emit_state"
-import {
-  msHasNull,
-  msKeepTy,
-  msMemberAtomsOfSet,
-  msMemberCount,
-  msSetOfTyAny,
-  msSetOfUnion,
-  removeAtomFromSetOf,
-  unMemIsMap,
-  unMemPeelAliasWrapper,
-  unionMemberCountOfName,
-  unionMemberSetOf,
-  unionNameHasNull,
-  unionNameNonNullCount,
-  unionSetMemberCount,
-} from "./emit_union_registry"
-import { i32ListHas, strListHas } from "./listutil"
+import { unMemIsMap, unMemPeelAliasWrapper } from "./emit_union_registry"
+import { i32ListHas } from "./listutil"
 import {
   bindGenWalk,
   holeJoinRefoldOf,
@@ -155,308 +109,8 @@ import {
   flattenVariantsInto,
   tyEmitPrimOf,
   tyHasTyVar,
-  tyLitSetMemberLexes,
   tyMapValOf,
 } from "./tyquery"
-
-// The set a null test over the index cell keyed `ik` subtracts from: a live narrowing that
-// an `is` complement left narrower than the declared set and still admitting `null`, else
-// its element union `un`'s declared set (D2586).
-export function indexCellCurSet(ik: string, un: string): string {
-  const slot = indexCellCurSlot(ik, un)
-  if slot < 0 { return unionMemberSetOf(un) }
-  narrowVariants[slot]
-}
-
-// The set id of `indexCellCurSet(ik, un)`; -1 when the set is uncovered.
-export function indexCellCurSetId(ik: string, un: string): i32 {
-  const slot = indexCellCurSlot(ik, un)
-  if slot < 0 { return msSetOfUnion(un) }
-  narrowSets[slot]
-}
-
-// The live narrowing slot `indexCellCurSet` answers from, or -1 for the declared set.
-function indexCellCurSlot(ik: string, un: string): i32 {
-  const slot = narrowSlotOf(ik)
-  if slot < 0 { return -1 }
-  const cur = narrowVariants[slot]
-  if cur == "" || cur == "null" { return -1 }
-  if cur == NARROW_TYPED {
-    const s = narrowSets[slot]
-    if !msHasNull(s) || msMemberCount(s) >= unionMemberCountOfName(un) {
-      return -1
-    }
-    return slot
-  }
-  if (
-    removeAtomFromSetOf(narrowSets[slot], cur, "null", narrowTys[slot])
-    == cur
-  ) {
-    return -1
-  }
-  if unionSetMemberCount(cur) >= unionMemberCountOfName(un) { return -1 }
-  slot
-}
-
-// Is `k` a place BELOW `tgt` — `tgt[…]`, `tgt.f`, or anything under those? The emitter's
-// copy of `writeRetiresNarrowing`'s prefix legs, in both separators, so a write retires the
-// same keys on both sides of the compiler.
-function keyIsBelow(k: string, tgt: string): boolean {
-  const n = tgt.length
-  if k.length <= n + 1 { return false }
-  if k[n] != '[' && k[n] != '.' { return false }
-  k.slice(0, n) == tgt
-}
-
-// Retire every live narrowing whose key is a place below the one keyed `root` — the
-// emitter twin of `retireNarrowingsForWrite`'s prefix rule. Needed because the checker
-// retires and re-types a write's reads at the declared rep, which for a niche cell is one
-// `print` renders fine, so the program stays check-clean while the stale emit-side entry traps.
-export function retireNarrowForIndexCells(root: string) {
-  if root == "" || narrowTop == 0 { return 0 }
-  const l = narrowPathIdx[narrowKeyRoot(root)]
-  if l == null { return 0 }
-  // A path below the root's innermost shadow is the outer binding's, and stays.
-  const shadow = narrowShadowSlot(narrowKeyRoot(root))
-  // Keeps the entries this write leaves standing, so the next write does not re-read the rest.
-  const keep: i32[] = []
-  let j = 0
-  while j < l.length {
-    const s = l[j]
-    if s >= 0 && s < narrowTop && narrowRetired[s] == 0 {
-      if s > shadow && keyIsBelow(narrowNames[s], root) {
-        narrowRetireSlot(s)
-      } else {
-        keep.push(s)
-      }
-    }
-    j = j + 1
-  }
-  narrowPathIdx[narrowKeyRoot(root)] = keep
-  0
-}
-
-// Retire the narrowings the left operand of the `&&`/`||` at `opIx` pushed from slot `mark` on
-// that its right operand writes, as the checker drops those facts (D2589). A re-test in the
-// right operand pushes afresh above them.
-export function retireRhsWritten(opIx: i32, mark: i32) {
-  const gone = condRhsRetiredOf(opIx)
-  if gone.length == 0 { return 0 }
-  let i = mark
-  while i < narrowTop {
-    if narrowRetired[i] == 0 && strListHas(gone, narrowNames[i]) {
-      narrowRetireSlot(i)
-    }
-    i = i + 1
-  }
-  0
-}
-
-// `x == L` over a literal union (Q10): the receiver `x`, or -1 when the checker banked no literal
-// test at `condIx` (a plain `string` or `i32` operand, which narrows nothing).
-export function litEqRecv(condIx: i32): i32 {
-  if condIx < 0 || isVarTyIxOf(condIx) < 0 { return -1 }
-  const c = nodeAt(condIx)
-  if !(c is BinExpr) { return -1 }
-  if litEqLexeme(c.binRight) != "" { return c.binLeft }
-  if litEqLexeme(c.binLeft) != "" { return c.binRight }
-  -1
-}
-
-// The `is` spelling of an operand the checker reads as a literal (`cmpLitNodeOf`) — its source
-// lexeme — or "" when it is not one.
-function litEqLexeme(ix: i32): string {
-  const lx = cmpLitNodeOf(ix)
-  if lx < 0 { return "" }
-  const e = nodeAt(lx)
-  if e is NumLit { return e.numText }
-  subscriptKeyLexemeOf(lx)
-}
-
-// The tested literal of a comparison `litEqRecv` accepted.
-export function litEqVariant(condIx: i32): string {
-  const c = nodeAt(condIx)
-  if c is BinExpr {
-    const r = litEqLexeme(c.binRight)
-    if r != "" { return r }
-    return litEqLexeme(c.binLeft)
-  }
-  ""
-}
-
-// The name a narrowing test of the operand at `ix` narrows: the target of an assignment it tests
-// (`(x = e) != null` narrows `x`, the checker's `asgTestedPlace`), else `ix`. -1 stays -1.
-export function asgTestedIdent(ix: i32): i32 {
-  if ix < 0 { return ix }
-  const u = unwrapParen(ix)
-  if u < 0 { return ix }
-  const n = nodeAt(u)
-  if n is BinExpr {
-    if n.binOp == "=" {
-      const t = unwrapParen(n.binLeft)
-      if t >= 0 && nodeAt(t) is Ident { return t }
-    }
-  }
-  ix
-}
-
-// The one base of the literals the checker typed null compare `condIx`'s operand at beside
-// `null`, or -1 when the operand's type is anything else.
-export function nullCmpLitBase(condIx: i32, fnIx: i32): i32 {
-  const ref = nullCmpRefOf(condIx)
-  if ref < 0 { return -1 }
-  const ty = nodeTyAt(ref, fnIx)
-  if ty < 0 || ty >= T.tys.length { return -1 }
-  let inner = ty
-  let sawNull = false
-  const t = tyAt(ty)
-  if t is TyNullable {
-    sawNull = true
-    inner = t.nInner
-    if inner < 0 || inner >= T.tys.length { return -1 }
-  }
-  const it = tyAt(inner)
-  const mems = if it is TyUnion { it.uMembers } else { [inner] }
-  let base = -1
-  for m in mems {
-    if m < 0 || m >= T.tys.length { return -1 }
-    const mt = tyAt(m)
-    if mt is TyLit {
-      const b = litBaseTy(mt)
-      if base >= 0 && base != b { return -1 }
-      base = b
-    } else if tyPrimNameOf(m) == "null" {
-      sawNull = true
-    } else {
-      return -1
-    }
-  }
-  if !sawNull { return -1 }
-  base
-}
-
-// The non-null operand of a `x == null` / `x != null` comparison at `condIx` (parens
-// peeled, either operand order), or -1 when `condIx` isn't a null compare. The one home
-// for that extraction — a grammar question (which side is the literal), not a per-rep
-// one, so a rep added to one selector can't get the peel subtly different from its siblings.
-export function nullCmpRefOf(condIx: i32) {
-  const c = nodeAt(condIx)
-  if c is BinExpr {
-    if c.binOp == "==" || c.binOp == "!=" {
-      const lhs = nodeAt(unwrapParen(c.binLeft))
-      const rhs = nodeAt(unwrapParen(c.binRight))
-      if rhs is NullLit { return unwrapParen(c.binLeft) }
-      if lhs is NullLit { return unwrapParen(c.binRight) }
-    }
-  }
-  -1
-}
-
-// Whether a place's union is a box a null compare narrows: a value union, or a struct union
-// with `null` and two or more arms — the same pair the ident arms split between them (D2565).
-export function nullCmpBoxUnion(un: string): boolean {
-  if isValueUnionName(un) { return true }
-  unionNameHasNull(un) && unionNameNonNullCount(un) >= 2
-}
-
-// D1193/D1194 — the spelling to push for `surv`, the sole survivor of a literal complement
-// over the union `uty`, or "" when this narrowing cannot name it. A value atom is the atom
-// `uty`'s member set spells it with; a struct arm is its nominal name, and only when
-// registered (`variantIndexOf`). Anything else answers "".
-export function litElseSurvName(uty: i32, surv: i32): string {
-  if boxTagOfTy(surv) >= 0 { return memberSetAtomOf(uty, surv) }
-  const nom = tyToNominalName(surv)
-  if nom == "" { return "" }
-  if variantIndexOf(nom) < 0 { return "" }
-  nom
-}
-
-// The one atom of union `uty`'s member set that `surv` covers, or "" when it covers none or
-// several.
-function memberSetAtomOf(uty: i32, surv: i32): string {
-  const atoms: string[] = []
-  if !msMemberAtomsOfSet(msKeepTy(msSetOfTyAny(uty), surv), atoms) { return "" }
-  if atoms.length != 1 { return "" }
-  atoms[0]
-}
-
-// The one base scalar every literal that survives `is variant` over the literal box `mems` has,
-// or -1: the else of `x is "s"` or `x is string` over `1 | 2 | "s"` holds an `i32` (D3522). A
-// member is ruled out by its lexeme or by its base's name; the box spans two bases or more.
-export function litBoxElseBase(mems: i32[], variant: string): i32 {
-  let survBase = -1
-  let hit = 0
-  const bases: i32[] = []
-  for m in mems {
-    if m < 0 { return -1 }
-    const mt = tyAt(m)
-    if !(mt is TyLit) { return -1 }
-    const b = litBaseTy(mt)
-    let seen = false
-    for o in bases {
-      if o == b { seen = true }
-    }
-    if !seen { bases.push(b) }
-    const lex = tyLitSetMemberLexes(m)
-    if (
-      (lex.length == 1 && lex[0] == variant)
-      || primNameStr(tyEmitPrimOf(b)) == variant
-    ) {
-      hit = hit + 1
-    } else if survBase < 0 {
-      survBase = b
-    } else if survBase != b {
-      return -1
-    }
-  }
-  if hit == 0 || bases.length < 2 { return -1 }
-  survBase
-}
-
-// False only when `setNarrowFromCondElse` provably pushes nothing for `condIx`: every arm there
-// needs an `is`, a `!`, or a `||` / `==` / `!=` at the top of the condition. Keep the two in step.
-export function condElseMayNarrow(condIx: i32): boolean {
-  const c = nodeAt(unwrapParen(condIx))
-  if c is IsExpr { return true }
-  if c is Unary { return c.unOp == "!" }
-  if c is BinExpr {
-    return c.binOp == "||" || c.binOp == "==" || c.binOp == "!="
-  }
-  condElseOtherKind()
-}
-
-// Every other condition kind (a name, a call, a literal, a member read) has no arm in
-// `setNarrowFromCondElseRaw`, so it pushes nothing.
-function condElseOtherKind(): boolean { false }
-
-// Retire every name in `names` — the checker's call retirements, mirrored (D2390). A name a
-// closure writes lives in a cell by then, `v[0]` for a `let` and `v$cb[0]` for a parameter or a
-// loop variable (`cboxWalk`), and its narrowing is keyed on that cell.
-export function retireNarrowNames(names: string[]) {
-  let i = 0
-  while i < names.length {
-    retireNarrowFor(names[i])
-    retireNarrowForIndexCells(names[i])
-    retireNarrowForIndexCells(names[i] + "$cb")
-    i = i + 1
-  }
-  0
-}
-
-// End the loop variable's shadow of `name` once its loop is done.
-export function unshadowNarrowFor(name: string) {
-  const b = narrowShadowSlot(name)
-  if b >= 0 { narrowRetired[b] = 1 }
-  0
-}
-
-// Rewind the narrowing stack depth back to `n` (drop bindings a branch pushed). The
-// arrays keep their backing slots — only the logical depth changes, so no `.pop()`.
-export function restoreNarrow(n: i32) {
-  narrowElseRestore(n)
-  narrowTop = n
-  0
-}
 
 // `t` through row `row` of `monoExactSubN`/`monoExactSubT`, at that row's owner (D9190).
 export function exactSubAt(t: i32, row: i32): i32 {
