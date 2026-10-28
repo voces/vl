@@ -1203,9 +1203,9 @@ axis(
 // closure captures the first. Both arms make the same closures in one frame, so the emitter's
 // per-frame cost cancels and only the per-name capture question moves: a walk of the frame per
 // captured name is quadratic in the many arm (D2529). The closures are never called: calling
-// each one cost both arms alike and super-quadratically (D5950), which drowned the walk and
-// read 1.02 with `crFrameDeclares` re-walking per name; the pair below grades the calls. Fuel
-// reads 1.10; re-walking per name in `crFrameDeclares` reads 1.51, in `crCaptureByRef` 2.19.
+// each one cost both arms alike and super-quadratically (D5950), which drowned the walk;
+// the pair below grades the calls. Fuel reads 1.10; re-walking the frame per name in
+// `crCaptureByRef` reads 2.19.
 const genNarrowedCaptures = (n: number, distinct: boolean): string => {
   const o: string[] = ["function m() {"];
   for (let i = 0; i < n; i++) {
