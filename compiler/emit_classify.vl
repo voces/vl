@@ -516,6 +516,8 @@ import {
   globalLetOf,
   globalLetOfSid,
   ifJoinTypedAtom,
+  lixFirstOf,
+  lixNextOf,
   maskNarrowFor,
   narrowElseHold,
   narrowElseLift,
@@ -639,6 +641,7 @@ import {
   nodeRepIsNulAtom,
   nodeTyIsNulScalarBox,
   nodeTyMapKeyIsLitUnion,
+  repAtomMk,
   repDescNone,
   repOfNode,
   repOfNodeAt,
@@ -853,6 +856,7 @@ import {
   globalIndexBySid,
   lfBlockOf,
   listIsIdentNames,
+  localDeclIx,
   localIsRef,
   localLitUnion,
   localLoopIter,
@@ -1036,6 +1040,7 @@ import {
   memoPassMoved,
 } from "./memo"
 import {
+  declOrigOf,
   identDeclOf,
   memberDeclOf,
   memberMethodOf,
@@ -3030,10 +3035,6 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   // A never-filled `let x = null` is the `null` type, cell `nullref` (D1576). Without it the
   // env field is an i32 holding 0 and the lambda reads a present value out of it.
   if letIsNulNone(letIx, fnIx) { return "nulnone" }
-  // A literal-union binding is an i32-backed interned atom, not a value-union box.
-  if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return "i32" }
-  // The `K | null` niche: the same i32 atom with the spare `-1` for null.
-  if letNulLitUnion(letIx, fnIx) { return "i32" }
   const nsk = letInitTyNarrowedScalarKind(letIx, fnIx)
   if nsk != null { return nsk }
   if (
@@ -3375,8 +3376,20 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
     bgSlotHave: false,
   }
   if letIsNulNone(letIx, fnIx) { return no }
-  if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return no }
-  if letNulLitUnion(letIx, fnIx) { return no }
+  // A literal-union binding is the i32 atom, whatever rep its held type reads as: annotated
+  // `: K`, off an atom initialiser, or the `K | null` niche with `-1` for null.
+  const atom = letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx)
+  if atom || letNulLitUnion(letIx, fnIx) {
+    const aty = letBindTy(letIx, fnIx)
+    const niche = !atom || (aty >= 0 && tyIsNulLitUnionNiche(aty))
+    return {
+      bgClaims: true,
+      bgRep: repAtomMk(if niche { 3 } else { 0 }),
+      bgTy: aty,
+      bgSlot: -1,
+      bgSlotHave: true,
+    }
+  }
   const ty = letBindTy(letIx, fnIx)
   if ty < 0 { return no }
   // A function value's cell is the closure rep whatever its type variables bind to; a list or
@@ -4399,12 +4412,6 @@ export function captureValKind(fe: i32, name: string): VKind {
             // field read's nullable slot goes unseen exactly where the ladder cannot ask. This
             // one is frame-blind: the field's storage decides it, not the scope (D1759).
             if initIsNestedStructFieldRead(b) { return nicheK }
-          }
-          // An initialiser committing a literal-union ATOM decides the env field whatever the
-          // annotation renders: an INLINE member set softens to `string` while a litunion array
-          // element arrives as the interned i32. Frame-blind, like the niche rung above (D1768).
-          if letInitIsLitAtom(b, parentBindingFrameArenaOf(fe, name)) {
-            return "i32"
           }
         }
         return annK
@@ -9267,6 +9274,13 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       // `exprIsLitAtom`'s capture channel, and the same node `captureValKind` sizes the env
       // field from. Checked first: a capture is none of the three channels below.
       if capturedIsNulLitUnion(fnIx, e.identName) { return true }
+      // A `let`: the slot the frame being emitted stored it in, else the storage column.
+      const nld = readLetDeclOf(e.identName, exprIx, fnIx)
+      if nld >= 0 {
+        const nown = readLetOwnerOf(nld, e.identName, fnIx)
+        if letReadSlotLitUnion(e.identName, nld, nown) == 0 { return false }
+        return bindingIsNulLitUnion(nld, nown)
+      }
       if fnIx >= 0 {
         const fn = nodeAt(fnIx)
         if fn is FuncDecl {
@@ -9281,12 +9295,8 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
             }
             i = i + 1
           }
-          const li = parentLetOf(fn.fnBody, e.identName)
-          if li >= 0 { return letNulLitUnion(li, fnIx) }
         }
       }
-      const gi = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
-      if gi >= 0 { return letNulLitUnion(gi, -1) }
       // A for-in loop var over a `(K | null)[]` — the one storage class the channels above
       // can't reach (no declaration node for an annotation). `declareForInLocals` flags its
       // slot as the atom; nullability comes from the checker's per-read recorded type.
@@ -10427,9 +10437,6 @@ export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
       return nodeRepIsAtom(bn.parType, ownerFnIx)
     }
     LetDecl => {
-      if letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx) {
-        return true
-      }
       return letBindRepClaims(bindIx, ownerFnIx)
         && letBindRep(bindIx, ownerFnIx).rdAtom == 1
     }
@@ -10449,7 +10456,9 @@ function bindingIsNulLitUnion(bindIx: i32, ownerFnIx: i32) {
       return nodeRepIsNulAtom(bn.parType, ownerFnIx)
     }
     LetDecl => {
-      return letNulLitUnion(bindIx, ownerFnIx)
+      if !letBindRepClaims(bindIx, ownerFnIx) { return false }
+      const rd = letBindRep(bindIx, ownerFnIx)
+      return rd.rdAtom == 1 && rd.rdNul == 3
     }
     // No other binding is a nullable literal union.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -11174,13 +11183,75 @@ export function fnReturnsLitAtom(fnIx: i32): boolean {
   pos >= 0 && pos < fRetLitAtom.length && fRetLitAtom[pos] == 1
 }
 
-// True if a name read `e` holds a literal-union atom: a capture, a flagged local, an atom
-// param, a global or frame binding, or a walk variable, each asked at its declaration.
+// The `LetDecl` a name read resolves to in frame `fnIx`, or -1 when it resolves to anything
+// else. A monomorphized instance's read names the generic's declaration, so the frame's own copy
+// is the slot collected for it, or the frame's binding of the name when the frame is not emitting.
+function readLetDeclOf(name: string, exprIx: i32, fnIx: i32): i32 {
+  const u = unwrapParen(exprIx)
+  const d = identDeclOf(u)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  if !(nodeAt(d) is LetDecl) { return -1 }
+  if fnIx < 0 || globalLetOfSid(sidLookup(name)) == d { return d }
+  if fnIx == emitCurFnIx {
+    const s = declSlotOfLet(name, d)
+    if s >= 0 { return localDeclIx[s] }
+    return d
+  }
+  const fl = frameLetOf(fnIx, name, u)
+  if fl >= 0 { return fl }
+  d
+}
+
+// The frame a read's `let` declaration `decl` lives in: -1 for a module global, else `fnIx`.
+function readLetOwnerOf(decl: i32, name: string, fnIx: i32): i32 {
+  if globalLetOfSid(sidLookup(name)) == decl { return -1 }
+  fnIx
+}
+
+// The slot `collectLocals` gave declaration `decl` of `name`, or a copy minted from it, in the
+// frame being emitted; -1 when none is collected yet.
+function declSlotOfLet(name: string, decl: i32): i32 {
+  const s = scopeSlotOf(name)
+  if s >= 0 && slotHoldsDecl(s, decl) { return s }
+  let pos = lixFirstOf(name)
+  while pos >= 0 {
+    if slotHoldsDecl(pos, decl) { return pos }
+    pos = lixNextOf(pos)
+  }
+  -1
+}
+
+// True when slot `s` holds `decl` or a copy minted from it.
+function slotHoldsDecl(s: i32, decl: i32): boolean {
+  if s >= localDeclIx.length { return false }
+  const sd = localDeclIx[s]
+  sd >= 0 && (sd == decl || declOrigOf(sd) == decl)
+}
+
+// The literal-union flag of the slot holding `let` declaration `decl` in frame `owner`: 1 or
+// 0 once the frame being emitted collected it, -1 when there is no slot to read.
+function letReadSlotLitUnion(name: string, decl: i32, owner: i32): i32 {
+  if owner < 0 || owner != emitCurFnIx { return -1 }
+  const s = declSlotOfLet(name, decl)
+  if s < 0 { return -1 }
+  if s < localLitUnion.length && localLitUnion[s] == 1 { 1 } else { 0 }
+}
+
+// True if a name read `e` holds a literal-union atom: a capture, a `let` by the storage chosen
+// for its declaration, an atom param, or a walk variable.
 function exprIsLitAtomIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // A captured variable, resolved against the enclosing frame's binding — the same node
   // `captureValKind` sizes the env field from, checked first because a capture shadows
   // nothing: it is by construction neither a local, param, nor global of the reader.
   if capturedIsLitAtom(fnIx, e.identName) { return true }
+  // A `let`: the slot the frame being emitted stored it in, else the storage column.
+  const ld = readLetDeclOf(e.identName, exprIx, fnIx)
+  if ld >= 0 {
+    const owner = readLetOwnerOf(ld, e.identName, fnIx)
+    const sl = letReadSlotLitUnion(e.identName, ld, owner)
+    if sl >= 0 { return sl == 1 }
+    return bindingIsLitAtom(ld, owner)
+  }
   const slot = declaredSlotOf(e.identName)
   if slot >= 0 && slot < localLitUnion.length {
     if localLitUnion[slot] == 1 { return true }
@@ -11192,17 +11263,6 @@ function exprIsLitAtomIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
     const r = nodeRepIsAtom(pt, fnIx)
     return r
   }
-  const gli = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
-  if gli >= 0 {
-    // An annotated `: K` global, or an un-annotated global whose init is an atom — the
-    // global dual of the `localLitUnion` init classification, through the same
-    // declaration-site answer the capture channel above asks for.
-    return bindingIsLitAtom(gli, -1)
-  }
-  // The frame's own `let`, asked outside the frame's emission, where no slot is collected
-  // yet: the declaration answers what `collectLocals` will flag the slot as.
-  const fli = frameLetOf(fnIx, e.identName, unwrapParen(exprIx))
-  if fli >= 0 { return bindingIsLitAtom(fli, fnIx) }
   // A walk variable asked outside its frame's emission, which has no slot to read yet.
   if readLoopVarIsLitAtom(unwrapParen(exprIx), fnIx) { return true }
   false
