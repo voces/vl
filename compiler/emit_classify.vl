@@ -298,6 +298,7 @@ import {
   objFieldVal,
   parentLetOf,
   parentLetOwnedBy,
+  parentLetOwnerOf,
   parentLetReadAt,
   parentLoopVarOf,
   placeNarrowKeyOf,
@@ -9309,10 +9310,6 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
             || tyIsNulLitUnionNiche(loopVarPinTyOf(exprIx, fnIx))
         }
       }
-      // …and one asked outside its frame's emission, found by its loop (D3169).
-      if readLoopVarIsLitAtom(unwrapParen(exprIx), fnIx) {
-        return nodeRepIsNulAtom(exprIx, fnIx)
-      }
       return false
     }
     // A `K | null` struct field read (`a.f`, code 30) is the niche i32 with the `-1`
@@ -10526,19 +10523,6 @@ export function forInVarIsLitAtom(
   false
 }
 
-// Whether the read `ix` in frame `fnIx` is a `for-in` element variable holding an
-// atom, found by the loop enclosing the read (D3169).
-function readLoopVarIsLitAtom(ix: i32, fnIx: i32): boolean {
-  const lp = readLoopNodeOf(ix, fnIx)
-  if lp < 0 { return false }
-  const ln = nodeAt(lp)
-  if ln is ForIn {
-    const it = frameBlindIter(ln.fiIter, fnIx)
-    return forInVarIsLitAtom(it, fnIx, forInElemKind(it, fnIx))
-  }
-  false
-}
-
 // The second name's twin: a map walk's literal-union value (D2656).
 export function forInPairVarIsLitAtom(iterIx: i32, fnIx: i32): boolean {
   if !forInPairIsMapVal(iterIx, fnIx) { return false }
@@ -11208,10 +11192,35 @@ function readLetDeclOf(name: string, exprIx: i32, fnIx: i32): i32 {
   d
 }
 
-// The frame a read's `let` declaration `decl` lives in: -1 for a module global, else `fnIx`.
+// The frame whose body declares a read's `let` `decl` (or a copy minted from it): `fnIx` or
+// the nearest enclosing frame, -1 for a module global or a module-scope block's binding (D14574).
 function readLetOwnerOf(decl: i32, name: string, fnIx: i32): i32 {
-  if globalLetOfSid(sidLookup(name)) == decl { return -1 }
-  fnIx
+  const sid = sidLookup(name)
+  if globalLetOfSid(sid) == decl { return -1 }
+  let f = fnIx
+  let pos = fnStmtsPosOf(fnIx)
+  while f >= 0 {
+    if frameDeclaresLet(f, sid, name, decl) { return f }
+    if pos < 0 || pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    if pos < 0 || pos >= fnStmts.length { return -1 }
+    f = fnStmts[pos]
+  }
+  -1
+}
+
+// Whether frame `fnIx`'s body holds `let` `decl` of `name`, or the copy an instance minted from it.
+function frameDeclaresLet(
+  fnIx: i32,
+  sid: i32,
+  name: string,
+  decl: i32,
+): boolean {
+  const fn = nodeAt(fnIx)
+  if !(fn is FuncDecl) { return false }
+  if parentLetOwnerOf(fn.fnBody, sid, decl) >= 0 { return true }
+  const fl = parentLetOf(fn.fnBody, name)
+  fl >= 0 && declOrigOf(fl) == decl
 }
 
 // The slot `collectLocals` gave declaration `decl` of `name`, or a copy minted from it, in the
@@ -11269,8 +11278,6 @@ function exprIsLitAtomIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
     const r = nodeRepIsAtom(pt, fnIx)
     return r
   }
-  // A walk variable asked outside its frame's emission, which has no slot to read yet.
-  if readLoopVarIsLitAtom(unwrapParen(exprIx), fnIx) { return true }
   false
 }
 
