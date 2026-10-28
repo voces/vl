@@ -13,6 +13,7 @@ import {
   TS_OBJ,
   TypeRef,
   annTsOf,
+  loopVarLoop,
   nodeAt,
   tsHasKind,
   tsKind,
@@ -47,7 +48,6 @@ import {
 } from "./check_types"
 import { sFieldTypeAt, structIndexOfTy } from "./emit_atom_kinds"
 import {
-  PL_READ_UNPLACED,
   annFnDecompose,
   annSplitPipe,
   moduleLocalLetOf,
@@ -58,7 +58,6 @@ import {
   normTypeAtom,
   parentLetCoversAt,
   parentLetOf,
-  parentLoopAt,
   parentLoopVarOf,
   tyIsBool,
   tyIsFuncType,
@@ -73,14 +72,9 @@ import {
   nodeTyAt,
   paramTyAt,
 } from "./emit_capture_frames"
-import {
-  bodyLetReadAtSid,
-  bodyReadInLoop,
-  bodyReadLet,
-  readSidOf,
-} from "./emit_fn_ret_kinds"
+import { bodyLetOfDecl, bodyLetReadAtSid } from "./emit_fn_ret_kinds"
 import { listRepOfFieldCode, listRepOfMf, listRepOrNull } from "./emit_list_rep"
-import { fnIndexOfInScopeAt, fnParamNodeOf } from "./emit_local_scope"
+import { fnIndexOfInScopeAt } from "./emit_local_scope"
 import { nonNulBaseOf } from "./emit_map_value_slots"
 import { mvListValKind, scalarListRepOfName } from "./emit_mv_slots"
 import { variantIndexOf } from "./emit_narrow_slots"
@@ -153,6 +147,7 @@ import {
 import { strContains } from "./strutil"
 import { mapSpellKeyEnd, mapSpellKeyName } from "./tyname"
 import { flattenVariantsInto, tyMapValOfHeld, tyPeelNul } from "./tyquery"
+import { declOrigOf, identDeclOf } from "./symbols"
 
 // The niche twin of `mvListValKind` — the nullable `VKind` a `{[K]: T[] | null}` value binds,
 // or null when the value is not a list. Composed on `mvListValKind` so the element-kind to rep
@@ -974,47 +969,52 @@ function frameBindingNode(fnIx: i32, name: string): i32 {
   -1
 }
 
-// `frameBindingNode` for a read at node `atIx` (-1: no position): the `let` or loop variable in
-// scope there shadows a parameter, and one in a block the read is outside binds nothing.
-function frameBindingNodeAt(fnIx: i32, name: string, atIx: i32): i32 {
-  if fnIx < 0 { return -1 }
-  const fn = nodeAt(fnIx)
-  if fn is FuncDecl {
-    const sid = readSidOf(name, atIx)
-    const li = bodyReadLet(fn.fnBody, sid, atIx)
-    if li == PL_READ_UNPLACED { return frameBindingNode(fnIx, name) }
-    if li >= 0 { return li }
-    if emitRootIx >= 0 && fn.fnBody <= emitRootIx {
-      const lp = parentLoopAt(fn.fnBody, sid, atIx)
-      if lp >= 0 { return lp }
-    } else if bodyReadInLoop(fn.fnBody, sid, atIx) {
-      return frameBindingNode(fnIx, name)
-    }
-    return fnParamNodeOf(fnIx, name)
+// The binding the name read at `atIx` denotes as seen from frame `fnIx` or a frame around it:
+// that frame's copy of the read's parameter or `let`, or the loop of a loop variable. -1 when
+// none is, the only case where the name can denote a module-level global or function.
+export function identBindingOfRead(fnIx: i32, atIx: i32): i32 {
+  const d = identDeclOf(unwrapParen(atIx))
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const lp = loopVarLoop(d)
+  if lp >= 0 { return lp }
+  const dn = nodeAt(d)
+  if dn is ForRange || dn is ForIn { return d }
+  if !(dn is Param || dn is LetDecl) { return -1 }
+  let f = fnIx
+  let pp = fnStmtsPosOf(fnIx)
+  let steps = 0
+  while f >= 0 && steps <= fnStmts.length {
+    const hit = frameCopyOfDecl(f, d)
+    if hit >= 0 { return hit }
+    if pp < 0 || pp >= fnParent.length { return -1 }
+    pp = fnParent[pp]
+    if pp < 0 || pp >= fnStmts.length { return -1 }
+    f = fnStmts[pp]
+    steps = steps + 1
   }
   -1
 }
 
-// The binding a bare identifier read at node `atIx` denotes, seen from inside the function at
-// arena index `fnIx`: this frame's own param/`let`/`for` variable, else the nearest enclosing frame
-// that binds it (a capture there). -1 when no scope in the chain binds it — the only case
-// where the name can denote a module-level global or function.
-export function identBindingNoLocal(fnIx: i32, name: string, atIx: i32): i32 {
-  const own = frameBindingNodeAt(fnIx, name, atIx)
-  if own >= 0 { return own }
-  let pp = fnStmtsPosOf(fnIx)
-  // `fnStmts.length` bounds the walk the way `fnIndexOfInScopeSid`'s does: a parent chain
-  // cannot outrun the function count, so a malformed `fnParent` cannot spin here.
-  let steps = 0
-  while pp >= 0 && steps <= fnStmts.length {
-    if pp >= fnParent.length { return -1 }
-    pp = fnParent[pp]
-    if pp < 0 || pp >= fnStmts.length { return -1 }
-    const hit = frameBindingNode(fnStmts[pp], name)
-    if hit >= 0 { return hit }
-    steps = steps + 1
+// Frame `fnIx`'s copy of parameter or `let` declaration `d`: `d` itself, or the one an instance
+// re-declared at its position; -1 when the frame declares neither.
+function frameCopyOfDecl(fnIx: i32, d: i32): i32 {
+  if fnIx < 0 || fnIx >= P.nodes.length || d < 0 || d >= P.nodes.length {
+    return -1
   }
-  -1
+  const fn = nodeAt(fnIx)
+  if !(fn is FuncDecl) { return -1 }
+  const dn = nodeAt(d)
+  if dn is Param {
+    for p in fn.fnParams {
+      if p == d || declOrigOf(p) == d { return p }
+      const pn = nodeAt(p)
+      if pn is Param && pn.pos == dn.pos && pn.parName == dn.parName {
+        return p
+      }
+    }
+    return -1
+  }
+  bodyLetOfDecl(fn.fnBody, d)
 }
 
 // Whether `name` read in the frame of function node `fnIx` (-1 for the module's statements)

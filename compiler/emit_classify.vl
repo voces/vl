@@ -275,7 +275,6 @@ import {
   objFieldVal,
   parentLetOf,
   parentLetOwnedBy,
-  parentLetOwnerOf,
   parentLetReadAt,
   parentLoopOfDecl,
   parentLoopVarOf,
@@ -365,7 +364,8 @@ import {
   fieldCodeOfTy,
 } from "./emit_field_codes"
 import {
-  bodyLetReadAt,
+  bodyLetOfDecl,
+  bodyLetOfRead,
   bodyLetReadAtSid,
   bodyReadLet,
   callsOfCallee,
@@ -384,7 +384,6 @@ import {
   paramNulMap,
   paramNulVariant,
   paramReadAt,
-  paramTypeNodeAt,
   popUnionBoxElem,
 } from "./emit_fn_ret_kinds"
 import {
@@ -572,6 +571,7 @@ import {
   paramMap,
   paramNulClosure,
   paramTypeNode,
+  paramTypeNodeOfRead,
 } from "./emit_query"
 import {
   TK_STR,
@@ -681,7 +681,7 @@ import {
   fnBlockShadowsAt,
   fnRetVariantIndexSid,
   frameBodyEnd,
-  identBindingNoLocal,
+  identBindingOfRead,
   identFnTypeAnnNodeAt,
   letAnnIsUnion,
   mfI32ResultOrColumn,
@@ -1799,7 +1799,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
     Ident => {
       // A parameter read typed `Circle | null`.
       if (paramNulVariant(fnIx, e.identName) && paramReadAt(fnIx, exprIx)) {
-        const pa = nulVariantIndexOf(paramTypeNodeAt(fnIx, e.identName, exprIx))
+        const pa = nulVariantIndexOf(paramTypeNodeOfRead(fnIx, exprIx))
         if pa >= 0 { return pa }
       }
       // A declared local carries its variant index in the slot's parallel column, put there
@@ -1823,7 +1823,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
       // is not enough: neither storage class is a global, and the declared-locals table that
       // would answer speaks only while that frame's body is emitted (D1635). Read in the frame
       // that OWNS the binding, so a nested initialiser resolves where it is written.
-      const fli = frameLetOf(fnIx, e.identName, exprIx)
+      const fli = frameLetOf(fnIx, exprIx)
       if fli >= 0 { return nulVariantIdxOfLetIn(fli, fnIx) }
       const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
       if mli >= 0 { return nulVariantIdxOfLetIn(mli, -1) }
@@ -2430,7 +2430,7 @@ export function mapRetExprShape(rx: i32, fe: i32) {
     // The `let` in scope at the read, which shadows a same-named parameter (D3295).
     let li = -1
     const fn = nodeAt(fnIx)
-    if fn is FuncDecl { li = bodyLetReadAt(fn.fnBody, e.identName, u) }
+    if fn is FuncDecl { li = bodyLetOfRead(fn.fnBody, u) }
     if (li < 0 && paramMap(fnIx, e.identName) && paramReadAt(fnIx, u)) {
       return paramMapShape(fnIx, e.identName)
     }
@@ -5713,7 +5713,7 @@ export function exprScalarWidth(exprIx: i32, fnIx: i32): string {
   }
   let ty = nodeTyAt(exprIx, fnIx)
   if n is Ident && ty >= 0 && tyHasTyVar(ty) {
-    const pt = nodeTyIxOf(paramTypeNodeAt(fnIx, n.identName, exprIx))
+    const pt = nodeTyIxOf(paramTypeNodeOfRead(fnIx, exprIx))
     if pt >= 0 && !tyHasTyVar(pt) { ty = pt }
   }
   if numUnionMinted && numBoxExpr(exprIx, ty) { return "" }
@@ -5856,7 +5856,7 @@ function cloArrBindingLitOf(ix: i32, fnIx: i32): i32 {
     let li = -1
     if fnIx >= 0 {
       const fn = nodeAt(fnIx)
-      if fn is FuncDecl { li = bodyLetReadAt(fn.fnBody, e.identName, ix) }
+      if fn is FuncDecl { li = bodyLetOfRead(fn.fnBody, ix) }
     }
     if li < 0 { li = globalLetOfIn(fnIx, e.identName, ix) }
     if li >= 0 {
@@ -7346,20 +7346,14 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       // field from. Checked first: a capture is none of the three channels below.
       if capturedIsNulLitUnion(fnIx, e.identName) { return true }
       // A `let`: the storage column, at the frame whose body declares it.
-      const nld = readLetDeclOf(e.identName, exprIx, fnIx)
+      const nld = readLetDeclOf(exprIx, fnIx)
       if nld >= 0 {
-        return bindingIsNulLitUnion(
-          nld,
-          readDeclOwnerOf(nld, e.identName, fnIx),
-        )
+        return bindingIsNulLitUnion(nld, readDeclOwnerOf(nld, fnIx))
       }
       // A loop variable: the storage column, at the frame whose loop declares it.
       const nlv = readLoopVarDeclOf(exprIx)
       if nlv >= 0 {
-        return bindingIsNulLitUnion(
-          nlv,
-          readDeclOwnerOf(nlv, e.identName, fnIx),
-        )
+        return bindingIsNulLitUnion(nlv, readDeclOwnerOf(nlv, fnIx))
       }
       if fnIx >= 0 {
         const fn = nodeAt(fnIx)
@@ -8663,7 +8657,7 @@ function arrElemLitUnionTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
   if n is Ident {
     const d = bindingDeclInScope(unwrapParen(arrIx))
     if d >= 0 { return declLitUnionTyAt(d, fnIx, depth, true) }
-    const pElem = nodeArrayElemTyIx(paramTypeNode(fnIx, n.identName))
+    const pElem = nodeArrayElemTyIx(paramTypeNodeOfRead(fnIx, arrIx))
     if tyIsLitUnion(pElem) { return pElem }
   }
   0 - 1
@@ -8733,7 +8727,7 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   }
   // An instance's parameter or local, whose declaration is what `exprNulLitUnion` claimed it by.
   if e is Ident && depth < declFallbackDepthCap() {
-    const pt = paramTypeNodeAt(fnIx, e.identName, unwrapParen(ix))
+    const pt = paramTypeNodeOfRead(fnIx, unwrapParen(ix))
     if pt >= 0 { return nodeNulLitUnionMemberTexts(pt) }
     let d = bindingDeclInScope(unwrapParen(ix))
     // Outside the emit walk no scope is open, so the body's own declaration answers, as it
@@ -8994,7 +8988,7 @@ function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
       }
       const d = bindingDeclInScope(ix)
       if d >= 0 { return declLitUnionTyAt(d, fnIx, depth, false) }
-      const pTy = nodeTyIxOf(paramTypeNodeAt(fnIx, e.identName, ix))
+      const pTy = nodeTyIxOf(paramTypeNodeOfRead(fnIx, ix))
       if tyIsLitUnion(pTy) { return pTy }
     }
     // No other expression names a literal-atom union member.
@@ -9225,21 +9219,21 @@ export function fnReturnsLitAtom(fnIx: i32): boolean {
   pos >= 0 && pos < fRetLitAtom.length && fRetLitAtom[pos] == 1
 }
 
-// The `LetDecl` a name read resolves to in frame `fnIx`, or -1 when it resolves to anything
+// The `LetDecl` the name read at `exprIx` resolves to in frame `fnIx`, or -1 when it resolves to anything
 // else. A monomorphized instance's read names the generic's declaration, so the frame's own copy
 // is the slot collected for it, or the frame's binding of the name when the frame is not emitting.
-export function readLetDeclOf(name: string, exprIx: i32, fnIx: i32): i32 {
+export function readLetDeclOf(exprIx: i32, fnIx: i32): i32 {
   const u = unwrapParen(exprIx)
   const d = identDeclOf(u)
   if d < 0 || d >= P.nodes.length { return -1 }
   if !(nodeAt(d) is LetDecl) { return -1 }
-  if fnIx < 0 || globalLetOfSid(sidLookup(name)) == d { return d }
+  if fnIx < 0 || globalLetOfSid(sidOfNode(d)) == d { return d }
   if fnIx == emitCurFnIx {
     const s = declaredSlotOf(u)
     if s >= 0 { return localDeclIx[s] }
     return d
   }
-  const fl = frameLetOf(fnIx, name, u)
+  const fl = frameLetOf(fnIx, u)
   if fl >= 0 { return fl }
   d
 }
@@ -9255,13 +9249,13 @@ function readLoopVarDeclOf(exprIx: i32): i32 {
 
 // The frame whose body declares a read's `let` or loop variable `decl` (or a copy minted from
 // it): `fnIx` or the nearest enclosing frame, -1 for a module-scope binding (D14574).
-function readDeclOwnerOf(decl: i32, name: string, fnIx: i32): i32 {
-  const sid = sidLookup(name)
+function readDeclOwnerOf(decl: i32, fnIx: i32): i32 {
+  const sid = sidOfNode(decl)
   if globalLetOfSid(sid) == decl { return -1 }
   let f = fnIx
   let pos = fnStmtsPosOf(fnIx)
   while f >= 0 {
-    if frameDeclares(f, sid, name, decl) { return f }
+    if frameDeclares(f, sid, decl) { return f }
     if pos < 0 || pos >= fnParent.length { return -1 }
     pos = fnParent[pos]
     if pos < 0 || pos >= fnStmts.length { return -1 }
@@ -9270,17 +9264,15 @@ function readDeclOwnerOf(decl: i32, name: string, fnIx: i32): i32 {
   -1
 }
 
-// Whether frame `fnIx`'s body holds declaration `decl` of `name`: a `let` or the copy an
-// instance minted from it, or a loop whose variable it is.
-function frameDeclares(fnIx: i32, sid: i32, name: string, decl: i32): boolean {
+// Whether frame `fnIx`'s body holds declaration `decl` (interned `sid`): a `let` or its copy
+// (`bodyLetOfDecl`), or a loop whose variable it is.
+function frameDeclares(fnIx: i32, sid: i32, decl: i32): boolean {
   const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return false }
   if loopVarLoop(decl) >= 0 {
     return parentLoopOfDecl(fn.fnBody, sid, decl) >= 0
   }
-  if parentLetOwnerOf(fn.fnBody, sid, decl) >= 0 { return true }
-  const fl = parentLetOf(fn.fnBody, name)
-  fl >= 0 && declOrigOf(fl) == decl
+  bodyLetOfDecl(fn.fnBody, decl) >= 0
 }
 
 // True if a name read `e` holds a literal-union atom: a capture, a `let` by the storage chosen
@@ -9291,16 +9283,12 @@ function exprIsLitAtomIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // nothing: it is by construction neither a local, param, nor global of the reader.
   if capturedIsLitAtom(fnIx, e.identName) { return true }
   // A `let`: the storage column, at the frame whose body declares it.
-  const ld = readLetDeclOf(e.identName, exprIx, fnIx)
-  if ld >= 0 {
-    return bindingIsLitAtom(ld, readDeclOwnerOf(ld, e.identName, fnIx))
-  }
+  const ld = readLetDeclOf(exprIx, fnIx)
+  if ld >= 0 { return bindingIsLitAtom(ld, readDeclOwnerOf(ld, fnIx)) }
   // A loop variable: the storage column, at the frame whose loop declares it.
   const lvd = readLoopVarDeclOf(exprIx)
-  if lvd >= 0 {
-    return bindingIsLitAtom(lvd, readDeclOwnerOf(lvd, e.identName, fnIx))
-  }
-  const pt = paramTypeNodeAt(fnIx, e.identName, unwrapParen(exprIx))
+  if lvd >= 0 { return bindingIsLitAtom(lvd, readDeclOwnerOf(lvd, fnIx)) }
+  const pt = paramTypeNodeOfRead(fnIx, unwrapParen(exprIx))
   if pt >= 0 {
     // The same structural predicate the rep layer assigns the valtype by, so the consumer
     // agrees with the rep by construction.
@@ -9617,7 +9605,7 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
   if n is Ident {
     if fn is FuncDecl {
       let et = -1
-      const pt = paramTypeNode(fnIx, n.identName)
+      const pt = paramTypeNodeOfRead(fnIx, iterIx)
       if pt >= 0 {
         et = tyStepElem(monoParamPinTy.get(pt) ?? nodeTyIxOf(pt))
       } else {
@@ -9761,7 +9749,7 @@ export function valueReadPinTy(ix: i32, fnIx: i32, depth: i32): i32 {
   if !(n is Ident) { return -1 }
   const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return -1 }
-  const pt = paramTypeNode(fnIx, n.identName)
+  const pt = paramTypeNodeOfRead(fnIx, rx)
   if pt >= 0 {
     const pp = monoParamPinTy.get(pt) ?? nodeTyIxOf(pt)
     if pp >= 0 && !tyHasTyVar(pp) { return pp }
@@ -9997,7 +9985,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
     if globalIsStructSid(fnIx, sidOfNode(exprIx), exprIx) { return true }
     // The frame's own `let`, asked outside the frame's emission, where `declaredStruct` has no
     // collected slot to read: the kind `structIndexOfExpr`'s frame leg already names a row for.
-    const fli = frameLetOf(fnIx, e.identName, exprIx)
+    const fli = frameLetOf(fnIx, exprIx)
     if fli >= 0 && !letIsVariant(fli, fnIx) {
       if structIndexOfLet(fli, fnIx) >= 0 {
         return !exprNullableStruct(exprIx, fnIx)
@@ -10059,12 +10047,12 @@ export function exprNullableRefNiche(exprIx: i32, fnIx: i32) {
 // The rep kind of the cell an identifier reads, across the four storage classes: parameter
 // annotation, declared local, captured env field, module global. The kind-level
 // generalization of `exprNullableStruct`'s four-arm ladder. Parameter first is not a
-// shadowing bug: `paramTypeNode` answers -1 once a declared local of that name is live.
+// shadowing bug: `paramTypeNodeOfRead` answers -1 for a read a `let` shadows.
 export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
   if exprIx < 0 { return null }
   const e = nodeAt(unwrapParen(exprIx))
   if e is Ident {
-    const pt = paramTypeNodeAt(fnIx, e.identName, unwrapParen(exprIx))
+    const pt = paramTypeNodeOfRead(fnIx, unwrapParen(exprIx))
     if pt >= 0 { return vtKindOfType(pt) }
     const dk = declaredKind(unwrapParen(exprIx))
     if dk != null { return dk }
@@ -10878,7 +10866,7 @@ function structIndexOfIdentExpr(e: Ident, exprIx: i32, fnIx: i32): i32 {
   // row is `ref valtype with no interned shape`, so the two land together (D21). Gated on
   // the variant the way every other index resolver here is: an arm's values live at
   // `uVarHeap`, so answering a struct row for one reaches a receiver that is not one.
-  const fli = frameLetOf(fnIx, e.identName, exprIx)
+  const fli = frameLetOf(fnIx, exprIx)
   if fli >= 0 && !letIsVariant(fli, fnIx) { return structIndexOfLet(fli, fnIx) }
   // The module frame's own `let`, which the leg above cannot reach: a module-scope BLOCK
   // binding is no frame's `fnBody` and no global. Annotated only — an initializer resolves
@@ -13330,7 +13318,7 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   if (paramNulRefArray(fnIx, e.identName) && paramReadAt(fnIx, exprIx)) {
     // Asked of the annotation's type: a monomorphized instance's grouped spelling
     // `(i32[][]|null)` is still a nullable ref array there.
-    const pn18 = paramTypeNodeAt(fnIx, e.identName, exprIx)
+    const pn18 = paramTypeNodeOfRead(fnIx, exprIx)
     if annNulRefArrSlot(pn18) >= 0 { return refListElemNameOfNodeTy(pn18) }
   }
   const pn = paramRefArrayName(fnIx, e.identName)
@@ -13876,7 +13864,7 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
       return exprNulStrArray(e.parInner, fnIx)
     }
     Ident => {
-      const pt = paramTypeNodeAt(fnIx, e.identName, exprIx)
+      const pt = paramTypeNodeOfRead(fnIx, exprIx)
       if pt >= 0 {
         // `…Deep` also admits a `(string | null)[] | null` param narrowed with `!= null`: the
         // narrowed value stays `(ref null)`, since the plain-string arm's recover traps on null.
@@ -14571,7 +14559,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       if capturedKindOf(fnIx, e.identName) == "map" { return true }
       // Last, after every resolver that can speak sooner: the frame's own `let`, read from the
       // arena rather than the declared-locals table, so a cross-frame question answers.
-      const fmm = frameLetOf(fnIx, e.identName, exprIx)
+      const fmm = frameLetOf(fnIx, exprIx)
       if fmm >= 0 && letIsMap(fmm, fnIx) { return true }
       return readRepIsMapCell(exprIx, fnIx)
     }
@@ -14889,7 +14877,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     }
     // The frame's own `let`, arm for arm with the module-frame leg below it — a kind
     // without its shape is a different reject, so the two land together.
-    const fms = frameLetOf(fnIx, e.identName, exprIx)
+    const fms = frameLetOf(fnIx, exprIx)
     if fms >= 0 {
       if letIsMap(fms, fnIx) { return letMapShapeOf(fms, fnIx) }
       if letIsNulMap(fms, fnIx) { return nulMapShapeOf(fms, fnIx) }
@@ -15692,7 +15680,7 @@ function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32): string {
   if !fnBlockShadowsAt(fnIx, sid, atIx) {
     // A `for f in fs` loop variable has no declaration node, so no rung below can name it;
     // it IS the iterable's element and calls through the element's key (D2110).
-    const lk = loopVarCloSigKey(name, fnIx)
+    const lk = loopVarCloSigKey(name, fnIx, atIx)
     if lk != "" { return lk }
     const pk = paramCloSigKey(fnIx, name)
     if pk != "" { return pk }
@@ -15857,12 +15845,12 @@ function frameCapturesName(fnIx: i32, name: string): boolean {
 }
 
 // The `$fnsig` key a for-in loop variable `name` calls through, or "" when `name` is no
-// closure-element loop variable of frame `fnIx`, keyed as `fs[i]` is so the two agree. The
-// scoped slot answers a loop the frame owns, so a closed loop's name means the outer binding
-// again; a captured loop variable has no slot and asks the frame that owns it.
-function loopVarCloSigKey(name: string, fnIx: i32) {
+// closure-element loop variable of frame `fnIx`, keyed as `fs[i]` is so the two agree. The slot
+// of the read at `atIx` (a minted read: the live scope's) answers a loop the frame owns.
+function loopVarCloSigKey(name: string, fnIx: i32, atIx: i32) {
   let iter = -1
-  const slot = scopeSlotOf(name)
+  const un = unwrapParen(atIx)
+  const slot = if identDeclOf(un) >= 0 { declaredSlotOf(un) } else { scopeSlotOf(name) }
   if slot >= 0 {
     if slot >= localLoopIter.length { return "" }
     iter = localLoopIter[slot]
@@ -16109,7 +16097,7 @@ function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {
     Ident => {
       // The scope must be asked first: a module-wide function lookup ranks below every scope
       // question, or a shadowing param/let/for-var would misclassify as the function.
-      const b = identBindingNoLocal(fnIx, e.identName, exprIx)
+      const b = identBindingOfRead(fnIx, exprIx)
       if b >= 0 {
         const bn = nodeAt(b)
         if bn is Param { return tyIsFuncType(bn.parType) }
