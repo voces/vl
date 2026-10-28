@@ -71,6 +71,7 @@ import {
   tyAt,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
+import { tyHasTyVar, tyReachesHole } from "./tyquery"
 import { lpExitsOf } from "./check_if_value"
 import { i32ListHas } from "./listutil"
 import { fnDeclParent } from "./check_decl_scan"
@@ -89,6 +90,7 @@ import {
   fnTagCallSetOf,
   fnTagCallSplits,
   fnTagCalls,
+  fnTagEscapeTysTake,
   fnTagEscapesTake,
   fnTagEtaWant,
   fnTagMark,
@@ -106,6 +108,7 @@ export function fnTagDecide(rootIx: i32) {
   ftLeafTys = Map()
   const calls = fnTagCalls()
   ftEscapes = fnTagEscapesTake()
+  const escTys = fnTagEscapeTysTake()
   // Sets of two or more first: a one-member set whose member is a leaf of one of their joins
   // follows that set's decision.
   const seen: i32[] = []
@@ -121,9 +124,15 @@ export function fnTagDecide(rootIx: i32) {
     }
     pass = pass + 1
   }
-  // A delivery of a tagged set is built as a closure by the next check.
-  for e in ftEscapes {
-    if fnTagSetIsTagged(fnTagSetOfTy(nodeTyIxOf(e))) { fnTagEtaWant(e) }
+  // A delivery of a tagged set, or to a function type taking or returning one, is built by the
+  // next check.
+  let ei = 0
+  while ei < ftEscapes.length && ei < escTys.length {
+    const et = escTys[ei]
+    if fnTagSetIsTagged(fnTagSetOfTy(et)) || ftSigTagged(et) {
+      fnTagEtaWant(ftEscapes[ei])
+    }
+    ei = ei + 1
   }
   ftEscapes = []
   for c in calls {
@@ -335,11 +344,17 @@ function ftScan(
     let fn = fs.pop() ?? -1
     let ok = oks.pop() ?? false
     if x >= 0 && x < P.nodes.length {
-      // A function read as a value whose signature holds the set hands its ids to a caller
-      // that expects closures.
+      // A function read as a value whose signature holds the set takes or hands ids, so it is
+      // called, or delivered only where the destination's type is its own.
       if ftSigValue(x, s) {
         const cn = nodeAt(p)
-        if !(cn is Call) || cn.callFn != x { return false }
+        if (
+          !(cn is Call)
+          || cn.callFn != x
+            && (ftArgDstTy(cn, x) != nodeTyIxOf(x) || !ftValueSigned(x))
+        ) {
+          return false
+        }
       }
       // A member leaf of another set's join is an id only when that set is tagged too, since
       // the join and its leaves share one rep.
@@ -376,7 +391,7 @@ function ftScan(
         }
       }
       // A list holding the set's ids is read by index only, outside an instance body.
-      if ftHolds(x, s) && (ftInOpenFn(fn) || !ftHoldCtxOk(x, p, g, s)) {
+      if ftHolds(x, s) && (ftInOpenFn(fn) || !ftHoldCtxOk(x, p, g, fn, s)) {
         return false
       }
       // A value a slot method writes into the holder is an id of the set, as a store's is.
@@ -410,6 +425,33 @@ function ftSigValue(x: i32, s: i32): boolean {
   const n = nodeAt(x)
   if !(n is Ident) && !(n is FuncDecl && n.fnName == "") { return false }
   ftSigCarries(nodeTyIxOf(x), s, 4)
+}
+
+// Whether function value `x` has one signature to be built at: a function with no type
+// parameters and every parameter declared, or a value that is not a declaration.
+function ftValueSigned(x: i32): boolean {
+  const n = nodeAt(x)
+  const d = if n is Ident { identDeclOf(x) } else { x }
+  if d < 0 || d >= P.nodes.length { return true }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return !(f is FuncDecl) }
+  for q in f.fnParams {
+    const pn = nodeAt(q)
+    if !(pn is Param) || pn.parType < 0 { return false }
+  }
+  true
+}
+
+// Whether function type `t` takes or returns a tagged set.
+function ftSigTagged(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const ft = tyAt(t)
+  if !(ft is TyFunc) { return false }
+  if fnTagSetIsTagged(fnTagSetOfTy(ft.fnRet)) { return true }
+  for q in ft.fnParamTypes {
+    if fnTagSetIsTagged(fnTagSetOfTy(q)) { return true }
+  }
+  false
 }
 
 // Whether function type `t` holds set `s` in a parameter or result, `depth` signatures deep.
@@ -878,21 +920,25 @@ function ftSlotTyOf(ht: i32, s: i32): i32 {
   }
 }
 
-// Whether `x` is the empty map `Map()`.
-function ftMapNew(x: i32): boolean {
-  if x < 0 { return false }
-  const n = nodeAt(x)
-  if !(n is Call) || n.callArgs.length > 0 || n.callFn < 0 { return false }
-  const f = nodeAt(n.callFn)
-  f is Ident && f.identName == "Map"
-}
-
 // Whether `p`, a field read of holder `x`, names a method a call reads or writes one slot of
-// the holder through: a map's entry methods, or a list's `push`.
+// the holder through: a map's entry methods, a list's `push`, or a list's `map` and `filter`
+// handing each element to a callback whose parameter is closed or is the set, so an adapter can
+// be built or is already in place.
 function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
   if g < 0 || !(nodeAt(g) is Call) { return false }
   const k = ftHoldKind(nodeTyIxOf(x), s, 4)
   const op = p.memProp
+  if k == 1 && (op == "map" || op == "filter") {
+    const c = nodeAt(g)
+    if !(c is Call) || c.callArgs.length != 1 { return false }
+    const cb = nodeTyIxOf(c.callArgs[0])
+    if cb < 0 { return false }
+    const ft = tyAt(cb)
+    if !(ft is TyFunc) || ft.fnParamTypes.length == 0 { return false }
+    const pt = ft.fnParamTypes[0]
+    if pt < 0 { return false }
+    return fnTagSetOfTy(pt) == s || !tyHasTyVar(pt) && !tyReachesHole(pt, 8)
+  }
   if k == 1 { return op == "push" }
   k == 3 && (op == "get" || op == "set" || op == "has" || op == "delete")
 }
@@ -909,49 +955,120 @@ function ftSlotWriteArg(c: Call, x: i32, s: i32): boolean {
   k == 3 && fn.memProp == "set" && c.callArgs.length == 2 && c.callArgs[1] == x
 }
 
-// Whether holder `x` of a set's ids, the child of `p`, sits where a list is only read by index
-// and a record only by its fields: a binding, the field of a record literal
-// that holds it too, or a read; `g` is the parent of `p`.
-function ftHoldCtxOk(x: i32, p: i32, g: i32, s: i32): boolean {
+// Whether holder `x` of set `s`, the child of `p` in function `fn`, is only read there or is
+// delivered where the destination's type is the holder's own: a holder has one rep and no
+// converting copy, so a destination of any other type can neither carry it nor be adapted to it.
+function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
   const n = nodeAt(x)
+  // A declaration's own node is placed by its value's parent; a spelled type never names a set.
   if n is LetDecl { return n.letType < 0 }
   if n is FieldInit { return ftHolds(p, s) }
-  if (
-    !(n is ArrayLit
-      || n is ObjLit
-      || n is Ident
-      || n is Paren
-      || n is Member
-      || ftMapNew(x))
-    || p < 0
-  ) {
-    return false
-  }
+  if p < 0 { return false }
+  const tx = nodeTyIxOf(x)
   const pn = nodeAt(p)
   match pn {
-    LetDecl => {
-      return pn.letInit == x && pn.letType < 0
-    }
-    Paren => {
-      return true
-    }
+    // Reads of the holder's slots and fields, and a loop binding each of its ids.
     Index => {
-      const k = ftHoldKind(nodeTyIxOf(x), s, 4)
-      return pn.idxArr == x && (k == 1 || k == 3)
+      return pn.idxArr == x
     }
     Member => {
       if pn.memObj != x { return false }
-      return ftHoldKind(nodeTyIxOf(x), s, 4) == 2 || ftSlotOp(pn, x, g, s)
+      return ftHoldKind(tx, s, 4) == 2
+        || ftSlotOp(pn, x, g, s)
+        || pn.memProp == "length"
     }
-    // The record literal holding the field is a holder itself, checked where it sits.
+    ForIn => {
+      return pn.fiIter == x
+    }
+    Program => {
+      return true
+    }
+    // Deliveries: the destination's type is the holder's.
+    LetDecl => {
+      return pn.letInit == x && pn.letType < 0
+    }
+    RetStmt => {
+      return fn >= 0 && rcwInferredRetTy(fn) == tx
+    }
+    FuncDecl => {
+      return pn.fnBody == x && rcwInferredRetTy(p) == tx
+    }
+    Call => {
+      return ftArgDstTy(pn, x) == tx
+    }
+    BinExpr => {
+      if ftIsStore(pn) && pn.binRight == x {
+        return nodeTyIxOf(pn.binLeft) == tx
+      }
+      if ftIsStore(pn) && pn.binLeft == x {
+        return nodeTyIxOf(pn.binRight) == tx
+      }
+      return pn.binOp == "??" && nodeTyIxOf(p) == tx
+    }
+    // A value's own position whose type is the holder's is a holder too, placed where it sits.
+    Paren | IfStmt | MatchExpr | Block => {
+      return nodeTyIxOf(p) == tx
+    }
+    // A container slot of the holder's type is a holder of holders, which `ftHoldKind` names.
+    ArrayLit => {
+      return ftArrElemTy(p) == tx && ftHolds(p, s)
+    }
     FieldInit => {
       return pn.fiValue == x && ftHolds(g, s)
     }
-    // Any other parent delivers the holder somewhere that reads its ids as closures.
-    Program | Call | RetStmt | IfStmt | MatchExpr | Block | Param | WhileStmt | BinExpr | FuncDecl | ArrayLit | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | OptMember | ErrExpr | TypeRef | BreakStmt | ContinueStmt | FieldDef | TypeDecl | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread | LoopVar => {
+    // A spelled type, a condition, an operand or a copy into a literal names no set.
+    Param | WhileStmt | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | OptMember | ErrExpr | TypeRef | BreakStmt | ContinueStmt | FieldDef | TypeDecl | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ImportDecl | Spread | LoopVar => {
       return false
     }
   }
+}
+
+// The parameter type the callee of `c` declares for argument `x`, or -1.
+function ftArgDstTy(c: Call, x: i32): i32 {
+  if c.callFn == x { return -1 }
+  const cb = ftListCallbackDst(c, x)
+  if cb >= 0 { return cb }
+  const ft = nodeTyIxOf(c.callFn)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const f = tyAt(ft)
+  if !(f is TyFunc) { return -1 }
+  let i = 0
+  while i < c.callArgs.length {
+    if c.callArgs[i] == x {
+      if i < f.fnParamTypes.length { return f.fnParamTypes[i] }
+      return -1
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The callback type a list's `map` or `filter` call `c` declares for argument `x`, or -1: the
+// built-in calls it with each element, so a callback taking the element type is delivered at its own.
+function ftListCallbackDst(c: Call, x: i32): i32 {
+  const f = parenPeelIx(c.callFn)
+  if f < 0 || c.callArgs.length != 1 || c.callArgs[0] != x { return -1 }
+  const m = nodeAt(f)
+  if !(m is Member) || m.memProp != "map" && m.memProp != "filter" { return -1 }
+  const lt = nodeTyIxOf(m.memObj)
+  const xt = nodeTyIxOf(x)
+  if lt < 0 || lt >= T.tys.length || xt < 0 || xt >= T.tys.length { return -1 }
+  const l = tyAt(lt)
+  const xf = tyAt(xt)
+  if !(l is TyArray) || !(xf is TyFunc) || xf.fnParamTypes.length != 1 {
+    return -1
+  }
+  if xf.fnParamTypes[0] == l.aElem { return xt }
+  -1
+}
+
+// The element type of list literal `p`, or -1.
+function ftArrElemTy(p: i32): i32 {
+  const t = nodeTyIxOf(p)
+  if t < 0 || t >= T.tys.length { return -1 }
+  const a = tyAt(t)
+  if a is TyArray { return a.aElem }
+  -1
 }
 
 // Whether function `fn`, or one it sits inside, is an instance body; such a list stays untagged
