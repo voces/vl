@@ -141,6 +141,7 @@ import {
   crNoNames,
   crwAnyWriteBase,
   crwArgCall,
+  crwBindDeclOf,
   crwBindOf,
   crwEnsure,
   crwGen,
@@ -154,6 +155,7 @@ import {
   crFirstBank,
   crFnBase,
   crInnerRowBelow,
+  crIsNarrowLayer,
   crNameIsModuleTop,
   crNameNulledInProgram,
   crOuterWidest,
@@ -356,7 +358,6 @@ import {
   crNameAssigned,
   crRetire,
   crRetireAt,
-  crShadowedHeight,
   crSubtreeAssigns,
   holeElseTested,
   holeElseTestedSetAt,
@@ -475,26 +476,20 @@ import {
   placeWith,
 } from "./check_place_ids"
 import {
-  constDeclOf,
-  constScopes,
   declDepthOf,
   declIsConst,
   declTyOf,
   declareSlot,
-  fnAliasScopes,
-  fnDeclScopes,
   identSlotOf,
-  isConstName,
-  lookup,
+  moduleNameTyOf,
   scopeDeclLog,
-  scopeDepthsOf,
   scopeFramePop,
-  scopeSlotAt,
   slotLayerDepth,
   slotLayerPrev,
   slotLayerTop,
   slotLayerTy,
   slotNameOf,
+  slotNameSoleLayer,
   slotTyAt,
   slotVisibleOf,
 } from "./check_scopes"
@@ -600,7 +595,7 @@ import {
   weTargetShape,
 } from "./check_write_effects"
 import { i32ListHas, strListAdd, strListHas, strListWith } from "./listutil"
-import { sidOf } from "./symbols"
+import { declShadowOf, sidOf } from "./symbols"
 import {
   arrElemValueTy,
   isLitBearing,
@@ -908,7 +903,7 @@ function narInstallJoin(ix: i32, p: i32, jt: i32, viaChain: boolean) {
     // Banked like the post-guard fall-through, so a write below is checked against storage
     // and a call that may write the name ends it (D2390).
     noteNarShadow(s, cur, NAR_KIND_POSTGUARD)
-    declareSlot(s, key, jt)
+    declareSlot(s, jt)
     narFitCompanions(p, cur, jt)
     recordArmJoin(ix, key, jt)
   } else if viaChain {
@@ -1754,7 +1749,11 @@ function retireAliasedNarrowings(
   }
   let family = ""
   if tgtKey == "" { family = indexRootKeyOf(tgtIx) }
-  const recvFresh = recvName != "" && crSoleRefHolds(recvName)
+  const recvFresh = recvName != ""
+    && crSoleRefHolds(
+    slotVisibleOf(identSlotOf(recv, recvName)),
+    recvName,
+  )
   const n0 = npKeys.length
   let i = 0
   while i < n0 {
@@ -1770,7 +1769,9 @@ function retireAliasedNarrowings(
     // resolve names here, so neither holds for an entry an inner declaration hides (D3307).
     const hidden = !own && !fam && placeRootHidden(npPlace[i])
     const apart = recvFresh && kRoot != recvName && !hidden
-    const skip0 = kRoot != recvName && !hidden && crSoleRefHolds(kRoot)
+    const skip0 = kRoot != recvName
+      && !hidden
+      && crSoleRefHolds(placeDecl(npPlace[i]), kRoot)
     const keeps = (!hidden
       && elemOnlyStoreKeeps(i, elemDepthOf(tgtIx), asgRhsIx(atIx), rt))
     const hits = !own
@@ -2234,7 +2235,7 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       if ws >= 0 { dcl = ws }
     }
     if dcl >= 0 {
-      const pre = lookup(nm)
+      const pre = declTyOf(s)
       let rn = writeReNarrowTy(dcl, rt)
       // What the arm join reads a write that kept its narrowing as ending at.
       let keptEnd = rn
@@ -2273,7 +2274,7 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
         // assignment node so both halves lower the reads after the write alike (D1736).
         if rn != dcl {
           noteNarShadow(s, dcl, NAR_KIND_GUARD)
-          declareSlot(s, nm, rn)
+          declareSlot(s, rn)
         }
         recordAsgNarTyIx(atIx, rn)
       }
@@ -2445,13 +2446,19 @@ export function crCaptureCallCheck(slot: i32, callIx: i32) {
   // Calling the reader itself runs it now, under the narrowing.
   crwEnsure(crCurRoot())
   let own = crwBindOf[rd] ?? ""
+  let ownDecl = crwBindDeclOf[rd] ?? -1
   const rdn = nodeAt(rd)
   if rdn is FuncDecl {
-    if rdn.fnName != "" { own = rdn.fnName }
+    if rdn.fnName != "" {
+      own = rdn.fnName
+      ownDecl = rd
+    }
   }
   if own != "" && calleeNameOf(callIx) == own { return 0 }
   // Nor can it run later once its only handle has gone out of scope without escaping.
-  if own != "" && lookup(own) < 0 && !crNameEscapesHere(own) { return 0 }
+  if own != "" && declDepthOf(ownDecl) < 0 && !crNameEscapesHere(own) {
+    return 0
+  }
   tErrCoded(
     "'"
       + npKeys[slot]
@@ -2699,41 +2706,48 @@ function narFitMembers(p: i32, nt: i32, r: TyObj, mems: i32[]) {
 // still write that binding. Its narrowing ends in the checker at once, since nothing in the block
 // can read it, and in the emitter after the statement holding the block, where the name reaches it
 // again. `loopIx` >= 0 asks of the loop there rather than of the call `callIx` (D3020).
-function crRetireShadowed(name: string, callIx: i32, loopIx: i32) {
-  const ds = scopeDepthsOf[name]
-  // A shadow needs a narrowed binding and a declaration over it; the narrowing may sit at the
-  // binding's own depth (a straight-line write or a join installed there, D3306).
-  if ds == null || ds.length < 2 { return 0 }
-  let h = crShadowedHeight(name, ds.length)
-  while h > 0 {
-    const hidden: i32[] = []
-    while ds.length > h {
-      hidden.push(ds[ds.length - 1])
-      ds.pop()
-    }
-    const st = crStmtHolding(hidden[hidden.length - 1])
-    const hs = scopeSlotAt(ds[ds.length - 1], name)
-    let c = callIx
-    if hs == -1 {
-      c = -1
-    } else if loopIx >= 0 {
-      c = -1
-      if crMayBeWritten(hs) {
-        c = crFirstWritingCall(loopIx, placeBare(hs), name)
+function crRetireShadowed(v: i32, callIx: i32, loopIx: i32) {
+  if v < 0 { return 0 }
+  const base = crFnBase()
+  // Each bound declaration `v` hides, innermost first; the narrowing may sit at the binding's
+  // own depth (a straight-line write or a join installed there, D3306).
+  let up = v
+  let o = declShadowOf(v)
+  let hops = 0
+  while o >= 0 && hops < 64 {
+    const e = slotLayerTop(o)
+    if e >= 0 {
+      const td = slotLayerDepth(e)
+      if td < base { return 0 }
+      const ud = crBindDepthOfSlot(up)
+      if td < ud && crIsNarrowLayer(o, td) {
+        crRetireHidden(o, ud, callIx, loopIx)
       }
-    } else if !callMayWrite(c, placeBare(hs), name) {
-      c = -1
+      up = o
     }
-    // The join row names this binding, which only the joins outside the shadow reach.
-    if c >= 0 && st >= 0 {
-      crRetireAt(hs, c, false, st, false, crBindDepthOfSlot(hs))
+    o = declShadowOf(o)
+    hops = hops + 1
+  }
+  0
+}
+
+// Retires the narrowing of `hs`, hidden by a declaration at depth `ud`, at the call `callIx` or
+// at the first call in the loop `loopIx` that may write it.
+function crRetireHidden(hs: i32, ud: i32, callIx: i32, loopIx: i32) {
+  const st = crStmtHolding(ud)
+  const name = slotNameOf(hs)
+  let c = callIx
+  if loopIx >= 0 {
+    c = -1
+    if crMayBeWritten(hs) {
+      c = crFirstWritingCall(loopIx, placeBare(hs), name)
     }
-    let k = hidden.length - 1
-    while k >= 0 {
-      ds.push(hidden[k])
-      k = k - 1
-    }
-    h = crShadowedHeight(name, h)
+  } else if !callMayWrite(c, placeBare(hs), name) {
+    c = -1
+  }
+  // The join row names this binding, which only the joins outside the shadow reach.
+  if c >= 0 && st >= 0 {
+    crRetireAt(hs, c, false, st, false, crBindDepthOfSlot(hs))
   }
   0
 }
@@ -2971,7 +2985,7 @@ export function crNoteCallBare(callIx: i32) {
     if s != -1 && callMayWrite(callIx, placeBare(s), nm) {
       crRetire(s, callIx, false, crStmtIxs[crStmtIxs.length - 1])
     }
-    crRetireShadowed(nm, callIx, -1)
+    crRetireShadowed(s, callIx, -1)
     i = i + 1
   }
   0
@@ -3007,7 +3021,7 @@ function crCallCandidates(): i32[] {
       c.first[nm] = i
       c.names.push(nm)
       c.nameRows.push(i)
-      if ccKeeps(nm, fb0) { ccAddCand(c, nm, i) }
+      if ccKeeps(asgDeclSlots[i], nm, fb0) { ccAddCand(c, nm, i) }
     }
     i = i + 1
   }
@@ -3016,9 +3030,9 @@ function crCallCandidates(): i32[] {
   // A name declared again since may have become one a call retires.
   let g = c.log
   while g < scopeDeclLog.length {
-    const nm = scopeDeclLog[g]
+    const nm = slotNameOf(scopeDeclLog[g])
     const r = c.first[nm] ?? -1
-    if r >= 0 && !(c.isCand[nm] ?? false) && ccKeeps(nm, fb0) {
+    if r >= 0 && !(c.isCand[nm] ?? false) && ccKeeps(asgDeclSlots[r], nm, fb0) {
       ccAddCand(c, nm, r)
     }
     g = g + 1
@@ -3110,10 +3124,10 @@ function ccTruncate(c: CallCands) {
   0
 }
 
-// Whether a call can retire live name `nm`.
-function ccKeeps(nm: string, fb0: i32): boolean {
-  const ds = scopeDepthsOf[nm]
-  const keep = ds != null && (ds.length >= 2 || (ds.length == 1 && ds[0] < fb0))
+// Whether a call can retire live name `nm`, banked for slot `s`.
+function ccKeeps(s: i32, nm: string, fb0: i32): boolean {
+  const sl = slotNameSoleLayer(s)
+  const keep = sl == -2 || (sl >= 0 && sl < fb0)
   if !keep && crCurRoot() == crProgRoot { crAskProg("w", nm) }
   keep || crwAnyWriteBase.has(nm) || isPathKey(nm)
 }
@@ -3257,7 +3271,7 @@ export function crLoopPreRetire(loopIx: i32) {
       c = crLoopLeavingWrite(loopIx, s)
     }
     if c >= 0 { crRetire(s, c, true, loopIx) }
-    crRetireShadowed(nm, -1, loopIx)
+    crRetireShadowed(s, -1, loopIx)
     i = i + 1
   }
   0
@@ -3570,7 +3584,7 @@ export function crReadHook(name: string, ix: i32): i32 {
     p = p - 1
   }
   if crStmtIxs.length == 0 { return -1 }
-  const cur = lookup(name)
+  const cur = identTyOf(ix, name)
   const root = crCurRoot()
   let r = crRetNames.length - 1
   while r >= 0 {
@@ -4195,21 +4209,13 @@ export function applyNarrows(places: i32[], tys: i32[]) {
       npCapByPush(-1)
       npAsgPush(0)
     } else {
-      const nm = placeText(p)
       const s = placeDecl(p)
-      const wasConst = isConstName(nm)
-      let wasDecl = -1
-      if wasConst { wasDecl = constDeclOf(nm) }
       const declTy = declTyOf(s)
       if declTy >= 0 && declTy != tys[i] {
         noteNarShadow(s, declTy, NAR_KIND_GUARD)
       }
-      declareSlot(s, nm, tys[i])
+      declareSlot(s, tys[i])
       if declTy >= 0 && declTy != tys[i] { narFitCompanions(p, declTy, tys[i]) }
-      if wasConst {
-        const ctop = constScopes.length - 1
-        if ctop >= 0 { constScopes[ctop][nm] = wasDecl }
-      }
     }
     i = i + 1
   }
@@ -4232,9 +4238,6 @@ export function popScope() {
     narWrPopTo(T.frames.length - 1)
   }
   scopeFramePop()
-  constScopes.pop()
-  fnDeclScopes.pop()
-  fnAliasScopes.pop()
   // The collapsed-binding marks go with the frame their bindings did (D1048). One length test
   // when the list is empty, which is nearly every program.
   collBindPopTo(T.frames.length)
@@ -4460,6 +4463,7 @@ export function ifChainExhausts(ifIx: i32) {
   chainMissingSet("")
   let havePlace = false
   let placeName = "?"
+  let placeIx = -1
   const testedTys: i32[] = []
   // `allIsArms` stays true only while every arm seen is a bare `<sameIdent> is T`
   // (the only shape we can prove exhaustive by union-member coverage).
@@ -4482,6 +4486,7 @@ export function ifChainExhausts(ifIx: i32) {
           if obj is Ident {
             if !havePlace {
               placeName = obj.identName
+              placeIx = cond.isObj
               havePlace = true
             } else if placeName != obj.identName {
               allIsArms = false
@@ -4511,6 +4516,7 @@ export function ifChainExhausts(ifIx: i32) {
           if eobj is Ident {
             if !havePlace {
               placeName = eobj.identName
+              placeIx = armObj
               havePlace = true
             } else if placeName != eobj.identName {
               allIsArms = false
@@ -4549,8 +4555,8 @@ export function ifChainExhausts(ifIx: i32) {
   if !havePlace { return false }
   // Uses the pre-subtraction type first (`pgPreIx`): this chain's own post-guard narrowing
   // has already replaced the place's binding with the residue of the arms being counted, so
-  // `lookup` alone would report "covered" for every chain whose arms actually diverge. The
-  // bank is keyed by this chain's node, so it answers only when this chain did the subtracting; `lookup` is the fallback otherwise.
+  // the binding alone would report "covered" for every chain whose arms actually diverge. The
+  // bank is keyed by this chain's node, so it answers only when this chain did the subtracting; the binding is the fallback otherwise.
   let pty = -1
   if pgPreIx == ifIx {
     let pk = 0
@@ -4559,7 +4565,7 @@ export function ifChainExhausts(ifIx: i32) {
       pk = pk + 1
     }
   }
-  if pty < 0 { pty = lookup(placeName) }
+  if pty < 0 { pty = identTyOf(placeIx, placeName) }
   if pty < 0 { return false }
   const pt = tyAt(pty)
   match pt {
@@ -4651,7 +4657,7 @@ export function getterReadTy(fn: string, n: Member, ix: i32) {
     return TY_ERR
   }
   getSiteBank(ix, fn)
-  const fnTy = lookup(fn)
+  const fnTy = moduleNameTyOf(fn)
   if fnTy < 0 { return TY_ERR }
   const ft = tyAt(fnTy)
   if ft is TyFunc {

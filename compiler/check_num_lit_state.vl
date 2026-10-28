@@ -104,7 +104,7 @@ import {
 import { pinRefDrop, pinRefuse } from "./check_pin_refusals"
 import { parenPeelIx } from "./check_places"
 import { rcwModOf, rcwWhere } from "./check_record_writes"
-import { identIntrShadowed, lookupDepth, lookupDepthSid } from "./check_scopes"
+import { identDepthOf, identIntrShadowed } from "./check_scopes"
 import { symEnabled, symOccTy } from "./check_state"
 import { demangleName, isIdentCharAt } from "./check_suggest"
 import { symDeclScope, symPendNode, symUse, symUseDecl } from "./check_sym_occ"
@@ -1166,16 +1166,17 @@ export function numLitNotesDropFrom(mark: i32) {
 
 export let nluAtoms = 1
 
-// Does a row of this table name the binding `name` currently resolves to? The depth pairing is
-// what makes it exact under shadowing: an inner binding that records nothing still answers
-// false, because `lookupDepth` names its own frame and no row carries that depth.
+// Does a row of this table name the binding the read `ix` of `name` resolves to? The depth
+// pairing is what makes it exact under shadowing: an inner binding that records nothing still
+// answers false, because `identDepthOf` names its own frame and no row carries that depth.
 export function bindMarkHas(
   depths: i32[],
   names: string[],
+  ix: i32,
   name: string,
 ): boolean {
   if names.length == 0 { return false }
-  const d = lookupDepth(name)
+  const d = identDepthOf(ix, name)
   if d < 0 { return false }
   let i = names.length - 1
   while i >= 0 {
@@ -1191,7 +1192,7 @@ export function lbiCandAt(ix: i32): i32 {
   const n = nodeAt(ix)
   if n is Ident {
     if !lbiNameSeen[lbiNameKey(n.identName)] { return -1 }
-    const c = lbiCandOfName(n.identName, sidOfNode(ix))
+    const c = lbiCandOfName(ix, n.identName)
     // An exported binding read in another module is a typed value there, never a use.
     if c >= 0 && lbiExpMod[c] != LBI_LOCAL && rcwModOf(ix) != lbiExpMod[c] {
       return -1
@@ -1201,12 +1202,12 @@ export function lbiCandAt(ix: i32): i32 {
   -1
 }
 
-// The candidate `name`, interned as `sid`, resolves to in the current scope, or -1: its newest
-// row at the depth `lookupDepth` answers, so a deeper binding that is not one shadows it.
-export function lbiCandOfName(name: string, sid: i32): i32 {
-  let r = sidArrGet(lbiBindTop, sid)
+// The candidate the read `ix` of `name` resolves to in the current scope, or -1: its newest row
+// at the depth `identDepthOf` answers, so a deeper binding that is not one shadows it.
+export function lbiCandOfName(ix: i32, name: string): i32 {
+  let r = sidArrGet(lbiBindTop, sidOfNode(ix))
   if r < 0 { return -1 }
-  const d = lookupDepthSid(sid, name)
+  const d = identDepthOf(ix, name)
   while r >= 0 && lbiBindDepth[r] > d { r = lbiBindPrev[r] }
   if r >= 0 && lbiBindDepth[r] == d { return lbiBindCand[r] }
   -1
@@ -1237,7 +1238,9 @@ export function lbiReadsPinned(ix: i32): boolean {
   for l in leaves {
     const n = nodeAt(l)
     if n is Ident {
-      if bindMarkHas(lbiPinnedDepth, lbiPinnedName, n.identName) { return true }
+      if bindMarkHas(lbiPinnedDepth, lbiPinnedName, l, n.identName) {
+        return true
+      }
     } else if lbiFieldsPinned(l) || lbiElemsPinned(l) {
       return true
     }
@@ -1328,7 +1331,7 @@ export function lbiConstLitAt(ix: i32, name: string): i32 {
     return -1
   }
   if lbiDefaultExpr[ix] ?? false { return lbiModLit[name] ?? -1 }
-  const c = lbiCandOfName(name, sidOfNode(ix))
+  const c = lbiCandOfName(ix, name)
   if c < 0 || !lbiIsConst[c] { return -1 }
   lbiLitOf(c)
 }
@@ -1338,7 +1341,7 @@ export function lbiConstLitAt(ix: i32, name: string): i32 {
 export function lbiInlineLit(ix: i32, lit: i32, pos: i32, name: string): i32 {
   lbiInlinedName[ix] = name
   if !(lbiDefaultExpr[ix] ?? false) {
-    const c = lbiCandOfName(name, sidOfNode(ix))
+    const c = lbiCandOfName(ix, name)
     if c >= 0 && c < lbiCands.length { lbiInlinedDecl[ix] = lbiCands[c] }
   }
   const neg = exprNegatedArg(lit)
@@ -1728,20 +1731,21 @@ export function lbiOperandRow(c: i32, self: i32, other: i32, at: i32) {
   lbiNoteDirect(self, t)
 }
 
-// The declaration of the numeric-literal binding `name` resolves to, or -1.
-export function numLitDeclOf(name: string): i32 {
-  bindMarkDeclOf(numLitBindDepth, numLitBindName, numLitBindDecl, name)
+// The declaration of the numeric-literal binding the read `ix` of `name` resolves to, or -1.
+export function numLitDeclOf(ix: i32, name: string): i32 {
+  bindMarkDeclOf(numLitBindDepth, numLitBindName, numLitBindDecl, ix, name)
 }
 
-// The declaration a row of the table `depths`/`names`/`decls` records for the binding `name`
-// resolves to, or -1. Paired by depth as `ctnLitInitOf` is, so shadowing holds.
+// The declaration a row of the table `depths`/`names`/`decls` records for the binding the read
+// `ix` of `name` resolves to, or -1. Paired by depth as `ctnLitInitOf` is, so shadowing holds.
 export function bindMarkDeclOf(
   depths: i32[],
   names: string[],
   decls: i32[],
+  ix: i32,
   name: string,
 ): i32 {
-  const d = lookupDepth(name)
+  const d = identDepthOf(ix, name)
   if d < 0 { return -1 }
   let i = names.length - 1
   while i >= 0 && depths[i] >= d {
