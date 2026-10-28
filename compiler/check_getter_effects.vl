@@ -52,6 +52,7 @@ import {
   arenaEditSlotAt,
   arenaEpochNow,
   arenaSetNode,
+  binderNameAt,
   declNameTokOf,
   elseIfLink,
   extGMut,
@@ -81,26 +82,25 @@ import {
   crFnBases,
   crOpOpaque,
   crProgRoot,
+  crSoleDecls,
   crSoleDepths,
-  crSoleNames,
   crSoleRoots,
   crSoleTys,
+  crValUseDecls,
   crValUseDyn,
   crValUseGetProps,
-  crValUseNames,
   crValUseRoot,
   cvuBumps,
+  cvuDecls,
   cvuEpoch,
+  cvuIdxDecl,
   cvuIdxIx,
-  cvuIdxName,
   cvuLogAt,
+  cvuMemDecl,
   cvuMemIx,
-  cvuMemName,
-  cvuNames,
   cvuSlotOf,
 } from "./check_capture_rows"
 import { crCurRoot } from "./check_capture_widen"
-import { crSoleRefBinding } from "./check_cr_walk"
 import { inferQuiet } from "./check_cursor"
 import {
   ES_UNBOUNDED,
@@ -208,7 +208,7 @@ import { peelParenIx, weInitIsFresh } from "./check_write_effects"
 import { cwPeel, declFirstParamIsSelf, fnDeclIx } from "./check_write_scan"
 import { strListHas } from "./listutil"
 import { modIxOfId } from "./modid"
-import { identSet } from "./symbols"
+import { identDeclOf, identSet } from "./symbols"
 
 // Every `get p(self: T): R` the program declares, collected by the top-level hoist: the
 // (merge-mangled) declaration name, the plain property, the `FuncDecl` node and the resolved
@@ -248,7 +248,7 @@ export function indexRootKeyOf(ix: i32) {
 export function crNoteSoleRef(n: LetDecl, ix: i32) {
   const d = declDepthOf(ix)
   if d < 0 { return 0 }
-  crDropSoleAt(n.letName, d)
+  crDropSoleAt(ix, d)
   if n.letKw != "const" || !weInitIsFresh(n.letInit) { return 0 }
   let root = crCurRoot()
   if crFnBases.length == 0 { root = crProgRoot }
@@ -256,31 +256,31 @@ export function crNoteSoleRef(n: LetDecl, ix: i32) {
   if root == crProgRoot {
     // Most top-level records are never asked about, and grading one walks the whole program.
     crValUseRoot = root
-    crSolePush(n.letName, d, root, declTyOf(ix))
+    crSolePush(ix, d, root, declTyOf(ix))
     return 0
   }
   if root != crValUseRoot {
     crValUseEnter(root)
     crValUseRoot = root
   }
-  if crSoleUsesOk(n.letName, declTyOf(ix)) { crSolePush(n.letName, d, -1, -1) }
+  if crSoleUsesOk(ix, declTyOf(ix)) { crSolePush(ix, d, -1, -1) }
   0
 }
 
-function crSolePush(name: string, d: i32, root: i32, lt: i32) {
-  crSoleNames.push(name)
+function crSolePush(decl: i32, d: i32, root: i32, lt: i32) {
+  crSoleDecls.push(decl)
   crSoleDepths.push(d)
   crSoleRoots.push(root)
   crSoleTys.push(lt)
   0
 }
 
-// Whether the root `crValUseNames` describes uses `name`, declared at type `lt`, only as a
-// receiver no getter or operator hands on.
-function crSoleUsesOk(name: string, lt: i32) {
-  if crValUseNames[name] ?? false { return false }
-  if crValUseDyn[name] ?? false { return false }
-  const gps = crValUseGetProps[name] ?? []
+// Whether the root `crValUseDecls` describes reads the binding declared at `decl`, at type `lt`,
+// only as a receiver no getter or operator hands on.
+function crSoleUsesOk(decl: i32, lt: i32) {
+  if crValUseDecls[decl] ?? false { return false }
+  if crValUseDyn[decl] ?? false { return false }
+  const gps = crValUseGetProps[decl] ?? []
   if gps.length > 0 {
     let k = 0
     while k < gps.length {
@@ -291,41 +291,42 @@ function crSoleUsesOk(name: string, lt: i32) {
   true
 }
 
-// Whether the binding `s`, spelled `name`, is one `crNoteSoleRef` recorded; a record
-// still waiting on its root is graded first, and dropped when that root uses it as a value.
-// Either answer asks `e` of the name, since a module checked without that use would hold.
-export function crSoleRefHolds(s: i32, name: string): boolean {
-  if name == "" || crSoleNames.length == 0 { return false }
+// Whether the binding declared at `s` is one `crNoteSoleRef` recorded; a record still waiting on
+// its root is graded first, and dropped when that root uses it as a value. Either answer asks `e`
+// of the name, since a module checked without that use would hold.
+export function crSoleRefHolds(s: i32): boolean {
+  if s < 0 || crSoleDecls.length == 0 { return false }
   const d = declDepthOf(s)
   if d < 0 { return false }
-  let i = crSoleNames.length - 1
+  let i = crSoleDecls.length - 1
   while i >= 0 && crSoleDepths[i] >= d {
-    if crSoleNames[i] == name && crSoleDepths[i] == d {
+    if crSoleDecls[i] == s && crSoleDepths[i] == d {
+      crAskProg("e", binderNameAt(s))
       const root = crSoleRoots[i]
       if root >= 0 {
         crSoleRoots[i] = -1
-        if !crSoleGradeAt(root, name, crSoleTys[i]) {
-          crAskProg("e", name)
-          crSoleNames[i] = ""
+        if !crSoleGradeAt(root, s, crSoleTys[i]) {
+          crSoleDecls[i] = -1
+          return false
         }
       }
-      return crSoleRefBinding(s, name)
+      return true
     }
     i = i - 1
   }
   false
 }
 
-// `crSoleUsesOk` against `root`; the root `crValUseNames` describes is restored after.
-function crSoleGradeAt(root: i32, name: string, lt: i32) {
+// `crSoleUsesOk` against `root`; the root `crValUseDecls` describes is restored after.
+function crSoleGradeAt(root: i32, decl: i32, lt: i32) {
   const kRoot = crValUseRoot
-  const kNames = crValUseNames
+  const kDecls = crValUseDecls
   const kDyn = crValUseDyn
   const kGets = crValUseGetProps
   crValUseEnter(root)
-  const ok = crSoleUsesOk(name, lt)
+  const ok = crSoleUsesOk(decl, lt)
   crValUseRoot = kRoot
-  crValUseNames = kNames
+  crValUseDecls = kDecls
   crValUseDyn = kDyn
   crValUseGetProps = kGets
   ok
@@ -347,17 +348,17 @@ function crTyMayReadGetter(t: i32, prop: string): boolean {
   false
 }
 
-// Forget a record of `name` at depth `d`: a later declaration there binds a different object.
-function crDropSoleAt(name: string, d: i32) {
-  let i = crSoleNames.length - 1
+// Forget an earlier record of `decl` at depth `d`: checking the declaration again records it anew.
+function crDropSoleAt(decl: i32, d: i32) {
+  let i = crSoleDecls.length - 1
   while i >= 0 && crSoleDepths[i] >= d {
-    if crSoleNames[i] == name && crSoleDepths[i] == d { crSoleNames[i] = "" }
+    if crSoleDecls[i] == decl && crSoleDepths[i] == d { crSoleDecls[i] = -1 }
     i = i - 1
   }
   0
 }
 
-// Point `crValUseNames` and `crValUseDyn` at `root`; a site `x.p` is kept when a getter is named
+// Point `crValUseDecls` and `crValUseDyn` at `root`; a site `x.p` is kept when a getter is named
 // `p`, since the root's own later sites are not banked yet (D3760). A root is walked again only
 // when the arena moved; the program's root instead adds the slots the logged edits rewrote, when
 // those made every bump since its walk.
@@ -369,21 +370,21 @@ function crValUseEnter(root: i32) {
     cvuEpoch.push(-1)
     cvuBumps.push(0)
     cvuLogAt.push(0)
-    cvuNames.push(Map())
+    cvuDecls.push(Map())
     cvuMemIx.push([])
-    cvuMemName.push([])
+    cvuMemDecl.push([])
     cvuIdxIx.push([])
-    cvuIdxName.push([])
+    cvuIdxDecl.push([])
   }
   const ep = arenaEpochNow()
   const logged = arenaEditBumpCount() - cvuBumps[slot] == ep - cvuEpoch[slot]
   const moved = cvuEpoch[slot] != ep && (root != crProgRoot || !logged)
   if cvuEpoch[slot] < 0 || moved {
-    cvuNames[slot] = Map()
+    cvuDecls[slot] = Map()
     cvuMemIx[slot] = []
-    cvuMemName[slot] = []
+    cvuMemDecl[slot] = []
     cvuIdxIx[slot] = []
-    cvuIdxName[slot] = []
+    cvuIdxDecl[slot] = []
     crValUseWalk(root, slot)
   } else if cvuEpoch[slot] != ep {
     let e = cvuLogAt[slot]
@@ -395,7 +396,7 @@ function crValUseEnter(root: i32) {
   cvuEpoch[slot] = ep
   cvuBumps[slot] = arenaEditBumpCount()
   cvuLogAt[slot] = arenaEditCount()
-  crValUseNames = cvuNames[slot]
+  crValUseDecls = cvuDecls[slot]
   crValUseDyn = Map()
   crValUseGetProps = Map()
   const mi = cvuMemIx[slot]
@@ -410,7 +411,7 @@ function crValUseEnter(root: i32) {
     while i < mi.length {
       const m = nodeAt(mi[i])
       if m is Member && (props[m.memProp] ?? false) {
-        const rn = cvuMemName[slot][i]
+        const rn = cvuMemDecl[slot][i]
         const ps = crValUseGetProps[rn] ?? []
         if !strListHas(ps, m.memProp) { ps.push(m.memProp) }
         crValUseGetProps[rn] = ps
@@ -426,28 +427,28 @@ function crValUseEnter(root: i32) {
       (anyOp || (crOpOpaque[xi[j]] ?? false))
       && opSiteDecls(xi[j]).length > 0
     ) {
-      crValUseDyn[cvuIdxName[slot][j]] = true
+      crValUseDyn[cvuIdxDecl[slot][j]] = true
     }
     j = j + 1
   }
   0
 }
 
-// Collect into slot `s` every name the subtree uses other than as the receiver of a field or cell
-// access. A method call, a getter and a dispatched index hand the receiver on, so the last two
+// Collect into slot `s` the declaration of every read in the subtree other than as the receiver of
+// a field or cell access. A method call, a getter and a dispatched index hand the receiver on, so the last two
 // are kept as sites for `crValUseEnter` to grade.
 function crValUseWalk(ix: i32, s: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = nodeAt(ix)
   if n is Ident {
-    cvuNames[s][n.identName] = true
+    const d = identDeclOf(ix)
+    if d >= 0 { cvuDecls[s][d] = true }
     return 0
   }
   if n is Member {
-    const mo = nodeAt(peelParenIx(n.memObj))
-    if mo is Ident {
+    if nodeAt(peelParenIx(n.memObj)) is Ident {
       cvuMemIx[s].push(ix)
-      cvuMemName[s].push(mo.identName)
+      cvuMemDecl[s].push(identDeclOf(peelParenIx(n.memObj)))
       return 0
     }
   }
@@ -455,10 +456,9 @@ function crValUseWalk(ix: i32, s: i32) {
     if nodeAt(peelParenIx(n.omObj)) is Ident { return 0 }
   }
   if n is Index {
-    const xo = nodeAt(peelParenIx(n.idxArr))
-    if xo is Ident {
+    if nodeAt(peelParenIx(n.idxArr)) is Ident {
       cvuIdxIx[s].push(ix)
-      cvuIdxName[s].push(xo.identName)
+      cvuIdxDecl[s].push(identDeclOf(peelParenIx(n.idxArr)))
       crValUseWalk(n.idxIndex, s)
       return 0
     }
@@ -466,8 +466,10 @@ function crValUseWalk(ix: i32, s: i32) {
   if n is Call {
     const cf = nodeAt(peelParenIx(n.callFn))
     if cf is Member {
-      const cr = nodeAt(peelParenIx(cf.memObj))
-      if cr is Ident { cvuNames[s][cr.identName] = true }
+      const cd = identDeclOf(peelParenIx(cf.memObj))
+      if nodeAt(peelParenIx(cf.memObj)) is Ident && cd >= 0 {
+        cvuDecls[s][cd] = true
+      }
     }
   }
   let cur = ix
