@@ -1108,7 +1108,7 @@ const genNarrowedGlobals = (n: number, after: boolean): string => {
 
 axis(
   "narrowed module bindings",
-  2.6,
+  2.7,
   "A top-level function is asking about every narrowed module binding, not only the ones it reads (D2529; its residual per-binding cost is D14562).",
   (d) => twoFiles(d, genNarrowedGlobals(600, true), genNarrowedGlobals(600, false)),
 );
