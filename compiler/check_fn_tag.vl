@@ -50,7 +50,15 @@ import {
   nodeChildrenPush,
 } from "./ast"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
-import { cwUseCaptures, fnDeclIx } from "./check_write_scan"
+import {
+  CW_OCC_CALL,
+  cwIxKind,
+  cwIxNode,
+  cwOccNext,
+  cwOccWalkSpelled,
+  cwUseCaptures,
+  fnDeclIx,
+} from "./check_write_scan"
 import { valueTailSplit } from "./check_num_adopt"
 import { collectRetValues } from "./check_nj_join"
 import { rcwInferredRetTy } from "./check_rcw"
@@ -74,6 +82,14 @@ import { parenPeelIx } from "./check_places"
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
 import { lpExitsOf } from "./check_if_value"
 import { i32ListHas } from "./listutil"
+import {
+  mintFactCallOf,
+  mintFactInScope,
+  mintFactRows,
+  mintFactRsOf,
+  mintFactSetOf,
+  mintFactSplits,
+} from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
 import { identDeclOf, identFromDecl } from "./symbols"
 import {
@@ -108,6 +124,7 @@ export function fnTagDecide(rootIx: i32) {
   fnTagUndecide()
   ftLeafTys = Map()
   const calls = fnTagCalls()
+  const mint = mintFactRows()
   ftEscapes = fnTagEscapesTake()
   const escTys = fnTagEscapeTysTake()
   // Sets of two or more first: a one-member set whose member is a leaf of one of their joins
@@ -120,7 +137,16 @@ export function fnTagDecide(rootIx: i32) {
       const one = fnTagMembers(s).length == 1
       if s >= 0 && one == (pass == 1) && !i32ListHas(seen, s) {
         seen.push(s)
-        ftTry(rootIx, s, calls)
+        ftTry(rootIx, s, calls, mint)
+      }
+    }
+    // A call an instance makes through a set its parameter is bound to calls that set too.
+    for r in mint {
+      const s = mintFactSetOf(r)
+      const one = fnTagMembers(s).length == 1
+      if s >= 0 && one == (pass == 1) && !i32ListHas(seen, s) {
+        seen.push(s)
+        ftTry(rootIx, s, calls, mint)
       }
     }
     pass = pass + 1
@@ -137,7 +163,7 @@ export function fnTagDecide(rootIx: i32) {
       }
       if plain && !i32ListHas(seen, s) {
         seen.push(s)
-        ftTry(rootIx, s, calls)
+        ftTry(rootIx, s, calls, mint)
       }
     }
   }
@@ -163,7 +189,7 @@ export function fnTagDecide(rootIx: i32) {
 
 // Tags set `s` when every node carrying it is a place an id can stand, and builds each call's
 // member calls.
-function ftTry(rootIx: i32, s: i32, calls: i32[]) {
+function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   const ds = fnTagMembers(s)
   const leaves: i32[] = []
   const ids: i32[] = []
@@ -176,6 +202,9 @@ function ftTry(rootIx: i32, s: i32, calls: i32[]) {
   if ftWideSeen {
     for c in calls {
       if fnTagCallSetOf(c) == s && fnTagCallSplits(c) { return 0 }
+    }
+    for r in mint {
+      if mintFactSetOf(r) == s && mintFactSplits(r) { return 0 }
     }
   }
   // A member call names the member as its leaves do, so each member needs one.
@@ -193,6 +222,12 @@ function ftTry(rootIx: i32, s: i32, calls: i32[]) {
   for c in calls {
     if fnTagCallSetOf(c) == s && !ftPlainArgs(c) { return 0 }
   }
+  for r in mint {
+    if mintFactSetOf(r) == s && !ftPlainArgs(mintFactCallOf(r)) { return 0 }
+  }
+  for r in mint {
+    if mintFactSetOf(r) == s && !ftMintComplete(r, s) { return 0 }
+  }
   fnTagMark(s, leaves, ids)
   ftLeafTys[s] = leafTy
   let ri = 0
@@ -209,7 +244,36 @@ function ftTry(rootIx: i32, s: i32, calls: i32[]) {
   for c in calls {
     if fnTagCallSetOf(c) == s { ftBuildArms(c, s, ds, leafTy) }
   }
+  for fr in mint {
+    if mintFactSetOf(fr) == s {
+      ftBuildArmsAt(mintFactCallOf(fr), s, ds, leafTy, mintFactRsOf(fr))
+    }
+  }
   0
+}
+
+// Whether every call through the parameter fact row `r`'s call names has a fact of set `s` in
+// `r`'s instance: a call the instance's typing never reached has no arms, so its set stays as is.
+function ftMintComplete(r: i32, s: i32): boolean {
+  const c = mintFactCallOf(r)
+  if c < 0 || c >= P.nodes.length { return false }
+  const n = nodeAt(c)
+  if !(n is Call) { return false }
+  const pd = identDeclOf(n.callFn)
+  if pd < 0 || pd >= P.nodes.length { return false }
+  const p = nodeAt(pd)
+  if !(p is Param) { return false }
+  const ow = cwOccWalkSpelled(pd, p.parName)
+  while cwOccNext(ow) {
+    if cwIxKind[ow.row] == CW_OCC_CALL {
+      const at = cwIxNode[ow.row]
+      const m = nodeAt(at)
+      if m is Call && identDeclOf(m.callFn) == pd {
+        if mintFactSetOf(mintFactInScope(r, at)) != s { return false }
+      }
+    }
+  }
+  true
 }
 
 // Each tagged set's member types, as its leaves name them.
@@ -241,7 +305,18 @@ export function fnTagInstanceArms(ix: i32): i32[] {
 
 // Builds, or re-types, the direct call of each member of `ds`, set `s`, at call `c`'s arguments.
 function ftBuildArms(c: i32, s: i32, ds: i32[], leafTy: i32[]) {
-  const rs: i32[] = if s == fnTagCallSetOf(c) { fnTagCallRsOf(c) } else { [] }
+  const none: i32[] = []
+  ftBuildArmsAt(
+    c,
+    s,
+    ds,
+    leafTy,
+    if s == fnTagCallSetOf(c) { fnTagCallRsOf(c) } else { none },
+  )
+}
+
+// `ftBuildArms` with each member's result at the call given as `rs`, in set order.
+function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
   let arms = fnTagArmsAt(c, s)
   const cn = nodeAt(c)
   if !(cn is Call) { return 0 }
