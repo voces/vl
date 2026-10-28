@@ -1454,7 +1454,7 @@ function fieldClosureFeOfRecvRaw(recvIx: i32, prop: string, fnIx: i32) {
       const fn = nodeAt(fnIx)
       if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
     }
-    if li < 0 { li = globalLetOfIn(fnIx, e.identName, unwrapParen(recvIx)) }
+    if li < 0 { li = globalLetOfRead(fnIx, unwrapParen(recvIx)) }
     if li >= 0 {
       const d = nodeAt(li)
       if d is LetDecl {
@@ -1564,70 +1564,62 @@ export function identBoundAt(fnIx: i32, sid: i32, atIx: i32) {
     // A `let` in a block the read is outside does not hide the global (D3294).
     const r = bodyReadLet(fnb.fnBody, sid, atIx)
     if r != PL_READ_UNPLACED { return r >= 0 }
-    // Elsewhere the read's own declaration says whether it is the frame's or the global.
-    if atIx < 0 || sidOfNode(atIx) != sid { return false }
-    const d = identDeclOf(atIx)
-    return d >= 0
-      && globalLetOfSid(sid) != d
-      && declOrigOf(d) != globalLetOfSid(sid)
   }
   false
 }
 
-// `globalLetOfSid` as read from inside function `fnIx`: -1 when the frame binds the name.
-// The global lookup runs first, so a name that is not a module global never pays for the
-// frame scan.
-export function globalLetOfSidIn(fnIx: i32, sid: i32, atIx: i32) {
+// The module global the read `readIx` inside function `fnIx` denotes, or -1. The read's own
+// declaration decides; a minted read, which has none, asks the frame whether it binds the name.
+export function globalLetOfRead(fnIx: i32, readIx: i32) {
+  if readIx < 0 { return -1 }
+  const sid = sidOfNode(readIx)
   const li = globalLetOfSid(sid)
   if li < 0 { return -1 }
-  if identReadsGlobal(sid, atIx) { return li }
+  const d = identDeclOf(readIx)
+  if d >= 0 { return if d == li || declOrigOf(d) == li { li } else { -1 } }
+  if identBoundAt(fnIx, sid, readIx) { return -1 }
+  li
+}
+
+// `globalLetOfRead` for the sid-keyed resolvers that may hold no read of `sid` (D14577).
+export function globalLetOfSidIn(fnIx: i32, sid: i32, atIx: i32) {
+  if atIx >= 0 && sidOfNode(atIx) == sid { return globalLetOfRead(fnIx, atIx) }
+  const li = globalLetOfSid(sid)
+  if li < 0 { return -1 }
   if identBoundAt(fnIx, sid, atIx) { return -1 }
   li
 }
 
-// True when the resolver bound the read at `atIx` to the module global `sid`, which it then
-// denotes whatever the live scope holds: a chase into a global's initializer runs inside the
+// True when the resolver bound the read `readIx` to a module global, which it then denotes
+// whatever the live scope holds: a chase into a global's initializer runs inside the
 // reader's frame, whose same-named local would otherwise answer, and can lead back to the
 // chase's start (D9681).
-export function identReadsGlobal(sid: i32, atIx: i32): boolean {
-  if atIx < 0 { return false }
-  const li = globalLetOfSid(sid)
-  li >= 0 && identDeclOf(atIx) == li
+export function identReadsGlobal(readIx: i32): boolean {
+  if readIx < 0 { return false }
+  const li = globalLetOfSid(sidOfNode(readIx))
+  li >= 0 && identDeclOf(readIx) == li
 }
 
-export function globalLetOfIn(fnIx: i32, name: string, atIx: i32) {
-  globalLetOfSidIn(fnIx, sidLookup(name), atIx)
-}
-
-// Whether the global `name` is a struct/array/string ref (so a bare reference to it in
-// an `exprStruct`/`exprArray`/`exprString` check is recognized as that ref type). The
-// global's valtype follows its `LetDecl` annotation or literal initializer, evaluated as
-// a top-level constexpr (`fnIx = -1`), mirroring the local `letIsX` predicates.
-function globalIsStructSid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
+// Whether the global the read `readIx` denotes is a struct/array/string ref (so a bare
+// reference to it in an `exprStruct`/`exprArray`/`exprString` check is recognized as that
+// ref type). The global's valtype follows its `LetDecl` annotation or literal initializer,
+// evaluated as a top-level constexpr (`fnIx = -1`), mirroring the local `letIsX` predicates.
+function globalReadIsStruct(fnIx: i32, readIx: i32) {
+  const li = globalLetOfRead(fnIx, readIx)
   if li < 0 { return false }
   letIsStruct(li, -1)
 }
 
-// True if the module global holds a nullable ref-array cell (`let g: S[] | null`) — the
-// storage-class twin of `declaredKind == "nulreflist"` and `paramNulRefArray`. Keyed on
-// `globalCellKind`, the cell's own answer, so a read can never disagree with the cell.
-function globalIsNulRefArraySid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  globalCellKind(li) == "nulreflist"
-}
-
-function globalIsStringSid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
+function globalReadIsString(fnIx: i32, readIx: i32) {
+  const li = globalLetOfRead(fnIx, readIx)
   if li < 0 { return false }
   // A `string | null` global reads as a string under narrowing: the global read recovers
   // non-null, and the `!= null` check reads the cell raw.
-  globalReadAsk(sid, li, 2)
+  globalReadAsk(sidOfNode(readIx), li, 2)
 }
 
-function globalIsMapSid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
+function globalReadIsMap(fnIx: i32, readIx: i32) {
+  const li = globalLetOfRead(fnIx, readIx)
   if li < 0 { return false }
   letIsMap(li, -1)
 }
@@ -1814,7 +1806,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
       const cnv = capturedNulVariantIdx(fnIx, e.identName)
       if cnv >= 0 { return cnv }
       // A global: the row its cell is written at (D1672).
-      const gi = globalLetOfIn(fnIx, e.identName, exprIx)
+      const gi = globalLetOfRead(fnIx, exprIx)
       if gi >= 0 {
         if globalCellKind(gi) != "nulvariant" { return -1 }
         return globalCellStructIdx(gi)
@@ -5858,7 +5850,7 @@ function cloArrBindingLitOf(ix: i32, fnIx: i32): i32 {
       const fn = nodeAt(fnIx)
       if fn is FuncDecl { li = bodyLetOfRead(fn.fnBody, ix) }
     }
-    if li < 0 { li = globalLetOfIn(fnIx, e.identName, ix) }
+    if li < 0 { li = globalLetOfRead(fnIx, ix) }
     if li >= 0 {
       const d = nodeAt(li)
       if d is LetDecl {
@@ -9982,7 +9974,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
     // never grew. Without it, a lambda whose body is a bare captured struct minted its
     // `$fnsig` result i32 over a body returning `(ref $S)` — two functypes, invalid wasm.
     if capturedKindOf(fnIx, e.identName) == "struct" { return true }
-    if globalIsStructSid(fnIx, sidOfNode(exprIx), exprIx) { return true }
+    if globalReadIsStruct(fnIx, exprIx) { return true }
     // The frame's own `let`, asked outside the frame's emission, where `declaredStruct` has no
     // collected slot to read: the kind `structIndexOfExpr`'s frame leg already names a row for.
     const fli = frameLetOf(fnIx, exprIx)
@@ -10058,7 +10050,7 @@ export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
     if dk != null { return dk }
     const ck = capturedKindOf(fnIx, e.identName)
     if ck != null { return ck }
-    const gl = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
+    const gl = globalLetOfRead(fnIx, unwrapParen(exprIx))
     if gl >= 0 { return globalReadCellKind(gl) }
   }
   null
@@ -10330,7 +10322,7 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
       // A module GLOBAL whose cell is the kind-8 raw variant — the global twin of the
       // `declaredVariantIndex` LOCAL leg above, and the leg every member-read site
       // (`o.field`) needs to pick `uVarHeap` over `sHeapIdx` for a variant receiver.
-      return globalVariantIndexSid(fnIx, sidOfNode(exprIx), exprIx)
+      return globalReadVariantIndex(fnIx, exprIx)
     }
     // A call to a `: Cat`-returning function yields the concrete variant ref, in the three
     // callee forms the nullable twin handles arm for arm: a declared function, a closure value,
@@ -10443,11 +10435,11 @@ function ifArmsAllVariantIdx(ifIx: i32, fnIx: i32, vi: i32): boolean {
 }
 
 // The union-variant table index a module global's cell holds, or -1 — the global sibling
-// of `globalStructIndexSid`, gated on the cell actually being the kind-8 variant so the two
+// of `globalReadStructIndex`, gated on the cell actually being the kind-8 variant so the two
 // never both answer for one binding. A global whose init names another global recurses one
 // level per link; module globals cannot cycle.
-function globalVariantIndexSid(fnIx: i32, sid: i32, atIx: i32): i32 {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
+function globalReadVariantIndex(fnIx: i32, readIx: i32): i32 {
+  const li = globalLetOfRead(fnIx, readIx)
   if li < 0 { return -1 }
   if globalCellKind(li) != "variant" { return -1 }
   globalCellStructIdx(li)
@@ -10468,10 +10460,10 @@ function fnRetStructIndexSid(sid: i32, name: string, fnIx: i32, at: i32) {
   d.rdSlot
 }
 
-// The struct table index of a module global `name` (from its annotation/initializer),
-// or -1.
-function globalStructIndexSid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
+// The struct table index of the module global the read `readIx` denotes (from its
+// annotation/initializer), or -1.
+function globalReadStructIndex(fnIx: i32, readIx: i32) {
+  const li = globalLetOfRead(fnIx, readIx)
   if li < 0 { return -1 }
   // Kind-gated, like every other storage class's struct reader — with only its variant
   // sibling gated, the two can both answer for one binding, and `emitUnionBoxArg`'s
@@ -10854,11 +10846,11 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
 function structIndexOfIdentExpr(e: Ident, exprIx: i32, fnIx: i32): i32 {
   const pi = paramStructIndex(fnIx, e.identName)
   if pi >= 0 && paramReadAt(fnIx, exprIx) { return pi }
-  if !identReadsGlobal(sidOfNode(exprIx), exprIx) {
+  if !identReadsGlobal(exprIx) {
     const di = declaredStructIndex(exprIx)
     if di >= 0 { return di }
   }
-  const gi = globalStructIndexSid(fnIx, sidOfNode(exprIx), exprIx)
+  const gi = globalReadStructIndex(fnIx, exprIx)
   if gi >= 0 { return gi }
   const ci = capturedStructIndex(fnIx, e.identName)
   if ci >= 0 { return ci }
@@ -11340,7 +11332,7 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   if capturedKindOf(fnIx, e.identName) == "union" { return true }
   // A module GLOBAL union binding (a union annotation, or a union-returning
   // init): top-level `const a = make(42)` / `let w: string | i32 = "a"`.
-  const gi = globalLetOfIn(fnIx, e.identName, exprIx)
+  const gi = globalLetOfRead(fnIx, exprIx)
   if gi >= 0 { return letIsUnion(gi, -1) || globalCellKind(gi) == "union" }
   // While a capture's env field is typed off its initializer from the capturing frame, a
   // parent local with no loaded slot answers from its own declaration, so the field and the
@@ -12851,13 +12843,6 @@ export function fnRetRefArrayNameSid(
   repOfNameResult(sid, name, fnIx, at).rdListElem
 }
 
-// The ref-list ELEMENT type-NAME a module global `name` declares (`S[]`/`N[]`), or "".
-function globalRefArrayName(fnIx: i32, name: string) {
-  const li = globalLetOfIn(fnIx, name, -1)
-  if li < 0 { return "" }
-  letRefListElemName(li, -1)
-}
-
 // The type the receiver `recv` of a list `is` has in function `fnIx`: its recorded type, or where
 // that names a type parameter, the instance's binding of it, exact, pinned or a hole's (D4771).
 // -1 where the instance leaves it open.
@@ -13303,7 +13288,7 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
     return refListElemNameOfInstTy(exprIx, fnIx)
   }
   // A read the resolver bound to a module global is no same-named local of this frame (D9681).
-  const rdg = identReadsGlobal(sidOfNode(exprIx), exprIx)
+  const rdg = identReadsGlobal(exprIx)
   // A kind-18 nullable ref-array local stores its INNER ref-list slot in `localStructIdx`; its element
   // name is that inner slot's element name, so `refListSlotOfExpr` round-trips back to the inner slot.
   if !rdg && declaredKind(exprIx) == "nulreflist" {
@@ -13329,22 +13314,25 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   // typed with — the storage-class mirror of `exprRefArray`'s capture arm.
   const cn = capturedRefListSlot(fnIx, e.identName)
   if cn >= 0 && cn < rlElemName.length { return rlElemName[cn] }
-  // A kind-18 nullable ref-array global reads its inner ref-list row off the annotation —
-  // `globalRefArrayName` below can't, since it falls through to a nameless `[]`/`null` init.
-  if globalIsNulRefArraySid(fnIx, sidOfNode(exprIx), exprIx) {
-    const g18 = globalLetOfIn(fnIx, e.identName, exprIx)
-    const gs18 = letAnnRefListSlot(g18)
-    if gs18 >= 0 && gs18 < rlElemName.length { return rlElemName[gs18] }
+  const grl = globalLetOfRead(fnIx, exprIx)
+  if grl >= 0 {
+    const gk = globalCellKind(grl)
+    // A kind-18 nullable ref-array global reads its inner ref-list row off the annotation,
+    // since the declared-element name below falls through to a nameless `[]`/`null` init.
+    if gk == "nulreflist" {
+      const gs18 = letAnnRefListSlot(grl)
+      if gs18 >= 0 && gs18 < rlElemName.length { return rlElemName[gs18] }
+    }
+    // A ref-list global reads the row its cell is declared at, which a destination may name
+    // instead of the literal's own element, as a local reads its slot's (D3093).
+    if gk == "reflist" {
+      const grs = letRefListSlot(grl, -1)
+      if grs >= 0 && grs < rlElemName.length { return rlElemName[grs] }
+    }
+    // The ref-list element type-name the global declares (`S[]`/`N[]`).
+    const gra = letRefListElemName(grl, -1)
+    if gra != "" { return gra }
   }
-  // A ref-list global reads the row its cell is declared at, which a destination may name
-  // instead of the literal's own element, as a local reads its slot's (D3093).
-  const grl = globalLetOfIn(fnIx, e.identName, exprIx)
-  if grl >= 0 && globalCellKind(grl) == "reflist" {
-    const grs = letRefListSlot(grl, -1)
-    if grs >= 0 && grs < rlElemName.length { return rlElemName[grs] }
-  }
-  const gra = globalRefArrayName(fnIx, e.identName)
-  if gra != "" { return gra }
   // A box narrowed to a list arm no registered union names (`{x: i32}[]` of a field read
   // at a pin) reads the arm's row off its narrowed type (D4930).
   const nrs = recordListSlotOfNode(exprIx, fnIx)
@@ -13877,7 +13865,7 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
       }
       // A local/global binding (or a rebind chain `const t0 = g`) annotated
       // `(string | null)[]` — or `(string | null)[] | null`, narrowed via `t0 != null`.
-      if identBindingNulStrList(e.identName, fnIx, 4) { return true }
+      if identBindingNulStrList(exprIx, fnIx, 4) { return true }
     }
     // No other expression is a nullable-string list.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -13885,12 +13873,13 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
   false
 }
 
-// The `exprNulStrArray` binding resolver: the LetDecl for `name` (function-local via
-// `parentLetOf`, else a module-level `startStmts` global) whose ANNOTATION — directly or
-// under an outer `| null` — is a `(string | null)[]` list; an un-annotated rebind
+// The `exprNulStrArray` binding resolver: whether the LetDecl the read `readIx` names
+// (function-local via `parentLetOf`, else a module global) has an ANNOTATION — directly or
+// under an outer `| null` — that is a `(string | null)[]` list; an un-annotated rebind
 // (`const t0 = g`) follows its init chain (depth-capped).
-function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
+function identBindingNulStrList(readIx: i32, fnIx: i32, depth: i32): boolean {
   if depth <= 0 { return false }
+  const name = sidText(sidOfNode(readIx))
   let li = -1
   if fnIx >= 0 {
     const fn = nodeAt(fnIx)
@@ -13902,7 +13891,7 @@ function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
     if pt >= 0 { return annIsNulStrListDeep(pt) }
     // A module GLOBAL (`const g: (string | null)[] | null = …`) — top-level LetDecls
     // live in `globalStmts` (they emit as wasm globals, not start statements).
-    li = globalLetOfIn(fnIx, name, -1)
+    li = globalLetOfRead(fnIx, readIx)
   }
   if li < 0 { return false }
   const d = nodeAt(li)
@@ -13911,7 +13900,7 @@ function identBindingNulStrList(name: string, fnIx: i32, depth: i32): boolean {
   if d.letInit >= 0 {
     const init = nodeAt(unwrapParen(d.letInit))
     if init is Ident {
-      return identBindingNulStrList(init.identName, fnIx, depth - 1)
+      return identBindingNulStrList(unwrapParen(d.letInit), fnIx, depth - 1)
     }
   }
   false
@@ -14131,7 +14120,7 @@ function identReadOutOfScope(exprIx: i32, fnIx: i32) {
   const n = e.identName
   if declaredSlotOf(exprIx) >= 0 || paramIndexOf(fnIx, n) >= 0 { return false }
   if capturedKindOf(fnIx, n) != null { return false }
-  globalLetOfSidIn(fnIx, sidOfNode(exprIx), exprIx) < 0
+  globalLetOfRead(fnIx, exprIx) < 0
 }
 
 // `exprListRep`'s answers during one outermost query, indexed by expression and stamped with
@@ -14551,9 +14540,9 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       if paramMap(fnIx, e.identName) && paramReadAt(fnIx, exprIx) {
         return true
       }
-      const gmr = identReadsGlobal(sidOfNode(exprIx), exprIx)
+      const gmr = identReadsGlobal(exprIx)
       if !gmr && declaredMap(exprIx) { return true }
-      if globalIsMapSid(fnIx, sidOfNode(exprIx), exprIx) { return true }
+      if globalReadIsMap(fnIx, exprIx) { return true }
       // A captured map variable of a lifted lambda: classify it exactly as a param/local
       // receiver would, so it takes the map-arm boxing in a union-boxed result.
       if capturedKindOf(fnIx, e.identName) == "map" { return true }
@@ -14825,7 +14814,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     if identReadContainerAt(exprIx, fnIx) == RC_MAP {
       return readMapArmShapeAt(exprIx, fnIx)
     }
-    const gms = identReadsGlobal(sidOfNode(exprIx), exprIx)
+    const gms = identReadsGlobal(exprIx)
     if !gms && declaredMap(exprIx) {
       const slot = declaredSlotOf(exprIx)
       if slot >= 0 { return localStructIdx[slot] }
@@ -14882,7 +14871,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       if letIsMap(fms, fnIx) { return letMapShapeOf(fms, fnIx) }
       if letIsNulMap(fms, fnIx) { return nulMapShapeOf(fms, fnIx) }
     }
-    const gl = globalLetOfIn(fnIx, e.identName, exprIx)
+    const gl = globalLetOfRead(fnIx, exprIx)
     if gl >= 0 {
       if letIsMap(gl, -1) { return letMapShapeOf(gl, -1) }
       if letIsNulMap(gl, -1) { return nulMapShapeOf(gl, -1) }
@@ -15157,7 +15146,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
       // too, since `exprNullableString` claims the `!= null` test first and never mis-routes it.
       const csk = capturedKindOf(fnIx, e.identName)
       if csk == "str" || csk == "nulstr" { return true }
-      return globalIsStringSid(fnIx, sidOfNode(exprIx), exprIx)
+      return globalReadIsString(fnIx, exprIx)
     }
     // An index read over a string list (`names[i]`) yields a string ref — the only
     // string-producing index form (an i32 list or `s[i]` yields an i32).
@@ -15356,7 +15345,7 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       // A declared local of the name that is not a closure cell denotes no module global.
       if declaredSlotOf(exprIx) >= 0 { return false }
       // A module-global closure cell — a bare closure (kind 14) or a NULLABLE one (kind 19).
-      const gl = globalLetOfIn(fnIx, e.identName, exprIx)
+      const gl = globalLetOfRead(fnIx, exprIx)
       if gl >= 0 {
         const gk = globalCellKind(gl)
         return gk == "closure" || gk == "nulclosure"
@@ -16530,7 +16519,7 @@ export function mfCallbackFe(cbIx: i32, fnIx: i32) {
         if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
       }
       if li < 0 {
-        li = globalLetOfIn(fnIx, e.identName, inner)
+        li = globalLetOfRead(fnIx, inner)
         if li >= 0 { initFn = -1 }
       }
       if li >= 0 {
