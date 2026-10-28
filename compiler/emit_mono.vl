@@ -308,6 +308,7 @@ import {
   annSplitParams,
   drwDispatchOp,
   exprEffectFree,
+  fnLetOfRead,
   moduleLocalLetAll,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
@@ -325,7 +326,6 @@ import {
   noteCallOrigin,
   nullablePartOf,
   parenUnionArrElemName,
-  parentLetOf,
   parentLetOfAt,
   pushUniqueAtom,
   tyIsFuncType,
@@ -859,16 +859,14 @@ function monoStructAnnName(name: string, isArr: boolean) {
   ""
 }
 
-// Is the name the read `readIx` spells still the module's binding when read from inside `fnIx`
-// (-1 = module scope)? False when that body binds it or the read is of one of its parameters — the shadow test, which is not
-// the same question as `fnIx >= 0` (D703).
+// Is the read `readIx` still of the module's binding inside `fnIx` (-1 = module scope)? False
+// when that body's `let` is the read's declaration or the read is of one of its parameters —
+// the shadow test, which is not the same question as `fnIx >= 0` (D703).
 function monoModuleNameVisible(readIx: i32, fnIx: i32) {
   if fnIx < 0 { return true }
   if paramTypeNodeOfRead(fnIx, readIx) >= 0 { return false }
   const shf = nodeAt(fnIx)
-  if shf is FuncDecl {
-    return parentLetOf(shf.fnBody, sidText(sidOfNode(readIx))) < 0
-  }
+  if shf is FuncDecl { return fnLetOfRead(fnIx, readIx) < 0 }
   false
 }
 
@@ -1088,7 +1086,7 @@ function monoAnnIsCloPin(annIx: i32) {
 
 // The annotation node of a binding of `fnIx` already pinned to a monomorphized function value,
 // or -1; the node carries both halves (`tyNameOf` key, `nodeTyIxOf` banked `TyFunc`). Param
-// before local. A name `fnIx` does not bind is a capture, read at the nearest enclosing frame
+// before local. A read `fnIx` does not bind is a capture, read at the nearest enclosing frame
 // that binds it (D13660).
 function monoCloPinAnnNodeOf(readIx: i32, fnIx: i32): i32 {
   const identName = sidText(sidOfNode(readIx))
@@ -1100,7 +1098,7 @@ function monoCloPinAnnNodeOf(readIx: i32, fnIx: i32): i32 {
     const ctxFn = nodeAt(fx)
     let li = -1
     if ctxFn is FuncDecl {
-      li = parentLetOf(ctxFn.fnBody, identName)
+      li = fnLetOfRead(fx, readIx)
       if li >= 0 {
         const ld = nodeAt(li)
         if ld is LetDecl {
@@ -1531,9 +1529,10 @@ function monoDestListPinName(letIx: i32, fnIx: i32): string {
   monoAnnPinName(en + "[]")
 }
 
-// `monoDestListPinName` of the binding a closure at `fnIx` captures as `name`: the nearest
-// enclosing frame's `let`, or "" once a frame binds the name as a parameter.
-function monoCapturedDestListPin(name: string, fnIx: i32): string {
+// `monoDestListPinName` of the binding a closure at `fnIx` captures as `name`, read at
+// `readIx`: the enclosing frame's `let` that is its declaration, or "" once a frame binds the
+// name as a parameter.
+function monoCapturedDestListPin(readIx: i32, name: string, fnIx: i32): string {
   let pp = fnStmtsPosOf(fnIx)
   let steps = 0
   while pp >= 0 && pp < fnParent.length && steps < 64 {
@@ -1542,7 +1541,7 @@ function monoCapturedDestListPin(name: string, fnIx: i32): string {
     const fx = fnStmts[pp]
     const fn = nodeAt(fx)
     if fn is FuncDecl {
-      const li = parentLetOf(fn.fnBody, name)
+      const li = fnLetOfRead(fx, readIx)
       if li >= 0 { return monoDestListPinName(li, fx) }
       if paramIndexOf(fx, name) >= 0 { return "" }
     }
@@ -1551,9 +1550,9 @@ function monoCapturedDestListPin(name: string, fnIx: i32): string {
   ""
 }
 
-// The annotation pin of the enclosing frame's PARAMETER the capture read `readIx` in a closure at
-// `fnIx` reads, or "" once a frame binds its name as a local. A lambda lifted out of an instance reads its capture
-// at the instance's substituted annotation, as a direct call in the instance's body does (D3063).
+// The annotation pin of the enclosing frame's PARAMETER the capture read `readIx` in a closure
+// at `fnIx` reads, or "" once a frame's `let` is its declaration. A lambda lifted out of an
+// instance reads its capture at the instance's substituted annotation (D3063).
 function monoCapturedParamPin(readIx: i32, fnIx: i32): string {
   const name = sidText(sidOfNode(readIx))
   let pp = fnStmtsPosOf(fnIx)
@@ -1564,7 +1563,7 @@ function monoCapturedParamPin(readIx: i32, fnIx: i32): string {
     const fx = fnStmts[pp]
     const fn = nodeAt(fx)
     if fn is FuncDecl {
-      if parentLetOf(fn.fnBody, name) >= 0 { return "" }
+      if fnLetOfRead(fx, readIx) >= 0 { return "" }
       if paramIndexOf(fx, name) >= 0 {
         const ptn = paramTypeNodeOfRead(fx, readIx)
         if ptn < 0 { return "" }
@@ -2298,7 +2297,7 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
     // type parameter it names, where the capture's own name rungs know only its default (D3831).
     const cl = nodeAt(unwrapParen(argN.idxArr))
     if cl is Ident && fnIx >= 0 {
-      if monoNameIsCapture(fnIx, cl.identName) {
+      if monoNameIsCapture(fnIx, unwrapParen(argN.idxArr), cl.identName) {
         let ep = nodeTyIxOf(unwrapParen(ix))
         // The cell of a written capture is read through an index the rewrite minted untyped.
         if ep < 0 { ep = tyArrayElemIx(nodeTyIxOf(unwrapParen(argN.idxArr))) }
@@ -2495,7 +2494,7 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
           }
         }
         if li < 0 && paramIndexOf(fnIx, argN.identName) < 0 {
-          const cdp = monoCapturedDestListPin(argN.identName, fnIx)
+          const cdp = monoCapturedDestListPin(cax, argN.identName, fnIx)
           if cdp != "" { return cdp }
           const cpp = monoCapturedParamPin(cax, fnIx)
           if cpp != "" { return cpp }
@@ -20121,11 +20120,8 @@ function monoCalleeAnnNode(callee: i32, fnIx: i32): i32 {
   if fnIx >= 0 {
     const ptn = paramTypeNodeOfRead(fnIx, cx)
     if ptn >= 0 { return ptn }
-    const fn = nodeAt(fnIx)
-    if fn is FuncDecl {
-      const fl = parentLetOf(fn.fnBody, c.identName)
-      if fl >= 0 { li = fl }
-    }
+    const fl = fnLetOfRead(fnIx, cx)
+    if fl >= 0 { li = fl }
   }
   if li < 0 { return -1 }
   const ld = nodeAt(li)
@@ -24640,12 +24636,13 @@ function monoCapturedLamFe(calleeIx: i32, ctx: i32): i32 {
   fe
 }
 
-// Whether `name` read in function `fx` is bound by neither its parameters nor its body's lets.
-function monoNameIsCapture(fx: i32, name: string): boolean {
+// Whether `name` read at `readIx` in function `fx` is bound by neither its parameters nor a
+// `let` of its body.
+function monoNameIsCapture(fx: i32, readIx: i32, name: string): boolean {
   const f = nodeAt(fx)
   if f is FuncDecl {
     if monoFnBindsParam(fx, name) { return false }
-    return parentLetOf(f.fnBody, name) < 0
+    return fnLetOfRead(fx, readIx) < 0
   }
   false
 }
