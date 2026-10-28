@@ -63,11 +63,10 @@ import {
 } from "./symbols"
 import { i32ListHas, i32ListIndexOf } from "./listutil"
 import { demangleName } from "./check_suggest"
-import { hashMixPair } from "./hash_mix"
 
 // —— which binding does a name mean: the frame table the write scan keys on (D1610/D1611) ——
-// A name is not a value: two functions may each bind `b` and mean two lists. Every predicate
-// below keys on the pair (name, frame), so a same-named handle another frame cannot reach
+// A name is not a value: two bindings of `b` may mean two lists. Every predicate below keys on
+// the declaration a read resolves to, so a same-named handle of another binding
 // neither spends D852's aliasing guard nor counts as a write through this one.
 
 // A top-level function's name to its `FuncDecl` arena index, so a forward call can infer the
@@ -75,33 +74,17 @@ import { hashMixPair } from "./hash_mix"
 export let fnDeclIx: {[string]: i32} = Map()
 
 // The enclosing function frame of every arena node: a `FuncDecl` index, `CW_FR_MOD` at module
-// scope, `CW_FR_UNKNOWN` for a node no `Program` reaches. Frames are FUNCTION-wide, not block-
-// wide, deliberately: `parentLetOf` gives the emitter one local per name per body, so a finer
-// answer here would license a copy the emitter then applies to a conflated slot.
+// scope, `CW_FR_UNKNOWN` for a node no `Program` reaches. A frame says whether the walk reached a
+// node; which binding a read means is its declaration's, since every declaration has its own local.
 export const CW_FR_MOD = -1
 // Matches every frame — the conservative answer. A binder this walk does not model (a
 // `MatchExpr` arm's payload `const`, before `desugarMatchAt` rewrites it) lands here, so an
 // unmodelled shape stays exactly as coarse as a bare name is, never coarser.
 export const CW_FR_UNKNOWN = -2
 export let cwFrameOf: i32[] = []
-// One row per declaration, in walk order: the declaring node, the frame it declares into and
-// the interned name. The membership table below is what keeps a lookup independent of the
-// frame's size, and module scope's is the whole program's top-level names.
-let cwDeclNode: i32[] = []
-let cwDeclFr: i32[] = []
-let cwDeclSid: i32[] = []
-// `(frame, sid)` membership, open-addressed with linear probing over the rows above. A slot
-// with `cwDeclSlotSid == -1` is free, and the table is sized to twice the rows, so a probe
-// always meets one.
-let cwDeclSlotFr: i32[] = []
-let cwDeclSlotSid: i32[] = []
-// How many declarations the occupied slot holds: a frame may bind one name twice (two blocks).
-let cwDeclSlotN: i32[] = []
-// The slot's first declaration, and per arena node the first declaration of its own slot or -1:
-// the key the occurrence index files a binding's rows under, one per emitted local.
-let cwDeclSlotRep: i32[] = []
-let cwDeclRep: i32[] = []
-let cwDeclCap = 0
+// Per arena node, 1 where the frame walk filed it as a declaration. A filed declaration is its
+// own key: the occurrence index files a binding's rows under it, one per emitted local.
+let cwDeclFiled: i32[] = []
 // The enclosing frame of a frame, indexed by its `FuncDecl` node — the chain a name walks out
 // along. A lambda is a `FuncDecl` with an empty name, so capture needs no arm of its own.
 // Keyed by the frames only: a node that opens none reads `CW_FR_MOD`. A map, not an
@@ -130,15 +113,7 @@ export function cwFrameReset() {
   cwFrameOf = []
   cwFrParent = []
   cwFrParentEpoch = -1
-  cwDeclNode = []
-  cwDeclFr = []
-  cwDeclSid = []
-  cwDeclSlotFr = []
-  cwDeclSlotSid = []
-  cwDeclSlotN = []
-  cwDeclSlotRep = []
-  cwDeclRep = []
-  cwDeclCap = 0
+  cwDeclFiled = []
   cwFrameUp = Map()
   cwFramesBuilt = false
   cwIxReset()
@@ -215,7 +190,7 @@ let cwIxAnyWrite = 0
 let cwIxBuilt = false
 // Whether `cwIxParent` is the frame walk's column, so the note pass files no parent itself.
 let cwIxParentFiled = false
-// The same rows chained per declaration (`cwDeclRep`), built for a name on its first query: each
+// The same rows chained per declaration (`cwDeclFiled`), built for a name on its first query: each
 // row's next row on its chain, the newest row per declaration, and per name the newest row that
 // resolves to no declaration — a call, which may write anything — and whether it is chained. A
 // reader walks its declaration's chain and that one (D2688).
@@ -272,14 +247,12 @@ function cwIxOcc(sid: i32, node: i32, fr: i32, kind: i32) {
   0
 }
 
-// The chain key of a row of `sid` declared by `d`: the first declaration sharing `d`'s frame and
-// name, or -1 when `d` declares nothing the frame walk filed.
+// The chain key of a row of `sid` declared by `d`: `d` itself, or -1 when `d` declares nothing
+// the frame walk filed or declares another name.
 function cwIxKey(sid: i32, d: i32): i32 {
-  if d < 0 || d >= cwDeclRep.length { return -1 }
-  const r = cwDeclRep[d]
-  if r < 0 || r >= P.nodes.length { return -1 }
-  if sidOfNode(r) != sid { return -1 }
-  r
+  if cwDeclKeyOf(d) < 0 { return -1 }
+  if sidOfNode(d) != sid { return -1 }
+  d
 }
 
 // The chain key of row `r` of `sid`: the key of the declaration it binds, the one its read or
@@ -621,8 +594,7 @@ export function cwIxBuild() {
 // newest first; with `all`, of every row of the name instead.
 export type CwOccWalk = { a: i32, u: i32, all: boolean, row: i32 }
 
-// The rows of the binding `d` declares: those resolving to it or to a declaration sharing its
-// frame and name, and the calls that may write it. Every row of its name when `d` has no frame
+// The rows of the binding `d` declares: those resolving to it, and the calls that may write it. Every row of its name when `d` has no frame
 // or is a key (`cwKeyOfDecl`) standing for every binding of a name.
 export function cwOccWalk(d: i32): CwOccWalk {
   if d <= -2 { return cwOccWalkAll(-2 - d) }
@@ -638,14 +610,11 @@ export function cwOccWalkUse(p: i32): CwOccWalk {
   cwOccWalk(identDeclOf(p))
 }
 
-// The key an alias set carries for the binding declaration `d` makes: the first declaration
-// sharing its frame and name, `d` itself where the frame walk filed none, or `-2 - sid` where
-// `d` has no frame, which stands for every binding of the name. -1 for no declaration.
+// The key an alias set carries for the binding declaration `d` makes: `d` itself, or `-2 - sid`
+// where `d` has no frame, which stands for every binding of the name. -1 for no declaration.
 export function cwKeyOfDecl(d: i32): i32 {
   if d < 0 || d >= P.nodes.length { return -1 }
   if cwFrameOfDecl(d) == CW_FR_UNKNOWN { return cwKeyAnyOf(sidOfNode(d)) }
-  const r = cwDeclRepOf(d)
-  if r >= 0 { return r }
   d
 }
 
@@ -743,66 +712,8 @@ function cwDeclare(d: i32, fr: i32) {
   if fr != CW_FR_MOD {
     if fr < 0 || fr >= cwFrameOf.length { return 0 }
   }
-  cwDeclNode.push(d)
-  cwDeclFr.push(fr)
-  cwDeclSid.push(sidOfNode(d))
+  if d >= 0 && d < cwDeclFiled.length { cwDeclFiled[d] = 1 }
   0
-}
-
-// The slot `(fr, sid)` occupies, or the free slot it would take; -1 while no table is open.
-function cwDeclSlotOf(fr: i32, sid: i32): i32 {
-  let h = hashMixPair(fr, sid) & (cwDeclCap - 1)
-  if h < 0 || h >= cwDeclSlotSid.length { return -1 }
-  while cwDeclSlotSid[h] >= 0 {
-    if cwDeclSlotSid[h] == sid {
-      if cwDeclSlotFr[h] == fr { return h }
-    }
-    h = h + 1
-    if h == cwDeclCap { h = 0 }
-  }
-  h
-}
-
-// Place every row in the membership table. Runs once, at the end of the frame walk, so no
-// reader can meet a half-filled table and read a declaration as absent.
-function cwDeclIndex() {
-  let cap = 16
-  while cap < cwDeclSid.length * 2 { cap = cap * 2 }
-  cwDeclCap = cap
-  while cwDeclSlotSid.length < cap {
-    cwDeclSlotSid.push(-1)
-    cwDeclSlotFr.push(0)
-    cwDeclSlotN.push(0)
-    cwDeclSlotRep.push(-1)
-  }
-  cwDeclRep = __array_new__(cwFrameOf.length, -1)
-  let i = 0
-  while i < cwDeclSid.length {
-    const s = cwDeclSlotOf(cwDeclFr[i], cwDeclSid[i])
-    if s >= 0 && s < cwDeclSlotSid.length {
-      cwDeclSlotFr[s] = cwDeclFr[i]
-      cwDeclSlotSid[s] = cwDeclSid[i]
-      cwDeclSlotN[s] = cwDeclSlotN[s] + 1
-      if cwDeclSlotRep[s] < 0 { cwDeclSlotRep[s] = cwDeclNode[i] }
-      const d = cwDeclNode[i]
-      if d >= 0 && d < cwDeclRep.length { cwDeclRep[d] = cwDeclSlotRep[s] }
-    }
-    i = i + 1
-  }
-  0
-}
-
-// How many declarations share declaration `d`'s frame and name, `d` among them: the emitter
-// gives a body one local per name, so a binding is the declaration's own only when this is 1.
-function cwDeclCount(d: i32): i32 {
-  if d < 0 || d >= P.nodes.length { return 0 }
-  const fr = cwFrameOfDecl(d)
-  if fr == CW_FR_UNKNOWN || cwDeclCap == 0 { return 0 }
-  const sid = sidOfNode(d)
-  const s = cwDeclSlotOf(fr, sid)
-  if s < 0 || s >= cwDeclSlotSid.length { return 0 }
-  if cwDeclSlotSid[s] != sid || cwDeclSlotFr[s] != fr { return 0 }
-  cwDeclSlotN[s]
 }
 
 // The walk. Mirrors `lint.vl`'s `bindScan` arm for arm — a binder it grows and this does not
@@ -923,6 +834,7 @@ export function cwBuildFrames() {
   const roots: i32[] = []
   const len = P.nodes.length
   cwFrameOf = __array_new__(len, CW_FR_UNKNOWN)
+  cwDeclFiled = __array_new__(len, 0)
   let at = 0
   for nd in P.nodes {
     if nd is Program { roots.push(at) }
@@ -961,7 +873,6 @@ export function cwBuildFrames() {
     t = t + 1
   }
   cwKids = []
-  cwDeclIndex()
   cwFramesBuilt = true
   0
 }
@@ -1286,20 +1197,15 @@ export function cwHeldFnOf(a: i32): i32 {
   -1
 }
 
-// The declaration standing for the binding the read `ix` names, the first one its frame files
-// under the name; -1 when the read's frame is not known or files no such declaration.
-export function cwBindingOf(ix: i32): i32 {
-  const k = cwKeyOfRoot(ix)
-  if k < 0 { return -1 }
-  cwDeclRepOf(k)
-}
+// The declaration the read `ix` names; -1 when the read's frame is not known or the frame walk
+// filed no such declaration.
+export function cwBindingOf(ix: i32): i32 { cwDeclKeyOf(cwKeyOfRoot(ix)) }
 
-// The first declaration sharing declaration `d`'s frame and name, or -1 when the frame walk
-// filed none for it.
-function cwDeclRepOf(d: i32): i32 {
+// `d` when the frame walk filed it as a declaration, else -1.
+function cwDeclKeyOf(d: i32): i32 {
   cwBuildFrames()
-  if d < 0 || d >= cwDeclRep.length { return -1 }
-  cwDeclRep[d]
+  if d < 0 || d >= cwDeclFiled.length || cwDeclFiled[d] == 0 { return -1 }
+  d
 }
 
 // The initialiser, parens peeled, of the binding `b` (`cwBindingOf`) when it is bound exactly
@@ -1331,15 +1237,15 @@ function cwBoundInitScan(b: i32): i32 {
 }
 
 // The `LetDecl` or `Param` the `Ident` read `ix` names, by the binder, or -1 when it names
-// another declaration or its frame declares the name more than once.
+// another declaration.
 export function cwSoleBinderAt(ix: i32): i32 {
   if !cwFrameOfOpen(ix) || !(nodeAt(ix) is Ident) { return -1 }
   cwSoleDecl(identDeclOf(ix))
 }
 
-// `d` when it is a `LetDecl` or `Param` its frame declares no other of the same name, else -1.
+// `d` when it is a `LetDecl` or `Param`, else -1.
 function cwSoleDecl(d: i32): i32 {
-  if d < 0 || d >= P.nodes.length || cwDeclCount(d) != 1 { return -1 }
+  if d < 0 || d >= P.nodes.length { return -1 }
   const n = nodeAt(d)
   if n is LetDecl || n is Param { return d }
   -1
@@ -1374,17 +1280,13 @@ function cwFvTargetsOf(b: i32): i32[] {
 function cwFvCollect(b: i32, out: i32[]): boolean {
   const fr = cwFrameOfDecl(b)
   let binds = 0
-  let bd = -1
   const ow = cwOccWalk(b)
   while cwOccNext(ow) {
     const r = ow.row
     const at = cwIxNode[r]
     const n = nodeAt(at)
     if cwIxKind[r] == CW_OCC_BIND {
-      if cwIxFr[r] == fr {
-        binds = binds + 1
-        bd = at
-      }
+      if cwIxFr[r] == fr { binds = binds + 1 }
       if n is LetDecl {
         if n.letInit >= 0 && !cwFvAddValue(n.letInit, out) { return false }
       } else if n is Param {
@@ -1393,16 +1295,16 @@ function cwFvCollect(b: i32, out: i32[]): boolean {
         return false
       }
     }
-    if cwIxKind[r] == CW_OCC_ASG {
-      if n is BinExpr {
-        // Only `nm = v` re-points the binding; a write into a part of it stores no function.
-        if nodeAt(cwPeel(n.binLeft)) is Ident {
-          if !cwFvAddValue(n.binRight, out) { return false }
-        }
-      }
+    // Only `nm = v` re-points the binding; a write into a part of it stores no function.
+    if (
+      cwIxKind[r] == CW_OCC_ASG
+      && n is BinExpr
+      && nodeAt(cwPeel(n.binLeft)) is Ident
+    ) {
+      if !cwFvAddValue(n.binRight, out) { return false }
     }
   }
-  binds > 0 && binds == cwDeclCount(bd)
+  binds > 0
 }
 
 // The write that stores function `decl` into the binding `b` (`cwBindingOf`): the `let`
@@ -1458,18 +1360,17 @@ export function cwLetSlotFnTargets(bd: i32): i32[] {
   out
 }
 
-// Walks the scope of the initialised `let` node `bd` for its name once; false when it has a
-// binder the walk does not model.
+// Walks the frame of the initialised `let` node `bd` for its name once, filing every same-named
+// `let` the walk meets as walked; false when the frame has a binder the walk does not model.
 function cwLexScopeOk(bd: i32): boolean {
   const n = nodeAt(bd)
   if !(n is LetDecl) || n.letInit < 0 { return false }
   const nm = n.letName
   const fr = cwFrameOfDecl(bd)
-  const key = cwDeclRepOf(bd)
-  if fr == CW_FR_UNKNOWN || key < 0 { return false }
-  if !(cwLexDone.get(key) ?? false) {
-    cwLexDone.set(key, true)
+  if fr == CW_FR_UNKNOWN || cwDeclKeyOf(bd) < 0 { return false }
+  if !(cwLexDone.get(bd) ?? false) {
     cwLexBail = false
+    cwLexMet = [bd]
     if fr == CW_FR_MOD {
       for nd in P.nodes {
         if nd is Program { cwLexSeq(nd.progStmts, nm, -1) }
@@ -1480,9 +1381,12 @@ function cwLexScopeOk(bd: i32): boolean {
     } else {
       cwLexBail = true
     }
-    if cwLexBail { cwLexBailed.set(key, true) }
+    for m in cwLexMet {
+      cwLexDone.set(m, true)
+      if cwLexBail { cwLexBailed.set(m, true) }
+    }
   }
-  !(cwLexBailed.get(key) ?? false)
+  !(cwLexBailed.get(bd) ?? false)
 }
 
 // Whether node `e`, parentheses peeled, reads the binding the `let` node `bd` declares.
@@ -1501,13 +1405,14 @@ function cwLexSlotPush(bd: i32, v: i32) {
 }
 
 // By `let` node, the values its scope's `nm = v` writes store, and the values its slot writes
-// store; by the first declaration of a frame's name, whether that frame has been walked for it,
-// and whether the walk met a binder it does not model.
+// store; by `let` node, whether its frame has been walked for its name and whether the walk met a
+// binder it does not model; and the same-named `let`s the current walk has met.
 let cwLexSlotStores: Map<i32, i32[]> = Map()
 let cwLexStores: Map<i32, i32[]> = Map()
 let cwLexDone: Map<i32, boolean> = Map()
 let cwLexBailed: Map<i32, boolean> = Map()
 let cwLexBail = false
+let cwLexMet: i32[] = []
 
 // Walks statements `xs` in order, `cur` the `let` of `nm` in scope (-1 for another binder).
 function cwLexSeq(xs: i32[], nm: string, cur: i32) {
@@ -1531,7 +1436,10 @@ function cwLexWalk(ix: i32, nm: string, cur: i32): i32 {
     }
     LetDecl => {
       cwLexWalk(n.letInit, nm, cur)
-      if n.letName == nm { return ix }
+      if n.letName == nm {
+        cwLexMet.push(ix)
+        return ix
+      }
       return cur
     }
     FuncDecl => {
@@ -2086,7 +1994,6 @@ function cwFvAddNamed(v: i32, out: i32[]): boolean {
     if vf == CW_FR_UNKNOWN { return false }
     const d = cwFnDeclAt(v)
     if d >= 0 && d < cwFrameOf.length && cwFrameOf[d] == vf {
-      if cwDeclCount(d) != 1 { return false }
       if !i32ListHas(out, d) { out.push(d) }
       return true
     }
