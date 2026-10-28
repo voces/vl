@@ -339,6 +339,7 @@ import {
   parentBindingFrameAt,
   parentBindingFrameOf,
   parentBindingOf,
+  readNarrowedTyAt,
   scopeTyAt,
 } from "./emit_capture_frames"
 import {
@@ -1001,13 +1002,13 @@ import {
 import {
   isUNameAB,
   isUNameABTyMayHit,
-  isUNameDeclAB,
   msKeepTy,
   msMemberAtomsOfSet,
   msRemoveAtomId,
   msSetOfCanon,
   msSetOfNameTy,
   msSetOfTy,
+  msSetOfTyAny,
   msSetOfUnion,
   msSoleMemberTy,
   msSubAtomOrView,
@@ -1015,7 +1016,6 @@ import {
   msSubTy,
   msSubTyAlike,
   msTextOf,
-  narrowSlotTy,
   removeAtomFromSetOf,
   removeAtomIdOf,
   removeAtomRestOf,
@@ -1054,7 +1054,7 @@ import {
   sidOfNode,
   sidText,
 } from "./symbols"
-import { arrElemNameRaw, peelGroupParens } from "./tyname"
+import { peelGroupParens } from "./tyname"
 import {
   assignable,
   holeFnArgRetAtParams,
@@ -8222,26 +8222,12 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   // A narrowed union arm iterates the arm's elements, not the literal's own values: for
   // `type K = string | K[]`, `if c is K[]` narrows to a list of boxes, while the plain
   // classifiers would type the temp as a string list (check-clean invalid wasm, D1015).
-  const fiN0 = nodeAt(iterIx)
-  if fiN0 is Ident {
-    const fiSl = narrowSlotOf(fiN0.identName)
-    if fiSl >= 0 {
-      const fiVa = narrowVariants[fiSl]
-      if fiVa != "" {
-        if tyIsArray(narrowSlotTy(fiSl)) {
-          // A literal union's element is an atom, never a box (D4907).
-          const fiAtoms = tyIsLitUnionArray(narrowTys[fiSl])
-          // The element's type finds its row by key; a slot whose list is not a `TyArray`, by the name.
-          const fiEl = tyStepElem(narrowSlotTy(fiSl))
-          let fiBox = false
-          if fiEl >= 0 {
-            fiBox = unRowOfKey(fiEl) >= 0
-          } else {
-            fiBox = isUNameDeclAB(72, arrElemNameRaw(fiVa))
-          }
-          if fiBox && !fiAtoms { return "union" }
-        }
-      }
+  if nodeAt(iterIx) is Ident {
+    const fiNt = readNarrowedTyAt(iterIx, fnIx)
+    // A literal union's element is an atom, never a box (D4907).
+    const fiEl = tyStepElem(fiNt)
+    if fiEl >= 0 && !tyIsLitUnionArray(fiNt) && unRowOfKey(fiEl) >= 0 {
+      return "union"
     }
   }
   const e = nodeAt(iterIx)
@@ -8633,18 +8619,10 @@ function mapReadMvSlot(exprIx: i32, fnIx: i32) {
       // misses — resolve the arm's value mv slot directly.
       const ax = nodeAt(unwrapParen(e.idxArr))
       if ax is Ident {
-        // …but blind is not the same as wrong: when an `is` narrow is active and says the
-        // receiver is the union's array arm, `exprMap` missing above is correct, not a
-        // pre-pass artefact — claiming the map arm anyway would reach a receiver that isn't
-        // one (D1012).
-        const d12v = narrowVariantFor(ax.identName)
-        // Asked of the slot's banked type, so a narrow to an ALIAS (`type JsonArr = Json[]`)
-        // and to its spelled-out twin classify the receiver alike (D1822).
-        if tyIsArray(narrowSlotTy(narrowSlotOf(ax.identName))) { return -1 }
-        // …and the same for a `string` narrow (D1033): `k[0]` over `k` narrowed to the
-        // union's string arm is a char read, not a map read (the index yields an i32) — and
-        // claiming the map arm skipped the argument boundary's box.
-        if d12v == "string" { return -1 }
+        // A read the checker narrowed to the array or `string` arm is no map read, whether the
+        // narrow names an alias or its spelled-out twin; a `string` index reads a char (D1012).
+        const d12t = readNarrowedTyAt(unwrapParen(e.idxArr), fnIx)
+        if tyIsArray(d12t) || tyPrimNameOf(d12t) == "string" { return -1 }
         const aun = unionNameOfIdentAt(
           sidOfNode(unwrapParen(e.idxArr)),
           fnIx,
@@ -14692,23 +14670,18 @@ export function sharedUnionFieldPlan(
   // the emitter's lazy-frame stash; what's decided here is only the narrowed-set typing.
   let set = ""
   let setId = -1
-  if recv is Ident {
-    // `currentStructNarrowSetAt` and its set-id twin, sharing one slot lookup and one
-    // declared-union read.
-    const slot = narrowSlotOf(recv.identName)
-    if slot >= 0 && narrowVariants[slot] != "" {
-      set = narrowVariants[slot]
-      setId = narrowSets[slot]
-    } else {
-      const ux = unwrapParen(recvIx)
-      const un = unionNameOfIdentAt(sidOf(recv.identName), fnIx, ux)
-      set = unionMemberSetOf(un)
-      if slot >= 0 {
-        setId = narrowSets[slot]
-      } else {
-        setId = msSetOfUnion(un)
-      }
-    }
+  const rnt = readNarrowedTyAt(recvIx, fnIx)
+  if rnt >= 0 {
+    setId = msSetOfTyAny(rnt)
+    if setId >= 0 { set = msTextOf(setId) }
+  } else if recv is Ident {
+    const un = unionNameOfIdentAt(
+      sidOf(recv.identName),
+      fnIx,
+      unwrapParen(recvIx),
+    )
+    set = unionMemberSetOf(un)
+    setId = msSetOfUnion(un)
   } else {
     const un = unionNameOfExpr(recvIx, fnIx)
     set = unionMemberSetOf(un)
@@ -14750,7 +14723,7 @@ export function sharedUnionFieldPlan(
   if (
     !mixed
     && code == FC_STRUCT
-    && sharedFieldNarrowedArms(readIx, outVis, outFis)
+    && sharedFieldNarrowedArms(readIx, fnIx, outVis, outFis)
   ) {
     return code
   }
@@ -14779,12 +14752,14 @@ export function sharedUnionFieldPlan(
 // Whether the record field read `readIx` is narrowed to one record (`if w.c is C`), keeping in
 // `vis`/`fis` only the members whose field stores that record; the `is` test read the box tag,
 // so no other member reaches the read. False, the plan untouched, when no member stores it.
-function sharedFieldNarrowedArms(readIx: i32, vis: i32[], fis: i32[]): boolean {
-  if readIx < 0 || narrowTop == 0 { return false }
-  const pk = placeNarrowKeyOf(readIx)
-  if pk == "" { return false }
-  const nt = narrowSlotTy(narrowSlotOf(pk))
-  if nt < 0 || nt >= T.tys.length || !(tyAt(nt) is TyObj) { return false }
+function sharedFieldNarrowedArms(
+  readIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+): boolean {
+  const nt = readNarrowedTyAt(readIx, fnIx)
+  if nt < 0 || !(tyAt(nt) is TyObj) { return false }
   const kv: i32[] = []
   const kf: i32[] = []
   let i = 0
@@ -16039,10 +16014,8 @@ export function exprNulStrArray(exprIx: i32, fnIx: i32) {
       }
       // A union binding narrowed to the `(string | null)[]` arm reads unboxed as the
       // string list whose ELEMENT stays `(ref null)` — the same nullable read discipline.
-      if narrowSlotOf(e.identName) >= 0 {
-        if tyScalarBackedListKind(nodeTyAt(exprIx, fnIx)) == "strlist" {
-          return true
-        }
+      if tyScalarBackedListKind(readNarrowedTyAt(exprIx, fnIx)) == "strlist" {
+        return true
       }
       // A local/global binding (or a rebind chain `const t0 = g`) annotated
       // `(string | null)[]` — or `(string | null)[] | null`, narrowed via `t0 != null`.
