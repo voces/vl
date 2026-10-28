@@ -1243,6 +1243,24 @@ export function cloRetIsStructRow(fe: i32): boolean {
   k == "struct" || k == "nulstruct"
 }
 
+// The variant row of the `(ref null $uVarHeap[vi])` niche a call of `fe` returns, or -1.
+// The annotation, or an un-annotated result's recorded return kind, is read first, so a call
+// that is not the niche never runs `cloRetValKind`'s inference.
+function cloRetNulVariantRow(fe: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const fn = nodeAt(fnStmts[fe])
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 {
+      if nulVariantIndexOf(fn.fnRet) < 0 { return -1 }
+    } else {
+      if fe >= fRetKind.length { return -1 }
+      if fRetKind[fe] != "nulvariant" { return -1 }
+    }
+  }
+  if cloRetValKind(fe) == "nulvariant" { return cloRetValSlot(fe) }
+  -1
+}
+
 // The struct-table slot for `fe`'s result valtype — a real index only for the kinds that
 // carry one (struct, nullable struct, variant, ref list, map), `-1` otherwise.
 export function cloRetValSlot(fe: i32) {
@@ -1807,8 +1825,12 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
     // arm that carries the rep.
     IfStmt => {
       const nlv = nulIfArmNullableValueIx(exprIx)
-      if nlv < 0 || nulVariantIdxOfExpr(nlv, fnIx) < 0 { return -1 }
-      return nulVariantIdxOfExpr(ifRepArmValueIx(exprIx), fnIx)
+      if nlv < 0 { return -1 }
+      const nlr = nulVariantIdxOfExpr(nlv, fnIx)
+      if nlr < 0 { return -1 }
+      const rav = ifRepArmValueIx(exprIx)
+      if rav == nlv { return nlr }
+      return nulVariantIdxOfExpr(rav, fnIx)
     }
     // A nullable variant-element list read (D851), then a bare `m[k]` over an arm-valued map
     // (D34).
@@ -1861,10 +1883,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
       const callee = nodeAt(e.callFn)
       if callee is Ident {
         const cfe = fnIndexOfNode(e.callFn)
-        if cfe >= 0 {
-          if cloRetValKind(cfe) == "nulvariant" { return cloRetValSlot(cfe) }
-          return -1
-        }
+        if cfe >= 0 { return cloRetNulVariantRow(cfe) }
         // A closure-value callee (`const f = mk; f()`), which `fnIndexOfSid` misses.
         // `calleeCloSigKeySid` is the key the kind comes from and `sigKeyRetSlot` that same
         // key's slot digit, so the pair stays one fact.
@@ -1875,7 +1894,8 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
       if callee is Member {
         const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
         if ffe >= 0 {
-          if cloRetValKind(ffe) == "nulvariant" { return cloRetValSlot(ffe) }
+          const fvr = cloRetNulVariantRow(ffe)
+          if fvr >= 0 { return fvr }
         }
       }
       return popArmElemVariantRow(exprIx, fnIx)
@@ -5311,11 +5331,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
     // The nullable receiver (`z: A | null` under its null test) reads the same arm field, so
     // it names the same box — `emitMem`'s nullable twin unboxes through this answer (D4636).
     // A named receiver only: asked of every link of a member chain, the walk is super-linear.
-    if (
-      avi < 0
-      && nodeAt(unwrapParen(m.memObj)) is Ident
-      && exprNullableVariant(m.memObj, fnIx)
-    ) {
+    if avi < 0 && nodeAt(unwrapParen(m.memObj)) is Ident {
       const nvi = nulVariantIdxOfExpr(m.memObj, fnIx)
       if nvi >= 0 && !armLayoutAmbiguousAt(nvi) {
         const nfi = variantFieldIndex(nvi, m.memProp)
@@ -12506,10 +12522,8 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
         if coalesceResultIsBox(exprIx) { return -1 }
         // A nullable default keeps the result the niche, which no concrete row answers for.
         if exprNullableVariant(exprIx, fnIx) { return -1 }
-        if exprNullableVariant(e.binLeft, fnIx) {
-          const lv = nulVariantIdxOfExpr(e.binLeft, fnIx)
-          if lv >= 0 { return lv }
-        }
+        const lv = nulVariantIdxOfExpr(e.binLeft, fnIx)
+        if lv >= 0 { return lv }
         return exprVariantIndex(e.binRight, fnIx)
       }
     }
@@ -13075,7 +13089,7 @@ function structIndexOfMemberExpr(e: Member, exprIx: i32, fnIx: i32): i32 {
   // nested read needs the field's target row, which `uFieldTgtStructIdx` holds. Kind-gated
   // exactly as `nulVariantIdxOfExpr`'s header requires.
   const nvi2 = nulVariantIdxOfExpr(e.memObj, fnIx)
-  if nvi2 >= 0 && exprNullableVariant(e.memObj, fnIx) {
+  if nvi2 >= 0 {
     const nvfi2 = variantFieldIndex(nvi2, e.memProp)
     if nvfi2 >= 0 {
       if variantFieldTypeAt(nvi2, nvfi2) == FC_STRUCT {

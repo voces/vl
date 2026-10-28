@@ -878,7 +878,6 @@ import {
   exprNullableRefNiche,
   exprNullableString,
   exprNullableStruct,
-  exprNullableVariant,
   exprRefArray,
   exprString,
   exprStringArray,
@@ -9088,10 +9087,11 @@ function emitUnionArmValueBox(
   if exprUnion(exprIx, fnIx) { return 0 }
   // A read that can still be null (a record-valued map's miss) is the niche below even where
   // `exprVariantIndex` names its arm: tagging it with the arm boxes the miss as a record (D10170).
-  const nulRead = nodeTyIsNullable(unwrapParen(exprIx))
-    && exprNullableVariant(exprIx, fnIx)
+  const nyNul = nodeTyIsNullable(unwrapParen(exprIx))
+  let nvi = -1
+  if nyNul { nvi = nulVariantIdxOfExpr(exprIx, fnIx) }
   const svi = exprVariantIndex(exprIx, fnIx)
-  if svi >= 0 && !nulRead {
+  if svi >= 0 && nvi < 0 {
     // A struct-typed value built as the plain struct (an anonymous union arm returned from a
     // `: {…}` function, or bound to a struct local) is a layout twin of but a distinct heap
     // type from the arm's variant struct: boxing the raw ref validates, and the narrow's
@@ -9128,14 +9128,13 @@ function emitUnionArmValueBox(
 
   // The narrow is what makes it sound: this position is only reachable with the value proved
   // non-null, and the box's payload field is `anyref`, so the niche rides it exactly as the
-  // non-null variant ref does. Gated on the boolean twin and not the index alone —
-  // `exprNullableVariant` and `nulVariantIdxOfExpr` are a kind/slot pair.
-  if exprNullableVariant(exprIx, fnIx) {
-    const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
-    if nvi >= 0 && nvi < uTags.length {
+  // non-null variant ref does.
+  if !nyNul { nvi = nulVariantIdxOfExpr(exprIx, fnIx) }
+  if nvi >= 0 {
+    if nvi < uTags.length {
       // Still nullable at this read (no narrow proved it): the null must become the union's
       // null, not a box tagged with the arm over a null payload (D2260).
-      if nodeTyIsNullable(unwrapParen(exprIx)) {
+      if nyNul {
         const nvSlot = nulNicheBoxSlot()
         const nvCtx = expCtxHere(ec)
         nvCtx.rawNullRead = true
@@ -9942,10 +9941,8 @@ function eqConcreteVariantRow(exprIx: i32, fnIx: i32) {
   // from heap identity and must decline an ambiguous match, while this reads the arm the
   // checker's own type names. The value is the same nullable niche the `nulstruct` operand parks,
   // and the field `struct.get` traps on null exactly as it does for that one.
-  if exprNullableVariant(exprIx, fnIx) {
-    const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
-    if nvi >= 0 { return nvi }
-  }
+  const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
+  if nvi >= 0 { return nvi }
   const ssi = structIndexOfExpr(exprIx, fnIx)
   if ssi < 0 { return -1 }
   if ssi >= sHeapIdx.length { return -1 }
@@ -11651,20 +11648,18 @@ function emitMemVariantRead(
     // where the checker admits the read — such an access is only reachable through a null test.
     const nvi = nulVariantIdxOfExpr(m0.memObj, fnIx)
     if nvi >= 0 {
-      if exprNullableVariant(m0.memObj, fnIx) {
-        const nvfi = variantFieldIndex(nvi, m0.memProp)
-        if nvfi < 0 {
-          return emitFail("emitProgram: unknown variant field in field access")
-        }
-        if emitExpr(body, m0.memObj, fnIx, ec) < 0 { return -1 }
-        fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
-        fbStructGet(uVarHeap[nvi], nvfi)
-        emitNulStrFieldRecover(variantFieldTypeAt(nvi, nvfi), ec)
-        if variantFieldTypeAt(nvi, nvfi) == FC_UNION {
-          if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
-        }
-        return 0
+      const nvfi = variantFieldIndex(nvi, m0.memProp)
+      if nvfi < 0 {
+        return emitFail("emitProgram: unknown variant field in field access")
       }
+      if emitExpr(body, m0.memObj, fnIx, ec) < 0 { return -1 }
+      fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
+      fbStructGet(uVarHeap[nvi], nvfi)
+      emitNulStrFieldRecover(variantFieldTypeAt(nvi, nvfi), ec)
+      if variantFieldTypeAt(nvi, nvfi) == FC_UNION {
+        if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
+      }
+      return 0
     }
   }
   emitMemSharedRead(body, memIx, fnIx, ec)
@@ -26849,7 +26844,7 @@ function emitAssignMember(
   // `(ref null $uVarHeap[vi])`, so this differs from the variant-param write above only
   // by one `ref.as_non_null`, safe since the checker admits the write only inside a null test.
   const nwvi = nulVariantIdxOfExpr(target.memObj, fnIx)
-  if nwvi >= 0 && exprNullableVariant(target.memObj, fnIx) {
+  if nwvi >= 0 {
     const nwfi = variantFieldIndex(nwvi, target.memProp)
     if nwfi < 0 {
       return emitFail("emitProgram: unknown variant field in field assignment")
@@ -38810,9 +38805,9 @@ function coalNicheBoxTag(
 // `br_on_non_null` block cannot disagree about the value's rep. -1 for every other niche,
 // whose tag `coalNicheBoxTag` resolves from its atom code instead of from a heap.
 function nulNicheValueHeap(exprIx: i32, fnIx: i32): i32 {
-  if exprNullableVariant(exprIx, fnIx) {
-    const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
-    if nvi >= 0 && nvi < uVarHeap.length { return uVarHeap[nvi] }
+  const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
+  if nvi >= 0 {
+    if nvi < uVarHeap.length { return uVarHeap[nvi] }
     return -1
   }
   if exprNullableStruct(exprIx, fnIx) {
@@ -40434,9 +40429,9 @@ function emitCoalesceUnionField(
       }
     } else {
       if mvi < 0 { mvi = exprVariantIndex(lhs.memObj, fnIx) }
-      if mvi < 0 && exprNullableVariant(lhs.memObj, fnIx) {
+      if mvi < 0 {
         mvi = nulVariantIdxOfExpr(lhs.memObj, fnIx)
-        mCast = -2
+        if mvi >= 0 { mCast = -2 }
       }
       if mvi >= 0 {
         mfi = variantFieldIndex(mvi, lhs.memProp)
@@ -40817,11 +40812,9 @@ function emitCoalesceOptMember(
         )
       }
     }
-    if exprNullableVariant(lhs.omObj, fnIx) {
-      const nvi = nulVariantIdxOfExpr(lhs.omObj, fnIx)
-      if nvi >= 0 {
-        return emitCoalesceOptNulVariant(body, e, lhs, nvi, fnIx, ec)
-      }
+    const nvi = nulVariantIdxOfExpr(lhs.omObj, fnIx)
+    if nvi >= 0 {
+      return emitCoalesceOptNulVariant(body, e, lhs, nvi, fnIx, ec)
     }
     // A nested optional chain `o?.inner?.v ?? d` (niche nullable links): any null link selects
     // the default; otherwise the chain reads through non-null refs (each `S | null` link
@@ -40894,9 +40887,9 @@ function emitCoalesceNullableRefs(
   // null` whose `T` is a union arm stores `(ref null $uVarHeap[vi])`, and
   // `structIndexOfExpr` has no row to answer with (`collectS` skips a union member). Same
   // niche, same `br_on_non_null` lowering, one table over.
-  if exprNullableVariant(e.binLeft, fnIx) {
-    const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
-    if cvi >= 0 && cvi < uVarHeap.length {
+  const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
+  if cvi >= 0 {
+    if cvi < uVarHeap.length {
       return emitCoalesceNulRef(
         body,
         e,
