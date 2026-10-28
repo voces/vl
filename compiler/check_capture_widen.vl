@@ -59,12 +59,14 @@ import {
   narBankRowsOf,
 } from "./check_nar_bank"
 import {
-  declare,
-  envDeclOfNameForFlow,
-  lookup,
+  declTyOf,
+  declareSlot,
+  identSlotOf,
   slotLayerDepth,
   slotLayerPrev,
   slotLayerTop,
+  slotNameOf,
+  slotVisibleOf,
 } from "./check_scopes"
 import { T } from "./check_types"
 import { crArgMayBeFn, crIsScalarRender } from "./check_write_effects"
@@ -80,23 +82,23 @@ export function crCurRoot(): i32 {
   crFnRoots[crFnRoots.length - 1]
 }
 
-// The key the writer analysis answers `name` under: the name itself for a binding of the root's
-// own level or the module, which no write resolving inside a nested function can reach, else
+// The key the writer analysis answers slot `s` under: its name for a binding of the root's own
+// level or the module, which no write resolving inside a nested function can reach, else
 // `name@`, which also counts those writes. Unsure is `name@`, the answer ending more narrowings.
-export function crWriteKey(name: string): string {
-  if crNameAtRootLevel(name) { return name }
-  name + "@"
+export function crWriteKey(s: i32): string {
+  if crSlotAtRootLevel(s) { return slotNameOf(s) }
+  slotNameOf(s) + "@"
 }
 
-// The memo key of `crInfoOf(name)` under the current root.
-export function crInfoKey(name: string): string {
-  i32ToStr(crCurRoot()) + "#" + crWriteKey(name)
+// The memo key of `crInfoOf(s)` under the current root.
+export function crInfoKey(s: i32): string {
+  i32ToStr(crCurRoot()) + "#" + crWriteKey(s)
 }
 
-// Whether `name` reads, through its narrowing layers, a binding declared outside every function
+// Whether slot `s` is, under its narrowing layers, a binding declared outside every function
 // body being checked or in the body of the current root itself.
-function crNameAtRootLevel(name: string): boolean {
-  const d = crBindDepthOfSlot(envDeclOfNameForFlow(name))
+function crSlotAtRootLevel(s: i32): boolean {
+  const d = crBindDepthOfSlot(s)
   if d < 0 { return false }
   let f = crFnBases.length - 1
   while f >= 0 && crFnBases[f] > d { f = f - 1 }
@@ -185,13 +187,14 @@ export function crFirstBank(s: i32, d: i32): i32 {
 
 // A top-level function may be called anywhere, after any write, so its body reads a module
 // binding that some code assigns at the declared type, whatever narrowing surrounds it (D2529).
-// Bind `name` at its declared type `wide` in the body scope. The binding stands in for the
+// Bind slot `s` at its declared type `wide` in the body scope. The binding stands in for the
 // captured one, so a declaration of the same name in the body shadows it rather than clashing.
-export function crDeclareWidened(name: string, wide: i32) {
-  declare(name, wide)
+export function crDeclareWidened(s: i32, wide: i32) {
+  const name = slotNameOf(s)
+  declareSlot(s, name, wide)
   crWideNames.push(name)
   crWideDepths.push(T.frames.length - 1)
-  crWideSlots.push(envDeclOfNameForFlow(name))
+  crWideSlots.push(s)
   0
 }
 
@@ -227,20 +230,20 @@ export function crRootCaptureWiden(fnIx: i32) {
   const base = crFnBase()
   // Rows sit in scope order, so the first is the outermost: none below `base` means no capture.
   if asgDeclSlots.length == 0 || asgDeclDepths[0] >= base { return 0 }
-  const reads = crBodyReadNames(fnIx)
+  const reads = crBodyReads(fnIx)
   let r = 0
   while r < reads.length {
-    const nm = reads[r]
-    const s = envDeclOfNameForFlow(nm)
+    const s = crReadSlot(reads[r])
+    const nm = slotNameOf(s)
     const i = crInnerRowBelow(s, base)
     if i >= 0 && crNameIsModuleTop(s) {
       const wide = crOuterWidest(s, base)
       if (
         wide >= 0
-        && wide != lookup(nm)
-        && crRootLoses(fnIx, nm, asgDeclKinds[i])
+        && wide != declTyOf(s)
+        && crRootLoses(fnIx, s, asgDeclKinds[i])
       ) {
-        crDeclareWidened(nm, wide)
+        crDeclareWidened(s, wide)
         crCapWidenBank[fnIx] = strListWith(
           crCapWidenBank[fnIx] ?? crNoNames,
           nm,
@@ -254,23 +257,26 @@ export function crRootCaptureWiden(fnIx: i32) {
   0
 }
 
-// Whether top-level function `fnIx` loses the narrowing of module binding `name`, whose innermost
+// Whether top-level function `fnIx` loses the narrowing of module binding `s`, whose innermost
 // layer has bank kind `kind`. An assignment's narrowing, which only removed `null`, is kept when
 // no write can store `null` and nothing can call the function ahead of the narrowing write.
-function crRootLoses(fnIx: i32, name: string, kind: i32): boolean {
-  if kind != NAR_KIND_ASG { return crNameAssignedInProgram(name) }
+function crRootLoses(fnIx: i32, s: i32, kind: i32): boolean {
+  if kind != NAR_KIND_ASG { return crNameAssignedInProgram(s) }
+  const name = slotNameOf(s)
   crNameNulledInProgram(name) || !crRootMayKeep(fnIx, name)
 }
 
-export function crNameAssignedInRoot(name: string): boolean {
+// Whether slot `s`'s name is the target of an assignment in the current root.
+export function crNameAssignedInRoot(s: i32): boolean {
+  const name = slotNameOf(s)
   if crCurRoot() == crProgRoot { crAskProg("w", name) }
-  const key = crInfoKey(name)
+  const key = crInfoKey(s)
   const hit = crAsgMemo[key]
   if hit is boolean { return hit }
   crwEnsure(crCurRoot())
   // A write resolving to a nested function's own binding (kind 3) counts only for such a binding.
   let inner = 2
-  if crWriteKey(name) != name { inner = 3 }
+  if crWriteKey(s) != name { inner = 3 }
   let found = false
   let u = 0
   while u < crwUseNames.length && !found {
@@ -295,9 +301,9 @@ export function crNameIsModuleTop(s: i32): boolean {
   false
 }
 
-function crNameAssignedInProgram(name: string): boolean {
+function crNameAssignedInProgram(s: i32): boolean {
   crFnRoots.push(crProgRoot)
-  const r = crNameAssignedInRoot(name)
+  const r = crNameAssignedInRoot(s)
   crFnRoots.pop()
   r
 }
@@ -365,10 +371,11 @@ function crHasCall(ix: i32): boolean {
   false
 }
 
-// The distinct bare names the body of function `fnIx` reads, nested functions included.
-export function crBodyReadNames(fnIx: i32): string[] {
+// The first read of each distinct bare name in the body of function `fnIx`, nested functions
+// included, as `Ident` nodes.
+export function crBodyReads(fnIx: i32): i32[] {
   const hit = crReadLists[fnIx]
-  if hit is string[] { return hit }
+  if hit is i32[] { return hit }
   crReadAcc = []
   const fd = nodeAt(fnIx)
   if fd is FuncDecl { crReadWalk(fd.fnBody, i32ToStr(fnIx) + "#") }
@@ -394,7 +401,7 @@ function crReadWalk(ix: i32, pre: string) {
     const key = pre + n.identName
     if !crReadMemo.has(key) {
       crReadMemo[key] = true
-      crReadAcc.push(n.identName)
+      crReadAcc.push(ix)
     }
     return 0
   }
@@ -411,7 +418,15 @@ function crReadWalk(ix: i32, pre: string) {
   0
 }
 
-let crReadAcc: string[] = []
+let crReadAcc: i32[] = []
+
+// The binding the name read at `Ident` `ix` reaches at the body's entry: where the body's own
+// declaration of it hides it, the one that declaration hides.
+export function crReadSlot(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if n is Ident { return slotVisibleOf(identSlotOf(ix, n.identName)) }
+  -1
+}
 
 // The type slot `s` reads at under no narrowing, when its innermost layer is a narrowing of a
 // function enclosing the one whose body starts at scope depth `base`; -1 otherwise.

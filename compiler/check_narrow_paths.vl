@@ -4,12 +4,11 @@
 import {
   constScopes,
   declDepthOf,
-  envDeclOfNameForFlow,
+  declIsConst,
+  declTyOf,
   fnAliasScopes,
   fnDeclScopes,
   identSlotOf,
-  isConstName,
-  lookup,
   lookupDepth,
   scopeDepthsOf,
   scopeFramePush,
@@ -18,6 +17,7 @@ import {
   slotLayerPrev,
   slotLayerTop,
   slotLayerTy,
+  slotNameOf,
   slotTyAt,
   slotTySetAt,
 } from "./check_scopes"
@@ -96,6 +96,7 @@ import {
   crCapRecFns,
   crCapRecHandles,
   crCapRecNames,
+  crCapRecSlots,
   crCapRecTys,
   crFnBases,
   crFnIxs,
@@ -647,7 +648,7 @@ export function crNoteLostName(name: string, ix: i32) {
   const lost = crCapLossBank[fnIx] ?? crNoNames
   if !strListHas(lost, name) { return 0 }
   // Only a captured binding: a local of the same name is the function's own.
-  const ls = envDeclOfNameForFlow(name)
+  const ls = identSlotOf(ix, name)
   const bd = narBindDepthOf(ls)
   if bd >= crFnBase() && !crWidenedAt(ls, bd) { return 0 }
   crLostPush(name, ix, fnIx, crFnBases.length, true)
@@ -704,6 +705,7 @@ export function crFnLeave() {
     crCapRecDepths.pop()
     crCapRecHandles.pop()
     crCapRecNames.pop()
+    crCapRecSlots.pop()
     crCapRecTys.pop()
     crCapRecFns.pop()
   }
@@ -725,7 +727,8 @@ export function crFnReBase(): i32 {
 // writer escaped: 0 / 1 / 2 as `crInfoMemo` documents. A reacher is a function that writes the
 // name or mentions a reacher's name; it escapes when it is unbound, or its name is used other
 // than as a callee or an assignment target, inside another reacher or not.
-function crInfoOf(name: string): i32 {
+function crInfoOf(s: i32): i32 {
+  const name = slotNameOf(s)
   const root = crCurRoot()
   if root == crProgRoot { crAskProg("w", name) }
   // A name no nested function writes, under either key, has no reacher: the cheap answer.
@@ -736,7 +739,7 @@ function crInfoOf(name: string): i32 {
   ) {
     return 0
   }
-  const wk = crWriteKey(name)
+  const wk = crWriteKey(s)
   const key = i32ToStr(root) + "#" + wk
   const hit = crInfoMemo[key]
   if hit is i32 { return hit }
@@ -792,28 +795,27 @@ function crInfoOf(name: string): i32 {
 }
 
 // The bare-name half of `callMayWrite`: the call names a function that can reach a writer of
-// `name`, or a writer escaped and the call is not one that provably runs none of it. An operator
+// slot `s`, or a writer escaped and the call is not one that provably runs none of it. An operator
 // that dispatched to a declaration is a call naming no function, so only an escape reaches.
-export function crCallReaches(callIx: i32, name: string): boolean {
-  if crCallReachesInRoot(callIx, name) { return true }
-  crGlobalReaches(callIx, name)
+export function crCallReaches(callIx: i32, s: i32): boolean {
+  if crCallReachesInRoot(callIx, s) { return true }
+  crGlobalReaches(callIx, s)
 }
 
 // A module binding narrowed inside a function can be written by any function of the program,
 // so the reachability rule is asked again with the whole module as the root (D2401).
-function crGlobalReaches(callIx: i32, name: string): boolean {
-  if !crNameIsGlobal(name) { return false }
+function crGlobalReaches(callIx: i32, s: i32): boolean {
+  if !crNameIsGlobal(s) { return false }
   crFnRoots.push(crProgRoot)
-  const r = crCallReachesInRoot(callIx, name)
+  const r = crCallReachesInRoot(callIx, s)
   crFnRoots.pop()
   r
 }
 
-// Whether the binding `name` reads, under its narrowing layers, is declared outside every
-// function body being checked — a module binding, while the root is a function.
-function crNameIsGlobal(name: string): boolean {
+// Whether slot `s`, under its narrowing layers, is declared outside every function body being
+// checked — a module binding, while the root is a function.
+function crNameIsGlobal(s: i32): boolean {
   if crFnBases.length == 0 || crCurRoot() == crProgRoot { return false }
-  const s = envDeclOfNameForFlow(name)
   if s == -1 { return false }
   // A narrowing layer, or the declared-type layer `crDeclareWidened` binds, is not a binding.
   let e = slotLayerTop(s)
@@ -826,35 +828,33 @@ function crNameIsGlobal(name: string): boolean {
   false
 }
 
-// Whether any function may write `key`: for a bare name, a closure of the root, or any function
-// of the module for a module binding; a path's writers are anywhere, so the per-call question
-// alone decides (D2401, D2404).
-export function crMayBeWritten(key: string): boolean {
-  if isPathKey(key) { return true }
-  if isConstName(key) { return false }
-  if crInfoOf(key) > 0 { return true }
-  if !crNameIsGlobal(key) { return false }
+// Whether any function may write slot `s`: a closure of the root, or any function of the module
+// for a module binding (D2401). A path's writers are anywhere, so its callers ask per call.
+export function crMayBeWritten(s: i32): boolean {
+  if declIsConst(s) { return false }
+  if crInfoOf(s) > 0 { return true }
+  if !crNameIsGlobal(s) { return false }
   crFnRoots.push(crProgRoot)
-  const info = crInfoOf(key)
+  const info = crInfoOf(s)
   crFnRoots.pop()
   info > 0
 }
 
-function crCallReachesInRoot(callIx: i32, name: string): boolean {
+function crCallReachesInRoot(callIx: i32, s: i32): boolean {
   if callIx < 0 || callIx >= P.nodes.length { return false }
   const cn = nodeAt(callIx)
-  if cn is Call { return crCallNodeReaches(cn, callIx, name) }
-  const info = crInfoOf(name)
+  if cn is Call { return crCallNodeReaches(cn, callIx, s) }
+  const info = crInfoOf(s)
   if info == 0 { return false }
   if info == 2 { return true }
-  crOpIsReacher(crOpOf(callIx), name)
+  crOpIsReacher(crOpOf(callIx), s)
 }
 
-// Is a declaration of operator `op` (`+`, or a receiver-keyed `+@P`) a reacher of `name`?
+// Is a declaration of operator `op` (`+`, or a receiver-keyed `+@P`) a reacher of slot `s`?
 // Asked of every declaration of `op`, since which one dispatched is the receiver's business.
-function crOpIsReacher(op: string, name: string): boolean {
+function crOpIsReacher(op: string, s: i32): boolean {
   if op == "" { return true }
-  const hs = crHandleMemo[crInfoKey(name)] ?? crNoNames
+  const hs = crHandleMemo[crInfoKey(s)] ?? crNoNames
   let i = 0
   while i < hs.length {
     if hs[i] == op || opDeclOpOf(hs[i]) == op { return true }
@@ -865,14 +865,14 @@ function crOpIsReacher(op: string, name: string): boolean {
 
 // `crCallReaches` for a `Call`: its callee named by a reacher's name (bare or as a method), a
 // function written in place and called at once, or an escape the call does not rule out.
-function crCallNodeReaches(cn: Call, callIx: i32, name: string): boolean {
-  const info = crInfoOf(name)
+function crCallNodeReaches(cn: Call, callIx: i32, s: i32): boolean {
+  const info = crInfoOf(s)
   if info == 0 { return false }
-  const hs = crHandleMemo[crInfoKey(name)] ?? crNoNames
+  const hs = crHandleMemo[crInfoKey(s)] ?? crNoNames
   const cname = calleeNameOf(callIx)
   if cname != "?" && strListHas(hs, cname) { return true }
   if cn.callFn >= 0 && nodeAt(cn.callFn) is FuncDecl { return true }
-  info == 2 && !crCallBenign(cn, callIx, name)
+  info == 2 && !crCallBenign(cn, callIx, slotNameOf(s))
 }
 
 // The type `name` reads at once every narrowing layer of the current function is gone, or -1
@@ -894,23 +894,18 @@ export function crChainWidest(s: i32, depths: i32[]): i32 {
   widest
 }
 
-// End the narrowing of `name` because of the call at `callIx`, in place, as a falsifying write
+// End the narrowing of slot `s` because of the call at `callIx`, in place, as a falsifying write
 // does. `atLoop` false banks it for the emitter after the statement being checked and refuses a
 // read later in that statement; true banks it before the loop `stmtIx`, which has not begun.
-export function crRetire(
-  name: string,
-  callIx: i32,
-  atLoop: boolean,
-  stmtIx: i32,
-) {
-  crRetireAt(name, callIx, atLoop, stmtIx, !atLoop, -1)
+export function crRetire(s: i32, callIx: i32, atLoop: boolean, stmtIx: i32) {
+  crRetireAt(s, callIx, atLoop, stmtIx, !atLoop, -1)
 }
 
 // `crRetire`, with the emitter's bank at `stmtIx` after it (`atLoop` false) or before it, a later
 // read in the statement being checked refused only when `pend`, and the arm-join row about the
 // binding at scope depth `bind`, or -1 for the one the name reaches (`narClobBind`).
 export function crRetireAt(
-  name: string,
+  s: i32,
   callIx: i32,
   atLoop: boolean,
   stmtIx: i32,
@@ -918,10 +913,10 @@ export function crRetireAt(
   bind: i32,
 ) {
   const depths: i32[] = []
-  const s = envDeclOfNameForFlow(name)
   const wide = crChainWidest(s, depths)
   if wide < 0 { return 0 }
-  const cur = lookup(name)
+  const cur = declTyOf(s)
+  const name = slotNameOf(s)
   if cur < 0 { return 0 }
   const pl = placeIntern(s, name, false)
   if cur == wide {
@@ -1020,12 +1015,17 @@ export function narFitRetire(slot: i32, atIx: i32, loopIx: i32) {
       && narFitKeyOf(npKeys[slot], nfNames[j])
     ) {
       if loopIx >= 0 {
-        crRetire(nfNames[j], atIx, true, loopIx)
+        crRetire(placeDecl(npPlace[slot]), atIx, true, loopIx)
       } else if (
         crStmtIxs.length > 0
         && crStmtFns[crStmtFns.length - 1] == crFnBases.length
       ) {
-        crRetire(nfNames[j], atIx, false, crStmtIxs[crStmtIxs.length - 1])
+        crRetire(
+          placeDecl(npPlace[slot]),
+          atIx,
+          false,
+          crStmtIxs[crStmtIxs.length - 1],
+        )
       }
     }
     j = j - 1
@@ -1057,18 +1057,13 @@ export function crShadowedHeight(name: string, from: i32): i32 {
   j + 1
 }
 
-// The scope depth of the binding `name` reads through its narrowing layers (`crBindDepthOfSlot`).
-export function crBindDepthOf(name: string): i32 {
-  crBindDepthOfSlot(envDeclOfNameForFlow(name))
-}
-
-// Whether `name` is the target of an assignment anywhere in the current root, or anywhere in the
-// program for a module binding.
-export function crNameAssigned(name: string): boolean {
-  if crNameAssignedInRoot(name) { return true }
-  if !crNameIsGlobal(name) { return false }
+// Whether slot `s`'s name is the target of an assignment anywhere in the current root, or anywhere
+// in the program for a module binding.
+export function crNameAssigned(s: i32): boolean {
+  if crNameAssignedInRoot(s) { return true }
+  if !crNameIsGlobal(s) { return false }
   crFnRoots.push(crProgRoot)
-  const r = crNameAssignedInRoot(name)
+  const r = crNameAssignedInRoot(s)
   crFnRoots.pop()
   r
 }
