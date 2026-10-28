@@ -146,7 +146,6 @@ import {
   NAR_KIND_POSTGUARD,
   asgDeclDepths,
   asgDeclKinds,
-  asgDeclOver,
   asgDeclTys,
   narBankPushFrame,
   narBankRowsOf,
@@ -278,54 +277,15 @@ export let narClobRetired: i32[] = []
 export function narClobRetiredPush(v: i32) { narClobRetired.push(v) }
 export function narClobRetiredSet(v: i32[]) { narClobRetired = v }
 
-// The scope depth of the binding each row is about, or -1 for whatever the name resolves to. A
-// call under a shadowing declaration retires a binding the name does not reach there (D3020).
-export let narClobBind: i32[] = []
-export function narClobBindPush(v: i32) { narClobBind.push(v) }
-export function narClobBindSet(v: i32[]) { narClobBind = v }
-
-// The binding (`narPlaceBind`) a write row's place resolved to, or -1 for a row about any.
-export let narClobDecl: i32[] = []
-export function narClobDeclPush(v: i32) { narClobDecl.push(v) }
-export function narClobDeclSet(v: i32[]) { narClobDecl = v }
-
 // Did a write at or after `mark` re-narrow place `p` away from its narrowing? `checkIfStmtNode`
 // asks it of its own subtree before handing a residual down (D1736).
 export function narClobberedSince(mark: i32, p: i32) {
   let i = mark
   while i < narClobPlace.length {
-    if narClobHits(i, p) {
-      if narClobRetired[i] == 1 { return true }
-    }
+    if narClobPlace[i] == p && narClobRetired[i] == 1 { return true }
     i = i + 1
   }
   false
-}
-
-// The scope depth of slot `s`'s binding here: the innermost layer that declares it, skipping
-// the layers that only narrow an outer binding (`asgDeclOver`). -1 when undeclared.
-function narBindDepthOf(s: i32): i32 {
-  if s == -1 { return -1 }
-  let e = slotLayerTop(s)
-  if e < 0 { return -1 }
-  while slotLayerPrev(e) >= 0 {
-    const row = crFirstBank(s, slotLayerDepth(e))
-    if row < 0 || asgDeclOver[row] { return slotLayerDepth(e) }
-    e = slotLayerPrev(e)
-  }
-  slotLayerDepth(e)
-}
-
-// The binding place `p`'s root resolves to here (`narBindDepthOf`).
-export function narPlaceBind(p: i32): i32 { narBindDepthOf(placeDecl(p)) }
-
-// Whether ledger row `i` is about place `p` as it resolves here: a row naming a binding counts
-// only where the root reaches that binding.
-export function narClobHits(i: i32, p: i32): boolean {
-  if narClobPlace[i] != p { return false }
-  // A row about a same-named binding of an inner block is not about this one.
-  if narClobDecl[i] >= 0 && narClobDecl[i] != narPlaceBind(p) { return false }
-  narClobBind[i] < 0 || narClobBind[i] == crBindDepthOfSlot(placeDecl(p))
 }
 
 // The in-place writes a join has to see past: a scope binding retired in place (`atScope`, at
@@ -397,14 +357,12 @@ export function narCompactIf(
   let i = mark
   while i < narClobPlace.length {
     const nm = narClobPlace[i]
-    if !((joined[nm] ?? false) && narClobHits(i, nm)) {
+    if !(joined[nm] ?? false) {
       narClobPlace[w] = nm
       narClobTys[w] = narClobTys[i]
       narClobPrev[w] = narClobPrev[i]
       narClobDepths[w] = narClobDepths[i]
       narClobRetired[w] = narClobRetired[i]
-      narClobBind[w] = narClobBind[i]
-      narClobDecl[w] = narClobDecl[i]
       w = w + 1
     }
     i = i + 1
@@ -415,8 +373,6 @@ export function narCompactIf(
     narClobPrev.pop()
     narClobDepths.pop()
     narClobRetired.pop()
-    narClobBind.pop()
-    narClobDecl.pop()
   }
   s = 0
   while s < sumPlaces.length {
@@ -425,8 +381,6 @@ export function narCompactIf(
     narClobPrev.push(sumPrev[s])
     narClobDepths.push(T.frames.length)
     narClobRetired.push(sumRet[s])
-    narClobBind.push(-1)
-    narClobDecl.push(narPlaceBind(sumPlaces[s]))
     s = s + 1
   }
   0
@@ -644,7 +598,7 @@ export function crNoteLostName(name: string, ix: i32) {
   if !strListHas(lost, name) { return 0 }
   // Only a captured binding: a local of the same name is the function's own.
   const ls = identSlotOf(ix, name)
-  const bd = narBindDepthOf(ls)
+  const bd = crBindDepthOfSlot(ls)
   if bd >= crFnBase() && !crWidenedAt(ls, bd) { return 0 }
   crLostPush(name, ix, fnIx, crFnBases.length, true)
   0
@@ -922,18 +876,16 @@ export function crChainWidest(s: i32, depths: i32[]): i32 {
 // does. `atLoop` false refuses a read later in the statement being checked; true retires it
 // before a loop that has not begun.
 export function crRetire(s: i32, callIx: i32, atLoop: boolean) {
-  crRetireAt(s, callIx, atLoop, !atLoop, -1)
+  crRetireAt(s, callIx, atLoop, !atLoop)
 }
 
-// `crRetire`, before a loop when `atLoop`, a later read in the statement being checked refused
-// only when `pend`, and the arm-join row about the binding at scope depth `bind`, or -1 for the
-// one the name reaches (`narClobBind`).
+// `crRetire`, before a loop when `atLoop`, and a later read in the statement being checked
+// refused only when `pend`.
 export function crRetireAt(
   s: i32,
   callIx: i32,
   atLoop: boolean,
   pend: boolean,
-  bind: i32,
 ) {
   const depths: i32[] = []
   const wide = crChainWidest(s, depths)
@@ -950,8 +902,6 @@ export function crRetireAt(
     narClobPrev.push(wide)
     narClobDepths.push(T.frames.length)
     narClobRetired.push(0)
-    narClobBind.push(bind)
-    narClobDecl.push(-1)
     return 0
   }
   let k = 0
@@ -967,8 +917,6 @@ export function crRetireAt(
   narClobPrev.push(wide)
   narClobDepths.push(T.frames.length)
   narClobRetired.push(1)
-  narClobBind.push(bind)
-  narClobDecl.push(-1)
   crRetNames.push(name)
   crRetCalls.push(callIx)
   crRetNarTys.push(cur)
@@ -1392,8 +1340,6 @@ export function narPathsReset() {
   narClobPrev = []
   narClobDepths = []
   narClobRetired = []
-  narClobBind = []
-  narClobDecl = []
   reScopeBases = []
   reNpBases = []
   reRdMarks = []
