@@ -17377,71 +17377,54 @@ function emitStrCatN(body: u8[], parts: i32[], fnIx: i32, ec: ExpCtx) {
 // `let s = ""; s = s + piece` in a loop is O(n²); `strAccScan` proves a binding is an
 // accumulator, and `emitStrAccAppend` then appends in place into slack its own grow
 // path allocated — linear, with no builder in the source. Soundness: `s` only ever holds a literal, a fresh concat result, or a buffer it allocated (DECISIONS.md "String building is a lowering").
-let saNames: string[] = []
+
+// A row is one declaration, keyed by `hoistDeclKey` so a clone meets its original. `saDecls`
+// counts the `let`s noted against a row; a body holding two clones of one declaration is two.
+let saKeys: i32[] = []
+let saRowOf: Map<i32, i32> = Map()
 let saDecls: i32[] = []
 let saApps: i32[] = []
 let saBads: i32[] = []
 let saFnIx = 0 - 2
-// A mark may only reach a name the scan already knows. At MODULE scope the walk covers
-// every function body, where minting a row per identifier would make the scan quadratic in
-// the program; the candidate declarations are all noted before the flag goes up.
+// A mark may only reach a declaration the scan already knows. At MODULE scope the walk covers
+// every function body, where minting a row per identifier would grow the table with every
+// local in the program; the candidate declarations are all noted before the flag goes up.
 let saKnownOnly = false
 
-// The row for `name`, or -1.
-function saFind(name: string) {
-  let i = 0
-  while i < saNames.length {
-    if saNames[i] == name { return i }
-    i = i + 1
-  }
-  -1
-}
+// The row for declaration key `k`, or -1.
+function saFind(k: i32) { saRowOf.get(k) ?? -1 }
 
-// Keep only the rows a later phase could still change: an already-disqualified name, or one
-// declared twice, can never qualify, and a dropped row reads as absent — which
-// `saNameQualifies` and `saMarkBad` both already treat as "not an accumulator". The prune is
-// what keeps the module-wide walk linear in the program rather than in its bindings.
-function saPruneSettled() {
-  const kn: string[] = []
-  const kd: i32[] = []
-  const ka: i32[] = []
-  const kb: i32[] = []
-  let i = 0
-  while i < saNames.length {
-    if saBads[i] == 0 && saDecls[i] == 1 {
-      kn.push(saNames[i])
-      kd.push(saDecls[i])
-      ka.push(saApps[i])
-      kb.push(saBads[i])
-    }
-    i = i + 1
-  }
-  saNames = kn
-  saDecls = kd
-  saApps = ka
-  saBads = kb
-  0
-}
-
-// Find (or start) the row for `name`.
-function saRow(name: string) {
-  const at = saFind(name)
+// Find (or start) the row for declaration key `k`.
+function saRow(k: i32) {
+  const at = saFind(k)
   if at >= 0 { return at }
-  saNames.push(name)
+  saKeys.push(k)
   saDecls.push(0)
   saApps.push(0)
   saBads.push(0)
-  saNames.length - 1
+  saRowOf.set(k, saKeys.length - 1)
+  saKeys.length - 1
 }
 
-function saMarkBad(name: string) {
-  const at = saFind(name)
+function saMarkBad(k: i32) {
+  if k < 0 { return 0 }
+  const at = saFind(k)
   if at >= 0 {
     saBads[at] = 1
     return 0
   }
   if saKnownOnly { return 0 }
-  saBads[saRow(name)] = 1
+  saBads[saRow(k)] = 1
+  0
+}
+
+function saResetRows() {
+  if saKeys.length > 0 { saRowOf = Map() }
+  saKeys = []
+  saDecls = []
+  saApps = []
+  saBads = []
+  saSites = []
   0
 }
 
@@ -17466,15 +17449,12 @@ function saDeclShapeOk(letIx: i32) {
   false
 }
 
-// Count the declaration at `letIx` against its name's row, minting the row if needed.
+// Count the declaration at `letIx` against its own row, minting the row if needed.
 function saNoteDecl(letIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    const r = saRow(d.letName)
-    if r < 0 { return 0 }
-    saDecls[r] = saDecls[r] + 1
-    if !saDeclShapeOk(letIx) { saBads[r] = 1 }
-  }
+  const r = saRow(hoistDeclKey(letIx))
+  if r < 0 { return 0 }
+  saDecls[r] = saDecls[r] + 1
+  if !saDeclShapeOk(letIx) { saBads[r] = 1 }
   0
 }
 
@@ -17497,24 +17477,40 @@ function exprMentionsName(ix: i32, name: string) {
   false
 }
 
-// True if `rhsIx` is `name + <parts>` — a maximal string chain whose FIRST part is the
-// accumulator itself and none of whose remaining parts mentions it. The second half is
-// what keeps the lowering's evaluation order unobservable: the parts run before `name`
-// is read, which is only sound while they cannot see or change it.
-function saSelfAppendOk(rhsIx: i32, name: string, fnIx: i32) {
+// True if any identifier in the subtree at `ix` resolves to declaration key `k`.
+function exprMentionsDecl(ix: i32, k: i32) {
+  if ix < 0 { return false }
+  const n = nodeAt(ix)
+  if n is Ident { return hoistDeclKey(identDeclOf(ix)) == k }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if exprMentionsDecl(kids[i], k) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// True if `rhsIx` is `s + <parts>` for `s` the declaration keyed `k` — a maximal string
+// chain whose FIRST part reads the accumulator and none of whose remaining parts mentions
+// it. The second half is what keeps the lowering's evaluation order unobservable: the
+// parts run before `s` is read, which is only sound while they cannot see or change it.
+function saSelfAppendOk(rhsIx: i32, k: i32, fnIx: i32) {
+  if k < 0 { return false }
   if !exprIsStrConcat(rhsIx, fnIx) { return false }
   const parts: i32[] = []
   strCatParts(rhsIx, fnIx, parts)
   if parts.length < 2 { return false }
-  const p0 = nodeAt(parts[0])
-  if p0 is Ident {
-    if p0.identName != name { return false }
-  } else {
-    return false
-  }
+  if !(nodeAt(parts[0]) is Ident) { return false }
+  if hoistDeclKey(identDeclOf(parts[0])) != k { return false }
   let i = 1
   while i < parts.length {
-    if exprMentionsName(parts[i], name) { return false }
+    if exprMentionsDecl(parts[i], k) { return false }
     i = i + 1
   }
   true
@@ -17527,7 +17523,7 @@ function strAccWalk(ix: i32, fnIx: i32, depth: i32, inLambda: boolean) {
   if ix < 0 { return 0 }
   const n = nodeAt(ix)
   if n is Ident {
-    if inLambda { saMarkBad(n.identName) }
+    if inLambda { saMarkBad(hoistDeclKey(identDeclOf(ix))) }
     return 0
   }
   if n is FuncDecl {
@@ -17536,7 +17532,7 @@ function strAccWalk(ix: i32, fnIx: i32, depth: i32, inLambda: boolean) {
   }
   if n is LetDecl {
     if inLambda || (saKnownOnly && !saDeclShapeOk(ix)) {
-      saMarkBad(n.letName)
+      saMarkBad(hoistDeclKey(ix))
     } else {
       saNoteDecl(ix)
     }
@@ -17545,17 +17541,20 @@ function strAccWalk(ix: i32, fnIx: i32, depth: i32, inLambda: boolean) {
   }
   if n is BinExpr {
     if n.binOp == "=" {
-      const t = nodeAt(unwrapParen(n.binLeft))
-      if t is Ident {
+      const tIx = unwrapParen(n.binLeft)
+      if tIx >= 0 && nodeAt(tIx) is Ident {
+        const k = hoistDeclKey(identDeclOf(tIx))
         if inLambda {
-          saMarkBad(t.identName)
-        } else if saSelfAppendOk(n.binRight, t.identName, fnIx) {
-          if depth > 0 && !(saKnownOnly && saFind(t.identName) < 0) {
-            saApps[saRow(t.identName)] = saApps[saRow(t.identName)] + 1
+          saMarkBad(k)
+        } else if saSelfAppendOk(n.binRight, k, fnIx) {
+          if depth > 0 && !(saKnownOnly && saFind(k) < 0) {
+            const r = saRow(k)
+            if r < 0 { return 0 }
+            saApps[r] = saApps[r] + 1
           }
         } else {
           const rhs = nodeAt(n.binRight)
-          if !(rhs is StrLit) { saMarkBad(t.identName) }
+          if !(rhs is StrLit) { saMarkBad(k) }
         }
       }
     }
@@ -17594,11 +17593,7 @@ function strAccWalk(ix: i32, fnIx: i32, depth: i32, inLambda: boolean) {
 // Prove this function's accumulators. Skipped outright where the function performs no
 // string op at all, which is most of them.
 function strAccScan(blockIx: i32, fnIx: i32) {
-  saNames = []
-  saDecls = []
-  saApps = []
-  saBads = []
-  saSites = []
+  saResetRows()
   saFnIx = fnIx
   saKnownOnly = false
   if !fnUsesStrOp { return 0 }
@@ -17945,11 +17940,7 @@ function emitStrSiteCat(
 // nested function into `fnStmts`, so walking all three is the whole program: a mention inside
 // any of them disqualifies the name, which is what makes the cell's one home safe to append into.
 export function strAccScanStart() {
-  saNames = []
-  saDecls = []
-  saApps = []
-  saBads = []
-  saSites = []
+  saResetRows()
   saFnIx = -1
   saKnownOnly = false
   if !fnUsesStrOp { return 0 }
@@ -17960,25 +17951,14 @@ export function strAccScanStart() {
   }
   // Declarations first: a function is HOISTED, so a body assigning to a global can be walked
   // before the global's own `let`, and a mark that arrived before the row would be lost. Only
-  // a CANDIDATE mints a row — `saFind` is a linear scan, so one row per top-level binding
-  // would make this pass quadratic in the program on its own.
+  // a CANDIDATE mints a row.
   let i = 0
   while i < globalStmts.length {
     if saDeclShapeOk(globalStmts[i]) { saNoteDecl(globalStmts[i]) }
     i = i + 1
   }
-  saPruneSettled()
-  if saNames.length == 0 { return 0 }
+  if saKeys.length == 0 { return 0 }
   saKnownOnly = true
-  // A second top-level declaration of a candidate name disqualifies it, whatever its shape.
-  i = 0
-  while i < globalStmts.length {
-    if !saDeclShapeOk(globalStmts[i]) {
-      const d = nodeAt(globalStmts[i])
-      if d is LetDecl { saMarkBad(d.letName) }
-    }
-    i = i + 1
-  }
   i = 0
   while i < globalStmts.length {
     const g = nodeAt(globalStmts[i])
@@ -18006,25 +17986,19 @@ export function strAccScanStart() {
   0
 }
 
-// Exactly one declaration, no disqualifying use, and at least one self-append inside a
-// loop. The one-declaration rule is what makes the name-keyed answer safe: two bindings
-// of one name in a function would share this row.
-function saNameQualifies(name: string) {
-  let i = 0
-  while i < saNames.length {
-    if saNames[i] == name {
-      return saBads[i] == 0 && saDecls[i] == 1 && saApps[i] > 0
-    }
-    i = i + 1
-  }
-  false
+// The declaration keyed `k` has one noted `let`, no disqualifying use, and a self-append
+// inside a loop.
+function saDeclQualifies(k: i32) {
+  const r = saFind(k)
+  if r < 0 { return false }
+  saBads[r] == 0 && saDecls[r] == 1 && saApps[r] > 0
 }
 
 // Where a proven accumulator lives when it is not a slot: the `globalStmts` position of the
-// module cell `name`, or -1. Only at module scope, where `emitStartFnCode` is the emitter.
-function saAccGlobalIdx(name: string) {
+// module cell declared at `k`, or -1. Only at module scope, where `emitStartFnCode` is the emitter.
+function saAccGlobalIdx(k: i32) {
   if saFnIx != -1 { return -1 }
-  globalIndexOf(name)
+  globalIndexOfSid(sidOfNode(k))
 }
 
 // Read the accumulator. A function local by slot; otherwise the module binding through
@@ -18052,16 +18026,17 @@ function saAccSet(slot: i32, gIx: i32) {
 // test. `saFnIx` pins the set to the body it is computed for.
 function strAccAppendOk(binIx: i32, fnIx: i32) {
   if saFnIx != fnIx { return false }
-  if saNames.length == 0 { return false }
+  if saKeys.length == 0 { return false }
   const a = nodeAt(binIx)
   if a is BinExpr {
-    const t = nodeAt(unwrapParen(a.binLeft))
-    if t is Ident {
-      if !saNameQualifies(t.identName) { return false }
-      if localIndexOf(fnIx, unwrapParen(a.binLeft)) < 0 {
-        if saAccGlobalIdx(t.identName) < 0 { return false }
+    const tIx = unwrapParen(a.binLeft)
+    if tIx >= 0 && nodeAt(tIx) is Ident {
+      const k = hoistDeclKey(identDeclOf(tIx))
+      if !saDeclQualifies(k) { return false }
+      if localIndexOf(fnIx, tIx) < 0 {
+        if saAccGlobalIdx(k) < 0 { return false }
       }
-      return saSelfAppendOk(a.binRight, t.identName, fnIx)
+      return saSelfAppendOk(a.binRight, k, fnIx)
     }
   }
   false
@@ -18074,10 +18049,10 @@ function strAccAppendOk(binIx: i32, fnIx: i32) {
 function emitStrAccAppend(body: u8[], binIx: i32, fnIx: i32, ec: ExpCtx) {
   const a = nodeAt(binIx)
   if a is BinExpr {
-    const t = nodeAt(unwrapParen(a.binLeft))
-    if t is Ident {
-      const slot = localIndexOf(fnIx, unwrapParen(a.binLeft))
-      const gIx = saAccGlobalIdx(t.identName)
+    const tIx = unwrapParen(a.binLeft)
+    if tIx >= 0 && nodeAt(tIx) is Ident {
+      const slot = localIndexOf(fnIx, tIx)
+      const gIx = saAccGlobalIdx(hoistDeclKey(identDeclOf(tIx)))
       const parts: i32[] = []
       strCatParts(a.binRight, fnIx, parts)
       const n = parts.length
