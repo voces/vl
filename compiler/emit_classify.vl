@@ -134,6 +134,7 @@ import {
   nodeTyIsFunc,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
+  nodeTyIsNulBool,
   nodeTyIsNulLitUnion,
   nodeTyIsNullType,
   nodeTyIsNullable,
@@ -235,6 +236,7 @@ import {
   tySame,
   tyScalarBaseIs,
   tyScalarBasePrim,
+  tyToStructStr,
 } from "./check_types"
 import { cexLitPeel } from "./check_num_lits"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
@@ -347,6 +349,7 @@ import {
   elabNodeTyAt,
   litRepTyAt,
   litRepUnionAt,
+  readNarrowedStoreAt,
 } from "./emit_elab"
 import {
   BC_LEAF,
@@ -479,6 +482,7 @@ import {
   lfFnAt,
   lfResolveAt,
   memNarrowVariantIndex,
+  narrowedFnTyOf,
   nodeTyIsBoxRep,
   nodeTyIsNarrowedShape,
   nodeTyIsUnionShaped,
@@ -716,7 +720,6 @@ import {
 import {
   COPY_CHAIN_MAX,
   annCloSigSpelled,
-  annSigKeyTy,
   calleeNodeSigKey,
   cloNameSigKeyTy,
   declaredStruct,
@@ -755,9 +758,6 @@ import {
   declaredUnion,
   ifJoinUnionNameIn,
   letUnionTyIxOf,
-  narrowedClosureOf,
-  narrowedClosureTyOf,
-  nicheReadKindAt,
   nodeJoinRowName,
   nodeMixedUnionName,
   nodeRegisteredUnionName,
@@ -2923,6 +2923,11 @@ export function storageReadEnter(ix: i32): i32 {
 }
 
 export function storageReadLeave(saved: i32) { storageReadIx = saved }
+
+// Whether `ix` is the operand being read at its storage (`storageReadEnter`).
+export function isStorageRead(ix: i32): boolean {
+  unwrapParen(ix) == storageReadIx
+}
 
 // The type the re-read of assignment `asgIx`'s target yields where the cell is wider than the
 // value: the member the checker typed the value at, or -1 when the cell's own type is the answer.
@@ -6964,7 +6969,7 @@ function narrowIsThen(
   if isObj < 0 { return false }
   const recv = nodeAt(isObj)
   if recv is Ident {
-    if identHoldsUnionBox(isObj, recv.identName, fnIx) {
+    if identHoldsUnionBox(isObj, fnIx) {
       pushNarrowIs(recv.identName, variant, condIx, fnIx)
       return true
     }
@@ -7218,7 +7223,7 @@ function narrowIsElse(
   // further. Only a boxed struct union narrows — a 1-struct niche is a nullable ref.
   const srecv = nodeAt(unwrapParen(isObj))
   if srecv is Ident {
-    if identHoldsUnionBox(isObj, srecv.identName, fnIx) {
+    if identHoldsUnionBox(isObj, fnIx) {
       // The subtracted atom is the resolved spelling, not the author's, agreeing with the
       // three gates that already read it. A member the spelling names under another shape
       // is found by the tested type (`pushNarrowComplement`), or the else arm would keep an
@@ -7921,9 +7926,9 @@ function pgJoinNarrow(stmtIx: i32, fnIx: i32) {
       !pushNarrowWriteReNarrow(jn, jt, identUnionTyAt(sidOf(jn), fnIx, stmtIx))
     ) {
       // A PATH key resolves no union NAME here — the join has only the key string, and the
-      // field's own spelling lives at the write. Push the arena type instead, which is what
-      // `narrowedValueAtomOf` reads first; a multi-member join names no atom and stays boxed,
-      // which is the answer the checker's own join gives it too (D1849).
+      // field's own spelling lives at the write. Push the arena type instead; a multi-member join
+      // names no atom and stays boxed, which is the answer the checker's own join gives it too
+      // (D1849).
       pushNarrowWrittenTy(jn, jt)
     }
     jr = joinRowNext(jr)
@@ -8232,7 +8237,6 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   // A narrowed union arm iterates the arm's elements, not the literal's own values: for
   // `type K = string | K[]`, `if c is K[]` narrows to a list of boxes, while the plain
   // classifiers would type the temp as a string list (check-clean invalid wasm, D1015).
-  // Keyed off `narrowSlotOf`, not `narrowedValueAtomOf`, which answers "" here regardless.
   const fiN0 = nodeAt(iterIx)
   if fiN0 is Ident {
     const fiSl = narrowSlotOf(fiN0.identName)
@@ -8990,7 +8994,7 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
 function tailCallsSelf(callFn: i32, fnIx: i32): boolean {
   const sid = sidOfNode(callFn)
   const target = fnIndexOfAt(sid, fnIx, callFn)
-  const bound = identIsBoundClosure(sidText(sid), fnIx)
+  const bound = identIsBoundClosure(callFn, fnIx)
   if (
     !bound
     && target >= 0
@@ -9105,7 +9109,7 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
         const target = fnIndexOfAt(sidOfNode(s.callFn), fnIx, s.callFn)
         // A live closure binding of the name is what the tail denotes, so the voidness is
         // that closure's and the module function of the name settles nothing (D1602).
-        if target >= 0 && !identIsBoundClosure(callee.identName, fnIx) {
+        if target >= 0 && !identIsBoundClosure(s.callFn, fnIx) {
           return fRetVoid[target] == 0
         }
         // A closure-value callee (invisible to `fnIndexOf`): a void one yields nothing, so
@@ -13176,17 +13180,13 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       const urd = repOfNode(exprIx, fnIx)
       if urd.rdCovered == 1 && urd.rdKind == "union" { return true }
       // A field or cell narrowed to a niche-repped `A | null` reads as that niche (D2590).
-      if nicheReadKindAt(exprIx, placeNarrowKeyOf(exprIx), fnIx) >= 0 {
-        return false
-      }
+      if nicheReadKindAt(exprIx, fnIx) >= 0 { return false }
       // A plain read of a value-union struct field (code 16) yields the field's union box, a
       // value usable wherever a union is expected. A read narrowed to one scalar atom unboxes
       // (mirrors the code-16 read path in emitMem), so the union box is not the value here — same
       // as the narrowed Ident case above; a sub-union narrowing keeps the box.
       if memberUnionFieldNameRead(exprIx, fnIx) == "" { return false }
-      const mAtom = narrowVariantFor(memberPathKeyOf(exprIx))
-      const mk = valueAtomKind(mAtom)
-      if mk >= 0 && mk != 6 { return false }
+      if memNarrowAtomKind(exprIx, fnIx) >= 0 { return false }
       // The container arms of the same narrowing (D1014), as the Index arm above.
       if placeReadContainerAt(exprIx, fnIx) > 0 { return false }
       // D209 — the other end of the read: an un-narrowed read the read site unboxes is not a
@@ -13197,9 +13197,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     }
     Index => {
       // A field or cell narrowed to a niche-repped `A | null` reads as that niche (D2590).
-      if nicheReadKindAt(exprIx, placeNarrowKeyOf(exprIx), fnIx) >= 0 {
-        return false
-      }
+      if nicheReadKindAt(exprIx, fnIx) >= 0 { return false }
       // `ns[i]` over a UNION-element ref list yields the union box (G7-ref) — so the value
       // is usable with `is`-narrowing (a `let n0 = ns[i]` is a union local). Per-slot: the
       // element kind comes from the receiver's distinct ref-list slot (2 = union box).
@@ -13376,7 +13374,7 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // A sub-union narrowing (2+ atoms) keeps the box.
   if identReadAtomKindAt(exprIx, fnIx) >= 0 { return false }
   // …and one narrowed to a niche-repped `A | null`, which the read converts (D2590).
-  if nicheReadKindAt(exprIx, e.identName, fnIx) >= 0 { return false }
+  if nicheReadKindAt(exprIx, fnIx) >= 0 { return false }
   // A union binding narrowed to a ref-element array arm reads unboxed to the reflist
   // wrapper: in this scope it is a list, not a union value — the ref-array twin of the
   // scalar-atom rule above. Without it a rebind under the narrow classified as a union
@@ -13420,9 +13418,7 @@ function exprUnionIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
     // A cell narrowed to one scalar atom unboxes at the read (D451), exactly as the
     // Member arm below declines a narrowed field read — the union box is not the value in
     // this scope. A sub-union narrowing (kind 6 = `null`, or no atom kind at all) keeps the box.
-    const iAtom = narrowVariantFor(indexPathKeyOf(exprIx))
-    const iak = valueAtomKind(iAtom)
-    if iak >= 0 && iak != 6 { return false }
+    if idxNarrowAtomKind(exprIx, fnIx) >= 0 { return false }
     // The container arms of the same narrowing (D1014): the Ident arm declines a narrowed
     // ref-array or map for the same reason the atom rule above exists, since the read
     // unboxes. Without them an un-annotated rebind under the narrow took the union-box
@@ -13997,9 +13993,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       // The ident arm declines the same three narrows `exprUnion`'s ident arm does (scalar atom,
       // ref array, map): a rebind under a narrow must not still be named a union here. D1252.
       if identReadAtomKindAt(exprIx, fnIx) >= 0 { return "" }
-      if nicheReadKindAt(unwrapParen(exprIx), e.identName, fnIx) >= 0 {
-        return ""
-      }
+      if nicheReadKindAt(unwrapParen(exprIx), fnIx) >= 0 { return "" }
       if identReadContainerAt(exprIx, fnIx) > 0 { return "" }
       // The sid-taking twin, off the node's own column: `sidOfNode` of this Ident is `sidOf` of
       // its name by that column's contract, so the id is read rather than the spelling re-interned.
@@ -14022,13 +14016,11 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     Member => {
       // The name-typed half of `exprUnion`'s niche decline for a field or cell (D2590).
       const nrx = unwrapParen(exprIx)
-      if nicheReadKindAt(nrx, placeNarrowKeyOf(nrx), fnIx) >= 0 { return "" }
+      if nicheReadKindAt(nrx, fnIx) >= 0 { return "" }
       // The name-typed mirror of `exprUnion`'s Member case: a code-16 field read carries
       // the field's union name (its atom set), unless narrowed to one scalar (unboxed).
       const mix = unwrapParen(exprIx)
-      const mAtom = narrowVariantFor(memberPathKeyOf(mix))
-      const mk = valueAtomKind(mAtom)
-      if mk >= 0 && mk != 6 { return "" }
+      if memNarrowAtomKind(mix, fnIx) >= 0 { return "" }
       // Must decline the same read `exprUnion`'s Member case does: a read the read site already
       // unboxes is a string ref, not a union box, whatever this field's declared type says. D311.
       if memReadUnboxAtomKind(mix, fnIx) >= 0 { return "" }
@@ -14037,7 +14029,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     Index => {
       // The name-typed half of `exprUnion`'s niche decline for a field or cell (D2590).
       const nrx = unwrapParen(exprIx)
-      if nicheReadKindAt(nrx, placeNarrowKeyOf(nrx), fnIx) >= 0 { return "" }
+      if nicheReadKindAt(nrx, fnIx) >= 0 { return "" }
       // `ns[i]` over a UNION-element ref list yields the element union's box (the
       // name-typed mirror of `exprUnion`'s Index case) — so an un-annotated
       // `const a = arr[0]` binding resolves its union name for narrowing/unboxing.
@@ -14114,9 +14106,9 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
     if bun != "" { return bun }
     // A callee narrowed to a union's closure arm: the binding's own annotation channel
     // misses (the type lives on the arm), so resolve the return from the active narrow instead.
-    const ncl = narrowedClosureOf(callee.identName)
-    if ncl != "" {
-      const nun = unionRetOfFnType(peelGroupParens(ncl))
+    const nft = narrowedFnTyOf(e.callFn, fnIx)
+    if nft >= 0 {
+      const nun = unionRetOfFnType(tyToStructStr(nft))
       if nun != "" { return nun }
     }
   }
@@ -14223,9 +14215,7 @@ function unionNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
         // scalar atom is unboxed by the read, so it carries no union name either. The two
         // must answer together — `exprUnion` false with a name still resolving is exactly
         // the split D311 records one classifier over.
-        const iAtom = narrowVariantFor(indexPathKeyOf(exprIx))
-        const iak = valueAtomKind(iAtom)
-        if iak >= 0 && iak != 6 { return "" }
+        if idxNarrowAtomKind(exprIx, fnIx) >= 0 { return "" }
         return rlElemName[slot]
       }
     }
@@ -14258,25 +14248,35 @@ function unionNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   ""
 }
 
-// The niche kind a field or cell read at `exprIx` converts to: its key is narrowed to a niche
-// `A | null` and, with that narrowing lifted, the read is the union box. -1 otherwise.
-export function placeNicheAtomKind(exprIx: i32, fnIx: i32): i32 {
-  const key = placeNarrowKeyOf(exprIx)
-  if key == "" { return -1 }
-  const nk = nicheReadKindAt(unwrapParen(exprIx), key, fnIx)
-  if nk < 0 { return -1 }
-  const masked = maskNarrowFor(key)
-  const box = exprUnion(exprIx, fnIx)
-  unmaskNarrow(masked)
-  if box { return nk }
+// The niche kind the read `ix` converts its box to: 1 for `boolean | null`, 2 for `string | null`,
+// when the checker narrowed it to exactly that niche out of a wider storage type (D2590), else -1.
+// A read of the storage itself (`storageReadEnter`) converts nothing.
+export function nicheReadKindAt(ix: i32, fnIx: i32): i32 {
+  if isStorageRead(ix) { return -1 }
+  if readNarrowedStoreAt(ix, fnIx) < 0 { return -1 }
+  if nodeTyIsNulBool(ix) { return 1 }
+  if nodeRepIs(ix, "nulstr", fnIx) { return 2 }
   -1
+}
+
+// The niche kind a field or cell read at `exprIx` converts to: the read is narrowed to a niche
+// `A | null` and the field or cell, read at its storage, is the union box. -1 otherwise.
+export function placeNicheAtomKind(exprIx: i32, fnIx: i32): i32 {
+  if placeNarrowKeyOf(exprIx) == "" { return -1 }
+  const r = unwrapParen(exprIx)
+  const nk = nicheReadKindAt(r, fnIx)
+  if nk < 0 { return -1 }
+  const sMark = storageReadEnter(r)
+  const box = exprUnion(r, fnIx)
+  storageReadLeave(sMark)
+  if box { nk } else { -1 }
 }
 
 // Whether the name read at `ix` holds a union box: `exprUnion`, or a read the niche narrowing
 // converts, whose storage is still the box a test on it narrows.
-function identHoldsUnionBox(ix: i32, name: string, fnIx: i32): boolean {
+function identHoldsUnionBox(ix: i32, fnIx: i32): boolean {
   if exprUnion(ix, fnIx) { return true }
-  nicheReadKindAt(unwrapParen(ix), name, fnIx) >= 0
+  nicheReadKindAt(unwrapParen(ix), fnIx) >= 0
 }
 
 // The `valueAtomKind` code of the narrowed atom that un-annotated `LetDecl` `letIx`'s bare-ident
@@ -15646,7 +15646,7 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   // A narrowed index over a nullable-ref-array element resolves via `nulRefArrayInnerSlot`,
   // gated on the ref-array shape so an unrelated nullable-string cell can't borrow the row. D451.
   if indexElemNulRefArraySlot(unwrapParen(exprIx), fnIx) >= 0 {
-    if narrowVariantFor(indexPathKeyOf(exprIx)) != "" {
+    if tyIsArray(nodeTyAt(unwrapParen(exprIx), fnIx)) {
       const nin = nulRefArrayInnerSlot(unwrapParen(exprIx), fnIx)
       if nin >= 0 && nin < rlElemName.length { return rlElemName[nin] }
     }
@@ -17521,12 +17521,15 @@ export function letIsClosure(letIx: i32, fnIx: i32) {
   false
 }
 
-// Does `name` denote a live binding holding a closure in frame `fnIx` — a narrowed arm, a
+// Does the read `readIx` denote a live binding holding a closure in frame `fnIx` — a narrowed arm, a
 // closure-typed param, a nullable one, a CAPTURE, or a `let`/`const` whose cell is a
 // closure? The rungs of `exprIsClosure`'s `Ident` arm that read a binding, asked without
 // the module-function rung above them, so a call site can let the binding win (D1602).
-export function identIsBoundClosure(name: string, fnIx: i32): boolean {
-  if narrowedClosureOf(name) != "" { return true }
+export function identIsBoundClosure(readIx: i32, fnIx: i32): boolean {
+  if readIx < 0 { return false }
+  if narrowedFnTyOf(readIx, fnIx) >= 0 { return true }
+  const rn = nodeAt(readIx)
+  const name = if rn is Ident { rn.identName } else { "" }
   if paramIsClosure(fnIx, name) { return true }
   if paramNulClosure(fnIx, name) { return true }
   const slot = declaredSlotLive(name)
@@ -17583,7 +17586,7 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       if fnIndexOfAt(sidOfNode(exprIx), fnIx, exprIx) >= 0 { return true }
       // A narrowed closure arm, a closure-typed param (kind 14) or nullable one (kind 19), or a
       // closure-celled local — every one calls via `call_ref`, recovered non-null at the call site.
-      if identIsBoundClosure(e.identName, fnIx) { return true }
+      if identIsBoundClosure(exprIx, fnIx) { return true }
       // A declared local of the name that is not a closure cell denotes no module global.
       if declaredSlotLive(e.identName) >= 0 { return false }
       // A module-global closure cell — a bare closure (kind 14) or a NULLABLE one (kind 19).
@@ -17612,7 +17615,7 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
     Member => {
       // A place (`h.f`) narrowed to a union's bare-closure arm reads back the closure
       // unboxed, as a narrowed binding does (D4346).
-      if narrowedClosureOf(placeNarrowKeyOf(exprIx)) != "" { return true }
+      if narrowedFnTyOf(exprIx, fnIx) >= 0 { return true }
       // A field read the checker narrowed to a function arm at a receiver no narrowing key
       // reaches (`hs[0].f`), which the read site unboxes to the closure.
       if memReadUnboxAtomKind(exprIx, fnIx) == 11 { return true }
@@ -17633,7 +17636,7 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
     Index => {
       // A place (`xs[0]`) narrowed to a union's bare-closure arm reads back the closure
       // unboxed, as a narrowed binding does (D4346).
-      if narrowedClosureOf(placeNarrowKeyOf(exprIx)) != "" { return true }
+      if narrowedFnTyOf(exprIx, fnIx) >= 0 { return true }
       // An index `xs[i]` into an ARRAY OF FUNCTIONS (`((i32) => i32)[]`, ref-list element
       // kind 5) reads back a closure fat-pointer — callable via `call_ref`.
       if exprRefArray(e.idxArr, fnIx) {
@@ -17902,11 +17905,8 @@ function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32): string {
   // A union binding narrowed to a bare-closure arm (`if x is () => i64 { x() }`): the arm's
   // function-type name interns the SAME `$fnsig` an annotated closure would — so the `call_ref`
   // casts to the right functype and the result classifiers (`calleeReturnsI64`/…) read its return.
-  const nc = narrowedClosureOf(name)
-  if nc != "" {
-    const nk = annSigKeyTy(nc, narrowedClosureTyOf(name))
-    if nk != "" { return nk }
-  }
+  const nft = narrowedFnTyOf(atIx, fnIx)
+  if nft >= 0 { return sigKeyOfTy(nft) }
   // Skipped when a block still open at `atIx` shadows `sid` (D2325): the loop-var/param/
   // anon-leaf rungs below answer for the function's OUTER binding, which a nearer block
   // `const`/`let` of the same name hides at this position — the ladder falls through to the

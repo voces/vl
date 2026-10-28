@@ -27,7 +27,12 @@ import {
 } from "./check_node_tys"
 import { fsAsk, fsAskCallee } from "./fn_split"
 import { keyHasPrefix } from "./check_places"
-import { elabSpreadNote, elabSpreadRunNote, litRepTyAt } from "./emit_elab"
+import {
+  elabSpreadNote,
+  elabSpreadRunNote,
+  litRepTyAt,
+  readNarrowedStoreAt,
+} from "./emit_elab"
 import { canonUnionMembersInto } from "./check_program"
 import {
   cexLitPeel,
@@ -274,7 +279,6 @@ import {
   cpsToUtf8,
   decodeStr,
   directArgsBad,
-  indexPathKeyOf,
   inferNicheNullByName,
   isLitVariantName,
   isRecvStagedIx,
@@ -950,6 +954,7 @@ import {
   mfResultKindOf,
   mfResultSlotOf,
   minMaxKind,
+  nicheReadKindAt,
   nulLitAtomTexts,
   nulRefStructIdxOfLet,
   nulVariantIdxOfExpr,
@@ -1257,9 +1262,6 @@ import {
   coalesceResultUnionName,
   ifJoinUnionNameIn,
   letUnionDeclTyIxOf,
-  narrowDropsNull,
-  narrowExcludesNull,
-  nicheReadKindAt,
   nicheReadStashSlot,
   nodeJoinRowName,
   nodeMixedUnionName,
@@ -3494,22 +3496,10 @@ function emitNulIsNullTest(
 ) {
   if !nicheOnly || !invert {
     // claimed first: every arm below reads the declared nullable rep while a narrowed
-    // binding is read at its arm's rep, so without this the assignment spelling gets no arm.
-    const nnRef = nodeAt(unwrapParen(refIx))
-    let nnKey = ""
-    if nnRef is Ident {
-      nnKey = nnRef.identName
-    } else {
-      nnKey = placeNarrowKeyOf(refIx)
-    }
-    // A place the checker proved non-null under its narrowing holds no null, whatever rep the
-    // narrowing pushed for it.
-    // A field or cell folds only on the checker's proof as well, which settles a call that
-    // may have written it; a bare name's narrowing is retired where the checker's is.
-    let nnFold = nnKey != "" && narrowExcludesNull(nnKey)
-    if !(nnRef is Ident) && nnKey != "" {
-      nnFold = narrowSlotOf(nnKey) >= 0 && nodeTyProvesNonNull(refIx)
-    }
+    // read is at its arm's rep, so without this the assignment spelling gets no arm. A read the
+    // checker narrowed to a type that holds no null folds.
+    const nnFold = readNarrowedStoreAt(refIx, fnIx) >= 0
+      && tyProvesNonNull(nodeTyAt(unwrapParen(refIx), fnIx))
     if nnFold {
       if invert { fbI32Const(1) } else { fbI32Const(0) }
       return 1
@@ -7415,7 +7405,9 @@ function emitNarrowedNicheRead(
   ec: ExpCtx,
 ) {
   const masked = maskNarrowFor(key)
+  const sMark = storageReadEnter(exprIx)
   const rc = emitExpr(body, exprIx, fnIx, ec)
+  storageReadLeave(sMark)
   unmaskNarrow(masked)
   if rc < 0 { return -1 }
   const st = nicheReadStashSlot()
@@ -13930,16 +13922,15 @@ function emitMonoMapDefault(
   0
 }
 
-// The narrowed-read tail of a bare map get `m[1]` whose index carries a live narrowing
+// The narrowed-read tail of a bare map get `m[1]` the checker typed without its miss's `null`
 // — the map twin of `emitIndex`'s ref-list rungs. Ref-recover runs first, since
 // `emitMapGet` leaves a nullable element for every ref-valued map; a union value (kind
 // 2) then unboxes to the tested atom, unless the narrow leaves two or more atoms.
 function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
   const mrs = mapReadNarrowableSlot(idxIx, fnIx)
   if mrs < 0 { return 0 }
-  const key = indexPathKeyOf(idxIx)
-  const v = narrowVariantFor(key)
-  if v == "" || v == "null" { return 0 }
+  const rt = nodeTyAt(unwrapParen(idxIx), fnIx)
+  if rt < 0 || tyAdmitsNull(rt) { return 0 }
   // A UNION value already left the NON-null box (`emitMapGetUnionBox` recovers it), so only
   // the unbox is owed; every other ref value is the raw `(ref null <elem>)` vals slot.
   if mvValKind[mrs] == MVK_UNION {
@@ -25427,7 +25418,7 @@ function emitCallCoreUserFn(
   if (
     target >= 0
     && identNameIsLiveBound(callee.identName, fnIx)
-    && identIsBoundClosure(callee.identName, fnIx)
+    && identIsBoundClosure(c.callFn, fnIx)
   ) {
     return emitCallRef(body, callIx, fnIx, ec)
   }
@@ -31794,7 +31785,7 @@ function emitCallStmtIdent(
     // A name a closure binding covers denotes that binding, so the void question is the
     // closure's — the module function of the name lowered no instruction here (D1602).
     let vt = fnIndexOfNode(s.callFn)
-    if vt >= 0 && identIsBoundClosure(callee.identName, fnIx) { vt = -1 }
+    if vt >= 0 && identIsBoundClosure(s.callFn, fnIx) { vt = -1 }
     if vt >= 0 {
       if fRetVoid[vt] == 1 { dropIt = false }
     } else {
@@ -35704,7 +35695,7 @@ function emitIdentNode(
   }
   // a union binding narrowed to a niche-repped `A | null` reads as that niche, under the
   // storage gates `identReadsUnionBox` names (D2590).
-  const nNk = nicheReadKindAt(exprIx, e.identName, fnIx)
+  const nNk = nicheReadKindAt(exprIx, fnIx)
   if nNk >= 0 {
     if identReadsUnionBox(isid, e.identName, exprIx, fnIx) {
       return emitNarrowedNicheRead(body, exprIx, e.identName, nNk, fnIx, ec)
@@ -36275,21 +36266,10 @@ function njBoxWidens(ix: i32, fnIx: i32): boolean {
 }
 
 // The bases of the two-base literal-number union the value at `ix` holds (`litNumUnionBasesOf`):
-// its recorded type's, at the instance `fnIx` where that is a hole or type parameter (D9523),
-// or, for a name narrowed past `null`, its nullable type's. Empty otherwise.
+// its recorded type's, at the instance `fnIx` where that is a hole or type parameter (D9523).
+// Empty otherwise.
 function njLitBasesOf(ix: i32, fnIx: i32): i32[] {
-  const t = njSideTyOf(ix, fnIx)
-  const lb = litNumUnionBasesOf(t)
-  if lb.length > 0 || t < 0 { return lb }
-  const nn = nonNullTy(t)
-  if nn == t { return lb }
-  const nb = litNumUnionBasesOf(nn)
-  if nb.length == 0 { return nb }
-  const u = nodeAt(unwrapParen(ix))
-  if u is Ident {
-    if narrowDropsNull(u.identName) { return nb }
-  }
-  lb
+  litNumUnionBasesOf(njSideTyOf(ix, fnIx))
 }
 
 // The type of operand `ix` a dispatch reads its literal bases off: its recorded type, or where
@@ -36333,11 +36313,7 @@ function njMembersOf(ix: i32, fnIx: i32): i32[] {
     }
     return none
   }
-  if tyIsNumericBox(t) {
-    // A name narrowed past its `null` holds only the number members of its box.
-    if narrowDropsNull(u.identName) { return numUnionMembersOf(nonNullTy(t)) }
-    return none
-  }
+  if tyIsNumericBox(t) { return none }
   // An instance's parameter can carry no recorded type at all; its box still names the members.
   if t >= 0 && !tyHasTyVar(t) { return none }
   if !exprUnion(ix, fnIx) { return none }

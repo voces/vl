@@ -18,12 +18,7 @@ import {
 import { nodeTyIsUnionAlias } from "./check_decl_scan"
 import { nodeTyPinIxOf } from "./check_hole_pins"
 import { luDeclPosOf } from "./check_list_union"
-import { nodeTyIsNulBool } from "./check_node_tys"
-import {
-  isValueUnionName,
-  nameIsLitUnionArmValueUnion,
-  valueAtomKind,
-} from "./check_ty_rep"
+import { isValueUnionName, nameIsLitUnionArmValueUnion } from "./check_ty_rep"
 import {
   T,
   TyArray,
@@ -37,11 +32,9 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
-  numLitUnionBaseName,
   tyAt,
   tyEmitNameNonEmpty,
   tyIsLitUnion,
-  tyIsLitUnionOrLit,
   tyIsNulValueUnionBox,
   tyLitMemberTexts,
 } from "./check_types"
@@ -59,15 +52,13 @@ import {
   sblVal,
 } from "./emit_lit_atoms"
 import { unMemRefArrArmSlot } from "./emit_map_value_slots"
-import { globalLetOfSid, narrowSlotOf, slotLetDecl } from "./emit_narrow_slots"
+import { globalLetOfSid, slotLetDecl } from "./emit_narrow_slots"
 import { paramTypeNode } from "./emit_query"
-import { boxTagOfTy, nodeRepIs, unRowOfKey } from "./emit_rep"
+import { boxTagOfTy, unRowOfKey } from "./emit_rep"
 import { tyIsRefArray } from "./emit_shape_rows"
 import { fnBlockShadowsAt } from "./emit_sig_tokens"
 import {
   localDeclIx,
-  narrowSets,
-  narrowVariants,
   scopeSlotOf,
   startStmts,
   unMemTyCount,
@@ -88,10 +79,6 @@ import {
 import { SCRATCH_BY_CODE, scratchSlot } from "./emit_union_casts"
 import {
   isUNameDeclAB,
-  msHasNull,
-  msMemberTysOfSet,
-  narrowSlotAtomsInto,
-  narrowSlotTy,
   unMemIsMap,
   unMemIsRefElemArray,
   unRowOfCanon,
@@ -107,12 +94,7 @@ import {
   sidText,
 } from "./symbols"
 import { nameIsParenOpen } from "./tyname"
-import {
-  intLitUnionBasesOf,
-  isNullTy,
-  tyHasTyVar,
-  tyIsUnionShaped,
-} from "./tyquery"
+import { intLitUnionBasesOf, tyHasTyVar, tyIsUnionShaped } from "./tyquery"
 
 // True if the parameter `name` of function `fnIx` is the union type.
 export function paramUnion(fnIx: i32, name: string) {
@@ -700,68 +682,8 @@ function nulValueUnionBoxRowName(ty: i32): string {
   unNames[u]
 }
 
-// True when the live narrowing on `name` proves it not null (`emitIdentNode` reads at the
-// arm's rep, but the `??` lowering and a `!= null` test still target the declared nullable
-// rep unless this says otherwise). Decided on the arena type the narrow banked, never the
-// rendered variant — a slot with no single banked type answers false, the safe default.
-export function narrowExcludesNull(name: string): boolean {
-  const i = narrowSlotOf(name)
-  if i < 0 { return false }
-  const v = narrowVariants[i]
-  if v == "" { return false }
-  if v == "null" { return false }
-  const ty = narrowSlotTy(i)
-  if ty < 0 { return false }
-  const t = tyAt(ty)
-  if t is TyNullable { return false }
-  !isNullTy(ty)
-}
-
-// `narrowExcludesNull`, or a complement narrowing whose surviving member set lacks `null` (the
-// `!= null` arm of `i32 | i64 | null`, which keeps two members and so binds no one type).
-export function narrowDropsNull(name: string): boolean {
-  if narrowExcludesNull(name) { return true }
-  const i = narrowSlotOf(name)
-  if i < 0 { return false }
-  const v = narrowVariants[i]
-  if v == "" || v == "null" { return false }
-  const s = narrowSets[i]
-  s >= 0 && !msHasNull(s)
-}
-
-export function narrowedValueAtomOf(name: string) {
-  const i = narrowSlotOf(name)
-  if i < 0 { return "" }
-  const v = narrowVariants[i]
-  if v == "" { return "" }
-  // The narrowed type decides reject (no value-atom or litunion arm, however costly its
-  // spelling is to classify); only where it IS an atom does the spelling decide instead.
-  const ty = narrowSlotTy(i)
-  if ty >= 0 {
-    const tk = boxTagOfTy(ty)
-    if tk < 0 || tk == 6 { return "" }
-    // A numeric literal arm (`if p is N` where `type N = 1 | 2`) unboxes as its base scalar, a
-    // string literal or literal-union arm as the string ref its box holds (D1193).
-    const nb = numLitUnionBaseName(ty)
-    if nb != "" { return nb }
-    if tyIsLitUnionOrLit(ty) { return "string" }
-  }
-  const k = valueAtomKind(v)
-  if k >= 0 && k != 6 { return v }
-  // A transparent alias (`type N = i32`) banks the alias spelling, which `valueAtomKind`
-  // declines; fall back to the arena `TyPrim`'s canonical `primName` for the same atom.
-  if k < 0 && ty >= 0 {
-    const at = tyAt(ty)
-    if at is TyPrim {
-      const ak = valueAtomKind(at.primName)
-      if ak >= 0 && ak != 6 { return at.primName }
-    }
-  }
-  ""
-}
-
 // The value-atom kind a read of checked type `ty` unboxes to from a union box, or -1 when `ty`
-// is no single atom (a union, null, a struct). The type-only twin of `narrowedValueAtomOf`.
+// is no single atom (a union, null, a struct).
 export function readAtomKindOfTy(ty: i32): i32 {
   const k = boxTagOfTy(ty)
   if k == 6 { -1 } else { k }
@@ -780,68 +702,10 @@ export function readContainerKindOfTy(ty: i32): i32 {
   0
 }
 
-// The kind of `A` when a union binding `name` is narrowed to exactly `A | null` and that pair has a
-// niche rep of its own (`boolean | null` is an i32 with 2 for null, `string | null` a nullable ref),
-// else -1. A read then converts the box to the niche, the type the checker gave it (D2590).
-function narrowedNicheAtomOf(name: string): i32 {
-  const i = narrowSlotOf(name)
-  if i < 0 { return -1 }
-  if narrowVariants[i] == "" { return -1 }
-  const atoms: string[] = []
-  narrowSlotAtomsInto(i, atoms)
-  if atoms.length != 2 { return -1 }
-  let k = -1
-  let nulls = 0
-  let a = 0
-  while a < 2 {
-    const ak = valueAtomKind(atoms[a])
-    if ak == 6 { nulls = nulls + 1 } else { k = ak }
-    a = a + 1
-  }
-  if nulls != 1 { return -1 }
-  if k == 1 || k == 2 { return k }
-  -1
-}
-
 // The stash a niche read parks a field's or cell's box in between its tag test and its payload
 // read. It shares the literal-`is` stash, code 17: neither holds it across any user code.
 export function nicheReadStashSlot() {
   scratchSlot(17, "i32", 0, SCRATCH_BY_CODE)
-}
-
-// `narrowedNicheAtomOf` for the read at node `ix` of key `key`, where the checker agrees: the
-// read's recorded type is that niche. A read it typed otherwise keeps the box.
-export function nicheReadKindAt(ix: i32, key: string, fnIx: i32): i32 {
-  const nk = narrowedNicheAtomOf(key)
-  if nk == 1 && nodeTyIsNulBool(ix) { return 1 }
-  if nk == 2 && nodeRepIs(ix, "nulstr", fnIx) { return 2 }
-  -1
-}
-
-// Whether `name` is narrowed to exactly `K | null`, or `K | L | null`, every non-null member a
-// literal-union alias or the `string` arm a mixed box holds its litunions in (D3174). The caller
-// has already asked that the read is typed as the nullable litunion.
-export function narrowedNulLitAlias(name: string): boolean {
-  const i = narrowSlotOf(name)
-  if i < 0 { return false }
-  if narrowVariants[i] == "" { return false }
-  const atoms: string[] = []
-  narrowSlotAtomsInto(i, atoms)
-  if atoms.length < 2 { return false }
-  // The member types, index-parallel to `atoms`; a narrow with no member set declines.
-  const tys: i32[] = []
-  if !msMemberTysOfSet(narrowSets[i], tys) { return false }
-  if tys.length != atoms.length { return false }
-  let nulls = 0
-  let a = 0
-  while a < atoms.length {
-    // Value-atom kind 6 is `null`, 2 the `string` arm.
-    const ak = valueAtomKind(atoms[a])
-    if ak == 6 { nulls = nulls + 1 }
-    else if ak != 2 && !tyIsLitUnion(tys[a]) { return false }
-    a = a + 1
-  }
-  nulls == 1
 }
 
 // The niche kind of a nullable literal union read out of a box: the atom id, `-1` for null.
@@ -854,22 +718,4 @@ export function nulLitMemberTexts(ty: i32): string[] {
     if t is TyNullable { return tyLitMemberTexts(t.nInner) }
   }
   tyLitMemberTexts(ty)
-}
-
-// The bare-closure arm a union binding `name` is currently narrowed to (`if x is () => i64`
-// → `() => i64`), or "" otherwise. The narrowed read already unboxes via
-// `narrowedValueAtomOf`; this isolates the closure case so `exprIsClosure` can route the
-// call through `call_ref` with the arm's `$fnsig`.
-export function narrowedClosureOf(name: string) {
-  const v = narrowedValueAtomOf(name)
-  if v != "" && valueAtomKind(v) == 11 { return v }
-  ""
-}
-
-// The arena type the narrowing of `name` binds, the type of the arm `narrowedClosureOf` names;
-// -1 when `name` is not narrowed or the narrowing banks no single type.
-export function narrowedClosureTyOf(name: string): i32 {
-  const i = narrowSlotOf(name)
-  if i < 0 { return -1 }
-  narrowSlotTy(i)
 }
