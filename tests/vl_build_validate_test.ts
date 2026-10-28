@@ -23,8 +23,8 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D3689 — an `f64` receiver tested
-// against an integer literal compares against an `i32` constant). If that hole is closed the fixture stops
+// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D13960 — a wider record list spread into
+// a narrower rest parameter builds the rest list unconverted). If that hole is closed the fixture stops
 // producing an invalid module and this pin would silently go inert — so the first
 // assertions check the PRECONDITION and fail loudly with a swap instruction rather than
 // passing vacuously. Swap in any other source that emits an invalid module; the whole
@@ -52,16 +52,28 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: D3689's witness. `d is 1` with `d: f64` lowers the
-// literal as an `i32` constant beside the `f64` operand — `type mismatch: expected i32, found f64`.
-// Closing D3689 is a change the precondition assertions below catch.
+// Type-checks clean, emits invalid wasm: D13960's witness. `total(...cs)` builds the `Shape[]` rest
+// list from `Circle` structs — `type mismatch: expected (ref $type), found (ref $type)`. Closing
+// D13960 is a change the precondition assertions below catch.
 //
-// It REPLACES D1400's annotated-binding cell, which the checker refuses since `as?` over a hole
+// It REPLACES D3689's `d is 1` over `d: f64`, which became a loud emit refusal pending its ruling
+// (D14642), which itself REPLACED D1400's annotated-binding cell, which the checker refuses since `as?` over a hole
 // is typed `N | null` before any pin (D3654). Before that: the member-variance fixture (refused
 // since the record-covariance ruling), the narrowed-litunion-arm fixture, a `.map` callback
 // PARAMETER spelled as the inline member union, and an unread global binding of a generic
 // function's nullable-closure return. The precondition assertion caught all five.
-const INVALID_SRC = `const d: f64 = 1.0\nprint(d is 1)\n`;
+const INVALID_SRC = [
+  "type Shape = { r: f64 }",
+  "type Circle = { r: f64, name: string }",
+  "function total(...xs: Shape[]): f64 {",
+  "  let t = 0.0",
+  "  for x in xs { t = t + x.r }",
+  "  t",
+  "}",
+  'const cs: Circle[] = [{ r: 1.5, name: "a" }, { r: 2.0, name: "b" }]',
+  "print(total(...cs))",
+  "",
+].join("\n");
 
 // The over-rejection control: an ordinary valid program must still build clean.
 const VALID_SRC = `print(6 * 7)\n`;
