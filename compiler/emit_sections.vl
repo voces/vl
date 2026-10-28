@@ -25,7 +25,6 @@ import {
 } from "./check_getter_effects"
 import { refViewSrcTys } from "./check_ref_list_view"
 import { lbiArenaReset } from "./check_num_lit_state"
-import { cexLitPeel } from "./check_num_lits"
 import { T, TyLit, tyLitMemberTexts } from "./check_types"
 import {
   ATOMIC_SIG_CMPXCHG,
@@ -115,7 +114,6 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
-  annTsOf,
   declNameTokOf,
   extGMut,
   extGNames,
@@ -133,7 +131,6 @@ import {
   nodeAt,
   nodeChildren,
   nodeToks,
-  tsMentionsAnyName,
 } from "./ast"
 import { bignumReset } from "./emit_bignum"
 import {
@@ -689,7 +686,6 @@ import {
   fnEnvIdxOf,
   nfdReset,
   nodeTyAt,
-  numLitTyWidth,
 } from "./emit_capture_frames"
 import { bcReset } from "./emit_closure_callee"
 import {
@@ -929,7 +925,6 @@ import {
   wasmEmitStateReset,
 } from "./wasmEmit"
 import { strListHas } from "./listutil"
-import { strContains } from "./strutil"
 import { memoCompileReset, memoPassAdvance } from "./memo"
 import { MAP_KEY_I32, MAP_KEY_I64, MAP_KEY_STR } from "./check_ty_rep"
 import { daTopAssignedAt } from "./check_definite"
@@ -7151,15 +7146,6 @@ function scanPrintReset() {
   0
 }
 
-// Flag the scalar width node `ix` is built at, as its literal value.
-function scanPrintLitWidth(ix: i32, saw: PrintScanSaw) {
-  const w = numLitTyWidth(ix, -1)
-  if w == "f64" { saw.sawF64 = true }
-  if w == "f32" { saw.sawF32 = true }
-  if w == "i64" { saw.sawI64Ann = true }
-  0
-}
-
 // Detects `print(...)`/memory-intrinsic use anywhere in the program: any print pulls in the
 // 4-import print family (imports shift every local function's wasm index, so this is decided
 // up front). "Any print" is the property, not the spelling `print(` — three constructs lower
@@ -7178,10 +7164,17 @@ function scanPrintUse() {
     sawFloatRem: false,
     sawRemUnknown: false,
   }
-  const litAsgs: i32[] = []
-  const stmtDropped: Map<i32, boolean> = Map()
   while pscan < P.nodes.length {
     const pn = nodeAt(pscan)
+    // Any node the checker typed at a wide scalar, at any depth of its type, flags that width:
+    // a value built or read, an annotation, a cast target. An unused import is harmless, a
+    // missed one is invalid wasm (D14489).
+    const nscal = repNodeScalarMask(pscan)
+    if nscal > 0 {
+      if (nscal & REP_SCAL_I64) != 0 { saw.sawI64Ann = true }
+      if (nscal & REP_SCAL_F64) != 0 { saw.sawF64 = true }
+      if (nscal & REP_SCAL_F32) != 0 { saw.sawF32 = true }
+    }
     // A map an `is` or `as` names joins its struct's tag family even where no union arm is
     // that map, so a pin whose union lacks it cannot answer with a twin's tag (D2493).
     if pn is IsExpr { mapTwinNotePattern(isVarTyIxOf(pscan)) }
@@ -7265,84 +7258,7 @@ function scanPrintUse() {
         }
       }
     }
-    // Any type annotation containing an i64/f64/f32 leaf anywhere — bare, `T[]` element, union
-    // member, map value, closure result, struct field, nullable inner — flags the program as
-    // using that scalar. Combined with `print`, it pulls in the matching `__print_*__` import: an
-    // over-approximation (an unused import is harmless) is fine, a missed flag is invalid wasm.
-    if pn is TypeRef {
-      // Exact containment via the checker's recorded type (`repTyScalarMask` walks the `Ty` arena
-      // transitively, terminating on recursive types), so an alias whose name never spells the
-      // scalar (`type Big = i64`) still flags it. Only a node with no recorded type falls back to the name-substring test, which sees exactly what the synthesis spelled.
-      const scal = repNodeScalarMask(pscan)
-      if scal >= 0 {
-        if (scal & REP_SCAL_I64) != 0 { saw.sawI64Ann = true }
-        if (scal & REP_SCAL_F64) != 0 { saw.sawF64 = true }
-        if (scal & REP_SCAL_F32) != 0 { saw.sawF32 = true }
-      } else {
-        // No recorded type — the parser's spelling tree answers instead of the rendering.
-        // `tsMentionsAnyName` walks the annotation the author actually wrote and compares each leaf
-        // whole, unlike the `strContains` substring test it replaces (which matched a field named
-        // `f64mode` or a type named `Bf64`). The corpus cannot distinguish the two readers, so this rests on the whole-leaf argument alone, not a graded signal.
-        const tsRoot = annTsOf(pscan)
-        if tsRoot >= 0 {
-          if tsMentionsAnyName(tsRoot, ["i64"]) { saw.sawI64Ann = true }
-          if tsMentionsAnyName(tsRoot, ["f64"]) { saw.sawF64 = true }
-          if tsMentionsAnyName(tsRoot, ["f32"]) { saw.sawF32 = true }
-        } else {
-          // Neither a recorded type nor a spelling tree. Flags all three rather than none: this scan is
-          // an over-approximation by design — a spare import is harmless, a missed flag is invalid wasm.
-          saw.sawI64Ann = true
-          saw.sawF64 = true
-          saw.sawF32 = true
-        }
-      }
-    }
-    // A literal flags the width it is built at, so `print(0xDEAD_BEEF)` pulls in the
-    // `__print_i64__` import even with no `i64` annotation.
-    // A literal the check never typed is a constant tree's folded-away operand, built nowhere.
-    if pn is NumLit { scanPrintLitWidth(pscan, saw) }
-    // So does an assignment whose value is a number literal and is read, built at the
-    // assignment's own type; a top-level statement or a block's non-last one is never read.
-    if pn is BinExpr {
-      if (
-        pn.binOp == "="
-        && pn.binCompound == ""
-        && cexLitPeel(pn.binRight) >= 0
-      ) {
-        litAsgs.push(pscan)
-      }
-    }
-    if pn is Block {
-      let k = 0
-      while k + 1 < pn.blkStmts.length {
-        stmtDropped.set(unwrapParen(pn.blkStmts[k]), true)
-        k = k + 1
-      }
-    }
-    if pn is Program {
-      for ps in pn.progStmts { stmtDropped.set(unwrapParen(ps), true) }
-    }
-    // An explicit `x as T` cast target rides as a string field (`asTy`), not a `TypeRef` node, so
-    // the annotation scan above misses it. Flag its scalar directly, or `print(x as i64)`/`print(x as f64)` would route to an undeclared import.
-    if pn is AsExpr {
-      // Arena first, exactly as the `TypeRef` arm above does — the fallback here is a substring
-      // scan over `asTy`, a rendered type name, kept for a node the checker did not record. The
-      // substring form is also wider than it reads: `strContains(t, "i64")` matches any name containing those characters — a field named `i64x`, an alias whose spelling embeds it — where the arena asks the cast's own recorded type and cannot be fooled.
-      const ascal = repNodeScalarMask(pscan)
-      if ascal >= 0 {
-        if (ascal & REP_SCAL_I64) != 0 { saw.sawI64Ann = true }
-        if (ascal & REP_SCAL_F64) != 0 { saw.sawF64 = true }
-        if (ascal & REP_SCAL_F32) != 0 { saw.sawF32 = true }
-      } else {
-        if strContains(pn.asTy, "i64") { saw.sawI64Ann = true }
-        if strContains(pn.asTy, "f64") { saw.sawF64 = true }
-        if strContains(pn.asTy, "f32") { saw.sawF32 = true }
-      }
-    }
     pscan = pscan + 1
-  }
-  for a in litAsgs {
-    if !(stmtDropped.get(a) ?? false) { scanPrintLitWidth(a, saw) }
   }
   // D1586 — the float-remainder helper. A `%` with no recorded type is only counted when
   // the module mentions a float somewhere, which is what keeps an integer-only program's
