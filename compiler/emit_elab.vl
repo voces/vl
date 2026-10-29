@@ -121,6 +121,7 @@ import {
   genAppRowOf,
   mkArrayTy,
   mkFuncTy,
+  mkMapTy,
   mkNullableTy,
   mkObjTy,
   structNameOfTy,
@@ -1373,11 +1374,34 @@ function elabSetRepTy(t: i32, depth: i32, ck: i32): i32 {
     const e = elabSetRepTy(ty.nInner, depth - 1, ck)
     return if e < 0 { -1 } else if e != ty.nInner { mkNullableTy(e) } else { t }
   }
+  if ty is TyMap {
+    const e = elabSetRepTy(ty.mVal, depth - 1, ck)
+    return if e < 0 { -1 } else if e != ty.mVal { mkMapTy(ty.mKey, e, ty.mSet) } else { t }
+  }
+  if ty is TyObj {
+    const fs: i32[] = []
+    let moved = false
+    for ft in ty.objFieldTypes {
+      const e = elabSetRepTy(ft, depth - 1, ck)
+      if e < 0 { return -1 }
+      if e != ft { moved = true }
+      fs.push(e)
+    }
+    return if moved { mkObjTy(ty.objFieldNames, fs) } else { t }
+  }
   if !(ty is TyFunc) { return t }
   const ms = elabFnSetOf(t)
   if ms.length == 0 { return t }
   let rep = -1
   for m in ms {
+    // A generic no instance reaches is built at its default (D4551).
+    if ck >= 0 && elabReachedOf(ck, m) == -1 {
+      const d = elabDefaultSig(m)
+      if d >= 0 {
+        if rep >= 0 && !tySame(rep, d) { return -1 }
+        rep = d
+      }
+    }
     for k in elabRepInstances(ck, m) {
       if k < 0 { return -1 }
       const sig = nodeTyIxOf(m)
@@ -1394,6 +1418,20 @@ function elabSetRepTy(t: i32, depth: i32, ck: i32): i32 {
   }
   if rep < 0 { return mkFuncTy([], TY_VOID) }
   rep
+}
+
+// Generic `m`'s signature with every type parameter at the default `i32` (D4551); -1 for a
+// declaration that is not generic or whose signature does not close.
+function elabDefaultSig(m: i32): i32 {
+  if m < 0 || m >= P.nodes.length { return -1 }
+  const f = nodeAt(m)
+  const sig = nodeTyIxOf(m)
+  if !(f is FuncDecl) || f.fnTyParams.length == 0 || sig < 0 { return -1 }
+  const tys: i32[] = []
+  for _tp in f.fnTyParams { tys.push(TY_I32) }
+  const s = substTyDeep(sig, f.fnTyParams, tys)
+  if s < 0 || s >= T.tys.length || !elabTyClosed(s, 0) { return -1 }
+  s
 }
 
 // The instances of `m` a set's rep reads: the one instance `ck` reaches ([] for none, [-1] for
