@@ -261,7 +261,11 @@ These have no unmet prerequisite and touch disjoint files:
      bank's kind and epoch as columns. The bank's readers move onto those rows one function
      at a time, `crCallCandidates`' stamp cache last. Then the bank is deleted. Done: the rows live in `check_nar_store.vl`, below
      `check_capture_widen.vl` in the module graph, and `check_nar_bank.vl` is gone.
-  3. Identifier reads take a narrowed type from the row rather than the layer. The 7 writers
+  3a. Each identifier row carries the narrowed type its layer holds, kept in step at every layer
+     write (the seven declares, `narSetScope`, the journal replay), and a declaration clock
+     (`slotDeclGen`) retires a row whose binding was declared again after it. A probe compared
+     the row against the layer on every identifier read: equal in all 17,265 files. Done.
+  3b. Identifier reads take a narrowed type from the row rather than the layer. The 7 writers
      stop writing a layer, and the join's snapshot covers both kinds of place. This is where
      a read costs `npSlotOf`'s scan, so it needs a per-declaration index first. The
      scaling-shape gate is the check.
