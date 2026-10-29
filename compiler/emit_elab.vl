@@ -41,6 +41,7 @@ import {
   elabCallIx,
   elabCallN,
   elabCallT,
+  elabCalleeTargets,
   elabCapBegin,
   elabCapDeadIx,
   elabCapEnd,
@@ -1041,7 +1042,55 @@ function elabOne(k: i32) {
     if tysClosed(ct) {
       elabReachNote(k, elabEnqueue(elabCallD[c], cn, ct, k), elabCallIx[c])
     }
+    const cx = nodeAt(elabCallIx[c])
+    if cx is Call {
+      const cft = elabCapTy[cx.callFn] ?? nodeTyIxOf(cx.callFn)
+      elabSetCallRows(elabCallIx[c], elabCallN[c], elabCallT[c], k, cft)
+    }
     c = c + 1
+  }
+  0
+}
+
+// Enqueues under `from` each function the callee of call `ix` (of type `calleeTy`, or its node's
+// type for -1) may hold, bound by its signature against the call's parameter types at
+// `names`/`tys`: a call through two or more functions reaches every one. A function with
+// nothing to bind is no instance.
+function elabSetCallRows(
+  ix: i32,
+  names: string[],
+  tys: i32[],
+  from: i32,
+  calleeTy: i32,
+) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const cn = nodeAt(ix)
+  if !(cn is Call) { return 0 }
+  const ct = if calleeTy >= 0 { calleeTy } else { nodeTyIxOf(cn.callFn) }
+  if ct < 0 || ct >= T.tys.length { return 0 }
+  const ms = elabCalleeTargets(cn.callFn)
+  if ms.length < 2 { return 0 }
+  const cf = tyAt(ct)
+  if !(cf is TyFunc) { return 0 }
+  const pts: i32[] = []
+  for pt in cf.fnParamTypes {
+    const st = substTyDeep(pt, names, tys)
+    if st < 0 || !elabTyClosed(st, 0) { return 0 }
+    pts.push(st)
+  }
+  for m in ms {
+    const sig = if m >= 0 && m < P.nodes.length { nodeTyIxOf(m) } else { -1 }
+    if sig < 0 || sig >= T.tys.length { continue }
+    const sf = tyAt(sig)
+    if !(sf is TyFunc) || sf.fnParamTypes.length != pts.length { continue }
+    const mn: string[] = []
+    const mt: i32[] = []
+    let i = 0
+    while i < pts.length {
+      bindGenWalk(sf.fnParamTypes[i], pts[i], mn, mt)
+      i = i + 1
+    }
+    if mn.length > 0 { elabReachNote(from, elabEnqueue(m, mn, mt, from), -1) }
   }
   0
 }
@@ -1133,6 +1182,7 @@ export function elabRun() {
   while r < n {
     const ix = callBindIxAt(r)
     const tys = elabSetArgBind(ix, callBindNamesAt(r), callBindTysAt(r))
+    elabSetCallRows(ix, callBindNamesAt(r), tys, -1, -1)
     if tysClosed(tys) {
       const d = elabCallDeclOf(ix)
       const k = elabEnqueue(d, callBindNamesAt(r), tys, -1)
