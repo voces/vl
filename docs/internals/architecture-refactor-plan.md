@@ -250,11 +250,13 @@ These have no unmet prerequisite and touch disjoint files:
   `check_capture_widen.vl` 181) and a bank row (`noteNarShadow`, the same sites), and
   `check_elab_cap.vl` 223 restores layers from a snapshot. About 26 references walk the
   layers (`slotLayerTop`/`slotLayerPrev`, `crIsNarrowLayer`, `scopeVisibleSnapshot`), and
-  about ten functions read the bank rows. The place store a path narrowing writes has 5 row
-  scans (`check_demands.vl` 598, `check_leaf_steps.vl` 644, `check_narrow_flow.vl` 1973,
-  2171, 3431); its other ~100 references index a slot `npSlotOf` already found by place. So
+  about ten functions read the bank rows. The place store a path narrowing writes is read in 42
+  functions; seven of them walk every row (`noteCallInvalidations`, `elemEverySlotOf`,
+  `retireNarrowingsForWrite`, `retireIndexedNarrowings`, `retireAliasedNarrowings`,
+  `crLoopPathPreRetire`, and `crNoteRhsRetired`, which matches one path), and the rest
+  index a slot `npSlotOf` or a mark already found. So
   the staging is:
-  1. Each of the 5 scans skips a place that is not a path. No behaviour change.
+  1. Each scan that walks every row skips a place that is not a path. No behaviour change.
   2. Each narrowing site pushes an identifier-place row beside its bank row, with the
      bank's kind and epoch as columns. The bank's readers move onto those rows one function
      at a time, `crCallCandidates`' stamp cache last. Then the bank is deleted.
