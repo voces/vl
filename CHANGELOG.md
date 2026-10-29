@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **A `let`'s cell kind has one producer for a local and a module global.** `letLocalSlot`'s ladder is deleted: a local takes `letCellKind`, the global's producer, at the slot `letCellSlot` reads for that kind. A probe found the two disagreeing in 1 of 17,265 files, a mapped list in a `string | null` instance, and `letCellKind` gains the `strlist` rung it lacked. No file builds differently.
 - **A loop variable's loop has one finder, keyed by declaration (D14543 closed).** `frameElemLoopAtRead`, which asked the frame's loop plan by read node and missed a read a mono instance shares with its template, is deleted; `frameElemLoopOfRead` asks the plan by the read's declaration and walks the body only where the plan has no row. No output or module differs over 17,265 files.
 - **An inferred `Map()` reaches every value rep: string, f64 and struct values run (#1359, #4466, #4770).**
 - **Union registries are keyed by type: registry-by-key step 5 landed (#3635, #3639, #4264, #4268); D1492 is closed.**
