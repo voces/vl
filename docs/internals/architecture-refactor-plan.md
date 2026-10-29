@@ -268,7 +268,13 @@ These have no unmet prerequisite and touch disjoint files:
   3b-i. Every identifier-type read outside `check_scopes` goes through the store's `declTyOf`,
      `identTyOf` and `placeNameTy`, which answer a live row's type before the layer's
      (`layerTyOf`). Done; equal to the layer by 3a's probe.
-  3b-ii. The narrowing writers stop writing a layer. The 7 writers
+  3b-ii. The narrowing writers stop writing a layer. Done: the walkers ask the store's
+     `narChainDepths`, `narTyAtDepth` and `narTopDepth`, `narSetScope` and the journal replay
+     write the row (a declaration's own layer only where no row stands), and the elaboration
+     snapshot takes the store's type. The one layer a narrowing site still writes is a guard
+     test that leaves the type unchanged and so records no row: its scope still binds the name.
+  4. B4: the journal's scope/path flag (`narIpScope`) and `crFirstBank` go once a retirement at
+     a declaration's depth writes a row too. The 7 writers
      stop writing a layer, and the join's snapshot covers both kinds of place. This is where
      a read costs `npSlotOf`'s scan, so it needs a per-declaration index first. The
      scaling-shape gate is the check.
