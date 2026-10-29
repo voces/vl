@@ -4,7 +4,7 @@
 // parameter pinned. The per-kind checkers reach `checkNode` through `checkNodeHook`.
 
 import { identTyOf } from "./check_nar_store"
-import { identFnDeclOf } from "./check_scopes"
+import { declareDecl, identFnDeclOf } from "./check_scopes"
 import {
   ArrayLit,
   AsExpr,
@@ -341,7 +341,6 @@ import {
   prbEnter,
   prbLeave,
 } from "./check_rollback"
-import { declareDecl } from "./check_scopes"
 import { valBindLambda } from "./check_side_rows"
 import { symEnabled } from "./check_state"
 import {
@@ -431,11 +430,17 @@ import { numUnionConverts, numUnionMinted } from "./check_union_mint"
 import { wideLitByNode } from "./check_wide_lits"
 import { recAdPinInit } from "./check_rec_adopt_rows"
 import { argLitAt, wsSuppress } from "./check_width"
-import { cwCalleeDeclOf, cwFnValueDeclOf, fnDeclIx } from "./check_write_scan"
+import {
+  cwBindingOf,
+  cwCalleeDeclOf,
+  cwFnValueDeclOf,
+  cwFnValueTargets,
+  fnDeclIx,
+} from "./check_write_scan"
 import { numLexIsFloat } from "./emit_bignum"
 import { i32ListEq, strListHas } from "./listutil"
 import { nodePos } from "./fmt_util"
-import { identFrom } from "./symbols"
+import { identDeclOf, identFrom } from "./symbols"
 import {
   flattenVariantsInto,
   isNullTy,
@@ -1508,6 +1513,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // return) is built at that type.
   adoptFnNameAt(srcExpr, dstTy)
   fvaValueRowNote(srcTy, dstTy)
+  fvaBindingRowsNote(srcExpr, dstTy)
   // The flow hook for the un-annotated-parameter solve. It sits above the `assignable`
   // short-circuit because a hole source always returns there, so this is the only point in the
   // function a hole reaches — and every binding / argument / return / field / element / store
@@ -3092,6 +3098,17 @@ function fvaValueRowNote(srcTy: i32, dstTy: i32) {
   fvaValueRowWalk(srcTy, dstTy, 4)
 }
 
+// Banks the instance at closed function type `dstTy` of each generic function a binding read
+// `srcExpr` may hold, every value assigned to it included (a closure's writes too).
+function fvaBindingRowsNote(srcExpr: i32, dstTy: i32) {
+  const p = parenPeelIx(srcExpr)
+  if p < 0 || p >= P.nodes.length || identDeclOf(p) < 0 { return 0 }
+  const dt = nonNullTy(dstTy)
+  if dt < 0 || dt >= T.tys.length || !(tyAt(dt) is TyFunc) { return 0 }
+  for t in cwFnValueTargets(cwBindingOf(p)) { fvaValueRowAt(t, dt) }
+  0
+}
+
 // `fvaValueRowNote` for each value body `body` hands back, at the instance's closed result `ret`.
 export function fvaRetRowsNote(body: i32, ret: i32) {
   const rv: i32[] = []
@@ -3118,8 +3135,16 @@ function fvaValueRowWalk(srcTy: i32, dstTy: i32, depth: i32) {
   if s is TyArray && d is TyArray {
     return fvaValueRowWalk(s.aElem, d.aElem, depth - 1)
   }
-  const decl = elabFnIdOf(srcTy)
-  if decl < 0 || decl >= P.nodes.length { return 0 }
+  fvaValueRowAt(elabFnIdOf(srcTy), dt)
+}
+
+// Banks generic function `decl`'s instance at closed function type `dt`, its type parameters
+// bound by its signature against `dt`'s.
+function fvaValueRowAt(decl: i32, dt: i32) {
+  if decl < 0 || decl >= P.nodes.length || dt < 0 || dt >= T.tys.length {
+    return 0
+  }
+  const d = tyAt(dt)
   const fn = nodeAt(decl)
   const st = nodeTyIxOf(decl)
   if !(fn is FuncDecl) || fn.fnTyParams.length == 0 || !(d is TyFunc) {
