@@ -583,11 +583,11 @@ The order: checker rows for value-of-generic deliveries, one slice per kind; the
 - 145: the rep is also read at the row's own instance, from the member instances its body reaches; a member it never calls adds nothing, so a set it calls nowhere is the stub.
 - 131: the rep walk enters record fields and map values, and a generic member no instance reaches takes its signature at the default `i32` (D4551), as mono builds it.
 
-What is left:
-- calls whose set of function values has members disagreeing on a signature, or whose rep mono derives from flow the elaboration does not see;
-- calls where two instances widen to one pin, or whose binding is a string literal union, which wait on mono keying instances by the elaboration;
-- function values delivered into a still-open generic slot, which mono defaults;
-- lambdas handed to intrinsic methods;
+What is left (131 files on 2026-10-29), by what the elaboration would need to know:
+- a hole function returned through an identity (`fw(g)`) and called at several types, where mono builds one instance per type the result is called at;
+- a callback over records whose pin names the adopted row (`{v: A}`) where the checker holds the structural type. Keys stay nominal, since fixtures keep same-shaped rows apart;
+- two instances widening to one pin, and string literal unions (an atom, not `string`), which wait on mono keying instances by the elaboration;
+- the capture-cell hole lambdas (D14425) and function values delivered into a still-open generic slot, which mono defaults;
 - a tail of single rules.
 
 **Container adoption: the emitter's name scan stays until the checker settles field types.** Deleting the scan and having the mint record node → row recovered 0 of 26 fixtures: `anonMintLiteral` mints only when `structIndexOfObj` is below 0, and without the scan the literal's checker type still holds the unsettled field (`[]`, an if-join with `null`, `Map()`). Dropping the `structRowOfObjFieldSet` fallback recovers the 26 and breaks 44: family A (21), a literal still holed at mint time, and family B (20), a concrete literal never adopted to its later declared record use (DECISIONS.md, "A record literal's row is settled by the checker"). Landed toward the deletion: a record literal's row is asked per instance (#4837, #4847, #4882); the checker adopts a concrete record literal to its declared record use at joins, `==` and call returns (#4844; 6 of 13 family-B cells run with the scan removed); the follower binds `T` to `recBuildTyOf` (#4902), and one `recValueOrigins` producer replaces `recLeafLitBinding` and `recReturnedBindings` (#4904). Residue with the scan removed: step 7 (`fieldStorageEq`), an interning gap at intersection and union destinations, module-scope hole-function records (family A2, 15), step 4 (A3, 6), an open elaboration type (A4, 2), mono cascade facts 1 and 3, and group G6.
