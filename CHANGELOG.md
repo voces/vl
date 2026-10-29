@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **A `boolean | null` binding's cell kind has one producer (D14563 closed).** `letCellKind`, shared by locals and module globals, answers `nulbool` for the sentinel niche, so a global's storage and read-side kinds agree and `globalReadCellKind` is deleted. No file over 17,267 builds differently.
 - **A list literal of un-annotated functions returned by a call runs when the results differ.** `holeSlotJudge` lifts the result comparison for a list literal a call returns into an element read (`holeSlotRetApart`), bound or read in place, as for the inline literal; a returned list written after is still judged (D14648).
 - **A `let` list of un-annotated functions re-pointed to another literal runs when the results differ.** `cwLetRepointFnTargets` joins the functions of each literal the binding is re-pointed to into its set, and the re-pointing literal is built at the widened list (`checkAssignStore`). One fixture D9172 kept as a refusal now runs; D14648 keeps parameters, returned lists, record list fields and maps.
 - **A function list written through an alias runs when the results differ (D14647, D9091 closed; D14648 filed).** `fnSlotSetOf` joins every function stored in the list's elements through any alias (`cwListElemFnTargets`, the write set the judge already read), so the source list's set holds the alias's writes and is tagged. A parameter's write, a re-pointed `let`, a returned list, a record list field and a map index write are still judged.
