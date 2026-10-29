@@ -273,8 +273,10 @@ These have no unmet prerequisite and touch disjoint files:
      write the row (a declaration's own layer only where no row stands), and the elaboration
      snapshot takes the store's type. The one layer a narrowing site still writes is a guard
      test that leaves the type unchanged and so records no row: its scope still binds the name.
-  4. B4: the journal's scope/path flag (`narIpScope`) and `crFirstBank` go once a retirement at
-     a declaration's depth writes a row too. The 7 writers
+  4. B4: done. A probe found every `narSetScope` and journal replay landing on a row in all
+     17,265 files, so the layer fallback goes with `slotTySetAt` and `slotLayerTy`; the journal
+     tells a bare name's entry from a path's by `narIpSlot` alone (`narIpScope` goes), and
+     `crFirstBank` is the store's `narRowAt`. The 7 writers
      stop writing a layer, and the join's snapshot covers both kinds of place. This is where
      a read costs `npSlotOf`'s scan, so it needs a per-declaration index first. The
      scaling-shape gate is the check.
