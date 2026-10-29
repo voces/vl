@@ -265,7 +265,10 @@ These have no unmet prerequisite and touch disjoint files:
      write (the seven declares, `narSetScope`, the journal replay), and a declaration clock
      (`slotDeclGen`) retires a row whose binding was declared again after it. A probe compared
      the row against the layer on every identifier read: equal in all 17,265 files. Done.
-  3b. Identifier reads take a narrowed type from the row rather than the layer. The 7 writers
+  3b-i. Every identifier-type read outside `check_scopes` goes through the store's `declTyOf`,
+     `identTyOf` and `placeNameTy`, which answer a live row's type before the layer's
+     (`layerTyOf`). Done; equal to the layer by 3a's probe.
+  3b-ii. The narrowing writers stop writing a layer. The 7 writers
      stop writing a layer, and the join's snapshot covers both kinds of place. This is where
      a read costs `npSlotOf`'s scan, so it needs a per-declaration index first. The
      scaling-shape gate is the check.
