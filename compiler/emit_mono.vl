@@ -29,7 +29,6 @@ import {
   nodeTyName,
   nodeTyNestedElemIsBoolPrim,
   nodeTyRecord,
-  nodeTyWidenedRepTy,
   tyIsUnionish,
 } from "./check_node_tys"
 import { nodePos, trimWs } from "./fmt_util"
@@ -59,12 +58,7 @@ import {
   recordClonedNodeTy,
   tpIfJoinPinName,
 } from "./check_emit_queries"
-import {
-  bindOf,
-  fusedMapReadRecvIx,
-  i32TyIx,
-  tyIsGradualUnion,
-} from "./check_leaf_steps"
+import { bindOf, i32TyIx, tyIsGradualUnion } from "./check_leaf_steps"
 import { canonEmitName } from "./check_program"
 import { topFnOwnerOf, tyIsForeignGenericSig } from "./check_subst"
 import {
@@ -116,7 +110,7 @@ import { litTyOfExpr } from "./check_match_desugar"
 import { memberRungOnTy } from "./check_builtin_methods"
 import { numUnionResultTy } from "./check_num_adopt"
 import { substNullFoldOffFor, substNullFoldRestore } from "./check_subst_fold"
-import { uniqueGenericDeclNamed } from "./check_generic_args"
+
 import {
   T,
   TY_BOOL,
@@ -580,7 +574,6 @@ import {
   exactSubAt,
   holeNulStringPinTyOf,
   instanceBindsNothingClosed,
-  mapTyScalarBoxKind,
   monoExactSubRowOf,
   nodeTyInOf,
   pinSubAt,
@@ -3214,29 +3207,6 @@ function monoStoredMapAnn(init: i32, bN: string[], bT: i32[]): i32 {
   synthTypeRefTy(nm, -1, sj)
 }
 
-// The annotation an un-annotated binding of a map read `m[k]` / `m.get(k)` takes at this pin
-// when the pin makes the map's value a scalar: its `V | null` there, the box a miss is the null
-// of, as the annotated spelling has it; the bare read is the unboxed value (D10292).
-function monoMapReadNulAnn(init: i32, bN: string[], bT: i32[]): i32 {
-  if init < 0 || bN.length == 0 { return -1 }
-  const u = unwrapParen(init)
-  if u < 0 || u >= P.nodes.length { return -1 }
-  const recv = fusedMapReadRecvIx(u)
-  if recv < 0 { return -1 }
-  const rt = nodeTyIxOf(unwrapParen(recv))
-  if rt < 0 || rt >= T.tys.length || !tyHasTyVar(rt) { return -1 }
-  const srt = monoSubstInst(rt, bN, bT)
-  if mapTyScalarBoxKind(srt) < 0 { return -1 }
-  const t = nodeTyIxOf(u)
-  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyNullable) { return -1 }
-  const st = monoSubstInst(t, bN, bT)
-  if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
-  if !(tyAt(st) is TyNullable) { return -1 }
-  const nm = monoPinAnnSpelling(st)
-  if nm == "" { return -1 }
-  synthTypeRefTy(nm, -1, st)
-}
-
 // The innermost element of list type `ty` beside how many lists wrap it: `[ty, 0]` for a type
 // that is not a list, and a leaf of -1 when a list's element is still open.
 function monoListLeaf(ty: i32): i32[] {
@@ -3256,129 +3226,6 @@ function monoListLeaf(ty: i32): i32[] {
   }
   if t < 0 || t >= T.tys.length { return [-1, 0] }
   [t, d]
-}
-
-// The instance's closure-pinned parameters, name beside concrete type. Module state around
-// the `monoCloneBody` call, like `monoInstIsFirst`: the shared body carries the checker's
-// inference hole for such a parameter, so only the frame being cloned names the closure.
-let monoCloPinNames: string[] = []
-let monoCloPinTys: i32[] = []
-
-// The concrete function type expression `ix` names by reading a closure-pinned parameter,
-// or -1. Matched on the parameter's name, like the inferred-return-list rung beside it,
-// with the shadow guard that name matching needs.
-function monoCloPinTyOfExpr(ix: i32): i32 {
-  if ix < 0 { return -1 }
-  const rd = unwrapParen(ix)
-  if rd < 0 || rd >= P.nodes.length { return -1 }
-  const e = nodeAt(rd)
-  if e is Ident {
-    // A read the checker typed is not this parameter: a body-local binding shadowing the
-    // name resolves to its own concrete type, and only the un-annotated parameter is left
-    // the inference hole. Without this test the name match reached a shadow and annotated
-    // an i32 list as a closure one — check-clean invalid wasm.
-    const rt = nodeTyIxOf(rd)
-    if rt >= 0 {
-      const rtt = tyAt(rt)
-      if !(rtt is TyVar) { return -1 }
-    }
-    let i = 0
-    while i < monoCloPinNames.length {
-      if monoCloPinNames[i] == e.identName { return monoCloPinTys[i] }
-      i = i + 1
-    }
-  }
-  -1
-}
-
-// One field's type for the shape annotation below: the pinned closure where the value reads
-// one, else the type the checker recorded. -1 declines the whole annotation, since a shape
-// missing one field's type is not a shape.
-function monoCloPinFieldTy(ix: i32): i32 {
-  const pt = monoCloPinTyOfExpr(ix)
-  if pt >= 0 { return pt }
-  // A literal-typed value widens to its base scalar, the rep the field stores: an annotation
-  // naming the literal itself is a type the field's own value does not lower as.
-  const wt = nodeTyWidenedRepTy(ix)
-  if wt >= 0 { return wt }
-  nodeTyIxOf(ix)
-}
-
-// The initializer node a container rung may read, or -1: this instance must bind a pin at
-// all, and the node must be in range. The shared entry of the two rungs below.
-function monoCloPinInitNode(initIx: i32): i32 {
-  if initIx < 0 { return -1 }
-  if monoCloPinNames.length == 0 { return -1 }
-  const rd = unwrapParen(initIx)
-  if rd < 0 || rd >= P.nodes.length { return -1 }
-  rd
-}
-
-// The array annotation an un-annotated LIST literal over closure-pinned parameters owes:
-// `[a]` becomes `((i32) => i32)[]`. Without it the element types i32 and the list's read is
-// not a callable. -1 when any element does not pin, since one literal is one row (D1664).
-function monoCloPinListAnn(initIx: i32): i32 {
-  const rd = monoCloPinInitNode(initIx)
-  if rd < 0 { return -1 }
-  const e = nodeAt(rd)
-  if e is ArrayLit {
-    if e.arrElems.length < 1 { return -1 }
-    let ety = -1
-    let i = 0
-    while i < e.arrElems.length {
-      const et = monoCloPinTyOfExpr(e.arrElems[i])
-      if et < 0 { return -1 }
-      if ety < 0 { ety = et }
-      else if ety != et { return -1 }
-      i = i + 1
-    }
-    const en = tyToEmitName(ety)
-    if en == "" { return -1 }
-    return synthTypeRefTy("(" + en + ")[]", 0 - 1, mkArrayTy(ety))
-  }
-  -1
-}
-
-// Its object-literal twin, a rung of its own because the annotation is built from a
-// different grammar — a field list, each field spelled in turn, not one element type. At
-// least one field must pin, or an unrelated literal gains an annotation it never had.
-function monoCloPinShapeAnn(initIx: i32): i32 {
-  const rd = monoCloPinInitNode(initIx)
-  if rd < 0 { return -1 }
-  const e = nodeAt(rd)
-  if e is ObjLit {
-    if e.objFields.length < 1 { return -1 }
-    let anyPin = false
-    let txt = "{"
-    const fns: string[] = []
-    const fts: i32[] = []
-    let j = 0
-    while j < e.objFields.length {
-      const f = nodeAt(e.objFields[j])
-      if f is FieldInit {
-        if monoCloPinTyOfExpr(f.fiValue) >= 0 { anyPin = true }
-        const fty = monoCloPinFieldTy(f.fiValue)
-        if fty < 0 { return -1 }
-        const ftn = tyToEmitName(fty)
-        if ftn == "" { return -1 }
-        if j > 0 { txt = txt + "," }
-        txt = txt + f.fiName + ":" + ftn
-        fns.push(f.fiName)
-        fts.push(fty)
-      } else {
-        return -1
-      }
-      j = j + 1
-    }
-    if !anyPin { return -1 }
-    // The shape's type is handed over with its spelling, so its closure fields keep their
-    // signatures rather than resolving through a parse of the text. The type is minted
-    // here, so it may share the row of a rep-equal shape interned first.
-    const sty = mkObjTy(fns, fts)
-    structTyMarkAliasable(sty)
-    return synthTypeRefTy(txt + "}", 0 - 1, sty)
-  }
-  -1
 }
 
 // The links of the `else if` chain headed by the `if` at `ix`, outermost first. A rewriter
@@ -4525,61 +4372,6 @@ function monoHoleIterLitCopy(iterIx: i32): i32 {
   iterIx
 }
 
-// An un-annotated binding of `Map<K, V>()` / `Set<T>()` whose type arguments name a type
-// parameter: the constructor's arguments become the binding's annotation, substituted for
-// this instance exactly as a written `{[K]: V}` would be. -1 when there is nothing to pin.
-function monoCollCtorAnn(
-  initIx: i32,
-  typarams: string[],
-  tvN: string[],
-  tvV: string[],
-): i32 {
-  if initIx < 0 { return -1 }
-  const ix = unwrapParen(initIx)
-  if ix < 0 || ix >= P.nodes.length { return -1 }
-  const c = nodeAt(ix)
-  if c is Call && c.callFn >= 0 {
-    const f = nodeAt(c.callFn)
-    if f is Ident {
-      const tas = callTyArgsOf(ix)
-      let name = ""
-      if f.identName == "Map" && tas.length == 2 {
-        name = "{[" + tyNameOf(tas[0]) + "]:" + tyNameOf(tas[1]) + "}"
-      } else if f.identName == "Set" && tas.length == 1 {
-        name = "{[" + tyNameOf(tas[0]) + "]:boolean}"
-      } else if tas.length > 0 {
-        name = monoTyArgCallRetName(f.identName, tas)
-      }
-      if name == "" { return -1 }
-      if !monoAnnHasTyParam(-1, nodeTyIxOf(ix), typarams) { return -1 }
-      const sub = monoSubstAnn(name, typarams, tvN, tvV)
-      if sub == "" { return -1 }
-      return synthTypeRefTy(sub, c.pos, -1)
-    }
-  }
-  -1
-}
-
-// The declared return spelling of the generic `callee`, its type parameters replaced by the
-// call's written type arguments (`make<T>()` against `(): T[]` is `T[]`), or "".
-function monoTyArgCallRetName(callee: string, tas: i32[]): string {
-  const dIx = uniqueGenericDeclNamed(callee, tas.length)
-  if dIx < 0 { return "" }
-  const d = nodeAt(dIx)
-  if d is FuncDecl {
-    if d.fnRet < 0 { return "" }
-    const argNames: string[] = []
-    let i = 0
-    while i < tas.length {
-      argNames.push(tyNameOf(tas[i]))
-      i = i + 1
-    }
-    const ret = monoDeclAnnName(d.fnRet, tyNameOf(d.fnRet), d.fnTyParams)
-    return monoSubstAnn(ret, d.fnTyParams, d.fnTyParams, argNames)
-  }
-  ""
-}
-
 function monoCloneBodyRaw(
   ix: i32,
   typarams: string[],
@@ -4841,11 +4633,6 @@ function monoCloneLetDecl(
       }
     }
   }
-  // The closure-pin rungs, for the same reason and at the same moment: an un-annotated
-  // container over a pinned parameter has no other source for its element type (D1664).
-  if nt < 0 { nt = monoCollCtorAnn(n.letInit, typarams, tvN, tvV) }
-  if nt < 0 { nt = monoCloPinListAnn(n.letInit) }
-  if nt < 0 { nt = monoCloPinShapeAnn(n.letInit) }
   if nt < 0 && monoInitListsLitMixed(n.letInit, bN, bT) {
     emitFailAt(
       "emitProgram: a join of lists with a literal-union element and another element has no lowering at this instance",
@@ -4856,7 +4643,6 @@ function monoCloneLetDecl(
   if nt < 0 { nt = monoTpJoinBindAnn(n.letInit, bN, bT) }
   if nt < 0 { nt = monoPushedListAnn(n.letInit, bN, bT) }
   if nt < 0 { nt = monoStoredMapAnn(n.letInit, bN, bT) }
-  if nt < 0 { nt = monoMapReadNulAnn(n.letInit, bN, bT) }
   let ninit = n.letInit
   if nt < 0 {
     nt = monoHoleListLitAnn(n.letInit)
@@ -11152,34 +10938,6 @@ function monoTwoListOf(r: i32): i32 {
   r
 }
 
-// Rebuilds the closure-pinned parameter column this instance binds (`monoCloPinNames` and
-// `monoCloPinTys`), read by the body clone's container rung. Rebuilt per instance, since
-// the pin is what differs between them.
-function monoMakeInstanceCloPins(
-  params: i32[],
-  pinKinds: i32[],
-  pinTys: i32[],
-) {
-  monoCloPinNames = []
-  monoCloPinTys = []
-  let cp = 0
-  while cp < params.length {
-    const cpp = nodeAt(params[cp])
-    if cpp is Param {
-      if cp < pinKinds.length && cp < pinTys.length {
-        if pinKinds[cp] == PIN_SIGKEY && pinTys[cp] >= 0 {
-          const cpt = tyAt(pinTys[cp])
-          if cpt is TyFunc {
-            monoCloPinNames.push(cpp.parName)
-            monoCloPinTys.push(pinTys[cp])
-          }
-        }
-      }
-    }
-    cp = cp + 1
-  }
-}
-
 // Records a new instance under `key` in the registry, with the side tables keyed by its
 // slot `instFe`: the two-list result type and the exact, pin and hole binding rows.
 function monoMakeInstanceRegister(
@@ -11786,7 +11544,6 @@ function monoMakeInstanceGo(
     if !first {
       instName = monoMakeInstanceLaterName(fn, origFe, count, slotFree)
     }
-    monoMakeInstanceCloPins(params, pinKinds, pinTys)
     // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
     // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
     // no such annotation.
