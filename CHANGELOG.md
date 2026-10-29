@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **A loop variable's loop has one finder, keyed by declaration (D14543 closed).** `frameElemLoopAtRead`, which asked the frame's loop plan by read node and missed a read a mono instance shares with its template, is deleted; `frameElemLoopOfRead` asks the plan by the read's declaration and walks the body only where the plan has no row. No output or module differs over 17,265 files.
 - **An inferred `Map()` reaches every value rep: string, f64 and struct values run (#1359, #4466, #4770).**
 - **Union registries are keyed by type: registry-by-key step 5 landed (#3635, #3639, #4264, #4268); D1492 is closed.**
 - **The parameter write-effect channel settles a call cycle once per strongly connected component, and is linear.** A path a cycle member passes on extended (`p.next`) widens to that extension, so the summary is sound and does not depend on order: master's `{v}` missed `o.next.v`, though the program was already refused at check by the shapes channel, so no row is filed. The new scaling axis "parameter call cycle under a narrowed path" goes from 32.1× to 1.04×. No outcome moves in any population. `weCut`, `weCache` and `weCycleOpaque` are deleted; compiler +71 lines.
