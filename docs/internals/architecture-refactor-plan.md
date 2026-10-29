@@ -243,6 +243,31 @@ These have no unmet prerequisite and touch disjoint files:
 - **B1**: continues in lane SC; steps 1 to 3 are done, and step 4's two container gates (the list pin's and the record-field pin's) are retired (L1 log, 2026-10-19). What is left of step 4 is the open rows its retirements filed.
 - **T3, first port — done**: `check-filed-witnesses.vl` prints the Python's report byte for byte on both inventories and now runs the `filed witnesses` gate row; the Python is deleted and its test pins the report. It found D4290 (a compiler trap) and one new `dogfood:` row (`runProgram` waits). Next: `regress.py` + `gradecensus.py`.
 
+- **B2, the rest (step 6): an identifier narrowing as a zero-length path.** Census on
+  2026-10-29, after #5124 and #5125 removed the bank's type column. Today an identifier
+  narrowing writes a scope layer (`declareSlot`, 7 sites: `check_narrow_flow.vl` 894, 2245,
+  4093; `check_node_rules.vl` 1603, 1620; `check_operators.vl` `declareAt`, 2 calls;
+  `check_capture_widen.vl` 181) and a bank row (`noteNarShadow`, the same sites), and
+  `check_elab_cap.vl` 223 restores layers from a snapshot. About 26 references walk the
+  layers (`slotLayerTop`/`slotLayerPrev`, `crIsNarrowLayer`, `scopeVisibleSnapshot`), and
+  about ten functions read the bank rows. The place store a path narrowing writes is read in 42
+  functions; seven of them walk every row (`noteCallInvalidations`, `elemEverySlotOf`,
+  `retireNarrowingsForWrite`, `retireIndexedNarrowings`, `retireAliasedNarrowings`,
+  `crLoopPathPreRetire`, and `crNoteRhsRetired`, which matches one path), and the rest
+  index a slot `npSlotOf` or a mark already found. So
+  the staging is:
+  1. Each scan that walks every row skips a place that is not a path. No behaviour change.
+  2. Each narrowing site pushes an identifier-place row beside its bank row, with the
+     bank's kind and epoch as columns. The bank's readers move onto those rows one function
+     at a time, `crCallCandidates`' stamp cache last. Then the bank is deleted.
+  3. Identifier reads take a narrowed type from the row rather than the layer. The 7 writers
+     stop writing a layer, and the join's snapshot covers both kinds of place. This is where
+     a read costs `npSlotOf`'s scan, so it needs a per-declaration index first. The
+     scaling-shape gate is the check.
+
+  Each stage lands only with 0 differences over the 17,265-file comparison and with scaling
+  shape green.
+
 ## Lane logs
 
 One bullet per step or PR, oldest first. Append at the end of a lane's log; do not edit earlier bullets.
