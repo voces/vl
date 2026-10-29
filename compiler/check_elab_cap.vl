@@ -2,6 +2,7 @@
 // node's type at the instance, and each call's closed bindings. Recording is live only at the
 // elaboration's own quiet depth, so a probe nested inside the body records nothing.
 
+import { mkArrayTy } from "././check_types"
 import { declTyOf } from "./check_nar_store"
 import {
   Call,
@@ -588,6 +589,50 @@ export function elabSlotJoinTy(recv: i32, t: i32): i32 {
   fresh
 }
 
+// The type an un-annotated list binding `bd` with inferred `t` gives its reads: `t` whose element
+// set also holds every function the binding's own scope writes into its slots, as the literal's
+// elements join (D14645). `t` when nothing widens it or an earlier check vetoed the widening.
+export function elabFnListLetTy(bd: i32, t: i32): i32 {
+  if bd < 0 || t < 0 || t >= T.tys.length || i32ListHas(fnLetVeto, bd) {
+    return t
+  }
+  const ta = T.tys[t]
+  if !(ta is TyArray) { return t }
+  const e = ta.aElem
+  if e < 0 || e >= T.tys.length { return t }
+  const tf = T.tys[e]
+  if !(tf is TyFunc) { return t }
+  const s = elabFnSetTy[e] ?? -1
+  if s < 0 { return t }
+  const w = fnSlotSetOf(bd)
+  if w < 0 || w == s || fnSetHasGeneric(s) || fnSetHasGeneric(w) { return t }
+  const u = fnSetIntern(fnSetUnion(s, w))
+  if u == s { return t }
+  const key = "list" + i32ToStr(bd) + "," + i32ToStr(t)
+  const memo = fnJoinMemo[key] ?? -1
+  if memo >= 0 && memo < T.tys.length { return memo }
+  const ps: i32[] = []
+  for p in tf.fnParamTypes { ps.push(p) }
+  const g: Ty = { fnParamTypes: ps, fnRet: tf.fnRet }
+  T.tys.push(g)
+  const fresh = T.tys.length - 1
+  elabFnSetTy[fresh] = u
+  if !fnTagEtaRan {
+    fnSlotWide.push(fresh)
+    fnSlotWideAt.push(bd)
+  }
+  fnListWidened.push(bd)
+  const lt = mkArrayTy(fresh)
+  fnJoinMemo[key] = lt
+  lt
+}
+
+// Whether the list binding `bd` gives its reads a set widened with what its scope writes, and no
+// check vetoed that widening; a call through its element then fixes its own member's tuple.
+export function elabFnListWidened(bd: i32): boolean {
+  i32ListHas(fnListWidened, bd) && !i32ListHas(fnLetVeto, bd)
+}
+
 // The set of every function the `let` node `bd` writes into its slots; -1 when one is not a
 // function or there is none.
 function fnSlotSetOf(bd: i32): i32 {
@@ -786,6 +831,8 @@ let fnTagEtaRan = false
 let fnLetWide: i32[] = []
 let fnLetWideAt: i32[] = []
 let fnSlotWide: i32[] = []
+// The list bindings `elabFnListLetTy` widened in this check.
+let fnListWidened: i32[] = []
 let fnSlotWideAt: i32[] = []
 let fnLetVeto: i32[] = []
 
@@ -809,6 +856,7 @@ export function fnTyFactsReset() {
   fnLetWideAt = []
   fnSlotWide = []
   fnSlotWideAt = []
+  fnListWidened = []
   0
 }
 
@@ -822,6 +870,7 @@ export function fnTagEtaReset() {
   fnLetWideAt = []
   fnSlotWide = []
   fnSlotWideAt = []
+  fnListWidened = []
   fnLetVeto = []
 }
 
