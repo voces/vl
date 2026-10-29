@@ -88,6 +88,7 @@ import { adoptRetLits } from "./check_inferred_return"
 import {
   assignable,
   bindGenWalk,
+  holeFnArgDecl,
   joinTys,
   substTyDeep,
   widenLitTy,
@@ -1309,6 +1310,102 @@ export function elabRun() {
     }
   }
   elabSettle(0)
+  // A row a function argument's result leaves open closes at that function's instance.
+  r = 0
+  while r < n {
+    const ix = callBindIxAt(r)
+    const tys = elabSetArgBind(ix, callBindNamesAt(r), callBindTysAt(r))
+    if !tysClosed(tys) {
+      const ct = elabRowByFnResults(ix, callBindNamesAt(r), tys)
+      if ct.length > 0 {
+        elabReachNote(
+          -1,
+          elabEnqueue(elabCallDeclOf(ix), callBindNamesAt(r), ct, -1),
+          ix,
+        )
+        elabSettle(0)
+      }
+    }
+    r = r + 1
+  }
+}
+
+// Row `names`/`tys` of call `ix` with each name a function-typed parameter's result binds taken
+// from the result of every function its argument may hold, instanced at that parameter's closed
+// types, when they all agree; [] when the row stays open.
+function elabRowByFnResults(ix: i32, names: string[], tys: i32[]): i32[] {
+  if ix < 0 || ix >= P.nodes.length { return [] }
+  const cn = nodeAt(ix)
+  const d = elabCallDeclOf(ix)
+  if !(cn is Call) || d < 0 || d >= P.nodes.length { return [] }
+  const sig = nodeTyIxOf(d)
+  if sig < 0 || sig >= T.tys.length { return [] }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || f.fnParamTypes.length != cn.callArgs.length { return [] }
+  const out = tys.slice(0, tys.length)
+  let i = 0
+  while i < cn.callArgs.length {
+    const pt = f.fnParamTypes[i]
+    const pf = if pt >= 0 && pt < T.tys.length { tyAt(pt) } else { tyAt(sig) }
+    if pt >= 0 && pt < T.tys.length && pf is TyFunc {
+      const r = elabArgResultAt(cn.callArgs[i], pf, names, out)
+      if r >= 0 {
+        const rn: string[] = []
+        const rt: i32[] = []
+        bindGenWalk(pf.fnRet, r, rn, rt)
+        let j = 0
+        while j < rn.length {
+          let q = 0
+          while q < names.length && q < out.length {
+            if names[q] == rn[j] && !elabTyClosed(out[q], 0) { out[q] = rt[j] }
+            q = q + 1
+          }
+          j = j + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  if tysClosed(out) { out } else { [] }
+}
+
+// The one result every function argument `a` may hold gives at function type `pf`'s parameters
+// under `names`/`tys`, each instanced there; -1 when they are not closed or disagree.
+function elabArgResultAt(a: i32, pf: TyFunc, names: string[], tys: i32[]): i32 {
+  const pts: i32[] = []
+  for p in pf.fnParamTypes {
+    const st = substTyDeep(p, names, tys)
+    if st < 0 || !elabTyClosed(st, 0) { return -1 }
+    pts.push(st)
+  }
+  const ms = elabCalleeTargets(a)
+  const hd = holeFnArgDecl(a)
+  if hd >= 0 && !i32ListHas(ms, hd) { ms.push(hd) }
+  if ms.length == 0 { return -1 }
+  let out = -1
+  for m in ms {
+    const sig = if m >= 0 && m < P.nodes.length { nodeTyIxOf(m) } else { -1 }
+    if sig < 0 || sig >= T.tys.length { return -1 }
+    const sf = tyAt(sig)
+    if !(sf is TyFunc) || sf.fnParamTypes.length != pts.length { return -1 }
+    const mn: string[] = []
+    const mt: i32[] = []
+    let i = 0
+    while i < pts.length {
+      bindGenWalk(sf.fnParamTypes[i], pts[i], mn, mt)
+      i = i + 1
+    }
+    const n0 = ekDecl.length
+    const k = elabEnqueue(m, mn, mt, -1)
+    elabReachNote(-1, k, -1)
+    elabSettle(n0)
+    const r = if k >= 0 { elabResultOf(k) } else { -1 }
+    if r < 0 || !elabTyClosed(r, 0) || (out >= 0 && !tySame(out, r)) {
+      return -1
+    }
+    out = r
+  }
+  widenLitTy(out)
 }
 
 // Binding `tys` of call `ix` with each un-annotated parameter handed a tagged set bound to the set
