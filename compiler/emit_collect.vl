@@ -157,7 +157,6 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
-  arenaEpochNow,
   arithRegionSeen,
   callHasTyArgs,
   elseIfLink,
@@ -197,7 +196,6 @@ import {
   normTypeAtom,
   nulLitUnionInnerNameOfTy,
   nullablePartOf,
-  objFieldVal,
   retBoolFlag,
   retVoidAnnFlag,
   setShapeOfTy,
@@ -6960,7 +6958,7 @@ let pinCtorBody = -1
 export function collectRegistersReset() {
   pinCtorRet = -1
   pinCtorBody = -1
-  anonKindIxClear()
+  0
 }
 
 // How many record literals under `ix` carry the field-name signature `sig`.
@@ -7215,11 +7213,7 @@ let anonShapesNodeLen = 0
 // `anonFieldCode` cannot type leaves the shape un-interned, so that literal fails loudly later.
 function collectAnonShapes() {
   anonShapesNodeLen = P.nodes.length
-  // `nestOwner`: for every object literal that is another literal's field value, the owning
-  // literal's node index; built only when the program declares a union variant.
-  const nestOwner: i32[] = []
   if uVariants.length > 0 {
-    while nestOwner.length < P.nodes.length { nestOwner.push(0 - 1) }
     let pi = 0
     while pi < P.nodes.length {
       const pn = nodeAt(pi)
@@ -7232,11 +7226,6 @@ function collectAnonShapes() {
             // the row a DECLARED `f: P` field stores through, read off the annotation, and an
             // inferred holder has none — so the field took no code and the literal no row (D1672).
             internArmShapeRow(repVariantShapeRowOf(nodeTyIxOf(pf.fiValue)))
-            const pv = unwrapParen(pf.fiValue)
-            if pv >= 0 && pv < nestOwner.length {
-              const pvn = nodeAt(pv)
-              if pvn is ObjLit { nestOwner[pv] = pi }
-            }
           }
           pk = pk + 1
         }
@@ -7244,9 +7233,6 @@ function collectAnonShapes() {
       pi = pi + 1
     }
   }
-  // D391 — `anonNestPolyPremint` mints the polymorphic nested rows first, before any owner
-  // row exists, so the owner scan below can tell the owners apart.
-  anonNestPolyPremint(nestOwner)
   // A holder whose empty-list field a later push pinned to a record keys that field by the
   // record's row, so it mints after every other literal has minted its row (D2640).
   const late: i32[] = []
@@ -7257,7 +7243,7 @@ function collectAnonShapes() {
       if anonHolderAwaitsElemRow(ai, 0, false) {
         late.push(ai)
       } else {
-        anonMintLiteral(ai, nestOwner)
+        anonMintLiteral(ai)
       }
     }
     ai = ai + 1
@@ -7271,24 +7257,24 @@ function collectAnonShapes() {
       if anonHolderAwaitsElemRow(li, 0, true) {
         next.push(li)
       } else {
-        anonMintLiteral(li, nestOwner)
+        anonMintLiteral(li)
       }
     }
     if next.length == pending.length {
-      for li in next { anonMintLiteral(li, nestOwner) }
+      for li in next { anonMintLiteral(li) }
       pending = []
     } else {
       pending = next
     }
   }
-  anonKindIxClear()
+  0
 }
 
 // The main loop's body for the object literal at `ai`: mint its row unless one already serves it.
 // A literal the checker adopted into a record of another type builds at that record's row;
 // once that row exists it mints none of its own, since a row keyed by the destination's type with
 // the literal's layout would be a canon twin of it.
-function anonMintLiteral(ai: i32, nestOwner: i32[]) {
+function anonMintLiteral(ai: i32) {
   // A literal the check never typed is built nowhere: a `__callsite__` object minted for a call
   // that supplied the argument itself.
   if nodeTyIxOf(ai) < 0 { return 0 }
@@ -7303,10 +7289,7 @@ function anonMintLiteral(ai: i32, nestOwner: i32[]) {
     internShapeDeepOfTy(adopted)
     if repRowOfTyStruct(adopted, sNames.length) >= 0 { return 0 }
   }
-  if (
-    structIndexOfObj(ai) < 0
-    && (objVariantName(ai) == "" || anonNestNeedsRow(ai, nestOwner))
-  ) {
+  if (structIndexOfObj(ai) < 0 && objVariantName(ai) == "") {
     anonMintRowFor(ai, 0 - 1)
   }
   0
@@ -7414,18 +7397,10 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
       if f is FieldInit {
         let code = anonFieldCode(f.fiValue)
         if code == FC_MAP && !anonMapFieldDestAdmits(ai, f.fiName) { code = -1 }
-        // D672 — a joined owner's field is a union box, not a nested ref: where two owner literals
-        // disagree at a nested field and something joins them, the code is 16 (`anonNestPolyUnionName` gates it, "" elsewhere).
-        const boxU = anonNestPolyUnionName(ai, f.fiName, unwrapParen(f.fiValue))
-        if boxU != "" { code = FC_UNION }
         if code < 0 { ok = false }
         codes.push(code)
         names.push(f.fiName)
-        if boxU != "" {
-          elemNames.push(boxU)
-        } else {
-          elemNames.push(anonFieldElemName(f.fiValue, code))
-        }
+        elemNames.push(anonFieldElemName(f.fiValue, code))
         elemKeys.push(anonFieldElemKeyKind(f.fiValue, code))
       } else {
         ok = false
@@ -7485,228 +7460,6 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
     }
   }
   0
-}
-
-// D391 — mints the nested rows of a polymorphic owner field set first, breaking a circularity:
-// `anonValueFitsField` can only refute two same-fieldset literals' mismatched code-15 targets
-// once both target names are known, so an unminted second nested literal matches the first
-// owner's row by default and one owner builds a box typed as the other's row.
-function anonNestPolyPremint(nestOwner: i32[]) {
-  let xi = 0
-  while xi < P.nodes.length {
-    const xn = nodeAt(xi)
-    if xn is ObjLit {
-      // Only an arm-claimed nested literal (one the main loop would skip), and only where the
-      // owner is a would-be anonymous row a sibling would otherwise absorb it into.
-      if structIndexOfObj(xi) < 0 && objVariantName(xi) != "" {
-        const ow = anonNestOwnerOf(xi, nestOwner)
-        if ow >= 0 && structIndexOfObj(ow) < 0 && objVariantName(ow) == "" {
-          const fname = anonNestFieldNameOf(ow, xi)
-          // The trigger: a sibling owner shares the field-name set and disagrees about the nested
-          // layout — except where the owners are joined into a box (D672), which must mint no row here.
-          if (
-            fname != ""
-            && !anonNestFieldMono(ow, fname, xi)
-            && anonNestPolyUnionName(ow, fname, xi) == ""
-          ) {
-            anonMintRowFor(xi, 0 - 1)
-          }
-        }
-      }
-    }
-    xi = xi + 1
-  }
-  0
-}
-
-// D672 — the declared union an owner field's polymorphic nested values are arms of, or "" when
-// this literal is not that shape; when it answers, the owner's field is coded 16 over that
-// union. Without a declaration each owner gets its own monomorphic row and the `??` default
-// targets the other arm's row, so this mints the row a declaration would have.
-function anonNestPolyUnionName(ow: i32, fname: string, inner: i32): string {
-  if inner < 0 { return "" }
-  const iv = nodeAt(inner)
-  if !(iv is ObjLit) { return "" }
-  if structIndexOfObj(inner) >= 0 { return "" }
-  const armNm = objVariantName(inner)
-  if armNm == "" { return "" }
-  if anonNestFieldMono(ow, fname, inner) { return "" }
-  if !anonPolyOwnersJoined(ow, fname, inner) { return "" }
-  const vi = variantIndexOf(armNm)
-  if vi < 0 { return "" }
-  let ui = 0
-  while ui < unNames.length {
-    if vi >= unVarStart[ui] && vi < unVarStart[ui] + unVarCount[ui] {
-      return unNames[ui]
-    }
-    ui = ui + 1
-  }
-  ""
-}
-
-// D672 — are the two owners joined into one value? True when this owner, or a disagreeing
-// same-field-set sibling, is the default of a `??`. Two owners merely both present (D391's
-// shape) are not joined and keep two rows — the gate is on the join, not the disagreement,
-// which both shapes have. Deliberately just `??`: a general join would claim rows not this one's.
-function anonPolyOwnersJoined(ow: i32, fname: string, inner: i32): boolean {
-  anonKindIxSync()
-  let qk = 0
-  while qk < anonKindCoalesce.length {
-    const qn = nodeAt(anonKindCoalesce[qk])
-    if qn is BinExpr {
-      if qn.binOp == "??" {
-        const d = unwrapParen(qn.binRight)
-        if d == ow { return true }
-        if d >= 0 {
-          const dn = nodeAt(d)
-          if dn is ObjLit {
-            if anonObjFieldSetEq(d, ow) {
-              const dv = unwrapParen(objFieldVal(d, fname))
-              if dv >= 0 {
-                const dvn = nodeAt(dv)
-                if dvn is ObjLit {
-                  if !anonObjFieldSetEq(dv, inner) { return true }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    qk = qk + 1
-  }
-  false
-}
-
-// The literal that owns `objIx` as one of its field values, read out of the owner map
-// `nestOwner` built by `collectAnonShapes` — or -1 when the literal is not nested in
-// another one. Split out so the gate below reads as one question.
-function anonNestOwnerOf(objIx: i32, nestOwner: i32[]) {
-  if objIx < 0 { return -1 }
-  if objIx >= nestOwner.length { return -1 }
-  nestOwner[objIx]
-}
-
-// Should a literal that `objVariantName` claimed still get an anonymous row? That scan is
-// context-free ("some union arm has this field-name set"), right for a literal the emitter
-// really boxes but wrong for one in a position nothing boxes — the field value of another
-// literal that is itself getting an anonymous row (D179), whose inline shape nothing boxes.
-function anonNestNeedsRow(objIx: i32, nestOwner: i32[]) {
-  const ow = anonNestOwnerOf(objIx, nestOwner)
-  if ow < 0 { return false }
-  if structIndexOfObj(ow) >= 0 { return false }
-  if objVariantName(ow) != "" { return false }
-  const fname = anonNestFieldNameOf(ow, objIx)
-  if fname == "" { return false }
-  anonNestFieldMono(ow, fname, objIx)
-}
-
-// The field NAME under which `inner` sits in `ow`. "" when it does not (which
-// `anonNestOwnerOf` has already ruled out, so the empty answer is a decline, not a case).
-function anonNestFieldNameOf(ow: i32, inner: i32) {
-  const o = nodeAt(ow)
-  if o is ObjLit {
-    let i = 0
-    while i < o.objFields.length {
-      const f = nodeAt(o.objFields[i])
-      if f is FieldInit {
-        if unwrapParen(f.fiValue) == inner { return f.fiName }
-      }
-      i = i + 1
-    }
-  }
-  ""
-}
-
-// Every `ObjLit` and every `??` `BinExpr` in the arena, in arena order: the nodes the
-// per-literal family scans visit, so each asks about those and not the whole arena. A node's
-// kind changes only by a push (the length) or an in-place replacement (the epoch).
-let anonKindObjLits: i32[] = []
-let anonKindCoalesce: i32[] = []
-let akIxLen: i32 = -1
-let akIxEpoch: i32 = -1
-
-function anonKindIxSync() {
-  if P.nodes.length == akIxLen && akIxEpoch == arenaEpochNow() { return 0 }
-  let i = akIxLen
-  if akIxEpoch != arenaEpochNow() || i < 0 || i > P.nodes.length {
-    anonKindObjLits = []
-    anonKindCoalesce = []
-    i = 0
-  }
-  while i < P.nodes.length {
-    const n = nodeAt(i)
-    if n is ObjLit {
-      anonKindObjLits.push(i)
-    } else if n is BinExpr {
-      if n.binOp == "??" { anonKindCoalesce.push(i) }
-    }
-    i = i + 1
-  }
-  akIxLen = P.nodes.length
-  akIxEpoch = arenaEpochNow()
-  0
-}
-
-function anonKindIxClear() {
-  anonKindObjLits = []
-  anonKindCoalesce = []
-  akIxLen = -1
-  akIxEpoch = -1
-  0
-}
-
-// Do two object literals set the same field names? The key `structIndexOfObj` matches a
-// literal to a row on, asked between two literals.
-function anonObjFieldSetEq(aIx: i32, bIx: i32) {
-  const a = nodeAt(aIx)
-  const b = nodeAt(bIx)
-  if a is ObjLit {
-    if b is ObjLit {
-      if a.objFields.length != b.objFields.length { return false }
-      let i = 0
-      while i < a.objFields.length {
-        const f = nodeAt(a.objFields[i])
-        if f is FieldInit {
-          if objFieldVal(bIx, f.fiName) < 0 { return false }
-        } else {
-          return false
-        }
-        i = i + 1
-      }
-      return true
-    }
-  }
-  false
-}
-
-// D391 — would the owner's row be monomorphic at this field, the condition that makes
-// minting the nested row safe? `structIndexOfObj` matches by field-name set, so the moment
-// two literals share it and disagree about the nested layout at `fname`, neither can have its
-// own anonymous row — that disagreement is exactly what the union box exists for.
-function anonNestFieldMono(ow: i32, fname: string, inner: i32) {
-  anonKindIxSync()
-  let qk = 0
-  while qk < anonKindObjLits.length {
-    const qi = anonKindObjLits[qk]
-    if qi != ow {
-      const qn = nodeAt(qi)
-      if qn is ObjLit {
-        if anonObjFieldSetEq(qi, ow) {
-          const qv = unwrapParen(objFieldVal(qi, fname))
-          if qv < 0 { return false }
-          const qvn = nodeAt(qv)
-          if qvn is ObjLit {
-            if !anonObjFieldSetEq(qv, inner) { return false }
-          } else {
-            return false
-          }
-        }
-      }
-    }
-    qk = qk + 1
-  }
-  true
 }
 
 // The type name to record for one generic-alias field: the annotation as canon'd, except
