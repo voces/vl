@@ -1,0 +1,206 @@
+// `check_nar_store.vl` — the narrowing store: one row per narrowing in force, at a path or at an
+// identifier's place, with per-scope frame marks that `popScope` unwinds. A path row carries the
+// narrowed type; an identifier row carries its kind (`NAR_KIND_*`), while the binding's type
+// stays on its scope layer and its storage type on the layer below every narrowing.
+
+import { placeBare, placeDecl, placeText } from "./check_place_ids"
+import { declDepthOf, slotStoreOf } from "./check_scopes"
+import { T } from "./check_types"
+
+export const NAR_KIND_ASG = 0
+export const NAR_KIND_GUARD = 1
+// The post-guard fall-through's shadow, a kind of its own: `if r is JsonError { return }`
+// narrows the rest of the block with no guard row, and the deep-`is` walker needs its storage.
+export const NAR_KIND_POSTGUARD = 2
+// Bodies checked so far, so a narrowing installed before a body that captures it is told apart.
+export let narFnEpoch = 0
+
+// Flow-narrowed property paths: a stack of `key → type-arena index` entries (`"o.v" → i32`)
+// overlaid while a branch body is checked, with per-scope frame marks so `popScope` unwinds what
+// that scope pushed. A bare name's narrowing is a row at the identifier's place, with its kind. `npInvBy` is the
+// invalidation slot, written in place, since a shadowing push would resurrect the narrowing.
+export let npKeys: string[] = []
+export function npKeysPop(): string | null {
+  const top = npPlace.length - 1
+  if top >= 0 && npKind[top] >= 0 {
+    const own = npIdRowsOf[placeDecl(npPlace[top])]
+    if own != null { own.pop() }
+  }
+  npKind.pop()
+  npDepth.pop()
+  npStamp.pop()
+  npPlace.pop()
+  npKeys.pop()
+}
+export function npKeysPush(p: i32) {
+  npPlace.push(p)
+  npKeys.push(placeText(p))
+  npKind.push(-1)
+  npDepth.push(T.frames.length - 1)
+  npStamp.push(npStampNext)
+  npStampNext = npStampNext + 1
+}
+
+// Per slot, the place it narrows: a place is rooted at one binding, so an inner binding of the
+// same name is a different place and hides nothing it should not.
+export let npPlace: i32[] = []
+
+// The innermost slot at or above `base` narrowing place `p`, or -1.
+export function npSlotOf(p: i32, base: i32): i32 {
+  if p < 0 { return -1 }
+  let i = npPlace.length - 1
+  while i >= base {
+    if npPlace[i] == p { return i }
+    i = i - 1
+  }
+  -1
+}
+
+export let npTys: i32[] = []
+export function npTysPop() {
+  npTys.pop()
+  0
+}
+export function npTysPush(v: i32) { npTys.push(v) }
+
+export let npInvBy: i32[] = []
+export function npInvByPop() {
+  npInvBy.pop()
+  0
+}
+export function npInvByPush(v: i32) { npInvBy.push(v) }
+
+export let npEpochs: i32[] = []
+export function npEpochsPop() {
+  npEpochs.pop()
+  0
+}
+export function npEpochsPush(v: i32) { npEpochs.push(v) }
+
+// Where the emitter retires a slot a CALL invalidated: the statement it retires after, -1 before
+// the loop holding the call, -2 not at all, which keeps every later read refused (D2405).
+export let npSettle: i32[] = []
+export function npSettlePop() {
+  npSettle.pop()
+  0
+}
+export function npSettlePush(v: i32) { npSettle.push(v) }
+export function npSettleSetAt(k: i32, v: i32) { npSettle[k] = v }
+
+// The nested function that first read a slot's narrowing, or -1 (D2402).
+export let npCapBy: i32[] = []
+export function npCapByPop() {
+  npCapBy.pop()
+  0
+}
+export function npCapByPush(v: i32) { npCapBy.push(v) }
+export function npCapBySetAt(k: i32, v: i32) { npCapBy[k] = v }
+
+// 1 when the slot is an assignment's strip of `null` (D1848) rather than a guard's: a nested
+// function reads the place at its declared type, and a write after one is checked against it.
+export let npAsg: i32[] = []
+export function npAsgPop() {
+  npAsg.pop()
+  0
+}
+export function npAsgPush(v: i32) { npAsg.push(v) }
+
+export let npFrames: i32[] = []
+export function npFramesPop() {
+  npFrames.pop()
+  0
+}
+
+// Per row: an identifier row's `NAR_KIND_*`, -1 for a path; the scope depth of its push;
+// and its push number, ascending along the store and never reused, so a reader can tell which
+// prefix of the store is the one it last saw.
+export let npKind: i32[] = []
+export let npDepth: i32[] = []
+export let npStamp: i32[] = []
+let npStampNext = 1
+// Each binding's identifier rows, in store order.
+let npIdRowsOf: {[i32]: i32[]} = Map()
+const npNoRows: i32[] = []
+
+// The identifier rows of slot `s`, oldest first; the caller must not change the list.
+export function narBankRowsOf(s: i32): i32[] { npIdRowsOf[s] ?? npNoRows }
+
+// The binding row `i` narrows.
+export function narRowSlot(i: i32): i32 { placeDecl(npPlace[i]) }
+
+// The storage type of row `i`'s binding, or -1 when nothing binds it.
+export function narRowTy(i: i32): i32 { slotStoreOf(narRowSlot(i)) }
+
+// The first identifier row, or the store's length when there is none.
+export function narFirstIdRow(): i32 {
+  let i = 0
+  while i < npKind.length && npKind[i] < 0 { i = i + 1 }
+  i
+}
+
+// The declared type of narrowed slot `s`, or -1 when no live row of a matching kind still
+// shadows it. `kind` is a `NAR_KIND_*`, or -1 for any. A row of the wrong kind is skipped
+// rather than stopping the walk, so a guard narrowing over an assignment narrowing does not
+// hide it from the assignment-kind question.
+export function narDeclaredTy(s: i32, kind: i32) {
+  const d = declDepthOf(s)
+  if d < 0 { return -1 }
+  const rows = narBankRowsOf(s)
+  let k = rows.length - 1
+  while k >= 0 {
+    const i = rows[k]
+    if npDepth[i] == d {
+      if kind < 0 || npKind[i] == kind { return narRowTy(i) }
+    }
+    k = k - 1
+  }
+  -1
+}
+
+// The declared type of an assignment-narrowed slot, or -1.
+export function asgDeclaredTy(s: i32) { narDeclaredTy(s, NAR_KIND_ASG) }
+
+// Records slot `s`'s narrowing of kind `kind` before it shadows the binding, as a row at the
+// identifier's place. Idempotent per (slot, depth, kind).
+export function noteNarShadow(s: i32, kind: i32) {
+  if s == -1 { return 0 }
+  const d = T.frames.length - 1
+  const rows = narBankRowsOf(s)
+  let k = rows.length - 1
+  while k >= 0 {
+    const i = rows[k]
+    if npDepth[i] == d && npKind[i] == kind { return 0 }
+    k = k - 1
+  }
+  npKeysPush(placeBare(s))
+  const top = npKind.length - 1
+  npKind[top] = kind
+  const own = npIdRowsOf[s]
+  if own == null { npIdRowsOf[s] = [top] } else { own.push(top) }
+  npTys.push(-1)
+  npInvBy.push(-1)
+  npEpochs.push(narFnEpoch)
+  npSettle.push(-2)
+  npCapBy.push(-1)
+  npAsg.push(if kind == NAR_KIND_ASG { 1 } else { 0 })
+  0
+}
+
+// Clears the store and the body count, once per program.
+export function narStoreReset() {
+  npKeys = []
+  npPlace = []
+  npTys = []
+  npInvBy = []
+  npEpochs = []
+  npSettle = []
+  npCapBy = []
+  npAsg = []
+  npFrames = []
+  npKind = []
+  npDepth = []
+  npStamp = []
+  npIdRowsOf = Map()
+  narFnEpoch = 0
+  0
+}

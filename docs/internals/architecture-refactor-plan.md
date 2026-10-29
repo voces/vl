@@ -256,10 +256,11 @@ These have no unmet prerequisite and touch disjoint files:
   `crLoopPathPreRetire`, and `crNoteRhsRetired`, which matches one path), and the rest
   index a slot `npSlotOf` or a mark already found. So
   the staging is:
-  1. Each scan that walks every row skips a place that is not a path. No behaviour change.
+  1. Each scan that walks every row skips a place that is not a path. No behaviour change. Done (#5129).
   2. Each narrowing site pushes an identifier-place row beside its bank row, with the
      bank's kind and epoch as columns. The bank's readers move onto those rows one function
-     at a time, `crCallCandidates`' stamp cache last. Then the bank is deleted.
+     at a time, `crCallCandidates`' stamp cache last. Then the bank is deleted. Done: the rows live in `check_nar_store.vl`, below
+     `check_capture_widen.vl` in the module graph, and `check_nar_bank.vl` is gone.
   3. Identifier reads take a narrowed type from the row rather than the layer. The 7 writers
      stop writing a layer, and the join's snapshot covers both kinds of place. This is where
      a read costs `npSlotOf`'s scan, so it needs a per-declaration index first. The
