@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **The capture-widen and capture-loss banks hold declarations, not names.** `crCaptureWiden` and `crRootCaptureWiden` record the binding's slot; `crNoteLostName` asks by the read's slot; `crCapRecNames` (always the slot's own name) and `capWidenOf` (no caller) are deleted, with the path keys only it read. No file builds or diagnoses differently over 17,265 files.
 - **A `let`'s cell kind has one producer for a local and a module global.** `letLocalSlot`'s ladder is deleted: a local takes `letCellKind`, the global's producer, at the slot `letCellSlot` reads for that kind. A probe found the two disagreeing in 1 of 17,265 files, a mapped list in a `string | null` instance, and `letCellKind` gains the `strlist` rung it lacked. No file builds differently.
 - **A loop variable's loop has one finder, keyed by declaration (D14543 closed).** `frameElemLoopAtRead`, which asked the frame's loop plan by read node and missed a read a mono instance shares with its template, is deleted; `frameElemLoopOfRead` asks the plan by the read's declaration and walks the body only where the plan has no row. No output or module differs over 17,265 files.
 - **An inferred `Map()` reaches every value rep: string, f64 and struct values run (#1359, #4466, #4770).**
