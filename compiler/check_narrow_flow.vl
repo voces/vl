@@ -3,7 +3,12 @@
 // back-edge or a capture (`cr*`). Callers in the core checker record and query; nothing here
 // checks an expression.
 
-import { identDepthOf, identFnDeclOf, identStoreTyOf } from "./check_scopes"
+import {
+  declareSlot,
+  identDepthOf,
+  identFnDeclOf,
+  identStoreTyOf,
+} from "./check_scopes"
 import {
   ArrayLit,
   AsExpr,
@@ -312,11 +317,14 @@ import {
   NAR_KIND_POSTGUARD,
   declTyOf,
   identTyOf,
+  narChainDepths,
   narDeclaredTy,
   narFirstIdRow,
   narFnEpoch,
   narLayerNote,
   narRowSlot,
+  narTopDepth,
+  narTyAtDepth,
   noteNarShadow,
   npAsg,
   npAsgPop,
@@ -467,18 +475,12 @@ import {
 import {
   declDepthOf,
   declIsConst,
-  declareSlot,
   identSlotOf,
   moduleNameTyOf,
   scopeDeclLog,
   scopeFramePop,
-  slotLayerDepth,
-  slotLayerPrev,
-  slotLayerTop,
-  slotLayerTy,
   slotNameOf,
   slotNameSoleLayer,
-  slotTyAt,
   slotVisibleOf,
 } from "./check_scopes"
 import {
@@ -694,7 +696,7 @@ export function narIpRedoArm(lo: i32, hi: i32) {
     const was = narIpOld[j]
     if narIpScope[j] {
       const s = narIpSlot[j]
-      const now = slotTyAt(s, at)
+      const now = narTyAtDepth(s, at)
       if now == narIpNew[j] || (now >= 0 && assignable(now, was)) {
         narSetScope(at, s, was)
       }
@@ -888,7 +890,6 @@ function narInstallJoin(ix: i32, p: i32, jt: i32, viaChain: boolean) {
     // Banked like the post-guard fall-through, so a write below is checked against storage
     // and a call that may write the name ends it (D2390).
     noteNarShadow(s, NAR_KIND_POSTGUARD)
-    declareSlot(s, jt)
     narLayerNote(s, T.frames.length - 1, jt)
     narFitCompanions(p, cur, jt)
     recordArmJoin(ix, key, placeDecl(p), jt)
@@ -905,13 +906,10 @@ function narRetireLayers(s: i32, now: i32, store: i32) {
   const base = crFnBase()
   let bar = 0
   if reScopeBases.length > 0 { bar = reScopeBases[reScopeBases.length - 1] }
-  let e = slotLayerTop(s)
-  while e >= 0 {
-    const d = slotLayerDepth(e)
+  for d in narChainDepths(s) {
     if d < base || d < bar || crFirstBank(s, d) < 0 { return 0 }
-    const t = slotLayerTy(e)
+    const t = narTyAtDepth(s, d)
     if t >= 0 && !assignable(now, t) { narSetScope(d, s, store) }
-    e = slotLayerPrev(e)
   }
   0
 }
@@ -2241,7 +2239,7 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       if retires {
         // The RETIREMENT goes back in place, so it outlives whatever inner block holds the
         // write: a narrowing the write falsified must not resurrect at that block's `}`.
-        const d = declDepthOf(s)
+        const d = narTopDepth(s)
         if guarded { narRetireLayers(s, rn, dcl) }
         if d >= 0 { narSetScope(d, s, dcl) }
         // The RE-NARROW — the one member of the declaration the written value can be — is a
@@ -2249,7 +2247,6 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
         // so every read after the write lowers alike (D1736).
         if rn != dcl {
           noteNarShadow(s, NAR_KIND_GUARD)
-          declareSlot(s, rn)
           narLayerNote(s, T.frames.length - 1, rn)
         }
       }
@@ -2675,9 +2672,8 @@ function crRetireShadowed(v: i32, callIx: i32, loopIx: i32) {
   let o = declShadowOf(v)
   let hops = 0
   while o >= 0 && hops < 64 {
-    const e = slotLayerTop(o)
-    if e >= 0 {
-      const td = slotLayerDepth(e)
+    const td = narTopDepth(o)
+    if td >= 0 {
       if td < base { return 0 }
       const ud = crBindDepthOfSlot(up)
       if td < ud && crIsNarrowLayer(o, td) {
@@ -4098,8 +4094,11 @@ export function applyNarrows(places: i32[], tys: i32[]) {
       const s = placeDecl(p)
       const declTy = declTyOf(s)
       if declTy >= 0 && declTy != tys[i] { noteNarShadow(s, NAR_KIND_GUARD) }
-      declareSlot(s, tys[i])
-      narLayerNote(s, T.frames.length - 1, tys[i])
+      // A test that leaves the type unchanged records no narrowing, but its scope still binds
+      // the name, so an enclosing narrowing is not this scope's (`retSiteTypedByAnnot`).
+      if !narLayerNote(s, T.frames.length - 1, tys[i]) {
+        declareSlot(s, tys[i])
+      }
       if declTy >= 0 && declTy != tys[i] { narFitCompanions(p, declTy, tys[i]) }
     }
     i = i + 1
