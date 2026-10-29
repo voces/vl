@@ -360,7 +360,6 @@ export function crNulledWalk(ix: i32) {
   0
 }
 
-// The bare name `ix` assigns (`x = e`), or "".
 // The declaration the plain `=` at `ix` assigns when its target is a bare name, else -1.
 export function crAssignTargetDecl(ix: i32): i32 {
   const n = nodeAt(ix)
@@ -373,17 +372,6 @@ export function crAssignTargetDecl(ix: i32): i32 {
     }
   }
   -1
-}
-
-export function crAssignTarget(ix: i32): string {
-  const n = nodeAt(ix)
-  if n is BinExpr {
-    if n.binOp == "=" {
-      const l = nodeAt(crUnParen(n.binLeft))
-      if l is Ident { return l.identName }
-    }
-  }
-  ""
 }
 
 // Whether expression `ix` is a literal that cannot be `null`, or a `??` defaulting to one, so
@@ -419,30 +407,30 @@ export function crNodeTok(ix: i32): i32 {
 // binding's cell. Never finer than the emitter's `cboxByRef`, since it tells no arm apart.
 export function crCaptureByRef(
   frame: i32,
-  name: string,
+  decl: i32,
   anyWrite: boolean,
 ): boolean {
   if !crByRefMemo.has(frame) { crByRefFrame(frame) }
-  if anyWrite { return (crByRefAnyMemo[frame] ?? crNoByRef)[name] ?? false }
-  (crByRefMemo[frame] ?? crNoByRef)[name] ?? false
+  if anyWrite { return (crByRefAnyMemo[frame] ?? crNoByRef)[decl] ?? false }
+  (crByRefMemo[frame] ?? crNoByRef)[decl] ?? false
 }
 
-const crNoByRef: {[string]: boolean} = Map()
+const crNoByRef: {[i32]: boolean} = Map()
 
-// Every name of `frame` whose capture is by reference, from one walk of the frame.
+// Every binding of `frame` whose capture is by reference, from one walk of the frame.
 function crByRefFrame(frame: i32) {
-  const byRef: {[string]: boolean} = Map()
-  const byRefAny: {[string]: boolean} = Map()
+  const byRef: {[i32]: boolean} = Map()
+  const byRefAny: {[i32]: boolean} = Map()
   crByRefMemo[frame] = byRef
   crByRefAnyMemo[frame] = byRefAny
   crbrOrd = 0
   crbrFnOrd = -1
   crbrFnLoops = []
   crbrArgFloor = -1
-  crbrCapNames = []
+  crbrCapDecls = []
   crbrCapOrds = []
   crbrCapLoops = []
-  crbrAsgNames = []
+  crbrAsgDecls = []
   crbrAsgOrds = []
   crbrAsgLoops = []
   crbrAsgNested = []
@@ -452,12 +440,12 @@ function crByRefFrame(frame: i32) {
   const fd = nodeAt(frame)
   if fd is FuncDecl { body = fd.fnBody }
   crbrWalk(body, 0, crNoLoops)
-  // The first capture of each name, and the loops its captures sit in.
-  const firstCap: {[string]: i32} = Map()
-  const capLoops: {[string]: i32[]} = Map()
+  // The first capture of each binding, and the loops its captures sit in.
+  const firstCap: {[i32]: i32} = Map()
+  const capLoops: {[i32]: i32[]} = Map()
   let c = 0
-  while c < crbrCapNames.length {
-    const nm = crbrCapNames[c]
+  while c < crbrCapDecls.length {
+    const nm = crbrCapDecls[c]
     const f0 = firstCap[nm] ?? -1
     if f0 < 0 || crbrCapOrds[c] < f0 { firstCap[nm] = crbrCapOrds[c] }
     const ls: i32[] = capLoops[nm] ?? []
@@ -466,8 +454,8 @@ function crByRefFrame(frame: i32) {
     c = c + 1
   }
   let a = 0
-  while a < crbrAsgNames.length {
-    const nm = crbrAsgNames[a]
+  while a < crbrAsgDecls.length {
+    const nm = crbrAsgDecls[a]
     const f0 = firstCap[nm] ?? -1
     if f0 >= 0 {
       if (
@@ -495,8 +483,9 @@ function crbrWalk(ix: i32, depth: i32, loops: i32[]) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = nodeAt(ix)
   if n is Ident {
-    if depth > 0 {
-      crbrCapNames.push(n.identName)
+    const cd = identDeclOf(ix)
+    if depth > 0 && cd >= 0 {
+      crbrCapDecls.push(cd)
       crbrCapOrds.push(crbrFnOrd)
       crbrCapLoops.push(crbrFnLoops)
     }
@@ -532,10 +521,10 @@ function crbrWalk(ix: i32, depth: i32, loops: i32[]) {
     cur = elseIfLink(cur)
   }
   crbrArgFloor = savedFloor
-  const tgt = crAssignTarget(ix)
-  if tgt != "" {
+  const tgt = crAssignTargetDecl(ix)
+  if tgt >= 0 {
     crbrOrd = crbrOrd + 1
-    crbrAsgNames.push(tgt)
+    crbrAsgDecls.push(tgt)
     crbrAsgOrds.push(crbrOrd)
     crbrAsgLoops.push(loops)
     crbrAsgNested.push(depth > 0)
@@ -555,7 +544,7 @@ function crAsgRhsNonNull(ix: i32): boolean {
 function crbrNoteLetDecl(ix: i32, loops: i32[]) {
   const n = nodeAt(ix)
   if n is LetDecl {
-    if !crbrDeclLoops.has(n.letName) { crbrDeclLoops[n.letName] = loops }
+    if !crbrDeclLoops.has(ix) { crbrDeclLoops[ix] = loops }
   }
   0
 }
@@ -569,7 +558,7 @@ function crbrNoteLoopDecl(ix: i32, inner: i32[]) {
 function crbrNoteRangeDecl(ix: i32, inner: i32[]) {
   const n = nodeAt(ix)
   if n is ForRange {
-    if !crbrDeclLoops.has(n.frVar) { crbrDeclLoops[n.frVar] = inner }
+    if !crbrDeclLoops.has(ix) { crbrDeclLoops[ix] = inner }
   }
   0
 }
@@ -577,9 +566,11 @@ function crbrNoteRangeDecl(ix: i32, inner: i32[]) {
 function crbrNoteForInDecl(ix: i32, inner: i32[]) {
   const n = nodeAt(ix)
   if n is ForIn {
-    if !crbrDeclLoops.has(n.fiVar) { crbrDeclLoops[n.fiVar] = inner }
-    if n.fiVar2 != "" && !crbrDeclLoops.has(n.fiVar2) {
-      crbrDeclLoops[n.fiVar2] = inner
+    if n.fiDecl1 >= 0 && !crbrDeclLoops.has(n.fiDecl1) {
+      crbrDeclLoops[n.fiDecl1] = inner
+    }
+    if n.fiDecl2 >= 0 && !crbrDeclLoops.has(n.fiDecl2) {
+      crbrDeclLoops[n.fiDecl2] = inner
     }
   }
   0
@@ -607,8 +598,9 @@ function crbrLoopsMeet(a: i32[], b: i32[], decl: i32[]): boolean {
   false
 }
 
-// Per frame, then per name: `crCaptureByRef` for a write that may store `null`, and for any write.
-export let crByRefMemo: {[i32]: {[string]: boolean}} = Map()
+// Per frame, then per declaration: `crCaptureByRef` for a write that may store `null`, and for
+// any write.
+export let crByRefMemo: {[i32]: {[i32]: boolean}} = Map()
 export let crNulledKeys: {[i32]: boolean} = Map()
 export let crNulledSids: {[i32]: boolean} = Map()
 export let crNulledBuilt = false
@@ -618,16 +610,16 @@ let crbrFnOrd = -1
 const crNoLoops: i32[] = []
 let crbrFnLoops: i32[] = []
 let crbrArgFloor = -1
-let crbrCapNames: string[] = []
+let crbrCapDecls: i32[] = []
 let crbrCapOrds: i32[] = []
 let crbrCapLoops: i32[][] = []
-let crbrAsgNames: string[] = []
+let crbrAsgDecls: i32[] = []
 let crbrAsgOrds: i32[] = []
 let crbrAsgLoops: i32[][] = []
 let crbrAsgNested: boolean[] = []
 let crbrAsgNull: boolean[] = []
-export let crByRefAnyMemo: {[i32]: {[string]: boolean}} = Map()
-let crbrDeclLoops: {[string]: i32[]} = Map()
+export let crByRefAnyMemo: {[i32]: {[i32]: boolean}} = Map()
+let crbrDeclLoops: {[i32]: i32[]} = Map()
 
 // One walk of a body, adding to `out` every name used other than as that body's own callee: an
 // identifier in any other position, or any identifier inside a nested function.
