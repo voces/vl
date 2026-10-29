@@ -132,6 +132,7 @@ import { covarWriteThrough } from "./check_covar_write"
 import { cstrCandAny } from "./check_cstr_probe"
 import {
   elabFnIdOf,
+  elabLiveTyOf,
   elabValueRowNote,
   fnTagChoiceAt,
   fnTagEscapeNote,
@@ -1506,6 +1507,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A generic function named at a closed function type (an argument, a store, a field, a
   // return) is built at that type.
   adoptFnNameAt(srcExpr, dstTy)
+  fvaValueRowNote(srcTy, dstTy)
   // The flow hook for the un-annotated-parameter solve. It sits above the `assignable`
   // short-circuit because a hole source always returns there, so this is the only point in the
   // function a hole reaches — and every binding / argument / return / field / element / store
@@ -3083,30 +3085,56 @@ function fvaSameSlots(s: TyFunc, d: TyFunc): boolean {
   true
 }
 
-// Banks the instance of the one generic function a value of type `srcTy` holds at closed function
-// type `dstTy`: its type parameters bound by its signature against the destination's.
+// Banks the instance of each generic function a value of type `srcTy` holds at closed type
+// `dstTy`, through record fields, list elements and a nullable: a function's type parameters are
+// bound by its signature against the destination function type's.
 function fvaValueRowNote(srcTy: i32, dstTy: i32) {
-  const decl = elabFnIdOf(srcTy)
+  fvaValueRowWalk(srcTy, dstTy, 4)
+}
+
+// `fvaValueRowNote` for each value body `body` hands back, at the instance's closed result `ret`.
+export function fvaRetRowsNote(body: i32, ret: i32) {
+  const rv: i32[] = []
+  collectRetValues(body, rv)
+  for v in rv { fvaValueRowNote(elabLiveTyOf(v), ret) }
+  0
+}
+
+function fvaValueRowWalk(srcTy: i32, dstTy: i32, depth: i32) {
+  if depth <= 0 || srcTy < 0 || srcTy >= T.tys.length { return 0 }
   const dt = nonNullTy(dstTy)
-  if decl < 0 || decl >= P.nodes.length || dt < 0 || dt >= T.tys.length {
+  if dt < 0 || dt >= T.tys.length { return 0 }
+  const s = tyAt(srcTy)
+  const d = tyAt(dt)
+  if s is TyObj && d is TyObj {
+    let i = 0
+    while i < s.objFieldNames.length && i < s.objFieldTypes.length {
+      const ft = objFieldType(d, s.objFieldNames[i])
+      if ft >= 0 { fvaValueRowWalk(s.objFieldTypes[i], ft, depth - 1) }
+      i = i + 1
+    }
     return 0
   }
+  if s is TyArray && d is TyArray {
+    return fvaValueRowWalk(s.aElem, d.aElem, depth - 1)
+  }
+  const decl = elabFnIdOf(srcTy)
+  if decl < 0 || decl >= P.nodes.length { return 0 }
   const fn = nodeAt(decl)
-  const d = tyAt(dt)
   const st = nodeTyIxOf(decl)
   if !(fn is FuncDecl) || fn.fnTyParams.length == 0 || !(d is TyFunc) {
     return 0
   }
   if st < 0 || st >= T.tys.length { return 0 }
-  const s = tyAt(st)
-  if !(s is TyFunc) || s.fnParamTypes.length != d.fnParamTypes.length {
+  const sf = tyAt(st)
+  if !(sf is TyFunc) || sf.fnParamTypes.length != d.fnParamTypes.length {
     return 0
   }
   const bn: string[] = []
   const bt: i32[] = []
   let i = 0
-  while i < s.fnParamTypes.length {
-    bindGenWalk(s.fnParamTypes[i], d.fnParamTypes[i], bn, bt)
+  while i < sf.fnParamTypes.length {
+    bindGenWalk(sf.fnParamTypes[i], d.fnParamTypes[i], bn, bt)
     i = i + 1
   }
   const names: string[] = []
