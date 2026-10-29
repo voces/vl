@@ -2,6 +2,7 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
+import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx } from "./check_ty_rep"
 import {
   ArrayLit,
@@ -87,6 +88,7 @@ import { adoptRetLits } from "./check_inferred_return"
 import {
   assignable,
   bindGenWalk,
+  joinTys,
   substTyDeep,
   widenLitTy,
 } from "./check_relate_core"
@@ -116,6 +118,7 @@ import {
   TyVar,
   genAppRowOf,
   mkArrayTy,
+  mkNullableTy,
   mkObjTy,
   structNameOfTy,
   tyAt,
@@ -135,7 +138,7 @@ import {
   monoArgInstFe,
   monoLamCloneTmpl,
 } from "./emit_state"
-import { nonNulTyOf, tyHasTyVar } from "./tyquery"
+import { isNumericPrimTy, nonNulTyOf, tyHasTyVar } from "./tyquery"
 import { identDeclOf, nodeSrc } from "./symbols"
 
 // The instances: declaration, binding names and types, and the canonical key.
@@ -801,24 +804,111 @@ function elabCkUsable(decl: i32, call: i32, from: i32): i32 {
 }
 
 // Whether each closed parameter pin in `pTys` is assignable to instance `ck`'s parameter of
-// signature `sig`, or is that parameter's brand erased: a pin the instance cannot take keeps the
+// signature `sig`, or is that parameter's brand erased, or its numeric literals widened where no
+// other instance of the declaration takes the same pins: a pin the instance cannot take keeps the
 // pin's own instance.
 function elabCkTakesPins(ck: i32, sig: i32, pTys: i32[]): boolean {
   if sig < 0 || sig >= T.tys.length { return false }
   const f = tyAt(sig)
   if !(f is TyFunc) { return false }
+  let widened = false
   let p = 0
   while p < f.fnParamTypes.length && p < pTys.length {
     if elabTyClosed(pTys[p], 0) {
       const bt = substTyDeep(f.fnParamTypes[p], ekNames[ck], ekTys[ck])
-      if bt < 0 { return false }
-      if !assignable(pTys[p], bt) && !tySame(pTys[p], nomErasedTyIx(bt)) {
-        return false
-      }
+      const how = elabPinTakes(pTys[p], bt)
+      if how == 0 { return false }
+      if how == 2 { widened = true }
     }
     p = p + 1
   }
+  !widened || elabSoleTaker(ck, f, pTys)
+}
+
+// How parameter type `bt` takes pin `pin`: 1 assignable or its brand erased, 2 its numeric
+// literals widened, 0 not at all.
+function elabPinTakes(pin: i32, bt: i32): i32 {
+  if bt < 0 { return 0 }
+  if assignable(pin, bt) || tySame(pin, nomErasedTyIx(bt)) { return 1 }
+  if tySame(pin, elabLitBaseTy(bt, 6)) { return 2 }
+  0
+}
+
+// Whether `ck` is the one instance of its declaration, under its parent, whose parameter types
+// (of signature `f`) take the pins `pTys`: a body built at those pins then serves only `ck`.
+function elabSoleTaker(ck: i32, f: TyFunc, pTys: i32[]): boolean {
+  let k = 0
+  while k < ekDecl.length {
+    if k != ck && ekDecl[k] == ekDecl[ck] && ekParent[k] == ekParent[ck] {
+      let takes = true
+      let p = 0
+      while p < f.fnParamTypes.length && p < pTys.length && takes {
+        const bt = substTyDeep(f.fnParamTypes[p], ekNames[k], ekTys[k])
+        if elabTyClosed(pTys[p], 0) && elabPinTakes(pTys[p], bt) == 0 {
+          takes = false
+        }
+        p = p + 1
+      }
+      if takes { return false }
+    }
+    k = k + 1
+  }
   true
+}
+
+// `t` with each numeric literal widened to its base, through unions, nullables and list elements:
+// the type a monomorphizer pin spells such a binding at, which lowers alike (a string literal
+// union does not: it is an atom). `t` itself when nothing widens.
+function elabLitBaseTy(t: i32, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length || depth <= 0 { return t }
+  const lb = litMembersBaseTy(t)
+  if lb != t { return if isNumericPrimTy(lb) { lb } else { t } }
+  const ty = tyAt(t)
+  match ty {
+    TyUnion => {
+      let acc = -1
+      let changed = false
+      for m in ty.uMembers {
+        const w = elabLitBaseTy(m, depth - 1)
+        if w != m { changed = true }
+        acc = if acc < 0 { w } else { joinTys(acc, w) }
+      }
+      return if changed && acc >= 0 { acc } else { t }
+    }
+    TyNullable => {
+      const w = elabLitBaseTy(ty.nInner, depth - 1)
+      return if w != ty.nInner { mkNullableTy(w) } else { t }
+    }
+    TyArray => {
+      const w = elabLitBaseTy(ty.aElem, depth - 1)
+      return if w != ty.aElem { mkArrayTy(w) } else { t }
+    }
+    // A literal widened above; a record, map or function type is pinned as written.
+    TyPrim => {
+      return t
+    }
+    TyErr => {
+      return t
+    }
+    TyObj => {
+      return t
+    }
+    TyFunc => {
+      return t
+    }
+    TyMap => {
+      return t
+    }
+    TyVar => {
+      return t
+    }
+    TyLit => {
+      return t
+    }
+    TyNeg => {
+      return t
+    }
+  }
 }
 
 // The checker's instance call `call` is elaborated at under the instance being walked, when a
