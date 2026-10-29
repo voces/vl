@@ -381,7 +381,6 @@ import {
   globalIndexOf,
   inferredRetKindCore,
   paramNulMap,
-  paramNulVariant,
   paramReadAt,
   popUnionBoxElem,
 } from "./emit_fn_ret_kinds"
@@ -1667,15 +1666,6 @@ export function nulVariantIdxOfLet(letIx: i32, fnIx: i32) {
   -1
 }
 
-// The variant-table index of a captured `Circle | null` cell of `fnIx`, or -1 — the
-// kind-gated reader on the companion-slot index space, beside `capturedStructIndex` and
-// `capturedRefListSlot`. The env field takes its type from this number, so the narrowed
-// read and the field cannot name two different heap types.
-function capturedNulVariantIdx(fnIx: i32, name: string) {
-  if capturedKindOf(fnIx, name) != "nulvariant" { return -1 }
-  capturedCompanionSlot(fnIx, name)
-}
-
 // The non-null twin of `capturedNulVariantIdx`: the variant-table index of a captured
 // `v: Circle` cell, or -1. Same index space and kind gate; without it `exprVariantIndex`'s
 // Ident arm has no capture leg and a captured variant handed to a union parameter is
@@ -1775,37 +1765,9 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
       }
       return popArmElemVariantRow(exprIx, fnIx)
     }
+    // A read: the row of the storage it reads, the type it is narrowed out of, else its own.
     Ident => {
-      // A parameter read typed `Circle | null`.
-      if (paramNulVariant(fnIx, exprIx)) {
-        const pa = nulVariantIndexOf(paramTypeNodeOfRead(fnIx, exprIx))
-        if pa >= 0 { return pa }
-      }
-      // A declared local carries its variant index in the slot's parallel column, put there
-      // by the `declareLocals` ladder — read it back rather than re-deriving from the
-      // annotation, which an inferred binding (`const c = x as? Circle`) does not have.
-      const dsl = declaredSlotOf(exprIx)
-      if dsl >= 0 {
-        if localIsRef[dsl] == "nulvariant" { return localStructIdx[dsl] }
-      }
-      // The capture arm of the twin: a `Circle | null` cell read from an enclosing frame's
-      // env is the same `(ref null $uVarHeap[vi])` niche.
-      const cnv = capturedNulVariantIdx(fnIx, e.identName)
-      if cnv >= 0 { return cnv }
-      // A global: the row its cell is written at (D1672).
-      const gi = globalLetOfRead(fnIx, exprIx)
-      if gi >= 0 {
-        if globalCellKind(gi) != "nulvariant" { return -1 }
-        return globalCellStructIdx(gi)
-      }
-      // The frame's own `let`, and the module frame's, last for the reason the rung above them
-      // is not enough: neither storage class is a global, and the declared-locals table that
-      // would answer speaks only while that frame's body is emitted (D1635). Read in the frame
-      // that OWNS the binding, so a nested initialiser resolves where it is written.
-      const fli = frameLetOf(fnIx, exprIx)
-      if fli >= 0 { return nulVariantIdxOfLetIn(fli, fnIx) }
-      const mli = moduleLocalLetOfRead(emitRootIx, exprIx)
-      if mli >= 0 { return nulVariantIdxOfLetIn(mli, -1) }
+      return nulVariantRowOfRead(exprIx, fnIx)
     }
     // No other expression carries a nullable variant row.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -1813,15 +1775,14 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The nullable-variant row a `LetDecl` binds, read in the frame `ownerIx` that owns it — the
-// annotation, else the initializer. The shared tail of `nulVariantIdxOfExpr`'s three binding
-// rungs, so a global, a frame `let` and a module-frame `let` cannot answer from three ladders.
-function nulVariantIdxOfLetIn(letIx: i32, ownerIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return nulVariantIndexOf(d.letType) }
-    return nulVariantIdxOfExpr(d.letInit, ownerIx)
-  }
+// The variant row of the `(ref null $uVarHeap[vi])` niche the read `ix` reads inside `fnIx`: its
+// storage type's, which is the type it is narrowed out of, else its own type; -1 for none.
+function nulVariantRowOfRead(ix: i32, fnIx: i32): i32 {
+  let st = readNarrowedStoreAt(ix, fnIx)
+  if st < 0 { st = nodeTyAt(ix, fnIx) }
+  if st < 0 || st >= T.tys.length { return -1 }
+  const sty = tyAt(st)
+  if sty is TyNullable { return repVariantShapeRowOf(sty.nInner) }
   -1
 }
 
