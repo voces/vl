@@ -619,19 +619,10 @@ import {
   forInPairIsMapVal,
   forInPairStructIdx,
   forInVarStructIdx,
-  letBindRep,
   letBindRepClaims,
   letBindRepSlot,
-  letIsClosure,
-  letIsMap,
-  letIsNulNone,
-  letIsNulRefArray,
-  letIsNulVariant,
-  letIsRefArray,
-  letIsString,
-  letIsStringArray,
-  letIsStruct,
-  letIsUnion,
+  letBindTy,
+  letCellKind,
   letMapShapeOf,
   letObjLitVariantIdx,
   letRefListSlot,
@@ -700,6 +691,7 @@ import {
   tailIfNullableIsReal,
 } from "./emit_fn_scans"
 import { initJoinsWiderRecord } from "./emit_join_records"
+import { repSlotOfKind } from "./emit_rep_slot"
 import { isScalarBackedListRep, rlElemListRep } from "./emit_list_rep"
 import {
   fieldCloSigOfTy,
@@ -3327,98 +3319,37 @@ function collectLetLocal(stmtIx: i32, s: LetDecl, fnIx: i32) {
   0
 }
 
-// The declared-local slot a `let` statement's binding takes, allocated by the first arm of the
-// classification ladder that claims its annotation or init. Returns the slot, -2 when the i32
-// default rejects the binding, or -3 when an inline-shape annotation fails (via `emitFail`).
+// The declared-local slot a `let` statement's binding takes: its cell kind (`letCellKind`, the
+// module global's producer too) at that kind's table slot. Returns the slot, -2 when an `i32`
+// cell rejects the binding, or -3 when an inline-shape annotation fails (via `emitFail`).
 function letLocalSlot(stmtIx: i32, fnIx: i32) {
-  let slot = -1
-  if letIsNulNone(stmtIx, fnIx) {
-    // D1576 — a never-filled `let x = null`. The A-infer-null hole nothing assigns into
-    // is not `T | null` for any `T`: the binding's only value is `null`, so its cell is
-    // `nullref`, the GC bottom, which flows to every nullable ref destination with no
-    // coercion. First in the ladder, since several arms below claim a bare `null`.
-    slot = addLocalSlot("nulnone", -1)
-  } else if letBindRepClaims(stmtIx, fnIx) {
-    // A literal-union local is the column's i32 atom; the column answers it before any rung
-    // below can store it as a string or a box.
-    slot = letRepSlot(stmtIx, fnIx)
-  } else if letIsMap(stmtIx, fnIx) {
-    // A `Map()` keyed by a literal union, whose constructor builds it string-keyed where the
-    // key type's rep is the atom (D14229): the shape comes from the readers, not the type.
-    slot = addLocalSlot("map", letMapShapeOf(stmtIx, fnIx))
-  } else if letIsNulVariant(stmtIx, fnIx) {
-    // A nullable record the emitter adopts into a union arm's niche, where its own type has no
-    // row (D14441).
-    slot = addLocalSlot("nulvariant", nulVariantIdxOfLet(stmtIx, fnIx))
-  } else {
-    slot = letLocalSlotList(stmtIx, fnIx)
-  }
-  slot
-}
-
-// The slot of a binding whose type answers its rep: that rep's kind, at its type's slot.
-function letRepSlot(stmtIx: i32, fnIx: i32): i32 {
-  addLocalSlot(letBindRep(stmtIx, fnIx).rdKind, letBindRepSlot(stmtIx, fnIx))
-}
-
-// `letLocalSlot`'s list rungs, for a list whose type names no row; falls on to the value rungs.
-// Returns the slot, or what `letLocalSlotValue` returns.
-function letLocalSlotList(stmtIx: i32, fnIx: i32) {
-  let slot = -1
-  if (
-    letIsStringArray(stmtIx, fnIx)
-    && !letIsUnion(stmtIx, fnIx)
-    && !letIsNulRefArray(stmtIx, fnIx)
-  ) {
-    // A string list whose element type is a union the rep does not cover.
-    slot = addLocalSlot("strlist", -1)
-  } else if letIsRefArray(stmtIx, fnIx) && !letIsUnion(stmtIx, fnIx) {
-    // A list of generic function values, or of an instance's lambda (D14501): its row is
-    // the one its initializer delivers. A union-annotated binding is the box instead.
-    slot = addLocalSlot("reflist", letRefListSlot(stmtIx, fnIx))
-  } else {
-    slot = letLocalSlotValue(stmtIx, fnIx)
-  }
-  slot
-}
-
-// `letLocalSlot`'s union, struct, string and closure rungs and the i32 default, in ladder order.
-// Returns the slot, -2 when the i32 default rejects the binding, or -3 from the struct rung.
-function letLocalSlotValue(stmtIx: i32, fnIx: i32) {
-  let slot = -1
-  if letIsUnion(stmtIx, fnIx) {
-    slot = addLocalSlot("union", -1)
-  } else if letIsStruct(stmtIx, fnIx) {
-    // `letIsStruct` also matches via the init object literal's field-name set, so an
-    // un-internable inline-shape annotation still lands here — and `structIndexOfLet` then
-    // resolves to a wrong, same-field-named struct and emits its layout. Reject cleanly
-    // when the annotation shape itself could not be interned.
-    if letAnnIsUninternedShape(stmtIx) {
+  const k = letCellKind(stmtIx, fnIx)
+  if !letBindRepClaims(stmtIx, fnIx) {
+    // An un-internable inline-shape annotation would resolve to a same-field-named struct.
+    if (k == "struct" || k == "variant") && letAnnIsUninternedShape(stmtIx) {
       emitFail(
         "emitProgram: binding's inline-shape type has an unsupported field",
       )
       return -3
     }
-    // The local half of D51, which `criClassify`'s return rung alone cannot see: `const c
-    // = { r: n }` beside `type Shape = Circle | Sq` has no struct row for its field set,
-    // so the literal is adopted into the arm's variant row (D14441).
-    const lsi = structIndexOfLet(stmtIx, fnIx)
-    const lov = letObjLitVariantIdx(stmtIx, fnIx)
-    if lsi < 0 && lov >= 0 {
-      slot = addLocalSlot("variant", lov)
-    } else {
-      slot = addLocalSlot("struct", lsi)
-    }
-  } else if letIsString(stmtIx, fnIx) {
-    slot = addLocalSlot("str", -1)
-  } else if letIsClosure(stmtIx, fnIx) {
-    // A function value whose type reads a parameter the D4551 default bound.
-    slot = addLocalSlot("closure", -1)
-  } else {
-    if checkLocalI32(stmtIx) < 0 { return -2 }
-    slot = addLocalSlot("i32", -1)
+    if k == "i32" && checkLocalI32(stmtIx) < 0 { return -2 }
   }
-  slot
+  addLocalSlot(k, letCellSlot(stmtIx, fnIx, k))
+}
+
+// The table slot beside binding `stmtIx`'s cell kind `k`: its rep's slot where the rep claims
+// the cell, else the map shape, nullable-variant row, list row, struct row or variant row its
+// initializer delivers; any other kind reads its slot off the type the binding holds.
+function letCellSlot(stmtIx: i32, fnIx: i32, k: VKind): i32 {
+  if letBindRepClaims(stmtIx, fnIx) { return letBindRepSlot(stmtIx, fnIx) }
+  match k {
+    "map" => letMapShapeOf(stmtIx, fnIx)
+    "nulvariant" => nulVariantIdxOfLet(stmtIx, fnIx)
+    "reflist" => letRefListSlot(stmtIx, fnIx)
+    "struct" => structIndexOfLet(stmtIx, fnIx)
+    "variant" => letObjLitVariantIdx(stmtIx, fnIx)
+    _ => repSlotOfKind(k, letBindTy(stmtIx, fnIx))
+  }
 }
 
 // Recursively collect the declared locals of the block at `blockIx` into the local columns,
