@@ -201,8 +201,10 @@ import {
   Member,
   NullLit,
   NumLit,
+  OP_INDEX_GET,
   ObjLit,
   OptMember,
+  P,
   Param,
   Paren,
   Program,
@@ -214,26 +216,13 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  adoptNodeTok,
   arithRegionSeen,
   binderNameAt,
-  nodeAt,
-} from "./ast"
-// `wasmEmit.vl` — the emitter's lowering core: the statement and expression lowerers
-// (`emitStmt` / `emitExpr` and the per-node `emit*` families — calls, assignment,
-// object/array/map construction, unions, closures, string and list ops, coalescing)
-// that turn arena nodes into WasmGC instruction bytes inside a function body.
-//
-// One layer of the emitter module stack: `emit_classify.vl` and the classifier modules
-// around it answer what type and rep a node lowers as, `emit_collect.vl` pre-fills the shared tables, `emit_rewrite.vl` and
-// `emit_mono.vl` mutate the arena first, `emit_bytes.vl` owns the byte encodings,
-// `emit_state.vl` the shared globals, and `emit_sections.vl` drives `emitProgram`'s pass
-// table and assembles the module sections around the bodies lowered here.
-import {
-  P,
-  adoptNodeTok,
   blockTailIsDead,
   callIsNever,
   condLitTrue,
+  declNameTokOf,
   elseIfLink,
   externArityAt,
   externGlobalCount,
@@ -255,6 +244,7 @@ import {
   mkMember,
   mkNull,
   mkStr,
+  nodeAt,
   nodeChildren,
   nodeContains,
   nodeIsTplHole,
@@ -265,6 +255,16 @@ import {
   stmtAlwaysExits,
   ufcsAliasAtSite,
 } from "./ast"
+// `wasmEmit.vl` — the emitter's lowering core: the statement and expression lowerers
+// (`emitStmt` / `emitExpr` and the per-node `emit*` families — calls, assignment,
+// object/array/map construction, unions, closures, string and list ops, coalescing)
+// that turn arena nodes into WasmGC instruction bytes inside a function body.
+//
+// One layer of the emitter module stack: `emit_classify.vl` and the classifier modules
+// around it answer what type and rep a node lowers as, `emit_collect.vl` pre-fills the shared tables, `emit_rewrite.vl` and
+// `emit_mono.vl` mutate the arena first, `emit_bytes.vl` owns the byte encodings,
+// `emit_state.vl` the shared globals, and `emit_sections.vl` drives `emitProgram`'s pass
+// table and assembles the module sections around the bodies lowered here.
 import {
   numLexFitsI32,
   numLexIs2Pow31,
@@ -322,6 +322,7 @@ import {
   paramNulString,
 } from "./emit_query"
 import {
+  AS_FAIL_DOMS,
   FC_CLOSURE,
   FC_F32,
   FC_F32_LIST,
@@ -346,6 +347,7 @@ import {
   FC_STR_LIST,
   FC_U8_LIST,
   FC_UNION,
+  INIT_REACH_NEVER,
   LBK_F32_LIST,
   LBK_F64_LIST,
   LBK_I32_LIST,
@@ -409,6 +411,7 @@ import {
   coalesceCallStrSlot,
   ctrlDepth,
   curBuf,
+  emitCurFnPos,
   emitFailed,
   emitLetCursor,
   emitPhaseReached,
@@ -416,6 +419,7 @@ import {
   envCacheBase,
   envCacheFes,
   envCacheTys,
+  exprArmLocalsAny,
   externIdxAt,
   f32PushScratchBase,
   f64PushScratchBase,
@@ -437,12 +441,15 @@ import {
   fitShTy,
   fl32TypeIdx,
   fl64TypeIdx,
+  fnDispNames,
+  fnInstOrigin,
   fnListCatKinds,
   fnListCatSlots,
   fnListEqGKinds,
   fnListEqGSlots,
   fnListEqRSlots,
   fnNestUsed,
+  fnParent,
   fnStmts,
   fnUsesAtomStage,
   fnUsesListGet,
@@ -470,7 +477,9 @@ import {
   gFoldOk,
   gFoldPool,
   gHeapGlobalIdx,
+  gHelpAsFail,
   gHelpF64Rem,
+  gHelpInitFail,
   gHelpMapCompact,
   gHelpMapProbe,
   gHelpMapProbeI32,
@@ -494,6 +503,17 @@ import {
   gHelpUtf8Dec,
   gHelpUtf8Enc,
   gImports,
+  gInitAny,
+  gInitAt,
+  gInitFnReach,
+  gInitGIdx,
+  gInitGLocs,
+  gInitGNames,
+  gInitGuard,
+  gInitProgIdx,
+  gInitRank,
+  gInitReaders,
+  gInitStartOrd,
   gLowMemUnused,
   gMapDeletes,
   gMapSetFn,
@@ -515,6 +535,7 @@ import {
   gStrPoolIx,
   gStrPoolTexts,
   gTailFnRows,
+  globalStmtOrd,
   globalStmts,
   i64PushScratchBase,
   ia64TypeIdx,
@@ -561,6 +582,13 @@ import {
   mfScratchBase,
   mkArrIdx,
   mkListIdx,
+  monoGradualAsScalar,
+  monoInertCalled,
+  monoInertValues,
+  monoInstFe,
+  monoInstOrig,
+  monoOrigNode,
+  monoStubValueOk,
   mvMapTypeIdx,
   mvRlSlot,
   mvValKind,
@@ -621,6 +649,7 @@ import {
   uVarHeap,
   uVarTyIx,
   uVariants,
+  unTyIx,
   unionSinkBase,
   variantReboxSlot,
   vbAtomListUsed,
@@ -977,6 +1006,8 @@ import {
   readCellHoldsNullRef,
   readOwesNonNullRecover,
   recBuildRowOf,
+  refListElemIsRow,
+  refListElemIsUnion,
   refListSlotOfExpr,
   rlUnionNameOfTy,
   sharedUnionFieldPlan,
@@ -1499,40 +1530,6 @@ import {
   voidTwinTargetOf,
 } from "./emit_rewrite"
 import { nameIsQuotedLeaf } from "./tyname"
-import {
-  exprArmLocalsAny,
-  monoGradualAsScalar,
-  monoInertCalled,
-  monoInertValues,
-  monoInstFe,
-  monoInstOrig,
-  monoOrigNode,
-  monoStubValueOk,
-  unTyIx,
-} from "./emit_state"
-import {
-  AS_FAIL_DOMS,
-  INIT_REACH_NEVER,
-  emitCurFnPos,
-  fnDispNames,
-  fnInstOrigin,
-  fnParent,
-  gHelpAsFail,
-  gHelpInitFail,
-  gInitAny,
-  gInitAt,
-  gInitFnReach,
-  gInitGIdx,
-  gInitGLocs,
-  gInitGNames,
-  gInitGuard,
-  gInitProgIdx,
-  gInitRank,
-  gInitReaders,
-  gInitStartOrd,
-  globalStmtOrd,
-} from "./emit_state"
-import { OP_INDEX_GET, declNameTokOf } from "./ast"
 import { srcmapFileOfTok } from "./srcmap"
 import { covarRootName, cwKeyFrame, cwKeyOfRoot } from "./check_write_scan"
 import {
@@ -26360,14 +26357,14 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     st.aTy = rlBackIdx[rslot]
     st.mfKind = "ref"
     st.slot = rslot
-    if rlElemKindTbl[rslot] == RLK_STRUCT {
+    if refListElemIsRow(arrIx, fnIx) {
       st.structIdx = rlElemStructRow(rslot)
       // ...and where that declines, the element is an ARM, at `uVarHeap[vi]`.
       if st.structIdx < 0 {
         st.variantIdx = variantIndexOf(nonNulBaseOf(rlElemName[rslot]))
       }
     }
-    if rlElemKindTbl[rslot] == RLK_UNION {
+    if refListElemIsUnion(arrIx, fnIx) {
       st.unionNm = rlElemName[rslot]
       st.unionTy = rlElemTyIxAt(rslot)
     }
@@ -27309,7 +27306,7 @@ function pushSlotOf(
     ps.lTy = rlWrapIdx[rslot]
     ps.aTy = rlBackIdx[rslot]
     ps.base = refPushScratchBaseFor(rslot)
-    if rlElemKindTbl[rslot] == RLK_UNION {
+    if refListElemIsUnion(recvIx, fnIx) {
       pv.pushUnionNm = rlElemName[rslot]
       pv.pushUnionTy = rlElemTyIxAt(rslot)
     }
