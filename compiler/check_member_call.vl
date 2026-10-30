@@ -1,6 +1,7 @@
 // The type of a method call `recv.f(args)`: a built-in method, a struct field holding a
 // function, or a free function reached by UFCS, with overload and hole-typed callees.
 
+import { nodeTyIxOf } from "./check_node_tys"
 import { declTyOf } from "./check_nar_store"
 import { ctnWrRecvPut } from "./check_decl_scan"
 import { recOwnPend } from "./check_rec_rows"
@@ -11,8 +12,10 @@ import {
   Call,
   FuncDecl,
   Ident,
+  IfStmt,
   MC_RUNG_BUILTIN,
   MC_RUNG_SELF_FN,
+  MatchExpr,
   Member,
   P,
   binderNameAt,
@@ -48,6 +51,7 @@ import { callBindNote } from "./check_bind_rows"
 import {
   elabCallDeclNote,
   elabCallNote,
+  elabCalleeTargets,
   elabCapLive,
   elabCbNote,
   elabTyClosed,
@@ -1113,19 +1117,30 @@ function memberCallMapFilterTy(
     const cb = tyAt(cbTy)
     if cb is TyFunc {
       const cbParams = cb.fnParamTypes
-      // A generic named as the callback is instanced at the element.
-      const cbd = if cbArg is Ident { identFnDeclOf(cargs[0]) } else { -1 }
-      const cbdn = if cbd >= 0 { nodeAt(cbd) } else { cbArg }
-      if (
-        cbdn is FuncDecl
-        && cbdn.fnTyParams.length > 0
-        && cbParams.length == 1
-        && elabTyClosed(rt.aElem, 0)
-      ) {
-        const eNames: string[] = []
-        const eTys: i32[] = []
-        bindGenWalk(cbParams[0], rt.aElem, eNames, eTys)
-        elabCbNote(cbd, eNames, eTys)
+      // Each generic the callback may be is instanced at the element, by its own signature.
+      if cbParams.length == 1 && elabTyClosed(rt.aElem, 0) {
+        const cbds: i32[] = []
+        if cbArg is Ident {
+          cbds.push(identFnDeclOf(cargs[0]))
+        } else if cbArg is IfStmt || cbArg is MatchExpr {
+          for m in elabCalleeTargets(cargs[0]) { cbds.push(m) }
+        }
+        for cbd in cbds {
+          const cbdn = if cbd >= 0 && cbd < P.nodes.length { nodeAt(cbd) } else { cbArg }
+          const cbs = if cbd >= 0 && cbd < P.nodes.length { nodeTyIxOf(cbd) } else { -1 }
+          const cbf = if cbs >= 0 && cbs < T.tys.length { tyAt(cbs) } else { cb }
+          if (
+            cbdn is FuncDecl
+            && cbdn.fnTyParams.length > 0
+            && cbf is TyFunc
+            && cbf.fnParamTypes.length == 1
+          ) {
+            const eNames: string[] = []
+            const eTys: i32[] = []
+            bindGenWalk(cbf.fnParamTypes[0], rt.aElem, eNames, eTys)
+            elabCbNote(cbd, eNames, eTys)
+          }
+        }
       }
       if cbParams.length != 1 {
         tErr(
