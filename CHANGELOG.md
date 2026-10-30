@@ -9,7 +9,7 @@ see **`DECISIONS.md`**.
 ## Type system (Track A)
 
 - **A generic value `if` joining a `??` arm with a bare type parameter keeps the parameter's arm (D14649, D12453, D2915, D3214, D3290, D3369 closed; D2934's fixture runs).** The template typed `if c { a ?? 5 } else { b }` as the `??` arm alone, so at `T = P | null` the call lost its `null` and a `null` result trapped or compared wrong. The join keeps both (`tyParamBesideDerived`), and three emitter readers take the instance's type where it decides: a box arm built from a value that may be `null` at its pin tests for it, and a union `==` against a nullable record, string or boolean compares that `null` with the box's null arm. 23 corpus cells that were refused or trapped now run, two that printed a wrong value print the right one, and no cell stops running.
-- **The elaboration enqueues before emit the instances the monomorphizer used to demand late (increment 3).** Files where mono enqueues an instance after `elabRun` settles fall from 589 to 40 of 17,267, over #5159–#5187, #5197–#5199 and #5201–#5209. What was fixed:
+- **The elaboration enqueues before emit the instances the monomorphizer used to demand late (increment 3).** Files where mono enqueues an instance after `elabRun` settles fall from 589 to 36 of 17,267, over #5159–#5187, #5197–#5199 and #5201–#5210. What was fixed:
   - hole-pin rows check banked were never drained when no root instance came first;
   - operator and index-operator dispatch recorded no call row;
   - a brand's erased pin, a numeric literal union's widened pin, and a declaration with nothing to bind refused or re-checked an instance;
