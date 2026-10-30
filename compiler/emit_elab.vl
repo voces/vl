@@ -1436,9 +1436,12 @@ export function elabRun() {
     elabSetCallRows(ix, callBindNamesAt(r), tys, -1, -1)
     if tysClosed(tys) {
       const d = elabCallDeclOf(ix)
-      const k = elabEnqueue(d, callBindNamesAt(r), tys, -1)
+      const rn: string[] = []
+      const rt: i32[] = []
+      elabRowComplete(ix, d, callBindNamesAt(r), tys, rn, rt)
+      const k = elabEnqueue(d, rn, rt, -1)
       elabReachNote(-1, k, ix)
-      elabArgRows(ix, d, callBindNamesAt(r), tys, -1)
+      elabArgRows(ix, d, rn, rt, -1)
       // A call through a set reaches the called member through the direct call built for it.
       for a in fnTagCallArms(ix) {
         const an = nodeAt(a)
@@ -1755,6 +1758,63 @@ function elabRowByFnResults(ix: i32, names: string[], tys: i32[]): i32[] {
   if tysClosed(out) { out } else { [] }
 }
 
+// Row `names`/`tys` of call `ix` to `d` into `outN`/`outT`, with each type parameter of `d` it does
+// not bind taken from the arguments: a bare member of a union parameter (`U | string` handed a
+// `string`) takes the argument's type, as mono does; a parameter still unbound stays out.
+function elabRowComplete(
+  ix: i32,
+  d: i32,
+  names: string[],
+  tys: i32[],
+  outN: string[],
+  outT: i32[],
+) {
+  let i = 0
+  while i < names.length && i < tys.length {
+    outN.push(names[i])
+    outT.push(tys[i])
+    i = i + 1
+  }
+  if ix < 0 || ix >= P.nodes.length || d < 0 || d >= P.nodes.length { return 0 }
+  const cn = nodeAt(ix)
+  const f = nodeAt(d)
+  if !(cn is Call) || !(f is FuncDecl) || f.fnTyParams.length <= names.length {
+    return 0
+  }
+  for tp in f.fnTyParams {
+    if strListHas(outN, tp) { continue }
+    let a = 0
+    while a < f.fnParams.length && a < cn.callArgs.length {
+      const pt = nodeTyIxOf(f.fnParams[a])
+      const u = if pt >= 0 && pt < T.tys.length { tyAt(pt) } else { cn }
+      const at = widenLitTy(nodeTyIxOf(cn.callArgs[a]))
+      if (
+        u is TyNullable
+        && at >= 0
+        && at < T.tys.length
+        && elabTyClosed(at, 0)
+      ) {
+        const iv = if u.nInner >= 0 && u.nInner < T.tys.length { tyAt(u.nInner) } else { cn }
+        if iv is TyVar && iv.tvName == tp && !strListHas(outN, tp) {
+          outN.push(tp)
+          outT.push(at)
+        }
+      }
+      if u is TyUnion && at >= 0 && at < T.tys.length && elabTyClosed(at, 0) {
+        for m in u.uMembers {
+          const mv = if m >= 0 && m < T.tys.length { tyAt(m) } else { cn }
+          if mv is TyVar && mv.tvName == tp && !strListHas(outN, tp) {
+            outN.push(tp)
+            outT.push(at)
+          }
+        }
+      }
+      a = a + 1
+    }
+  }
+  0
+}
+
 // Row `names`/`tys` of call `ix` with each open binding taken from an argument that is no function
 // value, at its own closed type, by its parameter's declared type (`u: U` handed `"ab"`); [] when
 // the row stays open.
@@ -1777,6 +1837,16 @@ function elabRowByPlainArgs(ix: i32, names: string[], tys: i32[]): i32[] {
       const rn: string[] = []
       const rt: i32[] = []
       bindGenWalk(pt, at, rn, rt)
+      // A bare member of a union parameter (`U | string` handed a `string`) takes the argument.
+      if pf is TyUnion {
+        for m in pf.uMembers {
+          const mv = if m >= 0 && m < T.tys.length { tyAt(m) } else { pf }
+          if mv is TyVar {
+            rn.push(mv.tvName)
+            rt.push(at)
+          }
+        }
+      }
       let j = 0
       while j < rn.length {
         let q = 0
