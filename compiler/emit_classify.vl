@@ -257,12 +257,16 @@ import {
   variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import {
+  bodyLetOfDecl,
+  bodyLetOfRead,
   callMemProp,
   callOriginOf,
   capIsBound,
+  fnLetOfRead,
   isBuiltinFnName,
   litLexIsMember,
   mapShapeFoldSet,
+  moduleLocalLetOfRead,
   nameIsBareMap,
   nameIsF32Array,
   nameIsF64Array,
@@ -356,12 +360,6 @@ import {
   fieldCodeForMatch,
   fieldCodeOfTy,
 } from "./emit_field_codes"
-import {
-  bodyLetOfDecl,
-  bodyLetOfRead,
-  fnLetOfRead,
-  moduleLocalLetOfRead,
-} from "./emit_base"
 import {
   bodyLetReadAtSid,
   callsOfCallee,
@@ -595,6 +593,7 @@ import {
   repOfTy,
   repRowOfTyStruct,
   repShadowOn,
+  repSigKindOfTy,
   repSigSlotTokOfKind,
   repSigTokOfKind,
   repVariantShapeRowOf,
@@ -755,15 +754,9 @@ import {
   MVK_UNION,
   MfKind,
   RLK_CLOSURE,
-  RLK_F32_LIST,
-  RLK_F64_LIST,
-  RLK_I32_LIST,
-  RLK_I64_LIST,
   RLK_MAP,
   RLK_REF_LIST,
   RLK_STRUCT,
-  RLK_STR_LIST,
-  RLK_U8_LIST,
   RLK_UNION,
   VKind,
   capCountTbl,
@@ -5954,94 +5947,10 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   if exprStringArray(iterIx, fnIx) { return "str" }
   // A struct-element ref list (`S[]`): the element is a struct ref, so bind the loop var
   // as a code-1 struct local. (Union-box (2) / map-array ref lists aren't wired here yet.)
+  // A ref list's loop var binds its element's rep, read from the iterable's type at this instance:
+  // a struct, variant, union box, inner list, closure or map, nullable where the slot is.
   if exprRefArray(iterIx, fnIx) {
-    // Bound-guarded, since `refListSlotOfExpr` doesn't answer -1 on a miss — it clamps to
-    // 0, so a miss is indistinguishable from slot 0, and with no ref list interned at all
-    // `rlElemKindTbl` is empty: an unguarded read is `wasm trap: out of bounds array
-    // access` from inside the compiler, not a diagnostic (D179).
-    const rslot = refListSlotOfExpr(iterIx, fnIx)
-    if rslot < 0 || rslot >= rlElemKindTbl.length {
-      // A box-element list built at its destination's row names no row of its own spelling.
-      if tyIsValueUnionBox(tyArrayElemIx(nodeTyInOf(iterIx, fnIx))) {
-        return "union"
-      }
-      return null
-    }
-    if rlElemKindTbl[rslot] == RLK_STRUCT {
-      // A nullable-struct element ref list (`(P | null)[]`): the loop var binds as a
-      // kind-9 niche, its read staying nullable (no `ref.as_non_null`); plain `S[]` is kind 1.
-      // A nullable union arm (`(Circle | null)[]`) has no struct row, so it binds the
-      // `nulvariant` niche over the arm's heap, as `const e = xs[i]` does (D3096).
-      if rlElemIsNulNiche(rslot) {
-        if rlElemVariantRow(rslot) >= 0 { return "nulvariant" }
-        return "nulstruct"
-      }
-      // An arm-element ref list (`Circle[]` where `Circle` is a declared union member): the
-      // loop var binds as the kind-8 variant local over `uVarHeap[vi]`, since
-      // `structIdxOfElemName`'s nominal floor declines an arm (D50).
-      if rlElemVariantRow(rslot) >= 0 { return "variant" }
-      return "struct"
-    }
-    // A union-box element ref list (`(C | S)[]`, kind 2): the loop var binds as a kind-4
-    // union-box local (the element-kind code IS the loop-var local kind, as struct's `1` is),
-    // so `for x in arr { … x is S … }` narrows each element. The `#l` temp is the ref-list
-    // wrapper (code 5), same as the struct case.
-    if rlElemKindTbl[rslot] == RLK_UNION { return "union" }
-    // A nested-array element ref list (`i32[][]`/`string[][]`/`f64[][]`/`i64[][]`): the
-    // loop var binds the inner list — a list local of kind 2/7/12/20. The element read is
-    // a ref (the inner wrapper, recovered non-null); the `#l` temp is the outer wrapper.
-    if rlElemKindTbl[rslot] == RLK_I32_LIST {
-      // A `(i32[] | null)[]` keeps the `| null` in its element slot, so the loop var is
-      // the kind-15 nullable list — the same rep `exprNullableList`'s kind-4 arm binds.
-      if rlElemIsNulNiche(rslot) { return "nullist" }
-      return "list"
-    }
-    // The four distinct-backing inner lists (`string[][]` 6 / `f64[][]` 7 / `i64[][]` 8 /
-    // `f32[][]` 10). A `(T[] | null)[]` element keeps `| null` in its slot exactly as the
-    // kind-4 niche above, so the loop var is the matching nullable-list kind.
-    if rlElemKindTbl[rslot] == RLK_STR_LIST {
-      if rlElemIsNulNiche(rslot) { return "nulstrlist" }
-      return "strlist"
-    }
-    if rlElemKindTbl[rslot] == RLK_F64_LIST {
-      if rlElemIsNulNiche(rslot) { return "nulf64list" }
-      return "f64list"
-    }
-    if rlElemKindTbl[rslot] == RLK_I64_LIST {
-      if rlElemIsNulNiche(rslot) { return "nuli64list" }
-      return "i64list"
-    }
-    if rlElemKindTbl[rslot] == RLK_F32_LIST {
-      if rlElemIsNulNiche(rslot) { return "nulf32list" }
-      return "f32list" // f32-inner list -> an f32-list local (kind 21)
-    }
-    if rlElemKindTbl[rslot] == RLK_U8_LIST {
-      if rlElemIsNulNiche(rslot) { return "nulu8list" }
-      return "u8list" // u8-inner list -> a packed-byte-list local
-    }
-    // A closure-element ref list (`((i32) => i32)[]`, element kind 5): the loop var binds a
-    // kind-14 closure recovered non-null, the `#l` temp the ref-list wrapper (code 5). A
-    // `(F | null)[]` element binds the nullable niche instead, since recovering it would trap
-    // on the null the body means to test.
-    if rlElemKindTbl[rslot] == RLK_CLOSURE {
-      if rlElemIsNulNiche(rslot) { return "nulclosure" }
-      return "closure"
-    }
-    // A nested ref array (`S[][]`/`(C|D)[][]`/`S[][][]`, element kind 9): the loop var
-    // binds the inner ref list — a kind-5 ref-list local carrying the inner slot,
-    // recursing (the inner slot may itself be kind 9). A `(S[] | null)[]` element is the
-    // kind-18 nullable ref list, the same niche rule.
-    if rlElemKindTbl[rslot] == RLK_REF_LIST {
-      if rlElemIsNulNiche(rslot) { return "nulreflist" }
-      return "reflist"
-    }
-    // A map element (`{[K]: V}[]`, element kind 3): the loop var binds a map local over the
-    // element's shape, and a `({[K]: V} | null)[]` element the nullable-map niche.
-    if rlElemKindTbl[rslot] == RLK_MAP {
-      if rlElemIsNulNiche(rslot) { return "nulmap" }
-      return "map"
-    }
-    return null
+    return repSigKindOfTy(tyArrayElemIx(nodeTyInOf(iterIx, fnIx)))
   }
   // An f64 element list (`f64[]`): the loop var binds as a scalar f64 local (code 11), and
   // the `#l` temp is the f64-list (code 12), recognized through `exprF64Array` so an
