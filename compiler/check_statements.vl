@@ -1,6 +1,7 @@
 // The statements: `let`, `if` with its narrowing head, `while`, `for` over a range or a
 // collection, `return` and a block.
 
+import { strListIndexOf } from "./listutil"
 import { nodeTyIx, nodeTySet, nodeTySetGrow } from "./check_node_tys"
 import {
   ArrayLit,
@@ -102,7 +103,7 @@ import {
 import { crStmtEnter, crUnwidenTop, crWidenedInTop } from "./check_cr_walk"
 import { noteLetCstr, noteRetCstr } from "./check_cstr_rows"
 import { markCtnLitBinding } from "./check_ctn_lit_bind"
-import { curFnDeclIx, inferQuiet, tpEnvNames } from "./check_cursor"
+import { curFnDeclIx, inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
 import { letDeclFnPut, tsMapKeyNodeOf, wrDstDeclPut } from "./check_decl_scan"
 import {
   daAddNode,
@@ -181,6 +182,7 @@ import {
   luMembers,
   luRecvLowers,
   luRef,
+  monoRecheckDepth,
 } from "./check_list_union"
 import {
   boolForNumberNote,
@@ -276,7 +278,7 @@ import {
   noteValBindLambda,
 } from "./check_side_rows"
 import { symDecl, symNameIsMinted } from "./check_sym_occ"
-import { mapKeyTySupported } from "./check_ty_rep"
+import { mapKeyTySupported, nomBaseTyIx } from "./check_ty_rep"
 import {
   T,
   TY_BOOL,
@@ -294,6 +296,7 @@ import {
   tyAt,
   tyHasHole,
   tyIsHole,
+  tyIsNewtypeBrand,
   tyIsStructBearingUnion,
   tyToStr,
 } from "./check_types"
@@ -1424,6 +1427,25 @@ export function checkForInNode(n: ForIn, ix: i32) {
 }
 // ── return ─────────────────────────────────────────────────────────────────
 
+// Under an instance re-check, a function declared `: T` whose `T` is pinned to a newtype brand
+// accepts a body value of the brand's base: the call already admits it (`retNomOnlyAtHole`),
+// and the re-check must agree rather than refuse what the call let through.
+function retNomPinOk(retArg: i32, got: i32, want: i32): boolean {
+  if monoRecheckDepth <= 0 || curFnDeclIx < 0 { return false }
+  const dn = nodeAt(curFnDeclIx)
+  if !(dn is FuncDecl) || dn.fnRet < 0 { return false }
+  const rn = nodeAt(dn.fnRet)
+  if !(rn is TypeRef) { return false }
+  if strListIndexOf(dn.fnTyParams, rn.tyName) < 0 { return false }
+  let k = tpEnvNames.length - 1
+  while k >= 0 && tpEnvNames[k] != rn.tyName { k = k - 1 }
+  if k < 0 || tpEnvTys[k] != want { return false }
+  if !tyIsNewtypeBrand(want) { return false }
+  const b = nomBaseTyIx(want)
+  if b < 0 || b == want { return false }
+  assignableExpr(retArg, got, b)
+}
+
 // Extracted from `checkNodeReal`'s `RetStmt` arm (C3: thin the dispatcher).
 export function checkRetStmtNode(n: RetStmt, ix: i32) {
   const want = T.curRet
@@ -1530,7 +1552,11 @@ export function checkRetStmtNode(n: RetStmt, ix: i32) {
   // An explicit `return inner` of an empty collection pins its element from the
   // declared return type — usage-driven inference clearing the floor.
   constrainEmptyExpr(n.retArg, got, want)
-  if want >= 0 && !assignableExpr(n.retArg, got, want) {
+  if (
+    want >= 0
+    && !assignableExpr(n.retArg, got, want)
+    && !retNomPinOk(n.retArg, got, want)
+  ) {
     tErrWant(
       "return type mismatch: expected "
         + tyToStr(want)
