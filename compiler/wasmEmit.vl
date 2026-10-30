@@ -9050,7 +9050,9 @@ function emitUnionArmValueBox(
   if exprUnion(exprIx, fnIx) { return 0 }
   // A read that can still be null (a record-valued map's miss) is the niche below even where
   // `exprVariantIndex` names its arm: tagging it with the arm boxes the miss as a record (D10170).
+  // Asked at the instance too: a type parameter's value is nullable where its pin is.
   const nyNul = nodeTyIsNullable(unwrapParen(exprIx))
+    || tyBearsNull(nodeTyAt(unwrapParen(exprIx), fnIx))
   let nvi = -1
   if nyNul { nvi = nulVariantIdxOfExpr(exprIx, fnIx) }
   const svi = exprVariantIndex(exprIx, fnIx)
@@ -9813,6 +9815,43 @@ function emitUnionConcreteEq(
     fbI32Bin(70)
     fbElse()
   }
+  // A nullable string at the instance (`T` pinned to `string | null`) equals the box's null when
+  // it is null, read raw for the test; present, it compares as the string below.
+  const nulStrOther = eak == 2
+    && !nulOther
+    && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+    && unionEqOperandOk(otherIx)
+    && !eqOnce
+    && unionSetHasNull(uname)
+  // The `boolean | null` niche's null is the value 2 (D2260).
+  const nulBoolOther = eak == 1
+    && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+    && unionEqOperandOk(otherIx)
+    && !eqOnce
+    && unionSetHasNull(uname)
+  if nulBoolOther {
+    if emitExpr(body, otherIx, fnIx, ec) < 0 { return -1 }
+    fbI32Const(2)
+    fbI32Bin(70)
+    fbIf(127)
+    if emitExpr(body, boxIx, fnIx, ec) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Bin(70)
+    fbElse()
+  }
+  if nulStrOther {
+    const rawCtx = expCtxHere(ec)
+    rawCtx.rawNullRead = true
+    if emitExprExpect(body, otherIx, fnIx, rawCtx) < 0 { return -1 }
+    fbRefIsNull()
+    fbIf(127)
+    if emitExpr(body, boxIx, fnIx, ec) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Bin(70)
+    fbElse()
+  }
   // tag == tagOf(atom), gating the payload compare.
   if emitExpr(body, boxIx, fnIx, ec) < 0 { return -1 }
   if eqOnce { fbLocalTee(eqStash) }
@@ -9837,7 +9876,7 @@ function emitUnionConcreteEq(
   fbElse() // 0x05 else: wrong-rep arm — structurally unequal
   fbI32Const(0)
   fbEnd()  // 0x0b end
-  if nulOther { fbEnd() }
+  if nulOther || nulStrOther || nulBoolOther { fbEnd() }
   if isNe {
     fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
   }
@@ -9943,9 +9982,27 @@ function emitUnionConcreteVariantEq(
   // inside `otherIx` re-enters this function and re-uses the same slots. A stack value cannot be
   // reached that way, and after the second operand lands no user code runs before the compare.
   if emitExpr(body, boxIx, fnIx, ec) < 0 { return -1 }
-  if emitExpr(body, otherIx, fnIx, ec) < 0 { return -1 }
-  fbLocalSet(ar)              // pops the concrete operand, leaving the box on top
+  // A nullable record at the instance is read raw, and its null equals the box's null arm.
+  const otherNul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+  if otherNul {
+    const rawCtx = expCtxHere(ec)
+    rawCtx.rawNullRead = true
+    if emitExprExpect(body, otherIx, fnIx, rawCtx) < 0 { return -1 }
+  } else if emitExpr(body, otherIx, fnIx, ec) < 0 {
+    return -1
+  }
+  fbLocalSet(ar) // pops the concrete operand, leaving the box on top
   fbLocalSet(sl)
+  if otherNul {
+    fbLocalGet(ar)
+    fbRefIsNull()
+    fbIf(127) // 0x04 if, i32 result: null against the box's null tag
+    fbLocalGet(sl)
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Bin(70)
+    fbElse()
+  }
   fbLocalGet(sl)
   fbStructGet(uBoxIdx, 0)     // field 0: tag
   fbI32Rel(RS_TAG, uTags[vi]) // the arm's program-global tag
@@ -9960,6 +10017,7 @@ function emitUnionConcreteVariantEq(
   fbElse()                    // the box holds a different arm — structurally unequal
   fbI32Const(0)
   fbEnd()
+  if otherNul { fbEnd() }
   if isNe { fbI32Eqz() }
   0
 }
