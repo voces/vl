@@ -126,7 +126,9 @@ import {
   tyIsNullableLitUnion,
   tyIxIsVariantMember,
   tyMutEpoch,
+  tySame,
   tyToEmitName,
+  tyToNominalName,
 } from "./check_types"
 import { sidOf } from "./symbols"
 import {
@@ -3330,12 +3332,12 @@ function repOfTyFlat(ty: i32): RepDesc {
       // niche, `rdNul` 3) — without this arm it repped as the union box while every read
       // classified it from the arena as the atom, printing invalid wasm. No alias gate here: canon preserves a nullable litunion's members, so both spellings rep as the atom.
       if tyIsNullableLitUnion(ty) { return repAtomMk(3) }
-      // A single-member object union is the canonicalized `{a} & {b}` struct
-      // alias — reps as the struct itself.
-      if t.uMembers.length == 1 {
+      // A union whose arms are all one type (a single member, the canonicalized `{a} & {b}`
+      // struct alias, or a degenerate `A | A`) reps as that arm; an object arm as the struct.
+      if unionArmsAllSame(t.uMembers) {
         const m = tyAt(t.uMembers[0])
         if m is TyObj { return repMk("struct", 0, "") }
-        // Any other one-member union (a recursive alias's `rest | null`) is its member.
+        // Any other union of one type (a recursive alias's `rest | null`) is that type.
         return repOfTyFlat(t.uMembers[0])
       }
       // Lists that all spell one list are that list: the first member a rep covers decides.
@@ -3382,6 +3384,17 @@ function repOfTyFlat(ty: i32): RepDesc {
   // The four empty arms above land here: no wasm rep of their own, so the
   // consumer keeps its legacy name-based path (`rdCovered == 0`).
   repUncovered()
+}
+
+// Are the arms `ms` all one type: one member, or members alike in structure and in name?
+function unionArmsAllSame(ms: i32[]): boolean {
+  if ms.length < 1 { return false }
+  if ms.length == 1 { return true }
+  const n0 = tyToNominalName(ms[0])
+  for m in ms {
+    if !tySame(m, ms[0]) || tyToNominalName(m) != n0 { return false }
+  }
+  true
 }
 
 function repOfPrim(pn: PrimName): RepDesc {
@@ -4525,7 +4538,7 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
       ty,
     )
   }
-  if members.length == 1 {
+  if unionArmsAllSame(members) {
     const m = tyAt(members[0])
     if m is TyObj {
       // The canonicalized `{a} & {b}` struct alias — a plain struct, never a variant:
@@ -4533,7 +4546,7 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
       // member's own index agrees since variant-member registration is arity-aware (#920 irregularity (a)): a single-member decl never marks its member a variant.
       return rtOfObjAs(ty, members[0], 0, m.objFieldTypes)
     }
-    // Any other one-member union is its member.
+    // Any other union of one type is that type.
     const k1 = rtGo(members[0])
     rtByTyPut(ty, k1)
     return k1
