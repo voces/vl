@@ -565,6 +565,8 @@ A later step is added: the elaboration moves into check with an error channel, w
 
 The order: checker rows for value-of-generic deliveries, one slice per kind; then `elabRun` moves into check with the error channel once both populations are 0, and `pinHoleLambdaArg` goes with it.
 
+**Speculative instances, re-measured on 2026-10-30.** A probe on `elabOne` counts files where an instance's re-check raises a diagnostic the rollback then discards: 769 of 17,267. About 500 were an `is` test that cannot match at the pin (`x is i32` at `T = f64`), a dead arm and no error, which the elaboration's re-check no longer raises (`deadArm` in `checkIsExprNode`): 130 files are left. Their messages are mostly a default `i32` instance (D4551) whose body only works at its real type (`.length` or a call on `i32`), and argument or arity errors in instances mono never builds.
+
 **Late demands, re-measured on 2026-10-29.** A probe on `elabDemandFrom` counts files where the monomorphizer enqueues an instance after `elabRun` settles. Each slice below was byte-identical over the 17,267-file build sweep:
 - 589: the first reading, 478 of them under `tests/cases`.
 - 513: `elabSettle` drains the hole-pin rows check banked before any instance (#5159).
