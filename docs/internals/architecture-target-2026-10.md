@@ -615,7 +615,7 @@ The order: checker rows for value-of-generic deliveries, one slice per kind; the
 What is left (35 files on 2026-10-30), grouped by what each waits on:
 - 14: hole lambdas and hole functions handed on, through a capture cell (D14425), a list, a map or another hole callee, which mono instances at the delivery;
 - 7: function values through record fields, rewritten `let`s and module bindings read before their declaration, where the elaboration does not see which function the value holds;
-- 8: literal-union pins (`T = "a"` beside mono's `string`), which wait on mono keying instances by the elaboration;
+- 8: literal-union pins (`T = "a"` beside mono's `string`), which wait on mono keying instances by the elaboration. Enqueueing each string-literal row a second time at the widened type cleared 4 of the 8, and made 51 builds trap the compiler, because the extra instance changes what the emitter reads for the literal one;
 - 4: a pin mono takes from storage rather than the checker's narrowed or structural type (`P[] | null` beside `P[]`, a nominal row beside its shape);
 - 2: the D4671 null-unit binding (`const n = null` handed to a generic), which waits on the per-binding storage column.
 
