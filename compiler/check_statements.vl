@@ -45,12 +45,16 @@ import {
   valueIfAdd,
 } from "./ast"
 import {
+  elabCapAlwaysTests,
   elabCapDeadEnter,
   elabCapDeadLeave,
+  elabCapDeadRestSet,
   elabCapDeadTests,
   elabCapLive,
   elabCapNote,
   elabCapOn,
+  elabDeadRestClose,
+  elabDeadRestOpen,
   elabFnLetTy,
   elabFnListLetTy,
 } from "./check_elab_cap"
@@ -732,7 +736,8 @@ export function checkIfStmtNode(ix: i32) {
     const at = cur
     cur = -1
     if c is IfStmt {
-      frames.push(checkIfHead(c, at))
+      const head = checkIfHead(c, at)
+      frames.push(head)
       // A discarded chain discards every link and arm under it.
       if c.ifElse >= 0 && valDiscarded(at) { markValDiscard(c.ifElse) }
       if c.ifElse >= 0 {
@@ -745,7 +750,10 @@ export function checkIfStmtNode(ix: i32) {
           const elseArm = valueArmAt
           if !valDiscarded(at) { valueArmAtSet(c.ifElse) }
           if ifChainSpine { spineAtSet(c.ifElse) }
+          const edOuter = head.elseDead && elabCapDeadEnter()
+          const edD0 = T.diags.length
           elseRes = checkNodeHook(c.ifElse)
+          if head.elseDead { elabCapDeadLeave(edOuter, edD0) }
           spineAtSet(elseSpine)
           valueArmAtSet(elseArm)
         }
@@ -942,6 +950,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   const enTys: i32[] = []
   const rwD0 = T.diags.length
   const rwT0 = elabCapDeadTests
+  const rwA0 = elabCapAlwaysTests
   ifCheckCondNarrows(n, tnPlaces, tnTys, enPlaces, enTys)
   // An elaboration marks the arm of a test its instance makes dead.
   const rwDead = elabCapLive()
@@ -974,6 +983,10 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // marked (D1972): the post-guard leg and the `else if` hand-up ask the
   // same predicate.
   const thenExits = stmtAlwaysExits(n.ifThen)
+  // A test always true at the pin leaves its `else` arm dead, and when its arm always exits
+  // and it has none, the rest of the block.
+  const elseDead = elabCapLive() && elabCapAlwaysTests > rwA0
+  if elseDead && thenExits && n.ifElse < 0 { elabCapDeadRestSet(true) }
   if guardedRet { guardAltStackPop() }
   retTailPosSet(false)
   const thenTy = blockTailTy
@@ -1012,6 +1025,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   }
   return {
     ifIx: ix,
+    elseDead: elseDead,
     isElseArm: isElseArm,
     pgUpMark: pgUpMark,
     clobMark: clobMark,
@@ -1596,6 +1610,7 @@ export function checkBlockNode(n: Block, ix: i32) {
   // A tail after a statement that always exits never runs, so the block has no value (D8720).
   // Asked once the predecessors are checked, since a `never` call is marked by its check.
   let tailDead = false
+  let restMark = -1
   let i = 0
   while i < stmts.length {
     // Only the last statement is the block's value (and inherits tail position); the
@@ -1623,6 +1638,7 @@ export function checkBlockNode(n: Block, ix: i32) {
       sty = checkNodeHook(stmts[i])
     }
     crStmtLeave()
+    restMark = elabDeadRestOpen(restMark)
     if lpOn {
       brkPrevTySet(sty)
       brkPrevIxSet(stmts[i])
@@ -1663,6 +1679,7 @@ export function checkBlockNode(n: Block, ix: i32) {
     }
     i = i + 1
   }
+  elabDeadRestClose(restMark)
   retTailPosSet(savedRTP)
   popScope()
   chkStmtBlkSet(savedStmtBlk)
