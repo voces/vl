@@ -2,21 +2,26 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
+import { weDigits } from "./check_write_effects"
 import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx } from "./check_ty_rep"
 import {
   ArrayLit,
   BinExpr,
+  Block,
   Call,
   FieldInit,
   FuncDecl,
+  Ident,
   Index,
   LetDecl,
   ObjLit,
   P,
   Param,
   Paren,
+  RetStmt,
   Spread,
+  TypeRef,
   elseIfLink,
   hasSpreadItem,
   i32ToStr,
@@ -1594,7 +1599,7 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
     return 0
   }
   // A binding to the one generic a set holds, whose root instances disagree, is an instance per
-  // signature of theirs: each use of the value runs it at one.
+  // signature of theirs when the declaration hands the value back: each use runs it at one.
   if ck >= 0 { return 0 }
   let at = -1
   let i = 0
@@ -1607,7 +1612,9 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
   }
   if at < 0 { return 0 }
   const ms = elabFnSetOf(tys[at])
-  if ms.length != 1 { return 0 }
+  if ms.length != 1 || !elabReturnsParam(elabCallDeclOf(ix), names[at]) {
+    return 0
+  }
   for f in elabMemberSigs(ms[0]) {
     const alt = tys.slice(0, tys.length)
     alt[at] = f
@@ -1616,6 +1623,70 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
     }
   }
   elabSettle(0)
+}
+
+// The name of declaration `d`'s parameter that hole or type parameter `nm` types, or "".
+function elabParamNameOf(d: i32, nm: string): string {
+  if d < 0 || d >= P.nodes.length { return "" }
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) { return "" }
+  let k = -1
+  if nm.length > 1 && nm[0] == '?' {
+    let dot = nm.length - 1
+    while dot > 0 && nm[dot] != '.' { dot = dot - 1 }
+    if dot > 0 { k = weDigits(nm.slice(dot + 1, nm.length)) }
+  }
+  let i = 0
+  while i < dn.fnParams.length {
+    const pn = nodeAt(dn.fnParams[i])
+    if pn is Param {
+      if i == k { return pn.parName }
+      if k < 0 && pn.parType >= 0 {
+        const tn = nodeAt(pn.parType)
+        if tn is TypeRef {
+          if tn.tyName == nm { return pn.parName }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether node `e` is the identifier `name`.
+function elabNamesIdent(e: i32, name: string): boolean {
+  if e < 0 || e >= P.nodes.length { return false }
+  const en = nodeAt(e)
+  if en is Ident { return en.identName == name }
+  false
+}
+
+// Whether declaration `d` returns, by a top-level `return` or its tail, the parameter `nm` types,
+// bare or handed to the call it returns.
+function elabReturnsParam(d: i32, nm: string): boolean {
+  const pn = elabParamNameOf(d, nm)
+  if pn == "" { return false }
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return false }
+  const b = nodeAt(dn.fnBody)
+  if !(b is Block) { return false }
+  let i = 0
+  while i < b.blkStmts.length {
+    let e = b.blkStmts[i]
+    const sn = nodeAt(e)
+    if sn is RetStmt { e = sn.retArg }
+    if (sn is RetStmt || i == b.blkStmts.length - 1) && e >= 0 {
+      if elabNamesIdent(e, pn) { return true }
+      const en = nodeAt(e)
+      if en is Call {
+        for a in en.callArgs {
+          if elabNamesIdent(a, pn) { return true }
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // The signature of each root instance of function `m`, at its closed parameters and result.
