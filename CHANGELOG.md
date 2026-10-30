@@ -8,7 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
-- **The elaboration enqueues before emit the instances the monomorphizer used to demand late (increment 3).** Files where mono enqueues an instance after `elabRun` settles fall from 589 to 50 of 17,267, over #5159–#5187, #5197–#5199, #5201 and #5202. What was fixed:
+- **The elaboration enqueues before emit the instances the monomorphizer used to demand late (increment 3).** Files where mono enqueues an instance after `elabRun` settles fall from 589 to 48 of 17,267, over #5159–#5187, #5197–#5199 and #5201–#5203. What was fixed:
   - hole-pin rows check banked were never drained when no root instance came first;
   - operator and index-operator dispatch recorded no call row;
   - a brand's erased pin, a numeric literal union's widened pin, and a declaration with nothing to bind refused or re-checked an instance;
