@@ -2656,6 +2656,7 @@ function judgeFnArgHoleCalls(
           const insts: i32[] = []
           genFnHoleCallInsts(vNames, wTys, k, vTys[k], calleeFn, insts)
           if insts.length > 1 && !noSplit { holeFnSplitAt(opFn, dhNames[j]) }
+          if !noSplit { holeFwdSplitAsk(opFn, dhNames[j], vNames, wTys, 0) }
           if insts.length > 1 { judgeHoleCallOps(opFn, vNames, wTys, a) }
           // A call moved out of a forwarding callee asks its own instance too, judged without a
           // split, as the direct spelling's call is (D13201).
@@ -3115,6 +3116,98 @@ function constRetFnNames(c: i32): string[] {
     }
   }
   gs
+}
+
+// Marks hole `hole` of `fn`, and the hole parameter of each function `fn` hands it on to by name,
+// as wanting a copy per instance when that function's body, bound at `fn`'s binding
+// `vNames`/`vTys`, calls it at two, directly or handing it on again (D14650). True when marked.
+function holeFwdSplitAsk(
+  fn: i32,
+  hole: string,
+  vNames: string[],
+  vTys: i32[],
+  depth: i32,
+): boolean {
+  if fn < 0 || fn >= P.nodes.length || depth > 4 { return false }
+  const f = nodeAt(fn)
+  if !(f is FuncDecl) || f.fnBody < 0 { return false }
+  let marked = false
+  let par = -1
+  let pi = 0
+  while pi < f.fnParams.length {
+    if paramHoleName(f.fnName, fn, pi) == hole { par = f.fnParams[pi] }
+    pi = pi + 1
+  }
+  if par < 0 { return false }
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const x = stack.pop() ?? -1
+    if x < 0 || x >= P.nodes.length { continue }
+    const xn = nodeAt(x)
+    if xn is FuncDecl { continue }
+    for kid in nodeChildren(x) {
+      if kid >= 0 { stack.push(kid) }
+    }
+    if !(xn is Call) { continue }
+    let named = false
+    for an in xn.callArgNames {
+      if an != "" { named = true }
+    }
+    const cf = nodeAt(parenPeelIx(xn.callFn))
+    if named || !(cf is Ident) { continue }
+    const ld = fnDeclIx[cf.identName] ?? -1
+    if ld < 0 || ld >= P.nodes.length || ld == fn { continue }
+    const l = nodeAt(ld)
+    if (
+      !(l is FuncDecl)
+      || l.fnTyParams.length > 0
+      || l.fnParams.length != xn.callArgs.length
+    ) {
+      continue
+    }
+    const lNames: string[] = []
+    const lTys: i32[] = []
+    let k = -1
+    let ai = 0
+    while ai < xn.callArgs.length {
+      const a = parenPeelIx(xn.callArgs[ai])
+      lNames.push(paramHoleName(l.fnName, ld, ai))
+      let t = -1
+      const ad = identDeclOf(a)
+      if ad >= 0 && ad < P.nodes.length && nodeAt(ad) is Param {
+        let q = 0
+        while q < f.fnParams.length {
+          if f.fnParams[q] == ad {
+            const vi = strListIndexOf(vNames, paramHoleName(f.fnName, fn, q))
+            if vi >= 0 && vi < vTys.length { t = vTys[vi] }
+          }
+          q = q + 1
+        }
+      }
+      if ad == par { k = ai }
+      if t < 0 { t = substTyDeep(nodeTyOf(a), vNames, vTys) }
+      lTys.push(t)
+      ai = ai + 1
+    }
+    if k >= 0 {
+      const insts: i32[] = []
+      genFnHoleCallInsts(lNames, lTys, k, lTys[k], ld, insts)
+      const ks: string[] = []
+      for li in insts {
+        const kk = tyToStr(li)
+        if strListIndexOf(ks, kk) < 0 { ks.push(kk) }
+      }
+      if (
+        ks.length > 1
+        || holeFwdSplitAsk(ld, lNames[k], lNames, lTys, depth + 1)
+      ) {
+        holeFnSplitAt(ld, lNames[k])
+        holeFnSplitAt(fn, hole)
+        marked = true
+      }
+    }
+  }
+  marked
 }
 
 // Marks the parameter of declared function `fn` whose hole is `hole` as wanting a copy per

@@ -144,3 +144,36 @@ Deno.test({
     }
   },
 });
+
+// A set whose members' bodies yield no value is called through like any other: its list holds
+// member ids, so the module needs no function table.
+const VOID_MEMBERS: string[] = [
+  "function inner<U>(u: U) { print(u) }",
+  "function other<V>(v: V) { print(v) }",
+  "function two() {",
+  "  const fs = [inner, other]",
+  "  fs[0](1)",
+  "  fs[1](2.5)",
+  "}",
+  "two()",
+];
+
+Deno.test({
+  name: "fn-set rep: a list of members that return nothing holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "voidMembers", VOID_MEMBERS);
+      const p = await wasmDis([`${dir}/voidMembers.wasm`]);
+      if (!p.success) throw new Error("wasm-dis voidMembers failed");
+      const tables =
+        new TextDecoder().decode(p.stdout).split("(table ").length - 1;
+      if (tables !== 0) {
+        throw new Error(`voidMembers: want no function table, got ${tables}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
