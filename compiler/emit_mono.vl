@@ -81,8 +81,13 @@ import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
 import { cwFnValueDeclOf } from "./check_write_scan"
-import { tyLeavesDisjoint } from "./check_type_shape"
-import { REC_REBUILT_DEPTH, recRebuiltRetRow } from "./check_bind_adopt"
+import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
+import {
+  REC_REBUILT_DEPTH,
+  callArgRepTy,
+  recRebuiltRetRow,
+  recRepWidens,
+} from "./check_bind_adopt"
 import { inferRetFnKey } from "./check_side_rows"
 import { recordClonedCallRetire } from "./check_asg_rows"
 import {
@@ -97,6 +102,7 @@ import { joinArmIsLit } from "./check_nj_join"
 import {
   callBindAgreedHoles,
   callBindHas,
+  callBindRepTyOf,
   callBindTyOf,
   holeFnSplitHas,
   holeLitCopiesOf,
@@ -7990,7 +7996,7 @@ function monoDefaultAnnTyParams(
       && !monoParamsMention(others, one)
       && !monoTyParamReachesSpelling(body, one, seen)
     ) {
-      const bt = callBindTyOf(callIx, tp)
+      const bt = callBindRepTyOf(callIx, tp)
       const sp = if bt >= 0 && bt < T.tys.length && !tyHasTyVar(bt) { monoPinAnnSpelling(bt) } else { "" }
       if sp == "" {
         monoBindTyParamDefault(tp, tvN, tvV, tvT)
@@ -10736,9 +10742,15 @@ function monoMakeInstanceLater(
 // The instance's return annotation node: its template's checked signature substituted through the
 // instance's binding (`elabRetOf`), the declared node where that names no type parameter, -1 for
 // none; -2 when a union it mints cannot be registered.
-function monoInstanceRet(fn: FuncDecl, ek: i32, tps: string[]): i32 {
+function monoInstanceRet(
+  fn: FuncDecl,
+  decl: i32,
+  ek: i32,
+  tps: string[],
+  pins: i32[],
+): i32 {
   if fn.fnRet >= 0 && !monoAnnHasTyParam(fn.fnRet, -1, tps) { return fn.fnRet }
-  const r = elabRetOf(ek)
+  const r = monoRetRepOf(decl, fn, pins, elabRetOf(ek))
   if r < 0 {
     if fn.fnRet < 0 { return -1 }
     return emitFail(
@@ -10756,6 +10768,38 @@ function monoInstanceRet(fn: FuncDecl, ek: i32, tps: string[]): i32 {
   // A literal union spelled by its alias carries the alias's row, whose rep the name promises.
   const at = if tyIsLitUnion(r) { litUnionAliasTyOfLitTexts(tyLitMemberTexts(r)) } else { -1 }
   synthTypeRefTy(nm, -1, if at >= 0 { at } else { r })
+}
+
+// Result `r` of the instance of `decl` at parameter pins `pins`, or the record pin every result
+// copies, where each result is a parameter or a binding of one and that pin widens `r`.
+function monoRetRepOf(decl: i32, fn: FuncDecl, pins: i32[], r: i32): i32 {
+  if r < 0 || r >= T.tys.length || !(tyAt(r) is TyObj) { return r }
+  let row = -1
+  for lf in recFnValueLeaves(decl) {
+    const pt = monoLeafParamPin(lf, fn, pins, 4)
+    if pt < 0 || (row >= 0 && !tySame(row, pt)) { return r }
+    row = pt
+  }
+  if recRepWidens(r, row) { row } else { r }
+}
+
+// The pin of the parameter of `fn` that value `lf` reads, directly or through un-annotated
+// bindings of one, else -1.
+function monoLeafParamPin(lf: i32, fn: FuncDecl, pins: i32[], depth: i32): i32 {
+  const u = unwrapParen(lf)
+  if u < 0 || depth <= 0 || !(nodeAt(u) is Ident) { return -1 }
+  const d = identDeclOf(u)
+  if d < 0 { return -1 }
+  let i = 0
+  while i < fn.fnParams.length && i < pins.length {
+    if fn.fnParams[i] == d { return pins[i] }
+    i = i + 1
+  }
+  const dn = nodeAt(d)
+  if dn is LetDecl && dn.letType < 0 && dn.letInit >= 0 {
+    return monoLeafParamPin(dn.letInit, fn, pins, depth - 1)
+  }
+  -1
 }
 
 // Gives closed undeclared record type `r` a row of its own, keyed by the type, when it has none:
@@ -11382,7 +11426,13 @@ function monoMakeInstanceGo(
     if fn.fnRet >= 0 {
       monoNicheNulListCheck(fn.fnRet, k.tps, tvN, tvV, letBN, letBT)
     }
-    const nret = monoInstanceRet(fn, ek, k.tps)
+    const nret = monoInstanceRet(
+      fn,
+      monoOrigNode[origFe],
+      ek,
+      k.tps,
+      pinnedTyIx,
+    )
     if nret < -1 { return elabWalkPop() - 1 }
     const nretW = if retWiden != "" { synthTypeRefTy(retWiden, -1, retWidenTy) } else { nret }
     const twoListTy = monoTwoListOf(elabRetOf(ek))
@@ -23015,7 +23065,11 @@ function monoPinHoleParam(
     }
   }
   // The elaboration's answer for the parameter at the call's template, where it closes.
-  const et = elabCallParamTy(monoCallTplOf(callIx), i)
+  const et = callArgRepTy(
+    monoCallTplOf(callIx),
+    i,
+    elabCallParamTy(monoCallTplOf(callIx), i),
+  )
   if an == "" {
     an = monoElabPin(callIx, args, i, et, ctx)
     if an != "" { anTy = et }
@@ -23208,7 +23262,11 @@ function monoPinAnnotatedParam(
         && ax >= 0
         && (nodeAt(ax) is ArrayLit || nodeAt(ax) is ObjLit)
       ) {
-        const et = elabCallParamTy(monoCallTplOf(callIx), i)
+        const et = callArgRepTy(
+          monoCallTplOf(callIx),
+          i,
+          elabCallParamTy(monoCallTplOf(callIx), i),
+        )
         an2 = monoElabPin(callIx, args, i, et, ctx)
         if an2 != "" { an2Ty = et }
       }
