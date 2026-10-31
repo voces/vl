@@ -81,7 +81,7 @@ import {
 import { parenPeelIx } from "./check_places"
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
 import { lpExitsOf } from "./check_if_value"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, i32ListIndexOf } from "./listutil"
 import {
   mintFactCallOf,
   mintFactInScope,
@@ -89,6 +89,7 @@ import {
   mintFactRsOf,
   mintFactSetOf,
   mintFactSplits,
+  mintParamSetOf,
   mintSetPartial,
 } from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
@@ -974,6 +975,48 @@ function ftHoleParamOf(c: Call, x: i32): boolean {
   false
 }
 
+// Whether callee `x` names a member of set `s` by its declaration, a direct call whatever the
+// set's rep; counted after the elaboration only.
+function ftLateDirectCall(x: i32, s: i32): boolean {
+  if !ftLate { return false }
+  const d = identDeclOf(x)
+  d >= 0
+    && d < P.nodes.length
+    && nodeAt(d) is FuncDecl
+    && i32ListHas(fnTagMembers(s), d)
+}
+
+// Whether argument `x` of call `c` to a named function may hold set `s`'s id: after the
+// elaboration, for a set the check left a closure, only where the callee's calls through that
+// parameter all take `s`, since a parameter handed on is typed where it lands.
+function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
+  if !ftLate || i32ListHas(ftWas, s) { return true }
+  const d = ftNamedFn(parenPeelIx(c.callFn))
+  if d < 0 { return true }
+  mintParamSetOf(d, i32ListIndexOf(c.callArgs, x)) == s
+}
+
+// Whether, after the elaboration, argument `x` of call `c` through a set of functions lands in a
+// parameter every member's calls through take as set `s`, so the id is what each member reads.
+// Only a list element read or a loop variable over one is such a callee.
+function ftLateArgOfSet(c: Call, x: i32, s: i32): boolean {
+  if !ftLate || mintSetPartial(s) { return false }
+  const i = i32ListIndexOf(c.callArgs, x)
+  if i < 0 || (i < c.callArgNames.length && c.callArgNames[i] != "") {
+    return false
+  }
+  const cf = parenPeelIx(c.callFn)
+  const cd = identDeclOf(cf)
+  const viaLoop = cd >= 0 && cd < P.nodes.length && nodeAt(cd) is LoopVar
+  if cf < 0 || !(nodeAt(cf) is Index || viaLoop) { return false }
+  const ds = fnTagMembers(fnTagSetOfTy(nodeTyIxOf(cf)))
+  if ds.length == 0 { return false }
+  for d in ds {
+    if mintParamSetOf(d, i) != s { return false }
+  }
+  true
+}
+
 // The deliveries of a choice to a closed function type noted by this check.
 let ftEscapes: i32[] = []
 
@@ -988,8 +1031,12 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       return true
     }
     Call => {
-      if pn.callFn == x { return fnTagCallSetOf(p) == s }
-      return ftParamOfSet(pn, x, s) || ftSlotWriteArg(pn, x, s)
+      if pn.callFn == x {
+        return fnTagCallSetOf(p) == s || ftLateDirectCall(x, s)
+      }
+      return (ftParamOfSet(pn, x, s) && ftLateParamOk(pn, x, s))
+        || ftSlotWriteArg(pn, x, s)
+        || ftLateArgOfSet(pn, x, s)
     }
     // A binding's annotation delivers the value to a declared function type, a closure.
     LetDecl => {
