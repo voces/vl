@@ -2,6 +2,7 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
+import { monoIsGenericDecl } from "./emit_base"
 import { decDigitsOf } from "./strutil"
 import { constListFnElemDecl } from "./check_calls"
 
@@ -9,6 +10,7 @@ import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx } from "./check_ty_rep"
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
   Call,
@@ -16,7 +18,9 @@ import {
   FuncDecl,
   Ident,
   Index,
+  IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   ObjLit,
   P,
@@ -25,6 +29,7 @@ import {
   RetStmt,
   Spread,
   TypeRef,
+  callTyArgsOf,
   elseIfLink,
   hasSpreadItem,
   i32ToStr,
@@ -199,14 +204,82 @@ let elabDeadKs: {[i32]: i32[]} = Map()
 const ELAB_MAX_KEYS = 20000
 
 function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
-  // Sorted by name, so two calls binding the same names in another order share a key.
+  // Sorted by name, so two calls binding the same names in another order share a key; a body
+  // testing a type parameter spells each binding exactly, a set apart from its map (D2684).
+  const exact = elabTestsTyVar(decl)
   let k = ""
   for o in elabNameOrder(names) {
     if o < tys.length {
-      k = k + names[o] + "=" + elabBindStr(tys[o], false) + ";"
+      k = k + names[o] + "=" + elabBindStr(tys[o], exact) + ";"
     }
   }
   i32ToStr(decl) + "|" + k
+}
+
+// Per declaration: 1 when its body tests a value of a type parameter, directly or by handing one
+// to a generic that does; 0 when not. A declaration on the walk's stack reads as "no".
+let elabExactMemo: {[i32]: i32} = Map()
+let elabExactOnStack: {[i32]: boolean} = Map()
+
+// Whether generic `decl`'s body tests a value whose type names a type parameter (D2684).
+export function elabTestsTyVar(decl: i32): boolean {
+  if decl < 0 || decl >= P.nodes.length { return false }
+  const m = elabExactMemo.get(decl) ?? -1
+  if m >= 0 { return m == 1 }
+  if elabExactOnStack.get(decl) ?? false { return false }
+  const fn = nodeAt(decl)
+  if !(fn is FuncDecl) { return false }
+  elabExactOnStack.set(decl, true)
+  const r = elabTestsTyVarIn(fn.fnBody)
+  elabExactOnStack.set(decl, false)
+  if r || !elabExactCycleOpen() {
+    elabExactMemo.set(decl, if r { 1 } else { 0 })
+  }
+  r
+}
+
+// Whether a declaration is still on the walk's stack, so a "no" read off it is provisional.
+function elabExactCycleOpen(): boolean {
+  for k in elabExactOnStack.keys() {
+    if elabExactOnStack.get(k) ?? false { return true }
+  }
+  false
+}
+
+// Whether node `ix`'s recorded type names a type parameter.
+function elabTyVarTyped(ix: i32): boolean {
+  const t = nodeTyIxOf(parenPeelIx(ix))
+  t >= 0 && tyHasTyVar(t)
+}
+
+// `elabTestsTyVar`'s walk over one subtree, nested lambdas included.
+function elabTestsTyVarIn(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is IsExpr && elabTyVarTyped(n.isObj) { return true }
+  if n is AsExpr && elabTyVarTyped(n.asObj) { return true }
+  if n is MatchExpr && elabTyVarTyped(n.matchScrut) { return true }
+  if n is Call && n.callFn >= 0 {
+    const cd = identDeclOf(n.callFn)
+    if cd >= 0 && nodeAt(n.callFn) is Ident && monoIsGenericDecl(cd) {
+      let passes = callTyArgsOf(ix).length > 0
+      let a = 0
+      while a < n.callArgs.length && !passes {
+        passes = elabTyVarTyped(n.callArgs[a])
+        a = a + 1
+      }
+      if passes && elabTestsTyVar(cd) { return true }
+    }
+  }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    for kid in nodeSpineChildren(cur) {
+      if elabTestsTyVarIn(kid) { return true }
+    }
+    cur = elseIfLink(cur)
+  }
+  false
 }
 
 // One binding's spelling in a key; `canon` spells each union's members in sorted order.
@@ -631,6 +704,7 @@ function elabCanon(
   names: string[],
   tys: i32[],
 ): boolean {
+  const exact = elabTestsTyVar(decl)
   let i0 = 0
   while i0 < names0.length && i0 < tys0.length {
     const al = names0[i0]
@@ -642,7 +716,7 @@ function elabCanon(
     if !has && (elabOwnName(decl, nm) || elabSigReads(decl, nm)) {
       if !elabTyClosed(tys0[i0], 0) { return false }
       names.push(nm)
-      tys.push(widenLitTy(tys0[i0]))
+      tys.push(if exact { tys0[i0] } else { widenLitTy(tys0[i0]) })
     }
     i0 = i0 + 1
   }
@@ -1192,6 +1266,8 @@ function elabSigHasLit(f: TyFunc): boolean {
 function elabPinTakes(pin: i32, bt: i32): i32 {
   if bt < 0 { return 0 }
   if assignable(pin, bt) || tySame(pin, nomErasedTyIx(bt)) { return 1 }
+  // A pin spelled as the binding is, a set by its map or a record by its twin, is that binding.
+  if tyToStructStr(pin) == tyToStructStr(bt) { return 1 }
   if tySame(pin, elabLitBaseTy(bt, 6)) { return 2 }
   // A record pin wider than the binding is the record the argument is built at, its rep only.
   if recRepWidens(bt, pin) { return 2 }
@@ -1815,6 +1891,8 @@ export function elabRun() {
   ekNames = []
   ekTys = []
   ekIndex = Map()
+  elabExactMemo = Map()
+  elabExactOnStack = Map()
   ekKids = Map()
   elabKeyGuess = Map()
   ekParent = []
