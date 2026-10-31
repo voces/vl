@@ -11182,3 +11182,23 @@ three different totals across three runs). Under `$VL_FUEL` the root pool is off
 in one instance, as `vl test`'s compile pool already did; one predicate, `compile_pool_allowed`,
 gates both pools. The unpooled reading is a different, larger number than any pooled one, so a
 baseline taken from a pooled run is re-measured, not compared.
+
+## An instance's diagnostics are the program's only when the instance belongs to the program a build keeps (ruling, 2026-10-31)
+
+The elaboration re-checks each instance a program needs, and a diagnostic an instance owes the
+program is a check error (increment 3's error channel). Two rules bound which instances owe it.
+
+An instance is elaborated from a well-typed template, so the elaboration runs only when the rest
+of check raised nothing: run over an ill-typed program, it would report cascades with no cause of
+their own. A program with both kinds of error is refused in two rounds, the template's errors
+first and the instances' once those are fixed. It is never accepted, so soundness holds. The
+editor follows the same rule, since the LSP and the playground check through
+`checkSrc`/`checkSrcSym`, which reach the elaboration only on a clean check.
+
+A build that splits a function (`fn_split.vl`, D6210) throws away the program it first
+elaborated, so that program's instances are not the built program's. `vl build` reports the
+channel's diagnostics from the pass whose output stands: one whose emit succeeds, or fails with no
+split asked, and the split-applied pass. `vl check` never splits, so where the channel raises
+anything it runs the build, and reports nothing from the channel when the kept program raised
+nothing, or when the first pass asked for a split no applied pass followed. This holds until the
+elaboration instances per call tuple in place of the split plan (increment 3, slice (ii)).

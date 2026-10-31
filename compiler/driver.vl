@@ -113,6 +113,7 @@ import {
   nodeAt,
 } from "./ast"
 import { elabPrepare, emitProgram, sidKeyedTablesReset } from "./emit_sections"
+import { elabErrorCount, elabErrorsMuteSet } from "./emit_elab"
 import {
   srcmapModOfTok,
   srcmapPathOf,
@@ -1181,13 +1182,20 @@ function pipelineReset(): i32 {
   0
 }
 
+// How many instance diagnostics the last compile's split-applied pass raised; -1 when none ran.
+let fsApplyElabErrors = -1
+// Whether the last compile's first pass asked for a split: its program is not the one kept.
+let fsFirstAsked = false
+
 // 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error. A program whose only emit
 // error is a function binding wanting two signatures compiles again with an instance record
 // (`fn_split.vl`), once more per round that asks for a parse node no earlier round asked
 // for (D6262); when none builds, the first compile's error is the one reported.
 export function compileSrc(): i32 {
   fsReset()
+  fsApplyElabErrors = -1
   const rc = compileSrcOnce()
+  fsFirstAsked = fsAsked()
   if rc != 3 || !fsAsked() { return rc }
   let going = true
   while going {
@@ -1197,9 +1205,10 @@ export function compileSrc(): i32 {
     } else {
       fsSetMode(FS_APPLY)
       const rc3 = compileSrcOnce()
-      if rc3 == 0 {
+      // The applied plan's program is the one built, so its type errors are the program's.
+      if rc3 == 0 || rc3 == 2 {
         fsSetMode(FS_COMPILE)
-        return 0
+        return rc3
       }
       if rc3 != 3 || !fsGrew() { going = false }
     }
@@ -1257,8 +1266,16 @@ function compileSrcOnce(): i32 {
     xt = xt + 1
   }
   if fsModeOf() == FS_PLAN { return fsPlan(root) }
+  // Read before emit, which may elaborate again and drop what that raises.
+  const owed = elabErrorCount()
+  if fsModeOf() == FS_APPLY { fsApplyElabErrors = owed }
   const rc = emitProgram(root)
-  if rc < 0 { return 3 }
+  // A program a split does not replace owes its instances' diagnostics (`elabErrors`).
+  if rc < 0 && (fsAsked() || owed == 0) {
+    while T.diags.length > 0 { T.diags.pop() }
+    return 3
+  }
+  if owed > 0 { return 2 }
   emitSrcSection()
   emitExternBoolSection()
   0
@@ -1304,6 +1321,23 @@ export function rbyteStore(off: i32, count: i32): i32 {
 // valid program the emitter cannot yet lower — an emit-coverage gap is not a check
 // failure. Shares the diagnostic stores (`diagLen`/`diagAt`) with `compileSrc`.
 export function checkSrc(): i32 {
+  // Instances' diagnostics are the program's only when they belong to the program a build
+  // keeps: where they arise, the build decides, and a clean build checks again without them.
+  const rc = checkSrcOnce()
+  if elabErrorCount() == 0 { return rc }
+  const built = compileSrc()
+  fsReset()
+  elabErrorsMuteSet(
+    built == 0
+      || fsApplyElabErrors == 0
+      || (fsFirstAsked && fsApplyElabErrors < 0),
+  )
+  const again = checkSrcOnce()
+  elabErrorsMuteSet(false)
+  again
+}
+
+function checkSrcOnce(): i32 {
   plusLinksClear()
   symSetEnabled(0)
   pipelineReset()
@@ -5193,8 +5227,14 @@ function modCompile(emit: i32): i32 {
   elabPrepare(merged)
   if fsModeOf() == FS_PLAN { return fsPlan(merged) }
   if emit != 0 {
+    const owed = elabErrorCount()
+    if fsModeOf() == FS_APPLY { fsApplyElabErrors = owed }
     const rc = emitProgram(merged)
-    if rc < 0 { return 3 }
+    if rc < 0 && (fsAsked() || owed == 0) {
+      while T.diags.length > 0 { T.diags.pop() }
+      return 3
+    }
+    if owed > 0 { return 2 }
     emitSrcSection()
     emitExternBoolSection()
   }
