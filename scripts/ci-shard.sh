@@ -40,10 +40,12 @@ FUEL_WARM=64
 
 # The native rows are the mean over two PR runs (41191375015, 41194363060; 2026-10-31) of each
 # file's summed test seconds, every native file listed: a sub-second file left at the default 2
-# overcharged its shard, and a 26 s one missing from the table sat on the critical path at 2. A
+# overcharged its shard, and a 26 s one missing from the table sat on the critical path at 2. The
+# headroom test is charged a whole shard (58, not its 26): it is one serial test, and beside a
+# full shard it ran 39 s (run 41197180464), so it is the floor of whichever shard holds it. A
 # self-sharded file's row is its whole cost, and each shard is charged 1/n of it.
 WEIGHTS='
-vl_seed_gc_headroom_test.ts 26
+vl_seed_gc_headroom_test.ts 58
 vl_check_filed_witnesses_test.ts 16
 selfhost_native_release_inline_test.ts 14
 vl_distilled_tools_test.ts 14
