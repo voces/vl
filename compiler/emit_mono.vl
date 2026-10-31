@@ -1698,7 +1698,8 @@ function monoPinKeepsInlineLits(named: i32, arg: i32): boolean {
 }
 
 // Whether a pin's row spelling `named` denotes another type than the closed record `arg` it
-// stores, or than a list of such records at the same depth: the two share the row, which keys
+// stores, or than a list of such records at the same depth: the two share the row (a record with
+// no row of its own whose `null` fields land in nullable ones is stored in that row), which keys
 // a field by its storage, so the parameter takes the argument's type.
 function monoPinRowNamesOtherTy(named: i32, arg: i32): boolean {
   if named < 0 || arg < 0 || named >= T.tys.length || arg >= T.tys.length {
@@ -1711,7 +1712,31 @@ function monoPinRowNamesOtherTy(named: i32, arg: i32): boolean {
     return monoPinRowNamesOtherTy(na.aElem, aa.aElem)
   }
   if !(aa is TyObj) { return false }
-  repRowId(named) == repRowId(arg)
+  if repRowId(named) == repRowId(arg) { return true }
+  structRowRecordingTy(arg) < 0
+    && structRowRecordingTy(named) >= 0
+    && monoObjNullFieldsOf(arg, named)
+}
+
+// Whether record `arg` has `named`'s fields, each of the same type or `null` where `named`'s is
+// nullable, and at least one such `null`.
+function monoObjNullFieldsOf(arg: i32, named: i32): boolean {
+  const a = tyAt(arg)
+  const n = tyAt(named)
+  if !(a is TyObj) || !(n is TyObj) { return false }
+  if a.objFieldNames.length != n.objFieldNames.length { return false }
+  let nul = false
+  let i = 0
+  while i < a.objFieldNames.length {
+    const j = strListIndexOf(n.objFieldNames, a.objFieldNames[i])
+    if j < 0 { return false }
+    const af = a.objFieldTypes[i]
+    const nf = n.objFieldTypes[j]
+    if af == TY_NULL && nf >= 0 && tyAt(nf) is TyNullable { nul = true }
+    else if !tySame(af, nf) { return false }
+    i = i + 1
+  }
+  nul
 }
 
 // `ty`'s inner type when it is a filled nullable, else `ty`.
@@ -10245,6 +10270,9 @@ function monoMakeInstanceParams(
             unTyKeyTagParam(),
           )
           nt = monoSynthPinRef(pinName, pinTys[pj])
+          if monoPinRowNamesOtherTy(nodeTyIxOf(nt), pinTys[pj]) {
+            nt = synthTypeRefTy(pinName, -1, pinTys[pj])
+          }
           // A literal-union arm beside a scalar (`T | i32` at `T := K`) boxes under a row too,
           // and no direct spelling minted one (D5310).
           if monoTyHoldsLitUnionArm(nodeTyIxOf(nt)) {
@@ -23044,6 +23072,19 @@ function monoArgClosedTyIn(ax: i32, ctx: i32, pinTy: i32): i32 {
   -1
 }
 
+// Pin `name` of argument `ax`, or, where `name` is the unbound default because the argument's
+// own type stays open, the pin of the closed type `ct` it is read at.
+function monoOpenArgDefaultPin(name: string, ax: i32, ct: i32): string {
+  if name != MONO_UNBOUND_TY_PARAM_DEFAULT || ax < 0 { return name }
+  const own = nodeTyIxOf(unwrapParen(ax))
+  if own < 0 || own >= T.tys.length || !tyHasTyVar(own) { return name }
+  if ct < 0 || ct >= T.tys.length || tyHasTyVar(ct) || tySame(ct, i32TyIx()) {
+    return name
+  }
+  const cn = monoClosedTyPin(ct)
+  if cn == "" { name } else { cn }
+}
+
 // Whether an argument is a list by its type: `closedTy` where `monoArgClosedTyIn` closed it, else
 // the shape of its open pin type `openTy` (an empty `[]` stays `T[]` at every instance).
 function monoTyIsArrayShaped(closedTy: i32, openTy: i32): boolean {
@@ -23148,6 +23189,13 @@ function monoPinAnnotatedParam(
       an2Ty = rowTy[0]
     }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
+    if ann == tp {
+      an2 = monoOpenArgDefaultPin(
+        an2,
+        args[i],
+        monoArgClosedTyIn(args[i], ctx, an2Ty),
+      )
+    }
     if an2 == "" {
       if ann == tp && nodeAt(args[i]) is Ident {
         fsAsk(args[i])

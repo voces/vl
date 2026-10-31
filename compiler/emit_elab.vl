@@ -17,6 +17,7 @@ import {
   Ident,
   Index,
   LetDecl,
+  Member,
   ObjLit,
   P,
   Param,
@@ -40,7 +41,7 @@ import {
   recKeptFnDecl,
   recKeptFnDstOf,
 } from "./check_rec_rows"
-import { cwPeelValue } from "./check_write_scan"
+import { cwFnValueDeclOf, cwPeelValue } from "./check_write_scan"
 import { recordRepTyAdopt } from "./check_fit_rules"
 import { recInferredFnOf } from "./check_rec_fresh"
 import { parenPeelIx } from "./check_places"
@@ -1376,7 +1377,9 @@ function elabParamArgTargets(k: i32, x: i32): i32[] {
   const f = nodeAt(ekDecl[k])
   if !(f is FuncDecl) { return [-1] }
   const pi = i32ListIndexOf(f.fnParams, d)
-  const cs = elabKeyCalls[k] ?? []
+  // An instance at a set's rep is reached by the calls whose rows it reps.
+  let cs = elabKeyCalls[k] ?? []
+  if cs.length == 0 { cs = elabRepRowCalls[k] ?? [] }
   if pi < 0 || cs.length == 0 { return [-1] }
   const out: i32[] = []
   for c in cs {
@@ -1444,6 +1447,7 @@ function elabSetCallRows(
     if (
       (own.length == 0 || own[0] < 0)
       && (elabKeyCalls[from] ?? []).length == 0
+      && (elabRepRowCalls[from] ?? []).length == 0
       && elabTyClosed(ct, 0)
     ) {
       return 0
@@ -1602,6 +1606,7 @@ export function elabRun() {
   elabReadsMemo = Map()
   elabCallKeys = Map()
   elabKeyCalls = Map()
+  elabRepRowCalls = Map()
   elabLitArg = Map()
   elabArgInner = Map()
   elabSpreadInner = Map()
@@ -1963,6 +1968,178 @@ function elabLamCallRep(lam: i32, pi: i32, pt: i32): i32 {
   rep
 }
 
+// Type `t` (a container of a set of functions) at the signature every function call `ix`'s callee
+// writes into it through the parameter whose hole is `hole` has (`p.push(f)`, `p.set(k, f)`,
+// `p[i] = f`, a generic at its D4551 default); -1 when it writes none, or two that disagree.
+function elabWrittenRep(ix: i32, hole: string, t: i32): i32 {
+  const d = elabCallDeclOf(ix)
+  if d < 0 || d != elabHoleDeclOf(hole) { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) { return -1 }
+  let dot = hole.length - 1
+  while dot > 0 && hole[dot] != '.' { dot = dot - 1 }
+  const pi = decDigitsOf(hole.slice(dot + 1, hole.length))
+  if pi < 0 || pi >= dn.fnParams.length { return -1 }
+  const vals: i32[] = []
+  elabParamWrites(dn.fnBody, dn.fnParams[pi], vals)
+  if vals.length == 0 { return -1 }
+  // A record literal written there holds its function-valued fields.
+  const fns: i32[] = []
+  for v in vals {
+    const vn = nodeAt(parenPeelIx(v))
+    if vn is ObjLit {
+      for fi in vn.objFields {
+        const f = nodeAt(fi)
+        if f is FieldInit { fns.push(f.fiValue) }
+      }
+    } else {
+      fns.push(v)
+    }
+  }
+  let sig = -1
+  for v in fns {
+    const fd = cwFnValueDeclOf(v)
+    let st = if fd >= 0 { nodeTyIxOf(fd) } else { -1 }
+    // A generic written there is built at its default (D4551).
+    if st >= 0 && !elabTyClosed(st, 0) { st = elabDefaultSig(fd) }
+    if st < 0 || !elabTyClosed(st, 0) { return -1 }
+    if sig >= 0 && !tySame(sig, st) { return -1 }
+    sig = st
+  }
+  elabReplaceFnTy(t, sig, 0)
+}
+
+// Appends to `out` each value the code under `ix`, outside a nested function, writes into the
+// parameter `pd`'s slots: `pd.push(v)`, `pd.unshift(v)`, `pd.set(k, v)` and `pd[i] = v`.
+function elabParamWrites(ix: i32, pd: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is FuncDecl { return 0 }
+  if n is Call && n.callArgs.length > 0 {
+    const f = nodeAt(parenPeelIx(n.callFn))
+    if f is Member && identDeclOf(parenPeelIx(f.memObj)) == pd {
+      if f.memProp == "push" || f.memProp == "unshift" {
+        out.push(n.callArgs[0])
+      }
+      if f.memProp == "set" && n.callArgs.length == 2 {
+        out.push(n.callArgs[1])
+      }
+    }
+  }
+  if n is BinExpr && n.binOp == "=" {
+    const l = nodeAt(parenPeelIx(n.binLeft))
+    if l is Index && identDeclOf(parenPeelIx(l.idxArr)) == pd {
+      out.push(n.binRight)
+    }
+  }
+  for c in nodeChildren(ix) { elabParamWrites(c, pd, out) }
+  0
+}
+
+// Type `t` with each function type inside it, through lists, maps and record fields, replaced by
+// `sig`; -1 past the depth bound.
+function elabReplaceFnTy(t: i32, sig: i32, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length || depth > 8 { return -1 }
+  const x = tyAt(t)
+  match x {
+    TyFunc => sig
+    TyArray => {
+      const e = elabReplaceFnTy(x.aElem, sig, depth + 1)
+      if e < 0 { -1 } else { mkArrayTy(e) }
+    }
+    TyMap => {
+      const e = elabReplaceFnTy(x.mVal, sig, depth + 1)
+      if e < 0 { -1 } else { mkMapTy(x.mKey, e, x.mSet) }
+    }
+    TyObj => {
+      const fs: i32[] = []
+      for ft in x.objFieldTypes {
+        const e = elabReplaceFnTy(ft, sig, depth + 1)
+        if e < 0 { return -1 }
+        fs.push(e)
+      }
+      mkObjTy(x.objFieldNames, fs)
+    }
+    TyNullable => {
+      const e = elabReplaceFnTy(x.nInner, sig, depth + 1)
+      if e < 0 { -1 } else { mkNullableTy(e) }
+    }
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => t
+  }
+}
+
+// Whether some instance of `m` that is not a guess has been enqueued.
+function elabCalledAnywhere(m: i32): boolean {
+  let k = 0
+  while k < ekDecl.length {
+    if ekDecl[k] == m && !(elabGuessKeys[k] ?? false) { return true }
+    k = k + 1
+  }
+  false
+}
+
+// The signature generic `m` runs at when call `ix`'s callee, bound at `names`/`tys`, calls it through
+// the parameter whose hole is `hole`: its type parameters bound from those calls' arguments, a
+// lambda argument by its instance at the parameter types already bound; -1 when they do not close
+// or disagree.
+function elabGenericCallRep(
+  ix: i32,
+  hole: string,
+  m: i32,
+  names: string[],
+  tys: i32[],
+): i32 {
+  const d = elabCallDeclOf(ix)
+  const msig = if m >= 0 && m < P.nodes.length { nodeTyIxOf(m) } else { -1 }
+  if d < 0 || d != elabHoleDeclOf(hole) || msig < 0 || msig >= T.tys.length {
+    return -1
+  }
+  const dn = nodeAt(d)
+  const mf = tyAt(msig)
+  if !(dn is FuncDecl) || !(mf is TyFunc) { return -1 }
+  let dot = hole.length - 1
+  while dot > 0 && hole[dot] != '.' { dot = dot - 1 }
+  const pi = decDigitsOf(hole.slice(dot + 1, hole.length))
+  if pi < 0 || pi >= dn.fnParams.length { return -1 }
+  const calls: i32[] = []
+  elabCallsThrough(dn.fnBody, dn.fnParams[pi], calls)
+  let rep = -1
+  for c in calls {
+    const cn = nodeAt(c)
+    if !(cn is Call) || cn.callArgs.length != mf.fnParamTypes.length {
+      return -1
+    }
+    const bn: string[] = []
+    const bt: i32[] = []
+    const lams: i32[] = []
+    let j = 0
+    while j < cn.callArgs.length {
+      const a = parenPeelIx(cn.callArgs[j])
+      if a >= 0 && nodeAt(a) is FuncDecl {
+        lams.push(j)
+      } else {
+        const at = substTyDeep(nodeTyIxOf(cn.callArgs[j]), names, tys)
+        if at < 0 || !elabTyClosed(at, 0) { return -1 }
+        bindGenWalk(mf.fnParamTypes[j], widenLitTy(at), bn, bt)
+      }
+      j = j + 1
+    }
+    for lj in lams {
+      const lp = substTyDeep(mf.fnParamTypes[lj], bn, bt)
+      const lf = if lp >= 0 && lp < T.tys.length { tyAt(lp) } else { mf }
+      if !(lf is TyFunc) || !tysClosed(lf.fnParamTypes) { return -1 }
+      const ft = elabMemberAt(parenPeelIx(cn.callArgs[lj]), lf.fnParamTypes)
+      if ft < 0 { return -1 }
+      bindGenWalk(mf.fnParamTypes[lj], ft, bn, bt)
+    }
+    const f = substTyDeep(msig, bn, bt)
+    if f < 0 || !elabTyClosed(f, 0) { return -1 }
+    if rep >= 0 && !tySame(rep, f) { return -1 }
+    rep = f
+  }
+  rep
+}
+
 // Appends to `out` each call under node `ix`, outside a nested function, whose callee reads the
 // parameter `pd`.
 function elabCallsThrough(ix: i32, pd: i32, out: i32[]) {
@@ -2007,15 +2184,39 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
   const rep: i32[] = []
   let moved = false
   elabRepStubbed = false
+  let i0 = 0
   for t in tys {
-    const rt = elabSetRepTy(t, 4, ck)
+    const stubbed0 = elabRepStubbed
+    elabRepStubbed = false
+    // The one generic a set holds runs at what the callee's own calls through the parameter bind,
+    // else at the set's rep.
+    let rt = -1
+    const ms = elabFnSetOf(t)
+    if ms.length == 1 && i0 < names.length && !elabIsHoleFn(ms[0]) {
+      rt = elabGenericCallRep(ix, names[i0], ms[0], names, tys)
+    }
+    // A set the callee writes functions into through the parameter runs at their signature.
+    const held: i32[] = []
+    elabFnIdsIn(t, held, 0)
+    if rt < 0 && i0 < names.length && held.length > 0 {
+      rt = elabWrittenRep(ix, names[i0], t)
+    }
+    if rt < 0 { rt = elabSetRepTy(t, 4, ck) }
+    elabRepStubbed = elabRepStubbed || stubbed0
     if rt != t { moved = true }
     rep.push(rt)
+    i0 = i0 + 1
   }
   if moved && rep.length > 0 && tysClosed(rep) {
     // A set no member gives a signature reps as a stub no call reaches, so its instance is a guess.
     elabGuessing = elabRepStubbed
-    elabReachNote(-1, elabEnqueue(elabCallDeclOf(ix), names, rep, -1), -1)
+    const rk = elabEnqueue(elabCallDeclOf(ix), names, rep, -1)
+    elabReachNote(-1, rk, -1)
+    if rk >= 0 {
+      const rc = elabRepRowCalls[rk] ?? []
+      if !i32ListHas(rc, ix) { rc.push(ix) }
+      elabRepRowCalls[rk] = rc
+    }
     elabGuessing = false
     elabSettle(0)
     return 0
@@ -2161,15 +2362,18 @@ function elabSetRepTy(t: i32, depth: i32, ck: i32): i32 {
   if ms.length == 0 { return t }
   let rep = -1
   for m in ms {
-    // A generic no instance reaches is built at its default (D4551).
+    // A generic no instance reaches is built at its default (D4551), unless calls elsewhere
+    // instance it, when it gives the set nothing and an unwritten set reps as the stub (D4123).
+    let skip = false
     if ck >= 0 && elabReachedOf(ck, m) == -1 {
-      const d = elabDefaultSig(m)
+      skip = elabCalledAnywhere(m)
+      const d = if skip { -1 } else { elabDefaultSig(m) }
       if d >= 0 {
         if rep >= 0 && !tySame(rep, d) { return -1 }
         rep = d
       }
     }
-    for k in elabRepInstances(ck, m) {
+    for k in if skip { [] } else { elabRepInstances(ck, m) } {
       if k < 0 { return -1 }
       const sig = nodeTyIxOf(m)
       const sf = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { ty }
@@ -3004,6 +3208,8 @@ let ekReach: i32[][] = []
 let elabCallKeys: {[i32]: i32[]} = Map()
 // The calls that reached each instance: key → call nodes.
 let elabKeyCalls: {[i32]: i32[]} = Map()
+// Each instance at a set's rep (`elabSetRepRow`): key → the calls whose rows it reps.
+let elabRepRowCalls: {[i32]: i32[]} = Map()
 // Each list or record literal argument of a call an instance reaches: literal → [call, position].
 let elabLitArg: {[i32]: i32[]} = Map()
 // Each list literal nested in such an argument's elements → the list literal holding it.

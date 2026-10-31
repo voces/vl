@@ -2010,6 +2010,29 @@ function elabUnionArgPin(f: FuncDecl, n: Call, tp: string): i32 {
   TY_I32
 }
 
+// The binding a call re-asks deferred constraints under, onto `outN`/`outT`: a call naming no
+// declaration leaves out the enclosing scope's type parameters as it binds them, which match
+// other generics' by name only and whose constraints the enclosing function's own pin asks.
+function cstrPinBinding(
+  cstrCallee: i32,
+  vNames: string[],
+  vTys: i32[],
+  outN: string[],
+  outT: i32[],
+) {
+  let i = 0
+  while i < vNames.length && i < vTys.length {
+    let sc = tpEnvNames.length - 1
+    while sc >= 0 && tpEnvNames[sc] != vNames[i] { sc = sc - 1 }
+    if (cstrCallee != CSTR_NODECL || sc < 0 || !tySame(tpEnvTys[sc], vTys[i])) {
+      outN.push(vNames[i])
+      outT.push(vTys[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
 // The pins an ordinary call's type-parameter bindings `vNames`/`vTys` give its callee: every
 // constraint the body deferred is validated under them, the declared bounds are judged, and
 // the substituted return is answered (`retTy0` with the bindings applied).
@@ -2045,6 +2068,20 @@ function callFtyPinCstrs(
   // A call typed through a constant list's element owns that element's constraints only.
   if cstrCallee == CSTR_NODECL && constListFnElemTy(n.callFn) >= 0 {
     cstrCallee = constListFnElemDecl(n.callFn)
+  }
+  // In an instance's re-check, a call through a value holding one generic owns that generic's
+  // constraints only.
+  if cstrCallee == CSTR_NODECL && elabCapLive() {
+    const one = elabCalleeFnId(n.callFn)
+    const od = if one >= 0 && one < P.nodes.length { nodeAt(one) } else { nodeAt(0) }
+    if (
+      one >= 0
+      && one < P.nodes.length
+      && od is FuncDecl
+      && od.fnTyParams.length > 0
+    ) {
+      cstrCallee = one
+    }
   }
   // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
   // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
@@ -2119,9 +2156,12 @@ function callFtyPinCstrs(
       fsbArgTysOf(ft, vNames, vTys),
     )
   }
+  const cNames: string[] = []
+  const cTys: i32[] = []
+  cstrPinBinding(cstrCallee, vNames, vTys, cNames, cTys)
   validateBinCstrs(
-    vNames,
-    vTys,
+    cNames,
+    cTys,
     ix,
     cstrCallee,
     cstrWho,
@@ -2129,20 +2169,20 @@ function callFtyPinCstrs(
     dhArgNo,
     dhArgNode,
   )
-  validatePrintCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-  validateNestCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-  validateIsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-  validateArgCstrs(vNames, vTys, ix, cstrCallee, dhNames, dhArgNode)
+  validatePrintCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  validateNestCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  validateIsCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  validateArgCstrs(cNames, cTys, ix, cstrCallee, dhNames, dhArgNode)
   forElemArgCstrs(n.callFn, ft, vNames, vTys)
   // The declared return rides the same pin: the body's mismatch check is vacuous under
   // a hole, and this is the first position that knows the instance (D551).
-  validateRetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateRetCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
   // The destination seam, for the same reason: a value landing in a hole-typed local /
   // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
-  validateLetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateLetCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
   // A builtin collection method's argument inside the body, for the same reason at a
   // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
-  validateBmCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateBmCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
   // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
   if !inferQuiet {
     let oa = 0
@@ -2155,8 +2195,8 @@ function callFtyPinCstrs(
   // the operation on a type variable correctly (a `T` pinned to a collection has it), and
   // this is the first position that knows which rep `T` became (D651 / D691).
   validateMemCstrs(
-    vNames,
-    vTys,
+    cNames,
+    cTys,
     ix,
     cstrCallee,
     cstrWho,
@@ -2164,7 +2204,7 @@ function callFtyPinCstrs(
     dhArgNo,
     dhArgNode,
   )
-  validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateUfcsCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
   pinHoleLambdaArgs(vNames, vTys, ix, cstrCallee)
   validateRcwPins(vNames, vTys, cstrCallee)
   if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
