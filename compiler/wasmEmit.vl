@@ -3574,7 +3574,6 @@ function emitNulIsNullTest(
     // the one arm that must read the receiver raw: a kind-16 ident is otherwise recovered
     // to non-null, which would make `ref.is_null` a const 0.
     const nsCtx = expCtxHere(ec)
-    nsCtx.rawNullRead = true
     if emitExprExpect(body, refIx, fnIx, nsCtx) < 0 { return -1 }
     fbRefIsNull()
     if invert { fbI32Eqz() }
@@ -3642,7 +3641,6 @@ function emitNulStrLitEq(
   fbBlock(64)
 
   const rawCtx = expCtxHere(ec)
-  rawCtx.rawNullRead = true
   if emitExprExpect(body, recvIx, fnIx, rawCtx) < 0 { return -1 }
   fbBrOnNull(0)
   if emitStrEqLit(body, mkStr(lex, -1), fnIx, ec) < 0 { return -1 }
@@ -6746,7 +6744,7 @@ function emitArmFieldsFit(
 
 // The `string | null` read rule for a field of code `code`, shared by every struct and variant
 // field read and by the ident reads in `emitIdentNode`: a value read recovers the non-null ref.
-// A null test and a nullable-string target keep the raw ref (`nulStrReadStaysRaw`).
+// A read typed `string | null` keeps the raw ref (`nulStrReadRecovers`).
 function emitNulStrFieldRecover(code: i32, readIx: i32, fnIx: i32) {
   if code == FC_NUL_STR && nulStrReadRecovers(readIx, fnIx) { fbRefAsNonNull() }
   0
@@ -7908,7 +7906,6 @@ function emitNulMapArmBox(
   fbBlock(127) // i32: the tag, carried out when the value is null
   fbI32Rel(RS_TAG, tag)
   const nmCtx = expCtxHere(ec)
-  nmCtx.rawNullRead = true
   if emitExprExpect(body, exprIx, fnIx, nmCtx) < 0 { return -1 }
   fbBrOnNull(0)
   fbStructNew(uBoxIdx) // { tag, map struct ref }
@@ -9117,7 +9114,6 @@ function emitUnionArmValueBox(
       if nyNul {
         const nvSlot = nulNicheBoxSlot()
         const nvCtx = expCtxHere(ec)
-        nvCtx.rawNullRead = true
         if emitExprExpect(body, exprIx, fnIx, nvCtx) < 0 { return -1 }
         fbLocalTee(nvSlot)
         fbRefIsNull()
@@ -9857,7 +9853,6 @@ function emitUnionConcreteEq(
   }
   if nulStrOther {
     const rawCtx = expCtxHere(ec)
-    rawCtx.rawNullRead = true
     if emitExprExpect(body, otherIx, fnIx, rawCtx) < 0 { return -1 }
     fbRefIsNull()
     fbIf(127)
@@ -10005,7 +10000,6 @@ function emitUnionConcreteVariantEq(
   const otherNul = tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
   if otherNul {
     const rawCtx = expCtxHere(ec)
-    rawCtx.rawNullRead = true
     if emitExprExpect(body, otherIx, fnIx, rawCtx) < 0 { return -1 }
   } else if emitExpr(body, otherIx, fnIx, ec) < 0 {
     return -1
@@ -19195,7 +19189,6 @@ function emitEqNonNullCore(body: u8[], binIx: i32, fnIx: i32, ec: ExpCtx) {
 function emitEqOperandRaw(body: u8[], ix: i32, fnIx: i32, ec: ExpCtx) {
   if exprIsLitAtom(ix, fnIx) { return emitStrValue(body, ix, fnIx, ec) }
   const rawCtx = expCtxHere(ec)
-  rawCtx.rawNullRead = true
   emitExprExpect(body, ix, fnIx, rawCtx)
 }
 
@@ -25814,7 +25807,6 @@ function emitCallRefArg(
   const ac = expCtxHere(ec)
   // An argument's raw-read seeds are its parameter's alone, as at a direct call (D3816).
   ac.nulString = pkk == "nulstr"
-  ac.rawNullRead = false
   expCtxApply(ac, ec)
   const pck = sigParamCoerceKind(ckey, i)
   if pck == "i64" {
@@ -34622,7 +34614,6 @@ export type ExpCtx = {
   nulBool: boolean,     // a bare `null` is the sentinel 2
   nulLitUnion: boolean, // a bare `null` is the sentinel -1
   nulString: boolean,   // a bare `null` is `ref.null $sTypeIdx`
-  rawNullRead: boolean, // a nullable read stays the RAW ref
   litUnion: i32,        // a member StrLit lowers as its atom id
 }
 
@@ -34632,16 +34623,10 @@ export function expCtxDefault(): ExpCtx {
     nulBool: false,
     nulLitUnion: false,
     nulString: false,
-    rawNullRead: false,
     litUnion: 0,
   }
   return c
 }
-
-// Whether a `string | null` read stays the raw nullable ref rather than recovering with
-// `ref.as_non_null`: under a null test (`rawNullRead`) or a nullable-string target
-// (`nulString`), where recovering would trap. The reads and the `??` block type both ask it.
-function nulStrReadStaysRaw(ctx: ExpCtx) { ctx.rawNullRead || ctx.nulString }
 
 // A copy of `ec`, the base a site starts from, overriding only the fields it knows.
 export function expCtxHere(ec: ExpCtx): ExpCtx {
@@ -34649,7 +34634,6 @@ export function expCtxHere(ec: ExpCtx): ExpCtx {
     nulBool: ec.nulBool,
     nulLitUnion: ec.nulLitUnion,
     nulString: ec.nulString,
-    rawNullRead: ec.rawNullRead,
     litUnion: ec.litUnion,
   }
   return c
@@ -34661,7 +34645,6 @@ export function expCtxApply(c: ExpCtx, ec: ExpCtx) {
   ec.nulBool = c.nulBool
   ec.nulLitUnion = c.nulLitUnion
   ec.nulString = c.nulString
-  ec.rawNullRead = c.rawNullRead
   ec.litUnion = c.litUnion
   0
 }
@@ -34773,12 +34756,9 @@ function emitPrintNullWord() {
 function emitPrintNulString(body: u8[], argIx: i32, fnIx: i32, ec: ExpCtx) {
   fbBlock(64) // $out
   fbBlock(64) // $null
-  // The RAW nullable ref. Without `rawNullRead` a kind-16 read recovers itself with
-  // `ref.as_non_null` (0xd4) — which TRAPS on the very value this arm exists to handle,
-  // before `br_on_null` can see it. Same context flag the `??` arms over a nullable
-  // string set for their own `ref.is_null`.
+  // The RAW nullable ref: the argument is typed `string | null`, so its read stays raw
+  // (`nulStrReadRecovers`) and `br_on_null` sees the null a recovery would trap on.
   const rawCtx = expCtxHere(ec)
-  rawCtx.rawNullRead = true
   if emitExprExpect(body, argIx, fnIx, rawCtx) < 0 { return -1 }
   fbBrOnNull(0) // → $null (the enclosing block)
   fbLocalSet(strScratchBase + 0)
@@ -34795,7 +34775,6 @@ function emitPrintNulString(body: u8[], argIx: i32, fnIx: i32, ec: ExpCtx) {
 // never reaches, since no text would be right for it.
 function emitPrintNulRefNiche(body: u8[], argIx: i32, fnIx: i32, ec: ExpCtx) {
   const rawCtx = expCtxHere(ec)
-  rawCtx.rawNullRead = true
   if emitExprExpect(body, argIx, fnIx, rawCtx) < 0 { return -1 }
   fbRefIsNull()
   fbIf(64)
@@ -35163,10 +35142,9 @@ function emitStrCatOperand(
   ctx: ExpCtx,
   ec: ExpCtx,
 ) {
-  if ctx.nulString || ctx.rawNullRead {
+  if ctx.nulString {
     const opCtx = expCtxHere(ec)
     opCtx.nulString = false
-    opCtx.rawNullRead = false
     if exprIsLitAtom(ix, fnIx) {
       const saved = expCtxHere(ec)
       expCtxApply(opCtx, ec)
@@ -37945,7 +37923,6 @@ function emitDirectArgValue(
     argCtx.nulString = cParamNulString
     // A raw-read seed is the enclosing null test's or `??` arm's, never the argument's: left
     // set, a narrowed `string | null` reached a `string` parameter unrecovered (D3816).
-    argCtx.rawNullRead = false
     if cParamLitUnion { argCtx.litUnion = 1 }
     if cParamNulLitUnion {
       argCtx.litUnion = 1
@@ -38251,7 +38228,6 @@ function emitCapturedCall(
     }
     const capArg = expCtxHere(ec)
     capArg.nulString = cpKind == "nulstr"
-    capArg.rawNullRead = false
     expCtxApply(capArg, ec)
     if cuNm != "" {
       if emitUnionBoxArg(body, cuNm, cuTy, cargs[cai], fnIx, ec) < 0 {
@@ -38289,7 +38265,6 @@ function emitCapturedCall(
   capOut.litUnion = capSaved.litUnion
   capOut.nulLitUnion = capSaved.nulLitUnion
   capOut.nulString = capSaved.nulString
-  capOut.rawNullRead = capSaved.rawNullRead
   expCtxApply(capOut, ec)
   callRefDepth = crDepth
   // The target's own interned `$fnsig` — the functype it is actually declared with — so the
@@ -38622,13 +38597,10 @@ function coalesceNulStrStaysNullable(exprIx: i32, fnIx: i32, _ec: ExpCtx) {
 // The context one arm of a `string | null` `??` emits under: `raw` iff the arm's value may be
 // left as `(ref null $aTypeIdx)`, exactly the block type the lowering just declared.
 
-// Both halves of the read gate are overridden, not just `rawNullRead` — the arms otherwise
-// inherit the ambient `ec.nulString` from the consumer, and a nullable-string binding with
-// a non-null default read its arms raw inside a `(ref $aTypeIdx)` block. `nulStrReadStaysRaw`
-// is the disjunction: "recover" clears both flags, "stay raw" sets both.
+// The arms' `nulString` seed is overridden, so the consumer's does not reach a `null` arm built
+// inside a `(ref $aTypeIdx)` block.
 function coalesceNulStrArmCtx(raw: boolean, ec: ExpCtx): ExpCtx {
   const c = expCtxHere(ec)
-  c.rawNullRead = raw
   c.nulString = raw
   return c
 }
@@ -38799,7 +38771,6 @@ function emitUnionBoxNulNiche(
   // Read raw: a nullable-string ident is otherwise recovered non-null, which traps on the very
   // null this rung exists to box (D2260).
   const nnCtx = expCtxHere(ec)
-  nnCtx.rawNullRead = true
   if emitExprExpect(body, exprIx, fnIx, nnCtx) < 0 { return -1 }
   fbLocalTee(nnSlot)
   fbRefIsNull()
@@ -39855,13 +39826,12 @@ function emitCoalesceNiche(
   // the same `br_on_non_null` core as the nullable struct/collections — one evaluation of the
   // place, and the narrow is the branch.
 
-  // The lhs is read raw (`rawNullRead`) so an `array.get` stays nullable under every context,
+  // The lhs is typed `string | null`, so its read stays raw and an `array.get` stays nullable,
   // and the default follows the block type (`coalesceNulStrArmCtx`). Ungated on
   // re-readability: the core evaluates the operand ONCE, so a CALL takes this arm too —
   // gated, it fell past every niche to a lowering with the wrong heap (D1763).
   if exprNullableString(e.binLeft, fnIx) {
     const rawCtx = expCtxHere(ec)
-    rawCtx.rawNullRead = true
     const coNul = coalesceNulStrStaysNullable(exprIx, fnIx, ec)
     return emitCoalesceNulRefCtx(
       body,
@@ -40269,12 +40239,11 @@ function emitCoalesceCallStash(
       return 0
     }
     // `f() ?? d` over a CALL returning `string | null` (kind 16): STASH the nullable
-    // ref once (raw, via `ec.rawNullRead`), then a value-typed `if` on
+    // ref once (raw, by its type), then a value-typed `if` on
     // `ref.is_null` selects `d` or the recovered non-null string — the call analogue
     // of the `string | null` ident path.
     if exprNullableString(e.binLeft, fnIx) {
       const rawCCtx = expCtxHere(ec)
-      rawCCtx.rawNullRead = true
       // the raw nullable ref, ONCE
       if emitExprExpect(body, e.binLeft, fnIx, rawCCtx) < 0 { return -1 }
       fbLocalSet(coalesceCallStrSlot)
