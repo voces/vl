@@ -209,3 +209,37 @@ Deno.test({
     }
   },
 });
+
+// A list of a set built in a generic function's body is tagged like any other: each instance
+// dispatches at its own tuple.
+const IN_GENERIC_BODY: string[] = [
+  "function inc(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "function run<T>(v: T, n: i32) {",
+  "  const fs = [inc, dbl]",
+  "  print(fs[0](n) + fs[1](n))",
+  "  v",
+  "}",
+  'run("s", 3)',
+  "run(1.5, 4)",
+];
+
+Deno.test({
+  name: "fn-set rep: a list of a set in a generic body holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "inGenericBody", IN_GENERIC_BODY);
+      const p = await wasmDis([`${dir}/inGenericBody.wasm`]);
+      if (!p.success) throw new Error("wasm-dis inGenericBody failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`inGenericBody: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
