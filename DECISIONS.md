@@ -10881,11 +10881,12 @@ experiment built most of that and still moved three corpus files. Splitting per 
 the source rewrite instance-aware, which it is not. Copying needs one checker ask and no new
 lowering. Its price is one more split-plan case for increment 3 to delete with the plan.
 
-So the step-4 lane closed D14439 without the mint's emitter reader (D14430), and its blockers 2
-and 3 (arms per mint scope, a set with a leaf in a generic body) were not built. They stay the
-emitter reader's work, and they are not needed until a set reaching a split parameter, or any
-tagged set called at two tuples, has to be one id. D14732 is the first program that needs
-them: a tagged set handed to a hole parameter at one tuple and called directly at another.
+The step-4 lane closed D14439 through the split plan, and then built the mint's emitter reader
+(D14430) for the case it next needed: a call an instance makes through a parameter bound to a
+set is read through the one set its facts name, in the emitter and in mono (D14737). Arms stay
+per call node, not per mint scope (blocker 2), and a set with a leaf in a generic body stays
+untagged (blocker 3): a call reached at two tuples of one set keeps one arm set, which no
+program in the corpus or the inventory needs yet.
 
 ## A function-value set escapes as a lambda (step 4 S3a, 2026-10-26)
 
