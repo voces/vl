@@ -2054,7 +2054,72 @@ function cwFvAddValue(e: i32, out: i32[]): boolean {
     if n.blkStmts.length == 0 { return false }
     return cwFvAddValue(n.blkStmts[n.blkStmts.length - 1], out)
   }
+  // A call of a named function holds what every value it returns holds.
+  if n is Call { return cwFvAddCallResult(n, out) }
   cwFvAddNamed(v, out)
+}
+
+// Appends to `out` each value the statement `ix` returns, at any depth but a nested function's,
+// and when `tail` the value it yields as a body's tail: a block's last statement or each arm of
+// a tail `if`. False at a statement whose returns this does not follow (a loop, a `match`).
+function cwRetValues(ix: i32, tail: boolean, out: i32[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = nodeAt(ix)
+  match n {
+    RetStmt => {
+      if n.retArg >= 0 { out.push(n.retArg) }
+      true
+    }
+    Block => cwRetBlockValues(n.blkStmts, tail, out)
+    IfStmt => cwRetValues(n.ifThen, tail, out) && cwRetValues(n.ifElse, tail, out)
+    WhileStmt | ForIn | ForRange | MatchExpr => false
+    LetDecl | FuncDecl | TypeDecl | UnionDecl | ImportDecl | BreakStmt | ContinueStmt => true
+    Program | Param | TypeRef | FieldDef | FieldInit | LoopVar => true
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary => cwRetTail(ix, tail, out)
+    BinExpr | Call | Member | OptMember | Paren | ErrExpr => cwRetTail(ix, tail, out)
+    ObjLit | ArrayLit | Index | IsExpr | AsExpr | Spread => cwRetTail(ix, tail, out)
+  }
+}
+
+// An expression statement yields its value only as a body's tail.
+function cwRetTail(ix: i32, tail: boolean, out: i32[]): boolean {
+  if tail { out.push(ix) }
+  true
+}
+
+// `cwRetValues` over the statements of a block, its last one in tail position when `tail` holds.
+function cwRetBlockValues(stmts: i32[], tail: boolean, out: i32[]): boolean {
+  let i = 0
+  while i < stmts.length {
+    if !cwRetValues(stmts[i], tail && i == stmts.length - 1, out) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// The named functions whose returns `cwFvAddCallResult` is reading, so a recursive one stops.
+const cwFvRetOpen: i32[] = []
+
+// Add to `out` what each value the named function `c` calls returns may be; false when the
+// callee is not a named function declared in reach, it returns nothing, or a value is unresolved.
+function cwFvAddCallResult(c: Call, out: i32[]): boolean {
+  const f = cwPeel(c.callFn)
+  if f < 0 || !(nodeAt(f) is Ident) { return false }
+  const d = cwFnDeclAt(f)
+  if d < 0 || i32ListHas(cwFvRetOpen, d) { return false }
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) || fd.fnBody < 0 { return false }
+  const rets: i32[] = []
+  if !cwRetValues(fd.fnBody, true, rets) || rets.length == 0 { return false }
+  cwFvRetOpen.push(d)
+  let ok = true
+  for r in rets {
+    if ok && !cwFvAddValue(r, out) { ok = false }
+  }
+  cwFvRetOpen.pop()
+  ok
 }
 
 // Add the functions the identifier at `v` may be to `out`: the function it declares, or every
