@@ -612,15 +612,17 @@ function elabCanon(
     }
     i0 = i0 + 1
   }
-  // A type parameter the call leaves unbound defaults as the instance it emits as (D4551).
+  // A type parameter the call leaves unbound takes the type of the parameter a binding annotated
+  // with it is seeded from (D6760), else defaults as the instance it emits as (D4551).
   for tp in elabTpDefaults[decl] ?? [] {
     let has = false
     for nm in names {
       if nm == tp { has = true }
     }
     if !has {
+      const st = elabTpSeedTy(decl, tp, names, tys)
       names.push(tp)
-      tys.push(elabTpDefaultTy)
+      tys.push(if st >= 0 { st } else { elabTpDefaultTy })
     }
   }
   // A string literal bound where the signature names a literal lowers as the `string` the
@@ -660,6 +662,87 @@ function elabStrLitWidenGo(t: i32, depth: i32): i32 {
     acc = if acc < 0 { w } else { joinTys(acc, w) }
   }
   if changed && acc >= 0 { acc } else { t }
+}
+
+// The closed type, under `names`/`tys`, of what seeds a binding of `decl`'s body annotated bare
+// with type parameter `tp`: a parameter of `decl`, or a binding annotated with a bound name;
+// -1 when no binding is so seeded, or two seeds disagree.
+function elabTpSeedTy(decl: i32, tp: string, names: string[], tys: i32[]): i32 {
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) { return -1 }
+  let out = -1
+  const stack: i32[] = [dn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if (
+        n is LetDecl
+        && n.letType >= 0
+        && n.letInit >= 0
+        && nodeAt(n.letType) is TypeRef
+      ) {
+        const tn = nodeAt(n.letType)
+        const v = parenPeelIx(n.letInit)
+        if (
+          tn is TypeRef
+          && tn.tyName == tp
+          && v >= 0
+          && nodeAt(v) is Ident
+          && !elabLetAnnotated(identDeclOf(v), tp)
+        ) {
+          const t = elabSeedReadTy(decl, identDeclOf(v), names, tys)
+          if t < 0 || (out >= 0 && out != t) { return -1 }
+          out = t
+        }
+      }
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  out
+}
+
+// Whether `d` is a binding annotated bare with type parameter `tp`.
+function elabLetAnnotated(d: i32, tp: string): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letType < 0 { return false }
+  const tn = nodeAt(n.letType)
+  tn is TypeRef && tn.tyName == tp
+}
+
+// The closed type under `names`/`tys` of declaration `d` read as a seed: a parameter of `decl`,
+// or a binding annotated bare with a bound name; -1 otherwise.
+function elabSeedReadTy(decl: i32, d: i32, names: string[], tys: i32[]): i32 {
+  if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
+    return -1
+  }
+  const n = nodeAt(d)
+  let t = -1
+  if n is Param {
+    const dn = nodeAt(decl)
+    let own = false
+    if dn is FuncDecl {
+      for p in dn.fnParams {
+        if p == d { own = true }
+      }
+    }
+    if own {
+      const held = holePinHeldSet(true)
+      t = substTyDeep(nodeTyIxOf(d), names, tys)
+      holePinHeldSet(held)
+    }
+  } else if n is LetDecl && n.letType >= 0 {
+    const tn = nodeAt(n.letType)
+    if tn is TypeRef {
+      let i = 0
+      while i < names.length && i < tys.length {
+        if names[i] == tn.tyName { t = tys[i] }
+        i += 1
+      }
+    }
+  }
+  if t >= 0 && elabTyClosed(t, 0) { t } else { -1 }
 }
 
 // Whether binding `names`/`tys` closes every parameter `decl`'s body reads, and a declared type
