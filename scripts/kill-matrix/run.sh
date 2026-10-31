@@ -32,6 +32,9 @@ for t in wasm-tools /usr/bin/time /usr/bin/true node_modules/.bin/wasm-opt node_
 done
 PRISTINE="$OUT/pristine.wasm"
 cp build/vl-compiler.wasm "$PRISTINE"
+# The seed's provenance (`.src`, `.key`) travels with it: a stale `.src` makes the witness
+# grader refuse the pristine tree (rc 2), which reads as a catch on every row that checks it.
+for x in src key; do [ -f "build/vl-compiler.wasm.$x" ] && cp "build/vl-compiler.wasm.$x" "$PRISTINE.$x"; done
 
 # gate.sh, with each `deno test` row writing junit next to its log and the logs kept.
 GATE="$OUT/gate-junit.sh"
@@ -44,6 +47,7 @@ grep -q 'junit-path' "$GATE" || { echo "kill-matrix: gate.sh's deno rows were no
 restore() {
   git checkout -q -- compiler/
   cp "$PRISTINE" build/vl-compiler.wasm
+  for x in src key; do [ -f "$PRISTINE.$x" ] && cp "$PRISTINE.$x" "build/vl-compiler.wasm.$x"; done
   # A mutant seed's engine sidecars are ~220 MB each; keep only the pristine seed's.
   find build -name 'vl-compiler.wasm.*.cwasm' -newer "$PRISTINE" -delete 2>/dev/null
 }
@@ -66,7 +70,7 @@ for m in pristine "$@"; do
   esac || { echo apply-failed > "$dir/status"; continue; }
   git diff --stat -- compiler/ > "$dir/diffstat"
   echo "$(date +%T) $id: building"
-  if ! timeout 900 bash scripts/refresh-compiler.sh > "$dir/build.log" 2>&1; then
+  if [ "$m" != pristine ] && ! timeout 900 bash scripts/refresh-compiler.sh > "$dir/build.log" 2>&1; then
     echo seed-build-failed > "$dir/status"; continue
   fi
   start=$(date +%s)

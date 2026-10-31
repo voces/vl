@@ -62,7 +62,8 @@ The mutants live in `scripts/kill-matrix/mutants/`, and they are of two kinds:
   * a wrong union box tag, for `rep-fuzz`.
 
   A cheap fixture that catches everything a 26 s test catches makes the 26 s test the
-  deletion, even though each fixture is unique.
+  deletion, even though each fixture is unique. A hand mutant is written `vl fmt`-clean,
+  or `lint-self + fmt` catches its formatting rather than its behaviour.
 
 **What the matrix can and cannot show.** A droppable check is a candidate, not a proof. A
 few dozen mutants can only show that the check was never the sole catcher among them. The
@@ -86,6 +87,90 @@ comments and whitespace (2026-10-31):
 
 Redundancy is expected between expensive whole-suite checks and the fixtures, not between
 fixtures.
+
+### First reading, 2026-10-31
+
+Measured at `e015395f2` on a 4-core container, about 4 minutes per mutant. Of 52 mutants,
+one revert no longer type-checks against the tree, and 51 were graded.
+
+* **22 survive every gate row.** 2 are hand mutants:
+  * `escinline`, the escape-inline threshold cut from 320 to 60 bytes;
+  * `escv`, a wrong `\v` escape.
+
+  The other 20 are reverts:
+  * 13 shipped no test of their own;
+  * 4 touched docs or `CHANGELOG.md` only;
+  * 3 filed a "must keep running" row whose witness runs either way.
+
+  These are behaviour-neutral refactors or untested fixes. They are not evidence about
+  redundancy. The 13 are test gaps, though: a fix whose revert no gate row notices can be
+  undone by the next change without a red.
+* **29 are caught, 15 of them by exactly one check:**
+
+  | check | sole catches |
+  | --- | ---: |
+  | corpus oracle | 9 |
+  | filed witnesses | 2 |
+  | `scaling shape` (`quadfn`) | 1 |
+  | `lint-self + fmt` (`fmtw`) | 1 |
+  | a release-shape inline test (`escrecord`) | 1 |
+  | `vl_diag_span_test.ts` (`whilecond`) | 1 |
+
+* **The expensive checks against mutants aimed at them:**
+  * `scaling shape` and the release-shape suites each caught their mutant alone, so they
+    earn their place.
+  * `rep-fuzz` caught its mutant (`repnulbool`), and so did the corpus oracle. One mutant
+    is not enough to delete it.
+  * `self-compile pair` caught 3 broad mutants and `distilled corpus` caught 2, every one
+    also caught elsewhere. Neither had a mutant aimed at it.
+* **The costliest single tests caught nothing here, and their intent lies outside
+  `compiler/`:**
+  * `vl_seed_gc_headroom_test.ts` (44 s) guards the host's GC policy;
+  * `lsp_undisplayable_type_test.ts` (31 s) guards the editor's filter.
+
+  A compiler mutant cannot judge either one. Deciding them needs mutants of the host and
+  `lsp/src`.
+
+What this reading supports is that no expensive compiler-facing check is yet shown
+redundant. The cheap wins it found were tooling and plain waste (§4).
+
+### The first fold: the editor's corpus sweep, 2026-10-31
+
+`lsp_undisplayable_type_test.ts` asserted, in one serial test, that the editor drops no inlay
+hint from a program the checker accepts. It did that by walking all of `tests/cases` and
+running a `check` and an `inlayHintsAt` on every file. The `check` half was the corpus
+oracle's own walk done again: 10.7 s of the sweep's 24.5 s, measured over 6,417 files. The
+assertion now lives in the oracle's walk (`hintsOfCase` in `tests/support/casesWasmOracle.ts`):
+
+* every case the checker accepts gets a symbol check of a fresh staging;
+* its entry-module hints are held to the editor's own `isDisplayableType`;
+* each shard ends with a test that it saw hints, so the check cannot pass vacuously.
+
+The sweep is deleted. The file's 8 targeted tests stay.
+
+The intent's own mutant is `mutants/inlaynullerr.diff`, in which a nullable inlay type
+renders `<error>` in hints only:
+
+| check | before the fold | after the fold |
+| --- | --- | --- |
+| corpus oracle | 6,600 pass | 1,488 cases fail |
+| `lsp_undisplayable_type_test.ts` | the sweep fails | 8 pass |
+| the other 37 editor suites | 430 pass | 430 pass |
+
+Before the fold the sweep was the only catcher; after it, the oracle is. Two broader
+mutants, an absent element rendering `<error>` and a hole rendering `<?>`, were caught
+before and after by the oracle's diagnostic text and by a targeted test.
+
+What it cost and saved, minimum of two runs each, 4 cores:
+
+| | before | after |
+| --- | ---: | ---: |
+| `gate.sh`'s `lsp suites` row | 17.3 s wall, 33.7 CPU-s | 5.8 s wall, 20.0 CPU-s |
+| the corpus oracle | 15.2 s wall, ~51 CPU-s | 17.7 s wall, ~60 CPU-s |
+
+The symbol check per accepted case costs nearly what the sweep's own inlay call did, so the
+CPU saved is about 5 s. The wall is what moved: one 24 s serial test became about 2.5 s
+spread over the oracle's four shards.
 
 ## 3 · Measuring cost
 

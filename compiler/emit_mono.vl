@@ -97,7 +97,6 @@ import {
   recordClonedIsVarTyIx,
 } from "./check_list_union"
 import { blockLastStmt } from "./check_if_value"
-import { HD_COAL, hdKindIs } from "./check_hole_pins"
 import { joinArmIsLit } from "./check_nj_join"
 import {
   callBindAgreedHoles,
@@ -2608,8 +2607,15 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
   let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
   if t < 0 { t = monoUnboundDefaultTy(nodeTyAt(cax, fnIx), fnIx) }
   if t < 0 || t >= T.tys.length { return "" }
-  // Declined: record build row (a4cf's row-key fact).
-  if tyHoldsObj(t, 8) { return "" }
+  // A record type pins at its nominal spelling, and a narrowed record read at the one its place
+  // holds, since a record is handed as the reference it is stored as; a structural record
+  // waits on its build row (a4cf's row-key fact).
+  if tyHoldsObj(t, 8) {
+    if !monoReadIsNarrowed(cax, fnIx) { return monoRecordNominalPin(t) }
+    const rh = monoPlaceHeldTy(cax, fnIx)
+    if rh < 0 || rh >= T.tys.length || tyHasTyVar(rh) { return "" }
+    return monoRecordNominalPin(rh)
+  }
   // A read the checker narrowed converts at the read and pins at its own type; one only the
   // instance types narrower than its place is handed the place's held type.
   if monoReadIsNarrowed(cax, fnIx) && readNarrowedStoreAt(cax, fnIx) < 0 {
@@ -2633,6 +2639,39 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
   // A value union nothing spells gets its row here, which the instance's boxes read tags from.
   if tyIsUnionish(t) && unRowOfCanon(t) < 0 { monoRegisterValueUnion(t) }
   monoClosedTyPin(t)
+}
+
+// The pin of closed record-bearing type `ty` by its declared names: a declared record or a generic
+// application by its name, any other type by its nominal render without spaces; "" where a
+// record in it is spelled only by its fields.
+function monoRecordNominalPin(ty: i32): string {
+  const t = tyAt(ty)
+  if t is TyObj {
+    const sn = structNameOfTy(ty)
+    if sn != "" {
+      // Same-shape declared records are one type, so they share the row's declared name.
+      const rr = repRowOfTyStruct(ty, sNames.length)
+      if (
+        rr >= 0
+        && rr < sNames.length
+        && structNameOfTy(sTyIx[rr]) == sNames[rr]
+      ) {
+        return sNames[rr]
+      }
+      return sn
+    }
+    return genAppNameOfTy(ty)
+  }
+  const raw = tyToNominalName(ty)
+  let out = ""
+  let i = 0
+  while i < raw.length {
+    const c = raw.slice(i, i + 1)
+    if c == "{" && raw.slice(i + 1, i + 2) != "[" { return "" }
+    if c != " " { out = out + c }
+    i = i + 1
+  }
+  out
 }
 
 // The pin of closed function-bearing type `ty`: a function by its `$fnsig` key, a nullable
@@ -4229,38 +4268,6 @@ function monoTpJoinBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
   synthTypeRefTy(nm, -1, st)
 }
 
-// The annotation an un-annotated binding of a `??` over a type parameter takes where the pin
-// makes the `??` a join (`T ?? 5` at `i32[]` is `i32[] | i32`): that box, which the body's
-// reads of the binding and the call's result already name. -1 otherwise.
-function monoCoalBoxBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
-  if init < 0 || bN.length == 0 { return -1 }
-  const u = unwrapParen(init)
-  if u < 0 || nodeAt(u) is Call { return -1 }
-  const t = nodeTyIxOf(u)
-  if !monoTyNamesCoalHole(t) { return -1 }
-  const st = monoSubstInst(t, bN, bT)
-  if st < 0 || st >= T.tys.length || tyHasTyVar(st) || !(tyAt(st) is TyUnion) {
-    return -1
-  }
-  if tyIsLitUnion(st) || monoTyHoldsRefArm(st) { return -1 }
-  const nm = monoPinUnionNameOfTy(st)
-  if nm == "" || monoRegisterPinUnion(nm, st) < 0 { return -1 }
-  synthTypeRefTy(nm, -1, st)
-}
-
-// Whether `t` is a `??` result hole, or a union with one as a member.
-function monoTyNamesCoalHole(t: i32): boolean {
-  if t < 0 || t >= T.tys.length { return false }
-  if hdKindIs(t, HD_COAL) { return true }
-  const ut = tyAt(t)
-  if ut is TyUnion {
-    for m in ut.uMembers {
-      if hdKindIs(m, HD_COAL) { return true }
-    }
-  }
-  false
-}
-
 // Whether `t` is a union or a nullable union, the two shapes a value-union box holds; a
 // nullable literal union is a niche, not a box.
 function monoTyIsUnionOrNulUnion(t: i32): boolean {
@@ -4612,7 +4619,6 @@ function monoCloneLetDecl(
 ): i32 {
   let nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
   // Ahead of the returned-local rungs, which read the re-check's dead-default `i32[]`.
-  if nt < 0 { nt = monoCoalBoxBindAnn(n.letInit, bN, bT) }
   // The inferred-list-return local (`const out = []`): annotate its empty build with the
   // pinned element type, per instance. Clones only this `LetDecl` and its enclosing
   // Block, never the shared original.
@@ -23214,19 +23220,16 @@ function monoPinAnnotatedParam(
         return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
       }
       genPin = an2 != ""
-      // A list or record literal takes the elaboration's answer for the parameter, where it
-      // closes; any other argument is pinned by what it holds.
+      // A list or record literal, or an argument built at a wider record than its type, takes
+      // the elaboration's answer for the parameter at its rep; any other is pinned by what it holds.
       const ax = unwrapParen(args[i])
+      const pet = elabCallParamTy(monoCallTplOf(callIx), i)
+      const et = callArgRepTy(monoCallTplOf(callIx), i, pet)
       if (
         an2 == ""
         && ax >= 0
-        && (nodeAt(ax) is ArrayLit || nodeAt(ax) is ObjLit)
+        && (nodeAt(ax) is ArrayLit || nodeAt(ax) is ObjLit || et != pet)
       ) {
-        const et = callArgRepTy(
-          monoCallTplOf(callIx),
-          i,
-          elabCallParamTy(monoCallTplOf(callIx), i),
-        )
         an2 = monoElabPin(callIx, args, i, et, ctx)
         if an2 != "" { an2Ty = et }
       }

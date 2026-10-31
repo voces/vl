@@ -177,3 +177,35 @@ Deno.test({
     }
   },
 });
+
+// A generic written into a list of another generic joins the list's set, so the list holds ids
+// of both and no function is placed in a table.
+const WRITTEN_GENERIC: string[] = [
+  "function inner<U>(u: U) { print(u) }",
+  "function other<V>(v: V) { print(v) }",
+  "const gs = [inner]",
+  "gs[0](3)",
+  "const fs = [other]",
+  "fs[0] = inner",
+  "fs[0](true)",
+];
+
+Deno.test({
+  name: "fn-set rep: a generic written into a list of generics joins its set",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "writtenGeneric", WRITTEN_GENERIC);
+      const p = await wasmDis([`${dir}/writtenGeneric.wasm`]);
+      if (!p.success) throw new Error("wasm-dis writtenGeneric failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`writtenGeneric: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
