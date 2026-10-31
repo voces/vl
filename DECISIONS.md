@@ -10881,11 +10881,12 @@ experiment built most of that and still moved three corpus files. Splitting per 
 the source rewrite instance-aware, which it is not. Copying needs one checker ask and no new
 lowering. Its price is one more split-plan case for increment 3 to delete with the plan.
 
-So the step-4 lane closed D14439 without the mint's emitter reader (D14430), and its blockers 2
-and 3 (arms per mint scope, a set with a leaf in a generic body) were not built. They stay the
-emitter reader's work, and they are not needed until a set reaching a split parameter, or any
-tagged set called at two tuples, has to be one id. D14732 is the first program that needs
-them: a tagged set handed to a hole parameter at one tuple and called directly at another.
+The step-4 lane closed D14439 through the split plan, and then built the mint's emitter reader
+(D14430) for the case it next needed: a call an instance makes through a parameter bound to a
+set is read through the one set its facts name, in the emitter and in mono (D14737). Arms stay
+per call node, not per mint scope (blocker 2), and a set with a leaf in a generic body stays
+untagged (blocker 3): a call reached at two tuples of one set keeps one arm set, which no
+program in the corpus or the inventory needs yet.
 
 ## A function-value set escapes as a lambda (step 4 S3a, 2026-10-26)
 
@@ -11215,3 +11216,17 @@ split asked, and the split-applied pass. `vl check` never splits, so where the c
 anything it runs the build, and reports nothing from the channel when the kept program raised
 nothing, or when the first pass asked for a split no applied pass followed. This holds until the
 elaboration instances per call tuple in place of the split plan (increment 3, slice (ii)).
+
+## Union-row identity preserves literals (ruling, 2026-10-31)
+
+A union row is the layout and the dispatch of one union type, and literals decide dispatch: `C | B`
+with `C = {x: 3 | 4}` and `B = {x: 1 | 2}` needs `is B` to tell its arms apart, while
+`repCanonId` keys a literal as its base scalar and so gives that union the canonical id of
+`A | B` with `A = {x: i32}`. Sharing union rows by canon broke two programs that ran
+(`is-contained-arm-tests-the-value.vl`, `discriminant-eq-ambiguous-name.vl`). So a row's identity
+is its literal-preserving type key (`unTyKey`, read by `unRowOfTyKey`), and a row with a type is
+keyed by that type, as a lookup keys it. `repCanonId` stays a rep identity: `unRowOfCanon`
+answers row membership where literal folding is intended, and each such caller says so; a
+caller that takes the row reads the type key. This refines "union rows are keyed by member
+reps" above: a top-level string literal boxes as a string does, but a record arm's literal
+fields do not fold.

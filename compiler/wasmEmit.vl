@@ -1,4 +1,5 @@
 import { arrLitDestTy, arrLitUnionDestTaken } from "./check_bind_rows"
+import { mintCallSoleSet } from "./check_mint"
 import {
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
@@ -26,7 +27,7 @@ import {
   nodeTyRecord,
 } from "./check_node_tys"
 import { fsAsk, fsAskCallee } from "./fn_split"
-import { keyHasPrefix } from "./check_places"
+import { keyHasPrefix, parenPeelIx } from "./check_places"
 import {
   elabNodeRepAt,
   elabSpreadNote,
@@ -956,6 +957,7 @@ import {
   ifExprRefKind,
   ifExprRefSlot,
   indexElemUnionName,
+  instanceOperandTyOf,
   instanceReadTyOf,
   letBindIsAtom,
   letBindIsNulAtom,
@@ -1310,9 +1312,9 @@ import {
   TY_WALK_DEPTH,
   coalResultTyOf,
   coalesceRetypedAtomToStr,
+  elabClosedTyAt,
   fnInPinnedInstance,
   forRangeStepIsConst,
-  holeCaptureTyOf,
   holeOperandTyOf,
   holePinProvesNonNull,
   instancePinnedMaps,
@@ -1330,7 +1332,6 @@ import {
   mapTwinExact,
   mapTwinOneStruct,
   nodeTyInOf,
-  pinSubOperandTyOf,
   tyMentionsSet,
   tySameSet,
   tySameSpelled,
@@ -7471,7 +7472,7 @@ function boxIsNulStrUnion(exprIx: i32, fnIx: i32): boolean {
   if pinned >= 0 { return tyIsNulStrBoxUnion(pinned) }
   const own = nodeTyIxOf(unwrapParen(exprIx))
   if tyIsNulStrBoxUnion(own) { return true }
-  tyIsNulStrBoxUnion(pinSubOperandTyOf(own, fnIx))
+  tyIsNulStrBoxUnion(elabClosedTyAt(unwrapParen(exprIx), fnIx))
 }
 
 // The box on the stack as `string | null`: the null tag is `ref.null`, any other arm's payload
@@ -23086,10 +23087,8 @@ function emitHoleNumAsOpt(
     )
   }
   // The instance's exact pin decides: a number converts, any other type is never the target.
-  let ext = exactOperandTyOf(e.asObj, fnIx)
-  // A hole's operand reads the pin of the hole instance this is (D3654).
-  if ext < 0 { ext = holeOperandTyOf(e.asObj, fnIx) }
-  if ext < 0 { ext = holeCaptureTyOf(e.asObj, fnIx) }
+  // A hole's operand, a capture's included, reads the instance's elaboration (D3654).
+  let ext = instanceOperandTyOf(e.asObj, fnIx)
   // A gradual union's operand the instance re-typed at a scalar carries that scalar itself.
   if ext < 0 && (monoGradualAsScalar.get(exprIx) ?? false) {
     ext = nodeTyIxOf(e.asObj)
@@ -24791,7 +24790,22 @@ function emitTagSetAt(ix: i32, fnIx: i32): i32 {
     const s = fnTagSetOfTy(nodeTyAt(c.callFn, fnIx))
     if fnTagSetIsTagged(s) { return s }
   }
-  fnTagCallSetOf(ix)
+  const noted = fnTagCallSetOf(ix)
+  if noted >= 0 { return noted }
+  // A call an instance makes through its parameter is noted only as that instance's fact.
+  const ms = mintCallSoleSet(ix)
+  if fnTagSetIsTagged(ms) && c is Call && emitTagParamHolds(c.callFn, ms) {
+    return ms
+  }
+  noted
+}
+
+// Whether the callee `f` reads a parameter whose recorded type in this function is tagged set
+// `s`, so its value is a member's id.
+function emitTagParamHolds(f: i32, s: i32): boolean {
+  const d = identDeclOf(parenPeelIx(f))
+  if d < 0 || !(nodeAt(d) is Param) { return false }
+  fnTagSetOfTy(nodeTyIxOf(d)) == s
 }
 
 // A call through a tagged function set (`fnTagDecide`): the callee is the i32 id of the member
