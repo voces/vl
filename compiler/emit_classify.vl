@@ -677,7 +677,6 @@ import {
   mvNulListValKind,
   outerFrameBinds,
   paramStructIndex,
-  paramVariantIndex,
   readPosIn,
   recRowOfTy,
   sigKeyOfTy,
@@ -801,9 +800,9 @@ import {
   mvValKind,
   mvValName,
   nestedNameBySid,
-  rlElemKindTbl,
   rlElemName,
   rlElemNullable,
+  rlElemTyIx,
   sAnonOwnTy,
   sLitMintFn,
   sLitMintRow,
@@ -934,6 +933,7 @@ import {
   sidText,
 } from "./symbols"
 import { peelGroupParens } from "./tyname"
+import { recRepWidens } from "./check_bind_adopt"
 import { holeFnArgRetAtParams, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
@@ -1572,10 +1572,8 @@ function fnRetNulRefSid(sid: i32, name: string, fnIx: i32, at: i32) {
   repOfNameResult(sid, name, fnIx, at).rdKind == "nulstruct"
 }
 
-// The non-null twin of `capturedNulVariantIdx`: the variant-table index of a captured
-// `v: Circle` cell, or -1. Same index space and kind gate; without it `exprVariantIndex`'s
-// Ident arm has no capture leg and a captured variant handed to a union parameter is
-// never boxed.
+// The variant row of a captured `v: Circle` cell of `fnIx`, or -1 when `name` is no capture or
+// its cell is not a variant.
 function capturedVariantIndex(fnIx: i32, name: string) {
   if capturedKindOf(fnIx, name) != "variant" { return -1 }
   capturedCompanionSlot(fnIx, name)
@@ -1608,7 +1606,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
     Index => {
       if exprRefArray(e.idxArr, fnIx) {
         const irls = refListSlotOfExpr(e.idxArr, fnIx)
-        if irls >= 0 && irls < rlElemKindTbl.length {
+        if irls >= 0 && irls < rlElemTyIx.length {
           if rlElemKindAt(irls) == RLK_STRUCT {
             if rlElemIsNulNiche(irls) {
               const irlv = rlElemVariantRow(irls)
@@ -1749,7 +1747,7 @@ function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
 // `Arm | null` niche, or -1 when the read is not one (D4668).
 function popArmElemVariantRow(exprIx: i32, fnIx: i32): i32 {
   const slot = popRefRecvSlot(exprIx, fnIx)
-  if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
+  if slot < 0 || slot >= rlElemTyIx.length { return -1 }
   if rlElemKindAt(slot) != RLK_STRUCT { return -1 }
   rlElemVariantRow(slot)
 }
@@ -2036,10 +2034,10 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     Index => {
       if exprRefArray(e.idxArr, fnIx) {
         // Guard the slot: a narrowed union-arm rebind receiver classifies `exprRefArray` true
-        // while the slot resolver can still miss, and an unguarded `rlElemKindTbl[-1]` is an
+        // while the slot resolver can still miss, and an unguarded `rlElemTyIx[-1]` is an
         // out-of-bounds crash in the compiler itself.
         const slot = refListSlotOfExpr(e.idxArr, fnIx)
-        if slot >= 0 && slot < rlElemKindTbl.length {
+        if slot >= 0 && slot < rlElemTyIx.length {
           if refListElemIsRow(e.idxArr, fnIx) {
             // The element must be a struct row, not a union arm (D851): a `(Circle | null)[]`
             // whose `Circle` is a declared union's member also interns kind 1, and its element
@@ -2701,7 +2699,10 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   // The resolved declaration answers the type first; whether it holds only its literal is the
   // costly question, asked last.
   const bd = identDeclOf(u)
+  if bd >= 0 && nodeAt(bd) is Param { return paramHeldTy(u, fnIx) }
   if bd < 0 || bd == letIx || !(nodeAt(bd) is LetDecl) { return -1 }
+  // A binding of a parameter stored at a wider record is stored there too.
+  if letHoldsParamBuilt(bd, fnIx) { return letBindTy(bd, fnIx) }
   const own = nodeTyIxOf(u)
   const t0 = letBindTy(bd, fnIx)
   if own < 0 || own >= T.tys.length || t0 < 0 || t0 >= T.tys.length {
@@ -2716,6 +2717,35 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   if !same || tySame(t, own) { return -1 }
   if recFreshDeclOf(u) != bd && t == t0 && !letHoldsCallBuilt(bd) { return -1 }
   t
+}
+
+// The record the parameter read `u` is stored as in `fnIx`, its annotation, where that is
+// another record than the read's own type; -1 otherwise.
+function paramHeldTy(u: i32, fnIx: i32): i32 {
+  if fnIx < 0 || fnIx >= P.nodes.length || u < 0 || u >= P.nodes.length {
+    return -1
+  }
+  const un = nodeAt(u)
+  const fd = nodeAt(fnIx)
+  if !(un is Ident) || !(fd is FuncDecl) { return -1 }
+  let ann = -1
+  for pi in fd.fnParams {
+    const p = nodeAt(pi)
+    if p is Param && p.parName == un.identName { ann = p.parType }
+  }
+  if ann < 0 { return -1 }
+  const t = nodeTyIxOf(ann)
+  if recRepWidens(nodeTyAt(u, fnIx), t) { t } else { -1 }
+}
+
+// Whether binding `d` holds a parameter stored at another record than its type (`paramHeldTy`).
+function letHoldsParamBuilt(d: i32, fnIx: i32): boolean {
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letType >= 0 { return false }
+  const u = unwrapParen(n.letInit)
+  if u < 0 || !(nodeAt(u) is Ident) { return false }
+  const pd = identDeclOf(u)
+  pd >= 0 && nodeAt(pd) is Param && paramHeldTy(u, fnIx) >= 0
 }
 
 // Whether binding `d` holds a call whose results are all built at another record than its type.
@@ -4171,7 +4201,7 @@ function catOperandWidensTo(
 ): boolean {
   if dk == LBK_REF {
     const row = refListSlotOfExpr(dst, fnIx)
-    if row < 0 || row >= rlElemKindTbl.length { return false }
+    if row < 0 || row >= rlElemTyIx.length { return false }
     if rlElemKindAt(row) != RLK_UNION { return false }
     return spreadSrcBoxes(src, row, fnIx) == 1
   }
@@ -4925,7 +4955,7 @@ export function spreadLitSrcRowName(arrIx: i32, fnIx: i32): string {
 // it (`spreadSrcBoxes`); -1 otherwise, which keeps the caller's refusal.
 export function spreadOwnBoxRow(arrIx: i32, elems: i32[], fnIx: i32): i32 {
   const row = spreadLitElemRow(arrIx)
-  if row < 0 || row >= rlElemKindTbl.length { return -1 }
+  if row < 0 || row >= rlElemTyIx.length { return -1 }
   if rlElemKindAt(row) != RLK_UNION { return -1 }
   let i = 0
   while i < elems.length {
@@ -4946,7 +4976,7 @@ export function spreadSrcBoxes(src: i32, row: i32, fnIx: i32): i32 {
   if k == "ref" {
     const s = refListSlotOfExpr(src, fnIx)
     if s == row { return 0 }
-    if s < 0 || s >= rlElemKindTbl.length { return -1 }
+    if s < 0 || s >= rlElemTyIx.length { return -1 }
     if rlElemKindAt(s) == RLK_UNION { return -1 }
     if rlWidenVariantOf(s, row) < 0 { return -1 }
     return 1
@@ -5346,9 +5376,9 @@ export function binMixHardF64(leftIx: i32, rightIx: i32, fnIx: i32) {
 }
 
 // The scalar width evaluating `exprIx` yields: its type at instance `fnIx` peeled to one base
-// scalar, else "" (a numeric union is a box). A direct call yields its callee slot's result, a `??`
-// what its lowering yields, and a number literal its built width; where the type names no scalar,
-// a function-value call yields its signature's.
+// scalar, else "" (a numeric union is a box), with a `??` at `coalResultTyOf` and a call left open
+// there at its instance's elaboration. A direct call yields its callee slot's result and a number
+// literal its built width.
 export function exprScalarWidth(exprIx: i32, fnIx: i32): string {
   if exprIx < 0 { return "" }
   const n = nodeAt(exprIx)
@@ -5365,16 +5395,13 @@ export function exprScalarWidth(exprIx: i32, fnIx: i32): string {
       if fe >= 0 { return scalarKindWidth(repOfFnSlot(fe).rdKind) }
     }
   }
-  if n is BinExpr && n.binOp == "??" {
-    const ct = coalResultTyOf(exprIx, fnIx)
-    if numUnionMinted && numBoxExpr(exprIx, ct) { return "" }
-    return tyScalarBasePrim(ct) ?? ""
+  let ty = if n is BinExpr && n.binOp == "??" { coalResultTyOf(exprIx, fnIx) } else { nodeTyAt(exprIx, fnIx) }
+  if n is Call && (ty < 0 || tyHasTyVar(ty)) {
+    const el = elabNodeTyAt(exprIx, fnIx)
+    if el >= 0 { ty = el }
   }
-  const ty = nodeTyAt(exprIx, fnIx)
   if numUnionMinted && numBoxExpr(exprIx, ty) { return "" }
-  const w: string = tyScalarBasePrim(ty) ?? ""
-  if w != "" || !(n is Call) { return w }
-  scalarKindWidth(cloCallResultKind(n, exprIx, fnIx))
+  tyScalarBasePrim(ty) ?? ""
 }
 
 // `k` where it names a scalar width, else "".
@@ -5384,16 +5411,6 @@ function scalarKindWidth(k: string): string {
   } else {
     ""
   }
-}
-
-// The result kind of the signature function-value call `n` at `exprIx` is called at; "" where
-// its callee is not a function value or its signature does not resolve.
-function cloCallResultKind(n: Call, exprIx: i32, fnIx: i32): string {
-  if n.callFn < 0 { return "" }
-  if nodeAt(n.callFn) is Ident {
-    return calleeRetKindOfRead(n.callFn, fnIx) ?? ""
-  }
-  cloArrCallRetKind(exprIx, fnIx) ?? cloValueCallRetKind(exprIx, fnIx) ?? ""
 }
 
 // True if evaluating `exprIx` yields an f32 scalar (see `exprScalarWidth`).
@@ -5837,7 +5854,7 @@ function indexElemUnionSlot(idxIx: i32, fnIx: i32): i32 {
   if e is Index {
     if exprRefArray(e.idxArr, fnIx) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if slot >= 0 && slot < rlElemKindTbl.length {
+      if slot >= 0 && slot < rlElemTyIx.length {
         if refListElemIsUnion(e.idxArr, fnIx) { return slot }
       }
     }
@@ -6154,7 +6171,7 @@ export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
       const mvs = forInMapValsSlot(iterIx, fnIx)
       if mvs >= 0 { return mvInnerMapShape(mvs) }
       const rs = refListSlotOfExpr(iterIx, fnIx)
-      if rs < 0 || rs >= rlElemKindTbl.length { return -1 }
+      if rs < 0 || rs >= rlElemTyIx.length { return -1 }
       return rlElemMapShape(rs)
     }
     // Every other element kind, and no element kind, carries no row.
@@ -9369,7 +9386,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
       // GUARD the slot (a narrowed union-arm rebind receiver can classify
       // `exprRefArray` true while the slot resolver misses — OOB otherwise).
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if slot < 0 || slot >= rlElemKindTbl.length { return false }
+      if slot < 0 || slot >= rlElemTyIx.length { return false }
       return refListElemIsRow(e.idxArr, fnIx)
     }
   }
@@ -9677,21 +9694,17 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
       }
       return -1
     }
+    // A read: the variant row of the cell it reads (a local, a capture or a module global),
+    // else of its own type. A cell's kind can say variant where its type names a record with a
+    // struct row of its own, a label the type does not carry.
     Ident => {
-      const pvi = paramVariantIndex(fnIx, exprIx)
-      if pvi >= 0 { return pvi }
       const dvi = declaredVariantIndex(exprIx)
       if dvi >= 0 { return dvi }
-      // The capture leg — the fourth storage class this ladder lacked while its
-      // boolean-and-nullable siblings carry it. `captureValKind`/`captureValStructIdx` already
-      // bank the fact; only the reader is missing here. Without it a captured variant read
-      // answers -1 and a nested function hands a raw struct ref to a union-box parameter.
       const cvi = capturedVariantIndex(fnIx, e.identName)
       if cvi >= 0 { return cvi }
-      // A module GLOBAL whose cell is the kind-8 raw variant — the global twin of the
-      // `declaredVariantIndex` LOCAL leg above, and the leg every member-read site
-      // (`o.field`) needs to pick `uVarHeap` over `sHeapIdx` for a variant receiver.
-      return globalReadVariantIndex(fnIx, exprIx)
+      const gvi = globalReadVariantIndex(fnIx, exprIx)
+      if gvi >= 0 { return gvi }
+      return variantRowOfRead(exprIx, fnIx)
     }
     // A call to a `: Cat`-returning function yields the concrete variant ref, in the three
     // callee forms the nullable twin handles arm for arm: a declared function, a closure value,
@@ -9782,6 +9795,15 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   -1
+}
+
+// The variant row of the type the read `ix` holds inside `fnIx`: the type it is narrowed out of,
+// else its own; -1 when that type is no arm.
+function variantRowOfRead(ix: i32, fnIx: i32): i32 {
+  let st = readNarrowedStoreAt(ix, fnIx)
+  if st < 0 { st = nodeTyAt(ix, fnIx) }
+  if st < 0 || st >= T.tys.length { return -1 }
+  repVariantShapeRowOf(st)
 }
 
 // Does every arm of the if-expression at `ifIx` — an `else if` chain included — denote the
@@ -10735,7 +10757,7 @@ function exprUnionIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
     // GUARD the slot (same discipline as the struct-element arm — a narrowed
     // union-arm rebind receiver resolves no slot; OOB otherwise).
     const slot = refListSlotOfExpr(e.idxArr, fnIx)
-    if slot < 0 || slot >= rlElemKindTbl.length { return false }
+    if slot < 0 || slot >= rlElemTyIx.length { return false }
     // A cell narrowed to one scalar atom unboxes at the read (D451), exactly as the
     // Member arm below declines a narrowed field read — the union box is not the value in
     // this scope. A sub-union narrowing (kind 6 = `null`, or no atom kind at all) keeps the box.
@@ -11002,7 +11024,7 @@ function forInPairUnionElemName(iterIx: i32, fnIx: i32) {
   const vsl = forInPairValsSlot(iterIx, fnIx)
   if vsl < 0 || vsl >= mvRlSlot.length { return "" }
   const slot = mvRlSlot[vsl]
-  if slot < 0 || slot >= rlElemKindTbl.length { return "" }
+  if slot < 0 || slot >= rlElemTyIx.length { return "" }
   if rlElemKindAt(slot) != RLK_UNION { return "" }
   rlElemName[slot]
 }
@@ -11028,7 +11050,7 @@ function forInIterUnionElemName(iterIx: i32, fnIx: i32) {
   if iterIx < 0 { return "" }
   if !exprRefArray(iterIx, fnIx) { return "" }
   const slot = refListSlotOfExpr(iterIx, fnIx)
-  if slot < 0 || slot >= rlElemKindTbl.length { return "" }
+  if slot < 0 || slot >= rlElemTyIx.length { return "" }
   if !refListElemIsUnion(iterIx, fnIx) { return "" }
   rlElemName[slot]
 }
@@ -11522,7 +11544,7 @@ function nestedUnionRowName(ty: i32): string {
 function unionNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   if exprRefArray(e.idxArr, fnIx) {
     const slot = refListSlotOfExpr(e.idxArr, fnIx)
-    if slot >= 0 && slot < rlElemKindTbl.length {
+    if slot >= 0 && slot < rlElemTyIx.length {
       if refListElemIsUnion(e.idxArr, fnIx) {
         // The name-typed half of `exprUnion`'s D451 decline: a cell narrowed to one
         // scalar atom is unboxed by the read, so it carries no union name either. The two
@@ -13790,7 +13812,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
           if callee.memProp == "pop" {
             if exprRefArray(callee.memObj, fnIx) {
               const slot = refListSlotOfExpr(callee.memObj, fnIx)
-              if slot >= 0 && slot < rlElemKindTbl.length {
+              if slot >= 0 && slot < rlElemTyIx.length {
                 const pk = refListElemKind(callee.memObj, fnIx)
                 return pk == "map" || pk == "nulmap"
               }
@@ -13841,7 +13863,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
         const slot = refListSlotOfExpr(e.idxArr, fnIx)
         // Bound-checked before the read: `refListSlotOfExpr` falls back to slot 0 for an
         // un-interned element name, so an unguarded read is a compiler-internal OOB trap.
-        if slot >= 0 && slot < rlElemKindTbl.length {
+        if slot >= 0 && slot < rlElemTyIx.length {
           // A NULLABLE map element (`({[string]: V} | null)[]`) yields `map | null` —
           // `exprNullableMap`'s element arm claims it, not this non-null arm.
           return refListElemKind(e.idxArr, fnIx) == "map"
@@ -14173,7 +14195,7 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
       const ck = refListElemKind(e.idxArr, fnIx)
       if (
         slot >= 0
-        && slot < rlElemKindTbl.length
+        && slot < rlElemTyIx.length
         && (ck == "map" || ck == "nulmap")
       ) {
         // A NULLABLE map element strips to its inner map for the value-slot resolve.
@@ -14659,7 +14681,7 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       // kind 5) reads back a closure fat-pointer — callable via `call_ref`.
       if exprRefArray(e.idxArr, fnIx) {
         const slot = refListSlotOfExpr(e.idxArr, fnIx)
-        if slot >= 0 && slot < rlElemKindTbl.length {
+        if slot >= 0 && slot < rlElemTyIx.length {
           const fk = refListElemKind(e.idxArr, fnIx)
           return fk == "closure" || fk == "nulclosure"
         }
@@ -14816,7 +14838,7 @@ export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
             if ini is Index {
               if exprRefArray(ini.idxArr, fnIx) {
                 const islot = refListSlotOfExpr(ini.idxArr, fnIx)
-                if islot >= 0 && islot < rlElemKindTbl.length {
+                if islot >= 0 && islot < rlElemTyIx.length {
                   if rlElemKindAt(islot) == RLK_CLOSURE {
                     const enm = rlElemName[islot]
                     if (
@@ -15411,7 +15433,7 @@ export function structListPopGetElem(exprIx: i32, fnIx: i32) {
       if callee.memProp == "pop" || callee.memProp == "get" {
         if exprRefArray(callee.memObj, fnIx) {
           const slot = refListSlotOfExpr(callee.memObj, fnIx)
-          if slot >= 0 && slot < rlElemKindTbl.length {
+          if slot >= 0 && slot < rlElemTyIx.length {
             if refListElemIsRow(callee.memObj, fnIx) {
               return rlElemStructRow(slot)
             }

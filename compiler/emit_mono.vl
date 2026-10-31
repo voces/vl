@@ -81,8 +81,13 @@ import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
 import { cwFnValueDeclOf } from "./check_write_scan"
-import { tyLeavesDisjoint } from "./check_type_shape"
-import { REC_REBUILT_DEPTH, recRebuiltRetRow } from "./check_bind_adopt"
+import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
+import {
+  REC_REBUILT_DEPTH,
+  callArgRepTy,
+  recRebuiltRetRow,
+  recRepWidens,
+} from "./check_bind_adopt"
 import { inferRetFnKey } from "./check_side_rows"
 import { recordClonedCallRetire } from "./check_asg_rows"
 import {
@@ -97,6 +102,7 @@ import { joinArmIsLit } from "./check_nj_join"
 import {
   callBindAgreedHoles,
   callBindHas,
+  callBindRepTyOf,
   callBindTyOf,
   holeFnSplitHas,
   holeLitCopiesOf,
@@ -603,6 +609,7 @@ import {
   elabWalkPop,
   elabWalkPush,
   elabWalkTy,
+  readNarrowedStoreAt,
 } from "./emit_elab"
 import {
   isUNameDeclAB,
@@ -2601,8 +2608,26 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
   let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
   if t < 0 { t = monoUnboundDefaultTy(nodeTyAt(cax, fnIx), fnIx) }
   if t < 0 || t >= T.tys.length { return "" }
-  // Declined: record build row (a4cf's row-key fact), narrowed read (aa0c K).
-  if tyHoldsObj(t, 8) || monoReadIsNarrowed(cax, fnIx) { return "" }
+  // A record type pins at its nominal spelling; a structural record waits on its build row
+  // (a4cf's row-key fact), and so does a narrowed record read.
+  if tyHoldsObj(t, 8) {
+    if monoReadIsNarrowed(cax, fnIx) { return "" }
+    return monoRecordNominalPin(t)
+  }
+  // A read the checker narrowed converts at the read and pins at its own type; one only the
+  // instance types narrower than its place is handed the place's held type.
+  if monoReadIsNarrowed(cax, fnIx) && readNarrowedStoreAt(cax, fnIx) < 0 {
+    const held = monoPlaceHeldTy(cax, fnIx)
+    if (
+      held < 0
+      || held >= T.tys.length
+      || tyHasTyVar(held)
+      || tyHoldsObj(held, 8)
+    ) {
+      return ""
+    }
+    t = held
+  }
   if tyMayHoldFn(t, 0) { return monoFnTyPin(t) }
   // A union of numeric literals is its base scalar, which is how its values are stored.
   if tyAt(t) is TyUnion {
@@ -2612,6 +2637,39 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
   // A value union nothing spells gets its row here, which the instance's boxes read tags from.
   if tyIsUnionish(t) && unRowOfCanon(t) < 0 { monoRegisterValueUnion(t) }
   monoClosedTyPin(t)
+}
+
+// The pin of closed record-bearing type `ty` by its declared names: a declared record or a generic
+// application by its name, any other type by its nominal render without spaces; "" where a
+// record in it is spelled only by its fields.
+function monoRecordNominalPin(ty: i32): string {
+  const t = tyAt(ty)
+  if t is TyObj {
+    const sn = structNameOfTy(ty)
+    if sn != "" {
+      // Same-shape declared records are one type, so they share the row's declared name.
+      const rr = repRowOfTyStruct(ty, sNames.length)
+      if (
+        rr >= 0
+        && rr < sNames.length
+        && structNameOfTy(sTyIx[rr]) == sNames[rr]
+      ) {
+        return sNames[rr]
+      }
+      return sn
+    }
+    return genAppNameOfTy(ty)
+  }
+  const raw = tyToNominalName(ty)
+  let out = ""
+  let i = 0
+  while i < raw.length {
+    const c = raw.slice(i, i + 1)
+    if c == "{" && raw.slice(i + 1, i + 2) != "[" { return "" }
+    if c != " " { out = out + c }
+    i = i + 1
+  }
+  out
 }
 
 // The pin of closed function-bearing type `ty`: a function by its `$fnsig` key, a nullable
@@ -4197,16 +4255,6 @@ function monoTpJoinBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
   if !tyIsTpJoinUnion(t) { return -1 }
   const st = monoSubstInst(t, bN, bT)
   if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
-  if tyAt(st) is TyUnion && monoListsLitMixed(st) {
-    if isCall { return -1 }
-    // A literal union's list shares a list rep with another member's, so the box's tags could
-    // not tell the two lists apart (D2760).
-    emitFailAt(
-      "emitProgram: a join of lists with a literal-union element and another element has no lowering at this instance",
-      init,
-    )
-    return -1
-  }
   let nm = monoPinUnionNameOfTy(st)
   // A literal union is spelled by its alias, whose rep is the atom; its render is `string`.
   if tyIsLitUnion(nonNullTy(st)) { nm = monoI32AtomPinName(st) }
@@ -4248,42 +4296,6 @@ function monoTyNamesCoalHole(t: i32): boolean {
     }
   }
   false
-}
-
-// Whether initializer `init`, typed at a union over a type parameter, is at the pin a union of
-// lists mixing a literal-union element with another (D2760).
-function monoInitListsLitMixed(init: i32, bN: string[], bT: i32[]): boolean {
-  if init < 0 { return false }
-  const t = nodeTyIxOf(unwrapParen(init))
-  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyUnion) || !tyHasTyVar(t) {
-    return false
-  }
-  const st = monoSubstInst(t, bN, bT)
-  st >= 0 && st < T.tys.length && tyAt(st) is TyUnion && monoListsLitMixed(st)
-}
-
-// Whether `p` is a list or a union of lists whose elements join a literal union with another
-// type, the element no instance boxes (D2760).
-function monoListsLitMixed(p: i32): boolean {
-  if p < 0 || p >= T.tys.length || tyHasTyVar(p) { return false }
-  const lists: i32[] = []
-  flattenVariantsInto(p, lists)
-  const elems: i32[] = []
-  for m in lists {
-    if m < 0 || m >= T.tys.length { return false }
-    const mt = tyAt(m)
-    if !(mt is TyArray) { return false }
-    flattenVariantsInto(mt.aElem, elems)
-  }
-  let lit = false
-  let other = false
-  for e in elems {
-    if e < 0 || e >= T.tys.length { return false }
-    const et = tyAt(e)
-    if tyIsLitUnion(e) || (et is TyLit && et.litKind == "str") { lit = true }
-    else if !tyBearsNull(e) { other = true }
-  }
-  lit && other
 }
 
 // Whether `t` is a union or a nullable union, the two shapes a value-union box holds; a
@@ -4653,12 +4665,6 @@ function monoCloneLetDecl(
         nt = synthTypeRefTy(outType, -1, outTyIx)
       }
     }
-  }
-  if nt < 0 && monoInitListsLitMixed(n.letInit, bN, bT) {
-    emitFailAt(
-      "emitProgram: a join of lists with a literal-union element and another element has no lowering at this instance",
-      n.letInit,
-    )
   }
   if nt < 0 { nt = monoApartJoinAnn(n.letInit) }
   if nt < 0 { nt = monoTpJoinBindAnn(n.letInit, bN, bT) }
@@ -6829,6 +6835,10 @@ function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
     } else {
       recordClonedIsVarTy(nx, variant)
     }
+    // A list-union rewrite's test keeps its mark at the arm the instance names (D14084).
+    if luIsTyOf(ix) >= 0 && isVarTyIxOf(nx) >= 0 {
+      luIsTyPut(nx, isVarTyIxOf(nx))
+    }
     return nx
   }
   ix
@@ -7975,7 +7985,7 @@ function monoDefaultAnnTyParams(
       && !monoParamsMention(others, one)
       && !monoTyParamReachesSpelling(body, one, seen)
     ) {
-      const bt = callBindTyOf(callIx, tp)
+      const bt = callBindRepTyOf(callIx, tp)
       const sp = if bt >= 0 && bt < T.tys.length && !tyHasTyVar(bt) { monoPinAnnSpelling(bt) } else { "" }
       if sp == "" {
         monoBindTyParamDefault(tp, tvN, tvV, tvT)
@@ -10721,9 +10731,15 @@ function monoMakeInstanceLater(
 // The instance's return annotation node: its template's checked signature substituted through the
 // instance's binding (`elabRetOf`), the declared node where that names no type parameter, -1 for
 // none; -2 when a union it mints cannot be registered.
-function monoInstanceRet(fn: FuncDecl, ek: i32, tps: string[]): i32 {
+function monoInstanceRet(
+  fn: FuncDecl,
+  decl: i32,
+  ek: i32,
+  tps: string[],
+  pins: i32[],
+): i32 {
   if fn.fnRet >= 0 && !monoAnnHasTyParam(fn.fnRet, -1, tps) { return fn.fnRet }
-  const r = elabRetOf(ek)
+  const r = monoRetRepOf(decl, fn, pins, elabRetOf(ek))
   if r < 0 {
     if fn.fnRet < 0 { return -1 }
     return emitFail(
@@ -10741,6 +10757,46 @@ function monoInstanceRet(fn: FuncDecl, ek: i32, tps: string[]): i32 {
   // A literal union spelled by its alias carries the alias's row, whose rep the name promises.
   const at = if tyIsLitUnion(r) { litUnionAliasTyOfLitTexts(tyLitMemberTexts(r)) } else { -1 }
   synthTypeRefTy(nm, -1, if at >= 0 { at } else { r })
+}
+
+// Result `r` of the instance of `decl` at parameter pins `pins`, or the record pin every result
+// copies, where each result is a parameter or a binding of one and that pin widens `r`.
+function monoRetRepOf(decl: i32, fn: FuncDecl, pins: i32[], r: i32): i32 {
+  if r < 0 || r >= T.tys.length || !(tyAt(r) is TyObj) { return r }
+  let row = -1
+  for lf in recFnValueLeaves(decl) {
+    const pt = monoLeafParamPin(lf, fn, pins, 4)
+    if pt < 0 || (row >= 0 && !tySame(row, pt)) { return r }
+    row = pt
+  }
+  if recRepWidens(r, row) { row } else { r }
+}
+
+// The pin of the parameter of `fn` that value `lf` reads, directly or through bindings of one
+// that `monoLetTypeOpen` admits, else -1.
+function monoLeafParamPin(lf: i32, fn: FuncDecl, pins: i32[], depth: i32): i32 {
+  const u = unwrapParen(lf)
+  if u < 0 || depth <= 0 || !(nodeAt(u) is Ident) { return -1 }
+  const d = identDeclOf(u)
+  if d < 0 { return -1 }
+  let i = 0
+  while i < fn.fnParams.length && i < pins.length {
+    if fn.fnParams[i] == d { return pins[i] }
+    i = i + 1
+  }
+  const dn = nodeAt(d)
+  if dn is LetDecl && dn.letInit >= 0 && monoLetTypeOpen(dn.letType, fn) {
+    return monoLeafParamPin(dn.letInit, fn, pins, depth - 1)
+  }
+  -1
+}
+
+// Whether a binding annotated `ann` (-1 for none) in `fn` is typed by its initializer: no
+// annotation, or one naming a type parameter of `fn` alone.
+function monoLetTypeOpen(ann: i32, fn: FuncDecl): boolean {
+  if ann < 0 { return true }
+  const a = nodeAt(ann)
+  a is TypeRef && strListHas(fn.fnTyParams, a.tyName)
 }
 
 // Gives closed undeclared record type `r` a row of its own, keyed by the type, when it has none:
@@ -11367,7 +11423,13 @@ function monoMakeInstanceGo(
     if fn.fnRet >= 0 {
       monoNicheNulListCheck(fn.fnRet, k.tps, tvN, tvV, letBN, letBT)
     }
-    const nret = monoInstanceRet(fn, ek, k.tps)
+    const nret = monoInstanceRet(
+      fn,
+      monoOrigNode[origFe],
+      ek,
+      k.tps,
+      pinnedTyIx,
+    )
     if nret < -1 { return elabWalkPop() - 1 }
     const nretW = if retWiden != "" { synthTypeRefTy(retWiden, -1, retWidenTy) } else { nret }
     const twoListTy = monoTwoListOf(elabRetOf(ek))
@@ -23000,7 +23062,11 @@ function monoPinHoleParam(
     }
   }
   // The elaboration's answer for the parameter at the call's template, where it closes.
-  const et = elabCallParamTy(monoCallTplOf(callIx), i)
+  const et = callArgRepTy(
+    monoCallTplOf(callIx),
+    i,
+    elabCallParamTy(monoCallTplOf(callIx), i),
+  )
   if an == "" {
     an = monoElabPin(callIx, args, i, et, ctx)
     if an != "" { anTy = et }
@@ -23193,7 +23259,11 @@ function monoPinAnnotatedParam(
         && ax >= 0
         && (nodeAt(ax) is ArrayLit || nodeAt(ax) is ObjLit)
       ) {
-        const et = elabCallParamTy(monoCallTplOf(callIx), i)
+        const et = callArgRepTy(
+          monoCallTplOf(callIx),
+          i,
+          elabCallParamTy(monoCallTplOf(callIx), i),
+        )
         an2 = monoElabPin(callIx, args, i, et, ctx)
         if an2 != "" { an2Ty = et }
       }
