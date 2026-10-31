@@ -619,9 +619,10 @@ The order: checker rows for value-of-generic deliveries, one slice per kind; the
 - 25: a pin that widens a string literal (`T = "a"` beside mono's `string`) takes the call's literal instance when that instance is the only one of the declaration taking the pins, as a numeric literal's widening already did, unless the signature itself names a literal: there the literal instance reads atoms where the widened pin builds strings (`f<T>(x: T): T | "b"` built invalid wasm when it was allowed).
 - 24: a storage pin of a value the call's narrowing proved non-null (`P[] | null` beside the checker's `P[]`, under `if xs != null`) takes the call's instance when it is the sole taker.
 - 22: a `let` cell holding several un-annotated functions is one signature, as mono builds it (D3851): each member no instance reaches takes the parameter types an instanced member has (`elabCellPeers`, over the cells `elabFnLetTy` read).
+- 21: a binding initialized from a field or element read reaches every function the read reaches, so a hole lambda written into a list by index and read back out is enqueued at the call's type (`elabCalleeTargets`).
 
-What is left (22 files on 2026-10-31), grouped by what each waits on:
-- 12: hole lambdas and hole functions handed on, through a capture cell (D14425), a list, a map or another hole callee, which mono instances at the delivery;
+What is left (21 files on 2026-10-31), grouped by what each waits on:
+- 11: hole lambdas and hole functions handed on, through a capture cell (D14425), a list, a map or another hole callee, which mono instances at the delivery;
 - 3: function values through record fields, rewritten `let`s and module bindings read before their declaration, where the elaboration does not see which function the value holds;
 - 5: literal-union pins (`T = "a"` beside mono's `string`) where the call's literal instance is not the sole taker or the signature names a literal, which wait on mono keying instances by the elaboration. Enqueueing each string-literal row a second time at the widened type cleared 4 of the 8, and made 51 builds trap the compiler, because the extra instance changes what the emitter reads for the literal one;
 - 3: a pin mono takes from storage rather than the checker's structural type (a nominal row beside its shape);
