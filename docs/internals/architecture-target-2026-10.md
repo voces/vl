@@ -614,10 +614,11 @@ The order: checker rows for value-of-generic deliveries, one slice per kind; the
 - 33: a call through a parameter's field (`o.f("in")` under `o is H`, `o: G`) instances each function every call's argument stores at that field, a binding's by the write scan and a record literal's by its field.
 - 31: a row left open only by a binding `null` alone fills (`const nn = null` handed to `id`, the null-only `_ | null`) closes at `null`, as mono builds it.
 - 30: a list method's callback that may be one of several un-annotated functions (`xs.filter(if c { ub } else { us })`) instances each at the element, as a choice of generics already was; with a closed result (`filter`'s `boolean`) only the arm the checker typed had been pinned.
+- 29: the write scan reads a binding of a named function's call (`const m = mk()`, `mk` returning `k`) as holding what every value the function returns holds, so a call of `m` above its declaration instances `k` at its own argument types.
 
-What is left (30 files on 2026-10-31), grouped by what each waits on:
+What is left (29 files on 2026-10-31), grouped by what each waits on:
 - 14: hole lambdas and hole functions handed on, through a capture cell (D14425), a list, a map or another hole callee, which mono instances at the delivery;
-- 5: function values through record fields, rewritten `let`s and module bindings read before their declaration, where the elaboration does not see which function the value holds;
+- 4: function values through record fields, rewritten `let`s and module bindings read before their declaration, where the elaboration does not see which function the value holds;
 - 8: literal-union pins (`T = "a"` beside mono's `string`), which wait on mono keying instances by the elaboration. Enqueueing each string-literal row a second time at the widened type cleared 4 of the 8, and made 51 builds trap the compiler, because the extra instance changes what the emitter reads for the literal one;
 - 4: a pin mono takes from storage rather than the checker's narrowed or structural type (`P[] | null` beside `P[]`, a nominal row beside its shape);
 
