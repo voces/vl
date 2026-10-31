@@ -2572,6 +2572,46 @@ export function validateRetCstrs(
 }
 
 // Whether the deferred destination constraints this binding resolves hold — the twin of
+// Whether every hole of `t` sits inside a function type, reached through lists, nullables and
+// record fields only: a hole anywhere else is a value's own open type, not a delivered function's.
+function holesOnlyInFns(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 16 { return false }
+  if !tyHasHole(t) { return true }
+  const x = tyAt(t)
+  if x is TyFunc { return true }
+  if x is TyArray { return holesOnlyInFns(x.aElem, depth + 1) }
+  if x is TyNullable { return holesOnlyInFns(x.nInner, depth + 1) }
+  if x is TyObj {
+    for ft in x.objFieldTypes {
+      if !holesOnlyInFns(ft, depth + 1) { return false }
+    }
+    return true
+  }
+  false
+}
+
+// Whether every hole the deferred pair `got`/`want` leaves open is a lambda's own parameter,
+// bound by the closed `want`: the delivery types the lambda's copy there, so a call of the
+// lambda at another type does not re-ask the pair.
+function lambdaCopyOnly(got: i32, want: i32): boolean {
+  if (
+    want < 0
+    || tyHasHole(want)
+    || tyHasTyVar(want)
+    || !holesOnlyInFns(got, 0)
+  ) {
+    return false
+  }
+  const bn: string[] = []
+  const bt: i32[] = []
+  bindGenWalk(got, want, bn, bt)
+  if bn.length == 0 { return false }
+  for nm in bn {
+    if nm.length < 3 || nm.slice(0, 3) != "?#L" { return false }
+  }
+  !tyHasHole(substTyDeep(got, bn, bt))
+}
+
 // `validateRetCstrs` for a `let`/`const` binding rather than a return (D572 is why the two
 // need separate tables). Same re-deferral rule; the message is `letAssignMsg`'s, verbatim,
 // with the attribution appended since the reader wrote no assignment.
@@ -2588,6 +2628,7 @@ export function validateLetCstrs(
   while ci < nOrigL {
     if (
       cstrOwnedBy(letCstr.fn[ci], calleeFn)
+      && !lambdaCopyOnly(letCstr.got[ci], letCstr.want[ci])
       && !nestCstrOutside(letCstr.ix[ci])
       && !wrUnreachedBy(ci, ix, calleeFn)
       && !ctnWrUnreachedBy(letCstr.ix[ci], letCstr.got[ci], letCstr.fn[ci], ix)
