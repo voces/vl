@@ -196,6 +196,7 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   ftRespine = []
   ftRespineTy = []
   ftWideSeen = false
+  ftFwdFn = ftCallsHandFn(s, calls, mint)
   if !ftScan(rootIx, s, ds, leaves, ids) { return 0 }
   // The functions written to one `let` must give a call through it one result (D9003), so a
   // set a written `let` holds stays untagged where a call's members split.
@@ -484,7 +485,10 @@ function ftScan(
         }
       }
       // A list holding the set's ids is read by index only, outside an instance body.
-      if ftHolds(x, s) && (ftInOpenFn(fn) || !ftHoldCtxOk(x, p, g, fn, s)) {
+      if (
+        ftHolds(x, s)
+        && (ftFwdFn && ftInOpenFn(fn) || !ftHoldCtxOk(x, p, g, fn, s))
+      ) {
         return false
       }
       // A value a slot method writes into the holder is an id of the set, as a store's is.
@@ -785,6 +789,61 @@ function ftJoinSplit(x: i32, sp: i32[], vs: i32[]) {
     }
   }
   0
+}
+
+// Whether a call through the set being decided hands on a function value (`ftCallsHandFn`).
+let ftFwdFn = false
+
+// Whether a call through set `s` hands on an argument of function type.
+function ftCallsHandFn(s: i32, calls: i32[], mint: i32[]): boolean {
+  for c in calls {
+    if fnTagCallSetOf(c) == s && ftArgsHoldFn(c, s) { return true }
+  }
+  for r in mint {
+    if mintFactSetOf(r) == s && ftArgsHoldFn(mintFactCallOf(r), s) {
+      return true
+    }
+  }
+  false
+}
+
+// Whether call `c` through set `s` has an argument of function type, or one a member hands to a
+// parameter it calls.
+function ftArgsHoldFn(c: i32, s: i32): boolean {
+  if c < 0 || c >= P.nodes.length { return false }
+  const cn = nodeAt(c)
+  if !(cn is Call) { return false }
+  let i = 0
+  while i < cn.callArgs.length {
+    const t = nodeTyIxOf(cn.callArgs[i])
+    if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc { return true }
+    for d in fnTagMembers(s) {
+      const f = nodeAt(d)
+      if (
+        f is FuncDecl
+        && i < f.fnParams.length
+        && ftParamCalled(f.fnBody, f.fnParams[i])
+      ) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether a call in `body` calls parameter `par` by name.
+function ftParamCalled(body: i32, par: i32): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Call && identDeclOf(parenPeelIx(n.callFn)) == par { return true }
+      nodeChildrenPush(x, todo)
+    }
+  }
+  false
 }
 
 // Whether the set being decided is held by a written `let`, whose writes a call must agree on.
@@ -1250,8 +1309,9 @@ function ftArrElemTy(p: i32): i32 {
   -1
 }
 
-// Whether function `fn`, or one it sits inside, takes a parameter with no annotation; such a
-// list stays untagged, since the split plan copies the hole parameters its calls hand on (D14430).
+// Whether function `fn`, or one it sits inside, takes a parameter with no annotation; a list there
+// whose calls hand on a function stays untagged, since the split plan copies the hole parameters
+// a call hands on per tuple and the set's arms do not see the copies (D14430).
 function ftInOpenFn(fn: i32): boolean {
   let f = fn
   let hops = 0
