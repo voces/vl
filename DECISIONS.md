@@ -11193,7 +11193,10 @@ of check raised nothing: run over an ill-typed program, it would report cascades
 their own. A program with both kinds of error is refused in two rounds, the template's errors
 first and the instances' once those are fixed. It is never accepted, so soundness holds. The
 editor follows the same rule, since the LSP and the playground check through
-`checkSrc`/`checkSrcSym`, which reach the elaboration only on a clean check.
+`checkSrc`/`checkSrcSym`, which reach the elaboration only on a clean check. This is what let
+`pinHoleLambdaArg`, a check-time copy of one instance diagnostic, be deleted: `go(name)` handing a
+lambda to a hole callee is reported by its instance
+(`tests/cases/functions/error-hole-lambda-through-hole-callee-demands.vl`).
 
 A build that splits a function (`fn_split.vl`, D6210) throws away the program it first
 elaborated, so that program's instances are not the built program's. `vl build` reports the
