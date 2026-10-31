@@ -24,6 +24,7 @@ import {
   nodeTyMapKeyKindSpan,
   nodeTyPrimName,
   nodeTyReachesClosure,
+  tyArrayElemRepName,
 } from "./check_node_tys"
 import { fnTagCallArms, fnTagHoldsTy } from "./check_elab_cap"
 import {
@@ -621,6 +622,7 @@ import {
   letBindRepClaims,
   letCellKind,
   letCellSlot,
+  mapCtorOpenInstTy,
   mapShapeOfExpr,
   mapUnionResultRow,
   mfCallbackFe,
@@ -778,6 +780,7 @@ import {
   fieldTypeRefusalMsg,
   forceScalarListField,
   forceScalarListRep,
+  mapCtorKeyKind,
   mvCanonRepOf,
   nameIsConcreteGenAppDecl,
   nameIsNulRefList,
@@ -923,6 +926,7 @@ import {
   tyHasTyVar,
   tyIsArray,
   tyIsLitSet,
+  tyMapHeld,
   tyMapValOf,
   tyPeelNul,
   tyStepElem,
@@ -5834,6 +5838,32 @@ export function collectArrNewFrames() {
   0
 }
 
+// The map struct and value slot a `Map()` builds only in its own frame: one whose template type
+// is open, which an instance's pins close. The frameless walk saw the open type (D10041).
+function collectFrameMapCtor(ix: i32, fnIx: i32) {
+  const t = mapCtorOpenInstTy(ix, fnIx)
+  if t < 0 { return 0 }
+  const m = tyMapHeld(t)
+  markMapKeyUsed(mapCtorKeyKind(ix, t))
+  mvShapeOfMapHeldTy("", m, tyMapValOf(m), tyMapValOf(m))
+  0
+}
+
+// The list pair or row an un-annotated binding's empty literal `ix` builds only in its own frame:
+// one whose template element is open, which a `push` of the instance's pin closes (D3100).
+function collectFrameEmptyList(ix: i32, fnIx: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const a = nodeAt(ix)
+  if !(a is ArrayLit) || a.arrElems.length > 0 || !tyHasTyVar(nodeTyIxOf(ix)) {
+    return 0
+  }
+  const t = litRepTyAt(ix, fnIx)
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) || !tyIsArray(t) { return 0 }
+  forceScalarListRep(tyArrayElemRepName(t))
+  if tyIsRefArray(t) { collectFrameRefRow(t) }
+  0
+}
+
 // The scalar list pair a list literal needs where its first element is a hole instance's local,
 // read at the hole's pin: `arrLitIsStr` and its siblings ask the locals table for a local's rep,
 // and collection runs before any table is built (D3061). Other pins reserve nothing here.
@@ -5891,6 +5921,9 @@ function arrNewFrameWalk(ix: i32, fnIx: i32) {
     collectFrameLeafRow(ix, fnIx)
     collectFrameRefRow(arrLitFrameRefTy(ix, fnIx))
   }
+  if n is LetDecl && n.letType < 0 {
+    collectFrameEmptyList(unwrapParen(n.letInit), fnIx)
+  }
   if n is ArrayLit {
     // A list literal over a parameter pinned to the softened `string` builds a string list, and
     // only the frame can see that pin: `collectA` asks this frameless, reserves the i32 pair and
@@ -5923,6 +5956,9 @@ function arrNewFrameWalk(ix: i32, fnIx: i32) {
         || cf.identName == "__array_new_default__"
       ) {
         collectArrNewScalarPair(arrNewIntrKind(ix, fnIx))
+      }
+      if cf.identName == "Map" && n.callArgs.length == 0 {
+        collectFrameMapCtor(ix, fnIx)
       }
     }
   }
