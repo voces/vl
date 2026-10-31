@@ -622,9 +622,10 @@ The order: checker rows for value-of-generic deliveries, one slice per kind; the
 - 21: a binding initialized from a field or element read reaches every function the read reaches, so a hole lambda written into a list by index and read back out is enqueued at the call's type (`elabCalleeTargets`).
 - 20: a cycle of `let`s written from each other (`let d2 = d1`, then `d1 = d2` in a called local function) resolves to the union of what the cycle is written, where the write scan declined it (`cwFvTargetsOf`).
 - 19: a call through a function value binds each generic member it may hold, and a hole lambda handed to that call takes its parameter types from the member's bound signature (`elabSetCallRows` → `elabArgRows`).
+- 18: a call through a parameter's nested element (`v[0][1](3)`) reaches each function a nested list literal argument holds at that path (`elabListLitPathTargets`).
 
-What is left (19 files on 2026-10-31), grouped by what each waits on:
-- 9: hole lambdas and hole functions handed on, through a capture cell (D14425), a list, a map or another hole callee, which mono instances at the delivery;
+What is left (18 files on 2026-10-31), grouped by what each waits on:
+- 8: hole lambdas and hole functions handed on, through a capture cell (D14425), a list, a map or another hole callee, which mono instances at the delivery;
 - 3: function values through record fields, rewritten `let`s and module bindings read before their declaration, where the elaboration does not see which function the value holds;
 - 5: literal-union pins (`T = "a"` beside mono's `string`) where the call's literal instance is not the sole taker or the signature names a literal, which wait on mono keying instances by the elaboration. Enqueueing each string-literal row a second time at the widened type cleared 4 of the 8, and made 51 builds trap the compiler, because the extra instance changes what the emitter reads for the literal one;
 - 3: a pin mono takes from storage rather than the checker's structural type (a nominal row beside its shape);
