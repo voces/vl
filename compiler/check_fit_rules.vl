@@ -275,6 +275,7 @@ import {
   recAdPushDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
+  recArgRepNote,
   recBuildHoldsElems,
   recBuildPassAt,
   recBuildPush,
@@ -2493,6 +2494,7 @@ export function recBuiltReadRefuse(u: i32) {
   const bt = recBuiltReadTy(p)
   if bt < 0 || own < 0 { return 0 }
   if !(nodeAt(p) is BinExpr) && recArgTakesRep(p, 4) { return 0 }
+  if !(nodeAt(p) is BinExpr) && recAnnArgTakesRep(p, nonNullTy(bt)) { return 0 }
   if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
   }
@@ -2543,6 +2545,64 @@ function recParamTakesRep(par: i32, depth: i32): boolean {
     }
   }
   used
+}
+
+// Whether `x` is an argument of a non-generic function whose annotated record parameter is only
+// read or written for a field in its own body and is a narrower record over `rep`'s fields; noted
+// with `recArgRepNote`, so the callee is instanced at `rep` (D14532).
+function recAnnArgTakesRep(x: i32, rep: i32): boolean {
+  if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_ARG {
+    return false
+  }
+  const c = nodeAt(cwIxUp[x])
+  if !(c is Call) || c.callFn < 0 { return false }
+  const fd = identBoundFnDeclOf(c.callFn)
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = nodeAt(fd)
+  const i = cwIxUpAux[x]
+  if (
+    !(f is FuncDecl)
+    || f.fnTyParams.length > 0
+    || i < 0
+    || i >= f.fnParams.length
+  ) {
+    return false
+  }
+  const par = f.fnParams[i]
+  const pn = nodeAt(par)
+  if !(pn is Param) || pn.parType < 0 { return false }
+  if !recRepWider(nodeTyIxOf(par), rep) { return false }
+  cwIxBuild()
+  let used = false
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if !recFieldRead(u) || recEnclosingFn(u) != fd { return false }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  if used { recArgRepNote(x, fd, rep) }
+  used
+}
+
+// Whether record `wide` is another record over the same field names as record `narrow`, which is
+// assignable to it.
+function recRepWider(narrow: i32, wide: i32): boolean {
+  if narrow < 0 || narrow >= T.tys.length || wide < 0 || wide >= T.tys.length {
+    return false
+  }
+  const n = tyAt(narrow)
+  const w = tyAt(wide)
+  if !(n is TyObj) || !(w is TyObj) || tySame(narrow, wide) { return false }
+  if n.objFieldNames.length != w.objFieldNames.length { return false }
+  for nm in n.objFieldNames {
+    if strListIndexOf(w.objFieldNames, nm) < 0 { return false }
+  }
+  assignable(narrow, wide)
 }
 
 // The function declaration whose body holds node `x`, or -1.
