@@ -68,9 +68,32 @@ if [ -z "${VL_BINARYEN:-}" ]; then
   else unset VL_BINARYEN; echo "gate.sh: no native binaryen; the suites use npm's (slower)" >&2; fi
 fi
 
+# THE BUILD IS THE SELF-COMPILE PAIR when it can be. The pair built from the seed on disk is
+# `names` (that seed's `--names` build of the source) and `stage4` (what `names` compiles).
+# When `stage4` equals `names`' plain bytes, the seed the source builds reproduces itself:
+# `stage4` ships, and the `self-compile pair` row grades this pair (SELF_COMPILE_PAIR) instead of
+# compiling two more. Two self-compiles in series, where refresh plus the row's pair was three.
+# Anything else (no seed, a build that fails, a codegen change that is not yet a fixpoint)
+# takes scripts/refresh-compiler.sh as before, and the row builds its own pair.
+build_from_pair() {
+  local pair="$LOGS/pair" s4
+  [ -s "$SEED" ] || return 1
+  mkdir -p "$pair"
+  SEED="$SEED" bash scripts/self-compile-pair.sh --build "$pair" || return 1
+  s4=$(wc -c < "$pair/stage4.wasm")
+  cmp -s -n "$s4" "$pair/names.wasm" "$pair/stage4.wasm" || { echo "not a first-level fixpoint"; return 1; }
+  printf 'print(6 * 7)\n' > "$pair/hello.vl"
+  [ "$("$VL" run "$pair/hello.vl" --compiler "$pair/stage4.wasm" 2>&1)" = 42 ] || { echo "stage4 fails the sanity run"; return 1; }
+  cp "$pair/stage4.wasm" "$SEED.gate-tmp" && mv "$SEED.gate-tmp" "$SEED" || return 1
+  rm -f "$SEED".*.cwasm
+  VL="$VL" scripts/warm-seed.sh "$SEED" && VL="$VL" scripts/record-seed-provenance.sh "$SEED" || return 1
+  echo "built $SEED ($(wc -c < "$SEED") bytes) as the self-compile pair's stage 4"
+}
 if [ "${1:-}" != "--no-build" ]; then
   echo "== building the seed (everything below reads it) =="
-  if ! bash scripts/refresh-compiler.sh > "$LOGS/build.log" 2>&1; then
+  if build_from_pair > "$LOGS/build.log" 2>&1; then
+    export SELF_COMPILE_PAIR="$LOGS/pair"
+  elif ! bash scripts/refresh-compiler.sh >> "$LOGS/build.log" 2>&1; then
     echo "SEED BUILD FAILED — nothing else can be trusted; see $LOGS/build.log"; tail -20 "$LOGS/build.log"; exit 1
   fi
   grep -E 'refreshed|bytes' "$LOGS/build.log" | tail -1

@@ -275,7 +275,11 @@ The wall is the build plus the slowest row, about 130–160 s here. The owner's 
   not by the box, so on 24 threads this should bring it toward its ~35–45 s file floor. It is
   not measurable on a 4-core box. CLAUDE.md keeps agents at `DENO_JOBS=4`, so it is resource
   policy, not a lane change.
-* **Proposal B, next.** Build the self-compile pair as the gate's build phase, from the old
-  seed (`SELF_COMPILE_PAIR`). When the first-level fixpoint holds that is two self-compiles in
-  series, not three. It pays once `ci-native` is off the critical path. A new check
-is held to §1 from the day it lands: say which breakage it catches that nothing else does.
+* **B, done.** The gate's build phase is now the self-compile pair, built from the seed on
+  disk. When `stage4` equals `names`' plain bytes, `stage4` ships as the seed and the
+  `self-compile pair` row grades that pair (`SELF_COMPILE_PAIR`) rather than building its own.
+  That is two self-compiles in series where there were three. Anything else falls back to
+  `refresh-compiler.sh`. On the 4-core box at `GATE_MAX_PAR=3` the row went from 114.9 s to
+  30–33 s and the gate from 279 s to 236 s; `ci-native` still sets the wall.
+
+A new check is held to §1 from the day it lands: say which breakage it catches that nothing else does.
