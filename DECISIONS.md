@@ -11216,3 +11216,17 @@ split asked, and the split-applied pass. `vl check` never splits, so where the c
 anything it runs the build, and reports nothing from the channel when the kept program raised
 nothing, or when the first pass asked for a split no applied pass followed. This holds until the
 elaboration instances per call tuple in place of the split plan (increment 3, slice (ii)).
+
+## Union-row identity preserves literals (ruling, 2026-10-31)
+
+A union row is the layout and the dispatch of one union type, and literals decide dispatch: `C | B`
+with `C = {x: 3 | 4}` and `B = {x: 1 | 2}` needs `is B` to tell its arms apart, while
+`repCanonId` keys a literal as its base scalar and so gives that union the canonical id of
+`A | B` with `A = {x: i32}`. Sharing union rows by canon broke two programs that ran
+(`is-contained-arm-tests-the-value.vl`, `discriminant-eq-ambiguous-name.vl`). So a row's identity
+is its literal-preserving type key (`unTyKey`, read by `unRowOfTyKey`), and a row with a type is
+keyed by that type, as a lookup keys it. `repCanonId` stays a rep identity: `unRowOfCanon`
+answers row membership where literal folding is intended, and each such caller says so; a
+caller that takes the row reads the type key. This refines "union rows are keyed by member
+reps" above: a top-level string literal boxes as a string does, but a record arm's literal
+fields do not fold.
