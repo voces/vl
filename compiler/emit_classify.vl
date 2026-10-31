@@ -340,7 +340,6 @@ import {
   cloCallResultLitUnion,
   exprIsFloatLit,
   fnHasParamNamed,
-  mfResKindFromSigRet,
   sigTakesParams,
 } from "./emit_closure_callee"
 import {
@@ -364,7 +363,6 @@ import {
   bodyLetReadAtSid,
   callsOfCallee,
   cloParamTok,
-  cloRetIsString,
   cloSigPosOfKey,
   fcrFnStack,
   fcrInFlight,
@@ -406,6 +404,7 @@ import {
   declaredString,
   letMapKeyKind,
   listRepOfFieldCode,
+  listRepOfMf,
   lrGen,
   lrMemoFn,
   lrMemoGen,
@@ -673,7 +672,6 @@ import {
   identBindingOfRead,
   identFnTypeAnnNodeOfRead,
   letAnnIsUnion,
-  mfI32ResultOrColumn,
   mvNulListValKind,
   outerFrameBinds,
   paramStructIndex,
@@ -15478,76 +15476,16 @@ export function mfRecvKindOf(recvIx: i32, fnIx: i32): MfKind | null {
   null
 }
 
-// The result element kind of the `.map`/`.filter` call at `callIx`: `0` (i32/boolean
-// element), `1` (f64 element), or -1 (unsupported). `filter` keeps the receiver's element
-// kind (a ref-list filter fails loudly at emit); `map`'s result element kind is the
-// callback's return kind (`cloRetKindOf`).
+// The element kind of the list the `.map`/`.filter`/`.slice` call at `callIx` returns inside
+// `fnIx`: the rep of the call's own type; null when that type is no list.
 export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
-  const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return null }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      // `.slice` preserves the element type — its result kind IS the receiver's.
-      if callee.memProp == "slice" { return mfRecvKindOf(callee.memObj, fnIx) }
-      if callee.memProp == "filter" { return mfRecvKindOf(callee.memObj, fnIx) }
-      if c.callArgs.length == 1 {
-        // A list-returning callback maps to a ref list of that list's wrapper (D4870).
-        if mfListResultElemTy(callIx, fnIx) >= 0 { return "ref" }
-        // A call typed as a list of a nullable record, a union's arm included, is a ref list
-        // of that type's own row, whatever kind the callback's return is classified as (D12820).
-        if mfNulRecResultElemTy(callIx, fnIx) >= 0 { return "ref" }
-        // A call typed `u8[]` builds the packed byte list; its callback's return reads as an
-        // `i32`, which would pick the plain list (D12902).
-        if tyIsU8ArrayTy(nodeTyInOf(callIx, fnIx)) { return "u8" }
-        const fe = mfCallbackFe(c.callArgs[0], fnIx)
-        if fe < 0 {
-          // A closure-value callback (`xs.map(f)`, `f` a function-typed param/binding) — its result
-          // kind comes from the closure's sig RETURN token, not a lifted fe (scalar returns only).
-          const ck = mfCallbackCloKey(c.callArgs[0], fnIx)
-          if ck != "" { return mfResKindFromSigRet(sigKeyRetKind(ck)) }
-          return null
-        }
-        // A string-returning callback maps to a string-list result (kind 3) — checked first
-        // since `cloRetKindOf` folds string into -1.
-        if cloRetIsString(fe) { return "str" }
-        // A struct-returning callback maps to a new ref list of the result struct — consult
-        // `cloRetValKind` directly, since the result element type differs from the source.
-        if cloRetIsStructRow(fe) { return "ref" }
-        // A concrete-variant-returning callback maps to a ref list of bare variant structs —
-        // checked before the union case since `cloRetValKind` already prefers the variant.
-        if cloRetValKind(fe) == "variant" { return "ref" }
-        // A union-returning callback maps to a ref list of union boxes; all unions share
-        // `$uBox`, so the result element is the declared union.
-        if cloRetValKind(fe) == "union" { return "ref" }
-        // A nullable-string-returning callback maps to the same `(string | null)[]` string
-        // list — `cloRetKindOf` folds the niche into i32, so consult `cloRetValKind` instead.
-        if cloRetValKind(fe) == "nulstr" { return "str" }
-        // An i64-/f32-returning callback maps to an i64-/f32-list result — `cloRetKindOf`
-        // folds these to -1 (out of the value-call ABI), so consult `cloRetValKind` directly.
-        if cloRetValKind(fe) == "i64" { return "i64" }
-        if cloRetValKind(fe) == "f32" { return "f32" }
-        // The `.map` dual of `fnSigKeyOf`'s key/bytes interlock: claim i32/f64 only when the
-        // coarse `cloRetKindOf` agrees with the honest `cloRetValKind`; else fall to a loud reject.
-        const rk2 = cloRetKindOf(fe)
-        // `boolean | null` rides the i32 result and maps to the i32 list its elements share.
-        let vk2 = cloRetValKind(fe)
-        if vk2 == "nulbool" { vk2 = "i32" }
-        if rk2 == vk2 {
-          match rk2 {
-            "i32" => {
-              return mfI32ResultOrColumn(callIx, fnIx, fe)
-            }
-            "f64" => {
-              return "f64"
-            }
-            // Every other coarse kind is claimed above or has no `.map` result kind.
-            "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {}
-          }
-        }
-      }
-      return null
-    }
+  const ty = nodeTyInOf(callIx, fnIx)
+  if ty < 0 || ty >= T.tys.length { return null }
+  const d = repOfTy(ty)
+  if d.rdCovered != 1 { return null }
+  const ks: MfKind[] = ["i32", "f64", "ref", "str", "i64", "f32", "u8"]
+  for k in ks {
+    if listRepOfMf(k) == d.rdKind { return k }
   }
   null
 }
