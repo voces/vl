@@ -39,7 +39,11 @@ deno run -A scripts/kill-matrix/report.ts [DIR]
 3. runs every `gate.sh` row, with each `deno test` row writing junit;
 4. restores `compiler/` and the pristine seed.
 
-It first runs `pristine`, the unmutated tree, which gives every check's cost. `report.ts`
+It first runs `pristine`, the unmutated tree, which gives every check's cost. It refuses
+to start without `wasm-tools`, `/usr/bin/time` and binaryen. A suite whose tool is absent
+registers as ignored and passes, so every mutant only that suite can see would read
+`SURVIVED`. The first matrix run lost the release-shape suites this way, and the weakened
+escape-inlining mutant graded as surviving. `report.ts`
 prints three things: the checks that caught each mutant, the catches no other check made,
 and a greedy list of checks that can be dropped, most expensive first, while every caught
 mutant keeps a catcher. A `deno test` row is split into its test files, so a suite is weighed

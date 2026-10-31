@@ -24,6 +24,12 @@ OUT="${TMPDIR:-/tmp}/vl-kill-matrix"
 mkdir -p "$OUT"
 [ -z "$(git status --porcelain -- compiler/)" ] || { echo "kill-matrix: compiler/ is dirty; commit or restore it first" >&2; exit 2; }
 [ -f build/vl-compiler.wasm ] || { echo "kill-matrix: no seed; run scripts/refresh-compiler.sh" >&2; exit 2; }
+# A suite whose tool is absent registers ignored and passes, so the matrix would read every
+# mutant only it can see as SURVIVED: the release-shape files need wasm-tools and binaryen, and
+# the timing pairs /usr/bin/time. CI's release job installs wasm-tools 1.258.0.
+for t in wasm-tools /usr/bin/time /usr/bin/true node_modules/.bin/wasm-opt node_modules/.bin/wasm-dis; do
+  command -v "$t" >/dev/null || { echo "kill-matrix: missing $t, and the suites that need it would skip; install it first" >&2; exit 2; }
+done
 PRISTINE="$OUT/pristine.wasm"
 cp build/vl-compiler.wasm "$PRISTINE"
 
