@@ -172,6 +172,38 @@ The symbol check per accepted case costs nearly what the sweep's own inlay call 
 CPU saved is about 5 s. The wall is what moved: one 24 s serial test became about 2.5 s
 spread over the oracle's four shards.
 
+### The host and the optimizer, 2026-10-31
+
+The two places a compiler mutant cannot reach got mutant sets of their own, each run through
+every gate row on master `fff449d59`.
+
+**Host GC policy** (`mutants/host/`, applied to `scripts/vl-host/src/main.rs`). These are
+outside `run.sh`'s loop, because each needs the host rebuilt into an isolated
+`--target-dir` and copied over the worktree's own `target/release/vl` (CLAUDE.md, the
+shared cargo target).
+
+| mutant | what it breaks | caught by |
+| --- | --- | --- |
+| `nogrow` | `SeedGcHeadroom` never grows the heap | `vl_seed_gc_headroom_test.ts`; filed witnesses only by timing out D12131 twice at 120 s |
+| `pct99` | the grow threshold 75% → 99% | `vl_seed_gc_headroom_test.ts` alone |
+| `offignored` | `VL_COMPILE_GC_GROW=off` is ignored | `vl_seed_gc_headroom_test.ts` alone |
+| `statsdead` | the GC stats line is renamed | `vl_seed_gc_headroom_test.ts` alone |
+
+The 44 s headroom test is the only guard of the policy, so it stays.
+
+**The `-O` inline-record step** (`mutants/opt-*.diff`):
+
+| mutant | what it breaks | caught by |
+| --- | --- | --- |
+| `opt-noinline` | the step never runs | `selfhost_native_release_inline` (27 tests), `selfhost_native_release_bounds` (8), one release-shape bench row |
+| `opt-compwrite` | a write elsewhere in a record's subtyping component no longer refuses it | nothing |
+| `opt-ident` | an observable identity (`ref.eq`) no longer refuses a record | nothing |
+
+Turning the whole step off is seen three times. A single eligibility rule broken alone is
+seen by nothing; so is `escinline` above. These are coverage gaps or rules a later check
+makes unreachable. They are not redundancy, so no release-shape file is deletable on this
+evidence.
+
 ## 3 · Measuring cost
 
 * **CPU seconds, not wall.** A test's wall under `--parallel` is the schedule
