@@ -110,7 +110,7 @@ import {
 } from "./check_relate_core"
 import { pushScope } from "./check_narrow_paths"
 import { popScope } from "./check_narrow_flow"
-import { i32ListHas, strListHas } from "./listutil"
+import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 import {
   mintScopeFnOf,
   mintScopeNamesOf,
@@ -1283,6 +1283,41 @@ function elabOne(k: i32) {
   0
 }
 
+// The functions the parameter `x` reads holds in instance `k`: what its argument holds at each
+// call that reached `k`; [-1] when one of those arguments is not known to hold only functions.
+function elabParamArgTargets(k: i32, x: i32): i32[] {
+  const d = identDeclOf(parenPeelIx(x))
+  if k < 0 || k >= ekDecl.length || d < 0 { return [-1] }
+  const f = nodeAt(ekDecl[k])
+  if !(f is FuncDecl) { return [-1] }
+  const pi = i32ListIndexOf(f.fnParams, d)
+  const cs = elabKeyCalls[k] ?? []
+  if pi < 0 || cs.length == 0 { return [-1] }
+  const out: i32[] = []
+  for c in cs {
+    const cn = nodeAt(c)
+    if !(cn is Call) || pi >= cn.callArgs.length { return [-1] }
+    const a = cn.callArgs[pi]
+    if elabOpenParamRead(a) { return [-1] }
+    const ts = elabCalleeTargets(a)
+    if ts.length == 0 { return [-1] }
+    for t in ts {
+      if !i32ListHas(out, t) { out.push(t) }
+    }
+  }
+  out
+}
+
+// Whether `x` reads a parameter whose declared or inferred type still holds a type variable.
+function elabOpenParamRead(x: i32): boolean {
+  const p = parenPeelIx(x)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return false }
+  const d = identDeclOf(p)
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is Param) { return false }
+  const t = nodeTyIxOf(d)
+  t >= 0 && t < T.tys.length && tyHasTyVar(t)
+}
+
 // Whether node `d` is a function declaration with no type parameters of its own.
 function elabIsHoleFn(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
@@ -1304,12 +1339,21 @@ function elabSetCallRows(
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const cn = nodeAt(ix)
   if !(cn is Call) { return 0 }
+  // A call through an open parameter runs what each instance binds it to: the functions the
+  // instance's own type of it names, when it names any, and nothing at the root.
+  const openParam = elabOpenParamRead(cn.callFn)
+  if from < 0 && openParam { return 0 }
   const ct = if calleeTy >= 0 { calleeTy } else { nodeTyIxOf(cn.callFn) }
   if ct < 0 || ct >= T.tys.length { return 0 }
   // A call through a literal list's constant element that is a hole function runs that element
   // alone (D10893); a declared generic element is instanced at every call, as mono builds it.
   const el = constListFnElemDecl(cn.callFn)
-  const all = if elabIsHoleFn(el) { [el] } else { elabCalleeTargets(cn.callFn) }
+  let all = if elabIsHoleFn(el) { [el] } else { elabCalleeTargets(cn.callFn) }
+  if openParam {
+    let own = elabParamArgTargets(from, cn.callFn)
+    if own.length > 0 && own[0] < 0 { own = elabFnSetOf(ct) }
+    if own.length > 0 && own[0] >= 0 { all = own }
+  }
   // A call through a value has no row of its own: each generic declaration it may hold is
   // instanced at its types, a lambda keeping the instance its own context types.
   const byValue = elabCallDeclOf(ix) < 0
@@ -1458,6 +1502,7 @@ export function elabRun() {
   ekReach = []
   elabReadsMemo = Map()
   elabCallKeys = Map()
+  elabKeyCalls = Map()
   elabLitArg = Map()
   elabArgInner = Map()
   elabSpreadInner = Map()
@@ -2642,6 +2687,8 @@ function elabSrcDecl(d: i32): i32 {
 let ekReach: i32[][] = []
 // Each call's instance by the instance its body sits in: call → [from, key, from, key, ...].
 let elabCallKeys: {[i32]: i32[]} = Map()
+// The calls that reached each instance: key → call nodes.
+let elabKeyCalls: {[i32]: i32[]} = Map()
 // Each list or record literal argument of a call an instance reaches: literal → [call, position].
 let elabLitArg: {[i32]: i32[]} = Map()
 // Each list literal nested in such an argument's elements → the list literal holding it.
@@ -2664,6 +2711,9 @@ function elabReachNote(from: i32, k: i32, ix: i32) {
     ks.push(from)
     ks.push(k)
     elabCallKeys[ix] = ks
+    const cs = elabKeyCalls[k] ?? []
+    if !i32ListHas(cs, ix) { cs.push(ix) }
+    elabKeyCalls[k] = cs
     const cn = nodeAt(ix)
     if cn is Call {
       let p = 0
