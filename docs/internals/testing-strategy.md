@@ -243,5 +243,39 @@ on separate runners, a stale shard table. Fix these first, because they cost no 
 * **CI: the critical path behind `seed`.** After #5253 that is about 78 s, on the native
   shard that holds the GC headroom test.
 
-A gate that pushes either past budget is what needs rethinking, not the budget. A new check
+A gate that pushes either past budget is what needs rethinking, not the budget.
+
+### What sets `gate.sh`'s wall, 2026-10-31
+
+Each heavy row was measured alone on a quiet 4-core box with a cold cache. The heavy rows cap
+their own parallelism at 4, so these approximate their floors on the 24-thread box:
+
+| phase or row | alone | what bounds it |
+| --- | ---: | --- |
+| the seed build, before any row | 45–75 s | one self-compile (~27 s), the sidecar warm (~14 s) and the seed's JIT, all serial |
+| `ci-native` | 84 s (276 CPU-s) | `DENO_JOBS=4`; its longest file is the 32 s headroom test |
+| `filed witnesses` | 65 s (hints kept, outcomes cold) | two chunks: a trap row compiled twice, and five `@@repeat` rows side by side |
+| `self-compile pair` | 60 s | two self-compiles in series |
+| `scaling shape` | 37 s | |
+| `distilled corpus` | 16.5 s | |
+
+The wall is the build plus the slowest row, about 130–160 s here. The owner's box measured 173 s.
+
+* **`filed witnesses`, done.** It did not scale with `JOBS` (87, 86 and 90 s at 4, 8 and 16)
+  and kept the box at load ~2. Three changes:
+  * a row the codegen batch already failed, or one graded alone by its hint, is no longer
+    checked a second time;
+  * rows go to chunks round-robin;
+  * the known-slow rows are dealt into the first chunks `xargs` starts.
+
+  The result is 65 → 45 s, with verdicts identical over both inventories (4,083 of 4,083) and
+  details identical apart from the temp-directory path.
+* **Proposal A, the owner's to decide.** Let `gate.sh` default `DENO_JOBS` to `max(4, nproc / 3)`,
+  which is unchanged on boxes of 12 or fewer threads. `ci-native` is bounded by its 4 workers,
+  not by the box, so on 24 threads this should bring it toward its ~35–45 s file floor. It is
+  not measurable on a 4-core box. CLAUDE.md keeps agents at `DENO_JOBS=4`, so it is resource
+  policy, not a lane change.
+* **Proposal B, next.** Build the self-compile pair as the gate's build phase, from the old
+  seed (`SELF_COMPILE_PAIR`). When the first-level fixpoint holds that is two self-compiles in
+  series, not three. It pays once `ci-native` is off the critical path. A new check
 is held to §1 from the day it lands: say which breakage it catches that nothing else does.
