@@ -63,6 +63,7 @@ const FIXTURES: [string, Want][] = [
   ["kept-written", "kept"],
   ["kept-nullable", "kept"],
   ["kept-subtype", "kept"],
+  ["kept-identity", "kept"],
   ["kept-export", "kept"],
   ["kept-export-nullable", "kept"],
   ["stable-reached-export", "stable"],
@@ -90,6 +91,7 @@ const EXPLAIN: Record<string, RegExp> = {
   "stored-fields": /type \d+ field \d+ \(type \d+\): inlined; 2 store\(s\)/,
   "kept-written": /refused: its fields are written \(struct\.set/,
   "kept-nullable": /not inlined: a value whose type admits null is stored into it/,
+  "kept-identity": /refused: its identity is observable \(ref\.eq or extern\.convert_any in /,
   "kept-export": /refused: a value of it can cross the module boundary \(export /,
   "kept-export-nullable":
     /refused: a value of it can cross the module boundary \(export origin\)/,
