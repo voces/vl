@@ -577,6 +577,7 @@ import {
 import { rlSlotOfTy, sFieldIndex } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
+  elabClosedTyAt,
   exactBindWalk,
   exactSubAt,
   holeNulStringPinTyOf,
@@ -584,7 +585,6 @@ import {
   monoExactSubRowOf,
   nodeTyInOf,
   pinSubAt,
-  pinSubOperandTyOf,
   pinnedParamTyAt,
   tyCanonKey,
   tySameSet,
@@ -1259,7 +1259,7 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   let nt = nodeTyIxOf(ax)
   // A generic body records a read narrowed to one list as `T[]`, which the pins name.
   if nt >= 0 && tyHasTyVar(nt) {
-    const ps = pinSubOperandTyOf(nt, fnIx)
+    const ps = elabClosedTyAt(ax, fnIx)
     if ps >= 0 { nt = ps }
   }
   // A type whose render softens its literals is not a name this test can compare: it
@@ -3527,7 +3527,7 @@ function monoHoleJoinDropsArm(
 function monoPinUnionBoxed(j: i32, refArm: boolean): i32 {
   if j < 0 || j >= T.tys.length || !monoTyIsUnionOrNulUnion(j) { return j }
   let name = valueUnionRetName(j)
-  // Such a union is named as a binding of it is (`monoTpJoinBindRow`).
+  // Such a union is named as a binding of it is (`monoRegisterElabJoinRows`).
   if name == "" && refArm && monoTyHoldsRefArm(j) {
     name = monoPinUnionName(tyToEmitName(j))
   }
@@ -4140,21 +4140,6 @@ function monoKeepTplHole(ix: i32, nx: i32) {
   0
 }
 
-// Registers the box row an un-annotated binding of a join the checker kept apart (`T | i32`)
-// holds at this pin (D2906); the re-check binds it there (`letKeptJoinAtPin`).
-function monoTpJoinBindRow(init: i32, bN: string[], bT: i32[]) {
-  if init < 0 { return 0 }
-  const t = nodeTyIxOf(unwrapParen(init))
-  if !tyIsTpJoinUnion(t) { return 0 }
-  const st = monoSubstInst(t, bN, bT)
-  if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return 0 }
-  let nm = monoPinUnionNameOfTy(st)
-  // A literal union is spelled by its alias, whose rep is the atom; its render is `string`.
-  if tyIsLitUnion(nonNullTy(st)) { nm = monoI32AtomPinName(st) }
-  if nm != "" && monoTyIsUnionOrNulUnion(st) { monoRegisterPinUnion(nm, st) }
-  0
-}
-
 // Registers the box of each kept-apart join an instance types as a value union, read off the
 // elaboration's per-instance types, so a function no instance clones (nested in one) has its
 // join's rep too (D4046).
@@ -4186,7 +4171,8 @@ function monoRegisterElabJoinRows() {
           && monoTyIsUnionOrNulUnion(st)
         ) {
           let nm = monoPinUnionNameOfTy(st)
-          if tyIsLitUnion(nonNullTy(st)) { nm = "" }
+          // A literal union is spelled by its alias, whose rep is the atom; its render is `string`.
+          if tyIsLitUnion(nonNullTy(st)) { nm = monoI32AtomPinName(st) }
           if nm != "" { monoRegisterPinUnion(nm, st) }
         }
         i = i + 2
@@ -4431,7 +4417,6 @@ function monoCloneLetDecl(
   if nt < 0 && monoLetOwnCopy(n) {
     return monoCopyOf(ix, mkLet(n.letKw, n.letName, -1, n.letInit, n.pos))
   }
-  if nt < 0 { monoTpJoinBindRow(n.letInit, bN, bT) }
   if nt == n.letType { return ix }
   const ninit = monoCtorInitCopy(n.letInit, nt)
   return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ninit, n.pos))
@@ -23077,48 +23062,26 @@ function monoPinAnnotatedParam(
   0
 }
 
-// Binds the type parameters only the result of arrow annotation `annIx` names to the result
-// function value `argIx` gives at the parameter types `tvN`/`tvV` already close, as an
-// un-annotated function handed to `(T) => R` gives `R` (D8943), or to `((T) => R) | null`.
+// Binds the type parameters arrow annotation `annIx` names that are still unbound to the
+// parameter type the elaboration gives argument `i` of call `callIx`, as an un-annotated
+// function handed to `(T) => R` binds `R` (D8943), or to `((T) => R) | null`.
 function monoBindArrowRet(
   annIx: i32,
-  argIx: i32,
+  callIx: i32,
+  i: i32,
   typarams: string[],
   tvN: string[],
   tvV: string[],
   tvT: i32[],
 ) {
-  let at = nodeTyIxOf(annIx)
-  const nf = tyNulFuncInner(at)
-  if nf >= 0 { at = nf }
-  if at < 0 || at >= T.tys.length { return 0 }
-  const af = tyAt(at)
-  if !(af is TyFunc) || af.fnRet < 0 { return 0 }
-  const hN: string[] = []
-  const hT: i32[] = []
-  monoBoundTys(tvN, tvV, tvT, hN, hT)
-  const qs = monoArrowParamTysAt(af, hN, hT)
-  if qs.length > 0 && qs[0] < 0 { return 0 }
-  const r = monoValueRetAt(argIx, qs, 0)
-  if r < 0 { return 0 }
-  monoBindArenaWalk(substTyDeep(af.fnRet, hN, hT), r, typarams, tvN, tvV, tvT)
-}
-
-// Binds each of `typarams` still unbound in `tvN`/`tvV` that pattern type `pt` names to what
-// `bindGenWalk` pairs it with in argument type `at`, where that is closed, spelled as a pin. 0.
-function monoBindArenaWalk(
-  pt: i32,
-  at: i32,
-  typarams: string[],
-  tvN: string[],
-  tvV: string[],
-  tvT: i32[],
-) {
-  if pt < 0 || at < 0 || at >= T.tys.length { return 0 }
-  const rN: string[] = []
-  const rT: i32[] = []
-  bindGenWalk(pt, at, rN, rT)
-  monoPushPins(rN, rT, typarams, tvN, tvV, tvT)
+  monoBindArenaFullTys(
+    nodeTyIxOf(annIx),
+    elabCallParamTy(monoCallTplOf(callIx), i),
+    typarams,
+    tvN,
+    tvV,
+    tvT,
+  )
 }
 
 // The pin spelling of `t` a typed binding takes: a declared record or union by its name, as the
@@ -23182,9 +23145,9 @@ function monoBindListLitElems(
   0
 }
 
-// `monoBindArenaWalk` through unions and generic-application arguments as well
-// (`bindGenWalkFull`): the binding of declared parameter type `pt` at argument type `at`, each
-// pin spelled by `monoPinNominalSpelling` with its type beside it in `tvT`. A parameter bound to
+// Binds each of `typarams` still unbound that declared parameter type `pt` names to what
+// `bindGenWalkFull` pairs it with in argument type `at`, through unions and generic applications,
+// spelled by `monoPinNominalSpelling` with its type beside it in `tvT`. A parameter bound to
 // `never` takes `void`, as a `never` function value lowers. 0.
 function monoBindArenaFullTys(
   pt: i32,
@@ -23217,7 +23180,7 @@ function monoBindArenaFullTys(
   0
 }
 
-// `monoBindArenaWalk` for the union arms inside `pt`'s lists, nullables, fields and map values
+// The binding of `pt` at `at` for the union arms inside `pt`'s lists, nullables, fields and map values
 // (`(S | T)[]`), which a spelling cannot pair when `at` spells a member another way (D10880).
 function monoBindInnerArmPins(
   pt: i32,
@@ -23436,6 +23399,8 @@ function monoHandWrittenLet(
   tvT: i32[],
   patTy: i32,
   own: string,
+  callIx: i32,
+  argI: i32,
 ): i32 {
   const at = unwrapParen(arg)
   const lf = monoWrittenGenLetFrame(at, ctx)
@@ -23448,7 +23413,7 @@ function monoHandWrittenLet(
     )
   }
   if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
-    monoBindArrowRet(p.parType, at, fn.fnTyParams, tvN, tvV, tvT)
+    monoBindArrowRet(p.parType, callIx, argI, fn.fnTyParams, tvN, tvV, tvT)
   }
   const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
   if pre == "" { return 0 }
@@ -23520,7 +23485,7 @@ function monoPinTyParamComposite(
         || monoArgCallsBackGeneric(args[i]))
     ) {
       if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
-        monoBindArrowRet(p.parType, args[i], fn.fnTyParams, tvN, tvV, tvT)
+        monoBindArrowRet(p.parType, callIx, i, fn.fnTyParams, tvN, tvV, tvT)
       }
       const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
       if pre != "" { anC = pre }
@@ -23536,6 +23501,8 @@ function monoPinTyParamComposite(
         tvT,
         patTy,
         own,
+        callIx,
+        i,
       )
       if hr < 0 { return hr }
       if hr > 0 { anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) }
