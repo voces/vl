@@ -11,6 +11,7 @@
 // program with no generic call creates none. The host oracle and the two deliberate
 // divergences: `docs/internals/monomorphization-design.md`.
 
+import { mintCallSoleSet } from "./check_mint"
 import {
   mkNumTyped,
   narrowedFromTyCopy,
@@ -698,6 +699,7 @@ import {
   fnTagCallSetOf,
   fnTagHoldsTy,
   fnTagListTy,
+  fnTagSetIsTagged,
   fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
@@ -3225,21 +3227,6 @@ function monoSubstLetType(
   letType
 }
 
-// Registers the union row an if-join the checker kept apart (D2832) builds at the instance being
-// walked, where the elaboration types it a union of lists with no shared rep.
-function monoApartJoinRow(init: i32) {
-  if init < 0 { return 0 }
-  const u = unwrapParen(init)
-  if (tpIfJoinAt.get(u) ?? -1) < 0 { return 0 }
-  const sj = elabWalkTy(u)
-  if sj < 0 || sj >= T.tys.length { return 0 }
-  if !tyUnionAllLists(sj) || listUnionSharedRep(sj) >= 0 { return 0 }
-  let name = tpIfJoinPinName(sj)
-  if name == "" { name = monoListUnionRowName(sj) }
-  if name != "" { monoRegisterPinUnion(name, sj) }
-  0
-}
-
 // The links of the `else if` chain headed by the `if` at `ix`, outermost first. A rewriter
 // maps each link's condition and then arm in this order, then the last link's else
 // (`monoIfChainElse`), and `monoIfChainRebuild` reassembles them — the node order of the
@@ -4174,15 +4161,28 @@ function monoTpJoinBindRow(init: i32, bN: string[], bT: i32[]) {
 function monoRegisterElabJoinRows() {
   for ix in elabNodeTys.keys() {
     const t = if ix >= 0 && ix < P.nodes.length { nodeTyIxOf(ix) } else { -1 }
-    if t >= 0 && tyIsTpJoinUnion(t) {
+    // An if-join the checker kept apart (D2832) is a union of lists at an instance that binds
+    // its arms apart, one row per such union unless the lists share one rep.
+    const apart = (tpIfJoinAt.get(ix) ?? -1) >= 0
+    if (t >= 0 && tyIsTpJoinUnion(t)) || apart {
       const ps = elabNodeTys[ix] ?? []
       let i = 1
       while i < ps.length {
         const st = ps[i]
+        const closed = st >= 0 && st < T.tys.length && !tyHasTyVar(st)
         if (
-          st >= 0
-          && st < T.tys.length
-          && !tyHasTyVar(st)
+          closed
+          && apart
+          && tyUnionAllLists(st)
+          && listUnionSharedRep(st) < 0
+        ) {
+          let name = tpIfJoinPinName(st)
+          if name == "" { name = monoListUnionRowName(st) }
+          if name != "" { monoRegisterPinUnion(name, st) }
+        } else if (
+          closed
+          && t >= 0
+          && tyIsTpJoinUnion(t)
           && monoTyIsUnionOrNulUnion(st)
         ) {
           let nm = monoPinUnionNameOfTy(st)
@@ -4456,7 +4456,6 @@ function monoCloneLetDecl(
   if nt < 0 && monoLetOwnCopy(n) {
     return monoCopyOf(ix, mkLet(n.letKw, n.letName, -1, n.letInit, n.pos))
   }
-  if nt < 0 { monoApartJoinRow(n.letInit) }
   if nt < 0 { monoTpJoinBindRow(n.letInit, bN, bT) }
   let ninit = n.letInit
   if nt < 0 {
@@ -7812,7 +7811,12 @@ function monoParamsMention(params: i32[], typarams: string[]): boolean {
 // callee with none, and the one it is noted at outside an instance.
 function monoTagSetAt(ix: i32, callFn: i32): i32 {
   const t = elabWalkTy(callFn)
-  if t < 0 { return fnTagCallSetOf(ix) }
+  if t < 0 {
+    const noted = fnTagCallSetOf(ix)
+    const ms = mintCallSoleSet(ix)
+    if noted < 0 && fnTagSetIsTagged(ms) { return ms }
+    return noted
+  }
   const s = fnTagSetOfTy(t)
   if s >= 0 && fnTagArmsAt(ix, s).length > 0 { return s }
   -1
@@ -24661,8 +24665,13 @@ function monoWalk(ix: i32, ctx: i32) {
   const n = nodeAt(ix)
   match n {
     Call => {
-      // A call through a tagged function set is each member's direct call (`fnTagDecide`).
-      const tagArms = fnTagCallArms(ix)
+      // A call through a tagged function set is each member's direct call (`fnTagDecide`); a
+      // call an instance makes through its parameter is noted only as that instance's fact.
+      let tagArms = fnTagCallArms(ix)
+      if tagArms.length == 0 {
+        const ms = mintCallSoleSet(ix)
+        if fnTagSetIsTagged(ms) { tagArms = fnTagArmsAt(ix, ms) }
+      }
       if tagArms.length > 0 {
         if monoWalk(n.callFn, ctx) < 0 { return -1 }
         for ta in tagArms {
