@@ -87,6 +87,7 @@ import {
   elabSnapKey,
   elabTyClosed,
   fnTagCallArms,
+  fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
 import {
@@ -120,10 +121,14 @@ import { pushScope } from "./check_narrow_paths"
 import { popScope } from "./check_narrow_flow"
 import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 import {
+  mintFactNote,
+  mintReset,
+  mintScopeAt,
   mintScopeFnOf,
   mintScopeNamesOf,
   mintScopeRows,
   mintScopeTysOf,
+  mintSetPartialNote,
 } from "./check_mint"
 import {
   T,
@@ -160,6 +165,7 @@ import {
   tyMentionsErr,
   tyMentionsTyVarNamed,
   tySame,
+  tyToStr,
   tyToStructStr,
 } from "./check_types"
 import {
@@ -1764,6 +1770,163 @@ function elabSelfRow(
     p = p + 1
   }
   true
+}
+
+// Replaces the mint facts with one per call each instance makes through a parameter it binds to
+// a function set: the set, the call's argument types and each member's result there, so the tag
+// decision sees every call an instance makes. The number of facts noted.
+export function elabMintFacts(): i32 {
+  mintReset()
+  elabMintCalls = Map()
+  elabMintSets = Map()
+  let n = 0
+  let k = 0
+  while k < ekDecl.length {
+    const dn = nodeAt(ekDecl[k])
+    if dn is FuncDecl && dn.fnBody >= 0 {
+      const sc = mintScopeAt(
+        ekDecl[k],
+        elabInstSpelling(k),
+        ekNames[k],
+        ekTys[k],
+      )
+      n = n + elabMintFactsIn(dn.fnBody, ekDecl[k], k, sc)
+    }
+    k = k + 1
+  }
+  // A set one instance calls through a parameter that another instance of the same function
+  // binds to no set has no one rep there, so it is partial.
+  for c in elabMintCalls.keys() {
+    const at = elabMintCalls[c] ?? []
+    const d = if at.length > 0 { ekDecl[at[0]] } else { -1 }
+    let all = d >= 0
+    let kk = 0
+    while all && kk < ekDecl.length {
+      if (
+        ekDecl[kk] == d
+        && !i32ListHas(at, kk)
+        && !(elabGuessKeys[kk] ?? false)
+      ) {
+        all = false
+      }
+      kk = kk + 1
+    }
+    if !all { mintSetPartialNote(elabMintSets[c] ?? -1) }
+  }
+  n
+}
+
+// Each call `elabMintFacts` noted → the instances it noted it in, and the set it went through.
+let elabMintCalls: {[i32]: i32[]} = Map()
+let elabMintSets: {[i32]: i32} = Map()
+
+// `elabMintFacts` over the subtree at `ix` of declaration `decl`'s body, nested functions aside.
+function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  let n = 0
+  let cur = ix
+  while cur >= 0 {
+    const cn = nodeAt(cur)
+    if cn is FuncDecl {
+      elabMintHandedIn(cur, -1, decl, k)
+      return n
+    }
+    if cn is Call && elabMintFactAt(cn, cur, decl, k, sc) { n = n + 1 }
+    for kid in nodeSpineChildren(cur) {
+      if cn is Call && kid == cn.callFn {
+        n = n + elabMintFactsIn(kid, decl, k, sc)
+      } else {
+        elabMintHandedIn(kid, cur, decl, k)
+        n = n + elabMintFactsIn(kid, decl, k, sc)
+      }
+    }
+    cur = elseIfLink(cur)
+  }
+  n
+}
+
+// Marks partial the set instance `k` binds a parameter of `decl` to, where node `ix` (the child
+// of `p`, or inside a nested function when `p` is -1) reads that parameter other than as a
+// callee: a set handed on is typed where it lands, which this decision does not see.
+function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const xn = nodeAt(ix)
+  if xn is Ident {
+    const pd = identDeclOf(ix)
+    const dn = nodeAt(decl)
+    if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
+      mintSetPartialNote(fnTagSetOfTy(elabNodeTy(ix, k)))
+    }
+    return 0
+  }
+  if xn is Paren { return elabMintHandedIn(xn.parInner, p, decl, k) }
+  if p >= 0 { return 0 }
+  for kid in nodeChildren(ix) { elabMintHandedIn(kid, -1, decl, k) }
+  0
+}
+
+// Notes the fact for call `c` at `ix` when its callee is a parameter of `decl` that instance `k`
+// binds to a set of functions each instanced at the call's closed argument types.
+function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
+  const cf = parenPeelIx(c.callFn)
+  const pd = identDeclOf(cf)
+  if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return false }
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) || !i32ListHas(dn.fnParams, pd) { return false }
+  const st = elabNodeTy(cf, k)
+  const ds = elabFnSetOf(st)
+  if ds.length == 0 || fnTagSetOfTy(st) < 0 { return false }
+  const wp: i32[] = []
+  let key = ""
+  for a in c.callArgs {
+    const at = elabNodeTy(a, k)
+    if at < 0 || !elabTyClosed(at, 0) { return false }
+    const w = widenLitTy(at)
+    wp.push(w)
+    key = key + tyToStr(w) + ","
+  }
+  const rs: i32[] = []
+  let split = false
+  for d in ds {
+    const r = elabMemberResultAt(d, wp)
+    if r < 0 { return false }
+    const w = widenLitTy(r)
+    if rs.length > 0 && !tySame(w, rs[0]) { split = true }
+    rs.push(w)
+  }
+  mintFactNote(sc, ix, fnTagSetOfTy(st), key, split, rs)
+  const at = elabMintCalls[ix] ?? []
+  at.push(k)
+  elabMintCalls[ix] = at
+  if (elabMintSets[ix] ?? fnTagSetOfTy(st)) != fnTagSetOfTy(st) {
+    mintSetPartialNote(elabMintSets[ix] ?? -1)
+    mintSetPartialNote(fnTagSetOfTy(st))
+  }
+  elabMintSets[ix] = fnTagSetOfTy(st)
+  true
+}
+
+// The result of the instance of `d` the elaboration made at parameter types `pTys`, or -1.
+function elabMemberResultAt(d: i32, pTys: i32[]): i32 {
+  const sig = if d >= 0 && d < P.nodes.length { nodeTyIxOf(d) } else { -1 }
+  if sig < 0 || sig >= T.tys.length { return -1 }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || f.fnParamTypes.length != pTys.length { return -1 }
+  let k = 0
+  while k < ekDecl.length {
+    if ekDecl[k] == d {
+      let same = true
+      let i = 0
+      while i < pTys.length {
+        const st = substTyDeep(f.fnParamTypes[i], ekNames[k], ekTys[k])
+        if st < 0 || !tySame(widenLitTy(st), pTys[i]) { same = false }
+        i = i + 1
+      }
+      if same { return elabResultOf(k) }
+    }
+    k = k + 1
+  }
+  -1
 }
 
 // Runs the worklist from the generic pass's closed calls.
