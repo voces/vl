@@ -290,6 +290,7 @@ import {
   identFromDecl,
   identOrigNote,
   memberMethodOf,
+  nodeSrc,
   nodeSrcNote,
   sidArrGet,
   sidArrPut,
@@ -677,7 +678,7 @@ import {
 } from "./check_ty_rep"
 import { nodeTyPinIxOf, tyIsWriteLandRead } from "./check_hole_pins"
 import { recFreshDeclOf } from "./check_rec_fresh"
-import { recBuildTyOf } from "./check_rec_rows"
+import { recArgRepOf, recBuildTyOf } from "./check_rec_rows"
 import { valueUnionRetName } from "./check_ret_names"
 import {
   holeNamesTpJoin,
@@ -3222,101 +3223,19 @@ function monoSubstLetType(
   letType
 }
 
-// The annotation an un-annotated binding of an if-join the checker kept apart (D2832) takes at
-// the instance being walked: the elaboration's type for the join there, a union of lists when
-// the arms stay apart and one list when a literal arm adapts to the pin (D4884).
-function monoApartJoinAnn(init: i32): i32 {
-  if init < 0 { return -1 }
+// Registers the union row an if-join the checker kept apart (D2832) builds at the instance being
+// walked, where the elaboration types it a union of lists with no shared rep.
+function monoApartJoinRow(init: i32) {
+  if init < 0 { return 0 }
   const u = unwrapParen(init)
-  if (tpIfJoinAt.get(u) ?? -1) < 0 { return -1 }
+  if (tpIfJoinAt.get(u) ?? -1) < 0 { return 0 }
   const sj = elabWalkTy(u)
-  if sj < 0 || sj >= T.tys.length { return -1 }
-  if tyAt(sj) is TyArray {
-    const en = monoListSpelling(tyToEmitName(sj), sj)
-    return if en == "" { -1 } else { synthTypeRefTy(en, -1, sj) }
-  }
-  if !tyUnionAllLists(sj) || listUnionSharedRep(sj) >= 0 { return -1 }
+  if sj < 0 || sj >= T.tys.length { return 0 }
+  if !tyUnionAllLists(sj) || listUnionSharedRep(sj) >= 0 { return 0 }
   let name = tpIfJoinPinName(sj)
   if name == "" { name = monoListUnionRowName(sj) }
-  if name == "" || monoRegisterPinUnion(name, sj) < 0 { return -1 }
-  synthTypeRefTy(name, -1, sj)
-}
-
-// The annotation an un-annotated binding of an empty list literal takes at this pin when a later
-// `push` pinned its element to a type parameter or a hole: that list at the pin, spelled as the
-// written annotation is, since the template builds the literal at its default `i32` (D3100).
-function monoPushedListAnn(init: i32, bN: string[], bT: i32[]): i32 {
-  if init < 0 { return -1 }
-  const u = unwrapParen(init)
-  if u < 0 || u >= P.nodes.length { return -1 }
-  const lit = nodeAt(u)
-  if !(lit is ArrayLit) { return -1 }
-  if lit.arrElems.length > 0 { return -1 }
-  const rt = nodeTyIxOf(u)
-  if rt < 0 || rt >= T.tys.length || !tyHasTyVar(rt) { return -1 }
-  if monoListLeaf(rt)[1] == 0 { return -1 }
-  let sj = monoHoleNodeTy(u, rt)
-  if bN.length > 0 { sj = monoSubstInst(sj, bN, bT) }
-  if sj < 0 || sj >= T.tys.length || tyHasTyVar(sj) { return -1 }
-  const sl = monoListLeaf(sj)
-  if sl[1] == 0 { return -1 }
-  if !(tyAt(sl[0]) is TyUnion) {
-    return synthTypeRefTy(monoListSpelling(tyToStr(sj), sj), -1, sj)
-  }
-  const name = tpIfJoinPinName(sl[0])
-  if name == "" || monoRegisterPinUnion(name, sl[0]) < 0 { return -1 }
-  let spell = "(" + name + ")"
-  let d = 0
-  while d < sl[1] {
-    spell = spell + "[]"
-    d = d + 1
-  }
-  synthTypeRefTy(spell, -1, sj)
-}
-
-// The annotation an un-annotated binding of a bare `Map()` takes at this pin when a later store
-// pinned its key or value to a parameter: that map at the pin, as `monoPushedListAnn` does for an
-// empty list, since the template has no value slot for the open type (D10041).
-function monoStoredMapAnn(init: i32, bN: string[], bT: i32[]): i32 {
-  if init < 0 { return -1 }
-  const u = unwrapParen(init)
-  if u < 0 || u >= P.nodes.length { return -1 }
-  const c = nodeAt(u)
-  if !(c is Call) || c.callArgs.length != 0 || c.callFn < 0 { return -1 }
-  const f = nodeAt(c.callFn)
-  if !(f is Ident) || f.identName != "Map" || identDeclOf(c.callFn) >= 0 {
-    return -1
-  }
-  const rt = nodeTyIxOf(u)
-  if rt < 0 || rt >= T.tys.length || !tyHasTyVar(rt) { return -1 }
-  if !(tyAt(rt) is TyMap) { return -1 }
-  let sj = monoHoleNodeTy(u, rt)
-  if bN.length > 0 { sj = monoSubstInst(sj, bN, bT) }
-  if sj < 0 || sj >= T.tys.length || tyHasTyVar(sj) { return -1 }
-  const nm = monoPinAnnSpelling(sj)
-  if nm == "" { return -1 }
-  synthTypeRefTy(nm, -1, sj)
-}
-
-// The innermost element of list type `ty` beside how many lists wrap it: `[ty, 0]` for a type
-// that is not a list, and a leaf of -1 when a list's element is still open.
-function monoListLeaf(ty: i32): i32[] {
-  let t = ty
-  let d = 0
-  let more = true
-  while more && d < 8 {
-    more = false
-    if t >= 0 && t < T.tys.length {
-      const a = tyAt(t)
-      if a is TyArray {
-        t = a.aElem
-        d = d + 1
-        more = true
-      }
-    }
-  }
-  if t < 0 || t >= T.tys.length { return [-1, 0] }
-  [t, d]
+  if name != "" { monoRegisterPinUnion(name, sj) }
+  0
 }
 
 // The links of the `else if` chain headed by the `if` at `ix`, outermost first. A rewriter
@@ -4634,10 +4553,8 @@ function monoCloneLetDecl(
       }
     }
   }
-  if nt < 0 { nt = monoApartJoinAnn(n.letInit) }
+  if nt < 0 { monoApartJoinRow(n.letInit) }
   if nt < 0 { nt = monoTpJoinBindAnn(n.letInit, bN, bT) }
-  if nt < 0 { nt = monoPushedListAnn(n.letInit, bN, bT) }
-  if nt < 0 { nt = monoStoredMapAnn(n.letInit, bN, bT) }
   let ninit = n.letInit
   if nt < 0 {
     nt = monoHoleListLitAnn(n.letInit)
@@ -10765,6 +10682,18 @@ function monoLetTypeOpen(ann: i32, fn: FuncDecl): boolean {
   if ann < 0 { return true }
   const a = nodeAt(ann)
   a is TypeRef && strListHas(fn.fnTyParams, a.tyName)
+}
+
+// The source node of argument `a`, peeled: an instance copy's argument maps to its template's,
+// the node the checker's tables key.
+function monoArgSrcOf(a: i32): i32 {
+  let x = unwrapParen(a)
+  let guard = 0
+  while x >= 0 && guard < 16 && (nodeSrc[x] ?? -1) >= 0 {
+    x = nodeSrc[x] ?? -1
+    guard = guard + 1
+  }
+  x
 }
 
 // Gives closed undeclared record type `r` a row of its own, keyed by the type, when it has none:
@@ -23174,8 +23103,16 @@ function monoPinAnnotatedParam(
       )
       if cr < 0 { return cr }
     } else {
-      pinned.push(ann)
-      pinTys.push(monoArgPinTyIx(args[i], ctx))
+      // An argument stored at a wider record pins the instance at that rep (D14532).
+      const ar = recArgRepOf(monoArgSrcOf(args[i]))
+      const arp = if ar >= 0 { monoClosedTyPin(ar) } else { "" }
+      if arp != "" {
+        pinned.push(arp)
+        pinTys.push(ar)
+      } else {
+        pinned.push(ann)
+        pinTys.push(monoArgPinTyIx(args[i], ctx))
+      }
     }
   } else {
     let an2 = ""

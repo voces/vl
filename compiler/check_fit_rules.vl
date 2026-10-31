@@ -275,6 +275,7 @@ import {
   recAdPushDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
+  recArgRepNote,
   recBuildHoldsElems,
   recBuildPassAt,
   recBuildPush,
@@ -1906,6 +1907,14 @@ function recReadInPlace(c: i32): boolean {
     if up >= 0 && up < P.nodes.length && recSolePinArg(up) >= 0 {
       if cwPeelValue(recSolePinArg(up)) == c { return recReadInPlace(up) }
     }
+    // So is one a non-generic function hands back from an un-annotated parameter (D14730).
+    if up >= 0 && up < P.nodes.length {
+      const uc = nodeAt(up)
+      if uc is Call && uc.callFn >= 0 {
+        const ha = recHoleIdentityArg(up, identBoundFnDeclOf(uc.callFn))
+        if ha >= 0 && cwPeelValue(ha) == c { return recReadInPlace(up) }
+      }
+    }
   }
   if c >= cwIxUpKind.length || cwIxUpKind[c] != CW_UP_LETINIT { return false }
   const d = cwIxUp[c]
@@ -2029,6 +2038,12 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
   if recSolePinArg(p) >= 0 {
     return recLandingIn(recSolePinArg(p), d, c, own, depth - 1)
   }
+  // A non-generic function handing back an un-annotated parameter lands its argument there.
+  const pc = nodeAt(p)
+  if pc is Call && pc.callFn >= 0 {
+    const ha = recHoleIdentityArg(p, identBoundFnDeclOf(pc.callFn))
+    if ha >= 0 { return recLandingIn(ha, d, c, own, depth - 1) }
+  }
   // A call of an inferred function lands each value it hands back where the call lands.
   const g = recInferredFnOf(p)
   if g >= 0 {
@@ -2134,7 +2149,7 @@ function recHoleAdoptLit(ap: i32, srcTy: i32, dstTy: i32): boolean {
 
 // The argument of call `p` that `fd`, a non-generic function whose body only rebinds and returns
 // an un-annotated parameter, hands back; -1 otherwise.
-function recHoleIdentityArg(p: i32, fd: i32): i32 {
+export function recHoleIdentityArg(p: i32, fd: i32): i32 {
   if p < 0 || p >= P.nodes.length || fd < 0 || fd >= P.nodes.length {
     return -1
   }
@@ -2479,6 +2494,7 @@ export function recBuiltReadRefuse(u: i32) {
   const bt = recBuiltReadTy(p)
   if bt < 0 || own < 0 { return 0 }
   if !(nodeAt(p) is BinExpr) && recArgTakesRep(p, 4) { return 0 }
+  if !(nodeAt(p) is BinExpr) && recAnnArgTakesRep(p, nonNullTy(bt)) { return 0 }
   if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
   }
@@ -2529,6 +2545,64 @@ function recParamTakesRep(par: i32, depth: i32): boolean {
     }
   }
   used
+}
+
+// Whether `x` is an argument of a non-generic function whose annotated record parameter is only
+// read or written for a field in its own body and is a narrower record over `rep`'s fields; noted
+// with `recArgRepNote`, so the callee is instanced at `rep` (D14532).
+function recAnnArgTakesRep(x: i32, rep: i32): boolean {
+  if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_ARG {
+    return false
+  }
+  const c = nodeAt(cwIxUp[x])
+  if !(c is Call) || c.callFn < 0 { return false }
+  const fd = identBoundFnDeclOf(c.callFn)
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = nodeAt(fd)
+  const i = cwIxUpAux[x]
+  if (
+    !(f is FuncDecl)
+    || f.fnTyParams.length > 0
+    || i < 0
+    || i >= f.fnParams.length
+  ) {
+    return false
+  }
+  const par = f.fnParams[i]
+  const pn = nodeAt(par)
+  if !(pn is Param) || pn.parType < 0 { return false }
+  if !recRepWider(nodeTyIxOf(par), rep) { return false }
+  cwIxBuild()
+  let used = false
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if !recFieldRead(u) || recEnclosingFn(u) != fd { return false }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  if used { recArgRepNote(x, fd, rep) }
+  used
+}
+
+// Whether record `wide` is another record over the same field names as record `narrow`, which is
+// assignable to it.
+function recRepWider(narrow: i32, wide: i32): boolean {
+  if narrow < 0 || narrow >= T.tys.length || wide < 0 || wide >= T.tys.length {
+    return false
+  }
+  const n = tyAt(narrow)
+  const w = tyAt(wide)
+  if !(n is TyObj) || !(w is TyObj) || tySame(narrow, wide) { return false }
+  if n.objFieldNames.length != w.objFieldNames.length { return false }
+  for nm in n.objFieldNames {
+    if strListIndexOf(w.objFieldNames, nm) < 0 { return false }
+  }
+  assignable(narrow, wide)
 }
 
 // The function declaration whose body holds node `x`, or -1.

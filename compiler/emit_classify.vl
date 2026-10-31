@@ -624,6 +624,7 @@ import {
   arrLitNominalRowTy,
   arrLitNulRefElemName,
   emptyArrLitIxOf,
+  mapCtorShapeOf,
   mapFindShapeOfNodeTy,
   mapNodeValKindLowerable,
   mvInnerMapShape,
@@ -942,6 +943,7 @@ import {
   tyIsArray,
   tyIsF32ArrayTy,
   tyIsU8ArrayTy,
+  tyMapHeld,
   tyMapValOf,
   tyNulLitUnionMemberTexts,
   tyPeelNul,
@@ -2383,7 +2385,7 @@ function readTypeVerdictGo(rx: i32, fnIx: i32): i32 {
   const li = readBindingLetOf(rx, fnIx)
   if li < 0 { return k }
   const rt = nodeTyIxOf(rx)
-  if rt >= 0 && tySame(rt, nodeTyIxOf(li)) { return -1 }
+  if rt >= 0 && !tyHasTyVar(rt) && tySame(rt, nodeTyIxOf(li)) { return -1 }
   if readAtomKindOfTy(nodeTyAt(li, fnIx)) == k { return -1 }
   k
 }
@@ -6735,23 +6737,8 @@ export function letNulBool(letIx: i32, fnIx: i32) {
 export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = nodeAt(unwrapParen(exprIx))
-  // `k as? K` over an atom is the niche: the id on a hit, the `-1` sentinel on a miss.
-  if e is AsExpr {
-    if (
-      e.asMode == "null"
-      && asExprLitAtomYieldsAtom(unwrapParen(exprIx), fnIx)
-    ) {
-      return true
-    }
-    // …and over a union box, whose string arm converts to the id on a hit (D11221).
-    if (
-      e.asMode == "null"
-      && asExprBoxToLitUnion(unwrapParen(exprIx), fnIx)
-      && asBoxLitUnionYieldsAtom(unwrapParen(exprIx), fnIx)
-    ) {
-      return true
-    }
-  }
+  // A cast is the niche exactly when its result reps as one: `k as? K` over an atom or a box.
+  if e is AsExpr { return nodeRepIsNulAtom(unwrapParen(exprIx), fnIx) }
   // …and the same `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfA = nulIfArmNullableValueIx(exprIx)
   // A join typed `string | null` is the string niche, whatever its first arm is, at its chain's
@@ -6888,7 +6875,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       return olc == FC_I32 && nodeRepIsNulAtom(exprIx, fnIx)
     }
     // No other expression reads a literal-union niche.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   false
 }
@@ -8572,14 +8559,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     Call => {
       return exprIsLitAtomCall(e, exprIx, fnIx)
     }
+    // A cast is an atom exactly when its result reps as one.
     AsExpr => {
-      if e.asMode != "null" {
-        const ax = unwrapParen(exprIx)
-        if asExprBoxToLitUnion(ax, fnIx) {
-          return asBoxLitUnionYieldsAtom(ax, fnIx)
-        }
-        return asExprLitAtomYieldsAtom(ax, fnIx)
-      }
+      return nodeRepIsAtom(unwrapParen(exprIx), fnIx)
     }
     // No other expression is a literal atom.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -10580,17 +10562,6 @@ export function asExprNumLitScalarCast(ix: i32, fnIx: i32): boolean {
   tb >= 0 && tb == numLitUnionBaseTy(nodeTyIxOf(n.asObj))
 }
 
-// Whether box cast `ix` to a string literal union yields the atom id rather than the member
-// string: the same rule `asExprLitAtomCast` applies to an atom operand.
-export function asBoxLitUnionYieldsAtom(ix: i32, fnIx: i32): boolean {
-  const n = nodeAt(ix)
-  if !(n is AsExpr) { return false }
-  let tty = nodeTyAt(ix, fnIx)
-  if n.asMode == "null" { tty = tyPeelNul(tty) }
-  if !tyIsLitUnion(tty) || tyIsBareStrLit(tty) { return false }
-  litUnionAliasNameOfTy(tty) != "" || asTargetRepsAtom(ix, n.asMode, fnIx)
-}
-
 // True if a cast `e` yields the union box: a sub-union cast, or a numeric `as?` that
 // can fail. A single-arm target and a numeric `as!` or `as` are not.
 function exprUnionAs(e: AsExpr, exprIx: i32, fnIx: i32): boolean {
@@ -11089,7 +11060,11 @@ export function letNulScalarBoxName(letIx: i32, fnIx: i32): string {
     return ""
   }
   const ty = letBindTy(letIx, fnIx)
-  const name = nulNumScalarUnionName(ty)
+  let name = nulNumScalarUnionName(ty)
+  if name == "" && tyHasTyVar(own) {
+    const u = unRowOfKey(ty)
+    if u >= 0 { name = unNames[u] }
+  }
   if name == "" || repOfTy(ty).rdKind != "union" { return "" }
   name
 }
@@ -13965,6 +13940,16 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
   -1
 }
 
+// The map type the `Map()` call `ix` builds in emitted function `fnIx` where its template type is
+// open and that instance closes it, else -1.
+export function mapCtorOpenInstTy(ix: i32, fnIx: i32): i32 {
+  if !tyHasTyVar(nodeTyIxOf(ix)) { return -1 }
+  const t = litRepTyAt(ix, fnIx)
+  const m = tyMapHeld(t)
+  if m < 0 || tyHasTyVar(m) { return -1 }
+  t
+}
+
 // `mapShapeOfExpr` of a composition map read (a nested-map read, or a list-of-maps element)
 // yielding a typed-value map; `-1`, the mono map, otherwise.
 function mapShapeOfComposition(exprIx: i32, fnIx: i32): i32 {
@@ -14055,6 +14040,11 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
         if sk == MAP_KEY_I32 { return -5 }
         if sk == MAP_KEY_I64 { return -7 }
         return -2
+      }
+      // A `Map()` whose template type is open builds the map its instance closes.
+      if callee.identName == "Map" && e.callArgs.length == 0 {
+        const imt = mapCtorOpenInstTy(exprIx, fnIx)
+        if imt >= 0 { return mapCtorShapeOf(exprIx, imt) }
       }
       // A map-returning function yields its declared map SHAPE (mono ⇒ -1, or a `string`-valued
       // map's mv slot); a `Map()` constructor is the mono map (-1).
@@ -15568,84 +15558,21 @@ export function mfListResultElemName(callIx: i32, fnIx: i32): string {
   rlMintNameOfTy(lt)
 }
 
-// The ref-list table slot of a kind-2 `.map`/`.filter` result, or -1. `.filter` preserves the
-// receiver's element list, so the result slot IS the source ref-list slot.
-export function mfResultSlotOf(callIx: i32, fnIx: i32) {
+// The ref-list slot of the list a `.map`/`.filter`/`.slice` call at `callIx` returns inside
+// `fnIx`, or -1 when it is no ref list. `.filter` and `.slice` keep the receiver's own slot; a
+// `.map` result's is the slot of its type's element.
+export function mfResultSlotOf(callIx: i32, fnIx: i32): i32 {
   const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      // `.slice` preserves the ref-list element — its result slot IS the receiver's.
-      if callee.memProp == "slice" {
-        if mfRecvKindOf(callee.memObj, fnIx) == "ref" {
-          return refListSlotOfExpr(callee.memObj, fnIx)
-        }
-      }
-      if callee.memProp == "filter" {
-        if mfRecvKindOf(callee.memObj, fnIx) == "ref" {
-          return refListSlotOfExpr(callee.memObj, fnIx)
-        }
-      }
-      // A STRUCT-returning `.map`: the result is a NEW ref list whose element is the
-      // callback's RETURN struct — its ref-list slot (interned by `mfScan`).
-      if callee.memProp == "map" && c.callArgs.length == 1 {
-        // A list-returning `.map`: the row `collectMapFilterUse` interned for that list type.
-        const lt = mfListResultElemTy(callIx, fnIx)
-        if lt >= 0 { return rlSlotOfTy(lt) }
-        const fe = mfCallbackFe(c.callArgs[0], fnIx)
-        // A nullable-record result keeps its `| null` in the row, so its elements read
-        // nullable; the struct row below would recover each one non-null (D10890). Its row,
-        // or -1 before `collectMapFilterUse` interns it, never the struct's (D12820).
-        const nrt = mfNulRecResultElemTy(callIx, fnIx)
-        if nrt >= 0 { return rlSlotOfTy(nrt) }
-        if fe >= 0 && cloRetIsStructRow(fe) {
-          const si = cloRetValSlot(fe)
-          if si >= 0 && si < sNames.length {
-            // Arena route, one layer up from the rep tables: the struct row's own `sTyIx`
-            // already carries its type, so `rlSlotOfTyOrTwin` needs no spelling to be produced at all.
-            let elemTy = -1
-            if si < sTyIx.length { elemTy = sTyIx[si] }
-            return rlSlotOfTyOrTwin(elemTy)
-          }
-        }
-        // A struct-returning closure-value callback: no lifted fe, so the result struct
-        // index comes from the closure's `>s<idx>;` sig-return token instead.
-        if fe < 0 {
-          const ck = mfCallbackCloKey(c.callArgs[0], fnIx)
-          if ck != "" && sigKeyRetKind(ck) == "struct" {
-            const csi = sigKeyRetSlot(ck)
-            if csi >= 0 && csi < sNames.length {
-              let cElemTy = -1
-              if csi < sTyIx.length { cElemTy = sTyIx[csi] }
-              return rlSlotOfTyOrTwin(cElemTy)
-            }
-          }
-        }
-        // A concrete-VARIANT `.map`: the result element is the variant — its ref-list slot
-        // is keyed by the variant's type (`uVarTyIx[vi]`).
-        if fe >= 0 && cloRetValKind(fe) == "variant" {
-          const vi = cloRetValSlot(fe)
-          if vi >= 0 && vi < uVariants.length {
-            let vTy = -1
-            if vi < uVarTyIx.length { vTy = uVarTyIx[vi] }
-            return rlSlotOfTyOrTwin(vTy)
-          }
-        }
-        // A UNION-returning `.map`: the result is a ref list of the declared union (all
-        // unions share `$uBox`, so the element key is the union alias name).
-        if fe >= 0 && cloRetValKind(fe) == "union" && unNames.length > 0 {
-          // With no row resolved, the first union's: every union shares one box.
-          let mur = mapUnionResultRow(callIx, fnIx)
-          if mur < 0 || mur >= unNames.length { mur = 0 }
-          let uTy = -1
-          if mur < unTyIx.length { uTy = unTyIx[mur] }
-          return rlSlotOfTyOrTwin(uTy)
-        }
-      }
-    }
+  if !(c is Call) || c.callFn < 0 { return -1 }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return -1 }
+  if callee.memProp == "slice" || callee.memProp == "filter" {
+    if mfRecvKindOf(callee.memObj, fnIx) != "ref" { return -1 }
+    return refListSlotOfExpr(callee.memObj, fnIx)
   }
-  -1
+  if callee.memProp != "map" || c.callArgs.length != 1 { return -1 }
+  if mfResultKindOf(callIx, fnIx) != "ref" { return -1 }
+  rlSlotOfTyOrTwin(tyArrayElemIx(nodeTyInOf(callIx, fnIx)))
 }
 
 // The element name of a struct- or variant-returning `.map`'s result row, or "". `collectMapFilterUse`

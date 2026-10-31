@@ -11033,6 +11033,16 @@ record as a rep row beside the bind row's types. Mono pins the parameter at the 
 (`recRepWidens`), and the parameter's storage, a `let` copying it and a result returning it read
 the rep.
 
+Extended 2026-10-31 (D14532, coordinator ruling (i)): an ordinary function is instanced by the rep
+its argument is built at, only where that rep differs from the parameter's declared build. A read
+out of a built container handed to an annotated record parameter, which its function only reads or
+writes for a field, notes the argument's rep (`recAnnArgTakesRep`). The function counts as generic
+for mono (`recRepFnHas`), the copy's parameter is pinned at the rep, and the elaboration types the
+copy at the declared type. Every other call shares the one copy. Measured: over 7,003
+`tests/**/*.vl`, no previously building file gains a copy, and the one fixture that hands a rep
+has 7 functions against 5 for the same program built at one row. The seed is +2,238 bytes
+(+0.04%), all of it the new code: the compiler hands itself no rep.
+
 ## A literal is built at the width of the position that reads it (ruling, 2026-10-27)
 
 This states the rule behind "Building a literal at the width a consumer demands is building". The
