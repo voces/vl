@@ -278,3 +278,32 @@ Deno.test({
     }
   },
 });
+
+// A list of inner list literals of a set holds member ids at both levels.
+const NESTED: string[] = [
+  "function inc0(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "const ws = [[inc0, dbl]]",
+  "print(ws[0][1](3))",
+  "print(ws[0][0](2.5))",
+];
+
+Deno.test({
+  name: "fn-set rep: a list of lists of a set holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "nested", NESTED);
+      const p = await wasmDis([`${dir}/nested.wasm`]);
+      if (!p.success) throw new Error("wasm-dis nested failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`nested: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
