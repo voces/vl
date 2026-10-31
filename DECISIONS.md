@@ -10881,6 +10881,12 @@ experiment built most of that and still moved three corpus files. Splitting per 
 the source rewrite instance-aware, which it is not. Copying needs one checker ask and no new
 lowering. Its price is one more split-plan case for increment 3 to delete with the plan.
 
+So the step-4 lane closed D14439 without the mint's emitter reader (D14430), and its blockers 2
+and 3 (arms per mint scope, a set with a leaf in a generic body) were not built. They stay the
+emitter reader's work, and they are not needed until a set reaching a split parameter, or any
+tagged set called at two tuples, has to be one id. D14730 is the first program that needs
+them: a tagged set handed to a hole parameter at one tuple and called directly at another.
+
 ## A function-value set escapes as a lambda (step 4 S3a, 2026-10-26)
 
 Where a finite set escapes into a closed slot (an argument to a declared function-type
