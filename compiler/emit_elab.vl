@@ -28,6 +28,7 @@ import {
   hasSpreadItem,
   i32ToStr,
   nodeAt,
+  nodeChildren,
   nodeContains,
   nodeSpineChildren,
 } from "./ast"
@@ -1775,14 +1776,83 @@ function elabLamRepInstance(lam: i32) {
   if !(sf is TyFunc) { return 0 }
   const names: string[] = []
   const tys: i32[] = []
+  let pi = 0
   for pt in sf.fnParamTypes {
-    const rt = elabSetRepTy(pt, 4, -1)
+    let rt = elabSetRepTy(pt, 4, -1)
+    if rt < 0 { rt = elabLamCallRep(lam, pi, pt) }
     if rt < 0 || !elabTyClosed(rt, 0) { return 0 }
     bindGenWalk(pt, rt, names, tys)
+    pi = pi + 1
   }
   if names.length == 0 { return 0 }
   elabReachNote(-1, elabEnqueue(lam, names, tys, -1), -1)
   elabSettle(0)
+}
+
+// The signature the set of functions parameter `pi` (of type `pt`) of lambda `lam` runs at: each
+// member's instance at the argument types of the lambda's own calls through that parameter; -1
+// when they disagree, a call's arguments do not close or no member is instanced there.
+function elabLamCallRep(lam: i32, pi: i32, pt: i32): i32 {
+  const f = nodeAt(lam)
+  if !(f is FuncDecl) || pi >= f.fnParams.length || !(tyAt(pt) is TyFunc) {
+    return -1
+  }
+  const calls: i32[] = []
+  elabCallsThrough(f.fnBody, f.fnParams[pi], calls)
+  const ms = elabFnSetOf(pt)
+  let rep = -1
+  for c in calls {
+    const cn = nodeAt(c)
+    const ats: i32[] = []
+    if cn is Call {
+      for a in cn.callArgs { ats.push(widenLitTy(nodeTyIxOf(a))) }
+    }
+    if !tysClosed(ats) { return -1 }
+    for m in ms {
+      const ft = elabMemberAt(m, ats)
+      if ft < 0 || (rep >= 0 && !tySame(rep, ft)) { return -1 }
+      rep = ft
+    }
+  }
+  rep
+}
+
+// Appends to `out` each call under node `ix`, outside a nested function, whose callee reads the
+// parameter `pd`.
+function elabCallsThrough(ix: i32, pd: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is FuncDecl { return 0 }
+  if n is Call && identDeclOf(parenPeelIx(n.callFn)) == pd { out.push(ix) }
+  for c in nodeChildren(ix) { elabCallsThrough(c, pd, out) }
+  0
+}
+
+// The signature of the instance of function `m` whose parameter types are `ats`, its result
+// widened; -1 for none.
+function elabMemberAt(m: i32, ats: i32[]): i32 {
+  const sig = if m >= 0 && m < P.nodes.length { nodeTyIxOf(m) } else { -1 }
+  if sig < 0 || sig >= T.tys.length { return -1 }
+  const sf = tyAt(sig)
+  if !(sf is TyFunc) || sf.fnParamTypes.length != ats.length { return -1 }
+  let k = 0
+  while k < ekDecl.length {
+    if ekDecl[k] == m {
+      const ps: i32[] = []
+      let same = true
+      let i = 0
+      while i < ats.length {
+        const p = substTyDeep(sf.fnParamTypes[i], ekNames[k], ekTys[k])
+        if p < 0 || !tySame(p, ats[i]) { same = false }
+        ps.push(p)
+        i = i + 1
+      }
+      const r = if same { elabResultOf(k) } else { -1 }
+      if r >= 0 { return mkFuncTy(ps, widenLitTy(r)) }
+    }
+    k = k + 1
+  }
+  -1
 }
 
 // Enqueues call `ix`'s row `names`/`tys` with each set of functions taking its rep at `ck`
