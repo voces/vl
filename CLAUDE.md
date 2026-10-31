@@ -70,6 +70,10 @@ sparse; otherwise the `.vhdx` keeps every byte it ever held (214 GB for 132 GB o
 
 ## Gates
 
+**What earns a place in the gate is `docs/internals/testing-strategy.md`**: a check stays
+while it catches a breakage nothing else catches, measured by the kill matrix
+(`scripts/kill-matrix/`); a redundant one is deleted with its intent folded into a survivor.
+
 **`scripts/gate.sh` runs the whole ladder and is the thing to run.** It refuses inside a builder
 worktree (`.claude/worktrees/`, override `GATE_IN_WORKTREE=1`): the merge queue gates every PR on
 the merged tree, and builders running it as well spent 66 full runs in one day. Every gate below is

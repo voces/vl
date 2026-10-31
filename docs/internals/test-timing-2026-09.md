@@ -8,6 +8,9 @@ successful master pushes. Local numbers are from a 24-core box shared with other
 every one names the load it was taken at, and **a local wall-clock figure is a minimum of
 several runs** — see "One pass is not a reading".
 
+The rule this survey's measurements now feed is [testing-strategy.md](testing-strategy.md):
+what earns a place in the merge gate, and how redundancy is measured.
+
 The question this answers: *"There are still quite a few individual tests that take >100 ms
 … 100 ms seems long for headless language testing. Can tests be improved?"*
 
