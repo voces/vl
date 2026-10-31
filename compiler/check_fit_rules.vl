@@ -2494,6 +2494,9 @@ export function recBuiltReadRefuse(u: i32) {
   if et >= 0 && own >= 0 {
     const ot = tyAt(own)
     const oe = if ot is TyArray { ot.aElem } else if ot is TyMap { ot.mVal } else { -1 }
+    if oe >= 0 && ot is TyArray && recAnnArgTakesRep(p, mkArrayTy(et)) {
+      return 0
+    }
     if oe >= 0 { recBuiltReadErr(p, own, nonNullTy(oe), et, true) }
     return 0
   }
@@ -2553,9 +2556,9 @@ function recParamTakesRep(par: i32, depth: i32): boolean {
   used
 }
 
-// Whether `x` is an argument of a non-generic function whose annotated record parameter is only
-// read or written for a field in its own body and is a narrower record over `rep`'s fields; noted
-// with `recArgRepNote`, so the callee is instanced at `rep` (D14532).
+// Whether `x` is an argument of a non-generic function whose annotated parameter, a narrower record
+// over `rep`'s fields or a list of one, is only read or written for a field (an element's, for a
+// list) in its own body; noted with `recArgRepNote`, so the callee is instanced at `rep` (D14532).
 function recAnnArgTakesRep(x: i32, rep: i32): boolean {
   if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_ARG {
     return false
@@ -2577,7 +2580,8 @@ function recAnnArgTakesRep(x: i32, rep: i32): boolean {
   const par = f.fnParams[i]
   const pn = nodeAt(par)
   if !(pn is Param) || pn.parType < 0 { return false }
-  if !recRepWider(nodeTyIxOf(par), rep) { return false }
+  const list = recListRepWider(nodeTyIxOf(par), rep)
+  if !list && !recRepWider(nodeTyIxOf(par), rep) { return false }
   cwIxBuild()
   let used = false
   const ow = cwOccWalk(par)
@@ -2585,7 +2589,8 @@ function recAnnArgTakesRep(x: i32, rep: i32): boolean {
     const r = ow.row
     if cwIxKind[r] == CW_OCC_USE {
       const u = cwIxNode[r]
-      if !recFieldRead(u) || recEnclosingFn(u) != fd { return false }
+      const ok = if list { recElemFieldRead(u) } else { recFieldRead(u) }
+      if !ok || recEnclosingFn(u) != fd { return false }
       used = true
     } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
       return false
@@ -2593,6 +2598,28 @@ function recAnnArgTakesRep(x: i32, rep: i32): boolean {
   }
   if used { recArgRepNote(x, fd, rep) }
   used
+}
+
+// Whether lists `narrow` and `wide` hold records `recRepWider` relates.
+function recListRepWider(narrow: i32, wide: i32): boolean {
+  if narrow < 0 || narrow >= T.tys.length || wide < 0 || wide >= T.tys.length {
+    return false
+  }
+  const n = tyAt(narrow)
+  const w = tyAt(wide)
+  n is TyArray && w is TyArray && recRepWider(n.aElem, w.aElem)
+}
+
+// Whether list read `u` is only its length, or indexed and the element read for a field.
+function recElemFieldRead(u: i32): boolean {
+  if u < 0 || u >= cwIxUpKind.length || cwIxUpKind[u] != CW_UP_OBJ {
+    return false
+  }
+  const up = cwIxUp[u]
+  if up < 0 || up >= P.nodes.length { return false }
+  const un = nodeAt(up)
+  if un is Member { return un.memProp == "length" && recFieldRead(u) }
+  un is Index && recFieldRead(up)
 }
 
 // Whether record `wide` is another record over the same field names as record `narrow`, which is
