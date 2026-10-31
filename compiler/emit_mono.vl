@@ -398,7 +398,6 @@ import {
   drwSelfDeclAt,
   drwSelfFnOf,
   fnDeclNamed,
-  recordedParamPinName,
 } from "./emit_rewrite"
 import {
   FC_STRUCT,
@@ -4353,51 +4352,6 @@ function monoRetBoundLitCopy(x: i32): i32 {
   cx
 }
 
-// Whether the instance takes its own un-annotated copy of binding `n`, for its walk to annotate:
-// a `const` of a list literal of function names whose type the checker left open at a function.
-function monoLetOwnCopy(n: LetDecl): boolean {
-  if n.letKw != "const" || n.letType >= 0 || n.letInit < 0 { return false }
-  const x = unwrapParen(n.letInit)
-  if !monoNameListLit(x) { return false }
-  const t = nodeTyIxOf(x)
-  monoTyOpen(t) && tyMayHoldFn(t, 0)
-}
-
-// Whether generic instance `fx` holds its own copy `at` of a binding `d` of a list of names.
-function monoInstOwnNameList(fx: i32, at: i32, d: LetDecl): boolean {
-  d.letInit >= 0
-    && monoNameListLit(unwrapParen(d.letInit))
-    && monoInstOwns(fx, at)
-}
-
-// Whether `x` is a non-empty list literal whose elements each name a function or a `const` of
-// such a literal, or are such literals; a `let`, which may be written, is not one.
-function monoNameListLit(x: i32): boolean { monoNameListLitAt(x, 0) }
-
-function monoNameListLitAt(x: i32, depth: i32): boolean {
-  if depth > TY_WALK_DEPTH || x < 0 || x >= P.nodes.length { return false }
-  const l = nodeAt(x)
-  if !(l is ArrayLit) || l.arrElems.length == 0 { return false }
-  for e in l.arrElems {
-    const ex = unwrapParen(e)
-    if ex < 0 || ex >= P.nodes.length { return false }
-    if nodeAt(ex) is Ident {
-      const d = identDeclOf(ex)
-      if d < 0 || d >= P.nodes.length { return false }
-      const dn = nodeAt(d)
-      const ok = dn is FuncDecl
-        || (dn is LetDecl
-        && dn.letKw == "const"
-        && dn.letInit >= 0
-        && monoNameListLitAt(unwrapParen(dn.letInit), depth + 1))
-      if !ok { return false }
-    } else if !monoNameListLitAt(ex, depth + 1) {
-      return false
-    }
-  }
-  true
-}
-
 // `monoCloneBodyRaw`'s arm for the binding `n` at `ix`: its instance annotation.
 function monoCloneLetDecl(
   n: LetDecl,
@@ -4409,11 +4363,6 @@ function monoCloneLetDecl(
   bT: i32[],
 ): i32 {
   const nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
-  // A `const` of a list of function names takes the instance's own copy, for its walk to
-  // annotate. Clones only this `LetDecl` and its enclosing Block, never the shared original.
-  if nt < 0 && monoLetOwnCopy(n) {
-    return monoCopyOf(ix, mkLet(n.letKw, n.letName, -1, n.letInit, n.pos))
-  }
   if nt == n.letType { return ix }
   const ninit = monoCtorInitCopy(n.letInit, nt)
   return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ninit, n.pos))
@@ -15353,10 +15302,9 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   }
   if pins.length != 1 { return 0 }
   // A pin taken at this instance's own template is this instance's alone, and a generic's
-  // instances share `d` unless this one took its own copy (D9660): its elements are instanced
-  // here and its reads typed per instance.
+  // instances share `d` (D9660): its elements are instanced here and its reads typed per
+  // instance.
   const shared = monoFrameIsGenericInstance(ctx)
-    && !monoInstOwnNameList(ctx, at, d)
     && monoDeclPathPinsPerInstance(at, path)
   const ann = monoSigFnTyName(pins[0] + ";")
   const dTys: i32[] = []
@@ -22697,9 +22645,9 @@ function monoPinHoleParam(
   pinned: string[],
   pinTys: i32[],
 ): i32 {
-  // A parameter the checker already decided is not a hole, so the instance
-  // pins the parameter's own type. `recordedParamPinName` is that one answer,
-  // shared with `synthParamAnnots`; "" keeps the argument-derived pin.
+  // A parameter the checker already decided is not a hole: the instance pins it at the
+  // elaboration's type for it, or its own where the function binds nothing; "" keeps the
+  // argument-derived pin.
   // A tagged function set is handed on as itself: the instance calls each member directly.
   const setTy = monoArgTaggedSetTy(args[i])
   if setTy >= 0 {
@@ -22707,7 +22655,10 @@ function monoPinHoleParam(
     pinTys.push(setTy)
     return 0
   }
-  let an = recordedParamPinName(params[i])
+  const pt0 = nodeTyIxOf(params[i])
+  const ept = elabCallParamTy(monoCallTplOf(callIx), i)
+  const dt = if ept >= 0 { ept } else { pt0 }
+  let an = if pt0 >= 0 && !tyHasTyVar(pt0) && dt >= 0 { monoClosedTyPin(dt) } else { "" }
   let anTy = -1
   // A literal handed to a parameter the body's own annotation decides delivers its open
   // functions at the slots the flow table pins, as at an annotated parameter (D9610).
@@ -26677,9 +26628,9 @@ function monoBoundFnListElemsTy(lits: i32[], ctx: i32): i32 {
   t
 }
 
-// The copy generic instance `fx` took of its template's binding `d` (`monoLetOwnCopy`), or of its
-// `for` loop `d` (`monoCloneGenericCalls`), which a read the instance shares with its template
-// still resolves to `d`; `d` itself otherwise.
+// The copy generic instance `fx` took of its template's binding or `for` loop `d`
+// (`monoCloneGenericCalls`), which a read the instance shares with its template still resolves
+// to `d`; `d` itself otherwise.
 function monoInstDeclCopy(fx: i32, d: i32): i32 {
   if d < 0 || d >= P.nodes.length || !monoFrameIsGenericInstance(fx) {
     return d
