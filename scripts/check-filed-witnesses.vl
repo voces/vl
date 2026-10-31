@@ -433,7 +433,12 @@ function batchClean(entries: string[]): Map<string, boolean> {
 // The `copies` `vl check --batch --json --codegen` answered exit 0 for and kept the validated
 // module of, as `kd/<name>.wasm`: the module `vl run` would compile, so running it skips a
 // second check. A seed that cannot keep modules keeps none, and every row is graded as before.
-function batchKept(copies: string[], kd: string): Map<string, boolean> {
+// `failed` gets each copy the batch answered with a nonzero exit: no later check can call it clean.
+function batchKept(
+  copies: string[],
+  kd: string,
+  failed: Map<string, boolean>,
+): Map<string, boolean> {
   const kept: Map<string, boolean> = Map()
   if copies.length == 0 { return kept }
   const args = [
@@ -455,6 +460,7 @@ function batchKept(copies: string[], kd: string): Map<string, boolean> {
     const j = parseJson(l)
     if j is JsonMap {
       const f = strField(j, "file")
+      if numField(j, "exit") != 0.0 { failed[f] = true }
       if (
         numField(j, "exit") == 0.0
         && exists(kd + "/" + f.slice(lastSlash(f) + 1, f.length) + ".wasm")
@@ -497,9 +503,10 @@ function gradeChunk(dirs: string[]) {
     k = k + 1
   }
   const got: Map<i32, Ran> = Map()
+  const failed: Map<string, boolean> = Map()
   if copies.length > 0 {
     const kd = dirs[0] + "/batch-keep"
-    const kept = batchKept(copies, kd)
+    const kept = batchKept(copies, kd, failed)
     const wasms: string[] = []
     const wnames: string[] = []
     const wat: i32[] = []
@@ -542,10 +549,22 @@ function gradeChunk(dirs: string[]) {
       }
     }
   }
+  // The rows still unanswered are checked once more, together, only when nothing has said
+  // they fail: a row the codegen batch failed, or one graded alone by its hint, goes straight
+  // to `classify`, whose own check decides it. Checked again here, a slow failing row (a
+  // compiler trap) cost its chunk that compile twice.
+  const bad: boolean[] = []
+  for _ in dirs { bad.push(false) }
+  let c0 = 0
+  while c0 < copies.length {
+    if failed[copies[c0]] ?? false { bad[at[c0]] = true }
+    c0 = c0 + 1
+  }
   const rest: string[] = []
   k = 0
   while k < dirs.length {
-    if got[k] == null { rest.push(entries[k]) }
+    if exists(dirs[k] + "/" + HINT_ALONE) { bad[k] = true }
+    if got[k] == null && !bad[k] { rest.push(entries[k]) }
     k = k + 1
   }
   const clean = batchClean(rest)
@@ -609,14 +628,37 @@ function gradeAll(root: string, dirs: string[], jobs: i32) {
   }
   let size = (dirs.length + jobs * 4 - 1) / (jobs * 4)
   if size > CHUNK { size = CHUNK }
-  const lists: string[] = []
-  let at = 0
-  while at < dirs.length {
-    const part: string[] = []
-    while at < dirs.length && part.length < size {
-      part.push(dirs[at])
-      at = at + 1
+  // Rows go to chunks round-robin: rows filed together cost alike (the `@@repeat` witnesses
+  // sit side by side), and a run of slow ones in one chunk was the whole row's tail.
+  // The rows known to be slow (graded alone by their hint, or an expanded `@@repeat`) are dealt
+  // first, so they land in the first chunks `xargs` starts rather than in the last.
+  const order: string[] = []
+  for d in dirs {
+    if (
+      exists(d + "/" + HINT_ALONE)
+      || contains(readText(d + "/repro"), "@@repeat(")
+    ) {
+      order.push(d)
     }
+  }
+  for d in dirs {
+    if (
+      !(exists(d + "/" + HINT_ALONE)
+        || contains(readText(d + "/repro"), "@@repeat("))
+    ) {
+      order.push(d)
+    }
+  }
+  const count = (order.length + size - 1) / size
+  const parts: string[][] = []
+  for _ in 0 until count { parts.push([]) }
+  let at = 0
+  while at < order.length {
+    parts[at % count].push(order[at])
+    at = at + 1
+  }
+  const lists: string[] = []
+  for part in parts {
     const list = root + "/chunk-" + toString(lists.length)
     writeText(list, join(part, "\n"))
     lists.push(list)
