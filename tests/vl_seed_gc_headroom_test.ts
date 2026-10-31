@@ -72,12 +72,7 @@ Deno.test({
     "seed-gc-headroom: a seed live set near a semispace grows the heap instead of re-collecting",
   ignore: !ENABLED,
   fn: async () => {
-    // Both runs at once: each is single-threaded past its JIT, and run in turn they were this
-    // test's whole 26 s on a CI runner, the longest single test in the native shards.
-    const [n, off] = await Promise.all([
-      collections("", "default policy"),
-      collections("off", "VL_COMPILE_GC_GROW=off"),
-    ]);
+    const n = await collections("", "default policy");
     if (n < 1) {
       throw new Error(
         `${n} collections with the default policy — the counter looks dead (GcStatsLog in ` +
@@ -92,6 +87,7 @@ Deno.test({
           "the three trace messages GC_LOG_TARGETS reads makes the policy a no-op.",
       );
     }
+    const off = await collections("off", "VL_COMPILE_GC_GROW=off");
     if (off <= MAX_DEFAULT || off < n * MIN_SPREAD) {
       throw new Error(
         `VL_COMPILE_GC_GROW=off collected ${off} times against the default's ${n}, want more ` +
