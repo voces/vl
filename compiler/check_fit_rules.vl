@@ -496,6 +496,7 @@ import {
   cwIxBuild,
   cwIxKind,
   cwIxNode,
+  cwIxParent,
   cwIxUp,
   cwIxUpAux,
   cwIxUpKind,
@@ -2477,10 +2478,69 @@ export function recBuiltReadRefuse(u: i32) {
   }
   const bt = recBuiltReadTy(p)
   if bt < 0 || own < 0 { return 0 }
+  if !(nodeAt(p) is BinExpr) && recArgTakesRep(p, 4) { return 0 }
   if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
   }
   0
+}
+
+// Whether `x` is an argument whose parameter takes its rep (`recParamTakesRep`), up to `depth`
+// hand-ons; the callee is instanced at the argument's type and stores it at its build (D14532).
+function recArgTakesRep(x: i32, depth: i32): boolean {
+  if (
+    depth <= 0
+    || x < 0
+    || x >= cwIxUpKind.length
+    || cwIxUpKind[x] != CW_UP_ARG
+  ) {
+    return false
+  }
+  const c = nodeAt(cwIxUp[x])
+  if !(c is Call) || c.callFn < 0 { return false }
+  const fd = identBoundFnDeclOf(c.callFn)
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = nodeAt(fd)
+  const i = cwIxUpAux[x]
+  if !(f is FuncDecl) || i < 0 || i >= f.fnParams.length { return false }
+  recParamTakesRep(f.fnParams[i], depth)
+}
+
+// Whether parameter `par`, open in a type variable or a hole, is only read or written for a field
+// or handed to another such parameter: the positions that read a value at a rep wider than its type.
+function recParamTakesRep(par: i32, depth: i32): boolean {
+  const pt = nodeTyIxOf(par)
+  if pt < 0 || pt >= T.tys.length || !(tyAt(pt) is TyVar) { return false }
+  cwIxBuild()
+  const owner = if par < cwIxParent.length { cwIxParent[par] } else { -1 }
+  if owner < 0 || !(nodeAt(owner) is FuncDecl) { return false }
+  let used = false
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if !recFieldRead(u) && !recArgTakesRep(u, depth - 1) { return false }
+      // A use a nested function captures reads the value where the capture stores it.
+      if recEnclosingFn(u) != owner { return false }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  used
+}
+
+// The function declaration whose body holds node `x`, or -1.
+function recEnclosingFn(x: i32): i32 {
+  let cur = if x >= 0 && x < cwIxParent.length { cwIxParent[x] } else { -1 }
+  let guard = 0
+  while cur >= 0 && cur < P.nodes.length && guard < 4096 {
+    if nodeAt(cur) is FuncDecl { return cur }
+    cur = if cur < cwIxParent.length { cwIxParent[cur] } else { -1 }
+    guard = guard + 1
+  }
+  -1
 }
 
 // The capability refusal for `recBuiltReadRefuse`: `at` (typed `whole`) is, or with `elems` holds,
@@ -2517,7 +2577,7 @@ function recBuiltElemOf(x: i32): i32 {
 
 // The record a container's build gives the read `x`: an element by index or `.get`, a field of
 // one, or a record binding's own build; else -1.
-function recBuiltReadTy(x: i32): i32 {
+export function recBuiltReadTy(x: i32): i32 {
   const n = nodeAt(x)
   if n is BinExpr {
     return if n.binOp == "??" { recBuiltReadTy(cwPeelValue(n.binLeft)) } else { -1 }
