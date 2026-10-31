@@ -11,6 +11,7 @@
 // program with no generic call creates none. The host oracle and the two deliberate
 // divergences: `docs/internals/monomorphization-design.md`.
 
+import { mintCallSoleSet } from "./check_mint"
 import {
   mkNumTyped,
   narrowedFromTyCopy,
@@ -576,6 +577,7 @@ import {
 import { rlSlotOfTy, sFieldIndex } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
+  elabClosedTyAt,
   exactBindWalk,
   exactSubAt,
   holeNulStringPinTyOf,
@@ -583,7 +585,6 @@ import {
   monoExactSubRowOf,
   nodeTyInOf,
   pinSubAt,
-  pinSubOperandTyOf,
   pinnedParamTyAt,
   tyCanonKey,
   tySameSet,
@@ -698,6 +699,7 @@ import {
   fnTagCallSetOf,
   fnTagHoldsTy,
   fnTagListTy,
+  fnTagSetIsTagged,
   fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
@@ -1257,7 +1259,7 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   let nt = nodeTyIxOf(ax)
   // A generic body records a read narrowed to one list as `T[]`, which the pins name.
   if nt >= 0 && tyHasTyVar(nt) {
-    const ps = pinSubOperandTyOf(nt, fnIx)
+    const ps = elabClosedTyAt(ax, fnIx)
     if ps >= 0 { nt = ps }
   }
   // A type whose render softens its literals is not a name this test can compare: it
@@ -3225,21 +3227,6 @@ function monoSubstLetType(
   letType
 }
 
-// Registers the union row an if-join the checker kept apart (D2832) builds at the instance being
-// walked, where the elaboration types it a union of lists with no shared rep.
-function monoApartJoinRow(init: i32) {
-  if init < 0 { return 0 }
-  const u = unwrapParen(init)
-  if (tpIfJoinAt.get(u) ?? -1) < 0 { return 0 }
-  const sj = elabWalkTy(u)
-  if sj < 0 || sj >= T.tys.length { return 0 }
-  if !tyUnionAllLists(sj) || listUnionSharedRep(sj) >= 0 { return 0 }
-  let name = tpIfJoinPinName(sj)
-  if name == "" { name = monoListUnionRowName(sj) }
-  if name != "" { monoRegisterPinUnion(name, sj) }
-  0
-}
-
 // The links of the `else if` chain headed by the `if` at `ix`, outermost first. A rewriter
 // maps each link's condition and then arm in this order, then the last link's else
 // (`monoIfChainElse`), and `monoIfChainRebuild` reassembles them — the node order of the
@@ -4174,15 +4161,28 @@ function monoTpJoinBindRow(init: i32, bN: string[], bT: i32[]) {
 function monoRegisterElabJoinRows() {
   for ix in elabNodeTys.keys() {
     const t = if ix >= 0 && ix < P.nodes.length { nodeTyIxOf(ix) } else { -1 }
-    if t >= 0 && tyIsTpJoinUnion(t) {
+    // An if-join the checker kept apart (D2832) is a union of lists at an instance that binds
+    // its arms apart, one row per such union unless the lists share one rep.
+    const apart = (tpIfJoinAt.get(ix) ?? -1) >= 0
+    if (t >= 0 && tyIsTpJoinUnion(t)) || apart {
       const ps = elabNodeTys[ix] ?? []
       let i = 1
       while i < ps.length {
         const st = ps[i]
+        const closed = st >= 0 && st < T.tys.length && !tyHasTyVar(st)
         if (
-          st >= 0
-          && st < T.tys.length
-          && !tyHasTyVar(st)
+          closed
+          && apart
+          && tyUnionAllLists(st)
+          && listUnionSharedRep(st) < 0
+        ) {
+          let name = tpIfJoinPinName(st)
+          if name == "" { name = monoListUnionRowName(st) }
+          if name != "" { monoRegisterPinUnion(name, st) }
+        } else if (
+          closed
+          && t >= 0
+          && tyIsTpJoinUnion(t)
           && monoTyIsUnionOrNulUnion(st)
         ) {
           let nm = monoPinUnionNameOfTy(st)
@@ -4242,9 +4242,8 @@ function monoTpJoinListElemBox(ix: i32, pty: i32): i32 {
   monoRegisterPinUnion(en, pl.aElem)
 }
 
-// The annotation an un-annotated list literal typed at the instance's holes takes, where its
-// element is a union, a nullable or a list: nothing else types such a local's build (D2898). -1
-// otherwise.
+// The instance type, as an annotation, of a list literal typed at the instance's holes whose
+// element is a union, a nullable or a list; -1 otherwise. A for-in re-makes its literal there.
 function monoHoleListLitAnn(initIx: i32): i32 {
   if initIx < 0 || monoCgcHoleN.length == 0 { return -1 }
   const ix = unwrapParen(initIx)
@@ -4261,30 +4260,7 @@ function monoHoleListLitAnn(initIx: i32): i32 {
   if !box && !nul && !(et is TyArray) { return -1 }
   const nm = monoListSpelling(tyToEmitName(ht), ht)
   if nm == "" { return -1 }
-  monoHoleListLitTy = -1
-  if nul { monoHoleListLitTy = ht }
   synthTypeRefTy(nm, -1, ht)
-}
-
-// The instance type `monoHoleListLitAnn`'s last annotation gave a nullable element, whose
-// literal is re-made at that type: the build reads its element rep off the literal, and the
-// template's casts the null away (D2899). -1 for any other element.
-let monoHoleListLitTy = -1
-
-// The list literal `initIx` re-made at `monoHoleListLitTy`, or `initIx` when there is none.
-function monoHoleListLitCopy(initIx: i32): i32 {
-  const t = monoHoleListLitTy
-  monoHoleListLitTy = -1
-  if t < 0 { return initIx }
-  const ix = unwrapParen(initIx)
-  if ix < 0 { return initIx }
-  const n = nodeAt(ix)
-  if n is ArrayLit {
-    const nx = monoCopyOf(ix, mkArrayLit(n.arrElems, n.pos))
-    nodeTyRecord(nx, t)
-    return nx
-  }
-  initIx
 }
 
 // A for-in's list literal typed at the instance's holes, re-made at the instance type where
@@ -4297,7 +4273,6 @@ function monoHoleIterLitCopy(iterIx: i32): i32 {
   if n is ArrayLit {
     const nx = monoCopyOf(ix, mkArrayLit(n.arrElems, n.pos))
     nodeTyRecord(nx, monoHoleNodeTy(ix, nodeTyIxOf(ix)))
-    monoHoleListLitTy = -1
     return nx
   }
   iterIx
@@ -4450,21 +4425,15 @@ function monoCloneLetDecl(
   bN: string[],
   bT: i32[],
 ): i32 {
-  let nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
+  const nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
   // A `const` of a list of function names takes the instance's own copy, for its walk to
   // annotate. Clones only this `LetDecl` and its enclosing Block, never the shared original.
   if nt < 0 && monoLetOwnCopy(n) {
     return monoCopyOf(ix, mkLet(n.letKw, n.letName, -1, n.letInit, n.pos))
   }
-  if nt < 0 { monoApartJoinRow(n.letInit) }
   if nt < 0 { monoTpJoinBindRow(n.letInit, bN, bT) }
-  let ninit = n.letInit
-  if nt < 0 {
-    nt = monoHoleListLitAnn(n.letInit)
-    if nt >= 0 { ninit = monoHoleListLitCopy(n.letInit) }
-  }
   if nt == n.letType { return ix }
-  if ninit == n.letInit { ninit = monoCtorInitCopy(n.letInit, nt) }
+  const ninit = monoCtorInitCopy(n.letInit, nt)
   return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ninit, n.pos))
 }
 
@@ -7812,7 +7781,12 @@ function monoParamsMention(params: i32[], typarams: string[]): boolean {
 // callee with none, and the one it is noted at outside an instance.
 function monoTagSetAt(ix: i32, callFn: i32): i32 {
   const t = elabWalkTy(callFn)
-  if t < 0 { return fnTagCallSetOf(ix) }
+  if t < 0 {
+    const noted = fnTagCallSetOf(ix)
+    const ms = mintCallSoleSet(ix)
+    if noted < 0 && fnTagSetIsTagged(ms) { return ms }
+    return noted
+  }
   const s = fnTagSetOfTy(t)
   if s >= 0 && fnTagArmsAt(ix, s).length > 0 { return s }
   -1
@@ -9741,7 +9715,6 @@ export function monoStateReset() {
   monoCurHasLam = false
   monoDestPinOff = false
   monoElemTakenSig = Map()
-  monoHoleListLitTy = -1
   monoInstBody = -1
   monoInstIsFirst = false
   monoInstParams = []
@@ -24661,8 +24634,13 @@ function monoWalk(ix: i32, ctx: i32) {
   const n = nodeAt(ix)
   match n {
     Call => {
-      // A call through a tagged function set is each member's direct call (`fnTagDecide`).
-      const tagArms = fnTagCallArms(ix)
+      // A call through a tagged function set is each member's direct call (`fnTagDecide`); a
+      // call an instance makes through its parameter is noted only as that instance's fact.
+      let tagArms = fnTagCallArms(ix)
+      if tagArms.length == 0 {
+        const ms = mintCallSoleSet(ix)
+        if fnTagSetIsTagged(ms) { tagArms = fnTagArmsAt(ix, ms) }
+      }
       if tagArms.length > 0 {
         if monoWalk(n.callFn, ctx) < 0 { return -1 }
         for ta in tagArms {

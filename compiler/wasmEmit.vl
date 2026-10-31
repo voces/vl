@@ -1,4 +1,5 @@
 import { arrLitDestTy, arrLitUnionDestTaken } from "./check_bind_rows"
+import { mintCallSoleSet } from "./check_mint"
 import {
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
@@ -26,7 +27,7 @@ import {
   nodeTyRecord,
 } from "./check_node_tys"
 import { fsAsk, fsAskCallee } from "./fn_split"
-import { keyHasPrefix } from "./check_places"
+import { keyHasPrefix, parenPeelIx } from "./check_places"
 import {
   elabNodeRepAt,
   elabSpreadNote,
@@ -855,6 +856,7 @@ import {
   asgLitWidth,
   asgReReadEnter,
   asgReReadLeave,
+  asgReReadOf,
   asgReadNode,
   asgReadUnwidenOp,
   asgYieldsNullLit,
@@ -1310,6 +1312,7 @@ import {
   TY_WALK_DEPTH,
   coalResultTyOf,
   coalesceRetypedAtomToStr,
+  elabClosedTyAt,
   fnInPinnedInstance,
   forRangeStepIsConst,
   holeOperandTyOf,
@@ -1329,7 +1332,6 @@ import {
   mapTwinExact,
   mapTwinOneStruct,
   nodeTyInOf,
-  pinSubOperandTyOf,
   tyMentionsSet,
   tySameSet,
   tySameSpelled,
@@ -7457,7 +7459,7 @@ function boxIsNulStrUnion(exprIx: i32, fnIx: i32): boolean {
   if pinned >= 0 { return tyIsNulStrBoxUnion(pinned) }
   const own = nodeTyIxOf(unwrapParen(exprIx))
   if tyIsNulStrBoxUnion(own) { return true }
-  tyIsNulStrBoxUnion(pinSubOperandTyOf(own, fnIx))
+  tyIsNulStrBoxUnion(elabClosedTyAt(unwrapParen(exprIx), fnIx))
 }
 
 // The box on the stack as `string | null`: the null tag is `ref.null`, any other arm's payload
@@ -9868,8 +9870,12 @@ function emitUnionConcreteEq(
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   if emitUnionPayloadUnbox(body, eak) < 0 { return -1 }
   if emitUnionEqOther(body, otherIx, eak, fnIx, ec) < 0 { return -1 }
-  if nulOther {
-    fbRefAsNonNull() // the `-1` took the other branch
+  // The null took the other branch, so a nullable operand is the non-null ref here.
+  if (
+    nulOther
+    || nulStrOther && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
+  ) {
+    fbRefAsNonNull()
   }
   // D-EQOPCODE: the payload compare is the last projection of `eak`, which already chose
   // the box tag, the payload unbox and the widened operand emit above it.
@@ -24771,7 +24777,22 @@ function emitTagSetAt(ix: i32, fnIx: i32): i32 {
     const s = fnTagSetOfTy(nodeTyAt(c.callFn, fnIx))
     if fnTagSetIsTagged(s) { return s }
   }
-  fnTagCallSetOf(ix)
+  const noted = fnTagCallSetOf(ix)
+  if noted >= 0 { return noted }
+  // A call an instance makes through its parameter is noted only as that instance's fact.
+  const ms = mintCallSoleSet(ix)
+  if fnTagSetIsTagged(ms) && c is Call && emitTagParamHolds(c.callFn, ms) {
+    return ms
+  }
+  noted
+}
+
+// Whether the callee `f` reads a parameter whose recorded type in this function is tagged set
+// `s`, so its value is a member's id.
+function emitTagParamHolds(f: i32, s: i32): boolean {
+  const d = identDeclOf(parenPeelIx(f))
+  if d < 0 || !(nodeAt(d) is Param) { return false }
+  fnTagSetOfTy(nodeTyIxOf(d)) == s
 }
 
 // A call through a tagged function set (`fnTagDecide`): the callee is the i32 id of the member
@@ -35666,7 +35687,7 @@ function emitIdentNode(
   if idx < 0 {
     return emitIdentNonLocalRead(body, e, isid, exprIx, fnIx, ctx, ec)
   }
-  emitIdentLocalRead(exprIx, idx, fnIx, ctx)
+  emitIdentLocalRead(exprIx, idx, fnIx)
 }
 
 // Whether a narrowed read of `name` finds the union box it unboxes: a binding of this frame
@@ -35735,7 +35756,7 @@ function emitIdentNonLocalRead(
 
 // The read at `exprIx` from its local `idx`, or an unrolled range variable's constant.
 // Returns 0.
-function emitIdentLocalRead(exprIx: i32, idx: i32, fnIx: i32, ctx: ExpCtx) {
+function emitIdentLocalRead(exprIx: i32, idx: i32, fnIx: i32) {
   // A fully unrolled range loop's variable reads as its copy's constant.
   const urAt = unrolledSlotAt(idx)
   if urAt >= 0 {
@@ -35751,10 +35772,13 @@ function emitIdentLocalRead(exprIx: i32, idx: i32, fnIx: i32, ctx: ExpCtx) {
     return 0
   }
   fbLocalGet(idx)
-  // The `string | null` (kind 16) read rule for a param/local — stated at `emitMem`'s
-  // field read. Mirrors the kind-15 list read, which never eagerly recovers.
-  if !nulStrReadStaysRaw(ctx) {
-    if paramNulString(fnIx, exprIx) || declaredNulString(exprIx) {
+  // A `string | null` param or local recovers the non-null ref exactly when the read's own
+  // type at the instance excludes null.
+  if paramNulString(fnIx, exprIx) || declaredNulString(exprIx) {
+    // An assignment's re-read of its target is the value just stored, typed at the assignment.
+    const asg = asgReReadOf(exprIx)
+    const rt = nodeTyAt(if asg >= 0 { asg } else { unwrapParen(exprIx) }, fnIx)
+    if rt >= 0 && !tyBearsNull(rt) && !isNullTy(rt) {
       fbRefAsNonNull() // 0xd4
     }
   }
