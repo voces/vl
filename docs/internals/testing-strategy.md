@@ -204,6 +204,18 @@ seen by nothing; so is `escinline` above. These are coverage gaps or rules a lat
 makes unreachable. They are not redundancy, so no release-shape file is deletable on this
 evidence.
 
+### The four gaps, resolved
+
+Four mutants survived every row: `escinline`, `opt-ident`, `escv` and `opt-compwrite`. Each
+was taken to a fixture or shown to change no behaviour.
+
+| mutant | resolution | sole catcher now |
+| --- | --- | --- |
+| `escinline` | `tests/fixtures/opt-escape/medium-helper.vl`, a helper body between 60 and 320 bytes | `selfhost_native_release_escape_test.ts`, `medium-helper` (7 of 8 pass under the mutant, 8 of 8 on master) |
+| `opt-ident` | `tests/fixtures/opt-inline/kept-identity.vl`. A closure's `==` is VL's one `ref.eq`, and its environment holds the record. | `selfhost_native_release_inline_test.ts`, `kept-identity` (29 of 30 under the mutant, 30 of 30 on master) |
+| `escv` | equivalent: the lexer reads `decodeSimpleEscape` only for "is it a known escape", and the decoded value is discarded (the emitter's `decodeStr` makes the bytes, pinned by `escapes.vl`) | none possible |
+| `opt-compwrite` | equivalent from VL source: a record with a width subtype is never a leaf candidate (the census skips `kept-subtype`), so the component branch of the write rule is never reached | none possible |
+
 ## 3 · Measuring cost
 
 * **CPU seconds, not wall.** A test's wall under `--parallel` is the schedule
