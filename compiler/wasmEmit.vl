@@ -8186,7 +8186,7 @@ function emitUnionCoerceValueAtom(
   if coerceTakesAtomAsStr(uSet, uTy) && exprIsLitAtom(exprIx, fnIx) {
     // A `K | null` value's `-1` boxes under the null tag, any other id as its member string
     // under the string tag; the id is read once (D3347).
-    const nlTexts = nulAtomWidenTexts(exprIx)
+    const nlTexts = nulAtomWidenTexts(exprIx, fnIx)
     if nlTexts.length > 0 {
       // Beside a plain `string` arm the join is `string | null`, not this box.
       const nlAtoms: string[] = []
@@ -21126,7 +21126,7 @@ function emitIfExprRef(
 // operand whose arm records no pin of its own, by the operand's pinned type.
 function joinArmHoldsNulAtom(armIx: i32, fnIx: i32): boolean {
   if armIx < 0 { return false }
-  if nulAtomWidenTexts(armIx).length > 0 { return true }
+  if nulAtomWidenTexts(armIx, fnIx).length > 0 { return true }
   tyNulLitUnionMemberTexts(holeOperandTyOf(armIx, fnIx)).length > 0
 }
 
@@ -26875,12 +26875,6 @@ function emitAssignMember(
 function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32, ec: ExpCtx) {
   const a = nodeAt(binIx)
   if a is BinExpr {
-    // A map cell's `null` is a miss, which no write narrows, so only other places refuse.
-    nulWidenWriteRhs = -1
-    const nwTgt = nodeAt(unwrapParen(a.binLeft))
-    if !(nwTgt is Index) || !exprMap(nwTgt.idxArr, fnIx) {
-      nulWidenWriteRhs = unwrapParen(a.binRight)
-    }
     // the target is read through `unwrapParen`, exactly as the RHS already is (D1089):
     // `(x) = 5` is check-clean, so a `Paren` LHS matching none of the Ident/Index/Member
     // arms reached the floor with the wrong message. Peeling here is one change for all
@@ -30073,7 +30067,11 @@ function emitReturnCoercedValue(
     // A literal-union atom returned from a `string`-typed function widens to its member string.
     // A `K | null` value needs a result that holds `null`, which an inferred one does not
     // declare here (D3198).
-    if !retNulString && retInferred && nulAtomWidenTexts(retArg).length > 0 {
+    if (
+      !retNulString
+      && retInferred
+      && nulAtomWidenTexts(retArg, fnIx).length > 0
+    ) {
       return emitFailAt(
         "emitProgram: an inferred return of a nullable literal union has no string result to widen into",
         retArg,
@@ -34677,7 +34675,6 @@ export function wasmEmitStateReset() {
   njRTys = []
   njRUnion = false
   njResBox = false
-  nulWidenWriteRhs = -1
   saFnIx = 0 - 2
   ssArmBin = -1
   ssArmMode = 0
@@ -35030,7 +35027,7 @@ export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32, ec: ExpCtx) {
   // members, the DECLARATION fallback for an operand whose recorded type is the GENERIC's,
   // then the bare one-member set. Two consumers ask the same question and both need every
   // rung — the classifier decides WHETHER to widen, this one needs the members to widen WITH.
-  const nulTexts = nulAtomWidenTexts(atomIx)
+  const nulTexts = nulAtomWidenTexts(atomIx, fnIx)
   if nulTexts.length > 0 {
     return emitNulAtomToStr(body, atomIx, nulTexts, fnIx, ec)
   }
@@ -35050,11 +35047,6 @@ export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32, ec: ExpCtx) {
   r
 }
 
-// The right-hand side of the assignment being lowered, which `emitNulAtomToStr` refuses to
-// widen when it is typed at a type parameter or lowered in an instance: the checker narrowed the
-// place to non-null after the write and folded its null tests, which a `-1` would make wrong.
-let nulWidenWriteRhs = -1
-
 // Widen a `K | null` atom to a `string | null`: `-1` is `ref.null`, any other id takes the
 // member tower. The id is evaluated once (D3198).
 function emitNulAtomToStr(
@@ -35064,14 +35056,6 @@ function emitNulAtomToStr(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  if (
-    unwrapParen(atomIx) == nulWidenWriteRhs
-    && (nodeTyHasTyVar(unwrapParen(atomIx)) || fnInPinnedInstance(fnIx))
-  ) {
-    return emitFail(
-      "emitProgram: literal-union string widening with no members",
-    )
-  }
   if !aUsed {
     return emitFail(
       "emitProgram: literal-union string widening but array type not collected",
@@ -39032,7 +39016,7 @@ function emitCoalesceAtomStrDefault(
   ec: ExpCtx,
 ) {
   if emitAtomToStr(body, defIx, fnIx, ec) < 0 { return -1 }
-  if !nulBlock && nulAtomWidenTexts(defIx).length > 0 {
+  if !nulBlock && nulAtomWidenTexts(defIx, fnIx).length > 0 {
     fbRefAsNonNull() // 0xd4 the block is non-null: the default's null is narrowed away
   }
   0
