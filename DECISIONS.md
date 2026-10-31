@@ -10868,6 +10868,19 @@ through it is a tag-compare chain of direct calls. Delivery to a declared functi
 store or a single-type call keeps the closure rep, so the annotated and un-annotated spellings
 build the same bytes. Lambdas and thunks are out of scope. `tests/vl_fn_set_rep_test.ts`.
 
+## A choice of names at a split parameter is copied, not tagged (D14439, 2026-10-31)
+
+A hole parameter called at two instances takes one copy per instance (D6210), and a choice of
+named functions handed to it (`if c { wrap } else { wrap2 }`) now asks for that split exactly
+as one name does, keeping its set untagged. The split plan already hands each copy the choice,
+evaluated once (D13360). Two other answers were weighed. Tagging every set that reaches a split
+parameter needs the arms per mint scope, a fact for every call through the set in every
+instance, and the split plan standing down for a tagged parameter while still copying for an
+untagged one beside it, since it rewrites the function once for every caller; the 2026-10-29
+experiment built most of that and still moved three corpus files. Splitting per instance makes
+the source rewrite instance-aware, which it is not. Copying needs one checker ask and no new
+lowering. Its price is one more split-plan case for increment 3 to delete with the plan.
+
 ## A function-value set escapes as a lambda (step 4 S3a, 2026-10-26)
 
 Where a finite set escapes into a closed slot (an argument to a declared function-type
