@@ -398,7 +398,6 @@ import {
   drwSelfDeclAt,
   drwSelfFnOf,
   fnDeclNamed,
-  recordedParamPinName,
 } from "./emit_rewrite"
 import {
   FC_STRUCT,
@@ -604,6 +603,7 @@ import {
   elabRetOf,
   elabSlotNote,
   elabStampAt,
+  elabTestsTyVar,
   elabTpDefaultsReset,
   elabTpDefaultsSet,
   elabWalkKidRet,
@@ -4356,51 +4356,6 @@ function monoRetBoundLitCopy(x: i32): i32 {
   cx
 }
 
-// Whether the instance takes its own un-annotated copy of binding `n`, for its walk to annotate:
-// a `const` of a list literal of function names whose type the checker left open at a function.
-function monoLetOwnCopy(n: LetDecl): boolean {
-  if n.letKw != "const" || n.letType >= 0 || n.letInit < 0 { return false }
-  const x = unwrapParen(n.letInit)
-  if !monoNameListLit(x) { return false }
-  const t = nodeTyIxOf(x)
-  monoTyOpen(t) && tyMayHoldFn(t, 0)
-}
-
-// Whether generic instance `fx` holds its own copy `at` of a binding `d` of a list of names.
-function monoInstOwnNameList(fx: i32, at: i32, d: LetDecl): boolean {
-  d.letInit >= 0
-    && monoNameListLit(unwrapParen(d.letInit))
-    && monoInstOwns(fx, at)
-}
-
-// Whether `x` is a non-empty list literal whose elements each name a function or a `const` of
-// such a literal, or are such literals; a `let`, which may be written, is not one.
-function monoNameListLit(x: i32): boolean { monoNameListLitAt(x, 0) }
-
-function monoNameListLitAt(x: i32, depth: i32): boolean {
-  if depth > TY_WALK_DEPTH || x < 0 || x >= P.nodes.length { return false }
-  const l = nodeAt(x)
-  if !(l is ArrayLit) || l.arrElems.length == 0 { return false }
-  for e in l.arrElems {
-    const ex = unwrapParen(e)
-    if ex < 0 || ex >= P.nodes.length { return false }
-    if nodeAt(ex) is Ident {
-      const d = identDeclOf(ex)
-      if d < 0 || d >= P.nodes.length { return false }
-      const dn = nodeAt(d)
-      const ok = dn is FuncDecl
-        || (dn is LetDecl
-        && dn.letKw == "const"
-        && dn.letInit >= 0
-        && monoNameListLitAt(unwrapParen(dn.letInit), depth + 1))
-      if !ok { return false }
-    } else if !monoNameListLitAt(ex, depth + 1) {
-      return false
-    }
-  }
-  true
-}
-
 // `monoCloneBodyRaw`'s arm for the binding `n` at `ix`: its instance annotation.
 function monoCloneLetDecl(
   n: LetDecl,
@@ -4412,11 +4367,6 @@ function monoCloneLetDecl(
   bT: i32[],
 ): i32 {
   const nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
-  // A `const` of a list of function names takes the instance's own copy, for its walk to
-  // annotate. Clones only this `LetDecl` and its enclosing Block, never the shared original.
-  if nt < 0 && monoLetOwnCopy(n) {
-    return monoCopyOf(ix, mkLet(n.letKw, n.letName, -1, n.letInit, n.pos))
-  }
   if nt == n.letType { return ix }
   const ninit = monoCtorInitCopy(n.letInit, nt)
   return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ninit, n.pos))
@@ -9436,115 +9386,6 @@ function monoRegisterPinUnion(name: string, ty: i32) {
   0
 }
 
-// Per template slot: 1 when its body tests a value of a type parameter, directly or through a
-// generic it calls with one, 0 when not, -1 or absent when not yet asked. A slot on the walk's
-// stack holds -2 - n, n its visit number: asked, or answered "no" pending its cycle's root.
-let monoExactMemo: i32[] = []
-// The walk's stack of slots, its next visit number, and the lowest visit number of a slot on the
-// stack the current walk has read (Tarjan's lowlink), so a cycle settles once at its root.
-let monoExactStack: i32[] = []
-let monoExactNext = 0
-let monoExactLow = 0
-
-// Whether generic `fe` is keyed by its exact pins: its body has an `is`, `as` or `match` over a
-// value whose type names a type parameter, or passes such a value to a generic that has.
-function monoNeedsExactKey(fe: i32): boolean {
-  if fe < 0 || fe >= monoOrigNode.length { return false }
-  while monoExactMemo.length <= fe { monoExactMemo.push(-1) }
-  const m = monoExactMemo[fe]
-  if m >= 0 { return m == 1 }
-  if m <= -2 {
-    // On the stack: a provisional "no" until the cycle through it settles.
-    if -2 - m < monoExactLow { monoExactLow = -2 - m }
-    return false
-  }
-  const me = monoExactNext
-  monoExactNext = me + 1
-  const outerLow = monoExactLow
-  monoExactLow = me
-  // arena-tick exempt: a memo of the template's body, which no rebuild pass reads.
-  monoExactMemo[fe] = -2 - me
-  monoExactStack.push(fe)
-  let r = false
-  const fn = nodeAt(monoOrigNode[fe])
-  if fn is FuncDecl { r = monoTestsTyVar(fn.fnBody) }
-  const low = monoExactLow
-  monoExactLow = outerLow
-  if r {
-    // A "yes" is final, and every "no" pending above it may have read it as a "no".
-    monoExactUnwind(fe, 1, -1)
-  } else if low >= me {
-    // The root of its cycle: its walk read nothing below it on the stack, so all of it is "no".
-    monoExactUnwind(fe, 0, 0)
-  } else if low < outerLow {
-    monoExactLow = low
-  }
-  r
-}
-
-// Pops the walk's stack down to and including `fe`, settling `fe` to `mine` and every slot above
-// it to `rest`: 0 for a cycle that settled "no", -1 to re-ask after a "yes".
-function monoExactUnwind(fe: i32, mine: i32, rest: i32) {
-  while monoExactStack.length > 0 {
-    const top = monoExactStack[monoExactStack.length - 1]
-    monoExactStack.pop()
-    let v = rest
-    if top == fe { v = mine }
-    // arena-tick exempt: the same memo.
-    if top >= 0 && top < monoExactMemo.length { monoExactMemo[top] = v }
-    if top == fe { return 0 }
-  }
-  0
-}
-
-// Whether the node recorded at `ix` has a type naming a type parameter.
-function monoTyVarTyped(ix: i32): boolean {
-  const t = nodeTyIxOf(unwrapParen(ix))
-  t >= 0 && tyHasTyVar(t)
-}
-
-// `monoNeedsExactKey`'s walk over one subtree, nested lambdas included.
-function monoTestsTyVar(ix: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = nodeAt(ix)
-  if n is IsExpr {
-    if monoTyVarTyped(n.isObj) { return true }
-  }
-  if n is AsExpr {
-    if monoTyVarTyped(n.asObj) { return true }
-  }
-  if n is MatchExpr {
-    if monoTyVarTyped(n.matchScrut) { return true }
-  }
-  if n is Call && n.callFn >= 0 {
-    const cf = nodeAt(n.callFn)
-    if cf is Ident {
-      if monoCalleeIsGeneric(n.callFn) {
-        let passes = callTyArgsOf(ix).length > 0
-        let a = 0
-        while a < n.callArgs.length && !passes {
-          passes = monoTyVarTyped(n.callArgs[a])
-          a = a + 1
-        }
-        // A callee still being asked is on this walk's own cycle and answers nothing new.
-        if passes && monoNeedsExactKey(fnIndexOfNode(n.callFn)) { return true }
-      }
-    }
-  }
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      if monoTestsTyVar(kids[i]) { return true }
-      i = i + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  false
-}
-
 // Whether `ty` is a union with a type-parameter member and a concrete member besides `null`,
 // the shape the checker's binding walk passes over (`monoDeclIsOpenUnion`, which also names the
 // member).
@@ -9862,7 +9703,7 @@ function monoMakeInstanceKey(
 ) {
   // A body testing a value of a type parameter is keyed by the exact types, which a pin's
   // spelling can merge (a Set and its boolean map), so each instance binds them to one.
-  if monoNeedsExactKey(origFe) {
+  if elabTestsTyVar(monoOrigNode[origFe]) {
     if (monoExactBind(params, tps, pinTys, exBN, exBT, exSubN, exSubT)) {
       monoShAliasBind(origFe, exSubN, exSubT)
       let xk = 0
@@ -15364,10 +15205,9 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   }
   if pins.length != 1 { return 0 }
   // A pin taken at this instance's own template is this instance's alone, and a generic's
-  // instances share `d` unless this one took its own copy (D9660): its elements are instanced
-  // here and its reads typed per instance.
+  // instances share `d` (D9660): its elements are instanced here and its reads typed per
+  // instance.
   const shared = monoFrameIsGenericInstance(ctx)
-    && !monoInstOwnNameList(ctx, at, d)
     && monoDeclPathPinsPerInstance(at, path)
   const ann = monoSigFnTyName(pins[0] + ";")
   const dTys: i32[] = []
@@ -22708,9 +22548,9 @@ function monoPinHoleParam(
   pinned: string[],
   pinTys: i32[],
 ): i32 {
-  // A parameter the checker already decided is not a hole, so the instance
-  // pins the parameter's own type. `recordedParamPinName` is that one answer,
-  // shared with `synthParamAnnots`; "" keeps the argument-derived pin.
+  // A parameter the checker already decided is not a hole: the instance pins it at the
+  // elaboration's type for it, or its own where the function binds nothing; "" keeps the
+  // argument-derived pin.
   // A tagged function set is handed on as itself: the instance calls each member directly.
   const setTy = monoArgTaggedSetTy(args[i])
   if setTy >= 0 {
@@ -22718,7 +22558,10 @@ function monoPinHoleParam(
     pinTys.push(setTy)
     return 0
   }
-  let an = recordedParamPinName(params[i])
+  const pt0 = nodeTyIxOf(params[i])
+  const ept = elabCallParamTy(monoCallTplOf(callIx), i)
+  const dt = if ept >= 0 { ept } else { pt0 }
+  let an = if pt0 >= 0 && !tyHasTyVar(pt0) && dt >= 0 { monoClosedTyPin(dt) } else { "" }
   let anTy = -1
   // A literal handed to a parameter the body's own annotation decides delivers its open
   // functions at the slots the flow table pins, as at an annotated parameter (D9610).
@@ -23062,48 +22905,26 @@ function monoPinAnnotatedParam(
   0
 }
 
-// Binds the type parameters only the result of arrow annotation `annIx` names to the result
-// function value `argIx` gives at the parameter types `tvN`/`tvV` already close, as an
-// un-annotated function handed to `(T) => R` gives `R` (D8943), or to `((T) => R) | null`.
+// Binds the type parameters arrow annotation `annIx` names that are still unbound to the
+// parameter type the elaboration gives argument `i` of call `callIx`, as an un-annotated
+// function handed to `(T) => R` binds `R` (D8943), or to `((T) => R) | null`.
 function monoBindArrowRet(
   annIx: i32,
-  argIx: i32,
+  callIx: i32,
+  i: i32,
   typarams: string[],
   tvN: string[],
   tvV: string[],
   tvT: i32[],
 ) {
-  let at = nodeTyIxOf(annIx)
-  const nf = tyNulFuncInner(at)
-  if nf >= 0 { at = nf }
-  if at < 0 || at >= T.tys.length { return 0 }
-  const af = tyAt(at)
-  if !(af is TyFunc) || af.fnRet < 0 { return 0 }
-  const hN: string[] = []
-  const hT: i32[] = []
-  monoBoundTys(tvN, tvV, tvT, hN, hT)
-  const qs = monoArrowParamTysAt(af, hN, hT)
-  if qs.length > 0 && qs[0] < 0 { return 0 }
-  const r = monoValueRetAt(argIx, qs, 0)
-  if r < 0 { return 0 }
-  monoBindArenaWalk(substTyDeep(af.fnRet, hN, hT), r, typarams, tvN, tvV, tvT)
-}
-
-// Binds each of `typarams` still unbound in `tvN`/`tvV` that pattern type `pt` names to what
-// `bindGenWalk` pairs it with in argument type `at`, where that is closed, spelled as a pin. 0.
-function monoBindArenaWalk(
-  pt: i32,
-  at: i32,
-  typarams: string[],
-  tvN: string[],
-  tvV: string[],
-  tvT: i32[],
-) {
-  if pt < 0 || at < 0 || at >= T.tys.length { return 0 }
-  const rN: string[] = []
-  const rT: i32[] = []
-  bindGenWalk(pt, at, rN, rT)
-  monoPushPins(rN, rT, typarams, tvN, tvV, tvT)
+  monoBindArenaFullTys(
+    nodeTyIxOf(annIx),
+    elabCallParamTy(monoCallTplOf(callIx), i),
+    typarams,
+    tvN,
+    tvV,
+    tvT,
+  )
 }
 
 // The pin spelling of `t` a typed binding takes: a declared record or union by its name, as the
@@ -23167,9 +22988,9 @@ function monoBindListLitElems(
   0
 }
 
-// `monoBindArenaWalk` through unions and generic-application arguments as well
-// (`bindGenWalkFull`): the binding of declared parameter type `pt` at argument type `at`, each
-// pin spelled by `monoPinNominalSpelling` with its type beside it in `tvT`. A parameter bound to
+// Binds each of `typarams` still unbound that declared parameter type `pt` names to what
+// `bindGenWalkFull` pairs it with in argument type `at`, through unions and generic applications,
+// spelled by `monoPinNominalSpelling` with its type beside it in `tvT`. A parameter bound to
 // `never` takes `void`, as a `never` function value lowers. 0.
 function monoBindArenaFullTys(
   pt: i32,
@@ -23202,7 +23023,7 @@ function monoBindArenaFullTys(
   0
 }
 
-// `monoBindArenaWalk` for the union arms inside `pt`'s lists, nullables, fields and map values
+// The binding of `pt` at `at` for the union arms inside `pt`'s lists, nullables, fields and map values
 // (`(S | T)[]`), which a spelling cannot pair when `at` spells a member another way (D10880).
 function monoBindInnerArmPins(
   pt: i32,
@@ -23421,6 +23242,8 @@ function monoHandWrittenLet(
   tvT: i32[],
   patTy: i32,
   own: string,
+  callIx: i32,
+  argI: i32,
 ): i32 {
   const at = unwrapParen(arg)
   const lf = monoWrittenGenLetFrame(at, ctx)
@@ -23433,7 +23256,7 @@ function monoHandWrittenLet(
     )
   }
   if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
-    monoBindArrowRet(p.parType, at, fn.fnTyParams, tvN, tvV, tvT)
+    monoBindArrowRet(p.parType, callIx, argI, fn.fnTyParams, tvN, tvV, tvT)
   }
   const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
   if pre == "" { return 0 }
@@ -23505,7 +23328,7 @@ function monoPinTyParamComposite(
         || monoArgCallsBackGeneric(args[i]))
     ) {
       if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
-        monoBindArrowRet(p.parType, args[i], fn.fnTyParams, tvN, tvV, tvT)
+        monoBindArrowRet(p.parType, callIx, i, fn.fnTyParams, tvN, tvV, tvT)
       }
       const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
       if pre != "" { anC = pre }
@@ -23521,6 +23344,8 @@ function monoPinTyParamComposite(
         tvT,
         patTy,
         own,
+        callIx,
+        i,
       )
       if hr < 0 { return hr }
       if hr > 0 { anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) }
@@ -26710,9 +26535,9 @@ function monoBoundFnListElemsTy(lits: i32[], ctx: i32): i32 {
   t
 }
 
-// The copy generic instance `fx` took of its template's binding `d` (`monoLetOwnCopy`), or of its
-// `for` loop `d` (`monoCloneGenericCalls`), which a read the instance shares with its template
-// still resolves to `d`; `d` itself otherwise.
+// The copy generic instance `fx` took of its template's binding or `for` loop `d`
+// (`monoCloneGenericCalls`), which a read the instance shares with its template still resolves
+// to `d`; `d` itself otherwise.
 function monoInstDeclCopy(fx: i32, d: i32): i32 {
   if d < 0 || d >= P.nodes.length || !monoFrameIsGenericInstance(fx) {
     return d
@@ -27416,11 +27241,7 @@ export function monomorphize(stmts: i32[]) {
   monoSupersededObjTys = []
   monoGradualAsScalar = Map()
   monoGradualRetPinned = false
-  monoExactMemo = []
   monoActiveDepth = []
-  monoExactStack = []
-  monoExactNext = 0
-  monoExactLow = 0
   monoProgStmts = stmts
   monoRegisterElabJoinRows()
   monoProgHeldStamp = 0 - 1
