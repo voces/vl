@@ -62,7 +62,8 @@ The mutants live in `scripts/kill-matrix/mutants/`, and they are of two kinds:
   * a wrong union box tag, for `rep-fuzz`.
 
   A cheap fixture that catches everything a 26 s test catches makes the 26 s test the
-  deletion, even though each fixture is unique.
+  deletion, even though each fixture is unique. A hand mutant is written `vl fmt`-clean,
+  or `lint-self + fmt` catches its formatting rather than its behaviour.
 
 **What the matrix can and cannot show.** A droppable check is a candidate, not a proof. A
 few dozen mutants can only show that the check was never the sole catcher among them. The
@@ -86,6 +87,51 @@ comments and whitespace (2026-10-31):
 
 Redundancy is expected between expensive whole-suite checks and the fixtures, not between
 fixtures.
+
+### First reading, 2026-10-31
+
+Measured at `e015395f2` on a 4-core container, about 4 minutes per mutant. Of 52 mutants,
+one revert no longer type-checks against the tree, and 51 were graded.
+
+* **22 survive every gate row.** 2 are hand mutants:
+  * `escinline`, the escape-inline threshold cut from 320 to 60 bytes;
+  * `escv`, a wrong `\v` escape.
+
+  The other 20 are reverts:
+  * 13 shipped no test of their own;
+  * 4 touched docs or `CHANGELOG.md` only;
+  * 3 filed a "must keep running" row whose witness runs either way.
+
+  These are behaviour-neutral refactors or untested fixes. They are not evidence about
+  redundancy.
+* **29 are caught, 15 of them by exactly one check:**
+
+  | check | sole catches |
+  | --- | ---: |
+  | corpus oracle | 9 |
+  | filed witnesses | 2 |
+  | `scaling shape` (`quadfn`) | 1 |
+  | `lint-self + fmt` (`fmtw`) | 1 |
+  | a release-shape inline test (`escrecord`) | 1 |
+  | `vl_diag_span_test.ts` (`whilecond`) | 1 |
+
+* **The expensive checks against mutants aimed at them:**
+  * `scaling shape` and the release-shape suites each caught their mutant alone, so they
+    earn their place.
+  * `rep-fuzz` caught its mutant (`repnulbool`), and so did the corpus oracle. One mutant
+    is not enough to delete it.
+  * `self-compile pair` caught 3 broad mutants and `distilled corpus` caught 2, every one
+    also caught elsewhere. Neither had a mutant aimed at it.
+* **The costliest single tests caught nothing here, and their intent lies outside
+  `compiler/`:**
+  * `vl_seed_gc_headroom_test.ts` (44 s) guards the host's GC policy;
+  * `lsp_undisplayable_type_test.ts` (31 s) guards the editor's filter.
+
+  A compiler mutant cannot judge either one. Deciding them needs mutants of the host and
+  `lsp/src`.
+
+What this reading supports is that no expensive compiler-facing check is yet shown
+redundant. The cheap wins it found were tooling and plain waste (§4).
 
 ## 3 · Measuring cost
 
