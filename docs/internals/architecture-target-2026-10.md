@@ -627,8 +627,9 @@ The order: checker rows for value-of-generic deliveries, one slice per kind; the
 - 15: a root pin row of a lambda that reads its enclosing function's open types (`(n) => n * k` under an un-annotated `k`) is enqueued under each instance of the enclosing function, where it was dropped (`elabDrainHoleRows`).
 - 14: a `let` cell's hole-function members take their peers' signature when the cell also holds a generic (`elabCellPeers`).
 - 13: a named function handed to `.map`/`.filter` over a list holding a set of functions is also instanced at the set's rep, or at the member instances its own calls through the parameter take, where it was instanced at the set type alone (`?apM.0=Fn#155` beside mono's `(i32) => i32`).
+- 12: a nested declaration with nothing to bind whose body calls a generic (`(x) => h(x)` in `runG<U>`) is instanced per instance of an encloser that binds, at that instance's bindings, as mono builds it; only an encloser that binds nothing had one (`elabNestedPerEncl`).
 
-What is left (13 files on 2026-10-31), grouped by what each waits on:
+What is left (12 files on 2026-10-31), grouped by what each waits on:
 - 3: hole lambdas and hole functions handed on, through a capture cell (D14425), a list, a map or another hole callee, which mono instances at the delivery;
 - 3: function values through record fields, rewritten `let`s and module bindings read before their declaration, where the elaboration does not see which function the value holds;
 - 5: literal-union pins (`T = "a"` beside mono's `string`) where the call's literal instance is not the sole taker or the signature names a literal, which wait on mono keying instances by the elaboration. Enqueueing each string-literal row a second time at the widened type cleared 4 of the 8, and made 51 builds trap the compiler, because the extra instance changes what the emitter reads for the literal one;
