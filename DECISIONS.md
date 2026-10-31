@@ -11021,6 +11021,12 @@ returns that copy it take that rep. The rekey is deleted as a type producer, and
 instance-at-row route goes with it. It changes reps, so it runs the rep-fuzz gate, and it is
 sequenced after c-3.
 
+Landed 2026-10-31 (D14426 closed): the rekey is `callBindAdoptReps`, which records the adopted
+record as a rep row beside the bind row's types. Mono pins the parameter at the rep
+(`callArgRepTy`), the elaboration keeps the checker's instance for a pin that only widens it
+(`recRepWidens`), and the parameter's storage, a `let` copying it and a result returning it read
+the rep.
+
 ## A literal is built at the width of the position that reads it (ruling, 2026-10-27)
 
 This states the rule behind "Building a literal at the width a consumer demands is building". The
