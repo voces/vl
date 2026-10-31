@@ -105,8 +105,17 @@ export function elabCapLive(): boolean {
   elabCapOn && quietDepth == elabCapQuiet
 }
 
-// Whether a type decided now stands: outside every quiet probe, or in an instance's re-check.
-export function stampsStand(): boolean { !inferQuiet || elabCapLive() }
+// Whether a type decided now stands: outside every quiet probe and every call's re-check of a
+// generic body's constraints, or in an instance's re-check.
+export function stampsStand(): boolean {
+  (!inferQuiet && !stampsHeld) || elabCapLive()
+}
+
+// Set while a call's argument types re-check a generic body's constraints: one call decides no
+// build type for a node every instance shares (D14721).
+export let stampsHeld = false
+
+export function stampsHeldSet(v: boolean) { stampsHeld = v }
 
 // Opens recording at quiet depth `depth` with empty tables.
 export function elabCapBegin(depth: i32) {
@@ -293,6 +302,9 @@ export function elabNestNote(
   for p in paramTys {
     if p >= 0 && p < T.tys.length && tyHasTyVar(p) { open = true }
   }
+  // A closed declaration in an open encloser reads the encloser's open captures (D4046).
+  const es = if enclDecl >= 0 && enclDecl < P.nodes.length { nodeTyIxOf(enclDecl) } else { -1 }
+  if es >= 0 && es < T.tys.length && tyHasTyVar(es) { open = true }
   if !open { return 0 }
   const key = elabSnapKey(if live { elabCapKey } else { -1 }, decl)
   const slots: i32[] = []
@@ -1406,22 +1418,23 @@ export function fnTagMembers(s: i32): i32[] {
   fnSets[s]
 }
 
-// Whether type `t` is a list of a tagged set's ids, whose cell is the i32 list.
+// Whether type `t` is a list of a tagged set's ids, whose cell is the i32 list, or a list of such
+// lists.
 export function fnTagListTy(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   const a = T.tys[t]
-  if a is TyArray { return fnTagTyIsTagged(a.aElem) }
+  if a is TyArray { return fnTagTyIsTagged(a.aElem) || fnTagListTy(a.aElem) }
   false
 }
 
-// Whether type `t` holds a tagged set's ids: such a list or map, or a record with a field that is one
-// or holds one, at most `depth` records deep.
+// Whether type `t` holds a tagged set's ids: such a list or map, a list of such lists, or a record
+// with a field that is one or holds one, at most `depth` levels deep.
 export function fnTagHoldsTy(t: i32, depth: i32): boolean {
   if depth <= 0 || t < 0 || t >= T.tys.length { return false }
   const o = T.tys[t]
   match o {
     TyArray => {
-      return fnTagTyIsTagged(o.aElem)
+      return fnTagTyIsTagged(o.aElem) || fnTagHoldsTy(o.aElem, depth - 1)
     }
     TyObj => {
       for f in o.objFieldTypes {

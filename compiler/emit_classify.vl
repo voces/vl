@@ -843,6 +843,7 @@ import {
   coalesceStaysNullable,
   columnListRep,
   columnListRepAt,
+  elabClosedTyAt,
   exactSubAt,
   exactSubOuterTyOf,
   fnInPinnedInstance,
@@ -1825,9 +1826,15 @@ export function exprNulKind(exprIx: i32, fnIx: i32): VKind | null {
   vkNulKindOf(d.rdKind)
 }
 
-// The kind of the cell a `null`-narrowed read names: a name's cell, or a field's by its code.
-// `nulnone` when the read names no cell, since the value is then the `null` unit itself.
+// The kind of the cell a `null` read names: for a narrowed read, the rep of the storage type it
+// narrows; else a name's cell, or a field's by its code. `nulnone` when the read names no cell,
+// since the value is then the `null` unit itself.
 function nulNoneReadCellKind(exprIx: i32, fnIx: i32): VKind {
+  const st = readNarrowedStoreAt(unwrapParen(exprIx), fnIx)
+  if st >= 0 {
+    const d = repOfTy(st)
+    if d.rdCovered == 1 { return d.rdKind }
+  }
   const ck = readCellKind(exprIx, fnIx)
   if ck != null { return ck }
   "nulnone"
@@ -2464,6 +2471,15 @@ function asgReReadPinAt(rx: i32, fnIx: i32): i32 {
 // The assignment whose target `emitAsgValue` is re-reading for its value, or -1.
 let asgReReadIx = -1
 
+// The assignment whose value the read `rx` is, as the re-read of its target; -1 for any other read.
+export function asgReReadOf(rx: i32): i32 {
+  if asgReReadIx < 0 { return -1 }
+  const a = nodeAt(asgReReadIx)
+  if !(a is BinExpr) { return -1 }
+  if unwrapParen(a.binLeft) != unwrapParen(rx) { return -1 }
+  asgReReadIx
+}
+
 // Mark `asgIx` as the assignment whose target is being re-read; returns the mark to restore.
 export function asgReReadEnter(asgIx: i32): i32 {
   const saved = asgReReadIx
@@ -2719,8 +2735,8 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   t
 }
 
-// The record the parameter read `u` is stored as in `fnIx`, its annotation, where that is
-// another record than the read's own type; -1 otherwise.
+// The record, or list of records, the parameter read `u` is stored as in `fnIx`, its annotation,
+// where that is a wider build than the read's own type; -1 otherwise.
 function paramHeldTy(u: i32, fnIx: i32): i32 {
   if fnIx < 0 || fnIx >= P.nodes.length || u < 0 || u >= P.nodes.length {
     return -1
@@ -2735,7 +2751,16 @@ function paramHeldTy(u: i32, fnIx: i32): i32 {
   }
   if ann < 0 { return -1 }
   const t = nodeTyIxOf(ann)
-  if recRepWidens(nodeTyAt(u, fnIx), t) { t } else { -1 }
+  const own = nodeTyAt(u, fnIx)
+  if recRepWidens(own, t) { return t }
+  // A list of records stored at a list of wider records.
+  const ol = if own >= 0 && own < T.tys.length { T.tys[own] } else { null }
+  const tl = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if ol is TyArray && tl is TyArray && recRepWidens(ol.aElem, tl.aElem) {
+    t
+  } else {
+    -1
+  }
 }
 
 // Whether binding `d` holds a parameter stored at another record than its type (`paramHeldTy`).
@@ -5906,8 +5931,9 @@ export function instanceOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   const h = holeOperandTyOf(exprIx, fnIx)
   if h >= 0 { return h }
   const ax = unwrapParen(exprIx)
-  if ax < 0 { return -1 }
-  pinSubOperandTyOf(nodeTyIxOf(ax), fnIx)
+  if ax < 0 || !tyHasTyVar(nodeTyIxOf(ax)) { return -1 }
+  const st = elabNodeTyAt(ax, fnIx)
+  if st < 0 || st >= T.tys.length || tyHasTyVar(st) { -1 } else { st }
 }
 
 export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
@@ -10837,7 +10863,12 @@ function exprUnionIf(exprIx: i32, fnIx: i32): boolean {
   // Inside an instance a join over its type parameters is read at the pin, where it can be
   // the one primitive both bind (D3528).
   if ijp >= 0 && tyHasTyVar(ijp) {
-    const ijs = pinSubOperandTyOf(ijp, fnIx)
+    let ijs = elabClosedTyAt(exprIx, fnIx)
+    // A function nested in an instance has no pin of its own: its instance types the join (D4046).
+    if ijs < 0 || tyHasTyVar(ijs) {
+      const ije = nodeTyAt(exprIx, fnIx)
+      if ije >= 0 && ije < T.tys.length && !tyHasTyVar(ije) { ijs = ije }
+    }
     // A join the pin makes a box (`V | null` at `i32`) is one, whatever its arms read as (D10231).
     if valueUnionNameOfTy(ijs) != "" { return true }
     if ijs >= 0 { ijp = ijs }
@@ -12316,11 +12347,18 @@ function exprRepTy(exprIx: i32, fnIx: i32, depth: i32): i32 {
   const e = nodeAt(exprIx)
   if e is Paren { return exprRepTy(e.parInner, fnIx, depth - 1) }
   if e is Ident {
-    const d = identDeclOf(exprIx)
+    // The binding the frame declares, which an instance's copy of the declaration may be.
+    const sd = bindingDeclInScope(exprIx)
+    const d = if sd >= 0 { sd } else { identDeclOf(exprIx) }
     const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
     if dn is LetDecl && dn.letType < 0 && dn.letInit >= 0 {
       const r = exprRepTy(dn.letInit, fnIx, depth - 1)
       if r >= 0 { return r }
+    }
+    // A parameter stored at a wider build than its type reads its annotation's.
+    if dn is Param {
+      const ph = paramHeldTy(exprIx, fnIx)
+      if ph >= 0 { return ph }
     }
     return litRepTyAt(exprIx, fnIx)
   }

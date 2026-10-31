@@ -1074,7 +1074,22 @@ function ftLitJoin(
   const lt = nodeTyIxOf(x)
   if lt < 0 || lt >= T.tys.length { return true }
   const at = tyAt(lt)
-  if !(at is TyArray) || fnTagSetOfTy(at.aElem) != s { return true }
+  if !(at is TyArray) { return true }
+  // A list of lists is built from inner literals of its one element row, of members that are
+  // not generic: the nested literal's build has no row for a generic member's ids.
+  if ftHoldKind(lt, s, 4) == 4 {
+    for d in ds {
+      const f = nodeAt(d)
+      if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+    }
+    for el in n.arrElems {
+      if nodeTyIxOf(el) != at.aElem || !(nodeAt(parenPeelIx(el)) is ArrayLit) {
+        return false
+      }
+    }
+    return true
+  }
+  if fnTagSetOfTy(at.aElem) != s { return true }
   for el in n.arrElems {
     if !ftIsS(el, s) && !ftJoinAt(el, at.aElem, s, ds, leaves, ids) {
       return false
@@ -1090,18 +1105,22 @@ function ftHolds(x: i32, s: i32): boolean {
 }
 
 // 1 when type `t` is a list whose element carries set `s`, 2 when it is a record with a field of
-// kind 1 or 2 within `depth` records, 3 when it is a map whose value carries `s`, else 0.
+// kind 1, 2 or 3 within `depth` records, 3 when it is a map whose value carries `s`, 4 when it is
+// a list of kind-1 or kind-4 lists, else 0.
 function ftHoldKind(t: i32, s: i32, depth: i32): i32 {
   if depth <= 0 || t < 0 || t >= T.tys.length { return 0 }
   const a = tyAt(t)
   match a {
     TyArray => {
       if fnTagSetOfTy(a.aElem) == s { return 1 }
+      const ek = ftHoldKind(a.aElem, s, depth - 1)
+      if ek == 1 || ek == 4 { return 4 }
       return 0
     }
     TyObj => {
       for f in a.objFieldTypes {
-        if fnTagSetOfTy(f) == s || ftHoldKind(f, s, depth - 1) > 0 { return 2 }
+        const fk = ftHoldKind(f, s, depth - 1)
+        if fnTagSetOfTy(f) == s || fk > 0 && fk != 4 { return 2 }
       }
       return 0
     }
@@ -1232,6 +1251,17 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
   if p < 0 { return false }
   const tx = nodeTyIxOf(x)
   const pn = nodeAt(p)
+  // A list of lists of ids is read in place: indexed, walked, bound or nested in a literal.
+  if (
+    ftHoldKind(tx, s, 4) == 4
+    && !(pn is Index
+      || pn is ForIn
+      || pn is LetDecl
+      || pn is ArrayLit
+      || pn is Program)
+  ) {
+    return false
+  }
   match pn {
     // Reads of the holder's slots and fields, and a loop binding each of its ids.
     Index => {

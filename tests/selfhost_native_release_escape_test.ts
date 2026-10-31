@@ -38,6 +38,8 @@ const FIXTURES: [string, boolean][] = [
   ["state-helpers", true],
   ["record-result", true],
   ["identity-alias", true],
+  // A helper body between 60 and 320 bytes: the step's size bound, not only small helpers.
+  ["medium-helper", true],
   ["escapes", false],
   ["cycle-helpers", false],
 ];

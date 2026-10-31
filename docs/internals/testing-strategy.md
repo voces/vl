@@ -172,6 +172,50 @@ The symbol check per accepted case costs nearly what the sweep's own inlay call 
 CPU saved is about 5 s. The wall is what moved: one 24 s serial test became about 2.5 s
 spread over the oracle's four shards.
 
+### The host and the optimizer, 2026-10-31
+
+The two places a compiler mutant cannot reach got mutant sets of their own, each run through
+every gate row on master `fff449d59`.
+
+**Host GC policy** (`mutants/host/`, applied to `scripts/vl-host/src/main.rs`). These are
+outside `run.sh`'s loop, because each needs the host rebuilt into an isolated
+`--target-dir` and copied over the worktree's own `target/release/vl` (CLAUDE.md, the
+shared cargo target).
+
+| mutant | what it breaks | caught by |
+| --- | --- | --- |
+| `nogrow` | `SeedGcHeadroom` never grows the heap | `vl_seed_gc_headroom_test.ts`; filed witnesses only by timing out D12131 twice at 120 s |
+| `pct99` | the grow threshold 75% → 99% | `vl_seed_gc_headroom_test.ts` alone |
+| `offignored` | `VL_COMPILE_GC_GROW=off` is ignored | `vl_seed_gc_headroom_test.ts` alone |
+| `statsdead` | the GC stats line is renamed | `vl_seed_gc_headroom_test.ts` alone |
+
+The 44 s headroom test is the only guard of the policy, so it stays.
+
+**The `-O` inline-record step** (`mutants/opt-*.diff`):
+
+| mutant | what it breaks | caught by |
+| --- | --- | --- |
+| `opt-noinline` | the step never runs | `selfhost_native_release_inline` (27 tests), `selfhost_native_release_bounds` (8), one release-shape bench row |
+| `opt-compwrite` | a write elsewhere in a record's subtyping component no longer refuses it | nothing |
+| `opt-ident` | an observable identity (`ref.eq`) no longer refuses a record | nothing |
+
+Turning the whole step off is seen three times. A single eligibility rule broken alone is
+seen by nothing; so is `escinline` above. These are coverage gaps or rules a later check
+makes unreachable. They are not redundancy, so no release-shape file is deletable on this
+evidence.
+
+### The four gaps, resolved
+
+Four mutants survived every row: `escinline`, `opt-ident`, `escv` and `opt-compwrite`. Each
+was taken to a fixture or shown to change no behaviour.
+
+| mutant | resolution | sole catcher now |
+| --- | --- | --- |
+| `escinline` | `tests/fixtures/opt-escape/medium-helper.vl`, a helper body between 60 and 320 bytes | `selfhost_native_release_escape_test.ts`, `medium-helper` (7 of 8 pass under the mutant, 8 of 8 on master) |
+| `opt-ident` | `tests/fixtures/opt-inline/kept-identity.vl`. A closure's `==` is VL's one `ref.eq`, and its environment holds the record. | `selfhost_native_release_inline_test.ts`, `kept-identity` (29 of 30 under the mutant, 30 of 30 on master) |
+| `escv` | equivalent: the lexer reads `decodeSimpleEscape` only for "is it a known escape", and the decoded value is discarded (the emitter's `decodeStr` makes the bytes, pinned by `escapes.vl`) | none possible |
+| `opt-compwrite` | equivalent from VL source: a record with a width subtype is never a leaf candidate (the census skips `kept-subtype`), so the component branch of the write rule is never reached | none possible |
+
 ## 3 · Measuring cost
 
 * **CPU seconds, not wall.** A test's wall under `--parallel` is the schedule
