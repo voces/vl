@@ -89,6 +89,7 @@ import { runWasm, VLRuntimeError } from "./runWasm.ts";
 // is the guard that keeps them agreeing.
 import { needsModules } from "../../compiler/moduleGate.ts";
 import { isStdKey } from "../../lsp/src/editorText.ts";
+import { isDisplayableType } from "../../lsp/src/typeFeatures.ts";
 
 const CASES_DIR = new URL("../cases/", import.meta.url);
 const STD_DIR = new URL("../../std/", import.meta.url);
@@ -166,9 +167,7 @@ const walk = function* (dir: URL): Generator<Case> {
 const readModuleSrc = (key: string): string | undefined => {
   try {
     return Deno.readTextFileSync(
-      isStdKey(key)
-        ? new URL(`${key.slice("std:".length)}.vl`, STD_DIR)
-        : key,
+      isStdKey(key) ? new URL(`${key.slice("std:".length)}.vl`, STD_DIR) : key,
     );
   } catch {
     return undefined;
@@ -195,20 +194,14 @@ const readDiags = (exp: Exports): WasmDiag[] => {
   return out;
 };
 
-/**
- * Drive one case through the seed: reset the module table, feed the module
- * fetch loop when imports are in play, push the entry source, and run
- * `checkSrc` (@check tier) or `compileSrc` (@run/@trap tier — emit included).
- * Returns the rc, the structured diagnostics, and (rc 0 under compile) the
- * emitted bytes.
- */
-const driveCase = (
+/** Stage a case on the shared instance: a fresh module table (with the pending-import fetch
+ * loop when imports are in play) and the entry source. */
+const stageCase = (
   exp: Exports,
   entryKey: string,
   src: string,
-  emit: boolean,
   isModule: boolean,
-): { rc: number; diags: WasmDiag[]; bytes?: Uint8Array; redun: LintDiag[] } => {
+): void => {
   exp.modReset();
   if (isModule || needsModules(src)) {
     const commit = (key: string, source: string | undefined) => {
@@ -232,6 +225,54 @@ const driveCase = (
   }
   exp.srcReset();
   pushString(exp.srcPush, src);
+};
+
+/**
+ * THE EDITOR'S HINTS ON CORRECT CODE, for a case the checker accepted: how many inlay hints
+ * the entry module offers, and the types among them the editor would drop as undisplayable
+ * (`isDisplayableType`). A drop means a type producer rendered an absence token (`<error>`,
+ * `<?>`) for a type the program determines. Read off a symbol check of a fresh staging, as the
+ * editor reads it; run after the case's own tiers, because a symbol check changes what the
+ * lint pass reports on the same staging.
+ */
+const hintsOfCase = (
+  exp: Exports,
+  entryKey: string,
+  src: string,
+  isModule: boolean,
+): { hints: number; undisplayable: string[] } => {
+  const undisplayable: string[] = [];
+  if (typeof exp.inlayScan !== "function") return { hints: 0, undisplayable };
+  stageCase(exp, entryKey, src, isModule);
+  exp.checkSrcSym();
+  let hints = 0;
+  const count = exp.inlayScan();
+  for (let i = 0; i < count; i++) {
+    if (exp.inlayModuleAt(i) !== 0) continue;
+    const len = exp.inlayTypeLen(i);
+    if (len <= 0) continue;
+    hints++;
+    const type = readString(len, (j) => exp.inlayTypeCharAt(i, j));
+    if (!isDisplayableType(type)) undisplayable.push(type);
+  }
+  return { hints, undisplayable };
+};
+
+/**
+ * Drive one case through the seed: reset the module table, feed the module
+ * fetch loop when imports are in play, push the entry source, and run
+ * `checkSrc` (@check tier) or `compileSrc` (@run/@trap tier — emit included).
+ * Returns the rc, the structured diagnostics, and (rc 0 under compile) the
+ * emitted bytes.
+ */
+const driveCase = (
+  exp: Exports,
+  entryKey: string,
+  src: string,
+  emit: boolean,
+  isModule: boolean,
+): { rc: number; diags: WasmDiag[]; bytes?: Uint8Array; redun: LintDiag[] } => {
+  stageCase(exp, entryKey, src, isModule);
   const rc = emit ? exp.compileSrc() : exp.checkSrc();
   // rc 0 means no diagnostics (the Rust host reads them only on failure) —
   // and the instance is shared across cases, so don't trust `diagCount` on a
@@ -664,6 +705,7 @@ export const registerCorpusOracle = (shard: number, shards: number): void => {
       `registerCorpusOracle: shard must be in [0, ${shards}), got ${shard}`,
     );
   }
+  let hintsSeen = 0, casesRun = 0;
   const lo = Math.floor((shard * cases.length) / shards);
   const hi = Math.floor(((shard + 1) * cases.length) / shards);
   for (let i = lo; i < hi; i++) {
@@ -707,9 +749,38 @@ export const registerCorpusOracle = (shard: number, shards: number): void => {
         ) {
           assertLint(d, [...driveLint(exports!, src), ...r.redun]);
         }
+        casesRun++;
+        // A program the checker accepted: rc 0, or an emit refusal past a clean check.
+        if (r.rc === 0 || r.rc === 3) {
+          const h = hintsOfCase(exports!, entryKey, src, c.kind === "module");
+          hintsSeen += h.hints;
+          if (h.undisplayable.length) {
+            throw new Error(
+              `the editor would drop ${h.undisplayable.length} inlay hint(s) from a program the ` +
+                `checker accepts: ${
+                  JSON.stringify(h.undisplayable)
+                }. A type producer rendered an ` +
+                "absence token for a type this program determines (lsp/src/typeFeatures.ts, isDisplayableType).",
+            );
+          }
+        }
       },
     });
   }
+
+  // The hint check above passes vacuously if the seed stops producing candidates; this shard's
+  // accepted cases offer hundreds of them.
+  Deno.test({
+    name: `corpus oracle shard ${shard}: the inlay-hint check saw hints`,
+    ignore: !seedExists,
+    fn: () => {
+      if (casesRun > 0 && hintsSeen === 0) {
+        throw new Error(
+          `${casesRun} cases ran and offered no inlay hint — the hint check is vacuous`,
+        );
+      }
+    },
+  });
 
   if (shard !== 0) return;
   // Stale-entry tripwire: every expected-divergence key must still name a

@@ -103,7 +103,8 @@ one revert no longer type-checks against the tree, and 51 were graded.
   * 3 filed a "must keep running" row whose witness runs either way.
 
   These are behaviour-neutral refactors or untested fixes. They are not evidence about
-  redundancy.
+  redundancy. The 13 are test gaps, though: a fix whose revert no gate row notices can be
+  undone by the next change without a red.
 * **29 are caught, 15 of them by exactly one check:**
 
   | check | sole catches |
@@ -132,6 +133,44 @@ one revert no longer type-checks against the tree, and 51 were graded.
 
 What this reading supports is that no expensive compiler-facing check is yet shown
 redundant. The cheap wins it found were tooling and plain waste (§4).
+
+### The first fold: the editor's corpus sweep, 2026-10-31
+
+`lsp_undisplayable_type_test.ts` asserted, in one serial test, that the editor drops no inlay
+hint from a program the checker accepts. It did that by walking all of `tests/cases` and
+running a `check` and an `inlayHintsAt` on every file. The `check` half was the corpus
+oracle's own walk done again: 10.7 s of the sweep's 24.5 s, measured over 6,417 files. The
+assertion now lives in the oracle's walk (`hintsOfCase` in `tests/support/casesWasmOracle.ts`):
+
+* every case the checker accepts gets a symbol check of a fresh staging;
+* its entry-module hints are held to the editor's own `isDisplayableType`;
+* each shard ends with a test that it saw hints, so the check cannot pass vacuously.
+
+The sweep is deleted. The file's 8 targeted tests stay.
+
+The intent's own mutant is `mutants/inlaynullerr.diff`, in which a nullable inlay type
+renders `<error>` in hints only:
+
+| check | before the fold | after the fold |
+| --- | --- | --- |
+| corpus oracle | 6,600 pass | 1,488 cases fail |
+| `lsp_undisplayable_type_test.ts` | the sweep fails | 8 pass |
+| the other 37 editor suites | 430 pass | 430 pass |
+
+Before the fold the sweep was the only catcher; after it, the oracle is. Two broader
+mutants, an absent element rendering `<error>` and a hole rendering `<?>`, were caught
+before and after by the oracle's diagnostic text and by a targeted test.
+
+What it cost and saved, minimum of two runs each, 4 cores:
+
+| | before | after |
+| --- | ---: | ---: |
+| `gate.sh`'s `lsp suites` row | 17.3 s wall, 33.7 CPU-s | 5.8 s wall, 20.0 CPU-s |
+| the corpus oracle | 15.2 s wall, ~51 CPU-s | 17.7 s wall, ~60 CPU-s |
+
+The symbol check per accepted case costs nearly what the sweep's own inlay call did, so the
+CPU saved is about 5 s. The wall is what moved: one 24 s serial test became about 2.5 s
+spread over the oracle's four shards.
 
 ## 3 · Measuring cost
 
