@@ -2490,7 +2490,7 @@ function cloCellReaches(fe: i32, fnIx: i32): boolean {
 
 // Pushes `fe`'s cell as frame `fnIx` reaches it: the frame's own slot, allocated at its first
 // use in an activation, when the frame declares `fe`, else the field the frame's env carries.
-function emitCloCellRef(body: u8[], fe: i32, fnIx: i32, ec: ExpCtx) {
+function emitCloCellRef(body: u8[], fe: i32, fnIx: i32, _ec: ExpCtx) {
   const ck = envCacheSlotOf(fe)
   if ck >= 0 {
     fbLocalGet(ck)
@@ -2503,7 +2503,7 @@ function emitCloCellRef(body: u8[], fe: i32, fnIx: i32, ec: ExpCtx) {
     fbLocalGet(ck)
     return 0
   }
-  if emitCapturedRead(body, capCellName(fe), fnIx, false, ec) == 1 { return 0 }
+  if emitCapturedRead(body, capCellName(fe), fnIx, -1) == 1 { return 0 }
   emitFail(
     "emitProgram: a function-value cell is not reachable from this frame",
   )
@@ -2513,23 +2513,35 @@ function emitCloCellRef(body: u8[], fe: i32, fnIx: i32, ec: ExpCtx) {
 // `captureValKind` so the recovery cannot disagree with the field's own type. A
 // `nulstr` capture must recover to non-null here; every other nullable cell
 // recovers at its own use site instead.
-function emitCapturedReadRecover(fe: i32, name: string, ec: ExpCtx) {
+function emitCapturedReadRecover(
+  fe: i32,
+  name: string,
+  readIx: i32,
+  fnIx: i32,
+) {
   if captureValKind(fe, name) == "nulstr" {
-    if !nulStrReadStaysRaw(ec) { fbRefAsNonNull() }
+    if nulStrReadRecovers(readIx, fnIx) { fbRefAsNonNull() }
   }
   0
 }
 
+// Whether a `string | null` read `readIx` in `fnIx` recovers the non-null ref: exactly when its
+// own type there excludes null. An assignment's re-read of its target is the value just stored.
+function nulStrReadRecovers(readIx: i32, fnIx: i32): boolean {
+  const asg = asgReReadOf(readIx)
+  const rt = nodeTyAt(if asg >= 0 { asg } else { unwrapParen(readIx) }, fnIx)
+  rt >= 0 && !tyBearsNull(rt) && !isNullTy(rt)
+}
+
 // If `name` is a captured variable of the capturing function `fnIx`, read it from the env
 // struct (`ref.cast` local 0 to the env, then `struct.get` the field index) and return 1;
-// else return 0 for the caller's param/local/global path. `recover` is false for the
-// env-to-env copy building a nested closure's frame — recovering there traps a null capture.
+// else return 0 for the caller's param/local/global path. `recoverIx` is the read to recover, -1
+// for the env-to-env copy building a nested closure's frame, where recovering traps a null capture.
 function emitCapturedRead(
   _body: u8[],
   name: string,
   fnIx: i32,
-  recover: boolean,
-  ec: ExpCtx,
+  recoverIx: i32,
 ) {
   if fnIx < 0 { return 0 }
   if !fnNestUsed { return 0 }
@@ -2545,7 +2557,7 @@ function emitCapturedRead(
     while fi < cnt {
       if capNamesFlat[start + fi] == name {
         emitCaptureSlotRead(fe, envIdx, fi)
-        if recover { emitCapturedReadRecover(fe, name, ec) }
+        if recoverIx >= 0 { emitCapturedReadRecover(fe, name, recoverIx, fnIx) }
         return 1
       }
       fi = fi + 1
@@ -2557,7 +2569,7 @@ function emitCapturedRead(
   while ci < caps.length {
     if caps[ci] == name {
       emitCaptureSlotRead(fe, envIdx, ci)
-      if recover { emitCapturedReadRecover(fe, name, ec) }
+      if recoverIx >= 0 { emitCapturedReadRecover(fe, name, recoverIx, fnIx) }
       return 1
     }
     ci = ci + 1
@@ -2592,7 +2604,7 @@ function emitCaptureRead(_body: u8[], name: string, fnIx: i32, ec: ExpCtx) {
   }
   const gIdx = globalIndexOf(name)
   if gIdx >= 0 { return emitUserGlobalGet(gIdx) }
-  if emitCapturedRead(_body, name, fnIx, false, ec) == 1 { return 0 }
+  if emitCapturedRead(_body, name, fnIx, -1) == 1 { return 0 }
 
   // capture analysis records every free identifier not bound locally, as a global or as a
   // collected function; an intrinsic is none of those, so name it rather than a variable.
@@ -6735,8 +6747,8 @@ function emitArmFieldsFit(
 // The `string | null` read rule for a field of code `code`, shared by every struct and variant
 // field read and by the ident reads in `emitIdentNode`: a value read recovers the non-null ref.
 // A null test and a nullable-string target keep the raw ref (`nulStrReadStaysRaw`).
-function emitNulStrFieldRecover(code: i32, ec: ExpCtx) {
-  if code == FC_NUL_STR && !nulStrReadStaysRaw(ec) { fbRefAsNonNull() }
+function emitNulStrFieldRecover(code: i32, readIx: i32, fnIx: i32) {
+  if code == FC_NUL_STR && nulStrReadRecovers(readIx, fnIx) { fbRefAsNonNull() }
   0
 }
 
@@ -6761,7 +6773,7 @@ function emitNarrowedMem(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx) {
     fbStructGet(uBoxIdx, 1)
     fbRefCast(uVarHeap[vi])
     fbStructGet(uVarHeap[vi], idx)
-    emitNulStrFieldRecover(variantFieldTypeAt(vi, idx), ec)
+    emitNulStrFieldRecover(variantFieldTypeAt(vi, idx), memIx, fnIx)
 
     // A value-union field read while the checker types it as one atom unboxes to that atom,
     // through the home the bare-arm twin uses: an index-rooted path has no member key, so
@@ -7283,7 +7295,7 @@ function fnHasTyParams(fnIx: i32): boolean {
 // capture or module global), bypassing
 // the narrowed-unbox Ident path so a tag read works even while the binding is narrowed to a
 // single atom — its slot still holds the box, narrowing being type-level only.
-function emitUnionBoxPush(_body: u8[], ix: i32, fnIx: i32, ec: ExpCtx) {
+function emitUnionBoxPush(_body: u8[], ix: i32, fnIx: i32, _ec: ExpCtx) {
   const rn = nodeAt(ix)
   const name = if rn is Ident { rn.identName } else { "" }
   const idx = localIndexOf(fnIx, ix)
@@ -7292,7 +7304,7 @@ function emitUnionBoxPush(_body: u8[], ix: i32, fnIx: i32, ec: ExpCtx) {
   } else {
     // A captured union box: read the field raw out of the env (`recover` false — the box is
     // the field's type, and the unbox every caller appends after this push is the recovery).
-    if emitCapturedRead(_body, name, fnIx, false, ec) == 1 { return 0 }
+    if emitCapturedRead(_body, name, fnIx, -1) == 1 { return 0 }
     const gIdx = globalIndexOf(name)
     if gIdx < 0 {
       // Neither a local, a capture of this frame, nor a global — nothing to read the box
@@ -11636,7 +11648,7 @@ function emitMemVariantRead(
       }
       if emitExpr(body, m0.memObj, fnIx, ec) < 0 { return -1 }
       fbStructGet(uVarHeap[pvi], pvfi) // 0xfb 0x02 <variant struct ht> <field index>
-      emitNulStrFieldRecover(variantFieldTypeAt(pvi, pvfi), ec)
+      emitNulStrFieldRecover(variantFieldTypeAt(pvi, pvfi), memIx, fnIx)
       // A code-16 (value-union box) field of the arm, read while its member PATH is
       // narrowed, unboxes to the narrowed atom — the arm-for-arm twin of the plain
       // struct read below and of `emitNarrowedMem`'s. Without it the box flowed into an
@@ -11659,7 +11671,7 @@ function emitMemVariantRead(
       if emitExpr(body, m0.memObj, fnIx, ec) < 0 { return -1 }
       fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
       fbStructGet(uVarHeap[nvi], nvfi)
-      emitNulStrFieldRecover(variantFieldTypeAt(nvi, nvfi), ec)
+      emitNulStrFieldRecover(variantFieldTypeAt(nvi, nvfi), memIx, fnIx)
       if variantFieldTypeAt(nvi, nvfi) == FC_UNION {
         if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
       }
@@ -11821,7 +11833,7 @@ function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx): i32 {
     fbStructGet(sHeapIdx[si], idx) // 0xfb 0x02 <struct ht> <field index>
     const narrowOp = memReadNarrowOp(memIx, fnIx)
     if narrowOp >= 0 { wU8(narrowOp) }
-    emitNulStrFieldRecover(sFieldTypeAt(si, idx), ec)
+    emitNulStrFieldRecover(sFieldTypeAt(si, idx), memIx, fnIx)
     // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
     // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
     // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
@@ -35569,10 +35581,10 @@ function emitCharLitNode(_body: u8[], e: CharLit, _exprIx: i32, _fnIx: i32) {
 // identifier read and a substituted parameter default. A kind-16 `string | null` cell is
 // always a nullable ref; a non-const ref cell is start-initialised, so it is nullable in
 // wasm and recovered unless its kind legitimately holds null or is not a ref at all.
-function emitGlobalReadRecover(isid: i32, ctx: ExpCtx) {
+function emitGlobalReadRecover(isid: i32, readIx: i32, fnIx: i32) {
   const gck0 = globalCellKind(globalLetOfSid(isid))
   if gck0 == "nulstr" {
-    if !nulStrReadStaysRaw(ctx) { fbRefAsNonNull() }
+    if nulStrReadRecovers(readIx, fnIx) { fbRefAsNonNull() }
     return 0
   }
   if !globalNameIsNonConstSid(isid) { return 0 }
@@ -35625,7 +35637,7 @@ function emitIdentNode(
     if dgIdx >= 0 {
       if emitUserGlobalGet(dgIdx) < 0 { return -1 }
       // the same recovery the argument spelling of this read gets (D3510)
-      emitGlobalReadRecover(isid, ctx)
+      emitGlobalReadRecover(isid, exprIx, fnIx)
       return 0
     }
   }
@@ -35681,12 +35693,10 @@ function emitIdentNode(
   // a captured variable (a free var of a capturing lifted function): read it from the
   // env struct threaded as the leading param (local 0). Checked before the param/local/
   // global paths so a capture shadows nothing. Only fires inside a capturing lifted function.
-  if emitCapturedRead(body, e.identName, fnIx, true, ec) == 1 { return 0 }
+  if emitCapturedRead(body, e.identName, fnIx, exprIx) == 1 { return 0 }
   // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
   const idx = localIndexOf(fnIx, exprIx)
-  if idx < 0 {
-    return emitIdentNonLocalRead(body, e, isid, exprIx, fnIx, ctx, ec)
-  }
+  if idx < 0 { return emitIdentNonLocalRead(body, e, isid, exprIx, fnIx, ec) }
   emitIdentLocalRead(exprIx, idx, fnIx)
 }
 
@@ -35707,7 +35717,6 @@ function emitIdentNonLocalRead(
   isid: i32,
   exprIx: i32,
   fnIx: i32,
-  ctx: ExpCtx,
   ec: ExpCtx,
 ) {
   // a bare top-level/lifted function name in value position constructs a function
@@ -35746,7 +35755,7 @@ function emitIdentNonLocalRead(
   const gIdx = globalIndexOfSid(isid)
   if gIdx >= 0 {
     if emitUserGlobalGet(gIdx) < 0 { return -1 }
-    emitGlobalReadRecover(isid, ctx)
+    emitGlobalReadRecover(isid, exprIx, fnIx)
     return 0
   }
   return emitFail(
@@ -35775,10 +35784,7 @@ function emitIdentLocalRead(exprIx: i32, idx: i32, fnIx: i32) {
   // A `string | null` param or local recovers the non-null ref exactly when the read's own
   // type at the instance excludes null.
   if paramNulString(fnIx, exprIx) || declaredNulString(exprIx) {
-    // An assignment's re-read of its target is the value just stored, typed at the assignment.
-    const asg = asgReReadOf(exprIx)
-    const rt = nodeTyAt(if asg >= 0 { asg } else { unwrapParen(exprIx) }, fnIx)
-    if rt >= 0 && !tyBearsNull(rt) && !isNullTy(rt) {
+    if nulStrReadRecovers(exprIx, fnIx) {
       fbRefAsNonNull() // 0xd4
     }
   }
