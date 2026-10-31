@@ -10884,7 +10884,7 @@ lowering. Its price is one more split-plan case for increment 3 to delete with t
 So the step-4 lane closed D14439 without the mint's emitter reader (D14430), and its blockers 2
 and 3 (arms per mint scope, a set with a leaf in a generic body) were not built. They stay the
 emitter reader's work, and they are not needed until a set reaching a split parameter, or any
-tagged set called at two tuples, has to be one id. D14730 is the first program that needs
+tagged set called at two tuples, has to be one id. D14732 is the first program that needs
 them: a tagged set handed to a hole parameter at one tuple and called directly at another.
 
 ## A function-value set escapes as a lambda (step 4 S3a, 2026-10-26)
