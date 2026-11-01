@@ -7293,12 +7293,8 @@ const MONO_UNBOUND_TY_PARAM_DEFAULT = "i32"
 // leaves them unbound defaults, by `monoDefaultUnboundTyParams`'s rule (D4551).
 export function monoElabDefaultsPrime(stmts: i32[]) {
   elabTpDefaultsReset()
-  // The stub keys read value reach over the program as checked, indexed for this question
-  // and put back after, since the checker's own question is still read.
-  vrStash()
-  vrResetFor("mono", stmts, true, false)
-  const vrCands: i32[] = []
-  vrIndex(stmts, vrCands)
+  monoPrimeStmts = stmts
+  monoPrimeIndexed = false
   const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
   let d = 0
   while d < P.nodes.length {
@@ -7331,8 +7327,27 @@ export function monoElabDefaultsPrime(stmts: i32[]) {
     }
     d = d + 1
   }
-  vrUnstash()
+  if monoPrimeIndexed { vrUnstash() }
+  monoPrimeIndexed = false
+  monoPrimeStmts = []
   0
+}
+
+// The program the stub keys are primed over, and whether its value reach is indexed yet. The
+// index is built at the first argument that asks it, and the checker's own put back after.
+let monoPrimeStmts: i32[] = []
+let monoPrimeIndexed = false
+
+// Whether read `x` reaches no call, over the program as checked (`vrInertFor`).
+function monoPrimeInert(x: i32): boolean {
+  if !monoPrimeIndexed {
+    vrStash()
+    vrResetFor("mono", monoPrimeStmts, true, false)
+    const cands: i32[] = []
+    vrIndex(monoPrimeStmts, cands)
+    monoPrimeIndexed = true
+  }
+  vrInertFor("mono", x, "")
 }
 
 // The stub type argument `a` is delivered at when it holds only hole functions no call reaches:
@@ -7373,11 +7388,38 @@ function monoStubFnTy(): i32 {
   mkFuncTy(noPs, TY_VOID)
 }
 
+// Whether a `break` in `body` leaves the labelled block `label` names.
+function monoBreaksTo(body: i32, label: string): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const b = nodeAt(ix)
+      if b is BreakStmt && b.brkLabel == label { return true }
+      for ch in nodeChildren(ix) { todo.push(ch) }
+    }
+  }
+  false
+}
+
 // Whether value `x` can only be hole functions, each read at a name no call reaches: a name of
-// one, an un-annotated `const` binding of one, an `if` choosing between them, or a call returning one.
+// one, an un-annotated `const` binding of one, an `if` choosing between them, a labelled block
+// no `break` leaves (D14780), or a call returning one.
 function monoInertFnsAt(x: i32, depth: i32): boolean {
   if x < 0 || x >= P.nodes.length || depth > 8 { return false }
   const n = nodeAt(x)
+  if n is WhileStmt {
+    if n.whileBlk != 1 || monoBreaksTo(n.whileBody, n.whileLabel) {
+      return false
+    }
+    const vs: i32[] = []
+    tailValueLeaves(n.whileBody, vs)
+    if vs.length == 0 { return false }
+    for v in vs {
+      if !monoInertFnsAt(unwrapParen(v), depth + 1) { return false }
+    }
+    return true
+  }
   if n is IfStmt {
     if n.ifElse < 0 { return false }
     const arms: i32[] = []
@@ -7406,7 +7448,7 @@ function monoInertFnsAt(x: i32, depth: i32): boolean {
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return false }
   const dn = nodeAt(d)
-  if dn is FuncDecl { return monoIsGenericDecl(d) && vrInertFor("mono", x, "") }
+  if dn is FuncDecl { return monoIsGenericDecl(d) && monoPrimeInert(x) }
   if (
     !(dn is LetDecl)
     || dn.letKw != "const"
