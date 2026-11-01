@@ -11315,11 +11315,11 @@ are assigned. An arm's fields are its row's. During collection an arm's fields a
 (`armStage*`); at the end of `collectS` each arm adopts a row (a struct row of its record type
 whose fields match by name and code, else its reference row, else one minted for it), the
 variant field columns become the struct-row lists themselves, and the staging is emptied; an arm
-created later adopts its row as it is minted. An arm adopting a struct row takes the row's
-element spellings: agreeing them at adoption writes a declared name into a row its canon twins
-compare by element name, and the twin lookup then declines; "a declared spelling wins" holds
-only where an arm's own row differs from its field row (`variantRowAgree`) until step 3 makes
-that comparison read element types, after which it holds everywhere. A shared-tag arm needs no
+created later adopts its row as it is minted. An arm adopting a struct row agrees its element
+spellings with the row's as the arms and rows agree everywhere: a declared spelling wins over a
+structural one. This waited on the layout compare reading element types before spellings
+(#5596), since a declared name written into a row its canon twins compare by spelling made the
+twin lookup decline. A shared-tag arm needs no
 row of its own: its fields match its record's row by name and code, so it adopts that row as its
 field row while its heap stays its tag-mate's; that is the one place an arm's two rows differ. Running `collectS`'s reset before
 `collectU`, so arms write rows directly, would remove the staging and is not done. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
@@ -11330,3 +11330,14 @@ for now the function-tag rule declines a record whose fields would mix the two s
 record keeps its untagged row. A delivery that tags one must keep running
 `closures/hole-fn-record-beside-declared-row-handed-to-param.vl`,
 `closures/hole-fn-record-field-called-at-other-param.vl` and `closures/hole-fn-record-list-element.vl`.
+
+**Where the label stops (step 4, 2026-11-01).** After #5613 the `"variant"` kind is the arm
+reference and nothing more: a value's heap and fields come from its arm's row (`variantRowOf`,
+which `variantHeap` reads), and the writers in `emit_bytes.vl` take a variant kind through the
+struct arms. What stays with the arm is its box tag: every boxing site emits `uTags[vi]` off the
+value's variant index (24 readers), and a row does not determine a tag, since structural twins
+(`Cat`/`Kot`, one heap through `uVarTwin`) share a row as distinct arms with distinct tags. So
+producers keep minting `("variant", vi)`, the `$fnsig` result token keeps its variant kind (a
+caller boxing a returned arm reads its tag through it), and the label is not narrowed further.
+Folding tags into rows, a tag keyed by (union, row) rather than by arm, would be a separate
+tag-numbering decision, and it is not taken.

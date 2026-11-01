@@ -471,7 +471,7 @@ import {
   globalLetOfSid,
   ifJoinTypedAtom,
   variantIndexOf,
-} from "./emit_narrow_slots"
+} from "./emit_local_slots"
 import {
   annIsNulStrListDeep,
   annValtypeSlotOf,
@@ -790,6 +790,7 @@ import {
   rlElemTyIx,
   sAnonOwnTy,
   sFieldCount,
+  sIsRefRow,
   sLitMintFn,
   sLitMintRow,
   sNames,
@@ -4430,10 +4431,13 @@ function pinKindFitsTy(
   true
 }
 
+// The struct row the object literal at `objIx` builds at, or -1. A reference row has no heap
+// and is never built at, so it answers -1 and the literal falls to its variant or own row.
 export function structIndexOfObjCtx(objIx: i32, fnIx: i32) {
-  const own = structIndexOfObjCtxMemo(objIx, fnIx)
+  let own = structIndexOfObjCtxMemo(objIx, fnIx)
+  if sIsRefRow(own) { own = -1 }
   const dst = objLitBindDestRow(objIx, own)
-  if dst >= 0 { return dst }
+  if dst >= 0 && !sIsRefRow(dst) { return dst }
   own
 }
 
@@ -8506,9 +8510,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       return exprIsLitAtomIdent(e, exprIx, fnIx)
     }
     Index => {
-      // An index read is an atom where its storage is one. `readIndexStoreKind` is the one producer
-      // `readRepOf`'s store half calls; ask it alone, not the whole read rep whose conversions cost.
-      return readIndexStoreKind(e, unwrapParen(exprIx), fnIx) == "litatom"
+      // An index read is an atom where its storage is one. `readStoreOf` is `readRepOf`'s store
+      // half alone, without the conversions a hot caller need not pay for.
+      return readStoreOf(exprIx, fnIx) == "litatom"
     }
     IfStmt => {
       // A value if-expression joining two atoms yields an atom, since the join rep is the
@@ -8542,9 +8546,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       return false
     }
     Member => {
-      // A field read is an atom where its storage is one. `readFieldStoreKind` is the one producer
-      // `readRepOf`'s store half calls; ask it alone, not the whole read rep whose conversions cost.
-      return readFieldStoreKind(unwrapParen(exprIx), fnIx) == "litatom"
+      // A field read is an atom where its storage is one. `readStoreOf` is `readRepOf`'s store
+      // half alone, without the conversions a hot caller need not pay for.
+      return readStoreOf(exprIx, fnIx) == "litatom"
     }
     Call => {
       return exprIsLitAtomCall(e, exprIx, fnIx)
@@ -15145,31 +15149,37 @@ function readRepMoved(): boolean {
   moved
 }
 
+// What a name, field or element read's storage holds: its cell's kind, `litatom` for an interned
+// literal-union id, `type` for a name with no slot whose own type is covered, or "" for a node
+// that is no such read or has no storage.
+export function readStoreOf(ix: i32, fnIx: i32): string {
+  const rx = unwrapParen(ix)
+  if rx < 0 { return "" }
+  const e = nodeAt(rx)
+  let st = ""
+  if e is Ident {
+    const k = identStoreVKind(rx, fnIx)
+    if k != null { st = k }
+    else if repOfNode(rx, fnIx).rdCovered == 1 { st = "type" }
+  } else if e is Member {
+    st = readFieldStoreKind(rx, fnIx)
+  } else if e is Index {
+    st = readIndexStoreKind(e, rx, fnIx)
+  }
+  st
+}
+
 function readRepGo(ix: i32, fnIx: i32): ReadRep {
   const rx = unwrapParen(ix)
   const none: ReadRep = { rrStore: "", rrRead: "", rrConv: 0 }
   if rx < 0 { return none }
   const e = nodeAt(rx)
-  let st = ""
-  if e is Ident {
-    const k = identStoreVKind(rx, fnIx)
-    if k != null {
-      st = k
-    } else {
-      // A read with no slot yet has no storage to read: it reads at its own type.
-      const td = repOfNode(rx, fnIx)
-      if td.rdCovered == 1 {
-        return { rrStore: "type", rrRead: td.rdKind, rrConv: 7 }
-      }
-    }
-  } else if e is Member {
-    st = readFieldStoreKind(rx, fnIx)
-  } else if e is Index {
-    st = readIndexStoreKind(e, rx, fnIx)
-  } else {
-    return none
-  }
+  const st = readStoreOf(rx, fnIx)
   if st == "" { return none }
+  // A read with no slot yet has no storage to read: it reads at its own type.
+  if st == "type" {
+    return { rrStore: "type", rrRead: repOfNode(rx, fnIx).rdKind, rrConv: 7 }
+  }
   const nk = nicheReadKindAt(rx, fnIx)
   if nk == 1 { return { rrStore: st, rrRead: "nulbool", rrConv: 2 } }
   if nk == 2 { return { rrStore: st, rrRead: "nulstr", rrConv: 2 } }
