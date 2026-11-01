@@ -2544,6 +2544,9 @@ export function narListDeliveryErr(
     }
     return hit
   }
+  if s is Ident {
+    if narRecDeliveryErr(ix, s.identName, srcTy, dstTy) { return true }
+  }
   // The list itself, or a row of it still a list (`b[0]` under `b is K[][]`, D4945).
   const pfx = elemRecvPrefix(ix)
   if pfx == "" { return false }
@@ -2589,6 +2592,79 @@ export function narListDeliveryErr(
     ix,
   )
   true
+}
+
+// A record narrowed by `is` to a record its declared type stores wider fits it only by its fields'
+// current values, so like a narrowed list it is read at the narrowed type and never delivered at
+// it (D4084). Reports a delivery of the name `name` at `ix` its declared type does not fit.
+function narRecDeliveryErr(
+  ix: i32,
+  name: string,
+  srcTy: i32,
+  dstTy: i32,
+): boolean {
+  const s = identSlotOf(ix, name)
+  if s < 0 || !narRecFitLive(s, name) { return false }
+  const decl = identStoreTyOf(ix, name)
+  if decl < 0 || narDeclFitsDst(decl, dstTy) || !assignable(srcTy, dstTy) {
+    return false
+  }
+  tErr(
+    "'"
+      + name
+      + "' is narrowed by `is` only for reading its fields; it is still declared "
+      + tyToStr(decl)
+      + " and a later write may widen it, so it cannot be delivered as "
+      + tyToStr(dstTy)
+      + ". Copy it with '"
+      + recCopyText(name, srcTy)
+      + "'",
+    ix,
+  )
+  true
+}
+
+// The declared type of the name read at `ix` while a narrowing to a record fits it by its fields'
+// current values, or -1. An un-annotated binding copying it takes this type, not the narrowed one.
+export function narRecFitDeclTy(ix: i32): i32 {
+  const p = peelParenIx(ix)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = nodeAt(p)
+  if !(n is Ident) { return -1 }
+  const s = identSlotOf(p, n.identName)
+  if s < 0 || !narRecFitLive(s, n.identName) { return -1 }
+  identStoreTyOf(p, n.identName)
+}
+
+// Whether the binding `s`, spelled `name`, holds a live field entry of a narrowing to a record.
+function narRecFitLive(s: i32, name: string): boolean {
+  let i = npKeys.length - 1
+  while i >= 0 {
+    if (
+      npInvBy[i] < 0
+      && keyHasPrefix(npKeys[i], name + ".")
+      && narFitNameOf(i) == name
+      && placeDecl(npPlace[i]) == s
+    ) {
+      return true
+    }
+    i = i - 1
+  }
+  false
+}
+
+// A record literal copying each field of the record type `t` from `name`.
+function recCopyText(name: string, t: i32): string {
+  const o = tyAt(nonNullTy(t))
+  if !(o is TyObj) { return name }
+  let text = "{ "
+  let f = 0
+  while f < o.objFieldNames.length {
+    if f > 0 { text = text + ", " }
+    text = text + o.objFieldNames[f] + ": " + name + "." + o.objFieldNames[f]
+    f = f + 1
+  }
+  text + " }"
 }
 
 // Whether a narrowed list's declared type `decl` fits `dst` at every instantiation. A type
@@ -4115,6 +4191,7 @@ export function applyNarrows(places: i32[], tys: i32[]) {
   while i < places.length {
     const p = places[i]
     if placeIsPath(p) {
+      const pathDecl = narKeyNowTy(p)
       npKeysPush(p)
       npTysPush(tys[i])
       npInvByPush(-1)
@@ -4122,6 +4199,11 @@ export function applyNarrows(places: i32[], tys: i32[]) {
       npSettlePush(-2)
       npCapByPush(-1)
       npAsgPush(0)
+      // A path narrowed to a record its type stores wider keeps the same field entries a
+      // name does, so a write through another place ends it (D4131).
+      if pathDecl >= 0 && pathDecl != tys[i] && tyAt(tys[i]) is TyObj {
+        narFitCompanions(p, pathDecl, tys[i])
+      }
     } else {
       const s = placeDecl(p)
       const declTy = declTyOf(s)
