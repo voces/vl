@@ -12,6 +12,8 @@ import { constBindsLitSet } from "./check_leaf_steps"
 // not through the republications in `emit_base.vl` and `typecheck.vl`.
 // `isTopLevelFuncTypeName` stays out of it because it also writes the module-level
 // `funcArrowAt` bank; `nameIsShapeSpanEnds` and `mapValNameOf`, because their span differs.
+import { collectRetValues } from "./check_nj_join"
+import { parenPeelIx } from "./check_places"
 import {
   ArrayLit,
   AsExpr,
@@ -8504,7 +8506,8 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       return exprIsLitAtomIdent(e, exprIx, fnIx)
     }
     Index => {
-      return exprIsLitAtomIndex(e, exprIx, fnIx)
+      // An index read is an atom where its storage is one.
+      return readRepOf(exprIx, fnIx).rrStore == "litatom"
     }
     IfStmt => {
       // A value if-expression joining two atoms yields an atom, since the join rep is the
@@ -8695,45 +8698,6 @@ function exprIsLitAtomIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
     return r
   }
   false
-}
-
-// True if an index read `e` yields a literal-union atom: an atom-element list's cell or an
-// atom-valued map's value. False when the receiver holds string refs.
-function exprIsLitAtomIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
-  // Every rung below asks a TYPE, and a literal union's type does not carry its rep: a list
-  // built over a parameter pinned at the softened `string` holds string refs while its
-  // element type is the same union an atom list has. The receiver's own literal is the rep,
-  // and claiming an atom over it emits an i32 consumer for a `(ref $type)` (D1740).
-  if idxRecvIsStrList(e.idxArr, fnIx) { return false }
-  // `xs[i]` over a literal-union array yields an atom element, through the declaration
-  // fallback: a monomorphized instance's receiver records the generic's `T[]`, so the
-  // direct probe answers false for an array it should claim. Without it, a generic
-  // returning the atom emitted a string-ref result over a body yielding the i32 atom — silent invalid wasm.
-  if arrElemLitUnionTy(e.idxArr, fnIx) >= 0 { return true }
-  // A list whose element is `string` or `string | null` holds refs, whatever a write of a
-  // type parameter narrowed the read to (D3198).
-  const recvTy = nonNullTy(nodeTyInOf(e.idxArr, fnIx))
-  if recvTy >= 0 && recvTy < T.tys.length {
-    const recvEl = tyArrayElemIx(recvTy)
-    if recvEl >= 0 && tyPrimNameOf(nonNullTy(recvEl)) == "string" {
-      return false
-    }
-    // A box element read under a narrowing unboxes to the member's own rep, which for a
-    // string literal is the string ref, however few literals the narrowing left (D4201).
-    if recvEl >= 0 && tyIsValueUnionBox(nonNullTy(recvEl)) { return false }
-    // …and so does a map cell's box read under one (D8120).
-    if mapReadNarrowedAtomKind(unwrapParen(exprIx), fnIx) == 2 { return false }
-  }
-  // `m[k]` over a litunion-valued map yields the atom id; without the claim a compare
-  // falls to string equality with the raw i32 atom — invalid wasm. Unless the members are
-  // numbers, whose values have no member id to widen — a case that needs both families in
-  // one module to surface, since the classifier sits behind `gLitUnionUsed`.
-  if nodeRepIsAtom(unwrapParen(exprIx), fnIx) { return true }
-  // The bare read types `K0 | null` (a missing key reads null) — the emit is the i32
-  // atom either way (the not-found arm yields a non-member sentinel), so the nullable
-  // spelling claims too.
-  if nodeRepIsNulAtom(unwrapParen(exprIx), fnIx) { return true }
-  return false
 }
 
 // True if a field read `e` yields a literal-union atom, through a variant or nullable-variant
@@ -14714,6 +14678,7 @@ export function fnReturnsClosure(t: i32) {
   if fn is FuncDecl {
     // A function returning a tagged set's value returns its member's i32 id.
     if fnTagRetIsTagged(fnStmts[t]) { return false }
+    if fnHandsBackTaggedParam(fn) { return false }
     // An annotated function-type return is a closure result regardless of how the body yields
     // it (a higher-order call the tail scan can't see), since the valtype is already kind 14.
     if fn.fnRet >= 0 && tyIsFuncType(fn.fnRet) { return true }
@@ -14725,6 +14690,44 @@ export function fnReturnsClosure(t: i32) {
     return blockTailIsClosure(fn.fnBody, fnStmts[t])
   }
   false
+}
+
+// Whether every value instance `fn` returns reads one parameter typed at a tagged set: it hands
+// the argument's id back.
+function fnHandsBackTaggedParam(fn: FuncDecl): boolean {
+  if fn.fnBody < 0 { return false }
+  // Most functions take no tagged set at all, so ask that before walking the body.
+  let any = false
+  for q in fn.fnParams {
+    const pn = nodeAt(q)
+    if (
+      pn is Param
+      && pn.parType >= 0
+      && fnTagTyIsTagged(nodeTyIxOf(pn.parType))
+    ) {
+      any = true
+    }
+  }
+  if !any { return false }
+  const vs: i32[] = []
+  collectRetValues(fn.fnBody, vs)
+  if vs.length == 0 { return false }
+  for v in vs {
+    const x = parenPeelIx(v)
+    if x < 0 || !(nodeAt(x) is Ident) { return false }
+    // A cloned body shares its reads with the template, so the parameter is matched by name.
+    const rd = nodeAt(identDeclOf(x))
+    if !(rd is Param) { return false }
+    let typed = false
+    for q in fn.fnParams {
+      const pn = nodeAt(q)
+      if pn is Param && pn.parName == rd.parName && pn.parType >= 0 {
+        typed = fnTagTyIsTagged(nodeTyIxOf(pn.parType))
+      }
+    }
+    if !typed { return false }
+  }
+  true
 }
 
 // True if the block's tail (implicit-return) expression is a function value.
@@ -15394,7 +15397,48 @@ function readFieldStoreKind(rx: i32, fnIx: i32): string {
 }
 
 // The kind an element or map-value read's slot holds.
+// Whether index read `e` reads an interned literal-union id: an atom list's element or an
+// atom-valued map's value, not a string-ref or box element whose type names the same set.
+function idxReadIsLitAtom(e: Index, exprIx: i32, fnIx: i32): boolean {
+  // Every rung below asks a TYPE, and a literal union's type does not carry its rep: a list
+  // built over a parameter pinned at the softened `string` holds string refs while its
+  // element type is the same union an atom list has. The receiver's own literal is the rep,
+  // and claiming an atom over it emits an i32 consumer for a `(ref $type)` (D1740).
+  if idxRecvIsStrList(e.idxArr, fnIx) { return false }
+  // `xs[i]` over a literal-union array yields an atom element, through the declaration
+  // fallback: a monomorphized instance's receiver records the generic's `T[]`, so the
+  // direct probe answers false for an array it should claim. Without it, a generic
+  // returning the atom emitted a string-ref result over a body yielding the i32 atom — silent invalid wasm.
+  if arrElemLitUnionTy(e.idxArr, fnIx) >= 0 { return true }
+  // A list whose element is `string` or `string | null` holds refs, whatever a write of a
+  // type parameter narrowed the read to (D3198).
+  const recvTy = nonNullTy(nodeTyInOf(e.idxArr, fnIx))
+  if recvTy >= 0 && recvTy < T.tys.length {
+    const recvEl = tyArrayElemIx(recvTy)
+    if recvEl >= 0 && tyPrimNameOf(nonNullTy(recvEl)) == "string" {
+      return false
+    }
+    // A box element read under a narrowing unboxes to the member's own rep, which for a
+    // string literal is the string ref, however few literals the narrowing left (D4201).
+    if recvEl >= 0 && tyIsValueUnionBox(nonNullTy(recvEl)) { return false }
+    // …and so does a map cell's box read under one (D8120).
+    if mapReadNarrowedAtomKind(unwrapParen(exprIx), fnIx) == 2 { return false }
+  }
+  // `m[k]` over a litunion-valued map yields the atom id; without the claim a compare
+  // falls to string equality with the raw i32 atom — invalid wasm. Unless the members are
+  // numbers, whose values have no member id to widen — a case that needs both families in
+  // one module to surface, since the classifier sits behind `gLitUnionUsed`.
+  if nodeRepIsAtom(unwrapParen(exprIx), fnIx) { return true }
+  // The bare read types `K0 | null` (a missing key reads null) — the emit is the i32
+  // atom either way (the not-found arm yields a non-member sentinel), so the nullable
+  // spelling claims too.
+  if nodeRepIsNulAtom(unwrapParen(exprIx), fnIx) { return true }
+  return false
+}
+
 function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
+  // An interned literal-union id: an atom list's element or an atom-valued map's value.
+  if gLitUnionUsed != 0 && idxReadIsLitAtom(e, rx, fnIx) { return "litatom" }
   if exprRefArray(e.idxArr, fnIx) {
     const k = refListElemKind(e.idxArr, fnIx)
     if k != null { return k }
