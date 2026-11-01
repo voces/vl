@@ -1841,18 +1841,31 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     const c = s / 2
     if c == call { hasCall = true }
     const mapped = recHeldStored(c)
-    const at = if mapped { -1 } else { recQueuedLandingOf(c, own) }
+    const at = if mapped { -1 } else { recQueuedLandingOf(c, own, dst) }
     if at >= 0 {
       if !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
     } else if (
       c == call
       || !recNullWidened(own, dst, mapped)
-      || (!mapped && recQueuedReaches(c, own))
+      || (!mapped && recQueuedReaches(c, own, dst))
     ) {
       return false
     }
   }
+  if hasCall { recRepArgsNote(sites, own, dst) }
   hasCall
+}
+
+// Note each call site in `sites` that `recRepArgOf` serves at `dst` for its callee's instance.
+function recRepArgsNote(sites: i32[], own: i32, dst: i32) {
+  for s in sites {
+    if s % 2 == 0 {
+      for src in recPendSrc {
+        if recRepArgOf(src, s / 2, own, dst) { recAnnArgTakesRep(src, dst) }
+      }
+    }
+  }
+  0
 }
 
 // Whether the record `dst` stores each field of the record `own` as `own` does, or as that
@@ -1897,12 +1910,12 @@ function recFieldRead(x: i32): boolean {
 }
 
 // Whether some queued delivery reaches call `c`'s record of `own` (`recLandingIn`).
-function recQueuedReaches(c: i32, own: i32): boolean {
+function recQueuedReaches(c: i32, own: i32, dst: i32): boolean {
   let i = 0
   while i < recPendSrc.length {
     if (
-      recLandingIn(recPendSrc[i], recPendDstTy[i], c, own, REC_STORE_DEPTH)
-      >= 0
+      !recRepArgOf(recPendSrc[i], c, own, dst)
+      && recLandingIn(recPendSrc[i], recPendDstTy[i], c, own, REC_STORE_DEPTH) >= 0
     ) {
       return true
     }
@@ -1939,7 +1952,7 @@ function recSitesLandApart(fd: i32, own: i32, dst: i32): boolean {
   if rcwCallSites(fd, sites) >= 0 { return false }
   for s in sites {
     if s % 2 == 0 {
-      const at = recQueuedLandingOf(s / 2, own)
+      const at = recQueuedLandingOf(s / 2, own, dst)
       if (
         at >= 0
         && !fieldStorageEq(at, dst, REC_STORE_DEPTH)
@@ -1955,10 +1968,14 @@ function recSitesLandApart(fd: i32, own: i32, dst: i32): boolean {
 // The record a queued delivery lands call `c`'s record of `own` on, through generic identities
 // only it pins and the fields and elements of literals; -1 when no queued delivery reaches `c` or
 // two land it differently.
-function recQueuedLandingOf(c: i32, own: i32): i32 {
+function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
   let got = -1
   let i = 0
   while i < recPendSrc.length {
+    if recRepArgOf(recPendSrc[i], c, own, dst) {
+      i = i + 1
+      continue
+    }
     const t = recLandingIn(
       recPendSrc[i],
       recPendDstTy[i],
@@ -1973,6 +1990,14 @@ function recQueuedLandingOf(c: i32, own: i32): i32 {
     i = i + 1
   }
   got
+}
+
+// Whether the queued delivery `src` is call `c`'s record of `own`, directly or relayed, handed as
+// an argument to an annotated parameter an instance at `dst` serves (`recAnnArgRepOk`), so it
+// lands at the build, not the annotation.
+function recRepArgOf(src: i32, c: i32, own: i32, dst: i32): boolean {
+  if dst < 0 || !recAnnArgRepOk(src, dst) { return false }
+  cwPeelValue(src) == c || recLandingIn(src, dst, c, own, REC_STORE_DEPTH) >= 0
 }
 
 // `recQueuedLandingOf` for one delivery of `src` as a `dstTy`.
@@ -2458,10 +2483,26 @@ export function recBuiltReadRefuse(u: i32) {
   if bt < 0 || own < 0 { return 0 }
   if !(nodeAt(p) is BinExpr) && recArgTakesRep(p, 4) { return 0 }
   if !(nodeAt(p) is BinExpr) && recAnnArgTakesRep(p, nonNullTy(bt)) { return 0 }
+  // A `??` whose default is a fresh record literal builds the literal at the read's record too.
+  if recCoalesceLitBuilt(p, nonNullTy(bt)) { return 0 }
   if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
   }
   0
+}
+
+// Whether `p` is `read ?? { … }` handed to a parameter that takes the rep `rep`; the literal is
+// then built at `rep`, so the whole value is one record of it.
+function recCoalesceLitBuilt(p: i32, rep: i32): boolean {
+  const n = nodeAt(p)
+  if !(n is BinExpr) || n.binOp != "??" { return false }
+  const lit = cwPeelValue(n.binRight)
+  if lit < 0 || !(nodeAt(lit) is ObjLit) || !(tyAt(rep) is TyObj) {
+    return false
+  }
+  if !recArgTakesRep(p, 4) && !recAnnArgTakesRep(p, rep) { return false }
+  recordRepTyAdopt(lit, rep, 6)
+  true
 }
 
 // Whether `x` is an argument whose parameter takes its rep (`recParamTakesRep`), up to `depth`
@@ -2514,6 +2555,15 @@ function recParamTakesRep(par: i32, depth: i32): boolean {
 // over `rep`'s fields or a list of one, is only read or written for a field (an element's, for a
 // list) in its own body; noted with `recArgRepNote`, so the callee is instanced at `rep` (D14532).
 function recAnnArgTakesRep(x: i32, rep: i32): boolean {
+  if !recAnnArgRepOk(x, rep) { return false }
+  const c = nodeAt(cwIxUp[x])
+  const fd = if c is Call { identBoundFnDeclOf(c.callFn) } else { -1 }
+  recArgRepNote(x, fd, rep)
+  true
+}
+
+// `recAnnArgTakesRep` without noting the argument.
+function recAnnArgRepOk(x: i32, rep: i32): boolean {
   if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_ARG {
     return false
   }
@@ -2550,7 +2600,6 @@ function recAnnArgTakesRep(x: i32, rep: i32): boolean {
       return false
     }
   }
-  if used { recArgRepNote(x, fd, rep) }
   used
 }
 
