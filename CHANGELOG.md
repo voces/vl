@@ -8,6 +8,13 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **The exact-key test is linear inside a cycle of generics again (master's `scaling shape` red since #5373), and three more instance-type ladders read the elaboration (`iterElemPinTy`, `valueReadPinTy`, `loopVarElemPinTyOf`; five helpers deleted) (#5394).**
+- **Mono's exact-sub rows are gone: D2684's exact instances are keyed by the elaboration alone (`monoNeedsExactKey`, `monoExactSub*`, `exactSubAt` deleted).** An instance's type reads substitute its elaboration's binding, and a decided hole parameter pins at the elaboration's type, not `recordedParamPinName` (#5379, #5380, #5384, #5397).
+- **Mono's return passes are no longer re-run after the walk (`monoRetSettle` deleted), and two calls built at one wider record are checked at that record with the program (late demands 2 → 1) (#5383, #5389).**
+- **Every caller that takes a union row asks for the literal-preserving key (`unRowOfTyKey`); membership tests keep the canonical fold (step 7) (#5381, #5391).**
+- **The elaboration is the mint facts' one producer, and a nested list of a set holds member ids when built from a named list or holding generic members (`monoLetOwnCopy`, `monoInstOwnNameList`, `monoNameListLit` deleted) (step 4; #5386, #5387, #5390).**
+- **A fused `string | null` `??` is nullable by its own type (`rawNullRead` deleted), and a `K | null` place or `if` join widens to the niche by its delivery stamp (step 5; #5385, #5393).** A call queued for no delivery is served from its function's wider build in every slot (`recReadInPlace` deleted, step 6; #5366).
+- **Master-push CI keeps one `ci-cost` reading and one `publish-seed` run in flight (#5388).**
 - **Step 1's residue is gone: the emitter takes an instance's types from the elaboration.** The hole readers, `holeCaptureTyOf`, `holeCompositeTyOf`, `holeRecordTyOf` and `pinSubOperandTyOf` are deleted, a closure call's instance signature reads its callee's elaborated type (D7202), and the elaboration keys D2684's exact instances apart (#5368, #5373, #5375, #5382).
 - **Mono stops deciding more pins: its kept-apart join rows come from the elaboration, and an arrow slot's open type parameters bind at the elaboration's slot type (`monoTpJoinBindRow`, `monoBindArenaWalk` deleted).** A re-pointed `let` of generics whose results disagree is refused at the write (D12214) (#5369, #5370, #5376).
 - **The elaboration notes each instance's calls through a function set, and the tag decision runs again after it (slice (ii) S1; D12231, D14737 closed).** A list of inner list literals of a set holds member ids, returned from a function too (#5345, #5372).

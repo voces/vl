@@ -403,7 +403,6 @@ import {
   FC_STRUCT,
   bodyRebuiltFrom,
   buildFnChildIndex,
-  caResumeArmed,
   emitRootIx,
   fmResumeArmed,
   fnChildHead,
@@ -444,10 +443,6 @@ import {
   monoLamShared,
   monoOrigNode,
   monoParamPinTy,
-  monoPinSubN,
-  monoPinSubOwn,
-  monoPinSubRow,
-  monoPinSubT,
   monoProgStmts,
   monoRetCopyReads,
   monoStubSlots,
@@ -576,13 +571,14 @@ import {
   holeNulStringPinTyOf,
   instanceBindsNothingClosed,
   nodeTyInOf,
-  pinSubAt,
   pinnedParamTyAt,
   tyCanonKey,
   tySameSet,
   tySameSpelled,
 } from "./emit_ty_canon"
 import {
+  ekNames,
+  ekTys,
   elabAliasNote,
   elabBodyDeclNote,
   elabCallInstWant,
@@ -591,6 +587,7 @@ import {
   elabInstSpelling,
   elabInstTyAt,
   elabKeyAt,
+  elabKeyAtPos,
   elabNarrowedCarry,
   elabNodeTys,
   elabResultAtParams,
@@ -636,8 +633,6 @@ import {
   buildFnMap,
   buildFnMapNoteFnSlotWrite,
   buildFnMapNoteFnStmtWrite,
-  collectA,
-  collectANoteIdentRename,
   registerInlineUnionOfTy,
   registerTyReachUnions,
 } from "./emit_collect"
@@ -6239,17 +6234,11 @@ function monoPinMapLambdas(
   ix
 }
 
-// Rebuild the name→index map and `collectA`'s rep rows after a new instance lands in
-// `fnStmts`: a pinned `string[]`/`f64` annotation forces types the original generic name never
-// did. Both read the arena alone, so an unmoved stamp means that state is in hand; `collectA`
-// resumes here alone, where only this module edits.
+// Extend the name→index map over a new instance in `fnStmts`, which the walk resolves by name
+// before collection runs. It reads the arena alone, so an unmoved stamp means it is in hand.
 function monoRebuild() {
   const stamp = monoArenaStamp()
   if stamp == monoRebuiltStamp { return 0 }
-  caResumeArmed = true
-  const caRc = collectA(monoProgStmts)
-  caResumeArmed = false
-  if caRc < 0 { return -1 }
   fmResumeArmed = true
   const bfmRc = buildFnMap(monoProgStmts)
   fmResumeArmed = false
@@ -6808,7 +6797,6 @@ function monoRenameGenAliasInit(at: i32, ctx: i32, tpl: string, inst: string) {
     if iv.identName == d.letName { return 0 }
     return monoRenameGenAliasInit(d.letInit, ctx, tpl, inst)
   }
-  collectANoteIdentRename(iv.identName)
   iv.identName = inst
   monoArenaTouch()
   sidNoteNodeName(d.letInit, monoFnDeclNamed(inst))
@@ -7011,10 +6999,10 @@ function monoEnclosingPinRow(
   if callFrame >= 0 { pos = callFrame }
   let guard = 0
   while pos >= 0 && guard <= fnStmts.length {
-    const row = monoPinSubRow.get(pos) ?? -1
-    if row >= 0 && row < monoPinSubN.length {
-      const ns = monoPinSubN[row]
-      const ts = monoPinSubT[row]
+    const row = elabKeyAtPos(pos)
+    if row >= 0 && row < ekNames.length {
+      const ns = ekNames[row]
+      const ts = ekTys[row]
       let i = 0
       while i < ns.length && i < ts.length {
         if (
@@ -9460,35 +9448,8 @@ function monoExactPinTyOf(t: i32, ctx: i32): i32 {
 // type parameter's or a hole's; `t` itself where no instance binds every one it names.
 function monoPinSubTyOf(t: i32, ctx: i32): i32 {
   if ctx < 0 { return t }
-  let pos = fnStmtsPosOf(ctx)
-  let guard = 0
-  // A nested generic's instance binds its own parameters only; what it leaves open is the
-  // enclosing instance's to bind, one frame up (D3831).
-  let cur = t
-  while pos >= 0 && guard <= fnStmts.length {
-    const row = monoPinSubRow.get(pos) ?? -1
-    if row >= 0 && row < monoPinSubN.length {
-      const st = pinSubAt(cur, row)
-      if st < 0 { return t }
-      if !tyHasTyVar(st) { return st }
-      cur = st
-    }
-    // A hole instance binds its holes, which the argument's recorded type may name directly.
-    const hrow = monoHoleSubRow.get(pos) ?? -1
-    if hrow >= 0 && hrow < monoHoleSubN.length {
-      let ht = holePinReadOf(cur, monoHoleSubN[hrow], monoHoleSubT[hrow])
-      if ht < 0 {
-        ht = substTyDeep(cur, monoHoleSubN[hrow], monoHoleSubT[hrow])
-      }
-      if ht < 0 { return t }
-      if !tyHasTyVar(ht) { return ht }
-      cur = ht
-    }
-    if pos >= fnParent.length { return t }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  t
+  const st = elabInstTyAt(t, ctx)
+  if st >= 0 { st } else { t }
 }
 
 // `monoExactPinTyOf` over each pin of one call.
@@ -9545,10 +9506,6 @@ export function monoSubTablesReset() {
   monoHoleSubRow = Map()
   monoHoleSubN = []
   monoHoleSubT = []
-  monoPinSubRow = Map()
-  monoPinSubN = []
-  monoPinSubT = []
-  monoPinSubOwn = []
   monoInstOwn = ""
   monoArgInstFe = Map()
   monoOpenArgCall = 0 - 1
@@ -9735,7 +9692,6 @@ function monoMakeInstanceHit(
             && !i32ListHas(monoNoRename, calleeIx)
           ) {
             monoAliasCallNote(calleeIx)
-            collectANoteIdentRename(cal.identName)
             cal.identName = monoInstName[k]
             monoArenaTouch()
             // R4 writer 5 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
@@ -10236,7 +10192,6 @@ function monoMakeInstanceLater(
   // R4 writer 6 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
   if cal2 is Ident && !i32ListHas(monoNoRename, calleeIx) {
     monoAliasCallNote(calleeIx)
-    collectANoteIdentRename(cal2.identName)
     cal2.identName = instName
     monoArenaTouch()
     let instDecl = fnStmts[instFe]
@@ -10359,15 +10314,13 @@ function monoTwoListOf(r: i32): i32 {
 }
 
 // Records a new instance under `key` in the registry, with the side tables keyed by its
-// slot `instFe`: the two-list result type and the pin and hole binding rows.
+// slot `instFe`: the two-list result type and the hole binding row.
 function monoMakeInstanceRegister(
   key: string,
   origFe: i32,
   instName: string,
   instFe: i32,
   twoListTy: i32,
-  letBN: string[],
-  letBT: i32[],
   instHoleN: string[],
   instHoleT: i32[],
 ) {
@@ -10377,12 +10330,6 @@ function monoMakeInstanceRegister(
   monoInstFe.push(instFe)
   monoLastInstFe = instFe
   if twoListTy >= 0 { monoTwoListRet.set(instFe, twoListTy) }
-  if letBN.length > 0 {
-    monoPinSubRow.set(instFe, monoPinSubN.length)
-    monoPinSubN.push(letBN)
-    monoPinSubT.push(letBT)
-    monoPinSubOwn.push(monoInstOwn)
-  }
   if instHoleN.length > 0 {
     monoHoleSubRow.set(instFe, monoHoleSubN.length)
     monoHoleSubN.push(instHoleN)
@@ -11019,8 +10966,6 @@ function monoMakeInstanceGo(
       instName,
       instFe,
       twoListTy,
-      letBN,
-      letBT,
       holeN,
       holeT,
     )
@@ -18017,9 +17962,9 @@ function monoDeclPathKeys(
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const it = monoFrameInstTmpl(lf[0])
     // A hole instance's parameters are spelled at its hole binding.
-    const hrow = monoHoleSubRow.get(fnStmtsPosOf(it[0])) ?? -1
-    if hrow >= 0 && hrow < monoHoleSubN.length {
-      fnFlowStageInstHoles(monoHoleSubN[hrow], monoHoleSubT[hrow])
+    const hk = elabKeyAt(it[0])
+    if hk >= 0 && hk < ekNames.length {
+      fnFlowStageInstHoles(ekNames[hk], ekTys[hk])
     }
     pins = monoDeclPathKeysIn(lf[1], path, it[0], it[1], rets, dead)
     const noN: string[] = []
@@ -23244,7 +23189,6 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
           const cal = nodeAt(c.callFn)
           // R4 writer 7 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
           if cal is Ident {
-            collectANoteIdentRename(cal.identName)
             cal.identName = monoInstName[r]
             monoArenaTouch()
             sidNoteNodeName(c.callFn, fnStmts[monoInstFe[r]])
@@ -23305,7 +23249,6 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       const cal2 = nodeAt(c.callFn)
       // R4 writer 8 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
       if cal2 is Ident {
-        collectANoteIdentRename(cal2.identName)
         cal2.identName = specName
         monoArenaTouch()
         sidNoteNodeName(c.callFn, fnStmts[instFe])
@@ -23370,7 +23313,6 @@ function monoLamCallByName(calleeIx: i32, origFe: i32, instName: string) {
     ) {
       return 0
     }
-    collectANoteIdentRename(cal.identName)
     cal.identName = instName
     monoArenaTouch()
     sidNoteNodeName(calleeIx, monoFnDeclNamed(instName))
@@ -24038,7 +23980,6 @@ function monoRespellLamFe(calleeIx: i32, ctx: i32): i32 {
   if captureCountOf(fe) > 0 { return fe }
   const name = monoSlotName(fe)
   if name == "" || name == cal.identName { return fe }
-  collectANoteIdentRename(cal.identName)
   cal.identName = name
   monoArenaTouch()
   sidNoteNodeName(calleeIx, fnStmts[fe])
