@@ -1926,136 +1926,16 @@ export function nulRefStructIdxOfLet(letIx: i32, fnIx: i32) {
 export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = nodeAt(exprIx)
-  match e {
-    Paren => {
-      return exprNullableStruct(e.parInner, fnIx)
-    }
-    // An assignment's value is its target cell, as `exprUnion` states it (D2602).
-    BinExpr => {
-      if e.binOp == "=" {
-        const ar = asgReadNode(exprIx, fnIx)
-        if ar != exprIx { return exprNullableStruct(ar, fnIx) }
-      }
-    }
-    // Any other expression is classified below.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+  if e is Paren { return exprNullableStruct(e.parInner, fnIx) }
+  // A name or field read is its cell's kind: a read narrowed to `null` still holds the ref.
+  if e is Ident || e is Member {
+    const nk = exprNulKind(exprIx, fnIx)
+    if nk == "nulstruct" { return true }
   }
-  // An `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560). Asked
-  // first because the rung below returns whatever its non-null predicate says, and a
-  // `S | null`-returning call arm answers no to that one.
-  const nlIfS = nulIfArmNullableValueIx(exprIx)
-  if nlIfS >= 0 {
-    if exprNullableStruct(nlIfS, fnIx) { return true }
-  }
-  // An if-expression with a null arm over a struct arm — see `nulArmIfThenValueIx`.
-  const elIfS = nulArmIfThenValueIx(exprIx, fnIx)
-  if elIfS >= 0 { return structIndexOfExpr(elIfS, fnIx) >= 0 }
-  // `x as? S` over a union yields `S | null`, the nullable struct ref. The `AsExpr` twin of
-  // the `exprNullableString` arm; both read the cast's own recorded type, which for the
-  // coalescing member is the nullable result.
-  match e {
-    AsExpr => {
-      if nodeRepIs(exprIx, "nulstruct", fnIx) { return true }
-      return asNulStructRow(exprIx) >= 0
-    }
-    Call => {
-      if e.callFn < 0 { return false }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        if (
-          fnRetNulRefSid(sidOfNode(e.callFn), callee.identName, fnIx, e.callFn)
-        ) {
-          return true
-        }
-        // An `S | null`-returning function value (a binding, or a `(…) => S | null` param
-        // callee) — its result is the nullable struct ref, `>nN;`.
-        if calleeRetKindOfRead(e.callFn, fnIx) == "nulstruct" { return true }
-      }
-      // An `S | null`-returning field-closure call.
-      if callee is Member {
-        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if ffe >= 0 && repOfFnSlot(ffe).rdKind == "nulstruct" { return true }
-      }
-      // `xs.pop()` and `xs.get(i)` over a struct-element ref list yield `S | null` — a pop of
-      // an empty list and an out-of-range get are both null.
-      if structListPopGetElem(exprIx, fnIx) >= 0 { return true }
-      // Fallback, scoped to a call: a nullable-struct-returning closure value call whose callee
-      // the cases above miss, such as an indexed closure-array element. Either object niche
-      // counts, a union arm's included, so `letIsNulRef` classifies such a binding nullable
-      // and its `!= null` narrow gets context.
-      return nodeRepIs(exprIx, "nulstruct", fnIx)
-        || nodeRepIs(exprIx, "nulvariant", fnIx)
-    }
-    // A read is what its recorded rep says: a narrowed read of a nullable cell, and a plain
-    // `inner: S` field stored `(ref null $S)`, recover at the read (`readOwesNonNullRecover`).
-    Ident | Member => {
-      return exprNulKind(exprIx, fnIx) == "nulstruct"
-    }
-    // The `?.` spelling of the same read (D1084): `o?.f` over a code-15 field is `S | null`
-    // for the second reason as well as the first — the chain itself can be null — so it is
-    // nullable-classified wherever `o.f` is, which is what makes the un-annotated spelling
-    // work. `optChainStructIdxOf` is the resolver the emitter uses at this node.
-    OptMember => {
-      const oNsi = optChainStructIdxOf(e.omObj, fnIx)
-      if oNsi >= 0 {
-        const oNfi = sFieldIndex(oNsi, e.omProp)
-        if oNfi >= 0 { return sFieldTypeAt(oNsi, oNfi) == FC_STRUCT }
-      }
-      return false
-    }
-    // An index into a nullable-struct array (`(P | null)[]`) yields `P | null` — the element
-    // legitimately holds null, so the read is not recovered to non-null as a `P[]` element
-    // is. `const e = xs[i]` binds the nullable-struct niche.
-    Index => {
-      if exprRefArray(e.idxArr, fnIx) {
-        // Guard the slot: a narrowed union-arm rebind receiver classifies `exprRefArray` true
-        // while the slot resolver can still miss, and an unguarded `rlElemTyIx[-1]` is an
-        // out-of-bounds crash in the compiler itself.
-        const slot = refListSlotOfExpr(e.idxArr, fnIx)
-        if slot >= 0 && slot < rlElemTyIx.length {
-          if refListElemIsRow(e.idxArr, fnIx) {
-            // The element must be a struct row, not a union arm (D851): a `(Circle | null)[]`
-            // whose `Circle` is a declared union's member also interns kind 1, and its element
-            // heap is `uVarHeap[vi]` rather than `sHeapIdx`, so claiming it here binds the read
-            // to a `nulstruct` local whose struct row does not exist.
-            if rlElemVariantRow(slot) < 0 {
-              if rlElemIsNulNiche(slot) { return true }
-            }
-          }
-        }
-      }
-      // A bare `m[k]` over a struct-valued map is `S | null`: the `vals` slot is
-      // `(ref null $S)` and `emitMapGet` yields it unrecovered, a miss being `ref.null`. So
-      // `const v = m[k]` binds the nullable-struct niche; a `?? d` read over a non-null value
-      // stays the non-null struct, which the `BinExpr` arm settles.
-      const mrs = mapReadMvSlot(exprIx, fnIx)
-      if mrs >= 0 { return mvValKind[mrs] == MVK_STRUCT }
-    }
-    // A `m[k] ?? d` read over a nullable-struct-valued map stays `S | null` only when the
-    // default is itself nullable; a non-null default coalesces every null, stored included,
-    // to the non-null struct, which `exprStruct` claims.
-    BinExpr => {
-      const cns = coalesceMvSlot(exprIx, fnIx)
-      if cns >= 0 {
-        return mvValKind[cns] == MVK_STRUCT
-          && coalesceStaysNullable(exprIx, cns, fnIx)
-      }
-      // The non-map `??` over the same niche obeys the identical rule — the consumer half of
-      // the decision `emitCoalesce`'s nullable-struct arm makes. Without it an un-annotated
-      // `const nv = p ?? q` binds a non-null struct cell and its `nv != null` lowers as struct
-      // equality, while an annotated consumer takes the `(ref null $S)` cell.
-      if e.binOp == "??" {
-        // A join to a default of another type is the union box, never the operand's niche.
-        if coalesceResultIsBox(exprIx, fnIx) { return false }
-        if exprNullableStruct(e.binLeft, fnIx) {
-          return coalesceDefaultNullable(e.binRight, fnIx)
-        }
-      }
-    }
-    // No other expression is a nullable struct.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
+  const rd = repOfNode(exprIx, fnIx)
+  if rd.rdCovered != 1 { return false }
+  // A record arm of a union reps as a variant (D14655); a call yielding it is the same ref.
+  rd.rdKind == "nulstruct" || (e is Call && rd.rdKind == "nulvariant")
 }
 
 // The arena index of the expression an un-annotated function returns: the body's trailing
