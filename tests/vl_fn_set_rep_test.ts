@@ -428,3 +428,30 @@ Deno.test({
     }
   },
 });
+
+// A lambda handed to an un-annotated parameter and called there at two types is a member of the
+// set, called by its declaration rather than through a closure.
+const LAMBDA_MEMBER: string[] = [
+  "function lap(f) { print(f(3)); print(f(2.5)) }",
+  "lap((a) => a)",
+];
+
+Deno.test({
+  name: "fn-set rep: a lambda handed to a hole parameter is a member id",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "lambda", LAMBDA_MEMBER);
+      const p = await wasmDis([`${dir}/lambda.wasm`]);
+      if (!p.success) throw new Error("wasm-dis lambda failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`lambda: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
