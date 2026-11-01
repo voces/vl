@@ -58,6 +58,7 @@ import {
 import {
   identDeclOf,
   memberDeclOf,
+  memberMovesNow,
   methodFnOfDecl,
   sidLookup,
   sidOf,
@@ -130,7 +131,8 @@ export const CW_OCC_USE = 0
 export const CW_OCC_BIND = 1
 export const CW_OCC_ASG = 2
 export const CW_OCC_CALL = 3
-// A method-spelled call `recv.m(…)`, filed under `m`'s plain name, carrying no frame.
+// A method-spelled call `recv.m(…)`, filed under `m`'s plain name, carrying no frame. It is
+// chained by the declaration the checker picked (`cwMethodCalls`), never by a binding's.
 export const CW_OCC_MCALL = 4
 // A named `FuncDecl`, filed under its plain name so a method spelling finds merged declarations.
 export const CW_OCC_FDECL = 5
@@ -200,6 +202,17 @@ let cwIxDNext: i32[] = []
 let cwIxDHead: i32[] = []
 let cwIxUHead: i32[] = []
 let cwIxDDone: i32[] = []
+// The method-call rows chained the same way, by the `self`-function the checker picked for the
+// call, and per spelling the rows it picked none for; filled on a spelling's first
+// `cwMethodCalls` once `cwPicksFinal` holds, since until then a pick may still move.
+let cwIxMNext: i32[] = []
+let cwIxMHead: {[i32]: i32} = Map()
+let cwIxMUHead: i32[] = []
+let cwIxMDone: i32[] = []
+let cwIxMMoves = -1
+// Whether this pass's checks have returned, so each member call's recorded declaration is the
+// checker's pick (its overload choice or type-bound fallback) rather than the binder's.
+let cwPicksFinal = false
 // `cwFnValueTargets` memo: a binding's declaration (`cwBindingOf`) to its row in `cwFvSets`, or
 // -2 - d while that binding is being resolved at stack depth d. A binding met again on the stack
 // adds nothing, and a result that leaned on one below its own depth is not kept.
@@ -218,6 +231,7 @@ function cwIxReset() {
   cwIxDHead = []
   cwIxUHead = []
   cwIxDDone = []
+  cwIxMethodReset()
   cwIxNode = []
   cwIxFr = []
   cwIxKind = []
@@ -264,14 +278,12 @@ function cwIxKey(sid: i32, d: i32): i32 {
 
 // The chain key of row `r` of `sid`: the key of the declaration it binds, the one its read or
 // assigned name resolves to, or the function a call resolves to; -1 for a row resolving to no
-// frame, and for a call of anything else, which may write anything (D2390). `sole` is the
-// name's one `self`-function, or -1 (`cwIxSoleSelf`).
-function cwIxRowKey(r: i32, sid: i32, sole: i32): i32 {
+// frame, and for a call of anything else, which may write anything (D2390).
+function cwIxRowKey(r: i32, sid: i32): i32 {
   if r < 0 || r >= cwIxNode.length { return -1 }
   const at = cwIxNode[r]
   const k = cwIxKind[r]
   if k == CW_OCC_CALL { return cwIxKey(sid, cwCallFnOf(at)) }
-  if k == CW_OCC_MCALL { return cwIxKey(sid, cwMethodCallFnOf(at, sole)) }
   if cwIxFr[r] == CW_FR_UNKNOWN { return -1 }
   if k == CW_OCC_BIND { return cwIxKey(sid, at) }
   if k == CW_OCC_USE { return cwIxKey(sid, identDeclOf(at)) }
@@ -280,8 +292,9 @@ function cwIxRowKey(r: i32, sid: i32, sole: i32): i32 {
   -1
 }
 
-// Chains every row of `sid`'s name chain onto its declaration's chain, once per built index. The
-// name chain is newest first, so its rows are placed oldest first to keep each chain newest first.
+// Chains every row of `sid`'s name chain but its method calls onto its declaration's chain, once
+// per built index. The name chain is newest first, so its rows are placed oldest first to keep each
+// chain newest first.
 function cwIxDeclEnsure(sid: i32) {
   if !cwIxBuilt || sid < 0 || sid >= cwIxHead.length { return 0 }
   if cwIxDDone.length < cwIxHead.length {
@@ -297,17 +310,73 @@ function cwIxDeclEnsure(sid: i32) {
     rows.push(r)
     r = cwIxNext[r]
   }
-  const sole = cwIxSoleSelf(rows)
   let i = rows.length - 1
   while i >= 0 {
     const row = rows[i]
-    const key = cwIxRowKey(row, sid, sole)
-    if key >= 0 && key < cwIxDHead.length {
+    const key = cwIxRowKey(row, sid)
+    if cwIxKind[row] == CW_OCC_MCALL {
+      cwIxDNext[row] = -1
+    } else if key >= 0 && key < cwIxDHead.length {
       cwIxDNext[row] = cwIxDHead[key]
       cwIxDHead[key] = row
     } else {
       cwIxDNext[row] = cwIxUHead[sid]
       cwIxUHead[sid] = row
+    }
+    i = i - 1
+  }
+  0
+}
+
+// Drops the method-call chains; the next `cwMethodCalls` of a spelling refills its own.
+function cwIxMethodReset() {
+  cwIxMNext = []
+  cwIxMHead = Map()
+  cwIxMUHead = []
+  cwIxMDone = []
+  0
+}
+
+// Record whether this pass's checks have returned. Either way the method-call chains are
+// dropped: before, a pick may still move; after, every pick is the checker's.
+export function cwPicksFinalSet(on: boolean) {
+  cwPicksFinal = on
+  cwIxMethodReset()
+  0
+}
+
+// Chains every method-call row of `sid` by the declaration the checker picked for it
+// (`cwMethodCallPickOf`), else onto the spelling's unpicked chain, once per index and per state
+// of the recorded picks: a pick written after the fill drops every spelling's chains.
+function cwIxMethodEnsure(sid: i32) {
+  if sid < 0 || sid >= cwIxHead.length { return 0 }
+  if cwIxMMoves != memberMovesNow() {
+    cwIxMethodReset()
+    cwIxMMoves = memberMovesNow()
+  }
+  if cwIxMDone.length < cwIxHead.length {
+    cwIxMDone = __array_new__(cwIxHead.length, 0)
+    cwIxMUHead = __array_new__(cwIxHead.length, -1)
+    cwIxMNext = __array_new__(cwIxNext.length, -1)
+  }
+  if cwIxMDone[sid] == 1 { return 0 }
+  cwIxMDone[sid] = 1
+  const rows: i32[] = []
+  let r = cwIxHead[sid]
+  while r >= 0 {
+    if cwIxKind[r] == CW_OCC_MCALL { rows.push(r) }
+    r = cwIxNext[r]
+  }
+  let i = rows.length - 1
+  while i >= 0 {
+    const row = rows[i]
+    const key = cwMethodCallPickOf(cwIxNode[row], sid)
+    if key >= 0 {
+      cwIxMNext[row] = cwIxMHead[key] ?? -1
+      cwIxMHead[key] = row
+    } else {
+      cwIxMNext[row] = cwIxMUHead[sid]
+      cwIxMUHead[sid] = row
     }
     i = i - 1
   }
@@ -1078,33 +1147,22 @@ function cwCallFnOf(c: i32): i32 {
   -1
 }
 
-// The one `self`-function among the declarations in `rows`, or -1 when there are none or
-// several: a spelling with one candidate is the only one no overload pick or type-bound
-// fallback can redirect.
-function cwIxSoleSelf(rows: i32[]): i32 {
-  let sole = -1
-  for r in rows {
-    if cwIxKind[r] == CW_OCC_FDECL {
-      const d = cwIxNode[r]
-      if methodFnOfDecl(d) == d {
-        if sole >= 0 { return -1 }
-        sole = d
-      }
-    }
-  }
-  sole
-}
-
-// The function the method call `c` resolves to: `sole` when its spelling records it, else -1.
-function cwMethodCallFnOf(c: i32, sole: i32): i32 {
-  if sole < 0 || c < 0 || c >= P.nodes.length { return -1 }
+// The `self`-function the checker recorded for the method call `c` spelled `sid`: its overload
+// pick or type-bound fallback included, merge suffix stripped. -1 for a call it recorded none
+// for, a binding's or a builtin's, which may reach any function of the spelling (D2390).
+function cwMethodCallPickOf(c: i32, sid: i32): i32 {
+  if c < 0 || c >= P.nodes.length { return -1 }
   const n = nodeAt(c)
   if !(n is Call) { return -1 }
   const cf = cwPeel(n.callFn)
   if cf < 0 || cf >= P.nodes.length { return -1 }
   if !(nodeAt(cf) is Member) { return -1 }
-  if memberDeclOf(cf) != sole { return -1 }
-  sole
+  const d = memberDeclOf(cf)
+  if d < 0 || d >= P.nodes.length || methodFnOfDecl(d) != d { return -1 }
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) || cwDeclKeyOf(d) < 0 { return -1 }
+  if sidLookup(demangleName(fd.fnName)) != sid { return -1 }
+  d
 }
 
 // The rows filed under the spelling `nm` that may stand for the declaration `d`: those resolving
@@ -1116,15 +1174,34 @@ export function cwOccWalkSpelled(d: i32, nm: string): CwOccWalk {
   cwOccWalkOf(cwIxKey(sid, d), sid)
 }
 
-// Every method call `recv.f(…)` that may reach the function `fnIx`: those resolving to it, and
-// those of its spelling resolving to no one function.
+// Every method call `recv.f(…)` that may reach the function `fnIx`, newest first: those the
+// checker picked it for, and those of its spelling it picked no function for. Before this pass's
+// checks have returned, every method call of the spelling.
 export function cwMethodCalls(fnIx: i32, out: i32[]) {
   if fnIx < 0 || fnIx >= P.nodes.length { return 0 }
   const fd = nodeAt(fnIx)
   if !(fd is FuncDecl) || fd.fnName == "" { return 0 }
-  const ow = cwOccWalkSpelled(fnIx, demangleName(fd.fnName))
-  while cwOccNext(ow) {
-    if cwIxKind[ow.row] == CW_OCC_MCALL { out.push(cwIxNode[ow.row]) }
+  const sid = sidLookup(demangleName(fd.fnName))
+  if !cwPicksFinal || cwFrameOfDecl(fnIx) == CW_FR_UNKNOWN {
+    const ow = cwOccWalkAll(sid)
+    while cwOccNext(ow) {
+      if cwIxKind[ow.row] == CW_OCC_MCALL { out.push(cwIxNode[ow.row]) }
+    }
+    return 0
+  }
+  cwIxBuild()
+  cwIxMethodEnsure(sid)
+  if sid < 0 || sid >= cwIxMUHead.length { return 0 }
+  let a = cwIxMHead[fnIx] ?? -1
+  let u = cwIxMUHead[sid]
+  while a >= 0 || u >= 0 {
+    if u > a {
+      out.push(cwIxNode[u])
+      u = cwIxMNext[u]
+    } else {
+      out.push(cwIxNode[a])
+      a = cwIxMNext[a]
+    }
   }
   0
 }

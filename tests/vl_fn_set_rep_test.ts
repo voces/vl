@@ -398,3 +398,33 @@ Deno.test({
     }
   },
 });
+
+// A list of lists of a set handed to an un-annotated parameter and called through its elements at
+// two types holds member ids (D14727).
+const HANDED: string[] = [
+  "function inc0(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "function take(v) { print(v[0][0](3)); print(v[0][1](2.5)) }",
+  "take([[inc0, dbl]])",
+];
+
+Deno.test({
+  name:
+    "fn-set rep: a list of lists of a set handed to a hole parameter holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "handed", HANDED);
+      const p = await wasmDis([`${dir}/handed.wasm`]);
+      if (!p.success) throw new Error("wasm-dis handed failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`handed: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
