@@ -6,7 +6,10 @@
 // declarations for later phases. Consults the classifiers (`emit_classify.vl`);
 // writes no bytes.
 
-import { elabNodeInstTys } from "./emit_elab"
+import { elabNodeInstTys, litRepTyAt } from "./emit_elab"
+import { collectRetValues } from "./check_nj_join"
+import { REC_STORE_DEPTH, recNumMergeField } from "./check_ty_relate"
+import { valueTailLeaves } from "./check_num_adopt"
 import {
   mkNumTyped,
   narrowedFromTyCarry,
@@ -2131,7 +2134,12 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
     // lands on the inner node only. D1371 — without peeling, `(a as? i32) ?? 0` read the
     // stale parenthesized type while the un-parenthesised spelling ran correctly.
     const coalLhs = unwrapParen(n.binLeft)
-    if nodeTyExcludesNull(coalLhs) && !readOfOpenBinding(coalLhs) {
+    // An operand whose type is open is left to the instance, whose pin may hold `null` (D4170).
+    if (
+      nodeTyExcludesNull(coalLhs)
+      && !readOfOpenBinding(coalLhs)
+      && !tyHasTyVar(nodeTyIxOf(coalLhs))
+    ) {
       capMemoNoteEdit()
       return n.binLeft
     }
@@ -3236,10 +3244,14 @@ export function synthNulListRetAnns() {
           // So does a return set joining lists of different storage, built as the union box,
           // and a union with a function member, which un-pinned lowered as a bare closure (D4349).
           const pinsUnion = tyIsListUnion(jty) || tyIsFnArmUnion(jty)
+          // Returned literals the record solve built at one other record keep the inferred
+          // result, which names that record's row: a pin at the checked type would not (D3401).
+          const built = !pinsUnion && fnRetBuiltRecord(fn, jty) >= 0
           if (
-            pinsUnion
-            || tyIsJoinedRecord(jty)
-            || fnRetJoinsWiderRecord(fnStmts[i], jty)
+            !built
+            && (pinsUnion
+              || tyIsJoinedRecord(jty)
+              || fnRetJoinsWiderRecord(fnStmts[i], jty))
           ) {
             let jnm = ""
             if tyIsListUnion(jty) {
@@ -3252,7 +3264,7 @@ export function synthNulListRetAnns() {
             } else if jnm != "" {
               fn.fnRet = synthTypeRefTy(jnm, -1, jty)
             }
-          } else {
+          } else if !built {
             // An inferred return that is one union arm is pinned to the arm's nominal name, so a
             // returned binding narrowed to it is unboxed exactly as under `: Arm` (D4555).
             const jvr = repVariantShapeRowOf(jty)
@@ -3266,6 +3278,30 @@ export function synthNulListRetAnns() {
     i = i + 1
   }
   0
+}
+
+// The record every value `fn` returns is built at, where each is a record literal the record
+// solve built at one record other than `jty`, the checked result, keeping each of its numbers;
+// else -1.
+function fnRetBuiltRecord(fn: FuncDecl, jty: i32): i32 {
+  if jty < 0 || jty >= T.tys.length || !(tyAt(jty) is TyObj) { return -1 }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  let r = -1
+  for rv in rets {
+    for l in valueTailLeaves(rv) {
+      const u = unwrapParen(l)
+      if u < 0 || !(nodeAt(u) is ObjLit) { return -1 }
+      const t = litRepTyAt(u, -1)
+      if t < 0 || t >= T.tys.length || !(tyAt(t) is TyObj) || tyEq(t, jty) {
+        return -1
+      }
+      if r >= 0 && !tyEq(r, t) { return -1 }
+      if recNumMergeField(nodeTyIxOf(u), t, REC_STORE_DEPTH) != "" { return -1 }
+      r = t
+    }
+  }
+  r
 }
 
 // Pins `fn`'s return to the union `jty` spelled `jnm`, registering the union a record list arm

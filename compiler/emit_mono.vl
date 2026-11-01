@@ -531,7 +531,6 @@ import {
   listUnionSharedRep,
   twoListValueTy,
 } from "./emit_fn_ret_kinds"
-import { tyIsListUnion } from "./emit_join_records"
 import {
   criFnIsAnonLambda,
   fnIndexOfInScopeAt,
@@ -610,6 +609,7 @@ import {
   elabWalkPop,
   elabWalkPush,
   elabWalkTy,
+  elabWidenedRet,
   readNarrowedStoreAt,
 } from "./emit_elab"
 import {
@@ -1003,16 +1003,6 @@ function monoAnnPinName(name: string) {
   monoNulAnnName(name)
 }
 
-// The pin of an instance's own list-union annotation `name` that no row holds yet: the pin
-// substituted `V[] | i32[]` to `string[] | i32[]` after `collectU` ran, so it is registered
-// here, as a pinned return is, else "". `ty` is the annotation's recorded type (D4931).
-function monoInstUnionAnnPin(name: string, ty: i32): string {
-  if !tyIsListUnion(ty) { return "" }
-  const c = monoPinUnionName(name)
-  if monoRegisterPinUnion(c, ty) < 0 { return "" }
-  monoAnnPinName(c)
-}
-
 // A nullable annotation whose non-null base is a spelling `monoAnnPinName` already
 // claims, echoed back whole — else "". The nullability rides the pin because the pin is
 // the instance's parameter annotation, while every other channel answers about the rep,
@@ -1278,12 +1268,6 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   if monoNameNarrowsFrom(n, wide) || monoNicheNarrowsFrom(n, nt, wide) {
     if monoAnnPinName(n) == n { return n }
     return ""
-  }
-  // A union narrowed to a smaller union of its own arms, which no row may hold yet (D4965).
-  // A type that is no union has one arm, which the membership test above already asked.
-  if monoTyIsUnionShaped(nt) && monoArmsNarrowFrom(n, nt, wide) {
-    const nu = monoInstUnionAnnPin(n, nt)
-    if nu != "" { return nu }
   }
   // The NOMINAL spelling of the same arm: the two sides of the membership test render
   // differently, since `tyToEmitName` spells a narrowed object structurally (`{r:i32}`)
@@ -2474,11 +2458,6 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
               // declines it or answers one dimension short.
               const r = monoAnnPinName(tyNameOf(ld.letType))
               if r != "" { return r }
-              const ru = monoInstUnionAnnPin(
-                tyNameOf(ld.letType),
-                nodeTyIxOf(ld.letType),
-              )
-              if ru != "" { return ru }
             }
             if ld.letType < 0 && ld.letInit >= 0 {
               const ldp = monoDestListPinName(li, fnIx)
@@ -2524,8 +2503,6 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
           // shape a generic forwarder has. One home, so the two cannot drift.
           const r = monoAnnPinName(pt.tyName)
           if r != "" { return r }
-          const ru = monoInstUnionAnnPin(pt.tyName, nodeTyIxOf(ptn))
-          if ru != "" { return ru }
         }
       }
     }
@@ -11000,7 +10977,14 @@ function monoMakeInstanceGo(
     const ekN: string[] = []
     const ekT: i32[] = []
     monoJoinBinding(ekN0, ekT0, k.exSubN, k.exSubT, ekN, ekT)
-    const ek = elabDemand(monoOrigNode[origFe], ekN, ekT, pinnedTyIx, tplCall)
+    const ek = elabDemand(
+      monoOrigNode[origFe],
+      ekN,
+      ekT,
+      pinnedTyIx,
+      tplCall,
+      retWidenTy,
+    )
     // Everything this build mints is demanded under this instance.
     elabWalkPush(ek)
     if makeCall >= 0 && makeCall == monoOpenLamOwner {
@@ -11018,6 +11002,13 @@ function monoMakeInstanceGo(
       pinnedTyIx,
     )
     if nret < -1 { return elabWalkPop() - 1 }
+    // A widened delivery's result is the one the elaboration records for this instance.
+    if retWiden != "" && !tySame(elabRetOf(ek), retWidenTy) {
+      elabWalkPop()
+      return emitFail(
+        "emitProgram: monomorphize: the elaboration records no widened result for a delivery built returning it",
+      )
+    }
     const nretW = if retWiden != "" { synthTypeRefTy(retWiden, -1, retWidenTy) } else { nret }
     const twoListTy = monoTwoListOf(elabRetOf(ek))
     let instName = fn.fnName
@@ -11305,8 +11296,7 @@ function monoInstanceFor(
       if normTypeAtom(rs) != monoInstanceRetName {
         let want = monoFnTyRet(expTy)
         if want < 0 { want = nameToTy(monoInstanceRetName) }
-        const got = nameToTy(rs)
-        if want >= 0 && got >= 0 && assignable(got, want) {
+        if elabWidenedRet(nameToTy(rs), want) >= 0 {
           monoInstRetWidenName = monoInstanceRetName
           monoInstRetWidenTy = want
         }
@@ -16479,9 +16469,6 @@ function monoPinFieldContainer(at: i32, ctx: i32, fld: string, v: i32): i32 {
   const sp: string[] = []
   if c is TyMap { return monoPinMapSlot(vx, at, ctx, fld, sp) }
   const lit = nodeAt(vx)
-  if lit is ArrayLit && tyAt(et) is TyArray {
-    return monoPinFieldNestedFnList(at, ctx, fld, vx, lit)
-  }
   if !(lit is ArrayLit) || !(tyAt(et) is TyFunc) { return -1 }
   const lf: i32[] = [ctx, at]
   const vals: i32[][] = []
@@ -16501,40 +16488,6 @@ function monoPinFieldContainer(at: i32, ctx: i32, fld: string, v: i32): i32 {
   nodeTyRecord(vx, nt)
   for rl in relits { monoRecordOpen(rl[0], nt, rl[1]) }
   monoRetypeMapReads(ctx, at, nt, ft, fld)
-  nt
-}
-
-// The type field `fld` of the record declared at `at` takes from its inline list of list literals
-// `lit` (`vx`) of functions, at the one type its slot `e`/`e` is pinned at (D9713); -1 left alone.
-function monoPinFieldNestedFnList(
-  at: i32,
-  ctx: i32,
-  fld: string,
-  vx: i32,
-  lit: ArrayLit,
-): i32 {
-  const vals: i32[][] = []
-  const inner: i32[] = []
-  for e in lit.arrElems {
-    const ex = unwrapParen(e)
-    if ex < 0 { return -1 }
-    const il = nodeAt(ex)
-    if !(il is ArrayLit) { return -1 }
-    inner.push(ex)
-    for v in il.arrElems { vals.push([v, ctx]) }
-  }
-  const sp: string[] = []
-  const ft = monoStoredSlotFnTy(
-    [ctx, at],
-    monoSlotPath(fld, ["e", "e"]),
-    vals,
-    sp,
-  )
-  if ft < 0 { return ft }
-  const it = mkArrayTy(ft)
-  const nt = mkArrayTy(it)
-  nodeTyRecord(vx, nt)
-  for x in inner { nodeTyRecord(x, it) }
   nt
 }
 
