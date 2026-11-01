@@ -8,6 +8,24 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **Step 1: the checker banks no program-wide hole pin.** `nodeTyPinIxOf` goes (#5452). The `?.` rewrite and the list-element rung read each instance's type from the elaboration (#5459, #5464), and `holePinsOfTy` goes with them.
+- **Step 7: `vtKindOfType` and `exprStruct` read the rep.**
+  - An annotation's value kind is its rep, and the 25-arm ladder goes (#5454).
+  - `exprStruct` answers a name from the record its binding is held at and a call from its recorded record; its capture and `??` rungs go (#5458, #5470, #5475).
+  - A variable's and a `let`'s variant row come from the stored type (#5450, D14655 closed; #5471).
+  - A layout family stores a literal-set field at the join of its twins (#5461, D14752 closed).
+- **Step 6: a method-call row keys on the checker's pick** (#5457), and `cwSelfDeclsNamed` goes (#5466, D14755 closed).
+  - An overloaded call in a generic body delivers its receiver to the instance's pick (#5477, D14756 closed).
+  - Calls built at a wider record are handed by rep at more positions (#5434, #5453, #5455; D14741, D14753, D14739 closed).
+  - The storage column answers a generic instance's local at the instance's binding (#5469).
+- **Step 4 and slice (ii):** a list or nested list of a set handed to an un-annotated parameter holds member ids (#5448). A set handed through a `const` alias, a nested hole or a typed hand-on is keyed by the set (#5460).
+- **Step 5:** a string literal at a record field and a list literal's atom element decide by their type (#5449, #5463). `rowFieldStoresAtom` answers a row's literal field storage (#5467).
+- **Mono and the checker:**
+  - monoPinHoleParam's stub rung runs only where the elaboration leaves the parameter open (#5441).
+  - A renamed identifier names its instance's slot (#5456), and monoArenaTouch's sites go (#5462).
+  - A call skips the then-arm of an `is` test its argument cannot pass (#5468, D3094).
+- **Container adoption 1:** the literal-row and field-set rungs that no build reaches go (#5465).
+- **CI** runs the rep-fuzz and splice-scan gate rows, and time-boxes the seed job (#5446).
 - **Step 1 is done: mono keeps no instance row tables.** The pin rows (#5405) and the hole rows (#5413) go, since every reader takes the instance's binding from its elaboration. The collect passes' union registers, the `??` and value-`if` union names, and the map-read box read each instance's type rather than the checker's one banked pin, and `synthNullableAnn`, `monoHoleListLitAnn`, `mapReadScalarBoxKindTy` and `mapRecvScalarBoxKindTy` are deleted (#5422, #5423, #5426, #5433, #5439).
 - **Step 7's classifiers read the rep: `exprMap`, `exprNullableMap`, `exprStruct` and `exprNullableStruct` answer from `repOfNode` plus named storage and delivery rungs (D2583, D2650, D3467 closed; D3469 refuses loudly) (#5416, #5419, #5429, #5435, #5442).** `exprMap`'s `Map()`/`Set()` constructor rung goes with #5432's delivery. A record arm of a union reps as a variant (D14655), which is what the remaining `exprStruct` rungs wait on.
 - **Step 7's union rows: a declared union names its type key's row, layout twins share it, an alias of one computed literal set holds its literals, and a shared field read boxes an atom-stored literal set as its string (D14746, D14747, D14750, D14751 closed; duplicate-key files 212 → 101) (#5411, #5420, #5428, #5431, #5437, #5438).**
