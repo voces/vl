@@ -42,7 +42,8 @@ const LOCAL: Record<string, string> = {
   "rep-fuzz": "CI does not run it",
   "filed witnesses": "CI does not run it",
   "splice scan": "CI does not run it",
-  "distilled corpus": "CI does not run it",
+  "distilled corpus":
+    "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
 };
 
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.
