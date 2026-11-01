@@ -390,6 +390,21 @@ print(k.r)
 if u is J { print(u.r ?? 0) }
 `;
 
+// D14902: a literal handed straight back, by a hole function that only rebinds its parameter and
+// by a generic identity, is built at the wider record the call lands on; the result reads there.
+const ROW_HAND_BACK = `type A = { d: i32 | null }
+type II = { d: i32 }
+function g(v) {
+  const w = v
+  return w
+}
+function h<T>(v: T): T { return v }
+const c: A = g({ d: 5 })
+print(c.d ?? 0)
+const e: A = h({ d: 6 })
+print(e.d ?? 0)
+`;
+
 Deno.test({
   name: "fn-ret shadow: row classes",
   ignore,
@@ -415,7 +430,15 @@ Deno.test({
       ROW_DELIVERY,
       DROP_NONE,
       true,
-      "row: stamped >s0;, lowered >V0; | idn=1",
+      "kind agree | idn=1",
+      true,
+    );
+    expectRows(
+      "row hand-back",
+      ROW_HAND_BACK,
+      DROP_NONE,
+      true,
+      "kind agree | g=1; kind agree | h=1",
       true,
     );
   },
