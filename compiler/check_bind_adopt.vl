@@ -61,6 +61,7 @@ import {
   TyObj,
   TyUnion,
   cUserTypes,
+  cUserTypesVer,
   mkArrayTy,
   tyAt,
   tyFieldTyOf,
@@ -244,51 +245,87 @@ function recListCallRepTy(x: i32, own: i32): i32 {
   callRetRepTy(iv, nodeTyIxOf(iv))
 }
 
-// Stamps each record literal no delivery adopted at the union arm its field set names, where
-// exactly one arm of the program's unions widens its type and no declared non-arm record fits
-// it: the arm is the record such a literal is built as (DECISIONS.md "A literal names its arm").
+// Stamps each record literal no delivery adopted at the union arm its type is narrower than
+// (`recNarrowRecordOf`), the record such a literal is built as (DECISIONS.md "A literal names its
+// arm"). A literal whose one record is not an arm keeps its own type.
 export function recArmLitsAdopt() {
   const lits = recObjLits
   recObjLitsSet([])
-  const arms: i32[] = []
-  const recs: i32[] = []
-  ralDeclaredRecords(arms, recs)
-  if arms.length == 0 { return 0 }
+  ralSync()
+  if ralArmN == 0 { return 0 }
   for ix in lits {
     const own = if ix >= 0 && ix < P.nodes.length { nodeTyIxOf(ix) } else { -1 }
     const rt = if own >= 0 { nodeRepTyIxOf(ix) } else { -1 }
     if own >= 0 && (rt < 0 || tySame(rt, own)) {
-      const arm = ralSoleArm(own, arms, recs)
-      if arm >= 0 && litAtDstStorage(ix, arm) { recordRepTyAdopt(ix, arm, 6) }
+      const arm = recNarrowRecordOf(own)
+      if arm >= 0 && ralHas(ralArms, arm) && litAtDstStorage(ix, arm) {
+        recordRepTyAdopt(ix, arm, 6)
+      }
     }
   }
   0
 }
 
-// The record members of every declared union of two or more members into `arms`, and every other
-// declared record into `recs`, each type once.
-function ralDeclaredRecords(arms: i32[], recs: i32[]) {
+// The one declared record that closed record `own` is narrower than and stores alike, or -1:
+// where `own` is a declared record itself, or two declared records of different types widen it.
+// Arms of two unions that are one structural type are one record.
+export function recNarrowRecordOf(own: i32): i32 {
+  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
+  if tyHasTyVar(own) || tyHasHole(own) { return -1 }
+  ralSync()
+  let one = -1
+  for r in ralRecs {
+    if tySame(r, own) { return -1 }
+    if recRepWidens(own, r) {
+      if one >= 0 { return -1 }
+      one = r
+    }
+  }
+  if one >= 0 && ralStoredAlike(own, one) { one } else { -1 }
+}
+
+// Every declared record, each type once, union members first (`ralArmN` of them), for the
+// `cUserTypes` version `ralVer` read.
+let ralRecs: i32[] = []
+let ralArms: i32[] = []
+let ralArmN = 0
+let ralVer = -1
+let ralTyN = -1
+
+function ralSync() {
+  if ralVer == cUserTypesVer && ralTyN == T.tys.length { return 0 }
+  ralVer = cUserTypesVer
+  ralTyN = T.tys.length
+  ralRecs = []
+  ralArms = []
   for nm in cUserTypes.keys() {
     const t = cUserTypes[nm] ?? -1
     const u = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
     if u is TyUnion && u.uMembers.length > 1 && !tyHasTyVar(t) {
       for m in u.uMembers {
-        if m >= 0 && m < T.tys.length && tyAt(m) is TyObj && !ralHas(arms, m) {
-          arms.push(m)
+        if (
+          m >= 0
+          && m < T.tys.length
+          && tyAt(m) is TyObj
+          && !ralHas(ralArms, m)
+        ) {
+          ralArms.push(m)
+          ralRecs.push(m)
         }
       }
     }
   }
+  ralArmN = ralArms.length
   for nm in cUserTypes.keys() {
     const t = cUserTypes[nm] ?? -1
     if (
       t >= 0
       && t < T.tys.length
       && tyAt(t) is TyObj
-      && !ralHas(arms, t)
-      && !ralHas(recs, t)
+      && !tyHasTyVar(t)
+      && !ralHas(ralRecs, t)
     ) {
-      recs.push(t)
+      ralRecs.push(t)
     }
   }
   0
@@ -302,28 +339,9 @@ function ralHas(ts: i32[], t: i32): boolean {
   false
 }
 
-// The one arm of `arms` that widens closed record `own`, or -1: where `own` is an arm or a
-// declared record itself, more than one arm widens it, or a declared non-arm record does.
-function ralSoleArm(own: i32, arms: i32[], recs: i32[]): i32 {
-  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
-  if tyHasTyVar(own) || tyHasHole(own) { return -1 }
-  for r in recs {
-    if tySame(r, own) || recRepWidens(own, r) { return -1 }
-  }
-  let one = -1
-  for a in arms {
-    if tySame(a, own) { return -1 }
-    if recRepWidens(own, a) && ralStoredAlike(own, a) {
-      if one >= 0 { return -1 }
-      one = a
-    }
-  }
-  one
-}
-
-// Whether arm `arm` stores each field of record `own` as `own` does: the same type, the arm's
-// nullable of it, or a `null` field. A numeric widening is no such store, since it changes what a
-// read of the field computes (D14493).
+// Whether arm `arm` stores each field of record `own` as `own` does: the same type, or a `null`
+// field, which any field holding null stores. A widening is no such store: a number changes what a
+// read computes (D14493), and a nullable field is a different storage.
 function ralStoredAlike(own: i32, arm: i32): boolean {
   const o = tyAt(own)
   if !(o is TyObj) { return false }
@@ -332,9 +350,7 @@ function ralStoredAlike(own: i32, arm: i32): boolean {
     const ot = o.objFieldTypes[i]
     const at = tyFieldTyOf(arm, o.objFieldNames[i])
     if at < 0 { return false }
-    if !(tySame(ot, at) || isNullTy(ot) || tySame(ot, nonNullTy(at))) {
-      return false
-    }
+    if !(tySame(ot, at) || isNullTy(ot)) { return false }
     i = i + 1
   }
   true
