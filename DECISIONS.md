@@ -11288,3 +11288,15 @@ out at its tag-mate's heap, while the same record standing alone has its own str
 tag-mate's. An arm's row is found by the arm, never by a literal-folded shape (`repCanonId`
 folds literals, so a shape key can land on another arm's row), and the variant-only columns
 (`uFieldLitTyIx`, `uFieldTyText`) stay keyed by (union, arm) until a struct-row home is chosen.
+
+Before the field tables move, an arm and its own row agree on each field's element name and type:
+where both record the same type, a declared spelling (`Inner`, `Box<i32>`) wins over a
+structural render (`{base:i32,length:i32}`), else the row's spelling stands, and the type index
+is the row's, the one a row lookup by type finds. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
+variant heap column is gone. A row is keyed by (record type, field storage codes), not by the
+type alone: a record with a tagged function field is a second row of its type. A value cannot
+cross between two storage rows of one type without a converting delivery, and none exists, so
+for now the function-tag rule declines a record whose fields would mix the two storages, and the
+record keeps its untagged row. A delivery that tags one must keep running
+`closures/hole-fn-record-beside-declared-row-handed-to-param.vl`,
+`closures/hole-fn-record-field-called-at-other-param.vl` and `closures/hole-fn-record-list-element.vl`.

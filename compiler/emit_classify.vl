@@ -1090,7 +1090,7 @@ export function cloRetIsStructRow(fe: i32): boolean {
   k == "struct" || k == "nulstruct"
 }
 
-// The variant row of the `(ref null $uVarHeap[vi])` niche a call of `fe` returns, or -1.
+// The variant row of the `(ref null $variantHeap(vi))` niche a call of `fe` returns, or -1.
 // The annotation, or an un-annotated result's recorded return kind, is read first, so a call
 // that is not the niche never runs `cloRetValKind`'s inference.
 function cloRetNulVariantRow(fe: i32): i32 {
@@ -1524,7 +1524,7 @@ function globalReadIsString(fnIx: i32, readIx: i32) {
   globalReadAsk(sidOfNode(readIx), li, 2)
 }
 
-// The variant row of the `(ref null $uVarHeap[vi])` niche expression `exprIx` holds, or -1
+// The variant row of the `(ref null $variantHeap(vi))` niche expression `exprIx` holds, or -1
 // when it holds none. The one producer of the nullable-variant kind and its row:
 // `exprNullableVariant` is this answer `>= 0`. Each arm reads the storage that typed the value,
 // so an arm and its layout twin in another position keep their own rows.
@@ -1624,7 +1624,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The variant row of the `(ref null $uVarHeap[vi])` niche the read `ix` reads inside `fnIx`: its
+// The variant row of the `(ref null $variantHeap(vi))` niche the read `ix` reads inside `fnIx`: its
 // storage type's, which is the type it is narrowed out of, else its own type; -1 for none.
 function nulVariantRowOfRead(ix: i32, fnIx: i32): i32 {
   let st = readNarrowedStoreAt(ix, fnIx)
@@ -2953,11 +2953,63 @@ export function letCellSlot(stmtIx: i32, fnIx: i32, k: VKind): i32 {
   }
 }
 
+// `letCellKindGo` remembered per binding and instance on the `gckGen` generation, which only a
+// walk's top re-stamps: an un-annotated binding walks its initializer, and every name read asks.
+// Rows chain per binding (`lckHead`/`lckNext`), one per asking function.
+let lckHead: i32[] = []
+let lckNext: i32[] = []
+let lckFn: i32[] = []
+let lckStamp: i32[] = []
+let lckVal: VKind[] = []
+let lckGenSeen = 0
+let lckDepth = 0
+
 // The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
 // annotation's kind through the shared annotation ladder, else the initializer's. The local
 // storage class's answer to what `globalCellKind` answers for a module global, kept here
 // because `emit_collect.vl` cannot be imported back into this file.
 export function letCellKind(letIx: i32, fnIx: i32): VKind {
+  if letIx < 0 || letIx >= P.nodes.length { return letCellKindGo(letIx, fnIx) }
+  if lckDepth == 0 {
+    if gckStale() { gckDrop() }
+  }
+  if gckGen < lckGenSeen { lckReset() }
+  lckGenSeen = gckGen
+  let r = if letIx < lckHead.length { lckHead[letIx] } else { -1 }
+  while r >= 0 && lckFn[r] != fnIx { r = lckNext[r] }
+  if r >= 0 && lckStamp[r] == gckGen { return lckVal[r] }
+  const gen = gckGen
+  lckDepth = lckDepth + 1
+  const v = letCellKindGo(letIx, fnIx)
+  lckDepth = lckDepth - 1
+  if r < 0 {
+    while lckHead.length <= letIx { lckHead.push(-1) }
+    r = lckStamp.length
+    lckNext.push(lckHead[letIx])
+    lckHead[letIx] = r
+    lckFn.push(fnIx)
+    lckStamp.push(0)
+    lckVal.push(v)
+  }
+  // A walk that minted rows moved the generation; its answer is served once and not kept.
+  lckStamp[r] = if gckGen == gen { gen } else { 0 }
+  lckVal[r] = v
+  v
+}
+
+// Empties `letCellKind`'s memo, at compile start and when the generation wrapped.
+function lckReset() {
+  lckHead = []
+  lckNext = []
+  lckFn = []
+  lckStamp = []
+  lckVal = []
+  lckGenSeen = 0
+  lckDepth = 0
+  0
+}
+
+function letCellKindGo(letIx: i32, fnIx: i32): VKind {
   if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
   // A `boolean | null` cell is the sentinel-2 niche, whatever the annotation's valtype says.
   if letNulBool(letIx, fnIx) { return "nulbool" }
@@ -5041,7 +5093,7 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   // A map join's blocktype selects this value-shape's `$mapStruct`, so the slot is the
   // map shape (`ifExprRefSlot`'s map arm), not a struct-table index.
   if exprMap(tv, fnIx) { return "map" }
-  // A concrete union ARM join: its heap type is `uVarHeap`, which the struct rung cannot
+  // A concrete union ARM join: its heap type is `variantHeap`, which the struct rung cannot
   // name. A program that also declares the union classifies the arm value as a variant, so
   // `structIndexOfExpr` answers -1 and the ladder fell through to the numeric blocktype over
   // a ref value (D1668). Ahead of the struct rung for the reason the nullable half says.
@@ -5062,7 +5114,7 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
     if exprNullableRefArray(nlv, fnIx) { return "reflist" }
     if exprNullableList(nlv, fnIx) { return "list" }
     if exprNullableMap(nlv, fnIx) { return "map" }
-    // The variant arm goes ahead of the struct one: a union member's heap is `uVarHeap`,
+    // The variant arm goes ahead of the struct one: a union member's heap is `variantHeap`,
     // and the struct fallback below would claim it with a row `sHeapIdx` doesn't have.
     if exprNullableVariant(nlv, fnIx) { return "variant" }
     if exprNullableStruct(nlv, fnIx) { return "struct" }
@@ -5090,7 +5142,7 @@ export function ifExprRefSlot(
   // a kind and its slot are never read off two different arms.
   const tv = ifRepArmValueIx(ifIx)
   match kind {
-    // A nullable-variant join: the row is the arm's own `uVarHeap` index. Without it the
+    // A nullable-variant join: the row is the arm's own `variantHeap` index. Without it the
     // struct arm below would claim the value and `fbValtype` would floor with no interned shape.
     "variant" => {
       // The non-null resolver first: `nulVariantIdxOfExpr` answers only for a `T | null` arm,
@@ -5934,7 +5986,7 @@ export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
     if mvSlotNullable(vsl) { return "nulstruct" }
     // A union-arm value (`{[string]: Circle}` where `Circle` is a declared union
     // member): the loop var is the kind-8 variant local, not struct — the arm's
-    // layout lives in `uVarHeap`, since `collectS` skips a union member (D50).
+    // layout lives in `variantHeap`, since `collectS` skips a union member (D50).
     if mvValVariantOf(vsl) >= 0 { return "variant" }
     return "struct" // struct value
   }
@@ -9066,7 +9118,7 @@ function asgCellOf(ix: i32, fnIx: i32): i32 {
   -1
 }
 
-// Expression `exprIx` is a nullable union variant: it holds a `(ref null $uVarHeap[vi])`
+// Expression `exprIx` is a nullable union variant: it holds a `(ref null $variantHeap(vi))`
 // niche, which is `nulVariantIdxOfExpr` naming its row. Strict beside `exprNullableStruct`,
 // since the two kinds index different heap tables; a null test wants `exprNullableRefNiche`.
 export function exprNullableVariant(exprIx: i32, fnIx: i32): boolean {
@@ -9236,7 +9288,7 @@ export function letIsStruct(letIx: i32, fnIx: i32) {
 }
 
 // True if the `LetDecl` at `letIx` binds a concrete union-variant value: a variant cell
-// `(ref $(uVarHeap[vi]))`, distinct from the union box and a standalone struct.
+// `(ref $(variantHeap(vi)))`, distinct from the union box and a standalone struct.
 export function letIsVariant(letIx: i32, fnIx: i32) {
   variantIndexOfLet(letIx, fnIx) >= 0
 }
@@ -9828,7 +9880,7 @@ function structIndexOfIdentExpr(e: Ident, exprIx: i32, fnIx: i32): i32 {
   // The frame's own `let`, arm for arm with `exprNullableStruct`'s leg: a kind without its
   // row is `ref valtype with no interned shape`, so the two land together (D21). Gated on
   // the variant the way every other index resolver here is: an arm's values live at
-  // `uVarHeap`, so answering a struct row for one reaches a receiver that is not one.
+  // `variantHeap`, so answering a struct row for one reaches a receiver that is not one.
   const fli = frameLetOf(fnIx, exprIx)
   if fli >= 0 && !letIsVariant(fli, fnIx) { return structIndexOfLet(fli, fnIx) }
   // The module frame's own `let`, which the leg above cannot reach: a module-scope BLOCK
@@ -15041,6 +15093,7 @@ export function classifyStateReset() {
   gckDepth = 0
   bcDepth = 0
   bindCellReset()
+  lckReset()
   irkDepth = 0
   lrDepth = 0
   asgReReadIx = -1
@@ -15170,6 +15223,13 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
     const nd = repOfNode(rx, fnIx)
     if nd.rdCovered == 1 && readKindIsNul(nd.rdKind) {
       return { rrStore: st, rrRead: nd.rdKind, rrConv: 4 }
+    }
+  }
+  // An `i32` cell read typed `boolean | null` holds that niche's sentinel encoding.
+  if st == "i32" {
+    const bd = repOfNode(rx, fnIx)
+    if bd.rdCovered == 1 && bd.rdKind == "nulbool" {
+      return { rrStore: st, rrRead: "nulbool", rrConv: 6 }
     }
   }
   // A read narrowed out of a nullable storage reads its non-null kind: one the checker recorded

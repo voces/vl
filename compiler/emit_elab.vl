@@ -116,6 +116,7 @@ import {
   elabSnapKey,
   elabTyClosed,
   fnTagCallArms,
+  fnTagMembers,
   fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
   fnTagSetOfTy,
@@ -137,7 +138,7 @@ import { RB_ALL, checkMark, checkRollback } from "./check_rollback"
 import { argIsLitAggregate, bindOf } from "./check_leaf_steps"
 import { holePinHeldSet } from "./check_hole_pins"
 import { a20RetWalk } from "./check_nj_gate"
-import { njFnIx, njFnIxSet } from "./check_nj_join"
+import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
 import { narrowedFromTyOf, nodeTyIxOf } from "./check_node_tys"
 import { nodeRepTyIx, nodeRepTyIxOf, nodeRepUnionIx } from "./check_core_state"
 import { adoptRetLits } from "./check_inferred_return"
@@ -1776,11 +1777,13 @@ function elabOne(k: i32) {
   let c = 0
   while c < elabCallIx.length {
     const cn: string[] = []
-    const ct: i32[] = []
-    if !elabSelfRow(k, elabCallIx[c], elabCallD[c], cn, ct) {
+    const ct0: i32[] = []
+    if !elabSelfRow(k, elabCallIx[c], elabCallD[c], cn, ct0) {
       for x in elabCallN[c] { cn.push(x) }
-      for x in elabCallT[c] { ct.push(x) }
+      for x in elabCallT[c] { ct0.push(x) }
     }
+    // An instance's call binds a tagged set or a primed stub as a root call does.
+    const ct = elabSetArgBind(elabCallIx[c], cn, ct0)
     if tysClosed(ct) {
       elabReachNote(k, elabEnqueue(elabCallD[c], cn, ct, k), elabCallIx[c])
       elabArgRows(elabCallIx[c], elabCallD[c], cn, ct, k)
@@ -2044,8 +2047,12 @@ function elabSelfRow(
 // Replaces the mint facts with one per call each instance makes through a parameter it binds to
 // a function set: the set, the call's argument types and each member's result there, so the tag
 // decision sees every call an instance makes. The number of facts noted.
+// The functions some set of functions holds, read once per `elabMintFacts`.
+let elabMintValueFns: i32[] = []
+
 export function elabMintFacts(): i32 {
   mintReset()
+  elabMintValueFns = elabFnSetMembers()
   elabMintCalls = Map()
   elabMintSets = Map()
   let n = 0
@@ -2341,8 +2348,18 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const at = elabMintCalls[ix] ?? []
   at.push(k)
   elabMintCalls[ix] = at
-  if (elabMintSets[ix] ?? fnTagSetOfTy(st)) != fnTagSetOfTy(st) {
-    mintSetPartialNote(elabMintSets[ix] ?? -1)
+  // One call through two sets in two instances: two singletons each take their own instance's
+  // arms; a wider set, a callee read out of a holder, or a caller itself held as a value shares
+  // the call's arms with the other, so both stay closures.
+  const was = elabMintSets[ix] ?? fnTagSetOfTy(st)
+  if (
+    was != fnTagSetOfTy(st)
+    && (elabFnSetOf(st).length > 1
+      || fnTagMembers(was).length > 1
+      || root != cf
+      || i32ListHas(elabMintValueFns, decl))
+  ) {
+    mintSetPartialNote(was)
     mintSetPartialNote(fnTagSetOfTy(st))
   }
   elabMintSets[ix] = fnTagSetOfTy(st)
@@ -3795,10 +3812,33 @@ export function elabRetOf(k: i32): i32 {
   if ft < 0 || ft >= T.tys.length { return -1 }
   const f = tyAt(ft)
   if !(f is TyFunc) { return -1 }
-  const r = elabSubstClosed(f.fnRet, k)
+  let r = elabSubstClosed(f.fnRet, k)
+  if r < 0 { r = elabRetOfValues(k) }
   if r < 0 { return -1 }
   const kd = recKeptFnDstOf(ekDecl[k], r)
   if kd >= 0 { kd } else { r }
+}
+
+// The type every value instance `k`'s body hands back has there, when each is a call through a
+// parameter and they agree and close: the signature leaves such a result open; else -1.
+function elabRetOfValues(k: i32): i32 {
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return -1 }
+  const vs: i32[] = []
+  collectRetValues(dn.fnBody, vs)
+  let t = -1
+  for v in vs {
+    const vn = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { nodeAt(dn.fnBody) }
+    if !(vn is Call) { return -1 }
+    const pd = identDeclOf(parenPeelIx(vn.callFn))
+    if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return -1 }
+    const vt = elabNodeTy(v, k)
+    if vt < 0 { return -1 }
+    const w = widenLitTy(vt)
+    if t >= 0 && !tySame(t, w) { return -1 }
+    t = w
+  }
+  t
 }
 
 // Node `ix`'s type at the instance `fnIx` is, or -1 where its elaboration leaves it open. A
