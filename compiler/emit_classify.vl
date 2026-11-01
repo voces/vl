@@ -6724,11 +6724,9 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   // from the array's element type so `p[i] != null` narrows against `-1`, not a bare null.
   match e {
     Index => {
-      // An element or map value whose cell holds the niche.
-      if readStoreOf(exprIx, fnIx) == "nullitatom" { return true }
-      // …and a bare `m[k]` over `{[string]: K}` reads the same niche: a missing key is null,
-      // via the same `-1` miss value.
-      if mapTyValIsLitUnion(mapRecvTyIn(e.idxArr, fnIx)) { return true }
+      // An element or map value whose cell holds the niche, or a bare `m[k]` over `{[string]: K}`
+      // whose miss reads `-1`: the producer `readStoreOf` names "nullitatom" from, asked alone.
+      if idxReadNulLitAtom(e, fnIx) > 0 { return true }
     }
     // A fused `m[k] ?? d` read over `{[string]: K | null}` yields the niche i32, so
     // `const t = m[k] ?? d` narrows with `!= null` — the same fused-read home `m.get(k) ?? d` shares.
@@ -6751,7 +6749,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     }
     // A call whose result the callee hands back as the niche.
     Call => {
-      return readStoreOf(exprIx, fnIx) == "nullitatom"
+      return callResultIsNulLitAtom(unwrapParen(exprIx), fnIx)
     }
     Ident => {
       // A CAPTURED variable, resolved against the enclosing frame's binding — the niche twin of
@@ -6791,7 +6789,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     // receiver and the `is`-narrowed variant receiver (`memberFieldCode` resolves both), so
     // `const t0 = v.f` binds the niche and its `!= null` narrows against `-1`.
     Member => {
-      return readStoreOf(exprIx, fnIx) == "nullitatom"
+      return fieldReadIsNulLitAtom(unwrapParen(exprIx), fnIx)
     }
     // A `?.` whose leaf is a literal-union atom field, nullable or not, is the same niche:
     // `emitOptMemberValue` yields the field's atom or `-1` (D3457).
@@ -8513,9 +8511,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       return readStoreOf(exprIx, fnIx) == "litatom"
     }
     Call => {
-      // A call's result is an atom where its storage is one. `readStoreOf` is `readRepOf`'s store
-      // half alone, without the conversions a hot caller need not pay for.
-      return readStoreOf(exprIx, fnIx) == "litatom"
+      // A call's result is an atom where its storage is one. A niche result is claimed above, so
+      // this asks `callResultIsLitAtom`, the producer `readStoreOf` names "litatom" from, alone.
+      return callResultIsLitAtom(e, unwrapParen(exprIx), fnIx)
     }
     // A cast is an atom exactly when its result reps as one.
     AsExpr => {
@@ -15311,9 +15309,18 @@ function memberReadIsLitAtom(e: Member, exprIx: i32, fnIx: i32): boolean {
   false
 }
 
+// Whether field read `rx` reads a cell holding the `K | null` niche.
+function fieldReadIsNulLitAtom(rx: i32, fnIx: i32): boolean {
+  fieldCodeIsNulLitAtom(memberFieldCode(rx, fnIx))
+}
+
+// Whether a field of code `fc` holds the `K | null` niche: an atom id or the `-1` null.
+function fieldCodeIsNulLitAtom(fc: i32): boolean { fc == FC_NUL_LIT_UNION }
+
 // The kind a field read's storage holds, by its field code.
 function readFieldStoreKind(rx: i32, fnIx: i32): string {
   const fc = memberFieldCode(rx, fnIx)
+  if fieldCodeIsNulLitAtom(fc) { return "nullitatom" }
   // An interned literal-union id, which the code column alone spells as a plain i32 field; a
   // receiver with no field code (an instance's hole) is asked too.
   if gLitUnionUsed != 0 && (fc == FC_I32 || fc < 0) {
@@ -15322,7 +15329,6 @@ function readFieldStoreKind(rx: i32, fnIx: i32): string {
       if memberReadIsLitAtom(fm, rx, fnIx) { return "litatom" }
     }
   }
-  if fc == FC_NUL_LIT_UNION { return "nullitatom" }
   if fc == FC_UNION { return "union" }
   if fc == FC_MAP { return "map" }
   if fc == FC_NUL_MAP { return "nulmap" }
@@ -15434,7 +15440,7 @@ function callResultIsLitAtom(e: Call, exprIx: i32, fnIx: i32): boolean {
 // Whether call `rx` returns the `K | null` niche: its result reps as one and its callee's
 // signature does not box it.
 function callResultIsNulLitAtom(rx: i32, fnIx: i32): boolean {
-  if !nodeRepIsNulAtom(rx, fnIx) { return false }
+  if gLitUnionUsed == 0 || !nodeRepIsNulAtom(rx, fnIx) { return false }
   const k = cloCallSigKey(rx, fnIx)
   k == "" || sigKeyRetKind(k) != "union"
 }
@@ -15447,21 +15453,27 @@ function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
   ""
 }
 
-// Whether index read `e` reads a cell holding the `K | null` niche: an element of a nullable
-// literal-union list or a value of a map whose values are one.
-function idxReadIsNulLitAtom(e: Index, fnIx: i32): boolean {
-  if idxRecvIsStrList(e.idxArr, fnIx) { return false }
-  if nodeArrayElemIsNulLitUnion(e.idxArr) { return true }
-  if tyIsNulLitUnionNiche(holeNulLitElemTy(e.idxArr, fnIx)) { return true }
-  mapTyValIsNulLitUnion(mapRecvTyIn(e.idxArr, fnIx))
+// How index read `e` reads the `K | null` niche: 2 from a cell holding it (an element of a
+// nullable literal-union list or a value of a map whose values are one), 1 from a
+// `{[string]: K}` cell whose missing key reads `-1`, 0 not at all.
+function idxReadNulLitAtom(e: Index, fnIx: i32): i32 {
+  if gLitUnionUsed == 0 { return 0 }
+  if nodeArrayElemIsNulLitUnion(e.idxArr) { return 2 }
+  if tyIsNulLitUnionNiche(holeNulLitElemTy(e.idxArr, fnIx)) { return 2 }
+  const mt = mapRecvTyIn(e.idxArr, fnIx)
+  if mapTyValIsNulLitUnion(mt) { return 2 }
+  if mapTyValIsLitUnion(mt) { return 1 }
+  0
 }
 
 // The kind an element or map-value read's slot holds.
 function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
-  // The `K | null` niche: an atom id or the `-1` null.
-  if idxReadIsNulLitAtom(e, fnIx) { return "nullitatom" }
-  // An interned literal-union id: an atom list's element or an atom-valued map's value.
-  if gLitUnionUsed != 0 && idxReadIsLitAtom(e, rx, fnIx) { return "litatom" }
+  // An interned literal-union id: an atom list's element or an atom-valued map's value, and the
+  // `K | null` niche where the cell also holds the `-1` null.
+  if gLitUnionUsed != 0 && idxReadIsLitAtom(e, rx, fnIx) {
+    if idxReadNulLitAtom(e, fnIx) == 2 { return "nullitatom" }
+    return "litatom"
+  }
   if exprRefArray(e.idxArr, fnIx) {
     const k = refListElemKind(e.idxArr, fnIx)
     if k != null { return k }
