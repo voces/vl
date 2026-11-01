@@ -129,6 +129,20 @@ const ANNOT = `const f = (x: i32): i32 => x + 1
 print(f(2))
 `;
 
+// A function whose body an earlier index write checked on demand, through the `"[]="` that calls
+// it: pass 2's skipped re-check keeps the function type that check recorded.
+const ON_DEMAND = `type IV = { base: i32 }
+function fl(n: i32) {
+  const out: i32[] = [0]
+  out[0] = n
+}
+function setI(v: i32) { print(v) }
+function "[]="(self: IV, i: i32, v: i32) { setI(v) }
+function "[]"(self: IV, i: i32): i32 { i }
+fl(1)
+setI(3)
+`;
+
 Deno.test({
   name: "fn-ret shadow: classes",
   ignore,
@@ -147,6 +161,13 @@ Deno.test({
       DROP_NONE,
       true,
       "agree | __lambda_0=1; no result recorded, instance or nested | lap=1",
+    );
+    expectRows(
+      "on demand",
+      ON_DEMAND,
+      DROP_NONE,
+      true,
+      "agree | []=@IV=1; agree | []@IV=1; agree | fl=1; agree | setI=1",
     );
     expectRows("stub", STUB, DROP_NONE, true, "agree | id=1; agree | keep=1");
     expectRows(
