@@ -22,7 +22,7 @@ set -uo pipefail
 
 MODES=${MODES:-inherit gated tree}
 # The jobs a `tree` verdict skips on master; each must have passed on the PR's run.
-TREE_SKIPS="ci-native ci-release-shape checks checks-suites ci-distilled ci-embed-seed"
+TREE_SKIPS="ci-native ci-release-shape checks checks-suites ci-distilled ci-witnesses ci-embed-seed"
 WAIT=${VERDICT_WAIT:-180}
 POLL=${VERDICT_POLL:-15}
 

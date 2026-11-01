@@ -103,7 +103,7 @@ export const isaEnv = (): Record<string, string> => {
 /**
  * The environment a native `vl` spawn takes: `RUST_BACKTRACE` holds a host panic
  * to one line, and `VL_STD` / `VL_COMPILER_WASM` pin both resolutions to THIS
- * tree. `VL_ISA` (the seed engine's pinned ISA)
+ * tree. `VL_ISA` (the pinned ISA of the seed and program engines)
  * rides along when set, so a `clearEnv` spawn reads the sidecar the run warmed
  * instead of JITing the seed. `Deno.Command` merges these over the inherited
  * environment.

@@ -665,7 +665,7 @@ import {
   nulNumScalarUnionName,
   nulNumScalarUnionRowTy,
 } from "./check_ty_rep"
-import { nodeTyPinIxOf, tyIsWriteLandRead } from "./check_hole_pins"
+import { tyIsWriteLandRead } from "./check_hole_pins"
 import { recFreshDeclOf } from "./check_rec_fresh"
 import { recArgRepOf, recBuildTyOf } from "./check_rec_rows"
 import { valueUnionRetName } from "./check_ret_names"
@@ -685,6 +685,7 @@ import {
   fnTagCallSetOf,
   fnTagHoldsTy,
   fnTagListTy,
+  fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
   fnTagSetOfTy,
   fnTagTyIsTagged,
@@ -1912,16 +1913,16 @@ function monoCoalJoinPinName(ix: i32): string {
   monoUnionPinName(ix)
 }
 
-// The pin of a `??` at `ix` typed at a hole whose banked read is a union or a nullable, which
-// no instance row records: the join the collect pass registered for it, or "".
-function monoHoleCoalPinName(ix: i32): string {
+// The join of a `??` at `ix` typed at a hole that instance `fnIx` binds to a union or a nullable:
+// the row the collect pass registered for it, or "".
+function monoHoleCoalPinName(ix: i32, fnIx: i32): string {
   if ix < 0 { return "" }
   const n = nodeAt(ix)
   if !(n is BinExpr) { return "" }
   if n.binOp != "??" { return "" }
   const t = nodeTyIxOf(ix)
   if t < 0 || t >= T.tys.length || !(tyAt(t) is TyVar) { return "" }
-  const p = nodeTyPinIxOf(ix)
+  const p = nodeTyInOf(ix, fnIx)
   if p < 0 || p == t || !monoTyIsUnionShaped(p) { return "" }
   monoUnionPinNameOfTy(p)
 }
@@ -2726,7 +2727,7 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
   }
   // An `i32` niche, a nullable literal union or `boolean | null`: the annotation's name and the
   // scalar cascade both name its raw `i32`, or its non-null half (D2998, D2985).
-  const hcp = monoHoleCoalPinName(cax)
+  const hcp = monoHoleCoalPinName(cax, fnIx)
   if hcp != "" { return hcp }
   const nluTy = argNichePinTyOf(cax, fnIx)
   if nluTy >= 0 {
@@ -3961,6 +3962,7 @@ function monoRemintCall(ix: i32, callee: i32, args: i32[]): i32 {
   if n is Call {
     const nc = ufcsSiteCarry(mkCallN(callee, args, n.callArgNames, n.pos), ix)
     monoNoteCallTpl(ix, nc)
+    nodeSrcNote(nc, ix)
     return nc
   }
   -1
@@ -9717,7 +9719,11 @@ function monoMakeInstanceParams(
         // The pinned name differs from the written annotation exactly when
         // a type param substituted through it (bare `T`, `T[]`, or a
         // composite like `Box<T>`); a concrete annotation keeps its node.
-        if pinned[pj] == tyNameOf(p3.parType) {
+        if fnTagTyIsTagged(pinTys[pj]) {
+          // A type parameter bound to a tagged set is the set itself, as at a hole.
+          nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
+          synthed = true
+        } else if pinned[pj] == tyNameOf(p3.parType) {
           nt = p3.parType
         } else {
           // The argument's type is one member of a union parameter; the explicit type
@@ -21836,6 +21842,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         declTys,
       )
       monoDefaultTyParamsOnlyGenFns(fn, params, args, ctx, tvN, tvV, tvT)
+      monoPreBindTaggedSets(fn, args, tvN, tvV, tvT)
       let oDecl = -1
       if origFe >= 0 && origFe < monoOrigNode.length {
         oDecl = monoOrigNode[origFe]
@@ -22010,6 +22017,32 @@ function monoDefaultTyParamsOnlyGenFns(
         monoBindTyParamDefault(tp, tvN, tvV, tvT)
       }
     }
+  }
+  0
+}
+
+// Binds each type parameter that alone annotates a parameter handed a tagged set to the set
+// itself, as a hole handed one is pinned: the instance calls each member directly.
+function monoPreBindTaggedSets(
+  fn: FuncDecl,
+  args: i32[],
+  tvN: string[],
+  tvV: string[],
+  tvT: i32[],
+) {
+  let i = 0
+  while i < args.length && i < fn.fnParams.length {
+    const p = nodeAt(fn.fnParams[i])
+    const st = monoArgTaggedSetTy(args[i])
+    if p is Param && st >= 0 && p.parType >= 0 && fnTagOwnTyParamAlone(fn, i) {
+      const tn = nodeAt(p.parType)
+      if tn is TypeRef && !strListHas(tvN, tn.tyName) {
+        tvN.push(tn.tyName)
+        tvV.push(tyToStr(st))
+        monoTvTyLast(tvN, tvT, st)
+      }
+    }
+    i = i + 1
   }
   0
 }
@@ -22316,6 +22349,14 @@ function monoPinAnnotatedParam(
       }
     }
   } else {
+    // A tagged set handed to a parameter its own type parameter alone annotates is pinned at
+    // the set, as a hole handed one is.
+    const setTy = if ann == tp && fnTagOwnTyParamAlone(fn, i) { monoArgTaggedSetTy(args[i]) } else { -1 }
+    if setTy >= 0 {
+      pinned.push(tyToStr(setTy))
+      pinTys.push(setTy)
+      return 0
+    }
     let an2 = ""
     let an2Ty = -1
     let genPin = false
