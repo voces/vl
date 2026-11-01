@@ -40,7 +40,8 @@ const LOCAL: Record<string, string> = {
   "plumb-shape cost":
     "ci-cost runs it with --require-fuel and no native binaryen",
   "rep-fuzz": "CI does not run it",
-  "filed witnesses": "CI does not run it",
+  "filed witnesses":
+    "ci-witnesses grades it in two --shard runs, not the one command the row runs",
   "splice scan": "CI does not run it",
   "distilled corpus":
     "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
