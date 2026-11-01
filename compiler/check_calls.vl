@@ -1394,6 +1394,19 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     }
   }
   if !inferQuiet { adoptArgLits(cDecl, params, args, vNames, vTys) }
+  // A call that binds nothing still answers its callee's deferred return, each parameter it left
+  // open read as `never`: a value the body returns as one is one it cannot hold (D14802).
+  if !inferQuiet && vNames.length == 0 && cfn is Ident {
+    const sd = identFnDeclOf(n.callFn)
+    if sd >= 0 && !nestParentOf.has(sd) {
+      const nNames: string[] = []
+      const nTys: i32[] = []
+      withUnboundAsNever(sd, vNames, vTys, nNames, nTys)
+      if nNames.length > 0 {
+        validateRetCstrs(nNames, nTys, ix, sd, cfn.identName)
+      }
+    }
+  }
   if vNames.length > 0 {
     elabHoleRowDropDecl(pinRows0, cDecl)
     retTy = callFtyPinCstrs(
@@ -2215,7 +2228,10 @@ function callFtyPinCstrs(
   forElemArgCstrs(n.callFn, ft, vNames, vTys)
   // The declared return rides the same pin: the body's mismatch check is vacuous under
   // a hole, and this is the first position that knows the instance (D551).
-  validateRetCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  const rNames: string[] = []
+  const rTys: i32[] = []
+  withUnboundAsNever(namedFn, cNames, cTys, rNames, rTys)
+  validateRetCstrs(rNames, rTys, ix, cstrCallee, cstrWho)
   // The destination seam, for the same reason: a value landing in a hole-typed local /
   // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
   validateLetCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
@@ -3958,4 +3974,48 @@ function adoptArgLits(
     i = i + 1
   }
   0
+}
+
+// `names`/`tys` onto `outN`/`outT`, then each type parameter of the declaration `fd` they leave
+// unbound, or bind only to a bare inference hole, as `never`: no value has that type (D14802).
+function withUnboundAsNever(
+  fd: i32,
+  names: string[],
+  tys: i32[],
+  outN: string[],
+  outT: i32[],
+) {
+  let k = 0
+  while k < names.length {
+    outN.push(names[k])
+    outT.push(tys[k])
+    k = k + 1
+  }
+  if fd < 0 || fd >= P.nodes.length { return 0 }
+  const d = nodeAt(fd)
+  if d is FuncDecl {
+    for p in d.fnTyParams {
+      let bound = false
+      let j = 0
+      while j < names.length {
+        if names[j] == p && j < tys.length && !bareInferHole(tys[j]) {
+          bound = true
+        }
+        j = j + 1
+      }
+      if !bound {
+        outN.push(p)
+        outT.push(TY_NEVER)
+      }
+    }
+  }
+  0
+}
+
+// Whether `t` is an inference hole and nothing else.
+function bareInferHole(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return true }
+  const tv = tyAt(t)
+  if tv is TyVar { return tv.tvName.length == 0 || tv.tvName[0] == "?"[0] }
+  false
 }
