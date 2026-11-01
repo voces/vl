@@ -916,6 +916,7 @@ import {
   strListIndexOf,
 } from "./listutil"
 import {
+  flattenVariantsInto,
   intLitUnionBasesOf,
   isNullTy,
   nonNullTy,
@@ -10008,6 +10009,32 @@ function mintVariantRows(
   0
 }
 
+// Whether every member of union `ty` is a record, a primitive, a literal or `null`: no list, map
+// or function arm, whose rows intern under a declaring alias's own name.
+function unionArmsAreRecordsOrScalars(ty: i32): boolean {
+  const xs: i32[] = []
+  flattenVariantsInto(ty, xs)
+  if xs.length < 2 { return false }
+  for x in xs {
+    if x >= 0 {
+      const t = tyAt(x)
+      if !(t is TyObj || t is TyPrim || t is TyLit) { return false }
+    }
+  }
+  true
+}
+
+// Whether each record arm `s` names is already a variant by its own name, so a row bound in place
+// of this declaration's own registration leaves no arm without one. A layout twin under another
+// name (`V = D | S` beside `U = C | S`) is not.
+function declArmsHaveVariants(s: UnionDecl): boolean {
+  for m in s.udVariants {
+    const mt = declTyIxOfName(m)
+    if mt >= 0 && tyAt(mt) is TyObj && variantIndexOf(m) < 0 { return false }
+  }
+  true
+}
+
 // Register the declared union `s` (at statement `stmtIx`): its row, member set and key, its
 // struct variants and their fields, and the value boxes, ref-array and map arms its members
 // need. A struct alias or an alias that denotes one member or one list gets no row. Returns 0,
@@ -10029,13 +10056,21 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   // Field unions of the arms register first, so they push their own rows before this union's
   // slice; arena-rooted since a named union carries no annotation node (`rootUnionDeclMembers`).
   if rootUnionDeclMembers(stmts, s.udName) < 0 { return -1 }
-  // A value-union alias whose type key already has a row names that row: one row per type.
+  // An alias whose type key already has a row names that row: one row per type. A value or
+  // literal union binds to a row with no variants; a union of records and scalars binds to a row
+  // whose variants are its own arms. A list, map or function arm keeps its row (D14741).
   const dty = declTyIxOfName(s.udName)
-  if dty >= 0 && (isValueUnionTyOr(dty) == 1 || tyIsLitUnion(dty)) {
+  if dty >= 0 {
     const kr = unRowOfTyKey(dty)
-    if kr >= 0 && unVarCount[kr] == 0 {
-      unNameBindRow(s.udName, kr)
-      return 0
+    if kr >= 0 {
+      const plain = isValueUnionTyOr(dty) == 1 || tyIsLitUnion(dty)
+      if (
+        (plain && unVarCount[kr] == 0)
+        || (!plain && unionArmsAreRecordsOrScalars(dty) && declArmsHaveVariants(s))
+      ) {
+        unNameBindRow(s.udName, kr)
+        return 0
+      }
     }
   }
   unNamesPush(s.udName)
