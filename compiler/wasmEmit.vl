@@ -1,3 +1,4 @@
+import { repSlotOfKind } from "./emit_rep_slot"
 import { arrLitDestTy, arrLitUnionDestTaken } from "./check_bind_rows"
 import { mintCallSoleSet } from "./check_mint"
 import {
@@ -50,6 +51,7 @@ import {
   condProvenTrue,
   ctxFieldNameOf,
   ctxFieldOwnerOf,
+  listCopyTyOf,
   mapUnboxTyOf,
   narListReadsDecl,
   nodeCtxTyIxOf,
@@ -1190,7 +1192,6 @@ import {
   variantHasDiscrimField,
 } from "./emit_map_twins"
 import {
-  mvValInnerRlSlotAt,
   mvValTyIxAt,
   mvValUnionHasNull,
   nonNulBaseOf,
@@ -1470,6 +1471,7 @@ import {
   identFrom,
   memberDeclOf,
   memberMethodOf,
+  nodeSrc,
   sidOfNode,
 } from "./symbols"
 import {
@@ -1909,21 +1911,8 @@ function emitStructFieldValueUnder(
   ) {
     return 0
   }
-  // The field's ref-list row, which the read-only covariant copy below converts into.
-  let fieldRow = 0
-  if scode == FC_REF_LIST {
-    let fslot = sFieldRefSlot(si, fi)
-    if fslot < 0 { fslot = 0 }
-
-    if fslot >= rlElemTyIx.length {
-      return emitFail(
-        "emitProgram: ref-list field element type is not interned",
-      )
-    }
-    fieldRow = fslot
-  } else if scode == FC_NUL_REF_LIST {
-    const fslot28 = sFieldRefSlot(si, fi)
-    fieldRow = if fslot28 < 0 { 0 } else { fslot28 }
+  if scode == FC_REF_LIST && sFieldRefSlot(si, fi) >= rlElemTyIx.length {
+    return emitFail("emitProgram: ref-list field element type is not interned")
   }
 
   if scode == FC_UNION {
@@ -1990,29 +1979,19 @@ function emitStructFieldValueUnder(
   if nulNicheRecoverOwed(fieldCodeVKind(scode), valIx, fnIx) {
     fbRefAsNonNull()
   }
-  // read-only covariance at the field boundary (D791), against this field's own row.
-  emitFieldListWidenSite(body, valIx, fnIx, scode, fieldRow)
+  // the scalar covariant copy at the field boundary (D965).
+  emitFieldListWidenSite(body, valIx, fnIx, scode)
   0
 }
 
-// The read-only covariant copy a list value owes on its way into a struct field of wasm-type
-// code `scode` whose ref-list row is `refSlot`: the ref copy for code 5 (D791), the scalar copy
-// for the list codes (D965). Shared by the construct and the field store (D2163).
+// The scalar covariant copy a list value owes on its way into a struct field of wasm-type code
+// `scode` (D965). Shared by the construct and the field store (D2163).
 function emitFieldListWidenSite(
   body: u8[],
   valIx: i32,
   fnIx: i32,
   scode: i32,
-  refSlot: i32,
 ): boolean {
-  if scode == FC_REF_LIST {
-    return emitRefListWidenSite(
-      body,
-      valIx,
-      exprEmittedRefListSlot(valIx, fnIx),
-      refSlot,
-    )
-  }
   // The i32 list and the distinct scalar backings widen; a string or ref list field does not.
   const sfk = listRepOfFieldCode(scode)
   if sfk == null { return false }
@@ -14308,18 +14287,7 @@ function emitMapSetValExpr(
   if mvArmOwed && mslot >= 0 {
     emitNarrowedArmUnboxTo(mvValElemHeapOf(mslot), valIx, fnIx)
   }
-  // Read-only covariance at the map-value boundary (D791) — `mU["k"] = lv1` over a
-  // `{[string]: Shape[]}` — targets the same `mvValInnerRlSlotAt` row the build seed above
-  // reads; it declines for every non-ref-list value type without parsing.
   if mslot >= 0 {
-    const mvWiden = mvValInnerRlSlotAt(mslot)
-    const mvSrc = exprEmittedRefListSlot(valIx, fnIx)
-    if mvWiden >= 0 {
-      emitRefListWidenSite(body, valIx, mvSrc, mvWiden)
-    } else {
-      // A list of union boxes has no row of its own here; its copy keeps the source's type.
-      emitRefListWidenSite(body, valIx, mvSrc, mvSrc)
-    }
     // the scalar copy at the same boundary (D965, D2163) — `m["k"] = ints` over a
     // `{[string]: readonly f64[]}`, keyed by the value list's own element kind.
     const mvLK = mvListValKind(mslot)
@@ -20001,6 +19969,10 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
+  if exprIx != listCopyHeld {
+    const lct = listCopyAtNode(exprIx)
+    if lct >= 0 { return emitListCopied(body, exprIx, lct, fnIx) }
+  }
   if exprIx == isRecvStagedIx {
     fbLocalGet(isRecvStagedSlot)
     if isRecvStagedNonNull { fbRefAsNonNull() }
@@ -25178,13 +25150,6 @@ function emitAssignGlobal(body: u8[], a: BinExpr, lhsIx: i32, fnIx: i32) {
     // module globals) — distinct from the global-init copy in `emit_sections`, since
     // a re-assignment is ordinary code and a const initializer a wasm constexpr.
     emitScalarListWidenSite(body, a.binRight, fnIx, gaKind)
-    // and the ref copy (D791) at the same boundary, the local assignment's twin (D2163).
-    emitRefListWidenSite(
-      body,
-      a.binRight,
-      exprEmittedRefListSlot(a.binRight, fnIx),
-      exprEmittedRefListSlot(lhsIx, fnIx),
-    )
     // the narrowed-arm unbox at the same boundary (D1031) — `gv = s` under `if s is
     // Circle`, between two module globals; `armDestHeapOf` reads the destination pair.
     if !gaCoerced && narrowedArmNeedsUnbox(a.binRight, fnIx) {
@@ -25307,14 +25272,6 @@ function emitAssignIdent(
   } else {
     if emitAssignLocalSeeded(body, a, fnIx) < 0 { return -1 }
   }
-  // read-only covariance at the ASSIGNMENT boundary (D791) — `aU = lv1` over a
-  // `let aU: Shape[]` and a `Circle[]`-repped `lv1`.
-  emitRefListWidenSite(
-    body,
-    a.binRight,
-    exprEmittedRefListSlot(a.binRight, fnIx),
-    exprEmittedRefListSlot(lhsIx, fnIx),
-  )
   // the scalar dual (D965) — `b = e` over a `let b: f64[]`. The destination is an
   // EXPRESSION here, not an annotation or a cell column, so its element kind comes
   // from classifying the LHS — the same classifier the source side uses.
@@ -25792,14 +25749,8 @@ function emitAssignMember(
   if nulNicheRecoverOwed(fieldCodeVKind(fscode), a.binRight, fnIx) {
     fbRefAsNonNull()
   }
-  // the read-only covariant copy at the field-store boundary, the construct's twin (D2163)
-  emitFieldListWidenSite(
-    body,
-    a.binRight,
-    fnIx,
-    fscode,
-    sFieldRefSlot(si, fieldIdx),
-  )
+  // the scalar covariant copy at the field-store boundary, the construct's twin (D2163)
+  emitFieldListWidenSite(body, a.binRight, fnIx, fscode)
   fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
   return 0
 }
@@ -27869,6 +27820,36 @@ function identBuiltAtUnionList(srcIx: i32): boolean {
   k >= 0 && nodeAt(k) is LetDecl && letInitUnionListTy(k, cwKeyFrame(k)) >= 0
 }
 
+// The list type the delivery of node `ix` copies its list into (`recordListCopy`), or the one
+// recorded at the node a rewrite or mono copy made `ix` from; -1 for none.
+function listCopyAtNode(ix: i32): i32 {
+  const t = listCopyTyOf(ix)
+  if t >= 0 { return t }
+  const o = nodeSrc[ix] ?? -1
+  if o < 0 { return -1 }
+  listCopyTyOf(o)
+}
+
+// The node `emitListCopied` is emitting before its conversion, or -1.
+let listCopyHeld = -1
+
+// `emitExpr` for a list value whose delivery the checker recorded as a copy into `lct`: the
+// value at its own row, then converted to the destination's row where the two storages differ.
+// One conversion point for every delivery position. Returns 0, or -1 failed.
+function emitListCopied(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
+  const held = listCopyHeld
+  listCopyHeld = exprIx
+  const r = emitExpr(body, exprIx, fnIx)
+  listCopyHeld = held
+  if r < 0 { return -1 }
+  const src = exprEmittedRefListSlot(exprIx, fnIx)
+  let dst = repSlotOfKind("reflist", lct)
+  if dst < 0 { dst = src }
+  emitRefListWidenSite(body, exprIx, src, dst)
+  if emitFailed { return -1 }
+  0
+}
+
 // The delivery-site half: a value just emitted at ref-list slot `srcSlot` is being
 // delivered into a `dstSlot` destination. Widen it in place when the pair is widenable
 // and the whole-program write scan licenses it; a widenable pair the scan declines is a
@@ -28028,16 +28009,6 @@ function emitNestedListWidenSite(
 ): boolean {
   if rslot < 0 || rslot >= rlElemTyIx.length { return false }
   const nest = rlElemKindAt(rslot)
-  if nest == RLK_REF_LIST {
-    const inner = rlElemInnerSlot(rslot)
-    if inner < 0 { return false }
-    return emitRefListWidenSite(
-      body,
-      valIx,
-      exprEmittedRefListSlot(valIx, fnIx),
-      inner,
-    )
-  }
   let nse: VKind | null = null
   if nest == RLK_I32_LIST { nse = "i32" }
   if nest == RLK_F64_LIST { nse = "f64" }
@@ -28918,30 +28889,19 @@ function emitReturnCoercedValue(
   0
 }
 
-// The widenings at a return boundary, after the value is emitted: a ref-list (`retRlSlot`) or
-// scalar-list (`retSLKind`) covariance copy, and the narrowed-arm unbox to `retArmHeap` when
-// no concrete variant (`retVi`) already served it.
+// The widenings at a return boundary, after the value is emitted: a scalar-list (`retSLKind`)
+// covariance copy, and the narrowed-arm unbox to `retArmHeap` when no concrete variant (`retVi`)
+// already served it.
 function emitReturnBoundaryWidens(
   body: u8[],
   retArg: i32,
   fnIx: i32,
-  retRlSlot: i32,
   retSLKind: VKind | null,
   retArmHeap: i32,
   retVi: i32,
 ) {
-  // read-only covariance at the RETURN boundary (D791) — `return lv1` from a `(): Shape[]`.
-  if retRlSlot >= 0 {
-    emitRefListWidenSite(
-      body,
-      retArg,
-      exprEmittedRefListSlot(retArg, fnIx),
-      retRlSlot,
-    )
-  }
-  // the scalar dual (D965) — `return e` from a `(): f64[]`. Read off the ANNOTATION for
-  // the reason `retRlSlot` is: the functype's own source is what keeps the widened value
-  // and the declared result in agreement by construction.
+  // the scalar copy (D965) — `return e` from a `(): f64[]`, read off the annotation: the
+  // functype's own source keeps the widened value and the declared result in agreement.
   if retSLKind != null {
     emitScalarListWidenSite(body, retArg, fnIx, retSLKind)
   }
@@ -29099,7 +29059,6 @@ function emitReturnValueTail(
   fnIx: i32,
   fnPos: i32,
   retArmHeap: i32,
-  retRlSlot: i32,
   retSLKind: VKind | null,
 ): i32 {
   const fn = nodeAt(fnIx)
@@ -29166,15 +29125,7 @@ function emitReturnValueTail(
       return -1
     }
   }
-  emitReturnBoundaryWidens(
-    body,
-    retArg,
-    fnIx,
-    retRlSlot,
-    retSLKind,
-    retArmHeap,
-    rf.retVi,
-  )
+  emitReturnBoundaryWidens(body, retArg, fnIx, retSLKind, retArmHeap, rf.retVi)
   // The caller's context comes back whole: a seed a `return { … }` or `return Map()` leaves
   // unconsumed would otherwise type the next function's `null` (D2564).
   0
@@ -29216,32 +29167,11 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     }
   }
   if fn is FuncDecl { retArmHeap = returnArmHeapOf(fn, fnPos) }
-  // the result's ref-list row, for the read-only-covariance widening (D791): the
-  // annotation's row, or — for an un-annotated function — `criClassify`'s recorded
-  // `("reflist", slot)`, the same pair `emitOneFuncType` reads for the result valtype.
-  let retRlSlot = -1
   let retSLKind: VKind | null = null
   if fn is FuncDecl {
-    if fn.fnRet >= 0 {
-      retSLKind = vtKindOfType(fn.fnRet)
-      if vtKindOfType(fn.fnRet) == "reflist" {
-        retRlSlot = tyAnnRefListSlot(fn.fnRet)
-      }
-    } else if fnPos >= 0 && fnPos < fRetKind.length {
-      if fRetKind[fnPos] == "reflist" && fnPos < fRetStructIdx.length {
-        retRlSlot = fRetStructIdx[fnPos]
-      }
-    }
+    if fn.fnRet >= 0 { retSLKind = vtKindOfType(fn.fnRet) }
   }
-  emitReturnValueTail(
-    body,
-    retArg,
-    fnIx,
-    fnPos,
-    retArmHeap,
-    retRlSlot,
-    retSLKind,
-  )
+  emitReturnValueTail(body, retArg, fnIx, fnPos, retArmHeap, retSLKind)
 }
 
 // The member texts of the `K | null` result of function `fnIx`: its annotation's (a
@@ -30167,18 +30097,6 @@ function emitLetDelivery(
   letArmOwed: boolean,
   letArmCell: boolean,
 ) {
-  // read-only covariance at the BINDING boundary (D791): the value on the stack is a
-  // ref list at one row and this binding's cell is another. `const b: Shape[] = a` over
-  // a `Circle[]` — D773's witness — is `vl check` rc 0 and INVALID WASM on master, and
-  // `emitRefListWidenSite` converts it where the copy is unobservable.
-  if localIsRef[slot] == "reflist" {
-    emitRefListWidenSite(
-      body,
-      s.letInit,
-      exprEmittedRefListSlot(s.letInit, fnIx),
-      localStructIdx[slot],
-    )
-  }
   // the scalar dual (D965) — `const b: f64[] = e` over an `i32[]`. The cell's own kind IS
   // the destination list kind, so this needs no second derivation.
   emitScalarListWidenSite(body, s.letInit, fnIx, localIsRef[slot])
@@ -33211,6 +33129,7 @@ export function emitUserGlobalSet(gi: i32) {
 // Puts this module's per-compile stashes, depths and memo cursors back to their declared
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
+  listCopyHeld = -1
   arrNewFillDepth = 0
   eqStashL = -1
   eqStashR = -1
@@ -36302,7 +36221,6 @@ function emitDirectArgValue(
   const cUNm = sd.cUNm
   const cParamNulString = sd.cParamNulString
   const cParamStr = sd.cParamStr
-  const cParamRlSlot = sd.cParamRlSlot
   const cParamSLKind = sd.cParamSLKind
   if (cParamStr || cParamNulString) && exprIsLitAtom(arg, fnIx) {
     // A literal-union atom flowing into a `string` param widens to its member string — and
@@ -36318,16 +36236,6 @@ function emitDirectArgValue(
     const argBoxToNulStr = cParamNulString && boxIsNulStrUnion(arg, fnIx)
     if emitExpr(body, arg, fnIx) < 0 { return -1 }
     if argBoxToNulStr { emitBoxToNulStr() }
-    // read-only covariance at the ARGUMENT boundary (D791) — `d773_readonly_param`:
-    // `look(xs: Shape[])` called with a `Circle[]`.
-    if cParamRlSlot >= 0 {
-      emitRefListWidenSite(
-        body,
-        arg,
-        exprEmittedRefListSlot(arg, fnIx),
-        cParamRlSlot,
-      )
-    }
     // the scalar dual (D965) — `take_f(xs: f64[])` called with an `i32[]`. Same
     // boundary, same licence, a numeric convert instead of a box.
     if cParamSLKind != null {
@@ -36397,7 +36305,6 @@ type DirectArgSeeds = {
   cParamNulString: boolean,
   cParamNulVariantIdx: i32,
   cParamStr: boolean,
-  cParamRlSlot: i32,
   cParamSLKind: VKind | null,
 }
 
@@ -36430,11 +36337,7 @@ function directArgSeedsOf(target: i32, i: i32): DirectArgSeeds {
   // A `string` param position (kind 3): a literal-union atom ARGUMENT widens to its member
   // string at the boundary (the atom-as-string-subtype edge).
   let cParamStr = false
-  // A ref-array param position's interned element ROW, for the read-only-covariance
-  // widening (D791) — the same `tyAnnRefListSlot` the build seed below reads, kept
-  // because the seed is cleared before the argument's widening can be asked.
-  let cParamRlSlot = -1
-  // The SCALAR-list dual of `cParamRlSlot` (D965) — the param's own list kind, so an
+  // A scalar-list param position's own list kind (D965), so an
   // argument whose element STORAGE differs (`i32[]` into an `f64[]` param) can take the
   // converting copy at this boundary. `""` for every non-scalar-list param, which is
   // what makes the delivery below cost nothing in the ordinary case.
@@ -36456,12 +36359,8 @@ function directArgSeedsOf(target: i32, i: i32): DirectArgSeeds {
           cUTy = nodeTyAt(cParams[i], fnStmts[target])
         }
       }
-      // A ref-array param position (`take(xs: B[])`): its ref-list row and kind.
-      const cp = nodeAt(cParams[i])
-      if cp is Param {
-        if cpK == "reflist" { cParamRlSlot = tyAnnRefListSlot(cp.parType) }
-        cParamSLKind = cpK
-      }
+      // A list param position (`take(xs: f64[])`): its list kind.
+      if nodeAt(cParams[i]) is Param { cParamSLKind = cpK }
       const cpnb = nodeAt(cParams[i])
       if cpnb is Param {
         if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
@@ -36484,7 +36383,6 @@ function directArgSeedsOf(target: i32, i: i32): DirectArgSeeds {
     cParamNulString: cParamNulString,
     cParamNulVariantIdx: cParamNulVariantIdx,
     cParamStr: cParamStr,
-    cParamRlSlot: cParamRlSlot,
     cParamSLKind: cParamSLKind,
   }
   seeds
@@ -37942,9 +37840,12 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
           || (pk == "i64" && pkPrim == "i64")
           || (pk == "f32" && pkPrim == "f32")
         ) {
+          // A literal-union list's i32 element widened to a string default takes the niche
+          // lowering, which converts the atom; the fused pop builds the default as is (D1413).
           if (
             !exprRefArray(lcallee.memObj, fnIx)
             && !exprStringArray(lcallee.memObj, fnIx)
+            && !coalesceNulAtomToStr(exprIx, fnIx)
           ) {
             return emitPopOr(body, lhsIx, e.binRight, fnIx)
           }
