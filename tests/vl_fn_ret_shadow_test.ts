@@ -82,7 +82,8 @@ f(g(2))
 `;
 
 // Two instances of one function, and a lambda inside another generic's instance: an instance
-// answers from its elaboration slot, a function nested in one from its own type there.
+// answers from its elaboration slot, a function nested in one from its own type there, and the
+// pruned template from its stub.
 const GENERIC = `function id<T>(x: T): T { x }
 function ap<T>(x: T): T {
   const k = (y: T) => y
@@ -110,6 +111,38 @@ function line(k: i32) {
 print(line(3))
 `;
 
+// A hole-parameter function whose instance's result the elaboration leaves open.
+const HOLE = `function lap(g, x) { return g(x) }
+const f = (n) => 0 - n
+print(lap(f, 4))
+`;
+
+// A generic nothing instantiates is pruned to an empty stub, void as minted (`monoStubSlots`).
+const STUB = `function id<T>(x: T): T { x }
+function keep(x: i32) { x + 1 }
+print(keep(1))
+`;
+
+// An annotated lambda: its annotation seeds the emitter's voidness, so a missing recorded
+// result there is no gap `computeVoidFns` has to fill.
+const ANNOT = `const f = (x: i32): i32 => x + 1
+print(f(2))
+`;
+
+// A function whose body an earlier index write checked on demand, through the `"[]="` that calls
+// it: pass 2's skipped re-check keeps the function type that check recorded.
+const ON_DEMAND = `type IV = { base: i32 }
+function fl(n: i32) {
+  const out: i32[] = [0]
+  out[0] = n
+}
+function setI(v: i32) { print(v) }
+function "[]="(self: IV, i: i32, v: i32) { setI(v) }
+function "[]"(self: IV, i: i32): i32 { i }
+fl(1)
+setI(3)
+`;
+
 Deno.test({
   name: "fn-ret shadow: classes",
   ignore,
@@ -120,15 +153,29 @@ Deno.test({
       GENERIC,
       DROP_NONE,
       true,
-      "agree | __lambda_1=1; agree | ap=1; agree | id$1=1; agree | id=1; " +
-        "no result recorded, instance or nested | __lambda_0=1",
+      "agree | __lambda_0=1; agree | __lambda_1=1; agree | ap=1; agree | id$1=1; agree | id=1",
     );
+    expectRows(
+      "hole instance",
+      HOLE,
+      DROP_NONE,
+      true,
+      "agree | __lambda_0=1; no result recorded, instance or nested | lap=1",
+    );
+    expectRows(
+      "on demand",
+      ON_DEMAND,
+      DROP_NONE,
+      true,
+      "agree | []=@IV=1; agree | []@IV=1; agree | fl=1; agree | setI=1",
+    );
+    expectRows("stub", STUB, DROP_NONE, true, "agree | id=1; agree | keep=1");
     expectRows(
       "tail write",
       TAIL_WRITE,
       DROP_NONE,
       true,
-      "agree | line=1; agree | nn=1; recorded value, emitter void | __lambda_0=1",
+      "agree | line=1; agree | nn=1; emit-time: tail assignment lowered void | __lambda_0=1",
     );
   },
 });
@@ -137,7 +184,20 @@ Deno.test({
   name: "fn-ret shadow: fires",
   ignore,
   fn() {
-    expectRows("plain, nothing", PLAIN, DROP_NOTHING, false, "no result recorded=2");
+    expectRows(
+      "plain, nothing",
+      PLAIN,
+      DROP_NOTHING,
+      false,
+      "no result recorded=2",
+    );
+    expectRows(
+      "annotated, nothing",
+      ANNOT,
+      DROP_NOTHING,
+      false,
+      "no result recorded, annotated=1",
+    );
     expectRows(
       "plain, all void",
       PLAIN,

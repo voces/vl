@@ -906,7 +906,7 @@ import {
   sidText,
 } from "./symbols"
 import { peelGroupParens } from "./tyname"
-import { recRepWidens } from "./check_bind_adopt"
+import { callRetRepTy, recRepWidens } from "./check_bind_adopt"
 import { holeFnArgRetAtParams, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
@@ -2051,7 +2051,7 @@ export function identReadAtomKindAt(ix: i32, fnIx: i32): i32 {
   if !uDeclared { return -1 }
   const rx = unwrapParen(ix)
   if rx < 0 || isStorageRead(rx) { return -1 }
-  if identCellVKind(rx, fnIx) != "union" { return -1 }
+  if identStoreClaimed(rx, fnIx) != "union" { return -1 }
   const pt = asgReReadPinAt(rx, fnIx)
   if pt >= 0 { readAtomAgreed(rx, pt, fnIx) } else { readTypeVerdict(rx, fnIx) }
 }
@@ -2132,7 +2132,7 @@ export function identReadContainerAt(ix: i32, fnIx: i32): i32 {
   if rx < 0 || isStorageRead(rx) { return 0 }
   const k = readContainerAgreed(rx, readTyHere(rx, fnIx), fnIx)
   if k == 0 { return 0 }
-  if identCellVKind(rx, fnIx) != "union" { return 0 }
+  if identStoreClaimed(rx, fnIx) != "union" { return 0 }
   const li = readBindingLetOf(rx, fnIx)
   if li >= 0 && readShapeKindOfTy(nodeTyAt(li, fnIx)) == k { return 0 }
   k
@@ -2628,6 +2628,9 @@ function callBuiltTy(x: i32, depth: i32): i32 {
   const fd = if u >= 0 { recInferredFnOf(u) } else { -1 }
   // A read out of a container its stores build elsewhere is that build (D14810).
   if fd < 0 {
+    // A generic call's result is its rep row's (D14733).
+    const gr = if u >= 0 && nodeAt(u) is Call { callRetRepTy(u, nodeTyIxOf(u)) } else { -1 }
+    if gr >= 0 { return gr }
     const br = if u >= 0 { recBuiltReadTy(cwPeelValue(u)) } else { -1 }
     return if br >= 0 { nonNullTy(br) } else { -1 }
   }
@@ -10296,8 +10299,8 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
     const ud = identDeclOf(exprIx)
     if ud >= 0 && nodeAt(ud) is LetDecl { return letIsUnion(ud, fnIx) }
   }
-  // An unnarrowed read asked outside the frame declaring it reads its binding's cell there.
-  if declaredSlotOf(exprIx) < 0 && readNarrowedTyAt(exprIx, fnIx) < 0 {
+  // A read asked outside the frame declaring it reads its binding's cell there, as converted.
+  if declaredSlotOf(exprIx) < 0 {
     if readSlotlessOwnLet(exprIx, fnIx) >= 0 {
       return readRepOf(exprIx, fnIx).rrRead == "union"
     }
@@ -14343,6 +14346,14 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   // The extended key (not just `fnSigKeyOf`) so a void-returning binding resolves its `>v`
   // sig, interned above; a value-eligible binding takes the same key `fnSigKeyOf` would.
   if fe >= 0 { return cloSigKeyExt(fe) }
+  // A lifted lambda answers above because it is lowered at its own signature, not its type's
+  // key, until lowering follows the recorded type (D8880). Past it, a read whose type at this
+  // instance is a closed function type is keyed by that type.
+  const rt = tyPeelNul(nodeTyAt(atIx, fnIx))
+  if rt >= 0 && tyAt(rt) is TyFunc && !tyHasTyVar(rt) {
+    const rk = sigKeyOfTy(rt)
+    if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
+  }
   // An inferred COPY of another closure binding (`const t0 = p`): chase the source so a call
   // through the intermediate binding classifies its result (nullable-closure read pattern).
   // Asked at the source's own read, so a same-named binding in a sibling block is not it (D3632).
@@ -14358,10 +14369,6 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
         if ofn is FuncDecl {
           if bodyLetReadAtSid(ofn.fnBody, csid, posAt) < 0 { srcFn = -1 }
         }
-      }
-      if srcFn < 0 && fnIx >= 0 {
-        const mk = moduleCopySigKey(srcSid)
-        if mk != "" { return mk }
       }
       const sk = calleeCloSigKeyOfRead(srcIx, srcFn)
       if sk != "" { return sk }
@@ -14387,8 +14394,8 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   if letIx >= 0 {
     const cd = nodeAt(letIx)
     if cd is LetDecl {
-      // A binding initialized by another name holds that name's value, whose key is that
-      // binding's, asked in the frame that declares this one (D3868).
+      // A module binding initialized by another name, read from inside a function, holds that
+      // module name's value, not one of the function's same-named locals (D3880).
       const isid = sidOfNode(cd.letInit)
       if (
         cd.letType < 0
@@ -14396,14 +14403,10 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
         && nodeAt(cd.letInit) is Ident
         && isid != csid
       ) {
-        // Read from inside a function, a module binding's source is not one of that function's
-        // locals of the same name (D3880).
         if letFn < 0 && fnIx >= 0 {
           const mk = moduleCopySigKey(isid)
           if mk != "" { return mk }
         }
-        const ik = calleeCloSigKeyOfRead(cd.letInit, letFn)
-        if ik != "" { return ik }
       }
       if cd.letInit >= 0 {
         const cty = nodeTyAt(cd.letInit, fnIx)
@@ -14415,10 +14418,6 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
             const lk = sigKeyOfTy(cty)
             if lk != "" { return lk }
           }
-          // The nullable twin (`letInitTyIsNulFunc`'s shape): a bare `const t = m[k]` read of
-          // a function-valued map records `TyFunc | null`, and the narrowed call runs at the
-          // inner signature — so the key is the inner's, not "" (D1662).
-          if ct is TyNullable { return sigKeyOfTy(ct.nInner) }
         }
       }
     }
@@ -15117,12 +15116,9 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
   const e = nodeAt(rx)
   let st = ""
   if e is Ident {
-    const k = identCellVKind(rx, fnIx)
+    const k = identStoreVKind(rx, fnIx)
     if k != null {
       st = k
-    } else if readSlotlessOwnLet(rx, fnIx) >= 0 {
-      // A read asked outside its frame reads the cell its binding has in the frame declaring it.
-      st = letCellKind(readSlotlessOwnLet(rx, fnIx), fnIx)
     } else {
       // A read with no slot yet has no storage to read: it reads at its own type.
       const td = repOfNode(rx, fnIx)
@@ -15169,6 +15165,13 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
       return { rrStore: st, rrRead: md.rdKind, rrConv: 4 }
     }
   }
+  // Any other map's value read converts only where a miss makes it a nullable rep.
+  if mvr >= 0 || (e is Index && readMapValTyAt(e, fnIx) >= 0) {
+    const nd = repOfNode(rx, fnIx)
+    if nd.rdCovered == 1 && readKindIsNul(nd.rdKind) {
+      return { rrStore: st, rrRead: nd.rdKind, rrConv: 4 }
+    }
+  }
   // A read narrowed out of a nullable storage reads its non-null kind: one the checker recorded
   // as narrowed, or one whose own type is that storage's non-null kind (a `?.` guard's re-read).
   if readKindIsNul(st) {
@@ -15196,6 +15199,26 @@ function readNonNulKind(k: string): string {
     i = i + 2
   }
   ""
+}
+
+// The cell an identifier read holds: its loaded slot's, or, asked outside the frame declaring
+// it, the cell its binding has there. Null for a read with neither.
+export function identStoreVKind(rx: i32, fnIx: i32): VKind | null {
+  const k = identCellVKind(rx, fnIx)
+  if k != null { return k }
+  const d = readSlotlessOwnLet(rx, fnIx)
+  if d < 0 { return null }
+  letCellKind(d, fnIx)
+}
+
+// `identStoreVKind` where the binding column claims the cell, read without walking an
+// initializer, so a hot conversion test stays linear in an alias chain; null otherwise.
+function identStoreClaimed(rx: i32, fnIx: i32): VKind | null {
+  const k = identCellVKind(rx, fnIx)
+  if k != null { return k }
+  const d = readSlotlessOwnLet(rx, fnIx)
+  if d < 0 || !letBindRepClaims(d, fnIx) { return null }
+  letBindRep(d, fnIx).rdKind
 }
 
 // The `let` read `rx` names when `fnIx` is the frame declaring it; -1 for any other read.
@@ -15252,5 +15275,19 @@ function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
     if v == MVK_STRUCT { return "struct" }
     return "mv" + i32ToStr(v)
   }
+  // A map with no value slot here (a hole bound per instance) holds what its type says.
+  const vt = readMapValTyAt(e, fnIx)
+  if vt >= 0 {
+    const vk = repSigKindOfTy(vt)
+    if vk != null { return vk }
+  }
   ""
+}
+
+// The value type of the map an index read `e` reads, from the receiver's type in frame
+// `fnIx`; -1 when the receiver is not a map there.
+function readMapValTyAt(e: Index, fnIx: i32): i32 {
+  const rt = nodeTyInOf(e.idxArr, fnIx)
+  if rt < 0 || !tyIsMap(rt) { return -1 }
+  tyMapValOf(rt)
 }

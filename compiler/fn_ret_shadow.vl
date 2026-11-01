@@ -3,11 +3,20 @@
 // lives in one, else from the checker; the emitter's re-derivation (`computeVoidFns`) can be
 // replaced by it only where they agree. Off unless a host arms it; armed, each emitted function
 // is counted by class (`docs/internals/architecture-target-2026-10.md` §4, the pass rows).
-import { FuncDecl, nodeAt } from "./ast"
+import { BinExpr, Block, Call, FuncDecl, nodeAt } from "./ast"
 import { T, TY_NEVER, TY_VOID, TyFunc, tyAt } from "./check_types"
 import { elabCheckedTyOf, elabKeyAtPos, elabRetOf } from "./emit_elab"
 import { scopeTyAt } from "./emit_capture_frames"
-import { fRetVoid, fnParent, fnStmts } from "./emit_state"
+import {
+  emitPhaseReached,
+  fRetVoid,
+  fnParent,
+  fnStmts,
+  fnStmtsPosOf,
+  monoStubSlots,
+} from "./emit_state"
+import { i32ListHas } from "./listutil"
+import { identDeclOf } from "./symbols"
 
 let frsArmed = false
 let frsNamed = false
@@ -22,24 +31,32 @@ export function fnRetShadowArm(on: i32) {
   0
 }
 
-// For the shadow's own test: 1 makes the column answer nothing, 2 answer `void` everywhere.
+// For the shadow's own test: the shadow reads the column as answering nothing (1) or `void`
+// everywhere (2). What the emitter reads is unchanged.
 export function fnRetShadowDropSet(d: i32) {
   frsDrop = d
   0
 }
 
-// The result type emitted function `fe` returns, as recorded: its instance's result when it
-// owns an elaboration slot, its own type inside the instance that holds it, else its checker
-// type. -1 where none is recorded or it is still open.
+// The result type emitted function `fe` returns, as recorded: `void` for a pruned template's
+// stub, its instance's result when it owns an elaboration slot, its own type inside the
+// instance that holds it, else its checker type. -1 where none is recorded or it is still open.
 export function fnRecordedRetTy(fe: i32): i32 {
   if fe < 0 || fe >= fnStmts.length { return -1 }
-  if frsDrop == 1 { return -1 }
-  if frsDrop == 2 { return TY_VOID }
   const fx = fnStmts[fe]
+  // The stub and elaboration ledgers are this compile's only once `monomorphize` has run; before,
+  // they hold the previous program's, so only the checker's own type answers.
+  if !emitPhaseReached("monomorphized") { return frsFnRet(elabCheckedTyOf(fx)) }
+  // A template no instance replaced is pruned to an empty stub, void as minted.
+  if i32ListHas(monoStubSlots, fe) { return TY_VOID }
   const k = elabKeyAtPos(fe)
   const nested = fe < fnParent.length && fnParent[fe] >= 0
   if k >= 0 && !nested { return elabRetOf(k) }
-  const ft = if k >= 0 { scopeTyAt(fx, fx) } else { elabCheckedTyOf(fx) }
+  frsFnRet(if k >= 0 { scopeTyAt(fx, fx) } else { elabCheckedTyOf(fx) })
+}
+
+// The result of the function type `ft`, or -1 where `ft` is no function type.
+function frsFnRet(ft: i32): i32 {
   if ft < 0 || ft >= T.tys.length { return -1 }
   const f = tyAt(ft)
   if f is TyFunc { return f.fnRet }
@@ -67,10 +84,16 @@ export function fnRetShadowRun() {
 
 // The class of emitted function `fe`.
 function frsClass(fe: i32): string {
-  const r = fnRecordedRetTy(fe)
+  let r = fnRecordedRetTy(fe)
+  if frsDrop == 1 { r = -1 }
+  if frsDrop == 2 { r = TY_VOID }
   const nested = fe < fnParent.length && fnParent[fe] >= 0
   if r == TY_NEVER { return "never" }
   if r != TY_VOID && (r < 0 || r >= T.tys.length) {
+    const fn = nodeAt(fnStmts[fe])
+    if fn is FuncDecl {
+      if fn.fnRet >= 0 { return "no result recorded, annotated" }
+    }
     if elabKeyAtPos(fe) >= 0 || nested {
       return "no result recorded, instance or nested"
     }
@@ -80,7 +103,38 @@ function frsClass(fe: i32): string {
   const emitVoid = fRetVoid[fe] == 1
   if recVoid == emitVoid { return "agree" }
   if recVoid { return "recorded void, emitter value" }
+  if frsTailIsAssign(fnStmts[fe]) {
+    return "emit-time: tail assignment lowered void"
+  }
+  if frsTailCallsVoid(fnStmts[fe]) {
+    return "emit-time: tail call of a function lowered void"
+  }
   "recorded value, emitter void"
+}
+
+// Whether the function `fx` ends in an assignment: the emitter lowers that tail as a statement
+// unless a reader takes its value, where the recorded result is the assignment's value.
+function frsTailIsAssign(fx: i32): boolean {
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) || fn.fnBody < 0 { return false }
+  const b = nodeAt(fn.fnBody)
+  if !(b is Block) || b.blkStmts.length == 0 { return false }
+  const t = nodeAt(b.blkStmts[b.blkStmts.length - 1])
+  t is BinExpr && t.binOp == "="
+}
+
+// Whether the function `fx` ends in a call of a function the emitter lowered void.
+function frsTailCallsVoid(fx: i32): boolean {
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) || fn.fnBody < 0 { return false }
+  const b = nodeAt(fn.fnBody)
+  if !(b is Block) || b.blkStmts.length == 0 { return false }
+  const t = nodeAt(b.blkStmts[b.blkStmts.length - 1])
+  if !(t is Call) { return false }
+  const cd = identDeclOf(t.callFn)
+  if cd < 0 { return false }
+  const ce = fnStmtsPosOf(cd)
+  ce >= 0 && ce < fRetVoid.length && fRetVoid[ce] == 1
 }
 
 function frsCount(key: string) {

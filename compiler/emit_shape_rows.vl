@@ -350,6 +350,7 @@ import {
   sFieldNames,
   sFieldStart,
   sFieldTypes,
+  sIsRefRow,
   sNames,
   sTyIx,
   slUsed,
@@ -519,7 +520,7 @@ export function mapTyValKindLowerable(mty: i32) {
 function mvValResidualOk(v: i32): boolean {
   if v < 0 || v >= T.tys.length { return false }
   if tyAt(v) is TyObj {
-    return joinRowOfTy(v) >= 0 || variantRowOfOwnRenderTy(v) >= 0
+    return structIndexOfTy(v) >= 0 || variantRowOfOwnRenderTy(v) >= 0
   }
   const ms: i32[] = []
   if !jrFlatMembers(v, ms) { return false }
@@ -535,7 +536,7 @@ function mvValResidualOk(v: i32): boolean {
         return true
       }
       TyObj => {
-        if joinRowOfTy(m) >= 0 { return true }
+        if structIndexOfTy(m) >= 0 { return true }
       }
       TyPrim | TyErr | TyNullable | TyUnion | TyVar | TyLit | TyNeg => {
         // No niche of its own; the atom rule below answers.
@@ -1503,15 +1504,6 @@ export function armLayoutAmbiguousAt(vi: i32): boolean {
   false
 }
 
-// The struct row of the joined record `ty`: its own arena row, else the row an equal join
-// elsewhere interned, else the row `structIndexOfTypeName`'s field-set scan picks for it.
-export function joinRowOfTy(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const r = structIndexOfTy(ty)
-  if r >= 0 { return r }
-  joinRowScanOfTy(ty)
-}
-
 // `structIndexOfTypeName` asked of the record type `ty` rather than of its render: a shape row
 // interned for an equal type, else the field-set scan at the same three leniencies. -1 for a
 // type that is not a record with at least one field.
@@ -1928,9 +1920,9 @@ export function structIndexOfTypeName(name: string) {
 }
 
 // `structIndexOfTypeName` given the arena type `ty` of `name` (or of its `| null` niche), -1 for
-// none: the exact name, a non-null `ty`'s own row, an undeclared record's canonical-key row, then
-// the field-TYPE scan and the spelling. A declared record with no own row never gets another
-// type's same-shape row: callers read that miss as a decision (a `nulvariant` arm, a mint).
+// none: the name, the own and canonical-key rows of `ty` and of its non-null part, the field-TYPE
+// scan (reached only by a canon-key twin), then the spelling. A declared record with no own row
+// never gets another type's same-shape row: callers read that miss as a decision.
 export function structIndexOfTypeNameTy(name: string, ty: i32): i32 {
   const si = structIndexByName(name)
   if si >= 0 { return si }
@@ -1944,6 +1936,10 @@ export function structIndexOfTypeNameTy(name: string, ty: i32): i32 {
   }
   const ot = nonNullTy(ty)
   if ot >= 0 && nameIsWholeSpanShape(name) && tyAt(ot) is TyObj {
+    const oo = structIndexOfTy(ot)
+    if oo >= 0 { return oo }
+    const kr = repRowOfTyStruct(ot, sScanLim())
+    if kr >= 0 { return kr }
     return joinRowScanOfTyMemo(ot)
   }
   structIndexOfTypeName(name)
@@ -1957,13 +1953,11 @@ export function structIndexOfNullPartTy(ty: i32): i32 {
   structIndexOfRecordTy(ot)
 }
 
-// The struct row record type `ty` names: the row of the struct declared at that type (-1 for a
-// declared variant arm with none), else the field-set scan over a record's field types.
+// The struct row of the struct declared at record type `ty`; -1 for none, a declared variant arm
+// with no struct row, or an undeclared record.
 function structIndexOfRecordTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
-  const dn = structNameOfTy(ty)
-  if dn != "" { return structIndexOfTy(ty) }
-  if tyAt(ty) is TyObj { return joinRowScanOfTyMemo(ty) }
+  if structNameOfTy(ty) != "" { return structIndexOfTy(ty) }
   -1
 }
 
@@ -5492,6 +5486,7 @@ export function wholeShapeRowOf(ty: i32): i32 {
     if (
       rt >= 0
       && rt < T.tys.length
+      && !sIsRefRow(i)
       && tyAt(rt) is TyObj
       && nameIsWholeSpanShape(sNames[i])
     ) {
@@ -5621,7 +5616,7 @@ export function sigRowHasNoTwin(si: i32): boolean {
   const lim = sScanLim()
   let j = 0
   while j < lim && j < sFieldCount.length && j < sFieldStart.length {
-    if j != si && sFieldCount[j] == sFieldCount[si] {
+    if j != si && !sIsRefRow(j) && sFieldCount[j] == sFieldCount[si] {
       // A row whose fields are not all appended yet may still become a twin.
       if sFieldStart[j] + sFieldCount[j] > sFieldNames.length { return false }
       if sigRowMayMatch(si, j) { return false }
@@ -5791,7 +5786,7 @@ export function famRelayField(recTy: i32, name: string, litTy: i32) {
   famRelay[i32ToStr(repCanonId(recTy)) + ":" + name] = litTy
   let si = 0
   while si < sFieldStart.length && si < sFieldCount.length {
-    famRelayStructRow(si)
+    if !sIsRefRow(si) { famRelayStructRow(si) }
     si = si + 1
   }
   0
