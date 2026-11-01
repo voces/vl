@@ -11292,7 +11292,12 @@ folds literals, so a shape key can land on another arm's row), and the variant-o
 Before the field tables move, an arm and its own row agree on each field's element name and type:
 where both record the same type, a declared spelling (`Inner`, `Box<i32>`) wins over a
 structural render (`{base:i32,length:i32}`), else the row's spelling stands, and the type index
-is the row's, the one a row lookup by type finds. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
+is the row's, the one a row lookup by type finds. Reference rows exist from the end of `collectS` (the struct table is reset at its start, so no
+earlier pass can hold one); a reference row's heap is claimed when the union heaps are assigned,
+and a record whose own row a later pass interns leaves its early reference row unclaimed,
+flagged and skipped like the rest. The passes that re-lay an arm's fields after that point
+re-sync its reference row, and each arm's fields are asserted equal to its row's when the heaps
+are assigned. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
 variant heap column is gone. A row is keyed by (record type, field storage codes), not by the
 type alone: a record with a tagged function field is a second row of its type. A value cannot
 cross between two storage rows of one type without a converting delivery, and none exists, so
