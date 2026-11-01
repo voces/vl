@@ -111,7 +111,8 @@ function line(k: i32) {
 print(line(3))
 `;
 
-// A hole-parameter function whose instance's result the elaboration leaves open.
+// A hole-parameter function whose instance's result is its returned call through the
+// parameter, which the elaboration records at the instance (`elabRetOfValues`).
 const HOLE = `function lap(g, x) { return g(x) }
 const f = (n) => 0 - n
 print(lap(f, 4))
@@ -166,7 +167,7 @@ Deno.test({
       HOLE,
       DROP_NONE,
       true,
-      "agree | __lambda_0=1; no result recorded, instance or nested | lap=1",
+      "agree | __lambda_0=1; agree | lap=1",
     );
     expectRows(
       "on demand",
