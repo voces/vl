@@ -6256,6 +6256,8 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
     NumLit | StrLit | CharLit | BoolLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   if nodeTyIsNullable(dix) { return true }
+  // A default whose type is `null` itself, as a call of a function that only returns `null` (D3408).
+  if isNullTy(nodeTyIxOf(dix)) { return true }
   // A hole the instance binds to a nullable type is nullable there.
   if tyBearsNull(holeOperandTyOf(dix, fnIx)) { return true }
   const un = unionNameOfExpr(dix, fnIx)
@@ -12900,6 +12902,16 @@ let lrDepth = 0
 // its list unless a float literal or spread built another; a recorded `f64[]` yields to an f32
 // shape, and the unpinned `i32[]` to any shape.
 function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
+  // A call's list is what its callee lowers, asked first; the ladder below answers a call whose
+  // lowering is not known, a builtin's or a method's among them.
+  const ce = nodeAt(exprIx)
+  if ce is Call {
+    const ck = callStoreListKind(ce, exprIx, fnIx)
+    if ck != null {
+      if vkListClass(ck) == 2 { return nulListBase(ck) }
+      return ck
+    }
+  }
   // A node recorded at a type variable has the column's rep at its instance's bindings. Before
   // `monomorphize` binds one, a node still open there has no rep.
   const xraw = nodeTyIxOf(exprIx)
@@ -15494,7 +15506,70 @@ function callResultIsNulLitAtom(rx: i32, fnIx: i32): boolean {
 function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
   if callResultIsNulLitAtom(rx, fnIx) { return "nullitatom" }
   if callStoreIsLitAtom(e, rx, fnIx) { return "litatom" }
+  const lk = callStoreListKind(e, rx, fnIx)
+  if lk != null { return lk }
   ""
+}
+
+// The list kind call `rx` hands back, nullable or not, where its callee's lowering names one;
+// null for any other result or a lowering not yet known.
+function callStoreListKind(e: Call, rx: i32, fnIx: i32): VKind | null {
+  const k = callLoweredKind(e, rx, fnIx)
+  if k != null && vkListClass(k) != 0 { return k }
+  null
+}
+
+// `fnLoweredKind` remembered per function, stamped with the pass and type arena that asked.
+const flkGen = memoGenNew(0)
+const flkKey = memoKeyNew(3)
+const flkStamp: i32[] = []
+const flkVal: VKind[] = []
+
+// The result kind function `fe` lowers, once return kinds are final: its closed recorded result's
+// rep, else its result kind; null for a void result.
+function fnLoweredKind(fe: i32): VKind | null {
+  if fe >= fRetKind.length || fe >= fRetVoid.length || fRetVoid[fe] != 0 {
+    return null
+  }
+  if memoMoved3(flkKey, emitPassGen, tyMutEpoch, fRetKind.length) {
+    memoGenAdvance(flkGen)
+  }
+  if fe < flkStamp.length && flkStamp[fe] == flkGen.at { return flkVal[fe] }
+  let k: VKind = fRetKind[fe]
+  if fe < fRecRetTy.length {
+    const r = fRecRetTy[fe]
+    if r >= 0 && r < T.tys.length && !tyHasTyVar(r) && !tyHasInferHole(r, 0) {
+      const d = repOfTy(r)
+      if d.rdCovered == 1 { k = d.rdKind }
+    }
+  }
+  while flkStamp.length <= fe {
+    flkStamp.push(-1)
+    flkVal.push("i32")
+  }
+  flkStamp[fe] = flkGen.at
+  flkVal[fe] = k
+  k
+}
+
+// The result kind call `rx`'s callee lowers, once return kinds are final: a named function's
+// closed recorded result, else its result kind, else a function value's `$fnsig` result token.
+// Null for a void, unresolved or unkeyed result, and for a generic function value, which is
+// instanced per call so its `$fnsig` is not the instance's (D4242).
+function callLoweredKind(e: Call, rx: i32, fnIx: i32): VKind | null {
+  if !emitPhaseReached("capsCached") { return null }
+  const fe = callNamedFe(e, fnIx)
+  if fe >= 0 { return fnLoweredKind(fe) }
+  // A method of a list, map or string is no function value and has no `$fnsig` of its own.
+  const cfx = unwrapParen(e.callFn)
+  if cfx < 0 { return null }
+  const cf = nodeAt(cfx)
+  if cf is Member && !memberIsClosure(cf.memObj, cf.memProp, fnIx) {
+    return null
+  }
+  const ct = nodeTyAt(cfx, fnIx)
+  if ct < 0 || ct >= T.tys.length || tyHasTyVar(ct) { return null }
+  sigKeyRetKind(cloCallSigKey(rx, fnIx))
 }
 
 // Whether call `rx` hands back an interned literal-union id. The callee's lowered result decides:
