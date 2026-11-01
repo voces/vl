@@ -7,11 +7,10 @@
 // collection leaving more than 75% of a semispace live (`SeedGcHeadroom`,
 // scripts/vl-host/src/main.rs; docs/internals/perf/gc-heap-policy-2026-09.md §4).
 //
-// The workload is `vl check compiler/emit_base.vl` at the default first heap (128 MiB a
-// semispace), whose live set passes the 96 MiB the policy grows at: 4 and 24 to 26 collections
-// over 2026-10-31 and 2026-11-01. The default heap is the engine configuration every other compile shares, so its
-// `.cwasm` is already warm; a pinned heap was its own configuration and re-JITted the seed
-// (about 13 s) on every new seed. Three bounds: the default
+// The workload is `vl check compiler/emit_shape_rows.vl` at a 144 MiB first heap, so its live set
+// sits past the 96 MiB the policy grows at as the compiler's own size drifts: at the 256 MiB
+// default this workload read 6 and 46 when chosen and 7 and 20 on 2026-10-31, when it was moved
+// to 144 MiB and read 8 and 48 over three seeds. Three bounds: the default
 // collects at least once (a dead counter reads 0) and at most `MAX_DEFAULT`; the policy switched
 // off collects more than `MAX_DEFAULT`, the red control run in the same test; and off collects at
 // least `MIN_SPREAD` times as often, so a workload that drifts out of the band fails here.
@@ -31,11 +30,11 @@ if (!ENABLED) {
   );
 }
 
-const TARGET = `${ROOT}/compiler/emit_base.vl`;
+const TARGET = `${ROOT}/compiler/emit_shape_rows.vl`;
 
-// 4 at the time of writing; loose so a compiler change that moves the live set cannot red it.
-const MAX_DEFAULT = 12;
-// 24 / 4 at the time of writing.
+// 8 at the time of writing; loose so a compiler change that moves the live set cannot red it.
+const MAX_DEFAULT = 20;
+// 48 / 8 at the time of writing.
 const MIN_SPREAD = 3;
 
 async function collections(grow: string, label: string): Promise<number> {
@@ -45,11 +44,10 @@ async function collections(grow: string, label: string): Promise<number> {
     stderr: "piped",
     // The collector and first heap are pinned, not inherited: a caller that sourced
     // scripts/self-compile-gc.sh starts at 2 GiB, where this live set never nears a semispace.
-    // An empty heap is the default, and the default's warm engine configuration.
     env: nativeEnv({
       VL_GC_STATS: "1",
       VL_COMPILE_GC: "copying",
-      VL_COMPILE_GC_HEAP: "",
+      VL_COMPILE_GC_HEAP: "144M",
       VL_COMPILE_GC_GROW: grow,
     }),
   }).output();
