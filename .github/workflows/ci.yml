@@ -133,7 +133,8 @@ jobs:
   #   seed ──┬── ci-native (5)        the auto-discovered native suites, split by weight
   #          ├── checks               ratchets, probes, self-lint, corpus oracle, editor suites
   #          ├── ci-release-shape (1) the binaryen-backed suites
-  #          └── ci-cost (2)         fuel/RSS cost ratchets
+  #          ├── ci-cost (2)         fuel/RSS cost ratchets
+  #          └── ci-distilled         the distilled census corpus (no working cell stops running)
   #
   # `seed` is the only job that builds anything: the vl-host binary (on a binary-cache miss)
   # and the seed, which it refreshes AND proves a self-compilation fixed point before saving
@@ -891,6 +892,58 @@ jobs:
           VL_SCALING_SHARD: ${{ matrix.part }}/2
 
   # ---------------------------------------------------------------------------
+  # ci-distilled — the distilled census corpus (scripts/silent-sweep/distilled/regress.vl), the
+  # gate's `distilled corpus` row with the same command: red only when a cell that ran stops
+  # running or a floor cell goes silent. Gate-only, it let #5429 merge 7 classes runs -> not-runs
+  # (108 census cells) on 2026-11-01. The cell-module cache is keyed on the compiled modules'
+  # bytes, so it carries across seeds: cold 36.6 s / 137 CPU-s, warm 15.4 s / 54 CPU-s on
+  # 4 cores. Not `--verify-fresh` (the master-only baseline-freshness half stays in gate.sh):
+  # a branch is meant to disagree with the committed baseline.
+  # ---------------------------------------------------------------------------
+  ci-distilled:
+    needs: seed
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore vl-host binary
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            build/vl-compiler.wasm.*.cwasm
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      # Saved once per seed, restored from the newest of any seed: a compiler change re-compiles
+      # only the cells whose module bytes it moved.
+      - name: Cache the distilled cell modules
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/vl-distilled
+          key: vl-distilled-${{ runner.os }}-${{ needs.seed.outputs.seed_key }}
+          restore-keys: |
+            vl-distilled-${{ runner.os }}-
+
+      - name: Warm the seed's sidecars
+        run: bash scripts/warm-seed.sh
+
+      - name: Distilled corpus (no working cell stops running)
+        run: scripts/vl-host/target/release/vl run scripts/silent-sweep/distilled/regress.vl --compiler build/vl-compiler.wasm -- build/vl-compiler.wasm
+        env:
+          JOBS: "4"
+
+  # ---------------------------------------------------------------------------
   # ci-embed-seed — the release DISTRIBUTION build (roadmap H-M2), gated on every
   # push instead of only at release time.
   #
@@ -1078,7 +1131,7 @@ jobs:
   # tests/ci_proof_test.ts holds `needs` to every other job in this file.
   # ---------------------------------------------------------------------------
   ci-proof:
-    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, ci-cost, ci-embed-seed]
+    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, ci-cost, ci-distilled, ci-embed-seed]
     if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/vl-queue/')
     runs-on: ubuntu-latest
     steps:
