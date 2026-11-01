@@ -9022,35 +9022,15 @@ export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
 export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
   if exprIx < 0 { return false }
   const e = nodeAt(unwrapParen(exprIx))
-  // A name, field or element read typed `null` is the `null` unit when its read rep reads one;
-  // a read the read rep does not cover keeps the arms below.
-  if e is Ident || e is Member || e is Index {
+  // A name, field, element or call read typed `null` is the `null` unit when its read rep reads
+  // one; a read the read rep does not cover keeps the arms below.
+  if e is Ident || e is Member || e is Index || e is Call {
     if isNullTy(nodeTyAt(exprIx, fnIx)) {
       const rr = readRepOf(exprIx, fnIx)
       if rr.rrRead != "" { return kindIn(rr.rrRead, READ_NUL_NONE_KINDS) }
     }
   }
-  if e is Call {
-    const cf = nodeAt(unwrapParen(e.callFn))
-    if cf is Ident {
-      const t = fnIndexOfNode(e.callFn)
-      if t >= 0 { return repOfFnSlot(t).rdKind == "nulnone" }
-      return calleeRetKindOfRead(e.callFn, fnIx) == "nulnone"
-    }
-    if cloValueCallRetKind(unwrapParen(exprIx), fnIx) == "nulnone" {
-      return true
-    }
-    // A `null[]`'s `pop` and `get` hand back its element, and a `null`-valued map's `get` its value.
-    if cf is Member {
-      if cf.memProp != "pop" && cf.memProp != "get" { return false }
-      if exprMap(cf.memObj, fnIx) {
-        return cf.memProp == "get"
-          && mapTyValIsNullUnit(mapRecvTyIn(cf.memObj, fnIx))
-      }
-      return arrElemIsNullUnitAt(cf.memObj, fnIx)
-    }
-    return false
-  }
+  if e is Call { return callIsNulNone(e, unwrapParen(exprIx), fnIx) }
   // An if-expression whose every arm is a bare `null` or itself `null`-typed is `null`-typed:
   // the join of `null` with `null` is `null`. One arm carrying a real value is not this — its
   // join is a genuine `T | null` and the niche paths own it. An else-less `if` used as a value
@@ -9081,6 +9061,31 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
   // an Ident, a captured read, and a module global all resolve through `identCellVKind`, and
   // for a kind that names no cell it answers `null` — the right answer for every remaining kind.
   identCellVKind(exprIx, fnIx) == "nulnone"
+}
+
+// Whether call `rx` hands back the `null` unit: a function whose every return is a bare `null`, a
+// value call whose `$fnsig` result is `Z`, or a `null[]`'s `pop`/`get` or a `null`-valued map's `get`.
+function callIsNulNone(e: Call, rx: i32, fnIx: i32): boolean {
+  const cf = nodeAt(unwrapParen(e.callFn))
+  if cf is Ident {
+    const t = fnIndexOfNode(e.callFn)
+    if t >= 0 { return repOfFnSlot(t).rdKind == "nulnone" }
+    return calleeRetKindOfRead(e.callFn, fnIx) == "nulnone"
+  }
+  if cloValueCallRetKind(rx, fnIx) == "nulnone" { return true }
+  methodCallIsNulNone(unwrapParen(e.callFn), fnIx)
+}
+
+// Whether the method callee `cfx` is a `null[]`'s `pop`/`get` or a `null`-valued map's `get`.
+function methodCallIsNulNone(cfx: i32, fnIx: i32): boolean {
+  const cf = nodeAt(cfx)
+  if !(cf is Member) { return false }
+  if cf.memProp != "pop" && cf.memProp != "get" { return false }
+  if exprMap(cf.memObj, fnIx) {
+    return cf.memProp == "get"
+      && mapTyValIsNullUnit(mapRecvTyIn(cf.memObj, fnIx))
+  }
+  arrElemIsNullUnitAt(cf.memObj, fnIx)
 }
 
 // Does the if-arm tail value `v` add nothing but `null` to the join? A bare `null`, a `null`-typed
@@ -15501,10 +15506,11 @@ function callResultIsNulLitAtom(rx: i32, fnIx: i32): boolean {
 }
 
 // What a call's result is stored as: "nullitatom" for the `K | null` niche, "litatom" for an
-// interned literal-union id, else "".
+// interned literal-union id, "nulnone" for the `null` unit, else "".
 function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
   if callResultIsNulLitAtom(rx, fnIx) { return "nullitatom" }
   if callStoreIsLitAtom(e, rx, fnIx) { return "litatom" }
+  if callIsNulNone(e, rx, fnIx) { return "nulnone" }
   ""
 }
 
