@@ -11341,3 +11341,14 @@ producers keep minting `("variant", vi)`, the `$fnsig` result token keeps its va
 caller boxing a returned arm reads its tag through it), and the label is not narrowed further.
 Folding tags into rows, a tag keyed by (union, row) rather than by arm, would be a separate
 tag-numbering decision, and it is not taken.
+
+## A value-fit list is not delivered at an instance (application of ruling (c), D4981, D5003)
+
+Not a new decision: owner ruling (c) on #3792 (D4928) says a list narrowed by `is K[]` is never
+delivered as `K[]`, applied here to the instance of a generic body. At `V = i32[]` an empty list
+passes `is f64[]` by value fit (D4771), and the arm reads it as a fresh `f64[]`. Handed to a
+parameter, a binding, a return or a field, a write would land in a list the caller does not hold,
+so the instance refuses the delivery as D4928 refuses it from a concrete declared type. Read-only
+uses in the arm (`v.length`, an element read) stay legal, as does every delivery at an instance
+whose list is the tested type or a union holding it. Aliasing the receiver is impossible across
+two storage types, and a silent copy is the lossy operation std and this file refuse elsewhere.
