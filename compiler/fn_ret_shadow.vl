@@ -10,13 +10,18 @@ import {
   FuncDecl,
   Ident,
   LetDecl,
+  ObjLit,
   P,
   nodeAt,
 } from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
 import { nodeTyIxOf } from "./check_node_tys"
 import { collectRetValues } from "./check_nj_join"
-import { recKeptFnDstOf } from "./check_rec_rows"
+import { recHoleIdentityArg } from "./check_fit_rules"
+import { recBuildTable, recBuildTyIn, recKeptFnDstOf } from "./check_rec_rows"
+import { recPassThroughArg } from "./check_record_origins"
+import { identBoundFnDeclOf } from "./check_scopes"
+import { cwPeelValue } from "./check_write_scan"
 import { nodeHoleElemOf } from "./check_side_rows"
 import {
   T,
@@ -135,7 +140,7 @@ function frsCallsBuiltRow(fx: i32, r: i32): i32 {
   if cs.length == 0 { return -1 }
   let row = -1
   for c in cs {
-    const st = nodeRepTyIxOf(c)
+    const st = frsCallBuiltAt(c, 0)
     if st < 0 || st >= T.tys.length || !(tyAt(st) is TyObj) || tyHasTyVar(st) {
       return -1
     }
@@ -143,6 +148,37 @@ function frsCallsBuiltRow(fx: i32, r: i32): i32 {
     row = st
   }
   row
+}
+
+// The record call `c`'s value is built at: where the callee hands an argument straight back (a
+// generic identity, or a hole function that only rebinds and returns its parameter), the row the
+// checker's record solve builds that argument at (D14902); else the call's own stamp.
+function frsCallBuiltAt(c: i32, hops: i32): i32 {
+  const st = nodeRepTyIxOf(c)
+  if hops >= 16 || c < 0 || c >= P.nodes.length { return st }
+  const cn = nodeAt(c)
+  if !(cn is Call) { return st }
+  let a = recPassThroughArg(c)
+  if a < 0 && cn.callFn >= 0 {
+    a = recHoleIdentityArg(c, identBoundFnDeclOf(cn.callFn))
+  }
+  const ap = if a >= 0 { cwPeelValue(a) } else { -1 }
+  if ap < 0 || ap >= P.nodes.length { return st }
+  const an = nodeAt(ap)
+  let b = -1
+  if an is Call {
+    b = frsCallBuiltAt(ap, hops + 1)
+  } else if an is Ident {
+    const d = identDeclOf(ap)
+    b = if d >= 0 { recBuildTyIn(recBuildTable(), d, false) } else { -1 }
+    if b < 0 { b = nodeRepTyIxOf(ap) }
+  } else if an is ObjLit {
+    b = nodeRepTyIxOf(ap)
+  }
+  if b < 0 || b >= T.tys.length || !(tyAt(b) is TyObj) || tyHasTyVar(b) {
+    return st
+  }
+  b
 }
 
 // Result `r` of function `fx`, a hole list (`_[]` or `_[] | null`) closed to the element the
