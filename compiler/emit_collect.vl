@@ -81,6 +81,7 @@ import { refViewSrcTys } from "./check_ref_list_view"
 import { widenRetagToHas } from "./check_retag_rows"
 import {
   T,
+  TY_NEVER,
   TY_NULL,
   TY_VOID,
   TyArray,
@@ -572,6 +573,7 @@ import {
   repOfTy,
   repRowOfTyStruct,
   repSigKindOfTy,
+  repSigTokHasSlot,
   repSlotOfTy,
   repTyHasArmShape,
   repVariantShapeRowOf,
@@ -2900,6 +2902,47 @@ function fnPosResultUnconsumed(i: i32): boolean {
   false
 }
 
+// Whether function `i`'s recorded result is a value its lowering must return: neither `void`
+// nor `never`, with no bare `return` and a result some caller consumes.
+function cvfRecordedValue(i: i32, fn: FuncDecl): boolean {
+  const r = fnRecordedRetTy(i)
+  if r < 0 || r == TY_VOID || r == TY_NEVER { return false }
+  !blockHasBareReturn(fn.fnBody) && !fnPosResultUnconsumed(i)
+}
+
+// Pin the result of every un-annotated function whose recorded result is a value the emitter
+// keys with no slot (a scalar, string, closure or scalar list): its annotation is synthesized
+// from the recorded type, so `buildFnMap` and `computeVoidFns` read the column, not the body. A
+// bare `return`, an unconsumed result, an open result and a record (whose row is built where
+// it is delivered) keep the derivation.
+export function synthRecordedRetAnnots() {
+  let i = 0
+  while i < fnStmts.length {
+    const fn = nodeAt(fnStmts[i])
+    if fn is FuncDecl {
+      if fn.fnRet < 0 {
+        const r = fnRecordedRetTy(i)
+        if (
+          r >= 0
+          && r != TY_VOID
+          && r != TY_NEVER
+          && !tyHasTyVar(r)
+          && !blockHasBareReturn(fn.fnBody)
+          && !fnPosResultUnconsumed(i)
+        ) {
+          const k = repSigKindOfTy(r)
+          if k != null && !repSigTokHasSlot(k) {
+            const nm = tyToEmitName(r)
+            if nm != "" { fn.fnRet = synthTypeRefTy(nm, -1, r) }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Classify each function's voidness as a monotone fixed point: a candidate with no return
 // annotation is void when its body has no valued `return` and no tail value. `stmtIsTailValue`
 // consults `fRetVoid` for tail calls, so marking a callee void can make its callers' tails
@@ -2913,7 +2956,7 @@ export function computeVoidFns() {
       if fRetVoid[i] == 0 {
         const fn = nodeAt(fnStmts[i])
         if fn is FuncDecl {
-          if fn.fnRet < 0 {
+          if fn.fnRet < 0 && !cvfRecordedValue(i, fn) {
             // A bare `return` pins this function void whatever its tail yields; the checker
             // reads the same predicate, so the functype and the caller's type agree (D1600).
             // So does a recorded `void` result, which a build-time fold cannot undo (D14790).
