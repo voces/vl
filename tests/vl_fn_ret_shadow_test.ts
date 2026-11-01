@@ -155,6 +155,17 @@ function c<T>(x: T) {
 c(1)
 `;
 
+// A lambda delivered into a nullable function field records the field's type, `(() => i64) | null`:
+// its result is the function member's.
+const NULLABLE_FIELD = `type R = { f: (() => i64) | null }
+function go() {
+  const t0: () => R = () => ({ f: () => (13131313131) })
+  const t1 = t0().f
+  if t1 != null { print(t1()) }
+}
+go()
+`;
+
 // A generic nothing instantiates is pruned to an empty stub, void as minted (`monoStubSlots`).
 const STUB = `function id<T>(x: T): T { x }
 function keep(x: i32) { x + 1 }
@@ -227,6 +238,13 @@ Deno.test({
       DROP_NONE,
       true,
       "agree | __lambda_0=1; agree | c=1; agree | inner=1; agree | other=1; recorded value, emitter void | __lambda_1=1",
+    );
+    expectRows(
+      "nullable field",
+      NULLABLE_FIELD,
+      DROP_NONE,
+      true,
+      "agree | __lambda_0=1; agree | __lambda_1=1; agree | go=1",
     );
     expectRows("stub", STUB, DROP_NONE, true, "agree | id=1; agree | keep=1");
     expectRows(

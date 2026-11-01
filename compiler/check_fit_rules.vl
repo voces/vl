@@ -50,6 +50,7 @@ import {
   WhileStmt,
   annTsOf,
   arenaSetNode,
+  callHasTyArgs,
   i32ToStr,
   nodeAt,
   nodeToks,
@@ -59,6 +60,7 @@ import {
   tsKidStart,
   tsKids,
   tsKind,
+  tsMentionsAnyName,
   tsText,
 } from "./ast"
 import {
@@ -525,7 +527,7 @@ import {
 } from "./const_exact"
 import { numLexRadixBits } from "./emit_bignum"
 import { nodeLastTok } from "./fmt_util"
-import { i32ListHas, strListIndexOf } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { nameIsBareIdent, nameIsQuotedLeaf } from "./tyname"
 import {
   flattenVariantsInto,
@@ -1852,6 +1854,7 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     const c = s / 2
     if c == call { hasCall = true }
     const mapped = recHeldStored(c)
+    if recHeldPinnedArg(c) { return false }
     const at = if mapped { -1 } else { recQueuedLandingOf(c, own, dst) }
     if at >= 0 {
       if !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
@@ -1865,6 +1868,89 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   }
   if hasCall { recRepArgsNote(sites, own, dst) }
   hasCall
+}
+
+// Whether call `c` is an argument to a parameter typed `T` of a generic callee, or an element of a
+// list literal handed to one typed `T[]`, where a held value no call of `c`'s function produced
+// also binds `T` (another argument, or another element), or the call writes its type arguments:
+// the instance is pinned there, so `c` lands at its own type (D14814).
+function recHeldPinnedArg(c: i32): boolean {
+  if c < 0 || c >= cwIxUpKind.length { return false }
+  // The argument the call is, or the list literal argument it is an element of.
+  let x = c
+  let elem = false
+  if cwIxUpKind[c] == CW_UP_ELEM {
+    x = cwIxUp[c]
+    elem = true
+    if x < 0 || x >= cwIxUpKind.length || !(nodeAt(x) is ArrayLit) {
+      return false
+    }
+  }
+  if cwIxUpKind[x] != CW_UP_ARG { return false }
+  const call = cwIxUp[x]
+  const cn = nodeAt(call)
+  if !(cn is Call) || cn.callFn < 0 { return false }
+  const gd = identBoundFnDeclOf(cn.callFn)
+  const g = if gd >= 0 && gd < P.nodes.length { nodeAt(gd) } else { null }
+  const i = cwIxUpAux[x]
+  if (
+    !(g is FuncDecl)
+    || g.fnTyParams.length == 0
+    || i < 0
+    || i >= g.fnParams.length
+  ) {
+    return false
+  }
+  if g.fnParams.length != cn.callArgs.length { return false }
+  const pn = nodeAt(g.fnParams[i])
+  const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+  if !(pt is TypeRef) { return false }
+  const tv = if elem && pt.tyName.length > 2 { pt.tyName.slice(0, pt.tyName.length - 2) } else { pt.tyName }
+  if elem && pt.tyName != tv + "[]" { return false }
+  if !strListHas(g.fnTyParams, tv) { return false }
+  if callHasTyArgs(call) { return true }
+  const fd = recInferredFnOf(c)
+  const xl = nodeAt(x)
+  if xl is ArrayLit {
+    for el in xl.arrElems {
+      if el != c && recHeldNotFrom(el, fd) { return true }
+    }
+  }
+  let j = 0
+  while j < g.fnParams.length {
+    const qn = nodeAt(g.fnParams[j])
+    if (
+      j != i
+      && qn is Param
+      && qn.parType >= 0
+      && tsMentionsAnyName(annTsOf(qn.parType), [tv])
+      && recHeldNotFrom(cn.callArgs[j], fd)
+    ) {
+      return true
+    }
+    j = j + 1
+  }
+  false
+}
+
+// Whether `a` is a held value, a name or a read of one, whose origin is no call of `fd`.
+function recHeldNotFrom(a: i32, fd: i32): boolean {
+  const p = cwPeelValue(a)
+  if p < 0 || p >= P.nodes.length { return false }
+  const n = nodeAt(p)
+  if !(n is Ident || n is Member || n is Index) { return false }
+  const o = recOriginExpr(p)
+  o < 0 || recInferredFnOf(o) != fd
+}
+
+// Whether some call of `fd` is a held-pinned argument (`recHeldPinnedArg`).
+function recSitesHeldPinned(fd: i32): boolean {
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 { return false }
+  for s in sites {
+    if s % 2 == 0 && recHeldPinnedArg(s / 2) { return true }
+  }
+  false
 }
 
 // Note each call site in `sites` that `recRepArgOf` serves at `dst` for its callee's instance.
@@ -2033,6 +2119,13 @@ function recRepArgOf(i: i32, c: i32, own: i32, dst: i32): boolean {
   if recAnnArgRepOk(src, dst) {
     return cwPeelValue(src) == c
       || recLandingIn(src, dst, c, own, REC_STORE_DEPTH) >= 0
+  }
+  // A call writing its type arguments decides its instance: the rep serves it only where the
+  // written instance stores the elements as `dst` does (D14815).
+  const up = if src >= 0 && src < cwIxUp.length { cwIxUp[src] } else { -1 }
+  if up >= 0 && callHasTyArgs(up) {
+    const de = tyArrayElemIx(nonNulTyOf(recPendDstTy[i]))
+    if de < 0 || !fieldStorageEq(de, dst, REC_STORE_DEPTH) { return false }
   }
   recListArgTakesRep(src)
     && recLandingIn(src, recPendDstTy[i], c, own, REC_STORE_DEPTH) >= 0
@@ -3243,7 +3336,7 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if (
         recBuildsLit(fd, 8)
         && ld >= 0
-        && recSitesLandApart(fd, nonNulTyOf(srcTy), ld)
+        && (recSitesLandApart(fd, nonNulTyOf(srcTy), ld) || recSitesHeldPinned(fd))
       ) {
         recRefuseAtOwnRow(p, nonNulTyOf(srcTy), ld)
         return 0
