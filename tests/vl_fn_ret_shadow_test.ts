@@ -324,6 +324,32 @@ Deno.test({
   },
 });
 
+// A generic returned past an un-annotated function into a `string`-returning slot is built
+// returning `string`, beside its exact instance: each records the result it is built at (D14795).
+const WIDENED_DELIVERY = `type K = "x" | "y"
+function same<T>(k: T): T { k }
+function d1() { return same }
+const v1: (k: K) => string = d1()
+print(v1("x") + "!")
+const u1: (k: K) => K = same
+print(u1("y"))
+`;
+
+Deno.test({
+  name: "fn-ret shadow: kind widened delivery",
+  ignore,
+  fn() {
+    expectRows(
+      "kind widened delivery",
+      WIDENED_DELIVERY,
+      DROP_NONE,
+      true,
+      "kind agree | __lambda_0=1; kind agree | d1=1; kind agree | same$1=1; kind agree | same=1",
+      true,
+    );
+  },
+});
+
 // A `u8[]` map's callback records `(e: u8) => u8`, a storage type its value widens from: it
 // crosses as the `i32` its lowered signature carries.
 const U8_MAP = `const xs: u8[] = [1, 200, 7]
