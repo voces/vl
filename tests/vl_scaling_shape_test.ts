@@ -784,7 +784,7 @@ axis("types", 2.8, "A per-declaration cost is scaling with the type table.", (d)
 axis(
   "unions",
   2.5,
-  "A per-union ask is scanning the union registry — `unRowOfCanon` (emit_rep.vl), `declaredStructUnionMembers` (check_nj_join.vl), `buildVariantTwins` (emit_union_atoms.vl) or `armRowOfRecordTyShim` (emit_mv_slots.vl).",
+  "A per-union ask is scanning the union registry — `unRowOfCanonFolded` (emit_rep.vl), `declaredStructUnionMembers` (check_nj_join.vl), `buildVariantTwins` (emit_union_atoms.vl) or `armRowOfRecordTyShim` (emit_mv_slots.vl).",
   (d) => twoFiles(d, genUnions(2400, 1), genUnions(2400, 20)),
 );
 
