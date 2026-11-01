@@ -121,7 +121,9 @@ export function fnRecordedRetTy(fe: i32): i32 {
     if r >= 0 && k < 0 {
       const kd = recKeptFnDstOf(fx, r)
       if kd >= 0 { r = kd }
-      const cr = frsCallsBuiltRow(fx, r)
+      // A value built by a call keeps that call's row whatever the delivery; else the calls'.
+      const vr = if r < T.tys.length && tyAt(r) is TyObj { frsValuesBuiltRow(fx, 0) } else { -1 }
+      const cr = if vr >= 0 { vr } else { frsCallsBuiltRow(fx, r) }
       if cr >= 0 { r = cr }
     }
   }
@@ -152,7 +154,8 @@ function frsCallsBuiltRow(fx: i32, r: i32): i32 {
 
 // The record call `c`'s value is built at: where the callee hands an argument straight back (a
 // generic identity, or a hole function that only rebinds and returns its parameter), the row the
-// checker's record solve builds that argument at (D14902); else the call's own stamp.
+// checker's record solve builds that argument at (D14902); where the callee's every value is
+// call-built, that row (`frsValuesBuiltRow`); else the call's own stamp.
 function frsCallBuiltAt(c: i32, hops: i32): i32 {
   const st = nodeRepTyIxOf(c)
   if hops >= 16 || c < 0 || c >= P.nodes.length { return st }
@@ -161,6 +164,10 @@ function frsCallBuiltAt(c: i32, hops: i32): i32 {
   let a = recPassThroughArg(c)
   if a < 0 && cn.callFn >= 0 {
     a = recHoleIdentityArg(c, identBoundFnDeclOf(cn.callFn))
+  }
+  if a < 0 && cn.callFn >= 0 {
+    const vr = frsValuesBuiltRow(identBoundFnDeclOf(cn.callFn), hops + 1)
+    return if vr >= 0 { vr } else { st }
   }
   const ap = if a >= 0 { cwPeelValue(a) } else { -1 }
   if ap < 0 || ap >= P.nodes.length { return st }
@@ -179,6 +186,37 @@ function frsCallBuiltAt(c: i32, hops: i32): i32 {
     return st
   }
   b
+}
+
+// The record un-annotated plain function `fx` builds its value at where every value it returns is
+// built by a call (`retValueRootCall`) and those calls agree on one closed record; else -1. An
+// annotated result converts its value at the return, so it is not read through.
+function frsValuesBuiltRow(fx: i32, hops: i32): i32 {
+  if hops >= 8 || fx < 0 || fx >= P.nodes.length { return -1 }
+  const fn = nodeAt(fx)
+  if (
+    !(fn is FuncDecl)
+    || fn.fnTyParams.length > 0
+    || fn.fnRet >= 0
+    || fn.fnBody < 0
+  ) {
+    return -1
+  }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  if vals.length == 0 { return -1 }
+  let row = -1
+  for v in vals {
+    const root = retValueRootCall(v)
+    if root < 0 { return -1 }
+    const st = frsCallBuiltAt(root, hops + 1)
+    if st < 0 || st >= T.tys.length || !(tyAt(st) is TyObj) || tyHasTyVar(st) {
+      return -1
+    }
+    if row >= 0 && !tySame(row, st) { return -1 }
+    row = st
+  }
+  row
 }
 
 // Result `r` of function `fx`, a hole list (`_[]` or `_[] | null`) closed to the element the
