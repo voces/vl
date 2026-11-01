@@ -17377,8 +17377,8 @@ function emitStrConcat(body: u8[], binIx: i32, fnIx: i32, ec: ExpCtx) {
     // the shared `__str_concat__` helper — the allocate+copy core lives once per
     // module (`emitStrConcatFnCode`). A literal-union atom operand widens to its
     // member string (`emitStrValue`) before the call.
-    if emitStrCatOperand(body, e.binLeft, fnIx, ec, ec) < 0 { return -1 }
-    if emitStrCatOperand(body, e.binRight, fnIx, ec, ec) < 0 { return -1 }
+    if emitStrCatOperand(body, e.binLeft, fnIx, ec) < 0 { return -1 }
+    if emitStrCatOperand(body, e.binRight, fnIx, ec) < 0 { return -1 }
     fbCall(gHelpStrConcat)
     return 0
   }
@@ -17428,7 +17428,7 @@ function emitStrCatN(body: u8[], parts: i32[], fnIx: i32, ec: ExpCtx) {
   const n = parts.length
   let i = 0
   while i < n {
-    if emitStrCatOperand(body, parts[i], fnIx, ec, ec) < 0 { return -1 }
+    if emitStrCatOperand(body, parts[i], fnIx, ec) < 0 { return -1 }
     i = i + 1
   }
   let j = n - 1
@@ -17887,7 +17887,7 @@ function emitStrSiteCat(
   const n = parts.length
   let i = 0
   while i < n {
-    if emitStrCatOperand(body, parts[i], fnIx, ec, ec) < 0 { return -1 }
+    if emitStrCatOperand(body, parts[i], fnIx, ec) < 0 { return -1 }
     i = i + 1
   }
   let j = n - 1
@@ -18162,7 +18162,7 @@ function emitStrAccAppend(body: u8[], binIx: i32, fnIx: i32, ec: ExpCtx) {
       const n = parts.length
       let i = 1
       while i < n {
-        if emitStrCatOperand(body, parts[i], fnIx, ec, ec) < 0 { return -1 }
+        if emitStrCatOperand(body, parts[i], fnIx, ec) < 0 { return -1 }
         i = i + 1
       }
       let j = n - 1
@@ -34759,6 +34759,7 @@ export function wasmEmitStateReset() {
   njRTys = []
   njRUnion = false
   njResBox = false
+  nulAtomTyMemo = Map()
   saFnIx = 0 - 2
   ssArmBin = -1
   ssArmMode = 0
@@ -35205,26 +35206,14 @@ function emitStrValue(body: u8[], ix: i32, fnIx: i32, ec: ExpCtx) {
 // A concatenation operand: a string VALUE even when the destination the whole chain feeds is
 // `string | null`, so that target's raw-read seed must not reach it, or a narrowed nullable
 // reads as `(ref null)` into a non-null slot (D2682).
-function emitStrCatOperand(
-  body: u8[],
-  ix: i32,
-  fnIx: i32,
-  ctx: ExpCtx,
-  ec: ExpCtx,
-) {
-  if ctx.nulString {
-    const opCtx = expCtxHere(ec)
-    opCtx.nulString = false
-    if exprIsLitAtom(ix, fnIx) {
-      const saved = expCtxHere(ec)
-      expCtxApply(opCtx, ec)
-      const ra = emitAtomToStr(body, ix, fnIx, ec)
-      expCtxApply(saved, ec)
-      return ra
-    }
-    return emitExprExpect(body, ix, fnIx, opCtx)
-  }
-  emitStrValue(body, ix, fnIx, ec)
+function emitStrCatOperand(body: u8[], ix: i32, fnIx: i32, ec: ExpCtx) {
+  const saved = expCtxHere(ec)
+  const opCtx = expCtxHere(ec)
+  opCtx.nulString = false
+  expCtxApply(opCtx, ec)
+  const r = emitStrValue(body, ix, fnIx, ec)
+  expCtxApply(saved, ec)
+  r
 }
 
 // Narrow a string-repped literal-union value to its interned i32 atom id — `emitAtomToStr`'s
@@ -36144,13 +36133,26 @@ function nullOwnAt(exprIx: i32, fnIx: i32, ctx: ExpCtx): i32 {
   own
 }
 
+// Type -> whether it reps as the `K | null` atom niche, for the program being emitted.
+let nulAtomTyMemo: {[i32]: boolean} = Map()
+
+// Whether type `t` reps as the `K | null` atom niche. Asked of every expression's delivered
+// and contextual types, so the answer is kept per type rather than rebuilt from the rep tree.
+function tyRepsAsNulAtom(t: i32): boolean {
+  const m = nulAtomTyMemo.get(t)
+  if m != null { return m }
+  const d = repOfTy(t)
+  const r = d.rdCovered == 1 && d.rdNul == 3
+  nulAtomTyMemo[t] = r
+  r
+}
+
 // Whether node `ix` is delivered into the `K | null` atom niche: the type the checker stamped
 // it with where it is delivered reps as that niche.
 function deliveredAsNulAtom(ix: i32, fnIx: i32): boolean {
   const st = nodeRepTyAt(unwrapParen(ix), fnIx)
   if st < 0 { return false }
-  const d = repOfTy(st)
-  d.rdCovered == 1 && d.rdNul == 3
+  tyRepsAsNulAtom(st)
 }
 
 // Whether string literal `ix` lowers as its atom: its closed contextual type reps as one, and a
@@ -36240,8 +36242,7 @@ function tyRepsAsAtom(t: i32): boolean {
 function ctxIsNulAtom(ix: i32, fnIx: i32): boolean {
   const ct = ctxTyAt(ix, fnIx)
   if ct < 0 { return false }
-  const d = repOfTy(ct)
-  d.rdCovered == 1 && d.rdNul == 3
+  tyRepsAsNulAtom(ct)
 }
 
 // The null a bare `null` lowers to: the bottom ref, the `boolean | null` sentinel 2, the
