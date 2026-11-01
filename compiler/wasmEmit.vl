@@ -24814,11 +24814,43 @@ function emitTagSetAt(ix: i32, fnIx: i32): i32 {
 }
 
 // Whether the callee `f` reads a parameter whose recorded type in this function is tagged set
-// `s`, so its value is a member's id.
+// `s`, or an element chain off one whose list holds `s`, so its value is a member's id.
 function emitTagParamHolds(f: i32, s: i32): boolean {
-  const d = identDeclOf(parenPeelIx(f))
+  let r = parenPeelIx(f)
+  let chain = false
+  let hops = 0
+  while r >= 0 && hops < 16 {
+    const n = nodeAt(r)
+    if n is Index { r = parenPeelIx(n.idxArr) } else { hops = 16 }
+    if hops < 16 {
+      chain = true
+      hops = hops + 1
+    }
+  }
+  const d = identDeclOf(r)
   if d < 0 || !(nodeAt(d) is Param) { return false }
-  fnTagSetOfTy(nodeTyIxOf(d)) == s
+  if !chain { return fnTagSetOfTy(nodeTyIxOf(d)) == s }
+  let t = nodeTyIxOf(d)
+  let depth = 0
+  while t >= 0 && t < T.tys.length && depth < 16 {
+    const a = tyAt(t)
+    if !(a is TyArray) { return depth > 0 && fnTagSetOfTy(t) == s }
+    t = a.aElem
+    depth = depth + 1
+  }
+  false
+}
+
+// The one result type every member call `arms` gives in function `fnIx`, or -1 when they differ.
+function fnTagArmsOneTy(arms: i32[], fnIx: i32): i32 {
+  let t = -1
+  for a in arms {
+    const at = nodeTyAt(a, fnIx)
+    if at < 0 { return -1 }
+    if t >= 0 && !tySame(at, t) { return -1 }
+    t = at
+  }
+  t
 }
 
 // A call through a tagged function set (`fnTagDecide`): the callee is the i32 id of the member
@@ -24841,7 +24873,12 @@ function emitFnTagDispatch(
   if emitExpr(body, c.callFn, fnIx, expCtxDefault()) < 0 { return -1 }
   const slot = fnTagIdSlot()
   fbLocalSet(slot)
-  const ty = nodeTyAt(callIx, fnIx)
+  let ty = nodeTyAt(callIx, fnIx)
+  // A call through a list element the instance leaves untyped takes its members' one result.
+  if !isVoidTy(ty) && repSigKindOfTy(ty) == null {
+    const at = fnTagArmsOneTy(arms, fnIx)
+    if at >= 0 { ty = at }
+  }
   // A call through a set of void members leaves no value, and answers 1.
   const isVoid = isVoidTy(ty)
   let kind: VKind | null = "i32"
