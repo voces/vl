@@ -47,8 +47,10 @@ import {
   recKeptFnDstOf,
 } from "./check_rec_rows"
 import { cwFnValueDeclOf, cwPeelValue } from "./check_write_scan"
-import { recordRepTyAdopt } from "./check_fit_rules"
-import { recInferredFnOf } from "./check_rec_fresh"
+import { recHoleIdentityArg, recordRepTyAdopt } from "./check_fit_rules"
+import { recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
+import { recSolePinArg } from "./check_record_origins"
+import { recFnValueLeaves } from "./check_type_shape"
 import { parenPeelIx } from "./check_places"
 import {
   elabCallD,
@@ -3424,6 +3426,13 @@ export function elabNodeTy(ix: i32, k: i32): i32 {
 }
 
 // Type `t` under instance `k`'s binding, or -1 where that does not close.
+// `t` at the instance emitted function `fnIx` is, or is lifted inside: that instance's binding
+// substituted; -1 outside one or where the substitution leaves it open.
+export function elabInstTyAt(t: i32, fnIx: i32): i32 {
+  if fnIx < 0 { return -1 }
+  elabSubstClosed(t, elabKeyAt(fnIx))
+}
+
 function elabSubstClosed(t: i32, k: i32): i32 {
   if t < 0 || t >= T.tys.length || k < 0 || k >= ekNames.length { return -1 }
   let names = ekNames[k]
@@ -3588,11 +3597,7 @@ function litKeptRepFrom(ix: i32, depth: i32): i32 {
   const p = parenPeelIx(ix)
   if p < 0 || p >= P.nodes.length { return -1 }
   const n = nodeAt(p)
-  if n is Call {
-    const fd = recInferredFnOf(p)
-    if fd < 0 { return -1 }
-    return recKeptFnDstOf(fd, nonNulTyOf(nodeTyIxOf(p)))
-  }
+  if n is Call { return litKeptCallRep(p, depth) }
   if n is ArrayLit {
     let r = -1
     for e in n.arrElems {
@@ -3603,6 +3608,29 @@ function litKeptRepFrom(ix: i32, depth: i32): i32 {
     return if r >= 0 { mkArrayTy(r) } else { -1 }
   }
   litKeptObjRep(p, depth)
+}
+
+// `litKeptRepOf` at a call `p`: a kept function's record, through a generic or hole identity
+// to its argument, or through a function every result of which is a binding of such a call.
+function litKeptCallRep(p: i32, depth: i32): i32 {
+  const sa = recSolePinArg(p)
+  if sa >= 0 { return litKeptRepOf(sa, depth - 1) }
+  const fd = recInferredFnOf(p)
+  if fd < 0 { return -1 }
+  const kd = recKeptFnDstOf(fd, nonNulTyOf(nodeTyIxOf(p)))
+  if kd >= 0 { return kd }
+  const ha = recHoleIdentityArg(p, fd)
+  if ha >= 0 { return litKeptRepOf(ha, depth - 1) }
+  let r = -1
+  for lf in recFnValueLeaves(fd) {
+    const hd = if lf >= 0 && nodeAt(lf) is Ident { recHeldDecl(lf) } else { -1 }
+    const hn = if hd >= 0 { nodeAt(hd) } else { null }
+    if !(hn is LetDecl) { return -1 }
+    const lr = litKeptRepOf(hn.letInit, depth - 1)
+    if lr < 0 || (r >= 0 && !tySame(r, lr)) { return -1 }
+    r = lr
+  }
+  r
 }
 
 // `litKeptRepOf` at a record literal `p`: its own type with each field holding a kept result

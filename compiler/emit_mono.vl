@@ -404,7 +404,6 @@ import {
   bodyRebuiltFrom,
   buildFnChildIndex,
   caResumeArmed,
-  capMemoArmed,
   emitRootIx,
   fmResumeArmed,
   fnChildHead,
@@ -424,10 +423,6 @@ import {
   lfNoteMinted,
   monoAnonParamPinTy,
   monoArgInstFe,
-  monoExactSubN,
-  monoExactSubOwn,
-  monoExactSubRow,
-  monoExactSubT,
   monoFieldReadTyIn,
   monoFieldReadTys,
   monoGen,
@@ -578,10 +573,8 @@ import {
   TY_WALK_DEPTH,
   elabClosedTyAt,
   exactBindWalk,
-  exactSubAt,
   holeNulStringPinTyOf,
   instanceBindsNothingClosed,
-  monoExactSubRowOf,
   nodeTyInOf,
   pinSubAt,
   pinnedParamTyAt,
@@ -596,6 +589,7 @@ import {
   elabCallParamTy,
   elabDemand,
   elabInstSpelling,
+  elabInstTyAt,
   elabKeyAt,
   elabNarrowedCarry,
   elabNodeTys,
@@ -643,8 +637,6 @@ import {
   buildFnMapNoteFnStmtWrite,
   collectA,
   collectANoteIdentRename,
-  computeRetInference,
-  computeVoidFns,
   registerInlineUnionOfTy,
   registerTyReachUnions,
 } from "./emit_collect"
@@ -6249,7 +6241,7 @@ function monoPinMapLambdas(
 // Rebuild the name→index map and `collectA`'s rep rows after a new instance lands in
 // `fnStmts`: a pinned `string[]`/`f64` annotation forces types the original generic name never
 // did. Both read the arena alone, so an unmoved stamp means that state is in hand; `collectA`
-// resumes here alone, where only this module edits. The return inference waits for the settle.
+// resumes here alone, where only this module edits.
 function monoRebuild() {
   const stamp = monoArenaStamp()
   if stamp == monoRebuiltStamp { return 0 }
@@ -6262,26 +6254,7 @@ function monoRebuild() {
   fmResumeArmed = false
   if bfmRc < 0 { return -1 }
   capMemoNoteEdit()
-  monoRetPending = true
   monoRebuiltStamp = stamp
-  0
-}
-
-// Set by a rebuild, whose `buildFnMap` re-seeds the return rows; cleared by `monoRetSettle`.
-let monoRetPending = false
-
-// Re-derive voidness and the inferred return kinds once, after the walk, rather than per
-// instance: both are whole-program fixpoints, so per instance they cost instances x functions.
-// They read capture sets and edit no body, so one run shares one capture memo (D2771).
-function monoRetSettle() {
-  if !monoRetPending { return 0 }
-  monoRetPending = false
-  capMemoNoteEdit()
-  const savedArmed = capMemoArmed
-  capMemoArmed = true
-  computeVoidFns()
-  computeRetInference()
-  capMemoArmed = savedArmed
   0
 }
 
@@ -9477,11 +9450,8 @@ function monoExactClear(outN: string[], outT: i32[]): boolean {
 // pinned types; else `t` itself.
 function monoExactPinTyOf(t: i32, ctx: i32): i32 {
   if t < 0 || !tyHasTyVar(t) { return t }
-  const row = monoExactSubRowOf(ctx)
-  if row >= 0 && row < monoExactSubN.length {
-    const st = exactSubAt(t, row)
-    if st >= 0 && !tyHasTyVar(st) { return st }
-  }
+  const st = elabInstTyAt(t, ctx)
+  if st >= 0 { return st }
   monoPinSubTyOf(t, ctx)
 }
 
@@ -9571,10 +9541,6 @@ export function monoStateReset() {
 
 // Empties the instance-binding tables, which `monomorphize` fills and the classifiers read.
 export function monoSubTablesReset() {
-  monoExactSubRow = Map()
-  monoExactSubN = []
-  monoExactSubT = []
-  monoExactSubOwn = []
   monoHoleSubRow = Map()
   monoHoleSubN = []
   monoHoleSubT = []
@@ -10392,15 +10358,13 @@ function monoTwoListOf(r: i32): i32 {
 }
 
 // Records a new instance under `key` in the registry, with the side tables keyed by its
-// slot `instFe`: the two-list result type and the exact, pin and hole binding rows.
+// slot `instFe`: the two-list result type and the pin and hole binding rows.
 function monoMakeInstanceRegister(
   key: string,
   origFe: i32,
   instName: string,
   instFe: i32,
   twoListTy: i32,
-  exSubN: string[],
-  exSubT: i32[],
   letBN: string[],
   letBT: i32[],
   instHoleN: string[],
@@ -10412,12 +10376,6 @@ function monoMakeInstanceRegister(
   monoInstFe.push(instFe)
   monoLastInstFe = instFe
   if twoListTy >= 0 { monoTwoListRet.set(instFe, twoListTy) }
-  if exSubN.length > 0 {
-    monoExactSubRow.set(instFe, monoExactSubN.length)
-    monoExactSubN.push(exSubN)
-    monoExactSubT.push(exSubT)
-    monoExactSubOwn.push(monoInstOwn)
-  }
   if letBN.length > 0 {
     monoPinSubRow.set(instFe, monoPinSubN.length)
     monoPinSubN.push(letBN)
@@ -11060,8 +11018,6 @@ function monoMakeInstanceGo(
       instName,
       instFe,
       twoListTy,
-      k.exSubN,
-      k.exSubT,
       letBN,
       letBT,
       holeN,
@@ -27204,7 +27160,6 @@ export function monomorphize(stmts: i32[]) {
   monoLamCallCallees = []
   monoProgLamNames = []
   monoRebuiltStamp = 0 - 1
-  monoRetPending = false
   monoBodyDeclStamp = 0 - 1
   monoGen = []
   monoOrigNode = []
@@ -27374,11 +27329,8 @@ export function monomorphize(stmts: i32[]) {
     fe3 = fe3 + 1
   }
   monoReachLitTys()
-  // Settled before the prune, as the walk left it, and again after, in case the prune minted.
-  monoRetSettle()
   const prc = monoPruneTemplates(nDecl)
   if prc < 0 { return prc }
-  monoRetSettle()
   // Each un-annotated binding the walk left open takes the closed type its initializer holds.
   let ai = 0
   while ai < P.nodes.length {

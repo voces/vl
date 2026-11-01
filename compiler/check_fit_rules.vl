@@ -489,7 +489,6 @@ import {
   CW_UP_ARG,
   CW_UP_ASG_LHS,
   CW_UP_CALLEE,
-  CW_UP_ELEM,
   CW_UP_FIELD,
   CW_UP_LETINIT,
   CW_UP_OBJ,
@@ -1831,8 +1830,8 @@ function recFnReturns(fd: i32): i32[] {
 
 // Whether call sites `sites` are `call` and calls each landing `own` on `dst`'s field storage,
 // queued for none, or stored into a container (`recHeldStored`, `recStoresAgree`), so one build
-// serves them all (D8201). One queued for none is read for a field, and `dst` widens a field no
-// further than `recNullWidened` reads back exactly (D8302).
+// serves them all (D8201). For one queued for none, `dst` widens a field no further than
+// `recNullWidened` reads back exactly, and its slots take the build (D8302).
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
@@ -1847,7 +1846,7 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     } else if (
       c == call
       || !recNullWidened(own, dst, mapped)
-      || (!mapped && (recQueuedReaches(c, own) || !recReadInPlace(c)))
+      || (!mapped && recQueuedReaches(c, own))
     ) {
       return false
     }
@@ -1882,58 +1881,6 @@ function recNullWidened(own: i32, dst: i32, stored: boolean): boolean {
       i = i + 1
     }
     return true
-  }
-  false
-}
-
-// Whether the value of call `c` is only read for a field: `c.f`, or an un-annotated `const`
-// whose every use is a field read. Any other use stores it where its own row is built (D8302).
-function recReadInPlace(c: i32): boolean {
-  cwIxBuild()
-  if recFieldRead(c) { return true }
-  // An element of a list literal that is only indexed is read where the index read is.
-  if c >= 0 && c < cwIxUpKind.length && cwIxUpKind[c] == CW_UP_ELEM {
-    const lit = cwIxUp[c]
-    if lit >= 0 && lit < cwIxUpKind.length && cwIxUpKind[lit] == CW_UP_OBJ {
-      const ix = cwIxUp[lit]
-      if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Index {
-        return recReadInPlace(ix)
-      }
-    }
-  }
-  // An argument a generic identity alone pins is read where the identity's result is.
-  if c >= 0 && c < cwIxUpKind.length && cwIxUpKind[c] == CW_UP_ARG {
-    const up = cwIxUp[c]
-    if up >= 0 && up < P.nodes.length && recSolePinArg(up) >= 0 {
-      if cwPeelValue(recSolePinArg(up)) == c { return recReadInPlace(up) }
-    }
-    // So is one a non-generic function hands back from an un-annotated parameter (D14730).
-    if up >= 0 && up < P.nodes.length {
-      const uc = nodeAt(up)
-      if uc is Call && uc.callFn >= 0 {
-        const ha = recHoleIdentityArg(up, identBoundFnDeclOf(uc.callFn))
-        if ha >= 0 && cwPeelValue(ha) == c { return recReadInPlace(up) }
-      }
-    }
-  }
-  if c >= cwIxUpKind.length || cwIxUpKind[c] != CW_UP_LETINIT { return false }
-  const d = cwIxUp[c]
-  if d < 0 || d >= P.nodes.length { return false }
-  const dn = nodeAt(d)
-  if dn is LetDecl {
-    if dn.letType >= 0 || dn.letKw != "const" { return false }
-    let used = false
-    const ow = cwOccWalk(d)
-    while cwOccNext(ow) {
-      const r = ow.row
-      if cwIxKind[r] == CW_OCC_USE {
-        if !recFieldRead(cwIxNode[r]) { return false }
-        used = true
-      } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
-        return false
-      }
-    }
-    return used
   }
   false
 }
@@ -2709,8 +2656,36 @@ export function recBuiltReadTy(x: i32): i32 {
 }
 
 // The storage a kept delivery builds the stored value `v` at, else -1.
-function recMapStoreKeptDst(v: i32): i32 {
-  const d = recFreshOriginDecl(cwPeelValue(v), 6)
+function recMapStoreKeptDst(v: i32): i32 { recKeptValueDst(v, 6) }
+
+// `recMapStoreKeptDst` through a generic or hole identity to its argument, or through a call of a
+// function every result of which is a binding of such a value.
+function recKeptValueDst(v: i32, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const p = cwPeelValue(v)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const sa = recSolePinArg(p)
+  if sa >= 0 { return recKeptValueDst(sa, depth - 1) }
+  const kd = recKeptDstOfDecl(recFreshOriginDecl(p, 6))
+  if kd >= 0 { return kd }
+  const fd = recInferredFnOf(p)
+  if fd < 0 { return -1 }
+  const ha = recHoleIdentityArg(p, fd)
+  if ha >= 0 { return recKeptValueDst(ha, depth - 1) }
+  let r = -1
+  for lf in recFnValueLeaves(fd) {
+    const hd = if lf >= 0 && nodeAt(lf) is Ident { recHeldDecl(lf) } else { -1 }
+    const hn = if hd >= 0 { nodeAt(hd) } else { null }
+    if !(hn is LetDecl) { return -1 }
+    const lr = recKeptValueDst(hn.letInit, depth - 1)
+    if lr < 0 || (r >= 0 && !tySame(r, lr)) { return -1 }
+    r = lr
+  }
+  r
+}
+
+// The storage the kept function `d` builds at (`recKeptDecl`), else -1.
+function recKeptDstOfDecl(d: i32): i32 {
   if d < 0 { return -1 }
   let k = recKeptDecl.length - 1
   while k >= 0 && recKeptDecl[k] != d { k = k - 1 }
@@ -2826,10 +2801,40 @@ export function recKeptStoreDecls(out: i32[]) {
     const sites: i32[] = []
     if nodeAt(fd) is FuncDecl && rcwCallSites(fd, sites) < 0 {
       for s in sites {
-        if s % 2 == 0 { recHeldStoreDecls(s / 2, out) }
+        if s % 2 == 0 { recRelayStoreDecls(s / 2, out, 4) }
       }
     }
     k = k + 1
+  }
+  0
+}
+
+// `recHeldStoreDecls` of the call `c` and of each call its value is relayed out of: a generic or
+// hole identity it is the argument of, or a call of a function that returns a binding of it.
+function recRelayStoreDecls(c: i32, out: i32[], depth: i32) {
+  recHeldStoreDecls(c, out)
+  if depth <= 0 || c < 0 || c >= cwIxUpKind.length { return 0 }
+  const up = cwIxUp[c]
+  if up < 0 || up >= P.nodes.length { return 0 }
+  if cwIxUpKind[c] == CW_UP_ARG && nodeAt(up) is Call {
+    const sa = recSolePinArg(up)
+    const fd = recInferredFnOf(up)
+    const ha = if fd >= 0 { recHoleIdentityArg(up, fd) } else { -1 }
+    if (sa >= 0 && cwPeelValue(sa) == c) || (ha >= 0 && cwPeelValue(ha) == c) {
+      recRelayStoreDecls(up, out, depth - 1)
+    }
+    return 0
+  }
+  if cwIxUpKind[c] != CW_UP_LETINIT || !(nodeAt(up) is LetDecl) { return 0 }
+  const fd = recEnclosingFn(up)
+  if fd < 0 { return 0 }
+  for lf in recFnValueLeaves(fd) {
+    if lf < 0 || !(nodeAt(lf) is Ident) || recHeldDecl(lf) != up { return 0 }
+  }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 { return 0 }
+  for s in sites {
+    if s % 2 == 0 { recRelayStoreDecls(s / 2, out, depth - 1) }
   }
   0
 }
