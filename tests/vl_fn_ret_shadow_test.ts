@@ -351,15 +351,35 @@ Deno.test({
   },
 });
 
-// The row shadow: a recorded record result the lowering keys at another slot is graded by the
-// row each returned value was stamped built at. A fresh literal stamped at its delivery's row
-// agrees; an identity instance's value, stamped at its binding, is built at the delivery's.
+// The row shadow: a recorded result whose slot the lowering keys elsewhere is graded by the row
+// each returned value was stamped built at. A fresh record a kept delivery builds wider is
+// recorded at that row (`recKeptFnDstOf`) and agrees outright; a list of an instance's function
+// value agrees by its stamp; an identity instance's value, stamped at its binding, is built at
+// the delivery's.
 const ROW_STAMP = `const i: { f: i32 } = { f: 4 }
 type I = { f: i32 | null }
 function mk() { { f: 7 } }
 const b: I = mk()
 print(b.f ?? 0)
 print(i.f)
+`;
+
+const ROW_LIST = `function id<T>(x: T): T { x }
+function d() { return [id] }
+const v: ((x: i32) => i32)[] = d()
+print(v[0](2))
+const u: ((x: i32) => i32)[] = d()
+print(u[0](3) + 2)
+function ds() { return [id] }
+const w: ((x: string) => string)[] = ds()
+const g = w[0]
+print(g("s"))
+function di() { return [id, id] }
+function main() {
+  const xs: ((x: i32) => i32)[] = di()
+  for f in xs { print(f(3)) }
+}
+main()
 `;
 
 const ROW_DELIVERY = `type J = { r: i32 | null }
@@ -379,7 +399,15 @@ Deno.test({
       ROW_STAMP,
       DROP_NONE,
       true,
-      "row agree | mk=1",
+      "kind agree | mk=1",
+      true,
+    );
+    expectRows(
+      "row list",
+      ROW_LIST,
+      DROP_NONE,
+      true,
+      "kind agree | ds=1; kind agree | id$1=1; kind agree | id=1; row agree | d=1; row agree | di=1",
       true,
     );
     expectRows(
