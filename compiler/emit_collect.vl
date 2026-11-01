@@ -64,7 +64,7 @@ import {
   optCallRetNodeAt,
 } from "./check_call_resolve"
 import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
-import { unionAliasMembers } from "./check_nj_join"
+import { collectRetValues, unionAliasMembers } from "./check_nj_join"
 import { declAnnRawTyName, declAnnTyOf } from "./check_gen_alias_anns"
 import { fieldNameOrder } from "./check_obj_shape"
 import { inferJoinCount, inferJoinTyAt } from "./check_inline_lit_union"
@@ -220,6 +220,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import {
+  identDeclOf,
   sidArrGet,
   sidArrPut,
   sidNoteNodeName,
@@ -584,6 +585,7 @@ import {
   sTyIxOfName,
   structCanonIxReset,
 } from "./emit_rep"
+import { repSigSlotTyOf, repSlotOfKind } from "./emit_rep_slot"
 import { RS_TAG, relSkew } from "./emit_reloc"
 import {
   anonFieldElemKeyKind,
@@ -3125,6 +3127,61 @@ function fnRetRefListDemand(i: i32) {
   0
 }
 
+// The record row of un-annotated function `i` read from the rep stamp of every value it returns,
+// where its recorded result is a record, variant or nullable record and each stamp names one
+// row. A value stamped open, or built by a call, keeps the walk (D14900). True if set.
+function criRowByStamp(i: i32): boolean {
+  if i >= fRecRetTy.length { return false }
+  const rk = repSigKindOfTy(fRecRetTy[i])
+  if rk != "struct" && rk != "nulstruct" && rk != "variant" { return false }
+  const fn = nodeAt(fnStmts[i])
+  if !(fn is FuncDecl) { return false }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  if vals.length == 0 { return false }
+  let kind: VKind | null = null
+  let slot = -1
+  let v = 0
+  while v < vals.length {
+    if criBuiltAtCallee(vals[v]) { return false }
+    const sty = nodeRepTyIxOf(vals[v])
+    if sty < 0 || tyHasTyVar(sty) { return false }
+    const k = repSigKindOfTy(sty)
+    if k != rk { return false }
+    const sl = repSlotOfKind(k, repSigSlotTyOf(sty))
+    if sl < 0 || (v > 0 && sl != slot) { return false }
+    kind = k
+    slot = sl
+    v = v + 1
+  }
+  if kind == null { return false }
+  if fRetKind[i] == kind && fRetStructIdx[i] == slot { return true }
+  fRetKind[i] = kind
+  fRetStructIdx[i] = slot
+  criChanged = true
+  true
+}
+
+// Whether returned value `v` is built where another function delivers it: a call, or a name a
+// `const` initialised by one, through any chain of such names.
+function criBuiltAtCallee(v: i32): boolean {
+  let cur = unwrapParen(v)
+  let hops = 0
+  while cur >= 0 && cur < P.nodes.length && hops < 64 {
+    const n = nodeAt(cur)
+    if n is Call { return true }
+    if !(n is Ident) { return false }
+    const d = identDeclOf(cur)
+    if d < 0 { return false }
+    const dn = nodeAt(d)
+    if !(dn is LetDecl) { return false }
+    if dn.letKw != "const" || dn.letInit < 0 { return false }
+    cur = unwrapParen(dn.letInit)
+    hops = hops + 1
+  }
+  false
+}
+
 export function computeRetInference() {
   let changed = true
   while changed {
@@ -3140,34 +3197,36 @@ export function computeRetInference() {
           criChanged = false
           const fnb = nodeAt(fnStmts[i])
           if fnb is FuncDecl {
-            if fnb.fnBody >= 0 {
-              const fb = nodeAt(fnb.fnBody)
-              if fb is Block {
-                const fbs = fb.blkStmts
-                if fbs.length > 0 {
-                  const tailIx = fbs[fbs.length - 1]
-                  // A value-yielding member call (`xs.map(…)`) is the tail `computeVoidFns` kept
-                  // non-void, so it types the result as `return xs.map(…)` would (D2566).
-                  if (
-                    stmtIsTailValue(tailIx, fnStmts[i])
-                    || memberCallYieldsValue(tailIx)
-                  ) {
-                    criClassify(tailIx, i)
-                  } else {
-                    // A tail value-`if` is not a `stmtIsTailValue` — that predicate has no
-                    // `IfStmt` case — so a named function's inferred struct return through an
-                    // if-join went unclassified. Classify the whole `if` here; `exprStruct` and
-                    // `exprString` see through it and pick up the join's ref.
-                    const tn = nodeAt(tailIx)
-                    if tn is IfStmt {
-                      if tn.ifElse >= 0 { criClassify(tailIx, i) }
+            if !criRowByStamp(i) {
+              if fnb.fnBody >= 0 {
+                const fb = nodeAt(fnb.fnBody)
+                if fb is Block {
+                  const fbs = fb.blkStmts
+                  if fbs.length > 0 {
+                    const tailIx = fbs[fbs.length - 1]
+                    // A value-yielding member call (`xs.map(…)`) is the tail `computeVoidFns` kept
+                    // non-void, so it types the result as `return xs.map(…)` would (D2566).
+                    if (
+                      stmtIsTailValue(tailIx, fnStmts[i])
+                      || memberCallYieldsValue(tailIx)
+                    ) {
+                      criClassify(tailIx, i)
+                    } else {
+                      // A tail value-`if` is not a `stmtIsTailValue` — that predicate has no
+                      // `IfStmt` case — so a named function's inferred struct return through an
+                      // if-join went unclassified. Classify the whole `if` here; `exprStruct` and
+                      // `exprString` see through it and pick up the join's ref.
+                      const tn = nodeAt(tailIx)
+                      if tn is IfStmt {
+                        if tn.ifElse >= 0 { criClassify(tailIx, i) }
+                      }
                     }
                   }
                 }
               }
+              criWalkBlock(fnb.fnBody, i, true)
+              criStructByFnTy(i)
             }
-            criWalkBlock(fnb.fnBody, i, true)
-            criStructByFnTy(i)
             criNulCloByRecorded(i)
           }
           if criChanged { changed = true }
