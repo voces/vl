@@ -7,9 +7,11 @@
 // collection leaving more than 75% of a semispace live (`SeedGcHeadroom`,
 // scripts/vl-host/src/main.rs; docs/internals/perf/gc-heap-policy-2026-09.md §4).
 //
-// The workload is `vl check compiler/emit_base.vl` at the default first heap (128 MiB a
-// semispace), whose live set passes the 96 MiB the policy grows at: 4 and 24 to 26 collections
-// over 2026-10-31 and 2026-11-01. The default heap is the engine configuration every other compile shares, so its
+// The workload is `vl check compiler/check_relate_core.vl` at the default first heap (128 MiB a
+// semispace), whose live set passes the 96 MiB the policy grows at: 4 and 41 collections on
+// 2026-11-01. `emit_base.vl` was the workload until a ~1 MiB drop in its live set took its
+// policy-off count from 32 to 10, inside `MAX_DEFAULT`; this one read 41 on both seeds. The
+// default heap is the engine configuration every other compile shares, so its
 // `.cwasm` is already warm; a pinned heap was its own configuration and re-JITted the seed
 // (about 13 s) on every new seed. Three bounds: the default
 // collects at least once (a dead counter reads 0) and at most `MAX_DEFAULT`; the policy switched
@@ -31,11 +33,11 @@ if (!ENABLED) {
   );
 }
 
-const TARGET = `${ROOT}/compiler/emit_base.vl`;
+const TARGET = `${ROOT}/compiler/check_relate_core.vl`;
 
 // 4 at the time of writing; loose so a compiler change that moves the live set cannot red it.
 const MAX_DEFAULT = 12;
-// 24 / 4 at the time of writing.
+// 41 / 4 at the time of writing.
 const MIN_SPREAD = 3;
 
 async function collections(grow: string, label: string): Promise<number> {
