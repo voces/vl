@@ -113,6 +113,7 @@ import {
   tyIsMap,
   tyIsNulStringRep,
   tyIsOneStrLit,
+  tyIxIsFunc,
   tyLitMemberTexts,
   tyMembersDistinctRecords,
   tyNomNameCycled,
@@ -685,6 +686,7 @@ import {
 import { nameIsWholeSpanShape } from "./emit_field_codes"
 import {
   cloSigPosOfKey,
+  criSetRetKind,
   criSettleNonNullRecordRet,
   fnInferredRetLitAtom,
   retAnnKindChain,
@@ -2846,7 +2848,8 @@ export function buildFnMap(_stmts: i32[]) {
     fRetRArrElem = []
     fRetBool = []
     fRetKind = []
-    fRecRetTy = []
+    // Round 1 drops the previous program's recorded column; round 2's was banked just before.
+    if !emitPhaseReached("monomorphized") { fRecRetTy = [] }
     fRetLitAtom = []
     fmSeedVoid = []
     fmSeedStructIdx = []
@@ -3030,6 +3033,30 @@ function inferNulVariantRow(rt: i32): i32 {
   variantRowOfShapeTy(inferNulInnerTy(rt))
 }
 
+// The nullable-closure niche of function `i` read from its recorded result, where no return the
+// walk reached named it: an `else`-less tail `if`, whose value the walk does not classify, and a
+// clone whose return carries no type of its own (an instance's lambda).
+function criNulCloByRecorded(i: i32) {
+  if fRetKind[i] != "i32" || fRetBool[i] != 0 || i >= fRecRetTy.length {
+    return 0
+  }
+  const r = fRecRetTy[i]
+  if tyIxIsFunc(tyNulInnerTy(r)) || criNulUnionFunc(r) {
+    criSetRetKind(i, "nulclosure")
+  }
+  0
+}
+
+// Whether `ty` is a two-member union of a function type and `null`.
+function criNulUnionFunc(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const u = tyAt(ty)
+  if !(u is TyUnion) || u.uMembers.length != 2 { return false }
+  const a = u.uMembers[0]
+  const b = u.uMembers[1]
+  (tyIxIsFunc(a) && b == TY_NULL) || (tyIxIsFunc(b) && a == TY_NULL)
+}
+
 // The struct row of the result the checker gave function `i`, for a function the expression
 // walk left at the `i32` default. The walk classifies a returned local by a kind no global
 // pass has collected yet, so an `if` joining two struct locals declared an i32 result over a
@@ -3113,6 +3140,7 @@ export function computeRetInference() {
             }
             criWalkBlock(fnb.fnBody, i, true)
             criStructByFnTy(i)
+            criNulCloByRecorded(i)
           }
           if criChanged { changed = true }
         }
