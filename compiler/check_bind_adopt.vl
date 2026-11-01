@@ -33,20 +33,24 @@ import { parenPeelIx } from "./check_places"
 import { recFreshDeclOf, recHeldDecl } from "./check_rec_fresh"
 import {
   recArgRepOf,
+  recBuildPassTable,
   recBuildTyOf,
   recKeptFnDstOf,
   recListLits,
   recListLitsLate,
   recListLitsLateSet,
+  recObjLits,
+  recObjLitsSet,
 } from "./check_rec_rows"
 import {
   litAtDstStorage,
   recBuiltReadTy,
+  recBuiltReadTyIn,
   recHoleIdentityArg,
   recordRepTyAdopt,
   repStampListBuilt,
 } from "./check_fit_rules"
-import { nonNullTy } from "./tyquery"
+import { isNullTy, nonNullTy, tyHasTyVar } from "./tyquery"
 import { recSolePinArg } from "./check_record_origins"
 import { assignable, bindGenWalk, substTyDeep } from "./check_relate_core"
 import { identBoundFnDeclOf } from "./check_scopes"
@@ -57,8 +61,12 @@ import {
   TyArray,
   TyFunc,
   TyObj,
+  TyUnion,
+  cUserTypes,
+  cUserTypesVer,
   mkArrayTy,
   tyAt,
+  tyFieldTyOf,
   tyHasHole,
   tyMentionsErr,
   tySame,
@@ -174,24 +182,29 @@ function recListRepWidens(narrow: i32, wide: i32): boolean {
 // rep a by-rep instance takes, its rep stamp, a rebuilt literal or call, a fresh binding's build,
 // or a read out of a built container; else -1. The one answer the bind rows and mono read.
 export function recArgBuiltTyOf(a: i32, own: i32): i32 {
+  recArgBuiltTyIn(a, own, recBuildPassTable())
+}
+
+// `recArgBuiltTyOf` with containers' builds read from `tbl`; mono passes `recBuildTable()`.
+export function recArgBuiltTyIn(a: i32, own: i32, tbl: Map<i32, i32>): i32 {
   const ar = recArgRepOf(parenPeelIx(a))
   if ar >= 0 { return ar }
   // A list literal whose elements are all built at one wider record is a list of it (D14733).
   const ln = nodeAt(parenPeelIx(a))
-  if ln is ArrayLit { return recListLitBuiltTyOf(ln, own) }
+  if ln is ArrayLit { return recListLitBuiltTyOf(ln, own, tbl) }
   let rt = nodeRepTyIxOf(a)
   if rt == own { rt = recRebuiltLeafRow(a, REC_REBUILT_DEPTH) }
   if rt < 0 || rt == own { rt = cbaBuildTyOf(a, rt) }
   // A read out of a container its stores build at another record is stored there.
   if rt < 0 || rt == own {
-    const br = recBuiltReadTy(parenPeelIx(a))
+    const br = recBuiltReadTyIn(parenPeelIx(a), tbl)
     if br >= 0 { rt = nonNullTy(br) }
   }
   // A call handing its argument back is built where that argument is (D14811).
   if rt < 0 || rt == own {
     const ia = cbaIdentityArg(parenPeelIx(a))
     if ia >= 0 && ia != a {
-      const ib = recBuiltReadTy(parenPeelIx(ia))
+      const ib = recBuiltReadTyIn(parenPeelIx(ia), tbl)
       if ib >= 0 { rt = nonNullTy(ib) }
     }
   }
@@ -213,12 +226,12 @@ function cbaIdentityArg(p: i32): i32 {
 
 // `recArgBuiltTyOf` for list literal `l` of type `own`: the list of the record every element is
 // built at, where that is one record wider than the element type; else -1.
-function recListLitBuiltTyOf(l: ArrayLit, own: i32): i32 {
+function recListLitBuiltTyOf(l: ArrayLit, own: i32, tbl: Map<i32, i32>): i32 {
   const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
   if !(ot is TyArray) || l.arrElems.length == 0 { return -1 }
   let r = -1
   for e in l.arrElems {
-    const et = recArgBuiltTyOf(e, ot.aElem)
+    const et = recArgBuiltTyIn(e, ot.aElem, tbl)
     if et < 0 || (r >= 0 && !tySame(r, et)) { return -1 }
     r = et
   }
@@ -237,6 +250,126 @@ function recListCallRepTy(x: i32, own: i32): i32 {
   const iv = parenPeelIx(dn.letInit)
   if iv < 0 || !(nodeAt(iv) is Call) { return -1 }
   callRetRepTy(iv, nodeTyIxOf(iv))
+}
+
+// Stamps each record literal no delivery adopted at the union arm its type is narrower than
+// (`recNarrowRecordOf`), the record such a literal is built as (DECISIONS.md "A literal names its
+// arm"). A literal whose one record is not an arm keeps its own type.
+export function recArmLitsAdopt() {
+  const lits = recObjLits
+  recObjLitsSet([])
+  ralSync()
+  if ralArmN == 0 { return 0 }
+  for ix in lits {
+    const own = if ix >= 0 && ix < P.nodes.length { nodeTyIxOf(ix) } else { -1 }
+    const rt = if own >= 0 { nodeRepTyIxOf(ix) } else { -1 }
+    if own >= 0 && (rt < 0 || tySame(rt, own)) {
+      const arm = recNarrowRecordOf(own)
+      if arm >= 0 && (ralIsArm[arm] ?? false) && litAtDstStorage(ix, arm) {
+        recordRepTyAdopt(ix, arm, 6)
+      }
+    }
+  }
+  0
+}
+
+// The one declared record that closed record `own` is narrower than and stores alike, or -1:
+// where `own` is a declared record itself, or two declared records of different types widen it.
+// Arms of two unions that are one structural type are one record.
+export function recNarrowRecordOf(own: i32): i32 {
+  if own < 0 || own >= T.tys.length { return -1 }
+  const o = tyAt(own)
+  if !(o is TyObj) || tyHasTyVar(own) || tyHasHole(own) { return -1 }
+  ralSync()
+  let one = -1
+  for r in ralBySig[ralSigOf(o.objFieldNames)] ?? [] {
+    if tySame(r, own) { return -1 }
+    if recRepWidens(own, r) {
+      if one >= 0 { return -1 }
+      one = r
+    }
+  }
+  if one >= 0 && ralStoredAlike(own, one) { one } else { -1 }
+}
+
+// Every declared record by its sorted field names, each type once, for the `cUserTypes` version
+// `ralVer` read; `ralIsArm` marks the union members among them, `ralArmN` of them.
+let ralBySig: {[string]: i32[]} = Map()
+let ralIsArm: {[i32]: boolean} = Map()
+let ralArmN = 0
+let ralVer = -1
+
+function ralSync() {
+  if ralVer == cUserTypesVer { return 0 }
+  ralVer = cUserTypesVer
+  ralBySig = Map()
+  ralIsArm = Map()
+  ralArmN = 0
+  for nm in cUserTypes.keys() {
+    const t = cUserTypes[nm] ?? -1
+    const u = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if u is TyUnion && u.uMembers.length > 1 && !tyHasTyVar(t) {
+      for m in u.uMembers {
+        const k = ralAdd(m)
+        if k >= 0 && !(ralIsArm[k] ?? false) {
+          ralIsArm[k] = true
+          ralArmN = ralArmN + 1
+        }
+      }
+    }
+  }
+  for nm in cUserTypes.keys() { ralAdd(cUserTypes[nm] ?? -1) }
+  0
+}
+
+// Files closed record `t` under its field names unless a record the same as it is filed; the
+// filed one, or -1 for a type that is no closed record.
+function ralAdd(t: i32): i32 {
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -1 }
+  const r = tyAt(t)
+  if !(r is TyObj) { return -1 }
+  const sig = ralSigOf(r.objFieldNames)
+  const b = ralBySig[sig] ?? []
+  for u in b {
+    if tySame(u, t) { return u }
+  }
+  if b.length == 0 { ralBySig[sig] = b }
+  b.push(t)
+  t
+}
+
+// The field names `names` sorted, as one key.
+function ralSigOf(names: string[]): string {
+  const s: string[] = []
+  for n in names {
+    let i = s.length
+    s.push(n)
+    while i > 0 && s[i - 1] > n {
+      s[i] = s[i - 1]
+      i = i - 1
+    }
+    s[i] = n
+  }
+  let k = ""
+  for n in s { k = k + n + "," }
+  k
+}
+
+// Whether arm `arm` stores each field of record `own` as `own` does: the same type, or a `null`
+// field, which any field holding null stores. A widening is no such store: a number changes what a
+// read computes (D14493), and a nullable field is a different storage.
+function ralStoredAlike(own: i32, arm: i32): boolean {
+  const o = tyAt(own)
+  if !(o is TyObj) { return false }
+  let i = 0
+  while i < o.objFieldNames.length {
+    const ot = o.objFieldTypes[i]
+    const at = tyFieldTyOf(arm, o.objFieldNames[i])
+    if at < 0 { return false }
+    if !(tySame(ot, at) || isNullTy(ot)) { return false }
+    i = i + 1
+  }
+  true
 }
 
 // Stamps each record list literal checked this pass whose elements are all reads out of
