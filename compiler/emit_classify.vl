@@ -82,7 +82,7 @@ import {
   mapUnboxTyOf,
   nodeRepTyIxOf,
 } from "./check_core_state"
-import { nodeTyIsUnionAlias } from "./check_decl_scan"
+import { letDeclFn, nodeTyIsUnionAlias } from "./check_decl_scan"
 import {
   nodeTyProvesNonNull,
   nodeUnionName,
@@ -12868,15 +12868,16 @@ const pslKey = memoKeyNew(5)
 const pslStamp: i32[] = []
 const pslFn: i32[] = []
 const pslVal: string[] = []
-// The list a field or element read `rx` reads where its cell holds one: the cell's list, a nullable
-// one's base, or the list arm a narrowed read's own type names (`readRepGo`'s conv 8); else null.
-function placeStoreListKind(rx: i32, fnIx: i32): VKind | null {
+// The list a field or element read `rx` reads, by its cell: the cell's list, a nullable one's base,
+// the list arm a narrowed read's own type names, or the list a box or map-value cell's read rep
+// converts to. "-" for a cell that reads as no list, "" for a read with no cell.
+function placeStoreListKind(rx: i32, fnIx: i32): string {
   let moved = memoMoved3(pslKey, emitPassGen, tyMutEpoch, P.nodes.length)
   moved = memoMoved(pslKey, 3, sFieldCount.length) || moved
   moved = memoMoved(pslKey, 4, ekDecl.length) || moved
   if moved { memoGenAdvance(pslGen) }
   if rx < pslStamp.length && pslStamp[rx] == pslGen.at && pslFn[rx] == fnIx {
-    return readListKindOf(pslVal[rx])
+    return pslVal[rx]
   }
   const v = placeStoreListKindGo(rx, fnIx)
   while pslStamp.length <= rx {
@@ -12886,14 +12887,22 @@ function placeStoreListKind(rx: i32, fnIx: i32): VKind | null {
   }
   pslStamp[rx] = pslGen.at
   pslFn[rx] = fnIx
-  pslVal[rx] = if v == null { "" } else { v }
+  pslVal[rx] = v
   v
 }
 
-function placeStoreListKindGo(rx: i32, fnIx: i32): VKind | null {
+function placeStoreListKindGo(rx: i32, fnIx: i32): string {
   const st = readStoreOf(rx, fnIx)
+  if st == "" { return "" }
   const k = readListKindOf(st)
-  if k == null { return null }
+  if k == null {
+    // Only a box or a map value converts to a list at its read; the read rep names which.
+    if st != "union" && !(st.length > 2 && st.slice(0, 2) == "mv") {
+      return "-"
+    }
+    const rk = readListKindOf(readRepOf(rx, fnIx).rrRead)
+    return if rk == null { "-" } else { rk }
+  }
   if readNarrowedStoreAt(rx, fnIx) >= 0 {
     const ld = repOfNode(rx, fnIx)
     if ld.rdCovered == 1 && vkListClass(ld.rdKind) == 1 { return ld.rdKind }
@@ -13011,24 +13020,24 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
   // lowering is not known, a builtin's or a method's among them.
   const ce = nodeAt(exprIx)
   // A name read is what its storage reads as there, once every instance has its own cells; a
-  // template's read before then holds its open parameter's default, so the ladder answers it.
+  // template's read before then holds its open parameter's default, and a read with no cell
+  // there has none, so the ladder answers both.
   if (
     ce is Ident
     && emitPhaseReached("monomorphized")
     && !lrTyIsNoList(nodeTyIxOf(exprIx))
   ) {
-    const nk = readListKindOf(readRepOf(exprIx, fnIx).rrRead)
-    if nk != null { return nk }
+    const rr = readRepOf(exprIx, fnIx)
+    if rr.rrStore != "" { return readListKindOf(rr.rrRead) }
   }
-  // A field or element read whose cell is a list reads that list, or the list arm a narrowing
-  // makes of it; any other cell leaves the read to the ladder below.
+  // A field or element read is what its cell reads as there, the same way.
   if (
     (ce is Member || ce is Index)
     && emitPhaseReached("monomorphized")
     && !lrTyIsNoList(nodeTyIxOf(exprIx))
   ) {
     const pk = placeStoreListKind(exprIx, fnIx)
-    if pk != null { return pk }
+    if pk != "" { return readListKindOf(pk) }
   }
   if ce is Call {
     const ck = callStoreListKind(ce, exprIx, fnIx)
@@ -15395,13 +15404,22 @@ function identStoreClaimed(rx: i32, fnIx: i32): VKind | null {
   letBindRep(d, fnIx).rdKind
 }
 
-// The `let` read `rx` names when `fnIx` is the frame declaring it; -1 for any other read.
+// The `let` read `rx` names when `fnIx` is the frame declaring it; -1 for any other read. Module
+// scope (-1) declares no function body's `let` (D14910).
 function readSlotlessOwnLet(rx: i32, fnIx: i32): i32 {
   const d = identDeclOf(rx)
   if d < 0 || d >= P.nodes.length { return -1 }
   if !(nodeAt(d) is LetDecl) { return -1 }
+  if fnIx < 0 && letInFnBody(d) { return -1 }
   if readDeclOwnerOf(d, fnIx) != fnIx { return -1 }
   d
+}
+
+// Whether `let` `d`, or the node it copies, is declared inside a function body.
+function letInFnBody(d: i32): boolean {
+  if (letDeclFn.get(d) ?? -1) >= 0 { return true }
+  const o = declOrigOf(d)
+  o >= 0 && (letDeclFn.get(o) ?? -1) >= 0
 }
 
 // The nullable rep kinds a read can read as.
