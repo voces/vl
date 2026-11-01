@@ -698,11 +698,13 @@ import {
   fnTagCallSetOf,
   fnTagHoldsTy,
   fnTagLeafCarry,
+  fnTagLeafSetOf,
   fnTagListTy,
   fnTagMembers,
   fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
   fnTagSetOfTy,
+  fnTagSetTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
 
@@ -9636,6 +9638,7 @@ export function monoStateReset() {
   monoCurHasLam = false
   monoDestPinOff = false
   monoElemTakenSig = Map()
+  monoElemAtSet = Map()
   monoInstBody = -1
   monoInstIsFirst = false
   monoInstParams = []
@@ -11245,6 +11248,10 @@ function monoInstanceFor(
   expTy: i32,
   deliveryTys: i32[],
 ) {
+  // A value a call through its set already instanced keeps that instance.
+  if (monoElemAtSet[letInitIx] ?? false) && !monoTysHoldSet(deliveryTys) {
+    return 0
+  }
   const fn = nodeAt(monoOrigNode[origFe])
   if fn is FuncDecl {
     const params = fn.fnParams
@@ -11252,6 +11259,13 @@ function monoInstanceFor(
     // No argument node on this path: the pins are the parameter types of the function type the
     // checker recorded for the value, else the destination's, else the delivery's (D2755).
     let vty = monoFnValueParamTys(nodeTyIxOf(letInitIx), pinnedNames.length)
+    // A destination or delivery handing a tagged set pins the set, which the value's own
+    // recorded type does not name.
+    const ety = monoFnValueParamTys(expTy, pinnedNames.length)
+    if monoTysHoldSet(ety) { vty = ety }
+    if deliveryTys.length == pinnedNames.length && monoTysHoldSet(deliveryTys) {
+      vty = deliveryTys
+    }
     if vty.length == 0 { vty = monoFnValueParamTys(expTy, pinnedNames.length) }
     if vty.length == 0 && deliveryTys.length == pinnedNames.length {
       vty = deliveryTys
@@ -19288,6 +19302,15 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     for pts in rows {
       if pts[j] < 0 { pts[j] = fill }
     }
+    // A function one element takes at its set is taken there by every element.
+    const st = monoElemArgSetTy(n.callArgs[j])
+    let atSet = false
+    for pts in rows {
+      if st >= 0 && pts[j] == st { atSet = true }
+    }
+    if atSet {
+      for pts in rows { pts[j] = st }
+    }
     j = j + 1
   }
   let ft = -1
@@ -19304,7 +19327,7 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     )
     if r < 0 { return 0 }
     const et = mkFuncTy(rows[k], r)
-    if !monoTyClosedFn(et) { return 0 }
+    if !monoTyClosedFn(et) && !monoElemSetFnTy(rows[k], r) { return 0 }
     // Elements typed from their own pins alone must agree on a function argument's parameter
     // types too, which the ABI key does not read.
     if (
@@ -19315,6 +19338,9 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     }
     ft = et
     k = k + 1
+  }
+  if monoElemSetFnTy(rows[0], monoFnTyRet(ft)) {
+    return monoElemsAtSet(n, elems, rows, ft, ctx)
   }
   const nm = monoConcreteFnTyName(ft)
   if nm == "" { return 0 }
@@ -19346,6 +19372,36 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     }
     if monoCoerceFnValueName(el, nm, ctx, ft) < 0 { return -1 }
     monoElemTakenSig[el] = nm
+  }
+  nodeTyRecord(n.callFn, ft)
+  1
+}
+
+// `monoOpenCallAtElems` where a parameter takes a tagged set: each element is its own instance
+// at the rows' types, keyed by the set as a direct call's is. 1 when it typed the callee, else 0.
+function monoElemsAtSet(
+  n: Call,
+  elems: i32[],
+  rows: i32[][],
+  ft: i32,
+  ctx: i32,
+): i32 {
+  let k = 0
+  while k < elems.length {
+    const x = unwrapParen(elems[k])
+    if x < 0 || !(nodeAt(x) is Ident) { return 0 }
+    const xn = nodeAt(x)
+    const fe = if xn is Ident { monoFnFeOfIdent(x, xn.identName, ctx) } else { -1 }
+    if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 { return 0 }
+    const pins: string[] = []
+    for pt in rows[k] {
+      pins.push(
+        if fnTagTyIsTagged(pt) { tyToStr(pt) } else { monoClosedTyPin(pt) },
+      )
+    }
+    if monoInstanceFor(fe, pins, x, -1, rows[k]) < 0 { return -1 }
+    monoElemAtSet[x] = true
+    k = k + 1
   }
   nodeTyRecord(n.callFn, ft)
   1
@@ -19658,14 +19714,23 @@ function monoElemParamTys(
       }
       if got {
         // Every function a parameter can hold is taken at the one instance the pins give.
+        let one = true
         for ax in axs {
           const r = monoFnDeclRetAt(ax, qs)
           const at = if r >= 0 { mkFuncTy(qs, r) } else { -1 }
           if at < 0 || (pt >= 0 && sigKeyOfTy(at) != sigKeyOfTy(pt)) {
-            return none
+            one = false
           }
-          pt = at
+          if one { pt = at }
         }
+        // With no one instance, a function the late decision made an id is taken at its set.
+        if !one {
+          pt = monoElemArgSetTy(args[j])
+          if pt < 0 { return none }
+        }
+      } else if monoElemArgSetTy(args[j]) >= 0 {
+        // A function the late decision made an id is taken at its set, as a direct call does.
+        pt = monoElemArgSetTy(args[j])
       } else if (
         monoElemFwdFnFits(args[j], f.fnParams[j], f.fnBody, bNames, bTys, ctx)
       ) {
@@ -19683,13 +19748,45 @@ function monoElemParamTys(
     } else {
       pt = nodeTyIxOf(unwrapParen(args[j]))
     }
-    if pt < 0 || pt >= T.tys.length || tyHasTyVar(pt) { return none }
+    if pt < 0 || pt >= T.tys.length || tyHasTyVar(pt) && !fnTagTyIsTagged(pt) {
+      return none
+    }
     pts.push(pt)
     j = j + 1
   }
   pts
 }
 
+// The type of the tagged set argument `a` is a member or value of, or -1.
+function monoElemArgSetTy(a: i32): i32 {
+  const x = unwrapParen(a)
+  if x < 0 { return -1 }
+  if fnTagTyIsTagged(nodeTyIxOf(x)) { return nodeTyIxOf(x) }
+  const ls = fnTagLeafSetOf(x)
+  if ls >= 0 && fnTagSetIsTagged(ls) { return fnTagSetTy(ls) }
+  -1
+}
+
+// The element values `monoElemsAtSet` instanced at a tagged set, by node.
+let monoElemAtSet: {[i32]: boolean} = Map()
+
+// Whether some type of `ts` is a tagged set's.
+function monoTysHoldSet(ts: i32[]): boolean {
+  for t in ts {
+    if fnTagTyIsTagged(t) { return true }
+  }
+  false
+}
+
+// Whether parameter types `ps` and result `r` are closed but for at least one tagged set.
+function monoElemSetFnTy(ps: i32[], r: i32): boolean {
+  let set = false
+  for p in ps {
+    if fnTagTyIsTagged(p) { set = true }
+    else if p < 0 || tyHasTyVar(p) { return false }
+  }
+  set && r >= 0 && !tyHasTyVar(r)
+}
 const monoNoNames: string[] = []
 const monoNoTys: i32[] = []
 
@@ -24381,14 +24478,18 @@ function monoWalk(ix: i32, ctx: i32) {
       const callee = nodeAt(n.callFn)
       // An `if` called in place asks the split as a binding of it does (D7848).
       const calleeIf = nodeAt(unwrapParen(n.callFn)) is IfStmt
-      if (callee is Index || calleeIf) && monoGenArgAtOpenParam(n, ctx) {
+      if (
+        elemsTyped == 0
+        && (callee is Index || calleeIf)
+        && monoGenArgAtOpenParam(n, ctx)
+      ) {
         return monoGenArgOpenFail(ix)
       }
       // A parameter of open type handed through list elements asks the split as a generic does
       // (D7845).
       if elemsTyped == 0 && paramArgs == 2 { fsAskOpenCall(monoCallTplOf(ix)) }
       if callee is Ident {
-        const wr = monoWalkIdentCall(n, callee, ix, ctx)
+        const wr = monoWalkIdentCall(n, callee, ix, ctx, elemsTyped)
         if wr >= 0 && genCallee { monoCloseRetFnTy(ix, ctx) }
         return wr
       }
@@ -24764,9 +24865,15 @@ function monoArmLamFe(cf: i32, callee: Ident): i32 {
 
 // `monoWalk`'s arm for a call `n` (node `ix`, in frame `ctx`) whose callee is the identifier
 // `callee`, its arguments already walked: coerces generic values at concrete parameters, then
-// instantiates the generic it resolves to, through any alias, or specializes a concrete one.
-// Returns what `monoWalk` returns for the call.
-function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
+// instantiates the generic it resolves to, through any alias, or specializes a concrete one;
+// `elemsTyped` is 1 when the callee's elements already took the call's type.
+function monoWalkIdentCall(
+  n: Call,
+  callee: Ident,
+  ix: i32,
+  ctx: i32,
+  elemsTyped: i32,
+) {
   // A generic function value passed as an argument to a concrete function-typed
   // parameter: materialize the instance for that declared function type. Only where
   // the declaration is concrete — the rest is deferred to `monoInstantiate`.
@@ -24787,6 +24894,7 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
   // An alias of a `let` calls the lambda that `let` is seeded with, as the binding itself does.
   if (
     dfe < 0
+    && elemsTyped == 0
     && monoGenArgAtOpenParam(n, ctx)
     && monoAliasLetLamFe(ix, ctx) < 0
   ) {
