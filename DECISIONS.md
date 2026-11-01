@@ -11293,5 +11293,7 @@ The heap is the first table moved: an arm's heap type is its row's (`variantHeap
 variant heap column is gone. A row is keyed by (record type, field storage codes), not by the
 type alone: a record with a tagged function field is a second row of its type. A value cannot
 cross between two storage rows of one type without a converting delivery, and none exists, so
-for now the function-tag rule declines a record whose fields would mix the two storages; the
-three `tests/cases/closures/hole-fn-record-*` fixtures hold that refusal.
+for now the function-tag rule declines a record whose fields would mix the two storages, and the
+record keeps its untagged row. A delivery that tags one must keep running
+`closures/hole-fn-record-beside-declared-row-handed-to-param.vl`,
+`closures/hole-fn-record-field-called-at-other-param.vl` and `closures/hole-fn-record-list-element.vl`.
