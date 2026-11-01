@@ -8547,7 +8547,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       return readFieldStoreKind(unwrapParen(exprIx), fnIx) == "litatom"
     }
     Call => {
-      return exprIsLitAtomCall(e, exprIx, fnIx)
+      // A call's result is an atom where its storage is one. `readCallStoreKind` is the one producer
+      // `readRepOf`'s store half calls; ask it alone, not the whole read rep whose conversions cost.
+      return readCallStoreKind(e, unwrapParen(exprIx), fnIx) == "litatom"
     }
     // A cast is an atom exactly when its result reps as one.
     AsExpr => {
@@ -8711,50 +8713,6 @@ export function memRecvVariantIndex(e: Member, memIx: i32, fnIx: i32): i32 {
   const vi = memNarrowVariantIndex(memIx, fnIx)
   if vi >= 0 { return vi }
   memRecvArmVariantIndex(e.memObj, fnIx)
-}
-
-// True if a call `e` returns a literal-union atom: a registered literal-union result type,
-// a function value's aliased result, or a callee whose annotated or inferred return is one.
-function exprIsLitAtomCall(e: Call, exprIx: i32, fnIx: i32): boolean {
-  // Any call whose checked result type is a registered litunion holds an i32 atom, widened
-  // at print. Covers a closure value call, a struct-field closure call, and an
-  // indexed-closure call, none of which the callee-Ident named arm below can reach. A
-  // generic call whose result a pin minted is excluded: its instance may return a string.
-  if nodeTyIsLitUnionAlias(unwrapParen(exprIx)) { return true }
-  // A function-value call whose callee's annotated result is an aliased litunion — the arm
-  // above cannot reach inside a monomorphized instance, where the call node is shared with
-  // the generic and still records the type variable. `cloCallResultLitUnion` asks the
-  // callee's own substituted annotation instead.
-  if cloCallResultLitUnion(unwrapParen(exprIx), fnIx) { return true }
-  if e.callFn < 0 { return false }
-  const callee = nodeAt(e.callFn)
-  if callee is Ident {
-    // A CLOSURE call, whose result rep is what the lifted body yields and not what a
-    // spelling renders — so the alias arms above miss an INLINE member set. `fRetLitAtom`
-    // is the banked answer the named rung below reads, asked of the lambda (D1768).
-    const cloFe = identClosureFeOfRead(e.callFn, fnIx)
-    if cloFe >= 0 && cloFe < fRetLitAtom.length {
-      if fRetLitAtom[cloFe] == 1 { return true }
-    }
-    const target = fnIndexOfNode(e.callFn)
-    if target >= 0 {
-      const cf = nodeAt(fnStmts[target])
-      if cf is FuncDecl {
-        if cf.fnRet >= 0 {
-          const r = nodeTyIsLitUnionAlias(cf.fnRet)
-          return r
-        }
-        // An un-annotated callee, from the flag its own classification recorded: an
-        // inferred return has neither a type node nor an annotation, so the signature's
-        // result kind is classified from the returned expression, and this reads that
-        // banked answer. Without it, a named-litunion tag printed its raw atom id.
-        if target < fRetLitAtom.length {
-          if fRetLitAtom[target] == 1 { return true }
-        }
-      }
-    }
-  }
-  false
 }
 
 // The type the value at `valIx`, recorded at a type parameter, has in the instance `fnIx`: an
@@ -15103,6 +15061,8 @@ function readRepOf(ix: i32, fnIx: i32): ReadRep {
   if rx < 0 { return readRepGo(ix, fnIx) }
   const t = nodeTyIxOf(rx)
   if t < 0 || tyHasTyVar(t) { return readRepGo(ix, fnIx) }
+  // A call's result storage reads per-function banks a pass fills in place, outside the key.
+  if nodeAt(rx) is Call { return readRepGo(ix, fnIx) }
   if readRepMoved() { memoGenAdvance(rrGen) }
   if rx < rrStamp.length && rrStamp[rx] == rrGen.at && rrFn[rx] == fnIx {
     return rrVal[rx]
@@ -15166,6 +15126,8 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
     st = readFieldStoreKind(rx, fnIx)
   } else if e is Index {
     st = readIndexStoreKind(e, rx, fnIx)
+  } else if e is Call {
+    st = readCallStoreKind(e, rx, fnIx)
   } else {
     return none
   }
@@ -15446,6 +15408,56 @@ function idxReadIsLitAtom(e: Index, exprIx: i32, fnIx: i32): boolean {
   // spelling claims too.
   if nodeRepIsNulAtom(unwrapParen(exprIx), fnIx) { return true }
   return false
+}
+
+// True if a call `e` returns a literal-union atom: a registered literal-union result type,
+// a function value's aliased result, or a callee whose annotated or inferred return is one.
+function callResultIsLitAtom(e: Call, exprIx: i32, fnIx: i32): boolean {
+  // Any call whose checked result type is a registered litunion holds an i32 atom, widened
+  // at print. Covers a closure value call, a struct-field closure call, and an
+  // indexed-closure call, none of which the callee-Ident named arm below can reach. A
+  // generic call whose result a pin minted is excluded: its instance may return a string.
+  if nodeTyIsLitUnionAlias(unwrapParen(exprIx)) { return true }
+  // A function-value call whose callee's annotated result is an aliased litunion — the arm
+  // above cannot reach inside a monomorphized instance, where the call node is shared with
+  // the generic and still records the type variable. `cloCallResultLitUnion` asks the
+  // callee's own substituted annotation instead.
+  if cloCallResultLitUnion(unwrapParen(exprIx), fnIx) { return true }
+  if e.callFn < 0 { return false }
+  const callee = nodeAt(e.callFn)
+  if callee is Ident {
+    // A CLOSURE call, whose result rep is what the lifted body yields and not what a
+    // spelling renders — so the alias arms above miss an INLINE member set. `fRetLitAtom`
+    // is the banked answer the named rung below reads, asked of the lambda (D1768).
+    const cloFe = identClosureFeOfRead(e.callFn, fnIx)
+    if cloFe >= 0 && cloFe < fRetLitAtom.length {
+      if fRetLitAtom[cloFe] == 1 { return true }
+    }
+    const target = fnIndexOfNode(e.callFn)
+    if target >= 0 {
+      const cf = nodeAt(fnStmts[target])
+      if cf is FuncDecl {
+        if cf.fnRet >= 0 {
+          const r = nodeTyIsLitUnionAlias(cf.fnRet)
+          return r
+        }
+        // An un-annotated callee, from the flag its own classification recorded: an
+        // inferred return has neither a type node nor an annotation, so the signature's
+        // result kind is classified from the returned expression, and this reads that
+        // banked answer. Without it, a named-litunion tag printed its raw atom id.
+        if target < fRetLitAtom.length {
+          if fRetLitAtom[target] == 1 { return true }
+        }
+      }
+    }
+  }
+  false
+}
+
+// What a call's result is stored as: "litatom" for an interned literal-union id, else "".
+function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
+  if gLitUnionUsed != 0 && callResultIsLitAtom(e, rx, fnIx) { return "litatom" }
+  ""
 }
 
 // The kind an element or map-value read's slot holds.
