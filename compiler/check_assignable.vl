@@ -143,6 +143,7 @@ import {
   fnTagEscapeNote,
   fnTagEtaAt,
   fnTagEtaInner,
+  fnTagHoleLambdaOfTy,
   fnTagSetValueOfTy,
   stampsHeld,
   stampsHeldSet,
@@ -453,6 +454,7 @@ import { identDeclOf, identFrom } from "./symbols"
 import {
   flattenVariantsInto,
   isNullTy,
+  isNumericPrimTy,
   isVoidTy,
   nonNullTy,
   primNameOf,
@@ -2345,8 +2347,13 @@ function adoptHoleLitArg(
   const org = holeArgOriginNode(ci, hNames, hArgNode)
   if org < 0 { return 0 }
   const lit = nodeAt(parenPeelIx(org))
-  if !(lit is ArrayLit || lit is ObjLit || lit is StrLit) { return 0 }
-  if !holeLitAdopts(org, bTys[k], rexp) { return 0 }
+  if lit is NumLit || holeNegNumLit(lit) {
+    // A number literal is built at the width the hole's use demands, as the direct call builds it.
+    if !holeNumLitAdopts(org, bTys[k], rexp) { return 0 }
+  } else {
+    if !(lit is ArrayLit || lit is ObjLit || lit is StrLit) { return 0 }
+    if !holeLitAdopts(org, bTys[k], rexp) { return 0 }
+  }
   holeLitAdopt(org, bTys[k], rexp)
   bTys[k] = rexp
   done.push(hv.tvName)
@@ -2362,6 +2369,27 @@ function holeLitAdopts(org: i32, rat: i32, rexp: i32): boolean {
   if scalarPrimPair(rat, rexp) { return false }
   if !empty && assignable(rat, rexp) && assignable(rexp, rat) { return false }
   if nodeAt(parenPeelIx(org)) is ObjLit && objWidthFitsExact(rat, rexp) {
+    return false
+  }
+  const savedQuiet = inferQuiet
+  inferQuiet = true
+  quietDepth = quietDepth + 1
+  const ok = assignableExpr(org, rat, rexp)
+  inferQuiet = savedQuiet
+  quietDepth = quietDepth - 1
+  ok
+}
+
+// Whether node `n` is a negated number literal (`-2.5`).
+function holeNegNumLit(n: Node): boolean {
+  if !(n is Unary) || n.unOp != "-" || n.unArg < 0 { return false }
+  nodeAt(parenPeelIx(n.unArg)) is NumLit
+}
+
+// Whether number literal `org` of type `rat` is rebuilt at the other numeric primitive `rexp`:
+// the fit the direct call's argument check admits (a float into `f32`, an integer into a wider one).
+function holeNumLitAdopts(org: i32, rat: i32, rexp: i32): boolean {
+  if rat == rexp || !scalarPrimPair(rat, rexp) || !isNumericPrimTy(rexp) {
     return false
   }
   const savedQuiet = inferQuiet
@@ -3209,6 +3237,23 @@ function fvaSameSlots(s: TyFunc, d: TyFunc): boolean {
   true
 }
 
+// Whether `n` is a call to a function whose result is inferred and that takes no open parameter:
+// what it returns it makes itself, so no argument is handed back through the call (D14884).
+function fvaInferredRetCall(n: Node): boolean {
+  if !(n is Call) { return false }
+  const d = identDeclOf(parenPeelIx(n.callFn))
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnTyParams.length > 0 {
+    return false
+  }
+  for p in f.fnParams {
+    const q = nodeAt(p)
+    if !(q is Param) || q.parType < 0 { return false }
+  }
+  true
+}
+
 // Banks the instance of each generic function a value of type `srcTy` holds at closed type
 // `dstTy`, through record fields, list elements and a nullable: a function's type parameters are
 // bound by its signature against the destination function type's.
@@ -3387,6 +3432,7 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   const namedFn = pe is Ident && identFnDeclOf(parenPeelIx(site)) >= 0
   const setSrc = fnTagChoiceAt(srcExpr, srcTy)
     || fnTagSetValueOfTy(srcTy) && !namedFn
+    || fnTagHoleLambdaOfTy(srcTy) && fvaInferredRetCall(pe)
   // A destination taking or returning a set is built once the decision has tagged that set.
   const setDst = fvaSetSlotsClosed(d)
   // A function already typed at the destination's own slots is delivered as it is.
@@ -3401,11 +3447,11 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       if holeInst < 0 && !setSrc { return false }
       // A choice is built here only once the decision has tagged its set.
       if holeInst < 0 && !fnTagEtaAt(site) {
-        fnTagEscapeNote(site, srcTy)
+        fnTagEscapeNote(site, srcTy, dt)
         return false
       }
     } else if (setSrc || setDst) && !fnTagEtaAt(site) {
-      fnTagEscapeNote(site, if setSrc { srcTy } else { dt })
+      fnTagEscapeNote(site, if setSrc { srcTy } else { dt }, dt)
       return false
     } else if !setSrc && !fvaFnMayDiffer(srcTy, dt, 8) {
       return false
