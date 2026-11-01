@@ -34,18 +34,19 @@ SELF_SHARDED='
 selfhost_native_align_test.ts
 '
 
-# ci.yml's "Warm the seed's sidecars" step with `--fuel`: 15-17 s of wall (two PR runs,
-# 2026-10-31) that holds back all four of the runner's cores, and a weight counts seconds of one file.
-FUEL_WARM=64
+# ci.yml's "Warm the seed's sidecars" step with `--fuel`: about 1 s when the `seed` job's fuel
+# sidecars restore (run 41267899399), 15-17 s of all four cores (64) on a miss. Charged near the
+# restored cost, since a miss is the exception and only slows the one shard that pays it.
+FUEL_WARM=8
 
 # The native rows are the mean over two PR runs (41191375015, 41194363060; 2026-10-31) of each
 # file's summed test seconds, every native file listed: a sub-second file left at the default 2
 # overcharged its shard, and a 26 s one missing from the table sat on the critical path at 2. The
-# headroom test is charged a whole shard (58, not its 26): it is one serial test, and beside a
-# full shard it ran 39 s (run 41197180464), so it is the floor of whichever shard holds it. A
-# self-sharded file's row is its whole cost, and each shard is charged 1/n of it.
+# headroom test was charged a whole shard (58) while it re-JITted the seed; since #5408 it checks
+# a warm default heap in about 8 s. A self-sharded file's row is its whole cost, and each shard
+# is charged 1/n of it.
 WEIGHTS='
-vl_seed_gc_headroom_test.ts 58
+vl_seed_gc_headroom_test.ts 8
 vl_check_filed_witnesses_test.ts 16
 selfhost_native_release_inline_test.ts 14
 vl_distilled_tools_test.ts 14
