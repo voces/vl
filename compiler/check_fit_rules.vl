@@ -1860,8 +1860,10 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
 function recRepArgsNote(sites: i32[], own: i32, dst: i32) {
   for s in sites {
     if s % 2 == 0 {
-      for src in recPendSrc {
-        if recRepArgOf(src, s / 2, own, dst) { recAnnArgTakesRep(src, dst) }
+      let i = 0
+      while i < recPendSrc.length {
+        if recRepArgOf(i, s / 2, own, dst) { recAnnArgTakesRep(recPendSrc[i], dst) }
+        i = i + 1
       }
     }
   }
@@ -1914,7 +1916,7 @@ function recQueuedReaches(c: i32, own: i32, dst: i32): boolean {
   let i = 0
   while i < recPendSrc.length {
     if (
-      !recRepArgOf(recPendSrc[i], c, own, dst)
+      !recRepArgOf(i, c, own, dst)
       && recLandingIn(recPendSrc[i], recPendDstTy[i], c, own, REC_STORE_DEPTH) >= 0
     ) {
       return true
@@ -1972,7 +1974,7 @@ function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
   let got = -1
   let i = 0
   while i < recPendSrc.length {
-    if recRepArgOf(recPendSrc[i], c, own, dst) {
+    if recRepArgOf(i, c, own, dst) {
       i = i + 1
       continue
     }
@@ -1992,12 +1994,28 @@ function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
   got
 }
 
-// Whether the queued delivery `src` is call `c`'s record of `own`, directly or relayed, handed as
-// an argument to an annotated parameter an instance at `dst` serves (`recAnnArgRepOk`), so it
-// lands at the build, not the annotation.
-function recRepArgOf(src: i32, c: i32, own: i32, dst: i32): boolean {
-  if dst < 0 || !recAnnArgRepOk(src, dst) { return false }
-  cwPeelValue(src) == c || recLandingIn(src, dst, c, own, REC_STORE_DEPTH) >= 0
+// Whether queued delivery `i` is call `c`'s record of `own`, directly or relayed, handed as an
+// argument to an annotated parameter an instance at `dst` serves (`recAnnArgRepOk`), or to a list
+// parameter that takes the rep (`recListArgTakesRep`), so it lands at the build.
+function recRepArgOf(i: i32, c: i32, own: i32, dst: i32): boolean {
+  const src = recPendSrc[i]
+  if dst < 0 { return false }
+  if recAnnArgRepOk(src, dst) {
+    return cwPeelValue(src) == c || recLandingIn(src, dst, c, own, REC_STORE_DEPTH) >= 0
+  }
+  recListArgTakesRep(src) && recLandingIn(src, recPendDstTy[i], c, own, REC_STORE_DEPTH) >= 0
+}
+
+// Whether `src` is an argument whose list parameter takes the rep (`recListParamTakesRep`).
+function recListArgTakesRep(src: i32): boolean {
+  if src < 0 || src >= cwIxUpKind.length || cwIxUpKind[src] != CW_UP_ARG { return false }
+  const c = nodeAt(cwIxUp[src])
+  if !(c is Call) || c.callFn < 0 { return false }
+  const fd = identBoundFnDeclOf(c.callFn)
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  const i = cwIxUpAux[src]
+  if !(f is FuncDecl) || i < 0 || i >= f.fnParams.length { return false }
+  recListParamTakesRep(f.fnParams[i], cwIxUp[src], 4)
 }
 
 // `recQueuedLandingOf` for one delivery of `src` as a `dstTy`.
@@ -2524,6 +2542,46 @@ function recArgTakesRep(x: i32, depth: i32): boolean {
   const i = cwIxUpAux[x]
   if !(f is FuncDecl) || i < 0 || i >= f.fnParams.length { return false }
   recParamTakesRep(f.fnParams[i], cwIxUp[x], depth)
+    || recListParamTakesRep(f.fnParams[i], cwIxUp[x], depth)
+}
+
+// Whether parameter `par`, a list of a type variable or a hole, is only read for its length or for
+// elements `recParamTakesRep` would take: read for a field, handed on by rep, or handed back to a
+// `call` that reads the rep (D14733).
+function recListParamTakesRep(par: i32, call: i32, depth: i32): boolean {
+  const pt = nodeTyIxOf(par)
+  if pt < 0 || pt >= T.tys.length { return false }
+  const pa = tyAt(pt)
+  if !(pa is TyArray) || pa.aElem < 0 || !(tyAt(pa.aElem) is TyVar) { return false }
+  cwIxBuild()
+  const owner = if par < cwIxParent.length { cwIxParent[par] } else { -1 }
+  if owner < 0 || !(nodeAt(owner) is FuncDecl) { return false }
+  let used = false
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if !recElemTakesRep(u, owner, call, depth - 1) || recEnclosingFn(u) != owner {
+        return false
+      }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  used
+}
+
+// Whether list read `u` is the object of `.length`, or of an index read whose element takes the rep.
+function recElemTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
+  if u < 0 || u >= cwIxUpKind.length || cwIxUpKind[u] != CW_UP_OBJ { return false }
+  const e = cwIxUp[u]
+  if e < 0 || e >= P.nodes.length { return false }
+  const en = nodeAt(e)
+  if en is Member { return en.memProp == "length" && recFieldRead(u) }
+  if !(en is Index) { return false }
+  recFieldRead(e) || recArgTakesRep(e, depth) || recRetTakesRep(e, fd, call, depth)
 }
 
 // Whether parameter `par`, open in a type variable or a hole, is only read or written for a field,
