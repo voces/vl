@@ -2523,12 +2523,13 @@ function recArgTakesRep(x: i32, depth: i32): boolean {
   const f = nodeAt(fd)
   const i = cwIxUpAux[x]
   if !(f is FuncDecl) || i < 0 || i >= f.fnParams.length { return false }
-  recParamTakesRep(f.fnParams[i], depth)
+  recParamTakesRep(f.fnParams[i], cwIxUp[x], depth)
 }
 
-// Whether parameter `par`, open in a type variable or a hole, is only read or written for a field
-// or handed to another such parameter: the positions that read a value at a rep wider than its type.
-function recParamTakesRep(par: i32, depth: i32): boolean {
+// Whether parameter `par`, open in a type variable or a hole, is only read or written for a field,
+// handed to another such parameter, or returned where `call`'s result is used the same way: the
+// positions that read a value at a rep wider than its type.
+function recParamTakesRep(par: i32, call: i32, depth: i32): boolean {
   const pt = nodeTyIxOf(par)
   if pt < 0 || pt >= T.tys.length || !(tyAt(pt) is TyVar) { return false }
   cwIxBuild()
@@ -2540,11 +2541,53 @@ function recParamTakesRep(par: i32, depth: i32): boolean {
     const r = ow.row
     if cwIxKind[r] == CW_OCC_USE {
       const u = cwIxNode[r]
-      if !recFieldRead(u) && !recArgTakesRep(u, depth - 1) { return false }
+      if (
+        !recFieldRead(u)
+        && !recArgTakesRep(u, depth - 1)
+        && !recRetTakesRep(u, owner, call, depth - 1)
+      ) {
+        return false
+      }
       // A use a nested function captures reads the value where the capture stores it.
       if recEnclosingFn(u) != owner { return false }
       used = true
     } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  used
+}
+
+// Whether `u` is a value function `fd` hands back, and `call`, the call it hands it back to, uses
+// the result only where the rep is read: for a field, as another such argument, or through a
+// `const` read only for fields.
+function recRetTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
+  if depth <= 0 || call < 0 || call >= P.nodes.length { return false }
+  let leaf = false
+  for lf in recFnValueLeaves(fd) {
+    if cwPeelValue(lf) == u { leaf = true }
+  }
+  if !leaf { return false }
+  recFieldRead(call) || recArgTakesRep(call, depth) || recBoundForFields(call)
+}
+
+// Whether `x` initialises an un-annotated `const` that is only read for a field.
+function recBoundForFields(x: i32): boolean {
+  if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_LETINIT {
+    return false
+  }
+  const d = cwIxUp[x]
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letKw != "const" { return false }
+  let used = false
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      if !recFieldRead(cwIxNode[r]) { return false }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
       return false
     }
   }
