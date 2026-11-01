@@ -1320,6 +1320,7 @@ import {
   rlElemTyIxAt,
   rlSlotOfTy,
   sFieldIndex,
+  tyPrimLeafListKind,
   uFieldElemTyIxRow,
 } from "./emit_struct_order"
 import {
@@ -1984,7 +1985,6 @@ function emitStructFieldValueUnder(
     fbRefAsNonNull()
   }
   // the scalar covariant copy at the field boundary (D965).
-  emitFieldListWidenSite(body, valIx, fnIx, scode)
   0
 }
 
@@ -12387,7 +12387,6 @@ function emitArrRefElem(
   }
   // Read-only covariance at a nested-list element (D791, D965) — `[lv1]` of a
   // `(readonly Shape[])[]`.
-  emitNestedListWidenSite(body, e, fnIx, rslot)
   0
 }
 
@@ -14311,7 +14310,6 @@ function emitMapSetValExpr(
     const mvLK = mvListValKind(mslot)
     if mvLK != null {
       const mvSE = scalarListElemOfListKind(mvLK)
-      if mvSE != null { emitScalarListWidenSiteElem(body, valIx, fnIx, mvSE) }
     }
   }
   0
@@ -25170,7 +25168,6 @@ function emitAssignGlobal(body: u8[], a: BinExpr, lhsIx: i32, fnIx: i32) {
     // the scalar dual (D965) at the global-assignment boundary (`b = e` between two
     // module globals) — distinct from the global-init copy in `emit_sections`, since
     // a re-assignment is ordinary code and a const initializer a wasm constexpr.
-    emitScalarListWidenSite(body, a.binRight, fnIx, gaKind)
     // the narrowed-arm unbox at the same boundary (D1031) — `gv = s` under `if s is
     // Circle`, between two module globals; `armDestHeapOf` reads the destination pair.
     if !gaCoerced && narrowedArmNeedsUnbox(a.binRight, fnIx) {
@@ -25298,7 +25295,6 @@ function emitAssignIdent(
   // from classifying the LHS — the same classifier the source side uses.
   const asgDE = scalarListElemKind(lhsIx, fnIx)
   if asgDE != null {
-    emitScalarListWidenSiteElem(body, a.binRight, fnIx, asgDE)
   }
   // the nullable-niche recover at the ASSIGNMENT boundary (D1115) — `z = y` under
   // `if y != null`, into a local or parameter whose slot is a non-null ref. The
@@ -25558,7 +25554,6 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
   if emitIdxStoreValue(body, fnIx, a, target.idxArr, st) < 0 { return -1 }
   // the read-only covariant copy at the indexed-store boundary (D2163)
   if st.mfKind == "ref" {
-    emitNestedListWidenSite(body, a.binRight, fnIx, st.slot)
   }
   // the narrowed-arm unbox at the ELEMENT-assignment boundary, the binding boundary's
   // twin one container over: the element's own variant or struct row is where the arm
@@ -25771,7 +25766,6 @@ function emitAssignMember(
     fbRefAsNonNull()
   }
   // the scalar covariant copy at the field-store boundary, the construct's twin (D2163)
-  emitFieldListWidenSite(body, a.binRight, fnIx, fscode)
   fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
   return 0
 }
@@ -26316,7 +26310,6 @@ function emitPushOne(
   // read the same slot heap, so the two spellings of one store cannot disagree.
   if pushArmOwed { emitNarrowedArmUnboxTo(ps.armHeap, argIx, fnIx) }
   // the read-only covariant copy at the `.push` boundary (D2163)
-  if ps.rSlot >= 0 { emitNestedListWidenSite(body, argIx, fnIx, ps.rSlot) }
   // D1197 — the non-null recover `.push` OWED. Eight sibling deliveries of the same
   // narrowed value ask `nulNicheRecoverOwed`; this one asked nothing, so `out.push(e)`
   // under `if e != null` handed a `(ref null $H)` to the non-null value slot.
@@ -27905,6 +27898,13 @@ function emitListCopied(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
   const r = emitExpr(body, exprIx, fnIx)
   listCopyHeld = held
   if r < 0 { return -1 }
+  // A scalar list converts each number; a pair no convert serves is delivered as built.
+  const sdk = tyPrimLeafListKind(instTyOrSelf(lct, fnIx))
+  if sdk != null && sdk != "reflist" && sdk != "strlist" {
+    emitScalarListWidenSite(body, exprIx, fnIx, sdk)
+    if emitFailed { return -1 }
+    return 0
+  }
   const src = exprEmittedRefListSlot(exprIx, fnIx)
   let dst = repSlotOfKind("reflist", instTyOrSelf(lct, fnIx))
   if dst < 0 { dst = src }
@@ -28965,9 +28965,6 @@ function emitReturnBoundaryWidens(
 ) {
   // the scalar copy (D965) — `return e` from a `(): f64[]`, read off the annotation: the
   // functype's own source keeps the widened value and the declared result in agreement.
-  if retSLKind != null {
-    emitScalarListWidenSite(body, retArg, fnIx, retSLKind)
-  }
   // the narrowed-arm unbox at the return boundary (D1031): the bare `: Circle` result is
   // already served through `emitVariantCoerce`; the niche results (`Circle | null`, `Dot |
   // null`) are the ones that took the box into a `(ref null $H)` slot. Read off the same
@@ -30162,7 +30159,6 @@ function emitLetDelivery(
 ) {
   // the scalar dual (D965) — `const b: f64[] = e` over an `i32[]`. The cell's own kind IS
   // the destination list kind, so this needs no second derivation.
-  emitScalarListWidenSite(body, s.letInit, fnIx, localIsRef[slot])
   // the narrowed-arm unbox at the binding boundary (D1031): the same shape as the two
   // widen sites above, since the cell's own (kind, slot) pair is the destination.
   if letArmOwed && !letArmCell {
@@ -36302,9 +36298,6 @@ function emitDirectArgValue(
     if argBoxToNulStr { emitBoxToNulStr() }
     // the scalar dual (D965) — `take_f(xs: f64[])` called with an `i32[]`. Same
     // boundary, same licence, a numeric convert instead of a box.
-    if cParamSLKind != null {
-      emitScalarListWidenSite(body, arg, fnIx, cParamSLKind)
-    }
     emitNonNullParamRecover(cRecoverKind, arg, fnIx)
   }
   0
