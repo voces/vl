@@ -81,12 +81,43 @@ Deno.test("ci-verdict: `gated` skips exactly the jobs scripts/gate.sh runs whole
   }
 });
 
+// The jobs a `tree` verdict skips: ci-verdict.sh's TREE_SKIPS, each of which the PR's run must
+// have passed. seed (the proven seed master's consumers restore), ci and ci-cost (a master
+// reading caught #5373's hang) are never among them.
+Deno.test("ci-verdict: `tree` skips exactly ci-verdict.sh's TREE_SKIPS, never seed, ci or ci-cost", () => {
+  const script = Deno.readTextFileSync(SCRIPT);
+  const listed = (script.match(/^TREE_SKIPS="([^"]*)"$/m)?.[1] ?? "").split(" ")
+    .filter(Boolean).sort();
+  if (listed.length === 0) {
+    throw new Error("want TREE_SKIPS in ci-verdict.sh, got none");
+  }
+  const all = jobs();
+  const skipped = [...all].filter(([, b]) =>
+    jobIf(b).includes("needs.seed.outputs.tree != 'true'") ||
+    b.includes("steps.verdict.outputs.tree != 'true'")
+  ).map(([n]) => n).sort();
+  if (skipped.join(",") !== listed.join(",")) {
+    throw new Error(
+      `want tree-skippable jobs ${listed.join(", ")}, got ${
+        skipped.join(", ")
+      }`,
+    );
+  }
+  for (const j of ["seed", "ci", "ci-cost"]) {
+    if (listed.includes(j)) {
+      throw new Error(
+        `want ${j} never skipped on a tree verdict, got it in TREE_SKIPS`,
+      );
+    }
+  }
+});
+
 Deno.test("ci-verdict: the jobs that start a run decide, and the seed hands the verdict on", () => {
   const all = jobs();
   const modes: Record<string, string> = {
     ci: "inherit",
     seed: "",
-    "ci-embed-seed": "inherit",
+    "ci-embed-seed": "inherit tree",
   };
   for (const [job, mode] of Object.entries(modes)) {
     const b = all.get(job) ?? "";
@@ -111,6 +142,7 @@ Deno.test("ci-verdict: the jobs that start a run decide, and the seed hands the 
     const o of [
       "heavy: ${{ steps.verdict.outputs.heavy }}",
       "gated: ${{ steps.verdict.outputs.gated }}",
+      "tree: ${{ steps.verdict.outputs.tree }}",
     ]
   ) {
     if (!seed.includes(o)) throw new Error(`want seed output "${o}", got none`);
@@ -150,22 +182,58 @@ case "$path" in
   */actions/runs\\?head_sha=*) k=runs-$(sed -E 's/.*head_sha=([0-9a-f]+).*/\\1/' <<< "$path");;
   */pulls/*) k=pull-\${path##*/};;
   */commits/*/statuses*) k=statuses-$(sed -E 's#.*/commits/([0-9a-f]+)/.*#\\1#' <<< "$path");;
+  */actions/runs/*/jobs*) k=jobs-$(sed -E 's#.*/actions/runs/([0-9]+)/jobs.*#\\1#' <<< "$path");;
+  */check-runs/*/annotations) k=ann-$(sed -E 's#.*/check-runs/([0-9]+)/annotations#\\1#' <<< "$path");;
   *) exit 1;;
 esac
 [ -f "$FAKE/$k.json" ] || exit 1
 jq -r "$filter" < "$FAKE/$k.json"
 `;
 
-function runs(conclusion: string): string {
+function runs(conclusion: string, repo = "o/r"): string {
   return JSON.stringify({
     workflow_runs: [{
+      id: 99,
       path: ".github/workflows/ci.yml",
       created_at: "2026-10-17T00:00:00Z",
       status: "completed",
       conclusion,
+      head_repository: { full_name: repo },
     }],
   });
 }
+
+// A pull_request run's jobs: every job a tree verdict needs, all green unless overridden.
+function runJobs(over: Record<string, string> = {}): string {
+  const names = [
+    "ci",
+    "seed",
+    "ci-embed-seed",
+    "checks",
+    "checks-suites (editor)",
+    "checks-suites (oracle)",
+    "ci-release-shape (1)",
+    "ci-native (1)",
+    "ci-native (2)",
+    "ci-cost (1)",
+    "ci-cost (2)",
+    "ci-proof",
+  ];
+  return JSON.stringify({
+    jobs: names.map((name, i) => ({
+      id: name === "seed" ? 500 : 501 + i,
+      name,
+      conclusion: over[name] ?? (name === "ci-proof" ? "skipped" : "success"),
+    })),
+  });
+}
+
+const RUSTC = "rustc 1.99.1 (58cf8f9c3 2026-10-13)";
+const annotation = (tree: string, rustc = RUSTC.replaceAll(" ", "_")) =>
+  JSON.stringify([
+    { title: "something else", message: "x" },
+    { title: "tested-tree", message: `${tree} rustc=${rustc}` },
+  ]);
 
 function verdict(
   cwd: string,
@@ -202,6 +270,11 @@ Deno.test({
       Deno.mkdirSync(`${fake}/bin`, { recursive: true });
       Deno.writeTextFileSync(`${fake}/bin/gh`, FAKE_GH);
       Deno.chmodSync(`${fake}/bin/gh`, 0o755);
+      Deno.writeTextFileSync(
+        `${fake}/bin/rustc`,
+        `#!/usr/bin/env bash\necho "${RUSTC}"\n`,
+      );
+      Deno.chmodSync(`${fake}/bin/rustc`, 0o755);
       Deno.mkdirSync(repo);
       const g = (c: string) => sh(repo, c);
       g("git init -q -b master && git config user.email t@t && git config user.name t");
@@ -347,6 +420,78 @@ Deno.test({
             }),
           );
         }],
+        ["tree: the PR's own green run tested this tree", push, "tree", () => {
+          write(
+            "pull-7",
+            JSON.stringify({
+              merged: true,
+              merge_commit_sha: squash,
+              head: { sha: clean },
+            }),
+          );
+          write(`statuses-${clean}`, "[]");
+          write(`runs-${clean}`, runs("success"));
+          write("jobs-99", runJobs());
+          write("ann-500", annotation(tree));
+        }],
+        [
+          "tree: the job asked only for gated",
+          { ...push, MODES: "inherit gated" },
+          "full",
+          () => {},
+        ],
+        [
+          "tree refused: the PR ran from a fork",
+          push,
+          "full",
+          () => write(`runs-${clean}`, runs("success", "x/r")),
+        ],
+        ["tree refused: a job did not succeed", push, "full", () => {
+          write(`runs-${clean}`, runs("success"));
+          write("jobs-99", runJobs({ "checks": "failure" }));
+        }],
+        [
+          "tree refused: the run inherited (its native shards skipped)",
+          push,
+          "full",
+          () =>
+            write(
+              "jobs-99",
+              runJobs({
+                "ci-native (1)": "skipped",
+                "ci-native (2)": "skipped",
+                "ci-release-shape (1)": "skipped",
+                "checks": "skipped",
+                "checks-suites (editor)": "skipped",
+                "checks-suites (oracle)": "skipped",
+                "ci-cost (1)": "skipped",
+                "ci-cost (2)": "skipped",
+              }),
+            ),
+        ],
+        ["tree refused: the run tested another tree", push, "full", () => {
+          write("jobs-99", runJobs());
+          write(
+            "ann-500",
+            annotation("0123456789abcdef0123456789abcdef01234567"),
+          );
+        }],
+        [
+          "tree refused: the run built with another rustc (another binary key)",
+          push,
+          "full",
+          () =>
+            write(
+              "ann-500",
+              annotation(tree, "rustc_1.98.0_(aaaaaaaaa_2026-09-01)"),
+            ),
+        ],
+        [
+          "tree refused: the run recorded no tested tree",
+          push,
+          "full",
+          () => write("ann-500", "[]"),
+        ],
         [
           "push to another branch",
           { ...push, REF: "refs/heads/pr" },

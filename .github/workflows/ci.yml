@@ -142,10 +142,13 @@ jobs:
   # compiler source — never on an earlier rung, and never on a seed it built itself.
   #
   # `seed` outputs `heavy` (false for a docs-only or an inherited run, which skip every
-  # downstream job) and `gated`. `gated` is true only on a master push of a tree the merge
-  # queue's scripts/gate.sh already passed (scripts/ci-verdict.sh), and skips just the three
-  # jobs gate.sh runs whole: ci-native, ci-release-shape, ci-cost.
-  # tests/ci_verdict_test.ts holds that list to what gate.sh covers.
+  # downstream job), `gated` and `tree`. `gated` is true only on a master push of a tree the
+  # merge queue's scripts/gate.sh already passed (scripts/ci-verdict.sh), and skips just the
+  # three jobs gate.sh runs whole: ci-native, ci-release-shape, ci-cost. `tree` is true only on
+  # a master push whose tree the squashed PR's own green run tested, and skips the jobs that
+  # run proved: ci-native, ci-release-shape, checks, checks-suites, ci-embed-seed; seed and
+  # ci-cost (a master reading caught #5373's hang) still run. tests/ci_verdict_test.ts holds
+  # both lists.
   # ---------------------------------------------------------------------------
   seed:
     runs-on: ubuntu-latest
@@ -156,9 +159,11 @@ jobs:
       actions: read
       statuses: read
       pull-requests: read
+      checks: read
     outputs:
       heavy: ${{ steps.verdict.outputs.heavy }}
       gated: ${{ steps.verdict.outputs.gated }}
+      tree: ${{ steps.verdict.outputs.tree }}
       seed_key: ${{ steps.keys.outputs.seed }}
       bin_key: ${{ steps.keys.outputs.bin }}
       rustc: ${{ steps.keys.outputs.rustc }}
@@ -331,7 +336,7 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-native:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -433,7 +438,7 @@ jobs:
   # ---------------------------------------------------------------------------
   checks:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -555,7 +560,7 @@ jobs:
   # ---------------------------------------------------------------------------
   checks-suites:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     # Two runners, not two steps in turn: the editor suites (~16 s) and the oracle (~21 s) were
     # this job's whole 54 s and the CI critical path behind `seed` (run 41197363355).
@@ -674,7 +679,7 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-release-shape:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -913,6 +918,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      checks: read
     steps:
       - uses: actions/checkout@v5
         with:
@@ -928,10 +934,10 @@ jobs:
         uses: ./.github/actions/ci-verdict
         with:
           docs_only: ${{ steps.docs_check.outputs.docs_only }}
-          modes: inherit
+          modes: inherit tree
 
       - name: Rustc version (cargo cache key)
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         id: rustc
         run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
@@ -943,7 +949,7 @@ jobs:
       # restores, builds and saves. One cold wasmtime build after a toolchain bump
       # is the same cost as before the split.
       - name: Restore cargo + vl-host target
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -960,7 +966,7 @@ jobs:
       # while `seed` stays the sole writer of the seed pair, which is what
       # keeps the `.cwasm` sidecars riding along with the wasm they were built from.
       - name: Restore seed compiler wasm
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -973,13 +979,13 @@ jobs:
 
       # Idempotent: fetch-seed.sh leaves a present, non-empty seed untouched.
       - name: Ensure a seed to embed
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         run: ./scripts/fetch-seed.sh
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Verify embedded-seed build (distribution path)
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         run: |
           cargo build --release --features embed-seed --manifest-path scripts/vl-host/Cargo.toml
           probe="$(mktemp -d)"
@@ -1014,7 +1020,7 @@ jobs:
       # is the whole claim. The stale-seed row is the other half: a released `vl`
       # must not become a different compiler because of what sits in the CWD.
       - name: Verify a released `vl` carries std and ignores the CWD
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         run: |
           set -e
           export VL_CACHE_DIR="$(mktemp -d)"
