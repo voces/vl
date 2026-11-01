@@ -1572,6 +1572,7 @@ import {
   tyNulLitUnionMemberTexts,
   tyNumLitMemberTexts,
   tyPeelNul,
+  tyUnionCovers,
 } from "./tyquery"
 import {
   MAP_KEY_I32,
@@ -5235,6 +5236,20 @@ function emitIs(body: u8[], isIx: i32, fnIx: i32) {
         fbI32Const(1)
         return 0
       }
+    }
+    // A non-union operand whose type is a member of the tested union fits it: the operand is
+    // evaluated for its effects and the test is true (D3360).
+    const covOp = nodeTyAt(nd0.isObj, fnIx)
+    if (
+      covOp >= 0
+      && !isUnionOfTy(covOp)
+      && !exprUnion(nd0.isObj, fnIx)
+      && tyUnionCovers(isVarTyIxOf(isIx), covOp)
+    ) {
+      if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+      fbDrop()
+      fbI32Const(1)
+      return 0
     }
   }
   emitIsTest(body, isIx, fnIx)
@@ -24866,13 +24881,12 @@ function emitCallRefArg(
     } else if cuNm != "" {
       if emitUnionBoxArg(body, cuNm, -1, args[i], fnIx) < 0 { return -1 }
     } else if (
-      sigParamKindAt(ckey, i) == "str"
+      (pkk == "str" || pkk == "nulstr")
       && exprIsLitAtom(args[i], fnIx)
     ) {
-      // the mirror of `clu`: a literal-union atom argument flowing into a `string`
-      // parameter widens to its member string, since the functype declares `(ref
-      // $array)` there and the atom local holds an i32 id — a `string` token is a ref,
-      // unlike the litunion token, so it is never confusable with i32.
+      // the mirror of `clu`: a literal-union atom argument flowing into a `string` or
+      // `string | null` parameter widens to its member string, since the functype declares
+      // a string ref there and the atom local holds an i32 id (D3189).
       if emitAtomToStr(body, args[i], fnIx) < 0 { return -1 }
     } else if (
       clu == 0
@@ -28812,6 +28826,35 @@ function emitReturnPlainValue(
   0
 }
 
+// Lower `retArg` as the `null` of a result holding only `null` (`nulnone`, or a `: null`
+// annotation): a `null` literal, or a write yielding one, is the bottom `ref.null none`, not
+// the null of the place written (D14798). 0 or -1, or -2 when `retArg` is neither.
+function emitRetNulNoneValue(
+  body: u8[],
+  retArg: i32,
+  fnIx: i32,
+  fnPos: i32,
+): i32 {
+  if !fnPosRetIsNulNone(fnPos) && !fnAnnRetIsNull(fnIx) { return -2 }
+  const u = unwrapParen(retArg)
+  if u < 0 || u >= P.nodes.length { return -2 }
+  if nodeAt(u) is NullLit {
+    fbRefNullNone()
+    return 0
+  }
+  if !asgYieldsNullLit(u) { return -2 }
+  if emitAssign(body, u, fnIx) < 0 { return -1 }
+  fbRefNullNone()
+  0
+}
+
+// Whether function `fnIx` is annotated (or pinned) with the `null` unit type as its result.
+function fnAnnRetIsNull(fnIx: i32): boolean {
+  const fn = nodeAt(fnIx)
+  if !(fn is FuncDecl) || fn.fnRet < 0 { return false }
+  tyPrimNameOf(nodeTyIxOf(fn.fnRet)) == "null"
+}
+
 // The coerced arms of a return value, in priority order: an f32, f64 or i64 widen, a
 // concrete variant (`retVi`), a union box (`retUNm`), or a literal-union atom widened to its
 // string. The caller takes the plain arm when none applies. Returns 0 or -1.
@@ -29033,6 +29076,8 @@ function emitReturnValueTail(
   retSLKind: VKind | null,
 ): i32 {
   const fn = nodeAt(fnIx)
+  const nulNone = emitRetNulNoneValue(body, retArg, fnIx, fnPos)
+  if nulNone != -2 { return nulNone }
   const rf: RetFlags = {
     retF32: false,
     retF64: false,
@@ -29544,6 +29589,14 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   if nulCloFlag(r) == 1 {
     fbRefNull(cloStructIdx)
     return 0
+  }
+  // The same niche for an un-annotated function its stored kind names one (an instance's lambda).
+  if r < 0 {
+    const nfp = fnStmtsPosOf(fnIx)
+    if nfp >= 0 && nfp < fRetKind.length && fRetKind[nfp] == "nulclosure" {
+      fbRefNull(cloStructIdx)
+      return 0
+    }
   }
   if fnRetIsNulAtom(fnIx) {
     fbI32Const(-1) // the nullable atom's null sentinel
