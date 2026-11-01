@@ -663,7 +663,6 @@ import {
   calleeNodeSigKey,
   cloNameSigKeyTy,
   declaredStructIndex,
-  declaredVariantIndex,
   drwFieldClosure,
   enclosingLoopVarBinds,
   fnBlockShadowsAt,
@@ -1540,13 +1539,6 @@ function globalReadIsString(fnIx: i32, readIx: i32) {
 // True if the function `name` returns a nullable struct (`"nulstruct"`).
 function fnRetNulRefSid(sid: i32, name: string, fnIx: i32, at: i32) {
   repOfNameResult(sid, name, fnIx, at).rdKind == "nulstruct"
-}
-
-// The variant row of a captured `v: Circle` cell of `fnIx`, or -1 when `name` is no capture or
-// its cell is not a variant.
-function capturedVariantIndex(fnIx: i32, name: string) {
-  if capturedKindOf(fnIx, name) != "variant" { return -1 }
-  capturedCompanionSlot(fnIx, name)
 }
 
 // The variant row of the `(ref null $uVarHeap[vi])` niche expression `exprIx` holds, or -1
@@ -9479,16 +9471,8 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
       }
       return -1
     }
-    // A read: the variant row of the cell it reads (a local, a capture or a module global),
-    // else of its own type. A cell's kind can say variant where its type names a record with a
-    // struct row of its own, a label the type does not carry.
+    // A read: the variant row of the type its binding is stored at, else of its own type.
     Ident => {
-      const dvi = declaredVariantIndex(exprIx)
-      if dvi >= 0 { return dvi }
-      const cvi = capturedVariantIndex(fnIx, e.identName)
-      if cvi >= 0 { return cvi }
-      const gvi = globalReadVariantIndex(fnIx, exprIx)
-      if gvi >= 0 { return gvi }
       return variantRowOfRead(exprIx, fnIx)
     }
     // A call to a `: Cat`-returning function yields the concrete variant ref, in the three
@@ -9586,9 +9570,22 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
 // else its own; -1 when that type is no arm.
 function variantRowOfRead(ix: i32, fnIx: i32): i32 {
   let st = readNarrowedStoreAt(ix, fnIx)
+  if st < 0 { st = readHeldTyOf(ix, fnIx) }
   if st < 0 { st = nodeTyAt(ix, fnIx) }
   if st < 0 || st >= T.tys.length { return -1 }
   repVariantShapeRowOf(st)
+}
+
+// The type the binding a read names is stored at, where that is another record than the read's
+// own type (`letBindTy`), else -1: a cell built at a union arm is that arm (D14655).
+function readHeldTyOf(ix: i32, fnIx: i32): i32 {
+  const u = unwrapParen(ix)
+  if u < 0 || !(nodeAt(u) is Ident) { return -1 }
+  const d = identDeclOf(u)
+  if d < 0 || !(nodeAt(d) is LetDecl) { return -1 }
+  const ht = letBindTy(d, fnIx)
+  if ht < 0 || ht >= T.tys.length || !(tyAt(ht) is TyObj) { return -1 }
+  ht
 }
 
 // Does every arm of the if-expression at `ifIx` — an `else if` chain included — denote the
@@ -9608,17 +9605,6 @@ function ifArmsAllVariantIdx(ifIx: i32, fnIx: i32, vi: i32): boolean {
     return exprVariantIndex(ev, fnIx) == vi
   }
   false
-}
-
-// The union-variant table index a module global's cell holds, or -1 — the global sibling
-// of `globalReadStructIndex`, gated on the cell actually being the kind-8 variant so the two
-// never both answer for one binding. A global whose init names another global recurses one
-// level per link; module globals cannot cycle.
-function globalReadVariantIndex(fnIx: i32, readIx: i32): i32 {
-  const li = globalLetOfRead(fnIx, readIx)
-  if li < 0 { return -1 }
-  if globalCellKind(li) != "variant" { return -1 }
-  globalCellStructIdx(li)
 }
 
 // The struct table index a function `name` returns (recorded in `fRetStructIdx`), or -1.
