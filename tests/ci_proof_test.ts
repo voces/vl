@@ -60,6 +60,9 @@ const CI_RUNS: Record<string, string[]> = {
   "seed size": [
     "vl run scripts/seed-size.vl --compiler build/vl-compiler.wasm -- --check",
   ],
+  "late demands": [
+    "vl run scripts/late-demands.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm",
+  ],
   "no-python": ["vl run scripts/no-python.vl"],
   "kind-ladder sets": [
     "vl run scripts/ladder-sets.vl --compiler build/vl-compiler.wasm",
