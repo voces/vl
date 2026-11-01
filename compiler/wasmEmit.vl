@@ -31,6 +31,7 @@ import { keyHasPrefix, parenPeelIx } from "./check_places"
 import {
   elabNodeRepAt,
   elabSpreadNote,
+  elabSpreadRunHolderOf,
   elabSpreadRunNote,
   litRepTyAt,
   readNarrowedStoreAt,
@@ -964,6 +965,7 @@ import {
   instanceReadTyOf,
   letBindIsAtom,
   letBindIsNulAtom,
+  letCellKind,
   letInfersF32,
   letInitTyIsNarrowedArm,
   letInitTyIsNarrowedNulArm,
@@ -13135,7 +13137,7 @@ function emitArrUnder(
     if (
       lb.lbKind == LBK_STR_LIST
       && !isRefLit
-      && (ec.nulString || arrElemsAllNull(elems))
+      && (listCtxElemIsNulStr(arrIx, fnIx) || arrElemsAllNull(elems))
     ) {
       isStrLit = true
       isF64Lit = false
@@ -31328,13 +31330,16 @@ function emitLetInitValue(
   } else if letIsI64(stmtIx, fnIx) {
     if emitExprAsI64(body, s.letInit, fnIx, ec) < 0 { return -1 }
   } else if (
-    (letAnnNm == "string" || tyIsBareStrLit(nodeTyIxOf(s.letType)))
+    (letAnnNm == "string"
+      || tyIsBareStrLit(nodeTyIxOf(s.letType))
+      || s.letType < 0 && letCellKind(stmtIx, fnIx) == "str")
     && exprIsLitAtom(s.letInit, fnIx)
     && !letBindIsAtom(stmtIx, fnIx)
   ) {
     // A literal-union atom initializing a `string` local widens to its member string. Not
     // where the binding's cell is the atom: an inline literal-union annotation renders as `string`, so
-    // the rendered name alone would widen into an atom cell (D1752).
+    // the rendered name alone would widen into an atom cell (D1752). An un-annotated `let`
+    // copying a `const`'s literal set is that string cell (D14757).
     if emitAtomToStr(body, s.letInit, fnIx, ec) < 0 { return -1 }
   } else if letIsNulString(stmtIx, fnIx) && exprIsLitAtom(s.letInit, fnIx) {
     // a literal-union atom initializing a `string | null` binding widens to its member
@@ -36177,13 +36182,39 @@ function ctxFieldStorageAgrees(ix: i32, t: i32): boolean {
 // rule; a literal with no record keeps the delivery context.
 function arrLitTakesAtom(ix: i32, fnIx: i32, ctx: ExpCtx): boolean {
   const pr = nodeCtxTyIxOf(ix)
-  if pr < 0 || !ctxFieldStorageAgrees(ix, pr) || !elabTyClosed(pr, 0) {
+  if pr < 0 {
+    const h = elabSpreadRunHolderOf(ix)
+    if h >= 0 { return tyElemRepsAsAtom(nodeTyAt(h, fnIx)) }
+    return ctx.litUnion == 1
+  }
+  if !ctxFieldStorageAgrees(ix, pr) || !elabTyClosed(pr, 0) {
     return ctx.litUnion == 1
   }
   const a = tyElemRepsAsAtom(pr)
   const at = ctxTyAt(ix, fnIx)
   if at != pr && tyElemRepsAsAtom(at) != a { return ctx.litUnion == 1 }
   a
+}
+
+// Whether list literal `ix` is delivered to a list whose element is a `string | null`: its
+// closed contextual type, or for a run the emitter built, the type of the list it is built at.
+function listCtxElemIsNulStr(ix: i32, fnIx: i32): boolean {
+  const pr = nodeCtxTyIxOf(ix)
+  if pr >= 0 && elabTyClosed(pr, 0) { return tyElemIsNulStr(pr) }
+  const h = elabSpreadRunHolderOf(ix)
+  if h >= 0 { return tyElemIsNulStr(nodeTyAt(h, fnIx)) }
+  false
+}
+
+// Whether `t`, through `| null`, is a list whose element reps as a `string | null`.
+function tyElemIsNulStr(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const n0 = tyAt(t)
+  const u = if n0 is TyNullable { n0.nInner } else { t }
+  if u < 0 { return false }
+  const n = tyAt(u)
+  if n is TyArray { return repOfTy(n.aElem).rdKind == "nulstr" }
+  false
 }
 
 // Whether `t`, through `| null`, is a list whose element reps as the atom.
@@ -36236,6 +36267,15 @@ function emitNullOwn(own: i32) {
   fbRefNullNone()
 }
 
+// The variant row object literal `exprIx` is constructed at, or -1: one the checker built at a
+// concrete arm, or one unadopted whose field set names a variant and no struct, is the bare
+// variant struct rather than a union box.
+function objLitBuildVariantRow(exprIx: i32, fnIx: i32): i32 {
+  const ad = nodeRepTyAt(exprIx, fnIx)
+  const pvi = if ad >= 0 && ad != nodeTyAt(exprIx, fnIx) { litArmRowOf(exprIx, fnIx, ad) } else { objLitVariantIdxNoStructRow(exprIx, fnIx) }
+  if pvi >= 0 && pvi < uVariants.length { pvi } else { -1 }
+}
+
 function emitObjLitNode(
   body: u8[],
   _e: ObjLit,
@@ -36244,13 +36284,8 @@ function emitObjLitNode(
   row: i32,
   ec: ExpCtx,
 ) {
-  // A literal the checker built at a concrete variant, or one unadopted whose field set names a
-  // variant and no struct, constructs the bare variant struct, not a union box.
-  const ad = nodeRepTyAt(exprIx, fnIx)
-  const pvi = if ad >= 0 && ad != nodeTyAt(exprIx, fnIx) { litArmRowOf(exprIx, fnIx, ad) } else { objLitVariantIdxNoStructRow(exprIx, fnIx) }
-  if pvi >= 0 && pvi < uVariants.length {
-    return emitVariantStruct(body, exprIx, pvi, fnIx, ec)
-  }
+  const pvi = objLitBuildVariantRow(exprIx, fnIx)
+  if pvi >= 0 { return emitVariantStruct(body, exprIx, pvi, fnIx, ec) }
   // A literal whose field-set matches a STANDALONE struct constructs that struct
   // directly (even alongside a union — `ast.vl`'s `Tok`/`Diag` coexist with `Node`).
   // Otherwise, in a union program, it is a union variant: box it `{tag, value}`.
