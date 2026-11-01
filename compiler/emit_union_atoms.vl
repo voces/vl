@@ -1,7 +1,7 @@
 // `emit_union_atoms.vl` — which value unions carry atoms or map arms, the
 // map-value shapes they intern, and the twins a variant is built with.
 
-import { FuncDecl, Ident, LetDecl, nodeAt } from "./ast"
+import { FuncDecl, Ident, LetDecl, i32ToStr, nodeAt } from "./ast"
 import { emitFail } from "./emit_bytes"
 import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
 import { recBuildElemTyOfInit } from "./check_rec_rows"
@@ -75,6 +75,7 @@ import {
 } from "./emit_map_twins"
 import {
   mvValTyIxAt,
+  nonNulBaseOf,
   nulMapInnerName,
   rlElemMapValMvSlotAt,
   tyRefArrElemOf,
@@ -192,10 +193,30 @@ import {
   rlElemTyIx,
   rlUsed,
   rlWrapIdx,
+  sFieldCloSig,
+  sFieldCount,
+  sFieldElemKeyKind,
+  sFieldElemName,
+  sFieldElemTyIx,
+  sFieldNames,
+  sFieldStart,
+  sFieldTypes,
+  sHeapIdx,
+  sIsRefRow,
   sNames,
+  sRefRow,
+  sRowDecl,
+  sTwin,
   sTyIx,
   slUsed,
   uDeclared,
+  uFieldCount,
+  uFieldElemKeyKind,
+  uFieldElemName,
+  uFieldElemTyIx,
+  uFieldNames,
+  uFieldStart,
+  uFieldTypes,
   uVarSTwin,
   uVarTwin,
   uVarTyIx,
@@ -253,7 +274,7 @@ import {
 import { variantSig } from "./emit_variant_sig"
 import { i32ListHas } from "./listutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
-import { nameIsMapOpen } from "./tyname"
+import { arrElemNameRaw, nameIsMapOpen } from "./tyname"
 import {
   isNullTy,
   nulLitUnionPeelTy,
@@ -919,6 +940,153 @@ export function buildVariantTwins() {
     uVarSTwin.push(variantStructHeapTwinAt(i))
     i = i + 1
   }
+}
+
+// Variant `vi`'s own struct row: the row of the arm's own record type on the arm's heap, else -1.
+// The heap twin is tried first; it may be a layout twin of another type or another spelling. An
+// arm sharing its tag-mate's layout (D1023) is on that heap, and its record's row is not.
+export function variantOwnRow(vi: i32, h: i32): i32 {
+  if vi >= uVarTyIx.length || uVarTyIx[vi] < 0 { return -1 }
+  const vt = uVarTyIx[vi]
+  const st = if vi < uVarSTwin.length { uVarSTwin[vi] } else { -1 }
+  if (
+    st >= 0
+    && st < sTyIx.length
+    && st < sHeapIdx.length
+    && sHeapIdx[st] == h
+    && sTyIx[st] >= 0
+    && tySame(vt, sTyIx[st])
+  ) {
+    return st
+  }
+  let r = 0
+  while r < sTyIx.length && r < sHeapIdx.length {
+    if sHeapIdx[r] == h && sTyIx[r] >= 0 && tySame(vt, sTyIx[r]) { return r }
+    r = r + 1
+  }
+  -1
+}
+
+// Whether element spelling `en` names a declared type: its head, past `[]`, `| null` and type
+// arguments, is a user type. A structural render (`{v:i32}`) does not.
+function elemNameIsDeclared(en: string): boolean {
+  let h = nonNulBaseOf(en)
+  let a = arrElemNameRaw(h)
+  while a != "" {
+    h = nonNulBaseOf(a)
+    a = arrElemNameRaw(h)
+  }
+  let i = 0
+  while i < h.length && h[i] != '<' { i = i + 1 }
+  (cUserTypes[h.slice(0, i)] ?? -1) >= 0
+}
+
+// Make variant `vi` and its own struct row `r` record one element name and type per field where
+// the two record the same type: a declared spelling wins over a structural one, else the row's,
+// and the type is the row's index, the one a row lookup by type finds.
+function variantRowAgree(vi: i32, r: i32) {
+  if r < 0 || vi >= uFieldCount.length || r >= sFieldCount.length { return 0 }
+  if uFieldCount[vi] != sFieldCount[r] { return 0 }
+  let k = 0
+  while k < uFieldCount[vi] {
+    const ui = uFieldStart[vi] + k
+    const si = sFieldStart[r] + k
+    if (
+      ui < uFieldElemName.length
+      && ui < uFieldElemTyIx.length
+      && si < sFieldElemName.length
+      && si < sFieldElemTyIx.length
+      && uFieldNames[ui] == sFieldNames[si]
+    ) {
+      const ut = uFieldElemTyIx[ui]
+      const st = sFieldElemTyIx[si]
+      const ue = uFieldElemName[ui]
+      const se = sFieldElemName[si]
+      if ut >= 0 && st >= 0 && (ut != st || ue != se) && tySame(ut, st) {
+        if ue != se && elemNameIsDeclared(ue) && !elemNameIsDeclared(se) {
+          sFieldElemName[si] = ue
+        } else {
+          uFieldElemName[ui] = se
+        }
+        uFieldElemTyIx[ui] = st
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Whether a struct row other than a reference row records variant `vi`'s record type, on any heap.
+// A D1023 shared-tag arm's record has one, off the arm's heap.
+function variantRecordHasRow(vi: i32): boolean {
+  const vt = uVarTyIx[vi]
+  let r = 0
+  while r < sTyIx.length {
+    if !sIsRefRow(r) && sTyIx[r] >= 0 && tySame(vt, sTyIx[r]) { return true }
+    r = r + 1
+  }
+  false
+}
+
+// Variant `vi`'s row: its own struct row, else a reference row minted for its record on its heap.
+// -1 for an arm with no recorded type, or one laid out at its tag-mate's heap (D1023).
+export function variantRowOrMint(vi: i32, h: i32): i32 {
+  const own = variantOwnRow(vi, h)
+  if own >= 0 && !sIsRefRow(own) { variantRowAgree(vi, own) }
+  if (own >= 0 || vi >= uVarTyIx.length || uVarTyIx[vi] < 0) { return own }
+  if variantRecordHasRow(vi) { return -1 }
+  refRowMint(vi, h)
+}
+
+// Append a reference row for variant `vi`: its record type, heap and fields, a twin of itself and
+// no declared name. -1 when the field table is mid-append and the row cannot be laid down.
+function refRowMint(vi: i32, h: i32): i32 {
+  const si = sNames.length
+  const fs = sFieldNames.length
+  if (
+    sFieldStart.length != si
+    || sFieldCount.length != si
+    || sHeapIdx.length != si
+    || sTwin.length != si
+    || sFieldTypes.length != fs
+    || sFieldElemName.length != fs
+    || sFieldCloSig.length != fs
+    || vi >= uFieldStart.length
+    || vi >= uFieldCount.length
+  ) {
+    return -1
+  }
+  while sRefRow.length < si { sRefRow.push(false) }
+  sRefRow.push(true)
+  sNames.push("#ref" + i32ToStr(si))
+  while sRowDecl.length < si { sRowDecl.push(0) }
+  sRowDecl.push(0)
+  while sTyIx.length < si { sTyIx.push(-1) }
+  sTyIx.push(uVarTyIx[vi])
+  sHeapIdx.push(h)
+  sTwin.push(si)
+  while sFieldElemTyIx.length < fs { sFieldElemTyIx.push(-1) }
+  while sFieldElemKeyKind.length < fs { sFieldElemKeyKind.push(MAP_KEY_STR) }
+  sFieldStart.push(fs)
+  sFieldCount.push(uFieldCount[vi])
+  let k = 0
+  while k < uFieldCount[vi] {
+    const u = uFieldStart[vi] + k
+    sFieldNames.push(uFieldNames[u])
+    sFieldTypes.push(uFieldTypes[u])
+    sFieldElemName.push(
+      if u < uFieldElemName.length { uFieldElemName[u] } else { "" },
+    )
+    sFieldCloSig.push("")
+    sFieldElemTyIx.push(
+      if u < uFieldElemTyIx.length { uFieldElemTyIx[u] } else { -1 },
+    )
+    sFieldElemKeyKind.push(
+      if u < uFieldElemKeyKind.length { uFieldElemKeyKind[u] } else { MAP_KEY_STR },
+    )
+    k = k + 1
+  }
+  si
 }
 
 // The static map type of the map-valued expression `exprIx`, or -1: its recorded type, else —

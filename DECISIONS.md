@@ -11255,3 +11255,48 @@ layout, and a field read takes
 its rep from the row's storage, not from the read's literal-set type alone. Arms under two tags
 are not one family's shared row: there each keeps its own layout and the shared read converts
 (D14746).
+
+## A record has one row; a union arm is a reference to it (ruling, 2026-11-01)
+
+A record type gets one emitter row, the struct row: its heap type, field order and field
+storage codes. A union arm is a reference from (union, arm) to that row, not a second row of
+the same record. The variant table (`uVariants`, `uField*`, `uVarHeap`) grew beside the struct
+table, and the two duplicate each other for every record that is also an arm: measured over
+`tests/**/*.vl`, 1,341 of 2,853 variant rows (47%) have a struct row of the same record type,
+and 1,337 of those are already on its heap with the same fields, order and codes. What the
+"variant" label really says is context: the value is a payload unboxed from a union box, which
+a tag test casts to. The layout is the row's either way.
+
+The variant row as the only row was refused: most struct rows (about 5,400 of 6,700 in the same
+corpus) are records that are never a union arm, and each would need a one-arm union and the
+box's tag machinery.
+
+The move goes in steps, each byte-identical: `uVarRow` names each arm's own struct row (the row
+of the arm's record type on the same heap with the same fields, never a layout twin of another
+type), then readers move off the variant tables onto the struct row one table at a time, then
+the shape-to-row lookup answers the struct row only, and the `"variant"` kind label narrows to
+the context. An arm whose record no struct row holds (about 1,500 of the 2,853) is given a
+reference row before the readers move: the record's type, fields and codes on the arm's heap, a
+twin of itself with no type-section entry. Until the shape-to-row lookup is rewritten, every
+existing struct-table walk skips a reference row (`sIsRefRow`), so minting one changes no
+output; each `sIsRefRow` call is a skip that rewrite retires. One arm keeps a layout that is not its record's row: an arm sharing a tag with
+another arm (D1023, one tag and one layout, `is` deciding by the discriminant's value) is laid
+out at its tag-mate's heap, while the same record standing alone has its own struct row
+(`unions/discriminant-mixed-litunion-bare-literal-arm.vl`,
+`unions/discriminant-set-beside-base-alias-arm.vl`, `unions/layout-family-literal-set-beside-string.vl`,
+`generics/one-literal-field-through-generic.vl`). Such an arm has no `uVarRow`; its row is its
+tag-mate's. An arm's row is found by the arm, never by a literal-folded shape (`repCanonId`
+folds literals, so a shape key can land on another arm's row), and the variant-only columns
+(`uFieldLitTyIx`, `uFieldTyText`) stay keyed by (union, arm) until a struct-row home is chosen.
+
+Before the field tables move, an arm and its own row agree on each field's element name and type:
+where both record the same type, a declared spelling (`Inner`, `Box<i32>`) wins over a
+structural render (`{base:i32,length:i32}`), else the row's spelling stands, and the type index
+is the row's, the one a row lookup by type finds. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
+variant heap column is gone. A row is keyed by (record type, field storage codes), not by the
+type alone: a record with a tagged function field is a second row of its type. A value cannot
+cross between two storage rows of one type without a converting delivery, and none exists, so
+for now the function-tag rule declines a record whose fields would mix the two storages, and the
+record keeps its untagged row. A delivery that tags one must keep running
+`closures/hole-fn-record-beside-declared-row-handed-to-param.vl`,
+`closures/hole-fn-record-field-called-at-other-param.vl` and `closures/hole-fn-record-list-element.vl`.

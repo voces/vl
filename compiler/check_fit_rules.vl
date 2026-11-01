@@ -290,11 +290,13 @@ import {
   recPend,
   recPendDstTy,
   recPendSrc,
+  recPendSrcTy,
 } from "./check_rec_rows"
 import {
   recAtPinnedArg,
   recCoalesceOperands,
   recDeclInit,
+  recElemPinLit,
   recIndexBase,
   recIsJoin,
   recLeafEscapes,
@@ -1609,8 +1611,13 @@ export function rcwPend(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A scalar source shares nothing; a type variable may stand for a record.
   if srcTy >= T.tys.length { return 0 }
   if !rcwIsRefTy(srcTy) && !(tyAt(srcTy) is TyVar) { return 0 }
-  // A source typed at a hole shares whatever its pin is: each pin re-asks it (D3250).
-  if tyAt(srcTy) is TyVar && rcwIsRefTy(dstTy) && cstrOwnerTop() >= 0 {
+  // A source typed at a hole shares whatever its pin is: each pin re-asks it (D3250), and a
+  // record literal holding one is re-asked whole (D14759).
+  if (
+    (tyAt(srcTy) is TyVar || (tyAt(srcTy) is TyObj && tyHasTyVar(srcTy)))
+    && rcwIsRefTy(dstTy)
+    && cstrOwnerTop() >= 0
+  ) {
     rcwPinNote(srcExpr, srcTy, dstTy)
   }
   const seen = rcwPendSeen[srcExpr] ?? []
@@ -1922,7 +1929,8 @@ function recQueuedReaches(c: i32, own: i32, dst: i32): boolean {
   let i = 0
   while i < recPendSrc.length {
     if (
-      !recRepArgOf(i, c, own, dst)
+      !recPendInert(i)
+      && !recRepArgOf(i, c, own, dst)
       && recLandingIn(recPendSrc[i], recPendDstTy[i], c, own, REC_STORE_DEPTH) >= 0
     ) {
       return true
@@ -1980,7 +1988,7 @@ function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
   let got = -1
   let i = 0
   while i < recPendSrc.length {
-    if recRepArgOf(i, c, own, dst) {
+    if recPendInert(i) || recRepArgOf(i, c, own, dst) {
       i = i + 1
       continue
     }
@@ -1998,6 +2006,22 @@ function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
     i = i + 1
   }
   got
+}
+
+// Whether queued delivery `i` is a list literal handed at its own type to a generic that hands
+// back one of its elements (`recElemPinLit`): its elements land where the call does (D14812).
+function recPendInert(i: i32): boolean {
+  if i < 0 || i >= recPendSrcTy.length || i >= recPendDstTy.length {
+    return false
+  }
+  const src = recPendSrc[i]
+  const p = cwPeelValue(src)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is ArrayLit) { return false }
+  if !tySame(recPendSrcTy[i], recPendDstTy[i]) { return false }
+  if src < 0 || src >= cwIxUpKind.length || cwIxUpKind[src] != CW_UP_ARG {
+    return false
+  }
+  recElemPinLit(cwIxUp[src]) == p
 }
 
 // Whether queued delivery `i` is call `c`'s record of `own`, directly or relayed, handed as an
@@ -2038,6 +2062,16 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
   if p == c { return recAdLanding(own, d) }
   if recSolePinArg(p) >= 0 {
     return recLandingIn(recSolePinArg(p), d, c, own, depth - 1)
+  }
+  // A generic handing back an element of its list literal argument lands each element there.
+  const epl = recElemPinLit(p)
+  const eln = if epl >= 0 { nodeAt(epl) } else { null }
+  if eln is ArrayLit {
+    for ex in eln.arrElems {
+      const t = recLandingIn(ex, d, c, own, depth - 1)
+      if t >= 0 { return t }
+    }
+    return -1
   }
   // A non-generic function handing back an un-annotated parameter lands its argument there.
   const pc = nodeAt(p)
@@ -2601,6 +2635,7 @@ function recElemTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
   recFieldRead(e)
     || recArgTakesRep(e, depth)
     || recRetTakesRep(e, fd, call, depth)
+    || (fd >= 0 && recConstFieldUses(e) >= 0)
 }
 
 // Whether parameter `par`, open in a type variable or a hole, is only read or written for a field,
@@ -2649,23 +2684,27 @@ function recRetTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
 }
 
 // Whether `x` initialises an un-annotated `const` that is only read for a field.
-function recBoundForFields(x: i32): boolean {
+function recBoundForFields(x: i32): boolean { recConstFieldUses(x) > 0 }
+
+// How many reads the un-annotated `const` that `x` initialises has, where each one is for a field;
+// -1 when `x` initialises no such `const` or a read is not for a field.
+function recConstFieldUses(x: i32): i32 {
   if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_LETINIT {
-    return false
+    return -1
   }
   const d = cwIxUp[x]
-  if d < 0 || d >= P.nodes.length { return false }
+  if d < 0 || d >= P.nodes.length { return -1 }
   const dn = nodeAt(d)
-  if !(dn is LetDecl) || dn.letType >= 0 || dn.letKw != "const" { return false }
-  let used = false
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letKw != "const" { return -1 }
+  let used = 0
   const ow = cwOccWalk(d)
   while cwOccNext(ow) {
     const r = ow.row
     if cwIxKind[r] == CW_OCC_USE {
-      if !recFieldRead(cwIxNode[r]) { return false }
-      used = true
+      if !recFieldRead(cwIxNode[r]) { return -1 }
+      used = used + 1
     } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
-      return false
+      return -1
     }
   }
   used
@@ -5356,14 +5395,21 @@ export function markFieldValue(ix: i32, owner: i32, name: string): i32 {
   1
 }
 
-// Records `t` as the destination of each value leaf join `ix` delivers, not of `ix` itself: a
-// value `if`, block or `match`'s arms are delivered to the join, whatever then takes it.
+// Records `t` as the destination of each value leaf and inner join that join `ix` delivers, not
+// of `ix` itself: a value `if`, block or `match`'s arms are delivered to the join, whatever then
+// takes it.
 export function recordLeafCtxTy(ix: i32, t: i32): i32 {
   if ix < 0 || t < 0 || litPinN.length > 0 || !stampsStand() { return 0 }
   const e = nodeAt(ix)
   if e is Paren { return recordCtxTy(e.parInner, t) }
   if !(e is IfStmt || e is Block || e is MatchExpr) { return 0 }
-  for l in valueTailLeaves(ix) {
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(ix, spine, leaves)
+  for j in spine {
+    if j != ix { ctxTyStamp(j, t) }
+  }
+  for l in leaves {
     if l != ix { ctxTyStamp(l, t) }
   }
   1
@@ -5507,7 +5553,8 @@ function arrLitFitsList(ix: i32, m: i32, exact: boolean, depth: i32): boolean {
 }
 
 // Whether `src` is a `null[]` element: a list literal's element, a `push`, `unshift` or `insert`
-// argument on a list, or the value of `xs[i] = …` on a list. A struct field or local is not one.
+// argument on a list, `__array_new__`'s fill, or the value of `xs[i] = …` on a list. A struct
+// field or local is not one.
 function nullUnitListCell(src: i32): boolean {
   cwIxBuild()
   if src < 0 || src >= cwIxUp.length { return false }
@@ -5518,6 +5565,9 @@ function nullUnitListCell(src: i32): boolean {
   if k == CW_UP_ELEM { return un is ArrayLit }
   if k == CW_UP_ARG && un is Call && un.callFn >= 0 {
     const f = nodeAt(un.callFn)
+    if f is Ident && f.identName == "__array_new__" {
+      return un.callArgs.length == 2 && un.callArgs[1] == src
+    }
     if (
       f is Member
       && (f.memProp == "push" || f.memProp == "unshift" || f.memProp == "insert")

@@ -620,6 +620,7 @@ import {
   sFieldNames,
   sFieldStart,
   sHeapIdx,
+  sIsRefRow,
   sTypeIdx,
   slUsed,
   startStmts,
@@ -650,11 +651,12 @@ import {
   uFieldTypes,
   uSinkFired,
   uTags,
-  uVarHeap,
+  uVarRow,
   uVarTyIx,
   uVariants,
   unTyIx,
   unionSinkBase,
+  variantHeap,
   variantReboxSlot,
   vbAtomListUsed,
   vbBoolListTop,
@@ -2839,7 +2841,7 @@ function emitVariantStruct(
       objIx,
     )
   }
-  fbStructNew(uVarHeap[vi])
+  fbStructNew(variantHeap(vi))
   0
 }
 
@@ -2945,7 +2947,7 @@ function emitStructExprAsVariantBox(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  // The guard covers the two span tables; `uTags` and `uVarHeap` are instead one row per
+  // The guard covers the two span tables; `uTags` and `variantHeap` are instead one row per
   // `uVariants` row, minted after the last pass that can push one. Each caller bounds `ssi`
   // its own way — `structIdxMatchesVariantIdx` here, `bssi < sHeapIdx.length` at the argument
   // boundary — so neither hands one on unchecked.
@@ -2955,7 +2957,10 @@ function emitStructExprAsVariantBox(
   const codes: i32[] = []
   variantRowFields(vi, names, codes)
   fbI32Rel(RS_TAG, uTags[vi])
-  if emitRecCopy(body, exprIx, ssi, uVarHeap[vi], names, codes, fnIx, ec) < 0 {
+  if (
+    emitRecCopy(body, exprIx, ssi, variantHeap(vi), names, codes, fnIx, ec)
+    < 0
+  ) {
     return -1
   }
   fbStructNew(uBoxIdx)
@@ -3049,8 +3054,8 @@ function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
   const ssi = structIndexOfExpr(exprIx, fnIx)
   if ssi < 0 || ssi >= sHeapIdx.length { return -1 }
   const vi = repVariantShapeRowOf(dst)
-  if vi >= 0 && vi < uVarHeap.length {
-    if uVarHeap[vi] == sHeapIdx[ssi] { return -1 }
+  if vi >= 0 && vi < uVarRow.length {
+    if variantHeap(vi) == sHeapIdx[ssi] { return -1 }
     return -2 - vi
   }
   const dsi = structIndexOfTy(dst)
@@ -3075,7 +3080,16 @@ function emitRecCopyInto(
     const vi = -2 - row
     if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
     variantRowFields(vi, names, codes)
-    return emitRecCopy(body, exprIx, ssi, uVarHeap[vi], names, codes, fnIx, ec)
+    return emitRecCopy(
+      body,
+      exprIx,
+      ssi,
+      variantHeap(vi),
+      names,
+      codes,
+      fnIx,
+      ec,
+    )
   }
   if (
     row < 0
@@ -3859,7 +3873,7 @@ function emitDiscrimFieldEq(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  if vi < 0 || vi >= uVarHeap.length {
+  if vi < 0 || vi >= uVarRow.length {
     return emitFail(
       "emitProgram: discriminant test on an arm with no heap type",
     )
@@ -3882,8 +3896,8 @@ function emitDiscrimFieldEq(
   const code = uFieldTypes[uFieldStart[vi] + fi]
   if emitExpr(body, recvIx, fnIx, ec) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1)
-  fbRefCast(uVarHeap[vi])
-  fbStructGet(uVarHeap[vi], fi)
+  fbRefCast(variantHeap(vi))
+  fbStructGet(variantHeap(vi), fi)
   emitFieldLitEq(body, code, lex, fnIx, ec)
 }
 
@@ -3965,8 +3979,8 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32, ec: ExpCtx): i32 {
       fis.push(fi)
       codes.push(if fi >= 0 { sFieldTypeAt(si, fi) } else { -1 })
     }
-  } else if vi >= 0 && vi < uVarHeap.length {
-    heap = uVarHeap[vi]
+  } else if vi >= 0 && vi < uVarRow.length {
+    heap = variantHeap(vi)
     for f in names {
       const fi = variantFieldIndex(vi, f)
       fis.push(fi)
@@ -6107,7 +6121,7 @@ function emitIsTestArmTag(
           const aifi = variantFieldIndex(aivi, vrecv.memProp)
           if aifi >= 0 {
             if emitExpr(body, vrecv.memObj, fnIx, ec) < 0 { return -1 }
-            fbStructGet(uVarHeap[aivi], aifi)
+            fbStructGet(variantHeap(aivi), aifi)
             fbStructGet(uBoxIdx, 0)
             fbI32Rel(RS_TAG, armTag)
             fbI32Bin(70)
@@ -6639,7 +6653,7 @@ function emitArmFieldsFit(
   slot: i32,
   ec: ExpCtx,
 ): i32 {
-  if yi < 0 || yi >= uVarHeap.length {
+  if yi < 0 || yi >= uVarRow.length {
     return emitFail(
       "emitProgram: `is` across record arms names an arm with no row",
     )
@@ -6670,8 +6684,8 @@ function emitArmFieldsFit(
       if nulStr {
         if emitSharedFieldRecv(body, recv, fnIx, slot, ec) < 0 { return -1 }
         fbStructGet(uBoxIdx, 1)
-        fbRefCast(uVarHeap[yi])
-        fbStructGet(uVarHeap[yi], fi)
+        fbRefCast(variantHeap(yi))
+        fbStructGet(variantHeap(yi), fi)
         fbRefIsNull()
         fbIf(127)
         fbI32Const(if nonNullTy(fxSet) != fxSet { 1 } else { 0 })
@@ -6683,8 +6697,8 @@ function emitArmFieldsFit(
       while li < lexes.length {
         if emitSharedFieldRecv(body, recv, fnIx, slot, ec) < 0 { return -1 }
         fbStructGet(uBoxIdx, 1)
-        fbRefCast(uVarHeap[yi])
-        fbStructGet(uVarHeap[yi], fi)
+        fbRefCast(variantHeap(yi))
+        fbStructGet(variantHeap(yi), fi)
         if nulStr { fbRefAsNonNull() }
         if (
           emitFieldLitEq(body, variantFieldTypeAt(yi, fi), lexes[li], fnIx, ec)
@@ -6736,8 +6750,8 @@ function emitArmFieldsFit(
     while j < yes.length {
       if emitSharedFieldRecv(body, recv, fnIx, slot, ec) < 0 { return -1 }
       fbStructGet(uBoxIdx, 1)
-      fbRefCast(uVarHeap[yi])
-      fbStructGet(uVarHeap[yi], fi)
+      fbRefCast(variantHeap(yi))
+      fbStructGet(variantHeap(yi), fi)
       fbStructGet(uBoxIdx, 0)
       fbI32Rel(RS_TAG, yes[j])
       fbI32Bin(70)
@@ -6780,8 +6794,8 @@ function emitNarrowedMem(body: u8[], memIx: i32, fnIx: i32, ec: ExpCtx) {
     }
     if emitExpr(body, m.memObj, fnIx, ec) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1)
-    fbRefCast(uVarHeap[vi])
-    fbStructGet(uVarHeap[vi], idx)
+    fbRefCast(variantHeap(vi))
+    fbStructGet(variantHeap(vi), idx)
     emitNulStrFieldRecover(variantFieldTypeAt(vi, idx), memIx, fnIx)
 
     // A value-union field read while the checker types it as one atom unboxes to that atom,
@@ -8640,7 +8654,7 @@ function emitUnionCoerceRecord(
     if rbVi >= 0 {
       const rbSsi = structIndexOfExpr(exprIx, fnIx)
       if rbSsi >= 0 {
-        if sHeapIdx[rbSsi] != uVarHeap[rbVi] {
+        if sHeapIdx[rbSsi] != variantHeap(rbVi) {
           return emitStructExprAsVariantBox(body, exprIx, rbVi, rbSsi, fnIx, ec)
         }
         // The heaps agreeing is not a reason to pass raw (D281). The test above answers "must
@@ -9097,7 +9111,7 @@ function emitUnionArmValueBox(
     if (
       bssi >= 0
       && bssi < sHeapIdx.length
-      && sHeapIdx[bssi] != uVarHeap[svi]
+      && sHeapIdx[bssi] != variantHeap(svi)
     ) {
       if emitStructExprAsVariantBox(body, exprIx, svi, bssi, fnIx, ec) < 0 {
         return -1
@@ -9309,7 +9323,7 @@ function emitUnionIfArm(
 // ref-array and map arms and none for the struct one — so every destination typed at the arm has
 // to recover the payload itself.
 
-// The cast target is the destination's heap and not `uVarHeap[vi]`: the slot is what the store
+// The cast target is the destination's heap and not `variantHeap(vi)`: the slot is what the store
 // must satisfy, and where the arm is merged with a declared twin the indices are the same
 // anyway. Not a change to `exprUnion`, which would move every narrowed struct receiver.
 function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
@@ -9382,7 +9396,7 @@ function sFieldTgtHeapOf(si: i32, fi: i32): i32 {
 // The heap a destination names, from the (kind, slot) pair every boundary already holds — the
 // same pair `fbValtype` writes the slot's valtype from, so the cast target and the slot cannot
 // disagree. -1 for a kind that is not a struct or variant ref and for an index outside its
-// table: the delivery then emits unchanged rather than reading `uVarHeap[-1]`.
+// table: the delivery then emits unchanged rather than reading `variantHeap(-1)`.
 
 // The heap a ref-list slot's element names, when that element is a struct or variant ref
 // (`rlElemKindAt` 1) — the destination for a narrowed arm delivered into a `Circle[]`. -1 for
@@ -9422,7 +9436,7 @@ function armDestHeapOf(kind: VKind, idx: i32): i32 {
   // silent -1 that reads as "this arm has no heap type".
   match kind {
     "variant" | "nulvariant" => {
-      if idx < uVarHeap.length { return uVarHeap[idx] }
+      if idx < uVarRow.length { return variantHeap(idx) }
       return -1
     }
     "struct" | "nulstruct" => {
@@ -9459,7 +9473,7 @@ function emitFailCrossTagDelivery(exprIx: i32, vi: i32): i32 {
   )
 }
 
-// Coerce the expression at `exprIx` to the concrete variant `vi`'s rep `(ref $uVarHeap[vi])`.
+// Coerce the expression at `exprIx` to the concrete variant `vi`'s rep `(ref $variantHeap(vi))`.
 // The collapse boundary, where a callback typed as one variant meets a mix of reps: an object
 // literal builds the bare variant, a narrowed union value unboxes, an already-bare variant
 // passes through, a value-`if` join recurses. The variant analogue of `emitUnionCoerce`.
@@ -9489,7 +9503,7 @@ export function emitVariantCoerce(
     if emitExpr(body, exprIx, fnIx, ec) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
     if vi < 0 { return -1 }
-    fbRefCast(uVarHeap[vi]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+    fbRefCast(variantHeap(vi)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
     return 0
   }
   emitVariantPassThrough(body, exprIx, fnIx, ec)
@@ -9553,7 +9567,7 @@ function emitVariantIfValueLink(
   const s = nodeAt(ifIx)
   if s is IfStmt {
     // An else-less `if` used as a value is `T | null` (`DECISIONS.md`): the variant rep's null
-    // is `ref.null $uVarHeap[vi]`, so the blocktype goes nullable with it (`fbRefNullOfKind` is
+    // is `ref.null $variantHeap(vi)`, so the blocktype goes nullable with it (`fbRefNullOfKind` is
     // `fbValtypeNullable`'s value twin).
     const noElse = s.ifElse < 0
     const condStart = wLen()
@@ -9561,9 +9575,9 @@ function emitVariantIfValueLink(
     const sg = staticIsGuard(s.ifCond, condStart)
     fbOpenIf() // 0x04 if
     if noElse {
-      fbValtypeNullable("variant", vi) // `(ref null $(uVarHeap[vi]))`
+      fbValtypeNullable("variant", vi) // `(ref null $(variantHeap(vi)))`
     } else {
-      fbValtype("variant", vi) // result blocktype: the variant struct `(ref $(uVarHeap[vi]))`
+      fbValtype("variant", vi) // result blocktype: the variant struct `(ref $(variantHeap(vi)))`
     }
     let rcT = 0
     if sg == 0 {
@@ -9940,7 +9954,7 @@ function unionEqArmPresent(
 // per storage class and none for a struct-field read, and an un-annotated object literal is
 // declined once the struct table holds a row matching its field set.
 
-// The bridge is heap identity, not shape matching: `sHeapIdx` and `uVarHeap` are two index spaces
+// The bridge is heap identity, not shape matching: `sHeapIdx` and `variantHeap` are two index spaces
 // over one wasm type space, and two rows that interned to the same wasm struct type hold
 // interchangeable values. Where they interned separately this answers -1 and the caller keeps its
 // loud refusal. Exactly one match, or none: two arms sharing a heap type do not fix the tag.
@@ -9964,8 +9978,8 @@ function eqConcreteVariantRow(exprIx: i32, fnIx: i32) {
   const h = sHeapIdx[ssi]
   let found = -1
   let i = 0
-  while i < uVarHeap.length {
-    if uVarHeap[i] == h {
+  while i < uVarRow.length {
+    if variantHeap(i) == h {
       if found >= 0 { return -1 }
       found = i
     }
@@ -9980,7 +9994,7 @@ function eqConcreteVariantRow(exprIx: i32, fnIx: i32) {
 
 // The concrete operand already has the arm's heap type: when a union is declared the union path
 // owns the struct types, so a `const a: A = {x: 1}` beside `type A` in an `A | i32` is a
-// `(ref $uVarHeap[vi])`. The box is evaluated first and once and both operands are parked, which
+// `(ref $variantHeap(vi))`. The box is evaluated first and once and both operands are parked, which
 // is what lets a non-place operand work here without `emitUnionConcreteEq`'s gate.
 function emitUnionConcreteVariantEq(
   body: u8[],
@@ -9995,7 +10009,7 @@ function emitUnionConcreteVariantEq(
   // The same four parallel-table bounds `emitStructUnionEq` takes before it writes a byte,
   // for the same reason: a variant row the emitter's tables do not cover must DECLINE, never
   // read out of bounds (`emitFail does not halt`).
-  if vi >= uVarHeap.length { return -1 }
+  if vi >= uVarRow.length { return -1 }
   if vi >= uTags.length { return -1 }
   if vi >= uFieldStart.length { return -1 }
   if vi >= uFieldCount.length { return -1 }
@@ -10035,7 +10049,7 @@ function emitUnionConcreteVariantEq(
   const al = unionEqArmSlot(vi)
   fbLocalGet(sl)
   fbStructGet(uBoxIdx, 1)     // field 1: payload (anyref)
-  fbRefCast(uVarHeap[vi])
+  fbRefCast(variantHeap(vi))
   fbLocalSet(al)
   if emitVariantFieldsEq(body, al, ar, vi, fnIx, ec) < 0 { return -1 }
   fbElse()                    // the box holds a different arm — structurally unequal
@@ -10115,7 +10129,7 @@ function unionBoxEqColumns(
       i = i + 1
       continue
     }
-    if vi >= uVarHeap.length { return false }
+    if vi >= uVarRow.length { return false }
     if vi >= uTags.length { return false }
     if vi >= uFieldStart.length { return false }
     if vi >= uFieldCount.length { return false }
@@ -10383,11 +10397,11 @@ function emitVariantArmEq(
   const ar = unionEqArmSlot(vi + 1024)
   fbLocalGet(sl)
   fbStructGet(uBoxIdx, 1)
-  fbRefCast(uVarHeap[vi])
+  fbRefCast(variantHeap(vi))
   fbLocalSet(al)
   fbLocalGet(sr)
   fbStructGet(uBoxIdx, 1)
-  fbRefCast(uVarHeap[vi])
+  fbRefCast(variantHeap(vi))
   fbLocalSet(ar)
   emitVariantFieldsEq(body, al, ar, vi, fnIx, ec)
 }
@@ -10430,9 +10444,9 @@ function emitVariantFieldsEq(
       }
     } else {
       fbLocalGet(al)
-      fbStructGet(uVarHeap[vi], j)
+      fbStructGet(variantHeap(vi), j)
       fbLocalGet(ar)
-      fbStructGet(uVarHeap[vi], j)
+      fbStructGet(variantHeap(vi), j)
       if emitVariantFieldEqCore(body, start + j, fnIx, ec) < 0 { return -1 }
     }
     fbI32Bin(113) // 0x71 i32.and
@@ -10456,24 +10470,24 @@ function emitVariantNulFieldEq(
   ec: ExpCtx,
 ) {
   fbLocalGet(al)
-  fbStructGet(uVarHeap[vi], j)
+  fbStructGet(variantHeap(vi), j)
   fbRefIsNull()
   fbIf(127)     // the left field was null
   fbLocalGet(ar)
-  fbStructGet(uVarHeap[vi], j)
+  fbStructGet(variantHeap(vi), j)
   fbRefIsNull() // both null ⇒ equal
   fbElse()
   fbLocalGet(ar)
-  fbStructGet(uVarHeap[vi], j)
+  fbStructGet(variantHeap(vi), j)
   fbRefIsNull()
   fbIf(127)
   fbI32Const(0) // exactly one side null
   fbElse()
   fbLocalGet(al)
-  fbStructGet(uVarHeap[vi], j)
+  fbStructGet(variantHeap(vi), j)
   fbRefAsNonNull()
   fbLocalGet(ar)
-  fbStructGet(uVarHeap[vi], j)
+  fbStructGet(variantHeap(vi), j)
   fbRefAsNonNull()
   if emitVariantFieldEqCoreAt(body, ufi, fnIx, inner, ec) < 0 { return -1 }
   fbEnd()
@@ -11119,7 +11133,7 @@ function emitSharedFieldArm(
   slot: i32,
   ec: ExpCtx,
 ) {
-  if vi < 0 || vi >= uVarHeap.length {
+  if vi < 0 || vi >= uVarRow.length {
     return emitFail("emitProgram: a shared field read names no member row")
   }
   // A `null` member of an atom-set read is the atom slot's `-1`.
@@ -11155,8 +11169,8 @@ function emitSharedFieldArm(
     }
     if emitSharedFieldRecv(body, recvIx, fnIx, slot, ec) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(uVarHeap[vi])
-    fbStructGet(uVarHeap[vi], fi)
+    fbRefCast(variantHeap(vi))
+    fbStructGet(variantHeap(vi), fi)
     const strSlot = objOrderStashSlot(FC_STR, uFieldStorageSlot(vi, fi))
     fbLocalSet(strSlot)
     const savedLU = expCtxSwapLitUnion(0, ec)
@@ -11189,8 +11203,8 @@ function emitSharedFieldArm(
   }
   if emitSharedFieldRecv(body, recvIx, fnIx, slot, ec) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-  fbRefCast(uVarHeap[vi])
-  fbStructGet(uVarHeap[vi], fi)
+  fbRefCast(variantHeap(vi))
+  fbStructGet(variantHeap(vi), fi)
   if setStr {
     if texts.length == 0 || !aUsed {
       return emitFail(
@@ -11303,9 +11317,9 @@ function emitSharedFieldAssign(
       }
       if emitSharedFieldRecv(body, m.memObj, fnIx, rslot, ec) < 0 { return -1 }
       fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-      fbRefCast(uVarHeap[vis[i]])
+      fbRefCast(variantHeap(vis[i]))
       fbLocalGet(vslot)
-      fbStructSet(uVarHeap[vis[i]], fis[i])
+      fbStructSet(variantHeap(vis[i]), fis[i])
       if !last { fbElse() }
       i = i + 1
     }
@@ -11346,11 +11360,11 @@ function emitSharedFieldAssignPerArm(
     }
     if emitSharedFieldRecv(body, recvIx, fnIx, rslot, ec) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(uVarHeap[vis[i]])
+    fbRefCast(variantHeap(vis[i]))
     if emitVariantFieldValue(body, vis[i], fis[i], valIx, fnIx, ec) < 0 {
       return -1
     }
-    fbStructSet(uVarHeap[vis[i]], fis[i])
+    fbStructSet(variantHeap(vis[i]), fis[i])
     if !last { fbElse() }
     i = i + 1
   }
@@ -11432,7 +11446,7 @@ function emitSharedFieldRecv(
 
 // The one home for "a code-16 value-union-box field read whose member path is narrowed to a
 // single scalar atom unboxes to that atom's rep". The receiver's own shape decides which
-// `struct.get` produced the box — the plain struct table, the arm's `uVarHeap` row, or the
+// `struct.get` produced the box — the plain struct table, the arm's `variantHeap` row, or the
 // nullable form of the same — but the unbox after it is one sequence.
 
 // The atom is the checker's type for the read (`memNarrowAtomKind`): a litunion-alias narrow
@@ -11661,7 +11675,7 @@ function emitMemVariantRead(
   // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
   // struct directly — the param already IS the unboxed variant ref, so there is NO box
   // unwrap / cast (gap #2). Evaluate the receiver (`local.get o`), then `struct.get
-  // $<uVarHeap[vi]> <fieldIdx>`.
+  // $<variantHeap(vi)> <fieldIdx>`.
   const m0 = nodeAt(memIx)
   if m0 is Member {
     const pvi = exprVariantIndex(m0.memObj, fnIx)
@@ -11671,7 +11685,7 @@ function emitMemVariantRead(
         return emitFail("emitProgram: unknown variant field in field access")
       }
       if emitExpr(body, m0.memObj, fnIx, ec) < 0 { return -1 }
-      fbStructGet(uVarHeap[pvi], pvfi) // 0xfb 0x02 <variant struct ht> <field index>
+      fbStructGet(variantHeap(pvi), pvfi) // 0xfb 0x02 <variant struct ht> <field index>
       emitNulStrFieldRecover(variantFieldTypeAt(pvi, pvfi), memIx, fnIx)
       // A code-16 (value-union box) field of the arm, read while its member PATH is
       // narrowed, unboxes to the narrowed atom — the arm-for-arm twin of the plain
@@ -11684,7 +11698,7 @@ function emitMemVariantRead(
     }
     // The nullable form of the same read (`c: Circle | null`, inside its `!= null` branch).
     // Identical `struct.get`, one `ref.as_non_null` ahead of it: the cell is a
-    // `(ref null $uVarHeap[vi])` and `struct.get` takes a non-null ref. The assertion cannot trap
+    // `(ref null $variantHeap(vi))` and `struct.get` takes a non-null ref. The assertion cannot trap
     // where the checker admits the read — such an access is only reachable through a null test.
     const nvi = nulVariantIdxOfExpr(m0.memObj, fnIx)
     if nvi >= 0 {
@@ -11694,7 +11708,7 @@ function emitMemVariantRead(
       }
       if emitExpr(body, m0.memObj, fnIx, ec) < 0 { return -1 }
       fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
-      fbStructGet(uVarHeap[nvi], nvfi)
+      fbStructGet(variantHeap(nvi), nvfi)
       emitNulStrFieldRecover(variantFieldTypeAt(nvi, nvfi), memIx, fnIx)
       if variantFieldTypeAt(nvi, nvfi) == FC_UNION {
         if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
@@ -13018,7 +13032,7 @@ function emitArrI32(
       // A declared union arm reaching the i32-list fallback — the same shape as the struct arm
       // above and the map arm below. The two namespaces are exclusive, a name in `uVariants`
       // having no `sNames` row, so `exprStruct` declines for an arm by construction and the
-      // element would reach `array.new_fixed $aTypeIdx` with a `(ref $uVarHeap)` operand.
+      // element would reach `array.new_fixed $aTypeIdx` with a `(ref $variantHeap)` operand.
 
       // A ref list of arms has a sound rep and the annotated spellings reach it; what has no
       // rep is an arm element on the i32 backing, which the inferred spelling reaches. Two
@@ -19870,7 +19884,7 @@ export function eqHelpReserve() {
   }
   r = 0
   while r < sFieldCount.length {
-    if gSawEqOp && eqHelpPathsOf(r) > EQ_HELP_PATHS {
+    if gSawEqOp && !sIsRefRow(r) && eqHelpPathsOf(r) > EQ_HELP_PATHS {
       gEqHelpTy.push(gEqHelpTyN)
       gEqHelpTyN = gEqHelpTyN + 1
     } else {
@@ -20787,12 +20801,10 @@ function emitExprRaw(body: u8[], ix: i32, fnIx: i32, ec: ExpCtx): i32 {
 let rawReadNode = -1
 
 // Whether `emitExpr`'s string-to-atom conversion takes node `ix`: its closed contextual type
-// reps as the atom, as `strLitTakesAtom` decides, unless a raw read of it is in progress; a
-// node with no record (an `as` target, a nested join's arm) keeps the delivery context.
+// reps as the atom, as `strLitTakesAtom` decides, unless a raw read of it is in progress.
 function hookTakesAtom(ix: i32, fnIx: i32, ctx: ExpCtx): boolean {
   const u = unwrapParen(ix)
   if u == rawReadNode || !hookMayConvert(u) { return false }
-  if nodeCtxTyIxOf(ix) < 0 { return ctx.litUnion == 1 }
   strLitTakesAtom(ix, fnIx, ctx)
 }
 
@@ -20899,7 +20911,7 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   }
   if e is CharLit { return emitCharLitNode(body, e, exprIx, fnIx) }
   if e is Ident {
-    if emitIdentNode(body, e, exprIx, fnIx, ctx, ec) < 0 { return -1 }
+    if emitIdentNode(body, e, exprIx, fnIx, ec) < 0 { return -1 }
     return emitReadRecover(exprIx, fnIx)
   }
   if e is Paren { return emitExpr(body, e.parInner, fnIx, ec) }
@@ -20907,7 +20919,7 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
     (e is Member || e is Index || callIsMethodAt(exprIx))
     && exprIsNulNone(exprIx, fnIx)
   ) {
-    return emitNulNoneRead(body, exprIx, fnIx, ctx, ec)
+    return emitNulNoneRead(body, exprIx, fnIx, ec)
   }
   if e is Member || e is Index {
     const pnk = placeNicheAtomKind(exprIx, fnIx)
@@ -20917,7 +20929,7 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   if e is AsExpr { return emitAsCast(body, e, exprIx, fnIx, ec) }
   if e is Call { return emitCallNode(body, e, exprIx, fnIx, ec) }
   if e is IsExpr { return emitIs(body, exprIx, fnIx, ec) }
-  if e is NullLit { return emitNullLitNode(body, e, exprIx, fnIx, ctx, ec) }
+  if e is NullLit { return emitNullLitNode(body, e, exprIx, fnIx, ec) }
   if e is ObjLit { return emitObjLitNode(body, e, exprIx, fnIx, -1, ec) }
   if e is StrLit {
     // A literal delivered to a destination whose type reps as the atom lowers as its interned id.
@@ -21116,7 +21128,7 @@ function armPreludeScopeOpen(ifIx: i32): boolean {
 // bare `null` there takes, so no arm can pick a blocktype for it (D2227).
 function emitAllNullIf(body: u8[], ifIx: i32, fnIx: i32, ec: ExpCtx) {
   if emitIfForEffect(body, unwrapParen(ifIx), fnIx, ec) < 0 { return -1 }
-  emitNullAt(ifIx, fnIx, ec)
+  emitNullAt(ifIx, fnIx)
 }
 
 // Whether node `ix` is a method call `recv.m(…)`.
@@ -21129,13 +21141,7 @@ function callIsMethodAt(ix: i32): boolean {
 // A field, element or map read, or a `null[]`'s `pop`/`get`, whose type is the `null` unit type:
 // the read runs in its own stored rep with the destination's null seeds lifted, is dropped, and
 // the value is the `null` the destination seeded, as an ident read of a `null` binding is (D4671).
-function emitNulNoneRead(
-  body: u8[],
-  exprIx: i32,
-  fnIx: i32,
-  ctx: ExpCtx,
-  ec: ExpCtx,
-) {
+function emitNulNoneRead(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   const outer = expCtxHere(ec)
   const raw = expCtxHere(ec)
   raw.nulBool = false
@@ -21159,7 +21165,7 @@ function emitNulNoneRead(
   expCtxApply(outer, ec)
   if rc < 0 { return -1 }
   fbDrop()
-  emitNullAt(exprIx, fnIx, ctx)
+  emitNullAt(exprIx, fnIx)
 }
 
 // Lower a ref-typed if-expression join (string / struct / array) as a value-typed `if`
@@ -22618,21 +22624,21 @@ function emitAsUnionOpt(
     return 0
   }
   // a struct-variant target (`as? Circle`) is the `nulvariant` niche, a
-  // `(ref null $uVarHeap[vi])`: unbox and cast on the hit, a typed null on the miss.
+  // `(ref null $variantHeap(vi))`: unbox and cast on the hit, a typed null on the miss.
   if armVi >= 0 {
-    if armVi >= uVarHeap.length {
+    if armVi >= uVarRow.length {
       return emitFail(
         "emitProgram: `as? "
           + tgt
           + "` names a variant with no interned shape",
       )
     }
-    fbIfRefNul(uVarHeap[armVi], true)
+    fbIfRefNul(variantHeap(armVi), true)
     fbLocalGet(unionAsBoxSlot())
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(uVarHeap[armVi])
+    fbRefCast(variantHeap(armVi))
     fbElse()
-    fbRefNull(uVarHeap[armVi])
+    fbRefNull(variantHeap(armVi))
     fbEnd()
     return 0
   }
@@ -22856,7 +22862,7 @@ function emitAsUnionCast(
   // cast, exactly as the shared-field dispatch does; a value atom takes the shared tail.
   if armVi >= 0 {
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(uVarHeap[armVi])
+    fbRefCast(variantHeap(armVi))
     return 0
   }
   if mapHeap >= 0 {
@@ -25826,16 +25832,16 @@ function orderedDirectArgs(callIx: i32, target: i32) {
 
 // Is the argument at `argIx` a plain struct whose emitted heap type is union-arm `vi`'s —
 // a declared layout twin sharing one heap type in the emitted module? The predicate
-// (`sHeapIdx[row] == uVarHeap[vi]`) is the same test `emitUnionBoxArg` runs at the box
+// (`sHeapIdx[row] == variantHeap(vi)`) is the same test `emitUnionBoxArg` runs at the box
 // boundary. False for a non-struct argument, an unresolvable row, or a slot outside the variant table.
 function cloArgIsArmHeapTwin(argIx: i32, vi: i32, fnIx: i32): boolean {
   if vi < 0 { return false }
-  if vi >= uVarHeap.length { return false }
+  if vi >= uVarRow.length { return false }
   if !exprStruct(argIx, fnIx) { return false }
   const si = structIndexOfExpr(argIx, fnIx)
   if si < 0 { return false }
   if si >= sHeapIdx.length { return false }
-  sHeapIdx[si] == uVarHeap[vi]
+  sHeapIdx[si] == variantHeap(vi)
 }
 
 // The lifted slot the callee `calleeIx` names when it reads a `const` bound to a
@@ -25941,7 +25947,7 @@ function emitCallRefArg(
       }
     }
     // the arm-parameter arm (D269, direction 2 of D200): a `variant` parameter demands
-    // one heap type (`uVarHeap[vi]`), so a raw push stays a floor except where it is
+    // one heap type (`variantHeap(vi)`), so a raw push stays a floor except where it is
     // provably safe. The slot comes off the resolved `$fnsig` key, so the cast target
     // cannot disagree with the bytes.
     let cvSlot = -1
@@ -25967,14 +25973,14 @@ function emitCallRefArg(
         if variantHasCrossTagFits(cvSlot, args[i], fnIx) {
           return emitFailCrossTagDelivery(args[i], cvSlot)
         }
-        fbStructGet(uBoxIdx, 1)     // 0xfb 0x02 <box ht> field 1: value (anyref)
-        fbRefCast(uVarHeap[cvSlot]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+        fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
+        fbRefCast(variantHeap(cvSlot)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
       }
     } else if pkk == "nulvariant" {
       // The niche parameter (D3074), as the direct call's argument rung builds it: an object
       // literal builds the arm, and a value narrowed out of a box is unboxed to the arm.
       const cnvSlot = sigParamSlotAt(ckey, i)
-      if cnvSlot < 0 || cnvSlot >= uVarHeap.length {
+      if cnvSlot < 0 || cnvSlot >= uVarRow.length {
         return emitFail(
           "emitProgram: value-call nullable union-arm parameter has no variant slot",
         )
@@ -26206,7 +26212,7 @@ function assignArmCellVariantIdx(lhsIx: i32, fnIx: i32): i32 {
   }
   if localIsRef[slot] != "variant" { return -1 }
   const vi = localStructIdx[slot]
-  if vi < 0 || vi >= uVarHeap.length { return -1 }
+  if vi < 0 || vi >= uVarRow.length { return -1 }
   vi
 }
 
@@ -26240,7 +26246,7 @@ function emitAssignGlobal(
     // the coerce owns that value's unbox and recover.
     const gaCoerced = gaKind == "variant"
       && gaArmIdx >= 0
-      && gaArmIdx < uVarHeap.length
+      && gaArmIdx < uVarRow.length
     if (
       gUNm != ""
       && !tyIsLitUnion(nodeTyIxOf(lhsIx))
@@ -26542,7 +26548,7 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     st.slot = rslot
     if refListElemIsRow(arrIx, fnIx) {
       st.structIdx = rlElemStructRow(rslot)
-      // ...and where that declines, the element is an ARM, at `uVarHeap[vi]`.
+      // ...and where that declines, the element is an ARM, at `variantHeap(vi)`.
       if st.structIdx < 0 {
         st.variantIdx = variantIndexOf(nonNulBaseOf(rlElemName[rslot]))
       }
@@ -26800,7 +26806,7 @@ function emitVariantFieldWrite(
 ): i32 {
   if emitVariantFieldStoreVal(body, vi, fi, rhs, fnIx, ec) < 0 { return -1 }
   if vi < 0 { return -1 }
-  fbStructSet(uVarHeap[vi], fi)
+  fbStructSet(variantHeap(vi), fi)
   0
 }
 
@@ -26911,8 +26917,8 @@ function emitAssignMember(
         )
       }
       if emitExpr(body, nm.memObj, fnIx, ec) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 1)  // box field 1: value (anyref)
-      fbRefCast(uVarHeap[nvi]) // ref.cast to the variant struct
+      fbStructGet(uBoxIdx, 1)     // box field 1: value (anyref)
+      fbRefCast(variantHeap(nvi)) // ref.cast to the variant struct
       // The field's context is taken AFTER the receiver's own emit, which may leave seeds
       // of its own behind.
       return emitVariantFieldWrite(body, nvi, nfi, a.binRight, fnIx, ec)
@@ -26936,7 +26942,7 @@ function emitAssignMember(
     }
   }
   // the nullable-variant receiver: a `T | null` binding whose `T` is a union arm holds
-  // `(ref null $uVarHeap[vi])`, so this differs from the variant-param write above only
+  // `(ref null $variantHeap(vi))`, so this differs from the variant-param write above only
   // by one `ref.as_non_null`, safe since the checker admits the write only inside a null test.
   const nwvi = nulVariantIdxOfExpr(target.memObj, fnIx)
   if nwvi >= 0 {
@@ -30931,8 +30937,8 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   // A record that is also a union's member is that member's variant struct, nullable.
   if retNulVariantFlag(r) == 1 {
     const nvi = nulVariantIndexOf(r)
-    if nvi >= 0 && nvi < uVarHeap.length {
-      fbRefNull(uVarHeap[nvi])
+    if nvi >= 0 && nvi < uVarRow.length {
+      fbRefNull(variantHeap(nvi))
       return 0
     }
   }
@@ -35666,13 +35672,12 @@ function emitIdentNode(
   e: Ident,
   exprIx: i32,
   fnIx: i32,
-  ctx: ExpCtx,
   ec: ExpCtx,
 ) {
   // D1576 — a read of a never-filled `let x = null` is the value `null`, so it takes the
   // destination's null rep from the same table a bare `null` literal does.
   if identCellVKind(exprIx, fnIx) == "nulnone" {
-    return emitNullAt(exprIx, fnIx, ctx)
+    return emitNullAt(exprIx, fnIx)
   }
   // An `is K[]` arm's read of an empty list of another element (D4911), ahead of the narrowed
   // unboxes, which would cast the receiver's own list to `K[]`.
@@ -36129,22 +36134,21 @@ function emitNullLitNode(
   _e: NullLit,
   exprIx: i32,
   fnIx: i32,
-  ctx: ExpCtx,
   _ec: ExpCtx,
 ) {
-  emitNullAt(exprIx, fnIx, ctx)
+  emitNullAt(exprIx, fnIx)
 }
 
 // The `null` value node `exprIx` evaluates to, built at the rep of the type the checker stamped
 // it with where it is delivered: the `boolean | null` or literal-union sentinel, a
 // `string | null`'s typed null, else the bottom ref.
-function emitNullAt(exprIx: i32, fnIx: i32, ctx: ExpCtx) {
-  emitNullOwn(nullOwnAt(exprIx, fnIx, ctx))
+function emitNullAt(exprIx: i32, fnIx: i32) {
+  emitNullOwn(nullOwnAt(exprIx, fnIx))
 }
 
 // Which null the `null` value node `exprIx` is where it is delivered (`NULL_OWN_*`): the rep of
 // the type the checker stamped it with, the instance's own stamp first.
-function nullOwnAt(exprIx: i32, fnIx: i32, ctx: ExpCtx): i32 {
+function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   const er = elabNodeRepAt(exprIx, fnIx)
   const d = repOfNodeAt(
     exprIx,
@@ -36158,14 +36162,12 @@ function nullOwnAt(exprIx: i32, fnIx: i32, ctx: ExpCtx): i32 {
   if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
     own = nullOwnOfTy(nodeCtxTyIxOf(parenPeelIx(exprIx)))
   }
-  // Two floors keep the destination's seed, both an instance's. A `null[]` write or result mono
-  // builds at `T = null` carries no rep stamp of its cell (D14773). An elaboration binding a type
-  // argument mono widened can stamp another null than mono's storage (D14640).
-  const seed = nullOwnOfSeed(ctx)
-  if own == NULL_OWN_NONE && seed == NULL_OWN_BOOL && d.rdKind == "nulnone" {
-    own = seed
+  // An instance's stamp can be an inner join's, which a delivery at a wider type outlives: the
+  // instance's contextual type, where closed, names the null its storage holds (D14640).
+  if er >= 0 {
+    const co = nullOwnOfTy(ctxTyAt(parenPeelIx(exprIx), fnIx))
+    if co != NULL_OWN_NONE { own = co }
   }
-  if er >= 0 && seed != NULL_OWN_NONE && seed != own { own = seed }
   own
 }
 
@@ -36314,14 +36316,6 @@ const NULL_OWN_NONE = 0
 const NULL_OWN_BOOL = 1
 const NULL_OWN_ATOM = 2
 const NULL_OWN_STR = 3
-
-// The null the destination seeds in `ctx` name.
-function nullOwnOfSeed(ctx: ExpCtx): i32 {
-  if ctx.nulBool { return NULL_OWN_BOOL }
-  if ctx.nulLitUnion { return NULL_OWN_ATOM }
-  if ctx.nulString { return NULL_OWN_STR }
-  NULL_OWN_NONE
-}
 
 // Emits the null `own` names.
 function emitNullOwn(own: i32) {
@@ -37816,7 +37810,7 @@ function emitBinRefOps(
     if eqSi >= 0 { return emitStructEq(body, exprIx, fnIx, eqSi, ec) }
     // The refusal spans both tables — either side naming a layout without the two agreeing is
     // a compare this emitter refuses rather than guesses at, matching D57 (an operand reaching
-    // the i32 tail as a `(ref $uVarHeap[vi])`). Two arms of one union sharing a layout resolve
+    // the i32 tail as a `(ref $variantHeap(vi))`). Two arms of one union sharing a layout resolve
     // to different variant rows and fall to this same refusal, exactly as two disagreeing structs would.
     if (
       structIndexOfExpr(e.binLeft, fnIx) >= 0
@@ -38010,7 +38004,7 @@ function emitDirectCall(
   ) {
     return -1
   }
-  emitDirectCallTail(target, callIx, fnIx, ec)
+  emitDirectCallTail(target, callIx, fnIx)
 }
 
 // Does a direct call with `nArgs` operands pass more than callee `target` declares? False when
@@ -38211,8 +38205,8 @@ function emitDirectArgUnbox(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
       if variantHasCrossTagFits(cVi, arg, fnIx) {
         return emitFailCrossTagDelivery(arg, cVi)
       }
-      fbStructGet(uBoxIdx, 1)  // 0xfb 0x02 <box ht> field 1: value (anyref)
-      fbRefCast(uVarHeap[cVi]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+      fbStructGet(uBoxIdx, 1)     // 0xfb 0x02 <box ht> field 1: value (anyref)
+      fbRefCast(variantHeap(cVi)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
     }
   }
   // The same unbox for a param whose annotation names a plain struct: an inferred
@@ -38322,7 +38316,7 @@ function directArgSeedsOf(target: i32, i: i32): DirectArgSeeds {
         if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
         if retNulVariantFlag(cpnb.parType) == 1 {
           const cpNvi = nulVariantIndexOf(cpnb.parType)
-          if cpNvi >= 0 && cpNvi < uVarHeap.length {
+          if cpNvi >= 0 && cpNvi < uVarRow.length {
             cParamNulVariantIdx = cpNvi
           }
         }
@@ -38359,7 +38353,7 @@ function directArgSeedsOf(target: i32, i: i32): DirectArgSeeds {
 
 // The `call` and what follows it, under the caller's restored context: the tail-call
 // cursor, a lifted callee's capture write-back, and the `nulnone` result's niche re-rep.
-function emitDirectCallTail(target: i32, callIx: i32, fnIx: i32, ctx: ExpCtx) {
+function emitDirectCallTail(target: i32, callIx: i32, fnIx: i32) {
   fbCall(gImports + target) // 0x10 call (imports occupy indices 0..gImports-1)
   // Arm the tail-call cursor: if this call is still the last thing written when the
   // enclosing `return` terminates, it is in tail position and `emitUnionRetSink`
@@ -38389,7 +38383,7 @@ function emitDirectCallTail(target: i32, callIx: i32, fnIx: i32, ctx: ExpCtx) {
   // unchanged; at a sentinel destination (`boolean | null`, `K | null`) the call's value is that
   // destination's null, the one a bare `null` delivered there is.
   if fnPosRetIsNulNone(target) {
-    const own = nullOwnAt(callIx, fnIx, ctx)
+    const own = nullOwnAt(callIx, fnIx)
     if own == NULL_OWN_BOOL || own == NULL_OWN_ATOM {
       fbDrop()
       emitNullOwn(own)
@@ -38942,7 +38936,7 @@ function coalNicheBoxTag(
 function nulNicheValueHeap(exprIx: i32, fnIx: i32): i32 {
   const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
   if nvi >= 0 {
-    if nvi < uVarHeap.length { return uVarHeap[nvi] }
+    if nvi < uVarRow.length { return variantHeap(nvi) }
     return -1
   }
   if exprNullableStruct(exprIx, fnIx) {
@@ -40545,7 +40539,7 @@ function emitCoalesceUnionField(
     // `emitMem` asks it: an index place is typed at the arm, so `structIndexOfExpr` answers
     // for a ref it does not hold (D8145). A null-tested nullable arm is asserted non-null.
     let mvi = coalNarrowedBoxArm(lhsIx, fnIx)
-    if mvi >= 0 { mCast = uVarHeap[mvi] }
+    if mvi >= 0 { mCast = variantHeap(mvi) }
     const msi = if mvi >= 0 { -1 } else { structIndexOfExpr(lhs.memObj, fnIx) }
     if msi >= 0 {
       mfi = sFieldIndex(msi, lhs.memProp)
@@ -40562,7 +40556,7 @@ function emitCoalesceUnionField(
       if mvi >= 0 {
         mfi = variantFieldIndex(mvi, lhs.memProp)
         if mfi >= 0 && variantFieldTypeAt(mvi, mfi) == FC_UNION {
-          mHeap = uVarHeap[mvi]
+          mHeap = variantHeap(mvi)
           mphys = variantFieldElemName(mvi, mfi)
         }
       }
@@ -40800,7 +40794,7 @@ function emitCoalesceOptNulVariant(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  if nvi < 0 || nvi >= uVarHeap.length {
+  if nvi < 0 || nvi >= uVarRow.length {
     return emitFail("emitProgram: `?.` receiver has no union arm row")
   }
   const vfi = variantFieldIndex(nvi, lhs.omProp)
@@ -40819,8 +40813,8 @@ function emitCoalesceOptNulVariant(
   if emitOptChainDefault(body, e.binRight, vCode, fnIx, ec) < 0 { return -1 }
   fbElse()
   if emitOptRecvBase(body, lhs.omObj, fnIx, false, ec) < 0 { return -1 }
-  fbRefCast(uVarHeap[nvi])
-  fbStructGet(uVarHeap[nvi], vfi)
+  fbRefCast(variantHeap(nvi))
+  fbStructGet(variantHeap(nvi), vfi)
   fbEnd()
   0
 }
@@ -40842,7 +40836,7 @@ function emitCoalesceOptMapField(
   // The variant half of the value row, the same either/or the store seed and the `??`
   // default seed have carried since D34. `mvValStructIdx` is -1 for an arm-valued map
   // (`collectS` skips a union member), so this site needs `variantFieldIndex` /
-  // `variantFieldTypeAt` / `uVarHeap` — arm-for-arm twins of the struct accessor beside it, since a missing branch answered -1 and blamed the wrong field.
+  // `variantFieldTypeAt` / `variantHeap` — arm-for-arm twins of the struct accessor beside it, since a missing branch answered -1 and blamed the wrong field.
   let omHeap = -1
   let omFi = -1
   let omCode = -1
@@ -40853,7 +40847,7 @@ function emitCoalesceOptMapField(
   if omVi >= 0 {
     omFi = variantFieldIndex(omVi, lhs.omProp)
     if omFi >= 0 {
-      omHeap = uVarHeap[omVi]
+      omHeap = variantHeap(omVi)
       omCode = variantFieldTypeAt(omVi, omFi)
     }
   } else {
@@ -40887,7 +40881,7 @@ function emitCoalesceOptMapField(
   fbI32Bin(107)                // i32.sub (entry - 1)
   fbArrayGet(cmValsBack())     // (ref null <value struct>)
   fbRefAsNonNull()             // a live entry's value is non-null
-  fbStructGet(omHeap, omFi)    // .f — the arm's `uVarHeap` row or the struct's
+  fbStructGet(omHeap, omFi)    // .f — the arm's `variantHeap` row or the struct's
   fbElse()                     // else
   if emitExpr(body, e.binRight, fnIx, ec) < 0 { return -1 }
   fbEnd()                      // end (if)
@@ -41010,17 +41004,17 @@ function emitCoalesceNullableRefs(
   ec: ExpCtx,
 ) {
   // The variant sibling of the arm below, its own arm rather than a widening of it: a `T |
-  // null` whose `T` is a union arm stores `(ref null $uVarHeap[vi])`, and
+  // null` whose `T` is a union arm stores `(ref null $variantHeap(vi))`, and
   // `structIndexOfExpr` has no row to answer with (`collectS` skips a union member). Same
   // niche, same `br_on_non_null` lowering, one table over.
   const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
   if cvi >= 0 {
-    if cvi < uVarHeap.length {
+    if cvi < uVarRow.length {
       return emitCoalesceNulRef(
         body,
         e,
         exprIx,
-        uVarHeap[cvi],
+        variantHeap(cvi),
         expCtxHere(ec),
         fnIx,
         ec,
