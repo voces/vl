@@ -83,6 +83,7 @@ import {
   inferObservedLit,
   inferObservedLitSet,
   inferObservedSet,
+  listCopyTyIx,
   mapUnboxTyIx,
   nodeCtxTyIx,
   nodeRepTyIx,
@@ -1764,6 +1765,8 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   if rcwCallSites(fd, sites) >= 0 || !recSitesLandAt(sites, call, own, dst) {
     return false
   }
+  const copies: i32[] = []
+  for cs in recSiteCopies { copies.push(cs) }
   const via: i32[] = []
   const leaves = recFnValueOrigins(fd, via)
   if leaves.length == 0 { return false }
@@ -1810,6 +1813,11 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   }
   // A leaf calling another such function hands the destination on to it (D8143).
   for cl in calls { recAdoptNote(cl, nodeTyIxOf(cl), dst) }
+  // A held-pinned call is built at `dst` and copied to its own record where it is delivered.
+  for cp in copies {
+    while recCopyTyIx.length <= cp { recCopyTyIx.push(-1) }
+    recCopyTyIx[cp] = own
+  }
   true
 }
 
@@ -1847,6 +1855,7 @@ function recFnReturns(fd: i32): i32[] {
 // serves them all (D8201). For one queued for none, `dst` widens a field no further than
 // `recNullWidened` reads back exactly, and its slots take the build (D8302).
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
+  recSiteCopies = []
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
   for s in sites {
@@ -1854,7 +1863,14 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     const c = s / 2
     if c == call { hasCall = true }
     const mapped = recHeldStored(c)
-    if recHeldPinnedArg(c) { return false }
+    // A held-pinned call is built at `dst` and copied to its own record where that loses nothing.
+    if recHeldPinnedArg(c) {
+      if mapped || !recHeldPinBare(c) || !recCopyNarrows(dst, own) {
+        return false
+      }
+      recSiteCopies.push(c)
+      continue
+    }
     const at = if mapped { -1 } else { recQueuedLandingOf(c, own, dst) }
     if at >= 0 {
       if !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
@@ -1868,6 +1884,79 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   }
   if hasCall { recRepArgsNote(sites, own, dst) }
   hasCall
+}
+
+// The held-pinned calls the last `recSitesLandAt` answer copies to their own record.
+let recSiteCopies: i32[] = []
+
+// Whether call `c` is a direct argument to a parameter typed `T` that another direct argument, a
+// held value, binds at a parameter typed `T` too: the instance is that value's.
+function recHeldPinBare(c: i32): boolean {
+  if c < 0 || c >= cwIxUpKind.length || cwIxUpKind[c] != CW_UP_ARG {
+    return false
+  }
+  const cn = nodeAt(cwIxUp[c])
+  if !(cn is Call) || cn.callFn < 0 || callHasTyArgs(cwIxUp[c]) { return false }
+  const gd = identBoundFnDeclOf(cn.callFn)
+  const g = if gd >= 0 && gd < P.nodes.length { nodeAt(gd) } else { null }
+  const i = cwIxUpAux[c]
+  if (
+    !(g is FuncDecl)
+    || i < 0
+    || i >= g.fnParams.length
+    || g.fnParams.length != cn.callArgs.length
+  ) {
+    return false
+  }
+  const tv = recParamTyName(g.fnParams[i])
+  if tv == "" || !strListHas(g.fnTyParams, tv) { return false }
+  const fd = recInferredFnOf(c)
+  let j = 0
+  while j < g.fnParams.length {
+    if (
+      j != i
+      && recParamTyName(g.fnParams[j]) == tv
+      && recHeldNotFrom(cn.callArgs[j], fd)
+    ) {
+      return true
+    }
+    j = j + 1
+  }
+  false
+}
+
+// The type name parameter `px` is annotated with, or "" for none or a composite annotation.
+function recParamTyName(px: i32): string {
+  const pn = nodeAt(px)
+  const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+  if pt is TypeRef { pt.tyName } else { "" }
+}
+
+// Whether record `wide` can be copied into record `own` field for field: each field stored alike,
+// or a `null` field of `own` where `wide` stores the field as nullable.
+function recCopyNarrows(wide: i32, own: i32): boolean {
+  if wide < 0 || own < 0 || wide >= T.tys.length || own >= T.tys.length {
+    return false
+  }
+  const w = tyAt(wide)
+  const o = tyAt(own)
+  if !(w is TyObj) || !(o is TyObj) || !objFieldNameSetsEq(wide, own) {
+    return false
+  }
+  let i = 0
+  while i < o.objFieldNames.length {
+    const of = o.objFieldTypes[i]
+    const wf = objFieldType(w, o.objFieldNames[i])
+    if wf < 0 { return false }
+    if (
+      !fieldStorageEq(wf, of, REC_STORE_DEPTH)
+      && !(of == TY_NULL && nullableInnerOrNone(wf) >= 0)
+    ) {
+      return false
+    }
+    i = i + 1
+  }
+  true
 }
 
 // Whether call `c` is an argument to a parameter typed `T` of a generic callee, or an element of a
@@ -2702,7 +2791,8 @@ function recListParamTakesRep(par: i32, call: i32, depth: i32): boolean {
     if cwIxKind[r] == CW_OCC_USE {
       const u = cwIxNode[r]
       if (
-        !recElemTakesRep(u, owner, call, depth - 1)
+        !(recElemTakesRep(u, owner, call, depth - 1)
+          || recListRetTakesRep(u, owner, call, depth - 1))
         || recEnclosingFn(u) != owner
       ) {
         return false
@@ -2773,7 +2863,63 @@ function recRetTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
     if cwPeelValue(lf) == u { leaf = true }
   }
   if !leaf { return false }
-  recFieldRead(call) || recArgTakesRep(call, depth) || recBoundForFields(call)
+  recFieldRead(call)
+    || recArgTakesRep(call, depth)
+    || recBoundForFields(call)
+    || recInReadOnlyList(call, depth)
+}
+
+// Whether `x` is an element of a list literal that initialises an un-annotated `const` read only
+// for its length or for an element's field: the list is built at its elements' rep (D14811).
+function recInReadOnlyList(x: i32, depth: i32): boolean {
+  if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_ELEM {
+    return false
+  }
+  const l = cwIxUp[x]
+  if l < 0 || l >= cwIxUpKind.length || !(nodeAt(l) is ArrayLit) {
+    return false
+  }
+  if cwIxUpKind[l] != CW_UP_LETINIT { return false }
+  recReadOnlyListDecl(cwIxUp[l], depth)
+}
+
+// Whether list `u` is handed back whole by function `fd` to `call`, its only call, whose result
+// is read only for its length or for an element's field, directly or through an un-annotated
+// `const`. A second call could share the instance at another storage (D14813).
+function recListRetTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
+  if depth <= 0 || call < 0 || call >= P.nodes.length { return false }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length != 1 || sites[0] != call * 2 {
+    return false
+  }
+  let leaf = false
+  for lf in recFnValueLeaves(fd) {
+    if cwPeelValue(lf) == u { leaf = true }
+  }
+  if !leaf { return false }
+  if recElemTakesRep(call, -1, -1, depth) { return true }
+  if call >= cwIxUpKind.length || cwIxUpKind[call] != CW_UP_LETINIT {
+    return false
+  }
+  recReadOnlyListDecl(cwIxUp[call], depth)
+}
+
+// Whether `d` is an un-annotated `const` list read only for its length or an element's field.
+function recReadOnlyListDecl(d: i32, depth: i32): boolean {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letKw != "const" { return false }
+  let used = false
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      if !recElemTakesRep(cwIxNode[r], -1, -1, depth - 1) { return false }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
+      return false
+    }
+  }
+  used
 }
 
 // Whether `x` initialises an un-annotated `const` that is only read for a field.
@@ -5005,6 +5151,65 @@ export function recordInferRetNullOnly(key: string, er: i32): boolean {
   // `TY_NULL`, not `er`: the hole's `er` has no inner a downstream read could take.
   recordInferRet(key, "null", TY_NULL, 1, IR_REC_NULL_ONLY)
   true
+}
+
+// Records `dstTy` at each list value `srcExpr` delivers into a list of another element type: the
+// emitter converts it there when the two element storages differ. A literal is built at its
+// destination, so the record goes on its elements and fields instead.
+export function recordListCopy(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  listCopyAt(srcExpr, srcTy, dstTy, REC_STORE_DEPTH)
+}
+
+// `recordListCopy` to `depth` literals deep.
+function listCopyAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
+  const dst = nonNulTyOf(dstTy)
+  if srcExpr < 0 || srcTy < 0 || dst < 0 || srcTy >= T.tys.length || depth < 0 {
+    return 0
+  }
+  const dt = tyAt(dst)
+  for lf in valueTailLeaves(srcExpr) {
+    if lf < 0 { continue }
+    const ln = nodeAt(parenPeelIx(lf))
+    if ln is ObjLit {
+      if dt is TyObj {
+        for fx in ln.objFields {
+          const fi = nodeAt(fx)
+          if fi is FieldInit {
+            const df = objFieldType(dt, fi.fiName)
+            if df >= 0 {
+              listCopyAt(fi.fiValue, nodeTyOf(fi.fiValue), df, depth - 1)
+            }
+          }
+        }
+      }
+    } else if ln is ArrayLit {
+      if dt is TyArray {
+        for ex in ln.arrElems {
+          if !(nodeAt(ex) is Spread) {
+            listCopyAt(ex, nodeTyOf(ex), dt.aElem, depth - 1)
+          }
+        }
+      }
+    } else if listTysElemDiffer(nodeTyOf(lf), dst) {
+      while listCopyTyIx.length <= lf { listCopyTyIx.push(-1) }
+      listCopyTyIx[lf] = dst
+    }
+  }
+  0
+}
+
+// Whether `src` and `dst` are both lists, `src` possibly nullable, of different element types.
+function listTysElemDiffer(src: i32, dst: i32): boolean {
+  const sn = nonNulTyOf(src)
+  if sn < 0 || sn >= T.tys.length || dst < 0 || dst >= T.tys.length {
+    return false
+  }
+  const s = tyAt(sn)
+  const d = tyAt(dst)
+  if s is TyArray {
+    if d is TyArray { return s.aElem != d.aElem }
+  }
+  false
 }
 
 // Records `dstTy` at each value `srcExpr` delivers when its record stores a number otherwise

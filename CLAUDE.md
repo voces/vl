@@ -483,6 +483,11 @@ CHECKER owed the diagnosis.
 interleaves two halves; only `self-lint + fmt-check clean` means both passed. Never put a
 gate and a commit in the same command — a non-zero exit scrolls past unread.
 
+**A PR with a merge conflict gets no merge ref and therefore no CI run at all, so it shows as
+silent, not red; after every push, confirm a workflow run exists.** Four PRs sat waiting on a
+CI that never started on 2026-11-01 (#5547, #5569, #5587, #5603). Merge the base in — a merge,
+not a rebase — resolve, re-run the fast gates, push, and check again.
+
 **QUOTE THE INSTRUMENT'S OUTPUT, NOT ITS SUMMARY — and a subset check has to say what it
 compared.** Three ways a correct tool produced a wrong sentence on 2026-09-02/03. A grader was
 run on a PARAGRAPH and its "no Repro block" was relayed as the row's defect; one `grep` on the
