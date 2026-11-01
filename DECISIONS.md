@@ -10790,6 +10790,30 @@ later `q.length` reads it (D4934); the caller's own list is not pushed onto, the
 pays for a field or capture. A closure declared in the arm reads an empty `K[]` for its capture
 (D4935). Only a field receiver still leaves the parameter unbound rather than defaulted.
 
+
+## A parameter a call leaves open is `never` in that call's deferred return (2026-11-01) — D14802, D2803, D12581
+
+**The rule.** A call can leave open a type parameter that a parameter annotation names. D2803 makes
+that legal: an argument a union's concrete member admits whole binds nothing (`pr<T>(v: T | string)`
+called as `pr("q")`). D12581 does the same for an empty `[]` handed to a `T[]` parameter. The call's
+deferred return check reads each such open parameter as `never`, the type no value has. So the check
+refuses exactly a body that would return a value the open parameter must hold:
+
+```vl
+function G<A>(v: A | i32): A { v }
+const y: boolean = G(5)
+// refused: return type mismatch: expected never, got never | i32 (the return of `G` at the
+// call's argument types; the call binds no type to `A`, so give it an explicit type argument)
+```
+
+**Why not refuse every call that leaves a parameter open.** Measured on 2026-11-01, that refused 26
+tests that run with their `@log` today, D2803's and D12581's among them. The calls are correct; only
+a value delivered as the open parameter is not. A parameter no parameter annotation names keeps
+D4551's default and its own declaration-time refusal; this rule does not touch it.
+
+**What it leaves open.** `F<A, B>(v: A | B): boolean { v }` called as `F(5)` reads `never | never`,
+which every destination accepts. Whether `5` binds `A`, binds both, or is refused as ambiguous is the
+owner's ruling, filed as D14803.
 ## A plain build drops the functions no root reaches (2026-10-23)
 
 **The rule.** `vl build` and `vl run` emit, for every function no root reaches, a three-byte
@@ -11377,3 +11401,14 @@ second record with the same field names moves a literal off an arm and onto its 
 because it is what the emitter already did, now one checker fact in place of two emitter scans. The
 alternative, refused for now, is that an unadopted literal is always its own row and a conversion is
 emitted wherever it later meets the union. If the distance ever bites, that is the change to make.
+
+## A value-fit list is not delivered at an instance (application of ruling (c), D4981, D5003)
+
+Not a new decision: owner ruling (c) on #3792 (D4928) says a list narrowed by `is K[]` is never
+delivered as `K[]`, applied here to the instance of a generic body. At `V = i32[]` an empty list
+passes `is f64[]` by value fit (D4771), and the arm reads it as a fresh `f64[]`. Handed to a
+parameter, a binding, a return or a field, a write would land in a list the caller does not hold,
+so the instance refuses the delivery as D4928 refuses it from a concrete declared type. Read-only
+uses in the arm (`v.length`, an element read) stay legal, as does every delivery at an instance
+whose list is the tested type or a union holding it. Aliasing the receiver is impossible across
+two storage types, and a silent copy is the lossy operation std and this file refuse elsewhere.

@@ -58,6 +58,7 @@ import {
   CW_OCC_CALL,
   cwIxKind,
   cwIxNode,
+  cwLetUnwritten,
   cwOccNext,
   cwOccWalkSpelled,
   cwUseCaptures,
@@ -475,10 +476,13 @@ function ftMintComplete(r: i32, s: i32): boolean {
   const pd = identDeclOf(root)
   if pd < 0 || pd >= P.nodes.length { return false }
   const p = nodeAt(pd)
-  // The callee is a parameter, or the `const` alias of one the elaboration took as it.
+  // The callee is a parameter, or an alias of one the elaboration took as it: a `const`, or a
+  // `let` nothing re-points.
   let name = ""
   if p is Param { name = p.parName }
-  if p is LetDecl && p.letKw == "const" { name = p.letName }
+  if p is LetDecl && (p.letKw == "const" || cwLetUnwritten(pd)) {
+    name = p.letName
+  }
   if name == "" { return false }
   if root != cf { return ftChainCallsComplete(r, s, pd) }
   const ow = cwOccWalkSpelled(pd, name)
@@ -733,7 +737,7 @@ function ftScan(
       // the join and its leaves share one rep.
       const ot = if ftIsS(x, s) { ftOtherTail(x, p, g, s, ds) } else { -1 }
       if ot >= 0 && !fnTagSetIsTagged(ot) { return false }
-      if ftIsS(x, s) && ot < 0 {
+      if ftIsS(x, s) && ot < 0 && !ftNamedAtClosed(x, p, s) {
         if !ok || !ftNodeOk(x, s, ds, leaves, ids) { return false }
         if !ftCtxOk(x, p, g, fn, s) { return false }
         const pn = nodeAt(p)
@@ -939,6 +943,36 @@ function ftParamClosed(q: i32): boolean {
   const pn = nodeAt(q)
   if !(pn is Param) { return false }
   pn.parType >= 0 || elabTyClosed(nodeTyIxOf(q), 0)
+}
+
+// Whether `x`, the child of `p`, names a member of set `s` delivered to a closed function type: a
+// parameter of a declared callee annotated so, or a binding annotated so. The name is its own instance
+// there, not a value of the set, as a generic member's is.
+function ftNamedAtClosed(x: i32, p: i32, s: i32): boolean {
+  if x < 0 || p < 0 || !(nodeAt(x) is Ident) { return false }
+  const d = identDeclOf(x)
+  if d < 0 || !i32ListHas(fnTagMembers(s), d) { return false }
+  const pn = nodeAt(p)
+  if pn is LetDecl {
+    return pn.letInit == x && pn.letType >= 0 && ftClosedFnTy(nodeTyIxOf(p))
+  }
+  if !(pn is Call) || pn.callFn == x { return false }
+  const i = i32ListIndexOf(pn.callArgs, x)
+  const cd = ftCalleeFn(ftCalleeSource(pn))
+  if i < 0 || cd < 0 { return false }
+  const f = nodeAt(cd)
+  if !(f is FuncDecl) || i >= f.fnParams.length { return false }
+  const q = nodeAt(f.fnParams[i])
+  q is Param && q.parType >= 0 && ftClosedFnTy(nodeTyIxOf(f.fnParams[i]))
+}
+
+// Whether `t` is a function type with no type parameter or hole in it.
+function ftClosedFnTy(t: i32): boolean {
+  t >= 0
+    && t < T.tys.length
+    && tyAt(t) is TyFunc
+    && !tyHasTyVar(t)
+    && !tyReachesHole(t, 8)
 }
 
 // Whether node `d` declares a named function with no type parameters.
@@ -1452,7 +1486,8 @@ function ftConstSource(v: i32, depth: i32): i32 {
   const r = identDeclOf(v)
   if r < 0 || r >= P.nodes.length { return v }
   const rn = nodeAt(r)
-  if !(rn is LetDecl) || rn.letKw != "const" || rn.letInit < 0 { return v }
+  if !(rn is LetDecl) || rn.letInit < 0 { return v }
+  if rn.letKw != "const" && !cwLetUnwritten(r) { return v }
   ftConstSource(parenPeelIx(rn.letInit), depth - 1)
 }
 
