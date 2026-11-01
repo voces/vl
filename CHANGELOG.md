@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **The exact-key test is linear inside a cycle of generics again (master's `scaling shape` red since #5373), and three more instance-type ladders read the elaboration (`iterElemPinTy`, `valueReadPinTy`, `loopVarElemPinTyOf`; five helpers deleted) (#5394).**
 - **Mono's exact-sub rows are gone: D2684's exact instances are keyed by the elaboration alone (`monoNeedsExactKey`, `monoExactSub*`, `exactSubAt` deleted).** An instance's type reads substitute its elaboration's binding, and a decided hole parameter pins at the elaboration's type, not `recordedParamPinName` (#5379, #5380, #5384, #5397).
 - **Mono's return passes are no longer re-run after the walk (`monoRetSettle` deleted), and two calls built at one wider record are checked at that record with the program (late demands 2 → 1) (#5383, #5389).**
 - **Every caller that takes a union row asks for the literal-preserving key (`unRowOfTyKey`); membership tests keep the canonical fold (step 7) (#5381, #5391).**
