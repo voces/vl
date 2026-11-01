@@ -1281,6 +1281,8 @@ import {
   rlSlotOfTyOrTwin,
   sFieldMapShape,
   sFieldRefSlot,
+  structRowFieldStoresAtom,
+  variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
 import {
   fieldCodeVKind,
@@ -36236,6 +36238,43 @@ function emitNullOwn(own: i32) {
   fbRefNullNone()
 }
 
+// The variant row object literal `exprIx` is constructed at, or -1: one the checker built at a
+// concrete arm, or one unadopted whose field set names a variant and no struct, is the bare
+// variant struct rather than a union box.
+function objLitBuildVariantRow(exprIx: i32, fnIx: i32): i32 {
+  const ad = nodeRepTyAt(exprIx, fnIx)
+  const pvi = if ad >= 0 && ad != nodeTyAt(exprIx, fnIx) { litArmRowOf(exprIx, fnIx, ad) } else { objLitVariantIdxNoStructRow(exprIx, fnIx) }
+  if pvi >= 0 && pvi < uVariants.length { pvi } else { -1 }
+}
+
+// Whether the row field `name` of owner `ownerIx` is built at stores it, typed by a string literal
+// or literal set, as the literal-union atom: an object literal's own row (the variant it is
+// constructed at, else its struct), a field write's receiver row. 1 the atom, 0 a string, -1 none.
+export function fieldOwnerStoresAtom(
+  ownerIx: i32,
+  fnIx: i32,
+  name: string,
+): i32 {
+  const o = unwrapParen(ownerIx)
+  if o < 0 { return -1 }
+  const n = nodeAt(o)
+  match n {
+    ObjLit => {
+      const vi = objLitBuildVariantRow(o, fnIx)
+      if vi >= 0 { return variantRowFieldStoresAtom(vi, name) }
+      return structRowFieldStoresAtom(structIndexOfObjCtx(o, fnIx), name)
+    }
+    Member => {
+      const rv = exprVariantIndex(n.memObj, fnIx)
+      if rv >= 0 { return variantRowFieldStoresAtom(rv, name) }
+      return structRowFieldStoresAtom(structIndexOfExpr(n.memObj, fnIx), name)
+    }
+    // No other node owns a field value.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar | Unary | BinExpr | IfStmt | Index => {}
+  }
+  -1
+}
+
 function emitObjLitNode(
   body: u8[],
   _e: ObjLit,
@@ -36244,13 +36283,8 @@ function emitObjLitNode(
   row: i32,
   ec: ExpCtx,
 ) {
-  // A literal the checker built at a concrete variant, or one unadopted whose field set names a
-  // variant and no struct, constructs the bare variant struct, not a union box.
-  const ad = nodeRepTyAt(exprIx, fnIx)
-  const pvi = if ad >= 0 && ad != nodeTyAt(exprIx, fnIx) { litArmRowOf(exprIx, fnIx, ad) } else { objLitVariantIdxNoStructRow(exprIx, fnIx) }
-  if pvi >= 0 && pvi < uVariants.length {
-    return emitVariantStruct(body, exprIx, pvi, fnIx, ec)
-  }
+  const pvi = objLitBuildVariantRow(exprIx, fnIx)
+  if pvi >= 0 { return emitVariantStruct(body, exprIx, pvi, fnIx, ec) }
   // A literal whose field-set matches a STANDALONE struct constructs that struct
   // directly (even alongside a union — `ast.vl`'s `Tok`/`Diag` coexist with `Node`).
   // Otherwise, in a union program, it is a union variant: box it `{tag, value}`.
