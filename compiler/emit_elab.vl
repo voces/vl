@@ -13,22 +13,42 @@ import {
   AsExpr,
   BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
+  ForIn,
+  ForRange,
   FuncDecl,
   Ident,
+  IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
+  LoopVar,
   MatchExpr,
   Member,
+  NullLit,
+  NumLit,
   ObjLit,
+  OptMember,
   P,
   Param,
   Paren,
+  Program,
   RetStmt,
   Spread,
+  StrLit,
+  TypeDecl,
   TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
   callTyArgsOf,
   elseIfLink,
   hasSpreadItem,
@@ -2111,7 +2131,7 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
     if cn is Call && elabMintFactAt(cn, cur, decl, k, sc) { n = n + 1 }
     for kid in nodeSpineChildren(cur) {
       if cn is Call && kid == cn.callFn {
-        n = n + elabMintFactsIn(kid, decl, k, sc)
+        n = n + elabMintCalleeIn(kid, decl, k, sc)
       } else {
         elabMintHandedIn(kid, cur, decl, k)
         n = n + elabMintFactsIn(kid, decl, k, sc)
@@ -2120,6 +2140,55 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
     cur = elseIfLink(cur)
   }
   n
+}
+
+// `elabMintFactsIn` over callee `ix`, where the root of an element chain is read as
+// the callee's slot, not handed on.
+function elabMintCalleeIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
+  let n = 0
+  let cur = ix
+  let hops = 0
+  while cur >= 0 && cur < P.nodes.length && hops < 16 {
+    const next = elabChainStep(cur)
+    if next < 0 {
+      hops = 16
+    } else {
+      const xn = nodeAt(cur)
+      if xn is Index {
+        elabMintHandedIn(xn.idxIndex, cur, decl, k)
+        n = n + elabMintFactsIn(xn.idxIndex, decl, k, sc)
+      }
+      cur = next
+      hops = hops + 1
+    }
+  }
+  n + elabMintFactsIn(cur, decl, k, sc)
+}
+
+// The function type at the leaves of list type `t`, at any depth, or -1.
+function elabHeldFnTyOf(t: i32): i32 {
+  let e = t
+  let depth = 0
+  while e >= 0 && e < T.tys.length && depth < 16 {
+    const a = tyAt(e)
+    if !(a is TyArray) { return if depth > 0 { e } else { -1 } }
+    e = a.aElem
+    depth = depth + 1
+  }
+  -1
+}
+
+// The set the elements of list type `t`, at any depth, belong to, or -1.
+function elabHeldSetOf(t: i32): i32 {
+  let e = t
+  let depth = 0
+  while e >= 0 && e < T.tys.length && depth < 16 {
+    const a = tyAt(e)
+    if !(a is TyArray) { return if depth > 0 { fnTagSetOfTy(e) } else { -1 } }
+    e = a.aElem
+    depth = depth + 1
+  }
+  -1
 }
 
 // Marks partial the set instance `k` binds a parameter of `decl` to, where node `ix` (the child
@@ -2132,6 +2201,7 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32) {
     const pd = identDeclOf(ix)
     const dn = nodeAt(decl)
     if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
+      mintSetPartialNote(elabHeldSetOf(elabNodeTy(ix, k)))
       const st = fnTagSetOfTy(elabNodeTy(ix, k))
       const to = elabMintFwdTarget(ix, p)
       if to.length == 2 && st >= 0 {
@@ -2148,15 +2218,52 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32) {
   0
 }
 
+// The node a callee read `x` reads its slot of: `x` itself, or the root an element or field
+// chain (`r[i]`, `r[i][j]`) starts from.
+function elabSlotRoot(x: i32): i32 {
+  let r = x
+  let depth = 0
+  while r >= 0 && r < P.nodes.length && depth < 16 {
+    const next = elabChainStep(r)
+    if next < 0 { return r }
+    r = next
+    depth = depth + 1
+  }
+  r
+}
+
+// The node chain read `x` steps to: a paren's inner or an index's holder; -1 for
+// any other node.
+function elabChainStep(x: i32): i32 {
+  const n = nodeAt(x)
+  match n {
+    Paren => {
+      return n.parInner
+    }
+    Index => {
+      return parenPeelIx(n.idxArr)
+    }
+    // A field read is typed by its record's own row, which the facts here do not reach.
+    Member => {
+      return -1
+    }
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return -1
+    }
+  }
+}
+
 // Notes the fact for call `c` at `ix` when its callee is a parameter of `decl` that instance `k`
 // binds to a set of functions each instanced at the call's closed argument types.
 function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const cf = parenPeelIx(c.callFn)
-  const pd = identDeclOf(cf)
+  const root = elabSlotRoot(cf)
+  const pd = identDeclOf(root)
   if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return false }
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) || !i32ListHas(dn.fnParams, pd) { return false }
-  const st = elabNodeTy(cf, k)
+  // A chain's callee the instance types at its rep reads the set its root's list holds.
+  const st = if root != cf && fnTagSetOfTy(elabNodeTy(cf, k)) < 0 { elabHeldFnTyOf(elabNodeTy(root, k)) } else { elabNodeTy(cf, k) }
   const ds = elabFnSetOf(st)
   if ds.length == 0 || fnTagSetOfTy(st) < 0 { return false }
   const wp: i32[] = []
@@ -2178,7 +2285,9 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
     rs.push(w)
   }
   mintFactNote(sc, ix, fnTagSetOfTy(st), key, split, rs)
-  mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
+  if root == cf {
+    mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
+  }
   const at = elabMintCalls[ix] ?? []
   at.push(k)
   elabMintCalls[ix] = at

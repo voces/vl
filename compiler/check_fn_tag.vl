@@ -84,6 +84,7 @@ import { lpExitsOf } from "./check_if_value"
 import { i32ListHas, i32ListIndexOf } from "./listutil"
 import {
   mintFactCallOf,
+  mintFactFnOf,
   mintFactInScope,
   mintFactRows,
   mintFactRsOf,
@@ -287,10 +288,13 @@ function ftMintComplete(r: i32, s: i32): boolean {
   if c < 0 || c >= P.nodes.length { return false }
   const n = nodeAt(c)
   if !(n is Call) { return false }
-  const pd = identDeclOf(n.callFn)
+  const cf = parenPeelIx(n.callFn)
+  const root = ftSlotRoot(cf)
+  const pd = identDeclOf(root)
   if pd < 0 || pd >= P.nodes.length { return false }
   const p = nodeAt(pd)
   if !(p is Param) { return false }
+  if root != cf { return ftChainCallsComplete(r, s, pd) }
   const ow = cwOccWalkSpelled(pd, p.parName)
   while cwOccNext(ow) {
     if cwIxKind[ow.row] == CW_OCC_CALL {
@@ -298,6 +302,43 @@ function ftMintComplete(r: i32, s: i32): boolean {
       const m = nodeAt(at)
       if m is Call && identDeclOf(m.callFn) == pd {
         if mintFactSetOf(mintFactInScope(r, at)) != s { return false }
+      }
+    }
+  }
+  true
+}
+
+// The root an element chain (`r[i]`, `r[i][j]`) read `x` starts from.
+function ftSlotRoot(x: i32): i32 {
+  let r = x
+  let depth = 0
+  while r >= 0 && r < P.nodes.length && depth < 16 {
+    const n = nodeAt(r)
+    if n is Index { r = parenPeelIx(n.idxArr) }
+    else if n is Member { r = parenPeelIx(n.memObj) }
+    else { return r }
+    depth = depth + 1
+  }
+  r
+}
+
+// `ftMintComplete` for a call through an element chain off parameter `pd`: every call
+// in fact row `r`'s function whose callee chain starts at `pd` has a fact of set `s` there.
+function ftChainCallsComplete(r: i32, s: i32, pd: i32): boolean {
+  const fn = mintFactFnOf(r)
+  if fn < 0 || fn >= P.nodes.length { return false }
+  const f = nodeAt(fn)
+  if !(f is FuncDecl) { return false }
+  const todo: i32[] = [f.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const m = nodeAt(x)
+      if !(m is FuncDecl) {
+        if m is Call && identDeclOf(ftSlotRoot(parenPeelIx(m.callFn))) == pd {
+          if mintFactSetOf(mintFactInScope(r, x)) != s { return false }
+        }
+        nodeChildrenPush(x, todo)
       }
     }
   }
@@ -1415,7 +1456,14 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       return pn.fnBody == x && rcwInferredRetTy(p) == tx
     }
     Call => {
-      return ftArgDstTy(pn, x) == tx || ftMapSetValTy(pn, x, s) == tx
+      return ftArgDstTy(pn, x) == tx
+        || ftMapSetValTy(pn, x, s) == tx
+        || ftLate
+        && ftHoleArg(pn, x)
+        && ftInnerLit(parenPeelIx(x))
+        && ftDeclsOnly(s)
+        && (fnTagMembers(s).length > 1 || ftHoldKind(tx, s, 4) == 4)
+        && !mintSetPartial(s)
     }
     BinExpr => {
       if ftIsStore(pn) && pn.binRight == x {
@@ -1506,6 +1554,34 @@ function ftInOpenFn(fn: i32): boolean {
     hops = hops + 1
   }
   false
+}
+
+// Whether `x` is an argument of call `c` to a declared function whose parameter there has no
+// annotation, which each instance types; the elaboration marks partial a set an instance reads
+// other than through calls.
+function ftHoleArg(c: Call, x: i32): boolean {
+  const d = identDeclOf(parenPeelIx(c.callFn))
+  if d < 0 || d >= P.nodes.length { return false }
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  let i = 0
+  while i < c.callArgs.length && i < fd.fnParams.length {
+    if c.callArgs[i] == x {
+      const pn = nodeAt(fd.fnParams[i])
+      return pn is Param && pn.parType < 0 && pn.parRest == 0
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether every member of set `s` is a declared function. A flat list of one member is handed on
+// by name, as the function alone is.
+function ftDeclsOnly(s: i32): boolean {
+  for m in fnTagMembers(s) {
+    if m < 0 || m >= P.nodes.length || !(nodeAt(m) is FuncDecl) { return false }
+  }
+  true
 }
 
 // Whether function `f` takes a parameter with no annotation.
