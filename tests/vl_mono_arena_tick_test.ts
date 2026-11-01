@@ -1,7 +1,7 @@
 // THE ARENA-TICK ENUMERATION, ENFORCED — every in-place write in `compiler/emit_mono.vl`
 // bumps the stamp, or says in one line why it does not.
 //
-// `monoRebuild` skips its four whole-program passes when the arena stamp has not moved.
+// `monoRebuild` skips its whole-program passes when the arena stamp has not moved.
 // The stamp is `P.nodes.length + fnStmts.length + fnParent.length + monoArenaTick`: the
 // three lengths see every APPEND, and `monoArenaTick` is what sees a write that lands IN
 // PLACE — a node field rewritten, an `fnStmts`/`fnParent` slot replaced. A registry hit
@@ -35,16 +35,8 @@
 // synthetic write with no bump and no exemption must be reported, because a classifier that
 // silently matches nothing would report a clean file forever.
 //
-// THE SECOND DISCIPLINE, same file, different reader. `collectA` resumes on the arena PREFIX
-// while the monomorphizer runs, so a write that changes what its walk would answer for a node
-// already walked has to retire that prefix. Nine of the ten writes land in `fnStmts`,
-// `fnParent` or a `Param`, which the walk never reads; the exception is a callee RENAME, whose
-// name the `Call` arm classifies. So every `<x>.identName =` must be preceded, within
-// `NOTE_WINDOW` lines, by `collectANoteIdentRename(<the old name>)` — before the write, since
-// the note reads the name being replaced — or carry the same exemption line.
-//
-// THE THIRD DISCIPLINE, same file again. `buildFnMap` resumes on the `fnStmts` PREFIX for the
-// same reason, and it reads things a rename cannot touch: `P.nodes[fnStmts[i]]`, `fnParent[i]`
+// THE SECOND DISCIPLINE, same file again. `buildFnMap` resumes on the `fnStmts` PREFIX while
+// the monomorphizer runs, and it reads: `P.nodes[fnStmts[i]]`, `fnParent[i]`
 // and the `FuncDecl`'s own `fnRet`/`fnName`. So every in-place write to one of those must be
 // preceded, within `NOTE_WINDOW` lines, by `buildFnMapNoteFnSlotWrite()` (or, for a `fnStmts`
 // slot, `buildFnMapNoteFnStmtWrite(slot, node)`) — or carry the exemption line. A `monoArenaTouch()` is NOT a substitute: it makes `monoRebuild` run, and a
@@ -66,20 +58,15 @@ const EXEMPT_WINDOW = 2;
 
 const EXEMPT_MARK = "arena-tick exempt:";
 
-// A write to a callee's name, and the call that tells `collectA` the prefix is stale. The note
-// must sit ABOVE the write: it reads the name the write is about to replace.
-const NAME_WRITE = /\.identName\s*=(?!=)/;
-const NOTE_CALL = "collectANoteIdentRename(";
-const NOTE_WINDOW = 3;
-
 // A write that re-points a function SLOT or rewrites a `FuncDecl` field `buildFnMap` classifies,
 // and the call that tells it its per-function row cache no longer covers that function. Above
-// the write, like the rename note. `.fnRet`/`.fnName` have no site in this file today: they are
+// the write, where the old row still stands. `.fnRet`/`.fnName` have no site in this file today: they are
 // here because `monoArenaTouch()` would make `monoRebuild` RUN while leaving the prefix armed,
 // so a bump is not a substitute for the note.
 const SLOT_WRITE =
   /\b(?:fnStmts|fnParent)\s*\[[^\]]*\]\s*=(?!=)|\.(?:fnRet|fnName)\s*=(?!=)/;
 const SLOT_NOTE_CALL = "buildFnMapNoteFnSlotWrite(";
+const NOTE_WINDOW = 3;
 // The row-scoped note a same-name `fnStmts` slot write may use instead (D3761).
 const SLOT_ROW_NOTE_CALL = "buildFnMapNoteFnStmtWrite(";
 // The row note covers only a `fnStmts` slot: a `fnParent` or `.fnRet`/`.fnName` write moves what
@@ -113,9 +100,6 @@ type Hit = {
   ticked: boolean;
   /** The reason text after the marker, or null when no exemption line is present. */
   exempt: string | null;
-  /** A callee-name write, and whether `collectANoteIdentRename` sits above it. */
-  renames: boolean;
-  noted: boolean;
   /** A `fnStmts`/`fnParent` slot write, and whether the `buildFnMap` note sits above it. */
   repoints: boolean;
   slotNoted: boolean;
@@ -133,8 +117,6 @@ const classify = (lines: string[]): Hit[] => {
     hits.push({
       line: i + 1,
       text: lines[i].trim(),
-      renames: NAME_WRITE.test(code),
-      noted: above.some((l) => l.includes(NOTE_CALL)),
       repoints: SLOT_WRITE.test(code),
       slotNoted: above.some((l) =>
         l.includes(SLOT_NOTE_CALL) || (FN_STMTS_SLOT.test(code) && l.includes(SLOT_ROW_NOTE_CALL))
@@ -165,22 +147,11 @@ Deno.test("mono arena tick: every in-place write bumps the stamp or is named exe
       `${unguarded.length} in-place write(s) in compiler/emit_mono.vl neither bump ` +
         `monoArenaTick nor say why they need not:\n` +
         unguarded.map((h) => `  emit_mono.vl:${h.line}  ${h.text}`).join("\n") +
-        `\n\nmonoRebuild skips its four passes on an unmoved stamp, and no LENGTH sees a ` +
-        `write that lands in place — so a write that changes what collectA / buildFnMap / ` +
+        `\n\nmonoRebuild skips its passes on an unmoved stamp, and no LENGTH sees a ` +
+        `write that lands in place — so a write that changes what buildFnMap / ` +
         `computeVoidFns / computeRetInference would answer must call monoArenaTouch() ` +
         `within ${TICK_WINDOW} lines. If this write cannot change their answer, say so on ` +
         `the line above it: "// ${EXEMPT_MARK} <why>".`,
-    );
-  }
-
-  const unnoted = hits.filter((h) => h.renames && !h.noted && h.exempt === null);
-  if (unnoted.length > 0) {
-    throw new Error(
-      `${unnoted.length} callee rename(s) in compiler/emit_mono.vl do not tell collectA:\n` +
-        unnoted.map((h) => `  emit_mono.vl:${h.line}  ${h.text}`).join("\n") +
-        `\n\ncollectA resumes on the arena prefix between two monoRebuild calls, and its ` +
-        `Call arm reads this name — so a rename must call ${NOTE_CALL}<old name>) within ` +
-        `${NOTE_WINDOW} lines ABOVE the write, which is where the old name still exists.`,
     );
   }
 
@@ -231,28 +202,6 @@ Deno.test("mono arena tick: the scanner reports a write with no bump (control)",
     throw new Error(
       `the scanner mis-read its own control — want [${want.join(", ")}], got [${got.join(", ")}]. ` +
         `A classifier that cannot see an unguarded write cannot guard emit_mono.vl either.`,
-    );
-  }
-});
-
-Deno.test("mono arena tick: the scanner reports a rename that does not tell collectA (control)", () => {
-  // The note rule's own control, for the reason the bump rule has one: a classifier that
-  // matches no rename would pass this file forever. Both exits are exercised.
-  const control = [
-    "  cal.identName = instName", //           1 — renames, unnoted
-    "  monoArenaTouch()",
-    "  collectANoteIdentRename(cal2.identName)",
-    "  cal2.identName = specName", //          4 — renames, noted
-    "  monoArenaTouch()",
-    "  fnStmts[a] = nd", //                    6 — not a rename, so the note rule ignores it
-    "  monoArenaTouch()",
-  ];
-  const got = classify(control).map((h) => `${h.line}:${h.renames ? (h.noted ? "noted" : "UNNOTED") : "n/a"}`);
-  const want = ["1:UNNOTED", "4:noted", "6:n/a"];
-  if (got.join(" ") !== want.join(" ")) {
-    throw new Error(
-      `the rename scanner mis-read its own control — want [${want.join(", ")}], got ` +
-        `[${got.join(", ")}]. A classifier blind to an untold rename cannot guard the resume.`,
     );
   }
 });
