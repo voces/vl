@@ -552,7 +552,7 @@ Deno.test({
           "a missing scaling part",
           () => write("jobs.json", jobList("ci-cost (2)")),
           {},
-          "has 3 'ci-cost' jobs",
+          "has 1 'ci-cost' jobs",
           sha,
         ],
         [
