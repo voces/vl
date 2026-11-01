@@ -477,6 +477,17 @@ D3531, trap:
 
 ### I: not narrowing: loop overflow, match re-evaluation, extern `never`, u8 truncation, `x!` parse
 
+Each of these five is its own one-row family, and each row's own Mechanism section already says so;
+only the keyword classifier put them under F. Their honest labels:
+
+| row | family | owner |
+|---|---|---|
+| D12181 | range loop: the counter add wraps before the exit test | loops |
+| D2038 | `match` lowering: a computed scrutinee is re-evaluated per arm | match |
+| D2027 | extern `never` result: the witness is graded through a host that lacks `exit` (fixed) | none |
+| D3428 | exact-constant ruling at a `u8` element: needs an owner ruling | owner |
+| D3585 | parser: `x! is O` reads as `x !is O`: needs an owner ruling | owner |
+
 D12181, runs:
 
     let n = 0
