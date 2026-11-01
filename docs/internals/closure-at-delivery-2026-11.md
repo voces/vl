@@ -19,6 +19,8 @@ Status: draft. The mechanism half is inc3's; the population and acceptance half 
   set's type counts as closed; its rep is the member id.
 - *fe* is the emitted function slot whose body is the lambda instanced at that signature.
 
+**A creation site inside a generic instance is per instance.** If a list literal of hole functions sits in the body of a function with two instances, a member handed each instance's own set needs one closure per instance. Today the element-at-set path (#5693) keys the element node once (`monoElemAtSet`). That is why #5673's shared-member partial clause has to stay. Measured on `run(h) { const fs = [apply2, apply3]; for f in fs { f(h) } }` with `run(add); run(mul)`: dropping the clause prints `3 4 3 4` for `3 4 2 3.75`. So the row's creation site is the node in the instance's copy, or the pair (node, instance), and the clause narrows to holders shared across instances only once that keying lands.
+
 The key is an i32 pair, never a spelling. This follows the destringify ruling: no new name
 spelling and no extension of an existing one. The row is written in exactly one place, where
 mono mints the clone (`monoCloneLambdaPinned`, or the private-body clone). Every reader asks
