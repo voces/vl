@@ -448,6 +448,7 @@ import {
   monoOrigNode,
   monoParamPinTy,
   monoProgStmts,
+  monoRenamedFe,
   monoRetCopyReads,
   monoStubSlots,
   monoSupersededObjTys,
@@ -6752,6 +6753,7 @@ function monoRenameGenAliasInit(at: i32, ctx: i32, tpl: string, inst: string) {
     return monoRenameGenAliasInit(d.letInit, ctx, tpl, inst)
   }
   iv.identName = inst
+  monoNoteRenamed(d.letInit, monoSlotOfDecl(monoFnDeclNamed(inst)))
   monoArenaTouch()
   sidNoteNodeName(d.letInit, monoFnDeclNamed(inst))
   0
@@ -9558,6 +9560,7 @@ export function monoStateReset() {
 export function monoSubTablesReset() {
   monoInstOwn = ""
   monoArgInstFe = Map()
+  monoRenamedFe = Map()
   monoOpenArgCall = 0 - 1
   monoOpenArgCallee = 0 - 1
   0
@@ -9743,6 +9746,7 @@ function monoMakeInstanceHit(
           ) {
             monoAliasCallNote(calleeIx)
             cal.identName = monoInstName[k]
+            monoNoteRenamed(calleeIx, monoInstFe[k])
             monoArenaTouch()
             // R4 writer 5 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
             let instDecl = fnStmts[monoInstFe[k]]
@@ -10247,6 +10251,7 @@ function monoMakeInstanceLater(
   if cal2 is Ident && !i32ListHas(monoNoRename, calleeIx) {
     monoAliasCallNote(calleeIx)
     cal2.identName = instName
+    monoNoteRenamed(calleeIx, instFe)
     monoArenaTouch()
     let instDecl = fnStmts[instFe]
     if identAuditDrop == IDENT_DROP_MONO_CALLEE { instDecl = -1 }
@@ -11288,11 +11293,38 @@ function monoCoerceLitPart(v: i32, lit: i32, path: string[], ctx: i32) {
   monoCoerceFnValueTys(v, nm, ctx, -1, tys)
 }
 
+// Record that the identifier at `identIx` now names the instance at slot `fe` (-1: none).
+function monoNoteRenamed(identIx: i32, fe: i32) {
+  // arena-tick exempt: a node-keyed side table no rebuild reads.
+  if identIx >= 0 && fe >= 0 { monoRenamedFe[identIx] = fe }
+  0
+}
+
+// The slot `monoNoteRenamed` recorded for `identIx`, while that slot still declares `name`; -1
+// otherwise. A just-minted instance is named here before the function map covers it.
+function monoRenamedFeOf(identIx: i32, name: string): i32 {
+  const fe = monoRenamedFe.get(identIx) ?? -1
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const d = nodeAt(fnStmts[fe])
+  if d is FuncDecl {
+    if d.fnName == name { return fe }
+  }
+  -1
+}
+
+// The `fnStmts` slot of declaration node `decl`, or -1.
+function monoSlotOfDecl(decl: i32): i32 {
+  if decl < 0 { return -1 }
+  fnStmtsPosOf(decl)
+}
+
 // The `fnStmts` slot of the function an `Ident` names — the one resolver every question
 // this pass asks about a named function goes through. `fnIndexOfInScopeSid` is the language's
 // innermost-scope rule for a name a `FuncDecl` carries; `identClosureFeOfRead` covers an
 // arrow lambda, which parses to a nameless `FuncDecl` and carries its name on the binding.
 function monoFnFeOfIdent(identIx: i32, name: string, ctx: i32) {
+  const rf = monoRenamedFeOf(identIx, name)
+  if rf >= 0 { return rf }
   const fe = fnIndexOfInScopeAt(sidOfNode(identIx), name, ctx, identIx)
   if fe >= 0 { return fe }
   identClosureFeOfRead(identIx, ctx)
@@ -23204,7 +23236,8 @@ function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
   if an is FuncDecl {
     fe = fnStmtsPosOf(ax)
   } else if an is Ident {
-    fe = fnIndexOfInScopeAt(sidOfNode(ax), an.identName, ctx, ax)
+    fe = monoRenamedFeOf(ax, an.identName)
+    if fe < 0 { fe = fnIndexOfInScopeAt(sidOfNode(ax), an.identName, ctx, ax) }
   }
   if fe < 0 || fe >= fnStmts.length { return "" }
   if !exprIsClosure(argIx, ctx) { return "" }
@@ -23328,6 +23361,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
           // R4 writer 7 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
           if cal is Ident {
             cal.identName = monoInstName[r]
+            monoNoteRenamed(c.callFn, monoInstFe[r])
             monoArenaTouch()
             sidNoteNodeName(c.callFn, fnStmts[monoInstFe[r]])
           }
@@ -23388,6 +23422,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       // R4 writer 8 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
       if cal2 is Ident {
         cal2.identName = specName
+        monoNoteRenamed(c.callFn, instFe)
         monoArenaTouch()
         sidNoteNodeName(c.callFn, fnStmts[instFe])
       }
@@ -23452,6 +23487,7 @@ function monoLamCallByName(calleeIx: i32, origFe: i32, instName: string) {
       return 0
     }
     cal.identName = instName
+    monoNoteRenamed(calleeIx, monoSlotOfDecl(monoFnDeclNamed(instName)))
     monoArenaTouch()
     sidNoteNodeName(calleeIx, monoFnDeclNamed(instName))
   }
@@ -24119,6 +24155,7 @@ function monoRespellLamFe(calleeIx: i32, ctx: i32): i32 {
   const name = monoSlotName(fe)
   if name == "" || name == cal.identName { return fe }
   cal.identName = name
+  monoNoteRenamed(calleeIx, fe)
   monoArenaTouch()
   sidNoteNodeName(calleeIx, fnStmts[fe])
   fe
