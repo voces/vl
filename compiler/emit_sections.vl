@@ -689,7 +689,6 @@ import {
   globalCellKind,
   globalCellStructIdx,
   inferredRetMapSlot,
-  letBindIsAtom,
   letCellSlot,
   letNulMapReadUnionBox,
   letUnionNameOf,
@@ -866,7 +865,6 @@ import {
   monomorphize,
 } from "./emit_mono"
 import {
-  ExpCtx,
   capCacheBuild,
   emitAtomToStr,
   emitClosureValueCore,
@@ -892,9 +890,6 @@ import {
   eqHelpFnName,
   eqHelpFuncType,
   eqHelpReserve,
-  expCtxApply,
-  expCtxDefault,
-  expCtxHere,
   initGuardValue,
   maFoldCandidateCount,
   mapSetFnBody,
@@ -1263,7 +1258,7 @@ function envCacheOpen(fnPos: i32) {
 // (declared locals, all i32), the body's statement instructions, then `end`. Framed bytes are
 // appended onto `out`. Returns 0, or -1 (via `emitFail`) on any unsupported shape. Every
 // declared local is i32, so the vector is one run `(L, 0x7f)`; params are not counted here — they are encoded in the functype, not the locals vector.
-function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32, ec: ExpCtx) {
+function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     // Anchors any emit failure raised while lowering this body at its declaration (`emitFail`
@@ -1313,7 +1308,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32, ec: ExpCtx) {
     // `emitFuncBody` banks a row per STATEMENT, relative to `bodyExpr`; the rebase below
     // moves them onto the code payload with the rest of this entry (ROADMAP row 22).
     const stmtSpanBase = emitFnSpanStart.length
-    if emitFuncBody(bodyExpr, fn.fnBody, fnIx, ec) < 0 { return -1 }
+    if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return -1 }
     // A void body whose last instruction is a call falls off its end with nothing to hand
     // back, so that call is a tail call (D4655).
     emitVoidTailCall(fnIx)
@@ -2322,11 +2317,11 @@ function collectStartLocals() {
 // Emits the synthetic start function's size-prefixed code entry onto `out`: the pool fills,
 // then a call to each module's init function, or every top-level node itself when
 // `gInitMods` is empty. `n` is the user function count.
-function emitStartFnCode(out: u8[], n: i32, ec: ExpCtx) {
+function emitStartFnCode(out: u8[], n: i32) {
   emitCurFnIx = -1
   emitCurFnPos = -1
   startWalkWindows(-1, -1)
-  if gInitMods.length == 0 { return emitStartBodyCode(out, -1, ec) }
+  if gInitMods.length == 0 { return emitStartBodyCode(out, -1) }
   // The whole top level is scanned once, so every init reads one accumulator answer.
   if collectStartLocals() < 0 { return -1 }
   startFnDetectFrames()
@@ -2350,13 +2345,13 @@ function emitStartFnCode(out: u8[], n: i32, ec: ExpCtx) {
 }
 
 // Emits the code entry of init function `k` onto `out`: the top-level nodes of its windows.
-function emitInitFnCode(out: u8[], k: i32, ec: ExpCtx) {
+function emitInitFnCode(out: u8[], k: i32) {
   emitCurFnIx = -1
   emitCurFnPos = -1
   startWalkWindows(ifW0[k], ifW1[k])
   fnUsesU8Push = false
   fnUsesMapVals = false
-  const rc = emitStartBodyCode(out, k, ec)
+  const rc = emitStartBodyCode(out, k)
   rc
 }
 
@@ -2374,7 +2369,7 @@ function emitInitProgressAt(ord: i32) {
 // The body both entries above share, over the nodes `startWalkWindows` set: the whole start
 // when `k` is -1, else init function `k`, which runs no pool fill and keeps the narrowing
 // its predecessor left. Frames exactly as `emitFuncCode` does.
-function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
+function emitStartBodyCode(out: u8[], k: i32) {
   // Locals first, detection second: the scratch detectors classify expressions through the
   // declared-locals registry, so it must be populated first. The start function is synthetic
   // and has no `FuncDecl` to anchor a failure at; -1 is the honest anchor for a failure with no
@@ -2454,7 +2449,6 @@ function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
         exprPrev,
         gi,
         globalStmts[gi],
-        ec,
       )
       if gArmKept >= 0 { stmtArmScopeClose(gArmKept) }
       if gInitRc < 0 { return gInitRc }
@@ -2470,7 +2464,7 @@ function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
       emitCurStmtIx = startStmts[si]
       gInitStartOrd = startStmtOrd[si]
       const sSpanAt = bodyExpr.length
-      if emitStmt(bodyExpr, startStmts[si], -1, ec) < 0 {
+      if emitStmt(bodyExpr, startStmts[si], -1) < 0 {
         wTarget(exprPrev)
         return -1
       }
@@ -2529,7 +2523,6 @@ function emitStartGlobalInit(
   exprPrev: u8[],
   gi: i32,
   gst: i32,
-  ec: ExpCtx,
 ) {
   if globalRunsInStartFn(gi) {
     const g = nodeAt(gst)
@@ -2540,29 +2533,24 @@ function emitStartGlobalInit(
       // matches the cell valtype. An i32 cell is untouched. (Slice 5 widening.)
       const gck = globalCellKind(gst)
       if gck == "f32" {
-        if emitExprAsF32(bodyExpr, g.letInit, -1, ec) < 0 {
+        if emitExprAsF32(bodyExpr, g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if gck == "f64" {
-        if emitExprAsF64(bodyExpr, g.letInit, -1, ec) < 0 {
+        if emitExprAsF64(bodyExpr, g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if gck == "i64" {
-        if emitExprAsI64(bodyExpr, g.letInit, -1, ec) < 0 {
+        if emitExprAsI64(bodyExpr, g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else {
-        emitStartGlobalSeedCtx(gst, ec)
-        if (emitStartGlobalInitValue(bodyExpr, exprPrev, gst, g, gck, ec) < 0) {
+        if (emitStartGlobalInitValue(bodyExpr, exprPrev, gst, g, gck) < 0) {
           return -1
         }
-        // Back to idle: a left armed null seed retypes the next global's bare `null` (D1563).
-        const idle = expCtxHere(ec)
-        idle.litUnion = 0
-        expCtxApply(idle, ec)
         // Read-only covariance at the module-global binding (D822), a delivery form of its own:
         // a global is not a `let`, so no let-side delivery reaches it. A const
         // global's init is a wasm constexpr and cannot carry a loop, so the widening copy can only go
@@ -2592,15 +2580,6 @@ function emitStartGlobalInit(
   0
 }
 
-// `emitStartGlobalInit`'s seeding step for global statement `gst`: an atom global's start-fn
-// init lowers a member literal as its atom id, the start-fn twin of the const-path seeding.
-function emitStartGlobalSeedCtx(gst: i32, ec: ExpCtx) {
-  const sc = expCtxHere(ec)
-  if letBindIsAtom(gst, -1) { sc.litUnion = 1 }
-  expCtxApply(sc, ec)
-  0
-}
-
 // `emitStartGlobalInit`'s value step for global statement `gst` (its `LetDecl` `g`, cell kind
 // `gck`): emits the initializer into `bodyExpr` by the cell's coercion. On
 // failure restores the writer to `exprPrev` and returns -1, else 0.
@@ -2610,7 +2589,6 @@ function emitStartGlobalInitValue(
   gst: i32,
   g: LetDecl,
   gck: VKind,
-  ec: ExpCtx,
 ) {
   let svi = -1
   if gck == "variant" { svi = globalCellStructIdx(gst) }
@@ -2635,10 +2613,7 @@ function emitStartGlobalInitValue(
   if gUmr {
     const gumrN = nodeAt(unwrapParen(g.letInit))
     if gumrN is Index {
-      if (
-        emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1, ec)
-        < 0
-      ) {
+      if (emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1) < 0) {
         wTarget(exprPrev)
         return -1
       }
@@ -2649,24 +2624,24 @@ function emitStartGlobalInitValue(
       )
     }
   } else if gun != "" {
-    if emitUnionBoxArg(bodyExpr, gun, gunTy, g.letInit, -1, ec) < 0 {
+    if emitUnionBoxArg(bodyExpr, gun, gunTy, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if (gck == "variant" && svi >= 0 && svi < uVarRow.length) {
     // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
-    if emitVariantCoerce(bodyExpr, svi, g.letInit, -1, ec) < 0 {
+    if emitVariantCoerce(bodyExpr, svi, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if gAliasFe >= 0 {
-    if emitClosureValueCore(bodyExpr, gAliasFe, -1, ec) < 0 {
+    if emitClosureValueCore(bodyExpr, gAliasFe, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if gck == "nulnone" {
     // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
-    if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1, ec) < 0 {
+    if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
@@ -2677,12 +2652,12 @@ function emitStartGlobalInitValue(
     // A literal-union atom initializing a `string` global widens to its member string.
     // The start fn is a real function, so the runtime widening tower runs here (unlike a
     // CONST global, whose constexpr init has no `select`/scratch).
-    if emitAtomToStr(bodyExpr, g.letInit, -1, ec) < 0 {
+    if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else {
-    if emitExpr(bodyExpr, g.letInit, -1, ec) < 0 {
+    if emitExpr(bodyExpr, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
@@ -2754,7 +2729,7 @@ function helpFrameBody(out: u8[], body: u8[]) {
 // Frame `__eq_<si>__` onto `out`: the frames a user function comparing row `si` reserves, laid
 // out after the two params, then the compare. A list or function field stages its operands
 // in those frames, so the locals vector is built as `emitFuncCode` builds one (D9962).
-function eqHelpFnCode(out: u8[], si: i32, ec: ExpCtx): i32 {
+function eqHelpFnCode(out: u8[], si: i32): i32 {
   resetFnScratchFlags()
   envCacheOpen(-1)
   fnUsesUnionSink = false
@@ -2763,7 +2738,7 @@ function eqHelpFnCode(out: u8[], si: i32, ec: ExpCtx): i32 {
   if shapeHasCloField(si, []) { fnUsesCloEq = true }
   leqNoteStructRowFields(si, [])
   fbBeginFunc(2, 0)
-  const code = eqHelpFnBody(si, ec)
+  const code = eqHelpFnBody(si)
   const body: u8[] = []
   if fbEmitLocalsVec(body, 0) < 0 { return -1 }
   appendAll(body, code)
@@ -6212,7 +6187,7 @@ function emitDataSection() {
 // wasm's mandated section-id order. Before any section bytes go out, this fixes the
 // module-wide index spaces every section then references — start-function and `__log__`
 // indices, shared-helper indices, the string pool, and every heap type — so no emitter has to re-derive an index another already chose.
-function emitModule(_stmts: i32[], ec: ExpCtx) {
+function emitModule(_stmts: i32[]) {
   emitReset()
   typeOrderReset()
   relReset()
@@ -6286,7 +6261,7 @@ function emitModule(_stmts: i32[], ec: ExpCtx) {
 
   if memUsed && !memImported() { emitMemorySection() }
 
-  emitGlobalSection(ec)
+  emitGlobalSection()
 
   emitExportSection(n)
 
@@ -6302,7 +6277,7 @@ function emitModule(_stmts: i32[], ec: ExpCtx) {
     seekChunk: 0,
     seekBase: 0,
   }
-  const built = buildCodePayload(codePayload, n, hasStart, memFn, nHelpers, ec)
+  const built = buildCodePayload(codePayload, n, hasStart, memFn, nHelpers)
   dfeOn = false
   if built < 0 { return -1 }
   // The global section is framed first: it sits after the function section in the rope, so
@@ -7949,7 +7924,7 @@ function emitProgramRun(rootIx: i32) {
     // After the arena is final, so a literal binding re-seated at a join's row is seen there.
     if auditRecordJoinLeaves() < 0 { return -1 }
     // The expected-type context every emitter threads, unseeded.
-    const rc = emitModule(stmts, expCtxDefault())
+    const rc = emitModule(stmts)
     if rc < 0 { return rc }
     // An `emitFail` whose -1 a deep helper swallowed (e.g. inside a valtype write)
     // must still fail the WHOLE emit: a failed module never reaches instantiation.
@@ -9414,8 +9389,8 @@ let gGlobalFixedN = 0
 let gGlobalEntries: u8[] = []
 let gGlobalRopeAt = 0
 
-function emitGlobalSection(ec: ExpCtx) {
-  if captureFoldedConsts(ec) < 0 { return -1 }
+function emitGlobalSection() {
+  if captureFoldedConsts() < 0 { return -1 }
   // Global section (id 6): one global per top-level `let`/`const`, in declaration
   // order (that order is the global index `global.get`/`global.set` use). Each entry is
   // `<valtype> <mutability> <init constexpr> 0x0b`, immutable for a constant `const`; a non-constexpr init fails loudly via `emitExpr`.
@@ -9520,7 +9495,7 @@ function emitGlobalSection(ec: ExpCtx) {
           // A `const` cell is immutable: nothing but this constexpr writes it, and an exported one
           // is what an `extern const` import links to. A constexpr `let` stays mutable.
           if globalCellIsImmutable(gi) { wU8(0) } else { wU8(1) }
-          if emitConstCellInit(globalPayload, gi, ec) < 0 { return -1 }
+          if emitConstCellInit(globalPayload, gi) < 0 { return -1 }
           fbEnd() // 0x0b end of init expr
         }
       }
@@ -9593,19 +9568,10 @@ function frameGlobalSection() {
 // the seeds its cell kind implies. Every seed is scoped to this one init and restored after it:
 // a constexpr runs before every function body, so a leaked null rep would retype a bare `null`
 // anywhere in the module (D1563). Shared by the global section and `captureFoldedConsts`.
-function emitConstCellInit(buf: u8[], gi: i32, ec: ExpCtx): i32 {
+function emitConstCellInit(buf: u8[], gi: i32): i32 {
   const g = nodeAt(globalStmts[gi])
   if g is LetDecl {
-    const gcSaved = expCtxHere(ec)
     const gck = globalCellKind(globalStmts[gi])
-    // The rungs a cell derives from its kind alone, shared with the local `let`, the
-    // start-function init and the `global.set` arm.
-    const cc = expCtxHere(ec)
-    // A literal-union const lowers its member init as `i32.const <id>`; a nullable one lowers a
-    // bare `null` as the -1 sentinel. Un-seeded, a member init emitted the string ref into the
-    // i32 niche cell (invalid wasm) and a `null` init drew a loud reject.
-    if letBindIsAtom(globalStmts[gi], -1) { cc.litUnion = 1 }
-    expCtxApply(cc, ec)
     // A union cell boxes its init in the constexpr (`struct.new` / `array.new_fixed` /
     // `i32.const` are all constant in WasmGC), and a `const f = add` aliasing a generic named
     // function emits its closure through the floor-less core, as `emitLetDeclStmt` does.
@@ -9621,16 +9587,15 @@ function emitConstCellInit(buf: u8[], gi: i32, ec: ExpCtx): i32 {
     if letInitFoldsExpr(g) {
       rc = emitConstFoldValue(buf, gck, g.letInit, constFoldOfLet(g).cfV)
     } else if gun2 != "" {
-      rc = emitUnionCoerce(buf, gun2, gun2Ty, g.letInit, -1, ec)
+      rc = emitUnionCoerce(buf, gun2, gun2Ty, g.letInit, -1)
     } else if gAliasFe >= 0 {
-      rc = emitClosureValueCore(buf, gAliasFe, -1, ec)
+      rc = emitClosureValueCore(buf, gAliasFe, -1)
     } else {
-      rc = emitExpr(buf, g.letInit, -1, ec)
+      rc = emitExpr(buf, g.letInit, -1)
     }
     gConstExprEmit = ceSaved
     // The snapshot restored, rather than a chosen list of seeds cleared: one this function
     // leaves standing would outlive the whole global section.
-    expCtxApply(gcSaved, ec)
     if rc < 0 { return -1 }
     return 0
   }
@@ -9659,7 +9624,7 @@ function emitConstFoldValue(buf: u8[], gck: VKind, init: i32, v: i64): i32 {
 // Folds every immutable cell whose own constexpr is exactly one scalar `*.const`: its bytes go
 // to `gFoldPool` for `emitFoldedConstRead`, and the cell is dropped unless an export names it.
 // Runs before the global section writes its count and before any body reads a global index.
-function captureFoldedConsts(ec: ExpCtx): i32 {
+function captureFoldedConsts(): i32 {
   let gi = 0
   while gi < globalStmts.length {
     // A guarded cell keeps its reads, so one before the declaration still traps (D2652).
@@ -9667,7 +9632,7 @@ function captureFoldedConsts(ec: ExpCtx): i32 {
     if gCellIdx[gi] >= 0 && globalCellIsImmutable(gi) && !guarded {
       const one: u8[] = []
       const prev = wTarget(one)
-      const rc = emitConstCellInit(one, gi, ec)
+      const rc = emitConstCellInit(one, gi)
       wTarget(prev)
       if rc < 0 { return -1 }
       if wIsOneScalarConst(one) {
@@ -9940,7 +9905,6 @@ function buildCodePayload(
   hasStart: i32,
   memFn: i32,
   nHelpers: i32,
-  ec: ExpCtx,
 ) {
   // The count is written once the bodies have decided the thunks, into the head chunk pushed
   // here; `rowsAt` marks the span rows its width change moves.
@@ -9963,7 +9927,7 @@ function buildCodePayload(
     // until `writeCodeSection` places the payload in the module.
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitFuncCode(entry, fnStmts[ci], ci, ec) < 0 { return -1 }
+    if emitFuncCode(entry, fnStmts[ci], ci) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, fnStmts[ci], ci, 0, "")
     ci = ci + 1
   }
@@ -9973,14 +9937,14 @@ function buildCodePayload(
     // Pushed after them, since `emitFnSpanAt` returns the first row whose range holds the offset and the narrower answer is the useful one.
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitStartFnCode(entry, n, ec) < 0 { return -1 }
+    if emitStartFnCode(entry, n) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 4, "")
   }
   let ik = 0
   while ik < gInitMods.length {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitInitFnCode(entry, ik, ec) < 0 { return -1 }
+    if emitInitFnCode(entry, ik) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 4, "")
     ik = ik + 1
   }
@@ -10108,7 +10072,7 @@ function buildCodePayload(
       helpFrameBody(entry, mapSetFnBody(mapCompactRowShape(row)))
       placeCodeEntry(codePayload, entry, rows, -1, -1, 3, mapSetFnName(row))
     } else {
-      if eqHelpFnCode(entry, -1 - row, ec) < 0 { return -1 }
+      if eqHelpFnCode(entry, -1 - row) < 0 { return -1 }
       placeCodeEntry(
         codePayload,
         entry,

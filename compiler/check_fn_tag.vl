@@ -44,10 +44,13 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  annTsOf,
+  callTyArgsOf,
   mkCallN,
   mkIdent,
   nodeAt,
   nodeChildrenPush,
+  tsMentionsAnyName,
 } from "./ast"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import {
@@ -81,7 +84,7 @@ import {
 import { parenPeelIx } from "./check_places"
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
 import { lpExitsOf } from "./check_if_value"
-import { i32ListHas, i32ListIndexOf } from "./listutil"
+import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 import {
   mintCallSoleSet,
   mintFactCallOf,
@@ -92,6 +95,7 @@ import {
   mintFactSetOf,
   mintFactSplits,
   mintParamTakes,
+  mintRetParamsOf,
   mintSetPartial,
 } from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
@@ -345,6 +349,49 @@ function ftCommit(rootIx: i32, k: i32, calls: i32[], mint: i32[]) {
   0
 }
 
+// Whether member `d`'s name is in scope at every call its set `s` builds arms at: a lambda or a
+// function its name resolves to everywhere is, another nested one only where its parent's body
+// holds both.
+function ftMemberSeenAtArms(
+  d: i32,
+  s: i32,
+  calls: i32[],
+  mint: i32[],
+): boolean {
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) || dn.fnName == "" || (fnDeclIx[dn.fnName] ?? -1) == d {
+    return true
+  }
+  const pf = fnDeclParent[d] ?? -1
+  if pf == -1 { return true }
+  const pn = if pf >= 0 && pf < P.nodes.length { nodeAt(pf) } else { null }
+  if !(pn is FuncDecl) || pn.fnBody < 0 || pn.fnBody >= P.nodes.length {
+    return false
+  }
+  const b = nodeAt(pn.fnBody)
+  if !(b is Block) || !i32ListHas(b.blkStmts, d) { return false }
+  const sites: i32[] = []
+  for c in calls {
+    if fnTagCallSetOf(c) == s { sites.push(c) }
+  }
+  for r in mint {
+    if mintFactSetOf(r) == s { sites.push(mintFactCallOf(r)) }
+  }
+  const under: Map<i32, boolean> = Map()
+  const todo: i32[] = [pn.fnBody]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length && !(under[y] ?? false) {
+      under[y] = true
+      nodeChildrenPush(y, todo)
+    }
+  }
+  for c in sites {
+    if !(under[c] ?? false) { return false }
+  }
+  true
+}
+
 // Whether set `s` may be tagged, planning it in a new row when so.
 function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   const ds = fnTagMembers(s)
@@ -377,6 +424,9 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
     // A member only a smaller set's read brings has its leaf in that set's plan.
     if t < 0 && ftSubNeed.length == 0 { return false }
     leafTy.push(t)
+  }
+  for d in ds {
+    if !ftMemberSeenAtArms(d, s, calls, mint) { return false }
   }
   // One member's call evaluates its arguments once, so after the elaboration a singleton's
   // arguments may allocate.
@@ -732,6 +782,106 @@ function ftScan(
   true
 }
 
+// Whether parameter `i` of `f` (declared at `d`) is typed by a type parameter that only it and
+// `f`'s result name, and `f` hands that parameter back: the result is the argument's value.
+export function ftOwnTyParamHandedBack(d: i32, f: FuncDecl, i: i32): boolean {
+  if !i32ListHas(mintRetParamsOf(d), i) || f.fnRet < 0 { return false }
+  const pn = nodeAt(f.fnParams[i])
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const tn = nodeAt(pn.parType)
+  const rn = nodeAt(f.fnRet)
+  if !(tn is TypeRef) || !(rn is TypeRef) || rn.tyName != tn.tyName {
+    return false
+  }
+  if !strListHas(f.fnTyParams, tn.tyName) { return false }
+  const nm: string[] = [tn.tyName]
+  let k = 0
+  while k < f.fnParams.length {
+    const q = nodeAt(f.fnParams[k])
+    if k != i && q is Param && q.parType >= 0 {
+      if tsMentionsAnyName(annTsOf(q.parType), nm) { return false }
+    }
+    k = k + 1
+  }
+  // Nor anything in the body that names a type: any of them could hold the id at `F`.
+  const todo: i32[] = [f.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if ftNamesTyIn(x, nm) { return false }
+      nodeChildrenPush(x, todo)
+    }
+  }
+  true
+}
+
+// Whether node `x` names a type mentioning one of `nm`: an annotation of a binding, parameter
+// or result, an `as` cast, or a call's explicit type arguments (refused whatever they name).
+function ftNamesTyIn(x: i32, nm: string[]): boolean {
+  const n = nodeAt(x)
+  match n {
+    TypeRef => {
+      return tsMentionsAnyName(annTsOf(x), nm)
+    }
+    LetDecl => {
+      return n.letType >= 0 && tsMentionsAnyName(annTsOf(n.letType), nm)
+    }
+    Param => {
+      return n.parType >= 0 && tsMentionsAnyName(annTsOf(n.parType), nm)
+    }
+    FuncDecl => {
+      return n.fnRet >= 0 && tsMentionsAnyName(annTsOf(n.fnRet), nm)
+    }
+    AsExpr => {
+      return ftSpellingNames(n.asTy, nm)
+    }
+    Call => {
+      return callTyArgsOf(x).length > 0
+    }
+    // No other node names a type of its own; its annotated children are walked separately.
+    ArrayLit | BinExpr | Block | BoolLit | BreakStmt | CharLit | ContinueStmt | ErrExpr | FieldDef | FieldInit | ForIn | ForRange | Ident | IfStmt | ImportDecl | Index | IsExpr | LoopVar | MatchExpr | Member | NullLit | NumLit | ObjLit | OptMember | Paren | Program | RetStmt | Spread | StrLit | TypeDecl | Unary | UnionDecl | WhileStmt => {
+      return false
+    }
+  }
+}
+
+// Whether type spelling `t` contains one of `nm` as a whole identifier.
+function ftSpellingNames(t: string, nm: string[]): boolean {
+  let i = 0
+  while i < t.length {
+    let j = i
+    while j < t.length && ftIdentChar(t[j]) { j = j + 1 }
+    if j > i && strListHas(nm, t.slice(i, j)) { return true }
+    i = if j > i { j } else { i + 1 }
+  }
+  false
+}
+
+function ftIdentChar(c: i32): boolean {
+  c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95
+}
+
+// Whether call `c` of declared function `d` hands a value of set `s` to a parameter `d` returns.
+function ftHandsBack(d: i32, c: Call, s: i32): boolean {
+  for i in mintRetParamsOf(d) {
+    if ftArgIsParam(c, i) && ftIsS(c.callArgs[i], s) { return true }
+  }
+  false
+}
+
+// Whether argument `i` of call `c` is parameter `i`: positional, unnamed, with no spread at or
+// before it.
+function ftArgIsParam(c: Call, i: i32): boolean {
+  if i < 0 || i >= c.callArgs.length { return false }
+  if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
+  let j = 0
+  while j <= i {
+    if nodeAt(parenPeelIx(c.callArgs[j])) is Spread { return false }
+    j = j + 1
+  }
+  true
+}
+
 // Whether `x` is a function name or lambda whose type holds set `s` in a parameter or result.
 function ftSigValue(x: i32, s: i32): boolean {
   const n = nodeAt(x)
@@ -945,6 +1095,8 @@ function ftNodeOk(
     Call => {
       if fnTagCallSetOf(x) == s { return true }
       const d = ftNamedFn(n.callFn)
+      // A function an instance found to hand back its parameter gives this call that argument.
+      if ftLate && d >= 0 && ftHandsBack(d, n, s) { return true }
       if d < 0 || !ftRetCarries(d, s) { return false }
       const f = nodeAt(d)
       if !(f is FuncDecl) { return false }
@@ -1224,9 +1376,14 @@ function ftValuesOk(
 
 // The member of `ds` the name at `v` reads, or -1; a local `const` reads its initialiser.
 function ftLeafMember(v: i32, ds: i32[]): i32 {
-  const d = ftNamedFn(ftConstSource(v, 8))
-  if d < 0 || !i32ListHas(ds, d) { return -1 }
-  d
+  const src = ftConstSource(v, 8)
+  const d = ftNamedFn(src)
+  if d >= 0 { return if i32ListHas(ds, d) { d } else { -1 } }
+  // A function declared inside another names a member where its id can stand for it.
+  const r = if src >= 0 && nodeAt(src) is Ident { identDeclOf(src) } else { -1 }
+  const f = if r >= 0 && i32ListHas(ds, r) { nodeAt(r) } else { null }
+  if !(f is FuncDecl) || f.fnName == "" || !ftLambdaIdOk(r) { return -1 }
+  r
 }
 
 // The node a name at `v` takes its value from: the initialiser of the local `const` it reads,
@@ -1304,7 +1461,9 @@ function ftHoleParamOf(c: Call, x: i32): boolean {
       if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
       const pn = nodeAt(f.fnParams[i])
       return pn is Param
-        && (pn.parType < 0 || ftLate && fnTagOwnTyParamAlone(f, i))
+        && (pn.parType < 0
+        || ftLate
+        && (fnTagOwnTyParamAlone(f, i) || ftOwnTyParamHandedBack(d, f, i)))
     }
     i = i + 1
   }
@@ -1345,7 +1504,9 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
   const d = ftCalleeFn(ftCalleeSource(c))
   if d < 0 { return true }
   const i = i32ListIndexOf(c.callArgs, x)
-  mintParamTakes(d, i, s) || ftParamUnread(d, i)
+  mintParamTakes(d, i, s)
+    || ftParamUnread(d, i)
+    || ftArgIsParam(c, i) && i32ListHas(mintRetParamsOf(d), i)
 }
 
 // Whether, after the elaboration, argument `x` of call `c` through a set of functions lands in a
