@@ -44,7 +44,7 @@ import {
   nameIsParenSpanEnds,
   peelGroupParens,
 } from "./tyname"
-import { njSetPinFn, nodeRepTyIxOf, pinResolvedFnTy } from "./check_core_state"
+import { njSetPinFn, nodeRepTyIxOf } from "./check_core_state"
 import {
   bindGenUnionShapedArmInto,
   holePinReadOf,
@@ -4293,6 +4293,19 @@ function monoRetBoundLitCopy(x: i32): i32 {
   cx
 }
 
+// Annotation `nt` of binding `n` at `ix` in the instance being walked, or, for a binding a
+// desugar minted (`$`-named), the elaboration's type for it where that closes the template's
+// union to one non-union type. A union stays spelled as `nt`, which keeps its declared rows.
+function monoMintedLetAnn(n: LetDecl, ix: i32, nt: i32): i32 {
+  if nt < 0 || n.letName.slice(0, 1) != "$" { return nt }
+  const et = elabWalkTy(ix)
+  if et < 0 || et >= T.tys.length || tyHasTyVar(et) || et == nodeTyIxOf(nt) {
+    return nt
+  }
+  if tyIsUnionish(et) || !tyIsUnionish(nodeTyIxOf(nt)) { return nt }
+  synthTypeRefTy(monoPinAnnSpelling(et), -1, et)
+}
+
 // `monoCloneBodyRaw`'s arm for the binding `n` at `ix`: its instance annotation.
 function monoCloneLetDecl(
   n: LetDecl,
@@ -4303,7 +4316,11 @@ function monoCloneLetDecl(
   bN: string[],
   bT: i32[],
 ): i32 {
-  const nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
+  const nt = monoMintedLetAnn(
+    n,
+    ix,
+    monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT),
+  )
   if nt == n.letType { return ix }
   const ninit = monoCtorInitCopy(n.letInit, nt)
   return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ninit, n.pos))
@@ -4997,7 +5014,11 @@ function monoPinBodyLambdasRaw(
     monoPinSink = false
     // A binding inside an expression (an `if` arm's prelude), which the statement clone does
     // not reach, has its annotation substituted here.
-    const nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
+    const nt = monoMintedLetAnn(
+      n,
+      ix,
+      monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT),
+    )
     if ci == n.letInit && nt == n.letType { return ix }
     return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ci, n.pos))
   }
@@ -17701,17 +17722,14 @@ function monoReachRecTy(a: i32, t: Ty) {
 
 // The call type literal `a`'s slot at `path`, of open function type `st`, reaches, recorded on
 // each reached callee still open; -1 when the slot is no such function or reaches no one type.
-// A slot whose holes are already pinned keeps its type (-1), and its open callees take the pin.
-// A slot holding a tagged set keeps the set's one rep (-1).
+// A slot with no type variable keeps its type (-1), and so does one holding a tagged set, the
+// set's one rep.
 function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
   if st < 0 || st >= T.tys.length || !(tyAt(st) is TyFunc) { return -1 }
   if fnTagTyIsTagged(st) { return -1 }
   if !tyHasTyVar(st) { return -1 }
-  const pr = pinResolvedFnTy(st)
-  const pinned = pr >= 0 && !tyHasTyVar(pr)
-  const reached = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
-  if reached < 0 { return -1 }
-  const ct = if pinned { pr } else { reached }
+  const ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
+  if ct < 0 { return -1 }
   for c in vrCalls(a, path) {
     if c < 0 || c >= P.nodes.length { continue }
     const cn = nodeAt(c)
@@ -17722,7 +17740,6 @@ function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
       }
     }
   }
-  if pinned { return -1 }
   ct
 }
 
