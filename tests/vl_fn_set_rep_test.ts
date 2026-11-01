@@ -338,3 +338,33 @@ Deno.test({
     }
   },
 });
+
+// A map whose value is a list of lists of a set holds member ids, written by `set`, read narrowed.
+const IN_MAP: string[] = [
+  "function inc0(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "const m = Map()",
+  'm.set("k", [[inc0, dbl]])',
+  'const y = m["k"]',
+  "if y != null { print(y[0][1](5)) }",
+];
+
+Deno.test({
+  name: "fn-set rep: a map of lists of lists of a set holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "inMap", IN_MAP);
+      const p = await wasmDis([`${dir}/inMap.wasm`]);
+      if (!p.success) throw new Error("wasm-dis inMap failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`inMap: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
