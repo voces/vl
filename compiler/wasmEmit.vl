@@ -12616,8 +12616,7 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32, lb: ListBuild) {
       isI64Lit = false
       isF32Lit = false
     }
-    // An ATOM-element literal under a threaded atom context (`ec.litUnion` — a `K[]`
-    // field / binding): the member elements are STRING exprs syntactically (`arrLitIsStr`
+    // An ATOM-element literal whose recorded type is a `K[]` (a field or binding): the member elements are STRING exprs syntactically (`arrLitIsStr`
     // would claim the string-list build), but each lowers as its interned i32 atom id —
     // the i32-list path is authoritative, like the kind overrides above.
     if arrLitTakesAtom(arrIx, fnIx) {
@@ -13034,9 +13033,8 @@ function emitMapRecvKey(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // The receiver expr is emitted OUTSIDE the context (it is map-op-free by
   // construction — an Ident/global/constructor).
   if pushMapRecvRef(body, recvIx, fnIx) < 0 { return -1 }
-  // A string-keyed map's key is a string ref — shield it from an ambient atom context, since an
-  // atom-typed binding init seeds `ec.litUnion` around the whole init and would lower the key
-  // literal as an i32 atom id. An i32 key wants no shielding but is unharmed by it. An inner map
+  // A string-keyed map's key is a string ref — shield it from an atom-typed destination, which
+  // would lower the key literal as an i32 atom id. An i32 key wants no shielding but is unharmed by it. An inner map
   // op in the key expression also clobbers `cmSlot`, so pin it afterwards.
   let keySeed = 0
   if keyLitU { keySeed = 1 }
@@ -13339,7 +13337,7 @@ function emitMapGetOrUnionBox(
 }
 
 // Emit the `??` DEFAULT for a MONO-atom-valued map (`cmSlot < 0`) onto `body`: an i32 atom id
-// for a litunion value (a MEMBER literal under `ec.litUnion`, or an atom-typed expr; a bare
+// for a litunion value (a MEMBER literal recorded atom-typed, or an atom-typed expr; a bare
 // `null` → the `-1` sentinel), else the value's own rep (boolean / i32). A non-member / general
 // string is the wrong rep for the fused i32 result — fail loudly.
 function emitMonoMapDefault(body: u8[], recvIx: i32, defIx: i32, fnIx: i32) {
@@ -14369,8 +14367,8 @@ function emitMapSetV(
 ) {
   // An ATOM-valued map (`{[string]: K}`, `K` a literal union) rides the MONO map: each
   // value is the interned atom id (a plain i32). Its member-literal value is a StrLit
-  // syntactically — it must BYPASS the mono string guard below and emit in atom context
-  // (`ec.litUnion`), so resolve the receiver's value type up front.
+  // syntactically — it must BYPASS the mono string guard below and emit as its atom id,
+  // so resolve the receiver's value type up front.
   const svMt = mapRecvTyIn(recvIx, fnIx)
   let atomVal = mapTyValIsLitUnion(svMt)
   if mapTyValIsNulLitUnion(svMt) { atomVal = true }
@@ -25082,8 +25080,8 @@ let stubWriteRhs = 0 - 1
 // Cleared per program by `emitProgram`: a node id is only meaningful in the arena that minted it.
 export function stubWriteRhsReset() { stubWriteRhs = 0 - 1 }
 
-// Lower an assignment `target = value` onto `body`: the value emits under the target's
-// `ExpCtx`, then the store. The caller's context is restored on every exit, failure included.
+// Lower an assignment `target = value` onto `body`: the value emits at the type the
+// checker recorded for it, then the store.
 // The variant row of the declared local `lhsIx` names when its cell holds a bare union arm
 // (`variant`), else -1. Every value assigned to such a cell is delivered as that arm.
 function assignArmCellVariantIdx(lhsIx: i32, fnIx: i32): i32 {
@@ -29035,7 +29033,7 @@ function retFlagsSeedNiches(
     rf.retLitUnion = true
   }
   // A `K | null` NICHE return: a `return null` lowers as the i32 sentinel `-1`, a `return "a"`
-  // as its atom id — so seed BOTH the niche flag and `ec.litUnion`.
+  // as its atom id.
   if nodeTyIsNulLitUnion(fn.fnRet) { rf.retNulLitUnion = true }
   rf.retStrWiden = retStrWidenOf(fn, retArg, fnIx, fnPos)
   // An atom result keeps an atom value: a synthesized `: K` also reads as `string` to the
@@ -29144,9 +29142,8 @@ function emitReturnValueTail(
   0
 }
 
-// Lower a return-value expression `retArg` for function `fnIx`: build the return's `ExpCtx`
-// from the function's return type, emit through the matching helper under it, then restore
-// the caller's context. Does not emit `return` itself — the caller appends `fbReturn` or
+// Lower a return-value expression `retArg` for function `fnIx`: emit it through the
+// helper the function's return type selects. Does not emit `return` itself — the caller appends `fbReturn` or
 // leaves the value on the stack. Unifies explicit `return e` with implicit tail returns.
 function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
   const fn = nodeAt(fnIx)
@@ -33617,8 +33614,8 @@ function emitStrToAtom(body: u8[], ix: i32, fnIx: i32) {
   if !unionEqOperandOk(ix) {
     // a non-place value — a call, a `+`, a ternary — is staged rather than refused:
     // evaluated once into `atomStageSlot`, then re-read per member (`emitAtomToStr`'s id
-    // stash mirrored). Reached through `emitExpr`'s single `ec.litUnion` hook, so every
-    // destination that seeds that context is served by one arm (D13).
+    // stash mirrored). Reached through `emitExpr`'s single atom hook, so every
+    // atom-typed destination is served by one arm (D13).
     if !fnUsesAtomStage {
       // the reservation scan claims a strict superset of what this arm stages, so reaching
       // here means the two have drifted. Keep the loud refusal rather than `local.set` an
@@ -33629,7 +33626,7 @@ function emitStrToAtom(body: u8[], ix: i32, fnIx: i32) {
     }
     // the atom context is cleared across the stash and the chain: the value must reach the
     // slot as the `(ref $array)` it is, and each member constant must lower as a string —
-    // under `ec.litUnion` a member literal folds to its interned id instead, so the
+    // at an atom-typed destination a member literal folds to its interned id instead, so the
     // tower called `strEq` with an i32 operand. Restored on both exits.
     let rv = emitExprRaw(body, ix, fnIx)
     if rv >= 0 {
@@ -33796,8 +33793,8 @@ function emitStagedStrToAtomChain(
 }
 
 // Does a `.push` value into a literal-union array need the destination-driven narrow? Only
-// when the existing atom context has no answer: an atom-repped value or a member string
-// literal both lower correctly under `ec.litUnion` already.
+// when the recorded type has no answer: an atom-repped value or a member string literal
+// both lower as atoms already.
 function litPushNeedsDestNarrow(valIx: i32, fnIx: i32) {
   if exprIsLitAtom(valIx, fnIx) { return false }
   const v = nodeAt(unwrapParen(valIx))
@@ -35801,7 +35798,7 @@ function emitBinLitEq(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   if e.binOp == "==" || e.binOp == "!=" {
     // SKIP a `null` operand: `r == null` over a `K | null` niche is the `-1` sentinel compare (the
     // nullable-struct block below owns it). A litunion atom never equals the `null` literal here, and
-    // lowering `null` with `ec.litUnion` would mis-route it to a bare-null struct context.
+    // lowering that `null` as an atom would mis-route it to a bare-null struct context.
     let atomNull = false
     if nodeAt(unwrapParen(e.binLeft)) is NullLit { atomNull = true }
     if nodeAt(unwrapParen(e.binRight)) is NullLit { atomNull = true }
