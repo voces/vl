@@ -510,15 +510,12 @@ import {
   declaredRefArrayName,
   emptyArrHoleElemSlot,
   exprReReadable,
-  fieldNamesSig,
   fnRetNulRefArrayNameSid,
   instAnnTyNameOfExpr,
   nodeTyIsUnionRow,
   objMapFieldCompat,
   objMapFieldKeyFits,
   objNestedFieldCompat,
-  ovnFirst,
-  ovnNextOf,
   paramNulRefArray,
   paramRefArrayName,
   recordListSlotOfNode,
@@ -757,6 +754,7 @@ import {
   emitCurFnPos,
   emitPhaseReached,
   emitRootIx,
+  fRecRetTy,
   fRetKind,
   fRetLitAtom,
   fRetRArrElem,
@@ -907,7 +905,11 @@ import {
   sidText,
 } from "./symbols"
 import { peelGroupParens } from "./tyname"
-import { callRetRepTy, recRepWidens } from "./check_bind_adopt"
+import {
+  callRetRepTy,
+  recNarrowRecordOf,
+  recRepWidens,
+} from "./check_bind_adopt"
 import { holeFnArgRetAtParams, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
@@ -8516,8 +8518,8 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
     Call => {
       // A call's result is an atom where its storage is one. A niche result is claimed above, so
-      // this asks `callResultIsLitAtom`, the producer `readStoreOf` names "litatom" from, alone.
-      return callResultIsLitAtom(e, unwrapParen(exprIx), fnIx)
+      // this asks `callStoreIsLitAtom`, the producer `readStoreOf` names "litatom" from, alone.
+      return callStoreIsLitAtom(e, unwrapParen(exprIx), fnIx)
     }
     // A cast is an atom exactly when its result reps as one.
     AsExpr => {
@@ -11194,15 +11196,14 @@ export function objVariantRowCtx(objIx: i32, fnIx: i32): i32 {
     if lrt >= 0 && lrt < T.tys.length {
       const r = tyAt(lrt)
       if r is TyObj && r.objFieldNames.length > o.objFields.length {
-        let vo = ovnFirst(fieldNamesSig(r.objFieldNames))
-        while vo >= 0 && vo < uVariants.length {
-          if (
-            objMatchesVariantIdxOmit(objIx, vo, fnIx, true)
-            && (!ownRow || ovnStoredAlike(lrt, vo))
-          ) {
-            return vo
-          }
-          vo = ovnNextOf(vo)
+        const nr = recNarrowRecordOf(lrt)
+        const vo = if nr >= 0 { litArmRowOf(objIx, fnIx, nr) } else { -1 }
+        if (
+          vo >= 0
+          && objMatchesVariantIdxOmit(objIx, vo, fnIx, true)
+          && (!ownRow || ovnStoredAlike(lrt, vo))
+        ) {
+          return vo
         }
       }
     }
@@ -15449,8 +15450,41 @@ function callResultIsNulLitAtom(rx: i32, fnIx: i32): boolean {
 // interned literal-union id, else "".
 function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
   if callResultIsNulLitAtom(rx, fnIx) { return "nullitatom" }
-  if gLitUnionUsed != 0 && callResultIsLitAtom(e, rx, fnIx) { return "litatom" }
+  if callStoreIsLitAtom(e, rx, fnIx) { return "litatom" }
   ""
+}
+
+// Whether call `rx` hands back an interned literal-union id. The callee's lowered result decides:
+// its function's result kind, else its `$fnsig` result token, must be `i32`. Its recorded result,
+// where closed, names the atom; an unresolved lowering or an open record asks the type rungs.
+function callStoreIsLitAtom(e: Call, rx: i32, fnIx: i32): boolean {
+  if gLitUnionUsed == 0 { return false }
+  const fe = callNamedFe(e, fnIx)
+  if fe >= 0 && fe < fRetKind.length {
+    if fRetKind[fe] != "i32" { return false }
+    if fe < fRecRetTy.length {
+      const r = fRecRetTy[fe]
+      if r >= 0 && r < T.tys.length && !tyHasTyVar(r) && !tyHasInferHole(r, 0) {
+        return tyIsLitUnion(nonNullTy(r)) || tyIsOneStrLit(r)
+      }
+    }
+  } else if fe < 0 {
+    const sk = cloCallSigKey(rx, fnIx)
+    if sk != "" && sigKeyRetKind(sk) != "i32" { return false }
+  }
+  callResultIsLitAtom(e, rx, fnIx)
+}
+
+// The function a call names directly, as the frame `fnIx` resolves its callee; -1 for a call
+// through a function value, which has no function of its own to ask.
+function callNamedFe(e: Call, fnIx: i32): i32 {
+  const cfx = unwrapParen(e.callFn)
+  if cfx < 0 { return -1 }
+  const cf = nodeAt(cfx)
+  if cf is Ident {
+    return fnIndexOfInScopeAt(sidOfNode(cfx), cf.identName, fnIx, cfx)
+  }
+  -1
 }
 
 // How index read `e` reads the `K | null` niche: 2 from a cell holding it (an element of a
