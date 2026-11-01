@@ -268,7 +268,6 @@ import {
   litLexIsMember,
   mapShapeFoldSet,
   moduleLocalLetOfRead,
-  nameIsBareMap,
   nameIsF32Array,
   nameIsF64Array,
   nulCloFlag,
@@ -13495,78 +13494,12 @@ export function letIsF64Array(letIx: i32, fnIx: i32) {
 export function exprNullableMap(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = nodeAt(exprIx)
-  match e {
-    Paren => {
-      return exprNullableMap(e.parInner, fnIx)
-    }
-    AsExpr => {
-      if asUnionMapTy(exprIx, fnIx, true) >= 0 { return true }
-    }
-    // Every other expression is resolved by the rungs below.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  // …and the same `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
-  const nlIfM = nulIfArmNullableValueIx(exprIx)
-  if nlIfM >= 0 {
-    if exprNullableMap(nlIfM, fnIx) { return true }
-  }
-  // An if-EXPRESSION with a NULL arm over a map arm — see `nulArmIfThenValueIx`.
-  const elIfM = nulArmIfThenValueIx(exprIx, fnIx)
-  if elIfM >= 0 { return exprMap(elIfM, fnIx) }
-  match e {
-    Index => {
-      // The map read (D1038/D1039), the sibling of `exprNullableList`'s map arm: one arm covers
-      // both the inline `if m[k] != null` test and the un-annotated `const g = m[k]` binding.
-      const mvSh = mapShapeOfExpr(e.idxArr, fnIx)
-      if mvSh >= 0 && mvSh < mvValName.length {
-        if nameIsBareMap(mvValName[mvSh]) { return true }
-      }
-      // An INDEX into a nullable-map array (`({[string]: V} | null)[]`, element kind 3 with the
-      // nullable bit): the element legitimately holds null — `const e = xs[i]` binds `nulmap`.
-      if exprRefArray(e.idxArr, fnIx) {
-        const slot = refListSlotOfExpr(e.idxArr, fnIx)
-        if slot >= 0 && slot < rlElemNullable.length {
-          if refListElemKind(e.idxArr, fnIx) == "nulmap" { return true }
-        }
-      }
-      const mnm = mapReadMvSlot(exprIx, fnIx)
-      if mnm >= 0 { return mvValIsMap(mnm) && mvSlotNullable(mnm) }
-    }
-    Ident | Member => {
-      return exprNulKind(exprIx, fnIx) == "nulmap"
-    }
-    BinExpr => {
-      // A read over a nullable-inner-map-valued map yields `map | null` — the fused `?? d` hit
-      // arm preserves a stored null, and a bare `m[k]` is nullable by construction.
-      const cnm = coalesceMvSlot(exprIx, fnIx)
-      if cnm >= 0 {
-        return mvValIsMap(cnm) && coalesceStaysNullable(exprIx, cnm, fnIx)
-      }
-    }
-    Call => {
-      // A call whose ANNOTATED return is `{[string]: V} | null` yields a nullable map, so an
-      // un-annotated `const t = mk(…)` infers kind `nulmap` and narrows with `if t != null`.
-      if e.callFn < 0 { return false }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        const target = fnIndexOfNode(e.callFn)
-        if target >= 0 {
-          const fn = nodeAt(fnStmts[target])
-          if fn is FuncDecl {
-            if fn.fnRet >= 0 { return retNulMapFlag(fn.fnRet) == 1 }
-            // The inferred return too, off the kind column `buildFnMap` recorded: without it a
-            // caller's `const r = pick(…)` bound a non-null cell with nothing to narrow against. D937.
-            return repOfFnSlot(target).rdKind == "nulmap"
-          }
-        }
-        return calleeRetKindOfRead(e.callFn, fnIx) == "nulmap"
-      }
-      return cloValueCallRetKind(exprIx, fnIx) == "nulmap"
-    }
-    // No other expression is a nullable map by its own form.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
+  // `u as? M` out of a union box yields the nullable map ref, whatever the cast node's rep.
+  if e is AsExpr && asUnionMapTy(exprIx, fnIx, true) >= 0 { return true }
+  // A name or field read is its cell's kind: a read narrowed to `null` still holds the ref.
+  if e is Ident || e is Member { return exprNulKind(exprIx, fnIx) == "nulmap" }
+  const rd = repOfNode(exprIx, fnIx)
+  rd.rdCovered == 1 && rd.rdKind == "nulmap"
 }
 
 // True if evaluating the expression at `exprIx` yields a string-keyed map: the

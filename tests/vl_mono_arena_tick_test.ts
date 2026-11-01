@@ -1,13 +1,9 @@
 // THE ARENA-TICK ENUMERATION, ENFORCED — every in-place write in `compiler/emit_mono.vl`
 // bumps the stamp, or says in one line why it does not.
 //
-// `monoRebuild` skips its whole-program passes when the arena stamp has not moved.
-// The stamp is `P.nodes.length + fnStmts.length + fnParent.length + monoArenaTick`: the
-// three lengths see every APPEND, and `monoArenaTick` is what sees a write that lands IN
-// PLACE — a node field rewritten, an `fnStmts`/`fnParent` slot replaced. A registry hit
-// renames a callee (`cal.identName = monoInstName[k]`) and mints nothing, and
-// `computeVoidFns` resolves a call by that name, so a missed bump is a rebuild skipped
-// that should have run: stale voidness, and a miscompile with nothing loud in it.
+// `monoArenaTouch` is inert: the stamp it fed is gone, since `monoRegisterInstance` measured
+// no different with it (#5255), and the next change deletes its sites with this first
+// discipline. Until then the rule below still holds every site in place.
 //
 // That soundness argument was an ENUMERATION — ten sites found by one grep on one day.
 // An enumeration is not a guard: the next in-place write lands with nothing to notice it,
@@ -39,8 +35,7 @@
 // the monomorphizer runs, and it reads: `P.nodes[fnStmts[i]]`, `fnParent[i]`
 // and the `FuncDecl`'s own `fnRet`/`fnName`. So every in-place write to one of those must be
 // preceded, within `NOTE_WINDOW` lines, by `buildFnMapNoteFnSlotWrite()` (or, for a `fnStmts`
-// slot, `buildFnMapNoteFnStmtWrite(slot, node)`) — or carry the exemption line. A `monoArenaTouch()` is NOT a substitute: it makes `monoRebuild` run, and a
-// run whose prefix is still armed re-seeds the stale row rather than re-classifying it.
+// slot, `buildFnMapNoteFnStmtWrite(slot, node)`) — or carry the exemption line. A `monoArenaTouch()` is NOT a substitute: it is inert.
 //
 // No assertion library, per CLAUDE.md: every failure is a `throw new Error` naming want and got.
 
@@ -61,8 +56,7 @@ const EXEMPT_MARK = "arena-tick exempt:";
 // A write that re-points a function SLOT or rewrites a `FuncDecl` field `buildFnMap` classifies,
 // and the call that tells it its per-function row cache no longer covers that function. Above
 // the write, where the old row still stands. `.fnRet`/`.fnName` have no site in this file today: they are
-// here because `monoArenaTouch()` would make `monoRebuild` RUN while leaving the prefix armed,
-// so a bump is not a substitute for the note.
+// here because a resume armed over a stale row re-seeds it rather than re-classifying it.
 const SLOT_WRITE =
   /\b(?:fnStmts|fnParent)\s*\[[^\]]*\]\s*=(?!=)|\.(?:fnRet|fnName)\s*=(?!=)/;
 const SLOT_NOTE_CALL = "buildFnMapNoteFnSlotWrite(";
@@ -147,11 +141,9 @@ Deno.test("mono arena tick: every in-place write bumps the stamp or is named exe
       `${unguarded.length} in-place write(s) in compiler/emit_mono.vl neither bump ` +
         `monoArenaTick nor say why they need not:\n` +
         unguarded.map((h) => `  emit_mono.vl:${h.line}  ${h.text}`).join("\n") +
-        `\n\nmonoRebuild skips its passes on an unmoved stamp, and no LENGTH sees a ` +
-        `write that lands in place — so a write that changes what buildFnMap / ` +
-        `computeVoidFns / computeRetInference would answer must call monoArenaTouch() ` +
-        `within ${TICK_WINDOW} lines. If this write cannot change their answer, say so on ` +
-        `the line above it: "// ${EXEMPT_MARK} <why>".`,
+        `\n\nmonoArenaTouch() is inert and its sites go next; until then each in-place write ` +
+        `calls it within ${TICK_WINDOW} lines or says on the line above it: ` +
+        `"// ${EXEMPT_MARK} <why>".`,
     );
   }
 
@@ -161,7 +153,7 @@ Deno.test("mono arena tick: every in-place write bumps the stamp or is named exe
       `${unslotted.length} function-slot write(s) in compiler/emit_mono.vl do not tell ` +
         `buildFnMap:\n` +
         unslotted.map((h) => `  emit_mono.vl:${h.line}  ${h.text}`).join("\n") +
-        `\n\nbuildFnMap resumes on the fnStmts prefix between two monoRebuild calls, and its ` +
+        `\n\nbuildFnMap resumes on the fnStmts prefix between two monoRegisterInstance calls, and its ` +
         `row comes off P.nodes[fnStmts[i]] and fnParent[i] — so re-pointing either must call ` +
         `${SLOT_NOTE_CALL}) within ${NOTE_WINDOW} lines ABOVE the write.`,
     );

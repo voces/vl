@@ -114,6 +114,7 @@ import {
   tyNulInnerIsPrim,
   tyNulInnerTy,
   tyPrimNameOf,
+  tySame,
   tyScalarBasePrim,
   tyToEmitName,
   tyToNominalName,
@@ -211,7 +212,13 @@ import {
   unionStructAliasShape,
   unwrapParen,
 } from "./emit_base"
-import { sidArrGet, sidArrPut, sidNoteNodeName, sidOfNode } from "./symbols"
+import {
+  sidArrGet,
+  sidArrPut,
+  sidNoteNodeName,
+  sidOf,
+  sidOfNode,
+} from "./symbols"
 import { fsMinted } from "./fn_split"
 import {
   blockHasValuedReturn,
@@ -9914,13 +9921,25 @@ function unionArmsAreRecordsOrScalars(ty: i32): boolean {
   true
 }
 
-// Whether each record arm `s` names is already a variant by its own name, so a row bound in place
-// of this declaration's own registration leaves no arm without one. A layout twin under another
-// name (`V = D | S` beside `U = C | S`) is not.
-function declArmsHaveVariants(s: UnionDecl): boolean {
+// Whether each record arm `s` names is a variant of row `kr`: by its own name, or as a layout
+// twin of exactly one of the row's arms (`V = D | S` beside `U = C | S`, `D` typed as `C`).
+// With `bind`, a twin's name is bound to that arm's variant, so both names read one position.
+function declArmsMatchRow(s: UnionDecl, kr: i32, bind: boolean): boolean {
   for m in s.udVariants {
     const mt = declTyIxOfName(m)
-    if mt >= 0 && tyAt(mt) is TyObj && variantIndexOf(m) < 0 { return false }
+    if mt >= 0 && tyAt(mt) is TyObj && variantIndexOf(m) < 0 {
+      let hit = -1
+      let v = unVarStart[kr]
+      while v < unVarStart[kr] + unVarCount[kr] {
+        if v < uVarTyIx.length && uVarTyIx[v] >= 0 && tySame(uVarTyIx[v], mt) {
+          if hit >= 0 { return false }
+          hit = v
+        }
+        v = v + 1
+      }
+      if hit < 0 { return false }
+      if bind { sidArrPut(uVariantRowBySid, sidOf(m), hit) }
+    }
   }
   true
 }
@@ -9948,7 +9967,8 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   if rootUnionDeclMembers(stmts, s.udName) < 0 { return -1 }
   // An alias whose type key already has a row names that row: one row per type. A value or
   // literal union binds to a row with no variants; a union of records and scalars binds to a row
-  // whose variants are its own arms. A list, map or function arm keeps its row (D14742).
+  // whose variants are its own arms or their twins. A list, map or function arm keeps its row
+  // (D14742).
   const dty = declTyIxOfName(s.udName)
   if dty >= 0 {
     const kr = unRowOfTyKey(dty)
@@ -9956,8 +9976,11 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
       const plain = isValueUnionTyOr(dty) == 1 || tyIsLitUnion(dty)
       if (
         (plain && unVarCount[kr] == 0)
-        || (!plain && unionArmsAreRecordsOrScalars(dty) && declArmsHaveVariants(s))
+        || (!plain
+          && unionArmsAreRecordsOrScalars(dty)
+          && declArmsMatchRow(s, kr, false))
       ) {
+        declArmsMatchRow(s, kr, true)
         unNameBindRow(s.udName, kr)
         return 0
       }
