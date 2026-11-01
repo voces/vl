@@ -2501,15 +2501,79 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
       return n
     }
     if cn is Call && elabMintFactAt(cn, cur, decl, k, sc) { n = n + 1 }
+    // A set-holding list mapped by a lambda that only calls its elements hands nothing on.
+    const cb = if cn is Call { elabMintCallbacksAt(cn, decl, k, sc) } else { -1 }
+    if cb > 0 { n = n + cb }
     for kid in nodeSpineChildren(cur) {
       if cn is Call && kid == cn.callFn {
-        n = n + elabMintCalleeIn(kid, decl, k, sc)
+        if cb <= 0 { n = n + elabMintCalleeIn(kid, decl, k, sc) }
       } else {
         elabMintHandedIn(kid, cur, decl, k, sc)
         n = n + elabMintFactsIn(kid, decl, k, sc)
       }
     }
     cur = elseIfLink(cur)
+  }
+  n
+}
+
+// Whether `elabMintFactAt` is noting a call in a lambda one body's instances share.
+let elabMintInLambda = false
+
+// `elabMintFactsIn` for `map` called on a list parameter of `decl` holding a set of functions, with
+// a lambda that only calls its element: the fact of each such call, which the instance types at
+// that set (D14886). The number noted, or -1 where the call is not that shape and its receiver is
+// handed on.
+function elabMintCallbacksAt(c: Call, decl: i32, k: i32, sc: i32): i32 {
+  const cf = parenPeelIx(c.callFn)
+  if cf < 0 || cf >= P.nodes.length { return -1 }
+  const fm = nodeAt(cf)
+  if !(fm is Member) { return -1 }
+  if fm.memProp != "map" { return -1 }
+  const recv = parenPeelIx(fm.memObj)
+  const pd = elabCalleeParam(recv, decl)
+  if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return -1 }
+  if elabHeldSetOf(elabNodeTy(recv, k)) < 0 || c.callArgs.length != 1 {
+    return -1
+  }
+  const ax = parenPeelIx(c.callArgs[0])
+  const an = if ax >= 0 && ax < P.nodes.length { nodeAt(ax) } else { nodeAt(cf) }
+  if !(an is FuncDecl) || an.fnParams.length == 0 { return -1 }
+  elabMintInLambda = true
+  const r = elabMintCallbackBodyIn(an.fnBody, -1, ax, an.fnParams[0], k, sc)
+  elabMintInLambda = false
+  if r <= 0 { return -1 }
+  r
+}
+
+// The facts for the calls through element parameter `pe` of lambda `lam` in the body at `ix`,
+// parent `p`; -1 where `pe` is read other than as a call's callee that takes a fact.
+function elabMintCallbackBodyIn(
+  ix: i32,
+  p: i32,
+  lam: i32,
+  pe: i32,
+  k: i32,
+  sc: i32,
+): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const xn = nodeAt(ix)
+  if xn is Ident && identDeclOf(ix) == pe {
+    const pn = if p >= 0 { nodeAt(p) } else { nodeAt(ix) }
+    if (
+      pn is Call
+      && parenPeelIx(pn.callFn) == ix
+      && elabMintFactAt(pn, p, lam, k, sc)
+    ) {
+      return 1
+    }
+    return -1
+  }
+  let n = 0
+  for kid in nodeChildren(ix) {
+    const r = elabMintCallbackBodyIn(kid, ix, lam, pe, k, sc)
+    if r < 0 { return -1 }
+    n = n + r
   }
   n
 }
@@ -2792,11 +2856,9 @@ function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       const st = fnTagSetOfTy(elabNodeTy(ix, k))
       const to = elabMintFwdTarget(ix, p)
       const pn = if p >= 0 { nodeAt(p) } else { nodeAt(ix) }
+      // A forward through a set from here would be one body's for every instance (D14842).
       if to.length == 2 && st >= 0 {
         mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
-      } else if (
-        elabMintSetFwd(decl, i32ListIndexOf(dn.fnParams, pd), ix, p, k, st)
-      ) {
       } else if (
         !(pn is Call && pn.callFn == ix && elabMintFactAt(pn, p, decl, k, sc))
       ) {
@@ -2884,12 +2946,12 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   at.push(k)
   elabMintCalls[ix] = at
   // One call through two sets in two instances takes each instance's own arms; a callee read
-  // out of a holder, or a caller held beside another function, shares the call's arms with the
-  // other, so both stay closures.
+  // out of a holder, a lambda's element, or a caller held beside another function, shares the
+  // call's arms with the other, so both stay closures.
   const was = elabMintSets[ix] ?? fnTagSetOfTy(st)
   if (
     was != fnTagSetOfTy(st)
-    && (root != cf || i32ListHas(elabMintValueFns, decl))
+    && (root != cf || elabMintInLambda || i32ListHas(elabMintValueFns, decl))
   ) {
     mintSetPartialNote(was)
     mintSetPartialNote(fnTagSetOfTy(st))
@@ -4660,6 +4722,24 @@ export function elabSubstClosed(t: i32, k: i32): i32 {
     return -1
   }
   s
+}
+
+// The record every call reaching instance `k` is built at, as the checker stamped each call's
+// delivery (`nodeRepTyIxOf`), when they all agree and it is closed; -1 otherwise (D14900).
+export function elabDeliveredRowOf(k: i32): i32 {
+  if k < 0 || k >= ekDecl.length { return -1 }
+  const cs = elabKeyCalls[k] ?? []
+  if cs.length == 0 { return -1 }
+  let row = -1
+  for c in cs {
+    const st = nodeRepTyIxOf(c)
+    if st < 0 || st >= T.tys.length || !(tyAt(st) is TyObj) || tyHasTyVar(st) {
+      return -1
+    }
+    if row >= 0 && !tySame(row, st) { return -1 }
+    row = st
+  }
+  row
 }
 
 // Instance `k`'s result: its template's checked return with `k`'s binding substituted, or the

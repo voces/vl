@@ -1,10 +1,10 @@
 // A computed `match` scrutinee is evaluated once (D1991): the lowered chain tests the
 // scrutinee at every arm, so `hoistMatchScrutinees` binds one that is neither a literal nor a
-// place to `const $scrut<match>` ahead of the statement holding the match, unless that would
-// reorder or skip an evaluation there (D2038). A computed `?.` receiver is bound the same way,
-// to `const $om<read>`, so the emitter may test it and read it again (D5300). It rewrites the
-// node arena before the checker walks it and reads no type, so it imports only `./ast`,
-// `./fmt_util` and `./check_places`.
+// place to `const $scrut<match>` ahead of the statement holding the match, or where the match
+// stands when that would reorder or skip an evaluation (D2038). A computed `?.` receiver is
+// bound the same way, to `const $om<read>`, so the emitter may test it and read it again
+// (D5300). It rewrites the node arena before the checker walks it and reads no type, so it
+// imports only `./ast`, `./fmt_util`, `./check_places` and `./symbols`.
 import {
   ArrayLit,
   AsExpr,
@@ -45,6 +45,7 @@ import {
   i32ToStr,
   mkBlock,
   mkBool,
+  mkCall,
   mkIdent,
   mkIf,
   mkIndex,
@@ -60,6 +61,7 @@ import {
 } from "./ast"
 import { nodePos } from "./fmt_util"
 import { placeKeyOf } from "./check_places"
+import { IDENT_BUILTIN, identSet } from "./symbols"
 
 // The matches found by the walk, innermost first, each beside a copy of its ancestor path.
 let hmsMatches: i32[] = []
@@ -111,6 +113,7 @@ export function hoistMatchScrutinees(rootIx: i32) {
   while k < hmsMatches.length {
     if hoistMatchScrutAt(hmsMatches[k], hmsPaths[k]) { done = done + 1 }
     else if hmsBindOptInPlace(hmsMatches[k], hmsPaths[k]) { done = done + 1 }
+    else if hmsBindMatchInPlace(hmsMatches[k], hmsPaths[k]) { done = done + 1 }
     k = k + 1
   }
   for m in hmsPlaceMatches { hmsSplitPlaceReads(m) }
@@ -374,6 +377,35 @@ function hmsBindOptInPlace(m: i32, anc: i32[]): boolean {
     return true
   }
   false
+}
+
+// A computed scrutinee that cannot move ahead of its statement is bound where its match stands:
+// just before it in a block that holds it, else as `if true { const $scrut<m> = <scrutinee>;
+// match $scrut<m> {…} } else { __trap__() }`, the value form of a block. Either way it is
+// evaluated once, in source order, at the match's own type (D2038).
+function hmsBindMatchInPlace(m: i32, anc: i32[]): boolean {
+  if !(nodeAt(m) is MatchExpr) { return false }
+  if anc.length > 0 {
+    const p = anc[anc.length - 1]
+    if nodeAt(p) is Block { return hmsInsertBefore(p, m, m) }
+  }
+  const decl = hmsBindMatch(m)
+  if decl < 0 { return false }
+  const pos = nodePos(m)
+  const inner = addNode(nodeAt(m))
+  adoptNodeTok(inner, m)
+  const thenStmts: i32[] = [decl, inner]
+  const thenB = mkBlock(thenStmts, pos)
+  const trapFn = mkIdent("__trap__", pos)
+  identSet(trapFn, IDENT_BUILTIN)
+  const none: i32[] = []
+  const elseStmts: i32[] = [mkCall(trapFn, none, pos)]
+  const elseB = mkBlock(elseStmts, pos)
+  const ifn = valueIfAdd(mkIf(mkBool(1, -1), thenB, elseB, pos))
+  adoptNodeTok(ifn, m)
+  const wrap: Node = { parInner: ifn, pos: pos }
+  arenaSetNode(m, wrap)
+  true
 }
 
 // Whether parent `p` evaluates child `cur` unconditionally, and after nothing but literals,
