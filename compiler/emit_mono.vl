@@ -98,7 +98,7 @@ import {
   recordClonedIsVarTyIx,
 } from "./check_list_union"
 import { blockLastStmt } from "./check_if_value"
-import { joinArmIsLit } from "./check_nj_join"
+import { collectRetValues, joinArmIsLit } from "./check_nj_join"
 import {
   callBindAgreedHoles,
   callBindHas,
@@ -178,7 +178,11 @@ import {
   tyVarRenameRow,
   tyWrapsRecord,
 } from "./check_types"
-import { blockHasBareReturn, fnResultUnconsumed } from "./check_unconsumed"
+import {
+  blockHasBareReturn,
+  fnResultUnconsumed,
+  tailValueLeaves,
+} from "./check_unconsumed"
 import { collectValuedReturns } from "./check_nj_gate"
 import {
   ArrayLit,
@@ -354,10 +358,13 @@ import {
   vrFrameOf,
   vrIndex,
   vrIndexed,
-  vrInert,
+  vrInertFor,
   vrLits,
   vrReadsInert,
   vrReset,
+  vrResetFor,
+  vrStash,
+  vrUnstash,
 } from "./value_reach"
 import {
   FF_CHAIN_LONG,
@@ -592,6 +599,7 @@ import {
   elabRetOf,
   elabSlotNote,
   elabStampAt,
+  elabStubArgSet,
   elabTestsTyVar,
   elabTpDefaultsReset,
   elabTpDefaultsSet,
@@ -7278,8 +7286,14 @@ const MONO_UNBOUND_TY_PARAM_DEFAULT = "i32"
 
 // Records, for the elaboration, each generic declaration's type parameters an inferred call that
 // leaves them unbound defaults, by `monoDefaultUnboundTyParams`'s rule (D4551).
-export function monoElabDefaultsPrime() {
+export function monoElabDefaultsPrime(stmts: i32[]) {
   elabTpDefaultsReset()
+  // The stub keys read value reach over the program as checked, indexed for this question
+  // and put back after, since the checker's own question is still read.
+  vrStash()
+  vrResetFor("mono", stmts, true, false)
+  const vrCands: i32[] = []
+  vrIndex(stmts, vrCands)
   const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
   let d = 0
   while d < P.nodes.length {
@@ -7301,9 +7315,92 @@ export function monoElabDefaultsPrime() {
         if out.length > 0 { elabTpDefaultsSet(d, out, dt) }
       }
     }
+    // An argument of only uncalled hole functions is keyed at the stub it is delivered at.
+    if fn is Call {
+      let k = 0
+      while k < fn.callArgs.length {
+        const st = monoInertStubTy(fn.callArgs[k])
+        if st >= 0 { elabStubArgSet(d, k, st) }
+        k = k + 1
+      }
+    }
     d = d + 1
   }
+  vrUnstash()
   0
+}
+
+// The stub type argument `a` is delivered at when it holds only hole functions no call reaches:
+// `() => void`, a list of it for a list literal of them, a list of lists for a list of list
+// literals; -1 otherwise.
+function monoInertStubTy(a: i32): i32 {
+  const noPs: i32[] = []
+  const stub = mkFuncTy(noPs, TY_VOID)
+  const ax = unwrapParen(a)
+  if ax < 0 || ax >= P.nodes.length { return -1 }
+  const al = nodeAt(ax)
+  if !(al is ArrayLit) { return if monoInertFnsAt(ax, 0) { stub } else { -1 } }
+  if al.arrElems.length == 0 { return -1 }
+  const rows = nodeAt(unwrapParen(al.arrElems[0])) is ArrayLit
+  for e in al.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 { return -1 }
+    const il = nodeAt(ex)
+    if rows && il is ArrayLit {
+      if il.arrElems.length == 0 { return -1 }
+      for ie in il.arrElems {
+        if !monoInertFnsAt(unwrapParen(ie), 0) { return -1 }
+      }
+    } else if rows || !monoInertFnsAt(ex, 0) {
+      return -1
+    }
+  }
+  if rows { mkArrayTy(mkArrayTy(stub)) } else { mkArrayTy(stub) }
+}
+
+// Whether value `x` can only be hole functions, each read at a name no call reaches: a name of
+// one, an un-annotated `const` binding of one, an `if` choosing between them, or a call returning one.
+function monoInertFnsAt(x: i32, depth: i32): boolean {
+  if x < 0 || x >= P.nodes.length || depth > 8 { return false }
+  const n = nodeAt(x)
+  if n is IfStmt {
+    if n.ifElse < 0 { return false }
+    const arms: i32[] = []
+    tailValueLeaves(x, arms)
+    if arms.length < 2 { return false }
+    for a in arms {
+      if !monoInertFnsAt(unwrapParen(a), depth + 1) { return false }
+    }
+    return true
+  }
+  // A call is each value its callee's body hands back (D6911).
+  if n is Call {
+    const cd = identDeclOf(unwrapParen(n.callFn))
+    if cd < 0 || cd >= P.nodes.length { return false }
+    const cf = nodeAt(cd)
+    if !(cf is FuncDecl) || cf.fnBody < 0 { return false }
+    const rv: i32[] = []
+    collectRetValues(cf.fnBody, rv)
+    if rv.length == 0 { return false }
+    for v in rv {
+      if !monoInertFnsAt(unwrapParen(v), depth + 1) { return false }
+    }
+    return true
+  }
+  if !(n is Ident) { return false }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  if dn is FuncDecl { return monoIsGenericDecl(d) && vrInertFor("mono", x, "") }
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return false
+  }
+  monoInertFnsAt(unwrapParen(dn.letInit), depth + 1)
 }
 
 // Binds each of `typarams` that is still unbound in `tvN`, that no annotation in `params` names
@@ -17574,7 +17671,7 @@ function monoPushedAdapterClosed(v: i32): boolean {
 // Notes inert each name of a generic function in the program `stmts` and the bodies in
 // `fnStmts` whose value reaches nothing that calls or observes it (`vrInert`).
 function monoInertReach(stmts: i32[]) {
-  vrReset(stmts, true, false)
+  vrResetFor("mono", stmts, true, false)
   const roots: i32[] = []
   for s in stmts { roots.push(s) }
   for f in fnStmts { roots.push(f) }
@@ -17676,7 +17773,9 @@ function monoReachIndex(roots: i32[]) {
   const cands: i32[] = []
   vrIndex(roots, cands)
   for x in cands {
-    if monoCalleeIsGeneric(x) && vrInert(x, "") { monoReachNote(x, false) }
+    if monoCalleeIsGeneric(x) && vrInertFor("mono", x, "") {
+      monoReachNote(x, false)
+    }
   }
   0
 }
@@ -21414,7 +21513,7 @@ function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
   const kept: boolean[] = []
   let j = 0
   while j < fes.length {
-    if !vrInert(at[j], "") { return "" }
+    if !vrInertFor("mono", at[j], "") { return "" }
     const g = monoFlowLeafGen(at[j])
     const k = (g >= 0 && monoFlowGenCalled(g))
       || !vrReadsInert(monoOrigNode[fes[j]])
@@ -22131,7 +22230,9 @@ function monoPinHoleParam(
     an = monoElabPin(callIx, args, i, et, ctx)
     if an != "" { anTy = et }
   }
-  if an == "" {
+  // The stub pin where the elaboration left the parameter open: a list of lists of a hole function
+  // the callee calls at two types, whose element has no one signature (D14727).
+  if an == "" && et < 0 {
     const inTy: i32[] = [0 - 1]
     an = monoInertParamStubPin(oDecl, args[i], inTy)
     anTy = inTy[0]
