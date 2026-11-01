@@ -763,7 +763,7 @@ The emitter still decides some literal widths from context: (A) the literal arms
 - Mint (a4cf): an instance's call binding starts from the template's row (#5087; D14572, D14500 closed); `paramTyAt` goes (#5092); an enclosing generic's parameter binds at the template (#5096); a set call's member arm is noted under the call's instance (#5107); a nested function's instance key reads its parent's only when it uses its type variables (#5109).
 
 **Open after #5115.** These are the forward items, in order within each line:
-- step 1 is done (#5413, 2026-11-01): mono keeps no instance row tables. The emitter reads an instance's types from the elaboration (#5352–#5404); D2684's exact keys come from the elaboration alone (#5373, #5379, #5384, #5397); the pin rows (#5405) and the hole rows (#5413) go; the collect registers, the `??`/value-`if` union names and the map-read box read each instance's type (#5423, #5426, #5433, #5439). `nodeTyPinIxOf`'s emitter readers are `emit_shape_rows` (an import cycle), `ifJoinUnionNameIn`'s openness test and `nodeTyInOf`'s own fallback. #5373 made the exact-key test exponential in a cycle of generics; #5394 fixed it as mono's Tarjan unwind did;
+- step 1 is done (#5413, 2026-11-01): mono keeps no instance row tables. The emitter reads an instance's types from the elaboration (#5352–#5404); D2684's exact keys come from the elaboration alone (#5373, #5379, #5384, #5397); the pin rows (#5405) and the hole rows (#5413) go; the collect registers, the `??`/value-`if` union names and the map-read box read each instance's type (#5423, #5426, #5433, #5439). `nodeTyPinIxOf` is deleted (#5444, #5452), and the checker banks no program-wide hole pin: the list-element rung, the `?.` rewrite over a hole receiver and the closure-list element row read the elaboration, and `holePinSet` goes with its last reader (#5459, #5464 and the PR after it). #5373 made the exact-key test exponential in a cycle of generics; #5394 fixed it as mono's Tarjan unwind did;
 - step 4: (γ) by position; on 2026-10-31 the remaining pin populations were e = 116 and f = 46 after #5299 (a set member yielding no value is called through at `void`) and #5308 (a generic written into a list joins its set), most carried by `monoPinListElems`, `monoStoredSlotFnTy`, `monoPinNestedListElems` and `monoPinRecordField`; #5318 deleted the element-slot reads a tagged list no longer needs, and e is 112; `Member`/`ObjLit` landed (#5001, D9191 closed) c-3's stamp is on the tag rule (#5009), container slot writes join (#5015), callback deliveries adapt through `fvaAdapt` (#5032) and a `.map`/`.filter` callback over a set's list is delivered through it at every set size (#5049); next the remaining pin populations (e, 98 files; f, 34), then returns, (b) shape interning for nested tagged lists, and ef-1b (singleton hole fns in map values or record fields with no call through the set), each slice deleting the element-pin reads it covers, with c-2 beside it; D14435 is closed (the bound spelling `const fs = [twice, lenOf]; for g in fs` runs: `holeSlotJudge` compares no hole members' results for an element its initialiser alone fills), and D14645 is closed (a pushed element joins the binding's set, `elabFnListLetTy`), D14646 is closed (an index write is an id store into the tagged list, `ftCtxOk`), D14647 is closed (an alias's writes join the source's set, `cwListElemFnTargets`), a re-pointed `let` joins its re-pointing literals (`cwLetRepointFnTargets`), a returned list literal is read per call (`holeSlotRetApart`), with D14648 (parameters, returned lists written after, record list fields and map index writes, still judged) open; D14428 (g4) after (γ); D14431 (filed by #5001); D14433 (a map of a set through a generic helper; waits on mint); D14429 (fh1), D14430 (`ftInOpenFn`) and the in-instance tuples with slice (c)'s per-instance mint, whose facts, decide reader, mint-scope instances and `Param` types landed (#5064, #5067, #5072, #5075; pins freed 1 of 31); next the fact producer visiting every call through a hole parameter in an instance, and the emitter's per-tuple instance reading the mint, which closes D14439 (a two-member set handed to a hole parameter called at two tuples, clause 1); measured on 2026-10-29 (D14439, "The emitter piece"): arms calling each member at the call's tuple, mono's and the emitter's set read through the facts and the instance's elaboration run the reduced witness, and what stands in the way is the split plan (D6210) copying a parameter a tagged set reaches; the let-write join slice (the capture cells and the impure else-if nested join, D14425); slice (d); the pin callers go in the slice that closes the last cell; the fresh `let` read head with the `Fn#` mislabel; then fn_split, fn_flow_shadow and the driver loop, deleted jointly with increment 3;
 - increment 3: the elaboration is the last step of check (#5273), and its error channel landed (#5293): an instance's re-check reports what it owes the program as a check error. The rule (DECISIONS.md, "An instance's diagnostics are the program's only when the instance belongs to the program a build keeps") reports instance diagnostics only once the template checks clean, and only for instances of the program a build keeps, so a pass the split plan (D6210) discards reports nothing, and `vl check` asks the split plan when the channel raised. `pinHoleLambdaArg` is deleted (#5320). Late demands and speculative instances are both 0 (#5279, #5282, #5285, #5297). Slice (ii) is next, the elaboration instancing a split parameter per call tuple in place of the split plan: of the 109 files the plan's forward half rewrites, 86 already elaborate clean unsplit and mono refuses them (42 through the D6210 rung), and 23 are forwarders whose parameter closes at a signature. The tag decision (`fnTagDecide`) moves after `elabRun`, fed by per-instance facts, jointly with step 4 (γ); then the D6210 rung, `holeFnSplit*`, the binding fallback, `fsPlanHoles` and the channel's kept-program filter go, and the driver loop goes with step 4. D14734 (a forwarder's result taking its first parameter's type) holds the corpus's last 2 clause-1 cells after #5317 (D3361, D3533);
 - mono: cascade fact 3 is done (#5289): `monoArgClosedPin` answers every narrowed read whose type holds no record, so the cascade serves only fact 1. Fact 1's probe found the checker's object-literal stamp names the emitter's row at 99.1% of literals that have a row, the residue being families A and B. Its order is F1a, closed naming of nominal, alias-app, map and union records (about 436 of 615 disagreeing argument sites); F1b, record storage against read; F1c, the checker's build-row fact for adoption, which is the container-adoption line below. F1a (#5303) and F1b (#5307) landed: a record-typed argument pins at its declared name and a narrowed record read at the record its place holds, taking fact-1 disagreements from 1,103 to the structural residue; F1c is the container-adoption line. Then one producer for `monoArgTyName`;
@@ -814,6 +814,44 @@ Same commands as 4.1; the baseline above stays as the reference.
 | special-case helpers, (b) classifiers | 892 (3,971 call sites) | **818** (3,143 call sites) |
 
 The emitter fell by 15,340 lines and the checker grew by 7,583: facts moving to their producer, as §3 intends.
+
+### 4.1b Reading at 2d9c02fc8 (2026-11-01)
+
+Same commands as 4.1, on a quiet 4-core cloud box (load under 1 at start). Fuel and counts are exact;
+this box's RSS is not comparable with 4.1's, so only the plumb RSS (graded by its own script) is given.
+
+| Metric | 76a3eb8fd | cb348241 | 2d9c02fc8 |
+|---|---|---|---|
+| compiler/*.vl lines | 371,600 (229 files) | 366,524 (238 files) | **366,702** (238 files) |
+| emitter / checker / fn_* lines | 188,533 / 112,825 / 9,594 | 173,193 / 120,408 / 9,601 | **172,530 / 121,178 / 9,601** |
+| functions | 14,784 | 14,927 | **14,982** |
+| seed bytes (fixpoint) | 5,916,548 | 5,954,946 | **5,965,733** |
+| L2 self-compile fuel | 75,749,721,676 | 59,619,845,390 (measured today) | **61,904,280,945** |
+| diderven check / build fuel | 48,290,741,306 / 6,282,852,143 | – | not read: no diderven tree on this box |
+| plumb-shape main / tail fuel | 7,493,309,049 / 5,422,531,645 | – | **7,312,307,918 / 5,325,933,774**; RSS 316.2 / 315.9 MB |
+| special-case helpers, (a) pin and position | 1,516 | 1,490 | **1,477** (emit_mono.vl 1,051, fn_split.vl 243, fn_flow_shadow.vl 183) |
+| special-case helpers, (b) classifiers | 892 (3,971 call sites) | 818 (3,143) | **815** (3,075) |
+| special-case helpers, (c) ExpCtx | 17 fields | 5 fields | **4 fields**: 128 writes outside `expCtx*`, 22 resets |
+| whole-arena scans outside a pass | 67 (baseline file) | – | **46** live; the baseline file holds 52 |
+| emitter pass rows | 47 (27 re-derive) | – | **43**; the re-derive split was a hand reading and is not re-graded |
+
+The (c) row's counting rule is a field write `x.<field> =` outside the `expCtx*` helpers, a reset being
+one whose value is `false`, `0` or `-1`. It reads 427 writes and 64 resets at 76a3eb8fd, where 4.1 hand-counted
+458 and 83, and 146 and 26 at cb348241.
+
+What moved since cb348241, across 93 commits that touch compiler/:
+
+- Lines rose by 178 net. The largest deletions: #5396 (−312), #5394 (−233), #5392 (−181),
+  #5462 (−161), #5368 (−149), #5442 (−132), #5416 (−119), #5454 (−112). The largest additions were
+  elaboration and check work: #5448 (+242), #5345 (+227), #5441 (+213), #5424 (+151), #5360 (+108).
+  The checker grew by 770 lines and the emitter fell by 663.
+- The seed grew by 10,787 bytes (+0.18%).
+- L2 fuel rose 3.8%, and not monotonically. Fixpoint samples: #5377 59.77 G, #5384 59.81 G,
+  #5394 60.49 G, #5392 60.44 G, #5402 61.80 G, #5433 60.84 G, now 61.90 G. The largest single
+  step is #5402 (+1.36 G, +2.2%). From 76a3eb8fd to cb348241 it fell 21%.
+- Helpers (a) fell by 13, all in emit_mono.vl, where the mono deletions above landed. (b) fell by
+  3 classifiers and 68 call sites; it was not read per commit. (c) lost a field (`rawNullRead`,
+  #5385).
 
 ### 4.2 Expected direction per step
 
