@@ -13,22 +13,42 @@ import {
   AsExpr,
   BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
+  ForIn,
+  ForRange,
   FuncDecl,
   Ident,
+  IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
+  LoopVar,
   MatchExpr,
   Member,
+  NullLit,
+  NumLit,
   ObjLit,
+  OptMember,
   P,
   Param,
   Paren,
+  Program,
   RetStmt,
   Spread,
+  StrLit,
+  TypeDecl,
   TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
   callTyArgsOf,
   elseIfLink,
   hasSpreadItem,
@@ -620,55 +640,6 @@ export function elabTpDefaultsSet(d: i32, names: string[], t: i32) {
   0
 }
 
-// Per key, the type parameters its checker instance bound to the default where its demand did not;
-// the instance type then reads the default, not the value (D4551).
-let elabKeyGuess: {[i32]: string[]} = Map()
-
-// Notes each parameter checker instance `ck` binds to `i32` where the demand binds it to another
-// type.
-function elabGuessNote(ck: i32, names0: string[], tys0: i32[]) {
-  let i = 0
-  while i < names0.length && i < tys0.length {
-    let j = 0
-    while j < ekNames[ck].length {
-      if (
-        ekNames[ck][j] == names0[i]
-        && ekTys[ck][j] == TY_I32
-        && tys0[i] != TY_I32
-      ) {
-        const g = elabKeyGuess[ck] ?? []
-        let has = false
-        for x in g {
-          if x == names0[i] { has = true }
-        }
-        if !has { g.push(names0[i]) }
-        elabKeyGuess[ck] = g
-      }
-      j = j + 1
-    }
-    i = i + 1
-  }
-  0
-}
-
-// Whether template type `ty` reads a type parameter the instance under key `k` (or a key it
-// nests in) bound by the D4551 default rather than by a call; such an instance type is a guess.
-export function elabKeyReadsDefault(k: i32, ty: i32): boolean {
-  let a = k
-  let guard = 0
-  while a >= 0 && a < ekDecl.length && guard < 64 {
-    for tp in elabTpDefaults[ekDecl[a]] ?? [] {
-      if tyMentionsTyVarNamed(ty, tp, 16) { return true }
-    }
-    for tp in elabKeyGuess[a] ?? [] {
-      if tyMentionsTyVarNamed(ty, tp, 16) { return true }
-    }
-    a = ekParent[a]
-    guard = guard + 1
-  }
-  false
-}
-
 // Each source declaration by its body, so an emitted rebuild finds the declaration it copies.
 let elabBodyDecl: {[i32]: i32} = Map()
 
@@ -1094,7 +1065,6 @@ function elabDemandFrom(
     && elabCkUsable(decl, call, from) >= 0
     && elabCkTakesPins(ck, sig, pTys)
   ) {
-    elabGuessNote(ck, names0, tys0)
     elabReachNote(from, ck, -1)
     const n1 = ekDecl.length
     if !ekDone[ck] { elabOne(ck) }
@@ -2095,14 +2065,14 @@ let elabMintCalls: {[i32]: i32[]} = Map()
 let elabMintSets: {[i32]: i32} = Map()
 
 // The named function and parameter position argument `ix` of call `p` lands in, as
-// `[decl, index]`, when it is a positional argument of a direct call to an un-annotated
-// parameter; [] otherwise.
+// `[decl, index]`, when it is a positional argument of a call by name or `const` alias to an
+// un-annotated parameter, or one its own type parameter alone annotates; [] otherwise.
 function elabMintFwdTarget(ix: i32, p: i32): i32[] {
   const none: i32[] = []
   if p < 0 || p >= P.nodes.length { return none }
   const pn = nodeAt(p)
   if !(pn is Call) { return none }
-  const d2 = identDeclOf(parenPeelIx(pn.callFn))
+  const d2 = elabConstCalleeDecl(parenPeelIx(pn.callFn), 8)
   if d2 < 0 || d2 >= P.nodes.length { return none }
   const f2 = nodeAt(d2)
   if !(f2 is FuncDecl) { return none }
@@ -2110,8 +2080,23 @@ function elabMintFwdTarget(ix: i32, p: i32): i32[] {
   if j < 0 || j >= f2.fnParams.length { return none }
   if j < pn.callArgNames.length && pn.callArgNames[j] != "" { return none }
   const q = nodeAt(f2.fnParams[j])
-  if !(q is Param) || q.parType >= 0 { return none }
+  if !(q is Param) || q.parType >= 0 && !fnTagOwnTyParamAlone(f2, j) {
+    return none
+  }
   [d2, j]
+}
+
+// The declaration the callee name `v` reads, through at most `depth` `const` aliases; -1 when
+// it reads no declaration.
+function elabConstCalleeDecl(v: i32, depth: i32): i32 {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return -1 }
+  const r = identDeclOf(v)
+  if r < 0 || r >= P.nodes.length { return -1 }
+  const rn = nodeAt(r)
+  if rn is LetDecl && rn.letKw == "const" && rn.letInit >= 0 && depth > 0 {
+    return elabConstCalleeDecl(parenPeelIx(rn.letInit), depth - 1)
+  }
+  r
 }
 
 // `elabMintFacts` over the subtree at `ix` of declaration `decl`'s body, nested functions aside.
@@ -2128,7 +2113,7 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
     if cn is Call && elabMintFactAt(cn, cur, decl, k, sc) { n = n + 1 }
     for kid in nodeSpineChildren(cur) {
       if cn is Call && kid == cn.callFn {
-        n = n + elabMintFactsIn(kid, decl, k, sc)
+        n = n + elabMintCalleeIn(kid, decl, k, sc)
       } else {
         elabMintHandedIn(kid, cur, decl, k, sc)
         n = n + elabMintFactsIn(kid, decl, k, sc)
@@ -2137,6 +2122,55 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
     cur = elseIfLink(cur)
   }
   n
+}
+
+// `elabMintFactsIn` over callee `ix`, where the root of an element chain is read as
+// the callee's slot, not handed on.
+function elabMintCalleeIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
+  let n = 0
+  let cur = ix
+  let hops = 0
+  while cur >= 0 && cur < P.nodes.length && hops < 16 {
+    const next = elabChainStep(cur)
+    if next < 0 {
+      hops = 16
+    } else {
+      const xn = nodeAt(cur)
+      if xn is Index {
+        elabMintHandedIn(xn.idxIndex, cur, decl, k, sc)
+        n = n + elabMintFactsIn(xn.idxIndex, decl, k, sc)
+      }
+      cur = next
+      hops = hops + 1
+    }
+  }
+  n + elabMintFactsIn(cur, decl, k, sc)
+}
+
+// The function type at the leaves of list type `t`, at any depth, or -1.
+function elabHeldFnTyOf(t: i32): i32 {
+  let e = t
+  let depth = 0
+  while e >= 0 && e < T.tys.length && depth < 16 {
+    const a = tyAt(e)
+    if !(a is TyArray) { return if depth > 0 { e } else { -1 } }
+    e = a.aElem
+    depth = depth + 1
+  }
+  -1
+}
+
+// The set the elements of list type `t`, at any depth, belong to, or -1.
+function elabHeldSetOf(t: i32): i32 {
+  let e = t
+  let depth = 0
+  while e >= 0 && e < T.tys.length && depth < 16 {
+    const a = tyAt(e)
+    if !(a is TyArray) { return if depth > 0 { fnTagSetOfTy(e) } else { -1 } }
+    e = a.aElem
+    depth = depth + 1
+  }
+  -1
 }
 
 // Marks partial the set instance `k` binds a parameter of `decl` to, where node `ix` (the child
@@ -2149,6 +2183,7 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
     const pd = identDeclOf(ix)
     const dn = nodeAt(decl)
     if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
+      mintSetPartialNote(elabHeldSetOf(elabNodeTy(ix, k)))
       const st = fnTagSetOfTy(elabNodeTy(ix, k))
       const to = elabMintFwdTarget(ix, p)
       if to.length == 2 && st >= 0 {
@@ -2192,15 +2227,52 @@ function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
   0
 }
 
+// The node a callee read `x` reads its slot of: `x` itself, or the root an element or field
+// chain (`r[i]`, `r[i][j]`) starts from.
+function elabSlotRoot(x: i32): i32 {
+  let r = x
+  let depth = 0
+  while r >= 0 && r < P.nodes.length && depth < 16 {
+    const next = elabChainStep(r)
+    if next < 0 { return r }
+    r = next
+    depth = depth + 1
+  }
+  r
+}
+
+// The node chain read `x` steps to: a paren's inner or an index's holder; -1 for
+// any other node.
+function elabChainStep(x: i32): i32 {
+  const n = nodeAt(x)
+  match n {
+    Paren => {
+      return n.parInner
+    }
+    Index => {
+      return parenPeelIx(n.idxArr)
+    }
+    // A field read is typed by its record's own row, which the facts here do not reach.
+    Member => {
+      return -1
+    }
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return -1
+    }
+  }
+}
+
 // Notes the fact for call `c` at `ix` when its callee is a parameter of `decl` that instance `k`
 // binds to a set of functions each instanced at the call's closed argument types.
 function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const cf = parenPeelIx(c.callFn)
-  const pd = identDeclOf(cf)
+  const root = elabSlotRoot(cf)
+  const pd = identDeclOf(root)
   if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return false }
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) || !i32ListHas(dn.fnParams, pd) { return false }
-  const st = elabNodeTy(cf, k)
+  // A chain's callee the instance types at its rep reads the set its root's list holds.
+  const st = if root != cf && fnTagSetOfTy(elabNodeTy(cf, k)) < 0 { elabHeldFnTyOf(elabNodeTy(root, k)) } else { elabNodeTy(cf, k) }
   const ds = elabFnSetOf(st)
   if ds.length == 0 || fnTagSetOfTy(st) < 0 { return false }
   const wp: i32[] = []
@@ -2223,7 +2295,9 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   }
   mintFactNote(sc, ix, fnTagSetOfTy(st), key, split, rs)
   if !split { elabNodeTyFill(ix, k, rs[0]) }
-  mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
+  if root == cf {
+    mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
+  }
   const at = elabMintCalls[ix] ?? []
   at.push(k)
   elabMintCalls[ix] = at
@@ -2281,7 +2355,8 @@ function elabMemberResultAt(d: i32, pTys: i32[]): i32 {
 }
 
 // Whether call `ix` of `d` by name hands an untagged set of functions to an un-annotated
-// parameter, which its row then binds at the set's rep (`elabSetArgBind` keys a tagged one).
+// parameter, or one its own type parameter alone annotates, which its row then binds at the
+// set's rep (`elabSetArgBind` keys a tagged one).
 function elabRowAtSetRep(ix: i32, d: i32): boolean {
   if ix < 0 || ix >= P.nodes.length || d < 0 || d >= P.nodes.length {
     return false
@@ -2297,7 +2372,7 @@ function elabRowAtSetRep(ix: i32, d: i32): boolean {
     const pn = nodeAt(f.fnParams[i])
     if (
       pn is Param
-      && pn.parType < 0
+      && (pn.parType < 0 || fnTagOwnTyParamAlone(f, i))
       && fnTagSetOfTy(st) >= 0
       && !fnTagSetIsTagged(fnTagSetOfTy(st))
     ) {
@@ -2324,7 +2399,6 @@ export function elabRun() {
   elabExactDepth = 0
   elabExactPending = []
   ekKids = Map()
-  elabKeyGuess = Map()
   ekParent = []
   ekReach = []
   elabReadsMemo = Map()

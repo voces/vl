@@ -448,6 +448,7 @@ import {
   monoOrigNode,
   monoParamPinTy,
   monoProgStmts,
+  monoRenamedFe,
   monoRetCopyReads,
   monoStubSlots,
   monoSupersededObjTys,
@@ -558,8 +559,8 @@ import {
 import {
   anonHandleTyIx,
   anonRowKindsAgree,
+  fnTagListRepName,
   structIndexOfTypeName,
-  structRowOfObjFieldSet,
 } from "./emit_shape_rows"
 import {
   fnBlockShadowsAt,
@@ -715,9 +716,6 @@ let monoProgLetBySid: i32[] = []
 
 // The arena's size, a memo key for the walks below that cache a whole-arena answer.
 function monoArenaStamp() { P.nodes.length + fnStmts.length + fnParent.length }
-
-// Inert: an in-place write once bumped a rebuild stamp no reader keeps; its sites go next.
-function monoArenaTouch() { 0 }
 
 // D1046 — is this the first instance of the generic being built? Read by the nested
 // named-function arm alone: at `count == 0` the instance reuses the template's own
@@ -1950,19 +1948,15 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   const lup = monoArgLitUnionPin(ix, fnIx)
   if lup != "" { return lup }
   // An empty list literal has no element for the collection arms to read; the body's pushes
-  // pinned its recorded row at the call (D2218). A record element no spelling names takes the
-  // row its field set matches, and a pinned element neither names is the loud floor, since
-  // the cascade below reads the literal and would pin `i32[]`.
+  // pinned its recorded row at the call (D2218). A pinned element no spelling names is the loud
+  // floor, since the cascade below reads the literal and would pin `i32[]`.
   const ealN = nodeAt(cax)
   if ealN is ArrayLit {
     if ealN.arrElems.length == 0 && !tyHasTyVar(nodeTyIxOf(cax)) {
       const ealTy = nodeTyIxOf(cax)
       const ealPin = monoAnnPinNameOfTy(ealTy)
       if ealPin != "" { return ealPin }
-      const ealEl = tyRefArrElemOf(ealTy)
-      const ealRow = structRowOfObjFieldSet(ealEl)
-      if ealRow >= 0 { return sNames[ealRow] + "[]" }
-      if ealEl >= 0 { return "" }
+      if tyRefArrElemOf(ealTy) >= 0 { return "" }
     }
   }
   // A map or Set argument pins its param as that map — the whole `{[K]:V}` spelling an
@@ -2192,7 +2186,6 @@ function monoNoteLitDestIn(x: i32, ms: i32[], depth: i32): i32 {
         monoNoteLitDestIn(ax, ms, depth + 1)
       } else if nodeAt(ax) is ObjLit && nodeRepTyIxOf(ax) == at {
         const vr = monoVariantRowAmong(at, ms)
-        // arena-tick exempt: read only by mono's pin naming, never by the four rebuild passes
         if vr >= 0 { monoLitDestVariant[ax] = vr }
       }
     }
@@ -4100,12 +4093,11 @@ let monoCallTpl: {[i32]: i32} = Map()
 
 function monoNoteCallTpl(ix: i32, nx: i32) {
   if nx != ix && ix >= 0 && nx >= 0 && nodeAt(nx) is Call {
-    // arena-tick exempt: a clone-to-template side map read by lookups of the checker's and the
-    // elaboration's per-call rows, never by a pass.
     monoCallTpl[nx] = monoCallTplOf(ix)
     const cn = nodeAt(ix)
     const tSet = if cn is Call { monoTagSetAt(ix, cn.callFn) } else { -1 }
-    const tArms = fnTagArmsAt(ix, tSet)
+    let tArms = fnTagArmsAt(ix, tSet)
+    if tArms.length == 0 { tArms = fnTagArmsAt(monoCallTplOf(ix), tSet) }
     if tArms.length > 0 && fnTagCallArms(nx).length == 0 {
       fnTagCallCopy(nx, ix, tSet, tArms)
     }
@@ -4528,14 +4520,10 @@ function monoReparentNestedLams(mark: i32, parentSlot: i32) {
       fnParent[s] = parentSlot
       wrote = true
     }
-    // arena-tick exempt: this module's own scratch list of slots already re-pointed, read by no pass.
     monoLamMintedSlots[k] = -1
     k = k + 1
   }
-  if wrote {
-    monoArenaTouch()
-    invalidateFnChildIndex()
-  }
+  if wrote { invalidateFnChildIndex() }
   0
 }
 
@@ -4722,7 +4710,6 @@ function monoCloneLambdaSubst(
     if a.fnRet < 0 && blockHasBareReturn(a.fnBody) { cloneRet = -1 }
     const clone = mkFunc(nm, noTP, ps, cloneRet, nbody, a.pos)
     identOrigNote(clone, fnIx)
-    // arena-tick exempt: a clone-to-template side map read only by monoLamTypedTemplate, never by a pass.
     monoLamCloneTmpl[clone] = fnIx
     // The clone is a value too, typed at this pin where the template's type substitutes.
     const cty = monoPinnedTyOf(fnIx, bN, bT)
@@ -4911,7 +4898,6 @@ function monoLamInstallClone(a: FuncDecl, fnIx: i32, clone: i32, mark: i32) {
     if tSlot >= 0 {
       buildFnMapNoteFnStmtWrite(tSlot, clone)
       fnStmts[tSlot] = clone
-      monoArenaTouch()
       monoNamedTmplNode.push(fnIx)
       monoNamedTmplSlot.push(tSlot)
       monoReparentNestedLams(mark, tSlot)
@@ -5145,7 +5131,6 @@ function monoPinBodyLambdasRaw(
         && !(tyAt(opt) is TyUnion)
         && !tyHasTyVar(opt)
       ) {
-        // arena-tick exempt: a per-program mark the cast's lowering reads.
         monoGradualAsScalar[rb] = true
       }
     }
@@ -5358,7 +5343,6 @@ function monoTpJoinObjTy(ix: i32, rb: i32, bN: string[], bT: i32[]) {
   const pty = monoPinnedTyOf(ix, bN, bT)
   if pty >= 0 && pty != t {
     monoPinRecordTy(rb, pty)
-    // arena-tick exempt: a per-program mark the post-monomorphization shape pass reads.
     monoGradualObjLits[rb] = true
     monoGradualObjList.push(rb)
   }
@@ -5494,7 +5478,6 @@ function monoPinCountDecls(ix: i32, seen: {[string]: i32}): i32 {
   let dup = 0
   if n is LetDecl {
     const c = (seen.get(n.letName) ?? 0) + 1
-    // arena-tick exempt: a per-call name count the box decision reads, no pass's input.
     seen[n.letName] = c
     if c > 1 && (monoPinReachNames.get(n.letName) ?? false) { dup = 1 }
   }
@@ -5538,7 +5521,6 @@ function monoPinNoteReachExpr(ix: i32) {
   const u = unwrapParen(ix)
   if u < 0 || u >= P.nodes.length { return 0 }
   const n = nodeAt(u)
-  // arena-tick exempt: a per-instance name set the box decision reads, no pass's input.
   if n is Ident { monoPinReachNames[n.identName] = true }
   0
 }
@@ -5575,7 +5557,6 @@ function monoPinReachStep(ix: i32): boolean {
         const iu = nodeAt(u)
         if iu is Ident {
           if !(monoPinReachNames.get(iu.identName) ?? false) {
-            // arena-tick exempt: a per-instance name set the box decision reads, no pass's input.
             monoPinReachNames[iu.identName] = true
             grew = true
           }
@@ -5616,7 +5597,6 @@ function monoPinNoteUnsafe(ix: i32) {
   while cur >= 0 && cur < P.nodes.length {
     const n = nodeAt(cur)
     if n is Ident {
-      // arena-tick exempt: a per-instance name set the body walk reads, no pass's input.
       monoPinUnsafeNames[n.identName] = true
       return 0
     }
@@ -6752,7 +6732,7 @@ function monoRenameGenAliasInit(at: i32, ctx: i32, tpl: string, inst: string) {
     return monoRenameGenAliasInit(d.letInit, ctx, tpl, inst)
   }
   iv.identName = inst
-  monoArenaTouch()
+  monoNoteRenamed(d.letInit, monoSlotOfDecl(monoFnDeclNamed(inst)))
   sidNoteNodeName(d.letInit, monoFnDeclNamed(inst))
   0
 }
@@ -6884,7 +6864,6 @@ function monoBinderBump(bn: string[], bc: i32[], name: string) {
   let i = 0
   while i < bn.length && i < bc.length {
     if bn[i] == name {
-      // arena-tick exempt: a count local to one instance's name filter, read by no pass.
       bc[i] = bc[i] + 1
       return 0
     }
@@ -7739,6 +7718,13 @@ function monoTagSetAt(ix: i32, callFn: i32): i32 {
   }
   const s = fnTagSetOfTy(t)
   if s >= 0 && fnTagArmsAt(ix, s).length > 0 { return s }
+  // A callee read off a list or record the instance types at its rep (an element's i32 id) is
+  // the set its template's facts name.
+  const tpl = monoCallTplOf(ix)
+  const ms = mintCallSoleSet(tpl)
+  if s < 0 && fnTagSetIsTagged(ms) && fnTagArmsAt(tpl, ms).length > 0 {
+    return ms
+  }
   -1
 }
 
@@ -9139,10 +9125,10 @@ function monoArgTaggedSetTy(ax: i32): i32 {
   const x = unwrapParen(ax)
   if x < 0 { return -1 }
   const t = nodeTyIxOf(x)
-  if fnTagTyIsTagged(t) { return t }
+  if fnTagTyIsTagged(t) || fnTagListTy(t) { return t }
   // A parameter handed on holds the set its instance binds it to.
   const it = elabWalkTy(x)
-  if it >= 0 && fnTagTyIsTagged(it) { return it }
+  if it >= 0 && (fnTagTyIsTagged(it) || fnTagListTy(it)) { return it }
   -1
 }
 
@@ -9509,7 +9495,6 @@ function monoPinSubTyOf(t: i32, ctx: i32): i32 {
 function monoExactPinTys(pinTys: i32[], ctx: i32) {
   let i = 0
   while i < pinTys.length {
-    // arena-tick exempt: the caller's own pin column, not an arena node.
     pinTys[i] = monoExactPinTyOf(pinTys[i], ctx)
     i = i + 1
   }
@@ -9558,6 +9543,7 @@ export function monoStateReset() {
 export function monoSubTablesReset() {
   monoInstOwn = ""
   monoArgInstFe = Map()
+  monoRenamedFe = Map()
   monoOpenArgCall = 0 - 1
   monoOpenArgCallee = 0 - 1
   0
@@ -9743,7 +9729,7 @@ function monoMakeInstanceHit(
           ) {
             monoAliasCallNote(calleeIx)
             cal.identName = monoInstName[k]
-            monoArenaTouch()
+            monoNoteRenamed(calleeIx, monoInstFe[k])
             // R4 writer 5 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
             let instDecl = fnStmts[monoInstFe[k]]
             if identAuditDrop == IDENT_DROP_MONO_CALLEE { instDecl = -1 }
@@ -9768,7 +9754,6 @@ function monoMakeInstanceHit(
                   // the type under the same pin this column holds. Equivalent
                   // to the clone arm only while this caller's column is all -1.
                   hpp.parType = synthTypeRef(pinned[hp], -1)
-                  monoArenaTouch()
                 }
               }
               hp = hp + 1
@@ -10223,7 +10208,6 @@ function monoMakeInstanceLater(
     if msl >= 0 && msl < fnParent.length {
       buildFnMapNoteFnSlotWrite()
       fnParent[msl] = instFe
-      monoArenaTouch()
       mlsWrote = true
     }
     mls = mls + 1
@@ -10247,7 +10231,7 @@ function monoMakeInstanceLater(
   if cal2 is Ident && !i32ListHas(monoNoRename, calleeIx) {
     monoAliasCallNote(calleeIx)
     cal2.identName = instName
-    monoArenaTouch()
+    monoNoteRenamed(calleeIx, instFe)
     let instDecl = fnStmts[instFe]
     if identAuditDrop == IDENT_DROP_MONO_CALLEE { instDecl = -1 }
     sidNoteNodeName(calleeIx, instDecl)
@@ -10383,10 +10367,7 @@ function monoMakeInstanceRegister(
   monoLastInstFe = instFe
   if twoListTy >= 0 { monoTwoListRet.set(instFe, twoListTy) }
   while fnInstOrigin.length <= instFe { fnInstOrigin.push(-1) }
-  if instFe != origFe {
-    fnInstOrigin[instFe] = origFe
-    monoArenaTouch()
-  }
+  if instFe != origFe { fnInstOrigin[instFe] = origFe }
 }
 
 // Walks a registered instance's body and its lambda clones' bodies, so their own generic
@@ -10410,13 +10391,11 @@ function monoMakeInstanceWalk(
       calleeIx,
     )
   }
-  // arena-tick exempt: a walk counter, which no rebuild pass reads.
   monoActiveDepth[origFe] = monoActiveDepth[origFe] + 1
   // Walk this instance's body — a nested generic call instantiates its own callee
   // against this instance's concrete annotations, and the callee rename lands on the
   // instance's own `Call` spine rather than on nodes its siblings share.
   const walked = monoWalkFnBody(nfn)
-  // arena-tick exempt: the same counter.
   monoActiveDepth[origFe] = monoActiveDepth[origFe] - 1
   if walked < 0 { return -1 }
   // A clone's body is walked beside its instance's: its generic calls are its own copies,
@@ -10573,7 +10552,6 @@ function monoMakeInstanceFirst(
 ) {
   buildFnMapNoteFnStmtWrite(origFe, nfn)
   fnStmts[origFe] = nfn
-  monoArenaTouch()
   monoLamCallByName(calleeIx, origFe, instName)
   0
 }
@@ -10835,10 +10813,8 @@ function monoMakeInstanceGo(
       tvV,
       cbFnNames,
     )
-    // arena-tick exempt: a fresh instance key record, read by the registry, never by a pass.
     if retWiden != "" { k.key = k.key + "=>" + retWiden }
     const tplCall = if makeCall >= 0 { monoCallTplOf(makeCall) } else { -1 }
-    // arena-tick exempt: the same fresh key record, marked per elaboration for the registry.
     k.key = monoElabSplitKey(k.key, origFe, tplCall)
     monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
@@ -11009,7 +10985,6 @@ function monoMakeInstanceGo(
     if !monoTypedKeys.has(typedKey) { monoTypedKeys.set(typedKey, k.key) }
     monoMakeInstanceRegister(k.key, origFe, instName, instFe, twoListTy)
     elabSlotNote(instFe, ek)
-    // arena-tick exempt: read only by monoElabSplitKey, never by the four rebuild passes
     monoKeyEk[k.key] = ek
     monoKeyPins[k.key] = pinnedTyIx
     monoNoteOpenArgs(calleeIx, instFe)
@@ -11288,11 +11263,37 @@ function monoCoerceLitPart(v: i32, lit: i32, path: string[], ctx: i32) {
   monoCoerceFnValueTys(v, nm, ctx, -1, tys)
 }
 
+// Record that the identifier at `identIx` now names the instance at slot `fe` (-1: none).
+function monoNoteRenamed(identIx: i32, fe: i32) {
+  if identIx >= 0 && fe >= 0 { monoRenamedFe[identIx] = fe }
+  0
+}
+
+// The slot `monoNoteRenamed` recorded for `identIx`, while that slot still declares `name`; -1
+// otherwise. A just-minted instance is named here before the function map covers it.
+function monoRenamedFeOf(identIx: i32, name: string): i32 {
+  const fe = monoRenamedFe.get(identIx) ?? -1
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const d = nodeAt(fnStmts[fe])
+  if d is FuncDecl {
+    if d.fnName == name { return fe }
+  }
+  -1
+}
+
+// The `fnStmts` slot of declaration node `decl`, or -1.
+function monoSlotOfDecl(decl: i32): i32 {
+  if decl < 0 { return -1 }
+  fnStmtsPosOf(decl)
+}
+
 // The `fnStmts` slot of the function an `Ident` names — the one resolver every question
 // this pass asks about a named function goes through. `fnIndexOfInScopeSid` is the language's
 // innermost-scope rule for a name a `FuncDecl` carries; `identClosureFeOfRead` covers an
 // arrow lambda, which parses to a nameless `FuncDecl` and carries its name on the binding.
 function monoFnFeOfIdent(identIx: i32, name: string, ctx: i32) {
+  const rf = monoRenamedFeOf(identIx, name)
+  if rf >= 0 { return rf }
   const fe = fnIndexOfInScopeAt(sidOfNode(identIx), name, ctx, identIx)
   if fe >= 0 { return fe }
   identClosureFeOfRead(identIx, ctx)
@@ -12438,7 +12439,6 @@ function monoFlowReads(stmts: i32[]): i32 {
       const ix = stack.pop()
       if ix >= 0 && ix < P.nodes.length && !(ix < seen.length && seen[ix]) {
         while seen.length <= ix { seen.push(false) }
-        // arena-tick exempt: a side table of this pass, not the arena
         seen[ix] = true
         monoFlowReadsNote(ix, lets, direct)
         const kids = nodeChildren(ix)
@@ -12446,7 +12446,6 @@ function monoFlowReads(stmts: i32[]): i32 {
         while k >= 0 {
           const ch = kids[k]
           if ch >= 0 {
-            // arena-tick exempt: a side table of this pass, not the arena
             sidArrPut(mfrParent, ch, ix)
             stack.push(ch)
           }
@@ -12732,7 +12731,6 @@ function monoFlowAnnLits(a: i32) {
     if unwrapParen(hn.letInit) != uc { return 0 }
   }
   const vals = monoFlowDeclVals(fd)
-  // arena-tick exempt: a side table of this pass, not the arena
   if vals.length > 0 { mfrAnnLits[a] = vals }
   0
 }
@@ -12905,13 +12903,11 @@ function monoFlowReadsNote(ix: i32, lets: i32[], direct: i32[]) {
     if d >= 0 {
       const us = mfrUses[d] ?? []
       us.push(ix)
-      // arena-tick exempt: a side table of this pass, not the arena
       mfrUses[d] = us
     }
   } else if n is LetDecl {
     monoFlowReadsName(n.letName)
     if n.letType < 0 && n.letInit >= 0 && !fnTagListTy(nodeTyIxOf(n.letInit)) {
-      // arena-tick exempt: a side table of this pass, not the arena
       mfrCand[ix] = true
       lets.push(ix)
     } else if n.letInit >= 0 {
@@ -12919,12 +12915,10 @@ function monoFlowReadsNote(ix: i32, lets: i32[], direct: i32[]) {
     }
   } else if n is FuncDecl {
     monoFlowReadsName(n.fnName)
-    // arena-tick exempt: a side table of this pass, not the arena
     if monoFlowTyParamGen(ix) { mfrGen[ix] = true }
   } else if n is Param {
     monoFlowReadsName(n.parName)
     if n.parType < 0 && n.parDefault < 0 && n.parOpt == 0 && n.parRest == 0 {
-      // arena-tick exempt: a side table of this pass, not the arena
       mfrCand[ix] = true
       lets.push(ix)
     }
@@ -12945,12 +12939,10 @@ function monoFlowSliceAsSpread(ix: i32, pos: i32) {
   nodeTyRecord(sp, nodeTyIxOf(recv))
   const lit: Node = { arrElems: [sp], pos: pos }
   arenaSetNode(ix, lit)
-  monoArenaTouch()
   0
 }
 
 function monoFlowReadsName(nm: string) {
-  // arena-tick exempt: a side table of this pass, not the arena
   if nm != "" { mfrNameCount[nm] = (mfrNameCount[nm] ?? 0) + 1 }
   0
 }
@@ -13002,7 +12994,6 @@ function monoFlowLetLeaf(d: i32): i32 {
   const dn = nodeAt(d)
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
   if mfrLetBusy[d] ?? false { return -3 }
-  // arena-tick exempt: a side table of this pass, not the arena
   mfrLetBusy[d] = true
   mfrLetDepth = mfrLetDepth + 1
   let g = monoFlowLeafGen(unwrapParen(dn.letInit))
@@ -13015,7 +13006,6 @@ function monoFlowLetLeaf(d: i32): i32 {
     }
   }
   mfrLetDepth = mfrLetDepth - 1
-  // arena-tick exempt: a side table of this pass, not the arena
   mfrLetBusy[d] = false
   if mfrLetDepth == 0 && g < 0 { return -1 }
   g
@@ -13219,7 +13209,6 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
     }
     i = i + 1
   }
-  // arena-tick exempt: a side table of this pass, not the arena
   mfrAliasWrites[d] = writes
   named
 }
@@ -13437,20 +13426,16 @@ function monoFlowDeclVals(d: i32): i32[] {
   const st = mfrValsState[d] ?? 0
   if st == 2 { return mfrVals[d] ?? [] }
   if st != 0 { return [] }
-  // arena-tick exempt: a side table of this pass, not the arena
   mfrValsState[d] = 1
   const out: i32[] = []
   const ok = monoFlowRetVals(d, out)
     || monoFlowLetVals(d, out)
     || monoFlowParamVals(d, out)
   if !ok {
-    // arena-tick exempt: a side table of this pass, not the arena
     mfrValsState[d] = 3
     return []
   }
-  // arena-tick exempt: a side table of this pass, not the arena
   mfrVals[d] = out
-  // arena-tick exempt: a side table of this pass, not the arena
   mfrValsState[d] = 2
   out
 }
@@ -13585,7 +13570,6 @@ function monoFlowReadsAll(lets: i32[]) {
     }
     if holds { again.push(d) }
   }
-  // arena-tick exempt: a side table of this pass, not the arena
   for h in hosts { mfrDirty[h] = false }
   monoFlowReadsRound(again)
   0
@@ -13616,7 +13600,6 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
         monoFlowTagPairs(pl, d, loops)
         monoFlowTagPairs(ps, d, spreads)
       } else {
-        // arena-tick exempt: a side table of this pass, not the arena
         for v in vals { mfrDirty[monoFlowLitRoot(v)] = true }
       }
     }
@@ -13633,9 +13616,7 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
       const da = mfrDirty[a] ?? false
       const db = mfrDirty[b] ?? false
       if da != db && !(db && (mfrTiedCopy[si] ?? false)) {
-        // arena-tick exempt: a side table of this pass, not the arena
         mfrDirty[a] = true
-        // arena-tick exempt: a side table of this pass, not the arena
         mfrDirty[b] = true
         spreadMoved = true
       }
@@ -14367,6 +14348,8 @@ function monoFlowElemAt(v: i32, k: i32): i32 {
   const ln = nodeAt(v)
   const kn = nodeAt(k)
   if !(ln is ArrayLit) || !(kn is NumLit) { return -1 }
+  // A holder of a tagged set's ids is read by its call's member arms, never resolved here.
+  if fnTagHoldsTy(nodeTyIxOf(v), 4) { return -1 }
   for e in ln.arrElems {
     if nodeAt(e) is Spread { return -1 }
   }
@@ -14380,6 +14363,7 @@ function monoFlowElemAt(v: i32, k: i32): i32 {
 function monoFlowFieldOf(v: i32, name: string): i32 {
   const on = nodeAt(v)
   if !(on is ObjLit) { return -1 }
+  if fnTagHoldsTy(nodeTyIxOf(v), 4) { return -1 }
   let out = -1
   for fi in on.objFields {
     const f = nodeAt(fi)
@@ -14466,7 +14450,6 @@ function monoFlowTie(a: i32, b: i32, copy: boolean) {
     if mfrTied[i] == a && mfrTied[i + 1] == b { return 0 }
     i = i + 2
   }
-  // arena-tick exempt: a side table of this pass, not the arena
   if copy { mfrTiedCopy[mfrTied.length] = true }
   mfrTied.push(a)
   mfrTied.push(b)
@@ -14774,7 +14757,6 @@ function monoFlowKeepIndex(x: i32): boolean {
     } else {
       startStmts.push(gk)
       startStmtOrd.push(ord)
-      monoArenaTouch()
     }
     mfrKeptTop.push(gk)
     return true
@@ -14800,7 +14782,6 @@ function monoFlowInsertAt(xs: i32[], at: i32, v: i32) {
     k = k - 1
   }
   xs[at] = v
-  monoArenaTouch()
 }
 
 // Rewrites read node `x` in place to a name read of generic `g`, where that name is in scope;
@@ -14824,7 +14805,6 @@ function monoFlowReadSet(x: i32, g: i32): boolean {
   const used = called || monoFlowHandedNarrowed(x)
   arenaSetNode(x, n)
   sidNoteNodeName(x, g)
-  monoArenaTouch()
   if used && !i32ListHas(mfrCalled, g) { mfrCalled.push(g) }
   if called { mfrSetCalls.push(mfrParentOf(x)) }
   monoFlowAliasCallsSet(x, g)
@@ -15031,7 +15011,6 @@ function monoFlowSpreadSet(sp: i32, v: i32): i32 {
             const nx = mkIdent(gnm, nodePos(sp))
             sidNoteNodeName(nx, g)
             nodeTyRecord(nx, nodeTyIxOf(x))
-            // arena-tick exempt: a side table of this pass, not the arena
             sidArrPut(mfrParent, nx, hx)
             out.push(nx)
           }
@@ -15042,7 +15021,6 @@ function monoFlowSpreadSet(sp: i32, v: i32): i32 {
     }
   }
   host.arrElems = out
-  monoArenaTouch()
   hx
 }
 
@@ -15209,7 +15187,6 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   const lt = mkArrayTy(ft)
   const fnm = monoSigFnTyNameAt(pins[0] + ";", fty)
   d.letType = synthTypeRefTy("(" + fnm + ")[]", -1, lt)
-  monoArenaTouch()
   nodeTyRecord(d.letInit, lt)
   for e in lit.arrElems {
     const et = nodeTyIxOf(e)
@@ -15290,7 +15267,6 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
   if bt >= 0 {
     const blt = mkArrayTy(bt)
     d.letType = synthTypeRefTy(monoPinAnnSpelling(blt), -1, blt)
-    monoArenaTouch()
     nodeTyRecord(d.letInit, blt)
     return 1
   }
@@ -15342,7 +15318,6 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
   const lt = mkArrayTy(it)
   const fnm = monoSigFnTyNameAt(pins[0] + ";", fty)
   d.letType = synthTypeRefTy("(" + fnm + ")[][]", -1, lt)
-  monoArenaTouch()
   nodeTyRecord(d.letInit, lt)
   for x in inner { nodeTyRecord(x, it) }
   for v in vals {
@@ -15365,7 +15340,6 @@ function monoUncalledNestedListElems(
   const it = mkArrayTy(ft)
   const lt = mkArrayTy(it)
   d.letType = synthTypeRefTy("(" + sp[0] + ")[][]", -1, lt)
-  monoArenaTouch()
   nodeTyRecord(d.letInit, lt)
   for x in inner { nodeTyRecord(x, it) }
   for vw in held {
@@ -15415,7 +15389,6 @@ function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
     nodeTyRecord(repoints[ri], nt)
     ri = ri + 2
   }
-  monoArenaTouch()
   monoRetypeMapReads(ctx, lf[1], nt, nv, "")
   0
 }
@@ -15513,7 +15486,6 @@ function monoUncalledListElems(
   if ft < 0 { return 0 }
   const lt = mkArrayTy(ft)
   d.letType = synthTypeRefTy("(" + sp[0] + ")[]", -1, lt)
-  monoArenaTouch()
   nodeTyRecord(d.letInit, lt)
   for e in lit.arrElems {
     if !monoTyClosedFn(nodeTyIxOf(e)) { nodeTyRecord(e, ft) }
@@ -15841,7 +15813,6 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
       }
     }
   }
-  monoArenaTouch()
   0
 }
 
@@ -15864,7 +15835,6 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
   monoLetWritesRecord(d, at, ctx)
   monoSupersededObjTys.push(nodeTyIxOf(d.letInit))
   nodeTyRecord(d.letInit, rt)
-  // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
   monoGradualObjList.push(d.letInit)
   // A `const` alias of the record, or of an alias, is the record (`const v = r`); an alias of a
   // nested record field is that record, at the field's path (`const v = w.f`).
@@ -15940,7 +15910,6 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
     }
     i = i + 1
   }
-  monoArenaTouch()
   0
 }
 
@@ -15953,7 +15922,7 @@ function monoPinReturnedObj(rx: i32, ctx: i32) {
   if lx < 0 || !(nodeAt(lx) is ObjLit) || monoFrameIsGenericInstance(ctx) {
     return 0
   }
-  if monoClosedObjLitTy(lx, ctx, true) >= 0 { monoArenaTouch() }
+  monoClosedObjLitTy(lx, ctx, true)
   0
 }
 
@@ -15992,7 +15961,6 @@ function monoPinCallRecord(d: LetDecl, at: i32, ctx: i32) {
     }
   }
   monoRetypeRecFieldReads(ctx, at, rt)
-  monoArenaTouch()
   0
 }
 
@@ -16026,7 +15994,6 @@ function monoPinInPlaceCallRecord(v: i32, ctx: i32) {
   if rt < 0 { return 0 }
   nodeTyRecord(x, rt)
   monoRetypeRecMemberReads(ctx, monoFrameNodes(ctx), x, rt, 0)
-  monoArenaTouch()
   0
 }
 
@@ -16069,9 +16036,7 @@ function monoRetRecordOf(fx: i32): i32 {
     if nm == "" { return -1 }
     buildFnMapNoteFnSlotWrite()
     fd.fnRet = synthTypeRefTy(nm, -1, rt)
-    // arena-tick exempt: a side table keyed by declaration, not an arena scan
     monoRetRepinned.set(fx, rt)
-    monoArenaTouch()
   }
   rt
 }
@@ -16191,7 +16156,6 @@ function monoClosedObjLitTy(lx: i32, ctx: i32, rec: boolean): i32 {
           nt = monoClosedReadTy(vx, ctx, rec)
         }
         if nt >= 0 {
-          // arena-tick exempt: a local copy of the field types; the caller touches after.
           tys[k] = nt
           any = true
         }
@@ -16203,7 +16167,6 @@ function monoClosedObjLitTy(lx: i32, ctx: i32, rec: boolean): i32 {
   if rec {
     monoSupersededObjTys.push(ot)
     nodeTyRecord(lx, rt)
-    // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
     monoGradualObjList.push(lx)
   }
   rt
@@ -16267,7 +16230,6 @@ function monoPinObjFields(
         )
         if nt == -2 { return -2 }
         if nt >= 0 {
-          // arena-tick exempt: a local copy of the field types; the record's write touches after.
           tys[k] = nt
           any = true
         }
@@ -16298,7 +16260,6 @@ function monoPinFieldValue(
     if nt < 0 { return nt }
     monoSupersededObjTys.push(nodeTyIxOf(vx))
     nodeTyRecord(vx, nt)
-    // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
     monoGradualObjList.push(vx)
     recs.push(path)
     recTys.push(nt)
@@ -16544,7 +16505,6 @@ function monoPinMapValues(d: LetDecl, at: i32, ctx: i32): i32 {
   if nt < 0 { return monoStoredSlotDecline(nt) }
   if !monoLetWritesAt(d, at, ctx, nt) { return 0 }
   d.letType = synthTypeRefTy(spell[0], -1, nt)
-  monoArenaTouch()
   0
 }
 
@@ -16763,7 +16723,6 @@ function monoPinMapSlot(
   }
   const nt = mkMapTy(mt.mKey, nv, 0)
   spell.push("{[" + monoPinAnnSpelling(mt.mKey) + "]:" + vs + "}")
-  monoArenaTouch()
   nodeTyRecord(mx, nt)
   monoRetypeMapReads(ctx, at, nt, nv, fld)
   nt
@@ -16892,7 +16851,6 @@ function monoPinStoredRecords(
       && monoTyOpen(nodeTyIxOf(sx))
     ) {
       monoSupersededObjTys.push(nodeTyIxOf(sx))
-      // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
       monoGradualObjList.push(sx)
     }
     monoRecordOpen(sx, nv, s[1])
@@ -17985,7 +17943,6 @@ function monoDeclPathPins(lf: i32[], path: string[]): string[] {
 function monoDeclLivePathPins(lf: i32[], path: string[]): string[] {
   const dead: {[i32]: boolean} = Map()
   for f in fnFlowDeclPathPinFns(lf[1], path) {
-    // arena-tick exempt: dead is this function's local table, not the arena
     if f >= 0 && f != lf[0] && monoWriteFrameDead(f, lf[0]) { dead[f] = true }
   }
   monoDeclPathKeys(lf, path, false, dead)
@@ -18715,10 +18672,7 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     // A `.map` whose lambda returns a function gives a list of that function's type (D9171).
     if m.memProp == "map" && monoTyOpen(nodeTyIxOf(ix)) {
       const lr = monoValueRetAt(a, [lt.aElem], 0)
-      if monoTyClosedFn(lr) {
-        nodeTyRecord(ix, mkArrayTy(lr))
-        monoArenaTouch()
-      }
+      if monoTyClosedFn(lr) { nodeTyRecord(ix, mkArrayTy(lr)) }
     }
     return 0
   }
@@ -18744,7 +18698,6 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   // A `.map` the checker left open, its element a hole function's, gives a list of that result.
   if m.memProp == "map" && monoTyOpen(nodeTyIxOf(ix)) {
     nodeTyRecord(ix, mkArrayTy(r))
-    monoArenaTouch()
   }
   // The choice's own type is what its closure value is built and called at.
   if choice && tyHasTyVar(nodeTyIxOf(ax)) {
@@ -18778,7 +18731,6 @@ function monoOpenFnListLitTy(recv: i32, ctx: i32): i32 {
   if !monoDeliverFnElemsAt(al.arrElems, ft, ctx) { return -2 }
   const lt = mkArrayTy(ft)
   nodeTyRecord(x, lt)
-  monoArenaTouch()
   lt
 }
 
@@ -19121,7 +19073,6 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     if fill < 0 { fill = monoSameReadArgTy(n.callArgs, rows, j) }
     if fill < 0 { return 0 }
     for pts in rows {
-      // arena-tick exempt: a local list of parameter types, not an arena row.
       if pts[j] < 0 { pts[j] = fill }
     }
     j = j + 1
@@ -19181,7 +19132,6 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
       )
     }
     if monoCoerceFnValueName(el, nm, ctx, ft) < 0 { return -1 }
-    // arena-tick exempt: read only by this check, never by the four rebuild passes.
     monoElemTakenSig[el] = nm
   }
   nodeTyRecord(n.callFn, ft)
@@ -20073,7 +20023,6 @@ function monoPreBindPastEmptyLit(
   while i < args.length && i < params.length {
     const tp = monoParamBareTyParam(params[i], typarams)
     if tp != "" && !seen.has(tp) {
-      // arena-tick exempt: a local dedupe map, not the arena.
       seen[tp] = 1
       if monoBindOf(tvN, tvV, tp) == "" && monoArgIsEmptyLit(args[i]) {
         monoBindFromLaterArg(
@@ -20277,10 +20226,8 @@ function monoPreBindPastUnionRest(
   if !any { return 0 }
   let a = 0
   while a < anns.length {
-    // arena-tick exempt: the call's own argument-name column, not an arena node.
     if anns[a] != "" && acts[a] == "" {
       acts[a] = monoPreBindArgName(args[a], ctx)
-      // arena-tick exempt: the call's own argument-type column, not an arena node.
       if acts[a] != "" { ats[a] = monoPreBindArgTy(args[a], ctx) }
     }
     a = a + 1
@@ -20311,7 +20258,6 @@ function monoPreBindPastUnionRest(
           sub != ""
           && !monoAtomsCover(canonEmitName(sub), canonEmitName(acts[k]))
         ) {
-          // arena-tick exempt: the call's own pin column, not an arena node.
           monoUnionRestPin[k] = acts[k]
         }
       }
@@ -20628,7 +20574,6 @@ function monoFnPinAt(
     monoRetypePinCalls(flowDecl, noPath)
     monoPinOpenCallLamsAt(flowDecl, bt)
   }
-  // arena-tick exempt: a caller-owned out-parameter, not the arena.
   tyOut[0] = bt
   const sk = sigKeyOfTy(bt)
   if sk != "" { return "=>" + sk }
@@ -20715,7 +20660,6 @@ function monoElabLamArg(
   let k = 0
   while k < c.callArgs.length && c.callArgs[k] != args[i] { k = k + 1 }
   if monoDeliverLamLit(args[i], ann, ctx, callIx) != 0 { return false }
-  // arena-tick exempt: a local copy of the slot monoHoleLamArgAgain replaced and touched
   if k < c.callArgs.length { args[i] = c.callArgs[k] }
   true
 }
@@ -20742,7 +20686,6 @@ function monoElabLitCopy(
       if nm == "" { return "" }
       c.callArgs[k] = cp
       args[i] = cp
-      monoArenaTouch()
       return nm
     }
   }
@@ -20805,9 +20748,7 @@ function monoElabDeliver(
   if go && !li {
     monoSupersededObjTys.push(xt)
     nodeTyRecord(x, t)
-    // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
     monoGradualObjList.push(x)
-    monoArenaTouch()
   }
   true
 }
@@ -21077,7 +21018,6 @@ function monoFieldCallArgTys(
           else if !tyEq(qs[a], at) { return false }
           a = a + 1
         }
-        // arena-tick exempt: a caller-owned counter, not the arena.
         seen[0] = seen[0] + 1
       }
     }
@@ -21561,7 +21501,6 @@ function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
     }
     j = j + 1
   }
-  // arena-tick exempt: the caller's out-parameter, not an arena row any pass reads.
   tyOut[0] = st
   nm
 }
@@ -21728,7 +21667,6 @@ function monoPinnedListElemPin(ax: i32, out: i32[]): string {
     ePath.push("e")
   }
   if !monoTyClosedFn(et) { return "" }
-  // arena-tick exempt: the caller's local out-parameter, never read by a rebuild pass.
   out[0] = et
   // A call the read reaches past its callee, `g(5)` after `const g = id(v[k])`, takes the pin (D9980).
   monoRetypePinCalls(d, ePath)
@@ -21785,7 +21723,6 @@ function monoOpenRowPinnedTy(dn: FuncDecl, i: i32, call: i32, arg: i32): i32 {
     )
     tys.push(o.objFieldTypes[k])
     if ft >= 0 {
-      // arena-tick exempt: a fresh local field list for mkObjTy, read by no pass.
       tys[k] = ft
       pinnedAny = true
     }
@@ -22226,7 +22163,9 @@ function monoPinHoleParam(
   // A tagged function set is handed on as itself: the instance calls each member directly.
   const setTy = monoArgTaggedSetTy(args[i])
   if setTy >= 0 {
-    pinned.push(tyToStr(setTy))
+    // A list of the set's ids is pinned by the i32 list it is stored as.
+    const rn = fnTagListRepName(setTy)
+    pinned.push(if rn != "" { rn } else { tyToStr(setTy) })
     pinTys.push(setTy)
     return 0
   }
@@ -22696,7 +22635,6 @@ function monoBindArenaFullTys(
   bindGenWalkFull(pt, at, rN, rT)
   let k = 0
   while k < rN.length {
-    // arena-tick exempt: `rT` is this call's own binding list, read by no rebuild pass.
     if rT[k] == TY_NEVER { rT[k] = TY_VOID }
     if strListHas(typarams, rN[k]) && monoBindOf(tvN, tvV, rN[k]) == "" {
       if !tyHasTyVar(rT[k]) {
@@ -22958,7 +22896,6 @@ function monoHandWrittenLet(
     if d is LetDecl { nm = d.letName }
     return monoBindSigFail(nm, lf[1])
   }
-  // arena-tick exempt: the pin each binding is first handed at, read only by the refusal above.
   monoWrittenLetHanded[key] = pre
   monoCoerceWrittenLetTys(
     at,
@@ -23204,7 +23141,8 @@ function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
   if an is FuncDecl {
     fe = fnStmtsPosOf(ax)
   } else if an is Ident {
-    fe = fnIndexOfInScopeAt(sidOfNode(ax), an.identName, ctx, ax)
+    fe = monoRenamedFeOf(ax, an.identName)
+    if fe < 0 { fe = fnIndexOfInScopeAt(sidOfNode(ax), an.identName, ctx, ax) }
   }
   if fe < 0 || fe >= fnStmts.length { return "" }
   if !exprIsClosure(argIx, ctx) { return "" }
@@ -23328,7 +23266,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
           // R4 writer 7 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
           if cal is Ident {
             cal.identName = monoInstName[r]
-            monoArenaTouch()
+            monoNoteRenamed(c.callFn, monoInstFe[r])
             sidNoteNodeName(c.callFn, fnStmts[monoInstFe[r]])
           }
           return 0
@@ -23388,7 +23326,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       // R4 writer 8 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
       if cal2 is Ident {
         cal2.identName = specName
-        monoArenaTouch()
+        monoNoteRenamed(c.callFn, instFe)
         sidNoteNodeName(c.callFn, fnStmts[instFe])
       }
       monoKeys.push(key)
@@ -23452,7 +23390,7 @@ function monoLamCallByName(calleeIx: i32, origFe: i32, instName: string) {
       return 0
     }
     cal.identName = instName
-    monoArenaTouch()
+    monoNoteRenamed(calleeIx, monoSlotOfDecl(monoFnDeclNamed(instName)))
     sidNoteNodeName(calleeIx, monoFnDeclNamed(instName))
   }
   0
@@ -23668,7 +23606,6 @@ function monoBodyDeclCopy(body: i32, e: i32): i32 {
   let row = monoBodyDeclRow[body] ?? -1
   if row < 0 {
     row = monoBodyDeclPos.length
-    // arena-tick exempt: this function's own index of the arena, read by no pass.
     monoBodyDeclRow[body] = row
     const pos: {[i32]: i32} = Map()
     const byOrig: {[i32]: i32} = Map()
@@ -23678,11 +23615,9 @@ function monoBodyDeclCopy(body: i32, e: i32): i32 {
       const cur = stack.pop() ?? -1
       if cur >= 0 && cur < P.nodes.length {
         if nodeAt(cur) is LetDecl {
-          // arena-tick exempt: a local index under construction.
           pos[cur] = n
           n = n + 1
           const o = declOrigOf(cur)
-          // arena-tick exempt: a local index under construction.
           if o >= 0 && (byOrig[o] ?? -1) < 0 { byOrig[o] = cur }
         }
         for k in nodeChildren(cur) { stack.push(k) }
@@ -23942,7 +23877,6 @@ function monoProgTopMark(top: i32[], root: i32, owner: i32): boolean {
     const cur = stack.pop() ?? -1
     const d = depths.pop() ?? 0
     if cur >= 0 && cur < top.length && top[cur] == -2 {
-      // arena-tick exempt: top is the caller's fresh table, not the arena
       top[cur] = owner
       if d > MONO_PROG_DEPTH { deep = true }
       let k = nodeChildrenPush(cur, stack)
@@ -24119,7 +24053,7 @@ function monoRespellLamFe(calleeIx: i32, ctx: i32): i32 {
   const name = monoSlotName(fe)
   if name == "" || name == cal.identName { return fe }
   cal.identName = name
-  monoArenaTouch()
+  monoNoteRenamed(calleeIx, fe)
   sidNoteNodeName(calleeIx, fnStmts[fe])
   fe
 }
@@ -24548,7 +24482,6 @@ function monoCloseListCbBindReads(n: LetDecl, at: i32, ctx: i32) {
       nodeTyRecord(ix, t)
     }
   }
-  monoArenaTouch()
   0
 }
 
@@ -24840,7 +24773,6 @@ function monoDeliverCallRets(at: i32, ann: string, fd: i32): i32 {
       at,
     )
   }
-  // arena-tick exempt: a side table keyed by declaration, not an arena scan
   monoRetDeliveredAt[fd] = at2
   for r in rets {
     if monoNoteBindDeliveryCall(r, ann, fd, -1) < 0 { return -1 }
@@ -25097,21 +25029,17 @@ function monoNamesUsedAsValue(names: string[], cmpCalls: boolean): i32[] {
     const cn = nodeAt(j)
     if cn is Call {
       const cf = cn.callFn
-      // arena-tick exempt: `isCallee` is a local declared in this function.
       if cf >= 0 && cf < isCallee.length { isCallee[cf] = 1 }
     }
     // A name write's value: the written-binding passes instance it or refuse it (D3939).
     if cn is BinExpr && cn.binOp == "=" && nodeAt(cn.binLeft) is Ident {
       const rv = unwrapParen(cn.binRight)
-      // arena-tick exempt: `isCallee` is a local declared in this function.
       if rv >= 0 && rv < isCallee.length { isCallee[rv] = 2 }
     }
     if cmpCalls && cn is BinExpr && (cn.binOp == "==" || cn.binOp == "!=") {
       const lo = unwrapParen(cn.binLeft)
       const ro = unwrapParen(cn.binRight)
-      // arena-tick exempt: `isCallee` is a local declared in this function.
       if lo >= 0 && lo < isCallee.length { isCallee[lo] = 1 }
-      // arena-tick exempt: `isCallee` is a local declared in this function.
       if ro >= 0 && ro < isCallee.length { isCallee[ro] = 1 }
     }
     j = j + 1
@@ -25130,7 +25058,6 @@ function monoNamesUsedAsValue(names: string[], cmpCalls: boolean): i32[] {
             // A template body no slot emits holds no use (D6930); built on the first such read.
             if mark == 1 && dead.length == 0 { dead = monoUnemittedNodes() }
             if mark == 1 && dead[k] == 1 { mark = hit[m] }
-            // arena-tick exempt: `hit` is this function's own out-parameter list.
             hit[m] = mark
           }
           m = m + 1
@@ -25148,7 +25075,6 @@ function monoNamesUsedAsValue(names: string[], cmpCalls: boolean): i32[] {
 function monoUnemittedNodes(): i32[] {
   const mark: i32[] = __array_new__(P.nodes.length, 0)
   const slots: {[i32]: i32} = Map()
-  // arena-tick exempt: `slots` is this function's own count, not the arena.
   for f in fnStmts { slots[f] = (slots[f] ?? 0) + 1 }
   const roots: i32[] = []
   let gc = 0
@@ -25166,14 +25092,12 @@ function monoUnemittedNodes(): i32[] {
     gc = gc + 1
   }
   if roots.length == 0 { return mark }
-  // arena-tick exempt: `mark` is this function's own table, not the arena.
   for o in roots { mark[o] = 3 }
   for o in roots { monoMarkReach(mark, o, 1) }
   for f in fnStmts { monoMarkReach(mark, f, 2) }
   for st in monoProgStmts { monoMarkReach(mark, st, 2) }
   let i = 0
   while i < mark.length {
-    // arena-tick exempt: `mark` is this function's own table, not the arena.
     if mark[i] == 3 { mark[i] = 1 }
     i = i + 1
   }
@@ -25189,7 +25113,6 @@ function monoMarkReach(mark: i32[], root: i32, v: i32) {
     const cur = stack.pop() ?? -1
     if cur >= 0 && cur < mark.length && (cur == root || mark[cur] < v) {
       if mark[cur] != 3 || cur == root {
-        // arena-tick exempt: `mark` is the caller's own table, not the arena.
         if mark[cur] != 3 { mark[cur] = v }
         const b = monoNestedBodyOf(cur)
         if b >= 0 { stack.push(b) }
@@ -25385,7 +25308,6 @@ function monoHoleLamArgAgain(
   const fe = monoLastInstFe
   if r < 0 || fe < 0 || fe >= fnStmts.length || fe == lfe { return -1 }
   c.callArgs[k] = fnStmts[fe]
-  monoArenaTouch()
   fnStmts[fe]
 }
 
@@ -25807,7 +25729,6 @@ function monoBindingsAtPin(nDecl: i32): i32 {
           const wf = monoTopFrameOf(i)
           const lf = monoReadLetFrame(nd.binLeft, wf)
           if lf[1] >= 0 && !(seen[lf[1]] ?? false) {
-            // arena-tick exempt: seen is this function's local table, not the arena
             seen[lf[1]] = true
             if monoBindingAtPin(lf, nDecl) < 0 { return -1 }
           }
@@ -26448,7 +26369,6 @@ function monoProgNamesIdent(nm: string): boolean {
       while ix < top.length {
         if top[ix] != -2 {
           const n = nodeAt(ix)
-          // arena-tick exempt: names is this function's fresh table, not the arena
           if n is Ident { names[n.identName] = true }
         }
         ix = ix + 1
@@ -26744,7 +26664,6 @@ function monoIsBuiltinCallback(lam: i32): boolean {
               (cf.memProp == "map" || cf.memProp == "filter")
               && n.callArgs.length == 1
             ) {
-              // arena-tick exempt: this module's own lookup table, not the arena.
               monoBuiltinCbLams[unwrapParen(n.callArgs[0])] = 1
               monoBuiltinCbRecv[unwrapParen(n.callArgs[0])] = cf.memObj
             }
@@ -27308,7 +27227,6 @@ function monoPruneTemplates(nDecl: i32) {
             mkBlock([], gfn.pos),
             gfn.pos,
           )
-          monoArenaTouch()
         }
       }
     }
@@ -27356,7 +27274,6 @@ function monoMemberPropNames(): {[string]: i32} {
     const ix = stack.pop() ?? -1
     if ix >= 0 && ix < P.nodes.length {
       const pn = monoMemberPropOf(ix)
-      // arena-tick exempt: `out` is this function's own result table, not the arena.
       if pn != "" { out[pn] = 1 }
       for k in nodeChildren(ix) { stack.push(k) }
     }

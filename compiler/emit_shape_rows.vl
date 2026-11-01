@@ -45,6 +45,7 @@ import {
   WhileStmt,
   arenaEpochNow,
   arenaRefWritesNow,
+  i32ToStr,
   nodeAt,
 } from "./ast"
 import { readNarrowedTyAt } from "./emit_capture_frames"
@@ -99,6 +100,7 @@ import {
   cUserTypesVer,
   litBaseTy,
   litUnionAliasNameOfTy,
+  litUnionInlineNameOfTy,
   mkArrayTy,
   mkFuncTy,
   mkMapTy,
@@ -369,6 +371,7 @@ import {
   rlSlotOfTy,
   sFieldElemKeyKindAt,
   sFieldIndex,
+  setSFieldElemRowTy,
   uFieldElemKeyKindAt,
   uFieldElemTyIxRow,
 } from "./emit_struct_order"
@@ -401,6 +404,7 @@ import {
   memoKeyNew,
   memoMoved,
   memoPassMoved,
+  tyRegNoteWrite,
   tyRegWrites,
   uFieldReLays,
 } from "./memo"
@@ -5842,4 +5846,77 @@ function uovSync() {
     uovUpTo = uovUpTo + 1
   }
   0
+}
+
+// ── a layout family's field storage ──────────────────────────────────────────
+// Records with one canonical shape (literals folded to their base) are one layout family: a
+// field the family stores at the string is stored there by every row of it, so a record with a
+// string-typed twin has one layout (D14752). `canon:field` to the field's literal set.
+let famRelay: {[string]: i32} = Map()
+
+// Forgets every family re-lay, with the struct table.
+export function famRelayReset() {
+  famRelay = Map()
+  0
+}
+
+// Records that the family of record type `recTy` stores field `name`, typed by literal set
+// `litTy`, at the string, and re-lays every struct row of the family minted so far.
+export function famRelayField(recTy: i32, name: string, litTy: i32) {
+  if recTy < 0 || litTy < 0 { return 0 }
+  famRelay[i32ToStr(repCanonId(recTy)) + ":" + name] = litTy
+  let si = 0
+  while si < sFieldStart.length && si < sFieldCount.length {
+    famRelayStructRow(si)
+    si = si + 1
+  }
+  0
+}
+
+// Re-lays struct row `si`'s fields at the string where its family stores them there.
+export function famRelayStructRow(si: i32) {
+  if famRelay.length == 0 { return 0 }
+  if si < 0 || si >= sTyIx.length || sTyIx[si] < 0 { return 0 }
+  if si >= sFieldStart.length || si >= sFieldCount.length { return 0 }
+  const c = i32ToStr(repCanonId(sTyIx[si])) + ":"
+  let fi = 0
+  while fi < sFieldCount[si] {
+    const sr = sFieldStart[si] + fi
+    const lty = famRelay.get(c + sFieldNames[sr])
+    if lty != null && sFieldTypes[sr] == FC_I32 {
+      sFieldTypes[sr] = FC_STR
+      sFieldElemName[sr] = litUnionInlineNameOfTy(lty)
+      tyRegNoteWrite()
+      setSFieldElemRowTy(sr, lty)
+    }
+    fi = fi + 1
+  }
+  0
+}
+
+// Whether the row record type `recTy` builds at stores field `name`, typed by a string literal
+// or literal set, as the literal-union atom: 1 the atom, 0 a string, -1 when no row or field
+// answers. `recTy` is a record, a declared struct or the union arm a value is built at, never
+// the union; a struct row answers before the arm's variant row, and a family agrees (D14752).
+export function rowFieldStoresAtom(recTy: i32, name: string): i32 {
+  if recTy < 0 || recTy >= T.tys.length || !(tyAt(recTy) is TyObj) { return -1 }
+  let si = repSlotOfTy(recTy)
+  if si < 0 { si = repRowOfTyStruct(recTy, sScanLim()) }
+  if si >= 0 && si < sFieldStart.length {
+    const fi = sFieldIndex(si, name)
+    if fi >= 0 { return fieldCodeStoresAtom(sFieldTypes[sFieldStart[si] + fi]) }
+  }
+  const vi = repVariantShapeRowOf(recTy)
+  if vi >= 0 && vi < uFieldStart.length {
+    const fj = variantFieldIndex(vi, name)
+    if fj >= 0 { return fieldCodeStoresAtom(uFieldTypes[uFieldStart[vi] + fj]) }
+  }
+  -1
+}
+
+// `rowFieldStoresAtom`'s answer for a literal field stored at code `c`.
+function fieldCodeStoresAtom(c: i32): i32 {
+  if c == FC_I32 { return 1 }
+  if c == FC_STR { return 0 }
+  -1
 }

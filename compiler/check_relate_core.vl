@@ -34,6 +34,7 @@ import {
   Ident,
   IfStmt,
   Index,
+  IsExpr,
   LetDecl,
   MatchExpr,
   Member,
@@ -1696,7 +1697,6 @@ function gradualUnionJoin(a: i32, b: i32): i32 {
   if tyMembersWithin(b, a) { return a }
   if tyMembersWithin(a, b) { return b }
   const tc = joinVariantTys(a, b)
-  // arena-tick exempt: a per-program mark on a fresh arena row.
   tpJoinUnions[tc] = 1
   tc
 }
@@ -1774,7 +1774,6 @@ export function joinTys(a: i32, b: i32) {
   const bVar = tyAt(b) is TyVar
   if (aVar || bVar) && (tyParamBesideBare(a, b) || tyParamBesideBare(b, a)) {
     const tc = joinVariantTys(a, b)
-    // arena-tick exempt: a per-program mark on a fresh arena row.
     tpJoinUnions[tc] = 1
     noteHoleTpJoin(tc)
     return tc
@@ -1785,7 +1784,6 @@ export function joinTys(a: i32, b: i32) {
     && (tyParamBesideDerived(a, b) || tyParamBesideDerived(b, a))
   ) {
     const td = joinVariantTys(a, b)
-    // arena-tick exempt: a per-program mark on a fresh arena row.
     tpJoinUnions[td] = 1
     noteHoleTpJoin(td)
     return td
@@ -1806,7 +1804,6 @@ export function joinTys(a: i32, b: i32) {
       if aVar && tyVarMemberOf(a, b) { return b }
       if bVar && tyVarMemberOf(b, a) { return a }
       const tv = joinVariantTys(a, b)
-      // arena-tick exempt: a per-program mark on a fresh arena row.
       tpJoinUnions[tv] = 1
       noteHoleTpJoin(tv)
       return tv
@@ -1821,7 +1818,6 @@ export function joinTys(a: i32, b: i32) {
     || tyParamArmAbsorbs(b, a)
   ) {
     const tj = joinVariantTys(a, b)
-    // arena-tick exempt: a per-program mark on a fresh arena row.
     tpJoinUnions[tj] = 1
     return tj
   }
@@ -1914,13 +1910,9 @@ function paramNullJoin(a: i32, b: i32): i32 {
   }
   if hasNull { kept.push(TY_NULL) }
   const res = mkUnionTy(kept)
-  if tyIsTpJoinUnion(a) || tyIsTpJoinUnion(b) {
-    // arena-tick exempt: a per-program mark on a fresh arena row.
-    tpJoinUnions[res] = 1
-  }
+  if tyIsTpJoinUnion(a) || tyIsTpJoinUnion(b) { tpJoinUnions[res] = 1 }
   if isJoinHoleUnion(a) || isJoinHoleUnion(b) { joinHoleUnions.push(res) }
   noteHoleTpJoin(res)
-  // arena-tick exempt: a per-program mark on a fresh arena row.
   paramNullJoins[res] = 1
   res
 }
@@ -6453,6 +6445,37 @@ export function genericDeclRetMisfit(
   r
 }
 
+// Whether `cond` is `p is T` over a hole parameter `p` of `f` (at `fIx`) whose binding in
+// `vNames`/`vTys` neither is `T` nor has a member of it, so its then-arm cannot run (D3109).
+function holeGuardDeadAt(
+  cond: i32,
+  f: FuncDecl,
+  fIx: i32,
+  vNames: string[],
+  vTys: i32[],
+): boolean {
+  const c = parenPeelIx(cond)
+  if c < 0 || c >= P.nodes.length { return false }
+  const ie = nodeAt(c)
+  if !(ie is IsExpr) { return false }
+  const ox = parenPeelIx(ie.isObj)
+  if ox < 0 || ox >= P.nodes.length { return false }
+  const o = nodeAt(ox)
+  if !(o is Ident) { return false }
+  let pi = 0
+  while pi < f.fnParams.length {
+    const p = nodeAt(f.fnParams[pi])
+    if p is Param && p.parName == o.identName && p.parType < 0 {
+      const pin = bindOf(vNames, vTys, paramHoleName(f.fnName, fIx, pi))
+      const alt = nameToTy(ie.isVariant)
+      if pin < 0 || alt < 0 || tyHasTyVar(pin) { return false }
+      return !assignable(pin, alt) && !pinHasMemberOf(pin, alt)
+    }
+    pi = pi + 1
+  }
+  false
+}
+
 // `holeRetTyOf` for any declared function or lambda, whatever its declared result. Values are
 // joined in source order, `return`s before the tail, so the union is spelled as the direct one.
 function bodyRetTyAt(calleeFn: i32, vNames: string[], vTys: i32[]): i32 {
@@ -6470,6 +6493,12 @@ function bodyRetTyAt(calleeFn: i32, vNames: string[], vTys: i32[]): i32 {
         if !holeRetLeaves(n.retArg, calleeFn, vNames, vTys, ts, lits) {
           return -1
         }
+      } else if (
+        n is IfStmt
+        && holeGuardDeadAt(n.ifCond, f, calleeFn, vNames, vTys)
+      ) {
+        // The then-arm is a branch these bindings cannot take, as its guarded return member is.
+        if n.ifElse >= 0 { todo.push(n.ifElse) }
       } else if !(n is FuncDecl) {
         const kids = nodeChildren(ix)
         let k = kids.length - 1
@@ -7947,7 +7976,6 @@ function substRejoinApart(
   }
   if holes > 0 && uniq.length > 1 {
     const r = mkUnionTy(uniq)
-    // arena-tick exempt: a per-program mark on a fresh arena row.
     tpJoinUnions[r] = tpJoinUnions.get(tyIx) ?? 1
     if recorded { carryRetJoin(r, key, vals) }
     return r
