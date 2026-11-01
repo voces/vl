@@ -5,7 +5,13 @@
 // is counted by class (`docs/internals/architecture-target-2026-10.md` §4, the pass rows).
 import { BinExpr, Block, Call, FuncDecl, nodeAt } from "./ast"
 import { T, TY_NEVER, TY_VOID, TyFunc, tyAt } from "./check_types"
-import { elabCheckedTyOf, elabKeyAtPos, elabRetOf } from "./emit_elab"
+import {
+  elabCheckedTyOf,
+  elabKeyAtPos,
+  elabRetOf,
+  elabSrcDecl,
+  elabSubstClosed,
+} from "./emit_elab"
 import { scopeTyAt } from "./emit_capture_frames"
 import {
   emitPhaseReached,
@@ -20,7 +26,7 @@ import {
 } from "./emit_state"
 import { i32ListHas } from "./listutil"
 import { identDeclOf } from "./symbols"
-import { tyHasTyVar } from "./tyquery"
+import { nonNullTy, tyHasTyVar } from "./tyquery"
 
 let frsArmed = false
 let frsNamed = false
@@ -43,9 +49,9 @@ export function fnRetShadowDropSet(d: i32) {
 }
 
 // The result type emitted function `fe` returns, as recorded: `void` for a pruned template's
-// stub, its instance's result when it owns an elaboration slot (its template's closed one when no
-// demand keyed it), its own type inside the instance that holds it, else its checker type. -1
-// where none is recorded or it is still open.
+// stub, its instance's result when it owns an elaboration slot, its own type inside the
+// instance that holds it, else its checker type; where that is open, its template's closed
+// result. -1 where none is recorded or it is still open.
 export function fnRecordedRetTy(fe: i32): i32 {
   if fe < 0 || fe >= fnStmts.length { return -1 }
   const fx = fnStmts[fe]
@@ -56,30 +62,42 @@ export function fnRecordedRetTy(fe: i32): i32 {
   if i32ListHas(monoStubSlots, fe) { return TY_VOID }
   const k = elabKeyAtPos(fe)
   const nested = fe < fnParent.length && fnParent[fe] >= 0
-  if k >= 0 && !nested { return elabRetOf(k) }
-  if k == 0 - 2 && !nested { return frsTemplateRet(fe) }
-  frsFnRet(if k >= 0 { scopeTyAt(fx, fx) } else { elabCheckedTyOf(fx) })
-}
-
-// For instance slot `fe` no demand keyed: its template's checker result, if that names no
-// type variable; else -1.
-function frsTemplateRet(fe: i32): i32 {
-  let i = 0
-  while i < monoInstFe.length {
-    if monoInstFe[i] == fe && i < monoInstOrig.length {
-      const o = monoInstOrig[i]
-      if o < 0 || o >= monoOrigNode.length { return -1 }
-      const r = frsFnRet(elabCheckedTyOf(monoOrigNode[o]))
-      if r < 0 || tyHasTyVar(r) { return -1 }
-      return r
-    }
-    i = i + 1
+  let r = -1
+  if k >= 0 && !nested {
+    r = elabRetOf(k)
+  } else {
+    r = frsFnRet(if k >= 0 { scopeTyAt(fx, fx) } else { elabCheckedTyOf(fx) })
   }
-  -1
+  if r >= 0 { return r }
+  frsTemplateRet(fe, nested, k)
 }
 
-// The result of the function type `ft`, or -1 where `ft` is no function type.
-function frsFnRet(ft: i32): i32 {
+// For emitted function `fe` whose own answer is open: the checker result of its template (the
+// generic an instance copies, or the source lambda of a lambda clone), closed by instance
+// `k`'s binding where it names a type variable; -1 where it stays open.
+function frsTemplateRet(fe: i32, nested: boolean, k: i32): i32 {
+  let t = -1
+  if !nested {
+    let i = 0
+    while i < monoInstFe.length && t < 0 {
+      if monoInstFe[i] == fe && i < monoInstOrig.length {
+        const o = monoInstOrig[i]
+        if o >= 0 && o < monoOrigNode.length { t = monoOrigNode[o] }
+      }
+      i = i + 1
+    }
+  }
+  if t < 0 { t = elabSrcDecl(fnStmts[fe]) }
+  const r = frsFnRet(elabCheckedTyOf(t))
+  if r < 0 { return -1 }
+  if !tyHasTyVar(r) { return r }
+  if k >= 0 { elabSubstClosed(r, k) } else { -1 }
+}
+
+// The result of the function type `ft0`, or of its function member where a delivery recorded it
+// nullable; -1 where it is no function type.
+function frsFnRet(ft0: i32): i32 {
+  const ft = nonNullTy(ft0)
   if ft < 0 || ft >= T.tys.length { return -1 }
   const f = tyAt(ft)
   if f is TyFunc { return f.fnRet }
