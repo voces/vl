@@ -48,7 +48,8 @@ import {
 import { intMatchHeadAt } from "./check_match_heads"
 import {
   condProvenTrue,
-  ctxIsFieldValue,
+  ctxFieldNameOf,
+  ctxFieldOwnerOf,
   mapUnboxTyOf,
   narListReadsDecl,
   nodeCtxTyIxOf,
@@ -1284,6 +1285,8 @@ import {
   rlSlotOfTyOrTwin,
   sFieldMapShape,
   sFieldRefSlot,
+  structRowFieldStoresAtom,
+  variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
 import {
   fieldCodeVKind,
@@ -36157,24 +36160,49 @@ function deliveredAsNulAtom(ix: i32, fnIx: i32): boolean {
 }
 
 // Whether string literal `ix` lowers as its atom: its closed contextual type at this instance
-// reps as one (D3423), and a literal delivered nowhere is a string. A field stored apart from its
-// type and an open record still decide by the delivery context.
+// reps as one (D3423), and a literal delivered nowhere is a string. A field no row answers for
+// and an open record still decide by the delivery context.
 function strLitTakesAtom(ix: i32, fnIx: i32, ctx: ExpCtx): boolean {
+  const fr = fieldRowStoresAtom(ix, fnIx)
+  if fr >= 0 { return fr == 1 }
+  if fr == -1 { return ctx.litUnion == 1 }
   const pr = nodeCtxTyIxOf(ix)
-  if !ctxFieldStorageAgrees(ix, pr) || (pr >= 0 && !elabTyClosed(pr, 0)) {
-    return ctx.litUnion == 1
-  }
+  if pr >= 0 && !elabTyClosed(pr, 0) { return ctx.litUnion == 1 }
   if pr < 0 { return false }
   tyRepsAsAtom(ctxTyAt(ix, fnIx))
 }
 
-// Whether a record field's storage agrees with `repOfTy` of `t`, node `ix`'s contextual type:
-// false for a field with no record, one typed by one string literal, which the row stores as
-// its set's atom (D14745), and one typed by a literal set, which a row beside its string base
-// can store as a string (D14752).
-function ctxFieldStorageAgrees(ix: i32, t: i32): boolean {
-  if !ctxIsFieldValue(ix) { return true }
-  t >= 0 && !(tyAt(t) is TyLit) && !tyRepsAsAtom(t)
+// Whether the row node `ix` is a field value of stores that field as the atom: 1 the atom,
+// 0 a string, -1 when no row answers, -2 when `ix` is no field value. The row is the owning
+// object literal's built arm or the member target's record (D14745, D14752).
+function fieldRowStoresAtom(ix: i32, fnIx: i32): i32 {
+  const o = ctxFieldOwnerOf(ix)
+  if o < 0 { return -2 }
+  fieldOwnerStoresAtom(o, fnIx, ctxFieldNameOf(ix))
+}
+
+// Whether the row field `name` of owner `ownerIx` is built at stores it as the literal-union
+// atom: an object literal's own row (the variant it is constructed at, else its struct), a field
+// write's receiver row. 1 the atom, 0 a string, -1 none.
+function fieldOwnerStoresAtom(ownerIx: i32, fnIx: i32, name: string): i32 {
+  const o = unwrapParen(ownerIx)
+  if o < 0 { return -1 }
+  const n = nodeAt(o)
+  match n {
+    ObjLit => {
+      const vi = objLitBuildVariantRow(o, fnIx)
+      if vi >= 0 { return variantRowFieldStoresAtom(vi, name) }
+      return structRowFieldStoresAtom(structIndexOfObjCtx(o, fnIx), name)
+    }
+    Member => {
+      const rv = exprVariantIndex(n.memObj, fnIx)
+      if rv >= 0 { return variantRowFieldStoresAtom(rv, name) }
+      return structRowFieldStoresAtom(structIndexOfExpr(n.memObj, fnIx), name)
+    }
+    // No other node owns a field value.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar | Unary | BinExpr | IfStmt | Index => {}
+  }
+  -1
 }
 
 // Whether list literal `ix` is delivered to a list whose element reps as the atom, by the same
@@ -36186,9 +36214,7 @@ function arrLitTakesAtom(ix: i32, fnIx: i32, ctx: ExpCtx): boolean {
     if h >= 0 { return tyElemRepsAsAtom(nodeTyAt(h, fnIx)) }
     return ctx.litUnion == 1
   }
-  if !ctxFieldStorageAgrees(ix, pr) || !elabTyClosed(pr, 0) {
-    return ctx.litUnion == 1
-  }
+  if !elabTyClosed(pr, 0) { return ctx.litUnion == 1 }
   tyElemRepsAsAtom(ctxTyAt(ix, fnIx))
 }
 
