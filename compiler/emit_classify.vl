@@ -1547,12 +1547,6 @@ function globalReadIsString(fnIx: i32, readIx: i32) {
   globalReadAsk(sidOfNode(readIx), li, 2)
 }
 
-function globalReadIsMap(fnIx: i32, readIx: i32) {
-  const li = globalLetOfRead(fnIx, readIx)
-  if li < 0 { return false }
-  letIsMap(li, -1)
-}
-
 // True if the function `name` returns a nullable struct (`"nulstruct"`).
 function fnRetNulRefSid(sid: i32, name: string, fnIx: i32, at: i32) {
   repOfNameResult(sid, name, fnIx, at).rdKind == "nulstruct"
@@ -12959,13 +12953,6 @@ function rsUp(x: i32): i32 {
 // a string list — a `(ref $mkListIdx)`. An index read `xs[i]` (a string) / `.length` (i32)
 // is not a list.
 
-// True if function `name` returns a string-keyed mono map (`{[string]: i32}`, annotated or
-// inferred — `"map"`). Lets `exprMap`/`mapShapeOfExpr` classify a call to it, so
-// `const r = mk()` (or `mk()[k]`) routes through the map lowering.
-function fnRetMapSid(sid: i32, name: string, fnIx: i32, at: i32) {
-  repOfNameResult(sid, name, fnIx, at).rdKind == "map"
-}
-
 // True if `exprIx` evaluates to a `string[]`: a projection of `exprListRep`.
 export function exprStringArray(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "strlist"
@@ -13582,13 +13569,6 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
   false
 }
 
-// A read whose recorded rep is a map cell, nullable or not: a narrowed read recovers non-null at
-// the read, and an un-narrowed one reaches only value positions that take the nullable ref.
-function readRepIsMapCell(exprIx: i32, fnIx: i32): boolean {
-  const rd = repOfNode(exprIx, fnIx)
-  rd.rdCovered == 1 && (rd.rdKind == "map" || rd.rdKind == "nulmap")
-}
-
 // True if evaluating the expression at `exprIx` yields a string-keyed map: the
 // `Map()` constructor call, a map param/local reference, or a parenthesized map
 // expression.
@@ -13596,127 +13576,28 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   // A union of maps delivered as one map reads as that map (`emitMapUnionPayload`).
   if mapDeliveryRecorded && mapUnboxTyOf(exprIx) >= 0 { return true }
+  // A read narrowed to a map arm unboxes to the map, while its rep is the box it is stored in.
   const e = nodeAt(exprIx)
-  match e {
-    Paren => {
-      return exprMap(e.parInner, fnIx)
-    }
-    IfStmt => {
-      // A value `if` whose join lowers at the map rep (D2663).
-      return ifExprRefKind(exprIx, fnIx) == "map"
-    }
-    BinExpr => {
-      // An assignment's value is its target cell, as `exprUnion` states it (D2602).
-      if e.binOp == "=" {
-        const mar = asgReadNode(exprIx, fnIx)
-        if mar != exprIx { return exprMap(mar, fnIx) }
-      }
-      // A nullable map with a map default is the non-null map (D3257).
-      if e.binOp.length == 2 && coalesceOfNulMapIsMap(e, exprIx, fnIx) {
-        return true
-      }
-      // `outer[k] ?? d` over a NESTED map (value kind 6) yields the inner Map ref — so a
-      // chained `(outer[k] ?? d)[j]` routes through the map lowering.
-      const cmm = coalesceMvSlot(exprIx, fnIx)
-      if cmm >= 0 {
-        // A NULLABLE inner-map value with a NULLABLE default yields `map | null` —
-        // `exprNullableMap` claims that; a non-null default coalesces to the non-null map.
-        if mvValIsMap(cmm) && !coalesceStaysNullable(exprIx, cmm, fnIx) {
-          return true
-        }
-      }
-    }
-    AsExpr => {
-      if asUnionMapTy(exprIx, fnIx, false) >= 0 { return true }
-    }
-    Call => {
-      if e.callFn < 0 { return false }
-      const callee = nodeAt(e.callFn)
-      // A `Set()` is a boolean-valued string map — the same struct — treated as a map
-      // throughout; a named function returning a map (`fnRetMap`) yields one too.
-      match callee {
-        Ident => {
-          if callee.identName == "Map" || callee.identName == "Set" {
-            return true
-          }
-          if (
-            fnRetMapSid(sidOfNode(e.callFn), callee.identName, fnIx, e.callFn)
-          ) {
-            return true
-          }
-        }
-        Member => {
-          // `scopes.pop()` over a map ref list (`{[string]:i32}[]`) yields a Map ref.
-          if callee.memProp == "pop" {
-            if exprRefArray(callee.memObj, fnIx) {
-              const slot = refListSlotOfExpr(callee.memObj, fnIx)
-              if slot >= 0 && slot < rlElemTyIx.length {
-                const pk = refListElemKind(callee.memObj, fnIx)
-                return pk == "map" || pk == "nulmap"
-              }
-            }
-          }
-        }
-        // Any other callee falls to the recorded-type fallback below.
-        NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-      }
-      // Fallback: a map-returning closure-value/factory call the syntactic cases miss — the map
-      // dual of `structIndexOfExpr`'s `nodeTyIsObj` fallback, off the checker's recorded type.
-      if nodeTyIsMap(exprIx) { return true }
-      return false
-    }
-    Ident => {
-      // A union binding narrowed to a map arm unboxes to the map struct ref, so it is a map in
-      // the narrowed branch — checked first, ahead of its declared type.
-      if identReadContainerAt(exprIx, fnIx) == RC_MAP { return true }
-      if paramMap(fnIx, exprIx) { return true }
-      const gmr = identReadsGlobal(exprIx)
-      if !gmr && declaredMap(exprIx) { return true }
-      if globalReadIsMap(fnIx, exprIx) { return true }
-      // A captured map variable of a lifted lambda: classify it exactly as a param/local
-      // receiver would, so it takes the map-arm boxing in a union-boxed result.
-      if capturedKindOf(fnIx, e.identName) == "map" { return true }
-      // Last, after every resolver that can speak sooner: the frame's own `let`, read from the
-      // arena rather than the declared-locals table, so a cross-frame question answers.
-      const fmm = frameLetOf(fnIx, exprIx)
-      if fmm >= 0 && letIsMap(fmm, fnIx) { return true }
-      return readRepIsMapCell(exprIx, fnIx)
-    }
-    Member => {
-      // A MAP-typed struct field read (`node.children`, code 19) yields a Map ref —
-      // map member/index ops on it route to the existing map lowering.
-      // A union-box field narrowed to a map arm unboxes to the map struct ref — the Ident
-      // arm's rule at the one receiver shape that never had it. D1014.
-      if placeReadContainerAt(exprIx, fnIx) == RC_MAP { return true }
-      if memFieldTypeCode(exprIx, fnIx) == FC_MAP { return true }
-      if readRepIsMapCell(exprIx, fnIx) { return true }
-    }
-    Index => {
-      // A union-box ELEMENT whose index PLACE is narrowed to a MAP arm (`if xs[0] is {[string]:
-      // K}`) — the index twin of the Member arm above (D1014).
-      if placeReadContainerAt(exprIx, fnIx) == RC_MAP { return true }
-      // `scopes[i]` over a map ref list yields a Map ref, per-slot; a bare `outer[k]` over a
-      // nested map likewise yields the inner Map.
-      if exprRefArray(e.idxArr, fnIx) {
-        const slot = refListSlotOfExpr(e.idxArr, fnIx)
-        // Bound-checked before the read: `refListSlotOfExpr` falls back to slot 0 for an
-        // un-interned element name, so an unguarded read is a compiler-internal OOB trap.
-        if slot >= 0 && slot < rlElemTyIx.length {
-          // A NULLABLE map element (`({[string]: V} | null)[]`) yields `map | null` —
-          // `exprNullableMap`'s element arm claims it, not this non-null arm.
-          return refListElemKind(e.idxArr, fnIx) == "map"
-        }
-      }
-      const mri = mapReadMvSlot(exprIx, fnIx)
-      if mri >= 0 {
-        // A bare read of a NULLABLE inner-map value stays `map | null` — `exprNullableMap`'s.
-        if mvValIsMap(mri) && !mvSlotNullable(mri) { return true }
-      }
-    }
-    // No other expression is a map by its own form.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+  if e is Ident {
+    if identReadContainerAt(exprIx, fnIx) == RC_MAP { return true }
+    // A lifted lambda's capture is read through its cell, which the read's rep does not name.
+    if capturedKindOf(fnIx, e.identName) == "map" { return true }
   }
-  false
+  if (
+    (e is Member || e is Index)
+    && placeReadContainerAt(exprIx, fnIx) == RC_MAP
+  ) {
+    return true
+  }
+  // A `Map()` or `Set()` call builds a map whatever union its destination is (D2649).
+  if e is Call && e.callFn >= 0 {
+    const cn = nodeAt(e.callFn)
+    if cn is Ident && (cn.identName == "Map" || cn.identName == "Set") {
+      return true
+    }
+  }
+  const rd = repOfNode(exprIx, fnIx)
+  rd.rdCovered == 1 && rd.rdKind == "map"
 }
 
 // True if the `LetDecl` at `letIx` declares a map-typed local: its annotation is a map
