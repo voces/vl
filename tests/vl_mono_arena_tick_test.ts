@@ -1,52 +1,28 @@
-// THE ARENA-TICK ENUMERATION, ENFORCED — every in-place write in `compiler/emit_mono.vl`
-// bumps the stamp, or says in one line why it does not.
+// THE FUNCTION-SLOT NOTES, ENFORCED — every in-place write in `compiler/emit_mono.vl` that
+// re-points a function slot or rewrites a field `buildFnMap` classifies tells `buildFnMap`.
 //
-// `monoArenaTouch` is inert: the stamp it fed is gone, since `monoRegisterInstance` measured
-// no different with it (#5255), and the next change deletes its sites with this first
-// discipline. Until then the rule below still holds every site in place.
-//
-// That soundness argument was an ENUMERATION — ten sites found by one grep on one day.
-// An enumeration is not a guard: the next in-place write lands with nothing to notice it,
-// and CLAUDE.md's stale-index history is a list of exactly that. This is the guard, and it
-// is the cheap half — it reads the source as text, runs no compiler, and costs milliseconds.
+// `buildFnMap` resumes on the `fnStmts` PREFIX while the monomorphizer runs (one call per
+// minted instance, `monoRegisterInstance`), and it reads `P.nodes[fnStmts[i]]`, `fnParent[i]`
+// and the `FuncDecl`'s own `fnRet`/`fnName`. So every in-place write to one of those must be
+// preceded, within `NOTE_WINDOW` lines, by `buildFnMapNoteFnSlotWrite()` (or, for a `fnStmts`
+// slot, `buildFnMapNoteFnStmtWrite(slot, node)`), or carry `// arena-tick exempt: <reason>`
+// on one of the two lines above it with a reason that is not empty.
 //
 // THE PATTERN, stated once so a reviewer can check it against the file. Comments are
 // stripped (quote-aware, so a `//` inside a string literal is not a comment); a line that
 // DECLARES a name (`const` / `let` / `export`) is skipped, because a declaration binds a
 // fresh name rather than writing through one; and what is left is a write whose left side
-// ends in a FIELD (`x.f = `) or an INDEX (`t[i] = `) — a write that lands in something the
-// line did not create. `=` is required not to be `==` / `!=` / `>=` / `<=`.
+// ends in a FIELD (`x.f = `) or an INDEX (`t[i] = `). `=` is required not to be `==` / `!=`
+// / `>=` / `<=`. The slot rule then reads only the writes `SLOT_WRITE` names.
 //
-// Each hit must then be EITHER followed within `TICK_WINDOW` lines by a `monoArenaTouch()`
-// call, OR carry `// arena-tick exempt: <reason>` on one of the two lines above it, with a
-// reason that is not empty. The window is a window and not an exact line because two real
-// sites tick after their loop or after a multi-line `mkFunc(` argument list.
-//
-// WHAT THIS DOES NOT CATCH, said plainly: a write that needs no tick and happens to sit
-// within the window of an unrelated one passes without an exemption line. That direction is
-// harmless — a spurious tick only costs a rebuild that would have been skipped. The
-// direction that matters, a real arena write with no bump anywhere near it, cannot pass.
-//
-// The scanner is validated against a CONTROL on every run (the second test below): a
-// synthetic write with no bump and no exemption must be reported, because a classifier that
-// silently matches nothing would report a clean file forever.
-//
-// THE SECOND DISCIPLINE, same file again. `buildFnMap` resumes on the `fnStmts` PREFIX while
-// the monomorphizer runs, and it reads: `P.nodes[fnStmts[i]]`, `fnParent[i]`
-// and the `FuncDecl`'s own `fnRet`/`fnName`. So every in-place write to one of those must be
-// preceded, within `NOTE_WINDOW` lines, by `buildFnMapNoteFnSlotWrite()` (or, for a `fnStmts`
-// slot, `buildFnMapNoteFnStmtWrite(slot, node)`) — or carry the exemption line. A `monoArenaTouch()` is NOT a substitute: it is inert.
+// Each scanner is validated against a CONTROL on every run: a synthetic untold write must be
+// reported, because a classifier that silently matches nothing would report a clean file forever.
 //
 // No assertion library, per CLAUDE.md: every failure is a `throw new Error` naming want and got.
 
 import { ROOT } from "./support/tree.ts";
 
 const SRC = `${ROOT}/compiler/emit_mono.vl`;
-
-// How far after a write a `monoArenaTouch()` may sit and still count as its bump. Two real
-// sites need room: `monoReparentNestedLams` ticks once after its loop (7 lines), and
-// `monoPruneGenerics` ticks after a 7-line `mkFunc(` argument list (8 lines).
-const TICK_WINDOW = 10;
 
 // How many lines above a write an `arena-tick exempt:` line may sit.
 const EXEMPT_WINDOW = 2;
@@ -91,7 +67,6 @@ type Hit = {
   /** 1-based, as an editor and a `grep -n` report it. */
   line: number;
   text: string;
-  ticked: boolean;
   /** The reason text after the marker, or null when no exemption line is present. */
   exempt: string | null;
   /** A `fnStmts`/`fnParent` slot write, and whether the `buildFnMap` note sits above it. */
@@ -104,7 +79,6 @@ const classify = (lines: string[]): Hit[] => {
   for (let i = 0; i < lines.length; i++) {
     const code = stripComment(lines[i]);
     if (DECL.test(code) || !WRITE.test(code)) continue;
-    const after = lines.slice(i + 1, i + 1 + TICK_WINDOW);
     const before = lines.slice(Math.max(0, i - EXEMPT_WINDOW), i);
     const mark = before.find((l) => l.includes(EXEMPT_MARK));
     const above = lines.slice(Math.max(0, i - NOTE_WINDOW), i);
@@ -115,14 +89,13 @@ const classify = (lines: string[]): Hit[] => {
       slotNoted: above.some((l) =>
         l.includes(SLOT_NOTE_CALL) || (FN_STMTS_SLOT.test(code) && l.includes(SLOT_ROW_NOTE_CALL))
       ),
-      ticked: after.some((l) => l.includes("monoArenaTouch()")),
       exempt: mark === undefined ? null : mark.slice(mark.indexOf(EXEMPT_MARK) + EXEMPT_MARK.length).trim(),
     });
   }
   return hits;
 };
 
-Deno.test("mono arena tick: every in-place write bumps the stamp or is named exempt", () => {
+Deno.test("mono arena tick: every function-slot write tells buildFnMap or is named exempt", () => {
   const hits = classify(Deno.readTextFileSync(SRC).split("\n"));
 
   // A classifier that matched nothing would pass this file silently forever. The floor is
@@ -132,18 +105,6 @@ Deno.test("mono arena tick: every in-place write bumps the stamp or is named exe
       `the in-place-write pattern found ${hits.length} site(s) in compiler/emit_mono.vl — ` +
         `want at least 8. Either the file lost most of its writes or the pattern in ` +
         `tests/vl_mono_arena_tick_test.ts stopped matching; check the pattern first.`,
-    );
-  }
-
-  const unguarded = hits.filter((h) => !h.ticked && h.exempt === null);
-  if (unguarded.length > 0) {
-    throw new Error(
-      `${unguarded.length} in-place write(s) in compiler/emit_mono.vl neither bump ` +
-        `monoArenaTick nor say why they need not:\n` +
-        unguarded.map((h) => `  emit_mono.vl:${h.line}  ${h.text}`).join("\n") +
-        `\n\nmonoArenaTouch() is inert and its sites go next; until then each in-place write ` +
-        `calls it within ${TICK_WINDOW} lines or says on the line above it: ` +
-        `"// ${EXEMPT_MARK} <why>".`,
     );
   }
 
@@ -164,61 +125,33 @@ Deno.test("mono arena tick: every in-place write bumps the stamp or is named exe
     throw new Error(
       `${mute.length} "${EXEMPT_MARK}" line(s) in compiler/emit_mono.vl carry no reason:\n` +
         mute.map((h) => `  emit_mono.vl:${h.line}  ${h.text}`).join("\n") +
-        `\n\nThe marker is not a mute button — it is the claim that the four passes cannot ` +
+        `\n\nThe marker is not a mute button — it is the claim that buildFnMap cannot ` +
         `see this write, and the next reader has to be able to check it.`,
     );
   }
 });
 
-Deno.test("mono arena tick: the scanner reports a write with no bump (control)", () => {
-  // Never trust a probe until a control you KNOW should trigger it does (CLAUDE.md). Three
-  // shapes, one of each classification, so the control fails if the pattern stops matching
-  // OR if either exit — the bump, the exemption — stops being read.
-  const pad = Array.from({ length: TICK_WINDOW + 1 }, () => "  k = k + 1");
-  const control = [
-    "function f(a: i32) {",
-    "  const nd = P.nodes[a]",
-    "  nd.identName = \"x\"", // 3 — unguarded: the nearest bump is past the window
-    ...pad,
-    "  fnStmts[a] = nd", //      guarded by the bump on the next line
-    "  monoArenaTouch()",
-    "  // arena-tick exempt: a local, not the arena.",
-    "  scratch[a] = -1", //      guarded by the exemption above
-    "  0",
-    "}",
-  ];
-  const hits = classify(control);
-  const got = hits.map((h) => `${h.line}:${h.ticked ? "tick" : h.exempt !== null ? "exempt" : "UNGUARDED"}`);
-  const want = ["3:UNGUARDED", `${4 + pad.length}:tick`, `${7 + pad.length}:exempt`];
-  if (got.join(" ") !== want.join(" ")) {
-    throw new Error(
-      `the scanner mis-read its own control — want [${want.join(", ")}], got [${got.join(", ")}]. ` +
-        `A classifier that cannot see an unguarded write cannot guard emit_mono.vl either.`,
-    );
-  }
-});
-
 Deno.test("mono arena tick: the scanner reports a slot write that does not tell buildFnMap (control)", () => {
-  // The slot rule's own control, both exits exercised, for the reason the other two have one.
+  // The slot rule's own control, both exits exercised, for the reason every scanner here has one.
   const control = [
     "  fnStmts[tSlot] = clone", //                 1 — re-points, unnoted
-    "  monoArenaTouch()",
+    "  k = k + 1",
     "  buildFnMapNoteFnSlotWrite()",
     "  fnParent[msl] = instFe", //                 4 — re-points, noted
-    "  monoArenaTouch()",
+    "  k = k + 1",
     "  cal.identName = specName", //               6 — a rename, so the slot rule ignores it
-    "  monoArenaTouch()",
+    "  k = k + 1",
     "  fn.fnRet = synthTypeRef(nm, -1)", //         8 — a classified field, and a bump is not a note
-    "  monoArenaTouch()",
+    "  k = k + 1",
     "  buildFnMapNoteFnStmtWrite(origFe, nfn)",
     "  fnStmts[origFe] = nfn", //                  11 — the row note covers a `fnStmts` slot
-    "  monoArenaTouch()",
+    "  k = k + 1",
     "  buildFnMapNoteFnStmtWrite(origFe, nfn)",
     "  fnParent[origFe] = instFe", //              14 — but not a `fnParent` write
-    "  monoArenaTouch()",
+    "  k = k + 1",
     "  buildFnMapNoteFnStmtWrite(origFe, nfn)",
     "  fn.fnName = nm", //                          17 — nor a `.fnName` write
-    "  monoArenaTouch()",
+    "  k = k + 1",
   ];
   const got = classify(control).map((h) =>
     `${h.line}:${h.repoints ? (h.slotNoted ? "noted" : "UNNOTED") : "n/a"}`
