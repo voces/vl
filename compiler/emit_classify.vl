@@ -800,7 +800,6 @@ import {
   sLitMintFn,
   sLitMintRow,
   sNames,
-  sRowDecl,
   sTyIx,
   scopeSlotOf,
   uDeclared,
@@ -4345,28 +4344,7 @@ export function structIndexOfObjCtx(objIx: i32, fnIx: i32) {
   const own = structIndexOfObjCtxMemo(objIx, fnIx)
   const dst = objLitBindDestRow(objIx, own)
   if dst >= 0 { return dst }
-  const fdst = objLitFieldDestRow(objIx, own, fnIx)
-  if fdst >= 0 { return fdst }
   own
-}
-
-// The row of the record field the object literal at `objIx` is the value of, where the literal
-// holding it is built at another row than its own; else -1 to keep `own`.
-function objLitFieldDestRow(objIx: i32, own: i32, fnIx: i32): i32 {
-  if own < 0 || !rsIxReady() { return -1 }
-  const fi = rsUp(objIx)
-  if fi < 0 || fi >= P.nodes.length { return -1 }
-  const f = nodeAt(fi)
-  if !(f is FieldInit) { return -1 }
-  const pi = rsUp(fi)
-  if pi < 0 || pi >= P.nodes.length || !(nodeAt(pi) is ObjLit) { return -1 }
-  const pr = structIndexOfObjCtx(pi, fnIx)
-  if pr < 0 || pr == structIndexOfObjCtxMemo(pi, fnIx) { return -1 }
-  const k = sFieldIndex(pr, f.fiName)
-  if k < 0 || sFieldTypeAt(pr, k) != FC_STRUCT { return -1 }
-  const t = sFieldTgtStructIdx(pr, k)
-  if t < 0 || rsSameRow(t, own) { return -1 }
-  t
 }
 
 function structIndexOfObjCtxMemo(objIx: i32, fnIx: i32) {
@@ -4405,8 +4383,6 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     if nf == 0 {
       const er = repRowOfTyStruct(nodeRepTyAt(objIx, fnIx), sScanLim())
       if er >= 0 { return er }
-      const fr = structRowOfObjFieldSet(nodeTyIxOf(objIx))
-      if fr >= 0 { return fr }
     }
     // A literal is built at the row of the record the checker stored it as: its own field types
     // would name a different row, or several (D2437).
@@ -4425,14 +4401,6 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
       if nt >= 0 && !tyHasTyVar(nt) && !tyHasInferHole(nt, 0) {
         const nr = repRowOfTyStruct(nt, sScanLim())
         if nr >= 0 { return nr }
-      } else {
-        // A stamp naming the hole of the parameter it is handed to leaves the literal its own
-        // record type, which that parameter's instance stores it as (D2762).
-        const ot = nodeTyIxOf(objIx)
-        if ot >= 0 && !tyHasTyVar(ot) && !tyHasInferHole(ot, 0) {
-          const orr = repRowOfTyStruct(ot, sScanLim())
-          if orr >= 0 { return orr }
-        }
       }
     }
     // Else the anonymous row the mint made for this literal, in this instance or in none.
@@ -7802,13 +7770,6 @@ export function anonFieldElemName(valIx: i32, code: i32) {
   const nvt = nodeTyIxOf(valIx)
   if nvt < 0 { return "" }
   if nodeTyIsObj(valIx) {
-    // A declared record's row is read off its arena type, since its spelling can be
-    // exponential in its depth (D2780). An anonymous one keeps the spelling-first order.
-    const ri = structIndexOfTy(nvt)
-    if ri >= 0 && ri < sRowDecl.length && sRowDecl[ri] == 1 {
-      const dr = structRowOfObjFieldSet(nvt)
-      if dr >= 0 { return sNames[dr] }
-    }
     // A deep anonymous one is read off its structural id before any spelling, which a shared
     // sub-record doubles per level (D9930).
     if tyDeeperThan(nvt, 8) {
@@ -9765,16 +9726,10 @@ function fnDeclRetRecNodeAt(sid: i32, name: string, fnIx: i32, at: i32): i32 {
   fd.fnRet
 }
 
-// The row of return annotation `drn`'s own record type: its rep's row, else a field-set match
-// whose row type is that type. -1 when neither; a row only sharing the field names is not it.
+// The row of return annotation `drn`'s own record type, its rep's row; -1 when it has none.
 function fnDeclRetOwnRow(drn: i32): i32 {
   if drn < 0 { return -1 }
-  const cr = repRowOfTyStruct(nodeRepTyIxOf(drn), sScanLim())
-  if cr >= 0 { return cr }
-  const fr = structRowOfObjFieldSet(nodeTyIxOf(drn))
-  if fr < 0 || fr >= sTyIx.length { return -1 }
-  if tySame(sTyIx[fr], nodeTyIxOf(drn)) { return fr }
-  -1
+  repRowOfTyStruct(nodeRepTyIxOf(drn), sScanLim())
 }
 
 // The struct row a call `e` returns: a named or closure callee's return row, a field or
@@ -9819,10 +9774,6 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
     const ci = calleeReturnsStructIdxOfRead(e.callFn, fnIx)
     if ci >= 0 { return ci }
     if dr >= 0 { return dr }
-    if drn >= 0 {
-      const fr = structRowOfObjFieldSet(nodeTyIxOf(drn))
-      if fr >= 0 { return fr }
-    }
   }
   // A field-closure call (`(a."[]")(i)` — a chained index trap whose "[]"
   // returns another trap object) yields the field function's return struct.
@@ -9847,8 +9798,8 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
   // call. Resolves the struct from the checker's per-node type, gated on the cheap
   // `nodeTyIsObj`. Off the hot path — struct receivers resolve syntactically above.
   if nodeTyIsObj(exprIx) {
-    // The Index arm's ordering, exactly: exact spelling, then the arena row, then the
-    // lenient field-set scan — `structIndexByName` runs ahead of the arena rung on purpose,
+    // The Index arm's ordering, exactly: exact spelling, then the arena row —
+    // `structIndexByName` runs ahead of the arena rung on purpose,
     // since an inline shape interned under its render can differ from the arena's smallest
     // row sharing the canon key; arena-first would silently flip a struct `==` into false.
     const snc = nodeTyCanonObjName(exprIx)
@@ -9863,16 +9814,7 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
     }
     const cr = repRowOfTyStruct(nodeRepTyAt(exprIx, fnIx), sScanLim())
     if cr >= 0 { return cr }
-    // The field-set rung on the canon render is gone: `structRowOfObjFieldSet` below already
-    // asks the same question of the type. `canonTyIxOf` can be -1 at this node while
-    // `nodeTyIxOf`/`nodeRepTyIxOf` hold it; `snc` stays since `structIndexByName(snc)` is a
-    // lookup of a declared name — nominal identity the arena cannot recover.
-    const fsx = structRowOfObjFieldSet(nodeTyIxOf(exprIx))
-    if fsx >= 0 { return fsx }
-    // The render-based rung here is gone: the question it asked — the type's spelling's
-    // field set against the table — is what the rung above now asks of the type directly.
-    // Its `-1` return is load-bearing, short-circuiting the nullable-struct rung below, so
-    // the fallback stays and only the render lookup is retired (`anonTySpellable`).
+    // A spellable record with no row answers -1, short-circuiting the nullable-struct rung below.
     if anonTySpellable(nodeTyIxOf(exprIx)) { return -1 }
   }
   // The nullable-struct dual: a `S | null`-returning closure value call resolves to its
