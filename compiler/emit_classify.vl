@@ -9242,53 +9242,11 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     // or a closure-valued field. Missing the latter two, a lambda binding or field closure
     // answers -1 — the whole kind decision here — so the value falls to the struct table.
     Call => {
-      if e.callFn < 0 { return -1 }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        const cvsid = sidOfNode(e.callFn)
-        const cvname = callee.identName
-        // A DECLARED function keeps its own richer resolution (the `: Cat` annotation, then
-        // the inferred `fRetKind`/`fRetStructIdx` pair) — unchanged, and asked first so no
-        // named-callee answer moves.
-        if fnIndexOfInScopeAt(cvsid, cvname, fnIx, e.callFn) >= 0 {
-          return fnRetVariantIndexSid(cvsid, cvname, fnIx, e.callFn)
-        }
-        // A closure-value callee (`const f = (x: Circle) => x; f(c)`, `const f = idc; f(c)`,
-        // a closure param `f(c)`), which `fnIndexOfSid` misses by construction. The resolved
-        // `$fnsig` key is the same key `emitCallRef` casts the call through, so the slot this
-        // reads and the functype the call site emits come from one fact.
-        const cvk = calleeCloSigKeyOfRead(e.callFn, fnIx)
-        if sigKeyRetKind(cvk) == "variant" { return sigKeyRetSlot(cvk) }
-        return -1
-      }
-      // A closure-valued FIELD callee (`holder.go(c)`) — the twin's third rung, same gate.
-      if callee is Member {
-        const cvfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if cvfe >= 0 {
-          if cloRetValKind(cvfe) == "variant" { return cloRetValSlot(cvfe) }
-        }
-        return -1
-      }
-      return -1
+      return callVariantIndex(e, exprIx, fnIx)
     }
     // An index into a `Cat[]` variant-element ref list yields the bare variant struct.
     Index => {
-      if exprRefArray(e.idxArr, fnIx) {
-        const ren = refListElemNameOfExpr(e.idxArr, fnIx)
-        // A plain-struct element list whose element shape also matches a value-union's struct
-        // member must not read through that union's variant heap: the array physically holds
-        // the plain struct's own heap, a distinct type from the box member. Only a genuine
-        // concrete-variant element list resolves through the variant heap here.
-        if structIndexOfTypeNameTy(ren, nodeTyAt(exprIx, fnIx)) < 0 {
-          return variantIndexOf(ren)
-        }
-      }
-      // A bare `m[k]` over an arm-valued map yields the bare variant struct — the map rung
-      // this ladder lacked while `structIndexOfExpr`'s own `Index` arm carries its struct twin
-      // (D34). Same slot, same kind gate, the other column; the two cannot both answer for one
-      // binding.
-      const ivs = mapReadMvSlot(exprIx, fnIx)
-      if ivs >= 0 { return mvValVariantOf(ivs) }
+      return indexVariantIndex(e, exprIx, fnIx)
     }
     // A `m[k] ?? d` over an arm-valued map — the BinExpr dual of the Index rung above, and
     // the same pairing: `structIndexOfExpr`'s `??` arm already reads `mvValStructIdx` off
@@ -9325,6 +9283,100 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     // No other expression names a union variant by its own form.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
+  -1
+}
+
+// The variant row call `e` (at `rx`) yields a concrete variant ref of, by its callee's form: a
+// declared function's resolution, a closure value's `$fnsig`, or a closure-valued field's.
+function callVariantIndex(e: Call, rx: i32, fnIx: i32): i32 {
+  if e.callFn < 0 { return -1 }
+  const callee = nodeAt(e.callFn)
+  if callee is Ident {
+    const cvsid = sidOfNode(e.callFn)
+    const cvname = callee.identName
+    // A DECLARED function keeps its own richer resolution (the `: Cat` annotation, then
+    // the inferred `fRetKind`/`fRetStructIdx` pair) — unchanged, and asked first so no
+    // named-callee answer moves.
+    if fnIndexOfInScopeAt(cvsid, cvname, fnIx, e.callFn) >= 0 {
+      return fnRetVariantIndexSid(cvsid, cvname, fnIx, e.callFn)
+    }
+    // A closure-value callee (`const f = (x: Circle) => x; f(c)`, `const f = idc; f(c)`,
+    // a closure param `f(c)`), which `fnIndexOfSid` misses by construction. The resolved
+    // `$fnsig` key is the same key `emitCallRef` casts the call through, so the slot this
+    // reads and the functype the call site emits come from one fact.
+    const cvk = calleeCloSigKeyOfRead(e.callFn, fnIx)
+    if sigKeyRetKind(cvk) == "variant" { return sigKeyRetSlot(cvk) }
+    return -1
+  }
+  // A closure-valued FIELD callee (`holder.go(c)`) — the twin's third rung, same gate.
+  if callee is Member {
+    const cvfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+    if cvfe >= 0 {
+      if cloRetValKind(cvfe) == "variant" { return cloRetValSlot(cvfe) }
+    }
+    return -1
+  }
+  -1
+}
+
+// The variant row call `rx` hands back, from its callee's lowered result once return kinds are
+// final: the named function's lowered kind and its closed recorded result's row, else a function
+// value's `$fnsig` result token. -1 for no variant; -2 where the column has no answer (before
+// `capsCached`, a method, a generic function value), which leaves the call to `callVariantIndex`.
+function readCallVariantRow(e: Call, rx: i32, fnIx: i32): i32 {
+  if !emitPhaseReached("capsCached") { return -2 }
+  const fe = callNamedFe(e, fnIx)
+  if fe >= 0 {
+    if fnLoweredKind(fe) != "variant" { return -1 }
+    if fe < fRecRetTy.length {
+      const r = fRecRetTy[fe]
+      if r >= 0 && r < T.tys.length && !tyHasTyVar(r) && !tyHasInferHole(r, 0) {
+        const row = repVariantShapeRowOf(r)
+        if row >= 0 { return row }
+      }
+    }
+    return if fe < fRetStructIdx.length { fRetStructIdx[fe] } else { -1 }
+  }
+  const k = callLoweredKind(e, rx, fnIx)
+  if k == null { return -2 }
+  if k != "variant" { return -1 }
+  sigKeyRetSlot(cloCallSigKey(rx, fnIx))
+}
+
+// The variant row index read `rx` yields, from its cell's store: a list element whose type at
+// this instance reps as a variant, or an arm-valued map's value. -1 for no variant; -2 where the
+// column has no answer (before `capsCached`), which leaves the read to the old arm.
+function readIndexVariantRow(e: Index, rx: i32, fnIx: i32): i32 {
+  if !emitPhaseReached("capsCached") { return -2 }
+  const et = tyArrayElemIx(nodeTyInOf(e.idxArr, fnIx))
+  if et >= 0 {
+    if repSigKindOfTy(et) != "variant" { return -1 }
+    return repVariantShapeRowOf(et)
+  }
+  const ivs = mapReadMvSlot(rx, fnIx)
+  if ivs >= 0 { return mvValVariantOf(ivs) }
+  -1
+}
+
+// The variant row index read `e` (at `exprIx`) yields by the name its list's element is stored
+// under, or an arm-valued map's value slot; -1 for neither.
+function indexVariantIndex(e: Index, exprIx: i32, fnIx: i32): i32 {
+  if exprRefArray(e.idxArr, fnIx) {
+    const ren = refListElemNameOfExpr(e.idxArr, fnIx)
+    // A plain-struct element list whose element shape also matches a value-union's struct
+    // member must not read through that union's variant heap: the array physically holds
+    // the plain struct's own heap, a distinct type from the box member. Only a genuine
+    // concrete-variant element list resolves through the variant heap here.
+    if structIndexOfTypeNameTy(ren, nodeTyAt(exprIx, fnIx)) < 0 {
+      return variantIndexOf(ren)
+    }
+  }
+  // A bare `m[k]` over an arm-valued map yields the bare variant struct — the map rung
+  // this ladder lacked while `structIndexOfExpr`'s own `Index` arm carries its struct twin
+  // (D34). Same slot, same kind gate, the other column; the two cannot both answer for one
+  // binding.
+  const ivs = mapReadMvSlot(exprIx, fnIx)
+  if ivs >= 0 { return mvValVariantOf(ivs) }
   -1
 }
 
