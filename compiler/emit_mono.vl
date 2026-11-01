@@ -593,6 +593,7 @@ import {
   ekTys,
   elabAliasNote,
   elabBodyDeclNote,
+  elabCallBundleSigs,
   elabCallInstWant,
   elabCallParamTy,
   elabDemand,
@@ -22487,6 +22488,99 @@ function monoTwoListArgFail(
   0
 }
 
+// The signatures bundle row `si` holds, field `c<k>` the `k`th; none for any other row.
+export function monoBundleSigsOfRow(si: i32): i32[] {
+  monoBundleRows.get(si) ?? []
+}
+
+// The bundle field the call through a bundle of `sigs` at argument types `argTys` reads: the
+// first signature taking those types, or -1 for none.
+export function monoBundleFieldOf(sigs: i32[], argTys: i32[]): i32 {
+  let k = 0
+  while k < sigs.length {
+    const f = tyAt(sigs[k])
+    if f is TyFunc {
+      if f.fnParamTypes.length == argTys.length {
+        let ok = true
+        let j = 0
+        while j < argTys.length {
+          if !tySame(widenLitTy(argTys[j]), f.fnParamTypes[j]) { ok = false }
+          j = j + 1
+        }
+        if ok { return k }
+      }
+    }
+    k = k + 1
+  }
+  -1
+}
+
+// The slot built for bundle field `k` of `sigs` from the lambda literal `x` read in function
+// `fnIx`, as the row records it; -1 where none was built.
+export function monoBundleFe(x: i32, fnIx: i32, sigs: i32[], k: i32): i32 {
+  if k < 0 || k >= sigs.length { return -1 }
+  monoCadRowFe(elabSrcDecl(unwrapParen(x)), monoCadInstOf(fnIx), sigs[k])
+}
+
+// The slot the row answers for (`site`, `inst`, `sig`), or -1.
+function monoCadRowFe(site: i32, inst: i32, sig: i32): i32 {
+  const rows = cadBySite.get(site) ?? []
+  for r in rows {
+    if cadInst[r] == inst && monoCadSigSame(cadSig[r], sig) { return cadFe[r] }
+  }
+  -1
+}
+
+// `monoPinHoleParam`'s bundle: where the callee's instance calls the hole lambda literal `arg`,
+// its argument `i`, at two or more signatures, builds the lambda at each and pins the parameter
+// at the anonymous record holding one closure per signature. 0, -1 on a failure, or 1 where the
+// argument is no bundle.
+function monoBundlePin(
+  arg: i32,
+  i: i32,
+  callIx: i32,
+  ctx: i32,
+  pinned: string[],
+  pinTys: i32[],
+): i32 {
+  const sigs = elabCallBundleSigs(monoCallTplOf(callIx), i)
+  if sigs.length < 2 { return 1 }
+  const x = unwrapParen(arg)
+  if x < 0 || !(nodeAt(x) is FuncDecl) { return 1 }
+  const lfe = monoLamValueFe(x, ctx)
+  if (
+    lfe < 0
+    || lfe >= monoGen.length
+    || monoGen[lfe] != 1
+    || !monoLamIsHole(lfe)
+  ) {
+    return 1
+  }
+  const names: string[] = []
+  for s in sigs {
+    const f = tyAt(s)
+    if !(f is TyFunc) { return 1 }
+    const pn: string[] = []
+    for pt in f.fnParamTypes { pn.push(monoPinOfClosedTy(pt)) }
+    if monoInstanceFor(lfe, pn, x, s, f.fnParamTypes) < 0 { return -1 }
+    names.push("c" + i32ToStr(names.length))
+  }
+  const bt = mkObjTy(names, sigs)
+  monoClosedRecordOwnRow(bt)
+  const si = structRowRecordingTy(bt)
+  const row = if si >= 0 { si } else { repRowOfTyStruct(bt, sScanLim()) }
+  if row < 0 || row >= sNames.length {
+    return emitFailAt(
+      "emitProgram: monomorphize: a lambda called at two signatures has no row for its closures",
+      x,
+    )
+  }
+  monoBundleRows[row] = sigs
+  pinned.push(sNames[row])
+  pinTys.push(bt)
+  0
+}
+
 // Pins un-annotated `p`, `fn`'s `i`th parameter, into `pinned`/`pinTys`: -1 on a refusal, else 0.
 function monoPinHoleParam(
   p: Param,
@@ -22502,6 +22596,9 @@ function monoPinHoleParam(
   // A parameter the checker already decided is not a hole: the instance pins it at the
   // elaboration's type for it, or its own where the function binds nothing; "" keeps the
   // argument-derived pin.
+  // A lambda the callee calls at two or more signatures is handed as a bundle (D14841).
+  const bun = monoBundlePin(args[i], i, callIx, ctx, pinned, pinTys)
+  if bun != 1 { return bun }
   // A tagged function set is handed on as itself: the instance calls each member directly.
   const setTy = monoArgTaggedSetTy(args[i])
   if setTy >= 0 {
@@ -27260,6 +27357,9 @@ let cadInBaked = false
 let cadWalkFn: i32[] = []
 let cadPendRows: i32[] = []
 let cadPendClones: i32[] = []
+// Each bundle record's row, by row index: the closed signatures its fields hold, field `c<k>`
+// the closure at the `k`th (D14841).
+let monoBundleRows: {[i32]: i32[]} = Map()
 
 // The row's size, its conflicting writes and its unkeyed writes, for a self-check.
 export function cadRowCount(): i32 { cadFe.length }
@@ -27284,6 +27384,7 @@ function cadRowReset() {
   cadWalkFn = []
   cadPendRows = []
   cadPendClones = []
+  monoBundleRows = Map()
   0
 }
 
