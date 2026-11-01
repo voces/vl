@@ -66,7 +66,6 @@ import {
 } from "./check_infer_ret"
 import {
   nodeTyBearsNull,
-  nodeTyIsLitUnionAlias,
   nodeTyIsMap,
   nodeTyIsNulLitUnion,
   nodeTyIsNulNumLitUnion,
@@ -103,24 +102,12 @@ import {
 import {
   inferNicheNullByName,
   mapNameKeyKind,
-  nameIsClosureArrayTy,
   nameIsMap,
-  nameIsU8Array,
   nulCloFlag,
   retArrFlag,
-  retF32ArrFlag,
-  retF32Flag,
   retF64ArrFlag,
-  retF64Flag,
-  retI64ArrFlag,
-  retI64Flag,
-  retNulListFlag,
-  retNulStringFlag,
   retStrArrFlag,
-  retStrFlag,
-  retV128Flag,
   retVoidAnnFlag,
-  tyIsFuncType,
   tyIsNulBareMap,
   tyIsNulBool,
   unwrapParen,
@@ -194,7 +181,7 @@ import {
 import { ArrNewKind, arrNewKindOfElemVKind } from "./emit_struct_order"
 import { i32ListHas } from "./listutil"
 import { emitPassGen, memoKeyNew, memoMoved, memoPassMoved } from "./memo"
-import { nonNullTy, tyIsU8ArrayTy } from "./tyquery"
+import { nonNullTy } from "./tyquery"
 
 // The `__array_new__` element kind named by an annotated-PARAMETER fill: the list a value of
 // the parameter's declared `VKind` is an element of. The one channel a monomorphized instance
@@ -953,93 +940,10 @@ export function annIsNulStrListDeep(tyIx: i32) {
 
 export function vtKindOfType(tyIx: i32): VKind {
   const rk = annRepKindOf(tyIx)
-  if repShadowOn {
-    let dw = "uncovered"
-    if rk != null { dw = rk }
-    repABNote("vtKindOfType", vtKindOfTypeLadder(tyIx), dw)
-  }
   if rk != null { return rk }
-  vtKindOfTypeLadder(tyIx)
-}
-
-function vtKindOfTypeLadder(tyIx: i32): VKind {
-  // A literal-union annotation (`type K = "a" | "b"`) is an i32-backed interned atom (`"i32"`), NOT
-  // a value-union box — checked first (it IS a `TyUnion`, so `retUnionFlag` would claim it).
-  if tyIx >= 0 {
-    if nodeAt(tyIx) is TypeRef {
-      if nodeTyIsLitUnionAlias(tyIx) { return "i32" }
-    }
-  }
-  // A nullable literal-union (`K | null`) is the same i32 atom (`"i32"`), with the spare
-  // value `-1` encoding `null` (no box). Checked before the `string | null` niche
-  // (`"nulstr"`) as a defensive ordering, ahead of any base-collapse.
-  if tyIx >= 0 {
-    if nodeAt(tyIx) is TypeRef {
-      if nodeTyIsNulLitUnion(tyIx) { return "i32" }
-    }
-  }
-  // A nullable numeric literal union (`1 | 2 | null`) is the value-union box (`<base
-  // scalar> | null`), not the atom niche — neither litunion rule above claims it, so
-  // without this arm it falls to the `"i32"` default while a `let`/global builds it as a
-  // box: one type with two reps.
+  // An annotation with no recorded type: a nullable numeric literal union (`1 | null`) is the
+  // value-union box; any other takes the scalar default.
   if nodeTyIsNulNumLitUnion(tyIx) { return "union" }
-  // A NULLABLE function `(fn) | null` is the closure fat-pointer made nullable, `"nulclosure"` —
-  // checked BEFORE `tyIsFuncType` (whose `=>` test would otherwise claim it as the non-null
-  // `"closure"`). The non-null part is a function, but the `| null` makes the slot nullable.
-  if nulCloFlag(tyIx) == 1 { return "nulclosure" }
-  // An array of functions (`((i32) => i32)[]`) is a closure-element ref list
-  // (`"reflist"`), not a single closure — checked before `tyIsFuncType`, whose `=>`
-  // substring test would otherwise claim the whole array as `"closure"`.
-  if nameIsClosureArrayTy(tyIx) == 1 { return "reflist" }
-  // A function-typed annotation (a name carrying `=>` — incl. the synthetic
-  // `"=>sigkey"` a monomorphized closure param is pinned with) is the closure
-  // fat-pointer, `"closure"`. Checked first; no other name contains an arrow.
-  if tyIsFuncType(tyIx) { return "closure" }
-  // A string-keyed map annotation (`{[string]: V}`) is the map struct ref, `"map"` — checked
-  // before the struct/object arms (an inline `{[…]:…}` is not a field-struct shape). Its
-  // `fbValtype` arg is the map shape slot (mono i32 ⇒ -1, via `paramStructIdxOf`/`retStructIndex`).
-  if retMapFlag(tyIx) == 1 { return "map" }
-  // A nullable string-keyed map (`{[string]: V} | null`) — the `(ref null $mapStruct)` niche
-  // (`"nulmap"`), the map twin of `nulstruct`. AFTER `retMapFlag` (a bare map is never nullable);
-  // disjoint from it anyway (a `| null` map name is a `nameIsMapMemberUnion`, which `retMapFlag`
-  // excludes). Its shape arg is `mapAnnShape` (now `| null`-aware), resolving THIS map's `$mapStruct`.
-  if retNulMapFlag(tyIx) == 1 { return "nulmap" }
-  // A nullable union variant (`Circle | null`) — the `(ref null $uVarHeap[vi])` niche,
-  // paired in `annValtypeSlotOf` with the variant index. Beside `retNulRefFlag` rather
-  // than after it as a fallback, because the two are disjoint at the producer.
-  if retNulVariantFlag(tyIx) == 1 { return "nulvariant" }
-  if retNulRefFlag(tyIx) == 1 { return "nulstruct" }
-  if retNulStringFlag(tyIx) == 1 { return "nulstr" }
-  // The five nullable scalar-list niches (`string[] | null` and the f64/i64/f32/u8 lists),
-  // each its own wrapper heap type. Before the generic nullable-list arms, which claim the
-  // i32 backing: without this rung all five fell to the `"i32"` default.
-  const nsl = nulScalarListKindOfNode(tyIx)
-  if nsl != null { return nsl }
-  if retNulListFlag(tyIx) == 1 { return "nullist" }
-  // A nullable ref array (`<ref-array> | null`) — the `(ref null $wrapper)` niche (kind 18,
-  // `"nulreflist"`). Before `retRefArrFlag` (whose non-null slot can't hold `null`) and the
-  // union arms. Disjoint from `"nullist"` above: an i32-backed list is `"nullist"`, a
-  // ref-element/nested list is `"nulreflist"`.
-  if retNulRefArrFlag(tyIx) == 1 { return "nulreflist" }
-  if retStrArrFlag(tyIx) == 1 { return "strlist" }
-  if retF64ArrFlag(tyIx) == 1 { return "f64list" }
-  if retI64ArrFlag(tyIx) == 1 { return "i64list" }
-  // A `u8[]` annotation — the packed byte list. Before `retArrFlag`, whose i32-list
-  // answer would name a 4-byte backing for a one-byte one. The `repOf` seam above
-  // already answers for a node the checker recorded a type on; this rung is the
-  // annotation-node fallback its scalar-list siblings each carry too.
-  if annIsU8Array(tyIx) { return "u8list" }
-  if retF32ArrFlag(tyIx) == 1 { return "f32list" }
-  if retRefArrFlag(tyIx) == 1 { return "reflist" }
-  if retUnionFlag(tyIx) == 1 { return "union" }
-  if retVariantFlag(tyIx) == 1 { return "variant" }
-  if retTRFlag(tyIx) == 1 { return "struct" }
-  if retArrFlag(tyIx) == 1 { return "list" }
-  if retStrFlag(tyIx) == 1 { return "str" }
-  if retI64Flag(tyIx) == 1 { return "i64" }
-  if retF64Flag(tyIx) == 1 { return "f64" }
-  if retF32Flag(tyIx) == 1 { return "f32" }
-  if retV128Flag(tyIx) == 1 { return "v128" }
   "i32"
 }
 
@@ -1388,17 +1292,6 @@ export function repLadderABSweep() {
   repABCnt = []
   repABIx = Map()
   0
-}
-
-// True if the type-annotation node `tyIx` spells `u8[]` — the arena's recorded type first,
-// the written spelling as the documented second opinion, the pattern every scalar list rung
-// in `vtKindOfType` follows.
-export function annIsU8Array(tyIx: i32) {
-  if tyIx < 0 { return false }
-  if tyIsU8ArrayTy(nodeTyIxOf(tyIx)) { return true }
-  const t = nodeAt(tyIx)
-  if t is TypeRef { return nameIsU8Array(t.tyName) }
-  false
 }
 
 // The one home of the monomorphized closure pin's marker: the `$fnsig` key a closure-pinned
