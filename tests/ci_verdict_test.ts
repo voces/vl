@@ -217,6 +217,9 @@ function runJobs(over: Record<string, string> = {}): string {
     "ci-native (2)",
     "ci-cost (1)",
     "ci-cost (2)",
+    "ci-distilled",
+    "ci-witnesses (1)",
+    "ci-witnesses (2)",
     "ci-proof",
   ];
   return JSON.stringify({
@@ -466,6 +469,9 @@ Deno.test({
                 "checks-suites (oracle)": "skipped",
                 "ci-cost (1)": "skipped",
                 "ci-cost (2)": "skipped",
+                "ci-distilled": "skipped",
+                "ci-witnesses (1)": "skipped",
+                "ci-witnesses (2)": "skipped",
               }),
             ),
         ],
