@@ -11160,6 +11160,20 @@ field read narrows back exactly, but nothing emitted that narrowing, and master 
 D81/D139 destination pin (`synthDstPinAnn`) is measured for deletion rather than given a guard,
 because a guarded pin is still a second producer of the destination's rep.
 
+**Extended 2026-11-01 (D14817): a fresh call result delivered directly at a narrower own-type
+landing is built at the wider row and copied.** One function body builds one record row (D8301), so
+`mkcall` delivered at `Circle` by `sink(mkcall())` and at its own `K` by `both(mkcall(), k)` (a
+held `k: K` pins `both@K`) was refused. It now builds at `Circle`, and the call that lands at `K`
+is copied into `K` field by field (`recCopyNarrows`, `recSiteCopies`; `emitRecCopy`'s `null` arm).
+Sound because the copy happens where the call's fresh result is delivered as an argument: no alias
+to that record exists between the call and the copy, and every field the copy narrows is one the
+own type types `null`, which is the only value it can hold. The original record is dropped at the
+copy, so no write through one landing can be observed at the other. The limit: a value stored and
+delivered again is not fresh (`const c = mkcall(); both(c, k)`), and neither is an argument to a
+parameter that is not a bare type variable (`b: T[]`, a list element), so those keep D14814's
+refusal. A field the copy would have to narrow other than to `null` (`i32 | null` into `i32`)
+keeps it too.
+
 ## A variant is a position in a union row, and union rows are keyed by member reps (ruling, D14551)
 
 Under structural records (D3870) a plain `{r: i32}` and a union's arm of the same shape are one
