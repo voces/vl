@@ -28,10 +28,10 @@ ingredients name the family. Master `8c716bf0c`, fixpoint seed.
 | D | 7 | a generic or hole function value at an instance | γ (D14791: mcall's flip) |
 | E | 6 | `??` and short-circuit lowering | error-channel |
 | I | 5 | not narrowing: loop overflow, match re-evaluation, extern `never`, u8 truncation, `x!` parse | step 7 (re-label only) |
-| B | 4 | a narrowing survives a write through an alias (the narrowing ledger proper) | step 7 |
+| B | 4 | a narrowing survives a write through an alias (the narrowing ledger proper): D4131 closed; D4084, D4133 and D4134 parked pending an owner ruling | step 7 |
 | F | 3 | `as` / `as!` inside an instance, a hole lambda or a copied hole binding | mono |
 | G | 3 | a generic body's read in an instance (`is`, list ops) | D3423 |
-| H | 2 | a module global read before its initializer | step 7 |
+| H | 2 | a module global read before its initializer: resolved, the trap is the ruled runtime error | none |
 | J | 1 | a tail `null` write lowered void | mcall |
 
 Only family B is the emitter-versus-checker narrowing ledger the step was written for. Family I is
@@ -628,6 +628,10 @@ D5003, runs:
     t(e)
 
 ### H: a module global read before its initializer
+
+Both rows are resolved, not clause 1. The owner ruled on 2026-09-26 that reading a module
+global before its initializer has run is a runtime error. Each witness now stops with
+"`n` read before its initializer ran", which is that ruling's designed trap.
 
 D2652, trap:
 
