@@ -117,6 +117,7 @@ import {
   elabTyClosed,
   fnTagCallArms,
   fnTagListTy,
+  fnTagMembers,
   fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
   fnTagSetOfTy,
@@ -130,7 +131,7 @@ import {
   callBindRowOf,
   callBindTysAt,
 } from "./check_bind_rows"
-import { recRepWidens } from "./check_bind_adopt"
+import { callArgRepTy, recRepWidens } from "./check_bind_adopt"
 import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
 import { monoRecheckEnd } from "./check_demands"
 import { cbExpMark, cbExpTruncate } from "./check_expected"
@@ -138,7 +139,7 @@ import { RB_ALL, checkMark, checkRollback } from "./check_rollback"
 import { argIsLitAggregate, bindOf } from "./check_leaf_steps"
 import { holePinHeldSet } from "./check_hole_pins"
 import { a20RetWalk } from "./check_nj_gate"
-import { njFnIx, njFnIxSet } from "./check_nj_join"
+import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
 import { narrowedFromTyOf, nodeTyIxOf } from "./check_node_tys"
 import { nodeRepTyIx, nodeRepTyIxOf, nodeRepUnionIx } from "./check_core_state"
 import { adoptRetLits } from "./check_inferred_return"
@@ -1289,6 +1290,17 @@ function elabRepRowInstances() {
   let grew = false
   let i = 0
   while i < rows.length {
+    // A list argument mono pins at its rep is that instance alone (D14733).
+    if elabListArgAtRep(callBindIxAt(rows[i]), ekDecl[cks[i]]) {
+      const k = elabEnqueue(
+        ekDecl[cks[i]],
+        callBindNamesAt(rows[i]),
+        callBindRepTysAt(rows[i]),
+        -1,
+      )
+      elabReachNote(-1, k, -1)
+      grew = true
+    }
     let j = i + 1
     while j < rows.length {
       if (
@@ -1311,6 +1323,29 @@ function elabRepRowInstances() {
     i = i + 1
   }
   if grew { elabSettle(0) }
+}
+
+// Whether call `ix` of `decl` hands a parameter annotated as a list of a type parameter an
+// argument built at a wider list than the instance's type (`callArgRepTy`), as mono pins it.
+function elabListArgAtRep(ix: i32, decl: i32): boolean {
+  const f = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  if !(f is FuncDecl) { return false }
+  let a = 0
+  while a < f.fnParams.length {
+    const pn = nodeAt(f.fnParams[a])
+    const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+    if pt is TypeRef {
+      const nm = pt.tyName
+      const n = nm.length
+      const el = if n > 2 && nm.slice(n - 2, n) == "[]" { nm.slice(0, n - 2) } else { "" }
+      if el != "" && strListHas(f.fnTyParams, el) {
+        const et = elabCallParamTy(ix, a)
+        if et >= 0 && callArgRepTy(ix, a, et) != et { return true }
+      }
+    }
+    a = a + 1
+  }
+  false
 }
 
 // Whether bind rows `a` and `b` bind the same names to the same rep types.
@@ -2032,8 +2067,12 @@ function elabSelfRow(
 // Replaces the mint facts with one per call each instance makes through a parameter it binds to
 // a function set: the set, the call's argument types and each member's result there, so the tag
 // decision sees every call an instance makes. The number of facts noted.
+// The functions some set of functions holds, read once per `elabMintFacts`.
+let elabMintValueFns: i32[] = []
+
 export function elabMintFacts(): i32 {
   mintReset()
+  elabMintValueFns = elabFnSetMembers()
   elabMintCalls = Map()
   elabMintSets = Map()
   let n = 0
@@ -2329,8 +2368,18 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const at = elabMintCalls[ix] ?? []
   at.push(k)
   elabMintCalls[ix] = at
-  if (elabMintSets[ix] ?? fnTagSetOfTy(st)) != fnTagSetOfTy(st) {
-    mintSetPartialNote(elabMintSets[ix] ?? -1)
+  // One call through two sets in two instances: two singletons each take their own instance's
+  // arms; a wider set, a callee read out of a holder, or a caller itself held as a value shares
+  // the call's arms with the other, so both stay closures.
+  const was = elabMintSets[ix] ?? fnTagSetOfTy(st)
+  if (
+    was != fnTagSetOfTy(st)
+    && (elabFnSetOf(st).length > 1
+      || fnTagMembers(was).length > 1
+      || root != cf
+      || i32ListHas(elabMintValueFns, decl))
+  ) {
+    mintSetPartialNote(was)
     mintSetPartialNote(fnTagSetOfTy(st))
   }
   elabMintSets[ix] = fnTagSetOfTy(st)
@@ -3783,10 +3832,33 @@ export function elabRetOf(k: i32): i32 {
   if ft < 0 || ft >= T.tys.length { return -1 }
   const f = tyAt(ft)
   if !(f is TyFunc) { return -1 }
-  const r = elabSubstClosed(f.fnRet, k)
+  let r = elabSubstClosed(f.fnRet, k)
+  if r < 0 { r = elabRetOfValues(k) }
   if r < 0 { return -1 }
   const kd = recKeptFnDstOf(ekDecl[k], r)
   if kd >= 0 { kd } else { r }
+}
+
+// The type every value instance `k`'s body hands back has there, when each is a call through a
+// parameter and they agree and close: the signature leaves such a result open; else -1.
+function elabRetOfValues(k: i32): i32 {
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return -1 }
+  const vs: i32[] = []
+  collectRetValues(dn.fnBody, vs)
+  let t = -1
+  for v in vs {
+    const vn = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { nodeAt(dn.fnBody) }
+    if !(vn is Call) { return -1 }
+    const pd = identDeclOf(parenPeelIx(vn.callFn))
+    if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return -1 }
+    const vt = elabNodeTy(v, k)
+    if vt < 0 { return -1 }
+    const w = widenLitTy(vt)
+    if t >= 0 && !tySame(t, w) { return -1 }
+    t = w
+  }
+  t
 }
 
 // Node `ix`'s type at the instance `fnIx` is, or -1 where its elaboration leaves it open. A
