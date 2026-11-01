@@ -8,8 +8,8 @@
 // scripts/vl-host/src/main.rs; docs/internals/perf/gc-heap-policy-2026-09.md §4).
 //
 // The workload is `vl check compiler/emit_base.vl` at the default first heap (128 MiB a
-// semispace), whose live set passes the 96 MiB the policy grows at: 4 and 26 collections on
-// 2026-10-31. The default heap is the engine configuration every other compile shares, so its
+// semispace), whose live set passes the 96 MiB the policy grows at: 4 and 24 to 26 collections
+// over 2026-10-31 and 2026-11-01. The default heap is the engine configuration every other compile shares, so its
 // `.cwasm` is already warm; a pinned heap was its own configuration and re-JITted the seed
 // (about 13 s) on every new seed. Three bounds: the default
 // collects at least once (a dead counter reads 0) and at most `MAX_DEFAULT`; the policy switched
@@ -35,7 +35,7 @@ const TARGET = `${ROOT}/compiler/emit_base.vl`;
 
 // 4 at the time of writing; loose so a compiler change that moves the live set cannot red it.
 const MAX_DEFAULT = 12;
-// 26 / 4 at the time of writing.
+// 24 / 4 at the time of writing.
 const MIN_SPREAD = 3;
 
 async function collections(grow: string, label: string): Promise<number> {
