@@ -637,6 +637,7 @@ import {
   structIndexOfNullPartTy,
   structIndexOfTypeName,
   structIndexOfTypeNameTy,
+  structRowOfRecordTy,
   tyIsRefArray,
   tyMentionsLitOrObj,
   uFieldMapShape,
@@ -5205,8 +5206,9 @@ export function ifExprRefSlot(
       if destStruct >= 0 { return destStruct }
       // Then arm is `null` with no binding seed — resolve the struct from the checker's
       // nullable join type instead, so the arm rep and nullable blocktype find the layout.
-      const inn = nodeNulStructInnerName(ifIx)
-      if inn != "" { return structIndexOfTypeNameTy(inn, nodeTyIxOf(ifIx)) }
+      if nodeNulStructInnerName(ifIx) != "" {
+        return structRowOfRecordTy(nonNullTy(nodeTyIxOf(ifIx)))
+      }
       return destStruct
     }
     "reflist" => {
@@ -6256,6 +6258,8 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
     NumLit | StrLit | CharLit | BoolLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   if nodeTyIsNullable(dix) { return true }
+  // A default whose type is `null` itself, as a call of a function that only returns `null` (D3408).
+  if isNullTy(nodeTyIxOf(dix)) { return true }
   // A hole the instance binds to a nullable type is nullable there.
   if tyBearsNull(holeOperandTyOf(dix, fnIx)) { return true }
   const un = unionNameOfExpr(dix, fnIx)
@@ -7915,11 +7919,8 @@ export function anonFieldElemName(valIx: i32, code: i32) {
       const sr = repRowOfTyStruct(nvt, sScanLim())
       if sr >= 0 { return sNames[sr] }
     }
-    const cn = nodeTyCanonObjName(valIx)
-    if cn != "" {
-      const bn = structIndexOfTypeNameTy(cn, nvt)
-      if bn >= 0 { return sNames[bn] }
-    }
+    const bn = structRowOfRecordTy(nvt)
+    if bn >= 0 { return sNames[bn] }
     const kr = repRowOfTyStruct(nvt, sScanLim())
     if kr >= 0 { return sNames[kr] }
     return ""
@@ -9022,27 +9023,15 @@ export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
 export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
   if exprIx < 0 { return false }
   const e = nodeAt(unwrapParen(exprIx))
-  if e is Call {
-    const cf = nodeAt(unwrapParen(e.callFn))
-    if cf is Ident {
-      const t = fnIndexOfNode(e.callFn)
-      if t >= 0 { return repOfFnSlot(t).rdKind == "nulnone" }
-      return calleeRetKindOfRead(e.callFn, fnIx) == "nulnone"
+  // A name, field, element or call read typed `null` is the `null` unit when its read rep reads
+  // one; a read the read rep does not cover keeps the arms below.
+  if e is Ident || e is Member || e is Index || e is Call {
+    if isNullTy(nodeTyAt(exprIx, fnIx)) {
+      const rr = readRepOf(exprIx, fnIx)
+      if rr.rrRead != "" { return kindIn(rr.rrRead, READ_NUL_NONE_KINDS) }
     }
-    if cloValueCallRetKind(unwrapParen(exprIx), fnIx) == "nulnone" {
-      return true
-    }
-    // A `null[]`'s `pop` and `get` hand back its element, and a `null`-valued map's `get` its value.
-    if cf is Member {
-      if cf.memProp != "pop" && cf.memProp != "get" { return false }
-      if exprMap(cf.memObj, fnIx) {
-        return cf.memProp == "get"
-          && mapTyValIsNullUnit(mapRecvTyIn(cf.memObj, fnIx))
-      }
-      return arrElemIsNullUnitAt(cf.memObj, fnIx)
-    }
-    return false
   }
+  if e is Call { return callIsNulNone(e, unwrapParen(exprIx), fnIx) }
   // An if-expression whose every arm is a bare `null` or itself `null`-typed is `null`-typed:
   // the join of `null` with `null` is `null`. One arm carrying a real value is not this — its
   // join is a genuine `T | null` and the niche paths own it. An else-less `if` used as a value
@@ -9073,6 +9062,41 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
   // an Ident, a captured read, and a module global all resolve through `identCellVKind`, and
   // for a kind that names no cell it answers `null` — the right answer for every remaining kind.
   identCellVKind(exprIx, fnIx) == "nulnone"
+}
+
+// Whether call `rx` hands back the `null` unit: a function whose every return is a bare `null`, a
+// value call whose `$fnsig` result is `Z`, or a `null[]`'s `pop`/`get` or a `null`-valued map's `get`.
+function callIsNulNone(e: Call, rx: i32, fnIx: i32): boolean {
+  const cf = nodeAt(unwrapParen(e.callFn))
+  if cf is Ident {
+    const t = fnIndexOfNode(e.callFn)
+    if t >= 0 { return fnResultIsNulNone(t) }
+    return calleeRetKindOfRead(e.callFn, fnIx) == "nulnone"
+  }
+  if cloValueCallRetKind(rx, fnIx) == "nulnone" { return true }
+  methodCallIsNulNone(unwrapParen(e.callFn), fnIx)
+}
+
+// Whether function `fe` hands back the `null` unit: its recorded result is the `null` type, or
+// its lowered result kind says so where none is recorded.
+function fnResultIsNulNone(fe: i32): boolean {
+  if fe < fRecRetTy.length {
+    const r = fRecRetTy[fe]
+    if r >= 0 && r < T.tys.length && isNullTy(r) { return true }
+  }
+  repOfFnSlot(fe).rdKind == "nulnone"
+}
+
+// Whether the method callee `cfx` is a `null[]`'s `pop`/`get` or a `null`-valued map's `get`.
+function methodCallIsNulNone(cfx: i32, fnIx: i32): boolean {
+  const cf = nodeAt(cfx)
+  if !(cf is Member) { return false }
+  if cf.memProp != "pop" && cf.memProp != "get" { return false }
+  if exprMap(cf.memObj, fnIx) {
+    return cf.memProp == "get"
+      && mapTyValIsNullUnit(mapRecvTyIn(cf.memObj, fnIx))
+  }
+  arrElemIsNullUnitAt(cf.memObj, fnIx)
 }
 
 // Does the if-arm tail value `v` add nothing but `null` to the join? A bare `null`, a `null`-typed
@@ -9693,9 +9717,8 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
     // `structIndexByName` runs ahead of the arena rung on purpose,
     // since an inline shape interned under its render can differ from the arena's smallest
     // row sharing the canon key; arena-first would silently flip a struct `==` into false.
-    const snc = nodeTyCanonObjName(exprIx)
-    if snc != "" {
-      const sbn = structIndexOfTypeNameTy(snc, nodeTyIxOf(exprIx))
+    if nodeTyCanonObjName(exprIx) != "" {
+      const sbn = structRowOfRecordTy(nodeTyIxOf(exprIx))
       if sbn >= 0 {
         // The render says struct; a declared record's own row says which one (D9784).
         const sdr = recRowOfTy(nodeTyIxOf(exprIx))
@@ -9720,8 +9743,9 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
       if nr >= 0 { return nr }
     }
   }
-  const nn = nodeNulStructInnerName(exprIx)
-  if nn != "" { return structIndexOfTypeNameTy(nn, nodeTyIxOf(exprIx)) }
+  if nodeNulStructInnerName(exprIx) != "" {
+    return structRowOfRecordTy(nonNullTy(nodeTyIxOf(exprIx)))
+  }
   return -1
 }
 
@@ -12900,6 +12924,16 @@ let lrDepth = 0
 // its list unless a float literal or spread built another; a recorded `f64[]` yields to an f32
 // shape, and the unpinned `i32[]` to any shape.
 function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
+  // A call's list is what its callee lowers, asked first; the ladder below answers a call whose
+  // lowering is not known, a builtin's or a method's among them.
+  const ce = nodeAt(exprIx)
+  if ce is Call {
+    const ck = callStoreListKind(ce, exprIx, fnIx)
+    if ck != null {
+      if vkListClass(ck) == 2 { return nulListBase(ck) }
+      return ck
+    }
+  }
   // A node recorded at a type variable has the column's rep at its instance's bindings. Before
   // `monomorphize` binds one, a node still open there has no rep.
   const xraw = nodeTyIxOf(exprIx)
@@ -13577,6 +13611,9 @@ export function memberFieldCode(memIx: i32, fnIx: i32) {
   }
   -1
 }
+
+// The read kinds that are the `null` unit: a cell of it, or a field of its code (FC_NUL_NONE).
+const READ_NUL_NONE_KINDS: string[] = ["nulnone", "fc37"]
 
 // The read kinds that are a string ref, the one nullable string read that is (from its own
 // cell), and the literal-union atom stores whose reads keep `exprString`'s own arms.
@@ -15490,11 +15527,75 @@ function callResultIsNulLitAtom(rx: i32, fnIx: i32): boolean {
 }
 
 // What a call's result is stored as: "nullitatom" for the `K | null` niche, "litatom" for an
-// interned literal-union id, else "".
+// interned literal-union id, its lowered list kind, "nulnone" for the `null` unit, else "".
 function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
   if callResultIsNulLitAtom(rx, fnIx) { return "nullitatom" }
   if callStoreIsLitAtom(e, rx, fnIx) { return "litatom" }
+  const lk = callStoreListKind(e, rx, fnIx)
+  if lk != null { return lk }
+  if callIsNulNone(e, rx, fnIx) { return "nulnone" }
   ""
+}
+
+// The list kind call `rx` hands back, nullable or not, where its callee's lowering names one;
+// null for any other result or a lowering not yet known.
+function callStoreListKind(e: Call, rx: i32, fnIx: i32): VKind | null {
+  const k = callLoweredKind(e, rx, fnIx)
+  if k != null && vkListClass(k) != 0 { return k }
+  null
+}
+
+// `fnLoweredKind` remembered per function, stamped with the pass and type arena that asked.
+const flkGen = memoGenNew(0)
+const flkKey = memoKeyNew(3)
+const flkStamp: i32[] = []
+const flkVal: VKind[] = []
+
+// The result kind function `fe` lowers, once return kinds are final: its closed recorded result's
+// rep, else its result kind; null for a void result.
+function fnLoweredKind(fe: i32): VKind | null {
+  if fe >= fRetKind.length || fe >= fRetVoid.length || fRetVoid[fe] != 0 {
+    return null
+  }
+  if memoMoved3(flkKey, emitPassGen, tyMutEpoch, fRetKind.length) {
+    memoGenAdvance(flkGen)
+  }
+  if fe < flkStamp.length && flkStamp[fe] == flkGen.at { return flkVal[fe] }
+  let k: VKind = fRetKind[fe]
+  if fe < fRecRetTy.length {
+    const r = fRecRetTy[fe]
+    if r >= 0 && r < T.tys.length && !tyHasTyVar(r) && !tyHasInferHole(r, 0) {
+      const d = repOfTy(r)
+      if d.rdCovered == 1 { k = d.rdKind }
+    }
+  }
+  while flkStamp.length <= fe {
+    flkStamp.push(-1)
+    flkVal.push("i32")
+  }
+  flkStamp[fe] = flkGen.at
+  flkVal[fe] = k
+  k
+}
+
+// The result kind call `rx`'s callee lowers, once return kinds are final: a named function's
+// closed recorded result, else its result kind, else a function value's `$fnsig` result token.
+// Null for a void, unresolved or unkeyed result, and for a generic function value, which is
+// instanced per call so its `$fnsig` is not the instance's (D4242).
+function callLoweredKind(e: Call, rx: i32, fnIx: i32): VKind | null {
+  if !emitPhaseReached("capsCached") { return null }
+  const fe = callNamedFe(e, fnIx)
+  if fe >= 0 { return fnLoweredKind(fe) }
+  // A method of a list, map or string is no function value and has no `$fnsig` of its own.
+  const cfx = unwrapParen(e.callFn)
+  if cfx < 0 { return null }
+  const cf = nodeAt(cfx)
+  if cf is Member && !memberIsClosure(cf.memObj, cf.memProp, fnIx) {
+    return null
+  }
+  const ct = nodeTyAt(cfx, fnIx)
+  if ct < 0 || ct >= T.tys.length || tyHasTyVar(ct) { return null }
+  sigKeyRetKind(cloCallSigKey(rx, fnIx))
 }
 
 // Whether call `rx` hands back an interned literal-union id. The callee's lowered result decides:
@@ -15555,6 +15656,12 @@ function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
     const k = refListElemKind(e.idxArr, fnIx)
     if k != null { return k }
     return "reflist?"
+  }
+  // An element of a `null[]` and a `null`-valued map's value are the `null` unit.
+  if exprMap(e.idxArr, fnIx) {
+    if mapTyValIsNullUnit(mapRecvTyIn(e.idxArr, fnIx)) { return "nulnone" }
+  } else if arrElemIsNullUnitAt(e.idxArr, fnIx) {
+    return "nulnone"
   }
   // A string list's element is a string ref, or a nullable one in a list of nullable strings.
   if exprStringArray(e.idxArr, fnIx) {
