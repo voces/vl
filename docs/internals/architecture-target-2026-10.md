@@ -631,6 +631,10 @@ The order: checker rows for value-of-generic deliveries, one slice per kind; the
 - 11: a set row that took the stub rep inside a container (`{[string]: Fn#}` handed to `f(mm)` that only reads `mm.length`) takes the rep of its hole-function members' default instances, their parameter holes at `i32` (D4551), as mono builds it; a bare set value stays the stub, built as no body.
 - 10 (#5256, the mono-keying lane): a list argument whose pin names another record's row of the same layout takes the argument's own type (`monoPinRowNamesOtherTy` peels list layers), so `take([...src])` is keyed at `{f: {v: i32}}[]`, not `J[]`.
 
+- 1 (#5383): two calls of one declaration that the checker typed apart, each built at the same wider record (D14532's rep row), are one instance at that rep, which `elabRepRowInstances` enqueues; only the `@emit-error` fixture `closures/listed-hole-fn-escaping-list-reject.vl` is still late.
+
+A producer inside `elabRun` decides without minting types. `substTyDeep` interns the types it builds, and calling it there, even with the result unused, changed later checking: D14426's and D14532's fixtures became type errors. Compare the rows' types (`tySame`) instead.
+
 What is left (5 files on 2026-10-31), grouped by what each waits on; lanes are on voces/vl#5255:
 - 5, literal-union pins (mono-keying lane): `generic-pin-literal-union-result`, `one-literal-field-through-generic`, `litunion-nested-union-arm-module-global`, `generic-union-param-litunion-alias-arm`, `lambda-narrowed-literal-arg`. The elaboration keeps the literal (`T = "a"`) where mono widens to `string`. These wait on mono reading the elaboration's key. Enqueueing a second, widened instance cleared 4 of 8 and trapped the compiler on 51 builds, because the extra instance changes what the emitter reads for the literal one.
 - 0, a nominal or branded row beside its shape: `b000498` and `flat-generic-rows-branded-bracket` closed by #5263 (mono-keying lane), which applies `monoPinRowNamesOtherTy` in the annotated arm too and counts a record with no row whose `null` fields land in a named row's nullable fields as stored in that row.
