@@ -34,6 +34,7 @@ ROWS=(
   "lsp lint"
   "lint-self + fmt"
   "seed size"
+  "late demands"
   "no-python"
   "kind-ladder sets"
   "dead-export budget"
