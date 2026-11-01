@@ -95,6 +95,7 @@ import {
   elabSnapKey,
   elabTyClosed,
   fnTagCallArms,
+  fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
   fnTagSetOfTy,
   fnTagTyIsTagged,
@@ -1087,7 +1088,7 @@ function elabDemandFrom(
   }
   // An argument holding a tagged set binds its hole parameter to the set itself, which no
   // checker instance at the set's rep has.
-  const tagged = elabCallTaggedArgs(call, decl)
+  const tagged = elabCallTaggedArgs(call, decl, from)
   if (
     !tagged
     && elabCkUsable(decl, call, from) >= 0
@@ -1111,7 +1112,7 @@ function elabDemandFrom(
     if f is TyFunc {
       let p = 0
       while p < f.fnParamTypes.length && p < pTys.length {
-        const at = if tagged { elabCallArgSetTy(call, decl, p) } else { -1 }
+        const at = if tagged { elabCallArgSetTy(call, decl, p, from) } else { -1 }
         if at >= 0 {
           bindGenWalk(f.fnParamTypes[p], at, names, tys)
         } else if elabTyClosed(pTys[p], 0) && !(p < byId.length && byId[p]) {
@@ -1131,8 +1132,9 @@ function elabDemandFrom(
   k
 }
 
-// The tagged set argument `p` of call `call` to `decl` hands an un-annotated parameter, or -1.
-function elabCallArgSetTy(call: i32, decl: i32, p: i32): i32 {
+// The tagged set argument `p` of call `call` to `decl` hands an un-annotated parameter, or one
+// its own type parameter alone annotates, or -1.
+function elabCallArgSetTy(call: i32, decl: i32, p: i32, from: i32): i32 {
   if call < 0 || call >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
     return -1
   }
@@ -1142,20 +1144,25 @@ function elabCallArgSetTy(call: i32, decl: i32, p: i32): i32 {
   if p >= cn.callArgs.length || p >= f.fnParams.length { return -1 }
   if p < cn.callArgNames.length && cn.callArgNames[p] != "" { return -1 }
   const q = nodeAt(f.fnParams[p])
-  if !(q is Param) || q.parType >= 0 { return -1 }
+  if !(q is Param) || q.parType >= 0 && !fnTagOwnTyParamAlone(f, p) {
+    return -1
+  }
   const ax = parenPeelIx(cn.callArgs[p])
   const t = if ax >= 0 { nodeTyIxOf(ax) } else { -1 }
-  if fnTagSetIsTagged(fnTagSetOfTy(t)) { t } else { -1 }
+  if fnTagSetIsTagged(fnTagSetOfTy(t)) { return t }
+  // A parameter of the calling instance handed on holds the set that instance binds it to.
+  const it = if ax >= 0 && from >= 0 { elabNodeTy(ax, from) } else { -1 }
+  if fnTagSetIsTagged(fnTagSetOfTy(it)) { it } else { -1 }
 }
 
 // Whether some argument of call `call` to `decl` is a tagged set its parameter takes as itself.
-function elabCallTaggedArgs(call: i32, decl: i32): boolean {
+function elabCallTaggedArgs(call: i32, decl: i32, from: i32): boolean {
   if call < 0 || call >= P.nodes.length { return false }
   const cn = nodeAt(call)
   if !(cn is Call) { return false }
   let p = 0
   while p < cn.callArgs.length {
-    if elabCallArgSetTy(call, decl, p) >= 0 { return true }
+    if elabCallArgSetTy(call, decl, p, from) >= 0 { return true }
     p = p + 1
   }
   false
@@ -2115,7 +2122,7 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
   while cur >= 0 {
     const cn = nodeAt(cur)
     if cn is FuncDecl {
-      elabMintHandedIn(cur, -1, decl, k)
+      elabMintHandedIn(cur, -1, decl, k, sc)
       return n
     }
     if cn is Call && elabMintFactAt(cn, cur, decl, k, sc) { n = n + 1 }
@@ -2123,7 +2130,7 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
       if cn is Call && kid == cn.callFn {
         n = n + elabMintFactsIn(kid, decl, k, sc)
       } else {
-        elabMintHandedIn(kid, cur, decl, k)
+        elabMintHandedIn(kid, cur, decl, k, sc)
         n = n + elabMintFactsIn(kid, decl, k, sc)
       }
     }
@@ -2135,7 +2142,7 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
 // Marks partial the set instance `k` binds a parameter of `decl` to, where node `ix` (the child
 // of `p`, or inside a nested function when `p` is -1) reads that parameter other than as a
 // callee: a set handed on is typed where it lands, which this decision does not see.
-function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32) {
+function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const xn = nodeAt(ix)
   if xn is Ident {
@@ -2152,9 +2159,36 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32) {
     }
     return 0
   }
-  if xn is Paren { return elabMintHandedIn(xn.parInner, p, decl, k) }
+  if xn is Paren { return elabMintHandedIn(xn.parInner, p, decl, k, sc) }
   if p >= 0 { return 0 }
-  for kid in nodeChildren(ix) { elabMintHandedIn(kid, -1, decl, k) }
+  for kid in nodeChildren(ix) { elabMintHandedNested(kid, ix, decl, k, sc) }
+  0
+}
+
+// `elabMintHandedIn` inside a function nested in `decl`'s body, with each node's parent `p`: a
+// captured parameter handed on to a named function's hole is a forward, one called there is a
+// fact of scope row `sc` where its arguments close, and any other read is partial.
+function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const xn = nodeAt(ix)
+  if xn is Ident {
+    const pd = identDeclOf(ix)
+    const dn = nodeAt(decl)
+    if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
+      const st = fnTagSetOfTy(elabNodeTy(ix, k))
+      const to = elabMintFwdTarget(ix, p)
+      const pn = if p >= 0 { nodeAt(p) } else { nodeAt(ix) }
+      if to.length == 2 && st >= 0 {
+        mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
+      } else if (
+        !(pn is Call && pn.callFn == ix && elabMintFactAt(pn, p, decl, k, sc))
+      ) {
+        mintSetPartialNote(st)
+      }
+    }
+    return 0
+  }
+  for kid in nodeChildren(ix) { elabMintHandedNested(kid, ix, decl, k, sc) }
   0
 }
 
@@ -2188,6 +2222,7 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
     rs.push(w)
   }
   mintFactNote(sc, ix, fnTagSetOfTy(st), key, split, rs)
+  if !split { elabNodeTyFill(ix, k, rs[0]) }
   mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
   const at = elabMintCalls[ix] ?? []
   at.push(k)
@@ -2198,6 +2233,28 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   }
   elabMintSets[ix] = fnTagSetOfTy(st)
   true
+}
+
+// Records `t` as call `ix`'s type at instance `k` where the re-check left it open: a callee whose
+// type is a type parameter bound to the set types no result of its own.
+function elabNodeTyFill(ix: i32, k: i32, t: i32) {
+  if ix < 0 || ix >= elabGenTy.length || t < 0 || !elabTyClosed(t, 0) {
+    return 0
+  }
+  const ps = elabNodeTys[ix] ?? []
+  let i = 0
+  while i + 1 < ps.length {
+    if ps[i] == k {
+      if !elabTyClosed(ps[i + 1], 0) { ps[i + 1] = t }
+      elabNodeTys[ix] = ps
+      return 0
+    }
+    i = i + 2
+  }
+  ps.push(k)
+  ps.push(t)
+  elabNodeTys[ix] = ps
+  0
 }
 
 // The result of the instance of `d` the elaboration made at parameter types `pTys`, or -1.
@@ -3441,8 +3498,8 @@ function elabArgResultAt(a: i32, pf: TyFunc, names: string[], tys: i32[]): i32 {
   widenLitTy(out)
 }
 
-// Binding `tys` of call `ix` with each un-annotated parameter handed a tagged set bound to the set
-// itself: the instance calls each member at its own arguments, so no one signature stands for it.
+// Binding `tys` of call `ix` with each un-annotated parameter, or one its own type parameter
+// alone annotates, handed a tagged set bound to the set itself: the instance calls each member at its own arguments, so no one signature stands for it.
 // One handed only uncalled hole functions is bound to the stub the monomorphizer primed.
 function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
   const cn = nodeAt(ix)
@@ -3457,6 +3514,7 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
     const st = nodeTyIxOf(parenPeelIx(cn.callArgs[i]))
     const named = i < cn.callArgNames.length && cn.callArgNames[i] != ""
     const pn = nodeAt(f.fnParams[i])
+    const alone = pn is Param && pn.parType >= 0 && fnTagOwnTyParamAlone(f, i)
     // An argument of only uncalled hole functions binds the stub it is delivered at (D6881).
     const stub = elabStubArg.get(i32ToStr(ix) + ":" + i32ToStr(i)) ?? -1
     if !named && pn is Param && pn.parType < 0 && stub >= 0 {
@@ -3472,8 +3530,14 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
         }
         j = j + 1
       }
-    } else if !named && pn is Param && pn.parType < 0 && fnTagTyIsTagged(st) {
-      const hn = elabHoleRootName(nodeTyIxOf(f.fnParams[i]))
+    } else if (
+      !named
+      && pn is Param
+      && (pn.parType < 0 || alone)
+      && fnTagTyIsTagged(st)
+    ) {
+      const tn = if alone { nodeAt(pn.parType) } else { nodeAt(f.fnParams[i]) }
+      const hn = if tn is TypeRef { tn.tyName } else { elabHoleRootName(nodeTyIxOf(f.fnParams[i])) }
       let j = 0
       while j < names.length && j < out.length {
         if hn != "" && names[j] == hn {
