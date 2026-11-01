@@ -140,11 +140,7 @@ import {
 } from "./check_elab_cap"
 import { letNullHoleFilledTy, letNullHoleUnfilled } from "./check_null_holes"
 import { canonUnionMembersInto } from "./check_program"
-import {
-  inferRetFnKey,
-  mapDeliveryRecorded,
-  nodePinPayloadOf,
-} from "./check_side_rows"
+import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
 import { tyVarRowsMinted } from "./check_subst"
 import {
   MAP_KEY_I32,
@@ -653,7 +649,6 @@ import {
 } from "./emit_shape_rows"
 import {
   COPY_CHAIN_MAX,
-  annCloSigSpelled,
   calleeNodeSigKey,
   cloNameSigKeyTy,
   declaredStructIndex,
@@ -10304,6 +10299,12 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
     const ud = identDeclOf(exprIx)
     if ud >= 0 && nodeAt(ud) is LetDecl { return letIsUnion(ud, fnIx) }
   }
+  // An unnarrowed read asked outside the frame declaring it reads its binding's cell there.
+  if declaredSlotOf(exprIx) < 0 && readNarrowedTyAt(exprIx, fnIx) < 0 {
+    if readSlotlessOwnLet(exprIx, fnIx) >= 0 {
+      return readRepOf(exprIx, fnIx).rrRead == "union"
+    }
+  }
   return false
 }
 
@@ -14599,23 +14600,10 @@ function paramCloSigKey(fnIx: i32, name: string) {
       const p = nodeAt(params[i])
       if p is Param {
         if p.parName == name {
-          if p.parType >= 0 {
-            // A monomorphized closure-pinned param announces itself in the pin column, which
-            // also carries the `$fnsig` key — read where it lives, not by prefix-testing the name.
-            const pin = nodePinPayloadOf(p.parType)
-            if pin != "" { return pin }
-            const ty = nodeAt(p.parType)
-            if ty is TypeRef {
-              const nm = ty.tyName
-              if nm.length > 2 {
-                // The parser's tree, not a character scan: asks whether the annotation spells a
-                // function type anywhere, including inside a union arm (unlike the narrower arena test).
-                if annCloSigSpelled(p.parType, nm) {
-                  return cloNameSigKeyTy(nm, nodeTyIxOf(p.parType))
-                }
-              }
-            }
-          }
+          // The parameter's type at this instance keys it, a pinned hole included.
+          if p.parType < 0 { return "" }
+          const it = tyPeelNul(nodeTyInOf(p.parType, fnIx))
+          if it >= 0 && tyAt(it) is TyFunc { return sigKeyOfTy(it) }
           return ""
         }
       }
@@ -15135,6 +15123,9 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
     const k = identCellVKind(rx, fnIx)
     if k != null {
       st = k
+    } else if readSlotlessOwnLet(rx, fnIx) >= 0 {
+      // A read asked outside its frame reads the cell its binding has in the frame declaring it.
+      st = letCellKind(readSlotlessOwnLet(rx, fnIx), fnIx)
     } else {
       // A read with no slot yet has no storage to read: it reads at its own type.
       const td = repOfNode(rx, fnIx)
@@ -15208,6 +15199,15 @@ function readNonNulKind(k: string): string {
     i = i + 2
   }
   ""
+}
+
+// The `let` read `rx` names when `fnIx` is the frame declaring it; -1 for any other read.
+function readSlotlessOwnLet(rx: i32, fnIx: i32): i32 {
+  const d = identDeclOf(rx)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  if !(nodeAt(d) is LetDecl) { return -1 }
+  if readDeclOwnerOf(d, fnIx) != fnIx { return -1 }
+  d
 }
 
 // Whether `k` is a nullable rep kind.
