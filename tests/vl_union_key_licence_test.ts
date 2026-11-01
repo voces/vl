@@ -16,8 +16,9 @@ const VL = `${ROOT}/scripts/vl-host/target/release/vl${
 }`;
 const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const WITNESSES = `${ROOT}/tests/fixtures/union-key-licence/witnesses.txt`;
-// D1492: `type AS = (Sc | Dg)` beside the inline `Sc | Dg` — one key, two rows.
-const CONTROL = "tests/cases/types/union-alias-transparent-and-its-gate.vl";
+// A struct union still minted as two rows under one key. D1492's own pair, `type AS = (Sc | Dg)`
+// beside the inline `Sc | Dg`, is one row now that a union names the row of its type key.
+const CONTROL = "tests/cases/unions/discriminant-narrows-parent.vl";
 const POOL = 4;
 
 const exists = (p: string) => {
