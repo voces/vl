@@ -351,6 +351,48 @@ Deno.test({
   },
 });
 
+// The row shadow: a recorded record result the lowering keys at another slot is graded by the
+// row each returned value was stamped built at. A fresh literal stamped at its delivery's row
+// agrees; an identity instance's value, stamped at its binding, is built at the delivery's.
+const ROW_STAMP = `const i: { f: i32 } = { f: 4 }
+type I = { f: i32 | null }
+function mk() { { f: 7 } }
+const b: I = mk()
+print(b.f ?? 0)
+print(i.f)
+`;
+
+const ROW_DELIVERY = `type J = { r: i32 | null }
+function idn<T>(v: T): T { v }
+const u: J | string = idn({ r: 4 })
+const k = { r: 5 }
+print(k.r)
+if u is J { print(u.r ?? 0) }
+`;
+
+Deno.test({
+  name: "fn-ret shadow: row classes",
+  ignore,
+  fn() {
+    expectRows(
+      "row stamp",
+      ROW_STAMP,
+      DROP_NONE,
+      true,
+      "row agree | mk=1",
+      true,
+    );
+    expectRows(
+      "row delivery",
+      ROW_DELIVERY,
+      DROP_NONE,
+      true,
+      "row: stamped >s0;, lowered >V0; | idn=1",
+      true,
+    );
+  },
+});
+
 // A `u8[]` map's callback records `(e: u8) => u8`, a storage type its value widens from: it
 // crosses as the `i32` its lowered signature carries.
 const U8_MAP = `const xs: u8[] = [1, 200, 7]

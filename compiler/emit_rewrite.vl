@@ -93,6 +93,7 @@ import {
   TyNullable,
   TyObj,
   TyUnion,
+  TyVar,
   litUnionAliasNameOfTy,
   mkArrayTy,
   mkNullableTyOf,
@@ -102,6 +103,7 @@ import {
   tyBearsNull,
   tyEq,
   tyFieldTyOf,
+  tyHasInferHole,
   tyIsHole,
   tyIsLitUnion,
   tyIsLitUnionOrLit,
@@ -2754,8 +2756,8 @@ function asvLitValue(ix: i32): boolean {
 }
 
 // `asvMoves`'s half that reads only the write at `asgIx`: a plain write to a name whose
-// storage type is not the value's, where neither is a literal-union atom or holds a type
-// variable, and the value is neither a bare `null` nor a number literal.
+// storage type is not the value's, where neither is a literal-union atom or an inference hole,
+// and the value is neither a bare `null` nor a number literal.
 function asvTypeMoves(asgIx: i32): boolean {
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
@@ -2764,11 +2766,37 @@ function asvTypeMoves(asgIx: i32): boolean {
   if nodeAt(unwrapParen(a.binRight)) is NullLit { return false }
   // A number literal's value is built where it is read (`asgLitWidth`), so it stays in place.
   if asvLitValue(a.binRight) { return false }
-  const lt = asgStoreTyOf(asgIx)
+  let lt = asgStoreTyOf(asgIx)
+  // Instances that store the place apart leave its column a hole; the shared body asks the type
+  // the place is declared at, which every instance substitutes.
+  if lt < 0 || tyHasInferHole(lt, 0) { lt = declaredPlaceTy(a.binLeft) }
   const vt = nodeTyIxOf(asgIx)
   if lt < 0 || vt < 0 || tySame(lt, vt) { return false }
   if tyIsLitUnionOrLit(nonNullTy(lt)) || tyIsLitUnionOrLit(vt) { return false }
-  !(tyHasTyVar(lt) || tyHasTyVar(vt))
+  if tyHasInferHole(lt, 0) || tyHasInferHole(vt, 0) { return false }
+  if !tyHasTyVar(lt) && !tyHasTyVar(vt) { return true }
+  // An open write moves only as a bare type parameter into a union holding it, whose instances
+  // store the two apart; any other open value keeps the place's own read (D2439).
+  tyAt(vt) is TyVar && tyAt(lt) is TyUnion
+}
+
+// The type the binding name `ix` reads is declared at, a `let`'s annotation or a parameter's;
+// -1 when it has none.
+function declaredPlaceTy(ix: i32): i32 {
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  match dn {
+    LetDecl => {
+      if dn.letType >= 0 { return nodeTyIxOf(dn.letType) }
+    }
+    Param => {
+      if dn.parType >= 0 { return nodeTyIxOf(dn.parType) }
+    }
+    // No other declaration is written with a type.
+    LoopVar | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
+  -1
 }
 
 // Walks the operands of `ix` that run first, moving each value-position write `asvMoves`
