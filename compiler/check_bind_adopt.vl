@@ -7,9 +7,13 @@ import {
   Call,
   FuncDecl,
   Ident,
+  Index,
   LetDecl,
+  Member,
   ObjLit,
   P,
+  Param,
+  TypeRef,
   nodeAt,
 } from "./ast"
 import {
@@ -36,8 +40,10 @@ import {
   recListLitsLateSet,
 } from "./check_rec_rows"
 import {
+  litAtDstStorage,
   recBuiltReadTy,
   recHoleIdentityArg,
+  recordRepTyAdopt,
   repStampListBuilt,
 } from "./check_fit_rules"
 import { nonNullTy } from "./tyquery"
@@ -67,8 +73,48 @@ export function callBindAdoptReps() {
   const n = callBindCount()
   while r < n {
     const tys = cbaRow(callBindIxAt(r), callBindNamesAt(r), callBindTysAt(r))
-    if tys.length > 0 { callBindRepTysSet(r, tys) }
+    if tys.length > 0 {
+      callBindRepTysSet(r, tys)
+      cbaAdoptLits(callBindIxAt(r), callBindNamesAt(r), tys)
+    }
     r = r + 1
+  }
+  0
+}
+
+// Builds each fresh record literal call `ix` hands to a parameter typed by a bare type variable
+// at the record the call's rep row binds it to, where the instance is built (D14816).
+function cbaAdoptLits(ix: i32, names: string[], reps: i32[]) {
+  const cn = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  const decl = elabCallDeclOf(ix)
+  const f = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  if (
+    !(cn is Call)
+    || !(f is FuncDecl)
+    || f.fnParams.length != cn.callArgs.length
+  ) {
+    return 0
+  }
+  let i = 0
+  while i < f.fnParams.length {
+    const pn = nodeAt(f.fnParams[i])
+    const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+    const a = parenPeelIx(cn.callArgs[i])
+    if pt is TypeRef && a >= 0 && a < P.nodes.length && nodeAt(a) is ObjLit {
+      let q = 0
+      while q < names.length {
+        const rt = if q < reps.length { reps[q] } else { -1 }
+        if (
+          names[q] == pt.tyName
+          && recRepWidens(nodeTyIxOf(a), rt)
+          && litAtDstStorage(a, rt)
+        ) {
+          recordRepTyAdopt(a, rt, 6)
+        }
+        q = q + 1
+      }
+    }
+    i = i + 1
   }
   0
 }
@@ -256,6 +302,17 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
   const tys: i32[] = []
   let moved = false
   for t in tys0 { tys.push(t) }
+  // A type variable a held argument binds at its own type stays there (D14817).
+  const heldN: string[] = []
+  const heldT: i32[] = []
+  let h = 0
+  while h < cn.callArgs.length {
+    const ha = cn.callArgs[h]
+    if cbaHeldArg(ha) && recArgBuiltTyOf(ha, nodeTyIxOf(ha)) < 0 {
+      bindGenWalk(f.fnParamTypes[h], nodeTyIxOf(ha), heldN, heldT)
+    }
+    h = h + 1
+  }
   let i = 0
   while i < cn.callArgs.length {
     const a = cn.callArgs[i]
@@ -274,6 +331,7 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
         while q < names.length {
           if (
             names[q] == dN[j]
+            && !strListHas(heldN, dN[j])
             && cbaBoundTo(oN, oT, dN[j], tys0[q])
             && !tyHasHole(dT[j])
             && !tyMentionsErr(tys0[q], 8)
@@ -290,6 +348,15 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
     i = i + 1
   }
   if moved { tys } else { [] }
+}
+
+// Whether argument `a` is a held value, a name or a read of one, rather than a fresh literal or a
+// call's result.
+function cbaHeldArg(a: i32): boolean {
+  const p = parenPeelIx(a)
+  if p < 0 || p >= P.nodes.length { return false }
+  const n = nodeAt(p)
+  n is Ident || n is Member || n is Index
 }
 
 // The record the literal binding argument `a` names is built at by the record solve

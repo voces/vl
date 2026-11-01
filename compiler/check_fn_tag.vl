@@ -44,11 +44,14 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  annTsOf,
+  callTyArgsOf,
   mkCallN,
   mkIdent,
   nodeAt,
   nodeChildren,
   nodeChildrenPush,
+  tsMentionsAnyName,
 } from "./ast"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import {
@@ -82,7 +85,7 @@ import {
 import { parenPeelIx } from "./check_places"
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
 import { lpExitsOf } from "./check_if_value"
-import { i32ListHas, i32ListIndexOf } from "./listutil"
+import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 import {
   mintCallSoleSet,
   mintFactCallOf,
@@ -93,6 +96,7 @@ import {
   mintFactSetOf,
   mintFactSplits,
   mintParamTakes,
+  mintRetParamsOf,
   mintSetPartial,
 } from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
@@ -232,60 +236,101 @@ export function fnTagRedecide(rootIx: i32): i32 {
 }
 
 // Tags set `s` when every node carrying it is a place an id can stand, and builds each call's
-// member calls.
+// member calls. A read of a smaller set stored where `s` is held is decided with it: both are
+// tagged or neither, since the store hands the smaller set's id on as one of `s`.
 function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
+  if fnTagSetIsTagged(s) { return 0 }
+  ftPlReset()
+  ftSubNeed = []
+  ftAssume = [s]
+  let ok = ftPlan(rootIx, s, calls, mint)
+  let q = 0
+  while ok && q < ftSubNeed.length {
+    const o = ftSubNeed[q]
+    if !i32ListHas(ftAssume, o) && !fnTagSetIsTagged(o) {
+      ftAssume.push(o)
+      ok = ftPlan(rootIx, o, calls, mint)
+    }
+    q = q + 1
+  }
+  ftAssume = []
+  if !ok || !ftPlLeafTysFill() { return 0 }
+  let k = 0
+  while k < ftPlS.length {
+    ftCommit(rootIx, k, calls, mint)
+    k = k + 1
+  }
+  0
+}
+
+// The sets the decision in progress takes as tagged, and the smaller sets its stores read.
+let ftAssume: i32[] = []
+let ftSubNeed: i32[] = []
+
+// One planned set per row: its leaves and their ids, each member's leaf type, and the joins
+// re-typed to it.
+let ftPlS: i32[] = []
+let ftPlLeaves: i32[][] = []
+let ftPlIds: i32[][] = []
+let ftPlLeafTy: i32[][] = []
+let ftPlResp: i32[][] = []
+let ftPlRespTy: i32[][] = []
+
+function ftPlReset() {
+  ftPlS = []
+  ftPlLeaves = []
+  ftPlIds = []
+  ftPlLeafTy = []
+  ftPlResp = []
+  ftPlRespTy = []
+  0
+}
+
+// Gives each planned member with no leaf of its own the type of its leaf in another row; false
+// when some member has none in any row.
+function ftPlLeafTysFill(): boolean {
+  let k = 0
+  while k < ftPlS.length {
+    const ds = fnTagMembers(ftPlS[k])
+    const lt = ftPlLeafTy[k]
+    let i = 0
+    while i < lt.length && i < ds.length {
+      if lt[i] < 0 {
+        let t = -1
+        let j = 0
+        while j < ftPlS.length && t < 0 {
+          const ls = ftPlLeaves[j]
+          const lids = ftPlIds[j]
+          let m = 0
+          while m < ls.length && m < lids.length && t < 0 {
+            if lids[m] == ds[i] { t = nodeTyIxOf(ls[m]) }
+            m = m + 1
+          }
+          j = j + 1
+        }
+        if t < 0 { return false }
+        lt[i] = t
+      }
+      i = i + 1
+    }
+    k = k + 1
+  }
+  true
+}
+
+// Tags the set planned in row `k` and builds each call's member calls.
+function ftCommit(rootIx: i32, k: i32, calls: i32[], mint: i32[]) {
+  if k < 0 || k >= ftPlS.length { return 0 }
+  const s = ftPlS[k]
   const ds = fnTagMembers(s)
-  const leaves: i32[] = []
-  const ids: i32[] = []
-  ftRespine = []
-  ftRespineTy = []
-  ftWideSeen = false
-  ftFwdFn = ftCallsHandFn(rootIx, s, calls, mint)
-  if !ftScan(rootIx, s, ds, leaves, ids) { return 0 }
-  // The functions written to one `let` must give a call through it one result (D9003), so a
-  // set a written `let` holds stays untagged where a call's members split.
-  if ftWideSeen {
-    for c in calls {
-      if fnTagCallSetOf(c) == s && fnTagCallSplits(c) { return 0 }
-    }
-    for r in mint {
-      if mintFactSetOf(r) == s && mintFactSplits(r) { return 0 }
-    }
-  }
-  // A member call names the member as its leaves do, so each member needs one.
-  const leafTy: i32[] = []
-  for d in ds {
-    let t = -1
-    let k = 0
-    while k < leaves.length && t < 0 {
-      if ids[k] == d { t = nodeTyIxOf(leaves[k]) }
-      k = k + 1
-    }
-    if t < 0 { return 0 }
-    leafTy.push(t)
-  }
-  // One member's call evaluates its arguments once, so after the elaboration a singleton's
-  // arguments may allocate.
-  const once = ftLate && ds.length == 1
-  for c in calls {
-    if fnTagCallSetOf(c) == s && !ftPlainArgsIn(c, once) { return 0 }
-  }
-  for r in mint {
-    if mintFactSetOf(r) == s && !ftPlainArgsIn(mintFactCallOf(r), once) {
-      return 0
-    }
-  }
-  for r in mint {
-    if mintFactSetOf(r) == s && !ftMintComplete(r, s) { return 0 }
-  }
-  // After the elaboration, a set the check left a closure is tagged only where every instance
-  // of a function calling through it binds it there.
-  if ftLate && !i32ListHas(ftWas, s) && mintSetPartial(s) { return 0 }
-  fnTagMark(s, leaves, ids)
+  const leafTy = ftPlLeafTy[k]
+  fnTagMark(s, ftPlLeaves[k], ftPlIds[k])
   ftLeafTys[s] = leafTy
+  const rs = ftPlResp[k]
+  const rt = ftPlRespTy[k]
   let ri = 0
-  while ri < ftRespine.length {
-    nodeTySetGrow(ftRespine[ri], ftRespineTy[ri])
+  while ri < rs.length && ri < rt.length {
+    nodeTySetGrow(rs[ri], rt[ri])
     ri = ri + 1
   }
   const r = nodeAt(rootIx)
@@ -303,6 +348,69 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     }
   }
   0
+}
+
+// Whether set `s` may be tagged, planning it in a new row when so.
+function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
+  const ds = fnTagMembers(s)
+  const leaves: i32[] = []
+  const ids: i32[] = []
+  ftRespine = []
+  ftRespineTy = []
+  ftWideSeen = false
+  ftFwdFn = ftCallsHandFn(rootIx, s, calls, mint)
+  if !ftScan(rootIx, s, ds, leaves, ids) { return false }
+  // The functions written to one `let` must give a call through it one result (D9003), so a
+  // set a written `let` holds stays untagged where a call's members split.
+  if ftWideSeen {
+    for c in calls {
+      if fnTagCallSetOf(c) == s && fnTagCallSplits(c) { return false }
+    }
+    for r in mint {
+      if mintFactSetOf(r) == s && mintFactSplits(r) { return false }
+    }
+  }
+  // A member call names the member as its leaves do, so each member needs one.
+  const leafTy: i32[] = []
+  for d in ds {
+    let t = -1
+    let k = 0
+    while k < leaves.length && t < 0 {
+      if ids[k] == d { t = nodeTyIxOf(leaves[k]) }
+      k = k + 1
+    }
+    // A member only a smaller set's read brings has its leaf in that set's plan.
+    if t < 0 && ftSubNeed.length == 0 { return false }
+    leafTy.push(t)
+  }
+  // One member's call evaluates its arguments once, so after the elaboration a singleton's
+  // arguments may allocate.
+  const once = ftLate && ds.length == 1
+  for c in calls {
+    if fnTagCallSetOf(c) == s && !ftPlainArgsIn(c, once) { return false }
+  }
+  for r in mint {
+    if mintFactSetOf(r) == s && !ftPlainArgsIn(mintFactCallOf(r), once) {
+      return false
+    }
+  }
+  for r in mint {
+    if mintFactSetOf(r) == s && !ftMintComplete(r, s) { return false }
+  }
+  // After the elaboration, a set the check left a closure is tagged only where every instance
+  // of a function calling through it binds it there.
+  if ftLate && !i32ListHas(ftWas, s) && mintSetPartial(s) { return false }
+  ftPlS.push(s)
+  ftPlLeaves.push(leaves)
+  ftPlIds.push(ids)
+  ftPlLeafTy.push(leafTy)
+  const rs: i32[] = []
+  const rt: i32[] = []
+  for x in ftRespine { rs.push(x) }
+  for t in ftRespineTy { rt.push(t) }
+  ftPlResp.push(rs)
+  ftPlRespTy.push(rt)
+  true
 }
 
 // Whether every call through the parameter fact row `r`'s call names has a fact of set `s` in
@@ -629,6 +737,106 @@ function ftScan(
   true
 }
 
+// Whether parameter `i` of `f` (declared at `d`) is typed by a type parameter that only it and
+// `f`'s result name, and `f` hands that parameter back: the result is the argument's value.
+export function ftOwnTyParamHandedBack(d: i32, f: FuncDecl, i: i32): boolean {
+  if !i32ListHas(mintRetParamsOf(d), i) || f.fnRet < 0 { return false }
+  const pn = nodeAt(f.fnParams[i])
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const tn = nodeAt(pn.parType)
+  const rn = nodeAt(f.fnRet)
+  if !(tn is TypeRef) || !(rn is TypeRef) || rn.tyName != tn.tyName {
+    return false
+  }
+  if !strListHas(f.fnTyParams, tn.tyName) { return false }
+  const nm: string[] = [tn.tyName]
+  let k = 0
+  while k < f.fnParams.length {
+    const q = nodeAt(f.fnParams[k])
+    if k != i && q is Param && q.parType >= 0 {
+      if tsMentionsAnyName(annTsOf(q.parType), nm) { return false }
+    }
+    k = k + 1
+  }
+  // Nor anything in the body that names a type: any of them could hold the id at `F`.
+  const todo: i32[] = [f.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if ftNamesTyIn(x, nm) { return false }
+      nodeChildrenPush(x, todo)
+    }
+  }
+  true
+}
+
+// Whether node `x` names a type mentioning one of `nm`: an annotation of a binding, parameter
+// or result, an `as` cast, or a call's explicit type arguments (refused whatever they name).
+function ftNamesTyIn(x: i32, nm: string[]): boolean {
+  const n = nodeAt(x)
+  match n {
+    TypeRef => {
+      return tsMentionsAnyName(annTsOf(x), nm)
+    }
+    LetDecl => {
+      return n.letType >= 0 && tsMentionsAnyName(annTsOf(n.letType), nm)
+    }
+    Param => {
+      return n.parType >= 0 && tsMentionsAnyName(annTsOf(n.parType), nm)
+    }
+    FuncDecl => {
+      return n.fnRet >= 0 && tsMentionsAnyName(annTsOf(n.fnRet), nm)
+    }
+    AsExpr => {
+      return ftSpellingNames(n.asTy, nm)
+    }
+    Call => {
+      return callTyArgsOf(x).length > 0
+    }
+    // No other node names a type of its own; its annotated children are walked separately.
+    ArrayLit | BinExpr | Block | BoolLit | BreakStmt | CharLit | ContinueStmt | ErrExpr | FieldDef | FieldInit | ForIn | ForRange | Ident | IfStmt | ImportDecl | Index | IsExpr | LoopVar | MatchExpr | Member | NullLit | NumLit | ObjLit | OptMember | Paren | Program | RetStmt | Spread | StrLit | TypeDecl | Unary | UnionDecl | WhileStmt => {
+      return false
+    }
+  }
+}
+
+// Whether type spelling `t` contains one of `nm` as a whole identifier.
+function ftSpellingNames(t: string, nm: string[]): boolean {
+  let i = 0
+  while i < t.length {
+    let j = i
+    while j < t.length && ftIdentChar(t[j]) { j = j + 1 }
+    if j > i && strListHas(nm, t.slice(i, j)) { return true }
+    i = if j > i { j } else { i + 1 }
+  }
+  false
+}
+
+function ftIdentChar(c: i32): boolean {
+  c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95
+}
+
+// Whether call `c` of declared function `d` hands a value of set `s` to a parameter `d` returns.
+function ftHandsBack(d: i32, c: Call, s: i32): boolean {
+  for i in mintRetParamsOf(d) {
+    if ftArgIsParam(c, i) && ftIsS(c.callArgs[i], s) { return true }
+  }
+  false
+}
+
+// Whether argument `i` of call `c` is parameter `i`: positional, unnamed, with no spread at or
+// before it.
+function ftArgIsParam(c: Call, i: i32): boolean {
+  if i < 0 || i >= c.callArgs.length { return false }
+  if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
+  let j = 0
+  while j <= i {
+    if nodeAt(parenPeelIx(c.callArgs[j])) is Spread { return false }
+    j = j + 1
+  }
+  true
+}
+
 // Whether `x` is a function name or lambda whose type holds set `s` in a parameter or result.
 function ftSigValue(x: i32, s: i32): boolean {
   const n = nodeAt(x)
@@ -842,6 +1050,8 @@ function ftNodeOk(
     Call => {
       if fnTagCallSetOf(x) == s { return true }
       const d = ftNamedFn(n.callFn)
+      // A function an instance found to hand back its parameter gives this call that argument.
+      if ftLate && d >= 0 && ftHandsBack(d, n, s) { return true }
       if d < 0 || !ftRetCarries(d, s) { return false }
       const f = nodeAt(d)
       if !(f is FuncDecl) { return false }
@@ -895,6 +1105,33 @@ function ftNodeOk(
       return false
     }
   }
+}
+
+// Whether the read `v` is of a set other than `s` whose members are all members of `s`, noting
+// that set for the decision in progress (`ftSubNeed`).
+function ftSubsetRead(v: i32, s: i32): boolean {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  const o = fnTagSetOfTy(nodeTyIxOf(v))
+  if o < 0 || o == s || !ftSetWithin(o, s) { return false }
+  if !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
+  true
+}
+
+// Whether a place of type `t` holds a set other than `s` with every member of `s`, tagged or
+// being decided with `s`.
+function ftHeldWider(t: i32, s: i32): boolean {
+  const o = fnTagSetOfTy(t)
+  if o < 0 || o == s || !ftSetWithin(s, o) { return false }
+  fnTagSetIsTagged(o) || i32ListHas(ftAssume, o)
+}
+
+// Whether every member of set `a` is a member of set `b`.
+function ftSetWithin(a: i32, b: i32): boolean {
+  const bm = fnTagMembers(b)
+  for d in fnTagMembers(a) {
+    if !i32ListHas(bm, d) { return false }
+  }
+  true
 }
 
 // Whether the list `arr` is written holds a tagged set other than `s` with every member of `s`:
@@ -1123,6 +1360,7 @@ function ftValuesOk(
   for v in vs {
     if !ftIsS(v, s) {
       const d = ftLeafMember(v, ds)
+      if d < 0 && ftSubsetRead(v, s) { continue }
       if d < 0 { return false }
       if !i32ListHas(leaves, v) {
         leaves.push(v)
@@ -1215,7 +1453,9 @@ function ftHoleParamOf(c: Call, x: i32): boolean {
       if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
       const pn = nodeAt(f.fnParams[i])
       return pn is Param
-        && (pn.parType < 0 || ftLate && fnTagOwnTyParamAlone(f, i))
+        && (pn.parType < 0
+        || ftLate
+        && (fnTagOwnTyParamAlone(f, i) || ftOwnTyParamHandedBack(d, f, i)))
     }
     i = i + 1
   }
@@ -1256,7 +1496,9 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
   const d = ftCalleeFn(ftCalleeSource(c))
   if d < 0 { return true }
   const i = i32ListIndexOf(c.callArgs, x)
-  mintParamTakes(d, i, s) || ftParamUnread(d, i)
+  mintParamTakes(d, i, s)
+    || ftParamUnread(d, i)
+    || ftArgIsParam(c, i) && i32ListHas(mintRetParamsOf(d), i)
 }
 
 // Whether, after the elaboration, argument `x` of call `c` through a set of functions lands in a
@@ -1354,6 +1596,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       }
       if pn.binRight != x { return false }
       if ftIsS(pn.binLeft, s) { return true }
+      if ftHeldWider(nodeTyIxOf(pn.binLeft), s) { return true }
       const ln = nodeAt(pn.binLeft)
       return ln is Index && ftStoreInWider(ln.idxArr, s)
     }

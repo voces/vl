@@ -37,11 +37,12 @@ const DROP_NONE = 0;
 const DROP_NOTHING = 1;
 const DROP_AS_VOID = 2;
 
-/** Compile `src` on a fresh instance with the shadow armed; the rows by class, summed. */
-const shadow = (src: string, drop: number, named: boolean) => {
+/** Compile `src` on a fresh instance with one shadow armed; the rows by class, summed. */
+const shadow = (src: string, drop: number, named: boolean, kind = false) => {
   const exp = new WebAssembly.Instance(compiled!, {})
     .exports as unknown as Exports;
-  exp.fnRetShadowArm(named ? 2 : 1);
+  if (kind) exp.fnKindShadowArm(named ? 2 : 1);
+  else exp.fnRetShadowArm(named ? 2 : 1);
   exp.fnRetShadowDropSet(drop);
   exp.modReset();
   exp.srcReset();
@@ -66,8 +67,9 @@ const expectRows = (
   drop: number,
   named: boolean,
   want: string,
+  kind = false,
 ) => {
-  const { rc, rows } = shadow(src, drop, named);
+  const { rc, rows } = shadow(src, drop, named, kind);
   if (rc !== 0) throw new Error(`${name}: want compileSrc rc 0, got ${rc}`);
   const got = show(rows);
   if (got !== want) {
@@ -288,6 +290,97 @@ Deno.test({
       DROP_AS_VOID,
       false,
       "agree=1; recorded void, emitter value=4",
+    );
+  },
+});
+
+// The result-kind shadow: a valued function's recorded result against its lowered signature's
+// result token. A closure writing a value `if` into a captured `i64` records `i32` (an
+// assignment yields its right side) and lowers the stored `i64`.
+const HEX_LAMBDA = `function g(c: boolean) {
+  let x: i64 = 0
+  const set = () => {
+    x = if c { 0xfffffffe } else { 1 }
+  }
+  set()
+  print(x)
+}
+g(true)
+`;
+
+Deno.test({
+  name: "fn-ret shadow: kind classes",
+  ignore,
+  fn() {
+    expectRows("kind plain", PLAIN, DROP_NONE, true, "kind agree | g=1", true);
+    expectRows(
+      "kind hex lambda",
+      HEX_LAMBDA,
+      DROP_NONE,
+      true,
+      "kind: recorded >i, lowered >I | __lambda_0=1",
+      true,
+    );
+  },
+});
+
+// A `u8[]` map's callback records `(e: u8) => u8`, a storage type its value widens from: it
+// crosses as the `i32` its lowered signature carries.
+const U8_MAP = `const xs: u8[] = [1, 200, 7]
+const m = xs.map((e) => e)
+print(m[1])
+`;
+
+// An intersection of records folds to a one-member union around the merged record (D14794),
+// whose rep and token are that record's.
+const INTERSECTION = `type AB = { a: i32 } & { b: i32 }
+function mkAB(): AB { return { a: 1, b: 2 } }
+function sumAB(v: AB): i32 { return v.a + v.b }
+print(sumAB(mkAB()))
+`;
+
+Deno.test({
+  name: "fn-ret shadow: kind u8 and intersection",
+  ignore,
+  fn() {
+    expectRows(
+      "kind intersection",
+      INTERSECTION,
+      DROP_NONE,
+      true,
+      "kind agree | mkAB=1; kind agree | sumAB=1",
+      true,
+    );
+    expectRows(
+      "kind u8 map",
+      U8_MAP,
+      DROP_NONE,
+      true,
+      "kind agree | __lambda_0=1",
+      true,
+    );
+  },
+});
+
+Deno.test({
+  name: "fn-ret shadow: kind fires",
+  ignore,
+  fn() {
+    expectRows(
+      "kind, nothing",
+      PLAIN,
+      DROP_NOTHING,
+      false,
+      "kind: no result recorded=1",
+      true,
+    );
+    expectRows(
+      "kind, all void",
+      PLAIN,
+      DROP_AS_VOID,
+      false,
+      "kind: recorded void or never=1",
+      true,
     );
   },
 });
