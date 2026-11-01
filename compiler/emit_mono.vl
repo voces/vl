@@ -44,7 +44,7 @@ import {
   nameIsParenSpanEnds,
   peelGroupParens,
 } from "./tyname"
-import { njSetPinFn, nodeRepTyIxOf, pinResolvedFnTy } from "./check_core_state"
+import { njSetPinFn, nodeRepTyIxOf } from "./check_core_state"
 import {
   bindGenUnionShapedArmInto,
   holePinReadOf,
@@ -692,6 +692,7 @@ import {
   fnTagCallCopy,
   fnTagCallSetOf,
   fnTagHoldsTy,
+  fnTagLeafCarry,
   fnTagListTy,
   fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
@@ -4293,6 +4294,19 @@ function monoRetBoundLitCopy(x: i32): i32 {
   cx
 }
 
+// Annotation `nt` of binding `n` at `ix` in the instance being walked, or, for a binding a
+// desugar minted (`$`-named), the elaboration's type for it where that closes the template's
+// union to one non-union type. A union stays spelled as `nt`, which keeps its declared rows.
+function monoMintedLetAnn(n: LetDecl, ix: i32, nt: i32): i32 {
+  if nt < 0 || n.letName.slice(0, 1) != "$" { return nt }
+  const et = elabWalkTy(ix)
+  if et < 0 || et >= T.tys.length || tyHasTyVar(et) || et == nodeTyIxOf(nt) {
+    return nt
+  }
+  if tyIsUnionish(et) || !tyIsUnionish(nodeTyIxOf(nt)) { return nt }
+  synthTypeRefTy(monoPinAnnSpelling(et), -1, et)
+}
+
 // `monoCloneBodyRaw`'s arm for the binding `n` at `ix`: its instance annotation.
 function monoCloneLetDecl(
   n: LetDecl,
@@ -4303,7 +4317,11 @@ function monoCloneLetDecl(
   bN: string[],
   bT: i32[],
 ): i32 {
-  const nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
+  const nt = monoMintedLetAnn(
+    n,
+    ix,
+    monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT),
+  )
   if nt == n.letType { return ix }
   const ninit = monoCtorInitCopy(n.letInit, nt)
   return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ninit, n.pos))
@@ -4442,6 +4460,7 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
           const clone = mkFunc(nm, noTP, ps, a.fnRet, a.fnBody, a.pos)
           identOrigNote(clone, unwrapParen(argIx))
           recordClonedCallRetire(unwrapParen(argIx), clone)
+          fnTagLeafCarry(clone, unwrapParen(argIx))
           fnStmts.push(clone)
           fnParent.push(-1)
           fnDispNames.push("")
@@ -4889,6 +4908,8 @@ function monoLamElabRet(fnIx: i32): i32 {
 // at `fnIx`, into its own `fnStmts` slot and re-parents the lambdas minted since `mark`.
 // Returns `clone`.
 function monoLamInstallClone(a: FuncDecl, fnIx: i32, clone: i32, mark: i32) {
+  // A lambda member of a tagged set is its id wherever an instance of it is read.
+  fnTagLeafCarry(clone, fnIx)
   // D1046 — the first instance of a named nested function replaces the template's slot
   // rather than pushing beside it: the by-name lookup takes the first child of the
   // frame, so two same-named children mean the call answers the unsubstituted template.
@@ -4997,7 +5018,11 @@ function monoPinBodyLambdasRaw(
     monoPinSink = false
     // A binding inside an expression (an `if` arm's prelude), which the statement clone does
     // not reach, has its annotation substituted here.
-    const nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
+    const nt = monoMintedLetAnn(
+      n,
+      ix,
+      monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT),
+    )
     if ci == n.letInit && nt == n.letType { return ix }
     return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ci, n.pos))
   }
@@ -7719,12 +7744,11 @@ function monoTagSetAt(ix: i32, callFn: i32): i32 {
   const s = fnTagSetOfTy(t)
   if s >= 0 && fnTagArmsAt(ix, s).length > 0 { return s }
   // A callee read off a list or record the instance types at its rep (an element's i32 id) is
-  // the set its template's facts name.
+  // the set its template's facts name; one the instance types as a closure is not.
+  if s >= 0 || tyAt(t) is TyFunc { return -1 }
   const tpl = monoCallTplOf(ix)
   const ms = mintCallSoleSet(tpl)
-  if s < 0 && fnTagSetIsTagged(ms) && fnTagArmsAt(tpl, ms).length > 0 {
-    return ms
-  }
+  if fnTagSetIsTagged(ms) && fnTagArmsAt(tpl, ms).length > 0 { return ms }
   -1
 }
 
@@ -10188,6 +10212,9 @@ function monoMakeInstanceLater(
       )
     }
   }
+  if origFe >= 0 && origFe < monoOrigNode.length {
+    fnTagLeafCarry(nfn, monoOrigNode[origFe])
+  }
   fnStmts.push(nfn)
   // A nested template's later instance keeps the template's frame, so its captures
   // resolve where the first instance's do and its env fields take their real types (D2749).
@@ -10551,6 +10578,7 @@ function monoMakeInstanceFirst(
   instName: string,
 ) {
   buildFnMapNoteFnStmtWrite(origFe, nfn)
+  fnTagLeafCarry(nfn, monoOrigNode[origFe])
   fnStmts[origFe] = nfn
   monoLamCallByName(calleeIx, origFe, instName)
   0
@@ -17701,17 +17729,14 @@ function monoReachRecTy(a: i32, t: Ty) {
 
 // The call type literal `a`'s slot at `path`, of open function type `st`, reaches, recorded on
 // each reached callee still open; -1 when the slot is no such function or reaches no one type.
-// A slot whose holes are already pinned keeps its type (-1), and its open callees take the pin.
-// A slot holding a tagged set keeps the set's one rep (-1).
+// A slot with no type variable keeps its type (-1), and so does one holding a tagged set, the
+// set's one rep.
 function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
   if st < 0 || st >= T.tys.length || !(tyAt(st) is TyFunc) { return -1 }
   if fnTagTyIsTagged(st) { return -1 }
   if !tyHasTyVar(st) { return -1 }
-  const pr = pinResolvedFnTy(st)
-  const pinned = pr >= 0 && !tyHasTyVar(pr)
-  const reached = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
-  if reached < 0 { return -1 }
-  const ct = if pinned { pr } else { reached }
+  const ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
+  if ct < 0 { return -1 }
   for c in vrCalls(a, path) {
     if c < 0 || c >= P.nodes.length { continue }
     const cn = nodeAt(c)
@@ -17722,7 +17747,6 @@ function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
       }
     }
   }
-  if pinned { return -1 }
   ct
 }
 
@@ -22211,8 +22235,8 @@ function monoPinHoleParam(
     an = monoElabPin(callIx, args, i, et, ctx)
     if an != "" { anTy = et }
   }
-  // The stub pin where the elaboration left the parameter open: a list of lists of a hole function
-  // the callee calls at two types, whose element has no one signature (D14727).
+  // The stub pin where the elaboration left the parameter open: a labelled block's uncalled hole
+  // function (D14780), and a nested list of one called at two types behind a returning guard (D14781).
   if an == "" && et < 0 {
     const inTy: i32[] = [0 - 1]
     an = monoInertParamStubPin(oDecl, args[i], inTy)
@@ -24521,6 +24545,14 @@ function monoNoteCallLitDests(n: Call, ix: i32, ctx: i32) {
   0
 }
 
+// The template slot of the lambda a dispatch arm's nameless callee `cf` is bound to, or -1.
+function monoArmLamFe(cf: i32, callee: Ident): i32 {
+  if callee.identName != "" { return -1 }
+  const d = identDeclOf(cf)
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is FuncDecl) { return -1 }
+  fnStmtsPosOf(d)
+}
+
 // `monoWalk`'s arm for a call `n` (node `ix`, in frame `ctx`) whose callee is the identifier
 // `callee`, its arguments already walked: coerces generic values at concrete parameters, then
 // instantiates the generic it resolves to, through any alias, or specializes a concrete one.
@@ -24576,9 +24608,15 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
   let wlAt = n.callFn
   let wlFr = ctx
   if fe < 0 {
+    // A dispatch arm calls its member by declaration: a lambda's arm names no function, so
+    // it takes the lambda's own template slot and is instantiated per call as a name is.
+    let afe = monoArmLamFe(n.callFn, callee)
+    if afe >= 0 && !i32ListHas(monoLamCallCallees, n.callFn) {
+      monoLamCallCallees.push(n.callFn)
+    }
     // A call through a `const` alias of a lambda's `const` binding calls that lambda, and is
     // instantiated per call alike (D2896).
-    let afe = monoRespellLamFe(n.callFn, ctx)
+    if afe < 0 { afe = monoRespellLamFe(n.callFn, ctx) }
     // A direct call through a value binding to a generic named function: resolve it
     // to the lifted slot and monomorphize per call site. Named functions only, and
     // re-read rather than reused from `dfe`, the coercion loop between having run.
