@@ -193,10 +193,10 @@ import {
   uBoxIdx,
   uBoxNewEnd,
   uDeclared,
-  uVarRow,
   unionSinkBase,
   variantHeap,
   variantReboxSlot,
+  variantRowOf,
 } from "./emit_state"
 
 // ── wasm opcode / type-byte constants ─────────────────────────────────────────
@@ -2509,11 +2509,22 @@ export function fbRefNullRun(heapIdx: i32) {
   wSLEB(heapIdx)
   0
 }
+// The slot a `(kind, structIdx)` pair writes from: a variant kind's arm row (`variantRowOf`),
+// -1 where the arm has none; any other kind's slot unchanged.
+function armStructSlot(kind: VKind, structIdx: i32): i32 {
+  if kind == "variant" || kind == "nulvariant" {
+    return variantRowOf(structIdx)
+  }
+  structIdx
+}
+
 // Emits `ref.null <heaptype>` for a global cell of ref `kind`: the zero initializer
 // that lets the cell be declared nullable before the start function `global.set`s the
 // real value. Mirrors `fbValtype`'s kind→heap-index map. A scalar global (kind 0)
 // never reaches here — it zero-inits with `i32.const 0`.
 export function fbRefNullForKind(kind: VKind, structIdx: i32) {
+  // A variant kind names its arm's struct row: the same heap, written by the struct arms.
+  const si = armStructSlot(kind, structIdx)
   wU8(OP_REF_NULL) // 0xd0 ref.null
   // Same unresolved-slot guard as `fbValtype`: fail loudly, never read a table OOB.
   if (
@@ -2525,12 +2536,13 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
     || kind == "nulstruct"
   ) {
     if (
-      structIdx < 0
-      || ((kind == "struct" || kind == "nulstruct") && structIdx >= sHeapIdx.length)
-      || ((kind == "variant" || kind == "nulvariant")
-        && structIdx >= uVarRow.length)
-      || ((kind == "reflist" || kind == "nulreflist")
-        && structIdx >= rlWrapIdx.length)
+      si < 0
+      || ((kind == "struct"
+        || kind == "nulstruct"
+        || kind == "variant"
+        || kind == "nulvariant")
+        && si >= sHeapIdx.length)
+      || ((kind == "reflist" || kind == "nulreflist") && si >= rlWrapIdx.length)
     ) {
       wSLEB(aTypeIdx)
       return emitFail("emitProgram: ref.null with no interned shape")
@@ -2540,14 +2552,8 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
   // member without an arm is a compile error here rather than the array heap type, which is a
   // well-formed answer for a rep that is not an array.
   match kind {
-    "struct" | "nulstruct" => {
-      wSLEB(sHeapIdx[structIdx])
-    }
-    "variant" | "nulvariant" => {
-      // The variant table, not `sHeapIdx`: without this arm a nullable-variant global cell
-      // zero-inits with a `ref.null` of an unrelated type while its own valtype says
-      // `variantHeap(vi)` — a module that does not even parse.
-      wSLEB(variantHeap(structIdx))
+    "struct" | "nulstruct" | "variant" | "nulvariant" => {
+      wSLEB(sHeapIdx[si])
     }
     "list" | "nullist" => {
       wSLEB(lTypeIdx)
@@ -2560,10 +2566,10 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
       wSLEB(uBoxIdx)
     }
     "reflist" | "nulreflist" => {
-      wSLEB(rlWrapIdx[structIdx]) // THIS ref-list slot's wrapper struct heap-type index
+      wSLEB(rlWrapIdx[si]) // THIS ref-list slot's wrapper struct heap-type index
     }
     "map" | "nulmap" => {
-      wSLEB(mapTypeIdxOf(structIdx)) // mono map, or THIS mv slot's map struct
+      wSLEB(mapTypeIdxOf(si)) // mono map, or THIS mv slot's map struct
     }
     "strlist" | "nulstrlist" => {
       wSLEB(mkListIdx) // `string[]`, and the `| null` cell that shares its wrapper
@@ -2737,6 +2743,8 @@ function fbFieldStorageRun(code: i32, storageSlot: i32) {
 // same `0x7f` i32 as `fbValtype`. Only used for NON-const globals; const globals keep
 // the non-null `fbValtype` (so goldens are unchanged).
 export function fbValtypeNullable(kind: VKind, structIdx: i32) {
+  // A variant kind names its arm's struct row: the same heap, written by the struct arms.
+  const si = armStructSlot(kind, structIdx)
   // A struct/ref-list kind with NO resolved table slot (or one past its table)
   // would read a table out of bounds (a trap). Fail loudly instead, writing a
   // placeholder i32 so the buffer stays well-formed while `emitFail` unwinds.
@@ -2749,15 +2757,15 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
     || kind == "nulstruct"
   ) {
     if (
-      structIdx < 0
-      || ((kind == "struct" || kind == "nulstruct") && structIdx >= sHeapIdx.length)
-      || ((kind == "variant" || kind == "nulvariant")
-        && structIdx >= uVarRow.length)
-      || ((kind == "reflist" || kind == "nulreflist")
-        && structIdx >= rlWrapIdx.length)
+      si < 0
+      || ((kind == "struct"
+        || kind == "nulstruct"
+        || kind == "variant"
+        || kind == "nulvariant")
+        && si >= sHeapIdx.length)
+      || ((kind == "reflist" || kind == "nulreflist") && si >= rlWrapIdx.length)
     ) {
-      // The variant kinds read `variantHeap`; an index past the variant table would index
-      // out of bounds and trap, which this guard converts into a loud reject instead
+      // An index past its table would trap; this guard converts it into a loud reject instead
       // (`emitFail` records and returns rather than halting, so emission keeps running
       // and an unbounded read here would otherwise still be reached).
 
@@ -2768,7 +2776,7 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
   // The declarative VKind → nullable-cell valtype table, exhaustive like `fbValtype`'s:
   // a new VKind member without an arm is a checker-caught compile error, not a silent
   // `0x7f` — no `_` arm, deliberately. `i32` and `nulbool` are both the i32 valtype;
-  // `variant` is the same `variantHeap` struct ref `fbValtype`'s non-null arm writes, nullable.
+  // a variant kind is its arm's struct row, written by the struct arms.
   match kind {
     "i32" => {
       wU8(VT_I32) // 0x7f i32 (scalar, never a nullable ref)
@@ -2788,13 +2796,13 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
     "v128" => {
       wU8(VT_V128) // 0x7b v128 (SIMD scalar, never a nullable ref)
     }
-    "struct" => {
+    "struct" | "variant" => {
       wU8(RT_REF_NULL) // 0x63 (ref null ht)
-      wSLEB(sHeapIdx[structIdx])
+      wSLEB(sHeapIdx[si])
     }
-    "nulstruct" => {
+    "nulstruct" | "nulvariant" => {
       wU8(RT_REF_NULL)
-      wSLEB(sHeapIdx[structIdx])
+      wSLEB(sHeapIdx[si])
     }
     "list" => {
       wU8(RT_REF_NULL)
@@ -2816,32 +2824,21 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
       wU8(RT_REF_NULL)
       wSLEB(uBoxIdx)
     }
-    "variant" => {
-      wU8(RT_REF_NULL) // the concrete union-variant struct ref, made nullable
-      wSLEB(variantHeap(structIdx))
-    }
-    "nulvariant" => {
-      // `Circle | null` — the SAME cell as the non-null `variant` above, because a wasm
-      // local is declared nullable either way; the two differ only in the SIGNATURE
-      // positions, which `fbValtype` writes.
-      wU8(RT_REF_NULL)
-      wSLEB(variantHeap(structIdx))
-    }
     "reflist" => {
       wU8(RT_REF_NULL)
-      wSLEB(rlWrapIdx[structIdx]) // THIS ref-list slot's wrapper struct heap-type index
+      wSLEB(rlWrapIdx[si]) // THIS ref-list slot's wrapper struct heap-type index
     }
     "nulreflist" => {
       wU8(RT_REF_NULL)
-      wSLEB(rlWrapIdx[structIdx])
+      wSLEB(rlWrapIdx[si])
     }
     "map" => {
       wU8(RT_REF_NULL)
-      wSLEB(mapTypeIdxOf(structIdx)) // mono map, or THIS mv slot's map struct
+      wSLEB(mapTypeIdxOf(si)) // mono map, or THIS mv slot's map struct
     }
     "nulmap" => {
       wU8(RT_REF_NULL) // `{[string]: V} | null` — the nullable map struct ref
-      wSLEB(mapTypeIdxOf(structIdx))
+      wSLEB(mapTypeIdxOf(si))
     }
     "strlist" => {
       wU8(RT_REF_NULL)
@@ -2905,6 +2902,8 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
 // scalar (its nullable rep is the union box, whose null its own sink builds). Paired
 // with `fbValtypeNullable` arm for arm — a mismatch between the two is invalid wasm.
 export function fbRefNullOfKind(kind: VKind, structIdx: i32) {
+  // A variant kind names its arm's struct row: the same heap, written by the struct arms.
+  const si = armStructSlot(kind, structIdx)
   // The same out-of-bounds guard `fbValtypeNullable` carries, for the same tables.
   if (
     kind == "struct"
@@ -2915,12 +2914,13 @@ export function fbRefNullOfKind(kind: VKind, structIdx: i32) {
     || kind == "nulstruct"
   ) {
     if (
-      structIdx < 0
-      || ((kind == "struct" || kind == "nulstruct") && structIdx >= sHeapIdx.length)
-      || ((kind == "variant" || kind == "nulvariant")
-        && structIdx >= uVarRow.length)
-      || ((kind == "reflist" || kind == "nulreflist")
-        && structIdx >= rlWrapIdx.length)
+      si < 0
+      || ((kind == "struct"
+        || kind == "nulstruct"
+        || kind == "variant"
+        || kind == "nulvariant")
+        && si >= sHeapIdx.length)
+      || ((kind == "reflist" || kind == "nulreflist") && si >= rlWrapIdx.length)
     ) {
       return emitFail("emitProgram: ref null with no interned shape")
     }
@@ -2944,11 +2944,11 @@ export function fbRefNullOfKind(kind: VKind, structIdx: i32) {
     "v128" => {
       return emitFail("emitProgram: a v128 has no null of its own")
     }
-    "struct" => {
-      fbRefNull(sHeapIdx[structIdx])
+    "struct" | "variant" => {
+      fbRefNull(sHeapIdx[si])
     }
-    "nulstruct" => {
-      fbRefNull(sHeapIdx[structIdx])
+    "nulstruct" | "nulvariant" => {
+      fbRefNull(sHeapIdx[si])
     }
     "list" => {
       fbRefNull(lTypeIdx)
@@ -2965,23 +2965,17 @@ export function fbRefNullOfKind(kind: VKind, structIdx: i32) {
     "union" => {
       fbRefNull(uBoxIdx)
     }
-    "variant" => {
-      fbRefNull(variantHeap(structIdx))
-    }
-    "nulvariant" => {
-      fbRefNull(variantHeap(structIdx))
-    }
     "reflist" => {
-      fbRefNull(rlWrapIdx[structIdx])
+      fbRefNull(rlWrapIdx[si])
     }
     "nulreflist" => {
-      fbRefNull(rlWrapIdx[structIdx])
+      fbRefNull(rlWrapIdx[si])
     }
     "map" => {
-      fbRefNull(mapTypeIdxOf(structIdx))
+      fbRefNull(mapTypeIdxOf(si))
     }
     "nulmap" => {
-      fbRefNull(mapTypeIdxOf(structIdx))
+      fbRefNull(mapTypeIdxOf(si))
     }
     "strlist" => {
       fbRefNull(mkListIdx)
@@ -3032,6 +3026,8 @@ export function fbRefNullOfKind(kind: VKind, structIdx: i32) {
 // `structIdx` is the table slot it resolves through — a ref-list kind must select the
 // caller's own slot, since each ref-list element type has its own wrapper, never the first.
 export function fbValtype(kind: VKind, structIdx: i32) {
+  // A variant kind names its arm's struct row: the same heap, written by the struct arms.
+  const si = armStructSlot(kind, structIdx)
   // Same out-of-bounds guard as `fbValtypeNullable`: a struct/ref-list kind whose
   // table slot never resolved (or overran its table) fails loudly, never traps.
   if (
@@ -3043,14 +3039,15 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     || kind == "nulreflist"
   ) {
     if (
-      structIdx < 0
-      || ((kind == "struct" || kind == "nulstruct") && structIdx >= sHeapIdx.length)
-      || ((kind == "variant" || kind == "nulvariant")
-        && structIdx >= uVarRow.length)
-      || ((kind == "reflist" || kind == "nulreflist")
-        && structIdx >= rlWrapIdx.length)
+      si < 0
+      || ((kind == "struct"
+        || kind == "nulstruct"
+        || kind == "variant"
+        || kind == "nulvariant")
+        && si >= sHeapIdx.length)
+      || ((kind == "reflist" || kind == "nulreflist") && si >= rlWrapIdx.length)
     ) {
-      // Same `variantHeap` bound as `fbValtypeNullable`'s guard — see there.
+      // Same bound as `fbValtypeNullable`'s guard — see there.
 
       wU8(VT_I32)
       return emitFail("emitProgram: ref valtype with no interned shape")
@@ -3079,9 +3076,9 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     "v128" => {
       wU8(VT_V128) // 0x7b v128 (SIMD scalar)
     }
-    "struct" => {
+    "struct" | "variant" => {
       wU8(RT_REF)
-      wSLEB(sHeapIdx[structIdx])
+      wSLEB(sHeapIdx[si])
     }
     "list" => {
       wU8(RT_REF)
@@ -3097,26 +3094,15 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     }
     "reflist" => {
       wU8(RT_REF)
-      wSLEB(rlWrapIdx[structIdx])
+      wSLEB(rlWrapIdx[si])
     }
     "map" => {
       wU8(RT_REF)
-      wSLEB(mapTypeIdxOf(structIdx))
+      wSLEB(mapTypeIdxOf(si))
     }
     "strlist" => {
       wU8(RT_REF)
       wSLEB(mkListIdx)
-    }
-    "variant" => {
-      wU8(RT_REF)
-      wSLEB(variantHeap(structIdx))
-    }
-    "nulvariant" => {
-      // The variant-table twin of `nulstruct` just below: a NULLABLE ref (0x63) to the
-      // variant's own heap type, which is what makes `Circle | null` a niche rather than
-      // a box — no allocation, and `null` is the ref's own null.
-      wU8(RT_REF_NULL)
-      wSLEB(variantHeap(structIdx))
     }
     "f64list" => {
       wU8(RT_REF)
@@ -3138,9 +3124,9 @@ export function fbValtype(kind: VKind, structIdx: i32) {
       wU8(RT_REF)
       wSLEB(cloStructIdx)
     }
-    "nulstruct" => {
+    "nulstruct" | "nulvariant" => {
       wU8(RT_REF_NULL)
-      wSLEB(sHeapIdx[structIdx])
+      wSLEB(sHeapIdx[si])
     }
     "nullist" => {
       wU8(RT_REF_NULL)
@@ -3152,7 +3138,7 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     }
     "nulreflist" => {
       wU8(RT_REF_NULL)
-      wSLEB(rlWrapIdx[structIdx])
+      wSLEB(rlWrapIdx[si])
     }
     "nulclosure" => {
       wU8(RT_REF_NULL)
@@ -3184,7 +3170,7 @@ export function fbValtype(kind: VKind, structIdx: i32) {
       // non-null `"map"` arm; only the ref nullability differs (the `struct → nulstruct`
       // relationship, hoisted to the map struct).
       wU8(RT_REF_NULL)
-      wSLEB(mapTypeIdxOf(structIdx))
+      wSLEB(mapTypeIdxOf(si))
     }
     "nulnone" => {
       // `nullref` — the one-byte abstract form (`0x71`), not `0x63 <typeidx>`: `none` is

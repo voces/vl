@@ -214,6 +214,13 @@ box reads 1.3–2.3x under load and is graded only from quiet runs. Binaryen's s
 cannot see, is held by two exact facts about the rung input (D2335, D2336). `-- --write-baseline`
 on a quiet box; profiling-the-compiler.md §Guards.
 
+**LATE DEMANDS ARE A GATED NUMBER TOO — `vl run scripts/late-demands.vl -- --check`.** It counts, per
+file, the elaboration keys a compile mints after `elabRun` returned (`$VL_LATE_DEMANDS=1` prints them
+for one build), against a committed `scripts/late-demands-baseline.txt`. A rise fails. A fall passes,
+but `--check` names it, and the PR that earned it runs `--write-baseline`. **Write the baseline from a
+FIXPOINT seed** (refresh until a second `refresh-compiler.sh` is byte-identical): a one-level build is
+the new source as the old compiler lowered it, and can count differently.
+
 ## "Zero silent rows" is a claim about the INVENTORY, not about VL
 
 The filed inventories hold ~199 hand-written rows. The distilled corpus holds **7,021 cells**.

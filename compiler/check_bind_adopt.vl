@@ -7,9 +7,13 @@ import {
   Call,
   FuncDecl,
   Ident,
+  Index,
   LetDecl,
+  Member,
   ObjLit,
   P,
+  Param,
+  TypeRef,
   nodeAt,
 } from "./ast"
 import {
@@ -32,10 +36,14 @@ import {
   recBuildTyOf,
   recKeptFnDstOf,
   recListLits,
+  recListLitsLate,
+  recListLitsLateSet,
 } from "./check_rec_rows"
 import {
+  litAtDstStorage,
   recBuiltReadTy,
   recHoleIdentityArg,
+  recordRepTyAdopt,
   repStampListBuilt,
 } from "./check_fit_rules"
 import { nonNullTy } from "./tyquery"
@@ -65,8 +73,48 @@ export function callBindAdoptReps() {
   const n = callBindCount()
   while r < n {
     const tys = cbaRow(callBindIxAt(r), callBindNamesAt(r), callBindTysAt(r))
-    if tys.length > 0 { callBindRepTysSet(r, tys) }
+    if tys.length > 0 {
+      callBindRepTysSet(r, tys)
+      cbaAdoptLits(callBindIxAt(r), callBindNamesAt(r), tys)
+    }
     r = r + 1
+  }
+  0
+}
+
+// Builds each fresh record literal call `ix` hands to a parameter typed by a bare type variable
+// at the record the call's rep row binds it to, where the instance is built (D14816).
+function cbaAdoptLits(ix: i32, names: string[], reps: i32[]) {
+  const cn = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  const decl = elabCallDeclOf(ix)
+  const f = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  if (
+    !(cn is Call)
+    || !(f is FuncDecl)
+    || f.fnParams.length != cn.callArgs.length
+  ) {
+    return 0
+  }
+  let i = 0
+  while i < f.fnParams.length {
+    const pn = nodeAt(f.fnParams[i])
+    const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+    const a = parenPeelIx(cn.callArgs[i])
+    if pt is TypeRef && a >= 0 && a < P.nodes.length && nodeAt(a) is ObjLit {
+      let q = 0
+      while q < names.length {
+        const rt = if q < reps.length { reps[q] } else { -1 }
+        if (
+          names[q] == pt.tyName
+          && recRepWidens(nodeTyIxOf(a), rt)
+          && litAtDstStorage(a, rt)
+        ) {
+          recordRepTyAdopt(a, rt, 6)
+        }
+        q = q + 1
+      }
+    }
+    i = i + 1
   }
   0
 }
@@ -160,32 +208,67 @@ function recListLitBuiltTyOf(l: ArrayLit, own: i32): i32 {
   if recRepWidens(ot.aElem, r) { mkArrayTy(r) } else { -1 }
 }
 
+// `callRetRepTy` of the call `x` is, or of the call a `const` binding read `x` holds; -1 else.
+function recListCallRepTy(x: i32, own: i32): i32 {
+  const n = nodeAt(x)
+  if n is Call { return callRetRepTy(x, own) }
+  if !(n is Ident) { return -1 }
+  const d = recHeldDecl(x)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+  const iv = parenPeelIx(dn.letInit)
+  if iv < 0 || !(nodeAt(iv) is Call) { return -1 }
+  callRetRepTy(iv, nodeTyIxOf(iv))
+}
+
 // Stamps each record list literal checked this pass whose elements are all reads out of
-// containers their stores build at one other record (`recBuiltReadTy`) with the list of that
-// record, which the emitter builds it as. A literal already stamped at another type keeps it.
+// containers their stores build at one other record (`recBuiltReadTy`), or calls and bindings
+// built there, with the list of that record, which the emitter builds it as.
 export function recListLitsBuild() {
   for l in recListLits {
-    const n = nodeAt(l)
-    if n is ArrayLit {
-      let bt = -1
-      for e in n.arrElems {
-        const br = recBuiltReadTy(parenPeelIx(e))
-        const b = if br >= 0 { nonNullTy(br) } else { -1 }
-        const own = nodeTyIxOf(e)
-        const moved = b >= 0 && own >= 0 && !tySame(b, own) && tyAt(b) is TyObj
-        if !moved || (bt >= 0 && !tySame(b, bt)) {
-          bt = -2
-          break
-        }
-        bt = b
-      }
-      const rt = nodeRepTyIxOf(l)
-      if bt >= 0 && (rt < 0 || tySame(rt, nodeTyIxOf(l))) {
-        repStampListBuilt(l, mkArrayTy(bt))
-      }
-    }
+    if recListLitBuild(l, false) { recListLitsLate.push(l) }
   }
   0
+}
+
+// `recListLitsBuild` over the lists it left for the rep rows, once `callBindAdoptReps` has set
+// them: a generic call's result, or a `const` holding one, is built at the call's rep row.
+export function recListLitsBuildLate() {
+  for l in recListLitsLate { recListLitBuild(l, true) }
+  recListLitsLateSet([])
+  0
+}
+
+// Stamps list literal `l` when every element is built at one other record; with `late`, a
+// generic call's rep row counts too. Whether `l` waits on that rep row.
+function recListLitBuild(l: i32, late: boolean): boolean {
+  const n = nodeAt(l)
+  if !(n is ArrayLit) { return false }
+  let bt = -1
+  let waits = false
+  for e in n.arrElems {
+    const own = nodeTyIxOf(e)
+    const pe = parenPeelIx(e)
+    const br = recBuiltReadTy(pe)
+    // A call or a binding is built where its value is (`recArgBuiltTyOf`).
+    const valued = pe >= 0
+      && own >= 0
+      && (nodeAt(pe) is Call || nodeAt(pe) is Ident)
+    let b = if br >= 0 { nonNullTy(br) } else { -1 }
+    if br < 0 && valued { b = recArgBuiltTyOf(pe, own) }
+    if b < 0 && valued {
+      if late { b = recListCallRepTy(pe, own) } else { waits = true }
+    }
+    const moved = b >= 0 && own >= 0 && !tySame(b, own) && tyAt(b) is TyObj
+    if !moved || (bt >= 0 && !tySame(b, bt)) { return waits && !late }
+    bt = b
+  }
+  const rt = nodeRepTyIxOf(l)
+  if bt >= 0 && (rt < 0 || tySame(rt, nodeTyIxOf(l))) {
+    repStampListBuilt(l, mkArrayTy(bt))
+  }
+  false
 }
 
 // Whether record `wide` is another record over the same field names as record `narrow`, which
@@ -219,6 +302,17 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
   const tys: i32[] = []
   let moved = false
   for t in tys0 { tys.push(t) }
+  // A type variable a held argument binds at its own type stays there (D14817).
+  const heldN: string[] = []
+  const heldT: i32[] = []
+  let h = 0
+  while h < cn.callArgs.length {
+    const ha = cn.callArgs[h]
+    if cbaHeldArg(ha) && recArgBuiltTyOf(ha, nodeTyIxOf(ha)) < 0 {
+      bindGenWalk(f.fnParamTypes[h], nodeTyIxOf(ha), heldN, heldT)
+    }
+    h = h + 1
+  }
   let i = 0
   while i < cn.callArgs.length {
     const a = cn.callArgs[i]
@@ -237,6 +331,7 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
         while q < names.length {
           if (
             names[q] == dN[j]
+            && !strListHas(heldN, dN[j])
             && cbaBoundTo(oN, oT, dN[j], tys0[q])
             && !tyHasHole(dT[j])
             && !tyMentionsErr(tys0[q], 8)
@@ -253,6 +348,15 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
     i = i + 1
   }
   if moved { tys } else { [] }
+}
+
+// Whether argument `a` is a held value, a name or a read of one, rather than a fresh literal or a
+// call's result.
+function cbaHeldArg(a: i32): boolean {
+  const p = parenPeelIx(a)
+  if p < 0 || p >= P.nodes.length { return false }
+  const n = nodeAt(p)
+  n is Ident || n is Member || n is Index
 }
 
 // The record the literal binding argument `a` names is built at by the record solve

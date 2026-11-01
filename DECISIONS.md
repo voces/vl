@@ -11160,6 +11160,20 @@ field read narrows back exactly, but nothing emitted that narrowing, and master 
 D81/D139 destination pin (`synthDstPinAnn`) is measured for deletion rather than given a guard,
 because a guarded pin is still a second producer of the destination's rep.
 
+**Extended 2026-11-01 (D14817): a fresh call result delivered directly at a narrower own-type
+landing is built at the wider row and copied.** One function body builds one record row (D8301), so
+`mkcall` delivered at `Circle` by `sink(mkcall())` and at its own `K` by `both(mkcall(), k)` (a
+held `k: K` pins `both@K`) was refused. It now builds at `Circle`, and the call that lands at `K`
+is copied into `K` field by field (`recCopyNarrows`, `recSiteCopies`; `emitRecCopy`'s `null` arm).
+Sound because the copy happens where the call's fresh result is delivered as an argument: no alias
+to that record exists between the call and the copy, and every field the copy narrows is one the
+own type types `null`, which is the only value it can hold. The original record is dropped at the
+copy, so no write through one landing can be observed at the other. The limit: a value stored and
+delivered again is not fresh (`const c = mkcall(); both(c, k)`), and neither is an argument to a
+parameter that is not a bare type variable (`b: T[]`, a list element), so those keep D14814's
+refusal. A field the copy would have to narrow other than to `null` (`i32 | null` into `i32`)
+keeps it too.
+
 ## A variant is a position in a union row, and union rows are keyed by member reps (ruling, D14551)
 
 Under structural records (D3870) a plain `{r: i32}` and a union's arm of the same shape are one
@@ -11292,7 +11306,23 @@ folds literals, so a shape key can land on another arm's row), and the variant-o
 Before the field tables move, an arm and its own row agree on each field's element name and type:
 where both record the same type, a declared spelling (`Inner`, `Box<i32>`) wins over a
 structural render (`{base:i32,length:i32}`), else the row's spelling stands, and the type index
-is the row's, the one a row lookup by type finds. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
+is the row's, the one a row lookup by type finds. Reference rows exist from the end of `collectS` (the struct table is reset at its start, so no
+earlier pass can hold one); a reference row's heap is claimed when the union heaps are assigned,
+and a record whose own row a later pass interns leaves its early reference row unclaimed,
+flagged and skipped like the rest. The passes that re-lay an arm's fields after that point
+re-sync its reference row, and each arm's fields are asserted equal to its row's when the heaps
+are assigned. An arm's fields are its row's. During collection an arm's fields are staged
+(`armStage*`); at the end of `collectS` each arm adopts a row (a struct row of its record type
+whose fields match by name and code, else its reference row, else one minted for it), the
+variant field columns become the struct-row lists themselves, and the staging is emptied; an arm
+created later adopts its row as it is minted. An arm adopting a struct row takes the row's
+element spellings: agreeing them at adoption writes a declared name into a row its canon twins
+compare by element name, and the twin lookup then declines; "a declared spelling wins" holds
+only where an arm's own row differs from its field row (`variantRowAgree`) until step 3 makes
+that comparison read element types, after which it holds everywhere. A shared-tag arm needs no
+row of its own: its fields match its record's row by name and code, so it adopts that row as its
+field row while its heap stays its tag-mate's; that is the one place an arm's two rows differ. Running `collectS`'s reset before
+`collectU`, so arms write rows directly, would remove the staging and is not done. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
 variant heap column is gone. A row is keyed by (record type, field storage codes), not by the
 type alone: a record with a tagged function field is a second row of its type. A value cannot
 cross between two storage rows of one type without a converting delivery, and none exists, so

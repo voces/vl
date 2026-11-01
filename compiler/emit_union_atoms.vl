@@ -102,6 +102,7 @@ import {
   nodeMapValTyIx,
   recordMvValTyIx,
   recordUnMemTys,
+  repCanonId,
   repElemIdOfNameTy,
   repNameCanonId,
   repSlotOfTy,
@@ -162,6 +163,22 @@ import {
   RLK_UNION,
   VKind,
   aUsed,
+  armFieldElemKeyKind,
+  armFieldElemName,
+  armFieldElemTyIx,
+  armFieldLitTyIx,
+  armFieldNames,
+  armFieldTyText,
+  armFieldTypes,
+  armStageClear,
+  armStageElemKeyKind,
+  armStageElemName,
+  armStageElemTyIx,
+  armStageLitTyIx,
+  armStageNames,
+  armStageTyText,
+  armStageTypes,
+  armsAdopted,
   ba8Used,
   cloSigTagNames,
   fa32Used,
@@ -198,8 +215,10 @@ import {
   sFieldElemKeyKind,
   sFieldElemName,
   sFieldElemTyIx,
+  sFieldLitTyIx,
   sFieldNames,
   sFieldStart,
+  sFieldTyText,
   sFieldTypes,
   sHeapIdx,
   sIsRefRow,
@@ -211,12 +230,8 @@ import {
   slUsed,
   uDeclared,
   uFieldCount,
-  uFieldElemKeyKind,
-  uFieldElemName,
-  uFieldElemTyIx,
-  uFieldNames,
   uFieldStart,
-  uFieldTypes,
+  uVarFieldRow,
   uVarSTwin,
   uVarTwin,
   uVarTyIx,
@@ -992,23 +1007,23 @@ function variantRowAgree(vi: i32, r: i32) {
     const ui = uFieldStart[vi] + k
     const si = sFieldStart[r] + k
     if (
-      ui < uFieldElemName.length
-      && ui < uFieldElemTyIx.length
+      ui < sFieldElemName.length
+      && ui < sFieldElemTyIx.length
       && si < sFieldElemName.length
       && si < sFieldElemTyIx.length
-      && uFieldNames[ui] == sFieldNames[si]
+      && sFieldNames[ui] == sFieldNames[si]
     ) {
-      const ut = uFieldElemTyIx[ui]
+      const ut = sFieldElemTyIx[ui]
       const st = sFieldElemTyIx[si]
-      const ue = uFieldElemName[ui]
+      const ue = sFieldElemName[ui]
       const se = sFieldElemName[si]
       if ut >= 0 && st >= 0 && (ut != st || ue != se) && tySame(ut, st) {
         if ue != se && elemNameIsDeclared(ue) && !elemNameIsDeclared(se) {
           sFieldElemName[si] = ue
         } else {
-          uFieldElemName[ui] = se
+          sFieldElemName[ui] = se
         }
-        uFieldElemTyIx[ui] = st
+        sFieldElemTyIx[ui] = st
       }
     }
     k = k + 1
@@ -1016,12 +1031,40 @@ function variantRowAgree(vi: i32, r: i32) {
   0
 }
 
-// Whether a struct row other than a reference row records variant `vi`'s record type, on any heap.
-// A D1023 shared-tag arm's record has one, off the arm's heap.
-function variantRecordHasRow(vi: i32): boolean {
+// Whether variant `vi`'s fields are row `r`'s: names, codes, element names and element types (an
+// arm sharing a reference row with an arm of its type may hold its own index of an equal type).
+export function variantRowFieldsMatch(vi: i32, r: i32): boolean {
+  if r < 0 || vi >= uFieldCount.length || r >= sFieldCount.length {
+    return false
+  }
+  if uFieldCount[vi] != sFieldCount[r] { return false }
+  let k = 0
+  while k < uFieldCount[vi] {
+    const ui = uFieldStart[vi] + k
+    const si = sFieldStart[r] + k
+    if (
+      sFieldNames[ui] != sFieldNames[si]
+      || sFieldTypes[ui] != sFieldTypes[si]
+    ) {
+      return false
+    }
+    const ue = if ui < sFieldElemName.length { sFieldElemName[ui] } else { "" }
+    const se = if si < sFieldElemName.length { sFieldElemName[si] } else { "" }
+    const ut = if ui < sFieldElemTyIx.length { sFieldElemTyIx[ui] } else { -1 }
+    const st = if si < sFieldElemTyIx.length { sFieldElemTyIx[si] } else { -1 }
+    if ue != se { return false }
+    if ut != st && (ut < 0 || st < 0 || !tySame(ut, st)) { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Whether a struct row below `lim` other than a reference row records variant `vi`'s record type,
+// on any heap. A D1023 shared-tag arm's record has one, off the arm's heap.
+function variantRecordHasRow(vi: i32, lim: i32): boolean {
   const vt = uVarTyIx[vi]
   let r = 0
-  while r < sTyIx.length {
+  while r < sTyIx.length && r < lim {
     if !sIsRefRow(r) && sTyIx[r] >= 0 && tySame(vt, sTyIx[r]) { return true }
     r = r + 1
   }
@@ -1034,59 +1077,277 @@ export function variantRowOrMint(vi: i32, h: i32): i32 {
   const own = variantOwnRow(vi, h)
   if own >= 0 && !sIsRefRow(own) { variantRowAgree(vi, own) }
   if (own >= 0 || vi >= uVarTyIx.length || uVarTyIx[vi] < 0) { return own }
-  if variantRecordHasRow(vi) { return -1 }
-  refRowMint(vi, h)
+  const c = refRowClaim(vi, h)
+  if c >= 0 { return c }
+  if variantRecordHasRow(vi, sTyIx.length) { return -1 }
+  const fr = if vi < uVarFieldRow.length { uVarFieldRow[vi] } else { -1 }
+  if fr >= 0 && sIsRefRow(fr) && fr < sHeapIdx.length && sHeapIdx[fr] < 0 {
+    sHeapIdx[fr] = h
+    return fr
+  }
+  const si = sNames.length
+  if sHeapIdx.length != si || sTwin.length != si { return -1 }
+  const m = refRowMint(vi)
+  if m < 0 { return -1 }
+  sHeapIdx.push(h)
+  sTwin.push(m)
+  m
 }
 
-// Append a reference row for variant `vi`: its record type, heap and fields, a twin of itself and
-// no declared name. -1 when the field table is mid-append and the row cannot be laid down.
-function refRowMint(vi: i32, h: i32): i32 {
+// The reference rows of each record type, by the type's canonical id, so a per-arm ask reads one
+// bucket. Reset with the struct table.
+let refRowsByCanon: {[i32]: i32[]} = Map()
+const refRowsNone: i32[] = []
+export function refRowIndexReset() {
+  refRowsByCanon = Map()
+  0
+}
+
+// The reference rows that may hold variant `vi`'s record type, ascending.
+function refRowsOfArm(vi: i32): i32[] {
+  refRowsByCanon[repCanonId(uVarTyIx[vi])] ?? refRowsNone
+}
+
+// Give variant `vi` a reference row at collect time when no struct row below `lim` holds its record
+// and no reference row does yet. Its heap is claimed when the union heaps are assigned.
+export function armRefRowEnsure(vi: i32, lim: i32) {
+  if vi >= uVarTyIx.length || uVarTyIx[vi] < 0 { return 0 }
+  if variantRecordHasRow(vi, lim) { return 0 }
+  const vt = uVarTyIx[vi]
+  for r in refRowsOfArm(vi) {
+    if tySame(vt, sTyIx[r]) { return 0 }
+  }
+  refRowMint(vi)
+  0
+}
+
+// The first reference row of variant `vi`'s record type whose heap is not yet assigned, given
+// heap `h`, or -1.
+function refRowClaim(vi: i32, h: i32): i32 {
+  const vt = uVarTyIx[vi]
+  for r in refRowsOfArm(vi) {
+    if r < sHeapIdx.length && sHeapIdx[r] < 0 && tySame(vt, sTyIx[r]) {
+      sHeapIdx[r] = h
+      return r
+    }
+  }
+  -1
+}
+
+// Append a reference row for variant `vi` from its field columns as they stand; the heap and
+// twin columns are the caller's. -1 when the field table is mid-append.
+function refRowMint(vi: i32): i32 {
+  if vi >= uFieldStart.length { return -1 }
+  rowMintFrom(
+    vi,
+    uFieldStart[vi],
+    armFieldNames(),
+    armFieldTypes(),
+    armFieldElemName(),
+    armFieldElemTyIx(),
+    armFieldElemKeyKind(),
+    armFieldTyText(),
+    armFieldLitTyIx(),
+    true,
+  )
+}
+
+// Append a flagged row for variant `vi`, its record type and the fields at `st` of the given
+// lists, with no declared name; bucketed for claiming unless it is a layout row (`bucket` false).
+// The heap and twin columns are the caller's. -1 when the field table is mid-append.
+function rowMintFrom(
+  vi: i32,
+  st: i32,
+  names: string[],
+  types: i32[],
+  ens: string[],
+  ets: i32[],
+  kks: i32[],
+  tts: string[],
+  lts: i32[],
+  bucket: boolean,
+): i32 {
   const si = sNames.length
   const fs = sFieldNames.length
   if (
     sFieldStart.length != si
     || sFieldCount.length != si
-    || sHeapIdx.length != si
-    || sTwin.length != si
     || sFieldTypes.length != fs
     || sFieldElemName.length != fs
     || sFieldCloSig.length != fs
-    || vi >= uFieldStart.length
     || vi >= uFieldCount.length
   ) {
     return -1
   }
+  const vt = if vi < uVarTyIx.length { uVarTyIx[vi] } else { -1 }
   while sRefRow.length < si { sRefRow.push(false) }
   sRefRow.push(true)
   sNames.push("#ref" + i32ToStr(si))
   while sRowDecl.length < si { sRowDecl.push(0) }
   sRowDecl.push(0)
   while sTyIx.length < si { sTyIx.push(-1) }
-  sTyIx.push(uVarTyIx[vi])
-  sHeapIdx.push(h)
-  sTwin.push(si)
+  sTyIx.push(vt)
+  if bucket && vt >= 0 {
+    const rk = repCanonId(vt)
+    const rb = refRowsByCanon[rk] ?? []
+    if rb.length == 0 { refRowsByCanon[rk] = rb }
+    rb.push(si)
+  }
   while sFieldElemTyIx.length < fs { sFieldElemTyIx.push(-1) }
   while sFieldElemKeyKind.length < fs { sFieldElemKeyKind.push(MAP_KEY_STR) }
+  armFactsPad()
+  const n = uFieldCount[vi]
   sFieldStart.push(fs)
-  sFieldCount.push(uFieldCount[vi])
+  sFieldCount.push(n)
   let k = 0
-  while k < uFieldCount[vi] {
-    const u = uFieldStart[vi] + k
-    sFieldNames.push(uFieldNames[u])
-    sFieldTypes.push(uFieldTypes[u])
-    sFieldElemName.push(
-      if u < uFieldElemName.length { uFieldElemName[u] } else { "" },
-    )
+  while k < n {
+    const u = st + k
+    sFieldNames.push(names[u])
+    sFieldTypes.push(types[u])
+    sFieldElemName.push(if u < ens.length { ens[u] } else { "" })
     sFieldCloSig.push("")
-    sFieldElemTyIx.push(
-      if u < uFieldElemTyIx.length { uFieldElemTyIx[u] } else { -1 },
-    )
-    sFieldElemKeyKind.push(
-      if u < uFieldElemKeyKind.length { uFieldElemKeyKind[u] } else { MAP_KEY_STR },
-    )
+    sFieldElemTyIx.push(if u < ets.length { ets[u] } else { -1 })
+    sFieldElemKeyKind.push(if u < kks.length { kks[u] } else { MAP_KEY_STR })
+    sFieldTyText.push(if u < tts.length { tts[u] } else { "" })
+    sFieldLitTyIx.push(if u < lts.length { lts[u] } else { -1 })
     k = k + 1
   }
   si
+}
+
+// Pad the arm-fact columns to the field table.
+function armFactsPad() {
+  while sFieldTyText.length < sFieldNames.length { sFieldTyText.push("") }
+  while sFieldLitTyIx.length < sFieldNames.length { sFieldLitTyIx.push(-1) }
+  0
+}
+
+// A struct row below `lim`, not a reference row, of variant `vi`'s record type whose fields are
+// the arm's staged fields at `st` by name and code, or -1.
+function armRealRow(vi: i32, st: i32, lim: i32): i32 {
+  const vt = uVarTyIx[vi]
+  const n = uFieldCount[vi]
+  let r = 0
+  while r < sTyIx.length && r < lim && r < sFieldCount.length {
+    if (
+      !sIsRefRow(r)
+      && sFieldCount[r] == n
+      && sTyIx[r] >= 0
+      && tySame(vt, sTyIx[r])
+      && stagedFieldsLayOn(st, n, r)
+    ) {
+      return r
+    }
+    r = r + 1
+  }
+  -1
+}
+
+// Whether the `n` staged fields at `st` are row `r`'s fields by name and code.
+function stagedFieldsLayOn(st: i32, n: i32, r: i32): boolean {
+  let k = 0
+  while k < n {
+    const a = st + k
+    const b = sFieldStart[r] + k
+    if a >= armStageNames.length || a >= armStageTypes.length { return false }
+    if (
+      armStageNames[a] != sFieldNames[b]
+      || armStageTypes[a] != sFieldTypes[b]
+    ) {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+// Variant `vi` adopts the struct row its fields are: a row of its record type laid out as its
+// staged fields, else its reference row, else a row minted for it. Its field start then indexes
+// the struct-row lists. -1 (via `emitFail`) when no row can be laid down.
+export function armAdopt(vi: i32, lim: i32): i32 {
+  if vi >= uFieldStart.length || vi >= uFieldCount.length {
+    return emitFail("emitProgram: a union arm has no staged fields to adopt")
+  }
+  const st = uFieldStart[vi]
+  const typed = vi < uVarTyIx.length && uVarTyIx[vi] >= 0
+  let r = -1
+  if typed { r = armRealRow(vi, st, lim) }
+  if r < 0 && typed {
+    for c in refRowsOfArm(vi) {
+      if (
+        r < 0
+        && c < sFieldCount.length
+        && sFieldCount[c] == uFieldCount[vi]
+        && tySame(uVarTyIx[vi], sTyIx[c])
+      ) {
+        r = c
+      }
+    }
+  }
+  if r < 0 {
+    r = rowMintFrom(
+      vi,
+      st,
+      armStageNames,
+      armStageTypes,
+      armStageElemName,
+      armStageElemTyIx,
+      armStageElemKeyKind,
+      armStageTyText,
+      armStageLitTyIx,
+      typed && !variantRecordHasRow(vi, lim),
+    )
+  }
+  if r < 0 {
+    return emitFail("emitProgram: a union arm has no struct row to adopt")
+  }
+  armFactsPad()
+  let k = 0
+  while k < uFieldCount[vi] {
+    const a = st + k
+    const b = sFieldStart[r] + k
+    if a < armStageTyText.length { sFieldTyText[b] = armStageTyText[a] }
+    if a < armStageLitTyIx.length { sFieldLitTyIx[b] = armStageLitTyIx[a] }
+    k = k + 1
+  }
+  uFieldStart[vi] = sFieldStart[r]
+  while uVarFieldRow.length <= vi { uVarFieldRow.push(-1) }
+  uVarFieldRow[vi] = r
+  r
+}
+
+// After every staged arm adopts its row: the staging lists are emptied, so nothing reads a staged
+// field again, and the arm field columns read the struct rows.
+export function armAdoptFinish() {
+  armFactsPad()
+  armStageClear()
+  armsAdopted = true
+  0
+}
+
+// Move variant `vi`'s fields onto row `r`, its own row found after adoption: the arm facts follow.
+export function armFieldRowMove(vi: i32, r: i32) {
+  if vi >= uVarFieldRow.length || r < 0 || r >= sFieldStart.length { return 0 }
+  const o = uVarFieldRow[vi]
+  if o < 0 || o == r || o >= sFieldStart.length { return 0 }
+  armFactsPad()
+  let k = 0
+  while k < uFieldCount[vi] && k < sFieldCount[r] {
+    sFieldTyText[sFieldStart[r] + k] = sFieldTyText[sFieldStart[o] + k]
+    sFieldLitTyIx[sFieldStart[r] + k] = sFieldLitTyIx[sFieldStart[o] + k]
+    k = k + 1
+  }
+  uFieldStart[vi] = sFieldStart[r]
+  uVarFieldRow[vi] = r
+  0
+}
+
+// Whether variant `vi`'s fields are its field row's, and the variant columns name the row lists.
+export function armFieldRowHolds(vi: i32): boolean {
+  if vi >= uVarFieldRow.length || vi >= uFieldStart.length { return false }
+  const r = uVarFieldRow[vi]
+  if r < 0 || r >= sFieldStart.length { return false }
+  uFieldStart[vi] == sFieldStart[r] && uFieldCount[vi] == sFieldCount[r]
 }
 
 // The static map type of the map-valued expression `exprIx`, or -1: its recorded type, else —

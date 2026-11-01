@@ -12,6 +12,8 @@ import { constBindsLitSet } from "./check_leaf_steps"
 // not through the republications in `emit_base.vl` and `typecheck.vl`.
 // `isTopLevelFuncTypeName` stays out of it because it also writes the module-level
 // `funcArrowAt` bank; `nameIsShapeSpanEnds` and `mapValNameOf`, because their span differs.
+import { collectRetValues } from "./check_nj_join"
+import { parenPeelIx } from "./check_places"
 import {
   ArrayLit,
   AsExpr,
@@ -742,6 +744,9 @@ import {
   RLK_STRUCT,
   RLK_UNION,
   VKind,
+  armFieldElemName,
+  armFieldNames,
+  armFieldTypes,
   capCountTbl,
   capNamesFlat,
   capStartTbl,
@@ -792,10 +797,7 @@ import {
   scopeSlotOf,
   uDeclared,
   uFieldCount,
-  uFieldElemName,
-  uFieldNames,
   uFieldStart,
-  uFieldTypes,
   uVarTyIx,
   uVariants,
   unNames,
@@ -1767,7 +1769,18 @@ export function exprNulKind(exprIx: i32, fnIx: i32): VKind | null {
   const d = repOfNode(exprIx, fnIx)
   if d.rdCovered != 1 { return null }
   if d.rdKind == "nulnone" { return nulNoneReadCellKind(exprIx, fnIx) }
-  vkNulKindOf(d.rdKind)
+  // A name, field or element read whose type is nullable is what its storage reads as there; a
+  // union-box cell's read is also claimed by `exprUnion`, and keeps its own type's kind.
+  const tk = vkNulKindOf(d.rdKind)
+  if tk == null { return null }
+  const e = nodeAt(unwrapParen(exprIx))
+  if e is Ident || e is Member || e is Index {
+    const rr = readRepOf(exprIx, fnIx)
+    if rr.rrRead != "" && rr.rrStore != "union" {
+      return readNulVKind(rr.rrRead)
+    }
+  }
+  tk
 }
 
 // The kind of the cell a `null` read names: for a narrowed read, the rep of the storage type it
@@ -3126,7 +3139,7 @@ export function asgLitWidth(asgIx: i32, fnIx: i32): string {
 // agree. Each widening it inverts is injective; a tail returning the cell keeps it (D2512).
 export function asgReadUnwidenOp(asgIx: i32, fnIx: i32): i32 {
   const vt = nodeTyIxOf(asgIx)
-  const st = asgStoreTyOf(asgIx)
+  const st = asgPlaceStoreTy(asgIx)
   if vt < 0 || st < 0 { return -1 }
   const stT = tyAt(st)
   if stT is TyNullable {
@@ -3142,6 +3155,22 @@ export function asgReadUnwidenOp(asgIx: i32, fnIx: i32): i32 {
     return -1
   }
   asgUnwidenPrim(vt, st)
+}
+
+// The storage type assignment `asgIx` writes where it differs from the value's: a name's as the
+// checker recorded it, a field's or element's its own checked type; -1 where they agree.
+function asgPlaceStoreTy(asgIx: i32): i32 {
+  const st = asgStoreTyOf(asgIx)
+  if st >= 0 { return st }
+  if asgIx < 0 || asgIx >= P.nodes.length { return -1 }
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return -1 }
+  const tgt = nodeAt(a.binLeft)
+  if !(tgt is Member || tgt is Index) { return -1 }
+  const tt = nodeTyIxOf(a.binLeft)
+  const vt = nodeTyIxOf(asgIx)
+  if tt < 0 || vt < 0 || tySame(tt, vt) { return -1 }
+  tt
 }
 
 // The member a nullable scalar cell of assignment `asgIx` is re-read at so that an unwidening
@@ -6422,7 +6451,8 @@ export function forInMapRecv(iterIx: i32, fnIx: i32) {
 
 // Whether the assignment at `asgIx` lowers as a value by storing and re-reading its target: a
 // name, a captured literal-union cell (`c[0]`, which the capture rewrite leaves untyped), or
-// a literal-index / field write on a named non-map place whose checked type is the assignment's.
+// a literal-index / field write on a named non-map place whose re-read is the assignment's type
+// or narrows back to it.
 export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
@@ -6461,7 +6491,9 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
       return asgReadUnwidenOp(asgIx, fnIx) >= 0
     }
   }
-  false
+  // A place wider than the right side is re-read and taken back to the right side's rep, as a
+  // name's is (D14820).
+  asgReadUnwidenOp(asgIx, fnIx) >= 0
 }
 
 // Whether callee name node `callFn`, read in function `fnIx`, is `tailSelfFnIx` itself. A name
@@ -8474,7 +8506,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       return exprIsLitAtomIdent(e, exprIx, fnIx)
     }
     Index => {
-      return exprIsLitAtomIndex(e, exprIx, fnIx)
+      // An index read is an atom where its storage is one. `readIndexStoreKind` is the one producer
+      // `readRepOf`'s store half calls; ask it alone, not the whole read rep whose conversions cost.
+      return readIndexStoreKind(e, unwrapParen(exprIx), fnIx) == "litatom"
     }
     IfStmt => {
       // A value if-expression joining two atoms yields an atom, since the join rep is the
@@ -8508,7 +8542,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       return false
     }
     Member => {
-      return exprIsLitAtomMember(e, exprIx, fnIx)
+      // A field read is an atom where its storage is one. `readFieldStoreKind` is the one producer
+      // `readRepOf`'s store half calls; ask it alone, not the whole read rep whose conversions cost.
+      return readFieldStoreKind(unwrapParen(exprIx), fnIx) == "litatom"
     }
     Call => {
       return exprIsLitAtomCall(e, exprIx, fnIx)
@@ -8667,45 +8703,6 @@ function exprIsLitAtomIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   false
 }
 
-// True if an index read `e` yields a literal-union atom: an atom-element list's cell or an
-// atom-valued map's value. False when the receiver holds string refs.
-function exprIsLitAtomIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
-  // Every rung below asks a TYPE, and a literal union's type does not carry its rep: a list
-  // built over a parameter pinned at the softened `string` holds string refs while its
-  // element type is the same union an atom list has. The receiver's own literal is the rep,
-  // and claiming an atom over it emits an i32 consumer for a `(ref $type)` (D1740).
-  if idxRecvIsStrList(e.idxArr, fnIx) { return false }
-  // `xs[i]` over a literal-union array yields an atom element, through the declaration
-  // fallback: a monomorphized instance's receiver records the generic's `T[]`, so the
-  // direct probe answers false for an array it should claim. Without it, a generic
-  // returning the atom emitted a string-ref result over a body yielding the i32 atom — silent invalid wasm.
-  if arrElemLitUnionTy(e.idxArr, fnIx) >= 0 { return true }
-  // A list whose element is `string` or `string | null` holds refs, whatever a write of a
-  // type parameter narrowed the read to (D3198).
-  const recvTy = nonNullTy(nodeTyInOf(e.idxArr, fnIx))
-  if recvTy >= 0 && recvTy < T.tys.length {
-    const recvEl = tyArrayElemIx(recvTy)
-    if recvEl >= 0 && tyPrimNameOf(nonNullTy(recvEl)) == "string" {
-      return false
-    }
-    // A box element read under a narrowing unboxes to the member's own rep, which for a
-    // string literal is the string ref, however few literals the narrowing left (D4201).
-    if recvEl >= 0 && tyIsValueUnionBox(nonNullTy(recvEl)) { return false }
-    // …and so does a map cell's box read under one (D8120).
-    if mapReadNarrowedAtomKind(unwrapParen(exprIx), fnIx) == 2 { return false }
-  }
-  // `m[k]` over a litunion-valued map yields the atom id; without the claim a compare
-  // falls to string equality with the raw i32 atom — invalid wasm. Unless the members are
-  // numbers, whose values have no member id to widen — a case that needs both families in
-  // one module to surface, since the classifier sits behind `gLitUnionUsed`.
-  if nodeRepIsAtom(unwrapParen(exprIx), fnIx) { return true }
-  // The bare read types `K0 | null` (a missing key reads null) — the emit is the i32
-  // atom either way (the not-found arm yields a non-member sentinel), so the nullable
-  // spelling claims too.
-  if nodeRepIsNulAtom(unwrapParen(exprIx), fnIx) { return true }
-  return false
-}
-
 // True if a field read `e` yields a literal-union atom, through a variant or nullable-variant
 // receiver, a struct union whose members all store it as one, or a struct's own field.
 // The variant member read `memIx`'s receiver holds, in the order the field-code twins take
@@ -8714,72 +8711,6 @@ export function memRecvVariantIndex(e: Member, memIx: i32, fnIx: i32): i32 {
   const vi = memNarrowVariantIndex(memIx, fnIx)
   if vi >= 0 { return vi }
   memRecvArmVariantIndex(e.memObj, fnIx)
-}
-
-function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
-  // `t0.f` reading a literal-union atom field through a narrowed union receiver or a
-  // variant-typed receiver yields the atom — the variant-table twin of the struct-receiver
-  // case below, in `memFieldTypeCode`'s dispatch order. Without it the read printed the raw atom id.
-  const mIxA = unwrapParen(exprIx)
-  const mviA = memRecvVariantIndex(e, mIxA, fnIx)
-  if mviA >= 0 {
-    const mvfiA = variantFieldIndex(mviA, e.memProp)
-    if mvfiA >= 0 && variantFieldTypeAt(mviA, mvfiA) == FC_I32 {
-      const rv = variantFieldIsLitUnion(mviA, mvfiA)
-      return rv
-    }
-  }
-  // The fourth receiver shape, whose absence causes a silent wrong value: an un-narrowed
-  // struct union whose members all carry the field printed the raw atom id instead of the
-  // member. `sharedUnionFieldPlan` is the same derivation the dispatch reads, so the atom
-  // claim cannot drift; code 0 alone is not sufficient, since it is also plain i32/boolean.
-  const avis: i32[] = []
-  const afis: i32[] = []
-  const aplan = sharedUnionFieldPlan(
-    e.memObj,
-    e.memProp,
-    mIxA,
-    fnIx,
-    avis,
-    afis,
-  )
-  if aplan == FC_I32 {
-    let allAtom = avis.length > 0
-    let ai = 0
-    while ai < avis.length {
-      const conv = sharedFieldArmConverts(FC_I32, avis[ai], afis[ai])
-      const nul = sharedFieldArmNull(avis[ai], afis[ai])
-      if !conv && !nul && !variantFieldIsLitUnion(avis[ai], afis[ai]) {
-        allAtom = false
-      }
-      ai = ai + 1
-    }
-    if allAtom { return true }
-  }
-  // `b.kind` reading a literal-union atom FIELD yields the atom.
-  const msi = structIndexOfExpr(e.memObj, fnIx)
-  if msi >= 0 {
-    const mfi = sFieldIndex(msi, e.memProp)
-    if mfi >= 0 {
-      // A plain i32 slot the checker reads as a literal-set alias holds its atom id: a record
-      // with a function field keeps its ident fields as i32 slots with no atom table (D2853).
-      if !sFieldIsLitUnion(msi, mfi) && sFieldTypeAt(msi, mfi) == FC_I32 {
-        if (
-          nodeTyIsLitUnionAlias(mIxA)
-          && numLitUnionBaseTy(nodeTyIxOf(mIxA)) < 0
-        ) {
-          return true
-        }
-      }
-      const r = sFieldIsLitUnion(msi, mfi)
-      return r
-    }
-  }
-  // An instance's hole receiver where no narrowing is open, as `memberAtomFieldTexts` reads it.
-  if aplan < 0 && mviA < 0 && fnInPinnedInstance(fnIx) {
-    return holeRecvAtomFieldTexts(e.memObj, e.memProp, fnIx).length > 0
-  }
-  false
 }
 
 // True if a call `e` returns a literal-union atom: a registered literal-union result type,
@@ -11379,8 +11310,8 @@ function ovnStoredAlike(ty: i32, vi: i32): boolean {
     const lc = fieldCodeOfTy(ft)
     let fj = 0
     while fj < uFieldCount[vi] {
-      if uFieldNames[start + fj] == t.objFieldNames[i] {
-        if lc != uFieldTypes[start + fj] && !isNullTy(ft) { return false }
+      if armFieldNames()[start + fj] == t.objFieldNames[i] {
+        if lc != armFieldTypes()[start + fj] && !isNullTy(ft) { return false }
       }
       fj = fj + 1
     }
@@ -11411,44 +11342,44 @@ export function objMatchesVariantIdxOmit(
     let present = 0
     let fj = 0
     while fj < cnt {
-      const at = objFieldVal(objIx, uFieldNames[start + fj])
+      const at = objFieldVal(objIx, armFieldNames()[start + fj])
       if at >= 0 { present = present + 1 }
       if at < 0 {
         if !omit || !variantFieldMayOmit(vi, fj) { allMatch = false }
-      } else if uFieldTypes[start + fj] == FC_MAP {
+      } else if armFieldTypes()[start + fj] == FC_MAP {
         if (
           !objMapFieldCompat(
             objIx,
-            uFieldNames[start + fj],
-            uFieldElemName[start + fj],
+            armFieldNames()[start + fj],
+            armFieldElemName()[start + fj],
             uFieldElemTyIxAt(vi, fj),
           )
-          || !objMapFieldKeyFits(objIx, uFieldNames[start + fj], vi)
+          || !objMapFieldKeyFits(objIx, armFieldNames()[start + fj], vi)
         ) {
           allMatch = false
         }
-      } else if uFieldTypes[start + fj] == FC_STRUCT {
+      } else if armFieldTypes()[start + fj] == FC_STRUCT {
         // A nested-struct candidate field (code 15) is tightened by its target's
         // field-name set, exactly as a map field is by its value rep.
         if (
           !objNestedFieldCompat(
             objIx,
-            uFieldNames[start + fj],
-            uFieldElemName[start + fj],
+            armFieldNames()[start + fj],
+            armFieldElemName()[start + fj],
             fnIx,
           )
-          || !variantFieldKindFits(objIx, uFieldNames[start + fj], vi)
+          || !variantFieldKindFits(objIx, armFieldNames()[start + fj], vi)
         ) {
           allMatch = false
         }
-      } else if !variantFieldKindFits(objIx, uFieldNames[start + fj], vi) {
+      } else if !variantFieldKindFits(objIx, armFieldNames()[start + fj], vi) {
         allMatch = false
       } else if (
         vi < uVarTyIx.length
         && !pinKindFitsTy(
           objIx,
-          uFieldNames[start + fj],
-          tyFieldTyOf(uVarTyIx[vi], uFieldNames[start + fj]),
+          armFieldNames()[start + fj],
+          tyFieldTyOf(uVarTyIx[vi], armFieldNames()[start + fj]),
           fnIx,
         )
       ) {
@@ -12314,7 +12245,7 @@ function refListElemNameOfMember(e: Member, exprIx: i32, fnIx: i32): string {
   const vi = memNarrowVariantIndex(exprIx, fnIx)
   if vi >= 0 {
     const vfi = variantFieldIndex(vi, e.memProp)
-    if vfi >= 0 { return uFieldElemName[uFieldStart[vi] + vfi] }
+    if vfi >= 0 { return armFieldElemName()[uFieldStart[vi] + vfi] }
     return ""
   }
   // The receiver rungs of `memFieldTypeCode`, arm for arm: a union ARM value (a variant
@@ -13829,6 +13760,11 @@ export function exprString(exprIx: i32, fnIx: i32) {
       return false
     }
     BinExpr => {
+      // An assignment's value is its target cell (D14821).
+      if e.binOp == "=" {
+        const sar = asgReadNode(exprIx, fnIx)
+        if sar != exprIx { return exprString(sar, fnIx) }
+      }
       // `m[k] ?? d`/`m.get(k) ?? d` over a string-valued map yields a string ref (the value
       // type); a nullable value with a nullable default stays `string | null`.
       const cms = coalesceMvSlot(exprIx, fnIx)
@@ -14679,6 +14615,7 @@ export function fnReturnsClosure(t: i32) {
   if fn is FuncDecl {
     // A function returning a tagged set's value returns its member's i32 id.
     if fnTagRetIsTagged(fnStmts[t]) { return false }
+    if fnHandsBackTaggedParam(fn) { return false }
     // An annotated function-type return is a closure result regardless of how the body yields
     // it (a higher-order call the tail scan can't see), since the valtype is already kind 14.
     if fn.fnRet >= 0 && tyIsFuncType(fn.fnRet) { return true }
@@ -14690,6 +14627,44 @@ export function fnReturnsClosure(t: i32) {
     return blockTailIsClosure(fn.fnBody, fnStmts[t])
   }
   false
+}
+
+// Whether every value instance `fn` returns reads one parameter typed at a tagged set: it hands
+// the argument's id back.
+function fnHandsBackTaggedParam(fn: FuncDecl): boolean {
+  if fn.fnBody < 0 { return false }
+  // Most functions take no tagged set at all, so ask that before walking the body.
+  let any = false
+  for q in fn.fnParams {
+    const pn = nodeAt(q)
+    if (
+      pn is Param
+      && pn.parType >= 0
+      && fnTagTyIsTagged(nodeTyIxOf(pn.parType))
+    ) {
+      any = true
+    }
+  }
+  if !any { return false }
+  const vs: i32[] = []
+  collectRetValues(fn.fnBody, vs)
+  if vs.length == 0 { return false }
+  for v in vs {
+    const x = parenPeelIx(v)
+    if x < 0 || !(nodeAt(x) is Ident) { return false }
+    // A cloned body shares its reads with the template, so the parameter is matched by name.
+    const rd = nodeAt(identDeclOf(x))
+    if !(rd is Param) { return false }
+    let typed = false
+    for q in fn.fnParams {
+      const pn = nodeAt(q)
+      if pn is Param && pn.parName == rd.parName && pn.parType >= 0 {
+        typed = fnTagTyIsTagged(nodeTyIxOf(pn.parType))
+      }
+    }
+    if !typed { return false }
+  }
+  true
 }
 
 // True if the block's tail (implicit-return) expression is a function value.
@@ -15298,6 +15273,20 @@ function readSlotlessOwnLet(rx: i32, fnIx: i32): i32 {
   d
 }
 
+// The nullable rep kinds a read can read as.
+const READ_NUL_VKINDS: VKind[] = [
+  "nulvariant", "nulstruct", "nullist", "nulstr", "nulbool", "nulreflist", "nulclosure",
+  "nulstrlist", "nulf64list", "nuli64list", "nulf32list", "nulu8list", "nulmap", "nulnone",
+]
+
+// The nullable rep kind a read reads as, or null for a read that reads no nullable rep.
+function readNulVKind(k: string): VKind | null {
+  for v in READ_NUL_VKINDS {
+    if v == k { return v }
+  }
+  null
+}
+
 // Whether `k` is a nullable rep kind.
 function readKindIsNul(k: string): boolean {
   k == "nulmap"
@@ -15316,21 +15305,153 @@ function readKindIsNul(k: string): boolean {
     || k == "nulu8list"
 }
 
+// Whether field read `e` reads an interned literal-union id: an atom field of the receiver's row,
+// a narrowed or shared union arm's, or a hole receiver's in an instance.
+function memberReadIsLitAtom(e: Member, exprIx: i32, fnIx: i32): boolean {
+  // `t0.f` reading a literal-union atom field through a narrowed union receiver or a
+  // variant-typed receiver yields the atom — the variant-table twin of the struct-receiver
+  // case below, in `memFieldTypeCode`'s dispatch order. Without it the read printed the raw atom id.
+  const mIxA = unwrapParen(exprIx)
+  const mviA = memRecvVariantIndex(e, mIxA, fnIx)
+  if mviA >= 0 {
+    const mvfiA = variantFieldIndex(mviA, e.memProp)
+    if mvfiA >= 0 && variantFieldTypeAt(mviA, mvfiA) == FC_I32 {
+      const rv = variantFieldIsLitUnion(mviA, mvfiA)
+      return rv
+    }
+  }
+  // The fourth receiver shape, whose absence causes a silent wrong value: an un-narrowed
+  // struct union whose members all carry the field printed the raw atom id instead of the
+  // member. `sharedUnionFieldPlan` is the same derivation the dispatch reads, so the atom
+  // claim cannot drift; code 0 alone is not sufficient, since it is also plain i32/boolean.
+  const avis: i32[] = []
+  const afis: i32[] = []
+  const aplan = sharedUnionFieldPlan(
+    e.memObj,
+    e.memProp,
+    mIxA,
+    fnIx,
+    avis,
+    afis,
+  )
+  if aplan == FC_I32 {
+    let allAtom = avis.length > 0
+    let ai = 0
+    while ai < avis.length {
+      const conv = sharedFieldArmConverts(FC_I32, avis[ai], afis[ai])
+      const nul = sharedFieldArmNull(avis[ai], afis[ai])
+      if !conv && !nul && !variantFieldIsLitUnion(avis[ai], afis[ai]) {
+        allAtom = false
+      }
+      ai = ai + 1
+    }
+    if allAtom { return true }
+  }
+  // `b.kind` reading a literal-union atom FIELD yields the atom.
+  const msi = structIndexOfExpr(e.memObj, fnIx)
+  if msi >= 0 {
+    const mfi = sFieldIndex(msi, e.memProp)
+    if mfi >= 0 {
+      // A plain i32 slot the checker reads as a literal-set alias holds its atom id: a record
+      // with a function field keeps its ident fields as i32 slots with no atom table (D2853).
+      if !sFieldIsLitUnion(msi, mfi) && sFieldTypeAt(msi, mfi) == FC_I32 {
+        if (
+          nodeTyIsLitUnionAlias(mIxA)
+          && numLitUnionBaseTy(nodeTyIxOf(mIxA)) < 0
+        ) {
+          return true
+        }
+      }
+      const r = sFieldIsLitUnion(msi, mfi)
+      return r
+    }
+  }
+  // An instance's hole receiver where no narrowing is open, as `memberAtomFieldTexts` reads it.
+  if aplan < 0 && mviA < 0 && fnInPinnedInstance(fnIx) {
+    return holeRecvAtomFieldTexts(e.memObj, e.memProp, fnIx).length > 0
+  }
+  false
+}
+
 // The kind a field read's storage holds, by its field code.
 function readFieldStoreKind(rx: i32, fnIx: i32): string {
   const fc = memberFieldCode(rx, fnIx)
+  // An interned literal-union id, which the code column alone spells as a plain i32 field; a
+  // receiver with no field code (an instance's hole) is asked too.
+  if gLitUnionUsed != 0 && (fc == FC_I32 || fc < 0) {
+    const fm = nodeAt(rx)
+    if fm is Member {
+      if memberReadIsLitAtom(fm, rx, fnIx) { return "litatom" }
+    }
+  }
   if fc == FC_UNION { return "union" }
   if fc == FC_MAP { return "map" }
   if fc == FC_NUL_MAP { return "nulmap" }
   if fc == FC_NUL_STR { return "nulstr" }
   if fc == FC_NUL_BOOL { return "nulbool" }
-  if fc == FC_STRUCT { return "struct" }
+  // A code-15 field holds a struct whether or not its type adds `null`, so its type names which.
+  if fc == FC_STRUCT {
+    const sd = repOfNode(rx, fnIx)
+    if (
+      sd.rdCovered == 1
+      && (sd.rdKind == "nulstruct"
+        || sd.rdKind == "nulvariant"
+        || sd.rdKind == "variant")
+    ) {
+      return sd.rdKind
+    }
+    return "struct"
+  }
+  if fc == FC_NUL_CLOSURE { return "nulclosure" }
+  const lk = listRepOfFieldCode(fc)
+  if lk != null { return lk }
   if fc < 0 { return "" }
   "fc" + i32ToStr(fc)
 }
 
+// Whether index read `e` reads an interned literal-union id: an atom list's element or an
+// atom-valued map's value, not a string-ref or box element whose type names the same set.
+function idxReadIsLitAtom(e: Index, exprIx: i32, fnIx: i32): boolean {
+  // Every rung below asks a TYPE, and a literal union's type does not carry its rep: a list
+  // built over a parameter pinned at the softened `string` holds string refs while its
+  // element type is the same union an atom list has. The receiver's own literal is the rep,
+  // and claiming an atom over it emits an i32 consumer for a `(ref $type)` (D1740).
+  if idxRecvIsStrList(e.idxArr, fnIx) { return false }
+  // `xs[i]` over a literal-union array yields an atom element, through the declaration
+  // fallback: a monomorphized instance's receiver records the generic's `T[]`, so the
+  // direct probe answers false for an array it should claim. Without it, a generic
+  // returning the atom emitted a string-ref result over a body yielding the i32 atom — silent invalid wasm.
+  if arrElemLitUnionTy(e.idxArr, fnIx) >= 0 { return true }
+  // A list whose element is `string` or `string | null` holds refs, whatever a write of a
+  // type parameter narrowed the read to (D3198).
+  const recvTy = nonNullTy(nodeTyInOf(e.idxArr, fnIx))
+  if recvTy >= 0 && recvTy < T.tys.length {
+    const recvEl = tyArrayElemIx(recvTy)
+    if recvEl >= 0 && tyPrimNameOf(nonNullTy(recvEl)) == "string" {
+      return false
+    }
+    // A box element read under a narrowing unboxes to the member's own rep, which for a
+    // string literal is the string ref, however few literals the narrowing left (D4201).
+    if recvEl >= 0 && tyIsValueUnionBox(nonNullTy(recvEl)) { return false }
+    // …and so does a map cell's box read under one (D8120).
+    if mapReadNarrowedAtomKind(unwrapParen(exprIx), fnIx) == 2 { return false }
+  }
+  // `m[k]` over a litunion-valued map yields the atom id; without the claim a compare
+  // falls to string equality with the raw i32 atom — invalid wasm. Unless the members are
+  // numbers, whose values have no member id to widen — a case that needs both families in
+  // one module to surface, since the classifier sits behind `gLitUnionUsed`.
+  if nodeRepIsAtom(unwrapParen(exprIx), fnIx) { return true }
+  // The bare read types `K0 | null` (a missing key reads null) — the emit is the i32
+  // atom either way (the not-found arm yields a non-member sentinel), so the nullable
+  // spelling claims too.
+  if nodeRepIsNulAtom(unwrapParen(exprIx), fnIx) { return true }
+  return false
+}
+
 // The kind an element or map-value read's slot holds.
 function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
+  // An interned literal-union id: an atom list's element or an atom-valued map's value.
+  if gLitUnionUsed != 0 && idxReadIsLitAtom(e, rx, fnIx) { return "litatom" }
   if exprRefArray(e.idxArr, fnIx) {
     const k = refListElemKind(e.idxArr, fnIx)
     if k != null { return k }
