@@ -30,11 +30,13 @@ the row; no reader re-derives the clone. The emitter-state audit holds it as per
 
 The elaboration answers *at which signatures*, never *which closure*.
 
-- `elabBundleSigs` (WIP, `claude/inc3-s14`) maps (callee instance, parameter index) to the
-  closed signatures that instance calls the parameter's lambda at. They are deduplicated and
-  kept in first-call order.
+- `elabBundleSigs` (WIP, `claude/inc3-s14`) maps (instance, declaration node) to the closed
+  signatures that instance calls the declaration's value at. The declaration is a parameter, or
+  a binding the bundle admits (below). They are deduplicated and kept in first-call order.
 - Two or more signatures, on a set the tag decision leaves untagged, make a bundle.
-- The WIP keys this map by a `k|i` string; it moves to an i32 pair before landing.
+- The WIP keys this map by a `k|i` string (callee instance, parameter index); it moves to the
+  i32 pair (instance, declaration node) before landing, which serves a parameter and a binding
+  alike.
 
 A nested lambda has no elaboration instance of its own today. The shared row is what supplies
 one: the creation site plus the signature. Two dead ends found by step7 on G1, so nobody
@@ -46,8 +48,8 @@ repeats them:
 
 ### The bundle (D14841)
 
-A parameter called at two or more signatures receives one closure per signature, carried as
-one value.
+A parameter or an admitted binding called at two or more signatures holds one closure per
+signature, carried as one value.
 
 - **Lowering:** an anonymous arena record `{c0: sig0, c1: sig1, …}`, one field per signature,
   in `elabBundleSigs` order. Each field is the shared row's closure for (the argument's creation
@@ -57,8 +59,12 @@ one value.
 - **The callee's body:** each call through the parameter reads the field for its own
   signature.
 - **The elab fact:** stays the signature list; the parameter keeps its function type there.
-- **Scope:** a parameter only. A bundle crosses as an argument and is never stored. Crossing a
-  result or a container belongs to the delivery token (below).
+- **Scope:** a parameter, or a binding that is local, never re-pointed (`const`, or a `let` with
+  no write), and whose every read is a callee or a positional argument to a parameter that is
+  itself bundled. The record lives in the binding's local instead of crossing as an argument. A
+  binding returned, stored in a container, or read by a function nested in its owner is no
+  bundle: the first two are the delivery token's (below), and the third has one body for every
+  instance (D14842). Crossing a result or a container belongs to the delivery token.
 
 ### Landing order
 
