@@ -13,7 +13,9 @@ import {
   ObjLit,
   P,
   Param,
+  TypeDecl,
   TypeRef,
+  UnionDecl,
   nodeAt,
 } from "./ast"
 import {
@@ -46,7 +48,8 @@ import {
   recordRepTyAdopt,
   repStampListBuilt,
 } from "./check_fit_rules"
-import { nonNullTy } from "./tyquery"
+import { gRootStmts } from "./check_nj_join"
+import { nonNullTy, tyHasTyVar } from "./tyquery"
 import { recSolePinArg } from "./check_record_origins"
 import { assignable, bindGenWalk, substTyDeep } from "./check_relate_core"
 import { identBoundFnDeclOf } from "./check_scopes"
@@ -57,6 +60,7 @@ import {
   TyArray,
   TyFunc,
   TyObj,
+  cUserTypes,
   mkArrayTy,
   tyAt,
   tyHasHole,
@@ -220,6 +224,81 @@ function recListCallRepTy(x: i32, own: i32): i32 {
   const iv = parenPeelIx(dn.letInit)
   if iv < 0 || !(nodeAt(iv) is Call) { return -1 }
   callRetRepTy(iv, nodeTyIxOf(iv))
+}
+
+// Stamps each record literal no delivery adopted at the union arm its field set names, where
+// exactly one arm of the program's unions widens its type and no declared non-arm record fits
+// it: the arm is the record such a literal is built as (DECISIONS.md "A literal names its arm").
+export function recArmLitsAdopt() {
+  const arms: i32[] = []
+  const recs: i32[] = []
+  ralDeclaredRecords(arms, recs)
+  if arms.length == 0 { return 0 }
+  let ix = 0
+  while ix < P.nodes.length {
+    const n = nodeAt(ix)
+    const own = nodeTyIxOf(ix)
+    const rt = nodeRepTyIxOf(ix)
+    if n is ObjLit && n.objFields.length > 0 && (rt < 0 || tySame(rt, own)) {
+      const arm = ralSoleArm(own, arms, recs)
+      if arm >= 0 && litAtDstStorage(ix, arm) { recordRepTyAdopt(ix, arm, 6) }
+    }
+    ix = ix + 1
+  }
+  0
+}
+
+// The record arms of every root union of two or more members into `arms`, and every other root
+// record declaration into `recs`, each type once.
+function ralDeclaredRecords(arms: i32[], recs: i32[]) {
+  const inArm: string[] = []
+  for si in gRootStmts {
+    const s = nodeAt(si)
+    if s is UnionDecl && s.udVariants.length > 1 {
+      for v in s.udVariants {
+        const t = cUserTypes[v] ?? -1
+        if t >= 0 && t < T.tys.length && tyAt(t) is TyObj {
+          inArm.push(v)
+          if !ralHas(arms, t) { arms.push(t) }
+        }
+      }
+    }
+  }
+  for si in gRootStmts {
+    const s = nodeAt(si)
+    if s is TypeDecl && !strListHas(inArm, s.tdName) {
+      const t = cUserTypes[s.tdName] ?? -1
+      if t >= 0 && t < T.tys.length && !ralHas(recs, t) { recs.push(t) }
+    }
+  }
+  0
+}
+
+// Whether `ts` holds a type the same as `t`.
+function ralHas(ts: i32[], t: i32): boolean {
+  for u in ts {
+    if tySame(u, t) { return true }
+  }
+  false
+}
+
+// The one arm of `arms` that widens closed record `own`, or -1: where `own` is an arm or a
+// declared record itself, more than one arm widens it, or a declared non-arm record does.
+function ralSoleArm(own: i32, arms: i32[], recs: i32[]): i32 {
+  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
+  if tyHasTyVar(own) || tyHasHole(own) { return -1 }
+  for r in recs {
+    if tySame(r, own) || recRepWidens(own, r) { return -1 }
+  }
+  let one = -1
+  for a in arms {
+    if tySame(a, own) { return -1 }
+    if recRepWidens(own, a) {
+      if one >= 0 { return -1 }
+      one = a
+    }
+  }
+  one
 }
 
 // Stamps each record list literal checked this pass whose elements are all reads out of
