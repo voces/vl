@@ -593,6 +593,7 @@ import {
   tyHasTyVar,
   tyMapValOf,
   tyStepElem,
+  tyUnionCovers,
 } from "./tyquery"
 
 // The join of two types a place may hold after an `if`. A place holds a member of its declared
@@ -3808,6 +3809,45 @@ function litSoleHolderIn(u: i32, lit: i32): boolean {
   found
 }
 
+// The narrowings writes in a short circuit's right side made, by the operator's node: they
+// hold only on the path where that side ran (D2451).
+const scWrPlaces: {[i32]: i32[]} = Map()
+const scWrTys: {[i32]: i32[]} = Map()
+const scWrOpen: i32[] = []
+
+export function scWrEnter(ix: i32) {
+  scWrPlaces[ix] = []
+  scWrTys[ix] = []
+  scWrOpen.push(ix)
+}
+
+export function scWrLeave() { scWrOpen.pop() }
+
+// Records that a write to the place at node `placeIx` narrowed it to `ty`, in the innermost
+// short circuit's right side; a write outside one records nothing.
+export function scWrNote(placeIx: i32, ty: i32) {
+  if scWrOpen.length == 0 || ty < 0 { return 0 }
+  const ix = scWrOpen[scWrOpen.length - 1]
+  const pl = scWrPlaces[ix]
+  const ts = scWrTys[ix]
+  if pl == null || ts == null { return 0 }
+  pl.push(placeIx)
+  ts.push(ty)
+  0
+}
+
+function scWrFacts(condIx: i32, places: i32[], tys: i32[]) {
+  const pl = scWrPlaces[condIx]
+  const ts = scWrTys[condIx]
+  if pl == null || ts == null { return 0 }
+  let i = 0
+  while i < pl.length {
+    pushNarrowFact(pl[i], ts[i], places, tys)
+    i = i + 1
+  }
+  0
+}
+
 // Collect the narrowings that hold when `cond` is true into the parallel `places`/`tys` arrays,
 // keyed by place path: `x != null` strips x's null, `x is T` pins x to T (`is null` pins to the
 // null type), `a && b` contributes both conjuncts, `!(e)` contributes e's false narrowings, and
@@ -3840,6 +3880,8 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         let meet = litSetMeetTy(isCur, tIdx)
         if meet < 0 { meet = recFitMeetTy(isCur, tIdx) }
         if meet >= 0 { tIdx = meet }
+        // A test the operand's type is a member of is always true and narrows nothing (D3360).
+        if meet < 0 && tyUnionCovers(tIdx, isCur) { return 0 }
         // A list-union rewrite's test reads the stored arm's tag, so it narrows to that arm.
         if tIdx >= 0 && luIsTyOf(condIx) >= 0 {
           pushNarrowFact(isPl, tIdx, places, tys)
@@ -3879,6 +3921,7 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         const lmark = places.length
         collectThenNarrows(cond.binLeft, places, tys)
         crFilterRhsRetired(condIx, places, tys, lmark)
+        scWrFacts(condIx, places, tys)
         collectThenNarrows(cond.binRight, places, tys)
         return 0
       }
@@ -4011,6 +4054,7 @@ function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         const lmark = places.length
         collectElseNarrows(cond.binLeft, places, tys)
         crFilterRhsRetired(condIx, places, tys, lmark)
+        scWrFacts(condIx, places, tys)
         collectElseNarrows(cond.binRight, places, tys)
         return 0
       }
@@ -4074,6 +4118,7 @@ export function applyNarrows(places: i32[], tys: i32[]) {
   while i < places.length {
     const p = places[i]
     if placeIsPath(p) {
+      const pathDecl = narKeyNowTy(p)
       npKeysPush(p)
       npTysPush(tys[i])
       npInvByPush(-1)
@@ -4081,6 +4126,11 @@ export function applyNarrows(places: i32[], tys: i32[]) {
       npSettlePush(-2)
       npCapByPush(-1)
       npAsgPush(0)
+      // A path narrowed to a record its type stores wider keeps the same field entries a
+      // name does, so a write through another place ends it (D4131).
+      if pathDecl >= 0 && pathDecl != tys[i] && tyAt(tys[i]) is TyObj {
+        narFitCompanions(p, pathDecl, tys[i])
+      }
     } else {
       const s = placeDecl(p)
       const declTy = declTyOf(s)
