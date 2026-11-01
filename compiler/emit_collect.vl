@@ -301,6 +301,15 @@ import {
   annRlNul,
   annRlSlot,
   armPreludeBlocks,
+  armStageClear,
+  armStageElemKeyKind,
+  armStageElemName,
+  armStageElemTyIx,
+  armStageLitTyIx,
+  armStageNames,
+  armStageTyText,
+  armStageTypes,
+  armsAdopted,
   ba8TypeIdx,
   ba8Used,
   bl8TypeIdx,
@@ -474,8 +483,10 @@ import {
   sFieldElemKeyKind,
   sFieldElemName,
   sFieldElemTyIx,
+  sFieldLitTyIx,
   sFieldNames,
   sFieldStart,
+  sFieldTyText,
   sFieldTypes,
   sHeapIdx,
   sLitMintFn,
@@ -508,6 +519,7 @@ import {
   uFieldTyText,
   uFieldTypes,
   uTags,
+  uVarFieldRow,
   uVarMemPos,
   uVarRow,
   uVarTwin,
@@ -847,8 +859,12 @@ import {
 } from "./emit_ty_canon"
 import {
   annRowOfNode,
+  armAdopt,
+  armAdoptFinish,
+  armFieldRowHolds,
+  armFieldRowMove,
   armRefRowEnsure,
-  armRefRowSync,
+  armRowAliasHolds,
   buildVariantTwins,
   ensureRefElem,
   ensureRefElemTy,
@@ -4981,6 +4997,11 @@ function mAssignUnionHeaps() {
   uVarTwin = []
   uVarRow = []
   if uDeclared {
+    if !armRowAliasHolds() {
+      emitFail(
+        "emitProgram: the variant field columns are not the struct rows' lists",
+      )
+    }
     buildVariantTwins()
     let vi = 0
     while vi < uVariants.length {
@@ -5001,6 +5022,10 @@ function mAssignUnionHeaps() {
       }
       if uVarRow[vi] >= 0 && !variantRowFieldsMatch(vi, uVarRow[vi]) {
         emitFail("emitProgram: a union arm's fields are not its row's")
+      }
+      if uVarRow[vi] >= 0 { armFieldRowMove(vi, uVarRow[vi]) }
+      if !armFieldRowHolds(vi) {
+        emitFail("emitProgram: a union arm's fields are not on a struct row")
       }
       vi = vi + 1
     }
@@ -6422,44 +6447,14 @@ function collectAFieldTables() {
   // struct table, the intern `collectShapeVariantFields`'s acceptance deferred because
   // `collectU` runs before the struct table exists. Idempotent, and a no-op for a declared
   // target name. Runs before the struct-field pass below, so a fresh shape's fields get slots.
-  let ufn = 0
-  while ufn < uFieldTypes.length {
-    // …with the row's own arena type: `recordUFieldElemRowTy` records `uFieldElemTyIx` from this
-    // cell, so the index the intern banks for the freshly-minted struct row is the index it
-    // would otherwise re-resolve the spelling to.
-    if uFieldTypes[ufn] == FC_STRUCT {
-      const si15 = internInlineShapeTy(
-        uFieldElemName[ufn],
-        uFieldElemTyIxRow(ufn),
-      )
-      // Re-key the row to the interned row's own name. The intern dedups, and a dedup can land
-      // on a row spelled differently from the text recorded here: `annShapeIndexOf` treats one
-      // wasm code as one layout, so `{b: boolean}` resolves to an existing `{b: i32}` row. The
-      // code-15 consumer looks the element up by name, so a stale spelling would read -1.
-      if si15 >= 0 {
-        uFieldElemName[ufn] = sNames[si15]
-        tyRegNoteWrite()
-      }
+  let avn = 0
+  while avn < uFieldStart.length && avn < uFieldCount.length {
+    let akn = 0
+    while akn < uFieldCount[avn] {
+      collectAArmFieldShape(uFieldStart[avn] + akn)
+      akn = akn + 1
     }
-    // A ref-list variant field (code 5): the variant-table twin of the struct-field pass's
-    // code-5 intern below. The recorded element key may be deferred, since `shapeFieldElemName`
-    // recorded the stripped element text before the struct table existed — so intern an
-    // inline-shape element first, then the element's ref-list slot.
-    if uFieldTypes[ufn] == FC_REF_LIST {
-      const en5 = uFieldElemName[ufn]
-      // The same row's arena type serves BOTH interns on this line and the next
-      // (D-INLINESHAPETY / D-REPELEMTY) — one cell, one recorder, two consumers.
-      if nameIsShapeOpen(en5) {
-        internInlineShapeTy(en5, uFieldElemTyIxRow(ufn))
-      }
-      rlUsed = true
-      raUsed = true
-      // The row's arena type, threaded into the intern. `recordUFieldElemRowTy` records
-      // `uFieldElemTyIx` from this cell's own `uFieldElemName`, so the slot key the intern
-      // computes from it is the key it computes from the spelling, one `resolveAnnot` fewer.
-      ensureRefElemTy(en5, uFieldElemTyIxRow(ufn))
-    }
-    ufn = ufn + 1
+    avn = avn + 1
   }
   // Field-table re-derivation, the struct table then the variant table below. Two rules run
   // through every arm of both loops: a field's own type is never a standalone `TypeRef` the arena
@@ -6523,50 +6518,98 @@ function collectAFieldTables() {
   // The variant-table twins of the same arms (a shape-text variant records its map value name
   // via `shapeFieldElemName`); a mono map value (i32 / boolean / atom) is a no-op
   // (`mvShapeOfValNameRowTy` returns -1, no intern).
-  let ufi = 0
-  while ufi < uFieldTypes.length {
-    if uFieldTypes[ufi] == FC_I32_LIST || uFieldTypes[ufi] == FC_NUL_I32_LIST {
-      lUsed = true
-      aUsed = true
+  let avi = 0
+  while avi < uFieldStart.length && avi < uFieldCount.length {
+    let aki = 0
+    while aki < uFieldCount[avi] {
+      collectAArmFieldNeeds(uFieldStart[avi] + aki)
+      aki = aki + 1
     }
-    if uFieldTypes[ufi] == FC_STR_LIST || uFieldTypes[ufi] == FC_NUL_STR_LIST {
-      slUsed = true
-      aUsed = true
-    }
-    // The variant-table twin of the struct pass's code-3 / code-20 string-backing arm: a
-    // union VARIANT whose field is a plain `string` (or a `string | null`) is the module's
-    // only mention of the string rep just as often as a struct field is.
-    if uFieldTypes[ufi] == FC_STR || uFieldTypes[ufi] == FC_NUL_STR {
-      aUsed = true
-    }
-    forceScalarListField(uFieldTypes[ufi])
-    // A NULLABLE ref-list variant field (code 28): re-intern its element so the field's
-    // storage type + narrowed reads resolve the wrapper slot (`rlSlotByName`).
-    if uFieldTypes[ufi] == FC_NUL_REF_LIST {
-      rlUsed = true
-      raUsed = true
-      // …with the row's arena type (D-REPELEMTY) — see the code-5 arm above.
-      ensureRefElemTy(uFieldElemName[ufi], uFieldElemTyIxRow(ufi))
-    }
-    if uFieldTypes[ufi] == FC_MAP || uFieldTypes[ufi] == FC_NUL_MAP {
-      // Code 29, the nullable map field, belongs here too: a variant row this file writes must be
-      // collectable from this file's own column, and the flags for a nullable map field on a
-      // union arm otherwise arrive only by accident, from an orphaned field `TypeRef` reaching
-      // the `nulMapInnerName` rung in the annotation walk.
-      mUsed = true
-      lUsed = true
-      aUsed = true
-      // The struct pass's key-and-flag rule, one table over; see its header there. Both writes
-      // are jointly, not severally, necessary: either one alone is covered by the struct row an
-      // inline union arm must spell to be narrowed. Kept anyway, because that covering row
-      // belongs to another pass and not to this table's invariant.
-      const ufk = uFieldRowKeyKind(ufi)
-      // The struct pass's row-type thread, one table over.
-      mvShapeOfValNameRowTy(uFieldElemName[ufi], ufk, uFieldElemTyIxRow(ufi))
-      markMapKeyUsed(ufk)
-    }
-    ufi = ufi + 1
+    avi = avi + 1
   }
+}
+
+// One arm field's code-15 intern and re-key, at flat field index `ufn`.
+function collectAArmFieldShape(ufn: i32) {
+  // …with the row's own arena type: `recordUFieldElemRowTy` records `uFieldElemTyIx` from this
+  // cell, so the index the intern banks for the freshly-minted struct row is the index it
+  // would otherwise re-resolve the spelling to.
+  if uFieldTypes[ufn] == FC_STRUCT {
+    const si15 = internInlineShapeTy(
+      uFieldElemName[ufn],
+      uFieldElemTyIxRow(ufn),
+    )
+    // Re-key the row to the interned row's own name. The intern dedups, and a dedup can land
+    // on a row spelled differently from the text recorded here: `annShapeIndexOf` treats one
+    // wasm code as one layout, so `{b: boolean}` resolves to an existing `{b: i32}` row. The
+    // code-15 consumer looks the element up by name, so a stale spelling would read -1.
+    if si15 >= 0 {
+      uFieldElemName[ufn] = sNames[si15]
+      tyRegNoteWrite()
+    }
+  }
+  // A ref-list variant field (code 5): the variant-table twin of the struct-field pass's
+  // code-5 intern below. The recorded element key may be deferred, since `shapeFieldElemName`
+  // recorded the stripped element text before the struct table existed — so intern an
+  // inline-shape element first, then the element's ref-list slot.
+  if uFieldTypes[ufn] == FC_REF_LIST {
+    const en5 = uFieldElemName[ufn]
+    // The same row's arena type serves BOTH interns on this line and the next
+    // (D-INLINESHAPETY / D-REPELEMTY) — one cell, one recorder, two consumers.
+    if nameIsShapeOpen(en5) { internInlineShapeTy(en5, uFieldElemTyIxRow(ufn)) }
+    rlUsed = true
+    raUsed = true
+    // The row's arena type, threaded into the intern. `recordUFieldElemRowTy` records
+    // `uFieldElemTyIx` from this cell's own `uFieldElemName`, so the slot key the intern
+    // computes from it is the key it computes from the spelling, one `resolveAnnot` fewer.
+    ensureRefElemTy(en5, uFieldElemTyIxRow(ufn))
+  }
+  0
+}
+
+// One arm field's presence flags and slot interns, at flat field index `ufi`.
+function collectAArmFieldNeeds(ufi: i32) {
+  if uFieldTypes[ufi] == FC_I32_LIST || uFieldTypes[ufi] == FC_NUL_I32_LIST {
+    lUsed = true
+    aUsed = true
+  }
+  if uFieldTypes[ufi] == FC_STR_LIST || uFieldTypes[ufi] == FC_NUL_STR_LIST {
+    slUsed = true
+    aUsed = true
+  }
+  // The variant-table twin of the struct pass's code-3 / code-20 string-backing arm: a
+  // union VARIANT whose field is a plain `string` (or a `string | null`) is the module's
+  // only mention of the string rep just as often as a struct field is.
+  if uFieldTypes[ufi] == FC_STR || uFieldTypes[ufi] == FC_NUL_STR {
+    aUsed = true
+  }
+  forceScalarListField(uFieldTypes[ufi])
+  // A NULLABLE ref-list variant field (code 28): re-intern its element so the field's
+  // storage type + narrowed reads resolve the wrapper slot (`rlSlotByName`).
+  if uFieldTypes[ufi] == FC_NUL_REF_LIST {
+    rlUsed = true
+    raUsed = true
+    // …with the row's arena type (D-REPELEMTY) — see the code-5 arm above.
+    ensureRefElemTy(uFieldElemName[ufi], uFieldElemTyIxRow(ufi))
+  }
+  if uFieldTypes[ufi] == FC_MAP || uFieldTypes[ufi] == FC_NUL_MAP {
+    // Code 29, the nullable map field, belongs here too: a variant row this file writes must be
+    // collectable from this file's own column, and the flags for a nullable map field on a
+    // union arm otherwise arrive only by accident, from an orphaned field `TypeRef` reaching
+    // the `nulMapInnerName` rung in the annotation walk.
+    mUsed = true
+    lUsed = true
+    aUsed = true
+    // The struct pass's key-and-flag rule, one table over; see its header there. Both writes
+    // are jointly, not severally, necessary: either one alone is covered by the struct row an
+    // inline union arm must spell to be narrowed. Kept anyway, because that covering row
+    // belongs to another pass and not to this table's invariant.
+    const ufk = uFieldRowKeyKind(ufi)
+    // The struct pass's row-type thread, one table over.
+    mvShapeOfValNameRowTy(uFieldElemName[ufi], ufk, uFieldElemTyIxRow(ufi))
+    markMapKeyUsed(ufk)
+  }
+  0
 }
 
 // Scan the arena for every use of a collection heap type, setting the presence flags and
@@ -6683,12 +6726,6 @@ export function collectA(_stmts: i32[]) {
     i = i + 1
   }
   collectAFieldTables()
-  // The code-15 re-key above rewrites arm fields a reference row copied; the copy follows them.
-  let rsv = 0
-  while rsv < uVariants.length {
-    armRefRowSync(rsv)
-    rsv = rsv + 1
-  }
   0
 }
 
@@ -7767,14 +7804,14 @@ function pushFieldRow(
   cloSig: string,
 ) {
   if toVariant {
-    uFieldTypes.push(code)
-    uFieldTyText.push(tyText)
+    armStageTypes.push(code)
+    armStageTyText.push(tyText)
     // D1023 — the discriminant column: the field's own arena type when it is a literal set, -1
     // otherwise. Pushed here, not per recorder, so no column drifts out of parallel across the three.
-    uFieldLitTyIx.push(litSetTyIxOf(litTyIx))
-    uFieldElemName.push(elemNm)
+    armStageLitTyIx.push(litSetTyIxOf(litTyIx))
+    armStageElemName.push(elemNm)
     recordUFieldElemRowTy(elemNm, keyK, elemTyHint) // D5 + B6b
-    uFieldNames.push(fName)
+    armStageNames.push(fName)
   } else {
     sFieldTypes.push(code)
     sFieldElemName.push(elemNm)
@@ -7858,6 +7895,8 @@ function structTableReset() {
   sFieldCloSig = []
   sFieldElemTyIx = []
   sFieldElemKeyKind = []
+  sFieldTyText = []
+  sFieldLitTyIx = []
   famRelayReset()
   0
 }
@@ -8000,6 +8039,14 @@ export function collectS(stmts: i32[]) {
     armRefRowEnsure(avi, realRows)
     avi = avi + 1
   }
+  // Every arm adopts the row its fields are; from here the variant field columns name the struct
+  // rows' lists, and an arm created later adopts its row as it is minted.
+  let adi = 0
+  while adi < uVariants.length {
+    if armAdopt(adi, realRows) < 0 { return -1 }
+    adi = adi + 1
+  }
+  armAdoptFinish()
   0
 }
 
@@ -8013,7 +8060,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
   // The group-interior cut at its home (`tyname.groupInnerOf`, W1). The guard is the
   // caller's — `collectVariantFields` gates on `nameIsShapeSpanEnds`.
   shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  uFieldStart.push(uFieldNames.length)
+  uFieldStart.push(armStageNames.length)
   // D622 — the canonical field order, needed here too: cross-table twin tests compare codes
   // positionally, so a declaration-order arm can merge into a canonical twin's opposite slots.
   const cOrd = fieldNameOrder(fnames)
@@ -8090,7 +8137,7 @@ function collectVariantFields(stmts: i32[], name: string, ty: i32) {
     const s = nodeAt(dsIx)
     if s is TypeDecl {
       if s.tdName == name {
-        uFieldStart.push(uFieldNames.length)
+        uFieldStart.push(armStageNames.length)
         const fields0 = s.tdFields
         // D622 — the canonical field order: cross-table twin tests compare field codes
         // positionally, so an arm and its declared struct twin must agree on the sequence.
@@ -8311,7 +8358,6 @@ function promoteLitFieldToAtom(vi: i32, fi: i32): i32 {
       setSFieldElemRowTy(sr, lty)
     }
   }
-  armRefRowSync(vi)
   0
 }
 
@@ -8343,7 +8389,6 @@ function demoteLitFieldToString(vi: i32, fi: i32): i32 {
   // Every other struct row of the arm's layout family, and each one minted later, stores the
   // field at the string too (D14752).
   famRelayField(uVarTyIx[vi], uFieldNames[r], lty)
-  armRefRowSync(vi)
   0
 }
 
@@ -9857,15 +9902,25 @@ function collectUReset() {
   uVarMemPos = []
   uVarTyIxResets = uVarTyIxResets + 1
   cloSigTagNames = []
+  // The variant field columns start empty and name the staging lists until the arms adopt rows.
   uFieldNames = []
-  uFieldStart = []
-  uFieldCount = []
   uFieldTypes = []
   uFieldTyText = []
   uFieldLitTyIx = []
   uFieldElemName = []
   uFieldElemTyIx = []
   uFieldElemKeyKind = []
+  armStageNames = uFieldNames
+  armStageTypes = uFieldTypes
+  armStageTyText = uFieldTyText
+  armStageLitTyIx = uFieldLitTyIx
+  armStageElemName = uFieldElemName
+  armStageElemTyIx = uFieldElemTyIx
+  armStageElemKeyKind = uFieldElemKeyKind
+  uFieldStart = []
+  uFieldCount = []
+  uVarFieldRow = []
+  armsAdopted = false
   variantSigMemoDrop()
   objVariantIndexDrop()
   0
@@ -9934,6 +9989,10 @@ function mintVariantRows(
       uVarTyIx.push(tys[i])
       uVarMemPos.push(pos[i])
       if collectVariantFields(stmts, names[i], tys[i]) < 0 { return -1 }
+      if armsAdopted {
+        if armAdopt(uVariants.length - 1, sNames.length) < 0 { return -1 }
+        armStageClear()
+      }
     }
     i = i + 1
   }
