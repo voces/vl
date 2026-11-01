@@ -3,7 +3,16 @@
 // lives in one, else from the checker; the emitter's re-derivation (`computeVoidFns`) can be
 // replaced by it only where they agree. Off unless a host arms it; armed, each emitted function
 // is counted by class (`docs/internals/architecture-target-2026-10.md` §4, the pass rows).
-import { BinExpr, Block, Call, FuncDecl, nodeAt } from "./ast"
+import {
+  BinExpr,
+  Block,
+  Call,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  P,
+  nodeAt,
+} from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
 import { nodeTyIxOf } from "./check_node_tys"
 import { collectRetValues } from "./check_nj_join"
@@ -30,6 +39,7 @@ import {
   elabSrcDecl,
   elabSubstClosed,
 } from "./emit_elab"
+import { unwrapParen } from "./emit_base"
 import { scopeTyAt } from "./emit_capture_frames"
 import { callsOfCallee } from "./emit_fn_ret_kinds"
 import { cloSigKeyExt } from "./emit_classify"
@@ -321,7 +331,9 @@ function frsRowClass(fe: i32, lr: string): string {
   const k = elabKeyAtPos(fe)
   let i = 0
   while i < vals.length {
-    let sty = nodeRepTyIxOf(vals[i])
+    // A call-built value is built at the row its root call is stamped at.
+    const root = retValueRootCall(vals[i])
+    let sty = nodeRepTyIxOf(if root >= 0 { root } else { vals[i] })
     // An instance's body is typed at its template, so its stamp closes under the binding.
     if sty >= 0 && tyHasTyVar(sty) && k >= 0 { sty = elabSubstClosed(sty, k) }
     const st = frsFoldSetTok(repSigRetTokOfTy(sty))
@@ -354,6 +366,26 @@ function frsRecordedOrAnn(fe: i32): i32 {
     if fn.fnRet >= 0 { return nodeTyIxOf(fn.fnRet) }
   }
   r
+}
+
+// The call that builds returned value `v` where another function delivers it: `v` itself, or the
+// initialiser of a `const` it names, through any chain of such names; -1 for any other value.
+export function retValueRootCall(v: i32): i32 {
+  let cur = unwrapParen(v)
+  let hops = 0
+  while cur >= 0 && cur < P.nodes.length && hops < 64 {
+    const n = nodeAt(cur)
+    if n is Call { return cur }
+    if !(n is Ident) { return -1 }
+    const d = identDeclOf(cur)
+    if d < 0 { return -1 }
+    const dn = nodeAt(d)
+    if !(dn is LetDecl) { return -1 }
+    if dn.letKw != "const" || dn.letInit < 0 { return -1 }
+    cur = unwrapParen(dn.letInit)
+    hops = hops + 1
+  }
+  -1
 }
 
 function frsCount(key: string) {
