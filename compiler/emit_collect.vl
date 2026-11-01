@@ -81,6 +81,7 @@ import { refViewSrcTys } from "./check_ref_list_view"
 import { widenRetagToHas } from "./check_retag_rows"
 import {
   T,
+  TY_NEVER,
   TY_NULL,
   TY_VOID,
   TyArray,
@@ -104,6 +105,7 @@ import {
   tyArrayElemIx,
   tyArrayElemPrim,
   tyAt,
+  tyBearsNull,
   tyEqSameHoles,
   tyFieldTyOf,
   tyHoldsObj,
@@ -112,6 +114,7 @@ import {
   tyIsMap,
   tyIsNulStringRep,
   tyIsOneStrLit,
+  tyIxIsFunc,
   tyLitMemberTexts,
   tyMembersDistinctRecords,
   tyNomNameCycled,
@@ -338,6 +341,7 @@ import {
   emitFailed,
   emitPhaseReached,
   exprArmLocalsAny,
+  fRecRetTy,
   fRetBool,
   fRetKind,
   fRetLitAtom,
@@ -572,6 +576,7 @@ import {
   repOfTy,
   repRowOfTyStruct,
   repSigKindOfTy,
+  repSigTokHasSlot,
   repSlotOfTy,
   repTyHasArmShape,
   repVariantShapeRowOf,
@@ -682,6 +687,7 @@ import {
 import { nameIsWholeSpanShape } from "./emit_field_codes"
 import {
   cloSigPosOfKey,
+  criSetRetKind,
   criSettleNonNullRecordRet,
   fnInferredRetLitAtom,
   retAnnKindChain,
@@ -2843,6 +2849,8 @@ export function buildFnMap(_stmts: i32[]) {
     fRetRArrElem = []
     fRetBool = []
     fRetKind = []
+    // Round 1 drops the previous program's recorded column; round 2 keeps the one just banked.
+    if !emitPhaseReached("monomorphized") { fRecRetTy = [] }
     fRetLitAtom = []
     fmSeedVoid = []
     fmSeedStructIdx = []
@@ -2900,6 +2908,76 @@ function fnPosResultUnconsumed(i: i32): boolean {
   false
 }
 
+// Whether function `i`'s recorded result is a value its lowering must return: neither `void`
+// nor `never`, with no bare `return` and a result some caller consumes.
+function cvfRecordedValue(i: i32, fn: FuncDecl): boolean {
+  const r = fnRecordedRetTy(i)
+  if r < 0 || r == TY_VOID || r == TY_NEVER { return false }
+  // A nullable map has no value an `else`-less tail delivers yet (D2498).
+  if tyBearsNull(r) && tyAt(nonNullTy(r)) is TyMap { return false }
+  !blockHasBareReturn(fn.fnBody) && !fnPosResultUnconsumed(i)
+}
+
+// Pin each un-annotated function's result to its recorded type where that is a value keyed with
+// no slot (a scalar, string, closure or scalar list), so `buildFnMap` reads the column, not the
+// body. A bare `return`, an unconsumed or open result, and a literal, record or slotted result
+// keep the derivation.
+export function synthRecordedRetAnnots() {
+  fRecRetTy = []
+  let i = 0
+  while i < fnStmts.length {
+    fRecRetTy.push(fnRecordedRetTy(i))
+    const fn = nodeAt(fnStmts[i])
+    if fn is FuncDecl {
+      if fn.fnRet < 0 {
+        const r = fRecRetTy[i]
+        if (
+          r >= 0
+          && r != TY_VOID
+          && r != TY_NEVER
+          && !tyHasTyVar(r)
+          && !srrNamesShape(r)
+          && !blockHasBareReturn(fn.fnBody)
+          && !fnPosResultUnconsumed(i)
+        ) {
+          const k = repSigKindOfTy(r)
+          if k != null && !repSigTokHasSlot(k) {
+            const ann = synthAnnOfTy(r, r)
+            if ann >= 0 { fn.fnRet = ann }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether recorded result `r` is, or has as a member, a literal type or a record shape: its
+// emit name spells the shape inline, which a pin does not read as the declared alias does.
+function srrNamesShape(r: i32): boolean {
+  if r < 0 || r >= T.tys.length { return false }
+  const t = tyAt(r)
+  match t {
+    TyLit | TyObj => {
+      return true
+    }
+    TyNullable => {
+      return srrNamesShape(t.nInner)
+    }
+    TyUnion => {
+      let m = 0
+      while m < t.uMembers.length {
+        if srrNamesShape(t.uMembers[m]) { return true }
+        m = m + 1
+      }
+    }
+    // A primitive, function, list, map or open type is spelled by its own name.
+    TyPrim | TyErr | TyFunc | TyArray | TyMap | TyVar | TyNeg => {}
+  }
+  false
+}
+
 // Classify each function's voidness as a monotone fixed point: a candidate with no return
 // annotation is void when its body has no valued `return` and no tail value. `stmtIsTailValue`
 // consults `fRetVoid` for tail calls, so marking a callee void can make its callers' tails
@@ -2913,7 +2991,7 @@ export function computeVoidFns() {
       if fRetVoid[i] == 0 {
         const fn = nodeAt(fnStmts[i])
         if fn is FuncDecl {
-          if fn.fnRet < 0 {
+          if fn.fnRet < 0 && !cvfRecordedValue(i, fn) {
             // A bare `return` pins this function void whatever its tail yields; the checker
             // reads the same predicate, so the functype and the caller's type agree (D1600).
             // So does a recorded `void` result, which a build-time fold cannot undo (D14790).
@@ -2981,6 +3059,30 @@ function inferNulStructRow(rt: i32): i32 { structRowOfTy(inferNulInnerTy(rt)) }
 // struct twin answers -1 for every `Circle | null`; a record an arm adopted names that arm.
 function inferNulVariantRow(rt: i32): i32 {
   variantRowOfShapeTy(inferNulInnerTy(rt))
+}
+
+// The nullable-closure niche of function `i` read from its recorded result, where no return the
+// walk reached named it: an `else`-less tail `if`, whose value the walk does not classify, and a
+// clone whose return carries no type of its own (an instance's lambda).
+function criNulCloByRecorded(i: i32) {
+  if fRetKind[i] != "i32" || fRetBool[i] != 0 || i >= fRecRetTy.length {
+    return 0
+  }
+  const r = fRecRetTy[i]
+  if tyIxIsFunc(tyNulInnerTy(r)) || criNulUnionFunc(r) {
+    criSetRetKind(i, "nulclosure")
+  }
+  0
+}
+
+// Whether `ty` is a two-member union of a function type and `null`.
+function criNulUnionFunc(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const u = tyAt(ty)
+  if !(u is TyUnion) || u.uMembers.length != 2 { return false }
+  const a = u.uMembers[0]
+  const b = u.uMembers[1]
+  (tyIxIsFunc(a) && b == TY_NULL) || (tyIxIsFunc(b) && a == TY_NULL)
 }
 
 // The struct row of the result the checker gave function `i`, for a function the expression
@@ -3066,6 +3168,7 @@ export function computeRetInference() {
             }
             criWalkBlock(fnb.fnBody, i, true)
             criStructByFnTy(i)
+            criNulCloByRecorded(i)
           }
           if criChanged { changed = true }
         }
