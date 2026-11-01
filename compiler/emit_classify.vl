@@ -13212,8 +13212,10 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
   const e = nodeAt(exprIx)
   // `u as? M` out of a union box yields the nullable map ref, whatever the cast node's rep.
   if e is AsExpr && asUnionMapTy(exprIx, fnIx, true) >= 0 { return true }
-  // A name or field read is its cell's kind: a read narrowed to `null` still holds the ref.
-  if e is Ident || e is Member { return exprNulKind(exprIx, fnIx) == "nulmap" }
+  // A name, field or element read is what its storage reads as there.
+  if e is Ident || e is Member || e is Index {
+    return readRepOf(exprIx, fnIx).rrRead == "nulmap"
+  }
   const rd = repOfNode(exprIx, fnIx)
   rd.rdCovered == 1 && rd.rdKind == "nulmap"
 }
@@ -15084,4 +15086,124 @@ export function classifyStateReset() {
   storageReadLeave(-1)
   objLitSlotsReset()
   0
+}
+
+// ── read rep ─────────────────────────────────────────────────────────────────
+// What a name, field or element read is stored as (`rrStore`) and what it reads as there
+// (`rrRead`): the storage kind, converted at the read (`rrConv`) to an atom, a niche, a
+// container or a non-null kind where the checker narrowed it; "" when the read has no rep.
+type ReadRep = { rrStore: string, rrRead: string, rrConv: i32 }
+
+function readRepOf(ix: i32, fnIx: i32): ReadRep {
+  const rx = unwrapParen(ix)
+  const none: ReadRep = { rrStore: "", rrRead: "", rrConv: 0 }
+  if rx < 0 { return none }
+  const e = nodeAt(rx)
+  let st = ""
+  if e is Ident {
+    const k = identCellVKind(rx, fnIx)
+    if k != null {
+      st = k
+    } else {
+      // A read with no slot yet has no storage to read: it reads at its own type.
+      const td = repOfNode(rx, fnIx)
+      if td.rdCovered == 1 {
+        return { rrStore: "type", rrRead: td.rdKind, rrConv: 7 }
+      }
+    }
+  } else if e is Member {
+    st = readFieldStoreKind(rx, fnIx)
+  } else if e is Index {
+    st = readIndexStoreKind(e, rx, fnIx)
+  } else {
+    return none
+  }
+  if st == "" { return none }
+  const nk = nicheReadKindAt(rx, fnIx)
+  if nk == 1 { return { rrStore: st, rrRead: "nulbool", rrConv: 2 } }
+  if nk == 2 { return { rrStore: st, rrRead: "nulstr", rrConv: 2 } }
+  let ak = -1
+  let ck = 0
+  if e is Ident {
+    ak = identReadAtomKindAt(rx, fnIx)
+    if ak < 0 { ck = identReadContainerAt(rx, fnIx) }
+  } else if e is Member {
+    ak = memNarrowAtomKind(rx, fnIx)
+    if ak < 0 { ak = memReadUnboxAtomKind(rx, fnIx) }
+    if ak < 0 { ck = placeReadContainerAt(rx, fnIx) }
+  } else if e is Index {
+    ak = idxNarrowAtomKind(rx, fnIx)
+    if ak < 0 { ak = mapReadNarrowedAtomKind(rx, fnIx) }
+    if ak < 0 { ck = placeReadContainerAt(rx, fnIx) }
+    if ak < 0 && ck == 0 && mapReadNarrowedContainer(rx, fnIx) { ck = RC_MAP }
+  }
+  if ak >= 0 {
+    return { rrStore: st, rrRead: "atom" + i32ToStr(ak), rrConv: 1 }
+  }
+  if ck == RC_MAP { return { rrStore: st, rrRead: "map", rrConv: 3 } }
+  if ck == RC_REF_LIST { return { rrStore: st, rrRead: "reflist", rrConv: 3 } }
+  // A map value read is the value or null, at the read's own type.
+  const mvr = if e is Index { mapReadMvSlot(rx, fnIx) } else { -1 }
+  if mvr >= 0 && mvValKind[mvr] == MVK_REF {
+    const md = repOfNode(rx, fnIx)
+    if md.rdCovered == 1 {
+      return { rrStore: st, rrRead: md.rdKind, rrConv: 4 }
+    }
+  }
+  // A read narrowed out of a nullable storage to its non-null kind reads that kind.
+  if readNarrowedStoreAt(rx, fnIx) >= 0 && readKindIsNul(st) {
+    const nd = repOfNode(rx, fnIx)
+    if nd.rdCovered == 1 && !readKindIsNul(nd.rdKind) {
+      return { rrStore: st, rrRead: nd.rdKind, rrConv: 5 }
+    }
+  }
+  { rrStore: st, rrRead: st, rrConv: 0 }
+}
+
+// Whether `k` is a nullable rep kind.
+function readKindIsNul(k: string): boolean {
+  k == "nulmap"
+    || k == "nulstruct"
+    || k == "nulvariant"
+    || k == "nulreflist"
+    || k == "nulstr"
+    || k == "nulbool"
+    || k == "nulclosure"
+    || k == "nullist"
+    || k == "nulnone"
+    || k == "nulstrlist"
+    || k == "nulf64list"
+    || k == "nulf32list"
+    || k == "nuli64list"
+    || k == "nulu8list"
+}
+
+// The kind a field read's storage holds, by its field code.
+function readFieldStoreKind(rx: i32, fnIx: i32): string {
+  const fc = memberFieldCode(rx, fnIx)
+  if fc == FC_UNION { return "union" }
+  if fc == FC_MAP { return "map" }
+  if fc == FC_NUL_MAP { return "nulmap" }
+  if fc == FC_NUL_STR { return "nulstr" }
+  if fc == FC_NUL_BOOL { return "nulbool" }
+  if fc == FC_STRUCT { return "struct" }
+  if fc < 0 { return "" }
+  "fc" + i32ToStr(fc)
+}
+
+// The kind an element or map-value read's slot holds.
+function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
+  if exprRefArray(e.idxArr, fnIx) {
+    const k = refListElemKind(e.idxArr, fnIx)
+    if k != null { return k }
+    return "reflist?"
+  }
+  const mri = mapReadMvSlot(rx, fnIx)
+  if mri >= 0 {
+    const v = mvValKind[mri]
+    if v == MVK_UNION { return "union" }
+    if v == MVK_STRUCT { return "struct" }
+    return "mv" + i32ToStr(v)
+  }
+  ""
 }
