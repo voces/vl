@@ -287,4 +287,28 @@ The wall is the build plus the slowest row, about 130–160 s here. The owner's 
   `refresh-compiler.sh`. On the 4-core box at `GATE_MAX_PAR=3` the row went from 114.9 s to
   30–33 s and the gate from 279 s to 236 s; `ci-native` still sets the wall.
 
+### Gate-only rows moved into CI, 2026-11-01
+
+Merges are direct squashes, so a row that runs only in `gate.sh` checks nothing before a merge.
+Four regressions landed that way on 2026-10-31.
+
+| row | where it runs now | what it catches that nothing else in CI does |
+| --- | --- | --- |
+| `rep-fuzz`, `splice scan` | `checks` (#5446) | rep-composition failures outside the baseline; spliced inventory rows |
+| the L2 fuel and heap tripwire (`self-compile-time.sh`, part of `self-compile pair`) | `ci-cost` shard 2, heavy runs (#5528) | a pass that scales with the program, which shows up only one bootstrap step late (D1090's quadratic collect pass); the seed job's fixpoint proves the bytes, not the cost |
+
+The tripwire's baseline was re-written at efc86b3b4 to 58,086,244,007 fuel, after the day's claw-backs:
+#5510, #5518 and #5520. It trips at 1.5×, 87.13 G. Before that, the baseline was 61.83 G, and the
+one before that was 101.98 G from 2026-10-18, which tripped only past 2.4× of the real cost.
+
+Three local-only rows stay local:
+
+* **The survey rows of `self-compile pair`.** They are informational. `gate.sh` also builds its seed
+  from the pair.
+* **`plumb-shape cost` under binaryen.** CI grades its fuel and RSS. The binaryen half adds two rung
+  facts (D2335, D2336) and CPU rows that read "not graded" on CI runners. No mutant has been aimed
+  at those facts.
+* **The seed-dependent part of `deno task test`.** It is already covered:
+  `tests/ci_seed_coverage_test.ts` fails any seed-backed test that CI runs nowhere.
+
 A new check is held to §1 from the day it lands: say which breakage it catches that nothing else does.
