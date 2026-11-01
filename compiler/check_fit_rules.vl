@@ -83,6 +83,7 @@ import {
   inferObservedLit,
   inferObservedLitSet,
   inferObservedSet,
+  listCopyTyIx,
   mapUnboxTyIx,
   nodeCtxTyIx,
   nodeRepTyIx,
@@ -2861,7 +2862,38 @@ function recRetTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
     if cwPeelValue(lf) == u { leaf = true }
   }
   if !leaf { return false }
-  recFieldRead(call) || recArgTakesRep(call, depth) || recBoundForFields(call)
+  recFieldRead(call)
+    || recArgTakesRep(call, depth)
+    || recBoundForFields(call)
+    || recInReadOnlyList(call, depth)
+}
+
+// Whether `x` is an element of a list literal that initialises an un-annotated `const` read only
+// for its length or for an element's field: the list is built at its elements' rep (D14811).
+function recInReadOnlyList(x: i32, depth: i32): boolean {
+  if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_ELEM {
+    return false
+  }
+  const l = cwIxUp[x]
+  if l < 0 || l >= cwIxUpKind.length || !(nodeAt(l) is ArrayLit) {
+    return false
+  }
+  if cwIxUpKind[l] != CW_UP_LETINIT { return false }
+  const d = cwIxUp[l]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letKw != "const" { return false }
+  let used = false
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      if !recElemTakesRep(cwIxNode[r], -1, -1, depth - 1) { return false }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
+      return false
+    }
+  }
+  used
 }
 
 // Whether `x` initialises an un-annotated `const` that is only read for a field.
@@ -5093,6 +5125,65 @@ export function recordInferRetNullOnly(key: string, er: i32): boolean {
   // `TY_NULL`, not `er`: the hole's `er` has no inner a downstream read could take.
   recordInferRet(key, "null", TY_NULL, 1, IR_REC_NULL_ONLY)
   true
+}
+
+// Records `dstTy` at each list value `srcExpr` delivers into a list of another element type: the
+// emitter converts it there when the two element storages differ. A literal is built at its
+// destination, so the record goes on its elements and fields instead.
+export function recordListCopy(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  listCopyAt(srcExpr, srcTy, dstTy, REC_STORE_DEPTH)
+}
+
+// `recordListCopy` to `depth` literals deep.
+function listCopyAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
+  const dst = nonNulTyOf(dstTy)
+  if srcExpr < 0 || srcTy < 0 || dst < 0 || srcTy >= T.tys.length || depth < 0 {
+    return 0
+  }
+  const dt = tyAt(dst)
+  for lf in valueTailLeaves(srcExpr) {
+    if lf < 0 { continue }
+    const ln = nodeAt(parenPeelIx(lf))
+    if ln is ObjLit {
+      if dt is TyObj {
+        for fx in ln.objFields {
+          const fi = nodeAt(fx)
+          if fi is FieldInit {
+            const df = objFieldType(dt, fi.fiName)
+            if df >= 0 {
+              listCopyAt(fi.fiValue, nodeTyOf(fi.fiValue), df, depth - 1)
+            }
+          }
+        }
+      }
+    } else if ln is ArrayLit {
+      if dt is TyArray {
+        for ex in ln.arrElems {
+          if !(nodeAt(ex) is Spread) {
+            listCopyAt(ex, nodeTyOf(ex), dt.aElem, depth - 1)
+          }
+        }
+      }
+    } else if listTysElemDiffer(nodeTyOf(lf), dst) {
+      while listCopyTyIx.length <= lf { listCopyTyIx.push(-1) }
+      listCopyTyIx[lf] = dst
+    }
+  }
+  0
+}
+
+// Whether `src` and `dst` are both lists, `src` possibly nullable, of different element types.
+function listTysElemDiffer(src: i32, dst: i32): boolean {
+  const sn = nonNulTyOf(src)
+  if sn < 0 || sn >= T.tys.length || dst < 0 || dst >= T.tys.length {
+    return false
+  }
+  const s = tyAt(sn)
+  const d = tyAt(dst)
+  if s is TyArray {
+    if d is TyArray { return s.aElem != d.aElem }
+  }
+  false
 }
 
 // Records `dstTy` at each value `srcExpr` delivers when its record stores a number otherwise
