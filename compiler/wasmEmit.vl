@@ -388,6 +388,8 @@ import {
   VKind,
   aTypeIdx,
   aUsed,
+  armFieldNames,
+  armFieldTypes,
   armPreludeBlocks,
   arrNewScratchBase,
   atomStageSlot,
@@ -617,8 +619,13 @@ import {
   sBackIdx,
   sDeclared,
   sFieldCount,
+  sFieldElemName,
+  sFieldElemTyIx,
+  sFieldLitTyIx,
   sFieldNames,
   sFieldStart,
+  sFieldTyText,
+  sFieldTypes,
   sHeapIdx,
   sIsRefRow,
   sTypeIdx,
@@ -642,13 +649,7 @@ import {
   uBoxNewEnd,
   uDeclared,
   uFieldCount,
-  uFieldElemName,
-  uFieldElemTyIx,
-  uFieldLitTyIx,
-  uFieldNames,
   uFieldStart,
-  uFieldTyText,
-  uFieldTypes,
   uSinkFired,
   uTags,
   uVarRow,
@@ -2638,8 +2639,8 @@ function guardVariantFieldSpan(vi: i32, where: string) {
     if (
       uFieldStart[vi] >= 0
       && uFieldCount[vi] >= 0
-      && end <= uFieldNames.length
-      && end <= uFieldTypes.length
+      && end <= sFieldNames.length
+      && end <= sFieldTypes.length
     ) {
       return 0
     }
@@ -2656,9 +2657,9 @@ function guardVariantFieldSpan(vi: i32, where: string) {
       + " field starts / "
       + i32ToStr(uFieldCount.length)
       + " field counts / "
-      + i32ToStr(uFieldNames.length)
+      + i32ToStr(armFieldNames().length)
       + " field names / "
-      + i32ToStr(uFieldTypes.length)
+      + i32ToStr(armFieldTypes().length)
       + " field types",
   )
 }
@@ -2777,17 +2778,17 @@ function emitVariantStruct(
   // row's fields are laid out sorted by name too, so `{ kind: "rect", w: f(), h: g() }` is
   // pushed `h, kind, w` and would run its initialisers permuted without this.
   const stash: i32[] = []
-  if objLitNeedsOrderStash(objIx, uFieldNames, start, cnt) {
+  if objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) {
     let pj = 0
     while pj < cnt {
       stash.push(0 - 1)
       pj = pj + 1
     }
-    const ord = objFieldSrcOrder(objIx, uFieldNames, start, cnt)
+    const ord = objFieldSrcOrder(objIx, sFieldNames, start, cnt)
     let oj = 0
     while oj < ord.length {
       const ofj = ord[oj]
-      const ovIx = objFieldVal(objIx, uFieldNames[start + ofj])
+      const ovIx = objFieldVal(objIx, sFieldNames[start + ofj])
       if ovIx < 0 {
         return emitFail(
           "emitProgram: object literal is missing a union-variant field",
@@ -2805,7 +2806,7 @@ function emitVariantStruct(
   }
   let fj = 0
   while fj < cnt {
-    const valIx = objFieldVal(objIx, uFieldNames[start + fj])
+    const valIx = objFieldVal(objIx, sFieldNames[start + fj])
     if valIx < 0 && stash.length == 0 && variantFieldMayOmit(vi, fj) {
       // A field the literal leaves out holds null, as a plain struct's does, built exactly as
       // the literal `null` written there would be (D2223).
@@ -2849,7 +2850,7 @@ function objLitHasFieldOutside(objIx: i32, start: i32, cnt: i32): boolean {
       let k = 0
       let found = false
       while k < cnt && !found {
-        if uFieldNames[start + k] == f.fiName { found = true }
+        if sFieldNames[start + k] == f.fiName { found = true }
         k = k + 1
       }
       if !found { return true }
@@ -3107,8 +3108,8 @@ function emitRecCopyInto(
 function variantRowFields(vi: i32, names: string[], codes: i32[]) {
   let fj = 0
   while fj < uFieldCount[vi] {
-    names.push(uFieldNames[uFieldStart[vi] + fj])
-    codes.push(uFieldTypes[uFieldStart[vi] + fj])
+    names.push(sFieldNames[uFieldStart[vi] + fj])
+    codes.push(sFieldTypes[uFieldStart[vi] + fj])
     fj = fj + 1
   }
   0
@@ -3885,7 +3886,7 @@ function emitDiscrimFieldEq(
         + " fields",
     )
   }
-  const code = uFieldTypes[uFieldStart[vi] + fi]
+  const code = sFieldTypes[uFieldStart[vi] + fi]
   if emitExpr(body, recvIx, fnIx, ec) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1)
   fbRefCast(variantHeap(vi))
@@ -10246,7 +10247,7 @@ function variantFieldsComparable(vi: i32): boolean {
   const cnt = uFieldCount[vi]
   let j = 0
   while j < cnt {
-    if start + j >= uFieldTypes.length { return false }
+    if start + j >= sFieldTypes.length { return false }
     if !variantFieldComparable(start + j) { return false }
     j = j + 1
   }
@@ -10262,7 +10263,7 @@ function variantFieldsComparable(vi: i32): boolean {
 // `p == a` while the identical field compares fine at its direct spelling. Most of those cores
 // exist already; `i64` and `f32` are the two the struct ladder does not serve either.
 function variantFieldComparable(ufi: i32): boolean {
-  const c = uFieldTypes[ufi]
+  const c = sFieldTypes[ufi]
   if c == FC_NUL_NONE {
     return true // `null` has one value: the core drops both reads and answers true
   }
@@ -10307,7 +10308,7 @@ function variantFieldComparable(ufi: i32): boolean {
 // Can the shared box core serve every arm of a code-16 variant field's union? The field's
 // recorded elem name is the atom-set name the box is built against.
 function variantBoxFieldComparable(ufi: i32): boolean {
-  const bn = uFieldElemName[ufi]
+  const bn = sFieldElemName[ufi]
   if bn == "" { return false }
   const bArms: string[] = []
   const bVis: i32[] = []
@@ -10332,9 +10333,9 @@ function variantFieldCodeComparable(ufi: i32, c: i32): boolean {
 // The ref-list slot of the code-5 variant field at flat row `ufi`, or -1 — keyed by the
 // field's recorded element type, as `variantFieldRefSlot` keys it by (variant, field).
 function variantRefListFieldSlot(ufi: i32): i32 {
-  if uFieldElemName[ufi] == "" { return 0 - 1 }
-  if ufi >= uFieldElemTyIx.length { return 0 - 1 }
-  rlSlotOfTyOrTwin(uFieldElemTyIx[ufi])
+  if sFieldElemName[ufi] == "" { return 0 - 1 }
+  if ufi >= sFieldElemTyIx.length { return 0 - 1 }
+  rlSlotOfTyOrTwin(sFieldElemTyIx[ufi])
 }
 
 // D1061 — the box tag of one arm of a mixed struct/scalar union, from whichever of the two
@@ -10420,7 +10421,7 @@ function emitVariantFieldsEq(
     // spellings, take the null guard: the payload may legitimately be `null`, and the core
     // underneath would `struct.get` it. Without the guard an `Inner | null` arm field is
     // `vl check` rc 0 and traps on `{d: null} == {d: null}`.
-    const jc = uFieldTypes[start + j]
+    const jc = sFieldTypes[start + j]
     const jn = nulFieldInnerCode(jc)
     if jn >= 0 || jc == FC_STRUCT {
       let inner = jc
@@ -10489,7 +10490,7 @@ function emitVariantNulFieldEq(
 // mirrored arm for arm; the floor below is unreachable through that gate and is a floor, not
 // a capability refusal.
 function emitVariantFieldEqCore(body: u8[], ufi: i32, fnIx: i32, ec: ExpCtx) {
-  emitVariantFieldEqCoreAt(body, ufi, fnIx, uFieldTypes[ufi], ec)
+  emitVariantFieldEqCoreAt(body, ufi, fnIx, sFieldTypes[ufi], ec)
 }
 
 // The same ladder keyed by an EXPLICIT code — what the null guard re-enters at the niche's
@@ -10540,7 +10541,7 @@ function emitVariantFieldEqCoreAt(
   }
   if c == FC_UNION {
     if ufi < 0 { return -1 }
-    const vbN = uFieldElemName[ufi]
+    const vbN = sFieldElemName[ufi]
     const vbArms: string[] = []
     const vbVis: i32[] = []
     const vbAks: i32[] = []
@@ -10563,7 +10564,7 @@ function emitVariantFieldEqCoreAt(
 
 // D974 — the interned struct row of a variant field's NESTED shape, or -1.
 function variantNestedRow(ufi: i32): i32 {
-  const nm = uFieldElemName[ufi]
+  const nm = sFieldElemName[ufi]
   if nm == "" { return -1 }
   // A NAMED nested type (`type C = {r: i32}` as an arm's field) has a struct row under its
   // NAME; only an INLINE shape needs interning. Asking the name first is what makes the
@@ -11384,11 +11385,11 @@ function sharedFieldTysIdentical(vis: i32[], fis: i32[]): boolean {
   let i = 0
   while i < vis.length {
     const at = uFieldStart[vis[i]] + fis[i]
-    if at < 0 || at >= uFieldTyText.length || at >= uFieldLitTyIx.length {
+    if at < 0 || at >= sFieldTyText.length || at >= sFieldLitTyIx.length {
       return false
     }
-    if at0 < 0 || at0 >= uFieldTyText.length { return false }
-    if uFieldTyText[at] != uFieldTyText[at0] || uFieldLitTyIx[at] >= 0 {
+    if at0 < 0 || at0 >= sFieldTyText.length { return false }
+    if sFieldTyText[at] != sFieldTyText[at0] || sFieldLitTyIx[at] >= 0 {
       return false
     }
     if variantFieldIsLitUnion(vis[i], fis[i]) { return false }
