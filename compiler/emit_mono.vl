@@ -605,6 +605,7 @@ import {
   elabResultAtParams,
   elabRetOf,
   elabSlotNote,
+  elabSrcDecl,
   elabStampAt,
   elabStubArgSet,
   elabTestsTyVar,
@@ -614,6 +615,7 @@ import {
   elabWalkNarrowedTy,
   elabWalkPop,
   elabWalkPush,
+  elabWalkTop,
   elabWalkTy,
   elabWidenedRet,
   readNarrowedStoreAt,
@@ -4507,6 +4509,7 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
           fnTagLeafCarry(clone, unwrapParen(argIx))
           fnStmts.push(clone)
           fnParent.push(-1)
+          monoCadNotePinnedLam(unwrapParen(argIx), fnStmts.length - 1, elemTyIx)
           fnDispNames.push("")
           fnValUsed = true
           fnNestUsed = true
@@ -4981,6 +4984,7 @@ function monoLamInstallClone(a: FuncDecl, fnIx: i32, clone: i32, mark: i32) {
   const mySlot = fnStmts.length - 1
   const tmplSlot = monoSlotOfLamNode(fnIx)
   monoCloneKeepsHoles(tmplSlot, mySlot, clone)
+  monoCadNoteLamClone(clone, mySlot)
   lfNoteClone(mySlot, tmplSlot)
   monoReparentNestedLams(mark, mySlot)
   monoLamMintedSlots.push(mySlot)
@@ -9631,6 +9635,7 @@ function monoExactPinTys(pinTys: i32[], ctx: i32) {
 // Writes the instance walk's scoped staging back to its declared values at compile start, so
 // no binding, pin or callee frame of an earlier program's walk is read by this one.
 export function monoStateReset() {
+  cadRowReset()
   monoCallFrameSlot = 0 - 1
   monoCellAliasListOk = 0 - 1
   monoCgcGenAliasNames = []
@@ -9725,6 +9730,8 @@ function monoMakeInstance(
   // The deliveries inside the instance's body are its own, not the one being built.
   const widenWas = monoInstanceWidenRet
   monoInstanceWidenRet = false
+  const bakedWas = cadInBaked
+  cadInBaked = monoCadBaked(cbFnNames)
   const rc = monoMakeInstanceGo(
     origFe,
     pinned,
@@ -9739,6 +9746,7 @@ function monoMakeInstance(
   substNullFoldRestore(foldWas)
   monoInstOwn = ownWas
   monoInstanceWidenRet = widenWas
+  cadInBaked = bakedWas
   rc
 }
 
@@ -10920,6 +10928,10 @@ function monoMakeInstanceGo(
 ) {
   const callFrame = monoCallFrameSlot
   monoCallFrameSlot = -1
+  // The delivery this build answers, read in the instance being walked before this one's.
+  const cadDel = cadDelivery
+  cadDelivery = -1
+  const cadEncl = elabWalkTop()
   const makeCall = monoMakeCallIx
   monoMakeCallIx = -1
   const retWiden = monoInstRetWidenName
@@ -10954,7 +10966,14 @@ function monoMakeInstanceGo(
     if (
       monoMakeInstanceHit(k.key, origFe, pinned, pinTys, calleeIx, annotateI32)
     ) {
-      return 0
+      return monoCadNoteInstance(
+        origFe,
+        monoLastInstFe,
+        k.key,
+        cadDel,
+        cadEncl,
+        cbFnNames,
+      )
     }
     // New shape: clone the original declaration with pinned annotations. An un-annotated
     // param pinned at plain i32 keeps `parType = -1` — the emitter's default kind, and
@@ -11002,7 +11021,14 @@ function monoMakeInstanceGo(
           annotateI32,
         )
       ) {
-        return 0
+        return monoCadNoteInstance(
+          origFe,
+          monoLastInstFe,
+          typedHit,
+          cadDel,
+          cadEncl,
+          cbFnNames,
+        )
       }
       return emitFail(
         "emitProgram: monomorphize: a typed instance key names no registered instance",
@@ -11134,6 +11160,7 @@ function monoMakeInstanceGo(
     elabSlotNote(instFe, ek)
     monoKeyEk[k.key] = ek
     monoKeyPins[k.key] = pinnedTyIx
+    monoCadNoteInstance(origFe, instFe, k.key, cadDel, cadEncl, cbFnNames)
     monoNoteOpenArgs(calleeIx, instFe)
     if monoRegisterInstance() < 0 { return elabWalkPop() - 1 }
     const walked = monoMakeInstanceWalk(fn, origFe, nfn, calleeIx, lamClones)
@@ -11392,7 +11419,8 @@ function monoInstanceFor(
     const noCb: string[] = []
     const pinKinds: i32[] = []
     monoBuildPinCol(pinned, pinKinds)
-    return monoMakeInstance(
+    cadDelivery = if cadDeliveryAt >= 0 { cadDeliveryAt } else { letInitIx }
+    const made = monoMakeInstance(
       origFe,
       pinned,
       pinKinds,
@@ -11403,6 +11431,8 @@ function monoInstanceFor(
       true,
       noCb,
     )
+    cadDelivery = -1
+    return made
   }
   0
 }
@@ -27203,6 +27233,203 @@ function monoSlotParamPins(fe: i32, out: string[]) {
   false
 }
 
+// The built-closure row: one entry per closure mono builds, keyed by its creation site, the
+// instance whose body holds that site (-1 for none) and the closed signature it is built at,
+// answering the emitted slot. Columns are parallel; `monoCadRowWrite` is the only writer.
+let cadSite: i32[] = []
+let cadInst: i32[] = []
+let cadSig: i32[] = []
+let cadFe: i32[] = []
+// The row entries of each creation site, so a write scans only its own site's.
+let cadBySite: {[i32]: i32[]} = Map()
+// Writes whose key already answered another slot, and writes whose signature did not close.
+let cadConflicts = 0
+let cadUnkeyed = 0
+// Each built slot's closed signature, minted once; -1 where it does not close.
+let cadFeSig: {[i32]: i32} = Map()
+// The instance being walked when each per-instance lambda clone is minted.
+let cadCloneInst: {[i32]: i32} = Map()
+// The value node a delivery asks `monoMakeInstance` to build a closure for, or -1; and the
+// delivery node standing for a value `monoInstanceFor` is handed as a fresh read, or -1.
+let cadDelivery = 0 - 1
+let cadDeliveryAt = 0 - 1
+// Whether the instance being built has a callback baked in, so what it mints is a call's
+// specialization rather than a closure at a signature.
+let cadInBaked = false
+
+// The row's size, its conflicting writes and its unkeyed writes, for a self-check.
+export function cadRowCount(): i32 { cadFe.length }
+
+export function cadRowConflicts(): i32 { cadConflicts }
+
+export function cadRowUnkeyed(): i32 { cadUnkeyed }
+
+function cadRowReset() {
+  cadSite = []
+  cadInst = []
+  cadSig = []
+  cadFe = []
+  cadBySite = Map()
+  cadConflicts = 0
+  cadUnkeyed = 0
+  cadFeSig = Map()
+  cadCloneInst = Map()
+  cadDelivery = 0 - 1
+  cadDeliveryAt = 0 - 1
+  cadInBaked = false
+  0
+}
+
+// Records that slot `fe` is the closure built for (`site`, `inst`, `sig`). A key already
+// answering another slot counts a conflict and keeps the first answer; -1 `sig` is unkeyed.
+function monoCadRowWrite(site: i32, inst: i32, sig: i32, fe: i32) {
+  if site < 0 || fe < 0 { return 0 }
+  if sig < 0 {
+    cadUnkeyed = cadUnkeyed + 1
+    return 0
+  }
+  const rows = cadBySite.get(site) ?? []
+  for r in rows {
+    if cadInst[r] == inst && monoCadSigSame(cadSig[r], sig) {
+      if cadFe[r] != fe { cadConflicts = cadConflicts + 1 }
+      return 0
+    }
+  }
+  rows.push(cadFe.length)
+  cadBySite[site] = rows
+  cadSite.push(site)
+  cadInst.push(inst)
+  cadSig.push(sig)
+  cadFe.push(fe)
+  0
+}
+
+// Whether two row signatures are one: the same type, with each tagged set the same set.
+function monoCadSigSame(a: i32, b: i32): boolean {
+  if !tySame(a, b) { return false }
+  const fa = tyAt(a)
+  const fb = tyAt(b)
+  if fa is TyFunc {
+    if fb is TyFunc {
+      if fnTagSetOfTy(fa.fnRet) != fnTagSetOfTy(fb.fnRet) { return false }
+      let i = 0
+      while i < fa.fnParamTypes.length && i < fb.fnParamTypes.length {
+        if (
+          fnTagSetOfTy(fa.fnParamTypes[i])
+          != fnTagSetOfTy(fb.fnParamTypes[i])
+        ) {
+          return false
+        }
+        i = i + 1
+      }
+    }
+  }
+  true
+}
+
+// The closed signature slot `fe` is built at, from its parameter types `ps` and result `ret`,
+// minted on the slot's first ask; -1 where one of them is open.
+function monoCadSigOf(fe: i32, ps: i32[], ret: i32): i32 {
+  const have = cadFeSig.get(fe) ?? 0 - 2
+  if have > -2 { return have }
+  let ok = monoCadTyClosed(ret)
+  for p in ps {
+    if !monoCadTyClosed(p) { ok = false }
+  }
+  const s = if ok { mkFuncTy(ps.slice(0), ret) } else { -1 }
+  cadFeSig[fe] = s
+  s
+}
+
+// A tagged set counts as closed: its rep is the member id, whatever its members' parameters.
+function monoCadTyClosed(t: i32): boolean {
+  t >= 0 && t < T.tys.length && (fnTagTyIsTagged(t) || !tyHasTyVar(t))
+}
+
+// Whether arena node `d` is an anonymous lambda, whose value is a closure built where it is
+// written.
+function monoCadIsLam(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  if n is FuncDecl {
+    return n.fnName.length >= 8 && n.fnName.slice(0, 8) == "__lambda"
+  }
+  false
+}
+
+// Whether an instance keyed by callbacks `cbFnNames` has one baked in.
+function monoCadBaked(cbFnNames: string[]): boolean {
+  for cb in cbFnNames {
+    if cb != "" { return true }
+  }
+  false
+}
+
+// An instance of template `origFe` at slot `fe`, keyed `key`, as the closure built for its
+// lambda or for the delivery `delivery` read in instance `encl`; 0, recording it in the row.
+// An instance with a callback baked in (`cbFnNames`) is a call's specialization, not a closure.
+function monoCadNoteInstance(
+  origFe: i32,
+  fe: i32,
+  key: string,
+  delivery: i32,
+  encl: i32,
+  cbFnNames: string[],
+) {
+  if monoCadBaked(cbFnNames) { return 0 }
+  const tpl = monoOrigNode[origFe]
+  const lam = monoCadIsLam(tpl)
+  if !lam && delivery < 0 { return 0 }
+  // A lambda cloned inside a baked instance's body (-2) is that specialization's too.
+  const lamInst = if lam { cadCloneInst.get(tpl) ?? -1 } else { -1 }
+  if lamInst < -1 { return 0 }
+  let sig = cadFeSig.get(fe) ?? 0 - 2
+  if sig < -1 {
+    let ret = elabRetOf(monoKeyEk.get(key) ?? -1)
+    if ret < 0 { ret = monoCadCheckedRet(tpl) }
+    sig = monoCadSigOf(fe, monoKeyPins.get(key) ?? [], ret)
+  }
+  if lam { return monoCadRowWrite(elabSrcDecl(tpl), lamInst, sig, fe) }
+  monoCadRowWrite(delivery, encl, sig, fe)
+}
+
+// A lambda template cloned per enclosing instance into slot `slot`: notes the instance being
+// walked (-2 inside a baked instance), and records the clone in the row where its signature
+// is already closed.
+function monoCadNoteLamClone(clone: i32, slot: i32) {
+  const inst = if cadInBaked { 0 - 2 } else { elabWalkTop() }
+  cadCloneInst[clone] = inst
+  if inst < -1 || !monoCadIsLam(clone) || monoIsGenericDecl(clone) { return 0 }
+  const t = nodeTyIxOf(clone)
+  let sig = -1
+  if t >= 0 && t < T.tys.length && monoCadTyClosed(t) {
+    if tyAt(t) is TyFunc { sig = t }
+  }
+  cadFeSig[slot] = sig
+  monoCadRowWrite(elabSrcDecl(clone), inst, sig, slot)
+}
+
+// The result `d`'s checked function type names, where that is closed (a lambda returning
+// nothing, which the elaboration leaves without a result); else -1.
+function monoCadCheckedRet(d: i32): i32 {
+  const t = nodeTyIxOf(d)
+  if t < 0 || t >= T.tys.length { return -1 }
+  const ft = tyAt(t)
+  if ft is TyFunc {
+    if monoCadTyClosed(ft.fnRet) { return ft.fnRet }
+  }
+  -1
+}
+
+// A `.map`/`.filter` callback lambda `arg` cloned into slot `slot` with its parameter at
+// `elemTy`: records it in the row at the signature its own type closes to.
+function monoCadNotePinnedLam(arg: i32, slot: i32, elemTy: i32) {
+  if cadInBaked { return 0 }
+  const ps: i32[] = [elemTy]
+  const sig = monoCadSigOf(slot, ps, monoCadCheckedRet(arg))
+  monoCadRowWrite(elabSrcDecl(arg), elabWalkTop(), sig, slot)
+}
+
 // Builds, for each delivery the tag decision recorded as a closure from a one-member set
 // (`fnCloCoerceTyIx`), the member's instance at the destination's parameters, banked for the
 // emitter (`monoCloCoerceFe`); -1 when one cannot be built (D14884).
@@ -27231,7 +27458,10 @@ function monoCloCoerceBuild(): i32 {
       const rd = mkIdent(monoSlotName(gfe), nodePos(ix))
       monoLastInstFe = -1
       const none: i32[] = []
-      if monoInstanceFor(gfe, pnames, rd, t, none) < 0 { return -1 }
+      cadDeliveryAt = ix
+      const made = monoInstanceFor(gfe, pnames, rd, t, none)
+      cadDeliveryAt = -1
+      if made < 0 { return -1 }
       if monoLastInstFe < 0 {
         return emitFailAt(
           "emitProgram: monomorphize: a function delivered to a declared function type has no instance there",
