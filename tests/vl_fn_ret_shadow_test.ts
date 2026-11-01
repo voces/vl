@@ -123,6 +123,37 @@ function f(x) { return twice(x) }
 print(f(21))
 `;
 
+// A lambda in each instance of a generic whose cell is written through it: the elaboration records
+// no type for the clone, so its template's result answers, closed under each instance's binding.
+const KEYED_NESTED = `function inner<U>(u: U) { print("I"); print(u) }
+function other<V>(v: V) { print("O"); print(v) }
+function a<T>(x: T) {
+  let k = inner
+  const toO = () => {
+    k = other
+  }
+  toO()
+  k(x)
+}
+a(1)
+a(true)
+`;
+
+// D14791: the tail is an \`else\`-less \`if\` writing a \`T\`-function cell. Closed under the binding,
+// the template's result is a function type, while the emitter lowers the lambda void.
+const IF_ARM_WRITE = `function inner<U>(u: U) { print(u) }
+function other<V>(v: V) { print("O") }
+function c<T>(x: T) {
+  let k: (t: T) => void = inner
+  const toO = () => {
+    if x == x { k = other }
+  }
+  toO()
+  k(x)
+}
+c(1)
+`;
+
 // A generic nothing instantiates is pruned to an empty stub, void as minted (`monoStubSlots`).
 const STUB = `function id<T>(x: T): T { x }
 function keep(x: i32) { x + 1 }
@@ -181,6 +212,20 @@ Deno.test({
       DROP_NONE,
       true,
       "agree | f=1; agree | twice=1",
+    );
+    expectRows(
+      "keyed nested",
+      KEYED_NESTED,
+      DROP_NONE,
+      true,
+      "agree | __lambda_0=1; agree | __lambda_1=1; agree | __lambda_2=1; agree | a$1=1; agree | a=1; agree | inner$1=1; agree | inner=1; agree | other$1=1; agree | other=1",
+    );
+    expectRows(
+      "if-arm write",
+      IF_ARM_WRITE,
+      DROP_NONE,
+      true,
+      "agree | __lambda_0=1; agree | c=1; agree | inner=1; agree | other=1; recorded value, emitter void | __lambda_1=1",
     );
     expectRows("stub", STUB, DROP_NONE, true, "agree | id=1; agree | keep=1");
     expectRows(
