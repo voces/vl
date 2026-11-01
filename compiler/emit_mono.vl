@@ -19402,6 +19402,8 @@ function monoElemsAtSet(
     const xn = nodeAt(x)
     const fe = if xn is Ident { monoFnFeOfIdent(x, xn.identName, ctx) } else { -1 }
     if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 { return 0 }
+    // A function also read as a value elsewhere shares that value with this element (D14428).
+    if monoFnReadElsewhere(identDeclOf(x), elems) { return 0 }
     const pins: string[] = []
     for pt in rows[k] {
       pins.push(
@@ -19780,6 +19782,52 @@ function monoElemArgSetTy(a: i32): i32 {
   const it = elabWalkTy(x)
   if fnTagTyIsTagged(it) { return it }
   -1
+}
+
+// The program's top-level statements, and each declared function's reads that are no callee.
+let monoTopStmts: i32[] = []
+let monoFnValReads: {[i32]: i32[]} = Map()
+let monoFnValReadsBuilt = false
+
+// Whether declared function `d` is read as a value other than at one of the nodes `elems`.
+function monoFnReadElsewhere(d: i32, elems: i32[]): boolean {
+  if !monoFnValReadsBuilt {
+    monoFnValReadsBuilt = true
+    const xs: i32[] = []
+    const ps: i32[] = []
+    for st in monoTopStmts {
+      xs.push(st)
+      ps.push(-1)
+    }
+    while xs.length > 0 {
+      const x = xs.pop() ?? -1
+      const p = ps.pop() ?? -1
+      if x >= 0 && x < P.nodes.length {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        const callee = p >= 0 && pn is Call && pn.callFn == x
+        if nodeAt(x) is Ident && !callee {
+          const xd = identDeclOf(x)
+          if xd >= 0 && xd < P.nodes.length && nodeAt(xd) is FuncDecl {
+            const at = monoFnValReads[xd] ?? []
+            at.push(x)
+            monoFnValReads[xd] = at
+          }
+        }
+        for c in nodeChildren(x) {
+          xs.push(c)
+          ps.push(x)
+        }
+      }
+    }
+  }
+  for r in monoFnValReads[d] ?? [] {
+    let mine = false
+    for e in elems {
+      if unwrapParen(e) == r { mine = true }
+    }
+    if !mine { return true }
+  }
+  false
 }
 
 // The element values `monoElemsAtSet` instanced at a tagged set, by node.
@@ -27259,6 +27307,9 @@ function monoCloCoerceBuild(): i32 {
 // bodies are walked as they are created. Usage-gated: a program with no generic
 // declaration and no concrete higher-order function returns immediately.
 export function monomorphize(stmts: i32[]) {
+  monoTopStmts = stmts
+  monoFnValReads = Map()
+  monoFnValReadsBuilt = false
   monoCloCoerceFe = Map()
   monoClashLits = []
   monoCallTpl = Map()
