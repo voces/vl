@@ -2846,9 +2846,6 @@ function emitStructExprAsVariantBox(
   0
 }
 
-// The node `emitRecCopy` is reading its fields from, so the re-entry emits the record itself.
-let recCopyHeld = -1
-
 // A fresh record at the heap `dHeap`, whose fields are `dNames` stored as `dCodes`, built from
 // the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
 // (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`.
@@ -2861,10 +2858,10 @@ function emitRecCopy(
   dCodes: i32[],
   fnIx: i32,
 ): i32 {
-  const held = recCopyHeld
-  recCopyHeld = exprIx
+  const held = coerceHeld
+  coerceHeld = exprIx
   const r = emitRecCopyFields(body, exprIx, ssi, dNames, dCodes, fnIx)
-  recCopyHeld = held
+  coerceHeld = held
   if r < 0 { return -1 }
   fbStructNew(dHeap)
   0
@@ -2933,7 +2930,7 @@ function emitRecCopyFields(
 // copy is recorded.
 function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
   const dst = recCopyTyOf(exprIx)
-  if dst < 0 || exprIx == recCopyHeld || !exprStruct(exprIx, fnIx) { return -1 }
+  if dst < 0 || !exprStruct(exprIx, fnIx) { return -1 }
   const ssi = structIndexOfExpr(exprIx, fnIx)
   if ssi < 0 || ssi >= sHeapIdx.length { return -1 }
   const vi = repVariantShapeRowOf(dst)
@@ -19683,18 +19680,10 @@ function emitStrBytes(body: u8[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string bytes call")
 }
 
-// The node `emitMapUnionPayload` is emitting as its union box, so the re-entry emits the box.
-let mapUnboxHeld = -1
-
-// A union of maps delivered as the one map `dstTy` whose storage every member shares (D2692):
-// the box, then its payload cast to that map's struct. A member of another struct is refused.
-function emitMapUnionPayload(body: u8[], exprIx: i32, dstTy: i32, fnIx: i32) {
-  const held = mapUnboxHeld
-  mapUnboxHeld = exprIx
-  const boxed = exprUnion(exprIx, fnIx)
-  const r = emitExpr(body, exprIx, fnIx)
-  mapUnboxHeld = held
-  if r < 0 || !boxed { return r }
+// A union of maps `exprIx`, its box just emitted, delivered as the one map `dstTy` whose storage
+// every member shares (D2692): the payload cast to that map's struct. A member of another struct
+// is refused.
+function emitMapUnionPayloadTail(exprIx: i32, dstTy: i32) {
   const sh = mapShapeFoldSet(mapArmShapeOfTy(dstTy))
   const mems: i32[] = []
   flattenVariantsInto(nodeTyIxOf(exprIx), mems)
@@ -19716,29 +19705,22 @@ function emitMapUnionPayload(body: u8[], exprIx: i32, dstTy: i32, fnIx: i32) {
   0
 }
 
-// A union box delivered into a union lacking one of its map members (D2690): a box tagged
-// with such a member takes the tag of the destination member it is assignable to, so `is`,
-// `match` and `as` in the destination read the member it holds there. A scalar member the
-// destination holds only widened (`wFrom` to `wTo`) is rebuilt with the widened payload (D2974).
-function emitMapRetag(
-  body: u8[],
-  exprIx: i32,
-  from: i32[],
-  to: i32[],
-  wFrom: i32[],
-  wTo: i32[],
-  fnIx: i32,
-) {
+// A union box `exprIx`, just emitted, delivered into a union lacking one of its map members
+// (D2690): a box tagged with such a member takes the tag of the destination member it is
+// assignable to, so `is`, `match` and `as` read the member it holds there. A scalar member the
+// destination holds only widened is rebuilt with the widened payload.
+function emitMapRetagTail(exprIx: i32) {
+  const from: i32[] = []
+  const to: i32[] = []
+  mapRetagRowsOf(exprIx, from, to)
+  const wFrom: i32[] = []
+  const wTo: i32[] = []
+  widenRetagRowsOf(exprIx, wFrom, wTo)
   const fromTags: i32[] = []
   const toTags: i32[] = []
   mapRetagTagPairs(from, to, fromTags, toTags)
-  const held = mapUnboxHeld
-  mapUnboxHeld = exprIx
-  const boxed = exprUnion(exprIx, fnIx)
-  const r = emitExpr(body, exprIx, fnIx)
-  mapUnboxHeld = held
   const arms = fromTags.length + wFrom.length
-  if r < 0 || !boxed || arms == 0 { return r }
+  if arms == 0 { return 0 }
   fbLocalSet(unionAsBoxSlot())
   let w = 0
   while w < wFrom.length {
@@ -19959,7 +19941,7 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
   if exprIx != coerceHeld {
-    const ck = coerceKindAt(exprIx)
+    const ck = coerceKindAt(exprIx, fnIx)
     if ck != "none" { return emitCoerced(body, exprIx, fnIx, ck) }
   }
   if exprIx == isRecvStagedIx {
@@ -19984,21 +19966,6 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
     lmaValNode = -1
     return emitExprAsI64(body, lmaArg, lmaCallerFn)
   }
-  if mapDeliveryRecorded && exprIx != mapUnboxHeld {
-    const mub = mapUnboxTyOf(exprIx)
-    if mub >= 0 { return emitMapUnionPayload(body, exprIx, mub, fnIx) }
-    if deliveryRetagHas(exprIx) {
-      const rtFrom: i32[] = []
-      const rtTo: i32[] = []
-      mapRetagRowsOf(exprIx, rtFrom, rtTo)
-      const wtFrom: i32[] = []
-      const wtTo: i32[] = []
-      widenRetagRowsOf(exprIx, wtFrom, wtTo)
-      return emitMapRetag(body, exprIx, rtFrom, rtTo, wtFrom, wtTo, fnIx)
-    }
-  }
-  const rcRow = recCopyRowAt(exprIx, fnIx)
-  if rcRow != -1 { return emitRecCopyInto(body, exprIx, rcRow, fnIx) }
   // A string-repped literal union reaching an atom-typed destination narrows to its interned
   // id here, one hook rather than one per destination. Without it the store is a `local.set`
   // of a `(ref $array)` into an `i32` slot: invalid wasm at every such destination.
@@ -27809,14 +27776,26 @@ function listCopyAtNode(ix: i32): i32 {
 }
 
 // The coercion a delivery's checker record owes at its node: a list copy into another
-// element's list, or a tagged one-member set's closure at a declared function type.
-type CoerceKind = "none" | "listCopy" | "fnClo"
+// element's list, a tagged one-member set's closure at a declared function type, a union of maps
+// read as its one map, a union box retagged for a union lacking a member, or a record copied
+// into another row.
+type CoerceKind = "none"
+  | "listCopy"
+  | "fnClo"
+  | "mapUnbox"
+  | "mapRetag"
+  | "recCopy"
 
-// The coercion recorded at `ix`, or at the node `ix` stands in for; a list and a function value
-// are never both, so at most one record holds.
-function coerceKindAt(ix: i32): CoerceKind {
+// The coercion recorded at `ix` in instance `fnIx`. Each record is of one value type (a list, a
+// function, a union box, a record), so at most one holds; a union of maps is read before retagged.
+function coerceKindAt(ix: i32, fnIx: i32): CoerceKind {
   if listCopyAtNode(ix) >= 0 { return "listCopy" }
   if fnCloCoerceAtNode(ix) >= 0 { return "fnClo" }
+  if mapDeliveryRecorded {
+    if mapUnboxTyOf(ix) >= 0 { return "mapUnbox" }
+    if deliveryRetagHas(ix) { return "mapRetag" }
+  }
+  if recCopyRowAt(ix, fnIx) != -1 { return "recCopy" }
   "none"
 }
 
@@ -27840,6 +27819,14 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
   }
   const held = coerceHeld
   coerceHeld = exprIx
+  if ck == "recCopy" {
+    // A copy reads each field off the value, so the node stays held for the whole copy.
+    const rc = emitRecCopyInto(body, exprIx, recCopyRowAt(exprIx, fnIx), fnIx)
+    coerceHeld = held
+    return rc
+  }
+  const boxed = (ck == "mapUnbox" || ck == "mapRetag")
+    && exprUnion(exprIx, fnIx)
   const r = emitExpr(body, exprIx, fnIx)
   coerceHeld = held
   if r < 0 { return -1 }
@@ -27851,6 +27838,14 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
       // The value's id names the one member; its closure at the destination's instance replaces it (D14884).
       fbDrop()
       return emitClosureValueCore(body, fe, fnIx)
+    }
+    "mapUnbox" => {
+      if !boxed { return 0 }
+      return emitMapUnionPayloadTail(exprIx, mapUnboxTyOf(exprIx))
+    }
+    "mapRetag" => {
+      if !boxed { return 0 }
+      return emitMapRetagTail(exprIx)
     }
     "none" => {}
   }
@@ -33137,9 +33132,8 @@ export function wasmEmitStateReset() {
   lmaCallerFn = -1
   lmaValArg = -1
   lmaValNode = -1
-  mapUnboxHeld = -1
+  coerceHeld = -1
   rawReadNode = -1
-  recCopyHeld = -1
   mfSrcSlot = -1
   mfSvDst = -1
   negGuardCond = -1
