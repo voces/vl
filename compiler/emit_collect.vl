@@ -10,8 +10,14 @@
 // feature, so a program that does not use it emits the bytes it would emit without the
 // feature at all. Each pass below states only its own gate.
 
+import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { chainHasPrelude } from "./emit_if_arm_values"
-import { elabLitInstTys, elabNodeTyAt, litRepTyAt } from "./emit_elab"
+import {
+  elabLitInstTys,
+  elabNodeInstTys,
+  elabNodeTyAt,
+  litRepTyAt,
+} from "./emit_elab"
 import {
   nodeTyArrayElemRepName,
   nodeTyIsLitUnionAlias,
@@ -109,6 +115,7 @@ import {
   tyNulInnerIsPrim,
   tyNulInnerTy,
   tyPrimNameOf,
+  tySame,
   tyScalarBasePrim,
   tyToEmitName,
   tyToNominalName,
@@ -206,7 +213,13 @@ import {
   unionStructAliasShape,
   unwrapParen,
 } from "./emit_base"
-import { sidArrGet, sidArrPut, sidNoteNodeName, sidOfNode } from "./symbols"
+import {
+  sidArrGet,
+  sidArrPut,
+  sidNoteNodeName,
+  sidOf,
+  sidOfNode,
+} from "./symbols"
 import { fsMinted } from "./fn_split"
 import {
   blockHasValuedReturn,
@@ -821,7 +834,7 @@ import {
 import {
   forRangeStepIsConst,
   holeOperandTyOf,
-  mapReadScalarBoxKindTy,
+  mapTyScalarBoxKind,
   variantRowOfShapeTy,
 } from "./emit_ty_canon"
 import {
@@ -890,7 +903,6 @@ import {
 } from "./emit_value_sites"
 import {
   litFieldRowIsAtomisable,
-  litFieldRowsReLaidAlike,
   variantFieldIndex,
   variantFieldSetFlag,
   variantSig,
@@ -904,6 +916,7 @@ import {
   strListIndexOf,
 } from "./listutil"
 import {
+  flattenVariantsInto,
   intLitUnionBasesOf,
   isNullTy,
   nonNullTy,
@@ -933,7 +946,7 @@ import {
   valueAtomKind,
 } from "./check_ty_rep"
 import { inferRetRungIsValueUnion, valueUnionRetName } from "./check_ret_names"
-import { nodeTyArrayElemPinRepName, nodeTyPinIxOf } from "./check_hole_pins"
+import { nodeTyArrayElemPinRepName } from "./check_hole_pins"
 import {
   inferLetCount,
   inferLetIxAt,
@@ -1305,11 +1318,16 @@ export function synthEmptyListAnn(letIx: i32) {
   0
 }
 
-// Whether `initIx` is the one initializer shape `synthNullableAnn` claims: a bare read of a
-// scalar-valued map, whose `V | null` result reps as the shared value box.
+// Whether `initIx` is a bare read of a scalar-valued map, whose `V | null` result reps as the
+// shared value box.
 function initNullableIsBoxScalar(initIx: i32) {
   if initIx < 0 { return false }
-  mapReadScalarBoxKindTy(initIx) >= 0
+  const recv = fusedMapReadRecvIx(unwrapParen(initIx))
+  if recv < 0 { return false }
+  for rt in elabNodeInstTys(unwrapParen(recv)) {
+    if mapTyScalarBoxKind(rt) >= 0 { return true }
+  }
+  false
 }
 
 // Whether `initIx` is a name read, or a narrowed field or element read, the checker typed as a
@@ -1320,39 +1338,6 @@ function initIsNarrowedBoxRead(initIx: i32): boolean {
   if !(nodeAt(ri) is Ident) && !placeReadIsNarrowed(ri, -1) { return false }
   const ty = nodeTyIxOf(ri)
   ty >= 0 && tyIsValueUnionBox(ty) && !tyIsLitUnion(ty)
-}
-
-// Synthesize the `T | null` annotation of an un-annotated binding whose initializer is
-// already nullable — `synthEmptyListAnn`'s sibling: an annotation is the one input every
-// downstream path reads, so writing the inferred type back makes the slot classifier agree
-// without re-inferring. `collectInlineUnions` is the other half; neither lowers alone.
-export function synthNullableAnn(letIx: i32) {
-  const s = nodeAt(letIx)
-  if s is LetDecl {
-    if s.letType >= 0 { return 0 }
-    if s.letInit < 0 { return 0 }
-    const nty = nodeTyPinIxOf(unwrapParen(s.letInit))
-    if nty < 0 { return 0 }
-    const nt = tyAt(nty)
-    if nt is TyNullable {
-      // An unfilled hole (`let x = null`, inner -1) is A-infer-null's business: it has its
-      // own usage-driven inference (`nliInferLet`) and no type to render yet.
-      if nt.nInner < 0 { return 0 }
-      // Only the box reps. Every other `T | null` carries "absent" in a niche — `boolean`
-      // and a string litunion on an i32 sentinel, a string, struct, list, map or variant on
-      // a nullable ref — and those bindings classify and lower without an annotation, so
-      // synthesizing one diverts a working path onto a ladder expecting a different slot.
-      if mapReadScalarBoxKindTy(s.letInit) < 0 { return 0 }
-      // Hand the recorded type over rather than re-parsing the rendered name, and only where
-      // the spelling denotes the type handed (`emit_rewrite`'s rule). A nullable numeric
-      // litunion is where they part: `tyToEmitName` renders the rep, so `N2 | null` renders
-      // `i32|null`, which does not denote `TyNullable<1|2>` and leaves `unRowOfCanonFolded` at -1.
-      let synTyIx = nty
-      if nulNumLitUnionBaseName(nty) != "" { synTyIx = -1 }
-      s.letType = synthAnnOfTy(nty, synTyIx)
-    }
-  }
-  0
 }
 
 // The annotation node synthesized for type `ty` under its render, recording `recTy` (-1 where
@@ -1728,7 +1713,6 @@ export function synthGlobalEmptyListAnns() {
   let i = 0
   while i < globalStmts.length {
     synthEmptyListAnn(globalStmts[i])
-    synthNullableAnn(globalStmts[i])
     synthNarrowedReadAnn(globalStmts[i], -1)
     i = i + 1
   }
@@ -1747,10 +1731,7 @@ export function synthCaptureEmptyListAnns() {
     let ci = 0
     while ci < caps.length {
       const b = parentBindingOf(fe, caps[ci])
-      if b >= 0 {
-        synthEmptyListAnn(b)
-        synthNullableAnn(b)
-      }
+      if b >= 0 { synthEmptyListAnn(b) }
       ci = ci + 1
     }
     fe = fe + 1
@@ -3261,7 +3242,6 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
 // scope. Returns 0, or -1 (via `emitFail`, the open scope popped on the paths that owe it).
 function collectLetLocal(stmtIx: i32, s: LetDecl, fnIx: i32) {
   synthEmptyListAnn(stmtIx)
-  synthNullableAnn(stmtIx)
   synthNarrowedReadAnn(stmtIx, fnIx)
   synthRetPinAnn(stmtIx, fnIx)
   // An if-expression initializer whose arms declare locals is walked first, by node, and
@@ -8218,9 +8198,6 @@ function reLayLitFieldsByName(va: i32, vb: i32): i32 {
         if litFieldRowIsAtomisable(ra) && litFieldRowIsAtomisable(rb) {
           if promoteLitFieldToAtom(va, fi) < 0 { return -1 }
           if promoteLitFieldToAtom(vb, fj) < 0 { return -1 }
-        } else if litFieldRowsReLaidAlike(ra, rb) {
-          if demoteLitFieldToString(va, fi) < 0 { return -1 }
-          if demoteLitFieldToString(vb, fj) < 0 { return -1 }
         }
       }
     }
@@ -9404,11 +9381,8 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
           }
         }
         if initNullableIsBoxScalar(s.letInit) {
-          if (
-            collectTyReachRegister(stmts, nodeTyPinIxOf(s.letInit), 16, false)
-            < 0
-          ) {
-            return -1
+          for bt in elabNodeInstTys(s.letInit) {
+            if collectTyReachRegister(stmts, bt, 16, false) < 0 { return -1 }
           }
         }
       }
@@ -9706,16 +9680,20 @@ export function collectU(stmts: i32[]) {
         if cty >= 0 && tyAt(cty) is TyUnion && isValueUnionTyOr(cty) == 1 {
           if collectTyReachRegister(stmts, cty, 16, false) < 0 { return -1 }
         }
-        // A hole's `??` reads at its pin, which no node records, so its join is registered here.
+        // A hole's `??` reads at each instance's binding, which no node records, so its join is
+        // registered here.
         if cty >= 0 && tyAt(cty) is TyVar {
-          const cpin = nodeTyPinIxOf(ipu)
-          if (
-            cpin >= 0
-            && cpin != cty
-            && isValueUnionTyOr(cpin) >= 0
-            && collectNoContainerArmJoin(cpin)
-          ) {
-            if collectTyReachRegister(stmts, cpin, 16, false) < 0 { return -1 }
+          for cpin in elabNodeInstTys(ipu) {
+            if (
+              cpin >= 0
+              && cpin != cty
+              && isValueUnionTyOr(cpin) >= 0
+              && collectNoContainerArmJoin(cpin)
+            ) {
+              if collectTyReachRegister(stmts, cpin, 16, false) < 0 {
+                return -1
+              }
+            }
           }
         }
       }
@@ -9748,12 +9726,13 @@ export function collectU(stmts: i32[]) {
       }
     }
     // A standalone `?.` over a non-null scalar field is `T | null`, spelled nowhere (D3513); a
-    // hole's reads at its pin (D3215).
+    // hole's reads at each instance's binding (D3215).
     if pn is OptMember {
-      const ounTy = nodeTyPinIxOf(ipu)
-      const oun = nulNumScalarUnionName(ounTy)
-      if oun != "" {
-        registerValueUnionNameAB(59, oun, nulNumScalarUnionRowTy(ounTy))
+      for ounTy in elabNodeInstTys(ipu) {
+        const oun = nulNumScalarUnionName(ounTy)
+        if oun != "" {
+          registerValueUnionNameAB(59, oun, nulNumScalarUnionRowTy(ounTy))
+        }
       }
     }
     ipu = ipu + 1
@@ -9891,6 +9870,44 @@ function mintVariantRows(
   0
 }
 
+// Whether every member of union `ty` is a record, a primitive, a literal or `null`: no list, map
+// or function arm, whose rows intern under a declaring alias's own name.
+function unionArmsAreRecordsOrScalars(ty: i32): boolean {
+  const xs: i32[] = []
+  flattenVariantsInto(ty, xs)
+  if xs.length < 2 { return false }
+  for x in xs {
+    if x >= 0 {
+      const t = tyAt(x)
+      if !(t is TyObj || t is TyPrim || t is TyLit) { return false }
+    }
+  }
+  true
+}
+
+// Whether each record arm `s` names is a variant of row `kr`: by its own name, or as a layout
+// twin of exactly one of the row's arms (`V = D | S` beside `U = C | S`, `D` typed as `C`).
+// With `bind`, a twin's name is bound to that arm's variant, so both names read one position.
+function declArmsMatchRow(s: UnionDecl, kr: i32, bind: boolean): boolean {
+  for m in s.udVariants {
+    const mt = declTyIxOfName(m)
+    if mt >= 0 && tyAt(mt) is TyObj && variantIndexOf(m) < 0 {
+      let hit = -1
+      let v = unVarStart[kr]
+      while v < unVarStart[kr] + unVarCount[kr] {
+        if v < uVarTyIx.length && uVarTyIx[v] >= 0 && tySame(uVarTyIx[v], mt) {
+          if hit >= 0 { return false }
+          hit = v
+        }
+        v = v + 1
+      }
+      if hit < 0 { return false }
+      if bind { sidArrPut(uVariantRowBySid, sidOf(m), hit) }
+    }
+  }
+  true
+}
+
 // Register the declared union `s` (at statement `stmtIx`): its row, member set and key, its
 // struct variants and their fields, and the value boxes, ref-array and map arms its members
 // need. A struct alias or an alias that denotes one member or one list gets no row. Returns 0,
@@ -9912,13 +9929,25 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   // Field unions of the arms register first, so they push their own rows before this union's
   // slice; arena-rooted since a named union carries no annotation node (`rootUnionDeclMembers`).
   if rootUnionDeclMembers(stmts, s.udName) < 0 { return -1 }
-  // A value-union alias whose type key already has a row names that row: one row per type.
+  // An alias whose type key already has a row names that row: one row per type. A value or
+  // literal union binds to a row with no variants; a union of records and scalars binds to a row
+  // whose variants are its own arms or their twins. A list, map or function arm keeps its row
+  // (D14742).
   const dty = declTyIxOfName(s.udName)
-  if dty >= 0 && (isValueUnionTyOr(dty) == 1 || tyIsLitUnion(dty)) {
+  if dty >= 0 {
     const kr = unRowOfTyKey(dty)
-    if kr >= 0 && unVarCount[kr] == 0 {
-      unNameBindRow(s.udName, kr)
-      return 0
+    if kr >= 0 {
+      const plain = isValueUnionTyOr(dty) == 1 || tyIsLitUnion(dty)
+      if (
+        (plain && unVarCount[kr] == 0)
+        || (!plain
+          && unionArmsAreRecordsOrScalars(dty)
+          && declArmsMatchRow(s, kr, false))
+      ) {
+        declArmsMatchRow(s, kr, true)
+        unNameBindRow(s.udName, kr)
+        return 0
+      }
     }
   }
   unNamesPush(s.udName)

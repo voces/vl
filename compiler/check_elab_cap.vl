@@ -51,13 +51,16 @@ import {
   P,
   Param,
   Paren,
+  TypeRef,
+  annTsOf,
   i32ToStr,
   nodeAt,
+  tsMentionsAnyName,
 } from "./ast"
 import { inferQuiet, quietDepth } from "./check_cursor"
 import { restoreSlot, scopeVisibleSnapshot } from "./check_scopes"
 import { tyHasTyVar } from "./tyquery"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import { identDeclOf, nodeSrc } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
 import { hdBase, hdRowOf } from "./check_hole_pins"
@@ -744,6 +747,32 @@ export function elabFnJoinTy(j: i32, a: i32, b: i32): i32 {
   if sa >= 0 && sb >= 0 { elabFnSetTy[fresh] = fnSetIntern(fnSetUnion(sa, sb)) }
   fnJoinMemo[key] = fresh
   fresh
+}
+
+// `elabFnJoinTy` for list element types: a join `j` of lists `a` and `b` whose leaves are
+// functions takes the union of the leaves' sets at every depth, so a list of inner lists of
+// fewer members holds the whole set. `j` when neither side's leaf carries a set.
+export function elabFnJoinListTy(j: i32, a: i32, b: i32): i32 {
+  if (
+    j < 0
+    || j >= T.tys.length
+    || a < 0
+    || a >= T.tys.length
+    || b < 0
+    || b >= T.tys.length
+  ) {
+    return j
+  }
+  const jl = T.tys[j]
+  const al = T.tys[a]
+  const bl = T.tys[b]
+  if !(jl is TyArray) || !(al is TyArray) || !(bl is TyArray) { return j }
+  const je = jl.aElem
+  if je < 0 || je >= T.tys.length { return j }
+  const jt = T.tys[je]
+  const ne = if jt is TyArray { elabFnJoinListTy(je, al.aElem, bl.aElem) } else { elabFnJoinTy(je, al.aElem, bl.aElem) }
+  if ne == je { return j }
+  mkArrayTy(ne)
 }
 
 // The set of every function the `let` node `bd` may hold: its initialiser and each value its
@@ -1607,4 +1636,29 @@ export function elabCapReset() {
   fnTagArms = Map()
   fnTagArmsBy = Map()
   0
+}
+
+// Whether parameter `i` of `f` is annotated by one of `f`'s own type parameters that no other
+// parameter and no return annotation names, so the instance binds it as it binds a hole.
+export function fnTagOwnTyParamAlone(f: FuncDecl, i: i32): boolean {
+  const pn = nodeAt(f.fnParams[i])
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const tn = nodeAt(pn.parType)
+  if !(tn is TypeRef) || !strListHas(f.fnTyParams, tn.tyName) { return false }
+  const nm: string[] = [tn.tyName]
+  if f.fnRet >= 0 && tsMentionsAnyName(annTsOf(f.fnRet), nm) { return false }
+  let k = 0
+  while k < f.fnParams.length {
+    const q = nodeAt(f.fnParams[k])
+    if (
+      k != i
+      && q is Param
+      && q.parType >= 0
+      && tsMentionsAnyName(annTsOf(q.parType), nm)
+    ) {
+      return false
+    }
+    k = k + 1
+  }
+  true
 }

@@ -75,6 +75,7 @@ import {
   cohSiteCol,
   cohSiteLine,
   cohWitness,
+  ctxFieldNodes,
   inferObserved,
   inferObservedLit,
   inferObservedLitSet,
@@ -2007,6 +2008,12 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
   // A binding holding only the call lands where its read does.
   const bo = if e is Ident { recBindOrigin(p) } else { -1 }
   if bo == c { return recAdLanding(own, d) }
+  // So does a binding holding only a value that relays it, such as `id(mk())`.
+  const hd = if e is Ident { recHeldDecl(p) } else { -1 }
+  const hn = if hd >= 0 { nodeAt(hd) } else { null }
+  if hn is LetDecl && hn.letInit >= 0 {
+    return recLandingIn(hn.letInit, d, c, own, depth - 1)
+  }
   if e is ObjLit && dt is TyObj {
     let i = 0
     while i < dt.objFieldNames.length {
@@ -5156,13 +5163,39 @@ function setCtorKeyNote(ix: i32, key: i32): i32 {
   0
 }
 
-// Records `t` as the type node `ix` is built at, in the elaboration in progress when one is
-// re-checking an instance; 1.
-// Records `t` as the destination type node `ix` is delivered at, where stamps stand: a delivery
-// with no assignability check of its own, an un-annotated binding's initializer.
+// Records `t` as the destination type node `ix` is delivered at, where stamps stand, and as the
+// destination of each value leaf a paren, `if`, block or `match` delivers through it.
 export function recordCtxTy(ix: i32, t: i32): i32 {
   if ix < 0 || t < 0 || litPinN.length > 0 || !stampsStand() { return 0 }
   ctxTyStamp(ix, t)
+  recordLeafCtxTy(ix, t)
+}
+
+// Marks node `ix`, and each value leaf a paren, `if`, block or `match` delivers through it, as
+// a record field's value.
+export function markFieldValue(ix: i32): i32 {
+  if ix < 0 || !stampsStand() { return 0 }
+  ctxFieldNodes[ix] = 1
+  const e = nodeAt(ix)
+  if e is Paren { return markFieldValue(e.parInner) }
+  if !(e is IfStmt || e is Block || e is MatchExpr) { return 0 }
+  for l in valueTailLeaves(ix) {
+    if l != ix { ctxFieldNodes[l] = 1 }
+  }
+  1
+}
+
+// Records `t` as the destination of each value leaf join `ix` delivers, not of `ix` itself: a
+// value `if`, block or `match`'s arms are delivered to the join, whatever then takes it.
+export function recordLeafCtxTy(ix: i32, t: i32): i32 {
+  if ix < 0 || t < 0 || litPinN.length > 0 || !stampsStand() { return 0 }
+  const e = nodeAt(ix)
+  if e is Paren { return recordCtxTy(e.parInner, t) }
+  if !(e is IfStmt || e is Block || e is MatchExpr) { return 0 }
+  for l in valueTailLeaves(ix) {
+    if l != ix { ctxTyStamp(l, t) }
+  }
+  1
 }
 
 // Records `t` as the destination type node `ix` is delivered at: the instance's where an
@@ -5177,6 +5210,8 @@ function ctxTyStamp(ix: i32, t: i32): i32 {
   1
 }
 
+// Records `t` as the type node `ix` is built at, in the elaboration in progress when one is
+// re-checking an instance; 1.
 function repStamp(ix: i32, t: i32): i32 {
   if elabCapLive() {
     elabCapRep[ix] = t

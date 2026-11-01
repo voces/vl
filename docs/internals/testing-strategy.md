@@ -189,7 +189,12 @@ shared cargo target).
 | `offignored` | `VL_COMPILE_GC_GROW=off` is ignored | `vl_seed_gc_headroom_test.ts` alone |
 | `statsdead` | the GC stats line is renamed | `vl_seed_gc_headroom_test.ts` alone |
 
-The 44 s headroom test is the only guard of the policy, so it stays.
+The headroom test is the only guard of the policy, so it stays, made cheaper instead. Its pinned
+144 MiB first heap was an engine configuration of its own, so every new seed re-JITted the
+compiler (about 13 s) before the test's two checks. It now checks `compiler/emit_base.vl` on
+the default heap, whose `.cwasm` is already warm: 4 and 24–26 collections, about 6 s, and all
+four mutants above still red it. `ci-native` alone on 4 cores went from 88–94 s to 71 s, and
+the whole gate (`GATE_MAX_PAR=3`) from 306 s to 262 s.
 
 **The `-O` inline-record step** (`mutants/opt-*.diff`):
 
