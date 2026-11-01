@@ -75,6 +75,7 @@ import {
 } from "./emit_map_twins"
 import {
   mvValTyIxAt,
+  nonNulBaseOf,
   nulMapInnerName,
   rlElemMapValMvSlotAt,
   tyRefArrElemOf,
@@ -273,7 +274,7 @@ import {
 import { variantSig } from "./emit_variant_sig"
 import { i32ListHas } from "./listutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
-import { nameIsMapOpen } from "./tyname"
+import { arrElemNameRaw, nameIsMapOpen } from "./tyname"
 import {
   isNullTy,
   nulLitUnionPeelTy,
@@ -966,6 +967,55 @@ export function variantOwnRow(vi: i32, h: i32): i32 {
   -1
 }
 
+// Whether element spelling `en` names a declared type: its head, past `[]`, `| null` and type
+// arguments, is a user type. A structural render (`{v:i32}`) does not.
+function elemNameIsDeclared(en: string): boolean {
+  let h = nonNulBaseOf(en)
+  let a = arrElemNameRaw(h)
+  while a != "" {
+    h = nonNulBaseOf(a)
+    a = arrElemNameRaw(h)
+  }
+  let i = 0
+  while i < h.length && h[i] != '<' { i = i + 1 }
+  (cUserTypes[h.slice(0, i)] ?? -1) >= 0
+}
+
+// Make variant `vi` and its own struct row `r` record one element name and type per field where
+// the two record the same type: a declared spelling wins over a structural one, else the row's.
+function variantRowAgree(vi: i32, r: i32) {
+  if r < 0 || vi >= uFieldCount.length || r >= sFieldCount.length { return 0 }
+  if uFieldCount[vi] != sFieldCount[r] { return 0 }
+  let k = 0
+  while k < uFieldCount[vi] {
+    const ui = uFieldStart[vi] + k
+    const si = sFieldStart[r] + k
+    if (
+      ui < uFieldElemName.length
+      && ui < uFieldElemTyIx.length
+      && si < sFieldElemName.length
+      && si < sFieldElemTyIx.length
+      && uFieldNames[ui] == sFieldNames[si]
+    ) {
+      const ut = uFieldElemTyIx[ui]
+      const st = sFieldElemTyIx[si]
+      const ue = uFieldElemName[ui]
+      const se = sFieldElemName[si]
+      if ut >= 0 && st >= 0 && (ut != st || ue != se) && tySame(ut, st) {
+        if ue != se && elemNameIsDeclared(ue) && !elemNameIsDeclared(se) {
+          sFieldElemName[si] = ue
+          sFieldElemTyIx[si] = ut
+        } else {
+          uFieldElemName[ui] = se
+          uFieldElemTyIx[ui] = st
+        }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
 // Whether a struct row other than a reference row records variant `vi`'s record type, on any heap.
 // A D1023 shared-tag arm's record has one, off the arm's heap.
 function variantRecordHasRow(vi: i32): boolean {
@@ -982,6 +1032,7 @@ function variantRecordHasRow(vi: i32): boolean {
 // -1 for an arm with no recorded type, or one laid out at its tag-mate's heap (D1023).
 export function variantRowOrMint(vi: i32, h: i32): i32 {
   const own = variantOwnRow(vi, h)
+  if own >= 0 && !sIsRefRow(own) { variantRowAgree(vi, own) }
   if (own >= 0 || vi >= uVarTyIx.length || uVarTyIx[vi] < 0) { return own }
   if variantRecordHasRow(vi) { return -1 }
   refRowMint(vi, h)
