@@ -34,6 +34,7 @@ import {
   Ident,
   IfStmt,
   Index,
+  IsExpr,
   LetDecl,
   MatchExpr,
   Member,
@@ -6453,6 +6454,37 @@ export function genericDeclRetMisfit(
   r
 }
 
+// Whether `cond` is `p is T` over a hole parameter `p` of `f` (at `fIx`) whose binding in
+// `vNames`/`vTys` neither is `T` nor has a member of it, so its then-arm cannot run (D3109).
+function holeGuardDeadAt(
+  cond: i32,
+  f: FuncDecl,
+  fIx: i32,
+  vNames: string[],
+  vTys: i32[],
+): boolean {
+  const c = parenPeelIx(cond)
+  if c < 0 || c >= P.nodes.length { return false }
+  const ie = nodeAt(c)
+  if !(ie is IsExpr) { return false }
+  const ox = parenPeelIx(ie.isObj)
+  if ox < 0 || ox >= P.nodes.length { return false }
+  const o = nodeAt(ox)
+  if !(o is Ident) { return false }
+  let pi = 0
+  while pi < f.fnParams.length {
+    const p = nodeAt(f.fnParams[pi])
+    if p is Param && p.parName == o.identName && p.parType < 0 {
+      const pin = bindOf(vNames, vTys, paramHoleName(f.fnName, fIx, pi))
+      const alt = nameToTy(ie.isVariant)
+      if pin < 0 || alt < 0 || tyHasTyVar(pin) { return false }
+      return !assignable(pin, alt) && !pinHasMemberOf(pin, alt)
+    }
+    pi = pi + 1
+  }
+  false
+}
+
 // `holeRetTyOf` for any declared function or lambda, whatever its declared result. Values are
 // joined in source order, `return`s before the tail, so the union is spelled as the direct one.
 function bodyRetTyAt(calleeFn: i32, vNames: string[], vTys: i32[]): i32 {
@@ -6470,6 +6502,12 @@ function bodyRetTyAt(calleeFn: i32, vNames: string[], vTys: i32[]): i32 {
         if !holeRetLeaves(n.retArg, calleeFn, vNames, vTys, ts, lits) {
           return -1
         }
+      } else if (
+        n is IfStmt
+        && holeGuardDeadAt(n.ifCond, f, calleeFn, vNames, vTys)
+      ) {
+        // The then-arm is a branch these bindings cannot take, as its guarded return member is.
+        if n.ifElse >= 0 { todo.push(n.ifElse) }
       } else if !(n is FuncDecl) {
         const kids = nodeChildren(ix)
         let k = kids.length - 1
