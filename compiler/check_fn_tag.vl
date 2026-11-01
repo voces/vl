@@ -98,6 +98,7 @@ import {
   mintFactRsOf,
   mintFactSetOf,
   mintFactSplits,
+  mintParamBoundSets,
   mintParamTakes,
   mintRetParamsOf,
   mintSetPartial,
@@ -140,6 +141,8 @@ import {
 // Decides every set from scratch over the program at `rootIx`, then raises the refusal each
 // call through a set left a closure owes.
 export function fnTagDecide(rootIx: i32) {
+  ftParamOwners = Map()
+  ftParamOwnersBuilt = false
   fnTagUndecide()
   ftLeafTys = Map()
   const calls = fnTagCalls()
@@ -1442,6 +1445,10 @@ function ftArgsHoldFn(rootIx: i32, c: i32, s: i32): boolean {
       i = i + 1
       continue
     }
+    if ftLate && ftParamBoundTagged(rootIx, identDeclOf(ax)) {
+      i = i + 1
+      continue
+    }
     const t = nodeTyIxOf(cn.callArgs[i])
     if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc { return true }
     for d in fnTagMembers(s) {
@@ -1457,6 +1464,45 @@ function ftArgsHoldFn(rootIx: i32, c: i32, s: i32): boolean {
     i = i + 1
   }
   false
+}
+
+// Whether `pd` is an un-annotated parameter every instance of its function binds to a tagged
+// set, so handing it on hands that instance's ids, which each arm keys at its own set.
+function ftParamBoundTagged(rootIx: i32, pd: i32): boolean {
+  if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return false }
+  const fd = ftParamOwner(rootIx, pd)
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) { return false }
+  const sets = mintParamBoundSets(fd, i32ListIndexOf(f.fnParams, pd))
+  if sets.length == 0 { return false }
+  for st in sets {
+    if st < 0 || !fnTagSetIsTagged(st) { return false }
+  }
+  true
+}
+
+// Each parameter under the root → the function declaring it, built once per decision.
+let ftParamOwners: {[i32]: i32} = Map()
+let ftParamOwnersBuilt = false
+
+// The function under `rootIx` declaring parameter `pd`, or -1.
+function ftParamOwner(rootIx: i32, pd: i32): i32 {
+  if !ftParamOwnersBuilt {
+    ftParamOwnersBuilt = true
+    const todo: i32[] = [rootIx]
+    while todo.length > 0 {
+      const x = todo.pop() ?? -1
+      if x >= 0 && x < P.nodes.length {
+        const n = nodeAt(x)
+        if n is FuncDecl {
+          for q in n.fnParams { ftParamOwners[q] = x }
+        }
+        nodeChildrenPush(x, todo)
+      }
+    }
+  }
+  ftParamOwners[pd] ?? -1
 }
 
 // Whether every name read under `rootIx` holding set `as` is a direct argument of a call
@@ -1633,6 +1679,44 @@ function ftHoleParamOf(c: Call, x: i32): boolean {
   false
 }
 
+// Whether parameter `i` of `d` is read only as a positional argument of calls through a set of
+// functions every member of which takes set `s` at that position, after the elaboration.
+function ftParamForwardsSet(d: i32, i: i32, s: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || i < 0 || i >= f.fnParams.length { return false }
+  const par = f.fnParams[i]
+  let seen = false
+  const xs: i32[] = [f.fnBody]
+  const ps: i32[] = [-1]
+  while xs.length > 0 {
+    const x = xs.pop() ?? -1
+    const p = ps.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == par {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        if !(pn is Call) || !i32ListHas(pn.callArgs, x) { return false }
+        const at = i32ListIndexOf(pn.callArgs, x)
+        // A set left a closure has no arms to key the id it is handed.
+        const cs = fnTagSetOfTy(nodeTyIxOf(parenPeelIx(pn.callFn)))
+        const ms = fnTagMembers(cs)
+        if !ftArgIsParam(pn, at) || ms.length == 0 || !fnTagSetIsTagged(cs) {
+          return false
+        }
+        for m in ms {
+          if !mintParamTakes(m, at, s) { return false }
+        }
+        seen = true
+      }
+      for k in nodeChildren(x) {
+        xs.push(k)
+        ps.push(x)
+      }
+    }
+  }
+  seen
+}
+
 // Whether parameter `i` of the function declared at `d` is read nowhere in its body but as a
 // direct argument handed to another such parameter of a named function, `depth` hops in.
 function ftParamInert(d: i32, i: i32, depth: i32): boolean {
@@ -1705,6 +1789,7 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
   const i = i32ListIndexOf(c.callArgs, x)
   mintParamTakes(d, i, s)
     || ftParamUnread(d, i)
+    || ftArgIsParam(c, i) && ftParamForwardsSet(d, i, s)
     || ftArgIsParam(c, i) && ftParamInert(d, i, 0)
     || ftArgIsParam(c, i) && i32ListHas(mintRetParamsOf(d), i)
 }
