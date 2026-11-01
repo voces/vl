@@ -201,9 +201,14 @@ shared row names.
    (c), refused with the split plan off. Proposal: γ's backlog owns it; this design names it and
    does not cover it.
 2. **D14825's two refutation files need the split plan.** With it off they refuse (see the table
-   above). Both are a generic taken as a value and called at two pins through one binding. That is
-   a binding called at two signatures, which neither the bundle (parameter only) nor the
-   single-closure token covers. Proposal: extend the bundle's scope from a parameter to any
-   binding whose calls the elaboration lists at two or more signatures. Inc3 to say whether
-   `elabBundleSigs` can key a binding as well as a (callee instance, parameter) pair.
-
+   above). Read against inc3's binding-bundle conditions (a local `const` or unwritten `let`, every
+   read a callee or a bundled argument, never returned, stored or captured):
+   - `generic-fn-value-one-binding-two-pins.vl` fits: `const a = mk()` then `a(1)` and `a("s")`.
+     The binding is bundled, and the creation site its closures come from is `k`, which reaches
+     the binding through `mk`'s result. Finding it is the delivery token (this half); holding two
+     closures is the bundle. The file needs both, and lands after (b) and (c).
+   - `block-local-maker-of-generic-in-generic-body-at-two-types.vl` is not a bundle. Each
+     instance of `g` calls `a` at one signature, so it is one closure per INSTANCE. Its creation
+     site, the read of `k` in `mk`, sits in a function nested in `g`, whose one body serves both
+     instances. That is the per-instance creation site above, and the D14842 shape. It is accepted
+     only once the row keys (node, instance) and a nested body is instanced per encloser.
