@@ -1246,6 +1246,8 @@ import {
   isVariantSpellingAtRecv,
   recvIsTestedRecord,
   sharedFieldArmAtomKind,
+  sharedFieldArmBoxKind,
+  sharedFieldArmBoxesAtomSet,
   sharedFieldArmConverts,
   sharedFieldArmLitTexts,
   sharedFieldArmNulStr,
@@ -1326,7 +1328,7 @@ import {
   mapNicheLacks,
   mapNicheNeedsPin,
   mapPinnedParamTyOf,
-  mapReadScalarBoxKindTy,
+  mapReadScalarBoxKindIn,
   mapRecvScalarBoxKindIn,
   mapRecvScalarKindInst,
   mapRecvTyIn,
@@ -3547,7 +3549,7 @@ function emitNulIsNullTest(
       return 1
     }
 
-    if mapReadScalarBoxKindTy(refIx) >= 0 {
+    if mapReadScalarBoxKindIn(refIx, fnIx) >= 0 {
       const mnRef = nodeAt(unwrapParen(refIx))
       if mnRef is Index {
         if emitMapHas(body, mnRef.idxArr, mnRef.idxIndex, fnIx, ec) < 0 {
@@ -7938,7 +7940,7 @@ function emitCoalesceMapJoin(
   ec: ExpCtx,
 ): i32 {
   if !exprNullableMap(e.binLeft, fnIx) { return 0 }
-  const un = coalesceResultUnionName(exprIx)
+  const un = coalesceResultUnionName(exprIx, fnIx)
   if un == "" { return 0 }
   const unTy = nodeTyInOf(exprIx, fnIx)
   const sh = mapShapeOfExpr(e.binLeft, fnIx)
@@ -11165,17 +11167,36 @@ function emitSharedFieldArm(
   }
   const bk = sharedFieldArmAtomKind(vi, fi)
   const nulStr = boxes && bk < 0 && sharedFieldArmNulStr(vi, fi)
+  // A string literal set stored at the atom boxes as the string it names (D14750).
+  const setStr = boxes && bk < 0 && sharedFieldArmBoxesAtomSet(vi, fi)
   // A record field rides the box under the read union's arm built at the record's own row.
   let recTag = -1
-  if boxes && bk < 0 && !nulStr {
+  if boxes && bk < 0 && !nulStr && !setStr {
     recTag = sharedFieldArmStructTag(vi, fi, readIx)
   }
-  if recTag >= 0 { fbI32Rel(RS_TAG, recTag) }
-  else if boxes && !nulStr { fbI32Rel(RS_TAG, scalarTagOfKind(bk)) }
+  if recTag >= 0 {
+    fbI32Rel(RS_TAG, recTag)
+  } else if setStr {
+    fbI32Rel(RS_TAG, scalarTagOfKind(sharedFieldArmBoxKind(vi, fi)))
+  } else if boxes && !nulStr {
+    fbI32Rel(RS_TAG, scalarTagOfKind(bk))
+  }
   if emitSharedFieldRecv(body, recvIx, fnIx, slot, ec) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   fbRefCast(uVarHeap[vi])
   fbStructGet(uVarHeap[vi], fi)
+  if setStr {
+    if texts.length == 0 || !aUsed {
+      return emitFail(
+        "emitProgram: literal-union string boxing with no members",
+      )
+    }
+    const setSlot = objOrderStashSlot(FC_I32, uFieldStorageSlot(vi, fi))
+    fbLocalSet(setSlot)
+    if emitAtomToStrChain(body, texts, 0, setSlot) < 0 { return -1 }
+    fbStructNew(uBoxIdx)
+    return 0
+  }
   if converts {
     // An atom set read at the string widens through its own members' tower.
     if texts.length == 0 || !aUsed {
@@ -14244,7 +14265,7 @@ function emitMapGetOrScalarJoin(
   if recvIx < 0 { return 0 }
   const ak = mapRecvScalarBoxKindIn(recvIx, fnIx)
   if ak < 0 { return 0 }
-  const joinN = coalesceResultUnionName(exprIx)
+  const joinN = coalesceResultUnionName(exprIx, fnIx)
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
   const vb = vbHeapIdxOfKind(ak)
@@ -23019,7 +23040,7 @@ function emitAsCast(
   // box unchanged — one box struct and a global tag registry make it already a value of
   // the enclosing function's union return type. `m[k] as! V` fuses the map probe instead.
   if e.asMode == "trap" {
-    const amk = mapReadScalarBoxKindTy(obj)
+    const amk = mapReadScalarBoxKindIn(obj, fnIx)
     if amk >= 0 {
       const amRef = nodeAt(unwrapParen(obj))
       if amRef is Index { return emitAsMapProbeTrap(body, amRef, fnIx, ec) }
@@ -38861,7 +38882,7 @@ function emitCoalesceNulRefJoin(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  const joinN = coalesceResultUnionName(exprIx)
+  const joinN = coalesceResultUnionName(exprIx, fnIx)
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
   const joinTy = nodeTyInOf(exprIx, fnIx)
@@ -38920,7 +38941,7 @@ function emitCoalesceNulBoolJoin(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  const joinN = coalesceResultUnionName(exprIx)
+  const joinN = coalesceResultUnionName(exprIx, fnIx)
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
   const joinTy = nodeTyInOf(exprIx, fnIx)
@@ -39016,7 +39037,7 @@ function emitCoalesceNulRefCtx(
   // A union of records with no row, as two instances of one generic record make, has no box.
   if (
     tyIsStructBearingUnion(nodeTyIxOf(exprIx))
-    && !coalesceResultIsBox(exprIx)
+    && !coalesceResultIsBox(exprIx, fnIx)
   ) {
     return emitFailAt(
       "emitProgram: this `??` joins records into a union that has no box yet, as a union of two instances of one generic record does not",
@@ -39991,7 +40012,7 @@ function coalResultBoxName(exprIx: i32, fnIx: i32): string {
   const rt = coalResultTyOf(exprIx, fnIx)
   const rn = valueUnionNameOfTy(rt)
   if rn != "" { return rn }
-  const mn = nodeMixedUnionName(exprIx)
+  const mn = nodeMixedUnionName(exprIx, fnIx)
   if mn != "" { return mn }
   nodeJoinRowName(exprIx, fnIx)
 }
@@ -40924,7 +40945,7 @@ function emitCoalesceNullableRefs(
     lhsIx >= 0
     && exprReReadable(lhsIx)
     && exprNulLitUnion(lhsIx, fnIx)
-    && coalesceResultIsBox(exprIx)
+    && coalesceResultIsBox(exprIx, fnIx)
   ) {
     return emitExpr(body, coalNullTestIf(e, exprIx, fnIx), fnIx, ec)
   }
