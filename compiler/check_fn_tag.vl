@@ -44,10 +44,13 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  annTsOf,
+  callTyArgsOf,
   mkCallN,
   mkIdent,
   nodeAt,
   nodeChildrenPush,
+  tsMentionsAnyName,
 } from "./ast"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import {
@@ -81,7 +84,7 @@ import {
 import { parenPeelIx } from "./check_places"
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
 import { lpExitsOf } from "./check_if_value"
-import { i32ListHas, i32ListIndexOf } from "./listutil"
+import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 import {
   mintCallSoleSet,
   mintFactCallOf,
@@ -92,6 +95,7 @@ import {
   mintFactSetOf,
   mintFactSplits,
   mintParamTakes,
+  mintRetParamsOf,
   mintSetPartial,
 } from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
@@ -732,6 +736,106 @@ function ftScan(
   true
 }
 
+// Whether parameter `i` of `f` (declared at `d`) is typed by a type parameter that only it and
+// `f`'s result name, and `f` hands that parameter back: the result is the argument's value.
+export function ftOwnTyParamHandedBack(d: i32, f: FuncDecl, i: i32): boolean {
+  if !i32ListHas(mintRetParamsOf(d), i) || f.fnRet < 0 { return false }
+  const pn = nodeAt(f.fnParams[i])
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const tn = nodeAt(pn.parType)
+  const rn = nodeAt(f.fnRet)
+  if !(tn is TypeRef) || !(rn is TypeRef) || rn.tyName != tn.tyName {
+    return false
+  }
+  if !strListHas(f.fnTyParams, tn.tyName) { return false }
+  const nm: string[] = [tn.tyName]
+  let k = 0
+  while k < f.fnParams.length {
+    const q = nodeAt(f.fnParams[k])
+    if k != i && q is Param && q.parType >= 0 {
+      if tsMentionsAnyName(annTsOf(q.parType), nm) { return false }
+    }
+    k = k + 1
+  }
+  // Nor anything in the body that names a type: any of them could hold the id at `F`.
+  const todo: i32[] = [f.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if ftNamesTyIn(x, nm) { return false }
+      nodeChildrenPush(x, todo)
+    }
+  }
+  true
+}
+
+// Whether node `x` names a type mentioning one of `nm`: an annotation of a binding, parameter
+// or result, an `as` cast, or a call's explicit type arguments (refused whatever they name).
+function ftNamesTyIn(x: i32, nm: string[]): boolean {
+  const n = nodeAt(x)
+  match n {
+    TypeRef => {
+      return tsMentionsAnyName(annTsOf(x), nm)
+    }
+    LetDecl => {
+      return n.letType >= 0 && tsMentionsAnyName(annTsOf(n.letType), nm)
+    }
+    Param => {
+      return n.parType >= 0 && tsMentionsAnyName(annTsOf(n.parType), nm)
+    }
+    FuncDecl => {
+      return n.fnRet >= 0 && tsMentionsAnyName(annTsOf(n.fnRet), nm)
+    }
+    AsExpr => {
+      return ftSpellingNames(n.asTy, nm)
+    }
+    Call => {
+      return callTyArgsOf(x).length > 0
+    }
+    // No other node names a type of its own; its annotated children are walked separately.
+    ArrayLit | BinExpr | Block | BoolLit | BreakStmt | CharLit | ContinueStmt | ErrExpr | FieldDef | FieldInit | ForIn | ForRange | Ident | IfStmt | ImportDecl | Index | IsExpr | LoopVar | MatchExpr | Member | NullLit | NumLit | ObjLit | OptMember | Paren | Program | RetStmt | Spread | StrLit | TypeDecl | Unary | UnionDecl | WhileStmt => {
+      return false
+    }
+  }
+}
+
+// Whether type spelling `t` contains one of `nm` as a whole identifier.
+function ftSpellingNames(t: string, nm: string[]): boolean {
+  let i = 0
+  while i < t.length {
+    let j = i
+    while j < t.length && ftIdentChar(t[j]) { j = j + 1 }
+    if j > i && strListHas(nm, t.slice(i, j)) { return true }
+    i = if j > i { j } else { i + 1 }
+  }
+  false
+}
+
+function ftIdentChar(c: i32): boolean {
+  c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95
+}
+
+// Whether call `c` of declared function `d` hands a value of set `s` to a parameter `d` returns.
+function ftHandsBack(d: i32, c: Call, s: i32): boolean {
+  for i in mintRetParamsOf(d) {
+    if ftArgIsParam(c, i) && ftIsS(c.callArgs[i], s) { return true }
+  }
+  false
+}
+
+// Whether argument `i` of call `c` is parameter `i`: positional, unnamed, with no spread at or
+// before it.
+function ftArgIsParam(c: Call, i: i32): boolean {
+  if i < 0 || i >= c.callArgs.length { return false }
+  if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
+  let j = 0
+  while j <= i {
+    if nodeAt(parenPeelIx(c.callArgs[j])) is Spread { return false }
+    j = j + 1
+  }
+  true
+}
+
 // Whether `x` is a function name or lambda whose type holds set `s` in a parameter or result.
 function ftSigValue(x: i32, s: i32): boolean {
   const n = nodeAt(x)
@@ -945,6 +1049,8 @@ function ftNodeOk(
     Call => {
       if fnTagCallSetOf(x) == s { return true }
       const d = ftNamedFn(n.callFn)
+      // A function an instance found to hand back its parameter gives this call that argument.
+      if ftLate && d >= 0 && ftHandsBack(d, n, s) { return true }
       if d < 0 || !ftRetCarries(d, s) { return false }
       const f = nodeAt(d)
       if !(f is FuncDecl) { return false }
@@ -1304,7 +1410,9 @@ function ftHoleParamOf(c: Call, x: i32): boolean {
       if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
       const pn = nodeAt(f.fnParams[i])
       return pn is Param
-        && (pn.parType < 0 || ftLate && fnTagOwnTyParamAlone(f, i))
+        && (pn.parType < 0
+        || ftLate
+        && (fnTagOwnTyParamAlone(f, i) || ftOwnTyParamHandedBack(d, f, i)))
     }
     i = i + 1
   }
@@ -1345,7 +1453,9 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
   const d = ftCalleeFn(ftCalleeSource(c))
   if d < 0 { return true }
   const i = i32ListIndexOf(c.callArgs, x)
-  mintParamTakes(d, i, s) || ftParamUnread(d, i)
+  mintParamTakes(d, i, s)
+    || ftParamUnread(d, i)
+    || ftArgIsParam(c, i) && i32ListHas(mintRetParamsOf(d), i)
 }
 
 // Whether, after the elaboration, argument `x` of call `c` through a set of functions lands in a
