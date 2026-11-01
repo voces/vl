@@ -217,6 +217,7 @@ import {
 } from "./ast"
 import {
   annArrowAt,
+  annFnDecompose,
   drwDispatchOp,
   monoAnnOpenTyNote,
   nodeIsTypeDecl,
@@ -4238,6 +4239,9 @@ function cboxContStoreBack(
 export function rewriteCountersReset() {
   cboxYieldCtr = 0
   shrSerial = 0
+  voidTwinSeamAt = []
+  voidTwinSeamFe = []
+  voidTwinSeamTy = []
   drwOpOrigin = Map()
   0
 }
@@ -5153,8 +5157,34 @@ export function voidTwinTargetOf(fe: i32) {
 // resolution resolves to the very target the twin targets. Either alone is not enough — a
 // same-named nested function must keep the original closure.
 export function voidTwinForNode(nodeIx: i32, fe: i32) {
-  if !voidCoerceValAt(nodeIx) { return -1 }
+  if !voidCoerceValAt(nodeIx) && !voidTwinSeamHas(nodeIx, fe) { return -1 }
   voidTwinOfTarget(fe)
+}
+
+// Each value node the monomorphizer delivers a generic instance returning a value at into a slot
+// whose type returns nothing, beside that instance: a twin is minted for each (D3969).
+// `voidTwinSeamTy` holds the slot's function type, whose parameters the twin takes.
+let voidTwinSeamAt: i32[] = []
+let voidTwinSeamFe: i32[] = []
+let voidTwinSeamTy: string[] = []
+
+export function voidTwinSeamNote(ix: i32, fe: i32, tname: string) {
+  if !voidTwinSeamHas(ix, fe) {
+    voidTwinSeamAt.push(ix)
+    voidTwinSeamFe.push(fe)
+    voidTwinSeamTy.push(tname)
+  }
+  0
+}
+
+// Whether the monomorphizer noted value node `ix` as delivering instance `fe` into a void slot.
+function voidTwinSeamHas(ix: i32, fe: i32): boolean {
+  let i = 0
+  while i < voidTwinSeamAt.length {
+    if voidTwinSeamAt[i] == ix && voidTwinSeamFe[i] == fe { return true }
+    i = i + 1
+  }
+  false
 }
 
 // The top-level function named `name` (`fnParent < 0`), or -1 — the emit-side twin of
@@ -5184,67 +5214,75 @@ export function synthVoidTwins(_stmts: i32[]) {
     const name = voidCoerceValNameAt(i)
     const target = topLevelFnByName(name)
     if target >= 0 && voidTwinOfTarget(target) < 0 {
+      // The checker's grant already excluded generics; a target that is one gets no twin.
       const tfn = nodeAt(fnStmts[target])
-      if tfn is FuncDecl {
-        // The checker's grant already excluded generics and non-declarations; these
-        // emit-side re-checks fail closed — an unmintable target simply gets no twin,
-        // and the un-swapped closure keeps its existing behaviour at the call.
-        if tfn.fnTyParams.length == 0 {
-          let mintable = true
-          const nps: i32[] = []
-          const argIds: i32[] = []
-          let pj = 0
-          while pj < tfn.fnParams.length {
-            const pn = nodeAt(tfn.fnParams[pj])
-            if pn is Param {
-              if pn.parType < 0 { mintable = false }
-              // Fresh Param nodes sharing the original's annotation node, so the twin's
-              // param valtypes — and its `$fnsig` param tokens — byte-match the
-              // original's (only the result differs: `>v`).
-              const np = mkParam(
-                pn.parName,
-                pn.parType,
-                -1,
-                0,
-                pn.parRest,
-                pn.pos,
-              )
-              identFrom(np, tfn.fnParams[pj])
-              nps.push(np)
-              const arg = mkIdent(pn.parName, tfn.pos)
-              identFromDecl(arg, np)
-              argIds.push(arg)
-            } else {
-              mintable = false
-            }
-            pj = pj + 1
-          }
-          if mintable {
-            const noTyParams: string[] = []
-            const callee = mkIdent(name, tfn.pos)
-            identFromDecl(callee, fnStmts[target])
-            const callIx = mkCall(callee, argIds, tfn.pos)
-            const bodyIx = mkBlock([callIx], tfn.pos)
-            const twin = mkFunc(
-              name + "$voidtw",
-              noTyParams,
-              nps,
-              synthTypeRefTy("void", -1, -1),
-              bodyIx,
-              tfn.pos,
-            )
-            fnStmts.push(twin)
-            fnParent.push(-1)
-            fnDispNames.push("")
-            fnValUsed = true
-            voidTwinTargetFe.push(target)
-            voidTwinFe.push(fnStmts.length - 1)
-          }
-        }
+      const none: string[] = []
+      if tfn is FuncDecl && tfn.fnTyParams.length == 0 {
+        voidTwinMint(target, name, none)
       }
     }
     i = i + 1
   }
+  // A generic's instance delivered into a void slot takes a twin at the slot's parameters.
+  let j = 0
+  while j < voidTwinSeamFe.length {
+    const fe = voidTwinSeamFe[j]
+    if fe >= 0 && fe < fnStmts.length && voidTwinOfTarget(fe) < 0 {
+      const ifn = nodeAt(fnStmts[fe])
+      const pts: string[] = []
+      annFnDecompose(voidTwinSeamTy[j], pts)
+      if ifn is FuncDecl && pts.length == ifn.fnParams.length {
+        voidTwinMint(fe, ifn.fnName, pts)
+      }
+    }
+    j = j + 1
+  }
+  0
+}
+
+// Mints the capture-free void twin of function `target`, called `name`, which calls it and drops
+// its result, its parameters typed `ptys` when given, else as the target's; none where a
+// parameter has no type, and the closure stays at the call.
+function voidTwinMint(target: i32, name: string, ptys: string[]) {
+  const tfn = nodeAt(fnStmts[target])
+  if !(tfn is FuncDecl) { return 0 }
+  const nps: i32[] = []
+  const argIds: i32[] = []
+  let pj = 0
+  while pj < tfn.fnParams.length {
+    const pn = nodeAt(tfn.fnParams[pj])
+    if !(pn is Param) { return 0 }
+    // Fresh Param nodes sharing the original's annotation node, so the twin's param valtypes
+    // and its `$fnsig` param tokens byte-match the original's; only the result differs (`>v`).
+    const pt = if pj < ptys.length { synthTypeRefTy(ptys[pj], -1, -1) } else { pn.parType }
+    if pt < 0 { return 0 }
+    const np = mkParam(pn.parName, pt, -1, 0, pn.parRest, pn.pos)
+    identFrom(np, tfn.fnParams[pj])
+    nps.push(np)
+    const arg = mkIdent(pn.parName, tfn.pos)
+    identFromDecl(arg, np)
+    argIds.push(arg)
+    pj = pj + 1
+  }
+  const noTyParams: string[] = []
+  const callee = mkIdent(name, tfn.pos)
+  identFromDecl(callee, fnStmts[target])
+  const callIx = mkCall(callee, argIds, tfn.pos)
+  const bodyIx = mkBlock([callIx], tfn.pos)
+  const twin = mkFunc(
+    name + "$voidtw",
+    noTyParams,
+    nps,
+    synthTypeRefTy("void", -1, -1),
+    bodyIx,
+    tfn.pos,
+  )
+  fnStmts.push(twin)
+  fnParent.push(-1)
+  fnDispNames.push("")
+  fnValUsed = true
+  voidTwinTargetFe.push(target)
+  voidTwinFe.push(fnStmts.length - 1)
   0
 }
 
