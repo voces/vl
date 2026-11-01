@@ -24,6 +24,7 @@ import {
   elabRun,
 } from "./emit_elab"
 import { fnTagRedecide } from "./check_fn_tag"
+import { elabHoleRowCut, elabHoleRowMark } from "./check_elab_cap"
 import { isVarTyIxOf } from "./check_list_union"
 import { topLetScalarOf } from "./check_nj_join"
 import { nodeTyComparesAsString } from "./check_getter_effects"
@@ -7885,6 +7886,9 @@ export function emitProgram(rootIx: i32) {
 // -1 when emit has to run it itself.
 let elabPreparedFor = -1
 
+// The elaboration rounds a growing tag decision may take before it is an internal error.
+const ELAB_TAG_ROUNDS = 16
+
 // Resets the per-compile state and runs the elaboration over the checked program at `rootIx`,
 // as the last step of check; `emitProgram` on the same root then builds from it. A diagnostic an
 // instance's re-check owes the program is reported (`elabErrors`); every other one is dropped.
@@ -7893,9 +7897,26 @@ export function elabPrepare(rootIx: i32) {
   emitProgramReset(rootIx)
   if rootIx < 0 || !(nodeAt(rootIx) is Program) { return 0 }
   const d0 = T.diags.length
+  const hm = elabHoleRowMark()
   elabPrepareRun()
-  // A set the elaboration's calls let the tag decision tag is elaborated as tagged.
-  if elabMintFacts() > 0 && fnTagRedecide(rootIx) { elabPrepareRun() }
+  // A set the elaboration's calls let the tag decision tag is elaborated as tagged, from scratch,
+  // until no decision tags another; each later decision only adds sets, so they bound the rounds.
+  let rounds = 0
+  let grew = if elabMintFacts() > 0 { fnTagRedecide(rootIx) } else { 0 }
+  // The check's decision saw no instance; the first one after the elaboration replaces it.
+  if grew == 2 { grew = 1 }
+  while grew == 1 && rounds < ELAB_TAG_ROUNDS {
+    // The rows an earlier round's instances banked are its own, not the program's.
+    elabHoleRowCut(hm)
+    elabPrepareRun()
+    rounds = rounds + 1
+    grew = if elabMintFacts() > 0 { fnTagRedecide(rootIx) } else { 0 }
+  }
+  if grew != 0 {
+    emitFail(
+      "emitProgram: internal: the tag decision after the elaboration did not settle",
+    )
+  }
   while T.diags.length > d0 { T.diags.pop() }
   // What an instance's re-check owed the program is check's error.
   if !elabErrorsMuted {
