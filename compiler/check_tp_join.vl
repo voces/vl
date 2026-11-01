@@ -66,6 +66,7 @@ import {
   tyNulInnerTy,
 } from "./check_types"
 import { mkUnionTy } from "./check_union_mint"
+import { i32ListHas } from "./listutil"
 import { fnDeclIx } from "./check_write_scan"
 import { declOrigOf } from "./symbols"
 
@@ -513,15 +514,45 @@ function tyParamOfOpenBody(p: i32): boolean {
 // when `keep` (the callee joins its arms apart, or declares its return) and every member is
 // that body's own parameter; -1 for `collapseDeferredJoin` to decide.
 export function keptParamUnion(tyIx: i32, keep: boolean): i32 {
-  if tyIx < 0 || tyIx >= T.tys.length || !keep || !tpOwnParamsOnly(tyIx) {
-    return -1
+  if tyIx < 0 || tyIx >= T.tys.length || !keep { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(tyIx, ms)
+  const own: i32[] = []
+  let nul = false
+  for m in ms {
+    if isNullTy(m) { nul = true }
+    else if !i32ListHas(own, m) { own.push(m) }
   }
-  const t = tyAt(tyIx)
-  if !(t is TyUnion) { return -1 }
-  const tc = mkUnionTy(t.uMembers)
+  const tc = mkUnionTy(own)
+  if !tpOwnParamsOnly(tc) { return -1 }
   tpJoinUnions[tc] = 2
   noteHoleTpJoin(tc)
-  tc
+  if !nul { return tc }
+  // The null stays the wrapper, as a body declaring these parameters keeps it (D3612).
+  const res = mkNullableTy(tc)
+  tpJoinUnions[res] = 2
+  noteHoleTpJoin(res)
+  res
+}
+
+// Whether deferred join `tyIx` is two or more of the checked body's own parameters beside a null:
+// the callee boxes that join at every pin, so it is kept rather than collapsed. Without the null
+// a pin may join the two as one number, which only the collapse reads (D3612).
+export function joinOverOwnParams(tyIx: i32): boolean {
+  if tyIx < 0 || tyIx >= T.tys.length { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(tyIx, ms)
+  const own: i32[] = []
+  let nul = false
+  for m in ms {
+    if isNullTy(m) { nul = true }
+    else if !i32ListHas(own, m) { own.push(m) }
+  }
+  if !nul || own.length < 2 { return false }
+  for m in own {
+    if !tyIsGradualParam(m) || !tyParamOfInnermostBody(m) { return false }
+  }
+  true
 }
 
 // Whether union `t`'s members are two or more parameters of the body being checked, declared or

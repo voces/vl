@@ -13578,11 +13578,53 @@ export function memberFieldCode(memIx: i32, fnIx: i32) {
   -1
 }
 
+// The read kinds that are a string ref, the one nullable string read that is (from its own
+// cell), and the literal-union atom stores whose reads keep `exprString`'s own arms.
+const READ_STR_KINDS: string[] = ["str", "fc3", "mv3", "atom2"]
+const READ_NUL_STR_KINDS: string[] = ["nulstr"]
+const READ_ATOM_STORES: string[] = ["litatom", "fc30"]
+
+// Whether `k` is one of `ks`.
+function kindIn(k: string, ks: string[]): boolean {
+  for x in ks {
+    if x == k { return true }
+  }
+  false
+}
+
+// Whether the read at `exprIx` is typed a string or a nullable string, the only reads whose
+// read rep `exprString` asks.
+function readMayBeString(exprIx: i32, fnIx: i32): boolean {
+  const d = repOfNode(exprIx, fnIx)
+  d.rdCovered == 1 && (d.rdKind == "str" || d.rdKind == "nulstr")
+}
+
+// Whether read rep `rr` reads a string ref: 1 or 0, or -1 where it has no answer (no read rep,
+// or an atom store). A map read converted to a nullable string is `exprNullableString`'s.
+function readIsString(rr: ReadRep): i32 {
+  if rr.rrRead == "" || kindIn(rr.rrStore, READ_ATOM_STORES) { return -1 }
+  if kindIn(rr.rrRead, READ_STR_KINDS) { return 1 }
+  if rr.rrRead == rr.rrStore && kindIn(rr.rrRead, READ_NUL_STR_KINDS) {
+    return 1
+  }
+  0
+}
+
 // True if evaluating the expression at `exprIx` yields a string: a string literal, a
 // `string`-returning call, a string param/local reference, or a parenthesized string
 // expression. An index read / `.length` yields an i32, so neither counts.
 export function exprString(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  // A name, field or element read is a string when what it reads there is one; a read whose
+  // storage the read rep does not cover, or a literal-union atom store, keeps the arms below.
+  const re = nodeAt(unwrapParen(exprIx))
+  if (
+    (re is Ident || re is Member || re is Index)
+    && readMayBeString(exprIx, fnIx)
+  ) {
+    const rs = readIsString(readRepOf(exprIx, fnIx))
+    if rs >= 0 { return rs == 1 }
+  }
   const e = nodeAt(exprIx)
   match e {
     StrLit => {
@@ -14262,18 +14304,17 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
     const ak = cloNameSigKeyTy(an, aty)
     if ak != "" { return ak }
   }
-  const fe = identClosureFeOfRead(atIx, fnIx)
-  // The extended key (not just `fnSigKeyOf`) so a void-returning binding resolves its `>v`
-  // sig, interned above; a value-eligible binding takes the same key `fnSigKeyOf` would.
-  if fe >= 0 { return cloSigKeyExt(fe) }
-  // A lifted lambda answers above because it is lowered at its own signature, not its type's
-  // key, until lowering follows the recorded type (D8880). Past it, a read whose type at this
-  // instance is a closed function type is keyed by that type.
+  // A read whose type at this instance is a closed function type is keyed by that type, a lifted
+  // lambda's included, since its lowering follows the recorded type (D8880).
   const rt = tyPeelNul(nodeTyAt(atIx, fnIx))
   if rt >= 0 && tyAt(rt) is TyFunc && !tyHasTyVar(rt) {
     const rk = sigKeyOfTy(rt)
     if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
   }
+  // Any other closure binding keys by its own signature: the extended key (not just
+  // `fnSigKeyOf`), so a void-returning binding resolves its `>v` sig, interned above.
+  const fe = identClosureFeOfRead(atIx, fnIx)
+  if fe >= 0 { return cloSigKeyExt(fe) }
   // An inferred COPY of another closure binding (`const t0 = p`): chase the source so a call
   // through the intermediate binding classifies its result (nullable-closure read pattern).
   // Asked at the source's own read, so a same-named binding in a sibling block is not it (D3632).
