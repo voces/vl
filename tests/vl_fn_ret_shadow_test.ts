@@ -296,7 +296,7 @@ Deno.test({
 
 // The result-kind shadow: a valued function's recorded result against its lowered signature's
 // result token. A closure writing a value `if` into a captured `i64` records `i32` (an
-// assignment yields its right side) and lowers the stored `i64`.
+// assignment yields its right side) and lowers it at `i32` too (D14796).
 const HEX_LAMBDA = `function g(c: boolean) {
   let x: i64 = 0
   const set = () => {
@@ -318,7 +318,45 @@ Deno.test({
       HEX_LAMBDA,
       DROP_NONE,
       true,
-      "kind: recorded >i, lowered >I | __lambda_0=1",
+      "kind agree | __lambda_0=1",
+      true,
+    );
+  },
+});
+
+// A `u8[]` map's callback records `(e: u8) => u8`, a storage type its value widens from: it
+// crosses as the `i32` its lowered signature carries.
+const U8_MAP = `const xs: u8[] = [1, 200, 7]
+const m = xs.map((e) => e)
+print(m[1])
+`;
+
+// An intersection of records folds to a one-member union around the merged record (D14794),
+// whose rep and token are that record's.
+const INTERSECTION = `type AB = { a: i32 } & { b: i32 }
+function mkAB(): AB { return { a: 1, b: 2 } }
+function sumAB(v: AB): i32 { return v.a + v.b }
+print(sumAB(mkAB()))
+`;
+
+Deno.test({
+  name: "fn-ret shadow: kind u8 and intersection",
+  ignore,
+  fn() {
+    expectRows(
+      "kind intersection",
+      INTERSECTION,
+      DROP_NONE,
+      true,
+      "kind agree | mkAB=1; kind agree | sumAB=1",
+      true,
+    );
+    expectRows(
+      "kind u8 map",
+      U8_MAP,
+      DROP_NONE,
+      true,
+      "kind agree | __lambda_0=1",
       true,
     );
   },
