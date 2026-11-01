@@ -3149,6 +3149,48 @@ function recKeptValueDst(v: i32, depth: i32): i32 {
   r
 }
 
+// Refuses each object literal inside the literal `init`, built at the record `dst`, whose field is
+// a union none of whose arms declares every field the literal sets: no arm is built from a wider
+// record (D3566). `depth` bounds the walk.
+function recBuildArmDropRefuse(init: i32, dst: i32, depth: i32) {
+  const lp = cwPeelValue(init)
+  if inferQuiet || depth <= 0 || lp < 0 || dst < 0 || dst >= T.tys.length {
+    return 0
+  }
+  const e = nodeAt(lp)
+  const d = tyAt(nonNulTyOf(dst))
+  if !(e is ObjLit) || !(d is TyObj) { return 0 }
+  for fx in e.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit {
+      const ft = objFieldType(d, f.fiName)
+      const v = cwPeelValue(f.fiValue)
+      const fu = if ft >= 0 { tyAt(nonNulTyOf(ft)) } else { null }
+      const vn = if v >= 0 { nodeAt(v) } else { null }
+      if (
+        fu is TyUnion
+        && vn is ObjLit
+        && objLitUnionArm(vn, nodeTyIxOf(v), fu.uMembers) < 0
+      ) {
+        for m in fu.uMembers {
+          if m >= 0 && tyAt(m) is TyObj && assignable(nodeTyIxOf(v), m) {
+            const through = " (reached through "
+              + tyToStr(nodeTyIxOf(lp))
+              + " into "
+              + tyToStr(dst)
+              + ")"
+            objShapeDropUnsupportedErr(v, nodeTyIxOf(v), m, through)
+            return 0
+          }
+        }
+      } else if ft >= 0 {
+        recBuildArmDropRefuse(v, ft, depth - 1)
+      }
+    }
+  }
+  0
+}
+
 // The storage the kept function `d` builds at (`recKeptDecl`), else -1.
 function recKeptDstOfDecl(d: i32): i32 {
   if d < 0 { return -1 }
@@ -3420,7 +3462,11 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         p,
       )
     }
-    return recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), false, p)
+    recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), false, p)
+    if recAdNoAdopt.has(decl) {
+      recBuildArmDropRefuse(recDeclInit(decl), nonNulTyOf(dstTy), 6)
+    }
+    return 0
   }
   if e is Index {
     const b = cwPeelValue(e.idxArr)
@@ -4083,6 +4129,9 @@ function listElemDiffers(se: i32, de: i32): boolean {
   listElemWidens(se, de) || containerElemClassDiffers(se, de)
 }
 
+// Set while `objShapeAdapterless` judges a pair whose destination is a union's member.
+let objShapeAtArm = false
+
 // `direct` — is the destination a slot a `(ref $src)` can be written into as it stands?
 // True at a value flow, where a declared WasmGC supertype makes the reference fit. False
 // wherever the pair sits under something whose own wasm type has to relate by identity — an
@@ -4170,8 +4219,11 @@ function objShapeAdapterless(
           if objFieldNameSetsEq(src, dst) {
             return objShapeSameNamesAdapts(srcExpr, src, dst, cx)
           }
-          // A pinned binding's literal runs the initializer of a field it drops.
-          if recAdPinInit && litShapeDropSrcExpr(cx) { return false }
+          // A pinned binding's literal runs the initializer of a field a record drops; no union
+          // arm is built from a wider record (D3566).
+          if recAdPinInit && !objShapeAtArm && litShapeDropSrcExpr(cx) {
+            return false
+          }
           // The width lift (D622): a `Wide` flowing into a `Narrow` whose fields are the first
           // of `Wide`'s, in the canonical layout order with identical types, needs no
           // conversion — `emitTypeSection` declares a `(sub)` edge, only at a `direct` position.
@@ -4285,6 +4337,8 @@ function objShapeUnionDstAdapts(
   let di = 0
   let anyClean = false
   let anyAdapts = false
+  const atArm = objShapeAtArm
+  objShapeAtArm = true
   while di < dms.length {
     if assignable(src, dms[di]) {
       if objShapeAdapterless(srcExpr, src, dms[di], depth - 1, false) {
@@ -4295,6 +4349,7 @@ function objShapeUnionDstAdapts(
     }
     di = di + 1
   }
+  objShapeAtArm = atArm
   if anyClean { return false }
   anyAdapts
 }
@@ -4578,25 +4633,36 @@ export function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
   if litShapeDropSrcExpr(sX) {
     objLitUndeclaredErr(srcExpr, sT, dT, through)
   } else {
-    tErrUnsupported(
-      "an object value of shape "
-        + tyToStr(sT)
-        + " flowing into "
-        + tyToStr(dT)
-        + through
-        + " drops the field "
-        + objDroppedFieldList(sT, dT)
-        + ": type-valid (structural width subtyping) but not yet supported by codegen — a "
-        + "struct's wasm type is its own field list, so these are unrelated types and no "
-        + "field-dropping conversion exists. Construct the value at "
-        + tyToStr(dT)
-        + " (an object literal is built at the shape it flows into), or declare the source "
-        + "with exactly "
-        + tyToStr(dT)
-        + "'s fields",
-      srcExpr,
-    )
+    objShapeDropUnsupportedErr(srcExpr, sT, dT, through)
   }
+}
+
+// The refusal of a value of record `sT` delivered into the record `dT`, which lacks a field it has:
+// no field-dropping conversion is built. `through` names the carrying pair, or is "".
+function objShapeDropUnsupportedErr(
+  at: i32,
+  sT: i32,
+  dT: i32,
+  through: string,
+) {
+  tErrUnsupported(
+    "an object value of shape "
+      + tyToStr(sT)
+      + " flowing into "
+      + tyToStr(dT)
+      + through
+      + " drops the field "
+      + objDroppedFieldList(sT, dT)
+      + ": type-valid (structural width subtyping) but not yet supported by codegen — a "
+      + "struct's wasm type is its own field list, so these are unrelated types and no "
+      + "field-dropping conversion exists. Construct the value at "
+      + tyToStr(dT)
+      + " (an object literal is built at the shape it flows into), or declare the source "
+      + "with exactly "
+      + tyToStr(dT)
+      + "'s fields",
+    at,
+  )
 }
 
 // The width-field refusal: `sT` and `dT` agree on field names but differ inside a field,
