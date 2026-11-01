@@ -11401,3 +11401,14 @@ second record with the same field names moves a literal off an arm and onto its 
 because it is what the emitter already did, now one checker fact in place of two emitter scans. The
 alternative, refused for now, is that an unadopted literal is always its own row and a conversion is
 emitted wherever it later meets the union. If the distance ever bites, that is the change to make.
+
+## A value-fit list is not delivered at an instance (application of ruling (c), D4981, D5003)
+
+Not a new decision: owner ruling (c) on #3792 (D4928) says a list narrowed by `is K[]` is never
+delivered as `K[]`, applied here to the instance of a generic body. At `V = i32[]` an empty list
+passes `is f64[]` by value fit (D4771), and the arm reads it as a fresh `f64[]`. Handed to a
+parameter, a binding, a return or a field, a write would land in a list the caller does not hold,
+so the instance refuses the delivery as D4928 refuses it from a concrete declared type. Read-only
+uses in the arm (`v.length`, an element read) stay legal, as does every delivery at an instance
+whose list is the tested type or a union holding it. Aliasing the receiver is impossible across
+two storage types, and a silent copy is the lossy operation std and this file refuse elsewhere.
