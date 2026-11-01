@@ -174,6 +174,7 @@ import {
 } from "./listutil"
 import {
   mintFactNote,
+  mintParamBoundNote,
   mintParamFwdNote,
   mintParamSetNote,
   mintReset,
@@ -2231,6 +2232,20 @@ export function elabMintFacts(): i32 {
         ekNames[k],
         ekTys[k],
       )
+      // The set each un-annotated parameter is bound to, which a forward of it hands on.
+      const repKey = (elabGuessKeys[k] ?? false)
+        || (elabCbRepKeys[k] ?? false)
+        || (elabSigAltKeys[k] ?? false)
+      for pi in dn.fnParams {
+        const pn = nodeAt(pi)
+        if !repKey && pn is Param && pn.parType < 0 {
+          mintParamBoundNote(
+            ekDecl[k],
+            i32ListIndexOf(dn.fnParams, pi),
+            fnTagSetOfTy(substTyDeep(nodeTyIxOf(pi), ekNames[k], ekTys[k])),
+          )
+        }
+      }
       // The hand-back first: the reads below ask it.
       n = n + elabMintRetFact(k)
       n = n + elabMintFactsIn(dn.fnBody, ekDecl[k], k, sc)
@@ -2425,6 +2440,36 @@ function elabMintFwdTarget(ix: i32, p: i32): i32[] {
   [d2, j]
 }
 
+// Notes parameter `i` of `decl`, read at `ix` as a positional argument of call `p` through a
+// set of functions (as instance `k` types its callee), as forwarded to every member's
+// parameter there; false when `p` is no such call or set `st` is none.
+function elabMintSetFwd(
+  decl: i32,
+  i: i32,
+  ix: i32,
+  p: i32,
+  k: i32,
+  st: i32,
+): boolean {
+  if st < 0 || p < 0 || p >= P.nodes.length { return false }
+  const pn = nodeAt(p)
+  if !(pn is Call) { return false }
+  const j = i32ListIndexOf(pn.callArgs, ix)
+  if j < 0 || j < pn.callArgNames.length && pn.callArgNames[j] != "" {
+    return false
+  }
+  const ms = fnTagMembers(fnTagSetOfTy(elabNodeTy(parenPeelIx(pn.callFn), k)))
+  if ms.length == 0 { return false }
+  for m in ms {
+    const f2 = nodeAt(m)
+    if !(f2 is FuncDecl) || j >= f2.fnParams.length { return false }
+    const q = nodeAt(f2.fnParams[j])
+    if !(q is Param) || q.parType >= 0 { return false }
+  }
+  for m in ms { mintParamFwdNote(decl, i, m, j) }
+  true
+}
+
 // The declaration the callee name `v` reads, through at most `depth` `const` aliases; -1 when
 // it reads no declaration.
 function elabConstCalleeDecl(v: i32, depth: i32): i32 {
@@ -2605,7 +2650,9 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       const to = elabMintFwdTarget(ix, p)
       if to.length == 2 && st >= 0 {
         mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
-      } else {
+      } else if (
+        !elabMintSetFwd(decl, i32ListIndexOf(dn.fnParams, pd), ix, p, k, st)
+      ) {
         mintSetPartialNote(st)
       }
     }
@@ -2632,6 +2679,9 @@ function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       const pn = if p >= 0 { nodeAt(p) } else { nodeAt(ix) }
       if to.length == 2 && st >= 0 {
         mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
+      } else if (
+        elabMintSetFwd(decl, i32ListIndexOf(dn.fnParams, pd), ix, p, k, st)
+      ) {
       } else if (
         !(pn is Call && pn.callFn == ix && elabMintFactAt(pn, p, decl, k, sc))
       ) {
