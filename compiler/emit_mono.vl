@@ -9647,6 +9647,7 @@ export function monoStateReset() {
   monoDestPinOff = false
   monoElemTakenSig = Map()
   monoElemAtSet = Map()
+  monoTopStmts = []
   monoInstBody = -1
   monoInstIsFirst = false
   monoInstParams = []
@@ -19282,11 +19283,11 @@ function monoCalleeAnnNode(callee: i32, fnIx: i32): i32 {
   -1
 }
 
-// Call `n` through a list element, a `for` variable over a list or a `const` joining functions
+// Call `n` (node `ix`) through a list element, a `for` variable over a list or a `const` joining functions
 // by `if`, or an `if` called in place, each element a named function: instances every element
 // and types the callee at the one closed type their parameters' own calls and the arguments'
 // results give it (D7183, D7848). 1 when it typed the callee, 0 when none applies, -1 on a failure.
-function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
+function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
   const elems = monoCalleeElems(n.callFn, ctx)
   if elems.length == 0 { return 0 }
   const inline = monoForInlineElems(n.callFn)
@@ -19348,7 +19349,7 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     k = k + 1
   }
   if monoElemSetFnTy(rows[0], monoFnTyRet(ft)) {
-    return monoElemsAtSet(n, elems, rows, ft, ctx)
+    return monoElemsAtSet(n, ix, elems, rows, ft, ctx)
   }
   const nm = monoConcreteFnTyName(ft)
   if nm == "" { return 0 }
@@ -19389,6 +19390,7 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
 // at the rows' types, keyed by the set as a direct call's is. 1 when it typed the callee, else 0.
 function monoElemsAtSet(
   n: Call,
+  ix: i32,
   elems: i32[],
   rows: i32[][],
   ft: i32,
@@ -19401,6 +19403,9 @@ function monoElemsAtSet(
     const xn = nodeAt(x)
     const fe = if xn is Ident { monoFnFeOfIdent(x, xn.identName, ctx) } else { -1 }
     if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 { return 0 }
+    // A function also delivered elsewhere, as to a closed function slot, shares that value with
+    // this element (D14428).
+    if monoFnReadElsewhere(identDeclOf(x)) { return 0 }
     const pins: string[] = []
     for pt in rows[k] {
       pins.push(
@@ -19412,6 +19417,9 @@ function monoElemsAtSet(
     k = k + 1
   }
   nodeTyRecord(n.callFn, ft)
+  // The call reads the result the elements give at the set, which the check left open.
+  const rt = monoFnTyRet(ft)
+  if rt >= 0 && !tySame(rt, nodeTyIxOf(ix)) { nodeTyRecord(ix, rt) }
   1
 }
 
@@ -19776,6 +19784,48 @@ function monoElemArgSetTy(a: i32): i32 {
   const it = elabWalkTy(x)
   if fnTagTyIsTagged(it) { return it }
   -1
+}
+
+// The program's top-level statements, and each declared function's reads that are neither a
+// callee nor a list element or `if` arm.
+let monoTopStmts: i32[] = []
+let monoFnValReads: {[i32]: i32[]} = Map()
+let monoFnValReadsBuilt = false
+
+// Whether declared function `d` is read as a value other than as a callee, a list element or an
+// `if` arm.
+function monoFnReadElsewhere(d: i32): boolean {
+  if !monoFnValReadsBuilt {
+    monoFnValReadsBuilt = true
+    const xs: i32[] = []
+    const ps: i32[] = []
+    for st in monoTopStmts {
+      xs.push(st)
+      ps.push(-1)
+    }
+    while xs.length > 0 {
+      const x = xs.pop() ?? -1
+      const p = ps.pop() ?? -1
+      if x >= 0 && x < P.nodes.length {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        const callee = p >= 0 && pn is Call && pn.callFn == x
+        const elem = pn is ArrayLit || pn is IfStmt || pn is Block
+        if nodeAt(x) is Ident && !callee && !elem {
+          const xd = identDeclOf(x)
+          if xd >= 0 && xd < P.nodes.length && nodeAt(xd) is FuncDecl {
+            const at = monoFnValReads[xd] ?? []
+            at.push(x)
+            monoFnValReads[xd] = at
+          }
+        }
+        for c in nodeChildren(x) {
+          xs.push(c)
+          ps.push(x)
+        }
+      }
+    }
+  }
+  (monoFnValReads[d] ?? []).length > 0
 }
 
 // The element values `monoElemsAtSet` instanced at a tagged set, by node.
@@ -20839,42 +20889,6 @@ function monoI32sSame(a: i32[], b: i32[]): boolean {
   true
 }
 
-// `monoHoleGenFnPin` for any other open function value: a binding holding an un-annotated
-// lambda or a value typed at a hole function's signature, or a call returning one, at the one
-// closed pin the flow table gives it past the call (D6002), else at `bindTy`, the checker's
-// binding of the hole at this call (-1 for none, D6112). "" when none closes.
-function monoOpenFnFlowPin(
-  argIx: i32,
-  ctx: i32,
-  bindTy: i32,
-  tyOut: i32[],
-): string {
-  const ax = unwrapParen(argIx)
-  if ax < 0 { return "" }
-  const vt = nodeTyIxOf(ax)
-  if vt < 0 || vt >= T.tys.length || !(tyAt(vt) is TyFunc) || !tyHasTyVar(vt) {
-    return ""
-  }
-  let fl = monoReadLetFrame(ax, ctx)
-  let ft = -1
-  if fl[1] < 0 {
-    const nl = monoNestedRowReadFrame(ax, ctx)
-    if nl[1] >= 0 {
-      fl = nl
-    } else {
-      if !(nodeAt(ax) is Call) { return "" }
-      fl = [ctx, ax]
-      ft = monoHoleGenFnFlowTy(argIx, fl)
-    }
-  } else {
-    ft = monoHoleGenFnFlowTy(argIx, fl)
-  }
-  if ft < 0 && bindTy >= 0 && monoTyConcreteFn(bindTy) {
-    return monoFnPinAt(argIx, ctx, bindTy, -1, tyOut)
-  }
-  monoFnPinAt(argIx, ctx, ft, fl[1], tyOut)
-}
-
 // `argIx` delivered at the concrete function type `bt`, and its pin name; each call taking the
 // flow pin of `flowDecl` (-1 for none) whose callee the checker left open is typed at it.
 function monoFnPinAt(
@@ -21436,9 +21450,9 @@ function monoFnDeclRetAtUnder(
   const r = holeLamRetAt(lx, mkFuncTy(qs, i32TyIx()), bN, bT)
   if r >= 0 { return r }
   const dr = monoFnTyRetAt(nodeTyIxOf(lx), qs)
-  if dr >= 0 || bN.length > 0 { return dr }
+  if dr >= 0 { return dr }
   // A tagged set argument is called member by member, so the instance the elaboration
-  // checked at it answers.
+  // checked at it answers, whatever the enclosing holes are bound to.
   for q in qs {
     if fnTagTyIsTagged(q) { return elabResultAtParams(lx, qs) }
   }
@@ -22212,7 +22226,6 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
               i,
               callIx,
               ctx,
-              oDecl,
               pinned,
               pinTys,
             )
@@ -22465,7 +22478,6 @@ function monoPinHoleParam(
   i: i32,
   callIx: i32,
   ctx: i32,
-  oDecl: i32,
   pinned: string[],
   pinTys: i32[],
 ): i32 {
@@ -22544,6 +22556,17 @@ function monoPinHoleParam(
     an = monoRecordRowPin(rt)
     if an != "" { anTy = rt }
   }
+  // A record the elaboration leaves open is pinned at the row its own type is built at.
+  if an == "" && et < 0 {
+    const rt = nodeTyIxOf(unwrapParen(args[i]))
+    if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyObj {
+      const si = structRowRecordingTy(rt)
+      if si >= 0 && si < sNames.length {
+        an = sNames[si]
+        anTy = rt
+      }
+    }
+  }
   if an == "" {
     // Kept for an argument the elaboration leaves open at this call.
     an = monoArgPinName(args[i], ctx)
@@ -22561,16 +22584,6 @@ function monoPinHoleParam(
     }
     // A hole function's `=>` pin is typed at the closed signature its rep key names.
     if anTy < 0 { anTy = monoHoleFnPinTy(args[i], ctx, an) }
-  }
-  if an == "" {
-    const pinTy: i32[] = [0 - 1]
-    an = monoOpenFnFlowPin(
-      args[i],
-      ctx,
-      monoHoleParamBindTy(callIx, oDecl, i),
-      pinTy,
-    )
-    anTy = pinTy[0]
   }
   if an == "" {
     const rowTy: i32[] = [0 - 1]
@@ -22789,11 +22802,6 @@ function monoPinAnnotatedParam(
         an2 = monoElabPin(callIx, args, i, eft, ctx)
         if an2 != "" { an2Ty = eft }
       }
-    }
-    if an2 == "" && ann == tp {
-      const pinTy: i32[] = [0 - 1]
-      an2 = monoOpenFnFlowPin(args[i], ctx, -1, pinTy)
-      an2Ty = pinTy[0]
     }
     if an2 == "" && ann == tp {
       const rowTy: i32[] = [0 - 1]
@@ -23896,23 +23904,6 @@ function monoDeclFrameIn(e: i32, ctx: i32): i32[] {
   none
 }
 
-// `[frame, declaration]` of the list of lists read at `at` (`v[0][0]`, literal indices), whose
-// slot `e`/`e` holds the function read (D9710); `[-1, -1]` for any other read.
-function monoNestedRowReadFrame(at: i32, ctx: i32): i32[] {
-  const none: i32[] = [0 - 1, 0 - 1]
-  const o = nodeAt(at)
-  if !(o is Index) || !(nodeAt(o.idxIndex) is NumLit) { return none }
-  const ix = unwrapParen(o.idxArr)
-  if ix < 0 { return none }
-  const i = nodeAt(ix)
-  if !(i is Index) || !(nodeAt(i.idxIndex) is NumLit) { return none }
-  const r = unwrapParen(i.idxArr)
-  if r < 0 || !(nodeAt(r) is Ident) { return none }
-  const e = identDeclOf(r)
-  if e < 0 || e >= P.nodes.length || !(nodeAt(e) is LetDecl) { return none }
-  monoDeclFrameIn(e, ctx)
-}
-
 // `[frame, declaration]` of the `let` the read at `at` (a name, or a capture cell's `d[0]`)
 // names by declaration, in frame `ctx` or the nearest enclosing frame holding its copy;
 // `[-1, -1]` for a read of anything else, such as a parameter.
@@ -24489,7 +24480,7 @@ function monoWalk(ix: i32, ctx: i32) {
         || paramArgs > 0
         || monoForInlineGenElems(n.callFn, ctx)
       ) {
-        elemsTyped = monoOpenCallAtElems(n, ctx)
+        elemsTyped = monoOpenCallAtElems(n, ix, ctx)
         if elemsTyped < 0 { return -1 }
       }
       if n.callFn < 0 { return 0 }
@@ -25644,21 +25635,6 @@ function monoLamLitTakeTys(at: i32, ann: string, ctx: i32, delTys: i32[]): i32 {
   if lfe < 0 || lfe >= monoGen.length || monoGen[lfe] != 1 { return 0 }
   if !monoLamIsHole(lfe) { return 0 }
   monoCellLamTake(lfe, x, ann, ctx, delTys)
-}
-
-// The concrete function type the checker bound un-annotated parameter `i` of `decl` to at call
-// `callIx`; -1 for none.
-function monoHoleParamBindTy(callIx: i32, decl: i32, i: i32): i32 {
-  if decl < 0 || decl >= P.nodes.length { return -1 }
-  const dn = nodeAt(decl)
-  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return -1 }
-  const pt = nodeTyIxOf(dn.fnParams[i])
-  if pt < 0 || pt >= T.tys.length { return -1 }
-  const pv = tyAt(pt)
-  if !(pv is TyVar) { return -1 }
-  const bt = callBindTyOf(callIx, pv.tvName)
-  if bt < 0 || bt >= T.tys.length || !(tyAt(bt) is TyFunc) { return -1 }
-  bt
 }
 
 // Hole lambda `lfe`, the literal `x` among the arguments of call `callIx`, instanced at the
@@ -27255,6 +27231,9 @@ function monoCloCoerceBuild(): i32 {
 // bodies are walked as they are created. Usage-gated: a program with no generic
 // declaration and no concrete higher-order function returns immediately.
 export function monomorphize(stmts: i32[]) {
+  monoTopStmts = stmts
+  monoFnValReads = Map()
+  monoFnValReadsBuilt = false
   monoCloCoerceFe = Map()
   monoClashLits = []
   monoCallTpl = Map()

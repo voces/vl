@@ -11412,3 +11412,36 @@ so the instance refuses the delivery as D4928 refuses it from a concrete declare
 uses in the arm (`v.length`, an element read) stay legal, as does every delivery at an instance
 whose list is the tested type or a union holding it. Aliasing the receiver is impossible across
 two storage types, and a silent copy is the lossy operation std and this file refuse elsewhere.
+
+The same refinement the records section below names would relax this rule too: a delivery that
+no later write can reach needs no copy (D14827, low priority).
+
+## A record narrowed by `is` is read at the narrowed type, not delivered as it (owner ruling, 2026-11-01) — D4084
+
+**The rule.** Records follow list ruling (c) (D4928). A record narrowed by `is B` (or tested
+by `as? B`) to a record that its declared type stores wider is read at `B`, but never delivered
+as `B`. That covers a binding, an argument, a push, an assignment, a return, and a field or
+element of a literal. The error names the copy, `{ x: a.x }`.
+
+```vl
+type A = { x: i32 }
+type B = { x: 1 | 2 }
+const keep: B[] = []
+function stash(a: A) { if a is B { keep.push({ x: a.x }) } }
+```
+
+An un-annotated copy (`const c = a`) binds at the declared type (D4133). `as B` from a union
+with a wider record member is refused, and `is B` with a copy is the spelling (D4134).
+
+**Why.** A record is shared, not copied. The narrowing is a fact about the record's current
+fields, and the caller's `A` may still write a value `B` does not allow, through the same
+object, after the narrowed scope has ended (D4084). A delivered `B` would then hold that value.
+
+**The price.** A correct program with no such write is refused too. The fixture for D14752
+delivered a narrowed `A | B` value as an `A` with nothing writing it afterwards, and now copies
+its fields.
+
+**The refinement, low priority (option (c)).** In an ideal world the compiler detects whether a
+later write could invalidate the narrowing, and when none can, the delivery is fine without a
+copy. It would relax lists and records alike (D14827, whose witness is D14752's original
+spelling).

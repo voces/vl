@@ -76,7 +76,7 @@ import {
 } from "./check_infer_ret"
 import { isTransparentAlias } from "./check_alias_transparent"
 import { letNullHoleFilledTy } from "./check_null_holes"
-import { fnRecordedRetTy } from "./fn_ret_shadow"
+import { fnRecordedRetTy, retValueRootCall } from "./fn_ret_shadow"
 import { refViewSrcTys } from "./check_ref_list_view"
 import { widenRetagToHas } from "./check_retag_rows"
 import {
@@ -220,7 +220,6 @@ import {
   unwrapParen,
 } from "./emit_base"
 import {
-  identDeclOf,
   sidArrGet,
   sidArrPut,
   sidNoteNodeName,
@@ -3124,7 +3123,7 @@ function fnRetRefListDemand(i: i32) {
 
 // The record row of un-annotated function `i` read from the rep stamp of every value it returns,
 // where its recorded result is a record, variant or nullable record and each stamp names one
-// row. A value stamped open, or built by a call, keeps the walk (D14900). True if set.
+// row; a value stamped open, or built by a call, reads its function's recorded row. True if set.
 function criRowByStamp(i: i32): boolean {
   if i >= fRecRetTy.length { return false }
   const rk = repSigKindOfTy(fRecRetTy[i])
@@ -3134,16 +3133,23 @@ function criRowByStamp(i: i32): boolean {
   const vals: i32[] = []
   collectRetValues(fn.fnBody, vals)
   if vals.length == 0 { return false }
+  // A value stamped open is built at the row its function's recorded result names (D14900); a
+  // call-built one at its root call's stamp; every other value at its own stamp's row.
+  const recSlot = repSlotOfKind(rk, repSigSlotTyOf(fRecRetTy[i]))
   let kind: VKind | null = null
   let slot = -1
   let v = 0
   while v < vals.length {
-    if criBuiltAtCallee(vals[v]) { return false }
-    const sty = nodeRepTyIxOf(vals[v])
-    if sty < 0 || tyHasTyVar(sty) { return false }
-    const k = repSigKindOfTy(sty)
+    // A call-built value's row is the one its root call is stamped at.
+    const root = retValueRootCall(vals[v])
+    const sty = nodeRepTyIxOf(if root >= 0 { root } else { vals[v] })
+    let k: VKind | null = rk
+    let sl = recSlot
+    if sty >= 0 && !tyHasTyVar(sty) {
+      k = repSigKindOfTy(sty)
+      sl = repSlotOfKind(k, repSigSlotTyOf(sty))
+    }
     if k != rk { return false }
-    const sl = repSlotOfKind(k, repSigSlotTyOf(sty))
     if sl < 0 || (v > 0 && sl != slot) { return false }
     kind = k
     slot = sl
@@ -3155,26 +3161,6 @@ function criRowByStamp(i: i32): boolean {
   fRetStructIdx[i] = slot
   criChanged = true
   true
-}
-
-// Whether returned value `v` is built where another function delivers it: a call, or a name a
-// `const` initialised by one, through any chain of such names.
-function criBuiltAtCallee(v: i32): boolean {
-  let cur = unwrapParen(v)
-  let hops = 0
-  while cur >= 0 && cur < P.nodes.length && hops < 64 {
-    const n = nodeAt(cur)
-    if n is Call { return true }
-    if !(n is Ident) { return false }
-    const d = identDeclOf(cur)
-    if d < 0 { return false }
-    const dn = nodeAt(d)
-    if !(dn is LetDecl) { return false }
-    if dn.letKw != "const" || dn.letInit < 0 { return false }
-    cur = unwrapParen(dn.letInit)
-    hops = hops + 1
-  }
-  false
 }
 
 export function computeRetInference() {

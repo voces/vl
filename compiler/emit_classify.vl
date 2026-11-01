@@ -12826,6 +12826,38 @@ export function exprU8Array(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "u8list"
 }
 
+// Each read rep a read can read a list as, beside the list kind it reads: a list, a nullable
+// list's base, or the list a union box's atom code names.
+const READ_LIST_FROM: string[] = [
+  "list", "nullist", "atom7", "atom17", "atom18", "u8list", "nulu8list",
+  "atom13", "i64list", "nuli64list", "atom10", "f32list", "nulf32list",
+  "atom12", "f64list", "nulf64list", "atom8", "strlist", "nulstrlist", "atom9",
+  "reflist", "nulreflist",
+]
+const READ_LIST_TO: VKind[] = [
+  "list", "list", "list", "list", "list", "u8list", "u8list", "u8list",
+  "i64list", "i64list", "i64list", "f32list", "f32list", "f32list", "f64list",
+  "f64list", "f64list", "strlist", "strlist", "strlist", "reflist", "reflist",
+]
+
+// The list kind a read of read rep `r` reads, or null for a read of anything else.
+function readListKindOf(r: string): VKind | null {
+  let i = 0
+  while i < READ_LIST_FROM.length {
+    if READ_LIST_FROM[i] == r { return READ_LIST_TO[i] }
+    i = i + 1
+  }
+  null
+}
+
+// Whether recorded type `ty` reads as no list wherever it is read: a primitive, record, function,
+// map or literal. A type variable, union or list may.
+function lrTyIsNoList(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  t is TyPrim || t is TyObj || t is TyFunc || t is TyMap || t is TyLit
+}
+
 // The non-null list rep the expression at `exprIx` produces, or null when this cannot name one.
 // The recorded type answers first, then the expression's shape. Each `expr*Array` predicate is
 // this answer compared with one kind, so no two of them can claim one expression (D2275).
@@ -12935,6 +12967,16 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
   // A call's list is what its callee lowers, asked first; the ladder below answers a call whose
   // lowering is not known, a builtin's or a method's among them.
   const ce = nodeAt(exprIx)
+  // A name read is what its storage reads as there, once every instance has its own cells; a
+  // template's read before then holds its open parameter's default, so the ladder answers it.
+  if (
+    ce is Ident
+    && emitPhaseReached("monomorphized")
+    && !lrTyIsNoList(nodeTyIxOf(exprIx))
+  ) {
+    const nk = readListKindOf(readRepOf(exprIx, fnIx).rrRead)
+    if nk != null { return nk }
+  }
   if ce is Call {
     const ck = callStoreListKind(ce, exprIx, fnIx)
     if ck != null {
@@ -14358,8 +14400,9 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
     const rk = sigKeyOfTy(rt)
     if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
   }
-  // Any other closure binding keys by its own signature: the extended key (not just
-  // `fnSigKeyOf`), so a void-returning binding resolves its `>v` sig, interned above.
+  // A closure binding keys by the signature its held value is lowered at: the producer for a
+  // read whose type at this instance is open, not a fallback (D14825). The extended key, so a
+  // void-returning binding resolves its `>v` sig.
   const fe = identClosureFeOfRead(atIx, fnIx)
   if fe >= 0 { return cloSigKeyExt(fe) }
   // An inferred COPY of another closure binding (`const t0 = p`): chase the source so a call
@@ -15252,6 +15295,14 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
       }
     }
   }
+  // A read narrowed to a list arm reads the arm's own list, which an `is` test over a list of
+  // another element makes apart from the cell it narrows (D4934).
+  if readListKindOf(st) != null && readNarrowedStoreAt(rx, fnIx) >= 0 {
+    const ld = repOfNode(rx, fnIx)
+    if ld.rdCovered == 1 && vkListClass(ld.rdKind) == 1 && ld.rdKind != st {
+      return { rrStore: st, rrRead: ld.rdKind, rrConv: 8 }
+    }
+  }
   { rrStore: st, rrRead: st, rrConv: 0 }
 }
 
@@ -15564,7 +15615,8 @@ const flkStamp: i32[] = []
 const flkVal: VKind[] = []
 
 // The result kind function `fe` lowers, once return kinds are final: its closed recorded result's
-// rep, else its result kind; null for a void result.
+// rep, else its result kind; null for a void result. Exact for a list kind; for a record or variant
+// the type's rep can differ from the lowered valtype (D14655).
 function fnLoweredKind(fe: i32): VKind | null {
   if fe >= fRetKind.length || fe >= fRetVoid.length || fRetVoid[fe] != 0 {
     return null
