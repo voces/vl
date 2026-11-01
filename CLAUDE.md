@@ -415,30 +415,19 @@ row per refusal literal a witness reaches, 21 of them, all invisible to the word
 `capability-probes.vl --live-sites` re-grades them and `tests/vl_live_sites_test.ts` refuses a row with no
 probe. `docs/internals/emit-refusal-wording-2026-09.md`.
 
-**The corpus's emit-side evidence comes only from its CURATED half.** On 2026-10-11
-`baseline.jsonl` held 10,065 cells:
+**The corpus holds no emit reject and no clause-1 cell.** On 2026-11-01 `baseline.jsonl` held
+10,395 cells, and `regress.vl` on a seed built from master `b792ef06` graded every one as filed:
 
-* 5,932 `runs` and 3,258 `loud check reject`;
-* 667 `loud emit reject`;
-* 208 clause-1 cells: 144 `runs but wrong value`, 54 `check-clean invalid wasm` and
-  10 `trap_loads`.
+* 7,086 `runs` and 3,309 `loud check reject`;
+* 0 `loud emit reject`;
+* 0 clause-1 cells.
 
-All 875 cells against the goal are in `named/`, and every one is a review's PRICE: the cells
-a candidate moved loud→silent into a defect master already had. The 1,477 DERIVED cells are
-still only `runs` (1,223) and `loud check reject` (254). So the census's behavioural classes
-carry no emit reject and no silent cell. The 875 measure what reviews looked at, not how
-often the language fails.
-
-**Triage the clause-1 cells by ablation, not by message.** Their 30 distinct messages fall
-into 12 families, and every family has a row:
-
-* D3423 holds 118 of the 208;
-* D3361 holds 24, and D3367 holds 20;
-* D4046 holds 18;
-* D3336 holds 5;
-* D3357, D3369 and D2594 hold 4 each;
-* D3346, D2595 and D3961 hold 3 each;
-* D3398 holds 2.
+The 1,477 DERIVED cells are 1,226 `runs` and 251 `loud check reject`. The 8,918 curated cells
+are 5,860 and 3,058. On 2026-10-11 the curated half held 875 cells against the goal, 208 of them
+clause 1 (118 were D3423's), and every family is now closed. So `regress.vl` can only report a
+loss. It cannot point at an open defect. Open work is in the inventory
+(`scripts/inventory/ls.vl -- --status open`) and the capability probes. A lane briefed off a
+corpus family count must re-run `regress.vl` first.
 
 The other ~500 refusal sites still have no corpus cell. Name the population in the sentence.
 
