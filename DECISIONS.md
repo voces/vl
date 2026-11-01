@@ -11315,11 +11315,11 @@ are assigned. An arm's fields are its row's. During collection an arm's fields a
 (`armStage*`); at the end of `collectS` each arm adopts a row (a struct row of its record type
 whose fields match by name and code, else its reference row, else one minted for it), the
 variant field columns become the struct-row lists themselves, and the staging is emptied; an arm
-created later adopts its row as it is minted. An arm adopting a struct row takes the row's
-element spellings: agreeing them at adoption writes a declared name into a row its canon twins
-compare by element name, and the twin lookup then declines; "a declared spelling wins" holds
-only where an arm's own row differs from its field row (`variantRowAgree`) until step 3 makes
-that comparison read element types, after which it holds everywhere. A shared-tag arm needs no
+created later adopts its row as it is minted. An arm adopting a struct row agrees its element
+spellings with the row's as the arms and rows agree everywhere: a declared spelling wins over a
+structural one. This waited on the layout compare reading element types before spellings
+(#5596), since a declared name written into a row its canon twins compare by spelling made the
+twin lookup decline. A shared-tag arm needs no
 row of its own: its fields match its record's row by name and code, so it adopts that row as its
 field row while its heap stays its tag-mate's; that is the one place an arm's two rows differ. Running `collectS`'s reset before
 `collectU`, so arms write rows directly, would remove the staging and is not done. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
