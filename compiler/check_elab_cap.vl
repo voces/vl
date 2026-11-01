@@ -35,6 +35,7 @@ import {
   TyUnion,
   TyVar,
   mkArrayTy,
+  tySame,
 } from "./check_types"
 import { declTyOf } from "./check_nar_store"
 import {
@@ -50,13 +51,16 @@ import {
   P,
   Param,
   Paren,
+  TypeRef,
+  annTsOf,
   i32ToStr,
   nodeAt,
+  tsMentionsAnyName,
 } from "./ast"
 import { inferQuiet, quietDepth } from "./check_cursor"
 import { restoreSlot, scopeVisibleSnapshot } from "./check_scopes"
 import { tyHasTyVar } from "./tyquery"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import { identDeclOf, nodeSrc } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
 import { hdBase, hdRowOf } from "./check_hole_pins"
@@ -73,6 +77,9 @@ export let elabCapTy: {[i32]: i32} = Map()
 
 // Literal → the type it is built at, for the elaboration in progress: its rep stamp there.
 export let elabCapRep: {[i32]: i32} = Map()
+
+// Node → the destination type it is delivered at, for the elaboration in progress.
+export let elabCapCtx: {[i32]: i32} = Map()
 
 // Literal → the union whose arm it is adopted into, for the elaboration in progress.
 export let elabCapRepUnion: {[i32]: i32} = Map()
@@ -104,8 +111,17 @@ export function elabCapLive(): boolean {
   elabCapOn && quietDepth == elabCapQuiet
 }
 
-// Whether a type decided now stands: outside every quiet probe, or in an instance's re-check.
-export function stampsStand(): boolean { !inferQuiet || elabCapLive() }
+// Whether a type decided now stands: outside every quiet probe and every call's re-check of a
+// generic body's constraints, or in an instance's re-check.
+export function stampsStand(): boolean {
+  (!inferQuiet && !stampsHeld) || elabCapLive()
+}
+
+// Set while a call's argument types re-check a generic body's constraints: one call decides no
+// build type for a node every instance shares (D14721).
+export let stampsHeld = false
+
+export function stampsHeldSet(v: boolean) { stampsHeld = v }
 
 // Opens recording at quiet depth `depth` with empty tables.
 export function elabCapBegin(depth: i32) {
@@ -114,6 +130,7 @@ export function elabCapBegin(depth: i32) {
   elabCapTy = Map()
   elabCapRep = Map()
   elabCapRepUnion = Map()
+  elabCapCtx = Map()
   elabCapNarrowed = Map()
   elabCapDead = 0
   elabCapDeadIx = Map()
@@ -292,6 +309,9 @@ export function elabNestNote(
   for p in paramTys {
     if p >= 0 && p < T.tys.length && tyHasTyVar(p) { open = true }
   }
+  // A closed declaration in an open encloser reads the encloser's open captures (D4046).
+  const es = if enclDecl >= 0 && enclDecl < P.nodes.length { nodeTyIxOf(enclDecl) } else { -1 }
+  if es >= 0 && es < T.tys.length && tyHasTyVar(es) { open = true }
   if !open { return 0 }
   const key = elabSnapKey(if live { elabCapKey } else { -1 }, decl)
   const slots: i32[] = []
@@ -458,6 +478,35 @@ export function elabValueRowNote(d: i32, names: string[], tys: i32[]) {
   elabHoleRowN.push(names.slice(0, names.length))
   elabHoleRowT.push(tys.slice(0, tys.length))
   0
+}
+
+// The rows `elabValueRowNote` banked for a call that leaves a type parameter at the D4551 default
+// `i32`: an instance only such a row asks for is a guess, since the default is no binding.
+export let elabDefaultRowDecl: i32[] = []
+export let elabDefaultRowT: i32[][] = []
+
+export function elabDefaultRowNote(d: i32, tys: i32[]) {
+  elabDefaultRowDecl.push(d)
+  elabDefaultRowT.push(tys.slice(0, tys.length))
+  0
+}
+
+// Whether `d` at `tys` is a row `elabDefaultRowNote` banked.
+export function elabDefaultRowHas(d: i32, tys: i32[]): boolean {
+  let r = 0
+  while r < elabDefaultRowDecl.length {
+    if elabDefaultRowDecl[r] == d && elabDefaultRowT[r].length == tys.length {
+      let same = true
+      let i = 0
+      while same && i < tys.length {
+        if !tySame(elabDefaultRowT[r][i], tys[i]) { same = false }
+        i = i + 1
+      }
+      if same { return true }
+    }
+    r = r + 1
+  }
+  false
 }
 
 // Whether `t` is a closed, fully resolved type: no type variable and no pending return anywhere.
@@ -700,6 +749,32 @@ export function elabFnJoinTy(j: i32, a: i32, b: i32): i32 {
   fresh
 }
 
+// `elabFnJoinTy` for list element types: a join `j` of lists `a` and `b` whose leaves are
+// functions takes the union of the leaves' sets at every depth, so a list of inner lists of
+// fewer members holds the whole set. `j` when neither side's leaf carries a set.
+export function elabFnJoinListTy(j: i32, a: i32, b: i32): i32 {
+  if (
+    j < 0
+    || j >= T.tys.length
+    || a < 0
+    || a >= T.tys.length
+    || b < 0
+    || b >= T.tys.length
+  ) {
+    return j
+  }
+  const jl = T.tys[j]
+  const al = T.tys[a]
+  const bl = T.tys[b]
+  if !(jl is TyArray) || !(al is TyArray) || !(bl is TyArray) { return j }
+  const je = jl.aElem
+  if je < 0 || je >= T.tys.length { return j }
+  const jt = T.tys[je]
+  const ne = if jt is TyArray { elabFnJoinListTy(je, al.aElem, bl.aElem) } else { elabFnJoinTy(je, al.aElem, bl.aElem) }
+  if ne == je { return j }
+  mkArrayTy(ne)
+}
+
 // The set of every function the `let` node `bd` may hold: its initialiser and each value its
 // own scope writes to it, read from the source; -1 when one is not a function.
 function fnLetSetOf(bd: i32): i32 {
@@ -815,7 +890,7 @@ export function elabFnListLetTy(bd: i32, t: i32): i32 {
   const s = elabFnSetTy[e] ?? -1
   if s < 0 { return t }
   const w = fnSlotSetOf(bd)
-  if w < 0 || w == s || fnSetHasGeneric(s) || fnSetHasGeneric(w) { return t }
+  if w < 0 || w == s { return t }
   const u = fnSetIntern(fnSetUnion(s, w))
   if u == s { return t }
   const key = "list" + i32ToStr(bd) + "," + i32ToStr(t)
@@ -1245,6 +1320,22 @@ function elabHoleRowsKeepStable() {
   elabHoleRowEpoch = e
   elabHoleRowN = n
   elabHoleRowT = t
+  const dd: i32[] = []
+  const dt: i32[][] = []
+  r = 0
+  while r < elabDefaultRowDecl.length {
+    let stable = true
+    for x in elabDefaultRowT[r] {
+      if x < 0 || x >= base { stable = false }
+    }
+    if stable {
+      dd.push(elabDefaultRowDecl[r])
+      dt.push(elabDefaultRowT[r])
+    }
+    r = r + 1
+  }
+  elabDefaultRowDecl = dd
+  elabDefaultRowT = dt
   0
 }
 
@@ -1360,22 +1451,23 @@ export function fnTagMembers(s: i32): i32[] {
   fnSets[s]
 }
 
-// Whether type `t` is a list of a tagged set's ids, whose cell is the i32 list.
+// Whether type `t` is a list of a tagged set's ids, whose cell is the i32 list, or a list of such
+// lists.
 export function fnTagListTy(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   const a = T.tys[t]
-  if a is TyArray { return fnTagTyIsTagged(a.aElem) }
+  if a is TyArray { return fnTagTyIsTagged(a.aElem) || fnTagListTy(a.aElem) }
   false
 }
 
-// Whether type `t` holds a tagged set's ids: such a list or map, or a record with a field that is one
-// or holds one, at most `depth` records deep.
+// Whether type `t` holds a tagged set's ids: such a list or map, a list of such lists, or a record
+// with a field that is one or holds one, at most `depth` levels deep.
 export function fnTagHoldsTy(t: i32, depth: i32): boolean {
   if depth <= 0 || t < 0 || t >= T.tys.length { return false }
   const o = T.tys[t]
   match o {
     TyArray => {
-      return fnTagTyIsTagged(o.aElem)
+      return fnTagTyIsTagged(o.aElem) || fnTagHoldsTy(o.aElem, depth - 1)
     }
     TyObj => {
       for f in o.objFieldTypes {
@@ -1395,6 +1487,17 @@ export function fnTagHoldsTy(t: i32, depth: i32): boolean {
 
 // Whether set `s` is tagged.
 export function fnTagSetIsTagged(s: i32): boolean { fnTagged[s] ?? false }
+
+// The tagged sets' ids, ascending.
+export function fnTagTaggedSets(): i32[] {
+  const r: i32[] = []
+  let s = 0
+  while s < fnSets.length {
+    if fnTagged[s] ?? false { r.push(s) }
+    s = s + 1
+  }
+  r
+}
 
 // The member whose id leaf node `ix` emits, or -1.
 export function fnTagLeafId(ix: i32): i32 {
@@ -1506,6 +1609,8 @@ export function elabCapReset() {
   elabHoleRowDecl = []
   elabHoleRowFrom = []
   elabHoleRowEpoch = []
+  elabDefaultRowDecl = []
+  elabDefaultRowT = []
   elabPinBindN = []
   elabPinBindT = []
   elabHoleRowN = []
@@ -1531,4 +1636,29 @@ export function elabCapReset() {
   fnTagArms = Map()
   fnTagArmsBy = Map()
   0
+}
+
+// Whether parameter `i` of `f` is annotated by one of `f`'s own type parameters that no other
+// parameter and no return annotation names, so the instance binds it as it binds a hole.
+export function fnTagOwnTyParamAlone(f: FuncDecl, i: i32): boolean {
+  const pn = nodeAt(f.fnParams[i])
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const tn = nodeAt(pn.parType)
+  if !(tn is TypeRef) || !strListHas(f.fnTyParams, tn.tyName) { return false }
+  const nm: string[] = [tn.tyName]
+  if f.fnRet >= 0 && tsMentionsAnyName(annTsOf(f.fnRet), nm) { return false }
+  let k = 0
+  while k < f.fnParams.length {
+    const q = nodeAt(f.fnParams[k])
+    if (
+      k != i
+      && q is Param
+      && q.parType >= 0
+      && tsMentionsAnyName(annTsOf(q.parType), nm)
+    ) {
+      return false
+    }
+    k = k + 1
+  }
+  true
 }

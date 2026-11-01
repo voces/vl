@@ -745,16 +745,21 @@ const CASES: Case[] = [
     want: "ambient",
   },
   {
-    // The arena half then stands alone, so the mask drops it too.
+    // Both checks now build the binding at the wider record, so the mask's witness is the
+    // `J | string` case below.
     name: "a literal an inferred builder returns declines beside a record of its storage",
     graph: { "main.vl": BUILT_MAIN, "lib.vl": BUILT_LIB("{ f: 4 }") },
     target: "lib.vl",
     want: "ambient",
-    mask: NO_ARENA | LOOSE_SETTLED,
   },
   {
     name: "a literal a builder hands to a generic call declines beside a record of its storage",
-    graph: { "main.vl": BUILT_MAIN, "lib.vl": BUILT_LIB("id({ f: 4 })") },
+    graph: {
+      "main.vl": BUILT_MAIN,
+      "lib.vl": "type J = { f: f64 }\nfunction id<T>(v: T): T { v }\nfunction mk() { id({ f: 4 }) }\n" +
+        "export function jj(): void {\n  const xj: J | string = mk()\n  const kk = mk()\n" +
+        "  if xj is J { print(xj.f) }\n  print([kk][0].f)\n}\n",
+    },
     target: "lib.vl",
     want: "ambient",
     mask: NO_ARENA | LOOSE_ARGS,

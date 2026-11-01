@@ -115,7 +115,11 @@ Deno.test("displayable-type: absence markers are filtered, elision is not", () =
     assertEquals(isDisplayableType(s), true, `present ${s}`);
   }
   // The hover-chain filter maps undisplayable → undefined so the caller falls through.
-  assertEquals(displayableType("(<error>) => string"), undefined, "chain drops");
+  assertEquals(
+    displayableType("(<error>) => string"),
+    undefined,
+    "chain drops",
+  );
   assertEquals(displayableType("i32"), "i32", "chain keeps");
   assertEquals(displayableType(undefined), undefined, "chain passes undefined");
 });
@@ -155,11 +159,19 @@ print(foobar({ bar: "okie" }))
   // The annotation does not resolve (`any` is not a VL type), so the checker
   // types the parameter `TyErr`. Hover used to read `(<error>) => string`; it is
   // now suppressed rather than printing a type VL does not have.
-  assertEquals(await hoverAtFnName(checker, src), undefined, "hover suppressed");
+  assertEquals(
+    await hoverAtFnName(checker, src),
+    undefined,
+    "hover suppressed",
+  );
 
   // Whatever labels DO survive must be spellable — no `<error>`/`<?>`.
   for (const label of await inlayLabels(checker, src)) {
-    assertEquals(isDisplayableType(label.slice(2)), true, `inlay label ${label}`);
+    assertEquals(
+      isDisplayableType(label.slice(2)),
+      true,
+      `inlay label ${label}`,
+    );
   }
 
   // The defect is diagnosed to the user by the checker, not by a bogus type.
@@ -193,12 +205,19 @@ print(1)
   const shapes: [string, string][] = [
     ["v: any", `function f(v: any) ${body}`],
     ["v: {bar: any}", `function f(v: {bar: any}) ${body}`],
-    ["v: {foo: string} | {bar: any}", `function f(v: {foo: string} | {bar: any}) ${body}`],
+    [
+      "v: {foo: string} | {bar: any}",
+      `function f(v: {foo: string} | {bar: any}) ${body}`,
+    ],
   ];
   for (const [name, src] of shapes) {
     assertEquals(await hoverAtFnName(checker, src), undefined, `hover ${name}`);
     for (const label of await inlayLabels(checker, src)) {
-      assertEquals(isDisplayableType(label.slice(2)), true, `${name} label ${label}`);
+      assertEquals(
+        isDisplayableType(label.slice(2)),
+        true,
+        `${name} label ${label}`,
+      );
     }
     // Both diagnostics survive at every nesting depth.
     const diags = await checker.check(src, "/tmp/x.vl", noSiblings);
@@ -210,7 +229,8 @@ print(1)
 // against an IDENTICAL annotation. Not a fix — a pin on the real cause, so the
 // filed producer-side diff is measured against the right thing.
 Deno.test({
-  name: "undisplayable: the `is` guard, not nesting, drops the second diagnostic",
+  name:
+    "undisplayable: the `is` guard, not nesting, drops the second diagnostic",
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
@@ -219,7 +239,9 @@ Deno.test({
     (await checker.check(src, "/tmp/x.vl", noSiblings)).map((d) => d.message);
 
   assertEquals(
-    await msgs(`${ann} {\n  if true { return v.foo }\n  return v.bar\n}\nprint(1)\n`),
+    await msgs(
+      `${ann} {\n  if true { return v.foo }\n  return v.bar\n}\nprint(1)\n`,
+    ),
     [
       "unknown type 'any' within '{foo:string}|{bar:any}'",
       "cannot infer a return type for 'f' — annotate a return type",
@@ -239,13 +261,15 @@ Deno.test({
 // One variable changes per control; each asserts a hint that must NOT vanish.
 
 Deno.test({
-  name: "control: healthy code keeps its hints (resolvable union, T|T, all-annotated)",
+  name:
+    "control: healthy code keeps its hints (resolvable union, T|T, all-annotated)",
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
 
   // A genuinely resolvable union return still renders, unchanged.
-  const unionSrc = `function f(b: boolean) {\n  if b { return "s" }\n  return 1\n}\nprint(1)\n`;
+  const unionSrc =
+    `function f(b: boolean) {\n  if b { return "s" }\n  return 1\n}\nprint(1)\n`;
   assertEquals(
     await inlayLabels(checker, unionSrc),
     [": string | i32"],
@@ -261,7 +285,11 @@ Deno.test({
   // still compiles — `T | T` dedup is not the defect.
   const dupSrc =
     `function f(b: boolean) {\n  if b { return "a" }\n  return "b"\n}\nprint(f(true))\n`;
-  assertEquals(await inlayLabels(checker, dupSrc), [": string"], "T|T collapses");
+  assertEquals(
+    await inlayLabels(checker, dupSrc),
+    [": string"],
+    "T|T collapses",
+  );
   assertEquals(
     (await checker.check(dupSrc, "/tmp/x.vl", noSiblings)).length,
     0,
@@ -270,8 +298,13 @@ Deno.test({
 
   // A function whose parameters all resolve: the return hint survives, and the
   // annotated params produce none (the pre-existing rule).
-  const addSrc = `function add(a: i32, b: i32) {\n  return a + b\n}\nprint(add(1,2))\n`;
-  assertEquals(await inlayLabels(checker, addSrc), [": i32"], "all-resolving params");
+  const addSrc =
+    `function add(a: i32, b: i32) {\n  return a + b\n}\nprint(add(1,2))\n`;
+  assertEquals(
+    await inlayLabels(checker, addSrc),
+    [": i32"],
+    "all-resolving params",
+  );
   assertEquals(
     await hoverAtFnName(checker, addSrc),
     "(a: i32, b: i32) => i32",
@@ -293,7 +326,8 @@ Deno.test({
 // 36 that went are exactly `_ | _` (35) and `_ | _ | _` (1). No hint
 // was added and no surviving hint changed.
 Deno.test({
-  name: "control: an all-hole union offers no hint, but a hole-BEARING type still does",
+  name:
+    "control: an all-hole union offers no hint, but a hole-BEARING type still does",
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
@@ -344,77 +378,10 @@ Deno.test({
   }
 });
 
-// A hint must not vanish on healthy code. Sweep the whole corpus: assert the
-// filter removes hints ONLY on files that carry an error-tier diagnostic, with
-// the one measured exception below.
-Deno.test({
-  name: "control: the filter removes no hint from a diagnostic-free file (corpus sweep)",
-  ignore,
-}, async () => {
-  const checker = loadWasmChecker(SEED, () => {})!;
-  const root = filePath(new URL("./cases/", import.meta.url));
-
-  // NO EXCEPTIONS, and the empty set is the assertion. The filter drops a hint only
-  // on a file that carries an error diagnostic; a diagnostic-free file keeps every
-  // hint it has. The two files that used to sit here — `types/infer-null-
-  // unconstrained.vl` (`let _x = null`) and `arrays/lambda-empty-array-literal-
-  // return.vl` (`const fu = () => { return [] }`) — are clean programs whose
-  // inferred types have an UNDETERMINED component, and the producer now renders that
-  // component as the blank `_` (`: _ | null`, `: () => _[]`) instead of an
-  // angle-bracket absence token. A blank-bearing rendering still names the shape
-  // around the blank, so it is displayable and the hints survive, which is why this
-  // list is empty rather than why the filter got weaker. Keep it empty: a name
-  // appearing here again means a producer started emitting an absence token on
-  // correct code, and that is the defect, not the exception.
-  const KNOWN_CLEAN_DROPS = new Set<string>([]);
-
-  const files: string[] = [];
-  for await (const dir of Deno.readDir(root)) {
-    if (!dir.isDirectory) continue;
-    for await (const f of Deno.readDir(`${root}${dir.name}`)) {
-      if (f.isFile && f.name.endsWith(".vl")) files.push(`${dir.name}/${f.name}`);
-    }
-  }
-  files.sort();
-  if (files.length < 1000) {
-    throw new Error(`corpus sweep found only ${files.length} files — harness bug`);
-  }
-
-  const unexpected: string[] = [];
-  let scanned = 0, dropsOnClean = 0, dropsOnErrored = 0;
-  for (const rel of files) {
-    const src = await Deno.readTextFile(`${root}${rel}`);
-    let cands, diags;
-    try {
-      cands = await checker.inlayHintsAt(src, `${root}${rel}`, noSiblings);
-      diags = await checker.check(src, `${root}${rel}`, noSiblings);
-    } catch {
-      continue;
-    }
-    scanned++;
-    // How many candidates the displayable filter removes, independent of the
-    // annotation/range filters that were always there.
-    const dropped = cands.filter((c) => !isDisplayableType(c.type)).length;
-    if (dropped === 0) continue;
-    if (diags.some((d) => d.severity === "error")) dropsOnErrored += dropped;
-    else {
-      dropsOnClean += dropped;
-      if (!KNOWN_CLEAN_DROPS.has(rel)) unexpected.push(`${rel} (${dropped})`);
-    }
-  }
-
-  if (scanned < 1000) {
-    throw new Error(`only ${scanned} files checked out — harness bug`);
-  }
-  assertEquals(unexpected, [], "hints removed from diagnostic-free files");
-  assertEquals(dropsOnClean, KNOWN_CLEAN_DROPS.size, "exactly the known clean drops");
-  // With the clean side at zero, the ERRORED side is what keeps this sweep from
-  // passing vacuously: a harness that silently stops producing candidates, or a
-  // filter that stops filtering, fails here instead of reporting a clean zero.
-  if (dropsOnErrored < 1) {
-    throw new Error("the filter dropped nothing on any errored file — harness bug");
-  }
-});
+// A hint must not vanish on healthy code: the corpus oracle holds that, for every
+// `tests/cases` program the checker accepts (`hintsOfCase`, tests/support/casesWasmOracle.ts).
+// It walked the corpus here once more, re-checking each file, until the kill matrix measured
+// the walk as the oracle's own (docs/internals/testing-strategy.md).
 
 // The completion detail reads the same `tyToStr` output as hover and the inlay
 // label, so it takes the same filter — a binding whose type didn't resolve offers
@@ -427,7 +394,9 @@ Deno.test({
   const src = `function f(v: any) {\n  return v.foo\n}\nprint(1)\n`;
   const binds = await checker.scopeAt(src, "/tmp/x.vl", noSiblings, 3, 0);
   // The binding IS offered (completion still works) but carries no bogus detail.
-  const fEntry = scopeCompletionsFromBindings(binds).find((c) => c.name === "f");
+  const fEntry = scopeCompletionsFromBindings(binds).find((c) =>
+    c.name === "f"
+  );
   if (fEntry === undefined) {
     throw new Error(`expected an 'f' completion; got ${JSON.stringify(binds)}`);
   }
@@ -435,7 +404,9 @@ Deno.test({
   // Control: a resolving function DOES carry its detail.
   const okSrc = `function g(a: i32) {\n  return a\n}\nprint(1)\n`;
   const okBinds = await checker.scopeAt(okSrc, "/tmp/x.vl", noSiblings, 3, 0);
-  const gEntry = scopeCompletionsFromBindings(okBinds).find((c) => c.name === "g");
+  const gEntry = scopeCompletionsFromBindings(okBinds).find((c) =>
+    c.name === "g"
+  );
   assertEquals(gEntry?.detail, "(i32) => i32", "healthy detail survives");
 });
 
@@ -456,7 +427,9 @@ f()
 print(mk().length)
 `;
   const hover = async (line: number, col: number) =>
-    displayableType(await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, line, col));
+    displayableType(
+      await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, line, col),
+    );
   assertEquals(await hover(3, 8), "_[] | null", "binding hover");
   assertEquals(await hover(1, 10), "() => _[]", "function hover");
   const diags = await checker.check(src, "/tmp/x.vl", noSiblings);

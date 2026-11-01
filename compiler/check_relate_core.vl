@@ -22,7 +22,6 @@ import {
 } from "./check_elab_cap"
 import { declTyOf, identTyOf } from "./check_nar_store"
 import { identDepthOf, identFnDeclOf } from "./check_scopes"
-import { mintFactNote, mintScopeAt } from "./check_mint"
 import {
   ArrayLit,
   BinExpr,
@@ -357,7 +356,6 @@ import {
   argPinNode,
   argPinWant,
   cstrOwnedBy,
-  joinClashMsg,
   joinClashMsgSet,
   shMemo,
   shMemoPut,
@@ -763,8 +761,16 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
             constrainEmptyD(s.mVal, d.mVal, depth - 1)
           }
         }
-        // A map pins only into a map.
-        TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyArray | TyVar | TyLit | TyNeg => {}
+        // An open map or set delivered to a union is built as its one member of the same kind,
+        // the arm a fresh `Map()` is pinned to at a binding (D2649).
+        TyUnion => {
+          if s.mKey < 0 || s.mVal < 0 {
+            const arm = unionMapArmOf(d, s.mSet)
+            if arm >= 0 { return constrainEmptyD(srcTy, arm, depth - 1) }
+          }
+        }
+        // A map pins only into a map, or into a union's one map member.
+        TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyVar | TyLit | TyNeg => {}
       }
       return 0
     }
@@ -805,10 +811,35 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
       }
       return 0
     }
+    // A union source pins each member that carries an open map, as that member alone would.
+    TyUnion => {
+      for m in s.uMembers {
+        if m >= 0 && m < T.tys.length && tyAt(m) is TyMap {
+          constrainEmptyD(m, dstTy, depth - 1)
+        }
+      }
+    }
     // No other source carries an open hole to pin.
-    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {}
+    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {}
   }
   0
+}
+
+// The one member of union `u` that is a map whose set flag is `mSet`, looking through `| null`;
+// -1 where there is none or more than one.
+function unionMapArmOf(u: TyUnion, mSet: i32): i32 {
+  let arm = -1
+  for m0 in u.uMembers {
+    const m = nonNullTy(m0)
+    if m >= 0 && m < T.tys.length {
+      const mt = tyAt(m)
+      if mt is TyMap && mt.mSet == mSet {
+        if arm >= 0 { return -1 }
+        arm = m
+      }
+    }
+  }
+  arm
 }
 
 // Whether a value typed `rt` may be a `te`: `rt` or one of its members overlaps `te`.
@@ -2253,18 +2284,6 @@ function refoldJoinUnion(
   res
 }
 
-// `refoldJoinUnion`'s re-join of deferred join `tyIx` at member types `subst`, every member live:
-// what a hole instance's join reads as once each member is read at its bindings. -1 where the
-// members clash. Reads, noting no pin (D2921).
-export function holeJoinRefoldOf(tyIx: i32, subst: i32[]): i32 {
-  if !isJoinHoleUnion(tyIx) { return -1 }
-  const savedClash = joinClashMsg
-  const res = refoldJoinLive(tyIx, subst, [], [], [])
-  joinClashMsgSet(savedClash)
-  if res == TY_ERR { return -1 }
-  res
-}
-
 // The re-join of `subst`'s members `orig` does not prove dead at `bNames`/`bTys` (every member,
 // where `orig` is empty); -1 when none is live.
 function refoldJoinLive(
@@ -2327,6 +2346,25 @@ function binCstrsHold(bNames: string[], bTys: i32[], calleeFn: i32) {
   true
 }
 
+// The declarations a function value of type `t` may be, when it carries a set and every member
+// is a declared generic; [] otherwise.
+function genericSetMembers(t: i32): i32[] {
+  const none: i32[] = []
+  const ms = elabFnSetOf(t)
+  for m in ms {
+    const f = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { nodeAt(0) }
+    if (
+      m < 0
+      || m >= P.nodes.length
+      || !(f is FuncDecl)
+      || f.fnTyParams.length == 0
+    ) {
+      return none
+    }
+  }
+  ms
+}
+
 // Is a generic function value of type `srcTy` (hole params or return) assignable to the concrete
 // function type `dstTy`? Instantiate it at `dstTy`'s param types, require the body's capability to
 // hold there and the substituted return to match — the per-call-site instantiation driven by the
@@ -2347,9 +2385,15 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
         if !fnSlotAssignable(dp[i], sp[i]) { return false }
         i = i + 1
       }
-      // -1: a function value names no declaration here, so every constraint is still consulted —
-      // `cstrOwnedBy`'s unknown-callee fallback, rather than guessing an owner from a `TyFunc`.
-      if !binCstrsHold(bNames, bTys, CSTR_ANYFN) { return false }
+      // A value of a set of declared generics holds each member's own constraints; any other
+      // names no declaration, so every constraint is consulted (`cstrOwnedBy`'s fallback).
+      const gms = genericSetMembers(srcTy)
+      if gms.length == 0 && !binCstrsHold(bNames, bTys, CSTR_ANYFN) {
+        return false
+      }
+      for gm in gms {
+        if !binCstrsHold(bNames, bTys, gm) { return false }
+      }
       if !argCstrsHold(bNames, bTys) { return false }
       // No `retCstrsHold` rung: a function value names no declaration, so `cstrOwnedBy` would put
       // every generic's return constraint in scope and refuse unrelated instantiations by name.
@@ -3638,6 +3682,25 @@ function assignableUnionSrc(members: i32[], dst: i32): boolean {
   ok
 }
 
+// A union source `members` fits nullable target `dst`, inner `inner`: a `null` or nullable member
+// (`(boolean | null) | f64`) against `dst` itself, every other one against `inner`.
+function assignableUnionToNullable(
+  members: i32[],
+  dst: i32,
+  inner: i32,
+): boolean {
+  const rest: i32[] = []
+  for m in members {
+    if m == TY_NULL || (m >= 0 && tyAt(m) is TyNullable) {
+      if !assignable(m, dst) { return false }
+    } else {
+      rest.push(m)
+    }
+  }
+  if rest.length == 0 { return true }
+  assignableUnionSrc(rest, inner)
+}
+
 // True when `src` is assignable to at least one of a union target's `members`.
 function assignableToSomeMember(src: i32, members: i32[]): boolean {
   let i = 0
@@ -3670,6 +3733,9 @@ function assignableGo(src: i32, dst: i32) {
   if d is TyNullable {
     if src == TY_NULL { return true }
     if s is TyNullable { return assignable(s.nInner, d.nInner) }
+    if s is TyUnion {
+      return assignableUnionToNullable(s.uMembers, dst, d.nInner)
+    }
     return assignable(src, d.nInner)
   }
   // A nullable source is not assignable to a non-nullable target unless the target already
@@ -4558,7 +4624,6 @@ function holeCallNodeTy(
   if n is Call && holeParamIndexOfCall(n, vNames, calleeFn) >= 0 {
     const inst = holeCallInstOf(ix, vNames, vTys, calleeFn, depth)
     if inst < 0 { return -1 }
-    mintCallNote(ix, n, vNames, vTys, calleeFn, inst)
     const f = tyAt(inst)
     if f is TyFunc { return f.fnRet }
     return -1
@@ -4580,64 +4645,6 @@ function holeCallNodeTy(
   const t = substTyDeep(nodeTyOf(ix), vNames, vTys)
   if t < 0 || tyHasTyVar(t) || tyIsDeferredJoin(t) { return -1 }
   t
-}
-
-// Whether `mintCallNote` is typing a set's members, whose own calls it does not record.
-let mintNoting = false
-
-// Records call `ix` of a hole parameter of `calleeFn`, typed at `vNames`/`vTys` with instance
-// type `inst`, when that parameter is bound to a function set: the fact `holeSetCallRet` notes
-// for a call outside an instance, kept by instance (`check_mint`, D14430).
-function mintCallNote(
-  ix: i32,
-  n: Call,
-  vNames: string[],
-  vTys: i32[],
-  calleeFn: i32,
-  inst: i32,
-) {
-  if mintNoting { return 0 }
-  const k = holeParamIndexOfCall(n, vNames, calleeFn)
-  if k < 0 || k >= vTys.length { return 0 }
-  const s = fnTagSetOfTy(vTys[k])
-  const ds = fnTagMembers(s)
-  if ds.length == 0 { return 0 }
-  for d in ds {
-    if !setMemberDecl(d) { return 0 }
-  }
-  const f = tyAt(inst)
-  if !(f is TyFunc) { return 0 }
-  const wp: i32[] = []
-  let key = ""
-  for pt in f.fnParamTypes {
-    const w = widenLitTy(pt)
-    wp.push(w)
-    key = key + tyToStr(w) + ","
-  }
-  mintNoting = true
-  const ft = mkFuncTy(wp, TY_I32)
-  const rs: i32[] = []
-  let split = false
-  let open = false
-  for d in ds {
-    const rd = setMemberRetAt(d, ft)
-    if rd < 0 || tyHasTyVar(rd) {
-      open = true
-    } else {
-      const w = widenLitTy(rd)
-      if rs.length > 0 && !tySame(w, rs[0]) { split = true }
-      rs.push(w)
-    }
-  }
-  mintNoting = false
-  if open { return 0 }
-  let bk = ""
-  let i = 0
-  while i < vNames.length && i < vTys.length {
-    bk = bk + vNames[i] + "=" + tyToStr(vTys[i]) + ";"
-    i = i + 1
-  }
-  mintFactNote(mintScopeAt(calleeFn, bk, vNames, vTys), ix, s, key, split, rs)
 }
 
 // The result of direct call `n` of un-annotated function `decl` as its body gives it at the bound
@@ -4736,6 +4743,26 @@ export function holeFnArgDecls(a: i32): i32[] {
     }
   }
   ts
+}
+
+// Whether the name `a` reads a re-pointed `let` holding two or more functions, some generic, each
+// a function `holeLetJudge` can call at closed parameter types (D12214).
+export function holeLetHoldsGenerics(a: i32): boolean {
+  const ix = parenPeelIx(a)
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return false }
+  cwIxWant()
+  if !cwFramedNode(ix) || cwKeyOfRoot(ix) < 0 { return false }
+  const ts = cwFnValueTargets(cwBindingOf(ix))
+  if ts.length < 2 { return false }
+  let gen = false
+  for t in ts {
+    const f = nodeAt(t)
+    if !(f is FuncDecl) || (!directHoleDecl(t) && f.fnTyParams.length == 0) {
+      return false
+    }
+    if f.fnTyParams.length > 0 { gen = true }
+  }
+  gen
 }
 
 // Refuses, at its write, a function a re-pointed `let` the value `a` may be read from may hold
@@ -5061,8 +5088,24 @@ function setMemberRetAt(d: i32, ft: i32): i32 {
   const noN: string[] = []
   const noT: i32[] = []
   const f = nodeAt(d)
-  if !(f is FuncDecl) || f.fnRet < 0 { return holeLamRetAt(d, ft, noN, noT) }
   const sig = nodeTyOf(d)
+  if !(f is FuncDecl) || f.fnRet < 0 {
+    const r = holeLamRetAt(d, ft, noN, noT)
+    // A body that yields no value returns nothing at every binding, which its signature says.
+    if r < 0 && sig >= 0 && sig < T.tys.length {
+      const sf = tyAt(sig)
+      const pc = tyAt(ft)
+      if (
+        sf is TyFunc
+        && pc is TyFunc
+        && sf.fnRet == TY_VOID
+        && sf.fnParamTypes.length == pc.fnParamTypes.length
+      ) {
+        return TY_VOID
+      }
+    }
+    return r
+  }
   if sig < 0 || sig >= T.tys.length || ft < 0 || ft >= T.tys.length {
     return -1
   }
@@ -5255,7 +5298,7 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
   if ds.length < 2 { return false }
   for d in ds {
     const f = nodeAt(d)
-    if !directHoleDecl(d) || !(f is FuncDecl) || f.fnTyParams.length > 0 {
+    if !(f is FuncDecl) || (!directHoleDecl(d) && f.fnTyParams.length == 0) {
       return false
     }
   }
@@ -7500,13 +7543,10 @@ export function bindGenInnerUnionArms(
       )
     }
     TyNullable => {
-      bindGenInnerUnionArms(
-        e.nInner,
-        tyNulInnerTy(atIx),
-        uNames,
-        uTys,
-        depth + 1,
-      )
+      // A non-null argument binds the inner type as it stands; `null` itself binds nothing.
+      let ai = tyNulInnerTy(atIx)
+      if ai < 0 && !isNullTy(atIx) && !(tyAt(atIx) is TyNullable) { ai = atIx }
+      bindGenInnerUnionArms(e.nInner, ai, uNames, uTys, depth + 1)
     }
     TyObj => {
       let i = 0
@@ -7896,6 +7936,21 @@ function substRejoinApart(
     ms = fallback
     fixed = []
     for _ in fallback { fixed.push(true) }
+  }
+  // Members still holes (a forwarder's own parameters) are not decided here: the join stays
+  // apart over them, and the instance that pins them re-joins it (D14734).
+  let holes = 0
+  const uniq: i32[] = []
+  for m in ms {
+    if tyIsHole(m) { holes = holes + 1 }
+    if !i32ListHas(uniq, m) { uniq.push(m) }
+  }
+  if holes > 0 && uniq.length > 1 {
+    const r = mkUnionTy(uniq)
+    // arena-tick exempt: a per-program mark on a fresh arena row.
+    tpJoinUnions[r] = tpJoinUnions.get(tyIx) ?? 1
+    if recorded { carryRetJoin(r, key, vals) }
+    return r
   }
   const tpSaved = tpApartConcrete
   tpApartConcreteSet(true)
@@ -8384,6 +8439,19 @@ function unionDeclCollapse(
   0
 }
 
+// The literals of the one member of `ms` when it is a homogeneous literal union, so an alias
+// whose body is one computed set (`K & !"lb"`) holds that set's literals, as its spelled form
+// `"la" | "lc"` does. False, leaving `out` untouched, for any other member list.
+function litUnionLoneMembers(ms: i32[], out: i32[]): boolean {
+  if ms.length != 1 || homogLitUnionBase(ms[0]) < 0 { return false }
+  const t = tyAt(ms[0])
+  if t is TyUnion {
+    for m in t.uMembers { out.push(m) }
+    return true
+  }
+  false
+}
+
 // Pushes a declared union's final members onto `members` (the `null` niche fold of `survU`,
 // else its literal-union flatten, else `survU` itself), and registers them as variants when
 // there are two or more: the flattened members, else the declared members `declU`.
@@ -8414,7 +8482,10 @@ function unionDeclFillMembers(
   if folded >= 0 {
     members.push(folded)
   } else {
-    if !sawNull { flattened = litUnionFlatMembers(survU, flatU) }
+    if !sawNull {
+      flattened = litUnionFlatMembers(survU, flatU)
+        || litUnionLoneMembers(survU, flatU)
+    }
     if flattened {
       let fi = 0
       while fi < flatU.length {

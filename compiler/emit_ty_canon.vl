@@ -13,10 +13,8 @@ import {
   Param,
   nodeAt,
 } from "./ast"
-import { holePinReadOf, joinPinnedArmLit } from "./check_emit_queries"
-import { isJoinHoleUnion } from "./check_core_state"
 import { nodeTyPinIxOf } from "./check_hole_pins"
-import { elabNodeTyAt } from "./emit_elab"
+import { elabInstTyAt, elabKeyAt, elabNodeTyAt } from "./emit_elab"
 import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { nodeTyIsNullable, nodeTyIxOf } from "./check_node_tys"
 import { cexLitPeel } from "./check_num_lits"
@@ -36,9 +34,6 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
-  mkArrayTy,
-  mkArrayViewTy,
-  mkNullableTyOf,
   nomNameOfTy,
   numLitUnionBaseName,
   primNameStr,
@@ -48,7 +43,6 @@ import {
   tyIsLitUnionOrLit,
   tyIsNullableLitUnion,
   tyPrimNameOf,
-  tySame,
   tyScalarBaseIs,
   tyToStr,
 } from "./check_types"
@@ -59,7 +53,7 @@ import {
   strLess,
   unwrapParen,
 } from "./emit_base"
-import { fnStmtsPosOf, nodeTyAt, readNarrowedTyAt } from "./emit_capture_frames"
+import { nodeTyAt, readNarrowedTyAt } from "./emit_capture_frames"
 import { vkListClass } from "./emit_list_rep"
 import { mvUnionIsScalarNull } from "./emit_map_value_slots"
 import { mapMonoShapeOfKey, mvSlotOfValTyK } from "./emit_mv_slots"
@@ -80,36 +74,17 @@ import {
   MVK_I64,
   MVK_UNION,
   VKind,
-  fnParent,
-  fnStmts,
   mTwinCodes,
   mTwinExtra,
   mTwinShapes,
   mTwinTys,
-  monoExactSubN,
-  monoExactSubOwn,
-  monoExactSubRow,
-  monoExactSubT,
-  monoHoleSubN,
-  monoHoleSubRow,
-  monoHoleSubT,
   monoParamPinTy,
-  monoPinSubN,
-  monoPinSubOwn,
-  monoPinSubRow,
-  monoPinSubT,
   mvValKind,
   uVarTyIx,
 } from "./emit_state"
 import { unMemIsMap, unMemPeelAliasWrapper } from "./emit_union_registry"
 import { i32ListHas } from "./listutil"
-import {
-  bindGenWalk,
-  holeJoinRefoldOf,
-  substTyDeep,
-  substTyDeepOf,
-  tyProvesNonNull,
-} from "./check_relate_core"
+import { bindGenWalk, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
   tyEmitPrimOf,
@@ -117,33 +92,11 @@ import {
   tyMapValOf,
 } from "./tyquery"
 
-// `t` through row `row` of `monoExactSubN`/`monoExactSubT`, at that row's owner (D9190).
-export function exactSubAt(t: i32, row: i32): i32 {
-  substTyDeepOf(t, monoExactSubN[row], monoExactSubT[row], monoExactSubOwn[row])
-}
-
-// `t` through row `row` of `monoPinSubN`/`monoPinSubT`, at that row's owner (D9190).
-export function pinSubAt(t: i32, row: i32): i32 {
-  substTyDeepOf(t, monoPinSubN[row], monoPinSubT[row], monoPinSubOwn[row])
-}
-
 // `ty` at the pin of the instance `fnIx` is, or is lifted inside: its type parameters or holes
 // bound to this instance's pins; -1 where one stays open.
 export function instanceTyOf(ty: i32, fnIx: i32): i32 {
   if ty < 0 || !tyHasTyVar(ty) { return ty }
-  const row = monoExactSubRowOf(fnIx)
-  if row >= 0 && row < monoExactSubN.length {
-    const st = exactSubAt(ty, row)
-    if st >= 0 && !tyHasTyVar(st) { return st }
-  }
-  const p = pinSubOperandTyOf(ty, fnIx)
-  if p >= 0 { return p }
-  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
-  const hrow = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
-  if hrow < 0 || hrow >= monoHoleSubN.length { return -1 }
-  const b = holePinReadOf(ty, monoHoleSubN[hrow], monoHoleSubT[hrow])
-  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
-  b
+  elabInstTyAt(ty, fnIx)
 }
 
 // Whether a `for` range's step is a constant the emitter FOLDS — absent (the implicit `+1`),
@@ -162,23 +115,17 @@ export function mapKeyElemVKind(sh: i32): VKind {
   "str"
 }
 
-// The arena-only twin of `mapReadScalarBoxKind` below: same question, answered from the
-// recorded types alone so it can run in passes with no enclosing function. A twin rather
-// than a default argument: `mapReadScalarBoxKind` resolves its receiver through the
-// function's locals, so a missing `fnIx` would silently answer "not a map read" everywhere.
-export function mapReadScalarBoxKindTy(exprIx: i32) {
+// The atom kind the scalar value of a fused map read (`m[k]` or `m.get(k)`) at `exprIx` boxes at
+// inside function `fnIx`, whose instance may pin the receiver; -1 for no such read, or a value
+// with a niche of its own.
+export function mapReadScalarBoxKindIn(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
-  mapRecvScalarBoxKindTy(fusedMapReadRecvIx(unwrapParen(exprIx)))
+  const recv = fusedMapReadRecvIx(unwrapParen(exprIx))
+  if recv < 0 { return -1 }
+  mapRecvScalarBoxKindIn(recv, fnIx)
 }
 
-// `mapReadScalarBoxKindTy` asked of the map RECEIVER: the atom kind its scalar value boxes at,
-// or -1 for a value with a niche of its own or no scalar rep.
-export function mapRecvScalarBoxKindTy(recvIx: i32) {
-  if recvIx < 0 { return -1 }
-  mapTyScalarBoxKind(nodeTyPinIxOf(recvIx))
-}
-
-// `mapRecvScalarBoxKindTy` inside function `fnIx`, whose instance may pin the receiver.
+// `mapReadScalarBoxKindIn` asked of the map receiver `recvIx`.
 export function mapRecvScalarBoxKindIn(recvIx: i32, fnIx: i32) {
   mapTyScalarBoxKind(mapRecvTyIn(recvIx, fnIx))
 }
@@ -193,7 +140,7 @@ export function mapRecvScalarKindInst(recvIx: i32, fnIx: i32) {
   mapTyScalarBoxKind(nodeTyInOf(r, fnIx))
 }
 
-// `mapRecvScalarBoxKindTy` of the map type `rt` itself.
+// The atom kind a read of map type `rt`'s scalar value boxes at; -1 for no map or a niche value.
 export function mapTyScalarBoxKind(rt: i32) {
   if rt < 0 || rt >= T.tys.length { return -1 }
   const r = tyAt(rt)
@@ -252,20 +199,7 @@ export function coalesceRetypedAtomToStr(exprIx: i32, fnIx: i32): boolean {
     return false
   }
   tyIsLitUnionOrLit(nodeTyAt(unwrapParen(e.binLeft), fnIx))
-    && tyPrimNameOf(nodeTyPinIxOf(exprIx)) == "string"
-}
-
-// The type an instance pins the `??` operand `lhsIx` to, when the generic body records it at
-// a type parameter; -1 otherwise.
-export function coalesceOperandPinTy(lhsIx: i32, fnIx: i32): i32 {
-  const h = holeOperandTyOf(lhsIx, fnIx)
-  if h >= 0 { return h }
-  const own = nodeTyIxOf(lhsIx)
-  if own < 0 || own >= T.tys.length { return -1 }
-  if !(tyAt(own) is TyVar) { return -1 }
-  const p = nodeTyPinIxOf(lhsIx)
-  if p == own { return -1 }
-  p
+    && tyPrimNameOf(nodeTyInOf(exprIx, fnIx)) == "string"
 }
 
 // Whether `ty` is `<prim> | null`.
@@ -809,7 +743,7 @@ export function pinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
   if n is Ident {
     if readNarrowedTyAt(ax, fnIx) >= 0 { return -1 }
     const ptn = paramTypeNodeOfRead(fnIx, ax)
-    if ptn >= 0 { return monoParamPinTy.get(ptn) ?? -1 }
+    if ptn >= 0 { return elabClosedTyAt(ax, fnIx) }
     if fnIx >= 0 {
       const fd = nodeAt(fnIx)
       if fd is FuncDecl {
@@ -830,146 +764,41 @@ export function pinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
 // checker typed once at its parameters and the emitter lowers at a pin.
 export function fnInPinnedInstance(fnIx: i32): boolean {
   if fnIx < 0 { return false }
-  let pos = fnStmtsPosOf(fnIx)
-  let guard = 0
-  while pos >= 0 && guard <= fnStmts.length {
-    if (monoExactSubRow.get(pos) ?? -1) >= 0 { return true }
-    if (monoPinSubRow.get(pos) ?? -1) >= 0 { return true }
-    if (monoHoleSubRow.get(pos) ?? -1) >= 0 { return true }
-    if pos >= fnParent.length { return false }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  false
+  elabKeyAt(fnIx) != -1
 }
 
-// The row of `monoExactSubN`/`monoExactSubT` binding the type parameters of the instance that
-// function `fnIx` is, or is lifted inside; -1 when that instance is shared between pins.
-export function monoExactSubRowOf(fnIx: i32): i32 {
-  if fnIx < 0 { return -1 }
-  let pos = fnStmtsPosOf(fnIx)
-  let guard = 0
-  while pos >= 0 && guard <= fnStmts.length {
-    const row = monoExactSubRow.get(pos) ?? -1
-    if row >= 0 { return row }
-    if pos >= fnParent.length { return -1 }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  -1
+// Node `ix`'s type at the instance `fnIx` as that instance's elaboration closes it; -1 where it
+// leaves the node open or `fnIx` is no instance.
+export function elabClosedTyAt(ix: i32, fnIx: i32): i32 {
+  if ix < 0 { return -1 }
+  const t = elabNodeTyAt(ix, fnIx)
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { -1 } else { t }
 }
 
-// `ty`, left open by the exact instance `fnIx` is, or is lifted inside, substituted through the
-// exact instances enclosing that one: a nested generic's instance binds its own parameters
-// only, and its enclosing instance binds the rest (D3831). -1 where one stays unbound.
-export function exactSubOuterTyOf(ty: i32, fnIx: i32): i32 {
-  let pos = fnStmtsPosOf(fnIx)
-  let guard = 0
-  let seen = false
-  let cur = ty
-  while pos >= 0 && guard <= fnStmts.length {
-    const row = monoExactSubRow.get(pos) ?? -1
-    if row >= 0 && row < monoExactSubN.length {
-      // The innermost row is the one the caller already applied.
-      if seen {
-        const st = exactSubAt(cur, row)
-        if st < 0 { return -1 }
-        if !tyHasTyVar(st) { return st }
-        cur = st
-      }
-      seen = true
-    }
-    if pos >= fnParent.length { return -1 }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  -1
-}
-
-// `ty` with the type parameters the instance `fnIx` is, or is lifted inside, binds to its
-// parameters' pins substituted; -1 outside one, or where one stays unbound.
-export function pinSubOperandTyOf(ty: i32, fnIx: i32): i32 {
-  if ty < 0 || monoPinSubN.length == 0 { return -1 }
-  let pos = fnStmtsPosOf(fnIx)
-  let guard = 0
-  let cur = ty
-  while pos >= 0 && guard <= fnStmts.length {
-    const row = monoPinSubRow.get(pos) ?? -1
-    if row >= 0 && row < monoPinSubN.length {
-      const st = pinSubAt(cur, row)
-      if st < 0 { return -1 }
-      if !tyHasTyVar(st) { return st }
-      // A nested generic's instance leaves its enclosing instance's parameters open (D3831).
-      cur = st
-    }
-    if pos >= fnParent.length { return -1 }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  -1
-}
-
-// `holeOperandTyOf` for a capture read in lambda `fnIx`, read at the hole instance it is
-// lifted inside; -1 where no enclosing function is one.
-export function holeCaptureTyOf(exprIx: i32, fnIx: i32): i32 {
-  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
-  const ty = nodeTyIxOf(unwrapParen(exprIx))
-  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyVar) { return -1 }
-  let pos = fnStmtsPosOf(fnIx)
-  let guard = 0
-  while pos >= 0 && pos < fnParent.length && guard <= fnStmts.length {
-    pos = fnParent[pos]
-    const row = monoHoleSubRow.get(pos) ?? -1
-    if row >= 0 && row < monoHoleSubN.length {
-      const b = holePinReadOf(ty, monoHoleSubN[row], monoHoleSubT[row])
-      if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
-      return b
-    }
-    guard = guard + 1
-  }
-  -1
-}
-
-// The type of `exprIx` inside the hole instance `fnIx` is: its recorded type is a hole's
-// variable, which that instance's elaboration closes, else its pin. A read, not a substitution,
-// which would bank pins. -1 anywhere else, including a lambda lifted inside the instance, which
-// may be shared (D2921).
+// The type of `exprIx` inside the hole instance `fnIx`, where its recorded type is a hole's
+// variable or a kept-apart join of holes: that instance's elaboration of it, which banks no
+// pin. -1 anywhere else, including a lambda lifted inside the instance, which may be shared
+// (D2921), and where the elaboration leaves it open.
 export function holeOperandTyOf(exprIx: i32, fnIx: i32): i32 {
-  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  if fnIx < 0 { return -1 }
   const ax = unwrapParen(exprIx)
   if ax < 0 { return -1 }
   const ty = nodeTyIxOf(ax)
   if ty < 0 || ty >= T.tys.length { return -1 }
-  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
-  if row < 0 || row >= monoHoleSubN.length { return -1 }
   const tu = tyAt(ty)
-  if tu is TyVar || (tu is TyUnion && tyIsTpJoinUnion(ty)) {
-    const e = elabNodeTyAt(ax, fnIx)
-    if e >= 0 { return e }
-  }
-  // A join of holes the checker kept apart reads as their one pin when every hole has it (D3520).
-  if tu is TyUnion && tyIsTpJoinUnion(ty) {
-    let one = -1
-    for m in tu.uMembers {
-      const mb = holePinReadOf(m, monoHoleSubN[row], monoHoleSubT[row])
-      if mb < 0 || mb >= T.tys.length || tyHasTyVar(mb) { return -1 }
-      if one >= 0 && mb != one && !tySame(mb, one) { return -1 }
-      one = mb
-    }
-    return one
-  }
-  if !(tu is TyVar) { return -1 }
-  const b = holePinReadOf(ty, monoHoleSubN[row], monoHoleSubT[row])
-  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
-  b
+  if !(tu is TyVar) && !(tu is TyUnion && tyIsTpJoinUnion(ty)) { return -1 }
+  const e = elabNodeTyAt(ax, fnIx)
+  if e < 0 || e >= T.tys.length || tyHasTyVar(e) { return -1 }
+  e
 }
 
-// The type of the `??` at `exprIx` inside `fnIx`: the hole instance's own reading of it first,
-// since two calls pinning the hole apart leave the program's bank with no one pin (D9914).
+// The type of the `??` at `exprIx` inside `fnIx`: its recorded type there, else, where that is
+// still open, the type its instance's elaboration gives it.
 export function coalResultTyOf(exprIx: i32, fnIx: i32): i32 {
-  const held = holeOperandTyOf(exprIx, fnIx)
-  if held >= 0 { return held }
-  nodeTyPinIxOf(unwrapParen(exprIx))
+  const rec = nodeTyAt(exprIx, fnIx)
+  if rec >= 0 && rec < T.tys.length && !tyHasTyVar(rec) { return rec }
+  const el = elabNodeTyAt(exprIx, fnIx)
+  if el >= 0 { el } else { rec }
 }
 
 // The map type receiver `recvIx` reads as inside function `fnIx`: its recorded type, else the
@@ -1003,122 +832,7 @@ export function nodeTyInOf(ix: i32, fnIx: i32): i32 {
 // variables only to types that are themselves open.
 export function instanceBindsNothingClosed(ty: i32, fnIx: i32): boolean {
   if fnIx < 0 { return true }
-  let pos = fnStmtsPosOf(fnIx)
-  let guard = 0
-  let cur = ty
-  let rows = 0
-  while pos >= 0 && guard <= fnStmts.length {
-    const pr = monoPinSubRow.get(pos) ?? -1
-    if pr >= 0 && pr < monoPinSubN.length {
-      rows = rows + 1
-      cur = pinSubAt(cur, pr)
-      if cur < 0 { return false }
-    }
-    const xr = monoExactSubRow.get(pos) ?? -1
-    if xr >= 0 && xr < monoExactSubN.length {
-      rows = rows + 1
-      cur = exactSubAt(cur, xr)
-      if cur < 0 { return false }
-    }
-    const hr = monoHoleSubRow.get(pos) ?? -1
-    if hr >= 0 && hr < monoHoleSubN.length {
-      rows = rows + 1
-      for b in monoHoleSubT[hr] {
-        if b >= 0 && b < T.tys.length && tyHasTyVar(b) { return true }
-      }
-      cur = substTyDeep(cur, monoHoleSubN[hr], monoHoleSubT[hr])
-      if cur < 0 { return false }
-    }
-    if pos >= fnParent.length { break }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  rows == 0 || (cur != ty && tyHasTyVar(cur))
-}
-
-// A list or nullable type `ty` over holes, read at the bindings of the hole instance `fnIx`:
-// each hole read as `holeOperandTyOf` reads a bare one, without banking a pin. -1 outside a
-// hole instance, for a bare hole, or where a hole stays unbound.
-export function holeCompositeTyOf(ty: i32, fnIx: i32): i32 {
-  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
-  if ty < 0 || ty >= T.tys.length || tyAt(ty) is TyVar { return -1 }
-  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
-  if row < 0 || row >= monoHoleSubN.length { return -1 }
-  holeTyRead(ty, monoHoleSubN[row], monoHoleSubT[row], 0)
-}
-
-// A record type `ty` over holes, substituted at the bindings of the hole instance `fnIx`; -1
-// outside a hole instance, for any other kind of type, or where a hole stays unbound.
-export function holeRecordTyOf(ty: i32, fnIx: i32): i32 {
-  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
-  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyObj) { return -1 }
-  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
-  if row < 0 || row >= monoHoleSubN.length { return -1 }
-  const st = substTyDeep(ty, monoHoleSubN[row], monoHoleSubT[row])
-  if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
-  st
-}
-
-// `holeCompositeTyOf`'s walk: `ty` with every hole replaced by its binding, -1 where one has
-// none or the type is a shape the walk does not rebuild.
-function holeTyRead(ty: i32, bNames: string[], bTys: i32[], depth: i32): i32 {
-  if ty < 0 || ty >= T.tys.length || depth > 8 { return -1 }
-  if !tyHasTyVar(ty) { return ty }
-  const t = tyAt(ty)
-  match t {
-    TyVar => {
-      const b = holePinReadOf(ty, bNames, bTys)
-      if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
-      return b
-    }
-    TyArray => {
-      const e = holeTyRead(t.aElem, bNames, bTys, depth + 1)
-      if e < 0 { return -1 }
-      if t.aRead == 1 { return mkArrayViewTy(e) }
-      return mkArrayTy(e)
-    }
-    TyNullable => {
-      const n = holeTyRead(t.nInner, bNames, bTys, depth + 1)
-      if n < 0 { return -1 }
-      return mkNullableTyOf(n)
-    }
-    TyUnion => {
-      // Members that all read as one type are that type; a deferred join re-joins as the
-      // checker re-folds it, and any other union is not rebuilt here.
-      let one = -1
-      let apart = false
-      const reads: i32[] = []
-      for m in t.uMembers {
-        const mb = holeTyRead(m, bNames, bTys, depth + 1)
-        if mb < 0 { return -1 }
-        if one >= 0 && mb != one && !tySame(mb, one) { apart = true }
-        one = mb
-        reads.push(mb)
-      }
-      if !apart { return one }
-      // A join the checker kept apart is its members' runtime join, as the instance's binding
-      // of it is annotated (D9632).
-      if tyIsTpJoinUnion(ty) && !isJoinHoleUnion(ty) {
-        const lits: boolean[] = []
-        for _r in reads { lits.push(false) }
-        const pj = joinPinnedArmLit(reads, lits)
-        if pj < 0 || pj >= T.tys.length || tyHasTyVar(pj) { return -1 }
-        return pj
-      }
-      const rj = holeJoinRefoldOf(ty, reads)
-      if rj < 0 || rj >= T.tys.length || tyHasTyVar(rj) { return -1 }
-      return rj
-    }
-    TyObj | TyMap | TyFunc | TyNeg => {
-      // A record, map, function or negated type is not rebuilt here: the caller asks its next
-      // reader.
-      return -1
-    }
-    TyPrim | TyLit | TyErr => {
-      // Holds no hole, so `tyHasTyVar` answered above.
-      return ty
-    }
-  }
+  elabInstTyAt(ty, fnIx) < 0
 }
 
 // The checked-rep column read inside function `fnIx`: node `ix`'s rep at the type its instance
@@ -1195,33 +909,9 @@ export function valueJoinArmValues(ix: i32): i32[] {
   arms
 }
 
-// A callback's declared return `at` at the pin of the instance `fnIx`: itself when it names no
-// type parameter, else its substitution by the instance's exact bindings; -1 otherwise.
-export function mapCbDeclRetPinTy(at: i32, fnIx: i32): i32 {
-  if at < 0 { return -1 }
-  if !tyHasTyVar(at) { return at }
-  const row = monoExactSubRowOf(fnIx)
-  if row < 0 || row >= monoExactSubN.length { return -1 }
-  const st = exactSubAt(at, row)
-  if st < 0 || tyHasTyVar(st) { return -1 }
-  st
-}
-
 // A hole read (`v.q` in `function g(v)`) whose pin in instance `fnIx` admits no `null` (D4637).
 export function holePinProvesNonNull(ix: i32, fnIx: i32): boolean {
   tyProvesNonNull(nodeTyInOf(ix, fnIx))
-}
-
-// The name every element of `elems` reads, all one bare Ident; "" otherwise.
-export function arrLitSameIdentName(elems: i32[]): string {
-  if elems.length == 0 { return "" }
-  const name = identNameOrEmpty(unwrapParen(elems[0]))
-  let i = 1
-  while i < elems.length {
-    if identNameOrEmpty(unwrapParen(elems[i])) != name { return "" }
-    i = i + 1
-  }
-  name
 }
 
 // Whether node `ix` is an `if` or `match` in value position, whose value joins its arms.

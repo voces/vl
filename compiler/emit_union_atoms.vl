@@ -10,12 +10,7 @@ import {
   nodeTyMapValIsNulLitUnion,
 } from "./check_hole_pins"
 import { canonUnionKeyOfName } from "./check_nj_join"
-import {
-  nodeTyIsMap,
-  nodeTyIsStruct,
-  nodeTyIxOf,
-  nodeTyMapKeyKind,
-} from "./check_node_tys"
+import { nodeTyIsMap, nodeTyIxOf, nodeTyMapKeyKind } from "./check_node_tys"
 import {
   MAP_KEY_I64,
   MAP_KEY_STR,
@@ -189,7 +184,6 @@ import {
   rlBackIdx,
   rlElemHeap,
   rlElemKey,
-  rlElemKindTbl,
   rlElemMapKey,
   rlElemMvSlot,
   rlElemName,
@@ -241,7 +235,6 @@ import {
   unMemIsRefElemArray,
   unMemPeelAliasWrapper,
   unNameBound,
-  unRowOfCanon,
   unRowOfName,
   unRowOfTyAB,
   unSiteOnKey,
@@ -251,7 +244,11 @@ import {
   unionRowOfAB,
   unionSetAtomsOf,
 } from "./emit_union_registry"
-import { unNameAdoptTyKeyRow, unTyKeyPushRow } from "./emit_union_tykey"
+import {
+  unNameAdoptTyKeyRow,
+  unRowOfTyKey,
+  unTyKeyPushRow,
+} from "./emit_union_tykey"
 import { variantSig } from "./emit_variant_sig"
 import { i32ListHas } from "./listutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
@@ -422,7 +419,7 @@ function mvShapeOfValNameArmTyGo(
   // `P[] | i32[]`); a spelling no row is keyed on has no member set, so a narrowed read of
   // the slot loses its arm. The slot takes the row its arena type resolves to (D5113).
   if kind == MVK_UNION && unionRowOfAB(53, valName, kindTy) < 0 {
-    const cu = unRowOfCanon(mvValTyIxOfNameRow(valNameIn, rowTy))
+    const cu = unRowOfTyKey(mvValTyIxOfNameRow(valNameIn, rowTy))
     if cu >= 0 { valName = unNames[cu] }
   }
   // A niche-nullable value name resolves its struct or map identity — and keys its vals
@@ -771,7 +768,6 @@ export function rlInternNameTy(name: string, kind: i32, tyIn: i32) {
   rlElemHeap.push(0)
   rlBackIdx.push(0)
   rlWrapIdx.push(0)
-  rlElemKindTbl.push(kind)
   if rlElemNicheNullable(kind, stored) {
     rlElemNullable.push(1)
   } else {
@@ -1018,6 +1014,14 @@ function registerValueUnionNameTy(name: string, tyIx: i32) {
 
 // Appends the value-union row `name`, typed `tyIx`, with its key and an empty variant slice.
 function pushValueUnionRow(name: string, tyIx: i32) {
+  // A value union whose type key already has a row names that row: one row per type.
+  if tyIx >= 0 && !unNameBound(name) {
+    const kr = unRowOfTyKey(tyIx)
+    if kr >= 0 && kr < unVarCount.length && unVarCount[kr] == 0 {
+      unNameBindRow(name, kr)
+      return 0
+    }
+  }
   uDeclared = true
   unNamesPush(name)
   unTyIx.push(tyIx)
@@ -1068,6 +1072,39 @@ export function valueUnionKeyTextOfTy(ty: i32): string {
 export function valueUnionNameOfTy(ty: i32): string {
   const text = unionSpellingOfTy(ty, 8)
   if text == UNION_SPELLING_DECLINE || !isValueUnionName(text) { return "" }
+  text
+}
+
+// The value-union name of union `ty` with each literal member, and each literal set, spelled as
+// its base: the box a shared field read builds when a member stores a set at the atom and the
+// read widens it (D14750). "" when a member is no scalar or the spelling is no value union.
+export function valueUnionNameOfSoftTy(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const t = tyAt(ty)
+  if !(t is TyUnion) { return "" }
+  const parts: string[] = []
+  for m in t.uMembers {
+    if m < 0 { return "" }
+    let mt = tyAt(m)
+    if mt is TyUnion && tyIsLitUnion(m) { mt = tyAt(mt.uMembers[0]) }
+    const b = if mt is TyLit { litBaseTy(mt) } else { m }
+    if b < 0 { return "" }
+    const bt = tyAt(b)
+    if !(bt is TyPrim) { return "" }
+    let seen = false
+    for q in parts {
+      if q == bt.primName { seen = true }
+    }
+    if !seen { parts.push(bt.primName) }
+  }
+  if parts.length < 2 { return "" }
+  let text = parts[0]
+  let i = 1
+  while i < parts.length {
+    text = text + "|" + parts[i]
+    i = i + 1
+  }
+  if !isValueUnionName(text) { return "" }
   text
 }
 
@@ -1963,7 +2000,7 @@ export function unionRefArrayArmSlotForNestedElem(
     const slot = unMemRefArrArmSlot(mems[i])
     if (
       slot >= 0
-      && slot < rlElemKindTbl.length
+      && slot < rlElemTyIx.length
       && rlElemKindAt(slot) == RLK_UNION
     ) {
       if wantMap {
@@ -1999,7 +2036,7 @@ export function unionRefArrayArmSlotForMapElem(name: string, mvShape: i32) {
       const slot = unMemRefArrArmSlot(mems[i])
       if (
         slot >= 0
-        && slot < rlElemKindTbl.length
+        && slot < rlElemTyIx.length
         && rlElemKindAt(slot) == RLK_MAP
       ) {
         const armMv = rlElemMapValMvSlot(slot)
@@ -2030,7 +2067,7 @@ export function unionNestedArrayArmSlot(name: string) {
   let i = 0
   while i < mems.length {
     const slot = unMemRefArrArmSlot(mems[i])
-    if slot >= 0 && slot < rlElemKindTbl.length {
+    if slot >= 0 && slot < rlElemTyIx.length {
       const k = rlElemKindAt(slot)
       if (
         k == RLK_I32_LIST
@@ -2221,12 +2258,19 @@ export function unNamesPush(name: string) {
   0
 }
 
-// Names the registered row of a union structurally equal to arena union `ty` by `name` too, so a
+// Binds spelling `name` to row `u`, by its sid and by its union key, so both lookups read `u`.
+export function unNameBindRow(name: string, u: i32) {
+  sidArrPut(unRowBySid, sidOf(name), u)
+  unKeyAliasRow(canonUnionKeyOfName(name), u)
+  0
+}
+
+// Names the registered row whose type key is arena union `ty`'s by `name` too, so a
 // record's shape spelling and its declared name read one box and one set of tags (D4930). The
 // row, or -1 when no row holds that type. The spelling's key finds the row as its name does.
-export function unNameShareCanonRow(name: string, ty: i32): i32 {
+export function unNameShareTyKeyRow(name: string, ty: i32): i32 {
   if unNameBound(name) { return unRowOfName(name) }
-  const u = unRowOfCanon(ty)
+  const u = unRowOfTyKey(ty)
   if u < 0 { return -1 }
   sidArrPut(unRowBySid, sidOf(name), u)
   unKeyAliasRow(canonUnionKeyOfName(name), u)
@@ -2240,14 +2284,6 @@ export function unionNameOfVariant(vi: i32) {
   const u = unionOfVariant(vi)
   if u >= 0 { return unNames[u] }
   ""
-}
-
-// True if the read `readIx` is of a struct-typed parameter of `fnIx`.
-export function paramStruct(fnIx: i32, readIx: i32) {
-  const pt = paramTypeNodeOfRead(fnIx, readIx)
-  // STRUCTURAL fast-path (C1): a recorded declared-struct param, else the name test.
-  if nodeTyIsStruct(pt) { return true }
-  false
 }
 
 // Resolves `name`'s arm spellings via `unionArmsOf` into `atoms`, then fills `tys` with their

@@ -6,6 +6,7 @@
 // compiles a third time with the plan applied to the fresh parse. A function returning a
 // generic its results call at two types is planned the same way, as a copy per result type.
 // A program the emitter never refuses runs none of this, so its output is unchanged.
+import { holeFnSplitHas } from "./check_bind_rows"
 import {
   ArrayLit,
   BinExpr,
@@ -1375,10 +1376,35 @@ function fsAheadAllKeep(pure: boolean): boolean {
   true
 }
 
+// Whether every name `x` reads is a declared function or a `const`, and it reads no element or
+// field, so no call run before it can change what it reads.
+function fsFixedReads(x: i32, depth: i32): boolean {
+  if x < 0 || x >= P.nodes.length || depth > 32 { return false }
+  const n = nodeAt(x)
+  if n is Index || n is Member || n is Call { return false }
+  if n is Ident {
+    const d = identDeclOf(x)
+    if d < 0 || d >= P.nodes.length || n.identName.slice(0, 1) == "$" {
+      return false
+    }
+    const dn = nodeAt(d)
+    return dn is FuncDecl || (dn is LetDecl && dn.letKw == "const")
+  }
+  for k in nodeChildren(x) {
+    if k >= 0 && !fsFixedReads(k, depth + 1) { return false }
+  }
+  true
+}
+
 // Whether `y`, noted `lvl` nodes above the choice's call, may stay where it is once the choice
-// runs first: at the call itself as `fsAheadStays` says, above it as `fsChoiceAheadOk` says.
+// runs first: at the call itself as `fsAheadStays` says, or as a pure choice ahead of a pure one
+// or reading only fixed names (D14651), and above it as `fsChoiceAheadOk` says.
 function fsAheadKeeps(y: i32, lvl: i32, pure: boolean): boolean {
-  if lvl == 0 { return fsAheadStays(y, !pure) }
+  if lvl == 0 {
+    return fsAheadStays(y, !pure)
+      || (pure && fsPureChoice(y, 0))
+      || (fsPureChoice(y, 0) && fsFixedReads(y, 0))
+  }
   fsChoiceAheadOk(y, pure)
 }
 
@@ -3932,7 +3958,28 @@ function fsPlanHoles(): i32 {
   fsHoleDecline()
   hsBad = false
   const work: i32[] = []
+  // An asked parameter brings the other parameters of its function the checker marked, since
+  // the emitter stops at the first one it refuses (D14652).
+  const asked: i32[] = []
   for a in fsAsks {
+    asked.push(a)
+    if a >= 0 && a < fsParseLen && nodeAt(a) is Param && fsParent[a] >= 0 {
+      const f = nodeAt(fsParent[a])
+      if f is FuncDecl {
+        for q in f.fnParams {
+          if (
+            q != a
+            && holeFnSplitHas(q)
+            && !hasI32(fsAsks, q)
+            && !hasI32(asked, q)
+          ) {
+            asked.push(q)
+          }
+        }
+      }
+    }
+  }
+  for a in asked {
     if (
       a >= 0
       && a < fsParseLen

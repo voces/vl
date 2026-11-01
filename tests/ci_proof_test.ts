@@ -39,17 +39,17 @@ const LOCAL: Record<string, string> = {
     "CI proves the fixpoint, not the fuel, heap or survey rows",
   "plumb-shape cost":
     "ci-cost runs it with --require-fuel and no native binaryen",
-  "rep-fuzz": "CI does not run it",
-  "filed witnesses": "CI does not run it",
-  "splice scan": "CI does not run it",
-  "distilled corpus": "CI does not run it",
+  "filed witnesses":
+    "ci-witnesses grades it in two --shard runs, not the one command the row runs",
+  "distilled corpus":
+    "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
 };
 
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.
 const CI_RUNS: Record<string, string[]> = {
   "ci-native": [
-    "bash scripts/ci-shard.sh native ${{ matrix.shard }} 7",
-    "bash scripts/ci-shard.sh release ${{ matrix.shard }} 4",
+    "bash scripts/ci-shard.sh native ${{ matrix.shard }} 5",
+    "bash scripts/ci-shard.sh release ${{ matrix.shard }} 1",
   ],
   "lsp suites (ci list)": ["- name: Editor features on the wasm compiler"],
   "lsp typecheck": [
@@ -83,6 +83,10 @@ const CI_RUNS: Record<string, string[]> = {
   ],
   "conflict markers": [],
   "corpus oracle": ["- name: Corpus oracle on the wasm compiler"],
+  "rep-fuzz": ["run: bash scripts/rep-fuzz-check.sh"],
+  "splice scan": [
+    "vl run scripts/inventory/splice-scan.vl --compiler build/vl-compiler.wasm -- --self-test",
+  ],
 };
 
 // Top-level jobs of ci.yml, name -> body.
@@ -543,16 +547,16 @@ Deno.test({
         ],
         [
           "a missing shard",
-          () => write("jobs.json", jobList("ci-native (7)")),
+          () => write("jobs.json", jobList("ci-native (5)")),
           {},
-          "has 6 'ci-native' jobs",
+          "has 4 'ci-native' jobs",
           sha,
         ],
         [
           "a missing scaling part",
           () => write("jobs.json", jobList("ci-cost (2)")),
           {},
-          "has 3 'ci-cost' jobs",
+          "has 1 'ci-cost' jobs",
           sha,
         ],
         [

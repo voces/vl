@@ -1,10 +1,8 @@
 // `check_mint.vl` — the calls an instance of a function makes through a set-typed value.
-// An instance is a declared function typed at one tuple of its hole parameters; while its body
-// is typed there, each call of a parameter bound to a function set records one fact: the set,
-// the call's parameter types and what each member returns there (D14430). Scopes are rows by
-// instance key and the check's generation; facts are rows by scope and call node, rolled back
-// with the hole rows (`mintFactsTruncate`) and cleared when the check restarts.
-
+// The elaboration notes one fact per call an instance makes through a parameter it binds to a
+// function set: the set, the call's parameter types and what each member returns there
+// (D14430, `elabMintFacts`). Scopes are rows by instance key; facts are rows by scope and call
+// node, and both are cleared before the elaboration notes them.
 import { i32ToStr } from "./ast"
 
 // The check's generation: a restart re-mints every type, so no row of an earlier one is read.
@@ -49,7 +47,77 @@ export function mintReset() {
   mintFactSplit = []
   mintFactRs = []
   mintFactPrev = []
+  mintPartial = []
+  mintParamSets = Map()
+  mintParamFwds = Map()
   0
+}
+
+// Each function's parameter, keyed `decl|index`, → the parameters it is handed on to as
+// `[decl, index, ...]`.
+let mintParamFwds: {[string]: i32[]} = Map()
+
+// Records that parameter `i` of `decl` is handed on to parameter `j` of `d2`.
+export function mintParamFwdNote(decl: i32, i: i32, d2: i32, j: i32) {
+  const key = i32ToStr(decl) + "|" + i32ToStr(i)
+  const have = mintParamFwds[key] ?? []
+  have.push(d2)
+  have.push(j)
+  mintParamFwds[key] = have
+  0
+}
+
+// Each function's parameter, keyed `decl|index`, → the sets the calls through it go through in
+// some instance.
+let mintParamSets: {[string]: i32[]} = Map()
+
+// Records that a call through parameter `i` of `decl` goes through set `s`.
+export function mintParamSetNote(decl: i32, i: i32, s: i32) {
+  const key = i32ToStr(decl) + "|" + i32ToStr(i)
+  const have = mintParamSets[key] ?? []
+  for x in have {
+    if x == s { return 0 }
+  }
+  have.push(s)
+  mintParamSets[key] = have
+  0
+}
+
+// The sets some instance calls through a parameter that another instance of its function binds
+// to no set or to another set.
+let mintPartial: i32[] = []
+
+export function mintSetPartialNote(s: i32) {
+  if s >= 0 && !mintSetPartial(s) { mintPartial.push(s) }
+  0
+}
+
+export function mintSetPartial(s: i32): boolean {
+  for x in mintPartial {
+    if x == s { return true }
+  }
+  false
+}
+
+// Whether some instance's calls through parameter `i` of `decl` go through set `s`, directly or
+// through a parameter it is handed on to.
+export function mintParamTakes(decl: i32, i: i32, s: i32): boolean {
+  mintParamTakesGo(decl, i, s, 0)
+}
+
+function mintParamTakesGo(decl: i32, i: i32, s: i32, depth: i32): boolean {
+  if depth > 8 { return false }
+  const key = i32ToStr(decl) + "|" + i32ToStr(i)
+  for x in mintParamSets[key] ?? [] {
+    if x == s { return true }
+  }
+  const fw = mintParamFwds[key] ?? []
+  let k = 0
+  while k + 1 < fw.length {
+    if mintParamTakesGo(fw[k], fw[k + 1], s, depth + 1) { return true }
+    k = k + 2
+  }
+  false
 }
 
 // The scope row of the instance of function `fn` binding `names` to `tys`, spelled `key`, made
@@ -158,6 +226,19 @@ export function mintFactRsOf(r: i32): i32[] {
   const none: i32[] = []
   if r < 0 || r >= mintFactRs.length { return none }
   mintFactRs[r]
+}
+
+// The one set every standing fact for call `call` goes through, or -1 when none does or two
+// differ.
+export function mintCallSoleSet(call: i32): i32 {
+  let s = -1
+  for r in mintFactRows() {
+    if mintFactCall[r] == call {
+      if s >= 0 && mintFactSet[r] != s { return -1 }
+      s = mintFactSet[r]
+    }
+  }
+  s
 }
 
 // The fact row standing for call `call` in the scope of fact row `r`, or -1.

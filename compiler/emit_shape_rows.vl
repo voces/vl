@@ -52,7 +52,7 @@ import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
 import { pinResolvedFnTy, setCtorKeys } from "./check_core_state"
 import { recBuildElemTyOfInit } from "./check_rec_rows"
 import { nodeArrayElemName, nominalStructNameOfTy } from "./check_emit_queries"
-import { nodeTyMapValName, nodeTyPinIxOf } from "./check_hole_pins"
+import { nodeTyMapValName } from "./check_hole_pins"
 import { isTopLevelFuncTypeName } from "./check_lit_union_spell"
 import {
   nodeArrayElemTyIx,
@@ -377,6 +377,7 @@ import {
   isUNameDeclAB,
   isUNameKeyAB,
   nulArmTyOf,
+  unNameBound,
   unionArmsOfTy,
   unionMemberCountOfName,
   unionSetAtomsOf,
@@ -691,6 +692,8 @@ export function mvValKindOfName(valName: string): i32 {
 // spelling being split; any other type, or -1, asks the spelling.
 export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
   if ty >= 0 && fnTagTyIsTagged(ty) { return MVK_MONO }
+  // A list of a tagged set's ids, at any depth, is the i32 list wrapper it is stored as.
+  if ty >= 0 && fnTagListTy(ty) { return MVK_REF }
   if valName == "i32" || valName == "boolean" { return MVK_MONO }
   // The `null` unit value stores the `boolean | null` sentinel, so it is the mono map too (D4671).
   if valName == "null" { return MVK_MONO }
@@ -846,6 +849,9 @@ export function mvCanonValNameTy(valName: string, ty: i32) {
   // Runaway cap: a value spelling this long is never a legitimate mv key, so pass it through
   // untouched and let the kind classifier's `-3` path fail loudly instead of rendering it.
   if valName.length > 4096 { return valName }
+  // A list of a tagged set's ids, at any depth, is the i32 list it is stored as.
+  const tn = fnTagListRepName(ty)
+  if tn != "" { return tn }
   // A ref-list value: canon its element union through the array wrapper, the same canon
   // `rlInternName` keys the vals ref-list slot on. Without it an annotation spelling and a
   // self-inferred factory-return lambda mint twin mv and map structs, a cast trap at the
@@ -858,6 +864,23 @@ export function mvCanonValNameTy(valName: string, ty: i32) {
   if nameIsBraceSpanEnds(valName) { return rlCanonLitUnionAtoms(valName, ty) }
   if unionSetMemberCount(valName) < 2 { return valName }
   canonLitUnionArms(valName, ty)
+}
+
+// The spelling of the list `ty` is when it holds a tagged set's ids at its leaves (`i32[]`,
+// `i32[][]`), or "" for any other type.
+export function fnTagListRepName(ty: i32): string {
+  if !fnTagListTy(ty) { return "" }
+  let t = ty
+  let sfx = ""
+  let depth = 0
+  while t >= 0 && t < T.tys.length && depth < 16 {
+    const a = tyAt(t)
+    if !(a is TyArray) { return "i32" + sfx }
+    sfx = sfx + "[]"
+    t = a.aElem
+    depth = depth + 1
+  }
+  ""
 }
 
 // The litunion-arm canon of `name`, whose arena type is `ty` or -1, shared by `mvCanonValNameTy`
@@ -916,7 +939,7 @@ function canonAtomsOfTy(name: string, ty: i32): string[] {
 // interns no slot, while its rendered value name collapses to `string`.
 export function mapFindShapeOfNodeTy(ix: i32) {
   mapShapeOfValKeyed(
-    nodeTyPinIxOf(ix),
+    nodeTyIxOf(ix),
     nodeTyMapKeyKind(ix),
     nodeMapValTyIx(ix),
     mapNodeValName(ix),
@@ -2737,11 +2760,7 @@ function nameIsRefArrayGo(name: string) {
     // Shape2}` arrives as `{r:{c2:i32}|{s2:i32}}`, claimed by neither the nominal rung nor
     // the struct bridge. `variantIndexOfTypeName` is the same resolver `objVariantName` uses.
     if variantIndexOfOwnRender(base) >= 0 { return true }
-    let u = 0
-    while u < unNames.length {
-      if base == unNames[u] { return true }
-      u = u + 1
-    }
+    if unNameBound(base) { return true }
   }
   false
 }
@@ -2811,11 +2830,7 @@ export function refArrElemKind(name: string) {
   // consult needed here, unlike `nameIsRefArray`'s four.
   if nameIsElemArray(name) {
     const base = arrElemNameRaw(name)
-    let u = 0
-    while u < unNames.length {
-      if base == unNames[u] { return RLK_UNION }
-      u = u + 1
-    }
+    if unNameBound(base) { return RLK_UNION }
   }
   RLK_STRUCT
 }
@@ -4136,6 +4151,8 @@ export function arrLitNestedElemName(arrIx: i32): string {
     if t.aElem >= 0 {
       const el = tyAt(t.aElem)
       if el is TyArray {
+        // A list of a tagged set's ids is stored as the i32 list it is.
+        if fnTagListTy(t.aElem) && !fnTagListTy(el.aElem) { return "i32[]" }
         // The gate is the same one `nodeArrayElemName`'s arm asks (D702): does this element
         // render? A spelling with no render is one no row can be keyed under.
         const dn = deepDeclRecName(t.aElem)
@@ -4164,6 +4181,7 @@ export function arrLitNestedElemName(arrIx: i32): string {
 // list element, which the classifier always answers, so there is no spelling floor.
 export function arrLitNestedElemKind(arrIx: i32): i32 {
   if arrLitElemRender(arrIx) == "" { return RLK_I32_LIST }
+  if fnTagListTy(tyArrayElemIx(nodeTyIxOf(arrIx))) { return RLK_I32_LIST }
   refListElemKindOfTy(tyArrayElemIx(nodeTyIxOf(arrIx)))
 }
 
@@ -4444,11 +4462,7 @@ function refArrElemNameGo(name: string) {
   // per-iteration `+ "[]"` concat that allocated a string per call.
   if nameIsElemArray(name) {
     const base = arrElemNameRaw(name)
-    let u = 0
-    while u < unNames.length {
-      if base == unNames[u] { return base }
-      u = u + 1
-    }
+    if unNameBound(base) { return base }
     if structIndexOfTypeName(base) >= 0 { return base }
     // An inline-shape element resolving to an interned row by the structural bridge: the
     // spelling stays the table key (its slot twins with the resolved row's slot at the heap

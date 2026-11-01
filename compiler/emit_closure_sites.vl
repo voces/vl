@@ -1,6 +1,7 @@
 // `emit_closure_sites.vl` — closure sites: the result kind and signature key a closure
 // call or lambda carries, and the boolean and list-element codes of the values it passes.
 
+import { elabNodeTyAt } from "./emit_elab"
 import {
   ArrayLit,
   AsExpr,
@@ -48,7 +49,6 @@ import {
 } from "./ast"
 import { nodeTyProvesNonNull } from "./check_emit_queries"
 import { recKeptFnDstOf } from "./check_rec_rows"
-import { nodeTyPinIxOf } from "./check_hole_pins"
 import {
   nodeArrayElemIsNulBool,
   nodeTyIsNulFunc,
@@ -235,12 +235,7 @@ import {
   vbAtomListTop,
 } from "./emit_state"
 import { rlSlotOfTy, sFieldIndex } from "./emit_struct_order"
-import {
-  holeCaptureTyOf,
-  holeOperandTyOf,
-  nodeTyInOf,
-  pinSubOperandTyOf,
-} from "./emit_ty_canon"
+import { elabClosedTyAt, holeOperandTyOf, nodeTyInOf } from "./emit_ty_canon"
 import { unionStoreAtomKindOfSet } from "./emit_union_casts"
 import { i32ListHas } from "./listutil"
 import { identDeclOf, sidOfNode } from "./symbols"
@@ -1203,7 +1198,7 @@ export function ifExprValtype(ifIx: i32, fnIx: i32) {
   // literal arm adapts to it (D3528).
   const pjt = nodeTyIxOf(ifIx)
   if pjt >= 0 && tyHasTyVar(pjt) {
-    const pjn = tyPrimNameOf(pinSubOperandTyOf(pjt, fnIx))
+    const pjn = tyPrimNameOf(elabClosedTyAt(ifIx, fnIx))
     if pjn == "f64" { return 124 }
     if pjn == "f32" { return 125 }
     if pjn == "i64" { return 126 }
@@ -1256,19 +1251,8 @@ export function exprIsBool(ix: i32, fnIx: i32) {
       if listElemIsBool(e.idxArr, fnIx) { return true }
       // An element typed at a type parameter an enclosing instance binds to `boolean`, read in
       // a nested generic's instance that binds only its own (D3831).
-      if tyPrimNameOf(pinSubOperandTyOf(nodeTyIxOf(ix), fnIx)) == "boolean" {
-        return true
-      }
-      // …and the cell of a written capture, whose read the rewrite minted untyped (D3886).
-      if (
-        tyPrimNameOf(
-          pinSubOperandTyOf(capturedCellElemTy(e.idxArr, fnIx), fnIx),
-        )
-        == "boolean"
-      ) {
-        return true
-      }
-      return tyPrimNameOf(holeCaptureTyOf(ix, fnIx)) == "boolean"
+      if elabReadIsBool(ix, fnIx) { return true }
+      return false
     }
     Unary => {
       return e.unOp == "!"
@@ -1287,10 +1271,7 @@ export function exprIsBool(ix: i32, fnIx: i32) {
       // A capture typed at a type parameter this lambda's instance pins to `boolean`: an
       // un-annotated copy of a parameter has no annotation to recover it from (D3520).
       if capturedKindOf(fnIx, e.identName) != null {
-        if tyPrimNameOf(pinSubOperandTyOf(nodeTyIxOf(ix), fnIx)) == "boolean" {
-          return true
-        }
-        if tyPrimNameOf(holeCaptureTyOf(ix, fnIx)) == "boolean" { return true }
+        if elabReadIsBool(ix, fnIx) { return true }
       }
       // A plain boolean local/param/global — recovered from the binding's annotation
       // or initializer, since a boolean local registers identically to an i32.
@@ -1643,7 +1624,7 @@ export function listElemIsBool(arrIx: i32, fnIx: i32) {
   // The instance's own pin, for a receiver the body typed only as a hole: the substituted
   // annotation the rungs above read is the generic's, so this is the first rung with a
   // concrete element. Below them, since a declared `i32[]` still outranks it.
-  if tyArrayElemPrimName(nodeTyPinIxOf(inner)) == "boolean" { return true }
+  if tyArrayElemPrimName(nodeTyInOf(inner, fnIx)) == "boolean" { return true }
   if e is Ident {
     let li = fnLetOfRead(fnIx, inner)
     if li < 0 { li = globalLetOfRead(fnIx, inner) }
@@ -1734,13 +1715,6 @@ function boundBoolOfRead(atIx: i32, fnIx: i32) {
   false
 }
 
-// The element type of captured list `arrIx` read in `fnIx`, or -1 for any other receiver.
-function capturedCellElemTy(arrIx: i32, fnIx: i32): i32 {
-  const a = nodeAt(unwrapParen(arrIx))
-  if !(a is Ident) || capturedKindOf(fnIx, a.identName) == null { return -1 }
-  tyArrayElemIx(nodeTyAt(unwrapParen(arrIx), fnIx))
-}
-
 // The boolean-list atom code of the value `ix` builds (`tyBoolListCode`): its recorded type's,
 // else inside a generic instance the pinned type's, else for a list literal its first
 // element's; -1 for any other value.
@@ -1752,7 +1726,7 @@ export function exprBoolListCode(ix: i32, fnIx: i32): i32 {
   if c >= 0 { return c }
   const ec = tyBoolListCode(exactOperandTyOf(bix, fnIx))
   if ec >= 0 { return ec }
-  const pc = tyBoolListCode(nodeTyPinIxOf(bix))
+  const pc = tyBoolListCode(nodeTyInOf(bix, fnIx))
   if pc >= 0 { return pc }
   // A name or call read inside an instance: a parameter's substituted annotation, or the callee
   // instance's declared return (D2820's rung).
@@ -1808,7 +1782,7 @@ function exprAtomLeafListDepth(ix: i32, fnIx: i32): i32 {
   if d >= 0 { return d }
   const ed = atomLeafListDepthOfTy(exactOperandTyOf(bix, fnIx))
   if ed >= 0 { return ed }
-  const pd = atomLeafListDepthOfTy(nodeTyPinIxOf(bix))
+  const pd = atomLeafListDepthOfTy(nodeTyInOf(bix, fnIx))
   if pd >= 0 { return pd }
   const init = frameLetInitOf(bix, fnIx)
   if init >= 0 { return exprAtomLeafListDepth(init, fnIx) }
@@ -2192,4 +2166,12 @@ export function cloRetTypeName(fe: i32) {
     "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {}
   }
   ""
+}
+
+// Whether the instance `fnIx`'s elaboration types read `ix` as `boolean`; false where it leaves
+// the read open.
+function elabReadIsBool(ix: i32, fnIx: i32): boolean {
+  const t = elabNodeTyAt(ix, fnIx)
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return false }
+  tyPrimNameOf(t) == "boolean"
 }

@@ -133,7 +133,7 @@ import { cstrCandAny } from "./check_cstr_probe"
 import {
   elabDeadRestClose,
   elabDeadRestOpen,
-  elabFnIdOf,
+  elabFnSetOf,
   elabLiveTyOf,
   elabValueRowNote,
   fnTagChoiceAt,
@@ -141,6 +141,8 @@ import {
   fnTagEtaAt,
   fnTagEtaInner,
   fnTagSetValueOfTy,
+  stampsHeld,
+  stampsHeldSet,
   stampsStand,
 } from "./check_elab_cap"
 import {
@@ -213,6 +215,7 @@ import {
   radixLitAdoptDst,
   rcwPend,
   recAdForce,
+  recordCtxTy,
   recordMapUnbox,
   recordRecCopy,
   recordRepTyAdopt,
@@ -1433,7 +1436,15 @@ function listArmIn(
   -1
 }
 
-export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
+// Whether `srcExpr` (of type `srcTy`) delivers to `dstTy`; a delivery that holds where stamps
+// stand records `dstTy` as the node's contextual type.
+export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const ok = assignableExprIn(srcExpr, srcTy, dstTy)
+  if ok { recordCtxTy(srcExpr, dstTy) }
+  ok
+}
+
+function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
   nolNoteDelivery(srcExpr, dstTy)
   if fsbName.length > 0 && !inferQuiet && srcExpr >= 0 {
@@ -2572,6 +2583,56 @@ export function validateRetCstrs(
 }
 
 // Whether the deferred destination constraints this binding resolves hold — the twin of
+// Whether every hole of `t` sits inside a function type, reached through lists, nullables and
+// record fields only: a hole anywhere else is a value's own open type, not a delivered function's.
+function holesOnlyInFns(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 16 { return false }
+  if !tyHasHole(t) { return true }
+  const x = tyAt(t)
+  match x {
+    TyFunc => {
+      return true
+    }
+    TyArray => {
+      return holesOnlyInFns(x.aElem, depth + 1)
+    }
+    TyNullable => {
+      return holesOnlyInFns(x.nInner, depth + 1)
+    }
+    TyObj => {
+      for ft in x.objFieldTypes {
+        if !holesOnlyInFns(ft, depth + 1) { return false }
+      }
+      return true
+    }
+    // a hole in any other position is a value's own open type
+    TyPrim | TyErr | TyUnion | TyMap | TyVar | TyLit | TyNeg => {}
+  }
+  false
+}
+
+// Whether every hole the deferred pair `got`/`want` leaves open is a lambda's own parameter,
+// bound by the closed `want`: the delivery types the lambda's copy there, so a call of the
+// lambda at another type does not re-ask the pair.
+function lambdaCopyOnly(got: i32, want: i32): boolean {
+  if (
+    want < 0
+    || tyHasHole(want)
+    || tyHasTyVar(want)
+    || !holesOnlyInFns(got, 0)
+  ) {
+    return false
+  }
+  const bn: string[] = []
+  const bt: i32[] = []
+  bindGenWalk(got, want, bn, bt)
+  if bn.length == 0 { return false }
+  for nm in bn {
+    if nm.length < 3 || nm.slice(0, 3) != "?#L" { return false }
+  }
+  !tyHasHole(substTyDeep(got, bn, bt))
+}
+
 // `validateRetCstrs` for a `let`/`const` binding rather than a return (D572 is why the two
 // need separate tables). Same re-deferral rule; the message is `letAssignMsg`'s, verbatim,
 // with the attribution appended since the reader wrote no assignment.
@@ -2588,6 +2649,7 @@ export function validateLetCstrs(
   while ci < nOrigL {
     if (
       cstrOwnedBy(letCstr.fn[ci], calleeFn)
+      && !lambdaCopyOnly(letCstr.got[ci], letCstr.want[ci])
       && !nestCstrOutside(letCstr.ix[ci])
       && !wrUnreachedBy(ci, ix, calleeFn)
       && !ctnWrUnreachedBy(letCstr.ix[ci], letCstr.got[ci], letCstr.fn[ci], ix)
@@ -2677,7 +2739,11 @@ export function validateBmCstrs(
       }
       if !tyHasHole(bg) {
         if !tyHasHole(bw) {
-          if !bmArgPred(bmCstr.form[ci], bg, bw, bmCstr.ix[ci]) {
+          const held = stampsHeld
+          stampsHeldSet(true)
+          const fits = bmArgPred(bmCstr.form[ci], bg, bw, bmCstr.ix[ci])
+          stampsHeldSet(held)
+          if !fits {
             let bWho = "the callee's body"
             if who != "" { bWho = "the body of `" + who + "`" }
             tErr(
@@ -3140,7 +3206,9 @@ function fvaValueRowWalk(srcTy: i32, dstTy: i32, depth: i32) {
   if s is TyArray && d is TyArray {
     return fvaValueRowWalk(s.aElem, d.aElem, depth - 1)
   }
-  fvaValueRowAt(elabFnIdOf(srcTy), dt)
+  // Each generic member of a set is banked at the destination, as one alone is.
+  for m in elabFnSetOf(srcTy) { fvaValueRowAt(m, dt) }
+  0
 }
 
 // Banks generic function `decl`'s instance at closed function type `dt`, its type parameters

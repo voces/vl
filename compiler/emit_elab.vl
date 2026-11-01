@@ -2,6 +2,7 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
+import { monoIsGenericDecl } from "./emit_base"
 import { decDigitsOf } from "./strutil"
 import { constListFnElemDecl } from "./check_calls"
 
@@ -9,6 +10,7 @@ import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx } from "./check_ty_rep"
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
   Call,
@@ -16,7 +18,10 @@ import {
   FuncDecl,
   Ident,
   Index,
+  IsExpr,
   LetDecl,
+  MatchExpr,
+  Member,
   ObjLit,
   P,
   Param,
@@ -24,6 +29,7 @@ import {
   RetStmt,
   Spread,
   TypeRef,
+  callTyArgsOf,
   elseIfLink,
   hasSpreadItem,
   i32ToStr,
@@ -40,9 +46,11 @@ import {
   recKeptFnDecl,
   recKeptFnDstOf,
 } from "./check_rec_rows"
-import { cwPeelValue } from "./check_write_scan"
-import { recordRepTyAdopt } from "./check_fit_rules"
-import { recInferredFnOf } from "./check_rec_fresh"
+import { cwFnValueDeclOf, cwPeelValue } from "./check_write_scan"
+import { recHoleIdentityArg, recordRepTyAdopt } from "./check_fit_rules"
+import { recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
+import { recSolePinArg } from "./check_record_origins"
+import { recFnValueLeaves } from "./check_type_shape"
 import { parenPeelIx } from "./check_places"
 import {
   elabCallD,
@@ -52,6 +60,8 @@ import {
   elabCallT,
   elabCalleeTargets,
   elabCapBegin,
+  elabCapCtx,
+  elabCapDeadDiags,
   elabCapDeadDiagsSet,
   elabCapDeadIx,
   elabCapEnd,
@@ -67,6 +77,7 @@ import {
   elabCbRootN,
   elabCbRootT,
   elabCbT,
+  elabDefaultRowHas,
   elabEarlyCalls,
   elabEncl,
   elabFnLetBindings,
@@ -84,15 +95,20 @@ import {
   elabSnapKey,
   elabTyClosed,
   fnTagCallArms,
+  fnTagOwnTyParamAlone,
+  fnTagSetIsTagged,
+  fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
 import {
   callBindCount,
   callBindIxAt,
   callBindNamesAt,
+  callBindRepTysAt,
   callBindRowOf,
   callBindTysAt,
 } from "./check_bind_rows"
+import { recRepWidens } from "./check_bind_adopt"
 import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
 import { monoRecheckEnd } from "./check_demands"
 import { cbExpMark, cbExpTruncate } from "./check_expected"
@@ -116,16 +132,24 @@ import { pushScope } from "./check_narrow_paths"
 import { popScope } from "./check_narrow_flow"
 import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 import {
+  mintFactNote,
+  mintParamFwdNote,
+  mintParamSetNote,
+  mintReset,
+  mintScopeAt,
   mintScopeFnOf,
   mintScopeNamesOf,
   mintScopeRows,
   mintScopeTysOf,
+  mintSetPartialNote,
 } from "./check_mint"
 import {
   T,
+  TDiag,
   TY_ERR,
   TY_I32,
   TY_NULL,
+  TY_STR,
   TY_VOID,
   TyArray,
   TyErr,
@@ -150,9 +174,11 @@ import {
   tyHasHole,
   tyHasInferHole,
   tyHasLitLeaf,
+  tyIsLitUnion,
   tyMentionsErr,
   tyMentionsTyVarNamed,
   tySame,
+  tyToStr,
   tyToStructStr,
 } from "./check_types"
 import {
@@ -179,6 +205,9 @@ export let elabNodeTys: {[i32]: i32[]} = Map()
 let elabNodeReps: {[i32]: i32[]} = Map()
 // Literal → [key, union, ...]: the union each instance's elaboration adopted it into an arm of.
 let elabNodeRepUnions: {[i32]: i32[]} = Map()
+
+// Node → (instance key, the destination type it is delivered at there) pairs.
+let elabNodeCtxs: {[i32]: i32[]} = Map()
 // Narrowed read → [key, storage type, ...]: what each instance's re-check read it out of.
 let elabNodeNarrowed: {[i32]: i32[]} = Map()
 // The type the checker left on each node, taken before the emitter's passes rewrite any body; a
@@ -192,14 +221,87 @@ let elabDeadKs: {[i32]: i32[]} = Map()
 const ELAB_MAX_KEYS = 20000
 
 function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
-  // Sorted by name, so two calls binding the same names in another order share a key.
+  // Sorted by name, so two calls binding the same names in another order share a key; a body
+  // testing a type parameter spells each binding exactly, a set apart from its map (D2684).
+  const exact = elabTestsTyVar(decl)
   let k = ""
   for o in elabNameOrder(names) {
     if o < tys.length {
-      k = k + names[o] + "=" + elabBindStr(tys[o], false) + ";"
+      k = k + names[o] + "=" + elabBindStr(tys[o], exact) + ";"
     }
   }
   i32ToStr(decl) + "|" + k
+}
+
+// Per declaration: 1 when its body tests a value of a type parameter, directly or by handing one
+// to a generic that does; 0 when not; 2 for a "no" that read a declaration still on the walk's
+// stack, which stands for the rest of that walk and is settled at its root.
+let elabExactMemo: {[i32]: i32} = Map()
+let elabExactOnStack: {[i32]: boolean} = Map()
+let elabExactDepth = 0
+let elabExactPending: i32[] = []
+
+// Whether generic `decl`'s body tests a value whose type names a type parameter (D2684). A root
+// walk's "no" means nothing it reached tests one; its "yes" drops the provisional answers.
+export function elabTestsTyVar(decl: i32): boolean {
+  if decl < 0 || decl >= P.nodes.length { return false }
+  const m = elabExactMemo.get(decl) ?? -1
+  if m >= 0 { return m == 1 }
+  if elabExactOnStack.get(decl) ?? false { return false }
+  const fn = nodeAt(decl)
+  if !(fn is FuncDecl) { return false }
+  elabExactOnStack.set(decl, true)
+  elabExactDepth = elabExactDepth + 1
+  const r = elabTestsTyVarIn(fn.fnBody)
+  elabExactDepth = elabExactDepth - 1
+  elabExactOnStack.set(decl, false)
+  if r || elabExactDepth == 0 {
+    elabExactMemo.set(decl, if r { 1 } else { 0 })
+  } else {
+    elabExactMemo.set(decl, 2)
+    elabExactPending.push(decl)
+  }
+  if elabExactDepth == 0 {
+    for d in elabExactPending { elabExactMemo.set(d, if r { -1 } else { 0 }) }
+    elabExactPending = []
+  }
+  r
+}
+
+// Whether node `ix`'s recorded type names a type parameter.
+function elabTyVarTyped(ix: i32): boolean {
+  const t = nodeTyIxOf(parenPeelIx(ix))
+  t >= 0 && tyHasTyVar(t)
+}
+
+// `elabTestsTyVar`'s walk over one subtree, nested lambdas included.
+function elabTestsTyVarIn(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is IsExpr && elabTyVarTyped(n.isObj) { return true }
+  if n is AsExpr && elabTyVarTyped(n.asObj) { return true }
+  if n is MatchExpr && elabTyVarTyped(n.matchScrut) { return true }
+  if n is Call && n.callFn >= 0 {
+    const cd = identDeclOf(n.callFn)
+    if cd >= 0 && nodeAt(n.callFn) is Ident && monoIsGenericDecl(cd) {
+      let passes = callTyArgsOf(ix).length > 0
+      let a = 0
+      while a < n.callArgs.length && !passes {
+        passes = elabTyVarTyped(n.callArgs[a])
+        a = a + 1
+      }
+      if passes && elabTestsTyVar(cd) { return true }
+    }
+  }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    for kid in nodeSpineChildren(cur) {
+      if elabTestsTyVarIn(kid) { return true }
+    }
+    cur = elseIfLink(cur)
+  }
+  false
 }
 
 // One binding's spelling in a key; `canon` spells each union's members in sorted order.
@@ -420,6 +522,33 @@ function elabTyVarNamesIn(t: i32, out: string[], depth: i32) {
   }
   0
 }
+// The diagnostics instances' re-checks owed the program, in the order the instances ran.
+export let elabErrors: TDiag[] = []
+// Set while a check re-runs for a program whose build stands clean: its instances' diagnostics
+// belong to a program the split plan replaces, so none is reported.
+export let elabErrorsMuted = false
+
+export function elabErrorsMuteSet(on: boolean) {
+  elabErrorsMuted = on
+  0
+}
+
+// Keeps `d` unless two instances raised the same diagnostic at the same node.
+function elabErrorNote(d: TDiag) {
+  for e in elabErrors {
+    if e.tat == d.tat && e.tmsg == d.tmsg { return 0 }
+  }
+  elabErrors.push(d)
+  0
+}
+
+// How many diagnostics the last elaboration reports.
+export function elabErrorCount(): i32 {
+  if elabErrorsMuted { 0 } else { elabErrors.length }
+}
+// The instances `elabSetRepRow` makes as representations mono builds, and those they make.
+let elabReprKeys: {[i32]: boolean} = Map()
+let elabRepresenting = false
 let elabHoleCur = 0
 // Root hole rows of a declaration that reads its enclosing declaration's open types, and the
 // instance count each has been enqueued up to.
@@ -439,11 +568,14 @@ function elabDrainHoleRows() {
         elabHoleDeferred.push(r)
         elabHoleDeferredAt.push(0)
       } else {
+        // An instance only a D4551 default asks for is a guess, as the default instance is.
+        elabGuessing = from < 0 && elabDefaultRowHas(d, elabHoleRowT[r])
         elabReachNote(
           from,
           elabEnqueue(d, elabHoleRowN[r], elabHoleRowT[r], from),
           -1,
         )
+        elabGuessing = false
       }
     }
     elabHoleCur = elabHoleCur + 1
@@ -545,7 +677,17 @@ export function elabBodyDeclNote(d: i32, body: i32) {
   0
 }
 
+// Per `<call>:<argument>`, the stub type an argument of only uncalled hole functions is delivered
+// at; primed by the monomorphizer before the worklist runs.
+let elabStubArg: {[string]: i32} = Map()
+
+export function elabStubArgSet(ix: i32, k: i32, t: i32) {
+  elabStubArg[i32ToStr(ix) + ":" + i32ToStr(k)] = t
+  0
+}
+
 export function elabTpDefaultsReset() {
+  elabStubArg = Map()
   elabTpDefaults = Map()
   elabBodyDecl = Map()
   0
@@ -594,6 +736,7 @@ function elabCanon(
   names: string[],
   tys: i32[],
 ): boolean {
+  const exact = elabTestsTyVar(decl)
   let i0 = 0
   while i0 < names0.length && i0 < tys0.length {
     const al = names0[i0]
@@ -605,22 +748,141 @@ function elabCanon(
     if !has && (elabOwnName(decl, nm) || elabSigReads(decl, nm)) {
       if !elabTyClosed(tys0[i0], 0) { return false }
       names.push(nm)
-      tys.push(widenLitTy(tys0[i0]))
+      tys.push(if exact { tys0[i0] } else { widenLitTy(tys0[i0]) })
     }
     i0 = i0 + 1
   }
-  // A type parameter the call leaves unbound defaults as the instance it emits as (D4551).
+  // A type parameter the call leaves unbound takes the type of the parameter a binding annotated
+  // with it is seeded from (D6760), else defaults as the instance it emits as (D4551).
   for tp in elabTpDefaults[decl] ?? [] {
     let has = false
     for nm in names {
       if nm == tp { has = true }
     }
     if !has {
+      const st = elabTpSeedTy(decl, tp, names, tys)
       names.push(tp)
-      tys.push(elabTpDefaultTy)
+      tys.push(if st >= 0 { st } else { elabTpDefaultTy })
+    }
+  }
+  // A string literal bound where the signature names a literal lowers as the `string` the
+  // monomorphizer builds the instance at, so the instance is keyed at it.
+  const sig = nodeTyIxOf(decl)
+  if sig >= 0 && sig < T.tys.length {
+    const f = tyAt(sig)
+    if f is TyFunc && elabSigHasLit(f) {
+      let i = 0
+      while i < tys.length {
+        tys[i] = elabStrLitWiden(tys[i], 4)
+        i = i + 1
+      }
     }
   }
   true
+}
+
+// `t` widened to `string` where it is a lone string literal, and its string literal members
+// widened where it is a union that also holds another member; a union of string literals alone
+// is kept, as the monomorphizer keeps it.
+function elabStrLitWiden(t: i32, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length || tyIsLitUnion(t) { return t }
+  elabStrLitWidenGo(t, depth)
+}
+
+function elabStrLitWidenGo(t: i32, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length || depth <= 0 { return t }
+  const ty = tyAt(t)
+  if ty is TyLit { return if ty.litKind == "str" { TY_STR } else { t } }
+  if !(ty is TyUnion) { return t }
+  let acc = -1
+  let changed = false
+  for m in ty.uMembers {
+    const w = elabStrLitWidenGo(m, depth - 1)
+    if w != m { changed = true }
+    acc = if acc < 0 { w } else { joinTys(acc, w) }
+  }
+  if changed && acc >= 0 { acc } else { t }
+}
+
+// The closed type, under `names`/`tys`, of what seeds a binding of `decl`'s body annotated bare
+// with type parameter `tp`: a parameter of `decl`, or a binding annotated with a bound name;
+// -1 when no binding is so seeded, or two seeds disagree.
+function elabTpSeedTy(decl: i32, tp: string, names: string[], tys: i32[]): i32 {
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) { return -1 }
+  let out = -1
+  const stack: i32[] = [dn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if (
+        n is LetDecl
+        && n.letType >= 0
+        && n.letInit >= 0
+        && nodeAt(n.letType) is TypeRef
+      ) {
+        const tn = nodeAt(n.letType)
+        const v = parenPeelIx(n.letInit)
+        if (
+          tn is TypeRef
+          && tn.tyName == tp
+          && v >= 0
+          && nodeAt(v) is Ident
+          && !elabLetAnnotated(identDeclOf(v), tp)
+        ) {
+          const t = elabSeedReadTy(decl, identDeclOf(v), names, tys)
+          if t < 0 || (out >= 0 && out != t) { return -1 }
+          out = t
+        }
+      }
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  out
+}
+
+// Whether `d` is a binding annotated bare with type parameter `tp`.
+function elabLetAnnotated(d: i32, tp: string): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letType < 0 { return false }
+  const tn = nodeAt(n.letType)
+  tn is TypeRef && tn.tyName == tp
+}
+
+// The closed type under `names`/`tys` of declaration `d` read as a seed: a parameter of `decl`,
+// or a binding annotated bare with a bound name; -1 otherwise.
+function elabSeedReadTy(decl: i32, d: i32, names: string[], tys: i32[]): i32 {
+  if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
+    return -1
+  }
+  const n = nodeAt(d)
+  let t = -1
+  if n is Param {
+    const dn = nodeAt(decl)
+    let own = false
+    if dn is FuncDecl {
+      for p in dn.fnParams {
+        if p == d { own = true }
+      }
+    }
+    if own {
+      const held = holePinHeldSet(true)
+      t = substTyDeep(nodeTyIxOf(d), names, tys)
+      holePinHeldSet(held)
+    }
+  } else if n is LetDecl && n.letType >= 0 {
+    const tn = nodeAt(n.letType)
+    if tn is TypeRef {
+      let i = 0
+      while i < names.length && i < tys.length {
+        if names[i] == tn.tyName { t = tys[i] }
+        i += 1
+      }
+    }
+  }
+  if t >= 0 && elabTyClosed(t, 0) { t } else { -1 }
 }
 
 // Whether binding `names`/`tys` closes every parameter `decl`'s body reads, and a declared type
@@ -696,6 +958,12 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   ekIndex[key] = k
   if elabGuessing || (from >= 0 && (elabGuessKeys[from] ?? false)) {
     elabGuessKeys[k] = true
+  }
+  if elabRepresenting || (from >= 0 && (elabReprKeys[from] ?? false)) {
+    elabReprKeys[k] = true
+  }
+  if elabSigAlting || (from >= 0 && (elabSigAltKeys[from] ?? false)) {
+    elabSigAltKeys[k] = true
   }
   const kk = i32ToStr(parent) + "^" + i32ToStr(decl)
   const kids = ekKids[kk] ?? []
@@ -818,7 +1086,14 @@ function elabDemandFrom(
       }
     }
   }
-  if elabCkUsable(decl, call, from) >= 0 && elabCkTakesPins(ck, sig, pTys) {
+  // An argument holding a tagged set binds its hole parameter to the set itself, which no
+  // checker instance at the set's rep has.
+  const tagged = elabCallTaggedArgs(call, decl, from)
+  if (
+    !tagged
+    && elabCkUsable(decl, call, from) >= 0
+    && elabCkTakesPins(ck, sig, pTys)
+  ) {
     elabGuessNote(ck, names0, tys0)
     elabReachNote(from, ck, -1)
     const n1 = ekDecl.length
@@ -837,7 +1112,10 @@ function elabDemandFrom(
     if f is TyFunc {
       let p = 0
       while p < f.fnParamTypes.length && p < pTys.length {
-        if elabTyClosed(pTys[p], 0) && !(p < byId.length && byId[p]) {
+        const at = if tagged { elabCallArgSetTy(call, decl, p, from) } else { -1 }
+        if at >= 0 {
+          bindGenWalk(f.fnParamTypes[p], at, names, tys)
+        } else if elabTyClosed(pTys[p], 0) && !(p < byId.length && byId[p]) {
           bindGenWalk(f.fnParamTypes[p], pTys[p], names, tys)
         }
         p = p + 1
@@ -852,6 +1130,42 @@ function elabDemandFrom(
   if k >= 0 && !ekDone[k] { elabOne(k) }
   elabSettle(n0)
   k
+}
+
+// The tagged set argument `p` of call `call` to `decl` hands an un-annotated parameter, or one
+// its own type parameter alone annotates, or -1.
+function elabCallArgSetTy(call: i32, decl: i32, p: i32, from: i32): i32 {
+  if call < 0 || call >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
+    return -1
+  }
+  const cn = nodeAt(call)
+  const f = nodeAt(decl)
+  if !(cn is Call) || !(f is FuncDecl) { return -1 }
+  if p >= cn.callArgs.length || p >= f.fnParams.length { return -1 }
+  if p < cn.callArgNames.length && cn.callArgNames[p] != "" { return -1 }
+  const q = nodeAt(f.fnParams[p])
+  if !(q is Param) || q.parType >= 0 && !fnTagOwnTyParamAlone(f, p) {
+    return -1
+  }
+  const ax = parenPeelIx(cn.callArgs[p])
+  const t = if ax >= 0 { nodeTyIxOf(ax) } else { -1 }
+  if fnTagSetIsTagged(fnTagSetOfTy(t)) { return t }
+  // A parameter of the calling instance handed on holds the set that instance binds it to.
+  const it = if ax >= 0 && from >= 0 { elabNodeTy(ax, from) } else { -1 }
+  if fnTagSetIsTagged(fnTagSetOfTy(it)) { it } else { -1 }
+}
+
+// Whether some argument of call `call` to `decl` is a tagged set its parameter takes as itself.
+function elabCallTaggedArgs(call: i32, decl: i32, from: i32): boolean {
+  if call < 0 || call >= P.nodes.length { return false }
+  const cn = nodeAt(call)
+  if !(cn is Call) { return false }
+  let p = 0
+  while p < cn.callArgs.length {
+    if elabCallArgSetTy(call, decl, p, from) >= 0 { return true }
+    p = p + 1
+  }
+  false
 }
 
 // Whether declaration `decl`, and each declaration enclosing it, is no generic and has no
@@ -905,11 +1219,11 @@ function elabNestedPerEncl() {
       && !elabBindsNothing(e)
       && f is FuncDecl
       && f.fnTyParams.length == 0
-      && !elabParamsAnnotated(f)
       && sig >= 0
       && sig < T.tys.length
       && !tyHasTyVar(sig)
-      && elabBodyCallsGeneric(d)
+      && ((!elabParamsAnnotated(f) && elabBodyCallsGeneric(d))
+        || (elabBodyReadsOpen(d) && elabSnapIx.has(elabSnapKey(-1, d))))
     ) {
       let a = 0
       const n = ekDecl.length
@@ -924,11 +1238,109 @@ function elabNestedPerEncl() {
   elabSettle(0)
 }
 
+// Whether declaration `d`'s body reads a captured value its template types with an open type, so
+// each instance of its encloser types it apart (D4046).
+function elabBodyReadsOpen(d: i32): boolean {
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) { return false }
+  const stack: i32[] = [dn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is Ident {
+        const dd = identDeclOf(ix)
+        const t = nodeTyIxOf(ix)
+        if (
+          dd >= 0
+          && !nodeContains(d, dd)
+          && t >= 0
+          && t < T.tys.length
+          && tyHasTyVar(t)
+        ) {
+          return true
+        }
+      }
+      if !(n is FuncDecl) {
+        for c in nodeChildren(ix) { stack.push(c) }
+      }
+    }
+  }
+  false
+}
+
 // Whether every parameter of `f` carries a written annotation.
 function elabParamsAnnotated(f: FuncDecl): boolean {
   for p in f.fnParams {
     const pn = nodeAt(p)
     if !(pn is Param) || pn.parType < 0 { return false }
+  }
+  true
+}
+
+// Two calls of one declaration whose arguments are built at the same wider record (D14532's rep
+// row) while the checker typed them apart are one instance at that rep, which mono pins and
+// neither checker instance answers alone; it is checked here, not demanded by the build.
+function elabRepRowInstances() {
+  const rows: i32[] = []
+  const cks: i32[] = []
+  const n = callBindCount()
+  let r = 0
+  while r < n {
+    const reps = callBindRepTysAt(r)
+    const ck = if reps.length > 0 && tysClosed(reps) { elabCallInstFrom(callBindIxAt(r), -1) } else { -1 }
+    if ck >= 0 && elabCkUsable(ekDecl[ck], callBindIxAt(r), -1) == ck {
+      rows.push(r)
+      cks.push(ck)
+    }
+    r = r + 1
+  }
+  let grew = false
+  let i = 0
+  while i < rows.length {
+    let j = i + 1
+    while j < rows.length {
+      if (
+        cks[i] != cks[j]
+        && ekDecl[cks[i]] == ekDecl[cks[j]]
+        && elabSameRow(rows[i], rows[j])
+      ) {
+        const k = elabEnqueue(
+          ekDecl[cks[i]],
+          callBindNamesAt(rows[i]),
+          callBindRepTysAt(rows[i]),
+          -1,
+        )
+        elabReachNote(-1, k, -1)
+        grew = true
+        j = rows.length
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  if grew { elabSettle(0) }
+}
+
+// Whether bind rows `a` and `b` bind the same names to the same rep types.
+function elabSameRow(a: i32, b: i32): boolean {
+  const an = callBindNamesAt(a)
+  const bn = callBindNamesAt(b)
+  const at = callBindRepTysAt(a)
+  const bt = callBindRepTysAt(b)
+  if (
+    an.length != bn.length
+    || at.length != bt.length
+    || at.length != an.length
+  ) {
+    return false
+  }
+  let q = 0
+  while q < an.length {
+    if an[q] != bn[q] || !(at[q] == bt[q] || tySame(at[q], bt[q])) {
+      return false
+    }
+    q = q + 1
   }
   true
 }
@@ -1002,7 +1414,11 @@ function elabSigHasLit(f: TyFunc): boolean {
 function elabPinTakes(pin: i32, bt: i32): i32 {
   if bt < 0 { return 0 }
   if assignable(pin, bt) || tySame(pin, nomErasedTyIx(bt)) { return 1 }
+  // A pin spelled as the binding is, a set by its map or a record by its twin, is that binding.
+  if tyToStructStr(pin) == tyToStructStr(bt) { return 1 }
   if tySame(pin, elabLitBaseTy(bt, 6)) { return 2 }
+  // A record pin wider than the binding is the record the argument is built at, its rep only.
+  if recRepWidens(bt, pin) { return 2 }
   // A storage pin of a value the call's narrowing proved non-null (`P[] | null` beside `P[]`).
   const nn = nonNullTy(pin)
   if nn != pin && nn >= 0 && (tySame(nn, bt) || tyEq(nn, bt)) { return 2 }
@@ -1283,6 +1699,13 @@ function elabOne(k: i32) {
   }
   elabCapEnd()
   if elabGuessKeys[k] ?? false { elabCapDeadDiagsSet(T.diags.length - ed0) }
+  // A diagnostic the re-check raises outside a dead arm, in an instance the program needs, is the
+  // program's error: the first one is kept past the rollback for check to report.
+  // An instance at a set's rep, or at one signature of the generic it holds, is a representation
+  // mono builds, as is every instance it makes; the set-keyed instance answers for the program.
+  if T.diags.length - ed0 > elabCapDeadDiags && !(elabReprKeys[k] ?? false) {
+    elabErrorNote(T.diags[ed0])
+  }
   if sv != null { monoRecheckEnd(sv) }
   checkRollback(em, RB_ALL)
   cbExpTruncate(cbm)
@@ -1318,6 +1741,12 @@ function elabOne(k: i32) {
     rs.push(k)
     rs.push(rt)
     elabNodeReps[ix] = rs
+  }
+  for ix in elabCapCtx.keys() {
+    const cs = elabNodeCtxs[ix] ?? []
+    cs.push(k)
+    cs.push(elabCapCtx[ix] ?? -1)
+    elabNodeCtxs[ix] = cs
   }
   for ix in elabCapRepUnion.keys() {
     const us = elabNodeRepUnions[ix] ?? []
@@ -1376,7 +1805,9 @@ function elabParamArgTargets(k: i32, x: i32): i32[] {
   const f = nodeAt(ekDecl[k])
   if !(f is FuncDecl) { return [-1] }
   const pi = i32ListIndexOf(f.fnParams, d)
-  const cs = elabKeyCalls[k] ?? []
+  // An instance at a set's rep is reached by the calls whose rows it reps.
+  let cs = elabKeyCalls[k] ?? []
+  if cs.length == 0 { cs = elabRepRowCalls[k] ?? [] }
   if pi < 0 || cs.length == 0 { return [-1] }
   const out: i32[] = []
   for c in cs {
@@ -1438,6 +1869,17 @@ function elabSetCallRows(
     let own = elabParamArgTargets(from, cn.callFn)
     if own.length > 0 && own[0] < 0 { own = elabFnSetOf(ct) }
     if own.length > 0 && own[0] >= 0 { all = own }
+    // An instance no call reaches that types the parameter at a closed function type with no set
+    // (a set's rep) calls through that value; its members' instances come from the calls that
+    // hand them over.
+    if (
+      (own.length == 0 || own[0] < 0)
+      && (elabKeyCalls[from] ?? []).length == 0
+      && (elabRepRowCalls[from] ?? []).length == 0
+      && elabTyClosed(ct, 0)
+    ) {
+      return 0
+    }
   }
   // A call through a value has no row of its own: each generic declaration it may hold is
   // instanced at its types, a lambda keeping the instance its own context types.
@@ -1454,10 +1896,23 @@ function elabSetCallRows(
   const cf = tyAt(ct)
   if !(cf is TyFunc) { return 0 }
   const pts: i32[] = []
-  for pt in cf.fnParamTypes {
-    const st = substTyDeep(pt, names, tys)
+  // Substituting names the callee's holes; a probe pins none of them, as `elabParamsClosed`'s.
+  const held = holePinHeldSet(true)
+  for pt in cf.fnParamTypes { pts.push(substTyDeep(pt, names, tys)) }
+  holePinHeldSet(held)
+  for st in pts {
     if st < 0 || !elabTyClosed(st, 0) { return 0 }
-    pts.push(st)
+  }
+  // Inside an instance, each member of a set binds at the arguments' own types, not at the
+  // set's one signature, which another member's parameters may have fixed.
+  if from >= 0 && ms.length >= 2 && cn.callArgs.length == pts.length {
+    let i = 0
+    while i < pts.length {
+      const a = cn.callArgs[i]
+      const at = if a >= 0 { elabCapTy[a] ?? -1 } else { -1 }
+      if at >= 0 && elabTyClosed(at, 0) { pts[i] = at }
+      i = i + 1
+    }
   }
   for m in ms {
     const sig = if m >= 0 && m < P.nodes.length { nodeTyIxOf(m) } else { -1 }
@@ -1492,7 +1947,10 @@ function elabArgRows(ix: i32, d: i32, names: string[], tys: i32[], from: i32) {
   if !(f is TyFunc) || f.fnParamTypes.length != cn.callArgs.length { return 0 }
   let i = 0
   while i < cn.callArgs.length {
+    // Substituting names the callee's holes; a probe pins none of them, as `elabParamsClosed`'s.
+    const held = holePinHeldSet(true)
     const dt = substTyDeep(f.fnParamTypes[i], names, tys)
+    holePinHeldSet(held)
     if dt >= 0 && dt < T.tys.length && elabTyClosed(dt, 0) {
       elabArgValueRows(cn.callArgs[i], dt, from)
     }
@@ -1578,13 +2036,293 @@ function elabSelfRow(
   true
 }
 
+// Replaces the mint facts with one per call each instance makes through a parameter it binds to
+// a function set: the set, the call's argument types and each member's result there, so the tag
+// decision sees every call an instance makes. The number of facts noted.
+export function elabMintFacts(): i32 {
+  mintReset()
+  elabMintCalls = Map()
+  elabMintSets = Map()
+  let n = 0
+  let k = 0
+  while k < ekDecl.length {
+    const dn = nodeAt(ekDecl[k])
+    if dn is FuncDecl && dn.fnBody >= 0 {
+      const sc = mintScopeAt(
+        ekDecl[k],
+        elabInstSpelling(k),
+        ekNames[k],
+        ekTys[k],
+      )
+      n = n + elabMintFactsIn(dn.fnBody, ekDecl[k], k, sc)
+    }
+    k = k + 1
+  }
+  // A set one instance calls through a parameter that another instance of the same function
+  // binds to no set has no one rep there, so it is partial.
+  for c in elabMintCalls.keys() {
+    const at = elabMintCalls[c] ?? []
+    const d = if at.length > 0 { ekDecl[at[0]] } else { -1 }
+    let all = d >= 0
+    let kk = 0
+    while all && kk < ekDecl.length {
+      if (
+        ekDecl[kk] == d
+        && !i32ListHas(at, kk)
+        && !(elabGuessKeys[kk] ?? false)
+        && !(elabCbRepKeys[kk] ?? false)
+        && !(elabSigAltKeys[kk] ?? false)
+      ) {
+        all = false
+      }
+      kk = kk + 1
+    }
+    if !all { mintSetPartialNote(elabMintSets[c] ?? -1) }
+  }
+  n
+}
+
+// The instances a list method's callback takes at its set's rep, which the members' calls never
+// reach through the parameter.
+let elabCbRepKeys: {[i32]: boolean} = Map()
+// The instances `elabSetRepRow` makes at an untagged set's rep or per signature of the one
+// generic it holds, and those they reach: a tagged set's calls reach none of them.
+let elabSigAltKeys: {[i32]: boolean} = Map()
+let elabSigAlting = false
+
+// Each call `elabMintFacts` noted → the instances it noted it in, and the set it went through.
+let elabMintCalls: {[i32]: i32[]} = Map()
+let elabMintSets: {[i32]: i32} = Map()
+
+// The named function and parameter position argument `ix` of call `p` lands in, as
+// `[decl, index]`, when it is a positional argument of a direct call to an un-annotated
+// parameter; [] otherwise.
+function elabMintFwdTarget(ix: i32, p: i32): i32[] {
+  const none: i32[] = []
+  if p < 0 || p >= P.nodes.length { return none }
+  const pn = nodeAt(p)
+  if !(pn is Call) { return none }
+  const d2 = identDeclOf(parenPeelIx(pn.callFn))
+  if d2 < 0 || d2 >= P.nodes.length { return none }
+  const f2 = nodeAt(d2)
+  if !(f2 is FuncDecl) { return none }
+  const j = i32ListIndexOf(pn.callArgs, ix)
+  if j < 0 || j >= f2.fnParams.length { return none }
+  if j < pn.callArgNames.length && pn.callArgNames[j] != "" { return none }
+  const q = nodeAt(f2.fnParams[j])
+  if !(q is Param) || q.parType >= 0 { return none }
+  [d2, j]
+}
+
+// `elabMintFacts` over the subtree at `ix` of declaration `decl`'s body, nested functions aside.
+function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  let n = 0
+  let cur = ix
+  while cur >= 0 {
+    const cn = nodeAt(cur)
+    if cn is FuncDecl {
+      elabMintHandedIn(cur, -1, decl, k, sc)
+      return n
+    }
+    if cn is Call && elabMintFactAt(cn, cur, decl, k, sc) { n = n + 1 }
+    for kid in nodeSpineChildren(cur) {
+      if cn is Call && kid == cn.callFn {
+        n = n + elabMintFactsIn(kid, decl, k, sc)
+      } else {
+        elabMintHandedIn(kid, cur, decl, k, sc)
+        n = n + elabMintFactsIn(kid, decl, k, sc)
+      }
+    }
+    cur = elseIfLink(cur)
+  }
+  n
+}
+
+// Marks partial the set instance `k` binds a parameter of `decl` to, where node `ix` (the child
+// of `p`, or inside a nested function when `p` is -1) reads that parameter other than as a
+// callee: a set handed on is typed where it lands, which this decision does not see.
+function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const xn = nodeAt(ix)
+  if xn is Ident {
+    const pd = identDeclOf(ix)
+    const dn = nodeAt(decl)
+    if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
+      const st = fnTagSetOfTy(elabNodeTy(ix, k))
+      const to = elabMintFwdTarget(ix, p)
+      if to.length == 2 && st >= 0 {
+        mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
+      } else {
+        mintSetPartialNote(st)
+      }
+    }
+    return 0
+  }
+  if xn is Paren { return elabMintHandedIn(xn.parInner, p, decl, k, sc) }
+  if p >= 0 { return 0 }
+  for kid in nodeChildren(ix) { elabMintHandedNested(kid, ix, decl, k, sc) }
+  0
+}
+
+// `elabMintHandedIn` inside a function nested in `decl`'s body, with each node's parent `p`: a
+// captured parameter handed on to a named function's hole is a forward, one called there is a
+// fact of scope row `sc` where its arguments close, and any other read is partial.
+function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const xn = nodeAt(ix)
+  if xn is Ident {
+    const pd = identDeclOf(ix)
+    const dn = nodeAt(decl)
+    if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
+      const st = fnTagSetOfTy(elabNodeTy(ix, k))
+      const to = elabMintFwdTarget(ix, p)
+      const pn = if p >= 0 { nodeAt(p) } else { nodeAt(ix) }
+      if to.length == 2 && st >= 0 {
+        mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
+      } else if (
+        !(pn is Call && pn.callFn == ix && elabMintFactAt(pn, p, decl, k, sc))
+      ) {
+        mintSetPartialNote(st)
+      }
+    }
+    return 0
+  }
+  for kid in nodeChildren(ix) { elabMintHandedNested(kid, ix, decl, k, sc) }
+  0
+}
+
+// Notes the fact for call `c` at `ix` when its callee is a parameter of `decl` that instance `k`
+// binds to a set of functions each instanced at the call's closed argument types.
+function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
+  const cf = parenPeelIx(c.callFn)
+  const pd = identDeclOf(cf)
+  if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return false }
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) || !i32ListHas(dn.fnParams, pd) { return false }
+  const st = elabNodeTy(cf, k)
+  const ds = elabFnSetOf(st)
+  if ds.length == 0 || fnTagSetOfTy(st) < 0 { return false }
+  const wp: i32[] = []
+  let key = ""
+  for a in c.callArgs {
+    const at = elabNodeTy(a, k)
+    if at < 0 || !elabTyClosed(at, 0) { return false }
+    const w = widenLitTy(at)
+    wp.push(w)
+    key = key + tyToStr(w) + ","
+  }
+  const rs: i32[] = []
+  let split = false
+  for d in ds {
+    const r = elabMemberResultAt(d, wp)
+    if r < 0 { return false }
+    const w = widenLitTy(r)
+    if rs.length > 0 && !tySame(w, rs[0]) { split = true }
+    rs.push(w)
+  }
+  mintFactNote(sc, ix, fnTagSetOfTy(st), key, split, rs)
+  if !split { elabNodeTyFill(ix, k, rs[0]) }
+  mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
+  const at = elabMintCalls[ix] ?? []
+  at.push(k)
+  elabMintCalls[ix] = at
+  if (elabMintSets[ix] ?? fnTagSetOfTy(st)) != fnTagSetOfTy(st) {
+    mintSetPartialNote(elabMintSets[ix] ?? -1)
+    mintSetPartialNote(fnTagSetOfTy(st))
+  }
+  elabMintSets[ix] = fnTagSetOfTy(st)
+  true
+}
+
+// Records `t` as call `ix`'s type at instance `k` where the re-check left it open: a callee whose
+// type is a type parameter bound to the set types no result of its own.
+function elabNodeTyFill(ix: i32, k: i32, t: i32) {
+  if ix < 0 || ix >= elabGenTy.length || t < 0 || !elabTyClosed(t, 0) {
+    return 0
+  }
+  const ps = elabNodeTys[ix] ?? []
+  let i = 0
+  while i + 1 < ps.length {
+    if ps[i] == k {
+      if !elabTyClosed(ps[i + 1], 0) { ps[i + 1] = t }
+      elabNodeTys[ix] = ps
+      return 0
+    }
+    i = i + 2
+  }
+  ps.push(k)
+  ps.push(t)
+  elabNodeTys[ix] = ps
+  0
+}
+
+// The result of the instance of `d` the elaboration made at parameter types `pTys`, or -1.
+function elabMemberResultAt(d: i32, pTys: i32[]): i32 {
+  const sig = if d >= 0 && d < P.nodes.length { nodeTyIxOf(d) } else { -1 }
+  if sig < 0 || sig >= T.tys.length { return -1 }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || f.fnParamTypes.length != pTys.length { return -1 }
+  let k = 0
+  while k < ekDecl.length {
+    if ekDecl[k] == d {
+      let same = true
+      let i = 0
+      while i < pTys.length {
+        const st = substTyDeep(f.fnParamTypes[i], ekNames[k], ekTys[k])
+        if st < 0 || !tySame(widenLitTy(st), pTys[i]) { same = false }
+        i = i + 1
+      }
+      if same { return elabResultOf(k) }
+    }
+    k = k + 1
+  }
+  -1
+}
+
+// Whether call `ix` of `d` by name hands an untagged set of functions to an un-annotated
+// parameter, which its row then binds at the set's rep (`elabSetArgBind` keys a tagged one).
+function elabRowAtSetRep(ix: i32, d: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || d < 0 || d >= P.nodes.length {
+    return false
+  }
+  const cn = nodeAt(ix)
+  if !(cn is Call) || identDeclOf(parenPeelIx(cn.callFn)) != d { return false }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) { return false }
+  let i = 0
+  while i < cn.callArgs.length && i < f.fnParams.length {
+    const ax = parenPeelIx(cn.callArgs[i])
+    const st = if ax >= 0 { nodeTyIxOf(ax) } else { -1 }
+    const pn = nodeAt(f.fnParams[i])
+    if (
+      pn is Param
+      && pn.parType < 0
+      && fnTagSetOfTy(st) >= 0
+      && !fnTagSetIsTagged(fnTagSetOfTy(st))
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
 // Runs the worklist from the generic pass's closed calls.
 export function elabRun() {
+  elabCbRepKeys = Map()
+  elabSigAltKeys = Map()
+  elabErrors = []
+  elabReprKeys = Map()
   elabGuessKeys = Map()
   ekDecl = []
   ekNames = []
   ekTys = []
   ekIndex = Map()
+  elabExactMemo = Map()
+  elabExactOnStack = Map()
+  elabExactDepth = 0
+  elabExactPending = []
   ekKids = Map()
   elabKeyGuess = Map()
   ekParent = []
@@ -1592,6 +2330,7 @@ export function elabRun() {
   elabReadsMemo = Map()
   elabCallKeys = Map()
   elabKeyCalls = Map()
+  elabRepRowCalls = Map()
   elabLitArg = Map()
   elabArgInner = Map()
   elabSpreadInner = Map()
@@ -1608,6 +2347,7 @@ export function elabRun() {
   elabNodeTys = Map()
   elabNodeReps = Map()
   elabNodeRepUnions = Map()
+  elabNodeCtxs = Map()
   elabNodeNarrowed = Map()
   elabGenTy = []
   elabDeadKs = Map()
@@ -1641,7 +2381,10 @@ export function elabRun() {
       const rn: string[] = []
       const rt: i32[] = []
       elabRowComplete(ix, d, callBindNamesAt(r), tys, rn, rt)
+      // A row binding an untagged set's value at its rep is that rep's instance.
+      elabSigAlting = elabRowAtSetRep(ix, d)
       const k = elabEnqueue(d, rn, rt, -1)
+      elabSigAlting = false
       elabReachNote(-1, k, ix)
       elabArgRows(ix, d, rn, rt, -1)
       // A call through a set reaches the called member through the direct call built for it.
@@ -1687,7 +2430,9 @@ export function elabRun() {
     }
   }
   elabSettle(0)
+  elabRepRowInstances()
   // A row binding a set of functions is also the instance at the set's rep, which mono builds.
+  const stubRows: i32[] = []
   r = 0
   while r < n {
     const ix = callBindIxAt(r)
@@ -1695,7 +2440,44 @@ export function elabRun() {
     const ck = elabCallInstFrom(ix, -1)
     if ck >= 0 { elabSetRepRow(ix, callBindNamesAt(r), tys, ck) }
     elabSetRepRow(ix, callBindNamesAt(r), tys, -1)
+    if elabRepStubbed { stubRows.push(r) }
     r = r + 1
+  }
+  // A row whose set took the stub rep inside a container, a hole-function member of which no
+  // instance reaches, takes the rep that member's default instance (its parameter holes at `i32`)
+  // gives; a bare set value stays the stub, built as no body.
+  if stubRows.length > 0 {
+    let grew = false
+    for sr in stubRows {
+      const tys = elabSetArgBind(
+        callBindIxAt(sr),
+        callBindNamesAt(sr),
+        callBindTysAt(sr),
+      )
+      const ms: i32[] = []
+      for t in tys {
+        if !(tyAt(t) is TyFunc) { elabFnIdsIn(t, ms, 0) }
+      }
+      for m in ms {
+        const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { nodeAt(0) }
+        if mn is FuncDecl && elabIsHoleFn(m) && !elabHasInstance(m) {
+          const pts: i32[] = []
+          for _p in mn.fnParams { pts.push(TY_I32) }
+          elabGuessing = true
+          elabEnqueueAtParams(m, pts)
+          elabGuessing = false
+          grew = true
+        }
+      }
+    }
+    if grew {
+      elabSettle(0)
+      for sr in stubRows {
+        const ix = callBindIxAt(sr)
+        const tys = elabSetArgBind(ix, callBindNamesAt(sr), callBindTysAt(sr))
+        elabSetRepRow(ix, callBindNamesAt(sr), tys, -1)
+      }
+    }
   }
   // A generic used as a value is also built at its default when nothing binds it (D4551).
   for m in elabFnSetMembers() {
@@ -1735,7 +2517,10 @@ export function elabRun() {
         rep.push(rt)
       }
       if moved && tysClosed(rep) {
-        elabReachNote(-1, elabEnqueue(d, elabCbRootN[cr], rep, -1), -1)
+        const n0 = ekDecl.length
+        const ck = elabEnqueue(d, elabCbRootN[cr], rep, -1)
+        if ck >= n0 { elabCbRepKeys[ck] = true }
+        elabReachNote(-1, ck, -1)
       }
     }
     cr = cr + 1
@@ -1749,15 +2534,18 @@ export function elabRun() {
     if !tysClosed(tys) {
       let ct = elabRowByFnResults(ix, callBindNamesAt(r), tys)
       if ct.length == 0 { ct = elabRowByPlainArgs(ix, callBindNamesAt(r), tys) }
-      if ct.length == 0 { ct = elabRowArgDefaults(ix, tys) }
+      // A row only the D4551 default closes is a guess, as the default instance is.
+      let byDefault = false
+      if ct.length == 0 {
+        ct = elabRowArgDefaults(ix, tys)
+        byDefault = ct.length > 0
+      }
       if ct.length == 0 { ct = elabRowEmptyListDefaults(ix, tys) }
       if ct.length > 0 {
         elabArgRows(ix, elabCallDeclOf(ix), callBindNamesAt(r), ct, -1)
-        elabReachNote(
-          -1,
-          elabEnqueue(elabCallDeclOf(ix), callBindNamesAt(r), ct, -1),
-          ix,
-        )
+        const dk = elabEnqueue(elabCallDeclOf(ix), callBindNamesAt(r), ct, -1)
+        elabReachNote(-1, dk, ix)
+        if byDefault && dk >= 0 { elabGuessKeys[dk] = true }
         elabSettle(0)
       }
     }
@@ -1790,6 +2578,16 @@ function elabCellPeers() {
     }
   }
   elabSettle(0)
+}
+
+// Whether some instance of declaration `d` has been enqueued.
+function elabHasInstance(d: i32): boolean {
+  let k = 0
+  while k < ekDecl.length {
+    if ekDecl[k] == d { return true }
+    k = k + 1
+  }
+  false
 }
 
 // The closed parameter types of an instance of `d`, or [] when none has them.
@@ -1902,6 +2700,178 @@ function elabLamCallRep(lam: i32, pi: i32, pt: i32): i32 {
   rep
 }
 
+// Type `t` (a container of a set of functions) at the signature every function call `ix`'s callee
+// writes into it through the parameter whose hole is `hole` has (`p.push(f)`, `p.set(k, f)`,
+// `p[i] = f`, a generic at its D4551 default); -1 when it writes none, or two that disagree.
+function elabWrittenRep(ix: i32, hole: string, t: i32): i32 {
+  const d = elabCallDeclOf(ix)
+  if d < 0 || d != elabHoleDeclOf(hole) { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) { return -1 }
+  let dot = hole.length - 1
+  while dot > 0 && hole[dot] != '.' { dot = dot - 1 }
+  const pi = decDigitsOf(hole.slice(dot + 1, hole.length))
+  if pi < 0 || pi >= dn.fnParams.length { return -1 }
+  const vals: i32[] = []
+  elabParamWrites(dn.fnBody, dn.fnParams[pi], vals)
+  if vals.length == 0 { return -1 }
+  // A record literal written there holds its function-valued fields.
+  const fns: i32[] = []
+  for v in vals {
+    const vn = nodeAt(parenPeelIx(v))
+    if vn is ObjLit {
+      for fi in vn.objFields {
+        const f = nodeAt(fi)
+        if f is FieldInit { fns.push(f.fiValue) }
+      }
+    } else {
+      fns.push(v)
+    }
+  }
+  let sig = -1
+  for v in fns {
+    const fd = cwFnValueDeclOf(v)
+    let st = if fd >= 0 { nodeTyIxOf(fd) } else { -1 }
+    // A generic written there is built at its default (D4551).
+    if st >= 0 && !elabTyClosed(st, 0) { st = elabDefaultSig(fd) }
+    if st < 0 || !elabTyClosed(st, 0) { return -1 }
+    if sig >= 0 && !tySame(sig, st) { return -1 }
+    sig = st
+  }
+  elabReplaceFnTy(t, sig, 0)
+}
+
+// Appends to `out` each value the code under `ix`, outside a nested function, writes into the
+// parameter `pd`'s slots: `pd.push(v)`, `pd.unshift(v)`, `pd.set(k, v)` and `pd[i] = v`.
+function elabParamWrites(ix: i32, pd: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is FuncDecl { return 0 }
+  if n is Call && n.callArgs.length > 0 {
+    const f = nodeAt(parenPeelIx(n.callFn))
+    if f is Member && identDeclOf(parenPeelIx(f.memObj)) == pd {
+      if f.memProp == "push" || f.memProp == "unshift" {
+        out.push(n.callArgs[0])
+      }
+      if f.memProp == "set" && n.callArgs.length == 2 {
+        out.push(n.callArgs[1])
+      }
+    }
+  }
+  if n is BinExpr && n.binOp == "=" {
+    const l = nodeAt(parenPeelIx(n.binLeft))
+    if l is Index && identDeclOf(parenPeelIx(l.idxArr)) == pd {
+      out.push(n.binRight)
+    }
+  }
+  for c in nodeChildren(ix) { elabParamWrites(c, pd, out) }
+  0
+}
+
+// Type `t` with each function type inside it, through lists, maps and record fields, replaced by
+// `sig`; -1 past the depth bound.
+function elabReplaceFnTy(t: i32, sig: i32, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length || depth > 8 { return -1 }
+  const x = tyAt(t)
+  match x {
+    TyFunc => sig
+    TyArray => {
+      const e = elabReplaceFnTy(x.aElem, sig, depth + 1)
+      if e < 0 { -1 } else { mkArrayTy(e) }
+    }
+    TyMap => {
+      const e = elabReplaceFnTy(x.mVal, sig, depth + 1)
+      if e < 0 { -1 } else { mkMapTy(x.mKey, e, x.mSet) }
+    }
+    TyObj => {
+      const fs: i32[] = []
+      for ft in x.objFieldTypes {
+        const e = elabReplaceFnTy(ft, sig, depth + 1)
+        if e < 0 { return -1 }
+        fs.push(e)
+      }
+      mkObjTy(x.objFieldNames, fs)
+    }
+    TyNullable => {
+      const e = elabReplaceFnTy(x.nInner, sig, depth + 1)
+      if e < 0 { -1 } else { mkNullableTy(e) }
+    }
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => t
+  }
+}
+
+// Whether some instance of `m` that is not a guess has been enqueued.
+function elabCalledAnywhere(m: i32): boolean {
+  let k = 0
+  while k < ekDecl.length {
+    if ekDecl[k] == m && !(elabGuessKeys[k] ?? false) { return true }
+    k = k + 1
+  }
+  false
+}
+
+// The signature generic `m` runs at when call `ix`'s callee, bound at `names`/`tys`, calls it through
+// the parameter whose hole is `hole`: its type parameters bound from those calls' arguments, a
+// lambda argument by its instance at the parameter types already bound; -1 when they do not close
+// or disagree.
+function elabGenericCallRep(
+  ix: i32,
+  hole: string,
+  m: i32,
+  names: string[],
+  tys: i32[],
+): i32 {
+  const d = elabCallDeclOf(ix)
+  const msig = if m >= 0 && m < P.nodes.length { nodeTyIxOf(m) } else { -1 }
+  if d < 0 || d != elabHoleDeclOf(hole) || msig < 0 || msig >= T.tys.length {
+    return -1
+  }
+  const dn = nodeAt(d)
+  const mf = tyAt(msig)
+  if !(dn is FuncDecl) || !(mf is TyFunc) { return -1 }
+  let dot = hole.length - 1
+  while dot > 0 && hole[dot] != '.' { dot = dot - 1 }
+  const pi = decDigitsOf(hole.slice(dot + 1, hole.length))
+  if pi < 0 || pi >= dn.fnParams.length { return -1 }
+  const calls: i32[] = []
+  elabCallsThrough(dn.fnBody, dn.fnParams[pi], calls)
+  let rep = -1
+  for c in calls {
+    const cn = nodeAt(c)
+    if !(cn is Call) || cn.callArgs.length != mf.fnParamTypes.length {
+      return -1
+    }
+    const bn: string[] = []
+    const bt: i32[] = []
+    const lams: i32[] = []
+    let j = 0
+    while j < cn.callArgs.length {
+      const a = parenPeelIx(cn.callArgs[j])
+      if a >= 0 && nodeAt(a) is FuncDecl {
+        lams.push(j)
+      } else {
+        const at = substTyDeep(nodeTyIxOf(cn.callArgs[j]), names, tys)
+        if at < 0 || !elabTyClosed(at, 0) { return -1 }
+        bindGenWalk(mf.fnParamTypes[j], widenLitTy(at), bn, bt)
+      }
+      j = j + 1
+    }
+    for lj in lams {
+      const lp = substTyDeep(mf.fnParamTypes[lj], bn, bt)
+      const lf = if lp >= 0 && lp < T.tys.length { tyAt(lp) } else { mf }
+      if !(lf is TyFunc) || !tysClosed(lf.fnParamTypes) { return -1 }
+      const ft = elabMemberAt(parenPeelIx(cn.callArgs[lj]), lf.fnParamTypes)
+      if ft < 0 { return -1 }
+      bindGenWalk(mf.fnParamTypes[lj], ft, bn, bt)
+    }
+    const f = substTyDeep(msig, bn, bt)
+    if f < 0 || !elabTyClosed(f, 0) { return -1 }
+    if rep >= 0 && !tySame(rep, f) { return -1 }
+    rep = f
+  }
+  rep
+}
+
 // Appends to `out` each call under node `ix`, outside a nested function, whose callee reads the
 // parameter `pd`.
 function elabCallsThrough(ix: i32, pd: i32, out: i32[]) {
@@ -1943,18 +2913,53 @@ function elabMemberAt(m: i32, ats: i32[]): i32 {
 // Enqueues call `ix`'s row `names`/`tys` with each set of functions taking its rep at `ck`
 // (`elabSetRepTy`), when one moves and the row closes.
 function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
+  // A direct call by name reaches the set-keyed instance once the set is tagged; a call through
+  // a value reaches the function at its rep, whatever the set.
+  const cn0 = nodeAt(ix)
+  const direct = cn0 is Call
+    && identDeclOf(parenPeelIx(cn0.callFn)) == elabCallDeclOf(ix)
   const rep: i32[] = []
   let moved = false
   elabRepStubbed = false
+  let i0 = 0
   for t in tys {
-    const rt = elabSetRepTy(t, 4, ck)
+    const stubbed0 = elabRepStubbed
+    elabRepStubbed = false
+    // The one generic a set holds runs at what the callee's own calls through the parameter bind,
+    // else at the set's rep.
+    let rt = -1
+    const ms = elabFnSetOf(t)
+    if ms.length == 1 && i0 < names.length && !elabIsHoleFn(ms[0]) {
+      rt = elabGenericCallRep(ix, names[i0], ms[0], names, tys)
+    }
+    // A set the callee writes functions into through the parameter runs at their signature.
+    const held: i32[] = []
+    elabFnIdsIn(t, held, 0)
+    if rt < 0 && i0 < names.length && held.length > 0 {
+      rt = elabWrittenRep(ix, names[i0], t)
+    }
+    if rt < 0 { rt = elabSetRepTy(t, 4, ck) }
+    // A tagged set is keyed by itself, so it has no instance at its rep.
+    if direct && fnTagSetIsTagged(fnTagSetOfTy(t)) { rt = t }
+    elabRepStubbed = elabRepStubbed || stubbed0
     if rt != t { moved = true }
     rep.push(rt)
+    i0 = i0 + 1
   }
   if moved && rep.length > 0 && tysClosed(rep) {
     // A set no member gives a signature reps as a stub no call reaches, so its instance is a guess.
     elabGuessing = elabRepStubbed
-    elabReachNote(-1, elabEnqueue(elabCallDeclOf(ix), names, rep, -1), -1)
+    elabRepresenting = true
+    elabSigAlting = direct
+    const rk = elabEnqueue(elabCallDeclOf(ix), names, rep, -1)
+    elabSigAlting = false
+    elabRepresenting = false
+    elabReachNote(-1, rk, -1)
+    if rk >= 0 {
+      const rc = elabRepRowCalls[rk] ?? []
+      if !i32ListHas(rc, ix) { rc.push(ix) }
+      elabRepRowCalls[rk] = rc
+    }
     elabGuessing = false
     elabSettle(0)
     return 0
@@ -1976,11 +2981,17 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
   if ms.length != 1 || !elabReturnsParam(elabCallDeclOf(ix), names[at]) {
     return 0
   }
+  // A tagged set is keyed by itself, so it has no instance per signature.
+  if fnTagSetIsTagged(fnTagSetOfTy(tys[at])) { return 0 }
   for f in elabMemberSigs(ms[0]) {
     const alt = tys.slice(0, tys.length)
     alt[at] = f
     if tysClosed(alt) {
+      elabRepresenting = true
+      elabSigAlting = true
       elabReachNote(-1, elabEnqueue(elabCallDeclOf(ix), names, alt, -1), -1)
+      elabSigAlting = false
+      elabRepresenting = false
     }
   }
   elabSettle(0)
@@ -2100,15 +3111,18 @@ function elabSetRepTy(t: i32, depth: i32, ck: i32): i32 {
   if ms.length == 0 { return t }
   let rep = -1
   for m in ms {
-    // A generic no instance reaches is built at its default (D4551).
+    // A generic no instance reaches is built at its default (D4551), unless calls elsewhere
+    // instance it, when it gives the set nothing and an unwritten set reps as the stub (D4123).
+    let skip = false
     if ck >= 0 && elabReachedOf(ck, m) == -1 {
-      const d = elabDefaultSig(m)
+      skip = elabCalledAnywhere(m)
+      const d = if skip { -1 } else { elabDefaultSig(m) }
       if d >= 0 {
         if rep >= 0 && !tySame(rep, d) { return -1 }
         rep = d
       }
     }
-    for k in elabRepInstances(ck, m) {
+    for k in if skip { [] } else { elabRepInstances(ck, m) } {
       if k < 0 { return -1 }
       const sig = nodeTyIxOf(m)
       const sf = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { ty }
@@ -2252,6 +3266,12 @@ function elabRowComplete(
   }
   for tp in f.fnTyParams {
     if strListHas(outN, tp) { continue }
+    const gs = elabTpGenericSeed(f, tp, cn)
+    if gs >= 0 {
+      outN.push(tp)
+      outT.push(gs)
+      continue
+    }
     let a = 0
     while a < f.fnParams.length && a < cn.callArgs.length {
       const pt = nodeTyIxOf(f.fnParams[a])
@@ -2282,6 +3302,41 @@ function elabRowComplete(
     }
   }
   0
+}
+
+// The signature of the one generic function call `cn` hands the parameter of `f` that seeds a
+// binding of `f`'s body annotated bare with type parameter `tp`, so each call through the binding
+// instances the generic at its own types; -1 when no such seed holds one generic, or two disagree.
+function elabTpGenericSeed(f: FuncDecl, tp: string, cn: Call): i32 {
+  let out = -1
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is LetDecl && n.letType >= 0 && n.letInit >= 0 {
+        const tn = nodeAt(n.letType)
+        const v = parenPeelIx(n.letInit)
+        if tn is TypeRef && tn.tyName == tp && v >= 0 && nodeAt(v) is Ident {
+          const pd = identDeclOf(v)
+          let a = 0
+          while a < f.fnParams.length && f.fnParams[a] != pd { a = a + 1 }
+          if a >= f.fnParams.length || a >= cn.callArgs.length { return -1 }
+          const ms = elabCalleeTargets(cn.callArgs[a])
+          if ms.length != 1 || ms[0] < 0 || ms[0] >= P.nodes.length {
+            return -1
+          }
+          const g = nodeAt(ms[0])
+          if !(g is FuncDecl) || g.fnTyParams.length == 0 { return -1 }
+          const t = nodeTyIxOf(parenPeelIx(cn.callArgs[a]))
+          if t < 0 || !tyHasTyVar(t) || (out >= 0 && out != t) { return -1 }
+          out = t
+        }
+      }
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  out
 }
 
 // Row `names`/`tys` of call `ix` with each open binding taken from an argument that is no function
@@ -2443,8 +3498,9 @@ function elabArgResultAt(a: i32, pf: TyFunc, names: string[], tys: i32[]): i32 {
   widenLitTy(out)
 }
 
-// Binding `tys` of call `ix` with each un-annotated parameter handed a tagged set bound to the set
-// itself: the instance calls each member at its own arguments, so no one signature stands for it.
+// Binding `tys` of call `ix` with each un-annotated parameter, or one its own type parameter
+// alone annotates, handed a tagged set bound to the set itself: the instance calls each member at its own arguments, so no one signature stands for it.
+// One handed only uncalled hole functions is bound to the stub the monomorphizer primed.
 function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
   const cn = nodeAt(ix)
   const d = elabCallDeclOf(ix)
@@ -2458,8 +3514,30 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
     const st = nodeTyIxOf(parenPeelIx(cn.callArgs[i]))
     const named = i < cn.callArgNames.length && cn.callArgNames[i] != ""
     const pn = nodeAt(f.fnParams[i])
-    if !named && pn is Param && pn.parType < 0 && fnTagTyIsTagged(st) {
+    const alone = pn is Param && pn.parType >= 0 && fnTagOwnTyParamAlone(f, i)
+    // An argument of only uncalled hole functions binds the stub it is delivered at (D6881).
+    const stub = elabStubArg.get(i32ToStr(ix) + ":" + i32ToStr(i)) ?? -1
+    if !named && pn is Param && pn.parType < 0 && stub >= 0 {
       const hn = elabHoleRootName(nodeTyIxOf(f.fnParams[i]))
+      let j = 0
+      while j < names.length && j < out.length {
+        if hn != "" && names[j] == hn {
+          if !copied {
+            out = tys.slice(0, tys.length)
+            copied = true
+          }
+          out[j] = stub
+        }
+        j = j + 1
+      }
+    } else if (
+      !named
+      && pn is Param
+      && (pn.parType < 0 || alone)
+      && fnTagTyIsTagged(st)
+    ) {
+      const tn = if alone { nodeAt(pn.parType) } else { nodeAt(f.fnParams[i]) }
+      const hn = if tn is TypeRef { tn.tyName } else { elabHoleRootName(nodeTyIxOf(f.fnParams[i])) }
       let j = 0
       while j < names.length && j < out.length {
         if hn != "" && names[j] == hn {
@@ -2536,6 +3614,13 @@ export function elabNodeTy(ix: i32, k: i32): i32 {
 }
 
 // Type `t` under instance `k`'s binding, or -1 where that does not close.
+// `t` at the instance emitted function `fnIx` is, or is lifted inside: that instance's binding
+// substituted; -1 outside one or where the substitution leaves it open.
+export function elabInstTyAt(t: i32, fnIx: i32): i32 {
+  if fnIx < 0 { return -1 }
+  elabSubstClosed(t, elabKeyAt(fnIx))
+}
+
 function elabSubstClosed(t: i32, k: i32): i32 {
   if t < 0 || t >= T.tys.length || k < 0 || k >= ekNames.length { return -1 }
   let names = ekNames[k]
@@ -2626,6 +3711,12 @@ function elabResultOf(k: i32): i32 {
 }
 
 // The type emitted function `fnIx`'s instance elaboration stamped node `ix` with, or -1.
+// The destination type node `ix` is delivered at in emitted function `fnIx`'s instance, or -1.
+export function elabNodeCtxAt(ix: i32, fnIx: i32): i32 {
+  if ix < 0 || !elabBankHolds(elabNodeCtxs, ix) { return -1 }
+  elabPairIn(elabNodeCtxs, ix, elabKeyAt(fnIx))
+}
+
 export function elabNodeRepAt(ix: i32, fnIx: i32): i32 {
   if ix < 0 { return -1 }
   elabPairIn(elabNodeReps, ix, elabKeyAt(fnIx))
@@ -2700,11 +3791,7 @@ function litKeptRepFrom(ix: i32, depth: i32): i32 {
   const p = parenPeelIx(ix)
   if p < 0 || p >= P.nodes.length { return -1 }
   const n = nodeAt(p)
-  if n is Call {
-    const fd = recInferredFnOf(p)
-    if fd < 0 { return -1 }
-    return recKeptFnDstOf(fd, nonNulTyOf(nodeTyIxOf(p)))
-  }
+  if n is Call { return litKeptCallRep(p, depth) }
   if n is ArrayLit {
     let r = -1
     for e in n.arrElems {
@@ -2715,6 +3802,29 @@ function litKeptRepFrom(ix: i32, depth: i32): i32 {
     return if r >= 0 { mkArrayTy(r) } else { -1 }
   }
   litKeptObjRep(p, depth)
+}
+
+// `litKeptRepOf` at a call `p`: a kept function's record, through a generic or hole identity
+// to its argument, or through a function every result of which is a binding of such a call.
+function litKeptCallRep(p: i32, depth: i32): i32 {
+  const sa = recSolePinArg(p)
+  if sa >= 0 { return litKeptRepOf(sa, depth - 1) }
+  const fd = recInferredFnOf(p)
+  if fd < 0 { return -1 }
+  const kd = recKeptFnDstOf(fd, nonNulTyOf(nodeTyIxOf(p)))
+  if kd >= 0 { return kd }
+  const ha = recHoleIdentityArg(p, fd)
+  if ha >= 0 { return litKeptRepOf(ha, depth - 1) }
+  let r = -1
+  for lf in recFnValueLeaves(fd) {
+    const hd = if lf >= 0 && nodeAt(lf) is Ident { recHeldDecl(lf) } else { -1 }
+    const hn = if hd >= 0 { nodeAt(hd) } else { null }
+    if !(hn is LetDecl) { return -1 }
+    const lr = litKeptRepOf(hn.letInit, depth - 1)
+    if lr < 0 || (r >= 0 && !tySame(r, lr)) { return -1 }
+    r = lr
+  }
+  r
 }
 
 // `litKeptRepOf` at a record literal `p`: its own type with each field holding a kept result
@@ -2857,6 +3967,29 @@ export function elabSpreadRunNote(run: i32, h: i32) {
   0
 }
 
+// Node `ix`'s type wherever it is built: its recorded type where that carries no type parameter
+// or no instance records it, else its closed type at each instance that does, without repeats.
+export function elabNodeInstTys(ix: i32): i32[] {
+  const ty = nodeTyIxOf(ix)
+  let ps = elabNodeTys[ix] ?? []
+  if ps.length == 0 { ps = elabNodeTys[nodeSrc[ix] ?? -1] ?? [] }
+  if ty < 0 || ty >= T.tys.length || !tyHasTyVar(ty) || ps.length == 0 {
+    return [ty]
+  }
+  const out: i32[] = []
+  let i = 0
+  while i + 1 < ps.length {
+    const t = elabNodeTy(ix, ps[i])
+    let seen = t < 0
+    for o in out {
+      if o == t { seen = true }
+    }
+    if !seen { out.push(t) }
+    i = i + 2
+  }
+  out
+}
+
 // The closed types instances build literal `ix` (or the node it copies) at: what each one's
 // elaboration gave it (`litRepTyIn`), else its own type there. Each instance that records the
 // literal contributes at most one.
@@ -2943,6 +4076,8 @@ let ekReach: i32[][] = []
 let elabCallKeys: {[i32]: i32[]} = Map()
 // The calls that reached each instance: key → call nodes.
 let elabKeyCalls: {[i32]: i32[]} = Map()
+// Each instance at a set's rep (`elabSetRepRow`): key → the calls whose rows it reps.
+let elabRepRowCalls: {[i32]: i32[]} = Map()
 // Each list or record literal argument of a call an instance reaches: literal → [call, position].
 let elabLitArg: {[i32]: i32[]} = Map()
 // Each list literal nested in such an argument's elements → the list literal holding it.
@@ -3204,6 +4339,12 @@ function elabHasPairs(bank: {[i32]: i32[]}, ix: i32): boolean {
 
 // Instance `k`'s entry for node `ix` (or the node it copies) in a `[key, type, ...]` bank; -1
 // for none.
+// Whether `bank` holds a row for node `ix` or for the source node it copies, so a reader can
+// decline before it walks to the instance's key.
+function elabBankHolds(bank: {[i32]: i32[]}, ix: i32): boolean {
+  bank.has(ix) || bank.has(nodeSrc[ix] ?? -1)
+}
+
 function elabPairIn(bank: {[i32]: i32[]}, ix: i32, k: i32): i32 {
   if k < 0 { return -1 }
   let rs = bank[ix] ?? elabFnNone

@@ -1,25 +1,30 @@
-// A generic call's bind row taken at the record its argument is built at. Where record adoption
-// builds an argument at its delivery's record rather than at its own type, each type variable
-// that argument alone bound takes the delivered record, so the call's instance is the one the
-// argument is built at and the emitter reads it rather than re-deriving it (D8202).
-import { Call, FuncDecl, Ident, ObjLit, P, nodeAt } from "./ast"
+// A generic call's rep row: the record its argument is built at. Where record adoption builds an
+// argument at its delivery's record rather than at its own type, each type variable that
+// argument alone bound has that record as its rep, beside the type the row keeps, so the
+// instance is typed at the binding and stored at the build (D14426).
+import { Call, FuncDecl, Ident, LetDecl, ObjLit, P, nodeAt } from "./ast"
 import {
   callBindCount,
   callBindIxAt,
   callBindNamesAt,
+  callBindRepTysAt,
+  callBindRepTysSet,
+  callBindRowOf,
   callBindTysAt,
-  callBindTysSet,
 } from "./check_bind_rows"
 import { nodeRepTyIxOf } from "./check_core_state"
 import { elabCallDeclOf } from "./check_elab_cap"
 import { nodeTyIxOf } from "./check_node_tys"
 import { parenPeelIx } from "./check_places"
-import { recFreshDeclOf } from "./check_rec_fresh"
-import { recBuildTyOf } from "./check_rec_rows"
+import { recFreshDeclOf, recHeldDecl } from "./check_rec_fresh"
+import { recArgRepOf, recBuildTyOf, recKeptFnDstOf } from "./check_rec_rows"
+import { recBuiltReadTy, recHoleIdentityArg } from "./check_fit_rules"
+import { nonNullTy } from "./tyquery"
 import { recSolePinArg } from "./check_record_origins"
-import { assignable, bindGenWalk } from "./check_relate_core"
+import { assignable, bindGenWalk, substTyDeep } from "./check_relate_core"
 import { identBoundFnDeclOf } from "./check_scopes"
 import { recFnValueLeaves } from "./check_type_shape"
+import { strListHas } from "./listutil"
 import {
   T,
   TyFunc,
@@ -33,16 +38,72 @@ import {
 // How many sole-pin identities and argument-free calls a rebuilt literal is followed through.
 export const REC_REBUILT_DEPTH = 8
 
-// Re-keys every bind row at its arguments' adopted records. Run once the check has settled.
-export function callBindAdoptRekey() {
+// Records every bind row's rep at its arguments' adopted records. Run once the check has settled.
+export function callBindAdoptReps() {
   let r = 0
   const n = callBindCount()
   while r < n {
     const tys = cbaRow(callBindIxAt(r), callBindNamesAt(r), callBindTysAt(r))
-    if tys.length > 0 { callBindTysSet(r, tys) }
+    if tys.length > 0 { callBindRepTysSet(r, tys) }
     r = r + 1
   }
   0
+}
+
+// The type argument `i` of call `ix` is built at: what the call's rep row binds its parameter
+// to, where that is a wider record over the same fields than `ty`, the instance's type; else `ty`.
+export function callArgRepTy(ix: i32, i: i32, ty: i32): i32 {
+  const r = callBindRowOf(ix)
+  if r < 0 || callBindRepTysAt(r).length == 0 { return ty }
+  const decl = elabCallDeclOf(ix)
+  if decl < 0 || decl >= P.nodes.length { return ty }
+  const sig = nodeTyIxOf(decl)
+  if sig < 0 || sig >= T.tys.length { return ty }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || i < 0 || i >= f.fnParamTypes.length { return ty }
+  const rt = substTyDeep(
+    f.fnParamTypes[i],
+    callBindNamesAt(r),
+    callBindRepTysAt(r),
+  )
+  if recRepWidens(ty, rt) { rt } else { ty }
+}
+
+// The record argument `a`, typed `own`, is built at where that is another record than `own`: the
+// rep a by-rep instance takes, its rep stamp, a rebuilt literal or call, a fresh binding's build,
+// or a read out of a built container; else -1. The one answer the bind rows and mono read.
+export function recArgBuiltTyOf(a: i32, own: i32): i32 {
+  const ar = recArgRepOf(parenPeelIx(a))
+  if ar >= 0 { return ar }
+  let rt = nodeRepTyIxOf(a)
+  if rt == own { rt = recRebuiltLeafRow(a, REC_REBUILT_DEPTH) }
+  if rt < 0 || rt == own { rt = cbaBuildTyOf(a, rt) }
+  // A read out of a container its stores build at another record is stored there.
+  if rt < 0 || rt == own {
+    const br = recBuiltReadTy(parenPeelIx(a))
+    if br >= 0 { rt = nonNullTy(br) }
+  }
+  if rt >= 0 && rt != own && rt < T.tys.length && tyAt(rt) is TyObj {
+    rt
+  } else {
+    -1
+  }
+}
+
+// Whether record `wide` is another record over the same field names as record `narrow`, which
+// is assignable to it: the record a value of `narrow` is built at when adoption widens it.
+export function recRepWidens(narrow: i32, wide: i32): boolean {
+  if narrow < 0 || narrow >= T.tys.length || wide < 0 || wide >= T.tys.length {
+    return false
+  }
+  const n = tyAt(narrow)
+  const w = tyAt(wide)
+  if !(n is TyObj) || !(w is TyObj) || tySame(narrow, wide) { return false }
+  if n.objFieldNames.length != w.objFieldNames.length { return false }
+  for f in n.objFieldNames {
+    if !strListHas(w.objFieldNames, f) { return false }
+  }
+  assignable(narrow, wide)
 }
 
 // Row `names`/`tys0` of call `ix` with each name an argument alone bound replaced by what it
@@ -64,10 +125,8 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
   while i < cn.callArgs.length {
     const a = cn.callArgs[i]
     const own = nodeTyIxOf(a)
-    let rt = nodeRepTyIxOf(a)
-    if rt == own { rt = recRebuiltLeafRow(a, REC_REBUILT_DEPTH) }
-    if rt < 0 || rt == own { rt = cbaBuildTyOf(a, rt) }
-    if rt >= 0 && rt != own && rt < T.tys.length && tyAt(rt) is TyObj {
+    const rt = recArgBuiltTyOf(a, own)
+    if rt >= 0 {
       const dN: string[] = []
       const dT: i32[] = []
       bindGenWalk(f.fnParamTypes[i], rt, dN, dT)
@@ -130,7 +189,8 @@ export function recRebuiltRetRow(fd: i32, depth: i32): i32 {
 }
 
 // The record value `lf` is built at when it is an object literal adopted at another record, an
-// identity over one, or an argument-free call of an inferred function whose results are; else -1.
+// identity over one, a binding of one, or an argument-free call of an inferred function whose
+// results are; else -1.
 export function recRebuiltLeafRow(lf: i32, depth: i32): i32 {
   const lp = parenPeelIx(lf)
   if lp < 0 || lp >= P.nodes.length || depth <= 0 { return -1 }
@@ -142,6 +202,17 @@ export function recRebuiltLeafRow(lf: i32, depth: i32): i32 {
   }
   const sp = recSolePinArg(lp)
   if sp >= 0 { return recRebuiltLeafRow(sp, depth - 1) }
+  // A binding that holds only its initializer is built where the initializer is.
+  if n is Ident {
+    const hd = recHeldDecl(lp)
+    const hn = if hd >= 0 { nodeAt(hd) } else { null }
+    if hn is LetDecl { return recRebuiltLeafRow(hn.letInit, depth - 1) }
+    return -1
+  }
+  if n is Call && n.callFn >= 0 && n.callFn < P.nodes.length {
+    const ha = recHoleIdentityArg(lp, identBoundFnDeclOf(n.callFn))
+    if ha >= 0 { return recRebuiltLeafRow(ha, depth - 1) }
+  }
   if (
     n is Call
     && n.callArgs.length == 0
@@ -154,6 +225,9 @@ export function recRebuiltLeafRow(lf: i32, depth: i32): i32 {
       if cd >= 0 && cd < P.nodes.length {
         const f = nodeAt(cd)
         if f is FuncDecl && f.fnRet < 0 && f.fnTyParams.length == 0 {
+          // A kept delivery builds the function's result at its own record.
+          const kd = recKeptFnDstOf(cd, nodeTyIxOf(lp))
+          if kd >= 0 && kd < T.tys.length && tyAt(kd) is TyObj { return kd }
           return recRebuiltRetRow(cd, depth - 1)
         }
       }

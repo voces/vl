@@ -21,7 +21,7 @@
 // detector that stopped counting cannot pass quietly.
 //
 // The fourth holds the index rule: an integer register holding a per-program id that only an
-// inner function clears. Ignoring `wasmEmitStateReset`'s clears must name `nulWidenWriteRhs`,
+// inner function clears. Ignoring `wasmEmitStateReset`'s clears must name `ssArmRhs`,
 // which is D11770 put back.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed.
@@ -40,7 +40,7 @@ const CONTROL_NAMES = ["capFrame", "gckDepth", "irkDepth", "lrDepth", "bcDepth"]
 
 /** The index rule's control: the reset whose line D11770 added, and the register it clears. */
 const INDEX_CONTROL_RESET = "wasmEmitStateReset";
-const INDEX_CONTROL_NAME = "nulWidenWriteRhs";
+const INDEX_CONTROL_NAME = "ssArmRhs";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -154,7 +154,7 @@ Deno.test({
     if (held.code !== 0 || !/unguarded inner index registers 0\b/.test(held.out)) {
       throw new Error(`--check on the tree: want exit 0 and 0 unguarded, got ${held.code}\n${held.out}`);
     }
-    // D11770's shape: `nulWidenWriteRhs` keeps its inner clear in `emitAssignUnder`, so without
+    // D11770's shape: `ssArmRhs` keeps its inner clear in `strSiteArm`, so without
     // the reset's clear it is no NEVER row, and only the index rule can see it.
     const red = await audit(["--check", "--without-reset", INDEX_CONTROL_RESET]);
     if (

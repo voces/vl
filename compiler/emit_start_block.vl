@@ -16,7 +16,7 @@ import {
   nodeAt,
 } from "./ast"
 import { nodeTyIsUnionAlias } from "./check_decl_scan"
-import { nodeTyPinIxOf } from "./check_hole_pins"
+import { nodeTyIxOf } from "./check_node_tys"
 import { luDeclPosOf } from "./check_list_union"
 import { isValueUnionName, nameIsLitUnionArmValueUnion } from "./check_ty_rep"
 import {
@@ -66,7 +66,7 @@ import {
   unVarCount,
 } from "./emit_state"
 import { declaredKind, declaredSlotOf } from "./emit_struct_order"
-import { holeOperandTyOf, pinSubOperandTyOf } from "./emit_ty_canon"
+import { elabClosedTyAt, holeOperandTyOf, nodeTyInOf } from "./emit_ty_canon"
 import {
   UNION_SPELLING_DECLINE,
   annRowOfNode,
@@ -81,11 +81,11 @@ import {
   isUNameDeclAB,
   unMemIsMap,
   unMemIsRefElemArray,
-  unRowOfCanon,
   unRowOfName,
   unionNameNonNullCount,
   unionRowNameAB,
 } from "./emit_union_registry"
+import { unRowOfTyKey } from "./emit_union_tykey"
 import {
   identDeclOf,
   sidArrGet,
@@ -461,8 +461,8 @@ export function paramUnionRetName(fnIx: i32, name: string) {
 // atom — that node `ix`'s own type is, or "". A `??` result reps as the value box exactly
 // there: an all-atom union is `isValueUnionName`'s, and a literal union is an interned i32 this
 // must not claim, which is what asking for a variant arm excludes (D1703).
-export function nodeMixedUnionName(ix: i32): string {
-  const nm = nodeRegisteredUnionName(ix)
+export function nodeMixedUnionName(ix: i32, fnIx: i32): string {
+  const nm = nodeRegisteredUnionName(ix, fnIx)
   if nm == "" { return "" }
   const u = unRowOfName(nm)
   if u < 0 { return "" }
@@ -501,7 +501,7 @@ function unionHoldsStrLit(ty: i32): boolean {
 // union (`i32 | "a" | "b"`) is the value box, and neither the value-union render nor the mixed
 // rung names its row.
 export function nodeJoinRowName(ix: i32, fnIx: i32): string {
-  let pin = nodeTyPinIxOf(ix)
+  let pin = nodeTyInOf(ix, fnIx)
   const held = holeOperandTyOf(ix, fnIx)
   if held >= 0 { pin = held }
   if (
@@ -519,8 +519,8 @@ export function nodeJoinRowName(ix: i32, fnIx: i32): string {
 // than `nodeMixedUnionName`, whose second clause also excludes an ALL-variant join (`A | B`);
 // both exclude a literal union, which is an interned i32 and not a box. A map arm boxes under
 // its own tag with no variant row, so a join of two maps is the box too (D2666).
-export function nodeVariantUnionName(ix: i32): string {
-  const nm = nodeRegisteredUnionName(ix)
+export function nodeVariantUnionName(ix: i32, fnIx: i32): string {
+  const nm = nodeRegisteredUnionName(ix, fnIx)
   if nm == "" { return "" }
   const u = unRowOfName(nm)
   if u < 0 { return "" }
@@ -531,17 +531,17 @@ export function nodeVariantUnionName(ix: i32): string {
 // The union a `??` RESULT reps as, or "": the checker's own type for the node when its render
 // names a value union, else the variant-bearing row keyed on the node's canon. One home, so
 // the lowering, the destination and the stash reservation cannot disagree about the rep.
-export function coalesceResultUnionName(ix: i32): string {
-  const nm = unionSpellingOfTy(nodeTyPinIxOf(ix), 8)
+export function coalesceResultUnionName(ix: i32, fnIx: i32): string {
+  const nm = unionSpellingOfTy(nodeTyInOf(ix, fnIx), 8)
   if nm != UNION_SPELLING_DECLINE {
     if isValueUnionName(nm) { return nm }
     // A join grouping string literals into a literal-union arm (`K|i32`) boxes as its row (D2952).
     if nameIsLitUnionArmValueUnion(nm) && unRowOfName(nm) >= 0 { return nm }
   }
-  const vn = nodeVariantUnionName(ix)
+  const vn = nodeVariantUnionName(ix, fnIx)
   if vn != "" { return vn }
   // A row whose arm is a list of lists is a box too, though it has no variant (D2819).
-  const rn = nodeRegisteredUnionName(ix)
+  const rn = nodeRegisteredUnionName(ix, fnIx)
   if rn != "" && unionHasRefArrayArm(rn) { return rn }
   ""
 }
@@ -560,13 +560,13 @@ function unionHasRefArrayArm(name: string): boolean {
 
 // Is the `??` at `ix` typed as a union box, two or more non-null members under one row? Then
 // no single record row answers for its value, whatever rep its left operand has (D2373).
-export function coalesceResultIsBox(ix: i32): boolean {
+export function coalesceResultIsBox(ix: i32, fnIx: i32): boolean {
   if ix < 0 { return false }
   const e = nodeAt(ix)
   if e is BinExpr {
     if e.binOp != "??" { return false }
     // The arena answers first: a result that is no union, or a one-member niche, renders nothing.
-    let rt = nodeTyPinIxOf(ix)
+    let rt = nodeTyInOf(ix, fnIx)
     if rt < 0 || rt >= T.tys.length { return false }
     const rtt = tyAt(rt)
     if rtt is TyNullable { rt = rtt.nInner }
@@ -574,7 +574,7 @@ export function coalesceResultIsBox(ix: i32): boolean {
     const rtu = tyAt(rt)
     if !(rtu is TyUnion) { return false }
     if rtu.uMembers.length < 2 { return false }
-    const jn = coalesceResultUnionName(ix)
+    const jn = coalesceResultUnionName(ix, fnIx)
     if jn == "" { return false }
     return unionNameNonNullCount(jn) >= 2
   }
@@ -602,19 +602,19 @@ export function coalesceChainLeftmost(ix: i32): i32 {
 
 // The registered union a node's own type is, when its render cannot name it: an inference
 // (a desugared `??`, a hole-param call) renders its union arms structurally, so a name-keyed
-// registry scan finds nothing. `unRowOfCanon` answers from the canon-keyed reverse index
-// instead, naming the row every downstream member-set, narrow and variant lookup keys on. D1561.
-export function nodeRegisteredUnionName(ix: i32): string {
-  const ty = nodeTyPinIxOf(unwrapParen(ix))
+// registry scan finds nothing. The type key (`unRowOfTyKey`) answers instead, naming the row
+// every downstream member-set, narrow and variant lookup keys on. D1561.
+export function nodeRegisteredUnionName(ix: i32, fnIx: i32): string {
+  const ty = nodeTyInOf(unwrapParen(ix), fnIx)
   if ty < 0 { return "" }
   const t = tyAt(ty)
   // Exhaustive over `Ty` and `_`-less. A nullable union is a union too — `string | A | null`
-  // interns as `TyNullable` over the non-null members — and the `unRowOfCanon` scan is a pass
-  // over every registered row, so only those two shapes pay it.
+  // interns as `TyNullable` over the non-null members — and the type-key lookup renders a key
+  // text of the whole type, so only those two shapes pay it.
   match t {
     TyUnion => {
       if t.uMembers.length < 2 { return "" }
-      const u = unRowOfCanon(ty)
+      const u = unRowOfTyKey(ty)
       if u >= 0 { return unNames[u] }
     }
     TyNullable => {
@@ -625,7 +625,7 @@ export function nodeRegisteredUnionName(ix: i32): string {
       if it is TyUnion {
         if it.uMembers.length < 2 { return "" }
         if tyIsLitUnion(t.nInner) { return "" }
-        const nu = unRowOfCanon(ty)
+        const nu = unRowOfTyKey(ty)
         if nu >= 0 { return unNames[nu] }
       }
     }
@@ -639,10 +639,10 @@ export function nodeRegisteredUnionName(ix: i32): string {
 // The union a value `if`'s JOIN reps as, read off the join's own recorded type and never off
 // an arm alone: an arm narrowed by the `if`'s own condition (`if n != null { n } …`) keeps its
 // declared union, while the join is the bare scalar. "" when the join is not a union.
-export function ifJoinUnionName(ifIx: i32) {
-  // Through the banked pin, as the `??` arm below is: a `??` in an ARM makes the join a
-  // deferred hole, and without this name the pinned face falls to a numeric block type (D1702).
-  const pin = nodeTyPinIxOf(ifIx)
+function ifJoinUnionName(ifIx: i32, fnIx: i32) {
+  // At the instance's binding: a `??` in an ARM makes the join a deferred hole, and without
+  // this name the pinned face falls to a numeric block type (D1702).
+  const pin = nodeTyInOf(ifIx, fnIx)
   const vu = valueUnionNameOfTy(pin)
   if vu != "" { return vu }
   // A pin with a hole has no row; a cycle (-1) is asked, as its render may be non-empty.
@@ -652,7 +652,7 @@ export function ifJoinUnionName(ifIx: i32) {
   }
   // A `??` over a declared struct union desugars to this `if`, whose recorded type renders
   // structurally, so the two rungs above miss it — named off the type instead. D1561.
-  const irn = nodeRegisteredUnionName(ifIx)
+  const irn = nodeRegisteredUnionName(ifIx, fnIx)
   if irn != "" { return irn }
   // A nullable box join no rung above names (a map `??` over a union value): the row its type
   // keys to, `null` included, so an arm that is a nullable niche boxes its null as the union's
@@ -663,11 +663,11 @@ export function ifJoinUnionName(ifIx: i32) {
 // `ifJoinUnionName` inside function `fnIx`, where a join over an instance's type parameters
 // is named at the pin (D3528).
 export function ifJoinUnionNameIn(ifIx: i32, fnIx: i32): string {
-  const own = ifJoinUnionName(ifIx)
+  const own = ifJoinUnionName(ifIx, fnIx)
   if own != "" { return own }
-  const t = nodeTyPinIxOf(ifIx)
+  const t = nodeTyIxOf(ifIx)
   if t < 0 || !tyHasTyVar(t) { return "" }
-  const ps = pinSubOperandTyOf(t, fnIx)
+  const ps = elabClosedTyAt(ifIx, fnIx)
   if ps < 0 { return "" }
   const vu = valueUnionKeyTextOfTy(ps)
   if vu != "" { return vu }

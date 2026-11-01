@@ -1152,6 +1152,9 @@ fn embedded_std_hash() -> String {
 fn gc_engine(collector: Collector, initial: u64) -> Result<Engine> {
     let mut cfg = gc_config(collector);
     cfg.gc_heap_initial_size(initial);
+    // A program module cached under a pinned level loads on any runner that has it, as the
+    // seed's sidecar does; without it the cache key names this CPU and a CI cache misses.
+    pin_seed_isa(&mut cfg)?;
     // A `--shared-memory` module's memory. wasmtime reads this flag only when it creates a
     // shared memory — no codegen, no engine hash — so a module without one pays nothing.
     cfg.wasm_threads(true);
@@ -1396,10 +1399,10 @@ fn seed_engine_sized(collector: Collector, initial: Option<u64>) -> Result<Engin
     Engine::new(&cfg)
 }
 
-/// `$VL_ISA=<cranelift x86 preset>` (e.g. `x86-64-v3`) compiles the seed for that feature
-/// level instead of the features inferred from this CPU. The `.cwasm` sidecar's tag then
-/// names the level rather than the CPU model, so a sidecar cached on one CI runner loads on
-/// another. A CPU lacking a pinned feature refuses the sidecar at load and recompiles.
+/// `$VL_ISA=<cranelift x86 preset>` (e.g. `x86-64-v3`) compiles the seed, and every program
+/// module, for that feature level instead of the features inferred from this CPU. The cache
+/// tag then names the level rather than the CPU model, so a `.cwasm` cached on one CI runner
+/// loads on another. A CPU lacking a pinned feature refuses the artifact at load and recompiles.
 fn pin_seed_isa(cfg: &mut Config) -> Result<()> {
     let isa = match std::env::var("VL_ISA") {
         Ok(isa) if !isa.is_empty() => isa,

@@ -144,3 +144,257 @@ Deno.test({
     }
   },
 });
+
+// A set whose members' bodies yield no value is called through like any other: its list holds
+// member ids, so the module needs no function table.
+const VOID_MEMBERS: string[] = [
+  "function inner<U>(u: U) { print(u) }",
+  "function other<V>(v: V) { print(v) }",
+  "function two() {",
+  "  const fs = [inner, other]",
+  "  fs[0](1)",
+  "  fs[1](2.5)",
+  "}",
+  "two()",
+];
+
+Deno.test({
+  name: "fn-set rep: a list of members that return nothing holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "voidMembers", VOID_MEMBERS);
+      const p = await wasmDis([`${dir}/voidMembers.wasm`]);
+      if (!p.success) throw new Error("wasm-dis voidMembers failed");
+      const tables =
+        new TextDecoder().decode(p.stdout).split("(table ").length - 1;
+      if (tables !== 0) {
+        throw new Error(`voidMembers: want no function table, got ${tables}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
+// A generic written into a list of another generic joins the list's set, so the list holds ids
+// of both and no function is placed in a table.
+const WRITTEN_GENERIC: string[] = [
+  "function inner<U>(u: U) { print(u) }",
+  "function other<V>(v: V) { print(v) }",
+  "const gs = [inner]",
+  "gs[0](3)",
+  "const fs = [other]",
+  "fs[0] = inner",
+  "fs[0](true)",
+];
+
+Deno.test({
+  name: "fn-set rep: a generic written into a list of generics joins its set",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "writtenGeneric", WRITTEN_GENERIC);
+      const p = await wasmDis([`${dir}/writtenGeneric.wasm`]);
+      if (!p.success) throw new Error("wasm-dis writtenGeneric failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`writtenGeneric: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
+// A list of a set built in a generic function's body is tagged like any other: each instance
+// dispatches at its own tuple.
+const IN_GENERIC_BODY: string[] = [
+  "function inc(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "function run<T>(v: T, n: i32) {",
+  "  const fs = [inc, dbl]",
+  "  print(fs[0](n) + fs[1](n))",
+  "  v",
+  "}",
+  'run("s", 3)',
+  "run(1.5, 4)",
+];
+
+Deno.test({
+  name: "fn-set rep: a list of a set in a generic body holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "inGenericBody", IN_GENERIC_BODY);
+      const p = await wasmDis([`${dir}/inGenericBody.wasm`]);
+      if (!p.success) throw new Error("wasm-dis inGenericBody failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`inGenericBody: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
+// So is one in a function with an un-annotated parameter, when no call through the set hands on a
+// function.
+const IN_HOLE_BODY: string[] = [
+  "function inc(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "function run(v, n: i32) {",
+  "  const fs = [inc, dbl]",
+  "  print(fs[0](n) + fs[1](n))",
+  "  v",
+  "}",
+  'run("s", 3)',
+  "run(1.5, 4)",
+];
+
+Deno.test({
+  name:
+    "fn-set rep: a list of a set in a hole function's body holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "inHoleBody", IN_HOLE_BODY);
+      const p = await wasmDis([`${dir}/inHoleBody.wasm`]);
+      if (!p.success) throw new Error("wasm-dis inHoleBody failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`inHoleBody: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
+// A list of inner list literals of a set holds member ids at both levels.
+const NESTED: string[] = [
+  "function inc0(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "const ws = [[inc0, dbl]]",
+  "print(ws[0][1](3))",
+  "print(ws[0][0](2.5))",
+];
+
+Deno.test({
+  name: "fn-set rep: a list of lists of a set holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "nested", NESTED);
+      const p = await wasmDis([`${dir}/nested.wasm`]);
+      if (!p.success) throw new Error("wasm-dis nested failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`nested: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
+// A record field holding a list of lists of a set holds member ids, read through a binding too.
+const IN_RECORD: string[] = [
+  "function inc0(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "const r = { fs: [[inc0, dbl]] }",
+  "const a = r.fs",
+  "print(a[0][1](3))",
+  "print(r.fs[0][0](2.5))",
+];
+
+Deno.test({
+  name:
+    "fn-set rep: a record field of lists of lists of a set holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "inRecord", IN_RECORD);
+      const p = await wasmDis([`${dir}/inRecord.wasm`]);
+      if (!p.success) throw new Error("wasm-dis inRecord failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`inRecord: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
+// A map whose value is a list of lists of a set holds member ids, written by `set`, read narrowed.
+const IN_MAP: string[] = [
+  "function inc0(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "const m = Map()",
+  'm.set("k", [[inc0, dbl]])',
+  'const y = m["k"]',
+  "if y != null { print(y[0][1](5)) }",
+];
+
+Deno.test({
+  name: "fn-set rep: a map of lists of lists of a set holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "inMap", IN_MAP);
+      const p = await wasmDis([`${dir}/inMap.wasm`]);
+      if (!p.success) throw new Error("wasm-dis inMap failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`inMap: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
+// A list of lists whose first inner list holds fewer members of a set still holds member ids.
+const FEWER_FIRST: string[] = [
+  "function inc0(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "const fs = [[inc0], [inc0, dbl]]",
+  "print(fs[1][1](3))",
+  "print(fs[0][0](2.5))",
+];
+
+Deno.test({
+  name:
+    "fn-set rep: a list of lists of a set with fewer members first holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "fewerFirst", FEWER_FIRST);
+      const p = await wasmDis([`${dir}/fewerFirst.wasm`]);
+      if (!p.success) throw new Error("wasm-dis fewerFirst failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`fewerFirst: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});

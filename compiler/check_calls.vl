@@ -83,10 +83,14 @@ import {
   elabCalleeFnId,
   elabCapLive,
   elabCapOn,
+  elabDefaultRowNote,
   elabEarlyCallNote,
+  elabHoleDeclOf,
+  elabHolePinNote,
   elabHoleRowCut,
   elabHoleRowDropDecl,
   elabHoleRowMark,
+  elabPinBindingIs,
   elabValueRowNote,
   fnTagChoiceOfTy,
   fnTagSetOfTy,
@@ -297,10 +301,12 @@ import {
   genFnHoleSoleInst,
   genericDeclRetMisfit,
   holeChoiceArms,
+  holeChoiceArmsOf,
   holeChoiceWaits,
   holeFnArgDecls,
   holeFnArgRetAt,
   holeFnReadsSlot,
+  holeLetHoldsGenerics,
   holeLetWritesDisagree,
   holeLetWritesDisagreeCall,
   holeRetTyOf,
@@ -346,6 +352,8 @@ import {
   SUBST_NESTED,
   argPinPark,
   cstrOwnedBy,
+  cstrOwnedStrict,
+  cstrOwnedStrictSet,
   curFnOwner,
   fnOwnerKey,
   nestParentOf,
@@ -365,6 +373,7 @@ import {
   tpIfReFn,
   tyIsDeferredJoin,
 } from "./check_tp_join"
+import { holeArgScalarRefused, scalarPrimPair } from "./check_ty_relate"
 import { unionRidesI32Spine } from "./check_ty_rep"
 import {
   T,
@@ -1889,6 +1898,31 @@ function holeCastPinReached(callFnIx: i32, i: i32, at: i32) {
   0
 }
 
+// Whether an instance's re-check admits scalar `at` into `expected` at call `n` because the
+// template called a hole there, which the pin holds only to `holeArgScalarRefused` (D3225).
+function elabHoleArgFits(n: Call, at: i32, expected: i32): boolean {
+  if !elabTplHoleCall(n) || !scalarPrimPair(at, expected) { return false }
+  !holeArgScalarRefused(at, expected)
+}
+
+// The one declaration every name of `vNames` is a parameter hole of, or -1.
+function holeNamesDecl(vNames: string[]): i32 {
+  let d = -1
+  for nm in vNames {
+    const hd = elabHoleDeclOf(nm)
+    if hd < 0 || (d >= 0 && hd != d) { return -1 }
+    d = hd
+  }
+  d
+}
+
+// Whether call `n` is checked in an instance's re-check and the template called a hole there.
+function elabTplHoleCall(n: Call): boolean {
+  if !elabCapLive() { return false }
+  const ct = nodeTyIxOf(n.callFn)
+  ct >= 0 && ct < T.tys.length && tyAt(ct) is TyVar
+}
+
 // Argument `i` delivered to `expected` under the generic-argument and wider-record flags,
 // a mismatch refused at the argument, and a passing hole-bearing function value parked (D1821).
 function callFtyArgAssign(
@@ -1928,7 +1962,7 @@ function callFtyArgAssign(
   wsSuppress = false
   lbiNoDest = savedLbiGen
   widenRetagGenArgSet(savedGenArg)
-  if !argOk {
+  if !argOk && !elabHoleArgFits(n, at, expected) {
     // Anchored at the offending argument (or its offending return site),
     // never at the call node — see `argMismatchErr`.
     argMismatchErr(i + 1, expected, at, args[i])
@@ -1960,12 +1994,18 @@ function elabUnboundCallNote(n: Call) {
   const f = nodeAt(d)
   if !(f is FuncDecl) || f.fnTyParams.length == 0 { return 0 }
   const tys: i32[] = []
-  for tp in f.fnTyParams { tys.push(elabUnionArgPin(f, n, tp)) }
+  let byDefault = false
+  for tp in f.fnTyParams {
+    const t = elabUnionArgPin(f, n, tp)
+    if t < 0 { byDefault = true }
+    tys.push(if t < 0 { TY_I32 } else { t })
+  }
   elabValueRowNote(d, f.fnTyParams, tys)
+  if byDefault { elabDefaultRowNote(d, tys) }
 }
 
 // The type call `n`'s argument gives type parameter `tp` of `f` where `tp` is a bare member of a
-// union parameter (`T | string` handed a `string`), else the default `i32`.
+// union parameter (`T | string` handed a `string`), else -1 for the default.
 function elabUnionArgPin(f: FuncDecl, n: Call, tp: string): i32 {
   let i = 0
   while i < f.fnParams.length && i < n.callArgs.length {
@@ -1996,7 +2036,30 @@ function elabUnionArgPin(f: FuncDecl, n: Call, tp: string): i32 {
     }
     i = i + 1
   }
-  TY_I32
+  -1
+}
+
+// The binding a call re-asks deferred constraints under, onto `outN`/`outT`: a call naming no
+// declaration leaves out the enclosing scope's type parameters as it binds them, which match
+// other generics' by name only and whose constraints the enclosing function's own pin asks.
+function cstrPinBinding(
+  cstrCallee: i32,
+  vNames: string[],
+  vTys: i32[],
+  outN: string[],
+  outT: i32[],
+) {
+  let i = 0
+  while i < vNames.length && i < vTys.length {
+    let sc = tpEnvNames.length - 1
+    while sc >= 0 && tpEnvNames[sc] != vNames[i] { sc = sc - 1 }
+    if (cstrCallee != CSTR_NODECL || sc < 0 || !tySame(tpEnvTys[sc], vTys[i])) {
+      outN.push(vNames[i])
+      outT.push(vTys[i])
+    }
+    i = i + 1
+  }
+  0
 }
 
 // The pins an ordinary call's type-parameter bindings `vNames`/`vTys` give its callee: every
@@ -2034,6 +2097,26 @@ function callFtyPinCstrs(
   // A call typed through a constant list's element owns that element's constraints only.
   if cstrCallee == CSTR_NODECL && constListFnElemTy(n.callFn) >= 0 {
     cstrCallee = constListFnElemDecl(n.callFn)
+  }
+  // In an instance's re-check, a call the template made through a hole owns only the
+  // constraints of the declaration whose holes it binds: the instance's pin asked the rest.
+  if cstrCallee == CSTR_NODECL && elabTplHoleCall(n) {
+    const hd = holeNamesDecl(vNames)
+    if hd >= 0 { cstrCallee = hd }
+  }
+  // In an instance's re-check, a call through a value holding one generic owns that generic's
+  // constraints only.
+  if cstrCallee == CSTR_NODECL && elabCapLive() {
+    const one = elabCalleeFnId(n.callFn)
+    const od = if one >= 0 && one < P.nodes.length { nodeAt(one) } else { nodeAt(0) }
+    if (
+      one >= 0
+      && one < P.nodes.length
+      && od is FuncDecl
+      && od.fnTyParams.length > 0
+    ) {
+      cstrCallee = one
+    }
   }
   // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
   // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
@@ -2108,9 +2191,16 @@ function callFtyPinCstrs(
       fsbArgTysOf(ft, vNames, vTys),
     )
   }
+  const cNames: string[] = []
+  const cTys: i32[] = []
+  cstrPinBinding(cstrCallee, vNames, vTys, cNames, cTys)
+  // An instance's re-check records under its own declaration, so an owner-less constraint is
+  // the module's top-level code, which that code's own pins ask.
+  const strictWas = cstrOwnedStrict
+  if elabCapLive() { cstrOwnedStrictSet(true) }
   validateBinCstrs(
-    vNames,
-    vTys,
+    cNames,
+    cTys,
     ix,
     cstrCallee,
     cstrWho,
@@ -2118,20 +2208,20 @@ function callFtyPinCstrs(
     dhArgNo,
     dhArgNode,
   )
-  validatePrintCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-  validateNestCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-  validateIsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-  validateArgCstrs(vNames, vTys, ix, cstrCallee, dhNames, dhArgNode)
+  validatePrintCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  validateNestCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  validateIsCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  validateArgCstrs(cNames, cTys, ix, cstrCallee, dhNames, dhArgNode)
   forElemArgCstrs(n.callFn, ft, vNames, vTys)
   // The declared return rides the same pin: the body's mismatch check is vacuous under
   // a hole, and this is the first position that knows the instance (D551).
-  validateRetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateRetCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
   // The destination seam, for the same reason: a value landing in a hole-typed local /
   // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
-  validateLetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateLetCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
   // A builtin collection method's argument inside the body, for the same reason at a
   // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
-  validateBmCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateBmCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
   // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
   if !inferQuiet {
     let oa = 0
@@ -2144,8 +2234,8 @@ function callFtyPinCstrs(
   // the operation on a type variable correctly (a `T` pinned to a collection has it), and
   // this is the first position that knows which rep `T` became (D651 / D691).
   validateMemCstrs(
-    vNames,
-    vTys,
+    cNames,
+    cTys,
     ix,
     cstrCallee,
     cstrWho,
@@ -2153,9 +2243,10 @@ function callFtyPinCstrs(
     dhArgNo,
     dhArgNode,
   )
-  validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-  pinHoleLambdaArgs(vNames, vTys, ix, cstrCallee)
+  validateUfcsCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  noteHoleLambdaArgPins(vNames, vTys, cstrCallee)
   validateRcwPins(vNames, vTys, cstrCallee)
+  cstrOwnedStrictSet(strictWas)
   if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
   substNestModeSet(modeWas)
   substNestDeclSet(declWas)
@@ -2187,6 +2278,7 @@ function callFtyPinCstrs(
     || cfn is Member
     || cfn is OptMember
     || (cfn is Ident && holeFnArgDecls(n.callFn).length > 1)
+    || (cfn is Ident && holeLetHoldsGenerics(n.callFn))
     || (namedFn < 0 && fnTagSetOfTy(nodeTyIxOf(n.callFn)) >= 0)
     || holeFnReadsSlot(n.callFn)
   ) {
@@ -2242,64 +2334,41 @@ function callFtyPinCstrs(
   retTy
 }
 
-// A lambda literal handed to a hole callee is pinned where the call binds that callee: its
-// parameter holes take the parameter types of the function type it is delivered at, and its
-// body's deferred demands are judged there, as a direct call through it would be (D5881).
-function pinHoleLambdaArgs(
-  vNames: string[],
-  vTys: i32[],
-  ix: i32,
-  calleeFn: i32,
-) {
-  const done: string[] = []
+// A lambda literal handed to a hole callee takes, where the call binds that callee, the
+// parameter types of the function type it is delivered at: the elaboration's instance of it.
+function noteHoleLambdaArgPins(vNames: string[], vTys: i32[], calleeFn: i32) {
   const n0 = argCstr.at.length
   let ci = 0
   while ci < n0 {
     if argCstr.form[ci] > 0 && cstrOwnedBy(argCstr.fn[ci], calleeFn) {
-      pinHoleLambdaArg(ci, vNames, vTys, ix, done)
+      const rat = substTyDeep(argCstr.at[ci], vNames, vTys)
+      const rexp = substTyDeep(argCstr.exp[ci], vNames, vTys)
+      const lf = if rat >= 0 && rat < T.tys.length { tyAt(rat) } else { tyAt(TY_I32) }
+      const df = if rexp >= 0 && rexp < T.tys.length { tyAt(rexp) } else { tyAt(TY_I32) }
+      if (
+        lf is TyFunc
+        && df is TyFunc
+        && !tyHasHole(rexp)
+        && lf.fnParamTypes.length == df.fnParamTypes.length
+      ) {
+        elabPinBindingIs(vNames, vTys)
+        let pi = 0
+        while pi < lf.fnParamTypes.length {
+          const pv = tyAt(lf.fnParamTypes[pi])
+          if (
+            pv is TyVar
+            && tyIsHole(lf.fnParamTypes[pi])
+            && pv.tvName.slice(0, 3) == "?#L"
+          ) {
+            elabHolePinNote(pv.tvName, df.fnParamTypes[pi])
+          }
+          pi = pi + 1
+        }
+      }
     }
     ci = ci + 1
   }
   0
-}
-
-// `pinHoleLambdaArgs` for demand `ci`; `done` holds the lambda holes already judged.
-function pinHoleLambdaArg(
-  ci: i32,
-  vNames: string[],
-  vTys: i32[],
-  ix: i32,
-  done: string[],
-) {
-  const rat = substTyDeep(argCstr.at[ci], vNames, vTys)
-  const rexp = substTyDeep(argCstr.exp[ci], vNames, vTys)
-  if rat < 0 || rexp < 0 || tyHasHole(rexp) { return 0 }
-  const lf = tyAt(rat)
-  const df = tyAt(rexp)
-  if !(lf is TyFunc) || !(df is TyFunc) { return 0 }
-  if lf.fnParamTypes.length != df.fnParamTypes.length { return 0 }
-  const nm: string[] = []
-  const ty: i32[] = []
-  for v in vNames { nm.push(v) }
-  for t in vTys { ty.push(t) }
-  let fresh = 0
-  let pi = 0
-  while pi < lf.fnParamTypes.length {
-    const pv = tyAt(lf.fnParamTypes[pi])
-    if pv is TyVar {
-      if tyIsHole(lf.fnParamTypes[pi]) && pv.tvName.slice(0, 3) == "?#L" {
-        if !strListHas(done, pv.tvName) {
-          done.push(pv.tvName)
-          fresh = fresh + 1
-        }
-        nm.push(pv.tvName)
-        ty.push(df.fnParamTypes[pi])
-      }
-    }
-    pi = pi + 1
-  }
-  if fresh == 0 { return 0 }
-  judgeHoleLambdaAt(rat, rexp, nm, ty, ix)
 }
 
 // A lambda typed `lam` with hole parameters, delivered at the concrete function type `want`
@@ -2521,6 +2590,21 @@ function judgeFnArgHoleCalls(
         if linsts.length == 0 {
           holeOpenCallsWait(a, vNames, wTys, k, vTys[k], calleeFn)
         }
+        // A choice of names called at two instances, written here or bound first, takes a copy
+        // per instance as one name does: the split plan hands each copy the choice, evaluated
+        // once (D6210, D13360, D14439). Instances are told apart by spelling, as the plan keys
+        // its calls.
+        const caA: i32[] = []
+        const caD: i32[] = []
+        holeChoiceArmsOf(a, caA, caD)
+        if !noSplit && (holeChoiceArms(a).length > 0 || caA.length > 0) {
+          const ks: string[] = []
+          for li in linsts {
+            const kk = tyToStr(li)
+            if strListIndexOf(ks, kk) < 0 { ks.push(kk) }
+          }
+          if ks.length > 1 { holeFnSplitAt(opFn, dhNames[j]) }
+        }
       }
     } else if holeChoiceArms(a).length > 0 {
       const k = strListIndexOf(vNames, dhNames[j])
@@ -2560,6 +2644,7 @@ function judgeFnArgHoleCalls(
           const insts: i32[] = []
           genFnHoleCallInsts(vNames, wTys, k, vTys[k], calleeFn, insts)
           if insts.length > 1 && !noSplit { holeFnSplitAt(opFn, dhNames[j]) }
+          if !noSplit { holeFwdSplitAsk(opFn, dhNames[j], vNames, wTys, 0) }
           if insts.length > 1 { judgeHoleCallOps(opFn, vNames, wTys, a) }
           // A call moved out of a forwarding callee asks its own instance too, judged without a
           // split, as the direct spelling's call is (D13201).
@@ -3019,6 +3104,98 @@ function constRetFnNames(c: i32): string[] {
     }
   }
   gs
+}
+
+// Marks hole `hole` of `fn`, and the hole parameter of each function `fn` hands it on to by name,
+// as wanting a copy per instance when that function's body, bound at `fn`'s binding
+// `vNames`/`vTys`, calls it at two, directly or handing it on again (D14650). True when marked.
+function holeFwdSplitAsk(
+  fn: i32,
+  hole: string,
+  vNames: string[],
+  vTys: i32[],
+  depth: i32,
+): boolean {
+  if fn < 0 || fn >= P.nodes.length || depth > 4 { return false }
+  const f = nodeAt(fn)
+  if !(f is FuncDecl) || f.fnBody < 0 { return false }
+  let marked = false
+  let par = -1
+  let pi = 0
+  while pi < f.fnParams.length {
+    if paramHoleName(f.fnName, fn, pi) == hole { par = f.fnParams[pi] }
+    pi = pi + 1
+  }
+  if par < 0 { return false }
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const x = stack.pop() ?? -1
+    if x < 0 || x >= P.nodes.length { continue }
+    const xn = nodeAt(x)
+    if xn is FuncDecl { continue }
+    for kid in nodeChildren(x) {
+      if kid >= 0 { stack.push(kid) }
+    }
+    if !(xn is Call) { continue }
+    let named = false
+    for an in xn.callArgNames {
+      if an != "" { named = true }
+    }
+    const cf = nodeAt(parenPeelIx(xn.callFn))
+    if named || !(cf is Ident) { continue }
+    const ld = fnDeclIx[cf.identName] ?? -1
+    if ld < 0 || ld >= P.nodes.length || ld == fn { continue }
+    const l = nodeAt(ld)
+    if (
+      !(l is FuncDecl)
+      || l.fnTyParams.length > 0
+      || l.fnParams.length != xn.callArgs.length
+    ) {
+      continue
+    }
+    const lNames: string[] = []
+    const lTys: i32[] = []
+    let k = -1
+    let ai = 0
+    while ai < xn.callArgs.length {
+      const a = parenPeelIx(xn.callArgs[ai])
+      lNames.push(paramHoleName(l.fnName, ld, ai))
+      let t = -1
+      const ad = identDeclOf(a)
+      if ad >= 0 && ad < P.nodes.length && nodeAt(ad) is Param {
+        let q = 0
+        while q < f.fnParams.length {
+          if f.fnParams[q] == ad {
+            const vi = strListIndexOf(vNames, paramHoleName(f.fnName, fn, q))
+            if vi >= 0 && vi < vTys.length { t = vTys[vi] }
+          }
+          q = q + 1
+        }
+      }
+      if ad == par { k = ai }
+      if t < 0 { t = substTyDeep(nodeTyOf(a), vNames, vTys) }
+      lTys.push(t)
+      ai = ai + 1
+    }
+    if k >= 0 {
+      const insts: i32[] = []
+      genFnHoleCallInsts(lNames, lTys, k, lTys[k], ld, insts)
+      const ks: string[] = []
+      for li in insts {
+        const kk = tyToStr(li)
+        if strListIndexOf(ks, kk) < 0 { ks.push(kk) }
+      }
+      if (
+        ks.length > 1
+        || holeFwdSplitAsk(ld, lNames[k], lNames, lTys, depth + 1)
+      ) {
+        holeFnSplitAt(ld, lNames[k])
+        holeFnSplitAt(fn, hole)
+        marked = true
+      }
+    }
+  }
+  marked
 }
 
 // Marks the parameter of declared function `fn` whose hole is `hole` as wanting a copy per

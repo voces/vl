@@ -60,8 +60,8 @@ import {
   mvValArmSig,
   mvValName,
   mvValTyIx,
-  rlElemKindTbl,
   rlElemTyIx,
+  rvSrcSlot,
   sAnonOwnTy,
   sFieldCount,
   sFieldElemKeyKind,
@@ -972,8 +972,10 @@ export function tyIsI32LeafElem(e: i32): boolean {
       }
       tyIsLitUnion(t.nInner)
     }
+    // A tagged set's value is its member's id.
+    TyFunc => fnTagTyIsTagged(e)
     // No other element shape rides the i32 backing as a leaf.
-    TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => false
+    TyObj | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => false
   }
 }
 
@@ -1707,6 +1709,8 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
     }
     TyFunc => {
       if mode == "row" { return hcIntern(HC_FUNC, hcNoArgs, 2) }
+      // A map value holding a tagged set's ids stores them as i32s, the slot its spelling names.
+      if mode == "mv" && fnTagTyIsTagged(ty) { return hcPrimId("i32") }
       // `"(" + join(",", params) + ")=>" + ret` — ONE for the open paren; the closer is
       // inside the `")=>"` added below, so starting at 2 double-counts it.
       const a: i32[] = []
@@ -3694,6 +3698,8 @@ function repOfNullableArray(elem: i32): RepDesc {
     // D979 — the PACKED byte list joins the nullable-scalar-list family.
     if et.primName == "u8" { return repMk("nulu8list", 1, "u8list") }
   }
+  // A tagged set's ids are i32s, so their list made nullable is the nullable i32-list ref.
+  if et is TyFunc && fnTagTyIsTagged(elem) { return repMk("nullist", 1, "i32") }
   // A litunion `K[] | null` — atoms are interned i32 ids, sharing the i32-list backing. A
   // nullable-litunion element `(K | null)[] | null` rides its null in the same i32 sentinel.
   if tyIsLitUnion(elem) || tyIsNullableLitUnion(elem) {
@@ -3724,18 +3730,17 @@ function repOfNullableArray(elem: i32): RepDesc {
   repUncovered()
 }
 
-// The `unNames` row whose recorded arena type is structurally `ty` (shares its interned canon
-// id), or -1. A row-identity scan of `unTyIx` is not enough: the arena is not hash-consed for
-// composite spellings, so one spelling can mint several rows, and an arena-side reader has no
-// spelling to offer.
-export function unRowOfCanon(ty: i32): i32 {
+// The first `unNames` row whose type shares `ty`'s canon id, or -1. Canon folds literals, so this
+// answers row membership with literals folded and may name another union's row: a caller that
+// takes the row reads `unRowOfTyKey` (DECISIONS.md, "Union-row identity preserves literals").
+export function unRowOfCanonFolded(ty: i32): i32 {
   if ty < 0 { return -1 }
   const c = repCanonId(ty)
   ucIxSync()
   ucIxFirst[c] ?? (-1)
 }
 
-// `unRowOfCanon`'s index: canon id to the first `unTyIx` row carrying it, over rows below
+// `unRowOfCanonFolded`'s index: canon id to the first `unTyIx` row carrying it, over rows below
 // `ucIxUpTo`. A row's canon id holds while the arena's generation does; the pass generation
 // is in the key too, since `collectU` refills the registry from empty within a compile.
 let ucIxFirst: {[i32]: i32} = Map()
@@ -3859,7 +3864,7 @@ function repOfArray(elem: i32): RepDesc {
       // A self-referential union with a `null` arm (`Json`) interns as `TyUnion[TyNullable(rest)]`;
       // it is the box over `rest | null`, and the registry holds its row under the wrapper.
       if w is TyNullable {
-        if tyIsValueUnionBox(w.nInner) && unRowOfCanon(elem) >= 0 {
+        if tyIsValueUnionBox(w.nInner) && unRowOfCanonFolded(elem) >= 0 {
           return repMk("reflist", 0, "union")
         }
       }
@@ -3871,7 +3876,7 @@ function repOfArray(elem: i32): RepDesc {
     // as its scalar list). The row is found by canon id, else by key, since an arena node
     // need not share the canon id of the spelling that registered the row.
     if tyIsValueUnionBox(elem) {
-      if unRowOfCanon(elem) >= 0 || unRowOfKey(elem) >= 0 {
+      if unRowOfCanonFolded(elem) >= 0 || unRowOfKey(elem) >= 0 {
         return repMk("reflist", 0, "union")
       }
     }
@@ -3913,7 +3918,7 @@ function repOfNulElemArray(elem: i32, inner: i32): RepDesc {
         || it.primName == "f32"
         || it.primName == "v128"
       ) {
-        if unRowOfCanon(elem) >= 0 { return repMk("reflist", 0, "union") }
+        if unRowOfCanonFolded(elem) >= 0 { return repMk("reflist", 0, "union") }
       }
     }
     TyFunc => {
@@ -3928,7 +3933,7 @@ function repOfNulElemArray(elem: i32, inner: i32): RepDesc {
       // The box over `A | B` holds `null` as a member atom, as `repOfNullable` says, so the inner's
       // row also serves a nullable only an instance forms, which no collect pass registered.
       if tyIsValueUnionBox(inner) {
-        if unRowOfCanon(elem) >= 0 || unRowOfCanon(inner) >= 0 {
+        if unRowOfCanonFolded(elem) >= 0 || unRowOfCanonFolded(inner) >= 0 {
           return repMk("reflist", 0, "union")
         }
       }
@@ -4765,7 +4770,7 @@ function rtListVKind(elem: i32): VKind | null {
     // the list is a ref list. Gated on the node's arena provenance, the same canon-id
     // question the flat arm asks, so a box with no row declines on both sides.
     "box" => {
-      if unRowOfCanon(rtTy[elem]) >= 0 { return "reflist" }
+      if unRowOfCanonFolded(rtTy[elem]) >= 0 { return "reflist" }
       return null
     }
   }
@@ -4778,7 +4783,7 @@ function rtNulElemListVKind(elem: i32): VKind | null {
   const d = rtDisc[elem]
   if d == 2 || d == 3 { return "list" }
   if d == 4 {
-    if unRowOfCanon(rtTy[elem]) >= 0 { return "reflist" }
+    if unRowOfCanonFolded(rtTy[elem]) >= 0 { return "reflist" }
     return null
   }
   const n = rtNulNicheElemName(elem)
@@ -5306,15 +5311,16 @@ function unionHasOpenMember(members: i32[]): boolean {
   false
 }
 
-// The element kind of ref-list slot `s`: its recorded element type's rep, or the kind the
-// intern recorded where that type has none (no type, or a rep with no ref-list kind).
+// The element kind of ref-list slot `s`: its recorded element type's rep, or -1 for a slot with
+// no type or a rep with no ref-list kind.
 export function rlElemKindAt(s: i32): i32 {
-  if s < 0 || s >= rlElemKindTbl.length { return -1 }
-  if s < rlElemTyIx.length {
-    const k = rlKindOfVKind(repSigKindOfTy(rlElemTyIx[s]))
-    if k >= 0 { return k }
-  }
-  rlElemKindTbl[s]
+  if s < 0 || s >= rlElemTyIx.length { return -1 }
+  rlKindOfVKind(repSigKindOfTy(rlElemTyIx[s]))
+}
+
+// Whether a list at ref-list row `slot` may be a view: a union-box list in a module that builds one.
+export function rvMayView(slot: i32): boolean {
+  rvSrcSlot.length > 0 && rlElemKindAt(slot) == RLK_UNION
 }
 
 // The ref-list element kind a value of rep kind `vk` takes; -1 for a rep with none.

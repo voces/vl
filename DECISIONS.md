@@ -10868,6 +10868,26 @@ through it is a tag-compare chain of direct calls. Delivery to a declared functi
 store or a single-type call keeps the closure rep, so the annotated and un-annotated spellings
 build the same bytes. Lambdas and thunks are out of scope. `tests/vl_fn_set_rep_test.ts`.
 
+## A choice of names at a split parameter is copied, not tagged (D14439, 2026-10-31)
+
+A hole parameter called at two instances takes one copy per instance (D6210), and a choice of
+named functions handed to it (`if c { wrap } else { wrap2 }`) now asks for that split exactly
+as one name does, keeping its set untagged. The split plan already hands each copy the choice,
+evaluated once (D13360). Two other answers were weighed. Tagging every set that reaches a split
+parameter needs the arms per mint scope, a fact for every call through the set in every
+instance, and the split plan standing down for a tagged parameter while still copying for an
+untagged one beside it, since it rewrites the function once for every caller; the 2026-10-29
+experiment built most of that and still moved three corpus files. Splitting per instance makes
+the source rewrite instance-aware, which it is not. Copying needs one checker ask and no new
+lowering. Its price is one more split-plan case for increment 3 to delete with the plan.
+
+The step-4 lane closed D14439 through the split plan, and then built the mint's emitter reader
+(D14430) for the case it next needed: a call an instance makes through a parameter bound to a
+set is read through the one set its facts name, in the emitter and in mono (D14737). Arms stay
+per call node, not per mint scope (blocker 2), and a set with a leaf in a generic body stays
+untagged (blocker 3): a call reached at two tuples of one set keeps one arm set, which no
+program in the corpus or the inventory needs yet.
+
 ## A function-value set escapes as a lambda (step 4 S3a, 2026-10-26)
 
 Where a finite set escapes into a closed slot (an argument to a declared function-type
@@ -11007,6 +11027,28 @@ the body, and the quiet elaboration re-check swallows the ill-typed operator it 
 returns that copy it take that rep. The rekey is deleted as a type producer, and D8202's
 instance-at-row route goes with it. It changes reps, so it runs the rep-fuzz gate, and it is
 sequenced after c-3.
+
+Landed 2026-10-31 (D14426 closed): the rekey is `callBindAdoptReps`, which records the adopted
+record as a rep row beside the bind row's types. Mono pins the parameter at the rep
+(`callArgRepTy`), the elaboration keeps the checker's instance for a pin that only widens it
+(`recRepWidens`), and the parameter's storage, a `let` copying it and a result returning it read
+the rep.
+
+Extended 2026-10-31 (D14532, coordinator ruling (i)): an ordinary function is instanced by the rep
+its argument is built at, only where that rep differs from the parameter's declared build. A read
+out of a built container handed to an annotated record parameter, which its function only reads or
+writes for a field, notes the argument's rep (`recAnnArgTakesRep`). The function counts as generic
+for mono (`recRepFnHas`), the copy's parameter is pinned at the rep, and the elaboration types the
+copy at the declared type. Every other call shares the one copy. Measured: over 7,003
+`tests/**/*.vl`, no previously building file gains a copy, and the one fixture that hands a rep
+has 7 functions against 5 for the same program built at one row. The seed is +2,238 bytes
+(+0.04%), all of it the new code: the compiler hands itself no rep.
+
+Extended 2026-11-01 (D14753, coordinator approval): a call result is handed by rep on the same
+terms. A call built at a wider record, directly or relayed through an identity or a returned
+binding, may reach an annotated parameter its function only reads or writes for a field. That
+delivery does not count as landing at the annotation (`recRepArgOf`), and it is noted only once
+the whole build is accepted (`recRepArgsNote`), so a refused build leaves no stale rep behind.
 
 ## A literal is built at the width of the position that reads it (ruling, 2026-10-27)
 
@@ -11157,3 +11199,40 @@ three different totals across three runs). Under `$VL_FUEL` the root pool is off
 in one instance, as `vl test`'s compile pool already did; one predicate, `compile_pool_allowed`,
 gates both pools. The unpooled reading is a different, larger number than any pooled one, so a
 baseline taken from a pooled run is re-measured, not compared.
+
+## An instance's diagnostics are the program's only when the instance belongs to the program a build keeps (ruling, 2026-10-31)
+
+The elaboration re-checks each instance a program needs, and a diagnostic an instance owes the
+program is a check error (increment 3's error channel). Two rules bound which instances owe it.
+
+An instance is elaborated from a well-typed template, so the elaboration runs only when the rest
+of check raised nothing: run over an ill-typed program, it would report cascades with no cause of
+their own. A program with both kinds of error is refused in two rounds, the template's errors
+first and the instances' once those are fixed. It is never accepted, so soundness holds. The
+editor follows the same rule, since the LSP and the playground check through
+`checkSrc`/`checkSrcSym`, which reach the elaboration only on a clean check. This is what let
+`pinHoleLambdaArg`, a check-time copy of one instance diagnostic, be deleted: `go(name)` handing a
+lambda to a hole callee is reported by its instance
+(`tests/cases/functions/error-hole-lambda-through-hole-callee-demands.vl`).
+
+A build that splits a function (`fn_split.vl`, D6210) throws away the program it first
+elaborated, so that program's instances are not the built program's. `vl build` reports the
+channel's diagnostics from the pass whose output stands: one whose emit succeeds, or fails with no
+split asked, and the split-applied pass. `vl check` never splits, so where the channel raises
+anything it runs the build, and reports nothing from the channel when the kept program raised
+nothing, or when the first pass asked for a split no applied pass followed. This holds until the
+elaboration instances per call tuple in place of the split plan (increment 3, slice (ii)).
+
+## Union-row identity preserves literals (ruling, 2026-10-31)
+
+A union row is the layout and the dispatch of one union type, and literals decide dispatch: `C | B`
+with `C = {x: 3 | 4}` and `B = {x: 1 | 2}` needs `is B` to tell its arms apart, while
+`repCanonId` keys a literal as its base scalar and so gives that union the canonical id of
+`A | B` with `A = {x: i32}`. Sharing union rows by canon broke two programs that ran
+(`is-contained-arm-tests-the-value.vl`, `discriminant-eq-ambiguous-name.vl`). So a row's identity
+is its literal-preserving type key (`unTyKey`, read by `unRowOfTyKey`), and a row with a type is
+keyed by that type, as a lookup keys it. `repCanonId` stays a rep identity: `unRowOfCanon`
+answers row membership where literal folding is intended, and each such caller says so; a
+caller that takes the row reads the type key. This refines "union rows are keyed by member
+reps" above: a top-level string literal boxes as a string does, but a record arm's literal
+fields do not fold.
