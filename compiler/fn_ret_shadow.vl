@@ -122,7 +122,7 @@ export function fnRecordedRetTy(fe: i32): i32 {
       const kd = recKeptFnDstOf(fx, r)
       if kd >= 0 { r = kd }
       // A value built by a call keeps that call's row whatever the delivery; else the calls'.
-      const vr = if r < T.tys.length && tyAt(r) is TyObj { frsValuesBuiltRow(fx, 0) } else { -1 }
+      const vr = if r < T.tys.length && tyAt(r) is TyObj { frsValuesBuiltRow(fx) } else { -1 }
       const cr = if vr >= 0 { vr } else { frsCallsBuiltRow(fx, r) }
       if cr >= 0 { r = cr }
     }
@@ -166,7 +166,7 @@ function frsCallBuiltAt(c: i32, hops: i32): i32 {
     a = recHoleIdentityArg(c, identBoundFnDeclOf(cn.callFn))
   }
   if a < 0 && cn.callFn >= 0 {
-    const vr = frsValuesBuiltRow(identBoundFnDeclOf(cn.callFn), hops + 1)
+    const vr = frsValuesBuiltRow(identBoundFnDeclOf(cn.callFn))
     return if vr >= 0 { vr } else { st }
   }
   const ap = if a >= 0 { cwPeelValue(a) } else { -1 }
@@ -189,27 +189,21 @@ function frsCallBuiltAt(c: i32, hops: i32): i32 {
 }
 
 // The record un-annotated plain function `fx` builds its value at where every value it returns is
-// built by a call (`retValueRootCall`) and those calls agree on one closed record; else -1. An
-// annotated result converts its value at the return, so it is not read through.
-function frsValuesBuiltRow(fx: i32, hops: i32): i32 {
-  if hops >= 8 || fx < 0 || fx >= P.nodes.length { return -1 }
+// a call of a plain function, directly or handed back through identities (`frsHandBackLeaf`), and
+// the outer calls' stamps agree on one closed record; else -1. An annotated result converts its
+// value at the return, and a literal leaf is built at its instance's row, so neither is read.
+function frsValuesBuiltRow(fx: i32): i32 {
+  if !frsIsPlainFn(fx) { return -1 }
   const fn = nodeAt(fx)
-  if (
-    !(fn is FuncDecl)
-    || fn.fnTyParams.length > 0
-    || fn.fnRet >= 0
-    || fn.fnBody < 0
-  ) {
-    return -1
-  }
+  if !(fn is FuncDecl) || fn.fnRet >= 0 || fn.fnBody < 0 { return -1 }
   const vals: i32[] = []
   collectRetValues(fn.fnBody, vals)
   if vals.length == 0 { return -1 }
   let row = -1
   for v in vals {
     const root = retValueRootCall(v)
-    if root < 0 { return -1 }
-    const st = frsCallBuiltAt(root, hops + 1)
+    if root < 0 || frsHandBackLeaf(root, 0) < 0 { return -1 }
+    const st = nodeRepTyIxOf(root)
     if st < 0 || st >= T.tys.length || !(tyAt(st) is TyObj) || tyHasTyVar(st) {
       return -1
     }
@@ -217,6 +211,29 @@ function frsValuesBuiltRow(fx: i32, hops: i32): i32 {
     row = st
   }
   row
+}
+
+// The call of a plain, non-generic function that call `c` is, or hands back through generic
+// identities and hole functions that return their parameter; -1 where the chain ends elsewhere.
+function frsHandBackLeaf(c: i32, hops: i32): i32 {
+  if hops >= 16 || c < 0 || c >= P.nodes.length { return -1 }
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callFn < 0 { return -1 }
+  const fd = identBoundFnDeclOf(cn.callFn)
+  let a = recPassThroughArg(c)
+  if a < 0 { a = recHoleIdentityArg(c, fd) }
+  if a >= 0 { return frsHandBackLeaf(cwPeelValue(a), hops + 1) }
+  if frsIsPlainFn(fd) { c } else { -1 }
+}
+
+// Whether `fd` is a function with no type parameters that no instance replaces: not a mono clone,
+// whose parameters are already substituted, and with no elaboration slot.
+function frsIsPlainFn(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+  const fe = fnStmtsPosOf(fd)
+  fe >= 0 && elabKeyAtPos(fe) < 0 && !i32ListHas(monoInstFe, fe)
 }
 
 // Result `r` of function `fx`, a hole list (`_[]` or `_[] | null`) closed to the element the
