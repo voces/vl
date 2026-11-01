@@ -2218,6 +2218,7 @@ export function elabMintFacts(): i32 {
   elabHandBackMemo = Map()
   elabMintValueFns = elabFnSetMembersShared()
   elabMintCalls = Map()
+  elabBundleSigs = Map()
   elabMintSets = Map()
   let n = 0
   let k = 0
@@ -2361,6 +2362,11 @@ let elabSigAlting = false
 // Each call `elabMintFacts` noted → the instances it noted it in, and the set it went through.
 let elabMintCalls: {[i32]: i32[]} = Map()
 let elabMintSets: {[i32]: i32} = Map()
+
+// By instance and parameter index (`k|i`): the closed signatures the instance calls a lambda's
+// singleton set through that parameter at, each once, in first-call order. Two or more, with the
+// set untagged, is a bundle: one closure per signature, delivered through the one parameter.
+let elabBundleSigs: {[string]: i32[]} = Map()
 
 // The named function and parameter position argument `ix` of call `p` lands in, as
 // `[decl, index]`, when it is a positional argument of a call by name or `const` alias to an
@@ -2638,6 +2644,41 @@ function elabChainStep(x: i32): i32 {
   }
 }
 
+// Notes signature `wp` => `r` for a call instance `k` makes through its parameter `i` bound to
+// the singleton set of lambda `ds[0]`.
+function elabBundleSigNote(k: i32, i: i32, ds: i32[], wp: i32[], r: i32) {
+  if ds.length != 1 || i < 0 { return 0 }
+  const m = nodeAt(ds[0])
+  if !(m is FuncDecl) || m.fnName != "" { return 0 }
+  const sig = mkFuncTy(wp, r)
+  const key = i32ToStr(k) + "|" + i32ToStr(i)
+  const have = elabBundleSigs[key] ?? []
+  for t in have {
+    if tySame(t, sig) { return 0 }
+  }
+  have.push(sig)
+  elabBundleSigs[key] = have
+  0
+}
+
+// The bundle call `ix`'s instance takes at its parameter `i`: the signatures it calls the lambda
+// handed there at, when two or more and the lambda's set stays untagged; else none.
+export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
+  const none: i32[] = []
+  const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const k = elabCallInstFrom(ix, from)
+  if k < 0 { return none }
+  const sigs = elabBundleSigs[i32ToStr(k) + "|" + i32ToStr(i)] ?? none
+  if sigs.length < 2 { return none }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || i >= dn.fnParams.length { return none }
+  const s = fnTagSetOfTy(
+    substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k]),
+  )
+  if s < 0 || fnTagSetIsTagged(s) { return none }
+  sigs
+}
+
 // Notes the fact for call `c` at `ix` when its callee is a parameter of `decl` that instance `k`
 // binds to a set of functions each instanced at the call's closed argument types.
 function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
@@ -2673,6 +2714,9 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   if !split { elabNodeTyFill(ix, k, rs[0]) }
   if root == cf {
     mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
+    if !split {
+      elabBundleSigNote(k, i32ListIndexOf(dn.fnParams, pd), ds, wp, rs[0])
+    }
   }
   const at = elabMintCalls[ix] ?? []
   at.push(k)
