@@ -14,6 +14,7 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  LetDecl,
   MC_RUNG_BUILTIN,
   MC_RUNG_FIELD,
   MatchExpr,
@@ -3619,9 +3620,10 @@ export function castPropagationFits(
 // the hole (D1342).
 export function noteCastDemand(name: string, n: AsExpr, ix: i32, target: i32) {
   if name == "" { return 0 }
-  // The pin describes the parameter, so the demand may only speak for a direct read of it —
-  // `const b = a ?? 0` retypes `b`, so a rung reading the pin there must not fire on `b`.
-  const vn = castOperandIdent(n.asObj)
+  // The pin describes the parameter, so the demand may only speak for a direct read of it or a
+  // `const` copy of one; `const b = a ?? 0` retypes `b`, so a rung reading the pin there must
+  // not fire on `b`.
+  const vn = castOperandSource(n.asObj, 4)
   if vn == "" { return 0 }
   // A narrowing in force over the operand's place is the operand's type, not the pin's:
   // `a = 7` ahead of the cast leaves the parameter pinned while the cast reads a value that can't fail.
@@ -3639,6 +3641,29 @@ export function noteCastDemand(name: string, n: AsExpr, ix: i32, target: i32) {
   }
   holeCastRowPush(name, n, vn, ix, target)
   0
+}
+
+// The binding cast operand `ix` reads, through un-annotated `const` copies of a bare read, so
+// `const c = a` then `c as i32` speaks for `a` (D1373); else `castOperandIdent`'s answer.
+function castOperandSource(ix: i32, depth: i32): string {
+  const vn = castOperandIdent(ix)
+  if vn == "" || depth <= 0 { return vn }
+  const x = parenPeelIx(ix)
+  const d = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return vn
+  }
+  const init = parenPeelIx(dn.letInit)
+  if init < 0 || init >= P.nodes.length || !(nodeAt(init) is Ident) {
+    return vn
+  }
+  castOperandSource(init, depth - 1)
 }
 
 // Parks a propagating `as` cast whose operand is a call of a hole parameter (`g(x) as i32`, the
