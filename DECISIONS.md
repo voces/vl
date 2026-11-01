@@ -11230,3 +11230,22 @@ answers row membership where literal folding is intended, and each such caller s
 caller that takes the row reads the type key. This refines "union rows are keyed by member
 reps" above: a top-level string literal boxes as a string does, but a record arm's literal
 fields do not fold.
+
+## A layout family stores a literal-set field at the join of its twins (ruling, 2026-11-01)
+
+Records with one canonical shape, literals folded to their base, are one layout family: `A =
+{kind: "circle" | "round", r: i32}` and `B = {kind: string, r: i32}` are twins. When two twins
+share one tag, `is A` decides by `kind`'s value, so `B` narrowed by `kind` in `A`'s set is
+structurally `A`. Every consumer of that narrowed value (a read, an argument, a binding) then
+takes `A`'s layout while a `B`-tagged value also passes the test (D14752). Two ways out were
+refused. Converting at the narrowing copies a record, and records are references, so a write
+through the narrowed binding would miss every alias. Dispatching at every narrowed consumer
+multiplies the positions each must be wired at.
+
+So a family's field storage is the join of its twins' field types: a literal set beside its
+`string` base is stored at the string, by the shared arm row and by every struct row of the
+family, those minted later included (`famRelayField`, `famRelayStructRow`). `A` then has one
+layout, and a field read takes
+its rep from the row's storage, not from the read's literal-set type alone. Arms under two tags
+are not one family's shared row: there each keeps its own layout and the shared read converts
+(D14746).
