@@ -1,0 +1,182 @@
+// The late-demand ratchet: elaboration work a compile asks for after `elabRun` returned.
+//
+//     vl run scripts/late-demands.vl [-- --check | --write-baseline] [paths…]
+//
+// The elaboration is meant to know every instance before emission starts, so a key it mints
+// afterwards is a demand the run did not foresee. This builds every program under `paths`
+// (default `tests`) through `vl check --codegen` with `$VL_LATE_DEMANDS=1` and counts, per
+// file, the keys minted late. `--check` exits 1 when any file's count is above the committed
+// `scripts/late-demands-baseline.txt` or a file the baseline does not list has one;
+// `--write-baseline` records the current counts. A count that FELL prints and passes.
+//
+// Paths resolve against the working directory; run it from the checkout root.
+
+import { IoError, readTextFile, writeTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { exit, runProgram } from "std:process"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import { split, startsWith, trim } from "std:str"
+import { sort } from "std:array"
+
+const VL = "./scripts/vl-host/target/release/vl"
+const BASELINE = "scripts/late-demands-baseline.txt"
+const PREFIX = "[late] "
+
+// One file's late count and the declarations it minted late.
+type Row = { path: string, n: i32, names: string[] }
+
+function die(msg: string, code: i32) {
+  print(msg)
+  exit(code)
+}
+
+// The per-file rows `vl check --codegen` printed under `$VL_LATE_DEMANDS=1` for `paths`.
+function measure(paths: string[]): Row[] {
+  const args = ["VL_LATE_DEMANDS=1", VL, "check", "--codegen"]
+  for p in paths { args.push(p) }
+  const r = runProgram("env", args)
+  if r is IoError {
+    die("late-demands: cannot run " + VL + " (" + r.msg + ")", 1)
+    return []
+  }
+  const rows: Row[] = []
+  const text = decodeUtf8Lossy(r.stderr) + "\n" + decodeUtf8Lossy(r.stdout)
+  for line in split(text, "\n") {
+    if !startsWith(line, PREFIX) { continue }
+    const rest = line.slice(PREFIX.length, line.length)
+    const c = rest.indexOf(": ")
+    if c < 0 { continue }
+    const path = rest.slice(0, c)
+    const tail = rest.slice(c + 2, rest.length)
+    if startsWith(tail, "demand ") {
+      for row in rows {
+        if row.path == path { row.names.push(tail.slice(7, tail.length)) }
+      }
+      continue
+    }
+    const n = parseI32(trim(tail))
+    if n == null { continue }
+    rows.push({ path: path, n: n, names: [] })
+  }
+  if rows.length == 0 {
+    die(
+      "late-demands: " + VL + " printed no `[late]` rows; the seed or the host predates "
+        + "`$VL_LATE_DEMANDS`",
+      1,
+    )
+  }
+  rows
+}
+
+// The committed counts, one `<n>\t<path>` line per file with a late demand.
+function loadBaseline(): Row[] {
+  const text = readTextFile(BASELINE)
+  if text is IoError {
+    die(
+      "late-demands: cannot read " + BASELINE + " (" + text.msg + "). Write one with\n"
+        + "  vl run scripts/late-demands.vl -- --write-baseline",
+      1,
+    )
+    return []
+  }
+  const rows: Row[] = []
+  for line in split(text, "\n") {
+    if line == "" || startsWith(line, "#") { continue }
+    const t = line.indexOf("\t")
+    if t < 0 { die("late-demands: " + BASELINE + ": no tab in `" + line + "`", 1) }
+    const n = parseI32(line.slice(0, t))
+    if n == null { die("late-demands: " + BASELINE + ": no count in `" + line + "`", 1) }
+    rows.push({ path: line.slice(t + 1, line.length), n: n ?? 0, names: [] })
+  }
+  rows
+}
+
+function countOf(rows: Row[], path: string): i32 {
+  for r in rows {
+    if r.path == path { return r.n }
+  }
+  0
+}
+
+// The files with a late demand, by path.
+function late(rows: Row[]): Row[] {
+  const out: Row[] = []
+  for r in rows {
+    if r.n > 0 { out.push(r) }
+  }
+  sort(out, (a: Row, b: Row) => a.path < b.path)
+  out
+}
+
+function total(rows: Row[]): i32 {
+  let t = 0
+  for r in rows { t = t + r.n }
+  t
+}
+
+function summary(rows: Row[]): string {
+  const l = late(rows)
+  "late demands: " + toString(total(l)) + " in " + toString(l.length) + " files, of "
+    + toString(rows.length) + " built"
+}
+
+function writeBaseline(rows: Row[]) {
+  let text = "# late demands per file: vl run scripts/late-demands.vl -- --write-baseline\n"
+  for r in late(rows) { text = text + toString(r.n) + "\t" + r.path + "\n" }
+  const w = writeTextFile(BASELINE, text)
+  if w != null { die("late-demands: cannot write " + BASELINE + " (" + w.msg + ")", 1) }
+  print("wrote " + BASELINE + ": " + summary(rows))
+  0
+}
+
+function check(rows: Row[]) {
+  const base = loadBaseline()
+  let rose = 0
+  for r in late(rows) {
+    const b = countOf(base, r.path)
+    if r.n > b {
+      rose = rose + 1
+      print("  ROSE " + r.path + ": " + toString(b) + " -> " + toString(r.n))
+      for name in r.names { print("    demand " + name) }
+    }
+  }
+  for b in base {
+    const n = countOf(rows, b.path)
+    if n < b.n { print("  fell " + b.path + ": " + toString(b.n) + " -> " + toString(n)) }
+  }
+  print(summary(rows) + "; baseline " + toString(total(base)))
+  if rose > 0 {
+    die(
+      "late demands ROSE in " + toString(rose) + " file(s). Make the run foresee them, or "
+        + "record the price with\n  vl run scripts/late-demands.vl -- --write-baseline",
+      1,
+    )
+  }
+  0
+}
+
+function main() {
+  let mode = ""
+  const paths: string[] = []
+  const argv = programArgs()
+  if argv is Utf8Error {
+    die("late-demands: an argument is not UTF-8", 2)
+    return 0
+  }
+  for a in argv {
+    if a == "--check" || a == "--write-baseline" { mode = a } else { paths.push(a) }
+  }
+  if paths.length == 0 { paths.push("tests") }
+  const rows = measure(paths)
+  if mode == "--check" { return check(rows) }
+  if mode == "--write-baseline" { return writeBaseline(rows) }
+  for r in late(rows) {
+    print(toString(r.n) + "\t" + r.path)
+    for name in r.names { print("    demand " + name) }
+  }
+  print(summary(rows))
+  0
+}
+
+main()

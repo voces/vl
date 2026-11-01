@@ -51,7 +51,8 @@ const INERT: &[&str] = &[
 /// A variable that exists to OBSERVE a compile: a hit would skip the thing measured, and a
 /// store would key a result on an observation. `VL_REP_SHADOW` prints a report the guest
 /// computes during the compile, so it is one too, as is `VL_CHECK_STATS` (read off the
-/// instances after a check). `VL_CHECK_KEEP_MODULES` writes files a hit would not write.
+/// instances after a check). `VL_CHECK_KEEP_MODULES` writes files a hit would not write, and
+/// `VL_LATE_DEMANDS` prints the elaboration work the compile asked for after the run.
 fn is_bypass(k: &str) -> bool {
     matches!(
         k,
@@ -63,6 +64,7 @@ fn is_bypass(k: &str) -> bool {
             | "VL_REP_SHADOW"
             | "VL_CHECK_STATS"
             | "VL_CHECK_KEEP_MODULES"
+            | "VL_LATE_DEMANDS"
     ) || k.starts_with("VL_PROFILE")
         || k.ends_with("_DUMP")
         || k.ends_with("_EXPLAIN")
