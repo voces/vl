@@ -20839,42 +20839,6 @@ function monoI32sSame(a: i32[], b: i32[]): boolean {
   true
 }
 
-// `monoHoleGenFnPin` for any other open function value: a binding holding an un-annotated
-// lambda or a value typed at a hole function's signature, or a call returning one, at the one
-// closed pin the flow table gives it past the call (D6002), else at `bindTy`, the checker's
-// binding of the hole at this call (-1 for none, D6112). "" when none closes.
-function monoOpenFnFlowPin(
-  argIx: i32,
-  ctx: i32,
-  bindTy: i32,
-  tyOut: i32[],
-): string {
-  const ax = unwrapParen(argIx)
-  if ax < 0 { return "" }
-  const vt = nodeTyIxOf(ax)
-  if vt < 0 || vt >= T.tys.length || !(tyAt(vt) is TyFunc) || !tyHasTyVar(vt) {
-    return ""
-  }
-  let fl = monoReadLetFrame(ax, ctx)
-  let ft = -1
-  if fl[1] < 0 {
-    const nl = monoNestedRowReadFrame(ax, ctx)
-    if nl[1] >= 0 {
-      fl = nl
-    } else {
-      if !(nodeAt(ax) is Call) { return "" }
-      fl = [ctx, ax]
-      ft = monoHoleGenFnFlowTy(argIx, fl)
-    }
-  } else {
-    ft = monoHoleGenFnFlowTy(argIx, fl)
-  }
-  if ft < 0 && bindTy >= 0 && monoTyConcreteFn(bindTy) {
-    return monoFnPinAt(argIx, ctx, bindTy, -1, tyOut)
-  }
-  monoFnPinAt(argIx, ctx, ft, fl[1], tyOut)
-}
-
 // `argIx` delivered at the concrete function type `bt`, and its pin name; each call taking the
 // flow pin of `flowDecl` (-1 for none) whose callee the checker left open is typed at it.
 function monoFnPinAt(
@@ -22212,7 +22176,6 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
               i,
               callIx,
               ctx,
-              oDecl,
               pinned,
               pinTys,
             )
@@ -22465,7 +22428,6 @@ function monoPinHoleParam(
   i: i32,
   callIx: i32,
   ctx: i32,
-  oDecl: i32,
   pinned: string[],
   pinTys: i32[],
 ): i32 {
@@ -22572,16 +22534,6 @@ function monoPinHoleParam(
     }
     // A hole function's `=>` pin is typed at the closed signature its rep key names.
     if anTy < 0 { anTy = monoHoleFnPinTy(args[i], ctx, an) }
-  }
-  if an == "" {
-    const pinTy: i32[] = [0 - 1]
-    an = monoOpenFnFlowPin(
-      args[i],
-      ctx,
-      monoHoleParamBindTy(callIx, oDecl, i),
-      pinTy,
-    )
-    anTy = pinTy[0]
   }
   if an == "" {
     const rowTy: i32[] = [0 - 1]
@@ -22800,11 +22752,6 @@ function monoPinAnnotatedParam(
         an2 = monoElabPin(callIx, args, i, eft, ctx)
         if an2 != "" { an2Ty = eft }
       }
-    }
-    if an2 == "" && ann == tp {
-      const pinTy: i32[] = [0 - 1]
-      an2 = monoOpenFnFlowPin(args[i], ctx, -1, pinTy)
-      an2Ty = pinTy[0]
     }
     if an2 == "" && ann == tp {
       const rowTy: i32[] = [0 - 1]
@@ -23905,23 +23852,6 @@ function monoDeclFrameIn(e: i32, ctx: i32): i32[] {
     hops = hops + 1
   }
   none
-}
-
-// `[frame, declaration]` of the list of lists read at `at` (`v[0][0]`, literal indices), whose
-// slot `e`/`e` holds the function read (D9710); `[-1, -1]` for any other read.
-function monoNestedRowReadFrame(at: i32, ctx: i32): i32[] {
-  const none: i32[] = [0 - 1, 0 - 1]
-  const o = nodeAt(at)
-  if !(o is Index) || !(nodeAt(o.idxIndex) is NumLit) { return none }
-  const ix = unwrapParen(o.idxArr)
-  if ix < 0 { return none }
-  const i = nodeAt(ix)
-  if !(i is Index) || !(nodeAt(i.idxIndex) is NumLit) { return none }
-  const r = unwrapParen(i.idxArr)
-  if r < 0 || !(nodeAt(r) is Ident) { return none }
-  const e = identDeclOf(r)
-  if e < 0 || e >= P.nodes.length || !(nodeAt(e) is LetDecl) { return none }
-  monoDeclFrameIn(e, ctx)
 }
 
 // `[frame, declaration]` of the `let` the read at `at` (a name, or a capture cell's `d[0]`)
@@ -25655,21 +25585,6 @@ function monoLamLitTakeTys(at: i32, ann: string, ctx: i32, delTys: i32[]): i32 {
   if lfe < 0 || lfe >= monoGen.length || monoGen[lfe] != 1 { return 0 }
   if !monoLamIsHole(lfe) { return 0 }
   monoCellLamTake(lfe, x, ann, ctx, delTys)
-}
-
-// The concrete function type the checker bound un-annotated parameter `i` of `decl` to at call
-// `callIx`; -1 for none.
-function monoHoleParamBindTy(callIx: i32, decl: i32, i: i32): i32 {
-  if decl < 0 || decl >= P.nodes.length { return -1 }
-  const dn = nodeAt(decl)
-  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return -1 }
-  const pt = nodeTyIxOf(dn.fnParams[i])
-  if pt < 0 || pt >= T.tys.length { return -1 }
-  const pv = tyAt(pt)
-  if !(pv is TyVar) { return -1 }
-  const bt = callBindTyOf(callIx, pv.tvName)
-  if bt < 0 || bt >= T.tys.length || !(tyAt(bt) is TyFunc) { return -1 }
-  bt
 }
 
 // Hole lambda `lfe`, the literal `x` among the arguments of call `callIx`, instanced at the
