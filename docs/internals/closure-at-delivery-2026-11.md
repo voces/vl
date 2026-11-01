@@ -94,9 +94,9 @@ site, closed signature). Three measured populations reduce to "which closure is 
 - A crossing whose destination closes the signature (a typed parameter, a container element whose
   call closes it, a result whose caller calls it at one signature) takes the row's fe for that
   signature, not the template lambda's.
-- A PARAMETER called at two or more signatures takes the bundle (inc3's half). A container or a
-  result called at two or more is not a bundle: named members dispatch through the tag's arms
-  (below), and lambda members are open question 1.
+- A parameter, or a binding the bundle admits, called at two or more signatures takes the bundle
+  (inc3's half). A container or a result called at two or more is not a bundle: named members
+  dispatch through the tag's arms (below), and lambda members are open question 1.
 - Keying a callee read by the CALL's per-instance type, rather than by what was built, is refuted
   (D14825): it traps in `closures/block-local-maker-of-generic-in-generic-body-at-two-types.vl` and
   prints a wrong value in `closures/generic-fn-value-one-binding-two-pins.vl`.
@@ -148,8 +148,9 @@ container at two types:
 
 A container element has one rep (DECISIONS.md, "A function value in a container keeps its set's
 one rep"), so a container called at two signatures does not hold two closures per element. It
-holds the set's tag, and the call dispatches to the row's fe per member and signature. Accepted
-when rung K's probe reports 0 class-4 sites and the 10 files run with unchanged output.
+holds the set's tag, and each call's arms call the members directly (γ's reading, below); the
+row is read only for a lambda member. Accepted when rung K's probe reports 0 class-4 sites and the
+10 files run with unchanged output.
 
 ### Acceptance for the whole design
 
