@@ -11341,3 +11341,39 @@ producers keep minting `("variant", vi)`, the `$fnsig` result token keeps its va
 caller boxing a returned arm reads its tag through it), and the label is not narrowed further.
 Folding tags into rows, a tag keyed by (union, row) rather than by arm, would be a separate
 tag-numbering decision, and it is not taken.
+
+## A literal names its arm: a record narrower than one declared record is stored as it (ruling, 2026-11-01)
+
+A record literal no delivery adopts has its own checked type, often narrower than any declared
+record: `{ r: null }` is typed `{ r: null }`, not `Circle = { r: i32 | null }`. The emitter used to
+decide where such a value lives by field-name set twice, with two scans that agree only by
+coincidence. At the build site, `objVariantRowCtx` took the first union arm whose names matched.
+At the read site, the join-row scan (`joinRowScanOfTy`) mapped the narrow type back to a struct row
+the same way. Where they disagreed, a `vl check`-clean program was refused (D14870).
+
+**The rule is one checker query, `recNarrowRecordOf(ty)`.** It answers the declared record that
+record type `ty` is narrower than, meaning the same field names with `ty` assignable to it
+(`recRepWidens`), and that stores every field alike, meaning the same type or a `null` field. The
+candidates are every declared record, union arms and non-arm records alike, each type once. Arms
+of two unions that are one structural type are one record, because types are structural and the
+answer is a type, not a name. It answers -1 when `ty` is itself a declared record, when no record
+widens it, when two different records widen it, and when the one record that widens it does not
+store it alike.
+
+"Stores alike" exists because of D14493's test. `{ v: 3 }` beside the arm `{ v: f64 }` widens, but
+built at the arm `v / 2` reads 1.5 instead of 1. A numeric widening, or an `i32` field into a
+nullable `i32` one, changes what a read computes or how the field is stored. Such a literal is not
+stamped and keeps its own row, which is what it did before.
+
+The query has two callers. The checker stamps an unadopted literal with the answer when the answer
+is a union arm (`recArmLitsAdopt`), so the literal is built at the arm and its binding, call result
+and reads reach the arm through the chains that already carry a rep. And `repStructRowOfTy`'s last
+rung asks it of a value's type, for receivers no rep chain reaches (a `??` over a map read, an
+element of a generic call's result). The field-set scans are gone: the join-row scan is deleted,
+and `objVariantRowCtx` finds an unadopted literal's arm by the literal's own type.
+
+**This is action at a distance.** A declaration elsewhere in the program picks the rep, so adding a
+second record with the same field names moves a literal off an arm and onto its own row. It is kept
+because it is what the emitter already did, now one checker fact in place of two emitter scans. The
+alternative, refused for now, is that an unadopted literal is always its own row and a conversion is
+emitted wherever it later meets the union. If the distance ever bites, that is the change to make.
