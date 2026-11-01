@@ -690,7 +690,9 @@ already there and already gates).
 
 **A comment-only change must produce a BYTE-IDENTICAL seed.** That is the trim campaign's
 whole safety proof: `scripts/refresh-compiler.sh`, then `cmp` against a seed built from the
-pre-trim source. One byte different means you edited code, not comments.
+pre-trim source. One byte different means you edited code, not comments. Build both seeds from a
+tree under a project root (a checkout or worktree): a tree with no `.git`/`deno.json`/`package.json`
+above it keys its modules by absolute path, so the same source builds a different seed there.
 
 ## A LADDER OVER A CLOSED KIND SET IS EXHAUSTIVE, OR ITS DEFAULT NAMES WHAT IT EXCLUDES
 
