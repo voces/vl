@@ -9122,105 +9122,31 @@ function fnRetStructSid(sid: i32, name: string, fnIx: i32, at: i32) {
 export function exprStruct(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = nodeAt(exprIx)
+  // An object literal builds its record whatever union its destination is.
   if e is ObjLit { return true }
   if e is Paren { return exprStruct(e.parInner, fnIx) }
   if e is AsExpr { return asTrapStructRow(exprIx) >= 0 }
-  // An if-EXPRESSION whose branch join is a struct — an un-annotated binding classifies kind 1
-  // (the THEN arm's rep, the arms agreeing by the checker), matching `structIndexOfExpr`.
-  if e is IfStmt {
-    const tv = ifThenValueIx(exprIx)
-    return tv >= 0 && exprStruct(tv, fnIx)
-  }
-  // A `m[k] ?? default` over a struct-valued map yields the value struct, so a bound
-  // `const p = m[k] ?? d` classifies as a struct local. A nullable-value slot yields
-  // `S | null` instead, since a stored null is preserved through `??` — `exprNullableStruct`
-  // claims that arm, not this one.
-  if e is BinExpr {
-    // A name's assignment yields a re-read of its cell, so it is the name's struct (D2170).
-    const asgCell = asgCellOf(exprIx, fnIx)
-    if asgCell >= 0 { return exprStruct(asgCell, fnIx) }
-    const cms = coalesceMvSlot(exprIx, fnIx)
-    if cms >= 0 {
-      // A nullable-value slot with a NON-null default coalesces to the non-null struct too
-      // (stored null included) — only a nullable default leaves it `S | null`.
-      return mvValKind[cms] == MVK_STRUCT
-        && !coalesceStaysNullable(exprIx, cms, fnIx)
-    }
-    // A `<S|null> ?? <S>` coalesce yields the non-null struct (the generic nullable-struct `??` emit) —
-    // so a bound `const p = r ?? d` classifies struct and `(r ?? d).x` resolves. The left is the
-    // nullable struct; the right is a plain struct default.
-    if e.binOp == "??" {
-      if exprNullableStruct(e.binLeft, fnIx) { return true }
-      return exprStruct(e.binRight, fnIx)
-    }
-  }
-  if e is Call {
-    if e.callFn < 0 { return false }
+  // A lifted lambda's capture is read through its cell, which the read's rep does not name.
+  if e is Ident && capturedKindOf(fnIx, e.identName) == "struct" { return true }
+  // A call delivered into a union is typed at the union; the callee still returns the record.
+  if e is Call && e.callFn >= 0 {
     const callee = nodeAt(e.callFn)
     if callee is Ident {
       if fnRetStructSid(sidOfNode(e.callFn), callee.identName, fnIx, e.callFn) {
         return true
       }
-      // A struct-returning function VALUE (a binding / `(i32) => S` param callee): its
-      // resolved `>sN;` sig (mirrors `structIndexOfExpr`'s closure case). Falls through to the
-      // per-node-type fallback below when the sig path misses (a factory-inferred value).
       if calleeReturnsStructIdxOfRead(e.callFn, fnIx) >= 0 { return true }
     }
-    // A field-closure call (`(a."*")(2)` — a rewritten operator/index trap)
-    // yields the field function's return struct (mirrors `structIndexOfExpr`).
-    if callee is Member {
-      if (
-        drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp)
-      ) {
-        const cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if cfe >= 0 {
-          if repOfFnSlot(cfe).rdKind == "struct" { return true }
-        }
-      }
-    }
-    // Fallback, scoped to a call: a struct-returning closure value call whose callee the
-    // cases above miss — an indexed closure-array element or a factory-inferred value. The
-    // cheap no-render `nodeTyIsObj` reads the checker's per-node type, the boolean dual of
-    // `structIndexOfExpr`'s fallback.
-    return nodeTyIsObj(exprIx)
+    if nodeTyIsObj(exprIx) { return true }
   }
-  if e is Ident {
-    if (paramStruct(fnIx, exprIx)) { return true }
-    if declaredStruct(exprIx) { return true }
-    // A captured struct: the env field is the struct ref (`captureValKind` sized it that
-    // way), so classify it like a struct param/local — the fourth storage class this arm
-    // never grew. Without it, a lambda whose body is a bare captured struct minted its
-    // `$fnsig` result i32 over a body returning `(ref $S)` — two functypes, invalid wasm.
-    if capturedKindOf(fnIx, e.identName) == "struct" { return true }
-    if globalReadIsStruct(fnIx, exprIx) { return true }
-    // The frame's own `let`, asked outside the frame's emission, where `declaredStruct` has no
-    // collected slot to read: the kind `structIndexOfExpr`'s frame leg already names a row for.
-    const fli = frameLetOf(fnIx, exprIx)
-    if fli >= 0 && !letIsVariant(fli, fnIx) {
-      if structIndexOfLet(fli, fnIx) >= 0 {
-        return !exprNullableStruct(exprIx, fnIx)
-      }
-    }
-    return false
+  // `r ?? d` over a nullable record yields the record, though the node is typed at its delivery.
+  if e is BinExpr && e.binOp == "??" {
+    if exprNullableStruct(e.binLeft, fnIx) { return true }
+    if exprStruct(e.binRight, fnIx) { return true }
   }
-  // `xs[i]` over a STRUCT-element ref list yields the struct (G7-ref). Per-slot: the
-  // element kind comes from the receiver's distinct ref-list slot (1 = struct).
-  if e is Index {
-    if exprRefArray(e.idxArr, fnIx) {
-      // GUARD the slot (a narrowed union-arm rebind receiver can classify
-      // `exprRefArray` true while the slot resolver misses — OOB otherwise).
-      const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if slot < 0 || slot >= rlElemTyIx.length { return false }
-      return refListElemIsRow(e.idxArr, fnIx)
-    }
-  }
-  // A field read is a struct when its recorded rep is one, whatever its storage holds.
-  if e is Member {
-    const md = repOfNode(exprIx, fnIx)
-    if md.rdCovered == 1 && md.rdKind == "struct" { return true }
-  }
-  // A NULLABLE struct value (`S | null`) participates in the struct machinery
-  // (member layout resolution); the field-read path inserts the non-null recover.
+  const rd = repOfNode(exprIx, fnIx)
+  if rd.rdCovered == 1 && rd.rdKind == "struct" { return true }
+  // A nullable struct takes the struct's member layout; its field reads recover non-null.
   exprNullableStruct(exprIx, fnIx)
 }
 
