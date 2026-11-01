@@ -2457,22 +2457,87 @@ function elabMintSetFwd(
   k: i32,
   st: i32,
 ): boolean {
-  if st < 0 || p < 0 || p >= P.nodes.length { return false }
+  if st < 0 { return false }
+  const to = elabSetFwdTarget(ix, p, k)
+  if to.length == 0 { return false }
+  let a = 1
+  while a < to.length {
+    mintParamFwdNote(decl, i, to[a], to[0])
+    a = a + 1
+  }
+  true
+}
+
+// `[j, member, ...]` when `ix` is positional argument `j` of call `p` through a set of functions
+// (as instance `k` types its callee) whose every member takes it un-annotated; else [].
+function elabSetFwdTarget(ix: i32, p: i32, k: i32): i32[] {
+  const none: i32[] = []
+  if p < 0 || p >= P.nodes.length { return none }
   const pn = nodeAt(p)
-  if !(pn is Call) { return false }
+  if !(pn is Call) { return none }
   const j = i32ListIndexOf(pn.callArgs, ix)
   if j < 0 || j < pn.callArgNames.length && pn.callArgNames[j] != "" {
-    return false
+    return none
   }
   const ms = fnTagMembers(fnTagSetOfTy(elabNodeTy(parenPeelIx(pn.callFn), k)))
-  if ms.length == 0 { return false }
+  if ms.length == 0 { return none }
+  const out: i32[] = [j]
   for m in ms {
     const f2 = nodeAt(m)
-    if !(f2 is FuncDecl) || j >= f2.fnParams.length { return false }
+    if !(f2 is FuncDecl) || j >= f2.fnParams.length { return none }
     const q = nodeAt(f2.fnParams[j])
-    if !(q is Param) || q.parType >= 0 { return false }
+    if !(q is Param) || q.parType >= 0 { return none }
+    out.push(m)
   }
-  for m in ms { mintParamFwdNote(decl, i, m, j) }
+  out
+}
+
+// Notes parameter `i` of `fn` (declared at `decl`), copied into the unannotated binding `d`,
+// as forwarded wherever `d` is read: true only when every read of `d` in `fn`'s body is a
+// positional argument of a call through a set of functions, and none sits in a nested function.
+function elabAliasSetFwd(
+  decl: i32,
+  i: i32,
+  d: i32,
+  fn: FuncDecl,
+  k: i32,
+  st: i32,
+) {
+  if st < 0 || d < 0 || d >= P.nodes.length { return false }
+  const ln = nodeAt(d)
+  if !(ln is LetDecl) || ln.letType >= 0 { return false }
+  const tos: i32[][] = []
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  const ins: boolean[] = [false]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    const inFn = ins.pop() ?? false
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == d {
+        // A nested function's read is one body for every instance (D14842).
+        if inFn { return false }
+        const to = elabSetFwdTarget(x, p, k)
+        if to.length == 0 { return false }
+        tos.push(to)
+      }
+      const deeper = inFn || nodeAt(x) is FuncDecl
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+        ins.push(deeper)
+      }
+    }
+  }
+  if tos.length == 0 { return false }
+  for to in tos {
+    let a = 1
+    while a < to.length {
+      mintParamFwdNote(decl, i, to[a], to[0])
+      a = a + 1
+    }
+  }
   true
 }
 
@@ -2814,6 +2879,22 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       }
       // A parameter handed back lands at the call's own value, which the decision reads.
       if elabRetHandsBack(decl, ix, i32ListIndexOf(dn.fnParams, pd)) {
+        return 0
+      }
+      // A binding copying it that is read only as an argument of calls through a set of
+      // functions forwards it there, as the parameter itself would.
+      if (
+        p >= 0
+        && nodeAt(p) is LetDecl
+        && elabAliasSetFwd(
+          decl,
+          i32ListIndexOf(dn.fnParams, pd),
+          p,
+          dn,
+          k,
+          fnTagSetOfTy(elabNodeTy(ix, k)),
+        )
+      ) {
         return 0
       }
       mintSetPartialNote(elabHeldSetOf(elabNodeTy(ix, k)))
