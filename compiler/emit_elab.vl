@@ -116,6 +116,7 @@ import {
   elabSnapKey,
   elabTyClosed,
   fnTagCallArms,
+  fnTagListTy,
   fnTagMembers,
   fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
@@ -130,7 +131,7 @@ import {
   callBindRowOf,
   callBindTysAt,
 } from "./check_bind_rows"
-import { recRepWidens } from "./check_bind_adopt"
+import { callArgRepTy, recRepWidens } from "./check_bind_adopt"
 import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
 import { monoRecheckEnd } from "./check_demands"
 import { cbExpMark, cbExpTruncate } from "./check_expected"
@@ -152,7 +153,12 @@ import {
 } from "./check_relate_core"
 import { pushScope } from "./check_narrow_paths"
 import { popScope } from "./check_narrow_flow"
-import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
+import {
+  i32ListHas,
+  i32ListIndexOf,
+  strListHas,
+  strListIndexOf,
+} from "./listutil"
 import {
   mintFactNote,
   mintParamFwdNote,
@@ -1086,7 +1092,21 @@ function elabDemandFrom(
       while p < f.fnParamTypes.length && p < pTys.length {
         const at = if tagged { elabCallArgSetTy(call, decl, p, from) } else { -1 }
         if at >= 0 {
-          bindGenWalk(f.fnParamTypes[p], at, names, tys)
+          // The set's own type replaces the rep a caller's pin binds the same variable to.
+          const an: string[] = []
+          const atys: i32[] = []
+          bindGenWalk(f.fnParamTypes[p], at, an, atys)
+          let j = 0
+          while j < an.length && j < atys.length {
+            const w = strListIndexOf(names, an[j])
+            if w >= 0 {
+              tys[w] = atys[j]
+            } else {
+              names.push(an[j])
+              tys.push(atys[j])
+            }
+            j = j + 1
+          }
         } else if elabTyClosed(pTys[p], 0) && !(p < byId.length && byId[p]) {
           bindGenWalk(f.fnParamTypes[p], pTys[p], names, tys)
         }
@@ -1104,8 +1124,8 @@ function elabDemandFrom(
   k
 }
 
-// The tagged set argument `p` of call `call` to `decl` hands an un-annotated parameter, or one
-// its own type parameter alone annotates, or -1.
+// The tagged set, or list of one, argument `p` of call `call` to `decl` hands an un-annotated
+// parameter, or one its own type parameter alone annotates, or -1.
 function elabCallArgSetTy(call: i32, decl: i32, p: i32, from: i32): i32 {
   if call < 0 || call >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
     return -1
@@ -1121,10 +1141,10 @@ function elabCallArgSetTy(call: i32, decl: i32, p: i32, from: i32): i32 {
   }
   const ax = parenPeelIx(cn.callArgs[p])
   const t = if ax >= 0 { nodeTyIxOf(ax) } else { -1 }
-  if fnTagSetIsTagged(fnTagSetOfTy(t)) { return t }
+  if fnTagSetIsTagged(fnTagSetOfTy(t)) || fnTagListTy(t) { return t }
   // A parameter of the calling instance handed on holds the set that instance binds it to.
   const it = if ax >= 0 && from >= 0 { elabNodeTy(ax, from) } else { -1 }
-  if fnTagSetIsTagged(fnTagSetOfTy(it)) { it } else { -1 }
+  if fnTagSetIsTagged(fnTagSetOfTy(it)) || fnTagListTy(it) { it } else { -1 }
 }
 
 // Whether some argument of call `call` to `decl` is a tagged set its parameter takes as itself.
@@ -1270,6 +1290,17 @@ function elabRepRowInstances() {
   let grew = false
   let i = 0
   while i < rows.length {
+    // A list argument mono pins at its rep is that instance alone (D14733).
+    if elabListArgAtRep(callBindIxAt(rows[i]), ekDecl[cks[i]]) {
+      const k = elabEnqueue(
+        ekDecl[cks[i]],
+        callBindNamesAt(rows[i]),
+        callBindRepTysAt(rows[i]),
+        -1,
+      )
+      elabReachNote(-1, k, -1)
+      grew = true
+    }
     let j = i + 1
     while j < rows.length {
       if (
@@ -1292,6 +1323,29 @@ function elabRepRowInstances() {
     i = i + 1
   }
   if grew { elabSettle(0) }
+}
+
+// Whether call `ix` of `decl` hands a parameter annotated as a list of a type parameter an
+// argument built at a wider list than the instance's type (`callArgRepTy`), as mono pins it.
+function elabListArgAtRep(ix: i32, decl: i32): boolean {
+  const f = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  if !(f is FuncDecl) { return false }
+  let a = 0
+  while a < f.fnParams.length {
+    const pn = nodeAt(f.fnParams[a])
+    const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+    if pt is TypeRef {
+      const nm = pt.tyName
+      const n = nm.length
+      const el = if n > 2 && nm.slice(n - 2, n) == "[]" { nm.slice(0, n - 2) } else { "" }
+      if el != "" && strListHas(f.fnTyParams, el) {
+        const et = elabCallParamTy(ix, a)
+        if et >= 0 && callArgRepTy(ix, a, et) != et { return true }
+      }
+    }
+    a = a + 1
+  }
+  false
 }
 
 // Whether bind rows `a` and `b` bind the same names to the same rep types.
@@ -3743,7 +3797,7 @@ export function elabInstTyAt(t: i32, fnIx: i32): i32 {
   elabSubstClosed(t, elabKeyAt(fnIx))
 }
 
-function elabSubstClosed(t: i32, k: i32): i32 {
+export function elabSubstClosed(t: i32, k: i32): i32 {
   if t < 0 || t >= T.tys.length || k < 0 || k >= ekNames.length { return -1 }
   let names = ekNames[k]
   let tys = ekTys[k]
@@ -4228,7 +4282,7 @@ function elabBodyRoot(b: i32): i32 {
 
 // The source declaration emitted declaration `d` copies: the one its body is rebuilt
 // from, else its lambda template's, else `d`.
-function elabSrcDecl(d: i32): i32 {
+export function elabSrcDecl(d: i32): i32 {
   if d < 0 || d >= P.nodes.length { return -1 }
   let t = d
   let guard = 0
