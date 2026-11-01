@@ -692,6 +692,7 @@ import {
   fnTagCallCopy,
   fnTagCallSetOf,
   fnTagHoldsTy,
+  fnTagLeafCarry,
   fnTagListTy,
   fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
@@ -4459,6 +4460,7 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
           const clone = mkFunc(nm, noTP, ps, a.fnRet, a.fnBody, a.pos)
           identOrigNote(clone, unwrapParen(argIx))
           recordClonedCallRetire(unwrapParen(argIx), clone)
+          fnTagLeafCarry(clone, unwrapParen(argIx))
           fnStmts.push(clone)
           fnParent.push(-1)
           fnDispNames.push("")
@@ -4906,6 +4908,8 @@ function monoLamElabRet(fnIx: i32): i32 {
 // at `fnIx`, into its own `fnStmts` slot and re-parents the lambdas minted since `mark`.
 // Returns `clone`.
 function monoLamInstallClone(a: FuncDecl, fnIx: i32, clone: i32, mark: i32) {
+  // A lambda member of a tagged set is its id wherever an instance of it is read.
+  fnTagLeafCarry(clone, fnIx)
   // D1046 — the first instance of a named nested function replaces the template's slot
   // rather than pushing beside it: the by-name lookup takes the first child of the
   // frame, so two same-named children mean the call answers the unsubstituted template.
@@ -7740,12 +7744,11 @@ function monoTagSetAt(ix: i32, callFn: i32): i32 {
   const s = fnTagSetOfTy(t)
   if s >= 0 && fnTagArmsAt(ix, s).length > 0 { return s }
   // A callee read off a list or record the instance types at its rep (an element's i32 id) is
-  // the set its template's facts name.
+  // the set its template's facts name; one the instance types as a closure is not.
+  if s >= 0 || tyAt(t) is TyFunc { return -1 }
   const tpl = monoCallTplOf(ix)
   const ms = mintCallSoleSet(tpl)
-  if s < 0 && fnTagSetIsTagged(ms) && fnTagArmsAt(tpl, ms).length > 0 {
-    return ms
-  }
+  if fnTagSetIsTagged(ms) && fnTagArmsAt(tpl, ms).length > 0 { return ms }
   -1
 }
 
@@ -10209,6 +10212,9 @@ function monoMakeInstanceLater(
       )
     }
   }
+  if origFe >= 0 && origFe < monoOrigNode.length {
+    fnTagLeafCarry(nfn, monoOrigNode[origFe])
+  }
   fnStmts.push(nfn)
   // A nested template's later instance keeps the template's frame, so its captures
   // resolve where the first instance's do and its env fields take their real types (D2749).
@@ -10572,6 +10578,7 @@ function monoMakeInstanceFirst(
   instName: string,
 ) {
   buildFnMapNoteFnStmtWrite(origFe, nfn)
+  fnTagLeafCarry(nfn, monoOrigNode[origFe])
   fnStmts[origFe] = nfn
   monoLamCallByName(calleeIx, origFe, instName)
   0
@@ -24538,6 +24545,14 @@ function monoNoteCallLitDests(n: Call, ix: i32, ctx: i32) {
   0
 }
 
+// The template slot of the lambda a dispatch arm's nameless callee `cf` is bound to, or -1.
+function monoArmLamFe(cf: i32, callee: Ident): i32 {
+  if callee.identName != "" { return -1 }
+  const d = identDeclOf(cf)
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is FuncDecl) { return -1 }
+  fnStmtsPosOf(d)
+}
+
 // `monoWalk`'s arm for a call `n` (node `ix`, in frame `ctx`) whose callee is the identifier
 // `callee`, its arguments already walked: coerces generic values at concrete parameters, then
 // instantiates the generic it resolves to, through any alias, or specializes a concrete one.
@@ -24593,9 +24608,15 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
   let wlAt = n.callFn
   let wlFr = ctx
   if fe < 0 {
+    // A dispatch arm calls its member by declaration: a lambda's arm names no function, so
+    // it takes the lambda's own template slot and is instantiated per call as a name is.
+    let afe = monoArmLamFe(n.callFn, callee)
+    if afe >= 0 && !i32ListHas(monoLamCallCallees, n.callFn) {
+      monoLamCallCallees.push(n.callFn)
+    }
     // A call through a `const` alias of a lambda's `const` binding calls that lambda, and is
     // instantiated per call alike (D2896).
-    let afe = monoRespellLamFe(n.callFn, ctx)
+    if afe < 0 { afe = monoRespellLamFe(n.callFn, ctx) }
     // A direct call through a value binding to a generic named function: resolve it
     // to the lifted slot and monomorphize per call site. Named functions only, and
     // re-read rather than reused from `dfe`, the coercion loop between having run.
