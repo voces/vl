@@ -4528,6 +4528,7 @@ fn compile_vl_instance(
     let rc = from_compiler(called)?;
     report_guest_fuel(store);
     report_guest_alloc(resident0);
+    report_late_demands(inst, store, source_path);
     if rc != 0 {
         let stage = match rc {
             1 => "parse",
@@ -4542,6 +4543,37 @@ fn compile_vl_instance(
         from_compiler(report_rep_shadow(inst, &mut store, source_path))?;
     }
     Ok(bytes)
+}
+
+/// Whether `$VL_LATE_DEMANDS=1` asked for each compile's late elaboration demands.
+fn late_demands_on() -> bool {
+    std::env::var("VL_LATE_DEMANDS").ok().as_deref() == Some("1")
+}
+
+/// Under `$VL_LATE_DEMANDS=1`, print `[late] <path>: <n>` to stderr, then one
+/// `[late] <path>: demand <name>` per key the elaboration minted after `elabRun` returned:
+/// work asked of it once it was done. A seed without `elabLateCount` prints nothing.
+fn report_late_demands(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !late_demands_on() {
+        return;
+    }
+    let (Ok(count), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "elabLateCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "elabLateLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "elabLateAt"),
+    ) else {
+        return;
+    };
+    let n = count.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = format!("[late] {path}: {n}\n");
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let name: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        rows.push_str(&format!("[late] {path}: demand {name}\n"));
+    }
+    eprint!("{rows}");
 }
 
 /// Stream the guest's rep-shadow report ($VL_REP_SHADOW mode) to stderr: one
@@ -9896,6 +9928,10 @@ fn pump_session(
                 // never issues it — still runs under this host.
                 let validate_commit =
                     inst.get_typed_func::<i32, i32>(&mut store, "cliValidateCommit")?;
+                if late_demands_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_late_demands(&inst, &mut store, &p);
+                }
                 let mut bytes = BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?;
                 // THE SEAM. Between the emitter's bytes and the engine's verdict,
                 // and nowhere else — everything below this line is the real path.

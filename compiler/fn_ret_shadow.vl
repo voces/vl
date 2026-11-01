@@ -13,6 +13,8 @@ import {
   elabSubstClosed,
 } from "./emit_elab"
 import { scopeTyAt } from "./emit_capture_frames"
+import { cloSigKeyExt } from "./emit_classify"
+import { repSigRetTokOfTy } from "./emit_rep_slot"
 import {
   emitPhaseReached,
   fRetVoid,
@@ -26,10 +28,11 @@ import {
 } from "./emit_state"
 import { i32ListHas } from "./listutil"
 import { identDeclOf } from "./symbols"
-import { tyHasTyVar } from "./tyquery"
+import { nonNullTy, tyHasTyVar } from "./tyquery"
 
 let frsArmed = false
 let frsNamed = false
+let frsKindArmed = false
 let frsDrop = 0
 let frsRowKey: string[] = []
 let frsRowN: i32[] = []
@@ -37,6 +40,14 @@ let frsRowN: i32[] = []
 // Arm (1) or disarm (0) the shadow for the compiles that follow; 2 also names each function.
 export function fnRetShadowArm(on: i32) {
   frsArmed = on != 0
+  frsNamed = on == 2
+  0
+}
+
+// Arm (1) or disarm (0) the result-kind shadow for the compiles that follow; 2 also names each
+// function. It counts beside the voidness rows, once `computeRetInference` has settled.
+export function fnKindShadowArm(on: i32) {
+  frsKindArmed = on != 0
   frsNamed = on == 2
   0
 }
@@ -94,8 +105,10 @@ function frsTemplateRet(fe: i32, nested: boolean, k: i32): i32 {
   if k >= 0 { elabSubstClosed(r, k) } else { -1 }
 }
 
-// The result of the function type `ft`, or -1 where `ft` is no function type.
-function frsFnRet(ft: i32): i32 {
+// The result of the function type `ft0`, or of its function member where a delivery recorded it
+// nullable; -1 where it is no function type.
+function frsFnRet(ft0: i32): i32 {
+  const ft = nonNullTy(ft0)
   if ft < 0 || ft >= T.tys.length { return -1 }
   const f = tyAt(ft)
   if f is TyFunc { return f.fnRet }
@@ -174,6 +187,52 @@ function frsTailCallsVoid(fx: i32): boolean {
   if cd < 0 { return false }
   const ce = fnStmtsPosOf(cd)
   ce >= 0 && ce < fRetVoid.length && fRetVoid[ce] == 1
+}
+
+// Count every function the emitter lowers valued by how the kind of its recorded result meets
+// `fRetKind`. Run once the kinds have settled (after `computeRetInference#2`).
+export function fnKindShadowRun() {
+  if !frsKindArmed { return 0 }
+  if frsArmed == false {
+    frsRowKey = []
+    frsRowN = []
+  }
+  let fe = 0
+  while fe < fnStmts.length && fe < fRetVoid.length {
+    const fn = nodeAt(fnStmts[fe])
+    if fn is FuncDecl {
+      if fRetVoid[fe] == 0 {
+        let key = frsKindClass(fe)
+        if frsNamed { key = key + " | " + fn.fnName }
+        frsCount(key)
+      }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// The kind class of valued function `fe`: the `$fnsig` result token its recorded result
+// crosses as, against the one its lowered signature (`cloSigKeyExt`) carries.
+function frsKindClass(fe: i32): string {
+  let r = fnRecordedRetTy(fe)
+  if frsDrop == 1 { r = -1 }
+  if frsDrop == 2 { r = TY_VOID }
+  if r == TY_VOID || r == TY_NEVER { return "kind: recorded void or never" }
+  if r < 0 || r >= T.tys.length { return "kind: no result recorded" }
+  const rec = repSigRetTokOfTy(r)
+  if rec == "" { return "kind: recorded result has no token" }
+  const low = cloSigKeyExt(fe)
+  let gt = -1
+  let i = 0
+  while i < low.length {
+    if low[i] == '>' { gt = i }
+    i = i + 1
+  }
+  if gt < 0 { return "kind: lowered signature has no token" }
+  const lr = low.slice(gt, low.length)
+  if lr == rec { return "kind agree" }
+  "kind: recorded " + rec + ", lowered " + lr
 }
 
 function frsCount(key: string) {

@@ -37,11 +37,12 @@ const DROP_NONE = 0;
 const DROP_NOTHING = 1;
 const DROP_AS_VOID = 2;
 
-/** Compile `src` on a fresh instance with the shadow armed; the rows by class, summed. */
-const shadow = (src: string, drop: number, named: boolean) => {
+/** Compile `src` on a fresh instance with one shadow armed; the rows by class, summed. */
+const shadow = (src: string, drop: number, named: boolean, kind = false) => {
   const exp = new WebAssembly.Instance(compiled!, {})
     .exports as unknown as Exports;
-  exp.fnRetShadowArm(named ? 2 : 1);
+  if (kind) exp.fnKindShadowArm(named ? 2 : 1);
+  else exp.fnRetShadowArm(named ? 2 : 1);
   exp.fnRetShadowDropSet(drop);
   exp.modReset();
   exp.srcReset();
@@ -66,8 +67,9 @@ const expectRows = (
   drop: number,
   named: boolean,
   want: string,
+  kind = false,
 ) => {
-  const { rc, rows } = shadow(src, drop, named);
+  const { rc, rows } = shadow(src, drop, named, kind);
   if (rc !== 0) throw new Error(`${name}: want compileSrc rc 0, got ${rc}`);
   const got = show(rows);
   if (got !== want) {
@@ -155,6 +157,17 @@ function c<T>(x: T) {
 c(1)
 `;
 
+// A lambda delivered into a nullable function field records the field's type, `(() => i64) | null`:
+// its result is the function member's.
+const NULLABLE_FIELD = `type R = { f: (() => i64) | null }
+function go() {
+  const t0: () => R = () => ({ f: () => (13131313131) })
+  const t1 = t0().f
+  if t1 != null { print(t1()) }
+}
+go()
+`;
+
 // A generic nothing instantiates is pruned to an empty stub, void as minted (`monoStubSlots`).
 const STUB = `function id<T>(x: T): T { x }
 function keep(x: i32) { x + 1 }
@@ -228,6 +241,13 @@ Deno.test({
       true,
       "agree | __lambda_0=1; agree | c=1; agree | inner=1; agree | other=1; recorded value, emitter void | __lambda_1=1",
     );
+    expectRows(
+      "nullable field",
+      NULLABLE_FIELD,
+      DROP_NONE,
+      true,
+      "agree | __lambda_0=1; agree | __lambda_1=1; agree | go=1",
+    );
     expectRows("stub", STUB, DROP_NONE, true, "agree | id=1; agree | keep=1");
     expectRows(
       "tail write",
@@ -270,6 +290,59 @@ Deno.test({
       DROP_AS_VOID,
       false,
       "agree=1; recorded void, emitter value=4",
+    );
+  },
+});
+
+// The result-kind shadow: a valued function's recorded result against its lowered signature's
+// result token. A closure writing a value `if` into a captured `i64` records `i32` (an
+// assignment yields its right side) and lowers the stored `i64`.
+const HEX_LAMBDA = `function g(c: boolean) {
+  let x: i64 = 0
+  const set = () => {
+    x = if c { 0xfffffffe } else { 1 }
+  }
+  set()
+  print(x)
+}
+g(true)
+`;
+
+Deno.test({
+  name: "fn-ret shadow: kind classes",
+  ignore,
+  fn() {
+    expectRows("kind plain", PLAIN, DROP_NONE, true, "kind agree | g=1", true);
+    expectRows(
+      "kind hex lambda",
+      HEX_LAMBDA,
+      DROP_NONE,
+      true,
+      "kind: recorded >i, lowered >I | __lambda_0=1",
+      true,
+    );
+  },
+});
+
+Deno.test({
+  name: "fn-ret shadow: kind fires",
+  ignore,
+  fn() {
+    expectRows(
+      "kind, nothing",
+      PLAIN,
+      DROP_NOTHING,
+      false,
+      "kind: no result recorded=1",
+      true,
+    );
+    expectRows(
+      "kind, all void",
+      PLAIN,
+      DROP_AS_VOID,
+      false,
+      "kind: recorded void or never=1",
+      true,
     );
   },
 });

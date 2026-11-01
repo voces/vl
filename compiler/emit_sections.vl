@@ -215,6 +215,8 @@ import {
   annRlNul,
   annRlSlot,
   armPreludeBlocks,
+  armStageElemKeyKind,
+  armStageElemTyIx,
   arrLitCommitAnn,
   arrLitCommitName,
   ba8TypeIdx,
@@ -519,9 +521,6 @@ import {
   uBoxIdx,
   uBoxNewEnd,
   uFieldCount,
-  uFieldElemKeyKind,
-  uFieldElemTyIx,
-  uFieldNames,
   uFieldStart,
   uSinkFired,
   uTags,
@@ -691,9 +690,7 @@ import {
   globalCellStructIdx,
   inferredRetMapSlot,
   letBindIsAtom,
-  letBindIsNulAtom,
   letCellSlot,
-  letIsNulString,
   letNulMapReadUnionBox,
   letUnionNameOf,
   refListSlotOfExpr,
@@ -792,7 +789,7 @@ import {
   globalRefListSlot,
 } from "./emit_value_sites"
 import { callBindShadowBegin } from "./call_bind_shadow"
-import { fnRetShadowRun } from "./fn_ret_shadow"
+import { fnKindShadowRun, fnRetShadowRun } from "./fn_ret_shadow"
 import {
   fnFlowShadowBegin,
   fnFlowShadowBuild,
@@ -2564,10 +2561,7 @@ function emitStartGlobalInit(
         }
         // Back to idle: a left armed null seed retypes the next global's bare `null` (D1563).
         const idle = expCtxHere(ec)
-        idle.nulBool = false
-        idle.nulString = false
         idle.litUnion = 0
-        idle.nulLitUnion = false
         expCtxApply(idle, ec)
         // Read-only covariance at the module-global binding (D822), a delivery form of its own:
         // a global is not a `let`, so no let-side delivery reaches it. A const
@@ -2598,24 +2592,12 @@ function emitStartGlobalInit(
   0
 }
 
-// `emitStartGlobalInit`'s seeding step for global statement `gst`:
-// applies the expression context its initializer lowers under — the niche null reps and atoms.
+// `emitStartGlobalInit`'s seeding step for global statement `gst`: an atom global's start-fn
+// init lowers a member literal as its atom id, the start-fn twin of the const-path seeding.
 function emitStartGlobalSeedCtx(gst: i32, ec: ExpCtx) {
   const sc = expCtxHere(ec)
-  // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
-  // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
-  sc.nulBool = globalCellKind(gst) == "nulbool"
-  sc.nulString = letIsNulString(gst, -1)
-  // An atom global's start-fn init lowers a member literal as its atom id, and a `K | null`
-  // niche's a bare `null` as the `-1` sentinel — the start-fn twin of the const-path seeding.
   if letBindIsAtom(gst, -1) { sc.litUnion = 1 }
-  if letBindIsNulAtom(gst, -1) { sc.nulLitUnion = true }
   expCtxApply(sc, ec)
-  // The cell's null rep, by kind (the local-`let` and `global.set`
-  // boundaries share the resolver). A bare `null` is never a WasmGC constexpr, so every
-  // `= null` global routes here and this is where its null rep is decided.
-  const cellCtx = expCtxHere(ec)
-  expCtxApply(cellCtx, ec)
   0
 }
 
@@ -5979,7 +5961,7 @@ function typeSeeds(g: i32): string[] {
     if kind == TSK_STRUCT && slot >= 0 && slot < sFieldCount.length {
       s = "R" + seedNames(sFieldNames, sFieldStart[slot], sFieldCount[slot])
     } else if kind == TSK_VARIANT && slot >= 0 && slot < uFieldCount.length {
-      s = "R" + seedNames(uFieldNames, uFieldStart[slot], uFieldCount[slot])
+      s = "R" + seedNames(sFieldNames, uFieldStart[slot], uFieldCount[slot])
     } else if (
       (kind == TSK_REF_BACK || kind == TSK_REF_WRAP)
       && slot >= 0
@@ -7449,7 +7431,9 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
       return cv
     }
     "computeRetInference#2" => {
-      return computeRetInference()
+      const cr = computeRetInference()
+      fnKindShadowRun()
+      return cr
     }
     "collectMapFilterUse" => {
       return collectMapFilterUse()
@@ -7589,17 +7573,17 @@ function emitProgramReset(rootIx: i32) {
   fmSeenSFields = -1
   fmSeenUFields = -1
   fmSeenTyParams = -1
-  sFieldElemTyIx = []    // a struct FIELD's element type     [collectS]
-  uFieldElemTyIx = []    // a VARIANT field's element type    [collectU]
-  sFieldElemKeyKind = [] // a struct FIELD's map KEY rep    [collectS]
-  uFieldElemKeyKind = [] // a VARIANT field's map KEY rep   [collectU]
-  unMemTyStart = []      // union MEMBER types per row        [collectU]
+  sFieldElemTyIx = []      // a struct FIELD's element type     [collectS]
+  armStageElemTyIx = []    // a VARIANT field's element type    [collectU]
+  sFieldElemKeyKind = []   // a struct FIELD's map KEY rep    [collectS]
+  armStageElemKeyKind = [] // a VARIANT field's map KEY rep [collectU]
+  unMemTyStart = []        // union MEMBER types per row        [collectU]
   unMemTyCount = []
   unMemTys = []
-  unMemAtoms = []        // the member-REFERENCE columns      [collectU]
+  unMemAtoms = []          // the member-REFERENCE columns      [collectU]
   unMemAtomIds = []
   unMemKinds = []
-  msPoolReset()          // the member SETS interned over those columns
+  msPoolReset()            // the member SETS interned over those columns
   // The if-expression arm blocks whose prelude locals the collect pass allocated. Arena node
   // indices, so it is the same hazard as the columns above and worse: a stale index that happens
   // to name a node in program N grants the emitter permission to lower a prelude with no allocated locals, claiming another binding's slot.
@@ -9621,8 +9605,6 @@ function emitConstCellInit(buf: u8[], gi: i32, ec: ExpCtx): i32 {
     // bare `null` as the -1 sentinel. Un-seeded, a member init emitted the string ref into the
     // i32 niche cell (invalid wasm) and a `null` init drew a loud reject.
     if letBindIsAtom(globalStmts[gi], -1) { cc.litUnion = 1 }
-    if letBindIsNulAtom(globalStmts[gi], -1) { cc.nulLitUnion = true }
-    cc.nulBool = gck == "nulbool"
     expCtxApply(cc, ec)
     // A union cell boxes its init in the constexpr (`struct.new` / `array.new_fixed` /
     // `i32.const` are all constant in WasmGC), and a `const f = add` aliasing a generic named
