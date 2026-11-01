@@ -11,17 +11,22 @@ Status: draft. The mechanism half is inc3's; the population and acceptance half 
 
 ### The shared row
 
-**One row per built closure: `(creation site, closed signature) → fe`.**
+**One row per built closure: `(creation site, instance, closed signature) → fe`.**
 
 - *Creation site* is the arena node where the closure's environment is captured: the lambda
   literal, or the declared function's name read where it becomes a value.
 - *Closed signature* is the `TyFunc` the closure is built at, with every hole closed. A tagged
   set's type counts as closed; its rep is the member id.
+- *Instance* is the elaboration instance whose body holds the creation site, or `-1` where the
+  site is in no instanced body. It is in the key from day one, though a nested body is not yet
+  instanced per encloser: adding it later would rewrite every reader twice, and a reader written
+  in between would key wrong for exactly the D14842 shape. The writer knows the instance where
+  mono mints the clone.
 - *fe* is the emitted function slot whose body is the lambda instanced at that signature.
 
-**A creation site inside a generic instance is per instance.** If a list literal of hole functions sits in the body of a function with two instances, a member handed each instance's own set needs one closure per instance. Today the element-at-set path (#5693) keys the element node once (`monoElemAtSet`). That is why #5673's shared-member partial clause has to stay. Measured on `run(h) { const fs = [apply2, apply3]; for f in fs { f(h) } }` with `run(add); run(mul)`: dropping the clause prints `3 4 3 4` for `3 4 2 3.75`. So the row's creation site is the node in the instance's copy, or the pair (node, instance), and the clause narrows to holders shared across instances only once that keying lands.
+**A creation site inside a generic instance is per instance.** If a list literal of hole functions sits in the body of a function with two instances, a member handed each instance's own set needs one closure per instance. Today the element-at-set path (#5693) keys the element node once (`monoElemAtSet`). That is why #5673's shared-member partial clause has to stay. Measured on `run(h) { const fs = [apply2, apply3]; for f in fs { f(h) } }` with `run(add); run(mul)`: dropping the clause prints `3 4 3 4` for `3 4 2 3.75`. So the row keys the instance beside the site (below), and the clause narrows to holders shared across instances only once a nested body is instanced per encloser.
 
-The key is an i32 pair, never a spelling. This follows the destringify ruling: no new name
+The key is three i32s, never a spelling. This follows the destringify ruling: no new name
 spelling and no extension of an existing one. The row is written in exactly one place, where
 mono mints the clone (`monoCloneLambdaPinned`, or the private-body clone). Every reader asks
 the row; no reader re-derives the clone. The emitter-state audit holds it as per-program state.
@@ -77,8 +82,10 @@ signature, carried as one value.
 ### Matrix
 
 The bundle record is an anonymous record, so its position matrix must include a same-shape
-USER record (`{c0: (i32) => i32, c1: (f64) => f64}` written by hand) beside the bundle. That
-proves the two never share a row they should not.
+USER record (`{c0: (i32) => i32, c1: (f64) => f64}` written by hand) beside the bundle, and a
+NOMINAL twin with the same field names (`type B = {c0: (i32) => i32, c1: (f64) => f64}`), the
+user record most likely to share an interned row with the bundle. That proves the bundle never
+shares a row it should not.
 
 ## Population and acceptance (step7)
 
@@ -205,8 +212,8 @@ shared row names.
    `ftLambdaIdOk` passes (γ's L4, which reads nothing but its own and the module's bindings). A
    capturing lambda stays a closure at one signature. So the shared row would need one closure per
    signature for that lambda, but a container element has one rep. Today this is γ's gaps (b) and
-   (c), refused with the split plan off. Proposal: γ's backlog owns it; this design names it and
-   does not cover it.
+   (c), refused with the split plan off, graded as D14844 (b) and D14845 (c). Agreed (coordinator,
+   2026-11-01): γ's backlog owns it; this design names it and does not cover it.
 2. **D14825's two refutation files need the split plan.** With it off they refuse (see the table
    above). Read against inc3's binding-bundle conditions (a local `const` or unwritten `let`, every
    read a callee or a bundled argument, never returned, stored or captured):
