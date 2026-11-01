@@ -21,18 +21,18 @@ ingredients name the family. Master `8c716bf0c`, fixpoint seed.
 
 ## Families
 
-| family | rows | mechanism |
-|---|---|---|
-| A | 13 | a join of scalars or type parameters read at the wrong rep |
-| C | 13 | a record or container delivered at a rep its destination stores differently |
-| D | 7 | a generic or hole function value at an instance |
-| E | 6 | `??` and short-circuit lowering |
-| I | 5 | not narrowing: loop overflow, match re-evaluation, extern `never`, u8 truncation, `x!` parse |
-| B | 4 | a narrowing survives a write through an alias (the narrowing ledger proper) |
-| F | 3 | `as` / `as!` inside an instance, a hole lambda or a copied hole binding |
-| G | 3 | a generic body's read in an instance (`is`, list ops) |
-| H | 2 | a module global read before its initializer |
-| J | 1 | a tail `null` write lowered void |
+| family | rows | mechanism | lane |
+|---|---|---|---|
+| A | 13 | a join of scalars or type parameters read at the wrong rep | step 5 |
+| C | 13 | a record or container delivered at a rep its destination stores differently | c-2 |
+| D | 7 | a generic or hole function value at an instance | γ (D14791: mcall's flip) |
+| E | 6 | `??` and short-circuit lowering | error-channel |
+| I | 5 | not narrowing: loop overflow, match re-evaluation, extern `never`, u8 truncation, `x!` parse | step 7 (re-label only) |
+| B | 4 | a narrowing survives a write through an alias (the narrowing ledger proper) | step 7 |
+| F | 3 | `as` / `as!` inside an instance, a hole lambda or a copied hole binding | mono |
+| G | 3 | a generic body's read in an instance (`is`, list ops) | D3423 |
+| H | 2 | a module global read before its initializer | step 7 |
+| J | 1 | a tail `null` write lowered void | mcall |
 
 Only family B is the emitter-versus-checker narrowing ledger the step was written for. Family I is
 not narrowing at all, and the rest belong to the rep, container, generic-instance, `??`, cast and
