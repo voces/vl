@@ -11330,3 +11330,14 @@ for now the function-tag rule declines a record whose fields would mix the two s
 record keeps its untagged row. A delivery that tags one must keep running
 `closures/hole-fn-record-beside-declared-row-handed-to-param.vl`,
 `closures/hole-fn-record-field-called-at-other-param.vl` and `closures/hole-fn-record-list-element.vl`.
+
+**Where the label stops (step 4, 2026-11-01).** After #5613 the `"variant"` kind is the arm
+reference and nothing more: a value's heap and fields come from its arm's row (`variantRowOf`,
+which `variantHeap` reads), and the writers in `emit_bytes.vl` take a variant kind through the
+struct arms. What stays with the arm is its box tag: every boxing site emits `uTags[vi]` off the
+value's variant index (24 readers), and a row does not determine a tag, since structural twins
+(`Cat`/`Kot`, one heap through `uVarTwin`) share a row as distinct arms with distinct tags. So
+producers keep minting `("variant", vi)`, the `$fnsig` result token keeps its variant kind (a
+caller boxing a returned arm reads its tag through it), and the label is not narrowed further.
+Folding tags into rows, a tag keyed by (union, row) rather than by arm, would be a separate
+tag-numbering decision, and it is not taken.
