@@ -39,9 +39,8 @@ const LOCAL: Record<string, string> = {
     "CI proves the fixpoint, not the fuel, heap or survey rows",
   "plumb-shape cost":
     "ci-cost runs it with --require-fuel and no native binaryen",
-  "rep-fuzz": "CI does not run it",
-  "filed witnesses": "CI does not run it",
-  "splice scan": "CI does not run it",
+  "filed witnesses":
+    "ci-witnesses grades it in two --shard runs, not the one command the row runs",
   "distilled corpus":
     "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
 };
@@ -84,6 +83,10 @@ const CI_RUNS: Record<string, string[]> = {
   ],
   "conflict markers": [],
   "corpus oracle": ["- name: Corpus oracle on the wasm compiler"],
+  "rep-fuzz": ["run: bash scripts/rep-fuzz-check.sh"],
+  "splice scan": [
+    "vl run scripts/inventory/splice-scan.vl --compiler build/vl-compiler.wasm -- --self-test",
+  ],
 };
 
 // Top-level jobs of ci.yml, name -> body.

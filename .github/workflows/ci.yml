@@ -134,7 +134,8 @@ jobs:
   #          ├── checks               ratchets, probes, self-lint, corpus oracle, editor suites
   #          ├── ci-release-shape (1) the binaryen-backed suites
   #          ├── ci-cost (2)         fuel/RSS cost ratchets
-  #          └── ci-distilled         the distilled census corpus (no working cell stops running)
+  #          ├── ci-distilled         the distilled census corpus (no working cell stops running)
+  #          └── ci-witnesses (2)     every filed inventory row's witness, graded as filed
   #
   # `seed` is the only job that builds anything: the vl-host binary (on a binary-cache miss)
   # and the seed, which it refreshes AND proves a self-compilation fixed point before saving
@@ -153,6 +154,10 @@ jobs:
   # ---------------------------------------------------------------------------
   seed:
     runs-on: ubuntu-latest
+    # A compiler that does not terminate compiling itself (CLAUDE.md, "A cost regression shows
+    # up one bootstrap step late") would otherwise hold this runner for six hours. The ladder
+    # takes about a minute warm and a few minutes on a cold cargo build.
+    timeout-minutes: 30
     # `actions: read` lets a master run find and download a pull request's proven seed, and
     # read a PR head's CI verdict; `statuses` and `pull-requests` read the queue's mark.
     permissions:
@@ -536,6 +541,18 @@ jobs:
         run: |
           scripts/vl-host/target/release/vl run scripts/render-parse-census.vl --compiler build/vl-compiler.wasm -- --out "$RUNNER_TEMP/render-parse.json"
           scripts/vl-host/target/release/vl check --budget scripts/render-parse-budget-baseline.json --findings "$RUNNER_TEMP/render-parse.json" --compiler build/vl-compiler.wasm
+
+      # The gate's `rep-fuzz` row: 16 pinned fuzz seeds through `vl run --batch`, red on any
+      # failing shape the baseline does not name (and on an unsound class in the baseline).
+      # About 4 s; gate-only it gated no direct merge.
+      - name: Rep-composition fuzz (no new failure)
+        run: bash scripts/rep-fuzz-check.sh
+
+      # The gate's `splice scan` row: inventory rows a conflict resolution spliced together.
+      - name: Splice scan
+        run: |
+          scripts/vl-host/target/release/vl run scripts/inventory/splice-scan.vl --compiler build/vl-compiler.wasm -- --self-test > /dev/null
+          scripts/vl-host/target/release/vl run scripts/inventory/splice-scan.vl --compiler build/vl-compiler.wasm
 
       # Collect the backgrounded self-lint. Bounded poll: the subshell wraps lint-self.sh
       # in `timeout 420`, so 450 s is a margin over that and a dead subshell fails fast.
@@ -944,6 +961,66 @@ jobs:
           JOBS: "4"
 
   # ---------------------------------------------------------------------------
+  # ci-witnesses — every filed inventory row's own witness, graded against its status line
+  # (scripts/check-filed-witnesses.vl --strict): the gate's `filed witnesses` row in two
+  # shards. `--shard K/N` deals the `@@repeat` rows first and the rest after, round-robin, by a
+  # rule that reads only the documents, so the shards partition the rows. Gate-only, it let
+  # #5431 move D4266 from a loud emit reject to check-clean invalid wasm on 2026-11-01. Measured
+  # on 4 cores: 51.9 s unsharded, 40.7 s / 29.0 s sharded. The outcome cache is keyed by seed;
+  # its `hints.rec` (which rows to grade alone) is not, so restoring any older entry helps.
+  # ---------------------------------------------------------------------------
+  ci-witnesses:
+    needs: seed
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore vl-host binary
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            build/vl-compiler.wasm.*.cwasm
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      - name: Cache the witness outcomes and hints
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/vl/filed-witnesses
+          key: vl-witnesses-${{ runner.os }}-${{ needs.seed.outputs.seed_key }}-${{ matrix.shard }}
+          restore-keys: |
+            vl-witnesses-${{ runner.os }}-${{ needs.seed.outputs.seed_key }}-
+            vl-witnesses-${{ runner.os }}-
+
+      - name: Warm the seed's sidecars
+        run: bash scripts/warm-seed.sh
+
+      - name: Filed witnesses (every row behaves as filed)
+        run: |
+          vl=scripts/vl-host/target/release/vl
+          if [ "${{ matrix.shard }}" = 1 ]; then
+            "$vl" run scripts/check-filed-witnesses.vl --compiler build/vl-compiler.wasm -- --self-test > /dev/null
+          fi
+          "$vl" run scripts/check-filed-witnesses.vl --compiler build/vl-compiler.wasm -- --strict --shard ${{ matrix.shard }}/2 docs/internals/inventory docs/internals/inventory-2
+        env:
+          JOBS: "4"
+
+  # ---------------------------------------------------------------------------
   # ci-embed-seed — the release DISTRIBUTION build (roadmap H-M2), gated on every
   # push instead of only at release time.
   #
@@ -1131,7 +1208,7 @@ jobs:
   # tests/ci_proof_test.ts holds `needs` to every other job in this file.
   # ---------------------------------------------------------------------------
   ci-proof:
-    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, ci-cost, ci-distilled, ci-embed-seed]
+    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, ci-cost, ci-distilled, ci-witnesses, ci-embed-seed]
     if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/vl-queue/')
     runs-on: ubuntu-latest
     steps:

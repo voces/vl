@@ -417,6 +417,65 @@ Deno.test({
   },
 });
 
+// `--shard K/N` is what CI's two ci-witnesses jobs run: each row lands in exactly one shard,
+// and the shards together grade every row exactly as one unsharded run does.
+Deno.test({
+  name:
+    "check-filed-witnesses: --shard K/N partitions the rows and grades each as a whole run does",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_cfw_shard_" });
+    try {
+      const docs = `${dir}/rows`;
+      await Deno.mkdir(docs);
+      for (const [id, body] of Object.entries(ROWS)) {
+        await Deno.writeTextFile(`${docs}/${id}.md`, body);
+      }
+      const graded = async (extra: string[], out: string) => {
+        await port(["--json", out, ...extra, docs]);
+        const rows = JSON.parse(await Deno.readTextFile(out));
+        return new Map<string, string>(
+          rows.map((
+            r: Record<string, string>,
+          ) => [r.id, `${r.declared}/${r.actual}`]),
+        );
+      };
+      const whole = await graded([], `${dir}/whole.json`);
+      const a = await graded(["--shard", "1/2"], `${dir}/a.json`);
+      const b = await graded(["--shard", "2/2"], `${dir}/b.json`);
+      const both = [...a.keys()].filter((id) => b.has(id));
+      if (both.length > 0 || a.size === 0 || b.size === 0) {
+        throw new Error(
+          `want two non-empty disjoint shards, got ${a.size} and ${b.size} sharing ${
+            both.join(", ")
+          }`,
+        );
+      }
+      const union = new Map([...a, ...b]);
+      const bad = [...whole].filter(([id, v]) => union.get(id) !== v).map((
+        [id],
+      ) => id);
+      if (union.size !== whole.size || bad.length > 0) {
+        throw new Error(
+          `want the shards to grade the ${whole.size} rows a whole run does, got ${union.size}, differing on ${
+            bad.join(", ")
+          }`,
+        );
+      }
+      for (const spec of ["0/2", "3/2", "2", "a/b"]) {
+        const r = await port(["--shard", spec, docs]);
+        if (r.code !== 2 || !r.out.includes("--shard needs K/N")) {
+          throw new Error(
+            `--shard ${spec}: want exit 2 and the K/N message, got ${r.code}:\n${r.out}`,
+          );
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 // A channel `timeout` stopped is the box's load, not the witness: before this, a witness
 // that never finished fell through `classify` to `silent_invalid_wasm` (a filed row graded
 // that way at load 83–122 and `runs` alone). It is retried once, then reported not graded.

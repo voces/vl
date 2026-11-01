@@ -25,7 +25,8 @@ set -uo pipefail
 # The gate rows CI runs with the same command on the same seed. `corpus oracle` is the part
 # of `deno task test` that checks-suites runs; the rest of that row stays local (CI runs it
 # without a seed), as do `self-compile pair` (CI proves only the fixpoint), `plumb-shape
-# cost` (CI runs it without binaryen), and the four corpus and inventory graders.
+# cost` (CI runs it without binaryen), the distilled corpus (gate.sh adds --verify-fresh on master)
+# and the filed witnesses (CI grades them in two --shard runs).
 ROWS=(
   "ci-native"
   "lsp suites (ci list)"
@@ -43,11 +44,13 @@ ROWS=(
   "capability probes"
   "conflict markers"
   "corpus oracle"
+  "rep-fuzz"
+  "splice scan"
 )
 # The jobs those rows run in, with how many matrix shards each must have passed.
 JOBS=(
   "ci=1" "seed=1" "ci-native=5" "ci-release-shape=1" "checks=1" "checks-suites=2"
-  "ci-cost=2" "ci-distilled=1" "ci-proof=1"
+  "ci-cost=2" "ci-distilled=1" "ci-witnesses=2" "ci-proof=1"
 )
 PROOF_RE='ci-proof: tree [0-9a-f]{40} seed [0-9a-f]{64} rustc [^ ]+'
 
