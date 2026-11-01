@@ -111,10 +111,17 @@ function line(k: i32) {
 print(line(3))
 `;
 
-// A hole-parameter function whose instance's result the elaboration leaves open.
+// A hole-parameter function whose instance's result is its returned call through the
+// parameter, which the elaboration records at the instance (`elabRetOfValues`).
 const HOLE = `function lap(g, x) { return g(x) }
 const f = (n) => 0 - n
 print(lap(f, 4))
+`;
+
+// A hole-parameter function's instance no demand keyed: its template's closed result answers.
+const HOLE_TEMPLATE = `function twice(n: i32) { return n * 2 }
+function f(x) { return twice(x) }
+print(f(21))
 `;
 
 // A generic nothing instantiates is pruned to an empty stub, void as minted (`monoStubSlots`).
@@ -160,7 +167,7 @@ Deno.test({
       HOLE,
       DROP_NONE,
       true,
-      "agree | __lambda_0=1; no result recorded, instance or nested | lap=1",
+      "agree | __lambda_0=1; agree | lap=1",
     );
     expectRows(
       "on demand",
@@ -168,6 +175,13 @@ Deno.test({
       DROP_NONE,
       true,
       "agree | []=@IV=1; agree | []@IV=1; agree | fl=1; agree | setI=1",
+    );
+    expectRows(
+      "hole template",
+      HOLE_TEMPLATE,
+      DROP_NONE,
+      true,
+      "agree | f=1; agree | twice=1",
     );
     expectRows("stub", STUB, DROP_NONE, true, "agree | id=1; agree | keep=1");
     expectRows(

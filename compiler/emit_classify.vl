@@ -2953,11 +2953,63 @@ export function letCellSlot(stmtIx: i32, fnIx: i32, k: VKind): i32 {
   }
 }
 
+// `letCellKindGo` remembered per binding and instance on the `gckGen` generation, which only a
+// walk's top re-stamps: an un-annotated binding walks its initializer, and every name read asks.
+// Rows chain per binding (`lckHead`/`lckNext`), one per asking function.
+let lckHead: i32[] = []
+let lckNext: i32[] = []
+let lckFn: i32[] = []
+let lckStamp: i32[] = []
+let lckVal: VKind[] = []
+let lckGenSeen = 0
+let lckDepth = 0
+
 // The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
 // annotation's kind through the shared annotation ladder, else the initializer's. The local
 // storage class's answer to what `globalCellKind` answers for a module global, kept here
 // because `emit_collect.vl` cannot be imported back into this file.
 export function letCellKind(letIx: i32, fnIx: i32): VKind {
+  if letIx < 0 || letIx >= P.nodes.length { return letCellKindGo(letIx, fnIx) }
+  if lckDepth == 0 {
+    if gckStale() { gckDrop() }
+  }
+  if gckGen < lckGenSeen { lckReset() }
+  lckGenSeen = gckGen
+  let r = if letIx < lckHead.length { lckHead[letIx] } else { -1 }
+  while r >= 0 && lckFn[r] != fnIx { r = lckNext[r] }
+  if r >= 0 && lckStamp[r] == gckGen { return lckVal[r] }
+  const gen = gckGen
+  lckDepth = lckDepth + 1
+  const v = letCellKindGo(letIx, fnIx)
+  lckDepth = lckDepth - 1
+  if r < 0 {
+    while lckHead.length <= letIx { lckHead.push(-1) }
+    r = lckStamp.length
+    lckNext.push(lckHead[letIx])
+    lckHead[letIx] = r
+    lckFn.push(fnIx)
+    lckStamp.push(0)
+    lckVal.push(v)
+  }
+  // A walk that minted rows moved the generation; its answer is served once and not kept.
+  lckStamp[r] = if gckGen == gen { gen } else { 0 }
+  lckVal[r] = v
+  v
+}
+
+// Empties `letCellKind`'s memo, at compile start and when the generation wrapped.
+function lckReset() {
+  lckHead = []
+  lckNext = []
+  lckFn = []
+  lckStamp = []
+  lckVal = []
+  lckGenSeen = 0
+  lckDepth = 0
+  0
+}
+
+function letCellKindGo(letIx: i32, fnIx: i32): VKind {
   if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
   // A `boolean | null` cell is the sentinel-2 niche, whatever the annotation's valtype says.
   if letNulBool(letIx, fnIx) { return "nulbool" }
@@ -2982,13 +3034,15 @@ export function inferredRetMapSlot(ti: i32) {
 
 function inferredRetMapSlotCore(ti: i32) {
   if ti < 0 { return -1 }
-  const mrx = fnRetExprOf(fnStmts[ti])
-  if mrx >= 0 { return mapRetExprShape(mrx, ti) }
+  // A closed checked result type names the map's shape; the tail expression answers where
+  // the type is open or names none.
   const crt = fnCheckedRetTy(ti)
-  if crt >= 0 {
+  if crt >= 0 && !tyHasTyVar(crt) {
     const csh = mapShapeOfTyPeeled(crt)
     if csh != -3 { return csh }
   }
+  const mrx = fnRetExprOf(fnStmts[ti])
+  if mrx >= 0 { return mapRetExprShape(mrx, ti) }
   -1
 }
 
@@ -15041,6 +15095,7 @@ export function classifyStateReset() {
   gckDepth = 0
   bcDepth = 0
   bindCellReset()
+  lckReset()
   irkDepth = 0
   lrDepth = 0
   asgReReadIx = -1
@@ -15170,6 +15225,13 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
     const nd = repOfNode(rx, fnIx)
     if nd.rdCovered == 1 && readKindIsNul(nd.rdKind) {
       return { rrStore: st, rrRead: nd.rdKind, rrConv: 4 }
+    }
+  }
+  // An `i32` cell read typed `boolean | null` holds that niche's sentinel encoding.
+  if st == "i32" {
+    const bd = repOfNode(rx, fnIx)
+    if bd.rdCovered == 1 && bd.rdKind == "nulbool" {
+      return { rrStore: st, rrRead: "nulbool", rrConv: 6 }
     }
   }
   // A read narrowed out of a nullable storage reads its non-null kind: one the checker recorded
