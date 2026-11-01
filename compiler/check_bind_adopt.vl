@@ -13,9 +13,7 @@ import {
   ObjLit,
   P,
   Param,
-  TypeDecl,
   TypeRef,
-  UnionDecl,
   nodeAt,
 } from "./ast"
 import {
@@ -40,6 +38,8 @@ import {
   recListLits,
   recListLitsLate,
   recListLitsLateSet,
+  recObjLits,
+  recObjLitsSet,
 } from "./check_rec_rows"
 import {
   litAtDstStorage,
@@ -48,8 +48,7 @@ import {
   recordRepTyAdopt,
   repStampListBuilt,
 } from "./check_fit_rules"
-import { gRootStmts } from "./check_nj_join"
-import { nonNullTy, tyHasTyVar } from "./tyquery"
+import { isNullTy, nonNullTy, tyHasTyVar } from "./tyquery"
 import { recSolePinArg } from "./check_record_origins"
 import { assignable, bindGenWalk, substTyDeep } from "./check_relate_core"
 import { identBoundFnDeclOf } from "./check_scopes"
@@ -60,9 +59,11 @@ import {
   TyArray,
   TyFunc,
   TyObj,
+  TyUnion,
   cUserTypes,
   mkArrayTy,
   tyAt,
+  tyFieldTyOf,
   tyHasHole,
   tyMentionsErr,
   tySame,
@@ -247,45 +248,47 @@ function recListCallRepTy(x: i32, own: i32): i32 {
 // exactly one arm of the program's unions widens its type and no declared non-arm record fits
 // it: the arm is the record such a literal is built as (DECISIONS.md "A literal names its arm").
 export function recArmLitsAdopt() {
+  const lits = recObjLits
+  recObjLitsSet([])
   const arms: i32[] = []
   const recs: i32[] = []
   ralDeclaredRecords(arms, recs)
   if arms.length == 0 { return 0 }
-  let ix = 0
-  while ix < P.nodes.length {
-    const n = nodeAt(ix)
-    const own = nodeTyIxOf(ix)
-    const rt = nodeRepTyIxOf(ix)
-    if n is ObjLit && n.objFields.length > 0 && (rt < 0 || tySame(rt, own)) {
+  for ix in lits {
+    const own = if ix >= 0 && ix < P.nodes.length { nodeTyIxOf(ix) } else { -1 }
+    const rt = if own >= 0 { nodeRepTyIxOf(ix) } else { -1 }
+    if own >= 0 && (rt < 0 || tySame(rt, own)) {
       const arm = ralSoleArm(own, arms, recs)
       if arm >= 0 && litAtDstStorage(ix, arm) { recordRepTyAdopt(ix, arm, 6) }
     }
-    ix = ix + 1
   }
   0
 }
 
-// The record arms of every root union of two or more members into `arms`, and every other root
-// record declaration into `recs`, each type once.
+// The record members of every declared union of two or more members into `arms`, and every other
+// declared record into `recs`, each type once.
 function ralDeclaredRecords(arms: i32[], recs: i32[]) {
-  const inArm: string[] = []
-  for si in gRootStmts {
-    const s = nodeAt(si)
-    if s is UnionDecl && s.udVariants.length > 1 {
-      for v in s.udVariants {
-        const t = cUserTypes[v] ?? -1
-        if t >= 0 && t < T.tys.length && tyAt(t) is TyObj {
-          inArm.push(v)
-          if !ralHas(arms, t) { arms.push(t) }
+  for nm in cUserTypes.keys() {
+    const t = cUserTypes[nm] ?? -1
+    const u = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if u is TyUnion && u.uMembers.length > 1 && !tyHasTyVar(t) {
+      for m in u.uMembers {
+        if m >= 0 && m < T.tys.length && tyAt(m) is TyObj && !ralHas(arms, m) {
+          arms.push(m)
         }
       }
     }
   }
-  for si in gRootStmts {
-    const s = nodeAt(si)
-    if s is TypeDecl && !strListHas(inArm, s.tdName) {
-      const t = cUserTypes[s.tdName] ?? -1
-      if t >= 0 && t < T.tys.length && !ralHas(recs, t) { recs.push(t) }
+  for nm in cUserTypes.keys() {
+    const t = cUserTypes[nm] ?? -1
+    if (
+      t >= 0
+      && t < T.tys.length
+      && tyAt(t) is TyObj
+      && !ralHas(arms, t)
+      && !ralHas(recs, t)
+    ) {
+      recs.push(t)
     }
   }
   0
@@ -310,12 +313,31 @@ function ralSoleArm(own: i32, arms: i32[], recs: i32[]): i32 {
   let one = -1
   for a in arms {
     if tySame(a, own) { return -1 }
-    if recRepWidens(own, a) {
+    if recRepWidens(own, a) && ralStoredAlike(own, a) {
       if one >= 0 { return -1 }
       one = a
     }
   }
   one
+}
+
+// Whether arm `arm` stores each field of record `own` as `own` does: the same type, the arm's
+// nullable of it, or a `null` field. A numeric widening is no such store, since it changes what a
+// read of the field computes (D14493).
+function ralStoredAlike(own: i32, arm: i32): boolean {
+  const o = tyAt(own)
+  if !(o is TyObj) { return false }
+  let i = 0
+  while i < o.objFieldNames.length {
+    const ot = o.objFieldTypes[i]
+    const at = tyFieldTyOf(arm, o.objFieldNames[i])
+    if at < 0 { return false }
+    if !(tySame(ot, at) || isNullTy(ot) || tySame(ot, nonNullTy(at))) {
+      return false
+    }
+    i = i + 1
+  }
+  true
 }
 
 // Stamps each record list literal checked this pass whose elements are all reads out of
