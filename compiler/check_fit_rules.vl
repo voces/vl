@@ -420,6 +420,7 @@ import {
 } from "./check_type_shape"
 import {
   T,
+  TY_BOOL,
   TY_ERR,
   TY_F32,
   TY_F64,
@@ -492,7 +493,9 @@ import {
   CW_OCC_USE,
   CW_UP_ARG,
   CW_UP_ASG_LHS,
+  CW_UP_ASG_RHS,
   CW_UP_CALLEE,
+  CW_UP_ELEM,
   CW_UP_FIELD,
   CW_UP_LETINIT,
   CW_UP_OBJ,
@@ -5430,6 +5433,48 @@ function arrLitFitsList(ix: i32, m: i32, exact: boolean, depth: i32): boolean {
   true
 }
 
+// Whether `src` is a `null[]` element: a list literal's element, a `push`, `unshift` or `insert`
+// argument on a list, or the value of `xs[i] = …` on a list. A struct field or local is not one.
+function nullUnitListCell(src: i32): boolean {
+  cwIxBuild()
+  if src < 0 || src >= cwIxUp.length { return false }
+  const up = cwIxUp[src]
+  if up < 0 || up >= P.nodes.length { return false }
+  const k = cwIxUpKind[src]
+  const un = nodeAt(up)
+  if k == CW_UP_ELEM { return un is ArrayLit }
+  if k == CW_UP_ARG && un is Call && un.callFn >= 0 {
+    const f = nodeAt(un.callFn)
+    if (
+      f is Member
+      && (f.memProp == "push" || f.memProp == "unshift" || f.memProp == "insert")
+    ) {
+      return tyIsListTy(nonNulTyOf(nodeTyIxOf(f.memObj)))
+    }
+    return false
+  }
+  if k == CW_UP_ASG_RHS && un is BinExpr && un.binOp == "=" {
+    const l = nodeAt(parenPeelIx(un.binLeft))
+    if l is Index { return tyIsListTy(nonNulTyOf(nodeTyIxOf(l.idxArr))) }
+  }
+  false
+}
+
+// Stamps `src`, delivered at `dst`, with the `(boolean | null)[]` list's element when it lands in a
+// `null[]` cell: that cell rides that list (D4671, D4771), whatever node computes the value, an
+// instance's `T = null` included. True when it stamped.
+export function stampNullUnitCell(src: i32, dst: i32): boolean {
+  if !isNullTy(dst) || litPinN.length > 0 || !stampsStand() { return false }
+  if !nullUnitListCell(src) { return false }
+  repStamp(src, mkNullableTy(TY_BOOL))
+  true
+}
+
+// Whether `t` is a list type.
+function tyIsListTy(t: i32): boolean {
+  t >= 0 && t < T.tys.length && tyAt(t) is TyArray
+}
+
 // Stamps the destination type `dstTy` onto literal `srcExpr` (recursively, into `ObjLit` fields /
 // `ArrayLit` elements) in the `nodeRepTyIx` sidecar, or the instance's while an elaboration
 // re-checks one. Nullable wrappers are peeled; `depth` bounds the walk. A quiet probe and a pin's
@@ -5453,6 +5498,7 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
   if dtix >= T.tys.length { return 0 }
   const d = tyAt(dtix)
   const e = nodeAt(srcExpr)
+  if stampNullUnitCell(srcExpr, dstTy) { return 1 }
   // A value of the `null` unit type is its destination's null, whatever node computes it.
   if !(e is NullLit) && isNullValue(srcExpr) && nullNamesOwnNull(dstTy) {
     repStamp(srcExpr, dstTy)

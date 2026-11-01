@@ -36,7 +36,7 @@ const LOCAL: Record<string, string> = {
   "deno task test":
     "the ci job runs it without a seed (its oracle part is `corpus oracle`)",
   "self-compile pair":
-    "CI proves the fixpoint, not the fuel, heap or survey rows",
+    "CI proves the fixpoint (seed) and the L2 fuel and heap tripwire (ci-cost 2), not the survey rows; gate.sh builds its seed from the pair",
   "plumb-shape cost":
     "ci-cost runs it with --require-fuel and no native binaryen",
   "filed witnesses":
