@@ -48,7 +48,8 @@ import {
 import { intMatchHeadAt } from "./check_match_heads"
 import {
   condProvenTrue,
-  ctxIsFieldValue,
+  ctxFieldNameOf,
+  ctxFieldOwnerOf,
   mapUnboxTyOf,
   narListReadsDecl,
   nodeCtxTyIxOf,
@@ -1011,6 +1012,7 @@ import {
   placeNicheAtomKind,
   placeReadContainerAt,
   readCellHoldsNullRef,
+  readOfOpenBinding,
   readOwesNonNullRecover,
   recBuildRowOf,
   refListElemIsRow,
@@ -1283,6 +1285,8 @@ import {
   rlSlotOfTyOrTwin,
   sFieldMapShape,
   sFieldRefSlot,
+  structRowFieldStoresAtom,
+  variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
 import {
   fieldCodeVKind,
@@ -34759,6 +34763,7 @@ export function wasmEmitStateReset() {
   njRTys = []
   njRUnion = false
   njResBox = false
+  nulAtomTyMemo = Map()
   saFnIx = 0 - 2
   ssArmBin = -1
   ssArmMode = 0
@@ -36132,13 +36137,26 @@ function nullOwnAt(exprIx: i32, fnIx: i32, ctx: ExpCtx): i32 {
   own
 }
 
+// Type -> whether it reps as the `K | null` atom niche, for the program being emitted.
+let nulAtomTyMemo: {[i32]: boolean} = Map()
+
+// Whether type `t` reps as the `K | null` atom niche. Asked of every expression's delivered
+// and contextual types, so the answer is kept per type rather than rebuilt from the rep tree.
+function tyRepsAsNulAtom(t: i32): boolean {
+  const m = nulAtomTyMemo.get(t)
+  if m != null { return m }
+  const d = repOfTy(t)
+  const r = d.rdCovered == 1 && d.rdNul == 3
+  nulAtomTyMemo[t] = r
+  r
+}
+
 // Whether node `ix` is delivered into the `K | null` atom niche: the type the checker stamped
 // it with where it is delivered reps as that niche.
 function deliveredAsNulAtom(ix: i32, fnIx: i32): boolean {
   const st = nodeRepTyAt(unwrapParen(ix), fnIx)
   if st < 0 { return false }
-  const d = repOfTy(st)
-  d.rdCovered == 1 && d.rdNul == 3
+  tyRepsAsNulAtom(st)
 }
 
 // Whether string literal `ix` lowers as its atom: its closed contextual type reps as one, and a
@@ -36146,10 +36164,11 @@ function deliveredAsNulAtom(ix: i32, fnIx: i32): boolean {
 // an instance whose record disagrees with the program's still decide by the delivery context:
 // either side can name a place stored apart from it (D3423).
 function strLitTakesAtom(ix: i32, fnIx: i32, ctx: ExpCtx): boolean {
+  const fr = fieldRowStoresAtom(ix, fnIx)
+  if fr >= 0 { return fr == 1 }
+  if fr == -1 { return ctx.litUnion == 1 }
   const pr = nodeCtxTyIxOf(ix)
-  if !ctxFieldStorageAgrees(ix, pr) || (pr >= 0 && !elabTyClosed(pr, 0)) {
-    return ctx.litUnion == 1
-  }
+  if pr >= 0 && !elabTyClosed(pr, 0) { return ctx.litUnion == 1 }
   if pr < 0 { return false }
   const a = tyRepsAsAtom(pr)
   const at = ctxTyAt(ix, fnIx)
@@ -36157,13 +36176,37 @@ function strLitTakesAtom(ix: i32, fnIx: i32, ctx: ExpCtx): boolean {
   a
 }
 
-// Whether a record field's storage agrees with `repOfTy` of `t`, node `ix`'s contextual type:
-// false for a field with no record, one typed by one string literal, which the row stores as
-// its set's atom (D14745), and one typed by a literal set, which a row beside its string base
-// can store as a string (D14752).
-function ctxFieldStorageAgrees(ix: i32, t: i32): boolean {
-  if !ctxIsFieldValue(ix) { return true }
-  t >= 0 && !(tyAt(t) is TyLit) && !tyRepsAsAtom(t)
+// Whether the row node `ix` is a field value of stores that field as the atom: 1 the atom,
+// 0 a string, -1 when no row answers, -2 when `ix` is no field value. The row is the owning
+// object literal's built arm or the member target's record (D14745, D14752).
+function fieldRowStoresAtom(ix: i32, fnIx: i32): i32 {
+  const o = ctxFieldOwnerOf(ix)
+  if o < 0 { return -2 }
+  fieldOwnerStoresAtom(o, fnIx, ctxFieldNameOf(ix))
+}
+
+// Whether the row field `name` of owner `ownerIx` is built at stores it as the literal-union
+// atom: an object literal's own row (the variant it is constructed at, else its struct), a field
+// write's receiver row. 1 the atom, 0 a string, -1 none.
+function fieldOwnerStoresAtom(ownerIx: i32, fnIx: i32, name: string): i32 {
+  const o = unwrapParen(ownerIx)
+  if o < 0 { return -1 }
+  const n = nodeAt(o)
+  match n {
+    ObjLit => {
+      const vi = objLitBuildVariantRow(o, fnIx)
+      if vi >= 0 { return variantRowFieldStoresAtom(vi, name) }
+      return structRowFieldStoresAtom(structIndexOfObjCtx(o, fnIx), name)
+    }
+    Member => {
+      const rv = exprVariantIndex(n.memObj, fnIx)
+      if rv >= 0 { return variantRowFieldStoresAtom(rv, name) }
+      return structRowFieldStoresAtom(structIndexOfExpr(n.memObj, fnIx), name)
+    }
+    // No other node owns a field value.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar | Unary | BinExpr | IfStmt | Index => {}
+  }
+  -1
 }
 
 // Whether list literal `ix` is delivered to a list whose element reps as the atom, by the same
@@ -36175,9 +36218,7 @@ function arrLitTakesAtom(ix: i32, fnIx: i32, ctx: ExpCtx): boolean {
     if h >= 0 { return tyElemRepsAsAtom(nodeTyAt(h, fnIx)) }
     return ctx.litUnion == 1
   }
-  if !ctxFieldStorageAgrees(ix, pr) || !elabTyClosed(pr, 0) {
-    return ctx.litUnion == 1
-  }
+  if !elabTyClosed(pr, 0) { return ctx.litUnion == 1 }
   const a = tyElemRepsAsAtom(pr)
   const at = ctxTyAt(ix, fnIx)
   if at != pr && tyElemRepsAsAtom(at) != a { return ctx.litUnion == 1 }
@@ -36228,8 +36269,7 @@ function tyRepsAsAtom(t: i32): boolean {
 function ctxIsNulAtom(ix: i32, fnIx: i32): boolean {
   const ct = ctxTyAt(ix, fnIx)
   if ct < 0 { return false }
-  const d = repOfTy(ct)
-  d.rdCovered == 1 && d.rdNul == 3
+  tyRepsAsNulAtom(ct)
 }
 
 // The null a bare `null` lowers to: the bottom ref, the `boolean | null` sentinel 2, the
@@ -39691,7 +39731,7 @@ function emitCoalesceGo(
   // `emit_rewrite` folds the concrete spelling; the shared node kept the template's hole.
   if (
     fnIx >= 0
-    && tyHasTyVar(nodeTyIxOf(lhsIx))
+    && (tyHasTyVar(nodeTyIxOf(lhsIx)) || readOfOpenBinding(lhsIx))
     && tyExcludesNull(nodeTyAt(lhsIx, fnIx))
   ) {
     return emitExpr(body, e.binLeft, fnIx, ec)

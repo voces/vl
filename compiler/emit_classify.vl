@@ -140,11 +140,7 @@ import {
 } from "./check_elab_cap"
 import { letNullHoleFilledTy, letNullHoleUnfilled } from "./check_null_holes"
 import { canonUnionMembersInto } from "./check_program"
-import {
-  inferRetFnKey,
-  mapDeliveryRecorded,
-  nodePinPayloadOf,
-} from "./check_side_rows"
+import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
 import { tyVarRowsMinted } from "./check_subst"
 import {
   MAP_KEY_I32,
@@ -168,7 +164,7 @@ import {
 } from "./check_type_shape"
 import { recFreshDeclOf, recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
 import { recSolePinArg } from "./check_record_origins"
-import { recHoleIdentityArg } from "./check_fit_rules"
+import { recBuiltReadTy, recHoleIdentityArg } from "./check_fit_rules"
 import {
   T,
   TY_STR,
@@ -218,7 +214,7 @@ import {
 } from "./check_types"
 import { cexLitPeel } from "./check_num_lits"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
-import { cwBindingOf, cwLambdaDeclOf } from "./check_write_scan"
+import { cwBindingOf, cwLambdaDeclOf, cwPeelValue } from "./check_write_scan"
 import {
   anonArithFieldCode,
   anonListWiderThanLits,
@@ -653,7 +649,6 @@ import {
 } from "./emit_shape_rows"
 import {
   COPY_CHAIN_MAX,
-  annCloSigSpelled,
   calleeNodeSigKey,
   cloNameSigKeyTy,
   declaredStructIndex,
@@ -775,6 +770,7 @@ import {
   lfBlockOf,
   listIsIdentNames,
   localDeclIx,
+  localFrameGen,
   localIsRef,
   localLoopIter,
   localPairIter,
@@ -788,6 +784,7 @@ import {
   rlElemNullable,
   rlElemTyIx,
   sAnonOwnTy,
+  sFieldCount,
   sLitMintFn,
   sLitMintRow,
   sNames,
@@ -2619,8 +2616,8 @@ function letCallHeldTy(init: i32): i32 {
 }
 
 // The record every result of the inferred-result call `u` is built at, through results that are
-// further such calls, a generic or hole identity of one, or a binding holding only one; -1 where
-// a result is anything else or the results disagree.
+// further such calls, a generic or hole identity of one, a binding holding only one, or a built
+// container's read; -1 where a result is anything else or the results disagree.
 function callBuiltTy(x: i32, depth: i32): i32 {
   if depth <= 0 { return -1 }
   const p = solePinPeel(x)
@@ -2629,7 +2626,11 @@ function callBuiltTy(x: i32, depth: i32): i32 {
   if hd >= 0 && hn is LetDecl { return callBuiltTy(hn.letInit, depth - 1) }
   const u = p
   const fd = if u >= 0 { recInferredFnOf(u) } else { -1 }
-  if fd < 0 { return -1 }
+  // A read out of a container its stores build elsewhere is that build (D14810).
+  if fd < 0 {
+    const br = if u >= 0 { recBuiltReadTy(cwPeelValue(u)) } else { -1 }
+    return if br >= 0 { nonNullTy(br) } else { -1 }
+  }
   const ha = recHoleIdentityArg(u, fd)
   if ha >= 0 { return callBuiltTy(ha, depth - 1) }
   let r = -1
@@ -5225,10 +5226,10 @@ export function binMixHardF64(leftIx: i32, rightIx: i32, fnIx: i32) {
   exprHasHardF64(rightIx, fnIx)
 }
 
-// The scalar width evaluating `exprIx` yields: its type at instance `fnIx` peeled to one base
-// scalar, else "" (a numeric union is a box), with a `??` at `coalResultTyOf` and a call left open
-// there at its instance's elaboration. A direct call yields its callee slot's result and a number
-// literal its built width.
+// The scalar width evaluating `exprIx` yields at instance `fnIx`: a direct call its callee
+// instance's result, which a call's program-wide recorded type is not, and a number literal its
+// built width. Else its type there peeled to one base scalar ("" for a numeric union, a box), a
+// `??` at `coalResultTyOf` and a call left open at its instance's elaboration.
 export function exprScalarWidth(exprIx: i32, fnIx: i32): string {
   if exprIx < 0 { return "" }
   const n = nodeAt(exprIx)
@@ -6279,6 +6280,28 @@ export function coalesceNulAtomToStr(exprIx: i32, fnIx: i32): boolean {
   if pr < 0 { return false }
   const r = tyAt(pr)
   if r is TyPrim { return r.primName == "string" }
+  false
+}
+
+// Whether `ix` reads a `let` or parameter whose written type holds a type variable: the checker
+// types the read at the template's gradual view (`T | string` as `string`), which an instance
+// may make nullable, so only the instance's own type says whether a `??` over it is dead (D3421).
+export function readOfOpenBinding(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || !(nodeAt(u) is Ident) { return false }
+  const d = identDeclOf(u)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  match dn {
+    LetDecl => {
+      return dn.letType >= 0 && tyHasTyVar(nodeTyIxOf(dn.letType))
+    }
+    Param => {
+      return dn.parType >= 0 && tyHasTyVar(nodeTyIxOf(dn.parType))
+    }
+    // No other declaration is written with a type.
+    LoopVar | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
   false
 }
 
@@ -10272,6 +10295,12 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   if capInitAsk && declaredSlotOf(exprIx) < 0 {
     const ud = identDeclOf(exprIx)
     if ud >= 0 && nodeAt(ud) is LetDecl { return letIsUnion(ud, fnIx) }
+  }
+  // An unnarrowed read asked outside the frame declaring it reads its binding's cell there.
+  if declaredSlotOf(exprIx) < 0 && readNarrowedTyAt(exprIx, fnIx) < 0 {
+    if readSlotlessOwnLet(exprIx, fnIx) >= 0 {
+      return readRepOf(exprIx, fnIx).rrRead == "union"
+    }
   }
   return false
 }
@@ -14568,23 +14597,10 @@ function paramCloSigKey(fnIx: i32, name: string) {
       const p = nodeAt(params[i])
       if p is Param {
         if p.parName == name {
-          if p.parType >= 0 {
-            // A monomorphized closure-pinned param announces itself in the pin column, which
-            // also carries the `$fnsig` key — read where it lives, not by prefix-testing the name.
-            const pin = nodePinPayloadOf(p.parType)
-            if pin != "" { return pin }
-            const ty = nodeAt(p.parType)
-            if ty is TypeRef {
-              const nm = ty.tyName
-              if nm.length > 2 {
-                // The parser's tree, not a character scan: asks whether the annotation spells a
-                // function type anywhere, including inside a union arm (unlike the narrower arena test).
-                if annCloSigSpelled(p.parType, nm) {
-                  return cloNameSigKeyTy(nm, nodeTyIxOf(p.parType))
-                }
-              }
-            }
-          }
+          // The parameter's type at this instance keys it, a pinned hole included.
+          if p.parType < 0 { return "" }
+          const it = tyPeelNul(nodeTyInOf(p.parType, fnIx))
+          if it >= 0 && tyAt(it) is TyFunc { return sigKeyOfTy(it) }
           return ""
         }
       }
@@ -15040,7 +15056,61 @@ export function classifyStateReset() {
 // container or a non-null kind where the checker narrowed it; "" when the read has no rep.
 type ReadRep = { rrStore: string, rrRead: string, rrConv: i32 }
 
+// `readRepGo` remembered per read and asking function, within one frame and pass; a read whose
+// type names a type variable answers per instance, which `fnIx` alone does not name.
+const rrGen = memoGenNew(0)
+const rrKey = memoKeyNew(10)
+const rrStamp: i32[] = []
+const rrFn: i32[] = []
+const rrVal: ReadRep[] = []
 function readRepOf(ix: i32, fnIx: i32): ReadRep {
+  const rx = unwrapParen(ix)
+  if rx < 0 { return readRepGo(ix, fnIx) }
+  const t = nodeTyIxOf(rx)
+  if t < 0 || tyHasTyVar(t) { return readRepGo(ix, fnIx) }
+  if readRepMoved() { memoGenAdvance(rrGen) }
+  if rx < rrStamp.length && rrStamp[rx] == rrGen.at && rrFn[rx] == fnIx {
+    return rrVal[rx]
+  }
+  const v = readRepGo(ix, fnIx)
+  while rrStamp.length <= rx {
+    rrStamp.push(-1)
+    rrFn.push(-1)
+    rrVal.push(v)
+  }
+  rrStamp[rx] = rrGen.at
+  rrFn[rx] = fnIx
+  rrVal[rx] = v
+  v
+}
+
+// Whether any table `readRepGo` consults has moved since the memo last looked.
+function readRepMoved(): boolean {
+  let moved = memoMoved3(rrKey, emitPassGen, tyMutEpoch, localFrameGen)
+  const af = if emitPhaseReached("arenaFinal") { 1 } else { 0 }
+  const s = rrKey.seen
+  if (
+    s[9] == af
+    && s[3] == P.nodes.length
+    && s[4] == ekDecl.length
+    && s[5] == mvValKind.length
+    && s[6] == sFieldCount.length
+    && s[7] == uVariants.length
+    && s[8] == unNames.length
+  ) {
+    if !moved { return false }
+  }
+  moved = memoMoved(rrKey, 3, P.nodes.length) || moved
+  moved = memoMoved(rrKey, 4, ekDecl.length) || moved
+  moved = memoMoved(rrKey, 5, mvValKind.length) || moved
+  moved = memoMoved(rrKey, 6, sFieldCount.length) || moved
+  moved = memoMoved(rrKey, 7, uVariants.length) || moved
+  moved = memoMoved(rrKey, 8, unNames.length) || moved
+  moved = memoMoved(rrKey, 9, af) || moved
+  moved
+}
+
+function readRepGo(ix: i32, fnIx: i32): ReadRep {
   const rx = unwrapParen(ix)
   const none: ReadRep = { rrStore: "", rrRead: "", rrConv: 0 }
   if rx < 0 { return none }
@@ -15050,6 +15120,9 @@ function readRepOf(ix: i32, fnIx: i32): ReadRep {
     const k = identCellVKind(rx, fnIx)
     if k != null {
       st = k
+    } else if readSlotlessOwnLet(rx, fnIx) >= 0 {
+      // A read asked outside its frame reads the cell its binding has in the frame declaring it.
+      st = letCellKind(readSlotlessOwnLet(rx, fnIx), fnIx)
     } else {
       // A read with no slot yet has no storage to read: it reads at its own type.
       const td = repOfNode(rx, fnIx)
@@ -15123,6 +15196,15 @@ function readNonNulKind(k: string): string {
     i = i + 2
   }
   ""
+}
+
+// The `let` read `rx` names when `fnIx` is the frame declaring it; -1 for any other read.
+function readSlotlessOwnLet(rx: i32, fnIx: i32): i32 {
+  const d = identDeclOf(rx)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  if !(nodeAt(d) is LetDecl) { return -1 }
+  if readDeclOwnerOf(d, fnIx) != fnIx { return -1 }
+  d
 }
 
 // Whether `k` is a nullable rep kind.
