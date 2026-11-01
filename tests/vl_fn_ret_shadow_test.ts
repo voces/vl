@@ -331,10 +331,26 @@ const m = xs.map((e) => e)
 print(m[1])
 `;
 
+// An intersection of records folds to a one-member union around the merged record (D14794),
+// whose rep and token are that record's.
+const INTERSECTION = `type AB = { a: i32 } & { b: i32 }
+function mkAB(): AB { return { a: 1, b: 2 } }
+function sumAB(v: AB): i32 { return v.a + v.b }
+print(sumAB(mkAB()))
+`;
+
 Deno.test({
-  name: "fn-ret shadow: kind u8",
+  name: "fn-ret shadow: kind u8 and intersection",
   ignore,
   fn() {
+    expectRows(
+      "kind intersection",
+      INTERSECTION,
+      DROP_NONE,
+      true,
+      "kind agree | mkAB=1; kind agree | sumAB=1",
+      true,
+    );
     expectRows(
       "kind u8 map",
       U8_MAP,
