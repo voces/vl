@@ -245,11 +245,16 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     if t < 0 { return 0 }
     leafTy.push(t)
   }
+  // One member's call evaluates its arguments once, so after the elaboration a singleton's
+  // arguments may allocate.
+  const once = ftLate && ds.length == 1
   for c in calls {
-    if fnTagCallSetOf(c) == s && !ftPlainArgs(c) { return 0 }
+    if fnTagCallSetOf(c) == s && !ftPlainArgsIn(c, once) { return 0 }
   }
   for r in mint {
-    if mintFactSetOf(r) == s && !ftPlainArgs(mintFactCallOf(r)) { return 0 }
+    if mintFactSetOf(r) == s && !ftPlainArgsIn(mintFactCallOf(r), once) {
+      return 0
+    }
   }
   for r in mint {
     if mintFactSetOf(r) == s && !ftMintComplete(r, s) { return 0 }
@@ -378,7 +383,10 @@ function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
 
 // Whether call `c`'s arguments are safe to evaluate in each member call: none holds a call, a
 // function, a literal that allocates, an assignment, or a block.
-function ftPlainArgs(c: i32): boolean {
+function ftPlainArgs(c: i32): boolean { ftPlainArgsIn(c, false) }
+
+// `ftPlainArgs`, where `lits` also admits the literals that allocate and nothing they hold calls.
+function ftPlainArgsIn(c: i32, lits: boolean): boolean {
   const cn = nodeAt(c)
   if !(cn is Call) { return false }
   const todo: i32[] = []
@@ -396,8 +404,15 @@ function ftPlainArgs(c: i32): boolean {
         if n.binOp == "=" || n.binCompound != "" { return false }
         nodeChildrenPush(x, todo)
       }
+      ArrayLit | ObjLit | FieldInit => {
+        if !lits { return false }
+        nodeChildrenPush(x, todo)
+      }
+      CharLit | NullLit => {
+        if !lits { return false }
+      }
       // Anything else may call, allocate, bind or loop.
-      CharLit | NullLit | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
         return false
       }
     }
@@ -961,6 +976,23 @@ function ftConstSource(v: i32, depth: i32): i32 {
   ftConstSource(parenPeelIx(rn.letInit), depth - 1)
 }
 
+// The node call `c`'s callee takes its value from: after the elaboration, through local `const`
+// aliases, since the instance an alias's call reaches is keyed as the named call's is.
+function ftCalleeSource(c: Call): i32 {
+  const f = parenPeelIx(c.callFn)
+  if ftLate { ftConstSource(f, 8) } else { f }
+}
+
+// The function callee `v` names: after the elaboration any declared one, since a nested
+// declaration's calls are noted under it as a top-level's are; before it, `ftNamedFn`.
+function ftCalleeFn(v: i32): i32 {
+  if ftLate && v >= 0 && v < P.nodes.length && nodeAt(v) is Ident {
+    const nd = identDeclOf(v)
+    if nd >= 0 && nd < P.nodes.length && nodeAt(nd) is FuncDecl { return nd }
+  }
+  ftNamedFn(v)
+}
+
 // The top-level function the name at `v` reads, or -1 when it is no name of one.
 function ftNamedFn(v: i32): i32 {
   if v < 0 || v >= P.nodes.length { return -1 }
@@ -996,7 +1028,7 @@ function ftParamOfSet(c: Call, x: i32, s: i32): boolean {
 // Whether argument `x` of call `c` binds a positional, un-annotated parameter of the named
 // top-level function `c` calls.
 function ftHoleParamOf(c: Call, x: i32): boolean {
-  const d = ftNamedFn(parenPeelIx(c.callFn))
+  const d = ftCalleeFn(ftCalleeSource(c))
   if d < 0 { return false }
   const f = nodeAt(d)
   if !(f is FuncDecl) { return false }
@@ -1044,7 +1076,7 @@ function ftLateDirectCall(x: i32, s: i32): boolean {
 // parameter all take `s`, since a parameter handed on is typed where it lands.
 function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
   if !ftLate || i32ListHas(ftWas, s) { return true }
-  const d = ftNamedFn(parenPeelIx(c.callFn))
+  const d = ftCalleeFn(ftCalleeSource(c))
   if d < 0 { return true }
   const i = i32ListIndexOf(c.callArgs, x)
   mintParamTakes(d, i, s) || ftParamUnread(d, i)
