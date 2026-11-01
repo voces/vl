@@ -11044,6 +11044,12 @@ copy at the declared type. Every other call shares the one copy. Measured: over 
 has 7 functions against 5 for the same program built at one row. The seed is +2,238 bytes
 (+0.04%), all of it the new code: the compiler hands itself no rep.
 
+Extended 2026-11-01 (D14753, coordinator approval): a call result is handed by rep on the same
+terms. A call built at a wider record, directly or relayed through an identity or a returned
+binding, may reach an annotated parameter its function only reads or writes for a field. That
+delivery does not count as landing at the annotation (`recRepArgOf`), and it is noted only once
+the whole build is accepted (`recRepArgsNote`), so a refused build leaves no stale rep behind.
+
 ## A literal is built at the width of the position that reads it (ruling, 2026-10-27)
 
 This states the rule behind "Building a literal at the width a consumer demands is building". The

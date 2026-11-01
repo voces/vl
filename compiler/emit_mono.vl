@@ -98,7 +98,7 @@ import {
   recordClonedIsVarTyIx,
 } from "./check_list_union"
 import { blockLastStmt } from "./check_if_value"
-import { joinArmIsLit } from "./check_nj_join"
+import { collectRetValues, joinArmIsLit } from "./check_nj_join"
 import {
   callBindAgreedHoles,
   callBindHas,
@@ -178,7 +178,11 @@ import {
   tyVarRenameRow,
   tyWrapsRecord,
 } from "./check_types"
-import { blockHasBareReturn, fnResultUnconsumed } from "./check_unconsumed"
+import {
+  blockHasBareReturn,
+  fnResultUnconsumed,
+  tailValueLeaves,
+} from "./check_unconsumed"
 import { collectValuedReturns } from "./check_nj_gate"
 import {
   ArrayLit,
@@ -354,10 +358,12 @@ import {
   vrFrameOf,
   vrIndex,
   vrIndexed,
-  vrInert,
+  vrInertFor,
   vrLits,
   vrReadsInert,
-  vrReset,
+  vrResetFor,
+  vrStash,
+  vrUnstash,
 } from "./value_reach"
 import {
   FF_CHAIN_LONG,
@@ -442,6 +448,7 @@ import {
   monoOrigNode,
   monoParamPinTy,
   monoProgStmts,
+  monoRenamedFe,
   monoRetCopyReads,
   monoStubSlots,
   monoSupersededObjTys,
@@ -593,6 +600,7 @@ import {
   elabRetOf,
   elabSlotNote,
   elabStampAt,
+  elabStubArgSet,
   elabTestsTyVar,
   elabTpDefaultsReset,
   elabTpDefaultsSet,
@@ -666,7 +674,7 @@ import {
   nulNumScalarUnionName,
   nulNumScalarUnionRowTy,
 } from "./check_ty_rep"
-import { nodeTyPinIxOf, tyIsWriteLandRead } from "./check_hole_pins"
+import { tyIsWriteLandRead } from "./check_hole_pins"
 import { recFreshDeclOf } from "./check_rec_fresh"
 import { recArgRepOf, recBuildTyOf } from "./check_rec_rows"
 import { valueUnionRetName } from "./check_ret_names"
@@ -686,6 +694,7 @@ import {
   fnTagCallSetOf,
   fnTagHoldsTy,
   fnTagListTy,
+  fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
   fnTagSetOfTy,
   fnTagTyIsTagged,
@@ -1913,16 +1922,16 @@ function monoCoalJoinPinName(ix: i32): string {
   monoUnionPinName(ix)
 }
 
-// The pin of a `??` at `ix` typed at a hole whose banked read is a union or a nullable, which
-// no instance row records: the join the collect pass registered for it, or "".
-function monoHoleCoalPinName(ix: i32): string {
+// The join of a `??` at `ix` typed at a hole that instance `fnIx` binds to a union or a nullable:
+// the row the collect pass registered for it, or "".
+function monoHoleCoalPinName(ix: i32, fnIx: i32): string {
   if ix < 0 { return "" }
   const n = nodeAt(ix)
   if !(n is BinExpr) { return "" }
   if n.binOp != "??" { return "" }
   const t = nodeTyIxOf(ix)
   if t < 0 || t >= T.tys.length || !(tyAt(t) is TyVar) { return "" }
-  const p = nodeTyPinIxOf(ix)
+  const p = nodeTyInOf(ix, fnIx)
   if p < 0 || p == t || !monoTyIsUnionShaped(p) { return "" }
   monoUnionPinNameOfTy(p)
 }
@@ -2727,7 +2736,7 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
   }
   // An `i32` niche, a nullable literal union or `boolean | null`: the annotation's name and the
   // scalar cascade both name its raw `i32`, or its non-null half (D2998, D2985).
-  const hcp = monoHoleCoalPinName(cax)
+  const hcp = monoHoleCoalPinName(cax, fnIx)
   if hcp != "" { return hcp }
   const nluTy = argNichePinTyOf(cax, fnIx)
   if nluTy >= 0 {
@@ -3962,6 +3971,7 @@ function monoRemintCall(ix: i32, callee: i32, args: i32[]): i32 {
   if n is Call {
     const nc = ufcsSiteCarry(mkCallN(callee, args, n.callArgNames, n.pos), ix)
     monoNoteCallTpl(ix, nc)
+    nodeSrcNote(nc, ix)
     return nc
   }
   -1
@@ -6745,6 +6755,7 @@ function monoRenameGenAliasInit(at: i32, ctx: i32, tpl: string, inst: string) {
     return monoRenameGenAliasInit(d.letInit, ctx, tpl, inst)
   }
   iv.identName = inst
+  monoNoteRenamed(d.letInit, monoSlotOfDecl(monoFnDeclNamed(inst)))
   monoArenaTouch()
   sidNoteNodeName(d.letInit, monoFnDeclNamed(inst))
   0
@@ -7280,8 +7291,14 @@ const MONO_UNBOUND_TY_PARAM_DEFAULT = "i32"
 
 // Records, for the elaboration, each generic declaration's type parameters an inferred call that
 // leaves them unbound defaults, by `monoDefaultUnboundTyParams`'s rule (D4551).
-export function monoElabDefaultsPrime() {
+export function monoElabDefaultsPrime(stmts: i32[]) {
   elabTpDefaultsReset()
+  // The stub keys read value reach over the program as checked, indexed for this question
+  // and put back after, since the checker's own question is still read.
+  vrStash()
+  vrResetFor("mono", stmts, true, false)
+  const vrCands: i32[] = []
+  vrIndex(stmts, vrCands)
   const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
   let d = 0
   while d < P.nodes.length {
@@ -7303,9 +7320,102 @@ export function monoElabDefaultsPrime() {
         if out.length > 0 { elabTpDefaultsSet(d, out, dt) }
       }
     }
+    // An argument of only uncalled hole functions is keyed at the stub it is delivered at.
+    if fn is Call {
+      let k = 0
+      while k < fn.callArgs.length {
+        const st = monoInertStubTy(fn.callArgs[k])
+        if st >= 0 { elabStubArgSet(d, k, st) }
+        k = k + 1
+      }
+    }
     d = d + 1
   }
+  vrUnstash()
   0
+}
+
+// The stub type argument `a` is delivered at when it holds only hole functions no call reaches:
+// `() => void`, a list of it for a list literal of them, a list of lists for a list of list
+// literals; -1 otherwise.
+function monoInertStubTy(a: i32): i32 {
+  const ax = unwrapParen(a)
+  if ax < 0 || ax >= P.nodes.length { return -1 }
+  const al = nodeAt(ax)
+  if !(al is ArrayLit) {
+    return if monoInertFnsAt(ax, 0) { monoStubFnTy() } else { -1 }
+  }
+  if al.arrElems.length == 0 { return -1 }
+  const rows = nodeAt(unwrapParen(al.arrElems[0])) is ArrayLit
+  for e in al.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 { return -1 }
+    const il = nodeAt(ex)
+    if rows && il is ArrayLit {
+      if il.arrElems.length == 0 { return -1 }
+      for ie in il.arrElems {
+        if !monoInertFnsAt(unwrapParen(ie), 0) { return -1 }
+      }
+    } else if rows || !monoInertFnsAt(ex, 0) {
+      return -1
+    }
+  }
+  if rows {
+    mkArrayTy(mkArrayTy(monoStubFnTy()))
+  } else {
+    mkArrayTy(monoStubFnTy())
+  }
+}
+
+// `() => void`, the type an inert hole function is delivered at.
+function monoStubFnTy(): i32 {
+  const noPs: i32[] = []
+  mkFuncTy(noPs, TY_VOID)
+}
+
+// Whether value `x` can only be hole functions, each read at a name no call reaches: a name of
+// one, an un-annotated `const` binding of one, an `if` choosing between them, or a call returning one.
+function monoInertFnsAt(x: i32, depth: i32): boolean {
+  if x < 0 || x >= P.nodes.length || depth > 8 { return false }
+  const n = nodeAt(x)
+  if n is IfStmt {
+    if n.ifElse < 0 { return false }
+    const arms: i32[] = []
+    tailValueLeaves(x, arms)
+    if arms.length < 2 { return false }
+    for a in arms {
+      if !monoInertFnsAt(unwrapParen(a), depth + 1) { return false }
+    }
+    return true
+  }
+  // A call is each value its callee's body hands back (D6911).
+  if n is Call {
+    const cd = identDeclOf(unwrapParen(n.callFn))
+    if cd < 0 || cd >= P.nodes.length { return false }
+    const cf = nodeAt(cd)
+    if !(cf is FuncDecl) || cf.fnBody < 0 { return false }
+    const rv: i32[] = []
+    collectRetValues(cf.fnBody, rv)
+    if rv.length == 0 { return false }
+    for v in rv {
+      if !monoInertFnsAt(unwrapParen(v), depth + 1) { return false }
+    }
+    return true
+  }
+  if !(n is Ident) { return false }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  if dn is FuncDecl { return monoIsGenericDecl(d) && vrInertFor("mono", x, "") }
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return false
+  }
+  monoInertFnsAt(unwrapParen(dn.letInit), depth + 1)
 }
 
 // Binds each of `typarams` that is still unbound in `tvN`, that no annotation in `params` names
@@ -9459,6 +9569,7 @@ export function monoStateReset() {
 export function monoSubTablesReset() {
   monoInstOwn = ""
   monoArgInstFe = Map()
+  monoRenamedFe = Map()
   monoOpenArgCall = 0 - 1
   monoOpenArgCallee = 0 - 1
   0
@@ -9644,6 +9755,7 @@ function monoMakeInstanceHit(
           ) {
             monoAliasCallNote(calleeIx)
             cal.identName = monoInstName[k]
+            monoNoteRenamed(calleeIx, monoInstFe[k])
             monoArenaTouch()
             // R4 writer 5 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
             let instDecl = fnStmts[monoInstFe[k]]
@@ -9726,7 +9838,11 @@ function monoMakeInstanceParams(
         // The pinned name differs from the written annotation exactly when
         // a type param substituted through it (bare `T`, `T[]`, or a
         // composite like `Box<T>`); a concrete annotation keeps its node.
-        if pinned[pj] == tyNameOf(p3.parType) {
+        if fnTagTyIsTagged(pinTys[pj]) {
+          // A type parameter bound to a tagged set is the set itself, as at a hole.
+          nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
+          synthed = true
+        } else if pinned[pj] == tyNameOf(p3.parType) {
           nt = p3.parType
         } else {
           // The argument's type is one member of a union parameter; the explicit type
@@ -10144,6 +10260,7 @@ function monoMakeInstanceLater(
   if cal2 is Ident && !i32ListHas(monoNoRename, calleeIx) {
     monoAliasCallNote(calleeIx)
     cal2.identName = instName
+    monoNoteRenamed(calleeIx, instFe)
     monoArenaTouch()
     let instDecl = fnStmts[instFe]
     if identAuditDrop == IDENT_DROP_MONO_CALLEE { instDecl = -1 }
@@ -11185,11 +11302,38 @@ function monoCoerceLitPart(v: i32, lit: i32, path: string[], ctx: i32) {
   monoCoerceFnValueTys(v, nm, ctx, -1, tys)
 }
 
+// Record that the identifier at `identIx` now names the instance at slot `fe` (-1: none).
+function monoNoteRenamed(identIx: i32, fe: i32) {
+  // arena-tick exempt: a node-keyed side table no rebuild reads.
+  if identIx >= 0 && fe >= 0 { monoRenamedFe[identIx] = fe }
+  0
+}
+
+// The slot `monoNoteRenamed` recorded for `identIx`, while that slot still declares `name`; -1
+// otherwise. A just-minted instance is named here before the function map covers it.
+function monoRenamedFeOf(identIx: i32, name: string): i32 {
+  const fe = monoRenamedFe.get(identIx) ?? -1
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const d = nodeAt(fnStmts[fe])
+  if d is FuncDecl {
+    if d.fnName == name { return fe }
+  }
+  -1
+}
+
+// The `fnStmts` slot of declaration node `decl`, or -1.
+function monoSlotOfDecl(decl: i32): i32 {
+  if decl < 0 { return -1 }
+  fnStmtsPosOf(decl)
+}
+
 // The `fnStmts` slot of the function an `Ident` names — the one resolver every question
 // this pass asks about a named function goes through. `fnIndexOfInScopeSid` is the language's
 // innermost-scope rule for a name a `FuncDecl` carries; `identClosureFeOfRead` covers an
 // arrow lambda, which parses to a nameless `FuncDecl` and carries its name on the binding.
 function monoFnFeOfIdent(identIx: i32, name: string, ctx: i32) {
+  const rf = monoRenamedFeOf(identIx, name)
+  if rf >= 0 { return rf }
   const fe = fnIndexOfInScopeAt(sidOfNode(identIx), name, ctx, identIx)
   if fe >= 0 { return fe }
   identClosureFeOfRead(identIx, ctx)
@@ -17586,7 +17730,7 @@ function monoPushedAdapterClosed(v: i32): boolean {
 // Notes inert each name of a generic function in the program `stmts` and the bodies in
 // `fnStmts` whose value reaches nothing that calls or observes it (`vrInert`).
 function monoInertReach(stmts: i32[]) {
-  vrReset(stmts, true, false)
+  vrResetFor("mono", stmts, true, false)
   const roots: i32[] = []
   for s in stmts { roots.push(s) }
   for f in fnStmts { roots.push(f) }
@@ -17688,7 +17832,9 @@ function monoReachIndex(roots: i32[]) {
   const cands: i32[] = []
   vrIndex(roots, cands)
   for x in cands {
-    if monoCalleeIsGeneric(x) && vrInert(x, "") { monoReachNote(x, false) }
+    if monoCalleeIsGeneric(x) && vrInertFor("mono", x, "") {
+      monoReachNote(x, false)
+    }
   }
   0
 }
@@ -21426,7 +21572,7 @@ function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
   const kept: boolean[] = []
   let j = 0
   while j < fes.length {
-    if !vrInert(at[j], "") { return "" }
+    if !vrInertFor("mono", at[j], "") { return "" }
     const g = monoFlowLeafGen(at[j])
     const k = (g >= 0 && monoFlowGenCalled(g))
       || !vrReadsInert(monoOrigNode[fes[j]])
@@ -21848,6 +21994,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         declTys,
       )
       monoDefaultTyParamsOnlyGenFns(fn, params, args, ctx, tvN, tvV, tvT)
+      monoPreBindTaggedSets(fn, args, tvN, tvV, tvT)
       let oDecl = -1
       if origFe >= 0 && origFe < monoOrigNode.length {
         oDecl = monoOrigNode[origFe]
@@ -22026,6 +22173,32 @@ function monoDefaultTyParamsOnlyGenFns(
   0
 }
 
+// Binds each type parameter that alone annotates a parameter handed a tagged set to the set
+// itself, as a hole handed one is pinned: the instance calls each member directly.
+function monoPreBindTaggedSets(
+  fn: FuncDecl,
+  args: i32[],
+  tvN: string[],
+  tvV: string[],
+  tvT: i32[],
+) {
+  let i = 0
+  while i < args.length && i < fn.fnParams.length {
+    const p = nodeAt(fn.fnParams[i])
+    const st = monoArgTaggedSetTy(args[i])
+    if p is Param && st >= 0 && p.parType >= 0 && fnTagOwnTyParamAlone(fn, i) {
+      const tn = nodeAt(p.parType)
+      if tn is TypeRef && !strListHas(tvN, tn.tyName) {
+        tvN.push(tn.tyName)
+        tvV.push(tyToStr(st))
+        monoTvTyLast(tvN, tvT, st)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Whether argument `argIx` names a generic function, directly or through `const` aliases.
 function monoArgIsGenFn(argIx: i32, ctx: i32): boolean {
   const ax = unwrapParen(argIx)
@@ -22145,7 +22318,9 @@ function monoPinHoleParam(
     an = monoElabPin(callIx, args, i, et, ctx)
     if an != "" { anTy = et }
   }
-  if an == "" {
+  // The stub pin where the elaboration left the parameter open: a list of lists of a hole function
+  // the callee calls at two types, whose element has no one signature (D14727).
+  if an == "" && et < 0 {
     const inTy: i32[] = [0 - 1]
     an = monoInertParamStubPin(oDecl, args[i], inTy)
     anTy = inTy[0]
@@ -22330,6 +22505,14 @@ function monoPinAnnotatedParam(
       }
     }
   } else {
+    // A tagged set handed to a parameter its own type parameter alone annotates is pinned at
+    // the set, as a hole handed one is.
+    const setTy = if ann == tp && fnTagOwnTyParamAlone(fn, i) { monoArgTaggedSetTy(args[i]) } else { -1 }
+    if setTy >= 0 {
+      pinned.push(tyToStr(setTy))
+      pinTys.push(setTy)
+      return 0
+    }
     let an2 = ""
     let an2Ty = -1
     let genPin = false
@@ -23067,7 +23250,8 @@ function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
   if an is FuncDecl {
     fe = fnStmtsPosOf(ax)
   } else if an is Ident {
-    fe = fnIndexOfInScopeAt(sidOfNode(ax), an.identName, ctx, ax)
+    fe = monoRenamedFeOf(ax, an.identName)
+    if fe < 0 { fe = fnIndexOfInScopeAt(sidOfNode(ax), an.identName, ctx, ax) }
   }
   if fe < 0 || fe >= fnStmts.length { return "" }
   if !exprIsClosure(argIx, ctx) { return "" }
@@ -23191,6 +23375,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
           // R4 writer 7 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
           if cal is Ident {
             cal.identName = monoInstName[r]
+            monoNoteRenamed(c.callFn, monoInstFe[r])
             monoArenaTouch()
             sidNoteNodeName(c.callFn, fnStmts[monoInstFe[r]])
           }
@@ -23251,6 +23436,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       // R4 writer 8 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
       if cal2 is Ident {
         cal2.identName = specName
+        monoNoteRenamed(c.callFn, instFe)
         monoArenaTouch()
         sidNoteNodeName(c.callFn, fnStmts[instFe])
       }
@@ -23315,6 +23501,7 @@ function monoLamCallByName(calleeIx: i32, origFe: i32, instName: string) {
       return 0
     }
     cal.identName = instName
+    monoNoteRenamed(calleeIx, monoSlotOfDecl(monoFnDeclNamed(instName)))
     monoArenaTouch()
     sidNoteNodeName(calleeIx, monoFnDeclNamed(instName))
   }
@@ -23982,6 +24169,7 @@ function monoRespellLamFe(calleeIx: i32, ctx: i32): i32 {
   const name = monoSlotName(fe)
   if name == "" || name == cal.identName { return fe }
   cal.identName = name
+  monoNoteRenamed(calleeIx, fe)
   monoArenaTouch()
   sidNoteNodeName(calleeIx, fnStmts[fe])
   fe
