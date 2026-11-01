@@ -163,6 +163,7 @@ import {
   globalHasTypeAnn,
   globalIsNonConst,
   letInitFoldsExpr,
+  nliFnIndexReset,
 } from "./emit_query"
 import {
   AS_FAIL_DOMS,
@@ -214,6 +215,8 @@ import {
   annRlNul,
   annRlSlot,
   armPreludeBlocks,
+  armStageElemKeyKind,
+  armStageElemTyIx,
   arrLitCommitAnn,
   arrLitCommitName,
   ba8TypeIdx,
@@ -427,6 +430,7 @@ import {
   liftWbEnd,
   localByNode,
   localDeclIx,
+  localFrameNote,
   localIsRef,
   localLoopIter,
   localLoopVar,
@@ -490,6 +494,7 @@ import {
   sFieldNames,
   sFieldStart,
   sHeapIdx,
+  sIsRefRow,
   sLitMintFn,
   sLitMintRow,
   sNames,
@@ -522,7 +527,7 @@ import {
   uFieldStart,
   uSinkFired,
   uTags,
-  uVarHeap,
+  uVarRow,
   uVariantRowBySid,
   unMemAtomIds,
   unMemAtoms,
@@ -532,6 +537,7 @@ import {
   unMemTys,
   unRowBySid,
   unionSinkBase,
+  variantHeap,
   vbF32Idx,
   vbF64Idx,
   vbI32Idx,
@@ -687,9 +693,7 @@ import {
   globalCellStructIdx,
   inferredRetMapSlot,
   letBindIsAtom,
-  letBindIsNulAtom,
   letCellSlot,
-  letIsNulString,
   letNulMapReadUnionBox,
   letUnionNameOf,
   refListSlotOfExpr,
@@ -788,6 +792,7 @@ import {
   globalRefListSlot,
 } from "./emit_value_sites"
 import { callBindShadowBegin } from "./call_bind_shadow"
+import { fnRetShadowRun } from "./fn_ret_shadow"
 import {
   fnFlowShadowBegin,
   fnFlowShadowBuild,
@@ -1024,6 +1029,7 @@ function emitHeader() {
 // or -1 (via `emitFail`) on any unsupported local. Must run before lowering the
 // body so identifier resolution and the locals vector see the full set.
 function buildLocals(fnIx: i32) {
+  localFrameNote()
   localIsRef = []
   localStructIdx = []
   localLoopVar = []
@@ -2216,6 +2222,7 @@ function startFnDetectScratch() {
 // the same collectLocals walkers user functions use, with the module-level
 // `fnIx = -1`). Resets the local registry + scope stack like `buildLocals`.
 function collectStartLocals() {
+  localFrameNote()
   localIsRef = []
   localStructIdx = []
   localLoopVar = []
@@ -2557,10 +2564,7 @@ function emitStartGlobalInit(
         }
         // Back to idle: a left armed null seed retypes the next global's bare `null` (D1563).
         const idle = expCtxHere(ec)
-        idle.nulBool = false
-        idle.nulString = false
         idle.litUnion = 0
-        idle.nulLitUnion = false
         expCtxApply(idle, ec)
         // Read-only covariance at the module-global binding (D822), a delivery form of its own:
         // a global is not a `let`, so no let-side delivery reaches it. A const
@@ -2591,24 +2595,12 @@ function emitStartGlobalInit(
   0
 }
 
-// `emitStartGlobalInit`'s seeding step for global statement `gst`:
-// applies the expression context its initializer lowers under — the niche null reps and atoms.
+// `emitStartGlobalInit`'s seeding step for global statement `gst`: an atom global's start-fn
+// init lowers a member literal as its atom id, the start-fn twin of the const-path seeding.
 function emitStartGlobalSeedCtx(gst: i32, ec: ExpCtx) {
   const sc = expCtxHere(ec)
-  // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
-  // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
-  sc.nulBool = globalCellKind(gst) == "nulbool"
-  sc.nulString = letIsNulString(gst, -1)
-  // An atom global's start-fn init lowers a member literal as its atom id, and a `K | null`
-  // niche's a bare `null` as the `-1` sentinel — the start-fn twin of the const-path seeding.
   if letBindIsAtom(gst, -1) { sc.litUnion = 1 }
-  if letBindIsNulAtom(gst, -1) { sc.nulLitUnion = true }
   expCtxApply(sc, ec)
-  // The cell's null rep, by kind (the local-`let` and `global.set`
-  // boundaries share the resolver). A bare `null` is never a WasmGC constexpr, so every
-  // `= null` global routes here and this is where its null rep is decided.
-  const cellCtx = expCtxHere(ec)
-  expCtxApply(cellCtx, ec)
   0
 }
 
@@ -2664,7 +2656,7 @@ function emitStartGlobalInitValue(
       wTarget(exprPrev)
       return -1
     }
-  } else if (gck == "variant" && svi >= 0 && svi < uVarHeap.length) {
+  } else if (gck == "variant" && svi >= 0 && svi < uVarRow.length) {
     // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
     if emitVariantCoerce(bodyExpr, svi, g.letInit, -1, ec) < 0 {
       wTarget(exprPrev)
@@ -7437,7 +7429,9 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
       return synthParamAnnots()
     }
     "computeVoidFns#2" => {
-      return computeVoidFns()
+      const cv = computeVoidFns()
+      fnRetShadowRun()
+      return cv
     }
     "computeRetInference#2" => {
       return computeRetInference()
@@ -7504,6 +7498,7 @@ function emitProgramReset(rootIx: i32) {
   // Every module's per-compile scalars back to their declared values (lane L7).
   emitStateReset()
   wasmEmitStateReset()
+  nliFnIndexReset()
   bcReset()
   bignumReset()
   capMemoEditsReset()
@@ -7581,8 +7576,10 @@ function emitProgramReset(rootIx: i32) {
   fmSeenTyParams = -1
   sFieldElemTyIx = []    // a struct FIELD's element type     [collectS]
   uFieldElemTyIx = []    // a VARIANT field's element type    [collectU]
+  armStageElemTyIx = uFieldElemTyIx
   sFieldElemKeyKind = [] // a struct FIELD's map KEY rep    [collectS]
   uFieldElemKeyKind = [] // a VARIANT field's map KEY rep   [collectU]
+  armStageElemKeyKind = uFieldElemKeyKind
   unMemTyStart = []      // union MEMBER types per row        [collectU]
   unMemTyCount = []
   unMemTys = []
@@ -8270,7 +8267,7 @@ function emitOneFuncType(ti: i32) {
       // its `(ref null $mapStruct)` result valtype (`mapAnnShape` is `| null`-aware).
       if retNulMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
       // A `: Cat` concrete-variant return is kind 8 — its `fbValtype` slot is the VARIANT
-      // index (`uVarHeap[vi]`), which `retStructIndex` (standalone structs only) misses.
+      // index (`variantHeap(vi)`), which `retStructIndex` (standalone structs only) misses.
       // The row follows `vtKindOfType`'s kind, so a structural twin of an arm takes that arm's
       // row, read off the recorded type rather than the rendered annotation.
       const retKind = vtKindOfType(fn.fnRet)
@@ -8278,7 +8275,7 @@ function emitOneFuncType(ti: i32) {
         retSlot = repVariantShapeRowOf(nodeTyIxOf(fn.fnRet))
       }
       // A `Circle | null` return (kind `nulvariant`) — the VARIANT index under the null,
-      // which the `(ref null $uVarHeap[vi])` result valtype indexes. `retStructIndex` is
+      // which the `(ref null $variantHeap(vi))` result valtype indexes. `retStructIndex` is
       // -1 for it (`collectS` gives a variant no struct row), the same reason every
       // nullable sibling above carries its own line in this ladder.
       if retNulVariantFlag(fn.fnRet) == 1 {
@@ -8338,7 +8335,7 @@ export function buildStructSupers() {
   }
   let c = 0
   while c < sNames.length {
-    if sTwin[c] == c {
+    if sTwin[c] == c && !sIsRefRow(c) {
       let best = -1
       let bestLen = 0
       let bestAgrees = false
@@ -8436,7 +8433,7 @@ function tsStruct(si: i32) {
 // declaration order. Then the union box `{ tag: i32, value: anyref }` at index `nv`: 2 fields
 // — an immutable i32 tag and an immutable `anyref` value — mirroring binaryen's `unionStruct` output.
 function tsVariant(vi: i32) {
-  tsEntryAt(uVarHeap[vi], "union variant")
+  tsEntryAt(variantHeap(vi), "union variant")
   wU8(95) // 0x5f struct
   const cnt = uFieldCount[vi]
   wULEB(cnt)
@@ -9611,8 +9608,6 @@ function emitConstCellInit(buf: u8[], gi: i32, ec: ExpCtx): i32 {
     // bare `null` as the -1 sentinel. Un-seeded, a member init emitted the string ref into the
     // i32 niche cell (invalid wasm) and a `null` init drew a loud reject.
     if letBindIsAtom(globalStmts[gi], -1) { cc.litUnion = 1 }
-    if letBindIsNulAtom(globalStmts[gi], -1) { cc.nulLitUnion = true }
-    cc.nulBool = gck == "nulbool"
     expCtxApply(cc, ec)
     // A union cell boxes its init in the constexpr (`struct.new` / `array.new_fixed` /
     // `i32.const` are all constant in WasmGC), and a `const f = add` aliasing a generic named

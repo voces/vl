@@ -1,0 +1,201 @@
+// The recorded result of each emitted function, and its shadow against the emitter's voidness.
+// One answer per `fnStmts` entry, from the elaboration where the function is an instance or
+// lives in one, else from the checker; the emitter's re-derivation (`computeVoidFns`) can be
+// replaced by it only where they agree. Off unless a host arms it; armed, each emitted function
+// is counted by class (`docs/internals/architecture-target-2026-10.md` §4, the pass rows).
+import { BinExpr, Block, Call, FuncDecl, nodeAt } from "./ast"
+import { T, TY_NEVER, TY_VOID, TyFunc, tyAt } from "./check_types"
+import {
+  elabCheckedTyOf,
+  elabKeyAtPos,
+  elabRetOf,
+  elabSrcDecl,
+  elabSubstClosed,
+} from "./emit_elab"
+import { scopeTyAt } from "./emit_capture_frames"
+import {
+  emitPhaseReached,
+  fRetVoid,
+  fnParent,
+  fnStmts,
+  fnStmtsPosOf,
+  monoInstFe,
+  monoInstOrig,
+  monoOrigNode,
+  monoStubSlots,
+} from "./emit_state"
+import { i32ListHas } from "./listutil"
+import { identDeclOf } from "./symbols"
+import { nonNullTy, tyHasTyVar } from "./tyquery"
+
+let frsArmed = false
+let frsNamed = false
+let frsDrop = 0
+let frsRowKey: string[] = []
+let frsRowN: i32[] = []
+
+// Arm (1) or disarm (0) the shadow for the compiles that follow; 2 also names each function.
+export function fnRetShadowArm(on: i32) {
+  frsArmed = on != 0
+  frsNamed = on == 2
+  0
+}
+
+// For the shadow's own test: the shadow reads the column as answering nothing (1) or `void`
+// everywhere (2). What the emitter reads is unchanged.
+export function fnRetShadowDropSet(d: i32) {
+  frsDrop = d
+  0
+}
+
+// The result type emitted function `fe` returns, as recorded: `void` for a pruned template's
+// stub, its instance's result when it owns an elaboration slot, its own type inside the
+// instance that holds it, else its checker type; where that is open, its template's closed
+// result. -1 where none is recorded or it is still open.
+export function fnRecordedRetTy(fe: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const fx = fnStmts[fe]
+  // The stub and elaboration ledgers are this compile's only once `monomorphize` has run; before,
+  // they hold the previous program's, so only the checker's own type answers.
+  if !emitPhaseReached("monomorphized") { return frsFnRet(elabCheckedTyOf(fx)) }
+  // A template no instance replaced is pruned to an empty stub, void as minted.
+  if i32ListHas(monoStubSlots, fe) { return TY_VOID }
+  const k = elabKeyAtPos(fe)
+  const nested = fe < fnParent.length && fnParent[fe] >= 0
+  let r = -1
+  if k >= 0 && !nested {
+    r = elabRetOf(k)
+  } else {
+    r = frsFnRet(if k >= 0 { scopeTyAt(fx, fx) } else { elabCheckedTyOf(fx) })
+  }
+  if r >= 0 { return r }
+  frsTemplateRet(fe, nested, k)
+}
+
+// For emitted function `fe` whose own answer is open: the checker result of its template (the
+// generic an instance copies, or the source lambda of a lambda clone), closed by instance
+// `k`'s binding where it names a type variable; -1 where it stays open.
+function frsTemplateRet(fe: i32, nested: boolean, k: i32): i32 {
+  let t = -1
+  if !nested {
+    let i = 0
+    while i < monoInstFe.length && t < 0 {
+      if monoInstFe[i] == fe && i < monoInstOrig.length {
+        const o = monoInstOrig[i]
+        if o >= 0 && o < monoOrigNode.length { t = monoOrigNode[o] }
+      }
+      i = i + 1
+    }
+  }
+  if t < 0 { t = elabSrcDecl(fnStmts[fe]) }
+  const r = frsFnRet(elabCheckedTyOf(t))
+  if r < 0 { return -1 }
+  if !tyHasTyVar(r) { return r }
+  if k >= 0 { elabSubstClosed(r, k) } else { -1 }
+}
+
+// The result of the function type `ft0`, or of its function member where a delivery recorded it
+// nullable; -1 where it is no function type.
+function frsFnRet(ft0: i32): i32 {
+  const ft = nonNullTy(ft0)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const f = tyAt(ft)
+  if f is TyFunc { return f.fnRet }
+  -1
+}
+
+// Count every emitted function by how its recorded result meets `fRetVoid`. Run once the
+// voidness has settled (after `computeVoidFns#2`).
+export function fnRetShadowRun() {
+  frsRowKey = []
+  frsRowN = []
+  if !frsArmed { return 0 }
+  let fe = 0
+  while fe < fnStmts.length && fe < fRetVoid.length {
+    const fn = nodeAt(fnStmts[fe])
+    if fn is FuncDecl {
+      let key = frsClass(fe)
+      if frsNamed { key = key + " | " + fn.fnName }
+      frsCount(key)
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// The class of emitted function `fe`.
+function frsClass(fe: i32): string {
+  let r = fnRecordedRetTy(fe)
+  if frsDrop == 1 { r = -1 }
+  if frsDrop == 2 { r = TY_VOID }
+  const nested = fe < fnParent.length && fnParent[fe] >= 0
+  if r == TY_NEVER { return "never" }
+  if r != TY_VOID && (r < 0 || r >= T.tys.length) {
+    const fn = nodeAt(fnStmts[fe])
+    if fn is FuncDecl {
+      if fn.fnRet >= 0 { return "no result recorded, annotated" }
+    }
+    if elabKeyAtPos(fe) >= 0 || nested {
+      return "no result recorded, instance or nested"
+    }
+    return "no result recorded"
+  }
+  const recVoid = r == TY_VOID
+  const emitVoid = fRetVoid[fe] == 1
+  if recVoid == emitVoid { return "agree" }
+  if recVoid { return "recorded void, emitter value" }
+  if frsTailIsAssign(fnStmts[fe]) {
+    return "emit-time: tail assignment lowered void"
+  }
+  if frsTailCallsVoid(fnStmts[fe]) {
+    return "emit-time: tail call of a function lowered void"
+  }
+  "recorded value, emitter void"
+}
+
+// Whether the function `fx` ends in an assignment: the emitter lowers that tail as a statement
+// unless a reader takes its value, where the recorded result is the assignment's value.
+function frsTailIsAssign(fx: i32): boolean {
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) || fn.fnBody < 0 { return false }
+  const b = nodeAt(fn.fnBody)
+  if !(b is Block) || b.blkStmts.length == 0 { return false }
+  const t = nodeAt(b.blkStmts[b.blkStmts.length - 1])
+  t is BinExpr && t.binOp == "="
+}
+
+// Whether the function `fx` ends in a call of a function the emitter lowered void.
+function frsTailCallsVoid(fx: i32): boolean {
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) || fn.fnBody < 0 { return false }
+  const b = nodeAt(fn.fnBody)
+  if !(b is Block) || b.blkStmts.length == 0 { return false }
+  const t = nodeAt(b.blkStmts[b.blkStmts.length - 1])
+  if !(t is Call) { return false }
+  const cd = identDeclOf(t.callFn)
+  if cd < 0 { return false }
+  const ce = fnStmtsPosOf(cd)
+  ce >= 0 && ce < fRetVoid.length && fRetVoid[ce] == 1
+}
+
+function frsCount(key: string) {
+  let i = 0
+  while i < frsRowKey.length {
+    if frsRowKey[i] == key {
+      frsRowN[i] = frsRowN[i] + 1
+      return 0
+    }
+    i = i + 1
+  }
+  frsRowKey.push(key)
+  frsRowN.push(1)
+  0
+}
+
+export function fnRetShadowRowCount() { frsRowKey.length }
+
+export function fnRetShadowRowLen(i: i32) { frsRowKey[i].length }
+
+export function fnRetShadowRowAt(i: i32, j: i32) { frsRowKey[i][j] }
+
+export function fnRetShadowRowN(i: i32) { frsRowN[i] }

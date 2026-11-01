@@ -340,6 +340,7 @@ import {
 } from "./check_overload"
 import { placeAt, placeIsPath } from "./check_place_ids"
 import { keyHasPrefix, parenPeelIx, placeKeyOf } from "./check_places"
+import { recFreshDeclOf } from "./check_rec_fresh"
 import { recOwnPend, recPend } from "./check_rec_rows"
 import {
   GEN_FN_HOLE_UNCALLED,
@@ -481,6 +482,7 @@ import {
 import {
   fnNodeOfDecl,
   fnParamsOfDecl,
+  identDeclOf,
   memberDeclOf,
   methodFnOfDecl,
 } from "./symbols"
@@ -841,14 +843,40 @@ export function methodDidYouMean(recvTy: i32, prop: string) {
   "; did you mean '." + s + "'?"
 }
 
+// The argument the call `at` passes for the parameter the read `rx` names, when `rx` reads a
+// parameter of the function `at` calls and that argument is a positional read of a fresh binding
+// (`recFreshDeclOf`); else `rx`. The record solve builds such a binding where the pin delivers it.
+function pinArgOfParamRead(rx: i32, at: i32): i32 {
+  const p = parenPeelIx(rx)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return rx }
+  const d = identDeclOf(p)
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is Param) { return rx }
+  if at < 0 || at >= P.nodes.length { return rx }
+  const c = nodeAt(at)
+  if !(c is Call) || hasNamedArgs(c.callArgNames) { return rx }
+  const cf = parenPeelIx(c.callFn)
+  if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return rx }
+  const fd = identDeclOf(cf)
+  if fd < 0 || fd >= P.nodes.length { return rx }
+  const fn = nodeAt(fd)
+  if !(fn is FuncDecl) { return rx }
+  let i = 0
+  while i < fn.fnParams.length && fn.fnParams[i] != d { i = i + 1 }
+  if i >= fn.fnParams.length || i >= c.callArgs.length { return rx }
+  const a = c.callArgs[i]
+  if a < 0 || recFreshDeclOf(parenPeelIx(a)) < 0 { return rx }
+  a
+}
+
 // The argument seam's container refusals for a generic body's receiver, re-asked once the
 // pin at `at` has bound it to `recvTy`. `callIx` is the member call inside the body (D2165).
 function ufcsRecvPinSeam(callIx: i32, recvTy: i32, selfTy: i32, at: i32) {
   if callIx < 0 || callIx >= P.nodes.length { return 0 }
   const c = nodeAt(callIx)
   if c is Call {
-    const rx = ufcsRecvExpr(c)
-    if rx < 0 { return 0 }
+    const rx0 = ufcsRecvExpr(c)
+    if rx0 < 0 { return 0 }
+    const rx = pinArgOfParamRead(rx0, at)
     if covarWriteThrough(rx, recvTy, selfTy) == 1 {
       covarWriteThroughErrAt(rx, recvTy, selfTy, at)
       return 0
@@ -856,6 +884,9 @@ function ufcsRecvPinSeam(callIx: i32, recvTy: i32, selfTy: i32, at: i32) {
     if objShapeAdapterlessAt(rx, recvTy, selfTy) {
       objShapeAdapterlessErr(at, recvTy, selfTy)
     } else if recvTy != selfTy {
+      // The caller's fresh binding is asked about a widened field the pick writes, as the direct
+      // member call asks it; the parameter itself is asked by the body's own pin (`rcwPinSrc`).
+      if rx != rx0 && !inferQuiet { rcwPend(rx, recvTy, selfTy) }
       recPend(rx, recvTy, selfTy, at)
     } else {
       recOwnPend(rx, recvTy)
@@ -886,6 +917,8 @@ export function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
             objShapeAdapterlessErr(rcwPinSrc[i], sub, rcwPinDstTy[i])
           } else {
             rcwPend(rcwPinSrc[i], sub, rcwPinDstTy[i])
+            // The record solve judges the pin's value as it does a binding's (D14759).
+            recPend(rcwPinSrc[i], sub, rcwPinDstTy[i], rcwPinSrc[i])
           }
         }
       }

@@ -363,11 +363,7 @@ import {
   tyIsForeignGenericSig,
   tyIsHoleGenericSig,
 } from "./check_subst"
-import {
-  nullableFlatInner,
-  substListTwinNominal,
-  substUnionNullFolded,
-} from "./check_subst_fold"
+import { nullableFlatInner, substUnionNullFolded } from "./check_subst_fold"
 import { demangleName, isBuiltinTyName } from "./check_suggest"
 import {
   joinTyParamNull,
@@ -3016,6 +3012,12 @@ function annNulStrLitSet(m: i32): boolean {
   armLiteralBaseTy(nonNullTy(m)) == TY_STR
 }
 
+// Whether `m` is a nullable member with no type variable: `S | string` over `type S = string |
+// null` is `string | null`. An open `(A | null)` keeps its spelling for the instance's fold (D3504).
+function annNulClosedMember(m: i32): boolean {
+  m >= 0 && m < T.tys.length && tyAt(m) is TyNullable && !tyHasTyVar(m)
+}
+
 // The whole union type an `A | B | null` spelling denotes: `annUnionInnerTy` over the
 // non-`null` members, wrapped in the null niche when `null` is present (a poisoned -1
 // propagates unwrapped, since `mkNullableTy(-1)` would lose the sentinel). A declared union
@@ -3037,12 +3039,12 @@ function annUnionTy(members: i32[], hasNull: boolean): i32 {
   for m in members {
     if isNullTy(m) {
       anyNull = true
-    } else if annNulStrLitSet(m) {
+    } else if annNulStrLitSet(m) || annNulClosedMember(m) {
       anyNull = true
       lifted = true
       annUnionPushDistinctMember(nonNull, nonNullTy(m))
     } else {
-      nonNull.push(m)
+      annUnionPushDistinctMember(nonNull, m)
     }
   }
   if nonNull.length == 0 && anyNull { return TY_NULL }
@@ -5005,12 +5007,19 @@ let holeSetCallAt = -1
 export function holeSetCallRet(ix: i32, callFn: i32, pts: i32[]): i32 {
   const cx = parenPeelIx(callFn)
   if cx < 0 || cx >= P.nodes.length { return -1 }
-  const s = fnTagSetOfTy(nodeTyIxOf(cx))
+  holeSetCallRetOf(ix, fnTagSetOfTy(nodeTyIxOf(cx)), pts, true)
+}
+
+// `holeSetCallRet` for set `s`, noting the call for `fnTagDecide` only when `note`: an
+// instance's re-check types its calls through the set its parameter is bound to and notes none.
+export function holeSetCallRetOf(
+  ix: i32,
+  s: i32,
+  pts: i32[],
+  note: boolean,
+): i32 {
   const ds = fnTagMembers(s)
   if ds.length == 0 { return -1 }
-  for d in ds {
-    if !setMemberDecl(d) { return -1 }
-  }
   const wp: i32[] = []
   let key = ""
   let open = false
@@ -5025,10 +5034,15 @@ export function holeSetCallRet(ix: i32, callFn: i32, pts: i32[]): i32 {
     wp.push(w)
     key = key + tyToStr(w) + ","
   }
+  for d in ds {
+    if !setMemberDecl(d, open) { return -1 }
+  }
   // A call at a type parameter is decided here and typed at each instance of its function.
   if open {
     const none: i32[] = []
-    if !inferQuiet && !holePinHeld { fnTagCallNote(ix, s, key, false, none) }
+    if note && !inferQuiet && !holePinHeld {
+      fnTagCallNote(ix, s, key, false, none)
+    }
     return -1
   }
   const ft = mkFuncTy(wp, TY_I32)
@@ -5049,17 +5063,20 @@ export function holeSetCallRet(ix: i32, callFn: i32, pts: i32[]): i32 {
       r = joinRetTys(r, w)
     }
   }
-  if !inferQuiet && !holePinHeld { fnTagCallNote(ix, s, key, split, rs) }
+  if note && !inferQuiet && !holePinHeld {
+    fnTagCallNote(ix, s, key, split, rs)
+  }
   r
 }
 
 // Whether `d` is a function a set's call can call directly at the call's own arguments: an
-// un-annotated function, or a generic one with a declared result.
-function setMemberDecl(d: i32): boolean {
+// un-annotated function, or a generic one with a declared result. At a call whose types are all
+// closed (not `open`), a generic one whose result its body gives, which the caller then closes.
+function setMemberDecl(d: i32, open: boolean): boolean {
   if d < 0 || d >= P.nodes.length { return false }
   const f = nodeAt(d)
   if !(f is FuncDecl) { return false }
-  directHoleDecl(d) || (f.fnTyParams.length > 0 && f.fnRet >= 0)
+  directHoleDecl(d) || (f.fnTyParams.length > 0 && (f.fnRet >= 0 || !open))
 }
 
 // What set member `d` returns at function type `ft`'s parameters, as its direct call there does;
@@ -8129,8 +8146,7 @@ function substUnionRebuild(ms: i32[], out3: i32[]): i32 {
     while w < uniq.length {
       if uniq[w] == dms[q] { seen = true }
       // `T[] | i32[]` at `T := i32` is one list; the substituted `T[]` is a fresh index (D2818).
-      if !wrapNull && substListTwin(uniq[w], dms[q]) { seen = true }
-      if wrapNull && substListTwinNominal(uniq[w], dms[q]) { seen = true }
+      if substListTwin(uniq[w], dms[q]) { seen = true }
       if substRecordTwin(uniq[w], dms[q]) { seen = true }
       if substMapTwin(uniq[w], dms[q]) { seen = true }
       w = w + 1

@@ -2,7 +2,16 @@
 // argument at its delivery's record rather than at its own type, each type variable that
 // argument alone bound has that record as its rep, beside the type the row keeps, so the
 // instance is typed at the binding and stored at the build (D14426).
-import { Call, FuncDecl, Ident, LetDecl, ObjLit, P, nodeAt } from "./ast"
+import {
+  ArrayLit,
+  Call,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  ObjLit,
+  P,
+  nodeAt,
+} from "./ast"
 import {
   callBindCount,
   callBindIxAt,
@@ -18,8 +27,17 @@ import { elabCallDeclOf } from "./check_elab_cap"
 import { nodeTyIxOf } from "./check_node_tys"
 import { parenPeelIx } from "./check_places"
 import { recFreshDeclOf, recHeldDecl } from "./check_rec_fresh"
-import { recArgRepOf, recBuildTyOf, recKeptFnDstOf } from "./check_rec_rows"
-import { recBuiltReadTy, recHoleIdentityArg } from "./check_fit_rules"
+import {
+  recArgRepOf,
+  recBuildTyOf,
+  recKeptFnDstOf,
+  recListLits,
+} from "./check_rec_rows"
+import {
+  recBuiltReadTy,
+  recHoleIdentityArg,
+  repStampListBuilt,
+} from "./check_fit_rules"
 import { nonNullTy } from "./tyquery"
 import { recSolePinArg } from "./check_record_origins"
 import { assignable, bindGenWalk, substTyDeep } from "./check_relate_core"
@@ -28,8 +46,10 @@ import { recFnValueLeaves } from "./check_type_shape"
 import { strListHas } from "./listutil"
 import {
   T,
+  TyArray,
   TyFunc,
   TyObj,
+  mkArrayTy,
   tyAt,
   tyHasHole,
   tyMentionsErr,
@@ -71,7 +91,35 @@ export function callArgRepTy(ix: i32, i: i32, ty: i32): i32 {
     callBindRepTysAt(r),
   )
   inferQuiet = q
-  if recRepWidens(ty, rt) { rt } else { ty }
+  if recRepWidens(ty, rt) || recListRepWidens(ty, rt) { rt } else { ty }
+}
+
+// The record generic call `ix`'s result is built at: its result type under the call's rep row, where
+// that is a wider record than `own`, the call's type; else -1.
+export function callRetRepTy(ix: i32, own: i32): i32 {
+  const r = callBindRowOf(ix)
+  if r < 0 || callBindRepTysAt(r).length == 0 { return -1 }
+  const decl = elabCallDeclOf(ix)
+  if decl < 0 || decl >= P.nodes.length { return -1 }
+  const sig = nodeTyIxOf(decl)
+  if sig < 0 || sig >= T.tys.length { return -1 }
+  const f = tyAt(sig)
+  if !(f is TyFunc) { return -1 }
+  const q = inferQuiet
+  inferQuiet = true
+  const rt = substTyDeep(f.fnRet, callBindNamesAt(r), callBindRepTysAt(r))
+  inferQuiet = q
+  if recRepWidens(own, rt) { rt } else { -1 }
+}
+
+// Whether list `wide` holds records `recRepWidens` builds the elements of list `narrow` at.
+function recListRepWidens(narrow: i32, wide: i32): boolean {
+  if narrow < 0 || narrow >= T.tys.length || wide < 0 || wide >= T.tys.length {
+    return false
+  }
+  const n = tyAt(narrow)
+  const w = tyAt(wide)
+  n is TyArray && w is TyArray && recRepWidens(n.aElem, w.aElem)
 }
 
 // The record argument `a`, typed `own`, is built at where that is another record than `own`: the
@@ -80,6 +128,9 @@ export function callArgRepTy(ix: i32, i: i32, ty: i32): i32 {
 export function recArgBuiltTyOf(a: i32, own: i32): i32 {
   const ar = recArgRepOf(parenPeelIx(a))
   if ar >= 0 { return ar }
+  // A list literal whose elements are all built at one wider record is a list of it (D14733).
+  const ln = nodeAt(parenPeelIx(a))
+  if ln is ArrayLit { return recListLitBuiltTyOf(ln, own) }
   let rt = nodeRepTyIxOf(a)
   if rt == own { rt = recRebuiltLeafRow(a, REC_REBUILT_DEPTH) }
   if rt < 0 || rt == own { rt = cbaBuildTyOf(a, rt) }
@@ -93,6 +144,54 @@ export function recArgBuiltTyOf(a: i32, own: i32): i32 {
   } else {
     -1
   }
+}
+
+// `recArgBuiltTyOf` for list literal `l` of type `own`: the list of the record every element is
+// built at, where that is one record wider than the element type; else -1.
+function recListLitBuiltTyOf(l: ArrayLit, own: i32): i32 {
+  const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+  if !(ot is TyArray) || l.arrElems.length == 0 { return -1 }
+  let r = -1
+  for e in l.arrElems {
+    const et = recArgBuiltTyOf(e, ot.aElem)
+    if et < 0 || (r >= 0 && !tySame(r, et)) { return -1 }
+    r = et
+  }
+  if recRepWidens(ot.aElem, r) { mkArrayTy(r) } else { -1 }
+}
+
+// Stamps each record list literal checked this pass whose elements are all reads out of
+// containers their stores build at one other record (`recBuiltReadTy`), or calls and bindings
+// built there, with the list of that record, which the emitter builds it as.
+export function recListLitsBuild() {
+  for l in recListLits {
+    const n = nodeAt(l)
+    if n is ArrayLit {
+      let bt = -1
+      for e in n.arrElems {
+        const own = nodeTyIxOf(e)
+        const pe = parenPeelIx(e)
+        const br = recBuiltReadTy(pe)
+        // A call or a binding is built where its value is (`recArgBuiltTyOf`).
+        const valued = pe >= 0
+          && own >= 0
+          && (nodeAt(pe) is Call || nodeAt(pe) is Ident)
+        let b = if br >= 0 { nonNullTy(br) } else { -1 }
+        if br < 0 && valued { b = recArgBuiltTyOf(pe, own) }
+        const moved = b >= 0 && own >= 0 && !tySame(b, own) && tyAt(b) is TyObj
+        if !moved || (bt >= 0 && !tySame(b, bt)) {
+          bt = -2
+          break
+        }
+        bt = b
+      }
+      const rt = nodeRepTyIxOf(l)
+      if bt >= 0 && (rt < 0 || tySame(rt, nodeTyIxOf(l))) {
+        repStampListBuilt(l, mkArrayTy(bt))
+      }
+    }
+  }
+  0
 }
 
 // Whether record `wide` is another record over the same field names as record `narrow`, which

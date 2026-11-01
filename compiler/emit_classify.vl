@@ -140,11 +140,7 @@ import {
 } from "./check_elab_cap"
 import { letNullHoleFilledTy, letNullHoleUnfilled } from "./check_null_holes"
 import { canonUnionMembersInto } from "./check_program"
-import {
-  inferRetFnKey,
-  mapDeliveryRecorded,
-  nodePinPayloadOf,
-} from "./check_side_rows"
+import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
 import { tyVarRowsMinted } from "./check_subst"
 import {
   MAP_KEY_I32,
@@ -168,7 +164,7 @@ import {
 } from "./check_type_shape"
 import { recFreshDeclOf, recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
 import { recSolePinArg } from "./check_record_origins"
-import { recHoleIdentityArg } from "./check_fit_rules"
+import { recBuiltReadTy, recHoleIdentityArg } from "./check_fit_rules"
 import {
   T,
   TY_STR,
@@ -218,7 +214,7 @@ import {
 } from "./check_types"
 import { cexLitPeel } from "./check_num_lits"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
-import { cwBindingOf, cwLambdaDeclOf } from "./check_write_scan"
+import { cwBindingOf, cwLambdaDeclOf, cwPeelValue } from "./check_write_scan"
 import {
   anonArithFieldCode,
   anonListWiderThanLits,
@@ -653,7 +649,6 @@ import {
 } from "./emit_shape_rows"
 import {
   COPY_CHAIN_MAX,
-  annCloSigSpelled,
   calleeNodeSigKey,
   cloNameSigKeyTy,
   declaredStructIndex,
@@ -775,6 +770,7 @@ import {
   lfBlockOf,
   listIsIdentNames,
   localDeclIx,
+  localFrameGen,
   localIsRef,
   localLoopIter,
   localPairIter,
@@ -788,6 +784,7 @@ import {
   rlElemNullable,
   rlElemTyIx,
   sAnonOwnTy,
+  sFieldCount,
   sLitMintFn,
   sLitMintRow,
   sNames,
@@ -909,7 +906,7 @@ import {
   sidText,
 } from "./symbols"
 import { peelGroupParens } from "./tyname"
-import { recRepWidens } from "./check_bind_adopt"
+import { callRetRepTy, recRepWidens } from "./check_bind_adopt"
 import { holeFnArgRetAtParams, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
@@ -1093,7 +1090,7 @@ export function cloRetIsStructRow(fe: i32): boolean {
   k == "struct" || k == "nulstruct"
 }
 
-// The variant row of the `(ref null $uVarHeap[vi])` niche a call of `fe` returns, or -1.
+// The variant row of the `(ref null $variantHeap(vi))` niche a call of `fe` returns, or -1.
 // The annotation, or an un-annotated result's recorded return kind, is read first, so a call
 // that is not the niche never runs `cloRetValKind`'s inference.
 function cloRetNulVariantRow(fe: i32): i32 {
@@ -1527,7 +1524,7 @@ function globalReadIsString(fnIx: i32, readIx: i32) {
   globalReadAsk(sidOfNode(readIx), li, 2)
 }
 
-// The variant row of the `(ref null $uVarHeap[vi])` niche expression `exprIx` holds, or -1
+// The variant row of the `(ref null $variantHeap(vi))` niche expression `exprIx` holds, or -1
 // when it holds none. The one producer of the nullable-variant kind and its row:
 // `exprNullableVariant` is this answer `>= 0`. Each arm reads the storage that typed the value,
 // so an arm and its layout twin in another position keep their own rows.
@@ -1627,7 +1624,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The variant row of the `(ref null $uVarHeap[vi])` niche the read `ix` reads inside `fnIx`: its
+// The variant row of the `(ref null $variantHeap(vi))` niche the read `ix` reads inside `fnIx`: its
 // storage type's, which is the type it is narrowed out of, else its own type; -1 for none.
 function nulVariantRowOfRead(ix: i32, fnIx: i32): i32 {
   let st = readNarrowedStoreAt(ix, fnIx)
@@ -2054,7 +2051,7 @@ export function identReadAtomKindAt(ix: i32, fnIx: i32): i32 {
   if !uDeclared { return -1 }
   const rx = unwrapParen(ix)
   if rx < 0 || isStorageRead(rx) { return -1 }
-  if identCellVKind(rx, fnIx) != "union" { return -1 }
+  if identStoreClaimed(rx, fnIx) != "union" { return -1 }
   const pt = asgReReadPinAt(rx, fnIx)
   if pt >= 0 { readAtomAgreed(rx, pt, fnIx) } else { readTypeVerdict(rx, fnIx) }
 }
@@ -2135,7 +2132,7 @@ export function identReadContainerAt(ix: i32, fnIx: i32): i32 {
   if rx < 0 || isStorageRead(rx) { return 0 }
   const k = readContainerAgreed(rx, readTyHere(rx, fnIx), fnIx)
   if k == 0 { return 0 }
-  if identCellVKind(rx, fnIx) != "union" { return 0 }
+  if identStoreClaimed(rx, fnIx) != "union" { return 0 }
   const li = readBindingLetOf(rx, fnIx)
   if li >= 0 && readShapeKindOfTy(nodeTyAt(li, fnIx)) == k { return 0 }
   k
@@ -2619,8 +2616,8 @@ function letCallHeldTy(init: i32): i32 {
 }
 
 // The record every result of the inferred-result call `u` is built at, through results that are
-// further such calls, a generic or hole identity of one, or a binding holding only one; -1 where
-// a result is anything else or the results disagree.
+// further such calls, a generic or hole identity of one, a binding holding only one, or a built
+// container's read; -1 where a result is anything else or the results disagree.
 function callBuiltTy(x: i32, depth: i32): i32 {
   if depth <= 0 { return -1 }
   const p = solePinPeel(x)
@@ -2629,7 +2626,14 @@ function callBuiltTy(x: i32, depth: i32): i32 {
   if hd >= 0 && hn is LetDecl { return callBuiltTy(hn.letInit, depth - 1) }
   const u = p
   const fd = if u >= 0 { recInferredFnOf(u) } else { -1 }
-  if fd < 0 { return -1 }
+  // A read out of a container its stores build elsewhere is that build (D14810).
+  if fd < 0 {
+    // A generic call's result is its rep row's (D14733).
+    const gr = if u >= 0 && nodeAt(u) is Call { callRetRepTy(u, nodeTyIxOf(u)) } else { -1 }
+    if gr >= 0 { return gr }
+    const br = if u >= 0 { recBuiltReadTy(cwPeelValue(u)) } else { -1 }
+    return if br >= 0 { nonNullTy(br) } else { -1 }
+  }
   const ha = recHoleIdentityArg(u, fd)
   if ha >= 0 { return callBuiltTy(ha, depth - 1) }
   let r = -1
@@ -2949,11 +2953,63 @@ export function letCellSlot(stmtIx: i32, fnIx: i32, k: VKind): i32 {
   }
 }
 
+// `letCellKindGo` remembered per binding and instance on the `gckGen` generation, which only a
+// walk's top re-stamps: an un-annotated binding walks its initializer, and every name read asks.
+// Rows chain per binding (`lckHead`/`lckNext`), one per asking function.
+let lckHead: i32[] = []
+let lckNext: i32[] = []
+let lckFn: i32[] = []
+let lckStamp: i32[] = []
+let lckVal: VKind[] = []
+let lckGenSeen = 0
+let lckDepth = 0
+
 // The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
 // annotation's kind through the shared annotation ladder, else the initializer's. The local
 // storage class's answer to what `globalCellKind` answers for a module global, kept here
 // because `emit_collect.vl` cannot be imported back into this file.
 export function letCellKind(letIx: i32, fnIx: i32): VKind {
+  if letIx < 0 || letIx >= P.nodes.length { return letCellKindGo(letIx, fnIx) }
+  if lckDepth == 0 {
+    if gckStale() { gckDrop() }
+  }
+  if gckGen < lckGenSeen { lckReset() }
+  lckGenSeen = gckGen
+  let r = if letIx < lckHead.length { lckHead[letIx] } else { -1 }
+  while r >= 0 && lckFn[r] != fnIx { r = lckNext[r] }
+  if r >= 0 && lckStamp[r] == gckGen { return lckVal[r] }
+  const gen = gckGen
+  lckDepth = lckDepth + 1
+  const v = letCellKindGo(letIx, fnIx)
+  lckDepth = lckDepth - 1
+  if r < 0 {
+    while lckHead.length <= letIx { lckHead.push(-1) }
+    r = lckStamp.length
+    lckNext.push(lckHead[letIx])
+    lckHead[letIx] = r
+    lckFn.push(fnIx)
+    lckStamp.push(0)
+    lckVal.push(v)
+  }
+  // A walk that minted rows moved the generation; its answer is served once and not kept.
+  lckStamp[r] = if gckGen == gen { gen } else { 0 }
+  lckVal[r] = v
+  v
+}
+
+// Empties `letCellKind`'s memo, at compile start and when the generation wrapped.
+function lckReset() {
+  lckHead = []
+  lckNext = []
+  lckFn = []
+  lckStamp = []
+  lckVal = []
+  lckGenSeen = 0
+  lckDepth = 0
+  0
+}
+
+function letCellKindGo(letIx: i32, fnIx: i32): VKind {
   if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
   // A `boolean | null` cell is the sentinel-2 niche, whatever the annotation's valtype says.
   if letNulBool(letIx, fnIx) { return "nulbool" }
@@ -2978,13 +3034,15 @@ export function inferredRetMapSlot(ti: i32) {
 
 function inferredRetMapSlotCore(ti: i32) {
   if ti < 0 { return -1 }
-  const mrx = fnRetExprOf(fnStmts[ti])
-  if mrx >= 0 { return mapRetExprShape(mrx, ti) }
+  // A closed checked result type names the map's shape; the tail expression answers where
+  // the type is open or names none.
   const crt = fnCheckedRetTy(ti)
-  if crt >= 0 {
+  if crt >= 0 && !tyHasTyVar(crt) {
     const csh = mapShapeOfTyPeeled(crt)
     if csh != -3 { return csh }
   }
+  const mrx = fnRetExprOf(fnStmts[ti])
+  if mrx >= 0 { return mapRetExprShape(mrx, ti) }
   -1
 }
 
@@ -3068,7 +3126,7 @@ export function asgLitWidth(asgIx: i32, fnIx: i32): string {
 // agree. Each widening it inverts is injective; a tail returning the cell keeps it (D2512).
 export function asgReadUnwidenOp(asgIx: i32, fnIx: i32): i32 {
   const vt = nodeTyIxOf(asgIx)
-  const st = asgStoreTyOf(asgIx)
+  const st = asgPlaceStoreTy(asgIx)
   if vt < 0 || st < 0 { return -1 }
   const stT = tyAt(st)
   if stT is TyNullable {
@@ -3084,6 +3142,22 @@ export function asgReadUnwidenOp(asgIx: i32, fnIx: i32): i32 {
     return -1
   }
   asgUnwidenPrim(vt, st)
+}
+
+// The storage type assignment `asgIx` writes where it differs from the value's: a name's as the
+// checker recorded it, a field's or element's its own checked type; -1 where they agree.
+function asgPlaceStoreTy(asgIx: i32): i32 {
+  const st = asgStoreTyOf(asgIx)
+  if st >= 0 { return st }
+  if asgIx < 0 || asgIx >= P.nodes.length { return -1 }
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return -1 }
+  const tgt = nodeAt(a.binLeft)
+  if !(tgt is Member || tgt is Index) { return -1 }
+  const tt = nodeTyIxOf(a.binLeft)
+  const vt = nodeTyIxOf(asgIx)
+  if tt < 0 || vt < 0 || tySame(tt, vt) { return -1 }
+  tt
 }
 
 // The member a nullable scalar cell of assignment `asgIx` is re-read at so that an unwidening
@@ -5037,7 +5111,7 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   // A map join's blocktype selects this value-shape's `$mapStruct`, so the slot is the
   // map shape (`ifExprRefSlot`'s map arm), not a struct-table index.
   if exprMap(tv, fnIx) { return "map" }
-  // A concrete union ARM join: its heap type is `uVarHeap`, which the struct rung cannot
+  // A concrete union ARM join: its heap type is `variantHeap`, which the struct rung cannot
   // name. A program that also declares the union classifies the arm value as a variant, so
   // `structIndexOfExpr` answers -1 and the ladder fell through to the numeric blocktype over
   // a ref value (D1668). Ahead of the struct rung for the reason the nullable half says.
@@ -5058,7 +5132,7 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
     if exprNullableRefArray(nlv, fnIx) { return "reflist" }
     if exprNullableList(nlv, fnIx) { return "list" }
     if exprNullableMap(nlv, fnIx) { return "map" }
-    // The variant arm goes ahead of the struct one: a union member's heap is `uVarHeap`,
+    // The variant arm goes ahead of the struct one: a union member's heap is `variantHeap`,
     // and the struct fallback below would claim it with a row `sHeapIdx` doesn't have.
     if exprNullableVariant(nlv, fnIx) { return "variant" }
     if exprNullableStruct(nlv, fnIx) { return "struct" }
@@ -5086,7 +5160,7 @@ export function ifExprRefSlot(
   // a kind and its slot are never read off two different arms.
   const tv = ifRepArmValueIx(ifIx)
   match kind {
-    // A nullable-variant join: the row is the arm's own `uVarHeap` index. Without it the
+    // A nullable-variant join: the row is the arm's own `variantHeap` index. Without it the
     // struct arm below would claim the value and `fbValtype` would floor with no interned shape.
     "variant" => {
       // The non-null resolver first: `nulVariantIdxOfExpr` answers only for a `T | null` arm,
@@ -5225,10 +5299,10 @@ export function binMixHardF64(leftIx: i32, rightIx: i32, fnIx: i32) {
   exprHasHardF64(rightIx, fnIx)
 }
 
-// The scalar width evaluating `exprIx` yields: its type at instance `fnIx` peeled to one base
-// scalar, else "" (a numeric union is a box), with a `??` at `coalResultTyOf` and a call left open
-// there at its instance's elaboration. A direct call yields its callee slot's result and a number
-// literal its built width.
+// The scalar width evaluating `exprIx` yields at instance `fnIx`: a direct call its callee
+// instance's result, which a call's program-wide recorded type is not, and a number literal its
+// built width. Else its type there peeled to one base scalar ("" for a numeric union, a box), a
+// `??` at `coalResultTyOf` and a call left open at its instance's elaboration.
 export function exprScalarWidth(exprIx: i32, fnIx: i32): string {
   if exprIx < 0 { return "" }
   const n = nodeAt(exprIx)
@@ -5930,7 +6004,7 @@ export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
     if mvSlotNullable(vsl) { return "nulstruct" }
     // A union-arm value (`{[string]: Circle}` where `Circle` is a declared union
     // member): the loop var is the kind-8 variant local, not struct — the arm's
-    // layout lives in `uVarHeap`, since `collectS` skips a union member (D50).
+    // layout lives in `variantHeap`, since `collectS` skips a union member (D50).
     if mvValVariantOf(vsl) >= 0 { return "variant" }
     return "struct" // struct value
   }
@@ -6282,6 +6356,28 @@ export function coalesceNulAtomToStr(exprIx: i32, fnIx: i32): boolean {
   false
 }
 
+// Whether `ix` reads a `let` or parameter whose written type holds a type variable: the checker
+// types the read at the template's gradual view (`T | string` as `string`), which an instance
+// may make nullable, so only the instance's own type says whether a `??` over it is dead (D3421).
+export function readOfOpenBinding(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || !(nodeAt(u) is Ident) { return false }
+  const d = identDeclOf(u)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  match dn {
+    LetDecl => {
+      return dn.letType >= 0 && tyHasTyVar(nodeTyIxOf(dn.letType))
+    }
+    Param => {
+      return dn.parType >= 0 && tyHasTyVar(nodeTyIxOf(dn.parType))
+    }
+    // No other declaration is written with a type.
+    LoopVar | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
+  false
+}
+
 // Whether the `??` at `exprIx` in the pinned instance `fnIx` reads an operand `lhsIx` the
 // instance typed without `null`, at the `??`'s own type or at a numeric literal type that reps
 // as its scalar: the default is dead, the fold the template's rewrite makes of a concrete one.
@@ -6342,7 +6438,8 @@ export function forInMapRecv(iterIx: i32, fnIx: i32) {
 
 // Whether the assignment at `asgIx` lowers as a value by storing and re-reading its target: a
 // name, a captured literal-union cell (`c[0]`, which the capture rewrite leaves untyped), or
-// a literal-index / field write on a named non-map place whose checked type is the assignment's.
+// a literal-index / field write on a named non-map place whose re-read is the assignment's type
+// or narrows back to it.
 export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
@@ -6381,7 +6478,9 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
       return asgReadUnwidenOp(asgIx, fnIx) >= 0
     }
   }
-  false
+  // A place wider than the right side is re-read and taken back to the right side's rep, as a
+  // name's is (D14820).
+  asgReadUnwidenOp(asgIx, fnIx) >= 0
 }
 
 // Whether callee name node `callFn`, read in function `fnIx`, is `tailSelfFnIx` itself. A name
@@ -9040,7 +9139,7 @@ function asgCellOf(ix: i32, fnIx: i32): i32 {
   -1
 }
 
-// Expression `exprIx` is a nullable union variant: it holds a `(ref null $uVarHeap[vi])`
+// Expression `exprIx` is a nullable union variant: it holds a `(ref null $variantHeap(vi))`
 // niche, which is `nulVariantIdxOfExpr` naming its row. Strict beside `exprNullableStruct`,
 // since the two kinds index different heap tables; a null test wants `exprNullableRefNiche`.
 export function exprNullableVariant(exprIx: i32, fnIx: i32): boolean {
@@ -9210,7 +9309,7 @@ export function letIsStruct(letIx: i32, fnIx: i32) {
 }
 
 // True if the `LetDecl` at `letIx` binds a concrete union-variant value: a variant cell
-// `(ref $(uVarHeap[vi]))`, distinct from the union box and a standalone struct.
+// `(ref $(variantHeap(vi)))`, distinct from the union box and a standalone struct.
 export function letIsVariant(letIx: i32, fnIx: i32) {
   variantIndexOfLet(letIx, fnIx) >= 0
 }
@@ -9545,33 +9644,12 @@ function capturedUnionName(fnIx: i32, name: string) {
     }
     return forInIterUnionElemName(lvIter, lvf)
   }
-  const bn = nodeAt(b)
-  match bn {
-    Param => {
-      const pn = tyNameOf(bn.parType)
-      // The registry test off the row: a canon-rewritten `tyName` is a compiler-produced
-      // spelling, so `annRowOfNode` reads `canonTyIxOf` there and `nodeTyIxOf` otherwise, though
-      // the name is still the product returned.
-      if unRowOfCanonFolded(annRowOfNode(bn.parType)) >= 0 { return pn }
-      return ""
-    }
-    LetDecl => {
-      const par = fnParent[fe]
-      if par >= 0 {
-        const lun = letUnionNameOf(b, fnStmts[par])
-        if lun != "" { return lun }
-        // The env field is the box, so an un-annotated init the checker typed as a value union
-        // (`m[k]`, `m.get(k)` over a scalar-valued map) names its set from that type (D3757).
-        if bn.letType < 0 {
-          const nun = nodeUnionName(unwrapParen(bn.letInit))
-          if isValueUnionName(nun) { return nun }
-        }
-      }
-    }
-    // No other node is a captured union binding.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  ""
+  // The capture's cell holds its binding's union type: the row that type keys names it.
+  const ct = capturedUnionTyIx(fnIx, name)
+  if ct < 0 { return "" }
+  const r = unRowOfTyKey(ct)
+  if r >= 0 && r < unNames.length { return unNames[r] }
+  valueUnionNameOfTy(ct)
 }
 
 // `capturedUnionName`'s type: the parent frame's binding's, or -1 (a captured loop variable
@@ -9823,7 +9901,7 @@ function structIndexOfIdentExpr(e: Ident, exprIx: i32, fnIx: i32): i32 {
   // The frame's own `let`, arm for arm with `exprNullableStruct`'s leg: a kind without its
   // row is `ref valtype with no interned shape`, so the two land together (D21). Gated on
   // the variant the way every other index resolver here is: an arm's values live at
-  // `uVarHeap`, so answering a struct row for one reaches a receiver that is not one.
+  // `variantHeap`, so answering a struct row for one reaches a receiver that is not one.
   const fli = frameLetOf(fnIx, exprIx)
   if fli >= 0 && !letIsVariant(fli, fnIx) { return structIndexOfLet(fli, fnIx) }
   // The module frame's own `let`, which the leg above cannot reach: a module-scope BLOCK
@@ -9870,6 +9948,12 @@ function structIndexOfIndexExpr(e: Index, exprIx: i32, fnIx: i32): i32 {
       sieKnown = true
       const sieT = tyAt(sieTy)
       if sieT is TyObj { sieObj = true }
+    }
+    // The list's own element row, which its elements are stored at whatever the read's type.
+    const els = refListSlotOfExpr(e.idxArr, fnIx)
+    if els >= 0 {
+      const elr = rlElemStructRow(els)
+      if elr >= 0 { return elr }
     }
     if !sieKnown || sieObj {
       const si = structIndexOfTypeNameTy(nm, sieTy)
@@ -10293,6 +10377,12 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   if capInitAsk && declaredSlotOf(exprIx) < 0 {
     const ud = identDeclOf(exprIx)
     if ud >= 0 && nodeAt(ud) is LetDecl { return letIsUnion(ud, fnIx) }
+  }
+  // A read asked outside the frame declaring it reads its binding's cell there, as converted.
+  if declaredSlotOf(exprIx) < 0 {
+    if readSlotlessOwnLet(exprIx, fnIx) >= 0 {
+      return readRepOf(exprIx, fnIx).rrRead == "union"
+    }
   }
   return false
 }
@@ -14335,6 +14425,14 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   // The extended key (not just `fnSigKeyOf`) so a void-returning binding resolves its `>v`
   // sig, interned above; a value-eligible binding takes the same key `fnSigKeyOf` would.
   if fe >= 0 { return cloSigKeyExt(fe) }
+  // A lifted lambda answers above because it is lowered at its own signature, not its type's
+  // key, until lowering follows the recorded type (D8880). Past it, a read whose type at this
+  // instance is a closed function type is keyed by that type.
+  const rt = tyPeelNul(nodeTyAt(atIx, fnIx))
+  if rt >= 0 && tyAt(rt) is TyFunc && !tyHasTyVar(rt) {
+    const rk = sigKeyOfTy(rt)
+    if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
+  }
   // An inferred COPY of another closure binding (`const t0 = p`): chase the source so a call
   // through the intermediate binding classifies its result (nullable-closure read pattern).
   // Asked at the source's own read, so a same-named binding in a sibling block is not it (D3632).
@@ -14350,10 +14448,6 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
         if ofn is FuncDecl {
           if bodyLetReadAtSid(ofn.fnBody, csid, posAt) < 0 { srcFn = -1 }
         }
-      }
-      if srcFn < 0 && fnIx >= 0 {
-        const mk = moduleCopySigKey(srcSid)
-        if mk != "" { return mk }
       }
       const sk = calleeCloSigKeyOfRead(srcIx, srcFn)
       if sk != "" { return sk }
@@ -14379,8 +14473,8 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   if letIx >= 0 {
     const cd = nodeAt(letIx)
     if cd is LetDecl {
-      // A binding initialized by another name holds that name's value, whose key is that
-      // binding's, asked in the frame that declares this one (D3868).
+      // A module binding initialized by another name, read from inside a function, holds that
+      // module name's value, not one of the function's same-named locals (D3880).
       const isid = sidOfNode(cd.letInit)
       if (
         cd.letType < 0
@@ -14388,14 +14482,10 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
         && nodeAt(cd.letInit) is Ident
         && isid != csid
       ) {
-        // Read from inside a function, a module binding's source is not one of that function's
-        // locals of the same name (D3880).
         if letFn < 0 && fnIx >= 0 {
           const mk = moduleCopySigKey(isid)
           if mk != "" { return mk }
         }
-        const ik = calleeCloSigKeyOfRead(cd.letInit, letFn)
-        if ik != "" { return ik }
       }
       if cd.letInit >= 0 {
         const cty = nodeTyAt(cd.letInit, fnIx)
@@ -14407,10 +14497,6 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
             const lk = sigKeyOfTy(cty)
             if lk != "" { return lk }
           }
-          // The nullable twin (`letInitTyIsNulFunc`'s shape): a bare `const t = m[k]` read of
-          // a function-valued map records `TyFunc | null`, and the narrowed call runs at the
-          // inner signature — so the key is the inner's, not "" (D1662).
-          if ct is TyNullable { return sigKeyOfTy(ct.nInner) }
         }
       }
     }
@@ -14589,23 +14675,10 @@ function paramCloSigKey(fnIx: i32, name: string) {
       const p = nodeAt(params[i])
       if p is Param {
         if p.parName == name {
-          if p.parType >= 0 {
-            // A monomorphized closure-pinned param announces itself in the pin column, which
-            // also carries the `$fnsig` key — read where it lives, not by prefix-testing the name.
-            const pin = nodePinPayloadOf(p.parType)
-            if pin != "" { return pin }
-            const ty = nodeAt(p.parType)
-            if ty is TypeRef {
-              const nm = ty.tyName
-              if nm.length > 2 {
-                // The parser's tree, not a character scan: asks whether the annotation spells a
-                // function type anywhere, including inside a union arm (unlike the narrower arena test).
-                if annCloSigSpelled(p.parType, nm) {
-                  return cloNameSigKeyTy(nm, nodeTyIxOf(p.parType))
-                }
-              }
-            }
-          }
+          // The parameter's type at this instance keys it, a pinned hole included.
+          if p.parType < 0 { return "" }
+          const it = tyPeelNul(nodeTyInOf(p.parType, fnIx))
+          if it >= 0 && tyAt(it) is TyFunc { return sigKeyOfTy(it) }
           return ""
         }
       }
@@ -15047,6 +15120,7 @@ export function classifyStateReset() {
   gckDepth = 0
   bcDepth = 0
   bindCellReset()
+  lckReset()
   irkDepth = 0
   lrDepth = 0
   asgReReadIx = -1
@@ -15061,14 +15135,68 @@ export function classifyStateReset() {
 // container or a non-null kind where the checker narrowed it; "" when the read has no rep.
 type ReadRep = { rrStore: string, rrRead: string, rrConv: i32 }
 
+// `readRepGo` remembered per read and asking function, within one frame and pass; a read whose
+// type names a type variable answers per instance, which `fnIx` alone does not name.
+const rrGen = memoGenNew(0)
+const rrKey = memoKeyNew(10)
+const rrStamp: i32[] = []
+const rrFn: i32[] = []
+const rrVal: ReadRep[] = []
 function readRepOf(ix: i32, fnIx: i32): ReadRep {
+  const rx = unwrapParen(ix)
+  if rx < 0 { return readRepGo(ix, fnIx) }
+  const t = nodeTyIxOf(rx)
+  if t < 0 || tyHasTyVar(t) { return readRepGo(ix, fnIx) }
+  if readRepMoved() { memoGenAdvance(rrGen) }
+  if rx < rrStamp.length && rrStamp[rx] == rrGen.at && rrFn[rx] == fnIx {
+    return rrVal[rx]
+  }
+  const v = readRepGo(ix, fnIx)
+  while rrStamp.length <= rx {
+    rrStamp.push(-1)
+    rrFn.push(-1)
+    rrVal.push(v)
+  }
+  rrStamp[rx] = rrGen.at
+  rrFn[rx] = fnIx
+  rrVal[rx] = v
+  v
+}
+
+// Whether any table `readRepGo` consults has moved since the memo last looked.
+function readRepMoved(): boolean {
+  let moved = memoMoved3(rrKey, emitPassGen, tyMutEpoch, localFrameGen)
+  const af = if emitPhaseReached("arenaFinal") { 1 } else { 0 }
+  const s = rrKey.seen
+  if (
+    s[9] == af
+    && s[3] == P.nodes.length
+    && s[4] == ekDecl.length
+    && s[5] == mvValKind.length
+    && s[6] == sFieldCount.length
+    && s[7] == uVariants.length
+    && s[8] == unNames.length
+  ) {
+    if !moved { return false }
+  }
+  moved = memoMoved(rrKey, 3, P.nodes.length) || moved
+  moved = memoMoved(rrKey, 4, ekDecl.length) || moved
+  moved = memoMoved(rrKey, 5, mvValKind.length) || moved
+  moved = memoMoved(rrKey, 6, sFieldCount.length) || moved
+  moved = memoMoved(rrKey, 7, uVariants.length) || moved
+  moved = memoMoved(rrKey, 8, unNames.length) || moved
+  moved = memoMoved(rrKey, 9, af) || moved
+  moved
+}
+
+function readRepGo(ix: i32, fnIx: i32): ReadRep {
   const rx = unwrapParen(ix)
   const none: ReadRep = { rrStore: "", rrRead: "", rrConv: 0 }
   if rx < 0 { return none }
   const e = nodeAt(rx)
   let st = ""
   if e is Ident {
-    const k = identCellVKind(rx, fnIx)
+    const k = identStoreVKind(rx, fnIx)
     if k != null {
       st = k
     } else {
@@ -15117,6 +15245,20 @@ function readRepOf(ix: i32, fnIx: i32): ReadRep {
       return { rrStore: st, rrRead: md.rdKind, rrConv: 4 }
     }
   }
+  // Any other map's value read converts only where a miss makes it a nullable rep.
+  if mvr >= 0 || (e is Index && readMapValTyAt(e, fnIx) >= 0) {
+    const nd = repOfNode(rx, fnIx)
+    if nd.rdCovered == 1 && readKindIsNul(nd.rdKind) {
+      return { rrStore: st, rrRead: nd.rdKind, rrConv: 4 }
+    }
+  }
+  // An `i32` cell read typed `boolean | null` holds that niche's sentinel encoding.
+  if st == "i32" {
+    const bd = repOfNode(rx, fnIx)
+    if bd.rdCovered == 1 && bd.rdKind == "nulbool" {
+      return { rrStore: st, rrRead: "nulbool", rrConv: 6 }
+    }
+  }
   // A read narrowed out of a nullable storage reads its non-null kind: one the checker recorded
   // as narrowed, or one whose own type is that storage's non-null kind (a `?.` guard's re-read).
   if readKindIsNul(st) {
@@ -15144,6 +15286,35 @@ function readNonNulKind(k: string): string {
     i = i + 2
   }
   ""
+}
+
+// The cell an identifier read holds: its loaded slot's, or, asked outside the frame declaring
+// it, the cell its binding has there. Null for a read with neither.
+export function identStoreVKind(rx: i32, fnIx: i32): VKind | null {
+  const k = identCellVKind(rx, fnIx)
+  if k != null { return k }
+  const d = readSlotlessOwnLet(rx, fnIx)
+  if d < 0 { return null }
+  letCellKind(d, fnIx)
+}
+
+// `identStoreVKind` where the binding column claims the cell, read without walking an
+// initializer, so a hot conversion test stays linear in an alias chain; null otherwise.
+function identStoreClaimed(rx: i32, fnIx: i32): VKind | null {
+  const k = identCellVKind(rx, fnIx)
+  if k != null { return k }
+  const d = readSlotlessOwnLet(rx, fnIx)
+  if d < 0 || !letBindRepClaims(d, fnIx) { return null }
+  letBindRep(d, fnIx).rdKind
+}
+
+// The `let` read `rx` names when `fnIx` is the frame declaring it; -1 for any other read.
+function readSlotlessOwnLet(rx: i32, fnIx: i32): i32 {
+  const d = identDeclOf(rx)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  if !(nodeAt(d) is LetDecl) { return -1 }
+  if readDeclOwnerOf(d, fnIx) != fnIx { return -1 }
+  d
 }
 
 // Whether `k` is a nullable rep kind.
@@ -15191,5 +15362,19 @@ function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
     if v == MVK_STRUCT { return "struct" }
     return "mv" + i32ToStr(v)
   }
+  // A map with no value slot here (a hole bound per instance) holds what its type says.
+  const vt = readMapValTyAt(e, fnIx)
+  if vt >= 0 {
+    const vk = repSigKindOfTy(vt)
+    if vk != null { return vk }
+  }
   ""
+}
+
+// The value type of the map an index read `e` reads, from the receiver's type in frame
+// `fnIx`; -1 when the receiver is not a map there.
+function readMapValTyAt(e: Index, fnIx: i32): i32 {
+  const rt = nodeTyInOf(e.idxArr, fnIx)
+  if rt < 0 || !tyIsMap(rt) { return -1 }
+  tyMapValOf(rt)
 }

@@ -956,7 +956,7 @@ function monoAnnPinName(name: string) {
     if isUNameDeclAB(80, arrElemNameRaw(name)) { return name }
   }
   // A declared union arm (`Circle` in `type Shape = Circle | Sq`) — the kind-8 variant,
-  // whose slot is `(ref $uVarHeap[vi])`. `monoStructAnnName` declines it (no struct row)
+  // whose slot is `(ref $variantHeap(vi))`. `monoStructAnnName` declines it (no struct row)
   // and the union registry declines it (an arm is not the union), so without this rung the
   // `"i32"` catch-all declares an i32 parameter over a `(ref $type)` value (D23).
   if variantIndexOf(name) >= 0 { return name }
@@ -3947,6 +3947,7 @@ function monoTyIsObj(t: i32): boolean {
 function monoExprRemake(ix: i32, kids: i32[]): i32 {
   const nx = monoExprMake(ix, kids)
   if nx != ix {
+    nodeSrcNote(nx, ix)
     recordClonedCallRetire(ix, nx)
     narrowedFromTyCopy(ix, nx)
     elabNarrowedCarry(ix, nx)
@@ -4017,10 +4018,13 @@ function monoExprMake(ix: i32, kids: i32[]): i32 {
       }
       const nb = mkBinary(n.binOp, kids[0], kids[1], n.pos)
       if n.binRegion != 0 { markArithRegion(nb) }
+      nodeSrcNote(nb, ix)
       return nb
     }
     Unary => {
-      return mkUnary(n.unOp, kids[0], n.pos)
+      const nu = mkUnary(n.unOp, kids[0], n.pos)
+      nodeSrcNote(nu, ix)
+      return nu
     }
     Paren => {
       return mkParen(kids[0], n.pos)
@@ -4032,7 +4036,9 @@ function monoExprMake(ix: i32, kids: i32[]): i32 {
       return mkOptMember(kids[0], n.omProp, n.omDot, n.pos)
     }
     Index => {
-      return mkIndex(kids[0], kids[1], n.pos)
+      const ni = mkIndex(kids[0], kids[1], n.pos)
+      nodeSrcNote(ni, ix)
+      return ni
     }
     IsExpr => {
       return monoReIsExpr(ix, kids[0])
@@ -7293,12 +7299,8 @@ const MONO_UNBOUND_TY_PARAM_DEFAULT = "i32"
 // leaves them unbound defaults, by `monoDefaultUnboundTyParams`'s rule (D4551).
 export function monoElabDefaultsPrime(stmts: i32[]) {
   elabTpDefaultsReset()
-  // The stub keys read value reach over the program as checked, indexed for this question
-  // and put back after, since the checker's own question is still read.
-  vrStash()
-  vrResetFor("mono", stmts, true, false)
-  const vrCands: i32[] = []
-  vrIndex(stmts, vrCands)
+  monoPrimeStmts = stmts
+  monoPrimeIndexed = false
   const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
   let d = 0
   while d < P.nodes.length {
@@ -7331,8 +7333,27 @@ export function monoElabDefaultsPrime(stmts: i32[]) {
     }
     d = d + 1
   }
-  vrUnstash()
+  if monoPrimeIndexed { vrUnstash() }
+  monoPrimeIndexed = false
+  monoPrimeStmts = []
   0
+}
+
+// The program the stub keys are primed over, and whether its value reach is indexed yet. The
+// index is built at the first argument that asks it, and the checker's own put back after.
+let monoPrimeStmts: i32[] = []
+let monoPrimeIndexed = false
+
+// Whether read `x` reaches no call, over the program as checked (`vrInertFor`).
+function monoPrimeInert(x: i32): boolean {
+  if !monoPrimeIndexed {
+    vrStash()
+    vrResetFor("mono", monoPrimeStmts, true, false)
+    const cands: i32[] = []
+    vrIndex(monoPrimeStmts, cands)
+    monoPrimeIndexed = true
+  }
+  vrInertFor("mono", x, "")
 }
 
 // The stub type argument `a` is delivered at when it holds only hole functions no call reaches:
@@ -7373,11 +7394,38 @@ function monoStubFnTy(): i32 {
   mkFuncTy(noPs, TY_VOID)
 }
 
+// Whether a `break` in `body` leaves the labelled block `label` names.
+function monoBreaksTo(body: i32, label: string): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const b = nodeAt(ix)
+      if b is BreakStmt && b.brkLabel == label { return true }
+      for ch in nodeChildren(ix) { todo.push(ch) }
+    }
+  }
+  false
+}
+
 // Whether value `x` can only be hole functions, each read at a name no call reaches: a name of
-// one, an un-annotated `const` binding of one, an `if` choosing between them, or a call returning one.
+// one, an un-annotated `const` binding of one, an `if` choosing between them, a labelled block
+// no `break` leaves (D14780), or a call returning one.
 function monoInertFnsAt(x: i32, depth: i32): boolean {
   if x < 0 || x >= P.nodes.length || depth > 8 { return false }
   const n = nodeAt(x)
+  if n is WhileStmt {
+    if n.whileBlk != 1 || monoBreaksTo(n.whileBody, n.whileLabel) {
+      return false
+    }
+    const vs: i32[] = []
+    tailValueLeaves(n.whileBody, vs)
+    if vs.length == 0 { return false }
+    for v in vs {
+      if !monoInertFnsAt(unwrapParen(v), depth + 1) { return false }
+    }
+    return true
+  }
   if n is IfStmt {
     if n.ifElse < 0 { return false }
     const arms: i32[] = []
@@ -7406,7 +7454,7 @@ function monoInertFnsAt(x: i32, depth: i32): boolean {
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return false }
   const dn = nodeAt(d)
-  if dn is FuncDecl { return monoIsGenericDecl(d) && vrInertFor("mono", x, "") }
+  if dn is FuncDecl { return monoIsGenericDecl(d) && monoPrimeInert(x) }
   if (
     !(dn is LetDecl)
     || dn.letKw != "const"
@@ -8528,7 +8576,10 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
   const n = nodeAt(ix)
   match n {
     BinExpr => {
-      return monoPinBin(ix, n, pNames, pTys)
+      // A `??` folded to its operand at an interpolation hole stays the hole (D4166).
+      const r = monoPinBin(ix, n, pNames, pTys)
+      monoKeepTplHole(ix, r)
+      return r
     }
     Block => {
       return monoPinBlock(ix, n, pNames, pTys)
@@ -17862,6 +17913,9 @@ function monoCoerceWrittenLetTys(
   if lf[1] < 0 { return false }
   const d = nodeAt(lf[1])
   if !(d is LetDecl) || d.letType >= 0 { return false }
+  // A read of the set of every function written is a tagged id, which a call dispatches per
+  // member at its own types, so it has no one signature to take.
+  if fnTagTyIsTagged(nodeTyIxOf(at)) { return false }
   const byCall = monoCellSigByCall
   monoCellSigByCall = false
   const take = monoLetPinTake(lf, tname, byCall)
@@ -21529,20 +21583,6 @@ function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
   nm
 }
 
-// Types the list literal `x` handed to the stub pin `st`, and each row literal of it, at the
-// pin's lists, so each builds at the row the parameter reads.
-function monoStubListRecord(x: i32, st: i32, ctx: i32) {
-  const ax = unwrapParen(x)
-  if ax < 0 || st < 0 || !(nodeAt(ax) is ArrayLit) { return 0 }
-  monoRecordOpen(ax, st, ctx)
-  const al = nodeAt(ax)
-  const it = tyArrayElemIx(st)
-  if al is ArrayLit && it >= 0 && tyAt(it) is TyArray {
-    for e in al.arrElems { monoRecordOpen(unwrapParen(e), it, ctx) }
-  }
-  0
-}
-
 // Appends to `fes` each hole function value `v` can be, and to `at` the name reading it: `v`
 // names one, is an un-annotated `const` binding whose initializer can only be such, is an `if`
 // whose arms can only be such, or calls a function every value it returns can be (D6911). False
@@ -22235,14 +22275,6 @@ function monoPinHoleParam(
     an = monoElabPin(callIx, args, i, et, ctx)
     if an != "" { anTy = et }
   }
-  // The stub pin where the elaboration left the parameter open: a labelled block's uncalled hole
-  // function (D14780), and a nested list of one called at two types behind a returning guard (D14781).
-  if an == "" && et < 0 {
-    const inTy: i32[] = [0 - 1]
-    an = monoInertParamStubPin(oDecl, args[i], inTy)
-    anTy = inTy[0]
-    if an != "" { monoStubListRecord(args[i], anTy, ctx) }
-  }
   let guessed = false
   if an == "" {
     // Kept for what a closed elaboration does not record: a function's `=>` key, an `#anon`
@@ -22463,6 +22495,15 @@ function monoPinAnnotatedParam(
         // The plan gives a parameter handed to closed function types one per type (D6741).
         fsAsk(params[i])
         monoHoleManyPinsFail(p.parName, fn.fnName)
+      }
+    }
+    // A list argument built at a wider record than its type pins at that rep (D14733).
+    if an2 == "" && ann != tp {
+      const lpt = elabCallParamTy(monoCallTplOf(callIx), i)
+      const lrt = callArgRepTy(monoCallTplOf(callIx), i, lpt)
+      if lrt != lpt {
+        an2 = monoElabPin(callIx, args, i, lrt, ctx)
+        if an2 != "" { an2Ty = lrt }
       }
     }
     if an2 == "" { an2 = monoArgPinName(args[i], ctx) }

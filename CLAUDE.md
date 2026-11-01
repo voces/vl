@@ -214,6 +214,13 @@ box reads 1.3–2.3x under load and is graded only from quiet runs. Binaryen's s
 cannot see, is held by two exact facts about the rung input (D2335, D2336). `-- --write-baseline`
 on a quiet box; profiling-the-compiler.md §Guards.
 
+**LATE DEMANDS ARE A GATED NUMBER TOO — `vl run scripts/late-demands.vl -- --check`.** It counts, per
+file, the elaboration keys a compile mints after `elabRun` returned (`$VL_LATE_DEMANDS=1` prints them
+for one build), against a committed `scripts/late-demands-baseline.txt`. A rise fails. A fall passes,
+but `--check` names it, and the PR that earned it runs `--write-baseline`. **Write the baseline from a
+FIXPOINT seed** (refresh until a second `refresh-compiler.sh` is byte-identical): a one-level build is
+the new source as the old compiler lowered it, and can count differently.
+
 ## "Zero silent rows" is a claim about the INVENTORY, not about VL
 
 The filed inventories hold ~199 hand-written rows. The distilled corpus holds **7,021 cells**.
@@ -415,30 +422,19 @@ row per refusal literal a witness reaches, 21 of them, all invisible to the word
 `capability-probes.vl --live-sites` re-grades them and `tests/vl_live_sites_test.ts` refuses a row with no
 probe. `docs/internals/emit-refusal-wording-2026-09.md`.
 
-**The corpus's emit-side evidence comes only from its CURATED half.** On 2026-10-11
-`baseline.jsonl` held 10,065 cells:
+**The corpus holds no emit reject and no clause-1 cell.** On 2026-11-01 `baseline.jsonl` held
+10,395 cells, and `regress.vl` on a seed built from master `b792ef06` graded every one as filed:
 
-* 5,932 `runs` and 3,258 `loud check reject`;
-* 667 `loud emit reject`;
-* 208 clause-1 cells: 144 `runs but wrong value`, 54 `check-clean invalid wasm` and
-  10 `trap_loads`.
+* 7,086 `runs` and 3,309 `loud check reject`;
+* 0 `loud emit reject`;
+* 0 clause-1 cells.
 
-All 875 cells against the goal are in `named/`, and every one is a review's PRICE: the cells
-a candidate moved loud→silent into a defect master already had. The 1,477 DERIVED cells are
-still only `runs` (1,223) and `loud check reject` (254). So the census's behavioural classes
-carry no emit reject and no silent cell. The 875 measure what reviews looked at, not how
-often the language fails.
-
-**Triage the clause-1 cells by ablation, not by message.** Their 30 distinct messages fall
-into 12 families, and every family has a row:
-
-* D3423 holds 118 of the 208;
-* D3361 holds 24, and D3367 holds 20;
-* D4046 holds 18;
-* D3336 holds 5;
-* D3357, D3369 and D2594 hold 4 each;
-* D3346, D2595 and D3961 hold 3 each;
-* D3398 holds 2.
+The 1,477 DERIVED cells are 1,226 `runs` and 251 `loud check reject`. The 8,918 curated cells
+are 5,860 and 3,058. On 2026-10-11 the curated half held 875 cells against the goal, 208 of them
+clause 1 (118 were D3423's), and every family is now closed. So `regress.vl` can only report a
+loss. It cannot point at an open defect. Open work is in the inventory
+(`scripts/inventory/ls.vl -- --status open`) and the capability probes. A lane briefed off a
+corpus family count must re-run `regress.vl` first.
 
 The other ~500 refusal sites still have no corpus cell. Name the population in the sentence.
 
@@ -647,6 +643,12 @@ commit anyone suspected was the culprit:
 
 **Bisect at BOTH LEVELS, under a timeout.** An L1-only check is vacuous for this class.
 
+**And a behaviour bisect, or a sweep's baseline, uses FIXPOINT seeds on both sides.** A one-level
+build (an older seed running `vl build compiler/entry.vl` over new source) is the new source as the
+OLD compiler lowered it, so that compiler's own lowering defects reach its behaviour. On
+2026-11-01 master `8641a073` built that way graded D3131 and D3466 MOVED, and built to its fixpoint
+graded both as filed — the one-level reading had nearly pinned them on an innocent merge.
+
 **`timeout` KILLS THE SHELL, NOT THE BUILD.** `timeout 900 bash scripts/refresh-compiler.sh`
 kills the script; the `vl build` it launched re-parents to init and keeps a core at ~90%
 forever. Five accumulated over 97 minutes before another session noticed the load — the
@@ -701,7 +703,9 @@ already there and already gates).
 
 **A comment-only change must produce a BYTE-IDENTICAL seed.** That is the trim campaign's
 whole safety proof: `scripts/refresh-compiler.sh`, then `cmp` against a seed built from the
-pre-trim source. One byte different means you edited code, not comments.
+pre-trim source. One byte different means you edited code, not comments. Build both seeds from a
+tree under a project root (a checkout or worktree): a tree with no `.git`/`deno.json`/`package.json`
+above it keys its modules by absolute path, so the same source builds a different seed there.
 
 ## A LADDER OVER A CLOSED KIND SET IS EXHAUSTIVE, OR ITS DEFAULT NAMES WHAT IT EXCLUDES
 

@@ -24,7 +24,7 @@ set -uo pipefail
 
 # The gate rows CI runs with the same command on the same seed. `corpus oracle` is the part
 # of `deno task test` that checks-suites runs; the rest of that row stays local (CI runs it
-# without a seed), as do `self-compile pair` (CI proves only the fixpoint), `plumb-shape
+# without a seed), as do `self-compile pair` (CI proves its fixpoint and fuel, not its survey rows), `plumb-shape
 # cost` (CI runs it without binaryen), the distilled corpus (gate.sh adds --verify-fresh on master)
 # and the filed witnesses (CI grades them in two --shard runs).
 ROWS=(
@@ -34,6 +34,7 @@ ROWS=(
   "lsp lint"
   "lint-self + fmt"
   "seed size"
+  "late demands"
   "no-python"
   "kind-ladder sets"
   "dead-export budget"

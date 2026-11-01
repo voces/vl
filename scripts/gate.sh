@@ -248,6 +248,9 @@ run "lint-self + fmt"          bash scripts/lint-self.sh
 # first orchestrator script the language runs on itself — and it is why the row sits
 # after the build rather than beside the file scans.
 run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED" -- --check
+# The late-demand RATCHET: elaboration keys minted after `elabRun` returned, per file,
+# against scripts/late-demands-baseline.txt. `$VL_BIN` makes the sweep use this host.
+run "late demands"             env VL_BIN="$VL" "$VL" run scripts/late-demands.vl --compiler "$SEED" -- --check --seed "$SEED"
 # No Python anywhere in the tree: a tracked .py file or a python invocation in a script fails.
 run "no-python"                "$VL" run scripts/no-python.vl
 # No `emitter state` row: lane L7's invariant (`emitter-state-audit.vl --check`, 0 never-cleared)

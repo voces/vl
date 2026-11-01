@@ -14,6 +14,7 @@ import {
   cwLetFnTargets,
   cwLetRepointFnTargets,
   cwLetSlotFnTargets,
+  cwLetWrittenInClosure,
   cwListElemFnTargets,
   cwParamArgs,
   cwSlotPath,
@@ -516,8 +517,17 @@ export function elabDefaultRowHas(d: i32, tys: i32[]): boolean {
 
 // Whether `t` is a closed, fully resolved type: no type variable and no pending return anywhere.
 export function elabTyClosed(t: i32, depth: i32): boolean {
+  if etcN > 0 {
+    etcMemo = Map()
+    etcN = 0
+  }
   elabTyClosedOwn(t, depth, [])
 }
+
+// The answers of one `elabTyClosed` walk with no owning declaration, keyed by type and depth, so
+// a type reached along many paths is walked once; cleared by the next walk.
+let etcMemo: {[i32]: boolean} = Map()
+let etcN = 0
 
 // Whether type variable `name` is a type parameter or a hole of a declaration in `own`.
 function elabOwnedBy(own: i32[], name: string): boolean {
@@ -552,6 +562,18 @@ export function elabHoleRootName(t: i32): string {
 function elabTyClosedOwn(t: i32, depth: i32, own: i32[]): boolean {
   if t < 0 || t >= T.tys.length { return false }
   if depth > 16 { return true }
+  if own.length > 0 { return elabTyClosedWalk(t, depth, own) }
+  const key = t * 17 + depth
+  const hit = etcMemo[key]
+  if hit != null { return hit }
+  const r = elabTyClosedWalk(t, depth, own)
+  etcMemo[key] = r
+  etcN = etcN + 1
+  r
+}
+
+// One step of `elabTyClosedOwn` at `t`, which is in the arena and at most 16 deep.
+function elabTyClosedWalk(t: i32, depth: i32, own: i32[]): boolean {
   const x = T.tys[t]
   match x {
     TyVar => {
@@ -675,8 +697,8 @@ function fnSetUnion(a: i32, b: i32): i32[] {
   ms
 }
 
-// Whether set `s` holds a function that declares type parameters: a `let` holding one keeps its
-// initializer's generic type, which a write to it is checked against.
+// Whether set `s` holds a function that declares type parameters: a `let` holding one that a closure
+// writes keeps its initializer's generic type.
 function fnSetHasGeneric(s: i32): boolean {
   if s < 0 || s >= fnSets.length { return false }
   for d in fnSets[s] {
@@ -822,7 +844,11 @@ export function elabFnLetTy(bd: i32, t: i32): i32 {
   if s < 0 { return t }
   if i32ListHas(fnLetVeto, bd) { return t }
   const w = fnLetSetOf(bd)
-  if w < 0 || w == s || fnSetHasGeneric(s) || fnSetHasGeneric(w) { return t }
+  if w < 0 || w == s { return t }
+  // A generic written from a closure keeps the initialiser's type: the capture cell holds one rep.
+  if (fnSetHasGeneric(s) || fnSetHasGeneric(w)) && cwLetWrittenInClosure(bd) {
+    return t
+  }
   const key = "let" + i32ToStr(bd) + "," + i32ToStr(t)
   const memo = fnJoinMemo[key] ?? -1
   if memo >= 0 && memo < T.tys.length { return memo }
@@ -1374,6 +1400,7 @@ export function fnTyFactsReset() {
 // Forgets the sites of an earlier program; once per `checkProgram`.
 export function fnTagEtaReset() {
   fnTagEtaSites = []
+  fnTagEtaSetAt = Map()
   fnTagEtaRan = false
   fnTagEscapes = []
   fnTagEscapeTys = []
@@ -1407,6 +1434,23 @@ export function fnTagEscapeTysTake(): i32[] {
   out
 }
 
+// The set each delivery asked to be built carried, by site, kept until the next program.
+let fnTagEtaSetAt: {[i32]: i32} = Map()
+
+// The sets of the deliveries this check builds as closures over their values, each once.
+export function fnTagEtaBuiltSets(): i32[] {
+  const out: i32[] = []
+  if !fnTagEtaRan { return out }
+  for site in fnTagEtaSites {
+    const s = fnTagEtaSetAt[site] ?? -1
+    if s >= 0 && !i32ListHas(out, s) { out.push(s) }
+  }
+  out
+}
+
+// The set delivery `site` carried when it asked to be built, or -1.
+export function fnTagEtaSetOf(site: i32): i32 { fnTagEtaSetAt[site] ?? -1 }
+
 // Whether delivery `site` is built as a closure over its value.
 export function fnTagEtaAt(site: i32): boolean {
   fnTagEtaRan && i32ListHas(fnTagEtaSites, site)
@@ -1420,10 +1464,11 @@ export function fnTagEtaInner(site: i32) {
   }
 }
 
-// Asks for delivery `site` to be built; true when it is new.
-export function fnTagEtaWant(site: i32): boolean {
+// Asks for delivery `site` of set `s` to be built; true when it is new.
+export function fnTagEtaWant(site: i32, s: i32): boolean {
   if fnTagEtaRan || i32ListHas(fnTagEtaSites, site) { return false }
   fnTagEtaSites.push(site)
+  fnTagEtaSetAt[site] = s
   true
 }
 
@@ -1598,6 +1643,8 @@ export function fnTagUndecide() {
 // Clears every per-program elaboration table; a compile's rounds each start from none.
 export function elabCapReset() {
   elabCapOn = false
+  etcMemo = Map()
+  etcN = 0
   elabEarlyCalls = []
   elabCapQuiet = 0
   elabCapTy = Map()

@@ -51,7 +51,7 @@ import {
 } from "./ast"
 import { readNarrowedTyAt } from "./emit_capture_frames"
 import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
-import { setCtorKeys } from "./check_core_state"
+import { nodeRepTyIxOf, setCtorKeys } from "./check_core_state"
 import { recBuildElemTyOfInit } from "./check_rec_rows"
 import { nodeArrayElemName, nominalStructNameOfTy } from "./check_emit_queries"
 import { nodeTyMapValName } from "./check_hole_pins"
@@ -202,7 +202,6 @@ import {
   nameIsRecordSpelling,
   nameIsWholeSpanShape,
   nestedStructNamesCompat,
-  objFieldCodeWidens,
   shapeFieldParse,
   unionMemberSetsCompat,
   variantIndexOfOwnRender,
@@ -351,6 +350,7 @@ import {
   sFieldNames,
   sFieldStart,
   sFieldTypes,
+  sIsRefRow,
   sNames,
   sTyIx,
   slUsed,
@@ -429,9 +429,7 @@ import {
 } from "./tyname"
 import {
   flattenVariantsInto,
-  isNullTy,
   nonNullTy,
-  tyAdmitsNull,
   tyHasTyVar,
   tyIsArray,
   tyMapHeld,
@@ -522,7 +520,7 @@ export function mapTyValKindLowerable(mty: i32) {
 function mvValResidualOk(v: i32): boolean {
   if v < 0 || v >= T.tys.length { return false }
   if tyAt(v) is TyObj {
-    return joinRowOfTy(v) >= 0 || variantRowOfOwnRenderTy(v) >= 0
+    return structIndexOfTy(v) >= 0 || variantRowOfOwnRenderTy(v) >= 0
   }
   const ms: i32[] = []
   if !jrFlatMembers(v, ms) { return false }
@@ -538,7 +536,7 @@ function mvValResidualOk(v: i32): boolean {
         return true
       }
       TyObj => {
-        if joinRowOfTy(m) >= 0 { return true }
+        if structIndexOfTy(m) >= 0 { return true }
       }
       TyPrim | TyErr | TyNullable | TyUnion | TyVar | TyLit | TyNeg => {
         // No niche of its own; the atom rule below answers.
@@ -1143,7 +1141,7 @@ export function rlElemStructRow(slot: i32): i32 {
   const bn = structIndexByName(ln)
   // The nominal floor, the exact complement of the read side's gate: a ref-list element whose
   // name is a registered union variant and not a registered plain struct has no struct-table
-  // row, its heap being `uVarHeap[vi]`, so every rung below must decline. Keyed on the name
+  // row, its heap being `variantHeap(vi)`, so every rung below must decline. Keyed on the name
   // because variants are nominal, and it gates the arena rung too, ahead of it (D32).
   if bn < 0 && variantIndexOf(ln) >= 0 { return -1 }
   const ar = rlElemStructIdxAt(slot)
@@ -1506,15 +1504,6 @@ export function armLayoutAmbiguousAt(vi: i32): boolean {
   false
 }
 
-// The struct row of the joined record `ty`: its own arena row, else the row an equal join
-// elsewhere interned, else the row `structIndexOfTypeName`'s field-set scan picks for it.
-export function joinRowOfTy(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const r = structIndexOfTy(ty)
-  if r >= 0 { return r }
-  joinRowScanOfTy(ty)
-}
-
 // `structIndexOfTypeName` asked of the record type `ty` rather than of its render: a shape row
 // interned for an equal type, else the field-set scan at the same three leniencies. -1 for a
 // type that is not a record with at least one field.
@@ -1835,20 +1824,9 @@ function rowElemDeclConflicts(si: i32, fnames: string[], ftys: i32[]): boolean {
   false
 }
 
-// `structIndexOfTypeName`'s arena twin — the struct row whose field set matches the
-// `TyObj` `ty`, or -1 (D-FIELDSETOFTY). Asks the fields directly instead of rendering and
-// re-parsing the type, with the same scan order and half-built-row guard as the name path:
-// a declining field fails the row rather than matching loosely.
-export function structRowOfObjFieldSet(ty: i32): i32 {
-  const strict = structRowOfObjFieldSetK(ty, false)
-  if strict >= 0 { return strict }
-  structRowOfObjFieldSetK(ty, true)
-}
-
-// The row scan `structRowOfObjFieldSet` runs, at one leniency (D733). Split out of that
-// function verbatim so the two passes cannot drift; `widen` is threaded to the per-field
-// code test and adds the unique-claimant requirement, and changes nothing else.
-function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
+// The struct row whose field set and field codes match the `TyObj` `ty`, or -1; a declining
+// field fails the row rather than matching loosely.
+function structRowOfObjFieldSet(ty: i32): i32 {
   if ty < 0 { return -1 }
   const t = tyAt(ty)
   if t is TyObj {
@@ -1857,7 +1835,6 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
     const lim = sScanLim()
     let first = -1
     let firstExact = -1
-    let nMatch = 0
     let si = 0
     while si < lim {
       if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
@@ -1871,18 +1848,10 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
           const fj = sFieldIndex(si, fnames[k])
           if fj < 0 {
             ok = false
-          } else if widen && declRowFieldAdopts(ftys[k], si, fj, 8) {
-            // The node-side adopter builds this literal at the row; the codes alone refute it.
           } else {
             const want = fieldCodeForMatch(ftys[k])
             if want >= 0 {
-              if widen {
-                if !objFieldCodeWidens(want, sFieldTypeAt(si, fj), si, fj) {
-                  ok = false
-                }
-              } else if want != sFieldTypeAt(si, fj) {
-                ok = false
-              }
+              if want != sFieldTypeAt(si, fj) { ok = false }
               if ok && want == FC_I32 && !code0TyFitsRow(ftys[k], si, fj) {
                 ok = false
               }
@@ -1924,7 +1893,6 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
           // vs `{xs: Dot[]}`) still need the query's own element declaration to pick the
           // right one. A preference, not a refutation: a conflicting row is only outranked.
           if first < 0 { first = si }
-          nMatch = nMatch + 1
           if firstExact < 0 {
             if !rowElemDeclConflicts(si, fnames, ftys) { firstExact = si }
           }
@@ -1932,50 +1900,10 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
       }
       si = si + 1
     }
-    // The unique-claimant gate on the widened pass: first-match is safe on the strict pass
-    // (agreeing on every field code makes two rows layout twins), but a widened match isn't
-    // — two claimants means two different layouts with no evidence which one is the real build.
-    if widen {
-      if nMatch != 1 { return -1 }
-    }
     if firstExact >= 0 { return firstExact }
     return first
   }
   -1
-}
-
-// Could a record field of type `fty` be adopted into declared row `si`'s record field `fi`, as
-// the node-side adopter builds the literal: a `null` where the declared field admits null, a
-// nested record whose fields adopt into the field's own row. `depth` bounds the walk (D10040).
-function declRowFieldAdopts(fty: i32, si: i32, fi: i32, depth: i32): boolean {
-  if depth <= 0 || si < 0 || sIsAnonRow(si) || fty < 0 || fty >= T.tys.length {
-    return false
-  }
-  if sFieldTypeAt(si, fi) != FC_STRUCT { return false }
-  if isNullTy(fty) { return tyAdmitsNull(sFieldRowTyAt(si, fi)) }
-  const t = tyAt(fty)
-  if !(t is TyObj) { return false }
-  const tgt = sFieldTgtStructIdx(si, fi)
-  if tgt < 0 || sIsAnonRow(tgt) || sFieldCount[tgt] != t.objFieldNames.length {
-    return false
-  }
-  let k = 0
-  while k < t.objFieldNames.length {
-    const fj = sFieldIndex(tgt, t.objFieldNames[k])
-    if fj < 0 { return false }
-    const fk = t.objFieldTypes[k]
-    if !declRowFieldAdopts(fk, tgt, fj, depth - 1) {
-      const want = fieldCodeForMatch(fk)
-      if want < 0 || !objFieldCodeWidens(want, sFieldTypeAt(tgt, fj), tgt, fj) {
-        return false
-      }
-      if want == FC_I32 && !code0TyFitsRow(fk, tgt, fj) { return false }
-      if want == FC_STRUCT && !nestedAnonRowFits(fk, tgt, fj) { return false }
-      if !declRowFnFieldFits(fk, tgt, t.objFieldNames[k]) { return false }
-    }
-    k = k + 1
-  }
-  true
 }
 
 // The struct table index a type NAME names: a declared struct name directly, or an INLINE
@@ -1992,9 +1920,9 @@ export function structIndexOfTypeName(name: string) {
 }
 
 // `structIndexOfTypeName` given the arena type `ty` of `name` (or of its `| null` niche), -1 for
-// none: the exact name, a non-null `ty`'s own row, an undeclared record's canonical-key row, then
-// the field-TYPE scan and the spelling. A declared record with no own row never gets another
-// type's same-shape row: callers read that miss as a decision (a `nulvariant` arm, a mint).
+// none: the name, the own and canonical-key rows of `ty` and of its non-null part, the field-TYPE
+// scan (reached only by a canon-key twin), then the spelling. A declared record with no own row
+// never gets another type's same-shape row: callers read that miss as a decision.
 export function structIndexOfTypeNameTy(name: string, ty: i32): i32 {
   const si = structIndexByName(name)
   if si >= 0 { return si }
@@ -2008,6 +1936,10 @@ export function structIndexOfTypeNameTy(name: string, ty: i32): i32 {
   }
   const ot = nonNullTy(ty)
   if ot >= 0 && nameIsWholeSpanShape(name) && tyAt(ot) is TyObj {
+    const oo = structIndexOfTy(ot)
+    if oo >= 0 { return oo }
+    const kr = repRowOfTyStruct(ot, sScanLim())
+    if kr >= 0 { return kr }
     return joinRowScanOfTyMemo(ot)
   }
   structIndexOfTypeName(name)
@@ -2021,13 +1953,11 @@ export function structIndexOfNullPartTy(ty: i32): i32 {
   structIndexOfRecordTy(ot)
 }
 
-// The struct row record type `ty` names: the row of the struct declared at that type (-1 for a
-// declared variant arm with none), else the field-set scan over a record's field types.
+// The struct row of the struct declared at record type `ty`; -1 for none, a declared variant arm
+// with no struct row, or an undeclared record.
 function structIndexOfRecordTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
-  const dn = structNameOfTy(ty)
-  if dn != "" { return structIndexOfTy(ty) }
-  if tyAt(ty) is TyObj { return joinRowScanOfTyMemo(ty) }
+  if structNameOfTy(ty) != "" { return structIndexOfTy(ty) }
   -1
 }
 
@@ -3351,9 +3281,7 @@ export function tyElemIsRefListElem(e: i32): boolean {
 }
 
 // Whether arena type `ty` is a list the ref-list layer stores by reference and can name a
-// row for: `nameIsRefArray`'s question asked of the type. An object element needs a struct or
-// arm row, its own or a declared one it adopts into; a record that fits two box rows equally
-// has none, where the spelling takes the first.
+// row for: `nameIsRefArray`'s question asked of the type.
 export function tyIsRefArray(ty: i32): boolean {
   if ty < 0 { return false }
   const t = tyAt(ty)
@@ -3370,7 +3298,8 @@ function tyIsRefArrayElem(e: i32): boolean {
   const et = tyAt(e)
   match et {
     TyObj => {
-      return tyObjHasRefRow(e)
+      // A record element is stored by reference; its row is minted where none exists yet.
+      return true
     }
     TyUnion => {
       return true
@@ -3414,17 +3343,6 @@ export function tyIsNulRefArray(ty: i32): boolean {
   const t = tyAt(ty)
   if t is TyNullable { return tyIsRefArray(t.nInner) }
   false
-}
-
-// Whether an object element has a row the ref-list layer can key: a struct row by index or
-// structure, a union arm by index or by its own render, or a declared struct row an inferred
-// record adopts into (`{r: null}` into `{r: i32 | null}`), found by the field-set scan.
-function tyObjHasRefRow(e: i32): boolean {
-  if structIndexOfTy(e) >= 0 { return true }
-  if repRowOfTyStruct(e, sScanLim()) >= 0 { return true }
-  if repTyHasArmShape(e) { return true }
-  if variantRowOfOwnRenderTy(e) >= 0 { return true }
-  structRowOfObjFieldSet(e) >= 0
 }
 
 // Whether `ty` is a nested list bottoming out at a scalar or string leaf list, at any depth:
@@ -4298,6 +4216,10 @@ function arrLitNominalElemTy(arrIx: i32): i32 {
     if a.arrElems.length < 1 { return -1 }
     const e0 = nodeAt(a.arrElems[0])
     if e0 is ObjLit || e0 is ArrayLit || e0 is FuncDecl { return -1 }
+    // The record list its elements are built as, which the checker stamps, else its own type.
+    const rt = nodeRepTyIxOf(arrIx)
+    const re = if rt >= 0 { tyArrayElemIx(rt) } else { -1 }
+    if re >= 0 && tyAt(re) is TyObj { return re }
     const aty = nodeTyIxOf(arrIx)
     if aty < 0 { return -1 }
     const at = tyAt(aty)
@@ -5564,6 +5486,7 @@ export function wholeShapeRowOf(ty: i32): i32 {
     if (
       rt >= 0
       && rt < T.tys.length
+      && !sIsRefRow(i)
       && tyAt(rt) is TyObj
       && nameIsWholeSpanShape(sNames[i])
     ) {
@@ -5674,14 +5597,11 @@ function shapeNominalRowOf(ty: i32): i32 {
   // signature shares.
   const kr = repRowOfTyStruct(ty, sScanLim())
   if kr >= 0 { return kr }
-  const fs = structRowOfObjFieldSetK(ty, false)
+  const fs = structRowOfObjFieldSet(ty)
   if fs >= 0 { return fs }
   const vr = variantRowOfObjFieldSetK(ty, false)
   if vr >= 0 { return -2 - vr }
-  // The widened passes, both tables, below both strict ones (D733): a widened struct match
-  // must not outrank a strict variant one, so the two scans are called at separate levels.
-  const fw = structRowOfObjFieldSetK(ty, true)
-  if fw >= 0 { return fw }
+  // The widened variant pass, below both strict ones (D733).
   const vw = variantRowOfObjFieldSetK(ty, true)
   if vw >= 0 { return -2 - vw }
   -1
@@ -5696,7 +5616,7 @@ export function sigRowHasNoTwin(si: i32): boolean {
   const lim = sScanLim()
   let j = 0
   while j < lim && j < sFieldCount.length && j < sFieldStart.length {
-    if j != si && sFieldCount[j] == sFieldCount[si] {
+    if j != si && !sIsRefRow(j) && sFieldCount[j] == sFieldCount[si] {
       // A row whose fields are not all appended yet may still become a twin.
       if sFieldStart[j] + sFieldCount[j] > sFieldNames.length { return false }
       if sigRowMayMatch(si, j) { return false }
@@ -5866,7 +5786,7 @@ export function famRelayField(recTy: i32, name: string, litTy: i32) {
   famRelay[i32ToStr(repCanonId(recTy)) + ":" + name] = litTy
   let si = 0
   while si < sFieldStart.length && si < sFieldCount.length {
-    famRelayStructRow(si)
+    if !sIsRefRow(si) { famRelayStructRow(si) }
     si = si + 1
   }
   0
@@ -5914,6 +5834,22 @@ export function rowFieldStoresAtom(recTy: i32, name: string): i32 {
   }
   if s >= 0 && v >= 0 && s != v { return -1 }
   if s >= 0 { s } else { v }
+}
+
+// `rowFieldStoresAtom`'s answer read off struct row `si` alone, -1 for no row or field.
+export function structRowFieldStoresAtom(si: i32, name: string): i32 {
+  if si < 0 || si >= sFieldStart.length { return -1 }
+  const fi = sFieldIndex(si, name)
+  if fi < 0 { return -1 }
+  fieldCodeStoresAtom(sFieldTypes[sFieldStart[si] + fi])
+}
+
+// `rowFieldStoresAtom`'s answer read off variant row `vi` alone, -1 for no row or field.
+export function variantRowFieldStoresAtom(vi: i32, name: string): i32 {
+  if vi < 0 || vi >= uFieldStart.length { return -1 }
+  const fj = variantFieldIndex(vi, name)
+  if fj < 0 { return -1 }
+  fieldCodeStoresAtom(uFieldTypes[uFieldStart[vi] + fj])
 }
 
 // `rowFieldStoresAtom`'s answer for a literal field stored at code `c`.

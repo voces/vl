@@ -774,6 +774,37 @@ export function globalHasTypeAnn(letIx: i32) {
   if d is LetDecl { return d.letType >= 0 }
   false
 }
+// Function name -> the first `FuncDecl` the arena holds with it, over arena nodes
+// [0, `nliFnIndexLen`).
+let nliFnIndex: {[string]: i32} = Map()
+let nliFnIndexLen = 0
+
+// Empties the name index, for a new program.
+export function nliFnIndexReset() {
+  nliFnIndex = Map()
+  nliFnIndexLen = 0
+}
+
+// The first `FuncDecl` in the arena named `name`, or -1. The index covers an arena prefix and
+// extends as the arena grows; a hit whose node does not name `name` rebuilds it.
+function nliFirstFnNamed(name: string): i32 {
+  if nliFnIndexLen > P.nodes.length { nliFnIndexReset() }
+  const hit = nliFnIndex.get(name) ?? -1
+  if hit >= 0 {
+    const f = nodeAt(hit)
+    if f is FuncDecl && f.fnName == name { return hit }
+    nliFnIndexReset()
+  }
+  while nliFnIndexLen < P.nodes.length {
+    const f = nodeAt(nliFnIndexLen)
+    if f is FuncDecl && !nliFnIndex.has(f.fnName) {
+      nliFnIndex[f.fnName] = nliFnIndexLen
+    }
+    nliFnIndexLen = nliFnIndexLen + 1
+  }
+  nliFnIndex.get(name) ?? -1
+}
+
 // The value-union atom name an assignment RHS fills a null hole with ("i32",
 // "boolean", "string", "f64", "i64"), or "" when the RHS is not classifiable at
 // collection time (an ident, a member read, …). A call RHS reads the callee's
@@ -795,23 +826,18 @@ export function nliAtomOfExpr(exprIx: i32) {
       if e.callFn < 0 || e.callFn >= P.nodes.length { return "" }
       const callee = nodeAt(e.callFn)
       if callee is Ident {
-        const cn = callee.identName
-        let ti = 0
-        while ti < P.nodes.length {
-          const f = nodeAt(ti)
-          if f is FuncDecl {
-            if f.fnName == cn {
-              let rn = tyNameOf(f.fnRet)
-              // An un-annotated callee is not an unknown callee: `tyNameOf` answers "" both
-              // for "no return type" and for "checker inferred one" (`inferRetIdx`, filled by
-              // `elaborateInferRets`), so falling back to `inferRetNameOf` here recovers the
-              // inferred name — `registerValueUnionName` is name-keyed, so a name is what it needs.
-              if rn == "" { rn = inferRetNameOf(inferRetFnKey(ti, f.fnName)) }
-              if valueAtomKind(rn) >= 0 && rn != "null" { return rn }
-              return ""
-            }
-          }
-          ti = ti + 1
+        const ti = nliFirstFnNamed(callee.identName)
+        if ti < 0 { return "" }
+        const f = nodeAt(ti)
+        if f is FuncDecl {
+          let rn = tyNameOf(f.fnRet)
+          // An un-annotated callee is not an unknown callee: `tyNameOf` answers "" both
+          // for "no return type" and for "checker inferred one" (`inferRetIdx`, filled by
+          // `elaborateInferRets`), so falling back to `inferRetNameOf` here recovers the
+          // inferred name — `registerValueUnionName` is name-keyed, so a name is what it needs.
+          if rn == "" { rn = inferRetNameOf(inferRetFnKey(ti, f.fnName)) }
+          if valueAtomKind(rn) >= 0 && rn != "null" { return rn }
+          return ""
         }
       }
     }

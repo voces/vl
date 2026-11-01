@@ -508,7 +508,7 @@ export type VKind = "i32"
   | "map"
   | "strlist"
   | "variant"
-  // A nullable union variant (`Circle | null`, the `(ref null $uVarHeap[vi])` niche) is
+  // A nullable union variant (`Circle | null`, the `(ref null $variantHeap(vi))` niche) is
   // a separate kind from `nulstruct` because the heap table differs — pairing them risks
   // reading an unrelated heap type at the same slot (#1803). A niche, not a box: boxing
   // would allocate on a cliff switched on whether `Circle` is a union member elsewhere.
@@ -573,6 +573,13 @@ export let localDeclIx: i32[] = []
 // The slot each declaration of the frame holds, keyed by the declaration and by the one a minted
 // copy stands for; written by `markLocalDecl` alone, so a read resolves through its declaration.
 export let localSlotOfDecl: {[i32]: i32} = Map()
+// Moves each time a frame's local tables are rebuilt or grow, so a memo over what a read's slot
+// holds is current only inside the frame that computed it.
+export let localFrameGen = 0
+export function localFrameNote() {
+  localFrameGen = localFrameGen + 1
+  0
+}
 // Parallel to `localIsRef`: 1 when the slot's `LetDecl` has no initializer. Wasm counts a
 // non-null local as set only inside the block that set it, so such a ref cell is declared
 // nullable and every read of it asserts non-null; the checker orders a write before any read.
@@ -906,6 +913,14 @@ export function sSubbedAt(si: i32): boolean {
 // type before computing the structural key; recording the index at the mint removes
 // that round-trip and covers rows a name cannot resolve at all (synthetic `#anon` shapes).
 export let sTyIx: i32[] = []
+// True for a reference row: a union arm's record that no struct row held, given a row on the arm's
+// heap with no type-section entry (DECISIONS.md, "A record has one row"). Every struct-table walk
+// skips one until the shape-to-row lookup answers the struct row only.
+export let sRefRow: boolean[] = []
+export function sIsRefRow(si: i32): boolean {
+  if si < 0 || si >= sRefRow.length { return false }
+  sRefRow[si]
+}
 // An anonymous row whose recorded type is a hole's context to the minting literal's own record
 // type, so a code-0 field still says whether it holds `i32`, `boolean` or a literal set (D2762).
 export let sAnonOwnTy: {[i32]: i32} = Map()
@@ -1463,17 +1478,31 @@ export let uVariantRowBySid: i32[] = []
 export let cloSigTagNames: string[] = []
 export let uTags: i32[] = []
 export let uBoxIdx = 0
-// `uVarHeap[i]` is variant `i`'s heap-type index; `uVarTwin` is the twin column (see
-// `sTwin`) for the variant layer, collapsing the same variant name pushed by two
-// unions and structural twins (`Cat`/`Kot`) onto one heap type — without it, two
-// occurrences mint distinct rec-group types and a twin flowing where the other is expected fails validation.
-export let uVarHeap: i32[] = []
+// `uVarTwin` is the twin column (see `sTwin`) for the variant layer, collapsing the same
+// variant name pushed by two unions and structural twins (`Cat`/`Kot`) onto one heap type —
+// without it, two occurrences mint distinct rec-group types and a twin flowing where the other is expected fails validation.
 export let uVarTwin: i32[] = []
 // D280 — the cross-table twin column: `uVarSTwin[i]` is the declared struct slot
 // whose heap type variant `i` shares, or -1. `uVarTwin` closes the variant table
 // against itself and `sTwin` the struct table against itself; this is the seam
 // neither covers, since a union arm and a same-layout declared struct are one type to the checker and must share a heap type.
 export let uVarSTwin: i32[] = []
+// `uVarRow[i]` is the struct row variant `i` is a reference to: the row of the arm's own record
+// type, on the same heap with the same fields, or -1. A record has one row and a union arm refers
+// to it (DECISIONS.md, "A record has one row; a union arm is a reference to it").
+export let uVarRow: i32[] = []
+
+// Variant `vi`'s heap type: its row's, or its tag-mate's row's for an arm with none (D1023).
+// -1 for an index past `uVarRow`, which is empty until the union heaps are assigned.
+export function variantHeap(vi: i32): i32 {
+  if vi < 0 || vi >= uVarRow.length { return -1 }
+  let r = uVarRow[vi]
+  if r < 0 && vi < uVarTwin.length && uVarTwin[vi] < vi {
+    r = uVarRow[uVarTwin[vi]]
+  }
+  if r < 0 || r >= sHeapIdx.length { return -1 }
+  sHeapIdx[r]
+}
 // Value unions (`i32 | null`, `string | i32`, ...): a scalar/string-atom union boxes
 // into the same `{tag, anyref}` box as a struct union. A scalar payload is a one-field
 // value box behind the `anyref` slot, keyed by wasm rep (boolean shares the i32 box); a
@@ -1541,6 +1570,45 @@ export let uFieldElemTyIx: i32[] = []
 // The `sFieldElemKeyKind` key column for variant fields (B6b) — see that column's
 // header for why a map field row that carries only `V` cannot resolve its map struct.
 export let uFieldElemKeyKind: i32[] = []
+// The collect-window staging of union-arm fields: the variant field columns name these lists
+// until the arms adopt their rows, then the struct-row lists. Emptied at each adoption.
+export let armStageNames: string[] = []
+export let armStageTypes: i32[] = []
+export let armStageElemName: string[] = []
+export let armStageElemTyIx: i32[] = []
+export let armStageElemKeyKind: i32[] = []
+export let armStageTyText: string[] = []
+export let armStageLitTyIx: i32[] = []
+// Whether the arms have adopted rows; an arm created later adopts its row at creation.
+export let armsAdopted = false
+// `uVarFieldRow[i]` is the struct row arm `i`'s fields are, or -1 before adoption.
+export let uVarFieldRow: i32[] = []
+// The struct-row homes of the arm-only facts (`uFieldTyText`, `uFieldLitTyIx`), padded to the
+// field table with "" and -1 where no arm's field is.
+export let sFieldTyText: string[] = []
+export let sFieldLitTyIx: i32[] = []
+// Point the variant field columns at the struct-row lists: an adopted arm's fields are its row's.
+export function armRowAlias() {
+  uFieldNames = sFieldNames
+  uFieldTypes = sFieldTypes
+  uFieldElemName = sFieldElemName
+  uFieldElemTyIx = sFieldElemTyIx
+  uFieldElemKeyKind = sFieldElemKeyKind
+  uFieldTyText = sFieldTyText
+  uFieldLitTyIx = sFieldLitTyIx
+  0
+}
+// Empty the staging lists once every staged arm has adopted its row.
+export function armStageClear() {
+  armStageNames = []
+  armStageTypes = []
+  armStageElemName = []
+  armStageElemTyIx = []
+  armStageElemKeyKind = []
+  armStageTyText = []
+  armStageLitTyIx = []
+  0
+}
 export let fnUsesMap = false
 export let mapScratchBase = 0
 // `m.keys()` / `for k in m` build a fresh string list of LIVE keys: a 6-slot frame —
