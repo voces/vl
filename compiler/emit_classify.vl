@@ -637,6 +637,7 @@ import {
   structIndexOfNullPartTy,
   structIndexOfTypeName,
   structIndexOfTypeNameTy,
+  structRowOfAnnTy,
   structRowOfRecordTy,
   tyIsRefArray,
   tyMentionsLitOrObj,
@@ -9942,7 +9943,8 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
         // structurally identical twin. Revert this rung if a pair ever surfaces with `repStructSlotsTwin == 0`.
         let si = structIndexOfTy(nodeTyIxOf(d.letType))
         if si < 0 {
-          si = structIndexOfTypeNameTy(lt.tyName, nodeTyIxOf(d.letType))
+          const lty = nodeTyIxOf(d.letType)
+          si = structRowOfAnnTy(lt.tyName, lty, lty)
         }
         if si >= 0 { return si }
         // A nullable annotation resolves its non-null part, as `collectAnnShapes` interned it:
@@ -9997,6 +9999,15 @@ function opNumUnionTyIn(exprIx: i32, fnIx: i32, l: i32, r: i32): i32 {
 export function exprUnion(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = nodeAt(exprIx)
+  // A name, field or element read is the box when what the emitted code holds there is: its read
+  // rep's read half. A storage read asks the store half, which the arms below answer, as they do
+  // a read with no read rep and a `litatom` store, which can hold a narrowed union box.
+  if (e is Ident || e is Member || e is Index) && !isStorageRead(exprIx) {
+    const rr = readRepOf(exprIx, fnIx)
+    if rr.rrRead != "" && rr.rrStore != "litatom" {
+      return rr.rrRead == "union"
+    }
+  }
   match e {
     Paren => {
       return exprUnion(e.parInner, fnIx)
@@ -12851,6 +12862,45 @@ function lrTyIsNoList(ty: i32): boolean {
   t is TyPrim || t is TyObj || t is TyFunc || t is TyMap || t is TyLit
 }
 
+// `placeStoreListKind` remembered per read and asking function, for the pass and tables it read.
+const pslGen = memoGenNew(0)
+const pslKey = memoKeyNew(5)
+const pslStamp: i32[] = []
+const pslFn: i32[] = []
+const pslVal: string[] = []
+// The list a field or element read `rx` reads where its cell holds one: the cell's list, a nullable
+// one's base, or the list arm a narrowed read's own type names (`readRepGo`'s conv 8); else null.
+function placeStoreListKind(rx: i32, fnIx: i32): VKind | null {
+  let moved = memoMoved3(pslKey, emitPassGen, tyMutEpoch, P.nodes.length)
+  moved = memoMoved(pslKey, 3, sFieldCount.length) || moved
+  moved = memoMoved(pslKey, 4, ekDecl.length) || moved
+  if moved { memoGenAdvance(pslGen) }
+  if rx < pslStamp.length && pslStamp[rx] == pslGen.at && pslFn[rx] == fnIx {
+    return readListKindOf(pslVal[rx])
+  }
+  const v = placeStoreListKindGo(rx, fnIx)
+  while pslStamp.length <= rx {
+    pslStamp.push(-1)
+    pslFn.push(-1)
+    pslVal.push("")
+  }
+  pslStamp[rx] = pslGen.at
+  pslFn[rx] = fnIx
+  pslVal[rx] = if v == null { "" } else { v }
+  v
+}
+
+function placeStoreListKindGo(rx: i32, fnIx: i32): VKind | null {
+  const st = readStoreOf(rx, fnIx)
+  const k = readListKindOf(st)
+  if k == null { return null }
+  if readNarrowedStoreAt(rx, fnIx) >= 0 {
+    const ld = repOfNode(rx, fnIx)
+    if ld.rdCovered == 1 && vkListClass(ld.rdKind) == 1 { return ld.rdKind }
+  }
+  k
+}
+
 // The non-null list rep the expression at `exprIx` produces, or null when this cannot name one.
 // The recorded type answers first, then the expression's shape. Each `expr*Array` predicate is
 // this answer compared with one kind, so no two of them can claim one expression (D2275).
@@ -12969,6 +13019,16 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
   ) {
     const nk = readListKindOf(readRepOf(exprIx, fnIx).rrRead)
     if nk != null { return nk }
+  }
+  // A field or element read whose cell is a list reads that list, or the list arm a narrowing
+  // makes of it; any other cell leaves the read to the ladder below.
+  if (
+    (ce is Member || ce is Index)
+    && emitPhaseReached("monomorphized")
+    && !lrTyIsNoList(nodeTyIxOf(exprIx))
+  ) {
+    const pk = placeStoreListKind(exprIx, fnIx)
+    if pk != null { return pk }
   }
   if ce is Call {
     const ck = callStoreListKind(ce, exprIx, fnIx)
@@ -15149,6 +15209,9 @@ const rrVal: ReadRep[] = []
 function readRepOf(ix: i32, fnIx: i32): ReadRep {
   const rx = unwrapParen(ix)
   if rx < 0 { return readRepGo(ix, fnIx) }
+  // A storage read answers its store half, which a plain read of the same node does not, so
+  // neither is served the other's memo entry.
+  if isStorageRead(rx) { return readRepGo(ix, fnIx) }
   const t = nodeTyIxOf(rx)
   if t < 0 || tyHasTyVar(t) { return readRepGo(ix, fnIx) }
   // A call's result storage reads per-function banks a pass fills in place, outside the key.
