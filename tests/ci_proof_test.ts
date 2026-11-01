@@ -49,7 +49,7 @@ const LOCAL: Record<string, string> = {
 const CI_RUNS: Record<string, string[]> = {
   "ci-native": [
     "bash scripts/ci-shard.sh native ${{ matrix.shard }} 7",
-    "bash scripts/ci-shard.sh release ${{ matrix.shard }} 4",
+    "bash scripts/ci-shard.sh release ${{ matrix.shard }} 1",
   ],
   "lsp suites (ci list)": ["- name: Editor features on the wasm compiler"],
   "lsp typecheck": [
