@@ -307,3 +307,34 @@ Deno.test({
     }
   },
 });
+
+// A record field holding a list of lists of a set holds member ids, read through a binding too.
+const IN_RECORD: string[] = [
+  "function inc0(a) { return a + 1 }",
+  "function dbl(a) { return a * 2 }",
+  "const r = { fs: [[inc0, dbl]] }",
+  "const a = r.fs",
+  "print(a[0][1](3))",
+  "print(r.fs[0][0](2.5))",
+];
+
+Deno.test({
+  name:
+    "fn-set rep: a record field of lists of lists of a set holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "inRecord", IN_RECORD);
+      const p = await wasmDis([`${dir}/inRecord.wasm`]);
+      if (!p.success) throw new Error("wasm-dis inRecord failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`inRecord: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});

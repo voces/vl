@@ -81,7 +81,6 @@ import {
 } from "./check_core_state"
 import { nodeTyIsUnionAlias } from "./check_decl_scan"
 import {
-  holePinReadOf,
   nodeTyProvesNonNull,
   nodeUnionName,
   nominalStructNameOfTy,
@@ -91,7 +90,6 @@ import {
   mapPinReadTy,
   nodeTyMapValIsLitUnion,
   nodeTyMapValIsNulLitUnion,
-  nodeTyPinIxOf,
   pinnedHoleTyOf,
 } from "./check_hole_pins"
 import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
@@ -424,8 +422,6 @@ import {
   arrElemIsNullUnitAt,
   declFallbackDepthCap,
   gLitUnionUsed,
-  holeArrElemPinTyOf,
-  holeCaptureArrElemTyOf,
   variantFieldElemNameOr,
   variantFieldMayOmit,
 } from "./emit_lit_atoms"
@@ -793,10 +789,6 @@ import {
   localPairIter,
   localStructIdx,
   monoFieldReadTyIn,
-  monoHoleSubN,
-  monoHoleSubRow,
-  monoHoleSubT,
-  monoParamPinTy,
   mvRlSlot,
   mvValKind,
   mvValName,
@@ -836,11 +828,9 @@ import {
 } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
-  arrLitSameIdentName,
   coalResultTyOf,
   coalesceKeepsScalarBox,
   coalesceNicheLhs,
-  coalesceOperandPinTy,
   coalesceRetypedAtomToStr,
   coalesceStaysNullable,
   columnListRep,
@@ -852,7 +842,6 @@ import {
   instanceBindsNothingClosed,
   instanceTyOf,
   mapArmShapeOfTy,
-  mapCbDeclRetPinTy,
   mapKeyElemVKind,
   mapRecvTyIn,
   mapTyPeel,
@@ -4800,7 +4789,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       } else if bcode == FC_UNION && sharedPlanBoxesSome(bvis, bfis) {
         // A join holding `null` is a nullable row, and names its box as a union row does (D13361).
         if nodeTyIsUnionRow(memIx) || nodeTyIsNullable(memIx) {
-          const bn = valueUnionNameOfTy(nodeTyPinIxOf(memIx))
+          const bn = valueUnionNameOfTy(nodeTyInOf(memIx, fnIx))
           if bn != "" { return bn }
         } else {
           // A read the checker typed at one atom of the box (a then arm over a type parameter).
@@ -6312,7 +6301,7 @@ export function coalesceMapReadJoins(exprIx: i32, fnIx: i32): boolean {
   if !coalesceResultIsBox(ix) { return false }
   const vt = tyPeelNul(tyMapValOf(mapRecvTyIn(recv, fnIx)))
   if vt < 0 { return false }
-  !tySameSet(vt, tyPeelNul(nodeTyPinIxOf(ix)), TY_WALK_DEPTH)
+  !tySameSet(vt, tyPeelNul(nodeTyInOf(ix, fnIx)), TY_WALK_DEPTH)
 }
 
 // The one nullability decision for the `??` reps: a non-null default collapses to the
@@ -6417,7 +6406,7 @@ export function coalesceLitUnionFits(exprIx: i32, fnIx: i32) {
     let lut = nodeNulLitUnionMemberTexts(lhs)
     if lut.length == 0 { lut = nodeLitUnionMemberTexts(lhs) }
     // A hole operand's members come from its pin, where the `??` there reads at the union (D3423).
-    const pin = nodeTyPinIxOf(exprIx)
+    const pin = nodeTyInOf(exprIx, fnIx)
     if lut.length == 0 && tyIsLitUnion(pin) { lut = nulLitAtomTexts(lhs, fnIx) }
     // An instance's `??` records its generic's hole, and the operand's own members decide.
     if (
@@ -6443,7 +6432,7 @@ export function coalesceNulAtomToStr(exprIx: i32, fnIx: i32): boolean {
   if !exprNulLitUnion(e.binLeft, fnIx) { return false }
   const texts = nulLitAtomTexts(e.binLeft, fnIx)
   if texts.length == 0 { return false }
-  const rt = nodeTyPinIxOf(exprIx)
+  const rt = nodeTyInOf(exprIx, fnIx)
   // An instance's `??` records its generic's hole, where a string default outside the set is
   // what makes the join `string`.
   if fnInPinnedInstance(fnIx) && (rt < 0 || tyHasTyVar(rt)) {
@@ -6466,7 +6455,7 @@ export function coalRetypedDead(exprIx: i32, lhsIx: i32, fnIx: i32): boolean {
   if !fnInPinnedInstance(fnIx) { return false }
   const lt = nodeTyAt(lhsIx, fnIx)
   if lt < 0 || lt >= T.tys.length || !tyProvesNonNull(lt) { return false }
-  const pt = nodeTyPinIxOf(exprIx)
+  const pt = nodeTyInOf(exprIx, fnIx)
   if lt == pt { return true }
   if tyAt(lt) is TyPrim { return false }
   const pn = tyPrimNameOf(pt)
@@ -6495,12 +6484,8 @@ export function coalesceOperandPinNonNull(exprIx: i32, fnIx: i32): boolean {
   pn == "i32" && tyPrimNameOf(nodeTyIxOf(d)) == "i32"
 }
 
-// `coalesceOperandPinTy`, else the type an instance shared between pins gives `ix` at its own.
-function coalPinTyOf(ix: i32, fnIx: i32): i32 {
-  const p = coalesceOperandPinTy(ix, fnIx)
-  if p >= 0 { return p }
-  instanceOperandTyOf(ix, fnIx)
-}
+// The type instance `fnIx` gives the `??` operand `ix` its body records open, or -1.
+function coalPinTyOf(ix: i32, fnIx: i32): i32 { instanceOperandTyOf(ix, fnIx) }
 
 // The map receiver arena index of a `for v in m.keys()` / `m.values()` iterable, or -1
 // when the iterable is not a map keys/values walk. Drives the tombstone-aware skip in
@@ -6792,12 +6777,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   match e {
     Index => {
       if nodeArrayElemIsNulLitUnion(e.idxArr) { return true }
-      if (
-        monoHoleSubN.length > 0
-        && tyIsNulLitUnionNiche(holeNulLitElemTy(e.idxArr, fnIx))
-      ) {
-        return true
-      }
+      if tyIsNulLitUnionNiche(holeNulLitElemTy(e.idxArr, fnIx)) { return true }
       // A bare map read `m[k]` over `{[string]: K | null}` yields the niche i32 (a member id
       // or `-1`), so `const t = m[k]` narrows with `!= null` against `-1`.
       const nlMt = mapRecvTyIn(e.idxArr, fnIx)
@@ -8161,7 +8141,7 @@ function arrElemLitUnionTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
   // The banked PIN's element, where the array node records nothing of its own: a container
   // reached through an un-annotated parameter is one, and `nodeTyPinIxOf` falls back to the
   // recorded type wherever no pin exists, so this is a strict widening (D1693, D1545).
-  const pinElem = tyStepElem(nodeTyPinIxOf(unwrapParen(arrIx)))
+  const pinElem = tyStepElem(nodeTyInOf(unwrapParen(arrIx), fnIx))
   if tyIsLitUnion(pinElem) { return pinElem }
   // The ELEMENT's own pin. A container whose own type is not a hole can still have one for its
   // element — `const xs = [a]` over a hole parameter records `<hole>[]` — and every rung above
@@ -8344,12 +8324,14 @@ function holeRecvAtomFieldTexts(
   texts
 }
 
-// The element type of receiver `arrIx`, which a hole instance `fnIx` pins to a list; -1 for any
-// other receiver, and for a list literal built as strings, whose elements are no atom niche.
+// The element type of receiver `arrIx`, recorded open, at instance `fnIx`'s elaboration; -1 for
+// a closed receiver, and for a list literal built as strings, whose elements are no atom niche.
 function holeNulLitElemTy(arrIx: i32, fnIx: i32): i32 {
   if idxRecvIsStrList(arrIx, fnIx) { return -1 }
-  const rt = holeOperandTyOf(arrIx, fnIx)
-  if rt < 0 { return holeArrElemPinTyOf(arrIx, fnIx) }
+  const ax = unwrapParen(arrIx)
+  if ax < 0 || !tyHasTyVar(nodeTyIxOf(ax)) { return -1 }
+  const rt = elabClosedTyAt(ax, fnIx)
+  if rt < 0 || !(tyAt(rt) is TyArray) { return -1 }
   tyStepElem(rt)
 }
 
@@ -8762,7 +8744,7 @@ function exprIsLitAtomIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
   if arrElemLitUnionTy(e.idxArr, fnIx) >= 0 { return true }
   // A list whose element is `string` or `string | null` holds refs, whatever a write of a
   // type parameter narrowed the read to (D3198).
-  const recvTy = nonNullTy(nodeTyPinIxOf(e.idxArr))
+  const recvTy = nonNullTy(nodeTyInOf(e.idxArr, fnIx))
   if recvTy >= 0 && recvTy < T.tys.length {
     const recvEl = tyArrayElemIx(recvTy)
     if recvEl >= 0 && tyPrimNameOf(nonNullTy(recvEl)) == "string" {
@@ -8935,7 +8917,7 @@ export function exactOperandTyOf(exprIx: i32, fnIx: i32): i32 {
 export function instanceReadTyOf(exprIx: i32, fnIx: i32): i32 {
   const st = exactOperandTyOf(exprIx, fnIx)
   if st >= 0 { return st }
-  const pt = nodeTyPinIxOf(unwrapParen(exprIx))
+  const pt = nodeTyInOf(unwrapParen(exprIx), fnIx)
   if pt >= 0 && pt < T.tys.length && !(tyAt(pt) is TyVar) { return pt }
   const ht = holeOperandTyOf(exprIx, fnIx)
   if ht >= 0 { return ht }
@@ -8987,19 +8969,13 @@ function holeJoinArmsAllAtom(ix: i32, fnIx: i32, depth: i32): boolean {
   true
 }
 
-// The element type iterable `iterIx` holds at the pin of the instance `fnIx` is: the hole and
-// exact rungs, an instance parameter's annotation, a local's own or its initializer's recorded
-// type, else its recorded element's hole. -1 anywhere else. Needs no locals table.
+// The element type iterable `iterIx` holds at instance `fnIx`: its recorded list type where that
+// is closed, else the instance's elaboration of it. -1 anywhere else.
 export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
   if fnIx < 0 { return -1 }
-  const own = holeOperandTyOf(iterIx, fnIx)
-  if own >= 0 { return tyStepElem(own) }
-  const ex = exactOperandTyOf(iterIx, fnIx)
-  if ex >= 0 { return tyStepElem(ex) }
-  // The iterable's recorded type through the binding chain of the instances `fnIx` is lifted
-  // inside, as the iterable's index read is typed: one rule for any spelling (D3842).
-  const rec = nodeTyAt(unwrapParen(iterIx), fnIx)
-  // A list over holes a hole instance binds, such as an `if` join of two of its lists (D10794).
+  const ax = unwrapParen(iterIx)
+  if ax < 0 { return -1 }
+  const rec = nodeTyAt(ax, fnIx)
   if (
     rec >= 0
     && rec < T.tys.length
@@ -9008,115 +8984,8 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
   ) {
     return tyStepElem(rec)
   }
-  // A captured list of an enclosing hole instance's hole, which no pin row binds (D3831).
-  const ci = nodeAt(unwrapParen(iterIx))
-  if ci is Ident {
-    if capturedKindOf(fnIx, ci.identName) != null {
-      const ch = holeCaptureArrElemTyOf(iterIx, fnIx)
-      if ch >= 0 { return ch }
-    }
-  }
-  // A loop variable over a list of lists holds its iterable's element at the pin (D3115).
-  const lv = loopVarElemPinTyOf(iterIx, fnIx)
-  if lv >= 0 && !tyHasTyVar(lv) { return tyStepElem(lv) }
-  const n = nodeAt(unwrapParen(iterIx))
-  const fn = nodeAt(fnIx)
-  if n is Ident {
-    if fn is FuncDecl {
-      let et = -1
-      const pt = paramTypeNodeOfRead(fnIx, iterIx)
-      if pt >= 0 {
-        et = tyStepElem(monoParamPinTy.get(pt) ?? nodeTyIxOf(pt))
-      } else {
-        const li = bodyLetOfRead(fn.fnBody, unwrapParen(iterIx))
-        if li >= 0 {
-          const d = nodeAt(li)
-          if d is LetDecl {
-            if d.letType >= 0 {
-              et = tyStepElem(nodeTyIxOf(d.letType))
-            } else if d.letInit >= 0 {
-              et = tyStepElem(nodeTyAt(d.letInit, fnIx))
-              // An un-annotated rebind of another pinned list holds what that one does.
-              if et >= 0 && tyHasTyVar(et) {
-                et = iterElemPinTy(d.letInit, fnIx)
-              }
-            }
-          }
-        }
-      }
-      if et >= 0 && !tyHasTyVar(et) { return et }
-    }
-  }
-  // A list literal of the instance's own parameter, `[x, x]`, holds that parameter's pin.
-  if n is ArrayLit {
-    const ln = arrLitSameIdentName(n.arrElems)
-    const lpt = if ln == "" { -1 } else { paramTypeNodeOfRead(fnIx, n.arrElems[0]) }
-    if lpt >= 0 {
-      const lp = monoParamPinTy.get(lpt) ?? nodeTyIxOf(lpt)
-      if lp >= 0 && !tyHasTyVar(lp) { return lp }
-    }
-    // A literal of other reads, `[l[0]]` or `[y]`, holds what they hold there (D3066).
-    const rp = arrLitReadsPinTy(n.arrElems, fnIx)
-    if rp >= 0 { return rp }
-  }
-  // A `.filter` or `.slice` holds its receiver's elements.
-  if n is Call && n.callFn >= 0 {
-    const cm = nodeAt(n.callFn)
-    if cm is Member {
-      if cm.memProp == "filter" || cm.memProp == "slice" {
-        const rt = iterElemPinTy(cm.memObj, fnIx)
-        if rt >= 0 { return rt }
-      }
-      if cm.memProp == "map" && n.callArgs.length == 1 {
-        const mt = mapCbResultPinTy(n.callArgs[0], cm.memObj, fnIx)
-        if mt >= 0 { return mt }
-      }
-    }
-  }
-  if monoHoleSubN.length == 0 { return -1 }
-  const hv = nodeArrayElemTyIx(iterIx)
-  if hv < 0 || hv >= T.tys.length || !(tyAt(hv) is TyVar) { return -1 }
-  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
-  if row < 0 || row >= monoHoleSubN.length { return -1 }
-  const b = holePinReadOf(hv, monoHoleSubN[row], monoHoleSubT[row])
-  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
-  b
-}
-
-// What an inline `.map` callback returns at the pin of the instance `fnIx` is: its own element
-// parameter holds the receiver's element, any other read answers as `valueReadPinTy` does. -1
-// for a callback that is not an inline lambda returning one such read.
-function mapCbResultPinTy(cbIx: i32, recvIx: i32, fnIx: i32): i32 {
-  const cx = unwrapParen(cbIx)
-  if cx < 0 { return -1 }
-  const cb = nodeAt(cx)
-  if !(cb is FuncDecl) { return -1 }
-  // A declared return is the result's element, which may be wider than what the body returns.
-  if cb.fnRet >= 0 { return mapCbDeclRetPinTy(nodeTyIxOf(cb.fnRet), fnIx) }
-  const rx = unwrapParen(fnRetExprOf(cx))
-  if rx < 0 { return -1 }
-  const rn = identNameOrEmpty(rx)
-  if rn != "" {
-    const pi = paramIndexOf(cx, rn)
-    if pi == 0 { return iterElemPinTy(recvIx, fnIx) }
-    if pi > 0 { return -1 }
-  }
-  valueReadPinTy(rx, fnIx, 0)
-}
-
-// The one type every element of `elems` holds at the pin of the instance `fnIx` is, each an
-// element read or a name (`valueReadPinTy`); -1 when one answers none or they differ.
-function arrLitReadsPinTy(elems: i32[], fnIx: i32): i32 {
-  if elems.length == 0 { return -1 }
-  const t0 = valueReadPinTy(elems[0], fnIx, 0)
-  if t0 < 0 { return -1 }
-  let i = 1
-  while i < elems.length {
-    const ti = valueReadPinTy(elems[i], fnIx, 0)
-    if ti < 0 || (ti != t0 && !tyEq(ti, t0)) { return -1 }
-    i = i + 1
-  }
-  t0
+  const el = elabClosedTyAt(ax, fnIx)
+  if el >= 0 && tyAt(el) is TyArray { tyStepElem(el) } else { -1 }
 }
 
 // `holeOperandTyOf` of `ix`, or of the name it reads asked of each enclosing frame that
@@ -9152,39 +9021,17 @@ function captureDeclFrames(ix: i32, fnIx: i32): i32[] {
   out
 }
 
-// The type the read `ix` holds at the pin of the instance `fnIx` is: an element read's list
-// element (`iterElemPinTy`), a parameter's pin, a local's annotation or initializer, or a loop
-// variable's list element. -1 for any other node, or where the type still names a type parameter.
-export function valueReadPinTy(ix: i32, fnIx: i32, depth: i32): i32 {
+// The type the read `ix` (an element read or a name) holds at instance `fnIx`: its recorded type
+// where closed, else the instance's elaboration of it. -1 for any other node, or where the
+// type still names a type parameter.
+export function valueReadPinTy(ix: i32, fnIx: i32, _depth: i32): i32 {
   const rx = unwrapParen(ix)
-  if rx < 0 || fnIx < 0 || depth > 4 { return -1 }
+  if rx < 0 || fnIx < 0 { return -1 }
   const n = nodeAt(rx)
-  if n is Index { return iterElemPinTy(n.idxArr, fnIx) }
-  if !(n is Ident) { return -1 }
-  const fn = nodeAt(fnIx)
-  if !(fn is FuncDecl) { return -1 }
-  const pt = paramTypeNodeOfRead(fnIx, rx)
-  if pt >= 0 {
-    const pp = monoParamPinTy.get(pt) ?? nodeTyIxOf(pt)
-    if pp >= 0 && !tyHasTyVar(pp) { return pp }
-    return -1
-  }
-  const li = bodyLetOfRead(fn.fnBody, rx)
-  if li < 0 {
-    const lv = loopVarElemPinTyOf(rx, fnIx)
-    if lv >= 0 && !tyHasTyVar(lv) { return lv }
-    return -1
-  }
-  const d = nodeAt(li)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = nodeTyIxOf(d.letType)
-      if lt >= 0 && !tyHasTyVar(lt) { return lt }
-      return -1
-    }
-    return valueReadPinTy(d.letInit, fnIx, depth + 1)
-  }
-  -1
+  if !(n is Index) && !(n is Ident) { return -1 }
+  const rec = nodeTyAt(rx, fnIx)
+  if rec >= 0 && rec < T.tys.length && !tyHasTyVar(rec) { return rec }
+  elabClosedTyAt(rx, fnIx)
 }
 
 // The type the for-in loop variable `exprIx` names holds at the pin of the instance `fnIx` is,
@@ -9199,23 +9046,22 @@ export function loopVarPinTyOf(exprIx: i32, fnIx: i32): i32 {
   t
 }
 
-// `loopVarPinTyOf` for a list of any cells: the element the loop variable's list holds at the
-// instance's pin, or -1.
+// `loopVarPinTyOf` for a list of any cells: the type an open for-in loop variable read holds at
+// instance `fnIx`, from the elaboration, or -1.
 export function loopVarElemPinTyOf(exprIx: i32, fnIx: i32): i32 {
   const ix = unwrapParen(exprIx)
   if ix < 0 || fnIx < 0 || !(nodeAt(ix) is Ident) { return -1 }
   const rt = nodeTyIxOf(ix)
   if rt < 0 || rt >= T.tys.length || !tyHasTyVar(rt) { return -1 }
   const fn = nodeAt(fnIx)
-  if fn is FuncDecl {
-    if paramIndexOf(fnIx, identNameOrEmpty(ix)) >= 0 { return -1 }
-    if bodyLetOfRead(fn.fnBody, ix) >= 0 { return -1 }
-    const lp = frameElemLoopOfRead(fn.fnBody, ix)
-    if lp < 0 { return -1 }
-    const fl = nodeAt(lp)
-    if fl is ForIn { return iterElemPinTy(fl.fiIter, fnIx) }
+  if !(fn is FuncDecl) || frameElemLoopOfRead(fn.fnBody, ix) < 0 { return -1 }
+  if (
+    paramIndexOf(fnIx, identNameOrEmpty(ix)) >= 0
+    || bodyLetOfRead(fn.fnBody, ix) >= 0
+  ) {
+    return -1
   }
-  -1
+  elabClosedTyAt(ix, fnIx)
 }
 
 // Whether Ident `ix` is a for-in loop variable of body `bodyIx` whose list holds `i32` cells, not
@@ -10854,7 +10700,7 @@ function exprUnionIf(exprIx: i32, fnIx: i32): boolean {
   // where no narrow is active, while `emitIfExpr` lowers the join as the member (D2264). Not
   // in a generic body, whose narrowed list arm is typed at the parameter and lowers as the box.
   const iuTv = ifThenValueIx(exprIx)
-  let ijp = nodeTyPinIxOf(exprIx)
+  let ijp = nodeTyInOf(exprIx, fnIx)
   // Inside an instance a join over its type parameters is read at the pin, where it can be
   // the one primitive both bind (D3528).
   if ijp >= 0 && tyHasTyVar(ijp) {
@@ -13467,7 +13313,7 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
     const nd = repOfNodeAt(exprIx, nrt)
     if nd.rdCovered == 1 && vkListClass(nd.rdKind) == 1 { return nd.rdKind }
   }
-  const pin = nodeTyPinIxOf(exprIx)
+  const pin = nodeTyInOf(exprIx, fnIx)
   const raw = nodeTyIxOf(exprIx)
   const e = nodeAt(exprIx)
   if pin >= 0 && pin == raw {

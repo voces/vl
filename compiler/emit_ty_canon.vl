@@ -13,9 +13,8 @@ import {
   Param,
   nodeAt,
 } from "./ast"
-import { holePinReadOf } from "./check_emit_queries"
 import { nodeTyPinIxOf } from "./check_hole_pins"
-import { elabInstTyAt, elabNodeTyAt } from "./emit_elab"
+import { elabInstTyAt, elabKeyAt, elabNodeTyAt } from "./emit_elab"
 import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { nodeTyIsNullable, nodeTyIxOf } from "./check_node_tys"
 import { cexLitPeel } from "./check_num_lits"
@@ -54,7 +53,7 @@ import {
   strLess,
   unwrapParen,
 } from "./emit_base"
-import { fnStmtsPosOf, nodeTyAt, readNarrowedTyAt } from "./emit_capture_frames"
+import { nodeTyAt, readNarrowedTyAt } from "./emit_capture_frames"
 import { vkListClass } from "./emit_list_rep"
 import { mvUnionIsScalarNull } from "./emit_map_value_slots"
 import { mapMonoShapeOfKey, mvSlotOfValTyK } from "./emit_mv_slots"
@@ -75,31 +74,18 @@ import {
   MVK_I64,
   MVK_UNION,
   VKind,
-  fnParent,
-  fnStmts,
   mTwinCodes,
   mTwinExtra,
   mTwinShapes,
   mTwinTys,
   monoHoleSubN,
-  monoHoleSubRow,
-  monoHoleSubT,
   monoParamPinTy,
-  monoPinSubN,
-  monoPinSubOwn,
-  monoPinSubRow,
-  monoPinSubT,
   mvValKind,
   uVarTyIx,
 } from "./emit_state"
 import { unMemIsMap, unMemPeelAliasWrapper } from "./emit_union_registry"
 import { i32ListHas } from "./listutil"
-import {
-  bindGenWalk,
-  substTyDeep,
-  substTyDeepOf,
-  tyProvesNonNull,
-} from "./check_relate_core"
+import { bindGenWalk, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
   tyEmitPrimOf,
@@ -107,23 +93,11 @@ import {
   tyMapValOf,
 } from "./tyquery"
 
-// `t` through row `row` of `monoPinSubN`/`monoPinSubT`, at that row's owner (D9190).
-export function pinSubAt(t: i32, row: i32): i32 {
-  substTyDeepOf(t, monoPinSubN[row], monoPinSubT[row], monoPinSubOwn[row])
-}
-
 // `ty` at the pin of the instance `fnIx` is, or is lifted inside: its type parameters or holes
 // bound to this instance's pins; -1 where one stays open.
 export function instanceTyOf(ty: i32, fnIx: i32): i32 {
   if ty < 0 || !tyHasTyVar(ty) { return ty }
-  const st = elabInstTyAt(ty, fnIx)
-  if st >= 0 { return st }
-  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
-  const hrow = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
-  if hrow < 0 || hrow >= monoHoleSubN.length { return -1 }
-  const b = holePinReadOf(ty, monoHoleSubN[hrow], monoHoleSubT[hrow])
-  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
-  b
+  elabInstTyAt(ty, fnIx)
 }
 
 // Whether a `for` range's step is a constant the emitter FOLDS — absent (the implicit `+1`),
@@ -233,19 +207,6 @@ export function coalesceRetypedAtomToStr(exprIx: i32, fnIx: i32): boolean {
   }
   tyIsLitUnionOrLit(nodeTyAt(unwrapParen(e.binLeft), fnIx))
     && tyPrimNameOf(nodeTyPinIxOf(exprIx)) == "string"
-}
-
-// The type an instance pins the `??` operand `lhsIx` to, when the generic body records it at
-// a type parameter; -1 otherwise.
-export function coalesceOperandPinTy(lhsIx: i32, fnIx: i32): i32 {
-  const h = holeOperandTyOf(lhsIx, fnIx)
-  if h >= 0 { return h }
-  const own = nodeTyIxOf(lhsIx)
-  if own < 0 || own >= T.tys.length { return -1 }
-  if !(tyAt(own) is TyVar) { return -1 }
-  const p = nodeTyPinIxOf(lhsIx)
-  if p == own { return -1 }
-  p
 }
 
 // Whether `ty` is `<prim> | null`.
@@ -789,7 +750,7 @@ export function pinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
   if n is Ident {
     if readNarrowedTyAt(ax, fnIx) >= 0 { return -1 }
     const ptn = paramTypeNodeOfRead(fnIx, ax)
-    if ptn >= 0 { return monoParamPinTy.get(ptn) ?? -1 }
+    if ptn >= 0 { return elabClosedTyAt(ax, fnIx) }
     if fnIx >= 0 {
       const fd = nodeAt(fnIx)
       if fd is FuncDecl {
@@ -810,16 +771,7 @@ export function pinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
 // checker typed once at its parameters and the emitter lowers at a pin.
 export function fnInPinnedInstance(fnIx: i32): boolean {
   if fnIx < 0 { return false }
-  let pos = fnStmtsPosOf(fnIx)
-  let guard = 0
-  while pos >= 0 && guard <= fnStmts.length {
-    if (monoPinSubRow.get(pos) ?? -1) >= 0 { return true }
-    if (monoHoleSubRow.get(pos) ?? -1) >= 0 { return true }
-    if pos >= fnParent.length { return false }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  false
+  elabKeyAt(fnIx) != -1
 }
 
 // Node `ix`'s type at the instance `fnIx` as that instance's elaboration closes it; -1 where it
@@ -887,32 +839,7 @@ export function nodeTyInOf(ix: i32, fnIx: i32): i32 {
 // variables only to types that are themselves open.
 export function instanceBindsNothingClosed(ty: i32, fnIx: i32): boolean {
   if fnIx < 0 { return true }
-  if elabInstTyAt(ty, fnIx) >= 0 { return false }
-  let pos = fnStmtsPosOf(fnIx)
-  let guard = 0
-  let cur = ty
-  let rows = 0
-  while pos >= 0 && guard <= fnStmts.length {
-    const pr = monoPinSubRow.get(pos) ?? -1
-    if pr >= 0 && pr < monoPinSubN.length {
-      rows = rows + 1
-      cur = pinSubAt(cur, pr)
-      if cur < 0 { return false }
-    }
-    const hr = monoHoleSubRow.get(pos) ?? -1
-    if hr >= 0 && hr < monoHoleSubN.length {
-      rows = rows + 1
-      for b in monoHoleSubT[hr] {
-        if b >= 0 && b < T.tys.length && tyHasTyVar(b) { return true }
-      }
-      cur = substTyDeep(cur, monoHoleSubN[hr], monoHoleSubT[hr])
-      if cur < 0 { return false }
-    }
-    if pos >= fnParent.length { break }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  rows == 0 || (cur != ty && tyHasTyVar(cur))
+  elabInstTyAt(ty, fnIx) < 0
 }
 
 // The checked-rep column read inside function `fnIx`: node `ix`'s rep at the type its instance
@@ -989,29 +916,9 @@ export function valueJoinArmValues(ix: i32): i32[] {
   arms
 }
 
-// A callback's declared return `at` at the pin of the instance `fnIx`: itself when it names no
-// type parameter, else its substitution by the instance's exact bindings; -1 otherwise.
-export function mapCbDeclRetPinTy(at: i32, fnIx: i32): i32 {
-  if at < 0 { return -1 }
-  if !tyHasTyVar(at) { return at }
-  elabInstTyAt(at, fnIx)
-}
-
 // A hole read (`v.q` in `function g(v)`) whose pin in instance `fnIx` admits no `null` (D4637).
 export function holePinProvesNonNull(ix: i32, fnIx: i32): boolean {
   tyProvesNonNull(nodeTyInOf(ix, fnIx))
-}
-
-// The name every element of `elems` reads, all one bare Ident; "" otherwise.
-export function arrLitSameIdentName(elems: i32[]): string {
-  if elems.length == 0 { return "" }
-  const name = identNameOrEmpty(unwrapParen(elems[0]))
-  let i = 1
-  while i < elems.length {
-    if identNameOrEmpty(unwrapParen(elems[i])) != name { return "" }
-    i = i + 1
-  }
-  name
 }
 
 // Whether node `ix` is an `if` or `match` in value position, whose value joins its arms.

@@ -60,6 +60,7 @@ import {
   elabCallT,
   elabCalleeTargets,
   elabCapBegin,
+  elabCapCtx,
   elabCapDeadDiags,
   elabCapDeadDiagsSet,
   elabCapDeadIx,
@@ -94,6 +95,7 @@ import {
   elabSnapKey,
   elabTyClosed,
   fnTagCallArms,
+  fnTagSetIsTagged,
   fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
@@ -130,6 +132,7 @@ import { popScope } from "./check_narrow_flow"
 import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 import {
   mintFactNote,
+  mintParamFwdNote,
   mintParamSetNote,
   mintReset,
   mintScopeAt,
@@ -201,6 +204,9 @@ export let elabNodeTys: {[i32]: i32[]} = Map()
 let elabNodeReps: {[i32]: i32[]} = Map()
 // Literal → [key, union, ...]: the union each instance's elaboration adopted it into an arm of.
 let elabNodeRepUnions: {[i32]: i32[]} = Map()
+
+// Node → (instance key, the destination type it is delivered at there) pairs.
+let elabNodeCtxs: {[i32]: i32[]} = Map()
 // Narrowed read → [key, storage type, ...]: what each instance's re-check read it out of.
 let elabNodeNarrowed: {[i32]: i32[]} = Map()
 // The type the checker left on each node, taken before the emitter's passes rewrite any body; a
@@ -227,11 +233,15 @@ function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
 }
 
 // Per declaration: 1 when its body tests a value of a type parameter, directly or by handing one
-// to a generic that does; 0 when not. A declaration on the walk's stack reads as "no".
+// to a generic that does; 0 when not; 2 for a "no" that read a declaration still on the walk's
+// stack, which stands for the rest of that walk and is settled at its root.
 let elabExactMemo: {[i32]: i32} = Map()
 let elabExactOnStack: {[i32]: boolean} = Map()
+let elabExactDepth = 0
+let elabExactPending: i32[] = []
 
-// Whether generic `decl`'s body tests a value whose type names a type parameter (D2684).
+// Whether generic `decl`'s body tests a value whose type names a type parameter (D2684). A root
+// walk's "no" means nothing it reached tests one; its "yes" drops the provisional answers.
 export function elabTestsTyVar(decl: i32): boolean {
   if decl < 0 || decl >= P.nodes.length { return false }
   const m = elabExactMemo.get(decl) ?? -1
@@ -240,20 +250,21 @@ export function elabTestsTyVar(decl: i32): boolean {
   const fn = nodeAt(decl)
   if !(fn is FuncDecl) { return false }
   elabExactOnStack.set(decl, true)
+  elabExactDepth = elabExactDepth + 1
   const r = elabTestsTyVarIn(fn.fnBody)
+  elabExactDepth = elabExactDepth - 1
   elabExactOnStack.set(decl, false)
-  if r || !elabExactCycleOpen() {
+  if r || elabExactDepth == 0 {
     elabExactMemo.set(decl, if r { 1 } else { 0 })
+  } else {
+    elabExactMemo.set(decl, 2)
+    elabExactPending.push(decl)
+  }
+  if elabExactDepth == 0 {
+    for d in elabExactPending { elabExactMemo.set(d, if r { -1 } else { 0 }) }
+    elabExactPending = []
   }
   r
-}
-
-// Whether a declaration is still on the walk's stack, so a "no" read off it is provisional.
-function elabExactCycleOpen(): boolean {
-  for k in elabExactOnStack.keys() {
-    if elabExactOnStack.get(k) ?? false { return true }
-  }
-  false
 }
 
 // Whether node `ix`'s recorded type names a type parameter.
@@ -939,6 +950,9 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   }
   if elabRepresenting || (from >= 0 && (elabReprKeys[from] ?? false)) {
     elabReprKeys[k] = true
+  }
+  if elabSigAlting || (from >= 0 && (elabSigAltKeys[from] ?? false)) {
+    elabSigAltKeys[k] = true
   }
   const kk = i32ToStr(parent) + "^" + i32ToStr(decl)
   const kids = ekKids[kk] ?? []
@@ -1671,6 +1685,12 @@ function elabOne(k: i32) {
     rs.push(rt)
     elabNodeReps[ix] = rs
   }
+  for ix in elabCapCtx.keys() {
+    const cs = elabNodeCtxs[ix] ?? []
+    cs.push(k)
+    cs.push(elabCapCtx[ix] ?? -1)
+    elabNodeCtxs[ix] = cs
+  }
   for ix in elabCapRepUnion.keys() {
     const us = elabNodeRepUnions[ix] ?? []
     us.push(k)
@@ -1994,6 +2014,7 @@ export function elabMintFacts(): i32 {
         && !i32ListHas(at, kk)
         && !(elabGuessKeys[kk] ?? false)
         && !(elabCbRepKeys[kk] ?? false)
+        && !(elabSigAltKeys[kk] ?? false)
       ) {
         all = false
       }
@@ -2007,10 +2028,34 @@ export function elabMintFacts(): i32 {
 // The instances a list method's callback takes at its set's rep, which the members' calls never
 // reach through the parameter.
 let elabCbRepKeys: {[i32]: boolean} = Map()
+// The instances per signature of the one generic a set holds (`elabSetRepRow`), and those they
+// reach, which a tagged set's calls do not reach.
+let elabSigAltKeys: {[i32]: boolean} = Map()
+let elabSigAlting = false
 
 // Each call `elabMintFacts` noted → the instances it noted it in, and the set it went through.
 let elabMintCalls: {[i32]: i32[]} = Map()
 let elabMintSets: {[i32]: i32} = Map()
+
+// The named function and parameter position argument `ix` of call `p` lands in, as
+// `[decl, index]`, when it is a positional argument of a direct call to an un-annotated
+// parameter; [] otherwise.
+function elabMintFwdTarget(ix: i32, p: i32): i32[] {
+  const none: i32[] = []
+  if p < 0 || p >= P.nodes.length { return none }
+  const pn = nodeAt(p)
+  if !(pn is Call) { return none }
+  const d2 = identDeclOf(parenPeelIx(pn.callFn))
+  if d2 < 0 || d2 >= P.nodes.length { return none }
+  const f2 = nodeAt(d2)
+  if !(f2 is FuncDecl) { return none }
+  const j = i32ListIndexOf(pn.callArgs, ix)
+  if j < 0 || j >= f2.fnParams.length { return none }
+  if j < pn.callArgNames.length && pn.callArgNames[j] != "" { return none }
+  const q = nodeAt(f2.fnParams[j])
+  if !(q is Param) || q.parType >= 0 { return none }
+  [d2, j]
+}
 
 // `elabMintFacts` over the subtree at `ix` of declaration `decl`'s body, nested functions aside.
 function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
@@ -2047,7 +2092,13 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32) {
     const pd = identDeclOf(ix)
     const dn = nodeAt(decl)
     if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
-      mintSetPartialNote(fnTagSetOfTy(elabNodeTy(ix, k)))
+      const st = fnTagSetOfTy(elabNodeTy(ix, k))
+      const to = elabMintFwdTarget(ix, p)
+      if to.length == 2 && st >= 0 {
+        mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
+      } else {
+        mintSetPartialNote(st)
+      }
     }
     return 0
   }
@@ -2125,6 +2176,7 @@ function elabMemberResultAt(d: i32, pTys: i32[]): i32 {
 // Runs the worklist from the generic pass's closed calls.
 export function elabRun() {
   elabCbRepKeys = Map()
+  elabSigAltKeys = Map()
   elabErrors = []
   elabReprKeys = Map()
   elabGuessKeys = Map()
@@ -2134,6 +2186,8 @@ export function elabRun() {
   ekIndex = Map()
   elabExactMemo = Map()
   elabExactOnStack = Map()
+  elabExactDepth = 0
+  elabExactPending = []
   ekKids = Map()
   elabKeyGuess = Map()
   ekParent = []
@@ -2158,6 +2212,7 @@ export function elabRun() {
   elabNodeTys = Map()
   elabNodeReps = Map()
   elabNodeRepUnions = Map()
+  elabNodeCtxs = Map()
   elabNodeNarrowed = Map()
   elabGenTy = []
   elabDeadKs = Map()
@@ -2779,12 +2834,16 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
   if ms.length != 1 || !elabReturnsParam(elabCallDeclOf(ix), names[at]) {
     return 0
   }
+  // A tagged set is keyed by itself, so it has no instance per signature.
+  if fnTagSetIsTagged(fnTagSetOfTy(tys[at])) { return 0 }
   for f in elabMemberSigs(ms[0]) {
     const alt = tys.slice(0, tys.length)
     alt[at] = f
     if tysClosed(alt) {
       elabRepresenting = true
+      elabSigAlting = true
       elabReachNote(-1, elabEnqueue(elabCallDeclOf(ix), names, alt, -1), -1)
+      elabSigAlting = false
       elabRepresenting = false
     }
   }
@@ -3482,6 +3541,12 @@ function elabResultOf(k: i32): i32 {
 }
 
 // The type emitted function `fnIx`'s instance elaboration stamped node `ix` with, or -1.
+// The destination type node `ix` is delivered at in emitted function `fnIx`'s instance, or -1.
+export function elabNodeCtxAt(ix: i32, fnIx: i32): i32 {
+  if ix < 0 || !elabBankHolds(elabNodeCtxs, ix) { return -1 }
+  elabPairIn(elabNodeCtxs, ix, elabKeyAt(fnIx))
+}
+
 export function elabNodeRepAt(ix: i32, fnIx: i32): i32 {
   if ix < 0 { return -1 }
   elabPairIn(elabNodeReps, ix, elabKeyAt(fnIx))
@@ -4081,6 +4146,12 @@ function elabHasPairs(bank: {[i32]: i32[]}, ix: i32): boolean {
 
 // Instance `k`'s entry for node `ix` (or the node it copies) in a `[key, type, ...]` bank; -1
 // for none.
+// Whether `bank` holds a row for node `ix` or for the source node it copies, so a reader can
+// decline before it walks to the instance's key.
+function elabBankHolds(bank: {[i32]: i32[]}, ix: i32): boolean {
+  bank.has(ix) || bank.has(nodeSrc[ix] ?? -1)
+}
+
 function elabPairIn(bank: {[i32]: i32[]}, ix: i32, k: i32): i32 {
   if k < 0 { return -1 }
   let rs = bank[ix] ?? elabFnNone
