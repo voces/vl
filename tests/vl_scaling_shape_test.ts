@@ -1048,14 +1048,14 @@ axis(
 axis(
   "generic pins",
   2.5,
-  "`monoRegisterInstance` re-runs a whole-program pass, or `monoNameWrittenAt` scans the arena, per minted instance (D4607).",
+  "`monoRebuild` re-runs a whole-program pass, or `monoNameWrittenAt` scans the arena, per minted instance (D4607).",
   (d) => twoFiles(d, genPins(400, true), genPins(400, false)),
 );
 
 // 1.73 (0.116G / 0.067G fuel) against master `b05991d98`'s 5.75 (0.385G): a first instance's
 // slot write retired `buildFnMap`'s whole banked prefix, so every instance re-classified every
 // function (D3761). Still super-linear in N through the other whole-program passes of
-// `monoRegisterInstance` (300 reads 2.0, 600 reads 2.76), so a bigger pair needs its own bar.
+// `monoRebuild` (300 reads 2.0, 600 reads 2.76), so a bigger pair needs its own bar.
 axis(
   "generic first instances",
   2.5,
@@ -1065,11 +1065,11 @@ axis(
 
 // S4 of incremental-compilation-design.md: 100 instances beside 200 inferred-return functions.
 // Fuel reads 1.23 (0.614G / 0.498G); master `7fe51e77c` read 3.59 (1.791G), from
-// `monoRegisterInstance` re-running `computeVoidFns` and `computeRetInference` after every instance.
+// `monoRebuild` re-running `computeVoidFns` and `computeRetInference` after every instance.
 axis(
   "generic instances beside inferred returns",
   2.5,
-  "`monoRegisterInstance` (compiler/emit_mono.vl) is re-running the return inference per minted instance instead of once at the end of the walk.",
+  "`monoRebuild` (compiler/emit_mono.vl) is re-running the return inference per minted instance instead of once at the end of the walk.",
   (d) => twoFiles(d, genInstsBesideInferred(100, 200, true), genInstsBesideInferred(100, 200, false)),
 );
 

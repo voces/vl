@@ -3,8 +3,8 @@
 // inference hole the checker pins per call site) into one concrete instance per
 // distinct call-site shape (`monomorphize` → `monoWalk` → `monoInstantiate` →
 // `monoMakeInstance`), plus the callback baking and lambda pinning that
-// specialization needs. It consults the classifiers, registers each minted instance in
-// the function map (`monoRegisterInstance`), and writes no bytes.
+// specialization needs. It consults the classifiers, re-runs the collection passes
+// after minting (`monoRebuild`), and writes no bytes.
 //
 // Function-index stability is the invariant: the first instance replaces the
 // original's `fnStmts` slot, each later distinct shape appends `name$N`, and a
@@ -429,6 +429,9 @@ import {
   monoGradualObjList,
   monoGradualObjLits,
   monoGradualRetPinned,
+  monoHoleSubN,
+  monoHoleSubRow,
+  monoHoleSubT,
   monoInertCalled,
   monoInertValues,
   monoInstFe,
@@ -698,17 +701,30 @@ let monoLamMintedSlots: i32[] = []
 // Never retired, since the instance walks each clone's body once it is registered (D2553).
 let monoLamCloneSlots: i32[] = []
 
+// The arena shape `monoRebuild`'s two whole-program passes are a pure function of:
+// `P.nodes`, `fnStmts` and `fnParent` grow, and `monoArenaTick` counts what lands IN PLACE,
+// which no length can see. Every in-place write in this module calls `monoArenaTouch` or
+// carries an `arena-tick exempt:` line; `tests/vl_mono_arena_tick_test.ts` enforces that.
+let monoArenaTick = 0
+let monoRebuiltStamp = 0 - 1
+
 // `monoProgStmts` indexed by the interned name of each module-scope `LetDecl`, first
 // occurrence winning — `monoModuleLetOf`'s answer whenever the name is one of them. A miss
 // stays -1, the fall-through to `moduleLocalLetOfUnique`. Rebuilt at the one write to
 // `monoProgStmts`, so it carries no row from an earlier compile.
 let monoProgLetBySid: i32[] = []
 
-// The arena's size, a memo key for the walks below that cache a whole-arena answer.
-function monoArenaStamp() { P.nodes.length + fnStmts.length + fnParent.length }
+function monoArenaStamp() {
+  P.nodes.length + fnStmts.length + fnParent.length + monoArenaTick
+}
 
-// Inert: an in-place write once bumped a rebuild stamp no reader keeps; its sites go next.
-function monoArenaTouch() { 0 }
+// Record an in-place write to a node field or to a `fnStmts`/`fnParent` slot: no length
+// moves, so the stamp needs the count to see it. Every such write in this module calls it,
+// and it drops the capture memo `monomorphize` runs under for the same reason.
+function monoArenaTouch() {
+  monoArenaTick = monoArenaTick + 1
+  capMemoNoteEdit()
+}
 
 // D1046 — is this the first instance of the generic being built? Read by the nested
 // named-function arm alone: at `count == 0` the instance reuses the template's own
@@ -6218,14 +6234,17 @@ function monoPinMapLambdas(
   ix
 }
 
-// Extend the name→index map over the instances minted since the last call, which the walk
-// resolves by name before collection runs.
-function monoRegisterInstance() {
+// Extend the name→index map over a new instance in `fnStmts`, which the walk resolves by name
+// before collection runs. It reads the arena alone, so an unmoved stamp means it is in hand.
+function monoRebuild() {
+  const stamp = monoArenaStamp()
+  if stamp == monoRebuiltStamp { return 0 }
   fmResumeArmed = true
   const bfmRc = buildFnMap(monoProgStmts)
   fmResumeArmed = false
   if bfmRc < 0 { return -1 }
   capMemoNoteEdit()
+  monoRebuiltStamp = stamp
   0
 }
 
@@ -9484,6 +9503,9 @@ export function monoStateReset() {
 
 // Empties the instance-binding tables, which `monomorphize` fills and the classifiers read.
 export function monoSubTablesReset() {
+  monoHoleSubRow = Map()
+  monoHoleSubN = []
+  monoHoleSubT = []
   monoInstOwn = ""
   monoArgInstFe = Map()
   monoOpenArgCall = 0 - 1
@@ -10292,13 +10314,15 @@ function monoTwoListOf(r: i32): i32 {
 }
 
 // Records a new instance under `key` in the registry, with the side tables keyed by its
-// slot `instFe`: the two-list result type.
+// slot `instFe`: the two-list result type and the hole binding row.
 function monoMakeInstanceRegister(
   key: string,
   origFe: i32,
   instName: string,
   instFe: i32,
   twoListTy: i32,
+  instHoleN: string[],
+  instHoleT: i32[],
 ) {
   monoKeys.push(key)
   monoInstOrig.push(origFe)
@@ -10306,6 +10330,11 @@ function monoMakeInstanceRegister(
   monoInstFe.push(instFe)
   monoLastInstFe = instFe
   if twoListTy >= 0 { monoTwoListRet.set(instFe, twoListTy) }
+  if instHoleN.length > 0 {
+    monoHoleSubRow.set(instFe, monoHoleSubN.length)
+    monoHoleSubN.push(instHoleN)
+    monoHoleSubT.push(instHoleT)
+  }
   while fnInstOrigin.length <= instFe { fnInstOrigin.push(-1) }
   if instFe != origFe {
     fnInstOrigin[instFe] = origFe
@@ -10362,7 +10391,7 @@ function monoMakeInstanceWalk(
     }
     pass = pass + 1
   }
-  if monoRegisterInstance() < 0 { return -1 }
+  if monoRebuild() < 0 { return -1 }
   0
 }
 
@@ -10931,13 +10960,21 @@ function monoMakeInstanceGo(
     // REGISTER before walking the body, so a recursive self-call at the same
     // shape resolves here instead of recursing (the host's discipline).
     if !monoTypedKeys.has(typedKey) { monoTypedKeys.set(typedKey, k.key) }
-    monoMakeInstanceRegister(k.key, origFe, instName, instFe, twoListTy)
+    monoMakeInstanceRegister(
+      k.key,
+      origFe,
+      instName,
+      instFe,
+      twoListTy,
+      holeN,
+      holeT,
+    )
     elabSlotNote(instFe, ek)
     // arena-tick exempt: read only by monoElabSplitKey, never by the four rebuild passes
     monoKeyEk[k.key] = ek
     monoKeyPins[k.key] = pinnedTyIx
     monoNoteOpenArgs(calleeIx, instFe)
-    if monoRegisterInstance() < 0 { return elabWalkPop() - 1 }
+    if monoRebuild() < 0 { return elabWalkPop() - 1 }
     const walked = monoMakeInstanceWalk(fn, origFe, nfn, calleeIx, lamClones)
     elabWalkPop()
     return walked
@@ -19449,24 +19486,17 @@ function monoElemParamTys(
   pts
 }
 
-const monoNoNames: string[] = []
-const monoNoTys: i32[] = []
-
 // Appends to `bNames`/`bTys` each hole type variable every instance binds to one type, and not
 // already bound there: the instances so far, else the type every call agrees on. A hole two
 // instances or two calls bind apart is left open.
 function monoOneInstHoleBinds(bNames: string[], bTys: i32[]): i32 {
   const seen: {[string]: i32} = Map()
-  for fe in monoInstFe {
-    const ek = if fe >= 0 && fe < fnStmts.length { elabKeyAt(fnStmts[fe]) } else { -1 }
-    const ns = if ek >= 0 && ek < ekNames.length { ekNames[ek] } else { monoNoNames }
-    const ts = if ek >= 0 && ek < ekTys.length { ekTys[ek] } else { monoNoTys }
+  let r = 0
+  while r < monoHoleSubN.length {
+    const ns = monoHoleSubN[r]
+    const ts = monoHoleSubT[r]
     let k = 0
     while k < ns.length && k < ts.length {
-      if ns[k].length == 0 || ns[k][0] != '?' {
-        k = k + 1
-        continue
-      }
       const t = ts[k]
       const prev = seen.get(ns[k]) ?? -1
       if t < 0 {
@@ -19478,6 +19508,7 @@ function monoOneInstHoleBinds(bNames: string[], bTys: i32[]): i32 {
       }
       k = k + 1
     }
+    r = r + 1
   }
   for nm in seen.keys() {
     const t = seen.get(nm) ?? -1
@@ -23226,11 +23257,11 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       monoInstOrig.push(fe)
       monoInstName.push(specName)
       monoInstFe.push(instFe)
-      if monoRegisterInstance() < 0 { return -1 }
+      if monoRebuild() < 0 { return -1 }
       // Walk the ORIGINAL body under this specialization's context so a nested generic call it
       // contains instantiates (idempotent via the registry — the main loop also walks the original).
       if monoWalk(fn.fnBody, nfn) < 0 { return -1 }
-      if monoRegisterInstance() < 0 { return -1 }
+      if monoRebuild() < 0 { return -1 }
     }
   }
   0
@@ -26752,11 +26783,13 @@ function monoSlotParamPins(fe: i32, out: string[]) {
 // bodies are walked as they are created. Usage-gated: a program with no generic
 // declaration and no concrete higher-order function returns immediately.
 export function monomorphize(stmts: i32[]) {
+  monoArenaTick = 0
   monoClashLits = []
   monoCallTpl = Map()
   monoLitDestVariant = Map()
   monoLamCallCallees = []
   monoProgLamNames = []
+  monoRebuiltStamp = 0 - 1
   monoBodyDeclStamp = 0 - 1
   monoGen = []
   monoOrigNode = []
