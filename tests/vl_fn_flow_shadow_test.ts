@@ -75,9 +75,10 @@ function inc(x: i32): i32 { x + 1 }
 print(ap(inc, 2))
 `;
 
-// One binding written with a generic and called at two signatures: the compile that builds
-// splits it into one binding per call type (D3975, `compiler/fn_split.vl`), and the table then
-// agrees with each instance of `id` at the binding and at the write.
+// One binding written with a generic and called at two signatures: the binding reads as its set,
+// whose calls run each member at its own instance (`compiler/check_fn_tag.vl`). The table does
+// not model a tagged set, so it grades the binding as one instance for its two pins, as it does
+// any written binding of generics the tag rule takes.
 const MULTI = `function id<T>(x: T): T { x }
 let k = id
 k = id
@@ -111,8 +112,9 @@ const CASES: [string, string, number, string][] = [
     "MULTI",
     MULTI,
     0,
-    "agree | binding | id$1=1; agree | binding | id=1; agree | write | id$1=1; " +
-    "agree | write | id=1",
+    "disagree: one instance for a class of several pins | binding | id=1; " +
+    "disagree: one instance for a class of several pins | write | id=1; " +
+    "multi-pin: table only | binding | k=1",
   ],
   [
     "H05",
