@@ -47,6 +47,7 @@ import {
   mkCallN,
   mkIdent,
   nodeAt,
+  nodeChildren,
   nodeChildrenPush,
 } from "./ast"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
@@ -239,7 +240,7 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   ftRespine = []
   ftRespineTy = []
   ftWideSeen = false
-  ftFwdFn = ftCallsHandFn(s, calls, mint)
+  ftFwdFn = ftCallsHandFn(rootIx, s, calls, mint)
   if !ftScan(rootIx, s, ds, leaves, ids) { return 0 }
   // The functions written to one `let` must give a call through it one result (D9003), so a
   // set a written `let` holds stays untagged where a call's members split.
@@ -1010,12 +1011,17 @@ function ftJoinSplit(x: i32, sp: i32[], vs: i32[]) {
 let ftFwdFn = false
 
 // Whether a call through set `s` hands on an argument of function type.
-function ftCallsHandFn(s: i32, calls: i32[], mint: i32[]): boolean {
+function ftCallsHandFn(
+  rootIx: i32,
+  s: i32,
+  calls: i32[],
+  mint: i32[],
+): boolean {
   for c in calls {
-    if fnTagCallSetOf(c) == s && ftArgsHoldFn(c, s) { return true }
+    if fnTagCallSetOf(c) == s && ftArgsHoldFn(rootIx, c, s) { return true }
   }
   for r in mint {
-    if mintFactSetOf(r) == s && ftArgsHoldFn(mintFactCallOf(r), s) {
+    if mintFactSetOf(r) == s && ftArgsHoldFn(rootIx, mintFactCallOf(r), s) {
       return true
     }
   }
@@ -1023,13 +1029,20 @@ function ftCallsHandFn(s: i32, calls: i32[], mint: i32[]): boolean {
 }
 
 // Whether call `c` through set `s` has an argument of function type, or one a member hands to a
-// parameter it calls.
-function ftArgsHoldFn(c: i32, s: i32): boolean {
+// parameter it calls; a set of functions read nowhere but as such an argument is an id the
+// arms key.
+function ftArgsHoldFn(rootIx: i32, c: i32, s: i32): boolean {
   if c < 0 || c >= P.nodes.length { return false }
   const cn = nodeAt(c)
   if !(cn is Call) { return false }
   let i = 0
   while i < cn.callArgs.length {
+    const ax = parenPeelIx(cn.callArgs[i])
+    const as = fnTagSetOfTy(nodeTyIxOf(ax))
+    if as >= 0 && as != s && ftSetOnlyArgOf(rootIx, as) {
+      i = i + 1
+      continue
+    }
     const t = nodeTyIxOf(cn.callArgs[i])
     if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc { return true }
     for d in fnTagMembers(s) {
@@ -1045,6 +1058,36 @@ function ftArgsHoldFn(c: i32, s: i32): boolean {
     i = i + 1
   }
   false
+}
+
+// Whether every name read under `rootIx` holding set `as` is a direct argument of a call
+// through a set of functions, or of a named function's parameter that its body never reads.
+function ftSetOnlyArgOf(rootIx: i32, as: i32): boolean {
+  const xs: i32[] = [rootIx]
+  const ps: i32[] = [-1]
+  while xs.length > 0 {
+    const x = xs.pop() ?? -1
+    const p = ps.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Ident && fnTagSetOfTy(nodeTyIxOf(x)) == as {
+        const pn = if p >= 0 { nodeAt(p) } else { n }
+        if !(pn is Call) || !i32ListHas(pn.callArgs, x) { return false }
+        const cf = parenPeelIx(pn.callFn)
+        if (
+          fnTagSetOfTy(nodeTyIxOf(cf)) < 0
+          && !ftParamUnread(ftNamedFn(cf), i32ListIndexOf(pn.callArgs, x))
+        ) {
+          return false
+        }
+      }
+      for k in nodeChildren(x) {
+        xs.push(k)
+        ps.push(x)
+      }
+    }
+  }
+  true
 }
 
 // Whether a call in `body` calls parameter `par` by name.
