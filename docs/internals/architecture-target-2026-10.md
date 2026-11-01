@@ -456,7 +456,7 @@ step may land in slices, each with its own proof.
 
 **Step 6. Narrowing produced once; the checker's write-back rounds shrink.**
 - **Change:** the elaborated read carries its narrowed type and rep change.
-- **Deletes:** emit_narrow_slots.vl, the `pushNarrow*` and restore family, `capNarrowBuild` (both rows) and
+- **Deletes:** the emitter's narrowing in emit_narrow_slots.vl (gone; what remained was local-slot bookkeeping, renamed `emit_local_slots.vl`), the `pushNarrow*` and restore family, `capNarrowBuild` (both rows) and
   `criWalkBlock`'s replay. Write-back `synth*Ann*` passes whose fact the elaboration now holds go too.
 - **Closes:** family F's ledger-disagreement rows (64 open; grade each).
 - **Scoreboard:** check fuel ↓ (fewer re-check rounds), lines ↓.
