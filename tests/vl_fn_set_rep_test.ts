@@ -429,6 +429,38 @@ Deno.test({
   },
 });
 
+// A list of lists of a set handed to a hole parameter whose length the body also reads holds
+// member ids: the length read hands no element on (D14781).
+const LENGTH_READ: string[] = [
+  "function inc4(a) { return a + 1 }",
+  "function take4(v) {",
+  "  if v.length == 2 { print(v[0][1](3)); print(v[1][0](2.5)); return }",
+  "  print(0)",
+  "}",
+  "take4([[inc4, inc4], [inc4]])",
+];
+
+Deno.test({
+  name:
+    "fn-set rep: a nested list handed to a hole parameter whose length is read holds member ids",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-fn-set-rep-" });
+    try {
+      await build(dir, "length", LENGTH_READ);
+      const p = await wasmDis([`${dir}/length.wasm`]);
+      if (!p.success) throw new Error("wasm-dis length failed");
+      const elems = new TextDecoder().decode(p.stdout).split("(elem ").length -
+        1;
+      if (elems !== 0) {
+        throw new Error(`length: want no table elements, got ${elems}`);
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
 // A lambda handed to an un-annotated parameter and called there at two types is a member of the
 // set, called by its declaration rather than through a closure.
 const LAMBDA_MEMBER: string[] = [
