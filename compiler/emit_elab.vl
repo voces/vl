@@ -227,11 +227,15 @@ function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
 }
 
 // Per declaration: 1 when its body tests a value of a type parameter, directly or by handing one
-// to a generic that does; 0 when not. A declaration on the walk's stack reads as "no".
+// to a generic that does; 0 when not; 2 for a "no" that read a declaration still on the walk's
+// stack, which stands for the rest of that walk and is settled at its root.
 let elabExactMemo: {[i32]: i32} = Map()
 let elabExactOnStack: {[i32]: boolean} = Map()
+let elabExactDepth = 0
+let elabExactPending: i32[] = []
 
-// Whether generic `decl`'s body tests a value whose type names a type parameter (D2684).
+// Whether generic `decl`'s body tests a value whose type names a type parameter (D2684). A root
+// walk's "no" means nothing it reached tests one; its "yes" drops the provisional answers.
 export function elabTestsTyVar(decl: i32): boolean {
   if decl < 0 || decl >= P.nodes.length { return false }
   const m = elabExactMemo.get(decl) ?? -1
@@ -240,20 +244,21 @@ export function elabTestsTyVar(decl: i32): boolean {
   const fn = nodeAt(decl)
   if !(fn is FuncDecl) { return false }
   elabExactOnStack.set(decl, true)
+  elabExactDepth = elabExactDepth + 1
   const r = elabTestsTyVarIn(fn.fnBody)
+  elabExactDepth = elabExactDepth - 1
   elabExactOnStack.set(decl, false)
-  if r || !elabExactCycleOpen() {
+  if r || elabExactDepth == 0 {
     elabExactMemo.set(decl, if r { 1 } else { 0 })
+  } else {
+    elabExactMemo.set(decl, 2)
+    elabExactPending.push(decl)
+  }
+  if elabExactDepth == 0 {
+    for d in elabExactPending { elabExactMemo.set(d, if r { -1 } else { 0 }) }
+    elabExactPending = []
   }
   r
-}
-
-// Whether a declaration is still on the walk's stack, so a "no" read off it is provisional.
-function elabExactCycleOpen(): boolean {
-  for k in elabExactOnStack.keys() {
-    if elabExactOnStack.get(k) ?? false { return true }
-  }
-  false
 }
 
 // Whether node `ix`'s recorded type names a type parameter.
@@ -2134,6 +2139,8 @@ export function elabRun() {
   ekIndex = Map()
   elabExactMemo = Map()
   elabExactOnStack = Map()
+  elabExactDepth = 0
+  elabExactPending = []
   ekKids = Map()
   elabKeyGuess = Map()
   ekParent = []
