@@ -19958,13 +19958,9 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
-  if exprIx != listCopyHeld {
-    const lct = listCopyAtNode(exprIx)
-    if lct >= 0 { return emitListCopied(body, exprIx, lct, fnIx) }
-  }
-  if exprIx != fnCloCoerceHeld {
-    const fct = fnCloCoerceAtNode(exprIx)
-    if fct >= 0 { return emitFnCloCoerced(body, exprIx, fnIx) }
+  if exprIx != coerceHeld {
+    const ck = coerceKindAt(exprIx)
+    if ck != "none" { return emitCoerced(body, exprIx, fnIx, ck) }
   }
   if exprIx == isRecvStagedIx {
     fbLocalGet(isRecvStagedSlot)
@@ -27812,8 +27808,54 @@ function listCopyAtNode(ix: i32): i32 {
   listCopyTyOf(o)
 }
 
-// The node `emitListCopied` is emitting before its conversion, or -1.
-let listCopyHeld = -1
+// The coercion a delivery's checker record owes at its node: a list copy into another
+// element's list, or a tagged one-member set's closure at a declared function type.
+type CoerceKind = "none" | "listCopy" | "fnClo"
+
+// The coercion recorded at `ix`, or at the node `ix` stands in for; a list and a function value
+// are never both, so at most one record holds.
+function coerceKindAt(ix: i32): CoerceKind {
+  if listCopyAtNode(ix) >= 0 { return "listCopy" }
+  if fnCloCoerceAtNode(ix) >= 0 { return "fnClo" }
+  "none"
+}
+
+// The node `emitCoerced` is emitting before its conversion, or -1.
+let coerceHeld = -1
+
+// `emitExpr` for a value whose delivery the checker recorded a coercion of kind `ck` at: the
+// value as built, then the one conversion for its kind. Every delivery position lowers it
+// here. Returns 0, or -1 failed.
+function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
+  let fe = -1
+  if ck == "fnClo" {
+    fe = monoCloCoerceFe.get(exprIx) ?? -1
+    if fe < 0 { fe = monoCloCoerceFe.get(nodeSrc[exprIx] ?? -1) ?? -1 }
+    if fe < 0 {
+      return emitFailAt(
+        "emitProgram: a function delivered to a declared function type has no instance there",
+        exprIx,
+      )
+    }
+  }
+  const held = coerceHeld
+  coerceHeld = exprIx
+  const r = emitExpr(body, exprIx, fnIx)
+  coerceHeld = held
+  if r < 0 { return -1 }
+  match ck {
+    "listCopy" => {
+      return emitListCopyTail(body, exprIx, listCopyAtNode(exprIx), fnIx)
+    }
+    "fnClo" => {
+      // The value's id names the one member; its closure at the destination's instance replaces it (D14884).
+      fbDrop()
+      return emitClosureValueCore(body, fe, fnIx)
+    }
+    "none" => {}
+  }
+  0
+}
 
 // The closed function type the tag decision recorded at `ix`, or at the node `ix` stands in for
 // (`nodeSrc`), or -1.
@@ -27825,30 +27867,6 @@ function fnCloCoerceAtNode(ix: i32): i32 {
   fnCloCoerceTyOf(o)
 }
 
-// The node `emitFnCloCoerced` is emitting before its conversion, or -1.
-let fnCloCoerceHeld = -1
-
-// `emitExpr` for a value of a tagged one-member set delivered to a closed function type: the
-// value, whose id names the one member, then that member's closure at the destination's
-// instance (`monoCloCoerceFe`). Returns 0, or -1 failed (D14884).
-function emitFnCloCoerced(body: u8[], exprIx: i32, fnIx: i32): i32 {
-  let fe = monoCloCoerceFe.get(exprIx) ?? -1
-  if fe < 0 { fe = monoCloCoerceFe.get(nodeSrc[exprIx] ?? -1) ?? -1 }
-  if fe < 0 {
-    return emitFailAt(
-      "emitProgram: a function delivered to a declared function type has no instance there",
-      exprIx,
-    )
-  }
-  const held = fnCloCoerceHeld
-  fnCloCoerceHeld = exprIx
-  const r = emitExpr(body, exprIx, fnIx)
-  fnCloCoerceHeld = held
-  if r < 0 { return -1 }
-  fbDrop()
-  emitClosureValueCore(body, fe, fnIx)
-}
-
 // Type `t` at the instance `fnIx` emits, or `t` itself where that instance binds none of it.
 function instTyOrSelf(t: i32, fnIx: i32): i32 {
   if t < 0 || !tyHasTyVar(t) { return t }
@@ -27857,15 +27875,9 @@ function instTyOrSelf(t: i32, fnIx: i32): i32 {
   t
 }
 
-// `emitExpr` for a list value whose delivery the checker recorded as a copy into `lct`: the
-// value at its own row, then converted to the destination's row where the two storages differ.
-// One conversion point for every delivery position. Returns 0, or -1 failed.
-function emitListCopied(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
-  const held = listCopyHeld
-  listCopyHeld = exprIx
-  const r = emitExpr(body, exprIx, fnIx)
-  listCopyHeld = held
-  if r < 0 { return -1 }
+// The conversion of a list value just emitted at its own row into the row of `lct`, the list
+// its delivery copies into, where the two storages differ. Returns 0, or -1 failed.
+function emitListCopyTail(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
   // A scalar list converts each number; a pair no convert serves is delivered as built.
   const sdk = tyPrimLeafListKind(instTyOrSelf(lct, fnIx))
   if sdk != null && sdk != "reflist" && sdk != "strlist" {
@@ -33123,8 +33135,7 @@ export function emitUserGlobalSet(gi: i32) {
 // Puts this module's per-compile stashes, depths and memo cursors back to their declared
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
-  listCopyHeld = -1
-  fnCloCoerceHeld = -1
+  coerceHeld = -1
   arrNewFillDepth = 0
   eqStashL = -1
   eqStashR = -1
