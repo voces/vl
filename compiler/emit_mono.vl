@@ -21682,6 +21682,55 @@ function monoInertArgsStubbed(): i32 {
   0
 }
 
+// The spelling of the closed function type index read `ax` reads from a list binding whose
+// annotation, written or pinned (`monoPinListElems`), closes it, through nested reads and `const`
+// aliases of them, with the type in `out[0]`; "" when `ax` is no such read. The read itself keeps
+// the open element the checker gave it (D9890).
+function monoPinnedListElemPin(ax: i32, out: i32[]): string {
+  let a = unwrapParen(ax)
+  if a < 0 || !(nodeAt(a) is Index) { return "" }
+  let depth = 0
+  let hops = 0
+  let d = -1
+  while d < 0 && a >= 0 && hops < MONO_ALIAS_CHAIN_MAX {
+    hops = hops + 1
+    const an = nodeAt(a)
+    if an is Index {
+      depth = depth + 1
+      a = unwrapParen(an.idxArr)
+    } else if an is Ident {
+      const ad = identDeclOf(a)
+      if ad < 0 { return "" }
+      const adn = nodeAt(ad)
+      if !(adn is LetDecl) { return "" }
+      if adn.letType >= 0 {
+        d = ad
+      } else if adn.letKw == "const" && adn.letInit >= 0 {
+        a = unwrapParen(adn.letInit)
+      } else {
+        return ""
+      }
+    } else {
+      return ""
+    }
+  }
+  if d < 0 { return "" }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) { return "" }
+  let et = nodeTyIxOf(dn.letType)
+  const ePath: string[] = []
+  while ePath.length < depth {
+    if et < 0 || et >= T.tys.length || !(tyAt(et) is TyArray) { return "" }
+    et = tyArrayElemIx(et)
+    ePath.push("e")
+  }
+  if !monoTyClosedFn(et) { return "" }
+  out[0] = et
+  // A call the read reaches past its callee, `g(5)` after `const g = id(v[k])`, takes the pin (D9980).
+  monoRetypePinCalls(d, ePath)
+  monoPinAnnSpelling(et)
+}
+
 // The function type the walk of call `call` pins field `name` of un-annotated parameter `i` of
 // `dn` at, where the argument's own field type `ft` is open, or -1.
 function monoOpenRowFieldTy(
@@ -22250,6 +22299,11 @@ function monoPinHoleParam(
     )
     anTy = pinTy[0]
   }
+  if an == "" {
+    const rowTy: i32[] = [0 - 1]
+    an = monoPinnedListElemPin(args[i], rowTy)
+    anTy = rowTy[0]
+  }
   // An argument open in this frame at a call no instance elaborates at a closed type: no
   // instance is demanded here.
   if an == "" && guessed { return 1 }
@@ -22451,6 +22505,11 @@ function monoPinAnnotatedParam(
       const pinTy: i32[] = [0 - 1]
       an2 = monoOpenFnFlowPin(args[i], ctx, -1, pinTy)
       an2Ty = pinTy[0]
+    }
+    if an2 == "" && ann == tp {
+      const rowTy: i32[] = [0 - 1]
+      an2 = monoPinnedListElemPin(args[i], rowTy)
+      an2Ty = rowTy[0]
     }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
     if ann == tp {
@@ -23039,7 +23098,13 @@ function monoPinTyParamComposite(
       anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
     }
   }
-  const atTy = monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx)
+  // A read out of a list its pin annotated, at any depth, takes the element type (D10310).
+  let atTy = monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx)
+  if annFnSlot && anC == "" {
+    const rowTy: i32[] = [0 - 1]
+    anC = monoPinnedListElemPin(args[i], rowTy)
+    if anC != "" && rowTy[0] >= 0 { atTy = rowTy[0] }
+  }
   // An argument typed at this parameter with the callee's own type parameters still open, as an
   // empty `Map()` or `[]` is, binds them by the call's instance, else at the default (D14735).
   const openArg = !annIsFn && monoTyMentionsTyParam(atTy, fn.fnTyParams)
