@@ -182,6 +182,7 @@ import {
   unkeyedSubscriptNote,
 } from "./check_diag_text"
 import {
+  adoptLitAt,
   boundMembersOf,
   constrainEmptyExpr,
   covarWriteThroughErrAt,
@@ -372,7 +373,11 @@ import {
   prbArmed,
   prbLeave,
 } from "./check_rollback"
-import { mergedDeclKeyOf, moduleNameTyOf } from "./check_scopes"
+import {
+  identBoundFnDeclOf,
+  mergedDeclKeyOf,
+  moduleNameTyOf,
+} from "./check_scopes"
 import { jwRecordSite, noteRetJoin } from "./check_side_rows"
 import { symEnabled } from "./check_state"
 import {
@@ -466,7 +471,22 @@ import {
   wsOrigAnn,
   wsRowOf,
 } from "./check_width"
-import { declFirstParamIsSelf, fnDeclIx } from "./check_write_scan"
+import {
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  CW_UP_OBJ,
+  cwIxBuild,
+  cwIxKind,
+  cwIxNode,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwOccNext,
+  cwOccWalk,
+  declFirstParamIsSelf,
+  fnDeclIx,
+} from "./check_write_scan"
 import { cexFitsSigned, cexOk } from "./const_exact"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
@@ -845,7 +865,8 @@ export function methodDidYouMean(recvTy: i32, prop: string) {
 
 // The argument the call `at` passes for the parameter the read `rx` names, when `rx` reads a
 // parameter of the function `at` calls and that argument is a positional read of a fresh binding
-// (`recFreshDeclOf`); else `rx`. The record solve builds such a binding where the pin delivers it.
+// (`recFreshDeclOf`) or a record literal; else `rx`. The record solve builds it where the pin
+// delivers it.
 function pinArgOfParamRead(rx: i32, at: i32): i32 {
   const p = parenPeelIx(rx)
   if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return rx }
@@ -864,8 +885,51 @@ function pinArgOfParamRead(rx: i32, at: i32): i32 {
   while i < fn.fnParams.length && fn.fnParams[i] != d { i = i + 1 }
   if i >= fn.fnParams.length || i >= c.callArgs.length { return rx }
   const a = c.callArgs[i]
-  if a < 0 || recFreshDeclOf(parenPeelIx(a)) < 0 { return rx }
-  a
+  const ap = if a >= 0 { parenPeelIx(a) } else { -1 }
+  if ap < 0 { return rx }
+  if recFreshDeclOf(ap) >= 0 { return a }
+  // A record literal is built where the pin delivers it, when the parameter never hands the
+  // value back out of the call (D14760).
+  if nodeAt(ap) is ObjLit && paramOnlyDelivered(d) { return a }
+  rx
+}
+
+// Whether parameter `d` is only read for a field or a method, or handed to an annotated parameter
+// of a non-generic function: no use lets the value leave the call.
+function paramOnlyDelivered(d: i32): boolean {
+  cwIxBuild()
+  let used = false
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if u < 0 || u >= cwIxUpKind.length { return false }
+      const k = cwIxUpKind[u]
+      if k == CW_UP_ARG {
+        const cn = nodeAt(cwIxUp[u])
+        const fd = if cn is Call && cn.callFn >= 0 { identBoundFnDeclOf(cn.callFn) } else { -1 }
+        const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+        const ai = cwIxUpAux[u]
+        if (
+          !(f is FuncDecl)
+          || f.fnTyParams.length > 0
+          || ai < 0
+          || ai >= f.fnParams.length
+        ) {
+          return false
+        }
+        const pn = nodeAt(f.fnParams[ai])
+        if !(pn is Param) || pn.parType < 0 { return false }
+      } else if k != CW_UP_OBJ {
+        return false
+      }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
+      return false
+    }
+  }
+  used
 }
 
 // The argument seam's container refusals for a generic body's receiver, re-asked once the
@@ -898,7 +962,12 @@ function ufcsRecvPinSeam(callIx: i32, recvTy: i32, selfTy: i32, at: i32) {
 // The deliveries `calleeFn`'s body recorded at a hole, at this call's bindings: a source the pin
 // makes concrete is asked the direct spelling's record rules, and one still open is recorded
 // for the caller's pins.
-export function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
+export function validateRcwPins(
+  bNames: string[],
+  bTys: i32[],
+  calleeFn: i32,
+  at: i32,
+) {
   if inferQuiet && !cstrProbe { return 0 }
   const n = rcwPinSrc.length
   let i = 0
@@ -913,12 +982,17 @@ export function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
         } else if !inferQuiet && assignable(sub, rcwPinDstTy[i]) {
           // The delivery seam's two record rules, in its order: a shape stored differently,
           // then a widened field something writes.
-          if objShapeAdapterlessAt(rcwPinSrc[i], sub, rcwPinDstTy[i]) {
+          // A parameter read stands for the call's fresh argument, judged where it is built.
+          const sx = pinArgOfParamRead(rcwPinSrc[i], at)
+          if objShapeAdapterlessAt(sx, sub, rcwPinDstTy[i]) {
             objShapeAdapterlessErr(rcwPinSrc[i], sub, rcwPinDstTy[i])
           } else {
-            rcwPend(rcwPinSrc[i], sub, rcwPinDstTy[i])
+            if sx != rcwPinSrc[i] && nodeAt(parenPeelIx(sx)) is ObjLit {
+              adoptLitAt(parenPeelIx(sx), rcwPinDstTy[i])
+            }
+            rcwPend(sx, sub, rcwPinDstTy[i])
             // The record solve judges the pin's value as it does a binding's (D14759).
-            recPend(rcwPinSrc[i], sub, rcwPinDstTy[i], rcwPinSrc[i])
+            recPend(sx, sub, rcwPinDstTy[i], rcwPinSrc[i])
           }
         }
       }
