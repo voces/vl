@@ -1,3 +1,5 @@
+import { recNarrowRecordOf } from "./check_bind_adopt"
+
 // `emit_shape_rows.vl` — the shape and struct rows a spelling, object field set or
 // ref-array element resolves to, and the heap twins of a variant's struct rows.
 
@@ -137,10 +139,8 @@ import {
 import {
   code0KindOf,
   code0TyFitsRow,
-  declRowFnFieldFits,
   declRowFnSpellingFits,
   ercGenKey,
-  nestedAnonRowFits,
   pxCapFor,
   pxSized,
   pxSlotOf,
@@ -193,11 +193,6 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   code0SpellingFitsRow,
-  declNominalOfTy,
-  fieldBoxSetConflict,
-  fieldCodeForMatch,
-  fieldCodeRefsElemHeapC,
-  fieldElemTyOfQueryTy,
   mvArmHintOfShapeTy,
   nameIsRecordSpelling,
   nameIsWholeSpanShape,
@@ -205,7 +200,6 @@ import {
   shapeFieldParse,
   unionMemberSetsCompat,
   variantIndexOfOwnRender,
-  variantRowOfObjFieldSetK,
   variantRowOfOwnRenderTy,
 } from "./emit_field_codes"
 import {
@@ -1672,128 +1666,6 @@ function jrMapValFits(f: i32, elem: string, et: i32): boolean {
   const sb = mvSlotOfMapValNameOrMonoKTys(elem, MAP_KEY_STR, -1, et)
   if sa >= 0 && sb >= 0 { return mvCanonRepOf(sa) == mvCanonRepOf(sb) }
   true
-}
-
-// Are the query field's element and struct row `si` field `fj`'s recorded element proven
-// to be different declarations? Nominal on both sides and refutation-only: an unresolvable
-// side is never a conflict. Nominal, not canon, is the point — `Circle` (a union arm) and
-// its exact layout twin `Dot` share one canon key but are two declarations (DECISIONS.md).
-function fieldElemDeclConflict(qElemTy: i32, si: i32, fj: i32): boolean {
-  let rn = declNominalOfTy(sFieldElemTyIxAt(si, fj))
-  if rn == "" { rn = sFieldElemNameAt(si, fj) }
-  if rn == "" { return false }
-  const qn = declNominalOfTy(qElemTy)
-  if qn != "" { return qn != rn }
-  // A CONTAINER element declares no nominal of its own, so the two keys go to the node
-  // reader's comparator instead of declining — one container or one nesting level at a
-  // time, and lenient wherever it cannot resolve a side (D1697).
-  const qk = tyToNominalName(qElemTy)
-  if qk == "" { return false }
-  if tyNomNameCycled() { return false }
-  !elemRowsCaptureCompat(qk, rn)
-}
-
-// Does struct row `si` carry a PROVEN element-declaration conflict against the query
-// object type's fields, on any of the named-heap field codes or on a union box?
-function rowElemDeclConflicts(si: i32, fnames: string[], ftys: i32[]): boolean {
-  let k = 0
-  while k < fnames.length {
-    const fj = sFieldIndex(si, fnames[k])
-    if fj >= 0 {
-      const code = sFieldTypeAt(si, fj)
-      if code == FC_UNION {
-        if fieldBoxSetConflict(ftys[k], si, fj) { return true }
-      } else if fieldCodeRefsElemHeapC(code) {
-        if fieldElemDeclConflict(fieldElemTyOfQueryTy(ftys[k], code), si, fj) {
-          return true
-        }
-      }
-    }
-    k = k + 1
-  }
-  false
-}
-
-// The struct row whose field set and field codes match the `TyObj` `ty`, or -1; a declining
-// field fails the row rather than matching loosely.
-function structRowOfObjFieldSet(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = tyAt(ty)
-  if t is TyObj {
-    const fnames = t.objFieldNames
-    const ftys = t.objFieldTypes
-    const lim = sScanLim()
-    let first = -1
-    let firstExact = -1
-    let si = 0
-    while si < lim {
-      if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
-        si = si + 1
-        continue
-      }
-      if sFieldCount[si] == fnames.length {
-        let ok = true
-        let k = 0
-        while k < fnames.length {
-          const fj = sFieldIndex(si, fnames[k])
-          if fj < 0 {
-            ok = false
-          } else {
-            const want = fieldCodeForMatch(ftys[k])
-            if want >= 0 {
-              if want != sFieldTypeAt(si, fj) { ok = false }
-              if ok && want == FC_I32 && !code0TyFitsRow(ftys[k], si, fj) {
-                ok = false
-              }
-              if (
-                ok
-                && want == FC_STRUCT
-                && !nestedAnonRowFits(ftys[k], si, fj)
-              ) {
-                ok = false
-              }
-              if ok && !declRowFnFieldFits(ftys[k], si, fnames[k]) {
-                ok = false
-              }
-            } else {
-              // An uncoded field is lenient, matching the render path's `shapeFieldTypeCompatK`
-              // (refutes only proven mismatches), with its one tightening: a code-15 nested-
-              // struct field is checked by canonical rep, so two arms sharing a field-name set
-              // but differing in nested layout cannot collide onto the wrong variant (B190).
-              if sFieldTypeAt(si, fj) == FC_STRUCT {
-                const rowElem = sFieldElemNameAt(si, fj)
-                if rowElem != "" {
-                  const cq = repCanonId(ftys[k])
-                  let cr = repNameCanonId(rowElem)
-                  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
-                  if cq >= 0 {
-                    if cr >= 0 {
-                      if cq != cr { ok = false }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          k = k + 1
-        }
-        if ok {
-          // The element-declaration preference (D94): a named-heap field's code is not its
-          // layout, so two rows agreeing on field set, code and canon key (`{xs: Circle[]}`
-          // vs `{xs: Dot[]}`) still need the query's own element declaration to pick the
-          // right one. A preference, not a refutation: a conflicting row is only outranked.
-          if first < 0 { first = si }
-          if firstExact < 0 {
-            if !rowElemDeclConflicts(si, fnames, ftys) { firstExact = si }
-          }
-        }
-      }
-      si = si + 1
-    }
-    if firstExact >= 0 { return firstExact }
-    return first
-  }
-  -1
 }
 
 // The struct table index a type NAME names: a declared struct name directly, or an INLINE
@@ -5463,13 +5335,9 @@ function shapeNominalRowOf(ty: i32): i32 {
   // signature shares.
   const kr = repRowOfTyStruct(ty, sScanLim())
   if kr >= 0 { return kr }
-  const fs = structRowOfObjFieldSet(ty)
-  if fs >= 0 { return fs }
-  const vr = variantRowOfObjFieldSetK(ty, false)
-  if vr >= 0 { return -2 - vr }
-  // The widened variant pass, below both strict ones (D733).
-  const vw = variantRowOfObjFieldSetK(ty, true)
-  if vw >= 0 { return -2 - vw }
+  // A record narrower than one declared record is stored as it (`recNarrowRecordOf`).
+  const nr = recNarrowRecordOf(ty)
+  if nr >= 0 && !tySame(nr, ty) { return shapeNominalRowOf(nr) }
   -1
 }
 
