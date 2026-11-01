@@ -97,7 +97,7 @@ print(ap(4))
 `;
 
 // An uncalled closure whose tail writes `null` into a captured nullable: the assignment's value
-// is the closure's recorded result, and the emitter makes it void.
+// is the closure's recorded result, which the emitter lowers from the column.
 const TAIL_WRITE = `function nn(v: i32): i32 | null {
   if v < 0 { return null }
   return v
@@ -143,7 +143,7 @@ a(true)
 `;
 
 // D14791: the tail is an \`else\`-less \`if\` writing a \`T\`-function cell. Closed under the binding,
-// the template's result is a function type, while the emitter lowers the lambda void.
+// the template's result is a function type, which the emitter now lowers from the column.
 const IF_ARM_WRITE = `function inner<U>(u: U) { print(u) }
 function other<V>(v: V) { print("O") }
 function c<T>(x: T) {
@@ -239,7 +239,7 @@ Deno.test({
       IF_ARM_WRITE,
       DROP_NONE,
       true,
-      "agree | __lambda_0=1; agree | c=1; agree | inner=1; agree | other=1; recorded value, emitter void | __lambda_1=1",
+      "agree | __lambda_0=1; agree | __lambda_1=1; agree | c=1; agree | inner=1; agree | other=1",
     );
     expectRows(
       "nullable field",
@@ -254,7 +254,7 @@ Deno.test({
       TAIL_WRITE,
       DROP_NONE,
       true,
-      "agree | line=1; agree | nn=1; emit-time: tail assignment lowered void | __lambda_0=1",
+      "agree | __lambda_0=1; agree | line=1; agree | nn=1",
     );
   },
 });
@@ -268,7 +268,8 @@ Deno.test({
       PLAIN,
       DROP_NOTHING,
       false,
-      "no result recorded=2",
+      // The valued function is pinned from its column before the shadow drops it.
+      "no result recorded, annotated=1; no result recorded=1",
     );
     expectRows(
       "annotated, nothing",
