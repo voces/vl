@@ -363,6 +363,7 @@ import {
   vrLits,
   vrReadsInert,
   vrResetFor,
+  vrSetFollow,
   vrStash,
   vrUnstash,
 } from "./value_reach"
@@ -15217,7 +15218,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   if (
     pins.length == 0
     && repoints.length == 0
-    && fnFlowDeclPathUncalled(at, path)
+    && (fnFlowDeclPathUncalled(at, path) || monoLitReachesNoCall(lit, ctx))
   ) {
     return monoUncalledListElems(d, at, lf, lit)
   }
@@ -15382,7 +15383,13 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
     // type its functions hold at no call, as the flat list does.
     const held: i32[][] = []
     for v in vals { held.push([v, ctx]) }
-    if pins.length == 0 && !fnFlowDeclPathUncalled(at, ["e", "e"]) { return 0 }
+    if (
+      pins.length == 0
+      && !fnFlowDeclPathUncalled(at, ["e", "e"])
+      && !monoValsReachNoCall(held)
+    ) {
+      return 0
+    }
     if (pins.length > 1 && !monoValsInert(held)) { return 0 }
     return monoUncalledNestedListElems(d, inner, held)
   }
@@ -17074,7 +17081,10 @@ function monoStoredSlotFnTy(
 ): i32 {
   const at = lf[1]
   let pins = monoDeclPathPins(lf, path)
-  if pins.length == 0 && fnFlowDeclPathUncalled(at, path) {
+  if (
+    pins.length == 0
+    && (fnFlowDeclPathUncalled(at, path) || monoValsReachNoCall(vals))
+  ) {
     return monoUncalledSlotFnTy(vals, spell)
   }
   // Functions whose every read now names its generic are called through no slot.
@@ -17135,6 +17145,41 @@ function monoStoredSlotFnTy(
   for vw in vals { monoRecordOpen(vw[0], ft, vw[1]) }
   spell.push(monoSigFnTyNameAt(pins[0] + ";", fty))
   ft
+}
+
+// `monoValsReachNoCall` over the elements of list literal `lit` written in frame `ctx`; false for
+// an empty literal or one with a spread.
+function monoLitReachesNoCall(lit: ArrayLit, ctx: i32): boolean {
+  const vals: i32[][] = []
+  for e in lit.arrElems {
+    if nodeAt(e) is Spread { return false }
+    vals.push([e, ctx])
+  }
+  monoValsReachNoCall(vals)
+}
+
+// Whether every function value of `vals` reaches no call or observation, written-into containers
+// followed (`vrSetFollow`), over the program the walk indexed; asked of an index of its own.
+function monoValsReachNoCall(vals: i32[][]): boolean {
+  if vals.length == 0 || monoPrimeIndexed || monoReachRoots.length == 0 {
+    return false
+  }
+  vrStash()
+  vrResetFor("monoslot", monoReachStmts, true, false)
+  vrSetFollow()
+  vrIndex(monoReachRoots, [])
+  let ok = true
+  for vw in vals {
+    const x = unwrapParen(vw[0])
+    if (
+      ok
+      && (x < 0 || !(nodeAt(x) is Ident) || !vrInertFor("monoslot", x, ""))
+    ) {
+      ok = false
+    }
+  }
+  vrUnstash()
+  ok
 }
 
 // Whether `vals` (each beside its write's frame) is not empty and each is a name `monoFlowReads`
@@ -17737,6 +17782,10 @@ function monoPushedAdapterClosed(v: i32): boolean {
 // every destination drops it, holds it where no function is read back, or hands it to such a
 // place is inert (D6881, D7000, D7002).
 
+// The program and roots `monoInertReach` indexed, for `monoValsReachNoCall`'s own index.
+let monoReachStmts: i32[] = []
+let monoReachRoots: i32[] = []
+
 // Notes inert each name of a generic function in the program `stmts` and the bodies in
 // `fnStmts` whose value reaches nothing that calls or observes it (`vrInert`).
 function monoInertReach(stmts: i32[]) {
@@ -17744,6 +17793,8 @@ function monoInertReach(stmts: i32[]) {
   const roots: i32[] = []
   for s in stmts { roots.push(s) }
   for f in fnStmts { roots.push(f) }
+  monoReachStmts = stmts
+  monoReachRoots = roots
   monoReachIndex(roots)
 }
 
@@ -26993,6 +27044,8 @@ export function monomorphize(stmts: i32[]) {
   monoStubSlots = []
   monoRetCopyReads = []
   monoInertValues = []
+  monoReachStmts = []
+  monoReachRoots = []
   monoInertCalled = []
   monoInertArgAt = []
   monoInertArgFe = []

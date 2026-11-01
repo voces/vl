@@ -458,7 +458,7 @@ step may land in slices, each with its own proof.
 - **Change:** the elaborated read carries its narrowed type and rep change.
 - **Deletes:** the emitter's narrowing in emit_narrow_slots.vl (gone; what remained was local-slot bookkeeping, renamed `emit_local_slots.vl`), the `pushNarrow*` and restore family, `capNarrowBuild` (both rows) and
   `criWalkBlock`'s replay. Write-back `synth*Ann*` passes whose fact the elaboration now holds go too.
-- **Closes:** family F's ledger-disagreement rows (64 open; grade each).
+- **Closes:** family F's ledger-disagreement rows. Graded by ablation on 2026-11-01 (`family-f-ablation-2026-11.md`): of 86 keyword rows, 57 are clause 1 and fall into ten mechanisms, and only family B, 4 rows (a narrowing that survives a write through an alias: D4084, D4131, D4133, D4134), is the narrowing ledger. The other nine families are routed to the rep, container, generic-instance, `??`, cast and init-order work.
 - **Scoreboard:** check fuel ↓ (fewer re-check rounds), lines ↓.
 
 **Step 7. `repOf(ty)` and one row per canonical type (the L2 end state).**
