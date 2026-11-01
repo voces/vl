@@ -7,7 +7,15 @@ import { BinExpr, Block, Call, FuncDecl, nodeAt } from "./ast"
 import { T, TY_NEVER, TY_VOID, TyFunc, tyAt } from "./check_types"
 import { elabCheckedTyOf, elabKeyAtPos, elabRetOf } from "./emit_elab"
 import { scopeTyAt } from "./emit_capture_frames"
-import { fRetVoid, fnParent, fnStmts, fnStmtsPosOf } from "./emit_state"
+import {
+  emitPhaseReached,
+  fRetVoid,
+  fnParent,
+  fnStmts,
+  fnStmtsPosOf,
+  monoStubSlots,
+} from "./emit_state"
+import { i32ListHas } from "./listutil"
 import { identDeclOf } from "./symbols"
 
 let frsArmed = false
@@ -30,16 +38,25 @@ export function fnRetShadowDropSet(d: i32) {
   0
 }
 
-// The result type emitted function `fe` returns, as recorded: its instance's result when it
-// owns an elaboration slot, its own type inside the instance that holds it, else its checker
-// type. -1 where none is recorded or it is still open.
+// The result type emitted function `fe` returns, as recorded: `void` for a pruned template's
+// stub, its instance's result when it owns an elaboration slot, its own type inside the
+// instance that holds it, else its checker type. -1 where none is recorded or it is still open.
 export function fnRecordedRetTy(fe: i32): i32 {
   if fe < 0 || fe >= fnStmts.length { return -1 }
   const fx = fnStmts[fe]
+  // The stub and elaboration ledgers are this compile's only once `monomorphize` has run; before,
+  // they hold the previous program's, so only the checker's own type answers.
+  if !emitPhaseReached("monomorphized") { return frsFnRet(elabCheckedTyOf(fx)) }
+  // A template no instance replaced is pruned to an empty stub, void as minted.
+  if i32ListHas(monoStubSlots, fe) { return TY_VOID }
   const k = elabKeyAtPos(fe)
   const nested = fe < fnParent.length && fnParent[fe] >= 0
   if k >= 0 && !nested { return elabRetOf(k) }
-  const ft = if k >= 0 { scopeTyAt(fx, fx) } else { elabCheckedTyOf(fx) }
+  frsFnRet(if k >= 0 { scopeTyAt(fx, fx) } else { elabCheckedTyOf(fx) })
+}
+
+// The result of the function type `ft`, or -1 where `ft` is no function type.
+function frsFnRet(ft: i32): i32 {
   if ft < 0 || ft >= T.tys.length { return -1 }
   const f = tyAt(ft)
   if f is TyFunc { return f.fnRet }
@@ -73,6 +90,10 @@ function frsClass(fe: i32): string {
   const nested = fe < fnParent.length && fnParent[fe] >= 0
   if r == TY_NEVER { return "never" }
   if r != TY_VOID && (r < 0 || r >= T.tys.length) {
+    const fn = nodeAt(fnStmts[fe])
+    if fn is FuncDecl {
+      if fn.fnRet >= 0 { return "no result recorded, annotated" }
+    }
     if elabKeyAtPos(fe) >= 0 || nested {
       return "no result recorded, instance or nested"
     }
