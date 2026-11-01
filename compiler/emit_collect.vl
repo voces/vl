@@ -11,7 +11,12 @@
 // feature at all. Each pass below states only its own gate.
 
 import { chainHasPrelude } from "./emit_if_arm_values"
-import { elabLitInstTys, elabNodeTyAt, litRepTyAt } from "./emit_elab"
+import {
+  elabLitInstTys,
+  elabNodeInstTys,
+  elabNodeTyAt,
+  litRepTyAt,
+} from "./emit_elab"
 import {
   nodeTyArrayElemRepName,
   nodeTyIsLitUnionAlias,
@@ -109,6 +114,7 @@ import {
   tyNulInnerIsPrim,
   tyNulInnerTy,
   tyPrimNameOf,
+  tySame,
   tyScalarBasePrim,
   tyToEmitName,
   tyToNominalName,
@@ -206,7 +212,13 @@ import {
   unionStructAliasShape,
   unwrapParen,
 } from "./emit_base"
-import { sidArrGet, sidArrPut, sidNoteNodeName, sidOfNode } from "./symbols"
+import {
+  sidArrGet,
+  sidArrPut,
+  sidNoteNodeName,
+  sidOf,
+  sidOfNode,
+} from "./symbols"
 import { fsMinted } from "./fn_split"
 import {
   blockHasValuedReturn,
@@ -904,6 +916,7 @@ import {
   strListIndexOf,
 } from "./listutil"
 import {
+  flattenVariantsInto,
   intLitUnionBasesOf,
   isNullTy,
   nonNullTy,
@@ -9404,11 +9417,8 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
           }
         }
         if initNullableIsBoxScalar(s.letInit) {
-          if (
-            collectTyReachRegister(stmts, nodeTyPinIxOf(s.letInit), 16, false)
-            < 0
-          ) {
-            return -1
+          for bt in elabNodeInstTys(s.letInit) {
+            if collectTyReachRegister(stmts, bt, 16, false) < 0 { return -1 }
           }
         }
       }
@@ -9706,16 +9716,20 @@ export function collectU(stmts: i32[]) {
         if cty >= 0 && tyAt(cty) is TyUnion && isValueUnionTyOr(cty) == 1 {
           if collectTyReachRegister(stmts, cty, 16, false) < 0 { return -1 }
         }
-        // A hole's `??` reads at its pin, which no node records, so its join is registered here.
+        // A hole's `??` reads at each instance's binding, which no node records, so its join is
+        // registered here.
         if cty >= 0 && tyAt(cty) is TyVar {
-          const cpin = nodeTyPinIxOf(ipu)
-          if (
-            cpin >= 0
-            && cpin != cty
-            && isValueUnionTyOr(cpin) >= 0
-            && collectNoContainerArmJoin(cpin)
-          ) {
-            if collectTyReachRegister(stmts, cpin, 16, false) < 0 { return -1 }
+          for cpin in elabNodeInstTys(ipu) {
+            if (
+              cpin >= 0
+              && cpin != cty
+              && isValueUnionTyOr(cpin) >= 0
+              && collectNoContainerArmJoin(cpin)
+            ) {
+              if collectTyReachRegister(stmts, cpin, 16, false) < 0 {
+                return -1
+              }
+            }
           }
         }
       }
@@ -9748,12 +9762,13 @@ export function collectU(stmts: i32[]) {
       }
     }
     // A standalone `?.` over a non-null scalar field is `T | null`, spelled nowhere (D3513); a
-    // hole's reads at its pin (D3215).
+    // hole's reads at each instance's binding (D3215).
     if pn is OptMember {
-      const ounTy = nodeTyPinIxOf(ipu)
-      const oun = nulNumScalarUnionName(ounTy)
-      if oun != "" {
-        registerValueUnionNameAB(59, oun, nulNumScalarUnionRowTy(ounTy))
+      for ounTy in elabNodeInstTys(ipu) {
+        const oun = nulNumScalarUnionName(ounTy)
+        if oun != "" {
+          registerValueUnionNameAB(59, oun, nulNumScalarUnionRowTy(ounTy))
+        }
       }
     }
     ipu = ipu + 1
@@ -9891,6 +9906,44 @@ function mintVariantRows(
   0
 }
 
+// Whether every member of union `ty` is a record, a primitive, a literal or `null`: no list, map
+// or function arm, whose rows intern under a declaring alias's own name.
+function unionArmsAreRecordsOrScalars(ty: i32): boolean {
+  const xs: i32[] = []
+  flattenVariantsInto(ty, xs)
+  if xs.length < 2 { return false }
+  for x in xs {
+    if x >= 0 {
+      const t = tyAt(x)
+      if !(t is TyObj || t is TyPrim || t is TyLit) { return false }
+    }
+  }
+  true
+}
+
+// Whether each record arm `s` names is a variant of row `kr`: by its own name, or as a layout
+// twin of exactly one of the row's arms (`V = D | S` beside `U = C | S`, `D` typed as `C`).
+// With `bind`, a twin's name is bound to that arm's variant, so both names read one position.
+function declArmsMatchRow(s: UnionDecl, kr: i32, bind: boolean): boolean {
+  for m in s.udVariants {
+    const mt = declTyIxOfName(m)
+    if mt >= 0 && tyAt(mt) is TyObj && variantIndexOf(m) < 0 {
+      let hit = -1
+      let v = unVarStart[kr]
+      while v < unVarStart[kr] + unVarCount[kr] {
+        if v < uVarTyIx.length && uVarTyIx[v] >= 0 && tySame(uVarTyIx[v], mt) {
+          if hit >= 0 { return false }
+          hit = v
+        }
+        v = v + 1
+      }
+      if hit < 0 { return false }
+      if bind { sidArrPut(uVariantRowBySid, sidOf(m), hit) }
+    }
+  }
+  true
+}
+
 // Register the declared union `s` (at statement `stmtIx`): its row, member set and key, its
 // struct variants and their fields, and the value boxes, ref-array and map arms its members
 // need. A struct alias or an alias that denotes one member or one list gets no row. Returns 0,
@@ -9912,13 +9965,25 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   // Field unions of the arms register first, so they push their own rows before this union's
   // slice; arena-rooted since a named union carries no annotation node (`rootUnionDeclMembers`).
   if rootUnionDeclMembers(stmts, s.udName) < 0 { return -1 }
-  // A value-union alias whose type key already has a row names that row: one row per type.
+  // An alias whose type key already has a row names that row: one row per type. A value or
+  // literal union binds to a row with no variants; a union of records and scalars binds to a row
+  // whose variants are its own arms or their twins. A list, map or function arm keeps its row
+  // (D14742).
   const dty = declTyIxOfName(s.udName)
-  if dty >= 0 && (isValueUnionTyOr(dty) == 1 || tyIsLitUnion(dty)) {
+  if dty >= 0 {
     const kr = unRowOfTyKey(dty)
-    if kr >= 0 && unVarCount[kr] == 0 {
-      unNameBindRow(s.udName, kr)
-      return 0
+    if kr >= 0 {
+      const plain = isValueUnionTyOr(dty) == 1 || tyIsLitUnion(dty)
+      if (
+        (plain && unVarCount[kr] == 0)
+        || (!plain
+          && unionArmsAreRecordsOrScalars(dty)
+          && declArmsMatchRow(s, kr, false))
+      ) {
+        declArmsMatchRow(s, kr, true)
+        unNameBindRow(s.udName, kr)
+        return 0
+      }
     }
   }
   unNamesPush(s.udName)

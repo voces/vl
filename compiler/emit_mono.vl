@@ -3,8 +3,8 @@
 // inference hole the checker pins per call site) into one concrete instance per
 // distinct call-site shape (`monomorphize` → `monoWalk` → `monoInstantiate` →
 // `monoMakeInstance`), plus the callback baking and lambda pinning that
-// specialization needs. It consults the classifiers, re-runs the collection passes
-// after minting (`monoRebuild`), and writes no bytes.
+// specialization needs. It consults the classifiers, registers each minted instance in
+// the function map (`monoRegisterInstance`), and writes no bytes.
 //
 // Function-index stability is the invariant: the first instance replaces the
 // original's `fnStmts` slot, each later distinct shape appends `name$N`, and a
@@ -430,9 +430,6 @@ import {
   monoGradualObjList,
   monoGradualObjLits,
   monoGradualRetPinned,
-  monoHoleSubN,
-  monoHoleSubRow,
-  monoHoleSubT,
   monoInertCalled,
   monoInertValues,
   monoInstFe,
@@ -444,10 +441,6 @@ import {
   monoLamShared,
   monoOrigNode,
   monoParamPinTy,
-  monoPinSubN,
-  monoPinSubOwn,
-  monoPinSubRow,
-  monoPinSubT,
   monoProgStmts,
   monoRetCopyReads,
   monoStubSlots,
@@ -576,13 +569,14 @@ import {
   holeNulStringPinTyOf,
   instanceBindsNothingClosed,
   nodeTyInOf,
-  pinSubAt,
   pinnedParamTyAt,
   tyCanonKey,
   tySameSet,
   tySameSpelled,
 } from "./emit_ty_canon"
 import {
+  ekNames,
+  ekTys,
   elabAliasNote,
   elabBodyDeclNote,
   elabCallInstWant,
@@ -591,6 +585,7 @@ import {
   elabInstSpelling,
   elabInstTyAt,
   elabKeyAt,
+  elabKeyAtPos,
   elabNarrowedCarry,
   elabNodeTys,
   elabResultAtParams,
@@ -704,30 +699,17 @@ let monoLamMintedSlots: i32[] = []
 // Never retired, since the instance walks each clone's body once it is registered (D2553).
 let monoLamCloneSlots: i32[] = []
 
-// The arena shape `monoRebuild`'s two whole-program passes are a pure function of:
-// `P.nodes`, `fnStmts` and `fnParent` grow, and `monoArenaTick` counts what lands IN PLACE,
-// which no length can see. Every in-place write in this module calls `monoArenaTouch` or
-// carries an `arena-tick exempt:` line; `tests/vl_mono_arena_tick_test.ts` enforces that.
-let monoArenaTick = 0
-let monoRebuiltStamp = 0 - 1
-
 // `monoProgStmts` indexed by the interned name of each module-scope `LetDecl`, first
 // occurrence winning — `monoModuleLetOf`'s answer whenever the name is one of them. A miss
 // stays -1, the fall-through to `moduleLocalLetOfUnique`. Rebuilt at the one write to
 // `monoProgStmts`, so it carries no row from an earlier compile.
 let monoProgLetBySid: i32[] = []
 
-function monoArenaStamp() {
-  P.nodes.length + fnStmts.length + fnParent.length + monoArenaTick
-}
+// The arena's size, a memo key for the walks below that cache a whole-arena answer.
+function monoArenaStamp() { P.nodes.length + fnStmts.length + fnParent.length }
 
-// Record an in-place write to a node field or to a `fnStmts`/`fnParent` slot: no length
-// moves, so the stamp needs the count to see it. Every such write in this module calls it,
-// and it drops the capture memo `monomorphize` runs under for the same reason.
-function monoArenaTouch() {
-  monoArenaTick = monoArenaTick + 1
-  capMemoNoteEdit()
-}
+// Inert: an in-place write once bumped a rebuild stamp no reader keeps; its sites go next.
+function monoArenaTouch() { 0 }
 
 // D1046 — is this the first instance of the generic being built? Read by the nested
 // named-function arm alone: at `count == 0` the instance reuses the template's own
@@ -4219,42 +4201,6 @@ function monoTpJoinListElemBox(ix: i32, pty: i32): i32 {
   monoRegisterPinUnion(en, pl.aElem)
 }
 
-// The instance type, as an annotation, of a list literal typed at the instance's holes whose
-// element is a union, a nullable or a list; -1 otherwise. A for-in re-makes its literal there.
-function monoHoleListLitAnn(initIx: i32): i32 {
-  if initIx < 0 || monoCgcHoleN.length == 0 { return -1 }
-  const ix = unwrapParen(initIx)
-  if ix < 0 || !(nodeAt(ix) is ArrayLit) { return -1 }
-  const t = nodeTyIxOf(ix)
-  if t < 0 || !tyHasTyVar(t) { return -1 }
-  const ht = monoHoleNodeTy(ix, t)
-  if ht < 0 || tyHasTyVar(ht) { return -1 }
-  const lt = tyAt(ht)
-  if !(lt is TyArray) || lt.aElem < 0 { return -1 }
-  const et = tyAt(lt.aElem)
-  const nul = et is TyNullable
-  const box = et is TyUnion && !tyIsLitUnion(lt.aElem)
-  if !box && !nul && !(et is TyArray) { return -1 }
-  const nm = monoListSpelling(tyToEmitName(ht), ht)
-  if nm == "" { return -1 }
-  synthTypeRefTy(nm, -1, ht)
-}
-
-// A for-in's list literal typed at the instance's holes, re-made at the instance type where
-// `monoHoleListLitAnn` would annotate it as a binding: no binding types its build (D3014).
-function monoHoleIterLitCopy(iterIx: i32): i32 {
-  if monoHoleListLitAnn(iterIx) < 0 { return iterIx }
-  const ix = unwrapParen(iterIx)
-  if ix < 0 { return iterIx }
-  const n = nodeAt(ix)
-  if n is ArrayLit {
-    const nx = monoCopyOf(ix, mkArrayLit(n.arrElems, n.pos))
-    nodeTyRecord(nx, monoHoleNodeTy(ix, nodeTyIxOf(ix)))
-    return nx
-  }
-  iterIx
-}
-
 function monoCloneBodyRaw(
   ix: i32,
   typarams: string[],
@@ -4306,9 +4252,8 @@ function monoCloneBodyRaw(
     }
     ForIn => {
       const cb = monoCloneBody(n.fiBody, typarams, tvN, tvV, bN, bT)
-      const ci = monoHoleIterLitCopy(n.fiIter)
-      if cb == n.fiBody && ci == n.fiIter { return ix }
-      return mkForInCopy(n, ci, cb)
+      if cb == n.fiBody { return ix }
+      return mkForInCopy(n, n.fiIter, cb)
     }
     RetStmt => {
       // The return value may be a block or `if` expression carrying its own `LetDecl`s.
@@ -6237,17 +6182,14 @@ function monoPinMapLambdas(
   ix
 }
 
-// Extend the name→index map over a new instance in `fnStmts`, which the walk resolves by name
-// before collection runs. It reads the arena alone, so an unmoved stamp means it is in hand.
-function monoRebuild() {
-  const stamp = monoArenaStamp()
-  if stamp == monoRebuiltStamp { return 0 }
+// Extend the name→index map over the instances minted since the last call, which the walk
+// resolves by name before collection runs.
+function monoRegisterInstance() {
   fmResumeArmed = true
   const bfmRc = buildFnMap(monoProgStmts)
   fmResumeArmed = false
   if bfmRc < 0 { return -1 }
   capMemoNoteEdit()
-  monoRebuiltStamp = stamp
   0
 }
 
@@ -7002,10 +6944,10 @@ function monoEnclosingPinRow(
   if callFrame >= 0 { pos = callFrame }
   let guard = 0
   while pos >= 0 && guard <= fnStmts.length {
-    const row = monoPinSubRow.get(pos) ?? -1
-    if row >= 0 && row < monoPinSubN.length {
-      const ns = monoPinSubN[row]
-      const ts = monoPinSubT[row]
+    const row = elabKeyAtPos(pos)
+    if row >= 0 && row < ekNames.length {
+      const ns = ekNames[row]
+      const ts = ekTys[row]
       let i = 0
       while i < ns.length && i < ts.length {
         if (
@@ -9451,35 +9393,8 @@ function monoExactPinTyOf(t: i32, ctx: i32): i32 {
 // type parameter's or a hole's; `t` itself where no instance binds every one it names.
 function monoPinSubTyOf(t: i32, ctx: i32): i32 {
   if ctx < 0 { return t }
-  let pos = fnStmtsPosOf(ctx)
-  let guard = 0
-  // A nested generic's instance binds its own parameters only; what it leaves open is the
-  // enclosing instance's to bind, one frame up (D3831).
-  let cur = t
-  while pos >= 0 && guard <= fnStmts.length {
-    const row = monoPinSubRow.get(pos) ?? -1
-    if row >= 0 && row < monoPinSubN.length {
-      const st = pinSubAt(cur, row)
-      if st < 0 { return t }
-      if !tyHasTyVar(st) { return st }
-      cur = st
-    }
-    // A hole instance binds its holes, which the argument's recorded type may name directly.
-    const hrow = monoHoleSubRow.get(pos) ?? -1
-    if hrow >= 0 && hrow < monoHoleSubN.length {
-      let ht = holePinReadOf(cur, monoHoleSubN[hrow], monoHoleSubT[hrow])
-      if ht < 0 {
-        ht = substTyDeep(cur, monoHoleSubN[hrow], monoHoleSubT[hrow])
-      }
-      if ht < 0 { return t }
-      if !tyHasTyVar(ht) { return ht }
-      cur = ht
-    }
-    if pos >= fnParent.length { return t }
-    pos = fnParent[pos]
-    guard = guard + 1
-  }
-  t
+  const st = elabInstTyAt(t, ctx)
+  if st >= 0 { st } else { t }
 }
 
 // `monoExactPinTyOf` over each pin of one call.
@@ -9533,13 +9448,6 @@ export function monoStateReset() {
 
 // Empties the instance-binding tables, which `monomorphize` fills and the classifiers read.
 export function monoSubTablesReset() {
-  monoHoleSubRow = Map()
-  monoHoleSubN = []
-  monoHoleSubT = []
-  monoPinSubRow = Map()
-  monoPinSubN = []
-  monoPinSubT = []
-  monoPinSubOwn = []
   monoInstOwn = ""
   monoArgInstFe = Map()
   monoOpenArgCall = 0 - 1
@@ -10348,17 +10256,13 @@ function monoTwoListOf(r: i32): i32 {
 }
 
 // Records a new instance under `key` in the registry, with the side tables keyed by its
-// slot `instFe`: the two-list result type and the pin and hole binding rows.
+// slot `instFe`: the two-list result type.
 function monoMakeInstanceRegister(
   key: string,
   origFe: i32,
   instName: string,
   instFe: i32,
   twoListTy: i32,
-  letBN: string[],
-  letBT: i32[],
-  instHoleN: string[],
-  instHoleT: i32[],
 ) {
   monoKeys.push(key)
   monoInstOrig.push(origFe)
@@ -10366,17 +10270,6 @@ function monoMakeInstanceRegister(
   monoInstFe.push(instFe)
   monoLastInstFe = instFe
   if twoListTy >= 0 { monoTwoListRet.set(instFe, twoListTy) }
-  if letBN.length > 0 {
-    monoPinSubRow.set(instFe, monoPinSubN.length)
-    monoPinSubN.push(letBN)
-    monoPinSubT.push(letBT)
-    monoPinSubOwn.push(monoInstOwn)
-  }
-  if instHoleN.length > 0 {
-    monoHoleSubRow.set(instFe, monoHoleSubN.length)
-    monoHoleSubN.push(instHoleN)
-    monoHoleSubT.push(instHoleT)
-  }
   while fnInstOrigin.length <= instFe { fnInstOrigin.push(-1) }
   if instFe != origFe {
     fnInstOrigin[instFe] = origFe
@@ -10433,7 +10326,7 @@ function monoMakeInstanceWalk(
     }
     pass = pass + 1
   }
-  if monoRebuild() < 0 { return -1 }
+  if monoRegisterInstance() < 0 { return -1 }
   0
 }
 
@@ -11002,23 +10895,13 @@ function monoMakeInstanceGo(
     // REGISTER before walking the body, so a recursive self-call at the same
     // shape resolves here instead of recursing (the host's discipline).
     if !monoTypedKeys.has(typedKey) { monoTypedKeys.set(typedKey, k.key) }
-    monoMakeInstanceRegister(
-      k.key,
-      origFe,
-      instName,
-      instFe,
-      twoListTy,
-      letBN,
-      letBT,
-      holeN,
-      holeT,
-    )
+    monoMakeInstanceRegister(k.key, origFe, instName, instFe, twoListTy)
     elabSlotNote(instFe, ek)
     // arena-tick exempt: read only by monoElabSplitKey, never by the four rebuild passes
     monoKeyEk[k.key] = ek
     monoKeyPins[k.key] = pinnedTyIx
     monoNoteOpenArgs(calleeIx, instFe)
-    if monoRebuild() < 0 { return elabWalkPop() - 1 }
+    if monoRegisterInstance() < 0 { return elabWalkPop() - 1 }
     const walked = monoMakeInstanceWalk(fn, origFe, nfn, calleeIx, lamClones)
     elabWalkPop()
     return walked
@@ -18006,9 +17889,9 @@ function monoDeclPathKeys(
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const it = monoFrameInstTmpl(lf[0])
     // A hole instance's parameters are spelled at its hole binding.
-    const hrow = monoHoleSubRow.get(fnStmtsPosOf(it[0])) ?? -1
-    if hrow >= 0 && hrow < monoHoleSubN.length {
-      fnFlowStageInstHoles(monoHoleSubN[hrow], monoHoleSubT[hrow])
+    const hk = elabKeyAt(it[0])
+    if hk >= 0 && hk < ekNames.length {
+      fnFlowStageInstHoles(ekNames[hk], ekTys[hk])
     }
     pins = monoDeclPathKeysIn(lf[1], path, it[0], it[1], rets, dead)
     const noN: string[] = []
@@ -19530,17 +19413,24 @@ function monoElemParamTys(
   pts
 }
 
+const monoNoNames: string[] = []
+const monoNoTys: i32[] = []
+
 // Appends to `bNames`/`bTys` each hole type variable every instance binds to one type, and not
 // already bound there: the instances so far, else the type every call agrees on. A hole two
 // instances or two calls bind apart is left open.
 function monoOneInstHoleBinds(bNames: string[], bTys: i32[]): i32 {
   const seen: {[string]: i32} = Map()
-  let r = 0
-  while r < monoHoleSubN.length {
-    const ns = monoHoleSubN[r]
-    const ts = monoHoleSubT[r]
+  for fe in monoInstFe {
+    const ek = if fe >= 0 && fe < fnStmts.length { elabKeyAt(fnStmts[fe]) } else { -1 }
+    const ns = if ek >= 0 && ek < ekNames.length { ekNames[ek] } else { monoNoNames }
+    const ts = if ek >= 0 && ek < ekTys.length { ekTys[ek] } else { monoNoTys }
     let k = 0
     while k < ns.length && k < ts.length {
+      if ns[k].length == 0 || ns[k][0] != '?' {
+        k = k + 1
+        continue
+      }
       const t = ts[k]
       const prev = seen.get(ns[k]) ?? -1
       if t < 0 {
@@ -19552,7 +19442,6 @@ function monoOneInstHoleBinds(bNames: string[], bTys: i32[]): i32 {
       }
       k = k + 1
     }
-    r = r + 1
   }
   for nm in seen.keys() {
     const t = seen.get(nm) ?? -1
@@ -23355,11 +23244,11 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       monoInstOrig.push(fe)
       monoInstName.push(specName)
       monoInstFe.push(instFe)
-      if monoRebuild() < 0 { return -1 }
+      if monoRegisterInstance() < 0 { return -1 }
       // Walk the ORIGINAL body under this specialization's context so a nested generic call it
       // contains instantiates (idempotent via the registry — the main loop also walks the original).
       if monoWalk(fn.fnBody, nfn) < 0 { return -1 }
-      if monoRebuild() < 0 { return -1 }
+      if monoRegisterInstance() < 0 { return -1 }
     }
   }
   0
@@ -26881,13 +26770,11 @@ function monoSlotParamPins(fe: i32, out: string[]) {
 // bodies are walked as they are created. Usage-gated: a program with no generic
 // declaration and no concrete higher-order function returns immediately.
 export function monomorphize(stmts: i32[]) {
-  monoArenaTick = 0
   monoClashLits = []
   monoCallTpl = Map()
   monoLitDestVariant = Map()
   monoLamCallCallees = []
   monoProgLamNames = []
-  monoRebuiltStamp = 0 - 1
   monoBodyDeclStamp = 0 - 1
   monoGen = []
   monoOrigNode = []

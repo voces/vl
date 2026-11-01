@@ -48,8 +48,8 @@ const LOCAL: Record<string, string> = {
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.
 const CI_RUNS: Record<string, string[]> = {
   "ci-native": [
-    "bash scripts/ci-shard.sh native ${{ matrix.shard }} 7",
-    "bash scripts/ci-shard.sh release ${{ matrix.shard }} 4",
+    "bash scripts/ci-shard.sh native ${{ matrix.shard }} 5",
+    "bash scripts/ci-shard.sh release ${{ matrix.shard }} 1",
   ],
   "lsp suites (ci list)": ["- name: Editor features on the wasm compiler"],
   "lsp typecheck": [
@@ -543,16 +543,16 @@ Deno.test({
         ],
         [
           "a missing shard",
-          () => write("jobs.json", jobList("ci-native (7)")),
+          () => write("jobs.json", jobList("ci-native (5)")),
           {},
-          "has 6 'ci-native' jobs",
+          "has 4 'ci-native' jobs",
           sha,
         ],
         [
           "a missing scaling part",
           () => write("jobs.json", jobList("ci-cost (2)")),
           {},
-          "has 3 'ci-cost' jobs",
+          "has 1 'ci-cost' jobs",
           sha,
         ],
         [

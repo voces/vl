@@ -132,8 +132,8 @@ jobs:
   #
   #   seed ──┬── ci-native (5)        the auto-discovered native suites, split by weight
   #          ├── checks               ratchets, probes, self-lint, corpus oracle, editor suites
-  #          ├── ci-release-shape (4) the binaryen-backed suites, split by weight
-  #          └── ci-cost (4)         fuel/RSS cost ratchets — master pushes and nightly only
+  #          ├── ci-release-shape (1) the binaryen-backed suites
+  #          └── ci-cost (2)         fuel/RSS cost ratchets
   #
   # `seed` is the only job that builds anything: the vl-host binary (on a binary-cache miss)
   # and the seed, which it refreshes AND proves a self-compilation fixed point before saving
@@ -142,10 +142,13 @@ jobs:
   # compiler source — never on an earlier rung, and never on a seed it built itself.
   #
   # `seed` outputs `heavy` (false for a docs-only or an inherited run, which skip every
-  # downstream job) and `gated`. `gated` is true only on a master push of a tree the merge
-  # queue's scripts/gate.sh already passed (scripts/ci-verdict.sh), and skips just the three
-  # jobs gate.sh runs whole: ci-native, ci-release-shape, ci-cost.
-  # tests/ci_verdict_test.ts holds that list to what gate.sh covers.
+  # downstream job), `gated` and `tree`. `gated` is true only on a master push of a tree the
+  # merge queue's scripts/gate.sh already passed (scripts/ci-verdict.sh), and skips just the
+  # three jobs gate.sh runs whole: ci-native, ci-release-shape, ci-cost. `tree` is true only on
+  # a master push whose tree the squashed PR's own green run tested, and skips the jobs that
+  # run proved: ci-native, ci-release-shape, checks, checks-suites, ci-embed-seed; seed and
+  # ci-cost (a master reading caught #5373's hang) still run. tests/ci_verdict_test.ts holds
+  # both lists.
   # ---------------------------------------------------------------------------
   seed:
     runs-on: ubuntu-latest
@@ -156,9 +159,11 @@ jobs:
       actions: read
       statuses: read
       pull-requests: read
+      checks: read
     outputs:
       heavy: ${{ steps.verdict.outputs.heavy }}
       gated: ${{ steps.verdict.outputs.gated }}
+      tree: ${{ steps.verdict.outputs.tree }}
       seed_key: ${{ steps.keys.outputs.seed }}
       bin_key: ${{ steps.keys.outputs.bin }}
       rustc: ${{ steps.keys.outputs.rustc }}
@@ -194,6 +199,18 @@ jobs:
           echo "bin=vl-bin-${{ runner.os }}-$(rustc -V | tr ' ' '_')-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**', 'compiler/check_intrinsics.vl') }}" >> "$GITHUB_OUTPUT"
           echo "seed=vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/src/**', 'scripts/warm-seed.sh') }}" >> "$GITHUB_OUTPUT"
           echo "rustc=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+
+      # The tree this pull_request run tests (refs/pull/N/merge, the head merged onto the base
+      # as GitHub saw it) and the rustc its binary key names: a `tested-tree` annotation, so a
+      # master push of the squash can ask whether it would re-test the same tree with the same
+      # keys (scripts/ci-verdict.sh) without parsing logs. Equal trees give equal hashFiles
+      # parts of both keys; rustc is the one input the tree does not fix.
+      - name: Record the tested tree
+        if: github.event_name == 'pull_request'
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          echo "::notice title=tested-tree::$tree rustc=${{ steps.keys.outputs.rustc }}"
+          echo "tested-tree: $tree (merge $(git rev-parse HEAD) of ${{ github.event.pull_request.head.sha }} into $(git rev-parse HEAD^1))"
 
       # An exact hit means cargo would reproduce this same binary, so the build is skipped
       # outright; "the host still compiles" stays covered every run by `ci-embed-seed`,
@@ -319,12 +336,12 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-native:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7]
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v5
 
@@ -376,7 +393,7 @@ jobs:
       - name: Does this shard meter fuel
         id: fuel
         run: |
-          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 7)
+          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 5)
           # shellcheck disable=SC2086  # one argument per file
           if grep -q VL_FUEL $files; then echo "need=true" >> "$GITHUB_OUTPUT"; fi
 
@@ -406,14 +423,14 @@ jobs:
       # case spawns its own `vl` subprocess, so cases are isolated regardless of schedule.
       - name: Native binary suites (corpus alignment, build -O, vl CLI)
         run: |
-          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 7)
-          [ -n "$files" ] || { echo "native shard ${{ matrix.shard }} of 7 is empty" >&2; exit 1; }
+          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 5)
+          [ -n "$files" ] || { echo "native shard ${{ matrix.shard }} of 5 is empty" >&2; exit 1; }
           # shellcheck disable=SC2086  # one argument per file
           deno test -A --no-check --parallel $files
         env:
           SELFHOST_NATIVE_ALIGN: "1"
           # A SELF_SHARDED file (ci-shard.sh) runs in every shard and asserts only this share.
-          VL_CI_SHARD: ${{ matrix.shard }}/7
+          VL_CI_SHARD: ${{ matrix.shard }}/5
 
   # ---------------------------------------------------------------------------
   # checks — the ratchets, the capability probes and the self-lint on the proven seed. The
@@ -421,7 +438,7 @@ jobs:
   # ---------------------------------------------------------------------------
   checks:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -543,7 +560,7 @@ jobs:
   # ---------------------------------------------------------------------------
   checks-suites:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     # Two runners, not two steps in turn: the editor suites (~16 s) and the oracle (~21 s) were
     # this job's whole 54 s and the CI critical path behind `seed` (run 41197363355).
@@ -656,15 +673,18 @@ jobs:
   # is positive (seed, binary, binaryen), so the files that also match the native globs run
   # HERE only: this job is a strict superset of what the native shards would run of them.
   # The SUITES list is what tests/ci_seed_coverage_test.ts and scripts/ci-shard.sh read.
+  # ONE shard: the suites' own test step took 1–4 s per shard against 12–22 s of setup
+  # (run 41267459907), so four shards paid setup four times for no wall time. The matrix stays,
+  # at one, so a suite that grows can be split again by raising the count here and below.
   # ---------------------------------------------------------------------------
   ci-release-shape:
     needs: seed
-    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1]
     steps:
       - uses: actions/checkout@v5
 
@@ -755,8 +775,8 @@ jobs:
 
       - name: Release-profile suites (-O3 / wasm-opt / wasm-dis / wasm-tools shape)
         run: |
-          files=$(bash scripts/ci-shard.sh release ${{ matrix.shard }} 4)
-          [ -n "$files" ] || { echo "release shard ${{ matrix.shard }} of 4 is empty" >&2; exit 1; }
+          files=$(bash scripts/ci-shard.sh release ${{ matrix.shard }} 1)
+          [ -n "$files" ] || { echo "release shard ${{ matrix.shard }} of 1 is empty" >&2; exit 1; }
           # shellcheck disable=SC2086  # one argument per file
           deno test -A --no-check --parallel $files
         env:
@@ -785,9 +805,10 @@ jobs:
   # other in a cycle, and #5373 merged a compiler that traps on them and hangs on `fn-flow`
   # because no PR job ran this file. Each part takes 18–29 s against ci-native's 26–51 s, so
   # it adds no PR wall time, and `timeout-minutes` turns a hang into a red job, not a runner
-  # held for 40 minutes. Split four ways so the slowest part, not their sum, follows `seed`:
-  # plumb-shape alone, and the scaling-shape file in thirds (`$VL_SCALING_SHARD`), each pair
-  # still graded whole inside one job. `seed` warms the two fuel sidecars once, beside its
+  # held for 40 minutes. Two parts, each about as long as a ci-native shard: the scaling-shape
+  # file in halves (`$VL_SCALING_SHARD`, each pair still graded whole inside one job), and
+  # plumb-shape (5 s) beside the first half. Four parts paid 9-16 s of setup each for 6-14 s of
+  # tests (run 41267459907). `seed` warms the two fuel sidecars once, beside its
   # ladder, and every part restores them.
   # ---------------------------------------------------------------------------
   ci-cost:
@@ -805,7 +826,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [plumb, "1", "2", "3"]
+        part: ["1", "2"]
     steps:
       - uses: actions/checkout@v5
 
@@ -857,18 +878,17 @@ jobs:
       # binaryen here, so `-O`'s wasm-opt step is skipped; the tool reads each build's
       # rusage through GNU time, which it refuses to run without.
       - name: Plumb-shape cost (ratchet)
-        if: matrix.part == 'plumb'
+        if: matrix.part == '1'
         run: |
           test -x /usr/bin/time || (sudo apt-get update -q && sudo apt-get install -y -q time)
           scripts/vl-host/target/release/vl run scripts/plumb-shape-cost.vl --compiler build/vl-compiler.wasm -- --check --require-fuel
 
       # Same-work-different-shape program pairs graded on the ratio of their guest fuel.
       - name: Cost ratchets (scaling shape)
-        if: matrix.part != 'plumb'
         run: deno test -A --no-check tests/vl_scaling_shape_test.ts
         env:
           SELFHOST_NATIVE_ALIGN: "1"
-          VL_SCALING_SHARD: ${{ matrix.part }}/3
+          VL_SCALING_SHARD: ${{ matrix.part }}/2
 
   # ---------------------------------------------------------------------------
   # ci-embed-seed — the release DISTRIBUTION build (roadmap H-M2), gated on every
@@ -898,6 +918,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      checks: read
     steps:
       - uses: actions/checkout@v5
         with:
@@ -913,10 +934,10 @@ jobs:
         uses: ./.github/actions/ci-verdict
         with:
           docs_only: ${{ steps.docs_check.outputs.docs_only }}
-          modes: inherit
+          modes: inherit tree
 
       - name: Rustc version (cargo cache key)
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         id: rustc
         run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
@@ -928,7 +949,7 @@ jobs:
       # restores, builds and saves. One cold wasmtime build after a toolchain bump
       # is the same cost as before the split.
       - name: Restore cargo + vl-host target
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -945,7 +966,7 @@ jobs:
       # while `seed` stays the sole writer of the seed pair, which is what
       # keeps the `.cwasm` sidecars riding along with the wasm they were built from.
       - name: Restore seed compiler wasm
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -958,13 +979,13 @@ jobs:
 
       # Idempotent: fetch-seed.sh leaves a present, non-empty seed untouched.
       - name: Ensure a seed to embed
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         run: ./scripts/fetch-seed.sh
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Verify embedded-seed build (distribution path)
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         run: |
           cargo build --release --features embed-seed --manifest-path scripts/vl-host/Cargo.toml
           probe="$(mktemp -d)"
@@ -999,7 +1020,7 @@ jobs:
       # is the whole claim. The stale-seed row is the other half: a released `vl`
       # must not become a different compiler because of what sits in the CWD.
       - name: Verify a released `vl` carries std and ignores the CWD
-        if: steps.verdict.outputs.heavy == 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         run: |
           set -e
           export VL_CACHE_DIR="$(mktemp -d)"

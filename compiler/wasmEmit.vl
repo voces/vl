@@ -47,8 +47,10 @@ import {
 import { intMatchHeadAt } from "./check_match_heads"
 import {
   condProvenTrue,
+  ctxFieldStorageAgrees,
   mapUnboxTyOf,
   narListReadsDecl,
+  nodeCtxTyIxOf,
   recCopyTyOf,
 } from "./check_core_state"
 import {
@@ -1504,6 +1506,7 @@ import {
   vbHeapIdxOfKind,
 } from "./emit_rep"
 import {
+  elabTyClosed,
   fnTagArmsAt,
   fnTagCallSetOf,
   fnTagLeafId,
@@ -7935,7 +7938,7 @@ function emitCoalesceMapJoin(
   ec: ExpCtx,
 ): i32 {
   if !exprNullableMap(e.binLeft, fnIx) { return 0 }
-  const un = coalesceResultUnionName(exprIx)
+  const un = coalesceResultUnionName(exprIx, fnIx)
   if un == "" { return 0 }
   const unTy = nodeTyInOf(exprIx, fnIx)
   const sh = mapShapeOfExpr(e.binLeft, fnIx)
@@ -14241,7 +14244,7 @@ function emitMapGetOrScalarJoin(
   if recvIx < 0 { return 0 }
   const ak = mapRecvScalarBoxKindIn(recvIx, fnIx)
   if ak < 0 { return 0 }
-  const joinN = coalesceResultUnionName(exprIx)
+  const joinN = coalesceResultUnionName(exprIx, fnIx)
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
   const vb = vbHeapIdxOfKind(ak)
@@ -20854,8 +20857,8 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32, ec: ExpCtx) {
   if e is NullLit { return emitNullLitNode(body, e, exprIx, fnIx, ctx, ec) }
   if e is ObjLit { return emitObjLitNode(body, e, exprIx, fnIx, -1, ec) }
   if e is StrLit {
-    // A literal-union MEMBER in atom context (`ctx.litUnion`) lowers as its interned i32 id.
-    if ctx.litUnion == 1 {
+    // A literal delivered to a destination whose type reps as the atom lowers as its interned id.
+    if strLitTakesAtom(exprIx, fnIx, ctx) {
       fbI32Rel(RS_ATOM, internAtom(e.strText))
       return 0
     }
@@ -36084,6 +36087,29 @@ function deliveredAsNulAtom(ix: i32, fnIx: i32): boolean {
   d.rdCovered == 1 && d.rdNul == 3
 }
 
+// Whether string literal `ix` lowers as its atom: its closed contextual type reps as one, and a
+// literal delivered nowhere is a string. A record field, an open record, and an instance whose
+// record disagrees with the program's still decide by the delivery context: either side can
+// name a place stored apart from it (D3423).
+function strLitTakesAtom(ix: i32, fnIx: i32, ctx: ExpCtx): boolean {
+  const pr = nodeCtxTyIxOf(ix)
+  if ctxFieldStorageAgrees(ix) && pr < 0 { return false }
+  if !ctxFieldStorageAgrees(ix) || !elabTyClosed(pr, 0) {
+    return ctx.litUnion == 1
+  }
+  const a = tyRepsAsAtom(pr)
+  const at = ctxTyAt(ix, fnIx)
+  if at != pr && tyRepsAsAtom(at) != a { return ctx.litUnion == 1 }
+  a
+}
+
+// Whether type `t` reps as the literal-union atom, with or without its null sentinel.
+function tyRepsAsAtom(t: i32): boolean {
+  if t < 0 { return false }
+  const d = repOfTy(t)
+  d.rdCovered == 1 && d.rdAtom == 1
+}
+
 // Whether node `ix` is delivered to a destination whose type reps as the `K | null` atom niche:
 // its contextual type, not its own narrowed one.
 function ctxIsNulAtom(ix: i32, fnIx: i32): boolean {
@@ -38835,7 +38861,7 @@ function emitCoalesceNulRefJoin(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  const joinN = coalesceResultUnionName(exprIx)
+  const joinN = coalesceResultUnionName(exprIx, fnIx)
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
   const joinTy = nodeTyInOf(exprIx, fnIx)
@@ -38894,7 +38920,7 @@ function emitCoalesceNulBoolJoin(
   fnIx: i32,
   ec: ExpCtx,
 ) {
-  const joinN = coalesceResultUnionName(exprIx)
+  const joinN = coalesceResultUnionName(exprIx, fnIx)
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
   const joinTy = nodeTyInOf(exprIx, fnIx)
@@ -38990,7 +39016,7 @@ function emitCoalesceNulRefCtx(
   // A union of records with no row, as two instances of one generic record make, has no box.
   if (
     tyIsStructBearingUnion(nodeTyIxOf(exprIx))
-    && !coalesceResultIsBox(exprIx)
+    && !coalesceResultIsBox(exprIx, fnIx)
   ) {
     return emitFailAt(
       "emitProgram: this `??` joins records into a union that has no box yet, as a union of two instances of one generic record does not",
@@ -39965,7 +39991,7 @@ function coalResultBoxName(exprIx: i32, fnIx: i32): string {
   const rt = coalResultTyOf(exprIx, fnIx)
   const rn = valueUnionNameOfTy(rt)
   if rn != "" { return rn }
-  const mn = nodeMixedUnionName(exprIx)
+  const mn = nodeMixedUnionName(exprIx, fnIx)
   if mn != "" { return mn }
   nodeJoinRowName(exprIx, fnIx)
 }
@@ -40898,7 +40924,7 @@ function emitCoalesceNullableRefs(
     lhsIx >= 0
     && exprReReadable(lhsIx)
     && exprNulLitUnion(lhsIx, fnIx)
-    && coalesceResultIsBox(exprIx)
+    && coalesceResultIsBox(exprIx, fnIx)
   ) {
     return emitExpr(body, coalNullTestIf(e, exprIx, fnIx), fnIx, ec)
   }
