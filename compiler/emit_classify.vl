@@ -12,6 +12,8 @@ import { constBindsLitSet } from "./check_leaf_steps"
 // not through the republications in `emit_base.vl` and `typecheck.vl`.
 // `isTopLevelFuncTypeName` stays out of it because it also writes the module-level
 // `funcArrowAt` bank; `nameIsShapeSpanEnds` and `mapValNameOf`, because their span differs.
+import { collectRetValues } from "./check_nj_join"
+import { parenPeelIx } from "./check_places"
 import {
   ArrayLit,
   AsExpr,
@@ -884,7 +886,7 @@ import {
   unionSetHasNull,
 } from "./emit_union_registry"
 import { variantFieldIndex } from "./emit_variant_sig"
-import { strListHas } from "./listutil"
+import { strListHas i32ListHas } from "./listutil"
 import {
   emitPassGen,
   memoGenAdvance,
@@ -14673,6 +14675,7 @@ export function fnReturnsClosure(t: i32) {
   if fn is FuncDecl {
     // A function returning a tagged set's value returns its member's i32 id.
     if fnTagRetIsTagged(fnStmts[t]) { return false }
+    if fnHandsBackTaggedParam(fn) { return false }
     // An annotated function-type return is a closure result regardless of how the body yields
     // it (a higher-order call the tail scan can't see), since the valtype is already kind 14.
     if fn.fnRet >= 0 && tyIsFuncType(fn.fnRet) { return true }
@@ -14684,6 +14687,44 @@ export function fnReturnsClosure(t: i32) {
     return blockTailIsClosure(fn.fnBody, fnStmts[t])
   }
   false
+}
+
+// Whether every value instance `fn` returns reads one parameter typed at a tagged set: it hands
+// the argument's id back.
+function fnHandsBackTaggedParam(fn: FuncDecl): boolean {
+  if fn.fnBody < 0 { return false }
+  // Most functions take no tagged set at all, so ask that before walking the body.
+  let any = false
+  for q in fn.fnParams {
+    const pn = nodeAt(q)
+    if (
+      pn is Param
+      && pn.parType >= 0
+      && fnTagTyIsTagged(nodeTyIxOf(pn.parType))
+    ) {
+      any = true
+    }
+  }
+  if !any { return false }
+  const vs: i32[] = []
+  collectRetValues(fn.fnBody, vs)
+  if vs.length == 0 { return false }
+  for v in vs {
+    const x = parenPeelIx(v)
+    if x < 0 || !(nodeAt(x) is Ident) { return false }
+    // A cloned body shares its reads with the template, so the parameter is matched by name.
+    const rd = nodeAt(identDeclOf(x))
+    if !(rd is Param) { return false }
+    let typed = false
+    for q in fn.fnParams {
+      const pn = nodeAt(q)
+      if pn is Param && pn.parName == rd.parName && pn.parType >= 0 {
+        typed = fnTagTyIsTagged(nodeTyIxOf(pn.parType))
+      }
+    }
+    if !typed { return false }
+  }
+  true
 }
 
 // True if the block's tail (implicit-return) expression is a function value.
