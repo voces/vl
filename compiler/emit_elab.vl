@@ -1064,7 +1064,14 @@ function elabDemandFrom(
       }
     }
   }
-  if elabCkUsable(decl, call, from) >= 0 && elabCkTakesPins(ck, sig, pTys) {
+  // An argument holding a tagged set binds its hole parameter to the set itself, which no
+  // checker instance at the set's rep has.
+  const tagged = elabCallTaggedArgs(call, decl)
+  if (
+    !tagged
+    && elabCkUsable(decl, call, from) >= 0
+    && elabCkTakesPins(ck, sig, pTys)
+  ) {
     elabGuessNote(ck, names0, tys0)
     elabReachNote(from, ck, -1)
     const n1 = ekDecl.length
@@ -1083,7 +1090,10 @@ function elabDemandFrom(
     if f is TyFunc {
       let p = 0
       while p < f.fnParamTypes.length && p < pTys.length {
-        if elabTyClosed(pTys[p], 0) && !(p < byId.length && byId[p]) {
+        const at = if tagged { elabCallArgSetTy(call, decl, p) } else { -1 }
+        if at >= 0 {
+          bindGenWalk(f.fnParamTypes[p], at, names, tys)
+        } else if elabTyClosed(pTys[p], 0) && !(p < byId.length && byId[p]) {
           bindGenWalk(f.fnParamTypes[p], pTys[p], names, tys)
         }
         p = p + 1
@@ -1098,6 +1108,36 @@ function elabDemandFrom(
   if k >= 0 && !ekDone[k] { elabOne(k) }
   elabSettle(n0)
   k
+}
+
+// The tagged set argument `p` of call `call` to `decl` hands an un-annotated parameter, or -1.
+function elabCallArgSetTy(call: i32, decl: i32, p: i32): i32 {
+  if call < 0 || call >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
+    return -1
+  }
+  const cn = nodeAt(call)
+  const f = nodeAt(decl)
+  if !(cn is Call) || !(f is FuncDecl) { return -1 }
+  if p >= cn.callArgs.length || p >= f.fnParams.length { return -1 }
+  if p < cn.callArgNames.length && cn.callArgNames[p] != "" { return -1 }
+  const q = nodeAt(f.fnParams[p])
+  if !(q is Param) || q.parType >= 0 { return -1 }
+  const ax = parenPeelIx(cn.callArgs[p])
+  const t = if ax >= 0 { nodeTyIxOf(ax) } else { -1 }
+  if fnTagSetIsTagged(fnTagSetOfTy(t)) { t } else { -1 }
+}
+
+// Whether some argument of call `call` to `decl` is a tagged set its parameter takes as itself.
+function elabCallTaggedArgs(call: i32, decl: i32): boolean {
+  if call < 0 || call >= P.nodes.length { return false }
+  const cn = nodeAt(call)
+  if !(cn is Call) { return false }
+  let p = 0
+  while p < cn.callArgs.length {
+    if elabCallArgSetTy(call, decl, p) >= 0 { return true }
+    p = p + 1
+  }
+  false
 }
 
 // Whether declaration `decl`, and each declaration enclosing it, is no generic and has no
@@ -2011,8 +2051,8 @@ export function elabMintFacts(): i32 {
 // The instances a list method's callback takes at its set's rep, which the members' calls never
 // reach through the parameter.
 let elabCbRepKeys: {[i32]: boolean} = Map()
-// The instances per signature of the one generic a set holds (`elabSetRepRow`), and those they
-// reach, which a tagged set's calls do not reach.
+// The instances `elabSetRepRow` makes at an untagged set's rep or per signature of the one
+// generic it holds, and those they reach: a tagged set's calls reach none of them.
 let elabSigAltKeys: {[i32]: boolean} = Map()
 let elabSigAlting = false
 
@@ -2156,6 +2196,34 @@ function elabMemberResultAt(d: i32, pTys: i32[]): i32 {
   -1
 }
 
+// Whether call `ix` of `d` by name hands an untagged set of functions to an un-annotated
+// parameter, which its row then binds at the set's rep (`elabSetArgBind` keys a tagged one).
+function elabRowAtSetRep(ix: i32, d: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || d < 0 || d >= P.nodes.length {
+    return false
+  }
+  const cn = nodeAt(ix)
+  if !(cn is Call) || identDeclOf(parenPeelIx(cn.callFn)) != d { return false }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) { return false }
+  let i = 0
+  while i < cn.callArgs.length && i < f.fnParams.length {
+    const ax = parenPeelIx(cn.callArgs[i])
+    const st = if ax >= 0 { nodeTyIxOf(ax) } else { -1 }
+    const pn = nodeAt(f.fnParams[i])
+    if (
+      pn is Param
+      && pn.parType < 0
+      && fnTagSetOfTy(st) >= 0
+      && !fnTagSetIsTagged(fnTagSetOfTy(st))
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
 // Runs the worklist from the generic pass's closed calls.
 export function elabRun() {
   elabCbRepKeys = Map()
@@ -2226,7 +2294,10 @@ export function elabRun() {
       const rn: string[] = []
       const rt: i32[] = []
       elabRowComplete(ix, d, callBindNamesAt(r), tys, rn, rt)
+      // A row binding an untagged set's value at its rep is that rep's instance.
+      elabSigAlting = elabRowAtSetRep(ix, d)
       const k = elabEnqueue(d, rn, rt, -1)
+      elabSigAlting = false
       elabReachNote(-1, k, ix)
       elabArgRows(ix, d, rn, rt, -1)
       // A call through a set reaches the called member through the direct call built for it.
@@ -2755,6 +2826,11 @@ function elabMemberAt(m: i32, ats: i32[]): i32 {
 // Enqueues call `ix`'s row `names`/`tys` with each set of functions taking its rep at `ck`
 // (`elabSetRepTy`), when one moves and the row closes.
 function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
+  // A direct call by name reaches the set-keyed instance once the set is tagged; a call through
+  // a value reaches the function at its rep, whatever the set.
+  const cn0 = nodeAt(ix)
+  const direct = cn0 is Call
+    && identDeclOf(parenPeelIx(cn0.callFn)) == elabCallDeclOf(ix)
   const rep: i32[] = []
   let moved = false
   elabRepStubbed = false
@@ -2776,6 +2852,8 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
       rt = elabWrittenRep(ix, names[i0], t)
     }
     if rt < 0 { rt = elabSetRepTy(t, 4, ck) }
+    // A tagged set is keyed by itself, so it has no instance at its rep.
+    if direct && fnTagSetIsTagged(fnTagSetOfTy(t)) { rt = t }
     elabRepStubbed = elabRepStubbed || stubbed0
     if rt != t { moved = true }
     rep.push(rt)
@@ -2785,7 +2863,9 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
     // A set no member gives a signature reps as a stub no call reaches, so its instance is a guess.
     elabGuessing = elabRepStubbed
     elabRepresenting = true
+    elabSigAlting = direct
     const rk = elabEnqueue(elabCallDeclOf(ix), names, rep, -1)
+    elabSigAlting = false
     elabRepresenting = false
     elabReachNote(-1, rk, -1)
     if rk >= 0 {
