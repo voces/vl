@@ -11297,7 +11297,18 @@ earlier pass can hold one); a reference row's heap is claimed when the union hea
 and a record whose own row a later pass interns leaves its early reference row unclaimed,
 flagged and skipped like the rest. The passes that re-lay an arm's fields after that point
 re-sync its reference row, and each arm's fields are asserted equal to its row's when the heaps
-are assigned. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
+are assigned. An arm's fields are its row's. During collection an arm's fields are staged
+(`armStage*`); at the end of `collectS` each arm adopts a row (a struct row of its record type
+whose fields match by name and code, else its reference row, else one minted for it), the
+variant field columns become the struct-row lists themselves, and the staging is emptied; an arm
+created later adopts its row as it is minted. An arm adopting a struct row takes the row's
+element spellings: agreeing them at adoption writes a declared name into a row its canon twins
+compare by element name, and the twin lookup then declines; "a declared spelling wins" holds
+only where an arm's own row differs from its field row (`variantRowAgree`) until step 3 makes
+that comparison read element types, after which it holds everywhere. A shared-tag arm needs no
+row of its own: its fields match its record's row by name and code, so it adopts that row as its
+field row while its heap stays its tag-mate's; that is the one place an arm's two rows differ. Running `collectS`'s reset before
+`collectU`, so arms write rows directly, would remove the staging and is not done. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
 variant heap column is gone. A row is keyed by (record type, field storage codes), not by the
 type alone: a record with a tagged function field is a second row of its type. A value cannot
 cross between two storage rows of one type without a converting delivery, and none exists, so
