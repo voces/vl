@@ -11255,3 +11255,32 @@ layout, and a field read takes
 its rep from the row's storage, not from the read's literal-set type alone. Arms under two tags
 are not one family's shared row: there each keeps its own layout and the shared read converts
 (D14746).
+
+## A record has one row; a union arm is a reference to it (ruling, 2026-11-01)
+
+A record type gets one emitter row, the struct row: its heap type, field order and field
+storage codes. A union arm is a reference from (union, arm) to that row, not a second row of
+the same record. The variant table (`uVariants`, `uField*`, `uVarHeap`) grew beside the struct
+table, and the two duplicate each other for every record that is also an arm: measured over
+`tests/**/*.vl`, 1,341 of 2,853 variant rows (47%) have a struct row of the same record type,
+and 1,337 of those are already on its heap with the same fields, order and codes. What the
+"variant" label really says is context: the value is a payload unboxed from a union box, which
+a tag test casts to. The layout is the row's either way.
+
+The variant row as the only row was refused: most struct rows (about 5,400 of 6,700 in the same
+corpus) are records that are never a union arm, and each would need a one-arm union and the
+box's tag machinery.
+
+The move goes in steps, each byte-identical: `uVarRow` names each arm's own struct row (the row
+of the arm's record type on the same heap with the same fields, never a layout twin of another
+type), then readers move off the variant tables onto the struct row one table at a time, then
+the shape-to-row lookup answers the struct row only, and the `"variant"` kind label narrows to
+the context. One arm keeps a layout that is not its record's row: an arm sharing a tag with
+another arm (D1023, one tag and one layout, `is` deciding by the discriminant's value) is laid
+out at its tag-mate's heap, while the same record standing alone has its own struct row
+(`unions/discriminant-mixed-litunion-bare-literal-arm.vl`,
+`unions/discriminant-set-beside-base-alias-arm.vl`, `unions/layout-family-literal-set-beside-string.vl`,
+`generics/one-literal-field-through-generic.vl`). Such an arm has no `uVarRow`; its row is its
+tag-mate's. An arm's row is found by the arm, never by a literal-folded shape (`repCanonId`
+folds literals, so a shape key can land on another arm's row), and the variant-only columns
+(`uFieldLitTyIx`, `uFieldTyText`) stay keyed by (union, arm) until a struct-row home is chosen.

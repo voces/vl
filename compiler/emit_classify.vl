@@ -14398,6 +14398,14 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   // The extended key (not just `fnSigKeyOf`) so a void-returning binding resolves its `>v`
   // sig, interned above; a value-eligible binding takes the same key `fnSigKeyOf` would.
   if fe >= 0 { return cloSigKeyExt(fe) }
+  // A lifted lambda answers above because it is lowered at its own signature, not its type's
+  // key, until lowering follows the recorded type (D8880). Past it, a read whose type at this
+  // instance is a closed function type is keyed by that type.
+  const rt = tyPeelNul(nodeTyAt(atIx, fnIx))
+  if rt >= 0 && tyAt(rt) is TyFunc && !tyHasTyVar(rt) {
+    const rk = sigKeyOfTy(rt)
+    if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
+  }
   // An inferred COPY of another closure binding (`const t0 = p`): chase the source so a call
   // through the intermediate binding classifies its result (nullable-closure read pattern).
   // Asked at the source's own read, so a same-named binding in a sibling block is not it (D3632).
@@ -14413,10 +14421,6 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
         if ofn is FuncDecl {
           if bodyLetReadAtSid(ofn.fnBody, csid, posAt) < 0 { srcFn = -1 }
         }
-      }
-      if srcFn < 0 && fnIx >= 0 {
-        const mk = moduleCopySigKey(srcSid)
-        if mk != "" { return mk }
       }
       const sk = calleeCloSigKeyOfRead(srcIx, srcFn)
       if sk != "" { return sk }
@@ -14442,8 +14446,8 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   if letIx >= 0 {
     const cd = nodeAt(letIx)
     if cd is LetDecl {
-      // A binding initialized by another name holds that name's value, whose key is that
-      // binding's, asked in the frame that declares this one (D3868).
+      // A module binding initialized by another name, read from inside a function, holds that
+      // module name's value, not one of the function's same-named locals (D3880).
       const isid = sidOfNode(cd.letInit)
       if (
         cd.letType < 0
@@ -14451,14 +14455,10 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
         && nodeAt(cd.letInit) is Ident
         && isid != csid
       ) {
-        // Read from inside a function, a module binding's source is not one of that function's
-        // locals of the same name (D3880).
         if letFn < 0 && fnIx >= 0 {
           const mk = moduleCopySigKey(isid)
           if mk != "" { return mk }
         }
-        const ik = calleeCloSigKeyOfRead(cd.letInit, letFn)
-        if ik != "" { return ik }
       }
       if cd.letInit >= 0 {
         const cty = nodeTyAt(cd.letInit, fnIx)
@@ -14470,10 +14470,6 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
             const lk = sigKeyOfTy(cty)
             if lk != "" { return lk }
           }
-          // The nullable twin (`letInitTyIsNulFunc`'s shape): a bare `const t = m[k]` read of
-          // a function-valued map records `TyFunc | null`, and the narrowed call runs at the
-          // inner signature — so the key is the inner's, not "" (D1662).
-          if ct is TyNullable { return sigKeyOfTy(ct.nInner) }
         }
       }
     }
@@ -15222,6 +15218,13 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
       return { rrStore: st, rrRead: md.rdKind, rrConv: 4 }
     }
   }
+  // Any other map's value read converts only where a miss makes it a nullable rep.
+  if mvr >= 0 || (e is Index && readMapValTyAt(e, fnIx) >= 0) {
+    const nd = repOfNode(rx, fnIx)
+    if nd.rdCovered == 1 && readKindIsNul(nd.rdKind) {
+      return { rrStore: st, rrRead: nd.rdKind, rrConv: 4 }
+    }
+  }
   // A read narrowed out of a nullable storage reads its non-null kind: one the checker recorded
   // as narrowed, or one whose own type is that storage's non-null kind (a `?.` guard's re-read).
   if readKindIsNul(st) {
@@ -15325,5 +15328,19 @@ function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
     if v == MVK_STRUCT { return "struct" }
     return "mv" + i32ToStr(v)
   }
+  // A map with no value slot here (a hole bound per instance) holds what its type says.
+  const vt = readMapValTyAt(e, fnIx)
+  if vt >= 0 {
+    const vk = repSigKindOfTy(vt)
+    if vk != null { return vk }
+  }
   ""
+}
+
+// The value type of the map an index read `e` reads, from the receiver's type in frame
+// `fnIx`; -1 when the receiver is not a map there.
+function readMapValTyAt(e: Index, fnIx: i32): i32 {
+  const rt = nodeTyInOf(e.idxArr, fnIx)
+  if rt < 0 || !tyIsMap(rt) { return -1 }
+  tyMapValOf(rt)
 }
