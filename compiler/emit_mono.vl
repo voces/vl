@@ -45,7 +45,7 @@ import {
   nameIsParenSpanEnds,
   peelGroupParens,
 } from "./tyname"
-import { njSetPinFn, nodeRepTyIxOf } from "./check_core_state"
+import { fnCloCoerceTyIx, njSetPinFn, nodeRepTyIxOf } from "./check_core_state"
 import {
   bindGenUnionShapedArmInto,
   holePinReadOf,
@@ -432,6 +432,7 @@ import {
   lfNoteMinted,
   monoAnonParamPinTy,
   monoArgInstFe,
+  monoCloCoerceFe,
   monoFieldReadTyIn,
   monoFieldReadTys,
   monoGen,
@@ -698,6 +699,7 @@ import {
   fnTagHoldsTy,
   fnTagLeafCarry,
   fnTagListTy,
+  fnTagMembers,
   fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
   fnTagSetOfTy,
@@ -27075,11 +27077,54 @@ function monoSlotParamPins(fe: i32, out: string[]) {
   false
 }
 
+// Builds, for each delivery the tag decision recorded as a closure from a one-member set
+// (`fnCloCoerceTyIx`), the member's instance at the destination's parameters, banked for the
+// emitter (`monoCloCoerceFe`); -1 when one cannot be built (D14884).
+function monoCloCoerceBuild(): i32 {
+  let ix = 0
+  while ix < fnCloCoerceTyIx.length {
+    const t = fnCloCoerceTyIx[ix]
+    if t >= 0 {
+      const ds = fnTagMembers(fnTagSetOfTy(nodeTyIxOf(ix)))
+      const gfe = if ds.length == 1 { fnStmtsPosOf(ds[0]) } else { -1 }
+      const tname = monoConcreteFnTyName(t)
+      const pnames: string[] = []
+      if (
+        gfe < 0
+        || gfe >= monoGen.length
+        || monoGen[gfe] != 1
+        || tname == ""
+        || !monoFnTypeAnnParamsName(peelGroupParens(tname), pnames)
+      ) {
+        return emitFailAt(
+          "emitProgram: monomorphize: a function delivered to a declared function type has no instance there",
+          ix,
+        )
+      }
+      // A fresh read stands for the member, so the pins are the destination's.
+      const rd = mkIdent(monoSlotName(gfe), nodePos(ix))
+      monoLastInstFe = -1
+      const none: i32[] = []
+      if monoInstanceFor(gfe, pnames, rd, t, none) < 0 { return -1 }
+      if monoLastInstFe < 0 {
+        return emitFailAt(
+          "emitProgram: monomorphize: a function delivered to a declared function type has no instance there",
+          ix,
+        )
+      }
+      monoCloCoerceFe[ix] = monoLastInstFe
+    }
+    ix = ix + 1
+  }
+  0
+}
+
 // The monomorphization pass: snapshot which lifted functions are generic, then walk every
 // top-level statement in program order and every non-generic function body; instance
 // bodies are walked as they are created. Usage-gated: a program with no generic
 // declaration and no concrete higher-order function returns immediately.
 export function monomorphize(stmts: i32[]) {
+  monoCloCoerceFe = Map()
   monoClashLits = []
   monoCallTpl = Map()
   monoLitDestVariant = Map()
@@ -27227,6 +27272,7 @@ export function monomorphize(stmts: i32[]) {
     }
     fe2 = fe2 + 1
   }
+  if monoCloCoerceBuild() < 0 { return -1 }
   // Lambdas the flow table pins come first: the table's classes already span every binding a
   // lambda is written into, so one pass settles a chain of them (D3851).
   let pe = 0
