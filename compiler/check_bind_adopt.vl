@@ -265,7 +265,7 @@ export function recArmLitsAdopt() {
     const rt = if own >= 0 { nodeRepTyIxOf(ix) } else { -1 }
     if own >= 0 && (rt < 0 || tySame(rt, own)) {
       const arm = recNarrowRecordOf(own)
-      if arm >= 0 && ralHas(ralArms, arm) && litAtDstStorage(ix, arm) {
+      if arm >= 0 && (ralIsArm[arm] ?? false) && litAtDstStorage(ix, arm) {
         recordRepTyAdopt(ix, arm, 6)
       }
     }
@@ -277,11 +277,12 @@ export function recArmLitsAdopt() {
 // where `own` is a declared record itself, or two declared records of different types widen it.
 // Arms of two unions that are one structural type are one record.
 export function recNarrowRecordOf(own: i32): i32 {
-  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
-  if tyHasTyVar(own) || tyHasHole(own) { return -1 }
+  if own < 0 || own >= T.tys.length { return -1 }
+  const o = tyAt(own)
+  if !(o is TyObj) || tyHasTyVar(own) || tyHasHole(own) { return -1 }
   ralSync()
   let one = -1
-  for r in ralRecs {
+  for r in ralBySig[ralSigOf(o.objFieldNames)] ?? [] {
     if tySame(r, own) { return -1 }
     if recRepWidens(own, r) {
       if one >= 0 { return -1 }
@@ -291,59 +292,67 @@ export function recNarrowRecordOf(own: i32): i32 {
   if one >= 0 && ralStoredAlike(own, one) { one } else { -1 }
 }
 
-// Every declared record, each type once, union members first (`ralArmN` of them), for the
-// `cUserTypes` version `ralVer` read.
-let ralRecs: i32[] = []
-let ralArms: i32[] = []
+// Every declared record by its sorted field names, each type once, for the `cUserTypes` version
+// `ralVer` read; `ralIsArm` marks the union members among them, `ralArmN` of them.
+let ralBySig: {[string]: i32[]} = Map()
+let ralIsArm: {[i32]: boolean} = Map()
 let ralArmN = 0
 let ralVer = -1
-let ralTyN = -1
 
 function ralSync() {
-  if ralVer == cUserTypesVer && ralTyN == T.tys.length { return 0 }
+  if ralVer == cUserTypesVer { return 0 }
   ralVer = cUserTypesVer
-  ralTyN = T.tys.length
-  ralRecs = []
-  ralArms = []
+  ralBySig = Map()
+  ralIsArm = Map()
+  ralArmN = 0
   for nm in cUserTypes.keys() {
     const t = cUserTypes[nm] ?? -1
     const u = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
     if u is TyUnion && u.uMembers.length > 1 && !tyHasTyVar(t) {
       for m in u.uMembers {
-        if (
-          m >= 0
-          && m < T.tys.length
-          && tyAt(m) is TyObj
-          && !ralHas(ralArms, m)
-        ) {
-          ralArms.push(m)
-          ralRecs.push(m)
+        const k = ralAdd(m)
+        if k >= 0 && !(ralIsArm[k] ?? false) {
+          ralIsArm[k] = true
+          ralArmN = ralArmN + 1
         }
       }
     }
   }
-  ralArmN = ralArms.length
-  for nm in cUserTypes.keys() {
-    const t = cUserTypes[nm] ?? -1
-    if (
-      t >= 0
-      && t < T.tys.length
-      && tyAt(t) is TyObj
-      && !tyHasTyVar(t)
-      && !ralHas(ralRecs, t)
-    ) {
-      ralRecs.push(t)
-    }
-  }
+  for nm in cUserTypes.keys() { ralAdd(cUserTypes[nm] ?? -1) }
   0
 }
 
-// Whether `ts` holds a type the same as `t`.
-function ralHas(ts: i32[], t: i32): boolean {
-  for u in ts {
-    if tySame(u, t) { return true }
+// Files closed record `t` under its field names unless a record the same as it is filed; the
+// filed one, or -1 for a type that is no closed record.
+function ralAdd(t: i32): i32 {
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -1 }
+  const r = tyAt(t)
+  if !(r is TyObj) { return -1 }
+  const sig = ralSigOf(r.objFieldNames)
+  const b = ralBySig[sig] ?? []
+  for u in b {
+    if tySame(u, t) { return u }
   }
-  false
+  if b.length == 0 { ralBySig[sig] = b }
+  b.push(t)
+  t
+}
+
+// The field names `names` sorted, as one key.
+function ralSigOf(names: string[]): string {
+  const s: string[] = []
+  for n in names {
+    let i = s.length
+    s.push(n)
+    while i > 0 && s[i - 1] > n {
+      s[i] = s[i - 1]
+      i = i - 1
+    }
+    s[i] = n
+  }
+  let k = ""
+  for n in s { k = k + n + "," }
+  k
 }
 
 // Whether arm `arm` stores each field of record `own` as `own` does: the same type, or a `null`
