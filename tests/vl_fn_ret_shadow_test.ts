@@ -128,7 +128,7 @@ Deno.test({
       TAIL_WRITE,
       DROP_NONE,
       true,
-      "agree | line=1; agree | nn=1; recorded value, emitter void | __lambda_0=1",
+      "agree | line=1; agree | nn=1; emit-time: tail assignment lowered void | __lambda_0=1",
     );
   },
 });
