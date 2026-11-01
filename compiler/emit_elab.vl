@@ -182,6 +182,7 @@ import {
 import {
   mintAliasNote,
   mintFactNote,
+  mintParamBoundNote,
   mintParamFwdNote,
   mintParamSetNote,
   mintReset,
@@ -2239,6 +2240,18 @@ export function elabMintFacts(): i32 {
         ekNames[k],
         ekTys[k],
       )
+      const repKey = (elabGuessKeys[k] ?? false)
+        || (elabCbRepKeys[k] ?? false)
+        || (elabSigAltKeys[k] ?? false)
+      // The set each un-annotated parameter is bound to, which a forward of it hands on; a rep
+      // instance takes the parameter as a closure and binds none.
+      for pi in dn.fnParams {
+        const pn = nodeAt(pi)
+        if pn is Param && pn.parType < 0 {
+          const bs = if repKey { -1 } else { fnTagSetOfTy(substTyDeep(nodeTyIxOf(pi), ekNames[k], ekTys[k])) }
+          mintParamBoundNote(ekDecl[k], i32ListIndexOf(dn.fnParams, pi), bs)
+        }
+      }
       // The hand-back first: the reads below ask it.
       n = n + elabMintRetFact(k)
       n = n + elabMintFactsIn(dn.fnBody, ekDecl[k], k, sc)
@@ -2431,6 +2444,36 @@ function elabMintFwdTarget(ix: i32, p: i32): i32[] {
     return none
   }
   [d2, j]
+}
+
+// Notes parameter `i` of `decl`, read at `ix` as a positional argument of call `p` through a
+// set of functions (as instance `k` types its callee), as forwarded to every member's
+// parameter there; false when `p` is no such call or set `st` is none.
+function elabMintSetFwd(
+  decl: i32,
+  i: i32,
+  ix: i32,
+  p: i32,
+  k: i32,
+  st: i32,
+): boolean {
+  if st < 0 || p < 0 || p >= P.nodes.length { return false }
+  const pn = nodeAt(p)
+  if !(pn is Call) { return false }
+  const j = i32ListIndexOf(pn.callArgs, ix)
+  if j < 0 || j < pn.callArgNames.length && pn.callArgNames[j] != "" {
+    return false
+  }
+  const ms = fnTagMembers(fnTagSetOfTy(elabNodeTy(parenPeelIx(pn.callFn), k)))
+  if ms.length == 0 { return false }
+  for m in ms {
+    const f2 = nodeAt(m)
+    if !(f2 is FuncDecl) || j >= f2.fnParams.length { return false }
+    const q = nodeAt(f2.fnParams[j])
+    if !(q is Param) || q.parType >= 0 { return false }
+  }
+  for m in ms { mintParamFwdNote(decl, i, m, j) }
+  true
 }
 
 // The declaration the callee name `v` reads, through at most `depth` `const` aliases; -1 when
@@ -2714,7 +2757,9 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       const to = elabMintFwdTarget(ix, p)
       if to.length == 2 && st >= 0 {
         mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
-      } else {
+      } else if (
+        !elabMintSetFwd(decl, i32ListIndexOf(dn.fnParams, pd), ix, p, k, st)
+      ) {
         mintSetPartialNote(st)
       }
     }
@@ -2749,6 +2794,9 @@ function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       const pn = if p >= 0 { nodeAt(p) } else { nodeAt(ix) }
       if to.length == 2 && st >= 0 {
         mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
+      } else if (
+        elabMintSetFwd(decl, i32ListIndexOf(dn.fnParams, pd), ix, p, k, st)
+      ) {
       } else if (
         !(pn is Call && pn.callFn == ix && elabMintFactAt(pn, p, decl, k, sc))
       ) {
@@ -2992,6 +3040,43 @@ function elabArmEarly(ad: i32, an: Call, a: i32) {
   elabReachNote(-1, k, a)
 }
 
+// Demands at the root the un-annotated member arm `a` calls, at the arm's arguments' closed
+// types, so the call mono builds for it reads that instance's parameters.
+function elabArmHole(a: i32) {
+  const an = nodeAt(a)
+  if !(an is Call) { return 0 }
+  const ad = identDeclOf(an.callFn)
+  if ad < 0 || ad >= P.nodes.length { return 0 }
+  const f = nodeAt(ad)
+  const sig = nodeTyIxOf(ad)
+  if (
+    !(f is FuncDecl)
+    || f.fnTyParams.length > 0
+    || sig < 0
+    || sig >= T.tys.length
+  ) {
+    return 0
+  }
+  const st = tyAt(sig)
+  if !(st is TyFunc) || st.fnParamTypes.length != an.callArgs.length {
+    return 0
+  }
+  if !tyHasTyVar(sig) { return 0 }
+  const pTys: i32[] = []
+  let i = 0
+  while i < an.callArgs.length {
+    const p = st.fnParamTypes[i]
+    pTys.push(
+      if tyHasTyVar(p) { widenLitTy(nodeTyIxOf(an.callArgs[i])) } else { p },
+    )
+    i = i + 1
+  }
+  if !tysClosed(pTys) { return 0 }
+  const none: string[] = []
+  const noTys: i32[] = []
+  elabReachNote(-1, elabDemandFrom(ad, none, noTys, pTys, -1, a), a)
+}
+
 // Whether call `ix` through a tagged set has an arm calling `d`.
 function elabArmsName(ix: i32, d: i32): boolean {
   for a in fnTagCallArms(ix) {
@@ -3137,6 +3222,12 @@ export function elabRun() {
       }
     }
     r = r + 1
+  }
+  // An arm no row keyed reaches its un-annotated member at the arm's own arguments.
+  for c in elabCalls {
+    for a in fnTagCallArms(c) {
+      if elabCallInstFrom(a, -1) < 0 { elabArmHole(a) }
+    }
   }
   // A call of a module binding above its declaration, at its arguments' own types.
   for ec in elabEarlyCalls { elabEarlyCallRows(ec) }
@@ -5169,9 +5260,29 @@ function elabReachedOf(k: i32, d: i32): i32 {
   found
 }
 
+// Whether `d` declares type parameters of its own.
+function elabIsGenericDecl(d: i32): boolean {
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  n is FuncDecl && n.fnTyParams.length > 0
+}
+
+// The one instance of declaration `d`, -1 for none, -2 for several.
+function elabSoleInstOf(d: i32): i32 {
+  let found = -1
+  let i = 0
+  while i < ekDecl.length {
+    if ekDecl[i] == d {
+      if found >= 0 { return 0 - 2 }
+      found = i
+    }
+    i = i + 1
+  }
+  found
+}
+
 // Type `t`, read at instance `k`, closed: each function value it carries as `Fn#d` takes the
-// instance of `d` `k` reaches; a member `k` reaches no instance of adds none. -1 where one is
-// reached at two, or `t` stays open.
+// instance of `d` `k` reaches, else, for a generic `d`, its only instance (its D4551 default,
+// D14784); a member with neither adds none. -1 where one is reached at two, or `t` stays open.
 export function elabOutTy(t: i32, k: i32): i32 {
   if t < 0 || t >= T.tys.length { return -1 }
   if !tyHasTyVar(t) { return t }
@@ -5180,7 +5291,11 @@ export function elabOutTy(t: i32, k: i32): i32 {
   const names: string[] = []
   const tys: i32[] = []
   for d in ds {
-    const r = elabReachedOf(k, d)
+    let r = elabReachedOf(k, d)
+    if r == -1 && elabIsGenericDecl(d) {
+      const so = elabSoleInstOf(d)
+      if so >= 0 { r = so }
+    }
     if r == -1 { continue }
     if r < 0 { return -1 }
     let i = 0
