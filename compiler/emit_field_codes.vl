@@ -31,17 +31,15 @@ import {
   sFieldElemNameAt,
   sScanLim,
   structIndexOfTy,
-  variantFieldElemName,
-  variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import { nameIsShapeSpanEnds, tyGroupWrapsWhole } from "./emit_base"
+import { recNarrowRecordOf } from "./check_bind_adopt"
 import { rowFieldCode0Kind } from "./emit_join_records"
 import { fieldCodeOfListRep } from "./emit_list_rep"
 import { isStructOfTy, mvValLowersTy } from "./emit_mv_slots"
 import { isVariantSpelling, variantIndexOf } from "./emit_local_slots"
 import {
   MV_ARM_NOHINT,
-  repCanonId,
   repElemTyOfName,
   repNameCanonId,
   repOfTy,
@@ -74,8 +72,6 @@ import {
   sIsRefRow,
   sNames,
   sTyIx,
-  uFieldCount,
-  uFieldStart,
   uVarTyIx,
   uVariants,
   unMemAtoms,
@@ -85,7 +81,6 @@ import {
 } from "./emit_state"
 import { sFieldIndex } from "./emit_struct_order"
 import { unionMemberSetOf, unionRowKeyAB } from "./emit_union_registry"
-import { variantFieldIndex } from "./emit_variant_sig"
 import { strListIndexOf } from "./listutil"
 import {
   annGenAppSpanEnds,
@@ -176,80 +171,6 @@ export function fieldCodeForMatch(ty: i32): i32 {
   -2
 }
 
-// `variantIndexOfTypeName`'s field-set arm asked of the type instead of a spelling, first match
-// wins.
-function variantRowOfObjFieldSet(ty: i32): i32 {
-  variantRowOfObjFieldSetK(ty, false)
-}
-
-// The leniency-levelled form (D733).
-// `widen` applies `objFieldCodeWidens` in place of code equality. First-match is kept on
-// the widened pass here (unlike the struct twin, which demands uniqueness) because the
-// variant side already has one first-match authority (`objVariantName`) this can only agree with or decline.
-export function variantRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
-  if ty < 0 { return -1 }
-  const t = tyAt(ty)
-  if t is TyObj {
-    const fnames = t.objFieldNames
-    const ftys = t.objFieldTypes
-    let vi = 0
-    while vi < uVariants.length {
-      if uFieldStart[vi] + uFieldCount[vi] > sFieldElemName.length {
-        vi = vi + 1
-        continue
-      }
-      if uFieldCount[vi] == fnames.length {
-        let ok = true
-        let k = 0
-        while k < fnames.length {
-          const fj = variantFieldIndex(vi, fnames[k])
-          if fj < 0 {
-            ok = false
-          } else {
-            const want = fieldCodeForMatch(ftys[k])
-            if want >= 0 {
-              if widen {
-                if (
-                  !variantFieldCodeWidens(
-                    want,
-                    variantFieldTypeAt(vi, fj),
-                    vi,
-                    fj,
-                  )
-                ) {
-                  ok = false
-                }
-              } else if want != variantFieldTypeAt(vi, fj) {
-                ok = false
-              }
-            } else {
-              // The same leniency-with-one-tightening the struct matcher carries: uncoded
-              // fields are lenient, except a code-15 nested row checked by canonical rep.
-              if variantFieldTypeAt(vi, fj) == FC_STRUCT {
-                const rowElem = variantFieldElemName(vi, fj)
-                if rowElem != "" {
-                  const cq = repCanonId(ftys[k])
-                  let cr = repNameCanonId(rowElem)
-                  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
-                  if cq >= 0 {
-                    if cr >= 0 {
-                      if cq != cr { ok = false }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          k = k + 1
-        }
-        if ok { return vi }
-      }
-      vi = vi + 1
-    }
-  }
-  -1
-}
-
 // The declaration-identity name of an arena type — `shapeNominalOfTy`'s two arena rungs,
 // lifted out so other nominal questions can ask them without the two field-set scans that
 // follow there. Both rungs answer by declaration identity, never a guess. "" for an
@@ -300,12 +221,6 @@ export function objFieldCodeWidens(
   fj: i32,
 ): boolean {
   fieldCodeWidensElem(qc, rc, sFieldElemNameAt(si, fj))
-}
-
-// `fieldCodeWidensElem` against a VARIANT row's field — the same relation read out of the
-// other table, so the two field-set scans cannot drift on what a widening is.
-function variantFieldCodeWidens(qc: i32, rc: i32, vi: i32, fj: i32): boolean {
-  fieldCodeWidensElem(qc, rc, variantFieldElemName(vi, fj))
 }
 
 // Whether every field a shape spelling writes as `i32` or `boolean` has that same code-0 kind
@@ -652,7 +567,14 @@ export function cbRetVariantIdx(fe: i32) {
   // identity the arena can't recover (B208). The arena arm is stricter, refusing a
   // field-set collision `shapeFieldTypeCompatK` would let through (avoided by the `fRetKind` guard below).
   let vi = variantIndexOf(nm)
-  if vi < 0 { vi = variantRowOfObjFieldSet(inferRetTyIxByNode(fnStmts[fe])) }
+  if vi < 0 {
+    const rt = inferRetTyIxByNode(fnStmts[fe])
+    vi = repVariantShapeRowOf(rt)
+    if vi < 0 {
+      const nr = recNarrowRecordOf(rt)
+      if nr >= 0 { vi = repVariantShapeRowOf(nr) }
+    }
+  }
   if vi < 0 { return -1 }
   // A lambda whose inferred return the checker classified as a plain struct must not
   // collapse to a variant merely because its anonymous shape coincides with an unrelated
