@@ -296,7 +296,7 @@ Deno.test({
 
 // The result-kind shadow: a valued function's recorded result against its lowered signature's
 // result token. A closure writing a value `if` into a captured `i64` records `i32` (an
-// assignment yields its right side) and lowers the stored `i64`.
+// assignment yields its right side) and lowers it at `i32` too (D14796).
 const HEX_LAMBDA = `function g(c: boolean) {
   let x: i64 = 0
   const set = () => {
@@ -318,7 +318,7 @@ Deno.test({
       HEX_LAMBDA,
       DROP_NONE,
       true,
-      "kind: recorded >i, lowered >I | __lambda_0=1",
+      "kind agree | __lambda_0=1",
       true,
     );
   },

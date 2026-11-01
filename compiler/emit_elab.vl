@@ -121,11 +121,13 @@ import {
   elabWideRowRet,
   elabWideRowT,
   fnTagCallArms,
+  fnTagLeafSetOf,
   fnTagListTy,
   fnTagMembers,
   fnTagOwnTyParamAlone,
   fnTagSetIsTagged,
   fnTagSetOfTy,
+  fnTagSetTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
 import {
@@ -147,9 +149,10 @@ import { a20RetWalk } from "./check_nj_gate"
 import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
 import { narrowedFromTyOf, nodeTyIxOf } from "./check_node_tys"
 import {
+  nodeCtxTyIxOf,
   nodeRepTyIx,
   nodeRepTyIxOf,
-  nodeRepUnionIx nodeCtxTyIxOf,
+  nodeRepUnionIx,
 } from "./check_core_state"
 import { adoptRetLits } from "./check_inferred_return"
 import {
@@ -2045,6 +2048,58 @@ function elabSetCallRows(
       elabReachNote(from, elabEnqueue(m, mn, mt, from), -1)
       elabArgRows(ix, m, mn, mt, from)
     }
+    if from >= 0 && elabArmTakesSet(ix, m) { elabArmAt(ix, m, from, pts) }
+  }
+  0
+}
+
+// Whether call `ix` of `d` is through a set whose arm hands `d` a set of functions, which is
+// instanced at each arm alone rather than at the call's row.
+function elabRowByArms(ix: i32, d: i32): boolean {
+  const rc = nodeAt(ix)
+  rc is Call
+    && identDeclOf(parenPeelIx(rc.callFn)) != d
+    && elabArmTakesSet(ix, d)
+}
+
+// Whether call `ix` through a tagged set has an arm handing member `m` a set of functions,
+// which is instanced at the set instead of at the call's one signature.
+function elabArmTakesSet(ix: i32, m: i32): boolean {
+  for a in fnTagCallArms(ix) {
+    const an = nodeAt(a)
+    if an is Call && identDeclOf(an.callFn) == m && elabArmHandsSet(a, m) {
+      return true
+    }
+  }
+  false
+}
+
+// Demands under instance `from` member `m`'s instance for each arm of call `ix` calling it, at
+// argument types `pts` there, a parameter handed a tagged set taking the set.
+function elabArmAt(ix: i32, m: i32, from: i32, pts: i32[]) {
+  for a in fnTagCallArms(ix) {
+    const an = nodeAt(a)
+    if (
+      an is Call
+      && identDeclOf(an.callFn) == m
+      && an.callArgs.length == pts.length
+    ) {
+      const pTys: i32[] = []
+      let i = 0
+      while i < pts.length {
+        const setTy = elabCallArgSetTy(a, m, i, from)
+        pTys.push(if setTy >= 0 { setTy } else { widenLitTy(pts[i]) })
+        i = i + 1
+      }
+      if tysClosed(pTys) {
+        const none: string[] = []
+        const noTys: i32[] = []
+        elabSigAlting = elabRowAtSetRep(a, m)
+        const k = elabDemandFrom(m, none, noTys, pTys, from, a)
+        elabSigAlting = false
+        elabReachNote(from, k, a)
+      }
+    }
   }
   0
 }
@@ -2194,6 +2249,7 @@ export function elabMintFacts(): i32 {
         && !(elabGuessKeys[kk] ?? false)
         && !(elabCbRepKeys[kk] ?? false)
         && !(elabSigAltKeys[kk] ?? false)
+        && !elabKeyUncalled(kk)
       ) {
         all = false
       }
@@ -2202,6 +2258,11 @@ export function elabMintFacts(): i32 {
     if !all { mintSetPartialNote(elabMintSets[c] ?? -1) }
   }
   n
+}
+
+// Whether instance `k` is reached by no call, as a checker pin a later decision outdated is.
+function elabKeyUncalled(k: i32): boolean {
+  (elabKeyCalls[k] ?? []).length == 0 && (elabRepRowCalls[k] ?? []).length == 0
 }
 
 // Notes instance `k`'s hand-back: every value its function returns reads one parameter, which
@@ -2409,6 +2470,56 @@ function elabHeldSetOf(t: i32): i32 {
   -1
 }
 
+// The parameter of `decl` read `root` names: the parameter itself, or a `const` alias of it
+// that is only ever called (`elabCallOnlyAlias`); else -1.
+function elabCalleeParam(root: i32, decl: i32): i32 {
+  const d = identDeclOf(root)
+  if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
+    return -1
+  }
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) { return -1 }
+  if nodeAt(d) is Param { return d }
+  const ap = elabCallOnlyAlias(d, dn)
+  if ap >= 0 { return ap }
+  -1
+}
+
+// The parameter of `fn` that `const` binding `d` is initialised with, where every read of `d`
+// in `fn`'s body is the callee of a call, so the alias hands the set nowhere else; else -1.
+function elabCallOnlyAlias(d: i32, fn: FuncDecl): i32 {
+  const ln = nodeAt(d)
+  if (
+    !(ln is LetDecl)
+    || ln.letKw != "const"
+    || ln.letType >= 0
+    || ln.letInit < 0
+  ) {
+    return -1
+  }
+  const ix = parenPeelIx(ln.letInit)
+  if ix < 0 || !(nodeAt(ix) is Ident) { return -1 }
+  const pd = identDeclOf(ix)
+  if !i32ListHas(fn.fnParams, pd) { return -1 }
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == d {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        if !(pn is Call) || parenPeelIx(pn.callFn) != x { return -1 }
+      }
+      for k in nodeChildren(x) {
+        todo.push(k)
+        par.push(x)
+      }
+    }
+  }
+  pd
+}
+
 // Marks partial the set instance `k` binds a parameter of `decl` to, where node `ix` (the child
 // of `p`, or inside a nested function when `p` is -1) reads that parameter other than as a
 // callee: a set handed on is typed where it lands, which this decision does not see.
@@ -2424,6 +2535,10 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
     const pd = identDeclOf(ix)
     const dn = nodeAt(decl)
     if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
+      // A `const` alias that is only ever called reads the set where its calls do.
+      if p >= 0 && nodeAt(p) is LetDecl && elabCallOnlyAlias(p, dn) == pd {
+        return 0
+      }
       // A parameter handed back lands at the call's own value, which the decision reads.
       if elabRetHandsBack(decl, ix, i32ListIndexOf(dn.fnParams, pd)) {
         return 0
@@ -2512,7 +2627,7 @@ function elabChainStep(x: i32): i32 {
 function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const cf = parenPeelIx(c.callFn)
   const root = elabSlotRoot(cf)
-  const pd = identDeclOf(root)
+  const pd = elabCalleeParam(root, decl)
   if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return false }
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) || !i32ListHas(dn.fnParams, pd) { return false }
@@ -2640,7 +2755,10 @@ function elabRowAtSetRep(ix: i32, d: i32): boolean {
     return false
   }
   const cn = nodeAt(ix)
-  if !(cn is Call) || identDeclOf(parenPeelIx(cn.callFn)) != d { return false }
+  if !(cn is Call) { return false }
+  if identDeclOf(parenPeelIx(cn.callFn)) != d && !elabArmsName(ix, d) {
+    return false
+  }
   const f = nodeAt(d)
   if !(f is FuncDecl) { return false }
   let i = 0
@@ -2662,14 +2780,20 @@ function elabRowAtSetRep(ix: i32, d: i32): boolean {
 }
 
 // Demands member `ad`'s instance for its arm `an` (node `a`) of a call through a set: each
-// parameter a type parameter of `ad` names takes the argument's type, any other keeps its own.
+// parameter a type parameter of `ad` names takes the argument's type, one handed a tagged set
+// takes the set, and any other keeps its own.
 function elabArmEarly(ad: i32, an: Call, a: i32) {
   if ad < 0 || ad >= P.nodes.length { return 0 }
   const f = nodeAt(ad)
   const sig = nodeTyIxOf(ad)
+  // A member generic by its un-annotated parameters is demanded at the set an argument holds, as
+  // the row's own member is: keyed there when the set is tagged, else as the set's rep.
+  const holeSet = f is FuncDecl
+    && f.fnTyParams.length == 0
+    && elabArmHandsSet(a, ad)
   if (
     !(f is FuncDecl)
-    || f.fnTyParams.length == 0
+    || f.fnTyParams.length == 0 && !holeSet
     || sig < 0
     || sig >= T.tys.length
   ) {
@@ -2683,15 +2807,50 @@ function elabArmEarly(ad: i32, an: Call, a: i32) {
   let i = 0
   while i < an.callArgs.length {
     const p = st.fnParamTypes[i]
-    pTys.push(
-      if tyHasTyVar(p) { widenLitTy(nodeTyIxOf(an.callArgs[i])) } else { p },
-    )
+    const setTy = if holeSet { elabCallArgSetTy(a, ad, i, -1) } else { -1 }
+    const at = if tyHasTyVar(p) { widenLitTy(nodeTyIxOf(an.callArgs[i])) } else { p }
+    pTys.push(if setTy >= 0 { setTy } else { at })
     i = i + 1
   }
   if !tysClosed(pTys) { return 0 }
   const none: string[] = []
   const noTys: i32[] = []
-  elabReachNote(-1, elabDemandFrom(ad, none, noTys, pTys, -1, a), a)
+  elabSigAlting = holeSet && elabRowAtSetRep(a, ad)
+  const k = elabDemandFrom(ad, none, noTys, pTys, -1, a)
+  elabSigAlting = false
+  elabReachNote(-1, k, a)
+}
+
+// Whether call `ix` through a tagged set has an arm calling `d`.
+function elabArmsName(ix: i32, d: i32): boolean {
+  for a in fnTagCallArms(ix) {
+    const an = nodeAt(a)
+    if an is Call && identDeclOf(an.callFn) == d { return true }
+  }
+  false
+}
+
+// Whether arm `a` of a call through a set hands member `ad` a set of functions at an
+// un-annotated parameter.
+function elabArmHandsSet(a: i32, ad: i32): boolean {
+  const an = nodeAt(a)
+  const f = nodeAt(ad)
+  if !(an is Call) || !(f is FuncDecl) { return false }
+  let i = 0
+  while i < an.callArgs.length && i < f.fnParams.length {
+    const q = nodeAt(f.fnParams[i])
+    const ax = parenPeelIx(an.callArgs[i])
+    if (
+      q is Param
+      && q.parType < 0
+      && ax >= 0
+      && fnTagSetOfTy(nodeTyIxOf(ax)) >= 0
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Runs the worklist from the generic pass's closed calls.
@@ -2774,6 +2933,18 @@ export function elabRun() {
       const rn: string[] = []
       const rt: i32[] = []
       elabRowComplete(ix, d, callBindNamesAt(r), tys, rn, rt)
+      if elabRowByArms(ix, d) {
+        // The row's own instance serves a set left untagged; no call reaches it.
+        elabSigAlting = elabRowAtSetRep(ix, d)
+        elabReachNote(-1, elabEnqueue(d, rn, rt, -1), -1)
+        elabSigAlting = false
+        for a in fnTagCallArms(ix) {
+          const an = nodeAt(a)
+          if an is Call { elabArmEarly(identDeclOf(an.callFn), an, a) }
+        }
+        r = r + 1
+        continue
+      }
       // A row binding an untagged set's value at its rep is that rep's instance.
       elabSigAlting = elabRowAtSetRep(ix, d)
       const k = elabEnqueue(d, rn, rt, -1)
@@ -2839,8 +3010,10 @@ export function elabRun() {
     const ix = callBindIxAt(r)
     const tys = elabSetArgBind(ix, callBindNamesAt(r), callBindTysAt(r))
     const ck = elabCallInstFrom(ix, -1)
-    if ck >= 0 { elabSetRepRow(ix, callBindNamesAt(r), tys, ck) }
-    elabSetRepRow(ix, callBindNamesAt(r), tys, -1)
+    if !elabRowByArms(ix, elabCallDeclOf(ix)) {
+      if ck >= 0 { elabSetRepRow(ix, callBindNamesAt(r), tys, ck) }
+      elabSetRepRow(ix, callBindNamesAt(r), tys, -1)
+    }
     if elabRepStubbed { stubRows.push(r) }
     r = r + 1
   }
@@ -3956,13 +4129,23 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
   let copied = false
   let i = 0
   while i < cn.callArgs.length && i < f.fnParams.length {
-    const st = nodeTyIxOf(parenPeelIx(cn.callArgs[i]))
+    const ax = parenPeelIx(cn.callArgs[i])
+    // A function named where the late decision made it an id carries its set, as mono reads it.
+    const ls = if fnTagTyIsTagged(nodeTyIxOf(ax)) { -1 } else { fnTagLeafSetOf(ax) }
+    const st = if ls >= 0 && fnTagSetTy(ls) >= 0 { fnTagSetTy(ls) } else { nodeTyIxOf(ax) }
     const named = i < cn.callArgNames.length && cn.callArgNames[i] != ""
     const pn = nodeAt(f.fnParams[i])
     const alone = pn is Param && pn.parType >= 0 && fnTagOwnTyParamAlone(f, i)
-    // An argument of only uncalled hole functions binds the stub it is delivered at (D6881).
+    // An argument of only uncalled hole functions binds the stub it is delivered at (D6881),
+    // unless it is a tagged set's id.
     const stub = elabStubArg.get(i32ToStr(ix) + ":" + i32ToStr(i)) ?? -1
-    if !named && pn is Param && pn.parType < 0 && stub >= 0 {
+    if (
+      !named
+      && pn is Param
+      && pn.parType < 0
+      && stub >= 0
+      && !fnTagTyIsTagged(st)
+    ) {
       const hn = elabHoleRootName(nodeTyIxOf(f.fnParams[i]))
       let j = 0
       while j < names.length && j < out.length {

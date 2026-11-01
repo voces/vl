@@ -59,7 +59,15 @@ import { isVarTyIxOf } from "./check_list_union"
 import { i32TyIx } from "./check_leaf_steps"
 import { nodeTyIxOf } from "./check_node_tys"
 import { holeSlotCallRets, substTyDeep } from "./check_relate_core"
-import { T, TyFunc, mkFuncTy, tyAt, tyEq, tyMayHoldFn } from "./check_types"
+import {
+  T,
+  TyFunc,
+  mkFuncTy,
+  tyAt,
+  tyEq,
+  tyIsMap,
+  tyMayHoldFn,
+} from "./check_types"
 import {
   monoAnnHasTyParam,
   monoDeclAnnName,
@@ -379,6 +387,14 @@ function vrStep(x: i32, path: string): i32[] {
     }
     ForIn => {
       if x == pn.fiBody { return none }
+      if (
+        x == pn.fiIter
+        && vrFollow
+        && tyIsMap(nodeTyIxOf(x))
+        && pn.fiVar2 == ""
+      ) {
+        return none
+      }
       if x == pn.fiIter { return vrForVar(pn, path) }
     }
     FuncDecl => {
@@ -417,6 +433,10 @@ function vrStep(x: i32, path: string): i32[] {
       if !vrExact {
         const pr = vrPushRecv(pn)
         if pr >= 0 { return vrPushed(pn, pr, x, path) }
+        const sr = vrMapSetRecv(pn)
+        if sr >= 0 && pn.callArgs.length == 2 && pn.callArgs[1] == x {
+          return vrPushed(pn, sr, x, path)
+        }
         return vrArg(pn, x, path)
       }
     }
@@ -913,6 +933,15 @@ function vrPushRecv(n: Call): i32 {
   m.memObj
 }
 
+// The map call `n` sets a value into, for a followed question: its receiver; else -1.
+function vrMapSetRecv(n: Call): i32 {
+  if !vrFollow || n.callFn < 0 { return -1 }
+  const m = nodeAt(n.callFn)
+  if !(m is Member) || m.memProp != "set" { return -1 }
+  if !tyIsMap(nodeTyIxOf(m.memObj)) { return -1 }
+  m.memObj
+}
+
 // The `Call` arm of `vrStep` for value `x` pushed onto list `recv` by call `n`: it is an element
 // of the binding `recv` names, at no known position; lost for any other receiver or a spread.
 function vrPushed(n: Call, recv: i32, x: i32, path: string): i32[] {
@@ -934,6 +963,21 @@ function vrProp(prop: string, p: i32, path: string): i32[] {
     if c >= 0 {
       const cn = nodeAt(c)
       if cn is Call && cn.callFn == p && vrPushRecv(cn) >= 0 { return none }
+      if cn is Call && cn.callFn == p && vrMapSetRecv(cn) >= 0 { return none }
+      const pm = nodeAt(p)
+      const mo = if pm is Member { pm.memObj } else { -1 }
+      if (
+        cn is Call
+        && cn.callFn == p
+        && vrFollow
+        && mo >= 0
+        && tyIsMap(nodeTyIxOf(mo))
+      ) {
+        if prop == "has" || prop == "delete" { return none }
+        if prop == "get" && vrElemOf(path) == -1 {
+          return vrCalls(c, vrPathRest)
+        }
+      }
     }
     return vrLost()
   }
