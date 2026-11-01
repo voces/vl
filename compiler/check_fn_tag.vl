@@ -113,6 +113,9 @@ import {
   fnTagCalls,
   fnTagEscapeTysTake,
   fnTagEscapesTake,
+  fnTagEtaAt,
+  fnTagEtaBuiltSets,
+  fnTagEtaSetOf,
   fnTagEtaWant,
   fnTagMark,
   fnTagMembers,
@@ -157,20 +160,33 @@ export function fnTagDecide(rootIx: i32) {
     }
     pass = pass + 1
   }
-  // A set of non-generic declared functions is called through where a function taking or
-  // returning its value is delivered; a value of the set delivered to a closed function type
-  // is the closure built there, unless the set has one member and so needs no dispatch.
+  // A set of declared functions is called through where a function taking or returning its value
+  // is delivered; a value of the set delivered to a closed function type is the closure built
+  // there, unless the set has one member, or a generic one, and so needs a dispatch.
   for et in escTys {
     const own = fnTagSetOfTy(et) >= 0
     for s in ftEscSets(et) {
-      let plain = !own || fnTagMembers(s).length == 1
+      // A value of generic members has no one closure signature, so its delivery dispatches too.
+      let gen = false
       for m in fnTagMembers(s) {
-        if !ftPlainDecl(m) { plain = false }
+        if ftNamedDecl(m) && !ftPlainDecl(m) { gen = true }
+      }
+      let plain = !own || fnTagMembers(s).length == 1 || gen
+      for m in fnTagMembers(s) {
+        if !ftNamedDecl(m) { plain = false }
       }
       if plain && !i32ListHas(seen, s) {
         seen.push(s)
         ftTry(rootIx, s, calls, mint)
       }
+    }
+  }
+  // A written binding of generic members delivered through an adapter the last check built is
+  // the id that adapter dispatches on, so its set is decided again.
+  for s in fnTagEtaBuiltSets() {
+    if ftWideEscOk(s) && !i32ListHas(seen, s) {
+      seen.push(s)
+      ftTry(rootIx, s, calls, mint)
     }
   }
   // A delivery of a tagged set, or to a function type taking or returning one, is built by the
@@ -179,7 +195,7 @@ export function fnTagDecide(rootIx: i32) {
   while ei < ftEscapes.length && ei < escTys.length {
     const et = escTys[ei]
     if fnTagSetIsTagged(fnTagSetOfTy(et)) || ftSigTagged(et) {
-      fnTagEtaWant(ftEscapes[ei])
+      fnTagEtaWant(ftEscapes[ei], fnTagSetOfTy(et))
     }
     ei = ei + 1
   }
@@ -553,12 +569,14 @@ function ftScan(
         if !ok || !ftNodeOk(x, s, ds, leaves, ids) { return false }
         if !ftCtxOk(x, p, g, fn, s) { return false }
         const pn = nodeAt(p)
-        // A written binding is read as a callee, a binding or a join's value: a function it is
-        // captured into sees later writes, and a delivery to a slot is not built from one yet.
+        // A written binding is read as a callee, a binding, a join's value or a delivery to a
+        // closed function type, which the adapter built there reads once: a function it is
+        // captured into sees later writes.
         const xn = nodeAt(x)
         if xn is Ident && fnLetIsWide(nodeTyIxOf(x)) {
-          if cwUseCaptures(x) || i32ListHas(ftEscapes, x) { return false }
-          if pn is Call && pn.callFn != x { return false }
+          const esc = i32ListHas(ftEscapes, x) || fnTagEtaAt(x)
+          if cwUseCaptures(x) || esc && !ftWideEscOk(s) { return false }
+          if pn is Call && pn.callFn != x && !esc { return false }
           ftWideSeen = true
         }
         // A binding of the set written: what the write stores is an id of it.
@@ -660,6 +678,29 @@ function ftPlainDecl(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
   const f = nodeAt(d)
   f is FuncDecl && f.fnName != "" && f.fnTyParams.length == 0
+}
+
+// Whether a written binding of set `s` may be delivered through an adapter: each member is a named
+// declaration and one is generic, so no one closure signature holds the binding's value.
+function ftWideEscOk(s: i32): boolean {
+  let gen = false
+  for m in fnTagMembers(s) {
+    if !ftNamedDecl(m) { return false }
+    if !ftPlainDecl(m) { gen = true }
+  }
+  gen
+}
+
+// Whether `x` is a delivery of set `s` that the last check built as an adapter.
+function ftWideEtaAt(x: i32, s: i32): boolean {
+  fnTagEtaAt(x) && fnTagEtaSetOf(x) == s && ftWideEscOk(s)
+}
+
+// Whether node `d` declares a named function, generic or not.
+function ftNamedDecl(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = nodeAt(d)
+  f is FuncDecl && f.fnName != ""
 }
 
 // The sets an escape of type `t` delivers: its own, or those of its parameters and result.
@@ -1203,7 +1244,7 @@ let ftEscapes: i32[] = []
 // sits where its value is a binding, a return, an arm, or a callee through `s`.
 function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
   if p < 0 { return false }
-  if i32ListHas(ftEscapes, x) { return true }
+  if i32ListHas(ftEscapes, x) || ftWideEtaAt(x, s) { return true }
   const pn = nodeAt(p)
   match pn {
     Program | Paren => {
@@ -1254,6 +1295,10 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     // A write to a binding of the set stores one of its ids.
     BinExpr => {
       if pn.binOp == "??" { return pn.binRight == x && ftIsS(p, s) }
+      // Two ids of one set are equal when they name one member.
+      if pn.binOp == "==" || pn.binOp == "!=" {
+        return ftIsS(pn.binLeft, s) && ftIsS(pn.binRight, s)
+      }
       if !ftIsStore(pn) { return false }
       if pn.binLeft == x {
         if x < 0 || x >= P.nodes.length { return false }
