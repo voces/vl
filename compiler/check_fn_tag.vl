@@ -349,6 +349,49 @@ function ftCommit(rootIx: i32, k: i32, calls: i32[], mint: i32[]) {
   0
 }
 
+// Whether member `d`'s name is in scope at every call its set `s` builds arms at: a lambda or a
+// function its name resolves to everywhere is, another nested one only where its parent's body
+// holds both.
+function ftMemberSeenAtArms(
+  d: i32,
+  s: i32,
+  calls: i32[],
+  mint: i32[],
+): boolean {
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) || dn.fnName == "" || (fnDeclIx[dn.fnName] ?? -1) == d {
+    return true
+  }
+  const pf = fnDeclParent[d] ?? -1
+  if pf == -1 { return true }
+  const pn = if pf >= 0 && pf < P.nodes.length { nodeAt(pf) } else { null }
+  if !(pn is FuncDecl) || pn.fnBody < 0 || pn.fnBody >= P.nodes.length {
+    return false
+  }
+  const b = nodeAt(pn.fnBody)
+  if !(b is Block) || !i32ListHas(b.blkStmts, d) { return false }
+  const sites: i32[] = []
+  for c in calls {
+    if fnTagCallSetOf(c) == s { sites.push(c) }
+  }
+  for r in mint {
+    if mintFactSetOf(r) == s { sites.push(mintFactCallOf(r)) }
+  }
+  const under: Map<i32, boolean> = Map()
+  const todo: i32[] = [pn.fnBody]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length && !(under[y] ?? false) {
+      under[y] = true
+      nodeChildrenPush(y, todo)
+    }
+  }
+  for c in sites {
+    if !(under[c] ?? false) { return false }
+  }
+  true
+}
+
 // Whether set `s` may be tagged, planning it in a new row when so.
 function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   const ds = fnTagMembers(s)
@@ -381,6 +424,9 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
     // A member only a smaller set's read brings has its leaf in that set's plan.
     if t < 0 && ftSubNeed.length == 0 { return false }
     leafTy.push(t)
+  }
+  for d in ds {
+    if !ftMemberSeenAtArms(d, s, calls, mint) { return false }
   }
   // One member's call evaluates its arguments once, so after the elaboration a singleton's
   // arguments may allocate.
@@ -1334,9 +1380,14 @@ function ftValuesOk(
 
 // The member of `ds` the name at `v` reads, or -1; a local `const` reads its initialiser.
 function ftLeafMember(v: i32, ds: i32[]): i32 {
-  const d = ftNamedFn(ftConstSource(v, 8))
-  if d < 0 || !i32ListHas(ds, d) { return -1 }
-  d
+  const src = ftConstSource(v, 8)
+  const d = ftNamedFn(src)
+  if d >= 0 { return if i32ListHas(ds, d) { d } else { -1 } }
+  // A function declared inside another names a member where its id can stand for it.
+  const r = if src >= 0 && nodeAt(src) is Ident { identDeclOf(src) } else { -1 }
+  const f = if r >= 0 && i32ListHas(ds, r) { nodeAt(r) } else { null }
+  if !(f is FuncDecl) || f.fnName == "" || !ftLambdaIdOk(r) { return -1 }
+  r
 }
 
 // The node a name at `v` takes its value from: the initialiser of the local `const` it reads,

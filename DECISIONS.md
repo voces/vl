@@ -11160,6 +11160,20 @@ field read narrows back exactly, but nothing emitted that narrowing, and master 
 D81/D139 destination pin (`synthDstPinAnn`) is measured for deletion rather than given a guard,
 because a guarded pin is still a second producer of the destination's rep.
 
+**Extended 2026-11-01 (D14817): a fresh call result delivered directly at a narrower own-type
+landing is built at the wider row and copied.** One function body builds one record row (D8301), so
+`mkcall` delivered at `Circle` by `sink(mkcall())` and at its own `K` by `both(mkcall(), k)` (a
+held `k: K` pins `both@K`) was refused. It now builds at `Circle`, and the call that lands at `K`
+is copied into `K` field by field (`recCopyNarrows`, `recSiteCopies`; `emitRecCopy`'s `null` arm).
+Sound because the copy happens where the call's fresh result is delivered as an argument: no alias
+to that record exists between the call and the copy, and every field the copy narrows is one the
+own type types `null`, which is the only value it can hold. The original record is dropped at the
+copy, so no write through one landing can be observed at the other. The limit: a value stored and
+delivered again is not fresh (`const c = mkcall(); both(c, k)`), and neither is an argument to a
+parameter that is not a bare type variable (`b: T[]`, a list element), so those keep D14814's
+refusal. A field the copy would have to narrow other than to `null` (`i32 | null` into `i32`)
+keeps it too.
+
 ## A variant is a position in a union row, and union rows are keyed by member reps (ruling, D14551)
 
 Under structural records (D3870) a plain `{r: i32}` and a union's arm of the same shape are one
@@ -11301,11 +11315,11 @@ are assigned. An arm's fields are its row's. During collection an arm's fields a
 (`armStage*`); at the end of `collectS` each arm adopts a row (a struct row of its record type
 whose fields match by name and code, else its reference row, else one minted for it), the
 variant field columns become the struct-row lists themselves, and the staging is emptied; an arm
-created later adopts its row as it is minted. An arm adopting a struct row takes the row's
-element spellings: agreeing them at adoption writes a declared name into a row its canon twins
-compare by element name, and the twin lookup then declines; "a declared spelling wins" holds
-only where an arm's own row differs from its field row (`variantRowAgree`) until step 3 makes
-that comparison read element types, after which it holds everywhere. A shared-tag arm needs no
+created later adopts its row as it is minted. An arm adopting a struct row agrees its element
+spellings with the row's as the arms and rows agree everywhere: a declared spelling wins over a
+structural one. This waited on the layout compare reading element types before spellings
+(#5596), since a declared name written into a row its canon twins compare by spelling made the
+twin lookup decline. A shared-tag arm needs no
 row of its own: its fields match its record's row by name and code, so it adopts that row as its
 field row while its heap stays its tag-mate's; that is the one place an arm's two rows differ. Running `collectS`'s reset before
 `collectU`, so arms write rows directly, would remove the staging and is not done. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
@@ -11316,3 +11330,14 @@ for now the function-tag rule declines a record whose fields would mix the two s
 record keeps its untagged row. A delivery that tags one must keep running
 `closures/hole-fn-record-beside-declared-row-handed-to-param.vl`,
 `closures/hole-fn-record-field-called-at-other-param.vl` and `closures/hole-fn-record-list-element.vl`.
+
+**Where the label stops (step 4, 2026-11-01).** After #5613 the `"variant"` kind is the arm
+reference and nothing more: a value's heap and fields come from its arm's row (`variantRowOf`,
+which `variantHeap` reads), and the writers in `emit_bytes.vl` take a variant kind through the
+struct arms. What stays with the arm is its box tag: every boxing site emits `uTags[vi]` off the
+value's variant index (24 readers), and a row does not determine a tag, since structural twins
+(`Cat`/`Kot`, one heap through `uVarTwin`) share a row as distinct arms with distinct tags. So
+producers keep minting `("variant", vi)`, the `$fnsig` result token keeps its variant kind (a
+caller boxing a returned arm reads its tag through it), and the label is not narrowed further.
+Folding tags into rows, a tag keyed by (union, row) rather than by arm, would be a separate
+tag-numbering decision, and it is not taken.
