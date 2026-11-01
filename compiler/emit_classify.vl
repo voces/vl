@@ -149,7 +149,6 @@ import {
   MAP_KEY_I32,
   MAP_KEY_I64,
   isValueUnionName,
-  isValueUnionTyOr,
   mapTyValIsLitUnion,
   mapTyValIsNulLitUnion,
   mapTyValIsNullUnit,
@@ -214,7 +213,6 @@ import {
   tySame,
   tyScalarBaseIs,
   tyScalarBasePrim,
-  tyToStructStr,
 } from "./check_types"
 import { cexLitPeel } from "./check_num_lits"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
@@ -696,13 +694,11 @@ import {
   nodeTyIsNumLitUnion,
   nodeVariantUnionName,
   paramUnion,
-  paramUnionRetName,
   readAtomKindOfTy,
   readContainerKindOfTy,
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentRead,
   unionRetName,
-  unionRetOfFnType,
   unionTyIxOfIdentAt,
 } from "./emit_start_block"
 import {
@@ -10891,9 +10887,9 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   ""
 }
 
-// The union name a call `e` returns: a list `pop`/`get` box, a named, closure, param or
-// field callee's annotated or inferred return, a boxed `$fnsig` result, then the
-// checker's recorded type. "" when the result is not a union.
+// The union name a call `e` returns: a list `pop`/`get` box, a declared callee's annotated or
+// inferred return, a boxed `$fnsig` result, then the checker's recorded type. "" when the
+// result is not a union.
 function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
   if e.callFn < 0 { return "" }
   const callee = nodeAt(e.callFn)
@@ -10906,78 +10902,21 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
       return rlElemName[pus]
     }
   }
+  // A declared callee's own return annotation names the union its result boxes as; the call's
+  // recorded type renders a literal-union member or an alias apart from that row's name.
   if callee is Ident {
     const t = fnIndexOfNode(e.callFn)
     if t >= 0 {
       const fn = nodeAt(fnStmts[t])
       if fn is FuncDecl {
-        const rn = tyNameOf(fn.fnRet)
-        if unRowOfCanonFolded(annRowOfNode(fn.fnRet)) >= 0 { return rn }
-        // An un-annotated function whose returns join to a value union: without its inferred
-        // name, a binding stays the raw box and a narrowed read mis-types (arrayref vs scalar).
+        if unRowOfCanonFolded(annRowOfNode(fn.fnRet)) >= 0 {
+          return tyNameOf(fn.fnRet)
+        }
         if fn.fnRet < 0 {
           const irk = inferRetFnKey(fnStmts[t], callee.identName)
           const im = inferRetNameOf(irk)
-          // A value union or a registered struct union (a union row, from this same inferred
-          // name in `collectU`) — either drives narrowing/unboxing as an annotation would.
           if isValueUnionName(im) { return im }
           if im != "" && isUNameAB(18, im, inferRetTyIxOf(irk)) { return im }
-        }
-      }
-    }
-    // A union-returning function-value callee (`const f = g; const r = f(7)`): without
-    // resolving through the lifted function, a closure-call union stays the raw box.
-    const cfe = identClosureFeOfRead(e.callFn, fnIx)
-    if cfe >= 0 {
-      const cfn = nodeAt(fnStmts[cfe])
-      if cfn is FuncDecl {
-        const crn = tyNameOf(cfn.fnRet)
-        if unRowOfCanonFolded(annRowOfNode(cfn.fnRet)) >= 0 { return crn }
-        // A value-union annotated return (`i32 | string`, pinned by `synthRetAnnots`) needs this:
-        // The struct-union row test covers struct unions only, so this narrowed result would not unbox otherwise. B290.
-        if isValueUnionTyOr(annRowOfNode(cfn.fnRet)) == 1 { return crn }
-        if cfn.fnRet < 0 {
-          const cirk = inferRetFnKey(fnStmts[cfe], cfn.fnName)
-          const cim = inferRetNameOf(cirk)
-          if isValueUnionName(cim) { return cim }
-          if cim != "" && isUNameAB(19, cim, inferRetTyIxOf(cirk)) {
-            return cim
-          }
-        }
-      }
-    }
-    // A union-returning closure param callee (`callIt(g: (i32) => A | B, x)`): resolve via
-    // the param's function-type annotation, so the HOF body's narrowed result unboxes too.
-    const pun = paramUnionRetName(fnIx, callee.identName)
-    if pun != "" { return pun }
-    // A closure binding with an inferred function type (`const g = mk()`): recover it from
-    // `identFnTypeAnnNameOfRead`, since `identClosureFeOfRead` can't see through the call result.
-    const bun = unionRetOfFnType(identFnTypeAnnNameOfRead(e.callFn, fnIx))
-    if bun != "" { return bun }
-    // A callee narrowed to a union's closure arm: the binding's own annotation channel
-    // misses (the type lives on the arm), so resolve the return from the active narrow instead.
-    const nft = narrowedFnTyOf(e.callFn, fnIx)
-    if nft >= 0 {
-      const nun = unionRetOfFnType(tyToStructStr(nft))
-      if nun != "" { return nun }
-    }
-  }
-  // A union-returning field-closure callee (`o.run(7)` over a `(…) => A | B` field): resolve
-  // via the lifted function `fieldClosureFeOfRecv` finds, mirroring the plain-binding case.
-  if callee is Member {
-    const mfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-    if mfe >= 0 {
-      const mfn = nodeAt(fnStmts[mfe])
-      if mfn is FuncDecl {
-        const mrn = tyNameOf(mfn.fnRet)
-        if unRowOfCanonFolded(annRowOfNode(mfn.fnRet)) >= 0 { return mrn }
-        if mfn.fnRet < 0 {
-          const mirk = inferRetFnKey(fnStmts[mfe], mfn.fnName)
-          const mim = inferRetNameOf(mirk)
-          if isValueUnionName(mim) { return mim }
-          if mim != "" && isUNameAB(20, mim, inferRetTyIxOf(mirk)) {
-            return mim
-          }
         }
       }
     }
