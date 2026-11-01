@@ -481,6 +481,7 @@ import {
   sLitMintFn,
   sLitMintRow,
   sNames,
+  sRefRow,
   sRowDecl,
   sTwin,
   sTyIx,
@@ -507,8 +508,8 @@ import {
   uFieldTyText,
   uFieldTypes,
   uTags,
-  uVarHeap,
   uVarMemPos,
+  uVarRow,
   uVarTwin,
   uVarTyIx,
   uVarTyIxResets,
@@ -530,6 +531,7 @@ import {
   unTyKeyFirstRow,
   unVarCount,
   unVarStart,
+  variantHeap,
   vbAtomListTop,
   vbAtomListUsed,
   vbBoolListTop,
@@ -873,6 +875,7 @@ import {
   unNameBindRow,
   unNameShareTyKeyRow,
   unNamesPush,
+  variantRowOrMint,
 } from "./emit_union_atoms"
 import { mfRecordDst, mfRecordSrc } from "./emit_union_casts"
 import {
@@ -3126,7 +3129,7 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
     fiLk = "reflist"
   } else if fiEk == "variant" || fiEk == "nulvariant" {
     // A union-arm element (code 8): the loop var carries the variant-table row, so its cell is
-    // `(ref $(uVarHeap[vi]))` — what a `const c: Circle = …` local binds. The `#l` temp is the
+    // `(ref $(variantHeap(vi)))` — what a `const c: Circle = …` local binds. The `#l` temp is the
     // ref-list wrapper (code 5), as for every other ref element (D50).
     fiLk = "reflist"
   } else if fiEk == "nulstruct" {
@@ -4784,14 +4787,14 @@ function rlMapElemValSlot(slot: i32): i32 {
 }
 
 // The variant struct heap index of ref-list slot `slot`'s element (`Cat[]` gives the `Cat`
-// variant's `uVarHeap`), or -1. One home, so the dedup signature pass and the element-heap pass
+// variant's `variantHeap`), or -1. One home, so the dedup signature pass and the element-heap pass
 // cannot drift: they are the same question by construction, the sig pass existing to predict the
 // heap pass. The name peel stays because no sweep reaches an arena reading of it.
 function rlElemVariantHeap(slot: i32): i32 {
   const rsen = nonNulBaseOf(rlElemName[slot])
   const evi = variantIndexOf(rsen)
   if evi < 0 { return -1 }
-  uVarHeap[evi]
+  variantHeap(evi)
 }
 
 // The record-list views (D3041): one per record row the checker saw delivered as a union-box list
@@ -4963,28 +4966,34 @@ function mAssignStructHeaps() {
   0
 }
 
-// Mint the declared unions' variant struct heaps into `uVarHeap`, then the union box and the
+// Mint the declared unions' variant struct heaps and their rows (`uVarRow`), then the union box and the
 // per-rep value boxes the registered value unions use. Mints nothing when no union is declared.
 function mAssignUnionHeaps() {
   // Union variant structs (one heap type per distinct variant layout), then the union box.
   // `uVarTwin[vi] < vi` marks variant `vi` a layout twin of an earlier slot — the same `sTwin`
   // discipline — so it reuses that heap index and the type-section emit skips it in lock-step.
   // Covers both one variant name pushed by two unions and a declared name against its shape.
-  uVarHeap = []
+  const heaps: i32[] = []
   uVarTwin = []
+  uVarRow = []
   if uDeclared {
     buildVariantTwins()
     let vi = 0
     while vi < uVariants.length {
       if uVarTwin[vi] < vi {
-        uVarHeap.push(uVarHeap[uVarTwin[vi]])
+        heaps.push(heaps[uVarTwin[vi]])
       } else if uVarSTwinAt(vi) >= 0 {
         // The cross-table merge: this arm's layout IS a declared struct's, so it takes
         // that row's already-allocated heap index instead of minting a second one. The
         // type section has no entry for it.
-        uVarHeap.push(sHeapIdx[uVarSTwinAt(vi)])
+        heaps.push(sHeapIdx[uVarSTwinAt(vi)])
       } else {
-        uVarHeap.push(mAllocType(TSK_VARIANT, vi))
+        heaps.push(mAllocType(TSK_VARIANT, vi))
+      }
+      // The arm's own struct row, once its heap is known. Every reader asks the row for the heap.
+      uVarRow.push(variantRowOrMint(vi, heaps[vi]))
+      if variantHeap(vi) != heaps[vi] {
+        emitFail("emitProgram: a union arm's row is not on the arm's heap")
       }
       vi = vi + 1
     }
@@ -5152,7 +5161,7 @@ function mAssignRefListPairs(mStructIdxPre: i32) {
         rlElemHeap[rs] = sHeapIdx[esi]
       } else {
         // A concrete-VARIANT element (`Cat[]`): the element heap is the variant struct
-        // `uVarHeap[vi]` (no standalone `sNames` entry — variants ride the union's structs).
+        // `variantHeap(vi)` (no standalone `sNames` entry — variants ride the union's structs).
         const evh = rlElemVariantHeap(rs)
         if evh >= 0 { rlElemHeap[rs] = evh } else { rlElemHeap[rs] = 0 }
       }
@@ -7806,6 +7815,7 @@ function structTableReset() {
   sNames = []
   sRowDecl = []
   sTyIx = []
+  sRefRow = []
   sAnonOwnTy = Map()
   sLitMintRow = Map()
   sLitMintFn = Map()
@@ -10250,7 +10260,7 @@ export function collectMapFilterUse() {
                 }
               } else if fe >= 0 && cloRetValKind(fe) == "variant" {
                 // A concrete-variant-returning callback (a collapse): interns the variant's
-                // ref-list slot (kind 1 — its element heap is `uVarHeap[vi]`).
+                // ref-list slot (kind 1 — its element heap is `variantHeap(vi)`).
                 const cvi = cloRetValSlot(fe)
                 if cvi >= 0 && cvi < uVariants.length {
                   // Hinted with the variant table's TYPE column, same provenance and

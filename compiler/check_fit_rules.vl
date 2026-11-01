@@ -290,11 +290,13 @@ import {
   recPend,
   recPendDstTy,
   recPendSrc,
+  recPendSrcTy,
 } from "./check_rec_rows"
 import {
   recAtPinnedArg,
   recCoalesceOperands,
   recDeclInit,
+  recElemPinLit,
   recIndexBase,
   recIsJoin,
   recLeafEscapes,
@@ -1609,8 +1611,13 @@ export function rcwPend(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A scalar source shares nothing; a type variable may stand for a record.
   if srcTy >= T.tys.length { return 0 }
   if !rcwIsRefTy(srcTy) && !(tyAt(srcTy) is TyVar) { return 0 }
-  // A source typed at a hole shares whatever its pin is: each pin re-asks it (D3250).
-  if tyAt(srcTy) is TyVar && rcwIsRefTy(dstTy) && cstrOwnerTop() >= 0 {
+  // A source typed at a hole shares whatever its pin is: each pin re-asks it (D3250), and a
+  // record literal holding one is re-asked whole (D14759).
+  if (
+    (tyAt(srcTy) is TyVar || (tyAt(srcTy) is TyObj && tyHasTyVar(srcTy)))
+    && rcwIsRefTy(dstTy)
+    && cstrOwnerTop() >= 0
+  ) {
     rcwPinNote(srcExpr, srcTy, dstTy)
   }
   const seen = rcwPendSeen[srcExpr] ?? []
@@ -1922,7 +1929,8 @@ function recQueuedReaches(c: i32, own: i32, dst: i32): boolean {
   let i = 0
   while i < recPendSrc.length {
     if (
-      !recRepArgOf(i, c, own, dst)
+      !recPendInert(i)
+      && !recRepArgOf(i, c, own, dst)
       && recLandingIn(recPendSrc[i], recPendDstTy[i], c, own, REC_STORE_DEPTH) >= 0
     ) {
       return true
@@ -1980,7 +1988,7 @@ function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
   let got = -1
   let i = 0
   while i < recPendSrc.length {
-    if recRepArgOf(i, c, own, dst) {
+    if recPendInert(i) || recRepArgOf(i, c, own, dst) {
       i = i + 1
       continue
     }
@@ -1998,6 +2006,22 @@ function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
     i = i + 1
   }
   got
+}
+
+// Whether queued delivery `i` is a list literal handed at its own type to a generic that hands
+// back one of its elements (`recElemPinLit`): its elements land where the call does (D14812).
+function recPendInert(i: i32): boolean {
+  if i < 0 || i >= recPendSrcTy.length || i >= recPendDstTy.length {
+    return false
+  }
+  const src = recPendSrc[i]
+  const p = cwPeelValue(src)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is ArrayLit) { return false }
+  if !tySame(recPendSrcTy[i], recPendDstTy[i]) { return false }
+  if src < 0 || src >= cwIxUpKind.length || cwIxUpKind[src] != CW_UP_ARG {
+    return false
+  }
+  recElemPinLit(cwIxUp[src]) == p
 }
 
 // Whether queued delivery `i` is call `c`'s record of `own`, directly or relayed, handed as an
@@ -2038,6 +2062,16 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
   if p == c { return recAdLanding(own, d) }
   if recSolePinArg(p) >= 0 {
     return recLandingIn(recSolePinArg(p), d, c, own, depth - 1)
+  }
+  // A generic handing back an element of its list literal argument lands each element there.
+  const epl = recElemPinLit(p)
+  const eln = if epl >= 0 { nodeAt(epl) } else { null }
+  if eln is ArrayLit {
+    for ex in eln.arrElems {
+      const t = recLandingIn(ex, d, c, own, depth - 1)
+      if t >= 0 { return t }
+    }
+    return -1
   }
   // A non-generic function handing back an un-annotated parameter lands its argument there.
   const pc = nodeAt(p)
@@ -5514,7 +5548,8 @@ function arrLitFitsList(ix: i32, m: i32, exact: boolean, depth: i32): boolean {
 }
 
 // Whether `src` is a `null[]` element: a list literal's element, a `push`, `unshift` or `insert`
-// argument on a list, or the value of `xs[i] = …` on a list. A struct field or local is not one.
+// argument on a list, `__array_new__`'s fill, or the value of `xs[i] = …` on a list. A struct
+// field or local is not one.
 function nullUnitListCell(src: i32): boolean {
   cwIxBuild()
   if src < 0 || src >= cwIxUp.length { return false }
@@ -5525,6 +5560,9 @@ function nullUnitListCell(src: i32): boolean {
   if k == CW_UP_ELEM { return un is ArrayLit }
   if k == CW_UP_ARG && un is Call && un.callFn >= 0 {
     const f = nodeAt(un.callFn)
+    if f is Ident && f.identName == "__array_new__" {
+      return un.callArgs.length == 2 && un.callArgs[1] == src
+    }
     if (
       f is Member
       && (f.memProp == "push" || f.memProp == "unshift" || f.memProp == "insert")
