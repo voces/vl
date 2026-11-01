@@ -1016,6 +1016,32 @@ function variantRowAgree(vi: i32, r: i32) {
   0
 }
 
+// Whether variant `vi`'s fields are row `r`'s: names, codes, element names and element types.
+export function variantRowFieldsMatch(vi: i32, r: i32): boolean {
+  if r < 0 || vi >= uFieldCount.length || r >= sFieldCount.length {
+    return false
+  }
+  if uFieldCount[vi] != sFieldCount[r] { return false }
+  let k = 0
+  while k < uFieldCount[vi] {
+    const ui = uFieldStart[vi] + k
+    const si = sFieldStart[r] + k
+    if (
+      uFieldNames[ui] != sFieldNames[si]
+      || uFieldTypes[ui] != sFieldTypes[si]
+    ) {
+      return false
+    }
+    const ue = if ui < uFieldElemName.length { uFieldElemName[ui] } else { "" }
+    const se = if si < sFieldElemName.length { sFieldElemName[si] } else { "" }
+    const ut = if ui < uFieldElemTyIx.length { uFieldElemTyIx[ui] } else { -1 }
+    const st = if si < sFieldElemTyIx.length { sFieldElemTyIx[si] } else { -1 }
+    if ue != se || ut != st { return false }
+    k = k + 1
+  }
+  true
+}
+
 // Whether a struct row other than a reference row records variant `vi`'s record type, on any heap.
 // A D1023 shared-tag arm's record has one, off the arm's heap.
 function variantRecordHasRow(vi: i32): boolean {
@@ -1035,19 +1061,60 @@ export function variantRowOrMint(vi: i32, h: i32): i32 {
   if own >= 0 && !sIsRefRow(own) { variantRowAgree(vi, own) }
   if (own >= 0 || vi >= uVarTyIx.length || uVarTyIx[vi] < 0) { return own }
   if variantRecordHasRow(vi) { return -1 }
-  refRowMint(vi, h)
+  const c = refRowClaim(vi, h)
+  if c >= 0 { return c }
+  const si = sNames.length
+  if sHeapIdx.length != si || sTwin.length != si { return -1 }
+  const m = refRowMint(vi)
+  if m < 0 { return -1 }
+  sHeapIdx.push(h)
+  sTwin.push(m)
+  m
 }
 
-// Append a reference row for variant `vi`: its record type, heap and fields, a twin of itself and
-// no declared name. -1 when the field table is mid-append and the row cannot be laid down.
-function refRowMint(vi: i32, h: i32): i32 {
+// Give variant `vi` a reference row at collect time when its record has no struct row and no
+// reference row yet. Its heap is claimed when the union heaps are assigned.
+export function armRefRowEnsure(vi: i32) {
+  if vi >= uVarTyIx.length || uVarTyIx[vi] < 0 { return 0 }
+  if variantRecordHasRow(vi) { return 0 }
+  const vt = uVarTyIx[vi]
+  let r = 0
+  while r < sTyIx.length {
+    if sIsRefRow(r) && sTyIx[r] >= 0 && tySame(vt, sTyIx[r]) { return 0 }
+    r = r + 1
+  }
+  refRowMint(vi)
+  0
+}
+
+// The first reference row of variant `vi`'s record type whose heap is not yet assigned, given
+// heap `h`, or -1.
+function refRowClaim(vi: i32, h: i32): i32 {
+  const vt = uVarTyIx[vi]
+  let r = 0
+  while r < sTyIx.length && r < sHeapIdx.length {
+    if (
+      sIsRefRow(r)
+      && sHeapIdx[r] < 0
+      && sTyIx[r] >= 0
+      && tySame(vt, sTyIx[r])
+    ) {
+      sHeapIdx[r] = h
+      return r
+    }
+    r = r + 1
+  }
+  -1
+}
+
+// Append a reference row for variant `vi`: its record type and fields and no declared name; the
+// heap and twin columns are the caller's. -1 when the field table is mid-append.
+function refRowMint(vi: i32): i32 {
   const si = sNames.length
   const fs = sFieldNames.length
   if (
     sFieldStart.length != si
     || sFieldCount.length != si
-    || sHeapIdx.length != si
-    || sTwin.length != si
     || sFieldTypes.length != fs
     || sFieldElemName.length != fs
     || sFieldCloSig.length != fs
@@ -1063,8 +1130,6 @@ function refRowMint(vi: i32, h: i32): i32 {
   sRowDecl.push(0)
   while sTyIx.length < si { sTyIx.push(-1) }
   sTyIx.push(uVarTyIx[vi])
-  sHeapIdx.push(h)
-  sTwin.push(si)
   while sFieldElemTyIx.length < fs { sFieldElemTyIx.push(-1) }
   while sFieldElemKeyKind.length < fs { sFieldElemKeyKind.push(MAP_KEY_STR) }
   sFieldStart.push(fs)
