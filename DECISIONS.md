@@ -11275,7 +11275,11 @@ The move goes in steps, each byte-identical: `uVarRow` names each arm's own stru
 of the arm's record type on the same heap with the same fields, never a layout twin of another
 type), then readers move off the variant tables onto the struct row one table at a time, then
 the shape-to-row lookup answers the struct row only, and the `"variant"` kind label narrows to
-the context. One arm keeps a layout that is not its record's row: an arm sharing a tag with
+the context. An arm whose record no struct row holds (about 1,500 of the 2,853) is given a
+reference row before the readers move: the record's type, fields and codes on the arm's heap, a
+twin of itself with no type-section entry. Until the shape-to-row lookup is rewritten, every
+existing struct-table walk skips a reference row (`sIsRefRow`), so minting one changes no
+output; each `sIsRefRow` call is a skip that rewrite retires. One arm keeps a layout that is not its record's row: an arm sharing a tag with
 another arm (D1023, one tag and one layout, `is` deciding by the discriminant's value) is laid
 out at its tag-mate's heap, while the same record standing alone has its own struct row
 (`unions/discriminant-mixed-litunion-bare-literal-arm.vl`,
