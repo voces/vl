@@ -636,12 +636,6 @@ commit anyone suspected was the culprit:
 
 **Bisect at BOTH LEVELS, under a timeout.** An L1-only check is vacuous for this class.
 
-**And a behaviour bisect, or a sweep's baseline, uses FIXPOINT seeds on both sides.** A one-level
-build (an older seed running `vl build compiler/entry.vl` over new source) is the new source as the
-OLD compiler lowered it, so that compiler's own lowering defects reach its behaviour. On
-2026-11-01 master `8641a073` built that way graded D3131 and D3466 MOVED, and built to its fixpoint
-graded both as filed — the one-level reading had nearly pinned them on an innocent merge.
-
 **`timeout` KILLS THE SHELL, NOT THE BUILD.** `timeout 900 bash scripts/refresh-compiler.sh`
 kills the script; the `vl build` it launched re-parents to init and keeps a core at ~90%
 forever. Five accumulated over 97 minutes before another session noticed the load — the

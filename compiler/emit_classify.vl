@@ -2953,11 +2953,63 @@ export function letCellSlot(stmtIx: i32, fnIx: i32, k: VKind): i32 {
   }
 }
 
+// `letCellKindGo` remembered per binding and instance on the `gckGen` generation, which only a
+// walk's top re-stamps: an un-annotated binding walks its initializer, and every name read asks.
+// Rows chain per binding (`lckHead`/`lckNext`), one per asking function.
+let lckHead: i32[] = []
+let lckNext: i32[] = []
+let lckFn: i32[] = []
+let lckStamp: i32[] = []
+let lckVal: VKind[] = []
+let lckGenSeen = 0
+let lckDepth = 0
+
 // The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
 // annotation's kind through the shared annotation ladder, else the initializer's. The local
 // storage class's answer to what `globalCellKind` answers for a module global, kept here
 // because `emit_collect.vl` cannot be imported back into this file.
 export function letCellKind(letIx: i32, fnIx: i32): VKind {
+  if letIx < 0 || letIx >= P.nodes.length { return letCellKindGo(letIx, fnIx) }
+  if lckDepth == 0 {
+    if gckStale() { gckDrop() }
+  }
+  if gckGen < lckGenSeen { lckReset() }
+  lckGenSeen = gckGen
+  let r = if letIx < lckHead.length { lckHead[letIx] } else { -1 }
+  while r >= 0 && lckFn[r] != fnIx { r = lckNext[r] }
+  if r >= 0 && lckStamp[r] == gckGen { return lckVal[r] }
+  const gen = gckGen
+  lckDepth = lckDepth + 1
+  const v = letCellKindGo(letIx, fnIx)
+  lckDepth = lckDepth - 1
+  if r < 0 {
+    while lckHead.length <= letIx { lckHead.push(-1) }
+    r = lckStamp.length
+    lckNext.push(lckHead[letIx])
+    lckHead[letIx] = r
+    lckFn.push(fnIx)
+    lckStamp.push(0)
+    lckVal.push(v)
+  }
+  // A walk that minted rows moved the generation; its answer is served once and not kept.
+  lckStamp[r] = if gckGen == gen { gen } else { 0 }
+  lckVal[r] = v
+  v
+}
+
+// Empties `letCellKind`'s memo, at compile start and when the generation wrapped.
+function lckReset() {
+  lckHead = []
+  lckNext = []
+  lckFn = []
+  lckStamp = []
+  lckVal = []
+  lckGenSeen = 0
+  lckDepth = 0
+  0
+}
+
+function letCellKindGo(letIx: i32, fnIx: i32): VKind {
   if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
   // A `boolean | null` cell is the sentinel-2 niche, whatever the annotation's valtype says.
   if letNulBool(letIx, fnIx) { return "nulbool" }
@@ -14346,14 +14398,6 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   // The extended key (not just `fnSigKeyOf`) so a void-returning binding resolves its `>v`
   // sig, interned above; a value-eligible binding takes the same key `fnSigKeyOf` would.
   if fe >= 0 { return cloSigKeyExt(fe) }
-  // A lifted lambda answers above because it is lowered at its own signature, not its type's
-  // key, until lowering follows the recorded type (D8880). Past it, a read whose type at this
-  // instance is a closed function type is keyed by that type.
-  const rt = tyPeelNul(nodeTyAt(atIx, fnIx))
-  if rt >= 0 && tyAt(rt) is TyFunc && !tyHasTyVar(rt) {
-    const rk = sigKeyOfTy(rt)
-    if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
-  }
   // An inferred COPY of another closure binding (`const t0 = p`): chase the source so a call
   // through the intermediate binding classifies its result (nullable-closure read pattern).
   // Asked at the source's own read, so a same-named binding in a sibling block is not it (D3632).
@@ -14369,6 +14413,10 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
         if ofn is FuncDecl {
           if bodyLetReadAtSid(ofn.fnBody, csid, posAt) < 0 { srcFn = -1 }
         }
+      }
+      if srcFn < 0 && fnIx >= 0 {
+        const mk = moduleCopySigKey(srcSid)
+        if mk != "" { return mk }
       }
       const sk = calleeCloSigKeyOfRead(srcIx, srcFn)
       if sk != "" { return sk }
@@ -14394,8 +14442,8 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   if letIx >= 0 {
     const cd = nodeAt(letIx)
     if cd is LetDecl {
-      // A module binding initialized by another name, read from inside a function, holds that
-      // module name's value, not one of the function's same-named locals (D3880).
+      // A binding initialized by another name holds that name's value, whose key is that
+      // binding's, asked in the frame that declares this one (D3868).
       const isid = sidOfNode(cd.letInit)
       if (
         cd.letType < 0
@@ -14403,10 +14451,14 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
         && nodeAt(cd.letInit) is Ident
         && isid != csid
       ) {
+        // Read from inside a function, a module binding's source is not one of that function's
+        // locals of the same name (D3880).
         if letFn < 0 && fnIx >= 0 {
           const mk = moduleCopySigKey(isid)
           if mk != "" { return mk }
         }
+        const ik = calleeCloSigKeyOfRead(cd.letInit, letFn)
+        if ik != "" { return ik }
       }
       if cd.letInit >= 0 {
         const cty = nodeTyAt(cd.letInit, fnIx)
@@ -14418,6 +14470,10 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
             const lk = sigKeyOfTy(cty)
             if lk != "" { return lk }
           }
+          // The nullable twin (`letInitTyIsNulFunc`'s shape): a bare `const t = m[k]` read of
+          // a function-valued map records `TyFunc | null`, and the narrowed call runs at the
+          // inner signature — so the key is the inner's, not "" (D1662).
+          if ct is TyNullable { return sigKeyOfTy(ct.nInner) }
         }
       }
     }
@@ -15041,6 +15097,7 @@ export function classifyStateReset() {
   gckDepth = 0
   bcDepth = 0
   bindCellReset()
+  lckReset()
   irkDepth = 0
   lrDepth = 0
   asgReReadIx = -1
@@ -15165,13 +15222,6 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
       return { rrStore: st, rrRead: md.rdKind, rrConv: 4 }
     }
   }
-  // Any other map's value read converts only where a miss makes it a nullable rep.
-  if mvr >= 0 || (e is Index && readMapValTyAt(e, fnIx) >= 0) {
-    const nd = repOfNode(rx, fnIx)
-    if nd.rdCovered == 1 && readKindIsNul(nd.rdKind) {
-      return { rrStore: st, rrRead: nd.rdKind, rrConv: 4 }
-    }
-  }
   // A read narrowed out of a nullable storage reads its non-null kind: one the checker recorded
   // as narrowed, or one whose own type is that storage's non-null kind (a `?.` guard's re-read).
   if readKindIsNul(st) {
@@ -15275,19 +15325,5 @@ function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
     if v == MVK_STRUCT { return "struct" }
     return "mv" + i32ToStr(v)
   }
-  // A map with no value slot here (a hole bound per instance) holds what its type says.
-  const vt = readMapValTyAt(e, fnIx)
-  if vt >= 0 {
-    const vk = repSigKindOfTy(vt)
-    if vk != null { return vk }
-  }
   ""
-}
-
-// The value type of the map an index read `e` reads, from the receiver's type in frame
-// `fnIx`; -1 when the receiver is not a map there.
-function readMapValTyAt(e: Index, fnIx: i32): i32 {
-  const rt = nodeTyInOf(e.idxArr, fnIx)
-  if rt < 0 || !tyIsMap(rt) { return -1 }
-  tyMapValOf(rt)
 }
