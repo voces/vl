@@ -403,7 +403,6 @@ import {
   FC_STRUCT,
   bodyRebuiltFrom,
   buildFnChildIndex,
-  capMemoArmed,
   emitRootIx,
   fmResumeArmed,
   fnChildHead,
@@ -423,10 +422,6 @@ import {
   lfNoteMinted,
   monoAnonParamPinTy,
   monoArgInstFe,
-  monoExactSubN,
-  monoExactSubOwn,
-  monoExactSubRow,
-  monoExactSubT,
   monoFieldReadTyIn,
   monoFieldReadTys,
   monoGen,
@@ -577,10 +572,8 @@ import {
   TY_WALK_DEPTH,
   elabClosedTyAt,
   exactBindWalk,
-  exactSubAt,
   holeNulStringPinTyOf,
   instanceBindsNothingClosed,
-  monoExactSubRowOf,
   nodeTyInOf,
   pinSubAt,
   pinnedParamTyAt,
@@ -595,6 +588,7 @@ import {
   elabCallParamTy,
   elabDemand,
   elabInstSpelling,
+  elabInstTyAt,
   elabKeyAt,
   elabNarrowedCarry,
   elabNodeTys,
@@ -602,6 +596,7 @@ import {
   elabRetOf,
   elabSlotNote,
   elabStampAt,
+  elabTestsTyVar,
   elabTpDefaultsReset,
   elabTpDefaultsSet,
   elabWalkKidRet,
@@ -639,8 +634,6 @@ import {
   buildFnMap,
   buildFnMapNoteFnSlotWrite,
   buildFnMapNoteFnStmtWrite,
-  computeRetInference,
-  computeVoidFns,
   registerInlineUnionOfTy,
   registerTyReachUnions,
 } from "./emit_collect"
@@ -6230,32 +6223,13 @@ function monoPinMapLambdas(
 }
 
 // Extend the name→index map over the instances minted since the last call, which the walk
-// resolves by name before collection runs. The return inference waits for the settle.
+// resolves by name before collection runs.
 function monoRegisterInstance() {
   fmResumeArmed = true
   const bfmRc = buildFnMap(monoProgStmts)
   fmResumeArmed = false
   if bfmRc < 0 { return -1 }
   capMemoNoteEdit()
-  monoRetPending = true
-  0
-}
-
-// Set by a rebuild, whose `buildFnMap` re-seeds the return rows; cleared by `monoRetSettle`.
-let monoRetPending = false
-
-// Re-derive voidness and the inferred return kinds once, after the walk, rather than per
-// instance: both are whole-program fixpoints, so per instance they cost instances x functions.
-// They read capture sets and edit no body, so one run shares one capture memo (D2771).
-function monoRetSettle() {
-  if !monoRetPending { return 0 }
-  monoRetPending = false
-  capMemoNoteEdit()
-  const savedArmed = capMemoArmed
-  capMemoArmed = true
-  computeVoidFns()
-  computeRetInference()
-  capMemoArmed = savedArmed
   0
 }
 
@@ -9359,115 +9333,6 @@ function monoRegisterPinUnion(name: string, ty: i32) {
   0
 }
 
-// Per template slot: 1 when its body tests a value of a type parameter, directly or through a
-// generic it calls with one, 0 when not, -1 or absent when not yet asked. A slot on the walk's
-// stack holds -2 - n, n its visit number: asked, or answered "no" pending its cycle's root.
-let monoExactMemo: i32[] = []
-// The walk's stack of slots, its next visit number, and the lowest visit number of a slot on the
-// stack the current walk has read (Tarjan's lowlink), so a cycle settles once at its root.
-let monoExactStack: i32[] = []
-let monoExactNext = 0
-let monoExactLow = 0
-
-// Whether generic `fe` is keyed by its exact pins: its body has an `is`, `as` or `match` over a
-// value whose type names a type parameter, or passes such a value to a generic that has.
-function monoNeedsExactKey(fe: i32): boolean {
-  if fe < 0 || fe >= monoOrigNode.length { return false }
-  while monoExactMemo.length <= fe { monoExactMemo.push(-1) }
-  const m = monoExactMemo[fe]
-  if m >= 0 { return m == 1 }
-  if m <= -2 {
-    // On the stack: a provisional "no" until the cycle through it settles.
-    if -2 - m < monoExactLow { monoExactLow = -2 - m }
-    return false
-  }
-  const me = monoExactNext
-  monoExactNext = me + 1
-  const outerLow = monoExactLow
-  monoExactLow = me
-  // arena-tick exempt: a memo of the template's body, which no rebuild pass reads.
-  monoExactMemo[fe] = -2 - me
-  monoExactStack.push(fe)
-  let r = false
-  const fn = nodeAt(monoOrigNode[fe])
-  if fn is FuncDecl { r = monoTestsTyVar(fn.fnBody) }
-  const low = monoExactLow
-  monoExactLow = outerLow
-  if r {
-    // A "yes" is final, and every "no" pending above it may have read it as a "no".
-    monoExactUnwind(fe, 1, -1)
-  } else if low >= me {
-    // The root of its cycle: its walk read nothing below it on the stack, so all of it is "no".
-    monoExactUnwind(fe, 0, 0)
-  } else if low < outerLow {
-    monoExactLow = low
-  }
-  r
-}
-
-// Pops the walk's stack down to and including `fe`, settling `fe` to `mine` and every slot above
-// it to `rest`: 0 for a cycle that settled "no", -1 to re-ask after a "yes".
-function monoExactUnwind(fe: i32, mine: i32, rest: i32) {
-  while monoExactStack.length > 0 {
-    const top = monoExactStack[monoExactStack.length - 1]
-    monoExactStack.pop()
-    let v = rest
-    if top == fe { v = mine }
-    // arena-tick exempt: the same memo.
-    if top >= 0 && top < monoExactMemo.length { monoExactMemo[top] = v }
-    if top == fe { return 0 }
-  }
-  0
-}
-
-// Whether the node recorded at `ix` has a type naming a type parameter.
-function monoTyVarTyped(ix: i32): boolean {
-  const t = nodeTyIxOf(unwrapParen(ix))
-  t >= 0 && tyHasTyVar(t)
-}
-
-// `monoNeedsExactKey`'s walk over one subtree, nested lambdas included.
-function monoTestsTyVar(ix: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = nodeAt(ix)
-  if n is IsExpr {
-    if monoTyVarTyped(n.isObj) { return true }
-  }
-  if n is AsExpr {
-    if monoTyVarTyped(n.asObj) { return true }
-  }
-  if n is MatchExpr {
-    if monoTyVarTyped(n.matchScrut) { return true }
-  }
-  if n is Call && n.callFn >= 0 {
-    const cf = nodeAt(n.callFn)
-    if cf is Ident {
-      if monoCalleeIsGeneric(n.callFn) {
-        let passes = callTyArgsOf(ix).length > 0
-        let a = 0
-        while a < n.callArgs.length && !passes {
-          passes = monoTyVarTyped(n.callArgs[a])
-          a = a + 1
-        }
-        // A callee still being asked is on this walk's own cycle and answers nothing new.
-        if passes && monoNeedsExactKey(fnIndexOfNode(n.callFn)) { return true }
-      }
-    }
-  }
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      if monoTestsTyVar(kids[i]) { return true }
-      i = i + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  false
-}
-
 // Whether `ty` is a union with a type-parameter member and a concrete member besides `null`,
 // the shape the checker's binding walk passes over (`monoDeclIsOpenUnion`, which also names the
 // member).
@@ -9556,11 +9421,8 @@ function monoExactClear(outN: string[], outT: i32[]): boolean {
 // pinned types; else `t` itself.
 function monoExactPinTyOf(t: i32, ctx: i32): i32 {
   if t < 0 || !tyHasTyVar(t) { return t }
-  const row = monoExactSubRowOf(ctx)
-  if row >= 0 && row < monoExactSubN.length {
-    const st = exactSubAt(t, row)
-    if st >= 0 && !tyHasTyVar(st) { return st }
-  }
+  const st = elabInstTyAt(t, ctx)
+  if st >= 0 { return st }
   monoPinSubTyOf(t, ctx)
 }
 
@@ -9650,10 +9512,6 @@ export function monoStateReset() {
 
 // Empties the instance-binding tables, which `monomorphize` fills and the classifiers read.
 export function monoSubTablesReset() {
-  monoExactSubRow = Map()
-  monoExactSubN = []
-  monoExactSubT = []
-  monoExactSubOwn = []
   monoHoleSubRow = Map()
   monoHoleSubN = []
   monoHoleSubT = []
@@ -9785,7 +9643,7 @@ function monoMakeInstanceKey(
 ) {
   // A body testing a value of a type parameter is keyed by the exact types, which a pin's
   // spelling can merge (a Set and its boolean map), so each instance binds them to one.
-  if monoNeedsExactKey(origFe) {
+  if elabTestsTyVar(monoOrigNode[origFe]) {
     if (monoExactBind(params, tps, pinTys, exBN, exBT, exSubN, exSubT)) {
       monoShAliasBind(origFe, exSubN, exSubT)
       let xk = 0
@@ -10469,15 +10327,13 @@ function monoTwoListOf(r: i32): i32 {
 }
 
 // Records a new instance under `key` in the registry, with the side tables keyed by its
-// slot `instFe`: the two-list result type and the exact, pin and hole binding rows.
+// slot `instFe`: the two-list result type and the pin and hole binding rows.
 function monoMakeInstanceRegister(
   key: string,
   origFe: i32,
   instName: string,
   instFe: i32,
   twoListTy: i32,
-  exSubN: string[],
-  exSubT: i32[],
   letBN: string[],
   letBT: i32[],
   instHoleN: string[],
@@ -10489,12 +10345,6 @@ function monoMakeInstanceRegister(
   monoInstFe.push(instFe)
   monoLastInstFe = instFe
   if twoListTy >= 0 { monoTwoListRet.set(instFe, twoListTy) }
-  if exSubN.length > 0 {
-    monoExactSubRow.set(instFe, monoExactSubN.length)
-    monoExactSubN.push(exSubN)
-    monoExactSubT.push(exSubT)
-    monoExactSubOwn.push(monoInstOwn)
-  }
   if letBN.length > 0 {
     monoPinSubRow.set(instFe, monoPinSubN.length)
     monoPinSubN.push(letBN)
@@ -11137,8 +10987,6 @@ function monoMakeInstanceGo(
       instName,
       instFe,
       twoListTy,
-      k.exSubN,
-      k.exSubT,
       letBN,
       letBT,
       holeN,
@@ -27275,7 +27123,6 @@ export function monomorphize(stmts: i32[]) {
   monoLitDestVariant = Map()
   monoLamCallCallees = []
   monoProgLamNames = []
-  monoRetPending = false
   monoBodyDeclStamp = 0 - 1
   monoGen = []
   monoOrigNode = []
@@ -27315,11 +27162,7 @@ export function monomorphize(stmts: i32[]) {
   monoSupersededObjTys = []
   monoGradualAsScalar = Map()
   monoGradualRetPinned = false
-  monoExactMemo = []
   monoActiveDepth = []
-  monoExactStack = []
-  monoExactNext = 0
-  monoExactLow = 0
   monoProgStmts = stmts
   monoRegisterElabJoinRows()
   monoProgHeldStamp = 0 - 1
@@ -27449,11 +27292,8 @@ export function monomorphize(stmts: i32[]) {
     fe3 = fe3 + 1
   }
   monoReachLitTys()
-  // Settled before the prune, as the walk left it, and again after, in case the prune minted.
-  monoRetSettle()
   const prc = monoPruneTemplates(nDecl)
   if prc < 0 { return prc }
-  monoRetSettle()
   // Each un-annotated binding the walk left open takes the closed type its initializer holds.
   let ai = 0
   while ai < P.nodes.length {
