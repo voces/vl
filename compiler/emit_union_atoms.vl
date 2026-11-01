@@ -102,6 +102,7 @@ import {
   nodeMapValTyIx,
   recordMvValTyIx,
   recordUnMemTys,
+  repCanonId,
   repElemIdOfNameTy,
   repNameCanonId,
   repSlotOfTy,
@@ -1023,12 +1024,9 @@ export function armRefRowSync(vi: i32) {
     return 0
   }
   const vt = uVarTyIx[vi]
-  let r = 0
-  while r < sTyIx.length {
+  for r in refRowsOfArm(vi) {
     if (
-      sIsRefRow(r)
-      && sTyIx[r] >= 0
-      && tySame(vt, sTyIx[r])
+      tySame(vt, sTyIx[r])
       && r < sFieldCount.length
       && sFieldCount[r] == uFieldCount[vi]
     ) {
@@ -1047,7 +1045,6 @@ export function armRefRowSync(vi: i32) {
       }
       return 0
     }
-    r = r + 1
   }
   0
 }
@@ -1080,12 +1077,12 @@ export function variantRowFieldsMatch(vi: i32, r: i32): boolean {
   true
 }
 
-// Whether a struct row other than a reference row records variant `vi`'s record type, on any heap.
-// A D1023 shared-tag arm's record has one, off the arm's heap.
-function variantRecordHasRow(vi: i32): boolean {
+// Whether a struct row below `lim` other than a reference row records variant `vi`'s record type,
+// on any heap. A D1023 shared-tag arm's record has one, off the arm's heap.
+function variantRecordHasRow(vi: i32, lim: i32): boolean {
   const vt = uVarTyIx[vi]
   let r = 0
-  while r < sTyIx.length {
+  while r < sTyIx.length && r < lim {
     if !sIsRefRow(r) && sTyIx[r] >= 0 && tySame(vt, sTyIx[r]) { return true }
     r = r + 1
   }
@@ -1098,9 +1095,9 @@ export function variantRowOrMint(vi: i32, h: i32): i32 {
   const own = variantOwnRow(vi, h)
   if own >= 0 && !sIsRefRow(own) { variantRowAgree(vi, own) }
   if (own >= 0 || vi >= uVarTyIx.length || uVarTyIx[vi] < 0) { return own }
-  if variantRecordHasRow(vi) { return -1 }
   const c = refRowClaim(vi, h)
   if c >= 0 { return c }
+  if variantRecordHasRow(vi, sTyIx.length) { return -1 }
   const si = sNames.length
   if sHeapIdx.length != si || sTwin.length != si { return -1 }
   const m = refRowMint(vi)
@@ -1110,16 +1107,28 @@ export function variantRowOrMint(vi: i32, h: i32): i32 {
   m
 }
 
-// Give variant `vi` a reference row at collect time when its record has no struct row and no
-// reference row yet. Its heap is claimed when the union heaps are assigned.
-export function armRefRowEnsure(vi: i32) {
+// The reference rows of each record type, by the type's canonical id, so a per-arm ask reads one
+// bucket. Reset with the struct table.
+let refRowsByCanon: {[i32]: i32[]} = Map()
+const refRowsNone: i32[] = []
+export function refRowIndexReset() {
+  refRowsByCanon = Map()
+  0
+}
+
+// The reference rows that may hold variant `vi`'s record type, ascending.
+function refRowsOfArm(vi: i32): i32[] {
+  refRowsByCanon[repCanonId(uVarTyIx[vi])] ?? refRowsNone
+}
+
+// Give variant `vi` a reference row at collect time when no struct row below `lim` holds its record
+// and no reference row does yet. Its heap is claimed when the union heaps are assigned.
+export function armRefRowEnsure(vi: i32, lim: i32) {
   if vi >= uVarTyIx.length || uVarTyIx[vi] < 0 { return 0 }
-  if variantRecordHasRow(vi) { return 0 }
+  if variantRecordHasRow(vi, lim) { return 0 }
   const vt = uVarTyIx[vi]
-  let r = 0
-  while r < sTyIx.length {
-    if sIsRefRow(r) && sTyIx[r] >= 0 && tySame(vt, sTyIx[r]) { return 0 }
-    r = r + 1
+  for r in refRowsOfArm(vi) {
+    if tySame(vt, sTyIx[r]) { return 0 }
   }
   refRowMint(vi)
   0
@@ -1129,18 +1138,11 @@ export function armRefRowEnsure(vi: i32) {
 // heap `h`, or -1.
 function refRowClaim(vi: i32, h: i32): i32 {
   const vt = uVarTyIx[vi]
-  let r = 0
-  while r < sTyIx.length && r < sHeapIdx.length {
-    if (
-      sIsRefRow(r)
-      && sHeapIdx[r] < 0
-      && sTyIx[r] >= 0
-      && tySame(vt, sTyIx[r])
-    ) {
+  for r in refRowsOfArm(vi) {
+    if r < sHeapIdx.length && sHeapIdx[r] < 0 && tySame(vt, sTyIx[r]) {
       sHeapIdx[r] = h
       return r
     }
-    r = r + 1
   }
   -1
 }
@@ -1168,6 +1170,10 @@ function refRowMint(vi: i32): i32 {
   sRowDecl.push(0)
   while sTyIx.length < si { sTyIx.push(-1) }
   sTyIx.push(uVarTyIx[vi])
+  const rk = repCanonId(uVarTyIx[vi])
+  const rb = refRowsByCanon[rk] ?? []
+  if rb.length == 0 { refRowsByCanon[rk] = rb }
+  rb.push(si)
   while sFieldElemTyIx.length < fs { sFieldElemTyIx.push(-1) }
   while sFieldElemKeyKind.length < fs { sFieldElemKeyKind.push(MAP_KEY_STR) }
   sFieldStart.push(fs)
