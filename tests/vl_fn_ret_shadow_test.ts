@@ -117,6 +117,12 @@ const f = (n) => 0 - n
 print(lap(f, 4))
 `;
 
+// A hole-parameter function's instance no demand keyed: its template's closed result answers.
+const HOLE_TEMPLATE = `function twice(n: i32) { return n * 2 }
+function f(x) { return twice(x) }
+print(f(21))
+`;
+
 // A generic nothing instantiates is pruned to an empty stub, void as minted (`monoStubSlots`).
 const STUB = `function id<T>(x: T): T { x }
 function keep(x: i32) { x + 1 }
@@ -168,6 +174,13 @@ Deno.test({
       DROP_NONE,
       true,
       "agree | []=@IV=1; agree | []@IV=1; agree | fl=1; agree | setI=1",
+    );
+    expectRows(
+      "hole template",
+      HOLE_TEMPLATE,
+      DROP_NONE,
+      true,
+      "agree | f=1; agree | twice=1",
     );
     expectRows("stub", STUB, DROP_NONE, true, "agree | id=1; agree | keep=1");
     expectRows(
