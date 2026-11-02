@@ -151,6 +151,8 @@ import {
   fnTagSetOfTy,
   fnTagTaggedSets,
   fnTagUndecide,
+  fnVetoedListLitSets,
+  fnVetoedListWideSet,
 } from "./check_elab_cap"
 
 // Decides every set from scratch over the program at `rootIx`, then raises the refusal each
@@ -477,6 +479,13 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   ftWideSeen = false
   ftFwdFn = ftCallsHandFn(rootIx, s, calls, mint)
   if !ftScan(rootIx, s, ds, leaves, ids) { return false }
+  // After the elaboration, a list the check kept at its literal's set while a write widens it to
+  // `s` holds that smaller set's ids, so the two are decided together.
+  if ftLate {
+    for o in fnVetoedListLitSets(s) {
+      if ftSetWithin(o, s) && !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
+    }
+  }
   // The functions written to one `let` must give a call through it one result (D9003), so a
   // set a written `let` holds stays untagged where a call's members split.
   if ftWideSeen {
@@ -879,7 +888,12 @@ function ftScan(
       // A member leaf of another set's join is an id only when that set is tagged too, since
       // the join and its leaves share one rep.
       const ot = if ftIsS(x, s) { ftOtherTail(x, p, g, s, ds) } else { -1 }
-      if ot >= 0 && !fnTagSetIsTagged(ot) { return false }
+      // After the elaboration a wider such set is decided with this one instead.
+      if ot >= 0 && !fnTagSetIsTagged(ot) && ftLate && ftSetWithin(s, ot) {
+        if !i32ListHas(ftSubNeed, ot) && !i32ListHas(ftAssume, ot) { ftSubNeed.push(ot) }
+      } else if ot >= 0 && !fnTagSetIsTagged(ot) {
+        return false
+      }
       if ftIsS(x, s) && ot < 0 && !ftNamedAtClosed(x, p, s) {
         if !ok || !ftNodeOk(x, s, ds, leaves, ids) { return false }
         if !ftCtxOk(x, p, g, fn, s) { return false }
@@ -895,11 +909,28 @@ function ftScan(
           ftWideSeen = true
         }
         // A binding of the set written: what the write stores is an id of it.
-        if pn is BinExpr && ftIsStore(pn) && pn.binLeft == x {
+        if (
+          pn is BinExpr
+          && ftIsStore(pn)
+          && pn.binLeft == x
+          && !ftStoreInVetoedWide(x, s)
+        ) {
           if !ftJoinAt(pn.binRight, nodeTyIxOf(x), s, ds, leaves, ids) {
             return false
           }
         }
+      }
+      // A write into a slot of a list the check kept at a smaller set, whose writes widen it to
+      // `s`, stores an id of `s`.
+      const vn = if p >= 0 { nodeAt(p) } else { null }
+      if (
+        vn is BinExpr
+        && ftIsStore(vn)
+        && vn.binLeft == x
+        && ftVetoedWideRoot(x) == s
+        && !ftJoinAt(vn.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
+      ) {
+        return false
       }
       // A written slot of a holder of the set's ids stores an id of it, whatever type the slot
       // read had before the holder's first write pinned it.
@@ -1383,6 +1414,26 @@ function ftHeldWider(t: i32, s: i32): boolean {
   fnTagSetIsTagged(o) || i32ListHas(ftAssume, o)
 }
 
+// The set the list whose slot `x` reads would widen to had the check not vetoed it, after the
+// elaboration; -1 otherwise.
+function ftVetoedWideRoot(x: i32): i32 {
+  if !ftLate { return -1 }
+  const r = ftSlotRoot(x)
+  if r == x || r < 0 || !(nodeAt(r) is Ident) { return -1 }
+  fnVetoedListWideSet(identDeclOf(r))
+}
+
+// Whether `x` is a slot of a list the check kept at set `s` while its writes widen it to a wider
+// set, which is then decided with `s`: what the write stores is an id of that set, whose plan
+// takes it.
+function ftStoreInVetoedWide(x: i32, s: i32): boolean {
+  const w = ftVetoedWideRoot(x)
+  if w < 0 || w == s || !ftSetWithin(s, w) { return false }
+  // Both hold the store's ids, so that set is decided with this one.
+  if !fnTagSetIsTagged(w) && !i32ListHas(ftSubNeed, w) { ftSubNeed.push(w) }
+  true
+}
+
 // Whether every member of set `a` is a member of set `b`.
 function ftSetWithin(a: i32, b: i32): boolean {
   const bm = fnTagMembers(b)
@@ -1708,7 +1759,8 @@ function ftValuesOk(
 ): boolean {
   for v in vs {
     if !ftIsS(v, s) {
-      const d = ftLeafMember(v, ds)
+      // A lambda member written is its own leaf, as `ftNodeOk` takes one read.
+      const d = if ftLambdaLeaf(v, ds) { v } else { ftLeafMember(v, ds) }
       if d < 0 && ftSubsetRead(v, s) { continue }
       if d < 0 { return false }
       if !i32ListHas(leaves, v) {
@@ -1721,6 +1773,12 @@ function ftValuesOk(
 }
 
 // The member of `ds` the name at `v` reads, or -1; a local `const` reads its initialiser.
+// Whether `v` is a lambda member of `ds` whose id can stand for it once the elaboration has typed
+// its calls.
+function ftLambdaLeaf(v: i32, ds: i32[]): boolean {
+  ftLate && i32ListHas(ds, v) && nodeAt(v) is FuncDecl && ftLambdaIdOk(v)
+}
+
 function ftLeafMember(v: i32, ds: i32[]): i32 {
   const src = ftConstSource(v, 8)
   const d = ftNamedFn(src)
