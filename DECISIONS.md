@@ -11379,6 +11379,24 @@ caller boxing a returned arm reads its tag through it), and the label is not nar
 Folding tags into rows, a tag keyed by (union, row) rather than by arm, would be a separate
 tag-numbering decision, and it is not taken.
 
+## A record wider than a union arm is that arm's subtype, not a copy of it (2026-11-02)
+
+A record value whose fields begin with one union arm's fields (same names, same storage, in the
+layout order) is delivered into the union as that arm. It is the same reference, boxed under
+the arm's tag. The arm's row is declared its WasmGC supertype, the way a narrower record row
+already is (D622), so the arm's `ref.cast` accepts it. A copy at the box was refused. It would
+build a new arm struct from the value's fields, so a write through the original binding after
+the delivery would not show through the union, and VL records alias. The edge is safe for
+dispatch because a union box is told apart by its tag, never by `ref.test` on a struct.
+
+Of two arms a value fits, it takes the longer one, which is the supertype `buildStructSupers`
+picks. Three sources reach the arm: a plain record (its row's supertype chain), a declared record
+that is another union's arm (that arm's row), and a box narrowed to such an arm (its payload,
+re-boxed under the narrower arm's tag, since a box keeps the tag it was built with). A nullable
+record is delivered as the union's null or as the record. Only a direct position lifts: a list
+element or map value is a different array type, so those positions are still refused. A union
+value delivered whole (D15057) is still refused, because only a runtime re-tag could serve it.
+
 ## A literal names its arm: a record narrower than one declared record is stored as it (ruling, 2026-11-01)
 
 A record literal no delivery adopts has its own checked type, often narrower than any declared
