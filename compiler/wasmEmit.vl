@@ -7891,7 +7891,10 @@ export function emitUnionCoerce(
     )
   }
   boxDstShadowEnter()
-  let r = emitUnionWideArmBox(body, unionNameIn, unionTy, exprIx, fnIx)
+  let r = emitUnionWideRetag(body, unionNameIn, unionTy, exprIx, fnIx)
+  if r == 0 {
+    r = emitUnionWideArmBox(body, unionNameIn, unionTy, exprIx, fnIx)
+  }
   if r == 1 {
     r = 0
   } else if r == 0 {
@@ -8855,7 +8858,14 @@ function emitUnionBoxArgGo(
       const bxSh = mapShapeOfExpr(bxIdx.idxArr, fnIx)
       if bxSh >= 0 && bxSh < mvValKind.length {
         if mvValKind[bxSh] == MVK_UNION {
-          return emitMapGetUnionBox(body, bxIdx.idxArr, bxIdx.idxIndex, fnIx)
+          const mgFrom: i32[] = []
+          const mgTo: i32[] = []
+          wideRetagPairs(exprIx, fnIx, unionName, unionTy, mgFrom, mgTo)
+          if emitMapGetUnionBox(body, bxIdx.idxArr, bxIdx.idxIndex, fnIx) < 0 {
+            return -1
+          }
+          if mgFrom.length > 0 { emitWideRetagChain(mgFrom, mgTo) }
+          return 0
         }
       }
     }
@@ -8931,6 +8941,82 @@ function emitUnionWideArmBox(
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   fbStructNew(uBoxIdx)
   1
+}
+
+// A box of another union with record arms wider than arms of `unionName`: each such arm is
+// re-boxed under the arm its row subtypes, and every other member keeps its tag (D15057).
+// Returns 1 handled, 0 when no arm needs it, -1 on error.
+function emitUnionWideRetag(
+  body: u8[],
+  unionName: string,
+  unionTy: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  if !exprUnion(exprIx, fnIx) { return 0 }
+  const fromTags: i32[] = []
+  const toTags: i32[] = []
+  wideRetagPairs(exprIx, fnIx, unionName, unionTy, fromTags, toTags)
+  if fromTags.length == 0 { return 0 }
+  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  emitWideRetagChain(fromTags, toTags)
+  1
+}
+
+// The tags of `exprIx`'s union whose arm is wider than an arm of `unionName` into `fromTags`,
+// and that arm's tag beside each into `toTags`.
+function wideRetagPairs(
+  exprIx: i32,
+  fnIx: i32,
+  unionName: string,
+  unionTy: i32,
+  fromTags: i32[],
+  toTags: i32[],
+) {
+  const vun = unionNameOfExpr(exprIx, fnIx)
+  if vun == "" || vun == unionName { return 0 }
+  const fa: string[] = []
+  unionArmsOf(vun, fa)
+  const ta: string[] = []
+  unionArmsOfTy(unionName, unionTy, ta)
+  for a in fa {
+    const vi = variantIndexOf(a)
+    if vi >= 0 && vi < uTags.length && !armsHoldHeap(ta, variantHeap(vi)) {
+      const w = wideArmOfRow(variantRowOf(vi), ta)
+      if w >= 0 && w < uTags.length {
+        fromTags.push(uTags[vi])
+        toTags.push(uTags[w])
+      }
+    }
+  }
+  0
+}
+
+// The box on the stack, re-boxed under `toTags[i]` where its tag is `fromTags[i]`.
+function emitWideRetagChain(fromTags: i32[], toTags: i32[]) {
+  const slot = unionAsBoxSlot()
+  fbLocalSet(slot)
+  let i = 0
+  while i < fromTags.length {
+    fbLocalGet(slot)
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, fromTags[i])
+    fbI32Bin(70) // i32.eq
+    fbIfRefNul(uBoxIdx, false)
+    fbI32Rel(RS_TAG, toTags[i])
+    fbLocalGet(slot)
+    fbStructGet(uBoxIdx, 1)
+    fbStructNew(uBoxIdx)
+    fbElse()
+    i = i + 1
+  }
+  fbLocalGet(slot)
+  fbRefAsNonNull()
+  while i > 0 {
+    fbEnd()
+    i = i - 1
+  }
+  0
 }
 
 // Whether one of the arms named `atoms` is on heap type `heap`.
