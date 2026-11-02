@@ -54,7 +54,7 @@ const VALUE_CHILDREN: Record<string, string[]> = {
   Spread: ["n.spdArg"],
   ObjLit: ["*n.objFields"],
   FieldInit: ["n.fiValue"],
-  IsExpr: ["n.isObj"],
+  IsExpr: ["isExprKid(n)"],
   AsExpr: ["n.asObj"],
   LetDecl: ["n.letInit"],
   IfStmt: ["n.ifCond", "n.ifThen", "n.ifElse"],

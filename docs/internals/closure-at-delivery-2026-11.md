@@ -267,6 +267,12 @@ shared row names.
     lambda handed at the call, and for a lambda of more parameters. It serves D6481's and
     D6706's fixtures without the plan. D14824 (a reassigned `let` beside the calls) and D14845
     (the list push) are left for later slices.
+  - **Slice 2, D14942, served by the tag decision, not the bundle.** A named `lap` is a tagged
+    one-member set, so `k(id)` dispatches to it and no closure is built. What refused was `id`'s
+    set: the decision took an argument of a call through a parameter as an id only for a
+    binding, element or field callee. It now also takes it for a parameter callee when the sets
+    its calls go through hold only named functions, each taking the set there
+    (`ftParamSetsTake`). A lambda member keeps slice 1's bundle.
 
 ### Open questions for the coordinator
 
