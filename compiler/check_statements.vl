@@ -1,7 +1,7 @@
 // The statements: `let`, `if` with its narrowing head, `while`, `for` over a range or a
 // collection, `return` and a block.
 
-import { strListIndexOf } from "./listutil"
+import { strListHas, strListIndexOf } from "./listutil"
 import {
   nodeTyIx,
   nodeTyIxOf,
@@ -22,6 +22,7 @@ import {
   Node,
   OptMember,
   P,
+  Param,
   Paren,
   RetStmt,
   TypeRef,
@@ -61,7 +62,9 @@ import {
   elabDeadRestClose,
   elabDeadRestOpen,
   elabFnLetTy,
+  elabFnListClosedNote,
   elabFnListLetTy,
+  elabFnListOpenWideMembers,
 } from "./check_elab_cap"
 import { npKeys, placeNameTy } from "./check_nar_store"
 import {
@@ -72,6 +75,7 @@ import {
   luElemTy,
   luTs,
   mapKeyUnsupportedErr,
+  resolveAnnotAt,
 } from "./check_annot_resolve"
 import { assignableExpr } from "./check_assignable"
 import {
@@ -113,7 +117,13 @@ import {
 import { crStmtEnter, crUnwidenTop, crWidenedInTop } from "./check_cr_walk"
 import { noteLetCstr, noteRetCstr } from "./check_cstr_rows"
 import { markCtnLitBinding } from "./check_ctn_lit_bind"
-import { curFnDeclIx, inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
+import {
+  curFnDeclIx,
+  inferQuiet,
+  quietDepth,
+  tpEnvNames,
+  tpEnvTys,
+} from "./check_cursor"
 import { letDeclFnPut, tsMapKeyNodeOf, wrDstDeclPut } from "./check_decl_scan"
 import {
   daAddNode,
@@ -271,6 +281,7 @@ import {
 import { recordRedundantAnnot } from "./check_redundant_annot"
 import {
   assignable,
+  bindGenWalk,
   mintedAnnTy,
   nameToTyAt,
   substTyDeep,
@@ -306,16 +317,19 @@ import {
   TY_VOID,
   TyArray,
   TyErr,
+  TyFunc,
   TyMap,
   TyObj,
   TyUnion,
   TyVar,
+  mkFuncTy,
   mkNullableTy,
   tyAt,
   tyHasHole,
   tyIsHole,
   tyIsNewtypeBrand,
   tyIsStructBearingUnion,
+  tySame,
   tyToStr,
 } from "./check_types"
 import { breakValueAt } from "./check_unconsumed"
@@ -330,6 +344,7 @@ import {
   isVoidTy,
   tyHasTyVar,
   tyMentionsVoid,
+  tyReachesHole,
 } from "./tyquery"
 
 // ── let declaration ────────────────────────────────────────────────────────
@@ -515,11 +530,20 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
       nodeTySetGrow(parenPeelIx(n.letInit), fitDecl)
     }
     bound = elabFnLetTy(ix, letDeclInferredBound(n, ix, initTy))
-    const lw = elabFnListLetTy(ix, bound)
+    // A literal's own binding only: an alias reads its source's writes without their order. Inside
+    // a generic the signature is the instance's, which one node cannot record.
+    const litInit = nodeAt(parenPeelIx(n.letInit)) is ArrayLit
+    let wm: i32[] = []
+    if litInit && tpEnvNames.length == 0 {
+      wm = elabFnListOpenWideMembers(ix, bound)
+    }
+    const closedAt = letFnListClosedSig(wm)
+    const lw = elabFnListLetTy(ix, bound, closedAt)
     if lw != bound {
       bound = lw
       if nodeAt(parenPeelIx(n.letInit)) is ArrayLit {
         nodeTySetGrow(parenPeelIx(n.letInit), lw)
+        if closedAt >= 0 { elabFnListClosedNote(parenPeelIx(n.letInit)) }
       }
     }
     recordCtxTy(n.letInit, bound)
@@ -1724,4 +1748,139 @@ export function checkBlockNode(n: Block, ix: i32) {
   blockTailTySet(tailTy)
   blockTailIxSet(tailIx)
   return TY_VOID
+}
+
+// The one closed signature the functions of `ms` share: a plain named one's, else a generic one's
+// bound at the annotated parameters of a written lambda, whose result the write is then checked
+// against. -1 when a plain one is open, two disagree, or a generic one does not fit.
+function letFnListClosedSig(ms: i32[]): i32 {
+  let f = -1
+  const lams: i32[] = []
+  for m in ms {
+    const d = nodeAt(m)
+    if !(d is FuncDecl) { return -1 }
+    if d.fnTyParams.length == 0 {
+      if d.fnName == "" {
+        lams.push(m)
+      } else {
+        const mt = nodeTyIxOf(m)
+        if mt < 0 || mt >= T.tys.length || !(T.tys[mt] is TyFunc) { return -1 }
+        if tyHasTyVar(mt) || tyReachesHole(mt, 8) { return -1 }
+        if f < 0 { f = mt }
+        else if !tySame(f, mt) { return -1 }
+      }
+    }
+  }
+  for m in lams {
+    const ps = letFnLambdaParamTys(m)
+    if ps.length == 0 { return -1 }
+    if f < 0 { f = letFnGenericAt(ms, ps) }
+    if f < 0 { return -1 }
+    const ff = T.tys[f]
+    if !(ff is TyFunc) || ff.fnParamTypes.length != ps.length { return -1 }
+    let i = 0
+    while i < ps.length {
+      if !tySame(ps[i], ff.fnParamTypes[i]) { return -1 }
+      i = i + 1
+    }
+  }
+  if f < 0 { return -1 }
+  for m in ms {
+    if !letFnGenericFitsAt(m, f) { return -1 }
+  }
+  f
+}
+
+// The closed types lambda `m`'s parameters are annotated with; [] when one is not annotated or
+// does not resolve to a closed type. Read quietly: the lambda's own check reports its annotations.
+function letFnLambdaParamTys(m: i32): i32[] {
+  const none: i32[] = []
+  const d = nodeAt(m)
+  if !(d is FuncDecl) || d.fnParams.length == 0 { return none }
+  const out: i32[] = []
+  const savedQuiet = inferQuiet
+  inferQuiet = true
+  quietDepth = quietDepth + 1
+  for q in d.fnParams {
+    const pn = nodeAt(q)
+    let t = -1
+    const at = if pn is Param { pn.parType } else { -1 }
+    if at >= 0 {
+      const tn = nodeAt(at)
+      if tn is TypeRef { t = resolveAnnotAt(tn.tyName, d.fnTyParams, at, "") }
+    }
+    if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyReachesHole(t, 8) {
+      inferQuiet = savedQuiet
+      quietDepth = quietDepth - 1
+      return none
+    }
+    out.push(t)
+  }
+  inferQuiet = savedQuiet
+  quietDepth = quietDepth - 1
+  out
+}
+
+// The signature the first generic function of `ms` gives at closed parameter types `ps`: its
+// result with its type parameters bound by them; -1 when there is none or one stays unbound.
+function letFnGenericAt(ms: i32[], ps: i32[]): i32 {
+  for m in ms {
+    const d = nodeAt(m)
+    if d is FuncDecl && d.fnTyParams.length > 0 {
+      const gt = nodeTyIxOf(m)
+      if gt < 0 || gt >= T.tys.length { return -1 }
+      const gf = T.tys[gt]
+      if !(gf is TyFunc) || gf.fnParamTypes.length != ps.length { return -1 }
+      const bn: string[] = []
+      const bt: i32[] = []
+      let i = 0
+      while i < ps.length {
+        bindGenWalk(gf.fnParamTypes[i], ps[i], bn, bt)
+        i = i + 1
+      }
+      for tp in d.fnTyParams {
+        if !strListHas(bn, tp) { return -1 }
+      }
+      const r = substTyDeep(gf.fnRet, bn, bt)
+      if r < 0 || r >= T.tys.length || tyHasTyVar(r) || tyReachesHole(r, 8) {
+        return -1
+      }
+      const cp: i32[] = []
+      for p in ps { cp.push(p) }
+      return mkFuncTy(cp, r)
+    }
+  }
+  -1
+}
+
+// Whether declaration `m` is plain, or a generic whose signature, bound against closed function
+// type `f`'s parameters, gives exactly `f`.
+function letFnGenericFitsAt(m: i32, f: i32): boolean {
+  const d = nodeAt(m)
+  if !(d is FuncDecl) { return false }
+  if d.fnTyParams.length == 0 { return true }
+  const gt = nodeTyIxOf(m)
+  if gt < 0 || gt >= T.tys.length { return false }
+  const gf = T.tys[gt]
+  const ff = T.tys[f]
+  if !(gf is TyFunc) || !(ff is TyFunc) { return false }
+  if gf.fnParamTypes.length != ff.fnParamTypes.length { return false }
+  const bn: string[] = []
+  const bt: i32[] = []
+  let i = 0
+  while i < gf.fnParamTypes.length {
+    bindGenWalk(gf.fnParamTypes[i], ff.fnParamTypes[i], bn, bt)
+    i = i + 1
+  }
+  for tp in d.fnTyParams {
+    if !strListHas(bn, tp) { return false }
+  }
+  i = 0
+  while i < gf.fnParamTypes.length {
+    if !tySame(substTyDeep(gf.fnParamTypes[i], bn, bt), ff.fnParamTypes[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  tySame(substTyDeep(gf.fnRet, bn, bt), ff.fnRet)
 }
