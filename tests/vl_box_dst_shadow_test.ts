@@ -178,6 +178,24 @@ function run() {
 run()
 `;
 
+// A `?.` read over a record that is a declared union's arm, printed, handed on and bound, and a
+// guarded `m?.get(k)`: the parts the rewrite puts in each read's place are minted by its check.
+const OPT = `type C = { r: i32 }
+type S = { s: i32 }
+type U = C | S
+function show(v: i32 | null) { print(v ?? -1) }
+function bound(p: C | null) {
+  const r = p?.r
+  print(r ?? 100)
+}
+const b: C | null = { r: 7 }
+print(b?.r)
+show(b?.r)
+bound(b)
+const m: {[string]: i32} | null = Map()
+show(m?.get("k"))
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -268,6 +286,18 @@ Deno.test({
   name: "box-dst shadow: a captured binding's cell read takes the read's record",
   ignore,
   fn: () => expectRows("cap", CAP, DROP_NONE, "agree=3; nested agree=3"),
+});
+
+Deno.test({
+  name: "box-dst shadow: a `?.` read's guard arms take the read's join or delivery",
+  ignore,
+  fn: () =>
+    expectRows(
+      "opt",
+      OPT,
+      DROP_NONE,
+      "agree=2; nested agree=14; nested value already a box=2; value already a box=3",
+    ),
 });
 
 Deno.test({

@@ -37,6 +37,7 @@ import {
   loopValAny,
   memSharedCalls,
   nodeRepTyIxOf,
+  optReadParts,
 } from "./check_core_state"
 import { nulRecListNominalName } from "./check_emit_queries"
 import {
@@ -297,6 +298,7 @@ import {
   identRedirect,
   memberDeclOf,
   memberMethodOf,
+  nodeSrc,
   nodeSrcNote,
   sidNoteNodeName,
   sidOfNode,
@@ -1670,8 +1672,10 @@ function drwOptGuard(
   let gElse = -1
   if !atStmt && !nodeTyExcludesNull(ix) {
     const gElseStmts: i32[] = []
-    // The guard's `null` is the call's own null, at the type the checker gave the call.
-    const gNull = mkNull("null", pos)
+    // The guard's `null` is the call's own null, at the type the checker gave the call: the
+    // one the call's check minted, where it minted one.
+    const gParts = optReadParts[ix] ?? []
+    const gNull = if gParts.length > 0 { gParts[0] } else { mkNull("null", pos) }
     recordRepTyAdopt(gNull, nodeTyIxOf(ix), 6)
     gElseStmts.push(gNull)
     gElse = mkBlock(gElseStmts, pos)
@@ -1770,7 +1774,7 @@ function drwWalkOptMember(ix: i32, n: OptMember, ctx: i32): i32 {
   // guard never widened. Folded here for the reason `x ?? d` over a non-nullable left
   // operand is (D1815).
   if nodeTyExcludesNull(n.omObj) {
-    const omFold = mkMember(n.omObj, n.omProp, n.pos)
+    const omFold = optReadPart(ix, 1, n)
     nodeTyCarry(omFold, ix)
     return omFold
   }
@@ -1979,7 +1983,19 @@ function drwWalkMemberCall(
       if tyIsMap(mgTy) { mgRecv = drwNarrowedClone(optRecv, mgTy) }
     }
     if args.length == 1 && nodeTyIsMap(mgRecv) {
-      const mgIx = mkIndex(mgRecv, args[0], n.pos)
+      let mgIx = -1
+      const mgParts = optReadParts[ix] ?? []
+      if optRecv >= 0 && mgParts.length > 1 {
+        // The read the call's check minted, over the guard's fresh receiver.
+        mgIx = mgParts[1]
+        const mgn = nodeAt(mgIx)
+        if mgn is Index {
+          mgn.idxArr = mgRecv
+          mgn.idxIndex = args[0]
+        }
+      } else {
+        mgIx = mkIndex(mgRecv, args[0], n.pos)
+      }
       nodeTyCarry(mgIx, ix)
       return drwOptGuard(mgIx, ix, optRecv, n.pos, atStmt)
     }
@@ -2129,6 +2145,7 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
           clTys[1],
           drwWalk(n.binRight, ctx),
           n.pos,
+          optReadPart(unwrapParen(n.binLeft), 1, cl),
         )
         nodeTyCarry(crIf, ix)
         capMemoNoteEdit()
@@ -2277,9 +2294,12 @@ function recUnionGuard(
   readTy: i32,
   other: i32,
   pos: i32,
+  read: i32,
 ): i32 {
   const rObj = drwNarrowedClone(recv, objTy)
-  const rRead = mkMember(rObj, prop, pos)
+  const rRead = read
+  const rn = nodeAt(rRead)
+  if rn is Member { rn.memObj = rObj }
   nodeTyRecord(rRead, readTy)
   const rThen: i32[] = []
   rThen.push(rRead)
@@ -2331,15 +2351,44 @@ function recUnionReadTys(
   true
 }
 
+// Part `k` of `?.` read `ix` the read's check minted (`optReadParts`): 0 its default `null`, 1 its
+// field read, over the read's receiver; minted here only for a read no check saw.
+function optReadPart(ix: i32, k: i32, n: OptMember): i32 {
+  let at = ix
+  let parts = optReadParts[at] ?? []
+  let depth = 0
+  while parts.length == 0 && at >= 0 && depth < 8 {
+    at = nodeSrc[at] ?? -1
+    parts = optReadParts[at] ?? []
+    depth = depth + 1
+  }
+  if k < parts.length {
+    const p = parts[k]
+    const pn = nodeAt(p)
+    if pn is Member { pn.memObj = n.omObj }
+    return p
+  }
+  if k == 0 { return mkNull("null", n.pos) }
+  mkMember(n.omObj, n.omProp, n.pos)
+}
+
 // A bare `r?.f` read as `ix`, the guard's types in `tys` (`recUnionReadTys`): the guarded read
 // with a `null` default, or `ix` unchanged when `r` cannot be read twice. A computed receiver is
 // bound to a name before the checker runs (D5300).
 function recUnionOptRead(ix: i32, n: OptMember, tys: i32[]): i32 {
   if !exprReReadable(unwrapParen(n.omObj)) { return ix }
   // The default is the read's own null, at the type the checker gave `r?.f`.
-  const dNull = mkNull("null", n.pos)
+  const dNull = optReadPart(ix, 0, n)
   recordRepTyAdopt(dNull, nodeTyIxOf(ix), 6)
-  const g = recUnionGuard(n.omObj, n.omProp, tys[0], tys[1], dNull, n.pos)
+  const g = recUnionGuard(
+    n.omObj,
+    n.omProp,
+    tys[0],
+    tys[1],
+    dNull,
+    n.pos,
+    optReadPart(ix, 1, n),
+  )
   nodeTyCarry(g, ix)
   capMemoNoteEdit()
   g

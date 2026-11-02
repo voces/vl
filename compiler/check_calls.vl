@@ -38,6 +38,8 @@ import {
   hasSpreadItem,
   i32ToStr,
   loopVarLoop,
+  mkIndex,
+  mkNull,
   nodeAt,
   nodeChildren,
   nodeIsTplHole,
@@ -118,6 +120,7 @@ import {
   globalBeforeDecl,
   inferObserved,
   memSharedCalls,
+  optReadParts,
 } from "./check_core_state"
 import {
   rcwBdCall,
@@ -200,6 +203,7 @@ import {
   collapseDeferredJoin,
   constrainEmptyExpr,
   rcwCovs,
+  recordCtxTy,
   stampNullUnitCell,
 } from "./check_fit_rules"
 import {
@@ -3809,6 +3813,27 @@ function listElemsWritten(ix: i32): boolean {
 // `checkBuiltinIdentCall`, a function-typed value to `checkCallOnFuncTy`. The type-answering
 // three return `-1` for "no arm claimed it"; an unclaimed callee is reported here as `TY_ERR`.
 export function checkCallNode(n: Call, ix: i32) {
+  // A map read `m?.get(k)` is rewritten to a guarded `m[k]`: its default `null` and its index
+  // read are minted here, once, and delivered into the call's own join until a delivery of
+  // the call stamps them with its union.
+  const ocf = if n.callFn >= 0 { nodeAt(n.callFn) } else { null }
+  if ocf is OptMember && ocf.omProp == "get" && n.callArgs.length == 1 {
+    if !optReadParts.has(ix) {
+      const parts: i32[] = [
+        mkNull("null", n.pos),
+        mkIndex(ocf.omObj, n.callArgs[0], n.pos),
+      ]
+      optReadParts[ix] = parts
+    }
+    const t = checkCallNodeGo(n, ix)
+    for op in optReadParts[ix] ?? [] { recordCtxTy(op, t) }
+    return t
+  }
+  checkCallNodeGo(n, ix)
+}
+
+// `checkCallNode`'s dispatch.
+function checkCallNodeGo(n: Call, ix: i32) {
   if n.callFn < 0 { return TY_ERR }
   const cfn = nodeAt(n.callFn)
   if callHasTyArgs(ix) {
