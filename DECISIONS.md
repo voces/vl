@@ -11446,6 +11446,22 @@ later write could invalidate the narrowing, and when none can, the delivery is f
 copy. It would relax lists and records alike (D14827, whose witness is D14752's original
 spelling).
 
+## A negative literal does not fit a `u8` element (owner ruling, 2026-11-02) — D3428
+
+**The rule.** A negative integer literal at a `u8` element is refused exactly as one past 255 is,
+and so is a constant holding one, since a constant is its literal at every read. `-0` fits.
+The wrap is spelled with a cast: `as% u8` keeps the low 8 bits (`as u8` is exact-or-fail).
+
+```vl
+const xs: u8[] = [-7]          // refused: the literal -7 does not fit a `u8` element
+const ys: u8[] = [-7 as% u8]   // 249
+```
+
+**Why.** The exact-constant ruling refuses a use whose destination cannot hold the exact value,
+and a literal the compiler can see is a mistake it can name. A computed value still truncates to
+its low 8 bits at the store, as the `u8` slot rule says, since a runtime range check on every
+store is not payable.
+
 ## `x! is O` is refused, not read as `x !is O` (owner ruling A, 2026-11-02) — D3585
 
 **The rule.** A `!` written against its operand and apart from a following `is` (`x! is O`,
@@ -11502,6 +11518,47 @@ that breaks the wider or the narrower type. This is the alias rule of D4084's ru
 **Status.** Backlogged in ROADMAP.md. D14385 and D14890 are its witnesses and wait on it. Until
 it is built, a separate change refuses the family at check with the kept-versus-own sentence,
 graded as clause 2.
+
+## A type variable's uses join over numeric widening (owner ruling, 2026-11-02) — D2459
+
+**The rule.** When the uses of one type variable at a call disagree only by a lossless numeric
+widening (`i32` to `i64` or `f64`, `f32` to `f64`), the variable binds at the wider number, and
+the narrower uses widen into it. The order of the arguments does not decide the instance.
+
+```vl
+function f<T>(x: T, g: (i32) => T) { return g(2) }
+const two: i32 = 2
+print(f(two, (i) => i * 1.5))   // T = f64, prints 3, as `f((i) => i * 1.5, two)` does
+```
+
+Uses that disagree by anything else still refuse: `i64` beside `f64`, `i32` beside `f32`, and a
+number beside a string. A number literal already followed this rule by binding after the values
+beside it (D3541); this extends it to typed values and to a callback's result.
+
+**Why.** Binding at the first use made two declarations that differ only in parameter order
+accept different programs. The widening edges are the ones every other numeric context already
+takes implicitly, so joining over them adds no conversion a reader cannot already see.
+
+**The limit.** A call inside a generic body joins only where the template's own check joined it.
+A use typed by the enclosing type parameter (`mix(u, v)` with `u: U`) is not a number at the
+template, so the template types the call at `U`, and an instance that joined it would hand back
+a type its template never saw. Those calls keep their refusal (D15041).
+
+## A list callback op fixes the length at entry (owner ruling A, 2026-11-02) — D3068
+
+**The rule.** `.map`, `.filter` and `std:array`'s `reduce`, `mapIndexed`, `some` and `every` read
+the list's length once, before the first call. An element the callback pushes is not visited. An
+index the callback cuts off (by a `pop` or a clear) is skipped by `filter`, `reduce`, `some` and
+`every`, and ends `map` and `mapIndexed` with the trap an `xs[i]` read past the length raises.
+The same holds over a readonly view of the list.
+
+**Why.** Before, the core ops fixed the length but read the backing directly, so they returned
+the popped element out of its spare slot, and the std ops re-read the length, so a callback that
+pushed every time never ended (D3068). JavaScript fixes the length and skips, and VL follows it
+except where JavaScript leaves a hole in `map`'s result, which VL has no rep for, so it traps.
+
+**The price.** One length read per step in the core loops. Dropping it where the callback
+provably does not change the list is deferred, the simple case first and the complex one later.
 
 ## A nested join means what its hoisted twin means (owner ruling, 2026-11-02) — D3657
 
