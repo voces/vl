@@ -31485,10 +31485,11 @@ function emitForRangeStmt(body: u8[], s: ForRange, stmtIx: i32, fnIx: i32) {
       stepK: stepK,
       excl: s.frExcl,
     }
+    const wraps = rangeMayWrap(s, rt)
     if rangePartialUnrollOk(s, stepK, dynStep, fnIx) {
-      rc = emitRangePartial(body, s, fnIx, rt)
+      rc = emitRangePartial(body, s, fnIx, rt, wraps)
     } else {
-      rc = emitRangeRolled(body, s, fnIx, rt)
+      rc = emitRangeRolled(body, s, fnIx, rt, wraps)
     }
   }
   loopHoistClose(frHoist)
@@ -31559,11 +31560,69 @@ function rangeTestHolds(rt: RangeTest, v: i32): boolean {
   v >= b
 }
 
+// Whether advancing range `s`'s loop var by its step can leave the i32 range before the test
+// ends it: a dynamic step, a body that writes the var, an inclusive or wider-stepped range to a
+// bound the step can pass the edge from, or a constant bound within one step of the edge.
+function rangeMayWrap(s: ForRange, rt: RangeTest): boolean {
+  if rt.dynStep || stmtAssignsName(s.frBody, s.frVar) { return true }
+  const intMax = 2147483647
+  const intMin = -2147483647 - 1
+  const k = rt.stepK
+  if !rt.bConst { return !(rt.excl && (k == 1 || k == -1)) }
+  // The last value the test admits, then whether one more step leaves the range.
+  let last = rt.bVal
+  if rt.excl {
+    if k > 0 && last == intMin { return false }
+    if k < 0 && last == intMax { return false }
+    last = if k > 0 { last - 1 } else { last + 1 }
+  }
+  if k > 0 { last > intMax - k } else { last < intMin - k }
+}
+
+// Exits range loop `rt` when its next step would leave the i32 range: `v > INT_MAX - K` for a
+// positive step, `v < INT_MIN - K` for a negative one, chosen by the step's sign when dynamic.
+function emitRangeWrapExit(rt: RangeTest) {
+  const intMax = 2147483647
+  const intMin = -2147483647 - 1
+  if rt.dynStep {
+    fbLocalGet(rt.vIdx)
+    fbI32Const(intMax)
+    fbLocalGet(rt.sIdx)
+    fbI32Bin(107) // 0x6b i32.sub
+    fbI32Bin(74)  // 0x4a i32.gt_s — past the top for a positive step
+    fbLocalGet(rt.vIdx)
+    fbI32Const(intMin)
+    fbLocalGet(rt.sIdx)
+    fbI32Bin(107) // 0x6b i32.sub
+    fbI32Bin(72)  // 0x48 i32.lt_s — past the bottom for a negative step
+    fbLocalGet(rt.sIdx)
+    fbI32Const(0)
+    fbI32Bin(74)  // 0x4a i32.gt_s — is the step positive?
+    fbSelect()
+  } else if rt.stepK > 0 {
+    fbLocalGet(rt.vIdx)
+    fbI32Const(intMax - rt.stepK)
+    fbI32Bin(74) // 0x4a i32.gt_s
+  } else {
+    fbLocalGet(rt.vIdx)
+    fbI32Const(intMin - rt.stepK)
+    fbI32Bin(72) // 0x48 i32.lt_s
+  }
+  fbBrIf(1) // 0x0d br_if -> out of the range loop's block
+  0
+}
+
 // The range loop, top-tested: `block { loop { br_if block (!test); body; v += K; br loop } }`.
 // A bottom-tested `br_if` back-edge is not used: wasmtime runs it up to 2.4x slower
 // (DECISIONS.md, "Loops stay top-tested"). A `continue` lands at the end of an inner block, so it
 // still steps.
-function emitRangeRolled(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
+function emitRangeRolled(
+  body: u8[],
+  s: ForRange,
+  fnIx: i32,
+  rt: RangeTest,
+  wraps: boolean,
+) {
   fbBlock(64) // 0x02 block, void
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.frLabel)
@@ -31588,6 +31647,8 @@ function emitRangeRolled(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
     loopContDepth.pop()
     loopContLabel.pop()
   }
+  // A step that would leave the i32 range is past every bound, so it ends the loop (D12181).
+  if wraps { emitRangeWrapExit(rt) }
   // v = v + K
   fbLocalGet(rt.vIdx)
   if rt.dynStep { fbLocalGet(rt.sIdx) } else { fbI32Const(rt.stepK) }
@@ -31674,12 +31735,20 @@ function partialUnrollCost(ix: i32, fnIx: i32): i32 {
 // remain (`v < bound - D`; a bound too low to subtract runs none), then rolled. Copy `k` stores
 // and reads the loop var as `u + k`, `u` the trip's first value, so two reads stay one expression
 // and the copies chain no increments. `break` leaves both loops; `continue` ends its own copy.
-function emitRangePartial(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
+function emitRangePartial(
+  body: u8[],
+  s: ForRange,
+  fnIx: i32,
+  rt: RangeTest,
+  wraps: boolean,
+) {
   fbBlock(64) // 0x02 block, void — the `break` target of both loops
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.frLabel)
+  // A trip whose last step could reach past the i32 range stops one step short, leaving the
+  // rest to the guarded rolled loop (D12181).
   let d = PARTIAL_UNROLL_COPIES - 1
-  if !rt.excl { d = d - 1 }
+  if !rt.excl && !wraps { d = d - 1 }
   const intMin = -2147483647 - 1
   // A constant bound too low to subtract from runs no main trip at all.
   const mainRuns = !rt.bConst || rt.bVal >= intMin + d
@@ -31748,7 +31817,7 @@ function emitRangePartial(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
     fbEnd()       // end loop
     fbEnd()       // end block
   }
-  if emitRangeRolled(body, s, fnIx, rt) < 0 { return -1 }
+  if emitRangeRolled(body, s, fnIx, rt, wraps) < 0 { return -1 }
   fbEnd() // end block
   loopBrkDepth.pop()
   loopBrkLabel.pop()
