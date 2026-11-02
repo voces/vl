@@ -4128,6 +4128,7 @@ export function elabRun() {
   ekReach = []
   elabReadsMemo = Map()
   elabCallKeys = Map()
+  elabHoleMapMemo = Map()
   elabKeyCalls = Map()
   elabRepRowCalls = Map()
   elabLitArg = Map()
@@ -5452,6 +5453,30 @@ function elabArgResultAt(a: i32, pf: TyFunc, names: string[], tys: i32[]): i32 {
   widenLitTy(out)
 }
 
+// The closed map an open map whose key or value nothing types is built at: a hole key as `string`,
+// a hole value as `i32`, the other side kept (D1887). -1 for a set, a closed map, a map whose
+// typed side still names a type variable, and every other type.
+export function elabHoleMapClosed(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const m = tyAt(t)
+  if !(m is TyMap) || m.mSet == 1 { return -1 }
+  const kh = m.mKey < 0 || (tyAt(m.mKey) is TyVar && tyHasInferHole(m.mKey, 0))
+  const vh = m.mVal < 0 || (tyAt(m.mVal) is TyVar && tyHasInferHole(m.mVal, 0))
+  if !kh && !vh { return -1 }
+  if (!kh && tyHasTyVar(m.mKey)) || (!vh && tyHasTyVar(m.mVal)) { return -1 }
+  const k = if kh { TY_STR } else { m.mKey }
+  const v = if vh { TY_I32 } else { m.mVal }
+  const key = i32ToStr(k) + ":" + i32ToStr(v)
+  const have = elabHoleMapMemo[key] ?? -1
+  if have >= 0 { return have }
+  const c = mkMapTy(k, v, 0)
+  elabHoleMapMemo[key] = c
+  c
+}
+
+// `elabHoleMapClosed`'s maps since the last `elabRun`, by key and value.
+let elabHoleMapMemo: {[string]: i32} = Map()
+
 // Binding `tys` of call `ix` with each un-annotated parameter, or one its own type parameter
 // alone annotates, handed a tagged set bound to the set itself: the instance calls each member at its own arguments, so no one signature stands for it.
 // One handed only uncalled hole functions is bound to the stub the monomorphizer primed.
@@ -5478,6 +5503,20 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
     // An argument of only uncalled hole functions binds the stub it is delivered at (D6881),
     // unless it is a tagged set's id.
     const stub = elabStubArg.get(i32ToStr(ix) + ":" + i32ToStr(i)) ?? -1
+    // An open map the call binds a type parameter to is that parameter's closed map (D1887).
+    const hmTv = if pn is Param { elabParamTyVarName(f, i) } else { "" }
+    let j0 = 0
+    while !named && hmTv != "" && j0 < names.length && j0 < out.length {
+      const hm = if names[j0] == hmTv { elabHoleMapClosed(out[j0]) } else { -1 }
+      if hm >= 0 {
+        if !copied {
+          out = tys.slice(0, tys.length)
+          copied = true
+        }
+        out[j0] = hm
+      }
+      j0 = j0 + 1
+    }
     if (
       !named
       && pn is Param
