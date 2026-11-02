@@ -1298,6 +1298,12 @@ function elabDemandFrom(
     elabSettle(nb)
     return ck
   }
+  // A lambda pinned at the bundle of its own parameter's calls is the instance that made them.
+  const lk = elabLamBundleInst(decl, pTys)
+  if lk >= 0 {
+    elabReachNote(from, lk, -1)
+    return lk
+  }
   // An argument holding a tagged set binds its hole parameter to the set itself, which no
   // checker instance at the set's rep has.
   const tagged = elabCallTaggedArgs(call, decl, from)
@@ -1717,12 +1723,23 @@ function elabPinsHoldBundle(ck: i32, pTys: i32[]): boolean {
   false
 }
 
-// Whether `pin` is the bundle of instance `ck`'s parameter `p`: the record whose field `c<j>` is
-// the `j`th signature the instance calls the parameter's lambdas at. Every encloser handing its
-// own lambda at those signatures shares the instance (D14841).
-function elabBundlePinTaken(ck: i32, p: i32, pin: i32): boolean {
-  const sigs = elabBundleSigs.get(elabBundleKey(ck, p)) ?? []
-  if sigs.length < 2 || pin < 0 || pin >= T.tys.length { return false }
+// The instance of lambda `d` whose calls through a parameter one of the pins `pTys` holds the
+// bundle of, as `elabLamParamSigs` records them; -1 where no pin is such a bundle.
+function elabLamBundleInst(d: i32, pTys: i32[]): i32 {
+  let p = 0
+  while p < pTys.length && p < 64 {
+    const sigs = elabLamSigs.get(elabBundleKey(d, p)) ?? []
+    if sigs.length >= 2 && elabPinIsBundleOf(pTys[p], sigs) {
+      return elabLamSigInst.get(elabBundleKey(d, p)) ?? -1
+    }
+    p = p + 1
+  }
+  -1
+}
+
+// Whether `pin` is the record whose field `c<j>` is the `j`th of `sigs`.
+function elabPinIsBundleOf(pin: i32, sigs: i32[]): boolean {
+  if pin < 0 || pin >= T.tys.length { return false }
   const o = tyAt(pin)
   if !(o is TyObj) || o.objFieldNames.length != sigs.length { return false }
   let j = 0
@@ -1730,6 +1747,33 @@ function elabBundlePinTaken(ck: i32, p: i32, pin: i32): boolean {
     const at = strListIndexOf(o.objFieldNames, "c" + i32ToStr(j))
     if at < 0 || !tySame(o.objFieldTypes[at], sigs[j]) { return false }
     j = j + 1
+  }
+  true
+}
+
+// Whether `pin` is the bundle of instance `ck`'s parameter `p`: the record whose field `c<j>` is
+// the `j`th signature the instance calls the parameter's lambdas at. Every encloser handing its
+// own lambda at those signatures shares the instance (D14841).
+function elabBundlePinTaken(ck: i32, p: i32, pin: i32): boolean {
+  const sigs = elabBundleSigs.get(elabBundleKey(ck, p)) ?? []
+  if sigs.length >= 2 && elabPinIsBundleOf(pin, sigs) { return true }
+  elabCloBundlePinTaken(ck, p, pin)
+}
+
+// Whether `pin` is the closure of a lambda instance `ck`'s parameter `p` holds, taking the bundle
+// of that lambda's calls through its own parameter (`elabLamBundleInst`).
+function elabCloBundlePinTaken(ck: i32, p: i32, pin: i32): boolean {
+  if pin < 0 || pin >= T.tys.length { return false }
+  const pf = tyAt(pin)
+  if !(pf is TyFunc) { return false }
+  const dn = nodeAt(ekDecl[ck])
+  if !(dn is FuncDecl) || p >= dn.fnParams.length { return false }
+  const ds = elabFnSetOf(
+    substTyDeep(nodeTyIxOf(dn.fnParams[p]), ekNames[ck], ekTys[ck]),
+  )
+  if ds.length == 0 { return false }
+  for d in ds {
+    if elabLamBundleInst(d, pf.fnParamTypes) < 0 { return false }
   }
   true
 }
@@ -2443,6 +2487,8 @@ export function elabMintFacts(): i32 {
   elabMintValueFns = elabFnSetMembersShared()
   elabMintCalls = Map()
   elabBundleSigs = Map()
+  elabLamSigs = Map()
+  elabLamSigInst = Map()
   elabMintSets = Map()
   let n = 0
   let k = 0
@@ -2705,6 +2751,10 @@ let elabMintSets: {[i32]: i32} = Map()
 // through that parameter at, each once, in first-call order. Two or more, with the lambda's set
 // untagged, is a bundle: one closure per signature, delivered through the one parameter.
 let elabBundleSigs: {[i32]: i32[]} = Map()
+// By lambda declaration and parameter (`elabBundleKey`): the closed signatures any instance of
+// the lambda calls that parameter at, and the instance that noted the last of them.
+let elabLamSigs: {[i32]: i32[]} = Map()
+let elabLamSigInst: {[i32]: i32} = Map()
 
 // The named function and parameter position argument `ix` of call `p` lands in, as
 // `[decl, index]`, when it is a positional argument of a call by name or `const` alias to an
@@ -3669,6 +3719,7 @@ function elabBundleKey(k: i32, i: i32): i32 { k * 64 + i }
 // a set `ds` of lambdas.
 function elabBundleSigNote(k: i32, i: i32, ds: i32[], wp: i32[], r: i32) {
   if ds.length == 0 || i < 0 || i >= 64 || k < 0 { return 0 }
+  elabLamSigNote(k, i, mkFuncTy(wp.slice(0), r))
   for d in ds {
     const m = nodeAt(d)
     if !(m is FuncDecl) || m.fnName != "" { return 0 }
@@ -3682,6 +3733,34 @@ function elabBundleSigNote(k: i32, i: i32, ds: i32[], wp: i32[], r: i32) {
   have.push(sig)
   elabBundleSigs[key] = have
   0
+}
+
+// Notes signature `sig` for a call lambda instance `k` makes through its parameter `i`, whatever
+// set the parameter holds; a lambda instanced twice keeps the union of its instances' calls.
+function elabLamSigNote(k: i32, i: i32, sig: i32) {
+  const d = ekDecl[k]
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) || dn.fnName != "" { return 0 }
+  const key = elabBundleKey(d, i)
+  const have = elabLamSigs.get(key) ?? []
+  for t in have {
+    if tySame(t, sig) { return 0 }
+  }
+  have.push(sig)
+  elabLamSigs[key] = have
+  elabLamSigInst[key] = k
+  0
+}
+
+// The signatures every instance of lambda `d` calls its parameter `i` at, each once, with the
+// instance last noting one in `inst[0]`; none where it calls the parameter at fewer than two.
+export function elabLamParamSigs(d: i32, i: i32, inst: i32[]): i32[] {
+  const none: i32[] = []
+  if d < 0 || i < 0 || i >= 64 { return none }
+  const sigs = elabLamSigs.get(elabBundleKey(d, i)) ?? none
+  if sigs.length < 2 { return none }
+  inst[0] = elabLamSigInst.get(elabBundleKey(d, i)) ?? -1
+  sigs
 }
 
 // The signatures call `ix`'s instance, reached from the instance being walked, calls the lambda

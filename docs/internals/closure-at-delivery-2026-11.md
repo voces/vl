@@ -229,7 +229,7 @@ call's types, so nothing on the set side is per-signature. Slice 2 therefore add
 container of NAMED members. Its share of class 4 is the lambda members, whose built closure the
 shared row names.
 
-- (d) Proposed, not scheduled: the bundle-typed closure parameter. It is the bundle for a callee
+- (d) Scheduled 2026-11-02: the bundle-typed closure parameter. It is the bundle for a callee
   reached only as a closure value.
   - **The shape it serves.** `const lap = (g) => { g(1); g("s") }; function use(k) { k(id) };
     use(lap)`. Today's bundle is decided at a direct call, on the parameter of a function instance
@@ -258,6 +258,15 @@ shared row names.
     named function's parameter bundled when it is reached as a value. Not W-lam, a written
     `let` of hole lambdas, which is the binding bundle and parked on the owner's flow-typing
     ruling. Not M-record.
+  - **Slice 1, built.** An anonymous lambda of one parameter, called at two or more signatures,
+    handed to a hole parameter that is only called, each call handing a named generic.
+    Elaboration notes the signatures per lambda declaration (`elabLamParamSigs`). Mono pins the
+    parameter at `(bundle) => R` (`monoClosureBundlePin`) and instances the generic at each
+    signature at the call (`monoCoerceBundleArgs`). The `call_ref` builds the record
+    (`emitBundleReadArg`). It declines under a split plan, for a reassigned binding, for a
+    lambda handed at the call, and for a lambda of more parameters. It serves D6481's and
+    D6706's fixtures without the plan. D14824 (a reassigned `let` beside the calls) and D14845
+    (the list push) are left for later slices.
 
 ### Open questions for the coordinator
 

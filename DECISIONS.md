@@ -11469,4 +11469,4 @@ takes implicitly, so joining over them adds no conversion a reader cannot alread
 **The limit.** A call inside a generic body joins only where the template's own check joined it.
 A use typed by the enclosing type parameter (`mix(u, v)` with `u: U`) is not a number at the
 template, so the template types the call at `U`, and an instance that joined it would hand back
-a type its template never saw. Those calls keep their refusal (D15031).
+a type its template never saw. Those calls keep their refusal (D15041).
