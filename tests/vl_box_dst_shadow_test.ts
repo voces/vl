@@ -231,6 +231,14 @@ const SPREAD = `function run(xs: (boolean | null)[], ys: i32[]) {
 run([true, null], [1])
 `;
 
+// An annotated function's tail value `if` whose number arms join apart is boxed whole into the
+// declared result.
+const ANNTAIL = `function pick(k: i32): i32 | f64 {
+  if k == 0 { 3 } else { 2.5 }
+}
+print(pick(1))
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -364,6 +372,13 @@ Deno.test({
   ignore,
   fn: () =>
     expectRows("spread", SPREAD, DROP_NONE, "agree=2; nested agree=2"),
+});
+
+Deno.test({
+  name: "box-dst shadow: an annotated tail `if` takes the declared result",
+  ignore,
+  fn: () =>
+    expectRows("anntail", ANNTAIL, DROP_NONE, "agree=1; nested agree=1"),
 });
 
 Deno.test({
