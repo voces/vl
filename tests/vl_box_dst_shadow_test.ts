@@ -196,6 +196,20 @@ const m: {[string]: i32} | null = Map()
 show(m?.get("k"))
 `;
 
+// A function's tail `if` ending in a field write yields the write's value or `null`, and a
+// loop's value is a labelled block's: each read the rewrite yields in their place takes the
+// value's record.
+const TAIL = `type C = { n: i32 }
+function bump(c: C, go: boolean) {
+  if go { c.n = c.n + 1 }
+}
+const inFor = (n: i32) => for i in 0 until 3 { if i == n { break (@B { i * 10 }) } }
+const c: C = { n: 1 }
+print(bump(c, true) ?? -1)
+print(bump(c, false) ?? -1)
+print(inFor(2) ?? -5)
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -297,6 +311,18 @@ Deno.test({
       OPT,
       DROP_NONE,
       "agree=2; nested agree=14; nested value already a box=2; value already a box=3",
+    ),
+});
+
+Deno.test({
+  name: "box-dst shadow: a spilled tail's read takes the value's record",
+  ignore,
+  fn: () =>
+    expectRows(
+      "tail",
+      TAIL,
+      DROP_NONE,
+      "agree=3; nested agree=4; nested value already a box=1; nested value never returns=2; value already a box=4",
     ),
 });
 
