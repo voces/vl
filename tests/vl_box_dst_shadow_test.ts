@@ -133,6 +133,23 @@ print(pick(3))
 print(pick(9))
 `;
 
+// A bare `as`'s miss, the enclosing function's `null`: minted by the cast's check and delivered to
+// the function's result, at a numeric operand, a type parameter pinned at a number and at none,
+// and a hole parameter's call parked until its pin.
+const AS = `function widen(d: f64): i32 | null { return d as i32 }
+function pin<T>(u: T): i32 | null { u as i32 }
+function add(a, b) { return a + b }
+function viaHole(g): i32 | null {
+  const v = g(1.5, 2.5) as i32
+  return v
+}
+print(widen(2.0) ?? -1)
+print(widen(2.5) ?? -1)
+print(pin(3.0) ?? -1)
+print(pin("s") ?? -1)
+print(viaHole(add) ?? -1)
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -193,6 +210,18 @@ Deno.test({
   name: "box-dst shadow: a minted map read takes its call's record",
   ignore,
   fn: () => expectRows("mapget", MAPGET, DROP_NONE, "agree=2; nested agree=2"),
+});
+
+Deno.test({
+  name: "box-dst shadow: a bare `as`'s miss null takes the function's result",
+  ignore,
+  fn: () =>
+    expectRows(
+      "as",
+      AS,
+      DROP_NONE,
+      "agree=5; nested agree=11; value already a box=5",
+    ),
 });
 
 Deno.test({
