@@ -91,6 +91,7 @@ import {
   TyUnion,
   TyVar,
   tyAt,
+  tySame,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
@@ -155,6 +156,7 @@ import {
 // Decides every set from scratch over the program at `rootIx`, then raises the refusal each
 // call through a set left a closure owes.
 export function fnTagDecide(rootIx: i32) {
+  ftTopCalls = ftModuleScopeCalls(rootIx)
   ftParamOwners = Map()
   ftParamOwnersBuilt = false
   fnTagUndecide()
@@ -508,12 +510,15 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   // A written `let`'s type makes its members agree on each parameter, so a record literal
   // handed through it is built at one row whichever member runs.
   for c in calls {
-    if fnTagCallSetOf(c) == s && !ftPlainArgsIn(c, once, ftWideSeen) {
+    if fnTagCallSetOf(c) == s && !ftPlainArgsIn(c, once, ftWideSeen, s) {
       return false
     }
   }
   for r in mint {
-    if mintFactSetOf(r) == s && !ftPlainArgsIn(mintFactCallOf(r), once, false) {
+    if (
+      mintFactSetOf(r) == s
+      && !ftPlainArgsIn(mintFactCallOf(r), once, false, s)
+    ) {
       return false
     }
   }
@@ -634,7 +639,7 @@ export function fnTagInstanceArms(ix: i32): i32[] {
   if s < 0 || !fnTagSetIsTagged(s) { return fnTagCallArms(ix) }
   const have = fnTagArmsAt(ix, s)
   if have.length > 0 { return have }
-  if !ftPlainArgs(ix) { return none }
+  if !ftPlainArgs(ix, s) { return none }
   const leafTy = ftLeafTys[s] ?? []
   const ds = fnTagMembers(s)
   if leafTy.length != ds.length { return none }
@@ -689,11 +694,13 @@ function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
 
 // Whether call `c`'s arguments are safe to evaluate in each member call: none holds a call, a
 // function, a literal that allocates, an assignment, or a block.
-function ftPlainArgs(c: i32): boolean { ftPlainArgsIn(c, false, false) }
+function ftPlainArgs(c: i32, s: i32): boolean {
+  ftPlainArgsIn(c, false, false, s)
+}
 
 // `ftPlainArgs`, where `lits` also admits the literals that allocate and nothing they hold calls,
 // and `recs` the record literals.
-function ftPlainArgsIn(c: i32, lits: boolean, recs: boolean): boolean {
+function ftPlainArgsIn(c: i32, lits: boolean, recs: boolean, s: i32): boolean {
   const cn = nodeAt(c)
   if !(cn is Call) { return false }
   const todo: i32[] = []
@@ -726,13 +733,94 @@ function ftPlainArgsIn(c: i32, lits: boolean, recs: boolean): boolean {
         if !lits { return false }
         nodeChildrenPush(x, todo)
       }
+      // A lambda every member calls at one closed signature is one closure whichever member
+      // takes it; one whose type an arm's instance fixes is the bundle's (D14841).
+      FuncDecl => {
+        if !ftLamArgOk(c, x, s) { return false }
+      }
       // Anything else may call, allocate, bind or loop.
-      OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      OptMember | ErrExpr | LetDecl | Param | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
         return false
       }
     }
   }
   true
+}
+
+// Whether lambda `x`, a positional argument of call `ci` through set `s`, has one signature in every
+// member: each takes it as an un-annotated parameter it only calls, all at one closed argument list.
+function ftLamArgOk(ci: i32, x: i32, s: i32): boolean {
+  const c = nodeAt(ci)
+  const lam = nodeAt(x)
+  if !(c is Call) || !(lam is FuncDecl) || lam.fnName != "" || s < 0 {
+    return false
+  }
+  const i = i32ListIndexOf(c.callArgs, x)
+  if !ftArgIsParam(c, i) { return false }
+  // A call in a function body is demanded through each encloser instance, where the lambda's
+  // argument types are still holes, so only a module-scope call is admitted.
+  if !(ftTopCalls.get(ci) ?? false) { return false }
+  const at: i32[] = []
+  for m in fnTagMembers(s) {
+    const f = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+    if !(f is FuncDecl) || i >= f.fnParams.length { return false }
+    const q = nodeAt(f.fnParams[i])
+    if !(q is Param) || q.parType >= 0 { return false }
+    if !ftParamOnlyCalledAt(f.fnBody, f.fnParams[i], lam.fnParams.length, at) {
+      return false
+    }
+  }
+  at.length > 0
+}
+
+// The calls at module scope under program `rootIx`, outside every function body.
+let ftTopCalls: {[i32]: boolean} = Map()
+
+function ftModuleScopeCalls(rootIx: i32): {[i32]: boolean} {
+  const out: {[i32]: boolean} = Map()
+  const r = if rootIx >= 0 && rootIx < P.nodes.length { nodeAt(rootIx) } else { null }
+  if !(r is Program) { return out }
+  const todo: i32[] = []
+  for st in r.progStmts { todo.push(st) }
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length && !(nodeAt(y) is FuncDecl) {
+      if nodeAt(y) is Call { out[y] = true }
+      nodeChildrenPush(y, todo)
+    }
+  }
+  out
+}
+
+// Whether parameter `q` is read under `body`, and only as the callee of positional calls of `n`
+// arguments whose types are closed and match `at`'s, which the first such call fills.
+function ftParamOnlyCalledAt(body: i32, q: i32, n: i32, at: i32[]): boolean {
+  let reads = 0
+  let calls = 0
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      const yn = nodeAt(y)
+      if yn is Ident && identDeclOf(y) == q { reads = reads + 1 }
+      if yn is Call && identDeclOf(parenPeelIx(yn.callFn)) == q {
+        calls = calls + 1
+        if yn.callArgs.length != n || !ftArgIsParam(yn, n - 1) && n > 0 {
+          return false
+        }
+        let k = 0
+        while k < n {
+          const t = nodeTyIxOf(yn.callArgs[k])
+          if t < 0 || t >= T.tys.length || !elabTyClosed(t, 0) { return false }
+          if at.length < n { at.push(t) }
+          else if !tySame(at[k], t) { return false }
+          k = k + 1
+        }
+      }
+      nodeChildrenPush(y, todo)
+    }
+  }
+  calls > 0 && reads == calls
 }
 
 // Whether `b` is a plain `=`.
@@ -2265,7 +2353,8 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
       || !tyHasTyVar(pt) && !tyReachesHole(pt, 8)
       || ftHoleCallback(c.callArgs[0])
   }
-  if k == 1 { return op == "push" }
+  // A slice copies the list's ids into a list of the same set, read as the holder is (D14931).
+  if k == 1 { return op == "push" || op == "slice" }
   (k == 3 || k == 5)
     && (op == "get" || op == "set" || op == "has" || op == "delete")
 }
