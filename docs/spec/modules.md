@@ -66,9 +66,10 @@ bump()
 print(count)   // prints 2
 ```
 
-**M2.3** An imported name is read-only in the importing module: it cannot be assigned,
-whether the exporter declared it `let` or `const`. The value it names may still be changed
-through its fields, as for any `const`.
+**M2.3** An imported `const` is read-only in the importing module. An imported `let` may
+be assigned, and the write lands in the exporter's binding, so the exporter and every other
+importer read the new value; a re-exported `let` is written the same way through the
+re-export. The value either names may still be changed through its fields.
 
 ```vl
 // file: c.vl
@@ -76,6 +77,16 @@ export const K = 1
 // file: main.vl
 import { K } from "./c"
 K = 5   // refused: cannot reassign `const` K
+```
+
+```vl
+// file: c.vl
+export let count = 0
+export function get(): i32 { count }
+// file: main.vl
+import { count, get } from "./c"
+count = 5
+print(get())   // prints 5
 ```
 
 ```vl
@@ -88,10 +99,8 @@ print(cfg.n)   // prints 9
 ```
 
 > Ruling: owner review 2026-06-06, direction 4, DECISIONS.md §"The module system's eight
-> decided directions".
-
-> Status: assigning an imported `let` is accepted, and writes the exporter's binding
-> (D4063).
+> decided directions"; the imported `let` half by owner ruling 2026-11-02, DECISIONS.md
+> §"An importer may assign an imported `let`".
 
 **M2.4** A type that an exported declaration uses need not be exported itself. An importer
 can use a value of that type through its fields and the functions that take it, but cannot
