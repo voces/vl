@@ -196,6 +196,16 @@ const m: {[string]: i32} | null = Map()
 show(m?.get("k"))
 `;
 
+// An optional call `p?.f()` delivered as it is, into a `??` and into a binding: the call is its
+// guard's non-null arm and takes the call's own join.
+const OPTCALL = `type P = { n: i32 }
+function twice(self: P) { self.n * 2 }
+const p: P | null = { n: 21 }
+print(p?.twice() ?? 0)
+const r = p?.twice()
+print(r ?? -1)
+`;
+
 // A function's tail `if` ending in a field write yields the write's value or `null`, and a
 // loop's value is a labelled block's: each read the rewrite yields in their place takes the
 // value's record.
@@ -208,6 +218,17 @@ const c: C = { n: 1 }
 print(bump(c, true) ?? -1)
 print(bump(c, false) ?? -1)
 print(inFor(2) ?? -5)
+`;
+
+// A list literal with a spread infers a union element: each element beside the spread is
+// delivered to it.
+const SPREAD = `function run(xs: (boolean | null)[], ys: i32[]) {
+  const u = [...xs, 5]
+  print(u.length)
+  const v = [...ys, "s"]
+  print(v.length)
+}
+run([true, null], [1])
 `;
 
 Deno.test({
@@ -315,6 +336,18 @@ Deno.test({
 });
 
 Deno.test({
+  name: "box-dst shadow: an optional call's guarded call takes the call's join",
+  ignore,
+  fn: () =>
+    expectRows(
+      "optcall",
+      OPTCALL,
+      DROP_NONE,
+      "nested agree=8; nested value already a box=1; value already a box=2",
+    ),
+});
+
+Deno.test({
   name: "box-dst shadow: a spilled tail's read takes the value's record",
   ignore,
   fn: () =>
@@ -324,6 +357,13 @@ Deno.test({
       DROP_NONE,
       "agree=3; nested agree=4; nested value already a box=1; nested value never returns=2; value already a box=4",
     ),
+});
+
+Deno.test({
+  name: "box-dst shadow: an element beside a spread takes the list's element union",
+  ignore,
+  fn: () =>
+    expectRows("spread", SPREAD, DROP_NONE, "agree=2; nested agree=2"),
 });
 
 Deno.test({
