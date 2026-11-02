@@ -64,6 +64,7 @@ import {
 import { lbiKeptDeclUnread } from "./check_num_lit_state"
 import { intMatchHeadAt } from "./check_match_heads"
 import {
+  asMissNullOf,
   condProvenTrue,
   ctxFieldNameOf,
   ctxFieldOwnerOf,
@@ -1150,6 +1151,8 @@ import {
   tailIsValueOrNever,
 } from "./emit_fn_scans"
 import {
+  SPREAD_NUL_NONE,
+  SPREAD_NUL_REF,
   chainHasPrelude,
   exprIsNullLike,
   fnTagIdSlot,
@@ -1167,6 +1170,7 @@ import {
   spreadGroupWrapSlot,
   spreadLitElemRow,
   spreadSrcBoxAtom,
+  spreadSrcNulMode,
   structEqStashSlot,
   unionEqArmSlot,
   unionEqStashSlot,
@@ -7800,7 +7804,8 @@ function boxRecordNameOf(ty: i32): string {
 }
 
 // `emitUnionBoxArg` into the union the checker records `valIx` delivered into, where a registry
-// row answers it, else into the site's own union `siteNm` / `siteTy`.
+// row answers it; a value already a box with no record, into its own union; else into the site's
+// own union `siteNm` / `siteTy`.
 function emitUnionBoxAtRecord(
   body: u8[],
   siteNm: string,
@@ -7810,8 +7815,16 @@ function emitUnionBoxAtRecord(
 ) {
   const recTy = boxRecordTyAt(valIx, fnIx)
   const recNm = boxRecordNameOf(recTy)
-  if recNm == "" { return emitUnionBoxArg(body, siteNm, siteTy, valIx, fnIx) }
-  emitUnionBoxArg(body, recNm, recTy, valIx, fnIx)
+  if recNm != "" { return emitUnionBoxArg(body, recNm, recTy, valIx, fnIx) }
+  // A value already of its destination's union is no coercion, so the checker records none: it is
+  // delivered as its own union, and `boxRetagNeeded` decides any retag from that.
+  if exprUnion(valIx, fnIx) {
+    const own = unionNameOfExpr(valIx, fnIx)
+    if own != "" {
+      return emitUnionBoxArg(body, own, nodeTyAt(valIx, fnIx), valIx, fnIx)
+    }
+  }
+  emitUnionBoxArg(body, siteNm, siteTy, valIx, fnIx)
 }
 
 // The value's form for the box shadow: 1 already a box, 2 a call that never returns, else 0.
@@ -11977,7 +11990,12 @@ function emitSpreadGroupBoxed(
   if emitSpreadGroup(body, grp, fnIx, pendingKindOfMf(k, 0), 0) < 0 {
     return -1
   }
-  emitScalarListBoxTop(spreadScalarVKind(k), ak, row)
+  emitScalarListBoxTop(
+    spreadScalarVKind(k),
+    ak,
+    row,
+    spreadSrcNulMode(grp, fnIx),
+  )
 }
 
 // One list operand `g` of a spread literal or a widening concat: a list literal is built at
@@ -21476,11 +21494,22 @@ function emitNumCastTrapMsg(exprIx: i32, tgt: string) {
   0
 }
 
-// The `null` node a bare `as`'s early return hands to `emitReturnValue`, so the return
-// path's own seeds (`emitNullLitNode`'s rep table) serve it rather than a second ladder
-// guessing a null encoding per rep. Minted fresh per site, not cached in a module `let` —
-// a cached arena index outliving its program is the hazard `emitProgram`'s sidecar-reset guards against, and the LSP compiles many programs through one instance.
-function numCastNullNode(): i32 { mkNull("null", -1) }
+// The `null` node bare `as` cast `exprIx` hands `emitReturnValue` on a miss: the one its check
+// minted and delivered (`asMissNullOf`), reached through a mono copy's source node (`nodeSrc`);
+// -1, through `emitFail`, where the check minted none.
+function numCastNullNode(exprIx: i32): i32 {
+  let at = exprIx
+  let depth = 0
+  while at >= 0 && depth < 8 {
+    const mn = asMissNullOf(at)
+    if mn >= 0 { return mn }
+    at = nodeSrc[at] ?? -1
+    depth = depth + 1
+  }
+  emitFail(
+    "emitProgram: internal: a bare `as` reached emit with no miss `null` its check minted",
+  )
+}
 
 // The three modes, over one shared test and conversion: `as?` is a value-producing `if`
 // whose result is the `{tag, payload}` union box (the same rep `emitUnionCoerce`'s
@@ -21559,7 +21588,9 @@ function emitNumExactCastFrom(
     // A bare `as` PROPAGATES. The checker proved the enclosing function returns something
     // `null` fits, so the value to hand back is that function's own null — built through
     // `emitReturnValue`, which is where every nullable-return seed already lives.
-    if emitReturnValue(body, numCastNullNode(), fnIx) < 0 { return -1 }
+    const missNull = numCastNullNode(exprIx)
+    if missNull < 0 { return -1 }
+    if emitReturnValue(body, missNull, fnIx) < 0 { return -1 }
     fbReturn()
   }
   fbEnd()
@@ -21576,7 +21607,9 @@ function emitHoleNumCastMiss(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
     fbUnreachable()
     return 0
   }
-  if emitReturnValue(body, numCastNullNode(), fnIx) < 0 { return -1 }
+  const missNull = numCastNullNode(exprIx)
+  if missNull < 0 { return -1 }
+  if emitReturnValue(body, missNull, fnIx) < 0 { return -1 }
   fbReturn()
   0
 }
@@ -27992,7 +28025,13 @@ function scalarBoxWidenOp(srcKind: VKind, atomK: i32): i32 {
 // Consume a scalar list of `srcKind` on the stack and leave a `(ref $rlWrapIdx[dstSlot])` whose
 // union-box elements each hold one source element under value atom `atomK`'s tag: the boxing
 // sibling of `emitScalarListWidenTop`, for a spread into a list of a union element (D2869).
-function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
+// `nul` (`SPREAD_NUL_*`) says how a source element is null; it lands as the union's null box.
+function emitScalarListBoxTop(
+  srcKind: VKind,
+  atomK: i32,
+  dstSlot: i32,
+  nul: i32,
+) {
   const conv = scalarBoxWidenOp(srcKind, atomK)
   if conv == -2 {
     return emitFail(
@@ -28027,14 +28066,33 @@ function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
   // block { loop { if i >= n br 1; back[i] = {tag, box(src.back[i])}; i++; br 0 } }
   fbLocalGet(dL)
   fbLocalGet(iL)
+  if nul != SPREAD_NUL_NONE {
+    fbLocalGet(sL)
+    fbStructGet(srcWrap, 0)
+    fbLocalGet(iL)
+    fbArrayGet(srcBack)
+    if nul == SPREAD_NUL_REF {
+      fbRefIsNull()
+    } else {
+      fbRefNullOfKind("nulbool", -1)
+      fbI32Bin(70) // i32.eq
+    }
+    fbIfRef(uBoxIdx)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    fbElse()
+  }
   fbI32Rel(RS_TAG, scalarTagOfKind(atomK))
   fbLocalGet(sL)
   fbStructGet(srcWrap, 0)
   fbLocalGet(iL)
   fbArrayGet(srcBack)
+  if nul == SPREAD_NUL_REF { fbRefAsNonNull() }
   if conv >= 0 { wU8(conv) }
   if vb >= 0 { fbStructNew(vb) }
   fbStructNew(uBoxIdx)
+  if nul != SPREAD_NUL_NONE { fbEnd() }
   fbArraySet(dstBack)
   emitCopyLoopClose(iL, dL, nL, dstWrap)
   0

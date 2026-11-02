@@ -67,7 +67,11 @@ import {
 } from "./check_emit_queries"
 import { bindOf, i32TyIx, tyIsGradualUnion } from "./check_leaf_steps"
 import { canonEmitName } from "./check_program"
-import { topFnOwnerOf, tyIsForeignGenericSig } from "./check_subst"
+import {
+  topFnOwnerOf,
+  tyIsForeignGenericSig,
+  tyVarOwnedByOtherGeneric,
+} from "./check_subst"
 import {
   assignable,
   bindGenFnRetUnionArm,
@@ -610,6 +614,7 @@ import {
   elabCallParamTy,
   elabCallSeedBind,
   elabDemand,
+  elabHoleMapClosed,
   elabInstSlotAt,
   elabInstSpelling,
   elabInstTyAt,
@@ -775,8 +780,8 @@ let monoNamedTmplNode: i32[] = []
 let monoNamedTmplSlot: i32[] = []
 
 // The lifted slot holding node `fnIx`: the plain scan, plus the replacement table for a
-// named template whose slot now holds its first instance. One home, because two call
-// sites ask the same question with the same loop.
+// named template whose slot now holds its first instance, and a hole template's slot its
+// first instance took over (D15032). One home, because two call sites ask the same question.
 function monoSlotOfLamNode(fnIx: i32) {
   let fe = 0 - 1
   let k = 0
@@ -789,6 +794,11 @@ function monoSlotOfLamNode(fnIx: i32) {
   while r < monoNamedTmplNode.length {
     if monoNamedTmplNode[r] == fnIx { return monoNamedTmplSlot[r] }
     r = r + 1
+  }
+  let o = 0
+  while o < monoOrigNode.length && o < fnStmts.length {
+    if monoOrigNode[o] == fnIx { return o }
+    o = o + 1
   }
   -1
 }
@@ -1962,6 +1972,13 @@ function monoIdentReadsValue(ix: i32): boolean {
   !(nodeAt(d) is FuncDecl)
 }
 
+// The pin of a map whose key or value nothing types (an empty `Map()` handed to a bare
+// parameter): the closed map the elaboration binds it at (D1887). "" for any other type.
+function monoHoleMapPinName(t: i32): string {
+  const c = elabHoleMapClosed(t)
+  if c < 0 { "" } else { tyToEmitName(c) }
+}
+
 // The rep rungs of `monoArgTyName`, after every binding and projection arm declined: the
 // argument's own recorded type, then the collection, union, record and scalar cascades.
 // `cax` is `ix` with its grouping parens peeled. "" is the loud floor, `"i32"` the last rung.
@@ -1986,6 +2003,8 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   // `tyToEmitName` spells a declared union arm structurally and the two mint two (D88).
   const mnArm = nodeMapArmNominalName(unwrapParen(ix), fnIx)
   if mnArm != "" { return mnArm }
+  const hm = monoHoleMapPinName(nodeTyIxOf(unwrapParen(ix)))
+  if hm != "" { return hm }
   const mn = nodeTyMapName(unwrapParen(ix))
   if mn != "" { return mn }
   // The string twin of the arm above, blind in the same place for the same reason:
@@ -4080,7 +4099,9 @@ function monoExprMake(ix: i32, kids: i32[]): i32 {
       return monoReIsExpr(ix, kids[0])
     }
     AsExpr => {
-      return mkAsExpr(kids[0], n.asTy, n.asMode, n.pos)
+      const na = mkAsExpr(kids[0], n.asTy, n.asMode, n.pos)
+      nodeSrcNote(na, ix)
+      return na
     }
     Spread => {
       return mkSpread(kids[0], n.pos)
@@ -4910,7 +4931,9 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32, bN: string[], bT: i32[]) {
     const er = monoLamElabRet(fnIx)
     let rs = er
     if rs < 0 {
-      rs = monoSubstInst(rty, bN, bT)
+      // A result typed at another generic's variable is not this instance's to pin: the clone
+      // keeps it open, as it keeps a parameter of that type, and is instanced at its calls (D15032).
+      rs = if tyVarOwnedByOtherGeneric(rty, monoInstOwn) { rty } else { monoSubstInst(rty, bN, bT) }
       if rs >= 0 && tyHasTyVar(rs) {
         const rr = monoLamReachParamTy(fnIx, -1, bN, bT)
         if rr >= 0 { rs = rr }
@@ -8401,7 +8424,9 @@ function monoCloneGenericCallsRaw(ix: i32) {
     AsExpr => {
       const ao = monoCloneGenericCalls(n.asObj)
       if ao == n.asObj { return ix }
-      return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+      const na = mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+      nodeSrcNote(na, ix)
+      return na
     }
     // A spread's source is an operand like any other (D2334).
     Spread => {
@@ -8907,7 +8932,9 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
     AsExpr => {
       const ao = monoPinBinOps(n.asObj, pNames, pTys)
       if ao == n.asObj { return ix }
-      return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+      const na = mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+      nodeSrcNote(na, ix)
+      return na
     }
     // A spread's source is an operand like any other (D2334).
     Spread => {
@@ -9174,7 +9201,9 @@ function monoFoldLayoutAt(
     AsExpr => {
       const ao = monoFoldTyParamLayout(n.asObj, typarams, tvN, tvV)
       if ao == n.asObj { return ix }
-      return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+      const na = mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+      nodeSrcNote(na, ix)
+      return na
     }
     // A spread's source is an operand like any other (D2334).
     Spread => {
