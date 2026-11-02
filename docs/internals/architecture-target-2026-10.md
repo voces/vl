@@ -864,7 +864,7 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 | M-maker | a capturing block-local maker called at two types, and a maker result called directly (`mkLoop()(5)`) | 2 | D5971 | mono lane (closure-at-delivery remnants); #5863 took the converting destinations and D9380 |
 | B | a `const` alias of a generic or hole function, at module scope or in a closure, called in a body instanced at two types | 0 | — | closed (#5846) |
 | F-let | a `let` copy of a forwarded hole parameter (`let hh = h`), beside a list forward of that parameter to a member calling it at two types | 2 | — | step 4 (γ), with F's copy read |
-| C | an impure `else if` choosing generics (D14425) | 1 | — | step 4 (γ) |
+| C | an impure `else if` choosing generics (D14425) | 0 | — | closed: a join at a tail of another set's join, whose members that set holds, is typed at the outer join's set (`ftNestedJoinsFollow`), so the nested `else if` no longer carries the set of a binding beside it |
 | H-b | a `const` list literal of a parameter called at two types, beside a copy of the parameter in a list (`twice(id); twice(dbl)` beside `copied`) | 0 | — | closed (#5870): the list widening is per instance |
 | H-nested | a choice of functions nested in the caller handed to a hole parameter, whose arms are built where those names are out of scope (`ftMemberSeenAtArms`) | 1 | — | unowned |
 | L-nested | a list forward of a captured hole parameter inside a nested function (D14842's shape) | 1 | D14842 | design-size: a nested function's body instanced per encloser instance |
