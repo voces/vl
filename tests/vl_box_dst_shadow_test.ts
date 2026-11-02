@@ -267,6 +267,24 @@ print(xs[0].f)
 print(wideJ.f ?? 0)
 `;
 
+// A field write into a parameter whose every call hands it a value built at a wider record: an
+// annotated one instanced at the build, and a hole one.
+const PARAMWRITE = `type J = { f: i32 | null }
+function mk() { { f: 4 } }
+function w(a: { f: i32 }) {
+  a.f = 9
+  a.f
+}
+function h(a) {
+  a.f = 7
+  a.f
+}
+const d: J = mk()
+print(w(mk()))
+print(h(mk()))
+print(d.f ?? 0)
+`;
+
 // A literal stored into a map before the store that decides the map's wider build: it is built at
 // that build, so its field is boxed at the build's field.
 const STORELIT = `type J = { f: i32 | null }
@@ -434,6 +452,13 @@ Deno.test({
   ignore,
   fn: () =>
     expectRows("storewrite", STOREWRITE, DROP_NONE, "agree=2; nested agree=2"),
+});
+
+Deno.test({
+  name: "box-dst shadow: a parameter's field write takes its calls' storage",
+  ignore,
+  fn: () =>
+    expectRows("paramwrite", PARAMWRITE, DROP_NONE, "agree=3; nested agree=3"),
 });
 
 Deno.test({

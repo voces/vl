@@ -1,10 +1,21 @@
 // The storage a value is built at, once a check pass's builds are known: the record every
 // result of a call or a binding of one is built at, and the field writes boxed at it.
 
-import { Call, Ident, LetDecl, ObjLit, nodeAt } from "./ast"
+import {
+  Call,
+  FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  ObjLit,
+  P,
+  Param,
+  nodeAt,
+} from "./ast"
+import { rcwCallSites } from "./check_record_writes"
 import { callRetRepTy } from "./check_bind_adopt"
 import { nodeTyIxOf } from "./check_node_tys"
-import { T, TyObj, objFieldType, tyAt, tySame } from "./check_types"
+import { T, TyArray, TyObj, objFieldType, tyAt, tySame } from "./check_types"
 import { nonNullTy } from "./tyquery"
 import {
   recBuiltReadTy,
@@ -12,6 +23,7 @@ import {
   recordBoxTy,
   storeWriteCount,
   storeWriteFieldAt,
+  storeWriteFnAt,
   storeWriteRecvAt,
   storeWriteValAt,
   storeWritesClear,
@@ -19,7 +31,10 @@ import {
 import { recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
 import { recSolePinArg } from "./check_record_origins"
 import { recFnValueLeaves } from "./check_type_shape"
-import { cwPeelValue } from "./check_write_scan"
+import { cwIxUp, cwPeelValue } from "./check_write_scan"
+import { recArgRepArgs, recArgRepOf } from "./check_rec_rows"
+import { identBoundFnDeclOf } from "./check_scopes"
+import { identDeclOf } from "./symbols"
 import { unwrapParen } from "./emit_base"
 import { litRepTyAt } from "./emit_elab"
 
@@ -72,12 +87,86 @@ function solePinPeel(x: i32): i32 {
   l
 }
 
+// The record the value `x`, read in function `fd`, is stored as: a call's or binding's build
+// (`callBuiltTy`), the rep every call hands a parameter of `fd` at, or an element of one; else -1.
+function storeRepOf(x: i32, fd: i32, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const b = callBuiltTy(x, 8)
+  if b >= 0 { return b }
+  const u = unwrapParen(x)
+  const n = if u >= 0 { nodeAt(u) } else { null }
+  if n is Index {
+    const a = storeRepOf(n.idxArr, fd, depth - 1)
+    const at = if a >= 0 && a < T.tys.length { T.tys[a] } else { null }
+    return if at is TyArray { at.aElem } else { -1 }
+  }
+  if n is Ident {
+    const d = identDeclOf(u)
+    const r = paramRepOf(d)
+    return if r >= 0 { r } else { paramCallsBuiltTy(d, fd) }
+  }
+  storeRepNone(u)
+}
+
+// Every other kind is stored as `callBuiltTy` answered, which found no build.
+function storeRepNone(_ix: i32): i32 { -1 }
+
+// The rep every noted argument hands parameter `par` at (`recArgRepOf`), where they agree; else -1.
+function paramRepOf(par: i32): i32 {
+  if par < 0 || !(nodeAt(par) is Param) { return -1 }
+  let r = -1
+  for x in recArgRepArgs() {
+    const c = if x >= 0 && x < cwIxUp.length { cwIxUp[x] } else { -1 }
+    const cn = if c >= 0 { nodeAt(c) } else { null }
+    const fd = if cn is Call { identBoundFnDeclOf(cn.callFn) } else { -1 }
+    const fn = if fd >= 0 { nodeAt(fd) } else { null }
+    if cn is Call && fn is FuncDecl {
+      let pi = 0
+      while pi < cn.callArgs.length && pi < fn.fnParams.length {
+        if (
+          fn.fnParams[pi] == par
+          && unwrapParen(cn.callArgs[pi]) == unwrapParen(x)
+        ) {
+          const rep = recArgRepOf(x)
+          if r < 0 { r = rep }
+          else if !tySame(r, rep) { return -1 }
+        }
+        pi = pi + 1
+      }
+    }
+  }
+  r
+}
+
+// The build every call of `fd` hands its parameter `par` at (`callBuiltTy` of each argument),
+// where every call is a plain one that names it and they agree; else -1.
+function paramCallsBuiltTy(par: i32, fd: i32): i32 {
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) { return -1 }
+  let pi = 0
+  while pi < fn.fnParams.length && fn.fnParams[pi] != par { pi = pi + 1 }
+  if pi >= fn.fnParams.length { return -1 }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length == 0 { return -1 }
+  let r = -1
+  for s in sites {
+    if (s & 1) == 1 { return -1 }
+    const c = nodeAt(s >> 1)
+    if !(c is Call) || pi >= c.callArgs.length { return -1 }
+    const b = callBuiltTy(c.callArgs[pi], 8)
+    if b < 0 { return -1 }
+    if r < 0 { r = b }
+    else if !tySame(r, b) { return -1 }
+  }
+  r
+}
+
 // Boxes each queued field write's value at its field's type in the record the receiver is
 // stored as, where that is a union, and empties the queue.
 export function storeWritesResolve() {
   let i = 0
   while i < storeWriteCount() {
-    const st = callBuiltTy(storeWriteRecvAt(i), 8)
+    const st = storeRepOf(storeWriteRecvAt(i), storeWriteFnAt(i), 4)
     const so = if st >= 0 && st < T.tys.length { T.tys[st] } else { null }
     const ft = if so is TyObj { objFieldType(so, storeWriteFieldAt(i)) } else { -1 }
     if ft >= 0 { recordBoxTy(storeWriteValAt(i), ft) }
