@@ -57,10 +57,13 @@ import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import { fnCloCoerceNote } from "./check_core_state"
 import {
   CW_OCC_CALL,
+  CW_OCC_USE,
   cwIxKind,
   cwIxNode,
+  cwIxWant,
   cwLetUnwritten,
   cwOccNext,
+  cwOccWalk,
   cwOccWalkSpelled,
   cwUseCaptures,
   fnDeclIx,
@@ -765,6 +768,7 @@ function ftScan(
         const cn = nodeAt(p)
         if (
           !ftRetAtOwn(x, p, g, fn)
+          && !ftConstLambdaOnlyCalled(x, p)
           && (!(cn is Call)
             || cn.callFn != x
             && (ftArgDstTy(cn, x) != nodeTyIxOf(x) || !ftValueSigned(x)))
@@ -1196,8 +1200,9 @@ function ftNodeOk(
       const d = ftNamedFn(n.callFn)
       // A function an instance found to hand back its parameter gives this call that argument.
       if ftLate && d >= 0 && ftHandsBack(d, n, s) { return true }
-      if d < 0 || !ftRetCarries(d, s) { return false }
-      const f = nodeAt(d)
+      const ld = if d >= 0 { d } else { ftConstLambdaOf(n.callFn) }
+      if ld < 0 || !ftRetCarries(ld, s) { return false }
+      const f = nodeAt(ld)
       if !(f is FuncDecl) { return false }
       const vs: i32[] = []
       collectRetValues(f.fnBody, vs)
@@ -1660,6 +1665,50 @@ function ftNamedFn(v: i32): i32 {
   if r >= 0 && r != d { return -1 }
   if r < 0 && elabFnIdOf(nodeTyIxOf(v)) != d { return -1 }
   d
+}
+
+// The lambda a `const` read `v` is bound to, whose calls run it; -1 otherwise.
+function ftConstLambdaOf(v: i32): i32 {
+  const r = parenPeelIx(v)
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return -1 }
+  const bd = identDeclOf(r)
+  if bd < 0 || bd >= P.nodes.length { return -1 }
+  const b = nodeAt(bd)
+  if !(b is LetDecl) || b.letKw != "const" || b.letInit < 0 { return -1 }
+  const li = parenPeelIx(b.letInit)
+  if li < 0 || li >= P.nodes.length { return -1 }
+  const f = nodeAt(li)
+  if f is FuncDecl && f.fnName == "" { li } else { -1 }
+}
+
+// Whether lambda `x` initialises the `const` node `p`, and every read of that binding is a call's
+// callee: what a call hands back is the lambda's result, and nothing holds the lambda itself.
+function ftConstLambdaOnlyCalled(x: i32, p: i32): boolean {
+  if p < 0 || p >= P.nodes.length { return false }
+  const b = nodeAt(p)
+  if !(b is LetDecl) || b.letKw != "const" || b.letType >= 0 { return false }
+  if parenPeelIx(b.letInit) != x { return false }
+  const f = nodeAt(x)
+  if !(f is FuncDecl) || f.fnName != "" { return false }
+  cwIxWant()
+  const callees: i32[] = []
+  const cw = cwOccWalk(p)
+  while cwOccNext(cw) {
+    const m = nodeAt(cwIxNode[cw.row])
+    if cwIxKind[cw.row] == CW_OCC_CALL && m is Call {
+      callees.push(parenPeelIx(m.callFn))
+    }
+  }
+  const uw = cwOccWalk(p)
+  while cwOccNext(uw) {
+    if (
+      cwIxKind[uw.row] == CW_OCC_USE
+      && !i32ListHas(callees, cwIxNode[uw.row])
+    ) {
+      return false
+    }
+  }
+  true
 }
 
 // Whether argument `x` of call `c` binds a parameter of set `s` itself, of a lambda called in
