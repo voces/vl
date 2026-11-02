@@ -2327,6 +2327,7 @@ export function elabMintFacts(): i32 {
   elabHandBackMemo = Map()
   elabMintValueFns = elabFnSetMembersShared()
   elabMintCalls = Map()
+  elabBundleSigs = Map()
   elabMintSets = Map()
   let n = 0
   let k = 0
@@ -2374,6 +2375,7 @@ export function elabMintFacts(): i32 {
         && !elabKeyUncalled(kk)
         && !elabKeyCallsHandSet(kk, c, d)
         && !elabKeyCallsHandClosure(kk, c, d)
+        && !elabKeyCallsHandSetValue(kk, c, d)
       ) {
         all = false
       }
@@ -2408,6 +2410,37 @@ function elabKeyCallsHandSet(k: i32, c: i32, d: i32): boolean {
     const a = parenPeelIx(xn.callArgs[pi])
     if a < 0 || !(nodeAt(a) is Ident) || !i32ListHas(ms, identDeclOf(a)) {
       return false
+    }
+  }
+  true
+}
+
+// Whether every call reaching instance `k` names the function `d` itself and hands, at the
+// parameter `c` calls through, a value the reaching instance types as `c`'s set: `k` is that
+// call's instance at the set's rep, which a tagged set's direct call does not build.
+function elabKeyCallsHandSetValue(k: i32, c: i32, d: i32): boolean {
+  const cs = elabKeyCalls[k] ?? []
+  if cs.length == 0 || (elabRepRowCalls[k] ?? []).length > 0 { return false }
+  const dn = nodeAt(d)
+  const cn = nodeAt(c)
+  if !(dn is FuncDecl) || dn.fnName == "" || !(cn is Call) { return false }
+  const pi = i32ListIndexOf(dn.fnParams, identDeclOf(parenPeelIx(cn.callFn)))
+  const s = elabMintSets[c] ?? -1
+  if pi < 0 || s < 0 { return false }
+  for x in cs {
+    const xn = nodeAt(x)
+    if !(xn is Call) || pi >= xn.callArgs.length { return false }
+    if elabCalleeNamesDecl(xn.callFn) != d { return false }
+    const ks = elabCallKeys[x] ?? []
+    let j = 0
+    while j + 1 < ks.length {
+      if ks[j + 1] == k {
+        if ks[j] < 0 { return false }
+        if fnTagSetOfTy(elabNodeTy(xn.callArgs[pi], ks[j])) != s {
+          return false
+        }
+      }
+      j = j + 2
     }
   }
   true
@@ -2552,6 +2585,11 @@ let elabSigAlting = false
 let elabMintCalls: {[i32]: i32[]} = Map()
 let elabMintSets: {[i32]: i32} = Map()
 
+// By instance and parameter (`elabBundleKey`): the closed signatures the instance calls a lambda
+// through that parameter at, each once, in first-call order. Two or more, with the lambda's set
+// untagged, is a bundle: one closure per signature, delivered through the one parameter.
+let elabBundleSigs: {[i32]: i32[]} = Map()
+
 // The named function and parameter position argument `ix` of call `p` lands in, as
 // `[decl, index]`, when it is a positional argument of a call by name or `const` alias to an
 // un-annotated parameter, or one its own type parameter alone annotates; [] otherwise.
@@ -2620,9 +2658,10 @@ function elabSetFwdTarget(ix: i32, p: i32, k: i32): i32[] {
   out
 }
 
-// Notes parameter `i` of `fn` (declared at `decl`), copied into the unannotated binding `d`,
-// as forwarded wherever `d` is read: true only when every read of `d` in `fn`'s body is a
-// positional argument of a call through a set of functions, and none sits in a nested function.
+// Notes parameter `i` of `fn` (declared at `decl`), copied into binding `d`, unannotated or
+// annotated with the type parameter annotating `i`, as forwarded wherever `d` is read: true only
+// when every read of `d` in `fn`'s body is a positional argument of a call through a set of
+// functions or of a named function's open parameter, and none sits in a nested function.
 function elabAliasSetFwd(
   decl: i32,
   i: i32,
@@ -2633,7 +2672,17 @@ function elabAliasSetFwd(
 ) {
   if st < 0 || d < 0 || d >= P.nodes.length { return false }
   const ln = nodeAt(d)
-  if !(ln is LetDecl) || ln.letType >= 0 { return false }
+  if !(ln is LetDecl) { return false }
+  if ln.letType >= 0 {
+    const own = elabTyParamNameOf(fn, d)
+    if (
+      own == ""
+      || i >= fn.fnParams.length
+      || elabTyParamNameOf(fn, fn.fnParams[i]) != own
+    ) {
+      return false
+    }
+  }
   const tos: i32[][] = []
   const todo: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
@@ -2647,8 +2696,9 @@ function elabAliasSetFwd(
         // A nested function's read is one body for every instance (D14842).
         if inFn { return false }
         const to = elabSetFwdTarget(x, p, k)
-        if to.length == 0 { return false }
-        tos.push(to)
+        const named = if to.length == 0 { elabMintFwdTarget(x, p) } else { [] }
+        if to.length == 0 && named.length != 2 { return false }
+        tos.push(if to.length > 0 { to } else { [named[1], named[0]] })
       }
       const deeper = inFn || nodeAt(x) is FuncDecl
       for c in nodeChildren(x) {
@@ -3120,6 +3170,46 @@ function elabChainStep(x: i32): i32 {
   }
 }
 
+// The key of instance `k`'s parameter `i` in `elabBundleSigs`.
+function elabBundleKey(k: i32, i: i32): i32 { k * 64 + i }
+
+// Notes signature `wp` => `r` for a call instance `k` makes through its parameter `i` bound to
+// a set `ds` of lambdas.
+function elabBundleSigNote(k: i32, i: i32, ds: i32[], wp: i32[], r: i32) {
+  if ds.length == 0 || i < 0 || i >= 64 || k < 0 { return 0 }
+  for d in ds {
+    const m = nodeAt(d)
+    if !(m is FuncDecl) || m.fnName != "" { return 0 }
+  }
+  const sig = mkFuncTy(wp.slice(0), r)
+  const key = elabBundleKey(k, i)
+  const have = elabBundleSigs.get(key) ?? []
+  for t in have {
+    if tySame(t, sig) { return 0 }
+  }
+  have.push(sig)
+  elabBundleSigs[key] = have
+  0
+}
+
+// The signatures call `ix`'s instance, reached from the instance being walked, calls the lambda
+// handed to its parameter `i` at: two or more, with the lambda's set untagged; else none.
+export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
+  const none: i32[] = []
+  const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const k = elabCallInstFrom(ix, from)
+  if k < 0 || i < 0 || i >= 64 { return none }
+  const sigs = elabBundleSigs.get(elabBundleKey(k, i)) ?? none
+  if sigs.length < 2 { return none }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || i >= dn.fnParams.length { return none }
+  const s = fnTagSetOfTy(
+    substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k]),
+  )
+  if s < 0 || fnTagSetIsTagged(s) { return none }
+  sigs
+}
+
 // Notes the fact for call `c` at `ix` when its callee is a parameter of `decl` that instance `k`
 // binds to a set of functions each instanced at the call's closed argument types.
 function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
@@ -3155,6 +3245,9 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   if !split { elabNodeTyFill(ix, k, rs[0]) }
   if root == cf {
     mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
+    if !split {
+      elabBundleSigNote(k, i32ListIndexOf(dn.fnParams, pd), ds, wp, rs[0])
+    }
   }
   const at = elabMintCalls[ix] ?? []
   at.push(k)
