@@ -51,6 +51,7 @@ import {
   WhileStmt,
   callTyArgsOf,
   elseIfLink,
+  hasNamedArgs,
   hasSpreadItem,
   i32ToStr,
   nodeAt,
@@ -184,6 +185,8 @@ import {
 } from "./listutil"
 import {
   mintAliasNote,
+  mintCloDeliveryNote,
+  mintCloRows,
   mintFactNote,
   mintParamBoundNote,
   mintParamFwdNote,
@@ -244,7 +247,13 @@ import {
   monoArgInstFe,
   monoLamCloneTmpl,
 } from "./emit_state"
-import { isNumericPrimTy, nonNulTyOf, nonNullTy, tyHasTyVar } from "./tyquery"
+import {
+  isNumericPrimTy,
+  nonNulTyOf,
+  nonNullTy,
+  tyHasTyVar,
+  tyReachesHole,
+} from "./tyquery"
 import { identDeclOf, nodeSrc } from "./symbols"
 
 // The instances: declaration, binding names and types, and the canonical key.
@@ -2438,7 +2447,8 @@ export function elabMintFacts(): i32 {
     }
     if !all { mintSetPartialNote(elabMintSets[c] ?? -1) }
   }
-  n
+  // A delivery to a closed function type is a fact the decision reads too.
+  n + mintCloRows()
 }
 
 // Whether instance `k` is reached by no call, as a checker pin a later decision outdated is.
@@ -2733,7 +2743,7 @@ function elabAliasSetFwd(
     if (
       own == ""
       || i >= fn.fnParams.length
-      || elabTyParamNameOf(fn, fn.fnParams[i]) != own
+      || !elabTyParamsAgreeAt(own, elabTyParamNameOf(fn, fn.fnParams[i]), k)
     ) {
       return false
     }
@@ -2829,7 +2839,7 @@ function elabMintCallbacksAt(c: Call, decl: i32, k: i32, sc: i32): i32 {
   if !(fm is Member) { return -1 }
   if fm.memProp != "map" { return -1 }
   const recv = parenPeelIx(fm.memObj)
-  const pd = elabCalleeParam(recv, decl)
+  const pd = elabCalleeParam(recv, decl, k)
   if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return -1 }
   if elabHeldSetOf(elabNodeTy(recv, k)) < 0 || c.callArgs.length != 1 {
     return -1
@@ -2926,8 +2936,8 @@ function elabHeldSetOf(t: i32): i32 {
 }
 
 // The parameter of `decl` read `root` names: the parameter itself, or a `const` alias of it
-// that is only ever called (`elabCallOnlyAlias`); else -1.
-function elabCalleeParam(root: i32, decl: i32): i32 {
+// that is only ever called (`elabCallOnlyAlias`, at instance `k`); else -1.
+function elabCalleeParam(root: i32, decl: i32, k: i32): i32 {
   const d = identDeclOf(root)
   if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
     return -1
@@ -2935,7 +2945,7 @@ function elabCalleeParam(root: i32, decl: i32): i32 {
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) { return -1 }
   if nodeAt(d) is Param { return d }
-  const ap = elabCallOnlyAlias(d, dn)
+  const ap = elabCallOnlyAlias(d, dn, k)
   if ap >= 0 { return ap }
   elabWrittenParamAlias(d, dn)
 }
@@ -3020,15 +3030,15 @@ function elabWrittenAliasReadsOk(d: i32, fn: FuncDecl): boolean {
 // The parameter of `fn` that binding `d` is initialised with, directly or through a chain of
 // such bindings, where every read of `d` in `fn`'s body is a call's callee or the initialiser of
 // another such binding: the alias hands the set nowhere else and nothing re-points it; else -1.
-function elabCallOnlyAlias(d: i32, fn: FuncDecl): i32 {
-  const pd = elabAliasSource(d, fn, 8)
-  if pd < 0 || !elabAliasReadsOk(d, fn, 8) { return -1 }
+function elabCallOnlyAlias(d: i32, fn: FuncDecl, k: i32): i32 {
+  const pd = elabAliasSource(d, fn, 8, k)
+  if pd < 0 || !elabAliasReadsOk(d, fn, 8, k) { return -1 }
   pd
 }
 
 // The parameter of `fn` the binding `d` is initialised with, through at most `depth` bindings
 // each initialised with the one before it; -1 when the chain reaches anything else.
-function elabAliasSource(d: i32, fn: FuncDecl, depth: i32): i32 {
+function elabAliasSource(d: i32, fn: FuncDecl, depth: i32, k: i32): i32 {
   if depth <= 0 || d < 0 || d >= P.nodes.length { return -1 }
   const ln = nodeAt(d)
   if !(ln is LetDecl) || ln.letInit < 0 { return -1 }
@@ -3038,15 +3048,31 @@ function elabAliasSource(d: i32, fn: FuncDecl, depth: i32): i32 {
   const ix = parenPeelIx(ln.letInit)
   if ix < 0 || !(nodeAt(ix) is Ident) { return -1 }
   const src = identDeclOf(ix)
-  const r = if i32ListHas(fn.fnParams, src) { src } else { elabAliasSource(src, fn, depth - 1) }
-  if r >= 0 && own != "" && elabTyParamNameOf(fn, r) != own { return -1 }
+  const r = if i32ListHas(fn.fnParams, src) { src } else { elabAliasSource(src, fn, depth - 1, k) }
+  if (
+    r >= 0
+    && own != ""
+    && !elabTyParamsAgreeAt(own, elabTyParamNameOf(fn, r), k)
+  ) {
+    return -1
+  }
   r
+}
+
+// Whether own type parameters `a` and `b` name one type: the same name, or two that instance `k`
+// binds to one closed type.
+function elabTyParamsAgreeAt(a: string, b: string, k: i32): boolean {
+  if a == b { return true }
+  if a == "" || b == "" || k < 0 || k >= ekDecl.length { return false }
+  const ta = bindOf(ekNames[k], ekTys[k], a)
+  const tb = bindOf(ekNames[k], ekTys[k], b)
+  ta >= 0 && tb >= 0 && tySame(ta, tb) && elabTyClosed(ta, 0)
 }
 
 // Whether every read of binding `d` in `fn`'s body is a call's callee, or the initialiser of a
 // binding (unannotated, or a copy `elabAliasSource` takes) whose own reads are so, within `depth`
 // bindings.
-function elabAliasReadsOk(d: i32, fn: FuncDecl, depth: i32): boolean {
+function elabAliasReadsOk(d: i32, fn: FuncDecl, depth: i32, k: i32): boolean {
   if depth <= 0 { return false }
   const todo: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
@@ -3057,14 +3083,15 @@ function elabAliasReadsOk(d: i32, fn: FuncDecl, depth: i32): boolean {
       if nodeAt(x) is Ident && identDeclOf(x) == d {
         const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
         const callee = pn is Call && parenPeelIx(pn.callFn) == x
+          || elabClosedDestTy(x, p) >= 0
         const seeds = pn is LetDecl
           && parenPeelIx(pn.letInit) == x
-          && (pn.letType < 0 || elabAliasSource(p, fn, depth) >= 0)
-          && elabAliasReadsOk(p, fn, depth - 1)
+          && (pn.letType < 0 || elabAliasSource(p, fn, depth, k) >= 0)
+          && elabAliasReadsOk(p, fn, depth - 1, k)
         if !callee && !seeds { return false }
       }
-      for k in nodeChildren(x) {
-        todo.push(k)
+      for c in nodeChildren(x) {
+        todo.push(c)
         par.push(x)
       }
     }
@@ -3104,7 +3131,11 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
     const dn = nodeAt(decl)
     if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
       // A `const` alias that is only ever called reads the set where its calls do.
-      if p >= 0 && nodeAt(p) is LetDecl && elabCallOnlyAlias(p, dn) == pd {
+      if p >= 0 && nodeAt(p) is LetDecl && elabCallOnlyAlias(p, dn, k) == pd {
+        // Its reads handed to a closed function type are deliveries of the parameter's set.
+        if !elabAliasCloNote(p, pd, dn, k) {
+          mintSetPartialNote(elabHeldSetOf(elabNodeTy(ix, k)))
+        }
         return 0
       }
       // So does a written binding every value of which is such a parameter.
@@ -3135,6 +3166,9 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       ) {
         return 0
       }
+      // A read handed to a named function's parameter of a closed function type is the closure
+      // there of the set's one named member (D6741).
+      if elabCloNoteAt(ix, p, pd, k) { return 0 }
       mintSetPartialNote(elabHeldSetOf(elabNodeTy(ix, k)))
       const st = fnTagSetOfTy(elabNodeTy(ix, k))
       const to = elabMintFwdTarget(ix, p)
@@ -3160,6 +3194,92 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
   if p >= 0 { return 0 }
   for kid in nodeChildren(ix) { elabMintHandedNested(kid, ix, decl, k, sc) }
   0
+}
+
+// The closed function type of the named function's parameter that read `ix`, an argument of call
+// `p`, is handed to; -1 for any other read.
+function elabClosedDestTy(ix: i32, p: i32): i32 {
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const pn = nodeAt(p)
+  if (
+    !(pn is Call)
+    || parenPeelIx(pn.callFn) == ix
+    || hasNamedArgs(pn.callArgNames)
+  ) {
+    return -1
+  }
+  let ai = -1
+  let i = 0
+  while i < pn.callArgs.length {
+    const a = pn.callArgs[i]
+    if a >= 0 && nodeAt(a) is Spread { return -1 }
+    if parenPeelIx(a) == ix { ai = i }
+    i = i + 1
+  }
+  const cf = parenPeelIx(pn.callFn)
+  if ai < 0 || cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) {
+    return -1
+  }
+  const fd = identDeclOf(cf)
+  if fd < 0 || fd >= P.nodes.length { return -1 }
+  const fdn = nodeAt(fd)
+  if !(fdn is FuncDecl) || fdn.fnName == "" || ai >= fdn.fnParams.length {
+    return -1
+  }
+  const dt = nodeTyIxOf(fdn.fnParams[ai])
+  if dt < 0 || dt >= T.tys.length || !(tyAt(dt) is TyFunc) { return -1 }
+  if tyHasTyVar(dt) || tyReachesHole(dt, 8) { return -1 }
+  dt
+}
+
+// Whether read `ix` of parameter `pd` of instance `k`'s function, handed as `p`'s argument to a
+// closed function type, delivers the closure there of the one named member of the set the
+// instance binds `pd` to, the same at every instance; it records that delivery (D6741).
+function elabCloNoteAt(ix: i32, p: i32, pd: i32, k: i32): boolean {
+  const dt = elabClosedDestTy(ix, p)
+  if dt < 0 || pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) {
+    return false
+  }
+  if k < 0 || k >= ekDecl.length { return false }
+  // The parameter's type at the instance names the set; a read delivered elsewhere first may be
+  // recorded at that delivery's signature.
+  const st = fnTagSetOfTy(substTyDeep(nodeTyIxOf(pd), ekNames[k], ekTys[k]))
+  const ms = fnTagMembers(st)
+  if ms.length != 1 || ms[0] < 0 || ms[0] >= P.nodes.length { return false }
+  const m = nodeAt(ms[0])
+  if !(m is FuncDecl) || m.fnName == "" { return false }
+  if !mintCloDeliveryNote(ix, dt, st) { return false }
+  // The parameter takes the set here as a call through it would.
+  const dn = nodeAt(ekDecl[k])
+  if dn is FuncDecl {
+    mintParamSetNote(ekDecl[k], i32ListIndexOf(dn.fnParams, pd), st)
+  }
+  true
+}
+
+// The reads of the `const` copy `d` of parameter `pd` that `elabCloNoteAt` takes as deliveries,
+// noted for instance `k`; false when one of them does not take.
+function elabAliasCloNote(d: i32, pd: i32, fn: FuncDecl, k: i32): boolean {
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if (
+        nodeAt(x) is Ident
+        && identDeclOf(x) == d
+        && elabClosedDestTy(x, p) >= 0
+      ) {
+        if !elabCloNoteAt(x, p, pd, k) { return false }
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+      }
+    }
+  }
+  true
 }
 
 // `elabMintHandedIn` inside a function nested in `decl`'s body, with each node's parent `p`: a
@@ -3270,7 +3390,7 @@ export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
 function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const cf = parenPeelIx(c.callFn)
   const root = elabSlotRoot(cf)
-  const pd = elabCalleeParam(root, decl)
+  const pd = elabCalleeParam(root, decl, k)
   if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return false }
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) || !i32ListHas(dn.fnParams, pd) { return false }
