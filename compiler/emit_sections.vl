@@ -371,6 +371,7 @@ import {
   gInitAny,
   gInitAt,
   gInitAtNode,
+  gInitBitIdx,
   gInitFnReach,
   gInitGIdx,
   gInitGLocs,
@@ -6809,6 +6810,32 @@ function igLetInit(letIx: i32): i32 {
   -1
 }
 
+// Numbers an assigned bit from `base` for each guarded global with no initializer that keeps a
+// cell, into `gInitBitIdx`; answers how many.
+function initBitsAssign(base: i32): i32 {
+  gInitBitIdx = []
+  let n = 0
+  let gi = 0
+  while gi < globalStmts.length {
+    gInitBitIdx.push(-1)
+    const d = nodeAt(globalStmts[gi])
+    if (
+      gInitAny
+      && gi < gInitGuard.length
+      && gInitGuard[gi] == 1
+      && gi < gCellIdx.length
+      && gCellIdx[gi] >= 0
+      && d is LetDecl
+      && d.letInit < 0
+    ) {
+      gInitBitIdx[gi] = base + n
+      n = n + 1
+    }
+    gi = gi + 1
+  }
+  n
+}
+
 // Decides which module globals need the read-before-init guard (D2652): a global whose
 // initializer runs in the start function, or builds a record or list, and whose name is mentioned
 // by top-level code at or before its declaration, or by a function that code can call (1); a
@@ -6818,6 +6845,7 @@ function initGuardScan(): i32 {
   gInitFnReach = []
   gInitAny = false
   gInitProgIdx = -1
+  gInitBitIdx = []
   gInitStartOrd = -1
   initAtCompute()
   let anyCand = false
@@ -9404,13 +9432,17 @@ function emitGlobalSection() {
     nProg = 1
     gInitProgIdx = externGlobalCount() + np + nCells + nHeap
   }
+  // The assigned bits of the guarded bindings with no initializer trail the progress cell.
+  const nBits = initBitsAssign(
+    externGlobalCount() + np + nCells + nHeap + nProg,
+  )
   // The synthetic constants trail everything, and the section is framed once the bodies that
   // mint them are built (`frameGlobalSection`), at this point of the module.
-  gSynthBase = externGlobalCount() + np + nCells + nHeap + nProg
-  gGlobalFixedN = nCells + np + nHeap + nProg
+  gSynthBase = externGlobalCount() + np + nCells + nHeap + nProg + nBits
+  gGlobalFixedN = nCells + np + nHeap + nProg + nBits
   gGlobalRopeAt = W.chunks.length
   gGlobalEntries = []
-  if nCells + np + nHeap + nProg > 0 {
+  if nCells + np + nHeap + nProg + nBits > 0 {
     const globalPayload: u8[] = gGlobalEntries
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
     // each entry's valtype (`fbValtype`), mutability flag, and init constexpr (`fb*`
@@ -9505,6 +9537,14 @@ function emitGlobalSection() {
       wU8(1)   // mutable
       fbI32Const(0)
       fbEnd()
+    }
+    let bk = 0
+    while bk < nBits {
+      wU8(127) // 0x7f i32
+      wU8(1)   // mutable
+      fbI32Const(0)
+      fbEnd()
+      bk = bk + 1
     }
     wTarget(gPrev)
     relHold(globalPayload)
