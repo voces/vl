@@ -689,6 +689,7 @@ import {
   unionSinkBase,
   variantHeap,
   variantReboxSlot,
+  variantRowOf,
   vbAtomListUsed,
   vbBoolListTop,
 } from "./emit_state"
@@ -1452,6 +1453,7 @@ import {
   unMemIsMap,
   unMemIsRefElemArray,
   unionArmsOf,
+  unionArmsOfTy,
   unionHasAtomAB,
   unionHasAtomTy,
   unionHasValueAtom,
@@ -7888,7 +7890,12 @@ export function emitUnionCoerce(
     )
   }
   boxDstShadowEnter()
-  const r = emitUnionCoerceUnder(body, unionNameIn, unionTy, exprIx, fnIx)
+  let r = emitUnionWideArmBox(body, unionNameIn, unionTy, exprIx, fnIx)
+  if r == 1 {
+    r = 0
+  } else if r == 0 {
+    r = emitUnionCoerceUnder(body, unionNameIn, unionTy, exprIx, fnIx)
+  }
   boxDstShadowLeave()
   r
 }
@@ -8855,18 +8862,114 @@ function emitUnionBoxArgGo(
   const bxMap = emitUnionMapArmBox(body, unionName, unionTy, exprIx, fnIx)
   if bxMap < 0 { return -1 }
   if bxMap == 1 { return 0 }
-  const bxArm = emitUnionArmValueBox(body, exprIx, fnIx)
+  const bxArm = emitUnionArmValueBox(body, unionName, unionTy, exprIx, fnIx)
   if bxArm < 0 { return -1 }
   if bxArm == 1 { return 0 }
   emitUnionCoerce(body, unionName, unionTy, exprIx, fnIx)
+}
+
+// Box a record wider than one arm of the union under that arm's tag, the reference as it
+// stands: its row declares the arm's row a supertype (`armSuperOf`). A value that is itself an
+// arm of another union is such a record too. Returns 1 handled, 0 not such a record, -1 on error.
+function emitUnionWideArmBox(
+  body: u8[],
+  unionName: string,
+  unionTy: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  const vty = nodeTyAt(unwrapParen(exprIx), fnIx)
+  const atoms: string[] = []
+  unionArmsOfTy(unionName, unionTy, atoms)
+  // A nullable record: its null is the union's, else it boxes as the record does.
+  if tyBearsNull(vty) {
+    if exprUnion(exprIx, fnIx) { return 0 }
+    const nwvi = wideArmOfRow(structIndexOfExpr(exprIx, fnIx), atoms)
+    if nwvi < 0 || nwvi >= uTags.length { return 0 }
+    const nvSlot = nulNicheBoxSlot()
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+    fbLocalTee(nvSlot)
+    fbRefIsNull()
+    fbIfRef(uBoxIdx)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    fbElse()
+    fbI32Rel(RS_TAG, uTags[nwvi])
+    fbLocalGet(nvSlot)
+    fbStructNew(uBoxIdx)
+    fbEnd()
+    return 1
+  }
+  // A box narrowed to one arm: its payload re-boxes under the arm it is wider than.
+  if exprUnion(exprIx, fnIx) {
+    if vty < 0 || !(tyAt(vty) is TyObj) { return 0 }
+    const nvi = repVariantShapeRowOf(vty)
+    if nvi < 0 || armsHoldHeap(atoms, variantHeap(nvi)) { return 0 }
+    const wvi = wideArmOfRow(variantRowOf(nvi), atoms)
+    if wvi < 0 || wvi >= uTags.length { return 0 }
+    fbI32Rel(RS_TAG, uTags[wvi])
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 1)
+    fbStructNew(uBoxIdx)
+    return 1
+  }
+  const svi = exprVariantIndex(exprIx, fnIx)
+  let row = -1
+  if svi >= 0 {
+    if armsHoldHeap(atoms, variantHeap(svi)) { return 0 }
+    row = variantRowOf(svi)
+  } else {
+    row = structIndexOfExpr(exprIx, fnIx)
+  }
+  const vi = wideArmOfRow(row, atoms)
+  if vi < 0 || vi >= uTags.length { return 0 }
+  fbI32Rel(RS_TAG, uTags[vi])
+  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  fbStructNew(uBoxIdx)
+  1
+}
+
+// Whether one of the arms named `atoms` is on heap type `heap`.
+function armsHoldHeap(atoms: string[], heap: i32): boolean {
+  if heap < 0 { return false }
+  for a in atoms {
+    const vi = variantIndexOf(a)
+    if vi >= 0 && variantHeap(vi) == heap { return true }
+  }
+  false
+}
+
+// The arm among `atoms` whose row is on struct row `si`'s supertype chain, or -1.
+function wideArmOfRow(si: i32, atoms: string[]): i32 {
+  if si < 0 { return -1 }
+  let x = sSuperAt(si)
+  let guard = 0
+  while x >= 0 && guard < 64 {
+    for a in atoms {
+      const vi = variantIndexOf(a)
+      if vi >= 0 && variantRowOf(vi) == x { return vi }
+    }
+    x = sSuperAt(x)
+    guard = guard + 1
+  }
+  -1
 }
 
 // Box a value that is already one arm of a value union — a concrete variant ref, or the
 // `nulvariant` niche narrowed non-null — into the `{tag, anyref}` box. Returns 1 handled, 0
 // not an arm value, -1 on error. Every box-typed destination delivers through it, since
 // `emitUnionCoerce` alone passes an arm value raw, which fits only a variant cell (D1606).
-function emitUnionArmValueBox(body: u8[], exprIx: i32, fnIx: i32): i32 {
+function emitUnionArmValueBox(
+  body: u8[],
+  unionName: string,
+  unionTy: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
   if exprUnion(exprIx, fnIx) { return 0 }
+  const wide = emitUnionWideArmBox(body, unionName, unionTy, exprIx, fnIx)
+  if wide != 0 { return wide }
   // A read that can still be null (a record-valued map's miss) is the niche below even where
   // `exprVariantIndex` names its arm: tagging it with the arm boxes the miss as a record (D10170).
   // Asked at the instance too: a type parameter's value is nullable where its pin is.
@@ -30456,15 +30559,15 @@ function emitLetInitValue(
     // The binding boundary is a box-typed destination, so an init that is one ARM of the union
     // boxes here exactly as an argument does (D1606) — `emitUnionCoerce` alone passes an arm
     // value raw, which fits only a variant cell, and a union annotation never types one.
+    // An inferred null-hole union (`nliNameOf`) is recorded by name alone, so it has no type.
+    let letUTy = -1
+    if s.letType >= 0 { letUTy = nodeTyIxOf(s.letType) }
     let letArmBoxed = 0
     if slotKind == "union" {
-      letArmBoxed = emitUnionArmValueBox(body, s.letInit, fnIx)
+      letArmBoxed = emitUnionArmValueBox(body, letUNm, letUTy, s.letInit, fnIx)
       if letArmBoxed < 0 { return -1 }
     }
     if letArmBoxed == 0 {
-      // An inferred null-hole union (`nliNameOf`) is recorded by name alone, so it has no type.
-      let letUTy = -1
-      if s.letType >= 0 { letUTy = nodeTyIxOf(s.letType) }
       if emitUnionCoerce(body, letUNm, letUTy, s.letInit, fnIx) < 0 {
         return -1
       }

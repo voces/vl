@@ -541,6 +541,7 @@ import {
   unRowBySid,
   unionSinkBase,
   variantHeap,
+  variantRowOf,
   vbF32Idx,
   vbF64Idx,
   vbI32Idx,
@@ -8306,10 +8307,10 @@ function structRowIsProperPrefix(p: i32, c: i32): boolean {
   true
 }
 
-// Builds `sSuper`/`sSubbed`: every representative struct row takes as its declared supertype
-// the longest proper-prefix representative row in the module, or -1. Representatives only, on
-// both ends — a twin shares an earlier row's heap index and has no form of its own to carry a
-// `sub` or be named a parent. Longest, so the chain is transitively closed: a row's other required prefixes are prefixes of its longest one, and that row takes them in turn.
+// Builds `sSuper`/`sSubbed`: every representative struct row, and every arm's own row, takes as
+// its declared supertype the longest proper-prefix row in the module, an arm's row among them,
+// or -1. A twin shares an earlier row's heap index and has no form of its own to carry a `sub`.
+// Longest, so the chain is transitively closed: a row's shorter prefixes are its longest one's.
 export function buildStructSupers() {
   sSuper = []
   sSubbed = []
@@ -8319,9 +8320,10 @@ export function buildStructSupers() {
     sSubbed.push(false)
     i = i + 1
   }
+  armRowsBuild()
   let c = 0
   while c < sNames.length {
-    if sTwin[c] == c && !sIsRefRow(c) {
+    if (sTwin[c] == c && !sIsRefRow(c)) || (armRowIs[c] ?? false) {
       let best = -1
       let bestLen = 0
       let bestAgrees = false
@@ -8345,6 +8347,8 @@ export function buildStructSupers() {
         }
         pi = pi + 1
       }
+      const arm = armSuperOf(c, bestLen)
+      if arm >= 0 { best = arm }
       if best >= 0 {
         sSuper[c] = best
         sSubbed[best] = true
@@ -8353,6 +8357,43 @@ export function buildStructSupers() {
     c = c + 1
   }
   0
+}
+
+// The reference rows of the union arms (rows on a variant's own heap, with no struct entry), as
+// a set and by first field name; `armRowsBuild` fills both for one `buildStructSupers`.
+let armRowIs: {[i32]: boolean} = Map()
+let armRowsByFirst: {[string]: i32[]} = Map()
+function armRowsBuild() {
+  armRowIs = Map()
+  armRowsByFirst = Map()
+  let vi = 0
+  while vi < uVarRow.length {
+    const r = variantRowOf(vi)
+    if r >= 0 && sIsRefRow(r) && !(armRowIs[r] ?? false) && sFieldCount[r] > 0 {
+      armRowIs[r] = true
+      const f = sFieldNames[sFieldStart[r]]
+      const b = armRowsByFirst[f] ?? []
+      if b.length == 0 { armRowsByFirst[f] = b }
+      b.push(r)
+    }
+    vi = vi + 1
+  }
+  0
+}
+
+// The longest arm row that is a proper prefix of row `c` and longer than `bestLen`, or -1: a
+// record wider than an arm boxes under that arm's tag as it stands.
+function armSuperOf(c: i32, bestLen: i32): i32 {
+  if sFieldCount[c] == 0 { return -1 }
+  let best = -1
+  let len = bestLen
+  for r in armRowsByFirst[sFieldNames[sFieldStart[c]]] ?? [] {
+    if r != c && structRowIsProperPrefix(r, c) && sFieldCount[r] > len {
+      best = r
+      len = sFieldCount[r]
+    }
+  }
+  best
 }
 
 // The rec-group entries `emitTypeSection` has written so far; entry k is heap type k.
@@ -8420,6 +8461,18 @@ function tsStruct(si: i32) {
 // — an immutable i32 tag and an immutable `anyref` value — mirroring binaryen's `unionStruct` output.
 function tsVariant(vi: i32) {
   tsEntryAt(variantHeap(vi), "union variant")
+  // An arm wider than another record or arm declares it its supertype; one that is a
+  // supertype is not final.
+  const vr = variantRowOf(vi)
+  const sup = sSuperAt(vr)
+  if sup >= 0 {
+    wU8(80) // 0x50 sub
+    wULEB(1)
+    wULEB(sHeapIdx[sup])
+  } else if sSubbedAt(vr) {
+    wU8(80) // 0x50 sub
+    wULEB(0)
+  }
   wU8(95) // 0x5f struct
   const cnt = uFieldCount[vi]
   wULEB(cnt)
