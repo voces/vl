@@ -7,7 +7,8 @@
 //
 // TWO HALVES, each needed for the other to mean anything:
 //
-//   classes — witnesses whose deliveries land in each class, with exact counts. `brk` reaches
+//   classes — witnesses whose deliveries land in each class, with exact counts. A delivery a
+//             site boxes inside its own lowering counts as `nested <class>`. `brk` reaches
 //             the record through the loop's exits; its minted `__trap__()` tail never returns.
 //   fires   — `boxDstDropSet(1)` reads no record, so every agreement becomes a missing row;
 //             `boxDstDropSet(2)` reads a type no site names, so every agreement disagrees.
@@ -135,33 +136,45 @@ print(pick(9))
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
-  fn: () => expectRows("arg", ARG, DROP_NONE, "agree=2"),
+  fn: () => expectRows("arg", ARG, DROP_NONE, "agree=2; nested agree=2"),
 });
 
 Deno.test({
   name:
     "box-dst shadow: a literal adopted into an arm records the alias, not the arm",
   ignore,
-  fn: () => expectRows("arm", ARM, DROP_NONE, "agree=2; value already a box=1"),
+  fn: () =>
+    expectRows(
+      "arm",
+      ARM,
+      DROP_NONE,
+      "agree=2; nested value already a box=1; value already a box=1",
+    ),
 });
 
 Deno.test({
   name: "box-dst shadow: an inferred union element agrees",
   ignore,
-  fn: () => expectRows("elem", ELEM, DROP_NONE, "agree=4"),
+  fn: () => expectRows("elem", ELEM, DROP_NONE, "agree=4; nested agree=4"),
 });
 
 Deno.test({
   name: "box-dst shadow: a ?? operand takes the join's union",
   ignore,
   fn: () =>
-    expectRows("coal", COAL, DROP_NONE, "agree=4; value already a box=1"),
+    expectRows(
+      "coal",
+      COAL,
+      DROP_NONE,
+      "agree=4; nested agree=8; nested value already a box=1; value already a box=1",
+    ),
 });
 
 Deno.test({
   name: "box-dst shadow: a set member's call takes the call's joined union",
   ignore,
-  fn: () => expectRows("setcall", SETCALL, DROP_NONE, "agree=2"),
+  fn: () =>
+    expectRows("setcall", SETCALL, DROP_NONE, "agree=2; nested agree=2"),
 });
 
 Deno.test({
@@ -172,26 +185,28 @@ Deno.test({
       "brk",
       BRK,
       DROP_NONE,
-      "agree=2; value already a box=2; value never returns=1",
+      "agree=2; nested agree=2; nested value already a box=2; nested value never returns=1; value already a box=2; value never returns=1",
     ),
 });
 
 Deno.test({
   name: "box-dst shadow: a minted map read takes its call's record",
   ignore,
-  fn: () => expectRows("mapget", MAPGET, DROP_NONE, "agree=2"),
+  fn: () => expectRows("mapget", MAPGET, DROP_NONE, "agree=2; nested agree=2"),
 });
 
 Deno.test({
   name:
     "box-dst shadow: reading no record turns every agreement into a missing row",
   ignore,
-  fn: () => expectRows("arg", ARG, DROP_READ, "no record=2"),
+  fn: () =>
+    expectRows("arg", ARG, DROP_READ, "nested no record=2; no record=2"),
 });
 
 Deno.test({
   name:
     "box-dst shadow: reading another type turns every agreement into a disagreement",
   ignore,
-  fn: () => expectRows("arg", ARG, DROP_AS_OTHER, "disagree=2"),
+  fn: () =>
+    expectRows("arg", ARG, DROP_AS_OTHER, "disagree=2; nested disagree=2"),
 });
