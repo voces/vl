@@ -644,6 +644,8 @@ import {
   sFieldTypes,
   sHeapIdx,
   sIsRefRow,
+  sSuperAt,
+  sTwin,
   sTypeIdx,
   slUsed,
   startStmts,
@@ -1210,6 +1212,7 @@ import {
   mvValTyIxAt,
   mvValUnionHasNull,
   nonNulBaseOf,
+  rlElemIsNulNiche,
   rlElemLitStructRow,
   tyRefArrElemOf,
 } from "./emit_map_value_slots"
@@ -11633,15 +11636,21 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32, lb: ListBuild) {
     const pk = pendingKindOfMf(kk, row)
     const seq = liKinds.length
     const slots: i32[] = []
+    const groupRows: i32[] = []
     let g = 0
     while g < groups.length {
       // A source of another scalar element builds at its own rep, then copies converting.
       const gk = spreadGroupSrcKind(groups[g], elems, kk, fnIx)
       let groupKind = pk
       if gk != kk { groupKind = pendingKindOfMf(gk, 0) }
+      // A source list whose record element is a subtype of the row's is read at its own row
+      // and copied as it is (D14960).
+      const gRow = spreadGroupSubRow(groups[g], kk, row, fnIx)
       // A fresh source built at a row no source has is built at exactly that row (D4871).
-      if row != ownRow && groupKind == LBK_REF { groupKind = LBK_REF_AT_SLOT }
-      if emitSpreadGroup(body, groups[g], fnIx, groupKind, row) < 0 {
+      if gRow == row && row != ownRow && groupKind == LBK_REF {
+        groupKind = LBK_REF_AT_SLOT
+      }
+      if emitSpreadGroup(body, groups[g], fnIx, groupKind, gRow) < 0 {
         return -1
       }
       svSyncRecv(groups[g], fnIx)
@@ -11661,14 +11670,26 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32, lb: ListBuild) {
           return -1
         }
       }
-      const gs = spreadGroupWrapSlot(kk, row, seq + g)
+      const gs = spreadGroupWrapSlot(kk, gRow, seq + g)
       slots.push(gs)
+      groupRows.push(gRow)
       fbLocalSet(gs)
       g = g + 1
     }
-    return spreadJoinGroups(slots, wrap, back, kk, row, seq)
+    return spreadJoinGroups(slots, groupRows, wrap, back, kk, row, seq)
   }
   emitFail("emitProgram: expected an array literal")
+}
+
+// The row spread group `grp` of a literal built at ref-list row `row` is read at: the group's
+// own row where it is an existing list whose element is a subtype of the row's, else `row`.
+function spreadGroupSubRow(grp: i32, kk: MfKind, row: i32, fnIx: i32): i32 {
+  if kk != "ref" { return row }
+  const lit = unwrapParen(grp)
+  if lit < 0 || nodeAt(lit) is ArrayLit { return row }
+  const s = refListSlotOfExpr(grp, fnIx)
+  if rlRowElemSubOf(s, row) { return s }
+  row
 }
 
 // The ref-list row spread literal `arrIx` of kind `kk` builds at: the threaded destination's
@@ -11692,16 +11713,48 @@ function spreadFreshDestRow(
     if src >= 0 {
       const lit = unwrapParen(src)
       const isLit = lit >= 0 && lit < P.nodes.length && nodeAt(lit) is ArrayLit
-      if !isLit && refListSlotOfExpr(src, fnIx) != want { return own }
+      if !isLit {
+        const ss = refListSlotOfExpr(src, fnIx)
+        if ss != want && !rlRowElemSubOf(ss, want) { return own }
+      }
     }
   }
   want
 }
 
-// Join a spread literal's item groups, each already a list at (`kk`, `row`) in its own frame
-// slot: allocate the destination once, then one `array.copy` per group in source order.
+// Whether ref-list row `s`'s element is a declared wasm subtype of row `d`'s, so a backing of
+// `s` copies into one of `d` as it is: both record rows, the first reaching the second's heap
+// through its `sub` chain, and a nullable element never into a non-null one.
+function rlRowElemSubOf(s: i32, d: i32): boolean {
+  if s < 0 || d < 0 || s == d { return false }
+  if rlElemIsNulNiche(s) && !rlElemIsNulNiche(d) { return false }
+  const sr = rlElemStructRow(s)
+  const dr = rlElemStructRow(d)
+  if sr < 0 || dr < 0 { return false }
+  const dh = structTwinRep(dr)
+  let x = structTwinRep(sr)
+  let guard = 0
+  while x >= 0 && guard < 64 {
+    if x == dh { return true }
+    x = structTwinRep(sSuperAt(x))
+    guard = guard + 1
+  }
+  false
+}
+
+// The representative of struct row `r`'s heap (`sTwin`), or -1 for none.
+function structTwinRep(r: i32): i32 {
+  if r < 0 { return -1 }
+  if r < sTwin.length { return sTwin[r] }
+  r
+}
+
+// Join a spread literal's item groups, each a list in its own frame slot, of (`kk`, `row`) or,
+// for a source whose element is a subtype of the row's, of that source's own row
+// (`groupRows`): allocate the destination once, then one `array.copy` per group in source order.
 function spreadJoinGroups(
   slots: i32[],
+  groupRows: i32[],
   wrap: i32,
   back: i32,
   kk: MfKind,
@@ -11717,8 +11770,8 @@ function spreadJoinGroups(
   while t < slots.length {
     fbLocalGet(totL)
     fbLocalGet(slots[t])
-    fbStructGet(wrap, 1) // the group's logical length
-    fbI32Bin(106)        // 0x6a i32.add
+    fbStructGet(spreadWrapIdx(kk, groupRows[t]), 1) // the group's logical length
+    fbI32Bin(106)                                   // 0x6a i32.add
     fbLocalSet(totL)
     t = t + 1
   }
@@ -11737,18 +11790,19 @@ function spreadJoinGroups(
   fbLocalSet(offL)
   let c = 0
   while c < slots.length {
-    fbLocalGet(dstL)     // dest backing
-    fbLocalGet(offL)     // dest offset
+    const gw = spreadWrapIdx(kk, groupRows[c])
+    fbLocalGet(dstL)   // dest backing
+    fbLocalGet(offL)   // dest offset
     fbLocalGet(slots[c])
-    fbStructGet(wrap, 0) // src backing
-    fbI32Const(0)        // src offset
+    fbStructGet(gw, 0) // src backing
+    fbI32Const(0)      // src offset
     fbLocalGet(slots[c])
-    fbStructGet(wrap, 1) // count
-    fbArrayCopy(back, back)
+    fbStructGet(gw, 1) // count
+    fbArrayCopy(back, spreadBackIdx(kk, groupRows[c]))
     if c + 1 < slots.length {
       fbLocalGet(offL)
       fbLocalGet(slots[c])
-      fbStructGet(wrap, 1)
+      fbStructGet(gw, 1)
       fbI32Bin(106) // i32.add
       fbLocalSet(offL)
     }
@@ -11828,6 +11882,7 @@ function emitArrSpreadBoxed(body: u8[], arrIx: i32, row: i32, fnIx: i32) {
   }
   const seq = liKinds.length
   const slots: i32[] = []
+  const groupRows: i32[] = []
   let g = 0
   while g < groups.length {
     if emitSpreadGroupBoxed(body, groups[g], isSrc[g], row, fnIx) < 0 {
@@ -11835,10 +11890,11 @@ function emitArrSpreadBoxed(body: u8[], arrIx: i32, row: i32, fnIx: i32) {
     }
     const gs = spreadGroupWrapSlot(kk, row, seq + g)
     slots.push(gs)
+    groupRows.push(row)
     fbLocalSet(gs)
     g = g + 1
   }
-  spreadJoinGroups(slots, wrap, back, kk, row, seq)
+  spreadJoinGroups(slots, groupRows, wrap, back, kk, row, seq)
 }
 
 // One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`.
