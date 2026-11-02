@@ -92,6 +92,16 @@ const ELEM = `const xs = [1, "two"]
 for x in xs { print(x) }
 `;
 
+// A map read spelled `m.get(k)`, which a rewrite mints as `m[k]` after check, beside the direct
+// spelling: the minted read takes the record of the call it was made from.
+const MAPGET = `const m: Map<string, i32> = Map()
+m.set("k", 3)
+const a: i32 | null = m.get("k")
+const b: i32 | null = m["k"]
+if a != null { print(a) }
+if b != null { print(b) }
+`;
+
 // A loop's `break` values, delivered to a union binding through the loop's exits.
 const BRK = `function pick(n: i32): i32 | string {
   let i = 0
@@ -135,6 +145,12 @@ Deno.test({
       DROP_NONE,
       "agree=2; value already a box=2; value never returns=1",
     ),
+});
+
+Deno.test({
+  name: "box-dst shadow: a minted map read takes its call's record",
+  ignore,
+  fn: () => expectRows("mapget", MAPGET, DROP_NONE, "agree=2"),
 });
 
 Deno.test({
