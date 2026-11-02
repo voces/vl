@@ -97,6 +97,10 @@ signature, carried as one value.
   (`monoTokenFe`). A result γ tags is left as the tag. Left: a call in an instanced body, a maker
   with an un-annotated parameter, and D14825's file as a whole, where one use delivering the
   maker's generic as a closure keeps γ from tagging its set for a hole-parameter maker beside it.
+  Second slice: a maker call delivered where the destination's type closes the result (an
+  annotated binding, a typed parameter, a return, a record field) is built at it, when that type is
+  exactly an instance of the maker's open result. A maker is instanced only when every read of it
+  takes an instance (`fvaMakerCoverCheck`): the root the others reach shares its body with them.
 
 ### Matrix
 
