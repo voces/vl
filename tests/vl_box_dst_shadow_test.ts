@@ -164,6 +164,20 @@ show({ kind: "a", q: 3 })
 showN({})
 `;
 
+// A written capture's narrowed read, through its cell: `v[0]` is the name read respelled, and
+// takes the read's record.
+const CAP = `function show(u: boolean | i32) {
+  if u is boolean { print(u) } else { print(u + 1) }
+}
+function run() {
+  let v: boolean | string = "a"
+  const k = () => { v = false }
+  k()
+  if v is boolean { show(v) }
+}
+run()
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -248,6 +262,12 @@ Deno.test({
       DROP_NONE,
       "agree=3; nested agree=7; nested value already a box=1; value already a box=1",
     ),
+});
+
+Deno.test({
+  name: "box-dst shadow: a captured binding's cell read takes the read's record",
+  ignore,
+  fn: () => expectRows("cap", CAP, DROP_NONE, "agree=3; nested agree=3"),
 });
 
 Deno.test({
