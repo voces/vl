@@ -390,6 +390,23 @@ print(k.r)
 if u is J { print(u.r ?? 0) }
 `;
 
+// D14902: an un-annotated function whose value is a call's, rebound, is built where that call is,
+// not at the narrow record its callers are stamped at; a generic taking its call reads it there.
+const ROW_CALL_BUILT = `type II = { f: i32 }
+type J = { f: i32 | null }
+function mk() { { f: 4 } }
+function id<T>(x: T): T { x }
+function r2() {
+  const k = id(mk())
+  const k2 = k
+  return k2
+}
+function g<T>(a: T): T { a }
+const d: J = mk()
+print(g(r2()).f)
+print(d.f ?? 0)
+`;
+
 // D14902: a literal handed straight back, by a hole function that only rebinds its parameter and
 // by a generic identity, is built at the wider record the call lands on; the result reads there.
 const ROW_HAND_BACK = `type A = { d: i32 | null }
@@ -439,6 +456,14 @@ Deno.test({
       DROP_NONE,
       true,
       "kind agree | g=1; kind agree | h=1",
+      true,
+    );
+    expectRows(
+      "row call-built",
+      ROW_CALL_BUILT,
+      DROP_NONE,
+      true,
+      "kind agree | g=1; kind agree | id=1; kind agree | mk=1; kind agree | r2=1",
       true,
     );
   },
