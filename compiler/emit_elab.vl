@@ -2997,7 +2997,100 @@ function elabCalleeParam(root: i32, decl: i32, k: i32): i32 {
   if nodeAt(d) is Param { return d }
   const ap = elabCallOnlyAlias(d, dn, k)
   if ap >= 0 { return ap }
+  const lp = elabListParamSource(d, dn, decl)
+  if lp >= 0 { return lp }
   elabWrittenParamAlias(d, dn)
+}
+
+// The parameter of `fn` every element of the `const` list literal bound at `d` reads, where each
+// read of `d` in `fn`'s own body is an element called in place (`d[i](...)`); else -1.
+function elabListParamSource(d: i32, fn: FuncDecl, decl: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const ln = nodeAt(d)
+  if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return -1 }
+  const li = parenPeelIx(ln.letInit)
+  if li < 0 || li >= P.nodes.length { return -1 }
+  const al = nodeAt(li)
+  if !(al is ArrayLit) || al.arrElems.length == 0 { return -1 }
+  let pd = -1
+  for e in al.arrElems {
+    const ex = parenPeelIx(e)
+    if ex < 0 || ex >= P.nodes.length || !(nodeAt(ex) is Ident) { return -1 }
+    const src = identDeclOf(ex)
+    if !i32ListHas(fn.fnParams, src) || pd >= 0 && src != pd { return -1 }
+    pd = src
+  }
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  const gpar: i32[] = [-1]
+  const deep: boolean[] = [false]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    const g = gpar.pop() ?? -1
+    const nested = deep.pop() ?? false
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Ident && identDeclOf(x) == d {
+        if nested || p < 0 || g < 0 { return -1 }
+        const pn = nodeAt(p)
+        const gn = nodeAt(g)
+        if !(pn is Index) || pn.idxArr != x { return -1 }
+        if !(gn is Call) || parenPeelIx(gn.callFn) != p { return -1 }
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+        gpar.push(p)
+        deep.push(nested || xn is FuncDecl)
+      }
+    }
+  }
+  // The literal is one node for every instance, so each must bind the parameter alike.
+  if pd >= 0 && !elabParamBoundAlike(decl, pd) { return -1 }
+  pd
+}
+
+// Whether every instance of `decl` that is not a guess or a rep binds parameter `pd` to one type.
+function elabParamBoundAlike(decl: i32, pd: i32): boolean {
+  let one = -1
+  let k = 0
+  while k < ekDecl.length {
+    if (
+      ekDecl[k] == decl
+      && !(elabGuessKeys[k] ?? false)
+      && !(elabCbRepKeys[k] ?? false)
+      && !(elabSigAltKeys[k] ?? false)
+    ) {
+      const t = substTyDeep(nodeTyIxOf(pd), ekNames[k], ekTys[k])
+      if t < 0 || one >= 0 && !tySame(one, t) { return false }
+      one = t
+    }
+    k = k + 1
+  }
+  true
+}
+
+// Whether list literal `lit` initialises a binding in `fn`'s body that `elabListParamSource`
+// takes as parameter `pd`.
+function elabListLitOfParam(
+  lit: i32,
+  fn: FuncDecl,
+  decl: i32,
+  pd: i32,
+): boolean {
+  const todo: i32[] = [fn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is LetDecl && parenPeelIx(xn.letInit) == lit {
+        return elabListParamSource(x, fn, decl) == pd
+      }
+      for c in nodeChildren(x) { todo.push(c) }
+    }
+  }
+  false
 }
 
 // The first parameter of `elabWrittenParamSources`, or -1.
@@ -3325,6 +3418,14 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
     const pd = identDeclOf(ix)
     const dn = nodeAt(decl)
     if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
+      // So does a `const` list literal of it whose elements are only ever called.
+      if (
+        p >= 0
+        && nodeAt(p) is ArrayLit
+        && elabListLitOfParam(p, dn, decl, pd)
+      ) {
+        return 0
+      }
       // A `const` alias that is only ever called reads the set where its calls do.
       if p >= 0 && nodeAt(p) is LetDecl && elabCallOnlyAlias(p, dn, k) == pd {
         // Its reads handed to a closed function type are deliveries of the parameter's set.
@@ -3613,6 +3714,11 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   }
   mintFactNote(sc, ix, fnTagSetOfTy(st), key, split, rs)
   if !split { elabNodeTyFill(ix, k, rs[0]) }
+  // An element of a list literal of the parameter is the parameter's value, so its call goes
+  // through the parameter's set too.
+  if root != cf && elabListParamSource(identDeclOf(root), dn, decl) == pd {
+    mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
+  }
   if root == cf {
     mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
     if !split {
