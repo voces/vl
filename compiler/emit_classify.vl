@@ -9289,6 +9289,10 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
       if ck != "" && sigKeyRetKind(ck) == "variant" { return sigKeyRetSlot(ck) }
       return -1
     }
+    // A nested-record field yields the variant row of the element type its field row records.
+    Member => {
+      return memberVariantRow(exprIx, fnIx)
+    }
     // An element of a ref list whose slot stores a variant is that variant's bare struct; a
     // nullable element is the niche, which no concrete row answers for.
     Index => {
@@ -9337,9 +9341,73 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
       }
     }
     // No other expression names a union variant by its own form.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   -1
+}
+
+// `memberVariantRowGo` remembered per arm-typed field read and asking function, for the pass and
+// tables it read. A chain `a.b.c` asks each receiver more than once, so unremembered it is
+// exponential; a read of any other type answers -1 before the memo.
+const mvrGen = memoGenNew(0)
+const mvrKey = memoKeyNew(5)
+const mvrStamp: i32[] = []
+const mvrFn: i32[] = []
+const mvrVal: i32[] = []
+function memberVariantRow(memIx: i32, fnIx: i32): i32 {
+  // A read whose own type is no arm cannot read one, so a record chain walks no receiver.
+  const own = nodeTyAt(memIx, fnIx)
+  if own < 0 || own >= T.tys.length || tyAt(own) is TyNullable { return -1 }
+  if repVariantShapeRowOf(own) < 0 { return -1 }
+  let moved = memoMoved3(mvrKey, emitPassGen, tyMutEpoch, P.nodes.length)
+  moved = memoMoved(mvrKey, 3, sFieldCount.length) || moved
+  moved = memoMoved(mvrKey, 4, ekDecl.length) || moved
+  if moved { memoGenAdvance(mvrGen) }
+  if (
+    memIx < mvrStamp.length
+    && mvrStamp[memIx] == mvrGen.at
+    && mvrFn[memIx] == fnIx
+  ) {
+    return mvrVal[memIx]
+  }
+  const v = memberVariantRowGo(memIx, fnIx)
+  while mvrStamp.length <= memIx {
+    mvrStamp.push(-1)
+    mvrFn.push(-1)
+    mvrVal.push(-1)
+  }
+  mvrStamp[memIx] = mvrGen.at
+  mvrFn[memIx] = fnIx
+  mvrVal[memIx] = v
+  v
+}
+
+// The variant row a non-null, arm-typed field read `memIx` yields: the arm its field row records
+// for the field. The field code holds a ref either way, so the read's own type gates it.
+function memberVariantRowGo(memIx: i32, fnIx: i32): i32 {
+  if memberFieldCode(memIx, fnIx) != FC_STRUCT { return -1 }
+  const et = memberFieldElemTy(memIx, fnIx)
+  if et < 0 || et >= T.tys.length { return -1 }
+  const t = tyAt(et)
+  repVariantShapeRowOf(if t is TyNullable { t.nInner } else { et })
+}
+
+// The element type the field row of field read `memIx` records (`sFieldElemTyIx`, or its variant
+// twin), found through the receiver row `memberFieldCode` takes its code from; -1 for none.
+function memberFieldElemTy(memIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(memIx)
+  if !(e is Member) { return -1 }
+  let vi = memNarrowVariantIndex(memIx, fnIx)
+  if vi < 0 { vi = exprVariantIndex(e.memObj, fnIx) }
+  if vi < 0 { vi = memRecvNulVariantIndex(e.memObj, fnIx) }
+  if vi >= 0 {
+    const vf = variantFieldIndex(vi, e.memProp)
+    return if vf >= 0 { uFieldElemTyIxAt(vi, vf) } else { -1 }
+  }
+  const si = structIndexOfExpr(e.memObj, fnIx)
+  if si < 0 { return -1 }
+  const sf = sFieldIndex(si, e.memProp)
+  if sf >= 0 { sFieldElemTyIxAt(si, sf) } else { -1 }
 }
 
 // The variant row of the type the read `ix` holds inside `fnIx`: the type it is narrowed out of,
@@ -12262,9 +12330,7 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   if rlSlotIsKindList(os, RLK_REF_LIST) {
     const ins = rlElemInnerSlot(os)
     if ins >= 0 && ins < rlElemName.length {
-      if rlSlotByNameTwin(rlElemName[ins], rlElemTyIxAt(ins)) == ins {
-        return rlElemName[ins]
-      }
+      if rlSlotOfTyOrTwin(rlElemTyIxAt(ins)) == ins { return rlElemName[ins] }
     }
   }
   const at = nodeTyAt(e.idxArr, fnIx)
@@ -12427,24 +12493,19 @@ function letTailRowSlot(letIx: i32, fnIx: i32): i32 {
       const ai = unwrapParen(d.letInit)
       if ai < 0 { return -1 }
       if letInitDeliversRow(ai, et, fnIx) { return refListSlotOfExpr(ai, fnIx) }
-      if nodeAt(ai) is ArrayLit { return arrLitRowSlotIn(ai, fnIx) }
+      if nodeAt(ai) is ArrayLit && !arrLitHasSpread(ai) {
+        return arrLitRowSlotIn(ai, fnIx)
+      }
     }
   }
   rlSlotOfRowTy(rlRowTyOfElem(et))
 }
 
-// Whether initializer `ai`, of element type `et`, binds the row its value already has: a
-// spread copy its source's, a named function's call its callee's result (none when that is no
-// ref list), a closure whose signature holds a type variable its bound one, and a record the
-// nominal row its value is delivered at rather than a same-layout twin.
+// Whether initializer `ai`, of element type `et`, binds the row its value already has rather
+// than the row its element type keys: a named function's call its callee's result (none when
+// that is no ref list), and a closure whose signature holds a type variable its bound one.
 function letInitDeliversRow(ai: i32, et: i32, fnIx: i32): boolean {
   const ini = nodeAt(ai)
-  if ini is ArrayLit {
-    for el in ini.arrElems {
-      if nodeAt(el) is Spread { return true }
-    }
-    return false
-  }
   if ini is Call {
     if ini.callFn >= 0 {
       const ce = nodeAt(ini.callFn)
@@ -12457,9 +12518,7 @@ function letInitDeliversRow(ai: i32, et: i32, fnIx: i32): boolean {
     }
   }
   if et < 0 || et >= T.tys.length { return false }
-  const t = tyAt(et)
-  if t is TyFunc { return tyHasTyVar(et) }
-  t is TyObj
+  tyAt(et) is TyFunc && tyHasTyVar(et)
 }
 
 // The struct row an un-annotated binding of the object literal at `objIx` is built at, or -1
