@@ -120,6 +120,8 @@ import {
 } from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
 import { identDeclOf, identFromDecl } from "./symbols"
+import { identFnDeclOf } from "./check_scopes"
+import { declIsExportedFn } from "./check_exp_obs"
 import {
   coerceRecordOpen,
   elabFnIdOf,
@@ -128,6 +130,7 @@ import {
   elabTyClosed,
   fnLetIsWide,
   fnLetOpenHandAt,
+  fnParamHandSets,
   fnTagArmsAt,
   fnTagArmsAtSet,
   fnTagCallArms,
@@ -195,6 +198,9 @@ function ftMembersWithin(s: i32, o: i32): boolean {
 export function fnTagDecide(rootIx: i32) {
   ftParamOwners = Map()
   ftParamOwnersBuilt = false
+  ftDirectLen = 0
+  ftDirectRefs = Map()
+  ftDirectCalls = Map()
   ftDecideRoot = rootIx
   fnTagUndecide()
   ftNestedJoinsFollow()
@@ -1734,6 +1740,75 @@ function ftParamBoundTagged(rootIx: i32, pd: i32): boolean {
   true
 }
 
+// Whether `v` reads an un-annotated parameter of a function only direct calls reach, every one of
+// which hands it a value of `s` or of a set within it, so a write of `v` stores one of `s`'s ids
+// (D15053). A smaller set is decided with `s`.
+function ftParamHandedWithin(v: i32, s: i32): boolean {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  const pd = identDeclOf(v)
+  if pd < 0 || pd >= P.nodes.length { return false }
+  const pn = nodeAt(pd)
+  if !(pn is Param) || pn.parType >= 0 { return false }
+  const fd = ftParamOwner(ftDecideRoot, pd)
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = nodeAt(fd)
+  if (
+    !(f is FuncDecl)
+    || ftReadInNestedFn(f.fnBody, pd)
+    || !ftOnlyCalledDirectly(fd)
+  ) {
+    return false
+  }
+  const sets = fnParamHandSets(fd, i32ListIndexOf(f.fnParams, pd))
+  if sets.length == 0 { return false }
+  for st in sets {
+    if st < 0 || st != s && !ftSetWithin(st, s) { return false }
+  }
+  for st in sets {
+    if st != s && !i32ListHas(ftSubNeed, st) { ftSubNeed.push(st) }
+  }
+  true
+}
+
+// Whether every reference to function `fd` is the callee of a call in this program: it is not
+// exported, stored, handed on or read as a value, so the calls the check saw are all of them.
+function ftOnlyCalledDirectly(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length || declIsExportedFn(fd) { return false }
+  ftDirectCountsGrow()
+  const refs = ftDirectRefs[fd] ?? 0
+  refs > 0 && refs == (ftDirectCalls[fd] ?? 0)
+}
+
+// Per function, the names reading it and the calls naming it as their callee, counted over the
+// arena's first `ftDirectLen` nodes; the decision in progress starts them again.
+let ftDirectLen = 0
+let ftDirectRefs: {[i32]: i32} = Map()
+let ftDirectCalls: {[i32]: i32} = Map()
+
+// Counts the nodes added since `ftDirectLen` into `ftDirectRefs` and `ftDirectCalls`.
+function ftDirectCountsGrow() {
+  let x = ftDirectLen
+  while x < P.nodes.length {
+    const n = nodeAt(x)
+    match n {
+      Ident => {
+        const d = identFnDeclOf(x)
+        if d >= 0 { ftDirectRefs[d] = (ftDirectRefs[d] ?? 0) + 1 }
+      }
+      Call => {
+        const cf = n.callFn
+        const d = if cf >= 0 && cf < P.nodes.length && nodeAt(cf) is Ident { identFnDeclOf(cf) } else { -1 }
+        if d >= 0 { ftDirectCalls[d] = (ftDirectCalls[d] ?? 0) + 1 }
+      }
+      // No other node names a function.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+    }
+    x = x + 1
+  }
+  ftDirectLen = P.nodes.length
+  0
+}
+
 // Whether a function nested in the body at `body` reads declaration `pd`.
 function ftReadInNestedFn(body: i32, pd: i32): boolean {
   const xs: i32[] = [body]
@@ -1849,6 +1924,7 @@ function ftValuesOk(
       // A lambda member written is its own leaf, as `ftNodeOk` takes one read.
       const d = if ftLambdaLeaf(v, ds) { v } else { ftLeafMember(v, ds) }
       if d < 0 && ftSubsetRead(v, s) { continue }
+      if d < 0 && ftParamHandedWithin(v, s) { continue }
       if d < 0 { return false }
       if !i32ListHas(leaves, v) {
         leaves.push(v)
