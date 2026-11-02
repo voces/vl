@@ -79,6 +79,7 @@ import { rcwInferredRetTy } from "./check_rcw"
 import { tErr } from "./check_relate_core"
 import {
   T,
+  TY_VOID,
   TyArray,
   TyErr,
   TyFunc,
@@ -148,6 +149,7 @@ import {
   fnTagMembers,
   fnTagOwnTyParamAlone,
   fnTagOwnTyParamShared,
+  fnTagParamCopyOf,
   fnTagRetMark,
   fnTagSetIsTagged,
   fnTagSetOfTy,
@@ -820,6 +822,16 @@ function ftRetCarries(f: i32, s: i32): boolean {
   fnTagSetOfTy(rcwInferredRetTy(f)) == s
 }
 
+// Whether binding `d` is a copy of a parameter of function `fn` (`fnTagParamCopyOf`).
+function ftParamCopyAt(d: i32, fn: i32): boolean {
+  if fn < 0 || fn >= P.nodes.length { return false }
+  const f = nodeAt(fn)
+  f is FuncDecl && fnTagParamCopyOf(f, d) >= 0
+}
+
+// Whether the result type of function `f` is `void`.
+function ftRetVoid(f: i32): boolean { f >= 0 && rcwInferredRetTy(f) == TY_VOID }
+
 // Whether node `x` carries set `s`.
 function ftIsS(x: i32, s: i32): boolean {
   x >= 0 && fnTagSetOfTy(nodeTyIxOf(x)) == s
@@ -1032,13 +1044,18 @@ export function ftOwnTyParamSharedBack(
     k = k + 1
   }
   if !back { return false }
-  // Nor anything in the body that names a type: any of them could hold the id at `T`.
+  // Nor anything in the body that names a type, but a copy of a parameter, which holds its id.
   const todo: i32[] = [f.fnBody]
   while todo.length > 0 {
     const x = todo.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
-      if ftNamesTyIn(x, nm) { return false }
-      nodeChildrenPush(x, todo)
+      const xn = nodeAt(x)
+      if xn is LetDecl && fnTagParamCopyOf(f, x) >= 0 {
+        todo.push(xn.letInit)
+      } else {
+        if ftNamesTyIn(x, nm) { return false }
+        nodeChildrenPush(x, todo)
+      }
     }
   }
   true
@@ -2165,8 +2182,9 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         || ftLateArgOfSet(pn, x, s)
     }
     // A binding's annotation delivers the value to a declared function type, a closure.
+    // So does a `const` copy of a parameter annotated with the function's type parameter.
     LetDecl => {
-      return pn.letInit == x && pn.letType < 0
+      return pn.letInit == x && (pn.letType < 0 || ftParamCopyAt(p, fn))
     }
     RetStmt => {
       return ftRetCarries(fn, s)
@@ -2186,7 +2204,12 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       if g >= 0 {
         const gn = nodeAt(g)
         if (gn is IfStmt || gn is MatchExpr) && ftIsS(g, s) { return true }
-        if gn is FuncDecl && gn.fnBody == p && ftRetCarries(g, s) {
+        // A function whose result is `void` discards its tail's value, so no id leaves it.
+        if (
+          gn is FuncDecl
+          && gn.fnBody == p
+          && (ftRetCarries(g, s) || ftRetVoid(g))
+        ) {
           return true
         }
         if gn is WhileStmt && gn.whileBody == p && ftIsS(g, s) { return true }
