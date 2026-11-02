@@ -406,6 +406,17 @@ function mk() { return [{ r: null }, { r: null }] }
 print(mk().length)
 `;
 
+// D14901 class D: an element read handed back is built where the list's stored values are, here
+// the kept build of the call that fills it, not at the element's row-less own record.
+const ELEM_HAND_BACK = `type J = { f: i32 | null }
+function mk() { { f: 4 } }
+function back(r) { return r }
+const wideJ: J = mk()
+const xs = [mk()]
+print(back(xs[0]).f)
+print(wideJ.f ?? 0)
+`;
+
 // D14902: an un-annotated function whose value is a call's, rebound, is built where that call is,
 // not at the narrow record its callers are stamped at; a generic taking its call reads it there.
 const ROW_CALL_BUILT = `type II = { f: i32 }
@@ -496,6 +507,14 @@ Deno.test({
       DROP_NONE,
       true,
       "kind agree | mk=1",
+      true,
+    );
+    expectRows(
+      "element hand-back",
+      ELEM_HAND_BACK,
+      DROP_NONE,
+      true,
+      "kind agree | back=1; kind agree | mk=1",
       true,
     );
   },

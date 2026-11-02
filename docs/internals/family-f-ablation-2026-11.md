@@ -28,7 +28,7 @@ ingredients name the family. Master `8c716bf0c`, fixpoint seed.
 | D | 7 | a generic or hole function value at an instance | γ (D14791: mcall's flip) |
 | E | 6 | `??` and short-circuit lowering | error-channel |
 | I | 5 | not narrowing: loop overflow, match re-evaluation, extern `never`, u8 truncation, `x!` parse | step 7 (re-label only) |
-| B | 4 | a narrowing survives a write through an alias (the narrowing ledger proper): D4131 closed; D4084, D4133 and D4134 parked pending an owner ruling | step 7 |
+| B | 4 | a narrowing survives a write through an alias (the narrowing ledger proper): all 4 closed as loud check rejects, D4084, D4133 and D4134 under the owner ruling (option (a)) | step 7 |
 | F | 3 | `as` / `as!` inside an instance, a hole lambda or a copied hole binding | mono |
 | G | 3 | a generic body's read in an instance (`is`, list ops) | D3423 |
 | H | 2 | a module global read before its initializer: resolved, the trap is the ruled runtime error | none |
@@ -37,6 +37,21 @@ ingredients name the family. Master `8c716bf0c`, fixpoint seed.
 Only family B is the emitter-versus-checker narrowing ledger the step was written for. Family I is
 not narrowing at all, and the rest belong to the rep, container, generic-instance, `??`, cast and
 init-order work they are routed to.
+
+## Re-graded on master `bb6e778d` (2026-11-02)
+
+`check-filed-witnesses.vl --strict` over the 57 clause-1 rows: 57 graded, 57 as filed, 0 MOVED.
+40 are now closed, fixed or resolved by their own status lines, and 17 are open:
+
+| family | open | rows | lane |
+|---|---|---|---|
+| A | 9 of 13 | D2701, D3362, D3495, D3535, D3611, D3618, D3643, D3656, D3657 | step 5's numeric-join lane (D3495 and D3535 are held back by its gates, `njRetSetHeld` and `listJoinApart`; D2701 waits on a ruling) |
+| C | 5 of 13 | D13960, D14140, D2498, D2660, D3566 | c-2 (D3566 is now a loud check reject, clause 2) |
+| I | 3 of 5 | D12181, D3428, D3585 | loops (D12181); an owner ruling each (D3428, D3585) |
+| B, D, E, F, G, H, J | 0 | | closed |
+
+So no family is left on step 6. The narrowing ledger (family B) closed as checker refusals, so an
+elaborated read has no alias-write invalidation left to carry.
 
 ## Rows
 
