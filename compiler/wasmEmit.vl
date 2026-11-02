@@ -7824,6 +7824,21 @@ function emitUnionBoxAtRecord(
   emitUnionBoxArg(body, siteNm, siteTy, valIx, fnIx)
 }
 
+// Whether `valIx` is boxed into a union at its delivery: its record is stored as a box and reaches
+// a registry row, or it is already a box of its own union (`emitUnionBoxAtRecord`'s rungs).
+function boxOwedAtRecord(valIx: i32, fnIx: i32): boolean {
+  const r = boxRecordTyAt(valIx, fnIx)
+  // A literal set or a nullable niche is no box, whatever row its union keys.
+  if r >= 0 && repOfTy(r).rdKind == "union" && boxRecordNameOf(r) != "" {
+    return true
+  }
+  // An already-boxed value is delivered as its own union only where no other coercion is
+  // recorded at it: a union of maps read as its one map unboxes (`mapUnbox`).
+  exprUnion(valIx, fnIx)
+    && coerceKindAt(valIx, fnIx) == "none"
+    && unionNameOfExpr(valIx, fnIx) != ""
+}
+
 // The value's form for the box shadow: 1 already a box, 2 a call that never returns, else 0.
 function boxDstFormOf(exprIx: i32, fnIx: i32): i32 {
   if exprUnion(exprIx, fnIx) { return 1 }
@@ -26395,8 +26410,6 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
         isF64: isF64,
         isI64: isI64,
         isF32: isF32,
-        pushUnionNm: "",
-        pushUnionTy: -1,
         pushNestSlot: -1,
         isLitArr: isLitArr,
         isNbArr: isNbArr,
@@ -26472,10 +26485,6 @@ function pushSlotOf(
     ps.lTy = rlWrapIdx[rslot]
     ps.aTy = rlBackIdx[rslot]
     ps.base = refPushScratchBaseFor(rslot)
-    if refListElemIsUnion(recvIx, fnIx) {
-      pv.pushUnionNm = rlElemName[rslot]
-      pv.pushUnionTy = rlElemTyIxAt(rslot)
-    }
     // The heap a narrowed arm pushed into a `Circle[]` lands in (D1031) — the slot's own
     // element heap, the same one `rlBackIdx` types the backing with.
     ps.armHeap = rlElemArmHeapOf(rslot)
@@ -26582,14 +26591,12 @@ function emitPushOne(
   0
 }
 
-// Which element rep a one-argument `.push` builds its value at: the scalar widths, the
-// union box and nested list a ref list's element names, and the atom and niche seeds.
+// Which element rep a one-argument `.push` builds its value at: the scalar widths, the nested
+// list a ref list's element names, and the atom and niche seeds. A union box is the record's.
 type PushValKinds = {
   isF64: boolean,
   isI64: boolean,
   isF32: boolean,
-  pushUnionNm: string,
-  pushUnionTy: i32,
   pushNestSlot: i32,
   isLitArr: boolean,
   isNbArr: boolean,
@@ -26610,7 +26617,6 @@ function emitPushValue(
   const isF64 = pv.isF64
   const isI64 = pv.isI64
   const isF32 = pv.isF32
-  const pushUnionNm = pv.pushUnionNm
   const pushNestSlot = pv.pushNestSlot
   const isLitArr = pv.isLitArr
   const isNbArr = pv.isNbArr
@@ -26624,13 +26630,9 @@ function emitPushValue(
   } else if isF32 {
     // an f32-list push coerces/encodes the value as f32 (a float literal re-encodes).
     if emitExprAsF32(body, argIx, fnIx) < 0 { return -1 }
-  } else if pushUnionNm != "" {
-    if (
-      emitUnionBoxAtRecord(body, pushUnionNm, pv.pushUnionTy, argIx, fnIx)
-      < 0
-    ) {
-      return -1
-    }
+  } else if boxOwedAtRecord(argIx, fnIx) {
+    // The checker's record decides the union box, as at every delivery that reads it.
+    if emitUnionBoxAtRecord(body, "", -1, argIx, fnIx) < 0 { return -1 }
   } else if pushNestSlot >= 0 {
     // A nested-list element push: the value builds as the INNER list (an inert
     // context for a non-literal value — an ident/call emits unchanged).
