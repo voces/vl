@@ -158,7 +158,7 @@ its use is pre-checked. That closes D12470. The two sites are merged into one in
 | `emit_mono.vl:20872` | emitProgram: a generic function is passed to a function value whose parameter type names a… | 2 row, 2 fixture | D3956 | CAPABILITY | open D3956, D10700 |
 | `emit_mono.vl:22721` | emitProgram: monomorphize: a function parameter handed on to `{}` in a call to `{}` is cal… | 1 row | D12218 | CAPABILITY | open D12218 |
 | `emit_mono.vl:23115` | emitProgram: monomorphize: unsupported argument type for `{}` in a call to `{}` | 9 row, 17 corpus | D3038 | CAPABILITY | open D3038, D3325, D3366, D3942, D9762, D9764, D9782, D10010, D12180; D10892, D10893, D10894 and D10895 now run |
-| `emit_mono.vl:23455` | emitProgram: monomorphize: `{}` is called at two instances of the function handed to it in… | 3 fixture | `closures/listed-hole-fn-variable-index-reject.vl` | CAPABILITY | new D12450; residue pass D12472 |
+| `emit_mono.vl:23455` | emitProgram: monomorphize: `{}` is called at two instances of the function handed to it in… | 3 fixture | `closures/listed-hole-fn-variable-index-runs.vl` | CAPABILITY | new D12450; residue pass D12472 |
 | `emit_mono.vl:23692` | emitProgram: monomorphize: expected an array argument for `{}` in a call to `{}` | 3 row | D2772 | CAPABILITY | open D2772, D3821, D4661 |
 | `emit_mono.vl:23713` | emitProgram: monomorphize: a generic function handed to two parameters of type `{}` in a c… | 1 row, 1 fixture | D12232 | CAPABILITY | open D12232 |
 | `emit_mono.vl:24672` | emitProgram: a call through a chain of more than {} un-annotated aliases of a lambda has n… | 1 row, 1 fixture | D12233 | CAPABILITY | open D12233 |
