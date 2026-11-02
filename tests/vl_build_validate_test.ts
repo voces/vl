@@ -23,8 +23,8 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D14960 — a spread of a wider record list
-// into a narrower rest parameter builds the rest list unconverted). If that hole is closed the fixture stops
+// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D2225 — an un-annotated `[]`-or-`null`
+// local reassigned a scalar list builds an invalid module). If that hole is closed the fixture stops
 // producing an invalid module and this pin would silently go inert — so the first
 // assertions check the PRECONDITION and fail loudly with a swap instruction rather than
 // passing vacuously. Swap in any other source that emits an invalid module; the whole
@@ -52,11 +52,12 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: D14960's witness. `total(...cs)` builds the `Shape[]` rest
-// list from `Circle` structs whose extra field is a number — `type mismatch: expected (ref $type),
-// found (ref $type)`. Closing D14960 is a change the precondition assertions below catch.
+// Type-checks clean, emits invalid wasm: D2225's witness. `x`'s `[]`-or-`null` binding is
+// reassigned a list of `f64` — `type mismatch: expected (ref null $type), found (ref $type)`.
+// Closing D2225 is a change the precondition assertions below catch.
 //
-// It REPLACES D13960's `name: string` face of the same spread, refused since the width-drop check
+// It REPLACES D14960's spread of a wider record list into a narrower rest parameter (closed by
+// building the rest list at the parameter's type), which REPLACED D13960's `name: string` face of the same spread, refused since the width-drop check
 // judges a spread's elements, which REPLACED D3689's `d is 1` over `d: f64`, which became a loud emit refusal pending its ruling
 // (D14642), which itself REPLACED D1400's annotated-binding cell, which the checker refuses since `as?` over a hole
 // is typed `N | null` before any pin (D3654). Before that: the member-variance fixture (refused
@@ -64,15 +65,10 @@ if (GATED && !ENABLED) {
 // PARAMETER spelled as the inline member union, and an unread global binding of a generic
 // function's nullable-closure return. The precondition assertion caught all five.
 const INVALID_SRC = [
-  "type Shape = { r: f64 }",
-  "type Circle = { r: f64, w: f64 }",
-  "function total(...xs: Shape[]): f64 {",
-  "  let t = 0.0",
-  "  for x in xs { t = t + x.r }",
-  "  t",
-  "}",
-  "const cs: Circle[] = [{ r: 1.5, w: 1.0 }, { r: 2.0, w: 2.0 }]",
-  "print(total(...cs))",
+  "function truthy() { 1 == 1 }",
+  "let x = if truthy() { [] } else { null }",
+  "x = [1.5]",
+  "print(x[0])",
   "",
 ].join("\n");
 
