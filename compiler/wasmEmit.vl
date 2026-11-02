@@ -1080,7 +1080,6 @@ import {
 import {
   cloCallArityFallbackUnsound,
   cloCallParamLitUnion,
-  cloCallParamUnionName,
   cloCallReflistElemTwin,
   cloCallSigRejectWhat,
   cloCallUnionResultUnrepresentable,
@@ -17987,9 +17986,41 @@ function emitListEqICore(_body: u8[]) {
   0
 }
 
+// Pushes whether element `i` of the staged list A, then of B, in the LEQS frame at `bA`, is null.
+function leqSElemNullTest(bA: i32) {
+  fbLocalGet(bA + 0)
+  fbStructGet(mkListIdx, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(mkArrIdx)
+  fbRefIsNull()
+  fbLocalGet(bA + 1)
+  fbStructGet(mkListIdx, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(mkArrIdx)
+  fbRefIsNull()
+  0
+}
+
+// Whether either operand of the `==` at `binIx` is a list whose elements may be null.
+function binListElemsNullable(binIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(binIx)
+  if !(e is BinExpr) { return false }
+  listElemsBearNull(nodeTyAt(e.binLeft, fnIx))
+    || listElemsBearNull(nodeTyAt(e.binRight, fnIx))
+}
+
+// Whether `t`, `| null` peeled, is a list whose element admits `null`.
+function listElemsBearNull(t: i32): boolean {
+  const n = if t >= 0 && t < T.tys.length { nonNullTy(t) } else { -1 }
+  if n < 0 { return false }
+  const el = tyArrayElemIx(n)
+  el >= 0 && tyAdmitsNull(el)
+}
+
 // String-list `==`: outer loop over the LEQS frame; each element pair rides
-// `emitStrEqCore` (the string-op frame — disjoint locals, safe to nest).
-function emitListEqSCore(body: u8[]) {
+// `emitStrEqCore` (the string-op frame — disjoint locals, safe to nest). With `nulElems` an
+// element may be null: two nulls are equal, a null and a string are not.
+function emitListEqSCore(body: u8[], nulElems: boolean) {
   const bA = leqSScratchBase
   fbLocalSet(bA + 1)        // B
   fbLocalSet(bA + 0)        // A
@@ -18013,6 +18044,14 @@ function emitListEqSCore(body: u8[]) {
   fbI32Bin(78)
   fbIf(64)
   fbElse()
+  if nulElems {
+    leqSElemNullTest(bA)
+    fbI32Bin(114) // i32.or: either element null
+    fbIf(127)
+    leqSElemNullTest(bA)
+    fbI32And() // equal only when both are
+    fbElse()
+  }
   // push elem A, elem B (non-null string refs), compare via the string core
   fbLocalGet(bA + 0)
   fbStructGet(mkListIdx, 0)
@@ -18025,6 +18064,7 @@ function emitListEqSCore(body: u8[]) {
   fbArrayGet(mkArrIdx)
   fbRefAsNonNull()
   if emitStrEqCore(body) < 0 { return -1 }
+  if nulElems { fbEnd() }
   fbI32Eqz() // 1 = mismatch
   fbIf(64)
   fbI32Const(0)
@@ -18149,7 +18189,7 @@ function emitListEqAnyRep(body: u8[], kind: i32, slot: i32, fnIx: i32) {
 
 function emitListEqAnyRepAt(body: u8[], kind: i32, slot: i32, fnIx: i32) {
   if kind == LBK_I32_LIST { return emitListEqICore(body) }
-  if kind == LBK_STR_LIST { return emitListEqSCore(body) }
+  if kind == LBK_STR_LIST { return emitListEqSCore(body, false) }
   if kind == LBK_REF {
     if slot >= 0 && slot < rlElemTyIx.length {
       if rlElemKindAt(slot) == RLK_I32_LIST {
@@ -18593,7 +18633,7 @@ function emitEqNonNullCore(body: u8[], binIx: i32, fnIx: i32) {
         return emitListEqICore(body)
       }
       "strlist" => {
-        return emitListEqSCore(body)
+        return emitListEqSCore(body, binListElemsNullable(binIx, fnIx))
       }
       "reflist" => {
         let lslot = refListSlotOfExpr(e.binLeft, fnIx)
@@ -25025,17 +25065,13 @@ function emitCallRefArg(
     // `$fnsig` key so the coercion cannot disagree with the bytes; the box's own
     // identity comes from the checker type instead, since it is slot-free in the ABI —
     // else a raw member argument pushes a string ref where the box is needed.
-    let cuNm = ""
-    if sigParamKindAt(ckey, i) == "union" {
-      cuNm = cloCallParamUnionName(callIx, i, fnIx)
-      if cuNm == "" {
-        // the key says box and no registered name resolves — a producer disagreement,
-        // not a shape the rep declines. Refuse loudly rather than push the un-boxed
-        // operand: invalid wasm is the one outcome this arm must never reach.
-        return emitFail(
-          "emitProgram: value-call union parameter has no resolvable union name",
-        )
-      }
+    const cuBox = sigParamKindAt(ckey, i) == "union"
+    if cuBox && !boxOwedAtRecord(args[i], fnIx) {
+      // The key says box and the checker records no union for the argument: a producer
+      // disagreement. Refuse loudly rather than push the un-boxed operand.
+      return emitFail(
+        "emitProgram: value-call union parameter has no recorded union for its argument",
+      )
     }
     // the arm-parameter arm (D269, direction 2 of D200): a `variant` parameter demands
     // one heap type (`variantHeap(vi)`), so a raw push stays a floor except where it is
@@ -25084,8 +25120,8 @@ function emitCallRefArg(
           fnIx,
         )
       }
-    } else if cuNm != "" {
-      if emitUnionBoxAtRecord(body, cuNm, -1, args[i], fnIx) < 0 { return -1 }
+    } else if cuBox {
+      if emitUnionBoxAtRecord(body, "", -1, args[i], fnIx) < 0 { return -1 }
     } else if (
       (pkk == "str" || pkk == "nulstr")
       && exprIsLitAtom(args[i], fnIx)
