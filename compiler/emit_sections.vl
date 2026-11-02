@@ -31,7 +31,7 @@ import { isVarTyIxOf } from "./check_list_union"
 import { topLetScalarOf } from "./check_nj_join"
 import { nodeTyComparesAsString } from "./check_getter_effects"
 import { refViewSrcTys } from "./check_ref_list_view"
-import { lbiArenaReset } from "./check_num_lit_state"
+import { lbiArenaReset, lbiKeptDeclUnread } from "./check_num_lit_state"
 import { T, TyLit, tyLitMemberTexts } from "./check_types"
 import {
   ATOMIC_SIG_FENCE,
@@ -371,6 +371,9 @@ import {
   gInitAny,
   gInitAt,
   gInitAtNode,
+  gInitBitBase,
+  gInitBitIdx,
+  gInitBitN,
   gInitFnReach,
   gInitGIdx,
   gInitGLocs,
@@ -485,8 +488,8 @@ import {
   rlWrapIdx,
   rvNul,
   rvSrcSlot,
+  rvTag,
   rvUnionSlot,
-  rvVariant,
   rvViewTy,
   sAnonOwnTy,
   sBackIdx,
@@ -525,7 +528,6 @@ import {
   uFieldCount,
   uFieldStart,
   uSinkFired,
-  uTags,
   uVarRow,
   uVariantRowBySid,
   unMemAtomIds,
@@ -1015,12 +1017,10 @@ function emitHeader() {
   0
 }
 
-// Rebuild the local columns for the function at `fnIx`: clear them, then collect every
-// declared local in the body (validating each as i32). Returns 0 on success,
-// or -1 (via `emitFail`) on any unsupported local. Must run before lowering the
-// body so identifier resolution and the locals vector see the full set.
-function buildLocals(fnIx: i32) {
-  localFrameNote()
+// Empties the frame's local registry and lexical scope stack. A pass before the first frame
+// is built reads them, so a compile starts from them empty too, not from the last program's
+// last frame.
+function localRegistryReset() {
   localIsRef = []
   localStructIdx = []
   localLoopVar = []
@@ -1031,11 +1031,21 @@ function buildLocals(fnIx: i32) {
   localUnset = []
   localByNode = []
   declSlotByNode = Map()
-  // Reset the lexical scope stack per function. `collectLocals` pushes/pops frames as
-  // it walks (leaving it balanced/empty), then the emit pass rebuilds it in lockstep.
   scopeNames = []
   scopeSlots = []
   scopeFrames = []
+  0
+}
+
+// Rebuild the local columns for the function at `fnIx`: clear them, then collect every
+// declared local in the body (validating each as i32). Returns 0 on success,
+// or -1 (via `emitFail`) on any unsupported local. Must run before lowering the
+// body so identifier resolution and the locals vector see the full set.
+function buildLocals(fnIx: i32) {
+  localFrameNote()
+  // The lexical scope stack too: `collectLocals` pushes/pops frames as it walks (leaving it
+  // balanced/empty), then the emit pass rebuilds it in lockstep.
+  localRegistryReset()
   const fn = nodeAt(fnIx)
   if fn is FuncDecl { return collectLocals(fn.fnBody, fnIx) }
   emitFail("emitProgram: not a function declaration")
@@ -2214,19 +2224,7 @@ function startFnDetectScratch() {
 // `fnIx = -1`). Resets the local registry + scope stack like `buildLocals`.
 function collectStartLocals() {
   localFrameNote()
-  localIsRef = []
-  localStructIdx = []
-  localLoopVar = []
-  localLoopIter = []
-  localPairIter = []
-  localDeclIx = []
-  localSlotOfDecl = Map()
-  localUnset = []
-  localByNode = []
-  declSlotByNode = Map()
-  scopeNames = []
-  scopeSlots = []
-  scopeFrames = []
+  localRegistryReset()
   scopePush()
   let i = swS0
   while i < swS1 {
@@ -2523,7 +2521,8 @@ function emitStartGlobalInit(
   gi: i32,
   gst: i32,
 ) {
-  if globalRunsInStartFn(gi) {
+  // A `const` every read copied the tree of is never read, as at a local (D15001).
+  if globalRunsInStartFn(gi) && !lbiKeptDeclUnread(gst) {
     const g = nodeAt(gst)
     if g is LetDecl {
       // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
@@ -5077,7 +5076,7 @@ function svLenFnCode(out: u8[], d: i32) {
 // —— record-list views (D3041) ——
 // A view of source row `p` is `{back, len, cap, src}`, a final subtype of the union-box list's
 // wrapper: the first three fields a snapshot the sync helper refreshes, `src` the record list
-// whose elements it boxes under variant `rvVariant[p]`.
+// whose elements it boxes under tag `rvTag[p]`.
 
 // Whether this module reserves the view helpers: the checker saw a record row delivered as a
 // union-box list from an unfresh root, and the module has a union-box list.
@@ -5206,7 +5205,7 @@ function rvSrcElem(p: i32, sL: i32, idx: i32, guard: boolean) {
   0
 }
 
-// Box that element under view row `p`'s variant, `{tag, record}`; a `null` element of a
+// Box that element under view row `p`'s tag, `{tag, record}`; a `null` element of a
 // nullable record row boxes under the null tag, as the element-converting copy does.
 function rvBoxElem(p: i32, sL: i32, idx: i32, guard: boolean) {
   if rvNul[p] == 1 {
@@ -5217,13 +5216,13 @@ function rvBoxElem(p: i32, sL: i32, idx: i32, guard: boolean) {
     fbRefNullNone()
     fbStructNew(uBoxIdx)
     fbElse()
-    fbI32Rel(RS_TAG, uTags[rvVariant[p]])
+    fbI32Rel(RS_TAG, rvTag[p])
     rvSrcElem(p, sL, idx, guard)
     fbStructNew(uBoxIdx)
     fbEnd()
     return 0
   }
-  fbI32Rel(RS_TAG, uTags[rvVariant[p]])
+  fbI32Rel(RS_TAG, rvTag[p])
   rvSrcElem(p, sL, idx, guard)
   fbStructNew(uBoxIdx)
   0
@@ -6818,6 +6817,9 @@ function initGuardScan(): i32 {
   gInitFnReach = []
   gInitAny = false
   gInitProgIdx = -1
+  gInitBitIdx = []
+  gInitBitBase = -1
+  gInitBitN = 0
   gInitStartOrd = -1
   initAtCompute()
   let anyCand = false
@@ -6894,6 +6896,28 @@ function initGuardScan(): i32 {
     if gInitGuard[g] >= 1 && gInitAt[g] != INIT_REACH_NEVER {
       gInitProgAfter[gInitAt[g]] = g
     }
+  }
+  // Each guarded global with no initializer that keeps a cell and that some top-level statement
+  // assigns gets an assigned bit; one only a function assigns keeps the progress cell's answer,
+  // which is never (D14360).
+  gi = 0
+  while gi < globalStmts.length {
+    gInitBitIdx.push(-1)
+    const d = nodeAt(globalStmts[gi])
+    if (
+      gi < gInitGuard.length
+      && gInitGuard[gi] == 1
+      && gi < gCellIdx.length
+      && gCellIdx[gi] >= 0
+      && gi < gInitAt.length
+      && gInitAt[gi] != INIT_REACH_NEVER
+      && d is LetDecl
+      && d.letInit < 0
+    ) {
+      gInitBitIdx[gi] = gInitBitN
+      gInitBitN = gInitBitN + 1
+    }
+    gi = gi + 1
   }
   0
 }
@@ -7456,6 +7480,7 @@ function emitProgramReset(rootIx: i32) {
   memoCompileReset()
   // Every module's per-compile scalars back to their declared values (lane L7).
   emitStateReset()
+  localRegistryReset()
   wasmEmitStateReset()
   nliFnIndexReset()
   bcReset()
@@ -9404,13 +9429,16 @@ function emitGlobalSection() {
     nProg = 1
     gInitProgIdx = externGlobalCount() + np + nCells + nHeap
   }
+  // The assigned bits of the guarded bindings with no initializer trail the progress cell.
+  const nBits = if gInitAny { gInitBitN } else { 0 }
+  gInitBitBase = externGlobalCount() + np + nCells + nHeap + nProg
   // The synthetic constants trail everything, and the section is framed once the bodies that
   // mint them are built (`frameGlobalSection`), at this point of the module.
-  gSynthBase = externGlobalCount() + np + nCells + nHeap + nProg
-  gGlobalFixedN = nCells + np + nHeap + nProg
+  gSynthBase = externGlobalCount() + np + nCells + nHeap + nProg + nBits
+  gGlobalFixedN = nCells + np + nHeap + nProg + nBits
   gGlobalRopeAt = W.chunks.length
   gGlobalEntries = []
-  if nCells + np + nHeap + nProg > 0 {
+  if nCells + np + nHeap + nProg + nBits > 0 {
     const globalPayload: u8[] = gGlobalEntries
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
     // each entry's valtype (`fbValtype`), mutability flag, and init constexpr (`fb*`
@@ -9500,11 +9528,14 @@ function emitGlobalSection() {
       fbI32Const(gHeapLimit)
       fbEnd()
     }
-    if nProg == 1 {
+    // The progress cell, then each assigned bit: a mutable i32 that starts at 0.
+    let bk = 0
+    while bk < nProg + nBits {
       wU8(127) // 0x7f i32
       wU8(1)   // mutable
       fbI32Const(0)
       fbEnd()
+      bk = bk + 1
     }
     wTarget(gPrev)
     relHold(globalPayload)

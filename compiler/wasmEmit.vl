@@ -59,6 +59,7 @@ import {
   numCastCanFail,
   numUnionMembersOf,
 } from "./check_num_lits"
+import { lbiKeptDeclUnread } from "./check_num_lit_state"
 import { intMatchHeadAt } from "./check_match_heads"
 import {
   condProvenTrue,
@@ -527,6 +528,8 @@ import {
   gImports,
   gInitAny,
   gInitAt,
+  gInitBitBase,
+  gInitBitIdx,
   gInitFnReach,
   gInitGIdx,
   gInitGLocs,
@@ -1289,7 +1292,7 @@ import {
   listBuildOfTy,
   rlBoxIntoRowList,
   rlWidenAllowed,
-  rlWidenVariantOf,
+  rlWidenTagOf,
 } from "./emit_ref_list_kinds"
 import { internInlineShapeTy } from "./emit_shape_intern"
 import {
@@ -7772,11 +7775,12 @@ function unionArmTagClash(unionName: string, unionTy: i32): string {
   ""
 }
 
-// The union the checker records value `ix` delivered into inside `fnIx`, or -1.
+// The union the checker records value `ix` delivered into inside `fnIx`, closed at that instance
+// where the record still names its type parameters; -1 for none.
 function boxRecordTyAt(ix: i32, fnIx: i32): i32 {
   let r = boxDstTyAt(ix, fnIx)
   if r < 0 { r = boxDstTyAt(unwrapParen(ix), fnIx) }
-  r
+  instTyOrSelf(r, fnIx)
 }
 
 // The registered name of the union row recorded type `ty` names (`unRowOfRecordTy`), or "".
@@ -11945,7 +11949,7 @@ function emitSpreadGroupBoxed(
     const s = refListSlotOfExpr(grp, fnIx)
     if emitSpreadGroup(body, grp, fnIx, LBK_REF, s) < 0 { return -1 }
     if s == row { return 0 }
-    if rlWidenVariantOf(s, row) < 0 {
+    if rlWidenTagOf(s, row) < 0 {
       return emitFailAt(
         "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
         grp,
@@ -24981,7 +24985,7 @@ function emitCallRefArg(
         )
       }
     } else if cuNm != "" {
-      if emitUnionBoxArg(body, cuNm, -1, args[i], fnIx) < 0 { return -1 }
+      if emitUnionBoxAtRecord(body, cuNm, -1, args[i], fnIx) < 0 { return -1 }
     } else if (
       (pkk == "str" || pkk == "nulstr")
       && exprIsLitAtom(args[i], fnIx)
@@ -27684,8 +27688,8 @@ function emitCopyLoopClose(iL: i32, dL: i32, nL: i32, dstWrap: i32) {
 // holding the same elements boxed into the shared union box — the only lowering the pair
 // has, since a mutable WasmGC array is invariant. Callers must ask `rlWidenAllowed` first.
 function emitRefListWidenTop(_body: u8[], srcSlot: i32, dstSlot: i32) {
-  const vi = rlWidenVariantOf(srcSlot, dstSlot)
-  if vi < 0 || vi >= uTags.length {
+  const tag = rlWidenTagOf(srcSlot, dstSlot)
+  if tag < 0 {
     return emitFail(
       "emitProgram: ref-list widening asked for an element pair with no union arm",
     )
@@ -27735,7 +27739,7 @@ function emitRefListWidenTop(_body: u8[], srcSlot: i32, dstSlot: i32) {
     fbRefNullNone() // the payload slot is unread under the null tag
     fbStructNew(uBoxIdx)
     fbElse()
-    fbI32Rel(RS_TAG, uTags[vi]) // the arm's program-global tag
+    fbI32Rel(RS_TAG, tag) // the arm's program-global tag
     fbLocalGet(sL)
     fbStructGet(srcWrap, 0)
     fbLocalGet(iL)
@@ -27743,7 +27747,7 @@ function emitRefListWidenTop(_body: u8[], srcSlot: i32, dstSlot: i32) {
     fbStructNew(uBoxIdx)
     fbEnd()
   } else {
-    fbI32Rel(RS_TAG, uTags[vi]) // the arm's program-global tag
+    fbI32Rel(RS_TAG, tag) // the arm's program-global tag
     fbLocalGet(sL)
     fbStructGet(srcWrap, 0) // the source backing, `(ref $srcBack)`
     fbLocalGet(iL)
@@ -28160,7 +28164,7 @@ function emitRefListCopy(
   }
   // Not a widenable pair: the same slot, or two element reps with no conversion between
   // them. The common case at every delivery, and nothing is owed.
-  if rlWidenVariantOf(srcSlot, dstSlot) < 0 { return false }
+  if rlWidenTagOf(srcSlot, dstSlot) < 0 { return false }
   if (!rlWidenAllowed(cwKeyOfRoot(srcIx), srcSlot, dstSlot)) {
     // A `readonly` destination needs no write proof: a view reads the source as it is (D3041).
     if refViewReadonlyAt(srcIx) && rvMayView(dstSlot) {
@@ -28501,7 +28505,7 @@ function emitRvIndexRead(rslot: i32) {
 // sync helper fills, beside the list itself. False where the row has no view type.
 function rvEmitView(srcSlot: i32): boolean {
   if srcSlot < 0 || srcSlot >= rlTwin.length || rvUnionSlot < 0 { return false }
-  const p = rvPairOf(rlTwin[srcSlot], rlWidenVariantOf(srcSlot, rvUnionSlot))
+  const p = rvPairOf(rlTwin[srcSlot], rlWidenTagOf(srcSlot, rvUnionSlot))
   if p < 0 || rvUnionSlot >= rlBackIdx.length { return false }
   const sL = widenSrcWrapSlot(srcSlot)
   fbLocalSet(sL)
@@ -30050,6 +30054,12 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     && s.letInit >= 0
     && cloLiftLetFe(fnStmtsPosOf(fnIx), stmtIx) >= 0
   ) {
+    scopeBind(s.letName, slot)
+    return 0
+  }
+  // A `const` every read copied the tree of is never read, and computing it would trap where
+  // the copies do not (D15001).
+  if s.letInit >= 0 && lbiKeptDeclUnread(stmtIx) {
     scopeBind(s.letName, slot)
     return 0
   }
@@ -33421,9 +33431,16 @@ function emitInitGuard(gi: i32, verb: string) {
   if gInitProgIdx < 0 || gHelpInitFail < 0 || gImports < 4 {
     return emitFail("emitProgram: read-before-init guard with no progress cell")
   }
-  fbGlobalGet(gInitProgIdx)
-  fbI32RelOf(RS_GUARD, gi, initGuardValue(gi) + relSkew(RS_GUARD))
-  fbI32Bin(72)          // 0x48 i32.lt_s
+  // A binding with no initializer holds its value from its first write, wherever that ran.
+  const bit = initBitOf(gi)
+  if bit >= 0 {
+    fbGlobalGet(bit)
+    fbI32Eqz()
+  } else {
+    fbGlobalGet(gInitProgIdx)
+    fbI32RelOf(RS_GUARD, gi, initGuardValue(gi) + relSkew(RS_GUARD))
+    fbI32Bin(72) // 0x48 i32.lt_s
+  }
   fbIf(64)              // 0x40 void
   fbI32RelOf(RS_GNAME, gi, initGuardGlobalRow(gi) + relSkew(RS_GNAME))
   if verb == "written" { fbI32Const(1) } else { fbI32Const(0) }
@@ -33456,7 +33473,20 @@ export function emitUserGlobalSet(gi: i32) {
     if emitInitGuard(gi, "written") < 0 { return -1 }
   }
   fbGlobalSet(userGlobalIdx(gi))
+  const bit = initBitOf(gi)
+  if bit >= 0 {
+    fbI32Const(1)
+    fbGlobalSet(bit)
+  }
   0
+}
+
+// The assigned bit of global `gi`, or -1 when it has none.
+function initBitOf(gi: i32): i32 {
+  if gi < 0 || gi >= gInitBitIdx.length || gInitBitBase < 0 { return -1 }
+  const o = gInitBitIdx[gi]
+  if o < 0 { return -1 }
+  gInitBitBase + o
 }
 
 // Puts this module's per-compile stashes, depths and memo cursors back to their declared
@@ -37378,7 +37408,13 @@ function emitCoalesceNulRefJoin(
   // kind-8 VARIANT local is a raw `(ref $variant)`, which the coerce hands back unboxed, and
   // the box blocktype then holds a bare struct. The box-typed destinations share this entry.
   if (
-    emitUnionBoxArg(body, joinN, nodeTyInOf(exprIx, fnIx), e.binRight, fnIx)
+    emitUnionBoxAtRecord(
+      body,
+      joinN,
+      nodeTyInOf(exprIx, fnIx),
+      e.binRight,
+      fnIx,
+    )
     < 0
   ) {
     return -1
@@ -37424,7 +37460,13 @@ function emitCoalesceNulBoolJoin(
   fbI32Bin(70)     // 0x46 i32.eq → null?
   fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
   if (
-    emitUnionBoxArg(body, joinN, nodeTyInOf(exprIx, fnIx), e.binRight, fnIx)
+    emitUnionBoxAtRecord(
+      body,
+      joinN,
+      nodeTyInOf(exprIx, fnIx),
+      e.binRight,
+      fnIx,
+    )
     < 0
   ) {
     return -1

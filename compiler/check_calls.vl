@@ -75,7 +75,6 @@ import {
   callBindTysAt,
   fsbDeclAtNode,
   fsbName,
-  holeFnSplitSet,
 } from "./check_bind_rows"
 import { crSubtreeMentions } from "./check_capture_walks"
 import {
@@ -159,6 +158,7 @@ import {
   holeCastPinCheck,
   holeDemandOk,
   holeFnDeliveryDemands,
+  holeKidMapDemands,
   instGenFnHolePins,
   memberFloorErr,
   orderNamedCallArgs,
@@ -271,7 +271,6 @@ import {
 import { checkMemberCallNode } from "./check_member_call"
 import { callTyArgsCalleeOk, popScope } from "./check_narrow_flow"
 import { noteHoleArgNullRead, pushScope } from "./check_narrow_paths"
-import { njFnReached } from "./check_nj_gate"
 import { njFnIx } from "./check_nj_join"
 import {
   checkBoundSubsumes,
@@ -1457,10 +1456,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   if vNames.length == 0 { elabUnboundCallNote(n) }
   if hNames.length > 0 { retTy = substTyDeep(retTy, hNames, hTys) }
   // A deferred join this site cannot decide has no rep, so it collapses to one arm, parked
-  // whole for a `return h(w)` relay (`inferRetTyOf`); in a body the gate does not hold, one of
-  // that body's own parameters is kept as a union instead, which its pins re-join (D3589).
+  // whole for a `return h(w)` relay (`inferRetTyOf`); otherwise one of the body's own
+  // parameters is kept as a union instead, which its pins re-join (D3589).
   let kept = -1
-  if tyIsDeferredJoin(retTy) && !njFnReached(njFnIx) {
+  if tyIsDeferredJoin(retTy) {
     const keep = (apartHoleJoins.get(retTy) ?? false)
       || calleeRetDeclared(cfn, n.callFn)
       || joinOverOwnParams(retTy)
@@ -1906,6 +1905,7 @@ function callFtyHoleParamDemands(
     if !holeDemandOk(pHole.tvName, args[i], at) {
       holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
     }
+    holeKidMapDemands(params[i], at, 4)
     // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
     // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
     if rowIsArrayDemanded(params[i]) {
@@ -2247,7 +2247,6 @@ function callFtyPinCstrs(
     cstrWho,
     dhNames,
     dhArgNode,
-    noSplit,
   )
   instGenFnHolePins(vNames, vTys, cstrCallee)
   pinUnreadGenFnArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
@@ -2630,8 +2629,7 @@ function holeOpenCallsWait(
 }
 
 // A function named as an argument to a hole the callee calls is judged at each instance those
-// calls ask for (D6190); two mark the parameter for a split unless `noSplit` (D6280), and refuse
-// when callee `fnVia` reads reassigned binding `fnValue`. `opFn` is the callee body whose
+// calls ask for (D6190), and refused when callee `fnVia` reads reassigned binding `fnValue`. `opFn` is the callee body whose
 // operators are judged (D6330).
 function judgeFnArgHoleCalls(
   vNames: string[],
@@ -2642,7 +2640,6 @@ function judgeFnArgHoleCalls(
   fnVia: string,
   dhNames: string[],
   dhArgNode: i32[],
-  noSplit: boolean,
 ) {
   if inferQuiet { return 0 }
   // Read under the other holes' own instances, so a call taking another hole parameter's
@@ -2720,8 +2717,6 @@ function judgeFnArgHoleCalls(
           }
           const insts: i32[] = []
           genFnHoleCallInsts(vNames, wTys, k, vTys[k], calleeFn, insts)
-          if insts.length > 1 && !noSplit { holeFnSplitAt(opFn, dhNames[j]) }
-          if !noSplit { holeFwdSplitAsk(opFn, dhNames[j], vNames, wTys, 0) }
           if insts.length > 1 { judgeHoleCallOps(opFn, vNames, wTys, a) }
           // A call moved out of a forwarding callee asks its own instance too, judged without a
           // split, as the direct spelling's call is (D13201).
@@ -3183,114 +3178,6 @@ function constRetFnNames(c: i32): string[] {
   gs
 }
 
-// Marks hole `hole` of `fn`, and the hole parameter of each function `fn` hands it on to by name,
-// as wanting a copy per instance when that function's body, bound at `fn`'s binding
-// `vNames`/`vTys`, calls it at two, directly or handing it on again (D14650). True when marked.
-function holeFwdSplitAsk(
-  fn: i32,
-  hole: string,
-  vNames: string[],
-  vTys: i32[],
-  depth: i32,
-): boolean {
-  if fn < 0 || fn >= P.nodes.length || depth > 4 { return false }
-  const f = nodeAt(fn)
-  if !(f is FuncDecl) || f.fnBody < 0 { return false }
-  let marked = false
-  let par = -1
-  let pi = 0
-  while pi < f.fnParams.length {
-    if paramHoleName(f.fnName, fn, pi) == hole { par = f.fnParams[pi] }
-    pi = pi + 1
-  }
-  if par < 0 { return false }
-  const stack: i32[] = [f.fnBody]
-  while stack.length > 0 {
-    const x = stack.pop() ?? -1
-    if x < 0 || x >= P.nodes.length { continue }
-    const xn = nodeAt(x)
-    if xn is FuncDecl { continue }
-    for kid in nodeChildren(x) {
-      if kid >= 0 { stack.push(kid) }
-    }
-    if !(xn is Call) { continue }
-    let named = false
-    for an in xn.callArgNames {
-      if an != "" { named = true }
-    }
-    const cf = nodeAt(parenPeelIx(xn.callFn))
-    if named || !(cf is Ident) { continue }
-    const ld = fnDeclIx[cf.identName] ?? -1
-    if ld < 0 || ld >= P.nodes.length || ld == fn { continue }
-    const l = nodeAt(ld)
-    if (
-      !(l is FuncDecl)
-      || l.fnTyParams.length > 0
-      || l.fnParams.length != xn.callArgs.length
-    ) {
-      continue
-    }
-    const lNames: string[] = []
-    const lTys: i32[] = []
-    let k = -1
-    let ai = 0
-    while ai < xn.callArgs.length {
-      const a = parenPeelIx(xn.callArgs[ai])
-      lNames.push(paramHoleName(l.fnName, ld, ai))
-      let t = -1
-      const ad = identDeclOf(a)
-      if ad >= 0 && ad < P.nodes.length && nodeAt(ad) is Param {
-        let q = 0
-        while q < f.fnParams.length {
-          if f.fnParams[q] == ad {
-            const vi = strListIndexOf(vNames, paramHoleName(f.fnName, fn, q))
-            if vi >= 0 && vi < vTys.length { t = vTys[vi] }
-          }
-          q = q + 1
-        }
-      }
-      if ad == par { k = ai }
-      if t < 0 { t = substTyDeep(nodeTyOf(a), vNames, vTys) }
-      lTys.push(t)
-      ai = ai + 1
-    }
-    if k >= 0 {
-      const insts: i32[] = []
-      genFnHoleCallInsts(lNames, lTys, k, lTys[k], ld, insts)
-      const ks: string[] = []
-      for li in insts {
-        const kk = tyToStr(li)
-        if strListIndexOf(ks, kk) < 0 { ks.push(kk) }
-      }
-      if (
-        ks.length > 1
-        || holeFwdSplitAsk(ld, lNames[k], lNames, lTys, depth + 1)
-      ) {
-        holeFnSplitAt(ld, lNames[k])
-        holeFnSplitAt(fn, hole)
-        marked = true
-      }
-    }
-  }
-  marked
-}
-
-// Marks the parameter of declared function `fn` whose hole is `hole` as wanting a copy per
-// instance its body calls it at.
-function holeFnSplitAt(fn: i32, hole: string) {
-  if fn < 0 || fn >= P.nodes.length { return 0 }
-  const f = nodeAt(fn)
-  if !(f is FuncDecl) { return 0 }
-  let pi = 0
-  while pi < f.fnParams.length {
-    if paramHoleName(f.fnName, fn, pi) == hole {
-      holeFnSplitSet(f.fnParams[pi])
-    }
-    pi = pi + 1
-  }
-  0
-}
-
 // A lambda with hole parameters bound to a hole the callee's body calls is instanced at the
 // arguments of those calls, as a generic function there is (`instGenFnHolePins`), and its
 // body's demands are judged at that instance (D5935); `opFn` and `noSplit` as
@@ -3341,8 +3228,7 @@ function pinHoleLambdaVals(
 }
 
 // A lambda literal handed to hole `vNames[k]`, which `opFn`'s body calls at several instances,
-// is judged at each and the parameter marked for the split plan, which hands it one copy per
-// instance (D6331). False when the calls ask for fewer than two.
+// is judged at each (D6331). False when the calls ask for fewer than two.
 function holeLambdaSplit(
   vNames: string[],
   vTys: i32[],
@@ -3368,7 +3254,6 @@ function holeLambdaSplit(
       judgeHoleLambdaAt(vt, inst, nm, ty, ix)
     }
   }
-  holeFnSplitAt(opFn, vNames[k])
   true
 }
 
