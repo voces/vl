@@ -469,7 +469,9 @@ step may land in slices, each with its own proof.
   - the name family (`rlSlotByNameTwin` and `letInitDeliversRow`);
   - the twin-row helpers;
   - the syntax side of the 56 twins;
-  - the type-blind classifiers in emit_classify (199 functions, 7,762 lines, as the ceiling).
+  - the type-blind classifiers in emit_classify: 116 functions, 3,180 lines by the 2026-11-02 census
+    ([type-blind-classifier-census-2026-11.md](type-blind-classifier-census-2026-11.md)); the earlier
+    199 / 7,762 was a different cut.
 - **Absorbs:** the rep-descriptor campaign (`rep-descriptor-campaign.md`), the `vtKindOfType`
   annotation ladder, the return-kind family and the slot layer.
 - VKind becomes derived from the rep descriptor.
@@ -794,6 +796,7 @@ The emitter still decides some literal widths from context: (A) the literal arms
 - step 7, one row per record, step 4 (#5613): closed. The `"variant"` kind is the arm reference; a value's heap and fields come from its arm's row (`variantRowOf`), and `emit_bytes.vl`'s writers take a variant kind through the struct arms. The tag stays with the arm, because boxing reads `uTags[vi]` and twins share a row with distinct tags, so the producers and the `$fnsig` result token keep the variant kind (DECISIONS.md, "A record has one row; a union arm is a reference to it"). Folding tags into rows is a separate tag-numbering decision, not taken.
 - step 7, the recorded-result flip's type-variable results ([D14901](inventory/D14901.md) class C): 17 valued functions the result-kind shadow grades `no token` or `no result recorded` whose result holds a hole-function value in a list, map or record (`((_) => _)[]`, `{m: {[string]: (_) => _}}`, `_`); a polymorphic value that closes per call or delivery, so it goes with (d1) and the per-delivery token. Classes A, B, D and E are closed or filed on the row.
 - step 7, the closure signature key: `calleeCloSigKeyOfRead`'s held-value rung (`identClosureFeOfRead` → `cloSigKeyExt`) is not a deletion target. It keys a closure binding by the signature its held value is lowered at, which is what a call through it must use; deleting it moved 214 files to rc 1, and keying by the call's per-instance type instead broke 2 (D14825, closed as measured). A value holding a hole lambda or generic that crosses at another signature is the per-delivery token design, with D14841.
+- step 7, the type-blind classifiers (census 2026-11-02, [type-blind-classifier-census-2026-11.md](type-blind-classifier-census-2026-11.md)): `emit_classify.vl` holds 179 classifiers (6,113 lines). 116 read no node type directly (3,180 lines, 605 call sites); 108 of those reach the arena through what they call. By caller phase over 17,630 files: 8 (210 lines) are called only after monomorphize, 4 (50 lines) only before, 96 (2,773 lines) in both, and 8 (147 lines) are the storage column itself, which stays. A classifier called in both phases is held by its asks before monomorphize, which are mostly template frames; the census counts them per classifier, and they are what step 7's "who still asks before monomorphize" work removes. The largest holds: `exprListRep` 233,073 calls (5,497 files), `listOfColumn` 232,981, `capturedKindOf` 137,574, `structIndexOfExpr` 94,072, `globalReadStructIndex` 53,357, `capturedStructIndex` 52,161, `callStoreListKind` 47,505. `letInitCellKind`, the binding ladder, agrees with the rep of the binding's type on every ask past monomorphize (275, 0 disagreements); its 15 disagreements are all before it, at template types. Next: shadow the post-monomorphize-only classifiers that answer a rep (`exprNulScalarListKind`, `minMaxKind`, `callIsArrSlice`) and delete those at 0.
 
 ---
 
