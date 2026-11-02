@@ -863,7 +863,7 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 | L-nested | a list forward of a captured hole parameter inside a nested function (D14842's shape) | 1 | D14842 | design-size: a nested function's body instanced per encloser instance |
 | L-set | a hole parameter forwarded through a two-member list or choice to a member calling it at two types | 1 | — | unowned |
 | L-map | `.map` lambdas calling a list of hole functions at several types | 1 | — | unowned |
-| N | a function declared above a module `const p = fw(add)` calling `p` at two types; declared below it, it runs | 1 | — | unowned: the global-init pre-pass (D6000) declares `p` without its function set, so the calls note no set |
+| N | a function declared above a module `const p = fw(add)` calling `p` at two types; declared below it, it runs | 0 | — | closed (#5926): the global-init pre-pass records the set its initializer yields |
 
 F's 15 files are four shapes by witness:
 
