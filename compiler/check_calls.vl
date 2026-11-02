@@ -73,6 +73,8 @@ import {
   callBindNote,
   callBindRowOf,
   callBindTysAt,
+  callNumJoinNote,
+  callNumJoined,
   fsbDeclAtNode,
   fsbName,
 } from "./check_bind_rows"
@@ -283,6 +285,7 @@ import {
 } from "./check_node_rules"
 import { nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import { lbiNoDest } from "./check_num_lit_state"
+import { RB_CALL_REJOIN, checkMark, checkRollback } from "./check_rollback"
 import { floatIntrWidth, isFloatLitExpr } from "./check_num_lits"
 import { arityWantText, ovPlainHint, paramNamesOfNodes } from "./check_overload"
 import {
@@ -296,6 +299,11 @@ import {
   argMismatchErr,
   assignable,
   bgCallArgSet,
+  bgWidenAskSet,
+  bgWidenClear,
+  bgWidenCount,
+  bgWidenNameAt,
+  bgWidenTyAt,
   bindExplicitTyArgs,
   bindGenFnRetUnionArm,
   bindGenInnerUnionArms,
@@ -1263,7 +1271,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   args = callFtyNormArgs(n, ix, cfn, params, dParams, args, naOk)
   if !naOk[0] { return retTy }
   // Generic call-site inference: a `TyVar` param (or `T[]`) binds its type-param to
-  // the argument's type (first use wins; later uses must agree), and the return
+  // the argument's type (first use wins, a wider number joins it), and the return
   // type substitutes through the binding — so `id("s")` is `string`, and
   // `let n: i32 = id("s")` is a genuine type error downstream.
   const bNames: string[] = []
@@ -1295,8 +1303,45 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // Each argument's destination as its own turn saw it, for the literals re-delivered below.
   const argExp: i32[] = []
   while argExp.length < args.length { argExp.push(-1) }
+  // A type variable's uses join over numeric widening: a use wider than the first one re-checks
+  // the arguments with the variable bound at the wider number (D2459).
+  const b0N = bNames.slice(0, bNames.length)
+  const b0T = bTys.slice(0, bTys.length)
+  const wm = checkMark()
+  let wPass = 0
+  bgWidenClear()
   let oi = 0
-  while oi < argOrder.length {
+  while oi <= argOrder.length {
+    if oi == argOrder.length {
+      // An instance joins only a call its template joined: the template typed what reads it.
+      const wTpl = !elabCapLive() || callNumJoined(ix)
+      if explicitTa || !wTpl || wPass >= 2 || bgWidenCount() == 0 { break }
+      const wN: string[] = []
+      const wT: i32[] = []
+      let wi = 0
+      // Only a binding an argument made joins: the destination's and a written one stand.
+      while wi < bgWidenCount() {
+        if !strListHas(b0N, bgWidenNameAt(wi)) {
+          wN.push(bgWidenNameAt(wi))
+          wT.push(bgWidenTyAt(wi))
+        }
+        wi = wi + 1
+      }
+      if wN.length == 0 { break }
+      checkRollback(wm, RB_CALL_REJOIN)
+      bgWidenClear()
+      callFtyRebind(bNames, bTys, b0N, b0T, wN, wT)
+      while uNames.length > 0 { uNames.pop() }
+      while uTys.length > 0 { uTys.pop() }
+      wi = 0
+      while wi < argExp.length {
+        argExp[wi] = -1
+        wi = wi + 1
+      }
+      wPass = wPass + 1
+      oi = 0
+      continue
+    }
     const aRet = callFtyCheckArg(
       n,
       ix,
@@ -1314,6 +1359,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     if aRet >= 0 { return aRet }
     oi = oi + 1
   }
+  bgWidenClear()
+  if wPass > 0 && !inferQuiet { callNumJoinNote(ix) }
   if !explicitTa { bindParamUnionsLate(params, args, bNames, bTys) }
   const hNames: string[] = []
   const hTys: i32[] = []
@@ -1758,7 +1805,9 @@ function callFtyCheckArg(
   // argument's shape (first use wins), then check the argument against the
   // SUBSTITUTED expected type — a later disagreeing use errors here.
   bgCallArgSet(true)
+  bgWidenAskSet(!numLitArg(args[i]) && !argIsLitAggregate(args[i]))
   bindGenWalk(params[i], at, bNames, bTys)
+  bgWidenAskSet(false)
   bgCallArgSet(false)
   bindParamUnionOwn(params, i, at, bNames, bTys)
   bindGenUnionArm(params[i], at, uNames, uTys)
@@ -3984,6 +4033,33 @@ function withUnboundAsNever(
         outT.push(TY_NEVER)
       }
     }
+  }
+  0
+}
+
+// Resets the call's bindings to `b0N`/`b0T`, the ones it held before its arguments, with each
+// name of `wN` bound first at its widened `wT` (D2459).
+function callFtyRebind(
+  bNames: string[],
+  bTys: i32[],
+  b0N: string[],
+  b0T: i32[],
+  wN: string[],
+  wT: i32[],
+) {
+  while bNames.length > 0 { bNames.pop() }
+  while bTys.length > 0 { bTys.pop() }
+  let i = 0
+  while i < wN.length && i < wT.length {
+    bNames.push(wN[i])
+    bTys.push(wT[i])
+    i = i + 1
+  }
+  i = 0
+  while i < b0N.length && i < b0T.length {
+    bNames.push(b0N[i])
+    bTys.push(b0T[i])
+    i = i + 1
   }
   0
 }
