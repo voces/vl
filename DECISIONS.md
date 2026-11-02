@@ -11579,3 +11579,30 @@ type was a member, so the `7` above was an `i32`. A float literal tail of an inn
 likewise kept at `f64`; it is now built at single precision, as `const y: f32 = 0.1` is
 (`tests/cases/numerics/f32-f64-join-widens.vl`). A join whose tails are all runtime values keeps
 D3656's member boxing; this ruling settles the literal tails.
+
+## `is` over a map against a narrower map tests its values (owner ruling, 2026-11-02) — D2701
+
+**The rule.** `m is {[K]: V2}` over a map typed `{[K]: V1}`, where `V2` is narrower than `V1`, is
+true when every value is a `V2`, so an empty map passes. This mirrors `xs is K[]` over a list
+(D4771). A join of two maps that store alike is the wider map (D2666), and this is where the test
+now reads true for a value built as the narrower one.
+
+```vl
+const w: {[string]: string | null} = Map()
+w["a"] = "x"
+print(w is {[string]: string})   // true
+```
+
+**How.** The checker mints the content check when it types the `is`: a loop over the map's
+values, kept on the node (`IsExpr.isFit`) as its one child. The elaboration re-checks it in
+each instance and the emitter lowers it in place of the test. Nothing is minted after the check
+(option (4); see the post-check minting inventory in `architecture-target-2026-10.md`).
+
+**The alias rule.** The narrowing holds only while nothing can write the map between the check
+and the use, as for a list (D4926, D4928). The values read at `V2` until a store through any
+alias, or a call that may write, ends it. The map is never delivered as `{[K]: V2}`, and the
+error names a copy. A key read still answers `V2 | null`, since a key can be absent.
+
+**The price.** A loop over the values for each such test, paid only where the static types
+cannot answer it.
+

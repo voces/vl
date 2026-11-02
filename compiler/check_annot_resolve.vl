@@ -6,11 +6,13 @@
 import { identTyOf } from "./check_nar_store"
 import {
   FieldDef,
+  ForIn,
   Ident,
   IsExpr,
   MatchExpr,
   Member,
   Node,
+  P,
   TS_NAME,
   TS_UNION,
   TypeDecl,
@@ -21,8 +23,11 @@ import {
   declGpBaseOf,
   i32ToStr,
   matchPatValueName,
+  mkBinary,
   mkBlock,
+  mkBool,
   mkCall,
+  mkForIn,
   mkIf,
   mkIndex,
   mkIsExpr,
@@ -30,6 +35,7 @@ import {
   mkMember,
   mkNum,
   mkTypeRef,
+  mkUnary,
   nodeAt,
   setAnnTs,
   tsKind,
@@ -87,7 +93,14 @@ import {
   recAnnObjs,
   v128NestMsg,
 } from "./check_leaf_steps"
-import { luAnnTyPut, luAt, luIsTyPut, luRef, luTrap } from "./check_list_union"
+import {
+  luAnnTyPut,
+  luAt,
+  luIsTyPut,
+  luRef,
+  luTrap,
+  luValueNode,
+} from "./check_list_union"
 import { matchConstPatWhy } from "./check_match_desugar"
 import {
   unkTyClash,
@@ -950,3 +963,73 @@ export function fvaRefuse(at: i32, srcTy: i32, dstTy: i32, why: string) {
   0
 }
 // ── member `o.field` ───────────────────────────────────────────────────────
+
+// `m is {[K]: V2}` over a map typed `{[K]: V1}` whose values `V2` is narrower than: decided by
+// the map's contents at runtime, true when every value is a `V2` (owner ruling, D2701). Builds
+// the loop for the caller to check and bank on the test `ix`; -1 when the pair is not one.
+export function mapFitBuild(
+  isObj: i32,
+  ix: i32,
+  objTy: i32,
+  chkTy: i32,
+  pos: i32,
+): i32 {
+  if objTy < 0 || chkTy < 0 || tyHasTyVar(objTy) || tyHasTyVar(chkTy) {
+    return -1
+  }
+  const o = tyAt(objTy)
+  const c = tyAt(chkTy)
+  if !(o is TyMap) || !(c is TyMap) { return -1 }
+  if o.mSet == 1 || c.mSet == 1 || o.mKey < 0 || o.mVal < 0 || c.mVal < 0 {
+    return -1
+  }
+  if (
+    !tyEq(o.mKey, c.mKey)
+    || tyEq(o.mVal, c.mVal)
+    || !assignable(c.mVal, o.mVal)
+  ) {
+    return -1
+  }
+  const vroot = tyToTs(c.mVal)
+  if vroot < 0 || luTs(c.mVal) < 0 || luTs(objTy) < 0 { return -1 }
+  const site = ix
+  const recv = luDecl("const", "$mf" + i32ToStr(ix), objTy, isObj, site, pos)
+  const ok = luDecl(
+    "let",
+    "$mo" + i32ToStr(ix),
+    TY_BOOL,
+    mkBool(1, pos),
+    site,
+    pos,
+  )
+  const vals = luAt(mkMember(luRef(recv, site, pos), "values", pos), site)
+  const iter = luAt(mkCall(vals, [], pos), site)
+  const loop = luAt(mkForIn("$mv" + i32ToStr(ix), "", iter, -1, "", pos), site)
+  if loop < 0 || loop >= P.nodes.length { return -1 }
+  const ln = nodeAt(loop)
+  if !(ln is ForIn) { return -1 }
+  const isV = luAt(
+    mkIsExpr(luRef(ln.fiDecl1, site, pos), tsToName(vroot), pos),
+    site,
+  )
+  setAnnTs(isV, vroot)
+  luIsTyPut(isV, c.mVal)
+  const test = luAt(mkUnary("!", isV, pos), site)
+  const clear = luAt(
+    mkBinary("=", luRef(ok, site, pos), mkBool(0, pos), pos),
+    site,
+  )
+  const thenStmts: i32[] = []
+  thenStmts.push(clear)
+  const bodyStmts: i32[] = []
+  bodyStmts.push(
+    luAt(mkIf(test, luAt(mkBlock(thenStmts, pos), site), -1, pos), site),
+  )
+  ln.fiBody = luAt(mkBlock(bodyStmts, pos), site)
+  const stmts: i32[] = []
+  stmts.push(recv)
+  stmts.push(ok)
+  stmts.push(loop)
+  stmts.push(luRef(ok, site, pos))
+  luValueNode(site, stmts, pos)
+}

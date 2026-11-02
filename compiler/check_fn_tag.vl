@@ -112,6 +112,7 @@ import {
   mintFactSetOf,
   mintFactSplits,
   mintParamBoundSets,
+  mintParamSetsOf,
   mintParamTakes,
   mintRetParamsOf,
   mintSetPartial,
@@ -159,6 +160,7 @@ import {
 export function fnTagDecide(rootIx: i32) {
   ftParamOwners = Map()
   ftParamOwnersBuilt = false
+  ftDecideRoot = rootIx
   fnTagUndecide()
   ftLeafTys = Map()
   const calls = fnTagCalls()
@@ -1631,6 +1633,8 @@ function ftReadInNestedFn(body: i32, pd: i32): boolean {
 // Each parameter under the root → the function declaring it, built once per decision.
 let ftParamOwners: {[i32]: i32} = Map()
 let ftParamOwnersBuilt = false
+// The root the decision in progress walks, for a question asked without it.
+let ftDecideRoot = 0 - 1
 
 // The function under `rootIx` declaring parameter `pd`, or -1.
 function ftParamOwner(rootIx: i32, pd: i32): i32 {
@@ -1714,7 +1718,8 @@ function ftValuesOk(
 ): boolean {
   for v in vs {
     if !ftIsS(v, s) {
-      const d = ftLeafMember(v, ds)
+      // A lambda member written is its own leaf, as `ftNodeOk` takes one read.
+      const d = if ftLambdaLeaf(v, ds) { v } else { ftLeafMember(v, ds) }
       if d < 0 && ftSubsetRead(v, s) { continue }
       if d < 0 { return false }
       if !i32ListHas(leaves, v) {
@@ -1724,6 +1729,31 @@ function ftValuesOk(
     }
   }
   true
+}
+
+// Whether `v` is a lambda member of `ds` whose id can stand for it once the elaboration has typed
+// its calls. One written inside a generic or hole function is a value per instance, which one
+// id cannot name.
+function ftLambdaLeaf(v: i32, ds: i32[]): boolean {
+  ftLate
+    && i32ListHas(ds, v)
+    && nodeAt(v) is FuncDecl
+    && ftLambdaIdOk(v)
+    && !ftWithinInstancedFn(v)
+}
+
+// Whether `x` is declared inside a generic or hole function, whose body each instance re-checks.
+export function ftWithinInstancedFn(x: i32): boolean {
+  let f = fnDeclParent[x] ?? -1
+  let hops = 0
+  while f >= 0 && hops < 64 {
+    const fd = if f < P.nodes.length { nodeAt(f) } else { null }
+    if fd is FuncDecl && fd.fnTyParams.length > 0 { return true }
+    if ftOpenFn(f) { return true }
+    f = fnDeclParent[f] ?? -1
+    hops = hops + 1
+  }
+  false
 }
 
 // The member of `ds` the name at `v` reads, or -1; a local `const` reads its initialiser.
@@ -2009,7 +2039,11 @@ function ftLateArgOfSet(c: Call, x: i32, s: i32): boolean {
   }
   const cf = parenPeelIx(c.callFn)
   const cd = identDeclOf(cf)
-  // A parameter or a declared function is no holder of the set; a binding, element or field is.
+  // A parameter hands the id to each member of the sets its calls go through.
+  if cd >= 0 && cd < P.nodes.length && nodeAt(cd) is Param {
+    return ftParamSetsTake(cd, i, s)
+  }
+  // A declared function is no holder of the set; a binding, element or field is.
   const held = cd >= 0
     && cd < P.nodes.length
     && !(nodeAt(cd) is Param)
@@ -2021,6 +2055,30 @@ function ftLateArgOfSet(c: Call, x: i32, s: i32): boolean {
   if ds.length == 0 { return false }
   for d in ds {
     if !mintParamTakes(d, i, s) { return false }
+  }
+  true
+}
+
+// Whether every call through parameter `par` goes through sets of named functions each of which
+// takes set `s` at its parameter `i`, so the id is what every member reads. A lambda member takes
+// a bundle of closures instead (D14841).
+function ftParamSetsTake(par: i32, i: i32, s: i32): boolean {
+  const fd = ftParamOwner(ftDecideRoot, par)
+  if fd < 0 { return false }
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) { return false }
+  const j = i32ListIndexOf(f.fnParams, par)
+  const sets = mintParamSetsOf(fd, j)
+  if j < 0 || sets.length == 0 { return false }
+  for ss in sets {
+    const ds = fnTagMembers(ss)
+    if ds.length == 0 { return false }
+    for d in ds {
+      const m = nodeAt(d)
+      if !(m is FuncDecl) || m.fnName == "" || !mintParamTakes(d, i, s) {
+        return false
+      }
+    }
   }
   true
 }
