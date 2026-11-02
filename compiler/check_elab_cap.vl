@@ -19,6 +19,7 @@ import {
   cwParamArgs,
   cwSlotPath,
   cwSlotWrittenValues,
+  cwUseCaptures,
   fnDeclIx,
 } from "./check_write_scan"
 import {
@@ -56,6 +57,7 @@ import {
   annTsOf,
   i32ToStr,
   nodeAt,
+  nodeChildren,
   tsMentionsAnyName,
 } from "./ast"
 import { inferQuiet, quietDepth } from "./check_cursor"
@@ -1116,6 +1118,71 @@ export function elabFnListOpenWideMembers(bd: i32, t: i32): i32[] {
   fnSets[u]
 }
 
+// Whether set `s` has a lambda member that reads a binding declared outside it.
+function fnSetHasCapturingLambda(s: i32): boolean {
+  if s < 0 || s >= fnSets.length { return false }
+  for m in fnSets[s] {
+    const f = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+    if f is FuncDecl && f.fnName == "" && fnLambdaCaptures(m) { return true }
+  }
+  false
+}
+
+// Whether lambda `x` reads a binding declared outside it that it captures.
+function fnLambdaCaptures(x: i32): boolean {
+  const inside: Map<i32, boolean> = Map()
+  const sub: i32[] = []
+  const todo: i32[] = [x]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length && !(inside[y] ?? false) {
+      inside[y] = true
+      sub.push(y)
+      for c in nodeChildren(y) { todo.push(c) }
+    }
+  }
+  for y in sub {
+    if nodeAt(y) is Ident {
+      const d = identDeclOf(y)
+      if d >= 0 && !(inside[d] ?? false) && cwUseCaptures(y) { return true }
+    }
+  }
+  false
+}
+
+// The sets of the lists initialising the list bindings this check widened to set `s`, other
+// than a literal its widening re-types: each copy holds its source's ids, which `s` must share.
+export function fnWidenedListSourceSets(s: i32): i32[] {
+  const out: i32[] = []
+  for bd in fnListWidened {
+    const n = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
+    if n is LetDecl && n.letInit >= 0 && !i32ListHas(fnLetVeto, bd) {
+      const init = n.letInit
+      const it = if init < P.nodes.length { nodeTyIxOf(init) } else { -1 }
+      const ia = if it >= 0 && it < T.tys.length { T.tys[it] } else { null }
+      const bt = nodeTyIxOf(bd)
+      const ba = if bt >= 0 && bt < T.tys.length { T.tys[bt] } else { null }
+      if ia is TyArray && ba is TyArray && fnTagSetOfTy(ba.aElem) == s {
+        const o = fnTagSetOfTy(ia.aElem)
+        if o >= 0 && o != s && !i32ListHas(out, o) { out.push(o) }
+      }
+    }
+  }
+  out
+}
+
+// The set list binding `bd`, initialised by a literal of type `t`, holds once its scope's writes
+// join the literal's elements (`elabFnListLetTy`); -1 when nothing widens it.
+export function elabFnListWideSet(bd: i32, t: i32): i32 {
+  if bd < 0 || t < 0 || t >= T.tys.length { return -1 }
+  const ta = T.tys[t]
+  if !(ta is TyArray) { return -1 }
+  const s = elabFnSetTy[ta.aElem] ?? -1
+  const w = fnSlotSetOf(bd)
+  if s < 0 || w < 0 || w == s { return -1 }
+  fnSetIntern(fnSetUnion(s, w))
+}
+
 // Whether the list binding `bd` gives its reads a set widened with what its scope writes, and no
 // check vetoed that widening; a call through its element then fixes its own member's tuple.
 export function elabFnListWidened(bd: i32): boolean {
@@ -1761,7 +1828,14 @@ export function fnTagEtaAgain(): boolean {
   }
   i = 0
   while i < fnSlotWide.length && i < fnSlotWideAt.length {
-    if !fnTagTyIsTagged(fnSlotWide[i]) { fnLetVeto.push(fnSlotWideAt[i]) }
+    // A list whose widened set holds a capturing lambda never takes ids, and its closures need
+    // each member instanced at the list's signature, which the elaboration does not foresee.
+    if (
+      !fnTagTyIsTagged(fnSlotWide[i])
+      && fnSetHasCapturingLambda(elabFnSetTy[fnSlotWide[i]] ?? -1)
+    ) {
+      fnLetVeto.push(fnSlotWideAt[i])
+    }
     i = i + 1
   }
   if fnTagEtaSites.length == 0 && fnLetVeto.length == 0 { return false }
