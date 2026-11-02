@@ -42,8 +42,8 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 1. **The architecture migration**, in [target §3](docs/internals/architecture-target-2026-10.md)
    order. The forward items after the latest landings are in §3.1, "Open after #5115". Status is in
    [the plan](docs/internals/architecture-refactor-plan.md).
-2. **Clause-1 defects:** D13960 (a wider record list spread into a narrower rest parameter is
-   check-clean invalid wasm). For the rest, run `ls.vl -- --status open` and grep for `clause 1`.
+2. **Clause-1 defects:** D14960 (a spread of a wider record list into a narrower rest parameter
+   hands the elements over unconverted). For the rest, run `ls.vl -- --status open` and grep for `clause 1`.
 3. **Initialization order** (DECISIONS.md, "Initialization order"). Make init-before-read a compile
    error and reorder initializers. D14361 is open beside it.
 4. **Generated-code performance:**
