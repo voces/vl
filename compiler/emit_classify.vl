@@ -637,8 +637,9 @@ import {
   sFieldMapShape,
   structIndexOfNullPartTy,
   structIndexOfTypeName,
-  structIndexOfTypeNameTy,
   structRowOfAnnTy,
+  structRowOfNameOrTy,
+  structRowOfNameTy,
   structRowOfRecordTy,
   tyIsRefArray,
   tyMentionsLitOrObj,
@@ -4637,7 +4638,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
             if mCov { msi = structIndexOfTy(mTys[mi]) }
             if msi < 0 {
               if mCov {
-                msi = structIndexOfTypeNameTy(ma, mTys[mi])
+                msi = structRowOfNameTy(ma, mTys[mi])
               } else {
                 msi = structIndexOfTypeName(ma)
               }
@@ -9269,38 +9270,23 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     Ident => {
       return variantRowOfRead(exprIx, fnIx)
     }
-    // A call to a `: Cat`-returning function yields the concrete variant ref, in the three
-    // callee forms the nullable twin handles arm for arm: a declared function, a closure value,
-    // or a closure-valued field. Missing the latter two, a lambda binding or field closure
-    // answers -1 — the whole kind decision here — so the value falls to the struct table.
+    // A call yields the variant row its callee's result is lowered at: a declared function's
+    // result column, else a function value's `$fnsig` result slot (D14826).
     Call => {
       if e.callFn < 0 { return -1 }
       const callee = nodeAt(e.callFn)
       if callee is Ident {
         const cvsid = sidOfNode(e.callFn)
         const cvname = callee.identName
-        // A DECLARED function keeps its own richer resolution (the `: Cat` annotation, then
-        // the inferred `fRetKind`/`fRetStructIdx` pair) — unchanged, and asked first so no
-        // named-callee answer moves.
+        // A declared function's result: its `: Cat` annotation, else `fRetKind`/`fRetStructIdx`.
         if fnIndexOfInScopeAt(cvsid, cvname, fnIx, e.callFn) >= 0 {
           return fnRetVariantIndexSid(cvsid, cvname, fnIx, e.callFn)
         }
-        // A closure-value callee (`const f = (x: Circle) => x; f(c)`, `const f = idc; f(c)`,
-        // a closure param `f(c)`), which `fnIndexOfSid` misses by construction. The resolved
-        // `$fnsig` key is the same key `emitCallRef` casts the call through, so the slot this
-        // reads and the functype the call site emits come from one fact.
-        const cvk = calleeCloSigKeyOfRead(e.callFn, fnIx)
-        if sigKeyRetKind(cvk) == "variant" { return sigKeyRetSlot(cvk) }
-        return -1
       }
-      // A closure-valued FIELD callee (`holder.go(c)`) — the twin's third rung, same gate.
-      if callee is Member {
-        const cvfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if cvfe >= 0 {
-          if cloRetValKind(cvfe) == "variant" { return cloRetValSlot(cvfe) }
-        }
-        return -1
-      }
+      // Any other callee is a function value, called through the `$fnsig` key `emitCallRef`
+      // casts to, so the slot this reads and the functype the call site emits are one fact.
+      const ck = cloCallSigKey(exprIx, fnIx)
+      if ck != "" && sigKeyRetKind(ck) == "variant" { return sigKeyRetSlot(ck) }
       return -1
     }
     // An element of a ref list whose slot stores a variant is that variant's bare struct; a
@@ -9833,7 +9819,7 @@ function structIndexOfIndexExpr(e: Index, exprIx: i32, fnIx: i32): i32 {
       if elr >= 0 { return elr }
     }
     if !sieKnown || sieObj {
-      const si = structIndexOfTypeNameTy(nm, sieTy)
+      const si = structRowOfNameOrTy(nm, sieTy)
       if si >= 0 { return si }
     }
   }
@@ -15729,6 +15715,25 @@ function fnLoweredKind(fe: i32): VKind | null {
   flkStamp[fe] = flkGen.at
   flkVal[fe] = k
   k
+}
+
+// The result kind call `rx` lowers (`callLoweredKind`), `rx` being the call or a `const` bound
+// to it; null where it names no call or the callee's kind is not known.
+export function callLoweredKindOf(rx: i32, fnIx: i32): VKind | null {
+  let u = unwrapParen(rx)
+  if u < 0 || u >= P.nodes.length { return null }
+  const id = nodeAt(u)
+  if id is Ident {
+    const d = identDeclOf(u)
+    if d < 0 || d >= P.nodes.length { return null }
+    const dn = nodeAt(d)
+    if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return null }
+    u = unwrapParen(dn.letInit)
+    if u < 0 || u >= P.nodes.length { return null }
+  }
+  const e = nodeAt(u)
+  if !(e is Call) { return null }
+  callLoweredKind(e, u, fnIx)
 }
 
 // The result kind call `rx`'s callee lowers, once return kinds are final: a named function's

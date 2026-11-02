@@ -887,6 +887,7 @@ import {
   binMixHardF64,
   callIsArrSlice,
   callIsMapFilter,
+  callLoweredKindOf,
   calleeIsVoidExtern,
   calleeReturnsVoidOfRead,
   capCellName,
@@ -3691,7 +3692,11 @@ function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
   if pTest == "" {
     // A record is never the member of a `string` or `boolean` niche, nor a literal union of a
     // reference or `boolean` one (D3344).
-    if readIsCallResult(recvIx, fnIx) { return false }
+    // A call's own instance typed its result, so only the niche its callee lowers is known.
+    if readIsCallResult(recvIx, fnIx) {
+      const ck = callLoweredKindOf(recvIx, fnIx)
+      return (ck == "nulstr" || ck == "nulbool") && tyIsRecord(ity)
+    }
     const pb = nulNicheBaseClass(recvIx, fnIx)
     if tyIsRecord(ity) { return pb == "string" || pb == "boolean" }
     if tyIsLitUnion(ity) { return pb == "#ref" || pb == "boolean" }
@@ -29550,13 +29555,29 @@ function emitTailReturnExit(body: u8[], stmtIx: i32, fnIx: i32) {
 function emitReturnExit(body: u8[], retArg: i32, fnIx: i32) {
   if fnUsesUnionSink {
     const bare = nodeAt(unwrapParen(retArg))
-    if bare is IfStmt {
+    // A join typed one wider number is that number, boxed once, as at every other delivery (D3656).
+    if bare is IfStmt && !retIfIsOneNumber(unwrapParen(retArg), fnIx) {
       return emitUnionRetIfSink(body, unwrapParen(retArg), fnIx)
     }
   }
   if emitReturnValue(body, retArg, fnIx) < 0 { return -1 }
   emitUnionRetSink(fnIx)
   0
+}
+
+// Whether the `if` at `ifIx`, returned from a function taking the union sink, is one wider
+// number its arms do not each box: it adapts (`ifJoinAdaptsScalar`) and a literal tail already
+// has that number's type, as D3571's join does. Runtime tails alone keep their members (D3656).
+function retIfIsOneNumber(ifIx: i32, fnIx: i32): boolean {
+  if !fnUsesUnionSink || ifIx < 0 || ifIx >= P.nodes.length { return false }
+  if !ifJoinAdaptsScalar(ifIx, fnIx) { return false }
+  const pn = tyPrimNameOf(nodeTyAt(ifIx, fnIx))
+  for lf in valueTailLeaves(ifIx) {
+    if cexLitPeel(lf) >= 0 && tyPrimNameOf(nodeTyAt(lf, fnIx)) == pn {
+      return true
+    }
+  }
+  false
 }
 
 // `return if c { a } else { b }` in a union-box-returning function taking the sink.
@@ -29596,9 +29617,14 @@ function emitUnionRetIfSinkLink(body: u8[], ifIx: i32, fnIx: i32, open: i32[]) {
       // function's own null, exiting like every other arm.
       rc = emitNullForRet(body, fnIx)
       if rc >= 0 { rc = emitUnionRetSink(fnIx) }
-    } else if nodeAt(s.ifElse) is IfStmt {
+    } else if (
+      nodeAt(s.ifElse) is IfStmt
+      && !retIfIsOneNumber(s.ifElse, fnIx)
+    ) {
       open.push(-1)
       return 1 // `else if`: the next link, which the caller emits into this open frame
+    } else if nodeAt(s.ifElse) is IfStmt {
+      rc = emitReturnExit(body, s.ifElse, fnIx)
     } else {
       rc = emitUnionRetIfArm(body, s.ifElse, fnIx)
     }
@@ -32922,6 +32948,10 @@ function emitStmtTail(body: u8[], stmtIx: i32, fnIx: i32) {
 // position): each arm is lowered with its last statement tail-aware (`emitStmtsTail`).
 // Mirrors `emitStmt`'s void-if shape, but routes the arm bodies through the tail path.
 function emitIfTail(body: u8[], stmtIx: i32, fnIx: i32) {
+  // A join typed one wider number returns as that number, boxed once (D3656).
+  if retIfIsOneNumber(stmtIx, fnIx) {
+    return emitTailReturnExit(body, stmtIx, fnIx)
+  }
   // An `else if` chain is lowered along its spine, as `emitIfStmtStmt` lowers one (D1990).
   const open: i32[] = []
   let cur = stmtIx
@@ -32967,12 +32997,14 @@ function emitIfLinkTail(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
     fbElse() // 0x05 else
     // A VALUE union narrows to the COMPLEMENT set in the else-arm (see emitStmt).
     const els = nodeAt(s.ifElse)
-    if els is IfStmt {
+    if (els is IfStmt && !retIfIsOneNumber(s.ifElse, fnIx)) {
       // `else if`: the next link, still in tail position.
       open.push(-1)
       return 1
     }
-    if els is Block {
+    if els is IfStmt {
+      if emitTailReturnExit(body, s.ifElse, fnIx) < 0 { return -1 }
+    } else if els is Block {
       if emitStmtsTail(body, s.ifElse, fnIx) < 0 { return -1 }
     } else {
       if emitStmtTail(body, s.ifElse, fnIx) < 0 { return -1 }
