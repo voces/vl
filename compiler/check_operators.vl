@@ -20,6 +20,9 @@ import {
   Param,
   Paren,
   Unary,
+  arenaSetNode,
+  mkCall,
+  mkMember,
   nodeAt,
 } from "./ast"
 import { nodeTyIxOf, nodeTySet, nodeTySetGrow } from "./check_node_tys"
@@ -177,6 +180,7 @@ import {
   isVarTyIxCap,
   isVarTyIxPush,
   isVarTyIxSetAt,
+  lmMembers,
   luWriteTgtPut,
 } from "./check_list_union"
 import { constLitNeverMsg, litSetNeverMsg } from "./check_lit_never_msgs"
@@ -1679,6 +1683,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   const op = n.binOp
   if op == "in" { return checkInOpNode(n, ix) }
   if op == "&&" || op == "||" { return checkLogicalBinNode(n, ix) }
+  if op == "=" && n.binCompound == "" {
+    const lw = lmIndexWriteAt(n, ix)
+    if lw != -2 { return lw }
+  }
   const savedLbiTgt = lbiWriteTgt
   const lt = binCheckLeftOperand(n, op)
   ltOut.push(lt)
@@ -1687,6 +1695,24 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   const rt = binCheckRightOperand(n, ix, op, lt, savedLbiTgt)
   if op == "??" { popScope() }
   binTyOfSides(n, ix, lt, rt, ltOut)
+}
+
+// `recv[k] = v` over a union of maps whose keys agree, rewritten in place to `recv.set(k, v)`,
+// which writes to the member the map holds (owner ruling, D2701); -2 for any other assignment.
+function lmIndexWriteAt(n: BinExpr, ix: i32): i32 {
+  const t = nodeAt(parenPeelIx(n.binLeft))
+  if !(t is Index) { return -2 }
+  const rty = checkNodeHook(t.idxArr)
+  const ms = lmMembers(rty)
+  if ms.length == 0 { return -2 }
+  const m0 = tyAt(ms[0])
+  if !(m0 is TyMap) || m0.mSet == 1 { return -2 }
+  const callee = mkMember(t.idxArr, "set", n.pos)
+  const args: i32[] = []
+  args.push(t.idxIndex)
+  args.push(n.binRight)
+  arenaSetNode(ix, nodeAt(mkCall(callee, args, n.pos)))
+  checkNodeHook(ix)
 }
 
 // Whether `n` (at `ix`) waits on an open element operand: banked, and answered -1 until the last

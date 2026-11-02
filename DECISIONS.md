@@ -11445,3 +11445,30 @@ its fields.
 later write could invalidate the narrowing, and when none can, the delivery is fine without a
 copy. It would relax lists and records alike (D14827, whose witness is D14752's original
 spelling).
+
+## A join of two different map types is their union (owner ruling, 2026-11-02) — D2701
+
+**The rule.** A join of two maps whose types differ is their union, and the map value carries
+its member's tag at runtime, so `is` refines it. Two maps that spell one storage over a numeric
+literal union and its base still collapse, since they are one map. Before this ruling, a pair
+that stored alike (`{[string]: string}` and `{[string]: string | null}`) joined as the wider map,
+so `is` against the narrower one was false for a value built as it.
+
+```vl
+const r = if c { mk() } else { mkw() }   // {[string]: string} | {[string]: string | null}
+print(r is {[string]: string})            // true when `mk()` built it
+print(r.length)                           // no narrowing needed
+r["z"] = "w"                              // fits every member's value
+```
+
+**No running program breaks.** What every member supports keeps working on the union without
+narrowing:
+
+* the reads `.length`, `r[k]`, `.get`, `.has`, `.keys()`, `.values()` and `for k in r`, through
+  the `is` chain the map-union reads already used;
+* the writes `r[k] = v`, `.set(k, v)` and `.delete(k)`, rewritten to the same chain. Each arm
+  checks the value against its member's own value type, so a value that does not fit every
+  member is still refused.
+
+**Where the tag lives.** Same-storage map types already carry distinct union-box tags (D2690), so
+the union needs no new runtime field.
