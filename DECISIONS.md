@@ -11445,3 +11445,23 @@ its fields.
 later write could invalidate the narrowing, and when none can, the delivery is fine without a
 copy. It would relax lists and records alike (D14827, whose witness is D14752's original
 spelling).
+
+## A nested join means what its hoisted twin means (owner ruling, 2026-11-02) — D3657
+
+**The rule.** Inlining or hoisting a sub-expression never changes a program's behaviour. A value
+join nested inside another is typed and built as it would be bound to a `const` first: the inner
+join's type wins, and its literal tails are built at that type wherever the outer join delivers
+it.
+
+```vl
+function run(q: i32 | null, r: f64 | null) {
+  const x = if q != null { q } else { if r != null { r } else { 7 } }
+  print(x is f64)   // true: the inner join is f64, so its `7` is 7.0
+}
+```
+
+**What moved.** An earlier rule boxed a literal inside a union chain at its own type when that
+type was a member, so the `7` above was an `i32`. A float literal tail of an inner `f32` join was
+likewise kept at `f64`; it is now built at single precision, as `const y: f32 = 0.1` is
+(`tests/cases/numerics/f32-f64-join-widens.vl`). A join whose tails are all runtime values keeps
+D3656's member boxing; this ruling settles the literal tails.
