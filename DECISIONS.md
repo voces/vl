@@ -11446,6 +11446,22 @@ later write could invalidate the narrowing, and when none can, the delivery is f
 copy. It would relax lists and records alike (D14827, whose witness is D14752's original
 spelling).
 
+## A negative literal does not fit a `u8` element (owner ruling, 2026-11-02) — D3428
+
+**The rule.** A negative integer literal at a `u8` element is refused exactly as one past 255 is,
+and so is a constant holding one, since a constant is its literal at every read. `-0` fits.
+The wrap is spelled with a cast: `as% u8` keeps the low 8 bits (`as u8` is exact-or-fail).
+
+```vl
+const xs: u8[] = [-7]          // refused: the literal -7 does not fit a `u8` element
+const ys: u8[] = [-7 as% u8]   // 249
+```
+
+**Why.** The exact-constant ruling refuses a use whose destination cannot hold the exact value,
+and a literal the compiler can see is a mistake it can name. A computed value still truncates to
+its low 8 bits at the store, as the `u8` slot rule says, since a runtime range check on every
+store is not payable.
+
 ## `x! is O` is refused, not read as `x !is O` (owner ruling A, 2026-11-02) — D3585
 
 **The rule.** A `!` written against its operand and apart from a following `is` (`x! is O`,
@@ -11502,3 +11518,39 @@ that breaks the wider or the narrower type. This is the alias rule of D4084's ru
 **Status.** Backlogged in ROADMAP.md. D14385 and D14890 are its witnesses and wait on it. Until
 it is built, a separate change refuses the family at check with the kept-versus-own sentence,
 graded as clause 2.
+
+## A list callback op fixes the length at entry (owner ruling A, 2026-11-02) — D3068
+
+**The rule.** `.map`, `.filter` and `std:array`'s `reduce`, `mapIndexed`, `some` and `every` read
+the list's length once, before the first call. An element the callback pushes is not visited. An
+index the callback cuts off (by a `pop` or a clear) is skipped by `filter`, `reduce`, `some` and
+`every`, and ends `map` and `mapIndexed` with the trap an `xs[i]` read past the length raises.
+The same holds over a readonly view of the list.
+
+**Why.** Before, the core ops fixed the length but read the backing directly, so they returned
+the popped element out of its spare slot, and the std ops re-read the length, so a callback that
+pushed every time never ended (D3068). JavaScript fixes the length and skips, and VL follows it
+except where JavaScript leaves a hole in `map`'s result, which VL has no rep for, so it traps.
+
+**The price.** One length read per step in the core loops. Dropping it where the callback
+provably does not change the list is deferred, the simple case first and the complex one later.
+
+## A nested join means what its hoisted twin means (owner ruling, 2026-11-02) — D3657
+
+**The rule.** Inlining or hoisting a sub-expression never changes a program's behaviour. A value
+join nested inside another is typed and built as it would be bound to a `const` first: the inner
+join's type wins, and its literal tails are built at that type wherever the outer join delivers
+it.
+
+```vl
+function run(q: i32 | null, r: f64 | null) {
+  const x = if q != null { q } else { if r != null { r } else { 7 } }
+  print(x is f64)   // true: the inner join is f64, so its `7` is 7.0
+}
+```
+
+**What moved.** An earlier rule boxed a literal inside a union chain at its own type when that
+type was a member, so the `7` above was an `i32`. A float literal tail of an inner `f32` join was
+likewise kept at `f64`; it is now built at single precision, as `const y: f32 = 0.1` is
+(`tests/cases/numerics/f32-f64-join-widens.vl`). A join whose tails are all runtime values keeps
+D3656's member boxing; this ruling settles the literal tails.

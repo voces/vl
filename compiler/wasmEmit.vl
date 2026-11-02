@@ -57,6 +57,7 @@ import { canonUnionMembersInto } from "./check_program"
 import {
   cexLitPeel,
   intLitIsNegated,
+  isFloatLitExpr,
   numCastCanFail,
   numUnionMembersOf,
 } from "./check_num_lits"
@@ -8918,18 +8919,15 @@ function emitUnionIfValue(
   closeIfChainFrames(open, rc, false)
 }
 
-// Whether the value `if` at `ifIx` is typed one number a runtime tail is not, while every
-// literal tail already has that type: delivered as that number, the runtime tail widens and a
-// literal boxes at its own type as the union chain would box it (D3571).
+// Whether the value `if` at `ifIx` is typed one number some tail is not: delivered as that
+// number, every tail is built at it, a literal included, so a nested join means what its
+// hoisted twin means (D3571; owner ruling, D3657).
 function ifJoinAdaptsScalar(ifIx: i32, fnIx: i32): boolean {
   const pn = tyPrimNameOf(nodeTyAt(ifIx, fnIx))
   if pn != "i64" && pn != "f64" && pn != "f32" { return false }
   let widens = false
   for lf in valueTailLeaves(ifIx) {
-    if tyPrimNameOf(nodeTyAt(lf, fnIx)) != pn {
-      if cexLitPeel(lf) >= 0 { return false }
-      widens = true
-    }
+    if tyPrimNameOf(nodeTyAt(lf, fnIx)) != pn { widens = true }
   }
   widens
 }
@@ -21305,6 +21303,11 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32) {
 export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32) {
   const lit = emitInstLitAs(exprIx, "f32", fnIx)
   if lit != -2 { return lit }
+  // A float literal tail of a join typed `f32` re-encodes at single precision, as the join's
+  // hoisted twin builds it (owner ruling, D3657).
+  if cexLitPeel(exprIx) >= 0 && isFloatLitExpr(unwrapParen(exprIx)) {
+    return emitSignedNumLitAt(unwrapParen(exprIx), "f32")
+  }
   const asgLit = emitAsgLitAs(body, exprIx, "f32", fnIx)
   if asgLit != -2 { return asgLit }
   const rw32f = asgRadixWidePrim(unwrapParen(exprIx), fnIx)
@@ -27549,6 +27552,29 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       fbLocalGet(nL)
       fbI32Bin(78) // 0x4e i32.ge_s — i >= n?
       fbBrIf(1)    // exit the block
+      // The length is fixed at entry; an index the callback has since cut off ends a map with
+      // the trap an `xs[i]` read raises, and is skipped by a filter (D3068).
+      fbLocalGet(iL)
+      fbLocalGet(srcL)
+      fbStructGet(srcWrap, 1)
+      fbI32Bin(78) // 0x4e i32.ge_s — i >= the current length?
+      if isMap {
+        fbIf(64)
+        fbLocalGet(srcL)
+        fbStructGet(srcWrap, 0)
+        if listBackIsRecord(srcBack) {
+          fbLocalGet(srcL)
+          fbStructGet(srcWrap, 0)
+          fbArrayLen()
+          fbLocalGet(srcL)
+          fbStructGet(srcWrap, 0)
+        }
+        emitListIdxTrap(srcBack)
+        fbEnd()
+      } else {
+        fbI32Eqz()
+        fbIf(64) // the filter's step, closed after it
+      }
       if isMap {
         // back[i] = call_ref(clo, [elem(i)])
         fbLocalGet(dstL)
@@ -27587,6 +27613,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
         fbI32Bin(106)                // 0x6a i32.add
         fbLocalSet(jL)
         fbEnd()
+        fbEnd()                      // the current-length test
       }
       fbLocalGet(iL)
       fbI32Const(1)
@@ -29727,16 +29754,14 @@ function emitReturnExit(body: u8[], retArg: i32, fnIx: i32) {
 }
 
 // Whether the `if` at `ifIx`, returned from a function taking the union sink, is one wider
-// number its arms do not each box: it adapts (`ifJoinAdaptsScalar`) and a literal tail already
-// has that number's type, as D3571's join does. Runtime tails alone keep their members (D3656).
+// number its arms do not each box: it adapts (`ifJoinAdaptsScalar`) and has a literal tail,
+// which is built at that number as its hoisted twin builds it (D3571; owner ruling, D3657).
+// Runtime tails alone keep their members (D3656).
 function retIfIsOneNumber(ifIx: i32, fnIx: i32): boolean {
   if !fnUsesUnionSink || ifIx < 0 || ifIx >= P.nodes.length { return false }
   if !ifJoinAdaptsScalar(ifIx, fnIx) { return false }
-  const pn = tyPrimNameOf(nodeTyAt(ifIx, fnIx))
   for lf in valueTailLeaves(ifIx) {
-    if cexLitPeel(lf) >= 0 && tyPrimNameOf(nodeTyAt(lf, fnIx)) == pn {
-      return true
-    }
+    if cexLitPeel(lf) >= 0 { return true }
   }
   false
 }
