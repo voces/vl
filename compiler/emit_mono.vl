@@ -602,6 +602,7 @@ import {
   elabCallBundleSigs,
   elabCallInstWant,
   elabCallParamTy,
+  elabCallSeedBind,
   elabDemand,
   elabInstSlotAt,
   elabInstSpelling,
@@ -621,6 +622,7 @@ import {
   elabTestsTyVar,
   elabTpDefaultsReset,
   elabTpDefaultsSet,
+  elabTyParamSeedParam,
   elabWalkKidRet,
   elabWalkNarrowedTy,
   elabWalkPop,
@@ -7779,6 +7781,53 @@ function monoAnnIsUnion(annIx: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   const ty = tyAt(t)
   (ty is TyUnion && ty.uMembers.length > 1) || ty is TyNullable
+}
+
+// Binds each type parameter of `fn` still unbound that the elaboration's instance for call
+// `callIx` binds to the type of the parameter it is inferred from (`elabCallSeedBind`), as that
+// parameter is bound here: its own type parameter's binding, or its pin when un-annotated.
+function monoBindSeededTyParams(
+  fn: FuncDecl,
+  decl: i32,
+  callIx: i32,
+  pinned: string[],
+  pinTys: i32[],
+  tvN: string[],
+  tvV: string[],
+  tvT: i32[],
+) {
+  for tp in fn.fnTyParams {
+    const et = if monoBindOf(tvN, tvV, tp) == "" { elabCallSeedBind(decl, callIx, tp) } else { -1 }
+    const pd = if et >= 0 { elabTyParamSeedParam(fn, tp) } else { -1 }
+    const j = i32ListIndexOf(fn.fnParams, pd)
+    let nm = ""
+    let t = -1
+    const ann = if j >= 0 { monoParamBareTyParam(fn.fnParams[j], fn.fnTyParams) } else { "" }
+    if ann != "" {
+      nm = monoBindOf(tvN, tvV, ann)
+      t = monoBindTyOf(tvN, tvT, ann)
+    } else if j >= 0 && monoParamUnannotated(fn.fnParams[j]) {
+      nm = if j < pinned.length { pinned[j] } else { "" }
+      t = if j < pinTys.length { pinTys[j] } else { -1 }
+    }
+    if nm != "" {
+      tvN.push(tp)
+      tvV.push(nm)
+      monoTvTyLast(tvN, tvT, t)
+      if t >= 0 && !strListHas(monoExplicitBN, tp) {
+        monoExplicitBN.push(tp)
+        monoExplicitBT.push(t)
+      }
+      monoKeyExtra = monoKeyExtra + tp + "=" + nm + ";"
+    }
+  }
+  0
+}
+
+// Whether parameter node `p` carries no annotation.
+function monoParamUnannotated(p: i32): boolean {
+  const pn = nodeAt(p)
+  pn is Param && pn.parType < 0
 }
 
 function monoBindTyParamDefault(
@@ -20420,6 +20469,7 @@ function monoLetTyParamMisfit(
   params: i32[],
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
   pinTys: i32[],
 ): i32 {
   const stack: i32[] = [fn.fnBody]
@@ -20430,7 +20480,7 @@ function monoLetTyParamMisfit(
       if n is LetDecl && n.letType >= 0 && n.letInit >= 0 {
         let j = 0
         while j < params.length && j < pinTys.length {
-          if monoLetSeedMisfits(fn, n, params[j], pinTys[j], tvN, tvV) {
+          if monoLetSeedMisfits(fn, n, params[j], pinTys[j], tvN, tvV, tvT) {
             fsAskTyParam(params[j])
             return emitFail(
               "emitProgram: monomorphize: `"
@@ -20453,7 +20503,7 @@ function monoLetTyParamMisfit(
 // Whether binding `n`, annotated bare with a type parameter of `fn`, is seeded by a read of
 // parameter `pd`, annotated bare with another, pinned at function type `pinTy`, and the two
 // type parameters bind different instances; or `pd` is un-annotated and the binding's type
-// parameter took the unbound default (D6760).
+// parameter took the unbound default or a type other than `pd`'s pin (D6760).
 function monoLetSeedMisfits(
   fn: FuncDecl,
   n: LetDecl,
@@ -20461,6 +20511,7 @@ function monoLetSeedMisfits(
   pinTy: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ): boolean {
   const v = unwrapParen(n.letInit)
   if v < 0 || !(nodeAt(v) is Ident) || identDeclOf(v) != pd { return false }
@@ -20469,9 +20520,15 @@ function monoLetSeedMisfits(
   const pn = nodeAt(pd)
   if !(tn is TypeRef) || !(pn is Param) { return false }
   if pn.parType < 0 {
-    return strListHas(fn.fnTyParams, tn.tyName)
-      && monoBindOf(tvN, tvV, tn.tyName) == MONO_UNBOUND_TY_PARAM_DEFAULT
-      && (pinTy < 0 || monoPinIsFnTy(pinTy))
+    if (
+      !strListHas(fn.fnTyParams, tn.tyName)
+      || pinTy >= 0 && !monoPinIsFnTy(pinTy)
+    ) {
+      return false
+    }
+    const bt = monoBindTyOf(tvN, tvT, tn.tyName)
+    return monoBindOf(tvN, tvV, tn.tyName) == MONO_UNBOUND_TY_PARAM_DEFAULT
+      || bt >= 0 && pinTy >= 0 && !tySame(bt, pinTy)
   }
   const pt = nodeAt(pn.parType)
   if !(pt is TypeRef) || pt.tyName == tn.tyName { return false }
@@ -22310,6 +22367,16 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         cbFnNames.push(monoSpecializableCallbackName(args[ci], ctx))
         ci = ci + 1
       }
+      monoBindSeededTyParams(
+        fn,
+        monoOrigNode[origFe],
+        callIx,
+        pinned,
+        pinTys,
+        tvN,
+        tvV,
+        tvT,
+      )
       monoDefaultUnboundTyParams(
         fn.fnTyParams,
         fn.fnParams,
@@ -22318,7 +22385,9 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         tvT,
         fn.fnBody,
       )
-      if monoLetTyParamMisfit(fn, params, tvN, tvV, pinTys) < 0 { return -1 }
+      if monoLetTyParamMisfit(fn, params, tvN, tvV, tvT, pinTys) < 0 {
+        return -1
+      }
       callBindShadowNote(callIx, fn.fnName, fn.fnTyParams, tvN, tvV)
       monoExactPinTys(pinTys, ctx)
       const pinKinds: i32[] = []
