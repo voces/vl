@@ -82,9 +82,12 @@ signature, carried as one value.
   yet, so the seed is byte-identical.
 - (b) The bundle. `monoPinHoleParam` decides, and the callee reads fields. Graded on D14841's
   grading list with the split plan off.
-  First slice (2026-11-02): a lambda literal written at a direct call, outside an instanced
-  body, to a parameter read only as a callee and bound to lambdas alone. The emitter's half is
-  `compiler/emit_bundle.vl`; the row answers each field. The rest of the scope is D14841's.
+  First slice (2026-11-02): a lambda literal written at a direct call, to a parameter read only as
+  a callee and bound to lambdas alone. The emitter's half is `compiler/emit_bundle.vl`; the row
+  answers each field. A lambda in an instanced body is admitted by the elaboration taking a
+  bundle pin at the call's own instance, so every encloser shares the callee. The written-let
+  bundle is not built (coordinator, 2026-11-02): D14841 grades the 15 W-lam files that would need
+  it, and none qualifies under the binding conditions above.
 - (c) The delivery token reads the row (step7's half).
 
 ### Matrix
@@ -229,6 +232,14 @@ shared row names.
      The binding is bundled, and the creation site its closures come from is `k`, which reaches
      the binding through `mk`'s result. Finding it is the delivery token (this half); holding two
      closures is the bundle. The file needs both, and lands after (b) and (c).
+     Measured 2026-11-02, one program per function, split plan off: 8 of its 10 shapes already
+     run, `const a = mk()` with `a(1)` and `a("s")` among them. A named generic crossing a
+     maker's result is the tagged set's id and each call dispatches through its arms, so those
+     need neither the bundle nor the token. Two refuse: `valueRead`, where one use of `mk` closes
+     its result's signature (`const h: () => (x: i32) => i32 = mk`) beside a use the tag serves,
+     which needs a maker instance per demanded result signature (the elaboration's, coordinator
+     ruling 2026-11-02); and `local`, a maker nested in a function, which is not tagged (D14940,
+     step 4 γ).
    - `block-local-maker-of-generic-in-generic-body-at-two-types.vl` is not a bundle. Each
      instance of `g` calls `a` at one signature, so it is one closure per INSTANCE. Its creation
      site, the read of `k` in `mk`, sits in a function nested in `g`, whose one body serves both
