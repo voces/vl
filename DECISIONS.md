@@ -10443,6 +10443,19 @@ block, and the message is still the bounds trap. Against the branch alone: rever
 sunpa's `track` 121.1 → 121.6 ms on V8, where `select` reads 150.8. The price is `struct-soa`
 on wasmtime, +5%. All variants and benches are in D4782.
 
+
+## An optimized build's `unreachable` banner names what it may stand for (owner ruling (c), 2026-11-02) — D3723
+
+**The rule.** At `-O`/`-O3` binaryen may prove that a trap always fires (an index into a list it
+knows is empty) and fold it into `unreachable`. The trap's kind is then gone from the module, so
+`vl run`'s banner for an `unreachable` says, after "a compiler-emitted trap", that an optimized
+build also stops this way where another trap always fires, such as an out-of-range index or a
+failed `as`. An unoptimized build keeps naming the index.
+
+**Why not exact.** Naming the folded trap's own kind needs the module to carry it: one kept trap
+function per kind (wasm-opt `--no-inline`) or a source-map row read at the trap. Both cost bytes or
+a flag the default build does not pass. That is backlogged in ROADMAP.md.
+
 ## `u32` and `u64` are value types (owner rulings U1–U4, 2026-10-03 and 2026-10-04)
 
 **VL gets `u32` and `u64` (U1 = A, 2026-10-03).** They are value types beside `i32` and
