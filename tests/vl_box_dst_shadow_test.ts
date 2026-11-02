@@ -7,8 +7,8 @@
 //
 // TWO HALVES, each needed for the other to mean anything:
 //
-//   classes — witnesses whose deliveries land in each class, with exact counts. `brk` is a
-//             producer gap (a `break` value gets no record) and flips the day it is closed.
+//   classes — witnesses whose deliveries land in each class, with exact counts. `brk` reaches
+//             the record through the loop's exits; its minted `__trap__()` tail never returns.
 //   fires   — `boxDstDropSet(1)` reads no record, so every agreement becomes a missing row;
 //             `boxDstDropSet(2)` reads a type no site names, so every agreement disagrees.
 //             Without these a shadow that stopped reading the record would pass.
@@ -92,7 +92,7 @@ const ELEM = `const xs = [1, "two"]
 for x in xs { print(x) }
 `;
 
-// A loop's `break` values, delivered to a union binding: no record yet.
+// A loop's `break` values, delivered to a union binding through the loop's exits.
 const BRK = `function pick(n: i32): i32 | string {
   let i = 0
   const v: i32 | string = while true {
@@ -113,10 +113,10 @@ Deno.test({
 });
 
 Deno.test({
-  name: "box-dst shadow: a literal adopted into an arm records the alias, not the arm",
+  name:
+    "box-dst shadow: a literal adopted into an arm records the alias, not the arm",
   ignore,
-  fn: () =>
-    expectRows("arm", ARM, DROP_NONE, "agree=2; value already a box=1"),
+  fn: () => expectRows("arm", ARM, DROP_NONE, "agree=2; value already a box=1"),
 });
 
 Deno.test({
@@ -126,20 +126,27 @@ Deno.test({
 });
 
 Deno.test({
-  name: "box-dst shadow: a break value has no record (producer gap)",
+  name: "box-dst shadow: a break value takes its loop's union",
   ignore,
   fn: () =>
-    expectRows("brk", BRK, DROP_NONE, "no record=3; value already a box=2"),
+    expectRows(
+      "brk",
+      BRK,
+      DROP_NONE,
+      "agree=2; value already a box=2; value never returns=1",
+    ),
 });
 
 Deno.test({
-  name: "box-dst shadow: reading no record turns every agreement into a missing row",
+  name:
+    "box-dst shadow: reading no record turns every agreement into a missing row",
   ignore,
   fn: () => expectRows("arg", ARG, DROP_READ, "no record=2"),
 });
 
 Deno.test({
-  name: "box-dst shadow: reading another type turns every agreement into a disagreement",
+  name:
+    "box-dst shadow: reading another type turns every agreement into a disagreement",
   ignore,
   fn: () => expectRows("arg", ARG, DROP_AS_OTHER, "disagree=2"),
 });

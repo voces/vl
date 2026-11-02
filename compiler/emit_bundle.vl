@@ -1,0 +1,93 @@
+// The bundle (D14841): a lambda a hole parameter calls at two or more signatures is handed as one
+// anonymous record holding a closure per signature, field `c<k>` the closure at the `k`th. Mono
+// decides a bundle and notes it here, by the instance parameter's annotation node; the emitter
+// asks it at the delivery and at each call through the parameter.
+import { FuncDecl, Ident, Param, nodeAt } from "./ast"
+import { widenLitTy } from "./check_relate_core"
+import { T, TyFunc, tyAt, tySame } from "./check_types"
+import { nodeTyAt } from "./emit_capture_frames"
+import { unwrapParen } from "./emit_base"
+import { declaredSlotOf } from "./emit_struct_order"
+import { identDeclOf } from "./symbols"
+
+// The signatures each bundle parameter's annotation node holds.
+let bundleParamSigs: {[i32]: i32[]} = Map()
+
+export function bundleReset() {
+  bundleParamSigs = Map()
+  0
+}
+
+// Notes that the instance parameter annotated by node `parType` holds a bundle of `sigs`.
+export function bundleParamNote(parType: i32, sigs: i32[]) {
+  if parType >= 0 { bundleParamSigs[parType] = sigs }
+  0
+}
+
+// The signatures bundle parameter `par` holds; none for any other parameter.
+export function bundleSigsOfParam(par: i32): i32[] {
+  const p = nodeAt(par)
+  if !(p is Param) || p.parType < 0 { return [] }
+  bundleParamSigs.get(p.parType) ?? []
+}
+
+// The bundle parameter of function `fnIx` the read `x` names, or -1 where it names none. The
+// read is the template's; the parameter is matched by name in the instance.
+export function bundleParamOfRead(x: i32, fnIx: i32): i32 {
+  const cfx = unwrapParen(x)
+  if cfx < 0 || fnIx < 0 || declaredSlotOf(cfx) >= 0 { return -1 }
+  const r = nodeAt(cfx)
+  const d = identDeclOf(cfx)
+  const fn = nodeAt(fnIx)
+  if !(r is Ident) || d < 0 || !(nodeAt(d) is Param) || !(fn is FuncDecl) {
+    return -1
+  }
+  for par in fn.fnParams {
+    const p = nodeAt(par)
+    if p is Param {
+      if p.parName == r.identName {
+        return if bundleSigsOfParam(par).length > 0 { par } else { -1 }
+      }
+    }
+  }
+  -1
+}
+
+// The field index `k` the call through bundle parameter `par` with arguments `args`, in function
+// `fnIx`, reads: the first signature taking the arguments' types, or -1 for none.
+export function bundleFieldOfCall(par: i32, args: i32[], fnIx: i32): i32 {
+  const sigs = bundleSigsOfParam(par)
+  let k = 0
+  while k < sigs.length {
+    const f = tyAt(sigs[k])
+    if f is TyFunc {
+      if f.fnParamTypes.length == args.length {
+        let ok = true
+        let j = 0
+        while j < args.length {
+          const at = nodeTyAt(args[j], fnIx)
+          if (
+            at < 0
+            || at >= T.tys.length
+            || !tySame(widenLitTy(at), f.fnParamTypes[j])
+          ) {
+            ok = false
+          }
+          j = j + 1
+        }
+        if ok { return k }
+      }
+    }
+    k = k + 1
+  }
+  -1
+}
+
+// The signature the call `c` through a bundle parameter reads in function `fnIx`, or -1 where
+// its callee holds no bundle or no signature takes its arguments.
+export function bundleCallSig(callFn: i32, args: i32[], fnIx: i32): i32 {
+  const par = bundleParamOfRead(callFn, fnIx)
+  if par < 0 { return -1 }
+  const k = bundleFieldOfCall(par, args, fnIx)
+  if k < 0 { -1 } else { bundleSigsOfParam(par)[k] }
+}
