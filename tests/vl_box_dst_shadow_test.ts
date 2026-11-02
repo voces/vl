@@ -220,6 +220,17 @@ print(bump(c, false) ?? -1)
 print(inFor(2) ?? -5)
 `;
 
+// A list literal with a spread infers a union element: each element beside the spread is
+// delivered to it.
+const SPREAD = `function run(xs: (boolean | null)[], ys: i32[]) {
+  const u = [...xs, 5]
+  print(u.length)
+  const v = [...ys, "s"]
+  print(v.length)
+}
+run([true, null], [1])
+`;
+
 // A value whose own join is a union, delivered where nothing boxes it: a generic's tail value
 // `if` at an instance whose arms join apart, and a loop's exits under a `??` that unwraps it.
 const OWNJOIN = `function lit<A, B>(k: i32, a: A, b: B) {
@@ -361,6 +372,13 @@ Deno.test({
       DROP_NONE,
       "agree=3; nested agree=4; nested value already a box=1; nested value never returns=2; value already a box=4",
     ),
+});
+
+Deno.test({
+  name: "box-dst shadow: an element beside a spread takes the list's element union",
+  ignore,
+  fn: () =>
+    expectRows("spread", SPREAD, DROP_NONE, "agree=2; nested agree=2"),
 });
 
 Deno.test({
