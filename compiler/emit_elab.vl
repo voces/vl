@@ -3263,15 +3263,23 @@ function elabListParamSource(d: i32, fn: FuncDecl): i32 {
 }
 
 // The parameter of `fn` that binding `d` copies: an un-annotated `const` initialised by a read
-// of it, which nothing writes; -1 otherwise.
+// of it or of such a copy, at most 8 deep, which nothing writes; -1 otherwise.
 function elabConstParamCopy(d: i32, fn: FuncDecl): i32 {
-  if d < 0 || d >= P.nodes.length { return -1 }
-  const ln = nodeAt(d)
-  if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return -1 }
-  const v = parenPeelIx(ln.letInit)
-  if v < 0 || !(nodeAt(v) is Ident) { return -1 }
-  const src = identDeclOf(v)
-  if i32ListHas(fn.fnParams, src) { src } else { -1 }
+  let cur = d
+  let hops = 0
+  while hops < 8 {
+    if cur < 0 || cur >= P.nodes.length { return -1 }
+    const ln = nodeAt(cur)
+    if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return -1 }
+    const v = parenPeelIx(ln.letInit)
+    if v < 0 || !(nodeAt(v) is Ident) { return -1 }
+    const src = identDeclOf(v)
+    if i32ListHas(fn.fnParams, src) { return src }
+    // A copy of a copy reads the parameter too (D15051).
+    cur = src
+    hops = hops + 1
+  }
+  -1
 }
 
 // Whether the `const` copy `d` of parameter `pd` is read only as an element of list literals
@@ -3285,10 +3293,14 @@ function elabCopyOnlyListed(d: i32, fn: FuncDecl, pd: i32): boolean {
     const p = par.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
       if nodeAt(x) is Ident && identDeclOf(x) == d {
+        // A further `const` copy read only in such literals is such a read too (D15051).
+        const chained = p >= 0
+          && nodeAt(p) is LetDecl
+          && elabConstParamCopy(p, fn) == pd
+          && elabCopyOnlyListed(p, fn, pd)
         if (
-          p < 0
-          || !(nodeAt(p) is ArrayLit)
-          || !elabListLitOfParam(p, fn, pd)
+          !chained
+          && (p < 0 || !(nodeAt(p) is ArrayLit) || !elabListLitOfParam(p, fn, pd))
         ) {
           return false
         }
