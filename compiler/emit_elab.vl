@@ -143,6 +143,7 @@ import {
   fnTagMembers,
   fnTagOwnTyParamAlone,
   fnTagOwnTyParamShared,
+  fnTagParamCopyOf,
   fnTagSetIsTagged,
   fnTagSetOfTy,
   fnTagSetTy,
@@ -2747,10 +2748,21 @@ function elabRetHandsBack(decl: i32, ix: i32, i: i32): boolean {
   if !(dn is FuncDecl) || dn.fnBody < 0 { return false }
   const vs: i32[] = []
   collectRetValues(dn.fnBody, vs)
+  const rets: i32[] = []
   for v in vs {
     if parenPeelIx(v) == ix { return true }
+    rets.push(parenPeelIx(v))
   }
-  false
+  // So is the seed of a returned copy of the parameter (`elabCopySeedsNote`).
+  for r in rets.slice(0) {
+    if r >= 0 && nodeAt(r) is Ident {
+      const cd = identDeclOf(r)
+      if cd >= 0 && fnTagParamCopyOf(dn, cd) == dn.fnParams[i] {
+        elabCopySeedsNote(cd, rets)
+      }
+    }
+  }
+  i32ListHas(rets, ix)
 }
 
 // Each declared function → the parameter every value it returns reads, else -1; a property of
@@ -2765,7 +2777,11 @@ function elabHandBackIx(decl: i32, dn: FuncDecl): i32 {
   collectRetValues(dn.fnBody, vs)
   for v in vs {
     const x = parenPeelIx(v)
-    const i = if x >= 0 && nodeAt(x) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(x)) } else { -1 }
+    let i = if x >= 0 && nodeAt(x) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(x)) } else { -1 }
+    // A returned `const` copy of a parameter hands that parameter back.
+    if i < 0 && x >= 0 && nodeAt(x) is Ident {
+      i = i32ListIndexOf(dn.fnParams, fnTagParamCopyOf(dn, identDeclOf(x)))
+    }
     if i < 0 || at >= 0 && i != at {
       elabHandBackMemo[decl] = -1
       return -1
@@ -2774,19 +2790,30 @@ function elabHandBackIx(decl: i32, dn: FuncDecl): i32 {
   }
   // A parameter read any other way (called, stored, handed on, captured) reaches a place that
   // holds a closure, so only a parameter whose every read is a returned value is handed back.
-  if at >= 0 && !elabParamOnlyReturned(dn.fnBody, dn.fnParams[at], vs) {
-    at = -1
-  }
+  if at >= 0 && !elabParamOnlyReturned(dn, dn.fnParams[at], vs) { at = -1 }
   elabHandBackMemo[decl] = at
   at
 }
 
 // Whether every read of parameter `par` in `body`, nested functions included, is one of the
 // returned values `vs`.
-function elabParamOnlyReturned(body: i32, par: i32, vs: i32[]): boolean {
+function elabParamOnlyReturned(fn: FuncDecl, par: i32, vs: i32[]): boolean {
   const rets: i32[] = []
   for v in vs { rets.push(parenPeelIx(v)) }
-  const todo: i32[] = [body]
+  // The seed of a returned copy of `par` reads it as the returned value does.
+  for r in rets.slice(0) {
+    if r >= 0 && nodeAt(r) is Ident {
+      const cd = identDeclOf(r)
+      if (
+        cd >= 0
+        && fnTagParamCopyOf(fn, cd) == par
+        && elabCopyOnlyReturned(fn.fnBody, cd, rets)
+      ) {
+        elabCopySeedsNote(cd, rets)
+      }
+    }
+  }
+  const todo: i32[] = [fn.fnBody]
   const reads: i32[] = []
   while todo.length > 0 {
     const x = todo.pop() ?? -1
@@ -2805,6 +2832,37 @@ function elabParamOnlyReturned(body: i32, par: i32, vs: i32[]): boolean {
     if !i32ListHas(rets, r) { return false }
   }
   true
+}
+
+// Whether every read of binding `d` in `body` is one of `rets`.
+function elabCopyOnlyReturned(body: i32, d: i32, rets: i32[]): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == d && !i32ListHas(rets, x) {
+        return false
+      }
+      for k in nodeChildren(x) { todo.push(k) }
+    }
+  }
+  true
+}
+
+// Pushes onto `out` the seed read of copy `d` and of each copy it is seeded from in turn.
+function elabCopySeedsNote(d: i32, out: i32[]) {
+  let x = d
+  let hops = 0
+  while hops < 8 && x >= 0 && x < P.nodes.length {
+    hops = hops + 1
+    const n = nodeAt(x)
+    if !(n is LetDecl) || n.letInit < 0 { return 0 }
+    const v = parenPeelIx(n.letInit)
+    if v < 0 || !(nodeAt(v) is Ident) { return 0 }
+    out.push(v)
+    x = identDeclOf(v)
+  }
+  0
 }
 
 // Pushes onto `out` each positional argument of call `c` to a declared function that lands in
