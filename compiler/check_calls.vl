@@ -97,6 +97,7 @@ import {
   elabHoleRowMark,
   elabPinBindingIs,
   elabValueRowNote,
+  fnLetOpenHandNote,
   fnTagChoiceOfTy,
   fnTagMembers,
   fnTagSetOfTy,
@@ -336,6 +337,7 @@ import {
   holeSetCallRetOf,
   holeSlotCallRets,
   judgeHoleCallOps,
+  setMemberRetAt,
   substTyDeep,
   substTyDeepOf,
   tErr,
@@ -424,6 +426,7 @@ import {
   TyVar,
   mkArrayTy,
   mkArrayViewTy,
+  mkFuncTy,
   mkMapTy,
   mkNullableTy,
   mkObjTy,
@@ -1774,6 +1777,11 @@ function callFtyCheckArg(
   seedExpected(args[i], seedTy)
   if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
   let at = checkNodeHook(args[i])
+  // A widened `let` handed to a parameter whose function type the callee leaves open is bound to
+  // its whole set in each instance of the callee.
+  if tyIsHole(params[i]) || tyHasTyVar(params[i]) && tyAt(params[i]) is TyFunc {
+    fnLetOpenHandNote(parenPeelIx(args[i]))
+  }
   // A function value at a hole the callee hands on to a generic's union-result function
   // parameter is delivered at that parameter's bound type (D10210).
   if tyIsHole(params[i]) && cfn is Ident {
@@ -1809,6 +1817,8 @@ function callFtyCheckArg(
       return TY_ERR
     }
   }
+  // A set's value binds a function parameter's result from every member's (W-hand slice 2).
+  bindSetArgResult(params[i], args[i], at, bNames, bTys)
   // Bind every TyVar reachable in the expected param position from the
   // argument's shape (first use wins), then check the argument against the
   // SUBSTITUTED expected type — a later disagreeing use errors here.
@@ -4135,4 +4145,38 @@ function litArgLast(params: i32[], args: i32[], i: i32): boolean {
     j = j + 1
   }
   true
+}
+
+// Binds the result type parameter of function parameter `pt` from what argument `arg` of type
+// `at` returns at `pt`'s bound parameter types: each member's of a set, or a named generic's own,
+// before the walk would bind it to that function's own type parameter.
+function bindSetArgResult(
+  pt: i32,
+  arg: i32,
+  at: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  if pt < 0 || at < 0 || !(tyAt(pt) is TyFunc) { return 0 }
+  const s = fnTagSetOfTy(at)
+  const many = s >= 0 && fnTagMembers(s).length > 1
+  const ad = if many { -1 } else { identFnDeclOf(parenPeelIx(arg)) }
+  const an = if ad >= 0 && ad < P.nodes.length { nodeAt(ad) } else { nodeAt(0) }
+  const gen = ad >= 0 && an is FuncDecl && an.fnTyParams.length > 0
+  if !many && !gen { return 0 }
+  const pf = tyAt(pt)
+  if !(pf is TyFunc) || pf.fnRet < 0 { return 0 }
+  const rv = tyAt(pf.fnRet)
+  if !(rv is TyVar) || bindOf(bNames, bTys, rv.tvName) >= 0 { return 0 }
+  const pts: i32[] = []
+  for p in pf.fnParamTypes {
+    const b = substTyDeep(p, bNames, bTys)
+    if b < 0 || tyHasTyVar(b) || tyIsHole(b) { return 0 }
+    pts.push(b)
+  }
+  const r = if many { holeSetCallRetOf(-1, s, pts, false) } else { setMemberRetAt(ad, mkFuncTy(pts, TY_I32)) }
+  if r < 0 || tyHasTyVar(r) || tyIsHole(r) { return 0 }
+  bNames.push(rv.tvName)
+  bTys.push(r)
+  0
 }

@@ -797,11 +797,19 @@ export function fnLetReadTyOf(bd: i32): i32 { fnLetReadTy[bd] ?? -1 }
 let fnLetSet: {[i32]: i32} = Map()
 let fnSlotSet: {[i32]: i32} = Map()
 
+// Set while the global-init pre-pass types a module binding's initializer: the function set that
+// initializer yields is a fact a body checked before the binding reads (D6000), so it is recorded
+// although the pre-pass's other types do not stand.
+export let globalInitRecordsFnSets = false
+export function globalInitRecordsFnSetsSet(v: boolean) {
+  globalInitRecordsFnSets = v
+}
+
 // Whether a value of function type `t` read now still decides `t`'s set. Only an open signature
 // needs one, since a closed one keys an instance by its spelling, and a quiet probe's types do
 // not stand.
 export function elabFnValWanted(t: i32): boolean {
-  if !stampsStand() { return false }
+  if !stampsStand() && !globalInitRecordsFnSets { return false }
   if t < 0 { return false }
   tyHasTyVar(t)
 }
@@ -1585,6 +1593,13 @@ let fnTagEtaRan = false
 let fnLetWide: i32[] = []
 let fnLetWideAt: i32[] = []
 let fnSlotWide: i32[] = []
+// The widened `let` reads this check handed to an open function parameter, and their `let`s: the
+// callee's instances bind that parameter to the set, which only the decision after them sees.
+let fnLetOpenHands: i32[] = []
+let fnLetOpenHandBds: i32[] = []
+// The `let`s a delivery to a closed function type reads, whose adapter only the first decision's
+// tag builds.
+let fnLetEscBds: i32[] = []
 // The list bindings `elabFnListLetTy` widened in this check.
 let fnListWidened: i32[] = []
 let fnSlotWideAt: i32[] = []
@@ -1722,6 +1737,9 @@ export function fnTyFactsReset() {
   fnLetReadTy = Map()
   fnLetWide = []
   fnLetWideAt = []
+  fnLetOpenHands = []
+  fnLetOpenHandBds = []
+  fnLetEscBds = []
   fnSlotWide = []
   fnSlotWideAt = []
   fnListWidened = []
@@ -1738,6 +1756,9 @@ export function fnTagEtaReset() {
   fnTagEscapeDsts = []
   fnLetWide = []
   fnLetWideAt = []
+  fnLetOpenHands = []
+  fnLetOpenHandBds = []
+  fnLetEscBds = []
   fnSlotWide = []
   fnSlotWideAt = []
   fnListWidened = []
@@ -1749,6 +1770,8 @@ export function fnTagEtaReset() {
 // destination type `ty` carries is tagged.
 export function fnTagEscapeNote(site: i32, ty: i32, dst: i32) {
   if fnTagEtaRan { return }
+  const bd = identDeclOf(parenPeelIx(site))
+  if bd >= 0 && !i32ListHas(fnLetEscBds, bd) { fnLetEscBds.push(bd) }
   fnTagEscapes.push(site)
   fnTagEscapeTys.push(ty)
   fnTagEscapeDsts.push(dst)
@@ -1814,6 +1837,23 @@ export function fnTagEtaWant(site: i32, s: i32): boolean {
   true
 }
 
+// Notes `site`, a read handed to a function parameter whose type is still open at the call, when
+// it reads a `let` this check widened.
+export function fnLetOpenHandNote(site: i32) {
+  const bd = identDeclOf(site)
+  if bd < 0 || (fnLetReadTy[bd] ?? -1) < 0 || i32ListHas(fnLetOpenHands, site) {
+    return 0
+  }
+  fnLetOpenHands.push(site)
+  fnLetOpenHandBds.push(bd)
+  0
+}
+
+// Whether read `site` of a widened `let` is handed to an open function parameter.
+export function fnLetOpenHandAt(site: i32): boolean {
+  i32ListHas(fnLetOpenHands, site)
+}
+
 // Whether `t` is the type a `let` written with other functions than its initialiser gives its reads.
 export function fnLetIsWide(t: i32): boolean { i32ListHas(fnLetWide, t) }
 
@@ -1823,7 +1863,12 @@ export function fnTagEtaAgain(): boolean {
   if fnTagEtaRan { return false }
   let i = 0
   while i < fnLetWide.length && i < fnLetWideAt.length {
-    if !fnTagTyIsTagged(fnLetWide[i]) { fnLetVeto.push(fnLetWideAt[i]) }
+    // A `let` handed to an open parameter is decided after the elaboration, which instances the
+    // callee with that parameter bound to the whole set, unless a closed delivery needs it built.
+    const bd = fnLetWideAt[i]
+    const late = i32ListHas(fnLetOpenHandBds, bd)
+      && !i32ListHas(fnLetEscBds, bd)
+    if !fnTagTyIsTagged(fnLetWide[i]) && !late { fnLetVeto.push(bd) }
     i = i + 1
   }
   i = 0
