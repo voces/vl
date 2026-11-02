@@ -1149,6 +1149,8 @@ import {
   tailIsValueOrNever,
 } from "./emit_fn_scans"
 import {
+  SPREAD_NUL_NONE,
+  SPREAD_NUL_REF,
   chainHasPrelude,
   exprIsNullLike,
   fnTagIdSlot,
@@ -1166,6 +1168,7 @@ import {
   spreadGroupWrapSlot,
   spreadLitElemRow,
   spreadSrcBoxAtom,
+  spreadSrcNulMode,
   structEqStashSlot,
   unionEqArmSlot,
   unionEqStashSlot,
@@ -11998,7 +12001,12 @@ function emitSpreadGroupBoxed(
   if emitSpreadGroup(body, grp, fnIx, pendingKindOfMf(k, 0), 0) < 0 {
     return -1
   }
-  emitScalarListBoxTop(spreadScalarVKind(k), ak, row)
+  emitScalarListBoxTop(
+    spreadScalarVKind(k),
+    ak,
+    row,
+    spreadSrcNulMode(grp, fnIx),
+  )
 }
 
 // One list operand `g` of a spread literal or a widening concat: a list literal is built at
@@ -28000,7 +28008,13 @@ function scalarBoxWidenOp(srcKind: VKind, atomK: i32): i32 {
 // Consume a scalar list of `srcKind` on the stack and leave a `(ref $rlWrapIdx[dstSlot])` whose
 // union-box elements each hold one source element under value atom `atomK`'s tag: the boxing
 // sibling of `emitScalarListWidenTop`, for a spread into a list of a union element (D2869).
-function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
+// `nul` (`SPREAD_NUL_*`) says how a source element is null; it lands as the union's null box.
+function emitScalarListBoxTop(
+  srcKind: VKind,
+  atomK: i32,
+  dstSlot: i32,
+  nul: i32,
+) {
   const conv = scalarBoxWidenOp(srcKind, atomK)
   if conv == -2 {
     return emitFail(
@@ -28035,14 +28049,33 @@ function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
   // block { loop { if i >= n br 1; back[i] = {tag, box(src.back[i])}; i++; br 0 } }
   fbLocalGet(dL)
   fbLocalGet(iL)
+  if nul != SPREAD_NUL_NONE {
+    fbLocalGet(sL)
+    fbStructGet(srcWrap, 0)
+    fbLocalGet(iL)
+    fbArrayGet(srcBack)
+    if nul == SPREAD_NUL_REF {
+      fbRefIsNull()
+    } else {
+      fbRefNullOfKind("nulbool", -1)
+      fbI32Bin(70) // i32.eq
+    }
+    fbIfRef(uBoxIdx)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    fbElse()
+  }
   fbI32Rel(RS_TAG, scalarTagOfKind(atomK))
   fbLocalGet(sL)
   fbStructGet(srcWrap, 0)
   fbLocalGet(iL)
   fbArrayGet(srcBack)
+  if nul == SPREAD_NUL_REF { fbRefAsNonNull() }
   if conv >= 0 { wU8(conv) }
   if vb >= 0 { fbStructNew(vb) }
   fbStructNew(uBoxIdx)
+  if nul != SPREAD_NUL_NONE { fbEnd() }
   fbArraySet(dstBack)
   emitCopyLoopClose(iL, dL, nL, dstWrap)
   0
