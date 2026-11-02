@@ -204,6 +204,8 @@ const p: P | null = { n: 21 }
 print(p?.twice() ?? 0)
 const r = p?.twice()
 print(r ?? -1)
+`;
+
 // A function's tail `if` ending in a field write yields the write's value or `null`, and a
 // loop's value is a labelled block's: each read the rewrite yields in their place takes the
 // value's record.
@@ -331,6 +333,10 @@ Deno.test({
       OPTCALL,
       DROP_NONE,
       "nested agree=8; nested value already a box=1; value already a box=2",
+    ),
+});
+
+Deno.test({
   name: "box-dst shadow: a spilled tail's read takes the value's record",
   ignore,
   fn: () =>
