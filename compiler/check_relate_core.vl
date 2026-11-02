@@ -372,11 +372,13 @@ import {
   nullParamBesideBare,
   paramHoleName,
   paramJoinDropsNull,
+  paramOnlyUnion,
   sameDeclaredTyParam,
   tpArmJoinDepth,
   tpGradualView,
   tpJoinUnions,
   tpOpenJoin,
+  tpParamLitJoins,
   tvElseBase,
   tyIsDeferredJoin,
   tyIsGradualParam,
@@ -1784,6 +1786,11 @@ export function joinTys(a: i32, b: i32) {
     noteHoleTpJoin(td)
     return td
   }
+  // A written union of declared parameters beside a concrete type keeps the two apart (D3618).
+  if !aVar && !bVar {
+    const pw = paramUnionBesideConcrete(a, b)
+    if pw >= 0 { return pw }
+  }
   // Such a union absorbs only its own members: its parameter member is assignable from
   // anything, which would fold `T | string` beside `T | i32` to the first (D3212).
   if tpJoinUnions.length > 0 && !aVar && !bVar {
@@ -1866,6 +1873,26 @@ export function joinTys(a: i32, b: i32) {
   const kept = joinVariantTys(a, b)
   njNoFieldwise = false
   kept
+}
+
+// The join of a written union of declared parameters and a concrete type, kept apart; -1 for
+// any other pair.
+function paramUnionBesideConcrete(a: i32, b: i32): i32 {
+  let u = a
+  let c = b
+  if !paramOnlyUnion(a) {
+    u = b
+    c = a
+  }
+  if !paramOnlyUnion(u) || c < 0 || c >= T.tys.length { return -1 }
+  if tyHasTyVar(c) || isNullTy(c) || c == TY_VOID || tyBearsNull(c) {
+    return -1
+  }
+  const tc = joinVariantTys(u, c)
+  tpJoinUnions[tc] = 1
+  tpParamLitJoins[tc] = u
+  noteHoleTpJoin(tc)
+  tc
 }
 
 // The join of a function type over inference holes and a closed one that fits it either
@@ -7970,6 +7997,11 @@ function substRejoinApart(
     if recorded { carryRetJoin(r, key, vals) }
     return r
   }
+  const pl = tpParamLitJoins.get(tyIx)
+  if pl != null && !recorded && (tpJoinUnions.get(tyIx) ?? 0) == 1 {
+    const pj = paramLitRejoin(tyIx, pl, ms)
+    if pj >= 0 { return pj }
+  }
   const tpSaved = tpApartConcrete
   tpApartConcreteSet(true)
   njRejoinApartSet((tpJoinUnions.get(tyIx) ?? 0) == 2)
@@ -7977,6 +8009,38 @@ function substRejoinApart(
   tpApartConcreteSet(tpSaved)
   if recorded { carryRetJoin(res, key, vals) }
   res
+}
+
+// The pin of join `tyIx` of written union `wu` and a concrete type, members `out` substituted:
+// `wu`'s members re-join apart, as runtime values, and the rest join into them; -1 when the
+// members do not line up with `tyIx`'s.
+function paramLitRejoin(tyIx: i32, wu: i32, out: i32[]): i32 {
+  const t = tyAt(tyIx)
+  const w = tyAt(wu)
+  if !(t is TyUnion) || !(w is TyUnion) || t.uMembers.length != out.length {
+    return -1
+  }
+  const grp: i32[] = []
+  const fixed: boolean[] = []
+  const rest: i32[] = []
+  let i = 0
+  while i < out.length {
+    if i32ListHas(w.uMembers, t.uMembers[i]) {
+      grp.push(out[i])
+      fixed.push(true)
+    } else {
+      rest.push(out[i])
+    }
+    i = i + 1
+  }
+  if grp.length == 0 { return -1 }
+  const tpSaved = tpApartConcrete
+  tpApartConcreteSet(true)
+  njRejoinApartSet(true)
+  let r = rejoinMembers(grp, fixed)
+  for m in rest { r = joinTys(r, m) }
+  tpApartConcreteSet(tpSaved)
+  rejoinDropSubsumed(r)
 }
 
 // `substTyDeep` over nullable `t` at `tyIx`: the inner type substituted, rebuilt only when it changed.
