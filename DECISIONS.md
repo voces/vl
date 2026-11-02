@@ -11445,3 +11445,19 @@ its fields.
 later write could invalidate the narrowing, and when none can, the delivery is fine without a
 copy. It would relax lists and records alike (D14827, whose witness is D14752's original
 spelling).
+
+## A list callback op fixes the length at entry (owner ruling A, 2026-11-02) — D3068
+
+**The rule.** `.map`, `.filter` and `std:array`'s `reduce`, `mapIndexed`, `some` and `every` read
+the list's length once, before the first call. An element the callback pushes is not visited. An
+index the callback cuts off (by a `pop` or a clear) is skipped by `filter`, `reduce`, `some` and
+`every`, and ends `map` and `mapIndexed` with the trap an `xs[i]` read past the length raises.
+The same holds over a readonly view of the list.
+
+**Why.** Before, the core ops fixed the length but read the backing directly, so they returned
+the popped element out of its spare slot, and the std ops re-read the length, so a callback that
+pushed every time never ended (D3068). JavaScript fixes the length and skips, and VL follows it
+except where JavaScript leaves a hole in `map`'s result, which VL has no rep for, so it traps.
+
+**The price.** One length read per step in the core loops. Dropping it where the callback
+provably does not change the list is deferred, the simple case first and the complex one later.
