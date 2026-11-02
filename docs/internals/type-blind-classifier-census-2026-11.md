@@ -26,6 +26,19 @@ below say how many there are.
 
 ## Called only after monomorphize
 
+Three of these answer a rep from syntax, and now read the node's rep at its instance
+(`repOfNode`). Shadowed over 17,630 files before the move, each had 0 disagreements:
+
+| classifier | agree | rep uncovered | what it read before |
+| --- | --- | --- | --- |
+| `exprNulScalarListKind` | 341,859 | 220, where both say none | `exprNulKind`'s ladder |
+| `minMaxKind` | 2,071 | 0 | the recorded float, then `exprIsF32` / `F64` / `I64` of each operand |
+| `callIsArrSlice` | 102 | 0 | `mfRecvKindOf` of the receiver |
+
+The other five are not rep-from-syntax classifiers. `vkNonNullRefTwin` is a VKind table,
+`callLoweredKindOf` the call column, `recBuildRowOf` the checker's record solve,
+`forInVarStructIdx` a loop variable's slot, and `mapRetExprShape` a return value's map shape.
+
 | classifier | lines | call sites | calls before monomorphize (files) | calls after (files) |
 | --- | --- | --- | --- | --- |
 | `mapRetExprShape` | 51 | 1 | 0 (0) | 8 (3) |
