@@ -390,6 +390,14 @@ print(k.r)
 if u is J { print(u.r ?? 0) }
 `;
 
+// D14901 class D: a fresh literal delivered at a float record is built at that record, its own
+// record having no row; the result reads the literal's stamp.
+const ROW_NO_OWN_ROW = `type F = { v: f32 }
+function d1() { return { v: -7 } }
+const w1: F = d1()
+print(w1.v / 2)
+`;
+
 // D14902: an un-annotated function whose value is a call's, rebound, is built where that call is,
 // not at the narrow record its callers are stamped at; a generic taking its call reads it there.
 const ROW_CALL_BUILT = `type II = { f: i32 }
@@ -464,6 +472,14 @@ Deno.test({
       DROP_NONE,
       true,
       "kind agree | g=1; kind agree | id=1; kind agree | mk=1; kind agree | r2=1",
+      true,
+    );
+    expectRows(
+      "row no own row",
+      ROW_NO_OWN_ROW,
+      DROP_NONE,
+      true,
+      "kind agree | d1=1",
       true,
     );
   },
