@@ -874,17 +874,32 @@ F's 15 files are four shapes by witness:
   `claude/group-f-wip`.
 - B, 4 files: a hole parameter copied into an un-annotated binding called at two types.
 - C, 8 files: a copy of a parameter into a binding annotated with a type parameter (`let b: F =
-  a1`). Two are served without the plan. One is served by mono pinning the copy at its seed
-  parameter's own pin, which is D6703's shape (`typaram-binding-seeded-from-another-typaram`).
-  The other is served by the elaboration taking a type parameter that names no parameter as
-  agreeing with the parameter its copies seed it from (`param-copied-into-two-type-params-called-apart`).
-  Of the other six, one copies into a record, and one is D6760's un-annotated seed, whose pin
-  route mints a late demand. The other four still refuse and are not yet analysed one by one.
+  a1`). Three are served without the plan. Mono pins a copy at its seed parameter's own pin
+  (`monoCopySeedParam`, `monoLetPinAt`): D6703's shape (`typaram-binding-seeded-from-another-typaram`)
+  and, through a chain of copies of one type parameter whose second parameter keeps its own pin
+  (D6090's rule no longer counting the copies as reads of `F`), `generic-fn-value-two-type-param-params-into-annotated-binding`.
+  The elaboration takes a type parameter that names no parameter as agreeing with the parameter
+  its copies seed it from (`param-copied-into-two-type-params-called-apart`). The other five:
+  - two have D6760's un-annotated seed (`type-param-binding-seeded-from-unannotated-param`,
+    `type-param-seeded-by-copy-result-handed-back`). Pinning the copy there mints a late demand,
+    so they wait on per-parameter pins in the elaboration;
+  - one copies into a record and waits on A's third layer;
+  - one (`param-copied-into-unread-binding-of-other-type-param`) is refused by the flow table's
+    two pins for the parameter (`monoHoleGenManyPins`, D6741), one of them taken by the copy. That
+    table is `fn_flow_shadow.vl`, deleted with the plan, so it waits on that step;
+  - one (`fn-value-param-copied-into-binding-called-at-another-type`) is a written `let` holding
+    either parameter, not a copy. It is handed to the per-frame lane with W-named.
 - D, 1 file: parameters swapped through a recursion (D6240).
 
-The per-parameter pin a copy takes lives in mono (`monoLetPinAt`), because the elaboration binds
-both type parameters to the generic's open signature. Moving per-parameter pins to the
-elaboration is the follow-up, after which the copy's pin becomes an elaboration fact mono reads.
+Per-parameter pins live in mono, because the elaboration binds a function's type parameters to
+the generic's open signature. Moving them to the elaboration is the follow-up. Each mono-side
+pin rule then becomes an elaboration fact mono reads:
+
+- D6090's per-parameter pin for a generic handed to a second `T` parameter (`genPin`,
+  `monoTyParamOnlyBareParams`);
+- a copy of a parameter taking that parameter's pin (`monoCopySeedParam`, `monoLetPinAt`);
+- D6760's un-annotated seed, which waits on this move, since pinning it in mono mints a late
+  demand.
 
 Besides the programs, four kinds of reader ask the plan, and each must lose its question before the files go:
 
