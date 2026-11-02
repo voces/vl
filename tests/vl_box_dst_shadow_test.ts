@@ -267,6 +267,19 @@ print(xs[0].f)
 print(wideJ.f ?? 0)
 `;
 
+// A literal stored into a map before the store that decides the map's wider build: it is built at
+// that build, so its field is boxed at the build's field.
+const STORELIT = `type J = { f: i32 | null }
+function mk() { { f: 4 } }
+const wideJ: J = mk()
+const m = Map()
+m.set("b", { f: 5 })
+m.set("a", mk())
+const x = m.get("b")
+if x != null { print(x.f + 1) }
+print(wideJ.f ?? 0)
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -421,6 +434,13 @@ Deno.test({
   ignore,
   fn: () =>
     expectRows("storewrite", STOREWRITE, DROP_NONE, "agree=2; nested agree=2"),
+});
+
+Deno.test({
+  name: "box-dst shadow: a stored literal's field takes the container's build",
+  ignore,
+  fn: () =>
+    expectRows("storelit", STORELIT, DROP_NONE, "agree=2; nested agree=2"),
 });
 
 Deno.test({
