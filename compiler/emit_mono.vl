@@ -6830,6 +6830,10 @@ function monoRenameGenAliasInit(at: i32, ctx: i32, tpl: string, inst: string) {
 // read by name: a call through one is renamed to the instance it reaches, which must be this
 // instance's own copy of the call (D3887).
 let monoCgcGenAliasNames: string[] = []
+// The bindings among them that are the aliases, and the clone walk's scope over those names: a
+// `+name` once an alias binds it, `-name` once another binding of it does (D4302).
+let monoCgcGenAliasDecls: i32[] = []
+let monoCgcAliasScope: string[] = []
 
 // Whether the annotation at `t` spells a function type, which a binding of a generic's value
 // holds one instance of per enclosing instance (D3926).
@@ -6842,7 +6846,11 @@ function monoInstGenAliasNames(body: i32): string[] {
   const bn: string[] = []
   const bc: i32[] = []
   monoBinderCounts(body, bn, bc)
+  const ln: string[] = []
+  const lc: i32[] = []
+  monoLetBinderCounts(body, ln, lc)
   const out: string[] = []
+  monoCgcGenAliasDecls = []
   // An alias of an alias is found once its target is, so a pass that adds a name runs again.
   let grew = true
   let pass = 0
@@ -6861,10 +6869,12 @@ function monoInstGenAliasNames(body: i32): string[] {
             && nodeAt(d.letInit) is Ident
             && (monoCalleeIsGeneric(d.letInit)
               || monoStrListHas(out, monoIdentNameOf(d.letInit)))
-            && monoBinderCount(bn, bc, d.letName) <= 1
-            && !monoStrListHas(out, d.letName)
+            && monoBinderCount(bn, bc, d.letName)
+              == monoBinderCount(ln, lc, d.letName)
+            && !i32ListHas(monoCgcGenAliasDecls, ix)
           ) {
-            out.push(d.letName)
+            monoCgcGenAliasDecls.push(ix)
+            if !monoStrListHas(out, d.letName) { out.push(d.letName) }
             grew = true
           }
         }
@@ -6954,6 +6964,44 @@ function monoBinderCounts(ix: i32, bn: string[], bc: i32[]) {
     i = i + 1
   }
   0
+}
+
+// Records statement `st` in the clone walk's scope when it binds a name an alias holds.
+function monoCgcAliasScopeNote(st: i32) {
+  if st < 0 || st >= P.nodes.length { return 0 }
+  const d = nodeAt(st)
+  if !(d is LetDecl) || !monoStrListHas(monoCgcGenAliasNames, d.letName) {
+    return 0
+  }
+  if i32ListHas(monoCgcGenAliasDecls, st) {
+    monoCgcAliasScope.push("+" + d.letName)
+  } else {
+    monoCgcAliasScope.push("-" + d.letName)
+  }
+  0
+}
+
+// `monoBinderCounts` over `let` and `const` bindings alone.
+function monoLetBinderCounts(ix: i32, bn: string[], bc: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is LetDecl { monoBinderBump(bn, bc, n.letName) }
+  for k in nodeChildren(ix) { monoLetBinderCounts(k, bn, bc) }
+  0
+}
+
+// Whether a read of `name` in the clone walk reaches an alias `monoInstGenAliasNames` found: the
+// innermost binding of it the walk has passed is one, or none is in scope.
+function monoCgcAliasActive(name: string): boolean {
+  if !monoStrListHas(monoCgcGenAliasNames, name) { return false }
+  let i = monoCgcAliasScope.length - 1
+  while i >= 0 {
+    const m = monoCgcAliasScope[i]
+    if m == "+" + name { return true }
+    if m == "-" + name { return false }
+    i = i - 1
+  }
+  true
 }
 
 function monoBinderBump(bn: string[], bc: i32[], name: string) {
@@ -8097,7 +8145,7 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
       lfNoteMinted(newCallee, n.callFn)
       identFrom(newCallee, n.callFn)
     } else if (
-      monoStrListHas(monoCgcGenAliasNames, callee.identName)
+      monoCgcAliasActive(callee.identName)
       || monoCalleeConstAliasGeneric(n.callFn)
     ) {
       // A call through an alias never written (`const`, or an unwritten `let`) of a generic
@@ -8178,13 +8226,16 @@ function monoCloneGenericCallsRaw(ix: i32) {
     Block => {
       const ns: i32[] = []
       let bchanged = false
+      const scope0 = monoCgcAliasScope.length
       let i = 0
       while i < n.blkStmts.length {
         const cs = monoCloneGenericCalls(n.blkStmts[i])
         ns.push(cs)
         if cs != n.blkStmts[i] { bchanged = true }
+        monoCgcAliasScopeNote(n.blkStmts[i])
         i = i + 1
       }
+      while monoCgcAliasScope.length > scope0 { monoCgcAliasScope.pop() }
       if !bchanged { return ix }
       return mkBlock(ns, n.pos)
     }
@@ -8194,7 +8245,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
       if (
         ci == n.letInit
         && n.letInit >= 0
-        && monoStrListHas(monoCgcGenAliasNames, n.letName)
+        && i32ListHas(monoCgcGenAliasDecls, ix)
       ) {
         const iv = nodeAt(n.letInit)
         if iv is Ident {
@@ -8324,7 +8375,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
     Ident => {
       if (
         monoCalleeIsGeneric(ix)
-        || monoStrListHas(monoCgcGenAliasNames, n.identName)
+        || monoCgcAliasActive(n.identName)
         || monoStrListHas(monoCgcLamNames, n.identName)
       ) {
         const vi = mkIdent(n.identName, n.pos)
@@ -9698,6 +9749,8 @@ export function monoStateReset() {
   monoCallFrameSlot = 0 - 1
   monoCellAliasListOk = 0 - 1
   monoCgcGenAliasNames = []
+  monoCgcGenAliasDecls = []
+  monoCgcAliasScope = []
   monoChoiceBindDecl = []
   monoChoiceBindFr = []
   monoChoiceBindTy = []
@@ -10187,6 +10240,7 @@ function monoMakeInstanceBodyPinned(
   monoInstIsFirst = first
   monoCgcLamNames = monoInstLamNames(instBody0)
   monoCgcGenAliasNames = monoInstGenAliasNames(instBody0)
+  monoCgcAliasScope = []
   monoPinUnsafeNames = Map()
   monoPinRetBox = false
   if fn.fnRet < 0 && nret >= 0 {
