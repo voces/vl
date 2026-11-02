@@ -11445,3 +11445,19 @@ its fields.
 later write could invalidate the narrowing, and when none can, the delivery is fine without a
 copy. It would relax lists and records alike (D14827, whose witness is D14752's original
 spelling).
+
+## A negative literal does not fit a `u8` element (owner ruling, 2026-11-02) — D3428
+
+**The rule.** A negative integer literal at a `u8` element is refused exactly as one past 255 is,
+and so is a constant holding one, since a constant is its literal at every read. `-0` fits.
+The wrap is spelled with a cast: `as% u8` keeps the low 8 bits (`as u8` is exact-or-fail).
+
+```vl
+const xs: u8[] = [-7]          // refused: the literal -7 does not fit a `u8` element
+const ys: u8[] = [-7 as% u8]   // 249
+```
+
+**Why.** The exact-constant ruling refuses a use whose destination cannot hold the exact value,
+and a literal the compiler can see is a mistake it can name. A computed value still truncates to
+its low 8 bits at the store, as the `u8` slot rule says, since a runtime range check on every
+store is not payable.
