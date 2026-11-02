@@ -196,6 +196,16 @@ const m: {[string]: i32} | null = Map()
 show(m?.get("k"))
 `;
 
+// An optional call `p?.f()` delivered as it is, into a `??` and into a binding: the call is its
+// guard's non-null arm and takes the call's own join.
+const OPTCALL = `type P = { n: i32 }
+function twice(self: P) { self.n * 2 }
+const p: P | null = { n: 21 }
+print(p?.twice() ?? 0)
+const r = p?.twice()
+print(r ?? -1)
+`;
+
 // A function's tail `if` ending in a field write yields the write's value or `null`, and a
 // loop's value is a labelled block's: each read the rewrite yields in their place takes the
 // value's record.
@@ -208,6 +218,40 @@ const c: C = { n: 1 }
 print(bump(c, true) ?? -1)
 print(bump(c, false) ?? -1)
 print(inFor(2) ?? -5)
+`;
+
+// A list literal with a spread infers a union element: each element beside the spread is
+// delivered to it.
+const SPREAD = `function run(xs: (boolean | null)[], ys: i32[]) {
+  const u = [...xs, 5]
+  print(u.length)
+  const v = [...ys, "s"]
+  print(v.length)
+}
+run([true, null], [1])
+`;
+
+// A value whose own join is a union, delivered where nothing boxes it: a generic's tail value
+// `if` at an instance whose arms join apart, and a loop's exits under a `??` that unwraps it.
+const OWNJOIN = `function lit<A, B>(k: i32, a: A, b: B) {
+  if k == 0 { return a }
+  if k == 1 { b } else { 5 }
+}
+const z: i64 = 9
+print(lit(0, z, z))
+function t(n: i32) {
+  const r = (for k in [1, 2] { if k == n { break k } }) ?? 99
+  print(r)
+}
+t(1)
+`;
+
+// An annotated function's tail value `if` whose number arms join apart is boxed whole into the
+// declared result.
+const ANNTAIL = `function pick(k: i32): i32 | f64 {
+  if k == 0 { 3 } else { 2.5 }
+}
+print(pick(1))
 `;
 
 Deno.test({
@@ -315,6 +359,18 @@ Deno.test({
 });
 
 Deno.test({
+  name: "box-dst shadow: an optional call's guarded call takes the call's join",
+  ignore,
+  fn: () =>
+    expectRows(
+      "optcall",
+      OPTCALL,
+      DROP_NONE,
+      "nested agree=8; nested value already a box=1; value already a box=2",
+    ),
+});
+
+Deno.test({
   name: "box-dst shadow: a spilled tail's read takes the value's record",
   ignore,
   fn: () =>
@@ -324,6 +380,27 @@ Deno.test({
       DROP_NONE,
       "agree=3; nested agree=4; nested value already a box=1; nested value never returns=2; value already a box=4",
     ),
+});
+
+Deno.test({
+  name: "box-dst shadow: an element beside a spread takes the list's element union",
+  ignore,
+  fn: () =>
+    expectRows("spread", SPREAD, DROP_NONE, "agree=2; nested agree=2"),
+});
+
+Deno.test({
+  name: "box-dst shadow: a tail `if` and a loop's exits take their own join",
+  ignore,
+  fn: () =>
+    expectRows("ownjoin", OWNJOIN, DROP_NONE, "agree=8; nested agree=7"),
+});
+
+Deno.test({
+  name: "box-dst shadow: an annotated tail `if` takes the declared result",
+  ignore,
+  fn: () =>
+    expectRows("anntail", ANNTAIL, DROP_NONE, "agree=1; nested agree=1"),
 });
 
 Deno.test({

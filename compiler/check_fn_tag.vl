@@ -79,6 +79,7 @@ import { rcwInferredRetTy } from "./check_rcw"
 import { tErr } from "./check_relate_core"
 import {
   T,
+  TY_VOID,
   TyArray,
   TyErr,
   TyFunc,
@@ -119,6 +120,8 @@ import {
 } from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
 import { identDeclOf, identFromDecl } from "./symbols"
+import { identFnDeclOf } from "./check_scopes"
+import { declIsExportedFn } from "./check_exp_obs"
 import {
   coerceRecordOpen,
   elabFnIdOf,
@@ -127,6 +130,7 @@ import {
   elabTyClosed,
   fnLetIsWide,
   fnLetOpenHandAt,
+  fnParamHandSets,
   fnTagArmsAt,
   fnTagArmsAtSet,
   fnTagCallArms,
@@ -148,6 +152,7 @@ import {
   fnTagMembers,
   fnTagOwnTyParamAlone,
   fnTagOwnTyParamShared,
+  fnTagParamCopyOf,
   fnTagRetMark,
   fnTagSetIsTagged,
   fnTagSetOfTy,
@@ -159,11 +164,46 @@ import {
 
 // Decides every set from scratch over the program at `rootIx`, then raises the refusal each
 // call through a set left a closure owes.
+// Types each `if` or `match` at a tail of another set's join, whose members that set holds, at
+// the outer join's type: the nested join is part of that choice, so it carries its set (D14425).
+function ftNestedJoinsFollow() {
+  let j = P.nodes.length - 1
+  while j >= 0 {
+    const jn = nodeAt(j)
+    const jt = nodeTyIxOf(j)
+    const o = if jn is IfStmt || jn is MatchExpr { fnTagSetOfTy(jt) } else { -1 }
+    if o >= 0 {
+      const sp: i32[] = []
+      const ls: i32[] = []
+      valueTailSplit(j, sp, ls)
+      for n in sp {
+        const s = if n != j { fnTagSetOfTy(nodeTyIxOf(n)) } else { -1 }
+        if s >= 0 && s != o && ftMembersWithin(s, o) { nodeTySetGrow(n, jt) }
+      }
+    }
+    j = j - 1
+  }
+  0
+}
+
+// Whether every member of set `s` is a member of set `o`.
+function ftMembersWithin(s: i32, o: i32): boolean {
+  const om = fnTagMembers(o)
+  for m in fnTagMembers(s) {
+    if !i32ListHas(om, m) { return false }
+  }
+  true
+}
+
 export function fnTagDecide(rootIx: i32) {
   ftParamOwners = Map()
   ftParamOwnersBuilt = false
+  ftDirectLen = 0
+  ftDirectRefs = Map()
+  ftDirectCalls = Map()
   ftDecideRoot = rootIx
   fnTagUndecide()
+  ftNestedJoinsFollow()
   ftLeafTys = Map()
   const calls = fnTagCalls()
   const mint = mintFactRows()
@@ -820,6 +860,16 @@ function ftRetCarries(f: i32, s: i32): boolean {
   fnTagSetOfTy(rcwInferredRetTy(f)) == s
 }
 
+// Whether binding `d` is a copy of a parameter of function `fn` (`fnTagParamCopyOf`).
+function ftParamCopyAt(d: i32, fn: i32): boolean {
+  if fn < 0 || fn >= P.nodes.length { return false }
+  const f = nodeAt(fn)
+  f is FuncDecl && fnTagParamCopyOf(f, d) >= 0
+}
+
+// Whether the result type of function `f` is `void`.
+function ftRetVoid(f: i32): boolean { f >= 0 && rcwInferredRetTy(f) == TY_VOID }
+
 // Whether node `x` carries set `s`.
 function ftIsS(x: i32, s: i32): boolean {
   x >= 0 && fnTagSetOfTy(nodeTyIxOf(x)) == s
@@ -895,7 +945,7 @@ function ftScan(
         if !i32ListHas(ftSubNeed, ot) { ftSubNeed.push(ot) }
       }
       if ftIsS(x, s) && ot < 0 && !ftNamedAtClosed(x, p, s) {
-        if !ok || !ftNodeOk(x, s, ds, leaves, ids) { return false }
+        if !ok || !ftNodeOk(x, p, s, ds, leaves, ids) { return false }
         if !ftCtxOk(x, p, g, fn, s) { return false }
         const pn = nodeAt(p)
         // A written binding is read as a callee, a binding, a join's value, a delivery to a
@@ -1036,13 +1086,18 @@ export function ftOwnTyParamSharedBack(
     k = k + 1
   }
   if !back { return false }
-  // Nor anything in the body that names a type: any of them could hold the id at `T`.
+  // Nor anything in the body that names a type, but a copy of a parameter, which holds its id.
   const todo: i32[] = [f.fnBody]
   while todo.length > 0 {
     const x = todo.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
-      if ftNamesTyIn(x, nm) { return false }
-      nodeChildrenPush(x, todo)
+      const xn = nodeAt(x)
+      if xn is LetDecl && fnTagParamCopyOf(f, x) >= 0 {
+        todo.push(xn.letInit)
+      } else {
+        if ftNamesTyIn(x, nm) { return false }
+        nodeChildrenPush(x, todo)
+      }
     }
   }
   true
@@ -1343,6 +1398,7 @@ function ftLambdaIdOk(x: i32): boolean {
 // values it is made of.
 function ftNodeOk(
   x: i32,
+  p: i32,
   s: i32,
   ds: i32[],
   leaves: i32[],
@@ -1377,7 +1433,10 @@ function ftNodeOk(
     }
     Call => {
       if fnTagCallSetOf(x) == s { return true }
-      const d = ftNamedFn(n.callFn)
+      // A nested function's call hands back what it returns, whatever it captures: only a
+      // member's id needs no environment (`ftNamedFn`).
+      const nd = ftNamedFn(n.callFn)
+      const d = if nd >= 0 { nd } else { ftNestedCalleeDecl(n.callFn) }
       // A function an instance found to hand back its parameter gives this call that argument.
       if ftLate && d >= 0 && ftHandsBack(d, n, s) { return true }
       const ld = if d >= 0 { d } else { ftConstLambdaOf(n.callFn) }
@@ -1419,10 +1478,18 @@ function ftNodeOk(
     Member => {
       return ftHoldKind(nodeTyIxOf(n.memObj), s, 4) == 2
     }
-    // A lambda member is its own leaf once the elaboration has typed its calls, where its id can
-    // stand for it.
+    // A lambda member is its own leaf where its id can stand for it: after the elaboration, beside
+    // a declared member, or written straight into the binding, where the elaboration instances
+    // each call's arm at its arguments.
     FuncDecl => {
-      if !ftLate || !i32ListHas(ds, x) || !ftLambdaIdOk(x) { return false }
+      if (
+        !(ftLate || ftDeclaredBeside(ds) || ftWrittenAt(x, p))
+        || !i32ListHas(ds, x)
+        || !ftLambdaIdOk(x)
+      ) {
+        return false
+      }
+      if ftWithinInstancedFn(x) { return false }
       if !i32ListHas(leaves, x) {
         leaves.push(x)
         ids.push(x)
@@ -1673,6 +1740,75 @@ function ftParamBoundTagged(rootIx: i32, pd: i32): boolean {
   true
 }
 
+// Whether `v` reads an un-annotated parameter of a function only direct calls reach, every one of
+// which hands it a value of `s` or of a set within it, so a write of `v` stores one of `s`'s ids
+// (D15053). A smaller set is decided with `s`.
+function ftParamHandedWithin(v: i32, s: i32): boolean {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  const pd = identDeclOf(v)
+  if pd < 0 || pd >= P.nodes.length { return false }
+  const pn = nodeAt(pd)
+  if !(pn is Param) || pn.parType >= 0 { return false }
+  const fd = ftParamOwner(ftDecideRoot, pd)
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = nodeAt(fd)
+  if (
+    !(f is FuncDecl)
+    || ftReadInNestedFn(f.fnBody, pd)
+    || !ftOnlyCalledDirectly(fd)
+  ) {
+    return false
+  }
+  const sets = fnParamHandSets(fd, i32ListIndexOf(f.fnParams, pd))
+  if sets.length == 0 { return false }
+  for st in sets {
+    if st < 0 || st != s && !ftSetWithin(st, s) { return false }
+  }
+  for st in sets {
+    if st != s && !i32ListHas(ftSubNeed, st) { ftSubNeed.push(st) }
+  }
+  true
+}
+
+// Whether every reference to function `fd` is the callee of a call in this program: it is not
+// exported, stored, handed on or read as a value, so the calls the check saw are all of them.
+function ftOnlyCalledDirectly(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length || declIsExportedFn(fd) { return false }
+  ftDirectCountsGrow()
+  const refs = ftDirectRefs[fd] ?? 0
+  refs > 0 && refs == (ftDirectCalls[fd] ?? 0)
+}
+
+// Per function, the names reading it and the calls naming it as their callee, counted over the
+// arena's first `ftDirectLen` nodes; the decision in progress starts them again.
+let ftDirectLen = 0
+let ftDirectRefs: {[i32]: i32} = Map()
+let ftDirectCalls: {[i32]: i32} = Map()
+
+// Counts the nodes added since `ftDirectLen` into `ftDirectRefs` and `ftDirectCalls`.
+function ftDirectCountsGrow() {
+  let x = ftDirectLen
+  while x < P.nodes.length {
+    const n = nodeAt(x)
+    match n {
+      Ident => {
+        const d = identFnDeclOf(x)
+        if d >= 0 { ftDirectRefs[d] = (ftDirectRefs[d] ?? 0) + 1 }
+      }
+      Call => {
+        const cf = n.callFn
+        const d = if cf >= 0 && cf < P.nodes.length && nodeAt(cf) is Ident { identFnDeclOf(cf) } else { -1 }
+        if d >= 0 { ftDirectCalls[d] = (ftDirectCalls[d] ?? 0) + 1 }
+      }
+      // No other node names a function.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+    }
+    x = x + 1
+  }
+  ftDirectLen = P.nodes.length
+  0
+}
+
 // Whether a function nested in the body at `body` reads declaration `pd`.
 function ftReadInNestedFn(body: i32, pd: i32): boolean {
   const xs: i32[] = [body]
@@ -1728,7 +1864,11 @@ function ftSetOnlyArgOf(rootIx: i32, as: i32): boolean {
     const p = ps.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
       const n = nodeAt(x)
-      if n is Ident && fnTagSetOfTy(nodeTyIxOf(x)) == as {
+      // A binding's initialiser is its reads' value, and each read carries the set and is asked
+      // in its own turn (D15046).
+      const pl = if p >= 0 { nodeAt(p) } else { n }
+      const init = pl is LetDecl && parenPeelIx(pl.letInit) == x
+      if n is Ident && fnTagSetOfTy(nodeTyIxOf(x)) == as && !init {
         const pn = if p >= 0 { nodeAt(p) } else { n }
         if !(pn is Call) || !i32ListHas(pn.callArgs, x) { return false }
         const cf = parenPeelIx(pn.callFn)
@@ -1784,6 +1924,7 @@ function ftValuesOk(
       // A lambda member written is its own leaf, as `ftNodeOk` takes one read.
       const d = if ftLambdaLeaf(v, ds) { v } else { ftLeafMember(v, ds) }
       if d < 0 && ftSubsetRead(v, s) { continue }
+      if d < 0 && ftParamHandedWithin(v, s) { continue }
       if d < 0 { return false }
       if !i32ListHas(leaves, v) {
         leaves.push(v)
@@ -1794,15 +1935,42 @@ function ftValuesOk(
   true
 }
 
-// Whether `v` is a lambda member of `ds` whose id can stand for it once the elaboration has typed
-// its calls. One written inside a generic or hole function is a value per instance, which one
-// id cannot name.
+// Whether `v`, a value a write, a join or a return gives the set, is a lambda member whose id can
+// stand for it, each call's arm instanced by the elaboration. One written inside a generic or
+// hole function is a value per instance, which one id cannot name.
 function ftLambdaLeaf(v: i32, ds: i32[]): boolean {
-  ftLate
-    && i32ListHas(ds, v)
+  i32ListHas(ds, v)
     && nodeAt(v) is FuncDecl
     && ftLambdaIdOk(v)
     && !ftWithinInstancedFn(v)
+}
+
+// Whether lambda `x` is the value its parent `p` writes into a binding: a `let`'s initialiser or
+// a store's right side, so the binding's reads are the only names it has.
+function ftWrittenAt(x: i32, p: i32): boolean {
+  if p < 0 || p >= P.nodes.length { return false }
+  const pn = nodeAt(p)
+  match pn {
+    LetDecl => {
+      return pn.letKw == "let" && pn.letInit == x
+    }
+    BinExpr => {
+      return ftIsStore(pn) && pn.binRight == x
+    }
+    // Any other parent names the lambda some other way, or reads it.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return false
+    }
+  }
+}
+
+// Whether set members `ds` include a declared function, beside which a lambda reached through
+// another name is a leaf before the elaboration's decision too.
+function ftDeclaredBeside(ds: i32[]): boolean {
+  for d in ds {
+    if ftNamedDecl(d) { return true }
+  }
+  false
 }
 
 // Whether `x` is declared inside a generic or hole function, whose body each instance re-checks.
@@ -1885,6 +2053,19 @@ function ftNamedFn(v: i32): i32 {
   if r >= 0 && r != d { return -1 }
   if r < 0 && elabFnIdOf(nodeTyIxOf(v)) != d { return -1 }
   d
+}
+
+// The named function the callee read `v` declares, nested or not, capturing or not; -1 for any
+// other callee.
+function ftNestedCalleeDecl(v: i32): i32 {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const n = nodeAt(x)
+  if !(n is Ident) { return -1 }
+  const r = identDeclOf(x)
+  if r < 0 || r >= P.nodes.length { return -1 }
+  const rn = nodeAt(r)
+  if rn is FuncDecl && rn.fnName == n.identName { r } else { -1 }
 }
 
 // The lambda a `const` read `v` is bound to, whose calls run it; -1 otherwise.
@@ -2169,8 +2350,9 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         || ftLateArgOfSet(pn, x, s)
     }
     // A binding's annotation delivers the value to a declared function type, a closure.
+    // So does a `const` copy of a parameter annotated with the function's type parameter.
     LetDecl => {
-      return pn.letInit == x && pn.letType < 0
+      return pn.letInit == x && (pn.letType < 0 || ftParamCopyAt(p, fn))
     }
     RetStmt => {
       return ftRetCarries(fn, s)
@@ -2190,7 +2372,12 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       if g >= 0 {
         const gn = nodeAt(g)
         if (gn is IfStmt || gn is MatchExpr) && ftIsS(g, s) { return true }
-        if gn is FuncDecl && gn.fnBody == p && ftRetCarries(g, s) {
+        // A function whose result is `void` discards its tail's value, so no id leaves it.
+        if (
+          gn is FuncDecl
+          && gn.fnBody == p
+          && (ftRetCarries(g, s) || ftRetVoid(g))
+        ) {
           return true
         }
         if gn is WhileStmt && gn.whileBody == p && ftIsS(g, s) { return true }
