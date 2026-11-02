@@ -3,6 +3,7 @@
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
 import { monoIsGenericDecl } from "./emit_base"
+import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { decDigitsOf } from "./strutil"
 import { constListFnElemDecl } from "./check_calls"
 
@@ -3049,14 +3050,65 @@ function elabAliasSource(d: i32, fn: FuncDecl, depth: i32, k: i32): i32 {
   if ix < 0 || !(nodeAt(ix) is Ident) { return -1 }
   const src = identDeclOf(ix)
   const r = if i32ListHas(fn.fnParams, src) { src } else { elabAliasSource(src, fn, depth - 1, k) }
-  if (
-    r >= 0
-    && own != ""
-    && !elabTyParamsAgreeAt(own, elabTyParamNameOf(fn, r), k)
-  ) {
-    return -1
-  }
+  if r >= 0 && own != "" && !elabOwnAgreesWith(fn, own, r, k) { return -1 }
   r
+}
+
+// Whether own type parameter `own` names parameter `r`'s type at instance `k`: the type parameter
+// annotating `r` agrees with it, or `r` is un-annotated and `k` binds `own` to `r`'s closed type.
+function elabOwnAgreesWith(fn: FuncDecl, own: string, r: i32, k: i32): boolean {
+  const pn = nodeAt(r)
+  if !(pn is Param) || pn.parType >= 0 {
+    return elabTyParamsAgreeAt(own, elabTyParamNameOf(fn, r), k)
+  }
+  if k < 0 || k >= ekDecl.length { return false }
+  const ta = bindOf(ekNames[k], ekTys[k], own)
+  const tr = elabNodeTy(r, k)
+  ta >= 0 && tr >= 0 && tySame(ta, tr) && elabTyClosed(ta, 0)
+}
+
+// The parameter of `fn` whose value own type parameter `tp` is inferred from: `tp` annotates no
+// parameter, and every binding annotated bare with `tp` is initialised by a read of a parameter,
+// directly or through bindings each initialised by a read of the one before. The first such
+// binding in source order names the seed; -1 when there is none.
+export function elabTyParamSeedParam(fn: FuncDecl, tp: string): i32 {
+  if anyParamMentionsTyParam(fn.fnParams, [tp]) { return -1 }
+  let seed = -1
+  const stack: i32[] = [fn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is LetDecl && n.letType >= 0 && n.letType < P.nodes.length {
+        const tn = nodeAt(n.letType)
+        if tn is TypeRef && tn.tyName == tp {
+          const r = elabReadSeedParam(n.letInit, fn, 8)
+          if r < 0 { return -1 }
+          if seed < 0 { seed = r }
+        }
+      }
+      const kids = nodeChildren(ix)
+      let c = kids.length - 1
+      while c >= 0 {
+        stack.push(kids[c])
+        c -= 1
+      }
+    }
+  }
+  seed
+}
+
+// The parameter of `fn` that `ix` reads, directly or through bindings each initialised by a read
+// of the one before, within `depth` bindings; else -1.
+function elabReadSeedParam(ix: i32, fn: FuncDecl, depth: i32): i32 {
+  const v = parenPeelIx(ix)
+  if depth <= 0 || v < 0 || !(nodeAt(v) is Ident) { return -1 }
+  const d = identDeclOf(v)
+  if i32ListHas(fn.fnParams, d) { return d }
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const ln = nodeAt(d)
+  if !(ln is LetDecl) { return -1 }
+  elabReadSeedParam(ln.letInit, fn, depth - 1)
 }
 
 // Whether own type parameters `a` and `b` name one type: the same name, or two that instance `k`
