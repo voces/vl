@@ -137,6 +137,7 @@ import {
   elabWideRowN,
   elabWideRowRet,
   elabWideRowT,
+  fnSetHasCapturingLambda,
   fnTagCallArms,
   fnTagLeafSetOf,
   fnTagListTy,
@@ -1062,6 +1063,22 @@ function elabParamsClosed(decl: i32, names: string[], tys: i32[]): boolean {
 let elabGuessKeys: {[i32]: boolean} = Map()
 let elabGuessing = false
 
+// The candidates: instances minted for a decision the tag decision after the elaboration may
+// take, and those made inside one. Mono builds one only where a demand reaches it, so a
+// diagnostic in one is not the program's, and it binds no mint fact.
+let elabCandKeys: {[i32]: boolean} = Map()
+let elabCandidating = false
+
+// `elabDemandFrom` for a candidate; its key, or -1.
+function elabDemandCandidate(decl: i32, pTys: i32[], call: i32): i32 {
+  const none: string[] = []
+  const noTys: i32[] = []
+  elabCandidating = true
+  const k = elabDemandFrom(decl, none, noTys, pTys, -1, call)
+  elabCandidating = false
+  k
+}
+
 // Whether `elabSetRepTy` has answered a set with the no-argument stub since the last clear.
 let elabRepStubbed = false
 
@@ -1116,6 +1133,9 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   }
   if elabSigAlting || (from >= 0 && (elabSigAltKeys[from] ?? false)) {
     elabSigAltKeys[k] = true
+  }
+  if elabCandidating || (from >= 0 && (elabCandKeys[from] ?? false)) {
+    elabCandKeys[k] = true
   }
   const kk = i32ToStr(parent) + "^" + i32ToStr(decl)
   const kids = ekKids[kk] ?? []
@@ -2150,7 +2170,11 @@ function elabOne(k: i32) {
   // program's error: the first one is kept past the rollback for check to report.
   // An instance at a set's rep, or at one signature of the generic it holds, is a representation
   // mono builds, as is every instance it makes; the set-keyed instance answers for the program.
-  if T.diags.length - ed0 > elabCapDeadDiags && !(elabReprKeys[k] ?? false) {
+  if (
+    T.diags.length - ed0 > elabCapDeadDiags
+    && !(elabReprKeys[k] ?? false)
+    && !(elabCandKeys[k] ?? false)
+  ) {
     elabErrorNote(T.diags[ed0])
   }
   if sv != null { monoRecheckEnd(sv) }
@@ -2563,7 +2587,7 @@ export function elabMintFacts(): i32 {
   let k = 0
   while k < ekDecl.length {
     const dn = nodeAt(ekDecl[k])
-    if dn is FuncDecl && dn.fnBody >= 0 {
+    if dn is FuncDecl && dn.fnBody >= 0 && !(elabCandKeys[k] ?? false) {
       const sc = mintScopeAt(
         ekDecl[k],
         elabInstSpelling(k),
@@ -4398,6 +4422,7 @@ export function elabRun() {
   elabErrors = []
   elabReprKeys = Map()
   elabGuessKeys = Map()
+  elabCandKeys = Map()
   ekDecl = []
   ekNames = []
   ekTys = []
@@ -4688,8 +4713,114 @@ export function elabRun() {
   elabCellPeers()
   elabNestedPerEncl()
   elabSoleRekey()
+  elabListMemberSigs()
   elabPinsClosedSet(true)
   elabRunDone = true
+}
+
+// Mints, as candidates, each named member of an untagged set holding a capturing lambda that a
+// call through a list element reaches, at the closed signature the call gives it: the instance
+// a closure in the list needs if the set stays untagged.
+function elabListMemberSigs() {
+  for c in elabCalls {
+    const cn = nodeAt(c)
+    if !(cn is Call) { continue }
+    const cf = parenPeelIx(cn.callFn)
+    const cd = if cf >= 0 && nodeAt(cf) is Ident { identDeclOf(cf) } else { -1 }
+    if !(nodeAt(cf) is Index) && !(cd >= 0 && nodeAt(cd) is LoopVar) {
+      continue
+    }
+    const s = fnTagSetOfTy(nodeTyIxOf(cf))
+    if s < 0 || fnTagSetIsTagged(s) || !fnSetHasCapturingLambda(s) { continue }
+    for m in fnTagMembers(s) {
+      const pTys = elabMemberCallSig(m, cn.callArgs)
+      if pTys.length > 0 {
+        const k = elabDemandCandidate(m, pTys, c)
+        elabReachNote(-1, k, c)
+      }
+    }
+  }
+  elabSettle(0)
+}
+
+// The closed parameter types named function `m` takes from a call with `args`: a hole parameter
+// handed a function takes `(p...) => r`, `p` the one set of argument types `m`'s body calls it
+// with and `r` that function's result there; any other takes its argument's type. [] when one
+// stays open.
+function elabMemberCallSig(m: i32, args: i32[]): i32[] {
+  const none: i32[] = []
+  const f = nodeAt(m)
+  if !(f is FuncDecl) || f.fnName == "" || f.fnTyParams.length > 0 {
+    return none
+  }
+  if f.fnParams.length != args.length { return none }
+  const out: i32[] = []
+  let fnHole = false
+  let i = 0
+  while i < args.length {
+    const pn = nodeAt(f.fnParams[i])
+    const at = nodeTyIxOf(parenPeelIx(args[i]))
+    const ads = elabFnSetOf(at)
+    if pn is Param && pn.parType < 0 && ads.length > 0 {
+      const wp = elabParamCallArgTys(f.fnBody, f.fnParams[i])
+      if wp.length == 0 { return none }
+      let r = -1
+      for d in ads {
+        const dr = widenLitTy(elabMemberResultAt(d, wp))
+        if dr < 0 || r >= 0 && !tySame(r, dr) { return none }
+        r = dr
+      }
+      out.push(mkFuncTy(wp, r))
+      fnHole = true
+    } else {
+      if at < 0 || !elabTyClosed(at, 0) { return none }
+      out.push(widenLitTy(at))
+    }
+    i = i + 1
+  }
+  if !fnHole { return none }
+  out
+}
+
+// The widened, closed argument types every call in `body` through parameter `pd` passes, when
+// they are one list and there is at least one such call; else [].
+function elabParamCallArgTys(body: i32, pd: i32): i32[] {
+  const none: i32[] = []
+  let got: i32[] = []
+  let seen = false
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y < 0 || y >= P.nodes.length { continue }
+    const n = nodeAt(y)
+    if n is FuncDecl && y != body { continue }
+    if n is Call {
+      const cf = parenPeelIx(n.callFn)
+      if cf >= 0 && nodeAt(cf) is Ident && identDeclOf(cf) == pd {
+        const tys: i32[] = []
+        for a in n.callArgs {
+          const at = widenLitTy(nodeTyIxOf(a))
+          if at < 0 || !elabTyClosed(at, 0) { return none }
+          tys.push(at)
+        }
+        if seen && !tysSameList(got, tys) { return none }
+        got = tys
+        seen = true
+      }
+    }
+    for ch in nodeChildren(y) { todo.push(ch) }
+  }
+  got
+}
+
+function tysSameList(a: i32[], b: i32[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if !tySame(a[i], b[i]) { return false }
+    i = i + 1
+  }
+  true
 }
 
 // Keys each root call that hands back a hole lambda, left open by its row, at that lambda's one
