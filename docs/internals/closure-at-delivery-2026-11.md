@@ -82,9 +82,12 @@ signature, carried as one value.
   yet, so the seed is byte-identical.
 - (b) The bundle. `monoPinHoleParam` decides, and the callee reads fields. Graded on D14841's
   grading list with the split plan off.
-  First slice (2026-11-02): a lambda literal written at a direct call, outside an instanced
-  body, to a parameter read only as a callee and bound to lambdas alone. The emitter's half is
-  `compiler/emit_bundle.vl`; the row answers each field. The rest of the scope is D14841's.
+  First slice (2026-11-02): a lambda literal written at a direct call, to a parameter read only as
+  a callee and bound to lambdas alone. The emitter's half is `compiler/emit_bundle.vl`; the row
+  answers each field. A lambda in an instanced body is admitted by the elaboration taking a
+  bundle pin at the call's own instance, so every encloser shares the callee. The written-let
+  bundle is not built (coordinator, 2026-11-02): D14841 grades the 15 W-lam files that would need
+  it, and none qualifies under the binding conditions above.
 - (c) The delivery token reads the row (step7's half).
 
 ### Matrix
