@@ -254,6 +254,19 @@ const ANNTAIL = `function pick(k: i32): i32 | f64 {
 print(pick(1))
 `;
 
+// A field write into a binding stored at a container's wider build (D14810): the value is boxed
+// at the field of the record it is stored as, not of its checked type.
+const STOREWRITE = `type J = { f: i32 | null }
+function mk() { { f: 4 } }
+function back(r) { return r }
+const wideJ: J = mk()
+const xs = [mk()]
+const b = back(xs[0])
+b.f = 9
+print(xs[0].f)
+print(wideJ.f ?? 0)
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -401,6 +414,13 @@ Deno.test({
   ignore,
   fn: () =>
     expectRows("anntail", ANNTAIL, DROP_NONE, "agree=1; nested agree=1"),
+});
+
+Deno.test({
+  name: "box-dst shadow: a field write takes the receiver's storage",
+  ignore,
+  fn: () =>
+    expectRows("storewrite", STOREWRITE, DROP_NONE, "agree=2; nested agree=2"),
 });
 
 Deno.test({
