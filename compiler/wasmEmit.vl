@@ -5,6 +5,11 @@ import {
   boxDstShadowNote,
 } from "./box_dst_shadow"
 import { repSlotOfKind } from "./emit_rep_slot"
+import {
+  bundleFieldOfCall,
+  bundleParamOfRead,
+  bundleSigsOfParam,
+} from "./emit_bundle"
 import { arrLitDestTy, arrLitUnionDestTaken } from "./check_bind_rows"
 import { mintCallSoleSet } from "./check_mint"
 import {
@@ -1297,6 +1302,7 @@ import {
 import {
   fieldCodeVKind,
   identCellSlot,
+  sigKeyOfTy,
   sigKeyRetIsVoid,
   tyIsUnionMemberOf,
 } from "./emit_sig_tokens"
@@ -1535,6 +1541,7 @@ import {
   monoAliasDeclOf,
   monoArgPinTyIx,
   monoArgTyName,
+  monoBundleFe,
   monoInstantiatedAny,
   monoIsClashLit,
   narrowRegionReads,
@@ -24424,7 +24431,10 @@ function emitCallCoreUserFn(
     const intrHere = isNumIntrinsicName(callee.identName)
       && !identNameIsBoundAt(callee.identName, fnIx, c.callFn)
       && globalIndexOf(callee.identName) < 0
-    if !intrHere && exprIsClosure(c.callFn, fnIx) {
+    if (
+      !intrHere
+      && (exprIsClosure(c.callFn, fnIx) || bundleParamOfRead(c.callFn, fnIx) >= 0)
+    ) {
       return emitCallRef(body, callIx, fnIx)
     }
     // The numeric-opcode intrinsics: one wasm instruction over the arguments. Reached
@@ -24958,6 +24968,9 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
         "emitProgram: named arguments work only on declared functions, not on a function value",
       )
     }
+    // A call through a bundle reads the closure for its own signature (D14841).
+    const bun = emitBundleCall(body, callIx, c, fnIx)
+    if bun != 1 { return bun }
     // Evaluate the closure once into the call-ref scratch local (`callRefNestSlot`).
     if emitExpr(body, c.callFn, fnIx) < 0 { return -1 }
     // A NULLABLE function value (`fn | null`, kind 19) loads as `(ref null $cloStruct)`;
@@ -25001,44 +25014,121 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
         "emitProgram: closure ref-list result element twin (deferred value-ABI composition)",
       )
     }
-    // env = closure.env (field 0).
-    fbLocalGet(crSlot)
-    fbStructGet(cloStructIdx, 0)
-    callRefDepth = crDepth + 1
-    // args, each COERCED to its parameter's scalar valtype (an i32 literal widened into an i64 / f64
-    // / f32 param) — the `call_ref` functype demands the exact valtype, exactly as a direct call.
-    const args = c.callArgs
-    // each argument's valtype is decided by its parameter, so an enclosing wide-scalar
-    // context must not leak into it — else a bare i32 literal argument under an outer f32/atom
-    // context lowers at the wrong valtype for the `call_ref` functype: invalid wasm.
-    let i = 0
-    while i < args.length {
-      if emitCallRefArg(body, callIx, fnIx, ckey, args, i) < 0 { return -1 }
-      i = i + 1
-    }
-    callRefDepth = crDepth
-    // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
-    // the concrete `$fnsig` (the engine signature-checks the callee against it).
-    let sig = -1
-    if ckey != "" { sig = cloSigTypeIdxAt(cloSigPosOfKey(ckey)) }
-    if sig < 0 && !cloCallArityFallbackUnsound(callIx, fnIx) {
-      sig = fnSigIdxForArity(args.length)
-    }
-    if sig < 0 {
-      // A binding called at two types can take a slot per type.
-      fsAskCallee(c.callFn)
-      return emitFail(
-        "emitProgram: a function-value call has no interned signature — "
-          + cloCallSigRejectWhat(callIx, fnIx),
-      )
-    }
-    fbLocalGet(crSlot)
-    fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
-    fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
-    armTailCallIndirect(sig, sigKeyRetVoid(ckey))
-    return 0
+    return emitCallRefAt(body, callIx, c, fnIx, ckey, crDepth, crSlot)
   }
   emitFail("emitProgram: expected a call expression")
+}
+
+// `emitCallRefUnder`'s call of the closure stored in `crSlot` at `$fnsig` key `ckey`: its env,
+// the arguments coerced to the key's parameters, then the indirect call. 0, or -1.
+function emitCallRefAt(
+  body: u8[],
+  callIx: i32,
+  c: Call,
+  fnIx: i32,
+  ckey: string,
+  crDepth: i32,
+  crSlot: i32,
+): i32 {
+  // env = closure.env (field 0).
+  fbLocalGet(crSlot)
+  fbStructGet(cloStructIdx, 0)
+  callRefDepth = crDepth + 1
+  // args, each COERCED to its parameter's scalar valtype (an i32 literal widened into an i64 / f64
+  // / f32 param) — the `call_ref` functype demands the exact valtype, exactly as a direct call.
+  const args = c.callArgs
+  // each argument's valtype is decided by its parameter, so an enclosing wide-scalar
+  // context must not leak into it — else a bare i32 literal argument under an outer f32/atom
+  // context lowers at the wrong valtype for the `call_ref` functype: invalid wasm.
+  let i = 0
+  while i < args.length {
+    if emitCallRefArg(body, callIx, fnIx, ckey, args, i) < 0 { return -1 }
+    i = i + 1
+  }
+  callRefDepth = crDepth
+  // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
+  // the concrete `$fnsig` (the engine signature-checks the callee against it).
+  let sig = -1
+  if ckey != "" { sig = cloSigTypeIdxAt(cloSigPosOfKey(ckey)) }
+  if sig < 0 && !cloCallArityFallbackUnsound(callIx, fnIx) {
+    sig = fnSigIdxForArity(args.length)
+  }
+  if sig < 0 {
+    // A binding called at two types can take a slot per type.
+    fsAskCallee(c.callFn)
+    return emitFail(
+      "emitProgram: a function-value call has no interned signature — "
+        + cloCallSigRejectWhat(callIx, fnIx),
+    )
+  }
+  fbLocalGet(crSlot)
+  fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
+  fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
+  armTailCallIndirect(sig, sigKeyRetVoid(ckey))
+  0
+}
+
+// Whether parameter `par` takes the lambda literal `arg` as a bundle.
+function emitBundleParamTakes(par: i32, arg: i32): boolean {
+  nodeAt(unwrapParen(arg)) is FuncDecl && bundleSigsOfParam(par).length > 0
+}
+
+// The lambda literal `arg` delivered to bundle parameter `par`: the closure built at each
+// signature, in the record row's field order, in one record. 0, or -1.
+function emitBundleArg(body: u8[], arg: i32, par: i32, fnIx: i32): i32 {
+  const sigs = bundleSigsOfParam(par)
+  const si = paramStructIdxOf(par)
+  if (
+    si < 0
+    || si >= sFieldCount.length
+    || si >= sFieldStart.length
+    || si >= sHeapIdx.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a lambda called at two signatures has no record row for its closures",
+      arg,
+    )
+  }
+  let fi = 0
+  while fi < sFieldCount[si] {
+    const nm = sFieldNames[sFieldStart[si] + fi]
+    let k = 0
+    while k < sigs.length && nm != "c" + i32ToStr(k) { k = k + 1 }
+    const fe = monoBundleFe(arg, fnIx, sigs, k)
+    if fe < 0 {
+      return emitFailAt(
+        "emitProgram: a lambda called at two signatures has no closure built for one of them",
+        arg,
+      )
+    }
+    if emitClosureValueCore(body, fe, fnIx) < 0 { return -1 }
+    fi = fi + 1
+  }
+  fbStructNew(sHeapIdx[si])
+  0
+}
+
+// Call `c` through a parameter holding a bundle: the closure for the call's own signature, read
+// from its field and called at that signature. 1 where the callee holds no bundle.
+function emitBundleCall(body: u8[], callIx: i32, c: Call, fnIx: i32): i32 {
+  const par = bundleParamOfRead(c.callFn, fnIx)
+  if par < 0 { return 1 }
+  const sigs = bundleSigsOfParam(par)
+  const si = paramStructIdxOf(par)
+  const k = bundleFieldOfCall(par, c.callArgs, fnIx)
+  const fi = sFieldIndex(si, "c" + i32ToStr(k))
+  if k < 0 || fi < 0 || si < 0 || si >= sHeapIdx.length {
+    return emitFailAt(
+      "emitProgram: a call through a lambda called at two signatures matches none of them",
+      callIx,
+    )
+  }
+  if emitExpr(body, c.callFn, fnIx) < 0 { return -1 }
+  fbStructGet(sHeapIdx[si], fi)
+  const crDepth = callRefDepth
+  const crSlot = callRefNestSlot(callRefDepth)
+  fbLocalSet(crSlot)
+  emitCallRefAt(body, callIx, c, fnIx, sigKeyOfTy(sigs[k]), crDepth, crSlot)
 }
 
 // ── statement-sequence lowering ──────────────────────────────────────────────
@@ -36213,7 +36303,12 @@ function emitDirectCallArgsUnder(
         if vtKindOfParam(cParams2[i]) == "i64" { cParamI64 = true }
       }
     }
-    if cParamF32 {
+    // A lambda the callee calls at two signatures is delivered as its bundle (D14841).
+    const bpar = if cFn is FuncDecl && i < cFn.fnParams.length { cFn.fnParams[i] } else { -1 }
+    if bpar >= 0 && emitBundleParamTakes(bpar, args[i]) {
+      if emitBundleArg(body, args[i], bpar, fnIx) < 0 { return -1 }
+      i = i + 1
+    } else if cParamF32 {
       if emitExprAsF32(body, args[i], fnIx) < 0 { return -1 }
       i = i + 1
     } else if cParamF64 {

@@ -82,6 +82,9 @@ signature, carried as one value.
   yet, so the seed is byte-identical.
 - (b) The bundle. `monoPinHoleParam` decides, and the callee reads fields. Graded on D14841's
   grading list with the split plan off.
+  First slice (2026-11-02): a lambda literal written at a direct call, outside an instanced
+  body, to a parameter read only as a callee and bound to lambdas alone. The emitter's half is
+  `compiler/emit_bundle.vl`; the row answers each field. The rest of the scope is D14841's.
 - (c) The delivery token reads the row (step7's half).
 
 ### Matrix
