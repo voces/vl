@@ -1,0 +1,87 @@
+// The storage a value is built at, once a check pass's builds are known: the record every
+// result of a call or a binding of one is built at, and the field writes boxed at it.
+
+import { Call, Ident, LetDecl, ObjLit, nodeAt } from "./ast"
+import { callRetRepTy } from "./check_bind_adopt"
+import { nodeTyIxOf } from "./check_node_tys"
+import { T, TyObj, objFieldType, tyAt, tySame } from "./check_types"
+import { nonNullTy } from "./tyquery"
+import {
+  recBuiltReadTy,
+  recHoleIdentityArg,
+  recordBoxTy,
+  storeWriteCount,
+  storeWriteFieldAt,
+  storeWriteRecvAt,
+  storeWriteValAt,
+  storeWritesClear,
+} from "./check_fit_rules"
+import { recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
+import { recSolePinArg } from "./check_record_origins"
+import { recFnValueLeaves } from "./check_type_shape"
+import { cwPeelValue } from "./check_write_scan"
+import { unwrapParen } from "./emit_base"
+import { litRepTyAt } from "./emit_elab"
+
+// The record every result of the inferred-result call `u` is built at, through results that are
+// further such calls, a generic or hole identity of one, a binding holding only one, or a built
+// container's read; -1 where a result is anything else or the results disagree.
+export function callBuiltTy(x: i32, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const p = solePinPeel(x)
+  const hd = if p >= 0 && nodeAt(p) is Ident { recHeldDecl(p) } else { -1 }
+  const hn = if hd >= 0 { nodeAt(hd) } else { nodeAt(0) }
+  if hd >= 0 && hn is LetDecl { return callBuiltTy(hn.letInit, depth - 1) }
+  // A binding's literal is built at its rep stamp, as a result literal is.
+  if p >= 0 && nodeAt(p) is ObjLit {
+    const ls = litRepTyAt(p, -1)
+    return if ls >= 0 && ls < T.tys.length && tyAt(ls) is TyObj { ls } else { -1 }
+  }
+  const u = p
+  const fd = if u >= 0 { recInferredFnOf(u) } else { -1 }
+  // A read out of a container its stores build elsewhere is that build (D14810).
+  if fd < 0 {
+    // A generic call's result is its rep row's (D14733).
+    const gr = if u >= 0 && nodeAt(u) is Call { callRetRepTy(u, nodeTyIxOf(u)) } else { -1 }
+    if gr >= 0 { return gr }
+    const br = if u >= 0 { recBuiltReadTy(cwPeelValue(u)) } else { -1 }
+    return if br >= 0 { nonNullTy(br) } else { -1 }
+  }
+  const ha = recHoleIdentityArg(u, fd)
+  if ha >= 0 { return callBuiltTy(ha, depth - 1) }
+  let r = -1
+  for lf in recFnValueLeaves(fd) {
+    const l = solePinPeel(lf)
+    if l < 0 { return -1 }
+    const s = if nodeAt(l) is ObjLit { litRepTyAt(l, -1) } else { callBuiltTy(l, depth - 1) }
+    if s < 0 || s >= T.tys.length || !(tyAt(s) is TyObj) { return -1 }
+    if r < 0 { r = s }
+    else if !tySame(r, s) { return -1 }
+  }
+  r
+}
+
+// The value `x` delivers once each generic identity it passes through (`recSolePinArg`) is peeled.
+function solePinPeel(x: i32): i32 {
+  let l = unwrapParen(x)
+  let hops = 0
+  while l >= 0 && hops < 8 && recSolePinArg(l) >= 0 {
+    l = unwrapParen(recSolePinArg(l))
+    hops = hops + 1
+  }
+  l
+}
+
+// Boxes each queued field write's value at its field's type in the record the receiver is
+// stored as, where that is a union, and empties the queue.
+export function storeWritesResolve() {
+  let i = 0
+  while i < storeWriteCount() {
+    const st = callBuiltTy(storeWriteRecvAt(i), 8)
+    const so = if st >= 0 && st < T.tys.length { T.tys[st] } else { null }
+    const ft = if so is TyObj { objFieldType(so, storeWriteFieldAt(i)) } else { -1 }
+    if ft >= 0 { recordBoxTy(storeWriteValAt(i), ft) }
+    i = i + 1
+  }
+  storeWritesClear()
+}
