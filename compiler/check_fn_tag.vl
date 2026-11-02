@@ -201,6 +201,10 @@ export function fnTagDecide(rootIx: i32) {
   ftDirectLen = 0
   ftDirectRefs = Map()
   ftDirectCalls = Map()
+  ftHandedAt = Map()
+  ftParamRefs = Map()
+  ftParamCalls = Map()
+  if !ftLate { ftCheckLen = P.nodes.length }
   ftDecideRoot = rootIx
   fnTagUndecide()
   ftNestedJoinsFollow()
@@ -1746,9 +1750,9 @@ function ftParamBoundTagged(rootIx: i32, pd: i32): boolean {
   true
 }
 
-// Whether `v` reads an un-annotated parameter of a function only direct calls reach, every one of
-// which hands it a value of `s` or of a set within it, so a write of `v` stores one of `s`'s ids
-// (D15053). A smaller set is decided with `s`.
+// Whether `v` reads an un-annotated parameter of a function every call reaching which
+// (`ftReachHandSets`) hands it a value of `s` or of a set within it, so a write of `v` stores one
+// of `s`'s ids (D15053). A smaller set is decided with `s`.
 function ftParamHandedWithin(v: i32, s: i32): boolean {
   if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
   const pd = identDeclOf(v)
@@ -1758,14 +1762,8 @@ function ftParamHandedWithin(v: i32, s: i32): boolean {
   const fd = ftParamOwner(ftDecideRoot, pd)
   if fd < 0 || fd >= P.nodes.length { return false }
   const f = nodeAt(fd)
-  if (
-    !(f is FuncDecl)
-    || ftReadInNestedFn(f.fnBody, pd)
-    || !ftOnlyCalledDirectly(fd)
-  ) {
-    return false
-  }
-  const sets = fnParamHandSets(fd, i32ListIndexOf(f.fnParams, pd))
+  if !(f is FuncDecl) || ftReadInNestedFn(f.fnBody, pd) { return false }
+  const sets = ftReachHandSets(fd, i32ListIndexOf(f.fnParams, pd), 0)
   if sets.length == 0 { return false }
   for st in sets {
     if st < 0 || st != s && !ftSetWithin(st, s) { return false }
@@ -1776,42 +1774,128 @@ function ftParamHandedWithin(v: i32, s: i32): boolean {
   true
 }
 
-// Whether every reference to function `fd` is the callee of a call in this program: it is not
-// exported, stored, handed on or read as a value, so the calls the check saw are all of them.
-function ftOnlyCalledDirectly(fd: i32): boolean {
-  if fd < 0 || fd >= P.nodes.length || declIsExportedFn(fd) { return false }
+// The set of the value each call reaching function `fd` hands its parameter `pi`, -1 for a value
+// of no set, or [] when a reference to `fd` is neither a direct call nor handed to an un-annotated
+// parameter only ever called, whose calls are read the same way (D15017).
+function ftReachHandSets(fd: i32, pi: i32, depth: i32): i32[] {
+  const none: i32[] = []
+  if depth > 4 || fd < 0 || fd >= P.nodes.length || declIsExportedFn(fd) {
+    return none
+  }
   ftDirectCountsGrow()
+  const at = ftHandedAt[fd] ?? []
+  const calls = ftDirectCalls[fd] ?? 0
   const refs = ftDirectRefs[fd] ?? 0
-  refs > 0 && refs == (ftDirectCalls[fd] ?? 0)
+  if refs == 0 || refs != calls + at.length / 2 { return none }
+  const out = fnParamHandSets(fd, pi).slice(0)
+  if calls > 0 && out.length == 0 { return none }
+  // Each parameter `fd` is handed to, `[function, index, ...]`, read once.
+  const seen: i32[] = []
+  let k = 0
+  while k + 1 < at.length {
+    const c = nodeAt(at[k])
+    const h = if c is Call { identFnDeclOf(c.callFn) } else { -1 }
+    let dup = false
+    let m = 0
+    while m + 1 < seen.length {
+      if seen[m] == h && seen[m + 1] == at[k + 1] { dup = true }
+      m = m + 2
+    }
+    if dup {
+      k = k + 2
+      continue
+    }
+    seen.push(h)
+    seen.push(at[k + 1])
+    const hf = nodeAt(if h >= 0 { h } else { at[k] })
+    if !(hf is FuncDecl) || at[k + 1] >= hf.fnParams.length { return none }
+    const pj = hf.fnParams[at[k + 1]]
+    const pn = nodeAt(pj)
+    if !(pn is Param) || pn.parType >= 0 || ftReadInNestedFn(hf.fnBody, pj) {
+      return none
+    }
+    const pcs = ftParamCalls[pj] ?? []
+    if pcs.length == 0 || (ftParamRefs[pj] ?? 0) != pcs.length { return none }
+    for pc in pcs {
+      const cn = nodeAt(pc)
+      if !(cn is Call) || pi >= cn.callArgs.length { return none }
+      const ax = parenPeelIx(cn.callArgs[pi])
+      const ad = if ax >= 0 && nodeAt(ax) is Ident { identDeclOf(ax) } else { -1 }
+      const q = if ad >= 0 { i32ListIndexOf(hf.fnParams, ad) } else { -1 }
+      const qn = nodeAt(if q >= 0 { ad } else { pc })
+      if qn is Param && qn.parType < 0 {
+        const sub = ftReachHandSets(h, q, depth + 1)
+        if sub.length == 0 { return none }
+        for st in sub { out.push(st) }
+      } else {
+        out.push(fnTagSetOfTy(nodeTyIxOf(ax)))
+      }
+    }
+    k = k + 2
+  }
+  out
 }
 
-// Per function, the names reading it and the calls naming it as their callee, counted over the
-// arena's first `ftDirectLen` nodes; the decision in progress starts them again.
+// Per function, the names reading it, the calls naming it as their callee, and each call handing
+// it as an argument with the argument's position (`[call, index, ...]`); per parameter, the names
+// reading it and the calls naming it as their callee. Counted over the arena's first
+// `ftDirectLen` nodes; the decision in progress starts them again.
 let ftDirectLen = 0
 let ftDirectRefs: {[i32]: i32} = Map()
 let ftDirectCalls: {[i32]: i32} = Map()
+let ftHandedAt: {[i32]: i32[]} = Map()
+let ftParamRefs: {[i32]: i32} = Map()
+let ftParamCalls: {[i32]: i32[]} = Map()
 
-// Counts the nodes added since `ftDirectLen` into `ftDirectRefs` and `ftDirectCalls`.
+// The arena's length at the check's own decision. A later decision counts only those nodes: the
+// calls the elaboration adds (a set's arms) hand nothing the check noted.
+let ftCheckLen = -1
+
+// Counts the nodes added since `ftDirectLen` into the tables above.
 function ftDirectCountsGrow() {
+  const end = if ftLate && ftCheckLen >= 0 && ftCheckLen < P.nodes.length { ftCheckLen } else { P.nodes.length }
   let x = ftDirectLen
-  while x < P.nodes.length {
+  while x < end {
     const n = nodeAt(x)
     match n {
       Ident => {
         const d = identFnDeclOf(x)
         if d >= 0 { ftDirectRefs[d] = (ftDirectRefs[d] ?? 0) + 1 }
+        const pd = identDeclOf(x)
+        if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is Param {
+          ftParamRefs[pd] = (ftParamRefs[pd] ?? 0) + 1
+        }
       }
       Call => {
         const cf = n.callFn
-        const d = if cf >= 0 && cf < P.nodes.length && nodeAt(cf) is Ident { identFnDeclOf(cf) } else { -1 }
+        const isId = cf >= 0 && cf < P.nodes.length && nodeAt(cf) is Ident
+        const d = if isId { identFnDeclOf(cf) } else { -1 }
         if d >= 0 { ftDirectCalls[d] = (ftDirectCalls[d] ?? 0) + 1 }
+        const pd = if isId { identDeclOf(cf) } else { -1 }
+        if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is Param {
+          const pcs = ftParamCalls[pd] ?? []
+          pcs.push(x)
+          ftParamCalls[pd] = pcs
+        }
+        let i = 0
+        while d >= 0 && i < n.callArgs.length {
+          const a = n.callArgs[i]
+          const ad = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identFnDeclOf(a) } else { -1 }
+          if ad >= 0 {
+            const at = ftHandedAt[ad] ?? []
+            at.push(x)
+            at.push(i)
+            ftHandedAt[ad] = at
+          }
+          i = i + 1
+        }
       }
       // No other node names a function.
       NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
     }
     x = x + 1
   }
-  ftDirectLen = P.nodes.length
+  ftDirectLen = end
   0
 }
 
