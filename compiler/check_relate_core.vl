@@ -360,6 +360,7 @@ import {
   substSelfOwner,
   substSelfOwnerSet,
   substSkipsForeignSig,
+  substSkipsForeignVar,
   tyIsForeignGenericSig,
   tyIsHoleGenericSig,
 } from "./check_subst"
@@ -739,6 +740,11 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
     TyMap => {
       match d {
         TyMap => {
+          // Both open is a link, as two open lists are (D1470): a later use pins one side, and
+          // `resolveHoleLinks` hands it to the other.
+          if (s.mKey < 0 && d.mKey < 0) || (s.mVal < 0 && d.mVal < 0) {
+            noteHoleLink(srcTy, dstTy)
+          }
           if s.mKey < 0 {
             s.mKey = d.mKey
             tyMutEpoch = tyMutEpoch + 1 // in-place key pin
@@ -7351,6 +7357,27 @@ let bgFull = false
 let bgCallArg = false
 export function bgCallArgSet(on: boolean) { bgCallArg = on }
 
+// The joins a call argument's use asked of a type variable an earlier use bound at a narrower
+// number: its name and the wider type, which `checkCallOnFuncTy` re-checks the call at (D2459).
+let bgWidenNames: string[] = []
+let bgWidenTys: i32[] = []
+
+export function bgWidenClear() {
+  bgWidenNames = []
+  bgWidenTys = []
+}
+
+export function bgWidenCount(): i32 { bgWidenNames.length }
+
+// Whether the argument binding now may ask for a join: not a number literal, which adapts to the
+// binding instead (D3541).
+let bgWidenAsk = false
+export function bgWidenAskSet(on: boolean) { bgWidenAsk = on }
+
+export function bgWidenNameAt(i: i32): string { bgWidenNames[i] }
+
+export function bgWidenTyAt(i: i32): i32 { bgWidenTys[i] }
+
 // `bindGenWalk` with two more arms at every depth: a union's one open member binds to the
 // argument's members no concrete member is (`T | string` at `i32 | string` binds `T` to `i32`),
 // and an application binds its arguments pairwise (`Rows<A>` at `Rows<i32>`, a phantom `A` too).
@@ -7565,9 +7592,15 @@ export function bindGenWalk(
     // `T` ranges over value types; `u8` is a storage type with no value rep, so binding it
     // would instantiate an i32-list over a one-byte backing — declined here so `assignable` reports it at the argument instead.
     if primNameOf(atIx) == "u8" { return 0 }
-    if bindOf(bNames, bTys, e.tvName) < 0 {
+    const have = bindOf(bNames, bTys, e.tvName)
+    if have < 0 {
       bNames.push(e.tvName)
       bTys.push(widenLitTy(atIx))
+    } else if bgCallArg && bgWidenAsk && numWidens(have, atIx) {
+      if bindOf(bgWidenNames, bgWidenTys, e.tvName) < 0 {
+        bgWidenNames.push(e.tvName)
+        bgWidenTys.push(atIx)
+      }
     }
     return 0
   }
@@ -8040,6 +8073,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if substNestMode != SUBST_ALL && !substBindsNestRow(tyIx, t.tvName) {
       return tyIx
     }
+    if substSkipsForeignVar(tyIx) { return tyIx }
     const b = substHoleTy(tyIx, bNames, bTys)
     if b >= 0 { return b }
     return tyIx

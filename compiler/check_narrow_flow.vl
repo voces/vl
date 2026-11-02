@@ -222,7 +222,15 @@ import {
   indexRootKeyOf,
 } from "./check_getter_effects"
 import { guardCallPlace, nullCmpPlace } from "./check_guard"
-import { arrDefRowIsCall, holeLinkClosure } from "./check_hole_links"
+import {
+  arrDefRowIsCall,
+  holeLinkA,
+  holeLinkAt,
+  holeLinkB,
+  holeLinkClosure,
+  holeLinkDstTop,
+  holeLinkSrcTop,
+} from "./check_hole_links"
 import {
   HD_GNOT,
   HD_HWR,
@@ -493,6 +501,7 @@ import {
   narDefTyPop,
   narDeferJoin,
   pendArgMapAts,
+  pendArgMapInline,
   pendArgMapTys,
   pendAts,
   pendAtsSet,
@@ -1191,6 +1200,35 @@ function flushNulListPins(depth: i32) {
   0
 }
 
+// At the program's end, every linked pair a use pinned on both sides is judged as the annotated
+// twin's store is: a store whose pinned source is not assignable to its pinned destination is
+// refused in that store's words, once per store. Pins that agree pass.
+export function judgeHoleLinks() {
+  const said: i32[] = []
+  let i = 0
+  while i < holeLinkA.length {
+    const at = holeLinkAt[i]
+    if (
+      at >= 0
+      && !unresolvedHole(holeLinkA[i])
+      && !unresolvedHole(holeLinkB[i])
+      && !i32ListHas(said, at)
+      && !assignable(holeLinkSrcTop[i], holeLinkDstTop[i])
+    ) {
+      said.push(at)
+      tErr(
+        "cannot assign "
+          + tyToStr(holeLinkSrcTop[i])
+          + " to "
+          + tyToStr(holeLinkDstTop[i]),
+        at,
+      )
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Whether `ty` holds a map with an open key or value, through a function's result, a `| null`
 // or a list element.
 function tyHoldsOpenMap(ty: i32, depth: i32): boolean {
@@ -1206,12 +1244,36 @@ function tyHoldsOpenMap(ty: i32, depth: i32): boolean {
   }
 }
 
+// Each open list `ty` holds — itself, a function's result, a `| null` or a map value — takes
+// the element a hole callee wrote into it, as a pending binding's list does at scope close.
+function pinCalleeWrittenLists(ty: i32, depth: i32) {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
+  const t = tyAt(ty)
+  match t {
+    TyArray => {
+      if t.aElem < 0 {
+        calleeWritePin(ty)
+      } else {
+        pinCalleeWrittenLists(t.aElem, depth - 1)
+      }
+    }
+    TyFunc => pinCalleeWrittenLists(t.fnRet, depth - 1)
+    TyNullable => pinCalleeWrittenLists(t.nInner, depth - 1)
+    TyMap => pinCalleeWrittenLists(t.mVal, depth - 1)
+    // No other row holds a list the argument built.
+    TyPrim | TyErr | TyObj | TyUnion | TyVar | TyLit | TyNeg => {}
+  }
+  0
+}
+
 // At the program's end, an inline hole-parameter argument still holding an open map is one no
 // use pinned, the callee's included, so it takes the binding's "cannot infer a type" refusal.
 export function flushOpenArgMaps() {
+  judgeHoleLinks()
   let i = 0
   while i < pendArgMapTys.length {
-    if tyHoldsOpenMap(pendArgMapTys[i], 8) {
+    pinCalleeWrittenLists(pendArgMapTys[i], 8)
+    if pendArgMapInline[i] && tyHoldsOpenMap(pendArgMapTys[i], 8) {
       tErr(
         "cannot infer a type for this argument — an empty Map it holds has no key or value type until it is used; use it where its type is known, or annotate the parameter it is passed to",
         pendArgMapAts[i],
@@ -1226,6 +1288,8 @@ export function flushOpenArgMaps() {
 // and for the global scope at program end. A binding whose hole is still open at this point
 // will never be pinned, so it takes the unified "cannot infer a type" diagnostic.
 export function flushUninferred(depth: i32) {
+  // A binding linked to one a use pinned (`b = a`, then a write to `b`) takes its type first.
+  resolveHoleLinks()
   // A `let x = null` a later write filled stores its `null` as the filled `T | null`.
   let fi = nhFilledIxs.length
   flushNullHoles(depth)
