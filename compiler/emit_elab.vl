@@ -3885,6 +3885,36 @@ function elabArmEarly(ad: i32, an: Call, a: i32) {
   elabReachNote(-1, k, a)
 }
 
+// Per arm of a call through a set, the closed type each argument takes in the member the call's row
+// instanced, -1 where it binds none: mono builds every arm at the row's types, and the tag decision
+// admits a lambda only where each member calls it at one type (`ftLamArgOk`).
+let elabArmAltTys: {[i32]: i32[]} = Map()
+
+function elabArmAltNote(a: i32, d: i32, rn: string[], rt: i32[]) {
+  const an = nodeAt(a)
+  const sig = if d >= 0 && d < P.nodes.length { nodeTyIxOf(d) } else { -1 }
+  if !(an is Call) || sig < 0 || sig >= T.tys.length { return 0 }
+  const st = tyAt(sig)
+  if !(st is TyFunc) { return 0 }
+  const out: i32[] = []
+  let i = 0
+  while i < an.callArgs.length {
+    let t = -1
+    if i < st.fnParamTypes.length {
+      const p = st.fnParamTypes[i]
+      const pv = if p >= 0 && p < T.tys.length { tyAt(p) } else { null }
+      if pv is TyVar {
+        const w = strListIndexOf(rn, pv.tvName)
+        if w >= 0 && w < rt.length && elabTyClosed(rt[w], 0) { t = rt[w] }
+      }
+    }
+    out.push(t)
+    i = i + 1
+  }
+  elabArmAltTys[a] = out
+  0
+}
+
 // Demands at the root the un-annotated function `ad` call `a` reaches, at the call's arguments'
 // closed types, so the call mono builds for it reads that instance's parameters.
 function elabHoleCallAt(a: i32, ad: i32) {
@@ -3906,13 +3936,14 @@ function elabHoleCallAt(a: i32, ad: i32) {
     return 0
   }
   if !tyHasTyVar(sig) { return 0 }
+  const alt = elabArmAltTys.get(a) ?? []
   const pTys: i32[] = []
   let i = 0
   while i < an.callArgs.length {
     const p = st.fnParamTypes[i]
-    pTys.push(
-      if tyHasTyVar(p) { widenLitTy(nodeTyIxOf(an.callArgs[i])) } else { p },
-    )
+    let pt = if tyHasTyVar(p) { widenLitTy(nodeTyIxOf(an.callArgs[i])) } else { p }
+    if tyHasTyVar(p) && i < alt.length && alt[i] >= 0 { pt = alt[i] }
+    pTys.push(pt)
     i = i + 1
   }
   if !tysClosed(pTys) { return 0 }
@@ -4021,6 +4052,7 @@ export function elabRun() {
   elabNodeBoxs = Map()
   elabNodeNarrowed = Map()
   elabGenTy = []
+  elabArmAltTys = Map()
   elabDeadKs = Map()
   let g = 0
   const setLams: i32[] = []
@@ -4061,7 +4093,14 @@ export function elabRun() {
         elabSigAlting = false
         for a in fnTagCallArms(ix) {
           const an = nodeAt(a)
-          if an is Call { elabArmEarly(identDeclOf(an.callFn), an, a) }
+          if an is Call {
+            const ad = identDeclOf(an.callFn)
+            elabArmEarly(ad, an, a)
+            if d >= 0 && ad != d {
+              elabArmAltNote(a, d, rn, rt)
+              elabHoleCallAt(a, ad)
+            }
+          }
         }
         r = r + 1
         continue
@@ -4082,6 +4121,8 @@ export function elabRun() {
             elabReachNote(-1, k, a)
           } else {
             elabArmEarly(ad, an, a)
+            elabArmAltNote(a, d, rn, rt)
+            elabHoleCallAt(a, ad)
           }
         }
       }
