@@ -253,7 +253,7 @@ shared row names.
     `(g: (x: i32) => i32) => void` keeps its one-signature closure, and a conversion between the
     two shapes is not part of this slice.
   - **What it retires.** bundle-lam in the split-plan census: 5 `@run` files and D6481, D6706,
-    D14824, D14845, which run today only through the split plan. D14942 (unfiled: D14942, row in #5857), the same shape with a
+    D14824, D14845, which run today only through the split plan. D14942, the same shape with a
     named `lap` that refuses even with the plan, is graded beside it; serving it also needs the
     named function's parameter bundled when it is reached as a value. Not W-lam, a written
     `let` of hole lambdas, which is the binding bundle and parked on the owner's flow-typing
