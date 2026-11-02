@@ -11461,3 +11461,80 @@ const ys: u8[] = [-7 as% u8]   // 249
 and a literal the compiler can see is a mistake it can name. A computed value still truncates to
 its low 8 bits at the store, as the `u8` slot rule says, since a runtime range check on every
 store is not payable.
+
+## `x! is O` is refused, not read as `x !is O` (owner ruling A, 2026-11-02) — D3585
+
+**The rule.** A `!` written against its operand and apart from a following `is` (`x! is O`,
+`xs[0]! is O`, `(x)! is O`) is a parse error. The message names both spellings the writer
+may have meant: `x is O` to test the type, `x !is O` to negate it. `x !is O` stays the negated
+test, as do `x!is O` and `x ! is O`, where the `!` is not attached to the operand alone.
+
+**Why.** `x! is O` is the TypeScript non-null assertion followed by a type test, and it read
+as the negated test, so the program printed the opposite answer with no diagnostic (D3585).
+VL has no postfix `!` (D3555), so nothing legal is lost: the parse keys on the token
+columns only to tell an assertion from the start of `!is`.
+
+## An importer may assign an imported `let` (owner ruling, 2026-11-02) — D4063
+
+**The rule.** An imported `let` is a live binding the importer may assign. The write lands in
+the exporter's binding, so the exporter and every other importer read the new value. A
+re-exported `let` is written the same way through the re-export. An imported `const` stays
+read-only. This supersedes "the imported name is read-only" in decided direction 4
+(`docs/internals/modules-design.md` §5) and `docs/spec/modules.md` §M2.3.
+
+```vl
+// file: c.vl
+export let count = 0
+export function get(): i32 { count }
+// file: main.vl
+import { count, get } from "./c"
+count = 5
+print(get())   // prints 5
+```
+
+**Why.** It is what the compiler already did, and the compiler itself relies on it: its own
+modules assign imported `let`s throughout. A read-only rule would need a setter for each.
+
+**The price.** No analysis of a module's `let` may assume that only its own module writes it.
+
+## A read of a `let` takes its most recent write's type (owner ruling, 2026-11-02) — D2660
+
+**The rule.** A read of a `let` takes the type of the most recent write in scope, not the join
+of all its writes. In `let x = null; const y: string | null = x; x = 5`, the read of `x` is
+`null`, so the delivery is sound.
+
+**Status.** Backlogged in ROADMAP.md. The checker has no read-after-assignment typing for any
+type today, so this is a new rule. D2660 and D14930 are its witnesses and wait on it.
+
+## An inferred result one use delivers wider is built at the destination (owner ruling, 2026-11-02) — D14385
+
+**The rule.** When one use delivers an un-annotated function's result into a wider record (or a
+list of them), the result is built at the destination, as a binding is, and the function's other
+uses read it at that storage. D14385's witness prints `true` and `false`.
+
+**The constraint.** The value must not be writable, between the delivery and a use, in a way
+that breaks the wider or the narrower type. This is the alias rule of D4084's ruling.
+
+**Status.** Backlogged in ROADMAP.md. D14385 and D14890 are its witnesses and wait on it. Until
+it is built, a separate change refuses the family at check with the kept-versus-own sentence,
+graded as clause 2.
+
+## A nested join means what its hoisted twin means (owner ruling, 2026-11-02) — D3657
+
+**The rule.** Inlining or hoisting a sub-expression never changes a program's behaviour. A value
+join nested inside another is typed and built as it would be bound to a `const` first: the inner
+join's type wins, and its literal tails are built at that type wherever the outer join delivers
+it.
+
+```vl
+function run(q: i32 | null, r: f64 | null) {
+  const x = if q != null { q } else { if r != null { r } else { 7 } }
+  print(x is f64)   // true: the inner join is f64, so its `7` is 7.0
+}
+```
+
+**What moved.** An earlier rule boxed a literal inside a union chain at its own type when that
+type was a member, so the `7` above was an `i32`. A float literal tail of an inner `f32` join was
+likewise kept at `f64`; it is now built at single precision, as `const y: f32 = 0.1` is
+(`tests/cases/numerics/f32-f64-join-widens.vl`). A join whose tails are all runtime values keeps
+D3656's member boxing; this ruling settles the literal tails.

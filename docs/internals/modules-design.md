@@ -77,9 +77,9 @@ linked ones.
   monomorphization and single-wasm-output, and the direct fit for H-M2. Separate
   compilation / wasm-linking is rejected for v1 (rationale below).
 - **Export semantics.** Exported bindings are **live references** (`export let x`
-  shares the live object with importers — like JS's live bindings); the imported
-  name is a **read-only binding** (an importer can't reassign another module's
-  `let`; `const` is also exportable and additionally forbids local reassignment).
+  shares the live object with importers — like JS's live bindings); an importer
+  **may assign an imported `let`**, and the write lands in the exporter's binding
+  (owner ruling 2026-11-02, D4063); an imported `const` is read-only.
   Readonly/encapsulated exports ("public shape vs private shape") are an
   application of **A9 Readable/Writable variance** at the module boundary — A9 is
   unstarted (⬜), so this depends on it; no parallel readonly mechanism is invented.
@@ -195,12 +195,12 @@ export type Point = { x: f64, y: f64 }
 - **Export semantics = live references.** An exported binding is a *live
   reference*, not a by-value snapshot: `export let cfg = { … }` shares the live
   object with importers, so mutations are visible across modules with no getter
-  boilerplate. (Aside: JS exports are live read-only bindings too, not by-value —
-  same model.) The **imported name is a read-only binding**: an importer can read
-  and (for an exported object) mutate the *object*, but **cannot reassign** another
-  module's `let`. `const` is also exportable — it adds nothing at the import
-  boundary (already read-only there) but additionally forbids reassignment in the
-  *defining* module.
+  boilerplate. (Aside: JS exports are live bindings too, not by-value.) An importer can read and (for an exported object) mutate the
+  *object*, and **may assign an imported `let`**: the write lands in the exporter's
+  binding, so the exporter and every other importer see it (owner ruling
+  2026-11-02, D4063; this differs from JS). A re-exported `let` is writable through
+  the re-export too, so no analysis of a module's `let` may assume that only its own
+  module writes it. An imported `const` is read-only.
 - **Readonly/encapsulated exports depend on A9.** Exporting a value importers can
   read but **cannot mutate** ("public shape vs private shape") is an application of
   **A9 Readable/Writable variance** at the module boundary, *not* a separate
@@ -564,9 +564,9 @@ model is what lets those files still become the *one* module H-M2 requires.
   expose the two-primitive floor and write `List` in VL** — the module system is the
   delivery vehicle that recommendation was missing (§LS.7 OQ2).
 - **Export semantics across the std boundary.** Std exports follow the §2.1 rule —
-  **live references, read-only at the import site.** A std `List<T>` value handed
-  to user code shares its live object (mutations visible), and the user cannot
-  reassign a std `let`. Where std wants to expose a value users may read but **not
+  **live references.** A std `List<T>` value handed to user code shares its live
+  object (mutations visible), and a std `let` is assignable by its importer like any
+  imported `let` (D4063). Where std wants to expose a value users may read but **not
   mutate** (encapsulated state, "public shape vs private shape"), that is the
   **A9 Readable/Writable** application at the module boundary — **A9 is unstarted
   (⬜)**, so any encapsulated-export need in std is gated on A9, not on a parallel
@@ -629,7 +629,7 @@ model is what lets those files still become the *one* module H-M2 requires.
 1. **Phase 1 — relative imports + explicit export + whole-program compile
    (unblocks H3).**
    - `export` modifier on `function`/`let`/`type`; `import { … } from "./path"`
-     (no `.vl` extension); live-reference / read-only-binding export semantics;
+     (no `.vl` extension); live-reference export semantics;
      **`import { x as y }` rename** (cheap, needed for generated code).
    - Loader + resolver for relative paths (append `.vl`); graph walk with dedupe +
      cycle handling; per-module scopes chained to `defaultScope` (no prelude).
@@ -735,8 +735,9 @@ each, and the unreviewed item (cross-module init order) stays fully open.
    source map now; embedded data section for the self-hosted compiler later).
 4. **Export semantics = live references; readonly is A9.** ✅ Exported bindings are
    **live references** (`export let x` shares the live object; cf. JS live
-   bindings); the imported name is **read-only** (no reassigning another module's
-   `let`; `const` also exportable, additionally forbidding local reassignment).
+   bindings); an importer **may assign an imported `let`** and the write lands in the
+   exporter's binding (owner ruling 2026-11-02, D4063, superseding "read-only"); an
+   imported `const` is read-only.
    **Readonly/encapsulated exports** ("public shape vs private shape") are an
    application of **A9 Readable/Writable** at the boundary — **A9 is unstarted (⬜),
    a flagged dependency**; no parallel readonly mechanism is invented.
