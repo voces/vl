@@ -198,7 +198,12 @@ import {
   rcwCovs,
   stampNullUnitCell,
 } from "./check_fit_rules"
-import { CSTR_NODECL, lambdaLastOrder } from "./check_generic_args"
+import {
+  CSTR_NODECL,
+  lambdaLitLastOrder,
+  litArgBindsLast,
+  numLitArg,
+} from "./check_generic_args"
 import {
   bitcastArgTy,
   builtinShadowMsg,
@@ -277,7 +282,7 @@ import {
 } from "./check_node_rules"
 import { nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import { lbiNoDest } from "./check_num_lit_state"
-import { floatIntrWidth } from "./check_num_lits"
+import { floatIntrWidth, isFloatLitExpr } from "./check_num_lits"
 import { arityWantText, ovPlainHint, paramNamesOfNodes } from "./check_overload"
 import {
   getSiteFnOf,
@@ -449,6 +454,7 @@ import {
   isNullTy,
   isVoidTy,
   nonNullTy,
+  primNameOf,
   tyHasTyVar,
   tyIsU8ArrayTy,
   tyReachesHole,
@@ -1270,7 +1276,15 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     dstNames = []
     dstBindLitTyParams(ix, ft.fnRet, params, args, bNames, bTys, dstNames)
   }
-  const argOrder = lambdaLastOrder(params, args)
+  const litLast: boolean[] = []
+  if !explicitTa {
+    let li = 0
+    while li < args.length {
+      litLast.push(litArgLast(params, args, li))
+      li = li + 1
+    }
+  }
+  const argOrder = lambdaLitLastOrder(params, args, litLast)
   const pinRows0 = elabHoleRowMark()
   // Each argument's destination as its own turn saw it, for the literals re-delivered below.
   const argExp: i32[] = []
@@ -4074,4 +4088,30 @@ function bareInferHole(t: i32): boolean {
   const tv = tyAt(t)
   if tv is TyVar { return tv.tvName.length == 0 || tv.tvName[0] == "?"[0] }
   false
+}
+
+// Whether number-literal argument `i` binds its variable after the arguments beside it: an
+// integer literal fits any number they bind, a float literal only an `f32` every named argument
+// beside it already holds; otherwise a float binds first and they widen into it (D3541).
+function litArgLast(params: i32[], args: i32[], i: i32): boolean {
+  if !litArgBindsLast(params, args, i) { return false }
+  if !isFloatLitExpr(args[i]) { return true }
+  const v = tyAt(params[i])
+  if !(v is TyVar) { return false }
+  let j = 0
+  while j < params.length && j < args.length {
+    if (
+      j != i
+      && !numLitArg(args[j])
+      && tyMentionsTyVarNamed(params[j], v.tvName, 8)
+    ) {
+      const a = nodeAt(cwPeel(args[j]))
+      if !(a is Ident) { return false }
+      if primNameOf(identTyOf(cwPeel(args[j]), a.identName)) != "f32" {
+        return false
+      }
+    }
+    j = j + 1
+  }
+  true
 }
