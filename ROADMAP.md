@@ -90,6 +90,11 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   The value must not be writable, between the delivery and a use, in a way that breaks the
   wider or the narrower type. Witnesses: D14385 and D14890. DECISIONS.md §"An inferred result
   one use delivers wider is built at the destination".
+- **Exact trap kinds through `-O`/`-O3`** (owner ruling (c), 2026-11-02). An optimizer that
+  proves a trap always fires folds it into `unreachable`, and the banner can only list the
+  causes. Routing each trap kind through a named function kept out of inlining (wasm-opt
+  `--no-inline`), or reading a source-map row at the trap, would name the one that fired.
+  DECISIONS.md §"An optimized build's `unreachable` banner names what it may stand for".
 
 ## Consumers
 
