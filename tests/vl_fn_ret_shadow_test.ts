@@ -398,6 +398,14 @@ const w1: F = d1()
 print(w1.v / 2)
 `;
 
+// D14901 class D: a list of records whose own element has no row is built at its literal's stamp.
+const LIST_NO_OWN_ROW = `type Circle = { r: i32 | null }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+function mk() { return [{ r: null }, { r: null }] }
+print(mk().length)
+`;
+
 // D14902: an un-annotated function whose value is a call's, rebound, is built where that call is,
 // not at the narrow record its callers are stamped at; a generic taking its call reads it there.
 const ROW_CALL_BUILT = `type II = { f: i32 }
@@ -480,6 +488,14 @@ Deno.test({
       DROP_NONE,
       true,
       "kind agree | d1=1",
+      true,
+    );
+    expectRows(
+      "list no own row",
+      LIST_NO_OWN_ROW,
+      DROP_NONE,
+      true,
+      "kind agree | mk=1",
       true,
     );
   },
