@@ -4,6 +4,7 @@
 
 import { monoIsGenericDecl } from "./emit_base"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
+import { paramHoleName } from "./check_tp_join"
 import { decDigitsOf } from "./strutil"
 import { constListFnElemDecl } from "./check_calls"
 
@@ -1347,12 +1348,60 @@ function elabDemandFrom(
   }
   // A declaration with no type variable to bind is its generic pass's own typing: the root.
   if names.length == 0 && elabBindsNothing(decl) { return -1 }
+  // A binding kept as a set where the elaboration already holds the instance at every closed pin
+  // (a rep row's) is that instance.
+  let anyId = false
+  for b in byId {
+    if b { anyId = true }
+  }
+  if anyId && !tagged {
+    const pk = elabKeyAtPins(decl, names0, tys0, pTys, from)
+    if pk >= 0 { return pk }
+  }
   const n0 = ekDecl.length
   const k = elabEnqueue(decl, names, tys, from)
   elabReachNote(from, k, -1)
   if k >= 0 && !ekDone[k] { elabOne(k) }
   elabSettle(n0)
   k
+}
+
+// The instance of `decl` under `from` already keyed by `names0`/`tys0` with each parameter bound
+// at its closed pin in `pTys`; -1 when the elaboration holds none.
+function elabKeyAtPins(
+  decl: i32,
+  names0: string[],
+  tys0: i32[],
+  pTys: i32[],
+  from: i32,
+): i32 {
+  const sig = nodeTyIxOf(decl)
+  if sig < 0 || sig >= T.tys.length { return -1 }
+  const f = tyAt(sig)
+  if !(f is TyFunc) { return -1 }
+  const bn: string[] = []
+  const bt: i32[] = []
+  let p = 0
+  while p < f.fnParamTypes.length && p < pTys.length {
+    if elabTyClosed(pTys[p], 0) {
+      bindGenWalk(f.fnParamTypes[p], pTys[p], bn, bt)
+    }
+    p = p + 1
+  }
+  let i = 0
+  while i < names0.length && i < tys0.length {
+    if !strListHas(bn, names0[i]) {
+      bn.push(names0[i])
+      bt.push(tys0[i])
+    }
+    i = i + 1
+  }
+  const names: string[] = []
+  const tys: i32[] = []
+  if !elabCanon(decl, bn, bt, names, tys) { return -1 }
+  const parent = elabParentFor(decl, from)
+  if parent == 0 - 2 { return -1 }
+  ekIndex[i32ToStr(parent) + "^" + elabKeyOf(decl, names, tys)] ?? -1
 }
 
 // The tagged set, or list of one, argument `p` of call `call` to `decl` hands an un-annotated
@@ -3111,6 +3160,100 @@ function elabReadSeedParam(ix: i32, fn: FuncDecl, depth: i32): i32 {
   elabReadSeedParam(ln.letInit, fn, depth - 1)
 }
 
+// Gives each type parameter of `decl` that `elabTyParamSeedParam` infers from a parameter the rep
+// of that parameter's binding in row `names`/`rep`, appending it to the row when absent. A seed
+// whose set holds one generic and has no closed rep takes the one signature the calls through it
+// and its copies instance that generic at. True when the row changed.
+function elabSeedReps(
+  decl: i32,
+  names: string[],
+  tys: i32[],
+  rep: i32[],
+): boolean {
+  if decl < 0 || decl >= P.nodes.length { return false }
+  const fn = nodeAt(decl)
+  if !(fn is FuncDecl) { return false }
+  let changed = false
+  for tp in fn.fnTyParams {
+    const pd = elabTyParamSeedParam(fn, tp)
+    const j = i32ListIndexOf(fn.fnParams, pd)
+    const sn = if j >= 0 { elabSeedBindName(fn, decl, j) } else { "" }
+    const w = strListIndexOf(names, sn)
+    if w >= 0 && w < rep.length && w < tys.length {
+      if !(rep[w] >= 0 && elabTyClosed(rep[w], 0)) {
+        const ms = elabFnSetOf(tys[w])
+        const r = if ms.length == 1 { elabCallsRep(elabSeedCalls(fn, pd), ms[0], names, tys) } else { -1 }
+        if r >= 0 {
+          rep[w] = r
+          changed = true
+        }
+      }
+      const i = strListIndexOf(names, tp)
+      if i < 0 {
+        names.push(tp)
+        rep.push(rep[w])
+        changed = true
+      } else if i < rep.length && rep[i] != rep[w] {
+        rep[i] = rep[w]
+        changed = true
+      }
+    }
+  }
+  changed
+}
+
+// The calls in `fn`'s body, outside nested functions, whose callee reads parameter `pd` or a
+// binding `elabReadSeedParam` traces to it.
+function elabSeedCalls(fn: FuncDecl, pd: i32): i32[] {
+  const out: i32[] = []
+  const stack: i32[] = [fn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length && !(nodeAt(ix) is FuncDecl) {
+      const n = nodeAt(ix)
+      if n is Call {
+        const cf = parenPeelIx(n.callFn)
+        if (
+          cf >= 0
+          && nodeAt(cf) is Ident
+          && elabReadSeedParam(cf, fn, 8) == pd
+        ) {
+          out.push(ix)
+        }
+      }
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  out
+}
+
+// The name an instance binds parameter `j` of `fn` by: the own type parameter annotating it bare,
+// or its hole's name when un-annotated; "" otherwise.
+function elabSeedBindName(fn: FuncDecl, decl: i32, j: i32): string {
+  const pn = nodeAt(fn.fnParams[j])
+  if !(pn is Param) { return "" }
+  if pn.parType >= 0 { return elabTyParamNameOf(fn, fn.fnParams[j]) }
+  paramHoleName(fn.fnName, decl, j)
+}
+
+// The closed type the elaboration's instance of `decl0` for `call`, reached from the instance
+// being walked, binds type parameter `tp` to, where that is the type of the parameter
+// `elabTyParamSeedParam` infers `tp` from; -1 when the instance does not bind it so.
+export function elabCallSeedBind(decl0: i32, call: i32, tp: string): i32 {
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const decl = elabSrcDecl(decl0)
+  if call < 0 || decl < 0 || decl >= P.nodes.length { return -1 }
+  const fn = nodeAt(decl)
+  if !(fn is FuncDecl) { return -1 }
+  const pd = elabTyParamSeedParam(fn, tp)
+  const k = elabCallInstFrom(call, top)
+  if pd < 0 || k < 0 || k >= ekDecl.length || ekDecl[k] != decl { return -1 }
+  const t = bindOf(ekNames[k], ekTys[k], tp)
+  const st = elabNodeTy(pd, k)
+  if t < 0 || st < 0 || !tySame(t, st) || !elabTyClosed(t, 0) { return -1 }
+  t
+}
+
 // Whether own type parameters `a` and `b` name one type: the same name, or two that instance `k`
 // binds to one closed type.
 function elabTyParamsAgreeAt(a: string, b: string, k: i32): boolean {
@@ -4385,6 +4528,16 @@ function elabGenericCallRep(
   if pi < 0 || pi >= dn.fnParams.length { return -1 }
   const calls: i32[] = []
   elabCallsThrough(dn.fnBody, dn.fnParams[pi], calls)
+  elabCallsRep(calls, m, names, tys)
+}
+
+// The one signature at which generic `m` is instanced by every call in `calls`, their argument
+// types read under `names`/`tys`; -1 when one does not close or two disagree.
+function elabCallsRep(calls: i32[], m: i32, names: string[], tys: i32[]): i32 {
+  const msig = if m >= 0 && m < P.nodes.length { nodeTyIxOf(m) } else { -1 }
+  if msig < 0 || msig >= T.tys.length { return -1 }
+  const mf = tyAt(msig)
+  if !(mf is TyFunc) || calls.length == 0 { return -1 }
   let rep = -1
   for c in calls {
     const cn = nodeAt(c)
@@ -4496,12 +4649,14 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
     rep.push(rt)
     i0 = i0 + 1
   }
+  const rowN = names.slice(0)
+  if elabSeedReps(elabCallDeclOf(ix), rowN, tys, rep) { moved = true }
   if moved && rep.length > 0 && tysClosed(rep) {
     // A set no member gives a signature reps as a stub no call reaches, so its instance is a guess.
     elabGuessing = elabRepStubbed
     elabRepresenting = true
     elabSigAlting = direct
-    const rk = elabEnqueue(elabCallDeclOf(ix), names, rep, -1)
+    const rk = elabEnqueue(elabCallDeclOf(ix), rowN, rep, -1)
     elabSigAlting = false
     elabRepresenting = false
     elabReachNote(-1, rk, -1)
