@@ -2415,6 +2415,7 @@ export function elabMintFacts(): i32 {
         && !elabKeyUncalled(kk)
         && !elabKeyCallsHandSet(kk, c, d)
         && !elabKeyCallsHandClosure(kk, c, d)
+        && !elabKeyCallsHandSetValue(kk, c, d)
       ) {
         all = false
       }
@@ -2449,6 +2450,37 @@ function elabKeyCallsHandSet(k: i32, c: i32, d: i32): boolean {
     const a = parenPeelIx(xn.callArgs[pi])
     if a < 0 || !(nodeAt(a) is Ident) || !i32ListHas(ms, identDeclOf(a)) {
       return false
+    }
+  }
+  true
+}
+
+// Whether every call reaching instance `k` names the function `d` itself and hands, at the
+// parameter `c` calls through, a value the reaching instance types as `c`'s set: `k` is that
+// call's instance at the set's rep, which a tagged set's direct call does not build.
+function elabKeyCallsHandSetValue(k: i32, c: i32, d: i32): boolean {
+  const cs = elabKeyCalls[k] ?? []
+  if cs.length == 0 || (elabRepRowCalls[k] ?? []).length > 0 { return false }
+  const dn = nodeAt(d)
+  const cn = nodeAt(c)
+  if !(dn is FuncDecl) || dn.fnName == "" || !(cn is Call) { return false }
+  const pi = i32ListIndexOf(dn.fnParams, identDeclOf(parenPeelIx(cn.callFn)))
+  const s = elabMintSets[c] ?? -1
+  if pi < 0 || s < 0 { return false }
+  for x in cs {
+    const xn = nodeAt(x)
+    if !(xn is Call) || pi >= xn.callArgs.length { return false }
+    if elabCalleeNamesDecl(xn.callFn) != d { return false }
+    const ks = elabCallKeys[x] ?? []
+    let j = 0
+    while j + 1 < ks.length {
+      if ks[j + 1] == k {
+        if ks[j] < 0 { return false }
+        if fnTagSetOfTy(elabNodeTy(xn.callArgs[pi], ks[j])) != s {
+          return false
+        }
+      }
+      j = j + 2
     }
   }
   true
@@ -2666,9 +2698,10 @@ function elabSetFwdTarget(ix: i32, p: i32, k: i32): i32[] {
   out
 }
 
-// Notes parameter `i` of `fn` (declared at `decl`), copied into the unannotated binding `d`,
-// as forwarded wherever `d` is read: true only when every read of `d` in `fn`'s body is a
-// positional argument of a call through a set of functions, and none sits in a nested function.
+// Notes parameter `i` of `fn` (declared at `decl`), copied into binding `d`, unannotated or
+// annotated with the type parameter annotating `i`, as forwarded wherever `d` is read: true only
+// when every read of `d` in `fn`'s body is a positional argument of a call through a set of
+// functions or of a named function's open parameter, and none sits in a nested function.
 function elabAliasSetFwd(
   decl: i32,
   i: i32,
@@ -2679,7 +2712,17 @@ function elabAliasSetFwd(
 ) {
   if st < 0 || d < 0 || d >= P.nodes.length { return false }
   const ln = nodeAt(d)
-  if !(ln is LetDecl) || ln.letType >= 0 { return false }
+  if !(ln is LetDecl) { return false }
+  if ln.letType >= 0 {
+    const own = elabTyParamNameOf(fn, d)
+    if (
+      own == ""
+      || i >= fn.fnParams.length
+      || elabTyParamNameOf(fn, fn.fnParams[i]) != own
+    ) {
+      return false
+    }
+  }
   const tos: i32[][] = []
   const todo: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
@@ -2693,8 +2736,9 @@ function elabAliasSetFwd(
         // A nested function's read is one body for every instance (D14842).
         if inFn { return false }
         const to = elabSetFwdTarget(x, p, k)
-        if to.length == 0 { return false }
-        tos.push(to)
+        const named = if to.length == 0 { elabMintFwdTarget(x, p) } else { [] }
+        if to.length == 0 && named.length != 2 { return false }
+        tos.push(if to.length > 0 { to } else { [named[1], named[0]] })
       }
       const deeper = inFn || nodeAt(x) is FuncDecl
       for c in nodeChildren(x) {
