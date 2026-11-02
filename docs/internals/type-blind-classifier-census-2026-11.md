@@ -172,3 +172,20 @@ The other five are not rep-from-syntax classifiers. `vkNonNullRefTwin` is a VKin
 | `readIndexStoreKind` | 41 | 1 | 963 (202) | 55,186 (3721) |
 | `letCellSlot` | 13 | 3 | 0 (0) | 186,888 (11483) |
 | `readCallStoreKind` | 9 | 1 | 0 (0) | 74 (15) |
+
+## After return-kind inference reads the recorded result (2026-11-02)
+
+`exprListRep`'s asks before monomorphize, by pass: `computeRetInference` 228,242 (97.9%),
+`monomorphize` 2,123, `collectA` 1,635, `dispatchRewrite` 921. Once `criClassify` answers a
+closed recorded result first, the asks before monomorphize fall as follows, with no output
+change. No mixed classifier becomes post-monomorphize-only yet.
+
+| classifier | calls before monomorphize, then | now |
+| --- | --- | --- |
+| `exprListRep` | 233,073 | 84,760 |
+| `listOfColumn` | 232,981 | 83,140 |
+| `callStoreListKind` | 47,505 | 8,621 |
+| `capturedKindOf` | 137,574 | 129,306 |
+| `unionIdentReadKind` | 26,320 | 22,274 |
+| `vkNulKindOf` | 13,193 | 9,176 |
+| `unionNameOfRead` | 18,340 | 14,616 |

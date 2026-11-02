@@ -71,6 +71,7 @@ import {
   tyArrayElemPrimName,
   tyAt,
   tyFieldTyOf,
+  tyHasInferHole,
   tyIsLitUnion,
   tyIsNullableLitUnion,
   tyPrimNameOf,
@@ -200,7 +201,7 @@ import {
   tyPrimLeafListKind,
   tyScalarBackedListKind,
 } from "./emit_ref_list_kinds"
-import { repSigTokOfKind } from "./emit_rep"
+import { repOfTy, repSigTokOfKind } from "./emit_rep"
 import { repSigRetTokOfTy, repSigTokOfTy } from "./emit_rep_slot"
 import { globalLetOfSid } from "./emit_local_slots"
 import { paramTypeNodeOfRead } from "./emit_query"
@@ -245,6 +246,8 @@ import { i32ListHas } from "./listutil"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { arrElemNameRaw } from "./tyname"
 import { primNameOf, tyEmitPrimOf, tyHasTyVar } from "./tyquery"
+import { fnRecordedRetTy } from "./fn_ret_shadow"
+import { vkListClass } from "./emit_list_rep"
 
 // True when the `.map` callback at `fe` produces an element riding the string list — a
 // plain `string` or the `string | null` niche, which share one wrapper and backing pair.
@@ -499,6 +502,29 @@ export function fnSigIdxOfFn(fe: i32) {
   cloSigTypeIdxAt(cloSigPosOfKey(key))
 }
 
+// The list function `i`'s recorded result is, when that result is closed and covered and its rep
+// is a non-null, non-union list; null otherwise, which leaves the return expressions to classify.
+function criRecordedListKind(i: i32): VKind | null {
+  const r = fnRecordedRetTy(i)
+  if r < 0 || r >= T.tys.length || tyHasTyVar(r) || tyHasInferHole(r, 0) {
+    return null
+  }
+  const rd = repOfTy(r)
+  if rd.rdCovered != 1 || vkListClass(rd.rdKind) != 1 { return null }
+  rd.rdKind
+}
+
+// Whether function `i`'s recorded result is closed and covered, and its rep is no list and no
+// union box, so no return expression of it can be a list.
+function criRecordedNoList(i: i32): boolean {
+  const r = fnRecordedRetTy(i)
+  if r < 0 || r >= T.tys.length || tyHasTyVar(r) || tyHasInferHole(r, 0) {
+    return false
+  }
+  const rd = repOfTy(r)
+  rd.rdCovered == 1 && vkListClass(rd.rdKind) == 0 && rd.rdKind != "union"
+}
+
 // Classify one valued return expression at `rx0` of the function at `fnStmts` position `i`,
 // the shared loop body of the return walk.
 export function criClassify(rx0: i32, i: i32) {
@@ -515,6 +541,15 @@ export function criClassify(rx0: i32, i: i32) {
     if fRetKind[i] != cmk {
       fRetKind[i] = cmk
       criChanged = true
+    }
+    return 0
+  }
+  // A result recorded at a closed non-null list is that list, whatever its return expressions'
+  // shapes; the ref list's element is named off the recorded type first.
+  const rlk = criRecordedListKind(i)
+  if rlk != null {
+    if criSetRetKind(i, rlk) && rlk == "reflist" && i < fRetRArrElem.length {
+      fRetRArrElem[i] = criRetRefListElemName(rx, i)
     }
     return 0
   }
@@ -553,11 +588,12 @@ export function criClassify(rx0: i32, i: i32) {
       criSetRetKind(i, "map")
     }
   }
-  criClassifyArenaRefList(rx, i)
+  const noList = criRecordedNoList(i)
+  if !noList { criClassifyArenaRefList(rx, i) }
   // The not-a-list guard is what separates i32 and f64 lists here: `exprArray`'s array-literal
   // case is `!arrLitIsRef` and an f64 element is not a ref, so it also claims `[1.5, 2.5]`.
   // The f64-list arm above has already set the kind, so this one skips it.
-  if !retKindIsList(fRetKind[i]) && exprArray(rx, fnStmts[i]) {
+  if !noList && !retKindIsList(fRetKind[i]) && exprArray(rx, fnStmts[i]) {
     criSetRetKind(i, "list")
   }
   criClassifyUnionNul(rx, i)
@@ -717,6 +753,8 @@ function criClassifyScalarTail(rx: i32, i: i32) {
 // scalar-backed, f64, i64, f32 and `u8` lists, then the empty `[]` hole, each filling the
 // kind (and a ref list's element name) only while no list kind is set yet.
 function criClassifyList(rx: i32, i: i32) {
+  // A result recorded at a closed type that is neither a list nor a union box takes no list rung.
+  if criRecordedNoList(i) { return 0 }
   if !retKindIsList(fRetKind[i]) && exprRefArray(rx, fnStmts[i]) {
     // Record the element type-name so the inferred functype result can resolve its ref-list
     // slot: the annotated path fills `fRetRArrElem` from the annotation, but an un-annotated
