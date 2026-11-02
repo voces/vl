@@ -824,9 +824,9 @@ The emitter still decides some literal widths from context: (A) the literal arms
 
 ### 3.2 What stands between master and deleting the split plan (re-census, 2026-11-02)
 
-Step 4's final deletion removes `fn_split.vl` (6,107 lines), `fn_flow_shadow.vl` (3,494) and the driver's `FS_PLAN`/`FS_APPLY` loop. Measured with the split plan turned off (`holeFnSplitHas` answering no and `compileSrc` returning after its first compile), on fixpoint seeds, first at `a48eddb4` and again at `bda38f7c` with #5913 merged:
+Step 4's final deletion removes `fn_split.vl` (6,107 lines), `fn_flow_shadow.vl` (3,494) and the driver's `FS_PLAN`/`FS_APPLY` loop. Measured with the split plan turned off (`holeFnSplitHas` answering no and `compileSrc` returning after its first compile), on fixpoint seeds, first at `a48eddb4` and again at `80e014f2` (after #5913):
 
-| population | `a48eddb4` | `bda38f7c` + #5913 |
+| population | `a48eddb4` | `80e014f2` |
 | --- | --- | --- |
 | `@run` files under `tests/` | 62 of 5,398 refuse | 55 of 5,439 refuse |
 | filed witnesses | 25 of 4,186 move, every one `runs` → emit refusal | 21 of 4,216 move: 20 `runs` → emit refusal, and D14943 check reject → emit refusal (with the plan off, `vl check` does not reach the instance's type error) |
