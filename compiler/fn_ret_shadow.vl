@@ -10,6 +10,7 @@ import {
   Call,
   FuncDecl,
   Ident,
+  Index,
   LetDecl,
   ObjLit,
   P,
@@ -22,7 +23,15 @@ import { recHoleIdentityArg } from "./check_fit_rules"
 import { recBuildTable, recBuildTyIn, recKeptFnDstOf } from "./check_rec_rows"
 import { recPassThroughArg } from "./check_record_origins"
 import { identBoundFnDeclOf } from "./check_scopes"
-import { cwPeelValue } from "./check_write_scan"
+import {
+  cwBindingOf,
+  cwFramedNode,
+  cwIxWant,
+  cwKeyOfRoot,
+  cwPeel,
+  cwPeelValue,
+  cwSlotWrittenValues,
+} from "./check_write_scan"
 import { nodeHoleElemOf } from "./check_side_rows"
 import {
   T,
@@ -159,10 +168,10 @@ function frsCallsBuiltRow(fx: i32, r: i32): i32 {
   row
 }
 
-// The record call `c`'s value is built at: where the callee hands an argument straight back (a
-// generic identity, or a hole function that only rebinds and returns its parameter), the row the
-// checker's record solve builds that argument at (D14902); where the callee's every value is
-// call-built, that row (`frsValuesBuiltRow`); else the call's own stamp.
+// The record call `c`'s value is built at: where the callee hands an argument straight back (an
+// identity, or a hole function returning its parameter), that argument's build (D14902), an
+// element read at its list's (`frsElemBuiltRow`); where the callee's every value is call-built,
+// that row (`frsValuesBuiltRow`); else the call's own stamp.
 function frsCallBuiltAt(c: i32, hops: i32): i32 {
   const st = nodeRepTyIxOf(c)
   if hops >= 16 || c < 0 || c >= P.nodes.length { return st }
@@ -188,6 +197,8 @@ function frsCallBuiltAt(c: i32, hops: i32): i32 {
     if b < 0 { b = nodeRepTyIxOf(ap) }
   } else if an is ObjLit {
     b = nodeRepTyIxOf(ap)
+  } else if an is Index {
+    b = frsElemBuiltRow(ap)
   }
   if b < 0 || b >= T.tys.length || !(tyAt(b) is TyObj) || tyHasTyVar(b) {
     return st
@@ -218,6 +229,50 @@ function frsValuesBuiltRow(fx: i32): i32 {
     row = st
   }
   row
+}
+
+// The record element read `ix` (`xs[i]`, `xs` a binding) is built at: every value stored in the
+// list's elements, its literal's and each write's through any alias (`cwSlotWrittenValues`), read
+// at a plain function's kept build where it is that function's call, else at its stamp; the one
+// closed record with a row they agree on, else -1 (D14901 class D).
+function frsElemBuiltRow(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if !(n is Index) { return -1 }
+  const arr = cwPeel(n.idxArr)
+  if arr < 0 || arr >= P.nodes.length || !(nodeAt(arr) is Ident) { return -1 }
+  cwIxWant()
+  if !cwFramedNode(arr) || cwKeyOfRoot(arr) < 0 { return -1 }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwBindingOf(arr), ["[]"], vals, ats) < 0 { return -1 }
+  if vals.length == 0 { return -1 }
+  let row = -1
+  for v in vals {
+    const st = frsValueBuiltAt(cwPeelValue(v))
+    if st < 0 || st >= T.tys.length || !(tyAt(st) is TyObj) || tyHasTyVar(st) {
+      return -1
+    }
+    if repSigRetTokOfTy(st) == "" { return -1 }
+    if row >= 0 && !tySame(row, st) { return -1 }
+    row = st
+  }
+  row
+}
+
+// The record stored value `v` is built at: a plain function's call at that function's kept
+// build (`recKeptFnDstOf`) where one is recorded, else its own stamp, as the lowering reads it.
+function frsValueBuiltAt(v: i32): i32 {
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const n = nodeAt(v)
+  if n is Call {
+    const fd = if n.callFn >= 0 { identBoundFnDeclOf(n.callFn) } else { -1 }
+    if frsIsPlainFn(fd) {
+      const own = frsFnRet(elabCheckedTyOf(fd))
+      const kd = if own >= 0 { recKeptFnDstOf(fd, own) } else { -1 }
+      if kd >= 0 { return kd }
+    }
+  }
+  nodeRepTyIxOf(v)
 }
 
 // The record or list every value function `fx` returns is stamped at, a literal at its own stamp
