@@ -231,6 +231,14 @@ const SPREAD = `function run(xs: (boolean | null)[], ys: i32[]) {
 run([true, null], [1])
 `;
 
+// A generic `a ?? 5` at a list pin is the join `i32[] | i32` (D10600): the instance boxes its
+// left operand into that, though the instance's own result is `i32[]`.
+const COALPIN = `function tail<T>(a: T) { a ?? 5 }
+const u = [1, 2]
+const v1 = tail(u)
+if v1 is i32[] { print(v1.length) } else { print(v1) }
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -364,6 +372,18 @@ Deno.test({
   ignore,
   fn: () =>
     expectRows("spread", SPREAD, DROP_NONE, "agree=2; nested agree=2"),
+});
+
+Deno.test({
+  name: "box-dst shadow: a generic `??` at an instance takes its pin's join",
+  ignore,
+  fn: () =>
+    expectRows(
+      "coalpin",
+      COALPIN,
+      DROP_NONE,
+      "agree=1; nested agree=1; nested value already a box=1; value already a box=1",
+    ),
 });
 
 Deno.test({
