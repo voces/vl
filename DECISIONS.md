@@ -11445,3 +11445,15 @@ its fields.
 later write could invalidate the narrowing, and when none can, the delivery is fine without a
 copy. It would relax lists and records alike (D14827, whose witness is D14752's original
 spelling).
+
+## `x! is O` is refused, not read as `x !is O` (owner ruling A, 2026-11-02) — D3585
+
+**The rule.** A `!` written against its operand and apart from a following `is` (`x! is O`,
+`xs[0]! is O`, `(x)! is O`) is a parse error. The message names both spellings the writer
+may have meant: `x is O` to test the type, `x !is O` to negate it. `x !is O` stays the negated
+test, as do `x!is O` and `x ! is O`, where the `!` is not attached to the operand alone.
+
+**Why.** `x! is O` is the TypeScript non-null assertion followed by a type test, and it read
+as the negated test, so the program printed the opposite answer with no diagnostic (D3585).
+VL has no postfix `!` (D3555), so nothing legal is lost: the parse keys on the token
+columns only to tell an assertion from the start of `!is`.
