@@ -11457,3 +11457,48 @@ test, as do `x!is O` and `x ! is O`, where the `!` is not attached to the operan
 as the negated test, so the program printed the opposite answer with no diagnostic (D3585).
 VL has no postfix `!` (D3555), so nothing legal is lost: the parse keys on the token
 columns only to tell an assertion from the start of `!is`.
+
+## An importer may assign an imported `let` (owner ruling, 2026-11-02) — D4063
+
+**The rule.** An imported `let` is a live binding the importer may assign. The write lands in
+the exporter's binding, so the exporter and every other importer read the new value. A
+re-exported `let` is written the same way through the re-export. An imported `const` stays
+read-only. This supersedes "the imported name is read-only" in decided direction 4
+(`docs/internals/modules-design.md` §5) and `docs/spec/modules.md` §M2.3.
+
+```vl
+// file: c.vl
+export let count = 0
+export function get(): i32 { count }
+// file: main.vl
+import { count, get } from "./c"
+count = 5
+print(get())   // prints 5
+```
+
+**Why.** It is what the compiler already did, and the compiler itself relies on it: its own
+modules assign imported `let`s throughout. A read-only rule would need a setter for each.
+
+**The price.** No analysis of a module's `let` may assume that only its own module writes it.
+
+## A read of a `let` takes its most recent write's type (owner ruling, 2026-11-02) — D2660
+
+**The rule.** A read of a `let` takes the type of the most recent write in scope, not the join
+of all its writes. In `let x = null; const y: string | null = x; x = 5`, the read of `x` is
+`null`, so the delivery is sound.
+
+**Status.** Backlogged in ROADMAP.md. The checker has no read-after-assignment typing for any
+type today, so this is a new rule. D2660 and D14930 are its witnesses and wait on it.
+
+## An inferred result one use delivers wider is built at the destination (owner ruling, 2026-11-02) — D14385
+
+**The rule.** When one use delivers an un-annotated function's result into a wider record (or a
+list of them), the result is built at the destination, as a binding is, and the function's other
+uses read it at that storage. D14385's witness prints `true` and `false`.
+
+**The constraint.** The value must not be writable, between the delivery and a use, in a way
+that breaks the wider or the narrower type. This is the alias rule of D4084's ruling.
+
+**Status.** Backlogged in ROADMAP.md. D14385 and D14890 are its witnesses and wait on it. Until
+it is built, a separate change refuses the family at check with the kept-versus-own sentence,
+graded as clause 2.
