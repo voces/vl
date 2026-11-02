@@ -22,6 +22,11 @@ Status: draft. The mechanism half is inc3's; the population and acceptance half 
   instanced per encloser: adding it later would rewrite every reader twice, and a reader written
   in between would key wrong for exactly the D14842 shape. The writer knows the instance where
   mono mints the clone.
+  As landed with (b), the column is the function node of the mono instance whose body holds the
+  site (`monoCadInstOf(fnIx)`, the node a reader in `fnIx` already holds), not the elaboration
+  key: one elaboration key can hold two mono instances (nominal twins `C`/`D`, or a parameter
+  pinned at `null` beside one pinned at its type), and keying by the elaboration key gave those
+  two clones one key.
 - *fe* is the emitted function slot whose body is the lambda instanced at that signature.
 
 **A creation site inside a generic instance is per instance.** If a list literal of hole functions sits in the body of a function with two instances, a member handed each instance's own set needs one closure per instance. Today the element-at-set path (#5693) keys the element node once (`monoElemAtSet`). That is why #5673's shared-member partial clause has to stay. Measured on `run(h) { const fs = [apply2, apply3]; for f in fs { f(h) } }` with `run(add); run(mul)`: dropping the clause prints `3 4 3 4` for `3 4 2 3.75`. So the row keys the instance beside the site (below), and the clause narrows to holders shared across instances only once a nested body is instanced per encloser.
