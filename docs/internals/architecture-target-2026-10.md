@@ -883,9 +883,11 @@ F's 15 files are four shapes by witness:
   - the partial-set rule ignores the reaches of the signature-alternative instances the result's
     type makes (`elabKeyCallsHandSetValue`).
 
-  Both rows' witnesses run, pinned by `generic-fn-value-two-type-param-params-one-handed-back`. The
-  two files still refuse on other spellings: a hand-back through a copy (`const b: F = a1; b`) and
-  the call made inside another function.
+  Both rows' witnesses run, pinned by `generic-fn-value-two-type-param-params-one-handed-back`.
+  Both files run without the plan, after two further facts:
+  - a returned `const` copy of a parameter (`const b: F = a1; b`) hands that parameter back
+    (`fnTagParamCopyOf`), and its seed read and annotation are the parameter's;
+  - the tail value of a `void` function is discarded, so no id leaves it (`ftRetVoid`).
 - B, 4 files: a hole parameter copied into an un-annotated binding called at two types.
 - C, 8 files: a copy of a parameter into a binding annotated with a type parameter (`let b: F =
   a1`). Three are served without the plan. Mono pins a copy at its seed parameter's own pin
@@ -912,6 +914,9 @@ pin rule then becomes an elaboration fact mono reads:
 - D6090's per-parameter pin for a generic handed to a second `T` parameter (`genPin`,
   `monoTyParamOnlyBareParams`);
 - a copy of a parameter taking that parameter's pin (`monoCopySeedParam`, `monoLetPinAt`);
+- the set pin of a type-parameter-annotated parameter, which mirrors the tag decision's rules for
+  one (`fnTagOwnTyParamAlone`, `fnTagOwnTyParamShared`, `ftOwnTyParamHandedBack`,
+  `ftOwnTyParamSharedBack`), so a rule added there is added here too;
 - D6760's un-annotated seed, which waits on this move, since pinning it in mono mints a late
   demand.
 
