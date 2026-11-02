@@ -2997,14 +2997,14 @@ function elabCalleeParam(root: i32, decl: i32, k: i32): i32 {
   if nodeAt(d) is Param { return d }
   const ap = elabCallOnlyAlias(d, dn, k)
   if ap >= 0 { return ap }
-  const lp = elabListParamSource(d, dn, decl)
+  const lp = elabListParamSource(d, dn)
   if lp >= 0 { return lp }
   elabWrittenParamAlias(d, dn)
 }
 
 // The parameter of `fn` every element of the `const` list literal bound at `d` reads, where each
 // read of `d` in `fn`'s own body is an element called in place (`d[i](...)`); else -1.
-function elabListParamSource(d: i32, fn: FuncDecl, decl: i32): i32 {
+function elabListParamSource(d: i32, fn: FuncDecl): i32 {
   if d < 0 || d >= P.nodes.length { return -1 }
   const ln = nodeAt(d)
   if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return -1 }
@@ -3047,8 +3047,6 @@ function elabListParamSource(d: i32, fn: FuncDecl, decl: i32): i32 {
       }
     }
   }
-  // The literal is one node for every instance, so each must bind the parameter alike.
-  if pd >= 0 && !elabParamBoundAlike(decl, pd) { return -1 }
   pd
 }
 
@@ -3066,7 +3064,7 @@ function elabConstParamCopy(d: i32, fn: FuncDecl): i32 {
 
 // Whether the `const` copy `d` of parameter `pd` is read only as an element of list literals
 // `elabListParamSource` takes as `pd`.
-function elabCopyOnlyListed(d: i32, fn: FuncDecl, decl: i32, pd: i32): boolean {
+function elabCopyOnlyListed(d: i32, fn: FuncDecl, pd: i32): boolean {
   const todo: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
   let seen = false
@@ -3078,7 +3076,7 @@ function elabCopyOnlyListed(d: i32, fn: FuncDecl, decl: i32, pd: i32): boolean {
         if (
           p < 0
           || !(nodeAt(p) is ArrayLit)
-          || !elabListLitOfParam(p, fn, decl, pd)
+          || !elabListLitOfParam(p, fn, pd)
         ) {
           return false
         }
@@ -3093,41 +3091,16 @@ function elabCopyOnlyListed(d: i32, fn: FuncDecl, decl: i32, pd: i32): boolean {
   seen
 }
 
-// Whether every instance of `decl` that is not a guess or a rep binds parameter `pd` to one type.
-function elabParamBoundAlike(decl: i32, pd: i32): boolean {
-  let one = -1
-  let k = 0
-  while k < ekDecl.length {
-    if (
-      ekDecl[k] == decl
-      && !(elabGuessKeys[k] ?? false)
-      && !(elabCbRepKeys[k] ?? false)
-      && !(elabSigAltKeys[k] ?? false)
-    ) {
-      const t = substTyDeep(nodeTyIxOf(pd), ekNames[k], ekTys[k])
-      if t < 0 || one >= 0 && !tySame(one, t) { return false }
-      one = t
-    }
-    k = k + 1
-  }
-  true
-}
-
 // Whether list literal `lit` initialises a binding in `fn`'s body that `elabListParamSource`
 // takes as parameter `pd`.
-function elabListLitOfParam(
-  lit: i32,
-  fn: FuncDecl,
-  decl: i32,
-  pd: i32,
-): boolean {
+function elabListLitOfParam(lit: i32, fn: FuncDecl, pd: i32): boolean {
   const todo: i32[] = [fn.fnBody]
   while todo.length > 0 {
     const x = todo.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
       const xn = nodeAt(x)
       if xn is LetDecl && parenPeelIx(xn.letInit) == lit {
-        return elabListParamSource(x, fn, decl) == pd
+        return elabListParamSource(x, fn) == pd
       }
       for c in nodeChildren(x) { todo.push(c) }
     }
@@ -3465,16 +3438,12 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
         p >= 0
         && nodeAt(p) is LetDecl
         && elabConstParamCopy(p, dn) == pd
-        && elabCopyOnlyListed(p, dn, decl, pd)
+        && elabCopyOnlyListed(p, dn, pd)
       ) {
         return 0
       }
       // So does a `const` list literal of it whose elements are only ever called.
-      if (
-        p >= 0
-        && nodeAt(p) is ArrayLit
-        && elabListLitOfParam(p, dn, decl, pd)
-      ) {
+      if (p >= 0 && nodeAt(p) is ArrayLit && elabListLitOfParam(p, dn, pd)) {
         return 0
       }
       // A `const` alias that is only ever called reads the set where its calls do.
@@ -3767,7 +3736,7 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   if !split { elabNodeTyFill(ix, k, rs[0]) }
   // An element of a list literal of the parameter is the parameter's value, so its call goes
   // through the parameter's set too.
-  if root != cf && elabListParamSource(identDeclOf(root), dn, decl) == pd {
+  if root != cf && elabListParamSource(identDeclOf(root), dn) == pd {
     mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
   }
   if root == cf {
@@ -3781,11 +3750,13 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   elabMintCalls[ix] = at
   // One call through two sets in two instances takes each instance's own arms; a callee read
   // out of a holder, a lambda's element, or a caller held beside another function, shares the
-  // call's arms with the other, so both stay closures.
+  // call's arms with the other, so both stay closures. A list literal of the parameter is typed
+  // per instance, so it holds each instance's own set.
   const was = elabMintSets[ix] ?? fnTagSetOfTy(st)
+  const held = root != cf && elabListParamSource(identDeclOf(root), dn) != pd
   if (
     was != fnTagSetOfTy(st)
-    && (root != cf || elabMintInLambda || i32ListHas(elabMintValueFns, decl))
+    && (held || elabMintInLambda || i32ListHas(elabMintValueFns, decl))
   ) {
     mintSetPartialNote(was)
     mintSetPartialNote(fnTagSetOfTy(st))
@@ -4077,6 +4048,7 @@ export function elabRun() {
   ekReach = []
   elabReadsMemo = Map()
   elabCallKeys = Map()
+  elabHoleMapMemo = Map()
   elabKeyCalls = Map()
   elabRepRowCalls = Map()
   elabLitArg = Map()
@@ -5404,6 +5376,30 @@ function elabArgResultAt(a: i32, pf: TyFunc, names: string[], tys: i32[]): i32 {
 // Binding `tys` of call `ix` with each un-annotated parameter, or one its own type parameter
 // alone annotates, handed a tagged set bound to the set itself: the instance calls each member at its own arguments, so no one signature stands for it.
 // One handed only uncalled hole functions is bound to the stub the monomorphizer primed.
+// The closed map an open map whose key or value nothing types is built at: a hole key as `string`,
+// a hole value as `i32`, the other side kept (D1887). -1 for a set, a closed map, a map whose
+// typed side still names a type variable, and every other type.
+export function elabHoleMapClosed(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const m = tyAt(t)
+  if !(m is TyMap) || m.mSet == 1 { return -1 }
+  const kh = m.mKey < 0 || (tyAt(m.mKey) is TyVar && tyHasInferHole(m.mKey, 0))
+  const vh = m.mVal < 0 || (tyAt(m.mVal) is TyVar && tyHasInferHole(m.mVal, 0))
+  if !kh && !vh { return -1 }
+  if (!kh && tyHasTyVar(m.mKey)) || (!vh && tyHasTyVar(m.mVal)) { return -1 }
+  const k = if kh { TY_STR } else { m.mKey }
+  const v = if vh { TY_I32 } else { m.mVal }
+  const key = i32ToStr(k) + ":" + i32ToStr(v)
+  const have = elabHoleMapMemo[key] ?? -1
+  if have >= 0 { return have }
+  const c = mkMapTy(k, v, 0)
+  elabHoleMapMemo[key] = c
+  c
+}
+
+// `elabHoleMapClosed`'s maps since the last `elabRun`, by key and value.
+let elabHoleMapMemo: {[string]: i32} = Map()
+
 function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
   const cn = nodeAt(ix)
   const d = elabCallDeclOf(ix)
@@ -5427,6 +5423,20 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
     // An argument of only uncalled hole functions binds the stub it is delivered at (D6881),
     // unless it is a tagged set's id.
     const stub = elabStubArg.get(i32ToStr(ix) + ":" + i32ToStr(i)) ?? -1
+    // An open map the call binds a type parameter to is that parameter's closed map (D1887).
+    const hmTv = if pn is Param { elabParamTyVarName(f, i) } else { "" }
+    let j0 = 0
+    while !named && hmTv != "" && j0 < names.length && j0 < out.length {
+      const hm = if names[j0] == hmTv { elabHoleMapClosed(out[j0]) } else { -1 }
+      if hm >= 0 {
+        if !copied {
+          out = tys.slice(0, tys.length)
+          copied = true
+        }
+        out[j0] = hm
+      }
+      j0 = j0 + 1
+    }
     if (
       !named
       && pn is Param

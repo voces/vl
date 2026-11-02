@@ -11,8 +11,8 @@
 // that printed it for every program, so the controls below assert that a VALID module is
 // unchanged: rc 0, no banner, and the program's own output.
 //
-// THE WITNESS MUST STILL BE INVALID. This is D15011's empty `Set()` at a bare type parameter,
-// called from a function, and it is check-clean invalid wasm on the current seed. When D15011
+// THE WITNESS MUST STILL BE INVALID. This is D15030's empty `Set()` at a bare type parameter,
+// called from a function, and it is check-clean invalid wasm on the current seed. When D15030
 // is fixed this suite goes RED at the "still invalid"
 // assertion rather than silently measuring nothing; the replacement is any other
 // check-clean invalid-wasm program (`scripts/goal-scoreboard.vl` names the population).
@@ -33,7 +33,7 @@ if (GATED && !ENABLED) {
 const EXIT_COMPILER_BUG = 70;
 const BUG_LINE = "this is a bug in vl, not in your program";
 
-// D15011's empty `Set()` at a bare type parameter (D1471's, D1413's and then D1887's witness
+// D15030's empty `Set()` at a bare type parameter (D1471's, D1413's and then D1887's witness
 // served until those rows closed): `vl check` rc 0, and the engine refuses the module. `take` is declared on line 2,
 // so the position this suite asserts names its NAME token: `2:10`, ONE literal for all three channels. The host used to
 // print `2:9` here — the guest's raw 0-based column — while the CLI pump shifted to 1-based,
@@ -117,7 +117,7 @@ Deno.test({
       const chk = await run(["check", "take.vl"], dir);
       if (chk.code !== 0) {
         throw new Error(
-          `the witness no longer check-cleans (D15011 fixed?) — replace it: ${chk.out}`,
+          `the witness no longer check-cleans (D15030 fixed?) — replace it: ${chk.out}`,
         );
       }
       const r = await run(["check", "--codegen", "take.vl"], dir);
