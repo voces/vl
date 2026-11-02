@@ -7846,6 +7846,21 @@ function boxOwedAtRecord(valIx: i32, fnIx: i32): boolean {
     && unionNameOfExpr(valIx, fnIx) != ""
 }
 
+// The registry name of the union `valIx` is boxed into at its delivery: its record's row where
+// it is stored as a box, else, for a value already a box with no other coercion recorded, its
+// own union; "" where neither holds (`boxOwedAtRecord`).
+function boxDstNameAt(valIx: i32, fnIx: i32): string {
+  const r = boxRecordTyAt(valIx, fnIx)
+  if r >= 0 && repOfTy(r).rdKind == "union" {
+    const nm = boxRecordNameOf(r)
+    if nm != "" { return nm }
+  }
+  if exprUnion(valIx, fnIx) && coerceKindAt(valIx, fnIx) == "none" {
+    return unionNameOfExpr(valIx, fnIx)
+  }
+  ""
+}
+
 // The value's form for the box shadow: 1 already a box, 2 a call that never returns, else 0.
 function boxDstFormOf(exprIx: i32, fnIx: i32): i32 {
   if exprUnion(exprIx, fnIx) { return 1 }
@@ -17986,9 +18001,41 @@ function emitListEqICore(_body: u8[]) {
   0
 }
 
+// Pushes whether element `i` of the staged list A, then of B, in the LEQS frame at `bA`, is null.
+function leqSElemNullTest(bA: i32) {
+  fbLocalGet(bA + 0)
+  fbStructGet(mkListIdx, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(mkArrIdx)
+  fbRefIsNull()
+  fbLocalGet(bA + 1)
+  fbStructGet(mkListIdx, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(mkArrIdx)
+  fbRefIsNull()
+  0
+}
+
+// Whether either operand of the `==` at `binIx` is a list whose elements may be null.
+function binListElemsNullable(binIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(binIx)
+  if !(e is BinExpr) { return false }
+  listElemsBearNull(nodeTyAt(e.binLeft, fnIx))
+    || listElemsBearNull(nodeTyAt(e.binRight, fnIx))
+}
+
+// Whether `t`, `| null` peeled, is a list whose element admits `null`.
+function listElemsBearNull(t: i32): boolean {
+  const n = if t >= 0 && t < T.tys.length { nonNullTy(t) } else { -1 }
+  if n < 0 { return false }
+  const el = tyArrayElemIx(n)
+  el >= 0 && tyAdmitsNull(el)
+}
+
 // String-list `==`: outer loop over the LEQS frame; each element pair rides
-// `emitStrEqCore` (the string-op frame — disjoint locals, safe to nest).
-function emitListEqSCore(body: u8[]) {
+// `emitStrEqCore` (the string-op frame — disjoint locals, safe to nest). With `nulElems` an
+// element may be null: two nulls are equal, a null and a string are not.
+function emitListEqSCore(body: u8[], nulElems: boolean) {
   const bA = leqSScratchBase
   fbLocalSet(bA + 1)        // B
   fbLocalSet(bA + 0)        // A
@@ -18012,6 +18059,14 @@ function emitListEqSCore(body: u8[]) {
   fbI32Bin(78)
   fbIf(64)
   fbElse()
+  if nulElems {
+    leqSElemNullTest(bA)
+    fbI32Bin(114) // i32.or: either element null
+    fbIf(127)
+    leqSElemNullTest(bA)
+    fbI32And() // equal only when both are
+    fbElse()
+  }
   // push elem A, elem B (non-null string refs), compare via the string core
   fbLocalGet(bA + 0)
   fbStructGet(mkListIdx, 0)
@@ -18024,6 +18079,7 @@ function emitListEqSCore(body: u8[]) {
   fbArrayGet(mkArrIdx)
   fbRefAsNonNull()
   if emitStrEqCore(body) < 0 { return -1 }
+  if nulElems { fbEnd() }
   fbI32Eqz() // 1 = mismatch
   fbIf(64)
   fbI32Const(0)
@@ -18148,7 +18204,7 @@ function emitListEqAnyRep(body: u8[], kind: i32, slot: i32, fnIx: i32) {
 
 function emitListEqAnyRepAt(body: u8[], kind: i32, slot: i32, fnIx: i32) {
   if kind == LBK_I32_LIST { return emitListEqICore(body) }
-  if kind == LBK_STR_LIST { return emitListEqSCore(body) }
+  if kind == LBK_STR_LIST { return emitListEqSCore(body, false) }
   if kind == LBK_REF {
     if slot >= 0 && slot < rlElemTyIx.length {
       if rlElemKindAt(slot) == RLK_I32_LIST {
@@ -18592,7 +18648,7 @@ function emitEqNonNullCore(body: u8[], binIx: i32, fnIx: i32) {
         return emitListEqICore(body)
       }
       "strlist" => {
-        return emitListEqSCore(body)
+        return emitListEqSCore(body, binListElemsNullable(binIx, fnIx))
       }
       "reflist" => {
         let lslot = refListSlotOfExpr(e.binLeft, fnIx)
@@ -37544,7 +37600,15 @@ function emitCoalesceNulRefJoin(
   heapIx: i32,
   fnIx: i32,
 ) {
-  const joinN = coalesceResultUnionName(exprIx, fnIx)
+  // The union the join's result boxes into is the one its default is delivered into
+  // (`boxDstNameAt`).
+  const joinN = boxDstNameAt(e.binRight, fnIx)
+  if joinN == "" {
+    return emitFailAt(
+      "emitProgram: `??` joins a nullable value into a union the checker recorded no row for",
+      exprIx,
+    )
+  }
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
   const joinTy = nodeTyInOf(exprIx, fnIx)
@@ -37579,18 +37643,7 @@ function emitCoalesceNulRefJoin(
   // Through `emitUnionBoxArg`, not `emitUnionCoerce`: a struct default that is already a
   // kind-8 VARIANT local is a raw `(ref $variant)`, which the coerce hands back unboxed, and
   // the box blocktype then holds a bare struct. The box-typed destinations share this entry.
-  if (
-    emitUnionBoxAtRecord(
-      body,
-      joinN,
-      nodeTyInOf(exprIx, fnIx),
-      e.binRight,
-      fnIx,
-    )
-    < 0
-  ) {
-    return -1
-  }
+  if (emitUnionBoxAtRecord(body, "", -1, e.binRight, fnIx) < 0) { return -1 }
   fbElse()             // 0x05 else — present → the staged ref, boxed under its own arm's tag
   fbI32Rel(RS_TAG, tag)
   fbLocalGet(optRecvSlot)
