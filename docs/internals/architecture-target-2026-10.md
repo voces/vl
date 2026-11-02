@@ -824,13 +824,19 @@ The emitter still decides some literal widths from context: (A) the literal arms
 
 ### 3.2 What stands between master and deleting the split plan (re-census, 2026-11-02)
 
-Step 4's final deletion removes `fn_split.vl` (6,107 lines), `fn_flow_shadow.vl` (3,494) and the driver's `FS_PLAN`/`FS_APPLY` loop. Measured at `a48eddb4` with the split plan turned off (`holeFnSplitHas` answering no and `compileSrc` returning after its first compile), on fixpoint seeds:
+Step 4's final deletion removes `fn_split.vl` (6,107 lines), `fn_flow_shadow.vl` (3,494) and the driver's `FS_PLAN`/`FS_APPLY` loop. Measured with the split plan turned off (`holeFnSplitHas` answering no and `compileSrc` returning after its first compile), on fixpoint seeds, first at `a48eddb4` and again at `bda38f7c` with #5913 merged:
 
-| population | depends on the split plan |
-| --- | --- |
-| `@run` files under `tests/` (5,398) | 62 refuse |
-| filed witnesses (4,186 graded) | 25 move, every one `runs` → emit refusal; none to invalid wasm since #5838 |
-| distilled corpus (7,152 cells) | 0 |
+| population | `a48eddb4` | `bda38f7c` + #5913 |
+| --- | --- | --- |
+| `@run` files under `tests/` | 62 of 5,398 refuse | 55 of 5,439 refuse |
+| filed witnesses | 25 of 4,186 move, every one `runs` → emit refusal | 21 of 4,216 move: 20 `runs` → emit refusal, and D14943 check reject → emit refusal (with the plan off, `vl check` does not reach the instance's type error) |
+| distilled corpus | 0 of 7,152 cells | 0 of 7,152 cells |
+
+Between the two counts seven files left and none joined. B's two left with #5846. M-maker's
+literal-union and two-result files left with #5854 and #5863. bundle-lam's two left with item (d)
+slice 1 (#5878). H-b's left with #5870. Each of the 55 still refuses with the message the
+`a48eddb4` census grouped it by, so the groups below are recounted by file, not re-minimised.
+The filed rows that left are D4308, D6320, D6481, D6706 and D9380.
 
 Each dependent was delta-debugged to a witness: greedy line removal, keeping the split-on run succeeding and the split-off refusal's message. The groups are by that witness, not by message: the 21 files that print `the reassigned function binding … holds functions called at more than one argument type` are three groups (W-cap, W-lam and seven of W-named), and two more W-named files carry the same witness under other messages. Owners are the lanes' open-list lines above.
 
@@ -840,13 +846,13 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 | W-named | a written `let` of named generics or hole functions called at one type and handed at another (`let f = idg; f = idh; f(3); app(f, "s")`) | 9 | D9030, D9131 | step 4 (γ), the fresh `let` read head |
 | W-cap | a `let` seeded with a hole lambda, written from a closure (`const flip = () => { k = other }`) | 7 | D3971, D3975 | step 4 (γ), the let-write join (W-cap) |
 | W-lam | a written `let` of hole lambdas called at two types, at module scope or written in a nested function or loop | 7 | D3857, D3858, D3868 | parked on the owner's flow-typing ruling |
-| bundle-lam | a hole lambda whose parameter is called at two types or two sets, handed to a hole parameter or pushed onto a list of hole functions (`lap = (g) => { g(1); g("s") }`) | 5 | D6481, D6706, D14824, D14845 | mono lane: closure-at-delivery item (d), whose slice 1 serves the files of D6481 and D6706 |
+| bundle-lam | a hole lambda whose parameter is called at two types or two sets, handed to a hole parameter or pushed onto a list of hole functions (`lap = (g) => { g(1); g("s") }`) | 3 | D14824, D14845 | mono lane: closure-at-delivery item (d); slice 1 (#5878) took D6481 and D6706, slice 2 (#5913) closed the named spelling D14942 |
 | M-record | a generic or a maker's result stored in a record field and called at two types | 4 | D6702 | step 4's field-chain delivery, parked on the row question (column-G1, #5539) |
-| M-maker | a maker's result at a literal-union destination (kept on the old path by #5799), a capturing block-local maker, a maker result called directly (`mkLoop()(5)`) | 4 | D5971, D9380 | mono lane (closure-at-delivery remnants) |
-| B | a `const` alias of a generic or hole function, at module scope or in a closure, called in a body instanced at two types | 2 | D4308, D6320 | mono lane, #5846 |
+| M-maker | a capturing block-local maker called at two types, and a maker result called directly (`mkLoop()(5)`) | 2 | D5971 | mono lane (closure-at-delivery remnants); #5863 took the converting destinations and D9380 |
+| B | a `const` alias of a generic or hole function, at module scope or in a closure, called in a body instanced at two types | 0 | — | closed (#5846) |
 | F-let | a `let` copy of a forwarded hole parameter (`let hh = h`), beside a list forward of that parameter to a member calling it at two types | 2 | — | step 4 (γ), with F's copy read |
 | C | an impure `else if` choosing generics (D14425) | 1 | — | step 4 (γ) |
-| H-b | a `const` list literal of a parameter called at two types, beside a copy of the parameter in a list (`twice(id); twice(dbl)` beside `copied`) | 1 | — | closed (#5870): the list widening is per instance |
+| H-b | a `const` list literal of a parameter called at two types, beside a copy of the parameter in a list (`twice(id); twice(dbl)` beside `copied`) | 0 | — | closed (#5870): the list widening is per instance |
 | H-nested | a choice of functions nested in the caller handed to a hole parameter, whose arms are built where those names are out of scope (`ftMemberSeenAtArms`) | 1 | — | unowned |
 | L-nested | a list forward of a captured hole parameter inside a nested function (D14842's shape) | 1 | D14842 | design-size: a nested function's body instanced per encloser instance |
 | L-set | a hole parameter forwarded through a two-member list or choice to a member calling it at two types | 1 | — | unowned |
