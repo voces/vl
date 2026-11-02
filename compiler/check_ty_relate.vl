@@ -6,6 +6,7 @@
 // the scope chain, `tErr` or checker state; what a single type is or how it is stored is
 // `tyquery.vl`'s and `check_ty_rep.vl`'s question.
 
+import { i32ToStr } from "./ast"
 import {
   ESC_F32,
   ESC_F64,
@@ -24,10 +25,12 @@ import {
   isStringTy,
   litPeekBaseTy,
   nonNulTyOf,
+  nonNullTy,
   nullableInnerOrNone,
   numLitUnionHasBase,
   primNameOf,
   sameNumeric,
+  tyAdmitsNull,
   tyEqNoneIsMap,
   tyHasNullMember,
   tyHasV128Member,
@@ -773,7 +776,12 @@ export function eqRefusals(
       // two different cores lowers one over the other's storage — check-clean invalid wasm without this (D45).
       const eqLc = eqCoreKindOfTyToken(eqLk)
       const eqRc = eqCoreKindOfTyToken(eqRk)
-      if eqLc != "none" && eqRc != "none" && eqLc != eqRc {
+      // So do two generic-core lists whose leaf elements are stored apart: another scalar width,
+      // or a nullable element (a box or a `(ref null …)`) beside a plain one.
+      const eqApart = eqLc == "glist"
+        && eqRc == "glist"
+        && glistLeafKey(lt, 0) != glistLeafKey(rt, 0)
+      if eqLc != "none" && eqRc != "none" && (eqLc != eqRc || eqApart) {
         msgs.push(
           "`"
             + op
@@ -791,6 +799,28 @@ export function eqRefusals(
   }
   0
 }
+
+// The storage key of list `t`'s leaf element, `| null` peeled at the top: one `[]` per list
+// level, a `?` for an element that admits `null`, then the scalar's name or `rec` for a record.
+// Two generic-core lists compare in one core only when their keys agree.
+function glistLeafKey(t: i32, depth: i32): string {
+  if depth > 8 || t < 0 || t >= T.tys.length { return "" }
+  const n = nonNullTy(t)
+  if n < 0 { return "" }
+  const e = tyArrayElemIx(n)
+  if e < 0 { return "" }
+  const q = if tyAdmitsNull(e) { "?" } else { "" }
+  const en = nonNullTy(e)
+  if en < 0 { return "[]" + q }
+  const et = tyAt(en)
+  if et is TyArray { return "[]" + q + glistLeafKey(en, depth + 1) }
+  if et is TyPrim { return "[]" + q + et.primName }
+  if et is TyObj { return "[]" + q + "rec" }
+  glistLeafOther(en)
+}
+
+// A leaf that is no list, scalar or record has no key of its own beyond its index.
+function glistLeafOther(t: i32): string { "[]#" + i32ToStr(t) }
 
 // A struct type with a numerically wider field on the destination side (`{f: i32}` vs
 // `{f: i64}`): assignable as a value (construction converts at the field store) but not as
