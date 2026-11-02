@@ -204,6 +204,18 @@ const p: P | null = { n: 21 }
 print(p?.twice() ?? 0)
 const r = p?.twice()
 print(r ?? -1)
+// A function's tail `if` ending in a field write yields the write's value or `null`, and a
+// loop's value is a labelled block's: each read the rewrite yields in their place takes the
+// value's record.
+const TAIL = `type C = { n: i32 }
+function bump(c: C, go: boolean) {
+  if go { c.n = c.n + 1 }
+}
+const inFor = (n: i32) => for i in 0 until 3 { if i == n { break (@B { i * 10 }) } }
+const c: C = { n: 1 }
+print(bump(c, true) ?? -1)
+print(bump(c, false) ?? -1)
+print(inFor(2) ?? -5)
 `;
 
 Deno.test({
@@ -319,6 +331,14 @@ Deno.test({
       OPTCALL,
       DROP_NONE,
       "nested agree=8; nested value already a box=1; value already a box=2",
+  name: "box-dst shadow: a spilled tail's read takes the value's record",
+  ignore,
+  fn: () =>
+    expectRows(
+      "tail",
+      TAIL,
+      DROP_NONE,
+      "agree=3; nested agree=4; nested value already a box=1; nested value never returns=2; value already a box=4",
     ),
 });
 
