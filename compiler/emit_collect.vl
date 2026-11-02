@@ -12,6 +12,7 @@
 
 import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { chainHasPrelude } from "./emit_if_arm_values"
+import { arrNewInFn } from "./check_decl_scan"
 import {
   elabListFnElemTy,
   elabLitInstTys,
@@ -220,6 +221,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import {
+  nodeSrc,
   sidArrGet,
   sidArrPut,
   sidNoteNodeName,
@@ -5892,39 +5894,12 @@ function collectArrNewIntr(callIx: i32, fnIx: i32) {
   collectArrNewScalarPair(ank)
 }
 
-// The array-intrinsic calls under a function body, which `collectA` does not ask frameless once
-// `monomorphize` has given every instance its frame: `collectArrNewFrames` asks each in its own,
-// and a template's body no frame emits interns nothing. Filled at each `collectA`, empty before.
-let anFrameCall: boolean[] = []
-
-// `arrNewFrameWalk`'s traversal, marking each array-intrinsic call it would ask.
-function anFrameCallWalk(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = nodeAt(ix)
-  if n is FuncDecl { return 0 }
-  if n is Call && n.callFn >= 0 {
-    const cf = nodeAt(n.callFn)
-    if cf is Ident {
-      if (
-        cf.identName == "__array_new__"
-        || cf.identName == "__array_new_default__"
-      ) {
-        while anFrameCall.length <= ix { anFrameCall.push(false) }
-        anFrameCall[ix] = true
-      }
-    }
-  }
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let k = 0
-    while k < kids.length {
-      anFrameCallWalk(kids[k])
-      k = k + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  0
+// Whether array-intrinsic call `i` (or the node it copies) was checked inside a function body:
+// `collectArrNewFrames` asks it in each frame, and a template's body no frame emits interns nothing.
+function arrNewCallInFn(i: i32): boolean {
+  if arrNewInFn.has(i) { return true }
+  const src = nodeSrc[i] ?? -1
+  src >= 0 && arrNewInFn.has(src)
 }
 
 // The two element-rep questions that need a frame, asked in each function's own: an array
@@ -6791,15 +6766,6 @@ export function collectA(_stmts: i32[]) {
   rlWrSlots = []
   rlWrAns = []
   collectAResetTables()
-  anFrameCall = []
-  if emitPhaseReached("monomorphized") {
-    let fj = 0
-    while fj < P.nodes.length {
-      const fn = nodeAt(fj)
-      if fn is FuncDecl { anFrameCallWalk(fn.fnBody) }
-      fj = fj + 1
-    }
-  }
   let i = 0
   while i < P.nodes.length {
     const nd = nodeAt(i)
@@ -6865,7 +6831,7 @@ export function collectA(_stmts: i32[]) {
             cf.identName == "__array_new__"
             || cf.identName == "__array_new_default__"
           ) {
-            if !(i < anFrameCall.length && anFrameCall[i]) {
+            if !emitPhaseReached("monomorphized") || !arrNewCallInFn(i) {
               collectArrNewIntr(i, -1)
             }
           }
