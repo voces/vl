@@ -102,6 +102,22 @@ if a != null { print(a) }
 if b != null { print(b) }
 `;
 
+// A `??` whose sides join apart: the read on its left is boxed into the join, which no
+// delivery names when the `??` is an argument of `print`.
+const COAL = `const l: (i32 | null)[] = [null, 4]
+const big: i64 = 5000000000
+print(l[0] ?? big)
+const v: i32 | i64 = l[1] ?? big
+print(v)
+`;
+
+// A call through a set of functions whose results differ: each member's call is boxed into the
+// call's joined result.
+const SETCALL = `function twice(s) { return s + s }
+function lenOf(s) { return s.length }
+for g in [twice, lenOf] { print(g("abc")) }
+`;
+
 // A loop's `break` values, delivered to a union binding through the loop's exits.
 const BRK = `function pick(n: i32): i32 | string {
   let i = 0
@@ -133,6 +149,19 @@ Deno.test({
   name: "box-dst shadow: an inferred union element agrees",
   ignore,
   fn: () => expectRows("elem", ELEM, DROP_NONE, "agree=4"),
+});
+
+Deno.test({
+  name: "box-dst shadow: a ?? operand takes the join's union",
+  ignore,
+  fn: () =>
+    expectRows("coal", COAL, DROP_NONE, "agree=4; value already a box=1"),
+});
+
+Deno.test({
+  name: "box-dst shadow: a set member's call takes the call's joined union",
+  ignore,
+  fn: () => expectRows("setcall", SETCALL, DROP_NONE, "agree=2"),
 });
 
 Deno.test({

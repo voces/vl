@@ -372,15 +372,16 @@ import {
   nullParamBesideBare,
   paramHoleName,
   paramJoinDropsNull,
+  paramOnlyUnion,
   sameDeclaredTyParam,
   tpArmJoinDepth,
   tpGradualView,
   tpJoinUnions,
   tpOpenJoin,
+  tpParamLitJoins,
   tvElseBase,
   tyIsDeferredJoin,
   tyIsGradualParam,
-  tyIsTpJoinUnion,
   tyParamBesideBare,
   tyParamBesideDerived,
   writtenTpUnion,
@@ -466,9 +467,11 @@ import {
   tyFieldTyOf,
   tyHasHole,
   tyHasInferHole,
+  tyIsDeclaredParam,
   tyIsHole,
   tyIsLitUnion,
   tyIsNulValueUnionBox,
+  tyMentionsTyVarNamed,
   tyMutEpoch,
   tyNulInnerTy,
   tyPrintsAsRef,
@@ -528,7 +531,7 @@ import {
 import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
 import { numLexIsFloat } from "./emit_bignum"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import { pairMemoClear, pairMemoGet, pairMemoNew, pairMemoPut } from "./memo"
 import {
   mimpAnyProgramSpec,
@@ -1784,6 +1787,11 @@ export function joinTys(a: i32, b: i32) {
     noteHoleTpJoin(td)
     return td
   }
+  // A written union of declared parameters beside a concrete type keeps the two apart (D3618).
+  if !aVar && !bVar {
+    const pw = paramUnionBesideConcrete(a, b)
+    if pw >= 0 { return pw }
+  }
   // Such a union absorbs only its own members: its parameter member is assignable from
   // anything, which would fold `T | string` beside `T | i32` to the first (D3212).
   if tpJoinUnions.length > 0 && !aVar && !bVar {
@@ -1868,6 +1876,26 @@ export function joinTys(a: i32, b: i32) {
   kept
 }
 
+// The join of a written union of declared parameters and a concrete type, kept apart; -1 for
+// any other pair.
+function paramUnionBesideConcrete(a: i32, b: i32): i32 {
+  let u = a
+  let c = b
+  if !paramOnlyUnion(a) {
+    u = b
+    c = a
+  }
+  if !paramOnlyUnion(u) || c < 0 || c >= T.tys.length { return -1 }
+  if tyHasTyVar(c) || isNullTy(c) || c == TY_VOID || tyBearsNull(c) {
+    return -1
+  }
+  const tc = joinVariantTys(u, c)
+  tpJoinUnions[tc] = 1
+  tpParamLitJoins[tc] = u
+  noteHoleTpJoin(tc)
+  tc
+}
+
 // The join of a function type over inference holes and a closed one that fits it either
 // way: the closed one, in either order, so a hole function is instanced at it (D10797);
 // -1 for any other pair.
@@ -1906,11 +1934,31 @@ function paramNullJoin(a: i32, b: i32): i32 {
   }
   if hasNull { kept.push(TY_NULL) }
   const res = mkUnionTy(kept)
-  if tyIsTpJoinUnion(a) || tyIsTpJoinUnion(b) { tpJoinUnions[res] = 1 }
+  // A join of runtime arms stays one beside its null, and so does a join of two or more
+  // declared parameters, each a runtime value (D3611).
+  const ma = tpJoinUnions.get(a) ?? 0
+  const mb = tpJoinUnions.get(b) ?? 0
+  let mk = if ma > mb { ma } else { mb }
+  if hasNull && allDeclaredParams(kept) { mk = 2 }
+  if mk > 0 { tpJoinUnions[res] = mk }
   if isJoinHoleUnion(a) || isJoinHoleUnion(b) { joinHoleUnions.push(res) }
+  // Its deferred re-fold keeps the members apart too.
+  if mk == 2 && isJoinHoleUnion(res) { apartHoleJoins[res] = true }
   noteHoleTpJoin(res)
   paramNullJoins[res] = 1
   res
+}
+
+// Whether `ms` holds two or more declared type parameters and nothing else but `null`.
+function allDeclaredParams(ms: i32[]): boolean {
+  let n = 0
+  for m in ms {
+    if !isNullTy(m) {
+      if !tyIsDeclaredParam(m) { return false }
+      n = n + 1
+    }
+  }
+  n >= 2
 }
 
 // `a op b` where an operand is a numeric union: each member pair takes the scalar rule, and
@@ -7282,6 +7330,11 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
 // `bindGenWalkFull`.
 let bgFull = false
 
+// Set while a call's argument binds: a union of parameters alone waits for the call's other
+// arguments there (`bindParamUnionOwn`, `bindParamUnionsLate`).
+let bgCallArg = false
+export function bgCallArgSet(on: boolean) { bgCallArg = on }
+
 // `bindGenWalk` with two more arms at every depth: a union's one open member binds to the
 // argument's members no concrete member is (`T | string` at `i32 | string` binds `T` to `i32`),
 // and an application binds its arguments pairwise (`Rows<A>` at `Rows<i32>`, a phantom `A` too).
@@ -7376,6 +7429,99 @@ function bindGenUnionRest(
   true
 }
 
+// Binds, after every argument, the type parameters a parameter typed a union of them alone
+// leaves unbound: the members of its argument no bound parameter holds go to the one left, or
+// pair by position with as many left (D3643). 0.
+export function bindParamUnionsLate(
+  params: i32[],
+  args: i32[],
+  bNames: string[],
+  bTys: i32[],
+) {
+  let i = 0
+  while i < params.length && i < args.length {
+    if args[i] >= 0 && params[i] >= 0 && paramOnlyUnion(nonNullTy(params[i])) {
+      bindParamUnionLate(params[i], nodeTyOf(args[i]), bNames, bTys)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Binds at its argument's turn the type parameters a union of them alone at `params[i]` holds
+// when no other parameter names them, so nothing later can bind them otherwise (D3643). 0.
+export function bindParamUnionOwn(
+  params: i32[],
+  i: i32,
+  at: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  if i < 0 || i >= params.length || params[i] < 0 { return 0 }
+  if !paramOnlyUnion(nonNullTy(params[i])) { return 0 }
+  const pms: i32[] = []
+  flattenVariantsInto(params[i], pms)
+  for m in pms {
+    const v = tyAt(m)
+    if v is TyVar {
+      let j = 0
+      while j < params.length {
+        if j != i && tyMentionsTyVarNamed(params[j], v.tvName, 8) { return 0 }
+        j = j + 1
+      }
+    }
+  }
+  bindParamUnionLate(params[i], at, bNames, bTys)
+}
+
+// `bindParamUnionsLate` for parameter type `p` and argument type `at`. 0.
+function bindParamUnionLate(p: i32, at: i32, bNames: string[], bTys: i32[]) {
+  if at < 0 || at >= T.tys.length || tyHasTyVar(at) { return 0 }
+  const pms: i32[] = []
+  flattenVariantsInto(p, pms)
+  const ams: i32[] = []
+  flattenVariantsInto(at, ams)
+  const open: string[] = []
+  const bound: i32[] = []
+  let pNull = false
+  for m in pms {
+    if isNullTy(m) {
+      pNull = true
+    } else {
+      const v = tyAt(m)
+      if !(v is TyVar) { return 0 }
+      const b = bindOf(bNames, bTys, v.tvName)
+      if b >= 0 { bound.push(b) }
+      else if !strListHas(open, v.tvName) { open.push(v.tvName) }
+    }
+  }
+  if open.length == 0 { return 0 }
+  const rest: i32[] = []
+  for a in ams {
+    if a < 0 { return 0 }
+    if !(pNull && isNullTy(a)) {
+      let held = false
+      for b in bound {
+        if b == a || tyEq(b, a) || tyMembersWithin(a, b) { held = true }
+      }
+      if !held { rest.push(a) }
+    }
+  }
+  if rest.length == 0 { return 0 }
+  if open.length == 1 {
+    bNames.push(open[0])
+    bTys.push(tyOfMembers(rest))
+  } else if open.length == rest.length {
+    let k = 0
+    while k < open.length {
+      bNames.push(open[k])
+      bTys.push(rest[k])
+      k = k + 1
+    }
+  }
+  0
+}
+
 // Whether pairing `pms` with `ams` by position meets every member but `open` with an equal one.
 function bgMembersAlign(pms: i32[], ams: i32[], open: i32): boolean {
   if pms.length != ams.length { return false }
@@ -7420,6 +7566,12 @@ export function bindGenWalk(
   if bgFull { bindGenAppArgs(expIx, atIx, bNames, bTys) }
   if bgFull && bindGenUnionRest(expIx, atIx, bNames, bTys) {
     // The union arm bound the open member, or paired the members.
+  } else if (
+    !bgCallArg
+    && paramOnlyUnion(expIx)
+    && bindGenUnionRest(expIx, atIx, bNames, bTys)
+  ) {
+    // A union of parameters alone pairs by position, as the instance's pin does (D3643).
   } else if e is TyArray {
     if a is TyArray { bindGenWalk(e.aElem, a.aElem, bNames, bTys) }
   } else if e is TyNullable {
@@ -7970,6 +8122,11 @@ function substRejoinApart(
     if recorded { carryRetJoin(r, key, vals) }
     return r
   }
+  const pl = tpParamLitJoins.get(tyIx)
+  if pl != null && !recorded && (tpJoinUnions.get(tyIx) ?? 0) == 1 {
+    const pj = paramLitRejoin(tyIx, pl, ms)
+    if pj >= 0 { return pj }
+  }
   const tpSaved = tpApartConcrete
   tpApartConcreteSet(true)
   njRejoinApartSet((tpJoinUnions.get(tyIx) ?? 0) == 2)
@@ -7977,6 +8134,38 @@ function substRejoinApart(
   tpApartConcreteSet(tpSaved)
   if recorded { carryRetJoin(res, key, vals) }
   res
+}
+
+// The pin of join `tyIx` of written union `wu` and a concrete type, members `out` substituted:
+// `wu`'s members re-join apart, as runtime values, and the rest join into them; -1 when the
+// members do not line up with `tyIx`'s.
+function paramLitRejoin(tyIx: i32, wu: i32, out: i32[]): i32 {
+  const t = tyAt(tyIx)
+  const w = tyAt(wu)
+  if !(t is TyUnion) || !(w is TyUnion) || t.uMembers.length != out.length {
+    return -1
+  }
+  const grp: i32[] = []
+  const fixed: boolean[] = []
+  const rest: i32[] = []
+  let i = 0
+  while i < out.length {
+    if i32ListHas(w.uMembers, t.uMembers[i]) {
+      grp.push(out[i])
+      fixed.push(true)
+    } else {
+      rest.push(out[i])
+    }
+    i = i + 1
+  }
+  if grp.length == 0 { return -1 }
+  const tpSaved = tpApartConcrete
+  tpApartConcreteSet(true)
+  njRejoinApartSet(true)
+  let r = rejoinMembers(grp, fixed)
+  for m in rest { r = joinTys(r, m) }
+  tpApartConcreteSet(tpSaved)
+  rejoinDropSubsumed(r)
 }
 
 // `substTyDeep` over nullable `t` at `tyIx`: the inner type substituted, rebuilt only when it changed.
