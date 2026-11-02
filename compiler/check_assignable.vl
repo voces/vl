@@ -64,8 +64,6 @@ import {
   mkStr,
   mkUnary,
   nodeAt,
-  nodeContains,
-  nodeSpineChildren,
   spreadArgOf,
 } from "./ast"
 import {
@@ -136,12 +134,8 @@ import { cstrCandAny } from "./check_cstr_probe"
 import {
   elabDeadRestClose,
   elabDeadRestOpen,
-  elabEncl,
   elabFnSetOf,
   elabLiveTyOf,
-  elabMakerCallNote,
-  elabMakerCallReset,
-  elabMakerRowNote,
   elabValueRowNote,
   elabWideRowNote,
   fnLetIsWide,
@@ -3316,166 +3310,6 @@ function fvaValueRowWalk(srcTy: i32, dstTy: i32, depth: i32) {
   0
 }
 
-// Banks maker `decl`, a non-generic function of type `st` whose result is an open function value,
-// at the closed result of destination `d`: the elaboration builds it at that result too.
-function fvaMakerRowAt(decl: i32, st: i32, d: TyFunc) {
-  if st < 0 || st >= T.tys.length { return 0 }
-  const sf = tyAt(st)
-  if !(sf is TyFunc) || sf.fnParamTypes.length != d.fnParamTypes.length {
-    return 0
-  }
-  for pt in sf.fnParamTypes {
-    if pt < 0 || tyHasTyVar(pt) { return 0 }
-  }
-  const sr = sf.fnRet
-  if sr < 0 || sr >= T.tys.length || !tyHasTyVar(sr) || !(tyAt(sr) is TyFunc) {
-    return 0
-  }
-  if d.fnRet < 0 || d.fnRet >= T.tys.length || !(tyAt(d.fnRet) is TyFunc) {
-    return 0
-  }
-  elabMakerRowNote(decl, d.fnRet)
-}
-
-// Whether `decl` is a maker: a non-generic function, every parameter annotated, whose result is an
-// open function value.
-export function fvaIsMaker(decl: i32): boolean {
-  if decl < 0 || decl >= P.nodes.length { return false }
-  const fn = nodeAt(decl)
-  if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return false }
-  for p in fn.fnParams {
-    const pn = nodeAt(p)
-    if !(pn is Param) || pn.parType < 0 { return false }
-  }
-  // A nested maker reading its encloser's bindings is built with that frame, which a twin
-  // checked at the root does not have.
-  const e = elabEncl.get(decl) ?? -1
-  if e >= 0 && fvaReadsWithin(decl, fn.fnBody, e) { return false }
-  const st = nodeTyIxOf(decl)
-  if st < 0 || st >= T.tys.length { return false }
-  const f = tyAt(st)
-  if !(f is TyFunc) || f.fnRet < 0 || f.fnRet >= T.tys.length { return false }
-  tyHasTyVar(f.fnRet) && tyAt(f.fnRet) is TyFunc
-}
-
-// Whether a read in the subtree at `ix` names a binding declared inside `e` but outside `d`.
-function fvaReadsWithin(d: i32, ix: i32, e: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const dc = identDeclOf(ix)
-  if dc >= 0 && !nodeContains(d, dc) && nodeContains(e, dc) { return true }
-  for kid in nodeSpineChildren(ix) {
-    if fvaReadsWithin(d, kid, e) { return true }
-  }
-  false
-}
-
-// Banks each maker call bound to a `const` whose every read is a call at one closed signature: the
-// elaboration builds the maker at that result, and mono builds the call's maker there
-// (`elabMakerCallSig`).
-export function fvaMakerCallRows() {
-  elabMakerCallReset()
-  const sigOf: {[i32]: i32} = Map()
-  const callOf: {[i32]: i32} = Map()
-  const calleeReads: {[i32]: boolean} = Map()
-  let ix = 0
-  while ix < P.nodes.length {
-    const n = nodeAt(ix)
-    if n is Call && n.callFn >= 0 {
-      const r = parenPeelIx(n.callFn)
-      const d = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
-      if d >= 0 && d < P.nodes.length {
-        const ln = nodeAt(d)
-        if ln is LetDecl {
-          const mc = fvaMakerCallOf(ln)
-          if mc >= 0 && (sigOf.get(d) ?? 0) != -1 {
-            calleeReads[r] = true
-            const sig = fvaMakerResultAt(mc, fvaCallSig(n, ix))
-            const have = sigOf.get(d) ?? -2
-            if sig < 0 || (have >= 0 && !tySame(have, sig)) {
-              sigOf[d] = -1
-            } else {
-              sigOf[d] = sig
-              callOf[d] = mc
-            }
-          }
-        }
-      }
-    }
-    ix = ix + 1
-  }
-  // A binding read other than as a callee hands its value on, which one closed result cannot fit.
-  ix = 0
-  while ix < P.nodes.length {
-    if nodeAt(ix) is Ident && !(calleeReads.get(ix) ?? false) {
-      const d = identDeclOf(ix)
-      if d != ix && sigOf.has(d) { sigOf[d] = -1 }
-    }
-    ix = ix + 1
-  }
-  for d in sigOf.keys() {
-    const sig = sigOf.get(d) ?? -1
-    const mc = callOf.get(d) ?? -1
-    if sig >= 0 && mc >= 0 {
-      const c = nodeAt(mc)
-      if c is Call {
-        const m = identDeclOf(parenPeelIx(c.callFn))
-        elabMakerRowNote(m, sig)
-        elabMakerCallNote(mc, sig)
-      }
-    }
-  }
-  0
-}
-
-// The maker call `const` binding `ln` is initialised by, its result left open; -1 otherwise.
-function fvaMakerCallOf(ln: LetDecl): i32 {
-  if ln.letKw != "const" || ln.letType >= 0 || ln.letInit < 0 { return -1 }
-  const mc = parenPeelIx(ln.letInit)
-  if mc < 0 || mc >= P.nodes.length { return -1 }
-  const c = nodeAt(mc)
-  if !(c is Call) || c.callFn < 0 { return -1 }
-  const m = identDeclOf(parenPeelIx(c.callFn))
-  if !fvaIsMaker(m) { return -1 }
-  const t = nodeTyIxOf(mc)
-  if t < 0 || t >= T.tys.length || !tyHasTyVar(t) { return -1 }
-  mc
-}
-
-// The maker result of maker call `mc` at call signature `cs`: its open function type with each
-// type variable bound by `cs`'s parameters, which keeps what the arguments narrow (a function
-// handed to a `| null` parameter); -1 where that does not close.
-function fvaMakerResultAt(mc: i32, cs: i32): i32 {
-  if cs < 0 || cs >= T.tys.length { return -1 }
-  const r = nodeTyIxOf(mc)
-  if r < 0 || r >= T.tys.length { return -1 }
-  const rf = tyAt(r)
-  const cf = tyAt(cs)
-  if !(rf is TyFunc) || !(cf is TyFunc) { return -1 }
-  if rf.fnParamTypes.length != cf.fnParamTypes.length { return -1 }
-  const nm: string[] = []
-  const ty: i32[] = []
-  let i = 0
-  while i < rf.fnParamTypes.length {
-    bindGenWalk(rf.fnParamTypes[i], cf.fnParamTypes[i], nm, ty)
-    i = i + 1
-  }
-  const st = substTyDeep(r, nm, ty)
-  if st < 0 || st >= T.tys.length || tyHasTyVar(st) { -1 } else { st }
-}
-
-// The closed signature call `c`, at node `ix`, calls its callee at; -1 where a type stays open.
-function fvaCallSig(c: Call, ix: i32): i32 {
-  const ps: i32[] = []
-  for a in c.callArgs {
-    const at = nodeTyIxOf(a)
-    if at < 0 || at >= T.tys.length || tyHasTyVar(at) { return -1 }
-    ps.push(widenLitTy(at))
-  }
-  const rt = nodeTyIxOf(ix)
-  if rt < 0 || rt >= T.tys.length || tyHasTyVar(rt) { return -1 }
-  mkFuncTy(ps, widenLitTy(rt))
-}
-
 // Banks generic function `decl`'s instance at closed function type `dt`, its type parameters
 // bound by its signature against `dt`'s.
 export function fvaValueRowAt(decl: i32, dt: i32) {
@@ -3485,9 +3319,6 @@ export function fvaValueRowAt(decl: i32, dt: i32) {
   const d = tyAt(dt)
   const fn = nodeAt(decl)
   const st = nodeTyIxOf(decl)
-  if fn is FuncDecl && fn.fnTyParams.length == 0 && d is TyFunc {
-    return fvaMakerRowAt(decl, st, d)
-  }
   if !(fn is FuncDecl) || fn.fnTyParams.length == 0 || !(d is TyFunc) {
     return 0
   }

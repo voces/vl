@@ -89,14 +89,6 @@ signature, carried as one value.
   bundle is not built (coordinator, 2026-11-02): D14841 grades the 15 W-lam files that would need
   it, and none qualifies under the binding conditions above.
 - (c) The delivery token reads the row (step7's half).
-  First slice (2026-11-02, coordinator ruling (ii)): a maker, a non-generic function whose
-  result is an open function value, is instanced by the elaboration at each closed result a use
-  demands: a read delivered at a declared function type (`fvaMakerRowAt`), or a call whose `const`
-  binding is only called, at one signature (`fvaMakerCallRows`). Each is the maker's wide twin;
-  mono mirrors it (`monoMakerTwin`), and the twin's returned read takes the row's closure
-  (`monoTokenFe`). A result γ tags is left as the tag. Left: a call in an instanced body, a maker
-  with an un-annotated parameter, and D14825's file as a whole, where one use delivering the
-  maker's generic as a closure keeps γ from tagging its set for a hole-parameter maker beside it.
 
 ### Matrix
 
