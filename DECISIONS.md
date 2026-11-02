@@ -11519,6 +11519,22 @@ that breaks the wider or the narrower type. This is the alias rule of D4084's ru
 it is built, a separate change refuses the family at check with the kept-versus-own sentence,
 graded as clause 2.
 
+## A list callback op fixes the length at entry (owner ruling A, 2026-11-02) — D3068
+
+**The rule.** `.map`, `.filter` and `std:array`'s `reduce`, `mapIndexed`, `some` and `every` read
+the list's length once, before the first call. An element the callback pushes is not visited. An
+index the callback cuts off (by a `pop` or a clear) is skipped by `filter`, `reduce`, `some` and
+`every`, and ends `map` and `mapIndexed` with the trap an `xs[i]` read past the length raises.
+The same holds over a readonly view of the list.
+
+**Why.** Before, the core ops fixed the length but read the backing directly, so they returned
+the popped element out of its spare slot, and the std ops re-read the length, so a callback that
+pushed every time never ended (D3068). JavaScript fixes the length and skips, and VL follows it
+except where JavaScript leaves a hole in `map`'s result, which VL has no rep for, so it traps.
+
+**The price.** One length read per step in the core loops. Dropping it where the callback
+provably does not change the list is deferred, the simple case first and the complex one later.
+
 ## A nested join means what its hoisted twin means (owner ruling, 2026-11-02) — D3657
 
 **The rule.** Inlining or hoisting a sub-expression never changes a program's behaviour. A value

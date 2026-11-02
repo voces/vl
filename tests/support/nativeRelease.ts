@@ -423,8 +423,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // so those sites leave the function bodies: allocs 8 -> 6 at both rungs, bytes 809 -> 790 and 688 -> 697.
     // SP-056: a list index's guard branches to an out-of-line trap rather than a
     // `select` to -1, structure unchanged: `-O` 790 -> 834, `-O3` 697 -> 741 bytes.
-    O: { bytes: 834, fns: 4, allocs: 6, indirect: 0 },
-    O3: { bytes: 741, fns: 1, allocs: 6, indirect: 0 },
+    // D3068 (owner ruling A): `.map` and `.filter` test the current length each step, a cut-off
+    // index trapping or skipped, structure unchanged: `-O` 834 -> 865, `-O3` 741 -> 770 bytes.
+    O: { bytes: 865, fns: 4, allocs: 6, indirect: 0 },
+    O3: { bytes: 770, fns: 1, allocs: 6, indirect: 0 },
   },
   // THE CONTROL FOR THE TWO ABOVE. A four-way dispatch table is genuinely dynamic, so
   // `meta.json` records that `-O3` does NOT help here (1.469s vs 1.331s) — binaryen cannot
