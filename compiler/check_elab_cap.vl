@@ -1025,7 +1025,7 @@ export function elabSlotJoinTy(recv: i32, t: i32): i32 {
   const tf = T.tys[t]
   if !(tf is TyFunc) { return t }
   const s = elabFnSetTy[t] ?? -1
-  if s < 0 || i32ListHas(fnLetVeto, bd) { return t }
+  if s < 0 { return t }
   const w = fnSlotSetOf(bd)
   if w < 0 || w == s || fnSetHasGeneric(s) || fnSetHasGeneric(w) { return t }
   const u = fnSetIntern(fnSetUnion(s, w))
@@ -1040,20 +1040,15 @@ export function elabSlotJoinTy(recv: i32, t: i32): i32 {
   const fresh = T.tys.length - 1
   elabFnSetTy[fresh] = u
   fnJoinMemo[key] = fresh
-  if !fnTagEtaRan {
-    fnSlotWide.push(fresh)
-    fnSlotWideAt.push(bd)
-  }
   fresh
 }
 
 // The type an un-annotated list binding `bd` with inferred `t` gives its reads: `t` whose element
 // set also holds every function the binding's own scope writes into its slots, as the literal's
 // elements join (D14645), its signature closed function type `closedAt` when that is not -1.
-// `t` when nothing widens it or an earlier check vetoed the widening.
+// `t` when nothing widens it. A widened set the decision leaves untagged holds closures.
 export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
   if bd < 0 || t < 0 || t >= T.tys.length { return t }
-  if closedAt < 0 && i32ListHas(fnLetVeto, bd) { return t }
   const ta = T.tys[t]
   if !(ta is TyArray) { return t }
   const e = ta.aElem
@@ -1082,11 +1077,6 @@ export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
   T.tys.push(g)
   const fresh = T.tys.length - 1
   elabFnSetTy[fresh] = u
-  // A closed signature holds every member as a closure, so it stands whether or not it is tagged.
-  if !fnTagEtaRan && closedAt < 0 {
-    fnSlotWide.push(fresh)
-    fnSlotWideAt.push(bd)
-  }
   fnListWidened.push(bd)
   const lt = mkArrayTy(fresh)
   fnJoinMemo[key] = lt
@@ -1095,7 +1085,7 @@ export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
 
 // The functions list binding `bd` with inferred `t` holds once `elabFnListLetTy` widens it with
 // its scope's writes, ascending; [] when it is not widened, is re-pointed, or its element
-// signature is closed. An untagged set's veto does not apply: it is asked for a closed signature.
+// signature is closed. It is asked for a closed signature.
 export function elabFnListOpenWideMembers(bd: i32, t: i32): i32[] {
   const none: i32[] = []
   if bd < 0 || t < 0 || t >= T.tys.length { return none }
@@ -1116,10 +1106,31 @@ export function elabFnListOpenWideMembers(bd: i32, t: i32): i32[] {
   fnSets[u]
 }
 
-// Whether the list binding `bd` gives its reads a set widened with what its scope writes, and no
-// check vetoed that widening; a call through its element then fixes its own member's tuple.
+// The sets of the lists initialising the list bindings this check widened to set `s`, other
+// than a literal its widening re-types: each copy holds its source's ids, which `s` must share.
+export function fnWidenedListSourceSets(s: i32): i32[] {
+  const out: i32[] = []
+  for bd in fnListWidened {
+    const n = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
+    if n is LetDecl && n.letInit >= 0 {
+      const init = n.letInit
+      const it = if init < P.nodes.length { nodeTyIxOf(init) } else { -1 }
+      const ia = if it >= 0 && it < T.tys.length { T.tys[it] } else { null }
+      const bt = nodeTyIxOf(bd)
+      const ba = if bt >= 0 && bt < T.tys.length { T.tys[bt] } else { null }
+      if ia is TyArray && ba is TyArray && fnTagSetOfTy(ba.aElem) == s {
+        const o = fnTagSetOfTy(ia.aElem)
+        if o >= 0 && o != s && !i32ListHas(out, o) { out.push(o) }
+      }
+    }
+  }
+  out
+}
+
+// Whether the list binding `bd` gives its reads a set widened with what its scope writes; a call
+// through its element then fixes its own member's tuple.
 export function elabFnListWidened(bd: i32): boolean {
-  i32ListHas(fnListWidened, bd) && !i32ListHas(fnLetVeto, bd)
+  i32ListHas(fnListWidened, bd)
 }
 
 // The set of every function the `let` node `bd` writes into its slots; -1 when one is not a
@@ -1513,14 +1524,12 @@ let fnTagEscapeDsts: i32[] = []
 let fnTagEtaSites: i32[] = []
 let fnTagEtaRan = false
 
-// The widened `let` and slot types of this check and their `let` nodes; the `let`s whose widened
-// set the decision left untagged, which the next check gives their initialiser's type.
+// The widened `let` types of this check and their `let` nodes; the `let`s whose widened set the
+// decision left untagged, which the next check gives their initialiser's type.
 let fnLetWide: i32[] = []
 let fnLetWideAt: i32[] = []
-let fnSlotWide: i32[] = []
 // The list bindings `elabFnListLetTy` widened in this check.
 let fnListWidened: i32[] = []
-let fnSlotWideAt: i32[] = []
 let fnLetVeto: i32[] = []
 // The list literals whose open element signature the functions written into their binding closed.
 let fnListClosedLits: i32[] = []
@@ -1655,8 +1664,6 @@ export function fnTyFactsReset() {
   fnLetReadTy = Map()
   fnLetWide = []
   fnLetWideAt = []
-  fnSlotWide = []
-  fnSlotWideAt = []
   fnListWidened = []
   0
 }
@@ -1671,8 +1678,6 @@ export function fnTagEtaReset() {
   fnTagEscapeDsts = []
   fnLetWide = []
   fnLetWideAt = []
-  fnSlotWide = []
-  fnSlotWideAt = []
   fnListWidened = []
   fnListClosedLits = []
   fnLetVeto = []
@@ -1757,11 +1762,6 @@ export function fnTagEtaAgain(): boolean {
   let i = 0
   while i < fnLetWide.length && i < fnLetWideAt.length {
     if !fnTagTyIsTagged(fnLetWide[i]) { fnLetVeto.push(fnLetWideAt[i]) }
-    i = i + 1
-  }
-  i = 0
-  while i < fnSlotWide.length && i < fnSlotWideAt.length {
-    if !fnTagTyIsTagged(fnSlotWide[i]) { fnLetVeto.push(fnSlotWideAt[i]) }
     i = i + 1
   }
   if fnTagEtaSites.length == 0 && fnLetVeto.length == 0 { return false }
