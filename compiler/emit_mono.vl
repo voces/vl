@@ -6353,13 +6353,19 @@ function monoBakeCallback(
       if n.callFn < 0 { return ix }
       const callee = nodeAt(n.callFn)
       if callee is Ident {
+        // A call through a never-written `const` alias of the parameter is a call of it too (D12216).
+        let pname = monoBakeAliasParam(n.callFn, fnDeclIx)
         if (
-          !fnBlockShadowsAt(fnDeclIx, sidOfNode(n.callFn), n.callFn)
+          pname == ""
+          && !fnBlockShadowsAt(fnDeclIx, sidOfNode(n.callFn), n.callFn)
           && monoReadsOwnParam(fnDeclIx, callee.identName, n.callFn)
         ) {
+          pname = callee.identName
+        }
+        if pname != "" {
           let bk = 0
           while bk < cbParamNames.length {
-            if cbFnNames[bk] != "" && callee.identName == cbParamNames[bk] {
+            if cbFnNames[bk] != "" && pname == cbParamNames[bk] {
               newCallee = mkIdent(cbFnNames[bk], callee.pos)
               identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[bk]))
             }
@@ -24219,6 +24225,39 @@ function monoFnBindsParamAt(fx: i32, name: string, at: i32): boolean {
     }
   }
   false
+}
+
+// The name of the parameter read `at` reaches through un-annotated `const` bindings each
+// initialised by a read of the one before, at least one of them, a parameter of `fx` when it is
+// not -1; "" for any other read.
+function monoBakeAliasParam(at: i32, fx: i32): string {
+  if at < 0 || at >= P.nodes.length { return "" }
+  const a = nodeAt(at)
+  if !(a is Ident) { return "" }
+  let d = monoReadDecl(a.identName, at)
+  let hops = 0
+  while hops < 8 && d >= 0 && d < P.nodes.length {
+    const ld = nodeAt(d)
+    if ld is LetDecl {
+      if ld.letKw != "const" || ld.letType >= 0 || ld.letInit < 0 { return "" }
+      const iv = unwrapParen(ld.letInit)
+      if iv < 0 { return "" }
+      const ivn = nodeAt(iv)
+      if !(ivn is Ident) { return "" }
+      d = monoReadDecl(ivn.identName, iv)
+      hops = hops + 1
+    } else if ld is Param {
+      if hops == 0 { return "" }
+      if fx >= 0 && fx < P.nodes.length {
+        const f = nodeAt(fx)
+        if !(f is FuncDecl) || !i32ListHas(f.fnParams, d) { return "" }
+      }
+      return ld.parName
+    } else {
+      return ""
+    }
+  }
+  ""
 }
 
 // Whether the read of `name` at `at` can be a parameter of function `fx` (-1: of whichever
