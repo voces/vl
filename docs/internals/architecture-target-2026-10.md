@@ -842,7 +842,7 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 
 | group | witness | `@run` files | filed rows | owner |
 | --- | --- | --- | --- | --- |
-| F | a generic handed in as a parameter, copied into a binding or a second type parameter, and called at two types (`mid<F, G>(a: G) { let b: F = a; b("w"); b2(3) }`) | 15 | D6200, D6240, D6425, D6520, D6530, D6762, D6793, D6884 | step 4 (γ), the rep-versus-tag duality (`ftLateArgOfSet`, `ftCtxOk`) |
+| F | a generic handed in as a parameter, copied into a binding or a second type parameter, and called at two types (`mid<F, G>(a: G) { let b: F = a; b("w"); b2(3) }`) | 15 | D6200, D6240, D6425, D6520, D6530, D6762, D6793, D6884 | four shapes, below the table |
 | W-named | a written `let` of named generics or hole functions called at one type and handed at another (`let f = idg; f = idh; f(3); app(f, "s")`) | 9 | D9030, D9131 | step 4 (γ), the fresh `let` read head |
 | W-cap | a `let` seeded with a hole lambda, written from a closure (`const flip = () => { k = other }`) | 7 | D3971, D3975 | step 4 (γ), the let-write join (W-cap) |
 | W-lam | a written `let` of hole lambdas called at two types, at module scope or written in a nested function or loop | 7 | D3857, D3858, D3868 | parked on the owner's flow-typing ruling |
@@ -858,6 +858,27 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 | L-set | a hole parameter forwarded through a two-member list or choice to a member calling it at two types | 1 | — | unowned |
 | L-map | `.map` lambdas calling a list of hole functions at several types | 1 | — | unowned |
 | N | a function declared above a module `const p = fw(add)` calling `p` at two types; declared below it, it runs | 1 | — | unowned: the global-init pre-pass (D6000) declares `p` without its function set, so the calls note no set |
+
+F's 15 files are four shapes by witness:
+
+- A, 2 files: a result `: F` with a parameter handed back (D6200, D6425). It needs three
+  layers: the elaboration's hand-back fact across a hand-on, a tag rule for a type parameter
+  that is shared and handed back, and a third, not yet located, where `mid` is instanced per
+  closed pin so the set is partial. It is parked, with the first two prototyped on branch
+  `claude/group-f-wip`.
+- B, 4 files: a hole parameter copied into an un-annotated binding called at two types.
+- C, 8 files: a copy of a parameter into a binding annotated with a type parameter (`let b: F =
+  a1`). Two are served without the plan. One is served by mono pinning the copy at its seed
+  parameter's own pin, which is D6703's shape (`typaram-binding-seeded-from-another-typaram`).
+  The other is served by the elaboration taking a type parameter that names no parameter as
+  agreeing with the parameter its copies seed it from (`param-copied-into-two-type-params-called-apart`).
+  Of the other six, one copies into a record, and one is D6760's un-annotated seed, whose pin
+  route mints a late demand. The other four still refuse and are not yet analysed one by one.
+- D, 1 file: parameters swapped through a recursion (D6240).
+
+The per-parameter pin a copy takes lives in mono (`monoLetPinAt`), because the elaboration binds
+both type parameters to the generic's open signature. Moving per-parameter pins to the
+elaboration is the follow-up, after which the copy's pin becomes an elaboration fact mono reads.
 
 Besides the programs, four kinds of reader ask the plan, and each must lose its question before the files go:
 

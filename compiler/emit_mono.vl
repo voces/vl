@@ -3246,6 +3246,9 @@ function monoSubstLetType(
   bT: i32[],
 ) {
   if letType < 0 { return letType }
+  // A copy of a parameter pinned on its own takes that pin (`monoLetTyParamMisfit`).
+  const lp = monoLetPinAt.get(letType) ?? ""
+  if lp != "" { return monoSynthPinRef(lp, monoLetPinTyAt.get(letType) ?? -1) }
   const tn = nodeAt(letType)
   if tn is TypeRef {
     if monoAnnMentionsTyParam(letType, typarams) {
@@ -20696,14 +20699,17 @@ function monoPinIsFnTy(t: i32): boolean {
 }
 
 // A binding of `fn`'s body annotated with one type parameter and seeded from a parameter of
-// another, where the two bind different function instances, asks the split to give the
-// binding the parameter's type (D6703), and fails; 0 when no binding does.
+// another, where the two bind different function instances, takes the parameter's pin when
+// nothing writes it (`monoLetPinAt`); else asks the split for it (D6703) and fails. 0 otherwise.
+let monoLetPinAt: {[i32]: string} = Map()
+let monoLetPinTyAt: {[i32]: i32} = Map()
 function monoLetTyParamMisfit(
   fn: FuncDecl,
   params: i32[],
   tvN: string[],
   tvV: string[],
   tvT: i32[],
+  pinned: string[],
   pinTys: i32[],
 ): i32 {
   const stack: i32[] = [fn.fnBody]
@@ -20715,6 +20721,17 @@ function monoLetTyParamMisfit(
         let j = 0
         while j < params.length && j < pinTys.length {
           if monoLetSeedMisfits(fn, n, params[j], pinTys[j], tvN, tvV, tvT) {
+            // A copy nothing writes holds the parameter's value, so it takes the parameter's pin.
+            if (
+              j < pinned.length
+              && monoParamTyParamAnnotated(params[j], fn)
+              && monoPinIsFnTy(pinTys[j])
+              && !monoLetIsAssigned(n.letName, ix)
+            ) {
+              monoLetPinAt[n.letType] = pinned[j]
+              monoLetPinTyAt[n.letType] = pinTys[j]
+              break
+            }
             fsAskTyParam(params[j])
             return emitFail(
               "emitProgram: monomorphize: `"
@@ -20732,6 +20749,15 @@ function monoLetTyParamMisfit(
     }
   }
   0
+}
+
+// Whether parameter `pd` is annotated bare with one of `fn`'s type parameters; an un-annotated
+// one's pin is the elaboration's binding of the copy's type parameter, so it takes no other.
+function monoParamTyParamAnnotated(pd: i32, fn: FuncDecl): boolean {
+  const pn = nodeAt(pd)
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const tn = nodeAt(pn.parType)
+  tn is TypeRef && strListHas(fn.fnTyParams, tn.tyName)
 }
 
 // Whether binding `n`, annotated bare with a type parameter of `fn`, is seeded by a read of
@@ -22620,7 +22646,9 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         tvT,
         fn.fnBody,
       )
-      if monoLetTyParamMisfit(fn, params, tvN, tvV, tvT, pinTys) < 0 {
+      monoLetPinAt = Map()
+      monoLetPinTyAt = Map()
+      if monoLetTyParamMisfit(fn, params, tvN, tvV, tvT, pinned, pinTys) < 0 {
         return -1
       }
       callBindShadowNote(callIx, fn.fnName, fn.fnTyParams, tvN, tvV)
@@ -22637,7 +22665,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       monoMakeCallIx = callIx
       monoOpenLamOwner = callIx
       monoOpenLamDefer = -1
-      return monoMakeInstance(
+      const made = monoMakeInstance(
         origFe,
         pinned,
         pinKinds,
@@ -22648,6 +22676,9 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         false,
         cbFnNames,
       )
+      monoLetPinAt = Map()
+      monoLetPinTyAt = Map()
+      return made
     }
   }
   0
@@ -28248,6 +28279,8 @@ export function monomorphize(stmts: i32[]) {
   monoProgNamesDeep = false
   monoNoRename = []
   monoAliasCallDecl = Map()
+  monoLetPinAt = Map()
+  monoLetPinTyAt = Map()
   monoRetWidenFns = Map()
   monoWrittenLetHanded = Map()
   monoDeclWrites = Map()
