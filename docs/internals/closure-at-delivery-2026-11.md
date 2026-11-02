@@ -229,6 +229,36 @@ call's types, so nothing on the set side is per-signature. Slice 2 therefore add
 container of NAMED members. Its share of class 4 is the lambda members, whose built closure the
 shared row names.
 
+- (d) Proposed, not scheduled: the bundle-typed closure parameter. It is the bundle for a callee
+  reached only as a closure value.
+  - **The shape it serves.** `const lap = (g) => { g(1); g("s") }; function use(k) { k(id) };
+    use(lap)`. Today's bundle is decided at a direct call, on the parameter of a function instance
+    mono builds per call. `lap` is one closure instance reached through `k`'s `call_ref`, so no
+    call can decide its `g`. The tag path does not serve it either: `ftLambdaIdOk` refuses a lambda
+    that calls its own parameter, and dropping that clause makes the witness refuse with the split
+    plan on as well (measured 2026-11-02).
+  - **ABI shape.** A closure whose parameter is bundled takes the bundle record
+    `{c0: sig0, c1: sig1, …}` in that slot, and its function-value signature key names the bundle
+    (a `bundle(sig0, sig1, …)` parameter kind in the closure signature key), so a `call_ref`
+    through it type-checks against the record. The signature list is the lambda's own: the
+    signatures its body calls the parameter at, which `elabBundleSigs` already computes for a
+    function's parameter, read at the lambda's one instance.
+  - **Conversion at the `call_ref`.** A call through a value whose members bundle a parameter
+    builds the record from its argument, as `emitBundleArg` does at a direct call. Each field is
+    the shared row's closure for (the argument's creation site, that signature). An argument
+    that is itself such a bundle is passed as is. The signature list comes from the members: every
+    member of the callee's set must bundle that parameter at one list, or the call refuses loudly.
+  - **Scope.** This holds only while every delivery of the lambda is to an un-annotated hole, so
+    the bundled ABI never meets a declared function type. A lambda delivered to
+    `(g: (x: i32) => i32) => void` keeps its one-signature closure, and a conversion between the
+    two shapes is not part of this slice.
+  - **What it retires.** bundle-lam in the split-plan census: 5 `@run` files and D6481, D6706,
+    D14824, D14845, which run today only through the split plan. D14942, the same shape with a
+    named `lap` that refuses even with the plan, is graded beside it; serving it also needs the
+    named function's parameter bundled when it is reached as a value. Not W-lam, a written
+    `let` of hole lambdas, which is the binding bundle and parked on the owner's flow-typing
+    ruling. Not M-record.
+
 ### Open questions for the coordinator
 
 1. **A lambda member of a container called at two signatures.** The tag admits only a lambda
