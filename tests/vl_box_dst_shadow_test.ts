@@ -150,6 +150,20 @@ print(pin("s") ?? -1)
 print(viaHole(add) ?? -1)
 `;
 
+// A record literal's omitted nullable field, in a tagged union's arm and in an empty `{}`: the
+// `null` it holds is minted where the literal's check completes it and delivered to the field.
+const OMIT = `type U = { kind: "a", q: i32 | null } | { kind: "b" }
+type N = { n: i32 | null, x: f64 | null }
+function show(u: U) {
+  if u.kind == "a" { print(u.q == null) } else { print(0) }
+}
+function showN(m: N) { print(m.n ?? 7) }
+const a: U = { kind: "a" }
+show(a)
+show({ kind: "a", q: 3 })
+showN({})
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -221,6 +235,18 @@ Deno.test({
       AS,
       DROP_NONE,
       "agree=5; nested agree=11; value already a box=5",
+    ),
+});
+
+Deno.test({
+  name: "box-dst shadow: an omitted nullable field's null takes the field's type",
+  ignore,
+  fn: () =>
+    expectRows(
+      "omit",
+      OMIT,
+      DROP_NONE,
+      "agree=3; nested agree=7; nested value already a box=1; value already a box=1",
     ),
 });
 
