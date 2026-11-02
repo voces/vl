@@ -867,11 +867,18 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 
 F's 15 files are four shapes by witness:
 
-- A, 2 files: a result `: F` with a parameter handed back (D6200, D6425). It needs three
-  layers: the elaboration's hand-back fact across a hand-on, a tag rule for a type parameter
-  that is shared and handed back, and a third, not yet located, where `mid` is instanced per
-  closed pin so the set is partial. It is parked, with the first two prototyped on branch
-  `claude/group-f-wip`.
+- A, 2 files: a result `: F` with a parameter handed back (D6200, D6425). The shape is served
+  without the plan in three layers:
+  - the elaboration's hand-back fact now holds across a hand-on to a named function's
+    un-annotated parameter (`elabParamOnlyReturned`);
+  - a tag rule covers a type parameter that is shared and handed back (`ftOwnTyParamSharedBack`,
+    mirrored at mono's set pin);
+  - the partial-set rule ignores the reaches of the signature-alternative instances the result's
+    type makes (`elabKeyCallsHandSetValue`).
+
+  Both rows' witnesses run, pinned by `generic-fn-value-two-type-param-params-one-handed-back`. The
+  two files still refuse on other spellings: a hand-back through a copy (`const b: F = a1; b`) and
+  the call made inside another function.
 - B, 4 files: a hole parameter copied into an un-annotated binding called at two types.
 - C, 8 files: a copy of a parameter into a binding annotated with a type parameter (`let b: F =
   a1`). Two are served without the plan. One is served by mono pinning the copy at its seed
