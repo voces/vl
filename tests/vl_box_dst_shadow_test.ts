@@ -196,6 +196,16 @@ const m: {[string]: i32} | null = Map()
 show(m?.get("k"))
 `;
 
+// An optional call `p?.f()` delivered as it is, into a `??` and into a binding: the call is its
+// guard's non-null arm and takes the call's own join.
+const OPTCALL = `type P = { n: i32 }
+function twice(self: P) { self.n * 2 }
+const p: P | null = { n: 21 }
+print(p?.twice() ?? 0)
+const r = p?.twice()
+print(r ?? -1)
+`;
+
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
@@ -297,6 +307,18 @@ Deno.test({
       OPT,
       DROP_NONE,
       "agree=2; nested agree=14; nested value already a box=2; value already a box=3",
+    ),
+});
+
+Deno.test({
+  name: "box-dst shadow: an optional call's guarded call takes the call's join",
+  ignore,
+  fn: () =>
+    expectRows(
+      "optcall",
+      OPTCALL,
+      DROP_NONE,
+      "nested agree=8; nested value already a box=1; value already a box=2",
     ),
 });
 
