@@ -11445,3 +11445,28 @@ its fields.
 later write could invalidate the narrowing, and when none can, the delivery is fine without a
 copy. It would relax lists and records alike (D14827, whose witness is D14752's original
 spelling).
+
+## A type variable's uses join over numeric widening (owner ruling, 2026-11-02) — D2459
+
+**The rule.** When the uses of one type variable at a call disagree only by a lossless numeric
+widening (`i32` to `i64` or `f64`, `f32` to `f64`), the variable binds at the wider number, and
+the narrower uses widen into it. The order of the arguments does not decide the instance.
+
+```vl
+function f<T>(x: T, g: (i32) => T) { return g(2) }
+const two: i32 = 2
+print(f(two, (i) => i * 1.5))   // T = f64, prints 3, as `f((i) => i * 1.5, two)` does
+```
+
+Uses that disagree by anything else still refuse: `i64` beside `f64`, `i32` beside `f32`, and a
+number beside a string. A number literal already followed this rule by binding after the values
+beside it (D3541); this extends it to typed values and to a callback's result.
+
+**Why.** Binding at the first use made two declarations that differ only in parameter order
+accept different programs. The widening edges are the ones every other numeric context already
+takes implicitly, so joining over them adds no conversion a reader cannot already see.
+
+**The limit.** A call inside a generic body joins only where the template's own check joined it.
+A use typed by the enclosing type parameter (`mix(u, v)` with `u: U`) is not a number at the
+template, so the template types the call at `U`, and an instance that joined it would hand back
+a type its template never saw. Those calls keep their refusal (D15031).
