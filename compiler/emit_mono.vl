@@ -10640,6 +10640,14 @@ function monoInstanceRet(
   pins: i32[],
 ): i32 {
   if fn.fnRet >= 0 && !monoAnnHasTyParam(fn.fnRet, -1, tps) { return fn.fnRet }
+  // A parameter pinned at a bundle's record and returned whole is returned as that record.
+  const bp = if fn.fnRet < 0 { monoReturnedBundlePin(fn, pins) } else { -1 }
+  if bp >= 0 {
+    const brow = monoBundleRowOf(bp)
+    if brow >= 0 && brow < sNames.length {
+      return synthTypeRefTy(sNames[brow], -1, bp)
+    }
+  }
   const r = monoRetRepOf(decl, fn, pins, elabRetOf(ek))
   if r < 0 {
     if fn.fnRet < 0 { return -1 }
@@ -10658,6 +10666,61 @@ function monoInstanceRet(
   // A literal union spelled by its alias carries the alias's row, whose rep the name promises.
   const at = if tyIsLitUnion(r) { litUnionAliasTyOfLitTexts(tyLitMemberTexts(r)) } else { -1 }
   synthTypeRefTy(nm, -1, if at >= 0 { at } else { r })
+}
+
+// The bundle record a parameter of `fn` is pinned at in `pins`, where the body returns that
+// parameter whole; -1 for none.
+function monoReturnedBundlePin(fn: FuncDecl, pins: i32[]): i32 {
+  let i = 0
+  while i < fn.fnParams.length && i < pins.length {
+    if (
+      monoIsBundleTy(pins[i])
+      && monoBodyReturnsParam(fn.fnBody, fn.fnParams[i])
+    ) {
+      return pins[i]
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether pin `t` is a bundle's record, matched by row since a pin is spelled afresh.
+function monoIsBundleTy(t: i32): boolean {
+  const r = monoBundleRowOf(t)
+  if r < 0 { return false }
+  for b in monoBundleTys {
+    if monoBundleRowOf(b) == r { return true }
+  }
+  false
+}
+
+// Whether function body `body` returns parameter `par` whole, by `return` or as its last
+// statement; nested functions aside.
+function monoBodyReturnsParam(body: i32, par: i32): boolean {
+  const b = nodeAt(body)
+  if b is Block && b.blkStmts.length > 0 {
+    if monoIsParamRead(b.blkStmts[b.blkStmts.length - 1], par) { return true }
+  }
+  monoStmtReturnsParam(body, par)
+}
+
+// Whether statement `x` holds a `return` of parameter `par`, nested functions aside.
+function monoStmtReturnsParam(x: i32, par: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is RetStmt { return monoIsParamRead(n.retArg, par) }
+  if (
+    n is Block
+    || n is IfStmt
+    || n is WhileStmt
+    || n is ForIn
+    || n is ForRange
+  ) {
+    for k in nodeChildren(x) {
+      if monoStmtReturnsParam(k, par) { return true }
+    }
+  }
+  false
 }
 
 // Result `r` of the instance of `decl` at parameter pins `pins`, or the record pin every result
@@ -23193,6 +23256,55 @@ function monoConstFnCopy(d: i32): boolean {
   fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl
 }
 
+// `monoParamReadOtherThanCalled` over function body `body`, where with `fwd` a return of `par`
+// from the function itself, by `return` or as the body's last statement, is not counted either.
+function monoBodyReadsOtherThanCalled(
+  body: i32,
+  par: i32,
+  fwd: boolean,
+): boolean {
+  const b = nodeAt(body)
+  if !fwd || !(b is Block) {
+    return monoParamReadOtherThanCalled(body, par, true, fwd, fwd)
+  }
+  let i = 0
+  while i < b.blkStmts.length {
+    const st = b.blkStmts[i]
+    const last = i == b.blkStmts.length - 1
+    if !(last && monoIsParamRead(st, par)) && monoStmtReadsOther(st, par) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether node `x` is a read of parameter `par`, under parentheses.
+function monoIsParamRead(x: i32, par: i32): boolean {
+  const u = unwrapParen(x)
+  u >= 0 && nodeAt(u) is Ident && identDeclOf(u) == par
+}
+
+// `monoBodyReadsOtherThanCalled` for statement `x` of the function's own body.
+function monoStmtReadsOther(x: i32, par: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is RetStmt && monoIsParamRead(n.retArg, par) { return false }
+  if (
+    n is Block
+    || n is IfStmt
+    || n is WhileStmt
+    || n is ForIn
+    || n is ForRange
+  ) {
+    for k in nodeChildren(x) {
+      if monoStmtReadsOther(k, par) { return true }
+    }
+    return false
+  }
+  monoParamReadOtherThanCalled(x, par, true, true, true)
+}
+
 // `monoPinHoleParam`'s bundle: where the callee's instance calls the hole lambda literal `arg`,
 // its argument `i`, at two or more signatures, builds the lambda at each and pins the parameter
 // at the anonymous record holding one closure per signature. 0, -1 on a failure, or 1 where the
@@ -23212,7 +23324,7 @@ function monoBundlePin(
   // The callee reads the record only as a callee, or hands it whole to a named function: any other
   // read wants one closure.
   const fwd = fsModeOf() == FS_COMPILE
-  if monoParamReadOtherThanCalled(fn.fnBody, par, true, fwd, fwd) { return 1 }
+  if monoBodyReadsOtherThanCalled(fn.fnBody, par, fwd) { return 1 }
   const at = pinTys.length
   const rc = monoBundlePinArg(arg, i, callIx, ctx, sigs, pinned, pinTys)
   // The record each parameter key is pinned at, read by a hand of that parameter.
