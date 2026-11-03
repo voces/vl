@@ -8399,22 +8399,39 @@ function collectVariantFields(stmts: i32[], name: string, ty: i32) {
 // identity (`variantSig` is the name half); `assignTags`'s exemption depends on this being
 // identity, not storage: `{a: i32}` and `{a: boolean}` share a wasm code but are different
 // types, so the `armFieldTyText` spelling column, not just the code, decides.
-// Whether field `fi` of variants `a` and `b` holds records of one record-row class, nullable in
-// both or in neither: two names for one shape (`R`, `S` = `{r: i32}`) are one field (D15150).
+// Whether field `fi` of variants `a` and `b` holds one shape under two record names (`R`, `S` =
+// `{r: i32}`), directly or as a list element, map key or value, or nullable inner (D15150).
 function variantRecordFieldsOneRow(a: i32, b: i32, fi: i32): boolean {
-  if armFieldTypes()[uFieldStart[a] + fi] != FC_STRUCT { return false }
   if a >= uVarTyIx.length || b >= uVarTyIx.length { return false }
   const fnm = armFieldNames()[uFieldStart[a] + fi]
-  let ta = recFieldTyOf(uVarTyIx[a], fnm)
-  let tb = recFieldTyOf(uVarTyIx[b], fnm)
-  if ta < 0 || tb < 0 { return false }
+  recordShapesOneRow(
+    recFieldTyOf(uVarTyIx[a], fnm),
+    recFieldTyOf(uVarTyIx[b], fnm),
+    0,
+  )
+}
+
+// Whether `ta` and `tb` are one shape whose records, at every leaf, share a record-row class.
+function recordShapesOneRow(ta: i32, tb: i32, depth: i32): boolean {
+  if ta < 0 || tb < 0 || depth > 16 { return false }
+  const ca = recordRowClassOf(ta)
+  if ca != "" { return ca == recordRowClassOf(tb) }
   const na = tyAt(ta)
   const nb = tyAt(tb)
-  if (na is TyNullable) != (nb is TyNullable) { return false }
-  if na is TyNullable { ta = na.nInner }
-  if nb is TyNullable { tb = nb.nInner }
-  const ca = recordRowClassOf(ta)
-  ca != "" && ca == recordRowClassOf(tb)
+  if na is TyNullable && nb is TyNullable {
+    return recordShapesOneRow(na.nInner, nb.nInner, depth + 1)
+  }
+  if na is TyArray && nb is TyArray {
+    return na.aRead == nb.aRead
+      && recordShapesOneRow(na.aElem, nb.aElem, depth + 1)
+  }
+  if na is TyMap && nb is TyMap {
+    if na.mSet != nb.mSet { return false }
+    const keyOne = na.mKey == nb.mKey
+      || recordShapesOneRow(na.mKey, nb.mKey, depth + 1)
+    return keyOne && recordShapesOneRow(na.mVal, nb.mVal, depth + 1)
+  }
+  false
 }
 
 function variantFieldTysEq(a: i32, b: i32) {
@@ -8427,21 +8444,19 @@ function variantFieldTysEq(a: i32, b: i32) {
     ) {
       return false
     }
-    if variantRecordFieldsOneRow(a, b, fi) {
-      fi = fi + 1
-      continue
-    }
-    if (
-      armFieldTyText()[uFieldStart[a] + fi]
-      != armFieldTyText()[uFieldStart[b] + fi]
-    ) {
-      return false
-    }
-    if (
-      armFieldElemName()[uFieldStart[a] + fi]
-      != armFieldElemName()[uFieldStart[b] + fi]
-    ) {
-      return false
+    if !variantRecordFieldsOneRow(a, b, fi) {
+      if (
+        armFieldTyText()[uFieldStart[a] + fi]
+        != armFieldTyText()[uFieldStart[b] + fi]
+      ) {
+        return false
+      }
+      if (
+        armFieldElemName()[uFieldStart[a] + fi]
+        != armFieldElemName()[uFieldStart[b] + fi]
+      ) {
+        return false
+      }
     }
     // B6b — the map field's key half: the elem-name column above records only `V`, so two
     // differently-keyed maps compare equal there; this column catches it.
