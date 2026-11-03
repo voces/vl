@@ -196,6 +196,20 @@ design. Until then they are the interim, at no measured cost (byte-identical, fu
 `generics/is-list-arm-anon-record.vl`, the 4b-i movers, the five shared-writer fixtures, the class-F
 trio and per-frame's two slot-probe files, D14842, D15049, D15019, D15102 and D15068.
 
+### M6. A hole parameter's delivered record (D15173, design only)
+
+**The case.** `u(a)` called with `r()`, a call the checker rebuilds at `J` (D14741), and with `{ f: 1 }`. Mono builds `u` at `J` and at `{f: i32}`, two row classes. The elaboration holds one key, `?u.0={f: i32}`, because it binds the hole at each argument's checked type.
+
+**The fact.** Per call and per un-annotated parameter `i`: the record the argument is delivered at. That is the checker's rebuilt row for a fresh call or literal (`recRebuiltLeafRow`, D8020), and for a binding the single answer D15172 settles between `recRebuiltLeafRow` and `recBuildTyOf`.
+
+**The producer.** The checker. The fact exists before the elaboration runs, so no stage derives it again. Once D15172 lands, one checker function answers it per argument, and the elaboration and mono both read that function.
+
+**The readers.** The elaboration's call key gets an entry naming the delivered record's row class (`recordRowClassOf`), so `u` at `J` and at `{f: i32}` are two keys, each walked at its delivered record. Mono's hole pin then reads that key instead of `monoRebuiltLitRetName`.
+
+**Why the hole's type stays untouched.** The hole binding `?u.0` is not only a key. It types the parameter for the hole solve, and it is what a call site delivers its argument at. Retyping it to the rebuilt row (#6105's rule applied to the hole, measured for D15173) made the call site deliver `{ f: 1 }` and `r()` at a type their builds do not have. The witness's own fixture became invalid wasm, and three files that hand record literals and lists to holes stopped building. So the delivered record is a separate entry beside `?u.0`. It splits the key and sets the instance's walk type, while the call-site delivery and the hole solve keep reading `?u.0`.
+
+**Open question.** Whether an instance walked at its delivered record while the solve keeps `?u.0` needs any adapter at the call, a widening from the argument's build to the delivered record. #6105's sole-pin case needed none, because there the binding and the delivery agree. The first slice measures this on D15173's witness before any key changes.
+
 ## Producers and readers
 
 | fact | producer | readers |
