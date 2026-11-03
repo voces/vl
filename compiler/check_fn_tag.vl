@@ -172,6 +172,7 @@ import {
   fnTagUndecide,
   fnWidenedListSourceSets,
 } from "./check_elab_cap"
+import { fvaListCopyAt } from "./check_fn_tag_facts"
 
 // Decides every set from scratch over the program at `rootIx`, then raises the refusal each
 // call through a set left a closure owes.
@@ -2683,33 +2684,64 @@ function ftHoleParamOf(c: Call, x: i32): boolean {
 }
 
 // Whether `f`'s body writes a read of parameter `par`, or of a `const` copy of it, into a holder's
-// slot, as a `push` or `set` argument: the holder's rep is an instance's, which a binding or
-// literal of the body is not (D15130).
+// slot, as a `push` or `set` argument or through a list literal a copy reads element by element:
+// the holder's rep is an instance's, which a binding or literal of the body is not (D15130,
+// D15131).
 function ftParamStored(f: FuncDecl, par: i32): boolean {
+  // The `const` lists whose literal holds a read of `par`.
+  const lists: i32[] = []
+  const ls: i32[] = [f.fnBody]
+  while ls.length > 0 {
+    const x = ls.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is LetDecl && ftLitHoldsParam(f, xn.letInit, par) { lists.push(x) }
+      nodeChildrenPush(x, ls)
+    }
+  }
   const xs: i32[] = [f.fnBody]
   const ps: i32[] = [-1]
   while xs.length > 0 {
     const x = xs.pop() ?? -1
     const p = ps.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
-      if (
-        nodeAt(x) is Ident
-        && (identDeclOf(x) == par || fnTagParamCopyOf(f, identDeclOf(x)) == par)
-        && p >= 0
-        && p < P.nodes.length
-      ) {
+      const xn = nodeAt(x)
+      if xn is Ident && p >= 0 && p < P.nodes.length {
+        const d = identDeclOf(x)
         const pn = nodeAt(p)
-        if pn is Call && i32ListHas(pn.callArgs, x) {
-          const cm = nodeAt(parenPeelIx(pn.callFn))
-          if cm is Member && (cm.memProp == "push" || cm.memProp == "set") {
-            return true
+        if d == par || fnTagParamCopyOf(f, d) == par {
+          if pn is Call && i32ListHas(pn.callArgs, x) {
+            const cm = nodeAt(parenPeelIx(pn.callFn))
+            if cm is Member && (cm.memProp == "push" || cm.memProp == "set") {
+              return true
+            }
           }
+        }
+        // A list holding it, copied element by element into a closed holder (D15131).
+        if i32ListHas(lists, d) && pn is Member && fvaListCopyAt(p) {
+          return true
         }
       }
       for k in nodeChildren(x) {
         xs.push(k)
         ps.push(x)
       }
+    }
+  }
+  false
+}
+
+// Whether `init` is a list literal with an element reading parameter `par` of `f`, or a copy of it.
+function ftLitHoldsParam(f: FuncDecl, init: i32, par: i32): boolean {
+  const li = parenPeelIx(init)
+  if li < 0 || li >= P.nodes.length { return false }
+  const lit = nodeAt(li)
+  if !(lit is ArrayLit) { return false }
+  for e in lit.arrElems {
+    const pe = parenPeelIx(e)
+    if pe >= 0 && pe < P.nodes.length && nodeAt(pe) is Ident {
+      const d = identDeclOf(pe)
+      if d == par || fnTagParamCopyOf(f, d) == par { return true }
     }
   }
   false
@@ -3377,9 +3409,11 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     Member => {
       if pn.memObj != x { return false }
+      // The receiver of a copy `fvaListSetCopy` built hands each element to an adapter.
       return ftHoldKind(tx, s, 4) == 2
         || ftSlotOp(pn, x, g, s)
         || pn.memProp == "length"
+        || pn.memProp == "map" && fvaListCopyAt(g)
     }
     ForIn => {
       return pn.fiIter == x

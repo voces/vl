@@ -572,7 +572,12 @@ import {
   synthTypeRefTy,
 } from "./emit_nullable_rets"
 import { tyReachesFuncD } from "./emit_obj_lit_fits"
-import { bundleParamNote, bundleReset, bundleTyNote } from "./emit_bundle"
+import {
+  bundleHandMemberNote,
+  bundleParamNote,
+  bundleReset,
+  bundleTyNote,
+} from "./emit_bundle"
 import { repRowId, repRowOfTyStruct } from "./emit_rep"
 import {
   gaeAppHasNulParamListField,
@@ -612,6 +617,7 @@ import {
   elabBodyDeclNote,
   elabCallBindTy,
   elabCallBundleSigs,
+  elabCallHandMember,
   elabCallInstWant,
   elabCallParamTy,
   elabCallParamTyOwn,
@@ -632,6 +638,7 @@ import {
   elabNarrowedCarry,
   elabNodeTyAt,
   elabNodeTys,
+  elabParamCarriedInstAt,
   elabResultAtParams,
   elabRetOf,
   elabSlotNote,
@@ -18698,6 +18705,55 @@ function monoCoerceNamedGenericTys(
 }
 
 // Whether value node `v`, read in frame `ctx`, names a declared generic function by name.
+// Rewrites argument `v`, a read in frame `ctx` of one of its parameters annotated with a bare
+// type parameter, to a read of the generic that parameter carries (`elabParamCarriedDeclAt`),
+// so the call pins that generic at its own parameter's close as a direct name is (D6202).
+function monoFwdCarriedRewrite(v: i32, ctx: i32): i32 {
+  const x = unwrapParen(v)
+  if x < 0 || ctx < 0 { return 0 }
+  const xn = nodeAt(x)
+  const f = nodeAt(ctx)
+  if !(xn is Ident) || !(f is FuncDecl) { return 0 }
+  const fe = fnStmtsPosOf(ctx)
+  let ofe = -1
+  let kk = 0
+  while kk < monoInstFe.length && ofe < 0 {
+    if monoInstFe[kk] == fe { ofe = monoInstOrig[kk] }
+    kk = kk + 1
+  }
+  if ofe < 0 && fe >= 0 && fe < monoOrigNode.length { ofe = fe }
+  const tfn = if ofe >= 0 && ofe < monoOrigNode.length && monoOrigNode[ofe] >= 0 { nodeAt(monoOrigNode[ofe]) } else { f }
+  const tf = if tfn is FuncDecl { tfn } else { f }
+  let qi = -1
+  let q = 0
+  while q < tf.fnParams.length && q < f.fnParams.length {
+    const pn = nodeAt(tf.fnParams[q])
+    if pn is Param && pn.parName == xn.identName && pn.parType >= 0 {
+      const tn = nodeAt(pn.parType)
+      if tn is TypeRef && strListHas(tf.fnTyParams, tn.tyName) { qi = q }
+    }
+    q = q + 1
+  }
+  if qi < 0 { return 0 }
+  const ck = elabParamCarriedInstAt(elabKeyAt(ctx), qi)
+  const d = if ck >= 0 && ck < ekDecl.length { ekDecl[ck] } else { -1 }
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) || dn.fnName == "" { return 0 }
+  // Only a top-level generic, whose name reaches it from any call; one nested in another frame
+  // is no name here, and its instances are keyed by that frame.
+  let dfe = -1
+  let j = 0
+  while j < monoOrigNode.length && dfe < 0 {
+    if monoOrigNode[j] == d { dfe = j }
+    j = j + 1
+  }
+  if dfe < 0 || dfe >= fnParent.length || fnParent[dfe] >= 0 { return 0 }
+  const n: Node = { identName: dn.fnName, pos: xn.pos }
+  arenaSetNode(x, n)
+  sidNoteNodeName(x, d)
+  0
+}
+
 function monoNamesDeclaredGeneric(v: i32, ctx: i32): boolean {
   if v < 0 { return false }
   const x = unwrapParen(v)
@@ -23306,6 +23362,9 @@ function monoPinHoleParam(
   // A parameter the checker already decided is not a hole: the instance pins it at the
   // elaboration's type for it, or its own where the function binds nothing; "" keeps the
   // argument-derived pin.
+  // A bundle handed to a parameter bound to one closure hands the member at its type.
+  const hm = elabCallHandMember(monoCallTplOf(callIx), i)
+  if hm >= -1 { bundleHandMemberNote(args[i], hm) }
   // A lambda the callee calls at two or more signatures is handed as a bundle (D14841).
   const bun = monoBundlePin(
     fn,
@@ -23599,6 +23658,7 @@ function monoPinAnnotatedParam(
       const pinTy: i32[] = [0 - 1]
       // A type parameter read only as whole parameter annotations: the elaboration closes each
       // parameter at the instances it alone carries.
+      if tyParamIsBareOnly(decl, tp) { monoFwdCarriedRewrite(args[i], ctx) }
       const own = if tyParamIsBareOnly(decl, tp) { elabCallParamTyOwn(monoCallTplOf(callIx), i) } else { -1 }
       if (
         own >= 0
