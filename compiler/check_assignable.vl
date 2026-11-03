@@ -1604,6 +1604,17 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         covarTwoUnionsErr(srcExpr, srcTy, dstTy)
         return true
       }
+      // A list of a function set read as a readonly list of a closed function type is a fresh
+      // copy whose elements pass through their adapters; a mutable list would alias (D2161).
+      const dnn = if dstTy >= 0 && dstTy < T.tys.length { nonNullTy(dstTy) } else { -1 }
+      const dla = if dnn >= 0 && dnn < T.tys.length { tyAt(dnn) } else { tyAt(TY_ERR) }
+      if (
+        dla is TyArray
+        && dla.aRead == 1
+        && fvaListSetCopy(srcExpr, srcTy, dla.aElem)
+      ) {
+        return true
+      }
       noteRefListView(srcExpr, srcTy, dstTy)
       recordListCopy(srcExpr, srcTy, dstTy)
       // D2060 — the record twin: a field widened by this delivery is shared with the source,
@@ -3263,6 +3274,32 @@ export function fvaAdaptListLit(ix: i32, listTy: i32): boolean {
   true
 }
 
+// Whether `site` reads a `const` list literal holding a `let` initialised from another `let`: that
+// binding's type is decided apart from the set it holds, so a copy's callback cannot read it as one.
+function fvaListHoldsLetAlias(site: i32): boolean {
+  const p = parenPeelIx(site)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return false }
+  const d = identDeclOf(p)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(p) }
+  if !(dn is LetDecl) { return false }
+  const li = parenPeelIx(dn.letInit)
+  const lit = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { nodeAt(p) }
+  if !(lit is ArrayLit) { return false }
+  for e in lit.arrElems {
+    const pe = parenPeelIx(e)
+    const ed = if pe >= 0 && pe < P.nodes.length && nodeAt(pe) is Ident { identDeclOf(pe) } else { -1 }
+    const en = if ed >= 0 && ed < P.nodes.length { nodeAt(ed) } else { nodeAt(p) }
+    if en is LetDecl && en.letKw == "let" {
+      const ii = parenPeelIx(en.letInit)
+      const idd = if ii >= 0 && ii < P.nodes.length && nodeAt(ii) is Ident { identDeclOf(ii) } else { -1 }
+      if idd >= 0 && idd < P.nodes.length && nodeAt(idd) is LetDecl {
+        return true
+      }
+    }
+  }
+  false
+}
+
 // A list `site` of type `srcTy` whose elements are a function set, copied into slots of the closed
 // function type `de`: `site` becomes `site.map(($e): de => $e)`, whose return delivers each
 // element through its adapter, at the source's own position. False when it is no such copy.
@@ -3270,7 +3307,9 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
   if site < 0 || srcTy < 0 || de < 0 || inferQuiet || monoRecheckDepth > 0 {
     return false
   }
-  if fvaListCopyAt(site) { return false }
+  if srcTy >= T.tys.length || de >= T.tys.length || fvaListCopyAt(site) {
+    return false
+  }
   if (
     nodeAt(parenPeelIx(site)) is ArrayLit
     || !(tyAt(de) is TyFunc)
@@ -3278,8 +3317,12 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
   ) {
     return false
   }
-  const sa = tyAt(nonNullTy(srcTy))
-  if !(sa is TyArray) || sa.aElem == de { return false }
+  const snn = nonNullTy(srcTy)
+  if snn < 0 || snn >= T.tys.length { return false }
+  const sa = tyAt(snn)
+  if !(sa is TyArray) || sa.aElem == de || fvaListHoldsLetAlias(site) {
+    return false
+  }
   // A set's elements, or a hole parameter's, which an instance binds to one.
   const held = fnTagSetValueOfTy(sa.aElem)
     || fnTagSetOfTy(sa.aElem) >= 0
@@ -3771,6 +3814,13 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // A join typed at the destination still carries each tail's own function value.
   if fvaAdaptJoin(srcExpr, dstTy) { return srcTy != dstTy }
   if srcTy == dstTy || !tyMayHoldFn(dstTy, 0) { return false }
+  // A list of a function set at a readonly list of a closed function type is copied through
+  // adapters, as at `assignableExpr`, for a field, element or assignment delivered here.
+  const fdn = nonNullTy(dstTy)
+  const fda = if fdn >= 0 && fdn < T.tys.length { tyAt(fdn) } else { tyAt(TY_ERR) }
+  if fda is TyArray && fda.aRead == 1 && fvaListSetCopy(srcExpr, srcTy, fda.aElem) {
+    return true
+  }
   // A literal delivers each element or field at the destination's own type, one seam down.
   const lit = nodeAt(parenPeelIx(srcExpr))
   if lit is ArrayLit {
