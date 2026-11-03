@@ -499,6 +499,12 @@ function declOpen(d: i32): boolean {
 // around it, -2 when an enclosing declaration whose type variables `d` reads is open and not on
 // the chain (the open enclosing instance reaches it instead).
 function elabParentFor(d: i32, from: i32): i32 {
+  elabParentForAt(d, from, true)
+}
+
+// `elabParentFor`, where `lam` says whether an anonymous lambda takes its open encloser's instance
+// as parent though it reads none of its type variables.
+function elabParentForAt(d: i32, from: i32, lam: boolean): i32 {
   let e = elabEncl.get(d) ?? -1
   let anyOpen = false
   let guard = 0
@@ -507,7 +513,16 @@ function elabParentFor(d: i32, from: i32): i32 {
     let g2 = 0
     while a >= 0 && g2 < 64 {
       if ekDecl[a] == e {
-        return if elabReadsChainOf(d, a) || anyOpen { a } else { -1 }
+        // A lambda declared in an instanced body is keyed under that instance, so each instance
+        // holds its own (per-instance-identity-2026-11.md, M3 step 2).
+        if (
+          elabReadsChainOf(d, a)
+          || anyOpen
+          || (lam && elabLamPerEncl(d) && declOpen(e))
+        ) {
+          return a
+        }
+        return -1
       }
       a = ekParent[a]
       g2 = g2 + 1
@@ -518,6 +533,26 @@ function elabParentFor(d: i32, from: i32): i32 {
   }
   if anyOpen { return 0 - 2 }
   -1
+}
+
+// Whether `d` is an anonymous lambda with an un-annotated parameter, whose key takes its encloser
+// instance as parent; a lambda with nothing to key is its template at every instance.
+function elabLamPerEncl(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  // Lifting renames a lambda `__lambda_N` after the run, and mono asks for it under that name.
+  if !(n is FuncDecl) { return false }
+  if (
+    n.fnName != ""
+    && !(n.fnName.length >= 8 && n.fnName.slice(0, 8) == "__lambda")
+  ) {
+    return false
+  }
+  for p in n.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  false
 }
 
 // Whether nested declaration `d` reads the type variable `nm` an enclosing declaration binds:
@@ -752,6 +787,12 @@ function elabDrainHoleRows() {
         }
         elabReachNote(from, k0, -1)
         elabGuessing = false
+        // A lambda pinned by the template check is also keyed under each instance of its
+        // encloser, which is where mono asks for it.
+        if from < 0 && elabLamPerEncl(d) && elabEncl.has(d) {
+          elabHoleDeferred.push(r)
+          elabHoleDeferredAt.push(0)
+        }
       }
     }
     elabHoleCur = elabHoleCur + 1
@@ -1109,6 +1150,11 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   if !elabCanon(decl, names0, tys0, names, tys) { return -1 }
   const parent = elabParentFor(decl, from)
   if parent == 0 - 2 { return -1 }
+  // The key a lambda had before it took its encloser instance stays minted beside the per-instance
+  // one, for the readers that ask with no instance in hand (per-instance-identity-2026-11.md, M5).
+  if parent >= 0 && elabParentForAt(decl, from, false) == -1 {
+    elabEnqueue(decl, names0, tys0, -1)
+  }
   const key = i32ToStr(parent) + "^" + elabKeyOf(decl, names, tys)
   const have = ekIndex[key] ?? -1
   if have >= 0 { return have }
@@ -4399,6 +4445,7 @@ function elabReturnedBundleSigs(k: i32): i32[] {
 // Whether function body `body` returns parameter `par` whole, by `return` or as its last
 // statement; nested functions aside.
 function elabBodyReturnsParam(body: i32, par: i32): boolean {
+  if body < 0 { return false }
   const b = nodeAt(body)
   if b is Block && b.blkStmts.length > 0 {
     const t = parenPeelIx(b.blkStmts[b.blkStmts.length - 1])
@@ -4478,16 +4525,18 @@ function elabCallsNamedFn(c: i32): boolean {
 }
 
 // Whether every function each key of the chain rooted at `r` in `up` binds its parameter to, or
-// is handed there by a call, has an instance at each of `sigs`.
+// is handed there by a call, has an instance at each of `sigs`. Each one that has none is a
+// demand the next round of the elaboration makes (`elabJoinDemandNote`).
 function elabChainMembersBuilt(
   up: Map<i32, i32>,
   r: i32,
   sigs: i32[],
 ): boolean {
+  let ok = true
   const ks: i32[] = []
   for key in up.keys() {
     if elabBundleRoot(up, key) == r {
-      if !elabKeyMembersBuilt(key, sigs) { return false }
+      if !elabKeyMembersBuilt(key, sigs) { ok = false }
       ks.push(key)
     }
   }
@@ -4495,11 +4544,11 @@ function elabChainMembersBuilt(
     const row = elabCallKeys[c] ?? []
     let j = 0
     while j + 1 < row.length {
-      if !elabCallArgsBuilt(c, row[j + 1], ks, sigs) { return false }
+      if !elabCallArgsBuilt(c, row[j + 1], ks, sigs) { ok = false }
       j = j + 2
     }
   }
-  true
+  ok
 }
 
 // Whether call `c` into instance `kc` hands, at each parameter whose key is in `ks`, a lambda or
@@ -4507,23 +4556,19 @@ function elabChainMembersBuilt(
 function elabCallArgsBuilt(c: i32, kc: i32, ks: i32[], sigs: i32[]): boolean {
   const cn = nodeAt(c)
   if !(cn is Call) { return true }
+  let ok = true
   let i = 0
   while i < cn.callArgs.length && i < 64 {
     if i32ListHas(ks, elabBundleKey(kc, i)) {
       const a = parenPeelIx(cn.callArgs[i])
       const d = if a >= 0 && nodeAt(a) is Ident { identDeclOf(a) } else { a }
       if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
-        for t in sigs {
-          const f = tyAt(t)
-          if !(f is TyFunc) || elabMemberKeyAt(d, f.fnParamTypes) < 0 {
-            return false
-          }
-        }
+        if !elabMembersAt(d, sigs) { ok = false }
       }
     }
     i = i + 1
   }
-  true
+  ok
 }
 
 // Whether every function parameter key `key`'s instance binds the parameter to has an instance at
@@ -4537,15 +4582,91 @@ function elabKeyMembersBuilt(key: i32, sigs: i32[]): boolean {
   const ds = elabFnSetOf(
     substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k]),
   )
+  let ok = true
   for d in ds {
-    for t in sigs {
-      const f = tyAt(t)
-      if !(f is TyFunc) || elabMemberKeyAt(d, f.fnParamTypes) < 0 {
-        return false
-      }
+    if !elabMembersAt(d, sigs) { ok = false }
+  }
+  ok
+}
+
+// Whether function `d` has an instance at each of `sigs`; each one it has none at is noted as a
+// demand.
+function elabMembersAt(d: i32, sigs: i32[]): boolean {
+  let ok = true
+  for t in sigs {
+    const f = tyAt(t)
+    if !(f is TyFunc) {
+      ok = false
+    } else if elabMemberKeyAt(d, f.fnParamTypes) < 0 {
+      elabJoinDemandNote(d, f.fnParamTypes)
+      ok = false
     }
   }
+  ok
+}
+
+// The instances a chain's join found missing, carried from one round of the elaboration to the
+// next and enqueued at its start: each function and the parameter types it is wanted at.
+let elabJoinDemDecls: i32[] = []
+let elabJoinDemTys: i32[][] = []
+let elabJoinDemNew = false
+let elabJoinRounds = 0
+
+// Clears the carried demands, once per preparation of a program.
+export function elabJoinDemandsReset() {
+  elabJoinDemDecls = []
+  elabJoinDemTys = []
+  elabJoinDemNew = false
+  elabJoinRounds = 0
+  0
+}
+
+// Whether the last join noted a demand no earlier round carried, which a further round makes;
+// counted in `elabJoinRoundsOf`.
+export function elabJoinDemandsTake(): boolean {
+  const grew = elabJoinDemNew
+  elabJoinDemNew = false
+  if grew { elabJoinRounds = elabJoinRounds + 1 }
+  grew
+}
+
+// The rounds this preparation took for the join's demands.
+export function elabJoinRoundsOf(): i32 { elabJoinRounds }
+
+// Notes function `d` wanted at parameter types `pts`, once.
+function elabJoinDemandNote(d: i32, pts: i32[]) {
+  let i = 0
+  while i < elabJoinDemDecls.length && i < elabJoinDemTys.length {
+    if elabJoinDemDecls[i] == d && elabTyListSame(elabJoinDemTys[i], pts) {
+      return 0
+    }
+    i = i + 1
+  }
+  elabJoinDemDecls.push(d)
+  elabJoinDemTys.push(pts.slice(0))
+  elabJoinDemNew = true
+  0
+}
+
+// Whether type lists `a` and `b` hold the same types in order.
+function elabTyListSame(a: i32[], b: i32[]): boolean {
+  if a.length != b.length { return false }
+  let j = 0
+  while j < a.length {
+    if !tySame(a[j], b[j]) { return false }
+    j = j + 1
+  }
   true
+}
+
+// Enqueues each carried demand, so this round mints it on time.
+function elabJoinDemandsEnqueue() {
+  let i = 0
+  while i < elabJoinDemDecls.length && i < elabJoinDemTys.length {
+    elabEnqueueAtParams(elabJoinDemDecls[i], elabJoinDemTys[i])
+    i = i + 1
+  }
+  0
 }
 
 // The parameter key of declaration `d` as instance `k` reads it: `k`'s own parameter, else that
@@ -5398,6 +5519,8 @@ export function elabRun() {
       )
     }
   }
+  // The instances an earlier round's join found missing are this round's demands.
+  elabJoinDemandsEnqueue()
   elabSettle(0)
   elabRepRowInstances()
   // A row binding a set of functions is also the instance at the set's rep, which mono builds.

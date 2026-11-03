@@ -13,6 +13,7 @@ import {
   BinExpr,
   Block,
   Call,
+  FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
@@ -20,6 +21,7 @@ import {
   IfStmt,
   LetDecl,
   Node,
+  ObjLit,
   OptMember,
   P,
   Param,
@@ -61,6 +63,7 @@ import {
   elabCapOn,
   elabDeadRestClose,
   elabDeadRestOpen,
+  elabFnFieldListTy,
   elabFnLetTy,
   elabFnListClosedNote,
   elabFnListLetTy,
@@ -325,6 +328,7 @@ import {
   TyVar,
   mkFuncTy,
   mkNullableTy,
+  mkObjTy,
   tyAt,
   tyHasHole,
   tyIsHole,
@@ -567,6 +571,10 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
         nodeTySetGrow(parenPeelIx(n.letInit), lw)
         if closedAt >= 0 { elabFnListClosedNote(parenPeelIx(n.letInit)) }
       }
+    }
+    // A record literal's list field of functions holds what is written into its elements too.
+    if nodeAt(parenPeelIx(n.letInit)) is ObjLit && tpEnvNames.length == 0 {
+      bound = letFieldListsWiden(ix, parenPeelIx(n.letInit), bound)
     }
     recordCtxTy(n.letInit, bound)
   } else if (
@@ -1905,4 +1913,43 @@ function letFnGenericFitsAt(m: i32, f: i32): boolean {
     i = i + 1
   }
   tySame(substTyDeep(gf.fnRet, bn, bt), ff.fnRet)
+}
+
+// Record type `t` of record literal `lit` binding `bd` initialises, each list field of functions
+// widened by `elabFnFieldListTy`, and each widened field's literal re-typed to its list (D15138).
+function letFieldListsWiden(bd: i32, lit: i32, t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return t }
+  const to = T.tys[t]
+  const ln = nodeAt(lit)
+  if !(to is TyObj) || !(ln is ObjLit) { return t }
+  const tys: i32[] = []
+  let changed = false
+  let i = 0
+  while i < to.objFieldNames.length {
+    const nm = to.objFieldNames[i]
+    let ft = to.objFieldTypes[i]
+    for fx in ln.objFields {
+      const f = nodeAt(fx)
+      if (
+        f is FieldInit
+        && f.fiName == nm
+        && nodeAt(parenPeelIx(f.fiValue)) is ArrayLit
+      ) {
+        const w = elabFnFieldListTy(bd, nm, ft)
+        if w != ft {
+          nodeTySetGrow(parenPeelIx(f.fiValue), w)
+          ft = w
+          changed = true
+        }
+      }
+    }
+    tys.push(ft)
+    i = i + 1
+  }
+  if !changed { return t }
+  const names: string[] = []
+  for nm in to.objFieldNames { names.push(nm) }
+  const nt = mkObjTy(names, tys)
+  nodeTySetGrow(lit, nt)
+  nt
 }
