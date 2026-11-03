@@ -20,6 +20,7 @@ import {
   structNameOfTy,
   tyAt,
   tyFieldTyOf,
+  tyHasHole,
   tyIsFuncArena,
   tyIsLitUnion,
   tyIsLitUnionAlias,
@@ -186,6 +187,7 @@ import {
 } from "./tyname"
 import {
   nullableInnerOrNone,
+  tyHasTyVar,
   tyMapValOf,
   tyPeelNul,
   tyStepElem,
@@ -193,16 +195,18 @@ import {
   tyStepRet,
 } from "./tyquery"
 
-// `nameFieldCode` with the caller's recorded arena type for the field — arena rung first,
-// the spelling ladder unchanged behind it, then the arena's `S[] | null` rung last. The type
-// answers first where the spelling cannot: a lone string literal is its atom, an `i32` list
-// behind `| null` is 18, a list of integer literals the `i32` list.
+// `nameFieldCode` with the caller's recorded arena type for the field, the arena's own rules
+// first: a lone string literal is its atom, a closed record a struct ref before its row exists
+// (one over a hole or type parameter has none), an `i32` list behind `| null` is 18, a list of
+// integer literals the `i32` list; then the spelling ladder, then the `S[] | null` rung.
 export function nameFieldCodeTy(t: string, ty: i32): i32 {
   if ty >= 0 && ty < T.tys.length {
     const xt = tyAt(ty)
     if xt is TyLit && xt.litKind == "str" { return FC_I32 }
-    if nfcIsRecord(ty) { return FC_STRUCT }
-    if xt is TyNullable && nfcIsRecord(nfcPeelOne(xt.nInner)) { return FC_STRUCT }
+    if nfcIsClosedRecord(ty) { return FC_STRUCT }
+    if xt is TyNullable && nfcIsClosedRecord(nfcPeelOne(xt.nInner)) {
+      return FC_STRUCT
+    }
     if xt is TyNullable && nfcIsI32List(nfcPeelOne(xt.nInner)) {
       return FC_NUL_I32_LIST
     }
@@ -536,7 +540,7 @@ export function variantNestedShapeOkTy(ftxt: string, ty: i32): boolean {
       okAll = false
     } else {
       const fty = tyFieldTyOf(nmTy, fnames[fi])
-      if nameFieldCodeTy(ftexts[fi], fty) < 0 || nfcIsInlineRecordField(ftexts[fi], fty) {
+      if nameFieldCodeTy(ftexts[fi], fty) < 0 {
         // A nested inline-shape field (`g: {h: i32}` / `g: {h: i32} | null`):
         // lowerable only if ITS shape is. A concrete generic application is lowerable as the
         // interner's own rung codes it (D4556).
@@ -1149,7 +1153,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       const fldTy = tyFieldTyOf(tyIx, rawNames[fi])
       internShapeDeepTy(ftxt, fldTy)
       let fc = nameFieldCodeTy(ftxt, fldTy)
-      if fc < 0 || nfcIsInlineRecordField(ftxt, fldTy) {
+      if fc < 0 {
         // A nested inline-shape field interns the nested shape and stores a struct ref on
         // it under the canonical registered name. An earlier literal may have interned the
         // identical shape as a synthetic `#anonN`, so keying this field by the raw inline
@@ -1164,10 +1168,6 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
           // nested in a declaration interns before `collectGenAliasShapes`, so the instance
           // has no row yet and is keyed by its application name, as a declared field is.
           fc = FC_STRUCT
-        } else {
-          // An inline record with no row of its own (one over a type parameter) has no struct
-          // to point at, so the field declines as if the producer had (D15156).
-          fc = -1
         }
       }
       // The arm-typed field's element name, the interner's copy of `fieldRefElemName`'s rung
@@ -1909,6 +1909,12 @@ function markRefArrayArmsOf(atoms: string[], mems: i32[], cov: boolean) {
   0
 }
 
+// Whether `ty` is a record with no hole and no type parameter in it, so it can have a row.
+function nfcIsClosedRecord(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  tyAt(ty) is TyObj && !tyHasHole(ty) && !tyHasTyVar(ty)
+}
+
 // `ty` with a one-member union alias peeled.
 function nfcPeelOne(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
@@ -1948,19 +1954,4 @@ function nfcIsIntLitUnion(ty: i32): boolean {
     if !(mt is TyLit) || mt.litKind != "int" { return false }
   }
   true
-}
-
-// Whether `ty` is a record.
-function nfcIsRecord(ty: i32): boolean {
-  ty >= 0 && ty < T.tys.length && tyAt(ty) is TyObj
-}
-
-// Whether field type `ty` is an inline record, or a nullable one, spelled `ftxt` by its shape:
-// a field whose nested row its caller materializes before recording it (D15156).
-export function nfcIsInlineRecordField(ftxt: string, ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  if !nameIsShapeSpanEnds(nonNulBaseOf(ftxt)) { return false }
-  const t = tyAt(ty)
-  if t is TyObj { return true }
-  t is TyNullable && nfcIsRecord(nfcPeelOne(t.nInner))
 }
