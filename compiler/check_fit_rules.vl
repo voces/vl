@@ -312,6 +312,7 @@ import {
 } from "./check_rec_rows"
 import {
   recAtPinnedArg,
+  recBindDeclOf,
   recCoalesceOperands,
   recDeclInit,
   recElemPinLit,
@@ -2901,13 +2902,46 @@ export function recBuiltReadRefuse(u: i32) {
   const bt = recBuiltReadTy(p)
   if bt < 0 || own < 0 { return 0 }
   if !(nodeAt(p) is BinExpr) && recArgTakesRep(p, 4) { return 0 }
-  if !(nodeAt(p) is BinExpr) && recAnnArgTakesRep(p, nonNullTy(bt)) { return 0 }
+  // A function's result handed to an annotated parameter is kept at the parameter's type, so an
+  // instance at the build cannot read it (D15124).
+  if (
+    !(nodeAt(p) is BinExpr)
+    && !recBuiltViaFnResult(p, REC_STORE_DEPTH)
+    && recAnnArgTakesRep(p, nonNullTy(bt))
+  ) {
+    return 0
+  }
   // A `??` whose default is a fresh record literal builds the literal at the read's record too.
   if recCoalesceLitBuilt(p, nonNullTy(bt)) { return 0 }
+  if recAsgIntoBuiltAt(p, nonNullTy(bt)) { return 0 }
   if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
   }
   0
+}
+
+// Whether read `x` is, or is a binding holding, a call of an inferred function (`recInferredFnOf`).
+function recBuiltViaFnResult(x: i32, depth: i32): boolean {
+  if depth <= 0 || x < 0 || x >= P.nodes.length { return false }
+  if nodeAt(x) is Call { return recInferredFnOf(x) >= 0 }
+  const d = if nodeAt(x) is Ident { recHeldDecl(x) } else { -1 }
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  dn is LetDecl && recBuiltViaFnResult(cwPeelValue(dn.letInit), depth - 1)
+}
+
+// Whether `p` is assigned into an un-annotated binding whose initialiser is a built read at
+// `rep` too: the binding is stored at `rep`, so the write converts nothing (D15124).
+function recAsgIntoBuiltAt(p: i32, rep: i32): boolean {
+  const a = if p < cwIxUp.length { cwIxUp[p] } else { -1 }
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if (!(an is BinExpr) || an.binOp != "=" || cwPeelValue(an.binRight) != p) {
+    return false
+  }
+  const d = if nodeAt(an.binLeft) is Ident { recBindDeclOf(an.binLeft) } else { -1 }
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
+  const b = recBuiltReadTy(cwPeelValue(dn.letInit))
+  b >= 0 && tySame(nonNullTy(b), rep)
 }
 
 // Whether `p` is `read ?? { … }` handed to a parameter that takes the rep `rep`; the literal is
@@ -3269,27 +3303,56 @@ export function recBuiltReadTy(x: i32): i32 {
 
 // `recBuiltReadTy` read from build table `tbl`: the pass's own during check, the last pass's after.
 export function recBuiltReadTyIn(x: i32, tbl: Map<i32, i32>): i32 {
+  recBuiltReadTyAt(x, tbl, true, REC_STORE_DEPTH)
+}
+
+// `recBuiltReadTyIn` through at most `depth` bindings and calls: a binding holding such a read,
+// or a call of an inferred function every value leaf of which is one at one record (D15124).
+// Without `fresh`, a binding's own build is not asked: a fresh record is not a container's read.
+function recBuiltReadTyAt(
+  x: i32,
+  tbl: Map<i32, i32>,
+  fresh: boolean,
+  depth: i32,
+): i32 {
+  if depth <= 0 || x < 0 || x >= P.nodes.length { return -1 }
   const n = nodeAt(x)
   if n is BinExpr {
-    return if n.binOp == "??" { recBuiltReadTyIn(cwPeelValue(n.binLeft), tbl) } else { -1 }
+    return if n.binOp == "??" { recBuiltReadTyAt(cwPeelValue(n.binLeft), tbl, fresh, depth) } else { -1 }
   }
   if n is Index { return recBuiltElemIn(cwPeelValue(n.idxArr), tbl) }
   if n is Call {
-    if n.callArgs.length != 1 || n.callFn < 0 { return -1 }
+    if n.callFn < 0 { return -1 }
     const f = nodeAt(n.callFn)
-    if f is Member && f.memProp == "get" {
+    if n.callArgs.length == 1 && f is Member && f.memProp == "get" {
       return recBuiltElemIn(cwPeelValue(f.memObj), tbl)
     }
-    return -1
+    return recBuiltLeavesTy(recInferredFnOf(x), tbl, depth - 1)
   }
   if n is Member {
-    const o = recBuiltReadTyIn(cwPeelValue(n.memObj), tbl)
+    const o = recBuiltReadTyAt(cwPeelValue(n.memObj), tbl, fresh, depth)
     if o < 0 { return -1 }
     const ot = tyAt(nonNullTy(o))
     return if ot is TyObj { objFieldType(ot, n.memProp) } else { -1 }
   }
   const d = recHeldDecl(x)
-  if d < 0 { -1 } else { recBuildTyIn(tbl, d, false) }
+  if d < 0 { return -1 }
+  const b = if fresh { recBuildTyIn(tbl, d, false) } else { -1 }
+  const dn = nodeAt(d)
+  if b >= 0 || !(dn is LetDecl) { return b }
+  recBuiltReadTyAt(cwPeelValue(dn.letInit), tbl, fresh, depth - 1)
+}
+
+// The record every value leaf of function `fd` is a built read at (`recBuiltReadTyAt`), else -1.
+function recBuiltLeavesTy(fd: i32, tbl: Map<i32, i32>, depth: i32): i32 {
+  if fd < 0 || depth <= 0 { return -1 }
+  let r = -1
+  for lf in recFnValueLeaves(fd) {
+    const b = recBuiltReadTyAt(cwPeelValue(lf), tbl, false, depth)
+    if b < 0 || (r >= 0 && !tySame(r, b)) { return -1 }
+    r = b
+  }
+  r
 }
 
 // Each field write a non-generic body checked, as the stored value, the receiver, the field and
