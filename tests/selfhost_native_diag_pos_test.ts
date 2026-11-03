@@ -617,3 +617,17 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "native-diag-pos: a mutable list sharing a fn-set list points at the user's source",
+  ignore: !ENABLED,
+  fn: async () => {
+    // D15133: the refusal names the delivered `zs`, not the literal its `const` names.
+    await assertPositioned(
+      FN_SET_LIST + "const ys: ((x: i32) => i32)[] = zs\nprint(ys[0](41))\n",
+      "type",
+      ": error [8:33] ((T) => T)[] is not ((i32) => i32)[]",
+    );
+  },
+});
