@@ -349,13 +349,13 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // A live emit-side refusal (`scripts/capability-probes/map-get-through-hole-parameter-record-value.vl`):
-      // `vl check` accepts it and the emitter refuses the map `.get` (D15153).
+      // A live emit-side refusal (`scripts/capability-probes/length-of-list-holding-a-generic-function.vl`):
+      // `vl check` accepts it and the emitter refuses the `.length` (D15010).
       await Deno.writeTextFile(
         file,
-        "type R = { r: i32 }\ntype A = { g: Map<string, R> }\nfunction take(a) {\n" +
-          '  const v = a.g.get("x")\n  print(v?.r ?? 0)\n}\nconst g: Map<string, R> = Map()\n' +
-          'g.set("x", { r: 7 })\nconst x: A = { g: g }\ntake(x)\n',
+        "function id<T>(x: T): T { x }\nfunction use(ys) { print(ys.length) }\n" +
+          "function take(a) {\n  const xs = [a]\n  use(xs)\n" +
+          '  print(xs[0]("abc").length + xs[0](2))\n}\ntake(id)\n',
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
