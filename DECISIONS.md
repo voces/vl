@@ -11206,10 +11206,17 @@ Sound because the copy happens where the call's fresh result is delivered as an 
 to that record exists between the call and the copy, and every field the copy narrows is one the
 own type types `null`, which is the only value it can hold. The original record is dropped at the
 copy, so no write through one landing can be observed at the other. The limit: a value stored and
-delivered again is not fresh (`const c = mkcall(); both(c, k)`), and neither is an argument to a
-parameter that is not a bare type variable (`b: T[]`, a list element), so those keep D14814's
-refusal. A field the copy would have to narrow other than to `null` (`i32 | null` into `i32`)
-keeps it too.
+delivered again is not fresh (`const c = mkcall(); both(c, k)`), so it keeps D14814's refusal
+(D15180 grades that DESIGN). A field the copy would have to narrow other than to `null`
+(`i32 | null` into `i32`) keeps it too (D15184).
+
+**Extended 2026-11-03 (D14818, D15183): the copy reaches a type parameter at any reach, under any
+pin.** A fresh call that reaches `T` as a list element, a record field or a nested list element, and
+one whose `T` a written type argument pins, is copied the same way: the call is still fresh where it
+lands, since a literal holding it is itself fresh. The checker records the copy's DECLARED
+destination, the pinning argument's declared type or the written type argument (`recCopyDstOf`), and
+the monomorphizer and the literal's elaboration read it (`recCopyTyOf`) rather than the call's build,
+so the instance is the pin's and a literal holding the call is built at the destination.
 
 ## A variant is a position in a union row, and union rows are keyed by member reps (ruling, D14551)
 
