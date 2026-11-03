@@ -10,6 +10,7 @@ import {
   bundleFieldOfCall,
   bundleHandMemberOf,
   bundleParamOfRead,
+  bundleRetParamOf,
   bundleSigsOfParam,
   bundleTySigsOf,
   bundleTysNoted,
@@ -46,6 +47,7 @@ import {
 import { fsAsk, fsAskCallee } from "./fn_split"
 import { keyHasPrefix, parenPeelIx } from "./check_places"
 import {
+  elabCallResultMember,
   elabInstTyAt,
   elabNestedCopyOnChain,
   elabNodeRepAt,
@@ -25696,6 +25698,10 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
     // A non-Ident callee yielding a function value (`o.go(10)`, `(expr)(args)`):
     // `call_ref` over the closure fat-pointer.
     if exprIsClosure(c.callFn, fnIx) { return emitCallRef(body, callIx, fnIx) }
+    // A call of a returned record's member, picked where the inner call is emitted.
+    if elabCallResultTy(unwrapParen(c.callFn)) >= 0 {
+      return emitCallRef(body, callIx, fnIx)
+    }
     // a UFCS `self`-method call: `o.f(args)` where `f` is a free function whose first
     // parameter is named `self` lowers to the direct call `f(o, args)`, by building the
     // direct-call node in the arena and re-lowering it so every coercion path is shared.
@@ -37574,6 +37580,27 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   }
   if (emitDirectCallArgsUnder(body, callIx, fnIx, target) < 0) { return -1 }
   emitDirectCallTail(target, callIx, fnIx)
+  emitBundleResultPick(callIx, target)
+}
+
+// After a direct call to an instance returning its bundle parameter's record: the member the
+// elaboration noted the call's value is used as, nothing for a value dropped. 0, or -1.
+function emitBundleResultPick(callIx: i32, target: i32): i32 {
+  const cFn = nodeAt(fnStmts[target])
+  const rp = bundleRetParamOf(fnStmts[target])
+  if rp < 0 || !(cFn is FuncDecl) || rp >= cFn.fnParams.length { return 0 }
+  const m = elabCallResultMember(callIx)
+  if m == -1 { return 0 }
+  const si = paramStructIdxOf(cFn.fnParams[rp])
+  const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
+  if fi < 0 || si < 0 || si >= sHeapIdx.length {
+    return emitFailAt(
+      "emitProgram: a function returning a parameter called at two signatures is called where its result is not used at one of them",
+      callIx,
+    )
+  }
+  fbStructGet(sHeapIdx[si], fi)
+  0
 }
 
 // Does a direct call with `nArgs` operands pass more than callee `target` declares? False when
