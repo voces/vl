@@ -282,7 +282,10 @@ lambda keys under an open encloser, 133 of them parentless, 0 uncovered. After, 
   key.
 * **6 of the 75 have no parented key at all.** They are in `generics/is-list-arm-anon-record.vl`
   (1) and `generics/is-list-arm-map-callback.vl` (5): lambdas no instance walk demands, which mono
-  pins from the checked type.
+  pins from the checked type. A probe counting every `elabEnqueue` of a lambda made with an
+  instance in hand reads 0 for all 6. Its control reads 4 on
+  `closures/hole-lambda-in-generic-returned-from-two-instances.vl`, whose lambdas are parented. So
+  none of the 6 was ever asked for under an instance, and there is no instance key they should have had.
 * **The twins are gone.** No parentless key remains for a lambda whose type is open, which was the
   exit criterion.
 
