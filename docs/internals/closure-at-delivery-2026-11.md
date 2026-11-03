@@ -288,7 +288,9 @@ shared row names.
    capturing lambda stays a closure at one signature. So the shared row would need one closure per
    signature for that lambda, but a container element has one rep. Today this is γ's gaps (b) and
    (c), refused with the split plan off, graded as D14844 (b) and D14845 (c). Agreed (coordinator,
-   2026-11-01): γ's backlog owns it; this design names it and does not cover it.
+   2026-11-01): γ's backlog owns it; this design names it and does not cover it. A lambda that
+   captures nothing and is held only as a list element is served by the tag instead (D14845,
+   `ftElemLams`); a capturing one stays γ's.
 2. **D14825's two refutation files need the split plan.** With it off they refuse (see the table
    above). Read against inc3's binding-bundle conditions (a local `const` or unwritten `let`, every
    read a callee or a bundled argument, never returned, stored or captured):
