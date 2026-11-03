@@ -1,6 +1,6 @@
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { constBindsLitSet } from "./check_leaf_steps"
-import { bundleCallSig } from "./emit_bundle"
+import { bundleCallSig, bundleRecordOfSigs } from "./emit_bundle"
 
 // `emit_classify.vl` — the emitter's type classifiers and their supporting state: the
 // `expr*` / `let*` / `declared*` / `param*` / `fnRet*` / `global*` families that resolve
@@ -313,7 +313,11 @@ import {
   ekDecl,
   elabCallResultTy,
   elabHolderMemberTy,
+  elabHolderRecordAt,
+  elabHoldsRecordAnywhere,
+  elabKeyAtPos,
   elabNodeTyAt,
+  elabThroughMemberAt,
   isStorageRead,
   litRepTyAt,
   litRepUnionAt,
@@ -902,6 +906,7 @@ import {
   identDeclOf,
   memberDeclOf,
   memberMethodOf,
+  nodeSrc,
   sidArrGet,
   sidLookup,
   sidOf,
@@ -2910,10 +2915,41 @@ function loopVarCellGo(d: i32, fnIx: i32): BindCellGo {
   }
 }
 
+// The elaboration instance function `fnIx`'s body is elaborated under, or -1 for none.
+export function elabKeyOfFn(fnIx: i32): i32 {
+  const pos = if fnIx >= 0 { fnStmtsPosOf(fnIx) } else { -1 }
+  const k = if pos >= 0 { elabKeyAtPos(pos) } else { -1 }
+  if k >= 0 { k } else { -1 }
+}
+
+// The record signatures `const` binding `d` holds whole in function `fnIx`, from the
+// elaboration's holder fact (D15144); none for any other binding.
+export function holderRecordSigs(d: i32, fnIx: i32): i32[] {
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return [] }
+  // Asked of every binding, so the instance is resolved only for one that holds a record.
+  const td = nodeSrc[d] ?? d
+  if !elabHoldsRecordAnywhere(td) { return [] }
+  elabHolderRecordAt(td, elabKeyOfFn(fnIx))
+}
+
+// The struct row of the record binding `d` holds whole in function `fnIx`, or -1.
+export function holderRecordRow(d: i32, fnIx: i32): i32 {
+  const sigs = holderRecordSigs(d, fnIx)
+  const bt = if sigs.length > 0 { bundleRecordOfSigs(sigs) } else { -1 }
+  if bt < 0 { -1 } else { structRowRecordingTy(bt) }
+}
+
+// The member of its holder's record call `callIx` through the holder takes in `fnIx`, or -1.
+export function holderCallMember(callIx: i32, fnIx: i32): i32 {
+  elabThroughMemberAt(nodeSrc[callIx] ?? callIx, elabKeyOfFn(fnIx))
+}
+
 // The table slot beside binding `stmtIx`'s cell kind `k`: its rep's slot where the rep claims
 // the cell, else the map shape, nullable-variant row, list row, struct row or variant row its
 // initializer delivers; any other kind reads its slot off the type the binding holds.
 export function letCellSlot(stmtIx: i32, fnIx: i32, k: VKind): i32 {
+  const hr = holderRecordRow(stmtIx, fnIx)
+  if hr >= 0 { return hr }
   // A map's shape and a list's row are what its stores and initializer deliver, which its
   // type's rep cannot see.
   if k == "map" { return letMapShapeOf(stmtIx, fnIx) }
@@ -2984,6 +3020,8 @@ function lckReset() {
 }
 
 function letCellKindGo(letIx: i32, fnIx: i32): VKind {
+  // A holder of a returned bundle's whole record is that record (D15144).
+  if holderRecordSigs(letIx, fnIx).length > 0 { return "struct" }
   if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
   // A `boolean | null` cell is the sentinel-2 niche, whatever the annotation's valtype says.
   if letNulBool(letIx, fnIx) { return "nulbool" }
@@ -3902,6 +3940,7 @@ export function captureValKind(fe: i32, name: string): VKind {
     LetDecl => {
       // The env field is the local's own cell, so it is read where the local's is.
       const rpf = parentBindingFrameArenaOf(fe, name)
+      if holderRecordSigs(b, rpf).length > 0 { return "struct" }
       if letBindRepClaims(b, rpf) { return letBindRep(b, rpf).rdKind }
       if bn.letType >= 0 {
         const annK = vtKindOfType(bn.letType)
@@ -3979,6 +4018,8 @@ export function captureValStructIdx(fe: i32, name: string) {
     }
     LetDecl => {
       const rpf = parentBindingFrameArenaOf(fe, name)
+      const hrow = holderRecordRow(b, rpf)
+      if hrow >= 0 { return hrow }
       if letBindRepClaims(b, rpf) { return letBindRepSlot(b, rpf) }
       if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
       if bn.letInit >= 0 {
@@ -5480,6 +5521,10 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     // A call through a bundle is at the signature of the closure it reads (D14841).
     const bs = bundleCallSig(cfx, c.callArgs, fnIx)
     if bs >= 0 { return sigKeyOfTy(bs) }
+    // A call through a holder of a returned record is at its member's signature.
+    const hsigs = if nodeAt(cfx) is Ident { holderRecordSigs(identDeclOf(cfx), fnIx) } else { [] }
+    const hmem = if hsigs.length > 0 { holderCallMember(callIx, fnIx) } else { -1 }
+    if hmem >= 0 && hmem < hsigs.length { return sigKeyOfTy(hsigs[hmem]) }
     // A binding holding one member of a returned record is at that member's signature.
     const hd = if nodeAt(cfx) is Ident { identDeclOf(cfx) } else { -1 }
     const hm = if hd >= 0 { elabHolderMemberTy(hd) } else { elabCallResultTy(cfx) }
