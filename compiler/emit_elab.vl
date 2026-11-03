@@ -498,6 +498,63 @@ function declOpen(d: i32): boolean {
 // declaration instanced on `from`'s chain, -1 when `d` reads none of the type variables open
 // around it, -2 when an enclosing declaration whose type variables `d` reads is open and not on
 // the chain (the open enclosing instance reaches it instead).
+// Whether binding name `nm` is a `#from` entry: the instance a per-instance value handed to the
+// callee was created in, which keys the callee apart (per-instance-identity-2026-11.md, M5).
+function elabFromName(nm: string): boolean {
+  nm.length > 6 && nm.slice(0, 6) == "#from."
+}
+
+// The lambda argument `a` holds: a lambda written there, or the lambda a `const` there was bound to.
+function elabArgLam(a: i32): i32 {
+  const x = parenPeelIx(a)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const n = nodeAt(x)
+  if n is FuncDecl { return x }
+  if !(n is Ident) { return -1 }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+  const v = parenPeelIx(dn.letInit)
+  if v >= 0 && v < P.nodes.length && nodeAt(v) is FuncDecl { v } else { -1 }
+}
+
+// Appends to `names`/`tys` a `#from` entry for each argument of `call` (instance `k`'s, to
+// `callee`) that is a per-instance lambda handed to an un-annotated parameter.
+function elabFromEntries(call: i32, callee: i32, k: i32, names: string[], tys: i32[]) {
+  if call < 0 || call >= P.nodes.length || k < 0 { return 0 }
+  const cn = nodeAt(call)
+  const fd = if callee >= 0 && callee < P.nodes.length { nodeAt(callee) } else { null }
+  if !(cn is Call) || !(fd is FuncDecl) { return 0 }
+  let i = 0
+  while i < cn.callArgs.length && i < fd.fnParams.length {
+    const pn = nodeAt(fd.fnParams[i])
+    const lam = elabArgLam(cn.callArgs[i])
+    const e = if lam >= 0 { elabEncl.get(lam) ?? -1 } else { -1 }
+    if pn is Param && pn.parType < 0 && lam >= 0 && elabLamPerEncl(lam) && e >= 0 && declOpen(e) {
+      names.push("#from." + i32ToStr(i) + "@" + i32ToStr(lam) + "@" + i32ToStr(k))
+      tys.push(TY_I32)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The instance a `#from` entry of key `a` names as the creator of lambda `d`, or -1.
+function elabFromCredit(d: i32, a: i32): i32 {
+  if a < 0 || a >= ekNames.length { return -1 }
+  const mid = "@" + i32ToStr(d) + "@"
+  for nm in ekNames[a] {
+    if elabFromName(nm) {
+      let at = 0
+      while at + mid.length <= nm.length && nm.slice(at, at + mid.length) != mid { at = at + 1 }
+      if at + mid.length <= nm.length {
+        return decDigitsOf(nm.slice(at + mid.length, nm.length))
+      }
+    }
+  }
+  -1
+}
+
 function elabParentFor(d: i32, from: i32): i32 {
   elabParentForAt(d, from, true)
 }
@@ -512,6 +569,9 @@ function elabParentForAt(d: i32, from: i32, lam: boolean): i32 {
     let a = from
     let g2 = 0
     while a >= 0 && g2 < 64 {
+      // A per-instance lambda handed out of its instance is credited to the instance that made it.
+      const cr = if lam { elabFromCredit(d, a) } else { -1 }
+      if cr >= 0 && cr < ekDecl.length && ekDecl[cr] == e { return cr }
       if ekDecl[a] == e {
         // A lambda declared in an instanced body is keyed under that instance, so each instance
         // holds its own (per-instance-identity-2026-11.md, M3 step 2).
@@ -932,7 +992,10 @@ function elabCanon(
     for x in names {
       if x == nm { has = true }
     }
-    if !has && (elabOwnName(decl, nm) || elabSigReads(decl, nm)) {
+    if !has && elabFromName(nm) {
+      names.push(nm)
+      tys.push(tys0[i0])
+    } else if !has && (elabOwnName(decl, nm) || elabSigReads(decl, nm)) {
       if !elabTyClosed(tys0[i0], 0) { return false }
       names.push(nm)
       tys.push(if exact { tys0[i0] } else { widenLitTy(tys0[i0]) })
@@ -2391,6 +2454,7 @@ function elabOne(k: i32) {
     // An instance's call binds a tagged set or a primed stub as a root call does.
     const ct = elabSetArgBind(elabCallIx[c], cn, ct0)
     if tysClosed(ct) {
+      elabFromEntries(elabCallIx[c], elabCallD[c], k, cn, ct)
       elabReachNote(k, elabEnqueue(elabCallD[c], cn, ct, k), elabCallIx[c])
       elabArgRows(elabCallIx[c], elabCallD[c], cn, ct, k)
     }
