@@ -222,3 +222,58 @@ Deno.test({
     }
   },
 });
+
+// A refusal raised before any body is lowered (D15154): the union discrimination is anchored at
+// the union's declaration, line 5, and a `monomorphize:` refusal at the call being instantiated,
+// line 8. The instance case above is the restore's control: `take(id)` is instantiated before
+// `take`'s body refuses, and a cursor left armed would name the call instead of `take`.
+const COLLECT_WITNESS = `type R = { r: i32 }
+type S = { r: i32 }
+type A = { n: i32, g: R }
+type B = { n: i32, g: S }
+type U = A | B
+const b: B = { n: 4, g: { r: 1 } }
+print(b.g.r)
+`;
+const MONO_WITNESS = `function id<T>(x: T): T { x }
+function use<T>(ys: T[]) { print(ys.length) }
+function take<T>(a: T) {
+  const xs = [a]
+  use(xs)
+  print(xs[0]("abc").length + xs[0](2))
+}
+take(id)
+`;
+
+Deno.test({
+  name:
+    "vl-emit-diag-position: a refusal raised before any body is lowered names the union or the call",
+  ignore: !ENABLED,
+  fn: async () => {
+    const cases: { name: string; src: string; line: number }[] = [
+      { name: "union discrimination", src: COLLECT_WITNESS, line: 5 },
+      { name: "monomorphize", src: MONO_WITNESS, line: 8 },
+    ];
+    for (const c of cases) {
+      const dir = await Deno.makeTempDir({ prefix: "vl_emit_early_" });
+      try {
+        await Deno.writeTextFile(`${dir}/early.vl`, c.src);
+        const r = await checkCodegen("early.vl", dir);
+        if (!r.out.includes("emit error")) {
+          throw new Error(
+            `${c.name}: the witness no longer reaches an emit refusal, so this guard is ` +
+              `measuring nothing — replace it with another refusal of that phase.\n${r.out}`,
+          );
+        }
+        const blk = errorBlock(r.out);
+        if (!new RegExp(`at \\S*early\\.vl:${c.line}:\\d+`).test(blk)) {
+          throw new Error(
+            `${c.name}: want the anchor at early.vl:${c.line}, got:\n${blk}`,
+          );
+        }
+      } finally {
+        await Deno.remove(dir, { recursive: true });
+      }
+    }
+  },
+});
