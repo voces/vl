@@ -10346,7 +10346,7 @@ function emitVariantFieldsEq(body: u8[], al: i32, ar: i32, vi: i32, fnIx: i32) {
       fbStructGet(variantHeap(vi), j)
       fbLocalGet(ar)
       fbStructGet(variantHeap(vi), j)
-      if emitArmFieldEq(body, vi, j, start + j, jc, fnIx) < 0 { return -1 }
+      if emitVariantFieldEqCore(body, start + j, fnIx) < 0 { return -1 }
     }
     fbI32Bin(113) // 0x71 i32.and
     j = j + 1
@@ -10387,35 +10387,12 @@ function emitVariantNulFieldEq(
   fbLocalGet(ar)
   fbStructGet(variantHeap(vi), j)
   fbRefAsNonNull()
-  if emitArmFieldEq(body, vi, j, ufi, inner, fnIx) < 0 { return -1 }
+  if emitVariantFieldEqCoreAt(body, ufi, fnIx, inner) < 0 { return -1 }
   fbEnd()
   fbEnd()
   0
 }
 
-// Field `j` of arm `vi` (field-table row `ufi`, compared at code `c`), both values on the
-// stack: a `(string | null)[]` field stores its nulls as null references (D15054).
-function emitArmFieldEq(
-  body: u8[],
-  vi: i32,
-  j: i32,
-  ufi: i32,
-  c: i32,
-  fnIx: i32,
-) {
-  if (
-    eqVariantListFieldKind(c) == LBK_STR_LIST
-    && structFieldListElemsNullable(variantRowOf(vi), j)
-  ) {
-    return emitListEqSCore(body, true)
-  }
-  emitVariantFieldEqCoreAt(body, ufi, fnIx, c)
-}
-
-// ONE field's compare, with both values already on the stack (left below right), leaving the
-// 0/1 answer. `variantFieldComparable` is this function's admission gate and the two are
-// mirrored arm for arm; the floor below is unreachable through that gate and is a floor, not
-// a capability refusal.
 function emitVariantFieldEqCore(body: u8[], ufi: i32, fnIx: i32) {
   emitVariantFieldEqCoreAt(body, ufi, fnIx, sFieldTypes[ufi])
 }
@@ -18232,26 +18209,10 @@ function leqSElemNullTest(bA: i32) {
   0
 }
 
-// Whether either operand of the `==` at `binIx` is a list whose elements may be null.
-function binListElemsNullable(binIx: i32, fnIx: i32): boolean {
-  const e = nodeAt(binIx)
-  if !(e is BinExpr) { return false }
-  listElemsBearNull(nodeTyAt(e.binLeft, fnIx))
-    || listElemsBearNull(nodeTyAt(e.binRight, fnIx))
-}
-
-// Whether `t`, `| null` peeled, is a list whose element admits `null`.
-function listElemsBearNull(t: i32): boolean {
-  const n = if t >= 0 && t < T.tys.length { nonNullTy(t) } else { -1 }
-  if n < 0 { return false }
-  const el = tyArrayElemIx(n)
-  el >= 0 && tyAdmitsNull(el)
-}
-
 // String-list `==`: outer loop over the LEQS frame; each element pair rides
-// `emitStrEqCore` (the string-op frame — disjoint locals, safe to nest). With `nulElems` an
-// element may be null: two nulls are equal, a null and a string are not.
-function emitListEqSCore(body: u8[], nulElems: boolean) {
+// `emitStrEqCore` (the string-op frame — disjoint locals, safe to nest). Any element may be
+// null, whatever the list's declared element: two nulls are equal, a null and a string are not.
+function emitListEqSCore(body: u8[]) {
   const bA = leqSScratchBase
   fbLocalSet(bA + 1)        // B
   fbLocalSet(bA + 0)        // A
@@ -18275,14 +18236,12 @@ function emitListEqSCore(body: u8[], nulElems: boolean) {
   fbI32Bin(78)
   fbIf(64)
   fbElse()
-  if nulElems {
-    leqSElemNullTest(bA)
-    fbI32Bin(114) // i32.or: either element null
-    fbIf(127)
-    leqSElemNullTest(bA)
-    fbI32And() // equal only when both are
-    fbElse()
-  }
+  leqSElemNullTest(bA)
+  fbI32Bin(114)             // i32.or: either element null
+  fbIf(127)
+  leqSElemNullTest(bA)
+  fbI32And()                // equal only when both are
+  fbElse()
   // push elem A, elem B (non-null string refs), compare via the string core
   fbLocalGet(bA + 0)
   fbStructGet(mkListIdx, 0)
@@ -18295,7 +18254,7 @@ function emitListEqSCore(body: u8[], nulElems: boolean) {
   fbArrayGet(mkArrIdx)
   fbRefAsNonNull()
   if emitStrEqCore(body) < 0 { return -1 }
-  if nulElems { fbEnd() }
+  fbEnd()
   fbI32Eqz() // 1 = mismatch
   fbIf(64)
   fbI32Const(0)
@@ -18420,7 +18379,7 @@ function emitListEqAnyRep(body: u8[], kind: i32, slot: i32, fnIx: i32) {
 
 function emitListEqAnyRepAt(body: u8[], kind: i32, slot: i32, fnIx: i32) {
   if kind == LBK_I32_LIST { return emitListEqICore(body) }
-  if kind == LBK_STR_LIST { return emitListEqSCore(body, false) }
+  if kind == LBK_STR_LIST { return emitListEqSCore(body) }
   if kind == LBK_REF {
     if slot >= 0 && slot < rlElemTyIx.length {
       if rlElemKindAt(slot) == RLK_I32_LIST {
@@ -18881,7 +18840,7 @@ function emitEqNonNullCore(body: u8[], binIx: i32, fnIx: i32) {
         return emitListEqICore(body)
       }
       "strlist" => {
-        return emitListEqSCore(body, binListElemsNullable(binIx, fnIx))
+        return emitListEqSCore(body)
       }
       "reflist" => {
         let lslot = refListSlotOfExpr(e.binLeft, fnIx)
@@ -19458,25 +19417,9 @@ function emitStructEqFieldAt(
   if eqSk >= 0 {
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    // A `(string | null)[]` field stores its nulls as null references (D15054).
-    if eqSk == LBK_STR_LIST && structFieldListElemsNullable(si, fi) {
-      return emitListEqSCore(body, true)
-    }
     return emitListEqAnyRep(body, eqSk, 0, fnIx)
   }
   emitFail("emitProgram: unsupported struct field type in equality")
-}
-
-// Whether field `fi` of struct row `si` is a list whose element admits `null`.
-function structFieldListElemsNullable(si: i32, fi: i32): boolean {
-  if si < 0 || si >= sTyIx.length || si >= sFieldStart.length { return false }
-  const rt = sTyIx[si]
-  if rt < 0 || rt >= T.tys.length { return false }
-  const r = tyAt(rt)
-  if !(r is TyObj) { return false }
-  const at = sFieldStart[si] + fi
-  if fi < 0 || at >= sFieldNames.length { return false }
-  listElemsBearNull(objFieldType(r, sFieldNames[at]))
 }
 
 // `emitStructEqFieldAt`'s nested-struct field `fi` of row `si`: recurse one level deeper along
