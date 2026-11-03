@@ -158,17 +158,13 @@ import {
   callBindCount,
   callBindIxAt,
   callBindNamesAt,
+  callBindRepKeyedAt,
   callBindRepTysAt,
   callBindRowOf,
   callBindTyOf,
   callBindTysAt,
 } from "./check_bind_rows"
-import {
-  REC_REBUILT_DEPTH,
-  callArgRepTy,
-  recRebuiltLeafRow,
-  recRepWidens,
-} from "./check_bind_adopt"
+import { callArgRepTy, recRepWidens } from "./check_bind_adopt"
 import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
 import { monoRecheckEnd } from "./check_demands"
 import { cbExpMark, cbExpTruncate } from "./check_expected"
@@ -329,31 +325,10 @@ function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
   i32ToStr(decl) + "|" + k
 }
 
-// Binds the type parameter call `call` hands straight back, where its sole pinning argument
-// (`recSolePinArg`) is a fresh call or literal the checker rebuilds at another record
-// (`recRebuiltLeafRow`), to that record in `names`/`tys`: the instance is taken there (D8020).
-function elabSolePinRebuilt(call: i32, decl: i32, names: string[], tys: i32[]) {
-  if call < 0 || call >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
-    return 0
-  }
-  const a = recSolePinArg(call)
-  // A binding's read is pinned at the record its declaration is built at (`recBuildTyOf`), which
-  // the call binding already names; only a fresh call or literal is rebuilt here.
-  if a < 0 || nodeAt(parenPeelIx(a)) is Ident { return 0 }
-  const row = recRebuiltLeafRow(a, REC_REBUILT_DEPTH)
-  const f = nodeAt(decl)
-  if row < 0 || !(f is FuncDecl) || f.fnRet < 0 { return 0 }
-  const rt = nodeAt(f.fnRet)
-  if !(rt is TypeRef) { return 0 }
-  let i = 0
-  while i < names.length && i < tys.length {
-    if names[i] == rt.tyName {
-      tys[i] = row
-      return 0
-    }
-    i = i + 1
-  }
-  0
+// The types call bind row `r` instances its call at: its rep row (`callBindRepTysAt`) where the
+// checker keys the instance there (`callBindRepKeyedAt`); else its own.
+function elabRowTys(r: i32): i32[] {
+  if callBindRepKeyedAt(r) { callBindRepTysAt(r) } else { callBindTysAt(r) }
 }
 
 // Per declaration: 1 when its body tests a value of a type parameter, directly or by handing one
@@ -2467,7 +2442,6 @@ function elabOneAt(k: i32) {
     }
     // An instance's call binds a tagged set or a primed stub as a root call does.
     const ct = elabSetArgBind(elabCallIx[c], cn, ct0)
-    elabSolePinRebuilt(elabCallIx[c], elabCallD[c], cn, ct)
     if tysClosed(ct) {
       elabReachNote(k, elabEnqueue(elabCallD[c], cn, ct, k), elabCallIx[c])
       elabArgRows(elabCallIx[c], elabCallD[c], cn, ct, k)
@@ -5942,14 +5916,13 @@ export function elabRun() {
   const n = callBindCount()
   while r < n {
     const ix = callBindIxAt(r)
-    const tys = elabSetArgBind(ix, callBindNamesAt(r), callBindTysAt(r))
+    const tys = elabSetArgBind(ix, callBindNamesAt(r), elabRowTys(r))
     elabSetCallRows(ix, callBindNamesAt(r), tys, -1, -1)
     if tysClosed(tys) {
       const d = elabCallDeclOf(ix)
       const rn: string[] = []
       const rt: i32[] = []
       elabRowComplete(ix, d, callBindNamesAt(r), tys, rn, rt)
-      elabSolePinRebuilt(ix, d, rn, rt)
       if elabRowByArms(ix, d) {
         // The row's own instance serves a set left untagged; no call reaches it.
         elabSigAlting = elabRowAtSetRep(ix, d)
