@@ -257,23 +257,44 @@ sets, `@run` output with the split plan on and off, and L2 fuel:
   byte-identical, and the probe above is its measurement), and a row banked inside a walk takes it as
   its `from`. The 1,134 lambda rows move from the root to an instance, and D15112's cross keys cannot
   recur even without #6128's rule.
-* c. A template row of a lambda in an open encloser is enqueued only under encloser instances, with no
-  parent -1 key minted for it.
-* d. The other root routes (the early arms, the root's set-call rows, the argument rows) are measured
-  by the same split, and take the walked key where they bank inside a walk.
-* e. The beside-mint in `elabEnqueue` is deleted. Exit criterion: 0 parentless keys of a lambda inside
-  an open encloser.
+* c, measured and dropped. Keying a lambda's template rows only under encloser instances moved
+  nothing: on the 48 files with twins, the count stayed at 397 keys and 131 parentless, and every
+  output stayed the same. The template rows were not where the twins came from. Every parentless key
+  was the beside-mint in `elabEnqueue`, which minted a parent -1 key beside each parented lambda key,
+  whatever route minted that.
+* d and e, landed together. With the beside-mint deleted (and slice b in place), one reader still
+  asked with no instance: mono's top-level `monoPinLamFromCheckedTy`, which pins a lambda from its
+  checked type outside every walk (`generics/unannotated-callback-pins-generic-callee.vl`, a late
+  demand). That lambda's checked type is closed, so it is one lambda at every instance, and its
+  root key is correct. The elaboration now mints it during the run (`elabClosedLamRootKeys`), for
+  each per-encloser lambda in an open encloser whose checked type the checker closed. The two other
+  readers this slice was expected to need, a lambda handed to a hole callee
+  (`closures/generic-returned-to-un-annotated-param-lambda.vl`,
+  `generics/hole-call-generic-lambda-arg.vl`), were already served once slice b credited walk-banked
+  rows to the walked key.
+
+**Exit, measured on master `6e694945e` over every `@run` file.** Before d and e there were 402
+lambda keys under an open encloser, 133 of them parentless, 0 uncovered. After, there are 344 keys,
+75 of them parentless.
+
+* **A parentless key is not the same thing as a twin.** All 75 belong to a lambda whose checked
+  type is closed. That lambda is the same at every instance, and the root key is its only correct
+  key.
+* **6 of the 75 have no parented key at all.** They are in `generics/is-list-arm-anon-record.vl`
+  (1) and `generics/is-list-arm-map-callback.vl` (5): lambdas no instance walk demands, which mono
+  pins from the checked type.
+* **The twins are gone.** No parentless key remains for a lambda whose type is open, which was the
+  exit criterion.
 
 **Risks.**
 
 * S2a's measured unsound reuse (`generics/hole-list-literal-local-nullable.vl`, a template pin run
   under one instance's bindings). Slice b enqueues a walk's row from its own key and never runs a
-  template pin under an instance, and slice c runs a template pin under every instance. Both grade
-  that file.
-* A walk of a parentless twin. 883 of the 1,134 walked lambda rows are banked while walking a key
-  whose chain does not hold the encloser instance. Slice b attributes them to that key, so they stay
-  parentless until slice e removes the twins they walk. The twin probe, not the row count, is the
-  grade.
+  template pin under an instance. The file runs as before.
+* A root key for a lambda whose encloser is not open. Such a lambda is checked inside its
+  encloser's scope, and walking it at the root raised `undeclared identifier` for its captures in the
+  fixture suite. So `elabClosedLamRootKeys` keys only lambdas in an open encloser, as the beside-mint
+  did.
 
 ### M6. A hole parameter's delivered record (D15173, design only)
 
