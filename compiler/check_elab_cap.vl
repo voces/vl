@@ -9,6 +9,8 @@ import {
   cwFnValueDeclOf,
   cwFnValueTargets,
   cwFramedNode,
+  cwIxUp,
+  cwKeyOfDecl,
   cwKeyOfRoot,
   cwLetCalledFnTargets,
   cwLetFnTargets,
@@ -50,6 +52,7 @@ import {
   IfStmt,
   LetDecl,
   MatchExpr,
+  Member,
   ObjLit,
   P,
   Param,
@@ -65,7 +68,7 @@ import { inferQuiet, quietDepth } from "./check_cursor"
 import { litPinN } from "./check_literals"
 import { restoreSlot, scopeVisibleSnapshot } from "./check_scopes"
 import { tyHasTyVar } from "./tyquery"
-import { i32ListHas, strListHas } from "./listutil"
+import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 import { identArmNote, identDeclOf, identIsArm, nodeSrc } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
 import { hdBase, hdRowOf } from "./check_hole_pins"
@@ -1065,7 +1068,14 @@ export function elabSlotJoinTy(recv: i32, t: i32): i32 {
   const fresh = T.tys.length - 1
   elabFnSetTy[fresh] = u
   fnJoinMemo[key] = fresh
+  if !i32ListHas(fnSlotWidened, bd) { fnSlotWidened.push(bd) }
   fresh
+}
+
+// Whether `elabSlotJoinTy` joined the slot writes of container binding `bd`, an open map's
+// among them, and no check vetoed the join (D15137).
+export function elabFnSlotWidened(bd: i32): boolean {
+  i32ListHas(fnSlotWidened, bd) && !i32ListHas(fnLetVeto, bd)
 }
 
 // The type an un-annotated list binding `bd` with inferred `t` gives its reads: `t` whose element
@@ -1104,9 +1114,83 @@ export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
   const fresh = T.tys.length - 1
   elabFnSetTy[fresh] = u
   fnListWidened.push(bd)
+  fnListWidenedElem.push(fresh)
   const lt = mkArrayTy(fresh)
   fnJoinMemo[key] = lt
   lt
+}
+
+// Appends to `out` each value a slot write of a list widened to set `s` stores that names member
+// `d`, a write a callee makes through a parameter included, and returns the list's element type,
+// or -1 when no such write lands only in lists of `s` (D14648).
+export function fnTagWriteLeavesOf(d: i32, s: i32, out: i32[]): i32 {
+  let et = -1
+  let i = 0
+  while i < fnListWidened.length {
+    const vals: i32[] = []
+    const ats: i32[] = []
+    if (
+      fnTagSetOfTy(fnListWidenedElem[i]) == s
+      && cwSlotWrittenValues(cwKeyOfDecl(fnListWidened[i]), ["[]"], vals, ats) >= 0
+    ) {
+      for v in vals {
+        if cwFnValueDeclOf(v) == d && !i32ListHas(out, v) {
+          if !fnWriteOnlyInto(v, fnListWidened[i]) { return -1 }
+          out.push(v)
+          et = fnListWidenedElem[i]
+        }
+      }
+    }
+    i = i + 1
+  }
+  et
+}
+
+// Whether the store of write value `v` lands only in lists widened to `bd`'s set: its target
+// roots at one, or at a parameter every call hands one or another such parameter. The leaf then emits its id at
+// every instance of the writing function.
+function fnWriteOnlyInto(v: i32, bd: i32): boolean {
+  if v < 0 || v >= cwIxUp.length { return false }
+  const p = cwIxUp[v]
+  if p < 0 { return false }
+  const pn = nodeAt(p)
+  let tgt = -1
+  if pn is BinExpr && pn.binOp == "=" && parenPeelIx(pn.binRight) == v {
+    tgt = pn.binLeft
+  } else if pn is Call {
+    const f = nodeAt(parenPeelIx(pn.callFn))
+    if f is Member && f.memProp == "push" { tgt = f.memObj }
+  }
+  if tgt < 0 { return false }
+  const path: string[] = []
+  const root = cwSlotPath(tgt, path)
+  if root < 0 || !(nodeAt(root) is Ident) { return false }
+  fnArgOnlyFrom(identDeclOf(root), bd, 0)
+}
+
+// Whether `d` and `bd` are both widened list bindings of one set.
+function fnWidenedSameSet(d: i32, bd: i32): boolean {
+  const i = i32ListIndexOf(fnListWidened, d)
+  const j = i32ListIndexOf(fnListWidened, bd)
+  i >= 0
+    && j >= 0
+    && fnTagSetOfTy(fnListWidenedElem[i]) == fnTagSetOfTy(fnListWidenedElem[j])
+}
+
+// Whether declaration `d` is `bd` or a list widened to its set, or a parameter every call hands
+// only such bindings through such parameters.
+function fnArgOnlyFrom(d: i32, bd: i32, depth: i32): boolean {
+  if d == bd || fnWidenedSameSet(d, bd) { return true }
+  if d < 0 || depth > 8 || !(nodeAt(d) is Param) { return false }
+  const args: i32[] = []
+  // An uncalled function's body is still built, at its parameters' defaults.
+  if !cwParamArgs(d, args) || args.length == 0 { return false }
+  for a in args {
+    const ap = parenPeelIx(a)
+    if ap < 0 || !(nodeAt(ap) is Ident) { return false }
+    if !fnArgOnlyFrom(identDeclOf(ap), bd, depth + 1) { return false }
+  }
+  true
 }
 
 // The functions list binding `bd` with inferred `t` holds once `elabFnListLetTy` widens it with
@@ -1618,6 +1702,9 @@ let fnParamHandArgs: {[string]: i32[]} = Map()
 let fnLetEscBds: i32[] = []
 // The list bindings `elabFnListLetTy` widened in this check.
 let fnListWidened: i32[] = []
+let fnListWidenedElem: i32[] = []
+// The container bindings `elabSlotJoinTy` widened.
+let fnSlotWidened: i32[] = []
 let fnLetVeto: i32[] = []
 // The list literals whose open element signature the functions written into their binding closed.
 let fnListClosedLits: i32[] = []
@@ -1759,6 +1846,8 @@ export function fnTyFactsReset() {
   fnParamHandArgs = Map()
   fnLetEscBds = []
   fnListWidened = []
+  fnListWidenedElem = []
+  fnSlotWidened = []
   0
 }
 
@@ -1779,6 +1868,8 @@ export function fnTagEtaReset() {
   fnParamHandArgs = Map()
   fnLetEscBds = []
   fnListWidened = []
+  fnListWidenedElem = []
+  fnSlotWidened = []
   fnListClosedLits = []
   fnLetVeto = []
 }

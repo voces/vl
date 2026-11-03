@@ -11,6 +11,7 @@
 // path, widening arm by arm. Recursive types are real arena cycles: the canonical
 // structural key (`repCanonKey`) terminates them with a de-Bruijn back-edge.
 
+import { fieldNameOrder } from "./check_obj_shape"
 import {
   nominalStructNameOfTy,
   nominalStructSoleOfTy,
@@ -758,14 +759,18 @@ function repKeyGo(ty: i32, mode: RepKeyMode): string {
         const ds = repSlotOfElemTy(ty, mode)
         if ds >= 0 { return "S" + i32ToStr(ds) }
       }
+      // The row key spells the fields in layout order (`fieldNameOrder`), and a nullable record
+      // field as its record, since both store a `ref null` to one row (D15152).
+      const ord = if mode == "row" { fieldNameOrder(t.objFieldNames) } else { repIdentityOrder(t.objFieldNames.length) }
       let s = "{"
       let i = 0
-      while i < t.objFieldNames.length {
-        let ft = t.objFieldTypes[i]
+      while i < ord.length {
+        let ft = t.objFieldTypes[ord[i]]
         if canon { ft = repCanonFieldTy(ft) }
+        if mode == "row" { ft = repRowRecordOf(ft) }
         const asSet = repFieldLitAsSet(ft)
         const fk = if canon && asSet.length > 0 { repKeyUnion(asSet, mode) } else { repKeyOf(ft, mode) }
-        s = s + t.objFieldNames[i] + ":" + fk + ","
+        s = s + t.objFieldNames[ord[i]] + ":" + fk + ","
         i = i + 1
       }
       return s + "}"
@@ -896,6 +901,7 @@ function repUnionMemberMode(m: i32, mode: RepKeyMode): RepKeyMode {
 // render, guarded by `structFieldCodesEq`.
 function repKeyUnion(mems: i32[], mode: RepKeyMode): string {
   const mixed = repUnionIsMixed(mems)
+  const parts: string[] = []
   let s = "("
   let emitted = 0
   let sawWideStr = false
@@ -910,14 +916,41 @@ function repKeyUnion(mems: i32[], mode: RepKeyMode): string {
         sawWideStr = true
       }
     }
-    if !skip {
-      if emitted > 0 { s = s + "|" }
-      s = s + r
-      emitted = emitted + 1
-    }
+    if !skip { parts.push(r) }
     i = i + 1
   }
+  // The row key names a member set in one order: a union field is a box whatever its spelling
+  // lists first (D15152).
+  const ord = if mode == "row" { fieldNameOrder(parts) } else { repIdentityOrder(parts.length) }
+  for k in ord {
+    if emitted > 0 { s = s + "|" }
+    s = s + parts[k]
+    emitted = emitted + 1
+  }
   s + ")"
+}
+
+// The positions `0..n` in order.
+function repIdentityOrder(n: i32): i32[] {
+  const out: i32[] = []
+  let i = 0
+  while i < n {
+    out.push(i)
+    i = i + 1
+  }
+  out
+}
+
+// A nullable record type's record, else `ty` itself.
+function repRowRecordOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const t = tyAt(ty)
+  if t is TyNullable {
+    if t.nInner >= 0 && t.nInner < T.tys.length && tyAt(t.nInner) is TyObj {
+      return t.nInner
+    }
+  }
+  ty
 }
 
 // repElemKey — the ref-list element rep key (destringify D2): a canonical key for an
@@ -1524,6 +1557,9 @@ export function repCanonId(ty: i32): i32 { repIdOf(ty, "canon") }
 // it is stored as, so records apart only in a function field's type share one row. The row's
 // reader takes that field's type from the position, never from the row.
 export function repRowId(ty: i32): i32 { repIdOf(ty, "row") }
+
+// The order-free key behind `repRowId`: equal keys are one struct row identity.
+export function repRowKey(ty: i32): string { repKeyOf(ty, "row") }
 
 export function repElemId(ty: i32): i32 { repIdOf(ty, "elem") }
 
