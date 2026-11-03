@@ -291,8 +291,8 @@ shared row names.
     that captures it is noted at the ancestor instance binding the parameter
     (`elabCapturedBundleSigNote`), mono admits a nested function that only calls the capture, and
     a captured read names the binding frame's bundle parameter (`bundleParamOfRead`), so the
-    closure calls a field of the record it captured. A returned capture, and a capture two
-    closures deep, stay refused.
+    closure calls a field of the record it captured, from a closure at any depth (each frame
+    re-captures the record). A returned capture stays refused.
 
 ### Open questions for the coordinator
 
