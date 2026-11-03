@@ -121,6 +121,7 @@ import {
   elabCapRepUnion,
   elabFnIdOf,
   elabTyClosed,
+  fnLetIsWide,
   stampsStand,
 } from "./check_elab_cap"
 import { boundObjRootOf } from "./check_decl_scan"
@@ -3886,6 +3887,16 @@ function listWidenWalk(
   if src >= T.tys.length || dst >= T.tys.length { return false }
   if src == dst { return false }
   const x = listOriginExpr(expr)
+  // A list literal a `const` names is built at its own type, so a mutable list sharing it cannot
+  // read a function set's elements at a closed function type (D15133).
+  if (
+    x >= 0
+    && expr >= 0
+    && parenPeelIx(expr) != x
+    && listConstLitFnSet(x, src, dst)
+  ) {
+    return listWidenClaim(parenPeelIx(expr), src, dst)
+  }
   if x == LW_INFERRED { return false }
   if x >= 0 && listWidenJoin(x, dst, depth, underNul) { return true }
   if x >= 0 && (recIsJoin(x) || recCoalesceOperands(x).length == 2) {
@@ -4023,6 +4034,11 @@ function listWidenArray(
     if listWidenWalk(-1, s.aElem, d.aElem, depth - 1, false) { return true }
     if d.aRead != 1 {
       if listElemWidens(s.aElem, d.aElem) { return listWidenClaim(x, src, dst) }
+      // A function set's generic member type into a closed function element needs a copy
+      // through adapters, which only a readonly list may take (D15133).
+      if listFnSetNeedsCopy(s.aElem, d.aElem) {
+        return listWidenClaim(x, src, dst)
+      }
       return false
     }
     // A readonly destination that needs a converting copy under `| null` has no lowering yet.
@@ -4032,6 +4048,33 @@ function listWidenArray(
     }
   }
   false
+}
+
+// Whether literal `x`, of list type `src`, delivered to the mutable list `dst` has elements of a
+// function set that `dst`'s closed function element needs copied (`listFnSetNeedsCopy`).
+function listConstLitFnSet(x: i32, src: i32, dst: i32): boolean {
+  if !(nodeAt(x) is ArrayLit) || src >= T.tys.length || dst >= T.tys.length {
+    return false
+  }
+  const s = tyAt(src)
+  const d = tyAt(dst)
+  s is TyArray
+    && d is TyArray
+    && d.aRead != 1
+    && listFnSetNeedsCopy(s.aElem, d.aElem)
+}
+
+// Whether element `se`, the read type of a re-pointed `let` of functions called at more than one
+// type (`fnLetIsWide`), meets `de`, a closed function type: no instance shares that list, so the
+// list must be copied, not aliased.
+function listFnSetNeedsCopy(se: i32, de: i32): boolean {
+  if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length || se == de {
+    return false
+  }
+  if !(tyAt(se) is TyFunc) || !(tyAt(de) is TyFunc) || tyHasHole(de) {
+    return false
+  }
+  fnLetIsWide(se)
 }
 
 // The elements of a list literal, each judged by its own expression; a spread hands over the
