@@ -95,6 +95,41 @@ parameter) is typed at the instance as an `i32` id, so mono falls back to the te
 Reading it in `monoTagSetAt` before the fallback is this mechanism's whole change. It is safe only
 once M1 makes the instances distinct: with a shared instance it reads one key's set for both.
 
+### M5. A per-instance value handed or returned out of its instance (step 2, S2a')
+
+Measured on master `b90c2ed2e`. In `closures/hole-lambda-bundle-positions.vl`, `capT<T>` hands a
+lambda capturing its `k: T` to the hole function `lapT`, which calls it at `i32` and `f64`. The
+elaboration keys `lapT` by its argument's type, `(?#L.0) => ?`, which is the same from `capT<i32>`
+and `capT<string>`. So both reach one `lapT` key, and the lambda's pins are made once, inside that
+shared instance. Mono keeps the two apart only by frame (`30#|T=i32`, `32#|T=string`). D15110 is
+the same shape through a return: `a(1)(2)` pins the lambda at a call outside every instance.
+
+**The key component.** A per-instance value carries its creating instance. Where a call hands one
+to a hole function's parameter `i`, the callee's key binding vector (`ekNames`/`ekTys`, the vector
+A2b's delivered-arm entries go into) gains the entry `#from.i`, naming the lambda's own key: the
+one S2a mints under its encloser instance. Two creating instances then key the hole function apart,
+and a pin made in its instance is enqueued from a key whose chain names the creating instance.
+`elabParentFor` follows `#from.i` back to it. A value returned by an instance is credited the same
+way: the callee of `a(1)(2)` is a call whose key is `a<i32>`, so the outer call's pin is enqueued
+from that key. A value that is not per instance (S2a minted it no instance key) adds no entry, so
+those keys do not split.
+
+**What it replaces in mono.** The encloser half of mono's instance key (`monoEnclosingPinRow` and
+`monoBindEnclosingPins`, the `|T=…` segment) and the frame-keyed instance head
+(`monoMakeInstanceKeyHead`, `monoNestedCallFrame`), wherever they key a callee by the instance a
+handed value came from. Those read the elaboration key once it carries `#from.i`, and are deleted
+for that case. Mono's clone predicate (`monoLamNodeIsTemplateCore`) goes in S2b. #6068's floor
+(`monoSharedLamGuard`) goes when D15110 runs.
+
+**Cost bound.** Keys split only where a call hands a per-instance value, so the added keys are
+bounded by those calls times their creating instances. Before the readers move, a probe counts, over
+the `@run` files, the hole functions that gain a `#from` entry and the keys added. It is priced in
+guest fuel on the scaling-shape gate and the L2 self-compile, the bar being a few percent.
+
+**Controls.** D15110 and its swapped and trap variants, its non-generic twin, the same-type case,
+`generics/is-list-arm-anon-record.vl`, the 4b-i movers, the five shared-writer fixtures, the class-F
+trio and per-frame's two slot-probe files, D14842, D15049, D15019, D15102 and D15068.
+
 ## Producers and readers
 
 | fact | producer | readers |
