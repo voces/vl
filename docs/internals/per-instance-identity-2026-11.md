@@ -147,6 +147,25 @@ bounded by those calls times their creating instances. Before the readers move, 
 the `@run` files, the hole functions that gain a `#from` entry and the keys added. It is priced in
 guest fuel on the scaling-shape gate and the L2 self-compile, the bar being a few percent.
 
+**S2a, landed: two keys per lambda, an interim.** An anonymous lambda with an un-annotated parameter,
+in an open encloser, takes that encloser's instance on the `from` chain as its key's parent
+(`elabParentForAt`). Where that rule alone gives the parent, the parent -1 key it had before is still
+minted beside it. Reusing an instance's key for a template pin instead was measured unsound:
+`generics/hole-list-literal-local-nullable.vl` went from running to trapping, because the template
+pin ran under one instance's encloser bindings. The parent -1 keys are the template's view until every
+pin is credited to an instance. Three late-demand causes shaped the rule. Lifting renames a lambda
+`__lambda_N`, so the rule reads the lifted name. A lambda with no un-annotated parameter has nothing to
+key. And mono asks for a callback with no instance in hand.
+
+**S2a''s exit criterion.** No lambda key is minted with parent -1 inside an open encloser. These are
+the readers that still ask with no instance (`from` -1), the list S2a' empties:
+
+* `elabDemandFrom`'s callers at `elabDemand` and at two arguments' demands (`elabArgResultAt`'s
+  neighbours);
+* the hole-row drain's template rows (`elabHolePinNote` outside a live re-check);
+* `elabEarlyCallRows`, `elabArgValueRows`, `elabListSigRow`, `elabSetRepRow`, `elabLamRepInstance`,
+  `elabSoleRekey`, `elabEnqueueAtParams` and `elabArgResultAt`.
+
 **Controls.** D15110 and its swapped and trap variants, its non-generic twin, the same-type case,
 `generics/is-list-arm-anon-record.vl`, the 4b-i movers, the five shared-writer fixtures, the class-F
 trio and per-frame's two slot-probe files, D14842, D15049, D15019, D15102 and D15068.
