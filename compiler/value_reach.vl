@@ -3,6 +3,7 @@
 // value is inert (it reaches no call and nothing that observes its signature), and the split
 // plan of `fn_split.vl` asks it which calls a slot serves, so both read one answer (D6880).
 
+import { tyParamIsBareOnly } from "./check_scopes"
 import { emitFail } from "./emit_bytes"
 import { elabHoleRowCut, elabHoleRowMark } from "./check_elab_cap"
 import {
@@ -46,16 +47,13 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
-  callHasTyArgs,
   declExported,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
-  nodeChildren,
   nodeChildrenPush,
 } from "./ast"
 import { wsOrigTyOf } from "./check_demands"
-import { isVarTyIxOf } from "./check_list_union"
 import { i32TyIx } from "./check_leaf_steps"
 import { nodeTyIxOf } from "./check_node_tys"
 import { holeSlotCallRets, substTyDeep } from "./check_relate_core"
@@ -69,7 +67,6 @@ import {
   tyMayHoldFn,
 } from "./check_types"
 import {
-  monoAnnHasTyParam,
   monoDeclAnnName,
   monoTyParamOf,
   retVoidAnnFlag,
@@ -86,7 +83,7 @@ import {
   reExpName,
   reExpTarget,
 } from "./emit_state"
-import { i32ListHas, strListHas } from "./listutil"
+import { i32ListHas } from "./listutil"
 
 import { identDeclOf, sidArrGet } from "./symbols"
 import { tyHasTyVar, tyIsArray, tyReachesHole } from "./tyquery"
@@ -915,7 +912,7 @@ function vrArg(n: Call, x: i32, path: string): i32[] {
       const pp = nodeAt(pIx)
       if pp is Param && pp.parDefault < 0 && pp.parRest == 0 {
         // A closed parameter type still yields the function to an `is` that widens it (D6701)
-        if !closed && !monoParamIsOpen(f, pIx) { return vrLost() }
+        if !closed && !monoParamIsOpen(cd, f, pIx) { return vrLost() }
         return vrDecl(pIx, path)
       }
     }
@@ -1022,7 +1019,7 @@ export function vrOuterReadsInert(fd: i32): boolean {
 
 // Whether parameter `pIx` of `f` takes its argument's own type: un-annotated, or annotated by a
 // type parameter that no other parameter, the result, an `is`/`as` or a type argument names (D6910).
-function monoParamIsOpen(f: FuncDecl, pIx: i32): boolean {
+function monoParamIsOpen(fd: i32, f: FuncDecl, pIx: i32): boolean {
   const p = nodeAt(pIx)
   if !(p is Param) { return false }
   if p.parType < 0 { return true }
@@ -1034,7 +1031,7 @@ function monoParamIsOpen(f: FuncDecl, pIx: i32): boolean {
   for q in f.fnParams {
     if q != pIx && monoParamBareTyParam(q, f.fnTyParams) == tp { return false }
   }
-  monoTyParamOnlyBareParams(f, tp)
+  tyParamIsBareOnly(fd, tp)
 }
 
 // The function declaration call `n`'s callee names directly, or -1.
@@ -1072,106 +1069,6 @@ export function monoFrameInstTmpl(fx: i32): i32[] {
     hops = hops + 1
   }
   none
-}
-
-// Whether `fn` names type parameter `tp` only as the whole annotation of some parameters: not
-// in its return type, another annotation, an `is`/`as` or a call's type arguments.
-export function monoTyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
-  const tps: string[] = [tp]
-  const bare: i32[] = []
-  for pIx in fn.fnParams {
-    const p = nodeAt(pIx)
-    if p is Param && p.parType >= 0 { bare.push(p.parType) }
-  }
-  // A copy of a parameter takes that parameter's pin, so its annotation reads `tp` bare too.
-  const walk: i32[] = [fn.fnBody]
-  while walk.length > 0 {
-    const ix = walk.pop() ?? -1
-    if ix >= 0 && ix < P.nodes.length {
-      const n = nodeAt(ix)
-      if n is LetDecl && monoCopySeedParam(fn, ix) >= 0 { bare.push(n.letType) }
-      for c in nodeChildren(ix) { walk.push(c) }
-    }
-  }
-  const stack: i32[] = []
-  for pIx in fn.fnParams { stack.push(pIx) }
-  stack.push(fn.fnRet)
-  stack.push(fn.fnBody)
-  while stack.length > 0 {
-    const ix = stack.pop()
-    if ix >= 0 && ix < P.nodes.length {
-      const n = nodeAt(ix)
-      if n is TypeRef && monoAnnHasTyParam(ix, -1, tps) {
-        let ok = n.tyName == tp
-        if ok {
-          ok = false
-          for x in bare {
-            if x == ix { ok = true }
-          }
-        }
-        if !ok { return false }
-      }
-      if n is IsExpr && monoAnnHasTyParam(ix, isVarTyIxOf(ix), tps) {
-        return false
-      }
-      if n is AsExpr && monoAnnHasTyParam(ix, -1, tps) { return false }
-      if n is Call && callHasTyArgs(ix) { return false }
-      for c in nodeChildren(ix) { stack.push(c) }
-    }
-  }
-  true
-}
-
-// The parameter of `fn` that binding `d` copies: `d` is annotated with a bare type parameter of
-// `fn`, nothing assigns it, and it is seeded by a read of a parameter annotated so, directly or
-// through such copies. A copy holds the parameter's value, so it takes the parameter's pin; -1
-// for any other binding.
-export function monoCopySeedParam(fn: FuncDecl, d: i32): i32 {
-  let x = d
-  let hops = 0
-  while hops < 8 {
-    hops = hops + 1
-    if x < 0 || x >= P.nodes.length { return -1 }
-    const n = nodeAt(x)
-    if !(n is LetDecl) || !monoBareOwnTyParam(n.letType, fn) || n.letInit < 0 {
-      return -1
-    }
-    if monoBindingAssigned(fn, x) { return -1 }
-    const v = unwrapParen(n.letInit)
-    if v < 0 || !(nodeAt(v) is Ident) { return -1 }
-    const src = identDeclOf(v)
-    if src >= 0 && src < P.nodes.length && i32ListHas(fn.fnParams, src) {
-      const pn = nodeAt(src)
-      if pn is Param && monoBareOwnTyParam(pn.parType, fn) { return src }
-      return -1
-    }
-    x = src
-  }
-  -1
-}
-
-// Whether annotation `t` is a bare type parameter of `fn`.
-function monoBareOwnTyParam(t: i32, fn: FuncDecl): boolean {
-  if t < 0 || t >= P.nodes.length { return false }
-  const tn = nodeAt(t)
-  tn is TypeRef && strListHas(fn.fnTyParams, tn.tyName)
-}
-
-// Whether anything in `fn`'s body, a nested function included, assigns binding `d`.
-function monoBindingAssigned(fn: FuncDecl, d: i32): boolean {
-  const stack: i32[] = [fn.fnBody]
-  while stack.length > 0 {
-    const ix = stack.pop() ?? -1
-    if ix >= 0 && ix < P.nodes.length {
-      const n = nodeAt(ix)
-      if n is BinExpr && n.binOp == "=" {
-        const l = unwrapParen(n.binLeft)
-        if l >= 0 && nodeAt(l) is Ident && identDeclOf(l) == d { return true }
-      }
-      for c in nodeChildren(ix) { stack.push(c) }
-    }
-  }
-  false
 }
 
 // The type parameter a bare `T` or `T[]` parameter annotation rides, or "".
