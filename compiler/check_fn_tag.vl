@@ -47,6 +47,7 @@ import {
   WhileStmt,
   annTsOf,
   callTyArgsOf,
+  declHasExportKw,
   mkCallN,
   mkIdent,
   nodeAt,
@@ -256,6 +257,10 @@ export function fnTagDecide(rootIx: i32) {
   ftHandedAt = Map()
   ftParamRefs = Map()
   ftParamCalls = Map()
+  ftListedAt = Map()
+  ftLitLet = Map()
+  ftLetRefs = Map()
+  ftLetElemCalls = Map()
   if !ftLate { ftCheckLen = P.nodes.length }
   ftDecideRoot = rootIx
   fnTagUndecide()
@@ -1911,9 +1916,29 @@ function ftReachHandSets(fd: i32, pi: i32, depth: i32): i32[] {
   const at = ftHandedAt[fd] ?? []
   const calls = ftDirectCalls[fd] ?? 0
   const refs = ftDirectRefs[fd] ?? 0
-  if refs == 0 || refs != calls + at.length / 2 { return none }
+  const lits = ftListedAt[fd] ?? []
+  if refs == 0 || refs != calls + at.length / 2 + lits.length { return none }
   const out = fnParamHandSets(fd, pi).slice(0)
   if calls > 0 && out.length == 0 { return none }
+  // A `const` list literal holding `fd`, read only as the callee of a call through an element,
+  // hands each such call's argument (D15053's stored spelling).
+  for lit in lits {
+    const ld = ftLitLet[lit] ?? -1
+    const ln = if ld >= 0 && ld < P.nodes.length { nodeAt(ld) } else { nodeAt(lit) }
+    if !(ln is LetDecl) || ln.letKw != "const" || declHasExportKw(ld) {
+      return none
+    }
+    const ecs = ftLetElemCalls[ld] ?? []
+    if ecs.length == 0 || (ftLetRefs[ld] ?? 0) != ecs.length { return none }
+    for ec in ecs {
+      const cn = nodeAt(ec)
+      if !(cn is Call) || pi >= cn.callArgs.length { return none }
+      const ax = parenPeelIx(cn.callArgs[pi])
+      const ad = if ax >= 0 && ax < P.nodes.length && nodeAt(ax) is Ident { identDeclOf(ax) } else { -1 }
+      if ad >= 0 && ad < P.nodes.length && nodeAt(ad) is Param { return none }
+      out.push(fnTagSetOfTy(nodeTyIxOf(ax)))
+    }
+  }
   // Each parameter `fd` is handed to, `[function, index, ...]`, read once.
   const seen: i32[] = []
   let k = 0
@@ -1971,6 +1996,12 @@ let ftDirectCalls: {[i32]: i32} = Map()
 let ftHandedAt: {[i32]: i32[]} = Map()
 let ftParamRefs: {[i32]: i32} = Map()
 let ftParamCalls: {[i32]: i32[]} = Map()
+// Per function, the list literals naming it as an element; per list literal, the `let` it
+// initialises; per `let`, the names reading it and the calls through an element of it.
+let ftListedAt: {[i32]: i32[]} = Map()
+let ftLitLet: {[i32]: i32} = Map()
+let ftLetRefs: {[i32]: i32} = Map()
+let ftLetElemCalls: {[i32]: i32[]} = Map()
 
 // The arena's length at the check's own decision. A later decision counts only those nodes: the
 // calls the elaboration adds (a set's arms) hand nothing the check noted.
@@ -1990,6 +2021,9 @@ function ftDirectCountsGrow() {
         if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is Param {
           ftParamRefs[pd] = (ftParamRefs[pd] ?? 0) + 1
         }
+        if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is LetDecl {
+          ftLetRefs[pd] = (ftLetRefs[pd] ?? 0) + 1
+        }
       }
       Call => {
         const cf = n.callFn
@@ -2001,6 +2035,15 @@ function ftDirectCountsGrow() {
           const pcs = ftParamCalls[pd] ?? []
           pcs.push(x)
           ftParamCalls[pd] = pcs
+        }
+        // A call through an element of a `let`: `fs[i](...)`.
+        const ixn = if cf >= 0 && cf < P.nodes.length { nodeAt(parenPeelIx(cf)) } else { n }
+        const base = if ixn is Index { parenPeelIx(ixn.idxArr) } else { -1 }
+        const bd = if base >= 0 && base < P.nodes.length && nodeAt(base) is Ident { identDeclOf(base) } else { -1 }
+        if bd >= 0 && bd < P.nodes.length && nodeAt(bd) is LetDecl {
+          const ecs = ftLetElemCalls[bd] ?? []
+          ecs.push(x)
+          ftLetElemCalls[bd] = ecs
         }
         let i = 0
         while d >= 0 && i < n.callArgs.length {
@@ -2015,8 +2058,24 @@ function ftDirectCountsGrow() {
           i = i + 1
         }
       }
+      ArrayLit => {
+        for e in n.arrElems {
+          const ed = if e >= 0 && e < P.nodes.length && nodeAt(e) is Ident { identFnDeclOf(e) } else { -1 }
+          if ed >= 0 {
+            const ls = ftListedAt[ed] ?? []
+            ls.push(x)
+            ftListedAt[ed] = ls
+          }
+        }
+      }
+      LetDecl => {
+        const li = parenPeelIx(n.letInit)
+        if li >= 0 && li < P.nodes.length && nodeAt(li) is ArrayLit {
+          ftLitLet[li] = x
+        }
+      }
       // No other node names a function.
-      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
     }
     x = x + 1
   }
@@ -2346,6 +2405,55 @@ function ftParamOfSet(c: Call, x: i32, s: i32): boolean {
   false
 }
 
+// Whether `x` is an argument of call `c` through an element of a `const` list literal of named
+// functions, each taking it at an un-annotated parameter that only `s` reaches: each member's
+// instance binds it to what the call hands, as a direct call's does (`ftLateParamOk` after the
+// elaboration).
+function ftListCallHoleArg(c: Call, x: i32, s: i32): boolean {
+  const cf = parenPeelIx(c.callFn)
+  if cf < 0 || cf >= P.nodes.length { return false }
+  const cn = nodeAt(cf)
+  if !(cn is Index) { return false }
+  const b = parenPeelIx(cn.idxArr)
+  if b < 0 || b >= P.nodes.length || !(nodeAt(b) is Ident) { return false }
+  const ld = identDeclOf(b)
+  const ln = if ld >= 0 && ld < P.nodes.length { nodeAt(ld) } else { cn }
+  if !(ln is LetDecl) || ln.letKw != "const" || declHasExportKw(ld) {
+    return false
+  }
+  // Read only as the base of a call through an element: nothing else adds to or reads the list.
+  ftDirectCountsGrow()
+  const ecs = ftLetElemCalls[ld] ?? []
+  if ecs.length == 0 || (ftLetRefs[ld] ?? 0) != ecs.length { return false }
+  const li = parenPeelIx(ln.letInit)
+  const lit = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { cn }
+  if !(lit is ArrayLit) || lit.arrElems.length == 0 { return false }
+  const i = i32ListIndexOf(c.callArgs, x)
+  if i < 0 || i < c.callArgNames.length && c.callArgNames[i] != "" {
+    return false
+  }
+  for e in lit.arrElems {
+    const d = if e >= 0 && e < P.nodes.length && nodeAt(e) is Ident { identFnDeclOf(e) } else { -1 }
+    const f = if d >= 0 { nodeAt(d) } else { cn }
+    if !(f is FuncDecl) || f.fnName == "" || i >= f.fnParams.length {
+      return false
+    }
+    const pn = nodeAt(f.fnParams[i])
+    if !(pn is Param) || pn.parType >= 0 { return false }
+    if ftLate && !i32ListHas(ftWas, s) && !ftLateParamTakes(c, d, i, s) {
+      return false
+    }
+    // No call reaching the member hands that parameter a set outside `s`, so the element's one
+    // closure signature holds `s`'s id (D15019).
+    const hs = ftReachHandSets(d, i, 0)
+    if hs.length == 0 { return false }
+    for st in hs {
+      if st < 0 || st != s && !ftSetWithin(st, s) { return false }
+    }
+  }
+  true
+}
+
 // Whether argument `x` of call `c` binds a positional, un-annotated parameter of the named
 // top-level function `c` calls.
 function ftHoleParamOf(c: Call, x: i32): boolean {
@@ -2517,7 +2625,11 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
   if !ftLate || i32ListHas(ftWas, s) { return true }
   const d = ftCalleeFn(ftCalleeSource(c))
   if d < 0 { return true }
-  const i = i32ListIndexOf(c.callArgs, x)
+  ftLateParamTakes(c, d, i32ListIndexOf(c.callArgs, x), s)
+}
+
+// Whether parameter `i` of `d`, handed `s` by call `c`, takes it as the elaboration's facts read.
+function ftLateParamTakes(c: Call, d: i32, i: i32, s: i32): boolean {
   mintParamTakes(d, i, s)
     || ftParamUnread(d, i)
     || ftArgIsParam(c, i) && ftParamForwardsSet(d, i, s)
@@ -2657,6 +2769,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         return fnTagCallSetOf(p) == s || ftLateDirectCall(x, s)
       }
       return (ftParamOfSet(pn, x, s) && ftLateParamOk(pn, x, s))
+        || ftListCallHoleArg(pn, x, s)
         || ftSlotWriteArg(pn, x, s)
         || ftLateArgOfSet(pn, x, s)
     }
