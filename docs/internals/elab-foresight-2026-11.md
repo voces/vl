@@ -82,6 +82,12 @@ types, not an instance's: a call in a generic or hole body whose types stay open
 nothing. Late demands are 0 over the whole late-demands population with the veto gone, so no
 measured call needs the instanced reading yet.
 
+A second producer uses the same class (D15062): a root call handing a list binding of an untagged
+set, whose rep row takes the list at the stub, is enqueued once more with the list at the
+signature the calls through its elements give (`elabListSigRow`, `elabListCallSig`), and a
+function of that set handed beside it at that signature too. It runs once every instance is in,
+since the members' results are read from their instances.
+
 **Build.**
 
 1. `elabListMemberSigs`, run at the end of `elabRun` before `elabRunDone`. It applies (A)'s
