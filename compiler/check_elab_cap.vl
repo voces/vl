@@ -38,6 +38,7 @@ import {
   TyUnion,
   TyVar,
   mkArrayTy,
+  mkObjTy,
   tySame,
 } from "./check_types"
 import { declTyOf } from "./check_nar_store"
@@ -70,7 +71,7 @@ import { identArmNote, identDeclOf, identIsArm, nodeSrc } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
 import { hdBase, hdRowOf } from "./check_hole_pins"
 import { mintReset } from "./check_mint"
-import { elabFnSetTy, fnTagged } from "./check_fn_tag_facts"
+import { elabFnSetTy, fnSetCarried, fnTagged } from "./check_fn_tag_facts"
 export { fnTagTyIsTagged } from "./check_fn_tag_facts"
 
 // Whether an elaboration is recording, and the quiet depth it records at.
@@ -1066,6 +1067,7 @@ export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
   const e = ta.aElem
   if e < 0 || e >= T.tys.length { return t }
   const tf = T.tys[e]
+  if tf is TyObj { return elabFnRecListLetTy(bd, t, tf) }
   if !(tf is TyFunc) { return t }
   const s = elabFnSetTy[e] ?? -1
   if s < 0 { return t }
@@ -1093,6 +1095,54 @@ export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
   const lt = mkArrayTy(fresh)
   fnJoinMemo[key] = lt
   lt
+}
+
+// `elabFnListLetTy` for a list of records `t` with element `o`: each field holding a set also
+// holds every function the binding's scope writes into that field of an element (M-record).
+// `t` when no field widens.
+function elabFnRecListLetTy(bd: i32, t: i32, o: TyObj): i32 {
+  const key = "reclist" + i32ToStr(bd) + "," + i32ToStr(t)
+  const memo = fnJoinMemo[key] ?? -1
+  if memo >= 0 && memo < T.tys.length { return memo }
+  const names: string[] = []
+  const tys: i32[] = []
+  let grew = false
+  let i = 0
+  while i < o.objFieldNames.length {
+    const ft = o.objFieldTypes[i]
+    names.push(o.objFieldNames[i])
+    tys.push(elabFnFieldWide(bd, o.objFieldNames[i], ft))
+    if tys[i] != ft { grew = true }
+    i = i + 1
+  }
+  if !grew { return t }
+  mkObjTy(names, tys)
+  const lt = mkArrayTy(T.tys.length - 1)
+  fnListWidened.push(bd)
+  fnJoinMemo[key] = lt
+  lt
+}
+
+// Field `name`'s type `ft` in the records list binding `bd` holds, its set joined with what the
+// scope writes there: a fresh function type of that union, or `ft` when nothing widens it.
+function elabFnFieldWide(bd: i32, name: string, ft: i32): i32 {
+  if ft < 0 || ft >= T.tys.length { return ft }
+  const tf = T.tys[ft]
+  if !(tf is TyFunc) { return ft }
+  const s = elabFnSetTy[ft] ?? -1
+  if s < 0 { return ft }
+  const ws = cwListFieldFnTargets(bd, name, !elabCapOn)
+  if ws.length == 0 || ws[0] < 0 { return ft }
+  const u = fnSetIntern(fnSetUnion(s, fnSetIntern(fnSetSorted(ws))))
+  if u == s { return ft }
+  const ps: i32[] = []
+  for p in tf.fnParamTypes { ps.push(p) }
+  const g: Ty = { fnParamTypes: ps, fnRet: tf.fnRet }
+  T.tys.push(g)
+  const fresh = T.tys.length - 1
+  elabFnSetTy[fresh] = u
+  fnSetCarried[fresh] = true
+  fresh
 }
 
 // The set of every function field `name` of the records list binding `bd` holds, its
@@ -1735,6 +1785,7 @@ export function fnTyFactsReset() {
   mintReset()
   fnTagUndecide()
   elabFnSetTy = Map()
+  fnSetCarried = Map()
   fnTagCallIxs = []
   fnTagCallSet = Map()
   fnTagCallKey = Map()
@@ -2162,6 +2213,7 @@ export function elabCapReset() {
   elabHoleRowBindT = []
   elabWideRowsKeep(0)
   elabFnSetTy = Map()
+  fnSetCarried = Map()
   fnSets = []
   fnValGenerics = []
   fnSetByKey = Map()
