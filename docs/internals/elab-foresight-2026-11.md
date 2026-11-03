@@ -70,10 +70,17 @@ rep, it also enqueues the twin keyed at the tagged set, as a candidate. Mint fac
 and the parameter-set notes) are recorded per instance key, and the late pass reads the twin's
 facts for a set it is deciding. If the late pass tags the set, the call's row is the twin and the
 rep instance is unreached. If it does not, the twin is unreached. #5950's check-time rule stays
-until this lands, and the twin then serves the functions its direct-call predicate excludes (a
-function stored in a list, or handed on as a value).
+until this lands, and the twin then serves the functions it excludes (a function stored in a list,
+or handed on as a value other than to a parameter only ever called, which D15017 follows).
 
 ## First slice: (A)
+
+**Status: built.** `elabListMemberSigs` (emit_elab.vl) mints the members as candidates
+(`elabCandKeys`, `elabDemandCandidate`), and the veto is deleted with the slot tables only it
+read. It reads a call's argument types and a member's own calls of its parameter at their checked
+types, not an instance's: a call in a generic or hole body whose types stay open there mints
+nothing. Late demands are 0 over the whole late-demands population with the veto gone, so no
+measured call needs the instanced reading yet.
 
 **Build.**
 

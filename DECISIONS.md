@@ -11395,7 +11395,9 @@ that is another union's arm (that arm's row), and a box narrowed to such an arm 
 re-boxed under the narrower arm's tag, since a box keeps the tag it was built with). A nullable
 record is delivered as the union's null or as the record. Only a direct position lifts: a list
 element or map value is a different array type, so those positions are still refused. A union
-value delivered whole (D15057) is still refused, because only a runtime re-tag could serve it.
+value delivered whole is re-tagged at run time (D15057): each tag of a wider arm becomes the tag
+of the arm it subtypes, and every other member keeps its own. Only a union destination takes
+it; a union of wider records into a plain record is still refused, since that needs an unbox.
 
 ## A literal names its arm: a record narrower than one declared record is stored as it (ruling, 2026-11-01)
 
