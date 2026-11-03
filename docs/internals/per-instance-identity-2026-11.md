@@ -86,6 +86,27 @@ callee is resolved by declaration (`fnTagArmCalleeOf`, #5990), and in an instanc
 resolve to that body's copy (`monoDeclCopyIn`), not to the template's declaration. An id that
 leaves the instance (returned, stored outside) keeps the set a closure, as today.
 
+**M3 step 2, planned (D15110, per-frame's class F).** Measured: a lambda's elaboration key has no
+parent, so one `?#L…` key covers every instance of its encloser, and a lambda no instance calls
+gets no key at all. Mono then decides "per instance" with a predicate of its own
+(`monoLamNodeIsTemplateCore`), and the tag decision with another (`ftWithinInstancedFn`). They
+disagreed on D15110, which built one closure at the first instance's type. The floor
+(`monoSharedLamGuard`) refuses that case on the elaboration's "no key" fact. The build:
+
+1. The elaboration keys every lambda declared in an instanced body under its encloser instance
+   (`ekParent` set), including one no instance calls. It records "per instance" as that key's
+   binding differing between two encloser instances.
+2. The tag decision reads that fact in place of `ftWithinInstancedFn`'s syntactic test. Mono's
+   clone reads it in place of `monoLamNodeIsTemplateCore`, which is deleted.
+3. A set holding a per-instance lambda is built over (lambda, instance), as M3 above, so each
+   instance's arm is its own copy.
+
+Controls: D15110 and its two variants, the non-generic twin, the four 4b-i movers, the five
+shared-writer fixtures, per-frame's `hole-lambda-bundle-positions`,
+`captured-hole-fn-handed-on-two-generics` and `nested-generic-capture-callers-that-run`, and the
+hard controls. Priced in guest fuel on the scaling-shape gate and the L2 self-compile, since every
+instanced lambda gains a key.
+
 ### M4. Per-instance arms for a call through an open function's parameter
 
 A call through a parameter whose set differs per instance resolves its arms by the instance's set
