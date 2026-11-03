@@ -93,6 +93,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  objFieldType,
   tyAt,
   tySame,
 } from "./check_types"
@@ -139,6 +140,7 @@ import {
   fnParamHandArgsOf,
   fnParamHandFromsOf,
   fnParamHandSets,
+  fnRecListFieldSet,
   fnTagArmMemberNote,
   fnTagArmsAt,
   fnTagArmsAtSet,
@@ -3284,6 +3286,49 @@ function ftSlotWriteArg(c: Call, x: i32, s: i32): boolean {
     && c.callArgs[1] == x
 }
 
+// Whether `x`, a record literal holding set `s`, is what call `c` pushes onto a list of records:
+// the push writes one slot of that list. A slot field of a wider set is decided with `s`, as a list
+// literal's element is (D15036); a closed slot field takes the value through its adapter.
+function ftRecordPushArg(c: Call, x: i32, s: i32): boolean {
+  const ox = parenPeelIx(x)
+  const on = if ox >= 0 && ox < P.nodes.length { nodeAt(ox) } else { nodeAt(0) }
+  if !(on is ObjLit) || !i32ListHas(c.callArgs, x) { return false }
+  const f = parenPeelIx(c.callFn)
+  if f < 0 || f >= P.nodes.length { return false }
+  const fn = nodeAt(f)
+  if !(fn is Member) || fn.memProp != "push" { return false }
+  const rb = identDeclOf(parenPeelIx(fn.memObj))
+  const lt = nodeTyIxOf(fn.memObj)
+  if lt < 0 || lt >= T.tys.length { return false }
+  const la = tyAt(lt)
+  if !(la is TyArray) || la.aElem < 0 || la.aElem >= T.tys.length {
+    return false
+  }
+  const et = tyAt(la.aElem)
+  if !(et is TyObj) { return false }
+  let any = false
+  for fi in on.objFields {
+    const fd = nodeAt(fi)
+    if fd is FieldInit && fnTagSetOfTy(nodeTyIxOf(fd.fiValue)) == s {
+      // The pin of a member's signature rebuilds the read's type without the field's set: what
+      // the binding's scope stores in that field is the set.
+      const ot = fnTagSetOfTy(objFieldType(et, fd.fiName))
+      const o = if ot < 0 && rb >= 0 { fnRecListFieldSet(rb, fd.fiName) } else { ot }
+      // A closed slot takes the value through the adapter its delivery noted.
+      const esc = i32ListHas(ftEscapes, fd.fiValue) || fnTagEtaAt(fd.fiValue)
+      if o < 0 && !esc { return false }
+      if o >= 0 && o != s {
+        if !ftSetWithin(s, o) { return false }
+        if !fnTagSetIsTagged(o) && !i32ListHas(ftSubNeed, o) {
+          ftSubNeed.push(o)
+        }
+      }
+      any = true
+    }
+  }
+  any
+}
+
 // The value type of the map `m.set(k, x)` writes `x` into, when that map's value holds set `s`
 // in a list (kind 5); -1 otherwise.
 function ftMapSetValTy(c: Call, x: i32, s: i32): i32 {
@@ -3359,6 +3404,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     Call => {
       return ftArgDstTy(pn, x) == tx
         || ftMapSetValTy(pn, x, s) == tx
+        || ftRecordPushArg(pn, x, s)
         || ftLate
         && ftHoleArg(pn, x)
         && ftInnerLit(parenPeelIx(x))
