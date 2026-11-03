@@ -995,14 +995,14 @@ export function elabFnLetMembers(bd: i32): i32[] {
 }
 
 // The type a `let` node `bd` with inferred `t` gives its reads: `t` carrying the set of every
-// function written to it as well as its initialiser's, as an `if`'s arms join. One nothing
-// assigns is its initialiser's value, as a `const` is (D15120).
+// function written to it as well as its initialiser's, as an `if`'s arms join. One that holds its
+// initialiser's value throughout (`pcLetHoldsInit`) is that value, as a `const` is (D15120, D15122).
 export function elabFnLetTy(bd: i32, t: i32): i32 {
   const n = nodeAt(bd)
   if (
     !(n is LetDecl)
     || n.letKw != "let"
-    || pcLetUnassigned(bd)
+    || pcLetHoldsInit(bd)
     || t < 0
     || t >= T.tys.length
   ) {
@@ -1068,7 +1068,72 @@ export function elabSlotJoinTy(recv: i32, t: i32): i32 {
   const fresh = T.tys.length - 1
   elabFnSetTy[fresh] = u
   fnJoinMemo[key] = fresh
+  if !i32ListHas(fnSlotWidened, bd) { fnSlotWidened.push(bd) }
   fresh
+}
+
+// The type list field `name` of the record literal binding `bd` initialises, inferred `t`, gives
+// its reads: `t` whose element set also holds every function written into the field's elements,
+// as `elabFnListLetTy` widens a list binding (D15138). `t` when nothing widens it.
+export function elabFnFieldListTy(bd: i32, name: string, t: i32): i32 {
+  if bd < 0 || t < 0 || t >= T.tys.length || i32ListHas(fnLetVeto, bd) {
+    return t
+  }
+  const ta = T.tys[t]
+  if !(ta is TyArray) { return t }
+  const e = ta.aElem
+  if e < 0 || e >= T.tys.length { return t }
+  const tf = T.tys[e]
+  if !(tf is TyFunc) { return t }
+  const s = elabFnSetTy[e] ?? -1
+  if s < 0 || fnSetHasGeneric(s) { return t }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwKeyOfDecl(bd), [name, "[]"], vals, ats) < 0 {
+    return t
+  }
+  const ds: i32[] = []
+  for v in vals {
+    const d = cwFnValueDeclOf(v)
+    if d < 0 { return t }
+    if !i32ListHas(ds, d) { ds.push(d) }
+  }
+  if ds.length == 0 { return t }
+  const w = fnSetIntern(fnSetSorted(ds))
+  if fnSetHasGeneric(w) { return t }
+  const u = fnSetIntern(fnSetUnion(s, w))
+  if u == s { return t }
+  const key = "field" + i32ToStr(bd) + "," + name + "," + i32ToStr(t)
+  const memo = fnJoinMemo[key] ?? -1
+  if memo >= 0 && memo < T.tys.length { return memo }
+  const ps: i32[] = []
+  for p in tf.fnParamTypes { ps.push(p) }
+  const g: Ty = { fnParamTypes: ps, fnRet: tf.fnRet }
+  T.tys.push(g)
+  const fresh = T.tys.length - 1
+  elabFnSetTy[fresh] = u
+  fnFieldWidened.push(bd)
+  fnFieldWidenedName.push(name)
+  const lt = mkArrayTy(fresh)
+  fnJoinMemo[key] = lt
+  lt
+}
+
+// Whether `elabFnFieldListTy` widened list field `name` of record binding `bd`.
+export function elabFnFieldWidened(bd: i32, name: string): boolean {
+  if i32ListHas(fnLetVeto, bd) { return false }
+  let i = 0
+  while i < fnFieldWidened.length {
+    if fnFieldWidened[i] == bd && fnFieldWidenedName[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `elabSlotJoinTy` joined the slot writes of container binding `bd`, an open map's
+// among them, and no check vetoed the join (D15137).
+export function elabFnSlotWidened(bd: i32): boolean {
+  i32ListHas(fnSlotWidened, bd) && !i32ListHas(fnLetVeto, bd)
 }
 
 // The type an un-annotated list binding `bd` with inferred `t` gives its reads: `t` whose element
@@ -1696,6 +1761,11 @@ let fnLetEscBds: i32[] = []
 // The list bindings `elabFnListLetTy` widened in this check.
 let fnListWidened: i32[] = []
 let fnListWidenedElem: i32[] = []
+// The container bindings `elabSlotJoinTy` widened.
+let fnSlotWidened: i32[] = []
+// The record bindings, and their list fields, `elabFnFieldListTy` widened.
+let fnFieldWidened: i32[] = []
+let fnFieldWidenedName: string[] = []
 let fnLetVeto: i32[] = []
 // The list literals whose open element signature the functions written into their binding closed.
 let fnListClosedLits: i32[] = []
@@ -1838,6 +1908,9 @@ export function fnTyFactsReset() {
   fnLetEscBds = []
   fnListWidened = []
   fnListWidenedElem = []
+  fnSlotWidened = []
+  fnFieldWidened = []
+  fnFieldWidenedName = []
   0
 }
 
@@ -1859,6 +1932,9 @@ export function fnTagEtaReset() {
   fnLetEscBds = []
   fnListWidened = []
   fnListWidenedElem = []
+  fnSlotWidened = []
+  fnFieldWidened = []
+  fnFieldWidenedName = []
   fnListClosedLits = []
   fnLetVeto = []
 }
@@ -2317,6 +2393,8 @@ let pcSrc: {[i32]: i32} = Map()
 let pcFlags: {[i32]: i32} = Map()
 let pcAnn: {[i32]: string} = Map()
 let pcBuilt = false
+// Per assigned binding: the declaration every `=` into it reads, or -2 when they differ.
+let pcWriteSrc: {[i32]: i32} = Map()
 const PC_CONST = 1
 const PC_ASSIGNED = 2
 const PC_ANN_OTHER = 4
@@ -2337,6 +2415,7 @@ export function paramCopyBuild() {
   pcFlags = Map()
   pcAnn = Map()
   const assigned: {[i32]: boolean} = Map()
+  pcWriteSrc = Map()
   let i = 0
   while i < P.nodes.length {
     pcAssignNote(i, assigned)
@@ -2358,7 +2437,13 @@ function pcAssignNote(i: i32, assigned: {[i32]: boolean}): i32 {
     const l = parenPeelIx(n.binLeft)
     if l >= 0 && nodeAt(l) is Ident {
       const ld = identDeclOf(l)
-      if ld >= 0 { assigned[ld] = true }
+      if ld >= 0 {
+        assigned[ld] = true
+        const r = parenPeelIx(n.binRight)
+        const rs = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -2 }
+        const was = pcWriteSrc[ld] ?? -3
+        pcWriteSrc[ld] = if was == -3 || was == rs { rs } else { -2 }
+      }
     }
     return 0
   }
@@ -2391,6 +2476,13 @@ function pcNotRecorded(_i: i32): i32 { 0 }
 // read's value throughout, as a `const` would.
 export function pcLetUnassigned(d: i32): boolean {
   pcHas(d) && ((pcFlags[d] ?? 0) & PC_ASSIGNED) == 0
+}
+
+// Whether binding `d`, a `let` initialised by a name read, holds that read's value throughout:
+// nothing assigns it, or every assignment stores a read of the same declaration.
+export function pcLetHoldsInit(d: i32): boolean {
+  if pcLetUnassigned(d) { return true }
+  pcHas(d) && (pcWriteSrc[d] ?? -2) == (pcSrc[d] ?? -1)
 }
 
 // Whether binding `d` is in the copy record, building it on a first read.
