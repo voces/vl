@@ -22,6 +22,7 @@ import {
   callBindCount,
   callBindIxAt,
   callBindNamesAt,
+  callBindRepKeyedSet,
   callBindRepMixedSet,
   callBindRepTysAt,
   callBindRepTysSet,
@@ -61,6 +62,20 @@ import { isNullTy, nonNullTy, tyHasTyVar } from "./tyquery"
 import { recSolePinArg } from "./check_record_origins"
 import { assignable, bindGenWalk, substTyDeep } from "./check_relate_core"
 import { identBoundFnDeclOf } from "./check_scopes"
+import {
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  cwIxBuild,
+  cwIxKind,
+  cwIxNode,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwOccNext,
+  cwOccWalk,
+  cwPeelValue,
+} from "./check_write_scan"
 import { recFnValueLeaves } from "./check_type_shape"
 import { strListHas } from "./listutil"
 import {
@@ -98,11 +113,91 @@ export function callBindAdoptReps() {
     if tys.length > 0 {
       callBindRepTysSet(r, tys)
       if mixed[0] { callBindRepMixedSet(r) }
+      const own = callBindTysAt(r)
+      if (
+        !mixed[0]
+        && cbaRowRepKeys(callBindIxAt(r), callBindNamesAt(r), own, tys)
+      ) {
+        callBindRepKeyedSet(r)
+      }
       cbaAdoptLits(callBindIxAt(r), callBindNamesAt(r), tys)
     }
     r = r + 1
   }
   0
+}
+
+// Whether call `ix`'s rep types `reps` can key its instance: every callee parameter whose type
+// mentions a type variable the rep row moves from `own` is rep-transparent.
+function cbaRowRepKeys(
+  ix: i32,
+  names: string[],
+  own: i32[],
+  reps: i32[],
+): boolean {
+  const decl = elabCallDeclOf(ix)
+  const f = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  const sig = if decl >= 0 { nodeTyIxOf(decl) } else { -1 }
+  const ft = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { null }
+  if (
+    !(f is FuncDecl)
+    || !(ft is TyFunc)
+    || ft.fnParamTypes.length != f.fnParams.length
+  ) {
+    return false
+  }
+  let q = 0
+  while q < names.length && q < own.length && q < reps.length {
+    if !tySame(own[q], reps[q]) {
+      let i = 0
+      while i < f.fnParams.length {
+        const pn: string[] = []
+        const pt: i32[] = []
+        bindGenWalk(ft.fnParamTypes[i], reps[q], pn, pt)
+        if (
+          strListHas(pn, names[q])
+          && !cbaParamRepTransparent(f.fnParams[i], decl, 4)
+        ) {
+          return false
+        }
+        i = i + 1
+      }
+    }
+    q = q + 1
+  }
+  true
+}
+
+// Whether parameter `par` of function `fd` only hands its value on: each read is a value `fd`
+// returns whole, or an argument to a parameter that does the same, to `depth` calls (D15172).
+export function cbaParamRepTransparent(par: i32, fd: i32, depth: i32): boolean {
+  if depth <= 0 || par < 0 || fd < 0 { return false }
+  cwIxBuild()
+  const leaves = recFnValueLeaves(fd)
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      let ok = false
+      for lf in leaves {
+        if cwPeelValue(lf) == u { ok = true }
+      }
+      if !ok && u < cwIxUpKind.length && cwIxUpKind[u] == CW_UP_ARG {
+        const c = nodeAt(cwIxUp[u])
+        const g = if c is Call && c.callFn >= 0 { identBoundFnDeclOf(c.callFn) } else { -1 }
+        const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { null }
+        const i = cwIxUpAux[u]
+        if gn is FuncDecl && i >= 0 && i < gn.fnParams.length {
+          ok = cbaParamRepTransparent(gn.fnParams[i], g, depth - 1)
+        }
+      }
+      if !ok { return false }
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  true
 }
 
 // Builds each fresh record literal call `ix` hands to a parameter typed by a bare type variable
