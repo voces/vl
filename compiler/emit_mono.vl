@@ -1,3 +1,5 @@
+import { recordRowClassOf } from "./record_rows"
+
 // `emit_mono.vl` — the emitter's per-callsite monomorphizer: the eager pre-pass that
 // clones a generic lifted function (explicit `<T>` params, or an un-annotated
 // inference hole the checker pins per call site) into one concrete instance per
@@ -13,11 +15,7 @@
 
 import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
-import {
-  mintCallSoleSet,
-  mintLamKeyedOf,
-  mintNestedPerEnclOf,
-} from "./check_mint"
+import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftOwnTyParamHandedBack, ftOwnTyParamSharedBack } from "./check_fn_tag"
 import {
   mkNumTyped,
@@ -56,6 +54,7 @@ import {
   fnCloCoerceTyIx,
   njSetPinFn,
   nodeRepTyIxOf,
+  recCopyTyOf,
 } from "./check_core_state"
 import {
   bindGenUnionShapedArmInto,
@@ -247,6 +246,7 @@ import {
   arenaSetNode,
   binderNameAt,
   callIsNever,
+  declNameTokOf,
   elseIfLink,
   hasNamedArgs,
   i32ToStr,
@@ -290,6 +290,7 @@ import {
   nodeContains,
   nodeIsTplHole,
   nodeSpineChildren,
+  nodeToks,
   orderArgsByParamNames,
   ovSiteSetOf,
   tsMentionsAnyName,
@@ -584,7 +585,7 @@ import {
   bundleRetParamNote,
   bundleTyNote,
 } from "./emit_bundle"
-import { repRowId, repRowOfTyStruct } from "./emit_rep"
+import { repElemTyOfName, repRowId, repRowOfTyStruct } from "./emit_rep"
 import {
   gaeAppHasNulParamListField,
   internOwnShapeOfTy,
@@ -641,6 +642,7 @@ import {
   elabKeyAtPos,
   elabLamInheritedOwn,
   elabLamParamSigs,
+  elabLamPinsUnderWalk,
   elabMakerTwinHeld,
   elabMemberKeyAt,
   elabNarrowedCarry,
@@ -1200,6 +1202,10 @@ export function monoArgPinTyIx(ix: i32, fnIx: i32) {
   // A literal the record solve built at another record banks that build, as its pin names it.
   const lb = monoLitBuiltTy(ax)
   if lb >= 0 { return lb }
+  const cpy = recCopyTyOf(ax)
+  if cpy >= 0 && cpy < T.tys.length && monoRecordNominalPin(cpy) != "" {
+    return cpy
+  }
   own
 }
 
@@ -2665,6 +2671,12 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
   // A list or record literal the record solve built at another record pins at that build (D15181).
   const lb = monoLitBuiltTy(cax)
   if lb >= 0 { return monoRecordNominalPin(lb) }
+  // A call copied where it is delivered pins at the declared record its copy lands in (D15183).
+  const cpy = recCopyTyOf(cax)
+  if cpy >= 0 && cpy < T.tys.length {
+    const cn = monoRecordNominalPin(cpy)
+    if cn != "" { return cn }
+  }
   let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
   if t < 0 { t = monoUnboundDefaultTy(nodeTyAt(cax, fnIx), fnIx) }
   if t < 0 || t >= T.tys.length { return "" }
@@ -4752,45 +4764,6 @@ function monoPinAnnSpelling(t: i32): string {
   nm
 }
 
-// Per un-keyed lambda `monoCloneLambdaSubst` shares across its encloser's instances, the binding of
-// the first instance that reaches it.
-let monoSharedLamAt: {[i32]: string} = Map()
-
-// Refuses lambda `fnIx` when a second instance of its encloser reaches it under another binding
-// while the elaboration minted it no key: its un-annotated parameters then take their types from
-// outside every instance, and the one lambda built for all of them cannot serve each (D15110).
-function monoSharedLamGuard(fnIx: i32, a: FuncDecl, tvV: string[]) {
-  if monoFnNameIsSourceNamed(a.fnName) || mintLamKeyedOf(fnIx) { return 0 }
-  // Only a parameter its checker type leaves open takes its type from outside the instances.
-  const lt = nodeTyIxOf(fnIx)
-  const lf = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
-  if !(lf is TyFunc) { return 0 }
-  let open = false
-  let i = 0
-  while i < a.fnParams.length && i < lf.fnParamTypes.length {
-    const pn = nodeAt(a.fnParams[i])
-    if pn is Param && pn.parType < 0 && tyHasTyVar(lf.fnParamTypes[i]) {
-      open = true
-    }
-    i = i + 1
-  }
-  if !open { return 0 }
-  let key = ""
-  for v in tvV { key = key + v + ";" }
-  const was = monoSharedLamAt[fnIx] ?? ""
-  if was == "" {
-    monoSharedLamAt[fnIx] = key
-    return 0
-  }
-  if was == key { return 0 }
-  emitFailAt(
-    "emitProgram: this lambda is written inside a generic function and is one value for every "
-      + "instance of it, but its parameters take a different type in each instance — annotate its "
-      + "parameters, or declare it outside the generic function",
-    fnIx,
-  )
-}
-
 // Clone the lifted lambda at `fnIx` with every type-param-mentioning parameter and return
 // annotation substituted through this instance's binding, lift the clone into `fnStmts`,
 // and return its node index — or -1 when nothing substitutes. The body is shared with the
@@ -4812,6 +4785,16 @@ function monoCloneLambdaSubst(
       bT = []
       monoJoinBinding(bN0, bT0, monoPinHoleN, monoPinHoleT, bN, bT)
     }
+    // A lambda the elaboration keyed under this instance takes that key's pins too (M5).
+    const lN: string[] = []
+    const lT: i32[] = []
+    if elabLamPinsUnderWalk(elabSrcDecl(fnIx), lN, lT) {
+      const jN: string[] = []
+      const jT: i32[] = []
+      monoJoinBinding(bN, bT, lN, lT, jN, jT)
+      bN = jN
+      bT = jT
+    }
     // A nested generic declaration carries pins of its own and is instantiated by
     // `monoInstantiate` at its own call sites; only a lambda that inherited the enclosing
     // frame's type parameters is this pass's business.
@@ -4820,16 +4803,10 @@ function monoCloneLambdaSubst(
     // correct at every pin. Returned before either ledger is touched: the prune reads them
     // to decide whether a template is still referenced, and a lambda that never became a
     // template must not appear in either.
-    if !monoLamNodeIsTemplateCore(fnIx, typarams) {
-      monoSharedLamGuard(fnIx, a, tvV)
-      return -1
-    }
+    if !monoLamNodeIsTemplateCore(fnIx, typarams) { return -1 }
     const ps: i32[] = []
     const psAny = monoLamSubstParams(a, fnIx, typarams, tvN, tvV, bN, bT, ps)
-    if psAny < 0 {
-      monoSharedLamGuard(fnIx, a, tvV)
-      return -1
-    }
+    if psAny < 0 { return -1 }
     let any = psAny > 0
     let nret = a.fnRet
     const rt = monoSubstAnnNode(a.fnRet, typarams, tvN, tvV, bN, bT)
@@ -4838,7 +4815,6 @@ function monoCloneLambdaSubst(
       any = true
     } else if rt == -2 {
       monoNoteLamNode(monoLamShared, fnIx)
-      monoSharedLamGuard(fnIx, a, tvV)
       return -1
     }
     // D943 — `any` asks whether a signature changed, and a capture-only template changes
@@ -4862,7 +4838,6 @@ function monoCloneLambdaSubst(
     }
     if !any && !capOnly && !bodyTP {
       monoNoteLamNode(monoLamShared, fnIx)
-      monoSharedLamGuard(fnIx, a, tvV)
       return -1
     }
     // An un-annotated return that rides the type parameter, annotated at the pin. The
@@ -10115,6 +10090,19 @@ function monoKeyPinSeg(
     // under the key's bindings, which already fix it; the argument's exact type and its
     // literal-union rep add nothing (D15109).
     const unionPin = pk < bound.length && bound[pk]
+    // A record pin is keyed by the row class of the record it spells (`recordRowClassOf`): records
+    // sharing a row build one instance, whatever their names or spellings.
+    const rowCls = if monoPinIsRecord(pinned[pk]) { monoPinRowClass(repElemTyOfName(pinned[pk])) } else { "" }
+    if rowCls != "" {
+      seg = seg
+        + "#row"
+        + rowCls
+        + monoSigPinDiscrim(pinned[pk], pinTys[pk])
+        + monoSetPinDiscrim(pinTys[pk])
+        + ","
+      pk = pk + 1
+      continue
+    }
     seg = seg
       + heads[pk]
       + (if unionPin { "" } else { monoAnonPinDiscrim(pinned[pk], pinTys[pk]) })
@@ -10125,6 +10113,56 @@ function monoKeyPinSeg(
     pk = pk + 1
   }
   seg
+}
+
+// Whether pin spelling `pin` names a record, or a nullable one, rather than a union a record is
+// boxed into: an anonymous shape, an anonymous row, or a declared record's name.
+function monoPinIsRecord(pin: string): boolean {
+  if pin.length == 0 { return false }
+  const base = if pin.length > 5 && pin.slice(pin.length - 5, pin.length) == "|null" { pin.slice(0, pin.length - 5) } else { pin }
+  if base.length == 0 { return false }
+  if base[0] == "{"[0] || base[0] == "#"[0] {
+    return !monoSpellingHasTopBar(base)
+  }
+  const dt = cUserTypes[base] ?? -1
+  dt >= 0 && dt < T.tys.length && tyAt(dt) is TyObj
+}
+
+// Whether spelling `s` holds a `|` outside every bracket.
+function monoSpellingHasTopBar(s: string): boolean {
+  let depth = 0
+  let i = 0
+  while i < s.length {
+    const c = s[i]
+    if c == "{"[0] || c == "("[0] || c == "["[0] || c == "<"[0] {
+      depth = depth + 1
+    }
+    if c == "}"[0] || c == ")"[0] || c == "]"[0] || c == ">"[0] {
+      depth = depth - 1
+    }
+    if c == "|"[0] && depth == 0 { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The row class a pin of closed type `t` is keyed by: a record's, or a nullable record's marked
+// `?`; "" for any other type, and for a record holding a function.
+function monoPinRowClass(t: i32): string {
+  // A record holding a function keys by the function too, since each field function is its own
+  // instance; its row does not tell two such records apart (D988).
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyMayHoldFn(t, 0) {
+    return ""
+  }
+  const ty = tyAt(t)
+  match ty {
+    TyObj => recordRowClassOf(t)
+    TyNullable => {
+      const c = if ty.nInner >= 0 && tyAt(ty.nInner) is TyObj { recordRowClassOf(ty.nInner) } else { "" }
+      if c != "" { "?" + c } else { "" }
+    }
+    TyArray | TyErr | TyFunc | TyLit | TyMap | TyNeg | TyPrim | TyUnion | TyVar => ""
+  }
 }
 
 // Per parameter of `fn`, whether its annotation is a union that names one of its type
@@ -11436,7 +11474,17 @@ function monoMakeInstanceFunc(
   const noTyParams: string[] = []
   const instRet = monoMakeInstanceRetIx(fn, origFe, nret)
   if instBody != fn.fnBody { bodyRebuiltFrom.set(instBody, fn.fnBody) }
-  mkFunc(instName, noTyParams, nps, instRet, instBody, -1)
+  const nfn = mkFunc(instName, noTyParams, nps, instRet, instBody, -1)
+  // The instance is anchored at its template's name, so a refusal raised while its body is lowered
+  // names the template, not the parser's last token (D15155). Only the anchor: a declaring-name
+  // token would rename the instance in the name section.
+  if origFe >= 0 && origFe < monoOrigNode.length {
+    const tpl = monoOrigNode[origFe]
+    adoptNodeTok(nfn, tpl)
+    const nt = declNameTokOf(tpl)
+    if nt >= 0 && nfn < nodeToks.length { nodeToks[nfn] = nt }
+  }
+  nfn
 }
 
 // Installs instance `nfn` and returns its function slot, -1 on a refusal.
@@ -28995,7 +29043,6 @@ export function monomorphize(stmts: i32[]) {
   }
   monoLamPinned = []
   monoLamShared = []
-  monoSharedLamAt = Map()
   monoNamedTmplNode = []
   monoNamedTmplSlot = []
   let any = false
