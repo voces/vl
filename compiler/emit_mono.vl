@@ -617,7 +617,9 @@ import {
   elabCallBindTy,
   elabCallBundleSigs,
   elabCallHandMember,
+  elabCallHandOwner,
   elabCallInstWant,
+  elabCallParamKey,
   elabCallParamTy,
   elabCallParamTyOwn,
   elabCallSeedBind,
@@ -23177,7 +23179,7 @@ function monoCadRowFe(site: i32, inst: i32, sig: i32): i32 {
 // Whether node `x` or one beneath it reads parameter `par` other than as the callee of a call in
 // its own function's body (`own`): handed on, stored, or read by a nested function. With `fwd`, a
 // read handed whole to a named function as a positional argument is not counted, and with `cap` a
-// call through it in a nested function at any depth is not either.
+// call through it or such a hand in a nested function at any depth is not either.
 function monoParamReadOtherThanCalled(
   x: i32,
   par: i32,
@@ -23190,7 +23192,7 @@ function monoParamReadOtherThanCalled(
   if n is Ident { return identDeclOf(x) == par }
   if n is FuncDecl {
     for k in nodeChildren(x) {
-      if monoParamReadOtherThanCalled(k, par, cap, false, cap) { return true }
+      if monoParamReadOtherThanCalled(k, par, cap, cap, cap) { return true }
     }
     return false
   }
@@ -23202,7 +23204,7 @@ function monoParamReadOtherThanCalled(
       && fwd
       && cd >= 0
       && cd < P.nodes.length
-      && nodeAt(cd) is FuncDecl
+      && (nodeAt(cd) is FuncDecl || monoConstFnCopy(cd))
     for k in nodeChildren(x) {
       const ku = unwrapParen(k)
       const handed = named
@@ -23226,6 +23228,16 @@ function monoParamReadOtherThanCalled(
   false
 }
 
+// Whether `d` is a `const` binding whose value is a read of a named function.
+function monoConstFnCopy(d: i32): boolean {
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letKw != "const" { return false }
+  const v = unwrapParen(n.letInit)
+  if v < 0 || !(nodeAt(v) is Ident) { return false }
+  const fd = identDeclOf(v)
+  fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl
+}
+
 // `monoPinHoleParam`'s bundle: where the callee's instance calls the hole lambda literal `arg`,
 // its argument `i`, at two or more signatures, builds the lambda at each and pins the parameter
 // at the anonymous record holding one closure per signature. 0, -1 on a failure, or 1 where the
@@ -23246,9 +23258,30 @@ function monoBundlePin(
   // read wants one closure.
   const fwd = fsModeOf() == FS_COMPILE
   if monoParamReadOtherThanCalled(fn.fnBody, par, true, fwd, fwd) { return 1 }
+  const at = pinTys.length
+  const rc = monoBundlePinArg(arg, i, callIx, ctx, sigs, pinned, pinTys)
+  // The record each parameter key is pinned at, read by a hand of that parameter.
+  const key = elabCallParamKey(monoCallTplOf(callIx), i)
+  if rc == 0 && key >= 0 && pinTys.length == at + 1 {
+    monoBundleKeyTys[key] = pinTys[at]
+  }
+  rc
+}
+
+// `monoBundlePin` once the callee takes a record of `sigs`: the record argument `arg` builds or
+// hands on. 0, -1 on a failure, or 1 where the argument is no bundle.
+function monoBundlePinArg(
+  arg: i32,
+  i: i32,
+  callIx: i32,
+  ctx: i32,
+  sigs: i32[],
+  pinned: string[],
+  pinTys: i32[],
+): i32 {
   const x = unwrapParen(arg)
   if x >= 0 && nodeAt(x) is Ident {
-    const fw = monoBundleHandOnPin(x, sigs, ctx, pinned, pinTys)
+    const fw = monoBundleHandOnPin(callIx, i, sigs, pinned, pinTys)
     if fw != 1 { return fw }
     return monoBundleNamedPin(x, sigs, ctx, pinned, pinTys)
   }
@@ -23290,54 +23323,31 @@ function monoBundlePin(
   0
 }
 
-// `monoBundlePin` for read `x` of the caller's own bundle parameter holding `sigs`: the record is
-// handed on as it is, so the parameter is pinned at its type. 0, or 1 where `x` reads no such
-// parameter.
+// `monoBundlePin` for call `callIx`'s argument `i` handing a parameter whole, its own or a
+// captured one, pinned at a record of `sigs`: the record is handed on as it is, so the
+// callee's parameter is pinned at its type. 0, or 1 where the argument hands no such parameter.
 function monoBundleHandOnPin(
-  x: i32,
+  callIx: i32,
+  i: i32,
   sigs: i32[],
-  ctx: i32,
   pinned: string[],
   pinTys: i32[],
 ): i32 {
   if fsModeOf() != FS_COMPILE { return 1 }
-  const d = identDeclOf(x)
-  if d < 0 || d >= P.nodes.length || ctx < 0 || ctx >= P.nodes.length {
+  const owner = elabCallHandOwner(monoCallTplOf(callIx), i)
+  const bt = if owner >= 0 { monoBundleKeyTys.get(owner) ?? -1 } else { -1 }
+  const bi = i32ListIndexOf(monoBundleTys, bt)
+  if (
+    bi < 0
+    || bi >= monoBundleTySigs.length
+    || !monoSigsSame(monoBundleTySigs[bi], sigs)
+  ) {
     return 1
   }
-  const p = nodeAt(d)
-  const fn = nodeAt(ctx)
-  if !(p is Param) || !(fn is FuncDecl) { return 1 }
-  // The read is the template's; the instance holds the parameter by name, pinned.
-  let pt = -1
-  for q in fn.fnParams {
-    const qn = nodeAt(q)
-    if qn is Param && qn.parName == p.parName && qn.parType >= 0 {
-      pt = nodeTyIxOf(qn.parType)
-    }
-  }
-  // The pin is spelled afresh in the instance by its record's row, and records listing the same
-  // signatures in another order share it, so the record is matched by row and signatures.
-  const pr = monoBundleRowOf(pt)
-  let bi = -1
-  let q = 0
-  while (
-    pr >= 0
-    && bi < 0
-    && q < monoBundleTys.length
-    && q < monoBundleTySigs.length
-  ) {
-    if (
-      monoBundleRowOf(monoBundleTys[q]) == pr
-      && monoSigsSame(monoBundleTySigs[q], sigs)
-    ) {
-      bi = q
-    }
-    q = q + 1
-  }
-  if bi < 0 || pr >= sNames.length { return 1 }
+  const pr = monoBundleRowOf(bt)
+  if pr < 0 || pr >= sNames.length { return 1 }
   pinned.push(sNames[pr])
-  pinTys.push(monoBundleTys[bi])
+  pinTys.push(bt)
   0
 }
 
@@ -28401,6 +28411,8 @@ let cadPendClones: i32[] = []
 // Each bundle record type, and beside it the closed signatures its fields hold, field `c<k>` the
 // closure at the `k`th (D14841). A record of the same shape written by hand is no bundle.
 let monoBundleTys: i32[] = []
+// The record type each elaboration parameter key is pinned at.
+let monoBundleKeyTys: {[i32]: i32} = Map()
 let monoBundleTySigs: i32[][] = []
 
 // The row's size, its conflicting writes and its unkeyed writes, for a self-check.
@@ -28427,6 +28439,7 @@ function cadRowReset() {
   cadPendRows = []
   cadPendClones = []
   monoBundleTys = []
+  monoBundleKeyTys = Map()
   monoBundleTySigs = []
   bundleReset()
   0

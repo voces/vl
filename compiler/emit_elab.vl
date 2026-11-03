@@ -2678,6 +2678,7 @@ export function elabMintFacts(): i32 {
   elabBundleSigs = Map()
   elabBundleJoinRoot = Map()
   elabHandMembers = Map()
+  elabHandOwners = Map()
   elabLamSigs = Map()
   elabLamSigInst = Map()
   elabMintSets = Map()
@@ -4190,13 +4191,13 @@ function elabBundleForwardsJoin() {
             let i = 0
             while kc >= 0 && i < n.callArgs.length && i < 64 {
               const a = parenPeelIx(n.callArgs[i])
-              const pi = if a >= 0 && nodeAt(a) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(a)) } else { -1 }
-              if pi >= 0 {
-                elabBundleUnite(up, elabBundleKey(k, pi), elabBundleKey(kc, i))
+              const ok = if a >= 0 && nodeAt(a) is Ident { elabParamOwnerKey(identDeclOf(a), k) } else { -1 }
+              if ok >= 0 {
+                elabBundleUnite(up, ok, elabBundleKey(kc, i))
                 hands.push(x)
                 hands.push(k)
                 hands.push(i)
-                hands.push(elabBundleKey(k, pi))
+                hands.push(ok)
                 hands.push(elabBundleKey(kc, i))
               }
               i = i + 1
@@ -4233,10 +4234,28 @@ function elabBundleForwardsJoin() {
       if !have { lists[at].push(t) }
     }
   }
+  // A chain a closure hands into, or a call through a copy of a function, joins only where each
+  // function its members are bound to already has an instance at every signature, as the hand is
+  // read after the instances are built.
+  const dropped: i32[] = []
+  let h = 0
+  while h + 4 < hands.length {
+    const r = elabBundleRoot(up, hands[h + 3])
+    const at = i32ListIndexOf(roots, r)
+    if (
+      (hands[h + 3] / 64 != hands[h + 1] || !elabCallsNamedFn(hands[h]))
+      && at >= 0
+      && !i32ListHas(dropped, r)
+      && !elabChainMembersBuilt(up, r, lists[at])
+    ) {
+      dropped.push(r)
+    }
+    h = h + 5
+  }
   for key in up.keys() {
     const r = elabBundleRoot(up, key)
     const at = i32ListIndexOf(roots, r)
-    if at >= 0 && lists[at].length >= 2 {
+    if at >= 0 && lists[at].length >= 2 && !i32ListHas(dropped, r) {
       elabBundleSigs[key] = lists[at].slice(0)
       elabBundleJoinRoot[key] = if setKeys[at] >= 0 { setKeys[at] } else { r }
     }
@@ -4245,11 +4264,114 @@ function elabBundleForwardsJoin() {
   0
 }
 
+// Whether call `c`'s callee is a read of a named function.
+function elabCallsNamedFn(c: i32): boolean {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return false }
+  const cf = parenPeelIx(cn.callFn)
+  const d = if cf >= 0 && nodeAt(cf) is Ident { identDeclOf(cf) } else { -1 }
+  d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl
+}
+
+// Whether every function each key of the chain rooted at `r` in `up` binds its parameter to, or
+// is handed there by a call, has an instance at each of `sigs`.
+function elabChainMembersBuilt(
+  up: Map<i32, i32>,
+  r: i32,
+  sigs: i32[],
+): boolean {
+  const ks: i32[] = []
+  for key in up.keys() {
+    if elabBundleRoot(up, key) == r {
+      if !elabKeyMembersBuilt(key, sigs) { return false }
+      ks.push(key)
+    }
+  }
+  for c in elabCallKeys.keys() {
+    const row = elabCallKeys[c] ?? []
+    let j = 0
+    while j + 1 < row.length {
+      if !elabCallArgsBuilt(c, row[j + 1], ks, sigs) { return false }
+      j = j + 2
+    }
+  }
+  true
+}
+
+// Whether call `c` into instance `kc` hands, at each parameter whose key is in `ks`, a lambda or
+// named function with an instance at each of `sigs`; a parameter it hands is the chain's own.
+function elabCallArgsBuilt(c: i32, kc: i32, ks: i32[], sigs: i32[]): boolean {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return true }
+  let i = 0
+  while i < cn.callArgs.length && i < 64 {
+    if i32ListHas(ks, elabBundleKey(kc, i)) {
+      const a = parenPeelIx(cn.callArgs[i])
+      const d = if a >= 0 && nodeAt(a) is Ident { identDeclOf(a) } else { a }
+      if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
+        for t in sigs {
+          const f = tyAt(t)
+          if !(f is TyFunc) || elabMemberKeyAt(d, f.fnParamTypes) < 0 {
+            return false
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether every function parameter key `key`'s instance binds the parameter to has an instance at
+// each of `sigs`.
+function elabKeyMembersBuilt(key: i32, sigs: i32[]): boolean {
+  const k = key / 64
+  const i = key % 64
+  if k < 0 || k >= ekDecl.length { return false }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || i >= dn.fnParams.length { return false }
+  const ds = elabFnSetOf(
+    substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k]),
+  )
+  for d in ds {
+    for t in sigs {
+      const f = tyAt(t)
+      if !(f is TyFunc) || elabMemberKeyAt(d, f.fnParamTypes) < 0 {
+        return false
+      }
+    }
+  }
+  true
+}
+
+// The parameter key of declaration `d` as instance `k` reads it: `k`'s own parameter, else that
+// of the enclosing instance whose function declares it; -1 where `d` is no such parameter.
+function elabParamOwnerKey(d: i32, k: i32): i32 {
+  let a = k
+  let guard = 0
+  while a >= 0 && a < ekDecl.length && guard < 64 {
+    const dn = nodeAt(ekDecl[a])
+    if dn is FuncDecl {
+      const pi = i32ListIndexOf(dn.fnParams, d)
+      if pi >= 0 { return if pi < 64 { elabBundleKey(a, pi) } else { -1 } }
+    }
+    a = ekParent[a]
+    guard = guard + 1
+  }
+  -1
+}
+
 // For each hand of a record to a parameter bound to one closed function type, the record member
-// whose signature that type is, or -1 where none is.
+// whose signature that type is, or -1 where none is; for every hand, the key of the parameter it
+// reads.
 function elabHandMembersNote(hands: i32[]) {
   let h = 0
   while h + 4 < hands.length {
+    const orow = elabHandOwners.get(hands[h]) ?? []
+    orow.push(hands[h + 1])
+    orow.push(hands[h + 2])
+    orow.push(hands[h + 3])
+    elabHandOwners[hands[h]] = orow
     const rec = elabBundleSigs.get(hands[h + 3]) ?? []
     const t = elabBundleKeyClosedFn(hands[h + 4])
     if rec.length >= 2 && t >= 0 {
@@ -4272,19 +4394,39 @@ function elabHandMembersNote(hands: i32[]) {
 
 // Per call, triples of the instance, the argument and the member `elabHandMembersNote` chose.
 let elabHandMembers: {[i32]: i32[]} = Map()
+// Per call, triples of the instance, the argument and the key of the parameter it hands.
+let elabHandOwners: {[i32]: i32[]} = Map()
 
-// The record member call `ix`'s argument `i`, under the instance being walked, hands to a
-// parameter bound to one closure: its index, -1 where the record holds no member at that
-// parameter's type, -2 where the argument is no such hand.
-export function elabCallHandMember(ix: i32, i: i32): i32 {
+// The key of the parameter call `ix`'s argument `i` hands whole, under the instance being walked:
+// the caller's own parameter or a captured one; -1 where the argument hands none.
+export function elabCallHandOwner(ix: i32, i: i32): i32 {
+  elabTripleUnderWalk(elabHandOwners.get(ix) ?? [], i, -1)
+}
+
+// The key the instance being walked passes to call `ix`'s argument `i` as the callee's
+// parameter, or -1.
+export function elabCallParamKey(ix: i32, i: i32): i32 {
   const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
-  const row = elabHandMembers.get(ix) ?? []
+  const k = elabCallInstFrom(ix, from)
+  if k < 0 || i < 0 || i >= 64 { -1 } else { elabBundleKey(k, i) }
+}
+
+// The value `row`'s triple for the instance being walked and argument `i` holds, else `none`.
+function elabTripleUnderWalk(row: i32[], i: i32, none: i32): i32 {
+  const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
   let j = 0
   while j + 2 < row.length {
     if row[j] == from && row[j + 1] == i { return row[j + 2] }
     j = j + 3
   }
-  -2
+  none
+}
+
+// The record member call `ix`'s argument `i`, under the instance being walked, hands to a
+// parameter bound to one closure: its index, -1 where the record holds no member at that
+// parameter's type, -2 where the argument is no such hand.
+export function elabCallHandMember(ix: i32, i: i32): i32 {
+  elabTripleUnderWalk(elabHandMembers.get(ix) ?? [], i, -2)
 }
 
 // Each parameter key `elabBundleForwardsJoin` gave a joined list, and the chain member whose set
