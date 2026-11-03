@@ -58,22 +58,27 @@ const errorBlock = (out: string): string => {
   return lines.slice(start, end).join("\n");
 };
 
-// A BODY-phase refusal at a top-level statement: reading a map that holds functions of two
-// result types by index has no value box (D15139), and the refusal is anchored at the read on
-// line 6. The collect phase has no positioned refusal a check-clean program reaches: the last one
-// ran (D15098), and D15150's refusal is raised there with no position at all (D15154). When D15154
-// is fixed, D15150's witness is the collect-phase case again.
-const BODY_WITNESS = `function inc0(a) { return a + 1 }
-function half(a) { return a / 2.0 }
-const m = Map()
-m.set("a", inc0)
-m.set("b", half)
-const g = m["b"]
-if g != null { print(g(3)) }
+// A BODY-phase refusal: a function returning a parameter it calls at two signatures, called
+// where its result is used at one of them (D15144), anchored at that call on line 7. The collect
+// phase has no positioned refusal a check-clean program reaches: the last one ran (D15098), and
+// D15150's refusal is raised there with no position at all (D15154). When D15154 is fixed,
+// D15150's witness is the collect-phase case again.
+const BODY_WITNESS = `function lap(f) {
+  print(f(2.5))
+  print(f(3))
+  return f
+}
+function go(k: i32) {
+  const r = lap((a) => a + k)
+  print(r(4))
+  print(r(1.5))
+}
+go(1)
 `;
 
 Deno.test({
-  name: "vl-emit-diag-position: a top-level emit refusal carries file:line:col",
+  name:
+    "vl-emit-diag-position: a function body's emit refusal carries file:line:col",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_emit_pos_" });
@@ -93,10 +98,10 @@ Deno.test({
           `expected the emit refusal to carry body.vl:<line>:<col>, got:\n${blk}`,
         );
       }
-      // The anchor is the refused read on line 6, not the last statement in the file.
-      if (!/at \S*body\.vl:6:\d+/.test(blk)) {
+      // The anchor is the refused call on line 7, not the last statement in the file.
+      if (!/at \S*body\.vl:7:\d+/.test(blk)) {
         throw new Error(
-          `expected the anchor on line 6 (the refused read), got:\n${blk}`,
+          `expected the anchor on line 7 (the refused call), got:\n${blk}`,
         );
       }
     } finally {
@@ -112,7 +117,7 @@ Deno.test({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_emit_mod_" });
     try {
-      // `lib.vl` carries the same refusal, on its own line 6. `main.vl` is two lines, so a
+      // `lib.vl` carries the same refusal, on its own line 7. `main.vl` is two lines, so a
       // merged-module line would land past the end of the file it names — the shape the
       // reporter bisected the wrong file for.
       await Deno.writeTextFile(
