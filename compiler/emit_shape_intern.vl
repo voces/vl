@@ -11,7 +11,9 @@ import {
 import {
   TyArray,
   TyNullable,
+  TyObj,
   TyVar,
+  structNameOfTy,
   tyAt,
   tyFieldTyOf,
   tyIsFuncArena,
@@ -28,6 +30,7 @@ import {
   sIsAnonRow,
   sScanLim,
   structIndexByName,
+  structIndexOfTy,
   structTyIxAlias,
   structTyMarkAliasable,
 } from "./emit_atom_kinds"
@@ -76,6 +79,7 @@ import {
   repCanonId,
   repRowId,
   repRowOfTyStruct,
+  repSlotOfTy,
   sTyIxOfName,
   sTyIxOfNameTy,
   unRowOfCanonFolded,
@@ -101,7 +105,9 @@ import {
   refArrShapeKind,
   shapeFieldElemName,
   tyIsNestedScalarLeafArray,
+  tyRegGenNow,
 } from "./emit_shape_rows"
+import { memoKeyNew, memoMoved } from "./memo"
 import {
   FC_F32,
   FC_F32_LIST,
@@ -826,6 +832,104 @@ export function internInlineShapeFieldsTy(
   iisAns
 }
 
+// The mint itself, keyed on the variant ROW: a declared field type reaches it by name, an
+// anonymous literal's field value by the shape of the value (`repVariantShapeRowOf`). Returns
+// the row minted, or -1; an arm already being minted is not minted again.
+export function internArmShapeRow(vi: i32): i32 {
+  if vi < 0 { return -1 }
+  if vi >= uVarTyIx.length { return -1 }
+  const aty = uVarTyIx[vi]
+  if aty < 0 { return -1 }
+  if iasMintNameOf(vi) != "" { return -1 }
+  const gen = tyRegGenNow()
+  if memoMoved(iasKey, 0, gen) {
+    iasDone = []
+    iasRow = []
+  }
+  if vi < iasDone.length && iasDone[vi] == aty + 1 { return iasRow[vi] }
+  // D34 — no arena hint: banking `tyIx` into `sTyIx` would make `structIndexOfTy` answer this
+  // row for the arm's own node, turning off D34's decline module-wide. Found structurally
+  // instead; the arm's type reaches only its fields' element names.
+  let spell = armMintRenderOf(aty)
+  if spell == "" { spell = tyToEmitName(aty) }
+  const nm = armMintShapeName(spell)
+  iasMintVi.push(vi)
+  iasMintNm.push(nm)
+  iasMintDepth.push(iisBusy + 1)
+  const r = internInlineShapeFieldsTy(nm, -1, aty)
+  iasMintVi.pop()
+  iasMintNm.pop()
+  iasMintDepth.pop()
+  if tyRegGenNow() == gen {
+    while iasDone.length <= vi {
+      iasDone.push(0)
+      iasRow.push(-1)
+    }
+    iasDone[vi] = aty + 1
+    iasRow[vi] = r
+  }
+  r
+}
+
+// The arms being minted, innermost last: variant row, the name its row is pushed under, and the
+// intern depth that row's own fields are coded at.
+const iasMintVi: i32[] = []
+const iasMintNm: string[] = []
+const iasMintDepth: i32[] = []
+
+// The name arm `vi`'s row is being minted under, or "" when it is not being minted.
+function iasMintNameOf(vi: i32): string {
+  let k = 0
+  while k < iasMintVi.length {
+    if iasMintVi[k] == vi { return iasMintNm[k] }
+    k = k + 1
+  }
+  ""
+}
+
+// The intern depth the innermost arm mint codes its own fields at, or -1 outside a mint.
+function iasMintTopDepth(): i32 {
+  const n = iasMintDepth.length
+  if n == 0 { return -1 }
+  iasMintDepth[n - 1]
+}
+
+// The arm rows `internArmShapeRow` minted, by variant row: the arm type plus one, and the row
+// (-1 for none); valid while the type-registry generation `iasKey` last read holds.
+const iasKey = memoKeyNew(1)
+let iasDone: i32[] = []
+let iasRow: i32[] = []
+
+// The spelling an arm's row is minted from: its fields by their declared record names when every
+// field is a declared record with its own row, which is the row the full render's nested intern
+// lands on, so the key and the row agree; otherwise "", and the caller renders it whole (D2780).
+function armMintRenderOf(aty: i32): string {
+  const t = tyAt(aty)
+  if t is TyObj {
+    let out = "{"
+    let fi = 0
+    while fi < t.objFieldNames.length {
+      const fnm = armMintFieldName(t.objFieldTypes[fi])
+      if fnm == "" { return "" }
+      if fi > 0 { out = out + "," }
+      out = out + t.objFieldNames[fi] + ":" + fnm
+      fi = fi + 1
+    }
+    return out + "}"
+  }
+  ""
+}
+
+// The declared name of record field type `ft` when that declaration owns the row its type
+// resolves to, else "".
+function armMintFieldName(ft: i32): string {
+  const nm = structNameOfTy(ft)
+  if nm == "" { return "" }
+  const si = structIndexOfTy(ft)
+  if si < 0 || repSlotOfTy(ft) != si { return "" }
+  nm
+}
+
 // The memo: a depth, so its entries clear when the outermost intern returns and nothing
 // survives into a later pass; the sid-keyed answer beside the type hint it is computed with;
 // and the sids written since, which the clear walks. Both answer columns store `+ 2`, so the
@@ -1052,6 +1156,26 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       if fc == FC_STRUCT {
         const armRow = armFieldStructRow(nonNulBaseOf(ftxt))
         if armRow >= 0 { ftxt = sNames[armRow] }
+      }
+      // A field naming an arm with no row yet, inside an arm mint: an arm still being minted is
+      // pointed at by the name its row is pushed under, at any depth, and the mint's own field
+      // naming any other arm mints that arm first, so a cycle of arms closes (D15095).
+      if iasMintTopDepth() >= 0 {
+        const xb = nonNulBaseOf(ftxt)
+        const xv = variantIndexOf(xb)
+        if xv >= 0 && (fc < 0 || fc == FC_STRUCT) && armFieldStructRow(xb) < 0 {
+          const inFlight = iasMintNameOf(xv)
+          if inFlight != "" {
+            fc = FC_STRUCT
+            ftxt = inFlight
+          } else if iasMintTopDepth() == iisBusy {
+            const xr = internArmShapeRow(xv)
+            if xr >= 0 {
+              fc = FC_STRUCT
+              ftxt = sNames[xr]
+            }
+          }
+        }
       }
       if fc < 0 { ok = false }
       names.push(rawNames[fi])
