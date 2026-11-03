@@ -4320,6 +4320,8 @@ let elabResThrough: {[i32]: i32[]} = Map()
 let elabResCalleeOf: {[i32]: i32} = Map()
 let elabResStmt: {[i32]: boolean} = Map()
 let elabResArgOf: {[i32]: i32[]} = Map()
+// Per binding, the (call, argument index) pairs that hand its read on whole.
+let elabResHands: {[i32]: i32[]} = Map()
 // Per call, the member of the record its callee returns that the call's value is used as (-1
 // for a value dropped); per holder binding, that member's function type.
 let elabResMembers: {[i32]: i32} = Map()
@@ -4333,6 +4335,7 @@ function elabResultScanReset() {
   elabResCalleeOf = Map()
   elabResStmt = Map()
   elabResArgOf = Map()
+  elabResHands = Map()
   elabArgRecs = Map()
   elabResMembers = Map()
   elabResHolderTys = Map()
@@ -4389,6 +4392,13 @@ function elabResScanCall(g: i32) {
     while i < n.callArgs.length {
       const a = parenPeelIx(n.callArgs[i])
       if a >= 0 && nodeAt(a) is Call { elabResArgOf[a] = [g, i] }
+      if a >= 0 && nodeAt(a) is Ident {
+        const ad = identDeclOf(a)
+        const hs = elabResHands.get(ad) ?? []
+        hs.push(g)
+        hs.push(i)
+        elabResHands[ad] = hs
+      }
       i = i + 1
     }
   }
@@ -4457,11 +4467,12 @@ function elabHolderRecordNote(c: i32, from: i32, kc: i32) {
   const rec = elabReturnedBundleSigs(kc)
   if rec.length < 2 { return 0 }
   const through = elabResThrough.get(h) ?? []
-  if through.length == 0 || through.length != (elabResReads.get(h) ?? 0) {
+  const hands = elabResHands.get(h) ?? []
+  if through.length + hands.length / 2 != (elabResReads.get(h) ?? 0) {
     return 0
   }
   const ms: i32[] = []
-  let two = false
+  let two = hands.length > 0
   for t in through {
     const m = elabCallSigMember(t, rec)
     if m < 0 { return 0 }
@@ -4469,15 +4480,66 @@ function elabHolderRecordNote(c: i32, from: i32, kc: i32) {
     ms.push(m)
   }
   if !two { return 0 }
+  // Each hand goes to a parameter its instance calls at the record's signatures.
+  let j = 0
+  while j + 1 < hands.length {
+    const whole = elabHandTakesRecord(hands[j], hands[j + 1], from, rec)
+    if !whole && elabHandMemberOf(hands[j], hands[j + 1], from, rec) < 0 {
+      return 0
+    }
+    j = j + 2
+  }
   elabRecTable.push(rec)
-  elabTriplePut(elabHolderRecs, h, from, elabRecTable.length - 1)
+  const at = elabRecTable.length - 1
+  elabTriplePut(elabHolderRecs, h, from, at)
   elabTriplePut(elabResKeeps, c, from, 1)
   let i = 0
   while i < through.length {
     elabTriplePut(elabThroughMembers, through[i], from, ms[i])
     i = i + 1
   }
+  j = 0
+  while j + 1 < hands.length {
+    const hm = elabHandMemberOf(hands[j], hands[j + 1], from, rec)
+    if hm >= 0 {
+      const row = elabHandMembers.get(hands[j]) ?? []
+      row.push(from)
+      row.push(hands[j + 1])
+      row.push(hm)
+      elabHandMembers[hands[j]] = row
+    } else {
+      elabTriplePut(elabArgRecs, hands[j] * 64 + hands[j + 1], from, at)
+    }
+    j = j + 2
+  }
   0
+}
+
+// The member of record `rec` call `x` from instance `from` hands at argument `i` to a parameter
+// bound to one closed function type, or -1 where the parameter is no such one.
+function elabHandMemberOf(x: i32, i: i32, from: i32, rec: i32[]): i32 {
+  const ko = elabCallInstFrom(x, from)
+  if ko < 0 || i >= 64 { return -1 }
+  if (elabBundleSigs.get(elabBundleKey(ko, i)) ?? []).length >= 2 { return -1 }
+  const t = elabBundleKeyClosedFn(elabBundleKey(ko, i))
+  if t < 0 { return -1 }
+  let j = 0
+  while j < rec.length {
+    if tySame(rec[j], t) { return j }
+    j = j + 1
+  }
+  -1
+}
+
+// Whether call `x` from instance `from` takes record `rec` whole at argument `i`: the callee
+// instance calls that parameter at exactly the record's signatures, whose order it then takes.
+function elabHandTakesRecord(x: i32, i: i32, from: i32, rec: i32[]): boolean {
+  const ko = elabCallInstFrom(x, from)
+  if ko < 0 || i >= 64 { return false }
+  const want = elabBundleSigs.get(elabBundleKey(ko, i)) ?? []
+  if !elabSigsPermute(want, rec) { return false }
+  elabBundleSigs[elabBundleKey(ko, i)] = rec.slice(0)
+  true
 }
 
 // For call `c` from instance `from` into instance `kc` returning a record, handed as an
