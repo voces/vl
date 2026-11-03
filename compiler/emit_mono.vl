@@ -10948,6 +10948,8 @@ type MonoInstKey = {
   argLit: boolean[],
   pinAt: i32,
   pinEnd: i32,
+  extraAt: i32,
+  extraEnd: i32,
 }
 
 // The key of `fn`'s instance at these pins, taking over the staged explicit bindings.
@@ -10969,6 +10971,8 @@ function monoMakeInstanceKeyOf(
   const outerT: i32[] = []
   monoEnclosingPinRow(origFe, callFrame, fn.fnTyParams, outerN, outerT)
   monoCurHasLam = monoFnDeclaresLambda(origFe)
+  const extraAt = i32ToStr(origFe).length + 1
+  const extraEnd = extraAt + monoKeyExtra.length
   let key = monoMakeInstanceKeyHead(origFe, callFrame)
   const exBN = monoExplicitBN
   const exBT = monoExplicitBT
@@ -11005,6 +11009,8 @@ function monoMakeInstanceKeyOf(
     argLit: argLit,
     pinAt: pinAt,
     pinEnd: pinEnd,
+    extraAt: extraAt,
+    extraEnd: extraEnd,
   }
   k
 }
@@ -11013,6 +11019,7 @@ function monoMakeInstanceKeyOf(
 // clone resolved it to, so two spellings of one type (`i32|string`, `string|i32`) share an
 // instance. A pin with no resolved type keeps its spelling.
 function monoTypedInstKey(
+  origFe: i32,
   k: MonoInstKey,
   pinned: string[],
   pinKinds: i32[],
@@ -11043,7 +11050,119 @@ function monoTypedInstKey(
     pk = pk + 1
   }
   const seg = monoKeyPinSeg(heads, pinned, pinTys)
-  k.key.slice(0, k.pinAt) + seg + k.key.slice(k.pinEnd, k.key.length)
+  const fd = nodeAt(monoOrigNode[origFe])
+  if !(fd is FuncDecl) {
+    return k.key.slice(0, k.pinAt) + seg + k.key.slice(k.pinEnd, k.key.length)
+  }
+  k.key.slice(0, k.extraAt)
+    + monoTypedExtra(k, fd, pinnedTyIx)
+    + k.key.slice(k.extraEnd, k.pinAt)
+    + seg
+    + monoTypedTail(k, fd, pinnedTyIx)
+}
+
+// The canonical type a pinned parameter annotated `tp` or `tp[]` resolves `tp` to, else "":
+// the binding the pins already name.
+function monoPinnedTyParamCanon(
+  fd: FuncDecl,
+  tp: string,
+  pinnedTyIx: i32[],
+): string {
+  let i = 0
+  while i < fd.fnParams.length && i < pinnedTyIx.length {
+    const p = nodeAt(fd.fnParams[i])
+    if p is Param && p.parType >= 0 && pinnedTyIx[i] >= 0 {
+      const tn = nodeAt(p.parType)
+      if tn is TypeRef && tn.tyName == tp {
+        return tyCanonKey(pinnedTyIx[i], TY_WALK_DEPTH)
+      }
+      if (
+        tn is TypeRef
+        && tn.tyName == tp + "[]"
+        && tyAt(pinnedTyIx[i]) is TyArray
+      ) {
+        return tyCanonKey(tyArrayElemIx(pinnedTyIx[i]), TY_WALK_DEPTH)
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The key's explicit and defaulted bindings, each by its canonical type, leaving out one the
+// pins already name, so `f<i32>(x)` and `f(x)` at an `i32` pin share an instance; the text as
+// spelled where a binding has no type.
+function monoTypedExtra(
+  k: MonoInstKey,
+  fd: FuncDecl,
+  pinnedTyIx: i32[],
+): string {
+  const text = k.key.slice(k.extraAt, k.extraEnd)
+  let n = 0
+  for ch in text {
+    if ch == ';' { n = n + 1 }
+  }
+  if n != k.exBN.length { return text }
+  let out = ""
+  let i = 0
+  while i < k.exBN.length {
+    const c = tyCanonKey(k.exBT[i], TY_WALK_DEPTH)
+    if (
+      monoPinnedTyParamCanon(fd, k.exBN[i], pinnedTyIx) != c
+      && monoKeyExactCanon(k, k.exBN[i]) != c
+    ) {
+      out = out + k.exBN[i] + "=" + c + ";"
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The canonical type the key's exact-type binding (`~tp=t;`) names for `tp`, else "".
+function monoKeyExactCanon(k: MonoInstKey, tp: string): string {
+  const tail = k.key.slice(k.pinEnd, k.key.length)
+  const want = "~" + tp + "="
+  let i = 0
+  while i + want.length <= tail.length {
+    if tail.slice(i, i + want.length) == want {
+      let j = i + want.length
+      while j < tail.length && tail[j] != ';' { j = j + 1 }
+      return tail.slice(i + want.length, j)
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The key's text past its pins, leaving out an exact-type binding (`~tp=t;`) that names the
+// binding the pins already give `tp`.
+function monoTypedTail(
+  k: MonoInstKey,
+  fd: FuncDecl,
+  pinnedTyIx: i32[],
+): string {
+  const tail = k.key.slice(k.pinEnd, k.key.length)
+  let out = ""
+  let i = 0
+  while i < tail.length {
+    if tail[i] == '~' {
+      let j = i + 1
+      while j < tail.length && tail[j] != ';' { j = j + 1 }
+      const seg = tail.slice(i + 1, j)
+      let eq = 0
+      while eq < seg.length && seg[eq] != '=' { eq = eq + 1 }
+      const tp = seg.slice(0, eq)
+      const t = seg.slice(eq + 1, seg.length)
+      if eq >= seg.length || monoPinnedTyParamCanon(fd, tp, pinnedTyIx) != t {
+        out = out + tail.slice(i, j + 1)
+      }
+      i = j + 1
+    } else {
+      out = out + tail.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
 }
 
 // `t` when `pin` is a `=>` pin and `t` is the closed function type its key names, else -1.
@@ -11246,7 +11365,14 @@ function monoMakeInstanceGo(
     }
     // A spelling missed but the resolved pin types name an instance already minted: reuse it,
     // dropping the clone's staged writes.
-    const typedKey = monoTypedInstKey(k, pinned, pinKinds, pinTys, pinnedTyIx)
+    const typedKey = monoTypedInstKey(
+      origFe,
+      k,
+      pinned,
+      pinKinds,
+      pinTys,
+      pinnedTyIx,
+    )
     const typedHit = monoTypedKeys.get(typedKey) ?? ""
     if (
       typedHit != ""
