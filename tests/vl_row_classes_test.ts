@@ -312,17 +312,35 @@ Deno.test({
 });
 
 Deno.test({
-  name:
-    "row classes: D15152, a field-order pair shares a row but keys apart today",
+  name: "row classes: a field-order pair is one class",
   ignore: !assertSeed(),
   fn: () => {
     const d = dump(
       'type PA = { a: i32, b: string }\ntype PB = { b: string, a: i32 }\nconst pa: PA = { a: 1, b: "x" }\n' +
         'const pb: PB = { b: "y", a: 2 }\nprint(pa.a + pb.a)\n',
     );
-    if (classOf(d, "PA") === classOf(d, "PB")) {
+    if (classOf(d, "PA") !== classOf(d, "PB")) {
       throw new Error(
-        "PA and PB now share a class: D15152's field-order case is closed, so update this case and the row",
+        `want PA and PB one class, got ${classOf(d, "PA")} vs ${
+          classOf(d, "PB")
+        }`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "row classes: D15152, arms one union lays out at one row key apart today",
+  ignore: !assertSeed(),
+  fn: () => {
+    const d = dump(
+      'type K = "circle" | "round"\ntype A = { kind: K, r: i32 }\ntype B = { kind: string, r: i32 }\n' +
+        'type U = A | B\nconst a: A = { kind: "circle", r: 2 }\nconst u: U = a\nif u is A { print(u.r) }\n',
+    );
+    if (classOf(d, "A") === classOf(d, "B")) {
+      throw new Error(
+        "A and B now share a class: D15152's membership re-lay is folded in, so update this case and the row",
       );
     }
   },
