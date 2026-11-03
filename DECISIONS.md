@@ -11391,6 +11391,12 @@ values of different width printed `false`, and `(i32 | null) == f64` was refused
 `(i64 | null) == i32` ran. A float literal against a union whose only float arm is `f32` is
 still built at that arm; an `f64` value is compared at `f64`.
 
+The same relation holds element by element between two lists stored apart (D15055): `i32[] ==
+f64[]`, `(i32 | null)[] == i32[]` and `(i32 | null)[] == (f64 | null)[]` compare each pair by
+value, and `(P | null)[] == P[]` compares records field-wise with a null unequal to a record.
+One loop reads each operand at its own storage, so neither list is converted. A lossy pair
+(`i64[] == f64[]`) is refused as `i64 == f64` is.
+
 ## A record wider than a union arm is that arm's subtype, not a copy of it (2026-11-02)
 
 A record value whose fields begin with one union arm's fields (same names, same storage, in the
