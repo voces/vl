@@ -33,11 +33,15 @@ const dump = (src: string): Dump => {
   const types = new Map<string, { row: number; variant: number }>();
   const armTwins: number[] = [];
   for (const line of text.split("\n")) {
-    const row = /^row (\d+) (\S+) decl=(\d) codes=(\S*)$/.exec(line);
-    if (row) rows[Number(row[1])] = `${row[2]} decl=${row[3]} codes=${row[4]}`;
-    const arm = /^arm (\d+) (\S+) twin=(-?\d+) codes=(\S*)$/.exec(line);
+    const row = /^row (\d+) (\S+) decl=(\d) heap=(-?\d+) codes=(\S*)$/.exec(
+      line,
+    );
+    if (row) rows[Number(row[1])] = `${row[2]} decl=${row[3]} codes=${row[5]}`;
+    const arm = /^arm (\d+) (\S+) twin=(-?\d+) heap=(-?\d+) codes=(\S*)$/.exec(
+      line,
+    );
     if (arm) {
-      arms.set(arm[2], { twin: Number(arm[3]), codes: arm[4] });
+      arms.set(arm[2], { twin: Number(arm[3]), codes: arm[5] });
       armTwins[Number(arm[1])] = Number(arm[3]);
     }
     const ty = /^type (\S+) row=(-?\d+) variant=(-?\d+)$/.exec(line);
