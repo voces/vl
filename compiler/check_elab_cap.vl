@@ -5,11 +5,16 @@
 import { decDigitsOf } from "./strutil"
 import { parenPeelIx } from "./check_places"
 import {
+  CW_OCC_USE,
+  CW_UP_ELEM,
   cwBindingOf,
   cwFnValueDeclOf,
   cwFnValueTargets,
   cwFramedNode,
+  cwIxKind,
+  cwIxNode,
   cwIxUp,
+  cwIxUpKind,
   cwKeyOfDecl,
   cwKeyOfRoot,
   cwLetCalledFnTargets,
@@ -18,6 +23,8 @@ import {
   cwLetSlotFnTargets,
   cwListElemFnTargets,
   cwListElemWriteFnTargets,
+  cwOccNext,
+  cwOccWalk,
   cwParamArgs,
   cwSlotPath,
   cwSlotWrittenValues,
@@ -1072,11 +1079,11 @@ export function elabSlotJoinTy(recv: i32, t: i32): i32 {
   fresh
 }
 
-// The type list field `name` of the record literal binding `bd` initialises, inferred `t`, gives
-// its reads: `t` whose element set also holds every function written into the field's elements,
-// as `elabFnListLetTy` widens a list binding, a set of generics too (D15166). `t` when
-// nothing widens it.
-export function elabFnFieldListTy(bd: i32, name: string, t: i32): i32 {
+// The type the list field at `steps` (outermost field first) of the record literal binding `bd`
+// initialises, inferred `t`, gives its reads: `t` whose element set also holds every function
+// written into the field's elements, as `elabFnListLetTy` widens a list binding, a set of
+// generics too (D15166). `t` when nothing widens it.
+export function elabFnFieldListTy(bd: i32, steps: string[], t: i32): i32 {
   if bd < 0 || t < 0 || t >= T.tys.length || i32ListHas(fnLetVeto, bd) {
     return t
   }
@@ -1090,9 +1097,12 @@ export function elabFnFieldListTy(bd: i32, name: string, t: i32): i32 {
   if s < 0 { return t }
   const vals: i32[] = []
   const ats: i32[] = []
-  if cwSlotWrittenValues(cwKeyOfDecl(bd), [name, "[]"], vals, ats) < 0 {
-    return t
-  }
+  const path: string[] = []
+  for st in steps { path.push(st) }
+  path.push("[]")
+  const name = fnFieldPathKey(steps)
+  if cwSlotWrittenValues(cwKeyOfDecl(bd), path, vals, ats) < 0 { return t }
+  if !fnFieldListedWith(bd, path, vals, ats) { return t }
   const ds: i32[] = []
   for v in vals {
     const d = cwFnValueDeclOf(v)
@@ -1119,15 +1129,67 @@ export function elabFnFieldListTy(bd: i32, name: string, t: i32): i32 {
   lt
 }
 
-// Whether `elabFnFieldListTy` widened list field `name` of record binding `bd`.
-export function elabFnFieldWidened(bd: i32, name: string): boolean {
+// Adds to `vals` what each other binding listed beside `bd` in a list literal stores at `path`,
+// so records listed together share their field's set, as a literal's elements join (D15195).
+// False when one of those is not a literal's part.
+function fnFieldListedWith(
+  bd: i32,
+  path: string[],
+  vals: i32[],
+  ats: i32[],
+): boolean {
+  const k = cwKeyOfDecl(bd)
+  if k < 0 { return true }
+  const ow = cwOccWalk(k)
+  while cwOccNext(ow) {
+    const r = ow.row
+    const u = cwIxNode[r]
+    if (
+      cwIxKind[r] == CW_OCC_USE
+      && u >= 0
+      && u < cwIxUpKind.length
+      && cwIxUpKind[u] == CW_UP_ELEM
+    ) {
+      const lit = cwIxUp[u]
+      const ln = if lit >= 0 && lit < P.nodes.length { nodeAt(lit) } else { null }
+      if ln is ArrayLit {
+        for e in ln.arrElems {
+          const pe = parenPeelIx(e)
+          if pe >= 0 && pe < P.nodes.length && pe != u && nodeAt(pe) is Ident {
+            const d = identDeclOf(pe)
+            if d >= 0 && d != bd && nodeAt(d) is LetDecl {
+              if cwSlotWrittenValues(cwKeyOfDecl(d), path, vals, ats) < 0 {
+                return false
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  true
+}
+
+// Whether `elabFnFieldListTy` widened the list field at `steps` of record binding `bd`.
+export function elabFnFieldWidened(bd: i32, steps: string[]): boolean {
   if i32ListHas(fnLetVeto, bd) { return false }
+  const name = fnFieldPathKey(steps)
   let i = 0
   while i < fnFieldWidened.length {
     if fnFieldWidened[i] == bd && fnFieldWidenedName[i] == name { return true }
     i = i + 1
   }
   false
+}
+
+// `steps` as one key, the field names joined by dots.
+function fnFieldPathKey(steps: string[]): string {
+  let k = ""
+  for st in steps {
+    if k != "" { k = k + "." }
+    k = k + st
+  }
+  k
 }
 
 // Whether `elabSlotJoinTy` joined the slot writes of container binding `bd`, an open map's

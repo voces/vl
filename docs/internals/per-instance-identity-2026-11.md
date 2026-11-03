@@ -116,6 +116,10 @@ parameter) is typed at the instance as an `i32` id, so mono falls back to the te
 Reading it in `monoTagSetAt` before the fallback is this mechanism's whole change. It is safe only
 once M1 makes the instances distinct: with a shared instance it reads one key's set for both.
 
+### The composite-pin slices: mono re-deriving elaboration facts
+
+The four slices planned as a composite-pin producer (D15107 classes B and G) each closed in mono, with no entry added to the elaboration key: the elaboration already held one instance, and mono split it on a fact it derived itself. A union pin keyed the argument's exact type and literal-union mark where the key's bindings fix the pin (#6061, #6085). A literal argument's spelling missed a union its type is held by (#6093). An instance was demanded at its pin's rep binding before its exact one (#6077). A record literal pinned at its own type where the elaboration stamps it at the parameter's record (D14140). Before adding a key entry for a split, look for the elaboration fact mono should read instead.
+
 ### M5. A per-instance value handed or returned out of its instance (step 2, S2a')
 
 Measured on master `b90c2ed2e`. In `closures/hole-lambda-bundle-positions.vl`, `capT<T>` hands a
@@ -166,6 +170,27 @@ the readers that still ask with no instance (`from` -1), the list S2a' empties:
 * the hole-row drain's template rows (`elabHolePinNote` outside a live re-check);
 * `elabEarlyCallRows`, `elabArgValueRows`, `elabListSigRow`, `elabSetRepRow`, `elabLamRepInstance`,
   `elabSoleRekey`, `elabEnqueueAtParams` and `elabArgResultAt`.
+
+**The twins stay, measured 2026-11-03 on master `2bb36ff5c`.** Over the 5,569 `@run` files, 121
+parentless keys of lambdas in an open encloser remain, in 45 files. Every one is covered by a parented
+key with the same pins (the probe compares the pins sorted, since one key may store them in another
+order). They are fed by four root routes that mint with no instance in hand: the template check's hole
+rows (`elabDrainHoleRows`, 150 first mints and 1,196 uses), the early arms demanded through
+`elabDemandFrom` (`elabArmEarly`), the root's set-call rows (`elabSetCallRows`), and the argument rows
+(`elabArgValueRows`, 15 mints and 21 uses). A further 208 lookups carry an instance but still reach a
+twin, because they walk a callee key that one of those routes minted with no instance. Three probes
+tried to retire the twins one route at a time:
+
+* b1, the `#from` credit at a direct callee and at a set call's members: the 208 fell to 206. The
+  credited callee key exists, but the walks that pin the lambda are of the uncredited one.
+* b2, the root's set-call rows skipped for a call in an open function's body: the 208 fell to 191,
+  plus 15 parentless mints moved to `elabOne` with an instance in hand. Byte-identical, fuel +0.12%.
+* b3, the root's whole call-bind row skipped for such a call: the table did not move, and
+  `closures/hole-fn-list-returned-read-at-two-types.vl` went from running to an emit reject.
+
+The routes are not independent: the root rows are load-bearing, and removing one moves nothing or
+loses a run. Retiring the twins is a rework of how the root seeds instances, which needs its own
+design. Until then they are the interim, at no measured cost (byte-identical, fuel +0.008%).
 
 **Controls.** D15110 and its swapped and trap variants, its non-generic twin, the same-type case,
 `generics/is-list-arm-anon-record.vl`, the 4b-i movers, the five shared-writer fixtures, the class-F
