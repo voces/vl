@@ -499,6 +499,12 @@ function declOpen(d: i32): boolean {
 // around it, -2 when an enclosing declaration whose type variables `d` reads is open and not on
 // the chain (the open enclosing instance reaches it instead).
 function elabParentFor(d: i32, from: i32): i32 {
+  elabParentForAt(d, from, true)
+}
+
+// `elabParentFor`, where `lam` says whether an anonymous lambda takes its open encloser's instance
+// as parent though it reads none of its type variables.
+function elabParentForAt(d: i32, from: i32, lam: boolean): i32 {
   let e = elabEncl.get(d) ?? -1
   let anyOpen = false
   let guard = 0
@@ -507,7 +513,16 @@ function elabParentFor(d: i32, from: i32): i32 {
     let g2 = 0
     while a >= 0 && g2 < 64 {
       if ekDecl[a] == e {
-        return if elabReadsChainOf(d, a) || anyOpen { a } else { -1 }
+        // A lambda declared in an instanced body is keyed under that instance, so each instance
+        // holds its own (per-instance-identity-2026-11.md, M3 step 2).
+        if (
+          elabReadsChainOf(d, a)
+          || anyOpen
+          || (lam && elabLamPerEncl(d) && declOpen(e))
+        ) {
+          return a
+        }
+        return -1
       }
       a = ekParent[a]
       g2 = g2 + 1
@@ -518,6 +533,26 @@ function elabParentFor(d: i32, from: i32): i32 {
   }
   if anyOpen { return 0 - 2 }
   -1
+}
+
+// Whether `d` is an anonymous lambda with an un-annotated parameter, whose key takes its encloser
+// instance as parent; a lambda with nothing to key is its template at every instance.
+function elabLamPerEncl(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  // Lifting renames a lambda `__lambda_N` after the run, and mono asks for it under that name.
+  if !(n is FuncDecl) { return false }
+  if (
+    n.fnName != ""
+    && !(n.fnName.length >= 8 && n.fnName.slice(0, 8) == "__lambda")
+  ) {
+    return false
+  }
+  for p in n.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  false
 }
 
 // Whether nested declaration `d` reads the type variable `nm` an enclosing declaration binds:
@@ -752,6 +787,12 @@ function elabDrainHoleRows() {
         }
         elabReachNote(from, k0, -1)
         elabGuessing = false
+        // A lambda pinned by the template check is also keyed under each instance of its
+        // encloser, which is where mono asks for it.
+        if from < 0 && elabLamPerEncl(d) && elabEncl.has(d) {
+          elabHoleDeferred.push(r)
+          elabHoleDeferredAt.push(0)
+        }
       }
     }
     elabHoleCur = elabHoleCur + 1
@@ -1109,6 +1150,11 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   if !elabCanon(decl, names0, tys0, names, tys) { return -1 }
   const parent = elabParentFor(decl, from)
   if parent == 0 - 2 { return -1 }
+  // The key a lambda had before it took its encloser instance stays minted beside the per-instance
+  // one, for the readers that ask with no instance in hand (per-instance-identity-2026-11.md, M5).
+  if parent >= 0 && elabParentForAt(decl, from, false) == -1 {
+    elabEnqueue(decl, names0, tys0, -1)
+  }
   const key = i32ToStr(parent) + "^" + elabKeyOf(decl, names, tys)
   const have = ekIndex[key] ?? -1
   if have >= 0 { return have }
@@ -4261,7 +4307,212 @@ function elabBundleForwardsJoin() {
     }
   }
   elabHandMembersNote(hands)
+  elabResultMembersNote()
   0
+}
+
+// What `elabResultMembersNote` reads, banked by the elaboration's one pass over the arena: each
+// call a `const` binding is initialised by, each binding's reads and the calls through it, each
+// call that is another call's callee, and each call that is a statement whose value is dropped.
+let elabResHolder: {[i32]: i32} = Map()
+let elabResReads: {[i32]: i32} = Map()
+let elabResThrough: {[i32]: i32[]} = Map()
+let elabResCalleeOf: {[i32]: i32} = Map()
+let elabResStmt: {[i32]: boolean} = Map()
+// Per call, the member of the record its callee returns that the call's value is used as (-1
+// for a value dropped); per holder binding, that member's function type.
+let elabResMembers: {[i32]: i32} = Map()
+let elabResHolderTys: {[i32]: i32} = Map()
+let elabResTys: {[i32]: i32} = Map()
+
+function elabResultScanReset() {
+  elabResHolder = Map()
+  elabResReads = Map()
+  elabResThrough = Map()
+  elabResCalleeOf = Map()
+  elabResStmt = Map()
+  elabResMembers = Map()
+  elabResHolderTys = Map()
+  elabResTys = Map()
+  0
+}
+
+// `elabRun`'s pass over node `g` for `elabResultMembersNote`.
+function elabResultScanAt(g: i32) {
+  elabResScanLet(g)
+  elabResScanIdent(g)
+  elabResScanCall(g)
+  elabResScanBlock(g)
+  0
+}
+
+// A `const` binding initialised by a call holds that call's value.
+function elabResScanLet(g: i32) {
+  const n = nodeAt(g)
+  if n is LetDecl && n.letKw == "const" && n.letInit >= 0 {
+    const v = parenPeelIx(n.letInit)
+    if v >= 0 && nodeAt(v) is Call { elabResHolder[v] = g }
+  }
+  0
+}
+
+// A read counts against the binding it reads.
+function elabResScanIdent(g: i32) {
+  const n = nodeAt(g)
+  if n is Ident {
+    const d = identDeclOf(g)
+    if d >= 0 { elabResReads[d] = (elabResReads.get(d) ?? 0) + 1 }
+  }
+  0
+}
+
+// A call through a binding, and a call that is another call's callee.
+function elabResScanCall(g: i32) {
+  const n = nodeAt(g)
+  if n is Call {
+    const cf = parenPeelIx(n.callFn)
+    if cf >= 0 && nodeAt(cf) is Ident {
+      const d = identDeclOf(cf)
+      const at = elabResThrough.get(d) ?? []
+      at.push(g)
+      elabResThrough[d] = at
+    }
+    if cf >= 0 && nodeAt(cf) is Call { elabResCalleeOf[cf] = g }
+  }
+  0
+}
+
+// A call that is a block's statement before its last drops its value.
+function elabResScanBlock(g: i32) {
+  const n = nodeAt(g)
+  if n is Block && n.blkStmts.length > 1 {
+    let i = 0
+    while i + 1 < n.blkStmts.length {
+      const st = parenPeelIx(n.blkStmts[i])
+      if st >= 0 && nodeAt(st) is Call { elabResStmt[st] = true }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// For each call outside every instance whose callee instance returns a parameter that holds a
+// record, the member its value is used as: dropped as a statement, called at once, or held by a
+// `const` every read of which is the callee of a call at one of the record's signatures.
+function elabResultMembersNote() {
+  for c in elabCallKeys.keys() {
+    const kc = elabCallInstFrom(c, -1)
+    const rec = if kc >= 0 { elabReturnedBundleSigs(kc) } else { [] }
+    if rec.length >= 2 {
+      let m = -2
+      if elabResStmt.get(c) ?? false { m = -1 }
+      const outer = elabResCalleeOf.get(c) ?? -1
+      if outer >= 0 { m = elabCallSigMember(outer, rec) }
+      const h = elabResHolder.get(c) ?? -1
+      if h >= 0 {
+        const through = elabResThrough.get(h) ?? []
+        if through.length > 0 && through.length == (elabResReads.get(h) ?? 0) {
+          m = elabCallSigMember(through[0], rec)
+          for t in through {
+            if elabCallSigMember(t, rec) != m { m = -2 }
+          }
+          if m >= 0 { elabResHolderTys[h] = rec[m] }
+        }
+      }
+      if m >= -1 { elabResMembers[c] = m }
+      if m >= 0 { elabResTys[c] = rec[m] }
+    }
+  }
+  0
+}
+
+// The record signatures instance `k` returns a parameter holding, whole; none where it returns
+// no such parameter.
+function elabReturnedBundleSigs(k: i32): i32[] {
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || dn.fnRet >= 0 { return [] }
+  let i = 0
+  while i < dn.fnParams.length && i < 64 {
+    const sigs = elabBundleSigs.get(elabBundleKey(k, i)) ?? []
+    if sigs.length >= 2 && elabBodyReturnsParam(dn.fnBody, dn.fnParams[i]) {
+      return sigs
+    }
+    i = i + 1
+  }
+  []
+}
+
+// Whether function body `body` returns parameter `par` whole, by `return` or as its last
+// statement; nested functions aside.
+function elabBodyReturnsParam(body: i32, par: i32): boolean {
+  if body < 0 { return false }
+  const b = nodeAt(body)
+  if b is Block && b.blkStmts.length > 0 {
+    const t = parenPeelIx(b.blkStmts[b.blkStmts.length - 1])
+    if t >= 0 && nodeAt(t) is Ident && identDeclOf(t) == par { return true }
+  }
+  elabStmtReturnsParam(body, par)
+}
+
+// Whether statement `x` holds a `return` of parameter `par`, nested functions aside.
+function elabStmtReturnsParam(x: i32, par: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is RetStmt {
+    const a = parenPeelIx(n.retArg)
+    return a >= 0 && nodeAt(a) is Ident && identDeclOf(a) == par
+  }
+  if (
+    n is Block
+    || n is IfStmt
+    || n is WhileStmt
+    || n is ForIn
+    || n is ForRange
+  ) {
+    for k in nodeChildren(x) {
+      if elabStmtReturnsParam(k, par) { return true }
+    }
+  }
+  false
+}
+
+// The index in `rec` of the signature call `c` is made at, by its arguments' closed types; -2
+// where none is.
+function elabCallSigMember(c: i32, rec: i32[]): i32 {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return -2 }
+  let j = 0
+  while j < rec.length {
+    const f = tyAt(rec[j])
+    if f is TyFunc && f.fnParamTypes.length == cn.callArgs.length {
+      let same = true
+      let i = 0
+      while i < cn.callArgs.length {
+        const a = cn.callArgs[i]
+        const et = elabNodeTy(a, -1)
+        const at = widenLitTy(if et >= 0 { et } else { nodeTyIxOf(a) })
+        if at < 0 || !tySame(at, f.fnParamTypes[i]) { same = false }
+        i = i + 1
+      }
+      if same { return j }
+    }
+    j = j + 1
+  }
+  -2
+}
+
+// The member call `c`, outside every instance, uses of the record its callee returns: its index,
+// -1 for a value dropped, -2 where the elaboration noted none.
+export function elabCallResultMember(c: i32): i32 {
+  elabResMembers.get(c) ?? -2
+}
+
+// The function type call `c`'s value is, as the member of a returned record it is used as; -1.
+export function elabCallResultTy(c: i32): i32 { elabResTys.get(c) ?? -1 }
+
+// The function type `const` binding `d` holds as one member of a returned record, or -1.
+export function elabHolderMemberTy(d: i32): i32 {
+  elabResHolderTys.get(d) ?? -1
 }
 
 // Whether call `c`'s callee is a read of a named function.
@@ -5075,10 +5326,12 @@ export function elabRun() {
   let g = 0
   const setLams: i32[] = []
   elabCalls = []
+  elabResultScanReset()
   while g < P.nodes.length {
     elabGenTy.push(nodeTyIxOf(g))
     if elabLamTakesSet(g) { setLams.push(g) }
     if nodeAt(g) is Call { elabCalls.push(g) }
+    elabResultScanAt(g)
     g = g + 1
   }
   // A value holding a kept function's result, and a literal the record solve builds at another

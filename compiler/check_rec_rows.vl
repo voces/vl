@@ -21,7 +21,6 @@ import {
   setAnnTs,
   tsToName,
 } from "./ast"
-import { nodeTyIxOf } from "./check_node_tys"
 import {
   recAdAt,
   recAdDecl,
@@ -50,6 +49,7 @@ import {
   recAdWidth,
 } from "./check_rec_adopt_rows"
 import { i32ListHas } from "./listutil"
+import { nodeTyIxOf } from "./check_node_tys"
 import {
   T,
   TY_I32,
@@ -58,6 +58,7 @@ import {
   TyMap,
   TyObj,
   TyUnion,
+  objFieldType,
   tyAt,
   tyHasInferHole,
   tyHoldsObjDeep,
@@ -208,60 +209,46 @@ export function recRepFnHas(fd: i32): boolean { (recRepFns.get(fd) ?? 0) == 1 }
 export let recOwnSrc: i32[] = []
 export function recOwnSrcSet(v: i32[]) { recOwnSrc = v }
 
-// Queue `srcExpr` (a `srcTy`) when it holds a record and could name a fresh binding or call.
+// Queue `srcExpr` (a `srcTy`) when it holds a record and could name a fresh binding or call. A list
+// or record literal queues each element or field value its own storage delivers at (D15180).
 export function recOwnPend(srcExpr: i32, srcTy: i32) {
-  if srcExpr < 0 || srcTy < 0 { return 0 }
+  recOwnPendAt(srcExpr, srcTy, false, 8)
+}
+
+// `recOwnPend`, where `part` says `srcExpr` is a literal's element or field, queued only when its
+// own type stores as `srcTy` does.
+function recOwnPendAt(srcExpr: i32, srcTy: i32, part: boolean, depth: i32) {
+  if srcExpr < 0 || srcTy < 0 || srcTy >= T.tys.length || depth <= 0 {
+    return 0
+  }
   if !tyHoldsObjDeep(srcTy) { return 0 }
   const p = cwPeelValue(srcExpr)
   if p < 0 || p >= P.nodes.length { return 0 }
   const e = nodeAt(p)
-  if e is Ident || e is Call || e is Index || e is Member || e is BinExpr {
-    recOwnSrc.push(p)
-  } else if e is ArrayLit || e is ObjLit {
-    recOwnLitPend(p, p, REC_STORE_DEPTH)
-  }
-  0
-}
-
-// The element and field values of list and record literals delivered whole, each beside the
-// outermost literal, asked only whether a read out of a built container reaches them (D15124).
-export let recOwnLitSrc: i32[] = []
-export let recOwnLitOuter: i32[] = []
-export function recOwnLitReset() {
-  recOwnLitSrc = []
-  recOwnLitOuter = []
-}
-
-// Queue the values literal `x`, nested `depth` deep in `outer`, holds.
-function recOwnLitPend(x: i32, outer: i32, depth: i32) {
-  if depth <= 0 || x < 0 || x >= P.nodes.length { return 0 }
-  const e = nodeAt(x)
-  const vs: i32[] = []
+  const st = tyAt(srcTy)
   if e is ArrayLit {
-    for v in e.arrElems { vs.push(v) }
-  } else if e is ObjLit {
-    for fx in e.objFields {
-      const fi = nodeAt(fx)
-      if fi is FieldInit { vs.push(fi.fiValue) }
+    if st is TyArray {
+      for el in e.arrElems { recOwnPendAt(el, st.aElem, true, depth - 1) }
     }
-  }
-  for v in vs {
-    const p = cwPeelValue(v)
-    const t = if p >= 0 { nodeTyIxOf(p) } else { -1 }
-    if p >= 0 && t >= 0 && tyHoldsObjDeep(t) {
-      const n = nodeAt(p)
-      if n is ArrayLit || n is ObjLit {
-        recOwnLitPend(p, outer, depth - 1)
-      } else if (
-        n is Ident
-        || n is Call
-        || n is Index
-        || n is Member
-        || n is BinExpr
-      ) {
-        recOwnLitSrc.push(p)
-        recOwnLitOuter.push(outer)
+  } else if e is ObjLit {
+    if st is TyObj {
+      for fx in e.objFields {
+        const fi = nodeAt(fx)
+        if fi is FieldInit {
+          const ft = objFieldType(st, fi.fiName)
+          if ft >= 0 { recOwnPendAt(fi.fiValue, ft, true, depth - 1) }
+        }
       }
+    }
+  } else if (
+    e is Ident
+    || e is Call
+    || e is Index
+    || e is Member
+    || e is BinExpr
+  ) {
+    if !part || fieldStorageEq(nodeTyIxOf(p), srcTy, REC_STORE_DEPTH) {
+      recOwnSrc.push(p)
     }
   }
   0

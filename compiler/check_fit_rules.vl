@@ -3,6 +3,18 @@
 // folding at a destination (`cex*`), object-shape adapters and the inferred-return joins.
 // Each answers a type or a verdict for a node the core checker has already typed.
 
+import {
+  fieldNameOf,
+  fieldTypeTextOf,
+  listElemNameOf,
+  nameIsBraceSpanEnds,
+  nameIsShapeOpen,
+  nameStripSpaces,
+  tyTopIndexOf,
+  tyTopLevelSplit,
+} from "./tyname"
+import { callBindTyOf } from "./check_bind_rows"
+import { cwFieldNameOf } from "./check_write_scan"
 import { holeLinkSiteSet } from "./check_hole_links"
 import { decDigitsOf } from "./strutil"
 import {
@@ -2042,6 +2054,113 @@ function recHeldPinnedArg(c: i32): boolean {
     j = j + 1
   }
   false
+}
+
+// The argument value `u` is, or the list or record literal argument it sits in through elements
+// and fields; -1 when `u` is neither.
+export function recArgOfReach(u: i32): i32 {
+  let x = u
+  let hops = 0
+  while x >= 0 && x < cwIxUpKind.length && hops < 16 {
+    const k = cwIxUpKind[x]
+    if k == CW_UP_ARG { return x }
+    if k != CW_UP_ELEM && k != CW_UP_FIELD { return -1 }
+    x = cwIxUp[x]
+    hops = hops + 1
+  }
+  -1
+}
+
+// The type a generic call's written type argument, or another argument holding a value no call
+// of `u`'s function produced, pins the type parameter at that `u` reaches through the path from
+// `recArgOfReach(u)`; -1 when no parameter is named there or nothing else pins it.
+export function recReachPinTy(u: i32): i32 {
+  const steps: string[] = []
+  let x = u
+  while x >= 0 && x < cwIxUpKind.length && cwIxUpKind[x] != CW_UP_ARG {
+    if cwIxUpKind[x] == CW_UP_ELEM {
+      steps.push("[]")
+    } else if cwIxUpKind[x] == CW_UP_FIELD {
+      steps.push(cwFieldNameOf(cwIxUpAux[x]))
+    } else {
+      return -1
+    }
+    if steps.length > 16 { return -1 }
+    x = cwIxUp[x]
+  }
+  if x < 0 || x >= cwIxUpKind.length { return -1 }
+  const call = cwIxUp[x]
+  const cn = nodeAt(call)
+  if !(cn is Call) || cn.callFn < 0 { return -1 }
+  const gd = identBoundFnDeclOf(cn.callFn)
+  const g = if gd >= 0 && gd < P.nodes.length { nodeAt(gd) } else { null }
+  const i = cwIxUpAux[x]
+  if !(g is FuncDecl) || i < 0 || i >= g.fnParams.length { return -1 }
+  let name = nameStripSpaces(recParamTyName(g.fnParams[i]))
+  let k = steps.length - 1
+  while k >= 0 && name != "" {
+    name = if steps[k] == "[]" { listElemNameOf(name) } else { shapeFieldTyName(name, steps[k]) }
+    k = k - 1
+  }
+  if name == "" || !strListHas(g.fnTyParams, name) { return -1 }
+  if !callHasTyArgs(call) && !recReachHeldPin(cn, g, i, x, u, name) {
+    return -1
+  }
+  callBindTyOf(call, name)
+}
+
+// Whether, besides `u` in argument `x` (at position `i`) of call `cn` to `g`, an argument to a
+// parameter mentioning `tv`, or another element of the list `x`, is a value no call of `u`'s
+// function produced.
+function recReachHeldPin(
+  cn: Call,
+  g: FuncDecl,
+  i: i32,
+  x: i32,
+  u: i32,
+  tv: string,
+): boolean {
+  const fd = recValueFnOf(u)
+  const xl = nodeAt(x)
+  if xl is ArrayLit && cwIxUp[u] == x {
+    for el in xl.arrElems {
+      if el != u && recHeldNotFrom(el, fd) { return true }
+    }
+  }
+  let j = 0
+  while j < g.fnParams.length && j < cn.callArgs.length {
+    const qn = nodeAt(g.fnParams[j])
+    if (
+      j != i
+      && qn is Param
+      && qn.parType >= 0
+      && tsMentionsAnyName(annTsOf(qn.parType), [tv])
+      && recHeldNotFrom(cn.callArgs[j], fd)
+    ) {
+      return true
+    }
+    j = j + 1
+  }
+  false
+}
+
+// The function whose call produced value `u`: its own callee, or its origin's.
+function recValueFnOf(u: i32): i32 {
+  if nodeAt(u) is Call { return recInferredFnOf(u) }
+  const o = recOriginExpr(cwPeelValue(u))
+  if o < 0 { -1 } else { recInferredFnOf(o) }
+}
+
+// The type name of field `f` in the record shape name `name` (`{f:T,g:U}`), or "" when none.
+function shapeFieldTyName(name: string, f: string): string {
+  if !nameIsShapeOpen(name) || !nameIsBraceSpanEnds(name) { return "" }
+  const parts: string[] = []
+  tyTopLevelSplit(name.slice(1, name.length - 1), 44, false, parts)
+  for p in parts {
+    const ci = tyTopIndexOf(p, 58, 0, 0)
+    if ci > 0 && fieldNameOf(p, ci) == f { return fieldTypeTextOf(p, ci) }
+  }
+  ""
 }
 
 // Whether `a` is a held value, a name or a read of one, whose origin is no call of `fd`.
