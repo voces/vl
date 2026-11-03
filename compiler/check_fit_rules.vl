@@ -1800,7 +1800,9 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   const copies: i32[] = []
+  const copyTys: i32[] = []
   for cs in recSiteCopies { copies.push(cs) }
+  for ct in recSiteCopyTys { copyTys.push(ct) }
   const via: i32[] = []
   const leaves = recFnValueOrigins(fd, via)
   if leaves.length == 0 { return false }
@@ -1848,9 +1850,12 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   // A leaf calling another such function hands the destination on to it (D8143).
   for cl in calls { recAdoptNote(cl, nodeTyIxOf(cl), dst) }
   // A held-pinned call is built at `dst` and copied to its own record where it is delivered.
-  for cp in copies {
+  let ci = 0
+  while ci < copies.length {
+    const cp = copies[ci]
     while recCopyTyIx.length <= cp { recCopyTyIx.push(-1) }
-    recCopyTyIx[cp] = own
+    recCopyTyIx[cp] = copyTys[ci]
+    ci = ci + 1
   }
   true
 }
@@ -1890,6 +1895,7 @@ function recFnReturns(fd: i32): i32[] {
 // `recNullWidened` reads back exactly, and its slots take the build (D8302).
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   recSiteCopies = []
+  recSiteCopyTys = []
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
   for s in sites {
@@ -1903,6 +1909,7 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
         return false
       }
       recSiteCopies.push(c)
+      recSiteCopyTys.push(recCopyDstOf(c, own))
       continue
     }
     const at = if mapped { -1 } else { recQueuedLandingOf(c, own, dst) }
@@ -1920,8 +1927,17 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   hasCall
 }
 
-// The held-pinned calls the last `recSitesLandAt` answer copies to their own record.
+// The held-pinned calls the last `recSitesLandAt` answer copies to their own record, and beside
+// each the record it is copied into.
 let recSiteCopies: i32[] = []
+let recSiteCopyTys: i32[] = []
+
+// The record call `c` of own type `own` is copied into: the type its pin names, which a written
+// type argument spells as a declared record, else `own` (D14818).
+function recCopyDstOf(c: i32, own: i32): i32 {
+  const pt = recReachPinTy(c)
+  if pt >= 0 && fieldStorageEq(pt, own, REC_STORE_DEPTH) { pt } else { own }
+}
 
 // Whether call `c` is a direct argument to a parameter typed `T` that another direct argument, a
 // held value, binds at a parameter typed `T` too: the instance is that value's.
@@ -2186,7 +2202,8 @@ function recSitesHeldPinned(fd: i32): boolean {
 // Note each call site in `sites` that `recRepArgOf` serves at `dst` for its callee's instance.
 function recRepArgsNote(sites: i32[], own: i32, dst: i32) {
   for s in sites {
-    if s % 2 == 0 {
+    // A copied call lands at its own record, so no argument beside it takes the build (D15183).
+    if s % 2 == 0 && !i32ListHas(recSiteCopies, s / 2) {
       let i = 0
       while i < recPendSrc.length {
         if recRepArgOf(i, s / 2, own, dst) {
