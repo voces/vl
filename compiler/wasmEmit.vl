@@ -47,6 +47,7 @@ import {
 import { fsAsk, fsAskCallee } from "./fn_split"
 import { keyHasPrefix, parenPeelIx } from "./check_places"
 import {
+  elabCallKeepsRecordAt,
   elabCallResultMember,
   elabCallResultTy,
   elabInstTyAt,
@@ -938,6 +939,7 @@ import {
   coalesceNulRefNicheOperand,
   coalesceOperandPinNonNull,
   declaredIndexAt,
+  elabKeyOfFn,
   envSlotShift,
   exactOperandTyOf,
   exprArray,
@@ -993,6 +995,9 @@ import {
   globalCellKind,
   globalCellStructIdx,
   globalLetOfRead,
+  holderCallMember,
+  holderRecordRow,
+  holderRecordSigs,
   identCellVKind,
   identIsBoundClosure,
   identIsEnvCapture,
@@ -26014,6 +26019,8 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
     // A call through a bundle reads the closure for its own signature (D14841).
     const bun = emitBundleCall(body, callIx, c, fnIx)
     if bun != 1 { return bun }
+    const hcall = emitHolderCall(body, callIx, c, fnIx)
+    if hcall != 1 { return hcall }
     // Evaluate the closure once into the call-ref scratch local (`callRefNestSlot`).
     if emitExpr(body, c.callFn, fnIx) < 0 { return -1 }
     // A NULLABLE function value (`fn | null`, kind 19) loads as `(ref null $cloStruct)`;
@@ -26303,6 +26310,31 @@ function emitBundleCall(body: u8[], callIx: i32, c: Call, fnIx: i32): i32 {
   const crSlot = callRefNestSlot(callRefDepth)
   fbLocalSet(crSlot)
   emitCallRefAt(body, callIx, c, fnIx, sigKeyOfTy(sigs[k]), crDepth, crSlot)
+}
+
+// A call through a `const` holding a returned record whole: the member the elaboration noted
+// for this call, called at its signature (D15144). 1 where the callee is no such holder.
+function emitHolderCall(body: u8[], callIx: i32, c: Call, fnIx: i32): i32 {
+  const cfx = unwrapParen(c.callFn)
+  if cfx < 0 || !(nodeAt(cfx) is Ident) { return 1 }
+  const d = identDeclOf(cfx)
+  const sigs = holderRecordSigs(d, fnIx)
+  if sigs.length == 0 { return 1 }
+  const m = holderCallMember(callIx, fnIx)
+  const si = holderRecordRow(d, fnIx)
+  const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
+  if m >= sigs.length || fi < 0 || si < 0 || si >= sHeapIdx.length {
+    return emitFailAt(
+      "emitProgram: a call through a held record matches none of its signatures",
+      callIx,
+    )
+  }
+  if emitExpr(body, c.callFn, fnIx) < 0 { return -1 }
+  fbStructGet(sHeapIdx[si], fi)
+  const crDepth = callRefDepth
+  const crSlot = callRefNestSlot(callRefDepth)
+  fbLocalSet(crSlot)
+  emitCallRefAt(body, callIx, c, fnIx, sigKeyOfTy(sigs[m]), crDepth, crSlot)
 }
 
 // ── statement-sequence lowering ──────────────────────────────────────────────
@@ -37581,15 +37613,19 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   }
   if (emitDirectCallArgsUnder(body, callIx, fnIx, target) < 0) { return -1 }
   emitDirectCallTail(target, callIx, fnIx)
-  emitBundleResultPick(callIx, target)
+  emitBundleResultPick(callIx, target, fnIx)
 }
 
 // After a direct call to an instance returning its bundle parameter's record: the member the
 // elaboration noted the call's value is used as, nothing for a value dropped. 0, or -1.
-function emitBundleResultPick(callIx: i32, target: i32): i32 {
+function emitBundleResultPick(callIx: i32, target: i32, fnIx: i32): i32 {
   const cFn = nodeAt(fnStmts[target])
   const rp = bundleRetParamOf(fnStmts[target])
   if rp < 0 || !(cFn is FuncDecl) || rp >= cFn.fnParams.length { return 0 }
+  // A holder keeps the record whole and picks at each call through it (D15144).
+  if elabCallKeepsRecordAt(nodeSrc[callIx] ?? callIx, elabKeyOfFn(fnIx)) {
+    return 0
+  }
   const m = elabCallResultMember(callIx)
   if m == -1 { return 0 }
   const si = paramStructIdxOf(cFn.fnParams[rp])
