@@ -281,6 +281,13 @@ shared row names.
     at a `call_ref` whose key's parameter is a bundle row (`bundleKeyParamTy`). It declines under
     a split plan, as slice 1 does.
 
+  - **Slice A (read as value), a forward, built.** A bundle parameter handed whole to another hole
+    parameter holds the one record on both sides: the elaboration joins the signatures of
+    parameters such hands link (`elabBundleForwardsJoin`), mono pins the callee's parameter at the
+    caller's record (`monoBundleHandOnPin`), and emit passes the record on as it is. A chain where
+    no instance binds the parameter to a set stays refused. The capture half of
+    `hole-lambda-bundle-param-read-as-value` is slice B.
+
 ### Open questions for the coordinator
 
 1. **A lambda member of a container called at two signatures.** The tag admits only a lambda
