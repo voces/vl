@@ -135,6 +135,7 @@ import {
   elabSnapIx,
   elabSnapKey,
   elabTyClosed,
+  elabWalkNowSet,
   elabWideRowDecl,
   elabWideRowFrom,
   elabWideRowN,
@@ -183,6 +184,7 @@ import {
   nodeRepTyIx,
   nodeRepTyIxOf,
   nodeRepUnionIx,
+  recCopyTyOf,
 } from "./check_core_state"
 import { adoptRetLits } from "./check_inferred_return"
 import {
@@ -799,6 +801,9 @@ function elabDrainHoleRows() {
     if tysClosed(elabHoleRowT[r]) {
       const d = elabHoleRowDecl[r]
       const from = elabHoleRowFrom[r]
+      if from >= 0 {
+        elabOwnHoleRows[i32ToStr(from) + "^" + i32ToStr(d)] = true
+      }
       if from < 0 && elabParentFor(d, -1) == -2 {
         elabHoleDeferred.push(r)
         elabHoleDeferredAt.push(0)
@@ -840,11 +845,19 @@ function elabDrainHoleRows() {
     elabHoleDeferredAt[i] = ekDecl.length
     while a < ekDecl.length {
       if ekDecl[a] == e {
-        elabReachNote(
-          a,
-          elabEnqueue(d, elabHoleRowN[r], elabHoleRowT[r], a),
-          -1,
-        )
+        // A template row of a lambda keyed per encloser instance fills only an instance whose own
+        // walk pinned it nowhere: an instance that did holds its own pins (D15112).
+        if (
+          !(elabLamPerEncl(d)
+            && elabHoleRowFrom[r] < 0
+            && (elabOwnHoleRows[i32ToStr(a) + "^" + i32ToStr(d)] ?? false))
+        ) {
+          elabReachNote(
+            a,
+            elabEnqueue(d, elabHoleRowN[r], elabHoleRowT[r], a),
+            -1,
+          )
+        }
       }
       a = a + 1
     }
@@ -852,6 +865,9 @@ function elabDrainHoleRows() {
   }
   0
 }
+
+// Each `instance^declaration` whose own walk banked a hole-pin row, marked as the rows drain.
+let elabOwnHoleRows: {[string]: boolean} = Map()
 
 // Builds each delivered value whose result only converts to its destination's as that result,
 // beside the instance at its own (D9282).
@@ -2291,7 +2307,15 @@ function elabTysFirst(names: string[], tys: i32[]): i32[] {
   out
 }
 
+// Walks key `k`, with `k` the key every hole row its walk banks records.
 function elabOne(k: i32) {
+  const was = elabWalkNowSet(k)
+  const r = elabOneAt(k)
+  elabWalkNowSet(was)
+  r
+}
+
+function elabOneAt(k: i32) {
   const decl = ekDecl[k]
   ekDone[k] = true
   const dn = nodeAt(decl)
@@ -4442,7 +4466,7 @@ function elabResScanLet(g: i32) {
     const n = nodeAt(g)
     if n is LetDecl {
       const v = parenPeelIx(n.letInit)
-      if nodeAt(v) is Call {
+      if v >= 0 && v < P.nodes.length && nodeAt(v) is Call {
         elabResHolder[v] = g
         const ws = elabResWrites.get(g) ?? []
         ws.push(v)
@@ -6109,6 +6133,7 @@ export function elabRun() {
   elabShortFrom = []
   elabWideCur = 0
   elabHoleDeferred = []
+  elabOwnHoleRows = Map()
   elabHoleDeferredAt = []
   ekDone = []
   elabWalkKeys = []
@@ -6434,55 +6459,29 @@ function elabReturnCredits() {
   elabSettle(0)
 }
 
-// The per-instance lambda declaration `f` returns: a lambda returned directly, or one stored into
-// the `let` it returns (by the checker's binding-writes reader). -1 for none, and -1 when two
+// The per-instance lambda of `f` among the functions the checker says `f` may return: a lambda it
+// returns, or one in the function set of a `let` it returns. -1 for none, and -1 when two
 // different lambdas qualify, since no one key then serves the call through the result.
 function elabReturnedLam(f: i32): i32 {
-  const fd = nodeAt(f)
-  if !(fd is FuncDecl) || fd.fnBody < 0 { return -1 }
   let found = -1
-  const st: i32[] = [fd.fnBody]
-  while st.length > 0 {
-    const x = st.pop() ?? -1
-    if x >= 0 && x < P.nodes.length {
-      const xn = nodeAt(x)
-      if xn is RetStmt && xn.retArg >= 0 {
-        const r = elabValueLamIn(xn.retArg, f)
-        if r == -2 || (r >= 0 && found >= 0 && r != found) { return -1 }
-        if r >= 0 { found = r }
-      }
-      if !(xn is FuncDecl) || x == fd.fnBody {
-        for c in nodeChildren(x) { st.push(c) }
-      }
-    }
-  }
-  found
-}
-
-// The per-instance lambda of `f` value `v` holds: `v` itself, or a value written into the `let` it
-// reads. -1 for none, -2 for two different ones.
-function elabValueLamIn(v: i32, f: i32): i32 {
-  const x = parenPeelIx(v)
-  if x < 0 || x >= P.nodes.length { return -1 }
-  const vs: i32[] = [x]
-  if nodeAt(x) is Ident {
-    const b = identDeclOf(x)
+  for lf in recFnValueLeaves(f) {
+    const x = parenPeelIx(lf)
+    const ds: i32[] = [x]
+    const b = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
     if b >= 0 && b < P.nodes.length && nodeAt(b) is LetDecl {
-      cwIxWant()
-      for w in cwBindingWrittenValues(b) { vs.push(parenPeelIx(w)) }
+      for d in elabFnLetMembers(b) { ds.push(d) }
     }
-  }
-  let found = -1
-  for d in vs {
-    if (
-      d >= 0
-      && d < P.nodes.length
-      && nodeAt(d) is FuncDecl
-      && elabLamPerEncl(d)
-      && (elabEncl.get(d) ?? -1) == f
-    ) {
-      if found >= 0 && found != d { return -2 }
-      found = d
+    for d in ds {
+      if (
+        d >= 0
+        && d < P.nodes.length
+        && nodeAt(d) is FuncDecl
+        && elabLamPerEncl(d)
+        && (elabEncl.get(d) ?? -1) == f
+      ) {
+        if found >= 0 && found != d { return -1 }
+        found = d
+      }
     }
   }
   found
@@ -8232,6 +8231,9 @@ function litKeptRepFrom(ix: i32, depth: i32): i32 {
   const p = parenPeelIx(ix)
   if p < 0 || p >= P.nodes.length { return -1 }
   const n = nodeAt(p)
+  // A call copied where it is delivered lands at the declared record the checker recorded for it,
+  // not at its function's build (D14818).
+  if n is Call && recCopyTyOf(p) >= 0 { return recCopyTyOf(p) }
   if n is Call { return litKeptCallRep(p, depth) }
   if n is ArrayLit {
     let r = -1
