@@ -7,13 +7,13 @@
 // collection leaving more than 75% of a semispace live (`SeedGcHeadroom`,
 // scripts/vl-host/src/main.rs; docs/internals/perf/gc-heap-policy-2026-09.md §4).
 //
-// The workload is `vl check compiler/typecheck.vl` at the default first heap (128 MiB a
-// semispace), whose live set crosses the 96 MiB the policy grows at: 6 and 56 collections on
-// 2026-11-02, and never under 24 / 7 on fixpoint seeds back to #5547. `check_relate_core.vl`
-// was the workload until #5797 shrank its peak live set by ~1.9 MB, a few MiB under a
-// semispace, and took its policy-off count from 79 to 21; `emit_base.vl` before it fell the
-// same way. A target whose live set sits just under a semispace is a cliff, so this one is
-// graded across history, not on one seed (PR body of the change that chose it). The
+// The workload is `vl check compiler/wasmEmit.vl` at the default first heap (128 MiB a
+// semispace), whose live set crosses the 96 MiB the policy grows at: 9 collections, and 46 to
+// 142 with the policy off, across master and two PRs on 2026-11-03. `typecheck.vl` was the
+// workload until its policy-off count fell from 42 to 18–20 on a 50 KiB move in the seed's live
+// set; `check_relate_core.vl` and `emit_base.vl` before it fell the same way. A target whose live
+// set sits just under a semispace is a cliff, so each one is graded across seeds and sources,
+// not on one (the PR body of the change that chose it). The
 // default heap is the engine configuration every other compile shares, so its
 // `.cwasm` is already warm; a pinned heap was its own configuration and re-JITted the seed
 // (about 13 s) on every new seed. Three bounds: the default
@@ -36,11 +36,11 @@ if (!ENABLED) {
   );
 }
 
-const TARGET = `${ROOT}/compiler/typecheck.vl`;
+const TARGET = `${ROOT}/compiler/wasmEmit.vl`;
 
-// 6 at the time of writing; loose so a compiler change that moves the live set cannot red it.
+// 9 at the time of writing; loose so a compiler change that moves the live set cannot red it.
 const MAX_DEFAULT = 12;
-// 56 / 6 at the time of writing; 24 / 7 the weakest reading back to #5547.
+// 92 / 9 on master at the time of writing; 46 / 9 the weakest reading of the three trees.
 const MIN_SPREAD = 3;
 
 async function collections(grow: string, label: string): Promise<number> {
