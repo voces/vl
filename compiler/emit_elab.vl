@@ -3,6 +3,7 @@
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
 import { monoIsGenericDecl } from "./emit_base"
+import { tyParamIsBareOnly } from "./check_scopes"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { paramHoleName } from "./check_tp_join"
 import { decDigitsOf } from "./strutil"
@@ -7445,7 +7446,7 @@ function elabParamReachedOf(k: i32, d: i32, i: i32, seen: i32[]): i32 {
       }
       let j = 0
       while j < c.callArgs.length {
-        if elabReadsDecl(dn, c.callArgs[j], p) {
+        if elabReadsDecl(dn, c.callArgs[j], p) && !elabArgRepins(cx, j) {
           const r = elabCallInstFrom(cx, k)
           if r < 0 { return 0 - 2 }
           const h = elabParamReachedOf(r, d, j, seen)
@@ -7464,6 +7465,72 @@ function elabParamReachedOf(k: i32, d: i32, i: i32, seen: i32[]): i32 {
     }
   }
   found
+}
+
+// `e` with its parentheses taken off.
+function elabUnparen(e: i32): i32 {
+  let x = e
+  while x >= 0 && x < P.nodes.length {
+    const n = nodeAt(x)
+    if n is Paren { x = n.parInner } else { return x }
+  }
+  -1
+}
+
+// Whether argument `j` of call `cx` lands on a parameter the callee annotates with a type parameter
+// read only as such annotations: a generic handed there keeps its own pin and is instanced at that
+// parameter's calls, so it carries nothing back to the caller's parameter (D6202).
+function elabArgRepins(cx: i32, j: i32): boolean {
+  const c = nodeAt(cx)
+  if !(c is Call) { return false }
+  const f = elabUnparen(c.callFn)
+  if f < 0 || !(nodeAt(f) is Ident) { return false }
+  const cd = identDeclOf(f)
+  if cd < 0 || cd >= P.nodes.length { return false }
+  const fd = nodeAt(cd)
+  if !(fd is FuncDecl) || j >= fd.fnParams.length { return false }
+  const pn = nodeAt(fd.fnParams[j])
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const tn = nodeAt(pn.parType)
+  if (
+    !(tn is TypeRef
+      && strListHas(fd.fnTyParams, tn.tyName)
+      && tyParamIsBareOnly(cd, tn.tyName))
+  ) {
+    return false
+  }
+  const seen: i32[] = []
+  elabParamStaysIn(fd, fd.fnParams[j], seen)
+}
+
+// Whether the value of parameter `p` of `fn` never leaves it: every read of it, or of a copy of
+// it, is a callee or an argument, and every argument it is lands on a declared function's
+// parameter that also stays in. A value that is returned, stored or captured leaves.
+function elabParamStaysIn(fn: FuncDecl, p: i32, seen: i32[]): boolean {
+  if i32ListHas(seen, p) { return true }
+  if seen.length > 64 { return false }
+  seen.push(p)
+  const calls: i32[] = []
+  if !elabParamReadsPlaced(fn, p, calls) { return false }
+  for cx in calls {
+    const c = nodeAt(cx)
+    if c is Call {
+      let j = 0
+      while j < c.callArgs.length {
+        if elabReadsDecl(fn, c.callArgs[j], p) {
+          const f = elabUnparen(c.callFn)
+          if f < 0 || !(nodeAt(f) is Ident) { return false }
+          const cd = identDeclOf(f)
+          if cd < 0 || cd >= P.nodes.length { return false }
+          const fd = nodeAt(cd)
+          if !(fd is FuncDecl) || j >= fd.fnParams.length { return false }
+          if !elabParamStaysIn(fd, fd.fnParams[j], seen) { return false }
+        }
+        j = j + 1
+      }
+    }
+  }
+  true
 }
 
 // The one instance of `d` call `cx`, through a function value in instance `k`'s body, ran; -1 for
@@ -7652,6 +7719,36 @@ export function elabParamTyOwnAt(k: i32, i: i32): i32 {
   const pt = nodeTyIxOf(dn.fnParams[i])
   if pt < 0 { return -1 }
   elabOutTyVia(substTyDeep(pt, ekNames[k], ekTys[k]), k, i)
+}
+
+// The elaboration instance of a generic that parameter `i` of instance `k` carries, the one its
+// own calls reach (`elabParamReachedOf`): the key mono demands that generic's instance by, and
+// `ekDecl` of it the generic. -1 when it carries none, two, or a read the walk does not place.
+export function elabParamCarriedInstAt(k: i32, i: i32): i32 {
+  if k < 0 || k >= ekDecl.length { return -1 }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return -1 }
+  const pt = nodeTyIxOf(dn.fnParams[i])
+  if pt < 0 { return -1 }
+  const ds: i32[] = []
+  elabFnIdsIn(substTyDeep(pt, ekNames[k], ekTys[k]), ds, 0)
+  let found = -1
+  for d in ds {
+    const seen: i32[] = []
+    const r = elabParamReachedOf(k, d, i, seen)
+    if r == 0 - 2 { return -1 }
+    if r >= 0 {
+      if found >= 0 && found != r { return -1 }
+      found = r
+    }
+  }
+  found
+}
+
+// The generic declaration of `elabParamCarriedInstAt(k, i)`, or -1.
+export function elabParamCarriedDeclAt(k: i32, i: i32): i32 {
+  const r = elabParamCarriedInstAt(k, i)
+  if r < 0 { -1 } else { ekDecl[r] }
 }
 
 // The closed type the copy binding `d` (`paramCopySeedOf`) takes in the instance being walked:
