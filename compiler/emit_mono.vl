@@ -15,11 +15,7 @@ import { recordRowClassOf } from "./record_rows"
 
 import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
-import {
-  mintCallSoleSet,
-  mintLamKeyedOf,
-  mintNestedPerEnclOf,
-} from "./check_mint"
+import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftOwnTyParamHandedBack, ftOwnTyParamSharedBack } from "./check_fn_tag"
 import {
   mkNumTyped,
@@ -646,6 +642,7 @@ import {
   elabKeyAtPos,
   elabLamInheritedOwn,
   elabLamParamSigs,
+  elabLamPinsUnderWalk,
   elabMakerTwinHeld,
   elabMemberKeyAt,
   elabNarrowedCarry,
@@ -4767,45 +4764,6 @@ function monoPinAnnSpelling(t: i32): string {
   nm
 }
 
-// Per un-keyed lambda `monoCloneLambdaSubst` shares across its encloser's instances, the binding of
-// the first instance that reaches it.
-let monoSharedLamAt: {[i32]: string} = Map()
-
-// Refuses lambda `fnIx` when a second instance of its encloser reaches it under another binding
-// while the elaboration minted it no key: its un-annotated parameters then take their types from
-// outside every instance, and the one lambda built for all of them cannot serve each (D15110).
-function monoSharedLamGuard(fnIx: i32, a: FuncDecl, tvV: string[]) {
-  if monoFnNameIsSourceNamed(a.fnName) || mintLamKeyedOf(fnIx) { return 0 }
-  // Only a parameter its checker type leaves open takes its type from outside the instances.
-  const lt = nodeTyIxOf(fnIx)
-  const lf = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
-  if !(lf is TyFunc) { return 0 }
-  let open = false
-  let i = 0
-  while i < a.fnParams.length && i < lf.fnParamTypes.length {
-    const pn = nodeAt(a.fnParams[i])
-    if pn is Param && pn.parType < 0 && tyHasTyVar(lf.fnParamTypes[i]) {
-      open = true
-    }
-    i = i + 1
-  }
-  if !open { return 0 }
-  let key = ""
-  for v in tvV { key = key + v + ";" }
-  const was = monoSharedLamAt[fnIx] ?? ""
-  if was == "" {
-    monoSharedLamAt[fnIx] = key
-    return 0
-  }
-  if was == key { return 0 }
-  emitFailAt(
-    "emitProgram: this lambda is written inside a generic function and is one value for every "
-      + "instance of it, but its parameters take a different type in each instance — annotate its "
-      + "parameters, or declare it outside the generic function",
-    fnIx,
-  )
-}
-
 // Clone the lifted lambda at `fnIx` with every type-param-mentioning parameter and return
 // annotation substituted through this instance's binding, lift the clone into `fnStmts`,
 // and return its node index — or -1 when nothing substitutes. The body is shared with the
@@ -4827,6 +4785,16 @@ function monoCloneLambdaSubst(
       bT = []
       monoJoinBinding(bN0, bT0, monoPinHoleN, monoPinHoleT, bN, bT)
     }
+    // A lambda the elaboration keyed under this instance takes that key's pins too (M5).
+    const lN: string[] = []
+    const lT: i32[] = []
+    if elabLamPinsUnderWalk(elabSrcDecl(fnIx), lN, lT) {
+      const jN: string[] = []
+      const jT: i32[] = []
+      monoJoinBinding(bN, bT, lN, lT, jN, jT)
+      bN = jN
+      bT = jT
+    }
     // A nested generic declaration carries pins of its own and is instantiated by
     // `monoInstantiate` at its own call sites; only a lambda that inherited the enclosing
     // frame's type parameters is this pass's business.
@@ -4835,16 +4803,10 @@ function monoCloneLambdaSubst(
     // correct at every pin. Returned before either ledger is touched: the prune reads them
     // to decide whether a template is still referenced, and a lambda that never became a
     // template must not appear in either.
-    if !monoLamNodeIsTemplateCore(fnIx, typarams) {
-      monoSharedLamGuard(fnIx, a, tvV)
-      return -1
-    }
+    if !monoLamNodeIsTemplateCore(fnIx, typarams) { return -1 }
     const ps: i32[] = []
     const psAny = monoLamSubstParams(a, fnIx, typarams, tvN, tvV, bN, bT, ps)
-    if psAny < 0 {
-      monoSharedLamGuard(fnIx, a, tvV)
-      return -1
-    }
+    if psAny < 0 { return -1 }
     let any = psAny > 0
     let nret = a.fnRet
     const rt = monoSubstAnnNode(a.fnRet, typarams, tvN, tvV, bN, bT)
@@ -4853,7 +4815,6 @@ function monoCloneLambdaSubst(
       any = true
     } else if rt == -2 {
       monoNoteLamNode(monoLamShared, fnIx)
-      monoSharedLamGuard(fnIx, a, tvV)
       return -1
     }
     // D943 — `any` asks whether a signature changed, and a capture-only template changes
@@ -4877,7 +4838,6 @@ function monoCloneLambdaSubst(
     }
     if !any && !capOnly && !bodyTP {
       monoNoteLamNode(monoLamShared, fnIx)
-      monoSharedLamGuard(fnIx, a, tvV)
       return -1
     }
     // An un-annotated return that rides the type parameter, annotated at the pin. The
@@ -5067,12 +5027,10 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32, bN: string[], bT: i32[]) {
         const rnm = monoPinAnnSpelling(rs)
         // The box a kept-apart join returns is registered here, as an instance return's is.
         if (
-          rnm != ""
-          && (keptJoin || nulJoin || er >= 0)
-          && monoTyIsUnionOrNulUnion(rs)
-          && !monoTyHoldsRefArm(rs)
+          (keptJoin || nulJoin || er >= 0)
+          && monoRegisterValuePin(rnm, rs) < 0
         ) {
-          if monoRegisterPinUnion(rnm, rs) < 0 { return -2 }
+          return -2
         }
         if rnm != "" { return synthTypeRefTy(rnm, -1, rs) }
       }
@@ -9869,6 +9827,16 @@ function monoRegisterPinUnion(name: string, ty: i32) {
   0
 }
 
+// Registers the value union `ty` a pin minted under its pin spelling `name`, the row `collectU`
+// never saw, for an instance's return and its parameters alike (D1042, D15170). 0 when `ty` is no
+// value union, or a union holding a map or record arm, whose spelling registers elsewhere; -1 failed.
+function monoRegisterValuePin(name: string, ty: i32): i32 {
+  if name == "" || !monoTyIsUnionOrNulUnion(ty) || monoTyHoldsRefArm(ty) {
+    return 0
+  }
+  monoRegisterPinUnion(name, ty)
+}
+
 // Whether `ty` is a union with a type-parameter member and a concrete member besides `null`,
 // the shape the checker's binding walk passes over (`monoDeclIsOpenUnion`, which also names the
 // member).
@@ -10462,6 +10430,26 @@ function monoMakeInstanceParams(
         // The one arm that mints no annotation node: an un-annotated param pinned at plain
         // i32 (`nt` stays -1 by design, so the all-i32 path adds zero arena nodes).
         pinTy = i32TyIx()
+      }
+      // A value union with a literal member that the pin minted (`T | "a"` at `T := i32`) has no
+      // row `collectU` registered, so it is registered under the pin's spelling, as an instance
+      // return's is (D1042, D15170).
+      if (
+        nt >= 0
+        && pinTy >= 0
+        && !tyHasTyVar(pinTy)
+        && monoTyHasLitMember(pinTy)
+      ) {
+        const unm = monoPinAnnSpelling(pinTy)
+        if monoRegisterValuePin(unm, pinTy) < 0 { return -1 }
+        if (
+          unm != ""
+          && unm != pinned[pj]
+          && monoTyIsUnionOrNulUnion(pinTy)
+          && !monoTyHoldsRefArm(pinTy)
+        ) {
+          nt = synthTypeRefTy(unm, -1, pinTy)
+        }
       }
       // D681 — an anon pin's type is its row's, not the placeholder's: `#anonN`
       // resolves to nothing, so the node records a field-less `TyObj` while this
@@ -29083,7 +29071,6 @@ export function monomorphize(stmts: i32[]) {
   }
   monoLamPinned = []
   monoLamShared = []
-  monoSharedLamAt = Map()
   monoNamedTmplNode = []
   monoNamedTmplSlot = []
   let any = false
