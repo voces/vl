@@ -60,20 +60,22 @@ const errorBlock = (out: string): string => {
 // not finished being decided when the field asks for a rep, and the refusal fires while the
 // declarations are being registered — before any function body arms a cursor.
 //
-// THE NESTED-STRUCT ARM FIELD USED TO BE THIS WITNESS and D1579 made it RUN, which is this
-// test's own failure mode working: the guard said so rather than passing green over a compiling
-// program. The self-referential arm is `armDeferStack`'s decline (D1518) and is the collect
-// phase's remaining loud refusal.
+// THE NESTED-STRUCT ARM FIELD USED TO BE THIS WITNESS and D1579 made it RUN, then the
+// self-referential arm (D3329) and a struct holding it (D15095) did the same: each time the
+// guard said so rather than passing green over a compiling program. A struct holding an arm
+// that recurses through a map value is the collect phase's remaining loud refusal (D15097).
 const COLLECT_WITNESS = `type E = { msg: string }
 
-// A SELF-REFERENTIAL ARM: \`A\`'s own field is typed as \`A\`, so the arm's layout is not
-// finished being decided when the field asks for its rep (\`armDeferStack\`, D1518) and
-// the refusal fires while \`collectU\` is registering this declaration.
-type A = { n: i32, f: A | null }
+// A STRUCT HOLDING AN ARM THAT RECURSES THROUGH A MAP VALUE: \`collectS\` codes \`Q.o\`, and
+// the map value inside the arm's row has no slot yet, so the refusal fires while \`collectS\`
+// is registering this declaration (D15097).
+type Q = { o: A }
+type A = { n: i32, g: Map<string, A> }
+const q: Q = { o: { n: 1, g: Map() } }
 
 function h(ok: boolean): A | E {
   if !ok { return { msg: "e" } }
-  return { n: 1, f: null }
+  return { n: 1, g: Map() }
 }
 print(h(true) is A)
 `;
@@ -99,11 +101,11 @@ Deno.test({
           `expected the emit refusal to carry collect.vl:<line>:<col>, got:\n${blk}`,
         );
       }
-      // The anchor is the FIELD whose type has no rep (`f: A | null` on line 6), not the
+      // The anchor is the DECLARATION whose field has no rep (`Q` on line 6), not the
       // declaration's own name and not the last function in the file.
       if (!/at \S*collect\.vl:6:\d+/.test(blk)) {
         throw new Error(
-          `expected the anchor on line 6 (the offending field), got:\n${blk}`,
+          `expected the anchor on line 6 (the offending declaration), got:\n${blk}`,
         );
       }
     } finally {

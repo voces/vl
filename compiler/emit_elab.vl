@@ -1171,6 +1171,18 @@ export function elabWalkPop() {
   0
 }
 
+// By `instance|call`, the set each instance's call through a parameter goes through, as
+// `elabMintFactAt` notes it (nested-per-encloser-2026-11.md, slice 1).
+let elabCallInstSets: {[string]: i32} = Map()
+
+// The set call `ix` goes through at the instance being walked, as the mint facts noted it; -1 for
+// none.
+export function elabCallSetIn(ix: i32): i32 {
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  if top < 0 || ix < 0 { return -1 }
+  elabCallInstSets[i32ToStr(top) + "|" + i32ToStr(ix)] ?? -1
+}
+
 // Node `ix`'s closed type at the instance being walked, or -1 outside one or where it stays open.
 export function elabWalkTy(ix: i32): i32 {
   const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
@@ -2591,6 +2603,7 @@ export function elabMintFacts(): i32 {
   elabLamSigs = Map()
   elabLamSigInst = Map()
   elabMintSets = Map()
+  elabCallInstSets = Map()
   let n = 0
   let k = 0
   while k < ekDecl.length {
@@ -3164,6 +3177,9 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
 
 // Whether `elabMintFactAt` is noting a call in a lambda one body's instances share.
 let elabMintInLambda = false
+// Whether that lambda maps a list that is the instance's own parameter, so each instance's call
+// goes through its own set (`elabCallSetIn`).
+let elabMintOwnRecv = false
 
 // `elabMintFactsIn` for `map` called on a list parameter of `decl` holding a set of functions, with
 // a lambda that only calls its element: the fact of each such call, which the instance types at
@@ -3184,9 +3200,13 @@ function elabMintCallbacksAt(c: Call, decl: i32, k: i32, sc: i32): i32 {
   const ax = parenPeelIx(c.callArgs[0])
   const an = if ax >= 0 && ax < P.nodes.length { nodeAt(ax) } else { nodeAt(cf) }
   if !(an is FuncDecl) || an.fnParams.length == 0 { return -1 }
+  const declOk = decl >= 0 && decl < P.nodes.length
+  const dn = if declOk { nodeAt(decl) } else { an }
   elabMintInLambda = true
+  elabMintOwnRecv = declOk && dn is FuncDecl && i32ListHas(dn.fnParams, pd)
   const r = elabMintCallbackBodyIn(an.fnBody, -1, ax, an.fnParams[0], k, sc)
   elabMintInLambda = false
+  elabMintOwnRecv = false
   if r <= 0 { return -1 }
   r
 }
@@ -4133,6 +4153,39 @@ function elabBundleUnite(up: Map<i32, i32>, a: i32, b: i32) {
   0
 }
 
+// Notes the signature call `c` in instance `k` makes through `pd`, a parameter of a function
+// enclosing `k`'s, for the bundle of the enclosing instance that binds it. Only members already
+// instanced at the call's types count, so nothing is enqueued here.
+function elabCapturedBundleSigNote(c: Call, pd: i32, k: i32) {
+  let a = if k >= 0 && k < ekParent.length { ekParent[k] } else { -1 }
+  let pi = -1
+  let guard = 0
+  while a >= 0 && pi < 0 && guard < 64 {
+    const an = nodeAt(ekDecl[a])
+    if an is FuncDecl { pi = i32ListIndexOf(an.fnParams, pd) }
+    if pi < 0 { a = ekParent[a] }
+    guard = guard + 1
+  }
+  if a < 0 || pi < 0 { return 0 }
+  const st = elabNodeTy(parenPeelIx(c.callFn), k)
+  const ds = elabFnSetOf(st)
+  if ds.length == 0 || fnTagSetOfTy(st) < 0 { return 0 }
+  const wp: i32[] = []
+  for x in c.callArgs {
+    const at = elabNodeTy(x, k)
+    if at < 0 || !elabTyClosed(at, 0) { return 0 }
+    wp.push(widenLitTy(at))
+  }
+  let r0 = -1
+  for d in ds {
+    const r = elabMemberResultAt(d, wp)
+    if r < 0 { return 0 }
+    if r0 >= 0 && !tySame(widenLitTy(r), r0) { return 0 }
+    r0 = widenLitTy(r)
+  }
+  elabBundleSigNote(a, pi, ds, wp, r0)
+}
+
 // The key of instance `k`'s parameter `i` in `elabBundleSigs`.
 function elabBundleKey(k: i32, i: i32): i32 { k * 64 + i }
 
@@ -4220,7 +4273,11 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
     return elabMintOuterSlotFactAt(c, ix, k, sc)
   }
   const dn = nodeAt(decl)
-  if !(dn is FuncDecl) || !i32ListHas(dn.fnParams, pd) { return false }
+  if !(dn is FuncDecl) { return false }
+  if !i32ListHas(dn.fnParams, pd) {
+    if root == cf { elabCapturedBundleSigNote(c, pd, k) }
+    return false
+  }
   // A chain's callee the instance types at its rep reads the set its root's list holds.
   const st = if root != cf && fnTagSetOfTy(elabNodeTy(cf, k)) < 0 { elabHeldFnTyOf(elabNodeTy(root, k)) } else { elabNodeTy(cf, k) }
   const ds = elabFnSetOf(st)
@@ -4264,10 +4321,18 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   // call's arms with the other, so both stay closures. A list literal of the parameter is typed
   // per instance, so it holds each instance's own set.
   const was = elabMintSets[ix] ?? fnTagSetOfTy(st)
-  const held = root != cf && elabListParamSource(identDeclOf(root), dn) != pd
+  elabCallInstSets[i32ToStr(k) + "|" + i32ToStr(ix)] = fnTagSetOfTy(st)
+  // A holder that is the instance's own parameter, or a lambda mapping it, is typed per instance:
+  // mono keys the instance by the set and resolves the call by `elabCallSetIn`.
+  const own = root != cf && identDeclOf(root) == pd
+  const held = root != cf
+    && !own
+    && elabListParamSource(identDeclOf(root), dn) != pd
   if (
     was != fnTagSetOfTy(st)
-    && (held || elabMintInLambda || i32ListHas(elabMintValueFns, decl))
+    && (held
+      || elabMintInLambda && !elabMintOwnRecv
+      || i32ListHas(elabMintValueFns, decl))
   ) {
     mintSetPartialNote(was)
     mintSetPartialNote(fnTagSetOfTy(st))

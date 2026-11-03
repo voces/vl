@@ -57,11 +57,21 @@ emitted module still has one closure trampoline for the list element `[apply2]`,
 (a list element, an argument, a binding) is built once per template node, not once per instance
 being walked.
 
-**The fix to measure.** The value's closure is keyed by the instance the node's demand is made
-under, as a demand is (`elabDemand` reads `elabWalkKeys`'s top). It is not one record per node.
-Where mono records a node's coerced function (`monoCoerceFnValueName`, `monoElemTakenSig`,
-`nodeTyRecord` on a template node), the record is keyed `instance|node` once the node sits in a
-body walked at more than one key.
+**Measured, 2026-11-03: the copies already exist, and one lookup reads the template's.** Each
+`inner` copy has its own body, its own `for` loop and its own list literal (in D14842's witness,
+loops 69 and 81, lists 65 and 77, against the template's 38 and 33). `monoCalleeElems` finds a
+`for` variable's list through `monoInstDeclCopy`, which searches only a generic-instance frame.
+An `inner` copy is not one, so the lookup fell back to the template's loop, whose element node 32
+both copies then renamed: the last instance won.
+
+**The fix, slice 3.** `monoNestedLoopCopy`: in a frame whose source declaration the elaboration
+built per encloser instance, `monoCalleeElems` takes that frame's own copy of the loop. No body is
+cloned. The fact that decides "per encloser" is **`mintNestedPerEnclOf(d)`**. The elaboration writes
+it (`elabNestedPerEncl`'s third branch, nested-per-encloser step 1, noted in `elabMintFacts`), and
+mono and the tag decision only read it (`monoNestedLoopCopy`, `ftReadInNestedFn`). On the probe,
+D14842's witness prints `3 4 2 3.75` with the plan off. The census file's nested-function,
+`const`-lambda and returned shapes each run alone. Its two-levels-deep shape still refuses, so the
+file waits on slice 4.
 
 ### M3. A set whose member is itself per instance
 
@@ -109,10 +119,11 @@ Each slice is graded on every hard control above, with the split plan on and off
    rule's exemption for a holder that is the instance's own parameter (the elaboration fact, not a
    syntactic test). This closes D15049. D14842 must keep `3 4 2 3.75` (it does not change
    here, since nothing nested is instanced yet). D15019's fixtures must keep their output.
-3. **L-nested.** nested-per-encloser slice 2's producer and facts (built on `lane/g2-nested2`),
-   with M2. D14842 must print `3 4 2 3.75` with the plan off. This is the slice's first check,
-   before anything else is graded.
-4. **Per-instance members (M3)**, with the per-frame lane's rows as witnesses, and G1's D15062 item 2
+3. **L-nested.** nested-per-encloser slice 2's producer and facts, with M2's
+   `monoNestedLoopCopy`. D14842 must print `3 4 2 3.75` with the plan off. This is the slice's
+   first check, before anything else is graded. D15068 joins the hard controls. Report seed size
+   and plumb-shape fuel deltas.
+4. **Two levels of nesting**, the last census L-nested shape, and **per-instance members (M3)**, with the per-frame lane's rows as witnesses, and G1's D15062 item 2
    graded against M4's reader from slice 2.
 
 **Out of scope.** Sets whose identity varies per instance and escapes the instance; those stay

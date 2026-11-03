@@ -8893,8 +8893,14 @@ function emitUnionWideArmBox(
   exprIx: i32,
   fnIx: i32,
 ): i32 {
-  // A literal is built at the arm it names, never at a wider row.
-  if nodeAt(unwrapParen(exprIx)) is ObjLit { return 0 }
+  // A literal is built at the arm it names, never at a wider row; one naming no arm is built at
+  // its own row, which boxes as the arm it subtypes (D3566).
+  if (
+    nodeAt(unwrapParen(exprIx)) is ObjLit
+    && exprVariantIndex(exprIx, fnIx) >= 0
+  ) {
+    return 0
+  }
   const vty = nodeTyAt(unwrapParen(exprIx), fnIx)
   const atoms: string[] = []
   unionArmsOfTy(unionName, unionTy, atoms)
@@ -10703,8 +10709,16 @@ function emitUnionUnionEq(
   isNe: boolean,
   fnIx: i32,
 ) {
-  const lname = unionNameOfExpr(lIx, fnIx)
-  const rname = unionNameOfExpr(rIx, fnIx)
+  let lname = unionNameOfExpr(lIx, fnIx)
+  let rname = unionNameOfExpr(rIx, fnIx)
+  // Two spellings of one member set are one union: both name the row their types reach.
+  if lname != rname {
+    const lr = unRowOfRecordTy(nodeTyAt(unwrapParen(lIx), fnIx))
+    if lr >= 0 && lr == unRowOfRecordTy(nodeTyAt(unwrapParen(rIx), fnIx)) {
+      lname = unNames[lr]
+      rname = lname
+    }
+  }
   // D973 — the struct-union path is tried before the re-readability gate, because it does not
   // need it: it evaluates each operand once into its own slot and reads the slots. The gate
   // exists for the value-union lowering below, which re-reads both sides per arm.
@@ -18841,7 +18855,8 @@ function emitListEqXBin(body: u8[], e: BinExpr, fnIx: i32) {
 }
 
 // The number kind a list rep's elements hold (0 i32, 3 i64, 4 f64, 5 f32) for a plain number
-// list, -2 for a list of union boxes, -3 for a list of records compared field-wise, or -1.
+// list, -2 for a list of union boxes, -3 for a list of records compared field-wise, -4 for a
+// list of lists, or -1.
 function xrepElemKind(kind: i32, slot: i32): i32 {
   if kind == LBK_I32_LIST { return 0 }
   if kind == LBK_I64_LIST { return 3 }
@@ -18849,6 +18864,7 @@ function xrepElemKind(kind: i32, slot: i32): i32 {
   if kind == LBK_F32_LIST { return 5 }
   if kind == LBK_REF && slot >= 0 && slot < rlElemTyIx.length {
     if rlElemKindAt(slot) == RLK_UNION { return -2 }
+    if eqgInnerKind(slot) >= 0 { return -4 }
     if eqgElemHasEqRow(slot) { return -3 }
   }
   -1
@@ -18953,6 +18969,19 @@ function xrepElemEq(
   fnIx: i32,
 ) {
   const i = fA + 3
+  // Two inner lists stored apart: the same loop one level down, at the inner reps (D15092).
+  if eA == -4 && eB == -4 {
+    xrepElemRead(fA + 0, i, wA, bA, true)
+    xrepElemRead(fB + 1, i, wB, bB, true)
+    return emitListEqXCore(
+      body,
+      eqgInnerKind(sA),
+      eqgInnerSlot(sA),
+      eqgInnerKind(sB),
+      eqgInnerSlot(sB),
+      fnIx,
+    )
+  }
   if eA == -3 || eB == -3 {
     return emitEqGStructElemX(body, fA, fB, sA, sB, fnIx)
   }

@@ -562,7 +562,7 @@ import {
   vbV128Idx,
   vbV128Used,
 } from "./emit_state"
-import { memoKeyNew, memoMoved, tyRegNoteWrite, uFieldReLayNote } from "./memo"
+import { tyRegNoteWrite, uFieldReLayNote } from "./memo"
 import { emitFail, emitFailAt } from "./emit_bytes"
 import {
   anonRowOwnTyIx,
@@ -580,7 +580,6 @@ import {
   repRowOfTyStruct,
   repSigKindOfTy,
   repSigTokHasSlot,
-  repSlotOfTy,
   repTyHasArmShape,
   repVariantShapeRowOf,
   rlElemKindAt,
@@ -777,10 +776,9 @@ import {
 } from "./emit_obj_lit_fits"
 import { rlWidenTagOf } from "./emit_ref_list_kinds"
 import {
-  armMintShapeName,
   funcTypeShapeLowerable,
   gaeEnsure,
-  internInlineShapeFieldsTy,
+  internArmShapeRow,
   internInlineShapeTy,
   internOwnShapeOfTy,
   internShapeAs,
@@ -4344,12 +4342,22 @@ function leqxNoteSide(ix: i32, fnIx: i32) {
   if k < 0 { return 0 }
   let sl = 0
   if k == LBK_REF { sl = refListSlotOfExpr(ix, fnIx) }
-  // The levels below (a record element's string and list fields) reserve as a same-rep compare
-  // does; a rep with a core of its own reserves no generic frame there, so it is forced here.
+  leqxNoteRep(k, sl, 0)
+  0
+}
+
+// The frame of rep `(k, sl)` and, for a list of lists, every level below it. The levels below a
+// record element (its string and list fields) reserve as a same-rep compare does; a rep with a
+// core of its own reserves no generic frame there, so it is forced here.
+function leqxNoteRep(k: i32, sl: i32, depth: i32) {
+  if depth > 6 || k < 0 { return 0 }
   leqgNoteRep(k, sl, 0)
   if i32PairIndexOf(fnListEqGKinds, fnListEqGSlots, k, sl) < 0 {
     fnListEqGKinds.push(k)
     fnListEqGSlots.push(sl)
+  }
+  if k == LBK_REF && eqgInnerKind(sl) >= 0 {
+    leqxNoteRep(eqgInnerKind(sl), eqgInnerSlot(sl), depth + 1)
   }
   0
 }
@@ -7827,64 +7835,6 @@ function internArmShapeOfTy(ty: i32, depth: i32) {
   internArmShapeRow(repVariantShapeRowOf(ty))
 }
 
-// The mint itself, keyed on the variant ROW: a declared field type reaches it by name, an
-// anonymous literal's field value by the shape of the value (`repVariantShapeRowOf`).
-function internArmShapeRow(vi: i32) {
-  if vi < 0 { return 0 }
-  if vi >= uVarTyIx.length { return 0 }
-  const aty = uVarTyIx[vi]
-  if aty < 0 { return 0 }
-  const gen = tyRegGenNow()
-  if memoMoved(iasKey, 0, gen) { iasDone = [] }
-  if vi < iasDone.length && iasDone[vi] == aty + 1 { return 0 }
-  // D34 — no arena hint: banking `tyIx` into `sTyIx` would make `structIndexOfTy` answer this
-  // row for the arm's own node, turning off D34's decline module-wide. Found structurally
-  // instead; the arm's type reaches only its fields' element names.
-  let spell = armMintRenderOf(aty)
-  if spell == "" { spell = tyToEmitName(aty) }
-  internInlineShapeFieldsTy(armMintShapeName(spell), -1, aty)
-  if tyRegGenNow() == gen {
-    while iasDone.length <= vi { iasDone.push(0) }
-    iasDone[vi] = aty + 1
-  }
-  0
-}
-
-// The arm rows `internArmShapeRow` interned to no effect, by variant row, as the arm type plus
-// one; valid while the type-registry generation `iasKey` last read holds.
-const iasKey = memoKeyNew(1)
-let iasDone: i32[] = []
-
-// The spelling an arm's row is minted from: its fields by their declared record names when every
-// field is a declared record with its own row, which is the row the full render's nested intern
-// lands on, so the key and the row agree; otherwise "", and the caller renders it whole (D2780).
-function armMintRenderOf(aty: i32): string {
-  const t = tyAt(aty)
-  if t is TyObj {
-    let out = "{"
-    let fi = 0
-    while fi < t.objFieldNames.length {
-      const fnm = armMintFieldName(t.objFieldTypes[fi])
-      if fnm == "" { return "" }
-      if fi > 0 { out = out + "," }
-      out = out + t.objFieldNames[fi] + ":" + fnm
-      fi = fi + 1
-    }
-    return out + "}"
-  }
-  ""
-}
-
-// The declared name of record field type `ft` when that declaration owns the row its type
-// resolves to, else "".
-function armMintFieldName(ft: i32): string {
-  const nm = structNameOfTy(ft)
-  if nm == "" { return "" }
-  const si = structIndexOfTy(ft)
-  if si < 0 || repSlotOfTy(ft) != si { return "" }
-  nm
-}
-
 // Interns every inline-shape struct field type (`type Box = { inner: {x:i32} }`) depth-first
 // before the struct decls that reference it, so `collectS`'s main loop can resolve the nested
 // shape (`internInlineShape` shares the flat `sField*` arrays and cannot run mid-loop). A no-op
@@ -8355,6 +8305,11 @@ function collectVariantFields(stmts: i32[], name: string, ty: i32) {
               if variantNestedShapeOkTy(ftxt, fdRowOf(fnode.fdType)) {
                 code = FC_STRUCT
               }
+            }
+            // A field naming a declared record, the arm itself included, waits the same way: the
+            // record has no row until `collectS` runs (D3329).
+            if code < 0 && declStructNodeOf(stmts, nonNulBaseOf(ftxt)) >= 0 {
+              code = FC_STRUCT
             }
             if code < 0 {
               // The shape-text recorder's sentence, from the field's own node so the reader is pointed
