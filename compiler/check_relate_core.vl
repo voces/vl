@@ -275,7 +275,7 @@ import {
   storageListNote,
   zeroBytesFixIx,
 } from "./check_mismatch_notes"
-import { collectRetValues, joinArmIsLit } from "./check_nj_join"
+import { collectRetValues, isTopLevelStmt, joinArmIsLit } from "./check_nj_join"
 import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import { numCmpOp, numPairTy, valueTailSplit } from "./check_num_adopt"
 import {
@@ -524,6 +524,7 @@ import {
   cwGetRecv,
   cwHeldFnOf,
   cwIxWant,
+  cwKeyOfDecl,
   cwKeyOfRoot,
   cwParamArgs,
   cwPeel,
@@ -5567,8 +5568,80 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
       && (nW == 0
       || elabFnListWidened(bd)
       || elabFnSlotWidened(bd)
-      || path.length >= 2 && elabFnFieldWidened(bd, holeSlotFieldSteps(path))),
+      || path.length >= 2 && elabFnFieldWidened(bd, holeSlotFieldSteps(path))
+      || holeSlotRepointLift(bd, cwBindingOf(root), path)),
   )
+}
+
+// Whether the `let` `bd`, keyed `b`, is bound and re-pointed only to names of containers the
+// check widened to one set at element path `path` (a list's or map's `[]`, or a record field's
+// `f[]`), directly or through `let`s bound to such names, so its element is theirs. A module's
+// own `let` only (D15196).
+function holeSlotRepointLift(bd: i32, b: i32, path: string[]): boolean {
+  if !isTopLevelStmt(bd) { return false }
+  if path.length == 0 || path[path.length - 1] != "[]" { return false }
+  const steps = holeSlotFieldSteps(path)
+  if path.length > 1 && steps.length != path.length - 1 { return false }
+  holeSlotRepointSet(bd, b, steps, 0) >= 0
+}
+
+// The one set `holeSlotRepointLift` finds for `bd` at field `steps`, or -1.
+function holeSlotRepointSet(bd: i32, b: i32, steps: string[], depth: i32): i32 {
+  if depth > 8 || bd < 0 || bd >= P.nodes.length { return -1 }
+  const bn = nodeAt(bd)
+  if !(bn is LetDecl) || bn.letInit < 0 { return -1 }
+  const vals: i32[] = [bn.letInit]
+  for v in cwBindingWrittenValues(b) {
+    if !i32ListHas(vals, v) { vals.push(v) }
+  }
+  let set = -1
+  for v in vals {
+    const pv = parenPeelIx(v)
+    if pv < 0 || pv >= P.nodes.length || !(nodeAt(pv) is Ident) { return -1 }
+    const d = identDeclOf(pv)
+    if d < 0 || d == bd || !(nodeAt(d) is LetDecl) { return -1 }
+    let s = -1
+    const widened = if steps.length == 0 { elabFnListWidened(d) || elabFnSlotWidened(d) } else { elabFnFieldWidened(d, steps) }
+    if widened {
+      s = holeSlotElemSetAt(nodeTyIxOf(d), steps)
+    } else {
+      s = holeSlotRepointSet(d, cwKeyOfDecl(d), steps, depth + 1)
+    }
+    if s < 0 || set >= 0 && s != set { return -1 }
+    set = s
+  }
+  set
+}
+
+// The set the element type of the list or map at field `steps` of type `t` carries, or -1.
+function holeSlotElemSetAt(t: i32, steps: string[]): i32 {
+  let cur = t
+  for st in steps {
+    if cur < 0 || cur >= T.tys.length { return -1 }
+    const o = T.tys[cur]
+    if !(o is TyObj) { return -1 }
+    let next = -1
+    let i = 0
+    while i < o.objFieldNames.length {
+      if o.objFieldNames[i] == st { next = o.objFieldTypes[i] }
+      i = i + 1
+    }
+    cur = next
+  }
+  if cur < 0 || cur >= T.tys.length { return -1 }
+  const c = T.tys[cur]
+  match c {
+    TyArray => {
+      return fnTagSetOfTy(c.aElem)
+    }
+    TyMap => {
+      return fnTagSetOfTy(c.mVal)
+    }
+    // Only a list's or a map's element carries a set of functions written to it.
+    TyObj | TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
 }
 
 // The field names of element path `path` (`r.a.b[]`) before its element step; empty when a
