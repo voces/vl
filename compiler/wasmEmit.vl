@@ -1141,6 +1141,7 @@ import {
   eqCmpKindOfOperand,
   eqCoreKindOfBin,
   eqgListKindOfBin,
+  eqgListKindOfExpr,
   exprIsStrEq,
   exprIsStrIndexOf,
   exprIsStrOrder,
@@ -1155,6 +1156,7 @@ import {
   printUnionArmsUnrenderable,
   printUnionPlan,
   tailIsValueOrNever,
+  xrepEmitPair,
 } from "./emit_fn_scans"
 import {
   SPREAD_NUL_NONE,
@@ -10318,8 +10320,11 @@ function emitUnionNumCrossArm(sl: i32, sr: i32, ka: i32, kb: i32): boolean {
   true
 }
 
-// The `eq` opcode of number kind `k` (`i64`, `f32` or `f64`, the kinds a widening reaches), or -1.
+// The `eq` opcode of number kind `k` (`i32`, `i64`, `f32` or `f64`), or -1.
 function numEqOpOfKind(k: i32): i32 {
+  if k == 0 {
+    return 70 // 0x46 i32.eq
+  }
   if k == 3 {
     return 81 // 0x51 i64.eq
   }
@@ -18813,6 +18818,307 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
   fbI32Const(1)
   fbEnd()       // end (block)
   0
+}
+
+// `==` / `!=` over two lists stored apart (`xrepEmitPair`): both operands, then the
+// cross-rep loop, negated for `!=`.
+function emitListEqXBin(body: u8[], e: BinExpr, fnIx: i32) {
+  const kA = eqgListKindOfExpr(e.binLeft, fnIx)
+  const kB = eqgListKindOfExpr(e.binRight, fnIx)
+  let sA = 0
+  if kA == LBK_REF { sA = refListSlotOfExpr(e.binLeft, fnIx) }
+  let sB = 0
+  if kB == LBK_REF { sB = refListSlotOfExpr(e.binRight, fnIx) }
+  if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+  if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
+  svSyncRecv(e.binLeft, fnIx)
+  if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+  if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
+  svSyncRecv(e.binRight, fnIx)
+  if emitListEqXCore(body, kA, sA, kB, sB, fnIx) < 0 { return -1 }
+  if e.binOp == "!=" { fbI32Eqz() }
+  0
+}
+
+// The number kind a list rep's elements hold (0 i32, 3 i64, 4 f64, 5 f32) for a plain number
+// list, -2 for a list of union boxes, -3 for a list of records compared field-wise, or -1.
+function xrepElemKind(kind: i32, slot: i32): i32 {
+  if kind == LBK_I32_LIST { return 0 }
+  if kind == LBK_I64_LIST { return 3 }
+  if kind == LBK_F64_LIST { return 4 }
+  if kind == LBK_F32_LIST { return 5 }
+  if kind == LBK_REF && slot >= 0 && slot < rlElemTyIx.length {
+    if rlElemKindAt(slot) == RLK_UNION { return -2 }
+    if eqgElemHasEqRow(slot) { return -3 }
+  }
+  -1
+}
+
+// The two-rep list compare: the wrappers parked in frame `fA`'s A slot and frame `fB`'s B
+// slot, `fA`'s length and index, and each element pair compared by value at the wider number
+// (D15055). Leaves the 0/1 equality.
+function emitListEqXCore(
+  body: u8[],
+  kA: i32,
+  sA: i32,
+  kB: i32,
+  sB: i32,
+  fnIx: i32,
+) {
+  const fA = leqgBaseOfRep(kA, sA)
+  const fB = leqgBaseOfRep(kB, sB)
+  const eA = xrepElemKind(kA, sA)
+  const eB = xrepElemKind(kB, sB)
+  if fA < 0 || fB < 0 || eA == -1 || eB == -1 {
+    return emitFail(
+      "emitProgram: a list compare across two element storages has no frame or element rep",
+    )
+  }
+  const wA = catWrapIdxOf(kA, sA)
+  const bA = catBackIdxOf(kA, sA)
+  const wB = catWrapIdxOf(kB, sB)
+  const bB = catBackIdxOf(kB, sB)
+  fbLocalSet(fB + 1) // B
+  fbLocalSet(fA + 0) // A
+  fbBlock(127)
+  fbLocalGet(fA + 0)
+  fbStructGet(wA, 1)
+  fbLocalSet(fA + 2) // n = lenA
+  fbLocalGet(fA + 2)
+  fbLocalGet(fB + 1)
+  fbStructGet(wB, 1)
+  fbI32Bin(71)       // i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(1)
+  fbEnd()
+  fbI32Const(0)
+  fbLocalSet(fA + 3) // i = 0
+  fbLoop(64)
+  fbLocalGet(fA + 3)
+  fbLocalGet(fA + 2)
+  fbI32Bin(78)       // i32.ge_s
+  fbIf(64)
+  fbElse()
+  if xrepElemEq(body, fA, fB, wA, bA, wB, bB, eA, eB, sA, sB, fnIx) < 0 {
+    return -1
+  }
+  fbI32Eqz()
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)
+  fbEnd()
+  fbLocalGet(fA + 3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(fA + 3)
+  fbBr(1)
+  fbEnd()
+  fbEnd()
+  fbI32Const(1)
+  fbEnd()
+  0
+}
+
+// Element `i` (frame `fA`'s index) of the wrapper in local `wl`.
+function xrepElemRead(
+  wl: i32,
+  iLocal: i32,
+  wrap: i32,
+  back: i32,
+  isRef: boolean,
+) {
+  fbLocalGet(wl)
+  fbStructGet(wrap, 0)
+  fbLocalGet(iLocal)
+  fbArrayGet(back)
+  if isRef { fbRefAsNonNull() }
+  0
+}
+
+// One element pair of `emitListEqXCore`, leaving the 0/1 equality: two numbers at the wider
+// kind, two boxes through the staged union compare, or a box against a number.
+function xrepElemEq(
+  body: u8[],
+  fA: i32,
+  fB: i32,
+  wA: i32,
+  bA: i32,
+  wB: i32,
+  bB: i32,
+  eA: i32,
+  eB: i32,
+  sA: i32,
+  sB: i32,
+  fnIx: i32,
+) {
+  const i = fA + 3
+  if eA == -3 || eB == -3 {
+    return emitEqGStructElemX(body, fA, fB, sA, sB, fnIx)
+  }
+  if eA >= 0 && eB >= 0 {
+    const wide = xrepWideKind(eA, eB)
+    xrepElemRead(fA + 0, i, wA, bA, false)
+    const upA = widenConvOpOfKinds(eA, wide)
+    if upA >= 0 { wU8(upA) }
+    xrepElemRead(fB + 1, i, wB, bB, false)
+    const upB = widenConvOpOfKinds(eB, wide)
+    if upB >= 0 { wU8(upB) }
+    wU8(numEqOpOfKind(wide))
+    return 0
+  }
+  if eA == -2 && eB == -2 {
+    const unA = rlElemName[sA]
+    const unB = rlElemName[sB]
+    const armsA: string[] = []
+    const visA: i32[] = []
+    const aksA: i32[] = []
+    const armsB: string[] = []
+    const visB: i32[] = []
+    const aksB: i32[] = []
+    if (
+      !unionBoxEqColumns(unA, armsA, visA, aksA)
+      || !unionBoxEqColumns(unB, armsB, visB, aksB)
+    ) {
+      return emitFail(
+        "emitProgram: list compare over a union element with no arm columns",
+      )
+    }
+    xrepElemRead(fA + 0, i, wA, bA, true)
+    xrepElemRead(fB + 1, i, wB, bB, true)
+    return emitUnionBoxEqStagedX(
+      body,
+      armsA,
+      visA,
+      aksA,
+      aksB,
+      false,
+      unA,
+      fnIx,
+    )
+  }
+  // A box against a number, the box read first whichever side holds it.
+  let boxSlot = sA
+  let numKind = eB
+  if eA == -2 {
+    xrepElemRead(fA + 0, i, wA, bA, true)
+  } else {
+    boxSlot = sB
+    numKind = eA
+    xrepElemRead(fB + 1, i, wB, bB, true)
+  }
+  const bs = unionAsBoxSlot()
+  fbLocalSet(bs)
+  if eA == -2 {
+    xrepElemRead(fB + 1, i, wB, bB, false)
+  } else {
+    xrepElemRead(fA + 0, i, wA, bA, false)
+  }
+  const os = numCrossEqSlot(numKind)
+  fbLocalSet(os)
+  const arms: string[] = []
+  const vis: i32[] = []
+  const aks: i32[] = []
+  if !unionBoxEqColumns(rlElemName[boxSlot], arms, vis, aks) {
+    return emitFail(
+      "emitProgram: list compare over a union element with no arm columns",
+    )
+  }
+  let opened = 0
+  for an in arms {
+    const ka = valueAtomKind(an)
+    const wide = xrepWideKind(ka, numKind)
+    if ka >= 0 && wide >= 0 && numEqOpOfKind(wide) >= 0 {
+      fbLocalGet(bs)
+      fbStructGet(uBoxIdx, 0)
+      fbI32Rel(RS_TAG, scalarTagOfKind(ka))
+      fbI32Bin(70)
+      fbIf(127)
+      fbLocalGet(bs)
+      if emitUnionUnboxTail(ka) < 0 { return -1 }
+      const up1 = widenConvOpOfKinds(ka, wide)
+      if up1 >= 0 { wU8(up1) }
+      fbLocalGet(os)
+      const up2 = widenConvOpOfKinds(numKind, wide)
+      if up2 >= 0 { wU8(up2) }
+      wU8(numEqOpOfKind(wide))
+      fbElse()
+      opened = opened + 1
+    }
+  }
+  fbI32Const(0)
+  while opened > 0 {
+    fbEnd()
+    opened = opened - 1
+  }
+  0
+}
+
+// `emitEqGStructElem` across two list reps of one record, one of them nullable: element `i` of
+// frame `fA`'s A wrapper and of frame `fB`'s B wrapper, both stashed at the nullable slot's
+// element type, then compared field-wise under the null guard. Leaves the 0/1 equality.
+function emitEqGStructElemX(
+  body: u8[],
+  fA: i32,
+  fB: i32,
+  sA: i32,
+  sB: i32,
+  fnIx: i32,
+) {
+  if (
+    !eqgElemHasEqRow(sA)
+    || !eqgElemHasEqRow(sB)
+    || eqgElemEqRow(sA) != eqgElemEqRow(sB)
+  ) {
+    return emitFail(
+      "emitProgram: a record-list compare across two storages has no one interned shape",
+    )
+  }
+  const row = eqgElemEqRow(sA)
+  let ns = sA
+  if !(sA < rlElemNullable.length && rlElemNullable[sA] == 1) { ns = sB }
+  const sa = listElemStashSlot("ref", ns)
+  const sb = listElemStashSlot("ref", ns)
+  fbLocalGet(fA + 0)
+  fbStructGet(catWrapIdxOf(LBK_REF, sA), 0)
+  fbLocalGet(fA + 3)
+  fbArrayGet(catBackIdxOf(LBK_REF, sA))
+  fbLocalSet(sa)
+  fbLocalGet(fB + 1)
+  fbStructGet(catWrapIdxOf(LBK_REF, sB), 0)
+  fbLocalGet(fA + 3)
+  fbArrayGet(catBackIdxOf(LBK_REF, sB))
+  fbLocalSet(sb)
+  fbLocalGet(sa)
+  fbRefIsNull()
+  fbLocalGet(sb)
+  fbRefIsNull()
+  fbI32Bin(114) // i32.or
+  fbIf(127)
+  fbLocalGet(sa)
+  fbRefIsNull()
+  fbLocalGet(sb)
+  fbRefIsNull()
+  fbI32And()
+  fbElse()
+  const savedL = eqStashL
+  const savedR = eqStashR
+  eqStashL = sa
+  eqStashR = sb
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  const r = emitStructEqRec(body, -2, -3, row, pathSi, pathFi, fnIx)
+  eqStashL = savedL
+  eqStashR = savedR
+  fbEnd()
+  r
+}
+
+// The kind two number kinds compare at: the same kind, or the one the other widens to; -1 for
+// a pair neither widens.
+function xrepWideKind(a: i32, b: i32): i32 {
+  if a == b { return a }
+  wideKindOf(a, b)
 }
 
 // The reserved LEQG frame base for compare rep `(kind, slot)`, or -1, over the pair the
@@ -36872,13 +37178,16 @@ function emitBinLitEq(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
           + "` over this operand rep has no lowering",
       )
     }
-    if binEqGRepUnresolved(exprIx, fnIx) {
+    // Two number lists stored apart compare across their reps, below (D15055).
+    const xrep = xrepEmitPair(e, fnIx)
+    if !xrep && binEqGRepUnresolved(exprIx, fnIx) {
       return emitFail(
         "emitProgram: the two operands of this list `"
           + e.binOp
           + "` do not resolve to one comparable list rep",
       )
     }
+    if xrep { return emitListEqXBin(body, e, fnIx) }
     const nulNiche = binEqNulNiche(exprIx, fnIx)
     if nulNiche != "" {
       if emitNulNicheEq(body, exprIx, fnIx, nulNiche) < 0 { return -1 }
@@ -36934,6 +37243,8 @@ function emitBinRefOps(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // `listOpKindOfBin` branch because its own home already declines every shape that branch
   // claims, and below the `+` concat arm because the two operators never overlap.
   if e.binOp == "==" || e.binOp == "!=" {
+    // Two number lists stored apart: one loop reading each side at its own rep (D15055).
+    if xrepEmitPair(e, fnIx) { return emitListEqXBin(body, e, fnIx) }
     const gK = eqgListKindOfBin(exprIx, fnIx, lopK)
     if gK >= 0 {
       if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
