@@ -96,7 +96,14 @@ import {
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
-import { cwFnValueDeclOf } from "./check_write_scan"
+import {
+  CW_UP_ARG,
+  cwFnValueDeclOf,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwIxWant,
+} from "./check_write_scan"
 import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
 import {
   REC_REBUILT_DEPTH,
@@ -117,7 +124,10 @@ import { collectRetValues, joinArmIsLit } from "./check_nj_join"
 import {
   callBindAgreedHoles,
   callBindHas,
+  callBindRepKeyedAt,
+  callBindRepMixedAt,
   callBindRepTyOf,
+  callBindRowOf,
   callBindTyOf,
   callNumJoined,
   holeLitCopiesOf,
@@ -635,6 +645,7 @@ import {
   elabCallSetIn,
   elabCopyTyOwn,
   elabDemand,
+  elabHolderRecordAt,
   elabHoleMapClosed,
   elabInstSlotAt,
   elabInstSpelling,
@@ -1203,11 +1214,38 @@ export function monoArgPinTyIx(ix: i32, fnIx: i32) {
   // A literal the record solve built at another record banks that build, as its pin names it.
   const lb = monoLitBuiltTy(ax)
   if lb >= 0 { return lb }
+  const rr = monoArgRepRowTy(ax)
+  if rr >= 0 { return rr }
   const cpy = recCopyTyOf(ax)
   if cpy >= 0 && cpy < T.tys.length && monoRecordNominalPin(cpy) != "" {
     return cpy
   }
   own
+}
+
+// The record argument `ax`'s call's rep row binds its parameter at (`callArgRepTy`), where the
+// checker keys or pins the call there and that is another record than its own type; else -1.
+function monoArgRepRowTy(ax: i32): i32 {
+  cwIxWant()
+  if ax < 0 || ax >= cwIxUpKind.length || cwIxUpKind[ax] != CW_UP_ARG {
+    return -1
+  }
+  const c = cwIxUp[ax]
+  const own = nodeTyIxOf(ax)
+  if c < 0 || c >= P.nodes.length || own < 0 || own >= T.tys.length {
+    return -1
+  }
+  // Only a row the checker keys at its rep, or one it pins argument by argument (mixed).
+  const row = callBindRowOf(c)
+  if row < 0 || !(callBindRepKeyedAt(row) || callBindRepMixedAt(row)) {
+    return -1
+  }
+  const r = callArgRepTy(c, cwIxUpAux[ax], own)
+  if r < 0 || r >= T.tys.length || tySame(r, own) || !(tyAt(r) is TyObj) {
+    -1
+  } else {
+    r
+  }
 }
 
 // The record the record solve built list or record literal `ax` at, where that is not its own
@@ -2672,6 +2710,9 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
   // A list or record literal the record solve built at another record pins at that build (D15181).
   const lb = monoLitBuiltTy(cax)
   if lb >= 0 { return monoRecordNominalPin(lb) }
+  // An argument its call's rep row binds at another record pins there, as elaboration keys it.
+  const rr = monoArgRepRowTy(cax)
+  if rr >= 0 { return monoRecordNominalPin(rr) }
   // A call copied where it is delivered pins at the declared record its copy lands in (D15183).
   const cpy = recCopyTyOf(cax)
   if cpy >= 0 && cpy < T.tys.length {
@@ -23514,22 +23555,35 @@ function monoConstFnCopy(d: i32): boolean {
 }
 
 // `monoParamReadOtherThanCalled` over function body `body`, where with `fwd` a return of `par`
-// from the function itself, by `return` or as the body's last statement, is not counted either.
+// from the function itself, by `return` or as the body's last statement, is not counted either,
+// nor is a copy the elaboration holds the record in under callee instance `hk`.
 function monoBodyReadsOtherThanCalled(
   body: i32,
   par: i32,
   fwd: boolean,
+  hk: i32,
 ): boolean {
   if body < 0 { return false }
   const b = nodeAt(body)
-  if !fwd || !(b is Block) {
+  if !(b is Block) {
     return monoParamReadOtherThanCalled(body, par, true, fwd, fwd)
+  }
+  if !fwd {
+    for st in b.blkStmts {
+      if (
+        !monoCopyHeld(st, par, hk)
+        && monoParamReadOtherThanCalled(st, par, true, false, false)
+      ) {
+        return true
+      }
+    }
+    return false
   }
   let i = 0
   while i < b.blkStmts.length {
     const st = b.blkStmts[i]
     const last = i == b.blkStmts.length - 1
-    if !(last && monoIsParamRead(st, par)) && monoStmtReadsOther(st, par) {
+    if !(last && monoIsParamRead(st, par)) && monoStmtReadsOther(st, par, hk) {
       return true
     }
     i = i + 1
@@ -23543,11 +23597,22 @@ function monoIsParamRead(x: i32, par: i32): boolean {
   u >= 0 && nodeAt(u) is Ident && identDeclOf(u) == par
 }
 
+// Whether statement `x` is a copy of parameter `par` the elaboration holds the record in under
+// callee instance `hk`.
+function monoCopyHeld(x: i32, par: i32, hk: i32): boolean {
+  if hk < 0 || x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  n is LetDecl
+    && monoIsParamRead(n.letInit, par)
+    && elabHolderRecordAt(x, hk).length > 0
+}
+
 // `monoBodyReadsOtherThanCalled` for statement `x` of the function's own body.
-function monoStmtReadsOther(x: i32, par: i32): boolean {
+function monoStmtReadsOther(x: i32, par: i32, hk: i32): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   const n = nodeAt(x)
   if n is RetStmt && monoIsParamRead(n.retArg, par) { return false }
+  if monoCopyHeld(x, par, hk) { return false }
   if (
     n is Block
     || n is IfStmt
@@ -23556,7 +23621,7 @@ function monoStmtReadsOther(x: i32, par: i32): boolean {
     || n is ForRange
   ) {
     for k in nodeChildren(x) {
-      if monoStmtReadsOther(k, par) { return true }
+      if monoStmtReadsOther(k, par, hk) { return true }
     }
     return false
   }
@@ -23582,7 +23647,9 @@ function monoBundlePin(
   // The callee reads the record only as a callee, or hands it whole to a named function: any other
   // read wants one closure.
   const fwd = fsModeOf() == FS_COMPILE
-  if monoBodyReadsOtherThanCalled(fn.fnBody, par, fwd) { return 1 }
+  const pk = elabCallParamKey(monoCallTplOf(callIx), i)
+  const hk = if pk >= 0 { pk / 64 } else { -1 }
+  if monoBodyReadsOtherThanCalled(fn.fnBody, par, fwd, hk) { return 1 }
   const at = pinTys.length
   const rc = monoBundlePinArg(arg, i, callIx, ctx, sigs, pinned, pinTys)
   // The record each parameter key is pinned at, read by a hand of that parameter.
