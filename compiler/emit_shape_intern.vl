@@ -9,9 +9,13 @@ import {
   tyIsValueUnion,
 } from "./check_ty_rep"
 import {
+  T,
   TyArray,
+  TyLit,
   TyNullable,
   TyObj,
+  TyPrim,
+  TyUnion,
   TyVar,
   structNameOfTy,
   tyAt,
@@ -22,13 +26,8 @@ import {
   tyIsLitUnionArray,
   tyToEmitName,
   tyToNominalName,
-  T,
-  TyLit,
-  TyPrim,
-  TyUnion,
 } from "./check_types"
 import { declAnnTyOf } from "./check_gen_alias_anns"
-import { nominalStructNameOfTy } from "./check_emit_queries"
 import {
   sFieldElemNameAt,
   sFieldTypeAt,
@@ -195,22 +194,17 @@ import {
 } from "./tyquery"
 
 // `nameFieldCode` with the caller's recorded arena type for the field — arena rung first,
-// the spelling ladder unchanged behind it, then the arena's `S[] | null` rung last.
+// the spelling ladder unchanged behind it, then the arena's `S[] | null` rung last. The type
+// answers first where the spelling cannot: a lone string literal is its atom, an `i32` list
+// behind `| null` is 18, a list of integer literals the `i32` list.
 export function nameFieldCodeTy(t: string, ty: i32): i32 {
   if ty >= 0 && ty < T.tys.length {
     const xt = tyAt(ty)
     if xt is TyLit && xt.litKind == "str" { return FC_I32 }
-    if xpRecordHasRow(ty) { return FC_STRUCT }
-    if xt is TyNullable {
-      let inner = xt.nInner
-      if inner >= 0 && inner < T.tys.length {
-        const it = tyAt(inner)
-        if it is TyUnion && it.uMembers.length == 1 { inner = it.uMembers[0] }
-      }
-      if xpRecordHasRow(inner) { return FC_STRUCT }
-      if xpIsI32List(inner) { return FC_NUL_I32_LIST }
+    if xt is TyNullable && nfcIsI32List(nfcPeelOne(xt.nInner)) {
+      return FC_NUL_I32_LIST
     }
-    if xt is TyArray && xpIsIntLitUnion(xt.aElem) { return FC_I32_LIST }
+    if xt is TyArray && nfcIsIntLitUnion(xt.aElem) { return FC_I32_LIST }
   }
   const a = fieldCodeOfTy(ty)
   if a != -2 { return a }
@@ -1909,25 +1903,36 @@ function markRefArrayArmsOf(atoms: string[], mems: i32[], cov: boolean) {
   0
 }
 
-function xpIsI32List(ty: i32): boolean {
+// `ty` with a one-member union alias peeled.
+function nfcPeelOne(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = tyAt(ty)
+  if t is TyUnion && t.uMembers.length == 1 { return t.uMembers[0] }
+  ty
+}
+
+// Whether `ty` stores as an `i32` list: a list of `i32`, `boolean` or integer literals, or a
+// union whose members all do.
+function nfcIsI32List(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   if t is TyUnion {
     if t.uMembers.length < 1 { return false }
     for m in t.uMembers {
-      if !xpIsI32List(m) { return false }
+      if !nfcIsI32List(m) { return false }
     }
     return true
   }
   if !(t is TyArray) { return false }
   const e = t.aElem
   if e < 0 || e >= T.tys.length { return false }
-  if xpIsIntLitUnion(e) { return true }
+  if nfcIsIntLitUnion(e) { return true }
   const et = tyAt(e)
   et is TyPrim && (et.primName == "i32" || et.primName == "boolean")
 }
 
-function xpIsIntLitUnion(ty: i32): boolean {
+// Whether `ty` is a union of integer literals, stored as `i32`.
+function nfcIsIntLitUnion(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   if !(t is TyUnion) || t.uMembers.length < 1 { return false }
@@ -1937,11 +1942,4 @@ function xpIsIntLitUnion(ty: i32): boolean {
     if !(mt is TyLit) || mt.litKind != "int" { return false }
   }
   true
-}
-
-function xpRecordHasRow(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  if !(tyAt(ty) is TyObj) { return false }
-  if nominalStructNameOfTy(ty) != "" { return true }
-  structIndexOfTy(ty) >= 0 || repRowOfTyStruct(ty, sScanLim()) >= 0
 }
