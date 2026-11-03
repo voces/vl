@@ -160,8 +160,8 @@ key. And mono asks for a callback with no instance in hand.
 **S2a''s exit criterion.** No lambda key is minted with parent -1 inside an open encloser. These are
 the readers that still ask with no instance (`from` -1), the list S2a' empties:
 
-* `elabDemandFrom`'s callers at `elabDemand` and at two arguments' demands (`elabArgResultAt`'s
-  neighbours);
+* `elabDemandFrom`'s callers that pass no instance: `elabDemandCandidate`, `elabArmEarly` and
+  `elabHoleCallAt`;
 * the hole-row drain's template rows (`elabHolePinNote` outside a live re-check);
 * `elabEarlyCallRows`, `elabArgValueRows`, `elabListSigRow`, `elabSetRepRow`, `elabLamRepInstance`,
   `elabSoleRekey`, `elabEnqueueAtParams` and `elabArgResultAt`.
