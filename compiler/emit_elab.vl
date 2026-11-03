@@ -4319,7 +4319,7 @@ let elabResReads: {[i32]: i32} = Map()
 let elabResThrough: {[i32]: i32[]} = Map()
 let elabResCalleeOf: {[i32]: i32} = Map()
 let elabResStmt: {[i32]: boolean} = Map()
-let elabResArgOf: {[i32]: i32[]} = Map()
+let elabResArgOf: {[i32]: i32} = Map()
 // Per binding, the (call, argument index) pairs that hand its read on whole.
 let elabResHands: {[i32]: i32[]} = Map()
 // Per call, the member of the record its callee returns that the call's value is used as (-1
@@ -4371,9 +4371,19 @@ function elabResScanIdent(g: i32) {
   const n = nodeAt(g)
   if n is Ident {
     const d = identDeclOf(g)
-    if d >= 0 { elabResReads[d] = (elabResReads.get(d) ?? 0) + 1 }
+    if elabResMayHold(d) { elabResReads[d] = (elabResReads.get(d) ?? 0) + 1 }
   }
   0
+}
+
+// Whether declaration `d` can hold a call's value: a `const` initialised by a call. The scan
+// banks reads of such a binding alone, as nothing else can be a holder.
+function elabResMayHold(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letKw != "const" || n.letInit < 0 { return false }
+  const v = parenPeelIx(n.letInit)
+  v >= 0 && nodeAt(v) is Call
 }
 
 // A call through a binding, and a call that is another call's callee.
@@ -4383,21 +4393,25 @@ function elabResScanCall(g: i32) {
     const cf = parenPeelIx(n.callFn)
     if cf >= 0 && nodeAt(cf) is Ident {
       const d = identDeclOf(cf)
-      const at = elabResThrough.get(d) ?? []
-      at.push(g)
-      elabResThrough[d] = at
+      if elabResMayHold(d) {
+        const at = elabResThrough.get(d) ?? []
+        at.push(g)
+        elabResThrough[d] = at
+      }
     }
     if cf >= 0 && nodeAt(cf) is Call { elabResCalleeOf[cf] = g }
     let i = 0
-    while i < n.callArgs.length {
+    while i < n.callArgs.length && i < 64 {
       const a = parenPeelIx(n.callArgs[i])
-      if a >= 0 && nodeAt(a) is Call { elabResArgOf[a] = [g, i] }
+      if a >= 0 && nodeAt(a) is Call { elabResArgOf[a] = g * 64 + i }
       if a >= 0 && nodeAt(a) is Ident {
         const ad = identDeclOf(a)
-        const hs = elabResHands.get(ad) ?? []
-        hs.push(g)
-        hs.push(i)
-        elabResHands[ad] = hs
+        if elabResMayHold(ad) {
+          const hs = elabResHands.get(ad) ?? []
+          hs.push(g)
+          hs.push(i)
+          elabResHands[ad] = hs
+        }
       }
       i = i + 1
     }
@@ -4546,19 +4560,21 @@ function elabHandTakesRecord(x: i32, i: i32, from: i32, rec: i32[]): boolean {
 // argument to a parameter whose instance calls it at the same signatures: the call keeps the
 // record whole, and the outer call's argument is noted as delivering it.
 function elabArgRecordNote(c: i32, from: i32, kc: i32) {
-  const at = elabResArgOf.get(c) ?? []
-  if at.length < 2 || kc < 0 { return 0 }
+  const packed = elabResArgOf.get(c) ?? -1
+  if packed < 0 || kc < 0 { return 0 }
+  const outer = packed / 64
+  const ai = packed % 64
   const rec = elabReturnedBundleSigs(kc)
   if rec.length < 2 { return 0 }
-  const ko = elabCallInstFrom(at[0], from)
-  if ko < 0 || at[1] >= 64 { return 0 }
-  const want = elabBundleSigs.get(elabBundleKey(ko, at[1])) ?? []
+  const ko = elabCallInstFrom(outer, from)
+  if ko < 0 { return 0 }
+  const want = elabBundleSigs.get(elabBundleKey(ko, ai)) ?? []
   if !elabSigsPermute(want, rec) { return 0 }
   // The parameter takes the record as it is built, so its signatures take the record's order.
-  elabBundleSigs[elabBundleKey(ko, at[1])] = rec.slice(0)
+  elabBundleSigs[elabBundleKey(ko, ai)] = rec.slice(0)
   elabRecTable.push(rec)
   elabTriplePut(elabResKeeps, c, from, 1)
-  elabTriplePut(elabArgRecs, at[0] * 64 + at[1], from, elabRecTable.length - 1)
+  elabTriplePut(elabArgRecs, packed, from, elabRecTable.length - 1)
   0
 }
 
