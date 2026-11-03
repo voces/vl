@@ -1800,7 +1800,9 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   const copies: i32[] = []
+  const copyTys: i32[] = []
   for cs in recSiteCopies { copies.push(cs) }
+  for ct in recSiteCopyTys { copyTys.push(ct) }
   const via: i32[] = []
   const leaves = recFnValueOrigins(fd, via)
   if leaves.length == 0 { return false }
@@ -1848,9 +1850,12 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   // A leaf calling another such function hands the destination on to it (D8143).
   for cl in calls { recAdoptNote(cl, nodeTyIxOf(cl), dst) }
   // A held-pinned call is built at `dst` and copied to its own record where it is delivered.
-  for cp in copies {
+  let ci = 0
+  while ci < copies.length {
+    const cp = copies[ci]
     while recCopyTyIx.length <= cp { recCopyTyIx.push(-1) }
-    recCopyTyIx[cp] = own
+    recCopyTyIx[cp] = copyTys[ci]
+    ci = ci + 1
   }
   true
 }
@@ -1890,6 +1895,7 @@ function recFnReturns(fd: i32): i32[] {
 // `recNullWidened` reads back exactly, and its slots take the build (D8302).
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   recSiteCopies = []
+  recSiteCopyTys = []
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
   for s in sites {
@@ -1899,10 +1905,15 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     const mapped = recHeldStored(c)
     // A held-pinned call is built at `dst` and copied to its own record where that loses nothing.
     if recHeldPinnedArg(c) {
-      if mapped || !recHeldPinBare(c) || !recCopyNarrows(dst, own) {
+      if (
+        mapped
+        || !(recHeldPinBare(c) || recTyArgPinBare(c, own))
+        || !recCopyNarrows(dst, own)
+      ) {
         return false
       }
       recSiteCopies.push(c)
+      recSiteCopyTys.push(recCopyDstOf(c, own))
       continue
     }
     const at = if mapped { -1 } else { recQueuedLandingOf(c, own, dst) }
@@ -1920,8 +1931,17 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   hasCall
 }
 
-// The held-pinned calls the last `recSitesLandAt` answer copies to their own record.
+// The held-pinned calls the last `recSitesLandAt` answer copies to their own record, and beside
+// each the record it is copied into.
 let recSiteCopies: i32[] = []
+let recSiteCopyTys: i32[] = []
+
+// The record call `c` of own type `own` is copied into: the type its pin names, which a written
+// type argument spells as a declared record, else `own` (D14818).
+function recCopyDstOf(c: i32, own: i32): i32 {
+  const pt = recReachPinTy(c)
+  if pt >= 0 && fieldStorageEq(pt, own, REC_STORE_DEPTH) { pt } else { own }
+}
 
 // Whether call `c` is a direct argument to a parameter typed `T` that another direct argument, a
 // held value, binds at a parameter typed `T` too: the instance is that value's.
@@ -1957,6 +1977,17 @@ function recHeldPinBare(c: i32): boolean {
     j = j + 1
   }
   false
+}
+
+// Whether call `c` is a direct argument to a parameter typed `T` of a call whose written type
+// arguments bind `T` at a record storing as `own` (D14818).
+function recTyArgPinBare(c: i32, own: i32): boolean {
+  if c < 0 || c >= cwIxUpKind.length || cwIxUpKind[c] != CW_UP_ARG {
+    return false
+  }
+  if !callHasTyArgs(cwIxUp[c]) { return false }
+  const pt = recReachPinTy(c)
+  pt >= 0 && fieldStorageEq(pt, own, REC_STORE_DEPTH)
 }
 
 // The type name parameter `px` is annotated with, or "" for none or a composite annotation.
@@ -2929,15 +2960,7 @@ export function recBuiltReadRefuse(u: i32) {
   const bt = recBuiltReadTy(p)
   if bt < 0 || own < 0 { return 0 }
   if !(nodeAt(p) is BinExpr) && recArgTakesRep(p, 4) { return 0 }
-  // A function's result handed to an annotated parameter is kept at the parameter's type, so an
-  // instance at the build cannot read it (D15124).
-  if (
-    !(nodeAt(p) is BinExpr)
-    && !recBuiltViaFnResult(p, REC_STORE_DEPTH)
-    && recAnnArgTakesRep(p, nonNullTy(bt))
-  ) {
-    return 0
-  }
+  if !(nodeAt(p) is BinExpr) && recAnnArgTakesRep(p, nonNullTy(bt)) { return 0 }
   // A `??` whose default is a fresh record literal builds the literal at the read's record too.
   if recCoalesceLitBuilt(p, nonNullTy(bt)) { return 0 }
   if recAsgIntoBuiltAt(p, nonNullTy(bt)) { return 0 }
@@ -2945,17 +2968,6 @@ export function recBuiltReadRefuse(u: i32) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
   }
   0
-}
-
-// Whether read `x` is, or is a binding holding, a call of an inferred function (`recInferredFnOf`).
-function recBuiltViaFnResult(x: i32, depth: i32): boolean {
-  if depth <= 0 || x < 0 || x >= P.nodes.length { return false }
-  if nodeAt(x) is Call {
-    return recInferredFnOf(x) >= 0 && recIdentityArgOf(x) < 0
-  }
-  const d = if nodeAt(x) is Ident { recHeldDecl(x) } else { -1 }
-  const dn = if d >= 0 { nodeAt(d) } else { null }
-  dn is LetDecl && recBuiltViaFnResult(cwPeelValue(dn.letInit), depth - 1)
 }
 
 // Whether `p` is assigned into an un-annotated binding whose initialiser is a built read at
@@ -3442,6 +3454,8 @@ export function storeWritePush(v: i32, recv: i32, field: string) {
 // results are built at where that is another than its own type (`storeLetsResolve`), by call node.
 let storeLetInit: i32[] = []
 let storeLetBuilt: {[i32]: i32} = Map()
+// The un-annotated functions a check queued, for `storeRetsResolve`.
+let storeFnQueue: i32[] = []
 
 // Queues the initializer `init` of an un-annotated binding for `storeLetsResolve`.
 export function storeLetPush(init: i32) {
@@ -3449,6 +3463,14 @@ export function storeLetPush(init: i32) {
   storeLetInit.push(init)
   0
 }
+// Queues the un-annotated, non-generic function `fd` for `storeRetsResolve`.
+export function storeFnPush(fd: i32) {
+  if fd < 0 || !stampsStand() || elabCapLive() { return 0 }
+  storeFnQueue.push(fd)
+  0
+}
+export function storeFnCount(): i32 { storeFnQueue.length }
+export function storeFnAt(i: i32): i32 { storeFnQueue[i] }
 export function storeLetCount(): i32 { storeLetInit.length }
 export function storeLetInitAt(i: i32): i32 { storeLetInit[i] }
 export function storeLetBuiltSet(call: i32, rec: i32) {
@@ -3474,6 +3496,7 @@ export function storeWriteFieldAt(i: i32): string { storeWriteField[i] }
 export function storeWriteFnAt(i: i32): i32 { storeWriteFn[i] }
 export function storeWritesClear() {
   storeLetInit = []
+  storeFnQueue = []
   storeWriteVal = []
   storeWriteRecv = []
   storeWriteField = []
@@ -6349,6 +6372,9 @@ function repStamp(ix: i32, t: i32): i32 {
 
 // Stamps the list literal `l` with the list type `ty` its elements are built as; 1.
 export function repStampListBuilt(l: i32, ty: i32): i32 { repStamp(l, ty) }
+
+// Stamps the returned read `x` with the record `t` its container builds it at; 1.
+export function repStampHeldRead(x: i32, t: i32): i32 { repStamp(x, t) }
 
 // Records union `u` as the one literal `ix` is adopted into an arm of, beside its rep stamp; 1.
 function repStampUnion(ix: i32, u: i32): i32 {
