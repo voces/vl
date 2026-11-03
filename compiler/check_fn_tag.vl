@@ -78,7 +78,7 @@ import {
 import { valueTailSplit } from "./check_num_adopt"
 import { collectRetValues } from "./check_nj_join"
 import { rcwInferredRetTy } from "./check_rcw"
-import { tErr } from "./check_relate_core"
+import { tErr, widenLitTy } from "./check_relate_core"
 import {
   T,
   TY_VOID,
@@ -677,7 +677,10 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   // A written `let`'s type makes its members agree on each parameter, so a record literal
   // handed through it is built at one row whichever member runs.
   for c in calls {
-    if fnTagCallSetOf(c) == s && !ftPlainArgsIn(c, once, ftWideSeen, s) {
+    if (
+      fnTagCallSetOf(c) == s
+      && !ftPlainArgsIn(c, once || ftLitArgsAgree(c, s), ftWideSeen, s)
+    ) {
       return false
     }
   }
@@ -869,6 +872,54 @@ function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
 // a function, a literal that allocates, an assignment, or a block.
 function ftPlainArgs(c: i32, s: i32): boolean {
   ftPlainArgsIn(c, false, false, s)
+}
+
+// Whether every member of set `s` takes each positional argument of call `c` at one rep: its
+// parameter is shaped only by type variables, which each arm instances at the argument's own
+// type, or is that argument's closed type. A literal argument is then built alike in every arm.
+function ftLitArgsAgree(c: i32, s: i32): boolean {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return false }
+  for nm in cn.callArgNames {
+    if nm != "" { return false }
+  }
+  for m in fnTagMembers(s) {
+    const f = nodeAt(m)
+    if !(f is FuncDecl) || f.fnParams.length < cn.callArgs.length {
+      return false
+    }
+    let i = 0
+    while i < cn.callArgs.length {
+      const pt = nodeTyIxOf(f.fnParams[i])
+      const at = nodeTyIxOf(cn.callArgs[i])
+      if (
+        !ftTyVarShaped(pt, 0)
+        && (at < 0 || pt < 0 || !tySame(widenLitTy(at), pt))
+      ) {
+        return false
+      }
+      i = i + 1
+    }
+  }
+  true
+}
+
+// Whether type `t` is a type variable, or a list of what this answers true for.
+function ftTyVarShaped(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 8 { return false }
+  const n = tyAt(t)
+  match n {
+    TyVar => {
+      return true
+    }
+    TyArray => {
+      return ftTyVarShaped(n.aElem, depth + 1)
+    }
+    // A closed kind, or one a type variable inside does not shape alone.
+    TyNullable | TyNeg | TyMap | TyObj | TyUnion | TyFunc | TyPrim | TyErr | TyLit => {
+      return false
+    }
+  }
 }
 
 // `ftPlainArgs`, where `lits` also admits the literals that allocate and nothing they hold calls,
@@ -1423,13 +1474,13 @@ function ftPlainDecl(d: i32): boolean {
 }
 
 // Whether a written binding of set `s` may be delivered through an adapter: each member is a named
-// declaration or a lambda whose id can stand for it, and one is generic or a hole lambda, so no
-// one closure signature holds the binding's value.
+// declaration or a lambda whose id can stand for it, and one is generic or has a parameter with no
+// annotation, so no one closure signature holds the binding's value.
 function ftWideEscOk(s: i32): boolean {
   let gen = false
   for m in fnTagMembers(s) {
     if ftNamedDecl(m) {
-      if !ftPlainDecl(m) { gen = true }
+      if !ftPlainDecl(m) || ftHoleLambda(m) { gen = true }
     } else if ftLambdaIdOk(m) && !ftWithinInstancedFn(m) {
       if ftHoleLambda(m) { gen = true }
     } else {
@@ -1439,7 +1490,7 @@ function ftWideEscOk(s: i32): boolean {
   gen
 }
 
-// Whether lambda `m` has a parameter with no annotation, so each call instances it anew.
+// Whether function `m` has a parameter with no annotation, so each call instances it anew.
 function ftHoleLambda(m: i32): boolean {
   const f = nodeAt(m)
   if !(f is FuncDecl) { return false }
@@ -1595,6 +1646,7 @@ function ftNodeOk(
     // A `let` written with other members holds the set its initialiser is one of.
     LetDecl => {
       if n.letInit < 0 || ftIsS(n.letInit, s) { return true }
+      if ftAliasIntoCaptured(n.letInit, x) { return false }
       return ftJoinAt(n.letInit, nodeTyIxOf(x), s, ds, leaves, ids)
     }
     Paren | Block => {
@@ -1645,8 +1697,11 @@ function ftNodeOk(
           || ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
       }
       if !ftIsStore(n) { return false }
-      return ftIsS(n.binRight, s)
-        || ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
+      if ftIsS(n.binRight, s) { return true }
+      const bl = parenPeelIx(n.binLeft)
+      const bd = if bl >= 0 && bl < P.nodes.length && nodeAt(bl) is Ident { identDeclOf(bl) } else { -1 }
+      if ftAliasIntoCaptured(n.binRight, bd) { return false }
+      return ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
     }
     // An element read of a list holding the set's ids is one of them.
     Index => {
@@ -2299,11 +2354,32 @@ export function ftWithinInstancedFn(x: i32): boolean {
   false
 }
 
-// The member of `ds` the name at `v` reads, or -1; a local `const` reads its initialiser.
+// Whether `v` reads a lambda through a `const` and binding `b` is read inside a closure, whose
+// capture of `b` an alias's id does not reach.
+function ftAliasIntoCaptured(v: i32, b: i32): boolean {
+  const vx = parenPeelIx(v)
+  if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) { return false }
+  const src = ftConstSource(vx, 8)
+  if src == vx || src < 0 || src >= P.nodes.length { return false }
+  const sn = nodeAt(src)
+  if !(sn is FuncDecl) || sn.fnName != "" || b < 0 { return false }
+  cwIxWant()
+  const w = cwOccWalk(b)
+  while cwOccNext(w) {
+    if cwIxKind[w.row] == CW_OCC_USE && cwUseCaptures(cwIxNode[w.row]) {
+      return true
+    }
+  }
+  false
+}
+
+// The member of `ds` the name at `v` reads, or -1; a local `const` reads its initialiser, a
+// lambda member among them where its id can stand for it.
 function ftLeafMember(v: i32, ds: i32[]): i32 {
   const src = ftConstSource(v, 8)
   const d = ftNamedFn(src)
   if d >= 0 { return if i32ListHas(ds, d) { d } else { -1 } }
+  if src != v && src >= 0 && ftLambdaLeaf(src, ds) { return src }
   // A function declared inside another names a member where its id can stand for it.
   const r = if src >= 0 && nodeAt(src) is Ident { identDeclOf(src) } else { -1 }
   const f = if r >= 0 && i32ListHas(ds, r) { nodeAt(r) } else { null }
