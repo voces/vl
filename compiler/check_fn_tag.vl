@@ -1534,7 +1534,7 @@ function ftWideEscOk(s: i32): boolean {
   for m in fnTagMembers(s) {
     if ftNamedDecl(m) {
       if !ftPlainDecl(m) || ftHoleLambda(m) { gen = true }
-    } else if ftLambdaIdOk(m) && !ftWithinInstancedFn(m) {
+    } else if ftLambdaIdOk(m) && (!ftWithinInstancedFn(m) || ftInstLeafOk(m, -1)) {
       if ftHoleLambda(m) { gen = true }
     } else {
       return false
@@ -1772,7 +1772,7 @@ function ftNodeOk(
       ) {
         return false
       }
-      if ftWithinInstancedFn(x) { return false }
+      if ftWithinInstancedFn(x) && !ftInstLeafOk(x, p) { return false }
       if !i32ListHas(leaves, x) {
         leaves.push(x)
         ids.push(x)
@@ -2413,7 +2413,75 @@ function ftLambdaLeaf(v: i32, ds: i32[]): boolean {
   i32ListHas(ds, v)
     && nodeAt(v) is FuncDecl
     && ftLambdaIdOk(v)
-    && !ftWithinInstancedFn(v)
+    && (!ftWithinInstancedFn(v) || ftInstLeafOk(v, -1))
+}
+
+// Whether lambda `x`, written by `p` (-1: by any write) into a `let` of the function declaring it,
+// is a value only that function's instance holds: the binding is written only in that function's
+// own body and every read of it is a call, so each instance makes and dispatches its own ids.
+function ftInstLeafOk(x: i32, p: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const f = fnDeclParent[x] ?? -1
+  if f < 0 || f >= P.nodes.length { return false }
+  const fd = nodeAt(f)
+  if !(fd is FuncDecl) { return false }
+  const b = ftLeafBinding(x, p, fd.fnBody)
+  if b < 0 { return false }
+  const xs: i32[] = [fd.fnBody]
+  const ps: i32[] = [-1]
+  const ins: boolean[] = [false]
+  while xs.length > 0 {
+    const c = xs.pop() ?? -1
+    const cp = ps.pop() ?? -1
+    const inFn = ins.pop() ?? false
+    if c >= 0 && c < P.nodes.length {
+      const n = nodeAt(c)
+      if c == b && inFn { return false }
+      if n is Ident && identDeclOf(c) == b && !ftInstLeafReadOk(c, cp, inFn) {
+        return false
+      }
+      const deeper = inFn || n is FuncDecl
+      for k in nodeChildren(c) {
+        xs.push(k)
+        ps.push(c)
+        ins.push(deeper)
+      }
+    }
+  }
+  true
+}
+
+// The `let` lambda `x` is written into by `p`, or by the first write of it under `body` when `p`
+// is -1; -1 for none.
+function ftLeafBinding(x: i32, p: i32, body: i32): i32 {
+  if p >= 0 && p < P.nodes.length {
+    const pn = nodeAt(p)
+    if pn is LetDecl && pn.letKw == "let" && pn.letInit == x { return p }
+    if pn is BinExpr && ftIsStore(pn) && pn.binRight == x && nodeAt(pn.binLeft) is Ident {
+      return identDeclOf(pn.binLeft)
+    }
+    return -1
+  }
+  const xs: i32[] = [body]
+  while xs.length > 0 {
+    const c = xs.pop() ?? -1
+    if c >= 0 && c < P.nodes.length {
+      for k in nodeChildren(c) {
+        if k == x { return ftLeafBinding(x, c, body) }
+        xs.push(k)
+      }
+    }
+  }
+  -1
+}
+
+// Whether read `r` of the binding, under parent `p`, keeps its id in the instance: a call through
+// it, or a write of it outside any nested function.
+function ftInstLeafReadOk(r: i32, p: i32, inFn: boolean): boolean {
+  if p < 0 || p >= P.nodes.length { return false }
+  const pn = nodeAt(p)
+  if pn is Call { return pn.callFn == r }
+  pn is BinExpr && ftIsStore(pn) && pn.binLeft == r && !inFn
 }
 
 // Whether lambda `x` is the value its parent `p` writes into a binding: a `let`'s initialiser or
