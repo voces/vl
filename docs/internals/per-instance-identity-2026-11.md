@@ -239,9 +239,10 @@ rows three ways. 8,431 of them belong to a lambda keyed per encloser instance:
 
 **The design.** Each bucket gets one producer, and no row is dropped.
 
-1. **A row banked inside a walk belongs to the walked key.** `elabOne` records the key it walks, and
-   every hole row banks it (`elabHoleRowWalk`). That is the instance in hand, so this bucket needs no
-   site.
+1. **A row banked inside a walk belongs to the walked key.** `elabOne` records the key it walks
+   (`elabWalkNow`), and a pin banked during that walk outside a live re-check takes that key as its
+   `from`, as a pin banked in a live re-check takes the re-checked key. That is the instance in hand,
+   so this bucket needs no site.
 2. **A template row of a lambda in an open encloser holds at every instance.** Its pins closed in the
    template check, so no encloser binding chose them. Its home is under each encloser instance, as the
    deferred loop does today (and as #6128 narrows), never a parent -1 key beside them.
@@ -252,11 +253,10 @@ rows three ways. 8,431 of them belong to a lambda keyed per encloser instance:
 (`closures/hole-fn-list-returned-read-at-two-types.vl`), M5's controls, the D15110 and D15112 named
 sets, `@run` output with the split plan on and off, and L2 fuel:
 
-* a. The walk key is recorded and nothing reads it. Programs build byte-identical. The probe above
-  is its measurement.
-* b. A row banked inside a walk takes the walked key as its `from`, as a row banked in a live re-check
-  does. The 1,134 lambda rows move from the root to an instance. D15112's cross keys can then not recur
-  even without #6128's rule.
+* a and b, landed together. The walk key is recorded (recorded alone, as a column, programs built
+  byte-identical, and the probe above is its measurement), and a row banked inside a walk takes it as
+  its `from`. The 1,134 lambda rows move from the root to an instance, and D15112's cross keys cannot
+  recur even without #6128's rule.
 * c. A template row of a lambda in an open encloser is enqueued only under encloser instances, with no
   parent -1 key minted for it.
 * d. The other root routes (the early arms, the root's set-call rows, the argument rows) are measured
