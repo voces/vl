@@ -22,6 +22,8 @@ import {
   callBindCount,
   callBindIxAt,
   callBindNamesAt,
+  callBindRepKeyedSet,
+  callBindRepMixedSet,
   callBindRepTysAt,
   callBindRepTysSet,
   callBindRowOf,
@@ -38,6 +40,7 @@ import {
   recArmListLits,
   recArmListLitsSet,
   recBuildPassTable,
+  recBuildTable,
   recBuildTyOf,
   recKeptFnDstOf,
   recListLits,
@@ -51,6 +54,7 @@ import {
   recBuiltReadTy,
   recBuiltReadTyIn,
   recHoleIdentityArg,
+  recReachTvAt,
   recordRepTyAdopt,
   repStampListBuilt,
 } from "./check_fit_rules"
@@ -58,6 +62,20 @@ import { isNullTy, nonNullTy, tyHasTyVar } from "./tyquery"
 import { recSolePinArg } from "./check_record_origins"
 import { assignable, bindGenWalk, substTyDeep } from "./check_relate_core"
 import { identBoundFnDeclOf } from "./check_scopes"
+import {
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  cwIxBuild,
+  cwIxKind,
+  cwIxNode,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwOccNext,
+  cwOccWalk,
+  cwPeelValue,
+} from "./check_write_scan"
 import { recFnValueLeaves } from "./check_type_shape"
 import { strListHas } from "./listutil"
 import {
@@ -85,14 +103,101 @@ export function callBindAdoptReps() {
   let r = 0
   const n = callBindCount()
   while r < n {
-    const tys = cbaRow(callBindIxAt(r), callBindNamesAt(r), callBindTysAt(r))
+    const mixed: boolean[] = [false]
+    const tys = cbaRow(
+      callBindIxAt(r),
+      callBindNamesAt(r),
+      callBindTysAt(r),
+      mixed,
+    )
     if tys.length > 0 {
       callBindRepTysSet(r, tys)
+      if mixed[0] { callBindRepMixedSet(r) }
+      const own = callBindTysAt(r)
+      if (
+        !mixed[0]
+        && cbaRowRepKeys(callBindIxAt(r), callBindNamesAt(r), own, tys)
+      ) {
+        callBindRepKeyedSet(r)
+      }
       cbaAdoptLits(callBindIxAt(r), callBindNamesAt(r), tys)
     }
     r = r + 1
   }
   0
+}
+
+// Whether call `ix`'s rep types `reps` can key its instance: every callee parameter whose type
+// mentions a type variable the rep row moves from `own` is rep-transparent.
+function cbaRowRepKeys(
+  ix: i32,
+  names: string[],
+  own: i32[],
+  reps: i32[],
+): boolean {
+  const decl = elabCallDeclOf(ix)
+  const f = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  const sig = if decl >= 0 { nodeTyIxOf(decl) } else { -1 }
+  const ft = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { null }
+  if (
+    !(f is FuncDecl)
+    || !(ft is TyFunc)
+    || ft.fnParamTypes.length != f.fnParams.length
+  ) {
+    return false
+  }
+  let q = 0
+  while q < names.length && q < own.length && q < reps.length {
+    if !tySame(own[q], reps[q]) {
+      let i = 0
+      while i < f.fnParams.length {
+        const pn: string[] = []
+        const pt: i32[] = []
+        bindGenWalk(ft.fnParamTypes[i], reps[q], pn, pt)
+        if (
+          strListHas(pn, names[q])
+          && !cbaParamRepTransparent(f.fnParams[i], decl, 4)
+        ) {
+          return false
+        }
+        i = i + 1
+      }
+    }
+    q = q + 1
+  }
+  true
+}
+
+// Whether parameter `par` of function `fd` only hands its value on: each read is a value `fd`
+// returns whole, or an argument to a parameter that does the same, to `depth` calls (D15172).
+export function cbaParamRepTransparent(par: i32, fd: i32, depth: i32): boolean {
+  if depth <= 0 || par < 0 || fd < 0 { return false }
+  cwIxBuild()
+  const leaves = recFnValueLeaves(fd)
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      let ok = false
+      for lf in leaves {
+        if cwPeelValue(lf) == u { ok = true }
+      }
+      if !ok && u < cwIxUpKind.length && cwIxUpKind[u] == CW_UP_ARG {
+        const c = nodeAt(cwIxUp[u])
+        const g = if c is Call && c.callFn >= 0 { identBoundFnDeclOf(c.callFn) } else { -1 }
+        const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { null }
+        const i = cwIxUpAux[u]
+        if gn is FuncDecl && i >= 0 && i < gn.fnParams.length {
+          ok = cbaParamRepTransparent(gn.fnParams[i], g, depth - 1)
+        }
+      }
+      if !ok { return false }
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  true
 }
 
 // Builds each fresh record literal call `ix` hands to a parameter typed by a bare type variable
@@ -523,7 +628,12 @@ export function recRepWidens(narrow: i32, wide: i32): boolean {
 // Row `names`/`tys0` of call `ix` with each name an argument alone bound replaced by what it
 // binds at the argument's adopted record, when that is closed and takes the old binding, which is
 // not the error type; [] when nothing changes.
-function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
+function cbaRow(
+  ix: i32,
+  names: string[],
+  tys0: i32[],
+  mixed: boolean[],
+): i32[] {
   if ix < 0 || ix >= P.nodes.length { return [] }
   const cn = nodeAt(ix)
   const decl = elabCallDeclOf(ix)
@@ -537,22 +647,28 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
   const tys: i32[] = []
   let moved = false
   for t in tys0 { tys.push(t) }
+  // Rows are built once the check is settled, so builds are read from the settled table.
+  const bt = recBuildTable()
   // A type variable a held argument binds at its own type stays there (D14817).
   const heldN: string[] = []
   const heldT: i32[] = []
+  // One a held binding inside a literal argument binds there marks the row mixed (D15172).
+  const heldLN: string[] = []
+  const heldLT: i32[] = []
   let h = 0
   while h < cn.callArgs.length {
     const ha = cn.callArgs[h]
-    if cbaHeldArg(ha) && recArgBuiltTyOf(ha, nodeTyIxOf(ha)) < 0 {
+    if cbaHeldArg(ha) && recArgBuiltTyIn(ha, nodeTyIxOf(ha), bt) < 0 {
       bindGenWalk(f.fnParamTypes[h], nodeTyIxOf(ha), heldN, heldT)
     }
+    cbaHeldInLit(parenPeelIx(ha), ix, bt, heldLN, heldLT, 8)
     h = h + 1
   }
   let i = 0
   while i < cn.callArgs.length {
     const a = cn.callArgs[i]
     const own = nodeTyIxOf(a)
-    const rt = recArgBuiltTyOf(a, own)
+    const rt = recArgBuiltTyIn(a, own, bt)
     if rt >= 0 {
       const dN: string[] = []
       const dT: i32[] = []
@@ -574,6 +690,7 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
           ) {
             tys[q] = dT[j]
             moved = true
+            if strListHas(heldLN, dN[j]) { mixed[0] = true }
           }
           q = q + 1
         }
@@ -583,6 +700,46 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
     i = i + 1
   }
   if moved { tys } else { [] }
+}
+
+// Adds to `heldN`/`heldT` the type variable of call `call` each held binding inside literal `x`,
+// at any field or element reach, binds at its own type (`recReachTvAt`), as D14817 does for a
+// held argument; a binding with a build is not held (D15172).
+function cbaHeldInLit(
+  x: i32,
+  call: i32,
+  bt: Map<i32, i32>,
+  heldN: string[],
+  heldT: i32[],
+  depth: i32,
+) {
+  if depth <= 0 || x < 0 || x >= P.nodes.length { return 0 }
+  const n = nodeAt(x)
+  const vs: i32[] = []
+  if n is ArrayLit {
+    for e in n.arrElems { vs.push(e) }
+  } else if n is ObjLit {
+    for fx in n.objFields {
+      const fi = nodeAt(fx)
+      if fi is FieldInit { vs.push(fi.fiValue) }
+    }
+  } else {
+    return 0
+  }
+  for v in vs {
+    const p = parenPeelIx(v)
+    if p >= 0 && p < P.nodes.length && cbaHeldArg(p) {
+      const own = nodeTyIxOf(p)
+      const tv = if recArgBuiltTyIn(p, own, bt) < 0 { recReachTvAt(p, call) } else { "" }
+      if tv != "" && own >= 0 && !strListHas(heldN, tv) {
+        heldN.push(tv)
+        heldT.push(own)
+      }
+    } else {
+      cbaHeldInLit(p, call, bt, heldN, heldT, depth - 1)
+    }
+  }
+  0
 }
 
 // Whether argument `a` is a held value, a name or a read of one, rather than a fresh literal or a
@@ -639,12 +796,14 @@ export function recRebuiltLeafRow(lf: i32, depth: i32): i32 {
   }
   const sp = recSolePinArg(lp)
   if sp >= 0 { return recRebuiltLeafRow(sp, depth - 1) }
-  // A binding that holds only its initializer is built where the initializer is.
+  // A binding that holds only its initializer is built where its build says (`recBuildTyOf`),
+  // else, before any pass recorded one, where the initializer is (D15172).
   if n is Ident {
     const hd = recHeldDecl(lp)
     const hn = if hd >= 0 { nodeAt(hd) } else { null }
-    if hn is LetDecl { return recRebuiltLeafRow(hn.letInit, depth - 1) }
-    return -1
+    if !(hn is LetDecl) { return -1 }
+    const bt = recBuildTyOf(hd)
+    return if bt >= 0 { bt } else { recRebuiltLeafRow(hn.letInit, depth - 1) }
   }
   if n is Call && n.callFn >= 0 && n.callFn < P.nodes.length {
     const ha = recHoleIdentityArg(lp, identBoundFnDeclOf(n.callFn))
