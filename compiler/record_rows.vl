@@ -1,8 +1,8 @@
-// The record-row class of a record type, from its checked type alone: two records build at one
-// wasm heap row exactly when their class keys are equal. The key is a function of the class, not
-// of the order records are met in: the record's fields in `fieldNameOrder`, each by its field code
-// and, for a reference, the class key of what it refers to, a cycle closing on a back-reference.
-// Computed on demand and memoised per compile; `recordRowsRun` warms it before the elaboration.
+// The record-row class of a record type: the order-free key of the struct row identity the
+// emitter already keys heap twins on (`repRowKey`), read from the checked type alone, so it can be
+// asked before the elaboration. Equal keys never name two heap rows; three cases still key apart
+// although they share a row (field order, a nullable record field against a non-null one, a
+// repeated literal member), recorded in D15152. Memoised per compile.
 import {
   T,
   TyArray,
@@ -17,26 +17,9 @@ import {
   TyUnion,
   TyVar,
   cUserTypes,
-  litBaseTy,
   tyAt,
-  tyIsLitUnionOrLit,
-  tyToEmitName,
 } from "./check_types"
-import { fieldNameOrder } from "./check_obj_shape"
-import {
-  FC_CLOSURE,
-  FC_I32,
-  FC_MAP,
-  FC_NUL_CLOSURE,
-  FC_NUL_MAP,
-  FC_NUL_REF_LIST,
-  FC_REF_LIST,
-  FC_STRUCT,
-} from "./emit_state"
-import { jrFlatMembers } from "./emit_join_records"
-import { jrWantOf } from "./emit_shape_rows"
-import { repRowKey, tyMapKeyKind } from "./emit_rep"
-import { i32ToStr } from "./ast"
+import { repRowKey } from "./emit_rep"
 
 let rrMemo: {[i32]: string} = Map()
 
@@ -46,178 +29,44 @@ export function recordRowsReset() {
   0
 }
 
-// The class key of record type `ty`, or "" when `ty` is not a record.
-export function recordRowClassKeyOf(ty: i32): string {
+// The class key of record type `ty`, or "" when `ty` is not a record. An alias whose union
+// wraps records of one class (an intersection, or a union of one shape) answers that class.
+export function recordRowClassOf(ty: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
   const hit = rrMemo[ty] ?? ""
   if hit != "" { return hit }
-  if !(tyAt(ty) is TyObj) { return "" }
-  const k = repRowKey(ty)
+  const k = rrClassGo(ty)
   if k != "" { rrMemo[ty] = k }
   k
 }
 
-// Warms the class key of every declared record, ahead of the elaboration that keys on it.
+// Warms the class of every declared record, ahead of the elaboration that keys on it.
 export function recordRowsRun() {
   recordRowsReset()
-  for k in cUserTypes.keys() { recordRowClassKeyOf(cUserTypes[k] ?? -1) }
+  for k in cUserTypes.keys() { recordRowClassOf(cUserTypes[k] ?? -1) }
   0
 }
 
-// The key of record `ty` inside the records `stack` is already spelling; a record on the stack
-// is a back-reference by depth.
-function rrKey(ty: i32, stack: i32[]): string {
-  if ty < 0 || ty >= T.tys.length { return "" }
+function rrClassGo(ty: i32): string {
   const t = tyAt(ty)
-  if !(t is TyObj) { return "" }
-  let d = 0
-  while d < stack.length {
-    if stack[d] == ty { return "^" + i32ToStr(stack.length - d) }
-    d = d + 1
-  }
-  stack.push(ty)
-  const ord = fieldNameOrder(t.objFieldNames)
-  let out = "{"
-  let i = 0
-  while i < ord.length {
-    if i > 0 { out = out + "," }
-    out = out
-      + t.objFieldNames[ord[i]]
-      + ":"
-      + rrFieldKey(t.objFieldTypes[ord[i]], stack)
-    i = i + 1
-  }
-  stack.pop()
-  out + "}"
-}
-
-// The key of a field of type `ft`: its field code, with what a reference refers to.
-function rrFieldKey(ft: i32, stack: i32[]) {
-  if ft < 0 || ft >= T.tys.length { return "?" }
-  const rec = rrRecordOf(ft)
-  if rec >= 0 { return i32ToStr(FC_STRUCT) + rrKey(rec, stack) }
-  const num = rrNumLitBase(ft)
-  if num >= 0 { return rrFieldKey(num, stack) }
-  const c = jrWantOf(ft)
-  if c == FC_REF_LIST || c == FC_NUL_REF_LIST {
-    return i32ToStr(c) + "[" + rrFieldKey(rrPeel(ft, 1), stack) + "]"
-  }
-  if c == FC_MAP || c == FC_NUL_MAP {
-    const m = rrPeel(ft, 2)
-    if m >= 0 && m < T.tys.length {
-      const mt = tyAt(m)
-      if mt is TyMap {
-        return i32ToStr(c)
-          + "<"
-          + i32ToStr(tyMapKeyKind(m))
-          + ","
-          + rrFieldKey(mt.mVal, stack)
-          + ">"
-      }
-    }
-  }
-  if c < 0 { return "?" + tyToEmitName(ft) }
-  // A function field stores the closure pair whatever its signature.
-  if c == FC_CLOSURE || c == FC_NUL_CLOSURE { return i32ToStr(c) }
-  // `boolean` stores at the `i32` code and still builds its own row.
-  if c == FC_I32 && rrIsBoolean(ft) { return i32ToStr(c) + "b" }
-  i32ToStr(c) + rrMembersKey(ft)
-}
-
-// The base type of a set of numeric literals (`1 | 2`), which stores as that type; -1 for any
-// other type.
-function rrNumLitBase(ft: i32): i32 {
-  const ms: i32[] = []
-  if jrFlatMembers(ft, ms) { return -1 }
-  if ms.length == 0 { return -1 }
-  let base = -1
-  for m in ms {
-    if m < 0 || m >= T.tys.length { return -1 }
-    const mt = tyAt(m)
-    if !(mt is TyLit) { return -1 }
-    if mt.litKind != "int" { return -1 }
-    base = litBaseTy(mt)
-  }
-  base
-}
-
-// Whether `ft` is the `boolean` primitive.
-function rrIsBoolean(ft: i32): boolean {
-  const t = tyAt(ft)
-  t is TyPrim && t.primName == "boolean"
-}
-
-// A member's name in a member-set key: a literal by its text, any other type by its render.
-function rrMemberName(m: i32): string {
-  if m < 0 || m >= T.tys.length { return "?" }
-  const t = tyAt(m)
-  if t is TyLit { return t.litKind + ":" + t.litText }
-  tyToEmitName(m)
-}
-
-// The member set a field of type `ft` stores, for a code that stands for a set (a literal set at
-// the atom, a union in its box): its non-null members, each rendered, sorted, with a mark for
-// `null`. "" for a type with one member and no `null`.
-function rrMembersKey(ft: i32): string {
-  const ms: i32[] = []
-  const hasNull = jrFlatMembers(ft, ms)
-  if ms.length < 2 && !hasNull && !tyIsLitUnionOrLit(ft) { return "" }
-  const names: string[] = []
-  for m in ms { names.push(rrMemberName(m)) }
-  const ord = fieldNameOrder(names)
-  let out = "("
-  let i = 0
-  while i < ord.length {
-    if i > 0 { out = out + "|" }
-    out = out + names[ord[i]]
-    i = i + 1
-  }
-  if hasNull { out = out + "|null" }
-  out + ")"
-}
-
-// The record a field of type `ft` refers to, directly or through a nullable; -1 for none.
-function rrRecordOf(ft: i32) {
-  if ft < 0 || ft >= T.tys.length { return -1 }
-  const t = tyAt(ft)
   match t {
     TyObj => {
-      return ft
+      return repRowKey(ty)
     }
-    TyNullable => {
-      if t.nInner >= 0 && t.nInner < T.tys.length && tyAt(t.nInner) is TyObj {
-        return t.nInner
+    TyUnion => {
+      let k = ""
+      for m in t.uMembers {
+        if m < 0 || m >= T.tys.length { return "" }
+        if !(tyAt(m) is TyObj) { return "" }
+        const mk = repRowKey(m)
+        if k != "" && mk != k { return "" }
+        k = mk
       }
-      return -1
+      return k
     }
-    TyPrim | TyErr | TyFunc | TyUnion | TyArray | TyMap | TyVar | TyLit | TyNeg => {
-      return -1
-    }
-  }
-}
-
-// Through a nullable, the element of a list (`want` 1) or the map itself (`want` 2); -1 for none.
-function rrPeel(ft: i32, want: i32) {
-  if ft < 0 || ft >= T.tys.length { return -1 }
-  const t = tyAt(ft)
-  match t {
-    TyArray => {
-      if want == 1 { return t.aElem }
-      return -1
-    }
-    TyMap => {
-      if want == 2 { return ft }
-      return -1
-    }
-    TyNullable => {
-      if t.nInner < 0 || t.nInner >= T.tys.length { return -1 }
-      const it = tyAt(t.nInner)
-      if want == 1 && it is TyArray { return it.aElem }
-      if want == 2 && it is TyMap { return t.nInner }
-      return -1
-    }
-    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
-      return -1
+    TyPrim | TyErr | TyFunc | TyArray | TyMap | TyNullable | TyVar | TyLit | TyNeg => {
+      // Not a record, and no alias of one.
+      return ""
     }
   }
 }
