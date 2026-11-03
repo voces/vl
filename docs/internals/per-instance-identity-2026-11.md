@@ -136,5 +136,15 @@ Each slice is graded on every hard control above, with the split plan on and off
    (`elabReadsEnclParam`, `elabEnclOwning`) walk the same chain. D14842's pin now carries two- and
    three-deep shapes and a generic-calling middle, all running with the plan off.
 
+   4b, measured: D15101, D15102 and D15103 are three mechanisms. Lifting `ftWithinInstancedFn`'s
+   decline everywhere moved 4 of 5,497 `@run` files with the plan off: two gains, whose binding is
+   written only in the instance's own body and only called, and two losses, where the binding is
+   written inside a nested closure or stored into a list or record. **4b-i** admits the member in
+   the first shape only (`ftInstLeafOk`, check_fn_tag.vl): the binding is written only in the body
+   that declares the lambda, and every read is a call. That closes D15102. **4b-ii** is D15101, a
+   write inside a nested closure, where the id meets a closure-typed capture cell. **4b-iii** is
+   D15103, a delivery at a type that differs per instance (`ftCtxOk`). Writing 4b-i's escape control
+   found D15110, a returned per-instance lambda that runs at the first instance's type.
+
 **Out of scope.** Sets whose identity varies per instance and escapes the instance; those stay
 closures. A per-instance `fnTagBind` (#6000), which no witness needs yet.
