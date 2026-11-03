@@ -64,6 +64,7 @@ import {
   annTsOf,
   arenaSetNode,
   callHasTyArgs,
+  callTyArgsOf,
   i32ToStr,
   nodeAt,
   nodeToks,
@@ -333,6 +334,7 @@ import {
 import {
   annotResolve,
   assignable,
+  bindGenWalk,
   constrainEmpty,
   joinArmFits,
   joinArmLit,
@@ -1939,6 +1941,8 @@ let recSiteCopyTys: i32[] = []
 // The record call `c` of own type `own` is copied into: the type its pin names, which a written
 // type argument spells as a declared record, else `own` (D14818).
 function recCopyDstOf(c: i32, own: i32): i32 {
+  const dt = recDeclaredPinTy(c)
+  if dt >= 0 && fieldStorageEq(dt, own, REC_STORE_DEPTH) { return dt }
   const pt = recReachPinTy(c)
   if pt >= 0 && fieldStorageEq(pt, own, REC_STORE_DEPTH) { pt } else { own }
 }
@@ -2106,6 +2110,21 @@ export function recArgOfReach(u: i32): i32 {
 // of `u`'s function produced, pins the type parameter at that `u` reaches through the path from
 // `recArgOfReach(u)`; -1 when no parameter is named there or nothing else pins it.
 export function recReachPinTy(u: i32): i32 {
+  const at: i32[] = []
+  const tv = recReachTv(u, at)
+  if tv == "" { return -1 }
+  const cn = nodeAt(at[1])
+  const g = nodeAt(at[2])
+  if !(cn is Call) || !(g is FuncDecl) { return -1 }
+  if !callHasTyArgs(at[1]) && !recReachHeldPin(cn, g, at[3], at[0], u, tv) {
+    return -1
+  }
+  callBindTyOf(at[1], tv)
+}
+
+// The type parameter value `u` reaches through the path from `recArgOfReach(u)` down to `u`, with
+// `at` filled as [argument, call, callee declaration, parameter position]; "" when none is named.
+function recReachTv(u: i32, at: i32[]): string {
   const steps: string[] = []
   let x = u
   while x >= 0 && x < cwIxUpKind.length && cwIxUpKind[x] != CW_UP_ARG {
@@ -2114,30 +2133,73 @@ export function recReachPinTy(u: i32): i32 {
     } else if cwIxUpKind[x] == CW_UP_FIELD {
       steps.push(cwFieldNameOf(cwIxUpAux[x]))
     } else {
-      return -1
+      return ""
     }
-    if steps.length > 16 { return -1 }
+    if steps.length > 16 { return "" }
     x = cwIxUp[x]
   }
-  if x < 0 || x >= cwIxUpKind.length { return -1 }
+  if x < 0 || x >= cwIxUpKind.length { return "" }
   const call = cwIxUp[x]
   const cn = nodeAt(call)
-  if !(cn is Call) || cn.callFn < 0 { return -1 }
+  if !(cn is Call) || cn.callFn < 0 { return "" }
   const gd = identBoundFnDeclOf(cn.callFn)
   const g = if gd >= 0 && gd < P.nodes.length { nodeAt(gd) } else { null }
   const i = cwIxUpAux[x]
-  if !(g is FuncDecl) || i < 0 || i >= g.fnParams.length { return -1 }
+  if !(g is FuncDecl) || i < 0 || i >= g.fnParams.length { return "" }
   let name = nameStripSpaces(recParamTyName(g.fnParams[i]))
   let k = steps.length - 1
   while k >= 0 && name != "" {
     name = if steps[k] == "[]" { listElemNameOf(name) } else { shapeFieldTyName(name, steps[k]) }
     k = k - 1
   }
-  if name == "" || !strListHas(g.fnTyParams, name) { return -1 }
-  if !callHasTyArgs(call) && !recReachHeldPin(cn, g, i, x, u, name) {
+  if name == "" || !strListHas(g.fnTyParams, name) { return "" }
+  at.push(x)
+  at.push(call)
+  at.push(gd)
+  at.push(i)
+  name
+}
+
+// The declared type that pins the type parameter call `c` reaches: the call's written type
+// argument for it, else what another argument, a value no call of `c`'s function produced,
+// binds it at through its parameter's annotation (`k: K` at `b: T`, `ks: K[]` at `b: T[]`); -1
+// when neither names one (D15183).
+function recDeclaredPinTy(c: i32): i32 {
+  const at: i32[] = []
+  const tv = recReachTv(c, at)
+  if tv == "" { return -1 }
+  const cn = nodeAt(at[1])
+  const g = nodeAt(at[2])
+  if !(cn is Call) || !(g is FuncDecl) { return -1 }
+  if callHasTyArgs(at[1]) {
+    const tas = callTyArgsOf(at[1])
+    let q = 0
+    while q < g.fnTyParams.length && q < tas.length {
+      if g.fnTyParams[q] == tv { return nodeTyIxOf(tas[q]) }
+      q = q + 1
+    }
     return -1
   }
-  callBindTyOf(call, name)
+  const sig = nodeTyIxOf(at[2])
+  const f = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { tyAt(TY_ERR) }
+  if !(f is TyFunc) { return -1 }
+  const fd = recValueFnOf(c)
+  let j = 0
+  while j < cn.callArgs.length && j < f.fnParamTypes.length {
+    const a = cn.callArgs[j]
+    if j != at[3] && recHeldNotFrom(a, fd) {
+      const bn: string[] = []
+      const bt: i32[] = []
+      bindGenWalk(f.fnParamTypes[j], nodeTyIxOf(cwPeelValue(a)), bn, bt)
+      let q = 0
+      while q < bn.length {
+        if bn[q] == tv { return bt[q] }
+        q = q + 1
+      }
+    }
+    j = j + 1
+  }
+  -1
 }
 
 // Whether, besides `u` in argument `x` (at position `i`) of call `cn` to `g`, an argument to a
@@ -2960,15 +3022,7 @@ export function recBuiltReadRefuse(u: i32) {
   const bt = recBuiltReadTy(p)
   if bt < 0 || own < 0 { return 0 }
   if !(nodeAt(p) is BinExpr) && recArgTakesRep(p, 4) { return 0 }
-  // A function's result handed to an annotated parameter is kept at the parameter's type, so an
-  // instance at the build cannot read it (D15124).
-  if (
-    !(nodeAt(p) is BinExpr)
-    && !recBuiltViaFnResult(p, REC_STORE_DEPTH)
-    && recAnnArgTakesRep(p, nonNullTy(bt))
-  ) {
-    return 0
-  }
+  if !(nodeAt(p) is BinExpr) && recAnnArgTakesRep(p, nonNullTy(bt)) { return 0 }
   // A `??` whose default is a fresh record literal builds the literal at the read's record too.
   if recCoalesceLitBuilt(p, nonNullTy(bt)) { return 0 }
   if recAsgIntoBuiltAt(p, nonNullTy(bt)) { return 0 }
@@ -2976,17 +3030,6 @@ export function recBuiltReadRefuse(u: i32) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
   }
   0
-}
-
-// Whether read `x` is, or is a binding holding, a call of an inferred function (`recInferredFnOf`).
-function recBuiltViaFnResult(x: i32, depth: i32): boolean {
-  if depth <= 0 || x < 0 || x >= P.nodes.length { return false }
-  if nodeAt(x) is Call {
-    return recInferredFnOf(x) >= 0 && recIdentityArgOf(x) < 0
-  }
-  const d = if nodeAt(x) is Ident { recHeldDecl(x) } else { -1 }
-  const dn = if d >= 0 { nodeAt(d) } else { null }
-  dn is LetDecl && recBuiltViaFnResult(cwPeelValue(dn.letInit), depth - 1)
 }
 
 // Whether `p` is assigned into an un-annotated binding whose initialiser is a built read at
@@ -3473,6 +3516,8 @@ export function storeWritePush(v: i32, recv: i32, field: string) {
 // results are built at where that is another than its own type (`storeLetsResolve`), by call node.
 let storeLetInit: i32[] = []
 let storeLetBuilt: {[i32]: i32} = Map()
+// The un-annotated functions a check queued, for `storeRetsResolve`.
+let storeFnQueue: i32[] = []
 
 // Queues the initializer `init` of an un-annotated binding for `storeLetsResolve`.
 export function storeLetPush(init: i32) {
@@ -3480,6 +3525,14 @@ export function storeLetPush(init: i32) {
   storeLetInit.push(init)
   0
 }
+// Queues the un-annotated, non-generic function `fd` for `storeRetsResolve`.
+export function storeFnPush(fd: i32) {
+  if fd < 0 || !stampsStand() || elabCapLive() { return 0 }
+  storeFnQueue.push(fd)
+  0
+}
+export function storeFnCount(): i32 { storeFnQueue.length }
+export function storeFnAt(i: i32): i32 { storeFnQueue[i] }
 export function storeLetCount(): i32 { storeLetInit.length }
 export function storeLetInitAt(i: i32): i32 { storeLetInit[i] }
 export function storeLetBuiltSet(call: i32, rec: i32) {
@@ -3505,6 +3558,7 @@ export function storeWriteFieldAt(i: i32): string { storeWriteField[i] }
 export function storeWriteFnAt(i: i32): i32 { storeWriteFn[i] }
 export function storeWritesClear() {
   storeLetInit = []
+  storeFnQueue = []
   storeWriteVal = []
   storeWriteRecv = []
   storeWriteField = []
@@ -6380,6 +6434,9 @@ function repStamp(ix: i32, t: i32): i32 {
 
 // Stamps the list literal `l` with the list type `ty` its elements are built as; 1.
 export function repStampListBuilt(l: i32, ty: i32): i32 { repStamp(l, ty) }
+
+// Stamps the returned read `x` with the record `t` its container builds it at; 1.
+export function repStampHeldRead(x: i32, t: i32): i32 { repStamp(x, t) }
 
 // Records union `u` as the one literal `ix` is adopted into an arm of, beside its rep stamp; 1.
 function repStampUnion(ix: i32, u: i32): i32 {
