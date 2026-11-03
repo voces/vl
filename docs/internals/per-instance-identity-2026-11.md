@@ -196,6 +196,91 @@ design. Until then they are the interim, at no measured cost (byte-identical, fu
 `generics/is-list-arm-anon-record.vl`, the 4b-i movers, the five shared-writer fixtures, the class-F
 trio and per-frame's two slot-probe files, D14842, D15049, D15019, D15102 and D15068.
 
+#### M5 follow-up: one producer of instance keys at the root (design only)
+
+**The fact.** Which encloser instance a pin belongs to. Today two stages produce it. The instance walks
+bank rows with the instance in hand (`from >= 0`). The root, meaning the template check and the
+root-level row routes, banks rows for the same pins with no instance (`from < 0`), and
+`elabDrainHoleRows` either mints them parentless (the twins) or keys them under encloser instances
+itself. D15112 was the price of the second producer. The drain keyed each template row under every
+instance of the encloser, so each instance held every other instance's pin. That was 28 cross keys
+over the `@run` files. #6128 (queued) narrows the rule: a template row fills only an instance whose own walk
+banked no row for that declaration.
+
+**Measured on master `f265220a`, over the 5,589 `@run` files**, counting lambdas in an open encloser:
+48 files, 425 keys, of which 131 are parentless and 0 are uncovered. With #6128 the total falls to 397 keys,
+still 131 parentless and 0 uncovered.
+
+**Why b1, b2 and b3 could not retire the twins.** Each probe changed one route and left the others
+minting parentless keys.
+
+* b1 credited a key. The walks that pin the lambda then walked a sibling key that a different route
+  had minted with no instance (208 → 206).
+* b2 skipped one route's rows. 15 mints moved to `elabOne` with an instance in hand, but the other
+  routes still fed the rest (208 → 191).
+* b3 removed a row whose pin no other route produced, and lost a run.
+
+So the routes are not redundant copies that can be deleted one at a time. Each root row carries a pin
+that some instance needs. What is wrong is only that the root decides which instance that is.
+
+**The design: the root re-attributes its rows, and drops none.** A root row is banked at a site: the
+call or delivery node whose check pinned it. The instance a pin belongs to is the instance whose walk
+reaches that site. For a call, the walk already records that: `elabReachNote` banks, per call, the
+instances whose walk reached it (`elabCallKeys[ix]`). A delivery site that is not a call needs the
+same record, kept beside it. So one function, `elabSiteInstances(site)`, answers "which keys' walks reached this site", and every root
+route reads it:
+
+1. **Producer of sites.** Every root row records its site. The call routes already hold a call node
+   (`elabEarlyCallRows`, `elabArgValueRows`, the root's set-call rows). Hole rows gain one
+   (`elabHoleRowSite`, banked beside `elabHoleRowFrom` by `elabHolePinNote`).
+2. **Attribution.** At drain time, a root row is enqueued from each instance its site's walk reached,
+   with that instance as `from`, and from no other. A site that no open encloser's walk reaches is a
+   true root pin. It stays parent -1, and it is not a twin. A row whose site has not been walked yet
+   waits, as the deferred list waits today, but keyed by site instead of by encloser instance.
+3. **Readers that ask with no instance** (the S2a' exit list above) ask `elabSiteInstances` for the
+   node they hold. Where it answers no instance, they keep the parent -1 key.
+4. **The beside-mint** in `elabEnqueue` (the parent -1 key kept beside a parented one) is deleted
+   last. That is the point at which a twin can no longer be minted.
+
+**Slices**, each graded on the twin probe, b3's control
+(`closures/hole-fn-list-returned-read-at-two-types.vl`), M5's controls, the D15110 and D15112 named
+sets, `@run` output with the split plan on and off, and L2 fuel:
+
+* a. Sites are recorded and nothing reads them. The seed's behaviour is byte-identical. A probe then
+  counts, per root row, how many instances reached its site (0, 1 or many), which predicts the next
+  slices before any key moves.
+* b. Hole rows are re-attributed. This generalises #6128's rule from "instances without their own
+  row" to "the instances that reached the site".
+* c. The early-arm, set-call and argument rows are re-attributed. The 208 instance-carrying lookups
+  that reach a twin should fall to 0 here.
+* d. The no-instance readers switch to `elabSiteInstances`.
+* e. The beside-mint is deleted. Exit criterion: 0 parentless keys of a lambda inside an open encloser.
+
+**Risks.**
+
+* A site reached by an instance walk whose bindings differ from the template check's, which was S2a's
+  unsound reuse on `generics/hole-list-literal-local-nullable.vl`. Re-attribution enqueues the row's
+  own pins from the reaching instance. It never reuses that instance's key for a template pin, and
+  slice b grades exactly that file.
+* Cost. The reach records are bounded by sites times instances, and are already kept. The new map
+  adds one lookup per root row.
+* Ordering. A row waiting on a site that no walk ever reaches has to be released as a root pin when
+  the elaboration settles, not dropped.
+
+### M6. A hole parameter's delivered record (D15173, design only)
+
+**The case.** `u(a)` called with `r()`, a call the checker rebuilds at `J` (D14741), and with `{ f: 1 }`. Mono builds `u` at `J` and at `{f: i32}`, two row classes. The elaboration holds one key, `?u.0={f: i32}`, because it binds the hole at each argument's checked type.
+
+**The fact.** Per call and per un-annotated parameter `i`: the record the argument is delivered at. That is the checker's rebuilt row for a fresh call or literal (`recRebuiltLeafRow`, D8020), and for a binding the single answer D15172 settles between `recRebuiltLeafRow` and `recBuildTyOf`.
+
+**The producer.** The checker. The fact exists before the elaboration runs, so no stage derives it again. Once D15172 lands, one checker function answers it per argument, and the elaboration and mono both read that function.
+
+**The readers.** The elaboration's call key gets an entry naming the delivered record's row class (`recordRowClassOf`), so `u` at `J` and at `{f: i32}` are two keys, each walked at its delivered record. Mono's hole pin then reads that key instead of `monoRebuiltLitRetName`.
+
+**Why the hole's type stays untouched.** The hole binding `?u.0` is not only a key. It types the parameter for the hole solve, and it is what a call site delivers its argument at. Retyping it to the rebuilt row (#6105's rule applied to the hole, measured for D15173) made the call site deliver `{ f: 1 }` and `r()` at a type their builds do not have. The witness's own fixture became invalid wasm, and three files that hand record literals and lists to holes stopped building. So the delivered record is a separate entry beside `?u.0`. It splits the key and sets the instance's walk type, while the call-site delivery and the hole solve keep reading `?u.0`.
+
+**Open question.** Whether an instance walked at its delivered record while the solve keeps `?u.0` needs any adapter at the call, a widening from the argument's build to the delivered record. #6105's sole-pin case needed none, because there the binding and the delivery agree. The first slice measures this on D15173's witness before any key changes.
+
 ## Producers and readers
 
 | fact | producer | readers |
