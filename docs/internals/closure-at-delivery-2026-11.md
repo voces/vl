@@ -297,7 +297,7 @@ shared row names.
    (c), refused with the split plan off, graded as D14844 (b) and D14845 (c). Agreed (coordinator,
    2026-11-01): γ's backlog owns it; this design names it and does not cover it. A lambda that
    captures nothing and is held only as a list element is served by the tag instead (D14845,
-   `ftElemLams`); a capturing one stays γ's.
+   `ftArmOnlyLams`); a capturing one stays γ's.
 2. **D14825's two refutation files need the split plan.** With it off they refuse (see the table
    above). Read against inc3's binding-bundle conditions (a local `const` or unwritten `let`, every
    read a callee or a bundled argument, never returned, stored or captured):
