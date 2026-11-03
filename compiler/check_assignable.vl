@@ -456,7 +456,7 @@ import {
   fnDeclIx,
 } from "./check_write_scan"
 import { numLexIsFloat } from "./emit_bignum"
-import { i32ListEq, strListHas } from "./listutil"
+import { i32ListEq, strListHas, strListIndexOf } from "./listutil"
 import { nodePos } from "./fmt_util"
 import { identDeclOf, identFrom } from "./symbols"
 import {
@@ -2628,6 +2628,84 @@ function litPinAssignable(
   ok
 }
 
+// Whether source `g`, holding open parameters somewhere, puts a function type where `w` holds no
+// function at any instance: walked through lists, nullables and shared record fields, deferring
+// (false) at every other pairing, a type parameter or a union of records included (D14979).
+function fnShapeClash(g: i32, w: i32, depth: i32): boolean {
+  if g < 0 || w < 0 || g >= T.tys.length || w >= T.tys.length || depth > 8 {
+    return false
+  }
+  const gt = tyAt(g)
+  const wt = tyAt(w)
+  if wt is TyNullable && !(gt is TyFunc) {
+    return fnShapeClash(g, wt.nInner, depth + 1)
+  }
+  match gt {
+    TyFunc => {
+      return tyHoldsNoFn(w, 0)
+    }
+    TyNullable => {
+      return fnShapeClash(gt.nInner, w, depth + 1)
+    }
+    TyArray => {
+      if wt is TyArray { return fnShapeClash(gt.aElem, wt.aElem, depth + 1) }
+      return false
+    }
+    TyObj => {
+      if !(wt is TyObj) { return false }
+      let i = 0
+      while i < wt.objFieldNames.length {
+        const k = strListIndexOf(gt.objFieldNames, wt.objFieldNames[i])
+        if (
+          k >= 0
+          && fnShapeClash(gt.objFieldTypes[k], wt.objFieldTypes[i], depth + 1)
+        ) {
+          return true
+        }
+        i = i + 1
+      }
+      return false
+    }
+    TyPrim | TyErr | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Whether no value of type `w` is a function: a scalar, a literal, or a union or nullable of
+// those. A type parameter, a record, a list or anything else may be one or is judged elsewhere.
+function tyHoldsNoFn(w: i32, depth: i32): boolean {
+  if w < 0 || w >= T.tys.length || depth > 8 { return false }
+  const t = tyAt(w)
+  match t {
+    TyLit => {
+      return true
+    }
+    TyPrim => {
+      return t.primName == "boolean"
+        || t.primName == "string"
+        || t.primName == "i32"
+        || t.primName == "i64"
+        || t.primName == "f32"
+        || t.primName == "f64"
+        || t.primName == "u8"
+        || t.primName == "null"
+    }
+    TyNullable => {
+      return tyHoldsNoFn(t.nInner, depth + 1)
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if !tyHoldsNoFn(m, depth + 1) { return false }
+      }
+      return true
+    }
+    TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyNeg => {
+      return false
+    }
+  }
+}
+
 // Re-validates every deferred return-type constraint this call resolves: substitutes the
 // call's bindings into the body's returned type and the declared return type, and asks the
 // mismatch question the body could only answer vacuously. Re-defers like `validateArgCstrs`
@@ -2667,12 +2745,27 @@ export function validateRetCstrs(
       // in every instance's value whatever the holes become (D14801).
       let rgc = rg
       if tyHasHole(rg) && !tyHasHole(rw) { rgc = boundUnionMembers(rg) }
-      if rgc >= 0 && !tyHasHole(rgc) {
+      // A function with open parameters returned where no function fits (D14979).
+      if (
+        (rgc < 0 || tyHasHole(rgc))
+        && !tyHasHole(rw)
+        && fnShapeClash(rg, rw, 0)
+      ) {
+        rgc = rg
+      }
+      const rClash = rgc == rg
+        && tyHasHole(rg)
+        && !tyHasHole(rw)
+        && fnShapeClash(rg, rw, 0)
+      if rgc >= 0 && (!tyHasHole(rgc) || rClash) {
         if (
           !tyHasHole(rw)
           && !retNomOnlyAtHole(retCstr.wOnly[ci], retCstr.ix[ci], rgc, rw)
         ) {
-          if !litPinAssignable(retCstr.ix[ci], rgc, rw, bNames, bTys) {
+          if (
+            rClash
+            || !litPinAssignable(retCstr.ix[ci], rgc, rw, bNames, bTys)
+          ) {
             let rWho = "the callee's return"
             if who != "" { rWho = "the return of `" + who + "`" }
             tErr(
@@ -2786,19 +2879,20 @@ export function validateLetCstrs(
           }
         }
       }
-      if !tyHasHole(lg) {
-        if !tyHasHole(lw) {
-          if !litPinAssignable(letCstr.ix[ci], lg, lw, bNames, bTys) {
-            let lWho = "the callee's body"
-            if who != "" { lWho = "the body of `" + who + "`" }
-            tErr(
-              letAssignMsg(letCstr.ix[ci], lg, lw, letCstr.name[ci], -1)
-                + " ("
-                + lWho
-                + " at the call's argument types)",
-              ix,
-            )
-          }
+      // A function whose own parameters are still open fits no destination that holds no
+      // function, whatever they become, so it is judged now rather than deferred (D14979).
+      const clash = tyHasHole(lg) && !tyHasHole(lw) && fnShapeClash(lg, lw, 0)
+      if !tyHasHole(lg) && !tyHasHole(lw) || clash {
+        if clash || !litPinAssignable(letCstr.ix[ci], lg, lw, bNames, bTys) {
+          let lWho = "the callee's body"
+          if who != "" { lWho = "the body of `" + who + "`" }
+          tErr(
+            letAssignMsg(letCstr.ix[ci], lg, lw, letCstr.name[ci], -1)
+              + " ("
+              + lWho
+              + " at the call's argument types)",
+            ix,
+          )
         }
       }
     }

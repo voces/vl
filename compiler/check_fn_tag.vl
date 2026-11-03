@@ -205,53 +205,87 @@ function ftMembersWithin(s: i32, o: i32): boolean {
   true
 }
 
-// The lambda literals whose one position is a list element, written by a list's `push` or an
-// index store. An id there is called only through the list's arms.
-let ftElemLams: {[i32]: boolean} = Map()
+// The lambda literals every call of which is an arm's: one whose one position is a list element,
+// written by a list's `push` or an index store, or a value of a written `let`, its initializer or
+// an `=` store into it.
+let ftArmOnlyLams: {[i32]: boolean} = Map()
 
-// Fills `ftElemLams` by one walk from `rootIx`, the shape `ftScan` walks the program in.
-function ftElemLamsNote(rootIx: i32) {
-  ftElemLams = Map()
+// Fills `ftArmOnlyLams` by one walk from `rootIx`, the shape `ftScan` walks the program in.
+function ftArmOnlyLamsNote(rootIx: i32) {
+  ftArmOnlyLams = Map()
+  const written: i32[] = []
+  const lets: i32[] = []
   const todo: i32[] = [rootIx]
   while todo.length > 0 {
     const x = todo.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
+      ftArmOnlyPushNote(x)
+      ftArmOnlyIndexStoreNote(x)
+      ftArmOnlyLetStoreNote(x, written)
       const n = nodeAt(x)
-      if n is Call {
-        const fn = nodeAt(parenPeelIx(n.callFn))
-        if fn is Member && fn.memProp == "push" {
-          const ht = nodeTyIxOf(fn.memObj)
-          if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
-            for a in n.callArgs { ftElemLamMark(a) }
-          }
-        }
-      } else if n is BinExpr && ftIsStore(n) {
-        const l = parenPeelIx(n.binLeft)
-        const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { nodeAt(n.binLeft) }
-        if ln is Index {
-          const ht = nodeTyIxOf(ln.idxArr)
-          if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
-            ftElemLamMark(n.binRight)
-          }
-        }
-      }
+      if n is LetDecl && n.letKw == "let" && n.letInit >= 0 { lets.push(x) }
       nodeChildrenPush(x, todo)
     }
+  }
+  for d in lets {
+    const n = nodeAt(d)
+    if n is LetDecl && i32ListHas(written, d) { ftArmOnlyLamMark(n.letInit) }
   }
   0
 }
 
-// Marks `v` in `ftElemLams` when it is a lambda literal.
-function ftElemLamMark(v: i32) {
+// Marks the lambdas call `x`, a list's `push`, appends.
+function ftArmOnlyPushNote(x: i32) {
+  const n = nodeAt(x)
+  if !(n is Call) { return 0 }
+  const fn = nodeAt(parenPeelIx(n.callFn))
+  if !(fn is Member) || fn.memProp != "push" { return 0 }
+  const ht = nodeTyIxOf(fn.memObj)
+  if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
+    for a in n.callArgs { ftArmOnlyLamMark(a) }
+  }
+  0
+}
+
+// Marks the lambda store `x` writes into a list's slot.
+function ftArmOnlyIndexStoreNote(x: i32) {
+  const n = nodeAt(x)
+  if !(n is BinExpr) || !ftIsStore(n) { return 0 }
+  const l = parenPeelIx(n.binLeft)
+  if l < 0 || l >= P.nodes.length { return 0 }
+  const ln = nodeAt(l)
+  if !(ln is Index) { return 0 }
+  const ht = nodeTyIxOf(ln.idxArr)
+  if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
+    ftArmOnlyLamMark(n.binRight)
+  }
+  0
+}
+
+// Marks the lambda store `x` writes to a `let`, and adds the `let` to `written`.
+function ftArmOnlyLetStoreNote(x: i32, written: i32[]) {
+  const n = nodeAt(x)
+  if !(n is BinExpr) || !ftIsStore(n) { return 0 }
+  const l = parenPeelIx(n.binLeft)
+  if l < 0 || l >= P.nodes.length || !(nodeAt(l) is Ident) { return 0 }
+  const d = identDeclOf(l)
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return 0 }
+  if !i32ListHas(written, d) { written.push(d) }
+  ftArmOnlyLamMark(n.binRight)
+  0
+}
+
+// Marks `v` in `ftArmOnlyLams` when it is a lambda literal.
+function ftArmOnlyLamMark(v: i32) {
   const x = parenPeelIx(v)
   if x < 0 || x >= P.nodes.length { return 0 }
   const f = nodeAt(x)
-  if f is FuncDecl && f.fnName == "" { ftElemLams[x] = true }
+  if f is FuncDecl && f.fnName == "" { ftArmOnlyLams[x] = true }
   0
 }
 
 export function fnTagDecide(rootIx: i32) {
-  ftElemLamsNote(rootIx)
+  ftArmOnlyLamsNote(rootIx)
   ftParamOwners = Map()
   ftParamOwnersBuilt = false
   ftDirectLen = 0
@@ -1607,8 +1641,8 @@ function ftFnOk(fn: i32): boolean {
 
 // Whether lambda `x` can stand as an id: it reads only its own bindings and the module's, so a
 // call by its declaration needs no environment, and calls none of its parameters, whose instance
-// is chosen by the function a caller hands it rather than by the one arm an id calls, unless it
-// is a list element (`ftElemLams`), whose every call is an arm's.
+// is chosen by the function a caller hands it rather than by the one arm an id calls, unless every
+// call of it is an arm's (`ftArmOnlyLams`).
 function ftLambdaIdOk(x: i32): boolean {
   const f = nodeAt(x)
   if !(f is FuncDecl) { return false }
@@ -1632,7 +1666,7 @@ function ftLambdaIdOk(x: i32): boolean {
     if (
       yn is Call
       && i32ListHas(f.fnParams, identDeclOf(parenPeelIx(yn.callFn)))
-      && !(ftElemLams[x] ?? false)
+      && !(ftArmOnlyLams[x] ?? false)
     ) {
       return false
     }
