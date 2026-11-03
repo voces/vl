@@ -167,6 +167,27 @@ the readers that still ask with no instance (`from` -1), the list S2a' empties:
 * `elabEarlyCallRows`, `elabArgValueRows`, `elabListSigRow`, `elabSetRepRow`, `elabLamRepInstance`,
   `elabSoleRekey`, `elabEnqueueAtParams` and `elabArgResultAt`.
 
+**The twins stay, measured 2026-11-03 on master `2bb36ff5c`.** Over the 5,569 `@run` files, 121
+parentless keys of lambdas in an open encloser remain, in 45 files. Every one is covered by a parented
+key with the same pins (the probe compares the pins sorted, since one key may store them in another
+order). They are fed by four root routes that mint with no instance in hand: the template check's hole
+rows (`elabDrainHoleRows`, 150 first mints and 1,196 uses), the early arms demanded through
+`elabDemandFrom` (`elabArmEarly`), the root's set-call rows (`elabSetCallRows`), and the argument rows
+(`elabArgValueRows`, 15 mints and 21 uses). A further 208 lookups carry an instance but still reach a
+twin, because they walk a callee key that one of those routes minted with no instance. Three probes
+tried to retire the twins one route at a time:
+
+* b1, the `#from` credit at a direct callee and at a set call's members: the 208 fell to 206. The
+  credited callee key exists, but the walks that pin the lambda are of the uncredited one.
+* b2, the root's set-call rows skipped for a call in an open function's body: the 208 fell to 191,
+  plus 15 parentless mints moved to `elabOne` with an instance in hand. Byte-identical, fuel +0.12%.
+* b3, the root's whole call-bind row skipped for such a call: the table did not move, and
+  `closures/hole-fn-list-returned-read-at-two-types.vl` went from running to an emit reject.
+
+The routes are not independent: the root rows are load-bearing, and removing one moves nothing or
+loses a run. Retiring the twins is a rework of how the root seeds instances, which needs its own
+design. Until then they are the interim, at no measured cost (byte-identical, fuel +0.008%).
+
 **Controls.** D15110 and its swapped and trap variants, its non-generic twin, the same-type case,
 `generics/is-list-arm-anon-record.vl`, the 4b-i movers, the five shared-writer fixtures, the class-F
 trio and per-frame's two slot-probe files, D14842, D15049, D15019, D15102 and D15068.
