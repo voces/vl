@@ -13,7 +13,7 @@
 
 import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
-import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
+import { mintCallSoleSet, mintLamKeyedOf, mintNestedPerEnclOf } from "./check_mint"
 import { ftOwnTyParamHandedBack, ftOwnTyParamSharedBack } from "./check_fn_tag"
 import {
   mkNumTyped,
@@ -4718,6 +4718,37 @@ function monoPinAnnSpelling(t: i32): string {
   nm
 }
 
+// The binding each un-keyed lambda that `monoCloneLambdaSubst` shares across its encloser's
+// instances was first reached under.
+let monoSharedLamAt: {[i32]: string} = Map()
+
+// Refuses lambda `fnIx` when a second instance of its encloser reaches it under another binding
+// while the elaboration minted it no key: its un-annotated parameters then take their types from
+// outside every instance, and the one lambda built for all of them cannot serve each (D15110).
+function monoSharedLamGuard(fnIx: i32, a: FuncDecl, tvV: string[]) {
+  if monoFnNameIsSourceNamed(a.fnName) || mintLamKeyedOf(fnIx) { return 0 }
+  let open = false
+  for p in a.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { open = true }
+  }
+  if !open { return 0 }
+  let key = ""
+  for v in tvV { key = key + v + ";" }
+  const was = monoSharedLamAt[fnIx] ?? ""
+  if was == "" {
+    monoSharedLamAt[fnIx] = key
+    return 0
+  }
+  if was == key { return 0 }
+  emitFailAt(
+    "emitProgram: this lambda is written inside a generic function and is one value for every "
+      + "instance of it, but its parameters take a different type in each instance — annotate its "
+      + "parameters, or declare it outside the generic function",
+    fnIx,
+  )
+}
+
 // Clone the lifted lambda at `fnIx` with every type-param-mentioning parameter and return
 // annotation substituted through this instance's binding, lift the clone into `fnStmts`,
 // and return its node index — or -1 when nothing substitutes. The body is shared with the
@@ -4747,10 +4778,16 @@ function monoCloneLambdaSubst(
     // correct at every pin. Returned before either ledger is touched: the prune reads them
     // to decide whether a template is still referenced, and a lambda that never became a
     // template must not appear in either.
-    if !monoLamNodeIsTemplateCore(fnIx, typarams) { return -1 }
+    if !monoLamNodeIsTemplateCore(fnIx, typarams) {
+      monoSharedLamGuard(fnIx, a, tvV)
+      return -1
+    }
     const ps: i32[] = []
     const psAny = monoLamSubstParams(a, fnIx, typarams, tvN, tvV, bN, bT, ps)
-    if psAny < 0 { return -1 }
+    if psAny < 0 {
+      monoSharedLamGuard(fnIx, a, tvV)
+      return -1
+    }
     let any = psAny > 0
     let nret = a.fnRet
     const rt = monoSubstAnnNode(a.fnRet, typarams, tvN, tvV, bN, bT)
@@ -4759,6 +4796,7 @@ function monoCloneLambdaSubst(
       any = true
     } else if rt == -2 {
       monoNoteLamNode(monoLamShared, fnIx)
+      monoSharedLamGuard(fnIx, a, tvV)
       return -1
     }
     // D943 — `any` asks whether a signature changed, and a capture-only template changes
@@ -4782,6 +4820,7 @@ function monoCloneLambdaSubst(
     }
     if !any && !capOnly && !bodyTP {
       monoNoteLamNode(monoLamShared, fnIx)
+      monoSharedLamGuard(fnIx, a, tvV)
       return -1
     }
     // An un-annotated return that rides the type parameter, annotated at the pin. The
@@ -28712,6 +28751,7 @@ export function monomorphize(stmts: i32[]) {
   }
   monoLamPinned = []
   monoLamShared = []
+  monoSharedLamAt = Map()
   monoNamedTmplNode = []
   monoNamedTmplSlot = []
   let any = false
