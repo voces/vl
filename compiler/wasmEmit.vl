@@ -18841,7 +18841,8 @@ function emitListEqXBin(body: u8[], e: BinExpr, fnIx: i32) {
 }
 
 // The number kind a list rep's elements hold (0 i32, 3 i64, 4 f64, 5 f32) for a plain number
-// list, -2 for a list of union boxes, -3 for a list of records compared field-wise, or -1.
+// list, -2 for a list of union boxes, -3 for a list of records compared field-wise, -4 for a
+// list of lists, or -1.
 function xrepElemKind(kind: i32, slot: i32): i32 {
   if kind == LBK_I32_LIST { return 0 }
   if kind == LBK_I64_LIST { return 3 }
@@ -18849,6 +18850,7 @@ function xrepElemKind(kind: i32, slot: i32): i32 {
   if kind == LBK_F32_LIST { return 5 }
   if kind == LBK_REF && slot >= 0 && slot < rlElemTyIx.length {
     if rlElemKindAt(slot) == RLK_UNION { return -2 }
+    if eqgInnerKind(slot) >= 0 { return -4 }
     if eqgElemHasEqRow(slot) { return -3 }
   }
   -1
@@ -18953,6 +18955,19 @@ function xrepElemEq(
   fnIx: i32,
 ) {
   const i = fA + 3
+  // Two inner lists stored apart: the same loop one level down, at the inner reps (D15092).
+  if eA == -4 && eB == -4 {
+    xrepElemRead(fA + 0, i, wA, bA, true)
+    xrepElemRead(fB + 1, i, wB, bB, true)
+    return emitListEqXCore(
+      body,
+      eqgInnerKind(sA),
+      eqgInnerSlot(sA),
+      eqgInnerKind(sB),
+      eqgInnerSlot(sB),
+      fnIx,
+    )
+  }
   if eA == -3 || eB == -3 {
     return emitEqGStructElemX(body, fA, fB, sA, sB, fnIx)
   }
@@ -26089,9 +26104,14 @@ function emitBundleParamTakes(par: i32, arg: i32): boolean {
   nodeAt(unwrapParen(arg)) is FuncDecl && bundleSigsOfParam(par).length > 0
 }
 
-// Whether parameter `par` takes the function read `arg` as a bundle.
-function emitBundleParamReads(par: i32, arg: i32): boolean {
-  nodeAt(unwrapParen(arg)) is Ident && bundleSigsOfParam(par).length > 0
+// Whether parameter `par` takes the function read `arg` in function `fnIx` as a bundle; a read of
+// a bundle parameter is the record itself, handed on as it is.
+function emitBundleParamReads(par: i32, arg: i32, fnIx: i32): boolean {
+  const a = unwrapParen(arg)
+  if a < 0 || !(nodeAt(a) is Ident) || bundleSigsOfParam(par).length == 0 {
+    return false
+  }
+  bundleParamOfRead(a, fnIx) < 0
 }
 
 // The function read `arg` delivered to bundle parameter `par`: its closure at each signature, in
@@ -37573,7 +37593,7 @@ function emitDirectCallArgsUnder(
     if bpar >= 0 && emitBundleParamTakes(bpar, args[i]) {
       if emitBundleArg(body, args[i], bpar, fnIx) < 0 { return -1 }
       i = i + 1
-    } else if bpar >= 0 && emitBundleParamReads(bpar, args[i]) {
+    } else if bpar >= 0 && emitBundleParamReads(bpar, args[i], fnIx) {
       if emitBundleParamRead(body, args[i], bpar, fnIx) < 0 { return -1 }
       i = i + 1
     } else if cParamF32 {
