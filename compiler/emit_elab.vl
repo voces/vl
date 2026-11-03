@@ -7161,69 +7161,123 @@ function elabReachedOf(k: i32, d: i32): i32 {
   found
 }
 
-// The one instance of `d` that parameter `i` of instance `k` carries to a call: called as the
-// callee, or handed on as an argument to a parameter of the instance that call reached, whose
-// own carry is followed. -1 when none is, -2 when two are.
+// The one instance of `d` that parameter `i` of instance `k` carries: called as the callee, or
+// handed as an argument to a parameter of the instance that call reached, whose carry is followed.
+// -1 when it carries none, -2 when it carries two or a read of it is not one of those.
 function elabParamReachedOf(k: i32, d: i32, i: i32, depth: i32): i32 {
-  if k < 0 || k >= ekReach.length || depth > 16 { return -1 }
+  if k < 0 || k >= ekReach.length || depth > 16 { return 0 - 2 }
   const dn = nodeAt(ekDecl[k])
-  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return -1 }
+  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return 0 - 2 }
   const p = dn.fnParams[i]
+  const calls: i32[] = []
+  if !elabParamReadsPlaced(dn, p, calls) { return 0 - 2 }
   let found = -1
-  const tried: i32[] = []
-  for r in ekReach[k] {
-    if !i32ListHas(tried, r) {
-      tried.push(r)
-      for cx in elabKeyCalls[r] ?? [] {
-        if elabCallKeyPairHas(cx, k, r) {
-          const c = nodeAt(cx)
-          if c is Call {
-            let hit = -1
-            if ekDecl[r] == d && elabReadsDecl(dn, c.callFn, p) { hit = r }
-            let j = 0
-            while j < c.callArgs.length {
-              if elabReadsDecl(dn, c.callArgs[j], p) {
-                const h = elabParamReachedOf(r, d, j, depth + 1)
-                if h == 0 - 2 { return 0 - 2 }
-                if h >= 0 {
-                  if hit >= 0 && hit != h { return 0 - 2 }
-                  hit = h
-                }
-              }
-              j = j + 1
-            }
-            if hit >= 0 {
-              if found >= 0 && found != hit { return 0 - 2 }
-              found = hit
-            }
+  for cx in calls {
+    const c = nodeAt(cx)
+    if c is Call {
+      let hit = -1
+      if elabReadsDecl(dn, c.callFn, p) {
+        hit = elabValCallInst(k, cx, d)
+        if hit < 0 { return 0 - 2 }
+      }
+      let j = 0
+      while j < c.callArgs.length {
+        if elabReadsDecl(dn, c.callArgs[j], p) {
+          const r = elabCallInstFrom(cx, k)
+          if r < 0 { return 0 - 2 }
+          const h = elabParamReachedOf(r, d, j, depth + 1)
+          if h == 0 - 2 { return 0 - 2 }
+          if h >= 0 {
+            if hit >= 0 && hit != h { return 0 - 2 }
+            hit = h
           }
         }
+        j = j + 1
+      }
+      if hit >= 0 {
+        if found >= 0 && found != hit { return 0 - 2 }
+        found = hit
       }
     }
-  }
-  const vc = elabValCalls[k] ?? []
-  let v = 0
-  while v + 1 < vc.length {
-    const c = nodeAt(vc[v])
-    const r = vc[v + 1]
-    if c is Call && ekDecl[r] == d && elabReadsDecl(dn, c.callFn, p) {
-      if found >= 0 && found != r { return 0 - 2 }
-      found = r
-    }
-    v = v + 2
   }
   found
 }
 
-// Whether call `cx` is recorded as reaching instance `r` from instance `k`'s body.
-function elabCallKeyPairHas(cx: i32, k: i32, r: i32): boolean {
+// The one instance of `d` call `cx`, through a function value in instance `k`'s body, ran; -1 for
+// none or two.
+function elabValCallInst(k: i32, cx: i32, d: i32): i32 {
+  let r = -1
+  const vc = elabValCalls[k] ?? []
+  let v = 0
+  while v + 1 < vc.length {
+    if vc[v] == cx && ekDecl[vc[v + 1]] == d {
+      if r >= 0 && r != vc[v + 1] { return -1 }
+      r = vc[v + 1]
+    }
+    v = v + 2
+  }
   const ks = elabCallKeys[cx] ?? []
   let j = 0
   while j + 1 < ks.length {
-    if ks[j] == k && ks[j + 1] == r { return true }
+    if ks[j] == k && ekDecl[ks[j + 1]] == d {
+      if r >= 0 && r != ks[j + 1] { return -1 }
+      r = ks[j + 1]
+    }
     j = j + 2
   }
-  false
+  r
+}
+
+// Whether every read of parameter `p` of `fn`, or of a copy of it, is a callee or an argument of
+// a call in `fn`'s own body or the seed of such a copy; those calls go to `calls`.
+function elabParamReadsPlaced(fn: FuncDecl, p: i32, calls: i32[]): boolean {
+  const copies: i32[] = []
+  let reads = 0
+  let placed = 0
+  const all: i32[] = [fn.fnBody]
+  while all.length > 0 {
+    const ix = all.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is Ident {
+        const dd = identDeclOf(ix)
+        if dd == p || (dd >= 0 && elabCopiedParam(fn, dd) == p) {
+          reads = reads + 1
+        }
+      }
+      for c in nodeChildren(ix) { all.push(c) }
+    }
+  }
+  const own: i32[] = [fn.fnBody]
+  while own.length > 0 {
+    const ix = own.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is Call {
+        let here = 0
+        if elabReadsDecl(fn, n.callFn, p) { here = here + 1 }
+        for a in n.callArgs {
+          if elabReadsDecl(fn, a, p) { here = here + 1 }
+        }
+        if here > 0 {
+          calls.push(ix)
+          placed = placed + here
+        }
+      }
+      if (
+        n is LetDecl
+        && elabCopiedParam(fn, ix) == p
+        && !i32ListHas(copies, ix)
+      ) {
+        copies.push(ix)
+        placed = placed + 1
+      }
+      if !(n is FuncDecl) {
+        for c in nodeChildren(ix) { own.push(c) }
+      }
+    }
+  }
+  reads == placed
 }
 
 // Whether expression `e` is a bare read of parameter `p` of `fn`, or of a copy of it that takes
