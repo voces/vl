@@ -1170,6 +1170,18 @@ export function elabWalkPop() {
   0
 }
 
+// By `instance|call`, the set each instance's call through a parameter goes through, as
+// `elabMintFactAt` notes it (nested-per-encloser-2026-11.md, slice 1).
+let elabCallInstSets: {[string]: i32} = Map()
+
+// The set call `ix` goes through at the instance being walked, as the mint facts noted it; -1 for
+// none.
+function _elabCallSetIn(ix: i32): i32 {
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  if top < 0 || ix < 0 { return -1 }
+  elabCallInstSets[i32ToStr(top) + "|" + i32ToStr(ix)] ?? -1
+}
+
 // Node `ix`'s closed type at the instance being walked, or -1 outside one or where it stays open.
 export function elabWalkTy(ix: i32): i32 {
   const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
@@ -2584,9 +2596,11 @@ export function elabMintFacts(): i32 {
   elabMintValueFns = elabFnSetMembersShared()
   elabMintCalls = Map()
   elabBundleSigs = Map()
+  elabBundleJoinRoot = Map()
   elabLamSigs = Map()
   elabLamSigInst = Map()
   elabMintSets = Map()
+  elabCallInstSets = Map()
   let n = 0
   let k = 0
   while k < ekDecl.length {
@@ -2616,6 +2630,7 @@ export function elabMintFacts(): i32 {
     }
     k = k + 1
   }
+  elabBundleForwardsJoin()
   // A set one instance calls through a parameter that another instance of the same function
   // binds to no set has no one rep there, so it is partial.
   for c in elabMintCalls.keys() {
@@ -2702,10 +2717,9 @@ function elabKeyCallsHandSetValue(k: i32, c: i32, d: i32): boolean {
     while j + 1 < ks.length {
       // A reach from a speculative instance is that instance's own guess, not this call's value.
       if ks[j + 1] == k && !(ks[j] >= 0 && elabKeySpeculative(ks[j])) {
-        if ks[j] < 0 { return false }
-        if fnTagSetOfTy(elabNodeTy(xn.callArgs[pi], ks[j])) != s {
-          return false
-        }
+        // A reach from module scope types the value as the template does.
+        const at = if ks[j] < 0 { nodeTyIxOf(xn.callArgs[pi]) } else { elabNodeTy(xn.callArgs[pi], ks[j]) }
+        if fnTagSetOfTy(at) != s { return false }
       }
       j = j + 2
     }
@@ -4037,6 +4051,98 @@ function elabChainStep(x: i32): i32 {
   }
 }
 
+// Joins the bundle signatures of a parameter an instance hands on whole as a call's argument with
+// the callee instance's parameter there: parameters such hands link hold one record, so each takes
+// the union of their calls in walk order. The union draws only on signatures already noted, so a
+// cycle of hands settles.
+function elabBundleForwardsJoin() {
+  const up: Map<i32, i32> = Map()
+  let k = 0
+  while k < ekDecl.length {
+    const dn = nodeAt(ekDecl[k])
+    if dn is FuncDecl && dn.fnBody >= 0 && dn.fnParams.length < 64 {
+      const todo: i32[] = [dn.fnBody]
+      while todo.length > 0 {
+        const x = todo.pop() ?? -1
+        if x >= 0 && x < P.nodes.length {
+          const n = nodeAt(x)
+          if n is Call {
+            const kc = elabCallInstFrom(x, k)
+            let i = 0
+            while kc >= 0 && i < n.callArgs.length && i < 64 {
+              const a = parenPeelIx(n.callArgs[i])
+              const pi = if a >= 0 && nodeAt(a) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(a)) } else { -1 }
+              if pi >= 0 {
+                elabBundleUnite(up, elabBundleKey(k, pi), elabBundleKey(kc, i))
+              }
+              i = i + 1
+            }
+          }
+          // A nested function's calls are its own instance's.
+          if !(n is FuncDecl) {
+            for c in nodeChildren(x) { todo.push(c) }
+          }
+        }
+      }
+    }
+    k = k + 1
+  }
+  const roots: i32[] = []
+  const lists: i32[][] = []
+  for key in up.keys() {
+    const r = elabBundleRoot(up, key)
+    let at = i32ListIndexOf(roots, r)
+    if at < 0 {
+      roots.push(r)
+      lists.push([])
+      at = roots.length - 1
+    }
+    for t in elabBundleSigs.get(key) ?? [] {
+      let have = false
+      for u in lists[at] {
+        if tySame(u, t) { have = true }
+      }
+      if !have { lists[at].push(t) }
+    }
+  }
+  for key in up.keys() {
+    const r = elabBundleRoot(up, key)
+    const at = i32ListIndexOf(roots, r)
+    if at >= 0 && lists[at].length >= 2 {
+      elabBundleSigs[key] = lists[at].slice(0)
+      elabBundleJoinRoot[key] = r
+    }
+  }
+  0
+}
+
+// Each parameter key `elabBundleForwardsJoin` gave a joined list, and the root key of its chain.
+let elabBundleJoinRoot: {[i32]: i32} = Map()
+
+// The root of `key` in the union `up`; a key never united is its own.
+function elabBundleRoot(up: Map<i32, i32>, key: i32): i32 {
+  let r = key
+  let guard = 0
+  while guard < 4096 {
+    const n = up.get(r) ?? r
+    if n == r { return r }
+    r = n
+    guard = guard + 1
+  }
+  r
+}
+
+// Unites `a` and `b` in `up`, the smaller root standing for both.
+function elabBundleUnite(up: Map<i32, i32>, a: i32, b: i32) {
+  if !up.has(a) { up[a] = a }
+  if !up.has(b) { up[b] = b }
+  const ra = elabBundleRoot(up, a)
+  const rb = elabBundleRoot(up, b)
+  if ra < rb { up[rb] = ra }
+  else if rb < ra { up[ra] = rb }
+  0
+}
+
 // The key of instance `k`'s parameter `i` in `elabBundleSigs`.
 function elabBundleKey(k: i32, i: i32): i32 { k * 64 + i }
 
@@ -4099,10 +4205,16 @@ export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
   if k < 0 || i < 0 || i >= 64 { return none }
   const sigs = elabBundleSigs.get(elabBundleKey(k, i)) ?? none
   if sigs.length < 2 { return none }
-  const dn = nodeAt(ekDecl[k])
-  if !(dn is FuncDecl) || i >= dn.fnParams.length { return none }
+  // A parameter a forward joined takes its chain's record, so the set is the chain root's.
+  const root = elabBundleJoinRoot.get(elabBundleKey(k, i))
+    ?? elabBundleKey(k, i)
+  const rk = root / 64
+  const ri = root % 64
+  if rk < 0 || rk >= ekDecl.length { return none }
+  const dn = nodeAt(ekDecl[rk])
+  if !(dn is FuncDecl) || ri >= dn.fnParams.length { return none }
   const s = fnTagSetOfTy(
-    substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k]),
+    substTyDeep(nodeTyIxOf(dn.fnParams[ri]), ekNames[rk], ekTys[rk]),
   )
   if s < 0 || fnTagSetIsTagged(s) { return none }
   sigs
@@ -4162,6 +4274,7 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   // call's arms with the other, so both stay closures. A list literal of the parameter is typed
   // per instance, so it holds each instance's own set.
   const was = elabMintSets[ix] ?? fnTagSetOfTy(st)
+  elabCallInstSets[i32ToStr(k) + "|" + i32ToStr(ix)] = fnTagSetOfTy(st)
   const held = root != cf && elabListParamSource(identDeclOf(root), dn) != pd
   if (
     was != fnTagSetOfTy(st)
