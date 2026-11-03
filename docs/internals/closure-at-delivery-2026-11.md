@@ -273,6 +273,13 @@ shared row names.
     binding, element or field callee. It now also takes it for a parameter callee when the sets
     its calls go through hold only named functions, each taking the set there
     (`ftParamSetsTake`). A lambda member keeps slice 1's bundle.
+  - **Slice 3, D14824, built.** A lambda called with a named generic it calls at two signatures,
+    beside a consumer calling that generic at one, so `{id}` is partial and untagged. The
+    elaboration notes a lambda instance's signatures whatever its parameter's members are
+    (`elabBundleSigNote`), and mono hands the named generic as the bundle of its instances
+    (`monoBundleNamedPin`). Emit builds the record at a direct call (`emitBundleParamRead`) and
+    at a `call_ref` whose key's parameter is a bundle row (`bundleKeyParamTy`). It declines under
+    a split plan, as slice 1 does.
 
 ### Open questions for the coordinator
 

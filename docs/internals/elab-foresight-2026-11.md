@@ -75,6 +75,13 @@ or handed on as a value other than to a parameter only ever called, which D15017
 
 ## First slice: (A)
 
+**Status: built.** `elabListMemberSigs` (emit_elab.vl) mints the members as candidates
+(`elabCandKeys`, `elabDemandCandidate`), and the veto is deleted with the slot tables only it
+read. It reads a call's argument types and a member's own calls of its parameter at their checked
+types, not an instance's: a call in a generic or hole body whose types stay open there mints
+nothing. Late demands are 0 over the whole late-demands population with the veto gone, so no
+measured call needs the instanced reading yet.
+
 **Build.**
 
 1. `elabListMemberSigs`, run at the end of `elabRun` before `elabRunDone`. It applies (A)'s
