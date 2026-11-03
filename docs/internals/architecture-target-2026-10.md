@@ -919,10 +919,11 @@ F's 15 files are four shapes by witness:
   and, through a chain of copies of one type parameter whose second parameter keeps its own pin
   (D6090's rule no longer counting the copies as reads of `F`), `generic-fn-value-two-type-param-params-into-annotated-binding`.
   The elaboration takes a type parameter that names no parameter as agreeing with the parameter
-  its copies seed it from (`param-copied-into-two-type-params-called-apart`). The other five:
+  its copies seed it from (`param-copied-into-two-type-params-called-apart`). Of the other five, the first two now run too:
   - two have D6760's un-annotated seed (`type-param-binding-seeded-from-unannotated-param`,
-    `type-param-seeded-by-copy-result-handed-back`). Pinning the copy there mints a late demand,
-    so they wait on per-parameter pins in the elaboration;
+    `type-param-seeded-by-copy-result-handed-back`). They run without the plan since D15071: a
+    function with a type parameter whose result holds a hole that parameter does not bind gets
+    its instance (`elabParamsClosed`);
   - one copies into a record and waits on A's third layer;
   - one (`param-copied-into-unread-binding-of-other-type-param`) is refused by the flow table's
     two pins for the parameter (`monoHoleGenManyPins`, D6741), one of them taken by the copy. That
