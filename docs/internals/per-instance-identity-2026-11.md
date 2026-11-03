@@ -204,7 +204,7 @@ root-level row routes, banks rows for the same pins with no instance (`from < 0`
 `elabDrainHoleRows` either mints them parentless (the twins) or keys them under encloser instances
 itself. D15112 was the price of the second producer. The drain keyed each template row under every
 instance of the encloser, so each instance held every other instance's pin. That was 28 cross keys
-over the `@run` files. #6128 (queued) narrows the rule: a template row fills only an instance whose own walk
+over the `@run` files. #6128 narrows the rule: a template row fills only an instance whose own walk
 banked no row for that declaration.
 
 **Measured on master `f265220a`, over the 5,589 `@run` files**, counting lambdas in an open encloser:
@@ -223,49 +223,57 @@ minting parentless keys.
 So the routes are not redundant copies that can be deleted one at a time. Each root row carries a pin
 that some instance needs. What is wrong is only that the root decides which instance that is.
 
-**The design: the root re-attributes its rows, and drops none.** A root row is banked at a site: the
-call or delivery node whose check pinned it. The instance a pin belongs to is the instance whose walk
-reaches that site. For a call, the walk already records that: `elabReachNote` banks, per call, the
-instances whose walk reached it (`elabCallKeys[ix]`). A delivery site that is not a call needs the
-same record, kept beside it. So one function, `elabSiteInstances(site)`, answers "which keys' walks reached this site", and every root
-route reads it:
+**Where the root rows come from, measured (slice a, master `6015a6da4`).** The plan first assumed
+that a root row was banked by the template check, and recorded the innermost call being checked as
+its site. On D15112's witness, all 6 of the lambda's root rows recorded no site. A trap at the bank
+gave the stack `elabHolePinNote` ← `substHoleTy` ← `elabOne` ← `elabSettle`. The elaboration's own
+walk banks them while it substitutes hole types, and they read `from < 0` only because no live
+capture is open. A sweep over the 1,191 `@run` files that bank a root row then split the 55,835 root
+rows three ways. 8,431 of them belong to a lambda keyed per encloser instance:
 
-1. **Producer of sites.** Every root row records its site. The call routes already hold a call node
-   (`elabEarlyCallRows`, `elabArgValueRows`, the root's set-call rows). Hole rows gain one
-   (`elabHoleRowSite`, banked beside `elabHoleRowFrom` by `elabHolePinNote`).
-2. **Attribution.** At drain time, a root row is enqueued from each instance its site's walk reached,
-   with that instance as `from`, and from no other. A site that no open encloser's walk reaches is a
-   true root pin. It stays parent -1, and it is not a twin. A row whose site has not been walked yet
-   waits, as the deferred list waits today, but keyed by site instead of by encloser instance.
-3. **Readers that ask with no instance** (the S2a' exit list above) ask `elabSiteInstances` for the
-   node they hold. Where it answers no instance, they keep the parent -1 key.
-4. **The beside-mint** in `elabEnqueue` (the parent -1 key kept beside a parented one) is deleted
-   last. That is the point at which a twin can no longer be minted.
+| where the row is banked | all root rows | per-encloser lambda rows |
+| --- | --- | --- |
+| inside an elaboration walk (`elabOne`) | 7,289 | 1,134 (251 with the encloser instance on the walked key's chain) |
+| outside every walk, at a call an instance's walk reached (`elabCallKeys`) | 1,556 | 160 |
+| neither: the checker's template check of the open body | 46,990 | 7,137 |
+
+**The design.** Each bucket gets one producer, and no row is dropped.
+
+1. **A row banked inside a walk belongs to the walked key.** `elabOne` records the key it walks
+   (`elabWalkNow`), and a pin banked during that walk outside a live re-check takes that key as its
+   `from`, as a pin banked in a live re-check takes the re-checked key. That is the instance in hand,
+   so this bucket needs no site.
+2. **A template row of a lambda in an open encloser holds at every instance.** Its pins closed in the
+   template check, so no encloser binding chose them. Its home is under each encloser instance, as the
+   deferred loop does today (and as #6128 narrows), never a parent -1 key beside them.
+3. **The reached-call bucket is not given a producer of its own.** 160 lambda rows is 1.9%, so
+   the call-site record is dropped. Those rows are template rows by the rule in 2.
 
 **Slices**, each graded on the twin probe, b3's control
 (`closures/hole-fn-list-returned-read-at-two-types.vl`), M5's controls, the D15110 and D15112 named
 sets, `@run` output with the split plan on and off, and L2 fuel:
 
-* a. Sites are recorded and nothing reads them. The seed's behaviour is byte-identical. A probe then
-  counts, per root row, how many instances reached its site (0, 1 or many), which predicts the next
-  slices before any key moves.
-* b. Hole rows are re-attributed. This generalises #6128's rule from "instances without their own
-  row" to "the instances that reached the site".
-* c. The early-arm, set-call and argument rows are re-attributed. The 208 instance-carrying lookups
-  that reach a twin should fall to 0 here.
-* d. The no-instance readers switch to `elabSiteInstances`.
-* e. The beside-mint is deleted. Exit criterion: 0 parentless keys of a lambda inside an open encloser.
+* a and b, landed together. The walk key is recorded (recorded alone, as a column, programs built
+  byte-identical, and the probe above is its measurement), and a row banked inside a walk takes it as
+  its `from`. The 1,134 lambda rows move from the root to an instance, and D15112's cross keys cannot
+  recur even without #6128's rule.
+* c. A template row of a lambda in an open encloser is enqueued only under encloser instances, with no
+  parent -1 key minted for it.
+* d. The other root routes (the early arms, the root's set-call rows, the argument rows) are measured
+  by the same split, and take the walked key where they bank inside a walk.
+* e. The beside-mint in `elabEnqueue` is deleted. Exit criterion: 0 parentless keys of a lambda inside
+  an open encloser.
 
 **Risks.**
 
-* A site reached by an instance walk whose bindings differ from the template check's, which was S2a's
-  unsound reuse on `generics/hole-list-literal-local-nullable.vl`. Re-attribution enqueues the row's
-  own pins from the reaching instance. It never reuses that instance's key for a template pin, and
-  slice b grades exactly that file.
-* Cost. The reach records are bounded by sites times instances, and are already kept. The new map
-  adds one lookup per root row.
-* Ordering. A row waiting on a site that no walk ever reaches has to be released as a root pin when
-  the elaboration settles, not dropped.
+* S2a's measured unsound reuse (`generics/hole-list-literal-local-nullable.vl`, a template pin run
+  under one instance's bindings). Slice b enqueues a walk's row from its own key and never runs a
+  template pin under an instance, and slice c runs a template pin under every instance. Both grade
+  that file.
+* A walk of a parentless twin. 883 of the 1,134 walked lambda rows are banked while walking a key
+  whose chain does not hold the encloser instance. Slice b attributes them to that key, so they stay
+  parentless until slice e removes the twins they walk. The twin probe, not the row count, is the
+  grade.
 
 ### M6. A hole parameter's delivered record (D15173, design only)
 
