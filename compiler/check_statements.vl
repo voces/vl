@@ -326,6 +326,7 @@ import {
   TyObj,
   TyUnion,
   TyVar,
+  mkArrayTy,
   mkFuncTy,
   mkNullableTy,
   mkObjTy,
@@ -512,7 +513,7 @@ function letDeclMarkLitBindings(n: LetDecl, ix: i32, bound: i32) {
 export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if curFnDeclIx >= 0 { letDeclFnPut(ix, curFnDeclIx) }
   // An un-annotated binding of a call is stored where the call's results are built.
-  if n.letType < 0 { storeLetPush(n.letInit) }
+  if n.letType < 0 { storeLetPush(n.letInit, ix) }
   if n.letInit >= 0 { wrDstDeclPut(n.letInit, ix) }
   const la = letDeclResolveAnnot(n)
   const annot = la.ty
@@ -572,9 +573,12 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
         if closedAt >= 0 { elabFnListClosedNote(parenPeelIx(n.letInit)) }
       }
     }
-    // A record literal's list field of functions holds what is written into its elements too.
-    if nodeAt(parenPeelIx(n.letInit)) is ObjLit && tpEnvNames.length == 0 {
-      bound = letFieldListsWiden(ix, parenPeelIx(n.letInit), bound)
+    // A record literal's list field of functions holds what is written into its elements too,
+    // as does one inside a list literal's elements (D15201).
+    const initLit = nodeAt(parenPeelIx(n.letInit))
+    if (initLit is ObjLit || initLit is ArrayLit) && tpEnvNames.length == 0 {
+      const none: string[] = []
+      bound = letLitListsWidenAt(ix, parenPeelIx(n.letInit), bound, none)
     }
     recordCtxTy(n.letInit, bound)
   } else if (
@@ -1915,12 +1919,43 @@ function letFnGenericFitsAt(m: i32, f: i32): boolean {
   tySame(substTyDeep(gf.fnRet, bn, bt), ff.fnRet)
 }
 
-// Record type `t` of record literal `lit` binding `bd` initialises, each list field of functions
-// widened by `elabFnFieldListTy`, at any depth of nested record literals, and each widened literal
-// re-typed (D15168).
-function letFieldListsWiden(bd: i32, lit: i32, t: i32): i32 {
-  const none: string[] = []
-  letFieldListsWidenAt(bd, lit, t, none)
+// Type `t` of literal `lit` at step path `pre` of the binding `bd` initialises, each list of
+// functions inside it widened by `elabFnFieldListTy`: a record's fields, and a list's elements as
+// `[]` when every element is a literal (D15168, D15201). Each widened literal is re-typed.
+function letLitListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
+  const ln = nodeAt(lit)
+  if ln is ObjLit { return letFieldListsWidenAt(bd, lit, t, pre) }
+  if !(ln is ArrayLit) || t < 0 || t >= T.tys.length || pre.length > 8 {
+    return t
+  }
+  const ta = T.tys[t]
+  if !(ta is TyArray) || ln.arrElems.length == 0 { return t }
+  // A list of functions below the binding's own value is the leaf `elabFnFieldListTy` widens.
+  const ea = if ta.aElem >= 0 && ta.aElem < T.tys.length { T.tys[ta.aElem] } else { T.tys[TY_ERR] }
+  if ea is TyFunc {
+    return if pre.length > 0 { elabFnFieldListTy(bd, pre, t) } else { t }
+  }
+  const steps: string[] = []
+  for st in pre { steps.push(st) }
+  steps.push("[]")
+  // Every element must be a literal before any is re-typed, so none is left at the old type.
+  for e in ln.arrElems {
+    const v = parenPeelIx(e)
+    if v < 0 || v >= P.nodes.length { return t }
+    const vn = nodeAt(v)
+    if !(vn is ArrayLit || vn is ObjLit) { return t }
+  }
+  let w = -1
+  for e in ln.arrElems {
+    const v = parenPeelIx(e)
+    const we = letLitListsWidenAt(bd, v, ta.aElem, steps)
+    if w < 0 { w = we }
+  }
+  if w < 0 || w == ta.aElem { return t }
+  for e in ln.arrElems { nodeTySetGrow(parenPeelIx(e), w) }
+  const nt = mkArrayTy(w)
+  nodeTySetGrow(lit, nt)
+  nt
 }
 
 // `letFieldListsWiden` for the record literal `lit` of type `t` at field path `pre`.
@@ -1945,7 +1980,7 @@ function letFieldListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
         steps.push(nm)
         let w = ft
         if nodeAt(v) is ArrayLit {
-          w = elabFnFieldListTy(bd, steps, ft)
+          w = letLitListsWidenAt(bd, v, ft, steps)
         } else if nodeAt(v) is ObjLit {
           w = letFieldListsWidenAt(bd, v, ft, steps)
         }
