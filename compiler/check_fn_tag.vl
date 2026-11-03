@@ -47,6 +47,7 @@ import {
   WhileStmt,
   annTsOf,
   callTyArgsOf,
+  declHasExportKw,
   mkCallN,
   mkIdent,
   nodeAt,
@@ -201,7 +202,53 @@ function ftMembersWithin(s: i32, o: i32): boolean {
   true
 }
 
+// The lambda literals whose one position is a list element, written by a list's `push` or an
+// index store. An id there is called only through the list's arms.
+let ftElemLams: {[i32]: boolean} = Map()
+
+// Fills `ftElemLams` by one walk from `rootIx`, the shape `ftScan` walks the program in.
+function ftElemLamsNote(rootIx: i32) {
+  ftElemLams = Map()
+  const todo: i32[] = [rootIx]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Call {
+        const fn = nodeAt(parenPeelIx(n.callFn))
+        if fn is Member && fn.memProp == "push" {
+          const ht = nodeTyIxOf(fn.memObj)
+          if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
+            for a in n.callArgs { ftElemLamMark(a) }
+          }
+        }
+      } else if n is BinExpr && ftIsStore(n) {
+        const l = parenPeelIx(n.binLeft)
+        const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { nodeAt(n.binLeft) }
+        if ln is Index {
+          const ht = nodeTyIxOf(ln.idxArr)
+          if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
+            ftElemLamMark(n.binRight)
+          }
+        }
+      }
+      nodeChildrenPush(x, todo)
+    }
+  }
+  0
+}
+
+// Marks `v` in `ftElemLams` when it is a lambda literal.
+function ftElemLamMark(v: i32) {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= P.nodes.length { return 0 }
+  const f = nodeAt(x)
+  if f is FuncDecl && f.fnName == "" { ftElemLams[x] = true }
+  0
+}
+
 export function fnTagDecide(rootIx: i32) {
+  ftElemLamsNote(rootIx)
   ftParamOwners = Map()
   ftParamOwnersBuilt = false
   ftDirectLen = 0
@@ -210,6 +257,10 @@ export function fnTagDecide(rootIx: i32) {
   ftHandedAt = Map()
   ftParamRefs = Map()
   ftParamCalls = Map()
+  ftListedAt = Map()
+  ftLitLet = Map()
+  ftLetRefs = Map()
+  ftLetElemCalls = Map()
   if !ftLate { ftCheckLen = P.nodes.length }
   ftDecideRoot = rootIx
   fnTagUndecide()
@@ -517,9 +568,47 @@ function ftMemberSeenAtArms(
     }
   }
   for c in sites {
-    if !(under[c] ?? false) { return false }
+    if !(under[c] ?? false) { return ftNestedCaptureFree(d) }
   }
   true
+}
+
+// Whether nested function `d` reads no binding of a function enclosing it, so an arm built where
+// its name is out of scope can call it by its declaration.
+function ftNestedCaptureFree(d: i32): boolean {
+  const own = ftSubtree(d)
+  let a = fnDeclParent[d] ?? -1
+  while a >= 0 {
+    const enc = ftSubtree(a)
+    const todo: i32[] = [d]
+    while todo.length > 0 {
+      const y = todo.pop() ?? -1
+      if y >= 0 && y < P.nodes.length {
+        const yn = nodeAt(y)
+        if yn is Ident {
+          const k = identDeclOf(y)
+          if k >= 0 && !(own[k] ?? false) && (enc[k] ?? false) { return false }
+        }
+        nodeChildrenPush(y, todo)
+      }
+    }
+    a = fnDeclParent[a] ?? -1
+  }
+  a != -2
+}
+
+// The nodes under node `r`, `r` included.
+function ftSubtree(r: i32): Map<i32, boolean> {
+  const under: Map<i32, boolean> = Map()
+  const todo: i32[] = [r]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length && !(under[y] ?? false) {
+      under[y] = true
+      nodeChildrenPush(y, todo)
+    }
+  }
+  under
 }
 
 // Whether set `s` may be tagged, planning it in a new row when so.
@@ -1334,13 +1423,13 @@ function ftPlainDecl(d: i32): boolean {
 }
 
 // Whether a written binding of set `s` may be delivered through an adapter: each member is a named
-// declaration or a lambda whose id can stand for it, and one is generic or a hole lambda, so no
-// one closure signature holds the binding's value.
+// declaration or a lambda whose id can stand for it, and one is generic or has a parameter with no
+// annotation, so no one closure signature holds the binding's value.
 function ftWideEscOk(s: i32): boolean {
   let gen = false
   for m in fnTagMembers(s) {
     if ftNamedDecl(m) {
-      if !ftPlainDecl(m) { gen = true }
+      if !ftPlainDecl(m) || ftHoleLambda(m) { gen = true }
     } else if ftLambdaIdOk(m) && !ftWithinInstancedFn(m) {
       if ftHoleLambda(m) { gen = true }
     } else {
@@ -1350,7 +1439,7 @@ function ftWideEscOk(s: i32): boolean {
   gen
 }
 
-// Whether lambda `m` has a parameter with no annotation, so each call instances it anew.
+// Whether function `m` has a parameter with no annotation, so each call instances it anew.
 function ftHoleLambda(m: i32): boolean {
   const f = nodeAt(m)
   if !(f is FuncDecl) { return false }
@@ -1450,7 +1539,8 @@ function ftFnOk(fn: i32): boolean {
 
 // Whether lambda `x` can stand as an id: it reads only its own bindings and the module's, so a
 // call by its declaration needs no environment, and calls none of its parameters, whose instance
-// is chosen by the function a caller hands it rather than by the one arm an id calls.
+// is chosen by the function a caller hands it rather than by the one arm an id calls, unless it
+// is a list element (`ftElemLams`), whose every call is an arm's.
 function ftLambdaIdOk(x: i32): boolean {
   const f = nodeAt(x)
   if !(f is FuncDecl) { return false }
@@ -1474,6 +1564,7 @@ function ftLambdaIdOk(x: i32): boolean {
     if (
       yn is Call
       && i32ListHas(f.fnParams, identDeclOf(parenPeelIx(yn.callFn)))
+      && !(ftElemLams[x] ?? false)
     ) {
       return false
     }
@@ -1504,6 +1595,7 @@ function ftNodeOk(
     // A `let` written with other members holds the set its initialiser is one of.
     LetDecl => {
       if n.letInit < 0 || ftIsS(n.letInit, s) { return true }
+      if ftAliasIntoCaptured(n.letInit, x) { return false }
       return ftJoinAt(n.letInit, nodeTyIxOf(x), s, ds, leaves, ids)
     }
     Paren | Block => {
@@ -1554,8 +1646,11 @@ function ftNodeOk(
           || ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
       }
       if !ftIsStore(n) { return false }
-      return ftIsS(n.binRight, s)
-        || ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
+      if ftIsS(n.binRight, s) { return true }
+      const bl = parenPeelIx(n.binLeft)
+      const bd = if bl >= 0 && bl < P.nodes.length && nodeAt(bl) is Ident { identDeclOf(bl) } else { -1 }
+      if ftAliasIntoCaptured(n.binRight, bd) { return false }
+      return ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
     }
     // An element read of a list holding the set's ids is one of them.
     Index => {
@@ -1863,9 +1958,29 @@ function ftReachHandSets(fd: i32, pi: i32, depth: i32): i32[] {
   const at = ftHandedAt[fd] ?? []
   const calls = ftDirectCalls[fd] ?? 0
   const refs = ftDirectRefs[fd] ?? 0
-  if refs == 0 || refs != calls + at.length / 2 { return none }
+  const lits = ftListedAt[fd] ?? []
+  if refs == 0 || refs != calls + at.length / 2 + lits.length { return none }
   const out = fnParamHandSets(fd, pi).slice(0)
   if calls > 0 && out.length == 0 { return none }
+  // A `const` list literal holding `fd`, read only as the callee of a call through an element,
+  // hands each such call's argument (D15053's stored spelling).
+  for lit in lits {
+    const ld = ftLitLet[lit] ?? -1
+    const ln = if ld >= 0 && ld < P.nodes.length { nodeAt(ld) } else { nodeAt(lit) }
+    if !(ln is LetDecl) || ln.letKw != "const" || declHasExportKw(ld) {
+      return none
+    }
+    const ecs = ftLetElemCalls[ld] ?? []
+    if ecs.length == 0 || (ftLetRefs[ld] ?? 0) != ecs.length { return none }
+    for ec in ecs {
+      const cn = nodeAt(ec)
+      if !(cn is Call) || pi >= cn.callArgs.length { return none }
+      const ax = parenPeelIx(cn.callArgs[pi])
+      const ad = if ax >= 0 && ax < P.nodes.length && nodeAt(ax) is Ident { identDeclOf(ax) } else { -1 }
+      if ad >= 0 && ad < P.nodes.length && nodeAt(ad) is Param { return none }
+      out.push(fnTagSetOfTy(nodeTyIxOf(ax)))
+    }
+  }
   // Each parameter `fd` is handed to, `[function, index, ...]`, read once.
   const seen: i32[] = []
   let k = 0
@@ -1923,6 +2038,12 @@ let ftDirectCalls: {[i32]: i32} = Map()
 let ftHandedAt: {[i32]: i32[]} = Map()
 let ftParamRefs: {[i32]: i32} = Map()
 let ftParamCalls: {[i32]: i32[]} = Map()
+// Per function, the list literals naming it as an element; per list literal, the `let` it
+// initialises; per `let`, the names reading it and the calls through an element of it.
+let ftListedAt: {[i32]: i32[]} = Map()
+let ftLitLet: {[i32]: i32} = Map()
+let ftLetRefs: {[i32]: i32} = Map()
+let ftLetElemCalls: {[i32]: i32[]} = Map()
 
 // The arena's length at the check's own decision. A later decision counts only those nodes: the
 // calls the elaboration adds (a set's arms) hand nothing the check noted.
@@ -1942,6 +2063,9 @@ function ftDirectCountsGrow() {
         if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is Param {
           ftParamRefs[pd] = (ftParamRefs[pd] ?? 0) + 1
         }
+        if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is LetDecl {
+          ftLetRefs[pd] = (ftLetRefs[pd] ?? 0) + 1
+        }
       }
       Call => {
         const cf = n.callFn
@@ -1953,6 +2077,15 @@ function ftDirectCountsGrow() {
           const pcs = ftParamCalls[pd] ?? []
           pcs.push(x)
           ftParamCalls[pd] = pcs
+        }
+        // A call through an element of a `let`: `fs[i](...)`.
+        const ixn = if cf >= 0 && cf < P.nodes.length { nodeAt(parenPeelIx(cf)) } else { n }
+        const base = if ixn is Index { parenPeelIx(ixn.idxArr) } else { -1 }
+        const bd = if base >= 0 && base < P.nodes.length && nodeAt(base) is Ident { identDeclOf(base) } else { -1 }
+        if bd >= 0 && bd < P.nodes.length && nodeAt(bd) is LetDecl {
+          const ecs = ftLetElemCalls[bd] ?? []
+          ecs.push(x)
+          ftLetElemCalls[bd] = ecs
         }
         let i = 0
         while d >= 0 && i < n.callArgs.length {
@@ -1967,8 +2100,24 @@ function ftDirectCountsGrow() {
           i = i + 1
         }
       }
+      ArrayLit => {
+        for e in n.arrElems {
+          const ed = if e >= 0 && e < P.nodes.length && nodeAt(e) is Ident { identFnDeclOf(e) } else { -1 }
+          if ed >= 0 {
+            const ls = ftListedAt[ed] ?? []
+            ls.push(x)
+            ftListedAt[ed] = ls
+          }
+        }
+      }
+      LetDecl => {
+        const li = parenPeelIx(n.letInit)
+        if li >= 0 && li < P.nodes.length && nodeAt(li) is ArrayLit {
+          ftLitLet[li] = x
+        }
+      }
       // No other node names a function.
-      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
     }
     x = x + 1
   }
@@ -2154,11 +2303,32 @@ export function ftWithinInstancedFn(x: i32): boolean {
   false
 }
 
-// The member of `ds` the name at `v` reads, or -1; a local `const` reads its initialiser.
+// Whether `v` reads a lambda through a `const` and binding `b` is read inside a closure, whose
+// capture of `b` an alias's id does not reach.
+function ftAliasIntoCaptured(v: i32, b: i32): boolean {
+  const vx = parenPeelIx(v)
+  if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) { return false }
+  const src = ftConstSource(vx, 8)
+  if src == vx || src < 0 || src >= P.nodes.length { return false }
+  const sn = nodeAt(src)
+  if !(sn is FuncDecl) || sn.fnName != "" || b < 0 { return false }
+  cwIxWant()
+  const w = cwOccWalk(b)
+  while cwOccNext(w) {
+    if cwIxKind[w.row] == CW_OCC_USE && cwUseCaptures(cwIxNode[w.row]) {
+      return true
+    }
+  }
+  false
+}
+
+// The member of `ds` the name at `v` reads, or -1; a local `const` reads its initialiser, a
+// lambda member among them where its id can stand for it.
 function ftLeafMember(v: i32, ds: i32[]): i32 {
   const src = ftConstSource(v, 8)
   const d = ftNamedFn(src)
   if d >= 0 { return if i32ListHas(ds, d) { d } else { -1 } }
+  if src != v && src >= 0 && ftLambdaLeaf(src, ds) { return src }
   // A function declared inside another names a member where its id can stand for it.
   const r = if src >= 0 && nodeAt(src) is Ident { identDeclOf(src) } else { -1 }
   const f = if r >= 0 && i32ListHas(ds, r) { nodeAt(r) } else { null }
@@ -2298,6 +2468,55 @@ function ftParamOfSet(c: Call, x: i32, s: i32): boolean {
   false
 }
 
+// Whether `x` is an argument of call `c` through an element of a `const` list literal of named
+// functions, each taking it at an un-annotated parameter that only `s` reaches: each member's
+// instance binds it to what the call hands, as a direct call's does (`ftLateParamOk` after the
+// elaboration).
+function ftListCallHoleArg(c: Call, x: i32, s: i32): boolean {
+  const cf = parenPeelIx(c.callFn)
+  if cf < 0 || cf >= P.nodes.length { return false }
+  const cn = nodeAt(cf)
+  if !(cn is Index) { return false }
+  const b = parenPeelIx(cn.idxArr)
+  if b < 0 || b >= P.nodes.length || !(nodeAt(b) is Ident) { return false }
+  const ld = identDeclOf(b)
+  const ln = if ld >= 0 && ld < P.nodes.length { nodeAt(ld) } else { cn }
+  if !(ln is LetDecl) || ln.letKw != "const" || declHasExportKw(ld) {
+    return false
+  }
+  // Read only as the base of a call through an element: nothing else adds to or reads the list.
+  ftDirectCountsGrow()
+  const ecs = ftLetElemCalls[ld] ?? []
+  if ecs.length == 0 || (ftLetRefs[ld] ?? 0) != ecs.length { return false }
+  const li = parenPeelIx(ln.letInit)
+  const lit = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { cn }
+  if !(lit is ArrayLit) || lit.arrElems.length == 0 { return false }
+  const i = i32ListIndexOf(c.callArgs, x)
+  if i < 0 || i < c.callArgNames.length && c.callArgNames[i] != "" {
+    return false
+  }
+  for e in lit.arrElems {
+    const d = if e >= 0 && e < P.nodes.length && nodeAt(e) is Ident { identFnDeclOf(e) } else { -1 }
+    const f = if d >= 0 { nodeAt(d) } else { cn }
+    if !(f is FuncDecl) || f.fnName == "" || i >= f.fnParams.length {
+      return false
+    }
+    const pn = nodeAt(f.fnParams[i])
+    if !(pn is Param) || pn.parType >= 0 { return false }
+    if ftLate && !i32ListHas(ftWas, s) && !ftLateParamTakes(c, d, i, s) {
+      return false
+    }
+    // No call reaching the member hands that parameter a set outside `s`, so the element's one
+    // closure signature holds `s`'s id (D15019).
+    const hs = ftReachHandSets(d, i, 0)
+    if hs.length == 0 { return false }
+    for st in hs {
+      if st < 0 || st != s && !ftSetWithin(st, s) { return false }
+    }
+  }
+  true
+}
+
 // Whether argument `x` of call `c` binds a positional, un-annotated parameter of the named
 // top-level function `c` calls.
 function ftHoleParamOf(c: Call, x: i32): boolean {
@@ -2310,6 +2529,11 @@ function ftHoleParamOf(c: Call, x: i32): boolean {
     if c.callArgs[i] == x {
       if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
       const pn = nodeAt(f.fnParams[i])
+      // A parameter the body writes into a holder's slot lands in that holder's rep, which an
+      // instance types and this decision does not see (D15065).
+      if pn is Param && pn.parType < 0 && ftParamStored(f, f.fnParams[i]) {
+        return false
+      }
       return pn is Param
         && (pn.parType < 0
         || ftLate
@@ -2319,6 +2543,38 @@ function ftHoleParamOf(c: Call, x: i32): boolean {
         || ftOwnTyParamSharedBack(d, f, i, c.callArgs)))
     }
     i = i + 1
+  }
+  false
+}
+
+// Whether `f`'s body writes a read of parameter `par` into a holder's slot, as a `push` or `set`
+// argument: the holder's rep is an instance's, which a binding or literal of the body is not.
+function ftParamStored(f: FuncDecl, par: i32): boolean {
+  const xs: i32[] = [f.fnBody]
+  const ps: i32[] = [-1]
+  while xs.length > 0 {
+    const x = xs.pop() ?? -1
+    const p = ps.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if (
+        nodeAt(x) is Ident
+        && identDeclOf(x) == par
+        && p >= 0
+        && p < P.nodes.length
+      ) {
+        const pn = nodeAt(p)
+        if pn is Call && i32ListHas(pn.callArgs, x) {
+          const cm = nodeAt(parenPeelIx(pn.callFn))
+          if cm is Member && (cm.memProp == "push" || cm.memProp == "set") {
+            return true
+          }
+        }
+      }
+      for k in nodeChildren(x) {
+        xs.push(k)
+        ps.push(x)
+      }
+    }
   }
   false
 }
@@ -2432,7 +2688,11 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
   if !ftLate || i32ListHas(ftWas, s) { return true }
   const d = ftCalleeFn(ftCalleeSource(c))
   if d < 0 { return true }
-  const i = i32ListIndexOf(c.callArgs, x)
+  ftLateParamTakes(c, d, i32ListIndexOf(c.callArgs, x), s)
+}
+
+// Whether parameter `i` of `d`, handed `s` by call `c`, takes it as the elaboration's facts read.
+function ftLateParamTakes(c: Call, d: i32, i: i32, s: i32): boolean {
   mintParamTakes(d, i, s)
     || ftParamUnread(d, i)
     || ftArgIsParam(c, i) && ftParamForwardsSet(d, i, s)
@@ -2490,12 +2750,44 @@ function ftLateArgOfSet(c: Call, x: i32, s: i32): boolean {
   if cf < 0 || !(nodeAt(cf) is Index || nodeAt(cf) is Member || held) {
     return false
   }
-  const ds = fnTagMembers(fnTagSetOfTy(nodeTyIxOf(cf)))
+  const cs = fnTagSetOfTy(nodeTyIxOf(cf))
+  const ds = fnTagMembers(cs)
   if ds.length == 0 { return false }
   for d in ds {
     if !mintParamTakes(d, i, s) { return false }
   }
+  // A call through a closure of named functions takes the closure's one signature, which holds
+  // `s`'s id only where no instance hands the members' parameter another set; else the callee's
+  // set is decided with `s`, so the call is a dispatch (D15019).
+  if (
+    cs != s
+    && !fnTagSetIsTagged(cs)
+    && ftAllNamed(ds)
+    && ftParamTakesOther(ds, i, s)
+  ) {
+    if !i32ListHas(ftSubNeed, cs) { ftSubNeed.push(cs) }
+  }
   true
+}
+
+// Whether every declaration in `ds` is a named function.
+function ftAllNamed(ds: i32[]): boolean {
+  for d in ds {
+    const m = nodeAt(d)
+    if !(m is FuncDecl) || m.fnName == "" { return false }
+  }
+  true
+}
+
+// Whether some instance's calls through parameter `i` of a member of `ds` go through a set other
+// than `s`.
+function ftParamTakesOther(ds: i32[], i: i32, s: i32): boolean {
+  for d in ds {
+    for o in mintParamSetsOf(d, i) {
+      if o != s { return true }
+    }
+  }
+  false
 }
 
 // Whether every call through parameter `par` goes through sets of named functions each of which
@@ -2540,6 +2832,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         return fnTagCallSetOf(p) == s || ftLateDirectCall(x, s)
       }
       return (ftParamOfSet(pn, x, s) && ftLateParamOk(pn, x, s))
+        || ftListCallHoleArg(pn, x, s)
         || ftSlotWriteArg(pn, x, s)
         || ftLateArgOfSet(pn, x, s)
     }

@@ -11379,6 +11379,18 @@ caller boxing a returned arm reads its tag through it), and the label is not nar
 Folding tags into rows, a tag keyed by (union, row) rather than by arm, would be a separate
 tag-numbering decision, and it is not taken.
 
+## Numeric `==` across widths is a value compare, through every box (ruling, 2026-11-03) — D15090
+
+`==` between two numbers of different width widens to the wider type and compares the values,
+whether the operands are plain, nullable or members of a union: `(i32 | null) 1 == (f64 | null)
+1.0` is true, as `i32 1 == f64 1.0` already was, and `null == null` is true. Only a lossless pair
+compares (`i32` and `i64`, `i32` and `f64`, `f32` and `f64`); a lossy one (`i64` and `f64`, `i32`
+and `f32`) is refused at check, plain or boxed, so the boxed spelling never answers a pair the
+plain one would not. Before the ruling a union `==` compared the two boxes' tags first, so equal
+values of different width printed `false`, and `(i32 | null) == f64` was refused while
+`(i64 | null) == i32` ran. A float literal against a union whose only float arm is `f32` is
+still built at that arm; an `f64` value is compared at `f64`.
+
 ## A record wider than a union arm is that arm's subtype, not a copy of it (2026-11-02)
 
 A record value whose fields begin with one union arm's fields (same names, same storage, in the
