@@ -499,6 +499,12 @@ function declOpen(d: i32): boolean {
 // around it, -2 when an enclosing declaration whose type variables `d` reads is open and not on
 // the chain (the open enclosing instance reaches it instead).
 function elabParentFor(d: i32, from: i32): i32 {
+  elabParentForAt(d, from, true)
+}
+
+// `elabParentFor`, where `lam` says whether an anonymous lambda takes its open encloser's instance
+// as parent though it reads none of its type variables.
+function elabParentForAt(d: i32, from: i32, lam: boolean): i32 {
   let e = elabEncl.get(d) ?? -1
   let anyOpen = false
   let guard = 0
@@ -507,7 +513,16 @@ function elabParentFor(d: i32, from: i32): i32 {
     let g2 = 0
     while a >= 0 && g2 < 64 {
       if ekDecl[a] == e {
-        return if elabReadsChainOf(d, a) || anyOpen { a } else { -1 }
+        // A lambda declared in an instanced body is keyed under that instance, so each instance
+        // holds its own (per-instance-identity-2026-11.md, M3 step 2).
+        if (
+          elabReadsChainOf(d, a)
+          || anyOpen
+          || (lam && elabLamPerEncl(d) && declOpen(e))
+        ) {
+          return a
+        }
+        return -1
       }
       a = ekParent[a]
       g2 = g2 + 1
@@ -518,6 +533,26 @@ function elabParentFor(d: i32, from: i32): i32 {
   }
   if anyOpen { return 0 - 2 }
   -1
+}
+
+// Whether `d` is an anonymous lambda with an un-annotated parameter, whose key takes its encloser
+// instance as parent; a lambda with nothing to key is its template at every instance.
+function elabLamPerEncl(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  // Lifting renames a lambda `__lambda_N` after the run, and mono asks for it under that name.
+  if !(n is FuncDecl) { return false }
+  if (
+    n.fnName != ""
+    && !(n.fnName.length >= 8 && n.fnName.slice(0, 8) == "__lambda")
+  ) {
+    return false
+  }
+  for p in n.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  false
 }
 
 // Whether nested declaration `d` reads the type variable `nm` an enclosing declaration binds:
@@ -752,6 +787,12 @@ function elabDrainHoleRows() {
         }
         elabReachNote(from, k0, -1)
         elabGuessing = false
+        // A lambda pinned by the template check is also keyed under each instance of its
+        // encloser, which is where mono asks for it.
+        if from < 0 && elabLamPerEncl(d) && elabEncl.has(d) {
+          elabHoleDeferred.push(r)
+          elabHoleDeferredAt.push(0)
+        }
       }
     }
     elabHoleCur = elabHoleCur + 1
@@ -1109,6 +1150,11 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   if !elabCanon(decl, names0, tys0, names, tys) { return -1 }
   const parent = elabParentFor(decl, from)
   if parent == 0 - 2 { return -1 }
+  // The key a lambda had before it took its encloser instance stays minted beside the per-instance
+  // one, for the readers that ask with no instance in hand (per-instance-identity-2026-11.md, M5).
+  if parent >= 0 && elabParentForAt(decl, from, false) == -1 {
+    elabEnqueue(decl, names0, tys0, -1)
+  }
   const key = i32ToStr(parent) + "^" + elabKeyOf(decl, names, tys)
   const have = ekIndex[key] ?? -1
   if have >= 0 { return have }
