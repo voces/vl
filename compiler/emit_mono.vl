@@ -22936,27 +22936,43 @@ function monoCadRowFe(site: i32, inst: i32, sig: i32): i32 {
 }
 
 // Whether node `x` or one beneath it reads parameter `par` other than as the callee of a call in
-// its own function's body (`own`): handed on, stored, or read by a nested function.
-function monoParamReadOtherThanCalled(x: i32, par: i32, own: boolean): boolean {
+// its own function's body (`own`): handed on, stored, or read by a nested function. With `fwd`, a
+// read handed whole to a named function as a positional argument is not counted.
+function monoParamReadOtherThanCalled(
+  x: i32,
+  par: i32,
+  own: boolean,
+  fwd: boolean,
+): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   const n = nodeAt(x)
   if n is Ident { return identDeclOf(x) == par }
   if n is FuncDecl {
     for k in nodeChildren(x) {
-      if monoParamReadOtherThanCalled(k, par, false) { return true }
+      if monoParamReadOtherThanCalled(k, par, false, false) { return true }
     }
     return false
   }
   if n is Call {
     const cf = unwrapParen(n.callFn)
-    const called = own
-      && cf >= 0
-      && nodeAt(cf) is Ident
-      && identDeclOf(cf) == par
+    const cd = if cf >= 0 && nodeAt(cf) is Ident { identDeclOf(cf) } else { -1 }
+    const called = own && cd == par
+    const named = own
+      && fwd
+      && cd >= 0
+      && cd < P.nodes.length
+      && nodeAt(cd) is FuncDecl
     for k in nodeChildren(x) {
+      const ku = unwrapParen(k)
+      const handed = named
+        && i32ListHas(n.callArgs, k)
+        && ku >= 0
+        && nodeAt(ku) is Ident
+        && identDeclOf(ku) == par
       if (
-        !(called && unwrapParen(k) == cf)
-        && monoParamReadOtherThanCalled(k, par, own)
+        !(called && ku == cf)
+        && !handed
+        && monoParamReadOtherThanCalled(k, par, own, fwd)
       ) {
         return true
       }
@@ -22964,7 +22980,7 @@ function monoParamReadOtherThanCalled(x: i32, par: i32, own: boolean): boolean {
     return false
   }
   for k in nodeChildren(x) {
-    if monoParamReadOtherThanCalled(k, par, own) { return true }
+    if monoParamReadOtherThanCalled(k, par, own, fwd) { return true }
   }
   false
 }
@@ -22985,10 +23001,14 @@ function monoBundlePin(
 ): i32 {
   const sigs = elabCallBundleSigs(monoCallTplOf(callIx), i)
   if sigs.length < 2 { return 1 }
-  // The callee reads the record only as a callee: any other read wants one closure.
-  if monoParamReadOtherThanCalled(fn.fnBody, par, true) { return 1 }
+  // The callee reads the record only as a callee, or hands it whole to a named function: any other
+  // read wants one closure.
+  const fwd = fsModeOf() == FS_COMPILE
+  if monoParamReadOtherThanCalled(fn.fnBody, par, true, fwd) { return 1 }
   const x = unwrapParen(arg)
   if x >= 0 && nodeAt(x) is Ident {
+    const fw = monoBundleHandOnPin(x, sigs, ctx, pinned, pinTys)
+    if fw != 1 { return fw }
     return monoBundleNamedPin(x, sigs, ctx, pinned, pinTys)
   }
   if x < 0 || !(nodeAt(x) is FuncDecl) { return 1 }
@@ -23027,6 +23047,62 @@ function monoBundlePin(
   pinned.push(sNames[row])
   pinTys.push(bt)
   0
+}
+
+// `monoBundlePin` for read `x` of the caller's own bundle parameter holding `sigs`: the record is
+// handed on as it is, so the parameter is pinned at its type. 0, or 1 where `x` reads no such
+// parameter.
+function monoBundleHandOnPin(
+  x: i32,
+  sigs: i32[],
+  ctx: i32,
+  pinned: string[],
+  pinTys: i32[],
+): i32 {
+  if fsModeOf() != FS_COMPILE { return 1 }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length || ctx < 0 || ctx >= P.nodes.length {
+    return 1
+  }
+  const p = nodeAt(d)
+  const fn = nodeAt(ctx)
+  if !(p is Param) || !(fn is FuncDecl) { return 1 }
+  // The read is the template's; the instance holds the parameter by name, pinned.
+  let pt = -1
+  for q in fn.fnParams {
+    const qn = nodeAt(q)
+    if qn is Param && qn.parName == p.parName && qn.parType >= 0 {
+      pt = nodeTyIxOf(qn.parType)
+    }
+  }
+  // The pin is spelled afresh in the instance by its record's row, and each bundle has a row of its
+  // own, so the record is matched by that row.
+  const pr = monoBundleRowOf(pt)
+  let bi = -1
+  let q = 0
+  while pr >= 0 && bi < 0 && q < monoBundleTys.length {
+    if monoBundleRowOf(monoBundleTys[q]) == pr { bi = q }
+    q = q + 1
+  }
+  if bi < 0 || bi >= monoBundleTySigs.length { return 1 }
+  const have = monoBundleTySigs[bi]
+  if have.length != sigs.length { return 1 }
+  let j = 0
+  while j < sigs.length {
+    if !tySame(have[j], sigs[j]) { return 1 }
+    j = j + 1
+  }
+  if pr >= sNames.length { return 1 }
+  pinned.push(sNames[pr])
+  pinTys.push(monoBundleTys[bi])
+  0
+}
+
+// The struct row of record type `t`, or -1.
+function monoBundleRowOf(t: i32): i32 {
+  if t < 0 { return -1 }
+  const si = structRowRecordingTy(t)
+  if si >= 0 { si } else { repRowOfTyStruct(t, sScanLim()) }
 }
 
 // `monoBundlePin` for a generic named by read `x`, handed to a lambda that calls its parameter at
@@ -23136,7 +23212,7 @@ function monoClosureBundlePin(
   const inst: i32[] = [0 - 1]
   const sigs = elabLamParamSigs(elabSrcDecl(lam), 0, inst)
   if sigs.length < 2 { return 1 }
-  if monoParamReadOtherThanCalled(fn.fnBody, par, true) { return 1 }
+  if monoParamReadOtherThanCalled(fn.fnBody, par, true, false) { return 1 }
   if !monoCallsHandGenerics(fn.fnBody, par) { return 1 }
   const ret = elabRetOf(inst[0])
   if ret < 0 || tyHasTyVar(ret) { return 1 }
