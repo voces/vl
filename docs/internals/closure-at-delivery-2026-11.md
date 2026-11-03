@@ -287,6 +287,12 @@ shared row names.
     caller's record (`monoBundleHandOnPin`), and emit passes the record on as it is. A chain where
     no instance binds the parameter to a set stays refused. The capture half of
     `hole-lambda-bundle-param-read-as-value` is slice B.
+  - **Slice B (read as value), a capture, built.** A call through a bundle parameter from a closure
+    that captures it is noted at the ancestor instance binding the parameter
+    (`elabCapturedBundleSigNote`), mono admits a nested function that only calls the capture, and
+    a captured read names the binding frame's bundle parameter (`bundleParamOfRead`), so the
+    closure calls a field of the record it captured. A returned capture, and a capture two
+    closures deep, stay refused.
 
 ### Open questions for the coordinator
 
