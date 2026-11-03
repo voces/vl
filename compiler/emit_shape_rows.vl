@@ -60,7 +60,6 @@ import { nodeTyMapValName } from "./check_hole_pins"
 import { isTopLevelFuncTypeName } from "./check_lit_union_spell"
 import {
   nodeArrayElemTyIx,
-  nodeTyIsLitUnionAlias,
   nodeTyIsNullType,
   nodeTyIxOf,
   nodeTyMapKeyKind,
@@ -130,7 +129,6 @@ import {
   tyNomNameCycled,
   tyNulInnerIsPrim,
   tySame,
-  tyScalarBaseIs,
   tyToEmitName,
   tyToNominalName,
   tyToNominalNameAt,
@@ -177,12 +175,10 @@ import {
   nameIsString,
   nameIsStringArray,
   nameIsU8Array,
-  nulCloFlag,
   nulLitUnionInnerNameOfTy,
   nullablePartOf,
   parenUnionArrElemName,
   setShapeOfTy,
-  tyIsFuncType,
 } from "./emit_base"
 import { emitFail } from "./emit_bytes"
 import {
@@ -1900,21 +1896,6 @@ export function annRepKindOf(tyNodeIx: i32): VKind | null {
   null
 }
 
-// True if the type-annotation node `tyIx` denotes the kind-19 nullable-closure niche,
-// seeing through a declared alias whose body is a function type (`type F = (i32) => i32`,
-// then `F | null`). The parser encodes such an alias as `TyNullable(TyUnion[TyFunc])`, so
-// `tyDenotesFunc` peels the degenerate one-member union wrapper to find the function.
-export function nulCloFlagAnn(tyIx: i32) {
-  if nulCloFlag(tyIx) == 1 { return 1 }
-  const ty = nodeTyIxOf(tyIx)
-  if ty < 0 { return 0 }
-  const t = tyAt(ty)
-  if t is TyNullable {
-    if tyDenotesFunc(t.nInner) { return 1 }
-  }
-  0
-}
-
 // The ref-array shape ladder — the one home of the arms `nameIsRefArray` and
 // `refArrElemKind` each carried as their own hand-copy (D-REFARRKIND). Returns the
 // ref-list element kind a name's shape decides, or -1 when no shape arm claims it — the
@@ -2576,10 +2557,10 @@ export function nameIsNulRefList(name: string) {
 export function fieldTypeIsDeferred(t: string): boolean { nameIsU8Array(t) }
 
 // The per-field wasm-type code a field type spelling carries — the one home of the
-// field-code ladder, shared by `fieldTypeCode` and `nameFieldCode`, whose arms must agree in
-// order. `litNode` is the annotation node (-1 for none); `fty` is a node-less caller's arena
-// type for the field (-1 for none), read ahead of the spelling by the literal-union and list arms.
-function fieldCodeOfSpelling(t: string, litNode: i32, fty: i32) {
+// field-code ladder behind `nameFieldCode` and `fieldCodeOfRecField`, whose arms must agree
+// in order. `fty` is the caller's arena type for the field (-1 for none), read ahead of the
+// spelling by the literal-union and list arms.
+function fieldCodeOfSpelling(t: string, fty: i32) {
   if t == "i32" { return FC_I32 }
   // The `null` unit type stores its one value in a `nullref` slot (D4671).
   if t == "null" { return FC_NUL_NONE }
@@ -2589,56 +2570,18 @@ function fieldCodeOfSpelling(t: string, litNode: i32, fty: i32) {
   if t == "f64" { return FC_F64 }
   if t == "i64" { return FC_I64 }
   if t == "f32" { return FC_F32 }
-  // A literal-union field stores an interned i32 atom (code 0), not a box. Checked before
-  // the union tests, since a literal union also registers as a union name that would
-  // otherwise claim it as code 16. The union name is recorded in `sFieldElemName` so
-  // construction, read, and assign recover the atom's membership.
-  if litNode >= 0 {
-    if nodeTyIsLitUnionAlias(litNode) { return FC_I32 }
-    // A bare string literal is its one-member set, so its field is the atom too (D7220).
-    if tyIsOneStrLit(nodeTyIxOf(litNode)) { return FC_I32 }
-    // An inline literal-union array field is the i32 atom list, code 4 — the same code the
-    // `K[]` alias gets. Its spelling cannot say so: `canonEmitName` softens it to
-    // `"string[]"`, which the array arm below would code 6, while every element path builds
-    // atom ids. Decided structurally off the recorded type, ahead of the softened name.
-    if tyIsLitUnionArray(nodeTyIxOf(litNode)) { return FC_I32_LIST }
-    // The `| null` twin: `("a"|"b")[] | null` is the nullable i32 atom list, code 18 — the
-    // same code its `K[] | null` alias gets. Same softening blindness: the
-    // nullable-scalar-list arm below would code it 31 while the object literal stores the
-    // atom wrapper. Asked of the rep (`repOfNullable`) rather than re-derived from the softened type.
-    if annRepKindOf(litNode) == "nullist" { return FC_NUL_I32_LIST }
-    // The nullable-ELEMENT twin, which folds onto the SAME code 4: `nameIsI32Array` admits
-    // `(K | null)[]` into the i32 backing (one `$lTypeIdx` wrapper for the whole atom-niche
-    // family), so the alias spelling already codes 4 here and the inline one must too.
-    if annIsNulLitUnionArray(litNode) { return FC_I32_LIST }
-  } else {
-    // An inline member set is the string slot; a registered alias is the atom — the split
-    // the node path makes with `nodeTyIsLitUnionAlias`, which this name-only path lacks.
-    // Without it an inline-shape annotation of the identical field coded 0, so passing a
-    // declared struct to that parameter produced check-clean invalid wasm.
-    if nameIsInlineLitUnion(t) { return FC_STR }
-    if (fty >= 0 && tyIsLitUnion(fty)) || (fty < 0 && nameIsLitUnionType(t)) {
-      return FC_I32
-    }
-    // A lone string literal is its one-member set, the atom (D7220).
-    if nameIsOneStrLit(t) { return FC_I32 }
+  // A registered literal-union alias stores its interned i32 atom (code 0), an inline member
+  // set the string slot. Checked before the union tests, which would claim either as code 16.
+  if nameIsInlineLitUnion(t) { return FC_STR }
+  if (fty >= 0 && tyIsLitUnion(fty)) || (fty < 0 && nameIsLitUnionType(t)) {
+    return FC_I32
   }
-  // The arena where a node came with the spelling, the name where none did: `fieldTypeCode`
-  // passes the field's annotation node, `nameFieldCode` has none and passes -1 (a deliberate
-  // absence, not a lost type). `canonTyIxOf` is read where canon rewrote the node, so a
-  // literal-union field softened to `string` still resolves through its own lowering.
-  let fsTy = -1
-  if litNode >= 0 {
-    fsTy = nodeTyIxOf(litNode)
-    if canonRewroteNode(litNode) { fsTy = canonTyIxOf(litNode) }
-    if tyScalarBaseIs(fsTy, "string") { return FC_STR }
-  } else if nameIsString(t) {
-    return FC_STR
-  }
+  // A lone string literal is its one-member set, the atom (D7220).
+  if nameIsOneStrLit(t) { return FC_I32 }
+  if nameIsString(t) { return FC_STR }
   // A list or a nullable map is asked of the type where one came with the spelling, of the
   // spelling where none did.
-  let recTy = fsTy
-  if litNode < 0 { recTy = fty }
+  const recTy = fty
   if (recTy >= 0 && tyIsArray(recTy)) || (recTy < 0 && nameIsArray(t)) {
     // A list of a tagged set's ids is the i32 list.
     if recTy >= 0 && fnTagListTy(recTy) { return FC_I32_LIST }
@@ -2710,12 +2653,7 @@ function fieldCodeOfSpelling(t: string, litNode: i32, fty: i32) {
   if isValueUnionName(t) { return FC_UNION }
   // Any spelling whose member set keys a registered row, including a self-referential arm's
   // `Node | null`, whose unrolled arm twin `buildVariantTwins` folds onto the rolled one (D4615).
-  // A node's type finds the row by its key; a spelling with no node, by the name.
-  if fsTy >= 0 {
-    if unRowOfKey(fsTy) >= 0 { return FC_UNION }
-  } else if isUNameDeclAB(75, t) {
-    return FC_UNION
-  }
+  if isUNameDeclAB(75, t) { return FC_UNION }
   // A field naming another struct, or a nullable struct, stores a `(ref null $S)`, code 15.
   // Resolved via the declaration scan rather than the incrementally-built struct table, so a
   // forward or mutually-recursive reference ties into the shared rec group.
@@ -2731,21 +2669,7 @@ function fieldCodeOfSpelling(t: string, litNode: i32, fty: i32) {
   // declines. This predicate says the mint will answer, and `collectNestedFieldShapes` is
   // what owes it.
   if armFieldDeferredRowOk(base) { return FC_STRUCT }
-  // D1293 — the arena, once every name arm has declined. `nameIsNulRefList` resolves
-  // through the struct/union tables, and `collectU` runs before `collectS` builds them, so
-  // an `S[] | null` variant-arm field coded -1 while the identical field on a plain struct
-  // coded 28. Last, so no spelling a name arm already answers can move.
-  nulRefListFieldCodeOfNode(litNode)
-}
-
-// The `S[] | null` FIELD code (28) the ARENA decides for a field's annotation node, or -1 —
-// the node-taking face of `nulRefListFieldCodeOfTy`, canon-routed so a rewritten annotation
-// asks about the type it now carries (D1293).
-function nulRefListFieldCodeOfNode(litNode: i32): i32 {
-  if litNode < 0 { return -1 }
-  let ty = nodeTyIxOf(litNode)
-  if canonRewroteNode(litNode) { ty = canonTyIxOf(litNode) }
-  nulRefListFieldCodeOfTy(ty)
+  -1
 }
 
 // The `S[] | null` FIELD code (28) the ARENA decides, or -1. Ref-ELEMENT lists only: that is
@@ -2979,43 +2903,6 @@ function fieldBaseStructRow(tyIx: i32) {
   repRowOfTyStruct(base, sScanLim())
 }
 
-// The per-field wasm-type code for a struct or union-variant field whose type node is
-// `tyIx`. Extends the inline classifier with array-typed fields: a field of array type
-// stores a ref to a list wrapper, so the code records which one. An unsupported field
-// type yields -1 and the caller fails loudly.
-export function fieldTypeCode(tyIx: i32) {
-  if tyIx < 0 { return -1 }
-  // A nullable-function field stores a nullable closure fat-pointer, code 22 — the field
-  // analogue of a kind-19 local. Checked before the bare-function test, in the same order
-  // `vtKindOfType` uses: `((i32) => i32) | null` is a nullable function, while `(i32) =>
-  // i32 | null` is a function returning a nullable, handled elsewhere.
-  if nulCloFlagAnn(tyIx) == 1 { return FC_NUL_CLOSURE }
-  // A function-typed field (`op: (i32) => i32`) stores the closure fat-pointer (code 14),
-  // the field analogue of a function-valued local.
-  if tyIsFuncType(tyIx) { return FC_CLOSURE }
-  const ty = nodeAt(tyIx)
-  if ty is TypeRef {
-    const c = fieldCodeOfSpelling(ty.tyName, tyIx, -1)
-    if c >= 0 { return c }
-    // An inline-shape struct field resolves structurally to its interned struct, the dual of
-    // a nominal `inner: Inner`. Guarded by the annotation's own type, `| null` peeled: the
-    // lookup ignores a trailing `[]`, so a nullable struct-list field would mis-code as a
-    // nullable struct (invalid wasm).
-    const base = nonNulBaseOf(ty.tyName)
-    let fTy = nodeTyIxOf(tyIx)
-    if canonRewroteNode(tyIx) { fTy = canonTyIxOf(tyIx) }
-    const baseIsArr = tyIsArray(nonNullTy(fTy))
-    if !baseIsArr && structRowOfNameOrTy(base, fTy) >= 0 { return FC_STRUCT }
-    // A generic-application field is a struct-ref field over the monomorphized instance,
-    // code 15, keyed by the application name `gaeEnsure` interns the instance under. It
-    // cannot use `structIndexOfTypeName` above: `collectS` codes every declared struct
-    // before `gaeCollectDecls` runs, so at field-code time the instance exists only in the arena.
-    if !baseIsArr && nameIsGenAppDecl(base) { return FC_STRUCT }
-    return -1
-  }
-  -1
-}
-
 // True if `name` is a generic-alias application (`Box<i32>`) whose head names a generic
 // `type` declaration — the application analogue of `nameIsStructDecl`, independent of the
 // registry and the struct table since both are built after `collectS`'s field-coding loop.
@@ -3116,12 +3003,11 @@ function typeDeclNameIxSync() {
 }
 
 // The ref-list element type-name of a field whose type node is `tyIx` — the key into
-// `rlElemName` when `fieldTypeCode(tyIx) == 5` (a struct/union ref list), else "". Strips
+// `rlElemName` when the field's `code` is 5 (a struct/union ref list), else "". Strips
 // the trailing `[]` directly, since `sNames` builds incrementally and a field may
 // reference a later-declared struct. Fills `sFieldElemName`/`armFieldElemName`.
-export function fieldRefElemName(tyIx: i32) {
+export function fieldRefElemName(tyIx: i32, code: i32) {
   if tyIx < 0 { return "" }
-  const code = fieldTypeCode(tyIx)
   const ty = nodeAt(tyIx)
   if ty is TypeRef {
     // A nested-struct field (code 15) records its target struct name, resolved to a struct
@@ -4399,7 +4285,7 @@ export function anonCodeIsSelfContained(c: i32) {
 
 export function nameFieldCode(t: string, fty: i32) {
   // A nullable function field is the nullable closure fat-pointer, code 22 — the
-  // `fieldTypeCode` `nulCloFlag` arm, asked of the caller's type. No caller without a type
+  // declared field's `nulCloFlag` arm, asked of the caller's type. No caller without a type
   // passes a nullable function spelling.
   if tyIsNulClosure(fty) { return FC_NUL_CLOSURE }
   // A tagged set's field holds its i32 id.
@@ -4412,7 +4298,7 @@ export function nameFieldCode(t: string, fty: i32) {
     return FC_CLOSURE
   }
   // -1: there is no node; `fty`, where the caller has one, decides ahead of the spelling.
-  fieldCodeOfSpelling(t, -1, fty)
+  fieldCodeOfSpelling(t, fty)
 }
 
 const armDeferStack: string[] = []
