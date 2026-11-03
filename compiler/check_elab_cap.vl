@@ -42,6 +42,7 @@ import {
 import { declTyOf } from "./check_nar_store"
 import {
   ArrayLit,
+  BinExpr,
   Call,
   FieldInit,
   FuncDecl,
@@ -2223,6 +2224,95 @@ export function fnTagOwnTyParamShared(
   true
 }
 
+// Per binding whose initialiser is a read: the declaration read (-1 for none), and flags.
+let pcSrc: {[i32]: i32} = Map()
+let pcFlags: {[i32]: i32} = Map()
+let pcAnn: {[i32]: string} = Map()
+let pcBuilt = false
+const PC_CONST = 1
+const PC_ASSIGNED = 2
+const PC_ANN_OTHER = 4
+
+// Empties the copy record; the next read or the pass end rebuilds it from the tree.
+export function paramCopyReset() {
+  pcSrc = Map()
+  pcFlags = Map()
+  pcAnn = Map()
+  pcBuilt = false
+  0
+}
+
+// Records, for each `let`/`const` initialised by a name read, what it reads, whether it is a
+// `const`, what bare type name annotates it, and whether any `=` assigns it.
+export function paramCopyBuild() {
+  pcSrc = Map()
+  pcFlags = Map()
+  pcAnn = Map()
+  const assigned: {[i32]: boolean} = Map()
+  let i = 0
+  while i < P.nodes.length {
+    pcAssignNote(i, assigned)
+    i = i + 1
+  }
+  i = 0
+  while i < P.nodes.length {
+    pcLetNote(i, assigned)
+    i = i + 1
+  }
+  pcBuilt = true
+  0
+}
+
+// Marks the binding an `=` at node `i` assigns; any other node assigns none.
+function pcAssignNote(i: i32, assigned: {[i32]: boolean}): i32 {
+  const n = nodeAt(i)
+  if n is BinExpr && n.binOp == "=" {
+    const l = parenPeelIx(n.binLeft)
+    if l >= 0 && nodeAt(l) is Ident {
+      const ld = identDeclOf(l)
+      if ld >= 0 { assigned[ld] = true }
+    }
+    return 0
+  }
+  pcNotRecorded(i)
+}
+
+// Records the binding at node `i` when a name read initialises it; any other node is not one.
+function pcLetNote(i: i32, assigned: {[i32]: boolean}): i32 {
+  const n = nodeAt(i)
+  if n is LetDecl && n.letInit >= 0 {
+    const v = parenPeelIx(n.letInit)
+    if v < 0 || !(nodeAt(v) is Ident) { return 0 }
+    pcSrc[i] = identDeclOf(v)
+    let fl = if n.letKw == "const" { PC_CONST } else { 0 }
+    if assigned[i] ?? false { fl = fl | PC_ASSIGNED }
+    if n.letType >= 0 {
+      const tn = nodeAt(n.letType)
+      if tn is TypeRef { pcAnn[i] = tn.tyName } else { fl = fl | PC_ANN_OTHER }
+    }
+    pcFlags[i] = fl
+    return 0
+  }
+  pcNotRecorded(i)
+}
+
+// A node the copy record has no row for.
+function pcNotRecorded(_i: i32): i32 { 0 }
+
+// Whether binding `d` is in the copy record, building it on a first read.
+function pcHas(d: i32): boolean {
+  if !pcBuilt { paramCopyBuild() }
+  pcSrc.has(d)
+}
+
+// Whether recorded binding `d` is annotated, by a bare type parameter of `f` when `own`.
+function pcAnnOk(d: i32, f: FuncDecl, unannOk: boolean): boolean {
+  if ((pcFlags[d] ?? 0) & PC_ANN_OTHER) != 0 { return false }
+  const a = pcAnn[d] ?? ""
+  if a == "" { return unannOk }
+  strListHas(f.fnTyParams, a)
+}
+
 // The parameter of `f` that binding `d` copies: a `const`, un-annotated or annotated with a bare
 // type parameter of `f`, seeded by a read of the parameter, directly or through such copies; -1
 // for any other binding. A copy holds the parameter's own value.
@@ -2231,16 +2321,42 @@ export function fnTagParamCopyOf(f: FuncDecl, d: i32): i32 {
   let hops = 0
   while hops < 8 && x >= 0 && x < P.nodes.length {
     hops = hops + 1
-    const n = nodeAt(x)
-    if !(n is LetDecl) || n.letKw != "const" || n.letInit < 0 { return -1 }
-    if n.letType >= 0 {
-      const tn = nodeAt(n.letType)
-      if !(tn is TypeRef) || !strListHas(f.fnTyParams, tn.tyName) { return -1 }
+    if (
+      !pcHas(x)
+      || ((pcFlags[x] ?? 0) & PC_CONST) == 0
+      || !pcAnnOk(x, f, true)
+    ) {
+      return -1
     }
-    const v = parenPeelIx(n.letInit)
-    if v < 0 || !(nodeAt(v) is Ident) { return -1 }
-    const src = identDeclOf(v)
+    const src = pcSrc[x] ?? -1
     if i32ListHas(f.fnParams, src) { return src }
+    x = src
+  }
+  -1
+}
+
+// The parameter of `fn` that binding `d` copies: `d` is annotated with a bare type parameter of
+// `fn`, nothing assigns it, and it is seeded by a read of a parameter annotated so, directly or
+// through such copies. A copy holds the parameter's value, so it takes the parameter's pin; -1
+// for any other binding.
+export function paramCopySeedOf(fn: FuncDecl, d: i32): i32 {
+  let x = d
+  let hops = 0
+  while hops < 8 {
+    hops = hops + 1
+    if x < 0 || x >= P.nodes.length || !pcHas(x) || !pcAnnOk(x, fn, false) {
+      return -1
+    }
+    if ((pcFlags[x] ?? 0) & PC_ASSIGNED) != 0 { return -1 }
+    const src = pcSrc[x] ?? -1
+    if src >= 0 && src < P.nodes.length && i32ListHas(fn.fnParams, src) {
+      const pn = nodeAt(src)
+      if pn is Param && pn.parType >= 0 {
+        const tn = nodeAt(pn.parType)
+        if tn is TypeRef && strListHas(fn.fnTyParams, tn.tyName) { return src }
+      }
+      return -1
+    }
     x = src
   }
   -1
