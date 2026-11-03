@@ -201,7 +201,53 @@ function ftMembersWithin(s: i32, o: i32): boolean {
   true
 }
 
+// The lambda literals whose one position is a list element, written by a list's `push` or an
+// index store. An id there is called only through the list's arms.
+let ftElemLams: {[i32]: boolean} = Map()
+
+// Fills `ftElemLams` by one walk from `rootIx`, the shape `ftScan` walks the program in.
+function ftElemLamsNote(rootIx: i32) {
+  ftElemLams = Map()
+  const todo: i32[] = [rootIx]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Call {
+        const fn = nodeAt(parenPeelIx(n.callFn))
+        if fn is Member && fn.memProp == "push" {
+          const ht = nodeTyIxOf(fn.memObj)
+          if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
+            for a in n.callArgs { ftElemLamMark(a) }
+          }
+        }
+      } else if n is BinExpr && ftIsStore(n) {
+        const l = parenPeelIx(n.binLeft)
+        const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { nodeAt(n.binLeft) }
+        if ln is Index {
+          const ht = nodeTyIxOf(ln.idxArr)
+          if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
+            ftElemLamMark(n.binRight)
+          }
+        }
+      }
+      nodeChildrenPush(x, todo)
+    }
+  }
+  0
+}
+
+// Marks `v` in `ftElemLams` when it is a lambda literal.
+function ftElemLamMark(v: i32) {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= P.nodes.length { return 0 }
+  const f = nodeAt(x)
+  if f is FuncDecl && f.fnName == "" { ftElemLams[x] = true }
+  0
+}
+
 export function fnTagDecide(rootIx: i32) {
+  ftElemLamsNote(rootIx)
   ftParamOwners = Map()
   ftParamOwnersBuilt = false
   ftDirectLen = 0
@@ -1450,7 +1496,8 @@ function ftFnOk(fn: i32): boolean {
 
 // Whether lambda `x` can stand as an id: it reads only its own bindings and the module's, so a
 // call by its declaration needs no environment, and calls none of its parameters, whose instance
-// is chosen by the function a caller hands it rather than by the one arm an id calls.
+// is chosen by the function a caller hands it rather than by the one arm an id calls, unless it
+// is a list element (`ftElemLams`), whose every call is an arm's.
 function ftLambdaIdOk(x: i32): boolean {
   const f = nodeAt(x)
   if !(f is FuncDecl) { return false }
@@ -1474,6 +1521,7 @@ function ftLambdaIdOk(x: i32): boolean {
     if (
       yn is Call
       && i32ListHas(f.fnParams, identDeclOf(parenPeelIx(yn.callFn)))
+      && !(ftElemLams[x] ?? false)
     ) {
       return false
     }
