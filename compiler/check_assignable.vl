@@ -56,6 +56,7 @@ import {
   mkCall,
   mkFieldInit,
   mkIdent,
+  mkMember,
   mkNull,
   mkNum,
   mkObjLit,
@@ -153,6 +154,7 @@ import {
   fnTagEtaAt,
   fnTagEtaInner,
   fnTagHoleLambdaOfTy,
+  fnTagSetOfTy,
   fnTagSetValueOfTy,
   stampsHeld,
   stampsHeldSet,
@@ -473,6 +475,7 @@ import {
   tysHaveTyVarIn,
   unionMemberCountOf,
 } from "./tyquery"
+import { fvaListCopyAt, fvaListCopyNote } from "./check_fn_tag_facts"
 
 // Record call `ix` through the marked binding `decl`, which re-asked the constraints `used` owns,
 // with what it bound; `fsbRecheckCalls` re-asks those of every other function written to it.
@@ -3257,6 +3260,63 @@ export function fvaAdaptListLit(ix: i32, listTy: i32): boolean {
   for el in lit.arrElems {
     if spreadArgOf(el) < 0 { fvaAdapt(el, nodeTyIxOf(el), la.aElem) }
   }
+  true
+}
+
+// A list `site` of type `srcTy` whose elements are a function set, copied into slots of the closed
+// function type `de`: `site` becomes `site.map(($e): de => $e)`, whose return delivers each
+// element through its adapter, at the source's own position. False when it is no such copy.
+export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
+  if site < 0 || srcTy < 0 || de < 0 || inferQuiet || monoRecheckDepth > 0 {
+    return false
+  }
+  if fvaListCopyAt(site) { return false }
+  if (
+    nodeAt(parenPeelIx(site)) is ArrayLit
+    || !(tyAt(de) is TyFunc)
+    || tyHasHole(de)
+  ) {
+    return false
+  }
+  const sa = tyAt(nonNullTy(srcTy))
+  if !(sa is TyArray) || sa.aElem == de { return false }
+  // A set's elements, or a hole parameter's, which an instance binds to one.
+  const held = fnTagSetValueOfTy(sa.aElem)
+    || fnTagSetOfTy(sa.aElem) >= 0
+    || tyHasHole(sa.aElem) && tyMayHoldFn(sa.aElem, 0)
+    || tyIsHole(sa.aElem)
+  if !held { return false }
+  const pos = nodePos(site)
+  // `$e` is left to `.map`, which types it at the receiver's element.
+  const rt = fvaAnnot(de, site, pos)
+  if rt < 0 { return false }
+  const pd = luAt(mkParam("$e" + i32ToStr(site), -1, -1, 0, 0, pos), site)
+  const ps: i32[] = []
+  ps.push(pd)
+  const lam = luAt(
+    addNode(fvaLambda(ps, rt, luRef(pd, site, pos), site, pos)),
+    site,
+  )
+  const siteNode = nodeAt(site)
+  const moved = addNode(siteNode)
+  if siteNode is Ident { identFrom(moved, site) }
+  adoptNodeTok(moved, site)
+  const mem = luAt(mkMember(moved, "map", pos), site)
+  adoptNodeTok(mem, site)
+  const cargs: i32[] = []
+  cargs.push(lam)
+  const names: string[] = []
+  const c: Node = {
+    callFn: mem,
+    callArgs: cargs,
+    callArgNames: names,
+    pos: pos,
+  }
+  arenaSetNode(site, c)
+  fvaListCopyNote(site)
+  fvaListCopyNote(mem)
+  luGrow()
+  checkNodeHook(site)
   true
 }
 
