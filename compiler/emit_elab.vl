@@ -2671,6 +2671,7 @@ export function elabMintFacts(): i32 {
   elabMintCalls = Map()
   elabBundleSigs = Map()
   elabBundleJoinRoot = Map()
+  elabHandMembers = Map()
   elabLamSigs = Map()
   elabLamSigInst = Map()
   elabMintSets = Map()
@@ -4167,6 +4168,8 @@ function elabChainStep(x: i32): i32 {
 // cycle of hands settles.
 function elabBundleForwardsJoin() {
   const up: Map<i32, i32> = Map()
+  // Each hand as five entries: the call, its instance, the argument, and both parameter keys.
+  const hands: i32[] = []
   let k = 0
   while k < ekDecl.length {
     const dn = nodeAt(ekDecl[k])
@@ -4184,6 +4187,11 @@ function elabBundleForwardsJoin() {
               const pi = if a >= 0 && nodeAt(a) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(a)) } else { -1 }
               if pi >= 0 {
                 elabBundleUnite(up, elabBundleKey(k, pi), elabBundleKey(kc, i))
+                hands.push(x)
+                hands.push(k)
+                hands.push(i)
+                hands.push(elabBundleKey(k, pi))
+                hands.push(elabBundleKey(kc, i))
               }
               i = i + 1
             }
@@ -4227,7 +4235,50 @@ function elabBundleForwardsJoin() {
       elabBundleJoinRoot[key] = if setKeys[at] >= 0 { setKeys[at] } else { r }
     }
   }
+  elabHandMembersNote(hands)
   0
+}
+
+// For each hand of a record to a parameter bound to one closed function type, the record member
+// whose signature that type is, or -1 where none is.
+function elabHandMembersNote(hands: i32[]) {
+  let h = 0
+  while h + 4 < hands.length {
+    const rec = elabBundleSigs.get(hands[h + 3]) ?? []
+    const t = elabBundleKeyClosedFn(hands[h + 4])
+    if rec.length >= 2 && t >= 0 {
+      let m = -1
+      let j = 0
+      while j < rec.length {
+        if m < 0 && tySame(rec[j], t) { m = j }
+        j = j + 1
+      }
+      const row = elabHandMembers.get(hands[h]) ?? []
+      row.push(hands[h + 1])
+      row.push(hands[h + 2])
+      row.push(m)
+      elabHandMembers[hands[h]] = row
+    }
+    h = h + 5
+  }
+  0
+}
+
+// Per call, triples of the instance, the argument and the member `elabHandMembersNote` chose.
+let elabHandMembers: {[i32]: i32[]} = Map()
+
+// The record member call `ix`'s argument `i`, under the instance being walked, hands to a
+// parameter bound to one closure: its index, -1 where the record holds no member at that
+// parameter's type, -2 where the argument is no such hand.
+export function elabCallHandMember(ix: i32, i: i32): i32 {
+  const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const row = elabHandMembers.get(ix) ?? []
+  let j = 0
+  while j + 2 < row.length {
+    if row[j] == from && row[j + 1] == i { return row[j + 2] }
+    j = j + 3
+  }
+  -2
 }
 
 // Each parameter key `elabBundleForwardsJoin` gave a joined list, and the chain member whose set
@@ -4249,17 +4300,22 @@ function elabBundleKeySet(key: i32): i32 {
 function elabBundleOwnSigs(key: i32): i32[] {
   const own = elabBundleSigs.get(key) ?? []
   if own.length > 0 { return own }
+  const t = elabBundleKeyClosedFn(key)
+  if t < 0 { own } else { [t] }
+}
+
+// The closed function type instance `key / 64` binds its parameter `key % 64` to, or -1.
+function elabBundleKeyClosedFn(key: i32): i32 {
   const k = key / 64
   const i = key % 64
-  if k < 0 || k >= ekDecl.length { return own }
+  if k < 0 || k >= ekDecl.length { return -1 }
   const dn = nodeAt(ekDecl[k])
-  if !(dn is FuncDecl) || i >= dn.fnParams.length { return own }
+  if !(dn is FuncDecl) || i >= dn.fnParams.length { return -1 }
   const t = substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k])
   if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || tyHasTyVar(t) {
-    return own
+    return -1
   }
-  if !elabTyClosed(t, 0) { return own }
-  [t]
+  if elabTyClosed(t, 0) { t } else { -1 }
 }
 
 // The root of `key` in the union `up`; a key never united is its own.
