@@ -76,6 +76,7 @@ import {
   cwBindingWrittenValues,
   cwFnValueDeclOf,
   cwFrameOfDecl,
+  cwIxParent,
   cwIxWant,
   cwLetWrittenInClosure,
   cwPeelValue,
@@ -4372,6 +4373,10 @@ let elabResStmt: {[i32]: boolean} = Map()
 let elabResArgOf: {[i32]: i32} = Map()
 // Per binding, the (call, argument index) pairs that hand its read on whole.
 let elabResHands: {[i32]: i32[]} = Map()
+// Per `let` holder, the calls it is written from (its initialiser first), and whether any write
+// is not a plain assignment of a call.
+let elabResWrites: {[i32]: i32[]} = Map()
+let elabResBadWrite: {[i32]: boolean} = Map()
 // Per call, the member of the record its callee returns that the call's value is used as (-1
 // for a value dropped); per holder binding, that member's function type.
 let elabResMembers: {[i32]: i32[]} = Map()
@@ -4386,6 +4391,8 @@ function elabResultScanReset() {
   elabResStmt = Map()
   elabResArgOf = Map()
   elabResHands = Map()
+  elabResWrites = Map()
+  elabResBadWrite = Map()
   elabArgRecs = Map()
   elabResMembers = Map()
   elabResHolderTys = Map()
@@ -4403,15 +4410,47 @@ function elabResultScanAt(g: i32) {
   elabResScanIdent(g)
   elabResScanCall(g)
   elabResScanBlock(g)
+  elabResScanAssign(g)
   0
 }
 
-// A `const` binding initialised by a call holds that call's value.
+// A binding initialised by a call holds that call's value.
 function elabResScanLet(g: i32) {
+  if elabResMayHold(g) {
+    const n = nodeAt(g)
+    if n is LetDecl {
+      const v = parenPeelIx(n.letInit)
+      elabResHolder[v] = g
+      const ws = elabResWrites.get(g) ?? []
+      ws.push(v)
+      elabResWrites[g] = ws
+    }
+  }
+  0
+}
+
+// An assignment to a `let` holder writes it; only a plain assignment of a call is a producer.
+function elabResScanAssign(g: i32) {
   const n = nodeAt(g)
-  if n is LetDecl && n.letKw == "const" && n.letInit >= 0 {
-    const v = parenPeelIx(n.letInit)
-    if v >= 0 && nodeAt(v) is Call { elabResHolder[v] = g }
+  if n is BinExpr && (n.binOp == "=" || n.binCompound != "") {
+    const l = parenPeelIx(n.binLeft)
+    const d = if l >= 0 && nodeAt(l) is Ident { identDeclOf(l) } else { -1 }
+    if elabResMayHold(d) {
+      const v = parenPeelIx(n.binRight)
+      if (
+        n.binOp == "="
+        && n.binCompound == ""
+        && v >= 0
+        && elabResMayReturnRecord(v)
+      ) {
+        elabResHolder[v] = d
+        const ws = elabResWrites.get(d) ?? []
+        ws.push(v)
+        elabResWrites[d] = ws
+      } else {
+        elabResBadWrite[d] = true
+      }
+    }
   }
   0
 }
@@ -4426,14 +4465,28 @@ function elabResScanIdent(g: i32) {
   0
 }
 
-// Whether declaration `d` can hold a call's value: a `const` initialised by a call. The scan
-// banks reads of such a binding alone, as nothing else can be a holder.
+// Whether declaration `d` can hold a call's value: a `const` or `let` initialised by a call that
+// can return a record. The scan banks reads of such a binding alone, as nothing else can be a
+// holder.
 function elabResMayHold(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
   const n = nodeAt(d)
-  if !(n is LetDecl) || n.letKw != "const" || n.letInit < 0 { return false }
+  if !(n is LetDecl) || n.letInit < 0 { return false }
   const v = parenPeelIx(n.letInit)
-  v >= 0 && nodeAt(v) is Call
+  v >= 0 && elabResMayReturnRecord(v)
+}
+
+// Whether call `v` can return a record: its callee names a function with no return annotation,
+// as only such an instance returns one.
+function elabResMayReturnRecord(v: i32): boolean {
+  const c = nodeAt(v)
+  if !(c is Call) { return false }
+  const cf = parenPeelIx(c.callFn)
+  if cf < 0 || !(nodeAt(cf) is Ident) { return false }
+  const fd = identDeclOf(cf)
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const fn = nodeAt(fd)
+  fn is FuncDecl && fn.fnRet < 0
 }
 
 // A call through a binding, and a call that is another call's callee.
@@ -4519,7 +4572,10 @@ function elabResultMemberNote(c: i32, from: i32, kc: i32) {
   const h = elabResHolder.get(c) ?? -1
   if h >= 0 {
     const through = elabResThrough.get(h) ?? []
-    if through.length > 0 && through.length == (elabResReads.get(h) ?? 0) {
+    const reads = through.length + elabResWriteReads(h)
+    if !elabHolderWritesAgree(h, from, rec) {
+      m = -2
+    } else if through.length > 0 && reads == (elabResReads.get(h) ?? 0) {
       m = elabCallSigMember(through[0], rec)
       for t in through {
         if elabCallSigMember(t, rec) != m { m = -2 }
@@ -4543,7 +4599,11 @@ function elabHolderRecordNote(c: i32, from: i32, kc: i32) {
   if rec.length < 2 { return 0 }
   const through = elabResThrough.get(h) ?? []
   const hands = elabResHands.get(h) ?? []
-  if through.length + hands.length / 2 != (elabResReads.get(h) ?? 0) {
+  const reads = through.length + hands.length / 2 + elabResWriteReads(h)
+  if (
+    reads != (elabResReads.get(h) ?? 0)
+    || !elabHolderWritesAgree(h, from, rec)
+  ) {
     return 0
   }
   const ms: i32[] = []
@@ -4588,6 +4648,53 @@ function elabHolderRecordNote(c: i32, from: i32, kc: i32) {
     j = j + 2
   }
   0
+}
+
+// The reads of holder `h` that are the targets of its assignments.
+function elabResWriteReads(h: i32): i32 {
+  const n = (elabResWrites.get(h) ?? []).length
+  if n > 1 { n - 1 } else { 0 }
+}
+
+// Whether every write of holder `h` from instance `from` is a call returning record `rec`, in
+// its order, inside the function that declares `h`. A `const` has its initialiser alone.
+function elabHolderWritesAgree(h: i32, from: i32, rec: i32[]): boolean {
+  const ws = elabResWrites.get(h) ?? []
+  if ws.length < 2 { return true }
+  if elabResBadWrite.get(h) ?? false { return false }
+  const fd = elabEnclosingFn(h)
+  for w in ws {
+    if elabEnclosingFn(w) != fd { return false }
+    const kw = elabCallInstFrom(w, from)
+    if kw < 0 || !elabTyListSame(elabReturnedBundleSigs(kw), rec) {
+      return false
+    }
+  }
+  for t in elabResThrough.get(h) ?? [] {
+    if elabEnclosingFn(t) != fd { return false }
+  }
+  const hands = elabResHands.get(h) ?? []
+  let j = 0
+  while j < hands.length {
+    if elabEnclosingFn(hands[j]) != fd { return false }
+    j = j + 2
+  }
+  true
+}
+
+// The function declaration whose body holds node `x`; -1 at the top level, -2 where the parent
+// table does not reach `x`.
+function elabEnclosingFn(x: i32): i32 {
+  if x < 0 || x >= cwIxParent.length { return -2 }
+  let cur = cwIxParent[x]
+  let guard = 0
+  while cur >= 0 && guard < 4096 {
+    if cur >= P.nodes.length || cur >= cwIxParent.length { return -2 }
+    if nodeAt(cur) is FuncDecl { return cur }
+    cur = cwIxParent[cur]
+    guard = guard + 1
+  }
+  if guard >= 4096 { -2 } else { -1 }
 }
 
 // The member of record `rec` call `x` from instance `from` hands at argument `i` to a parameter
