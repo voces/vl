@@ -142,7 +142,6 @@ import {
   rowCanonIdOfName,
   sFieldElemNameAt,
   sFieldRowTyAt,
-  sFieldTgtStructIdx,
   sFieldTypeAt,
   sIsAnonRow,
   sScanLim,
@@ -264,6 +263,7 @@ import {
   repVariantShapeRowOf,
   rlElemKindAt,
   sFieldElemTyIxAt,
+  slotRowTyOf,
   tyDenotesFunc,
   tyMapKeyKind,
   unRowOfKey,
@@ -383,11 +383,9 @@ import {
   variantFieldIndex,
   variantSig,
   variantTagKey,
-  vshtPairSi,
-  vshtPairVi,
-  vshtPop,
 } from "./emit_variant_sig"
 import { i32ListHas, strListHas } from "./listutil"
+import { recordRowClassOf } from "./record_rows"
 import {
   memoKeyClear,
   memoKeyNew,
@@ -4719,72 +4717,27 @@ export function repSigNulVariantTok(vi: i32): string {
   repSigSlotTokOfKind("nulvariant", repVariantSlotRep(vi))
 }
 
+// The struct row union arm `vi` shares its heap type with, or -1: the declared row of its record
+// type, else an anonymous literal row, when the two have one record-row class (D15152). An arm or
+// row with no record type has no twin. Asked from the checked types alone, so it answers before
+// the map slots are interned (D15098).
 export function variantStructHeapTwinAt(vi: i32): i32 {
   if vi < 0 { return -1 }
   if vi >= uVarTyIx.length { return -1 }
   if vi >= uFieldCount.length { return -1 }
   let si = repSlotOfTy(uVarTyIx[vi])
   // The anonymous claimant (D282): `repSlotOfTy` answers only for a declared row, so an arm
-  // whose only layout-mate is an interned `#anonN` literal row read -1 and minted a second
-  // heap type for a checker type that already had one. `repRowOfTyStruct` is the same double
-  // gate over a whole-table scan, confirm-only and second, so a declared answer stays untouched.
+  // whose only layout-mate is an interned `#anonN` literal row is found by the whole-table
+  // scan, confirm-only and second, so a declared answer stays untouched.
   if si < 0 { si = repRowOfTyStruct(uVarTyIx[vi], sScanLim()) }
   if si < 0 { return -1 }
   if si >= sFieldCount.length { return -1 }
   if uFieldCount[vi] != sFieldCount[si] { return -1 }
-  // D627 — the coinductive pair stack, not a re-entrancy guard: the map-value comparison
-  // below can re-enter this function, unbounded on a mutually recursive map-valued shape.
-  // Assuming a revisited pair is merged is sound because the answer wanted is the greatest
-  // fixpoint of equirecursive type equality — any finite disagreement still unwinds to -1.
-  let vsi = 0
-  while vsi < vshtPairVi.length {
-    if vshtPairVi[vsi] == vi && vshtPairSi[vsi] == si { return si }
-    vsi = vsi + 1
-  }
-  vshtPairVi.push(vi)
-  vshtPairSi.push(si)
-  let fi = 0
-  while fi < uFieldCount[vi] {
-    const cv = armFieldTypes()[uFieldStart[vi] + fi]
-    if cv != sFieldTypes[sFieldStart[si] + fi] { return vshtPop(0 - 1) }
-    // The referenced-layer descent both sibling comparators already had (D1579): a field
-    // whose storage is a ref (15 a nested struct, 5 a ref list, 28 its niche) declined
-    // outright here before, so an arm carrying one shared a heap with no struct row. The two
-    // sides record the same field under different spellings, so the question must ask the referenced rows, not the names.
-    if cv == FC_STRUCT {
-      if (
-        repStructSlotsTwin(
-          uFieldTgtStructIdx(vi, fi),
-          sFieldTgtStructIdx(si, fi),
-        )
-        == 0
-      ) {
-        return vshtPop(0 - 1)
-      }
-    }
-    if cv == FC_REF_LIST || cv == FC_NUL_REF_LIST {
-      if (
-        rlSlotsLayoutTwin(variantFieldRefSlot(vi, fi), sFieldRefSlot(si, fi))
-        == 0
-      ) {
-        return vshtPop(0 - 1)
-      }
-    }
-    if cv == FC_MAP || cv == FC_NUL_MAP {
-      const um = uFieldMapShape(vi, fi)
-      if um == -3 { return vshtPop(0 - 1) }
-      const sm = sFieldMapShape(si, fi)
-      // The widening D624 permits: two mv slots whose value types are layout twins emit
-      // byte-identical map structs, so slot-index equality alone would decline a merge the
-      // reps already agree on. `mvCanonRepOf` catches it, costing nothing on the corpus and
-      // is what makes D627's witness print its value.
-      if um != sm {
-        if mvCanonRepOf(um) != mvCanonRepOf(sm) { return vshtPop(0 - 1) }
-      }
-    }
-    fi = fi + 1
-  }
-  vshtPop(si)
+  const ac = recordRowClassOf(uVarTyIx[vi])
+  const rt = slotRowTyOf(si)
+  if ac == "" || rt < 0 { return -1 }
+  if recordRowClassOf(rt) != ac { return -1 }
+  si
 }
 
 // Are variants `a` and `b` — same field-name set, sharing a tag — legal under D1023's ruling:

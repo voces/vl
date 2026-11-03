@@ -93,28 +93,34 @@ Deno.test({
 
 Deno.test({
   name:
-    "row classes: a declared record and an arm holding a map each get a row",
+    "row classes: a declared record and an arm holding a map each get a row, in both orders",
   ignore: !assertSeed(),
   fn: () => {
-    // D15098's witness in the order that runs: the record declared after the holder.
-    const d = dump(
-      "type Q = { o: A }\ntype R = { r: i32 }\ntype A = { n: i32, g: Map<string, R> }\n" +
-        "type P = { m: i32 }\ntype U = A | P\nconst g: Map<string, R> = Map()\n" +
-        'g.set("x", { r: 7 })\nconst q: Q = { o: { n: 1, g: g } }\nprint(q.o.g.get("x")?.r ?? 0)\n',
-    );
-    if (d.rc !== 0) throw new Error(`want rc 0, got ${d.rc}`);
-    const a = arm(d, "A");
-    if (a.codes !== "19,0") {
-      throw new Error(`want A's codes 19,0 (map, i32), got ${a.codes}`);
-    }
-    if (a.twin < 0 || !d.rows[a.twin]) {
-      throw new Error(`want A on a row, got twin=${a.twin}`);
-    }
-    for (const nm of ["Q", "R"]) {
-      if (!d.rows.some((r) => r?.startsWith(`${nm} decl=1 `))) {
-        throw new Error(
-          `want a declared row ${nm}, got ${JSON.stringify(d.rows)}`,
-        );
+    // D15098's witness with the record declared after the holder, then before it.
+    const tail = "type A = { n: i32, g: Map<string, R> }\n" +
+      "type P = { m: i32 }\ntype U = A | P\nconst g: Map<string, R> = Map()\n" +
+      'g.set("x", { r: 7 })\nconst q: Q = { o: { n: 1, g: g } }\nprint(q.o.g.get("x")?.r ?? 0)\n';
+    for (
+      const head of [
+        "type Q = { o: A }\ntype R = { r: i32 }\n",
+        "type R = { r: i32 }\ntype Q = { o: A }\n",
+      ]
+    ) {
+      const d = dump(head + tail);
+      if (d.rc !== 0) throw new Error(`want rc 0, got ${d.rc} for ${head}`);
+      const a = arm(d, "A");
+      if (a.codes !== "19,0") {
+        throw new Error(`want A's codes 19,0 (map, i32), got ${a.codes}`);
+      }
+      if (a.twin < 0 || !d.rows[a.twin]) {
+        throw new Error(`want A on a row, got twin=${a.twin}`);
+      }
+      for (const nm of ["Q", "R"]) {
+        if (!d.rows.some((r) => r?.startsWith(`${nm} decl=1 `))) {
+          throw new Error(
+            `want a declared row ${nm}, got ${JSON.stringify(d.rows)}`,
+          );
+        }
       }
     }
   },
