@@ -332,13 +332,12 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // A live emit-side refusal (`scripts/capability-probes/self-recursive-union-arm-field.vl`):
-      // `vl check` accepts it and the emitter refuses the arm's self-typed field.
+      // A live emit-side refusal (`scripts/capability-probes/struct-holding-self-recursive-union-arm.vl`):
+      // `vl check` accepts it and the emitter refuses the struct field typed as a recursive arm.
       await Deno.writeTextFile(
         file,
-        "type A = { f: A | null, n: i32 }\ntype B = { m: i32 }\ntype U = A | B\n" +
-          "function pick(u: U): i32 {\n  if u is B { return u.m }\n  return 0\n}\n" +
-          "const b: B = { m: 3 }\nprint(pick(b))\n",
+        "type Q = { o: O | null }\ntype O = { n: i32, next: O | null }\ntype P = { m: i32 }\n" +
+          "type U = O | P\nconst q: Q = { o: { n: 1, next: null } }\nif q.o != null { print(q.o.n) }\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
