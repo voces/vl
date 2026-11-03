@@ -178,3 +178,60 @@ Deno.test({
     }
   },
 });
+
+// D15107's class-A soundness controls: each keeps two record representations apart that differ in
+// SHAPE (a nullable field against a plain one), so the row class must keep them apart too, unlike
+// the C/D pair above, which differs only by name.
+const CASES = new URL("./cases/soundness/", import.meta.url);
+const APART: [string, string, string][] = [
+  ["identity-fresh-call-keeps-declared-instance-apart.vl", "Col", "J"],
+  ["record-literal-through-hole-identity-into-wider-record.vl", "A", "II"],
+  ["record-literal-through-identity-ignores-unused-record.vl", "Col", "J"],
+  ["returned-binding-built-wider-handed-to-hole-param-runs.vl", "II", "J"],
+];
+
+for (const [file, x, y] of APART) {
+  Deno.test({
+    name: `row classes: ${file} keeps ${x} and ${y} on two rows`,
+    ignore: !assertSeed(),
+    fn: () => {
+      const d = dump(Deno.readTextFileSync(new URL(file, CASES)));
+      if (d.rc !== 0) throw new Error(`want rc 0, got ${d.rc}`);
+      const rx = rowOf(d, x);
+      const ry = rowOf(d, y);
+      if (rx < 0 || ry < 0 || rx === ry) {
+        throw new Error(
+          `want ${x} and ${y} on two rows, got ${x}=${rx}, ${y}=${ry}`,
+        );
+      }
+    },
+  });
+}
+
+Deno.test({
+  name:
+    "row classes: generic-identity-literal-into-union-beside-own-row keeps the literal off J's row",
+  ignore: !assertSeed(),
+  fn: () => {
+    // The one control whose second record is an anonymous literal (`{r: i32}`) beside the arm
+    // `J = {r: i32 | null}`: J's row stores the field boxed, and some other row stores it bare.
+    const d = dump(
+      Deno.readTextFileSync(
+        new URL("generic-identity-literal-into-union-beside-own-row.vl", CASES),
+      ),
+    );
+    if (d.rc !== 0) throw new Error(`want rc 0, got ${d.rc}`);
+    const j = rowOf(d, "J");
+    if (j < 0 || !d.rows[j]?.endsWith("codes=16")) {
+      throw new Error(
+        `want J on a row storing r boxed (16), got ${j}: ${d.rows[j]}`,
+      );
+    }
+    const bare = d.rows.findIndex((r, i) => i !== j && r?.endsWith(" codes=0"));
+    if (bare < 0) {
+      throw new Error(
+        `want a second row storing r bare (0), got ${JSON.stringify(d.rows)}`,
+      );
+    }
+  },
+});
