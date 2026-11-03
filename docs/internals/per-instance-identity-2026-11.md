@@ -122,7 +122,8 @@ Each slice is graded on every hard control above, with the split plan on and off
 3. **L-nested.** nested-per-encloser slice 2's producer and facts, with M2's
    `monoNestedLoopCopy`. D14842 must print `3 4 2 3.75` with the plan off. This is the slice's
    first check, before anything else is graded. D15068 joins the hard controls. Report seed size
-   and plumb-shape fuel deltas.
+   and plumb-shape fuel deltas. Built: D14842's Repro and the three spellings in
+   `closures/nested-fn-forwarding-captured-hole-param-per-encloser-instance.vl` run with the plan off.
 4. **Two levels of nesting**, the last census L-nested shape, and **per-instance members (M3)**, with the per-frame lane's rows as witnesses, and G1's D15062 item 2
    graded against M4's reader from slice 2.
 
