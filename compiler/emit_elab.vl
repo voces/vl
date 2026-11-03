@@ -1637,8 +1637,19 @@ function elabNestedPerEncl() {
 // The nested declarations `elabNestedPerEncl`'s third branch built per encloser instance.
 let elabPerEnclDecls: {[i32]: boolean} = Map()
 
-// Whether nested declaration `d`'s body reads an un-annotated parameter of its encloser `e`.
+// Whether nested declaration `d`'s body reads an un-annotated parameter of its encloser `e`, or of
+// an encloser of `e` whose instances `e` is built under.
 function elabReadsEnclParam(d: i32, e: i32): boolean {
+  if e < 0 || e >= P.nodes.length || d < 0 || d >= P.nodes.length {
+    return false
+  }
+  if elabReadsParamOf(d, e) { return true }
+  const up = elabEncl[e] ?? -1
+  (elabPerEnclDecls[e] ?? false) && elabReadsEnclParam(d, up)
+}
+
+// Whether nested declaration `d`'s body reads an un-annotated parameter of declaration `e`.
+function elabReadsParamOf(d: i32, e: i32): boolean {
   const en = nodeAt(e)
   const dn = nodeAt(d)
   if !(en is FuncDecl) || !(dn is FuncDecl) { return false }
@@ -3873,6 +3884,21 @@ function elabWrittenAliasSeed(ix: i32, p: i32, fn: FuncDecl): boolean {
   elabWrittenParamAlias(identDeclOf(l), fn) >= 0
 }
 
+// The encloser of `decl` declaring parameter `pd`, reached through enclosers built per instance of
+// theirs, or -1.
+function elabEnclOwning(decl: i32, pd: i32): i32 {
+  let e = elabEncl.get(decl) ?? -1
+  let n = 0
+  while e >= 0 && e < P.nodes.length && n < P.nodes.length {
+    const en = nodeAt(e)
+    if en is FuncDecl && i32ListHas(en.fnParams, pd) { return e }
+    if !(elabPerEnclDecls[e] ?? false) { return -1 }
+    e = elabEncl.get(e) ?? -1
+    n = n + 1
+  }
+  -1
+}
+
 // Marks partial the set instance `k` binds a parameter of `decl` to, where node `ix` (the child
 // of `p`, or inside a nested function when `p` is -1) reads that parameter other than as a
 // callee: a set handed on is typed where it lands, which this decision does not see.
@@ -3889,18 +3915,14 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
     const dn = nodeAt(decl)
     // In a nested declaration built per encloser instance, a read of the encloser's parameter is
     // that parameter's, typed at this instance.
-    const enc = elabEncl.get(decl) ?? -1
     if (
       (elabPerEnclDecls[decl] ?? false)
-      && enc >= 0
       && pd >= 0
       && dn is FuncDecl
       && !i32ListHas(dn.fnParams, pd)
     ) {
-      const en = nodeAt(enc)
-      if en is FuncDecl && i32ListHas(en.fnParams, pd) {
-        return elabMintHandedIn(ix, p, enc, k, sc)
-      }
+      const own = elabEnclOwning(decl, pd)
+      if own >= 0 { return elabMintHandedIn(ix, p, own, k, sc) }
     }
     if pd >= 0 && dn is FuncDecl && i32ListHas(dn.fnParams, pd) {
       // So does a `const` copy of it read only in such literals.
@@ -4178,15 +4200,19 @@ function elabBundleForwardsJoin() {
   }
   const roots: i32[] = []
   const lists: i32[][] = []
+  // The chain's set is that of the first member whose instance binds the parameter to one.
+  const setKeys: i32[] = []
   for key in up.keys() {
     const r = elabBundleRoot(up, key)
     let at = i32ListIndexOf(roots, r)
     if at < 0 {
       roots.push(r)
       lists.push([])
+      setKeys.push(-1)
       at = roots.length - 1
     }
-    for t in elabBundleSigs.get(key) ?? [] {
+    if setKeys[at] < 0 && elabBundleKeySet(key) >= 0 { setKeys[at] = key }
+    for t in elabBundleOwnSigs(key) {
       let have = false
       for u in lists[at] {
         if tySame(u, t) { have = true }
@@ -4199,14 +4225,43 @@ function elabBundleForwardsJoin() {
     const at = i32ListIndexOf(roots, r)
     if at >= 0 && lists[at].length >= 2 {
       elabBundleSigs[key] = lists[at].slice(0)
-      elabBundleJoinRoot[key] = r
+      elabBundleJoinRoot[key] = if setKeys[at] >= 0 { setKeys[at] } else { r }
     }
   }
   0
 }
 
-// Each parameter key `elabBundleForwardsJoin` gave a joined list, and the root key of its chain.
+// Each parameter key `elabBundleForwardsJoin` gave a joined list, and the chain member whose set
+// the chain takes (its root where no member binds one).
 let elabBundleJoinRoot: {[i32]: i32} = Map()
+
+// The set instance `key / 64` binds its parameter `key % 64` to, or -1.
+function elabBundleKeySet(key: i32): i32 {
+  const k = key / 64
+  const i = key % 64
+  if k < 0 || k >= ekDecl.length { return -1 }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || i >= dn.fnParams.length { return -1 }
+  fnTagSetOfTy(substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k]))
+}
+
+// The signatures parameter key `key` adds to its chain: those its instance's calls noted, else
+// the one closed function type the instance binds the parameter to.
+function elabBundleOwnSigs(key: i32): i32[] {
+  const own = elabBundleSigs.get(key) ?? []
+  if own.length > 0 { return own }
+  const k = key / 64
+  const i = key % 64
+  if k < 0 || k >= ekDecl.length { return own }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || i >= dn.fnParams.length { return own }
+  const t = substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k])
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || tyHasTyVar(t) {
+    return own
+  }
+  if !elabTyClosed(t, 0) { return own }
+  [t]
+}
 
 // The root of `key` in the union `up`; a key never united is its own.
 function elabBundleRoot(up: Map<i32, i32>, key: i32): i32 {
@@ -4327,7 +4382,7 @@ export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
   if k < 0 || i < 0 || i >= 64 { return none }
   const sigs = elabBundleSigs.get(elabBundleKey(k, i)) ?? none
   if sigs.length < 2 { return none }
-  // A parameter a forward joined takes its chain's record, so the set is the chain root's.
+  // A parameter a forward joined takes its chain's record, so the set is the chain's.
   const root = elabBundleJoinRoot.get(elabBundleKey(k, i))
     ?? elabBundleKey(k, i)
   const rk = root / 64
@@ -7638,6 +7693,18 @@ export function elabParamCarriedInstAt(k: i32, i: i32): i32 {
 export function elabParamCarriedDeclAt(k: i32, i: i32): i32 {
   const r = elabParamCarriedInstAt(k, i)
   if r < 0 { -1 } else { ekDecl[r] }
+}
+
+// The closed type the copy binding `d` (`paramCopySeedOf`) takes in the instance being walked:
+// its parameter's own (`elabParamTyOwnAt`); -1 where `d` copies no parameter or that does not close.
+export function elabCopyTyOwn(d: i32): i32 {
+  const k = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  if k < 0 || k >= ekDecl.length { return -1 }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) { return -1 }
+  const pi = i32ListIndexOf(dn.fnParams, paramCopySeedOf(dn, d))
+  if pi < 0 { return -1 }
+  elabParamTyOwnAt(k, pi)
 }
 
 // The closed type of parameter `i` of instance `k`, or -1.

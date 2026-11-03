@@ -616,6 +616,7 @@ import {
   elabCallParamTyOwn,
   elabCallSeedBind,
   elabCallSetIn,
+  elabCopyTyOwn,
   elabDemand,
   elabHoleMapClosed,
   elabInstSlotAt,
@@ -3246,6 +3247,7 @@ function monoNicheNulParamsCheck(
 // index — so a generic body's `const out: T[] = []` lowers against the instance's concrete
 // element type, reusing the concrete annotated path rather than per-rep usage inference.
 function monoSubstLetType(
+  letIx: i32,
   letType: i32,
   typarams: string[],
   tvN: string[],
@@ -3254,9 +3256,11 @@ function monoSubstLetType(
   bT: i32[],
 ) {
   if letType < 0 { return letType }
-  // A copy of a parameter pinned on its own takes that pin (`monoLetTyParamMisfit`).
-  const lp = monoLetPinAt.get(letType) ?? ""
-  if lp != "" { return monoSynthPinRef(lp, monoLetPinTyAt.get(letType) ?? -1) }
+  // A copy of a parameter takes the type the elaboration closes that parameter at.
+  const ct = elabCopyTyOwn(letIx)
+  if ct >= 0 && tyAt(ct) is TyFunc {
+    return monoSynthPinRef(monoPinOfClosedTy(ct), ct)
+  }
   const tn = nodeAt(letType)
   if tn is TypeRef {
     if monoAnnMentionsTyParam(letType, typarams) {
@@ -4402,7 +4406,7 @@ function monoCloneLetDecl(
   const nt = monoMintedLetAnn(
     n,
     ix,
-    monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT),
+    monoSubstLetType(ix, n.letType, typarams, tvN, tvV, bN, bT),
   )
   if nt == n.letType { return ix }
   const ninit = monoCtorInitCopy(n.letInit, nt)
@@ -5107,7 +5111,7 @@ function monoPinBodyLambdasRaw(
     const nt = monoMintedLetAnn(
       n,
       ix,
-      monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT),
+      monoSubstLetType(ix, n.letType, typarams, tvN, tvV, bN, bT),
     )
     if ci == n.letInit && nt == n.letType { return ix }
     return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ci, n.pos))
@@ -20783,12 +20787,10 @@ function monoPinIsFnTy(t: i32): boolean {
   t >= 0 && t < T.tys.length && tyAt(t) is TyFunc
 }
 
-// A binding of `fn`'s body annotated with one type parameter and seeded from a parameter of
-// another, where the two bind different function instances, asks the split to give the binding
-// the parameter's type (D6703), and fails; a copy (`paramCopySeedOf`) takes the parameter's pin
-// instead (`monoLetPinAt`). 0 when no binding fails.
-let monoLetPinAt: {[i32]: string} = Map()
-let monoLetPinTyAt: {[i32]: i32} = Map()
+// A binding annotated with one type parameter and seeded from a parameter of another, the two
+// binding different function instances, asks the split for the parameter's type (D6703) and
+// fails; a copy (`paramCopySeedOf`) passes, its annotation read from `elabCopyTyOwn`. 0 when no
+// binding fails.
 function monoLetTyParamMisfit(
   fn: FuncDecl,
   params: i32[],
@@ -20812,12 +20814,7 @@ function monoLetTyParamMisfit(
         && cj < pinTys.length
         && monoPinIsFnTy(pinTys[cj])
       ) {
-        const tn = if n.letType >= 0 && n.letType < P.nodes.length { nodeAt(n.letType) } else { nodeAt(ix) }
-        const bt = if tn is TypeRef { monoBindTyOf(tvN, tvT, tn.tyName) } else { -1 }
-        if bt < 0 || !tySame(bt, pinTys[cj]) {
-          monoLetPinAt[n.letType] = pinned[cj]
-          monoLetPinTyAt[n.letType] = pinTys[cj]
-        }
+        // `monoSubstLetType` reads its type from the elaboration.
       } else if n is LetDecl && n.letType >= 0 && n.letInit >= 0 {
         let j = 0
         while j < params.length && j < pinTys.length {
@@ -20829,8 +20826,6 @@ function monoLetTyParamMisfit(
               && monoPinIsFnTy(pinTys[j])
               && !monoLetIsAssigned(n.letName, ix)
             ) {
-              monoLetPinAt[n.letType] = pinned[j]
-              monoLetPinTyAt[n.letType] = pinTys[j]
               break
             }
             fsAskTyParam(params[j])
@@ -22747,8 +22742,6 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         tvT,
         fn.fnBody,
       )
-      monoLetPinAt = Map()
-      monoLetPinTyAt = Map()
       if monoLetTyParamMisfit(fn, params, tvN, tvV, tvT, pinned, pinTys) < 0 {
         return -1
       }
@@ -22777,8 +22770,6 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         false,
         cbFnNames,
       )
-      monoLetPinAt = Map()
-      monoLetPinTyAt = Map()
       return made
     }
   }
@@ -23148,27 +23139,40 @@ function monoBundleHandOnPin(
       pt = nodeTyIxOf(qn.parType)
     }
   }
-  // The pin is spelled afresh in the instance by its record's row, and each bundle has a row of its
-  // own, so the record is matched by that row.
+  // The pin is spelled afresh in the instance by its record's row, and records listing the same
+  // signatures in another order share it, so the record is matched by row and signatures.
   const pr = monoBundleRowOf(pt)
   let bi = -1
   let q = 0
-  while pr >= 0 && bi < 0 && q < monoBundleTys.length {
-    if monoBundleRowOf(monoBundleTys[q]) == pr { bi = q }
+  while (
+    pr >= 0
+    && bi < 0
+    && q < monoBundleTys.length
+    && q < monoBundleTySigs.length
+  ) {
+    if (
+      monoBundleRowOf(monoBundleTys[q]) == pr
+      && monoSigsSame(monoBundleTySigs[q], sigs)
+    ) {
+      bi = q
+    }
     q = q + 1
   }
-  if bi < 0 || bi >= monoBundleTySigs.length { return 1 }
-  const have = monoBundleTySigs[bi]
-  if have.length != sigs.length { return 1 }
-  let j = 0
-  while j < sigs.length {
-    if !tySame(have[j], sigs[j]) { return 1 }
-    j = j + 1
-  }
-  if pr >= sNames.length { return 1 }
+  if bi < 0 || pr >= sNames.length { return 1 }
   pinned.push(sNames[pr])
   pinTys.push(monoBundleTys[bi])
   0
+}
+
+// Whether signature lists `a` and `b` hold the same types in the same order.
+function monoSigsSame(a: i32[], b: i32[]): boolean {
+  if a.length != b.length { return false }
+  let j = 0
+  while j < a.length {
+    if !tySame(a[j], b[j]) { return false }
+    j = j + 1
+  }
+  true
 }
 
 // The struct row of record type `t`, or -1.
@@ -28539,8 +28543,6 @@ export function monomorphize(stmts: i32[]) {
   monoProgNamesDeep = false
   monoNoRename = []
   monoAliasCallDecl = Map()
-  monoLetPinAt = Map()
-  monoLetPinTyAt = Map()
   monoRetWidenFns = Map()
   monoWrittenLetHanded = Map()
   monoDeclWrites = Map()
