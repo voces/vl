@@ -1,7 +1,8 @@
 // The record-row class of a record type: the order-free key of the struct row identity the
 // emitter already keys heap twins on (`repRowKey`), read from the checked type alone, so it can be
-// asked before the elaboration. Equal keys never name two heap rows; arms one union lays out at one
-// row by their membership still key apart (D15152). Computed on demand and memoised per compile.
+// asked before the elaboration, with the union literal re-lay (D1050) folded in. Equal keys never
+// name two heap rows; records one layout family builds at one row still key apart (D15152).
+// Computed on demand and memoised per compile.
 import {
   T,
   TyArray,
@@ -15,9 +16,13 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  cUserTypes,
   tyAt,
+  tyIsLitUnion,
+  tySame,
 } from "./check_types"
-import { repRowKey } from "./emit_rep"
+import { fieldNameOrder } from "./check_obj_shape"
+import { repRowFieldKey, repRowKey } from "./emit_rep"
 
 let rrMemo: {[i32]: string} = Map()
 
@@ -49,7 +54,7 @@ function rrClassGo(ty: i32): string {
   const t = tyAt(ty)
   match t {
     TyObj => {
-      return repRowKey(ty)
+      return rrArmKey(ty)
     }
     TyUnion => {
       let k = ""
@@ -67,4 +72,116 @@ function rrClassGo(ty: i32): string {
       return ""
     }
   }
+}
+
+// Record `ty`'s key with the fields the union re-lay rewrites (D1050): where an arm of a declared
+// union meets a sibling of the same field names whose field is another literal set, both store the
+// atom; where either is the plain `string`, both store the string. The string wins over the atom,
+// whichever union is met first. A record no re-lay touches answers `repRowKey`.
+function rrArmKey(ty: i32): string {
+  const t = tyAt(ty)
+  if !(t is TyObj) { return "" }
+  const ovr: {[string]: string} = Map()
+  let any = false
+  for un in cUserTypes.keys() {
+    const u = cUserTypes[un] ?? -1
+    if u >= 0 && u < T.tys.length {
+      const ut = tyAt(u)
+      if ut is TyUnion && rrHas(ut.uMembers, ty) {
+        for m in ut.uMembers {
+          if m >= 0 && m < T.tys.length && m != ty && !tySame(m, ty) {
+            const mt = tyAt(m)
+            if mt is TyObj && rrSameNames(t.objFieldNames, mt.objFieldNames) {
+              let i = 0
+              while i < t.objFieldNames.length {
+                const nm = t.objFieldNames[i]
+                const a = t.objFieldTypes[i]
+                const b = rrFieldTyOf(mt, nm)
+                const r = rrRelayOf(a, b)
+                if r != "" {
+                  if (ovr[nm] ?? "") != "string" { ovr[nm] = r }
+                  any = true
+                }
+                i = i + 1
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if !any { return repRowKey(ty) }
+  const ord = fieldNameOrder(t.objFieldNames)
+  let out = "{"
+  for k in ord {
+    const nm = t.objFieldNames[k]
+    const o = ovr[nm] ?? ""
+    out = out
+      + nm
+      + ":"
+      + (if o != "" { o } else { repRowFieldKey(t.objFieldTypes[k]) })
+      + ","
+  }
+  out + "}"
+}
+
+// The rep two arms' fields of types `a` and `b` are re-laid to: "string" where a literal set
+// meets the plain string, "$atom" where two literal sets differ; "" where the re-lay leaves them.
+function rrRelayOf(a: i32, b: i32): string {
+  if b < 0 { return "" }
+  const la = rrIsStrLit(a)
+  const lb = rrIsStrLit(b)
+  const sa = rrIsString(a)
+  const sb = rrIsString(b)
+  if !(la || sa) || !(lb || sb) { return "" }
+  if !la && !lb { return "" }
+  if repRowFieldKey(a) == repRowFieldKey(b) && la && lb { return "" }
+  if sa || sb { return "string" }
+  "$atom"
+}
+
+// Whether `ty` is a string literal or a set of them.
+function rrIsStrLit(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  if tyIsLitUnion(ty) { return true }
+  const t = tyAt(ty)
+  t is TyLit && t.litKind == "str"
+}
+
+// Whether `ty` is the plain `string` primitive.
+function rrIsString(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  t is TyPrim && t.primName == "string"
+}
+
+// Whether `ms` holds `ty`.
+function rrHas(ms: i32[], ty: i32): boolean {
+  for m in ms {
+    if m == ty || tySame(m, ty) { return true }
+  }
+  false
+}
+
+// Whether two records have the same field names, in any order.
+function rrSameNames(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  for n in a {
+    let hit = false
+    for m in b {
+      if m == n { hit = true }
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+// The type of record `t`'s field `nm`, or -1.
+function rrFieldTyOf(t: TyObj, nm: string): i32 {
+  let i = 0
+  while i < t.objFieldNames.length {
+    if t.objFieldNames[i] == nm { return t.objFieldTypes[i] }
+    i = i + 1
+  }
+  -1
 }

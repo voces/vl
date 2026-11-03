@@ -331,16 +331,39 @@ Deno.test({
 
 Deno.test({
   name:
-    "row classes: D15152, arms one union lays out at one row key apart today",
+    "row classes: D15152, records one layout family builds at one row key apart today",
   ignore: !assertSeed(),
   fn: () => {
+    // `A = {kind: K, r}` is contained in `B = {kind: string, r}` with no union between them.
     const d = dump(
-      'type K = "circle" | "round"\ntype A = { kind: K, r: i32 }\ntype B = { kind: string, r: i32 }\n' +
-        'type U = A | B\nconst a: A = { kind: "circle", r: 2 }\nconst u: U = a\nif u is A { print(u.r) }\n',
+      Deno.readTextFileSync(
+        new URL(
+          "./cases/unions/layout-family-literal-set-beside-string.vl",
+          import.meta.url,
+        ),
+      ),
     );
     if (classOf(d, "A") === classOf(d, "B")) {
       throw new Error(
-        "A and B now share a class: D15152's membership re-lay is folded in, so update this case and the row",
+        "A and B now share a class: D15152's layout family is folded in, so update this case and the row",
+      );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "row classes: two arms of one union whose literal discriminants differ are one class",
+  ignore: !assertSeed(),
+  fn: () => {
+    // The union literal re-lay (D1050): the two sets meet on the atom, so the arms build at one row.
+    const d = dump(
+      'type A = { kind: "a", x: i32 }\ntype B = { kind: "b" | "c", x: i32 }\ntype U = A | B\n' +
+        'const a: A = { kind: "a", x: 1 }\nconst u: U = a\nprint(u.x)\n',
+    );
+    if (classOf(d, "A") !== classOf(d, "B")) {
+      throw new Error(
+        `want A and B one class, got ${classOf(d, "A")} vs ${classOf(d, "B")}`,
       );
     }
   },
