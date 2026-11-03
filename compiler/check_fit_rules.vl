@@ -2923,7 +2923,9 @@ export function recBuiltReadRefuse(u: i32) {
 // Whether read `x` is, or is a binding holding, a call of an inferred function (`recInferredFnOf`).
 function recBuiltViaFnResult(x: i32, depth: i32): boolean {
   if depth <= 0 || x < 0 || x >= P.nodes.length { return false }
-  if nodeAt(x) is Call { return recInferredFnOf(x) >= 0 }
+  if nodeAt(x) is Call {
+    return recInferredFnOf(x) >= 0 && recIdentityArgOf(x) < 0
+  }
   const d = if nodeAt(x) is Ident { recHeldDecl(x) } else { -1 }
   const dn = if d >= 0 { nodeAt(d) } else { null }
   dn is LetDecl && recBuiltViaFnResult(cwPeelValue(dn.letInit), depth - 1)
@@ -3076,6 +3078,38 @@ function recRetTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
     || recArgTakesRep(call, depth)
     || recBoundForFields(call)
     || recInReadOnlyList(call, depth)
+    || recIdentityReadsBuilt(call)
+}
+
+// Whether `call` hands back its argument, a read out of a built container: the call is then read
+// as that read, and its own delivery is judged where it lands (D14819).
+// A result another function returns is kept at that function's own result type (D15125).
+function recIdentityReadsBuilt(call: i32): boolean {
+  const ia = recIdentityArgOf(call)
+  ia >= 0 && recBuiltReadTy(cwPeelValue(ia)) >= 0 && !recFnResultLeaf(call)
+}
+
+// Whether `x` is a value function around it returns, directly or through a binding it holds.
+function recFnResultLeaf(x: i32): boolean {
+  const fd = recEnclosingFn(x)
+  if fd < 0 { return false }
+  for lf in recFnValueLeaves(fd) {
+    const l = cwPeelValue(lf)
+    if l == x { return true }
+    const d = if l >= 0 && nodeAt(l) is Ident { recHeldDecl(l) } else { -1 }
+    const dn = if d >= 0 { nodeAt(d) } else { null }
+    if dn is LetDecl && cwPeelValue(dn.letInit) == x { return true }
+  }
+  false
+}
+
+// The argument call `x` hands back: a hole function's identity, or a generic's sole-pin one; -1
+// otherwise.
+function recIdentityArgOf(x: i32): i32 {
+  const c = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(c is Call) || c.callFn < 0 { return -1 }
+  const ha = recHoleIdentityArg(x, identBoundFnDeclOf(c.callFn))
+  if ha >= 0 { ha } else { recSolePinArg(x) }
 }
 
 // Whether `x` is an element of a list literal that initialises an un-annotated `const` read only
@@ -3326,6 +3360,11 @@ function recBuiltReadTyAt(
     const f = nodeAt(n.callFn)
     if n.callArgs.length == 1 && f is Member && f.memProp == "get" {
       return recBuiltElemIn(cwPeelValue(f.memObj), tbl)
+    }
+    // A call handing its argument back reads where that argument does (D14819).
+    const ia = recIdentityArgOf(x)
+    if ia >= 0 {
+      return recBuiltReadTyAt(cwPeelValue(ia), tbl, false, depth - 1)
     }
     return recBuiltLeavesTy(recInferredFnOf(x), tbl, depth - 1)
   }
