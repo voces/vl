@@ -150,3 +150,75 @@ Deno.test({
     }
   },
 });
+
+// A refusal raised while a hole parameter's instance is lowered (D15010): the instance's body is
+// rebuilt into nodes minted after parsing, so the anchor is the instance's template, `take` on
+// line 3, in the module that declares it (D15155). The same shapes with `use` generic.
+const INSTANCE_WITNESS = `function id<T>(x: T): T { x }
+function use(ys) { print(ys.length) }
+function take(a) {
+  const xs = [a]
+  use(xs)
+  print(xs[0]("abc").length + xs[0](2))
+}
+`;
+
+Deno.test({
+  name:
+    "vl-emit-diag-position: a refusal inside a parameter's instance names its template, in its own module",
+  ignore: !ENABLED,
+  fn: async () => {
+    const generic = INSTANCE_WITNESS.replace(
+      "function use(ys)",
+      "function use<T>(ys: T[])",
+    );
+    const shapes: { name: string; lib: string; main: string | null }[] = [
+      { name: "one file", lib: INSTANCE_WITNESS + "take(id)\n", main: null },
+      {
+        name: "a function after it",
+        lib: INSTANCE_WITNESS + "take(id)\nexport function one(): i32 { 1 }\n",
+        main: null,
+      },
+      {
+        name: "a wrapper call",
+        lib: INSTANCE_WITNESS + "function run() { take(id) }\nrun()\n",
+        main: null,
+      },
+      {
+        name: "imported, at the module's top level",
+        lib: INSTANCE_WITNESS + "take(id)\nexport function one(): i32 { 1 }\n",
+        main: 'import { one } from "./lib"\nprint(one())\n',
+      },
+      {
+        name: "imported, a generic instance",
+        lib: generic + "export function run() { take(id) }\n",
+        main: 'import { run } from "./lib"\nrun()\n',
+      },
+    ];
+    for (const s of shapes) {
+      const dir = await Deno.makeTempDir({ prefix: "vl_emit_inst_" });
+      try {
+        await Deno.writeTextFile(`${dir}/lib.vl`, s.lib);
+        if (s.main !== null) await Deno.writeTextFile(`${dir}/main.vl`, s.main);
+        const r = await checkCodegen(
+          s.main === null ? "lib.vl" : "main.vl",
+          dir,
+        );
+        if (!r.out.includes("emit error")) {
+          throw new Error(
+            `${s.name}: the instance witness no longer reaches an emit refusal, so this guard ` +
+              `is measuring nothing — replace INSTANCE_WITNESS (D15010 closed?).\n${r.out}`,
+          );
+        }
+        const blk = errorBlock(r.out);
+        if (!/at \S*lib\.vl:3:\d+/.test(blk)) {
+          throw new Error(
+            `${s.name}: want the anchor at lib.vl:3 (\`take\`), got:\n${blk}`,
+          );
+        }
+      } finally {
+        await Deno.remove(dir, { recursive: true });
+      }
+    }
+  },
+});
