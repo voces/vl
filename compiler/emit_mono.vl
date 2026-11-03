@@ -9452,11 +9452,6 @@ function monoAnonPinDiscrim(pin: string, tyIx: i32): string {
   }
   if pin.length < 5 { return "" }
   if pin[0] != "#"[0] && pin[0] != "{"[0] { return "" }
-  // MEASUREMENT (D15109): a union pin is a composite parameter's substituted annotation, which
-  // the key's bindings already fix; only a row pin needs the exact-type suffix.
-  for ch in pin {
-    if ch == '|' { return "" }
-  }
   const canon = tyCanonKey(tyIx, TY_WALK_DEPTH)
   if canon == "" { return "" }
   "=" + canon
@@ -10021,13 +10016,17 @@ function monoKeyPinSeg(
   heads: string[],
   pinned: string[],
   pinTys: i32[],
+  bound: boolean[],
 ): string {
   let seg = ""
   let pk = 0
   while pk < pinned.length {
+    // A parameter annotated with a union naming a type parameter is pinned at that annotation
+    // under the key's bindings, which already fix it; the argument's exact type adds nothing (D15109).
+    const unionPin = pk < bound.length && bound[pk]
     seg = seg
       + heads[pk]
-      + monoAnonPinDiscrim(pinned[pk], pinTys[pk])
+      + (if unionPin { "" } else { monoAnonPinDiscrim(pinned[pk], pinTys[pk]) })
       + monoSigPinDiscrim(pinned[pk], pinTys[pk])
       + monoSetPinDiscrim(pinTys[pk])
       + monoLitUnionPinDiscrim(pinTys[pk])
@@ -10035,6 +10034,22 @@ function monoKeyPinSeg(
     pk = pk + 1
   }
   seg
+}
+
+// Per parameter of `fn`, whether its annotation is a union that names one of its type
+// parameters: such a pin is the substituted annotation, which the key's bindings fix.
+function monoUnionTyParamPins(fn: FuncDecl): boolean[] {
+  const out: boolean[] = []
+  for pIx in fn.fnParams {
+    const p = nodeAt(pIx)
+    out.push(
+      p is Param
+        && p.parType >= 0
+        && monoAnnIsUnion(p.parType)
+        && monoAnnHasTyParam(p.parType, -1, fn.fnTyParams),
+    )
+  }
+  out
 }
 
 // The instance registry key, `key` extended by the exact types a type-testing body binds
@@ -10998,7 +11013,7 @@ function monoMakeInstanceKeyOf(
   const exSubN: string[] = []
   const exSubT: i32[] = []
   const pinAt = key.length
-  key = key + monoKeyPinSeg(pinned, pinned, pinTys)
+  key = key + monoKeyPinSeg(pinned, pinned, pinTys, monoUnionTyParamPins(fn))
   const pinEnd = key.length
   key = monoMakeInstanceKey(
     key,
@@ -11062,8 +11077,14 @@ function monoTypedInstKey(
     heads.push(pin)
     pk = pk + 1
   }
-  const seg = monoKeyPinSeg(heads, pinned, pinTys)
   const fd = nodeAt(monoOrigNode[origFe])
+  const none: boolean[] = []
+  const seg = monoKeyPinSeg(
+    heads,
+    pinned,
+    pinTys,
+    if fd is FuncDecl { monoUnionTyParamPins(fd) } else { none },
+  )
   if !(fd is FuncDecl) {
     return k.key.slice(0, k.pinAt) + seg + k.key.slice(k.pinEnd, k.key.length)
   }
