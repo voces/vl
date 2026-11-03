@@ -136,6 +136,8 @@ import {
   elabTyClosed,
   fnLetIsWide,
   fnLetOpenHandAt,
+  fnParamHandArgsOf,
+  fnParamHandFromsOf,
   fnParamHandSets,
   fnTagArmMemberNote,
   fnTagArmsAt,
@@ -1935,6 +1937,8 @@ function ftParamHandedWithin(v: i32, s: i32): boolean {
   if fd < 0 || fd >= P.nodes.length { return false }
   const f = nodeAt(fd)
   if !(f is FuncDecl) || ftReadInNestedFn(f.fnBody, pd) { return false }
+  // A body that never runs stores nothing.
+  if ftNeverRuns(fd) { return true }
   const sets = ftReachHandSets(fd, i32ListIndexOf(f.fnParams, pd), 0)
   if sets.length == 0 { return false }
   for st in sets {
@@ -1960,8 +1964,30 @@ function ftReachHandSets(fd: i32, pi: i32, depth: i32): i32[] {
   const refs = ftDirectRefs[fd] ?? 0
   const lits = ftListedAt[fd] ?? []
   if refs == 0 || refs != calls + at.length / 2 + lits.length { return none }
-  const out = fnParamHandSets(fd, pi).slice(0)
-  if calls > 0 && out.length == 0 { return none }
+  // A call in a named function nothing references and nothing exports never runs, so it hands
+  // nothing; one handing on its caller's un-annotated parameter hands what reaches that one.
+  const out: i32[] = []
+  const hs = fnParamHandSets(fd, pi)
+  const froms = fnParamHandFromsOf(fd, pi)
+  const args = fnParamHandArgsOf(fd, pi)
+  let hi = 0
+  while hi < hs.length {
+    const fr = if hi < froms.length { froms[hi] } else { -1 }
+    const q = if hs[hi] < 0 && hi < args.length { ftParamIndexIn(fr, args[hi]) } else { -1 }
+    if ftNeverRuns(fr) {
+      hi = hi + 1
+      continue
+    }
+    if q >= 0 {
+      const sub = ftReachHandSets(fr, q, depth + 1)
+      if sub.length == 0 { return none }
+      for st in sub { out.push(st) }
+    } else {
+      out.push(hs[hi])
+    }
+    hi = hi + 1
+  }
+  if calls > 0 && hs.length == 0 { return none }
   // A `const` list literal holding `fd`, read only as the callee of a call through an element,
   // hands each such call's argument (D15053's stored spelling).
   for lit in lits {
@@ -2026,6 +2052,31 @@ function ftReachHandSets(fd: i32, pi: i32, depth: i32): i32[] {
     k = k + 2
   }
   out
+}
+
+// The position of the un-annotated parameter of declaration `fr` that read `a` names, or -1.
+function ftParamIndexIn(fr: i32, a: i32): i32 {
+  if fr < 0 || fr >= P.nodes.length || a < 0 || a >= P.nodes.length {
+    return -1
+  }
+  const f = nodeAt(fr)
+  if !(f is FuncDecl) || !(nodeAt(a) is Ident) { return -1 }
+  const pd = identDeclOf(a)
+  const pn = if pd >= 0 && pd < P.nodes.length { nodeAt(pd) } else { f }
+  if !(pn is Param) || pn.parType >= 0 || ftReadInNestedFn(f.fnBody, pd) {
+    return -1
+  }
+  i32ListIndexOf(f.fnParams, pd)
+}
+
+// Whether `fr` is a named function no name reads and that is not exported, so its body never
+// runs.
+function ftNeverRuns(fr: i32): boolean {
+  if fr < 0 || fr >= P.nodes.length || declIsExportedFn(fr) { return false }
+  const f = nodeAt(fr)
+  if !(f is FuncDecl) || f.fnName == "" { return false }
+  ftDirectCountsGrow()
+  (ftDirectRefs[fr] ?? 0) == 0
 }
 
 // Per function, the names reading it, the calls naming it as their callee, and each call handing
