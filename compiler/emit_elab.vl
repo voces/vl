@@ -210,6 +210,7 @@ import {
   mintScopeNamesOf,
   mintScopeRows,
   mintScopeTysOf,
+  mintSeedNote,
   mintSetPartialNote,
 } from "./check_mint"
 import {
@@ -1026,9 +1027,9 @@ function elabSeedReadTy(decl: i32, d: i32, names: string[], tys: i32[]): i32 {
   if t >= 0 && elabTyClosed(t, 0) { t } else { -1 }
 }
 
-// Whether binding `names`/`tys` closes every parameter `decl`'s body reads, and a declared type
-// parameter its return names; a hole the return derives from a parameter's may stay open, and so
-// may a function value's own. A question, not a pin: the substitution banks none.
+// Whether binding `names`/`tys` closes every parameter `decl`'s body reads, and each declared type
+// parameter its return names; any other hole in the return may stay open, as may a function
+// value's own. A question, not a pin: the substitution banks none.
 function elabParamsClosed(decl: i32, names: string[], tys: i32[]): boolean {
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) { return false }
@@ -1050,7 +1051,10 @@ function elabParamsClosed(decl: i32, names: string[], tys: i32[]): boolean {
   if !open && dn.fnTyParams.length > 0 && sig >= 0 && sig < T.tys.length {
     const f = tyAt(sig)
     if f is TyFunc {
-      open = !elabTyClosed(substTyDeep(f.fnRet, names, marks), 0)
+      const rt = substTyDeep(f.fnRet, names, marks)
+      for tp in dn.fnTyParams {
+        if !open && tyMentionsTyVarNamed(rt, tp, 16) { open = true }
+      }
     }
   }
   holePinHeldSet(held)
@@ -3399,6 +3403,76 @@ function elabListLitOfParam(lit: i32, fn: FuncDecl, pd: i32): boolean {
   false
 }
 
+// Whether parameter read `ix`, the child of `p`, initialises an un-annotated written `let` of
+// `fn` whose every other value names a declared function and whose every read is a callee, an
+// assignment's target, or a hand-on to a named function's or (as instance `k` types it) a set's
+// open parameter, none nested.
+function elabParamSeedsWritten(ix: i32, p: i32, fn: FuncDecl, k: i32): boolean {
+  if p < 0 || p >= P.nodes.length { return false }
+  const ln = nodeAt(p)
+  if (
+    !(ln is LetDecl)
+    || ln.letKw != "let"
+    || ln.letType >= 0
+    || parenPeelIx(ln.letInit) != ix
+  ) {
+    return false
+  }
+  cwIxWant()
+  const vs = cwBindingWrittenValues(p)
+  if vs.length < 2 || cwLetWrittenInClosure(p) { return false }
+  for v in vs {
+    const vx = parenPeelIx(v)
+    if vx != ix {
+      if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) {
+        return false
+      }
+      const vd = identDeclOf(vx)
+      if vd < 0 || vd >= P.nodes.length { return false }
+      const vn = nodeAt(vd)
+      if !(vn is FuncDecl) || vn.fnName == "" { return false }
+    }
+  }
+  elabSeededReadsOk(p, fn, k)
+}
+
+// Whether every read of binding `d` in `fn`'s own body is a call's callee, an assignment's target,
+// or a positional argument of a named function's or (as instance `k` types it) a set's open
+// parameter, and none is in a nested function.
+function elabSeededReadsOk(d: i32, fn: FuncDecl, k: i32): boolean {
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  const deep: boolean[] = [false]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    const nested = deep.pop() ?? false
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Ident && identDeclOf(x) == d {
+        if nested || p < 0 { return false }
+        const pn = nodeAt(p)
+        const callee = pn is Call && parenPeelIx(pn.callFn) == x
+        const target = pn is BinExpr && pn.binOp == "=" && pn.binLeft == x
+        if (
+          !callee
+          && !target
+          && elabMintFwdTarget(x, p).length != 2
+          && elabSetFwdTarget(x, p, k).length == 0
+        ) {
+          return false
+        }
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+        deep.push(nested || xn is FuncDecl)
+      }
+    }
+  }
+  true
+}
+
 // The first parameter of `elabWrittenParamSources`, or -1.
 function elabWrittenParamAlias(d: i32, fn: FuncDecl): i32 {
   const ps = elabWrittenParamSources(d, fn)
@@ -3754,6 +3828,15 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
           mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), ss)
         }
         return 0
+      }
+      // So does a written `let` it seeds whose other values are named functions.
+      if elabParamSeedsWritten(ix, p, dn, k) {
+        const ss = fnTagSetOfTy(elabNodeTy(ix, k))
+        const ws = fnTagSetOfTy(elabNodeTy(p, k))
+        if ss >= 0 && ws >= 0 {
+          mintSeedNote(decl, i32ListIndexOf(dn.fnParams, pd), ss, p, ws)
+          return 0
+        }
       }
       // A parameter handed back lands at the call's own value, which the decision reads.
       if elabRetHandsBack(decl, ix, i32ListIndexOf(dn.fnParams, pd)) {

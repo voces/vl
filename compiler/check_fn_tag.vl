@@ -63,6 +63,7 @@ import {
 import {
   CW_OCC_CALL,
   CW_OCC_USE,
+  cwBindingWrittenValues,
   cwIxKind,
   cwIxNode,
   cwIxWant,
@@ -116,6 +117,10 @@ import {
   mintParamSetsOf,
   mintParamTakes,
   mintRetParamsOf,
+  mintSeedBindsOf,
+  mintSeedHeldOf,
+  mintSeedWideOfBind,
+  mintSeedWideOfParam,
   mintSetPartial,
 } from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
@@ -565,6 +570,25 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   ftWideSeen = false
   ftFwdFn = ftCallsHandFn(rootIx, s, calls, mint)
   if !ftScan(rootIx, s, ds, leaves, ids) { return false }
+  // A written `let` a parameter initialises holds `s` only in an instance, so the members written
+  // to it are the set's leaves, and the parameter's own set is decided with it.
+  for b in mintSeedBindsOf(s) {
+    cwIxWant()
+    for v in cwBindingWrittenValues(b) {
+      const vx = parenPeelIx(v)
+      const vn = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
+      const vd = if vn is Ident { identDeclOf(vx) } else { -1 }
+      if vd >= 0 && i32ListHas(ds, vd) && !i32ListHas(leaves, vx) {
+        leaves.push(vx)
+        ids.push(vd)
+      }
+    }
+  }
+  for o in mintSeedHeldOf(s) {
+    if o != s && ftSetWithin(o, s) && !i32ListHas(ftSubNeed, o) {
+      ftSubNeed.push(o)
+    }
+  }
   // A list widened to `s` from a copy of a list of a smaller set holds that set's ids, so the
   // two are decided together.
   for o in fnWidenedListSourceSets(s) {
@@ -2452,6 +2476,33 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
     || ftArgIsParam(c, i) && ftParamForwardsSet(d, i, s)
     || ftArgIsParam(c, i) && ftParamInert(d, i, 0)
     || ftArgIsParam(c, i) && i32ListHas(mintRetParamsOf(d), i)
+    || ftParamSeedsWider(d, i, s)
+}
+
+// Whether `x` names a written binding a parameter initialises, which holds `s` or a wider set
+// in every instance, the wider one decided with `s`.
+function ftSeededHolds(x: i32, s: i32): boolean {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
+  ftWiderWith(mintSeedWideOfBind(identDeclOf(x)), s)
+}
+
+// Whether parameter `i` of `d`, holding set `s`, initialises written bindings that hold `s` or a
+// wider set decided with it, so the id an argument hands is what they hold.
+function ftParamSeedsWider(d: i32, i: i32, s: i32): boolean {
+  ftWiderWith(mintSeedWideOfParam(d, i, s), s)
+}
+
+// Whether `ws` is not empty and each set in it is `s` or holds `s`, queueing each wider one to
+// be decided with `s`.
+function ftWiderWith(ws: i32[], s: i32): boolean {
+  if ws.length == 0 { return false }
+  for w in ws {
+    if w != s && !ftSetWithin(s, w) { return false }
+  }
+  for w in ws {
+    if w != s && !i32ListHas(ftSubNeed, w) { ftSubNeed.push(w) }
+  }
+  true
 }
 
 // Whether, after the elaboration, argument `x` of call `c` through a set of functions lands in a
@@ -2591,6 +2642,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       }
       if pn.binRight != x { return false }
       if ftIsS(pn.binLeft, s) { return true }
+      if ftSeededHolds(pn.binLeft, s) { return true }
       if ftHeldWider(nodeTyIxOf(pn.binLeft), s) { return true }
       const ln = nodeAt(pn.binLeft)
       return ln is Index && ftStoreInWider(ln.idxArr, s)
