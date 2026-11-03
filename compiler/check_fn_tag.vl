@@ -1504,6 +1504,7 @@ function ftNodeOk(
     // A `let` written with other members holds the set its initialiser is one of.
     LetDecl => {
       if n.letInit < 0 || ftIsS(n.letInit, s) { return true }
+      if ftAliasIntoCaptured(n.letInit, x) { return false }
       return ftJoinAt(n.letInit, nodeTyIxOf(x), s, ds, leaves, ids)
     }
     Paren | Block => {
@@ -1554,8 +1555,11 @@ function ftNodeOk(
           || ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
       }
       if !ftIsStore(n) { return false }
-      return ftIsS(n.binRight, s)
-        || ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
+      if ftIsS(n.binRight, s) { return true }
+      const bl = parenPeelIx(n.binLeft)
+      const bd = if bl >= 0 && bl < P.nodes.length && nodeAt(bl) is Ident { identDeclOf(bl) } else { -1 }
+      if ftAliasIntoCaptured(n.binRight, bd) { return false }
+      return ftJoinAt(n.binRight, nodeTyIxOf(x), s, ds, leaves, ids)
     }
     // An element read of a list holding the set's ids is one of them.
     Index => {
@@ -2112,14 +2116,14 @@ function ftLambdaLeaf(v: i32, ds: i32[]): boolean {
     && !ftWithinInstancedFn(v)
 }
 
-// Whether lambda `x` is the value its parent `p` writes into a binding: an un-annotated
-// binding's initialiser or a store's right side, so the binding's reads are the only names it has.
+// Whether lambda `x` is the value its parent `p` writes into a binding: a `let`'s initialiser or
+// a store's right side, so the binding's reads are the only names it has.
 function ftWrittenAt(x: i32, p: i32): boolean {
   if p < 0 || p >= P.nodes.length { return false }
   const pn = nodeAt(p)
   match pn {
     LetDecl => {
-      return pn.letInit == x && (pn.letKw == "let" || pn.letType < 0)
+      return pn.letKw == "let" && pn.letInit == x
     }
     BinExpr => {
       return ftIsStore(pn) && pn.binRight == x
@@ -2150,6 +2154,25 @@ export function ftWithinInstancedFn(x: i32): boolean {
     if ftOpenFn(f) { return true }
     f = fnDeclParent[f] ?? -1
     hops = hops + 1
+  }
+  false
+}
+
+// Whether `v` reads a lambda through a `const` and binding `b` is read inside a closure, whose
+// capture of `b` an alias's id does not reach.
+function ftAliasIntoCaptured(v: i32, b: i32): boolean {
+  const vx = parenPeelIx(v)
+  if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) { return false }
+  const src = ftConstSource(vx, 8)
+  if src == vx || src < 0 || src >= P.nodes.length { return false }
+  const sn = nodeAt(src)
+  if !(sn is FuncDecl) || sn.fnName != "" || b < 0 { return false }
+  cwIxWant()
+  const w = cwOccWalk(b)
+  while cwOccNext(w) {
+    if cwIxKind[w.row] == CW_OCC_USE && cwUseCaptures(cwIxNode[w.row]) {
+      return true
+    }
   }
   false
 }
