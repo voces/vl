@@ -4357,9 +4357,9 @@ let elabResArgOf: {[i32]: i32} = Map()
 let elabResHands: {[i32]: i32[]} = Map()
 // Per call, the member of the record its callee returns that the call's value is used as (-1
 // for a value dropped); per holder binding, that member's function type.
-let elabResMembers: {[i32]: i32} = Map()
-let elabResHolderTys: {[i32]: i32} = Map()
-let elabResTys: {[i32]: i32} = Map()
+let elabResMembers: {[i32]: i32[]} = Map()
+let elabResHolderTys: {[i32]: i32[]} = Map()
+let elabResTys: {[i32]: i32[]} = Map()
 
 function elabResultScanReset() {
   elabResHolder = Map()
@@ -4471,26 +4471,11 @@ function elabResScanBlock(g: i32) {
 // `const` every read of which is the callee of a call at one of the record's signatures.
 function elabResultMembersNote() {
   for c in elabCallKeys.keys() {
-    const kc = elabCallInstFrom(c, -1)
-    const rec = if kc >= 0 { elabReturnedBundleSigs(kc) } else { [] }
-    if rec.length >= 2 {
-      let m = -2
-      if elabResStmt.get(c) ?? false { m = -1 }
-      const outer = elabResCalleeOf.get(c) ?? -1
-      if outer >= 0 { m = elabCallSigMember(outer, rec) }
-      const h = elabResHolder.get(c) ?? -1
-      if h >= 0 {
-        const through = elabResThrough.get(h) ?? []
-        if through.length > 0 && through.length == (elabResReads.get(h) ?? 0) {
-          m = elabCallSigMember(through[0], rec)
-          for t in through {
-            if elabCallSigMember(t, rec) != m { m = -2 }
-          }
-          if m >= 0 { elabResHolderTys[h] = rec[m] }
-        }
-      }
-      if m >= -1 { elabResMembers[c] = m }
-      if m >= 0 { elabResTys[c] = rec[m] }
+    const row = elabCallKeys[c] ?? []
+    let j = 0
+    while j + 1 < row.length {
+      elabResultMemberNote(c, row[j], row[j + 1])
+      j = j + 2
     }
   }
   for c in elabCallKeys.keys() {
@@ -4502,6 +4487,32 @@ function elabResultMembersNote() {
       j = j + 2
     }
   }
+  0
+}
+
+// For call `c` from instance `from` into instance `kc` returning a record: the member its value
+// is used as, keyed by that instance (slice A's one-signature uses).
+function elabResultMemberNote(c: i32, from: i32, kc: i32) {
+  const rec = if kc >= 0 { elabReturnedBundleSigs(kc) } else { [] }
+  if rec.length < 2 { return 0 }
+  let m = -2
+  if elabResStmt.get(c) ?? false { m = -1 }
+  const outer = elabResCalleeOf.get(c) ?? -1
+  if outer >= 0 { m = elabCallSigMember(outer, rec) }
+  const h = elabResHolder.get(c) ?? -1
+  if h >= 0 {
+    const through = elabResThrough.get(h) ?? []
+    if through.length > 0 && through.length == (elabResReads.get(h) ?? 0) {
+      m = elabCallSigMember(through[0], rec)
+      for t in through {
+        if elabCallSigMember(t, rec) != m { m = -2 }
+      }
+      if m >= 0 { elabTriplePut(elabResHolderTys, h, from, rec[m]) }
+    }
+  }
+  // A dropped value is stored as 1 and a member as itself plus 2, so -1 reads as no fact.
+  if m >= -1 { elabTriplePut(elabResMembers, c, from, m + 2) }
+  if m >= 0 { elabTriplePut(elabResTys, c, from, rec[m]) }
   0
 }
 
@@ -4769,18 +4780,37 @@ function elabCallSigMember(c: i32, rec: i32[]): i32 {
   -2
 }
 
-// The member call `c`, outside every instance, uses of the record its callee returns: its index,
-// -1 for a value dropped, -2 where the elaboration noted none.
-export function elabCallResultMember(c: i32): i32 {
-  elabResMembers.get(c) ?? -2
+// The member call `c`, under instance `k`, uses of the record its callee returns: its index, -1
+// for a value dropped, -2 where the elaboration noted none.
+export function elabCallResultMember(c: i32, k: i32): i32 {
+  if !elabResMembers.has(c) { return -2 }
+  const v = elabPairUnder(elabResMembers, c, k)
+  if v < 0 { -2 } else { v - 2 }
 }
 
+// Whether call `c` has a member fact under some instance, asked before resolving one.
+export function elabHasResultFact(c: i32): boolean { elabResMembers.has(c) }
+
 // The function type call `c`'s value is, as the member of a returned record it is used as; -1.
-export function elabCallResultTy(c: i32): i32 { elabResTys.get(c) ?? -1 }
+export function elabCallResultTy(c: i32, k: i32): i32 {
+  if elabResTys.has(c) { elabPairUnder(elabResTys, c, k) } else { -1 }
+}
+
+// Whether call `c`'s value is a member's type under some instance.
+export function elabHasResultTy(c: i32): boolean { elabResTys.has(c) }
 
 // The function type `const` binding `d` holds as one member of a returned record, or -1.
-export function elabHolderMemberTy(d: i32): i32 {
-  elabResHolderTys.get(d) ?? -1
+export function elabHolderMemberTy(d: i32, k: i32): i32 {
+  if elabResHolderTys.has(d) {
+    elabPairUnder(elabResHolderTys, d, k)
+  } else {
+    -1
+  }
+}
+
+// Whether `const` binding `d` holds one member's type under some instance.
+export function elabHasHolderMemberTy(d: i32): boolean {
+  elabResHolderTys.has(d)
 }
 
 // Whether call `c`'s callee is a read of a named function.
