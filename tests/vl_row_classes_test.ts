@@ -10,7 +10,7 @@ type Dump = {
   rc: number;
   rows: string[];
   arms: Map<string, { twin: number; codes: string }>;
-  types: Map<string, { row: number; variant: number }>;
+  types: Map<string, { row: number; variant: number; cls: string }>;
   armTwins: number[];
 };
 
@@ -30,18 +30,31 @@ const dump = (src: string): Dump => {
   for (let i = 0; i < n; i++) text += String.fromCharCode(e.rowDumpAt(i));
   const rows: string[] = [];
   const arms = new Map<string, { twin: number; codes: string }>();
-  const types = new Map<string, { row: number; variant: number }>();
+  const types = new Map<
+    string,
+    { row: number; variant: number; cls: string }
+  >();
   const armTwins: number[] = [];
   for (const line of text.split("\n")) {
-    const row = /^row (\d+) (\S+) decl=(\d) codes=(\S*)$/.exec(line);
-    if (row) rows[Number(row[1])] = `${row[2]} decl=${row[3]} codes=${row[4]}`;
-    const arm = /^arm (\d+) (\S+) twin=(-?\d+) codes=(\S*)$/.exec(line);
+    const row = /^row (\d+) (\S+) decl=(\d) heap=(-?\d+) codes=(\S*)$/.exec(
+      line,
+    );
+    if (row) rows[Number(row[1])] = `${row[2]} decl=${row[3]} codes=${row[5]}`;
+    const arm = /^arm (\d+) (\S+) twin=(-?\d+) heap=(-?\d+) codes=(\S*)$/.exec(
+      line,
+    );
     if (arm) {
-      arms.set(arm[2], { twin: Number(arm[3]), codes: arm[4] });
+      arms.set(arm[2], { twin: Number(arm[3]), codes: arm[5] });
       armTwins[Number(arm[1])] = Number(arm[3]);
     }
-    const ty = /^type (\S+) row=(-?\d+) variant=(-?\d+)$/.exec(line);
-    if (ty) types.set(ty[1], { row: Number(ty[2]), variant: Number(ty[3]) });
+    const ty = /^type (\S+) row=(-?\d+) variant=(-?\d+) class=(.*)$/.exec(line);
+    if (ty) {
+      types.set(ty[1], {
+        row: Number(ty[2]),
+        variant: Number(ty[3]),
+        cls: ty[4],
+      });
+    }
     if (line !== "" && !row && !arm && !ty) {
       throw new Error(`unparsed dump line: ${JSON.stringify(line)}`);
     }
@@ -231,6 +244,103 @@ Deno.test({
     if (bare < 0) {
       throw new Error(
         `want a second row storing r bare (0), got ${JSON.stringify(d.rows)}`,
+      );
+    }
+  },
+});
+
+// The record-row class (`recordRowClassOf`), computed before the elaboration: the classes must
+// agree with the rows wherever the rows say "one" or "two", except for D15152's three finer cases.
+const classOf = (d: Dump, name: string): string => {
+  const c = d.types.get(name)?.cls ?? "";
+  if (c === "") {
+    throw new Error(
+      `no class for ${name}: ${JSON.stringify([...d.types.entries()])}`,
+    );
+  }
+  return c;
+};
+
+Deno.test({
+  name: "row classes: C and D are one class with and without the second union",
+  ignore: !assertSeed(),
+  fn: () => {
+    for (const src of [CLASS_A, CLASS_A.replace("type V = D | S\n", "")]) {
+      const d = dump(src);
+      if (classOf(d, "C") !== classOf(d, "D")) {
+        throw new Error(
+          `want C and D one class, got ${classOf(d, "C")} vs ${
+            classOf(d, "D")
+          }`,
+        );
+      }
+    }
+  },
+});
+
+for (const [file, x, y] of APART) {
+  Deno.test({
+    name: `row classes: ${file} gives ${x} and ${y} two classes`,
+    ignore: !assertSeed(),
+    fn: () => {
+      const d = dump(Deno.readTextFileSync(new URL(file, CASES)));
+      if (classOf(d, x) === classOf(d, y)) {
+        throw new Error(
+          `want ${x} and ${y} two classes, got ${classOf(d, x)} for both`,
+        );
+      }
+    },
+  });
+}
+
+Deno.test({
+  name: "row classes: an intersection alias answers its record's class",
+  ignore: !assertSeed(),
+  fn: () => {
+    const d = dump(
+      "type AB = { a: i32 } & { b: i32 }\ntype C = { a: i32, b: i32 }\n" +
+        "const x: AB = { a: 1, b: 2 }\nconst y: C = { a: 3, b: 4 }\nprint(x.a + y.b)\n",
+    );
+    if (classOf(d, "AB") !== classOf(d, "C")) {
+      throw new Error(
+        `want AB and C one class, got ${classOf(d, "AB")} vs ${
+          classOf(d, "C")
+        }`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "row classes: a field-order pair is one class",
+  ignore: !assertSeed(),
+  fn: () => {
+    const d = dump(
+      'type PA = { a: i32, b: string }\ntype PB = { b: string, a: i32 }\nconst pa: PA = { a: 1, b: "x" }\n' +
+        'const pb: PB = { b: "y", a: 2 }\nprint(pa.a + pb.a)\n',
+    );
+    if (classOf(d, "PA") !== classOf(d, "PB")) {
+      throw new Error(
+        `want PA and PB one class, got ${classOf(d, "PA")} vs ${
+          classOf(d, "PB")
+        }`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "row classes: D15152, arms one union lays out at one row key apart today",
+  ignore: !assertSeed(),
+  fn: () => {
+    const d = dump(
+      'type K = "circle" | "round"\ntype A = { kind: K, r: i32 }\ntype B = { kind: string, r: i32 }\n' +
+        'type U = A | B\nconst a: A = { kind: "circle", r: 2 }\nconst u: U = a\nif u is A { print(u.r) }\n',
+    );
+    if (classOf(d, "A") === classOf(d, "B")) {
+      throw new Error(
+        "A and B now share a class: D15152's membership re-lay is folded in, so update this case and the row",
       );
     }
   },

@@ -13,7 +13,11 @@
 
 import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
-import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
+import {
+  mintCallSoleSet,
+  mintLamKeyedOf,
+  mintNestedPerEnclOf,
+} from "./check_mint"
 import { ftOwnTyParamHandedBack, ftOwnTyParamSharedBack } from "./check_fn_tag"
 import {
   mkNumTyped,
@@ -576,6 +580,7 @@ import {
   bundleHandMemberNote,
   bundleParamNote,
   bundleReset,
+  bundleRetParamNote,
   bundleTyNote,
 } from "./emit_bundle"
 import { repRowId, repRowOfTyStruct } from "./emit_rep"
@@ -4720,6 +4725,45 @@ function monoPinAnnSpelling(t: i32): string {
   nm
 }
 
+// Per un-keyed lambda `monoCloneLambdaSubst` shares across its encloser's instances, the binding of
+// the first instance that reaches it.
+let monoSharedLamAt: {[i32]: string} = Map()
+
+// Refuses lambda `fnIx` when a second instance of its encloser reaches it under another binding
+// while the elaboration minted it no key: its un-annotated parameters then take their types from
+// outside every instance, and the one lambda built for all of them cannot serve each (D15110).
+function monoSharedLamGuard(fnIx: i32, a: FuncDecl, tvV: string[]) {
+  if monoFnNameIsSourceNamed(a.fnName) || mintLamKeyedOf(fnIx) { return 0 }
+  // Only a parameter its checker type leaves open takes its type from outside the instances.
+  const lt = nodeTyIxOf(fnIx)
+  const lf = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+  if !(lf is TyFunc) { return 0 }
+  let open = false
+  let i = 0
+  while i < a.fnParams.length && i < lf.fnParamTypes.length {
+    const pn = nodeAt(a.fnParams[i])
+    if pn is Param && pn.parType < 0 && tyHasTyVar(lf.fnParamTypes[i]) {
+      open = true
+    }
+    i = i + 1
+  }
+  if !open { return 0 }
+  let key = ""
+  for v in tvV { key = key + v + ";" }
+  const was = monoSharedLamAt[fnIx] ?? ""
+  if was == "" {
+    monoSharedLamAt[fnIx] = key
+    return 0
+  }
+  if was == key { return 0 }
+  emitFailAt(
+    "emitProgram: this lambda is written inside a generic function and is one value for every "
+      + "instance of it, but its parameters take a different type in each instance — annotate its "
+      + "parameters, or declare it outside the generic function",
+    fnIx,
+  )
+}
+
 // Clone the lifted lambda at `fnIx` with every type-param-mentioning parameter and return
 // annotation substituted through this instance's binding, lift the clone into `fnStmts`,
 // and return its node index — or -1 when nothing substitutes. The body is shared with the
@@ -4749,10 +4793,16 @@ function monoCloneLambdaSubst(
     // correct at every pin. Returned before either ledger is touched: the prune reads them
     // to decide whether a template is still referenced, and a lambda that never became a
     // template must not appear in either.
-    if !monoLamNodeIsTemplateCore(fnIx, typarams) { return -1 }
+    if !monoLamNodeIsTemplateCore(fnIx, typarams) {
+      monoSharedLamGuard(fnIx, a, tvV)
+      return -1
+    }
     const ps: i32[] = []
     const psAny = monoLamSubstParams(a, fnIx, typarams, tvN, tvV, bN, bT, ps)
-    if psAny < 0 { return -1 }
+    if psAny < 0 {
+      monoSharedLamGuard(fnIx, a, tvV)
+      return -1
+    }
     let any = psAny > 0
     let nret = a.fnRet
     const rt = monoSubstAnnNode(a.fnRet, typarams, tvN, tvV, bN, bT)
@@ -4761,6 +4811,7 @@ function monoCloneLambdaSubst(
       any = true
     } else if rt == -2 {
       monoNoteLamNode(monoLamShared, fnIx)
+      monoSharedLamGuard(fnIx, a, tvV)
       return -1
     }
     // D943 — `any` asks whether a signature changed, and a capture-only template changes
@@ -4784,6 +4835,7 @@ function monoCloneLambdaSubst(
     }
     if !any && !capOnly && !bodyTP {
       monoNoteLamNode(monoLamShared, fnIx)
+      monoSharedLamGuard(fnIx, a, tvV)
       return -1
     }
     // An un-annotated return that rides the type parameter, annotated at the pin. The
@@ -10660,6 +10712,14 @@ function monoInstanceRet(
   pins: i32[],
 ): i32 {
   if fn.fnRet >= 0 && !monoAnnHasTyParam(fn.fnRet, -1, tps) { return fn.fnRet }
+  // A parameter pinned at a bundle's record and returned whole is returned as that record.
+  const bp = if fn.fnRet < 0 { monoReturnedBundlePin(fn, pins) } else { -1 }
+  if bp >= 0 {
+    const brow = monoBundleRowOf(bp)
+    if brow >= 0 && brow < sNames.length {
+      return synthTypeRefTy(sNames[brow], -1, bp)
+    }
+  }
   const r = monoRetRepOf(decl, fn, pins, elabRetOf(ek))
   if r < 0 {
     if fn.fnRet < 0 { return -1 }
@@ -10678,6 +10738,69 @@ function monoInstanceRet(
   // A literal union spelled by its alias carries the alias's row, whose rep the name promises.
   const at = if tyIsLitUnion(r) { litUnionAliasTyOfLitTexts(tyLitMemberTexts(r)) } else { -1 }
   synthTypeRefTy(nm, -1, if at >= 0 { at } else { r })
+}
+
+// The bundle record a parameter of `fn` is pinned at in `pins`, where the body returns that
+// parameter whole; -1 for none.
+function monoReturnedBundlePin(fn: FuncDecl, pins: i32[]): i32 {
+  const i = monoReturnedBundleParam(fn, pins)
+  if i >= 0 { pins[i] } else { -1 }
+}
+
+// The index of the parameter of `fn` pinned at a bundle's record in `pins` that the body returns
+// whole, or -1.
+function monoReturnedBundleParam(fn: FuncDecl, pins: i32[]): i32 {
+  if fn.fnRet >= 0 { return -1 }
+  let i = 0
+  while i < fn.fnParams.length && i < pins.length {
+    if (
+      monoIsBundleTy(pins[i])
+      && monoBodyReturnsParam(fn.fnBody, fn.fnParams[i])
+    ) {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether pin `t` is a bundle's record, matched by row since a pin is spelled afresh.
+function monoIsBundleTy(t: i32): boolean {
+  const r = monoBundleRowOf(t)
+  if r < 0 { return false }
+  for b in monoBundleTys {
+    if monoBundleRowOf(b) == r { return true }
+  }
+  false
+}
+
+// Whether function body `body` returns parameter `par` whole, by `return` or as its last
+// statement; nested functions aside.
+function monoBodyReturnsParam(body: i32, par: i32): boolean {
+  const b = nodeAt(body)
+  if b is Block && b.blkStmts.length > 0 {
+    if monoIsParamRead(b.blkStmts[b.blkStmts.length - 1], par) { return true }
+  }
+  monoStmtReturnsParam(body, par)
+}
+
+// Whether statement `x` holds a `return` of parameter `par`, nested functions aside.
+function monoStmtReturnsParam(x: i32, par: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is RetStmt { return monoIsParamRead(n.retArg, par) }
+  if (
+    n is Block
+    || n is IfStmt
+    || n is WhileStmt
+    || n is ForIn
+    || n is ForRange
+  ) {
+    for k in nodeChildren(x) {
+      if monoStmtReturnsParam(k, par) { return true }
+    }
+  }
+  false
 }
 
 // Result `r` of the instance of `decl` at parameter pins `pins`, or the record pin every result
@@ -11465,9 +11588,11 @@ function monoMakeInstanceGo(
     const ekN0: string[] = []
     const ekT0: i32[] = []
     monoJoinBinding(letBN, letBT, holeN, holeT, ekN0, ekT0)
+    // A type-testing body's instance is demanded at the exact binding its key names, not the
+    // rep its pin spells, which merges a literal-typed record field with its base (D4088).
     const ekN1: string[] = []
     const ekT1: i32[] = []
-    monoJoinBinding(ekN0, ekT0, k.exSubN, k.exSubT, ekN1, ekT1)
+    monoJoinBinding(k.exSubN, k.exSubT, ekN0, ekT0, ekN1, ekT1)
     const ekN: string[] = []
     const ekT: i32[] = []
     elabLamInheritedOwn(monoOrigNode[origFe], ekN1, ekT1, ekN, ekT)
@@ -11554,6 +11679,8 @@ function monoMakeInstanceGo(
     )
     const nfn = monoMakeInstanceFunc(fn, origFe, nretW, instBody, instName, nps)
     if retWiden != "" { monoRetWidenFns[nfn] = true }
+    const rbp = monoReturnedBundleParam(fn, pinnedTyIx)
+    if rbp >= 0 { bundleRetParamNote(nfn, rbp) }
     cadWalkFn[cadWalkFn.length - 1] = nfn
     cadPatchPending(nfn)
     const instFe = monoMakeInstanceInstall(
@@ -23219,6 +23346,55 @@ function monoConstFnCopy(d: i32): boolean {
   fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl
 }
 
+// `monoParamReadOtherThanCalled` over function body `body`, where with `fwd` a return of `par`
+// from the function itself, by `return` or as the body's last statement, is not counted either.
+function monoBodyReadsOtherThanCalled(
+  body: i32,
+  par: i32,
+  fwd: boolean,
+): boolean {
+  const b = nodeAt(body)
+  if !fwd || !(b is Block) {
+    return monoParamReadOtherThanCalled(body, par, true, fwd, fwd)
+  }
+  let i = 0
+  while i < b.blkStmts.length {
+    const st = b.blkStmts[i]
+    const last = i == b.blkStmts.length - 1
+    if !(last && monoIsParamRead(st, par)) && monoStmtReadsOther(st, par) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether node `x` is a read of parameter `par`, under parentheses.
+function monoIsParamRead(x: i32, par: i32): boolean {
+  const u = unwrapParen(x)
+  u >= 0 && nodeAt(u) is Ident && identDeclOf(u) == par
+}
+
+// `monoBodyReadsOtherThanCalled` for statement `x` of the function's own body.
+function monoStmtReadsOther(x: i32, par: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is RetStmt && monoIsParamRead(n.retArg, par) { return false }
+  if (
+    n is Block
+    || n is IfStmt
+    || n is WhileStmt
+    || n is ForIn
+    || n is ForRange
+  ) {
+    for k in nodeChildren(x) {
+      if monoStmtReadsOther(k, par) { return true }
+    }
+    return false
+  }
+  monoParamReadOtherThanCalled(x, par, true, true, true)
+}
+
 // `monoPinHoleParam`'s bundle: where the callee's instance calls the hole lambda literal `arg`,
 // its argument `i`, at two or more signatures, builds the lambda at each and pins the parameter
 // at the anonymous record holding one closure per signature. 0, -1 on a failure, or 1 where the
@@ -23238,7 +23414,7 @@ function monoBundlePin(
   // The callee reads the record only as a callee, or hands it whole to a named function: any other
   // read wants one closure.
   const fwd = fsModeOf() == FS_COMPILE
-  if monoParamReadOtherThanCalled(fn.fnBody, par, true, fwd, fwd) { return 1 }
+  if monoBodyReadsOtherThanCalled(fn.fnBody, par, fwd) { return 1 }
   const at = pinTys.length
   const rc = monoBundlePinArg(arg, i, callIx, ctx, sigs, pinned, pinTys)
   // The record each parameter key is pinned at, read by a hand of that parameter.
@@ -28751,6 +28927,7 @@ export function monomorphize(stmts: i32[]) {
   }
   monoLamPinned = []
   monoLamShared = []
+  monoSharedLamAt = Map()
   monoNamedTmplNode = []
   monoNamedTmplSlot = []
   let any = false
