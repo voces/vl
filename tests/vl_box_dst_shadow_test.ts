@@ -504,6 +504,33 @@ Deno.test({
     ),
 });
 
+// A map read narrowed by an `is` test, coalesced with a default its values hold: the read is one
+// fused lookup built at the map's value union, so the default is boxed there.
+const MAPREAD = `function pickS(n: i32): string | i32 | null {
+  if n > 0 { return "s" }
+  return null
+}
+function run(n: i32) {
+  const m: { [string]: string | i32 | null } = Map()
+  m["k"] = pickS(n)
+  if !(m["k"] is i32) { print(m["k"] ?? "N") }
+}
+run(1)
+run(0)
+`;
+
+Deno.test({
+  name: "box-dst shadow: a fused map read's default takes the map's value union",
+  ignore,
+  fn: () =>
+    expectRows(
+      "mapread",
+      MAPREAD,
+      DROP_NONE,
+      "agree=3; nested agree=3; nested value already a box=1; value already a box=1",
+    ),
+});
+
 // A record literal with a null field inside a list literal is re-typed to its destination, and
 // its fields' box destinations are recorded beside that re-type (D14978). The last three spellings
 // already agreed through another producer.

@@ -73,6 +73,14 @@ rep instance is unreached. If it does not, the twin is unreached. #5950's check-
 until this lands, and the twin then serves the functions it excludes (a function stored in a list,
 or handed on as a value other than to a parameter only ever called, which D15017 follows).
 
+**Status: its witness is decided in the check, and the twin is not built.** The stored spelling
+(`take(id); const fs = [take]; fs[0](id)`) reads like D15017: a `const` list literal of named
+functions, read only as the base of calls through an element, hands each such call's arguments to
+its members' parameters (`ftReachHandSets`), and an argument of such a call is a hand to an
+un-annotated parameter (`ftListCallHoleArg`), allowed only where no call reaching a member hands
+that parameter a set outside the one decided (D15019's hazard). The twin stays the design for a
+list the check cannot see through: one written, pushed onto, or read as a value.
+
 ## First slice: (A)
 
 **Status: built.** `elabListMemberSigs` (emit_elab.vl) mints the members as candidates
