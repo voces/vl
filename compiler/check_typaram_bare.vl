@@ -1,0 +1,68 @@
+// Whether a function names a type parameter only as the whole annotation of some parameters,
+// the scan the check records per declaration (`tyParamBareOnlyNote`) and mono reads back.
+
+import {
+  AsExpr,
+  Call,
+  FuncDecl,
+  IsExpr,
+  LetDecl,
+  P,
+  Param,
+  TypeRef,
+  callHasTyArgs,
+  nodeAt,
+  nodeChildren,
+} from "./ast"
+import { monoAnnHasTyParam } from "./emit_base"
+import { isVarTyIxOf } from "./check_list_union"
+import { paramCopySeedOf } from "./check_elab_cap"
+
+// Whether `fn` names type parameter `tp` only as the whole annotation of some parameters: not
+// in its return type, another annotation, an `is`/`as` or a call's type arguments. The check
+// records it per declaration (`tyParamBareOnlyNote`), which every reader asks.
+export function tyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
+  const tps: string[] = [tp]
+  const bare: i32[] = []
+  for pIx in fn.fnParams {
+    const p = nodeAt(pIx)
+    if p is Param && p.parType >= 0 { bare.push(p.parType) }
+  }
+  // A copy of a parameter takes that parameter's pin, so its annotation reads `tp` bare too.
+  const walk: i32[] = [fn.fnBody]
+  while walk.length > 0 {
+    const ix = walk.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is LetDecl && paramCopySeedOf(fn, ix) >= 0 { bare.push(n.letType) }
+      for c in nodeChildren(ix) { walk.push(c) }
+    }
+  }
+  const stack: i32[] = []
+  for pIx in fn.fnParams { stack.push(pIx) }
+  stack.push(fn.fnRet)
+  stack.push(fn.fnBody)
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is TypeRef && monoAnnHasTyParam(ix, -1, tps) {
+        let ok = n.tyName == tp
+        if ok {
+          ok = false
+          for x in bare {
+            if x == ix { ok = true }
+          }
+        }
+        if !ok { return false }
+      }
+      if n is IsExpr && monoAnnHasTyParam(ix, isVarTyIxOf(ix), tps) {
+        return false
+      }
+      if n is AsExpr && monoAnnHasTyParam(ix, -1, tps) { return false }
+      if n is Call && callHasTyArgs(ix) { return false }
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  true
+}
