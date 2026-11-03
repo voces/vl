@@ -19,12 +19,14 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { COMPILER, exists, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
 if (GATED && !ENABLED) {
-  console.warn("[vl-emit-diag-position] skipped — missing vl binary or seed wasm.");
+  console.warn(
+    "[vl-emit-diag-position] skipped — missing vl binary or seed wasm.",
+  );
 }
 
 const checkCodegen = async (
@@ -56,57 +58,50 @@ const errorBlock = (out: string): string => {
   return lines.slice(start, end).join("\n");
 };
 
-// A COLLECT-phase refusal: `A` is a union arm whose OWN field is typed as `A`, so its layout is
-// not finished being decided when the field asks for a rep, and the refusal fires while the
-// declarations are being registered — before any function body arms a cursor.
-//
-// THE NESTED-STRUCT ARM FIELD USED TO BE THIS WITNESS and D1579 made it RUN, then the
-// self-referential arm (D3329), a struct holding it (D15095) and a struct holding an arm that
-// recurses through a map value (D15097) did the same: each time the guard said so rather than
-// passing green over a compiling program. A struct holding an arm whose map value is a declared
-// record is the collect phase's remaining loud refusal (D15098).
-const COLLECT_WITNESS = `type E = { msg: string }
-type R = { r: i32 }
-// A STRUCT HOLDING AN ARM WHOSE MAP VALUE IS A DECLARED RECORD: the arm's twin row spells \`R\`
-// by its shape and the arm's own row by its name, so the two key different map slots and the
-// refusal fires while \`collectS\` registers this declaration (D15098).
-type Q = { o: A }
-type A = { n: i32, g: Map<string, R> }
-const q: Q = { o: { n: 1, g: Map() } }
-
-function h(ok: boolean): A | E {
-  if !ok { return { msg: "e" } }
-  return { n: 1, g: Map() }
+// A BODY-phase refusal: a function returning a parameter it calls at two signatures, called
+// where its result is used at one of them (D15144), anchored at that call on line 7. The collect
+// phase has no positioned refusal a check-clean program reaches: the last one ran (D15098), and
+// D15150's refusal is raised there with no position at all (D15154). When D15154 is fixed,
+// D15150's witness is the collect-phase case again.
+const BODY_WITNESS = `function lap(f) {
+  print(f(2.5))
+  print(f(3))
+  return f
 }
-print(h(true) is A)
+function go(k: i32) {
+  const r = lap((a) => a + k)
+  print(r(4))
+  print(r(1.5))
+}
+go(1)
 `;
 
 Deno.test({
-  name: "vl-emit-diag-position: a COLLECT-phase emit refusal carries file:line:col",
+  name:
+    "vl-emit-diag-position: a function body's emit refusal carries file:line:col",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_emit_pos_" });
     try {
-      await Deno.writeTextFile(`${dir}/collect.vl`, COLLECT_WITNESS);
-      const r = await checkCodegen("collect.vl", dir);
+      await Deno.writeTextFile(`${dir}/body.vl`, BODY_WITNESS);
+      const r = await checkCodegen("body.vl", dir);
       if (!r.out.includes("emit error")) {
         throw new Error(
-          "the collect-phase witness no longer reaches an emit refusal, so this guard is " +
-            "measuring nothing — replace COLLECT_WITNESS with another program that refuses " +
-            `during collectU/collectS.\n${r.out}`,
+          "the top-level witness no longer reaches an emit refusal, so this guard is " +
+            "measuring nothing — replace BODY_WITNESS with another program whose refusal " +
+            `carries a position.\n${r.out}`,
         );
       }
       const blk = errorBlock(r.out);
-      if (!/at \S*collect\.vl:\d+:\d+/.test(blk)) {
+      if (!/at \S*body\.vl:\d+:\d+/.test(blk)) {
         throw new Error(
-          `expected the emit refusal to carry collect.vl:<line>:<col>, got:\n${blk}`,
+          `expected the emit refusal to carry body.vl:<line>:<col>, got:\n${blk}`,
         );
       }
-      // The anchor is the DECLARATION whose field has no rep (`Q` on line 6), not the
-      // declaration's own name and not the last function in the file.
-      if (!/at \S*collect\.vl:6:\d+/.test(blk)) {
+      // The anchor is the refused call on line 7, not the last statement in the file.
+      if (!/at \S*body\.vl:7:\d+/.test(blk)) {
         throw new Error(
-          `expected the anchor on line 6 (the offending declaration), got:\n${blk}`,
+          `expected the anchor on line 7 (the refused call), got:\n${blk}`,
         );
       }
     } finally {
@@ -116,24 +111,22 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-emit-diag-position: a refusal inside an imported module names THAT file",
+  name:
+    "vl-emit-diag-position: a refusal inside an imported module names THAT file",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_emit_mod_" });
     try {
-      // `lib.vl` carries the same collect-phase refusal, on its own line 6. `main.vl` is two
-      // lines, so a merged-module line would land past the end of the file it names — the
-      // shape the reporter bisected the wrong file for.
+      // `lib.vl` carries the same refusal, on its own line 7. `main.vl` is two lines, so a
+      // merged-module line would land past the end of the file it names — the shape the
+      // reporter bisected the wrong file for.
       await Deno.writeTextFile(
         `${dir}/lib.vl`,
-        COLLECT_WITNESS
-          .replace("type E =", "export type E =")
-          .replace("function h", "export function h")
-          .replace("print(h(true) is A)\n", ""),
+        BODY_WITNESS + "export function one(): i32 { 1 }\n",
       );
       await Deno.writeTextFile(
         `${dir}/main.vl`,
-        'import { E, h } from "./lib"\nprint(h(true) is E)\n',
+        'import { one } from "./lib"\nprint(one())\n',
       );
       const r = await checkCodegen("main.vl", dir);
       if (!r.out.includes("emit error")) {
