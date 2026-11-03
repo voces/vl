@@ -61,16 +61,17 @@ const errorBlock = (out: string): string => {
 // declarations are being registered — before any function body arms a cursor.
 //
 // THE NESTED-STRUCT ARM FIELD USED TO BE THIS WITNESS and D1579 made it RUN, then the
-// self-referential arm (D3329) and a struct holding it (D15095) did the same: each time the
-// guard said so rather than passing green over a compiling program. A struct holding an arm
-// that recurses through a map value is the collect phase's remaining loud refusal (D15097).
+// self-referential arm (D3329), a struct holding it (D15095) and a struct holding an arm that
+// recurses through a map value (D15097) did the same: each time the guard said so rather than
+// passing green over a compiling program. A struct holding an arm whose map value is a declared
+// record is the collect phase's remaining loud refusal (D15098).
 const COLLECT_WITNESS = `type E = { msg: string }
-
-// A STRUCT HOLDING AN ARM THAT RECURSES THROUGH A MAP VALUE: \`collectS\` codes \`Q.o\`, and
-// the map value inside the arm's row has no slot yet, so the refusal fires while \`collectS\`
-// is registering this declaration (D15097).
+type R = { r: i32 }
+// A STRUCT HOLDING AN ARM WHOSE MAP VALUE IS A DECLARED RECORD: the arm's twin row spells \`R\`
+// by its shape and the arm's own row by its name, so the two key different map slots and the
+// refusal fires while \`collectS\` registers this declaration (D15098).
 type Q = { o: A }
-type A = { n: i32, g: Map<string, A> }
+type A = { n: i32, g: Map<string, R> }
 const q: Q = { o: { n: 1, g: Map() } }
 
 function h(ok: boolean): A | E {
