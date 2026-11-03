@@ -503,3 +503,112 @@ Deno.test({
       "agree=1; nested agree=1; nested value already a box=1; value already a box=1",
     ),
 });
+
+// A record literal with a null field inside a list literal is re-typed to its destination, and
+// its fields' box destinations are recorded beside that re-type (D14978). The last three spellings
+// already agreed through another producer.
+const NULL_HOLE_LIST_LITS: [string, string, string][] = [
+  ["an inferred function's local list", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+type GL = { g: Circle[] }
+function mk() {
+  const lv1 = [{ r: null }]
+  return lv1
+}
+const xs: Circle[] = mk()
+print(xs[0].r ?? 5)
+`, "agree=1; nested agree=1"],
+  ["an annotated binding", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+const xs: Circle[] = [{ r: null }]
+print(xs[0].r ?? 5)
+`, "agree=1; nested agree=1"],
+  ["a function-local binding", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+function mk(): i32 {
+  const lv1: Circle[] = [{ r: null }]
+  return lv1[0].r ?? 5
+}
+print(mk())
+`, "agree=1; nested agree=1"],
+  ["a declared list return", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+function mk(): Circle[] {
+  return [{ r: null }]
+}
+print(mk()[0].r ?? 5)
+`, "agree=1; nested agree=1"],
+  ["a list re-delivered from a binding", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+const lv1: Circle[] = [{ r: null }]
+const xs: Circle[] = lv1
+print(xs[0].r ?? 5)
+`, "agree=1; nested agree=1"],
+  ["a map value", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+type GL = { g: Circle[] }
+const m: Map<string, Circle[]> = Map()
+m.set("a", [{ r: null }])
+print((m.get("a") ?? [])[0].r ?? 5)
+`, "agree=1; nested agree=1"],
+  ["a nested list", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+type GL = { g: Circle[] }
+const xs: Circle[][] = [[{ r: null }]]
+print(xs[0][0].r ?? 5)
+`, "agree=1; nested agree=1"],
+  ["an assigned let", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+type GL = { g: Circle[] }
+let xs: Circle[] = []
+xs = [{ r: null }]
+print(xs[0].r ?? 5)
+`, "agree=1; nested agree=1"],
+  ["an argument", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+type GL = { g: Circle[] }
+function f(xs: Circle[]): i32 { xs[0].r ?? 5 }
+print(f([{ r: null }]))
+`, "agree=1; nested agree=1"],
+  ["a union-element list", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+type GL = { g: Circle[] }
+const xs: Shape[] = [{ r: null }]
+const c = xs[0]
+if c is Circle { print(c.r ?? 5) }
+`, "agree=1; nested agree=3; nested value already a box=1; value already a box=1"],
+  ["a record field", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+type GL = { g: Circle[] }
+const q: GL = { g: [{ r: null }] }
+print(q.g[0].r ?? 5)
+`, "agree=1; nested agree=1"],
+  ["a bare record binding", `type Shape = Circle | Sq
+type Sq = { s: i32 }
+type Circle = { r: i32 | null }
+function mk(): Circle {
+  const c: Circle = { r: null }
+  return c
+}
+print(mk().r ?? 5)
+`, "agree=1; nested agree=1"],
+];
+
+for (const [what, src, want] of NULL_HOLE_LIST_LITS) {
+  Deno.test({
+    name: `box-dst shadow: a null-field record in a list literal at ${what}`,
+    ignore,
+    fn: () => expectRows("nullholelist", src, DROP_NONE, want),
+  });
+}
