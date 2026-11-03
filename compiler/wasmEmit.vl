@@ -1169,6 +1169,7 @@ import {
   listPayloadStashSlot,
   litAtomCastSlot,
   nulNicheBoxSlot,
+  numCrossEqSlot,
   numLitCastSlot,
   objOrderStashSlot,
   spreadDstBackSlot,
@@ -9739,6 +9740,17 @@ function emitUnionConcreteEq(
   // Without the string leg above a `K | i32` box statically answers `u == k` false: the banked
   // member kinds carry only `i32`, so the arm that holds the value looks absent.
   if !eqHasArm {
+    // A number arm the operand widens to or from compares by value (D15090).
+    const cross = emitUnionConcreteNumCross(
+      body,
+      boxIx,
+      otherIx,
+      eak,
+      isNe,
+      uname,
+      fnIx,
+    )
+    if cross != 0 { return if cross < 0 { -1 } else { 0 } }
     // No arm has the other operand's rep: the box can never hold such a value.
     if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
@@ -10069,6 +10081,21 @@ function emitUnionBoxEqStaged(
   uname: string,
   fnIx: i32,
 ) {
+  emitUnionBoxEqStagedX(body, arms, vis, aks, aks, isNe, uname, fnIx)
+}
+
+// `emitUnionBoxEqStaged` where the right operand's union has number arms of kinds `rAks`, which
+// a left number arm of another width compares against by value (D15090).
+function emitUnionBoxEqStagedX(
+  body: u8[],
+  arms: string[],
+  vis: i32[],
+  aks: i32[],
+  rAks: i32[],
+  isNe: boolean,
+  uname: string,
+  fnIx: i32,
+) {
   const sl = unionEqStashSlot()
   const sr = unionEqStashSlot2()
   fbLocalSet(sr) // pops the right operand, leaving the left on top
@@ -10109,6 +10136,9 @@ function emitUnionBoxEqStaged(
     e = e + 1
   }
   fbElse() // tags differ
+  // Two number arms compare by value at the wider of the two (D15090).
+  const numPairs = emitUnionNumCrossArms(sl, sr, aks, rAks)
+  if numPairs < 0 { return -1 }
   if unionCloArmCount(aks) >= 2 {
     // A function value's identity is its declaration, whichever function-type arm holds it.
     emitUnionCloTagIn(sl, vis, aks, uname, arms)
@@ -10125,9 +10155,181 @@ function emitUnionBoxEqStaged(
   } else {
     fbI32Const(0)
   }
+  let np = 0
+  while np < numPairs {
+    fbEnd()
+    np = np + 1
+  }
   fbEnd()
   if isNe { fbI32Eqz() }
   0
+}
+
+// `emitUnionConcreteEq` where the box's union has no arm of the operand's number kind `eak` but
+// has arms of a kind it widens to or from: the box and then the operand are evaluated once, and
+// each such arm compares the two values at the wider kind; any other arm is unequal. Returns 1
+// handled, 0 when no arm qualifies, -1 on error.
+function emitUnionConcreteNumCross(
+  body: u8[],
+  boxIx: i32,
+  otherIx: i32,
+  eak: i32,
+  isNe: boolean,
+  uname: string,
+  fnIx: i32,
+): i32 {
+  const atoms: string[] = []
+  unionArmsOf(uname, atoms)
+  const kas: i32[] = []
+  for a in atoms {
+    const ka = valueAtomKind(a)
+    if ka != eak && numEqOpOfKind(wideKindOf(ka, eak)) >= 0 { kas.push(ka) }
+  }
+  if kas.length == 0 { return 0 }
+  const bs = unionAsBoxSlot()
+  const os = numCrossEqSlot(eak)
+  if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
+  fbLocalSet(bs)
+  if emitUnionEqOther(body, otherIx, eak, fnIx) < 0 { return -1 }
+  fbLocalSet(os)
+  for ka in kas {
+    fbLocalGet(bs)
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, scalarTagOfKind(ka))
+    fbI32Bin(70) // i32.eq
+    fbIf(127)
+    fbLocalGet(bs)
+    if emitUnionUnboxTail(ka) < 0 { return -1 }
+    const upL = widenConvOpOfKinds(ka, eak)
+    if upL >= 0 { wU8(upL) }
+    fbLocalGet(os)
+    const upR = widenConvOpOfKinds(eak, ka)
+    if upR >= 0 { wU8(upR) }
+    wU8(numEqOpOfKind(wideKindOf(ka, eak)))
+    fbElse()
+  }
+  fbI32Const(0)
+  for _ka in kas { fbEnd() }
+  if isNe { fbI32Eqz() }
+  1
+}
+
+// The kind two number kinds compare at: the one the other widens to, or -1 when neither does.
+function wideKindOf(a: i32, b: i32): i32 {
+  if widenConvOpOfKinds(a, b) >= 0 { return b }
+  if widenConvOpOfKinds(b, a) >= 0 { return a }
+  -1
+}
+
+// For each number atom of `lAtoms` and a different one of `rAtoms` one widens to the other, an
+// `if` on the two operands holding exactly that pair, comparing the values at the wider type,
+// each left open on its `else`. Returns how many it opened, or -1 on error.
+function emitUnionUnionNumCross(
+  body: u8[],
+  lIx: i32,
+  rIx: i32,
+  lAtoms: string[],
+  rAtoms: string[],
+  fnIx: i32,
+): i32 {
+  let opened = 0
+  for la in lAtoms {
+    for ra in rAtoms {
+      const ka = valueAtomKind(la)
+      const kb = valueAtomKind(ra)
+      const upL = widenConvOpOfKinds(ka, kb)
+      const upR = widenConvOpOfKinds(kb, ka)
+      if ka != kb && (upL >= 0 || upR >= 0) {
+        let wide = kb
+        if upR >= 0 { wide = ka }
+        const eqOp = numEqOpOfKind(wide)
+        if eqOp >= 0 {
+          if emitExpr(body, lIx, fnIx) < 0 { return -1 }
+          fbStructGet(uBoxIdx, 0)
+          fbI32Rel(RS_TAG, scalarTagOfKind(ka))
+          fbI32Bin(70) // i32.eq
+          if emitExpr(body, rIx, fnIx) < 0 { return -1 }
+          fbStructGet(uBoxIdx, 0)
+          fbI32Rel(RS_TAG, scalarTagOfKind(kb))
+          fbI32Bin(70) // i32.eq
+          fbI32And()
+          fbIf(127)
+          if emitExpr(body, lIx, fnIx) < 0 { return -1 }
+          fbStructGet(uBoxIdx, 1)
+          if emitUnionPayloadUnbox(body, ka) < 0 { return -1 }
+          if upL >= 0 { wU8(upL) }
+          if emitExpr(body, rIx, fnIx) < 0 { return -1 }
+          fbStructGet(uBoxIdx, 1)
+          if emitUnionPayloadUnbox(body, kb) < 0 { return -1 }
+          if upR >= 0 { wU8(upR) }
+          wU8(eqOp)
+          fbElse()
+          opened = opened + 1
+        }
+      }
+    }
+  }
+  opened
+}
+
+// For each left number arm of `aks` and right one of `rAks` one widens to the other, an `if` on
+// the boxes parked in `sl` and `sr` holding exactly that pair, comparing the two values at the
+// wider type, each left open on its `else`. Returns how many it opened, or -1 on error.
+function emitUnionNumCrossArms(sl: i32, sr: i32, aks: i32[], rAks: i32[]): i32 {
+  let opened = 0
+  for ka in aks {
+    for kb in rAks {
+      if ka != kb && emitUnionNumCrossArm(sl, sr, ka, kb) {
+        opened = opened + 1
+      }
+    }
+  }
+  opened
+}
+
+// One arm of `emitUnionNumCrossArms` for left kind `ka` against right kind `kb`; false, and
+// nothing emitted, when neither widens to the other.
+function emitUnionNumCrossArm(sl: i32, sr: i32, ka: i32, kb: i32): boolean {
+  const upL = widenConvOpOfKinds(ka, kb)
+  const upR = widenConvOpOfKinds(kb, ka)
+  if upL < 0 && upR < 0 { return false }
+  let wide = kb
+  if upR >= 0 { wide = ka }
+  const eqOp = numEqOpOfKind(wide)
+  if eqOp < 0 { return false }
+  fbLocalGet(sl)
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, scalarTagOfKind(ka))
+  fbI32Bin(70) // i32.eq
+  fbLocalGet(sr)
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, scalarTagOfKind(kb))
+  fbI32Bin(70) // i32.eq
+  fbI32And()
+  fbIf(127)
+  fbLocalGet(sl)
+  if emitUnionUnboxTail(ka) < 0 { return false }
+  if upL >= 0 { wU8(upL) }
+  fbLocalGet(sr)
+  if emitUnionUnboxTail(kb) < 0 { return false }
+  if upR >= 0 { wU8(upR) }
+  wU8(eqOp)
+  fbElse()
+  true
+}
+
+// The `eq` opcode of number kind `k` (`i64`, `f32` or `f64`, the kinds a widening reaches), or -1.
+function numEqOpOfKind(k: i32): i32 {
+  if k == 3 {
+    return 81 // 0x51 i64.eq
+  }
+  if k == 4 {
+    return 97 // 0x61 f64.eq
+  }
+  if k == 5 {
+    return 91 // 0x5b f32.eq
+  }
+  -1
 }
 
 // How many of a union's arms are function values (atom kind 11).
@@ -10518,9 +10720,22 @@ function emitUnionUnionEq(
       && rname != ""
       && unionBoxEqColumns(lname, sArms, sVis, sAks)
     ) {
+      const rKs: i32[] = []
+      const rAtomsS: string[] = []
+      unionArmsOf(rname, rAtomsS)
+      for ra in rAtomsS { rKs.push(valueAtomKind(ra)) }
       if emitExpr(body, lIx, fnIx) < 0 { return -1 }
       if emitExpr(body, rIx, fnIx) < 0 { return -1 }
-      return emitUnionBoxEqStaged(body, sArms, sVis, sAks, isNe, lname, fnIx)
+      return emitUnionBoxEqStagedX(
+        body,
+        sArms,
+        sVis,
+        sAks,
+        rKs,
+        isNe,
+        lname,
+        fnIx,
+      )
     }
     return emitFail(
       "emitProgram: union `==` over a non-binding union value is not supported yet",
@@ -10680,6 +10895,16 @@ function emitUnionUnionEq(
     fbElse() // left holds an earlier arm → recurse down the chain
     k = k - 1
   }
+  // Two number arms the sides do not share compare by value at the wider one (D15090).
+  const crossOpened = emitUnionUnionNumCross(
+    body,
+    lIx,
+    rIx,
+    lAtoms,
+    rAtoms,
+    fnIx,
+  )
+  if crossOpened < 0 { return -1 }
   // Chain bottom: bare tag equality (null arm / non-shared arms).
   if emitExpr(body, lIx, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 0)
@@ -10688,7 +10913,7 @@ function emitUnionUnionEq(
   fbI32Bin(70) // 0x46 i32.eq
   // Close every arm's outer `if` frame.
   let c = 0
-  while c < arms.length {
+  while c < arms.length + crossOpened {
     fbEnd()
     c = c + 1
   }
