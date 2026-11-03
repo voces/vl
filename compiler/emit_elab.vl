@@ -4519,6 +4519,10 @@ export function elabRun() {
   elabReprKeys = Map()
   elabGuessKeys = Map()
   elabCandKeys = Map()
+  elabListSigRows = []
+  elabListSigNames = []
+  elabListSigTys = []
+  elabListSigReps = []
   ekDecl = []
   ekNames = []
   ekTys = []
@@ -4810,6 +4814,16 @@ export function elabRun() {
   elabNestedPerEncl()
   elabSoleRekey()
   elabListMemberSigs()
+  let lr = 0
+  while lr < elabListSigRows.length {
+    elabListSigRow(
+      elabListSigRows[lr],
+      elabListSigNames[lr],
+      elabListSigTys[lr],
+      elabListSigReps[lr],
+    )
+    lr = lr + 1
+  }
   elabPinsClosedSet(true)
   elabRunDone = true
 }
@@ -5374,6 +5388,127 @@ function elabMemberAt(m: i32, ats: i32[]): i32 {
   -1
 }
 
+// The root rows `elabSetRepRow` built, each with its names, types and reps, which
+// `elabListSigRow` reads once every instance is in.
+let elabListSigRows: i32[] = []
+let elabListSigNames: string[][] = []
+let elabListSigTys: i32[][] = []
+let elabListSigReps: i32[][] = []
+
+// Call `ix`'s root row `names`/`tys`, at `rep` but with each list binding of an untagged set handed
+// to it taken at the signature the calls through its elements give (`elabListCallSig`), enqueued
+// as a candidate when that moves a type: mono types such a list there where the set's rep is
+// not that signature (D15062).
+function elabListSigRow(ix: i32, names: string[], tys: i32[], rep: i32[]) {
+  const cn = nodeAt(ix)
+  const d = elabCallDeclOf(ix)
+  if !(cn is Call) || d < 0 || rep.length != tys.length { return 0 }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) { return 0 }
+  const out = rep.slice(0)
+  let moved = false
+  elabListSigFound = []
+  elabListSigFoundTy = []
+  let pi = 0
+  while pi < f.fnParams.length && pi < cn.callArgs.length {
+    const nm = elabParamTyVarName(f, pi)
+    const j = if nm == "" { -1 } else { strListIndexOf(names, nm) }
+    const ax = parenPeelIx(cn.callArgs[pi])
+    const isId = ax >= 0 && ax < P.nodes.length && nodeAt(ax) is Ident
+    const bd = if j >= 0 && isId { identDeclOf(ax) } else { -1 }
+    const lt = if j >= 0 { tyAt(tys[j]) } else { tyAt(TY_VOID) }
+    if bd >= 0 && lt is TyArray {
+      const s = fnTagSetOfTy(lt.aElem)
+      const sig = if s >= 0 && !fnTagSetIsTagged(s) { elabListCallSig(bd, s) } else { -1 }
+      if sig >= 0 && (out[j] < 0 || !tySame(out[j], mkArrayTy(sig))) {
+        out[j] = mkArrayTy(sig)
+        elabListSigFound.push(s)
+        elabListSigFoundTy.push(sig)
+        moved = true
+      }
+    }
+    pi = pi + 1
+  }
+  if !moved { return 0 }
+  // A function of one of those sets handed beside the list, with no rep or at the stub, is
+  // delivered into it at the list's signature.
+  let j2 = 0
+  while j2 < out.length {
+    const ms = elabFnSetOf(tys[j2])
+    const open = out[j2] < 0 || elabIsStubTy(out[j2])
+    if ms.length > 0 && open && elabSigOfMembers(ms) >= 0 {
+      out[j2] = elabSigOfMembers(ms)
+    }
+    j2 = j2 + 1
+  }
+  if !tysClosed(out) { return 0 }
+  elabCandidating = true
+  const k = elabEnqueue(d, names, out, -1)
+  elabCandidating = false
+  elabReachNote(-1, k, -1)
+  elabSettle(0)
+}
+
+// The sets `elabListSigRow` found a list signature for, in its current row, and each signature.
+let elabListSigFound: i32[] = []
+let elabListSigFoundTy: i32[] = []
+
+// The list signature found for a set holding every one of `ms`, or -1.
+function elabSigOfMembers(ms: i32[]): i32 {
+  let i = 0
+  while i < elabListSigFound.length {
+    const held = fnTagMembers(elabListSigFound[i])
+    let all = true
+    for m in ms {
+      if !i32ListHas(held, m) { all = false }
+    }
+    if all { return elabListSigFoundTy[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether `t` is the no-argument stub a set no member gives a signature reps as.
+function elabIsStubTy(t: i32): boolean {
+  const ty = tyAt(t)
+  ty is TyFunc && ty.fnParamTypes.length == 0 && ty.fnRet == TY_VOID
+}
+
+// The closed signature every call through an element of list binding `bd` gives the members of
+// set `s`: the calls' widened argument types and the members' one result there; -1 when there is
+// no such call, two disagree, or one stays open.
+function elabListCallSig(bd: i32, s: i32): i32 {
+  let sig = -1
+  for c in elabCalls {
+    const cn = nodeAt(c)
+    if !(cn is Call) { continue }
+    const cf = parenPeelIx(cn.callFn)
+    if cf < 0 || cf >= P.nodes.length { continue }
+    const cfn = nodeAt(cf)
+    if !(cfn is Index) { continue }
+    const ar = parenPeelIx(cfn.idxArr)
+    if ar < 0 || ar >= P.nodes.length || !(nodeAt(ar) is Ident) { continue }
+    if identDeclOf(ar) != bd { continue }
+    const wp: i32[] = []
+    for a in cn.callArgs {
+      const at = widenLitTy(nodeTyIxOf(a))
+      if at < 0 || !elabTyClosed(at, 0) { return -1 }
+      wp.push(at)
+    }
+    let r = -1
+    for m in fnTagMembers(s) {
+      const mr = widenLitTy(elabMemberResultAt(m, wp))
+      if mr < 0 || r >= 0 && !tySame(r, mr) { return -1 }
+      r = mr
+    }
+    if r < 0 { return -1 }
+    const one = mkFuncTy(wp, r)
+    if sig >= 0 && !tySame(sig, one) { return -1 }
+    sig = one
+  }
+  sig
+}
+
 // Enqueues call `ix`'s row `names`/`tys` with each set of functions taking its rep at `ck`
 // (`elabSetRepTy`), when one moves and the row closes.
 function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
@@ -5412,6 +5547,12 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
   }
   const rowN = names.slice(0)
   if elabSeedReps(elabCallDeclOf(ix), rowN, tys, rep) { moved = true }
+  if ck < 0 {
+    elabListSigRows.push(ix)
+    elabListSigNames.push(rowN)
+    elabListSigTys.push(tys.slice(0))
+    elabListSigReps.push(rep.slice(0))
+  }
   if moved && rep.length > 0 && tysClosed(rep) {
     // A set no member gives a signature reps as a stub no call reaches, so its instance is a guess.
     elabGuessing = elabRepStubbed
