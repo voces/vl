@@ -91,11 +91,14 @@ declaration not in it. No syntactic test is added to the decision.
 
 ### 4. Mono builds and calls the nested instance per encloser instance
 
-Mono already builds a nested declaration per enclosing instance where the elaboration keyed one
-(the comment on `elabNestedPerEncl`). The call `inner()` inside `run`'s instance demands under that
-instance, so the parent chain separates the keys. What mono does not do today is resolve a tagged
-call in the nested body by the nested instance's set: a callee read out of a list element (`f` over
-`[apply2]`) falls back to the template's single set (`monoTagSetAt`). That is D15049's gap, below.
+**Corrected 2026-11-03, after slice 2 was built on `lane/g2-nested2` (not merged).** With steps 1–3
+the elaboration minted `inner` under each `run` instance, and mono did walk two `inner` copies, each
+reaching its own `apply2` instance (keyed `#set1` and `#set2`). D14842's witness still printed its
+old wrong output, `2 3.75 2 3.75`. Both `inner` copies dispatch the list element `[apply2]` through
+one closure trampoline: the closure value mono builds for the template's list literal is one for
+every copy of the body that holds it. So "mono already builds a nested declaration per enclosing
+instance" is true of the declaration and false of a function value built inside it. That value's
+identity per instance is `per-instance-identity-2026-11.md`'s mechanism M2, and slice 2 waits on it.
 
 ## Interactions
 
