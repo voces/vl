@@ -78,7 +78,7 @@ import {
 import { valueTailSplit } from "./check_num_adopt"
 import { collectRetValues } from "./check_nj_join"
 import { rcwInferredRetTy } from "./check_rcw"
-import { tErr } from "./check_relate_core"
+import { tErr, widenLitTy } from "./check_relate_core"
 import {
   T,
   TY_VOID,
@@ -575,9 +575,47 @@ function ftMemberSeenAtArms(
     }
   }
   for c in sites {
-    if !(under[c] ?? false) { return false }
+    if !(under[c] ?? false) { return ftNestedCaptureFree(d) }
   }
   true
+}
+
+// Whether nested function `d` reads no binding of a function enclosing it, so an arm built where
+// its name is out of scope can call it by its declaration.
+function ftNestedCaptureFree(d: i32): boolean {
+  const own = ftSubtree(d)
+  let a = fnDeclParent[d] ?? -1
+  while a >= 0 {
+    const enc = ftSubtree(a)
+    const todo: i32[] = [d]
+    while todo.length > 0 {
+      const y = todo.pop() ?? -1
+      if y >= 0 && y < P.nodes.length {
+        const yn = nodeAt(y)
+        if yn is Ident {
+          const k = identDeclOf(y)
+          if k >= 0 && !(own[k] ?? false) && (enc[k] ?? false) { return false }
+        }
+        nodeChildrenPush(y, todo)
+      }
+    }
+    a = fnDeclParent[a] ?? -1
+  }
+  a != -2
+}
+
+// The nodes under node `r`, `r` included.
+function ftSubtree(r: i32): Map<i32, boolean> {
+  const under: Map<i32, boolean> = Map()
+  const todo: i32[] = [r]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length && !(under[y] ?? false) {
+      under[y] = true
+      nodeChildrenPush(y, todo)
+    }
+  }
+  under
 }
 
 // Whether set `s` may be tagged, planning it in a new row when so.
@@ -647,7 +685,10 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   // A written `let`'s type makes its members agree on each parameter, so a record literal
   // handed through it is built at one row whichever member runs.
   for c in calls {
-    if fnTagCallSetOf(c) == s && !ftPlainArgsIn(c, once, ftWideSeen, s) {
+    if (
+      fnTagCallSetOf(c) == s
+      && !ftPlainArgsIn(c, once || ftLitArgsAgree(c, s), ftWideSeen, s)
+    ) {
       return false
     }
   }
@@ -840,6 +881,54 @@ function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
 // a function, a literal that allocates, an assignment, or a block.
 function ftPlainArgs(c: i32, s: i32): boolean {
   ftPlainArgsIn(c, false, false, s)
+}
+
+// Whether every member of set `s` takes each positional argument of call `c` at one rep: its
+// parameter is shaped only by type variables, which each arm instances at the argument's own
+// type, or is that argument's closed type. A literal argument is then built alike in every arm.
+function ftLitArgsAgree(c: i32, s: i32): boolean {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return false }
+  for nm in cn.callArgNames {
+    if nm != "" { return false }
+  }
+  for m in fnTagMembers(s) {
+    const f = nodeAt(m)
+    if !(f is FuncDecl) || f.fnParams.length < cn.callArgs.length {
+      return false
+    }
+    let i = 0
+    while i < cn.callArgs.length {
+      const pt = nodeTyIxOf(f.fnParams[i])
+      const at = nodeTyIxOf(cn.callArgs[i])
+      if (
+        !ftTyVarShaped(pt, 0)
+        && (at < 0 || pt < 0 || !tySame(widenLitTy(at), pt))
+      ) {
+        return false
+      }
+      i = i + 1
+    }
+  }
+  true
+}
+
+// Whether type `t` is a type variable, or a list of what this answers true for.
+function ftTyVarShaped(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 8 { return false }
+  const n = tyAt(t)
+  match n {
+    TyVar => {
+      return true
+    }
+    TyArray => {
+      return ftTyVarShaped(n.aElem, depth + 1)
+    }
+    // A closed kind, or one a type variable inside does not shape alone.
+    TyNullable | TyNeg | TyMap | TyObj | TyUnion | TyFunc | TyPrim | TyErr | TyLit => {
+      return false
+    }
+  }
 }
 
 // `ftPlainArgs`, where `lits` also admits the literals that allocate and nothing they hold calls,
@@ -1394,13 +1483,13 @@ function ftPlainDecl(d: i32): boolean {
 }
 
 // Whether a written binding of set `s` may be delivered through an adapter: each member is a named
-// declaration or a lambda whose id can stand for it, and one is generic or a hole lambda, so no
-// one closure signature holds the binding's value.
+// declaration or a lambda whose id can stand for it, and one is generic or has a parameter with no
+// annotation, so no one closure signature holds the binding's value.
 function ftWideEscOk(s: i32): boolean {
   let gen = false
   for m in fnTagMembers(s) {
     if ftNamedDecl(m) {
-      if !ftPlainDecl(m) { gen = true }
+      if !ftPlainDecl(m) || ftHoleLambda(m) { gen = true }
     } else if ftLambdaIdOk(m) && !ftWithinInstancedFn(m) {
       if ftHoleLambda(m) { gen = true }
     } else {
@@ -1410,7 +1499,7 @@ function ftWideEscOk(s: i32): boolean {
   gen
 }
 
-// Whether lambda `m` has a parameter with no annotation, so each call instances it anew.
+// Whether function `m` has a parameter with no annotation, so each call instances it anew.
 function ftHoleLambda(m: i32): boolean {
   const f = nodeAt(m)
   if !(f is FuncDecl) { return false }
@@ -1567,6 +1656,7 @@ function ftNodeOk(
     LetDecl => {
       if !i32ListHas(ftBindsCur, x) { ftBindsCur.push(x) }
       if n.letInit < 0 || ftIsS(n.letInit, s) { return true }
+      if ftAliasIntoCaptured(n.letInit, x) { return false }
       return ftJoinAt(n.letInit, nodeTyIxOf(x), s, ds, leaves, ids)
     }
     Paren | Block => {
