@@ -14,6 +14,7 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  LetDecl,
   MC_RUNG_BUILTIN,
   MC_RUNG_SELF_FN,
   MatchExpr,
@@ -218,6 +219,7 @@ import {
   tyEq,
   tyFieldTyOf,
   tyHasHole,
+  tyIsHole,
   tyIsNonIndexableScalar,
   tyIsPrimNamed,
   tyIxIsView,
@@ -235,7 +237,12 @@ import {
   fnDeclParamsOf,
 } from "./check_write_scan"
 import { i32ListHas } from "./listutil"
-import { memberDeclOf, memberDeclSet, methodFnOfDecl } from "./symbols"
+import {
+  identDeclOf,
+  memberDeclOf,
+  memberDeclSet,
+  methodFnOfDecl,
+} from "./symbols"
 import {
   arrElemValueTy,
   tyHasTyVar,
@@ -1051,8 +1058,12 @@ function checkListPushArgs(
         // A spread literal appends its elements, so each is delivered to the element as a
         // pushed value is, through its adapter when the element is a closed function (D15067).
         const sl = nodeAt(peelParenIx(spd))
-        // A list of a function set is copied element by element through adapters (D15131).
-        if !(sl is ArrayLit) { fvaListSetCopy(spd, nodeTyIxOf(spd), rt.aElem) }
+        // A list of a function set is copied element by element through adapters (D15131); a
+        // hole value a `const` list holds is pinned at the element, as `push` pins it (D15134).
+        if !(sl is ArrayLit) {
+          pushSpreadPinHoles(spd, rt.aElem)
+          fvaListSetCopy(spd, nodeTyIxOf(spd), rt.aElem)
+        }
         if sl is ArrayLit && tyMayHoldFn(rt.aElem, 0) {
           const lt = mkArrayTy(rt.aElem)
           recordCtxTy(peelParenIx(spd), lt)
@@ -1100,6 +1111,30 @@ function checkListPushArgs(
     }
     mi = mi + 1
   }
+}
+
+// Each hole-typed element of the list literal the `const` at `spd` names, judged as a value
+// pushed into a closed function element `de` is, which pins the hole there.
+function pushSpreadPinHoles(spd: i32, de: i32) {
+  if de < 0 || de >= T.tys.length || !(tyAt(de) is TyFunc) || tyHasHole(de) {
+    return 0
+  }
+  const p = peelParenIx(spd)
+  if p < 0 || !(nodeAt(p) is Ident) { return 0 }
+  const d = identDeclOf(p)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(p) }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return 0 }
+  const li = peelParenIx(dn.letInit)
+  const lit = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { nodeAt(p) }
+  if !(lit is ArrayLit) { return 0 }
+  for e in lit.arrElems {
+    const et = nodeTyIxOf(e)
+    if spreadArgOf(e) < 0 && et >= 0 && et < T.tys.length && tyIsHole(et) {
+      cnhFill(de, et)
+      assignableExpr(e, et, de)
+    }
+  }
+  0
 }
 
 // `.map(fn)` / `.filter(pred)` over `rt`'s element: the callback's arity and parameter are
