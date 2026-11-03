@@ -8,6 +8,7 @@ import {
   ArrayLit,
   AsExpr,
   BinExpr,
+  Call,
   ErrExpr,
   FuncDecl,
   Ident,
@@ -380,6 +381,7 @@ import {
   tyExcludesNull,
   tyHasTyVar,
   tyIsV128Brand,
+  tyMapValOfHeld,
   tyUnionCovers,
   unionCoversTy,
 } from "./tyquery"
@@ -980,6 +982,23 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
 // `lt ?? rt`, with `lt` bound. Nullish coalescing peels the full nullability of the merged
 // type (`nonNullTy`), not one layer: a stored null in a nullable-valued map read is a double
 // nullable, just like a miss. Answers the result type.
+// The value type of the map the read `x` indexes (`m[k]` or `m.get(k)`), else -1.
+function coalMapReadValTy(x: i32): i32 {
+  const u = parenPeelIx(x)
+  const n = if u >= 0 { nodeAt(u) } else { null }
+  if n is Index { return tyMapValOfHeld(nodeTyIxOf(parenPeelIx(n.idxArr))) }
+  if n is Call && n.callArgs.length == 1 && n.callFn >= 0 {
+    const f = nodeAt(n.callFn)
+    if f is Member && f.memProp == "get" {
+      return tyMapValOfHeld(nodeTyIxOf(parenPeelIx(f.memObj)))
+    }
+  }
+  coalNotMapRead(u)
+}
+
+// Every other read indexes no map.
+function coalNotMapRead(_ix: i32): i32 { -1 }
+
 function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   // A `??` whose left operand can never be null has a dead default — recorded (a lint), not
   // rejected, since `emit_rewrite` folds it. A narrowed place is exempt: its storage still admits
@@ -1818,6 +1837,10 @@ function binTyOfSides(n: BinExpr, ix: i32, lt0: i32, rt0: i32, ltOut: i32[]) {
     }
     recordCtxTy(n.binRight, dct)
     recordBoxTy(n.binLeft, ct)
+    // A map read whose default fits the map's values is one fused read, built where the map
+    // stores them whatever narrows the read; any other default joins at the result.
+    const mvt = coalMapReadValTy(n.binLeft)
+    if mvt >= 0 && assignable(rt, mvt) { recordBoxTy(n.binRight, mvt) }
     // An instance types a `??` its template typed as a hole at that hole's pinned join, the type
     // the pin gives its callers, and boxes the left operand into it.
     const ch = coalNodeHole[ix] ?? -1
