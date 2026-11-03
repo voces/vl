@@ -116,6 +116,10 @@ parameter) is typed at the instance as an `i32` id, so mono falls back to the te
 Reading it in `monoTagSetAt` before the fallback is this mechanism's whole change. It is safe only
 once M1 makes the instances distinct: with a shared instance it reads one key's set for both.
 
+### The composite-pin slices: mono re-deriving elaboration facts
+
+The four slices planned as a composite-pin producer (D15107 classes B and G) each closed in mono, with no entry added to the elaboration key: the elaboration already held one instance, and mono split it on a fact it derived itself. A union pin keyed the argument's exact type and literal-union mark where the key's bindings fix the pin (#6061, #6085). A literal argument's spelling missed a union its type is held by (#6093). An instance was demanded at its pin's rep binding before its exact one (#6077). A record literal pinned at its own type where the elaboration stamps it at the parameter's record (D14140). Before adding a key entry for a split, look for the elaboration fact mono should read instead.
+
 ### M5. A per-instance value handed or returned out of its instance (step 2, S2a')
 
 Measured on master `b90c2ed2e`. In `closures/hole-lambda-bundle-positions.vl`, `capT<T>` hands a
