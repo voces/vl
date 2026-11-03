@@ -10,6 +10,8 @@ type Dump = {
   rc: number;
   rows: string[];
   arms: Map<string, { twin: number; codes: string }>;
+  types: Map<string, { row: number; variant: number }>;
+  armTwins: number[];
 };
 
 const dump = (src: string): Dump => {
@@ -28,16 +30,23 @@ const dump = (src: string): Dump => {
   for (let i = 0; i < n; i++) text += String.fromCharCode(e.rowDumpAt(i));
   const rows: string[] = [];
   const arms = new Map<string, { twin: number; codes: string }>();
+  const types = new Map<string, { row: number; variant: number }>();
+  const armTwins: number[] = [];
   for (const line of text.split("\n")) {
     const row = /^row (\d+) (\S+) decl=(\d) codes=(\S*)$/.exec(line);
     if (row) rows[Number(row[1])] = `${row[2]} decl=${row[3]} codes=${row[4]}`;
-    const arm = /^arm \d+ (\S+) twin=(-?\d+) codes=(\S*)$/.exec(line);
-    if (arm) arms.set(arm[1], { twin: Number(arm[2]), codes: arm[3] });
-    if (line !== "" && !row && !arm) {
+    const arm = /^arm (\d+) (\S+) twin=(-?\d+) codes=(\S*)$/.exec(line);
+    if (arm) {
+      arms.set(arm[2], { twin: Number(arm[3]), codes: arm[4] });
+      armTwins[Number(arm[1])] = Number(arm[3]);
+    }
+    const ty = /^type (\S+) row=(-?\d+) variant=(-?\d+)$/.exec(line);
+    if (ty) types.set(ty[1], { row: Number(ty[2]), variant: Number(ty[3]) });
+    if (line !== "" && !row && !arm && !ty) {
       throw new Error(`unparsed dump line: ${JSON.stringify(line)}`);
     }
   }
-  return { rc, rows, arms };
+  return { rc, rows, arms, types, armTwins };
 };
 
 const arm = (d: Dump, name: string) => {
@@ -116,6 +125,56 @@ Deno.test({
       if (a.twin !== -1) {
         throw new Error(`want ${nm} with no row, got twin=${a.twin}`);
       }
+    }
+  },
+});
+
+// The row a declared type name builds at: its own row, else its arm's twin row; -1 for neither.
+const rowOf = (d: Dump, name: string): number => {
+  const t = d.types.get(name);
+  if (!t) {
+    throw new Error(
+      `no type ${name} in the dump: ${JSON.stringify([...d.types.keys()])}`,
+    );
+  }
+  if (t.row >= 0) return t.row;
+  if (t.variant < 0) return -1;
+  return d.armTwins[t.variant] ?? -1;
+};
+
+// D15107's class-A witness: `ap` elaborates once for `C` and `D`, which mono keeps apart as two
+// instances. The collect tables give the two records ONE row in both spellings, with and without
+// the second union, so the row does not carry what separates the instances.
+const CLASS_A =
+  "type C = { r: i32 }\ntype S = { s: i32 }\ntype U = C | S\ntype D = { r: i32 }\n" +
+  "type V = D | S\nfunction ap<T>(x: T): T { x }\nconst c: C = { r: 1 }\nconst d: D = { r: 2 }\n" +
+  "print(ap(c).r)\nprint(ap(d).r)\n";
+
+Deno.test({
+  name:
+    "row classes: D15107's class-A witness, C and D in different unions, share one row",
+  ignore: !assertSeed(),
+  fn: () => {
+    const d = dump(CLASS_A);
+    if (d.rc !== 0) throw new Error(`want rc 0, got ${d.rc}`);
+    const c = rowOf(d, "C");
+    const dd = rowOf(d, "D");
+    if (c < 0 || c !== dd) {
+      throw new Error(`want C and D on one row, got C=${c}, D=${dd}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "row classes: D15107's no-union control, C and D share one row",
+  ignore: !assertSeed(),
+  fn: () => {
+    const d = dump(CLASS_A.replace("type V = D | S\n", ""));
+    if (d.rc !== 0) throw new Error(`want rc 0, got ${d.rc}`);
+    const c = rowOf(d, "C");
+    const dd = rowOf(d, "D");
+    if (c < 0 || c !== dd) {
+      throw new Error(`want C and D on one row, got C=${c}, D=${dd}`);
     }
   },
 });
