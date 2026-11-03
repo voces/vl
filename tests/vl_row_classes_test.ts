@@ -250,7 +250,7 @@ Deno.test({
 });
 
 // The record-row class (`recordRowClassOf`), computed before the elaboration: the classes must
-// agree with the rows wherever the rows say "one" or "two", except for D15152's three finer cases.
+// agree with the rows wherever the rows say "one" or "two" (D15152).
 const classOf = (d: Dump, name: string): string => {
   const c = d.types.get(name)?.cls ?? "";
   if (c === "") {
@@ -330,11 +330,11 @@ Deno.test({
 });
 
 Deno.test({
-  name:
-    "row classes: D15152, records one layout family builds at one row key apart today",
+  name: "row classes: an inline union's layout family is one class (D15152)",
   ignore: !assertSeed(),
   fn: () => {
-    // `A = {kind: K, r}` is contained in `B = {kind: string, r}` with no union between them.
+    // `A = {kind: K, r}` and `B = {kind: string, r}` meet only in a function's `A | B`; the
+    // re-lay stores the field at the string for both.
     const d = dump(
       Deno.readTextFileSync(
         new URL(
@@ -343,9 +343,9 @@ Deno.test({
         ),
       ),
     );
-    if (classOf(d, "A") === classOf(d, "B")) {
+    if (classOf(d, "A") !== classOf(d, "B")) {
       throw new Error(
-        "A and B now share a class: D15152's layout family is folded in, so update this case and the row",
+        `want A and B one class, got ${classOf(d, "A")} vs ${classOf(d, "B")}`,
       );
     }
   },
