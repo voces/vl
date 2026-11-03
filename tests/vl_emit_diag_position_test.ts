@@ -58,20 +58,19 @@ const errorBlock = (out: string): string => {
   return lines.slice(start, end).join("\n");
 };
 
-// A BODY-phase refusal: a function returning a parameter it calls at two signatures, called
-// where its result is used at one of them (D15144), anchored at that call on line 7. The collect
-// phase has no positioned refusal a check-clean program reaches: the last one ran (D15098), and
-// D15150's refusal is raised there with no position at all (D15154). When D15154 is fixed,
-// D15150's witness is the collect-phase case again.
+// A BODY-phase refusal: a function returning a parameter it calls at two signatures, its result
+// put in a list element (D15144's B2 position, `bundle-record-value-2026-11.md`), anchored at
+// that call on line 7. The collect phase has no positioned refusal a check-clean program
+// reaches: the last one ran (D15098), and D15150's refusal is raised there with no position at
+// all (D15154). When D15154 is fixed, D15150's witness is the collect-phase case again.
 const BODY_WITNESS = `function lap(f) {
   print(f(2.5))
   print(f(3))
   return f
 }
 function go(k: i32) {
-  const r = lap((a) => a + k)
-  print(r(4))
-  print(r(1.5))
+  const xs = [lap((a) => a + k)]
+  print(xs[0](4))
 }
 go(1)
 `;
