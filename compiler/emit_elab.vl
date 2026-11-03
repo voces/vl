@@ -201,7 +201,6 @@ import {
   mintCloDeliveryNote,
   mintCloRows,
   mintFactNote,
-  mintLamKeyedNote,
   mintNestedPerEnclNote,
   mintParamBoundNote,
   mintParamFwdNote,
@@ -1209,6 +1208,23 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
 let ekDone: boolean[] = []
 // The instances whose bodies the monomorphizer is walking, innermost last.
 let elabWalkKeys: i32[] = []
+
+// Appends to `names`/`tys` the pins of lambda `d`'s one key under the instance being walked, the
+// key `elabReturnCredits` or an instance's own call minted for it there; false when it has none.
+export function elabLamPinsUnderWalk(d: i32, names: string[], tys: i32[]): boolean {
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  if top < 0 || d < 0 { return false }
+  const kids = ekKids[i32ToStr(top) + "^" + i32ToStr(d)] ?? []
+  if kids.length != 1 { return false }
+  const k = kids[0]
+  let i = 0
+  while i < ekNames[k].length && i < ekTys[k].length {
+    names.push(ekNames[k][i])
+    tys.push(ekTys[k][i])
+    i = i + 1
+  }
+  true
+}
 
 export function elabWalkPush(k: i32) {
   elabWalkKeys.push(k)
@@ -2714,10 +2730,6 @@ let elabMintValueFns: i32[] = []
 export function elabMintFacts(): i32 {
   mintReset()
   for pe in elabPerEnclDecls.keys() { mintNestedPerEnclNote(pe) }
-  for kd in ekDecl {
-    const kn = nodeAt(kd)
-    if kn is FuncDecl && kn.fnName == "" { mintLamKeyedNote(kd) }
-  }
   elabHandBackMemo = Map()
   elabMintValueFns = elabFnSetMembersShared()
   elabMintCalls = Map()
@@ -5649,6 +5661,7 @@ export function elabRun() {
   elabNestedPerEncl()
   elabSoleRekey()
   elabListMemberSigs()
+  elabReturnCredits()
   let lr = 0
   while lr < elabListSigRows.length {
     elabListSigRow(
@@ -5661,6 +5674,91 @@ export function elabRun() {
   }
   elabPinsClosedSet(true)
   elabRunDone = true
+}
+
+// Keys each per-instance lambda an open function's instance returns under that instance, at the
+// pins the call through the returned value gives its holes: the call `f(x)(y)` pins the lambda
+// `f`'s instance returned, which no instance's own body pins (per-instance-identity-2026-11.md, M5).
+function elabReturnCredits() {
+  for c in elabCalls {
+    const cn = nodeAt(c)
+    if !(cn is Call) { continue }
+    const inner = parenPeelIx(cn.callFn)
+    if inner < 0 || inner >= P.nodes.length || !(nodeAt(inner) is Call) { continue }
+    const ik = elabCallInstFrom(inner, -1)
+    if ik < 0 || ik >= ekDecl.length || !declOpen(ekDecl[ik]) { continue }
+    const lam = elabReturnedLam(ekDecl[ik])
+    const lt = if lam >= 0 { nodeTyIxOf(lam) } else { -1 }
+    const lf = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+    const ln = if lam >= 0 { nodeAt(lam) } else { null }
+    if !(lf is TyFunc) || !(ln is FuncDecl) { continue }
+    const names: string[] = []
+    const tys: i32[] = []
+    let i = 0
+    while i < ln.fnParams.length && i < cn.callArgs.length {
+      const pn = nodeAt(ln.fnParams[i])
+      const at = nodeTyIxOf(cn.callArgs[i])
+      // The parameter's checker type may be another declaration's variable it was unified with.
+      if pn is Param && pn.parType < 0 && at >= 0 && elabTyClosed(at, 0) && i < lf.fnParamTypes.length {
+        bindGenWalk(lf.fnParamTypes[i], widenLitTy(at), names, tys)
+      }
+      i = i + 1
+    }
+    if names.length > 0 { elabReachNote(ik, elabEnqueue(lam, names, tys, ik), c) }
+  }
+  elabSettle(0)
+}
+
+// The per-instance lambda declaration `f` returns: a lambda returned directly, or the one written
+// into the binding it returns; -1 for none or more than one.
+function elabReturnedLam(f: i32): i32 {
+  const fd = nodeAt(f)
+  if !(fd is FuncDecl) || fd.fnBody < 0 { return -1 }
+  let found = -1
+  const st: i32[] = [fd.fnBody]
+  while st.length > 0 {
+    const x = st.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is RetStmt && xn.retArg >= 0 {
+        const r = elabValueLamIn(fd.fnBody, xn.retArg, f)
+        if r >= 0 && found >= 0 && r != found { return -1 }
+        if r >= 0 { found = r }
+      }
+      if !(xn is FuncDecl) || x == fd.fnBody { for c in nodeChildren(x) { st.push(c) } }
+    }
+  }
+  found
+}
+
+// The per-instance lambda of `f` that value `v` holds: written there, or written into the `let` it
+// reads anywhere in `body`; -1 for none.
+function elabValueLamIn(body: i32, v: i32, f: i32): i32 {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const xn = nodeAt(x)
+  if xn is FuncDecl {
+    return if elabLamPerEncl(x) && (elabEncl.get(x) ?? -1) == f { x } else { -1 }
+  }
+  if !(xn is Ident) { return -1 }
+  const b = identDeclOf(x)
+  if b < 0 || b >= P.nodes.length || !(nodeAt(b) is LetDecl) { return -1 }
+  let found = -1
+  const st: i32[] = [body]
+  while st.length > 0 {
+    const y = st.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      const yn = nodeAt(y)
+      const w = if yn is BinExpr && yn.binOp == "=" && nodeAt(yn.binLeft) is Ident && identDeclOf(yn.binLeft) == b { yn.binRight } else { -1 }
+      const ww = if w >= 0 { parenPeelIx(w) } else { -1 }
+      if ww >= 0 && nodeAt(ww) is FuncDecl && elabLamPerEncl(ww) && (elabEncl.get(ww) ?? -1) == f {
+        if found >= 0 && found != ww { return -1 }
+        found = ww
+      }
+      for c in nodeChildren(y) { st.push(c) }
+    }
+  }
+  found
 }
 
 // Mints, as candidates, each named member of an untagged set holding a capturing lambda that a
