@@ -124,8 +124,17 @@ Each slice is graded on every hard control above, with the split plan on and off
    first check, before anything else is graded. D15068 joins the hard controls. Report seed size
    and plumb-shape fuel deltas. Built: D14842's Repro and the three spellings in
    `closures/nested-fn-forwarding-captured-hole-param-per-encloser-instance.vl` run with the plan off.
-4. **Two levels of nesting**, the last census L-nested shape, and **per-instance members (M3)**, with the per-frame lane's rows as witnesses, and G1's D15062 item 2
-   graded against M4's reader from slice 2.
+4. **Two levels of nesting** (4a), the last census L-nested shape, and **per-instance members
+   (M3)** (4b), with the per-frame lane's rows as witnesses, and G1's D15062 item 2 graded against
+   M4's reader from slice 2.
+
+   4a, measured: the checker snapshots the bindings around a nested declaration (`elabNestNote`)
+   only when its own or its encloser's signature is open. In `viaTwoDeep`, `b`'s encloser `a` is
+   `() => void`, so `b`'s instance re-check had no snapshot, typed `h` as an error, and built
+   `apply2` at it, which the late tag decision then declined. The fix is checker-side: snapshot when
+   any encloser up the chain is open. The elaboration's per-encloser test and its mint redirect
+   (`elabReadsEnclParam`, `elabEnclOwning`) walk the same chain. D14842's pin now carries two- and
+   three-deep shapes and a generic-calling middle, all running with the plan off.
 
 **Out of scope.** Sets whose identity varies per instance and escapes the instance; those stay
 closures. A per-instance `fnTagBind` (#6000), which no witness needs yet.
