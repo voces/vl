@@ -3,16 +3,64 @@
 // lives in one, else from the checker; the emitter's re-derivation (`computeVoidFns`) can be
 // replaced by it only where they agree. Off unless a host arms it; armed, each emitted function
 // is counted by class (`docs/internals/architecture-target-2026-10.md` §4, the pass rows).
-import { BinExpr, Block, Call, FuncDecl, nodeAt } from "./ast"
-import { T, TY_NEVER, TY_VOID, TyFunc, tyAt } from "./check_types"
+import {
+  ArrayLit,
+  BinExpr,
+  Block,
+  Call,
+  FuncDecl,
+  Ident,
+  Index,
+  Member,
+  ObjLit,
+  P,
+  nodeAt,
+} from "./ast"
+import { nodeRepTyIxOf } from "./check_core_state"
+import { nodeTyIxOf } from "./check_node_tys"
+import { retValueRootCall } from "./check_store_rep"
+import { collectRetValues } from "./check_nj_join"
+import { recHoleIdentityArg } from "./check_fit_rules"
+import { recBuildTable, recBuildTyIn, recKeptFnDstOf } from "./check_rec_rows"
+import { recPassThroughArg } from "./check_record_origins"
+import { identBoundFnDeclOf } from "./check_scopes"
+import {
+  cwBindingOf,
+  cwFramedNode,
+  cwIxWant,
+  cwKeyOfRoot,
+  cwPeel,
+  cwPeelValue,
+  cwSlotWrittenValues,
+} from "./check_write_scan"
+import { nodeHoleElemOf } from "./check_side_rows"
+import {
+  T,
+  TY_NEVER,
+  TY_VOID,
+  TyArray,
+  TyFunc,
+  TyNullable,
+  TyObj,
+  mkArrayTy,
+  mkNullableTy,
+  tyAt,
+  tySame,
+} from "./check_types"
 import {
   elabCheckedTyOf,
+  elabDeliveredRowOf,
   elabKeyAtPos,
-  elabRetOf,
+  elabResultOf,
   elabSrcDecl,
   elabSubstClosed,
 } from "./emit_elab"
+import { unwrapParen } from "./emit_base"
 import { scopeTyAt } from "./emit_capture_frames"
+import { callsOfCallee } from "./emit_fn_ret_kinds"
+import { cloSigKeyExt } from "./emit_classify"
+import { repSigKindOfTy, repSigTokHasSlot } from "./emit_rep"
+import { repSigRetTokOfTy } from "./emit_rep_slot"
 import {
   emitPhaseReached,
   fRetVoid,
@@ -30,6 +78,7 @@ import { nonNullTy, tyHasTyVar } from "./tyquery"
 
 let frsArmed = false
 let frsNamed = false
+let frsKindArmed = false
 let frsDrop = 0
 let frsRowKey: string[] = []
 let frsRowN: i32[] = []
@@ -37,6 +86,14 @@ let frsRowN: i32[] = []
 // Arm (1) or disarm (0) the shadow for the compiles that follow; 2 also names each function.
 export function fnRetShadowArm(on: i32) {
   frsArmed = on != 0
+  frsNamed = on == 2
+  0
+}
+
+// Arm (1) or disarm (0) the result-kind shadow for the compiles that follow; 2 also names each
+// function. It counts beside the voidness rows, once `computeRetInference` has settled.
+export function fnKindShadowArm(on: i32) {
+  frsKindArmed = on != 0
   frsNamed = on == 2
   0
 }
@@ -64,12 +121,255 @@ export function fnRecordedRetTy(fe: i32): i32 {
   const nested = fe < fnParent.length && fnParent[fe] >= 0
   let r = -1
   if k >= 0 && !nested {
-    r = elabRetOf(k)
+    r = elabResultOf(k)
+    // The instance is built at the record the calls mono routes to it are stamped at, where they
+    // agree, else at the record every call reaching its key is.
+    const cr = frsCallsBuiltRow(fx, r)
+    const dr = if cr >= 0 { cr } else { elabDeliveredRowOf(k) }
+    if dr >= 0 && r >= 0 && r < T.tys.length && tyAt(r) is TyObj { r = dr }
   } else {
     r = frsFnRet(if k >= 0 { scopeTyAt(fx, fx) } else { elabCheckedTyOf(fx) })
+    if r >= 0 && k < 0 {
+      const kd = recKeptFnDstOf(fx, r)
+      if kd >= 0 { r = kd }
+      // A value built by a call keeps that call's row whatever the delivery; else the calls'.
+      const vr = if r < T.tys.length && tyAt(r) is TyObj { frsValuesBuiltRow(fx) } else { -1 }
+      const cr = if vr >= 0 { vr } else { frsCallsBuiltRow(fx, r) }
+      if cr >= 0 { r = cr }
+      // A record or list with no row of its own is built only at its values' stamps (D14901
+      // class D).
+      if r < T.tys.length && repSigRetTokOfTy(r) == "" {
+        const sr = frsValuesStampRow(fx, r)
+        if sr >= 0 { r = sr }
+      }
+    }
   }
-  if r >= 0 { return r }
+  if r >= 0 { return frsClosedHoleRet(fx, r) }
   frsTemplateRet(fe, nested, k)
+}
+
+// The record every call of plain function `fx` is stamped at, when its result `r` is a record and
+// they all agree: the row its value is built at where a delivery widens it (D14900); else -1.
+function frsCallsBuiltRow(fx: i32, r: i32): i32 {
+  if r < 0 || r >= T.tys.length || !(tyAt(r) is TyObj) { return -1 }
+  if fx < 0 || fx >= P.nodes.length { return -1 }
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) { return -1 }
+  const cs = callsOfCallee(fn.fnName)
+  if cs.length == 0 { return -1 }
+  let row = -1
+  for c in cs {
+    const st = frsCallBuiltAt(c, 0)
+    if st < 0 || st >= T.tys.length || !(tyAt(st) is TyObj) || tyHasTyVar(st) {
+      return -1
+    }
+    if row >= 0 && !tySame(row, st) { return -1 }
+    row = st
+  }
+  row
+}
+
+// The record call `c`'s value is built at: where the callee hands an argument straight back (an
+// identity, or a hole function returning its parameter), that argument's build (D14902), an
+// element read at its list's (`frsElemBuiltRow`); where the callee's every value is call-built,
+// that row (`frsValuesBuiltRow`); else the call's own stamp.
+function frsCallBuiltAt(c: i32, hops: i32): i32 {
+  const st = nodeRepTyIxOf(c)
+  if hops >= 16 || c < 0 || c >= P.nodes.length { return st }
+  const cn = nodeAt(c)
+  if !(cn is Call) { return st }
+  let a = recPassThroughArg(c)
+  if a < 0 && cn.callFn >= 0 {
+    a = recHoleIdentityArg(c, identBoundFnDeclOf(cn.callFn))
+  }
+  if a < 0 && cn.callFn >= 0 {
+    const vr = frsValuesBuiltRow(identBoundFnDeclOf(cn.callFn))
+    return if vr >= 0 { vr } else { st }
+  }
+  const ap = if a >= 0 { cwPeelValue(a) } else { -1 }
+  if ap < 0 || ap >= P.nodes.length { return st }
+  const an = nodeAt(ap)
+  let b = -1
+  if an is Call {
+    b = frsCallBuiltAt(ap, hops + 1)
+  } else if an is Ident {
+    const d = identDeclOf(ap)
+    b = if d >= 0 { recBuildTyIn(recBuildTable(), d, false) } else { -1 }
+    if b < 0 { b = nodeRepTyIxOf(ap) }
+  } else if an is ObjLit {
+    b = nodeRepTyIxOf(ap)
+  } else if an is Index {
+    b = frsElemBuiltRow(ap)
+  }
+  if b < 0 || b >= T.tys.length || !(tyAt(b) is TyObj) || tyHasTyVar(b) {
+    return st
+  }
+  b
+}
+
+// The record un-annotated plain function `fx` builds its value at where every value it returns is
+// a call of a plain function or handed back through identities (`frsHandBackLeaf`), or a read the
+// store column stamped (`frsHeldRead`), and the stamps agree on one closed record; else -1. An
+// annotated result, and a literal leaf built at its instance's row, are not read.
+function frsValuesBuiltRow(fx: i32): i32 {
+  if fx < 0 || fx >= P.nodes.length || !frsIsPlainFn(fx) { return -1 }
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) || fn.fnRet >= 0 || fn.fnBody < 0 { return -1 }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  if vals.length == 0 { return -1 }
+  let row = -1
+  for v in vals {
+    const root = retValueRootCall(v)
+    const at = if root >= 0 && frsHandBackLeaf(root, 0) >= 0 { root } else { frsHeldRead(v) }
+    if at < 0 { return -1 }
+    const st = nodeRepTyIxOf(at)
+    if st < 0 || st >= T.tys.length || !(tyAt(st) is TyObj) || tyHasTyVar(st) {
+      return -1
+    }
+    if row >= 0 && !tySame(row, st) { return -1 }
+    row = st
+  }
+  row
+}
+
+// Returned value `v` when it is a read the checker's store column stamped at another record than
+// its own type (`storeRetsResolve`, D15127); else -1.
+function frsHeldRead(v: i32): i32 {
+  const u = unwrapParen(v)
+  const n = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+  if !(n is Index) && !(n is Member) && !(n is Ident) { return -1 }
+  const st = nodeRepTyIxOf(u)
+  if st < 0 || tySame(st, nodeTyIxOf(u)) { -1 } else { u }
+}
+
+// The record element read `ix` (`xs[i]`, `xs` a binding) is built at: every value stored in the
+// list's elements, its literal's and each write's through any alias (`cwSlotWrittenValues`), read
+// at a plain function's kept build where it is that function's call, else at its stamp; the one
+// closed record with a row they agree on, else -1 (D14901 class D).
+function frsElemBuiltRow(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if !(n is Index) { return -1 }
+  const arr = cwPeel(n.idxArr)
+  if arr < 0 || arr >= P.nodes.length || !(nodeAt(arr) is Ident) { return -1 }
+  cwIxWant()
+  if !cwFramedNode(arr) || cwKeyOfRoot(arr) < 0 { return -1 }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwBindingOf(arr), ["[]"], vals, ats) < 0 { return -1 }
+  if vals.length == 0 { return -1 }
+  let row = -1
+  for v in vals {
+    const st = frsValueBuiltAt(cwPeelValue(v))
+    if st < 0 || st >= T.tys.length || !(tyAt(st) is TyObj) || tyHasTyVar(st) {
+      return -1
+    }
+    if repSigRetTokOfTy(st) == "" { return -1 }
+    if row >= 0 && !tySame(row, st) { return -1 }
+    row = st
+  }
+  row
+}
+
+// The record stored value `v` is built at: a plain function's call at that function's kept
+// build (`recKeptFnDstOf`) where one is recorded, else its own stamp, as the lowering reads it.
+function frsValueBuiltAt(v: i32): i32 {
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const n = nodeAt(v)
+  if n is Call {
+    const fd = if n.callFn >= 0 { identBoundFnDeclOf(n.callFn) } else { -1 }
+    if frsIsPlainFn(fd) {
+      const own = frsFnRet(elabCheckedTyOf(fd))
+      const kd = if own >= 0 { recKeptFnDstOf(fd, own) } else { -1 }
+      if kd >= 0 { return kd }
+    }
+  }
+  nodeRepTyIxOf(v)
+}
+
+// The record or list every value function `fx` returns is stamped at, a literal at its own stamp
+// and a call-built value at its root call's, when they agree on one closed type of `r`'s shape
+// that has a row; else -1. The lowering builds such a value at that stamp (`criRowByStamp`).
+function frsValuesStampRow(fx: i32, r: i32): i32 {
+  const isObj = tyAt(r) is TyObj
+  if !isObj && !(tyAt(r) is TyArray) { return -1 }
+  if fx < 0 || fx >= P.nodes.length { return -1 }
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) || fn.fnBody < 0 { return -1 }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  if vals.length == 0 { return -1 }
+  let row = -1
+  for v in vals {
+    const root = retValueRootCall(v)
+    const pv = unwrapParen(v)
+    if (
+      root < 0
+      && (pv < 0
+        || pv >= P.nodes.length
+        || !(nodeAt(pv) is ObjLit || nodeAt(pv) is ArrayLit))
+    ) {
+      return -1
+    }
+    const st = nodeRepTyIxOf(if root >= 0 { root } else { pv })
+    if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
+    if (if isObj { !(tyAt(st) is TyObj) } else { !(tyAt(st) is TyArray) }) {
+      return -1
+    }
+    if repSigRetTokOfTy(st) == "" { return -1 }
+    if row >= 0 && !tySame(row, st) { return -1 }
+    row = st
+  }
+  row
+}
+
+// The call of a plain, non-generic function that call `c` is, or hands back through generic
+// identities and hole functions that return their parameter; -1 where the chain ends elsewhere.
+function frsHandBackLeaf(c: i32, hops: i32): i32 {
+  if hops >= 16 || c < 0 || c >= P.nodes.length { return -1 }
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callFn < 0 { return -1 }
+  const fd = identBoundFnDeclOf(cn.callFn)
+  let a = recPassThroughArg(c)
+  if a < 0 { a = recHoleIdentityArg(c, fd) }
+  if a >= 0 { return frsHandBackLeaf(cwPeelValue(a), hops + 1) }
+  if frsIsPlainFn(fd) { c } else { -1 }
+}
+
+// Whether `fd` is a function with no type parameters that no instance replaces: not a mono clone,
+// whose parameters are already substituted, and with no elaboration slot.
+function frsIsPlainFn(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+  const fe = fnStmtsPosOf(fd)
+  fe >= 0 && elabKeyAtPos(fe) < 0 && !i32ListHas(monoInstFe, fe)
+}
+
+// Result `r` of function `fx`, a hole list (`_[]` or `_[] | null`) closed to the element the
+// checker records at every value the function returns once its last pin ran (`nodeHoleElemOf`),
+// so the record names the list the value is built as while its type keeps the hole; else `r`.
+function frsClosedHoleRet(fx: i32, r: i32): i32 {
+  if r < 0 || r >= T.tys.length { return r }
+  const t = tyAt(r)
+  if t is TyNullable {
+    const inner = frsClosedHoleRet(fx, t.nInner)
+    return if inner == t.nInner { r } else { mkNullableTy(inner) }
+  }
+  if !(t is TyArray) || t.aElem >= 0 { return r }
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) { return r }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  if vals.length == 0 { return r }
+  const el = nodeHoleElemOf(vals[0])
+  if el < 0 { return r }
+  let i = 1
+  while i < vals.length {
+    if nodeHoleElemOf(vals[i]) != el { return r }
+    i = i + 1
+  }
+  mkArrayTy(el)
 }
 
 // For emitted function `fe` whose own answer is open: the checker result of its template (the
@@ -125,7 +425,7 @@ export function fnRetShadowRun() {
 
 // The class of emitted function `fe`.
 function frsClass(fe: i32): string {
-  let r = fnRecordedRetTy(fe)
+  let r = frsRecordedOrAnn(fe)
   if frsDrop == 1 { r = -1 }
   if frsDrop == 2 { r = TY_VOID }
   const nested = fe < fnParent.length && fnParent[fe] >= 0
@@ -176,6 +476,102 @@ function frsTailCallsVoid(fx: i32): boolean {
   if cd < 0 { return false }
   const ce = fnStmtsPosOf(cd)
   ce >= 0 && ce < fRetVoid.length && fRetVoid[ce] == 1
+}
+
+// Count every function the emitter lowers valued by how the kind of its recorded result meets
+// `fRetKind`. Run once the kinds have settled (after `computeRetInference#2`).
+export function fnKindShadowRun() {
+  if !frsKindArmed { return 0 }
+  if frsArmed == false {
+    frsRowKey = []
+    frsRowN = []
+  }
+  let fe = 0
+  while fe < fnStmts.length && fe < fRetVoid.length {
+    const fn = nodeAt(fnStmts[fe])
+    if fn is FuncDecl {
+      if fRetVoid[fe] == 0 {
+        let key = frsKindClass(fe)
+        if frsNamed { key = key + " | " + fn.fnName }
+        frsCount(key)
+      }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// The kind class of valued function `fe`: the `$fnsig` result token its recorded result
+// crosses as, against the one its lowered signature (`cloSigKeyExt`) carries.
+function frsKindClass(fe: i32): string {
+  let r = frsRecordedOrAnn(fe)
+  if frsDrop == 1 { r = -1 }
+  if frsDrop == 2 { r = TY_VOID }
+  if r == TY_VOID || r == TY_NEVER { return "kind: recorded void or never" }
+  if r < 0 || r >= T.tys.length { return "kind: no result recorded" }
+  const rec = repSigRetTokOfTy(r)
+  if rec == "" { return "kind: recorded result has no token" }
+  const low = cloSigKeyExt(fe)
+  let gt = -1
+  let i = 0
+  while i < low.length {
+    if low[i] == '>' { gt = i }
+    i = i + 1
+  }
+  if gt < 0 { return "kind: lowered signature has no token" }
+  const lr = low.slice(gt, low.length)
+  if lr == rec { return "kind agree" }
+  const k = repSigKindOfTy(r)
+  if k != null && repSigTokHasSlot(k) { return frsRowClass(fe, lr) }
+  "kind: recorded " + rec + ", lowered " + lr
+}
+
+// The row class of valued function `fe` whose recorded result has a slot the lowering keys
+// elsewhere: each value it returns, by the row its stamp names, against token `lr`.
+function frsRowClass(fe: i32, lr: string): string {
+  const fn = nodeAt(fnStmts[fe])
+  if !(fn is FuncDecl) { return "row: not a function" }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  if vals.length == 0 { return "row: no value returned" }
+  const k = elabKeyAtPos(fe)
+  let i = 0
+  while i < vals.length {
+    // A call-built value is built at the row its root call is stamped at.
+    const root = retValueRootCall(vals[i])
+    let sty = nodeRepTyIxOf(if root >= 0 { root } else { vals[i] })
+    // An instance's body is typed at its template, so its stamp closes under the binding.
+    if sty >= 0 && tyHasTyVar(sty) && k >= 0 { sty = elabSubstClosed(sty, k) }
+    const st = frsFoldSetTok(repSigRetTokOfTy(sty))
+    if st != frsFoldSetTok(lr) {
+      return "row: stamped " + st + ", lowered " + lr
+    }
+    i = i + 1
+  }
+  "row agree"
+}
+
+// Token `t` with a set's map shape folded to its map sibling, as the lowering keys it
+// (`mapShapeFoldSet`): `-2`, `-5` and `-7` read as `-1`, `-4` and `-6`.
+function frsFoldSetTok(t: string): string {
+  if t.length < 4 || (t[1] != 'm' && t[1] != 'M') { return t }
+  const sh = t.slice(2, t.length - 1)
+  if sh == "-2" { return t.slice(0, 2) + "-1;" }
+  if sh == "-5" { return t.slice(0, 2) + "-4;" }
+  if sh == "-7" { return t.slice(0, 2) + "-6;" }
+  t
+}
+
+// The result the shadow grades function `fe` by: its recorded one, else the annotation of a
+// function the emitter mints after the checker (`$eqc`, `$extv`), which no checker node types.
+function frsRecordedOrAnn(fe: i32): i32 {
+  const r = fnRecordedRetTy(fe)
+  if r >= 0 || fe < 0 || fe >= fnStmts.length { return r }
+  const fn = nodeAt(fnStmts[fe])
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return nodeTyIxOf(fn.fnRet) }
+  }
+  r
 }
 
 function frsCount(key: string) {

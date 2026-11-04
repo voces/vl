@@ -10443,6 +10443,19 @@ block, and the message is still the bounds trap. Against the branch alone: rever
 sunpa's `track` 121.1 → 121.6 ms on V8, where `select` reads 150.8. The price is `struct-soa`
 on wasmtime, +5%. All variants and benches are in D4782.
 
+
+## An optimized build's `unreachable` banner names what it may stand for (owner ruling (c), 2026-11-02) — D3723
+
+**The rule.** At `-O`/`-O3` binaryen may prove that a trap always fires (an index into a list it
+knows is empty) and fold it into `unreachable`. The trap's kind is then gone from the module, so
+`vl run`'s banner for an `unreachable` says, after "a compiler-emitted trap", that an optimized
+build also stops this way where another trap always fires, such as an out-of-range index or a
+failed `as`. An unoptimized build keeps naming the index.
+
+**Why not exact.** Naming the folded trap's own kind needs the module to carry it: one kept trap
+function per kind (wasm-opt `--no-inline`) or a source-map row read at the trap. Both cost bytes or
+a flag the default build does not pass. That is backlogged in ROADMAP.md.
+
 ## `u32` and `u64` are value types (owner rulings U1–U4, 2026-10-03 and 2026-10-04)
 
 **VL gets `u32` and `u64` (U1 = A, 2026-10-03).** They are value types beside `i32` and
@@ -10790,6 +10803,30 @@ later `q.length` reads it (D4934); the caller's own list is not pushed onto, the
 pays for a field or capture. A closure declared in the arm reads an empty `K[]` for its capture
 (D4935). Only a field receiver still leaves the parameter unbound rather than defaulted.
 
+
+## A parameter a call leaves open is `never` in that call's deferred return (2026-11-01) — D14802, D2803, D12581
+
+**The rule.** A call can leave open a type parameter that a parameter annotation names. D2803 makes
+that legal: an argument a union's concrete member admits whole binds nothing (`pr<T>(v: T | string)`
+called as `pr("q")`). D12581 does the same for an empty `[]` handed to a `T[]` parameter. The call's
+deferred return check reads each such open parameter as `never`, the type no value has. So the check
+refuses exactly a body that would return a value the open parameter must hold:
+
+```vl
+function G<A>(v: A | i32): A { v }
+const y: boolean = G(5)
+// refused: return type mismatch: expected never, got never | i32 (the return of `G` at the
+// call's argument types; the call binds no type to `A`, so give it an explicit type argument)
+```
+
+**Why not refuse every call that leaves a parameter open.** Measured on 2026-11-01, that refused 26
+tests that run with their `@log` today, D2803's and D12581's among them. The calls are correct; only
+a value delivered as the open parameter is not. A parameter no parameter annotation names keeps
+D4551's default and its own declaration-time refusal; this rule does not touch it.
+
+**What it leaves open.** `F<A, B>(v: A | B): boolean { v }` called as `F(5)` reads `never | never`,
+which every destination accepts. Whether `5` binds `A`, binds both, or is refused as ambiguous is the
+owner's ruling, filed as D14803.
 ## A plain build drops the functions no root reaches (2026-10-23)
 
 **The rule.** `vl build` and `vl run` emit, for every function no root reaches, a three-byte
@@ -11160,6 +11197,27 @@ field read narrows back exactly, but nothing emitted that narrowing, and master 
 D81/D139 destination pin (`synthDstPinAnn`) is measured for deletion rather than given a guard,
 because a guarded pin is still a second producer of the destination's rep.
 
+**Extended 2026-11-01 (D14817): a fresh call result delivered directly at a narrower own-type
+landing is built at the wider row and copied.** One function body builds one record row (D8301), so
+`mkcall` delivered at `Circle` by `sink(mkcall())` and at its own `K` by `both(mkcall(), k)` (a
+held `k: K` pins `both@K`) was refused. It now builds at `Circle`, and the call that lands at `K`
+is copied into `K` field by field (`recCopyNarrows`, `recSiteCopies`; `emitRecCopy`'s `null` arm).
+Sound because the copy happens where the call's fresh result is delivered as an argument: no alias
+to that record exists between the call and the copy, and every field the copy narrows is one the
+own type types `null`, which is the only value it can hold. The original record is dropped at the
+copy, so no write through one landing can be observed at the other. The limit: a value stored and
+delivered again is not fresh (`const c = mkcall(); both(c, k)`), so it keeps D14814's refusal
+(D15180 grades that DESIGN). A field the copy would have to narrow other than to `null`
+(`i32 | null` into `i32`) keeps it too (D15184).
+
+**Extended 2026-11-03 (D14818, D15183): the copy reaches a type parameter at any reach, under any
+pin.** A fresh call that reaches `T` as a list element, a record field or a nested list element, and
+one whose `T` a written type argument pins, is copied the same way: the call is still fresh where it
+lands, since a literal holding it is itself fresh. The checker records the copy's DECLARED
+destination, the pinning argument's declared type or the written type argument (`recCopyDstOf`), and
+the monomorphizer and the literal's elaboration read it (`recCopyTyOf`) rather than the call's build,
+so the instance is the pin's and a literal holding the call is built at the destination.
+
 ## A variant is a position in a union row, and union rows are keyed by member reps (ruling, D14551)
 
 Under structural records (D3870) a plain `{r: i32}` and a union's arm of the same shape are one
@@ -11301,11 +11359,11 @@ are assigned. An arm's fields are its row's. During collection an arm's fields a
 (`armStage*`); at the end of `collectS` each arm adopts a row (a struct row of its record type
 whose fields match by name and code, else its reference row, else one minted for it), the
 variant field columns become the struct-row lists themselves, and the staging is emptied; an arm
-created later adopts its row as it is minted. An arm adopting a struct row takes the row's
-element spellings: agreeing them at adoption writes a declared name into a row its canon twins
-compare by element name, and the twin lookup then declines; "a declared spelling wins" holds
-only where an arm's own row differs from its field row (`variantRowAgree`) until step 3 makes
-that comparison read element types, after which it holds everywhere. A shared-tag arm needs no
+created later adopts its row as it is minted. An arm adopting a struct row agrees its element
+spellings with the row's as the arms and rows agree everywhere: a declared spelling wins over a
+structural one. This waited on the layout compare reading element types before spellings
+(#5596), since a declared name written into a row its canon twins compare by spelling made the
+twin lookup decline. A shared-tag arm needs no
 row of its own: its fields match its record's row by name and code, so it adopts that row as its
 field row while its heap stays its tag-mate's; that is the one place an arm's two rows differ. Running `collectS`'s reset before
 `collectU`, so arms write rows directly, would remove the staging and is not done. The heap is the first table moved: an arm's heap type is its row's (`variantHeap`), and the
@@ -11316,3 +11374,293 @@ for now the function-tag rule declines a record whose fields would mix the two s
 record keeps its untagged row. A delivery that tags one must keep running
 `closures/hole-fn-record-beside-declared-row-handed-to-param.vl`,
 `closures/hole-fn-record-field-called-at-other-param.vl` and `closures/hole-fn-record-list-element.vl`.
+
+**Where the label stops (step 4, 2026-11-01).** After #5613 the `"variant"` kind is the arm
+reference and nothing more: a value's heap and fields come from its arm's row (`variantRowOf`,
+which `variantHeap` reads), and the writers in `emit_bytes.vl` take a variant kind through the
+struct arms. What stays with the arm is its box tag: every boxing site emits `uTags[vi]` off the
+value's variant index (24 readers), and a row does not determine a tag, since structural twins
+(`Cat`/`Kot`, one heap through `uVarTwin`) share a row as distinct arms with distinct tags. So
+producers keep minting `("variant", vi)`, the `$fnsig` result token keeps its variant kind (a
+caller boxing a returned arm reads its tag through it), and the label is not narrowed further.
+Folding tags into rows, a tag keyed by (union, row) rather than by arm, would be a separate
+tag-numbering decision, and it is not taken.
+
+## Numeric `==` across widths is a value compare, through every box (ruling, 2026-11-03) — D15090
+
+`==` between two numbers of different width widens to the wider type and compares the values,
+whether the operands are plain, nullable or members of a union: `(i32 | null) 1 == (f64 | null)
+1.0` is true, as `i32 1 == f64 1.0` already was, and `null == null` is true. Only a lossless pair
+compares (`i32` and `i64`, `i32` and `f64`, `f32` and `f64`); a lossy one (`i64` and `f64`, `i32`
+and `f32`) is refused at check, plain or boxed, so the boxed spelling never answers a pair the
+plain one would not. Before the ruling a union `==` compared the two boxes' tags first, so equal
+values of different width printed `false`, and `(i32 | null) == f64` was refused while
+`(i64 | null) == i32` ran. A float literal against a union whose only float arm is `f32` is
+still built at that arm; an `f64` value is compared at `f64`.
+
+The same relation holds element by element between two lists stored apart (D15055): `i32[] ==
+f64[]`, `(i32 | null)[] == i32[]` and `(i32 | null)[] == (f64 | null)[]` compare each pair by
+value, and `(P | null)[] == P[]` compares records field-wise with a null unequal to a record.
+One loop reads each operand at its own storage, so neither list is converted. A lossy pair
+(`i64[] == f64[]`) is refused as `i64 == f64` is.
+
+## A record wider than a union arm is that arm's subtype, not a copy of it (2026-11-02)
+
+A record value whose fields begin with one union arm's fields (same names, same storage, in the
+layout order) is delivered into the union as that arm. It is the same reference, boxed under
+the arm's tag. The arm's row is declared its WasmGC supertype, the way a narrower record row
+already is (D622), so the arm's `ref.cast` accepts it. A copy at the box was refused. It would
+build a new arm struct from the value's fields, so a write through the original binding after
+the delivery would not show through the union, and VL records alias. The edge is safe for
+dispatch because a union box is told apart by its tag, never by `ref.test` on a struct.
+
+Of two arms a value fits, it takes the longer one, which is the supertype `buildStructSupers`
+picks. Three sources reach the arm: a plain record (its row's supertype chain), a declared record
+that is another union's arm (that arm's row), and a box narrowed to such an arm (its payload,
+re-boxed under the narrower arm's tag, since a box keeps the tag it was built with). A nullable
+record is delivered as the union's null or as the record. Only a direct position lifts: a list
+element or map value is a different array type, so those positions are still refused. A union
+value delivered whole is re-tagged at run time (D15057): each tag of a wider arm becomes the tag
+of the arm it subtypes, and every other member keeps its own. Only a union destination takes
+it; a union of wider records into a plain record is still refused, since that needs an unbox.
+
+## A literal names its arm: a record narrower than one declared record is stored as it (ruling, 2026-11-01)
+
+A record literal no delivery adopts has its own checked type, often narrower than any declared
+record: `{ r: null }` is typed `{ r: null }`, not `Circle = { r: i32 | null }`. The emitter used to
+decide where such a value lives by field-name set twice, with two scans that agree only by
+coincidence. At the build site, `objVariantRowCtx` took the first union arm whose names matched.
+At the read site, the join-row scan (`joinRowScanOfTy`) mapped the narrow type back to a struct row
+the same way. Where they disagreed, a `vl check`-clean program was refused (D14870).
+
+**The rule is one checker query, `recNarrowRecordOf(ty)`.** It answers the declared record that
+record type `ty` is narrower than, meaning the same field names with `ty` assignable to it
+(`recRepWidens`), and that stores every field alike, meaning the same type or a `null` field. The
+candidates are every declared record, union arms and non-arm records alike, each type once. Arms
+of two unions that are one structural type are one record, because types are structural and the
+answer is a type, not a name. It answers -1 when `ty` is itself a declared record, when no record
+widens it, when two different records widen it, and when the one record that widens it does not
+store it alike.
+
+"Stores alike" exists because of D14493's test. `{ v: 3 }` beside the arm `{ v: f64 }` widens, but
+built at the arm `v / 2` reads 1.5 instead of 1. A numeric widening, or an `i32` field into a
+nullable `i32` one, changes what a read computes or how the field is stored. Such a literal is not
+stamped and keeps its own row, which is what it did before.
+
+The query has two callers. The checker stamps an unadopted literal with the answer when the answer
+is a union arm (`recArmLitsAdopt`), so the literal is built at the arm and its binding, call result
+and reads reach the arm through the chains that already carry a rep. And `repStructRowOfTy`'s last
+rung asks it of a value's type, for receivers no rep chain reaches (a `??` over a map read, an
+element of a generic call's result). The field-set scans are gone: the join-row scan is deleted,
+and `objVariantRowCtx` finds an unadopted literal's arm by the literal's own type.
+
+**This is action at a distance.** A declaration elsewhere in the program picks the rep, so adding a
+second record with the same field names moves a literal off an arm and onto its own row. It is kept
+because it is what the emitter already did, now one checker fact in place of two emitter scans. The
+alternative, refused for now, is that an unadopted literal is always its own row and a conversion is
+emitted wherever it later meets the union. If the distance ever bites, that is the change to make.
+
+## A value-fit list is not delivered at an instance (application of ruling (c), D4981, D5003)
+
+Not a new decision: owner ruling (c) on #3792 (D4928) says a list narrowed by `is K[]` is never
+delivered as `K[]`, applied here to the instance of a generic body. At `V = i32[]` an empty list
+passes `is f64[]` by value fit (D4771), and the arm reads it as a fresh `f64[]`. Handed to a
+parameter, a binding, a return or a field, a write would land in a list the caller does not hold,
+so the instance refuses the delivery as D4928 refuses it from a concrete declared type. Read-only
+uses in the arm (`v.length`, an element read) stay legal, as does every delivery at an instance
+whose list is the tested type or a union holding it. Aliasing the receiver is impossible across
+two storage types, and a silent copy is the lossy operation std and this file refuse elsewhere.
+
+The same refinement the records section below names would relax this rule too: a delivery that
+no later write can reach needs no copy (D14827, low priority).
+
+## A record narrowed by `is` is read at the narrowed type, not delivered as it (owner ruling, 2026-11-01) — D4084
+
+**The rule.** Records follow list ruling (c) (D4928). A record narrowed by `is B` (or tested
+by `as? B`) to a record that its declared type stores wider is read at `B`, but never delivered
+as `B`. That covers a binding, an argument, a push, an assignment, a return, and a field or
+element of a literal. The error names the copy, `{ x: a.x }`.
+
+```vl
+type A = { x: i32 }
+type B = { x: 1 | 2 }
+const keep: B[] = []
+function stash(a: A) { if a is B { keep.push({ x: a.x }) } }
+```
+
+An un-annotated copy (`const c = a`) binds at the declared type (D4133). `as B` from a union
+with a wider record member is refused, and `is B` with a copy is the spelling (D4134).
+
+**Why.** A record is shared, not copied. The narrowing is a fact about the record's current
+fields, and the caller's `A` may still write a value `B` does not allow, through the same
+object, after the narrowed scope has ended (D4084). A delivered `B` would then hold that value.
+
+**The price.** A correct program with no such write is refused too. The fixture for D14752
+delivered a narrowed `A | B` value as an `A` with nothing writing it afterwards, and now copies
+its fields.
+
+**The refinement, low priority (option (c)).** In an ideal world the compiler detects whether a
+later write could invalidate the narrowing, and when none can, the delivery is fine without a
+copy. It would relax lists and records alike (D14827, whose witness is D14752's original
+spelling).
+
+## A negative literal does not fit a `u8` element (owner ruling, 2026-11-02) — D3428
+
+**The rule.** A negative integer literal at a `u8` element is refused exactly as one past 255 is,
+and so is a constant holding one, since a constant is its literal at every read. `-0` fits.
+The wrap is spelled with a cast: `as% u8` keeps the low 8 bits (`as u8` is exact-or-fail).
+
+```vl
+const xs: u8[] = [-7]          // refused: the literal -7 does not fit a `u8` element
+const ys: u8[] = [-7 as% u8]   // 249
+```
+
+**Why.** The exact-constant ruling refuses a use whose destination cannot hold the exact value,
+and a literal the compiler can see is a mistake it can name. A computed value still truncates to
+its low 8 bits at the store, as the `u8` slot rule says, since a runtime range check on every
+store is not payable.
+
+## `x! is O` is refused, not read as `x !is O` (owner ruling A, 2026-11-02) — D3585
+
+**The rule.** A `!` written against its operand and apart from a following `is` (`x! is O`,
+`xs[0]! is O`, `(x)! is O`) is a parse error. The message names both spellings the writer
+may have meant: `x is O` to test the type, `x !is O` to negate it. `x !is O` stays the negated
+test, as do `x!is O` and `x ! is O`, where the `!` is not attached to the operand alone.
+
+**Why.** `x! is O` is the TypeScript non-null assertion followed by a type test, and it read
+as the negated test, so the program printed the opposite answer with no diagnostic (D3585).
+VL has no postfix `!` (D3555), so nothing legal is lost: the parse keys on the token
+columns only to tell an assertion from the start of `!is`.
+
+## An importer may assign an imported `let` (owner ruling, 2026-11-02) — D4063
+
+**The rule.** An imported `let` is a live binding the importer may assign. The write lands in
+the exporter's binding, so the exporter and every other importer read the new value. A
+re-exported `let` is written the same way through the re-export. An imported `const` stays
+read-only. This supersedes "the imported name is read-only" in decided direction 4
+(`docs/internals/modules-design.md` §5) and `docs/spec/modules.md` §M2.3.
+
+```vl
+// file: c.vl
+export let count = 0
+export function get(): i32 { count }
+// file: main.vl
+import { count, get } from "./c"
+count = 5
+print(get())   // prints 5
+```
+
+**Why.** It is what the compiler already did, and the compiler itself relies on it: its own
+modules assign imported `let`s throughout. A read-only rule would need a setter for each.
+
+**The price.** No analysis of a module's `let` may assume that only its own module writes it.
+
+## A read of a `let` takes its most recent write's type (owner ruling, 2026-11-02) — D2660
+
+**The rule.** A read of a `let` takes the type of the most recent write in scope, not the join
+of all its writes. In `let x = null; const y: string | null = x; x = 5`, the read of `x` is
+`null`, so the delivery is sound.
+
+**Status.** Backlogged in ROADMAP.md. The checker has no read-after-assignment typing for any
+type today, so this is a new rule. D2660 and D14930 are its witnesses and wait on it.
+
+## An inferred result one use delivers wider is built at the destination (owner ruling, 2026-11-02) — D14385
+
+**The rule.** When one use delivers an un-annotated function's result into a wider record (or a
+list of them), the result is built at the destination, as a binding is, and the function's other
+uses read it at that storage. D14385's witness prints `true` and `false`.
+
+**The constraint.** The value must not be writable, between the delivery and a use, in a way
+that breaks the wider or the narrower type. This is the alias rule of D4084's ruling.
+
+**Status.** Backlogged in ROADMAP.md. D14385 and D14890 are its witnesses and wait on it. Until
+it is built, a separate change refuses the family at check with the kept-versus-own sentence,
+graded as clause 2.
+
+## A type variable's uses join over numeric widening (owner ruling, 2026-11-02) — D2459
+
+**The rule.** When the uses of one type variable at a call disagree only by a lossless numeric
+widening (`i32` to `i64` or `f64`, `f32` to `f64`), the variable binds at the wider number, and
+the narrower uses widen into it. The order of the arguments does not decide the instance.
+
+```vl
+function f<T>(x: T, g: (i32) => T) { return g(2) }
+const two: i32 = 2
+print(f(two, (i) => i * 1.5))   // T = f64, prints 3, as `f((i) => i * 1.5, two)` does
+```
+
+Uses that disagree by anything else still refuse: `i64` beside `f64`, `i32` beside `f32`, and a
+number beside a string. A number literal already followed this rule by binding after the values
+beside it (D3541); this extends it to typed values and to a callback's result.
+
+**Why.** Binding at the first use made two declarations that differ only in parameter order
+accept different programs. The widening edges are the ones every other numeric context already
+takes implicitly, so joining over them adds no conversion a reader cannot already see.
+
+**The limit.** A call inside a generic body joins only where the template's own check joined it.
+A use typed by the enclosing type parameter (`mix(u, v)` with `u: U`) is not a number at the
+template, so the template types the call at `U`, and an instance that joined it would hand back
+a type its template never saw. Those calls keep their refusal (D15041).
+
+## A list callback op fixes the length at entry (owner ruling A, 2026-11-02) — D3068
+
+**The rule.** `.map`, `.filter` and `std:array`'s `reduce`, `mapIndexed`, `some` and `every` read
+the list's length once, before the first call. An element the callback pushes is not visited. An
+index the callback cuts off (by a `pop` or a clear) is skipped by `filter`, `reduce`, `some` and
+`every`, and ends `map` and `mapIndexed` with the trap an `xs[i]` read past the length raises.
+The same holds over a readonly view of the list.
+
+**Why.** Before, the core ops fixed the length but read the backing directly, so they returned
+the popped element out of its spare slot, and the std ops re-read the length, so a callback that
+pushed every time never ended (D3068). JavaScript fixes the length and skips, and VL follows it
+except where JavaScript leaves a hole in `map`'s result, which VL has no rep for, so it traps.
+
+**The price.** One length read per step in the core loops. Dropping it where the callback
+provably does not change the list is deferred, the simple case first and the complex one later.
+
+## A nested join means what its hoisted twin means (owner ruling, 2026-11-02) — D3657
+
+**The rule.** Inlining or hoisting a sub-expression never changes a program's behaviour. A value
+join nested inside another is typed and built as it would be bound to a `const` first: the inner
+join's type wins, and its literal tails are built at that type wherever the outer join delivers
+it.
+
+```vl
+function run(q: i32 | null, r: f64 | null) {
+  const x = if q != null { q } else { if r != null { r } else { 7 } }
+  print(x is f64)   // true: the inner join is f64, so its `7` is 7.0
+}
+```
+
+**What moved.** An earlier rule boxed a literal inside a union chain at its own type when that
+type was a member, so the `7` above was an `i32`. A float literal tail of an inner `f32` join was
+likewise kept at `f64`; it is now built at single precision, as `const y: f32 = 0.1` is
+(`tests/cases/numerics/f32-f64-join-widens.vl`). A join whose tails are all runtime values keeps
+D3656's member boxing; this ruling settles the literal tails.
+
+## `is` over a map against a narrower map tests its values (owner ruling, 2026-11-02) — D2701
+
+**The rule.** `m is {[K]: V2}` over a map typed `{[K]: V1}`, where `V2` is narrower than `V1`, is
+true when every value is a `V2`, so an empty map passes. This mirrors `xs is K[]` over a list
+(D4771). A join of two maps that store alike is the wider map (D2666), and this is where the test
+now reads true for a value built as the narrower one.
+
+```vl
+const w: {[string]: string | null} = Map()
+w["a"] = "x"
+print(w is {[string]: string})   // true
+```
+
+**How.** The checker mints the content check when it types the `is`: a loop over the map's
+values, kept on the node (`IsExpr.isFit`) as its one child. The elaboration re-checks it in
+each instance and the emitter lowers it in place of the test. Nothing is minted after the check
+(option (4); see the post-check minting inventory in `architecture-target-2026-10.md`).
+
+**The alias rule.** The narrowing holds only while nothing can write the map between the check
+and the use, as for a list (D4926, D4928). The values read at `V2` until a store through any
+alias, or a call that may write, ends it. The map is never delivered as `{[K]: V2}`, and the
+error names a copy. A key read still answers `V2 | null`, since a key can be absent.
+
+**The price.** A loop over the values for each such test, paid only where the static types
+cannot answer it.
+

@@ -3,6 +3,7 @@
 // value is inert (it reaches no call and nothing that observes its signature), and the split
 // plan of `fn_split.vl` asks it which calls a slot serves, so both read one answer (D6880).
 
+import { tyParamIsBareOnly } from "./check_scopes"
 import { emitFail } from "./emit_bytes"
 import { elabHoleRowCut, elabHoleRowMark } from "./check_elab_cap"
 import {
@@ -46,22 +47,26 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
-  callHasTyArgs,
   declExported,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
-  nodeChildren,
   nodeChildrenPush,
 } from "./ast"
 import { wsOrigTyOf } from "./check_demands"
-import { isVarTyIxOf } from "./check_list_union"
 import { i32TyIx } from "./check_leaf_steps"
 import { nodeTyIxOf } from "./check_node_tys"
 import { holeSlotCallRets, substTyDeep } from "./check_relate_core"
-import { T, TyFunc, mkFuncTy, tyAt, tyEq, tyMayHoldFn } from "./check_types"
 import {
-  monoAnnHasTyParam,
+  T,
+  TyFunc,
+  mkFuncTy,
+  tyAt,
+  tyEq,
+  tyIsMap,
+  tyMayHoldFn,
+} from "./check_types"
+import {
   monoDeclAnnName,
   monoTyParamOf,
   retVoidAnnFlag,
@@ -379,6 +384,14 @@ function vrStep(x: i32, path: string): i32[] {
     }
     ForIn => {
       if x == pn.fiBody { return none }
+      if (
+        x == pn.fiIter
+        && vrFollow
+        && tyIsMap(nodeTyIxOf(x))
+        && pn.fiVar2 == ""
+      ) {
+        return none
+      }
       if x == pn.fiIter { return vrForVar(pn, path) }
     }
     FuncDecl => {
@@ -417,6 +430,10 @@ function vrStep(x: i32, path: string): i32[] {
       if !vrExact {
         const pr = vrPushRecv(pn)
         if pr >= 0 { return vrPushed(pn, pr, x, path) }
+        const sr = vrMapSetRecv(pn)
+        if sr >= 0 && pn.callArgs.length == 2 && pn.callArgs[1] == x {
+          return vrPushed(pn, sr, x, path)
+        }
         return vrArg(pn, x, path)
       }
     }
@@ -895,7 +912,7 @@ function vrArg(n: Call, x: i32, path: string): i32[] {
       const pp = nodeAt(pIx)
       if pp is Param && pp.parDefault < 0 && pp.parRest == 0 {
         // A closed parameter type still yields the function to an `is` that widens it (D6701)
-        if !closed && !monoParamIsOpen(f, pIx) { return vrLost() }
+        if !closed && !monoParamIsOpen(cd, f, pIx) { return vrLost() }
         return vrDecl(pIx, path)
       }
     }
@@ -910,6 +927,15 @@ function vrPushRecv(n: Call): i32 {
   const m = nodeAt(n.callFn)
   if !(m is Member) || m.memProp != "push" { return -1 }
   if !tyIsArray(nodeTyIxOf(m.memObj)) { return -1 }
+  m.memObj
+}
+
+// The map call `n` sets a value into, for a followed question: its receiver; else -1.
+function vrMapSetRecv(n: Call): i32 {
+  if !vrFollow || n.callFn < 0 { return -1 }
+  const m = nodeAt(n.callFn)
+  if !(m is Member) || m.memProp != "set" { return -1 }
+  if !tyIsMap(nodeTyIxOf(m.memObj)) { return -1 }
   m.memObj
 }
 
@@ -934,6 +960,21 @@ function vrProp(prop: string, p: i32, path: string): i32[] {
     if c >= 0 {
       const cn = nodeAt(c)
       if cn is Call && cn.callFn == p && vrPushRecv(cn) >= 0 { return none }
+      if cn is Call && cn.callFn == p && vrMapSetRecv(cn) >= 0 { return none }
+      const pm = nodeAt(p)
+      const mo = if pm is Member { pm.memObj } else { -1 }
+      if (
+        cn is Call
+        && cn.callFn == p
+        && vrFollow
+        && mo >= 0
+        && tyIsMap(nodeTyIxOf(mo))
+      ) {
+        if prop == "has" || prop == "delete" { return none }
+        if prop == "get" && vrElemOf(path) == -1 {
+          return vrCalls(c, vrPathRest)
+        }
+      }
     }
     return vrLost()
   }
@@ -978,7 +1019,7 @@ export function vrOuterReadsInert(fd: i32): boolean {
 
 // Whether parameter `pIx` of `f` takes its argument's own type: un-annotated, or annotated by a
 // type parameter that no other parameter, the result, an `is`/`as` or a type argument names (D6910).
-function monoParamIsOpen(f: FuncDecl, pIx: i32): boolean {
+function monoParamIsOpen(fd: i32, f: FuncDecl, pIx: i32): boolean {
   const p = nodeAt(pIx)
   if !(p is Param) { return false }
   if p.parType < 0 { return true }
@@ -990,7 +1031,7 @@ function monoParamIsOpen(f: FuncDecl, pIx: i32): boolean {
   for q in f.fnParams {
     if q != pIx && monoParamBareTyParam(q, f.fnTyParams) == tp { return false }
   }
-  monoTyParamOnlyBareParams(f, tp)
+  tyParamIsBareOnly(fd, tp)
 }
 
 // The function declaration call `n`'s callee names directly, or -1.
@@ -1028,44 +1069,6 @@ export function monoFrameInstTmpl(fx: i32): i32[] {
     hops = hops + 1
   }
   none
-}
-
-// Whether `fn` names type parameter `tp` only as the whole annotation of some parameters: not
-// in its return type, another annotation, an `is`/`as` or a call's type arguments.
-export function monoTyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
-  const tps: string[] = [tp]
-  const bare: i32[] = []
-  for pIx in fn.fnParams {
-    const p = nodeAt(pIx)
-    if p is Param && p.parType >= 0 { bare.push(p.parType) }
-  }
-  const stack: i32[] = []
-  for pIx in fn.fnParams { stack.push(pIx) }
-  stack.push(fn.fnRet)
-  stack.push(fn.fnBody)
-  while stack.length > 0 {
-    const ix = stack.pop()
-    if ix >= 0 && ix < P.nodes.length {
-      const n = nodeAt(ix)
-      if n is TypeRef && monoAnnHasTyParam(ix, -1, tps) {
-        let ok = n.tyName == tp
-        if ok {
-          ok = false
-          for x in bare {
-            if x == ix { ok = true }
-          }
-        }
-        if !ok { return false }
-      }
-      if n is IsExpr && monoAnnHasTyParam(ix, isVarTyIxOf(ix), tps) {
-        return false
-      }
-      if n is AsExpr && monoAnnHasTyParam(ix, -1, tps) { return false }
-      if n is Call && callHasTyArgs(ix) { return false }
-      for c in nodeChildren(ix) { stack.push(c) }
-    }
-  }
-  true
 }
 
 // The type parameter a bare `T` or `T[]` parameter annotation rides, or "".

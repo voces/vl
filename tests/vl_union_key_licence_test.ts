@@ -17,8 +17,9 @@ const VL = `${ROOT}/scripts/vl-host/target/release/vl${
 const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const WITNESSES = `${ROOT}/tests/fixtures/union-key-licence/witnesses.txt`;
 // A struct union still minted as two rows under one key. D1492's own pair, `type AS = (Sc | Dg)`
-// beside the inline `Sc | Dg`, is one row now that a union names the row of its type key.
-const CONTROL = "tests/cases/unions/discriminant-narrows-parent.vl";
+// beside the inline `Sc | Dg`, is one row now that a union names the row of its type key, and
+// so are the literal-alias twins (`{kind: KC}` beside `{kind: "circle"}`, D15082).
+const CONTROL = "tests/cases/unions/discriminated-union-tag-read.vl";
 const POOL = 4;
 
 const exists = (p: string) => {

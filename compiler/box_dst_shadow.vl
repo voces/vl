@@ -1,0 +1,173 @@
+// The box-destination shadow: at each union-box delivery the emitter lowers, compare the union
+// its call site names against the checker's per-instance box record (`boxDstTyAt`). Off unless a
+// host arms it; armed, it counts each delivery by class, so the record can replace the sites'
+// own unions only where they agree (architecture-target-2026-10.md, step 5's record line).
+import { boxDstTyAt } from "./emit_capture_frames"
+import {
+  canonUnionKeyOfName,
+  canonUnionKeyOfTy,
+  canonUnionKeyTextOfName,
+} from "./check_nj_join"
+import { canonUnionKeyTextOfTy } from "./check_inline_lit_union"
+import { splitUnionAtoms } from "./tyname"
+import { tyToEmitName } from "./check_types"
+import { nodeSrc } from "./symbols"
+import { unwrapParen } from "./emit_base"
+import { elabInstTyAt } from "./emit_elab"
+import { tyHasTyVar } from "./tyquery"
+
+let bdsArmed = false
+let bdsNamed = false
+let bdsDrop = 0
+let bdsDepth = 0
+let bdsRowKey: string[] = []
+let bdsRowN: i32[] = []
+
+// Arm (1) or disarm (0) the shadow for the compiles that follow; 2 also names the site and both
+// unions in each row.
+export function boxDstShadowArm(on: i32) {
+  bdsArmed = on != 0
+  bdsNamed = on == 2
+  0
+}
+
+// The shadow's own control: 0 reads the record, 1 reads none (every delivery has no record), 2
+// reads a type no site names (every record disagrees).
+export function boxDstDropSet(v: i32) {
+  bdsDrop = v
+  0
+}
+
+// Start a compile's shadow.
+export function boxDstShadowBegin() {
+  bdsRowKey = []
+  bdsRowN = []
+  bdsDepth = 0
+  0
+}
+
+function bdsCount(key: string) {
+  let i = 0
+  while i < bdsRowKey.length {
+    if bdsRowKey[i] == key {
+      bdsRowN[i] = bdsRowN[i] + 1
+      return 0
+    }
+    i = i + 1
+  }
+  bdsRowKey.push(key)
+  bdsRowN.push(1)
+  0
+}
+
+// The box record for delivery node `ix` in `fnIx`, read through a paren and the node a rewrite or
+// mono copy made it from; -1 for none.
+function bdsRecord(ix: i32, fnIx: i32): i32 {
+  if bdsDrop == 1 { return -1 }
+  let r = boxDstTyAt(ix, fnIx)
+  if r < 0 { r = boxDstTyAt(unwrapParen(ix), fnIx) }
+  if r < 0 { r = boxDstTyAt(nodeSrc[ix] ?? -1, fnIx) }
+  if r < 0 { return -1 }
+  if bdsDrop == 2 { return 0 }
+  // A record a generic body banked names its type parameters; the instance closes them.
+  if tyHasTyVar(r) {
+    const it = elabInstTyAt(r, fnIx)
+    if it >= 0 { return it }
+  }
+  r
+}
+
+// The class of the delivery of `ix` into the union the site names `unionName` (type `unionTy`
+// where it has one); `form` is 1 when the value is already a box, 2 when it never returns.
+function bdsClass(
+  unionName: string,
+  unionTy: i32,
+  ix: i32,
+  fnIx: i32,
+  form: i32,
+) {
+  if form == 1 { return "value already a box" }
+  if form == 2 { return "value never returns" }
+  const r = bdsRecord(ix, fnIx)
+  if r < 0 { return "no record" }
+  if unionTy >= 0 && unionTy == r { return "agree" }
+  const rn = tyToEmitName(r)
+  if rn == unionName { return "agree" }
+  // Two spellings of one union: an alias against its members, `null` in another position, or the
+  // members in another order, since a box's tag is its member's alone (`boxTagOfTy`).
+  const ks = canonUnionKeyOfName(unionName)
+  if ks >= 0 && (canonUnionKeyOfTy(r) == ks || canonUnionKeyOfName(rn) == ks) {
+    return "agree up to spelling"
+  }
+  if rn == "" { return "record renders empty" }
+  if (
+    bdsSameAtoms(canonUnionKeyTextOfName(unionName), canonUnionKeyTextOfTy(r))
+  ) {
+    return "agree up to spelling"
+  }
+  "disagree"
+}
+
+// Whether key texts `a` and `b` hold the same members, in any order.
+function bdsSameAtoms(a: string, b: string): boolean {
+  if a == "" || b == "" { return false }
+  const xs: string[] = []
+  const ys: string[] = []
+  splitUnionAtoms(a, xs)
+  splitUnionAtoms(b, ys)
+  if xs.length != ys.length { return false }
+  for x in xs {
+    let hit = false
+    for y in ys {
+      if y == x { hit = true }
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+// Note a site's union-box delivery of `ix` into `unionName`, `site` naming the entry point and
+// `form` the value's (`bdsClass`). A delivery inside another's lowering counts as `nested`.
+export function boxDstShadowNote(
+  site: string,
+  unionName: string,
+  unionTy: i32,
+  ix: i32,
+  fnIx: i32,
+  form: i32,
+) {
+  if !bdsArmed { return 0 }
+  let key = bdsClass(unionName, unionTy, ix, fnIx, form)
+  // A delivery a site boxes inside its own lowering is counted apart, so a class over sites
+  // stays comparable, and a nested delivery with no record is still seen.
+  if bdsDepth > 0 { key = "nested " + key }
+  if bdsNamed {
+    const r = bdsRecord(ix, fnIx)
+    let col = "-"
+    if r >= 0 { col = tyToEmitName(r) }
+    key = key + " | " + site + " | site " + unionName + " | record " + col
+  }
+  bdsCount(key)
+  0
+}
+
+// Bracket a site's own lowering, so the deliveries inside it count as nested.
+export function boxDstShadowEnter() {
+  if bdsArmed { bdsDepth = bdsDepth + 1 }
+  0
+}
+
+export function boxDstShadowLeave() {
+  if bdsArmed && bdsDepth > 0 { bdsDepth = bdsDepth - 1 }
+  0
+}
+
+export function boxDstShadowRowCount() { bdsRowKey.length }
+
+export function boxDstShadowRowLen(i: i32) { bdsRowKey[i].length }
+
+export function boxDstShadowRowAt(i: i32, j: i32) { bdsRowKey[i][j] }
+
+export function boxDstShadowRowN(i: i32) { bdsRowN[i] }
+
+export function boxDstShadowArmed(): boolean { bdsArmed }

@@ -5,6 +5,7 @@
 // it also grades every function value the monomorphizer decided against its class after the last
 // pass, and counts the verdicts as `flow | …` rows in the per-call shadow's bank.
 import { nodeTyIxOf } from "./check_node_tys"
+import { cwParamArgs } from "./check_write_scan"
 import {
   ArrayLit,
   AsExpr,
@@ -77,7 +78,7 @@ import {
   tyToEmitName,
   tyToStr,
 } from "./check_types"
-import { tyHasTyVar } from "./tyquery"
+import { nonNullTy, tyHasTyVar } from "./tyquery"
 import { sigKeyOfTy } from "./emit_sig_tokens"
 
 // 0 off, 1 armed, 2 armed with names in each row, 3 armed and keyed by call path instead of by
@@ -1124,6 +1125,15 @@ function ffCall(ix: i32, fnIx: i32): i32 {
       if ty is TyVar && n is Call && sk != "" {
         return ffMethodAt(ix, cn.memObj, cn.memProp, sk)
       }
+      // So does a read of one slot, its value read as an element is (D15175).
+      const rk = if ty is TyVar && n is Call { ffReadKindOf(cn.memProp, cn.memObj) } else { "" }
+      if rk == "ev" && n is Call {
+        // Lists and maps both handed to it: the read is either one's slot.
+        const r = ffFlow(cn.memObj, "receiver")
+        for a in n.callArgs { ffFlow(a, "argument") }
+        return ffJoin2(ffKid(r, "e"), ffKid(r, "v"))
+      }
+      if rk != "" { return ffMethodAt(ix, cn.memObj, cn.memProp, rk) }
       if ffObjHasField(rt, cn.memProp) || ffBoundObjHasField(rt, cn.memProp) {
         return ffSlotCall(ix, ffFlow(c, "callee"), [])
       }
@@ -1315,6 +1325,31 @@ function ffStoreKindOfName(name: string): string {
   if name == "set" || name == "add" { return "v" }
   if name == "push" || name == "unshift" || name == "insert" { return "e" }
   ""
+}
+
+// The slot kind a reading method takes on an un-annotated parameter `recv`: a list's `pop` its
+// element; `get` the kind the arguments handed to the parameter have, a list's element "e", a
+// map's value "v", or "ev" when both are handed; "" otherwise.
+function ffReadKindOf(name: string, recv: i32): string {
+  if name == "pop" { return "e" }
+  if name != "get" { return "" }
+  const r = unwrapParen(recv)
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return "" }
+  const d = identDeclOf(r)
+  const args: i32[] = []
+  if d < 0 || d >= P.nodes.length || !cwParamArgs(d, args) || args.length == 0 {
+    return ""
+  }
+  let k = ""
+  for a in args {
+    const t = nodeTyIxOf(a)
+    if t < 0 || t >= T.tys.length { return "" }
+    const ty = tyAt(nonNullTy(t))
+    const ak = if ty is TyArray { "e" } else if ty is TyMap { "v" } else { "" }
+    if ak == "" { return "" }
+    if k == "" || k == ak { k = ak } else { k = "ev" }
+  }
+  k
 }
 
 // Whether the checker gave node type `t` a shape a member read can resolve against.

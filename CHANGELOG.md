@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **Step 5: `ExpCtx` is deleted.** Its last field, `litUnion`, had one reader, a string literal at an open program record, which reads its recorded type now (#5606). The `ctx` parameter goes from 458 functions, compiler −1,938 lines, every built module byte-identical. Before it: a `??` default records the join (#5591), and an index store pins a hole map's key at the instance (#5599, D14229 closed).
 - **Step 1: the checker banks no program-wide hole pin.** `nodeTyPinIxOf` goes (#5452). The `?.` rewrite and the list-element rung read each instance's type from the elaboration (#5459, #5464), and `holePinsOfTy` goes with them.
 - **Step 7: `vtKindOfType` and `exprStruct` read the rep.**
   - An annotation's value kind is its rep, and the 25-arm ladder goes (#5454).

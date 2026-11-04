@@ -3,6 +3,7 @@
 // getter contracts, the effect summaries, the record-covariance writes and widenings, the
 // numeric-literal refutations and the rewrite of annotation names into the emitter's
 // vocabulary. It sits above `typecheck.vl`, which never calls it.
+import { paramCopyBuild, paramCopyReset } from "./check_elab_cap"
 import { declTyOf } from "./check_nar_store"
 import { recListLitsBuild } from "./check_bind_adopt"
 import {
@@ -152,6 +153,7 @@ import {
   narIfEndsSet,
   narListDeclReadsSet,
   nodeRepTyIx,
+  pinLitServed,
   shiftCountNodes,
   topUnannotFns,
   voidRetRwBlk,
@@ -468,6 +470,10 @@ import {
   REC_DELIV_OWN,
   recAdApartAtPin,
   recAdOpen,
+  recApartAt,
+  recApartDecl,
+  recApartDst,
+  recApartReset,
   recArgRepOf,
   recArgRepReset,
   recBuildNote,
@@ -480,6 +486,7 @@ import {
   recKeptDst,
   recKeptDstSet,
   recKeptFnNote,
+  recKeptOwn,
   recKeptOwnSet,
   recListLitsSet,
   recOwnPend,
@@ -492,6 +499,12 @@ import {
   recPendReset,
   recPendSrc,
   recPendSrcTy,
+  recWideFnAt,
+  recWideFnDecl,
+  recWideFnDst,
+  recWideFnOwn,
+  recWideFnPush,
+  recWideFnReset,
 } from "./check_rec_rows"
 import {
   recCoalesceOperands,
@@ -499,7 +512,6 @@ import {
   recIsJoin,
   recKeptWhat,
   recLeafEscapes,
-  recOwnIsPin,
 } from "./check_record_origins"
 import {
   rcwCallSites,
@@ -543,7 +555,12 @@ import {
   nulListRetName,
   valueUnionRetName,
 } from "./check_ret_names"
-import { declareAmbient, identIsConst } from "./check_scopes"
+import {
+  declareAmbient,
+  identIsConst,
+  tyParamBareOnlyNote,
+} from "./check_scopes"
+import { tyParamOnlyBareParams } from "./check_typaram_bare"
 import {
   joinDeclSet,
   joinHeadSet,
@@ -552,7 +569,6 @@ import {
   joinTySet,
   nestedUnannotFns,
   nestedUnannotTys,
-  nodePinKindSet,
   pgVoidSet,
 } from "./check_side_rows"
 import { tyIsDeferredJoin } from "./check_tp_join"
@@ -561,6 +577,7 @@ import {
   fieldStorageEq,
   listJoinStorageDiffers,
   objFieldNameSetsEq,
+  recNumMergeField,
   recStorageField,
 } from "./check_ty_relate"
 import {
@@ -571,7 +588,13 @@ import {
   oneListUnionAliasName,
   transparentMemberEmitName,
 } from "./check_ty_rep"
-import { nonNullTy, primNameOf, tyHasTyVar, tyStepElem } from "./tyquery"
+import {
+  nonNulTyOf,
+  nonNullTy,
+  primNameOf,
+  tyHasTyVar,
+  tyStepElem,
+} from "./tyquery"
 import {
   elemHasZero,
   partsHaveNull,
@@ -666,6 +689,7 @@ import {
   CW_UP_TAIL,
   cwBuildFrames,
   cwCalleeDeclOf,
+  cwFnCalls,
   cwFnTailStmt,
   cwFrJoins,
   cwFrRets,
@@ -684,11 +708,19 @@ import {
   cwOccNext,
   cwOccWalk,
   cwPeel,
+  cwPeelValue,
   cwPicksFinalSet,
   fnDeclIx,
   rcwBlockTail,
 } from "./check_write_scan"
 import { numLexFitsI32 } from "./emit_bignum"
+import {
+  callBuiltTy,
+  storeCoalescesResolve,
+  storeLetsResolve,
+  storeRetsResolve,
+  storeWritesResolve,
+} from "./check_store_rep"
 import { nodeStartTok } from "./fmt_util"
 import { i32ListHas, strListHas } from "./listutil"
 import {
@@ -738,15 +770,21 @@ import {
   recAdoptNote,
   recAdoptUnionList,
   recBuiltReadRefuse,
+  recHandsBackPinLit,
+  recKeptOwnMsg,
   recKeptStoreDecls,
+  recOwnHoldsCopy,
+  recOwnPinSkip,
   recStoreDeclOf,
   recStoresAgree,
   recordInferRet,
   recordInferRetNullOnly,
   recordRepTyAdopt,
+  storeRepPassReset,
 } from "./check_fit_rules"
 import {
   arrDefPinHoleElem,
+  flushOpenArgMaps,
   flushUninferred,
   objFieldHolesToI32,
 } from "./check_narrow_flow"
@@ -3604,8 +3642,11 @@ function recWidenWalk(expr: i32, src: i32, dst: i32, depth: i32): boolean {
       const rl = recFnValueLeaves(fd)
       let ri = 0
       while ri < rl.length {
-        // A local the function also hands elsewhere is shared, so it is judged by its type.
-        const lx = if recLeafEscapes(rl[ri]) { -1 } else { rl[ri] }
+        // A local the function also hands elsewhere is shared, so it is judged by its type, and
+        // so is a literal the destination keeps two of its numbers as one in: the function's
+        // result is built at its own type, not the destination's (D14891).
+        const lx = if (recLeafEscapes(rl[ri])
+          || recNumMergeField(nodeTyIxOf(rl[ri]), dst, REC_STORE_DEPTH) != "") { -1 } else { rl[ri] }
         if recWidenWalk(lx, nodeTyIxOf(rl[ri]), dst, depth - 1) { return true }
         ri = ri + 1
       }
@@ -3692,6 +3733,19 @@ function recAdTemplatePair(src: i32, dst: i32): boolean {
     && recAdApartAtPin(src, dst)
 }
 
+// Note `src`, a call of a function with no declared result, when it delivers its record list
+// result as another list.
+function recWideListNote(src: i32, srcTy: i32, dstTy: i32) {
+  const p = cwPeelValue(src)
+  if p < 0 || p >= P.nodes.length || !tyHoldsObjDeep(srcTy) { return 0 }
+  const fd = recInferredFnOf(p)
+  const sl = nonNulTyOf(srcTy)
+  const dl = nonNulTyOf(dstTy)
+  if fd < 0 || sl < 0 || dl < 0 || tySame(sl, dl) { return 0 }
+  if !(tyAt(sl) is TyArray) || !(tyAt(dl) is TyArray) { return 0 }
+  recWideFnPush(fd, sl, dl, p)
+}
+
 // Judge every queued delivery, and note the ones that adopt a binding or function.
 function recRunPending() {
   recArgRepReset()
@@ -3705,7 +3759,9 @@ function recRunPending() {
       shapeAdaptSrcTySet(-1)
       shapeAdaptDstTySet(-1)
       shapeAdaptSrcExprSet(-1)
-      const refused = recWidenWalk(
+      // A literal whose fields' parameter reads every pin served is built around those arguments.
+      const refused = !(pinLitServed[cwPeelValue(recPendSrc[i])] ?? false)
+        && recWidenWalk(
         recPendSrc[i],
         recPendSrcTy[i],
         recPendDstTy[i],
@@ -3713,6 +3769,8 @@ function recRunPending() {
       )
       if refused {
         objShapeAdapterlessErr(recPendAt[i], recPendSrcTy[i], recPendDstTy[i])
+      } else {
+        recWideListNote(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i])
       }
       shapeAdaptRecStorageSet(false)
       recPendRefusedSet(refused)
@@ -3724,12 +3782,20 @@ function recRunPending() {
     } else {
       recAdoptUnionList(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i])
       recOwnPend(recPendSrc[i], recPendSrcTy[i])
+      recWideListNote(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i])
     }
     i = i + 1
   }
   recKeptConflicts()
+  recKeptFnOwnCalls()
   recListLitsBuild()
   recKeptFnNote()
+  // The writes read this pass's builds, which `recBuildNote` then hands on.
+  storeLetsResolve()
+  storeRetsResolve()
+  storeWritesResolve()
+  storeCoalescesResolve()
+  paramCopyBuild()
   recBuildNote()
   if recDelivOn { recDelivRecord() }
   recAnnObjsSet([])
@@ -3740,6 +3806,8 @@ function recRunPending() {
   recKeptDstSet([])
   recKeptAtSet([])
   recKeptOwnSet([])
+  recApartReset()
+  recWideFnReset()
   0
 }
 
@@ -3753,15 +3821,160 @@ function recDelivRecord() {
     k = k + 1
   }
   for u in recOwnSrc {
-    const d = if recOwnIsPin(u) { -1 } else { recFreshOriginDecl(u, 6) }
+    const d = if recOwnPinSkip(u) { -1 } else { recFreshOriginDecl(u, 6) }
     if d >= 0 { recDelivPush(d, u, REC_DELIV_OWN) }
   }
 }
 
+// Refuse every other call of a function whose result one delivery builds at a wider record: the
+// body builds one result, and a call kept at its own type cannot read it (D14385, clause 2 until
+// the result is built at the destination).
+function recKeptFnOwnCalls() {
+  if recKeptDecl.length == 0 && recWideFnDecl.length == 0 { return 0 }
+  cwIxBuild()
+  let k = 0
+  while k < recKeptDecl.length {
+    if nodeAt(recKeptDecl[k]) is FuncDecl && k < recKeptOwn.length {
+      if recBoxApart(recKeptOwn[k], recKeptDst[k], REC_STORE_DEPTH) {
+        recWideFnOwnCalls(recKeptDecl[k], recKeptDst[k], recKeptAt[k])
+      }
+    }
+    k = k + 1
+  }
+  k = 0
+  while k < recWideFnDecl.length {
+    if recBoxApart(recWideFnOwn[k], recWideFnDst[k], REC_STORE_DEPTH) {
+      recWideFnOwnCalls(recWideFnDecl[k], recWideFnDst[k], recWideFnAt[k])
+    }
+    k = k + 1
+  }
+  recOwnRefused = []
+  0
+}
+
+// Whether `dst` stores some part of an `own` value in a union box that `own` does not, or the
+// reverse: the part a build at the destination cannot hand to a use kept at its own type. A
+// `| null` widening is served, so it is not apart.
+function recBoxApart(own: i32, dst: i32, depth: i32): boolean {
+  if own < 0 || dst < 0 || depth <= 0 || tySame(own, dst) { return false }
+  const o = tyAt(own)
+  const d = tyAt(dst)
+  if o is TyNullable {
+    if d is TyNullable { return recBoxApart(o.nInner, d.nInner, depth - 1) }
+    return recBoxApart(o.nInner, dst, depth - 1)
+  }
+  if d is TyNullable { return recBoxApart(own, d.nInner, depth - 1) }
+  if o is TyUnion || d is TyUnion { return true }
+  if o is TyArray && d is TyArray {
+    return recBoxApart(o.aElem, d.aElem, depth - 1)
+  }
+  if o is TyObj && d is TyObj {
+    let i = 0
+    while i < d.objFieldNames.length {
+      let j = 0
+      while (
+        j < o.objFieldNames.length
+        && o.objFieldNames[j] != d.objFieldNames[i]
+      ) {
+        j = j + 1
+      }
+      if j < o.objFieldNames.length {
+        if recBoxApart(o.objFieldTypes[j], d.objFieldTypes[i], depth - 1) {
+          return true
+        }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  recBoxNoPart(own, dst)
+}
+
+// Two types neither of which is a `| null`, union, list or record pair hold no part a box stores.
+function recBoxNoPart(_own: i32, _dst: i32): boolean { false }
+
+// Refuse each call of `fd` kept at its own type, where the call `at` builds its result as `dst`.
+function recWideFnOwnCalls(fd: i32, dst: i32, at: i32) {
+  const calls: i32[] = []
+  cwFnCalls(fd, calls)
+  for c in calls {
+    if recFnOwnCall(fd, c, dst) {
+      recAdRaising = true
+      tErr(recKeptOwnMsg(fd, dst, at, false), c)
+      recAdRaising = false
+    }
+  }
+  0
+}
+
+// Whether `c`, a call of `fd`, is kept at its own type: no delivery builds it at `dst`'s
+// storage, it is no own-storage delivery already refused, and no generic argument pins it.
+function recFnOwnCall(fd: i32, c: i32, dst: i32): boolean {
+  if c < 0 || c >= P.nodes.length || recInferredFnOf(c) != fd { return false }
+  if recArgRepOf(c) >= 0 || i32ListHas(recOwnRefused, c) { return false }
+  let j = 0
+  while j < recKeptDecl.length {
+    if (
+      recKeptDecl[j] == fd
+      && recKeptAt[j] == c
+      && fieldStorageEq(recKeptDst[j], dst, REC_STORE_DEPTH)
+    ) {
+      return false
+    }
+    j = j + 1
+  }
+  j = 0
+  while j < recWideFnDecl.length {
+    if (
+      recWideFnDecl[j] == fd
+      && recWideFnAt[j] == c
+      && fieldStorageEq(recWideFnDst[j], dst, REC_STORE_DEPTH)
+    ) {
+      return false
+    }
+    j = j + 1
+  }
+  true
+}
+
+// The own-storage deliveries `recKeptConflicts` refused this pass.
+let recOwnRefused: i32[] = []
+
 // Refuse every own-storage delivery of a value a kept delivery builds at another storage: one
 // value cannot be stored both ways, and a record is shared, not copied.
+// Refuse each own-storage delivery of a binding built apart (`recApartDecl`), as a kept one's
+// is below, without the kept arm's container checks (D15281).
+function recApartRefuse() {
+  if recApartDecl.length == 0 { return 0 }
+  cwIxBuild()
+  for u in recOwnSrc {
+    const skip = recOwnPinSkip(u) || recOwnHoldsCopy(u)
+    const d = if skip { -1 } else { recFreshOriginDecl(u, 6) }
+    let k = recApartDecl.length - 1
+    while k >= 0 && recApartDecl[k] != d { k = k - 1 }
+    if d >= 0 && k >= 0 && recStoreDeclOf(u) < 0 && recArgRepOf(u) < 0 {
+      recAdRaising = true
+      recOwnRefused.push(u)
+      tErr(
+        recKeptOwnMsg(d, recApartDst[k], recApartAt[k], recApartAt[k] == u),
+        u,
+      )
+      recAdRaising = false
+    }
+  }
+  0
+}
+
 function recKeptConflicts() {
-  if recKeptDecl.length == 0 { return 0 }
+  recApartRefuse()
+  if recKeptDecl.length == 0 {
+    // A literal a pin built wider is still refused where a call hands it back and it is handed
+    // on at its own type (D15185).
+    for u in recOwnSrc {
+      if recHandsBackPinLit(u) { recBuiltReadRefuse(u) }
+    }
+    return 0
+  }
   // Two deliveries that build one kept binding at two storages.
   let i = 0
   while i < recKeptDecl.length {
@@ -3797,7 +4010,8 @@ function recKeptConflicts() {
   cwIxBuild()
   const maps: i32[] = []
   for u in recOwnSrc {
-    const d = if recOwnIsPin(u) { -1 } else { recFreshOriginDecl(u, 6) }
+    const skip = recOwnPinSkip(u) || recOwnHoldsCopy(u)
+    const d = if skip { -1 } else { recFreshOriginDecl(u, 6) }
     if d >= 0 {
       let k = recKeptDecl.length - 1
       while k >= 0 && recKeptDecl[k] != d { k = k - 1 }
@@ -3808,21 +4022,9 @@ function recKeptConflicts() {
       } else if k >= 0 && recArgRepOf(u) < 0 {
         recAdRaising = true
         // One delivery in a generic body reaches the value at two instances' types.
-        let how = " where line "
-          + i32ToStr(nodeLineOf(recKeptAt[k]))
-          + " delivers it, and it is handed on here at its own type"
-        if recKeptAt[k] == u {
-          how = " by this delivery at one instance of the generic function around it, and "
-            + "kept at its own type at another"
-        }
+        recOwnRefused.push(u)
         tErr(
-          recKeptWhat(d)
-            + " is built as "
-            + tyToStr(recKeptDst[k])
-            + how
-            + ", which stores a field differently; a record is shared, not copied, so one "
-            + "value cannot be both. Annotate it with one of the types, and copy it with an "
-            + "object literal for the other",
+          recKeptOwnMsg(d, recKeptDst[k], recKeptAt[k], recKeptAt[k] == u),
           u,
         )
         recAdRaising = false
@@ -4242,6 +4444,8 @@ export function checkProgramPass(rootIx: i32) {
   checkerArmedSet(false)
   wsPassReset()
   recPendReset()
+  storeRepPassReset()
+  paramCopyReset()
   recDupFieldErrs()
   // Before the tables below are sized, so every node it mints is checked (D1991).
   hoistMatchScrutinees(rootIx)
@@ -4268,7 +4472,6 @@ export function checkProgramPass(rootIx: i32) {
   joinDeclSet([])
   cFuncPinTyIxSet(-1)
   cObjPinTyIxSet(-1)
-  nodePinKindSet([])
   let ntz = 0
   lbiDefaultExpr = Map()
   nolLitsSet([])
@@ -4291,10 +4494,23 @@ export function checkProgramPass(rootIx: i32) {
   bindProgram(rootIx)
   checkExternDecls()
   checkNode(rootIx)
+  // Each type parameter a named function names only as whole parameter annotations, which a
+  // generic handed to two of them may pin apart (D6090); read once every body is checked.
+  let bo = 0
+  while bo < P.nodes.length {
+    const bn = nodeAt(bo)
+    if bn is FuncDecl && bn.fnName != "" {
+      for tp in bn.fnTyParams {
+        if tyParamOnlyBareParams(bn, tp) { tyParamBareOnlyNote(bo, tp) }
+      }
+    }
+    bo = bo + 1
+  }
   cwPicksFinalSet(true)
   // The global scope (depth 0) is never popped, so flush its un-annotated
   // empty-collection bindings here: any still-open hole is genuinely uninferable.
   flushUninferred(0)
+  flushOpenArgMaps()
   flushNullOnlyLits()
   flushU8MixLits()
   flushContainerNullHoles()
@@ -5783,6 +5999,7 @@ function checkerForce(k: i32, a: i32, b: i32, c: i32): i32 {
     if fvaAdaptJoin(a, b) || fvaAdaptListLit(a, b) { return 1 }
     return 0
   }
+  if k == 3 { return callBuiltTy(a, b) }
   if assignableExpr(a, b, c) { return 1 }
   0
 }

@@ -1,0 +1,553 @@
+// The storage a value is built at, once a check pass's builds are known: the record every
+// result of a call or a binding of one is built at, and the field writes boxed at it.
+
+import {
+  ArrayLit,
+  BinExpr,
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  Member,
+  ObjLit,
+  P,
+  Param,
+  nodeAt,
+} from "./ast"
+import { rcwCallSites } from "./check_record_writes"
+import { callRetRepTy } from "./check_bind_adopt"
+import { nodeTyIxOf } from "./check_node_tys"
+import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
+import { tErr } from "./check_relate_core"
+import {
+  nodeRepStamped,
+  nodeRepTyIxOf,
+  recCopyFromOf,
+  recCopyTyOf,
+} from "./check_core_state"
+import {
+  T,
+  TyArray,
+  TyObj,
+  mkArrayTy,
+  mkObjTy,
+  objFieldType,
+  tyAt,
+  tySame,
+  tyToStr,
+} from "./check_types"
+import { nonNullTy } from "./tyquery"
+import {
+  recBuiltReadTy,
+  recCoalesceDefaultBuilt,
+  recCoalesceDefaultDeliver,
+  recCoalesceLitAdopt,
+  recHoleIdentityArg,
+  recordBoxTy,
+  recordRepTyAdopt,
+  repStampHeldRead,
+  storeFnAt,
+  storeFnCount,
+  storeLetBuiltOf,
+  storeLetBuiltSet,
+  storeLetCount,
+  storeLetDeclAt,
+  storeLetInitAt,
+  storeWriteCount,
+  storeWriteFieldAt,
+  storeWriteFnAt,
+  storeWriteRecvAt,
+  storeWriteValAt,
+  storeWritesClear,
+} from "./check_fit_rules"
+import { recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
+import { recSolePinArg } from "./check_record_origins"
+import { recFnValueLeaves } from "./check_type_shape"
+import { cwFrJoins, cwIxUp, cwPeelValue } from "./check_write_scan"
+import { i32ListHas } from "./listutil"
+import { recArgRepArgs, recArgRepOf, recBuildPush } from "./check_rec_rows"
+import { identBoundFnDeclOf } from "./check_scopes"
+import { identDeclOf } from "./symbols"
+import { unwrapParen } from "./emit_base"
+import { litRepTyAt } from "./emit_elab"
+
+// The record every result of the inferred-result call `u` is built at, through results that are
+// further such calls, a generic or hole identity of one, a binding holding only one, or a built
+// container's read; -1 where a result is anything else or the results disagree.
+export function callBuiltTy(x: i32, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const p = solePinPeel(x)
+  // A call copied back to its own record is built at the copy's record (D15246, D15266).
+  if p >= 0 && nodeAt(p) is Call && recCopyFromOf(p) >= 0 {
+    return recCopyTyOf(p)
+  }
+  const hd = if p >= 0 && nodeAt(p) is Ident { recHeldDecl(p) } else { -1 }
+  const hn = if hd >= 0 { nodeAt(hd) } else { nodeAt(0) }
+  if hd >= 0 && hn is LetDecl { return callBuiltTy(hn.letInit, depth - 1) }
+  // A binding's literal is built at its rep stamp, as a result literal is.
+  if p >= 0 && nodeAt(p) is ObjLit {
+    const ls = litRepTyAt(p, -1)
+    return if ls >= 0 && ls < T.tys.length && tyAt(ls) is TyObj { ls } else { -1 }
+  }
+  const u = p
+  const fd = if u >= 0 { recInferredFnOf(u) } else { -1 }
+  // A read out of a container its stores build elsewhere is that build (D14810).
+  if fd < 0 {
+    // A generic call's result is its rep row's (D14733).
+    const gr = if u >= 0 && nodeAt(u) is Call { callRetRepTy(u, nodeTyIxOf(u)) } else { -1 }
+    if gr >= 0 { return gr }
+    const br = if u >= 0 { recBuiltReadTy(cwPeelValue(u)) } else { -1 }
+    return if br >= 0 { nonNullTy(br) } else { -1 }
+  }
+  const ha = recHoleIdentityArg(u, fd)
+  if ha >= 0 { return callBuiltTy(ha, depth - 1) }
+  let r = -1
+  for lf in recFnValueLeaves(fd) {
+    const l = solePinPeel(lf)
+    if l < 0 { return -1 }
+    const s = if nodeAt(l) is ObjLit { litRepTyAt(l, -1) } else { callBuiltTy(l, depth - 1) }
+    if s < 0 || s >= T.tys.length || !(tyAt(s) is TyObj) { return -1 }
+    if r < 0 { r = s }
+    else if !tySame(r, s) { return -1 }
+  }
+  r
+}
+
+// The value `x` delivers once each generic identity it passes through (`recSolePinArg`) is peeled.
+function solePinPeel(x: i32): i32 {
+  let l = unwrapParen(x)
+  let hops = 0
+  while l >= 0 && hops < 8 && recSolePinArg(l) >= 0 {
+    l = unwrapParen(recSolePinArg(l))
+    hops = hops + 1
+  }
+  l
+}
+
+// The record the value `x`, read in function `fd`, is stored as: a call's or binding's build
+// (`callBuiltTy`), the rep every call hands a parameter of `fd` at, or an element of one; else -1.
+function storeRepOf(x: i32, fd: i32, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const b = callBuiltTy(x, 8)
+  if b >= 0 { return b }
+  const u = unwrapParen(x)
+  const n = if u >= 0 { nodeAt(u) } else { null }
+  if n is Index {
+    const a = storeRepOf(n.idxArr, fd, depth - 1)
+    const at = if a >= 0 && a < T.tys.length { T.tys[a] } else { null }
+    return if at is TyArray { at.aElem } else { -1 }
+  }
+  if n is Ident {
+    const d = identDeclOf(u)
+    const r = paramRepOf(d)
+    return if r >= 0 { r } else { paramCallsBuiltTy(d, fd) }
+  }
+  storeRepNone(u)
+}
+
+// Every other kind is stored as `callBuiltTy` answered, which found no build.
+function storeRepNone(_ix: i32): i32 { -1 }
+
+// The rep every noted argument hands parameter `par` at (`recArgRepOf`), where they agree; else -1.
+function paramRepOf(par: i32): i32 {
+  if par < 0 || !(nodeAt(par) is Param) { return -1 }
+  let r = -1
+  for x in recArgRepArgs() {
+    const c = if x >= 0 && x < cwIxUp.length { cwIxUp[x] } else { -1 }
+    const cn = if c >= 0 { nodeAt(c) } else { null }
+    const fd = if cn is Call { identBoundFnDeclOf(cn.callFn) } else { -1 }
+    const fn = if fd >= 0 { nodeAt(fd) } else { null }
+    if cn is Call && fn is FuncDecl {
+      let pi = 0
+      while pi < cn.callArgs.length && pi < fn.fnParams.length {
+        if (
+          fn.fnParams[pi] == par
+          && unwrapParen(cn.callArgs[pi]) == unwrapParen(x)
+        ) {
+          const rep = recArgRepOf(x)
+          if r < 0 { r = rep }
+          else if !tySame(r, rep) { return -1 }
+        }
+        pi = pi + 1
+      }
+    }
+  }
+  r
+}
+
+// The build every call of `fd` hands its parameter `par` at (`callBuiltTy` of each argument),
+// where every call is a plain one that names it and they agree; else -1.
+function paramCallsBuiltTy(par: i32, fd: i32): i32 {
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) { return -1 }
+  let pi = 0
+  while pi < fn.fnParams.length && fn.fnParams[pi] != par { pi = pi + 1 }
+  if pi >= fn.fnParams.length { return -1 }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length == 0 { return -1 }
+  let r = -1
+  for s in sites {
+    if (s & 1) == 1 { return -1 }
+    const c = nodeAt(s >> 1)
+    if !(c is Call) || pi >= c.callArgs.length { return -1 }
+    const b = callBuiltTy(c.callArgs[pi], 8)
+    if b < 0 { return -1 }
+    if r < 0 { r = b }
+    else if !tySame(r, b) { return -1 }
+  }
+  r
+}
+
+// Boxes each queued field write's value at its field's type in the record the receiver is
+// stored as, where that is a union, and empties the queue.
+export function storeWritesResolve() {
+  let i = 0
+  while i < storeWriteCount() {
+    const st = storeRepOf(storeWriteRecvAt(i), storeWriteFnAt(i), 4)
+    const so = if st >= 0 && st < T.tys.length { T.tys[st] } else { null }
+    const ft = if so is TyObj { objFieldType(so, storeWriteFieldAt(i)) } else { -1 }
+    if ft >= 0 { recordBoxTy(storeWriteValAt(i), ft) }
+    i = i + 1
+  }
+  storeWritesClear()
+}
+
+// Records, for each queued un-annotated binding, the record its initializer is held at where that
+// is another than its own type (`storeHeldAt`); read by the emitter's binding. Queued in check
+// order, so a binding of an earlier binding reads that binding's row; each `??` join is held
+// first, so a binding of a call reads the build its default's delivery decides (D15317).
+export function storeLetsResolve() {
+  storeJoinsHeld = []
+  const joins: i32[] = []
+  let i = 0
+  while i < storeLetCount() {
+    const u = unwrapParen(storeLetInitAt(i))
+    const own = if u >= 0 && u < P.nodes.length { nodeTyIxOf(u) } else { -1 }
+    const join = u >= 0 && u < P.nodes.length && nodeAt(u) is BinExpr
+    const obj = own >= 0 && own < T.tys.length && tyAt(own) is TyObj
+    joins.push(if join && obj { storeHeldAt(u) } else { -2 })
+    i = i + 1
+  }
+  i = 0
+  while i < storeLetCount() {
+    const u = unwrapParen(storeLetInitAt(i))
+    const own = if u >= 0 && u < P.nodes.length { nodeTyIxOf(u) } else { -1 }
+    const lit = u >= 0
+      && u < P.nodes.length
+      && (nodeAt(u) is ArrayLit || nodeAt(u) is ObjLit)
+    if lit && own >= 0 && own < T.tys.length {
+      // A literal holding a value held at another record is built there (D15312).
+      const lt = storeLitHeldAt(u, 4)
+      if lt >= 0 && lt < T.tys.length && !tySame(lt, own) {
+        recordRepTyAdopt(u, lt, 6)
+      }
+    } else if own >= 0 && own < T.tys.length && tyAt(own) is TyObj {
+      const r = if joins[i] != -2 { joins[i] } else { storeHeldAt(u) }
+      // A call the record solve copies back to its own record is not held at its build (D15246).
+      const back = recCopyFromOf(u) >= 0
+      if (
+        !back
+        && r >= 0
+        && r < T.tys.length
+        && tyAt(r) is TyObj
+        && !tySame(r, own)
+      ) {
+        storeLetBuiltSet(u, r)
+        // A binding of a call is built where the call's results are (`recBuildTyOf`, D15172).
+        if nodeAt(u) is Call { recBuildPush(storeLetDeclAt(i), own, r, false) }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// The type list or record literal `l` is built at where an element or field is a value held at
+// another record (a built read's `??` join, or a binding of one): its own type with that slot at the
+// held record; -1 when none is, or two elements are held at different records.
+function storeLitHeldAt(l: i32, depth: i32): i32 {
+  if depth <= 0 || l < 0 || l >= P.nodes.length { return -1 }
+  const own = nodeTyIxOf(l)
+  if own < 0 || own >= T.tys.length { return -1 }
+  const n = nodeAt(l)
+  if n is ArrayLit {
+    let held = -1
+    for e in n.arrElems {
+      const r = storeSlotHeldAt(unwrapParen(e), depth - 1)
+      if r >= 0 {
+        if held >= 0 && !tySame(held, r) { return -1 }
+        held = r
+      }
+    }
+    return if held >= 0 { mkArrayTy(held) } else { -1 }
+  }
+  const o = tyAt(own)
+  if !(n is ObjLit) || !(o is TyObj) { return -1 }
+  const names: string[] = []
+  const tys: i32[] = []
+  let any = false
+  let k = 0
+  while k < o.objFieldNames.length {
+    names.push(o.objFieldNames[k])
+    let ft = o.objFieldTypes[k]
+    for fx in n.objFields {
+      const f = nodeAt(fx)
+      if f is FieldInit && f.fiName == o.objFieldNames[k] {
+        const r = storeSlotHeldAt(unwrapParen(f.fiValue), depth - 1)
+        if r >= 0 {
+          ft = r
+          any = true
+        }
+      }
+    }
+    tys.push(ft)
+    k = k + 1
+  }
+  if any { mkObjTy(names, tys) } else { -1 }
+}
+
+// The record the value `v` in a literal's slot is held at, where that is another record than its own
+// type: a `??` join or a binding the store column builds elsewhere, or a nested literal holding one.
+function storeSlotHeldAt(v: i32, depth: i32): i32 {
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const n = nodeAt(v)
+  // A nested literal is held where a slot of its own is (`storeLitHeldAt` answers -1 otherwise).
+  const nested = storeLitHeldAt(v, depth)
+  if nested >= 0 { return nested }
+  const own = nodeTyIxOf(v)
+  const r = if n is BinExpr { storeHeldAt(v) } else if n is Ident { storeBindingHeldAt(v) } else { storeSlotKeepsOwnRow(v) }
+  // A join whose default is a binding the record solve adopts (a `let`, a `const` of a call) is
+  // typed as a union of its own row and the read's record, which a literal slot built at that
+  // record cannot hold; a fresh `const` literal is built there and joins as one record (D15316).
+  const j = if n is Ident { storeJoinOfBinding(v) } else { v }
+  const jb = if j >= 0 && j < P.nodes.length && nodeAt(j) is BinExpr { recBuiltReadTy(j) } else { -1 }
+  if jb >= 0 && storeJoinDefaultHeld(j) && !recCoalesceDefaultBuilt(j) {
+    tErr(
+      "a `??` whose default is a `let` or a call's result held in a `const`, built at "
+        + tyToStr(nonNullTy(jb))
+        + " for a read of a container built wider, is not yet supported inside a list or record "
+        + "literal",
+      v,
+    )
+    return -1
+  }
+  if (
+    r < 0
+    || r >= T.tys.length
+    || own < 0
+    || tySame(r, own)
+    || !(tyAt(r) is TyObj)
+  ) {
+    return -1
+  }
+  if n is BinExpr { storeLetBuiltSet(v, r) }
+  r
+}
+
+// -1 for slot value `v`, which is neither a `??` join nor a binding of one: it keeps its own row
+// in the literal, and the literal's own delivery builds it where it is held (D15215).
+function storeSlotKeepsOwnRow(_v: i32): i32 { -1 }
+
+// The `??` join binding read `x` is initialised with, or -1.
+function storeJoinOfBinding(x: i32): i32 {
+  const d = recHeldDecl(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
+  unwrapParen(dn.letInit)
+}
+
+// Whether `j` is a `??` whose default operand is a binding read.
+function storeJoinDefaultHeld(j: i32): boolean {
+  if j < 0 || j >= P.nodes.length { return false }
+  const n = nodeAt(j)
+  if !(n is BinExpr) || n.binOp != "??" { return false }
+  const r = unwrapParen(n.binRight)
+  r >= 0 && r < P.nodes.length && nodeAt(r) is Ident
+}
+
+// The call that builds returned value `v` where another function delivers it: `v` itself, or the
+// initialiser of a `const` it names, through any chain of such names; -1 for any other value. The
+// node a result row is read from, and the one `storeRetsResolve` stamps.
+export function retValueRootCall(v: i32): i32 {
+  let cur = unwrapParen(v)
+  let hops = 0
+  while cur >= 0 && cur < P.nodes.length && hops < 64 {
+    const n = nodeAt(cur)
+    if n is Call { return cur }
+    if !(n is Ident) { return -1 }
+    const d = identDeclOf(cur)
+    if d < 0 { return -1 }
+    const dn = nodeAt(d)
+    if !(dn is LetDecl) { return -1 }
+    if dn.letKw != "const" || dn.letInit < 0 { return -1 }
+    cur = unwrapParen(dn.letInit)
+    hops = hops + 1
+  }
+  -1
+}
+
+// The `??` joins `storeHeldAt` held this pass.
+let storeJoinsHeld: i32[] = []
+
+// Refuses each `??` over a read of a container built wider whose default is a parameter or an
+// annotated binding stored apart from the read's record: no build can move it, so the join would
+// hold two storages; a converting copy of the read is the capability this stands in for (D15241).
+export function storeCoalescesResolve() {
+  for j in cwFrJoins {
+    const n = if j >= 0 && j < P.nodes.length { nodeAt(j) } else { null }
+    if n is BinExpr && n.binOp == "??" {
+      const b = recBuiltReadTy(j)
+      const bt = if b >= 0 { nonNullTy(b) } else { -1 }
+      const v = cwPeelValue(n.binRight)
+      // A join no binding, return or write holds delivers its default at the read's record as a
+      // held one does (D15319).
+      if (
+        bt >= 0
+        && bt < T.tys.length
+        && tyAt(bt) is TyObj
+        && !i32ListHas(storeJoinsHeld, j)
+        && !storeDefaultFixed(v)
+      ) {
+        storeHeldAt(j)
+      }
+      if (
+        bt >= 0
+        && bt < T.tys.length
+        && tyAt(bt) is TyObj
+        && storeDefaultFixed(v)
+      ) {
+        const vt = nodeTyIxOf(v)
+        // An un-annotated parameter's own type is its hole here, so no storage can be compared;
+        // every pin of one joins the read with a record no build moves (D15318).
+        const apart = storeDefaultIsHoleParam(v)
+          || (vt >= 0
+          && vt < T.tys.length
+          && tyAt(vt) is TyObj
+          && !fieldStorageEq(vt, bt, REC_STORE_DEPTH))
+        if apart {
+          tErr(
+            "a `??` whose default is a parameter or an annotated binding, stored apart from the "
+              + tyToStr(bt)
+              + " a read of a container built wider holds, is not yet supported",
+            v,
+          )
+        }
+      }
+    }
+  }
+}
+
+// Whether `v` reads a parameter or an annotated binding, a record no build can move.
+function storeDefaultFixed(v: i32): boolean {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  const d = identDeclOf(v)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if dn is Param { return true }
+  dn is LetDecl && dn.letType >= 0
+}
+
+// Whether `v` reads an un-annotated parameter, whose type is its hole until a call pins it.
+function storeDefaultIsHoleParam(v: i32): boolean {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  const d = identDeclOf(v)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  dn is Param && dn.parType < 0
+}
+
+// Stamps every value a queued function returns with the record a build holds it at, where each
+// is a read, a call or a `??` `storeHeldAt` answers and all agree; the result is then built there
+// (D15127).
+export function storeRetsResolve() {
+  let i = 0
+  while i < storeFnCount() {
+    const fd = storeFnAt(i)
+    const lvs: i32[] = []
+    let r = -1
+    let ok = fd >= 0 && fd < P.nodes.length
+    if ok {
+      for lf in recFnValueLeaves(fd) {
+        const l = unwrapParen(lf)
+        const n = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+        const held = n is Index
+          || n is Member
+          || n is Ident
+          || n is Call
+          || n is BinExpr
+        const b = if held { storeHeldAt(l) } else { -1 }
+        if b < 0 || (r >= 0 && !tySame(r, b)) { ok = false }
+        r = b
+        lvs.push(l)
+      }
+    }
+    if ok && r >= 0 && r < T.tys.length && tyAt(r) is TyObj {
+      for lv in lvs {
+        const rc = retValueRootCall(lv)
+        const l = if rc >= 0 { rc } else { lv }
+        const st = nodeRepTyIxOf(l)
+        const own = nodeTyIxOf(l)
+        const unbuilt = st < 0
+          || (own >= 0 && tySame(st, own) && !nodeRepStamped(l))
+        if unbuilt && own >= 0 && !tySame(own, r) { repStampHeldRead(l, r) }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// The record initializer `u` delivers where a build decides it: a call's results (`callBuiltTy`),
+// an element of a list whose stores or literal build its records elsewhere, a binding of one this
+// pass resolved, or a field of one; else -1 (D15127).
+function storeHeldAt(u: i32): i32 {
+  const n = nodeAt(u)
+  if n is Call { return callBuiltTy(u, 8) }
+  // A built read's `??` is held at the read's build, its default delivered there as a typed
+  // delivery is (D15230, D15240, D15248).
+  if n is BinExpr {
+    storeJoinsHeld.push(u)
+    const b = recBuiltReadTy(u)
+    const r = if b >= 0 { nonNullTy(b) } else { -1 }
+    // A bare literal is stamped at the build, where a delivery only notes its fields.
+    const adopted = r >= 0
+      && (recCoalesceLitAdopt(u, r)
+      || recCoalesceDefaultDeliver(u, r))
+    return if adopted { r } else { -1 }
+  }
+  if n is Index {
+    const b = recBuiltReadTy(u)
+    if b >= 0 { return nonNullTy(b) }
+    const lt = storeBindingHeldAt(unwrapParen(n.idxArr))
+    const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+    return if la is TyArray { la.aElem } else { -1 }
+  }
+  if n is Member {
+    const o = storeBindingHeldAt(unwrapParen(n.memObj))
+    const ot = if o >= 0 && o < T.tys.length { tyAt(o) } else { null }
+    return if ot is TyObj { objFieldType(ot, n.memProp) } else { -1 }
+  }
+  // Every other node is a binding read or no value a build decides, which `recHeldDecl` answers.
+  const d = recHeldDecl(u)
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  if dn is LetDecl { storeLetBuiltOf(unwrapParen(dn.letInit)) } else { -1 }
+}
+
+// The type the un-annotated binding read `x` is held at: the row this pass resolved for it, or
+// its list or record literal's build; else -1.
+function storeBindingHeldAt(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const d = recHeldDecl(x)
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  if !(dn is LetDecl) { return -1 }
+  const v = unwrapParen(dn.letInit)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const r = storeLetBuiltOf(v)
+  if r >= 0 { return r }
+  const vn = nodeAt(v)
+  if !(vn is ArrayLit) && !(vn is ObjLit) { return -1 }
+  const lt = litRepTyAt(v, -1)
+  if lt < 0 || lt >= T.tys.length || tySame(lt, nodeTyIxOf(v)) {
+    -1
+  } else {
+    lt
+  }
+}

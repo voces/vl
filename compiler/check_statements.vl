@@ -1,7 +1,7 @@
 // The statements: `let`, `if` with its narrowing head, `while`, `for` over a range or a
 // collection, `return` and a block.
 
-import { strListIndexOf } from "./listutil"
+import { strListHas, strListIndexOf } from "./listutil"
 import {
   nodeTyIx,
   nodeTyIxOf,
@@ -13,6 +13,7 @@ import {
   BinExpr,
   Block,
   Call,
+  FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
@@ -20,8 +21,10 @@ import {
   IfStmt,
   LetDecl,
   Node,
+  ObjLit,
   OptMember,
   P,
+  Param,
   Paren,
   RetStmt,
   TypeRef,
@@ -60,8 +63,11 @@ import {
   elabCapOn,
   elabDeadRestClose,
   elabDeadRestOpen,
+  elabFnFieldTy,
   elabFnLetTy,
+  elabFnListClosedNote,
   elabFnListLetTy,
+  elabFnListOpenWideMembers,
 } from "./check_elab_cap"
 import { npKeys, placeNameTy } from "./check_nar_store"
 import {
@@ -72,8 +78,9 @@ import {
   luElemTy,
   luTs,
   mapKeyUnsupportedErr,
+  resolveAnnotAt,
 } from "./check_annot_resolve"
-import { assignableExpr } from "./check_assignable"
+import { assignableExpr, fvaValueRowAt } from "./check_assignable"
 import {
   collapsedTy,
   fnRetCollapsed,
@@ -113,7 +120,13 @@ import {
 import { crStmtEnter, crUnwidenTop, crWidenedInTop } from "./check_cr_walk"
 import { noteLetCstr, noteRetCstr } from "./check_cstr_rows"
 import { markCtnLitBinding } from "./check_ctn_lit_bind"
-import { curFnDeclIx, inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
+import {
+  curFnDeclIx,
+  inferQuiet,
+  quietDepth,
+  tpEnvNames,
+  tpEnvTys,
+} from "./check_cursor"
 import { letDeclFnPut, tsMapKeyNodeOf, wrDstDeclPut } from "./check_decl_scan"
 import {
   daAddNode,
@@ -131,6 +144,7 @@ import {
   constStrLitBound,
   constrainEmptyExpr,
   recordCtxTy,
+  storeLetPush,
 } from "./check_fit_rules"
 import {
   crNoteSoleRef,
@@ -215,8 +229,10 @@ import {
   elemFactFor,
   elemOnlyKeyOf,
   lpPopResult,
+  narConvListDelivery,
   narIpUndoArm,
   narKeysNowTys,
+  narRecFitDeclTy,
   narrowFreshBinding,
   popScope,
 } from "./check_narrow_flow"
@@ -269,6 +285,8 @@ import {
 import { recordRedundantAnnot } from "./check_redundant_annot"
 import {
   assignable,
+  bindGenWalk,
+  holeSlotCallRets,
   mintedAnnTy,
   nameToTyAt,
   substTyDeep,
@@ -304,21 +322,26 @@ import {
   TY_VOID,
   TyArray,
   TyErr,
+  TyFunc,
   TyMap,
   TyObj,
   TyUnion,
   TyVar,
+  mkArrayTy,
+  mkFuncTy,
   mkNullableTy,
+  mkObjTy,
   tyAt,
   tyHasHole,
   tyIsHole,
   tyIsNewtypeBrand,
   tyIsStructBearingUnion,
+  tySame,
   tyToStr,
 } from "./check_types"
 import { breakValueAt } from "./check_unconsumed"
-import { fnDeclIx } from "./check_write_scan"
-import { identFromDecl, identRedirect } from "./symbols"
+import { cwLetUnwritten, fnDeclIx } from "./check_write_scan"
+import { identDeclOf, identFromDecl, identRedirect } from "./symbols"
 import {
   isNeverTy,
   isNulBoolTy,
@@ -328,6 +351,7 @@ import {
   isVoidTy,
   tyHasTyVar,
   tyMentionsVoid,
+  tyReachesHole,
 } from "./tyquery"
 
 // ── let declaration ────────────────────────────────────────────────────────
@@ -438,6 +462,14 @@ function letDeclMarkCollapsed(n: LetDecl, annotCollapsedHere: boolean) {
   0
 }
 
+// Whether `ix` reads a `let` the program writes after its initialiser.
+function identReadsWrittenLet(ix: i32): boolean {
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  dn is LetDecl && dn.letKw == "let" && !cwLetUnwritten(d)
+}
+
 // `const f = addT` — records which declaration the binding of `n` at `ix` aliases, for
 // deferred-constraint ownership alone. A bare Ident initializer naming a declared function, or
 // a binding that aliases one, is the whole rung: a copy of an alias owns what it owns (D5160).
@@ -448,7 +480,13 @@ function letDeclNoteFnAlias(n: LetDecl, ix: i32) {
       // The declaration the name resolves to in scope, a nested function shadowing a top-level one.
       let aDecl = identFnDeclOf(parenPeelIx(n.letInit))
       if aDecl < 0 { aDecl = fnDeclIx[aInit.identName] ?? -1 }
-      if aDecl < 0 { aDecl = identFnAliasOf(parenPeelIx(n.letInit)) }
+      // A written `let` holds more than the function it starts as, so a copy of it aliases none.
+      if aDecl < 0 {
+        const via = identFnAliasOf(parenPeelIx(n.letInit))
+        if via >= 0 && !identReadsWrittenLet(parenPeelIx(n.letInit)) {
+          aDecl = via
+        }
+      }
       if aDecl >= 0 { declFnAliasSet(ix, aDecl) }
     }
   }
@@ -475,6 +513,8 @@ function letDeclMarkLitBindings(n: LetDecl, ix: i32, bound: i32) {
 
 export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if curFnDeclIx >= 0 { letDeclFnPut(ix, curFnDeclIx) }
+  // An un-annotated binding of a call is stored where the call's results are built.
+  if n.letType < 0 { storeLetPush(n.letInit, ix) }
   if n.letInit >= 0 { wrDstDeclPut(n.letInit, ix) }
   const la = letDeclResolveAnnot(n)
   const annot = la.ty
@@ -503,12 +543,49 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     bound = annot
     if initTy >= 0 { letDeclGradeAnnotated(n, ix, annot, initTy) }
   } else if initTy >= 0 {
+    // A binding keeps what it is initialised with, so a list read only an empty list's value fit
+    // narrowed is refused here as at any other delivery (D5003).
+    narConvListDelivery(n.letInit, initTy, initTy)
+    // A copy of a record narrowed by its fields reads it at its declared type (D4133).
+    const fitDecl = narRecFitDeclTy(n.letInit)
+    if fitDecl >= 0 {
+      initTy = fitDecl
+      nodeTySetGrow(parenPeelIx(n.letInit), fitDecl)
+    }
     bound = elabFnLetTy(ix, letDeclInferredBound(n, ix, initTy))
-    const lw = elabFnListLetTy(ix, bound)
+    // A literal's own binding only: an alias reads its source's writes without their order. Inside
+    // a generic the signature is the instance's, which one node cannot record.
+    const litInit = nodeAt(parenPeelIx(n.letInit)) is ArrayLit
+    let wm: i32[] = []
+    if litInit && tpEnvNames.length == 0 {
+      wm = elabFnListOpenWideMembers(ix, bound)
+    }
+    const closedAt = letFnListClosedSig(wm)
+    const lw = elabFnListLetTy(ix, bound, closedAt)
+    // Each generic member is delivered at the closed signature, as an annotated list's is.
+    const lwa = if lw >= 0 && lw < T.tys.length { T.tys[lw] } else { T.tys[TY_ERR] }
+    if lw != bound && closedAt >= 0 && lwa is TyArray {
+      for m in wm { fvaValueRowAt(m, lwa.aElem) }
+    }
     if lw != bound {
       bound = lw
       if nodeAt(parenPeelIx(n.letInit)) is ArrayLit {
         nodeTySetGrow(parenPeelIx(n.letInit), lw)
+        if closedAt >= 0 { elabFnListClosedNote(parenPeelIx(n.letInit)) }
+      }
+    }
+    // A record literal's list field of functions holds what is written into its elements too,
+    // as does one inside a list literal's elements (D15201).
+    const initLit = nodeAt(parenPeelIx(n.letInit))
+    if (initLit is ObjLit || initLit is ArrayLit) && tpEnvNames.length == 0 {
+      const none: string[] = []
+      bound = letLitListsWidenAt(ix, parenPeelIx(n.letInit), bound, none)
+    } else if initLit is Call && tpEnvNames.length == 0 {
+      // A binding a call initialises holds the records the call returns, so its function fields
+      // take what is written into them too (D15270).
+      const rets: i32[] = []
+      if holeSlotCallRets(initLit, rets) {
+        bound = letCallFieldsWiden(ix, bound, rets)
       }
     }
     recordCtxTy(n.letInit, bound)
@@ -1713,4 +1790,258 @@ export function checkBlockNode(n: Block, ix: i32) {
   blockTailTySet(tailTy)
   blockTailIxSet(tailIx)
   return TY_VOID
+}
+
+// The one closed signature the functions of `ms` share: a plain named one's, else a generic one's
+// bound at the annotated parameters of a written lambda, whose result the write is then checked
+// against. -1 when a plain one is open, two disagree, or a generic one does not fit.
+function letFnListClosedSig(ms: i32[]): i32 {
+  let f = -1
+  const lams: i32[] = []
+  for m in ms {
+    const d = nodeAt(m)
+    if !(d is FuncDecl) { return -1 }
+    if d.fnTyParams.length == 0 {
+      if d.fnName == "" {
+        lams.push(m)
+      } else {
+        const mt = nodeTyIxOf(m)
+        if mt < 0 || mt >= T.tys.length || !(T.tys[mt] is TyFunc) { return -1 }
+        if tyHasTyVar(mt) || tyReachesHole(mt, 8) { return -1 }
+        if f < 0 { f = mt }
+        else if !tySame(f, mt) { return -1 }
+      }
+    }
+  }
+  for m in lams {
+    const ps = letFnLambdaParamTys(m)
+    if ps.length == 0 { return -1 }
+    if f < 0 { f = letFnGenericAt(ms, ps) }
+    if f < 0 { return -1 }
+    const ff = T.tys[f]
+    if !(ff is TyFunc) || ff.fnParamTypes.length != ps.length { return -1 }
+    let i = 0
+    while i < ps.length {
+      if !tySame(ps[i], ff.fnParamTypes[i]) { return -1 }
+      i = i + 1
+    }
+  }
+  if f < 0 { return -1 }
+  for m in ms {
+    if !letFnGenericFitsAt(m, f) { return -1 }
+  }
+  f
+}
+
+// The closed types lambda `m`'s parameters are annotated with; [] when one is not annotated or
+// does not resolve to a closed type. Read quietly: the lambda's own check reports its annotations.
+function letFnLambdaParamTys(m: i32): i32[] {
+  const none: i32[] = []
+  const d = nodeAt(m)
+  if !(d is FuncDecl) || d.fnParams.length == 0 { return none }
+  const out: i32[] = []
+  const savedQuiet = inferQuiet
+  inferQuiet = true
+  quietDepth = quietDepth + 1
+  for q in d.fnParams {
+    const pn = nodeAt(q)
+    let t = -1
+    const at = if pn is Param { pn.parType } else { -1 }
+    if at >= 0 {
+      const tn = nodeAt(at)
+      if tn is TypeRef { t = resolveAnnotAt(tn.tyName, d.fnTyParams, at, "") }
+    }
+    if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyReachesHole(t, 8) {
+      inferQuiet = savedQuiet
+      quietDepth = quietDepth - 1
+      return none
+    }
+    out.push(t)
+  }
+  inferQuiet = savedQuiet
+  quietDepth = quietDepth - 1
+  out
+}
+
+// The signature the first generic function of `ms` gives at closed parameter types `ps`: its
+// result with its type parameters bound by them; -1 when there is none or one stays unbound.
+function letFnGenericAt(ms: i32[], ps: i32[]): i32 {
+  for m in ms {
+    const d = nodeAt(m)
+    if d is FuncDecl && d.fnTyParams.length > 0 {
+      const gt = nodeTyIxOf(m)
+      if gt < 0 || gt >= T.tys.length { return -1 }
+      const gf = T.tys[gt]
+      if !(gf is TyFunc) || gf.fnParamTypes.length != ps.length { return -1 }
+      const bn: string[] = []
+      const bt: i32[] = []
+      let i = 0
+      while i < ps.length {
+        bindGenWalk(gf.fnParamTypes[i], ps[i], bn, bt)
+        i = i + 1
+      }
+      for tp in d.fnTyParams {
+        if !strListHas(bn, tp) { return -1 }
+      }
+      const r = substTyDeep(gf.fnRet, bn, bt)
+      if r < 0 || r >= T.tys.length || tyHasTyVar(r) || tyReachesHole(r, 8) {
+        return -1
+      }
+      const cp: i32[] = []
+      for p in ps { cp.push(p) }
+      return mkFuncTy(cp, r)
+    }
+  }
+  -1
+}
+
+// Whether declaration `m` is plain, or a generic whose signature, bound against closed function
+// type `f`'s parameters, gives exactly `f`.
+function letFnGenericFitsAt(m: i32, f: i32): boolean {
+  const d = nodeAt(m)
+  if !(d is FuncDecl) { return false }
+  if d.fnTyParams.length == 0 { return true }
+  const gt = nodeTyIxOf(m)
+  if gt < 0 || gt >= T.tys.length { return false }
+  const gf = T.tys[gt]
+  const ff = T.tys[f]
+  if !(gf is TyFunc) || !(ff is TyFunc) { return false }
+  if gf.fnParamTypes.length != ff.fnParamTypes.length { return false }
+  const bn: string[] = []
+  const bt: i32[] = []
+  let i = 0
+  while i < gf.fnParamTypes.length {
+    bindGenWalk(gf.fnParamTypes[i], ff.fnParamTypes[i], bn, bt)
+    i = i + 1
+  }
+  for tp in d.fnTyParams {
+    if !strListHas(bn, tp) { return false }
+  }
+  i = 0
+  while i < gf.fnParamTypes.length {
+    if !tySame(substTyDeep(gf.fnParamTypes[i], bn, bt), ff.fnParamTypes[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  tySame(substTyDeep(gf.fnRet, bn, bt), ff.fnRet)
+}
+
+// Type `t` of literal `lit` at step path `pre` of the binding `bd` initialises, each list of
+// functions inside it widened by `elabFnFieldTy`: a record's fields, and a list's elements as
+// `[]` when every element is a literal (D15168, D15201). Each widened literal is re-typed.
+function letLitListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
+  const ln = nodeAt(lit)
+  if ln is ObjLit { return letFieldListsWidenAt(bd, lit, t, pre) }
+  if !(ln is ArrayLit) || t < 0 || t >= T.tys.length || pre.length > 8 {
+    return t
+  }
+  const ta = T.tys[t]
+  if !(ta is TyArray) || ln.arrElems.length == 0 { return t }
+  // A list of functions below the binding's own value is the leaf `elabFnFieldTy` widens.
+  const ea = if ta.aElem >= 0 && ta.aElem < T.tys.length { T.tys[ta.aElem] } else { T.tys[TY_ERR] }
+  if ea is TyFunc {
+    const none: i32[] = []
+    return if pre.length > 0 { elabFnFieldTy(bd, pre, t, none) } else { t }
+  }
+  const steps: string[] = []
+  for st in pre { steps.push(st) }
+  steps.push("[]")
+  // Every element must be a literal before any is re-typed, so none is left at the old type.
+  for e in ln.arrElems {
+    const v = parenPeelIx(e)
+    if v < 0 || v >= P.nodes.length { return t }
+    const vn = nodeAt(v)
+    if !(vn is ArrayLit || vn is ObjLit) { return t }
+  }
+  let w = -1
+  for e in ln.arrElems {
+    const v = parenPeelIx(e)
+    const we = letLitListsWidenAt(bd, v, ta.aElem, steps)
+    if w < 0 { w = we }
+  }
+  if w < 0 || w == ta.aElem { return t }
+  for e in ln.arrElems { nodeTySetGrow(parenPeelIx(e), w) }
+  const nt = mkArrayTy(w)
+  nodeTySetGrow(lit, nt)
+  nt
+}
+
+// Type `t` of the record a call returns into binding `bd`, each field holding a function or a
+// list of functions widened by `elabFnFieldTy` over the call's returned values `rets` and the
+// writes through `bd`.
+function letCallFieldsWiden(bd: i32, t: i32, rets: i32[]): i32 {
+  if t < 0 || t >= T.tys.length { return t }
+  const to = T.tys[t]
+  if !(to is TyObj) { return t }
+  const tys: i32[] = []
+  let changed = false
+  let i = 0
+  while i < to.objFieldNames.length {
+    let ft = to.objFieldTypes[i]
+    const fa = if ft >= 0 && ft < T.tys.length { T.tys[ft] } else { T.tys[TY_ERR] }
+    const fe = if fa is TyArray && fa.aElem >= 0 && fa.aElem < T.tys.length { T.tys[fa.aElem] } else { fa }
+    if fe is TyFunc {
+      const steps: string[] = [to.objFieldNames[i]]
+      const w = elabFnFieldTy(bd, steps, ft, rets)
+      if w != ft {
+        ft = w
+        changed = true
+      }
+    }
+    tys.push(ft)
+    i = i + 1
+  }
+  if !changed { return t }
+  const names: string[] = []
+  for nm in to.objFieldNames { names.push(nm) }
+  mkObjTy(names, tys)
+}
+
+// `letFieldListsWiden` for the record literal `lit` of type `t` at field path `pre`.
+function letFieldListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
+  if t < 0 || t >= T.tys.length || pre.length > 8 { return t }
+  const to = T.tys[t]
+  const ln = nodeAt(lit)
+  if !(to is TyObj) || !(ln is ObjLit) { return t }
+  const tys: i32[] = []
+  let changed = false
+  let i = 0
+  while i < to.objFieldNames.length {
+    const nm = to.objFieldNames[i]
+    let ft = to.objFieldTypes[i]
+    for fx in ln.objFields {
+      const f = nodeAt(fx)
+      if f is FieldInit && f.fiName == nm {
+        const v = parenPeelIx(f.fiValue)
+        if v < 0 || v >= P.nodes.length { continue }
+        const steps: string[] = []
+        for st in pre { steps.push(st) }
+        steps.push(nm)
+        let w = ft
+        if nodeAt(v) is ArrayLit {
+          w = letLitListsWidenAt(bd, v, ft, steps)
+        } else if nodeAt(v) is ObjLit {
+          w = letFieldListsWidenAt(bd, v, ft, steps)
+        } else if ft >= 0 && ft < T.tys.length && T.tys[ft] is TyFunc {
+          // A field holding a function takes the functions written into it too (D15119).
+          const none: i32[] = []
+          w = elabFnFieldTy(bd, steps, ft, none)
+        }
+        if w != ft {
+          nodeTySetGrow(v, w)
+          ft = w
+          changed = true
+        }
+      }
+    }
+    tys.push(ft)
+    i = i + 1
+  }
+  if !changed { return t }
+  const names: string[] = []
+  for nm in to.objFieldNames { names.push(nm) }
+  const nt = mkObjTy(names, tys)
+  nodeTySetGrow(lit, nt)
+  nt
 }

@@ -72,17 +72,24 @@ import {
   tyIsLitUnionOrLit,
   tyPrimNameOf,
 } from "./check_types"
-import { objFieldVal, unionEqOperandOk, unwrapParen } from "./emit_base"
+import {
+  isTestsNull,
+  objFieldVal,
+  unionEqOperandOk,
+  unwrapParen,
+} from "./emit_base"
 import {
   declTyIxOfName,
   repCanonId,
-  repNameCanonId,
   repRowId,
   sFieldElemTyIxAt,
 } from "./emit_rep"
 import {
   FC_I32,
   FC_I32_LIST,
+  armFieldElemName,
+  armFieldElemTyIx,
+  armFieldTypes,
   fnStmts,
   sAnonOwnTy,
   sFieldCount,
@@ -93,16 +100,11 @@ import {
   sIsRefRow,
   sNames,
   sTyIx,
-  uFieldElemName,
-  uFieldElemTyIx,
-  uFieldNames,
   uFieldStart,
-  uFieldTypes,
   uVarTyIx,
 } from "./emit_state"
 import { memoKeyNew, memoPassMoved } from "./memo"
 import { strContains } from "./strutil"
-import { hashMixPair } from "./hash_mix"
 import { recFitNarrowedFields } from "./check_fit_rules"
 import { nonNullTy, tyHasTyVar } from "./tyquery"
 
@@ -117,11 +119,11 @@ export function sFieldElemNameAt(si: i32, fi: i32) {
   sFieldElemName[sFieldStart[si] + fi]
 }
 
-// The `sFieldElemTyIxAt` twin for variant fields (`uFieldElemTyIx`).
+// The `sFieldElemTyIxAt` twin for variant fields (`armFieldElemTyIx`).
 export function uFieldElemTyIxAt(vi: i32, fi: i32): i32 {
   const ix = uFieldStart[vi] + fi
-  if ix >= uFieldElemTyIx.length { return -1 }
-  uFieldElemTyIx[ix]
+  if ix >= armFieldElemTyIx().length { return -1 }
+  armFieldElemTyIx()[ix]
 }
 
 // ── the struct-row arena index ───────────────────────────────────────────────
@@ -145,9 +147,12 @@ function sTyRowSync() {
   if sTyRowLen > sTyIx.length { structTyIxReset() }
   while sTyRowLen < sTyIx.length {
     const ty = sTyIx[sTyRowLen]
-    if ty >= 0 && !sIsRefRow(sTyRowLen) {
+    if ty >= 0 {
       while sTyRow.length <= ty { sTyRow.push(-1) }
-      if sTyRow[ty] < 0 { sTyRow[ty] = sTyRowLen }
+      const had = sTyRow[ty]
+      if had < 0 || (sIsRefRow(had) && !sIsRefRow(sTyRowLen)) {
+        sTyRow[ty] = sTyRowLen
+      }
     }
     sTyRowLen = sTyRowLen + 1
   }
@@ -233,7 +238,7 @@ export function sFieldRowTyAt(si: i32, fi: i32): i32 {
 // `sFieldRowTyAt`'s variant twin, off the variant's own arena type (`uVarTyIx`).
 function uFieldRowTyAt(vi: i32, fj: i32): i32 {
   if vi < 0 || vi >= uVarTyIx.length { return -1 }
-  tyFieldTyOf(uVarTyIx[vi], uFieldNames[uFieldStart[vi] + fj])
+  tyFieldTyOf(uVarTyIx[vi], sFieldNames[uFieldStart[vi] + fj])
 }
 
 // True if struct `si`'s field `fi` is a literal-union atom field: code 0 whose element sidecar,
@@ -298,9 +303,7 @@ function sNameIxSync() {
   if sNameIxLen > sNames.length { structNameIxReset() }
   while sNameIxLen < sNames.length {
     const nm = sNames[sNameIxLen]
-    if (sNameIx[nm] ?? -1) < 0 && !sIsRefRow(sNameIxLen) {
-      sNameIx[nm] = sNameIxLen
-    }
+    if (sNameIx[nm] ?? -1) < 0 { sNameIx[nm] = sNameIxLen }
     sNameIxLen = sNameIxLen + 1
   }
   0
@@ -395,7 +398,7 @@ export function structIndexByName(name: string) {
 
 // The number of fully-collected struct entries — the scan bound for any matcher reading
 // a struct's field metadata. During `collectS`'s field-coding loop the in-flight
-// declaration has `sNames` pushed but `sFieldCount` not yet, and `fieldTypeCode` can
+// declaration has `sNames` pushed but `sFieldCount` not yet, and the field-code ladder can
 // re-enter these matchers, so a raw `sNames.length` bound would read `sFieldCount` out of bounds.
 export function sScanLim() {
   let n = sNames.length
@@ -737,92 +740,6 @@ export function code0KindOf(ty: i32): i32 {
   0
 }
 
-// Whether a nested-record field of type `fty` may share row `si`'s field `fi`: the field's
-// target row and `fty` must agree canonically where both are known (D2841).
-export function nestedAnonRowFits(fty: i32, si: i32, fi: i32): boolean {
-  if tyHasTyVar(fty) { return true }
-  // The row's recorded element type answers the common agreeing case without resolving a name.
-  const ety = sFieldElemTyIxAt(si, fi)
-  if ety >= 0 && repCanonId(ety) == repCanonId(fty) { return true }
-  const rowElem = sFieldElemNameAt(si, fi)
-  if rowElem == "" { return true }
-  let cr = repNameCanonId(rowElem)
-  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
-  if cr < 0 { return true }
-  repCanonId(fty) == cr
-}
-
-// Whether a code-0 field of type `fty` may share row `si`'s field `fi`: false only when both
-// code-0 kinds are known and differ (D2841).
-export function code0TyFitsRow(fty: i32, si: i32, fi: i32): boolean {
-  const tk = code0KindOf(fty)
-  if tk == 0 || si < 0 || si >= sTyIx.length { return true }
-  const rk = code0KindOf(
-    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + fi]),
-  )
-  rk == 0 || rk == tk
-}
-
-// An open-addressed pair table, generation-stamped so a new walk costs no clearing: a slot is
-// live only while its stamp equals the walk id, and the capacity is sized once per emit pass.
-// The arrays are the caller's, so two users cannot share a slot (D1705).
-export function pxSized(
-  cap: i32,
-  keyA: i32[],
-  keyB: i32[],
-  stamp: i32[],
-  val: i32[],
-) {
-  while keyA.length < cap {
-    keyA.push(-1)
-    keyB.push(-1)
-    stamp.push(-1)
-    val.push(-1)
-  }
-  0
-}
-
-// The capacity for a table over `want` keys: a power of two at least four times it, so the
-// probe stays short, floored at 1024 and capped so one table cannot outgrow the heap.
-export function pxCapFor(want: i32): i32 {
-  let cap = 1024
-  while cap < want * 4 {
-    if cap >= 262144 { return 262144 }
-    cap = cap * 2
-  }
-  cap
-}
-
-// The slot `(a, b)` occupies on walk `walk`, or the free slot it would take; -1 when the probe
-// finds neither, which is the caller's named default. Reading a free slot back is how a caller
-// answers "not seen", so both callers read the slot rather than a boolean. `cap` is a power of
-// two (`pxCapFor`).
-export function pxSlotOf(
-  keyA: i32[],
-  keyB: i32[],
-  stamp: i32[],
-  cap: i32,
-  walk: i32,
-  a: i32,
-  b: i32,
-): i32 {
-  if cap < 16 { return -1 }
-  if keyA.length < cap { return -1 }
-  let h = hashMixPair(a, b) & (cap - 1)
-  let steps = 0
-  while steps < cap {
-    if stamp[h] != walk { return h }
-    if keyA[h] == a {
-      if keyB[h] == b { return h }
-    }
-    h = h + 1
-    if h == cap { h = 0 }
-    steps = steps + 1
-  }
-  -1
-}
-
-export const ercGenKey = memoKeyNew(1)
 // True if struct-table row `si` is an anonymous shape — one `collectAnonShapes` minted
 // from an object literal under a synthetic `#anonN` name, rather than a declared `type`
 // or inline-shape annotation. An anon row's codes read directly off the literal (exact); a
@@ -906,7 +823,7 @@ export function optChainBaseOf(exprIx: i32) {
 export function recordFitIsStagesRecv(ix: i32): boolean {
   const n = nodeAt(ix)
   if !(n is IsExpr) { return false }
-  if n.isVariant == "null" || unionEqOperandOk(n.isObj) { return false }
+  if isTestsNull(ix) || unionEqOperandOk(n.isObj) { return false }
   const names: string[] = []
   const sets: i32[] = []
   recFitNarrowedFields(nodeTyIxOf(n.isObj), isVarTyIxOf(ix), names, sets) > 0
@@ -970,12 +887,12 @@ export function rowCanonIdOfName(name: string): i32 {
 
 // The wasm-type code (`0` i32, `3` string) of variant `vi`'s field at field index `fi`.
 export function variantFieldTypeAt(vi: i32, fi: i32) {
-  uFieldTypes[uFieldStart[vi] + fi]
+  armFieldTypes()[uFieldStart[vi] + fi]
 }
 
 // The ELEMENT/atom-set NAME recorded for variant `vi`'s field `fi` — a union-box field
 // (code 16) records its atom-set name (the key `emitUnionCoerce` boxes against), a
 // ref-list its element name, a nested-struct its target. "" for a plain scalar field.
 export function variantFieldElemName(vi: i32, fi: i32) {
-  uFieldElemName[uFieldStart[vi] + fi]
+  armFieldElemName()[uFieldStart[vi] + fi]
 }

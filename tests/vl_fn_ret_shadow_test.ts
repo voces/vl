@@ -37,11 +37,12 @@ const DROP_NONE = 0;
 const DROP_NOTHING = 1;
 const DROP_AS_VOID = 2;
 
-/** Compile `src` on a fresh instance with the shadow armed; the rows by class, summed. */
-const shadow = (src: string, drop: number, named: boolean) => {
+/** Compile `src` on a fresh instance with one shadow armed; the rows by class, summed. */
+const shadow = (src: string, drop: number, named: boolean, kind = false) => {
   const exp = new WebAssembly.Instance(compiled!, {})
     .exports as unknown as Exports;
-  exp.fnRetShadowArm(named ? 2 : 1);
+  if (kind) exp.fnKindShadowArm(named ? 2 : 1);
+  else exp.fnRetShadowArm(named ? 2 : 1);
   exp.fnRetShadowDropSet(drop);
   exp.modReset();
   exp.srcReset();
@@ -66,8 +67,9 @@ const expectRows = (
   drop: number,
   named: boolean,
   want: string,
+  kind = false,
 ) => {
-  const { rc, rows } = shadow(src, drop, named);
+  const { rc, rows } = shadow(src, drop, named, kind);
   if (rc !== 0) throw new Error(`${name}: want compileSrc rc 0, got ${rc}`);
   const got = show(rows);
   if (got !== want) {
@@ -95,7 +97,7 @@ print(ap(4))
 `;
 
 // An uncalled closure whose tail writes `null` into a captured nullable: the assignment's value
-// is the closure's recorded result, and the emitter makes it void.
+// is the closure's recorded result, which the emitter lowers from the column.
 const TAIL_WRITE = `function nn(v: i32): i32 | null {
   if v < 0 { return null }
   return v
@@ -141,7 +143,7 @@ a(true)
 `;
 
 // D14791: the tail is an \`else\`-less \`if\` writing a \`T\`-function cell. Closed under the binding,
-// the template's result is a function type, while the emitter lowers the lambda void.
+// the template's result is a function type, which the emitter now lowers from the column.
 const IF_ARM_WRITE = `function inner<U>(u: U) { print(u) }
 function other<V>(v: V) { print("O") }
 function c<T>(x: T) {
@@ -237,7 +239,7 @@ Deno.test({
       IF_ARM_WRITE,
       DROP_NONE,
       true,
-      "agree | __lambda_0=1; agree | c=1; agree | inner=1; agree | other=1; recorded value, emitter void | __lambda_1=1",
+      "agree | __lambda_0=1; agree | __lambda_1=1; agree | c=1; agree | inner=1; agree | other=1",
     );
     expectRows(
       "nullable field",
@@ -252,7 +254,7 @@ Deno.test({
       TAIL_WRITE,
       DROP_NONE,
       true,
-      "agree | line=1; agree | nn=1; emit-time: tail assignment lowered void | __lambda_0=1",
+      "agree | __lambda_0=1; agree | line=1; agree | nn=1",
     );
   },
 });
@@ -266,7 +268,8 @@ Deno.test({
       PLAIN,
       DROP_NOTHING,
       false,
-      "no result recorded=2",
+      // The valued function is pinned from its column before the shadow drops it.
+      "no result recorded, annotated=1; no result recorded=1",
     );
     expectRows(
       "annotated, nothing",
@@ -288,6 +291,292 @@ Deno.test({
       DROP_AS_VOID,
       false,
       "agree=1; recorded void, emitter value=4",
+    );
+  },
+});
+
+// The result-kind shadow: a valued function's recorded result against its lowered signature's
+// result token. A closure writing a value `if` into a captured `i64` records `i32` (an
+// assignment yields its right side) and lowers it at `i32` too (D14796).
+const HEX_LAMBDA = `function g(c: boolean) {
+  let x: i64 = 0
+  const set = () => {
+    x = if c { 0xfffffffe } else { 1 }
+  }
+  set()
+  print(x)
+}
+g(true)
+`;
+
+Deno.test({
+  name: "fn-ret shadow: kind classes",
+  ignore,
+  fn() {
+    expectRows("kind plain", PLAIN, DROP_NONE, true, "kind agree | g=1", true);
+    expectRows(
+      "kind hex lambda",
+      HEX_LAMBDA,
+      DROP_NONE,
+      true,
+      "kind agree | __lambda_0=1",
+      true,
+    );
+  },
+});
+
+// A generic returned past an un-annotated function into a `string`-returning slot is built
+// returning `string`, beside its exact instance: each records the result it is built at (D14795).
+const WIDENED_DELIVERY = `type K = "x" | "y"
+function same<T>(k: T): T { k }
+function d1() { return same }
+const v1: (k: K) => string = d1()
+print(v1("x") + "!")
+const u1: (k: K) => K = same
+print(u1("y"))
+`;
+
+Deno.test({
+  name: "fn-ret shadow: kind widened delivery",
+  ignore,
+  fn() {
+    expectRows(
+      "kind widened delivery",
+      WIDENED_DELIVERY,
+      DROP_NONE,
+      true,
+      "kind agree | __lambda_0=1; kind agree | d1=1; kind agree | same$1=1; kind agree | same=1",
+      true,
+    );
+  },
+});
+
+// The row shadow: a recorded result whose slot the lowering keys elsewhere is graded by the row
+// each returned value was stamped built at. A fresh record a kept delivery builds wider is
+// recorded at that row (`recKeptFnDstOf`) and agrees outright; a list of an instance's function
+// value agrees by its stamp; an identity instance's value, stamped at its binding, is built at
+// the delivery's.
+const ROW_STAMP = `const i: { f: i32 } = { f: 4 }
+type I = { f: i32 | null }
+function mk() { { f: 7 } }
+const b: I = mk()
+print(b.f ?? 0)
+print(i.f)
+`;
+
+const ROW_LIST = `function id<T>(x: T): T { x }
+function d() { return [id] }
+const v: ((x: i32) => i32)[] = d()
+print(v[0](2))
+const u: ((x: i32) => i32)[] = d()
+print(u[0](3) + 2)
+function ds() { return [id] }
+const w: ((x: string) => string)[] = ds()
+const g = w[0]
+print(g("s"))
+function di() { return [id, id] }
+function main() {
+  const xs: ((x: i32) => i32)[] = di()
+  for f in xs { print(f(3)) }
+}
+main()
+`;
+
+const ROW_DELIVERY = `type J = { r: i32 | null }
+function idn<T>(v: T): T { v }
+const u: J | string = idn({ r: 4 })
+const k = { r: 5 }
+print(k.r)
+if u is J { print(u.r ?? 0) }
+`;
+
+// D14901 class D: a fresh literal delivered at a float record is built at that record, its own
+// record having no row; the result reads the literal's stamp.
+const ROW_NO_OWN_ROW = `type F = { v: f32 }
+function d1() { return { v: -7 } }
+const w1: F = d1()
+print(w1.v / 2)
+`;
+
+// D14901 class D: a list of records whose own element has no row is built at its literal's stamp.
+const LIST_NO_OWN_ROW = `type Circle = { r: i32 | null }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+function mk() { return [{ r: null }, { r: null }] }
+print(mk().length)
+`;
+
+// D14901 class D: an element read handed back is built where the list's stored values are, here
+// the kept build of the call that fills it, not at the element's row-less own record.
+const ELEM_HAND_BACK = `type J = { f: i32 | null }
+function mk() { { f: 4 } }
+function back(r) { return r }
+const wideJ: J = mk()
+const xs = [mk()]
+print(back(xs[0]).f)
+print(wideJ.f ?? 0)
+`;
+
+// D14902: an un-annotated function whose value is a call's, rebound, is built where that call is,
+// not at the narrow record its callers are stamped at; a generic taking its call reads it there.
+const ROW_CALL_BUILT = `type II = { f: i32 }
+type J = { f: i32 | null }
+function mk() { { f: 4 } }
+function id<T>(x: T): T { x }
+function r2() {
+  const k = id(mk())
+  const k2 = k
+  return k2
+}
+function g<T>(a: T): T { a }
+const d: J = mk()
+print(g(r2()).f)
+print(d.f ?? 0)
+`;
+
+// D14902: a literal handed straight back, by a hole function that only rebinds its parameter and
+// by a generic identity, is built at the wider record the call lands on; the result reads there.
+const ROW_HAND_BACK = `type A = { d: i32 | null }
+type II = { d: i32 }
+function g(v) {
+  const w = v
+  return w
+}
+function h<T>(v: T): T { return v }
+const c: A = g({ d: 5 })
+print(c.d ?? 0)
+const e: A = h({ d: 6 })
+print(e.d ?? 0)
+`;
+
+Deno.test({
+  name: "fn-ret shadow: row classes",
+  ignore,
+  fn() {
+    expectRows(
+      "row stamp",
+      ROW_STAMP,
+      DROP_NONE,
+      true,
+      "kind agree | mk=1",
+      true,
+    );
+    expectRows(
+      "row list",
+      ROW_LIST,
+      DROP_NONE,
+      true,
+      "kind agree | ds=1; kind agree | id$1=1; kind agree | id=1; row agree | d=1; row agree | di=1",
+      true,
+    );
+    expectRows(
+      "row delivery",
+      ROW_DELIVERY,
+      DROP_NONE,
+      true,
+      "kind agree | idn=1",
+      true,
+    );
+    expectRows(
+      "row hand-back",
+      ROW_HAND_BACK,
+      DROP_NONE,
+      true,
+      "kind agree | g=1; kind agree | h=1",
+      true,
+    );
+    expectRows(
+      "row call-built",
+      ROW_CALL_BUILT,
+      DROP_NONE,
+      true,
+      "kind agree | g=1; kind agree | id=1; kind agree | mk=1; kind agree | r2=1",
+      true,
+    );
+    expectRows(
+      "row no own row",
+      ROW_NO_OWN_ROW,
+      DROP_NONE,
+      true,
+      "kind agree | d1=1",
+      true,
+    );
+    expectRows(
+      "list no own row",
+      LIST_NO_OWN_ROW,
+      DROP_NONE,
+      true,
+      "kind agree | mk=1",
+      true,
+    );
+    expectRows(
+      "element hand-back",
+      ELEM_HAND_BACK,
+      DROP_NONE,
+      true,
+      "kind agree | back=1; kind agree | mk=1",
+      true,
+    );
+  },
+});
+
+// A `u8[]` map's callback records `(e: u8) => u8`, a storage type its value widens from: it
+// crosses as the `i32` its lowered signature carries.
+const U8_MAP = `const xs: u8[] = [1, 200, 7]
+const m = xs.map((e) => e)
+print(m[1])
+`;
+
+// An intersection of records folds to a one-member union around the merged record (D14794),
+// whose rep and token are that record's.
+const INTERSECTION = `type AB = { a: i32 } & { b: i32 }
+function mkAB(): AB { return { a: 1, b: 2 } }
+function sumAB(v: AB): i32 { return v.a + v.b }
+print(sumAB(mkAB()))
+`;
+
+Deno.test({
+  name: "fn-ret shadow: kind u8 and intersection",
+  ignore,
+  fn() {
+    expectRows(
+      "kind intersection",
+      INTERSECTION,
+      DROP_NONE,
+      true,
+      "kind agree | mkAB=1; kind agree | sumAB=1",
+      true,
+    );
+    expectRows(
+      "kind u8 map",
+      U8_MAP,
+      DROP_NONE,
+      true,
+      "kind agree | __lambda_0=1",
+      true,
+    );
+  },
+});
+
+Deno.test({
+  name: "fn-ret shadow: kind fires",
+  ignore,
+  fn() {
+    expectRows(
+      "kind, nothing",
+      PLAIN,
+      DROP_NOTHING,
+      false,
+      "kind: no result recorded=1",
+      true,
+    );
+    expectRows(
+      "kind, all void",
+      PLAIN,
+      DROP_AS_VOID,
+      false,
+      "kind: recorded void or never=1",
+      true,
     );
   },
 });

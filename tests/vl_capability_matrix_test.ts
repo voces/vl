@@ -353,6 +353,54 @@ __show(v)
 null
 `;
 
+// An emit refusal's reason is the refusal's own text. `vl check` prints a parenthesised note
+// when a program imports std (`(std: modules not linted …)`), and the reason column once quoted
+// that note for every emit refusal, since it is the first line the check phase leaves. The
+// control imports std through interpolation and is refused at emit by D15159's uncalled function.
+const EMIT_REASON_TEMPLATE = `// An emit refusal past a clean check, with std imported.
+// @@PRELUDE@@
+function __inc0(a) { return a + 1 }
+const __rss = [[{ f: __inc0 }]]
+print("\\{__rss.length}")
+// @@VALUE@@
+1
+// @@TYPE@@
+i32
+// @@PROOF@@
+print("\\{v}")
+// @@WANT@@
+1
+`;
+
+Deno.test({
+  name: "matrix: an emit refusal's reason is the refusal text, not a check note",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_capability_matrix_reason_" });
+    try {
+      const t = `${dir}/emit-reason.matrix.vl`;
+      await Deno.writeTextFile(t, EMIT_REASON_TEMPLATE);
+      const { cells } = await runMatrix(t, "binding,argument");
+      for (const face of ["annotated", "un-annotated"]) {
+        for (const p of ["binding", "argument"]) {
+          const grade = gradeOf(cells, p, face);
+          if (verdictOf(grade) !== "emit refuses") {
+            throw new Error(
+              `${p}/${face}: the control no longer reaches an emit refusal, so this guard measures ` +
+                `nothing — replace its prelude with another check-clean emit refusal. Got: ${grade}`,
+            );
+          }
+          if (!grade.includes("ref valtype with no interned shape") || grade.includes("not linted")) {
+            throw new Error(`${p}/${face}: want the refusal's own text as the reason, got ${grade}`);
+          }
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 Deno.test({
   name: "matrix: a check-clean program that traps is TRAP (program) and exits 1",
   ignore: !ENABLED,

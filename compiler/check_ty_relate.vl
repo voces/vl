@@ -6,6 +6,7 @@
 // the scope chain, `tErr` or checker state; what a single type is or how it is stored is
 // `tyquery.vl`'s and `check_ty_rep.vl`'s question.
 
+import { i32ToStr } from "./ast"
 import {
   ESC_F32,
   ESC_F64,
@@ -21,12 +22,15 @@ import {
   flattenVariantsInto,
   isNullTy,
   isNumericPrimTy,
+  isStringTy,
   litPeekBaseTy,
   nonNulTyOf,
+  nonNullTy,
   nullableInnerOrNone,
   numLitUnionHasBase,
   primNameOf,
   sameNumeric,
+  tyAdmitsNull,
   tyEqNoneIsMap,
   tyHasNullMember,
   tyHasV128Member,
@@ -476,6 +480,17 @@ function eqStructFieldFlatTy(ty: i32, depth: i32): boolean {
   false
 }
 
+// Whether `t` is a number a list stores, beside `null`, in a union box: `i32`, `f64`, `i64`,
+// `f32`. A float literal operand beside an `f32` list builds an `f64` list, a second rep, and the
+// leaf-key test refuses that pair.
+function nulBoxedNumTy(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const p = tyAt(t)
+  if !(p is TyPrim) { return false }
+  const n = p.primName
+  n == "i32" || n == "f64" || n == "i64" || n == "f32"
+}
+
 function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
   if elem < 0 { return "list" }
   const e = tyAt(elem)
@@ -548,6 +563,19 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
     }
     TyNullable => {
       if tyIsI32SentinelNullable(elem) { return "list" }
+      // A nullable record element compares field-wise under a null guard, the flat subset
+      // a `Circle[]` element is (`emitEqGStructElem`).
+      if (
+        e.nInner >= 0
+        && tyAt(e.nInner) is TyObj
+        && eqStructElemFlatTy(e.nInner, 0)
+      ) {
+        return "glist"
+      }
+      // A nullable string element rides the string list, null-guarded at a top-level compare.
+      if e.nInner >= 0 && isStringTy(e.nInner) { return "strlist" }
+      // A nullable number is a union box in a list, compared tag first, then the arm.
+      if nulBoxedNumTy(e.nInner) { return "glist" }
       return "none"
     }
     // A literal-union element rides the same i32 list `i32[]`/`boolean[]` do — a string union
@@ -738,7 +766,17 @@ export function eqRefusals(
       // two different cores lowers one over the other's storage — check-clean invalid wasm without this (D45).
       const eqLc = eqCoreKindOfTyToken(eqLk)
       const eqRc = eqCoreKindOfTyToken(eqRk)
-      if eqLc != "none" && eqRc != "none" && eqLc != eqRc {
+      // So do two generic-core lists whose leaf elements are stored apart: another scalar width,
+      // or a nullable element (a box or a `(ref null …)`) beside a plain one.
+      const eqApart = eqLc == "glist"
+        && eqRc == "glist"
+        && glistLeafKey(lt, 0) != glistLeafKey(rt, 0)
+      if (
+        eqLc != "none"
+        && eqRc != "none"
+        && (eqLc != eqRc || eqApart)
+        && !xrepListPair(lt, rt)
+      ) {
         msgs.push(
           "`"
             + op
@@ -756,6 +794,119 @@ export function eqRefusals(
   }
   0
 }
+
+// Whether `lt` and `rt` are lists of two different element storages that compare by value: two
+// numbers, each plain or nullable, the same or one widening losslessly to the other (`i32` and
+// `i64`, `i32` and `f64`, `f32` and `f64`), or one flat record plain beside nullable; through
+// any number of list levels (D15055, D15092).
+export function xrepListPair(lt: i32, rt: i32): boolean {
+  xrepListPairAt(lt, rt, 0)
+}
+
+// `xrepListPair` at nesting `depth`: two lists of lists compare their elements as a pair of
+// lists stored apart (D15092).
+function xrepListPairAt(lt: i32, rt: i32, depth: i32): boolean {
+  if depth > 6 { return false }
+  const le = xrepListOfList(lt)
+  const re = xrepListOfList(rt)
+  if le >= 0 && re >= 0 { return xrepListPairAt(le, re, depth + 1) }
+  const ln = xrepListElem(lt)
+  const rn = xrepListElem(rt)
+  if ln == "" || rn == "" || ln == rn { return false }
+  const lp = xrepNumPrim(ln)
+  const rp = xrepNumPrim(rn)
+  if lp.length > 4 && lp.slice(0, 4) == "rec#" { return lp == rp }
+  lp == rp || xrepNumWidens(lp, rp) || xrepNumWidens(rp, lp)
+}
+
+// The element of list `t` (`| null` peeled at the top) when it is itself a list, else -1.
+function xrepListOfList(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const n = nonNullTy(t)
+  if n < 0 { return -1 }
+  const e = tyArrayElemIx(n)
+  if e < 0 || e >= T.tys.length { return -1 }
+  if tyAt(e) is TyArray { return e }
+  -1
+}
+
+// The element of list `t` (`| null` peeled at the top) as `<prim>` or `<prim>?` for a number,
+// `rec#<type>` or `rec#<type>?` for a record a list compares field-wise; "" for any other.
+function xrepListElem(t: i32): string {
+  if t < 0 || t >= T.tys.length { return "" }
+  const n = nonNullTy(t)
+  if n < 0 { return "" }
+  const e = tyArrayElemIx(n)
+  if e < 0 || e >= T.tys.length { return "" }
+  const ep = tyAt(e)
+  match ep {
+    TyNullable => {
+      if ep.nInner < 0 || ep.nInner >= T.tys.length { return "" }
+      const inner = xrepElemLeaf(ep.nInner)
+      if inner == "" { return "" }
+      return inner + "?"
+    }
+    // every other element is its own leaf
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+  }
+  xrepElemLeaf(e)
+}
+
+// A list element `e` as `<prim>` for a number or `rec#<type>` for a record a list compares
+// field-wise; "" for any other.
+function xrepElemLeaf(e: i32): string {
+  const ep = tyAt(e)
+  match ep {
+    TyPrim => {
+      if xrepIsNum(ep.primName) { return ep.primName }
+      return ""
+    }
+    TyObj => {
+      if eqStructElemFlatTy(e, 0) { return "rec#" + tyToStr(e) }
+      return ""
+    }
+    // no other element compares across storages
+    TyErr | TyFunc | TyUnion | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+  }
+  ""
+}
+
+function xrepIsNum(n: string): boolean {
+  n == "i32" || n == "i64" || n == "f64" || n == "f32"
+}
+
+// `xrepListElem`'s answer without its `?`.
+function xrepNumPrim(k: string): string {
+  if k.length > 0 && k[k.length - 1] == '?' { return k.slice(0, k.length - 1) }
+  k
+}
+
+// Whether number `a` widens losslessly to `b`.
+function xrepNumWidens(a: string, b: string): boolean {
+  (a == "i32" && (b == "i64" || b == "f64")) || (a == "f32" && b == "f64")
+}
+
+// The storage key of list `t`'s leaf element, `| null` peeled at the top: one `[]` per list
+// level, a `?` for an element that admits `null`, then the scalar's name or `rec` for a record.
+// Two generic-core lists compare in one core only when their keys agree.
+function glistLeafKey(t: i32, depth: i32): string {
+  if depth > 8 || t < 0 || t >= T.tys.length { return "" }
+  const n = nonNullTy(t)
+  if n < 0 { return "" }
+  const e = tyArrayElemIx(n)
+  if e < 0 { return "" }
+  const q = if tyAdmitsNull(e) { "?" } else { "" }
+  const en = nonNullTy(e)
+  if en < 0 { return "[]" + q }
+  const et = tyAt(en)
+  if et is TyArray { return "[]" + q + glistLeafKey(en, depth + 1) }
+  if et is TyPrim { return "[]" + q + et.primName }
+  if et is TyObj { return "[]" + q + "rec" }
+  glistLeafOther(en)
+}
+
+// A leaf that is no list, scalar or record has no key of its own beyond its index.
+function glistLeafOther(t: i32): string { "[]#" + i32ToStr(t) }
 
 // A struct type with a numerically wider field on the destination side (`{f: i32}` vs
 // `{f: i64}`): assignable as a value (construction converts at the field store) but not as
@@ -816,7 +967,7 @@ export function objFieldNameSetsEq(src: i32, dst: i32): boolean {
 // Do a container's source and destination element types land in different storage
 // classes? Neither side may be unknown. The three lossless scalar element widenings the
 // converting copy serves are the only pairs where a differing class stops being a refusal
-// (D965). The map arms below must keep refusing: `emitScalarListWidenSite` copies a list, and a map has no such copy built.
+// (D965). The map arms below must keep refusing: the emitter copies a list, and a map has no such copy built.
 export function scalarElemWidenServed(se: i32, de: i32): boolean {
   const sc = elemStoreClassOf(se, 8)
   if sc == ESC_UNKNOWN { return false }
@@ -979,14 +1130,19 @@ export function recDeclaredRowOf(ut: i32, own: i32, dst: i32): boolean {
     && !fieldStorageEq(ut, dst, REC_STORE_DEPTH)
 }
 
-// Does the record `dst` store as a bare `f32` or `f64` a field the record `src` holds as an
-// integer, at any depth of records?
+// Does the record `dst` store as an `f32` or `f64` a field the record `src` holds as an integer,
+// at any depth of records, past `| null` at each level as `recNullWidenedAt` reads it (D15247)?
 export function recIntToFloat(src: i32, dst: i32, depth: i32): boolean {
-  recFloatField(src, dst) != "" || recIntToFloatNested(src, dst, depth)
+  recFloatFieldAt(src, dst, true) != "" || recIntToFloatNested(src, dst, depth)
 }
 
 // The first field of `dst` that is a bare float where `src` holds an integer, or "".
 export function recFloatField(src: i32, dst: i32): string {
+  recFloatFieldAt(src, dst, false)
+}
+
+// `recFloatField`, a nullable float field counted too when `pastNull`.
+export function recFloatFieldAt(src: i32, dst: i32, pastNull: boolean): string {
   if src < 0 || dst < 0 || src >= T.tys.length || dst >= T.tys.length {
     return ""
   }
@@ -997,11 +1153,13 @@ export function recFloatField(src: i32, dst: i32): string {
       let i = 0
       while i < d.objFieldNames.length {
         const sf = objFieldType(s, d.objFieldNames[i])
-        const dc = recNumClass(d.objFieldTypes[i])
+        const df = d.objFieldTypes[i]
+        const inner = if pastNull { nullableInnerOrNone(df) } else { -1 }
+        const dc = recNumClass(if inner < 0 { df } else { inner })
         if (
           sf >= 0
           && recNumClass(sf) == "i32"
-          && !(tyAt(d.objFieldTypes[i]) is TyNullable)
+          && (pastNull || !(tyAt(df) is TyNullable))
         ) {
           if dc == "f64" || dc == "f32" { return d.objFieldNames[i] }
         }
@@ -1030,7 +1188,12 @@ function recIntToFloatNested(src: i32, dst: i32, depth: i32): boolean {
       let i = 0
       while i < d.objFieldNames.length {
         const sf = objFieldType(s, d.objFieldNames[i])
-        if sf >= 0 && recIntToFloat(sf, d.objFieldTypes[i], depth - 1) {
+        const df = d.objFieldTypes[i]
+        const inner = nullableInnerOrNone(df)
+        if (
+          sf >= 0
+          && recIntToFloat(sf, if inner < 0 { df } else { inner }, depth - 1)
+        ) {
           return true
         }
         i = i + 1
@@ -1365,7 +1528,7 @@ export function primAmong(name: string, tys: i32[]): i32 {
 
 // Whether slot types `a` and `b` may lower to different wasm reps. Conservative: only an equal
 // type, or a list differing only in `readonly`, is known to agree.
-function fvaSlotMayDiffer(a0: i32, b0: i32, depth: i32): boolean {
+export function fvaSlotMayDiffer(a0: i32, b0: i32, depth: i32): boolean {
   if a0 == b0 { return false }
   if a0 < 0 || b0 < 0 || depth <= 0 { return true }
   // A single literal is stored as its base scalar.

@@ -3,6 +3,19 @@
 // folding at a destination (`cex*`), object-shape adapters and the inferred-return joins.
 // Each answers a type or a verdict for a node the core checker has already typed.
 
+import {
+  fieldNameOf,
+  fieldTypeTextOf,
+  listElemNameOf,
+  nameIsBraceSpanEnds,
+  nameIsShapeOpen,
+  nameStripSpaces,
+  tyTopIndexOf,
+  tyTopLevelSplit,
+} from "./tyname"
+import { callBindTyOf } from "./check_bind_rows"
+import { cwFieldNameOf } from "./check_write_scan"
+import { holeLinkSiteSet } from "./check_hole_links"
 import { decDigitsOf } from "./strutil"
 import {
   ArrayLit,
@@ -51,6 +64,7 @@ import {
   annTsOf,
   arenaSetNode,
   callHasTyArgs,
+  callTyArgsOf,
   i32ToStr,
   nodeAt,
   nodeToks,
@@ -60,6 +74,7 @@ import {
   tsKidStart,
   tsKids,
   tsKind,
+  tsMentionsAnyName,
   tsText,
 } from "./ast"
 import {
@@ -76,17 +91,26 @@ import {
   cohSiteCol,
   cohSiteLine,
   cohWitness,
+  ctxElemNodes,
   ctxFieldNames,
   ctxFieldNodes,
   inferObserved,
   inferObservedLit,
   inferObservedLitSet,
   inferObservedSet,
+  listCopyTyIx,
   mapUnboxTyIx,
+  nodeBoxTyIx,
   nodeCtxTyIx,
+  nodeRepStamped,
   nodeRepTyIx,
+  nodeRepTyIxOf,
   nodeRepUnionIx,
+  optReadParts,
+  recCopyFrom,
+  recCopyFromOf,
   recCopyTyIx,
+  recCopyUnwrap,
   setCtorKeys,
 } from "./check_core_state"
 import {
@@ -105,14 +129,19 @@ import {
   covarWriteThrough,
 } from "./check_covar_write"
 import { cstrOwnerTop } from "./check_cstr_rows"
-import { curFnDeclIx, inferQuiet, quietDepth } from "./check_cursor"
+import { curFnDeclIx, inferQuiet, quietDepth, tpEnvNames } from "./check_cursor"
 import {
+  coerceRecordOpen,
+  elabCapBox,
   elabCapCtx,
   elabCapLive,
   elabCapRep,
   elabCapRepUnion,
+  elabFnFieldWidenedAny,
   elabFnIdOf,
   elabTyClosed,
+  fnLetIsWide,
+  fnTagHeldRepOf,
   stampsStand,
 } from "./check_elab_cap"
 import { boundObjRootOf } from "./check_decl_scan"
@@ -130,6 +159,7 @@ import {
   ifArmGivesNoValue,
   ifArmValTy,
   ifNoValueAtSetAt,
+  lpExitsOf,
   valDiscarded,
 } from "./check_if_value"
 import { inferRetIdx } from "./check_infer_ret"
@@ -209,13 +239,7 @@ import {
 } from "./check_literals"
 import { litTyOfExpr, strLitViewOf } from "./check_match_desugar"
 import { declTyOf, narDeclaredTy } from "./check_nar_store"
-import {
-  armLit,
-  gRootStmts,
-  njFnIx,
-  njJoinGated,
-  njMayPart,
-} from "./check_nj_join"
+import { armLit, gRootStmts, njFnIx, njMayPart } from "./check_nj_join"
 import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import {
   f32LitTailsAdopt,
@@ -280,14 +304,20 @@ import {
   recAdPushDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
+  recApartAt,
+  recApartDecl,
+  recApartDst,
   recArgRepNote,
-  recBuildHoldsElems,
+  recArgRepOf,
   recBuildPassAt,
+  recBuildPassTable,
   recBuildPush,
+  recBuildTyIn,
   recDelivPush,
   recKeptDecl,
   recKeptDst,
   recKeptFnPush,
+  recOwnSrc,
   recPend,
   recPendDstTy,
   recPendSrc,
@@ -295,12 +325,15 @@ import {
 } from "./check_rec_rows"
 import {
   recAtPinnedArg,
+  recBindDeclOf,
   recCoalesceOperands,
   recDeclInit,
   recElemPinLit,
   recIndexBase,
   recIsJoin,
+  recKeptWhat,
   recLeafEscapes,
+  recOwnIsPin,
   recPassThroughArg,
   recShapePassArg,
   recSolePinArg,
@@ -315,6 +348,7 @@ import {
 import {
   annotResolve,
   assignable,
+  bindGenWalk,
   constrainEmpty,
   joinArmFits,
   joinArmLit,
@@ -323,6 +357,7 @@ import {
   joinRetTys,
   joinTys,
   keepListStorage,
+  njFixSet,
   recArmFitKind,
   sameVariantTy,
   substTyDeep,
@@ -390,7 +425,9 @@ import {
   recAdLanding,
   recDeclaredRowOf,
   recFloatField,
+  recFloatFieldAt,
   recIntToFloat,
+  recNumChanges,
   recNumClass,
   recStorageFieldOf,
   scalarElemWidenServed,
@@ -463,6 +500,7 @@ import {
   tyAmong,
   tyArrayElemIx,
   tyAt,
+  tyBearsNull,
   tyChildrenOf,
   tyDeeperThan,
   tyEq,
@@ -492,29 +530,41 @@ import { objSigSame } from "./check_union_arm_msgs"
 import { mkUnionTy } from "./check_union_mint"
 import { isWideLitJoin, mkWideStrLitTy } from "./check_wide_lits"
 import {
+  CW_OCC_ASG,
   CW_OCC_BIND,
   CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_ARM,
   CW_UP_ASG_LHS,
   CW_UP_ASG_RHS,
   CW_UP_CALLEE,
+  CW_UP_COAL,
   CW_UP_ELEM,
   CW_UP_FIELD,
   CW_UP_LETINIT,
   CW_UP_OBJ,
+  CW_UP_RET,
+  CW_UP_TAIL,
   covarRootName,
+  cwBindingOf,
+  cwGetRecv,
   cwIxBuild,
+  cwIxFr,
   cwIxKind,
   cwIxNode,
   cwIxParent,
   cwIxUp,
   cwIxUpAux,
   cwIxUpKind,
+  cwKeyFrame,
   cwKeyOfRoot,
+  cwLetUnwritten,
   cwOccNext,
   cwOccWalk,
   cwPeel,
   cwPeelValue,
+  cwSlotPath,
+  cwSlotWrittenValues,
 } from "./check_write_scan"
 import {
   Cex,
@@ -526,7 +576,7 @@ import {
 } from "./const_exact"
 import { numLexRadixBits } from "./emit_bignum"
 import { nodeLastTok } from "./fmt_util"
-import { i32ListHas, strListIndexOf } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { nameIsBareIdent, nameIsQuotedLeaf } from "./tyname"
 import {
   flattenVariantsInto,
@@ -553,7 +603,10 @@ export function constrainEmptyExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if !inferQuiet && srcExpr >= 0 && tyReachesEmptyHole(srcTy, 8) {
     recordRepTyAdopt(srcExpr, dstTy, 6)
   }
+  if inferQuiet || srcExpr < 0 { return constrainEmpty(srcTy, dstTy) }
+  holeLinkSiteSet(srcExpr, srcTy, dstTy)
   constrainEmpty(srcTy, dstTy)
+  holeLinkSiteSet(-1, -1, -1)
 }
 
 // The inferred return `observed` of the body whose witness frame is on top, re-typed f32 when
@@ -715,6 +768,9 @@ export function sharedUnionFieldTy(u: TyUnion, prop: string) {
         // Runtime field values of different numeric types join apart, as an `if` over the
         // members' reads would.
         njApartSet(true)
+        // Each member's field is a record that already exists, so the join keeps it a member
+        // rather than widening it in place, as a `??` over two existing records does (D15314).
+        njFixSet(true, true)
         shared = joinTys(shared, ft)
       }
     } else {
@@ -924,7 +980,6 @@ export function recordContainedIsAt(
 // spells; -1 when the ordinary `??` rules decide (a literal or hole default, a gated function).
 export function coalJoinApart(l: i32, dt: i32, d: i32): i32 {
   if !njMayPart(l, dt) || tyIsHole(dt) || armLit(dt, d) { return -1 }
-  if njJoinGated(l, dt, false) { return -1 }
   // A hole body keeps master's widening (D2562), as does a union left operand; a declared
   // parameter's body joins apart, as its `if` spelling does, and so does its recheck (D3580).
   if l >= T.tys.length { return -1 }
@@ -1139,7 +1194,7 @@ export function radixLitAdoptDst(srcExpr: i32, dstTy: i32) {
   if e is ObjLit { return radixLitAdoptFields(e, dstTy) }
   if e is ArrayLit { return radixLitAdoptElems(e, dstTy) }
   if e is BinExpr || e is Unary {
-    if litTreeAdoptDst(lix, dstTy) == TY_I64 { return 1 }
+    if litTreeAdoptDst(srcExpr, dstTy) == TY_I64 { return 1 }
     return 0
   }
   radixLitNoParts()
@@ -1219,9 +1274,7 @@ function radixLitAdoptTails(ix: i32, dstTy: i32) {
     let treeLeaf = false
     let ti = 0
     while ti < leaves.length {
-      if litTreeAdoptDst(parenPeelIx(leaves[ti]), dstTy) >= 0 {
-        treeLeaf = true
-      }
+      if litTreeAdoptDst(leaves[ti], dstTy) >= 0 { treeLeaf = true }
       ti = ti + 1
     }
     if all32 && (treeLeaf || radixLeafAmong(leaves)) { reTy = nonNullTy(dstTy) }
@@ -1606,6 +1659,19 @@ function rcwSharedCovs(srcExpr: i32, srcTy: i32, dstTy: i32): string[] {
   out
 }
 
+// Whether a list or map `srcExpr`, typed `srcTy` at a hole, is re-asked at each pin: it names a
+// type parameter, its destination names none, and it is not a method's result, which is fresh.
+function rcwPinsContainer(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if !tyHasTyVar(srcTy) || tyHasTyVar(dstTy) { return false }
+  const p = parenPeelIx(srcExpr)
+  if p < 0 || p >= P.nodes.length { return false }
+  const n = nodeAt(p)
+  if n is Call {
+    if n.callFn >= 0 && nodeAt(n.callFn) is Member { return false }
+  }
+  true
+}
+
 // Record a delivery of `srcExpr` (typed `srcTy`) into `dstTy` when it widens a shared slot.
 export function rcwPend(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if srcExpr < 0 || srcTy < 0 || dstTy < 0 || srcTy == dstTy { return 0 }
@@ -1613,9 +1679,13 @@ export function rcwPend(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if srcTy >= T.tys.length { return 0 }
   if !rcwIsRefTy(srcTy) && !(tyAt(srcTy) is TyVar) { return 0 }
   // A source typed at a hole shares whatever its pin is: each pin re-asks it (D3250), and a
-  // record literal holding one is re-asked whole (D14759).
+  // record literal holding one is re-asked whole (D14759), as is a list or map handed to a
+  // concrete destination, unless a method built it fresh (D4983, D5002).
+  const st = tyAt(srcTy)
   if (
-    (tyAt(srcTy) is TyVar || (tyAt(srcTy) is TyObj && tyHasTyVar(srcTy)))
+    (st is TyVar
+      || (st is TyObj && tyHasTyVar(srcTy))
+      || ((st is TyArray || st is TyMap) && rcwPinsContainer(srcExpr, srcTy, dstTy)))
     && rcwIsRefTy(dstTy)
     && cstrOwnerTop() >= 0
   ) {
@@ -1729,22 +1799,63 @@ function recLandingOf(srcTy: i32, dstTy: i32): i32 {
 }
 
 // A record a function built, or an element of a list binding, delivered where a field it holds as
-// an integer is a bare float: the value is built at its own row and has no conversion, so it is
-// refused as an existing record is (D3339). True when it refused.
+// an integer is a float (D3339), or a number stored at another width that no converting copy
+// serves (D15247): the value is built at its own row and refused. True when it refused.
 function recFloatBuiltElsewhere(at: i32, srcTy: i32, dstTy: i32): boolean {
   const own = nonNulTyOf(srcTy)
   const dst = nonNulTyOf(dstTy)
-  if !recIntToFloat(own, dst, REC_STORE_DEPTH) { return false }
+  if !recIntToFloat(own, dst, REC_STORE_DEPTH) {
+    if !recNumChanges(own, dst, REC_STORE_DEPTH) || recCopyConverts(own, dst) {
+      return false
+    }
+    recWidthCopyGapErr(at, own, dst)
+    return true
+  }
   shapeAdaptSrcTySet(own)
   shapeAdaptDstTySet(dst)
   shapeAdaptSrcExprSet(at)
   shapeAdaptElemPairSet(false)
   shapeAdaptWidthFieldSet(false)
   shapeAdaptRecStorageSet(true)
-  shapeAdaptRecStorageFieldSet(recFloatField(own, dst))
+  const ff = recFloatFieldAt(own, dst, true)
+  shapeAdaptRecStorageFieldSet(
+    if ff != "" { ff } else { recStorageFieldOf(own, dst) },
+  )
   objShapeAdapterlessErr(at, own, dst)
   shapeAdaptRecStorageSet(false)
   true
+}
+
+// The refusal of a record `own` delivered to `dst`, which stores a number at another width in a
+// nested or nullable field the converting copy does not reach (D15247).
+function recWidthCopyGapErr(at: i32, own: i32, dst: i32) {
+  const fnm = recStorageFieldOf(own, dst)
+  let note = ""
+  const o = tyAt(own)
+  const d = tyAt(dst)
+  if o is TyObj {
+    if d is TyObj {
+      const of = objFieldType(o, fnm)
+      const df = objFieldType(d, fnm)
+      if of >= 0 && df >= 0 {
+        note = " (`" + tyToStr(of) + "` into `" + tyToStr(df) + "`)"
+      }
+    }
+  }
+  tErr(
+    tyToStr(own)
+      + " is not "
+      + tyToStr(dst)
+      + ": they store field `"
+      + fnm
+      + "` differently"
+      + note
+      + ", and the record is also kept at its own type; converting it into "
+      + tyToStr(dst)
+      + " is not yet supported: the converting copy does not reach a nested or nullable field",
+    at,
+  )
+  0
 }
 
 // A function with no declared result called only at `call`, whose every returned value is an
@@ -1763,6 +1874,12 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   if rcwCallSites(fd, sites) >= 0 || !recSitesLandAt(sites, call, own, dst) {
     return false
   }
+  const copies: i32[] = []
+  const copyTys: i32[] = []
+  const copyBack: i32[] = []
+  for cs in recSiteCopies { copies.push(cs) }
+  for ct in recSiteCopyTys { copyTys.push(ct) }
+  for cb in recSiteCopyBack { copyBack.push(cb) }
   const via: i32[] = []
   const leaves = recFnValueOrigins(fd, via)
   if leaves.length == 0 { return false }
@@ -1782,6 +1899,8 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
       && recInferredFnOf(lp) >= 0
       && recInferredFnOf(lp) != fd
     ) {
+      // Else the hand-on refuses the two builds, as D14516 pins.
+      if recLeafLeavesToCopy(lp, dst) { return false }
       calls.push(lp)
     } else if lp != call && recSolePinArg(lp) >= 0 {
       let x = lp
@@ -1805,11 +1924,113 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
       recBuildPush(recHeldDecl(litVia[i]), nodeTyIxOf(lits[i]), dst, false)
     }
     recordRepTyAdopt(lits[i], dst, 6)
+    recLitFieldsDeliver(lits[i], dst, REC_STORE_DEPTH)
     i = i + 1
   }
   // A leaf calling another such function hands the destination on to it (D8143).
   for cl in calls { recAdoptNote(cl, nodeTyIxOf(cl), dst) }
+  // A held-pinned call is built at `dst` and copied to its own record where it is delivered.
+  let ci = 0
+  while ci < copies.length {
+    const cp = copies[ci]
+    while recCopyTyIx.length <= cp { recCopyTyIx.push(-1) }
+    recCopyTyIx[cp] = copyTys[ci]
+    // A call copied back to its own record is delivered as the copy, so its rep is stamped there;
+    // the build stays readable at `recCopyFromOf` for the copy itself (D15266).
+    if i32ListHas(copyBack, cp) {
+      recCopyFrom[cp] = dst
+      repStamp(cp, copyTys[ci])
+    }
+    const un = recCopyUnwrapNames(dst, own)
+    if un.length > 0 { recCopyUnwrap[cp] = un }
+    ci = ci + 1
+  }
   true
+}
+
+// Whether value leaf `lp`, a call of another function that cannot itself be built at `dst`, leaves
+// the delivery to its converting copy, where one serves (D15216).
+function recLeafLeavesToCopy(lp: i32, dst: i32): boolean {
+  const lfn = recInferredFnOf(lp)
+  lfn >= 0
+    && recCopyConverts(nodeTyIxOf(lp), dst)
+    && !recFnBuildsAt(lfn, lp, nodeTyIxOf(lp), dst, REC_STORE_DEPTH)
+}
+
+// Whether some value leaf of `fd` is a call of another function that leaves the delivery at `dst`
+// to its converting copy (`recLeafLeavesToCopy`): `fd` relays a result it does not build (D15244).
+function recRelayLeavesToCopy(fd: i32, dst: i32): boolean {
+  const via: i32[] = []
+  for lf in recFnValueOrigins(fd, via) {
+    if lf >= 0 && recInferredFnOf(lf) != fd && recLeafLeavesToCopy(lf, dst) {
+      return true
+    }
+  }
+  false
+}
+
+// Whether inferred function `fd`, called at `call` with result `own`, can be built at `dst`: its call
+// sites land there (`recSitesLandAt`), and each value leaf calling another such function can be
+// too, to `depth` calls (`REC_STORE_DEPTH` from the solve, D15216).
+function recFnBuildsAt(
+  fd: i32,
+  call: i32,
+  own: i32,
+  dst: i32,
+  depth: i32,
+): boolean {
+  if depth <= 0 || fd < 0 { return false }
+  cwIxBuild()
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || !recSitesLandAt(sites, call, own, dst) {
+    return false
+  }
+  const via: i32[] = []
+  for lf in recFnValueOrigins(fd, via) {
+    if lf < 0 { return false }
+    const lfn = recInferredFnOf(lf)
+    if (
+      lfn >= 0
+      && lfn != fd
+      && !recFnBuildsAt(lfn, lf, nodeTyIxOf(lf), dst, depth - 1)
+    ) {
+      return false
+    }
+  }
+  true
+}
+
+// Delivers each field value of record literal `lit`, built at record `dst`, at `dst`'s field, as
+// the literal written at `dst` delivers it: a call or binding holding a record there is built at
+// or copied to that field (D15215). Nested literals are walked to `depth`.
+function recLitFieldsDeliver(lit: i32, dst: i32, depth: i32) {
+  if (
+    depth <= 0
+    || lit < 0
+    || lit >= P.nodes.length
+    || dst < 0
+    || dst >= T.tys.length
+  ) {
+    return 0
+  }
+  const e = nodeAt(parenPeelIx(lit))
+  const d = tyAt(nonNulTyOf(dst))
+  if !(e is ObjLit) || !(d is TyObj) { return 0 }
+  for fx in e.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit {
+      const df = objFieldType(d, f.fiName)
+      const v = parenPeelIx(f.fiValue)
+      if df >= 0 && v >= 0 && v < P.nodes.length {
+        if nodeAt(v) is ObjLit {
+          recLitFieldsDeliver(v, df, depth - 1)
+        } else {
+          recAdoptNote(v, nodeTyIxOf(v), df)
+        }
+      }
+    }
+  }
+  0
 }
 
 // What an inferred function `fd` of result `own` returns when its call sites all land where
@@ -1846,6 +2067,9 @@ function recFnReturns(fd: i32): i32[] {
 // serves them all (D8201). For one queued for none, `dst` widens a field no further than
 // `recNullWidened` reads back exactly, and its slots take the build (D8302).
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
+  recSiteCopies = []
+  recSiteCopyTys = []
+  recSiteCopyBack = []
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
   for s in sites {
@@ -1853,25 +2077,656 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     const c = s / 2
     if c == call { hasCall = true }
     const mapped = recHeldStored(c)
+    // A held-pinned call is built at `dst` and copied to its own record where that loses nothing.
+    if recHeldPinnedArg(c) || recPinnedAtOwn(c, own) {
+      if (mapped || !recPinnedAtOwn(c, own) || !recCopyNarrows(dst, own)) {
+        return false
+      }
+      recSiteCopies.push(c)
+      recSiteCopyTys.push(recCopyDstOf(c, own))
+      continue
+    }
     const at = if mapped { -1 } else { recQueuedLandingOf(c, own, dst) }
     if at >= 0 {
       if !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
+      // A value landing at the build that a record is then written through takes its own copy.
+      if (
+        c != call
+        && recValueWrittenThrough(c, own, REC_STORE_DEPTH)
+        && recCopyNarrows(dst, own)
+      ) {
+        recSiteCopies.push(c)
+        recSiteCopyTys.push(own)
+        recSiteCopyBack.push(c)
+      }
     } else if (
       c == call
       || !recNullWidened(own, dst, mapped)
       || (!mapped && recQueuedReaches(c, own, dst))
     ) {
       return false
+    } else if (
+      (!mapped || recStoreDeclOf(c) >= 0)
+      && recValueWrittenThrough(c, own, REC_STORE_DEPTH)
+      && recCopyNarrows(dst, own)
+    ) {
+      // A binding a record is written through takes its own copy of the build rather than sharing
+      // it; one no copy serves shares it as before (D15246).
+      recSiteCopies.push(c)
+      recSiteCopyTys.push(own)
+      recSiteCopyBack.push(c)
     }
   }
   if hasCall { recRepArgsNote(sites, own, dst) }
   hasCall
 }
 
+// The held-pinned calls the last `recSitesLandAt` answer copies to their own record, and beside
+// each the record it is copied into.
+let recSiteCopies: i32[] = []
+let recSiteCopyTys: i32[] = []
+// The copies among `recSiteCopies` that a binding written through takes back to its own record.
+let recSiteCopyBack: i32[] = []
+
+// Whether the value call site `c` produces reaches a binding a record is written through: the
+// binding it initialises, the parameter it is handed to, or, through a return, whatever each call
+// of the enclosing function reaches, to `depth` such hops (`recBindWrittenThrough`, D15266).
+function recValueWrittenThrough(c: i32, own: i32, depth: i32): boolean {
+  cwIxBuild()
+  if depth <= 0 || c < 0 || c >= cwIxParent.length || c >= cwIxUpKind.length {
+    return false
+  }
+  const d = cwIxParent[c]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+  if dn is LetDecl && parenPeelIx(dn.letInit) == c {
+    return recOwnTypedAt(d, own) && recBindWrittenThrough(d, 4)
+  }
+  const uk = cwIxUpKind[c]
+  // A value stored into a container slot is asked of the slot's reads.
+  if uk == CW_UP_ARG && recAtStoreArg(c) { return recSlotWrittenThrough(c) }
+  if uk == CW_UP_ARG { return recArgWrittenThrough(c, own) }
+  if uk == CW_UP_ELEM || uk == CW_UP_FIELD || uk == CW_UP_ASG_RHS {
+    return recSlotWrittenThrough(c)
+  }
+  if uk == CW_UP_RET || uk == CW_UP_TAIL {
+    const fd = recEnclosingFn(c)
+    const sites: i32[] = []
+    if fd < 0 || rcwCallSites(fd, sites) >= 0 { return false }
+    for s in sites {
+      if s % 2 == 0 && recValueWrittenThrough(s / 2, own, depth - 1) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Whether the container slot value `c` is stored at is read, through the binding the literal holding
+// it initialises, into a place a record is written through: the write scan's slot model
+// (`cwSlotPath`, `cwSlotWrittenValues`) decides which reads see `c`.
+function recSlotWrittenThrough(c: i32): boolean {
+  const md = recStoreDeclOf(c)
+  if md < 0 { return false }
+  const w = cwOccWalk(md)
+  while cwOccNext(w) {
+    const r = w.row
+    let m = if cwIxKind[r] == CW_OCC_USE { cwIxNode[r] } else { -1 }
+    let steps = 0
+    while (
+      m >= 0
+      && m < cwIxUpKind.length
+      && cwIxUpKind[m] == CW_UP_OBJ
+      && steps < 16
+    ) {
+      m = cwIxUp[m]
+      const mg = if m >= 0 && m < cwIxUpKind.length && cwIxUpKind[m] == CW_UP_CALLEE { cwIxUp[m] } else { -1 }
+      if mg >= 0 && cwGetRecv(mg) >= 0 { m = mg }
+      if recSlotReadHolds(m, c) && recUseWritesThrough(m, 4) { return true }
+      steps = steps + 1
+    }
+  }
+  false
+}
+
+// Whether the place `m` reads is a slot `c` is stored at.
+function recSlotReadHolds(m: i32, c: i32): boolean {
+  const path: string[] = []
+  const root = cwSlotPath(m, path)
+  if root < 0 || path.length == 0 { return false }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwBindingOf(root), path, vals, ats) < 0 {
+    return false
+  }
+  i32ListHas(vals, c)
+}
+
+// Whether binding or parameter `d` is typed at the record `own` stores as, or at an open hole a
+// call pins: a copy back to `own` is what it holds then.
+function recOwnTypedAt(d: i32, own: i32): boolean {
+  const t = nodeTyIxOf(d)
+  if t < 0 || t >= T.tys.length { return false }
+  tyReachesHole(t, 8)
+    || tyHasTyVar(t)
+    || fieldStorageEq(t, own, REC_STORE_DEPTH)
+}
+
+// Whether argument `a` is handed to a parameter a record is written through (`recBindWrittenThrough`).
+function recArgWrittenThrough(a: i32, own: i32): boolean {
+  const up = cwIxUp[a]
+  const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { nodeAt(0) }
+  if !(un is Call) { return false }
+  const fd = recInferredFnOf(up)
+  const fn = if fd >= 0 { nodeAt(fd) } else { nodeAt(0) }
+  if !(fn is FuncDecl) { return false }
+  let i = 0
+  while i < un.callArgs.length && i < fn.fnParams.length {
+    if parenPeelIx(un.callArgs[i]) == a {
+      const pd = fn.fnParams[i]
+      return recOwnTypedAt(pd, own) && recBindWrittenThrough(pd, 4)
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether binding or parameter `d` may be written through: a field path of it is assigned, or it
+// is bound by `const` or handed as an argument to a binding or parameter that is, to `depth` hops.
+function recBindWrittenThrough(d: i32, depth: i32): boolean {
+  if d < 0 || depth <= 0 { return false }
+  const fr = cwKeyFrame(d)
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const r = w.row
+    const an = if cwIxKind[r] == CW_OCC_ASG && cwIxFr[r] == fr { nodeAt(cwIxNode[r]) } else { null }
+    if (
+      an is BinExpr
+      && an.binOp == "="
+      && !(nodeAt(parenPeelIx(an.binLeft)) is Ident)
+      && tyHoldsObjDeep(nodeTyIxOf(an.binRight))
+    ) {
+      return true
+    }
+    const u = if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == fr { cwIxNode[r] } else { -1 }
+    if u >= 0 && u < cwIxUpKind.length && recUseWritesThrough(u, depth) {
+      return true
+    }
+  }
+  false
+}
+
+// Whether assignment `a` stores a value holding a record: a scalar field write is served by the
+// shared build's own field storage.
+function recAsgStoresRecord(a: i32): boolean {
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { nodeAt(0) }
+  an is BinExpr && tyHoldsObjDeep(nodeTyIxOf(an.binRight))
+}
+
+// Whether the read `u` of a binding writes through it: the field path it roots is assigned, or the
+// whole value is bound by `const` or handed as an argument to a binding written through.
+function recUseWritesThrough(u: i32, depth: i32): boolean {
+  let top = u
+  while top >= 0 && top < cwIxUpKind.length && cwIxUpKind[top] == CW_UP_OBJ {
+    top = cwIxUp[top]
+  }
+  if top < 0 || top >= cwIxUpKind.length { return false }
+  const uk = cwIxUpKind[top]
+  if uk == CW_UP_ASG_LHS { return top != u && recAsgStoresRecord(cwIxUp[top]) }
+  if top != u { return false }
+  const up = cwIxUp[top]
+  if up < 0 || up >= P.nodes.length { return false }
+  const un = nodeAt(up)
+  if uk == CW_UP_LETINIT && un is LetDecl {
+    return recBindWrittenThrough(up, depth - 1)
+  }
+  if uk == CW_UP_ARG && un is Call {
+    const fd = recInferredFnOf(up)
+    const fn = if fd >= 0 { nodeAt(fd) } else { nodeAt(0) }
+    if !(fn is FuncDecl) { return false }
+    let i = 0
+    while i < un.callArgs.length && i < fn.fnParams.length {
+      if parenPeelIx(un.callArgs[i]) == top {
+        return recBindWrittenThrough(fn.fnParams[i], depth - 1)
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The record call `c` of own type `own` is copied into: the type its pin names, which a written
+// type argument spells as a declared record, else `own` (D14818).
+function recCopyDstOf(c: i32, own: i32): i32 {
+  const dt = recDeclaredPinTy(c)
+  if dt >= 0 && fieldStorageEq(dt, own, REC_STORE_DEPTH) { return dt }
+  const pt = recReachPinTy(c)
+  if pt >= 0 && fieldStorageEq(pt, own, REC_STORE_DEPTH) { pt } else { own }
+}
+
+// Whether call `c` reaches a type parameter that a written type argument, or another argument
+// holding a value no call of its function produced, pins at a type storing as `own` (D14818).
+function recPinnedAtOwn(c: i32, own: i32): boolean {
+  const pt = recReachPinTy(c)
+  pt >= 0 && fieldStorageEq(pt, own, REC_STORE_DEPTH)
+}
+
+// The type name parameter `px` is annotated with, or "" for none or a composite annotation.
+function recParamTyName(px: i32): string {
+  const pn = nodeAt(px)
+  const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+  if pt is TypeRef { pt.tyName } else { "" }
+}
+
+// Whether record `wide` can be copied into record `own` field for field: each field stored alike,
+// or a `null` field of `own` where `wide` stores the field as nullable.
+function recCopyNarrows(wide: i32, own: i32): boolean {
+  recCopyNarrowsAt(wide, own, REC_STORE_DEPTH)
+}
+
+// `recCopyNarrows` with at most `depth` levels of record fields left: a field holding a record at
+// another row is copied into its own row by the level below.
+function recCopyNarrowsAt(wide: i32, own: i32, depth: i32): boolean {
+  if (
+    depth <= 0
+    || wide < 0
+    || own < 0
+    || wide >= T.tys.length
+    || own >= T.tys.length
+  ) {
+    return false
+  }
+  const w = tyAt(wide)
+  const o = tyAt(own)
+  if !(w is TyObj) || !(o is TyObj) || !objFieldNameSetsEq(wide, own) {
+    return false
+  }
+  let i = 0
+  while i < o.objFieldNames.length {
+    const of = o.objFieldTypes[i]
+    const wf = objFieldType(w, o.objFieldNames[i])
+    if wf < 0 { return false }
+    if (
+      !fieldStorageEq(wf, of, REC_STORE_DEPTH)
+      && !(of == TY_NULL && nullableInnerOrNone(wf) >= 0)
+      && !recCopyUnwraps(wf, of)
+      && !(recCopyNestable(wf, of)
+        && recCopyNarrowsAt(wf, nonNulTyOf(of), depth - 1))
+    ) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether a copy reads field `sf` as a record of its own to copy into the record `df` holds:
+// `sf` a record, never null, and `df` a record or a nullable one.
+function recCopyNestable(sf: i32, df: i32): boolean {
+  if sf < 0 || df < 0 || sf >= T.tys.length || df >= T.tys.length {
+    return false
+  }
+  const dn = nonNulTyOf(df)
+  tyAt(sf) is TyObj && dn >= 0 && dn < T.tys.length && tyAt(dn) is TyObj
+}
+
+// Whether a field stored as `wf` in the wide row is copied into own field `of` by unwrapping it:
+// `wf` is `of` or null, `of` is not. Sound for the copy because `own` is the copied call's own
+// result type, so every value its function builds holds an `of` there (D15184).
+function recCopyUnwraps(wf: i32, of: i32): boolean {
+  const inner = nullableInnerOrNone(wf)
+  of != TY_NULL && inner >= 0 && fieldStorageEq(inner, of, REC_STORE_DEPTH)
+}
+
+// The fields of record `own` a copy from wide row `wide` unwraps (`recCopyUnwraps`), as field
+// paths (`j.f`) through the records a copy nests (`recCopyNestable`).
+function recCopyUnwrapNames(wide: i32, own: i32): string[] {
+  const out: string[] = []
+  recCopyUnwrapNamesAt(wide, own, "", REC_STORE_DEPTH, out)
+  out
+}
+
+// `recCopyUnwrapNames` below the path `pre`, at most `depth` levels down, pushed onto `out`.
+function recCopyUnwrapNamesAt(
+  wide: i32,
+  own: i32,
+  pre: string,
+  depth: i32,
+  out: string[],
+) {
+  if depth <= 0 { return 0 }
+  const w = if wide >= 0 && wide < T.tys.length { tyAt(wide) } else { tyAt(TY_ERR) }
+  const o = if own >= 0 && own < T.tys.length { tyAt(own) } else { tyAt(TY_ERR) }
+  if !(w is TyObj) || !(o is TyObj) { return 0 }
+  let i = 0
+  while i < o.objFieldNames.length {
+    const wf = objFieldType(w, o.objFieldNames[i])
+    const of = o.objFieldTypes[i]
+    if wf >= 0 && !fieldStorageEq(wf, of, REC_STORE_DEPTH) {
+      if recCopyUnwraps(wf, of) {
+        out.push(pre + o.objFieldNames[i])
+      } else if recCopyNestable(wf, of) {
+        recCopyUnwrapNamesAt(
+          wf,
+          nonNulTyOf(of),
+          pre + o.objFieldNames[i] + ".",
+          depth - 1,
+          out,
+        )
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether call `c` is an argument to a parameter typed `T` of a generic callee, or an element of a
+// list literal handed to one typed `T[]`, where a held value no call of `c`'s function produced
+// also binds `T` (another argument, or another element), or the call writes its type arguments:
+// the instance is pinned there, so `c` lands at its own type (D14814).
+function recHeldPinnedArg(c: i32): boolean {
+  if c < 0 || c >= cwIxUpKind.length { return false }
+  // The argument the call is, or the list literal argument it is an element of.
+  let x = c
+  let elem = false
+  if cwIxUpKind[c] == CW_UP_ELEM {
+    x = cwIxUp[c]
+    elem = true
+    if x < 0 || x >= cwIxUpKind.length || !(nodeAt(x) is ArrayLit) {
+      return false
+    }
+  }
+  if cwIxUpKind[x] != CW_UP_ARG { return false }
+  const call = cwIxUp[x]
+  const cn = nodeAt(call)
+  if !(cn is Call) || cn.callFn < 0 { return false }
+  const gd = identBoundFnDeclOf(cn.callFn)
+  const g = if gd >= 0 && gd < P.nodes.length { nodeAt(gd) } else { null }
+  const i = cwIxUpAux[x]
+  if (
+    !(g is FuncDecl)
+    || g.fnTyParams.length == 0
+    || i < 0
+    || i >= g.fnParams.length
+  ) {
+    return false
+  }
+  if g.fnParams.length != cn.callArgs.length { return false }
+  const pn = nodeAt(g.fnParams[i])
+  const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+  if !(pt is TypeRef) { return false }
+  const tv = if elem && pt.tyName.length > 2 { pt.tyName.slice(0, pt.tyName.length - 2) } else { pt.tyName }
+  if elem && pt.tyName != tv + "[]" { return false }
+  if !strListHas(g.fnTyParams, tv) { return false }
+  if callHasTyArgs(call) { return true }
+  const fd = recInferredFnOf(c)
+  const xl = nodeAt(x)
+  if xl is ArrayLit {
+    for el in xl.arrElems {
+      if el != c && recHeldNotFrom(el, fd) { return true }
+    }
+  }
+  let j = 0
+  while j < g.fnParams.length {
+    const qn = nodeAt(g.fnParams[j])
+    if (
+      j != i
+      && qn is Param
+      && qn.parType >= 0
+      && tsMentionsAnyName(annTsOf(qn.parType), [tv])
+      && recHeldNotFrom(cn.callArgs[j], fd)
+    ) {
+      return true
+    }
+    j = j + 1
+  }
+  false
+}
+
+// The argument value `u` is, or the list or record literal argument it sits in through elements
+// and fields; -1 when `u` is neither.
+export function recArgOfReach(u: i32): i32 {
+  let x = u
+  let hops = 0
+  while x >= 0 && x < cwIxUpKind.length && hops < 16 {
+    const k = cwIxUpKind[x]
+    if k == CW_UP_ARG { return x }
+    if k != CW_UP_ELEM && k != CW_UP_FIELD { return -1 }
+    x = cwIxUp[x]
+    hops = hops + 1
+  }
+  -1
+}
+
+// The type a generic call's written type argument, or another argument holding a value no call
+// of `u`'s function produced, pins the type parameter at that `u` reaches through the path from
+// `recArgOfReach(u)`; -1 when no parameter is named there or nothing else pins it.
+export function recReachPinTy(u: i32): i32 {
+  const at: i32[] = []
+  const tv = recReachTv(u, at)
+  if tv == "" { return -1 }
+  const cn = nodeAt(at[1])
+  const g = nodeAt(at[2])
+  if !(cn is Call) || !(g is FuncDecl) { return -1 }
+  if !callHasTyArgs(at[1]) && !recReachHeldPin(cn, g, at[3], at[0], u, tv) {
+    return -1
+  }
+  callBindTyOf(at[1], tv)
+}
+
+// `recReachTv` for value `u` when the call it reaches is `call`, else "".
+export function recReachTvAt(u: i32, call: i32): string {
+  const at: i32[] = []
+  const tv = recReachTv(u, at)
+  if tv != "" && at.length > 1 && at[1] == call { tv } else { "" }
+}
+
+// The type parameter value `u` reaches through the path from `recArgOfReach(u)` down to `u`, with
+// `at` filled as [argument, call, callee declaration, parameter position]; "" when none is named.
+function recReachTv(u: i32, at: i32[]): string {
+  const steps: string[] = []
+  let x = u
+  while x >= 0 && x < cwIxUpKind.length && cwIxUpKind[x] != CW_UP_ARG {
+    if cwIxUpKind[x] == CW_UP_ELEM {
+      steps.push("[]")
+    } else if cwIxUpKind[x] == CW_UP_FIELD {
+      steps.push(cwFieldNameOf(cwIxUpAux[x]))
+    } else {
+      return ""
+    }
+    if steps.length > 16 { return "" }
+    x = cwIxUp[x]
+  }
+  if x < 0 || x >= cwIxUpKind.length { return "" }
+  const call = cwIxUp[x]
+  const cn = nodeAt(call)
+  if !(cn is Call) || cn.callFn < 0 { return "" }
+  const gd = identBoundFnDeclOf(cn.callFn)
+  const g = if gd >= 0 && gd < P.nodes.length { nodeAt(gd) } else { null }
+  const i = cwIxUpAux[x]
+  if !(g is FuncDecl) || i < 0 || i >= g.fnParams.length { return "" }
+  let name = nameStripSpaces(recParamTyName(g.fnParams[i]))
+  let k = steps.length - 1
+  while k >= 0 && name != "" {
+    name = if steps[k] == "[]" { listElemNameOf(name) } else { shapeFieldTyName(name, steps[k]) }
+    k = k - 1
+  }
+  if name == "" || !strListHas(g.fnTyParams, name) { return "" }
+  at.push(x)
+  at.push(call)
+  at.push(gd)
+  at.push(i)
+  name
+}
+
+// The declared type that pins the type parameter call `c` reaches: the call's written type
+// argument for it, else what another argument, a value no call of `c`'s function produced,
+// binds it at through its parameter's annotation (`k: K` at `b: T`, `ks: K[]` at `b: T[]`); -1
+// when neither names one (D15183).
+function recDeclaredPinTy(c: i32): i32 {
+  const at: i32[] = []
+  const tv = recReachTv(c, at)
+  if tv == "" { return -1 }
+  const cn = nodeAt(at[1])
+  const g = nodeAt(at[2])
+  if !(cn is Call) || !(g is FuncDecl) { return -1 }
+  if callHasTyArgs(at[1]) {
+    const tas = callTyArgsOf(at[1])
+    let q = 0
+    while q < g.fnTyParams.length && q < tas.length {
+      if g.fnTyParams[q] == tv { return nodeTyIxOf(tas[q]) }
+      q = q + 1
+    }
+    return -1
+  }
+  const sig = nodeTyIxOf(at[2])
+  const f = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { tyAt(TY_ERR) }
+  if !(f is TyFunc) { return -1 }
+  const fd = recValueFnOf(c)
+  let j = 0
+  while j < cn.callArgs.length && j < f.fnParamTypes.length {
+    const a = cn.callArgs[j]
+    if j != at[3] && recHeldNotFrom(a, fd) {
+      const bn: string[] = []
+      const bt: i32[] = []
+      bindGenWalk(f.fnParamTypes[j], nodeTyIxOf(cwPeelValue(a)), bn, bt)
+      let q = 0
+      while q < bn.length {
+        if bn[q] == tv { return bt[q] }
+        q = q + 1
+      }
+    }
+    j = j + 1
+  }
+  -1
+}
+
+// Whether, besides `u` in argument `x` (at position `i`) of call `cn` to `g`, an argument to a
+// parameter mentioning `tv`, or another element of the list `x`, is a value no call of `u`'s
+// function produced.
+function recReachHeldPin(
+  cn: Call,
+  g: FuncDecl,
+  i: i32,
+  x: i32,
+  u: i32,
+  tv: string,
+): boolean {
+  const fd = recValueFnOf(u)
+  const xl = nodeAt(x)
+  if xl is ArrayLit && cwIxUp[u] == x {
+    for el in xl.arrElems {
+      if el != u && recHeldNotFrom(el, fd) { return true }
+    }
+  }
+  // Bare, or one list level down, `u`'s build row instances the call, and a literal holding a
+  // held value types only its own parameter; through a field or deeper it pins the instance (D15182).
+  const deep = u != x && (cwIxUp[u] != x || cwIxUpKind[u] == CW_UP_FIELD)
+  let j = 0
+  while j < g.fnParams.length && j < cn.callArgs.length {
+    const qn = nodeAt(g.fnParams[j])
+    const a = cn.callArgs[j]
+    if (
+      j != i
+      && qn is Param
+      && qn.parType >= 0
+      && tsMentionsAnyName(annTsOf(qn.parType), [tv])
+      && (recHeldNotFrom(a, fd)
+        || ((deep || recParamsMeet(g, i, j)) && recHeldInside(a, fd, 8)))
+    ) {
+      return true
+    }
+    j = j + 1
+  }
+  false
+}
+
+// Whether parameters `i` and `j` of `g` are both read, so values handed to the two can meet in its
+// body; a literal holding a held value then pins the instance at a bare reach too (D15129).
+function recParamsMeet(g: FuncDecl, i: i32, j: i32): boolean {
+  if i < 0 || j < 0 || i >= g.fnParams.length || j >= g.fnParams.length {
+    return false
+  }
+  recParamRead(g.fnParams[i]) && recParamRead(g.fnParams[j])
+}
+
+// Whether parameter `par` is read anywhere in its function.
+function recParamRead(par: i32): boolean {
+  cwIxBuild()
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    if cwIxKind[ow.row] == CW_OCC_USE { return true }
+  }
+  false
+}
+
+// Whether a list or record literal `a` holds, through elements and fields, a value no call of
+// `fd` produced (`recHeldNotFrom`).
+function recHeldInside(a: i32, fd: i32, depth: i32): boolean {
+  if recHeldNotFrom(a, fd) { return true }
+  if depth <= 0 { return false }
+  const p = cwPeelValue(a)
+  if p < 0 || p >= P.nodes.length { return false }
+  const n = nodeAt(p)
+  if n is ArrayLit {
+    for el in n.arrElems {
+      if recHeldInside(el, fd, depth - 1) { return true }
+    }
+  } else if n is ObjLit {
+    for fx in n.objFields {
+      const fi = nodeAt(fx)
+      if fi is FieldInit && recHeldInside(fi.fiValue, fd, depth - 1) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// The function whose call produced value `u`: its own callee, or its origin's.
+function recValueFnOf(u: i32): i32 {
+  if nodeAt(u) is Call { return recInferredFnOf(u) }
+  const o = recOriginExpr(cwPeelValue(u))
+  if o < 0 { -1 } else { recInferredFnOf(o) }
+}
+
+// The type name of field `f` in the record shape name `name` (`{f:T,g:U}`), or "" when none.
+function shapeFieldTyName(name: string, f: string): string {
+  if !nameIsShapeOpen(name) || !nameIsBraceSpanEnds(name) { return "" }
+  const parts: string[] = []
+  tyTopLevelSplit(name.slice(1, name.length - 1), 44, false, parts)
+  for p in parts {
+    const ci = tyTopIndexOf(p, 58, 0, 0)
+    if ci > 0 && fieldNameOf(p, ci) == f { return fieldTypeTextOf(p, ci) }
+  }
+  ""
+}
+
+// Whether `a` is a held value, a name or a read of one, whose origin is no call of `fd`.
+function recHeldNotFrom(a: i32, fd: i32): boolean {
+  const p = cwPeelValue(a)
+  if p < 0 || p >= P.nodes.length { return false }
+  const n = nodeAt(p)
+  if !(n is Ident || n is Member || n is Index) { return false }
+  const o = recOriginExpr(p)
+  o < 0 || recInferredFnOf(o) != fd
+}
+
+// Whether some call of `fd` is a held-pinned argument (`recHeldPinnedArg`).
+function recSitesHeldPinned(fd: i32): boolean {
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 { return false }
+  for s in sites {
+    if s % 2 == 0 && recHeldPinnedArg(s / 2) { return true }
+  }
+  false
+}
+
 // Note each call site in `sites` that `recRepArgOf` serves at `dst` for its callee's instance.
 function recRepArgsNote(sites: i32[], own: i32, dst: i32) {
   for s in sites {
-    if s % 2 == 0 {
+    // A binding that takes its own copy hands its own row on, so no argument it reaches takes the
+    // build's rep (D15267).
+    if s % 2 == 0 && !i32ListHas(recSiteCopyBack, s / 2) {
       let i = 0
       while i < recPendSrc.length {
         if recRepArgOf(i, s / 2, own, dst) {
@@ -1884,11 +2739,30 @@ function recRepArgsNote(sites: i32[], own: i32, dst: i32) {
   0
 }
 
-// Whether the record `dst` stores each field of the record `own` as `own` does, or as that
-// type or null, or, where `stored` (the record is held in a container built at `dst`), as `i64`
-// where `own` holds `i32`. A field read of a widened number must have the checker's type, so
-// the record is otherwise built at its own row and its delivery copies (D8302).
+// Whether record `dst` stores each field of record `own` as `own` does, as that type or null, or,
+// where `stored` (held in a container built at `dst`), as `i64` for `i32`; a record field is judged
+// alike, to `REC_STORE_DEPTH` levels. Otherwise the record is built at its own row and each delivery
+// copies, since a widened number's read must have the checker's type (D8302).
 function recNullWidened(own: i32, dst: i32, stored: boolean): boolean {
+  recNullWidenedAt(own, dst, stored, REC_STORE_DEPTH)
+}
+
+// `recNullWidened` with at most `depth` levels of record fields left.
+function recNullWidenedAt(
+  own: i32,
+  dst: i32,
+  stored: boolean,
+  depth: i32,
+): boolean {
+  if (
+    depth <= 0
+    || own < 0
+    || dst < 0
+    || own >= T.tys.length
+    || dst >= T.tys.length
+  ) {
+    return false
+  }
   const o = tyAt(own)
   const d = tyAt(dst)
   if o is TyObj && d is TyObj {
@@ -1904,6 +2778,7 @@ function recNullWidened(own: i32, dst: i32, stored: boolean): boolean {
           !fieldStorageEq(of, at, REC_STORE_DEPTH)
           && !(of == TY_NULL && inner >= 0)
           && !(stored && of == TY_I32 && at == TY_I64)
+          && !recNullWidenedAt(of, at, stored, depth - 1)
         ) {
           return false
         }
@@ -1916,7 +2791,7 @@ function recNullWidened(own: i32, dst: i32, stored: boolean): boolean {
 }
 
 // Whether `x` is the object of a field read that is not a method's callee.
-function recFieldRead(x: i32): boolean {
+export function recFieldRead(x: i32): boolean {
   if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_OBJ {
     return false
   }
@@ -1982,6 +2857,21 @@ function recSitesLandApart(fd: i32, own: i32, dst: i32): boolean {
   false
 }
 
+// The record a queued delivery of `src` as `dstTy` lands at: the default of a `??` over a read
+// built wider is delivered at the read's record, as the store column delivers it (D15317).
+function recCoalesceDefaultLanding(src: i32, dstTy: i32): i32 {
+  const v = cwPeelValue(src)
+  if v < 0 || v >= cwIxUpKind.length || cwIxUpKind[v] != CW_UP_COAL {
+    return dstTy
+  }
+  const q = cwIxUp[v]
+  const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
+  if !(qn is BinExpr) || cwPeelValue(qn.binRight) != v { return dstTy }
+  const b = recBuiltReadTy(q)
+  const r = if b >= 0 { nonNullTy(b) } else { -1 }
+  if r >= 0 && r < T.tys.length && tyAt(r) is TyObj { r } else { dstTy }
+}
+
 // The record a queued delivery lands call `c`'s record of `own` on, through generic identities
 // only it pins and the fields and elements of literals; -1 when no queued delivery reaches `c` or
 // two land it differently.
@@ -1995,7 +2885,7 @@ function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
     }
     const t = recLandingIn(
       recPendSrc[i],
-      recPendDstTy[i],
+      recCoalesceDefaultLanding(recPendSrc[i], recPendDstTy[i]),
       c,
       own,
       REC_STORE_DEPTH,
@@ -2182,10 +3072,12 @@ function recHoleIdentityAt(p: i32, fd: i32, srcTy: i32, dstTy: i32): boolean {
   const ap = cwPeelValue(a)
   if ap < 0 || ap >= P.nodes.length { return false }
   if nodeAt(ap) is ObjLit { return recHoleAdoptLit(ap, srcTy, dstTy) }
-  // A call of an inferred function takes the destination on, as a result leaf does (D14736).
-  const ia = recInferredFnOf(ap)
+  // A call of an inferred function, directly or through bindings holding it (`recOriginExpr`),
+  // takes the destination on, as a result leaf does (D14736, D15179).
+  const ao = recOriginExpr(a)
+  const ia = if ao >= 0 { recInferredFnOf(ao) } else { -1 }
   if ia >= 0 && ia != fd {
-    recAdoptNote(ap, nodeTyIxOf(ap), dstTy)
+    recAdoptNote(ao, nodeTyIxOf(ao), dstTy)
     return true
   }
   if recFreshDeclOf(ap) < 0 { return false }
@@ -2467,6 +3359,41 @@ export function recStoresAgree(md: i32) {
     const built = st >= 0
       && (lit || (kd >= 0 && fieldStorageEq(kd, st, REC_STORE_DEPTH)))
     if !built && at >= 0 { recRefuseAtOwnRow(v, nodeTyIxOf(v), at) }
+    // A stored literal is built at the build, so its fields are boxed at the build's fields.
+    if built && lit { litFieldsBoxAt(v, st, 4) }
+  }
+  0
+}
+
+// Boxes each field value of each record literal `x` builds at destination `dst` — `x` itself, or
+// the elements of a list literal — at the field's type, into nested literals up to `depth`.
+export function litBoxesAtDst(x: i32, dst: i32, depth: i32) {
+  const n = if x >= 0 { nodeAt(x) } else { null }
+  const d = nonNullTy(dst)
+  const dn = if d >= 0 && d < T.tys.length { T.tys[d] } else { null }
+  if depth <= 0 { return 0 }
+  if n is ArrayLit && dn is TyArray {
+    for el in n.arrElems { litBoxesAtDst(cwPeelValue(el), dn.aElem, depth - 1) }
+    return 0
+  }
+  litFieldsBoxAt(x, d, depth)
+}
+
+// Boxes each field value of the record literal `lit` at its field's type in the record `st` the
+// literal is built at, into nested literals up to `depth`.
+function litFieldsBoxAt(lit: i32, st: i32, depth: i32) {
+  const n = if lit >= 0 { nodeAt(lit) } else { null }
+  const so = if st >= 0 && st < T.tys.length { T.tys[st] } else { null }
+  if depth <= 0 || !(n is ObjLit) || !(so is TyObj) { return 0 }
+  for fi in n.objFields {
+    const f = nodeAt(fi)
+    if f is FieldInit {
+      const ft = objFieldType(so, f.fiName)
+      if ft >= 0 {
+        recordBoxTy(f.fiValue, ft)
+        litFieldsBoxAt(cwPeelValue(f.fiValue), nonNullTy(ft), depth - 1)
+      }
+    }
   }
   0
 }
@@ -2555,24 +3482,698 @@ export function recBuiltReadRefuse(u: i32) {
   if !(nodeAt(p) is BinExpr) && recAnnArgTakesRep(p, nonNullTy(bt)) { return 0 }
   // A `??` whose default is a fresh record literal builds the literal at the read's record too.
   if recCoalesceLitBuilt(p, nonNullTy(bt)) { return 0 }
+  if recAsgIntoBuiltAt(p, nonNullTy(bt)) { return 0 }
   if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
   }
   0
 }
 
+// Whether `p` is assigned into an un-annotated binding whose initialiser is a built read at
+// `rep` too: the binding is stored at `rep`, so the write converts nothing (D15124).
+function recAsgIntoBuiltAt(p: i32, rep: i32): boolean {
+  const b = recLitPlaceBuiltTy(p)
+  b >= 0 && tySame(b, rep)
+}
+
+// The record (or list) a literal or read `p` delivered into a built place is built at: an
+// un-annotated binding whose initialiser is a built read or a built list (D15188, D15189), or a
+// literal pushed or index-stored into a list with a recorded element build (D15235); else -1.
+export function recLitPlaceBuiltTy(p: i32): i32 {
+  const init = recAsgBindInit(p)
+  const b0 = if init >= 0 { recBuiltReadTy(init) } else { -1 }
+  // An element of a list whose literal built its records elsewhere is read at that stamp (D15232).
+  const b = if b0 < 0 && init >= 0 { recElemReadStampTy(init) } else { b0 }
+  if b >= 0 { return nonNullTy(b) }
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const pn = nodeAt(p)
+  // A binding whose function fields its writes widened is built at its own record (D15306).
+  const fw = recAsgFnWidenedTy(p)
+  if fw >= 0 { return fw }
+  // A call's build is the store column's (`callBuiltTy`), unless the record solve copies the
+  // call back to its own record (D15246, D15282).
+  const call = init >= 0 && nodeAt(init) is Call && recCopyFromOf(init) < 0
+  const cb = if call { checkerForceFn(3, init, 8, -1) } else { -1 }
+  if (
+    cb >= 0
+    && cb < T.tys.length
+    && tyAt(cb) is TyObj
+    && (pn is ObjLit || pn is Ident)
+  ) {
+    return cb
+  }
+  if init >= 0 {
+    if !(pn is ArrayLit) { return -1 }
+    const it = nodeTyIxOf(init)
+    const e = recHeldElemBuilt(init)
+    return if e >= 0 && it >= 0 && it < T.tys.length && tyAt(it) is TyArray { mkArrayTy(e) } else { -1 }
+  }
+  // A list literal that is itself an element of a built list of lists is built at its inner
+  // lists' build (D15284).
+  if pn is ArrayLit {
+    cwIxBuild()
+    const er = recSlotReceiverOf(p, p)
+    const ee = if er >= 0 { recElemOfElemStamp(er) } else { -1 }
+    if ee >= 0 { return mkArrayTy(ee) }
+  }
+  const r = recLitSlotReceiver(p)
+  // A list literal spread into a built list of lists holds its inner lists (D15285).
+  const ie = if r >= 0 && pn is ArrayLit { recElemOfElemStamp(r) } else { -1 }
+  if ie >= 0 { return mkArrayTy(mkArrayTy(ie)) }
+  const e = if r >= 0 { recHeldElemBuilt(r) } else { -1 }
+  if e < 0 { return -1 }
+  // A list literal reaches the list's slots only spread into a push, whose elements it holds.
+  if pn is ObjLit || pn is Ident { e }
+  else if pn is ArrayLit { mkArrayTy(e) }
+  else { -1 }
+}
+
+// Builds the fresh record `const` record literal `l` initialises at the record a read of it is
+// pushed or assigned into, where that place's build is recorded (D15237). Two places at two
+// records each push their demand, and the solve refuses the pair.
+export function recHeldLitPlaceAdopt(l: i32) {
+  cwIxBuild()
+  if l < 0 || l >= cwIxUp.length || cwIxUpKind[l] != CW_UP_LETINIT { return 0 }
+  const d = cwIxUp[l]
+  const written = recCoalesceHeldLit(d) != l
+  if written && recWrittenLetLit(d) != l { return 0 }
+  const own = nodeTyIxOf(l)
+  const ats: i32[] = []
+  const reps: i32[] = []
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const u = if cwIxKind[w.row] == CW_OCC_USE { cwIxNode[w.row] } else { -1 }
+    const b = if u >= 0 { recLitPlaceBuiltTy(u) } else { -1 }
+    if b >= 0 && own >= 0 && !tySame(b, own) && tyAt(b) is TyObj {
+      ats.push(u)
+      reps.push(b)
+    }
+  }
+  let i = 0
+  while i < ats.length {
+    if written {
+      recHeldLetWritesAt(d, l, reps[i], ats[i], ats)
+    } else if recAsgBindInit(ats[i]) >= 0 {
+      recHeldAsgStamp(d, reps[i], ats[i], ats)
+    } else {
+      recHeldBindAdopt(d, reps[i], ats[i], ats)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Builds the fresh list `const` list literal `l` initialises, where a read of it is spread into a
+// push whose receiver's elements are built at a record, with its elements at that record, as an
+// element read delivered there adopts it, refusing its other own-storage deliveries (D15287).
+export function recHeldListSpreadAdopt(l: i32) {
+  cwIxBuild()
+  if l < 0 || l >= cwIxUp.length || cwIxUpKind[l] != CW_UP_LETINIT { return 0 }
+  const d = cwIxUp[l]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letKw != "const" { return 0 }
+  const own = nodeTyIxOf(l)
+  const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+  const oe = if ot is TyArray { ot.aElem } else { -1 }
+  if oe < 0 || oe >= T.tys.length { return 0 }
+  const oo = tyAt(oe)
+  // A list of record lists is built by its literal's stamp at the receiver's (D15370).
+  const nested = oo is TyArray
+    && oo.aElem >= 0
+    && oo.aElem < T.tys.length
+    && tyAt(oo.aElem) is TyObj
+  if !(oo is TyObj) && !nested { return 0 }
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const u = if cwIxKind[w.row] == CW_OCC_USE { cwIxNode[w.row] } else { -1 }
+    const sp = if u >= 0 && u < cwIxUp.length { cwIxUp[u] } else { -1 }
+    const r = if sp >= 0 && nodeAt(sp) is Spread { recSlotReceiverOf(sp, u) } else { -1 }
+    if nested {
+      const ie = if r >= 0 { recElemOfElemStamp(r) } else { -1 }
+      if (
+        ie >= 0
+        && ie < T.tys.length
+        && tyAt(ie) is TyObj
+        && oo is TyArray
+        && !tySame(ie, oo.aElem)
+      ) {
+        const lt = mkArrayTy(mkArrayTy(ie))
+        adoptLitAt(l, lt)
+        recHeldOwnRefuse(d, lt, u, [u])
+      }
+    } else {
+      const e = if r >= 0 { recHeldElemBuilt(r) } else { -1 }
+      if e >= 0 && e < T.tys.length && tyAt(e) is TyObj && !tySame(e, oe) {
+        recAdPushDecl(d, oe, e, true, u)
+        recHeldOwnRefuse(d, e, u, [u])
+      }
+    }
+  }
+  0
+}
+
+// The list a record literal `p` is pushed, unshifted or index-stored into, or a list literal `p`
+// is spread into a push of, peeled; else -1.
+function recLitSlotReceiver(p: i32): i32 {
+  cwIxBuild()
+  if !(nodeAt(p) is ArrayLit) { return recSlotReceiverOf(p, p) }
+  const a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
+  if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Spread) { return -1 }
+  recSlotReceiverOf(a, p)
+}
+
+// The list value `x` (the literal `p` itself, or a spread of it) is pushed, unshifted or
+// index-stored into, peeled; else -1.
+function recSlotReceiverOf(x: i32, p: i32): i32 {
+  const a = if x >= 0 && x < cwIxUp.length { cwIxUp[x] } else { -1 }
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if an is Call && an.callFn >= 0 && i32ListHas(an.callArgs, x) {
+    const f = nodeAt(an.callFn)
+    if f is Member && (f.memProp == "push" || f.memProp == "unshift") {
+      return cwPeelValue(f.memObj)
+    }
+    return -1
+  }
+  if (
+    x == p
+    && an is BinExpr
+    && an.binOp == "="
+    && cwPeelValue(an.binRight) == p
+  ) {
+    const l = nodeAt(an.binLeft)
+    if l is Index { return cwPeelValue(l.idxArr) }
+  }
+  -1
+}
+
+// The record the elements of the list `x` reads are built at: its own recorded build, an element
+// of a built list of lists, or, for an un-annotated binding, its initialiser's; else -1.
+export function recHeldElemBuilt(x: i32): i32 {
+  const e = recBuiltElemOf(x)
+  if e >= 0 || x < 0 || x >= P.nodes.length { return e }
+  const xn = nodeAt(x)
+  // An element of a list of lists is read at its literal's build, one level in (D15236).
+  if xn is Index { return recElemOfElemStamp(cwPeelValue(xn.idxArr)) }
+  // A list literal whose records its parts built elsewhere holds them at its stamp (D15232).
+  if xn is ArrayLit {
+    const rt = nodeRepTyIxOf(x)
+    const ro = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
+    const re = if ro is TyArray { ro.aElem } else { -1 }
+    const ot = tyArrayElemIx(nodeTyIxOf(x))
+    const stamped = re >= 0 && re < T.tys.length && tyAt(re) is TyObj
+    return if stamped && !(ot >= 0 && tySame(re, ot)) { re } else { -1 }
+  }
+  if !(xn is Ident) { return -1 }
+  const d = recBindDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  recHeldElemBuilt(cwPeelValue(dn.letInit))
+}
+
+// The record element read `x` (`xs[i]`) is built at, from the rep stamp of the list literal
+// `xs`'s binding is initialised with, where that is another record than its own; else -1.
+function recElemReadStampTy(x: i32): i32 {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is Index) { return -1 }
+  const a = cwPeelValue(n.idxArr)
+  if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) { return -1 }
+  const d = recBindDeclOf(a)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  const iv = cwPeelValue(dn.letInit)
+  if iv < 0 || iv >= P.nodes.length || !(nodeAt(iv) is ArrayLit) { return -1 }
+  const rt = nodeRepTyIxOf(iv)
+  const ro = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
+  const e = if ro is TyArray { ro.aElem } else { -1 }
+  const own = nodeTyIxOf(x)
+  if (
+    e < 0
+    || e >= T.tys.length
+    || !(tyAt(e) is TyObj)
+    || (own >= 0 && tySame(e, own))
+  ) {
+    return -1
+  }
+  e
+}
+
+// The record the elements of an element of the list binding read `a` are built at, from its
+// list literal initialiser's rep stamp (`T[][]`), through bindings of bindings; else -1.
+export function recElemOfElemStamp(a: i32): i32 {
+  if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) { return -1 }
+  const d = recBindDeclOf(a)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  const iv = cwPeelValue(dn.letInit)
+  // A binding of another such binding reads that one's literal.
+  if iv >= 0 && iv < P.nodes.length && nodeAt(iv) is Ident {
+    return recElemOfElemStamp(iv)
+  }
+  const rt = nodeRepTyIxOf(iv)
+  const ro = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
+  const it = if ro is TyArray { ro.aElem } else { -1 }
+  const io = if it >= 0 && it < T.tys.length { tyAt(it) } else { null }
+  if io is TyArray { io.aElem } else { -1 }
+}
+
+// The initialiser of the un-annotated binding `p` is assigned into, peeled, where `p` is the
+// assigned value or one of its `if` or `match` arm leaves (`tailValueLeaves`, D15280); else -1.
+export function recAsgBindInit(p: i32): i32 {
+  const d = recAsgBindDecl(p)
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  cwPeelValue(dn.letInit)
+}
+
+// The record a record literal `p` written whole into a binding the field widener widened, a field
+// or element slot of one, or pushed onto a list one roots, is built at (D15306, D15307, D15336);
+// else -1.
+export function recAsgFnWidenedTy(p: i32): i32 {
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is ObjLit) { return -1 }
+  // The place, a binding or a field or element slot of one, and the binding it is rooted at;
+  // `steps` is the slot's path from the place inward.
+  let x = recAsgPlaceOf(p)
+  // A literal pushed onto a list is a write of one of its elements (D15336).
+  const pushed = x < 0
+  if pushed { x = recLitPushReceiverOf(p) }
+  const steps: string[] = []
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 16 {
+    const xn = nodeAt(x)
+    if xn is Member {
+      steps.push(xn.memProp)
+      x = cwPeelValue(xn.memObj)
+    } else if xn is Index {
+      steps.push("")
+      x = cwPeelValue(xn.idxArr)
+    } else {
+      hops = 16
+    }
+    hops = hops + 1
+  }
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const d = recBindDeclOf(x)
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letType >= 0
+    || dn.letInit < 0
+    || !elabFnFieldWidenedAny(d)
+  ) {
+    return -1
+  }
+  // A holder of a tagged set's ids is built at the rep the tag stamped on it (D15350).
+  const held = fnTagHeldRepOf(d)
+  let t = if held >= 0 { held } else { nodeTyIxOf(d) }
+  let k = steps.length - 1
+  while k >= 0 {
+    const st = steps[k]
+    k = k - 1
+    const tt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    t = if st == "" && tt is TyArray { tt.aElem } else if st != "" && tt is TyObj { tyFieldTyOf(t, st) } else { -1 }
+  }
+  if pushed {
+    const lt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    t = if lt is TyArray { lt.aElem } else { -1 }
+  }
+  if t >= 0 && t < T.tys.length && tyAt(t) is TyObj { t } else { -1 }
+}
+
+// The list a record literal `p` is pushed onto, peeled; else -1.
+function recLitPushReceiverOf(p: i32): i32 {
+  cwIxBuild()
+  const a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if !(an is Call) || an.callFn < 0 || !i32ListHas(an.callArgs, p) { return -1 }
+  const f = nodeAt(an.callFn)
+  if f is Member && f.memProp == "push" { cwPeelValue(f.memObj) } else { -1 }
+}
+
+// The un-annotated binding a literal or read `p` is assigned whole into, through `if` arms; -1
+// when it is no such value.
+function recAsgBindDecl(p: i32): i32 {
+  const l = recAsgPlaceOf(p)
+  if l >= 0 && nodeAt(l) is Ident { recBindDeclOf(l) } else { -1 }
+}
+
+// The place a literal or read `p` is assigned whole into, through `if` arms; -1 when it is no
+// such value.
+function recAsgPlaceOf(p: i32): i32 {
+  cwIxBuild()
+  let x = p
+  let hops = 0
+  while x >= 0 && x < cwIxUp.length && cwIxUpKind[x] == CW_UP_ARM && hops < 16 {
+    x = cwIxUp[x]
+    hops = hops + 1
+  }
+  const a = if x >= 0 && x < cwIxUp.length { cwIxUp[x] } else { -1 }
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if (!(an is BinExpr) || an.binOp != "=" || cwPeelValue(an.binRight) != x) {
+    return -1
+  }
+  const leaves: i32[] = []
+  tailValueLeaves(an.binRight, leaves)
+  if !i32ListHas(leaves, p) { return -1 }
+  an.binLeft
+}
+
 // Whether `p` is `read ?? { … }` handed to a parameter that takes the rep `rep`; the literal is
 // then built at `rep`, so the whole value is one record of it.
 function recCoalesceLitBuilt(p: i32, rep: i32): boolean {
-  const n = nodeAt(p)
-  if !(n is BinExpr) || n.binOp != "??" { return false }
-  const lit = cwPeelValue(n.binRight)
-  if lit < 0 || !(nodeAt(lit) is ObjLit) || !(tyAt(rep) is TyObj) {
-    return false
-  }
+  if recCoalesceLitOf(p, rep) < 0 { return false }
   if !recArgTakesRep(p, 4) && !recAnnArgTakesRep(p, rep) { return false }
+  recCoalesceLitAdopt(p, rep)
+}
+
+// Builds the record literal that `p`, a `read ?? { … }`, defaults to at the record `rep`; false,
+// building nothing, where `p` is no such value. The store column builds an un-annotated
+// binding of one there (D15230), as `recCoalesceLitBuilt` does an argument.
+export function recCoalesceLitAdopt(p: i32, rep: i32): boolean {
+  const lit = recCoalesceLitOf(p, rep)
+  if lit < 0 { return false }
   recordRepTyAdopt(lit, rep, 6)
   true
+}
+
+// Delivers the default of `p`, a `read ?? d`, at the record `rep` as a typed delivery of `d`
+// there does (`recAdoptNote`), or builds a `const` there (D15248, D15249, D15310). False when `d`
+// is no record of another row.
+export function recCoalesceDefaultDeliver(p: i32, rep: i32): boolean {
+  const n = nodeAt(p)
+  if !(n is BinExpr) || n.binOp != "??" || rep < 0 || rep >= T.tys.length {
+    return false
+  }
+  const v = cwPeelValue(n.binRight)
+  if v < 0 || v >= P.nodes.length || !(tyAt(rep) is TyObj) { return false }
+  const own = nodeTyIxOf(v)
+  if (
+    own < 0
+    || own >= T.tys.length
+    || !(tyAt(own) is TyObj)
+    || tySame(own, rep)
+  ) {
+    return false
+  }
+  const d = if nodeAt(v) is Ident { recHeldDecl(v) } else { -1 }
+  // A fresh `const` literal keeps its own type and is built at `rep`, so the join stays one record
+  // (D15310); one record cannot also be delivered at its own storage, so those are refused.
+  if recCoalesceDefaultBuilt(p) {
+    recBuildPush(d, own, rep, false)
+    recHeldOwnRefuse(d, rep, p, recCoalesceDefaultsAt(d, rep))
+    return true
+  }
+  // A `const` of a call whose result reads back from `rep` is adopted there with its function,
+  // which its other calls share (D15240).
+  const init = recCoalesceHeldInit(d)
+  if init >= 0 && recNullWidened(own, rep, false) {
+    recHeldBindAdopt(d, rep, p, [p, v])
+    return true
+  }
+  recAdoptNote(v, own, rep)
+  true
+}
+
+// Whether `p`, a `??`, defaults to a binding of a fresh `const` record literal, which the general
+// arm builds at the read's record while it keeps its own type, so the join is one record. False
+// for a `let` or a `const` of a call, which the record solve adopts at the read's record instead.
+export function recCoalesceDefaultBuilt(p: i32): boolean {
+  const n = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if !(n is BinExpr) || n.binOp != "??" { return false }
+  const v = cwPeelValue(n.binRight)
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  recCoalesceHeldLit(recHeldDecl(v)) >= 0
+}
+
+// Every read of the binding `d` that defaults a `??` over a read built at the record `rep`, and
+// that `??`: each delivers `d` at `rep`, so none of them is a delivery at its own storage.
+function recCoalesceDefaultsAt(d: i32, rep: i32): i32[] {
+  cwIxBuild()
+  const out: i32[] = []
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const u = if cwIxKind[w.row] == CW_OCC_USE { cwIxNode[w.row] } else { -1 }
+    const q = if u >= 0 && u < cwIxUp.length && cwIxUpKind[u] == CW_UP_COAL { cwIxUp[u] } else { -1 }
+    const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
+    if qn is BinExpr && cwPeelValue(qn.binRight) == u {
+      const b = recBuiltReadTy(q)
+      if b >= 0 && fieldStorageEq(nonNullTy(b), rep, REC_STORE_DEPTH) {
+        out.push(u)
+        out.push(q)
+      }
+    }
+  }
+  out
+}
+
+// Whether every read of the binding `d` defaults a `??` over a read built at the record `rep`
+// (`recCoalesceDefaultsAt`). Narrow on purpose: with an own-type delivery the pin's refusal is
+// what stops invalid wasm, and an unscoped hand-on broke a maker also called at its own (D15311).
+function recUsedOnlyAsDefaultAt(d: i32, rep: i32): boolean {
+  cwIxBuild()
+  let uses = 0
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    if cwIxKind[w.row] == CW_OCC_USE { uses = uses + 1 }
+  }
+  uses > 0 && uses * 2 == recCoalesceDefaultsAt(d, rep).length
+}
+
+// Whether inferred function `fd` hands back another inferred function's call: a returned value is
+// such a call, or a binding holding one. False for -1 and for a maker of its own literal.
+function recMakerHandsOnCall(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length { return false }
+  for lf in recFnValueLeaves(fd) {
+    const v = cwPeelValue(lf)
+    if (
+      v >= 0
+      && v < P.nodes.length
+      && nodeAt(v) is Call
+      && recInferredFnOf(v) >= 0
+    ) {
+      return true
+    }
+    if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident {
+      const c = recHeldCallOrigin(v)
+      if (
+        c >= 0
+        && c < P.nodes.length
+        && nodeAt(c) is Call
+        && recInferredFnOf(c) >= 0
+      ) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Builds the fresh record `const` `d` at the record `rep` where `p` delivers it, refusing each
+// delivery of `d` at its own storage outside `skip`, since one record cannot be both.
+function recHeldBindAdopt(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
+  const init = recCoalesceHeldInit(d)
+  // A call's function is built at `rep` too, as a delivery of the call there builds it (D15240).
+  if init >= 0 && init < P.nodes.length && nodeAt(init) is Call {
+    recAdoptNote(init, nodeTyIxOf(init), rep)
+    // A maker handing back another maker's call is built at `rep` down the chain by that
+    // delivery; adopting the binding as well declines the hand-on, so it is not (D15311).
+    if (
+      recMakerHandsOnCall(recInferredFnOf(init))
+      && recUsedOnlyAsDefaultAt(d, rep)
+    ) {
+      return recHeldOwnRefuse(d, rep, p, skip)
+    }
+  }
+  recAdPushDecl(d, nodeTyIxOf(init), rep, false, p)
+  recHeldOwnRefuse(d, rep, p, skip)
+}
+
+// Builds the fresh record `const` `d`, assigned by `p` into a binding held at the record `rep`, by
+// stamping its literal there; its type stays, so each delivery of it at its own storage outside
+// `skip` is refused. False, building nothing, where `d` holds no fresh literal (D15238).
+function recHeldAsgStamp(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
+  const l = recCoalesceHeldLit(d)
+  if l < 0 { return false }
+  adoptLitAt(l, rep)
+  recHeldOwnRefuse(d, rep, p, skip)
+}
+
+function recHeldOwnRefuse(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
+  // The store column runs after `recKeptConflicts`, so `d`'s own-storage deliveries are refused here,
+  // unless `d` is kept, whose deliveries that pass already refused: one refusal per delivery.
+  if i32ListHas(recKeptDecl, d) { return true }
+  for u in recOwnSrc {
+    const pu = cwPeelValue(u)
+    const o = if i32ListHas(skip, pu) || recOwnPinSkip(u) { -1 } else { recFreshOriginDecl(u, 6) }
+    if o == d && recArgRepOf(u) < 0 {
+      recAdRaising = true
+      tErr(recKeptOwnMsg(d, rep, p, false), u)
+      recAdRaising = false
+    }
+  }
+  true
+}
+
+// Whether own-storage delivery `u` reads a binding that holds its own copy of a call built wider
+// (`recCopyFromOf`): the value it hands on is at its own row (D15267).
+export function recOwnHoldsCopy(u: i32): boolean {
+  const p = cwPeelValue(u)
+  const hd = if p >= 0 && nodeAt(p) is Ident { recHeldDecl(p) } else { -1 }
+  const hn = if hd >= 0 { nodeAt(hd) } else { nodeAt(0) }
+  hn is LetDecl
+    && hn.letInit >= 0
+    && recCopyFromOf(parenPeelIx(hn.letInit)) >= 0
+}
+
+// Whether own-storage delivery `u` is left to the pins: it is, or sits in a literal that is, an
+// argument to a generic, and is a call or reaches a type parameter the call binds at a type that
+// does not store as `u`'s own (D15180).
+export function recOwnPinSkip(u: i32): boolean {
+  const x = recArgOfReach(u)
+  if x < 0 || !recOwnIsPin(x) { return false }
+  if nodeAt(u) is Call { return true }
+  const pt = recReachPinTy(u)
+  pt < 0 || !fieldStorageEq(pt, nodeTyIxOf(u), REC_STORE_DEPTH)
+}
+
+// D15180's refusal of a value `d` built as `dst` where `at` delivers it, handed on at its own type
+// elsewhere; `inst` where `at` is that delivery itself, at one instance of the generic around it.
+export function recKeptOwnMsg(
+  d: i32,
+  dst: i32,
+  at: i32,
+  inst: boolean,
+): string {
+  let how = " where line "
+    + i32ToStr(nodeLineOf(at))
+    + " delivers it, and it is handed on here at its own type"
+  if inst {
+    how = " by this delivery at one instance of the generic function around it, and "
+      + "kept at its own type at another"
+  }
+  recKeptWhat(d)
+    + " is built as "
+    + tyToStr(dst)
+    + how
+    + ", which stores a field differently; a record is shared, not copied, so one "
+    + "value cannot be both. Annotate it with one of the types, and copy it with an "
+    + "object literal for the other"
+}
+
+// What an un-annotated `const` `d` holds fresh: its record literal, or a call of an inferred
+// function, whose result `recFnBuiltAtDst` can build elsewhere; else -1.
+function recCoalesceHeldInit(d: i32): i32 {
+  const lit = recCoalesceHeldLit(d)
+  if lit >= 0 { return lit }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letType >= 0
+    || dn.letKw != "const"
+    || dn.letInit < 0
+  ) {
+    return -1
+  }
+  const c = cwPeelValue(dn.letInit)
+  if c >= 0 && nodeAt(c) is Call && recInferredFnOf(c) >= 0 { c } else { -1 }
+}
+
+// The fresh record literal an un-annotated `let` `d` that is reassigned is initialised with,
+// else -1 (D15374).
+function recWrittenLetLit(d: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letType >= 0
+    || dn.letKw != "let"
+    || dn.letInit < 0
+  ) {
+    return -1
+  }
+  const lit = cwPeelValue(dn.letInit)
+  if lit >= 0 && lit < P.nodes.length && nodeAt(lit) is ObjLit {
+    lit
+  } else {
+    -1
+  }
+}
+
+// Builds the reassigned fresh record `let` `d`, initialised with literal `l` and delivered at `p`
+// into a place held at the record `rep`, there: every record literal written into it is stamped
+// at `rep`, a value held at its own storage written into it is refused, and each delivery of it
+// at its own storage outside `skip` is refused (D15374).
+function recHeldLetWritesAt(
+  d: i32,
+  l: i32,
+  rep: i32,
+  p: i32,
+  skip: i32[],
+): boolean {
+  adoptLitAt(l, rep)
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const a = if cwIxKind[w.row] == CW_OCC_ASG { cwIxNode[w.row] } else { -1 }
+    const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+    const leaves: i32[] = []
+    if an is BinExpr && an.binOp == "=" { tailValueLeaves(an.binRight, leaves) }
+    for v in leaves {
+      if nodeAt(v) is ObjLit {
+        adoptLitAt(v, rep)
+      } else {
+        const vt = nodeTyIxOf(v)
+        // A read its container builds at `rep` is already stored there.
+        const vb = recBuiltReadTy(v)
+        const held = vb >= 0
+          && fieldStorageEq(nonNullTy(vb), rep, REC_STORE_DEPTH)
+        if vt >= 0 && !held && !fieldStorageEq(vt, rep, REC_STORE_DEPTH) {
+          recAdRaising = true
+          tErr(
+            recKeptWhat(d)
+              + " is built as "
+              + tyToStr(rep)
+              + " where line "
+              + i32ToStr(nodeLineOf(p))
+              + " delivers it, and this value of its own type is assigned into it, which stores a "
+              + "field differently; a record is shared, not copied. Copy it with an object literal",
+            v,
+          )
+          recAdRaising = false
+        }
+      }
+    }
+  }
+  recHeldOwnRefuse(d, rep, p, skip)
+}
+
+// The fresh record literal an un-annotated `const`, or `let` nothing reassigns, `d` is
+// initialised with, else -1.
+function recCoalesceHeldLit(d: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  // A `let` nothing reassigns holds its literal as a `const` does; the index is built first, so
+  // the answer does not hang on whether a reader before this one built it (D15283).
+  if dn.letKw != "const" {
+    cwIxBuild()
+    if !cwLetUnwritten(d) { return -1 }
+  }
+  const lit = cwPeelValue(dn.letInit)
+  if lit >= 0 && nodeAt(lit) is ObjLit { lit } else { -1 }
+}
+
+// The record literal `p`, a `??`, defaults to where `rep` is a record; else -1.
+function recCoalesceLitOf(p: i32, rep: i32): i32 {
+  const n = nodeAt(p)
+  if !(n is BinExpr) || n.binOp != "??" { return -1 }
+  const lit = cwPeelValue(n.binRight)
+  if (
+    lit < 0
+    || !(nodeAt(lit) is ObjLit)
+    || rep < 0
+    || rep >= T.tys.length
+    || !(tyAt(rep) is TyObj)
+  ) {
+    return -1
+  }
+  lit
 }
 
 // Whether `x` is an argument whose parameter takes its rep (`recParamTakesRep`), up to `depth`
@@ -2617,7 +4218,8 @@ function recListParamTakesRep(par: i32, call: i32, depth: i32): boolean {
     if cwIxKind[r] == CW_OCC_USE {
       const u = cwIxNode[r]
       if (
-        !recElemTakesRep(u, owner, call, depth - 1)
+        !(recElemTakesRep(u, owner, call, depth - 1)
+          || recListRetTakesRep(u, owner, call, depth - 1))
         || recEnclosingFn(u) != owner
       ) {
         return false
@@ -2688,7 +4290,80 @@ function recRetTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
     if cwPeelValue(lf) == u { leaf = true }
   }
   if !leaf { return false }
-  recFieldRead(call) || recArgTakesRep(call, depth) || recBoundForFields(call)
+  recFieldRead(call)
+    || recArgTakesRep(call, depth)
+    || recBoundForFields(call)
+    || recInReadOnlyList(call, depth)
+    || recIdentityReadsBuilt(call)
+}
+
+// Whether `call` hands back its argument, a read out of a built container: the call is then read
+// as that read, and its own delivery is judged where it lands (D14819).
+function recIdentityReadsBuilt(call: i32): boolean {
+  const ia = recIdentityArgOf(call)
+  ia >= 0 && recBuiltReadTy(cwPeelValue(ia)) >= 0
+}
+
+// The argument call `x` hands back: a hole function's identity, or a generic's sole-pin one; -1
+// otherwise.
+function recIdentityArgOf(x: i32): i32 {
+  const c = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(c is Call) || c.callFn < 0 { return -1 }
+  const ha = recHoleIdentityArg(x, identBoundFnDeclOf(c.callFn))
+  if ha >= 0 { ha } else { recSolePinArg(x) }
+}
+
+// Whether `x` is an element of a list literal that initialises an un-annotated `const` read only
+// for its length or for an element's field: the list is built at its elements' rep (D14811).
+function recInReadOnlyList(x: i32, depth: i32): boolean {
+  if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_ELEM {
+    return false
+  }
+  const l = cwIxUp[x]
+  if l < 0 || l >= cwIxUpKind.length || !(nodeAt(l) is ArrayLit) {
+    return false
+  }
+  if cwIxUpKind[l] != CW_UP_LETINIT { return false }
+  recReadOnlyListDecl(cwIxUp[l], depth)
+}
+
+// Whether list `u` is handed back whole by function `fd` to `call`, its only call, whose result
+// is read only for its length or for an element's field, directly or through an un-annotated
+// `const`. A second call could share the instance at another storage (D14813).
+function recListRetTakesRep(u: i32, fd: i32, call: i32, depth: i32): boolean {
+  if depth <= 0 || call < 0 || call >= P.nodes.length { return false }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length != 1 || sites[0] != call * 2 {
+    return false
+  }
+  let leaf = false
+  for lf in recFnValueLeaves(fd) {
+    if cwPeelValue(lf) == u { leaf = true }
+  }
+  if !leaf { return false }
+  if recElemTakesRep(call, -1, -1, depth) { return true }
+  if call >= cwIxUpKind.length || cwIxUpKind[call] != CW_UP_LETINIT {
+    return false
+  }
+  recReadOnlyListDecl(cwIxUp[call], depth)
+}
+
+// Whether `d` is an un-annotated `const` list read only for its length or an element's field.
+function recReadOnlyListDecl(d: i32, depth: i32): boolean {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letKw != "const" { return false }
+  let used = false
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      if !recElemTakesRep(cwIxNode[r], -1, -1, depth - 1) { return false }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
+      return false
+    }
+  }
+  used
 }
 
 // Whether `x` initialises an un-annotated `const` that is only read for a field.
@@ -2809,7 +4484,7 @@ function recRepWider(narrow: i32, wide: i32): boolean {
 }
 
 // The function declaration whose body holds node `x`, or -1.
-function recEnclosingFn(x: i32): i32 {
+export function recEnclosingFn(x: i32): i32 {
   let cur = if x >= 0 && x < cwIxParent.length { cwIxParent[x] } else { -1 }
   let guard = 0
   while cur >= 0 && cur < P.nodes.length && guard < 4096 {
@@ -2846,36 +4521,181 @@ function recBuiltReadErr(
   )
 }
 
-// The element record the stores into the list or map binding `x` names build, else -1.
-function recBuiltElemOf(x: i32): i32 {
+// The element record the stores into the list or map binding `x` names build, else -1. This
+// table wins: a list literal's rep stamp is read only where it has no row (`recHeldElemBuilt`,
+// `recElemReadStampTy`), and both are written from the same parts' builds (D15232).
+function recBuiltElemOf(x: i32): i32 { recBuiltElemIn(x, recBuildPassTable()) }
+
+// `recBuiltElemOf` read from build table `tbl` (`recBuildPassTable` or `recBuildTable`).
+function recBuiltElemIn(x: i32, tbl: Map<i32, i32>): i32 {
   const d = recHeldDecl(x)
-  if d < 0 || !recBuildHoldsElems(d) { -1 } else { recBuildPassAt(d) }
+  if d < 0 { -1 } else { recBuildTyIn(tbl, d, true) }
 }
 
 // The record a container's build gives the read `x`: an element by index or `.get`, a field of
 // one, or a record binding's own build; else -1.
 export function recBuiltReadTy(x: i32): i32 {
+  recBuiltReadTyIn(x, recBuildPassTable())
+}
+
+// `recBuiltReadTy` read from build table `tbl`: the pass's own during check, the last pass's after.
+export function recBuiltReadTyIn(x: i32, tbl: Map<i32, i32>): i32 {
+  recBuiltReadTyAt(x, tbl, true, REC_STORE_DEPTH)
+}
+
+// `recBuiltReadTyIn` through at most `depth` bindings and calls: a binding holding such a read,
+// or a call of an inferred function every value leaf of which is one at one record (D15124).
+// Without `fresh`, a binding's own build is not asked: a fresh record is not a container's read.
+function recBuiltReadTyAt(
+  x: i32,
+  tbl: Map<i32, i32>,
+  fresh: boolean,
+  depth: i32,
+): i32 {
+  if depth <= 0 || x < 0 || x >= P.nodes.length { return -1 }
   const n = nodeAt(x)
   if n is BinExpr {
-    return if n.binOp == "??" { recBuiltReadTy(cwPeelValue(n.binLeft)) } else { -1 }
+    return if n.binOp == "??" { recBuiltReadTyAt(cwPeelValue(n.binLeft), tbl, fresh, depth) } else { -1 }
   }
-  if n is Index { return recBuiltElemOf(cwPeelValue(n.idxArr)) }
+  if n is Index { return recBuiltElemIn(cwPeelValue(n.idxArr), tbl) }
   if n is Call {
-    if n.callArgs.length != 1 || n.callFn < 0 { return -1 }
+    if n.callFn < 0 { return -1 }
     const f = nodeAt(n.callFn)
-    if f is Member && f.memProp == "get" {
-      return recBuiltElemOf(cwPeelValue(f.memObj))
+    if n.callArgs.length == 1 && f is Member && f.memProp == "get" {
+      return recBuiltElemIn(cwPeelValue(f.memObj), tbl)
     }
-    return -1
+    // A list's `pop()` reads an element, as an index does (D15230).
+    if n.callArgs.length == 0 && f is Member && f.memProp == "pop" {
+      return recBuiltElemIn(cwPeelValue(f.memObj), tbl)
+    }
+    // A call handing its argument back reads where that argument does (D14819).
+    const ia = recIdentityArgOf(x)
+    if ia >= 0 {
+      const lb = recLitArgBuiltTy(cwPeelValue(ia))
+      if lb >= 0 { return lb }
+      return recBuiltReadTyAt(cwPeelValue(ia), tbl, false, depth - 1)
+    }
+    return recBuiltLeavesTy(recInferredFnOf(x), tbl, depth - 1)
   }
   if n is Member {
-    const o = recBuiltReadTy(cwPeelValue(n.memObj))
+    const o = recBuiltReadTyAt(cwPeelValue(n.memObj), tbl, fresh, depth)
     if o < 0 { return -1 }
     const ot = tyAt(nonNullTy(o))
     return if ot is TyObj { objFieldType(ot, n.memProp) } else { -1 }
   }
   const d = recHeldDecl(x)
-  if d < 0 || recBuildHoldsElems(d) { -1 } else { recBuildPassAt(d) }
+  if d < 0 { return -1 }
+  const b = if fresh { recBuildTyIn(tbl, d, false) } else { -1 }
+  const dn = nodeAt(d)
+  if b >= 0 || !(dn is LetDecl) { return b }
+  recBuiltReadTyAt(cwPeelValue(dn.letInit), tbl, fresh, depth - 1)
+}
+
+// Whether `u` is a call handing back a record literal a pin built at another record (D15185).
+export function recHandsBackPinLit(u: i32): boolean {
+  const p = cwPeelValue(u)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Call) { return false }
+  const ia = recIdentityArgOf(p)
+  ia >= 0 && recLitArgBuiltTy(cwPeelValue(ia)) >= 0
+}
+
+// The record literal `x` is built at when a pin stamped it at another record than its own, else -1:
+// a call handing it back reads it there (D15185).
+function recLitArgBuiltTy(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) { return -1 }
+  const rt = nodeRepTyIxOf(x)
+  const own = nodeTyIxOf(x)
+  if rt < 0 || rt >= T.tys.length || own < 0 || tySame(rt, own) { return -1 }
+  if tyAt(rt) is TyObj { rt } else { -1 }
+}
+
+// The record every value leaf of function `fd` is a built read at (`recBuiltReadTyAt`), else -1.
+function recBuiltLeavesTy(fd: i32, tbl: Map<i32, i32>, depth: i32): i32 {
+  if fd < 0 || depth <= 0 { return -1 }
+  let r = -1
+  for lf in recFnValueLeaves(fd) {
+    const b = recBuiltReadTyAt(cwPeelValue(lf), tbl, false, depth)
+    if b < 0 || (r >= 0 && !tySame(r, b)) { return -1 }
+    r = b
+  }
+  r
+}
+
+// Each field write a non-generic body checked, as the stored value, the receiver, the field and
+// the function around it, boxed at the receiver's storage once the pass's builds are known.
+let storeWriteVal: i32[] = []
+let storeWriteRecv: i32[] = []
+let storeWriteField: string[] = []
+let storeWriteFn: i32[] = []
+
+// Queues the field write `recv.field = v` for `storeWritesResolve`.
+export function storeWritePush(v: i32, recv: i32, field: string) {
+  if v < 0 || recv < 0 || !stampsStand() || tpEnvNames.length > 0 { return 0 }
+  storeWriteVal.push(v)
+  storeWriteRecv.push(recv)
+  storeWriteField.push(field)
+  storeWriteFn.push(curFnDeclIx)
+  0
+}
+
+// Each un-annotated binding's initializer a check queued, and the record a call initializer's
+// results are built at where that is another than its own type (`storeLetsResolve`), by call node.
+let storeLetInit: i32[] = []
+let storeLetDecl: i32[] = []
+let storeLetBuilt: {[i32]: i32} = Map()
+// The un-annotated functions a check queued, for `storeRetsResolve`.
+let storeFnQueue: i32[] = []
+
+// Queues the initializer `init` of un-annotated binding `decl` for `storeLetsResolve`.
+export function storeLetPush(init: i32, decl: i32) {
+  if init < 0 || !stampsStand() || elabCapLive() { return 0 }
+  storeLetInit.push(init)
+  storeLetDecl.push(decl)
+  0
+}
+// Queues the un-annotated, non-generic function `fd` for `storeRetsResolve`.
+export function storeFnPush(fd: i32) {
+  if fd < 0 || !stampsStand() || elabCapLive() { return 0 }
+  storeFnQueue.push(fd)
+  0
+}
+export function storeFnCount(): i32 { storeFnQueue.length }
+export function storeFnAt(i: i32): i32 { storeFnQueue[i] }
+export function storeLetCount(): i32 { storeLetInit.length }
+export function storeLetInitAt(i: i32): i32 { storeLetInit[i] }
+export function storeLetDeclAt(i: i32): i32 {
+  if i < storeLetDecl.length { storeLetDecl[i] } else { -1 }
+}
+export function storeLetBuiltSet(call: i32, rec: i32) {
+  storeLetBuilt[call] = rec
+  0
+}
+
+// The record every result of the call `call` an un-annotated binding holds is built at, where
+// that is another record than the call's own type; else -1.
+export function storeLetBuiltOf(call: i32): i32 { storeLetBuilt[call] ?? -1 }
+
+// Empties the built-record column and both queues, as a check pass begins.
+export function storeRepPassReset() {
+  storeLetBuilt = Map()
+  storeWritesClear()
+}
+
+// The queued writes, for `storeWritesResolve`, which empties the queue once it has read them.
+export function storeWriteCount(): i32 { storeWriteVal.length }
+export function storeWriteValAt(i: i32): i32 { storeWriteVal[i] }
+export function storeWriteRecvAt(i: i32): i32 { storeWriteRecv[i] }
+export function storeWriteFieldAt(i: i32): string { storeWriteField[i] }
+export function storeWriteFnAt(i: i32): i32 { storeWriteFn[i] }
+export function storeWritesClear() {
+  storeLetInit = []
+  storeLetDecl = []
+  storeFnQueue = []
+  storeWriteVal = []
+  storeWriteRecv = []
+  storeWriteField = []
+  storeWriteFn = []
+  0
 }
 
 // The storage a kept delivery builds the stored value `v` at, else -1.
@@ -2889,6 +4709,14 @@ function recKeptValueDst(v: i32, depth: i32): i32 {
   if p < 0 || p >= P.nodes.length { return -1 }
   const sa = recSolePinArg(p)
   if sa >= 0 { return recKeptValueDst(sa, depth - 1) }
+  // A call the solve stamped at its own record is kept nowhere else (D15266).
+  if (
+    nodeAt(p) is Call
+    && nodeRepStamped(p)
+    && tySame(nodeRepTyIxOf(p), nodeTyIxOf(p))
+  ) {
+    return -1
+  }
   const kd = recKeptDstOfDecl(recFreshOriginDecl(p, 6))
   if kd >= 0 { return kd }
   const fd = recInferredFnOf(p)
@@ -2905,6 +4733,55 @@ function recKeptValueDst(v: i32, depth: i32): i32 {
     r = lr
   }
   r
+}
+
+// Refuses each object literal inside the literal `init`, built at the record `dst`, whose field is
+// a union none of whose arms declares every field the literal sets, unless an arm's fields are the
+// first of the literal's: that arm is its row's supertype (D3566). `depth` bounds the walk.
+function recBuildArmDropRefuse(init: i32, dst: i32, depth: i32) {
+  const lp = cwPeelValue(init)
+  if inferQuiet || depth <= 0 || lp < 0 || dst < 0 || dst >= T.tys.length {
+    return 0
+  }
+  const e = nodeAt(lp)
+  const d = tyAt(nonNulTyOf(dst))
+  if !(e is ObjLit) || !(d is TyObj) { return 0 }
+  for fx in e.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit {
+      const ft = objFieldType(d, f.fiName)
+      const v = cwPeelValue(f.fiValue)
+      const fu = if ft >= 0 { tyAt(nonNulTyOf(ft)) } else { null }
+      const vn = if v >= 0 { nodeAt(v) } else { null }
+      if (
+        fu is TyUnion
+        && vn is ObjLit
+        && objLitUnionArm(vn, nodeTyIxOf(v), fu.uMembers) < 0
+      ) {
+        for m in fu.uMembers {
+          // An arm whose fields are the first of the literal's is its WasmGC supertype, so the
+          // literal is built at its own row and boxed as that arm (D3566).
+          if (
+            m >= 0
+            && tyAt(m) is TyObj
+            && assignable(nodeTyIxOf(v), m)
+            && !objWidthPrefix(nodeTyIxOf(v), m)
+          ) {
+            const through = " (reached through "
+              + tyToStr(nodeTyIxOf(lp))
+              + " into "
+              + tyToStr(dst)
+              + ")"
+            objShapeDropUnsupportedErr(v, nodeTyIxOf(v), m, through)
+            return 0
+          }
+        }
+      } else if ft >= 0 {
+        recBuildArmDropRefuse(v, ft, depth - 1)
+      }
+    }
+  }
+  0
 }
 
 // The storage the kept function `d` builds at (`recKeptDecl`), else -1.
@@ -3170,6 +5047,17 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     const iv = nodeAt(parenPeelIx(recDeclInit(decl)))
     if iv is ArrayLit {
       if recAdoptUnionList(srcExpr, srcTy, dstTy) { return 0 }
+      // A list of record lists is built at the destination by its literal's stamp, keeping its
+      // type, and its own-storage deliveries are refused at the pass end (D15370).
+      const land = recAdLandingList(nonNulTyOf(dstTy))
+      const se = tyArrayElemIx(srcTy)
+      if se >= 0 && se < T.tys.length && tyAt(se) is TyArray && land >= 0 {
+        adoptLitAt(parenPeelIx(recDeclInit(decl)), land)
+        recApartDecl.push(decl)
+        recApartDst.push(land)
+        recApartAt.push(p)
+        return 0
+      }
       return recAdPushDecl(
         decl,
         tyArrayElemIx(srcTy),
@@ -3178,7 +5066,11 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         p,
       )
     }
-    return recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), false, p)
+    recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), false, p)
+    if recAdNoAdopt.has(decl) {
+      recBuildArmDropRefuse(recDeclInit(decl), nonNulTyOf(dstTy), 6)
+    }
+    return 0
   }
   if e is Index {
     const b = cwPeelValue(e.idxArr)
@@ -3251,13 +5143,15 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if (
         recBuildsLit(fd, 8)
         && ld >= 0
-        && recSitesLandApart(fd, nonNulTyOf(srcTy), ld)
+        && (recSitesLandApart(fd, nonNulTyOf(srcTy), ld) || recSitesHeldPinned(fd))
       ) {
         recRefuseAtOwnRow(p, nonNulTyOf(srcTy), ld)
         return 0
       }
       if recHoleIdentityAt(p, fd, srcTy, dstTy) { return 0 }
       recIdentityLeavesAt(fd, ld)
+      // A relay of a result built elsewhere is converted where it is delivered, not kept at `ld`.
+      if ld >= 0 && recRelayLeavesToCopy(fd, ld) { return 0 }
       return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
     }
     const pa = recPassThroughArg(p)
@@ -3291,8 +5185,11 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       ) {
         return recAdoptNote(pa, nodeTyIxOf(pa), dstTy)
       }
-      // A fresh call handed through is built at its own row, as it is delivered directly.
-      const pf = if pp >= 0 { recInferredFnOf(pp) } else { -1 }
+      // A fresh call handed through, directly or through bindings holding it, is built at its own
+      // row, as it is delivered directly; the origin is the walk the arm's other branches read
+      // (`recOriginExpr`, D15179).
+      const pc = if pp >= 0 { recOriginExpr(pp) } else { -1 }
+      const pf = if pc >= 0 { recInferredFnOf(pc) } else { -1 }
       if pf >= 0 {
         const pl = nonNulTyOf(dstTy)
         if (
@@ -3306,9 +5203,9 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         if (
           recSolePinArg(p) >= 0
           && recLandingOf(srcTy, dstTy) == pl
-          && recFnBuiltAtDst(pf, pp, srcTy, dstTy)
+          && recFnBuiltAtDst(pf, pc, srcTy, dstTy)
         ) {
-          return recAdPushDecl(pf, srcTy, nonNulTyOf(dstTy), false, pp)
+          return recAdPushDecl(pf, srcTy, nonNulTyOf(dstTy), false, pc)
         }
         if recHasLitLeaf(pf) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
         const pld = recLandingOf(srcTy, dstTy)
@@ -3479,6 +5376,16 @@ function listWidenWalk(
   if src >= T.tys.length || dst >= T.tys.length { return false }
   if src == dst { return false }
   const x = listOriginExpr(expr)
+  // A list literal a `const` names is built at its own type, so a mutable list sharing it cannot
+  // read a function set's elements at a closed function type (D15133).
+  if (
+    x >= 0
+    && expr >= 0
+    && parenPeelIx(expr) != x
+    && listConstLitFnSet(x, src, dst)
+  ) {
+    return listWidenClaim(parenPeelIx(expr), src, dst)
+  }
   if x == LW_INFERRED { return false }
   if x >= 0 && listWidenJoin(x, dst, depth, underNul) { return true }
   if x >= 0 && (recIsJoin(x) || recCoalesceOperands(x).length == 2) {
@@ -3616,6 +5523,11 @@ function listWidenArray(
     if listWidenWalk(-1, s.aElem, d.aElem, depth - 1, false) { return true }
     if d.aRead != 1 {
       if listElemWidens(s.aElem, d.aElem) { return listWidenClaim(x, src, dst) }
+      // A function set's generic member type into a closed function element needs a copy
+      // through adapters, which only a readonly list may take (D15133).
+      if listFnSetNeedsCopy(s.aElem, d.aElem) {
+        return listWidenClaim(x, src, dst)
+      }
       return false
     }
     // A readonly destination that needs a converting copy under `| null` has no lowering yet.
@@ -3625,6 +5537,33 @@ function listWidenArray(
     }
   }
   false
+}
+
+// Whether literal `x`, of list type `src`, delivered to the mutable list `dst` has elements of a
+// function set that `dst`'s closed function element needs copied (`listFnSetNeedsCopy`).
+function listConstLitFnSet(x: i32, src: i32, dst: i32): boolean {
+  if !(nodeAt(x) is ArrayLit) || src >= T.tys.length || dst >= T.tys.length {
+    return false
+  }
+  const s = tyAt(src)
+  const d = tyAt(dst)
+  s is TyArray
+    && d is TyArray
+    && d.aRead != 1
+    && listFnSetNeedsCopy(s.aElem, d.aElem)
+}
+
+// Whether element `se`, the read type of a re-pointed `let` of functions called at more than one
+// type (`fnLetIsWide`), meets `de`, a closed function type: no instance shares that list, so the
+// list must be copied, not aliased.
+function listFnSetNeedsCopy(se: i32, de: i32): boolean {
+  if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length || se == de {
+    return false
+  }
+  if !(tyAt(se) is TyFunc) || !(tyAt(de) is TyFunc) || tyHasHole(de) {
+    return false
+  }
+  fnLetIsWide(se)
 }
 
 // The elements of a list literal, each judged by its own expression; a spread hands over the
@@ -3841,6 +5780,9 @@ function listElemDiffers(se: i32, de: i32): boolean {
   listElemWidens(se, de) || containerElemClassDiffers(se, de)
 }
 
+// Set while `objShapeAdapterless` judges a pair whose destination is a union's member.
+let objShapeAtArm = false
+
 // `direct` — is the destination a slot a `(ref $src)` can be written into as it stands?
 // True at a value flow, where a declared WasmGC supertype makes the reference fit. False
 // wherever the pair sits under something whose own wasm type has to relate by identity — an
@@ -3877,8 +5819,10 @@ function objShapeAdapterless(
     TyUnion => {
       const sms = s.uMembers
       let si = 0
+      // A member wider than an arm of a union destination is re-tagged at run time (D15057).
+      const memDirect = direct && tyAt(dst) is TyUnion
       while si < sms.length {
-        if objShapeAdapterless(-1, sms[si], dst, depth - 1, false) {
+        if objShapeAdapterless(-1, sms[si], dst, depth - 1, memDirect) {
           return true
         }
         si = si + 1
@@ -3890,7 +5834,7 @@ function objShapeAdapterless(
   }
   match d {
     TyUnion => {
-      return objShapeUnionDstAdapts(srcExpr, src, d.uMembers, depth)
+      return objShapeUnionDstAdapts(srcExpr, src, d.uMembers, depth, direct)
     }
     // every other destination pairs with its source's kind below
     TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
@@ -3928,8 +5872,11 @@ function objShapeAdapterless(
           if objFieldNameSetsEq(src, dst) {
             return objShapeSameNamesAdapts(srcExpr, src, dst, cx)
           }
-          // A pinned binding's literal runs the initializer of a field it drops.
-          if recAdPinInit && litShapeDropSrcExpr(cx) { return false }
+          // A pinned binding's literal runs the initializer of a field a record drops; no union
+          // arm is built from a wider record (D3566).
+          if recAdPinInit && !objShapeAtArm && litShapeDropSrcExpr(cx) {
+            return false
+          }
           // The width lift (D622): a `Wide` flowing into a `Narrow` whose fields are the first
           // of `Wide`'s, in the canonical layout order with identical types, needs no
           // conversion — `emitTypeSection` declares a `(sub)` edge, only at a `direct` position.
@@ -4039,13 +5986,16 @@ function objShapeUnionDstAdapts(
   src: i32,
   dms: i32[],
   depth: i32,
+  direct: boolean,
 ): boolean {
   let di = 0
   let anyClean = false
   let anyAdapts = false
+  const atArm = objShapeAtArm
+  objShapeAtArm = true
   while di < dms.length {
     if assignable(src, dms[di]) {
-      if objShapeAdapterless(srcExpr, src, dms[di], depth - 1, false) {
+      if objShapeAdapterless(srcExpr, src, dms[di], depth - 1, direct) {
         anyAdapts = true
       } else {
         anyClean = true
@@ -4053,6 +6003,7 @@ function objShapeUnionDstAdapts(
     }
     di = di + 1
   }
+  objShapeAtArm = atArm
   if anyClean { return false }
   anyAdapts
 }
@@ -4122,8 +6073,15 @@ function objShapeListLitAdapts(
   let ei = 0
   while ei < els.length {
     const sx = ctorExprOf(spreadArgOf(els[ei]))
+    const sp = nodeAt(els[ei])
     if sx >= 0 && nodeAt(sx) is ArrayLit {
       if (objShapeAdapterless(sx, nodeTyIxOf(sx), dst, depth - 1, direct)) {
+        return true
+      }
+    } else if sp is Spread {
+      // An existing list's elements are existing records, handed over one at a time (D13960).
+      const se = tyArrayElemIx(nodeTyIxOf(sp.spdArg))
+      if se >= 0 && objShapeAdapterless(-1, se, dElem, depth - 1, true) {
         return true
       }
     } else if (
@@ -4184,10 +6142,38 @@ function objShapeMapPairAdapts(
     containerElemClassDiffers(s.mVal, d.mVal)
     || mapValBoxDiffers(s.mVal, d.mVal)
     || unionElemMemberWidens(s.mVal, d.mVal)
+    || mapValIntLitNulls(s.mVal, d.mVal)
   ) {
     return objShapeAdaptNote(src, dst, cx, true, false)
   }
   false
+}
+
+// Whether map value `se`, an integer literal or a union of them, is delivered as a value `de`
+// that adds `null`: the source is stored as `i32` and the destination boxed (D2713).
+function mapValIntLitNulls(se: i32, de: i32): boolean {
+  if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length {
+    return false
+  }
+  if tyBearsNull(se) || !tyBearsNull(de) { return false }
+  const t = tyAt(se)
+  match t {
+    TyLit => {
+      return t.litKind == "int"
+    }
+    TyUnion => {
+      if t.uMembers.length < 1 { return false }
+      for m in t.uMembers {
+        const mt = if m >= 0 && m < T.tys.length { tyAt(m) } else { null }
+        if !(mt is TyLit) || mt.litKind != "int" { return false }
+      }
+      return true
+    }
+    // Any other value is no integer literal.
+    TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyNeg => {
+      return false
+    }
+  }
 }
 
 // A function pair adapts through its result or any parameter. Parameters compare
@@ -4308,25 +6294,36 @@ export function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
   if litShapeDropSrcExpr(sX) {
     objLitUndeclaredErr(srcExpr, sT, dT, through)
   } else {
-    tErrUnsupported(
-      "an object value of shape "
-        + tyToStr(sT)
-        + " flowing into "
-        + tyToStr(dT)
-        + through
-        + " drops the field "
-        + objDroppedFieldList(sT, dT)
-        + ": type-valid (structural width subtyping) but not yet supported by codegen — a "
-        + "struct's wasm type is its own field list, so these are unrelated types and no "
-        + "field-dropping conversion exists. Construct the value at "
-        + tyToStr(dT)
-        + " (an object literal is built at the shape it flows into), or declare the source "
-        + "with exactly "
-        + tyToStr(dT)
-        + "'s fields",
-      srcExpr,
-    )
+    objShapeDropUnsupportedErr(srcExpr, sT, dT, through)
   }
+}
+
+// The refusal of a value of record `sT` delivered into the record `dT`, which lacks a field it has:
+// no field-dropping conversion is built. `through` names the carrying pair, or is "".
+function objShapeDropUnsupportedErr(
+  at: i32,
+  sT: i32,
+  dT: i32,
+  through: string,
+) {
+  tErrUnsupported(
+    "an object value of shape "
+      + tyToStr(sT)
+      + " flowing into "
+      + tyToStr(dT)
+      + through
+      + " drops the field "
+      + objDroppedFieldList(sT, dT)
+      + ": type-valid (structural width subtyping) but not yet supported by codegen — a "
+      + "struct's wasm type is its own field list, so these are unrelated types and no "
+      + "field-dropping conversion exists. Construct the value at "
+      + tyToStr(dT)
+      + " (an object literal is built at the shape it flows into), or declare the source "
+      + "with exactly "
+      + tyToStr(dT)
+      + "'s fields",
+    at,
+  )
 }
 
 // The width-field refusal: `sT` and `dT` agree on field names but differ inside a field,
@@ -4689,9 +6686,7 @@ export function inferRetJoin(g: i32, lit: boolean) {
     inferObservedLitSet(neutral || lit)
     return 0
   }
-  njApartRetSet(
-    !inferObservedLit && !lit && !njJoinGated(inferObserved, g, true),
-  )
+  njApartRetSet(!inferObservedLit && !lit)
   inferObservedSet(
     keepListStorage(
       inferObserved,
@@ -4922,6 +6917,66 @@ export function recordInferRetNullOnly(key: string, er: i32): boolean {
   true
 }
 
+// Records `dstTy` at each list value `srcExpr` delivers into a list of another element type: the
+// emitter converts it there when the two element storages differ. A literal is built at its
+// destination, so the record goes on its elements and fields instead.
+export function recordListCopy(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  listCopyAt(srcExpr, srcTy, dstTy, REC_STORE_DEPTH)
+}
+
+// `recordListCopy` to `depth` literals deep.
+function listCopyAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
+  const dst = nonNulTyOf(dstTy)
+  if srcExpr < 0 || srcTy < 0 || dst < 0 || srcTy >= T.tys.length || depth < 0 {
+    return 0
+  }
+  const dt = tyAt(dst)
+  for lf in valueTailLeaves(srcExpr) {
+    if lf < 0 { continue }
+    const ln = nodeAt(parenPeelIx(lf))
+    if ln is ObjLit {
+      if dt is TyObj {
+        for fx in ln.objFields {
+          const fi = nodeAt(fx)
+          if fi is FieldInit {
+            const df = objFieldType(dt, fi.fiName)
+            if df >= 0 {
+              listCopyAt(fi.fiValue, nodeTyOf(fi.fiValue), df, depth - 1)
+            }
+          }
+        }
+      }
+    } else if ln is ArrayLit {
+      if dt is TyArray {
+        for ex in ln.arrElems {
+          if !(nodeAt(ex) is Spread) {
+            listCopyAt(ex, nodeTyOf(ex), dt.aElem, depth - 1)
+          }
+        }
+      }
+    } else if coerceRecordOpen() && listTysElemDiffer(nodeTyOf(lf), dst) {
+      // The generic pass records the open destination, which each instance closes.
+      while listCopyTyIx.length <= lf { listCopyTyIx.push(-1) }
+      listCopyTyIx[lf] = dst
+    }
+  }
+  0
+}
+
+// Whether `src` and `dst` are both lists, `src` possibly nullable, of different element types.
+function listTysElemDiffer(src: i32, dst: i32): boolean {
+  const sn = nonNulTyOf(src)
+  if sn < 0 || sn >= T.tys.length || dst < 0 || dst >= T.tys.length {
+    return false
+  }
+  const s = tyAt(sn)
+  const d = tyAt(dst)
+  if s is TyArray {
+    if d is TyArray { return s.aElem != d.aElem }
+  }
+  false
+}
+
 // Records `dstTy` at each value `srcExpr` delivers when its record stores a number otherwise
 // than the destination's record does: the emitter builds a fresh record there, converting each
 // number. Only number fields may differ, and a literal is built at its destination instead.
@@ -4971,6 +7026,21 @@ function recCopyAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
 // Whether the record `dst` stores some field of the record `src` as another number class, and
 // every other field as `src` stores it.
 function recCopyConverts(src: i32, dst: i32): boolean {
+  recCopyConvertsAt(src, dst, REC_STORE_DEPTH)
+}
+
+// `recCopyConverts` with at most `depth` levels of record fields left: a field holding a record
+// that converts is copied by the level below.
+function recCopyConvertsAt(src: i32, dst: i32, depth: i32): boolean {
+  if (
+    depth <= 0
+    || src < 0
+    || dst < 0
+    || src >= T.tys.length
+    || dst >= T.tys.length
+  ) {
+    return false
+  }
   const s = tyAt(src)
   const d = tyAt(dst)
   if !(s is TyObj) || !(d is TyObj) { return false }
@@ -4986,7 +7056,13 @@ function recCopyConverts(src: i32, dst: i32): boolean {
       if nonNulTyOf(sf) != sf || nonNulTyOf(df) != df { return false }
       converts = true
     } else if !fieldStorageEq(sf, df, REC_STORE_DEPTH) {
-      return false
+      if (
+        !recCopyNestable(sf, df)
+        || !recCopyConvertsAt(sf, nonNulTyOf(df), depth - 1)
+      ) {
+        return false
+      }
+      converts = true
     }
     i = i + 1
   }
@@ -5251,9 +7327,14 @@ export function litAtDstStorage(x: i32, dstTy: i32): boolean {
   false
 }
 
-// Whether `x`, past parentheses, is a fresh value (`freshLitValue`), or a value `if`, `match` or
-// block one of whose arms is: the sources a rep stamp can adopt.
+// Whether `x`, past parentheses, is a fresh value (`freshLitValue`), or a value `if`, `match`,
+// block or `??` one of whose arms is: the sources a rep stamp can adopt.
 export function repStampableLit(x: i32): boolean {
+  const p = parenPeelIx(x)
+  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if pn is BinExpr && pn.binOp == "??" {
+    return repStampableLit(pn.binLeft) || repStampableLit(pn.binRight)
+  }
   const leaves = if valueJoinAt(x) < 0 { [parenPeelIx(x)] } else { valueTailLeaves(x) }
   for l in leaves {
     if freshLitValue(l) && !freshSetCall(l) { return true }
@@ -5403,6 +7484,13 @@ export function markFieldValue(ix: i32, owner: i32, name: string): i32 {
   1
 }
 
+// Marks node `ix` as an element of list literal `owner`.
+export function markElemValue(ix: i32, owner: i32): i32 {
+  if ix < 0 || owner < 0 || !stampsStand() { return 0 }
+  ctxElemNodes[ix] = owner
+  1
+}
+
 // Records `t` as the destination of each value leaf and inner join that join `ix` delivers, not
 // of `ix` itself: a value `if`, block or `match`'s arms are delivered to the join, whatever then
 // takes it.
@@ -5426,12 +7514,95 @@ export function recordLeafCtxTy(ix: i32, t: i32): i32 {
 // Records `t` as the destination type node `ix` is delivered at: the instance's where an
 // elaboration re-checks it, else the program's.
 function ctxTyStamp(ix: i32, t: i32): i32 {
+  // The nodes a `?.` read's rewrite puts in its place are delivered where the read is.
+  for op in optReadParts[ix] ?? [] { ctxTyStampOne(op, t) }
+  ctxTyStampOne(ix, t)
+}
+
+// `ctxTyStamp` for node `ix` alone.
+function ctxTyStampOne(ix: i32, t: i32): i32 {
+  const isBox = tyIsUnionDst(t)
+  if isBox { boxExitsStamp(ix, t) }
   if elabCapLive() {
     elabCapCtx[ix] = t
+    if isBox { elabCapBox[ix] = t }
     return 1
   }
   while nodeCtxTyIx.length <= ix { nodeCtxTyIx.push(-1) }
   nodeCtxTyIx[ix] = t
+  if isBox { boxTyStamp(ix, t) }
+  1
+}
+
+// Records union `t` as the box destination of node `ix` and each value leaf it delivers through,
+// where stamps stand, without a contextual type: a `??` operand joins its result, it is not
+// delivered to it. Not a union, nothing.
+export function recordBoxTy(ix: i32, t: i32): i32 {
+  if ix < 0 || !tyIsUnionDst(t) || litPinN.length > 0 || !stampsStand() {
+    return 0
+  }
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(ix, spine, leaves)
+  boxTyStamp(ix, t)
+  for j in spine { boxTyStamp(j, t) }
+  for l in leaves { boxTyStamp(l, t) }
+  1
+}
+
+// Records union `t` as the box destination of node `ix` alone, the instance's where an
+// elaboration re-checks it, else the program's.
+function boxTyStamp(ix: i32, t: i32): i32 {
+  for op in optReadParts[ix] ?? [] { boxTyStampOne(op, t) }
+  boxTyStampOne(ix, t)
+}
+
+// `boxTyStamp` for node `ix` alone.
+function boxTyStampOne(ix: i32, t: i32): i32 {
+  if elabCapLive() {
+    elabCapBox[ix] = t
+    return 1
+  }
+  while nodeBoxTyIx.length <= ix { nodeBoxTyIx.push(-1) }
+  nodeBoxTyIx[ix] = t
+  1
+}
+
+// Records union `t` as the box destination of each value loop `ix` exits with (`lpExitsOf`), and of
+// each leaf a join among them delivers; the loop's own `ctxTy` stamp does not reach them.
+function boxExitsStamp(ix: i32, t: i32): i32 {
+  const todo = lpExitsOf(ix).slice(0)
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x < 0 { continue }
+    boxTyStamp(x, t)
+    for y in lpExitsOf(x) { todo.push(y) }
+    const spine: i32[] = []
+    const leaves: i32[] = []
+    valueTailSplit(x, spine, leaves)
+    for j in spine {
+      if j != x { boxTyStamp(j, t) }
+    }
+    for l in leaves {
+      if l != x { todo.push(l) }
+    }
+  }
+  0
+}
+
+// Whether `t` is a union or a nullable type: a destination a value may be boxed into.
+function tyIsUnionDst(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const d = T.tys[t]
+  d is TyUnion || d is TyNullable
+}
+
+let repTemplateMuted = false
+
+// Runs nothing; while `on`, a stamp outside an elaboration writes no template column, for a
+// question asked at one instance's pin of a node every instance shares (D15288).
+export function repTemplateMute(on: boolean): i32 {
+  repTemplateMuted = on
   1
 }
 
@@ -5442,6 +7613,7 @@ function repStamp(ix: i32, t: i32): i32 {
     elabCapRep[ix] = t
     return 1
   }
+  if repTemplateMuted { return 1 }
   while nodeRepTyIx.length <= ix { nodeRepTyIx.push(-1) }
   nodeRepTyIx[ix] = t
   1
@@ -5450,12 +7622,16 @@ function repStamp(ix: i32, t: i32): i32 {
 // Stamps the list literal `l` with the list type `ty` its elements are built as; 1.
 export function repStampListBuilt(l: i32, ty: i32): i32 { repStamp(l, ty) }
 
+// Stamps the returned read `x` with the record `t` its container builds it at; 1.
+export function repStampHeldRead(x: i32, t: i32): i32 { repStamp(x, t) }
+
 // Records union `u` as the one literal `ix` is adopted into an arm of, beside its rep stamp; 1.
 function repStampUnion(ix: i32, u: i32): i32 {
   if elabCapLive() {
     elabCapRepUnion[ix] = u
     return 1
   }
+  if repTemplateMuted { return 1 }
   nodeRepUnionIx[ix] = u
   1
 }
@@ -5711,12 +7887,14 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       if nullNamesOwnNull(dstTy) { return repStamp(srcExpr, dstTy) }
       return 0
     }
-    // A value `if`, `match` or block delivers each arm's value to the same destination.
+    // A value `if`, `match` or block delivers each arm's value to the same destination, and one
+    // whose arms took a record destination is built as that record too, not as their join (D15020).
     IfStmt | Block | MatchExpr => {
       let any = 0
       for l in valueTailLeaves(srcExpr) {
         if l != srcExpr { any = any | recordRepTyAdopt(l, dtix, depth - 1) }
       }
+      if any != 0 && d is TyObj { repStamp(srcExpr, dtix) }
       return any
     }
     // A fresh `Map()` or `Set()` is built as the map it is delivered to.
@@ -5738,8 +7916,17 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       numLitAdoptDst(srcExpr, dtix)
       return 0
     }
+    // A `??` delivers its value from either operand, so each is built at the destination.
+    BinExpr => {
+      if e.binOp != "??" { return 0 }
+      const l = recordRepTyAdopt(e.binLeft, dtix, depth - 1)
+      // A join on the left is built at the destination too, as its arms are.
+      const lj = parenPeelIx(e.binLeft)
+      if l != 0 && lj >= 0 && valueJoinAt(lj) >= 0 { repStamp(lj, dtix) }
+      return l | recordRepTyAdopt(e.binRight, dtix, depth - 1)
+    }
     // no other source is a literal shape to stamp
-    StrLit | CharLit | BoolLit | BinExpr | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread | LoopVar => {}
+    StrLit | CharLit | BoolLit | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread | LoopVar => {}
   }
   0
 }
@@ -5863,20 +8050,14 @@ export function listJoinApart(elems: i32[], ets: i32[]): i32 {
     if armLit(et, elems[i]) {
       lits.push(et)
     } else {
-      // A nullable element keeps master's widening outside a body checked at each pin: a
-      // generic `==` over a list of nullable number unions does not lower (D3535).
-      if tyAdmitsNull(et) && !njFnOpen(njFnIx) { return -1 }
       if run.length > 0 && njMayPart(run[0], et) && !tyEqSameHoles(run[0], et) {
-        if njJoinGated(run[0], et, false) { return -1 }
         parts = true
       }
       run.push(et)
     }
     i = i + 1
   }
-  // A literal beside parted elements in a body checked at each pin keeps master's widening: the
-  // pin's re-join cannot tell the literal from the runtime members (D3534).
-  if !parts || (lits.length > 0 && njFnOpen(njFnIx)) { return -1 }
+  if !parts { return -1 }
   let j = run[0]
   i = 1
   while i < run.length {

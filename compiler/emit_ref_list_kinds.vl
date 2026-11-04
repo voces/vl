@@ -63,6 +63,7 @@ import {
   mkNullableTy,
   numLitUnionBaseTy,
   tyAt,
+  tyEq,
   tyHasInferHole,
   tyIsLitUnion,
   tyIsLitUnionArray,
@@ -72,7 +73,7 @@ import { unwrapParen } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { arrLitHasSpread } from "./emit_list_rep"
 import { nonNulBaseOf, tyRefArrElemOf } from "./emit_map_value_slots"
-import { variantIndexOf } from "./emit_narrow_slots"
+import { variantIndexOf } from "./emit_local_slots"
 import {
   nulScalarListBuildKind,
   nulVariantIndexOf,
@@ -81,10 +82,12 @@ import {
 import { emptyArrHoleElemSlot } from "./emit_obj_lit_fits"
 import {
   RepDesc,
+  boxTagOfTy,
   repOfTy,
   repShadowOn,
   repStructSlotsTwin,
   rlElemKindAt,
+  scalarTagOfKind,
 } from "./emit_rep"
 import { repSlotOfKind } from "./emit_rep_slot"
 import {
@@ -106,7 +109,12 @@ import {
   LBK_U8_LIST,
   LBK_UNION,
   RLK_CLOSURE,
+  RLK_F32_LIST,
+  RLK_F64_LIST,
+  RLK_I32_LIST,
+  RLK_I64_LIST,
   RLK_STRUCT,
+  RLK_STR_LIST,
   RLK_UNION,
   VKind,
   rlElemName,
@@ -115,6 +123,7 @@ import {
   rlWrAns,
   rlWrSlots,
   sHeapIdx,
+  uTags,
   uVarRow,
   variantHeap,
 } from "./emit_state"
@@ -393,6 +402,44 @@ export function rlWidenVariantOf(srcSlot: i32, dstSlot: i32): i32 {
   -1
 }
 
+// The box tag an element-converting copy from ref-list slot `srcSlot` into union-box slot
+// `dstSlot` boxes each element under: a record row's arm tag, or the tag of a scalar list the
+// union holds as a member (`string[]` into `string | string[]`); -1 for no such pair.
+export function rlWidenTagOf(srcSlot: i32, dstSlot: i32): i32 {
+  const vi = rlWidenVariantOf(srcSlot, dstSlot)
+  if vi >= 0 { return if vi < uTags.length { uTags[vi] } else { -1 } }
+  if srcSlot < 0 || dstSlot < 0 || srcSlot == dstSlot { return -1 }
+  if srcSlot >= rlElemTyIx.length || dstSlot >= rlElemTyIx.length { return -1 }
+  if srcSlot >= rlElemNullable.length || dstSlot >= rlElemNullable.length {
+    return -1
+  }
+  if rlElemKindAt(dstSlot) != RLK_UNION || rlElemNullable[dstSlot] == 1 {
+    return -1
+  }
+  if rlElemNullable[srcSlot] == 1 { return -1 }
+  const k = rlElemKindAt(srcSlot)
+  if (
+    k != RLK_I32_LIST
+    && k != RLK_STR_LIST
+    && k != RLK_F64_LIST
+    && k != RLK_I64_LIST
+    && k != RLK_F32_LIST
+  ) {
+    return -1
+  }
+  const et = rlElemTyIx[srcSlot]
+  const bt = boxTagOfTy(et)
+  if bt != 7 && bt != 8 && bt != 9 && bt != 10 && bt != 12 { return -1 }
+  const ut = rlElemTyIx[dstSlot]
+  if et < 0 || ut < 0 || et >= T.tys.length || ut >= T.tys.length { return -1 }
+  const u = tyAt(ut)
+  if !(u is TyUnion) { return -1 }
+  for m in u.uMembers {
+    if m == et || tyEq(m, et) { return scalarTagOfKind(bt) }
+  }
+  -1
+}
+
 // Could a store through the receiver at `recvIx` reach a list whose element rep is ref-list
 // slot `slot`? An unclassified side must never be claimed: an unrecorded type or an
 // unresolved ref-ish element answers true (the widening then declines, unchanged behaviour),
@@ -502,7 +549,7 @@ export function rlWidenAllowed(
   srcSlot: i32,
   dstSlot: i32,
 ): boolean {
-  if rlWidenVariantOf(srcSlot, dstSlot) < 0 { return false }
+  if rlWidenTagOf(srcSlot, dstSlot) < 0 { return false }
   if !rlSlotEverWritten(srcSlot) {
     if !rlSlotEverWritten(dstSlot) { return true }
   }

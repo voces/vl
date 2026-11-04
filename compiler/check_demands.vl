@@ -3,6 +3,7 @@
 // overload resolution, cast pins, bare-brace delivery and the inferred-return notes. Each
 // reads what the core checker recorded and reports through the relation core.
 
+import { cbaParamRepTransparent } from "./check_bind_adopt"
 import { declTyOf, npInvBy, npKeys, npPlace, npTys } from "./check_nar_store"
 import {
   ArrayLit,
@@ -14,6 +15,7 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  LetDecl,
   MC_RUNG_BUILTIN,
   MC_RUNG_FIELD,
   MatchExpr,
@@ -35,6 +37,7 @@ import {
   i32ToStr,
   markCallRestPacked,
   mkArrayLit,
+  mkNull,
   mkParen,
   nodeAt,
   nodeChildren,
@@ -111,6 +114,7 @@ import {
   holeCastVarPush,
 } from "./check_coal"
 import {
+  asMissNull,
   bareBraceCount,
   bareBraceCountSet,
   bareBraceLits,
@@ -118,6 +122,7 @@ import {
   bareBraceSpec,
   bareBraceSpecSet,
   callSiteOpenListRows,
+  checkNodeHook,
   checkerForceFn,
   cnhAts,
   cnhDemand,
@@ -129,6 +134,9 @@ import {
   cstrProbe,
   inferVoidRetBlks,
   inferVoidRetSites,
+  omitFieldKey,
+  omitFieldNull,
+  pinLitServed,
   retNatural,
   retNaturalErrSet,
   retNaturalSet,
@@ -150,6 +158,7 @@ import {
   CV_UFCS,
   MC_LAYOUT_MARK,
   argCstr,
+  arrDefCstr,
   binCstr,
   bmCstr,
   cstrOwnerTop,
@@ -160,6 +169,7 @@ import {
   memCstr,
   nestCstr,
   noteArgCstr,
+  noteArrDefCstr,
   noteBinCstrAt,
   noteIsCstr,
   noteMemCstr,
@@ -182,12 +192,14 @@ import {
   unkeyedSubscriptNote,
 } from "./check_diag_text"
 import {
+  adoptLitAt,
   boundMembersOf,
   constrainEmptyExpr,
   covarWriteThroughErrAt,
   objShapeAdapterlessAt,
   objShapeAdapterlessErr,
   rcwPend,
+  recordCtxTy,
   recordRepTyAdopt,
   sharedUnionFieldTy,
   tpMemberFloorMsg,
@@ -199,6 +211,7 @@ import {
   HD_ELEM,
   HD_RET,
   hdBase,
+  hdKidsOfBase,
   hdKind,
   hdRootTy,
   hdRowOf,
@@ -372,7 +385,11 @@ import {
   prbArmed,
   prbLeave,
 } from "./check_rollback"
-import { mergedDeclKeyOf, moduleNameTyOf } from "./check_scopes"
+import {
+  identBoundFnDeclOf,
+  mergedDeclKeyOf,
+  moduleNameTyOf,
+} from "./check_scopes"
 import { jwRecordSite, noteRetJoin } from "./check_side_rows"
 import { symEnabled } from "./check_state"
 import {
@@ -412,9 +429,14 @@ import {
   tpJoinUnions,
   tyIsDeferredJoin,
 } from "./check_tp_join"
-import { eqRefusals, isWidenNotVariant } from "./check_ty_relate"
+import {
+  REC_STORE_DEPTH,
+  eqRefusals,
+  fieldStorageEq,
+  isWidenNotVariant,
+} from "./check_ty_relate"
 import { nomErasedTyIx, tyBoxesV128 } from "./check_ty_rep"
-import { fieldSigOf, jsonReceiverDeclTy } from "./check_type_shape"
+import { elemHasZero, fieldSigOf, jsonReceiverDeclTy } from "./check_type_shape"
 import {
   T,
   TY_ERR,
@@ -432,6 +454,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  mkArrayTy,
   mkMapTy,
   mkNullableTy,
   nearNamesNote,
@@ -466,7 +489,24 @@ import {
   wsOrigAnn,
   wsRowOf,
 } from "./check_width"
-import { declFirstParamIsSelf, fnDeclIx } from "./check_write_scan"
+import {
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  CW_UP_FIELD,
+  CW_UP_LETINIT,
+  CW_UP_OBJ,
+  cwIxBuild,
+  cwIxKind,
+  cwIxNode,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwOccNext,
+  cwOccWalk,
+  declFirstParamIsSelf,
+  fnDeclIx,
+} from "./check_write_scan"
 import { cexFitsSigned, cexOk } from "./const_exact"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
@@ -845,7 +885,8 @@ export function methodDidYouMean(recvTy: i32, prop: string) {
 
 // The argument the call `at` passes for the parameter the read `rx` names, when `rx` reads a
 // parameter of the function `at` calls and that argument is a positional read of a fresh binding
-// (`recFreshDeclOf`); else `rx`. The record solve builds such a binding where the pin delivers it.
+// (`recFreshDeclOf`) or a record literal; else `rx`. The record solve builds it where the pin
+// delivers it.
 function pinArgOfParamRead(rx: i32, at: i32): i32 {
   const p = parenPeelIx(rx)
   if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return rx }
@@ -864,8 +905,117 @@ function pinArgOfParamRead(rx: i32, at: i32): i32 {
   while i < fn.fnParams.length && fn.fnParams[i] != d { i = i + 1 }
   if i >= fn.fnParams.length || i >= c.callArgs.length { return rx }
   const a = c.callArgs[i]
-  if a < 0 || recFreshDeclOf(parenPeelIx(a)) < 0 { return rx }
-  a
+  const ap = if a >= 0 { parenPeelIx(a) } else { -1 }
+  if ap < 0 { return rx }
+  if recFreshDeclOf(ap) >= 0 { return a }
+  // A record literal is built where the pin delivers it, when the parameter never hands the
+  // value back out of the call (D14760).
+  if nodeAt(ap) is ObjLit && paramOnlyDelivered(d) { return a }
+  // So is one handed back whole, where the call's instance is keyed at the built rep (D15185).
+  if nodeAt(ap) is ObjLit && cbaParamRepTransparent(d, fd, 4) { return a }
+  rx
+}
+
+// Whether record literal `src`, typed `sub` at the pin and delivered as `dst`, stores apart only
+// at fields whose value reads a parameter the call `at` hands a fresh record literal: each such
+// literal is then built at its field's destination, and true. False, nothing queued, otherwise.
+function pinLitFieldArgs(src: i32, sub: i32, dst: i32, at: i32): boolean {
+  const lp = parenPeelIx(src)
+  const ln = if lp >= 0 && lp < P.nodes.length { nodeAt(lp) } else { null }
+  const dn = nonNullTy(dst)
+  if !(ln is ObjLit) || sub < 0 || dn < 0 || dn >= T.tys.length { return false }
+  const st = tyAt(sub)
+  const dt = tyAt(dn)
+  if !(st is TyObj) || !(dt is TyObj) { return false }
+  const args: i32[] = []
+  const subs: i32[] = []
+  const dsts: i32[] = []
+  const reads: i32[] = []
+  for fx in ln.objFields {
+    const fi = nodeAt(fx)
+    if !(fi is FieldInit) { return false }
+    const fs = objFieldType(st, fi.fiName)
+    const fd = objFieldType(dt, fi.fiName)
+    if fs < 0 || fd < 0 { return false }
+    if !fieldStorageEq(fs, fd, REC_STORE_DEPTH) {
+      const a = pinArgOfParamRead(fi.fiValue, at)
+      const ap = if a >= 0 { parenPeelIx(a) } else { -1 }
+      if a == fi.fiValue || ap < 0 || !(nodeAt(ap) is ObjLit) { return false }
+      if objShapeAdapterlessAt(a, fs, fd) { return false }
+      args.push(a)
+      subs.push(fs)
+      dsts.push(fd)
+      reads.push(fi.fiValue)
+    }
+  }
+  if args.length == 0 { return false }
+  pinLitServed[lp] = true
+  let k = 0
+  while k < args.length {
+    adoptLitAt(parenPeelIx(args[k]), dsts[k])
+    rcwPend(args[k], subs[k], dsts[k])
+    recPend(args[k], subs[k], dsts[k], reads[k])
+    k = k + 1
+  }
+  true
+}
+
+// Whether parameter `d` is only read for a field or a method, or handed to an annotated parameter
+// of a non-generic function: no use lets the value leave the call.
+function paramOnlyDelivered(d: i32): boolean {
+  cwIxBuild()
+  let used = false
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if u < 0 || u >= cwIxUpKind.length { return false }
+      const k = cwIxUpKind[u]
+      if k == CW_UP_ARG {
+        if !argToAnnotatedPlainParam(u) { return false }
+      } else if k == CW_UP_FIELD {
+        // A field of a record literal that is itself only delivered (D15184).
+        if !litOnlyDelivered(cwIxUp[u]) { return false }
+      } else if k != CW_UP_OBJ {
+        return false
+      }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
+      return false
+    }
+  }
+  used
+}
+
+// Whether record literal `l` is handed to an annotated parameter of a non-generic function, or bound
+// to an annotated binding that is only delivered (`paramOnlyDelivered`): a value placed in its field
+// cannot leave the call through it.
+function litOnlyDelivered(l: i32): boolean {
+  if l < 0 || l >= cwIxUpKind.length { return false }
+  if cwIxUpKind[l] == CW_UP_ARG { return argToAnnotatedPlainParam(l) }
+  if cwIxUpKind[l] != CW_UP_LETINIT { return false }
+  const d = cwIxUp[l]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  dn is LetDecl && dn.letType >= 0 && paramOnlyDelivered(d)
+}
+
+// Whether `u`, a call argument, is handed to an annotated parameter of a non-generic function.
+function argToAnnotatedPlainParam(u: i32): boolean {
+  const cn = nodeAt(cwIxUp[u])
+  const fd = if cn is Call && cn.callFn >= 0 { identBoundFnDeclOf(cn.callFn) } else { -1 }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  const ai = cwIxUpAux[u]
+  if (
+    !(f is FuncDecl)
+    || f.fnTyParams.length > 0
+    || ai < 0
+    || ai >= f.fnParams.length
+  ) {
+    return false
+  }
+  const pn = nodeAt(f.fnParams[ai])
+  pn is Param && pn.parType >= 0
 }
 
 // The argument seam's container refusals for a generic body's receiver, re-asked once the
@@ -898,7 +1048,12 @@ function ufcsRecvPinSeam(callIx: i32, recvTy: i32, selfTy: i32, at: i32) {
 // The deliveries `calleeFn`'s body recorded at a hole, at this call's bindings: a source the pin
 // makes concrete is asked the direct spelling's record rules, and one still open is recorded
 // for the caller's pins.
-export function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
+export function validateRcwPins(
+  bNames: string[],
+  bTys: i32[],
+  calleeFn: i32,
+  at: i32,
+) {
   if inferQuiet && !cstrProbe { return 0 }
   const n = rcwPinSrc.length
   let i = 0
@@ -913,12 +1068,21 @@ export function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
         } else if !inferQuiet && assignable(sub, rcwPinDstTy[i]) {
           // The delivery seam's two record rules, in its order: a shape stored differently,
           // then a widened field something writes.
-          if objShapeAdapterlessAt(rcwPinSrc[i], sub, rcwPinDstTy[i]) {
+          // A parameter read stands for the call's fresh argument, judged where it is built.
+          const sx = pinArgOfParamRead(rcwPinSrc[i], at)
+          // A record literal whose fields hold such reads is built around those arguments, each
+          // built at its field's destination (D15184).
+          if pinLitFieldArgs(rcwPinSrc[i], sub, rcwPinDstTy[i], at) {
+            // handled field by field
+          } else if objShapeAdapterlessAt(sx, sub, rcwPinDstTy[i]) {
             objShapeAdapterlessErr(rcwPinSrc[i], sub, rcwPinDstTy[i])
           } else {
-            rcwPend(rcwPinSrc[i], sub, rcwPinDstTy[i])
+            if sx != rcwPinSrc[i] && nodeAt(parenPeelIx(sx)) is ObjLit {
+              adoptLitAt(parenPeelIx(sx), rcwPinDstTy[i])
+            }
+            rcwPend(sx, sub, rcwPinDstTy[i])
             // The record solve judges the pin's value as it does a binding's (D14759).
-            recPend(rcwPinSrc[i], sub, rcwPinDstTy[i], rcwPinSrc[i])
+            recPend(sx, sub, rcwPinDstTy[i], rcwPinSrc[i])
           }
         }
       }
@@ -966,6 +1130,32 @@ function holeMapArgNullPin(hm: i32, at: i32, srcExpr: i32) {
         a.mVal = cnhPinTy(TY_NULL, srcExpr, srcExpr, true, false)
         tyMutEpoch = tyMutEpoch + 1 // the argument's value pinned in place
       }
+    }
+  }
+  0
+}
+
+// A map the body wrote through a hole read off parameter `hole` — the result of calling it
+// (`const m = a(2)`), or its non-null face under a null test — pins the matching part of the
+// argument `at`, as a write to the hole itself pins an argument map. Depth-bounded.
+export function holeKidMapDemands(hole: i32, at: i32, depth: i32) {
+  if at < 0 || at >= T.tys.length || depth <= 0 { return 0 }
+  const kids = hdKidsOfBase[hole] ?? []
+  for ix in kids {
+    const row = hdRowOf(ix)
+    let sub = -1
+    if row >= 0 && hdKind[row] == HD_RET {
+      const af = tyAt(at)
+      if af is TyFunc { sub = af.fnRet }
+    } else {
+      sub = nonNullTy(at)
+    }
+    if sub >= 0 {
+      const dv = tyAt(ix)
+      if dv is TyVar && holeMapOf(dv.tvName) >= 0 {
+        holeDemandOk(dv.tvName, -1, sub)
+      }
+      holeKidMapDemands(ix, sub, depth - 1)
     }
   }
   0
@@ -1554,6 +1744,58 @@ export function validatePrintCstrs(
     ci = ci + 1
   }
   cvNow = cvWas
+  0
+}
+
+// Re-asks every `__array_new_default__` in the body `calleeFn` instantiates for its element's
+// default, substituted, refusing at the call with the direct spelling's sentence; an element
+// still open under the caller's hole is re-recorded there (D2578).
+export function validateArrDefCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const n0 = arrDefCstr.ty.length
+  let ci = 0
+  while ci < n0 {
+    if (
+      cstrOwnedBy(arrDefCstr.fn[ci], calleeFn)
+      && !nestCstrOutside(arrDefCstr.ix[ci])
+    ) {
+      const lt = arrDefCstr.ty[ci]
+      const l = tyAt(lt)
+      if l is TyArray {
+        if l.aElem >= 0 && tyHasHole(l.aElem) {
+          const el = substTyDeep(l.aElem, bNames, bTys)
+          if tyHasHole(el) {
+            if el != l.aElem && calleeFn >= 0 {
+              noteArrDefCstr(mkArrayTy(el), arrDefCstr.ix[ci])
+            }
+          } else if (
+            el >= 0
+            && el < T.tys.length
+            && !(tyAt(el) is TyErr)
+            && !elemHasZero(el)
+          ) {
+            let pWho = "a type parameter's list is built here: "
+            if who != "" {
+              pWho = "`" + who + "` builds its type parameter's list here: "
+            }
+            tErr(
+              pWho
+                + "__array_new_default__ fills every slot with the element's default value, and "
+                + tyToStr(el)
+                + " has none — use __array_new__(n, fill)",
+              ix,
+            )
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
   0
 }
 
@@ -3231,6 +3473,8 @@ export function bareBraceDeliver(
     recordRepTyAdopt(srcExpr, rec, 6)
     while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
     nodeTySet(srcExpr, rec)
+    // Each of its fields is left out, so each holds the `null` minted for it here.
+    if bareBraceSpec == 0 { bareBraceFieldNulls(srcExpr, rec) }
     // Into a union the chosen member is the answer: the first whose fields all admit `null`,
     // the order the literal-to-union adoption below tries members in. A speculative trial of
     // one member only records; the outer delivery decides.
@@ -3243,6 +3487,20 @@ export function bareBraceDeliver(
   bareBraceCountSet(bareBraceCount + 1)
   tErr(msg, srcExpr)
   true
+}
+
+// Delivers the minted `null` of each field of record `rec` that the empty literal `objIx` leaves out.
+function bareBraceFieldNulls(objIx: i32, rec: i32) {
+  const r = tyAt(rec)
+  if !(r is TyObj) { return 0 }
+  let i = 0
+  while i < r.objFieldNames.length {
+    if i < r.objFieldTypes.length {
+      omitFieldNullDeliver(objIx, r.objFieldNames[i], r.objFieldTypes[i])
+    }
+    i = i + 1
+  }
+  0
 }
 
 // `bareBraceDeliver` over a list literal's elements, against the element type of `dstTy`.
@@ -3545,9 +3803,10 @@ export function castPropagationFits(
 // the hole (D1342).
 export function noteCastDemand(name: string, n: AsExpr, ix: i32, target: i32) {
   if name == "" { return 0 }
-  // The pin describes the parameter, so the demand may only speak for a direct read of it —
-  // `const b = a ?? 0` retypes `b`, so a rung reading the pin there must not fire on `b`.
-  const vn = castOperandIdent(n.asObj)
+  // The pin describes the parameter, so the demand may only speak for a direct read of it or a
+  // `const` copy of one; `const b = a ?? 0` retypes `b`, so a rung reading the pin there must
+  // not fire on `b`.
+  const vn = castOperandSource(n.asObj, 4)
   if vn == "" { return 0 }
   // A narrowing in force over the operand's place is the operand's type, not the pin's:
   // `a = 7` ahead of the cast leaves the parameter pinned while the cast reads a value that can't fail.
@@ -3565,6 +3824,29 @@ export function noteCastDemand(name: string, n: AsExpr, ix: i32, target: i32) {
   }
   holeCastRowPush(name, n, vn, ix, target)
   0
+}
+
+// The binding cast operand `ix` reads, through un-annotated `const` copies of a bare read, so
+// `const c = a` then `c as i32` speaks for `a` (D1373); else `castOperandIdent`'s answer.
+function castOperandSource(ix: i32, depth: i32): string {
+  const vn = castOperandIdent(ix)
+  if vn == "" || depth <= 0 { return vn }
+  const x = parenPeelIx(ix)
+  const d = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return vn
+  }
+  const init = parenPeelIx(dn.letInit)
+  if init < 0 || init >= P.nodes.length || !(nodeAt(init) is Ident) {
+    return vn
+  }
+  castOperandSource(init, depth - 1)
 }
 
 // Parks a propagating `as` cast whose operand is a call of a hole parameter (`g(x) as i32`, the
@@ -3706,7 +3988,38 @@ function castPinAdjudicate(k: i32, at: i32) {
   const snNum = sn == "i32" || sn == "i64" || sn == "f32" || sn == "f64"
   if snNum && !numCastCanFail(sn, dom) { return 0 }
   if mode == "null" { return castPinNullLand(k, castIx, target) }
-  castPropagationFits(TY_NULL, holeCastTgtName[k], castIx, holeCastRet[k], at)
+  if (
+    castPropagationFits(TY_NULL, holeCastTgtName[k], castIx, holeCastRet[k], at)
+  ) {
+    castMissNullDeliver(castIx, holeCastRet[k])
+  }
+  0
+}
+
+// The `null` literal `objIx`'s omitted field `name` holds: minted once per literal and field,
+// and delivered to the field's type `ft`, so each instance's re-check records it.
+export function omitFieldNullDeliver(objIx: i32, name: string, ft: i32) {
+  const key = omitFieldKey(objIx, name)
+  let mn = omitFieldNull[key] ?? -1
+  if mn < 0 {
+    mn = mkNull("null", -1)
+    omitFieldNull[key] = mn
+  }
+  checkNodeHook(mn)
+  recordCtxTy(mn, ft)
+  0
+}
+
+// The `null` a bare `as` at `ix` returns on a miss: minted once per cast and delivered to the
+// enclosing function's result `ret` as `return null` is, so every instance's re-check records it.
+export function castMissNullDeliver(ix: i32, ret: i32) {
+  let mn = asMissNull[ix] ?? -1
+  if mn < 0 {
+    mn = mkNull("null", -1)
+    asMissNull[ix] = mn
+  }
+  checkNodeHook(mn)
+  recordCtxTy(mn, ret)
   0
 }
 

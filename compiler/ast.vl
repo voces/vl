@@ -222,10 +222,17 @@ export type UnionDecl = {
   pos: i32,
   udNew: i32,
 } // type N = A | B
-// `isNeg` is 1 for a surface `x !is T` (desugared to `!(x is T)`), else 0 — a
-// faithful-surface marker the printer reads to reprint `!is`. Typecheck/emit
-// ignore it (the wrapping `Unary "!"` carries the negation).
-export type IsExpr = { isObj: i32, isVariant: string, pos: i32, isNeg: i32 } // x is T,  x !is T
+// `isNeg` is 1 for a surface `x !is T` (desugared to `!(x is T)`); the printer reads it, and the
+// wrapping `Unary "!"` carries the negation. `isFit` is -1, or the content check the checker
+// minted for a map tested against a narrower map (D2701): a value block whose first statement
+// binds `isObj`, so it is the node's one child.
+export type IsExpr = {
+  isObj: i32,
+  isVariant: string,
+  pos: i32,
+  isNeg: i32,
+  isFit: i32,
+} // x is T,  x !is T
 
 // `x as T`, a checked numeric conversion: `asObj` the operand's arena index, `asTy` the
 // target as a name the checker resolves with `nameToTy`, `asMode` the family member
@@ -3309,8 +3316,38 @@ export function mkUnionDecl(
   addNode(n)
 }
 
+// The one child an `is` test has: its minted content check when it has one, which holds the
+// operand, else the operand.
+export function isExprKid(n: IsExpr): i32 {
+  if n.isFit >= 0 { n.isFit } else { n.isObj }
+}
+
+// The operand a minted content check `fit` binds first, or -1 when `fit` is not that shape.
+export function isFitObjOf(fit: i32): i32 {
+  const v = nodeAt(fit)
+  if !(v is IfStmt) { return -1 }
+  const tb = nodeAt(v.ifThen)
+  if !(tb is Block) || tb.blkStmts.length == 0 { return -1 }
+  const d = nodeAt(tb.blkStmts[0])
+  if d is LetDecl { return d.letInit }
+  -1
+}
+
+// Give the `is` node `ix` the content check `fit`.
+export function isFitSet(ix: i32, fit: i32) {
+  const n = nodeAt(ix)
+  if n is IsExpr { n.isFit = fit }
+  0
+}
+
 export function mkIsExpr(obj: i32, variant: string, pos: i32) {
-  const n: Node = { isObj: obj, isVariant: variant, pos: pos, isNeg: 0 }
+  const n: Node = {
+    isObj: obj,
+    isVariant: variant,
+    pos: pos,
+    isNeg: 0,
+    isFit: -1,
+  }
   addNode(n)
 }
 
@@ -3318,7 +3355,13 @@ export function mkIsExpr(obj: i32, variant: string, pos: i32) {
 // this node) for typecheck/emit's narrowing, but flagged `isNeg` so the printer
 // reprints the surface `!is` instead of `!(… is …)`.
 export function mkIsExprNeg(obj: i32, variant: string, pos: i32) {
-  const n: Node = { isObj: obj, isVariant: variant, pos: pos, isNeg: 1 }
+  const n: Node = {
+    isObj: obj,
+    isVariant: variant,
+    pos: pos,
+    isNeg: 1,
+    isFit: -1,
+  }
   addNode(n)
 }
 
@@ -3642,7 +3685,7 @@ function nodeKidsOf(n: Node): i32[] {
       return out
     }
     IsExpr => {
-      const out: i32[] = [n.isObj]
+      const out: i32[] = [isExprKid(n)]
       return out
     }
     WhileStmt => {
@@ -3798,7 +3841,7 @@ function nodeKidsPush(ix: i32, out: i32[], spine: boolean): i32 {
       return 1
     }
     IsExpr => {
-      out.push(n.isObj)
+      out.push(isExprKid(n))
       return 1
     }
     WhileStmt => {

@@ -1,0 +1,320 @@
+// The record-row class of a record type: the order-free key of the struct row identity the
+// emitter already keys heap twins on (`repRowKey`), read from the checked type alone, so it can be
+// asked before the elaboration, with the union literal re-lay (D1050, D14752) folded in over every
+// union the program holds, so two records share a class exactly when they build at one heap row
+// (D15152). Computed on demand and memoised per compile.
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyAt,
+  tyIsLitUnion,
+  tyMayHoldFn,
+  tySame,
+  tyToStr,
+} from "./check_types"
+import { tyHasTyVar } from "./tyquery"
+import { fieldNameOrder } from "./check_obj_shape"
+import { repRowFieldKey, repRowKey } from "./emit_rep"
+
+let rrMemo: {[i32]: string} = Map()
+
+// Forgets every class key and the union list, for a new compile's arena.
+export function recordRowsReset() {
+  rrMemo = Map()
+  rrUnions = []
+  rrUnionsByNames = Map()
+  rrUnionReps = Map()
+  rrUnionsBuilt = false
+  0
+}
+
+let rrUnions: i32[] = []
+let rrUnionsByNames: {[string]: i32[]} = Map()
+let rrUnionReps: {[string]: i32[]} = Map()
+let rrUnionsBuilt = false
+
+// Every union type the program holds with two or more record members, declared or inline (a
+// function's `A | B`), collected once per compile on first use: the re-lay's memberships.
+function rrUnionsOf(): i32[] {
+  if rrUnionsBuilt { return rrUnions }
+  rrUnionsBuilt = true
+  let i = 0
+  while i < T.tys.length {
+    const t = tyAt(i)
+    if t is TyUnion {
+      let recs = 0
+      for m in t.uMembers {
+        if m >= 0 && m < T.tys.length && tyAt(m) is TyObj { recs = recs + 1 }
+      }
+      if recs >= 2 {
+        rrUnions.push(i)
+        if rrUnionIsNew(i, t.uMembers) { rrUnionsIndex(i, t.uMembers) }
+      }
+    }
+    i = i + 1
+  }
+  rrUnions
+}
+
+// Whether union `u` is the first of the arena's copies of its type: a later copy that is
+// `tySame` to an earlier one adds nothing to a class key, so only the first is filed.
+function rrUnionIsNew(u: i32, ms: i32[]): boolean {
+  let k = ""
+  for m in ms {
+    if m >= 0 && m < T.tys.length {
+      const mt = tyAt(m)
+      if mt is TyObj {
+        k = k + rrNamesKey(mt.objFieldNames) + "|"
+      } else {
+        k = k + "_|"
+      }
+    }
+  }
+  const at = rrUnionReps[k] ?? []
+  for r in at {
+    if tySame(r, u) { return false }
+  }
+  at.push(u)
+  rrUnionReps[k] = at
+  true
+}
+
+// Files union `u` under the field-name key of each record member, once per key.
+function rrUnionsIndex(u: i32, ms: i32[]) {
+  for m in ms {
+    if m >= 0 && m < T.tys.length {
+      const mt = tyAt(m)
+      if mt is TyObj {
+        const k = rrNamesKey(mt.objFieldNames)
+        const at = rrUnionsByNames[k] ?? []
+        if at.length == 0 || at[at.length - 1] != u {
+          at.push(u)
+          rrUnionsByNames[k] = at
+        }
+      }
+    }
+  }
+  0
+}
+
+// The unions `rrUnionsOf` collects that have a record member with the field names `names`, in
+// arena order: the only ones a record of those names can be `tySame` to a member of.
+function rrUnionsNamed(names: string[]): i32[] {
+  rrUnionsOf()
+  rrUnionsByNames[rrNamesKey(names)] ?? []
+}
+
+// A record's field names in sorted order, as one key.
+function rrNamesKey(names: string[]): string {
+  let k = ""
+  for i in fieldNameOrder(names) { k = k + names[i] + "," }
+  k
+}
+
+// The class key of record type `ty`, or "" when `ty` is not a record. An alias whose union
+// wraps records of one class (an intersection, or a union of one shape) answers that class.
+export function recordRowClassOf(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const hit = rrMemo[ty] ?? ""
+  if hit != "" { return hit }
+  const k = rrClassGo(ty)
+  if k != "" { rrMemo[ty] = k }
+  k
+}
+
+// The class of a type built around records: a record's row class, and a list, nullable, or map of
+// records spelled by those rows in place of the records' names, so two spellings of one row inside
+// a container share a class (D15262).
+let trcSawRecord = false
+
+// The class of closed type `ty`: its records' row classes spelled where the records stand; "" for
+// a type holding no record, a type variable or a union, and for one that may hold a function, since
+// each field function is its own instance (D988).
+export function typeRowClassOf(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) || tyMayHoldFn(ty, 0) {
+    return ""
+  }
+  trcSawRecord = false
+  const k = trcGo(ty, 0)
+  if !trcSawRecord || k == "" { "" } else { k }
+}
+
+// `typeRowClassOf`'s walk: "" where a part has no class.
+function trcGo(ty: i32, depth: i32): string {
+  if ty < 0 || ty >= T.tys.length || depth > 16 { return "" }
+  const t = tyAt(ty)
+  match t {
+    TyObj => {
+      const c = recordRowClassOf(ty)
+      if c != "" { trcSawRecord = true }
+      c
+    }
+    TyNullable => {
+      const c = trcGo(t.nInner, depth + 1)
+      if c == "" { "" } else { "?" + c }
+    }
+    TyArray => {
+      const c = trcGo(t.aElem, depth + 1)
+      if c == "" { "" } else { "[" + c + "]" }
+    }
+    TyMap => {
+      const kc = trcGo(t.mKey, depth + 1)
+      const vc = trcGo(t.mVal, depth + 1)
+      if kc == "" || vc == "" { "" } else { "{[" + kc + "]:" + vc + "}" }
+    }
+    TyPrim | TyLit => tyToStr(ty)
+    TyErr | TyFunc | TyNeg | TyUnion | TyVar => ""
+  }
+}
+
+// Starts a compile's classes ahead of the elaboration. A class is computed only when asked: the
+// key of a record whose fields share a record grows with each level of that sharing (D15152).
+export function recordRowsRun() {
+  recordRowsReset()
+  0
+}
+
+function rrClassGo(ty: i32): string {
+  const t = tyAt(ty)
+  match t {
+    TyObj => {
+      return rrArmKey(ty)
+    }
+    TyUnion => {
+      let k = ""
+      for m in t.uMembers {
+        if m < 0 || m >= T.tys.length { return "" }
+        if !(tyAt(m) is TyObj) { return "" }
+        const mk = repRowKey(m)
+        if k != "" && mk != k { return "" }
+        k = mk
+      }
+      return k
+    }
+    TyPrim | TyErr | TyFunc | TyArray | TyMap | TyNullable | TyVar | TyLit | TyNeg => {
+      // Not a record, and no alias of one.
+      return ""
+    }
+  }
+}
+
+// Record `ty`'s key with the fields the union re-lay rewrites (D1050): where an arm of any union
+// the program holds meets a sibling of the same field names whose field is another literal set, both store the
+// atom; where either is the plain `string`, both store the string. The string wins over the atom,
+// whichever union is met first. A record no re-lay touches answers `repRowKey`.
+function rrArmKey(ty: i32): string {
+  const t = tyAt(ty)
+  if !(t is TyObj) { return "" }
+  const ovr: {[string]: string} = Map()
+  let any = false
+  for u in rrUnionsNamed(t.objFieldNames) {
+    if u >= 0 && u < T.tys.length {
+      const ut = tyAt(u)
+      if ut is TyUnion && rrHas(ut.uMembers, ty) {
+        for m in ut.uMembers {
+          if m >= 0 && m < T.tys.length && m != ty && !tySame(m, ty) {
+            const mt = tyAt(m)
+            if mt is TyObj && rrSameNames(t.objFieldNames, mt.objFieldNames) {
+              let i = 0
+              while i < t.objFieldNames.length {
+                const nm = t.objFieldNames[i]
+                const a = t.objFieldTypes[i]
+                const b = rrFieldTyOf(mt, nm)
+                const r = rrRelayOf(a, b)
+                if r != "" {
+                  if (ovr[nm] ?? "") != "string" { ovr[nm] = r }
+                  any = true
+                }
+                i = i + 1
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if !any { return repRowKey(ty) }
+  const ord = fieldNameOrder(t.objFieldNames)
+  let out = "{"
+  for k in ord {
+    const nm = t.objFieldNames[k]
+    const o = ovr[nm] ?? ""
+    out = out
+      + nm
+      + ":"
+      + (if o != "" { o } else { repRowFieldKey(t.objFieldTypes[k]) })
+      + ","
+  }
+  out + "}"
+}
+
+// The rep two arms' fields of types `a` and `b` are re-laid to: "string" where a literal set
+// meets the plain string, "$atom" where two literal sets differ; "" where the re-lay leaves them.
+function rrRelayOf(a: i32, b: i32): string {
+  if b < 0 { return "" }
+  const la = rrIsStrLit(a)
+  const lb = rrIsStrLit(b)
+  const sa = rrIsString(a)
+  const sb = rrIsString(b)
+  if !(la || sa) || !(lb || sb) { return "" }
+  if !la && !lb { return "" }
+  if repRowFieldKey(a) == repRowFieldKey(b) && la && lb { return "" }
+  if sa || sb { return "string" }
+  "$atom"
+}
+
+// Whether `ty` is a string literal or a set of them.
+function rrIsStrLit(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  if tyIsLitUnion(ty) { return true }
+  const t = tyAt(ty)
+  t is TyLit && t.litKind == "str"
+}
+
+// Whether `ty` is the plain `string` primitive.
+function rrIsString(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  t is TyPrim && t.primName == "string"
+}
+
+// Whether `ms` holds `ty`.
+function rrHas(ms: i32[], ty: i32): boolean {
+  for m in ms {
+    if m == ty || tySame(m, ty) { return true }
+  }
+  false
+}
+
+// Whether two records have the same field names, in any order.
+function rrSameNames(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  for n in a {
+    let hit = false
+    for m in b {
+      if m == n { hit = true }
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+// The type of record `t`'s field `nm`, or -1.
+function rrFieldTyOf(t: TyObj, nm: string): i32 {
+  let i = 0
+  while i < t.objFieldNames.length {
+    if t.objFieldNames[i] == nm { return t.objFieldTypes[i] }
+    i = i + 1
+  }
+  -1
+}

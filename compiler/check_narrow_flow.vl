@@ -1,3 +1,5 @@
+import { objSigSame } from "./check_union_arm_msgs"
+
 // Flow narrowing: the narrowing ledger (`nar*`) and its joins at an `if`, the facts a test
 // pushes, and what retires them: a write to a place, a call that may write (`call*`), a loop
 // back-edge or a capture (`cr*`). Callers in the core checker record and query; nothing here
@@ -211,6 +213,7 @@ import {
   recFitMeetTy,
   recFitNarrowKeepsRep,
   recIsFitsAcrossTags,
+  recordBoxTy,
   recordRepTyAdopt,
   sharedUnionFieldTy,
 } from "./check_fit_rules"
@@ -222,7 +225,15 @@ import {
   indexRootKeyOf,
 } from "./check_getter_effects"
 import { guardCallPlace, nullCmpPlace } from "./check_guard"
-import { arrDefRowIsCall, holeLinkClosure } from "./check_hole_links"
+import {
+  arrDefRowIsCall,
+  holeLinkA,
+  holeLinkAt,
+  holeLinkB,
+  holeLinkClosure,
+  holeLinkDstTop,
+  holeLinkSrcTop,
+} from "./check_hole_links"
 import {
   HD_GNOT,
   HD_HWR,
@@ -447,6 +458,7 @@ import {
   joinArmTys,
   joinTys,
   joinVariantTys,
+  recArmFitKind,
   sameVariantTy,
   subtractTy,
   tErr,
@@ -492,6 +504,9 @@ import {
   narDefTy,
   narDefTyPop,
   narDeferJoin,
+  pendArgMapAts,
+  pendArgMapInline,
+  pendArgMapTys,
   pendAts,
   pendAtsSet,
   pendDepths,
@@ -558,6 +573,7 @@ import {
   mkNullableTy,
   objFieldType,
   tyAt,
+  tyBearsNull,
   tyFieldTyOf,
   tyHasHole,
   tyIsHole,
@@ -585,14 +601,17 @@ import { i32ListHas, i32ListWith } from "./listutil"
 import { declOutermostOf, declShadowOf, identDeclOf, sidOf } from "./symbols"
 import {
   arrElemValueTy,
+  flattenVariantsInto,
   isLitBearing,
   isNullTy,
   litPeekBaseTy,
+  litSetBaseTy,
   nonNullTy,
   tyAdmitsNull,
   tyHasTyVar,
   tyMapValOf,
   tyStepElem,
+  tyUnionCovers,
 } from "./tyquery"
 
 // The join of two types a place may hold after an `if`. A place holds a member of its declared
@@ -1188,10 +1207,96 @@ function flushNulListPins(depth: i32) {
   0
 }
 
+// At the program's end, every linked pair a use pinned on both sides is judged as the annotated
+// twin's store is: a store whose pinned source is not assignable to its pinned destination is
+// refused in that store's words, once per store. Pins that agree pass.
+export function judgeHoleLinks() {
+  const said: i32[] = []
+  let i = 0
+  while i < holeLinkA.length {
+    const at = holeLinkAt[i]
+    if (
+      at >= 0
+      && !unresolvedHole(holeLinkA[i])
+      && !unresolvedHole(holeLinkB[i])
+      && !i32ListHas(said, at)
+      && !assignable(holeLinkSrcTop[i], holeLinkDstTop[i])
+    ) {
+      said.push(at)
+      tErr(
+        "cannot assign "
+          + tyToStr(holeLinkSrcTop[i])
+          + " to "
+          + tyToStr(holeLinkDstTop[i]),
+        at,
+      )
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether `ty` holds a map with an open key or value, through a function's result, a `| null`
+// or a list element.
+function tyHoldsOpenMap(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyMap => t.mKey < 0 || t.mVal < 0 || tyHoldsOpenMap(t.mVal, depth - 1)
+    TyFunc => tyHoldsOpenMap(t.fnRet, depth - 1)
+    TyNullable => tyHoldsOpenMap(t.nInner, depth - 1)
+    TyArray => tyHoldsOpenMap(t.aElem, depth - 1)
+    // A record, union or scalar argument is graded through its own binding, if it has one.
+    TyPrim | TyErr | TyObj | TyUnion | TyVar | TyLit | TyNeg => false
+  }
+}
+
+// Each open list `ty` holds — itself, a function's result, a `| null` or a map value — takes
+// the element a hole callee wrote into it, as a pending binding's list does at scope close.
+function pinCalleeWrittenLists(ty: i32, depth: i32) {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
+  const t = tyAt(ty)
+  match t {
+    TyArray => {
+      if t.aElem < 0 {
+        calleeWritePin(ty)
+      } else {
+        pinCalleeWrittenLists(t.aElem, depth - 1)
+      }
+    }
+    TyFunc => pinCalleeWrittenLists(t.fnRet, depth - 1)
+    TyNullable => pinCalleeWrittenLists(t.nInner, depth - 1)
+    TyMap => pinCalleeWrittenLists(t.mVal, depth - 1)
+    // No other row holds a list the argument built.
+    TyPrim | TyErr | TyObj | TyUnion | TyVar | TyLit | TyNeg => {}
+  }
+  0
+}
+
+// At the program's end, an inline hole-parameter argument still holding an open map is one no
+// use pinned, the callee's included, so it takes the binding's "cannot infer a type" refusal.
+export function flushOpenArgMaps() {
+  judgeHoleLinks()
+  let i = 0
+  while i < pendArgMapTys.length {
+    pinCalleeWrittenLists(pendArgMapTys[i], 8)
+    if pendArgMapInline[i] && tyHoldsOpenMap(pendArgMapTys[i], 8) {
+      tErr(
+        "cannot infer a type for this argument — an empty Map it holds has no key or value type until it is used; use it where its type is known, or annotate the parameter it is passed to",
+        pendArgMapAts[i],
+      )
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Flush every pending binding recorded at scope `depth`, called just before the scope is popped
 // and for the global scope at program end. A binding whose hole is still open at this point
 // will never be pinned, so it takes the unified "cannot infer a type" diagnostic.
 export function flushUninferred(depth: i32) {
+  // A binding linked to one a use pinned (`b = a`, then a write to `b`) takes its type first.
+  resolveHoleLinks()
   // A `let x = null` a later write filled stores its `null` as the filled `T | null`.
   let fi = nhFilledIxs.length
   flushNullHoles(depth)
@@ -2519,6 +2624,51 @@ function narFitFields(p: i32, declTy: i32, nt: i32, r: TyObj) {
   0
 }
 
+// In an instance, a list binding that passed `is K[]` for a `K[]` its own type does not fit (an
+// empty list does, D4771) reads as a fresh `K[]`. Delivered to `dstTy` that takes its declared
+// type, or a union holding it, it is the caller's list (D4982), answered 2; delivered elsewhere a write would not reach
+// the caller, so it is refused (ruling (c), D4981), answered 1; any other delivery answers 0.
+export function narConvListDelivery(srcExpr: i32, srcTy: i32, dstTy: i32): i32 {
+  if !elabCapLive() || srcExpr < 0 || srcTy < 0 || srcTy >= T.tys.length {
+    return 0
+  }
+  if !(tyAt(srcTy) is TyArray) { return 0 }
+  const ix = peelParenIx(srcExpr)
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return 0 }
+  const ns = slotVisibleOf(identDeclOf(ix))
+  if ns < 0 { return 0 }
+  let decl = narDeclaredTy(ns, -1)
+  if decl < 0 { decl = declTyOf(ns) }
+  if (
+    decl < 0
+    || decl >= T.tys.length
+    || tyHasTyVar(decl)
+    || !(tyAt(decl) is TyArray)
+  ) {
+    return 0
+  }
+  if assignable(srcTy, decl) { return 0 }
+  const dn = nonNullTy(dstTy)
+  if dn >= 0 && (tySame(dn, decl) || tyUnionCovers(dn, decl)) { return 2 }
+  const text = narRowText(ix)
+  tErr(
+    "'"
+      + text
+      + "' passes `is "
+      + tyToStr(srcTy)
+      + "` here only as an empty list does; it is still declared "
+      + tyToStr(decl)
+      + " here, so it cannot be delivered as "
+      + tyToStr(srcTy)
+      + ". Copy it with '"
+      + text
+      + mapCopyText(1)
+      + "'",
+    ix,
+  )
+  1
+}
+
 // A list narrowed by its elements (`b is K[]`) narrows its reads only: delivered whole, or as a
 // field or element of a literal, to a type its declared type does not fit, it would outlive the
 // guard as a `K[]` the declared type still writes (D4928). Reports each such delivery and answers
@@ -2543,6 +2693,9 @@ export function narListDeliveryErr(
       if narListDeliveryErr(e, nodeTyOf(e), da.aElem) { hit = true }
     }
     return hit
+  }
+  if s is Ident {
+    if narRecDeliveryErr(ix, s.identName, srcTy, dstTy) { return true }
   }
   // The list itself, or a row of it still a list (`b[0]` under `b is K[][]`, D4945).
   const pfx = elemRecvPrefix(ix)
@@ -2576,19 +2729,96 @@ export function narListDeliveryErr(
     return false
   }
   const text = narRowText(ix)
-  const copy = "'" + text + mapCopyText(depth) + "'"
+  const dn = nonNullTy(decl)
+  const isMap = dn >= 0 && tyAt(dn) is TyMap
+  const what = if isMap { "values" } else { "elements" }
+  const tail = if isMap { ". Copy its entries into a fresh map" } else { ". Copy it with '" + text + mapCopyText(depth) + "'" }
   tErr(
     "'"
       + text
-      + "' is narrowed by `is` only for reading its elements; it is still declared "
+      + "' is narrowed by `is` only for reading its "
+      + what
+      + "; it is still declared "
       + tyToStr(decl)
       + " and a later write may widen it, so it cannot be delivered as "
       + tyToStr(dstTy)
-      + ". Copy it with "
-      + copy,
+      + tail,
     ix,
   )
   true
+}
+
+// A record narrowed by `is` to a record its declared type stores wider fits it only by its fields'
+// current values, so like a narrowed list it is read at the narrowed type and never delivered at
+// it (D4084). Reports a delivery of the name `name` at `ix` its declared type does not fit.
+function narRecDeliveryErr(
+  ix: i32,
+  name: string,
+  srcTy: i32,
+  dstTy: i32,
+): boolean {
+  const s = identSlotOf(ix, name)
+  if s < 0 || !narRecFitLive(s, name) { return false }
+  const decl = identStoreTyOf(ix, name)
+  if decl < 0 || narDeclFitsDst(decl, dstTy) || !assignable(srcTy, dstTy) {
+    return false
+  }
+  tErr(
+    "'"
+      + name
+      + "' is narrowed by `is` only for reading its fields; it is still declared "
+      + tyToStr(decl)
+      + " and a later write may widen it, so it cannot be delivered as "
+      + tyToStr(dstTy)
+      + ". Copy it with '"
+      + recCopyText(name, srcTy)
+      + "'",
+    ix,
+  )
+  true
+}
+
+// The declared type of the name read at `ix` while a narrowing to a record fits it by its fields'
+// current values, or -1. An un-annotated binding copying it takes this type, not the narrowed one.
+export function narRecFitDeclTy(ix: i32): i32 {
+  const p = peelParenIx(ix)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = nodeAt(p)
+  if !(n is Ident) { return -1 }
+  const s = identSlotOf(p, n.identName)
+  if s < 0 || !narRecFitLive(s, n.identName) { return -1 }
+  identStoreTyOf(p, n.identName)
+}
+
+// Whether the binding `s`, spelled `name`, holds a live field entry of a narrowing to a record.
+function narRecFitLive(s: i32, name: string): boolean {
+  let i = npKeys.length - 1
+  while i >= 0 {
+    if (
+      npInvBy[i] < 0
+      && keyHasPrefix(npKeys[i], name + ".")
+      && narFitNameOf(i) == name
+      && placeDecl(npPlace[i]) == s
+    ) {
+      return true
+    }
+    i = i - 1
+  }
+  false
+}
+
+// A record literal copying each field of the record type `t` from `name`.
+function recCopyText(name: string, t: i32): string {
+  const o = tyAt(nonNullTy(t))
+  if !(o is TyObj) { return name }
+  let text = "{ "
+  let f = 0
+  while f < o.objFieldNames.length {
+    if f > 0 { text = text + ", " }
+    text = text + o.objFieldNames[f] + ": " + name + "." + o.objFieldNames[f]
+    f = f + 1
+  }
+  text + " }"
 }
 
 // Whether a narrowed list's declared type `decl` fits `dst` at every instantiation. A type
@@ -3189,6 +3419,14 @@ function crFirstElemWritingCall(ix: i32, p: i32): i32 {
   -1
 }
 
+// The part of loop `loopIx` that runs again: a `for … in`'s iterable runs once, before the first
+// pass, and its own check retires what a call in it may end, so only the body re-runs.
+function crLoopRerun(loopIx: i32): i32 {
+  const n = nodeAt(loopIx)
+  if n is ForIn { return n.fiBody }
+  loopIx
+}
+
 // A loop re-runs the reads before a call after it, so a narrowing live at the loop that a call
 // anywhere in the loop may end ends before the loop starts, in both halves.
 export function crLoopPreRetire(loopIx: i32) {
@@ -3205,7 +3443,7 @@ export function crLoopPreRetire(loopIx: i32) {
     const nm = slotNameOf(s)
     let c = -1
     if s != -1 && crMayBeWritten(s) {
-      c = crFirstWritingCall(loopIx, placeBare(s), nm)
+      c = crFirstWritingCall(crLoopRerun(loopIx), placeBare(s), nm)
     }
     // So does a write in the loop that leaves a guard's narrowing (D2609), or a straight-line
     // null strip's: the reads at the loop's top run again after it (D3302).
@@ -3238,7 +3476,7 @@ function crLoopPathPreRetire(loopIx: i32) {
       // which no read check in the body sees; so an element narrowing a call may end ends here.
       let byCall = false
       if a < 0 && keyIsListEvery(npKeys[s]) {
-        a = crFirstElemWritingCall(loopIx, npPlace[s])
+        a = crFirstElemWritingCall(crLoopRerun(loopIx), npPlace[s])
         byCall = a >= 0
       }
       if a >= 0 {
@@ -3808,6 +4046,45 @@ function litSoleHolderIn(u: i32, lit: i32): boolean {
   found
 }
 
+// The narrowings writes in a short circuit's right side made, by the operator's node: they
+// hold only on the path where that side ran (D2451).
+const scWrPlaces: {[i32]: i32[]} = Map()
+const scWrTys: {[i32]: i32[]} = Map()
+const scWrOpen: i32[] = []
+
+export function scWrEnter(ix: i32) {
+  scWrPlaces[ix] = []
+  scWrTys[ix] = []
+  scWrOpen.push(ix)
+}
+
+export function scWrLeave() { scWrOpen.pop() }
+
+// Records that a write to the place at node `placeIx` narrowed it to `ty`, in the innermost
+// short circuit's right side; a write outside one records nothing.
+export function scWrNote(placeIx: i32, ty: i32) {
+  if scWrOpen.length == 0 || ty < 0 { return 0 }
+  const ix = scWrOpen[scWrOpen.length - 1]
+  const pl = scWrPlaces[ix]
+  const ts = scWrTys[ix]
+  if pl == null || ts == null { return 0 }
+  pl.push(placeIx)
+  ts.push(ty)
+  0
+}
+
+function scWrFacts(condIx: i32, places: i32[], tys: i32[]) {
+  const pl = scWrPlaces[condIx]
+  const ts = scWrTys[condIx]
+  if pl == null || ts == null { return 0 }
+  let i = 0
+  while i < pl.length {
+    pushNarrowFact(pl[i], ts[i], places, tys)
+    i = i + 1
+  }
+  0
+}
+
 // Collect the narrowings that hold when `cond` is true into the parallel `places`/`tys` arrays,
 // keyed by place path: `x != null` strips x's null, `x is T` pins x to T (`is null` pins to the
 // null type), `a && b` contributes both conjuncts, `!(e)` contributes e's false narrowings, and
@@ -3840,6 +4117,8 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         let meet = litSetMeetTy(isCur, tIdx)
         if meet < 0 { meet = recFitMeetTy(isCur, tIdx) }
         if meet >= 0 { tIdx = meet }
+        // A test the operand's type is a member of is always true and narrows nothing (D3360).
+        if meet < 0 && tyUnionCovers(tIdx, isCur) { return 0 }
         // A list-union rewrite's test reads the stored arm's tag, so it narrows to that arm.
         if tIdx >= 0 && luIsTyOf(condIx) >= 0 {
           pushNarrowFact(isPl, tIdx, places, tys)
@@ -3879,6 +4158,7 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         const lmark = places.length
         collectThenNarrows(cond.binLeft, places, tys)
         crFilterRhsRetired(condIx, places, tys, lmark)
+        scWrFacts(condIx, places, tys)
         collectThenNarrows(cond.binRight, places, tys)
         return 0
       }
@@ -3928,6 +4208,93 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   0
+}
+
+// An `is` test of an operand of type `op` against `t`: 1 when it always holds, 0 when it never
+// does, -1 when the stored value decides. Member by member over `op`, by D15252's rules: open
+// types defer, a covering union holds, literals meet, scalars and records go by their own type.
+export function isTestAnswer(op: i32, t: i32): i32 {
+  if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(op, ms)
+  if ms.length == 0 { return -1 }
+  let all1 = true
+  let all0 = true
+  for m in ms {
+    const a = isTestMemberAnswer(m, t, 8)
+    if a != 1 { all1 = false }
+    if a != 0 { all0 = false }
+  }
+  if all1 { return 1 }
+  if all0 { return 0 }
+  -1
+}
+
+// The kind of value type `ty` is, for `isTestMemberAnswer`: 1 scalar or literal, 2 record, 3 list,
+// 4 map, 5 function; 0 for any other type.
+function isTestKindOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = tyAt(ty)
+  match t {
+    TyPrim | TyLit => 1
+    TyObj => 2
+    TyArray => 3
+    TyMap => 4
+    TyFunc => 5
+    TyErr | TyUnion | TyNullable | TyVar | TyNeg => 0
+  }
+}
+
+// `isTestAnswer` for one member `m` of the operand against `t`.
+function isTestMemberAnswer(m: i32, t: i32, depth: i32): i32 {
+  if depth <= 0 || m < 0 || t < 0 || m >= T.tys.length || t >= T.tys.length {
+    return -1
+  }
+  const mt = tyAt(m)
+  const tt = tyAt(t)
+  if mt is TyVar || tt is TyVar || tyIsHole(m) || tyIsHole(t) { return -1 }
+  if m == t || tySame(m, t) || tyUnionCovers(t, m) { return 1 }
+  if isNullTy(m) { return if tyBearsNull(t) { 1 } else { 0 } }
+  if isNullTy(t) { return 0 }
+  // A tested union holds where one of its members does.
+  if tt is TyUnion && litSetBaseTy(t) < 0 {
+    let any1 = false
+    let all0 = true
+    for x in tt.uMembers {
+      const a = isTestMemberAnswer(m, x, depth - 1)
+      if a == 1 { any1 = true }
+      if a != 0 { all0 = false }
+    }
+    return if any1 { 1 } else if all0 { 0 } else { -1 }
+  }
+  // A value of one kind is never one of another: a scalar, a record, a list, a map, a function.
+  const km = isTestKindOf(m)
+  const kt = isTestKindOf(t)
+  if km > 0 && kt > 0 && km != kt { return 0 }
+  const lbm = litSetBaseTy(m)
+  const lbt = litSetBaseTy(t)
+  if lbm >= 0 || lbt >= 0 {
+    const meet = litSetMeetTy(m, t)
+    if meet == m { return 1 }
+    if meet >= 0 { return -1 }
+    const bm = if lbm >= 0 { lbm } else { m }
+    const bt = if lbt >= 0 { lbt } else { t }
+    return if tySame(bm, bt) { -1 } else { 0 }
+  }
+  if mt is TyPrim && tt is TyPrim {
+    return if mt.primName == tt.primName { 1 } else { 0 }
+  }
+  if recIsFitsAcrossTags(m, t) || listIsFitsAcrossReps(m, t) { return -1 }
+  if mt is TyObj && tt is TyObj {
+    if !objSigSame(mt, tt) || !objSigSame(tt, mt) { return 0 }
+    const k = recArmFitKind(t, m)
+    return if k == 1 { 1 } else if k == 0 { 0 } else { -1 }
+  }
+  if mt is TyArray && tt is TyArray {
+    return isTestMemberAnswer(mt.aElem, tt.aElem, depth - 1)
+  }
+  if mt is TyFunc && tt is TyFunc { return if tySame(m, t) { 1 } else { 0 } }
+  -1
 }
 
 // `subtractTy` for an `is` test's else arm. A concrete tested type stays apart from a type
@@ -4011,6 +4378,7 @@ function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         const lmark = places.length
         collectElseNarrows(cond.binLeft, places, tys)
         crFilterRhsRetired(condIx, places, tys, lmark)
+        scWrFacts(condIx, places, tys)
         collectElseNarrows(cond.binRight, places, tys)
         return 0
       }
@@ -4074,6 +4442,7 @@ export function applyNarrows(places: i32[], tys: i32[]) {
   while i < places.length {
     const p = places[i]
     if placeIsPath(p) {
+      const pathDecl = narKeyNowTy(p)
       npKeysPush(p)
       npTysPush(tys[i])
       npInvByPush(-1)
@@ -4081,6 +4450,11 @@ export function applyNarrows(places: i32[], tys: i32[]) {
       npSettlePush(-2)
       npCapByPush(-1)
       npAsgPush(0)
+      // A path narrowed to a record its type stores wider keeps the same field entries a
+      // name does, so a write through another place ends it (D4131).
+      if pathDecl >= 0 && pathDecl != tys[i] && tyAt(tys[i]) is TyObj {
+        narFitCompanions(p, pathDecl, tys[i])
+      }
     } else {
       const s = placeDecl(p)
       const declTy = declTyOf(s)
@@ -4720,6 +5094,10 @@ export function lpPopResult(
   lpColSet(lpValTail, ix, tl)
   // A fresh tail is stored as the block's value.
   if used == 1 && tl >= 0 { recordRepTyAdopt(tl, t, 6) }
+  // Each exit is boxed into the loop's own join until a delivery of the loop stamps its union.
+  if used == 1 {
+    for x in arms { recordBoxTy(x, t) }
+  }
   t
 }
 

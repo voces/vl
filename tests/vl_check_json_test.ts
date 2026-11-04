@@ -9,7 +9,7 @@
 // @test-timing native
 
 import { makeTempDir } from "./support/filePath.ts";
-import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -65,7 +65,8 @@ const parseBatch = (out: string): Batch[] => {
   const lines = out.split("\n").filter((l) => l.trim() !== "");
   return lines.map((l) => {
     const rec = JSON.parse(l);
-    if (typeof rec.file !== "string" || typeof rec.exit !== "number" ||
+    if (
+      typeof rec.file !== "string" || typeof rec.exit !== "number" ||
       !Array.isArray(rec.diagnostics)
     ) {
       throw new Error(`--batch record is not {file, exit, diagnostics}: ${l}`);
@@ -154,12 +155,20 @@ Deno.test({
       }
       const diags = parseDiags(dflt.out);
       const d = diags.find((x) => x.code === "prefer-const");
-      if (!d) throw new Error(`expected a prefer-const finding, got: ${dflt.out}`);
+      if (!d) {
+        throw new Error(`expected a prefer-const finding, got: ${dflt.out}`);
+      }
       if (d.severity !== "info") {
         throw new Error(`expected info severity, got: ${d.severity}`);
       }
       // Floor above the finding's tier: filtered from the output, exit stays 0.
-      const warn = await run(["check", file, "--json", "--severity", "warning"]);
+      const warn = await run([
+        "check",
+        file,
+        "--json",
+        "--severity",
+        "warning",
+      ]);
       if (warn.code !== 0 || parseDiags(warn.out).length !== 0) {
         throw new Error(
           `expected [] and exit 0 at --severity warning, got ${warn.code}: ${warn.out}`,
@@ -263,7 +272,7 @@ Deno.test({
       // this import's specifier — it must appear in no message.
       await Deno.writeTextFile(
         file,
-        'import { readTextFile } from \'std:fs\'\nprint("the story")\n',
+        "import { readTextFile } from 'std:fs'\nprint(\"the story\")\n",
       );
       const { code, out } = await run(["check", file, "--json"]);
       if (code !== 1) throw new Error(`expected exit 1, got ${code}: ${out}`);
@@ -304,7 +313,11 @@ Deno.test({
       const cases: [string, string, string][] = [
         ["let x = (\n", "expected an expression", "parse"],
         ['const x: i32 = "s"\nprint(x)\n', "cannot assign string", "type"],
-        ['import { a } from "./nope"\nprint(1)\n', "Cannot resolve import", "import"],
+        [
+          'import { a } from "./nope"\nprint(1)\n',
+          "Cannot resolve import",
+          "import",
+        ],
         ["let y = 1\nprint(y)\n", "never reassigned", "lint"],
         ["const z: i32 = 1\nprint(z)\n", "redundant type annotation", "type"],
       ];
@@ -316,10 +329,14 @@ Deno.test({
         const d = diags.find((x) => x.message.includes(frag));
         if (!d) throw new Error(`no diagnostic matching "${frag}": ${out}`);
         if (d.stage !== stage) {
-          throw new Error(`want stage "${stage}" for "${frag}", got "${d.stage}": ${out}`);
+          throw new Error(
+            `want stage "${stage}" for "${frag}", got "${d.stage}": ${out}`,
+          );
         }
         for (const other of diags) {
-          if (!other.stage) throw new Error(`a diagnostic carries no stage: ${out}`);
+          if (!other.stage) {
+            throw new Error(`a diagnostic carries no stage: ${out}`);
+          }
         }
       }
     });
@@ -332,12 +349,13 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // A live emit-side refusal (`scripts/capability-probes/map-union-member-under-fn-type.vl`):
-      // `vl check` accepts it and the emitter refuses the map union member.
+      // A live emit-side refusal (`scripts/capability-probes/length-of-list-holding-a-generic-function.vl`):
+      // `vl check` accepts it and the emitter refuses the `.length` (D15010).
       await Deno.writeTextFile(
         file,
-        "type Circle = { r: i32 }\ntype Sq = { s: i32 }\ntype K = Circle | Sq\n" +
-          "function f(h: () => ({[string]: i32} | K)): i32 { 1 }\nprint(f(() => Map()))\n",
+        "function id<T>(x: T): T { x }\nfunction use(ys) { print(ys.length) }\n" +
+          "function take(a) {\n  const xs = [a]\n  use(xs)\n" +
+          '  print(xs[0]("abc").length + xs[0](2))\n}\ntake(id)\n',
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
@@ -356,11 +374,15 @@ Deno.test({
 // never checked, so a caller batching a file list cannot tell the two apart —
 // which is what `tests/selfhost_native_align_test.ts` needs to grade a case.
 Deno.test({
-  name: "check --batch --json: one record per file, in argv order, exit per file",
+  name:
+    "check --batch --json: one record per file, in argv order, exit per file",
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      await Deno.writeTextFile(`${dir}/bad.vl`, 'const x: i32 = "s"\nprint(x)\n');
+      await Deno.writeTextFile(
+        `${dir}/bad.vl`,
+        'const x: i32 = "s"\nprint(x)\n',
+      );
       await Deno.writeTextFile(`${dir}/ok.vl`, "print(1)\n");
       const { code, out, err } = await run([
         "check",
@@ -378,7 +400,11 @@ Deno.test({
         throw new Error(`records are not in argv order: ${out}`);
       }
       if (recs[0].exit !== 1 || recs[1].exit !== 0) {
-        throw new Error(`want per-file exits 1 then 0, got ${recs[0].exit} and ${recs[1].exit}`);
+        throw new Error(
+          `want per-file exits 1 then 0, got ${recs[0].exit} and ${
+            recs[1].exit
+          }`,
+        );
       }
       if (recs[1].diagnostics.length !== 0) {
         throw new Error(`the clean file must carry no diagnostics: ${out}`);
@@ -391,7 +417,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "check --batch --json: an unreadable entry is a record, not a silent skip",
+  name:
+    "check --batch --json: an unreadable entry is a record, not a silent skip",
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
@@ -407,11 +434,15 @@ Deno.test({
       if (code !== 2) throw new Error(`expected exit 2, got ${code}: ${out}`);
       const recs = parseBatch(out);
       if (recs.length !== 2) {
-        throw new Error(`expected a record for BOTH paths, got ${recs.length}: ${out}`);
+        throw new Error(
+          `expected a record for BOTH paths, got ${recs.length}: ${out}`,
+        );
       }
       const gone = recs[1];
       if (gone.exit !== 2 || gone.diagnostics[0]?.stage !== "read") {
-        throw new Error(`want exit 2 at stage "read" for the missing path: ${out}`);
+        throw new Error(
+          `want exit 2 at stage "read" for the missing path: ${out}`,
+        );
       }
     });
   },
@@ -456,10 +487,17 @@ Deno.test({
       for (let i = 0; i < names.length; i++) {
         const want = alone.get(names[i])!;
         const got = recs[i];
-        if (JSON.stringify(want) !== JSON.stringify({ exit: got.exit, diagnostics: got.diagnostics })) {
+        if (
+          JSON.stringify(want) !==
+            JSON.stringify({ exit: got.exit, diagnostics: got.diagnostics })
+        ) {
           throw new Error(
-            `${names[i]} differs batched vs alone\n  alone: ${JSON.stringify(want)}\n` +
-              `  batch: ${JSON.stringify({ exit: got.exit, diagnostics: got.diagnostics })}`,
+            `${names[i]} differs batched vs alone\n  alone: ${
+              JSON.stringify(want)
+            }\n` +
+              `  batch: ${
+                JSON.stringify({ exit: got.exit, diagnostics: got.diagnostics })
+              }`,
           );
         }
       }

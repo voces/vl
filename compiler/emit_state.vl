@@ -11,8 +11,7 @@ import { declOrigOf, identDeclOf } from "./symbols"
 // minted only when the program uses the feature, so an unused feature shifts no
 // index); and arena-index sidecars (a `*TyIx` column parallels a name column with a
 // resolved `T.tys` index, padded -1 so a skipped mint falls back to the name
-// path, emptied at the top of `emitProgram`). The expected-type seeds are `ExpCtx`'s,
-// private to `wasmEmit.vl`.
+// path, emptied at the top of `emitProgram`).
 
 // ── binary writer (layer 1) ── the only place bytes are appended, one packed `u8[]`
 // element per byte. State is module-global `let`s (no closures), and `wTarget(buf)`
@@ -158,6 +157,12 @@ export let gInitProgAfter: Map<i32, i32> = Map()
 // guarded initializer's `globalStmts` position + 1), or -1 when none is.
 export let gInitAny = false
 export let gInitProgIdx = -1
+// Per guarded global with no initializer, the ordinal of the i32 global its first write sets to
+// 1, else -1: no initializer can overwrite it later, so it holds its value from that write on
+// (D14361). The globals trail the progress cell, from `gInitBitBase`; `gInitBitN` of them.
+export let gInitBitIdx: i32[] = []
+export let gInitBitBase = -1
+export let gInitBitN = 0
 // The top-level position the start function is lowering, or -1 outside it.
 export let gInitStartOrd = -1
 // The module of each per-module initialisation function the start calls, in function-index
@@ -228,6 +233,9 @@ export let emitCurStmtIx = -1
 // not guess one — after a module merge the arena holds several `Program` nodes (D661).
 export let emitRootIx = -1
 export let emitErrAt = -1
+// The statement or function cursor at the first failure, the anchor a diagnostic falls back to
+// when `emitErrAt` is a node minted after parsing that took no anchor of its own (D15155).
+export let emitErrCursorAt = -1
 // The emit-time body-span table: one row per stretch of code section the emitter
 // can name — its arena node, `fnStmts` position, and `[start, end)` byte range in
 // the finished module. Diagnostics only, since a refused module reports a byte
@@ -451,16 +459,23 @@ export let fRetStructIdx: i32[] = []
 // `S[]`/`N[]` return annotation's element), or "". Lets a ref-list-returning call resolve
 // its distinct element-type table slot.
 export let fRetRArrElem: string[] = []
+// Parallel to `fnNames`: the ref-list row an inferred list result is built at, recorded once by
+// `computeRetInference` from the rows and function sets of every value it returns; -1 where none
+// is recorded, -2 where the returned values disagree on it (D15203).
+export let fRetRListRow: i32[] = []
 // Parallel to `fnNames`: `1` if the i-th function returns a boolean (declared, or
 // inferred by `computeRetInference`). Drives the `print` import choice for a call
 // argument, since a bool rides an i32 at the wasm level. Not folded into `fRetKind`:
 // `VKind` has no `bool` member, so this stays a side channel beside the kind.
 export let fRetBool: i32[] = []
-// Parallel to `fnNames`: the stored return kind, a single `VKind` slot folding
-// several per-family flag tables. Seeded by `buildFnMap`, then refined by
-// `computeRetInference`'s fixed point (`criSetRetKind`). `"i32"` means no non-i32
-// fact: plain i32, boolean (`fRetBool`), void (`fRetVoid`) and variant returns all read it.
+// Parallel to `fnNames`: the stored return kind, seeded by `buildFnMap` and refined by
+// `computeRetInference` (`criSetRetKind`). `"i32"` means no non-i32 fact: plain i32, boolean,
+// void and variant returns read it, and so does an annotated `i64[]`, `u8[]` or `f32[]` result,
+// so it is not every list result's lowered kind; the rep of `fRecRetTy` is.
 export let fRetKind: VKind[] = []
+// Parallel to `fnStmts`: the result each function's recorded type gives it (`fnRecordedRetTy`),
+// banked by `synthRecordedRetAnnots` ahead of `buildFnMap#2`; -1 where none is recorded.
+export let fRecRetTy: i32[] = []
 // Parallel to `fRetKind`: 1 when this function's un-annotated return yields a
 // literal-union atom (an interned i32 id) rather than a plain i32 — both reps are
 // i32, so a reader of only `fRetKind` cannot tell `print(f())` needs the atom-member
@@ -827,7 +842,7 @@ export let sRowDecl: i32[] = []
 export let sFieldNames: string[] = []
 export let sFieldStart: i32[] = []
 export let sFieldCount: i32[] = []
-// The field codes: the storage kind `sFieldTypes` and `uFieldTypes` record per field, which
+// The field codes: the storage kind `sFieldTypes` and `armFieldTypes` record per field, which
 // `pushFieldStorage` turns into a valtype. Integers because they live in i32 tables and in
 // the object-literal order stash (`100 + code`).
 export const FC_I32 = 0            // `i32`, `boolean` and a literal-union atom
@@ -971,7 +986,7 @@ export let rlElemName: string[] = []
 export let rlElemKey: i32[] = []
 // Arena-index sidecar per ref-list slot, recorded by `rlInternName` from the stored
 // spelling (destringify D5-final): the structural input `rlElemName` readers
-// (`nullablePartOf`, `refArrElemName`, `structIdxOfElemName`) use instead of re-deriving
+// (`nullablePartOf`, `refArrElemName`, `structIdxOfElemNameTy`) use instead of re-deriving
 // structure by string surgery. -1 also covers a spelling neither the nominal nor the annotation path resolves.
 export let rlElemTyIx: i32[] = []
 // Per type-annotation node: the ref-list row the node's ref-array spelling interned,
@@ -1247,7 +1262,7 @@ export let gHelpRvGet = -1
 export let gHelpRvLen = -1
 export let rvUnionSlot = -1
 export let rvSrcSlot: i32[] = []
-export let rvVariant: i32[] = []
+export let rvTag: i32[] = []
 export let rvNul: i32[] = []
 export let rvViewTy: i32[] = []
 
@@ -1492,15 +1507,22 @@ export let uVarSTwin: i32[] = []
 // to it (DECISIONS.md, "A record has one row; a union arm is a reference to it").
 export let uVarRow: i32[] = []
 
-// Variant `vi`'s heap type: its row's, or its tag-mate's row's for an arm with none (D1023).
-// -1 for an index past `uVarRow`, which is empty until the union heaps are assigned.
-export function variantHeap(vi: i32): i32 {
+// Variant `vi`'s struct row: its own, or its tag-mate's for an arm with none (D1023). -1 for an
+// index past `uVarRow`, which is empty until the union heaps are assigned, or for no row.
+export function variantRowOf(vi: i32): i32 {
   if vi < 0 || vi >= uVarRow.length { return -1 }
   let r = uVarRow[vi]
   if r < 0 && vi < uVarTwin.length && uVarTwin[vi] < vi {
     r = uVarRow[uVarTwin[vi]]
   }
   if r < 0 || r >= sHeapIdx.length { return -1 }
+  r
+}
+
+// Variant `vi`'s heap type: its struct row's, or -1 where `variantRowOf` has none.
+export function variantHeap(vi: i32): i32 {
+  const r = variantRowOf(vi)
+  if r < 0 { return -1 }
   sHeapIdx[r]
 }
 // Value unions (`i32 | null`, `string | i32`, ...): a scalar/string-atom union boxes
@@ -1542,36 +1564,12 @@ export let vbI64Idx = 0
 export let vbF32Idx = 0
 export let vbF64Idx = 0
 export let vbV128Idx = 0
-// Flat multi-struct field table (union variant structs), parallel to `uVariants`:
-// variant struct `i` owns the field names `uFieldNames[uFieldStart[i] ..
-// + uFieldCount[i]]`, in declaration order. A flat backing store sidesteps a
-// `string[][]`, which the codebase avoids. Built by `collectU`.
-export let uFieldNames: string[] = []
+// Union arm `i`'s fields are the `uFieldCount[i]` field-table entries from `uFieldStart[i]`: the
+// staging lists' while the arms are collected, then its struct row's (`uVarFieldRow`).
 export let uFieldStart: i32[] = []
 export let uFieldCount: i32[] = []
-// Parallel to `uFieldNames`: each variant field's wasm-type code (`0` = i32/boolean,
-// `3` = string). A string variant field lowers to a non-null `(ref $sTypeIdx)`.
-export let uFieldTypes: i32[] = []
-// Parallel to `uFieldTypes`: a ref-list variant field's element type-NAME, "" otherwise.
-export let uFieldElemName: string[] = []
-// Parallel to `uFieldTypes`: the variant field's own canonical type text (`"i32"`,
-// `"boolean"`, `"{[string]:i32}"`) — its identity, where the code column is only its
-// storage (`i32`/`boolean` share code 0). `variantFieldTysEq` reads this column: two
-// arms that merely store alike are different variants; two that name the same type are one, folded by the twin machinery.
-export let uFieldTyText: string[] = []
-// D1023 — the discriminant column, parallel to `uFieldTypes`: the arena type of a
-// variant field whose declared type is a literal set, else -1. `uFieldTyText` softens
-// a literal set to its base type, so two arms differing only in a multi-member set
-// compared equal and folded as layout twins without it; both readers ask `tyLitSetMemberLexes` on demand.
-export let uFieldLitTyIx: i32[] = []
-// The `sFieldElemTyIx` sidecar for VARIANT fields (destringify D5), recorded by
-// `recordUFieldElemRowTy`.
-export let uFieldElemTyIx: i32[] = []
-// The `sFieldElemKeyKind` key column for variant fields (B6b) — see that column's
-// header for why a map field row that carries only `V` cannot resolve its map struct.
-export let uFieldElemKeyKind: i32[] = []
-// The collect-window staging of union-arm fields: the variant field columns name these lists
-// until the arms adopt their rows, then the struct-row lists. Emptied at each adoption.
+// The collect-window staging of union-arm fields, parallel and indexed by `uFieldStart` until the
+// arms adopt their rows. Emptied at each adoption.
 export let armStageNames: string[] = []
 export let armStageTypes: i32[] = []
 export let armStageElemName: string[] = []
@@ -1583,20 +1581,31 @@ export let armStageLitTyIx: i32[] = []
 export let armsAdopted = false
 // `uVarFieldRow[i]` is the struct row arm `i`'s fields are, or -1 before adoption.
 export let uVarFieldRow: i32[] = []
-// The struct-row homes of the arm-only facts (`uFieldTyText`, `uFieldLitTyIx`), padded to the
+// The struct-row homes of the arm-only facts (`armFieldTyText`, `armFieldLitTyIx`), padded to the
 // field table with "" and -1 where no arm's field is.
 export let sFieldTyText: string[] = []
 export let sFieldLitTyIx: i32[] = []
-// Point the variant field columns at the struct-row lists: an adopted arm's fields are its row's.
-export function armRowAlias() {
-  uFieldNames = sFieldNames
-  uFieldTypes = sFieldTypes
-  uFieldElemName = sFieldElemName
-  uFieldElemTyIx = sFieldElemTyIx
-  uFieldElemKeyKind = sFieldElemKeyKind
-  uFieldTyText = sFieldTyText
-  uFieldLitTyIx = sFieldLitTyIx
-  0
+// An arm field column: the staging list while the arms are collected, the struct rows' after.
+export function armFieldNames(): string[] {
+  if armsAdopted { sFieldNames } else { armStageNames }
+}
+export function armFieldTypes(): i32[] {
+  if armsAdopted { sFieldTypes } else { armStageTypes }
+}
+export function armFieldElemName(): string[] {
+  if armsAdopted { sFieldElemName } else { armStageElemName }
+}
+export function armFieldElemTyIx(): i32[] {
+  if armsAdopted { sFieldElemTyIx } else { armStageElemTyIx }
+}
+export function armFieldElemKeyKind(): i32[] {
+  if armsAdopted { sFieldElemKeyKind } else { armStageElemKeyKind }
+}
+export function armFieldTyText(): string[] {
+  if armsAdopted { sFieldTyText } else { armStageTyText }
+}
+export function armFieldLitTyIx(): i32[] {
+  if armsAdopted { sFieldLitTyIx } else { armStageLitTyIx }
 }
 // Empty the staging lists once every staged arm has adopted its row.
 export function armStageClear() {
@@ -1904,6 +1913,10 @@ export let monoGradualAsScalar: {[i32]: boolean} = Map()
 export let monoGradualRetPinned = false
 // The root statement list, for the per-instance map/inference rebuilds.
 export let monoProgStmts: i32[] = []
+
+// Per delivery node the tag decision recorded as a closure from a one-member set, the lifted
+// instance of its member the emitter builds that closure from (`monoCloCoerceBuild`).
+export let monoCloCoerceFe: Map<i32, i32> = Map()
 
 // `fnStmtsPosOf`'s index: arena node → its first `fnStmts` position, and → its first
 // `monoOrigNode` position, each valid only where its stamp equals `fnPosEpoch`. Pushes extend

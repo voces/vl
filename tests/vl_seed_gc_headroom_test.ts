@@ -7,10 +7,13 @@
 // collection leaving more than 75% of a semispace live (`SeedGcHeadroom`,
 // scripts/vl-host/src/main.rs; docs/internals/perf/gc-heap-policy-2026-09.md §4).
 //
-// The workload is `vl check compiler/check_relate_core.vl` at the default first heap (128 MiB a
-// semispace), whose live set passes the 96 MiB the policy grows at: 4 and 41 collections on
-// 2026-11-01. `emit_base.vl` was the workload until a ~1 MiB drop in its live set took its
-// policy-off count from 32 to 10, inside `MAX_DEFAULT`; this one read 41 on both seeds. The
+// The workload is `vl check compiler/emit_elab.vl` at the default first heap (128 MiB a
+// semispace), whose live set crosses the 96 MiB the policy grows at: 6 collections, and 30 to
+// 32 with the policy off across six seeds and three checkout path lengths on 2026-11-04. `wasmEmit.vl` was the workload until its policy-off count fell from 46–142 to
+// 21–31, 2.3–3.4x against its 9; `typecheck.vl`, `check_relate_core.vl` and `emit_base.vl`
+// before it fell the same way. A target whose live
+// set sits just under a semispace is a cliff, so each one is graded across seeds and sources,
+// not on one (the PR body of the change that chose it). The
 // default heap is the engine configuration every other compile shares, so its
 // `.cwasm` is already warm; a pinned heap was its own configuration and re-JITted the seed
 // (about 13 s) on every new seed. Three bounds: the default
@@ -33,16 +36,19 @@ if (!ENABLED) {
   );
 }
 
-const TARGET = `${ROOT}/compiler/check_relate_core.vl`;
+// Relative, run from ROOT: the policy-off count moves with the checkout path's length (24 to 28
+// absolute against 30 to 32 relative), so the test does not read its own path.
+const TARGET = "compiler/emit_elab.vl";
 
-// 4 at the time of writing; loose so a compiler change that moves the live set cannot red it.
+// 6 at the time of writing; loose so a compiler change that moves the live set cannot red it.
 const MAX_DEFAULT = 12;
-// 41 / 4 at the time of writing.
+// 30 / 6 at the time of writing, 30–32 / 6 across six seeds and three checkout path lengths.
 const MIN_SPREAD = 3;
 
 async function collections(grow: string, label: string): Promise<number> {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: ["check", TARGET, "--compiler", COMPILER],
+    cwd: ROOT,
     stdout: "piped",
     stderr: "piped",
     // The collector and first heap are pinned, not inherited: a caller that sourced

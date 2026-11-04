@@ -76,7 +76,7 @@ import {
   nodeTyIxOf,
   nodeTyMapKeyKindSpan,
 } from "./check_node_tys"
-import { inferRetFnKey, recordNodePin } from "./check_side_rows"
+import { inferRetFnKey } from "./check_side_rows"
 import { MAP_KEY_STR, isValueUnionName } from "./check_ty_rep"
 import {
   T,
@@ -87,6 +87,7 @@ import {
   TyObj,
   TyPrim,
   tyAt,
+  tyBearsNull,
   tyIsNullableLitUnion,
   tyMutEpoch,
   tyPrimNameOf,
@@ -128,7 +129,7 @@ import {
   mvArmKeyName,
   mvSlotByValNameKArm,
 } from "./emit_mv_slots"
-import { globalLetOfSid, variantIndexOf } from "./emit_narrow_slots"
+import { globalLetOfSid, variantIndexOf } from "./emit_local_slots"
 import {
   exprIsIfStmt,
   globalIsNonConst,
@@ -140,7 +141,6 @@ import {
   mvSlotOfValNameTyKArm,
   nodeMapValTyIx,
   nodeRepIs,
-  repRowOfName,
   repRowOfTyStruct,
   repShadowAddReason,
   repShadowOn,
@@ -155,7 +155,7 @@ import {
   mvDeclNameOfValTy,
   nulScalarListKind,
   structIndexOfTypeName,
-  structIndexOfTypeNameTy,
+  structRowOfRecordTy,
   tyIsNulLitUnionArr,
 } from "./emit_shape_rows"
 import {
@@ -167,13 +167,12 @@ import {
   LBK_STR_LIST,
   VKind,
   cboxReadsCell,
-  emitCurFnIx,
-  fnParent,
-  fnStmtsIndexOf,
+  fRecRetTy,
+  fRetKind,
+  fnStmtsPosOf,
   localIsRef,
   localSlotOfDecl,
   sFieldCount,
-  sIsRefRow,
   sNames,
   sTyIx,
   uVariants,
@@ -241,6 +240,18 @@ export function fnRetNullBearing(fnIx: i32) {
       return inferRetBearsNull(irk)
     }
     if inferNicheNullByName(irk) != "" { return true }
+    // A nullable map is lowered as its own result kind, whose `null` `emitNullForRet` emits (D2498).
+    const mp = fnStmtsPosOf(fnIx)
+    if mp >= 0 && mp < fRetKind.length && fRetKind[mp] == "nulmap" {
+      return true
+    }
+    // A clone the inferred-return table does not key (an instance's lambda) answers from its
+    // recorded result, where that is a nullable closure.
+    const rp = fnStmtsPosOf(fnIx)
+    const rr = if rp >= 0 && rp < fRecRetTy.length { fRecRetTy[rp] } else { -1 }
+    if rr >= 0 && rr < T.tys.length && tyBearsNull(rr) {
+      if tyAt(nonNullTy(rr)) is TyFunc { return true }
+    }
   }
   false
 }
@@ -286,7 +297,7 @@ export function assignTargetSpills(asgIx: i32): boolean {
   if t < 0 { return false }
   if !(nodeAt(t) is Member || nodeAt(t) is Index) { return false }
   const vt = nodeTyIxOf(asgIx)
-  if nodeAt(v) is NullLit { return !asgTargetIsCell(t) && !asgFrameIsClosure() }
+  if nodeAt(v) is NullLit { return true }
   if vt < 0 || vt >= T.tys.length { return false }
   if tyAt(vt) is TyMap { return !asgTargetIsCell(t) }
   const nt = tyAt(nonNullTy(vt))
@@ -300,20 +311,6 @@ function asgTargetIsCell(t: i32): boolean {
   const cell = nodeAt(tn.idxArr)
   if !(cell is Ident) { return false }
   cboxReadsCell(tn.idxArr)
-}
-
-// Whether the function a tail is classified in is a lifted lambda or a nested function: the
-// one `computeVoidFns` stages, else the one being lowered; false when neither is set.
-function asgFrameIsClosure(): boolean {
-  let f = tailSelfFnIx
-  if f < 0 { f = emitCurFnIx }
-  if f < 0 || f >= P.nodes.length { return false }
-  const fn = nodeAt(f)
-  if !(fn is FuncDecl) { return false }
-  const nm = fn.fnName
-  if nm.length >= 8 && nm.slice(0, 8) == "__lambda" { return true }
-  const pos = fnStmtsIndexOf(f)
-  pos >= 0 && pos < fnParent.length && fnParent[pos] >= 0
 }
 
 // The function `computeVoidFns` is classifying, or -1: its own call in tail position yields
@@ -595,12 +592,12 @@ export function nulBaseStructRow(tyIx: i32): i32 {
 function namedRowOfTy(ty: i32): i32 {
   let s = 0
   while s < sTyIx.length {
-    if sTyIx[s] == ty && !sIsAnonRow(s) && !sIsRefRow(s) { return s }
+    if sTyIx[s] == ty && !sIsAnonRow(s) { return s }
     s = s + 1
   }
   let q = 0
   while q < sTyIx.length {
-    if sTyIx[q] >= 0 && !sIsAnonRow(q) && !sIsRefRow(q) {
+    if sTyIx[q] >= 0 && !sIsAnonRow(q) {
       if tySame(sTyIx[q], ty) { return q }
     }
     q = q + 1
@@ -797,9 +794,7 @@ export function synthTypeRef(name: string, pos: i32) {
 // See `recordClonedNodeTyFb` for the measurement that fixes this precedence.
 export function synthTypeRefFb(name: string, pos: i32, tyFb: i32) {
   const n = mkTypeRef(name, pos)
-  const pin = pinKindOfName(name)
-  recordNodePin(n, pin)
-  recordClonedNodeTyFb(n, name, pin, tyFb)
+  recordClonedNodeTyFb(n, name, pinKindOfName(name), tyFb)
   n
 }
 
@@ -809,24 +804,15 @@ export function synthTypeRefTy(name: string, pos: i32, tyIx: i32) {
   const n = mkTypeRef(name, pos)
   const root = tyTsExact(tyIx)
   if root >= 0 { setAnnTs(n, root) }
-  const pin = pinKindOfNameTy(name, tyIx)
-  recordNodePin(n, pin)
+  // A pin kind is read only where the type is unknown.
+  const pin = if tyIx >= 0 { PIN_NONE } else { pinKindOfName(name) }
   recordClonedNodeTyKnown(n, name, pin, tyIx)
   n
 }
 
-// `pinKindOfName` for a caller holding the name's arena type `ty`, or -1: a spelled shape
-// whose type is a record is placed by its field types rather than by texts cut from `name`.
-function pinKindOfNameTy(name: string, ty: i32) {
-  if sigKeyPinPayload(name) != "" { return PIN_SIGKEY }
-  if structIndexOfTypeNameTy(name, ty) >= 0 { return PIN_ANON }
-  PIN_NONE
-}
-
-// The mint-side bridge of the pin column: which provenance, if any, the synthesized name
-// `name` carries. Every pin enters the arena through `synthTypeRef` above, so classifying
-// here covers the column completely. The anon leg is an exact-name query
-// (`isSName`) — a prefix test would also match `"#anon3[]"`, an array of an interned shape.
+// Which provenance, if any, the synthesized name `name` carries: the placeholder type a node
+// whose name does not parse takes. The anon leg is an exact-name query (`isSName`): a prefix
+// test would also match `"#anon3[]"`, an array of an interned shape.
 export function pinKindOfName(name: string) {
   if sigKeyPinPayload(name) != "" { return PIN_SIGKEY }
   if isSName(name) { return PIN_ANON }
@@ -1220,33 +1206,21 @@ export function structRowOfTy(ty: i32): i32 {
   if own >= 0 { return own }
   let q = 0
   while q < sTyIx.length {
-    if tySame(sTyIx[q], ty) && !sIsRefRow(q) { return q }
+    if tySame(sTyIx[q], ty) { return q }
     q = q + 1
   }
   -1
 }
 
-// The struct-table index for a ref-list element name, stripping a `| null` niche suffix
-// first (a nullable-struct array's slot keys on the full `"P | null"`, but the struct it
-// stores/reads is the bare `P`). Nominal first (`structIndexByName`), then the structural
-// bridge (`structIndexOfTypeName`) for an inline-shape element deduped onto its declared twin.
-export function structIdxOfElemName(name: string) {
+// The struct-table row of a ref-list element spelled `name` whose recorded type is `ty`, or -1:
+// a declared struct by name, else none for a registered union variant (its heap is
+// `variantHeap(vi)`, D63), else the row `ty`'s non-null part is stored at.
+export function structIdxOfElemNameTy(name: string, ty: i32) {
   const n = nonNulBaseOf(name)
-  // Nominal exact-name match first: unambiguous, cheap, and it moves no bytes.
-  const sbn = structIndexOfTypeName(n)
+  const sbn = structIndexByName(n)
   if sbn >= 0 { return sbn }
-  // The same nominal floor `rlElemStructRow` carries, at the second copy of this ladder
-  // (D63): a registered union variant that isn't also a registered plain struct has no
-  // struct-table row (its heap is `variantHeap(vi)`), so every structural rung below must
-  // decline rather than bridge the arm's shape onto a standalone struct row (D32, D36/D38).
   if variantIndexOf(n) >= 0 { return -1 }
-  // Consults the canon-key vocabulary (`repRowOfName` → `resolveAnnot` → `repRowOfTyStruct`)
-  // rather than the lenient fieldset scan, since it distinguishes a same-fieldset nested
-  // twin (`{f: {f: i64 | null}}` vs its inner row) by the full nested field type. After the
-  // nominal consult, before the fieldset scan: trust the arena where it covers the element.
-  const rr = repRowOfName(n, sScanLim())
-  if rr >= 0 { return rr }
-  structIndexOfTypeName(n)
+  structRowOfRecordTy(nonNullTy(ty))
 }
 
 // The ladder↔descriptor agreement oracle: per (family, ladder answer, descriptor answer)

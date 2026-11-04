@@ -413,6 +413,49 @@ const WANT_SPECIMENS: Array<[string, boolean, number, string]> = [
   ["no label", false, 0, ""],
 ];
 
+// A ROW TITLED CLOSED IS SETTLED BY ITS STATUS LINE. The status line is the one field every
+// instrument reads (`ls.vl`, the grader, this test), so a `[CLOSED …]` title over a status whose
+// first clause says only the outcome lists as open in `ls.vl --status open`: 25 rows did, until
+// their status lines took a `closed <date> · ` prefix. The settled words are read out of
+// `ls.vl`, so the two cannot drift.
+const LS = "scripts/inventory/ls.vl";
+
+/** `ls.vl`'s `SETTLED_WORDS`, parsed. */
+function settledWords(src: string): string[] {
+  const m = /const SETTLED_WORDS = \[([^\]]*)\]/.exec(src);
+  if (m === null) {
+    throw new Error(`${LS}: no \`const SETTLED_WORDS = [\` list found — update this parse`);
+  }
+  return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+}
+
+/** Whether a status's first clause (up to ` · `) names a settled word, as `rowSettled` reads. */
+function firstClauseSettled(status: string, words: string[]): boolean {
+  const low = status.toLowerCase().split(" · ")[0];
+  return words.some((w) => new RegExp(`(^|[^a-z0-9_-])${w}($|[^a-z0-9_-])`).test(low));
+}
+
+Deno.test("a row titled `[CLOSED …]` has a status line `ls.vl` counts as settled", async () => {
+  const words = settledWords(await Deno.readTextFile(LS));
+  const bad: string[] = [];
+  for (const dir of DIRS) {
+    for (const doc of await docsOf(dir)) {
+      for (const r of parseRows(await Deno.readTextFile(doc))) {
+        if (!r.title.includes("[CLOSED")) continue;
+        if (!firstClauseSettled(r.status ?? "", words)) {
+          bad.push(
+            `${doc}:${r.line}  ${r.id} — titled closed, but \`ls.vl --status open\` lists it\n` +
+              `      want: the status line's first clause to say ${words.join(" / ")} ` +
+              `(prefix \`closed <date> · \`)\n` +
+              `      got:  ${(r.status ?? "(no status line)").slice(0, 120)}`,
+          );
+        }
+      }
+    }
+  }
+  if (bad.length > 0) throw new Error(`${bad.length} closed row(s) list as open:\n${bad.join("\n")}`);
+});
+
 Deno.test("a `Want:` block is an indented block directly under its label", () => {
   const bad: string[] = [];
   for (const [name, want, labels, body] of WANT_SPECIMENS) {

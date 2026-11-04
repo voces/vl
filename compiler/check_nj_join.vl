@@ -1,5 +1,5 @@
-// Numeric join gating: which functions and calls a mixed-numeric join is held back in, and
-// the literal-only joins it lets through. Emptied by `njJoinReset`.
+// Numeric join helpers: the function whose body is being checked, whether two types could part,
+// and the literal-only joins a literal adapts in. Emptied by `njJoinReset`.
 // Does not import the checker.
 import { declTyOf } from "./check_nar_store"
 import {
@@ -12,7 +12,6 @@ import {
   ArrayLit,
   BinExpr,
   Call,
-  FuncDecl,
   Ident,
   Index,
   LetDecl,
@@ -32,7 +31,7 @@ import {
   tailPushMatchArms,
   tailValueLeaves,
 } from "./check_unconsumed"
-import { a20RetWalk, njFnReached } from "./check_nj_gate"
+import { a20RetWalk } from "./check_nj_gate"
 import {
   T,
   TY_BOOL,
@@ -62,7 +61,7 @@ import {
   tyVarRenames,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
-import { cwPeel, fnDeclIx } from "./check_write_scan"
+import { cwPeel } from "./check_write_scan"
 import {
   isNumericPrimTy,
   nonNullTy,
@@ -71,20 +70,13 @@ import {
   tyHasTyVar,
   tyHoldsNumericPrim,
 } from "./tyquery"
-import { nodeTyIxOf } from "./check_node_tys"
-import { tyIsNumUnion } from "./check_union_mint"
 import { leafIsLit } from "./check_call_retire"
 import { cFillStmtIx, canonUnionKeyTextOfTy } from "./check_inline_lit_union"
 import { canonUnionKeyAtomOfTy } from "./check_ty_rep"
 
-// The function whose body is being checked, re-checked at a pin or instantiated (`njFnGated`).
+// The function whose body is being checked, re-checked at a pin or instantiated.
 export let njFnIx = -1
 export function njFnIxSet(v: i32) { njFnIx = v }
-
-export let njGateMemo: {[i32]: boolean} = Map()
-
-// The held-back call nodes `njExprHeld` answers for.
-export let njHeldNodes: {[i32]: boolean} = Map()
 
 // The top-level statement list, captured at `checkProgram` entry so the return-inference floor
 // can reverse-map an inferred struct-union's object members to named types
@@ -170,113 +162,6 @@ export function numLitNamesStoredNonLit(
 // Whether every value the `if`, `match` or block at `ix` yields is a literal (`valueIsLitOnly`).
 export function joinArmIsLit(ix: i32): boolean { valueIsLitOnly(ix) }
 
-// Whether function `fx` joins its returns as master did, by widening: its return set holds a
-// literal arm or a held-back call, or `njFnReached`. The rule's joins are kept only where every
-// caller sees them; the rest are D3494 and D3495.
-export function njFnGated(fx: i32): boolean {
-  if fx < 0 || fx >= P.nodes.length { return false }
-  const memo = njGateMemo.get(fx)
-  if memo != null { return memo }
-  let g = false
-  // Provisional, so a cycle of returned calls reads the members not yet decided as direct.
-  njGateMemo[fx] = false
-  const fn = nodeAt(fx)
-  if fn is FuncDecl {
-    g = njFnReached(fx) || (fn.fnRet < 0 && njRetSetHeld(fn.fnBody))
-  }
-  njGateMemo[fx] = g
-  g
-}
-
-// Whether expression `ix` is the result of a call `njFnGated` holds back, or a name bound
-// only from one: its members are master's widening, so an operator, conversion or delivery the
-// rule adds is refused over it, as there. A union a direct join produced is never held.
-export function njExprHeld(ix: i32): boolean {
-  if njHeldNodes.length == 0 { return false }
-  njExprHeldAt(ix, 0)
-}
-
-function njExprHeldAt(ix: i32, depth: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length || depth > 4 { return false }
-  const e = cwPeel(ix)
-  if e < 0 || e >= P.nodes.length { return false }
-  if njHeldNodes.get(e) ?? false { return true }
-  const id = nodeAt(e)
-  if !(id is Ident) { return false }
-  // The name's declarations in the body being checked: held only when every one is.
-  let root = -1
-  if njFnIx >= 0 && njFnIx < P.nodes.length {
-    const fn = nodeAt(njFnIx)
-    if fn is FuncDecl { root = fn.fnBody }
-  }
-  const todo: i32[] = []
-  if root >= 0 {
-    todo.push(root)
-  } else {
-    for r in gRootStmts { todo.push(r) }
-  }
-  let held = false
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      const n = nodeAt(at)
-      if n is LetDecl {
-        if n.letName == id.identName {
-          if n.letKw != "const" || n.letInit < 0 { return false }
-          if !njExprHeldAt(n.letInit, depth + 1) { return false }
-          held = true
-        }
-      }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  held
-}
-
-// Notes call `ix` as one `njExprHeld` refuses when its callee is held back.
-export function njNoteHeldCall(n: Call, ix: i32, t: i32) {
-  if t < 0 || t >= T.tys.length || n.callFn < 0 { return 0 }
-  const cf = nodeAt(n.callFn)
-  if !(cf is Ident) { return 0 }
-  const d = fnDeclIx.get(cf.identName) ?? -1
-  if d < 0 { return 0 }
-  // A declared return is the union the author wrote, not a join.
-  const dn = nodeAt(d)
-  if !(dn is FuncDecl) || dn.fnRet >= 0 || !njFnGated(d) { return 0 }
-  if !tyIsNumUnion(nonNullTy(t)) { return 0 }
-  // Only a callee whose inferred return is itself a join can have mis-joined its members; one
-  // that hands back an argument (`rec<T>(v: T) { … v }`) returns that argument's own type.
-  const ft = nodeTyIxOf(d)
-  if ft < 0 || ft >= T.tys.length { return 0 }
-  const fnt = tyAt(ft)
-  if !(fnt is TyFunc) { return 0 }
-  const rt = nonNullTy(fnt.fnRet)
-  if rt < 0 || rt >= T.tys.length || !(tyAt(rt) is TyUnion) { return 0 }
-  njHeldNodes[ix] = true
-  0
-}
-
-// Whether a join of `a` and `b` in the body being checked is held back: by `njFnGated` for a
-// return set (`ret`), by `njFnReached` for any other.
-export function njJoinGated(a: i32, b: i32, ret: boolean): boolean {
-  if !njJoinMayPart(njFnIx, a, b) { return false }
-  if ret { return njFnGated(njFnIx) }
-  njFnReached(njFnIx)
-}
-
-// Whether a join of `a` and `b` in function `fx` could keep two numbers apart at all: both
-// hold a number or a type variable, and not the same numbers alone.
-export function njJoinMayPart(fx: i32, a: i32, b: i32): boolean {
-  if fx < 0 || a == b { return false }
-  const sa = njNumSig(a, 0)
-  if sa == 0 { return false }
-  const sb = njNumSig(b, 0)
-  if sb == 0 { return false }
-  sa != sb || sa >= 16
-}
-
 // The number types `t` holds as bits (`njNumNames` order from 1), plus 16 for a type
 // variable, through unions and nullables; 0 for none.
 function njNumSig(t: i32, depth: i32): i32 {
@@ -301,29 +186,6 @@ function njNumSig(t: i32, depth: i32): i32 {
 
 // The number types, in `njNumSig`'s bit order; every other primitive holds no number.
 const njNumNames: string[] = ["i32", "i64", "f32", "f64"]
-
-// Whether any value the function body at `body` returns has a literal arm, or is a call of a
-// function `njFnGated` holds back.
-function njRetSetHeld(body: i32): boolean {
-  const rets: i32[] = []
-  collectRetValues(body, rets)
-  for r in rets {
-    const leaves: i32[] = []
-    tailValueLeaves(r, leaves)
-    for l in leaves {
-      if valueIsLitOnly(l) { return true }
-      const c = nodeAt(cwPeel(l))
-      if c is Call && c.callFn >= 0 {
-        const cf = nodeAt(c.callFn)
-        if cf is Ident {
-          const d = fnDeclIx.get(cf.identName) ?? -1
-          if d >= 0 && njFnGated(d) { return true }
-        }
-      }
-    }
-  }
-  false
-}
 
 // Whether a join of `a` and `b` could keep two numbers apart: both hold a number or a type
 // variable, and not the same numbers alone (`njJoinMayPart` without the function).
@@ -751,8 +613,6 @@ export function collectRetValues(blockIx: i32, out: i32[]) {
 }
 
 export function njJoinReset() {
-  njGateMemo = Map()
-  njHeldNodes = Map()
   njFnIx = -1
   gRootStmtsSet([])
 }

@@ -26,6 +26,7 @@ import {
   adoptArmAt,
   f32LitJoinOf,
   listJoinApart,
+  markElemValue,
   markFieldValue,
   recordCtxTy,
 } from "./check_fit_rules"
@@ -37,8 +38,13 @@ import {
   voidValueSlotErr,
 } from "./check_node_rules"
 import { joinTys, keepListStorage, tErr, widenLitTy } from "./check_relate_core"
-import { elabCapLive, elabFnJoinListTy, elabFnJoinTy } from "./check_elab_cap"
-import { recListLits } from "./check_rec_rows"
+import {
+  elabCapLive,
+  elabFnJoinListTy,
+  elabFnJoinMapTy,
+  elabFnJoinTy,
+} from "./check_elab_cap"
+import { recArmListLits, recListLits, recObjLits } from "./check_rec_rows"
 import {
   T,
   TY_ERR,
@@ -46,11 +52,13 @@ import {
   TY_STR,
   TY_U8,
   TyArray,
+  TyMap,
   TyObj,
   TyUnion,
   mkArrayTy,
   mkObjTy,
   tyAt,
+  tyHoldsObjDeep,
   tyToStr,
 } from "./check_types"
 import { i32ListHas } from "./listutil"
@@ -102,7 +110,8 @@ export function checkArrayLitNode(n: ArrayLit, _ix: i32) {
     // Function elements join their sets, as an `if` join does.
     const etFixed = !valueIsFreshList(elems[ei])
     const j0 = joinTys(elemTy, et)
-    const jt = if j0 >= 0 && j0 < T.tys.length && tyAt(j0) is TyArray { elabFnJoinListTy(j0, elemTy, et) } else { elabFnJoinTy(j0, elemTy, et) }
+    const jk = if j0 >= 0 && j0 < T.tys.length { tyAt(j0) } else { null }
+    const jt = if jk is TyArray { elabFnJoinListTy(j0, elemTy, et) } else if jk is TyMap { elabFnJoinMapTy(j0, elemTy, et) } else { elabFnJoinTy(j0, elemTy, et) }
     elemTy = keepListStorage(elemTy, fixed, et, etFixed, jt)
     fixed = fixed || etFixed
     ei = ei + 1
@@ -123,12 +132,18 @@ export function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
   adoptElemLits(elems, elemTy)
   // Each element is delivered to the element type the list joins to.
-  for el in elems { recordCtxTy(el, elemTy) }
+  for el in elems {
+    recordCtxTy(el, elemTy)
+    markElemValue(el, _ix)
+  }
   if elemTy == TY_NULL { nolLitsPush(_ix) }
   if elemTy >= 0 && (tyAt(elemTy) is TyUnion || tyAt(elemTy) is TyObj) {
     ulLitNSet(ulLitN + 1)
   }
   if elemTy >= 0 && tyAt(elemTy) is TyObj && !elabCapLive() {
+    recListLits.push(_ix)
+    recArmListLits.push(_ix)
+  } else if elemTy >= 0 && tyHoldsObjDeep(elemTy) && !elabCapLive() {
     recListLits.push(_ix)
   }
   return mkArrayTy(elemTy)
@@ -161,6 +176,17 @@ function checkSpreadArrayLit(elems: i32[], ix: i32) {
     if u is TyUnion && i32ListHas(u.uMembers, TY_U8) { u8MixLitsPush(ix) }
   }
   adoptElemLits(elems, elemTy)
+  // Each element beside the spreads is delivered to the element type the list joins to.
+  for el in elems {
+    if spreadArgOf(el) < 0 {
+      recordCtxTy(el, elemTy)
+      markElemValue(el, ix)
+    }
+  }
+  // Asked once the pass is over where its parts are built, as a list without a spread is (D15371).
+  if elemTy >= 0 && tyHoldsObjDeep(elemTy) && !elabCapLive() {
+    recListLits.push(ix)
+  }
   mkArrayTy(elemTy)
 }
 
@@ -213,5 +239,11 @@ export function checkObjLitNode(n: ObjLit, ix: i32) {
     i = i + 1
   }
   objLitDupKeyErrs(fields)
-  return mkObjTy(fnames, ftys)
+  if fields.length > 0 && !elabCapLive() { recObjLits.push(ix) }
+  const oty = mkObjTy(fnames, ftys)
+  // A field holding a record is asked once the pass is over where it is built (D15181).
+  if fields.length > 0 && !elabCapLive() && tyHoldsObjDeep(oty) {
+    recListLits.push(ix)
+  }
+  return oty
 }

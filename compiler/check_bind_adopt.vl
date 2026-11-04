@@ -5,55 +5,119 @@
 import {
   ArrayLit,
   Call,
+  FieldInit,
   FuncDecl,
   Ident,
+  Index,
   LetDecl,
+  Member,
   ObjLit,
   P,
+  Param,
+  Spread,
+  TypeRef,
+  callHasTyArgs,
+  i32ToStr,
   nodeAt,
 } from "./ast"
 import {
   callBindCount,
   callBindIxAt,
   callBindNamesAt,
+  callBindRepKeyedSet,
+  callBindRepMixedAt,
+  callBindRepMixedSet,
   callBindRepTysAt,
   callBindRepTysSet,
   callBindRowOf,
   callBindTysAt,
 } from "./check_bind_rows"
-import { nodeRepTyIxOf } from "./check_core_state"
+import { nodeRepStamped, nodeRepTyIxOf } from "./check_core_state"
 import { inferQuiet } from "./check_cursor"
 import { elabCallDeclOf } from "./check_elab_cap"
-import { nodeTyIxOf } from "./check_node_tys"
+import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import { parenPeelIx } from "./check_places"
 import { recFreshDeclOf, recHeldDecl } from "./check_rec_fresh"
 import {
   recArgRepOf,
+  recArmListLits,
+  recArmListLitsSet,
+  recBuildPassTable,
+  recBuildTable,
   recBuildTyOf,
   recKeptFnDstOf,
   recListLits,
+  recListLitsLate,
+  recListLitsLateSet,
+  recObjLits,
+  recObjLitsSet,
 } from "./check_rec_rows"
 import {
+  adoptLitAt,
+  litAtDstStorage,
+  recAsgFnWidenedTy,
   recBuiltReadTy,
+  recBuiltReadTyIn,
+  recElemOfElemStamp,
+  recEnclosingFn,
+  recFieldRead,
+  recHeldElemBuilt,
+  recHeldListSpreadAdopt,
+  recHeldLitPlaceAdopt,
   recHoleIdentityArg,
+  recLitPlaceBuiltTy,
+  recReachTvAt,
+  recordRepTyAdopt,
   repStampListBuilt,
 } from "./check_fit_rules"
-import { nonNullTy } from "./tyquery"
+import { isNullTy, nonNullTy, tyHasTyVar } from "./tyquery"
 import { recSolePinArg } from "./check_record_origins"
-import { assignable, bindGenWalk, substTyDeep } from "./check_relate_core"
+import { assignable, bindGenWalk, substTyDeep, tErr } from "./check_relate_core"
+import { nodeLineOf } from "./check_capture_loss"
+import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
 import { identBoundFnDeclOf } from "./check_scopes"
+import {
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  CW_UP_ASG_LHS,
+  CW_UP_OBJ,
+  cwIxBuild,
+  cwIxKind,
+  cwIxNode,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwOccNext,
+  cwOccWalk,
+  cwPeelValue,
+} from "./check_write_scan"
 import { recFnValueLeaves } from "./check_type_shape"
-import { strListHas } from "./listutil"
+import { strListHas, strListIndexOf } from "./listutil"
 import {
   T,
   TyArray,
+  TyErr,
   TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
   TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  cUserTypes,
+  cUserTypesVer,
   mkArrayTy,
+  mkObjTy,
+  tyArrayElemIx,
   tyAt,
+  tyFieldTyOf,
   tyHasHole,
   tyMentionsErr,
   tySame,
+  tyToStr,
 } from "./check_types"
 
 // How many sole-pin identities and argument-free calls a rebuilt literal is followed through.
@@ -64,9 +128,188 @@ export function callBindAdoptReps() {
   let r = 0
   const n = callBindCount()
   while r < n {
-    const tys = cbaRow(callBindIxAt(r), callBindNamesAt(r), callBindTysAt(r))
-    if tys.length > 0 { callBindRepTysSet(r, tys) }
+    const mixed: boolean[] = [false]
+    const tys = cbaRow(
+      callBindIxAt(r),
+      callBindNamesAt(r),
+      callBindTysAt(r),
+      mixed,
+    )
+    if tys.length > 0 {
+      callBindRepTysSet(r, tys)
+      if mixed[0] { callBindRepMixedSet(r) }
+      const own = callBindTysAt(r)
+      if (
+        !mixed[0]
+        && cbaRowRepKeys(callBindIxAt(r), callBindNamesAt(r), own, tys)
+      ) {
+        callBindRepKeyedSet(r)
+      }
+      cbaAdoptLits(callBindIxAt(r), callBindNamesAt(r), tys)
+    }
     r = r + 1
+  }
+  0
+}
+
+// Whether call `ix`'s rep types `reps` can key its instance: every callee parameter whose type
+// mentions a type variable the rep row moves from `own` is rep-transparent.
+function cbaRowRepKeys(
+  ix: i32,
+  names: string[],
+  own: i32[],
+  reps: i32[],
+): boolean {
+  const decl = elabCallDeclOf(ix)
+  const f = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  const sig = if decl >= 0 { nodeTyIxOf(decl) } else { -1 }
+  const ft = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { null }
+  if (
+    !(f is FuncDecl)
+    || !(ft is TyFunc)
+    || ft.fnParamTypes.length != f.fnParams.length
+  ) {
+    return false
+  }
+  let q = 0
+  while q < names.length && q < own.length && q < reps.length {
+    if !tySame(own[q], reps[q]) {
+      let i = 0
+      while i < f.fnParams.length {
+        const pn: string[] = []
+        const pt: i32[] = []
+        bindGenWalk(ft.fnParamTypes[i], reps[q], pn, pt)
+        if (
+          strListHas(pn, names[q])
+          && !cbaParamRepTransparent(f.fnParams[i], decl, 4)
+        ) {
+          return false
+        }
+        i = i + 1
+      }
+    }
+    q = q + 1
+  }
+  true
+}
+
+// Whether parameter `par` of function `fd` only hands its value on: each read is a value `fd`
+// returns whole, an argument to a parameter that does the same, to `depth` calls (D15172), or an
+// argument to a record-annotated parameter of a non-generic function (D15185).
+export function cbaParamRepTransparent(par: i32, fd: i32, depth: i32): boolean {
+  if depth <= 0 || par < 0 || fd < 0 { return false }
+  cwIxBuild()
+  const leaves = recFnValueLeaves(fd)
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      let ok = false
+      for lf in leaves {
+        if cwPeelValue(lf) == u { ok = true }
+      }
+      if !ok && u < cwIxUpKind.length && cwIxUpKind[u] == CW_UP_ARG {
+        const c = nodeAt(cwIxUp[u])
+        const g = if c is Call && c.callFn >= 0 { identBoundFnDeclOf(c.callFn) } else { -1 }
+        const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { null }
+        const i = cwIxUpAux[u]
+        if gn is FuncDecl && i >= 0 && i < gn.fnParams.length {
+          ok = cbaParamRepTransparent(gn.fnParams[i], g, depth - 1)
+            || cbaAnnRecordParam(g, i)
+        }
+      }
+      if !ok { return false }
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  true
+}
+
+// Whether parameter `i` of the non-generic function `fd` is annotated with a record type and only
+// read for a scalar field in its own body: an argument handed there is built at that record,
+// and nothing the callee does is seen by a caller reading the value back at its own type.
+function cbaAnnRecordParam(fd: i32, i: i32): boolean {
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+  const par = f.fnParams[i]
+  const pn = nodeAt(par)
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const pt = nodeTyIxOf(par)
+  if pt < 0 || pt >= T.tys.length || !(tyAt(pt) is TyObj) { return false }
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if !recFieldRead(u) || recEnclosingFn(u) != fd { return false }
+      const m = cwIxUp[u]
+      if (
+        m < cwIxUpKind.length
+        && (cwIxUpKind[m] == CW_UP_ASG_LHS || cwIxUpKind[m] == CW_UP_OBJ)
+      ) {
+        return false
+      }
+      const mt = nodeTyIxOf(m)
+      if !cbaHoldsNoShared(mt) { return false }
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  true
+}
+
+// Whether a value of type `ty` holds no record, list or map another reader could write through.
+function cbaHoldsNoShared(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  match t {
+    TyObj | TyArray | TyMap | TyFunc => false
+    TyNullable => cbaHoldsNoShared(t.nInner)
+    TyUnion => {
+      for m in t.uMembers {
+        if !cbaHoldsNoShared(m) { return false }
+      }
+      true
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => true
+  }
+}
+
+// Builds each fresh record literal call `ix` hands to a parameter typed by a bare type variable
+// at the record the call's rep row binds it to, where the instance is built (D14816).
+function cbaAdoptLits(ix: i32, names: string[], reps: i32[]) {
+  const cn = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  const decl = elabCallDeclOf(ix)
+  const f = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  if (
+    !(cn is Call)
+    || !(f is FuncDecl)
+    || f.fnParams.length != cn.callArgs.length
+  ) {
+    return 0
+  }
+  let i = 0
+  while i < f.fnParams.length {
+    const pn = nodeAt(f.fnParams[i])
+    const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+    const a = parenPeelIx(cn.callArgs[i])
+    if pt is TypeRef && a >= 0 && a < P.nodes.length && nodeAt(a) is ObjLit {
+      let q = 0
+      while q < names.length {
+        const rt = if q < reps.length { reps[q] } else { -1 }
+        if (
+          names[q] == pt.tyName
+          && recRepWidens(nodeTyIxOf(a), rt)
+          && litAtDstStorage(a, rt)
+        ) {
+          recordRepTyAdopt(a, rt, 6)
+        }
+        q = q + 1
+      }
+    }
+    i = i + 1
   }
   0
 }
@@ -91,7 +334,19 @@ export function callArgRepTy(ix: i32, i: i32, ty: i32): i32 {
     callBindRepTysAt(r),
   )
   inferQuiet = q
-  if recRepWidens(ty, rt) || recListRepWidens(ty, rt) { rt } else { ty }
+  if !(recRepWidens(ty, rt) || recListRepWidens(ty, rt)) { return ty }
+  // In a mixed row a literal holding a held binding is built at that binding's own record (D15210).
+  if callBindRepMixedAt(r) && cbaArgHoldsHeld(ix, i) { ty } else { rt }
+}
+
+// Whether argument `i` of call `ix` is a literal holding a held binding at some reach.
+export function cbaArgHoldsHeld(ix: i32, i: i32): boolean {
+  const cn = nodeAt(ix)
+  if !(cn is Call) || i < 0 || i >= cn.callArgs.length { return false }
+  const hN: string[] = []
+  const hT: i32[] = []
+  cbaHeldInLit(parenPeelIx(cn.callArgs[i]), ix, recBuildTable(), hN, hT, 8)
+  hN.length > 0
 }
 
 // The record generic call `ix`'s result is built at: its result type under the call's rep row, where
@@ -126,18 +381,32 @@ function recListRepWidens(narrow: i32, wide: i32): boolean {
 // rep a by-rep instance takes, its rep stamp, a rebuilt literal or call, a fresh binding's build,
 // or a read out of a built container; else -1. The one answer the bind rows and mono read.
 export function recArgBuiltTyOf(a: i32, own: i32): i32 {
+  recArgBuiltTyIn(a, own, recBuildPassTable())
+}
+
+// `recArgBuiltTyOf` with containers' builds read from `tbl`; mono passes `recBuildTable()`.
+export function recArgBuiltTyIn(a: i32, own: i32, tbl: Map<i32, i32>): i32 {
   const ar = recArgRepOf(parenPeelIx(a))
   if ar >= 0 { return ar }
   // A list literal whose elements are all built at one wider record is a list of it (D14733).
   const ln = nodeAt(parenPeelIx(a))
-  if ln is ArrayLit { return recListLitBuiltTyOf(ln, own) }
+  if ln is ArrayLit { return recListLitBuiltTyOf(ln, own, tbl) }
   let rt = nodeRepTyIxOf(a)
-  if rt == own { rt = recRebuiltLeafRow(a, REC_REBUILT_DEPTH) }
-  if rt < 0 || rt == own { rt = cbaBuildTyOf(a, rt) }
+  const stamped = nodeRepStamped(a)
+  if rt == own && !stamped { rt = recRebuiltLeafRow(a, REC_REBUILT_DEPTH) }
+  if rt < 0 || (rt == own && !stamped) { rt = cbaBuildTyOf(a, rt) }
   // A read out of a container its stores build at another record is stored there.
-  if rt < 0 || rt == own {
-    const br = recBuiltReadTy(parenPeelIx(a))
+  if rt < 0 || (rt == own && !stamped) {
+    const br = recBuiltReadTyIn(parenPeelIx(a), tbl)
     if br >= 0 { rt = nonNullTy(br) }
+  }
+  // A call handing its argument back is built where that argument is (D14811).
+  if rt < 0 || (rt == own && !stamped) {
+    const ia = cbaIdentityArg(parenPeelIx(a))
+    if ia >= 0 && ia != a {
+      const ib = recBuiltReadTyIn(parenPeelIx(ia), tbl)
+      if ib >= 0 { rt = nonNullTy(ib) }
+    }
   }
   if rt >= 0 && rt != own && rt < T.tys.length && tyAt(rt) is TyObj {
     rt
@@ -146,52 +415,442 @@ export function recArgBuiltTyOf(a: i32, own: i32): i32 {
   }
 }
 
+// The argument call `p` hands back: a hole function's identity, or a generic's sole-pin one; else -1.
+function cbaIdentityArg(p: i32): i32 {
+  const c = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if !(c is Call) || c.callFn < 0 { return -1 }
+  const ha = recHoleIdentityArg(p, identBoundFnDeclOf(c.callFn))
+  if ha >= 0 { return ha }
+  recSolePinArg(p)
+}
+
 // `recArgBuiltTyOf` for list literal `l` of type `own`: the list of the record every element is
 // built at, where that is one record wider than the element type; else -1.
-function recListLitBuiltTyOf(l: ArrayLit, own: i32): i32 {
+function recListLitBuiltTyOf(l: ArrayLit, own: i32, tbl: Map<i32, i32>): i32 {
   const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
   if !(ot is TyArray) || l.arrElems.length == 0 { return -1 }
   let r = -1
   for e in l.arrElems {
-    const et = recArgBuiltTyOf(e, ot.aElem)
+    const et = recArgBuiltTyIn(e, ot.aElem, tbl)
     if et < 0 || (r >= 0 && !tySame(r, et)) { return -1 }
     r = et
   }
   if recRepWidens(ot.aElem, r) { mkArrayTy(r) } else { -1 }
 }
 
+// `callRetRepTy` of the call `x` is, or of the call a `const` binding read `x` holds; -1 else.
+// Whether list part `x` is a call, or a `const` holding one: a fresh record nothing else shares.
+function recListFreshCall(x: i32): boolean {
+  const n = nodeAt(x)
+  if n is Call { return true }
+  if !(n is Ident) { return false }
+  const d = recHeldDecl(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return false }
+  const iv = parenPeelIx(dn.letInit)
+  iv >= 0 && iv < P.nodes.length && nodeAt(iv) is Call
+}
+
+// The call value `x` is, or the call the `const` it names holds, where it has a binding row whose
+// rep tys the late pass fills; else -1 (D15372, D15375).
+function recListCallOf(x: i32): i32 {
+  const n = nodeAt(x)
+  if n is Call { return if callBindRowOf(x) >= 0 { x } else { -1 } }
+  if !(n is Ident) { return -1 }
+  const d = recHeldDecl(x)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+  const iv = parenPeelIx(dn.letInit)
+  if iv >= 0 && nodeAt(iv) is Call && callBindRowOf(iv) >= 0 { iv } else { -1 }
+}
+
+function recListCallRepTy(x: i32, own: i32): i32 {
+  const n = nodeAt(x)
+  if n is Call { return callRetRepTy(x, own) }
+  if !(n is Ident) { return -1 }
+  const d = recHeldDecl(x)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+  const iv = parenPeelIx(dn.letInit)
+  if iv < 0 || !(nodeAt(iv) is Call) { return -1 }
+  callRetRepTy(iv, nodeTyIxOf(iv))
+}
+
+// Stamps each record literal no delivery adopted at the union arm its type is narrower than
+// (`recNarrowRecordOf`), the record such a literal is built as (DECISIONS.md "A literal names its
+// arm"). A literal whose one record is not an arm keeps its own type.
+export function recArmLitsAdopt() {
+  const lits = recObjLits
+  recObjLitsSet([])
+  ralSync()
+  if ralArmN == 0 { return 0 }
+  for ix in lits {
+    const own = if ix >= 0 && ix < P.nodes.length { nodeTyIxOf(ix) } else { -1 }
+    if own >= 0 && !nodeRepStamped(ix) {
+      const arm = recNarrowRecordOf(own)
+      if arm >= 0 && (ralIsArm[arm] ?? false) && litAtDstStorage(ix, arm) {
+        recordRepTyAdopt(ix, arm, 6)
+      }
+    }
+  }
+  const lists = recArmListLits
+  recArmListLitsSet([])
+  for l in lists { ralListAdopt(l) }
+  0
+}
+
+// Stamps record list literal `l` with the list of the arm its every element literal is built at,
+// where that is another record than the elements' own type: the list is built as the arm's list.
+function ralListAdopt(l: i32) {
+  if l < 0 || l >= P.nodes.length { return 0 }
+  const n = nodeAt(l)
+  if !(n is ArrayLit) || n.arrElems.length == 0 { return 0 }
+  let arm = -1
+  for e in n.arrElems {
+    const pe = parenPeelIx(e)
+    if pe < 0 || !(nodeAt(pe) is ObjLit) { return 0 }
+    const b = nodeRepTyIxOf(pe)
+    if b < 0 || tySame(b, nodeTyIxOf(pe)) || !(ralIsArm[b] ?? false) {
+      return 0
+    }
+    if arm >= 0 && !tySame(arm, b) { return 0 }
+    arm = b
+  }
+  if arm >= 0 && !nodeRepStamped(l) { repStampListBuilt(l, mkArrayTy(arm)) }
+  0
+}
+
+// The one declared record that closed record `own` is narrower than and stores alike, or -1:
+// where `own` is a declared record itself, or two declared records of different types widen it.
+// Arms of two unions that are one structural type are one record.
+export function recNarrowRecordOf(own: i32): i32 {
+  if own < 0 || own >= T.tys.length { return -1 }
+  const o = tyAt(own)
+  if !(o is TyObj) || tyHasTyVar(own) || tyHasHole(own) { return -1 }
+  ralSync()
+  let one = -1
+  for r in ralBySig[ralSigOf(o.objFieldNames)] ?? [] {
+    if tySame(r, own) { return -1 }
+    if recRepWidens(own, r) {
+      if one >= 0 { return -1 }
+      one = r
+    }
+  }
+  if one >= 0 && ralStoredAlike(own, one) { one } else { -1 }
+}
+
+// Every declared record by its sorted field names, each type once, for the `cUserTypes` version
+// `ralVer` read; `ralIsArm` marks the union members among them, `ralArmN` of them.
+let ralBySig: {[string]: i32[]} = Map()
+let ralIsArm: {[i32]: boolean} = Map()
+let ralArmN = 0
+let ralVer = -1
+
+function ralSync() {
+  if ralVer == cUserTypesVer { return 0 }
+  ralVer = cUserTypesVer
+  ralBySig = Map()
+  ralIsArm = Map()
+  ralArmN = 0
+  for nm in cUserTypes.keys() {
+    const t = cUserTypes[nm] ?? -1
+    const u = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if u is TyUnion && u.uMembers.length > 1 && !tyHasTyVar(t) {
+      for m in u.uMembers {
+        const k = ralAdd(m)
+        if k >= 0 && !(ralIsArm[k] ?? false) {
+          ralIsArm[k] = true
+          ralArmN = ralArmN + 1
+        }
+      }
+    }
+  }
+  for nm in cUserTypes.keys() { ralAdd(cUserTypes[nm] ?? -1) }
+  0
+}
+
+// Files closed record `t` under its field names unless a record the same as it is filed; the
+// filed one, or -1 for a type that is no closed record.
+function ralAdd(t: i32): i32 {
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -1 }
+  const r = tyAt(t)
+  if !(r is TyObj) { return -1 }
+  const sig = ralSigOf(r.objFieldNames)
+  const b = ralBySig[sig] ?? []
+  for u in b {
+    if tySame(u, t) { return u }
+  }
+  if b.length == 0 { ralBySig[sig] = b }
+  b.push(t)
+  t
+}
+
+// The field names `names` sorted, as one key.
+function ralSigOf(names: string[]): string {
+  const s: string[] = []
+  for n in names {
+    let i = s.length
+    s.push(n)
+    while i > 0 && s[i - 1] > n {
+      s[i] = s[i - 1]
+      i = i - 1
+    }
+    s[i] = n
+  }
+  let k = ""
+  for n in s { k = k + n + "," }
+  k
+}
+
+// Whether arm `arm` stores each field of record `own` as `own` does: the same type, or a `null`
+// field, which any field holding null stores. A widening is no such store: a number changes what a
+// read computes (D14493), and a nullable field is a different storage.
+function ralStoredAlike(own: i32, arm: i32): boolean {
+  const o = tyAt(own)
+  if !(o is TyObj) { return false }
+  let i = 0
+  while i < o.objFieldNames.length {
+    const ot = o.objFieldTypes[i]
+    const at = tyFieldTyOf(arm, o.objFieldNames[i])
+    if at < 0 { return false }
+    if !(tySame(ot, at) || isNullTy(ot)) { return false }
+    i = i + 1
+  }
+  true
+}
+
 // Stamps each record list literal checked this pass whose elements are all reads out of
 // containers their stores build at one other record (`recBuiltReadTy`), or calls and bindings
 // built there, with the list of that record, which the emitter builds it as.
 export function recListLitsBuild() {
+  recLitStamped = Map()
   for l in recListLits {
-    const n = nodeAt(l)
-    if n is ArrayLit {
-      let bt = -1
-      for e in n.arrElems {
-        const own = nodeTyIxOf(e)
-        const pe = parenPeelIx(e)
-        const br = recBuiltReadTy(pe)
-        // A call or a binding is built where its value is (`recArgBuiltTyOf`).
-        const valued = pe >= 0
-          && own >= 0
-          && (nodeAt(pe) is Call || nodeAt(pe) is Ident)
-        let b = if br >= 0 { nonNullTy(br) } else { -1 }
-        if br < 0 && valued { b = recArgBuiltTyOf(pe, own) }
-        const moved = b >= 0 && own >= 0 && !tySame(b, own) && tyAt(b) is TyObj
-        if !moved || (bt >= 0 && !tySame(b, bt)) {
-          bt = -2
-          break
-        }
+    if recListLitBuild(l, false) { recListLitsLate.push(l) }
+  }
+  for l in recObjLits {
+    recHeldLitPlaceAdopt(l)
+    // Every literal the place answers is stamped: a set's type spells as a closure's, so a
+    // literal of the initialiser's own function compares same and still holds a closure.
+    const fw = recAsgFnWidenedTy(l)
+    if fw >= 0 { recLitFnFieldsAt(l, fw, 0) }
+  }
+  for l in recListLits { recHeldListSpreadAdopt(l) }
+  0
+}
+
+// `recLitFnFieldsAt` from the top: record literal `l` built at record `r` (D15350).
+export function recLitFnFieldsRestamp(l: i32, r: i32) {
+  recLitFnFieldsAt(l, r, 0)
+}
+
+// Builds record literal `l` at record `r` whose function fields hold wider sets: each function
+// field value takes `r`'s field type and each nested literal is built at its field (D15306).
+function recLitFnFieldsAt(l: i32, r: i32, depth: i32) {
+  const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+  const rt = if r >= 0 && r < T.tys.length { tyAt(r) } else { null }
+  if !(ln is ObjLit) || !(rt is TyObj) || depth > 6 { return 0 }
+  for fx in ln.objFields {
+    const f = nodeAt(fx)
+    const k = if f is FieldInit { strListIndexOf(rt.objFieldNames, f.fiName) } else { -1 }
+    if f is FieldInit && k >= 0 && k < rt.objFieldTypes.length {
+      const ft = rt.objFieldTypes[k]
+      const v = parenPeelIx(f.fiValue)
+      const vn = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
+      const fa = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+      if vn is ObjLit { recLitFnFieldsAt(v, ft, depth + 1) }
+      else if fa is TyFunc { nodeTySetGrow(v, ft) }
+    }
+  }
+  recordRepTyAdopt(l, r, 6)
+}
+
+// `recListLitsBuild` over the lists it left for the rep rows, once `callBindAdoptReps` has set
+// them: a generic call's result, or a `const` holding one, is built at the call's rep row.
+export function recListLitsBuildLate() {
+  for l in recListLitsLate { recListLitBuild(l, true) }
+  recListLitsLateSet([])
+  0
+}
+
+// The literals `recListLitBuild` stamped built at another record this pass, which a literal
+// holding one is built around.
+let recLitStamped: {[i32]: boolean} = Map()
+
+// Stamps list literal `l` when every element is built at one other record, or record literal `l`
+// with each field built at another record at that record; with `late`, a generic call's rep row
+// counts too. Whether `l` waits on that rep row.
+function recListLitBuild(l: i32, late: boolean): boolean {
+  // Delivered into a built place, the literal is built where that place is (D15188, D15235).
+  const ar = recLitPlaceBuiltTy(l)
+  if ar >= 0 && !tySame(ar, nodeTyIxOf(l)) {
+    adoptLitAt(l, ar)
+    if tySame(nodeRepTyIxOf(l), ar) { recLitStamped[l] = true }
+    return false
+  }
+  const n = nodeAt(l)
+  if n is ObjLit { return recObjLitBuild(l, n, late) }
+  if !(n is ArrayLit) { return false }
+  let bt = -1
+  // Fresh literal parts, and spread list literals, take the build the other parts agree on.
+  const fresh: i32[] = []
+  const freshLists: i32[] = []
+  const owns: i32[] = []
+  let btAt = -1
+  for e in n.arrElems {
+    const pe = parenPeelIx(e)
+    const pn = if pe >= 0 && pe < P.nodes.length { nodeAt(pe) } else { null }
+    const sv = if pn is Spread { parenPeelIx(pn.spdArg) } else { -1 }
+    const svn = if sv >= 0 && sv < P.nodes.length { nodeAt(sv) } else { null }
+    if svn is ArrayLit && !(recLitStamped[sv] ?? false) {
+      freshLists.push(sv)
+    } else if (
+      (pn is ObjLit || pn is ArrayLit)
+      && !(recLitStamped[pe] ?? false)
+    ) {
+      fresh.push(pe)
+    } else {
+      const ix = if pn is Index { recElemOfElemStamp(parenPeelIx(pn.idxArr)) } else { -1 }
+      const b = if pn is Spread { recSpreadPartBuiltTy(sv) } else if ix >= 0 { mkArrayTy(ix) } else { recLitPartBuiltTy(e, late) }
+      if b == -2 { return !late }
+      if b < 0 {
+        owns.push(pe)
+      } else if bt >= 0 && !tySame(b, bt) {
+        return false
+      } else {
+        // A call's result is copied where it lands (D14817), so only a held part pins the list.
+        if !(pn is Call) { btAt = pe }
         bt = b
-      }
-      const rt = nodeRepTyIxOf(l)
-      if bt >= 0 && (rt < 0 || tySame(rt, nodeTyIxOf(l))) {
-        repStampListBuilt(l, mkArrayTy(bt))
       }
     }
   }
+  // A part held at its own storage beside one built elsewhere: the list cannot hold both (D15372).
+  if owns.length > 0 {
+    if bt >= 0 && btAt >= 0 { recListPartsApartRefuse(owns, bt, btAt) }
+    return false
+  }
+  if bt >= 0 && !nodeRepStamped(l) {
+    for f in fresh { adoptLitAt(f, bt) }
+    for f in freshLists { adoptLitAt(f, mkArrayTy(bt)) }
+    repStampListBuilt(l, mkArrayTy(bt))
+    recLitStamped[l] = true
+  }
+  false
+}
+
+// Refuses each part in `owns` of a list literal whose elements are held at their own storage,
+// where another part, at `at`, is built at `bt` and stores a field differently (D15372).
+function recListPartsApartRefuse(owns: i32[], bt: i32, at: i32) {
+  for o in owns {
+    const on = nodeAt(o)
+    // A binding of a fresh literal can be built where the list is: not refused here.
+    if recFreshDeclOf(o) >= 0 { continue }
+    const ot = if on is Spread { tyArrayElemIx(nodeTyIxOf(parenPeelIx(on.spdArg))) } else { nodeTyIxOf(o) }
+    if (
+      ot >= 0
+      && ot < T.tys.length
+      && !fieldStorageEq(ot, bt, REC_STORE_DEPTH)
+      && recListFreshCall(o)
+    ) {
+      // A call's result is fresh, so nothing is shared: a capability gap, not the design rule.
+      tErr(
+        "this record, returned by a call, is fresh and type-valid here, but not supported yet: "
+          + "it is not built where a list holding elements built as "
+          + tyToStr(bt)
+          + " (line "
+          + i32ToStr(nodeLineOf(at))
+          + ") takes it",
+        o,
+      )
+    } else if (
+      ot >= 0
+      && ot < T.tys.length
+      && !fieldStorageEq(ot, bt, REC_STORE_DEPTH)
+    ) {
+      tErr(
+        "this list holds elements built as "
+          + tyToStr(bt)
+          + " where line "
+          + i32ToStr(nodeLineOf(at))
+          + " gives them, and elements held at their own "
+          + tyToStr(ot)
+          + " here, which store a field differently; a record is shared, not copied, so one "
+          + "list cannot hold both. Copy these with an object literal",
+        o,
+      )
+    }
+  }
   0
+}
+
+// The type each element of list `x`, spread as a part of a list literal, is built at: an inner
+// list of a built list of lists (`recElemOfElemStamp`), or a record its builds record
+// (`recHeldElemBuilt`); else -1 (D15371).
+function recSpreadPartBuiltTy(x: i32): i32 {
+  const ie = recElemOfElemStamp(x)
+  if ie >= 0 { return mkArrayTy(ie) }
+  const e = recHeldElemBuilt(x)
+  if e >= 0 && e < T.tys.length && tyAt(e) is TyObj { e } else { -1 }
+}
+
+// `recListLitBuild` for record literal `l`: built at its record with each field a part built
+// elsewhere holds at that part's built type (D15181).
+function recObjLitBuild(l: i32, n: ObjLit, late: boolean): boolean {
+  const own = nodeTyIxOf(l)
+  const o = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+  if !(o is TyObj) { return false }
+  const tys: i32[] = []
+  for t in o.objFieldTypes { tys.push(t) }
+  let moved = false
+  for fx in n.objFields {
+    const fi = nodeAt(fx)
+    if fi is FieldInit {
+      const b = recLitPartBuiltTy(fi.fiValue, late)
+      if b == -2 { return !late }
+      let k = 0
+      while k < o.objFieldNames.length {
+        if o.objFieldNames[k] == fi.fiName && b >= 0 {
+          tys[k] = b
+          moved = true
+        }
+        k = k + 1
+      }
+    }
+  }
+  if moved && !nodeRepStamped(l) {
+    repStampListBuilt(l, mkObjTy(o.objFieldNames, tys))
+    recLitStamped[l] = true
+  }
+  false
+}
+
+// The record or list part `e` of a literal is built at when that is not its own type: a read out
+// of a container built elsewhere, a call or binding built where its value is, or a nested literal
+// stamped built; -1 when it is built at its own type, and -2 when it waits on a generic's rep row.
+function recLitPartBuiltTy(e: i32, late: boolean): i32 {
+  const own = nodeTyIxOf(e)
+  const pe = parenPeelIx(e)
+  if pe < 0 || own < 0 { return -1 }
+  const pn = nodeAt(pe)
+  if pn is ArrayLit || pn is ObjLit {
+    const rt = nodeRepTyIxOf(pe)
+    if (recLitStamped[pe] ?? false) && rt >= 0 && !tySame(rt, own) { return rt }
+    return -1
+  }
+  // A call the solve stamped at its own record is that record here (D15266).
+  if pn is Call && nodeRepStamped(pe) && tySame(nodeRepTyIxOf(pe), own) {
+    return -1
+  }
+  const br = recBuiltReadTy(pe)
+  let b = if br >= 0 { nonNullTy(br) } else { -1 }
+  const valued = pn is Call || pn is Ident
+  if br < 0 && valued { b = recArgBuiltTyOf(pe, own) }
+  // Only a call, or a `const` holding one, waits on a rep row; any other part answers now (D15372).
+  if b < 0 && valued && (late || recListCallOf(pe) >= 0) {
+    if late { b = recListCallRepTy(pe, own) } else { return -2 }
+  }
+  if b >= 0 && !tySame(b, own) && tyAt(b) is TyObj { b } else { -1 }
 }
 
 // Whether record `wide` is another record over the same field names as record `narrow`, which
@@ -213,11 +872,18 @@ export function recRepWidens(narrow: i32, wide: i32): boolean {
 // Row `names`/`tys0` of call `ix` with each name an argument alone bound replaced by what it
 // binds at the argument's adopted record, when that is closed and takes the old binding, which is
 // not the error type; [] when nothing changes.
-function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
+function cbaRow(
+  ix: i32,
+  names: string[],
+  tys0: i32[],
+  mixed: boolean[],
+): i32[] {
   if ix < 0 || ix >= P.nodes.length { return [] }
   const cn = nodeAt(ix)
   const decl = elabCallDeclOf(ix)
   if !(cn is Call) || decl < 0 || decl >= P.nodes.length { return [] }
+  // A call that writes its type arguments is instanced at them (D14818).
+  if callHasTyArgs(ix) { return [] }
   const sig = nodeTyIxOf(decl)
   if sig < 0 || sig >= T.tys.length { return [] }
   const f = tyAt(sig)
@@ -225,11 +891,28 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
   const tys: i32[] = []
   let moved = false
   for t in tys0 { tys.push(t) }
+  // Rows are built once the check is settled, so builds are read from the settled table.
+  const bt = recBuildTable()
+  // A type variable a held argument binds at its own type stays there (D14817).
+  const heldN: string[] = []
+  const heldT: i32[] = []
+  // One a held binding inside a literal argument binds there marks the row mixed (D15172).
+  const heldLN: string[] = []
+  const heldLT: i32[] = []
+  let h = 0
+  while h < cn.callArgs.length {
+    const ha = cn.callArgs[h]
+    if cbaHeldArg(ha) && recArgBuiltTyIn(ha, nodeTyIxOf(ha), bt) < 0 {
+      bindGenWalk(f.fnParamTypes[h], nodeTyIxOf(ha), heldN, heldT)
+    }
+    cbaHeldInLit(parenPeelIx(ha), ix, bt, heldLN, heldLT, 8)
+    h = h + 1
+  }
   let i = 0
   while i < cn.callArgs.length {
     const a = cn.callArgs[i]
     const own = nodeTyIxOf(a)
-    const rt = recArgBuiltTyOf(a, own)
+    const rt = recArgBuiltTyIn(a, own, bt)
     if rt >= 0 {
       const dN: string[] = []
       const dT: i32[] = []
@@ -243,6 +926,7 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
         while q < names.length {
           if (
             names[q] == dN[j]
+            && !strListHas(heldN, dN[j])
             && cbaBoundTo(oN, oT, dN[j], tys0[q])
             && !tyHasHole(dT[j])
             && !tyMentionsErr(tys0[q], 8)
@@ -250,6 +934,7 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
           ) {
             tys[q] = dT[j]
             moved = true
+            if strListHas(heldLN, dN[j]) { mixed[0] = true }
           }
           q = q + 1
         }
@@ -259,6 +944,55 @@ function cbaRow(ix: i32, names: string[], tys0: i32[]): i32[] {
     i = i + 1
   }
   if moved { tys } else { [] }
+}
+
+// Adds to `heldN`/`heldT` the type variable of call `call` each held binding inside literal `x`,
+// at any field or element reach, binds at its own type (`recReachTvAt`), as D14817 does for a
+// held argument; a binding with a build is not held (D15172).
+function cbaHeldInLit(
+  x: i32,
+  call: i32,
+  bt: Map<i32, i32>,
+  heldN: string[],
+  heldT: i32[],
+  depth: i32,
+) {
+  if depth <= 0 || x < 0 || x >= P.nodes.length { return 0 }
+  const n = nodeAt(x)
+  const vs: i32[] = []
+  if n is ArrayLit {
+    for e in n.arrElems { vs.push(e) }
+  } else if n is ObjLit {
+    for fx in n.objFields {
+      const fi = nodeAt(fx)
+      if fi is FieldInit { vs.push(fi.fiValue) }
+    }
+  } else {
+    return 0
+  }
+  for v in vs {
+    const p = parenPeelIx(v)
+    if p >= 0 && p < P.nodes.length && cbaHeldArg(p) {
+      const own = nodeTyIxOf(p)
+      const tv = if recArgBuiltTyIn(p, own, bt) < 0 { recReachTvAt(p, call) } else { "" }
+      if tv != "" && own >= 0 && !strListHas(heldN, tv) {
+        heldN.push(tv)
+        heldT.push(own)
+      }
+    } else {
+      cbaHeldInLit(p, call, bt, heldN, heldT, depth - 1)
+    }
+  }
+  0
+}
+
+// Whether argument `a` is a held value, a name or a read of one, rather than a fresh literal or a
+// call's result.
+function cbaHeldArg(a: i32): boolean {
+  const p = parenPeelIx(a)
+  if p < 0 || p >= P.nodes.length { return false }
+  const n = nodeAt(p)
+  n is Ident || n is Member || n is Index
 }
 
 // The record the literal binding argument `a` names is built at by the record solve
@@ -292,9 +1026,19 @@ export function recRebuiltRetRow(fd: i32, depth: i32): i32 {
   row
 }
 
+// Whether every parameter in `ps` is annotated, so a call's arguments cannot change the record
+// the callee's literals are built at.
+function recParamsAllAnnotated(ps: i32[]): boolean {
+  for px in ps {
+    const p = nodeAt(px)
+    if !(p is Param) || p.parType < 0 { return false }
+  }
+  true
+}
+
 // The record value `lf` is built at when it is an object literal adopted at another record, an
-// identity over one, a binding of one, or an argument-free call of an inferred function whose
-// results are; else -1.
+// identity over one, a binding of one, or a call of an inferred function whose parameters are all
+// annotated and whose results are; else -1.
 export function recRebuiltLeafRow(lf: i32, depth: i32): i32 {
   const lp = parenPeelIx(lf)
   if lp < 0 || lp >= P.nodes.length || depth <= 0 { return -1 }
@@ -306,36 +1050,49 @@ export function recRebuiltLeafRow(lf: i32, depth: i32): i32 {
   }
   const sp = recSolePinArg(lp)
   if sp >= 0 { return recRebuiltLeafRow(sp, depth - 1) }
-  // A binding that holds only its initializer is built where the initializer is.
+  // A binding that holds only its initializer is built where its build says (`recBuildTyOf`),
+  // else, before any pass recorded one, where the initializer is (D15172).
   if n is Ident {
     const hd = recHeldDecl(lp)
     const hn = if hd >= 0 { nodeAt(hd) } else { null }
-    if hn is LetDecl { return recRebuiltLeafRow(hn.letInit, depth - 1) }
-    return -1
+    if !(hn is LetDecl) { return -1 }
+    const bt = recBuildTyOf(hd)
+    return if bt >= 0 { bt } else { recRebuiltLeafRow(hn.letInit, depth - 1) }
   }
-  if n is Call && n.callFn >= 0 && n.callFn < P.nodes.length {
-    const ha = recHoleIdentityArg(lp, identBoundFnDeclOf(n.callFn))
-    if ha >= 0 { return recRebuiltLeafRow(ha, depth - 1) }
-  }
+  // A call the solve stamped at its own record is delivered there, whatever its function builds.
   if (
     n is Call
-    && n.callArgs.length == 0
-    && n.callFn >= 0
-    && n.callFn < P.nodes.length
+    && nodeRepStamped(lp)
+    && tySame(nodeRepTyIxOf(lp), nodeTyIxOf(lp))
   ) {
-    const cn = nodeAt(n.callFn)
-    if cn is Ident {
-      const cd = identBoundFnDeclOf(n.callFn)
-      if cd >= 0 && cd < P.nodes.length {
-        const f = nodeAt(cd)
-        if f is FuncDecl && f.fnRet < 0 && f.fnTyParams.length == 0 {
-          // A kept delivery builds the function's result at its own record.
-          const kd = recKeptFnDstOf(cd, nodeTyIxOf(lp))
-          if kd >= 0 && kd < T.tys.length && tyAt(kd) is TyObj { return kd }
-          return recRebuiltRetRow(cd, depth - 1)
-        }
-      }
-    }
+    return -1
   }
-  -1
+  // The rest is the call ladder's, which answers -1 for every kind but a call.
+  recRebuiltCallRow(lp, depth)
+}
+
+// The record call `lp` is built at: an identity's argument's, or the rebuilt row of an inferred
+// function whose parameters are all annotated; -1 for any other node.
+function recRebuiltCallRow(lp: i32, depth: i32): i32 {
+  const n = nodeAt(lp)
+  if !(n is Call) || n.callFn < 0 || n.callFn >= P.nodes.length { return -1 }
+  const ha = recHoleIdentityArg(lp, identBoundFnDeclOf(n.callFn))
+  if ha >= 0 { return recRebuiltLeafRow(ha, depth - 1) }
+  const cn = nodeAt(n.callFn)
+  if !(cn is Ident) { return -1 }
+  const cd = identBoundFnDeclOf(n.callFn)
+  if cd < 0 || cd >= P.nodes.length { return -1 }
+  const f = nodeAt(cd)
+  if (
+    !(f is FuncDecl)
+    || f.fnRet >= 0
+    || f.fnTyParams.length > 0
+    || !recParamsAllAnnotated(f.fnParams)
+  ) {
+    return -1
+  }
+  // A kept delivery builds the function's result at its own record.
+  const kd = recKeptFnDstOf(cd, nodeTyIxOf(lp))
+  if kd >= 0 && kd < T.tys.length && tyAt(kd) is TyObj { return kd }
+  recRebuiltRetRow(cd, depth - 1)
 }

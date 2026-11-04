@@ -31,22 +31,20 @@ import {
   sFieldElemNameAt,
   sScanLim,
   structIndexOfTy,
-  variantFieldElemName,
-  variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import { nameIsShapeSpanEnds, tyGroupWrapsWhole } from "./emit_base"
-import { jrBoxFits, rowFieldCode0Kind } from "./emit_join_records"
+import { recNarrowRecordOf } from "./check_bind_adopt"
+import { rowFieldCode0Kind } from "./emit_join_records"
 import { fieldCodeOfListRep } from "./emit_list_rep"
 import { isStructOfTy, mvValLowersTy } from "./emit_mv_slots"
-import { isVariantSpelling, variantIndexOf } from "./emit_narrow_slots"
+import { variantIndexOf } from "./emit_local_slots"
 import {
   MV_ARM_NOHINT,
-  repCanonId,
   repElemTyOfName,
   repNameCanonId,
   repOfTy,
+  repRowOfTyStruct,
   repVariantShapeRowOf,
-  sFieldElemTyIxAt,
 } from "./emit_rep"
 import {
   FC_CLOSURE,
@@ -58,7 +56,6 @@ import {
   FC_MAP,
   FC_NUL_CLOSURE,
   FC_NUL_LIT_UNION,
-  FC_NUL_REF_LIST,
   FC_NUL_STR,
   FC_REF_LIST,
   FC_STR,
@@ -70,15 +67,10 @@ import {
   fnStmts,
   gaeBases,
   sFieldCount,
-  sFieldElemName,
   sFieldNames,
   sFieldStart,
-  sIsRefRow,
   sNames,
   sTyIx,
-  uFieldCount,
-  uFieldElemName,
-  uFieldStart,
   uVarTyIx,
   uVariants,
   unMemAtoms,
@@ -86,9 +78,7 @@ import {
   unMemTyStart,
   unMemberSet,
 } from "./emit_state"
-import { sFieldIndex } from "./emit_struct_order"
 import { unionMemberSetOf, unionRowKeyAB } from "./emit_union_registry"
-import { variantFieldIndex } from "./emit_variant_sig"
 import { strListIndexOf } from "./listutil"
 import {
   annGenAppSpanEnds,
@@ -101,7 +91,7 @@ import {
   nameStripSpaces,
   tyTopLevelSplit,
 } from "./tyname"
-import { tyEmitNamesOf, tyEmitPrimOf } from "./tyquery"
+import { tyEmitPrimOf } from "./tyquery"
 
 // True if `name` is a single inline struct shape spanning the whole string (`{f: i32}`) —
 // its first `{`'s matching `}` is the last char, and it isn't a map spelling (`{[`). The
@@ -114,37 +104,16 @@ export function nameIsWholeSpanShape(name: string) {
   tyGroupWrapsWhole(name)
 }
 
-// Does some struct row carry exactly this `TyObj`'s field-name set? A shallow,
-// terminating structural test for "this field is a struct" — no code comparison, so a
-// recursive shape (`type Node = {next: Node | null}`) cannot loop. Ignoring field types is
-// sound here: this decides only the code (15, "a nested struct"), never which row.
+// Whether record `ty` is stored at a struct row: its own, one of its storage key, or that of the
+// one declared record it is narrower than. This decides only the code (15, "a nested struct"),
+// never which row.
 function tyHasStructRowShallow(ty: i32): boolean {
-  if ty < 0 { return false }
-  const t = tyAt(ty)
-  if t is TyObj {
-    const fnames = t.objFieldNames
-    if fnames.length == 0 { return false }
-    const lim = sScanLim()
-    let si = 0
-    while si < lim {
-      if (
-        !sIsRefRow(si)
-        && sFieldStart[si] + sFieldCount[si] <= sFieldElemName.length
-      ) {
-        if sFieldCount[si] == fnames.length {
-          let ok = true
-          let k = 0
-          while k < fnames.length {
-            if sFieldIndex(si, fnames[k]) < 0 { ok = false }
-            k = k + 1
-          }
-          if ok { return true }
-        }
-      }
-      si = si + 1
-    }
+  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyObj) { return false }
+  if structIndexOfTy(ty) >= 0 || repRowOfTyStruct(ty, sScanLim()) >= 0 {
+    return true
   }
-  false
+  const nr = recNarrowRecordOf(ty)
+  nr >= 0 && (structIndexOfTy(nr) >= 0 || repRowOfTyStruct(nr, sScanLim()) >= 0)
 }
 
 // `fieldCodeOfTy` for the matcher only (D-MATCHCODE): `fieldCodeOfTy` serves two
@@ -179,81 +148,6 @@ export function fieldCodeForMatch(ty: i32): i32 {
   -2
 }
 
-// The variant twin of `structRowOfObjFieldSet`, and specifically of
-// `variantIndexOfTypeName`'s field-set arm.
-// Asks the same field-set question of the type instead of a spelling, first match wins.
-function variantRowOfObjFieldSet(ty: i32): i32 {
-  variantRowOfObjFieldSetK(ty, false)
-}
-
-// The leniency-levelled form (D733), the variant half of `structRowOfObjFieldSet`.
-// `widen` applies `objFieldCodeWidens` in place of code equality. First-match is kept on
-// the widened pass here (unlike the struct twin, which demands uniqueness) because the
-// variant side already has one first-match authority (`objVariantName`) this can only agree with or decline.
-export function variantRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
-  if ty < 0 { return -1 }
-  const t = tyAt(ty)
-  if t is TyObj {
-    const fnames = t.objFieldNames
-    const ftys = t.objFieldTypes
-    let vi = 0
-    while vi < uVariants.length {
-      if uFieldStart[vi] + uFieldCount[vi] > uFieldElemName.length {
-        vi = vi + 1
-        continue
-      }
-      if uFieldCount[vi] == fnames.length {
-        let ok = true
-        let k = 0
-        while k < fnames.length {
-          const fj = variantFieldIndex(vi, fnames[k])
-          if fj < 0 {
-            ok = false
-          } else {
-            const want = fieldCodeForMatch(ftys[k])
-            if want >= 0 {
-              if widen {
-                if (
-                  !variantFieldCodeWidens(
-                    want,
-                    variantFieldTypeAt(vi, fj),
-                    vi,
-                    fj,
-                  )
-                ) {
-                  ok = false
-                }
-              } else if want != variantFieldTypeAt(vi, fj) {
-                ok = false
-              }
-            } else {
-              // The same leniency-with-one-tightening the struct matcher carries: uncoded
-              // fields are lenient, except a code-15 nested row checked by canonical rep.
-              if variantFieldTypeAt(vi, fj) == FC_STRUCT {
-                const rowElem = variantFieldElemName(vi, fj)
-                if rowElem != "" {
-                  const cq = repCanonId(ftys[k])
-                  let cr = repNameCanonId(rowElem)
-                  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
-                  if cq >= 0 {
-                    if cr >= 0 {
-                      if cq != cr { ok = false }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          k = k + 1
-        }
-        if ok { return vi }
-      }
-      vi = vi + 1
-    }
-  }
-  -1
-}
-
 // The declaration-identity name of an arena type — `shapeNominalOfTy`'s two arena rungs,
 // lifted out so other nominal questions can ask them without the two field-set scans that
 // follow there. Both rungs answer by declaration identity, never a guess. "" for an
@@ -265,40 +159,6 @@ export function declNominalOfTy(ty: i32): string {
   const av = repVariantShapeRowOf(ty)
   if av >= 0 { return uVariants[av] }
   ""
-}
-
-// `emit_rep.fieldCodeRefsElemHeap`, private to its own module and needed here for the
-// same reason: 15 a nested struct, 5 a ref list, 28 its `| null` niche — field codes whose
-// storage is a `(ref [null] <heap>)` the code alone doesn't name, so two rows can
-// field-set match, code-match and canon-match while still emitting different layouts.
-export function fieldCodeRefsElemHeapC(code: i32): boolean {
-  code == FC_STRUCT || code == FC_REF_LIST || code == FC_NUL_REF_LIST
-}
-
-// That field's ELEMENT, asked of the QUERY side's arena type: a ref list peels its
-// `TyArray`, the `| null` niche peels the nullable first, and a nested struct IS its own
-// element. -1 for every other code and for a type that does not have the peeled shape.
-export function fieldElemTyOfQueryTy(ty: i32, code: i32): i32 {
-  if ty < 0 { return -1 }
-  if code == FC_STRUCT { return ty }
-  let base = ty
-  if code == FC_NUL_REF_LIST {
-    const n = tyAt(ty)
-    if n is TyNullable { base = n.nInner } else { return -1 }
-  }
-  if base < 0 { return -1 }
-  const b = tyAt(base)
-  if b is TyArray { return b.aElem }
-  -1
-}
-
-// `fieldElemDeclConflict`'s union-box twin: every box field is code 16 whatever it boxes, so
-// the field-set scan matches two boxes on their code alone. Two boxes are one layout only if
-// their member SEQUENCES are, the tags being positional. Refutation-only, like its sibling.
-export function fieldBoxSetConflict(qTy: i32, si: i32, fj: i32): boolean {
-  if !tyEmitNamesOf(qTy) { return false }
-  if sFieldElemNameAt(si, fj) == "" { return false }
-  !jrBoxFits(qTy, sFieldElemTyIxAt(si, fj))
 }
 
 // The declared-row widenings `anonValueFitsField` grants an object literal's field value,
@@ -338,12 +198,6 @@ export function objFieldCodeWidens(
   fj: i32,
 ): boolean {
   fieldCodeWidensElem(qc, rc, sFieldElemNameAt(si, fj))
-}
-
-// `fieldCodeWidensElem` against a VARIANT row's field — the same relation read out of the
-// other table, so the two field-set scans cannot drift on what a widening is.
-function variantFieldCodeWidens(qc: i32, rc: i32, vi: i32, fj: i32): boolean {
-  fieldCodeWidensElem(qc, rc, variantFieldElemName(vi, fj))
 }
 
 // Whether every field a shape spelling writes as `i32` or `boolean` has that same code-0 kind
@@ -556,19 +410,6 @@ export function mvArmHintOfShapeTy(ty: i32): i32 {
   mvArmSigOfShapeTy(ty, 8)
 }
 
-// `isVariantSpelling`, then the arm whose record is the tested record's type spelled by shape:
-// same-shape records are one type, so a declared name tests the arm a pin minted by shape
-// (D5051). An arm only rendered alike (`{x: i32}` for `{x: 1 | 2}`) is not it (D4089).
-export function isVariantSpellingOfShape(variant: string, tyIx: i32): string {
-  const sp = isVariantSpelling(variant, tyIx)
-  if variantIndexOf(sp) >= 0 { return sp }
-  if tyIx < 0 || tyIx >= T.tys.length || !(tyAt(tyIx) is TyObj) { return sp }
-  const vi = variantRowOfOwnRenderTy(tyIx)
-  if vi < 0 || vi >= uVariants.length || vi >= uVarTyIx.length { return sp }
-  if !tySame(uVarTyIx[vi], tyIx) { return sp }
-  uVariants[vi]
-}
-
 // The one arm scan both keys share: the first arm that is the record `ty` or has its fields in
 // its order, each spelled alike; `exact` also keeps a literal field apart from its base, as the
 // arm's own render does. `anonOf` >= 0 keeps only an arm with no declared name that is that
@@ -690,7 +531,14 @@ export function cbRetVariantIdx(fe: i32) {
   // identity the arena can't recover (B208). The arena arm is stricter, refusing a
   // field-set collision `shapeFieldTypeCompatK` would let through (avoided by the `fRetKind` guard below).
   let vi = variantIndexOf(nm)
-  if vi < 0 { vi = variantRowOfObjFieldSet(inferRetTyIxByNode(fnStmts[fe])) }
+  if vi < 0 {
+    const rt = inferRetTyIxByNode(fnStmts[fe])
+    vi = repVariantShapeRowOf(rt)
+    if vi < 0 {
+      const nr = recNarrowRecordOf(rt)
+      if nr >= 0 { vi = repVariantShapeRowOf(nr) }
+    }
+  }
   if vi < 0 { return -1 }
   // A lambda whose inferred return the checker classified as a plain struct must not
   // collapse to a variant merely because its anonymous shape coincides with an unrelated

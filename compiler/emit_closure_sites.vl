@@ -1,6 +1,7 @@
 // `emit_closure_sites.vl` — closure sites: the result kind and signature key a closure
 // call or lambda carries, and the boolean and list-element codes of the values it passes.
 
+import { emitFailAt } from "./emit_bytes"
 import { elabNodeTyAt } from "./emit_elab"
 import {
   ArrayLit,
@@ -71,12 +72,11 @@ import {
   tyArrayElemPrimName,
   tyAt,
   tyFieldTyOf,
+  tyHasInferHole,
   tyIsLitUnion,
   tyIsNullableLitUnion,
   tyPrimNameOf,
   tyToEmitName,
-  tyToNominalName,
-  unionAliasDeclNameOfTy,
 } from "./check_types"
 import { sFieldTgtStructIdx, sFieldTypeAt } from "./emit_atom_kinds"
 import {
@@ -96,7 +96,10 @@ import {
 import {
   asgLitWidth,
   asgReadUnwidenOp,
+  bundleRecordRowOfSigs,
   callIsMapFilter,
+  callTyClosedIn,
+  calleeReturnsRecord,
   captureNamesOf,
   capturedKindOf,
   cloCallSigKey,
@@ -118,6 +121,7 @@ import {
   exprNulBool,
   exprNullableStruct,
   exprRefArray,
+  exprRepTy,
   exprString,
   exprStringArray,
   exprStruct,
@@ -199,13 +203,16 @@ import {
   tyPrimLeafListKind,
   tyScalarBackedListKind,
 } from "./emit_ref_list_kinds"
-import { repSigTokOfKind } from "./emit_rep"
+import { repOfTy } from "./emit_rep"
 import { repSigRetTokOfTy, repSigTokOfTy } from "./emit_rep_slot"
-import { globalLetOfSid } from "./emit_narrow_slots"
+import { globalLetOfSid } from "./emit_local_slots"
 import { paramTypeNodeOfRead } from "./emit_query"
-import { rlSlotByNameTwin, rlSlotsLayoutTwin } from "./emit_shape_rows"
 import {
-  annParamKindTy,
+  rlSlotByNameTwin,
+  rlSlotOfTyOrTwin,
+  rlSlotsLayoutTwin,
+} from "./emit_shape_rows"
+import {
   cloArityRepIsWide,
   drwFieldClosure,
   mfCbRetIsBool,
@@ -240,6 +247,8 @@ import { i32ListHas } from "./listutil"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { arrElemNameRaw } from "./tyname"
 import { primNameOf, tyEmitPrimOf, tyHasTyVar } from "./tyquery"
+import { fnRecordedRetTy } from "./fn_ret_shadow"
+import { vkListClass } from "./emit_list_rep"
 
 // True when the `.map` callback at `fe` produces an element riding the string list — a
 // plain `string` or the `string | null` niche, which share one wrapper and backing pair.
@@ -323,8 +332,17 @@ function criRelayJoinListTy(rx: i32, i: i32, depth: i32): i32 {
 function criRetRefListElemName(rx: i32, i: i32): string {
   const ks = rlSlotOfTy(tyRefArrElemOf(criKeptRetTy(i)))
   if ks >= 0 && ks < rlElemName.length { return rlElemName[ks] }
+  // The row the expression is stored at: its rep type's element, where that type closes; the
+  // checker's type of a read can be narrower than its storage (a field width, a nullable cell).
+  const rt = tyRefArrElemOf(exprRepTy(rx, fnStmts[i], 8))
   const nm = refListElemNameOfExpr(rx, fnStmts[i])
-  if rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(rx, fnStmts[i]))) >= 0 {
+  if rt >= 0 {
+    const ts = rlSlotOfTyOrTwin(rt)
+    if ts >= 0 && ts < rlElemName.length { return rlElemName[ts] }
+  } else if (
+    rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(rx, fnStmts[i])))
+    >= 0
+  ) {
     return nm
   }
   const rll = criRetLocalLet(rx, i)
@@ -485,10 +503,59 @@ export function fnSigIdxOfFn(fe: i32) {
   cloSigTypeIdxAt(cloSigPosOfKey(key))
 }
 
+// The list function `i`'s recorded result is, when that result is closed and covered and its rep
+// is a non-null, non-union list; null otherwise, which leaves the return expressions to classify.
+function criRecordedListKind(i: i32): VKind | null {
+  const r = fnRecordedRetTy(i)
+  if r < 0 || r >= T.tys.length || tyHasTyVar(r) || tyHasInferHole(r, 0) {
+    return null
+  }
+  const rd = repOfTy(r)
+  if rd.rdCovered != 1 || vkListClass(rd.rdKind) != 1 { return null }
+  rd.rdKind
+}
+
+// Whether function `i`'s recorded result is closed and covered, and its rep is no list and no
+// union box, so no return expression of it can be a list.
+function criRecordedNoList(i: i32): boolean {
+  const r = fnRecordedRetTy(i)
+  if r < 0 || r >= T.tys.length || tyHasTyVar(r) || tyHasInferHole(r, 0) {
+    return false
+  }
+  const rd = repOfTy(r)
+  rd.rdCovered == 1 && vkListClass(rd.rdKind) == 0 && rd.rdKind != "union"
+}
+
+// After the inference that follows mono: un-annotated function `i`, returning another call's
+// record of members, has that record's row, which mono's bundle pin mints; a named refusal when it
+// does not, so a pass moved ahead of mono fails loudly rather than declaring a closure result.
+export function criRecordRowCheck(i: i32): i32 {
+  if i < 0 || i >= fnStmts.length { return 0 }
+  const fn = nodeAt(fnStmts[i])
+  if !(fn is FuncDecl) || fn.fnRet >= 0 { return 0 }
+  const rec = calleeReturnsRecord(fnStmts[i])
+  if rec.length < 2 || bundleRecordRowOfSigs(rec) >= 0 { return 0 }
+  emitFailAt(
+    "emitProgram: a function returning a record of members has no row for the record after monomorphization",
+    fnStmts[i],
+  )
+}
+
 // Classify one valued return expression at `rx0` of the function at `fnStmts` position `i`,
 // the shared loop body of the return walk.
 export function criClassify(rx0: i32, i: i32) {
   let rx = rx0
+  // A function returning another's record as a call's value returns that record whole.
+  const rec = calleeReturnsRecord(fnStmts[i])
+  if rec.length >= 2 {
+    const row = bundleRecordRowOfSigs(rec)
+    if row >= 0 && (fRetKind[i] != "struct" || fRetStructIdx[i] != row) {
+      fRetKind[i] = "struct"
+      fRetStructIdx[i] = row
+      criChanged = true
+    }
+    return 0
+  }
   if fnCheckedRetIsMapUnion(i) || fnCheckedRetIsUnionBox(i) {
     if fRetKind[i] != "union" {
       fRetKind[i] = "union"
@@ -501,6 +568,15 @@ export function criClassify(rx0: i32, i: i32) {
     if fRetKind[i] != cmk {
       fRetKind[i] = cmk
       criChanged = true
+    }
+    return 0
+  }
+  // A result recorded at a closed non-null list is that list, whatever its return expressions'
+  // shapes; the ref list's element is named off the recorded type first.
+  const rlk = criRecordedListKind(i)
+  if rlk != null {
+    if criSetRetKind(i, rlk) && rlk == "reflist" && i < fRetRArrElem.length {
+      fRetRArrElem[i] = criRetRefListElemName(rx, i)
     }
     return 0
   }
@@ -539,11 +615,12 @@ export function criClassify(rx0: i32, i: i32) {
       criSetRetKind(i, "map")
     }
   }
-  criClassifyArenaRefList(rx, i)
+  const noList = criRecordedNoList(i)
+  if !noList { criClassifyArenaRefList(rx, i) }
   // The not-a-list guard is what separates i32 and f64 lists here: `exprArray`'s array-literal
   // case is `!arrLitIsRef` and an f64 element is not a ref, so it also claims `[1.5, 2.5]`.
   // The f64-list arm above has already set the kind, so this one skips it.
-  if !retKindIsList(fRetKind[i]) && exprArray(rx, fnStmts[i]) {
+  if !noList && !retKindIsList(fRetKind[i]) && exprArray(rx, fnStmts[i]) {
     criSetRetKind(i, "list")
   }
   criClassifyUnionNul(rx, i)
@@ -703,6 +780,8 @@ function criClassifyScalarTail(rx: i32, i: i32) {
 // scalar-backed, f64, i64, f32 and `u8` lists, then the empty `[]` hole, each filling the
 // kind (and a ref list's element name) only while no list kind is set yet.
 function criClassifyList(rx: i32, i: i32) {
+  // A result recorded at a closed type that is neither a list nor a union box takes no list rung.
+  if criRecordedNoList(i) { return 0 }
   if !retKindIsList(fRetKind[i]) && exprRefArray(rx, fnStmts[i]) {
     // Record the element type-name so the inferred functype result can resolve its ref-list
     // slot: the annotated path fills `fRetRArrElem` from the annotation, but an un-annotated
@@ -1169,13 +1248,32 @@ export function unionEqAtomKindOf(
     if eqw >= 0 { k = eqw }
     if numLitWidth(unwrapParen(otherIx), fnIx) == "i64" { k = 3 }
   }
-  // The f64-to-f32 re-encode: a float value against a union whose only float arm is
-  // `f32` is stored in the f32 box, so the compare must select that arm too.
-  if k == 4 {
+  // The f64-to-f32 re-encode: a float literal against a union whose only float arm is `f32` is
+  // stored in the f32 box, so the compare must select that arm too. An `f64` value is compared at
+  // `f64`, the arm widened to it (D15090).
+  if k == 4 && eqOtherIsNumLit(otherIx) {
     const eqw4 = unionStoreAtomKindOfSet(uSet, unionName, 4)
     if eqw4 >= 0 { k = eqw4 }
   }
   k
+}
+
+// Whether `ix` is a number literal, or one negated.
+function eqOtherIsNumLit(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = nodeAt(u)
+  match n {
+    NumLit => {
+      return true
+    }
+    Unary => {
+      return n.unOp == "-" && eqOtherIsNumLit(n.unArg)
+    }
+    // no other node is a number literal
+    StrLit | CharLit | BoolLit | NullLit | Ident | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+  }
+  false
 }
 
 // Whether `ix` is a list of booleans: typed `boolean[]`, or a literal whose first element is one.
@@ -1311,7 +1409,7 @@ export function exprIsBool(ix: i32, fnIx: i32) {
       // A field-closure call (an index-trap dispatch) classifies by the field function's
       // return: the receiver's origin resolves the exact monomorphized instance, since bool-
       // ness lives in the instance's own pinned param annotation, not the shared closure body.
-      if callee is Member {
+      if callee is Member && !callTyClosedIn(ix, fnIx) {
         if (
           drwFieldClosure(
             structIndexOfExpr(callee.memObj, fnIx),
@@ -1409,75 +1507,6 @@ function cloCallParamFnTyOf(callIx: i32, fnIx: i32): i32 {
     return ct
   }
   -1
-}
-
-// The last-resort rung of `cloCallParamUnionName`: inside a monomorphized instance the
-// callee `Ident` shares a leaf with the generic, so `nodeTyIxOf` answers a `TyFunc` no
-// union registry ever names. The lifted lambda's own `Param` node carries the substituted
-// pin instead (D426): last, since every callee resolving today takes an earlier candidate.
-function cloLamParamUnionName(calleeIx: i32, idx: i32, fnIx: i32) {
-  const cre = nodeAt(calleeIx)
-  if cre is Ident {
-    const fe = identClosureFeOfRead(calleeIx, fnIx)
-    if fe >= 0 && fe < fnStmts.length {
-      const lf = nodeAt(fnStmts[fe])
-      if lf is FuncDecl {
-        if idx >= 0 && idx < lf.fnParams.length {
-          const p = nodeAt(lf.fnParams[idx])
-          if p is Param {
-            if p.parType >= 0 {
-              const nm = tyNameOf(p.parType)
-              if nm != "" {
-                // The registration test the arena arms make, restated by the same producer:
-                // a name `annParamKindTy` keys `u` is one the registry admits, hence one
-                // `unionMemberSetOf` resolves.
-                if (
-                  annParamKindTy(nm, nodeTyAt(lf.fnParams[idx], fnStmts[fe]))
-                  == repSigTokOfKind("union")
-                ) {
-                  return nm
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  ""
-}
-
-// The union-box parameter name of value call `callIx`'s parameter `idx` — the emitter's
-// registered union name, which `emitUnionCoerce` resolves to its member set for
-// the tag choice, read off `cloCallParamFnTyOf`'s type so a hole's pin serves (D6541). "" when
-// not a union box. Not from the `$fnsig` key: its union token `u` is slot-free.
-export function cloCallParamUnionName(callIx: i32, idx: i32, fnIx: i32) {
-  const c = nodeAt(callIx)
-  if c is Call {
-    const ft = cloCallParamFnTyOf(callIx, fnIx)
-    if ft < 0 { return cloLamParamUnionName(c.callFn, idx, fnIx) }
-    const t = tyAt(ft)
-    if t is TyFunc {
-      if idx < 0 || idx >= t.fnParamTypes.length { return "" }
-      const pty = t.fnParamTypes[idx]
-      if tyIsLitUnion(pty) { return "" }
-      if tyIsNullableLitUnion(pty) { return "" }
-      // A registry lookup, not a key mint: ask the declared alias (by arena-index identity),
-      // then the nominal render, for an inline union registered under its member set. Each
-      // is kept only when `annParamKindTy`, the token producer, keys it `u`, so this arm and
-      // the ABI cannot disagree.
-      let nm = unionAliasDeclNameOfTy(pty)
-      if nm != "" {
-        if annParamKindTy(nm, pty) == repSigTokOfKind("union") { return nm }
-      }
-      nm = tyToNominalName(pty)
-      if nm != "" {
-        if annParamKindTy(nm, pty) == repSigTokOfKind("union") { return nm }
-      }
-      return cloLamParamUnionName(c.callFn, idx, fnIx)
-    }
-  }
-  ""
 }
 
 // The producer (concrete-lambda) `$fnsig` key of the function-value binding the read `readIx`

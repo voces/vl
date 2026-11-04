@@ -144,9 +144,16 @@ export function cstrOwnedBy(owner: i32, calleeFn: i32) {
   if owner == CSTR_DELIVERY_ONLY { return false }
   if owner < 0 { return !cstrOwnedStrict }
   if calleeFn == CSTR_ANYFN { return true }
-  if calleeFn == CSTR_NODECL { return true }
+  if calleeFn == CSTR_NODECL {
+    return cstrSetOwners.length == 0 || i32ListHas(cstrSetOwners, owner)
+  }
   owner == calleeFn
 }
+
+// The members of the set a call through a value of a set of functions reaches, while that call's
+// constraints are judged: the call owns theirs, not every generic's (D15066). Empty otherwise.
+export let cstrSetOwners: i32[] = []
+export function cstrSetOwnersSet(v: i32[]) { cstrSetOwners = v }
 
 // The type an un-annotated parameter takes — the single source of truth. A parameter whose
 // own body pinned it takes that type as if annotated; one nothing pinned takes a fresh
@@ -303,6 +310,86 @@ export function substSkipsForeignSig(ty: i32): boolean {
   const fd = nodeAt(d)
   if !(fd is FuncDecl) || fd.fnTyParams.length == 0 { return false }
   tyVarsOwnedBy(ty, owner, [], 64)
+}
+
+// Whether type-variable row `row` is another top-level generic's than `substSelfOwner`, which
+// declares a type parameter of the same name: the instance binding being substituted speaks for
+// its own, not for the other's (D12212).
+export function substSkipsForeignVar(row: i32): boolean {
+  if substSelfOwner == "" { return false }
+  const owner = tyVarOwnerOf(row)
+  if owner == "" || owner == substSelfOwner { return false }
+  const t = tyAt(row)
+  if !(t is TyVar) { return false }
+  topFnDeclaresTyParam(owner, t.tvName)
+    && topFnDeclaresTyParam(substSelfOwner, t.tvName)
+}
+
+// Whether type-variable row `row` belongs to a top-level generic other than `self`, one that
+// declares type parameters; false for a row no function owns, or when `self` is "".
+export function tyVarOwnedByOtherGeneric(row: i32, self: string): boolean {
+  if self == "" || row < 0 || row >= T.tys.length || !(tyAt(row) is TyVar) {
+    return false
+  }
+  const owner = tyVarOwnerOf(row)
+  if owner == "" || owner == self { return false }
+  const d = fnDeclIx[owner] ?? -1
+  if d < 0 || d >= P.nodes.length { return false }
+  const fd = nodeAt(d)
+  fd is FuncDecl && fd.fnTyParams.length > 0
+}
+
+// Whether `ty` names a type variable `name` that is not another top-level generic's than `self`
+// declaring that name (D15034).
+export function tyMentionsOwnVarNamed(
+  ty: i32,
+  name: string,
+  self: string,
+  depth: i32,
+): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyVar => {
+      if t.tvName != name { return false }
+      const o = tyVarOwnerOf(ty)
+      o == "" || o == self || !topFnDeclaresTyParam(o, name)
+    }
+    TyArray => tyMentionsOwnVarNamed(t.aElem, name, self, depth - 1)
+    TyNullable => tyMentionsOwnVarNamed(t.nInner, name, self, depth - 1)
+    TyNeg => tyMentionsOwnVarNamed(t.negTy, name, self, depth - 1)
+    TyMap => {
+      tyMentionsOwnVarNamed(t.mKey, name, self, depth - 1)
+        || tyMentionsOwnVarNamed(t.mVal, name, self, depth - 1)
+    }
+    TyObj => tysMentionOwnVarNamed(t.objFieldTypes, name, self, depth - 1)
+    TyFunc => {
+      tysMentionOwnVarNamed(t.fnParamTypes, name, self, depth - 1)
+        || tyMentionsOwnVarNamed(t.fnRet, name, self, depth - 1)
+    }
+    TyUnion => tysMentionOwnVarNamed(t.uMembers, name, self, depth - 1)
+    TyPrim | TyErr | TyLit => false
+  }
+}
+
+function tysMentionOwnVarNamed(
+  ts: i32[],
+  name: string,
+  self: string,
+  depth: i32,
+): boolean {
+  for x in ts {
+    if tyMentionsOwnVarNamed(x, name, self, depth) { return true }
+  }
+  false
+}
+
+// Whether `owner` names a top-level function declaring type parameter `name`.
+function topFnDeclaresTyParam(owner: string, name: string): boolean {
+  const d = fnDeclIx[owner] ?? -1
+  if d < 0 || d >= P.nodes.length { return false }
+  const fd = nodeAt(d)
+  fd is FuncDecl && strListHas(fd.fnTyParams, name)
 }
 
 // The owner key of declaration node `d` when it is the top-level function so named, else "".
@@ -504,7 +591,7 @@ export function tyIsHoleGenericSig(ty: i32): boolean {
 }
 
 // The recorded owner of the first type variable met in `ty`, or "" when none is met.
-function tyFirstVarOwner(ty: i32, depth: i32): string {
+export function tyFirstVarOwner(ty: i32, depth: i32): string {
   if ty < 0 || ty >= T.tys.length || depth <= 0 { return "" }
   const t = tyAt(ty)
   match t {

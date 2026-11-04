@@ -9,11 +9,18 @@ import {
   tyIsValueUnion,
 } from "./check_ty_rep"
 import {
+  T,
   TyArray,
+  TyLit,
   TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
   TyVar,
+  structNameOfTy,
   tyAt,
   tyFieldTyOf,
+  tyHasHole,
   tyIsFuncArena,
   tyIsLitUnion,
   tyIsLitUnionAlias,
@@ -28,6 +35,7 @@ import {
   sIsAnonRow,
   sScanLim,
   structIndexByName,
+  structIndexOfTy,
   structTyIxAlias,
   structTyMarkAliasable,
 } from "./emit_atom_kinds"
@@ -65,7 +73,7 @@ import {
   unionSetArmTysAB,
 } from "./emit_map_twins"
 import { nonNulBaseOf } from "./emit_map_value_slots"
-import { variantIndexOf } from "./emit_narrow_slots"
+import { variantIndexOf } from "./emit_local_slots"
 import { isNulScalarListFieldCode } from "./emit_nullable_rets"
 import {
   hcShapeSetId,
@@ -76,6 +84,7 @@ import {
   repCanonId,
   repRowId,
   repRowOfTyStruct,
+  repSlotOfTy,
   sTyIxOfName,
   sTyIxOfNameTy,
   unRowOfCanonFolded,
@@ -83,6 +92,7 @@ import {
 } from "./emit_rep"
 import {
   armFieldStructRow,
+  armTwinRowName,
   elemNameIsNominal,
   famRelayStructRow,
   fieldTypeIsDeferred,
@@ -101,7 +111,9 @@ import {
   refArrShapeKind,
   shapeFieldElemName,
   tyIsNestedScalarLeafArray,
+  tyRegGenNow,
 } from "./emit_shape_rows"
+import { memoKeyNew, memoMoved } from "./memo"
 import {
   FC_F32,
   FC_F32_LIST,
@@ -175,6 +187,7 @@ import {
 } from "./tyname"
 import {
   nullableInnerOrNone,
+  tyHasTyVar,
   tyMapValOf,
   tyPeelNul,
   tyStepElem,
@@ -182,9 +195,23 @@ import {
   tyStepRet,
 } from "./tyquery"
 
-// `nameFieldCode` with the caller's recorded arena type for the field — arena rung first,
-// the spelling ladder unchanged behind it, then the arena's `S[] | null` rung last.
+// `nameFieldCode` with the caller's recorded arena type for the field, the arena's own rules
+// first: a lone string literal is its atom, a closed record a struct ref before its row exists
+// (one over a hole or type parameter has none), an `i32` list behind `| null` is 18, a list of
+// integer literals the `i32` list; then the spelling ladder, then the `S[] | null` rung.
 export function nameFieldCodeTy(t: string, ty: i32): i32 {
+  if ty >= 0 && ty < T.tys.length {
+    const xt = tyAt(ty)
+    if xt is TyLit && xt.litKind == "str" { return FC_I32 }
+    if nfcIsClosedRecord(ty) { return FC_STRUCT }
+    if xt is TyNullable && nfcIsClosedRecord(nfcPeelOne(xt.nInner)) {
+      return FC_STRUCT
+    }
+    if xt is TyNullable && nfcIsI32List(nfcPeelOne(xt.nInner)) {
+      return FC_NUL_I32_LIST
+    }
+    if xt is TyArray && nfcIsIntLitUnion(xt.aElem) { return FC_I32_LIST }
+  }
   const a = fieldCodeOfTy(ty)
   if a != -2 { return a }
   const c = nameFieldCode(t, ty)
@@ -826,6 +853,104 @@ export function internInlineShapeFieldsTy(
   iisAns
 }
 
+// The mint itself, keyed on the variant ROW: a declared field type reaches it by name, an
+// anonymous literal's field value by the shape of the value (`repVariantShapeRowOf`). Returns
+// the row minted, or -1; an arm already being minted is not minted again.
+export function internArmShapeRow(vi: i32): i32 {
+  if vi < 0 { return -1 }
+  if vi >= uVarTyIx.length { return -1 }
+  const aty = uVarTyIx[vi]
+  if aty < 0 { return -1 }
+  if iasMintNameOf(vi) != "" { return -1 }
+  const gen = tyRegGenNow()
+  if memoMoved(iasKey, 0, gen) {
+    iasDone = []
+    iasRow = []
+  }
+  if vi < iasDone.length && iasDone[vi] == aty + 1 { return iasRow[vi] }
+  // D34 — no arena hint: banking `tyIx` into `sTyIx` would make `structIndexOfTy` answer this
+  // row for the arm's own node, turning off D34's decline module-wide. Found structurally
+  // instead; the arm's type reaches only its fields' element names.
+  let spell = armMintRenderOf(aty)
+  if spell == "" { spell = tyToEmitName(aty) }
+  const nm = armMintShapeName(spell)
+  iasMintVi.push(vi)
+  iasMintNm.push(nm)
+  iasMintDepth.push(iisBusy + 1)
+  const r = internInlineShapeFieldsTy(nm, -1, aty)
+  iasMintVi.pop()
+  iasMintNm.pop()
+  iasMintDepth.pop()
+  if tyRegGenNow() == gen {
+    while iasDone.length <= vi {
+      iasDone.push(0)
+      iasRow.push(-1)
+    }
+    iasDone[vi] = aty + 1
+    iasRow[vi] = r
+  }
+  r
+}
+
+// The arms being minted, innermost last: variant row, the name its row is pushed under, and the
+// intern depth that row's own fields are coded at.
+const iasMintVi: i32[] = []
+const iasMintNm: string[] = []
+const iasMintDepth: i32[] = []
+
+// The name arm `vi`'s row is being minted under, or "" when it is not being minted.
+function iasMintNameOf(vi: i32): string {
+  let k = 0
+  while k < iasMintVi.length {
+    if iasMintVi[k] == vi { return iasMintNm[k] }
+    k = k + 1
+  }
+  ""
+}
+
+// The intern depth the innermost arm mint codes its own fields at, or -1 outside a mint.
+function iasMintTopDepth(): i32 {
+  const n = iasMintDepth.length
+  if n == 0 { return -1 }
+  iasMintDepth[n - 1]
+}
+
+// The arm rows `internArmShapeRow` minted, by variant row: the arm type plus one, and the row
+// (-1 for none); valid while the type-registry generation `iasKey` last read holds.
+const iasKey = memoKeyNew(1)
+let iasDone: i32[] = []
+let iasRow: i32[] = []
+
+// The spelling an arm's row is minted from: its fields by their declared record names when every
+// field is a declared record with its own row, which is the row the full render's nested intern
+// lands on, so the key and the row agree; otherwise "", and the caller renders it whole (D2780).
+function armMintRenderOf(aty: i32): string {
+  const t = tyAt(aty)
+  if t is TyObj {
+    let out = "{"
+    let fi = 0
+    while fi < t.objFieldNames.length {
+      const fnm = armMintFieldName(t.objFieldTypes[fi])
+      if fnm == "" { return "" }
+      if fi > 0 { out = out + "," }
+      out = out + t.objFieldNames[fi] + ":" + fnm
+      fi = fi + 1
+    }
+    return out + "}"
+  }
+  ""
+}
+
+// The declared name of record field type `ft` when that declaration owns the row its type
+// resolves to, else "".
+function armMintFieldName(ft: i32): string {
+  const nm = structNameOfTy(ft)
+  if nm == "" { return "" }
+  const si = structIndexOfTy(ft)
+  if si < 0 || repSlotOfTy(ft) != si { return "" }
+  nm
+}
+
 // The memo: a depth, so its entries clear when the outermost intern returns and nothing
 // survives into a later pass; the sid-keyed answer beside the type hint it is computed with;
 // and the sids written since, which the clear walks. Both answer columns store `+ 2`, so the
@@ -1039,7 +1164,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
           fc = FC_STRUCT
           ftxt = sNames[iidx]
         } else if nameIsConcreteGenAppDecl(base) {
-          // The declared field's generic-application rung (`fieldTypeCode`, D4556): a shape
+          // The declared field's generic-application rung (D4556): a shape
           // nested in a declaration interns before `collectGenAliasShapes`, so the instance
           // has no row yet and is keyed by its application name, as a declared field is.
           fc = FC_STRUCT
@@ -1050,8 +1175,48 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       // shape arm above never runs and `ftxt` would stay the arm's name, unresolvable by
       // `structIndexByName`. Recorded as the cross-table twin's name instead.
       if fc == FC_STRUCT {
-        const armRow = armFieldStructRow(nonNulBaseOf(ftxt))
-        if armRow >= 0 { ftxt = sNames[armRow] }
+        const armNm = armTwinRowName(nonNulBaseOf(ftxt))
+        if armNm != "" { ftxt = armNm }
+      }
+      // A field naming an arm with no row yet, inside an arm mint: an arm still being minted is
+      // pointed at by the name its row is pushed under, at any depth, and the mint's own field
+      // naming any other arm mints that arm first, so a cycle of arms closes (D15095).
+      if iasMintTopDepth() >= 0 {
+        const xb = nonNulBaseOf(ftxt)
+        const xv = variantIndexOf(xb)
+        if xv >= 0 && (fc < 0 || fc == FC_STRUCT) && armFieldStructRow(xb) < 0 {
+          const inFlight = iasMintNameOf(xv)
+          if inFlight != "" {
+            fc = FC_STRUCT
+            ftxt = inFlight
+          } else if iasMintTopDepth() == iisBusy {
+            const xr = internArmShapeRow(xv)
+            if xr >= 0 {
+              fc = FC_STRUCT
+              ftxt = sNames[xr]
+            }
+          }
+        }
+      }
+      // A field naming an arm with no row yet, inside an arm mint: an arm still being minted is
+      // pointed at by the name its row is pushed under, at any depth, and the mint's own field
+      // naming any other arm mints that arm first, so a cycle of arms closes (D15095).
+      if iasMintTopDepth() >= 0 {
+        const xb = nonNulBaseOf(ftxt)
+        const xv = variantIndexOf(xb)
+        if xv >= 0 && (fc < 0 || fc == FC_STRUCT) && armFieldStructRow(xb) < 0 {
+          const inFlight = iasMintNameOf(xv)
+          if inFlight != "" {
+            fc = FC_STRUCT
+            ftxt = inFlight
+          } else if iasMintTopDepth() == iisBusy {
+            const xr = internArmShapeRow(xv)
+            if xr >= 0 {
+              fc = FC_STRUCT
+              ftxt = sNames[xr]
+            }
+          }
+        }
       }
       if fc < 0 { ok = false }
       names.push(rawNames[fi])
@@ -1641,6 +1806,17 @@ export function gaeEnsure(name: string) {
       // for the map, litunion-atom, nullable-ref-list, and `K | null` codes where the
       // shape-text table records a key — a known, intentional divergence, not merged here.
       elem = shapeFieldElemName(tn, code, gaeFty)
+      // An arm-typed field names its twin row, as the other two recorders do; an arm that
+      // reaches the instance only through a type argument has no row yet, so it is minted (D15096).
+      if code == FC_STRUCT {
+        const gaeBase = nonNulBaseOf(tn)
+        const gaeArmVi = variantIndexOf(gaeBase)
+        if gaeArmVi >= 0 {
+          internArmShapeRow(gaeArmVi)
+          const gaeArmNm = armTwinRowName(gaeBase)
+          if gaeArmNm != "" { elem = gaeArmNm }
+        }
+      }
       if code == FC_UNION { registerValueUnionNameAB(64, elem, gaeFty) }
     }
     if code < 0 { ok = false }
@@ -1731,4 +1907,51 @@ function markRefArrayArmsOf(atoms: string[], mems: i32[], cov: boolean) {
   }
   markAtomLeafListArms(mems)
   0
+}
+
+// Whether `ty` is a record with no hole and no type parameter in it, so it can have a row.
+function nfcIsClosedRecord(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  tyAt(ty) is TyObj && !tyHasHole(ty) && !tyHasTyVar(ty)
+}
+
+// `ty` with a one-member union alias peeled.
+function nfcPeelOne(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = tyAt(ty)
+  if t is TyUnion && t.uMembers.length == 1 { return t.uMembers[0] }
+  ty
+}
+
+// Whether `ty` stores as an `i32` list: a list of `i32`, `boolean` or integer literals, or a
+// union whose members all do.
+function nfcIsI32List(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  if t is TyUnion {
+    if t.uMembers.length < 1 { return false }
+    for m in t.uMembers {
+      if !nfcIsI32List(m) { return false }
+    }
+    return true
+  }
+  if !(t is TyArray) { return false }
+  const e = t.aElem
+  if e < 0 || e >= T.tys.length { return false }
+  if nfcIsIntLitUnion(e) { return true }
+  const et = tyAt(e)
+  et is TyPrim && (et.primName == "i32" || et.primName == "boolean")
+}
+
+// Whether `ty` is a union of integer literals, stored as `i32`.
+function nfcIsIntLitUnion(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  if !(t is TyUnion) || t.uMembers.length < 1 { return false }
+  for m in t.uMembers {
+    if m < 0 || m >= T.tys.length { return false }
+    const mt = tyAt(m)
+    if !(mt is TyLit) || mt.litKind != "int" { return false }
+  }
+  true
 }

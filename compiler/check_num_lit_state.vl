@@ -29,7 +29,9 @@ import {
   declHasExportKw,
   i32ToStr,
   markLetRetyped,
+  mkBinary,
   mkNum,
+  mkParen,
   mkTypeRef,
   mkUnary,
   nodeAt,
@@ -298,6 +300,8 @@ export let lbiUseTy: {[i32]: i32} = Map()
 export let lbiSureTy: {[i32]: i32} = Map()
 // The rewritten read each editor occurrence stands for, by occurrence.
 export let lbiOccLit: {[i32]: i32} = Map()
+// The kept-tree `const` declarations some read reached as the binding rather than a copy.
+export let lbiKeptPlain: {[i32]: boolean} = Map()
 
 // Drop this compile's node-keyed tables; the driver calls it wherever the arena resets.
 export function lbiArenaReset() {
@@ -307,6 +311,7 @@ export function lbiArenaReset() {
   lbiInlinedDecl = Map()
   cexFolded = Map()
   cexNotTree = Map()
+  lbiKeptPlain = Map()
   0
 }
 
@@ -1356,6 +1361,115 @@ export function lbiInlineLit(ix: i32, lit: i32, pos: i32, name: string): i32 {
   lbiInlined[ix] = true
   ix
 }
+
+// The tree an un-annotated `const` declaration `decl` holds when the fold left it whole to its
+// use's width (`cexKeepWhole`), its leaves are literals and one is a radix pattern, so a read can
+// be that tree; else -1. A float tree has one value at every width and stays one read.
+export function lbiKeptTreeOf(ix: i32, decl: i32): i32 {
+  const t = lbiKeptTreeDecl(decl)
+  if t < 0 { return -1 }
+  if (
+    ix == daWriteTarget
+    || ix == nlCmpdTgt
+    || ix == lbiWriteTgt
+    || lbiKeepName > 0
+  ) {
+    lbiKeptPlain[decl] = true
+    return -1
+  }
+  t
+}
+
+// Whether the kept-tree `const` declaration `decl` is read only through copies of its tree, so
+// its own `i32` value is never read and the declaration computes nothing (D15001).
+export function lbiKeptDeclUnread(decl: i32): boolean {
+  lbiKeptTreeDecl(decl) >= 0 && !(lbiKeptPlain[decl] ?? false)
+}
+
+// The tree of `lbiKeptTreeOf` the declaration `decl` holds, read guards aside; else -1.
+function lbiKeptTreeDecl(decl: i32): i32 {
+  if decl < 0 || decl >= P.nodes.length { return -1 }
+  const d = nodeAt(decl)
+  if !(d is LetDecl) || d.letType >= 0 || d.letKw != "const" || d.letInit < 0 {
+    return -1
+  }
+  const t = parenPeelIx(d.letInit)
+  if t < 0 || cexNotTree.length == 0 || !(cexNotTree[t] ?? false) { return -1 }
+  if !lbiLitTree(t, 0) || !lbiTreeHasRadix(t, 0) { return -1 }
+  t
+}
+
+// Whether the literal tree `ix` holds a radix literal.
+function lbiTreeHasRadix(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return false }
+  const e = nodeAt(ix)
+  if e is NumLit { return numLexRadixBits(e.numText) >= 0 }
+  if e is Paren { return lbiTreeHasRadix(e.parInner, depth + 1) }
+  if e is Unary { return lbiTreeHasRadix(e.unArg, depth + 1) }
+  if e is BinExpr {
+    return lbiTreeHasRadix(e.binLeft, depth + 1)
+      || lbiTreeHasRadix(e.binRight, depth + 1)
+  }
+  lbiNotLitTree()
+}
+
+// Whether `ix` is an operator tree over numeric literals alone.
+function lbiLitTree(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return false }
+  const e = nodeAt(ix)
+  if e is NumLit { return true }
+  if e is Paren { return lbiLitTree(e.parInner, depth + 1) }
+  if e is Unary {
+    return (e.unOp == "-" || e.unOp == "~") && lbiLitTree(e.unArg, depth + 1)
+  }
+  if e is BinExpr {
+    return e.binCompound.length == 0
+      && cexOp(e.binOp)
+      && lbiLitTree(e.binLeft, depth + 1)
+      && lbiLitTree(e.binRight, depth + 1)
+  }
+  lbiNotLitTree()
+}
+
+// Every other node, a name, a call or a string among them, is no literal tree.
+function lbiNotLitTree(): boolean { false }
+
+// Rewrite the read `ix` of `name`, at `pos`, into a copy of the kept-whole tree `tree`, so each
+// read computes it at its own width as the tree written there would (D14990). Answers `ix`.
+export function lbiInlineTree(ix: i32, tree: i32, pos: i32, name: string): i32 {
+  lbiInlinedName[ix] = name
+  // The read becomes the tree's own root: a `Paren` over it would type the read apart from it.
+  arenaSetNode(ix, nodeAt(lbiCopyTree(tree, pos)))
+  lbiInlined[ix] = true
+  ix
+}
+
+// A fresh copy of the literal tree `t`, grown into the node-indexed tables as `lbiCopyLit` is.
+function lbiCopyTree(t: i32, pos: i32): i32 {
+  const out = lbiCopyNode(t, pos)
+  if out < 0 { return -1 }
+  while nodeTyIx.length <= out { nodeTyIx.push(-1) }
+  lbiInlined[out] = true
+  out
+}
+
+// The fresh node copying `t`'s own kind over copies of its operands, or -1.
+function lbiCopyNode(t: i32, pos: i32): i32 {
+  if t < 0 || t >= P.nodes.length { return -1 }
+  const e = nodeAt(t)
+  if e is NumLit { return mkNum(e.numText, pos) }
+  if e is Paren { return mkParen(lbiCopyTree(e.parInner, pos), pos) }
+  if e is Unary { return mkUnary(e.unOp, lbiCopyTree(e.unArg, pos), pos) }
+  if e is BinExpr {
+    const l = lbiCopyTree(e.binLeft, pos)
+    const r = lbiCopyTree(e.binRight, pos)
+    return mkBinary(e.binOp, l, r, pos)
+  }
+  lbiNoCopy()
+}
+
+// Every other node is no literal tree, which `lbiKeptTreeOf` refused before any copy.
+function lbiNoCopy(): i32 { -1 }
 
 // A fresh node holding the literal `lit` (negations kept), with every node-indexed table the check
 // fills grown to cover it.

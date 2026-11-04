@@ -437,25 +437,48 @@ export function noteInferRetValue(srcExpr: i32, srcTy: i32) {
 // f64 today and runs where an f64 is accepted, so adopting changes values (D2774).
 export function f32JoinRetypesRunning(): boolean { false }
 
-// Hand `src`'s resolved element to `dst`'s open one, enforcing the link's own invariant that the
-// two rows carry the same element. True when the pin moved, which is what the fixpoint below
+// Hand `src`'s resolved element, or a map's key and value, to `dst`'s open one, enforcing the
+// link's own invariant that the two rows carry the same type. True when the pin moved, which is what the fixpoint below
 // iterates on.
 export function holeLinkPinFrom(src: i32, dst: i32) {
   if src < 0 || dst < 0 { return false }
   const s = tyAt(src)
-  if s is TyArray {
-    if s.aElem >= 0 {
-      const d = tyAt(dst)
-      if d is TyArray {
-        if d.aElem < 0 {
-          d.aElem = s.aElem
-          tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
-          return true
-        }
-      }
-    }
+  match s {
+    TyMap => linkPinMapFrom(s, dst)
+    TyArray => linkPinListFrom(s, dst)
+    // Only a list's element or a map's key and value is ever left open by a store.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => false
   }
-  false
+}
+
+// `holeLinkPinFrom` for a map `s`: its closed key and value fill `dst`'s open ones.
+function linkPinMapFrom(s: TyMap, dst: i32): boolean {
+  const d = tyAt(dst)
+  if !(d is TyMap) { return false }
+  let moved = false
+  if s.mKey >= 0 && d.mKey < 0 {
+    d.mKey = s.mKey
+    moved = true
+  }
+  if s.mVal >= 0 && d.mVal < 0 {
+    d.mVal = s.mVal
+    moved = true
+  }
+  if moved {
+    tyMutEpoch = tyMutEpoch + 1 // in-place key/value pin of a linked map
+  }
+  moved
+}
+
+// `holeLinkPinFrom` for a list `s`: its closed element fills `dst`'s open one.
+function linkPinListFrom(s: TyArray, dst: i32): boolean {
+  if s.aElem < 0 { return false }
+  const d = tyAt(dst)
+  if !(d is TyArray) { return false }
+  if d.aElem >= 0 { return false }
+  d.aElem = s.aElem
+  tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+  true
 }
 
 // An element type this pass must not judge: a `TyErr`, whose own diagnostic is already raised
@@ -575,24 +598,22 @@ export function narFitElems(p: i32, declTy: i32, nt: i32) {
   0
 }
 
-// `narFitElems` against one declared list `d`: pushes the entries and answers true when some
-// depth of `d` holds wider elements than `n`.
+// `narFitElems` against one declared list or map `d`: pushes the entries and answers true when
+// some depth of `d` holds wider elements or values than `n` (D2701 for a map's values).
 function narFitElemsOf(p: i32, d0: i32, n0: i32): boolean {
   let d = d0
   let n = n0
   const keys: i32[] = []
   const tys: i32[] = []
   let key = p
-  while d >= 0 && n >= 0 && tyAt(d) is TyArray && tyAt(n) is TyArray {
-    const da = tyAt(d)
-    const na = tyAt(n)
-    if da is TyArray && na is TyArray {
-      key = placeWith(key, LIST_EVERY_STEP)
-      keys.push(key)
-      tys.push(na.aElem)
-      d = da.aElem
-      n = na.aElem
-    }
+  while narEveryInner(d, n, d) >= 0 && narEveryInner(d, n, n) >= 0 {
+    key = placeWith(key, LIST_EVERY_STEP)
+    const nd = narEveryInner(d, n, d)
+    const nn = narEveryInner(d, n, n)
+    keys.push(key)
+    tys.push(nn)
+    d = nd
+    n = nn
   }
   if keys.length == 0 || key < 0 || d < 0 || n < 0 || tySame(d, n) {
     return false
@@ -612,6 +633,25 @@ function narFitElemsOf(p: i32, d0: i32, n0: i32): boolean {
   }
   true
 }
+
+// The element or value type of `of`, one of the declared `d` and the narrowed `n`, when both are
+// lists, or both maps over one key; else -1.
+function narEveryInner(d: i32, n: i32, of: i32): i32 {
+  if d < 0 || n < 0 || of < 0 { return -1 }
+  const da = tyAt(d)
+  const na = tyAt(n)
+  const o = tyAt(of)
+  if da is TyArray && na is TyArray && o is TyArray { return o.aElem }
+  if da is TyMap && na is TyMap && o is TyMap {
+    if da.mSet == 0 && na.mSet == 0 && tySame(da.mKey, na.mKey) {
+      return o.mVal
+    }
+  }
+  narEveryNone(d, n)
+}
+
+// A declared and a narrowed type that are not two lists or two maps have no element step.
+function narEveryNone(_d: i32, _n: i32): i32 { -1 }
 
 // The list `ix` reads (a name or field path, or a subscript chain over one) as a message spells
 // it: a literal or named subscript as written, any other as `[…]`.
@@ -1670,8 +1710,8 @@ export function softenBareLitTy(ty: i32): i32 {
   softenLitTy(ty)
 }
 
-// Whether a pushed or set value of type `got` is a function with holes, or a record or list
-// holding one, and the slot's type `want` has none: the store a binding would check, so
+// Whether a pushed or set value of type `got` is a function with holes, a hole, or a record or
+// list holding a hole function, and the slot's type `want` has none: the store a binding would check, so
 // `{ f: inc0 }` into an `{ f: (a: i32) => f64 }` slot is judged as `const r: R` is (D9471).
 export function pushHoleFnToConcrete(got: i32, want: i32): boolean {
   if got < 0 || want < 0 || got >= T.tys.length || want >= T.tys.length {
@@ -1680,6 +1720,9 @@ export function pushHoleFnToConcrete(got: i32, want: i32): boolean {
   if tyHasHole(want) || !tyHasHole(got) { return false }
   const g = tyAt(got)
   if g is TyFunc { return tyAt(want) is TyFunc }
+  // A hole parameter's value stored into a closed function slot is pinned there, as a binding
+  // of that type pins it, so its callers deliver it through their adapter (D15134).
+  if tyIsHole(got) { return tyAt(want) is TyFunc }
   (g is TyObj || g is TyArray) && holdsHoleFn(got, 0)
 }
 

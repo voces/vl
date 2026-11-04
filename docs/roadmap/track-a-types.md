@@ -39,7 +39,7 @@ rules there apply here, and `tests/roadmap_honest_test.ts` gates this file too.
   - The A9 container-copy diagnostic still says "not yet supported by codegen", but the ruling made
     that refusal DESIGN, so reword it.
 - **Width subtyping, the container half.** `Wide[]` into `Narrow[]` still refuses "not yet supported
-  by codegen", which was ruled a gap on 2026-09-01. The spread into a rest parameter is D13960.
+  by codegen", which was ruled a gap on 2026-09-01. A spread of a list whose extra fields are numbers builds at the destination's list type.
 - **A10. Generics.** Two gaps:
   - `map` and `filter` on `Map`/`Set`;
   - const generics: `type Buf<N: i32>` is a parse error, and they gate Decimal (B2) and the

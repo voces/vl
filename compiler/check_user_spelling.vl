@@ -1,0 +1,91 @@
+// The user's spelling of a type: the annotation on the declaration a value is read from, as written,
+// when it denotes the value's type and names a transparent alias. One producer for every diagnostic
+// that names an inferred type, so a transparent alias keeps the name the user wrote (D15085).
+
+import { Call, FuncDecl, Ident, LetDecl, P, Param, Paren, nodeAt } from "./ast"
+import { tyEq, tyToStrUser } from "./check_types"
+import { nodeTyIxOf } from "./check_node_tys"
+import { nodeLastTok, nodeStartTok } from "./fmt_util"
+import { identDeclOf } from "./symbols"
+import { isTransparentAlias } from "./check_alias_transparent"
+
+// The written annotation of the declaration `valIx` reads (a binding's or parameter's annotation,
+// a called function's result annotation) when it denotes `ty` and names a transparent alias, the
+// one name a type's render cannot recover; else the type's own render.
+export function userSpellingOfValue(valIx: i32, ty: i32): string {
+  const ann = declAnnOfValue(valIx, 0)
+  if ann >= 0 && annNamesTransparentAlias(ann) {
+    const at = nodeTyIxOf(ann)
+    if at >= 0 && tyEq(at, ty) {
+      const s = annTextOf(ann)
+      if s != "" { return s }
+    }
+  }
+  tyToStrUser(ty)
+}
+
+// The annotation node of the declaration value `ix` reads, or -1.
+function declAnnOfValue(ix: i32, depth: i32): i32 {
+  if ix < 0 || depth > 8 { return -1 }
+  const n = nodeAt(ix)
+  if n is Paren { return declAnnOfValue(n.parInner, depth + 1) }
+  if n is Ident { return declAnnOfDecl(identDeclOf(ix)) }
+  if n is Call {
+    if n.callFn < 0 { return -1 }
+    if !(nodeAt(n.callFn) is Ident) { return -1 }
+    const d = identDeclOf(n.callFn)
+    if d < 0 { return -1 }
+    const dn = nodeAt(d)
+    if dn is FuncDecl { return dn.fnRet }
+    return -1
+  }
+  valueReadsNoDecl()
+}
+
+// The named default above: any other value (a literal, an operator, a join, a field read) is
+// typed by inference, not by a declaration the user annotated, so it has no written spelling.
+function valueReadsNoDecl(): i32 { -1 }
+
+// The annotation node declaration `d` carries, or -1.
+function declAnnOfDecl(d: i32): i32 {
+  if d < 0 { return -1 }
+  const dn = nodeAt(d)
+  if dn is LetDecl { return dn.letType }
+  if dn is Param { return dn.parType }
+  declHasNoAnnotation()
+}
+
+// The named default above: a declaration that is neither a binding nor a parameter (a function,
+// a type, a loop variable, an import) carries no value annotation here.
+function declHasNoAnnotation(): i32 { -1 }
+
+// Whether annotation node `ann` names a transparent alias (`type Id = i32`, `type KC = "circle"`).
+function annNamesTransparentAlias(ann: i32): boolean {
+  const first = nodeStartTok(ann)
+  const last = nodeLastTok(ann)
+  if first < 0 || last < first { return false }
+  let t = first
+  while t <= last {
+    if isTransparentAlias(P.toks[t].text) { return true }
+    t = t + 1
+  }
+  false
+}
+
+// Annotation node `ann` as its tokens spell it, spaced as a type render is (`A | B`, `{k: T}`,
+// `(i32) => T`).
+function annTextOf(ann: i32): string {
+  const first = nodeStartTok(ann)
+  const last = nodeLastTok(ann)
+  if first < 0 || last < first { return "" }
+  let out = ""
+  let t = first
+  while t <= last {
+    const tx = P.toks[t].text
+    if tx == "|" || tx == "=>" { out = out + " " + tx + " " }
+    else if tx == ":" || tx == "," { out = out + tx + " " }
+    else { out = out + tx }
+    t = t + 1
+  }
+  out
+}

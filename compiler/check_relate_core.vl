@@ -7,10 +7,14 @@
 
 import {
   elabCapOn,
-  elabFnJoinTy,
+  elabFnArmJoinNote,
+  elabFnFieldWidened,
+  elabFnJoinDeepTy,
   elabFnLetMembers,
   elabFnListWidened,
+  elabFnRetJoinNote,
   elabFnSetOf,
+  elabFnSlotWidened,
   elabHolePinNote,
   elabPinBindingIs,
   fnLetIsWide,
@@ -273,7 +277,7 @@ import {
   storageListNote,
   zeroBytesFixIx,
 } from "./check_mismatch_notes"
-import { collectRetValues, joinArmIsLit, njJoinGated } from "./check_nj_join"
+import { collectRetValues, isTopLevelStmt, joinArmIsLit } from "./check_nj_join"
 import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import { numCmpOp, numPairTy, valueTailSplit } from "./check_num_adopt"
 import {
@@ -360,6 +364,7 @@ import {
   substSelfOwner,
   substSelfOwnerSet,
   substSkipsForeignSig,
+  substSkipsForeignVar,
   tyIsForeignGenericSig,
   tyIsHoleGenericSig,
 } from "./check_subst"
@@ -369,17 +374,19 @@ import {
   joinTyParamNull,
   markTpJoinApart,
   noteHoleTpJoin,
+  nullParamBesideBare,
   paramHoleName,
   paramJoinDropsNull,
+  paramOnlyUnion,
   sameDeclaredTyParam,
   tpArmJoinDepth,
   tpGradualView,
   tpJoinUnions,
   tpOpenJoin,
+  tpParamLitJoins,
   tvElseBase,
   tyIsDeferredJoin,
   tyIsGradualParam,
-  tyIsTpJoinUnion,
   tyParamBesideBare,
   tyParamBesideDerived,
   writtenTpUnion,
@@ -387,12 +394,14 @@ import {
 import {
   containerElemClassDiffers,
   eqRefusals,
+  fvaSlotMayDiffer,
   holeArgScalarRefused,
   joinWidensMap,
   listJoinStorageDiffers,
   numWidens,
   numWidensName,
   objNumWidens,
+  xrepListPair,
 } from "./check_ty_relate"
 import { mapKeyTySupported, nomBaseTyIx, nomErasedTyIx } from "./check_ty_rep"
 import {
@@ -465,9 +474,11 @@ import {
   tyFieldTyOf,
   tyHasHole,
   tyHasInferHole,
+  tyIsDeclaredParam,
   tyIsHole,
   tyIsLitUnion,
   tyIsNulValueUnionBox,
+  tyMentionsTyVarNamed,
   tyMutEpoch,
   tyNulInnerTy,
   tyPrintsAsRef,
@@ -502,6 +513,7 @@ import {
 } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
 import {
+  covarRootName,
   cwBindingOf,
   cwBindingWrittenValues,
   cwBoundInitOf,
@@ -515,19 +527,22 @@ import {
   cwGetRecv,
   cwHeldFnOf,
   cwIxWant,
+  cwKeyOfDecl,
   cwKeyOfRoot,
   cwParamArgs,
   cwPeel,
+  cwSlotDescend,
   cwSlotPath,
   cwSlotValuesFrom,
   cwSlotWrittenValues,
   cwSoleBinderAt,
+  cwUfcsDeclOf,
   fnDeclIx,
 } from "./check_write_scan"
 import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
 import { numLexIsFloat } from "./emit_bignum"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import { pairMemoClear, pairMemoGet, pairMemoNew, pairMemoPut } from "./memo"
 import {
   mimpAnyProgramSpec,
@@ -585,6 +600,7 @@ import {
   tyIsLitUnionLike,
   tyJoinsVoidAt,
   tyMapValOf,
+  tyReachesHole,
   tyStoresVoid,
   unionArmSubsumedBy,
   unionCoversTy,
@@ -735,6 +751,11 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
     TyMap => {
       match d {
         TyMap => {
+          // Both open is a link, as two open lists are (D1470): a later use pins one side, and
+          // `resolveHoleLinks` hands it to the other.
+          if (s.mKey < 0 && d.mKey < 0) || (s.mVal < 0 && d.mVal < 0) {
+            noteHoleLink(srcTy, dstTy)
+          }
           if s.mKey < 0 {
             s.mKey = d.mKey
             tyMutEpoch = tyMutEpoch + 1 // in-place key pin
@@ -804,8 +825,16 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
         }
       }
     }
+    // A function value's result pins as a returned value would: covariantly, into the
+    // destination's result, so a lambda's open `Map()` is built at the type it is called at.
+    TyFunc => {
+      const fd = tyAt(nonNullTy(dstTy))
+      if fd is TyFunc && s.fnParamTypes.length == fd.fnParamTypes.length {
+        return constrainEmptyD(s.fnRet, fd.fnRet, depth - 1)
+      }
+    }
     // No other source carries an open hole to pin.
-    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {}
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {}
   }
   0
 }
@@ -1682,6 +1711,14 @@ function gradualUnionJoin(a: i32, b: i32): i32 {
   if tyMembersWithin(a, b) { return b }
   const tc = joinVariantTys(a, b)
   tpJoinUnions[tc] = 1
+  // A join of runtime arms beside a concrete type keeps its members apart at the pin, the other
+  // folding into them (`paramLitRejoin`, D3534).
+  if concreteBeside {
+    const rt = if ta { a } else { b }
+    if (tpJoinUnions.get(rt) ?? 0) == 2 && tyAt(rt) is TyUnion {
+      tpParamLitJoins[tc] = rt
+    }
+  }
   tc
 }
 
@@ -1762,6 +1799,17 @@ export function joinTys(a: i32, b: i32) {
     noteHoleTpJoin(tc)
     return tc
   }
+  // So is a nullable one, its null kept as the wrapper: `T | null` beside `"z"` (D4174).
+  const npa = nullParamBesideBare(a, b)
+  const npb = nullParamBesideBare(b, a)
+  if npa >= 0 || npb >= 0 {
+    const tn = if npa >= 0 { joinVariantTys(npa, b) } else { joinVariantTys(a, npb) }
+    tpJoinUnions[tn] = 1
+    noteHoleTpJoin(tn)
+    const tw = mkNullableTy(tn)
+    tpJoinUnions[tw] = 1
+    return tw
+  }
   if (
     aVar
     && bVar
@@ -1771,6 +1819,11 @@ export function joinTys(a: i32, b: i32) {
     tpJoinUnions[td] = 1
     noteHoleTpJoin(td)
     return td
+  }
+  // A written union of declared parameters beside a concrete type keeps the two apart (D3618).
+  if !aVar && !bVar {
+    const pw = paramUnionBesideConcrete(a, b)
+    if pw >= 0 { return pw }
   }
   // Such a union absorbs only its own members: its parameter member is assignable from
   // anything, which would fold `T | string` beside `T | i32` to the first (D3212).
@@ -1856,6 +1909,26 @@ export function joinTys(a: i32, b: i32) {
   kept
 }
 
+// The join of a written union of declared parameters and a concrete type, kept apart; -1 for
+// any other pair.
+function paramUnionBesideConcrete(a: i32, b: i32): i32 {
+  let u = a
+  let c = b
+  if !paramOnlyUnion(a) {
+    u = b
+    c = a
+  }
+  if !paramOnlyUnion(u) || c < 0 || c >= T.tys.length { return -1 }
+  if tyHasTyVar(c) || isNullTy(c) || c == TY_VOID || tyBearsNull(c) {
+    return -1
+  }
+  const tc = joinVariantTys(u, c)
+  tpJoinUnions[tc] = 1
+  tpParamLitJoins[tc] = u
+  noteHoleTpJoin(tc)
+  tc
+}
+
 // The join of a function type over inference holes and a closed one that fits it either
 // way: the closed one, in either order, so a hole function is instanced at it (D10797);
 // -1 for any other pair.
@@ -1894,11 +1967,31 @@ function paramNullJoin(a: i32, b: i32): i32 {
   }
   if hasNull { kept.push(TY_NULL) }
   const res = mkUnionTy(kept)
-  if tyIsTpJoinUnion(a) || tyIsTpJoinUnion(b) { tpJoinUnions[res] = 1 }
+  // A join of runtime arms stays one beside its null, and so does a join of two or more
+  // declared parameters, each a runtime value (D3611).
+  const ma = tpJoinUnions.get(a) ?? 0
+  const mb = tpJoinUnions.get(b) ?? 0
+  let mk = if ma > mb { ma } else { mb }
+  if hasNull && allDeclaredParams(kept) { mk = 2 }
+  if mk > 0 { tpJoinUnions[res] = mk }
   if isJoinHoleUnion(a) || isJoinHoleUnion(b) { joinHoleUnions.push(res) }
+  // Its deferred re-fold keeps the members apart too.
+  if mk == 2 && isJoinHoleUnion(res) { apartHoleJoins[res] = true }
   noteHoleTpJoin(res)
   paramNullJoins[res] = 1
   res
+}
+
+// Whether `ms` holds two or more declared type parameters and nothing else but `null`.
+function allDeclaredParams(ms: i32[]): boolean {
+  let n = 0
+  for m in ms {
+    if !isNullTy(m) {
+      if !tyIsDeclaredParam(m) { return false }
+      n = n + 1
+    }
+  }
+  n >= 2
 }
 
 // `a op b` where an operand is a numeric union: each member pair takes the scalar rule, and
@@ -2023,12 +2116,14 @@ export function binCstrPairRefusal(ci: i32, clt: i32, crt: i32): string {
 }
 
 // `joinTys` for the arms of a value `if` or `match`; function values of two different sets join
-// at a fresh index (`elabFnJoinTy`).
+// at a fresh index, through lists and records as a function's returned values do (`elabFnJoinDeepTy`).
 export function joinArmTys(a: i32, b: i32): i32 {
   tpArmJoinDepth = tpArmJoinDepth + 1
   const j = joinTys(a, b)
   tpArmJoinDepth = tpArmJoinDepth - 1
-  elabFnJoinTy(j, a, b)
+  const dj = elabFnJoinDeepTy(j, a, b, 0)
+  elabFnArmJoinNote(dj, a, b)
+  dj
 }
 
 // `joinArmTys` of an arm typed `a` beside one typed `b`, where `aLit`/`bLit` say an arm's every
@@ -2043,7 +2138,7 @@ export function joinArmLit(a: i32, aLit: boolean, b: i32, bLit: boolean): i32 {
     else if !aLit && !bLit && writtenTpUnion(a) { markTpJoinApart(same) }
     return same
   }
-  const apart = !aLit && !bLit && !njJoinGated(a, b, false)
+  const apart = !aLit && !bLit
   njApartSet(apart)
   const j = keepListStorage(a, !aLit, b, !bLit, joinArmTys(a, b))
   njApartSet(false)
@@ -2187,7 +2282,9 @@ export function joinRetTys(a: i32, b: i32) {
     njApartSet(njApartRet)
     const j = joinTys(a, b)
     tpApartConcreteSet(saved)
-    return elabFnJoinTy(j, a, b)
+    const dj = elabFnJoinDeepTy(j, a, b, 0)
+    elabFnRetJoinNote(dj, a, b)
+    return dj
   }
   const kept: i32[] = []
   flattenVariantsInto(a, kept)
@@ -3964,6 +4061,19 @@ function objOpSelfFnRetTy(op: string, lt: i32) {
   -1
 }
 
+// Whether `lt` and `rt` compare by value across their storages: two number lists stored apart
+// (`xrepListPair`), or each with `null` peeled assignable one way: a nullable number
+// compares by value with a number it widens to or from, `null` matching only `null` (D15090).
+export function eqNonNullMutual(lt: i32, rt: i32): boolean {
+  // Two number lists stored apart compare element by element the same way (D15055).
+  if xrepListPair(lt, rt) { return true }
+  if !tyBearsNull(lt) && !tyBearsNull(rt) { return false }
+  const ln = nonNullTy(lt)
+  const rn = nonNullTy(rt)
+  if ln < 0 || rn < 0 { return false }
+  assignable(ln, rn) || assignable(rn, ln)
+}
+
 // Whether the emitter can lower `lt op rt` for two concrete operand types — the soundness
 // criterion a generic call site checks after substituting a hole to its argument type. A
 // still-unresolved operand defers (true — the outer call validates it). Mirrors
@@ -4013,6 +4123,7 @@ export function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
       && !assignable(eqR, eqL)
       && !assignable(eqL0, eqR0)
       && !assignable(eqR0, eqL0)
+      && !eqNonNullMutual(eqL, eqR)
     ) {
       return false
     }
@@ -4765,6 +4876,16 @@ function holeReadsParam(a: i32): boolean {
   bd >= 0 && bd < P.nodes.length && nodeAt(bd) is Param
 }
 
+// Whether the name `a` reads a `let`, which writes may re-point; a `const` choice is judged by
+// its arms.
+function holeReadsWrittenLet(a: i32): boolean {
+  const ix = parenPeelIx(a)
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return false }
+  const d = identDeclOf(ix)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  dn is LetDecl && dn.letKw == "let"
+}
+
 // When the value `a`, called at parameter types `pts` some of which are still open, may be read
 // from a choice or a re-pointed `let` of un-annotated functions: records the call as a demand,
 // so the pin judges every function it may run at its closed types (D13782).
@@ -4786,6 +4907,7 @@ export function holeChoiceWaits(a: i32, pts: i32[]) {
       holeChoiceArms(r).length > 0
       || holeFnArgDecls(r).length > 1
       || holeSetMembers(r).length > 1
+      || holeReadsWrittenLet(r) && holeLetHoldsGenerics(r)
     ) {
       const ct = mkFuncTy(wp, TY_I32)
       noteArgCstr(ct, ct, "", ACF_CHOICE, a)
@@ -5025,7 +5147,8 @@ export function holeSetCallRetOf(
   let open = false
   for pt in pts {
     if pt < 0 { return -1 }
-    if tyHasTyVar(pt) {
+    // A set of functions is a closed argument, its members instanced at their own calls.
+    if tyHasTyVar(pt) && fnTagSetOfTy(pt) < 0 {
       // An open function type is a hole function handed on, which no instance closes.
       if curFnDeclIx < 0 || tyAt(pt) is TyFunc { return -1 }
       open = true
@@ -5035,7 +5158,9 @@ export function holeSetCallRetOf(
     key = key + tyToStr(w) + ","
   }
   for d in ds {
-    if !setMemberDecl(d, open) { return -1 }
+    if !setMemberDecl(d, open) && (open || !setMemberFixedFits(d, wp)) {
+      return -1
+    }
   }
   // A call at a type parameter is decided here and typed at each instance of its function.
   if open {
@@ -5052,6 +5177,15 @@ export function holeSetCallRetOf(
   const rs: i32[] = []
   for d in ds {
     const rd = setMemberRetAt(d, ft)
+    // A lambda written after this call is not checked yet; the call is decided with the set,
+    // typed by its own callee, and each arm takes its member's result when it is instanced.
+    if rd < 0 && setMemberUnchecked(d) {
+      const none: i32[] = []
+      if note && !inferQuiet && !holePinHeld {
+        fnTagCallNote(ix, s, key, false, none)
+      }
+      return -1
+    }
     if rd < 0 || tyHasTyVar(rd) { return -1 }
     const w = widenLitTy(rd)
     rs.push(w)
@@ -5069,6 +5203,13 @@ export function holeSetCallRetOf(
   r
 }
 
+// Whether set member `d` is a lambda the check has not reached yet, so it has no type.
+function setMemberUnchecked(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = nodeAt(d)
+  f is FuncDecl && f.fnName == "" && nodeTyOf(d) < 0
+}
+
 // Whether `d` is a function a set's call can call directly at the call's own arguments: an
 // un-annotated function, or a generic one with a declared result. At a call whose types are all
 // closed (not `open`), a generic one whose result its body gives, which the caller then closes.
@@ -5079,9 +5220,28 @@ function setMemberDecl(d: i32, open: boolean): boolean {
   directHoleDecl(d) || (f.fnTyParams.length > 0 && (f.fnRet >= 0 || !open))
 }
 
+// Whether `d` is a function whose every parameter and result are written, with no type
+// parameter, and whose parameters accept the closed argument types `wp`: a set's call calls it
+// directly there.
+function setMemberFixedFits(d: i32, wp: i32[]): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 || f.fnRet < 0 { return false }
+  if f.fnParams.length != wp.length { return false }
+  let i = 0
+  while i < wp.length {
+    const p = nodeAt(f.fnParams[i])
+    if !(p is Param) || p.parType < 0 { return false }
+    const pt = nodeTyOf(f.fnParams[i])
+    if pt < 0 || !assignable(wp[i], pt) { return false }
+    i = i + 1
+  }
+  true
+}
+
 // What set member `d` returns at function type `ft`'s parameters, as its direct call there does;
 // -1 when that stays open.
-function setMemberRetAt(d: i32, ft: i32): i32 {
+export function setMemberRetAt(d: i32, ft: i32): i32 {
   const noN: string[] = []
   const noT: i32[] = []
   const f = nodeAt(d)
@@ -5354,16 +5514,33 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   if an is ForIn {
     root = cwSlotPath(an.fiIter, p0)
     p0.push("[]")
+    if root < 0 {
+      const cp: string[] = []
+      const c = holeSlotCallPath(an.fiIter, cp)
+      if c < 0 { return false }
+      cp.push("[]")
+      return holeSlotCallJudgeAt(c, cp, wp, pts)
+    }
   } else if an is Param {
     root = cwSlotPath(cwElemCallbackRecv(a), p0)
     p0.push("[]")
   } else {
     root = cwSlotPath(a, p0)
+    if root < 0 { return holeSlotCallRootJudge(a, wp, pts) }
   }
   if root < 0 || p0.length == 0 || !cwFramedNode(root) { return false }
   const path: string[] = []
   root = holeSlotRebase(root, p0, path)
   if root < 0 || root >= P.nodes.length || !cwFramedNode(root) { return false }
+  // A binding bound once to a place a call's result is read through reads that place.
+  if nodeAt(root) is Ident && cwKeyOfRoot(root) >= 0 {
+    const cp: string[] = []
+    const c = holeSlotCallPath(cwBoundInitOf(cwBindingOf(root)), cp)
+    if c >= 0 && cp.length > 0 {
+      for st in path { cp.push(st) }
+      return holeSlotCallJudgeAt(c, cp, wp, pts)
+    }
+  }
   // A call through an element fixes the tuple of the member it runs (D3975 A), so an element
   // holding only its initialiser's functions needs no common result (D14435).
   const elem = path.length > 0 && path[path.length - 1] == "[]"
@@ -5378,8 +5555,16 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     if holeSlotDeferring { return false }
     const args: i32[] = []
     if cwElemCallbackRecv(bd) >= 0 || !cwParamArgs(bd, args) { return false }
+    // An argument bound after the read has no widening facts yet, so the read is judged again
+    // after the pass (`holeSlotLateRun`): its refusal reports then, at the same location.
+    if !holeSlotReplaying && !inferQuiet && holeSlotArgsAhead(args, a) {
+      holeSlotLateNote(a, wp, pts)
+      return false
+    }
     for v in args {
-      if holeSlotArgJudge(v, rn.identName, path, wp, pts, 0) { return true }
+      if holeSlotArgJudge(v, rn.identName, path, wp, pts, 0, true) {
+        return true
+      }
     }
     return false
   }
@@ -5391,7 +5576,7 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     const cn = nodeAt(init)
     holeSlotRetApart = elem
     const rj = cn is Call
-      && holeSlotRetJudge(cn, rn.identName, path, wp, pts, 0)
+      && holeSlotRetJudge(cn, rn.identName, path, wp, pts, 0, true)
     holeSlotRetApart = false
     if rj { return true }
     if cn is Call { called = holeSlotCallRets(cn, rets) }
@@ -5413,8 +5598,281 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     nW,
     wp,
     pts,
-    elem && (nW == 0 || elabFnListWidened(bd)),
+    elem && (nW == 0 || holeSlotWidenLift(bd, cwBindingOf(root), path)),
   )
+}
+
+// `holeSlotJudge` for a slot read `a` rooted at a call, `mk()[1].f`: every function the call's
+// returns store there judged at `wp`, as for a binding the call initialises (D15221, D15225).
+function holeSlotCallRootJudge(a: i32, wp: i32[], pts: i32[]): boolean {
+  const path: string[] = []
+  const c = holeSlotCallPath(a, path)
+  if c < 0 || path.length == 0 { return false }
+  holeSlotCallJudgeAt(c, path, wp, pts)
+}
+
+// `holeSlotCallRootJudge` for the slot `path` (root first) of what the call `c` returns.
+function holeSlotCallJudgeAt(
+  c: i32,
+  path: string[],
+  wp: i32[],
+  pts: i32[],
+): boolean {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return false }
+  const nm = holeCallRootName(cn)
+  if nm == "" { return false }
+  const elem = path[path.length - 1] == "[]"
+  holeSlotRetApart = elem
+  const rj = holeSlotRetJudge(cn, nm, path, wp, pts, 0, true)
+  holeSlotRetApart = false
+  if rj { return true }
+  const rets: i32[] = []
+  if !holeSlotCallRetsDeep(cn, rets, 0) { return false }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  for r in rets {
+    if !cwSlotDescend(r, path, 0, -1, vals, ats) { return false }
+  }
+  holeSlotValsJudge(
+    holeSlotName(nm, path),
+    holeSlotSpell(nm, path),
+    vals,
+    ats,
+    0,
+    wp,
+    pts,
+    elem,
+  )
+}
+
+// The call the place `a` reads through list elements, map values and record fields is rooted
+// at, its steps in `path` root first as `cwSlotPath` gives a name's; -1 for any other root.
+function holeSlotCallPath(a: i32, path: string[]): i32 {
+  const rev: string[] = []
+  let ix = cwPeel(a)
+  while ix >= 0 && ix < P.nodes.length && rev.length < 16 {
+    const n = nodeAt(ix)
+    const fi = cwForInBinderOf(ix)
+    const fl = if fi >= 0 { nodeAt(fi) } else { null }
+    if fl is ForIn {
+      // A `for` loop's element reads an element of what the loop walks (D15209).
+      rev.push("[]")
+      ix = cwPeel(fl.fiIter)
+    } else if cwGetRecv(ix) >= 0 {
+      rev.push("[]")
+      ix = cwPeel(cwGetRecv(ix))
+    } else if n is Call {
+      let k = rev.length - 1
+      while k >= 0 {
+        path.push(rev[k])
+        k = k - 1
+      }
+      return ix
+    } else if n is Index {
+      rev.push("[]")
+      ix = cwPeel(n.idxArr)
+    } else if n is Member {
+      rev.push(n.memProp)
+      ix = cwPeel(n.memObj)
+    } else if n is OptMember {
+      rev.push(n.omProp)
+      ix = cwPeel(n.omObj)
+    } else {
+      return -1
+    }
+  }
+  -1
+}
+
+// How a diagnostic names the call `c` a slot is rooted at, by the function it runs or the name
+// it is called by: `mk()`; "" for a callee that is neither.
+function holeCallRootName(c: Call): string {
+  const d = cwCalleeDeclOf(c.callFn)
+  const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if f is FuncDecl && f.fnName != "" { return f.fnName + "()" }
+  const nm = covarRootName(c.callFn)
+  if nm != "" { nm + "()" } else { "" }
+}
+
+// `holeSlotCallRets`, each returned call of such a function replaced by its own returns, at
+// most 8 calls deep; false when a call reached is not one `holeSlotCallRets` follows.
+function holeSlotCallRetsDeep(c: Call, out: i32[], depth: i32): boolean {
+  if depth > 8 { return false }
+  const rv: i32[] = []
+  if !holeSlotCallRets(c, rv) { return false }
+  for r in rv {
+    const x = cwPeel(r)
+    const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if xn is Call && cwGetRecv(x) < 0 {
+      if !holeSlotCallRetsDeep(xn, out, depth + 1) { return false }
+    } else {
+      out.push(r)
+    }
+  }
+  true
+}
+
+// Whether the check widened the element at `path` of the binding `bd`, keyed `b`, to one set,
+// directly (D15137, D15138) or through the names it is re-pointed to (D15196), so a function
+// read there needs no common result with the binding's other writes.
+function holeSlotWidenLift(bd: i32, b: i32, path: string[]): boolean {
+  if path.length == 0 || path[path.length - 1] != "[]" { return false }
+  elabFnListWidened(bd)
+    || elabFnSlotWidened(bd)
+    || path.length >= 2 && elabFnFieldWidened(bd, holeSlotPathSteps(path))
+    || holeSlotRepointLift(bd, b, path)
+}
+
+// The slot reads `holeSlotJudge` left for after the pass, with their call types.
+let holeLateA: i32[] = []
+let holeLateWp: i32[][] = []
+let holeLatePts: i32[][] = []
+let holeSlotReplaying = false
+
+// Whether an argument in `args` names a binding declared after the read `a`.
+function holeSlotArgsAhead(args: i32[], a: i32): boolean {
+  for v in args {
+    const ix = parenPeelIx(v)
+    if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Ident {
+      const d = identDeclOf(ix)
+      if (
+        d >= 0
+        && d < P.nodes.length
+        && nodeAt(d) is LetDecl
+        && nodeStartTok(d) > nodeStartTok(a)
+      ) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Leaves the read `a` at `wp` and `pts` for `holeSlotLateRun`, once.
+function holeSlotLateNote(a: i32, wp: i32[], pts: i32[]) {
+  if i32ListHas(holeLateA, a) { return 0 }
+  holeLateA.push(a)
+  holeLateWp.push(wp.slice(0, wp.length))
+  holeLatePts.push(pts.slice(0, pts.length))
+  0
+}
+
+// Judges each slot read `holeSlotJudge` left for after the pass, now that every binding it reads
+// through is checked: the same judge at a second time, after the producers of the facts it reads.
+export function holeSlotLateRun() {
+  holeSlotReplaying = true
+  let i = 0
+  while i < holeLateA.length {
+    holeSlotJudge(holeLateA[i], holeLateWp[i], holeLatePts[i])
+    i = i + 1
+  }
+  holeSlotReplaying = false
+  holeSlotLateReset()
+}
+
+// Forgets the reads left for after the pass.
+export function holeSlotLateReset() {
+  holeLateA = []
+  holeLateWp = []
+  holeLatePts = []
+  0
+}
+
+// Whether the `let` `bd`, keyed `b`, is bound and re-pointed only to names of containers the
+// check widened to one set at element path `path` (a list's or map's `[]`, or a record field's
+// `f[]`), directly or through `let`s bound to such names, so its element is theirs. A module's
+// own `let` only (D15196).
+function holeSlotRepointLift(bd: i32, b: i32, path: string[]): boolean {
+  if !isTopLevelStmt(bd) { return false }
+  if path.length == 0 || path[path.length - 1] != "[]" { return false }
+  const steps = holeSlotFieldSteps(path)
+  if path.length > 1 && steps.length != path.length - 1 { return false }
+  holeSlotRepointSet(bd, b, steps, 0) >= 0
+}
+
+// The one set `holeSlotRepointLift` finds for `bd` at field `steps`, or -1.
+function holeSlotRepointSet(bd: i32, b: i32, steps: string[], depth: i32): i32 {
+  if depth > 8 || bd < 0 || bd >= P.nodes.length { return -1 }
+  const bn = nodeAt(bd)
+  if !(bn is LetDecl) || bn.letInit < 0 { return -1 }
+  const vals: i32[] = [bn.letInit]
+  for v in cwBindingWrittenValues(b) {
+    if !i32ListHas(vals, v) { vals.push(v) }
+  }
+  let set = -1
+  for v in vals {
+    const pv = parenPeelIx(v)
+    if pv < 0 || pv >= P.nodes.length || !(nodeAt(pv) is Ident) { return -1 }
+    const d = identDeclOf(pv)
+    if d < 0 || d == bd || !(nodeAt(d) is LetDecl) { return -1 }
+    let s = -1
+    const widened = if steps.length == 0 { elabFnListWidened(d) || elabFnSlotWidened(d) } else { elabFnFieldWidened(d, steps) }
+    if widened {
+      s = holeSlotElemSetAt(nodeTyIxOf(d), steps)
+    } else {
+      s = holeSlotRepointSet(d, cwKeyOfDecl(d), steps, depth + 1)
+    }
+    if s < 0 || set >= 0 && s != set { return -1 }
+    set = s
+  }
+  set
+}
+
+// The set the element type of the list or map at field `steps` of type `t` carries, or -1.
+function holeSlotElemSetAt(t: i32, steps: string[]): i32 {
+  let cur = t
+  for st in steps {
+    if cur < 0 || cur >= T.tys.length { return -1 }
+    const o = T.tys[cur]
+    if !(o is TyObj) { return -1 }
+    let next = -1
+    let i = 0
+    while i < o.objFieldNames.length {
+      if o.objFieldNames[i] == st { next = o.objFieldTypes[i] }
+      i = i + 1
+    }
+    cur = next
+  }
+  if cur < 0 || cur >= T.tys.length { return -1 }
+  const c = T.tys[cur]
+  match c {
+    TyArray => {
+      return fnTagSetOfTy(c.aElem)
+    }
+    TyMap => {
+      return fnTagSetOfTy(c.mVal)
+    }
+    // Only a list's or a map's element carries a set of functions written to it.
+    TyObj | TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// The field names of element path `path` (`r.a.b[]`) before its element step; empty when a
+// step other than the last is an element.
+function holeSlotFieldSteps(path: string[]): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < path.length - 1 {
+    if path[i] == "[]" { return [] }
+    out.push(path[i])
+    i = i + 1
+  }
+  out
+}
+
+// `path` without its last step, an element as `[]`: the steps `elabFnFieldWidened` keys a list
+// of functions by (D15201).
+function holeSlotPathSteps(path: string[]): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < path.length - 1 {
+    out.push(path[i])
+    i = i + 1
+  }
+  out
 }
 
 // The root of the place `root` and `p0` name, its steps in `out`, followed through each binding
@@ -5444,6 +5902,8 @@ function holeSlotRebase(root: i32, p0: string[], out: string[]): i32 {
 
 // `holeSlotJudge` for argument `v` handed to the parameter `pNm` the slot `path` reads: an
 // inline list literal's elements, or the slot of the binding it names, `depth` calls deep.
+// `lift` takes a widened slot's set as already joined; a delivery to a closed function type
+// passes false, since it calls every element at its one signature.
 function holeSlotArgJudge(
   v: i32,
   pNm: string,
@@ -5451,6 +5911,7 @@ function holeSlotArgJudge(
   wp: i32[],
   pts: i32[],
   depth: i32,
+  lift: boolean,
 ): boolean {
   const ix = parenPeelIx(v)
   if ix < 0 || ix >= P.nodes.length { return false }
@@ -5463,6 +5924,8 @@ function holeSlotArgJudge(
       vals.push(e)
       ats.push(e)
     }
+    // A literal handed straight to the parameter is read at its own type, which joins its
+    // elements as a binding's initialiser's are joined (D15363); through a forwarder it is not.
     return holeSlotValsJudge(
       holeSlotName(pNm, path),
       holeSlotSpell(pNm, path),
@@ -5471,17 +5934,26 @@ function holeSlotArgJudge(
       0,
       wp,
       pts,
-      holeSlotRetApart,
+      lift && depth == 0 || holeSlotRetApart,
     )
   }
   if depth > 8 { return false }
-  if n is Call { return holeSlotRetJudge(n, pNm, path, wp, pts, depth) }
-  if !(n is Ident) || !cwFramedNode(ix) { return false }
+  if n is Call { return holeSlotRetJudge(n, pNm, path, wp, pts, depth, lift) }
+  // A field or element read judges that slot of the binding it reads (D15199), with no lift:
+  // the instance reads such an argument's slot at the binding's checked type, not its widened set.
+  if !(n is Ident) {
+    const pre: string[] = []
+    const rt = cwSlotPath(ix, pre)
+    if rt < 0 || rt == ix || pre.length == 0 { return false }
+    for st in path { pre.push(st) }
+    return holeSlotArgJudge(rt, pNm, pre, wp, pts, depth + 1, false)
+  }
+  if !cwFramedNode(ix) { return false }
   // A binding bound to another place reads that place's slot.
   const rp: string[] = []
   const rx = holeSlotRebase(ix, path, rp)
   if rx != ix && rx >= 0 && rx < P.nodes.length {
-    return holeSlotArgJudge(rx, pNm, rp, wp, pts, depth + 1)
+    return holeSlotArgJudge(rx, pNm, rp, wp, pts, depth + 1, lift)
   }
   if cwKeyOfRoot(ix) < 0 { return false }
   const bd = cwSoleBinderAt(ix)
@@ -5489,7 +5961,7 @@ function holeSlotArgJudge(
   const init = parenPeelIx(cwBoundInitOf(cwBindingOf(ix)))
   if nodeAt(bd) is LetDecl && init >= 0 && init < P.nodes.length {
     const cn = nodeAt(init)
-    if cn is Call && holeSlotRetJudge(cn, pNm, path, wp, pts, depth) {
+    if cn is Call && holeSlotRetJudge(cn, pNm, path, wp, pts, depth, lift) {
       return true
     }
   }
@@ -5498,7 +5970,7 @@ function holeSlotArgJudge(
     const args: i32[] = []
     if cwElemCallbackRecv(bd) >= 0 || !cwParamArgs(bd, args) { return false }
     for a in args {
-      if holeSlotArgJudge(a, n.identName, path, wp, pts, depth + 1) {
+      if holeSlotArgJudge(a, n.identName, path, wp, pts, depth + 1, lift) {
         return true
       }
     }
@@ -5514,7 +5986,8 @@ function holeSlotArgJudge(
     nW,
     wp,
     pts,
-    false,
+    lift
+      && (nW == 0 && depth == 0 || holeSlotWidenLift(bd, cwBindingOf(ix), path)),
   )
 }
 
@@ -5543,9 +6016,13 @@ export function holeSlotDeliveryJudge(v: i32, srcTy: i32, dstTy: i32): boolean {
     if vn is Ident {
       nm = vn.identName
       if !holeSlotRootCut(vx) { return false }
+    } else {
+      const pre: string[] = []
+      const rt = cwSlotPath(vx, pre)
+      if rt >= 0 && rt != vx && !holeSlotRootCut(rt) { return false }
     }
   }
-  const out = holeSlotArgJudge(v, nm, ["[]"], pts, pts, 0)
+  const out = holeSlotArgJudge(v, nm, ["[]"], pts, pts, 0, false)
   ctnCutClear()
   out
 }
@@ -5573,29 +6050,34 @@ function holeSlotRetJudge(
   wp: i32[],
   pts: i32[],
   depth: i32,
+  lift: boolean,
 ): boolean {
   const rv: i32[] = []
   if !holeSlotCallRets(c, rv) { return false }
   for r in rv {
-    if holeSlotArgJudge(r, pNm, path, wp, pts, depth + 1) { return true }
+    if holeSlotArgJudge(r, pNm, path, wp, pts, depth + 1, lift) { return true }
   }
   false
 }
 
-// Adds to `out` each value the top-level function declaring no type parameter that `c` calls
-// returns; false when `c` calls anything else.
+// Adds to `out` each value the function declaring no type parameter that `c` calls returns: a
+// top-level function by name or as a UFCS method, or a lambda a `const` binds; false for
+// anything else.
 export function holeSlotCallRets(c: Call, out: i32[]): boolean {
   if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
   const cf = nodeAt(parenPeelIx(c.callFn))
-  if !(cf is Ident) { return false }
-  const fx = fnDeclIx[cf.identName] ?? -1
-  if (
-    fx < 0
-    || fx >= P.nodes.length
-    || identFnDeclOf(parenPeelIx(c.callFn)) != fx
-  ) {
-    return false
+  // A UFCS call `x.mk()` runs the `self`-function its member names.
+  let fx = -1
+  if cf is Member {
+    fx = cwUfcsDeclOf(c.callFn)
+  } else if cf is Ident {
+    fx = fnDeclIx[cf.identName] ?? -1
+    // A name that is no top-level function runs the lambda a `const` binds it to (D15209).
+    if fx < 0 || identFnDeclOf(parenPeelIx(c.callFn)) != fx {
+      fx = cwCalleeDeclOf(c.callFn)
+    }
   }
+  if fx < 0 || fx >= P.nodes.length { return false }
   const fd = nodeAt(fx)
   if !(fd is FuncDecl) || fd.fnTyParams.length > 0 || fd.fnBody < 0 {
     return false
@@ -6249,6 +6731,18 @@ function holeOpenFnRetAt(f: i32, c: i32, bNames: string[], bTys: i32[]): i32 {
   if !(ft is TyFunc) || !(n is Call) || !tyHasTyVar(ft.fnRet) { return -1 }
   const np = ft.fnParamTypes.length
   if np == 0 || n.callArgs.length != np { return -1 }
+  // A function a set of several stands for runs the member it holds, so the call gives the set's
+  // join, as the same call does at module scope; its signature names only the first member (D15364).
+  const fs = fnTagSetOfTy(f)
+  if fs >= 0 && fnTagMembers(fs).length > 1 {
+    const sts: i32[] = []
+    for a in n.callArgs {
+      const at = substTyDeep(nodeTyOf(a), bNames, bTys)
+      if at < 0 || tyHasTyVar(at) { return -1 }
+      sts.push(at)
+    }
+    return holeSetCallRetOf(-1, fs, sts, false)
+  }
   const p0 = tyAt(ft.fnParamTypes[0])
   if !(p0 is TyVar) || !tyIsHole(ft.fnParamTypes[0]) { return -1 }
   const d = holeParamDecl(p0.tvName)
@@ -6636,6 +7130,7 @@ function holeCallInstOf(
   const oTys: i32[] = []
   // An un-annotated lambda is bound last, at what the other arguments bind (D6543).
   const lams: i32[] = []
+  const ats: i32[] = []
   let j = 0
   while j < n.callArgs.length {
     if holeArgIsLam(n.callArgs[j]) {
@@ -6649,9 +7144,17 @@ function holeCallInstOf(
         depth + 1,
       )
       if at < 0 { return -1 }
+      ats.push(at)
       bindGenWalk(vf.fnParamTypes[j], at, oNames, oTys)
     }
     j = j + 1
+  }
+  // A tagged set's signature names its members' own holes, so the call is each member's at the
+  // call's own arguments.
+  if fnTagTyIsTagged(vt) {
+    if lams.length > 0 { return -1 }
+    const r = holeSetCallRetOf(c, fnTagSetOfTy(vt), ats, false)
+    return if r >= 0 { mkFuncTy(ats, r) } else { -1 }
   }
   for lj in lams {
     const p = vf.fnParamTypes[lj]
@@ -6694,6 +7197,58 @@ function holeLamBind(
   if r < 0 { return false }
   bindGenWalk(pf.fnRet, r, gNames, gTys)
   true
+}
+
+// Whether a function of open parameters held inside record type `s`, at the place `d` holds a
+// function of closed ones, gives a member a result there whose rep may differ from `d`'s: the
+// twin of `fvaNestedFnDiffers` for a set its members' results decide (D15198).
+export function fvaHeldHoleFnDiffers(s: i32, d: i32, depth: i32): boolean {
+  if s < 0 || d < 0 || depth <= 0 || s >= T.tys.length || d >= T.tys.length {
+    return false
+  }
+  const st = tyAt(s)
+  const dt = tyAt(nonNullTy(d))
+  match st {
+    TyObj => {
+      if !(dt is TyObj) { return false }
+      let i = 0
+      while i < dt.objFieldNames.length {
+        const sf = objFieldType(st, dt.objFieldNames[i])
+        if fvaHeldHoleFnDiffers(sf, dt.objFieldTypes[i], depth - 1) {
+          return true
+        }
+        i = i + 1
+      }
+      return false
+    }
+    TyArray => {
+      return dt is TyArray
+        && fvaHeldHoleFnDiffers(st.aElem, dt.aElem, depth - 1)
+    }
+    TyNullable => {
+      return fvaHeldHoleFnDiffers(st.nInner, nonNullTy(d), depth - 1)
+    }
+    TyFunc => {
+      if (
+        !(dt is TyFunc)
+        || !tyReachesHole(s, 8)
+        || tyReachesHole(nonNullTy(d), 8)
+      ) {
+        return false
+      }
+      const none: string[] = []
+      const noTys: i32[] = []
+      for m in fnTagMembers(fnTagSetOfTy(s)) {
+        const r = holeLamRetAt(m, nonNullTy(d), none, noTys)
+        if r >= 0 && fvaSlotMayDiffer(r, dt.fnRet, 8) { return true }
+      }
+      return false
+    }
+    // A map's, a union's or a scalar's functions are some other rule's.
+    TyMap | TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
 }
 
 // The result of un-annotated lambda `lx` delivered at function type `pt`: its body's type with
@@ -7047,6 +7602,8 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   if tyIx < 0 { return -1 }
   const t = tyAt(tyIx)
   if !(t is TyVar) { return -1 }
+  // A derived hole's base walks here directly, past `substTyDeep`'s own skip (D15034).
+  if substSkipsForeignVar(tyIx) { return -1 }
   const b = bindOf(bNames, bTys, t.tvName)
   if b >= 0 {
     elabPinBindingIs(bNames, bTys)
@@ -7249,6 +7806,32 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
 // `bindGenWalkFull`.
 let bgFull = false
 
+// Set while a call's argument binds: a union of parameters alone waits for the call's other
+// arguments there (`bindParamUnionOwn`, `bindParamUnionsLate`).
+let bgCallArg = false
+export function bgCallArgSet(on: boolean) { bgCallArg = on }
+
+// The joins a call argument's use asked of a type variable an earlier use bound at a narrower
+// number: its name and the wider type, which `checkCallOnFuncTy` re-checks the call at (D2459).
+let bgWidenNames: string[] = []
+let bgWidenTys: i32[] = []
+
+export function bgWidenClear() {
+  bgWidenNames = []
+  bgWidenTys = []
+}
+
+export function bgWidenCount(): i32 { bgWidenNames.length }
+
+// Whether the argument binding now may ask for a join: not a number literal, which adapts to the
+// binding instead (D3541).
+let bgWidenAsk = false
+export function bgWidenAskSet(on: boolean) { bgWidenAsk = on }
+
+export function bgWidenNameAt(i: i32): string { bgWidenNames[i] }
+
+export function bgWidenTyAt(i: i32): i32 { bgWidenTys[i] }
+
 // `bindGenWalk` with two more arms at every depth: a union's one open member binds to the
 // argument's members no concrete member is (`T | string` at `i32 | string` binds `T` to `i32`),
 // and an application binds its arguments pairwise (`Rows<A>` at `Rows<i32>`, a phantom `A` too).
@@ -7343,6 +7926,99 @@ function bindGenUnionRest(
   true
 }
 
+// Binds, after every argument, the type parameters a parameter typed a union of them alone
+// leaves unbound: the members of its argument no bound parameter holds go to the one left, or
+// pair by position with as many left (D3643). 0.
+export function bindParamUnionsLate(
+  params: i32[],
+  args: i32[],
+  bNames: string[],
+  bTys: i32[],
+) {
+  let i = 0
+  while i < params.length && i < args.length {
+    if args[i] >= 0 && params[i] >= 0 && paramOnlyUnion(nonNullTy(params[i])) {
+      bindParamUnionLate(params[i], nodeTyOf(args[i]), bNames, bTys)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Binds at its argument's turn the type parameters a union of them alone at `params[i]` holds
+// when no other parameter names them, so nothing later can bind them otherwise (D3643). 0.
+export function bindParamUnionOwn(
+  params: i32[],
+  i: i32,
+  at: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  if i < 0 || i >= params.length || params[i] < 0 { return 0 }
+  if !paramOnlyUnion(nonNullTy(params[i])) { return 0 }
+  const pms: i32[] = []
+  flattenVariantsInto(params[i], pms)
+  for m in pms {
+    const v = tyAt(m)
+    if v is TyVar {
+      let j = 0
+      while j < params.length {
+        if j != i && tyMentionsTyVarNamed(params[j], v.tvName, 8) { return 0 }
+        j = j + 1
+      }
+    }
+  }
+  bindParamUnionLate(params[i], at, bNames, bTys)
+}
+
+// `bindParamUnionsLate` for parameter type `p` and argument type `at`. 0.
+function bindParamUnionLate(p: i32, at: i32, bNames: string[], bTys: i32[]) {
+  if at < 0 || at >= T.tys.length || tyHasTyVar(at) { return 0 }
+  const pms: i32[] = []
+  flattenVariantsInto(p, pms)
+  const ams: i32[] = []
+  flattenVariantsInto(at, ams)
+  const open: string[] = []
+  const bound: i32[] = []
+  let pNull = false
+  for m in pms {
+    if isNullTy(m) {
+      pNull = true
+    } else {
+      const v = tyAt(m)
+      if !(v is TyVar) { return 0 }
+      const b = bindOf(bNames, bTys, v.tvName)
+      if b >= 0 { bound.push(b) }
+      else if !strListHas(open, v.tvName) { open.push(v.tvName) }
+    }
+  }
+  if open.length == 0 { return 0 }
+  const rest: i32[] = []
+  for a in ams {
+    if a < 0 { return 0 }
+    if !(pNull && isNullTy(a)) {
+      let held = false
+      for b in bound {
+        if b == a || tyEq(b, a) || tyMembersWithin(a, b) { held = true }
+      }
+      if !held { rest.push(a) }
+    }
+  }
+  if rest.length == 0 { return 0 }
+  if open.length == 1 {
+    bNames.push(open[0])
+    bTys.push(tyOfMembers(rest))
+  } else if open.length == rest.length {
+    let k = 0
+    while k < open.length {
+      bNames.push(open[k])
+      bTys.push(rest[k])
+      k = k + 1
+    }
+  }
+  0
+}
+
 // Whether pairing `pms` with `ams` by position meets every member but `open` with an equal one.
 function bgMembersAlign(pms: i32[], ams: i32[], open: i32): boolean {
   if pms.length != ams.length { return false }
@@ -7370,9 +8046,15 @@ export function bindGenWalk(
     // `T` ranges over value types; `u8` is a storage type with no value rep, so binding it
     // would instantiate an i32-list over a one-byte backing — declined here so `assignable` reports it at the argument instead.
     if primNameOf(atIx) == "u8" { return 0 }
-    if bindOf(bNames, bTys, e.tvName) < 0 {
+    const have = bindOf(bNames, bTys, e.tvName)
+    if have < 0 {
       bNames.push(e.tvName)
       bTys.push(widenLitTy(atIx))
+    } else if bgCallArg && bgWidenAsk && numWidens(have, atIx) {
+      if bindOf(bgWidenNames, bgWidenTys, e.tvName) < 0 {
+        bgWidenNames.push(e.tvName)
+        bgWidenTys.push(atIx)
+      }
     }
     return 0
   }
@@ -7387,6 +8069,12 @@ export function bindGenWalk(
   if bgFull { bindGenAppArgs(expIx, atIx, bNames, bTys) }
   if bgFull && bindGenUnionRest(expIx, atIx, bNames, bTys) {
     // The union arm bound the open member, or paired the members.
+  } else if (
+    !bgCallArg
+    && paramOnlyUnion(expIx)
+    && bindGenUnionRest(expIx, atIx, bNames, bTys)
+  ) {
+    // A union of parameters alone pairs by position, as the instance's pin does (D3643).
   } else if e is TyArray {
     if a is TyArray { bindGenWalk(e.aElem, a.aElem, bNames, bTys) }
   } else if e is TyNullable {
@@ -7839,6 +8527,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if substNestMode != SUBST_ALL && !substBindsNestRow(tyIx, t.tvName) {
       return tyIx
     }
+    if substSkipsForeignVar(tyIx) { return tyIx }
     const b = substHoleTy(tyIx, bNames, bTys)
     if b >= 0 { return b }
     return tyIx
@@ -7937,6 +8626,11 @@ function substRejoinApart(
     if recorded { carryRetJoin(r, key, vals) }
     return r
   }
+  const pl = tpParamLitJoins.get(tyIx)
+  if pl != null && !recorded && (tpJoinUnions.get(tyIx) ?? 0) == 1 {
+    const pj = paramLitRejoin(tyIx, pl, ms)
+    if pj >= 0 { return pj }
+  }
   const tpSaved = tpApartConcrete
   tpApartConcreteSet(true)
   njRejoinApartSet((tpJoinUnions.get(tyIx) ?? 0) == 2)
@@ -7944,6 +8638,38 @@ function substRejoinApart(
   tpApartConcreteSet(tpSaved)
   if recorded { carryRetJoin(res, key, vals) }
   res
+}
+
+// The pin of join `tyIx` of written union `wu` and a concrete type, members `out` substituted:
+// `wu`'s members re-join apart, as runtime values, and the rest join into them; -1 when the
+// members do not line up with `tyIx`'s.
+function paramLitRejoin(tyIx: i32, wu: i32, out: i32[]): i32 {
+  const t = tyAt(tyIx)
+  const w = tyAt(wu)
+  if !(t is TyUnion) || !(w is TyUnion) || t.uMembers.length != out.length {
+    return -1
+  }
+  const grp: i32[] = []
+  const fixed: boolean[] = []
+  const rest: i32[] = []
+  let i = 0
+  while i < out.length {
+    if i32ListHas(w.uMembers, t.uMembers[i]) {
+      grp.push(out[i])
+      fixed.push(true)
+    } else {
+      rest.push(out[i])
+    }
+    i = i + 1
+  }
+  if grp.length == 0 { return -1 }
+  const tpSaved = tpApartConcrete
+  tpApartConcreteSet(true)
+  njRejoinApartSet(true)
+  let r = rejoinMembers(grp, fixed)
+  for m in rest { r = joinTys(r, m) }
+  tpApartConcreteSet(tpSaved)
+  rejoinDropSubsumed(r)
 }
 
 // `substTyDeep` over nullable `t` at `tyIx`: the inner type substituted, rebuilt only when it changed.

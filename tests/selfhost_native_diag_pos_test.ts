@@ -24,7 +24,7 @@
 // @test-timing native
 
 import { makeTempDir } from "./support/filePath.ts";
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -76,7 +76,8 @@ const assertPositioned = async (
 };
 
 Deno.test({
-  name: "native-diag-pos: type error carries path:line:col of the offending token",
+  name:
+    "native-diag-pos: type error carries path:line:col of the offending token",
   ignore: !ENABLED,
   fn: async () => {
     // Line 2, col 16 (0-based) is the `x` initializer — the type-diag anchor;
@@ -90,7 +91,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "native-diag-pos: parse error carries path:line:col of the unexpected token",
+  name:
+    "native-diag-pos: parse error carries path:line:col of the unexpected token",
   ignore: !ENABLED,
   fn: async () => {
     // Line 2, col 4 (0-based) is the `=` where an IDENT was expected; shown
@@ -116,7 +118,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "native-diag-pos: corpus lambda-uninferable-param pins the parameter token",
+  name:
+    "native-diag-pos: corpus lambda-uninferable-param pins the parameter token",
   ignore: !ENABLED,
   fn: async () => {
     // The real corpus file: a lambda passed to an un-annotated HOF param its callee only returns,
@@ -125,7 +128,8 @@ Deno.test({
     const path = `${ROOT}/tests/cases/functions/lambda-uninferable-param.vl`;
     const r = await check(path);
     if (r.code === 0) throw new Error("expected rejection, vl check exited 0");
-    const needle = `${path}: error [11:14] cannot infer a type for parameter \`n\``;
+    const needle =
+      `${path}: error [11:14] cannot infer a type for parameter \`n\``;
     if (!r.err.includes(needle)) {
       throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
     }
@@ -133,7 +137,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "native-diag-pos: unused-function anchors at the declaration's NAME token",
+  name:
+    "native-diag-pos: unused-function anchors at the declaration's NAME token",
   ignore: !ENABLED,
   fn: async () => {
     // A LINT diagnostic's position: `dead` starts at line 1, col 9 (0-based) —
@@ -149,11 +154,15 @@ Deno.test({
       );
       const r = await check(path);
       if (r.code !== 0) {
-        throw new Error(`expected exit 0 (warning only), got ${r.code}:\n${r.err}`);
+        throw new Error(
+          `expected exit 0 (warning only), got ${r.code}:\n${r.err}`,
+        );
       }
       const needle = `${path}: warning [1:10] Unused function \`dead\``;
       if (!r.err.includes(needle)) {
-        throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
+        throw new Error(
+          `expected stderr to contain "${needle}", got:\n${r.err}`,
+        );
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
@@ -188,7 +197,8 @@ const build = async (path: string): Promise<{ code: number; err: string }> => {
 };
 
 Deno.test({
-  name: "native-diag-pos: EMIT-stage failure anchors at the failing function's name",
+  name:
+    "native-diag-pos: EMIT-stage failure anchors at the failing function's name",
   ignore: !ENABLED,
   fn: async () => {
     // `is` over a literal-union list arm has no interned arm representation (D14041), so
@@ -209,16 +219,20 @@ Deno.test({
           "  if x is K[] { print(x[0]) } else { print(z) }\n" +
           "}\n" +
           "useIt([1])\n" +
-          "useIt(\"s\")\n",
+          'useIt("s")\n',
       );
       const r = await build(path);
-      if (r.code === 0) throw new Error("expected emit-stage rejection, got exit 0");
+      if (r.code === 0) {
+        throw new Error("expected emit-stage rejection, got exit 0");
+      }
       if (!r.err.includes("emit error")) {
         throw new Error(`expected "emit error" in stderr, got:\n${r.err}`);
       }
       const needle = `${path}:4:10:`;
       if (!r.err.includes(needle)) {
-        throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
+        throw new Error(
+          `expected stderr to contain "${needle}", got:\n${r.err}`,
+        );
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
@@ -227,7 +241,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "native-diag-pos: a TOP-LEVEL emit failure anchors at the read, not at the last function",
+  name:
+    "native-diag-pos: a TOP-LEVEL emit failure anchors at the read, not at the last function",
   ignore: !ENABLED,
   fn: async () => {
     // The function-name anchor above is the right one for a failure raised deep inside a
@@ -238,36 +253,37 @@ Deno.test({
     // that had nothing to do with the failure.
     //
     // Two things fix it and this pins both: the field-access floors are NODE-anchored
-    // (`emitFailAt`, the `Member` node → its property token, 0-based col 17 of line 11,
-    // printed 1-based as 11:18), and the start function arms a top-level STATEMENT cursor so
+    // (`emitFailAt`, the `Member` node → its property token, 0-based col 20 of line 9,
+    // printed 1-based as 9:21), and the start function arms a top-level STATEMENT cursor so
     // any other failure it raises lands on the statement instead of on a stale function.
     //
-    // The shared field here is a RECORD stored at a different shape per member, which the
-    // dispatch has no result rep for — so this is still a loud reject after a same-typed
-    // field learned to dispatch (D3562), which is exactly why it is usable as a position
-    // witness.
+    // The witness is a top-level then-arm read of a field the `is` arms store differently,
+    // still a loud field-access reject (D4266). The earlier witness, a record field stored at
+    // a different shape per member, lowers since D15314.
     const dir = await makeTempDir({ prefix: "vl_diag_pos_top_" });
     try {
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
         path,
-        "type A = { xs: { x: i32 }, a: i32 }\n" +
-          "type B = { pad: boolean, xs: { x: i32, y: i32 } }\n" +
-          "function g(flag: boolean): A | B {\n" +
-          "  if flag { return { xs: { x: 1 }, a: 3 } }\n" +
-          "  return { pad: true, xs: { x: 4, y: 5 } }\n" +
-          "}\n" +
+        'type A = { v: "a" | "b" }\n' +
+          "type B = { v: string | null }\n" +
           "function pad(x: i32): i32 {\n" +
           "  return x + 1\n" +
           "}\n" +
           "print(pad(1))\n" +
-          "print(g(true).xs.x)\n",
+          'const b: B = { v: "a" }\n' +
+          "const u: A | B = b\n" +
+          'if u is A { print(u.v) } else { print("B") }\n',
       );
       const r = await build(path);
-      if (r.code === 0) throw new Error("expected emit-stage rejection, got exit 0");
-      const needle = `${path}:11:18:`;
+      if (r.code === 0) {
+        throw new Error("expected emit-stage rejection, got exit 0");
+      }
+      const needle = `${path}:9:21:`;
       if (!r.err.includes(needle)) {
-        throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
+        throw new Error(
+          `expected stderr to contain "${needle}", got:\n${r.err}`,
+        );
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
@@ -316,7 +332,14 @@ const runIn = async (dir: string): Promise<{ code: number; err: string }> => {
 
 const buildIn = async (dir: string): Promise<{ code: number; err: string }> => {
   const { code, stderr } = await new Deno.Command(VL, {
-    args: ["build", `${dir}/entry.vl`, "-o", `${dir}/out.wasm`, "--compiler", COMPILER],
+    args: [
+      "build",
+      `${dir}/entry.vl`,
+      "-o",
+      `${dir}/out.wasm`,
+      "--compiler",
+      COMPILER,
+    ],
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv(),
@@ -348,20 +371,34 @@ const assertOwnerAgreement = async (
 ): Promise<void> => {
   const dir = await writeTree(files);
   try {
-    const [r, b, c] = [await runIn(dir), await buildIn(dir), await check(`${dir}/entry.vl`)];
+    const [r, b, c] = [
+      await runIn(dir),
+      await buildIn(dir),
+      await check(`${dir}/entry.vl`),
+    ];
     const expect = want(dir).slice().sort();
     const got = runLocs(r.err).slice().sort();
     const gotB = runLocs(b.err).slice().sort();
     const oracle = checkLocs(c.err).slice().sort();
     if (JSON.stringify(got) !== JSON.stringify(expect)) {
-      throw new Error(`vl run: expected ${JSON.stringify(expect)}, got ${JSON.stringify(got)}\n${r.err}`);
+      throw new Error(
+        `vl run: expected ${JSON.stringify(expect)}, got ${
+          JSON.stringify(got)
+        }\n${r.err}`,
+      );
     }
     if (JSON.stringify(gotB) !== JSON.stringify(expect)) {
-      throw new Error(`vl build: expected ${JSON.stringify(expect)}, got ${JSON.stringify(gotB)}\n${b.err}`);
+      throw new Error(
+        `vl build: expected ${JSON.stringify(expect)}, got ${
+          JSON.stringify(gotB)
+        }\n${b.err}`,
+      );
     }
     if (JSON.stringify(oracle) !== JSON.stringify(expect)) {
       throw new Error(
-        `vl check (the oracle) disagrees: expected ${JSON.stringify(expect)}, got ${JSON.stringify(oracle)}\n${c.err}`,
+        `vl check (the oracle) disagrees: expected ${
+          JSON.stringify(expect)
+        }, got ${JSON.stringify(oracle)}\n${c.err}`,
       );
     }
   } finally {
@@ -370,74 +407,88 @@ const assertOwnerAgreement = async (
 };
 
 Deno.test({
-  name: "native-diag-owner: a type error in a DEPENDENCY is labelled with the dependency's path",
+  name:
+    "native-diag-owner: a type error in a DEPENDENCY is labelled with the dependency's path",
   ignore: !ENABLED,
   fn: async () => {
     // Before the fix `vl run` printed `entry.vl:2:20` — the dependency's line and
     // column against the entry's name.
     await assertOwnerAgreement({
       "entry.vl": 'import { bad } from "./dep"\nprint(bad())\n',
-      "dep.vl": "export function bad(): i32 {\n  const s: string = 42\n  return 1\n}\n",
+      "dep.vl":
+        "export function bad(): i32 {\n  const s: string = 42\n  return 1\n}\n",
     }, (d) => [`${d}/dep.vl:2`]);
   },
 });
 
 Deno.test({
-  name: "native-diag-owner: a PARSE error in a dependency is labelled with the dependency's path",
+  name:
+    "native-diag-owner: a PARSE error in a dependency is labelled with the dependency's path",
   ignore: !ENABLED,
   fn: async () => {
     // The parse tier resolves its owner through a TOKEN index (`modOfTok`), the
     // type tier through `nodeToks` — two different anchor paths in `diagModule`.
     await assertOwnerAgreement({
       "entry.vl": 'import { bad } from "./dep"\nprint(bad())\n',
-      "dep.vl": "export function bad(): i32 {\n  const s: = 42\n  return 1\n}\n",
+      "dep.vl":
+        "export function bad(): i32 {\n  const s: = 42\n  return 1\n}\n",
     }, (d) => [`${d}/dep.vl:2`]);
   },
 });
 
 Deno.test({
-  name: "native-diag-owner: a TRANSITIVE dependency's error names that file, not the entry or the middle",
+  name:
+    "native-diag-owner: a TRANSITIVE dependency's error names that file, not the entry or the middle",
   ignore: !ENABLED,
   fn: async () => {
     await assertOwnerAgreement({
       "entry.vl": 'import { a } from "./mid"\nprint(a())\n',
-      "mid.vl": 'import { deep } from "./deep"\nexport function a(): i32 { return deep() }\n',
-      "deep.vl": "export function deep(): i32 {\n  const s: string = 42\n  return 1\n}\n",
+      "mid.vl":
+        'import { deep } from "./deep"\nexport function a(): i32 { return deep() }\n',
+      "deep.vl":
+        "export function deep(): i32 {\n  const s: string = 42\n  return 1\n}\n",
     }, (d) => [`${d}/deep.vl:2`]);
   },
 });
 
 Deno.test({
-  name: "native-diag-owner: two errors in two files are labelled per-diagnostic",
+  name:
+    "native-diag-owner: two errors in two files are labelled per-diagnostic",
   ignore: !ENABLED,
   fn: async () => {
     // The decisive shape: one label for the whole run cannot be right for both.
     await assertOwnerAgreement({
-      "entry.vl": 'import { bad } from "./dep"\nconst t: string = 7\nprint(bad())\n',
-      "dep.vl": "export function bad(): i32 {\n  const s: string = 42\n  return 1\n}\n",
+      "entry.vl":
+        'import { bad } from "./dep"\nconst t: string = 7\nprint(bad())\n',
+      "dep.vl":
+        "export function bad(): i32 {\n  const s: string = 42\n  return 1\n}\n",
     }, (d) => [`${d}/dep.vl:2`, `${d}/entry.vl:2`]);
   },
 });
 
 Deno.test({
-  name: "native-diag-owner: a subdirectory dependency keeps its `sub/dep.vl` key",
+  name:
+    "native-diag-owner: a subdirectory dependency keeps its `sub/dep.vl` key",
   ignore: !ENABLED,
   fn: async () => {
     // The module KEY is the path the host was asked to read, slashes and all.
     await assertOwnerAgreement({
       "entry.vl": 'import { bad } from "./sub/dep"\nprint(bad())\n',
-      "sub/dep.vl": "export function bad(): i32 {\n  const s: string = 42\n  return 1\n}\n",
+      "sub/dep.vl":
+        "export function bad(): i32 {\n  const s: string = 42\n  return 1\n}\n",
     }, (d) => [`${d}/sub/dep.vl:2`]);
   },
 });
 
 Deno.test({
-  name: "native-diag-owner: CONTROL — an error in the ENTRY of a multi-module program is unchanged",
+  name:
+    "native-diag-owner: CONTROL — an error in the ENTRY of a multi-module program is unchanged",
   ignore: !ENABLED,
   fn: async () => {
     // Module 0's key IS the entry path, so this row must read exactly as before.
     await assertOwnerAgreement({
-      "entry.vl": 'import { ok } from "./dep"\nconst s: string = 42\nprint(ok())\n',
+      "entry.vl":
+        'import { ok } from "./dep"\nconst s: string = 42\nprint(ok())\n',
       "dep.vl": "export function ok(): i32 { return 1 }\n",
     }, (d) => [`${d}/entry.vl:2`]);
   },
@@ -452,7 +503,9 @@ Deno.test({
 // disagreement that anything scraping either channel inherits. `cli-design.md` settles
 // it: "`line` (1-based), `col` (1-based, inclusive)".
 
-const runProg = async (path: string): Promise<{ code: number; err: string }> => {
+const runProg = async (
+  path: string,
+): Promise<{ code: number; err: string }> => {
   const { code, stderr } = await new Deno.Command(VL, {
     args: ["run", path, "--compiler", COMPILER],
     stdout: "piped",
@@ -462,7 +515,9 @@ const runProg = async (path: string): Promise<{ code: number; err: string }> => 
   return { code, err: new TextDecoder().decode(stderr) };
 };
 
-const checkJson = async (path: string): Promise<{ code: number; out: string }> => {
+const checkJson = async (
+  path: string,
+): Promise<{ code: number; out: string }> => {
   const { code, stdout } = await new Deno.Command(VL, {
     args: ["check", path, "--json", "--compiler", COMPILER],
     stdout: "piped",
@@ -473,7 +528,8 @@ const checkJson = async (path: string): Promise<{ code: number; out: string }> =
 };
 
 Deno.test({
-  name: "native-diag-pos: the same diagnostic reaches the same column through check and run",
+  name:
+    "native-diag-pos: the same diagnostic reaches the same column through check and run",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await makeTempDir({ prefix: "vl_diag_pos_base_" });
@@ -496,11 +552,15 @@ Deno.test({
       const rm = ran.err.match(/case\.vl:(\d+):(\d+): /);
       if (!rm) throw new Error(`no run path:line:col in:\n${ran.err}`);
 
-      for (const [chan, m] of Object.entries({ concise: cm, json: jm, run: rm })) {
+      for (
+        const [chan, m] of Object.entries({ concise: cm, json: jm, run: rm })
+      ) {
         if (Number(m[1]) !== 1 || Number(m[2]) !== WANT) {
           throw new Error(
             `${chan}: want 1:${WANT} (1-based, the opening quote of \`"s"\`), got ` +
-              `${m[1]}:${m[2]}. Every channel renders the guest's 0-based \`diagCol\`, ` +
+              `${m[1]}:${
+                m[2]
+              }. Every channel renders the guest's 0-based \`diagCol\`, ` +
               `and each must shift it exactly once.`,
           );
         }
@@ -508,5 +568,63 @@ Deno.test({
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
+  },
+});
+
+// A list of a function set copied into a readonly list of a closed function type is rewritten to
+// `src.map(...)` (`fvaListSetCopy`). The user's source span is what a diagnostic names: the refused
+// delivery points at `zs`, and a copy that is accepted reports nothing about the synthesized nodes.
+const FN_SET_LIST = "function id<T>(x: T): T { return x }\n" +
+  "function dbl<T>(x: T): T { return x + x }\n" +
+  'let f = id\nf = dbl\nprint(f("s"))\nprint(f(1))\nconst zs = [f]\n';
+
+Deno.test({
+  name:
+    "native-diag-pos: a refused fn-set list copy points at the user's source",
+  ignore: !ENABLED,
+  fn: async () => {
+    await assertPositioned(
+      FN_SET_LIST +
+        "const ys: readonly ((x: i32) => string)[] = zs\nprint(ys.length)\n",
+      "type",
+      ": error [8:45] cannot assign ((T) => T)[] to 'ys' of type readonly ((i32) => string)[]",
+    );
+  },
+});
+
+Deno.test({
+  name:
+    "native-diag-pos: an accepted fn-set list copy names no synthesized node",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_diag_pos_" });
+    try {
+      const path = `${dir}/case.vl`;
+      await Deno.writeTextFile(
+        path,
+        FN_SET_LIST +
+          "const ys: readonly ((x: i32) => i32)[] = zs\nprint(ys[0](41))\n",
+      );
+      const r = await check(path);
+      if (r.code !== 0 || r.err.includes("map") || r.err.includes("$e")) {
+        throw new Error(`want a clean check, got exit ${r.code}:\n${r.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "native-diag-pos: a mutable list sharing a fn-set list points at the user's source",
+  ignore: !ENABLED,
+  fn: async () => {
+    // D15133: the refusal names the delivered `zs`, not the literal its `const` names.
+    await assertPositioned(
+      FN_SET_LIST + "const ys: ((x: i32) => i32)[] = zs\nprint(ys[0](41))\n",
+      "type",
+      ": error [8:33] ((T) => T)[] is not ((i32) => i32)[]",
+    );
   },
 });

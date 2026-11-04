@@ -21739,7 +21739,7 @@ can never fail this way, so a green local ladder is evidence about your seed, no
      and it is precisely the evidence that cannot ride in the same PR. Take the corpus pin for the
      fix, and land the self-compile use as the follow-up that also re-proves it.
 
-## D-SIGSKIP + D-ARRROUTE — the ONE non-inert `$fnsig` intern site gets its guard, and the ARRAY-NAME grammar leaves three more files (#PRNUM)
+## D-SIGSKIP + D-ARRROUTE — the ONE non-inert `$fnsig` intern site gets its guard, and the ARRAY-NAME grammar leaves three more files (#5870)
 
 Off master `63cdb61` (#1175). Two subjects, one partition
 (`emit_collect` / `emit_mono` / `emit_rep` / `emit_rewrite`).
@@ -22450,7 +22450,7 @@ re-`check`s. The *parser* half IS pinned, by both fixtures.
      compiles and executes every fixture; `format.vl` is on neither path. The channel that can see
      it is a fmt sweep with an idempotence leg. *Pick the channel by what the change touches, not
      by what the harness already does.*
-## D-ARRCLASSIFY — the ARRAY-NAME grammar leaves the compiler's LARGEST file: 49 hand-written copies in `emit_classify.vl` go to 3, and the peel loop gets the home it never had (#PRNUM)
+## D-ARRCLASSIFY — the ARRAY-NAME grammar leaves the compiler's LARGEST file: 49 hand-written copies in `emit_classify.vl` go to 3, and the peel loop gets the home it never had (#5870)
 
 Branched from **`339ed9a`** (#1177), rebased onto **`563b9e7`** (#1180 — comment-only, and it does
 not touch this partition). Partition: `compiler/emit_classify.vl` + `compiler/emit_base.vl` + this

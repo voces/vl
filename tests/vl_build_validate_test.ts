@@ -23,8 +23,8 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D13960 — a wider record list spread into
-// a narrower rest parameter builds the rest list unconverted). If that hole is closed the fixture stops
+// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D2660 — a generic `T` bound from a list
+// and from a `let x = null` hole that a later write fills builds an invalid module). If that hole is closed the fixture stops
 // producing an invalid module and this pin would silently go inert — so the first
 // assertions check the PRECONDITION and fail loudly with a swap instruction rather than
 // passing vacuously. Swap in any other source that emits an invalid module; the whole
@@ -52,26 +52,30 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: D13960's witness. `total(...cs)` builds the `Shape[]` rest
-// list from `Circle` structs — `type mismatch: expected (ref $type), found (ref $type)`. Closing
-// D13960 is a change the precondition assertions below catch.
+// Type-checks clean, emits invalid wasm: D2660's witness, invalid inside `main`. Closing D2660 is
+// a change the precondition assertions below catch.
 //
-// It REPLACES D3689's `d is 1` over `d: f64`, which became a loud emit refusal pending its ruling
+// It REPLACES D14891's record built from a wider value union (refused since the call delivery
+// judges a literal its destination merges numbers in by its type), which REPLACED D2225's reassigned `[]`-or-`null` binding (closed by the assignment pinning the
+// list's element), which REPLACED D14960's spread of a wider record list into a narrower rest parameter (closed by
+// building the rest list at the parameter's type), which REPLACED D13960's `name: string` face of the same spread, refused since the width-drop check
+// judges a spread's elements, which REPLACED D3689's `d is 1` over `d: f64`, which became a loud emit refusal pending its ruling
 // (D14642), which itself REPLACED D1400's annotated-binding cell, which the checker refuses since `as?` over a hole
 // is typed `N | null` before any pin (D3654). Before that: the member-variance fixture (refused
 // since the record-covariance ruling), the narrowed-litunion-arm fixture, a `.map` callback
 // PARAMETER spelled as the inline member union, and an unread global binding of a generic
 // function's nullable-closure return. The precondition assertion caught all five.
 const INVALID_SRC = [
-  "type Shape = { r: f64 }",
-  "type Circle = { r: f64, name: string }",
-  "function total(...xs: Shape[]): f64 {",
-  "  let t = 0.0",
-  "  for x in xs { t = t + x.r }",
-  "  t",
+  "function link2<T>(xs: T[], v: T) { xs.push(v) }",
+  "function main() {",
+  "  const xs: (string | null)[] = []",
+  "  let x = null",
+  "  link2(xs, x)",
+  "  x = 5",
+  "  xs.push(\"s\")",
+  "  print(xs.length)",
   "}",
-  'const cs: Circle[] = [{ r: 1.5, name: "a" }, { r: 2.0, name: "b" }]',
-  "print(total(...cs))",
+  "main()",
   "",
 ].join("\n");
 

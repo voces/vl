@@ -2,28 +2,51 @@
 // optional call, or a call through a function type with its bounds, constraints and rest
 // parameter.
 
+import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { decDigitsOf } from "./strutil"
 import { identTyOf } from "./check_nar_store"
 import {
   ArrayLit,
+  AsExpr,
+  BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
+  ForRange,
   FuncDecl,
   Ident,
+  IfStmt,
+  ImportDecl,
   Index,
+  IsExpr,
   LetDecl,
+  LoopVar,
+  MatchExpr,
   Member,
   Node,
+  NullLit,
   NumLit,
   ObjLit,
   OptMember,
   P,
   Param,
+  Paren,
+  Program,
   RetStmt,
   Spread,
+  StrLit,
+  TypeDecl,
   TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
   annTsOf,
   callHasTyArgs,
   callIsRestPacked,
@@ -37,6 +60,8 @@ import {
   hasSpreadItem,
   i32ToStr,
   loopVarLoop,
+  mkIndex,
+  mkNull,
   nodeAt,
   nodeChildren,
   nodeIsTplHole,
@@ -72,9 +97,10 @@ import {
   callBindNote,
   callBindRowOf,
   callBindTysAt,
+  callNumJoinNote,
+  callNumJoined,
   fsbDeclAtNode,
   fsbName,
-  holeFnSplitSet,
 } from "./check_bind_rows"
 import { crSubtreeMentions } from "./check_capture_walks"
 import {
@@ -86,6 +112,7 @@ import {
   elabCapTy,
   elabDefaultRowNote,
   elabEarlyCallNote,
+  elabFnFieldWidened,
   elabHoleDeclOf,
   elabHolePinNote,
   elabHoleRowCut,
@@ -93,6 +120,11 @@ import {
   elabHoleRowMark,
   elabPinBindingIs,
   elabValueRowNote,
+  fnLetOpenHandNote,
+  fnParamHandNote,
+  fnSetCalleeNote,
+  fnSlotCallNote,
+  fnTagArmMemberOf,
   fnTagChoiceOfTy,
   fnTagMembers,
   fnTagSetOfTy,
@@ -116,6 +148,7 @@ import {
   globalBeforeDecl,
   inferObserved,
   memSharedCalls,
+  optReadParts,
 } from "./check_core_state"
 import {
   rcwBdCall,
@@ -129,6 +162,7 @@ import {
   compArgCstrOk,
   noteArgCstr,
   noteArgCstrAt,
+  noteArrDefCstr,
   noteBinCstr,
   noteMemCstr,
   notePrintCstr,
@@ -136,12 +170,14 @@ import {
 import { ctnLitInitOf } from "./check_ctn_lit_bind"
 import {
   cstrOwnerStack,
+  curFnDeclIx,
   inferQuiet,
   tpEnvNames,
   tpEnvTyOfName,
   tpEnvTys,
 } from "./check_cursor"
 import {
+  arrNewInFnPut,
   boundObjRootOf,
   memOffsetCheckedValue,
   v128SeenSet,
@@ -155,6 +191,7 @@ import {
   holeCastPinCheck,
   holeDemandOk,
   holeFnDeliveryDemands,
+  holeKidMapDemands,
   instGenFnHolePins,
   memberFloorErr,
   orderNamedCallArgs,
@@ -162,6 +199,7 @@ import {
   refuseOpenNullHoleArg,
   restCallPack,
   tplHoleHandled,
+  validateArrDefCstrs,
   validateBinCstrs,
   validateEscJoins,
   validateIsCstrs,
@@ -180,7 +218,7 @@ import {
   tyArgReadHintIfAny,
 } from "./check_diag_text"
 import {
-  callDstTyOf,
+  callDstTyForGeneric,
   calleeIdentName,
   calleeRetDeclared,
   lambdaBodyTail,
@@ -193,9 +231,15 @@ import {
   collapseDeferredJoin,
   constrainEmptyExpr,
   rcwCovs,
+  recordCtxTy,
   stampNullUnitCell,
 } from "./check_fit_rules"
-import { CSTR_NODECL, lambdaLastOrder } from "./check_generic_args"
+import {
+  CSTR_NODECL,
+  lambdaLitLastOrder,
+  litArgBindsLast,
+  numLitArg,
+} from "./check_generic_args"
 import {
   bitcastArgTy,
   builtinShadowMsg,
@@ -212,6 +256,7 @@ import {
   HD_ELEM,
   HD_PARAM,
   HD_RET,
+  holePinHeld,
   tyArithMeetsParam,
   tyIsNonNullHoleRead,
   tyParamsApart,
@@ -259,9 +304,8 @@ import {
   withUnionArmBinds,
 } from "./check_leaf_steps"
 import { checkMemberCallNode } from "./check_member_call"
-import { callTyArgsCalleeOk } from "./check_narrow_flow"
-import { noteHoleArgNullRead } from "./check_narrow_paths"
-import { njFnReached } from "./check_nj_gate"
+import { callTyArgsCalleeOk, popScope } from "./check_narrow_flow"
+import { noteHoleArgNullRead, pushScope } from "./check_narrow_paths"
 import { njFnIx } from "./check_nj_join"
 import {
   checkBoundSubsumes,
@@ -274,7 +318,8 @@ import {
 } from "./check_node_rules"
 import { nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import { lbiNoDest } from "./check_num_lit_state"
-import { floatIntrWidth } from "./check_num_lits"
+import { RB_CALL_REJOIN, checkMark, checkRollback } from "./check_rollback"
+import { floatIntrWidth, isFloatLitExpr } from "./check_num_lits"
 import { arityWantText, ovPlainHint, paramNamesOfNodes } from "./check_overload"
 import {
   getSiteFnOf,
@@ -286,11 +331,19 @@ import {
   GEN_FN_HOLE_UNCALLED,
   argMismatchErr,
   assignable,
+  bgCallArgSet,
+  bgWidenAskSet,
+  bgWidenClear,
+  bgWidenCount,
+  bgWidenNameAt,
+  bgWidenTyAt,
   bindExplicitTyArgs,
   bindGenFnRetUnionArm,
   bindGenInnerUnionArms,
   bindGenUnionArm,
   bindGenWalk,
+  bindParamUnionOwn,
+  bindParamUnionsLate,
   directHoleBodyRet,
   genFnHoleCallInsts,
   genFnHoleCalled,
@@ -300,7 +353,6 @@ import {
   genFnHoleSoleInst,
   genericDeclRetMisfit,
   holeChoiceArms,
-  holeChoiceArmsOf,
   holeChoiceWaits,
   holeFnArgDecls,
   holeFnArgRetAt,
@@ -313,7 +365,9 @@ import {
   holeSetCallRetOf,
   holeSlotCallRets,
   judgeHoleCallOps,
+  setMemberRetAt,
   substTyDeep,
+  substTyDeepOf,
   tErr,
   tErrUnsupported,
   widenLitTy,
@@ -324,7 +378,13 @@ import {
   recFreshMapDeclOf,
   recHeldLit,
 } from "./check_rec_fresh"
-import { recAdPushSettled, recAdSetGroup } from "./check_rec_rows"
+import {
+  recAdDeclineSettled,
+  recAdPushSettled,
+  recAdPushSettledLit,
+  recAdSetGroup,
+  recPend,
+} from "./check_rec_rows"
 import { pgrNoteCall } from "./check_poly_growth"
 import {
   calleeDeclParams,
@@ -342,6 +402,7 @@ import {
   noteDeferredJoinNode,
   noteHoleArgLambda,
   noteHoleArgNamed,
+  notePendingArgMap,
   noteValBindLambda,
   widenRetagGenArg,
   widenRetagGenArgSet,
@@ -353,6 +414,8 @@ import {
   cstrOwnedBy,
   cstrOwnedStrict,
   cstrOwnedStrictSet,
+  cstrSetOwners,
+  cstrSetOwnersSet,
   curFnOwner,
   fnOwnerKey,
   nestParentOf,
@@ -361,10 +424,15 @@ import {
   substNestDeclSet,
   substNestMode,
   substNestModeSet,
+  substSelfOwner,
+  substSelfOwnerSet,
+  topFnOwnerOf,
+  tyFirstVarOwner,
   tyIsForeignGenericSig,
   tyIsHoleGenericSig,
 } from "./check_subst"
 import {
+  joinOverOwnParams,
   keptParamUnion,
   paramHoleName,
   tpGradualView,
@@ -394,6 +462,7 @@ import {
   TyVar,
   mkArrayTy,
   mkArrayViewTy,
+  mkFuncTy,
   mkMapTy,
   mkNullableTy,
   mkObjTy,
@@ -404,6 +473,7 @@ import {
   tyHasHole,
   tyIsDeclaredParam,
   tyIsHole,
+  tyIsParamHole,
   tyIxIsView,
   tyMentionsTyVarNamed,
   tyPrintsAsRef,
@@ -442,6 +512,7 @@ import {
   isNullTy,
   isVoidTy,
   nonNullTy,
+  primNameOf,
   tyHasTyVar,
   tyIsU8ArrayTy,
   tyReachesHole,
@@ -851,6 +922,13 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
   // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
   // host parity: `defaultScope.ts`. `__array_new__(n, fill)` allocates `n`
   // slots each set to `fill`, typing as `T[]` with `T` = the fill's type.
+  if (
+    curFnDeclIx >= 0
+    && (cfn.identName == "__array_new__"
+      || cfn.identName == "__array_new_default__")
+  ) {
+    arrNewInFnPut(ix)
+  }
   if cfn.identName == "__array_new__" {
     const anArgs = n.callArgs
     if anArgs.length != 2 {
@@ -1015,6 +1093,7 @@ function checkArrayNewDefaultCall(n: Call, ix: i32): i32 {
   const adTy = mkArrayTy(-1)
   arrDefCallIx.push(ix)
   arrDefCallTy.push(adTy)
+  noteArrDefCstr(adTy, ix)
   return adTy
 }
 
@@ -1054,8 +1133,10 @@ function checkArrayCopyCall(n: Call, ix: i32): i32 {
 
 // A call through a binding whose type an annotation or a lambda's parameters wrote binds each
 // enclosing type parameter that type names to itself, since `k: (x: T) => void` takes the body's
-// `T`; an argument of another type parameter is then judged at each instance (D6483).
+// `T`; an argument of another type parameter is then judged at each instance (D6483). A set's
+// dispatch arm `ix` calls its member, whose variables are its own, solved from the arguments.
 function bindCalleeScopeTyParams(
+  ix: i32,
   cfn: Node,
   cfnIx: i32,
   ft: TyFunc,
@@ -1063,6 +1144,7 @@ function bindCalleeScopeTyParams(
   bTys: i32[],
 ) {
   if tpEnvNames.length == 0 || !calleeTyIsScoped(cfn, cfnIx) { return 0 }
+  if fnTagArmMemberOf(ix) >= 0 { return 0 }
   const own = selfCallHolePrefix(cfn, cfnIx)
   let i = tpEnvNames.length - 1
   while i >= 0 {
@@ -1101,7 +1183,9 @@ function bindTemplateRow(ix: i32, bNames: string[], bTys: i32[]) {
   let q = 0
   while q < tn.length && q < tt.length {
     if !strListHas(bNames, tn[q]) {
-      const t = substTyDeep(tt[q], tpEnvNames, tpEnvTys)
+      // The instance's binding speaks for its own type parameters only: a template row binding
+      // the callee's variable to itself is solved afresh, though the two share a name (D15033).
+      const t = substTyDeepOf(tt[q], tpEnvNames, tpEnvTys, topFnOwnerOf(njFnIx))
       if t >= 0 && !tyHasTyVar(t) {
         bNames.push(tn[q])
         bTys.push(t)
@@ -1237,7 +1321,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   args = callFtyNormArgs(n, ix, cfn, params, dParams, args, naOk)
   if !naOk[0] { return retTy }
   // Generic call-site inference: a `TyVar` param (or `T[]`) binds its type-param to
-  // the argument's type (first use wins; later uses must agree), and the return
+  // the argument's type (first use wins, a wider number joins it), and the return
   // type substitutes through the binding — so `id("s")` is `string`, and
   // `let n: i32 = id("s")` is a genuine type error downstream.
   const bNames: string[] = []
@@ -1249,20 +1333,65 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   if explicitTa {
     if !bindExplicitTyArgs(cfn, n.callFn, ix, bNames, bTys) { return TY_ERR }
   }
-  bindCalleeScopeTyParams(cfn, n.callFn, ft, bNames, bTys)
+  bindCalleeScopeTyParams(ix, cfn, n.callFn, ft, bNames, bTys)
   if !explicitTa { bindTemplateRow(ix, bNames, bTys) }
   let dstNames = NO_DST_NAMES
-  if !explicitTa && callDstTyOf(ix) >= 0 {
+  if !explicitTa && callDstTyForGeneric(ix) >= 0 {
     dstNames = []
     dstBindLitTyParams(ix, ft.fnRet, params, args, bNames, bTys, dstNames)
   }
-  const argOrder = lambdaLastOrder(params, args)
+  const litLast: boolean[] = []
+  if !explicitTa {
+    let li = 0
+    while li < args.length {
+      litLast.push(litArgLast(params, args, li))
+      li = li + 1
+    }
+  }
+  const argOrder = lambdaLitLastOrder(params, args, litLast)
   const pinRows0 = elabHoleRowMark()
   // Each argument's destination as its own turn saw it, for the literals re-delivered below.
   const argExp: i32[] = []
   while argExp.length < args.length { argExp.push(-1) }
+  // A type variable's uses join over numeric widening: a use wider than the first one re-checks
+  // the arguments with the variable bound at the wider number (D2459).
+  const b0N = bNames.slice(0, bNames.length)
+  const b0T = bTys.slice(0, bTys.length)
+  const wm = checkMark()
+  let wPass = 0
+  bgWidenClear()
   let oi = 0
-  while oi < argOrder.length {
+  while oi <= argOrder.length {
+    if oi == argOrder.length {
+      // An instance joins only a call its template joined: the template typed what reads it.
+      const wTpl = !elabCapLive() || callNumJoined(ix)
+      if explicitTa || !wTpl || wPass >= 2 || bgWidenCount() == 0 { break }
+      const wN: string[] = []
+      const wT: i32[] = []
+      let wi = 0
+      // Only a binding an argument made joins: the destination's and a written one stand.
+      while wi < bgWidenCount() {
+        if !strListHas(b0N, bgWidenNameAt(wi)) {
+          wN.push(bgWidenNameAt(wi))
+          wT.push(bgWidenTyAt(wi))
+        }
+        wi = wi + 1
+      }
+      if wN.length == 0 { break }
+      checkRollback(wm, RB_CALL_REJOIN)
+      bgWidenClear()
+      callFtyRebind(bNames, bTys, b0N, b0T, wN, wT)
+      while uNames.length > 0 { uNames.pop() }
+      while uTys.length > 0 { uTys.pop() }
+      wi = 0
+      while wi < argExp.length {
+        argExp[wi] = -1
+        wi = wi + 1
+      }
+      wPass = wPass + 1
+      oi = 0
+      continue
+    }
     const aRet = callFtyCheckArg(
       n,
       ix,
@@ -1280,6 +1409,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     if aRet >= 0 { return aRet }
     oi = oi + 1
   }
+  bgWidenClear()
+  if wPass > 0 && !inferQuiet { callNumJoinNote(ix) }
+  if !explicitTa { bindParamUnionsLate(params, args, bNames, bTys) }
   const hNames: string[] = []
   const hTys: i32[] = []
   callFtyNoteLateArgCstrs(cfn, params, args, argExp, bNames, bTys, hNames, hTys)
@@ -1394,6 +1526,19 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     }
   }
   if !inferQuiet { adoptArgLits(cDecl, params, args, vNames, vTys) }
+  // A call that binds nothing still answers its callee's deferred return, each parameter it left
+  // open read as `never`: a value the body returns as one is one it cannot hold (D14802).
+  if !inferQuiet && vNames.length == 0 && cfn is Ident {
+    const sd = identFnDeclOf(n.callFn)
+    if sd >= 0 && !nestParentOf.has(sd) {
+      const nNames: string[] = []
+      const nTys: i32[] = []
+      withUnboundAsNever(sd, vNames, vTys, nNames, nTys)
+      if nNames.length > 0 {
+        validateRetCstrs(nNames, nTys, ix, sd, cfn.identName)
+      }
+    }
+  }
   if vNames.length > 0 {
     elabHoleRowDropDecl(pinRows0, cDecl)
     retTy = callFtyPinCstrs(
@@ -1413,12 +1558,13 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   if vNames.length == 0 { elabUnboundCallNote(n) }
   if hNames.length > 0 { retTy = substTyDeep(retTy, hNames, hTys) }
   // A deferred join this site cannot decide has no rep, so it collapses to one arm, parked
-  // whole for a `return h(w)` relay (`inferRetTyOf`); in a body the gate does not hold, one of
-  // that body's own parameters is kept as a union instead, which its pins re-join (D3589).
+  // whole for a `return h(w)` relay (`inferRetTyOf`); otherwise one of the body's own
+  // parameters is kept as a union instead, which its pins re-join (D3589).
   let kept = -1
-  if tyIsDeferredJoin(retTy) && !njFnReached(njFnIx) {
+  if tyIsDeferredJoin(retTy) {
     const keep = (apartHoleJoins.get(retTy) ?? false)
       || calleeRetDeclared(cfn, n.callFn)
+      || joinOverOwnParams(retTy)
     kept = keptParamUnion(retTy, keep)
   }
   let cRetTy = kept
@@ -1670,6 +1816,22 @@ function callFtyCheckArg(
   seedExpected(args[i], seedTy)
   if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
   let at = checkNodeHook(args[i])
+  // A widened `let` handed to a parameter whose function type the callee leaves open is bound to
+  // its whole set in each instance of the callee.
+  if tyIsHole(params[i]) || tyHasTyVar(params[i]) && tyAt(params[i]) is TyFunc {
+    fnLetOpenHandNote(parenPeelIx(args[i]))
+  }
+  // What a call hands an un-annotated parameter decides whether a binding it is written to holds
+  // a set's id (D15053).
+  if !inferQuiet && !holePinHeld && tyIsHole(params[i]) {
+    fnParamHandNote(
+      identFnDeclOf(parenPeelIx(n.callFn)),
+      i,
+      at,
+      curFnDeclIx,
+      parenPeelIx(args[i]),
+    )
+  }
   // A function value at a hole the callee hands on to a generic's union-result function
   // parameter is delivered at that parameter's bound type (D10210).
   if tyIsHole(params[i]) && cfn is Ident {
@@ -1705,10 +1867,17 @@ function callFtyCheckArg(
       return TY_ERR
     }
   }
+  // A set's value binds a function parameter's result from every member's (W-hand slice 2).
+  bindSetArgResult(params[i], args[i], at, bNames, bTys)
   // Bind every TyVar reachable in the expected param position from the
   // argument's shape (first use wins), then check the argument against the
   // SUBSTITUTED expected type — a later disagreeing use errors here.
+  bgCallArgSet(true)
+  bgWidenAskSet(!numLitArg(args[i]) && !argIsLitAggregate(args[i]))
   bindGenWalk(params[i], at, bNames, bTys)
+  bgWidenAskSet(false)
+  bgCallArgSet(false)
+  bindParamUnionOwn(params, i, at, bNames, bTys)
   bindGenUnionArm(params[i], at, uNames, uTys)
   bindGenInnerUnionArms(params[i], at, uNames, uTys, 0)
   // A call from inside the callee itself hands on its own `T`, which no default may take.
@@ -1858,6 +2027,10 @@ function callFtyHoleParamDemands(
     if !holeDemandOk(pHole.tvName, args[i], at) {
       holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
     }
+    holeKidMapDemands(params[i], at, 4)
+    if !inferQuiet && tyIsParamHole(params[i]) {
+      notePendingArgMap(at, args[i], holeArgIsInlineMapSource(args[i]))
+    }
     // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
     // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
     if rowIsArrayDemanded(params[i]) {
@@ -1880,6 +2053,23 @@ function callFtyHoleParamDemands(
     if hcName == "" { holeCastPinReached(n.callFn, i, at) }
   }
 }
+
+// Whether argument `ix` is written in place as a lambda or a `Map()` / `Set()` call, so no
+// binding of the caller's grades the map it builds.
+function holeArgIsInlineMapSource(ix: i32): boolean {
+  const n = nodeAt(peelParenIx(ix))
+  if n is FuncDecl { return true }
+  if n is Call {
+    if n.callFn < 0 || n.callArgs.length > 0 { return false }
+    const c = nodeAt(n.callFn)
+    if c is Ident { return c.identName == "Map" || c.identName == "Set" }
+  }
+  notInlineMapSource()
+}
+
+// Every other argument node — a name, a field or element read, a literal, an operator — is
+// read from somewhere a binding of its own grades.
+function notInlineMapSource(): boolean { false }
 
 // The parked casts of every function a re-pointed callee binding reaches, each re-asked under
 // its own parameter `i`'s hole and name at the argument type `at` (D3691).
@@ -2062,6 +2252,39 @@ function livePts(args: i32[], pts: i32[]): i32[] {
   out
 }
 
+// Queues each argument whose parameter names a type parameter with the record-covariance rule
+// (D2996) at this call's binding, as a direct spelling's argument is queued: the record solve then
+// refuses an existing record its parameter stores differently and adopts a fresh one (D14140).
+function recPendBoundArgs(
+  params: i32[],
+  args: i32[],
+  names: string[],
+  tys: i32[],
+) {
+  if inferQuiet || names.length == 0 { return 0 }
+  let i = 0
+  while i < params.length && i < args.length {
+    const pt = params[i]
+    const a = args[i]
+    if a >= 0 && pt >= 0 && pt < T.tys.length && tyHasTyVar(pt) {
+      const sub = substTyDeep(pt, names, tys)
+      const at = nodeTyIxOf(a)
+      if (
+        sub >= 0
+        && sub != pt
+        && at >= 0
+        && !tyHasHole(sub)
+        && !tyHasTyVar(sub)
+        && !tyHasTyVar(at)
+      ) {
+        recPend(a, at, sub, a)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // The pins an ordinary call's type-parameter bindings `vNames`/`vTys` give its callee: every
 // constraint the body deferred is validated under them, the declared bounds are judged, and
 // the substituted return is answered (`retTy0` with the bindings applied).
@@ -2082,8 +2305,10 @@ function callFtyPinCstrs(
   const dBeforeC = T.diags.length
   let cstrCallee = CSTR_NODECL
   let cstrWho = ""
+  // A dispatch arm calls the member its fact records; a lambda member has no name to resolve.
+  const armD = fnTagArmMemberOf(ix)
   if cfn is Ident {
-    cstrCallee = fnDeclIx[cfn.identName] ?? CSTR_NODECL
+    cstrCallee = if armD >= 0 { armD } else { fnDeclIx[cfn.identName] ?? CSTR_NODECL }
     // A local bound to a declared generic names that declaration — without this rung the
     // call falls to `CSTR_NODECL` and adjudicates every generic in the program, since
     // `substTyDeep` matches `TyVar`s by name and `const g = idT  g(structList)` would
@@ -2118,6 +2343,15 @@ function callFtyPinCstrs(
       cstrCallee = one
     }
   }
+  // A call through a value of a set of named functions owns its members' constraints (D15066); a
+  // lambda member's constraints are its encloser's, so such a set keeps every owner.
+  const ownersWas = cstrSetOwners
+  const noOwners: i32[] = []
+  cstrSetOwnersSet(noOwners)
+  if cstrCallee == CSTR_NODECL {
+    const cs = fnTagSetOfTy(nodeTyIxOf(parenPeelIx(n.callFn)))
+    if cs >= 0 && csNamedMembers(cs) { cstrSetOwnersSet(fnTagMembers(cs)) }
+  }
   // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
   // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
   const dhNames: string[] = []
@@ -2130,7 +2364,7 @@ function callFtyPinCstrs(
   let namedFn = -1
   if cfn is Ident {
     // The declaration the callee names, directly or through an alias.
-    namedFn = identFnDeclOf(n.callFn)
+    namedFn = if armD >= 0 { armD } else { identFnDeclOf(n.callFn) }
     if namedFn < 0 { namedFn = identFnAliasOf(n.callFn) }
     if nestParentOf.has(namedFn) { nestCallee = namedFn }
   }
@@ -2166,7 +2400,6 @@ function callFtyPinCstrs(
     cstrWho,
     dhNames,
     dhArgNode,
-    noSplit,
   )
   instGenFnHolePins(vNames, vTys, cstrCallee)
   pinUnreadGenFnArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
@@ -2198,6 +2431,16 @@ function callFtyPinCstrs(
   // the module's top-level code, which that code's own pins ask.
   const strictWas = cstrOwnedStrict
   if elabCapLive() { cstrOwnedStrictSet(true) }
+  // The callee's binding speaks for its own type parameters only: an operator or a write on
+  // another generic's variable of the same name, read through a value of its type, stays open (D12212).
+  const ownerWas = substSelfOwner
+  // A callee with no declaration (an element read) speaks for the generic its type's variables
+  // belong to.
+  let calleeOwner = topFnOwnerOf(cstrCallee)
+  if cstrCallee == CSTR_NODECL {
+    calleeOwner = tyFirstVarOwner(nodeTyOf(n.callFn), 64)
+  }
+  substSelfOwnerSet(calleeOwner)
   validateBinCstrs(
     cNames,
     cTys,
@@ -2208,17 +2451,26 @@ function callFtyPinCstrs(
     dhArgNo,
     dhArgNode,
   )
+  substSelfOwnerSet(ownerWas)
   validatePrintCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  validateArrDefCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
   validateNestCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
   validateIsCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  substSelfOwnerSet(topFnOwnerOf(cstrCallee))
   validateArgCstrs(cNames, cTys, ix, cstrCallee, dhNames, dhArgNode)
+  substSelfOwnerSet(ownerWas)
   forElemArgCstrs(n.callFn, ft, vNames, vTys)
   // The declared return rides the same pin: the body's mismatch check is vacuous under
   // a hole, and this is the first position that knows the instance (D551).
-  validateRetCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  const rNames: string[] = []
+  const rTys: i32[] = []
+  withUnboundAsNever(namedFn, cNames, cTys, rNames, rTys)
+  validateRetCstrs(rNames, rTys, ix, cstrCallee, cstrWho)
   // The destination seam, for the same reason: a value landing in a hole-typed local /
   // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
+  substSelfOwnerSet(calleeOwner)
   validateLetCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  substSelfOwnerSet(ownerWas)
   // A builtin collection method's argument inside the body, for the same reason at a
   // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
   validateBmCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
@@ -2243,9 +2495,12 @@ function callFtyPinCstrs(
     dhArgNo,
     dhArgNode,
   )
+  substSelfOwnerSet(calleeOwner)
   validateUfcsCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  substSelfOwnerSet(ownerWas)
   noteHoleLambdaArgPins(vNames, vTys, cstrCallee)
-  validateRcwPins(vNames, vTys, cstrCallee)
+  validateRcwPins(vNames, vTys, cstrCallee, ix)
+  recPendBoundArgs(params, args, vNames, vTys)
   cstrOwnedStrictSet(strictWas)
   if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
   substNestModeSet(modeWas)
@@ -2308,6 +2563,15 @@ function callFtyPinCstrs(
       holeFieldCallAdopt(cfn.memObj, cfn.memProp, inst, ix)
     }
   }
+  // A call through a `const` copy of a field is a use of that field at this call's instance.
+  if cfn is Ident && T.diags.length == dBeforeC {
+    const fm = holeFieldCopyOf(n.callFn)
+    const fmn = if fm >= 0 { nodeAt(fm) } else { null }
+    if fmn is Member {
+      const inst = substTyDeep(nodeTyOf(n.callFn), vNames, vTys)
+      holeFieldCallAdopt(fmn.memObj, fmn.memProp, inst, ix)
+    }
+  }
   if cfn is Ident {
     let hd = namedFn
     if hd < 0 { hd = constLambdaOf(cfn, n.callFn) }
@@ -2336,6 +2600,7 @@ function callFtyPinCstrs(
     }
     validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
   }
+  cstrSetOwnersSet(ownersWas)
   retTy
 }
 
@@ -2395,6 +2660,7 @@ function judgeHoleLambdaAt(
   substNestModeSet(SUBST_ALL)
   validateBinCstrs(nm, ty, ix, CSTR_NODECL, "", none, noNo, noNode)
   validatePrintCstrs(nm, ty, ix, CSTR_NODECL, "")
+  validateArrDefCstrs(nm, ty, ix, CSTR_NODECL, "")
   validateIsCstrs(nm, ty, ix, CSTR_NODECL, "")
   validateArgCstrs(nm, ty, ix, CSTR_NODECL, none, noNode)
   validateRetCstrs(nm, ty, ix, CSTR_NODECL, "")
@@ -2543,8 +2809,7 @@ function holeOpenCallsWait(
 }
 
 // A function named as an argument to a hole the callee calls is judged at each instance those
-// calls ask for (D6190); two mark the parameter for a split unless `noSplit` (D6280), and refuse
-// when callee `fnVia` reads reassigned binding `fnValue`. `opFn` is the callee body whose
+// calls ask for (D6190), and refused when callee `fnVia` reads reassigned binding `fnValue`. `opFn` is the callee body whose
 // operators are judged (D6330).
 function judgeFnArgHoleCalls(
   vNames: string[],
@@ -2555,7 +2820,6 @@ function judgeFnArgHoleCalls(
   fnVia: string,
   dhNames: string[],
   dhArgNode: i32[],
-  noSplit: boolean,
 ) {
   if inferQuiet { return 0 }
   // Read under the other holes' own instances, so a call taking another hole parameter's
@@ -2595,21 +2859,6 @@ function judgeFnArgHoleCalls(
         if linsts.length == 0 {
           holeOpenCallsWait(a, vNames, wTys, k, vTys[k], calleeFn)
         }
-        // A choice of names called at two instances, written here or bound first, takes a copy
-        // per instance as one name does: the split plan hands each copy the choice, evaluated
-        // once (D6210, D13360, D14439). Instances are told apart by spelling, as the plan keys
-        // its calls.
-        const caA: i32[] = []
-        const caD: i32[] = []
-        holeChoiceArmsOf(a, caA, caD)
-        if !noSplit && (holeChoiceArms(a).length > 0 || caA.length > 0) {
-          const ks: string[] = []
-          for li in linsts {
-            const kk = tyToStr(li)
-            if strListIndexOf(ks, kk) < 0 { ks.push(kk) }
-          }
-          if ks.length > 1 { holeFnSplitAt(opFn, dhNames[j]) }
-        }
       }
     } else if holeChoiceArms(a).length > 0 {
       const k = strListIndexOf(vNames, dhNames[j])
@@ -2648,8 +2897,6 @@ function judgeFnArgHoleCalls(
           }
           const insts: i32[] = []
           genFnHoleCallInsts(vNames, wTys, k, vTys[k], calleeFn, insts)
-          if insts.length > 1 && !noSplit { holeFnSplitAt(opFn, dhNames[j]) }
-          if !noSplit { holeFwdSplitAsk(opFn, dhNames[j], vNames, wTys, 0) }
           if insts.length > 1 { judgeHoleCallOps(opFn, vNames, wTys, a) }
           // A call moved out of a forwarding callee asks its own instance too, judged without a
           // split, as the direct spelling's call is (D13201).
@@ -2882,7 +3129,7 @@ function holeSlotTyWith(t: i32, path: string[], i: i32, rt: i32): i32 {
 }
 
 // Builds the records of `s` as `rt`: each binding is pinned at its own type with them replaced,
-// queued under judged call `grp`, and each literal adopts that type. Nothing when one type
+// and each literal built at it, both queued under judged call `grp`. Nothing when one type
 // cannot be built.
 function holeRecAdopt(s: HoleRecSrcs, rt: i32, at: i32, grp: i32) {
   if rt < 0 || tyHasTyVar(rt) || tyReachesHole(rt, 8) { return 0 }
@@ -2909,7 +3156,7 @@ function holeRecAdopt(s: HoleRecSrcs, rt: i32, at: i32, grp: i32) {
   }
   i = 0
   while i < s.lits.length {
-    adoptLitAt(s.lits[i], lTys[i])
+    recAdPushSettledLit(s.lits[i], lTys[i], grp)
     i = i + 1
   }
   0
@@ -2938,7 +3185,57 @@ function holeFieldCallAdopt(recv: i32, field: string, inst: i32, at: i32) {
     recs: [],
   }
   if !holeRecSrcsOf(recv, [], false, s, 0) { return 0 }
-  holeRecAdopt(s, mkObjTy(ro.objFieldNames, tys), at, recAdSetGroup())
+  const grp = recAdSetGroup()
+  // A binding a call initialises whose field the elaboration widened holds the set there, so its
+  // call dispatches and builds no record, nor lets another call build its literal (D15270).
+  if holeFieldCallWidened(recv, field) { recAdDeclineSettled(grp) }
+  holeRecAdopt(s, mkObjTy(ro.objFieldNames, tys), at, grp)
+}
+
+// The field read `recv.field` the read `x` copies through un-annotated `const` bindings; -1 when
+// it copies none.
+function holeFieldCopyOf(x: i32): i32 {
+  let rx = parenPeelIx(x)
+  let hops = 0
+  while hops < 8 && rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Ident {
+    const d = identDeclOf(rx)
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if (
+      !(dn is LetDecl)
+      || dn.letKw != "const"
+      || dn.letType >= 0
+      || dn.letInit < 0
+    ) {
+      return -1
+    }
+    rx = parenPeelIx(dn.letInit)
+    hops = hops + 1
+  }
+  if hops > 0 && rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Member {
+    rx
+  } else {
+    -1
+  }
+}
+
+// Whether `recv` reads a binding a call initialises, directly or through `const` copies, whose
+// function field `field` the elaboration widened.
+function holeFieldCallWidened(recv: i32, field: string): boolean {
+  let rx = parenPeelIx(recv)
+  let hops = 0
+  while hops < 8 && rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Ident {
+    const d = identDeclOf(rx)
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if !(dn is LetDecl) || dn.letInit < 0 { return false }
+    const init = parenPeelIx(dn.letInit)
+    if init >= 0 && init < P.nodes.length && nodeAt(init) is Call {
+      return elabFnFieldWidened(d, [field])
+    }
+    // A `const` copy reads the binding it copies.
+    rx = if dn.letKw == "const" { init } else { -1 }
+    hops = hops + 1
+  }
+  false
 }
 
 // Whether `ft` is a function type with a parameter an inference hole still types, not a declared
@@ -3111,114 +3408,6 @@ function constRetFnNames(c: i32): string[] {
   gs
 }
 
-// Marks hole `hole` of `fn`, and the hole parameter of each function `fn` hands it on to by name,
-// as wanting a copy per instance when that function's body, bound at `fn`'s binding
-// `vNames`/`vTys`, calls it at two, directly or handing it on again (D14650). True when marked.
-function holeFwdSplitAsk(
-  fn: i32,
-  hole: string,
-  vNames: string[],
-  vTys: i32[],
-  depth: i32,
-): boolean {
-  if fn < 0 || fn >= P.nodes.length || depth > 4 { return false }
-  const f = nodeAt(fn)
-  if !(f is FuncDecl) || f.fnBody < 0 { return false }
-  let marked = false
-  let par = -1
-  let pi = 0
-  while pi < f.fnParams.length {
-    if paramHoleName(f.fnName, fn, pi) == hole { par = f.fnParams[pi] }
-    pi = pi + 1
-  }
-  if par < 0 { return false }
-  const stack: i32[] = [f.fnBody]
-  while stack.length > 0 {
-    const x = stack.pop() ?? -1
-    if x < 0 || x >= P.nodes.length { continue }
-    const xn = nodeAt(x)
-    if xn is FuncDecl { continue }
-    for kid in nodeChildren(x) {
-      if kid >= 0 { stack.push(kid) }
-    }
-    if !(xn is Call) { continue }
-    let named = false
-    for an in xn.callArgNames {
-      if an != "" { named = true }
-    }
-    const cf = nodeAt(parenPeelIx(xn.callFn))
-    if named || !(cf is Ident) { continue }
-    const ld = fnDeclIx[cf.identName] ?? -1
-    if ld < 0 || ld >= P.nodes.length || ld == fn { continue }
-    const l = nodeAt(ld)
-    if (
-      !(l is FuncDecl)
-      || l.fnTyParams.length > 0
-      || l.fnParams.length != xn.callArgs.length
-    ) {
-      continue
-    }
-    const lNames: string[] = []
-    const lTys: i32[] = []
-    let k = -1
-    let ai = 0
-    while ai < xn.callArgs.length {
-      const a = parenPeelIx(xn.callArgs[ai])
-      lNames.push(paramHoleName(l.fnName, ld, ai))
-      let t = -1
-      const ad = identDeclOf(a)
-      if ad >= 0 && ad < P.nodes.length && nodeAt(ad) is Param {
-        let q = 0
-        while q < f.fnParams.length {
-          if f.fnParams[q] == ad {
-            const vi = strListIndexOf(vNames, paramHoleName(f.fnName, fn, q))
-            if vi >= 0 && vi < vTys.length { t = vTys[vi] }
-          }
-          q = q + 1
-        }
-      }
-      if ad == par { k = ai }
-      if t < 0 { t = substTyDeep(nodeTyOf(a), vNames, vTys) }
-      lTys.push(t)
-      ai = ai + 1
-    }
-    if k >= 0 {
-      const insts: i32[] = []
-      genFnHoleCallInsts(lNames, lTys, k, lTys[k], ld, insts)
-      const ks: string[] = []
-      for li in insts {
-        const kk = tyToStr(li)
-        if strListIndexOf(ks, kk) < 0 { ks.push(kk) }
-      }
-      if (
-        ks.length > 1
-        || holeFwdSplitAsk(ld, lNames[k], lNames, lTys, depth + 1)
-      ) {
-        holeFnSplitAt(ld, lNames[k])
-        holeFnSplitAt(fn, hole)
-        marked = true
-      }
-    }
-  }
-  marked
-}
-
-// Marks the parameter of declared function `fn` whose hole is `hole` as wanting a copy per
-// instance its body calls it at.
-function holeFnSplitAt(fn: i32, hole: string) {
-  if fn < 0 || fn >= P.nodes.length { return 0 }
-  const f = nodeAt(fn)
-  if !(f is FuncDecl) { return 0 }
-  let pi = 0
-  while pi < f.fnParams.length {
-    if paramHoleName(f.fnName, fn, pi) == hole {
-      holeFnSplitSet(f.fnParams[pi])
-    }
-    pi = pi + 1
-  }
-  0
-}
-
 // A lambda with hole parameters bound to a hole the callee's body calls is instanced at the
 // arguments of those calls, as a generic function there is (`instGenFnHolePins`), and its
 // body's demands are judged at that instance (D5935); `opFn` and `noSplit` as
@@ -3269,8 +3458,7 @@ function pinHoleLambdaVals(
 }
 
 // A lambda literal handed to hole `vNames[k]`, which `opFn`'s body calls at several instances,
-// is judged at each and the parameter marked for the split plan, which hands it one copy per
-// instance (D6331). False when the calls ask for fewer than two.
+// is judged at each (D6331). False when the calls ask for fewer than two.
 function holeLambdaSplit(
   vNames: string[],
   vTys: i32[],
@@ -3296,7 +3484,6 @@ function holeLambdaSplit(
       judgeHoleLambdaAt(vt, inst, nm, ty, ix)
     }
   }
-  holeFnSplitAt(opFn, vNames[k])
   true
 }
 
@@ -3757,6 +3944,158 @@ function listElemsWritten(ix: i32): boolean {
 // `checkBuiltinIdentCall`, a function-typed value to `checkCallOnFuncTy`. The type-answering
 // three return `-1` for "no arm claimed it"; an unclaimed callee is reported here as `TY_ERR`.
 export function checkCallNode(n: Call, ix: i32) {
+  const t = checkCallNodeAt(n, ix)
+  // A call through a function value notes the set its callee holds, for `fnSetCalledWithAny`.
+  if n.callFn >= 0 {
+    const cf = nodeAt(n.callFn)
+    const argTys: i32[] = []
+    for a in n.callArgs { argTys.push(nodeTyIxOf(a)) }
+    fnSetCalleeNote(
+      nodeTyIxOf(n.callFn),
+      cf is Ident && identFnDeclOf(n.callFn) >= 0,
+      argTys,
+    )
+    const path: string[] = []
+    const holder = calleeSlotOf(n.callFn, path, 0)
+    if holder >= 0 && path.length > 0 { fnSlotCallNote(holder, path, argTys) }
+  }
+  t
+}
+
+// The `let` binding a callee read `x` takes its value from through a field, element or map value,
+// with that slot's path (`f.<name>`, `e`, `v`, outermost last) pushed onto `path`; -1 for none.
+function calleeSlotOf(x0: i32, path: string[], depth: i32): i32 {
+  const x = parenPeelIx(x0)
+  if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
+  const n = nodeAt(x)
+  match n {
+    Ident => {
+      const d = identDeclOf(x)
+      const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+      if !(dn is LetDecl) { return -1 }
+      // A `const` copy of a slot (`const f = m["k"]`), of a whole binding (`const ws = zs`) or of
+      // one spread binding (`[...ps]`) is that slot, at any depth.
+      if dn.letKw != "const" || dn.letInit < 0 { return d }
+      const src = calleeCopySrc(dn.letInit)
+      const before = path.length
+      const via = calleeSlotOf(src, path, depth + 1)
+      const alias = src >= 0 && src < P.nodes.length && nodeAt(src) is Ident
+      if via >= 0 && (path.length > before || alias) { return via }
+      while path.length > before { path.pop() }
+      return d
+    }
+    Member => {
+      const h = calleeSlotOf(n.memObj, path, depth + 1)
+      if h >= 0 { path.push("f." + n.memProp) }
+      return h
+    }
+    OptMember => {
+      const h = calleeSlotOf(n.omObj, path, depth + 1)
+      if h >= 0 { path.push("f." + n.omProp) }
+      return h
+    }
+    Index => {
+      const h = calleeSlotOf(n.idxArr, path, depth + 1)
+      const at = nodeTyIxOf(n.idxArr)
+      const isMap = at >= 0 && at < T.tys.length && T.tys[at] is TyMap
+      if h >= 0 { path.push(if isMap { "v" } else { "e" }) }
+      return h
+    }
+    // `x ?? []` holds `x`'s values: the empty default adds none.
+    BinExpr => {
+      const r = nodeAt(parenPeelIx(n.binRight))
+      if n.binOp != "??" || !(r is ArrayLit) || r.arrElems.length > 0 {
+        return -1
+      }
+      return calleeSlotOf(n.binLeft, path, depth + 1)
+    }
+    Call => {
+      const g = calleeMapGetSlot(n, path, depth)
+      if g >= 0 { return g }
+      return calleeCopyCallSlot(n, path, depth)
+    }
+    // No other expression reads a binding's slot.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return -1
+    }
+  }
+}
+
+// The binding a list literal `[...b]` copies, for a literal that is one spread of a name; `init`
+// otherwise. A literal of two sources is a join, not a copy, and is left as itself.
+function calleeCopySrc(init: i32): i32 {
+  const x = parenPeelIx(init)
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is ArrayLit) || n.arrElems.length != 1 { return x }
+  const sp = nodeAt(parenPeelIx(n.arrElems[0]))
+  if !(sp is Spread) { return x }
+  const a = parenPeelIx(sp.spdArg)
+  if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { a } else { x }
+}
+
+// `calleeSlotOf` for `m.get(k)` on a map `m`: the slot of `m`'s values; -1 for any other call.
+function calleeMapGetSlot(n: Call, path: string[], depth: i32): i32 {
+  if n.callArgs.length != 1 { return -1 }
+  const f = nodeAt(parenPeelIx(n.callFn))
+  if !(f is Member) || f.memProp != "get" { return -1 }
+  const ot = nodeTyIxOf(f.memObj)
+  if ot < 0 || ot >= T.tys.length || !(T.tys[ot] is TyMap) { return -1 }
+  const h = calleeSlotOf(f.memObj, path, depth + 1)
+  if h >= 0 { path.push("v") }
+  h
+}
+
+// `calleeSlotOf` for a call that copies or makes the value read: `b.slice(...)` of a list is `b`'s
+// slot, and a call of a declared non-generic function is that function's result (the function
+// itself as holder); -1 for any other call.
+function calleeCopyCallSlot(n: Call, path: string[], depth: i32): i32 {
+  const f = nodeAt(parenPeelIx(n.callFn))
+  if f is Member && f.memProp == "slice" {
+    const ot = nodeTyIxOf(f.memObj)
+    if ot < 0 || ot >= T.tys.length || !(T.tys[ot] is TyArray) { return -1 }
+    return calleeSlotOf(f.memObj, path, depth + 1)
+  }
+  if !(f is Ident) { return -1 }
+  const fd = identFnDeclOf(parenPeelIx(n.callFn))
+  const fdn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if fdn is FuncDecl && fdn.fnTyParams.length == 0 { fd } else { -1 }
+}
+
+// `calleeSlotOf` for a read `x` delivered as a value rather than called: the one walker both use.
+export function slotOfRead(x: i32, path: string[]): i32 {
+  calleeSlotOf(x, path, 0)
+}
+
+// `checkCallNode` before the callee's set is noted.
+function checkCallNodeAt(n: Call, ix: i32) {
+  // A map read `m?.get(k)` is rewritten to a guarded `m[k]`: its default `null` and its index
+  // read are minted here, once, and delivered into the call's own join until a delivery of
+  // the call stamps them with its union.
+  const ocf = if n.callFn >= 0 { nodeAt(n.callFn) } else { null }
+  if ocf is OptMember && ocf.omProp == "get" && n.callArgs.length == 1 {
+    if !optReadParts.has(ix) {
+      const parts: i32[] = [
+        mkNull("null", n.pos),
+        mkIndex(ocf.omObj, n.callArgs[0], n.pos),
+      ]
+      optReadParts[ix] = parts
+    }
+    const t = checkCallNodeGo(n, ix)
+    for op in optReadParts[ix] ?? [] { recordCtxTy(op, t) }
+    return t
+  }
+  // Any other `p?.f(args)` keeps this node as its guard's non-null arm, delivered into the
+  // call's own join until a delivery of the call stamps it with its union.
+  if ocf is OptMember {
+    const t = checkCallNodeGo(n, ix)
+    recordCtxTy(ix, t)
+    return t
+  }
+  checkCallNodeGo(n, ix)
+}
+
+// `checkCallNode`'s dispatch.
+function checkCallNodeGo(n: Call, ix: i32) {
   if n.callFn < 0 { return TY_ERR }
   const cfn = nodeAt(n.callFn)
   if callHasTyArgs(ix) {
@@ -3769,7 +4108,10 @@ export function checkCallNode(n: Call, ix: i32) {
   // `p?.f(args)` — the receiver's guard covers the whole call. Answered before the callee is
   // typed as a value, which is what read a nullable closure field as "not a function" (D1814).
   if cfn is OptMember {
+    // A null receiver skips the arguments, so a write in one narrows nothing after (D2451).
+    pushScope(-1)
     const ot = checkOptCallNode(n, ix, cfn)
+    popScope()
     if ot >= 0 { return ot }
   }
   if cfn is Ident {
@@ -3955,4 +4297,149 @@ function adoptArgLits(
     i = i + 1
   }
   0
+}
+
+// `names`/`tys` onto `outN`/`outT`, then each type parameter of the declaration `fd` that a
+// parameter position names and they leave unbound, or bind only to a bare inference hole, as
+// `never`: no value has that type (D14802).
+function withUnboundAsNever(
+  fd: i32,
+  names: string[],
+  tys: i32[],
+  outN: string[],
+  outT: i32[],
+) {
+  let k = 0
+  while k < names.length {
+    outN.push(names[k])
+    outT.push(tys[k])
+    k = k + 1
+  }
+  if fd < 0 || fd >= P.nodes.length { return 0 }
+  const d = nodeAt(fd)
+  if d is FuncDecl {
+    for p in d.fnTyParams {
+      // A parameter no parameter position names has its own refusal at the declaration.
+      const one: string[] = [p]
+      let bound = !anyParamMentionsTyParam(d.fnParams, one)
+      let j = 0
+      while j < names.length {
+        if names[j] == p && j < tys.length && !bareInferHole(tys[j]) {
+          bound = true
+        }
+        j = j + 1
+      }
+      if !bound {
+        outN.push(p)
+        outT.push(TY_NEVER)
+      }
+    }
+  }
+  0
+}
+
+// Resets the call's bindings to `b0N`/`b0T`, the ones it held before its arguments, with each
+// name of `wN` bound first at its widened `wT` (D2459).
+function callFtyRebind(
+  bNames: string[],
+  bTys: i32[],
+  b0N: string[],
+  b0T: i32[],
+  wN: string[],
+  wT: i32[],
+) {
+  while bNames.length > 0 { bNames.pop() }
+  while bTys.length > 0 { bTys.pop() }
+  let i = 0
+  while i < wN.length && i < wT.length {
+    bNames.push(wN[i])
+    bTys.push(wT[i])
+    i = i + 1
+  }
+  i = 0
+  while i < b0N.length && i < b0T.length {
+    bNames.push(b0N[i])
+    bTys.push(b0T[i])
+    i = i + 1
+  }
+  0
+}
+
+// Whether `t` is an inference hole and nothing else.
+function bareInferHole(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return true }
+  const tv = tyAt(t)
+  if tv is TyVar { return tv.tvName.length == 0 || tv.tvName[0] == "?"[0] }
+  false
+}
+
+// Whether number-literal argument `i` binds its variable after the arguments beside it: an
+// integer literal fits any number they bind, a float literal only an `f32` every named argument
+// beside it already holds; otherwise a float binds first and they widen into it (D3541).
+function litArgLast(params: i32[], args: i32[], i: i32): boolean {
+  if !litArgBindsLast(params, args, i) { return false }
+  if !isFloatLitExpr(args[i]) { return true }
+  const v = tyAt(params[i])
+  if !(v is TyVar) { return false }
+  let j = 0
+  while j < params.length && j < args.length {
+    if (
+      j != i
+      && !numLitArg(args[j])
+      && tyMentionsTyVarNamed(params[j], v.tvName, 8)
+    ) {
+      const a = nodeAt(cwPeel(args[j]))
+      if !(a is Ident) { return false }
+      if primNameOf(identTyOf(cwPeel(args[j]), a.identName)) != "f32" {
+        return false
+      }
+    }
+    j = j + 1
+  }
+  true
+}
+
+// Binds the result type parameter of function parameter `pt` from what argument `arg` of type
+// `at` returns at `pt`'s bound parameter types: each member's of a set, or a named generic's own,
+// before the walk would bind it to that function's own type parameter.
+function bindSetArgResult(
+  pt: i32,
+  arg: i32,
+  at: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  if pt < 0 || at < 0 || !(tyAt(pt) is TyFunc) { return 0 }
+  const s = fnTagSetOfTy(at)
+  const many = s >= 0 && fnTagMembers(s).length > 1
+  const ad = if many { -1 } else { identFnDeclOf(parenPeelIx(arg)) }
+  const an = if ad >= 0 && ad < P.nodes.length { nodeAt(ad) } else { nodeAt(0) }
+  const gen = ad >= 0 && an is FuncDecl && an.fnTyParams.length > 0
+  if !many && !gen { return 0 }
+  const pf = tyAt(pt)
+  if !(pf is TyFunc) || pf.fnRet < 0 { return 0 }
+  const rv = tyAt(pf.fnRet)
+  if !(rv is TyVar) || bindOf(bNames, bTys, rv.tvName) >= 0 { return 0 }
+  const pts: i32[] = []
+  for p in pf.fnParamTypes {
+    const b = substTyDeep(p, bNames, bTys)
+    if b < 0 || tyHasTyVar(b) || tyIsHole(b) { return 0 }
+    pts.push(b)
+  }
+  const r = if many { holeSetCallRetOf(-1, s, pts, false) } else { setMemberRetAt(ad, mkFuncTy(pts, TY_I32)) }
+  if r < 0 || tyHasTyVar(r) || tyIsHole(r) { return 0 }
+  bNames.push(rv.tvName)
+  bTys.push(r)
+  0
+}
+
+// Whether every member of set `s` is a named function declaration.
+function csNamedMembers(s: i32): boolean {
+  const ms = fnTagMembers(s)
+  if ms.length == 0 { return false }
+  for m in ms {
+    const d = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { nodeAt(0) }
+    if !(d is FuncDecl) || d.fnName == "" { return false }
+  }
+  true
 }

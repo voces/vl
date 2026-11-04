@@ -28,6 +28,7 @@ import { covarWriteReset } from "./check_covar_pins"
 import { cstrProbeReset } from "./check_cstr_probe"
 import {
   argCstr,
+  arrDefCstr,
   binCstr,
   bmCstr,
   cstrSeqNext,
@@ -82,7 +83,6 @@ import { mismatchNotesReset } from "./check_mismatch_notes"
 import { narStoreReset } from "./check_nar_store"
 import { narWrittenReset } from "./check_nar_written"
 import { narPathsReset } from "./check_narrow_paths"
-import { njGateReset } from "./check_nj_gate"
 import { njJoinReset } from "./check_nj_join"
 import {
   colAt,
@@ -90,6 +90,7 @@ import {
   nodeTyIx,
   nodeTyIxOf,
   nodeTyWrites,
+  tyCarrySrcReset,
 } from "./check_node_tys"
 import {
   lpColSet,
@@ -156,6 +157,7 @@ import {
   holeTpJoinNames,
   joinRowsReset,
   tpJoinUnions,
+  tpParamLitJoins,
   tvElseBase,
   tvElseTested,
 } from "./check_tp_join"
@@ -511,10 +513,39 @@ export let nodeRepTyIx: i32[] = []
 // `nodeRepTyIx`, any node kind is recorded, a narrowed read included.
 export let nodeCtxTyIx: i32[] = []
 
+// The union each node is delivered into, where the checker proved a delivery at a union type:
+// `nodeCtxTyIx`'s union writes alone, so an arm a literal then adopts does not replace it.
+export let nodeBoxTyIx: i32[] = []
+
+// The `null` a bare `as` hands back on a miss, per cast node: minted by the cast's check and
+// delivered to the enclosing function's result, so each instance's re-check records it.
+export let asMissNull: {[i32]: i32} = Map()
+
+// The `null` a record literal's omitted nullable field holds, per literal node and field name:
+// minted where the check adopts the literal and delivered to the field's type.
+export let omitFieldNull: {[string]: i32} = Map()
+
+// The nodes a `?.` read's rewrite puts in its place, per `OptMember` node: its default `null`
+// and its guarded field read. Minted by the read's check, and stamped wherever the read's
+// delivery is, since each stands where the read stood.
+export let optReadParts: {[i32]: i32[]} = Map()
+
+// The result hole a generic `??` takes at its template, per `BinExpr` node: an instance
+// builds the `??` at that hole's pinned join and boxes its left operand there.
+export let coalNodeHole: {[i32]: i32} = Map()
+
+// The key `omitFieldNull` holds literal `objIx`'s field `name` at.
+export function omitFieldKey(objIx: i32, name: string): string {
+  i32ToStr(objIx) + "." + name
+}
+
 // The record field each node the checker delivered as a field's value goes into: the owning
 // object literal or member target, and the field's name; read by `ctxFieldOwnerOf`.
 export let ctxFieldNodes: {[i32]: i32} = Map()
 export let ctxFieldNames: {[i32]: string} = Map()
+// The list literal each node the checker delivered as a list element goes into; read by
+// `ctxElemOwnerOf`.
+export let ctxElemNodes: {[i32]: i32} = Map()
 
 // Per literal the checker adopted into an arm of a union, that union: the row the arm's variant
 // is read from. -1 where no union adopted the literal.
@@ -527,6 +558,19 @@ export let mapUnboxTyIx: i32[] = []
 // Per node, the record a delivery copies the node's record into, its number fields converted
 // (`recordRecCopy`). -1 where nothing is recorded.
 export let recCopyTyIx: i32[] = []
+// Per copied call, the fields its copy unwraps from the wide row's nullable to its own non-null type.
+export let recCopyUnwrap: {[i32]: string[]} = Map()
+// Per call copied back to its own record, the record its function builds the result at: the row
+// the copy reads from, where the call itself is typed at the copy's record.
+export let recCopyFrom: {[i32]: i32} = Map()
+// Record literals in a generic body whose fields' parameter reads each pin serves with a fresh
+// argument built at the field's destination (`pinLitFieldArgs`): their own delivery is not refused.
+export let pinLitServed: {[i32]: boolean} = Map()
+// Per node, the list type a delivery copies the node's list into (`recordListCopy`), else -1.
+export let listCopyTyIx: i32[] = []
+// Per node, the closed function type a delivery builds the closure of the node's one-member
+// tagged set at (`fnCloCoerceNote`), else -1.
+export let fnCloCoerceTyIx: i32[] = []
 
 // The shift nodes whose count is a literal, graded once every width is in (`checkShiftCounts`).
 export let shiftCountNodes: i32[] = []
@@ -644,6 +688,9 @@ function checkerResetCstrColumns() {
   printCstr.ty = []
   printCstr.ix = []
   printCstr.fn = []
+  arrDefCstr.ty = []
+  arrDefCstr.ix = []
+  arrDefCstr.fn = []
   nestCstr.ty = []
   nestCstr.ix = []
   nestCstr.fn = []
@@ -722,6 +769,7 @@ function checkerResetInferState() {
   inlineLitUnionReset()
   bodyChecked = Map()
   nodeTyIx = []
+  tyCarrySrcReset()
   narrowedFromTyIx = []
   nodeTyWrites = nodeTyWrites + 1
   matchHeadsReset()
@@ -733,11 +781,23 @@ function checkerResetInferState() {
   fvaDone = Map()
   nodeRepTyIx = []
   nodeCtxTyIx = []
+  nodeBoxTyIx = []
+  asMissNull = Map()
+  omitFieldNull = Map()
+  optReadParts = Map()
+  coalNodeHole = Map()
   ctxFieldNodes = Map()
   ctxFieldNames = Map()
+  ctxElemNodes = Map()
   nodeRepUnionIx = Map()
   mapUnboxTyIx = []
   recCopyTyIx = []
+  recCopyUnwrap = Map()
+  recCopyFrom = Map()
+  pinLitServed = Map()
+  listCopyTyIx = []
+  fnCloCoerceTyIx = []
+  fnCloCoerceSetAt = Map()
   retagRowsReset()
   refListViewReset()
   literalsReset()
@@ -810,6 +870,7 @@ function checkerResetPassTables() {
   wideLitMinted = false
   objNamesDistinctReset()
   tpJoinUnions = Map()
+  tpParamLitJoins = Map()
   tvElseBase = Map()
   tvElseTested = Map()
   listUnionReset()
@@ -851,7 +912,6 @@ function checkerResetPassTables() {
   hdReset()
   guardReset()
   joinHoleUnions = []
-  njGateReset()
   njJoinReset()
   njPinFn = -1
   apartHoleJoins = Map()
@@ -1257,6 +1317,9 @@ export function inferJoinListTyOf(name: string): i32 {
 // The object literal or member target node `ix` is a field value of, or -1.
 export function ctxFieldOwnerOf(ix: i32): i32 { ctxFieldNodes[ix] ?? -1 }
 
+// The list literal node `ix` is an element of, or -1.
+export function ctxElemOwnerOf(ix: i32): i32 { ctxElemNodes[ix] ?? -1 }
+
 // The name of the field node `ix` is the value of, or "".
 export function ctxFieldNameOf(ix: i32): string { ctxFieldNames[ix] ?? "" }
 
@@ -1264,6 +1327,15 @@ export function ctxFieldNameOf(ix: i32): string { ctxFieldNames[ix] ?? "" }
 export function nodeCtxTyIxOf(ix: i32): i32 {
   if ix < 0 || ix >= nodeCtxTyIx.length { return -1 }
   nodeCtxTyIx[ix]
+}
+
+// The miss `null` of bare `as` cast `ix`, or -1 where its check minted none.
+export function asMissNullOf(ix: i32): i32 { asMissNull[ix] ?? -1 }
+
+// The union node `ix` is delivered into, or -1 where no delivery at a union recorded one.
+export function nodeBoxTyIxOf(ix: i32): i32 {
+  if ix < 0 || ix >= nodeBoxTyIx.length { return -1 }
+  nodeBoxTyIx[ix]
 }
 
 // The context-resolved companion of `nodeTyIxOf`: returns the destination type recorded by
@@ -1280,11 +1352,73 @@ export function nodeRepTyIxOf(ix: i32) {
   nodeTyIxOf(ix)
 }
 
+// Whether a producer stamped node `ix` with the type it is built at, even its own type; the
+// unstamped answer is what `nodeRepTyIxOf` falls back from.
+export function nodeRepStamped(ix: i32): boolean {
+  ix >= 0 && ix < nodeRepTyIx.length && nodeRepTyIx[ix] >= 0
+}
+
 // The map type a union of maps at `ix` is delivered as, or -1 (`recordMapUnbox`).
 export function mapUnboxTyOf(ix: i32): i32 { colAt(mapUnboxTyIx, ix) }
 
 // The record the value at `ix` is copied into where it is delivered, or -1 (`recordRecCopy`).
 export function recCopyTyOf(ix: i32): i32 { colAt(recCopyTyIx, ix) }
+export function recCopyUnwrapOf(ix: i32): string[] { recCopyUnwrap[ix] ?? [] }
+// The record a call copied back to its own record is built at (`recCopyFrom`), or -1.
+export function recCopyFromOf(ix: i32): i32 { recCopyFrom[ix] ?? -1 }
+// The list type `recordListCopy` recorded at node `ix`, or -1.
+export function listCopyTyOf(ix: i32): i32 { colAt(listCopyTyIx, ix) }
+
+// The closed function type `fnCloCoerceNote` recorded at node `ix`, or -1.
+export function fnCloCoerceTyOf(ix: i32): i32 { colAt(fnCloCoerceTyIx, ix) }
+
+// Records that the delivery of node `ix`, a value of a tagged one-member set, builds that
+// member's closure at closed function type `ty` (D14884).
+export function fnCloCoerceNote(ix: i32, ty: i32) {
+  if ix < 0 || ty < 0 { return 0 }
+  while fnCloCoerceTyIx.length <= ix { fnCloCoerceTyIx.push(-1) }
+  fnCloCoerceTyIx[ix] = ty
+  0
+}
+
+// The one-member set whose member `fnCloCoerceNote` builds at node `ix` where the node's own
+// type carries none (a parameter read in a generic body), or -1; -2 once two instances disagree.
+export let fnCloCoerceSetAt: Map<i32, i32> = Map()
+
+// Records that parameter read `ix`, delivered to closed function type `ty`, is the closure of set
+// `s`'s one member at every instance; false, recording nothing new, once an instance binds another.
+export function fnCloCoerceSetNote(ix: i32, ty: i32, s: i32): boolean {
+  const have = fnCloCoerceSetAt.get(ix) ?? -1
+  if have == -2 || (have >= 0 && have != s) {
+    fnCloCoerceSetAt[ix] = -2
+    return false
+  }
+  const t = fnCloCoerceTyOf(ix)
+  if t >= 0 && t != ty { return false }
+  fnCloCoerceSetAt[ix] = s
+  fnCloCoerceNote(ix, ty)
+  true
+}
+
+// Moves node `from`'s closure-coercion record onto `to`, a read a rewrite delivers in its place.
+export function fnCloCoerceMove(from: i32, to: i32) {
+  const t = fnCloCoerceTyOf(from)
+  if t < 0 || to < 0 { return 0 }
+  fnCloCoerceTyIx[from] = -1
+  fnCloCoerceNote(to, t)
+  const s = fnCloCoerceSetAt.get(from) ?? -1
+  if s >= 0 { fnCloCoerceSetAt[to] = s }
+}
+
+// Moves node `from`'s list-copy record onto `to`, a read a rewrite delivers in its place.
+export function listCopyMove(from: i32, to: i32) {
+  const t = listCopyTyOf(from)
+  if t < 0 || to < 0 { return 0 }
+  listCopyTyIx[from] = -1
+  while listCopyTyIx.length <= to { listCopyTyIx.push(-1) }
+  listCopyTyIx[to] = t
+  0
+}
 
 // Whether any delivery copies a record (`recordRecCopy`).
 export function recCopyAny(): boolean { recCopyTyIx.length > 0 }

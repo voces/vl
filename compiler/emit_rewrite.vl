@@ -6,7 +6,11 @@
 // declarations for later phases. Consults the classifiers (`emit_classify.vl`);
 // writes no bytes.
 
-import { elabNodeInstTys } from "./emit_elab"
+import { deliveryRetagMove } from "./check_retag_rows"
+import { elabNodeInstTys, litRepTyAt } from "./emit_elab"
+import { collectRetValues } from "./check_nj_join"
+import { REC_STORE_DEPTH, recNumMergeField } from "./check_ty_relate"
+import { valueTailLeaves } from "./check_num_adopt"
 import {
   mkNumTyped,
   narrowedFromTyCarry,
@@ -21,15 +25,20 @@ import {
   nodeTyMapName,
   nodeTyName,
   nodeTyRecord,
+  nodeTySetGrow,
 } from "./check_node_tys"
 import { cexLitPeel } from "./check_num_lits"
 import { nameIsSpaceFree, tyTopIndexOf } from "./tyname"
 import {
   deadTailBlks,
   externValueSeen,
+  fnCloCoerceMove,
+  listCopyMove,
   loopValAny,
   memSharedCalls,
+  nodeRepStamped,
   nodeRepTyIxOf,
+  optReadParts,
 } from "./check_core_state"
 import { nulRecListNominalName } from "./check_emit_queries"
 import {
@@ -40,7 +49,7 @@ import {
   optCallRestamp,
   recordNodeTyFrom,
 } from "./check_leaf_steps"
-import { annUnionAtomsOf } from "./check_decl_scan"
+import { annUnionAtomsOf, primTyIxOfName } from "./check_decl_scan"
 import { recordRepTyAdopt } from "./check_fit_rules"
 import {
   inferRetFnKey,
@@ -57,7 +66,7 @@ import {
 } from "./check_side_rows"
 import { asgAnyWiderStore, asgStoreTyOf } from "./check_asg_rows"
 import { ifYieldsNoValue } from "./check_if_value"
-import { isVarTyIxOf } from "./check_list_union"
+import { isPatTyIxOf, isVarTyIxOf } from "./check_list_union"
 import {
   exitArmBlockAt,
   exitArmCount,
@@ -82,12 +91,14 @@ import {
   T,
   TY_BOOL,
   TY_I32,
+  TY_I64,
   TY_NULL,
   TyArray,
   TyFunc,
   TyNullable,
   TyObj,
   TyUnion,
+  TyVar,
   litUnionAliasNameOfTy,
   mkArrayTy,
   mkNullableTyOf,
@@ -97,6 +108,7 @@ import {
   tyBearsNull,
   tyEq,
   tyFieldTyOf,
+  tyHasInferHole,
   tyIsHole,
   tyIsLitUnion,
   tyIsLitUnionOrLit,
@@ -167,6 +179,8 @@ import {
   fnRequiredArity,
   hasNamedArgs,
   i32ToStr,
+  isExprKid,
+  isFitObjOf,
   loopVarsMoveTo,
   markCallNever,
   mkArrayLit,
@@ -209,7 +223,9 @@ import {
 } from "./ast"
 import {
   annArrowAt,
+  annFnDecompose,
   drwDispatchOp,
+  isTestsNull,
   monoAnnOpenTyNote,
   nodeIsTypeDecl,
   noteCallOrigin,
@@ -244,6 +260,7 @@ import {
   unTyIx,
 } from "./emit_state"
 import { capMemoNoteEdit } from "./emit_capture_frames"
+import { fnLetReadTyOf, fnTagTyIsTagged } from "./check_elab_cap"
 import {
   exprIsClosure,
   fnIndexOf,
@@ -285,6 +302,7 @@ import {
   identRedirect,
   memberDeclOf,
   memberMethodOf,
+  nodeSrc,
   nodeSrcNote,
   sidNoteNodeName,
   sidOfNode,
@@ -519,6 +537,8 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
     const rd = mkIdent(name, pos)
     identFromDecl(rd, decl)
     nodeTyRecord(rd, ty)
+    // The read is the loop's value, so the loop's facts answer for it.
+    nodeSrcNote(rd, x)
     thenSt.push(rd)
   }
   const thenB = mkBlock(thenSt, pos)
@@ -1210,9 +1230,13 @@ function nssTry(blk: i32, letIx: i32) {
           } else if n is IsExpr {
             if nssReadOf(n.isObj, letIx) {
               if fn || !tyEq(nodeTyIxOf(n.isObj), t) { return 0 }
-              if n.isVariant == "null" { abs.push(ix) }
-              else if n.isVariant == tyToStr(s) { pres.push(ix) }
-              else { return 0 }
+              if isTestsNull(ix) {
+                abs.push(ix)
+              } else if isPatTyIxOf(ix) >= 0 && tySame(isPatTyIxOf(ix), s) {
+                pres.push(ix)
+              } else {
+                return 0
+              }
               kids = false
             }
           }
@@ -1658,8 +1682,10 @@ function drwOptGuard(
   let gElse = -1
   if !atStmt && !nodeTyExcludesNull(ix) {
     const gElseStmts: i32[] = []
-    // The guard's `null` is the call's own null, at the type the checker gave the call.
-    const gNull = mkNull("null", pos)
+    // The guard's `null` is the call's own null, at the type the checker gave the call: the
+    // one the call's check minted, where it minted one.
+    const gParts = optReadParts[ix] ?? []
+    const gNull = if gParts.length > 0 { gParts[0] } else { mkNull("null", pos) }
     recordRepTyAdopt(gNull, nodeTyIxOf(ix), 6)
     gElseStmts.push(gNull)
     gElse = mkBlock(gElseStmts, pos)
@@ -1687,8 +1713,15 @@ let drwAtStmt = false
 // checked type, so a reader of the rewritten node (a walk's element, a print) sees the result.
 function drwOpCall(call: i32, opIx: i32): i32 {
   nodeTyCarry(call, opIx)
+  if call >= 0 { drwOpOrigin[call] = opIx }
   call
 }
+
+// Each call `drwOpCall` builds, to the operator node it dispatches, whose bind row is the call's.
+let drwOpOrigin: {[i32]: i32} = Map()
+
+// The operator node dispatch call `ix` stands for, or -1.
+export function drwOpCallOrigin(ix: i32): i32 { drwOpOrigin[ix] ?? -1 }
 
 // `drwWalk`'s block arm: walks block `n`'s statements in order, splicing each compound place's
 // spills in ahead of it.
@@ -1751,7 +1784,7 @@ function drwWalkOptMember(ix: i32, n: OptMember, ctx: i32): i32 {
   // guard never widened. Folded here for the reason `x ?? d` over a non-nullable left
   // operand is (D1815).
   if nodeTyExcludesNull(n.omObj) {
-    const omFold = mkMember(n.omObj, n.omProp, n.pos)
+    const omFold = optReadPart(ix, 1, n)
     nodeTyCarry(omFold, ix)
     return omFold
   }
@@ -1883,7 +1916,12 @@ function drwWalk(ix: i32, ctx: i32) {
       return drwWalkIndex(ix, n, ctx)
     }
     IsExpr => {
-      n.isObj = drwWalk(n.isObj, ctx)
+      if n.isFit >= 0 {
+        n.isFit = drwWalk(n.isFit, ctx)
+        n.isObj = isFitObjOf(n.isFit)
+      } else {
+        n.isObj = drwWalk(n.isObj, ctx)
+      }
       return ix
     }
     AsExpr => {
@@ -1960,7 +1998,19 @@ function drwWalkMemberCall(
       if tyIsMap(mgTy) { mgRecv = drwNarrowedClone(optRecv, mgTy) }
     }
     if args.length == 1 && nodeTyIsMap(mgRecv) {
-      const mgIx = mkIndex(mgRecv, args[0], n.pos)
+      let mgIx = -1
+      const mgParts = optReadParts[ix] ?? []
+      if optRecv >= 0 && mgParts.length > 1 {
+        // The read the call's check minted, over the guard's fresh receiver.
+        mgIx = mgParts[1]
+        const mgn = nodeAt(mgIx)
+        if mgn is Index {
+          mgn.idxArr = mgRecv
+          mgn.idxIndex = args[0]
+        }
+      } else {
+        mgIx = mkIndex(mgRecv, args[0], n.pos)
+      }
       nodeTyCarry(mgIx, ix)
       return drwOptGuard(mgIx, ix, optRecv, n.pos, atStmt)
     }
@@ -2047,6 +2097,14 @@ function drwWalkMemberCall(
     noteCallOrigin(ufcsFn, ix)
     n.callFn = ufcsFn
     arenaNoteRefWrite()
+  } else if optRecv >= 0 {
+    // A built-in method under `?.` reads its receiver in the guard's arm too, at the
+    // receiver's non-null type (D14792).
+    callee.memObj = drwNarrowedClone(
+      optRecv,
+      nonNullTy(nodeTyIxOf(unwrapParen(optRecv))),
+    )
+    arenaNoteRefWrite()
   }
   drwFillDefaults(ix, ctx)
   return drwOptGuard(ix, ix, optRecv, n.pos, atStmt)
@@ -2097,11 +2155,11 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
         const crRecv = drwWalk(cl.omObj, ctx)
         const crIf = recUnionGuard(
           crRecv,
-          cl.omProp,
           clTys[0],
           clTys[1],
           drwWalk(n.binRight, ctx),
           n.pos,
+          optReadPart(unwrapParen(n.binLeft), 1, cl),
         )
         nodeTyCarry(crIf, ix)
         capMemoNoteEdit()
@@ -2121,8 +2179,15 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
     // lands on the inner node only. D1371 — without peeling, `(a as? i32) ?? 0` read the
     // stale parenthesized type while the un-parenthesised spelling ran correctly.
     const coalLhs = unwrapParen(n.binLeft)
-    if nodeTyExcludesNull(coalLhs) && !readOfOpenBinding(coalLhs) {
+    // An operand whose type is open is left to the instance, whose pin may hold `null` (D4170).
+    if (
+      nodeTyExcludesNull(coalLhs)
+      && !readOfOpenBinding(coalLhs)
+      && !tyHasTyVar(nodeTyIxOf(coalLhs))
+    ) {
       capMemoNoteEdit()
+      // The checker records the delivery's retag on the `??`, which the left operand stands for.
+      deliveryRetagMove(ix, coalLhs)
       return n.binLeft
     }
     // `x ?? null` is `x` for every `x`: a null left selects a null default. Folded so the
@@ -2233,19 +2298,21 @@ function drwNarrowedClone(src: i32, ty: i32) {
   c
 }
 
-// `if recv != null { recv.prop } else { other }`: the fresh receiver is typed `objTy`, the type
-// the checker gives the same place under `!= null`, and the field read `readTy`. `recv` is a
-// re-readable place; the caller types the result.
+// `if recv != null { read } else { other }`: `read` is the field read the read's check minted,
+// re-pointed at a fresh receiver typed `objTy` (the place's type under `!= null`) and typed
+// `readTy`. `recv` is a re-readable place; the caller types the result.
 function recUnionGuard(
   recv: i32,
-  prop: string,
   objTy: i32,
   readTy: i32,
   other: i32,
   pos: i32,
+  read: i32,
 ): i32 {
   const rObj = drwNarrowedClone(recv, objTy)
-  const rRead = mkMember(rObj, prop, pos)
+  const rRead = read
+  const rn = nodeAt(rRead)
+  if rn is Member { rn.memObj = rObj }
   nodeTyRecord(rRead, readTy)
   const rThen: i32[] = []
   rThen.push(rRead)
@@ -2297,15 +2364,43 @@ function recUnionReadTys(
   true
 }
 
+// Part `k` of `?.` read `ix` the read's check minted (`optReadParts`): 0 its default `null`, 1 its
+// field read, over the read's receiver; minted here only for a read no check saw.
+function optReadPart(ix: i32, k: i32, n: OptMember): i32 {
+  let at = ix
+  let parts = optReadParts[at] ?? []
+  let depth = 0
+  while parts.length == 0 && at >= 0 && depth < 8 {
+    at = nodeSrc[at] ?? -1
+    parts = optReadParts[at] ?? []
+    depth = depth + 1
+  }
+  if k < parts.length {
+    const p = parts[k]
+    const pn = nodeAt(p)
+    if pn is Member { pn.memObj = n.omObj }
+    return p
+  }
+  if k == 0 { return mkNull("null", n.pos) }
+  mkMember(n.omObj, n.omProp, n.pos)
+}
+
 // A bare `r?.f` read as `ix`, the guard's types in `tys` (`recUnionReadTys`): the guarded read
 // with a `null` default, or `ix` unchanged when `r` cannot be read twice. A computed receiver is
 // bound to a name before the checker runs (D5300).
 function recUnionOptRead(ix: i32, n: OptMember, tys: i32[]): i32 {
   if !exprReReadable(unwrapParen(n.omObj)) { return ix }
   // The default is the read's own null, at the type the checker gave `r?.f`.
-  const dNull = mkNull("null", n.pos)
+  const dNull = optReadPart(ix, 0, n)
   recordRepTyAdopt(dNull, nodeTyIxOf(ix), 6)
-  const g = recUnionGuard(n.omObj, n.omProp, tys[0], tys[1], dNull, n.pos)
+  const g = recUnionGuard(
+    n.omObj,
+    tys[0],
+    tys[1],
+    dNull,
+    n.pos,
+    optReadPart(ix, 1, n),
+  )
   nodeTyCarry(g, ix)
   capMemoNoteEdit()
   g
@@ -2429,6 +2524,8 @@ function spillTail(blockIx: i32, fnIx: i32) {
     const out: i32[] = []
     const val = spillWrite(last, out)
     if val < 0 { return 0 }
+    // The tail now yields `val` where it yielded the write's value, so the write's facts answer.
+    nodeSrcNote(val, last)
     b.blkStmts.pop()
     let k = 0
     while k < out.length {
@@ -2507,7 +2604,8 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
     const val = spillLocal(a.binRight, asgIx, "v", out, a.pos)
     spillTypeByTarget(out[out.length - 1], val, t)
     a.binRight = val
-    return spillRead(val)
+    const rd = spillRead(val)
+    return cboxYieldAs(rd, nodeTyIxOf(rd), nodeTyIxOf(asgIx))
   }
   -1
 }
@@ -2601,6 +2699,8 @@ function spillLocal(
   identFromDecl(rd, decl)
   nodeTyCarry(rd, ix)
   refViewCarry(ix, rd)
+  listCopyMove(unwrapParen(ix), rd)
+  fnCloCoerceMove(unwrapParen(ix), rd)
   // The read is `ix`'s value, so an instance's facts about `ix` answer for it (D14773).
   nodeSrcNote(rd, ix)
   rd
@@ -2731,8 +2831,8 @@ function asvLitValue(ix: i32): boolean {
 }
 
 // `asvMoves`'s half that reads only the write at `asgIx`: a plain write to a name whose
-// storage type is not the value's, where neither is a literal-union atom or holds a type
-// variable, and the value is neither a bare `null` nor a number literal.
+// storage type is not the value's, where neither is a literal-union atom or an inference hole,
+// and the value is neither a bare `null` nor a number literal.
 function asvTypeMoves(asgIx: i32): boolean {
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
@@ -2741,11 +2841,37 @@ function asvTypeMoves(asgIx: i32): boolean {
   if nodeAt(unwrapParen(a.binRight)) is NullLit { return false }
   // A number literal's value is built where it is read (`asgLitWidth`), so it stays in place.
   if asvLitValue(a.binRight) { return false }
-  const lt = asgStoreTyOf(asgIx)
+  let lt = asgStoreTyOf(asgIx)
+  // Instances that store the place apart leave its column a hole; the shared body asks the type
+  // the place is declared at, which every instance substitutes.
+  if lt < 0 || tyHasInferHole(lt, 0) { lt = declaredPlaceTy(a.binLeft) }
   const vt = nodeTyIxOf(asgIx)
   if lt < 0 || vt < 0 || tySame(lt, vt) { return false }
   if tyIsLitUnionOrLit(nonNullTy(lt)) || tyIsLitUnionOrLit(vt) { return false }
-  !(tyHasTyVar(lt) || tyHasTyVar(vt))
+  if tyHasInferHole(lt, 0) || tyHasInferHole(vt, 0) { return false }
+  if !tyHasTyVar(lt) && !tyHasTyVar(vt) { return true }
+  // An open write moves only as a bare type parameter into a union holding it, whose instances
+  // store the two apart; any other open value keeps the place's own read (D2439).
+  tyAt(vt) is TyVar && tyAt(lt) is TyUnion
+}
+
+// The type the binding name `ix` reads is declared at, a `let`'s annotation or a parameter's;
+// -1 when it has none.
+function declaredPlaceTy(ix: i32): i32 {
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  match dn {
+    LetDecl => {
+      if dn.letType >= 0 { return nodeTyIxOf(dn.letType) }
+    }
+    Param => {
+      if dn.parType >= 0 { return nodeTyIxOf(dn.parType) }
+    }
+    // No other declaration is written with a type.
+    LoopVar | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
+  -1
 }
 
 // Walks the operands of `ix` that run first, moving each value-position write `asvMoves`
@@ -3224,10 +3350,14 @@ export function synthNulListRetAnns() {
           // So does a return set joining lists of different storage, built as the union box,
           // and a union with a function member, which un-pinned lowered as a bare closure (D4349).
           const pinsUnion = tyIsListUnion(jty) || tyIsFnArmUnion(jty)
+          // Returned literals the record solve built at one other record keep the inferred
+          // result, which names that record's row: a pin at the checked type would not (D3401).
+          const built = !pinsUnion && fnRetBuiltRecord(fn, jty) >= 0
           if (
-            pinsUnion
-            || tyIsJoinedRecord(jty)
-            || fnRetJoinsWiderRecord(fnStmts[i], jty)
+            !built
+            && (pinsUnion
+              || tyIsJoinedRecord(jty)
+              || fnRetJoinsWiderRecord(fnStmts[i], jty))
           ) {
             let jnm = ""
             if tyIsListUnion(jty) {
@@ -3240,7 +3370,7 @@ export function synthNulListRetAnns() {
             } else if jnm != "" {
               fn.fnRet = synthTypeRefTy(jnm, -1, jty)
             }
-          } else {
+          } else if !built {
             // An inferred return that is one union arm is pinned to the arm's nominal name, so a
             // returned binding narrowed to it is unboxed exactly as under `: Arm` (D4555).
             const jvr = repVariantShapeRowOf(jty)
@@ -3254,6 +3384,33 @@ export function synthNulListRetAnns() {
     i = i + 1
   }
   0
+}
+
+// The record every value `fn` returns is built at, where each is a record literal the record
+// solve built, or a call or `??` the store column stamped, at one record other than `jty`, the
+// checked result, keeping each of its numbers; else -1 (D15317).
+function fnRetBuiltRecord(fn: FuncDecl, jty: i32): i32 {
+  if jty < 0 || jty >= T.tys.length || !(tyAt(jty) is TyObj) { return -1 }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  let r = -1
+  for rv in rets {
+    for l in valueTailLeaves(rv) {
+      const u = unwrapParen(l)
+      const un = if u >= 0 { nodeAt(u) } else { null }
+      const call = (un is Call || (un is BinExpr && un.binOp == "??"))
+        && nodeRepStamped(u)
+      if u < 0 || !(nodeAt(u) is ObjLit || call) { return -1 }
+      const t = if call { nodeRepTyIxOf(u) } else { litRepTyAt(u, -1) }
+      if t < 0 || t >= T.tys.length || !(tyAt(t) is TyObj) || tyEq(t, jty) {
+        return -1
+      }
+      if r >= 0 && !tyEq(r, t) { return -1 }
+      if recNumMergeField(nodeTyIxOf(u), t, REC_STORE_DEPTH) != "" { return -1 }
+      r = t
+    }
+  }
+  r
 }
 
 // Pins `fn`'s return to the union `jty` spelled `jnm`, registering the union a record list arm
@@ -3768,7 +3925,7 @@ function cboxScan(ix: i32, depth: i32, dlets: i32[], alam: i32[]) {
       return cboxScan(n.idxIndex, depth, dlets, alam)
     }
     IsExpr => {
-      cboxScan(n.isObj, depth, dlets, alam)
+      cboxScan(isExprKid(n), depth, dlets, alam)
       // `x is L` may store an empty `L` back into `x`, so it writes `x` as an assignment does.
       const wo = unwrapParen(n.isObj)
       if wo >= 0 && nodeAt(wo) is Ident && cboxIsMayStore(ix, n.isObj) {
@@ -3920,9 +4077,27 @@ function cboxYieldTail(blockIx: i32, boxed: i32[]) {
   nodeTyRecord(yielded, heldTy)
   st[st.length - 1] = tlet
   st.push(tx)
-  st.push(yielded)
+  st.push(cboxYieldAs(yielded, heldTy, valTy))
   plCacheBust()
   0
+}
+
+// The tail read `rd` of a temp held at `heldTy` as the write's value `valTy`: a radix literal its
+// place built at `i64` or `f64` yields its 32-bit pattern where the write is typed `i32`
+// (D14796, D14797). An `f64` holds the literal exactly, so it goes through `i64` first.
+function cboxYieldAs(rd: i32, heldTy: i32, valTy: i32): i32 {
+  if tyPrimNameOf(valTy) != "i32" { return rd }
+  const held = tyPrimNameOf(heldTy)
+  let wide = rd
+  if held == "f64" {
+    wide = mkAsExpr(rd, "i64", "trap", -1)
+    nodeTyRecord(wide, TY_I64)
+  } else if held != "i64" {
+    return rd
+  }
+  const w = mkAsExpr(wide, "i32", "wrap", -1)
+  nodeTyRecord(w, valTy)
+  w
 }
 
 // A fresh copy of the literal at `ix` (string, number, char, boolean), or -1 for any other node.
@@ -3976,6 +4151,9 @@ function cboxBoxLet(ix: i32, key: i32) {
     // An init that read another cell is already `c[0]`, untyped, its read's type banked aside.
     let initTy = nodeTyIxOf(n.letInit)
     if initTy < 0 && n.letInit >= 0 { initTy = cboxReadTy[n.letInit] ?? -1 }
+    // A binding read as a tagged set holds an id, whichever member seeds it.
+    const lr = fnLetReadTyOf(ix)
+    if lr >= 0 && fnTagTyIsTagged(lr) { initTy = lr }
     if initTy >= 0 { cboxCellTy[key] = mkArrayTy(initTy) }
     // The binding's inferred value union described the value, which is now the cell's
     // element: left standing, it would box the cell literal itself (D2392).
@@ -4138,6 +4316,10 @@ function cboxContStoreBack(
 export function rewriteCountersReset() {
   cboxYieldCtr = 0
   shrSerial = 0
+  voidTwinSeamAt = []
+  voidTwinSeamFe = []
+  voidTwinSeamTy = []
+  drwOpOrigin = Map()
   0
 }
 
@@ -4245,7 +4427,12 @@ function cboxWalk(ix: i32, boxed: i32[]) {
       return ix
     }
     IsExpr => {
-      n.isObj = cboxWalk(n.isObj, boxed)
+      if n.isFit >= 0 {
+        n.isFit = cboxWalk(n.isFit, boxed)
+        n.isObj = isFitObjOf(n.isFit)
+      } else {
+        n.isObj = cboxWalk(n.isObj, boxed)
+      }
       return ix
     }
     AsExpr => {
@@ -4317,6 +4504,7 @@ function cboxWalkIdent(ix: i32, n: Ident, boxed: i32[]): i32 {
       nodeTyRecord(rd, tyArrayElemIx(cellTy))
       const un = mkAsExpr(rd, "v128", "trap", -1)
       if rty >= 0 { nodeTyRecord(un, rty) }
+      nodeSrcNote(un, ix)
       return un
     }
     if rd >= 0 && rty >= 0 { cboxReadTy[rd] = rty }
@@ -4324,7 +4512,11 @@ function cboxWalkIdent(ix: i32, n: Ident, boxed: i32[]): i32 {
     if rd >= 0 && rty >= 0 && !cboxStoreTarget && !(tyAt(rty) is TyFunc) {
       nodeTyRecord(rd, rty)
     }
-    if rd >= 0 && !cboxStoreTarget { narrowedFromTyCopy(ix, rd) }
+    if rd >= 0 && !cboxStoreTarget {
+      narrowedFromTyCopy(ix, rd)
+      // The cell read is the name read respelled: its delivery's records are the read's.
+      nodeSrcNote(rd, ix)
+    }
     return rd
   }
   return ix
@@ -5052,8 +5244,34 @@ export function voidTwinTargetOf(fe: i32) {
 // resolution resolves to the very target the twin targets. Either alone is not enough — a
 // same-named nested function must keep the original closure.
 export function voidTwinForNode(nodeIx: i32, fe: i32) {
-  if !voidCoerceValAt(nodeIx) { return -1 }
+  if !voidCoerceValAt(nodeIx) && !voidTwinSeamHas(nodeIx, fe) { return -1 }
   voidTwinOfTarget(fe)
+}
+
+// Each value node the monomorphizer delivers a generic instance returning a value at into a slot
+// whose type returns nothing, beside that instance: a twin is minted for each (D3969).
+// `voidTwinSeamTy` holds the slot's function type, whose parameters the twin takes.
+let voidTwinSeamAt: i32[] = []
+let voidTwinSeamFe: i32[] = []
+let voidTwinSeamTy: string[] = []
+
+export function voidTwinSeamNote(ix: i32, fe: i32, tname: string) {
+  if !voidTwinSeamHas(ix, fe) {
+    voidTwinSeamAt.push(ix)
+    voidTwinSeamFe.push(fe)
+    voidTwinSeamTy.push(tname)
+  }
+  0
+}
+
+// Whether the monomorphizer noted value node `ix` as delivering instance `fe` into a void slot.
+function voidTwinSeamHas(ix: i32, fe: i32): boolean {
+  let i = 0
+  while i < voidTwinSeamAt.length {
+    if voidTwinSeamAt[i] == ix && voidTwinSeamFe[i] == fe { return true }
+    i = i + 1
+  }
+  false
 }
 
 // The top-level function named `name` (`fnParent < 0`), or -1 — the emit-side twin of
@@ -5083,67 +5301,87 @@ export function synthVoidTwins(_stmts: i32[]) {
     const name = voidCoerceValNameAt(i)
     const target = topLevelFnByName(name)
     if target >= 0 && voidTwinOfTarget(target) < 0 {
+      // The checker's grant already excluded generics; a target that is one gets no twin.
       const tfn = nodeAt(fnStmts[target])
-      if tfn is FuncDecl {
-        // The checker's grant already excluded generics and non-declarations; these
-        // emit-side re-checks fail closed — an unmintable target simply gets no twin,
-        // and the un-swapped closure keeps its existing behaviour at the call.
-        if tfn.fnTyParams.length == 0 {
-          let mintable = true
-          const nps: i32[] = []
-          const argIds: i32[] = []
-          let pj = 0
-          while pj < tfn.fnParams.length {
-            const pn = nodeAt(tfn.fnParams[pj])
-            if pn is Param {
-              if pn.parType < 0 { mintable = false }
-              // Fresh Param nodes sharing the original's annotation node, so the twin's
-              // param valtypes — and its `$fnsig` param tokens — byte-match the
-              // original's (only the result differs: `>v`).
-              const np = mkParam(
-                pn.parName,
-                pn.parType,
-                -1,
-                0,
-                pn.parRest,
-                pn.pos,
-              )
-              identFrom(np, tfn.fnParams[pj])
-              nps.push(np)
-              const arg = mkIdent(pn.parName, tfn.pos)
-              identFromDecl(arg, np)
-              argIds.push(arg)
-            } else {
-              mintable = false
-            }
-            pj = pj + 1
-          }
-          if mintable {
-            const noTyParams: string[] = []
-            const callee = mkIdent(name, tfn.pos)
-            identFromDecl(callee, fnStmts[target])
-            const callIx = mkCall(callee, argIds, tfn.pos)
-            const bodyIx = mkBlock([callIx], tfn.pos)
-            const twin = mkFunc(
-              name + "$voidtw",
-              noTyParams,
-              nps,
-              synthTypeRefTy("void", -1, -1),
-              bodyIx,
-              tfn.pos,
-            )
-            fnStmts.push(twin)
-            fnParent.push(-1)
-            fnDispNames.push("")
-            fnValUsed = true
-            voidTwinTargetFe.push(target)
-            voidTwinFe.push(fnStmts.length - 1)
-          }
-        }
+      const none: string[] = []
+      if tfn is FuncDecl && tfn.fnTyParams.length == 0 {
+        voidTwinMint(target, name, none)
       }
     }
     i = i + 1
   }
+  // A generic's instance delivered into a void slot takes a twin at the slot's parameters.
+  let j = 0
+  while j < voidTwinSeamFe.length {
+    const fe = voidTwinSeamFe[j]
+    if fe >= 0 && fe < fnStmts.length && voidTwinOfTarget(fe) < 0 {
+      const ifn = nodeAt(fnStmts[fe])
+      const pts: string[] = []
+      annFnDecompose(voidTwinSeamTy[j], pts)
+      if ifn is FuncDecl && pts.length == ifn.fnParams.length {
+        voidTwinMint(fe, ifn.fnName, pts)
+      }
+    }
+    j = j + 1
+  }
+  0
+}
+
+// Mints the capture-free void twin of function `target`, called `name`, which calls it and drops
+// its result, its parameters typed `ptys` when given, else as the target's; none where a
+// parameter has no type, and the closure stays at the call.
+function voidTwinMint(target: i32, name: string, ptys: string[]) {
+  const tfn = nodeAt(fnStmts[target])
+  if !(tfn is FuncDecl) { return 0 }
+  const nps: i32[] = []
+  const argIds: i32[] = []
+  let pj = 0
+  while pj < tfn.fnParams.length {
+    const pn = nodeAt(tfn.fnParams[pj])
+    if !(pn is Param) { return 0 }
+    // Fresh Param nodes sharing the original's annotation node, so the twin's param valtypes
+    // and its `$fnsig` param tokens byte-match the original's; only the result differs (`>v`).
+    const pt = if pj < ptys.length { synthTypeRefTy(ptys[pj], -1, -1) } else { pn.parType }
+    if pt < 0 { return 0 }
+    const np = mkParam(pn.parName, pt, -1, 0, pn.parRest, pn.pos)
+    identFrom(np, tfn.fnParams[pj])
+    nps.push(np)
+    const arg = mkIdent(pn.parName, tfn.pos)
+    identFromDecl(arg, np)
+    // A read of a parameter the slot's type spells takes the instance's own parameter type, which
+    // its argument conversion reads.
+    if pj < ptys.length { voidTwinArgTy(arg, tfn.fnParams[pj], ptys[pj]) }
+    argIds.push(arg)
+    pj = pj + 1
+  }
+  const noTyParams: string[] = []
+  const callee = mkIdent(name, tfn.pos)
+  identFromDecl(callee, fnStmts[target])
+  const callIx = mkCall(callee, argIds, tfn.pos)
+  const bodyIx = mkBlock([callIx], tfn.pos)
+  const twin = mkFunc(
+    name + "$voidtw",
+    noTyParams,
+    nps,
+    synthTypeRefTy("void", -1, -1),
+    bodyIx,
+    tfn.pos,
+  )
+  fnStmts.push(twin)
+  fnParent.push(-1)
+  fnDispNames.push("")
+  fnValUsed = true
+  voidTwinTargetFe.push(target)
+  voidTwinFe.push(fnStmts.length - 1)
+  0
+}
+
+// Types the twin's read `arg` of a parameter spelled `pname` as instance parameter `p` is typed,
+// else as the spelling's primitive; untyped when neither is closed.
+function voidTwinArgTy(arg: i32, p: i32, pname: string) {
+  let t = nodeTyIxOf(p)
+  if t < 0 || tyHasTyVar(t) { t = primTyIxOfName(pname) }
+  if t >= 0 { nodeTySetGrow(arg, t) }
   0
 }
 

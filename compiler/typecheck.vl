@@ -102,7 +102,6 @@ import { checkMatchExprNode } from "./check_match"
 import { neAssigned, neKeys, neKill } from "./check_narrow_ends"
 import { crReadHook, daCheckRead } from "./check_narrow_flow"
 import { crNoteLostName } from "./check_narrow_paths"
-import { njNoteHeldCall } from "./check_nj_join"
 import {
   checkBreakNode,
   checkNodeDone,
@@ -117,7 +116,9 @@ import {
   lbiBindName,
   lbiConstLitAt,
   lbiInlineLit,
+  lbiInlineTree,
   lbiInlinedName,
+  lbiKeptTreeOf,
   lbiModLit,
   lbiSymRead,
 } from "./check_num_lit_state"
@@ -130,7 +131,13 @@ import {
 } from "./check_operators"
 import { tErr, widenLitTy } from "./check_relate_core"
 import { identConstDeclOf } from "./check_scopes"
-import { elabCapLive, elabFnValNote, stampsStand } from "./check_elab_cap"
+import {
+  elabCapLive,
+  elabFnValNote,
+  fnTagArmCalleeOf,
+  globalInitRecordsFnSets,
+  stampsStand,
+} from "./check_elab_cap"
 import { fnTagInstanceArms } from "./check_fn_tag"
 import { symEnabled } from "./check_state"
 import {
@@ -161,7 +168,6 @@ import {
   tyAt,
   tySame,
 } from "./check_types"
-import { numUnionMinted } from "./check_union_mint"
 import { wsValueRead } from "./check_width"
 import { fnDeclIx } from "./check_write_scan"
 import {
@@ -299,10 +305,20 @@ function checkIdentNode(n: Ident, ix: i32): i32 {
     lbiInlineLit(ix, lit, n.pos, n.identName)
     return checkNodeReal(ix)
   }
-  // A dispatch arm's callee names no function: it is bound to its member's declaration, and
+  // A `const` whose tree computes at its use's width is that tree at each read (D14990).
+  const ktd = identConstDeclOf(ix)
+  if ktd >= 0 {
+    const kt = lbiKeptTreeOf(ix, ktd)
+    if kt >= 0 {
+      lbiInlineTree(ix, kt, n.pos, n.identName)
+      return checkNodeReal(ix)
+    }
+  }
+  // A dispatch arm's callee is its member's declaration, whatever its name resolves to here: it
   // reads the type the arm recorded for it, else that declaration's.
-  if n.identName == "" {
-    const ad = identDeclOf(ix)
+  const armD = fnTagArmCalleeOf(ix)
+  if armD >= 0 || n.identName == "" {
+    const ad = if armD >= 0 { armD } else { identDeclOf(ix) }
     if ad >= 0 && nodeAt(ad) is FuncDecl {
       const at = nodeTyIxOf(ix)
       return if at >= 0 { at } else { nodeTyIxOf(ad) }
@@ -328,7 +344,7 @@ function checkIdentNode(n: Ident, ix: i32): i32 {
     ix != ckCalleeIx
     && ty < T.tys.length
     && T.tys[ty] is TyFunc
-    && stampsStand()
+    && (stampsStand() || globalInitRecordsFnSets)
   ) {
     elabFnValNote(ty, identFnDeclOf(ix))
   }
@@ -443,12 +459,10 @@ function checkNodeReal(ix: i32) {
           else if !tySame(at, one) { agree = false }
         }
         if agree && one >= 0 && !tySame(one, callTy) {
-          if numUnionMinted { njNoteHeldCall(n, ix, one) }
           if !(nodeAt(ix) is Paren) { noteCallInvalidations(ix) }
           return one
         }
       }
-      if numUnionMinted { njNoteHeldCall(n, ix, callTy) }
       // A call can falsify a path narrowing by a write the guarded scope never spells. Asked
       // after the arguments, so they read under the narrowing that holds there. A string hole's
       // render call that became a `Paren` around the hole runs nothing (D7765).

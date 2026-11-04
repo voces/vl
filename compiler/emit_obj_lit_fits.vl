@@ -63,6 +63,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  structNameOfTy,
   tyAt,
   tyBearsNull,
   tyEq,
@@ -84,19 +85,19 @@ import {
   variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import { bodyLetOfRead, objFieldVal, tyNameOf, unwrapParen } from "./emit_base"
-import { isVariantSpellingOfShape } from "./emit_field_codes"
 import { fnIndexOfInScopeAt } from "./emit_local_scope"
 import { annBareRefArrElemName, tyRefArrElemOf } from "./emit_map_value_slots"
 import { repSlotOfKind } from "./emit_rep_slot"
-import { variantIndexOf } from "./emit_narrow_slots"
+import { variantIndexOf } from "./emit_local_slots"
 import { retNulRefArrFlag } from "./emit_nullable_rets"
 import { paramTypeNodeOfRead } from "./emit_query"
 import { nodeMapValTyIx, nullValKind, unRowOfKey } from "./emit_rep"
+import { mapTwinSame } from "./emit_map_twins"
 import {
   emptyArrLitIxOf,
   mvValKindOfNameTy,
   mvValNamesCompat,
-  structIndexOfTypeName,
+  structRowOfSpelling,
   tyIsRefArray,
   uFieldTgtStructIdx,
 } from "./emit_shape_rows"
@@ -113,22 +114,22 @@ import {
   FC_STRUCT,
   FC_UNION,
   MVK_MONO,
+  armFieldLitTyIx,
   emitCurFnIx,
   fnStmts,
   localIsRef,
   localStructIdx,
   rlElemName,
   sFieldCount,
+  sFieldLitTyIx,
   sFieldNames,
   sFieldStart,
+  sFieldTyText,
+  sFieldTypes,
   sHeapIdx,
   sTyIx,
   uFieldCount,
-  uFieldLitTyIx,
-  uFieldNames,
   uFieldStart,
-  uFieldTyText,
-  uFieldTypes,
   uTags,
   uVarRow,
   uVarTyIx,
@@ -139,7 +140,12 @@ import {
   variantHeap,
 } from "./emit_state"
 import { declaredSlotOf, rlSlotOfTy, sFieldIndex } from "./emit_struct_order"
-import { nodeTyInOf } from "./emit_ty_canon"
+import {
+  TY_WALK_DEPTH,
+  nodeTyInOf,
+  tySameSet,
+  tySameSpelled,
+} from "./emit_ty_canon"
 import {
   registerValueUnionNameAB,
   valueUnionKeyTextOfTy,
@@ -322,7 +328,7 @@ export function objNestedFieldCompat(
 ): boolean {
   const valIx = objFieldVal(objIx, fname)
   if valIx < 0 { return true }
-  objLitFitsRow(unwrapParen(valIx), structIndexOfTypeName(elem), 8, true, fnIx)
+  objLitFitsRow(unwrapParen(valIx), structRowOfSpelling(elem), 8, true, fnIx)
 }
 
 // Whether the object literal at `litIx` fits struct row `si`: each scalar field of a kind the
@@ -603,10 +609,10 @@ export function structIdxMatchesVariantIdx(ssi: i32, vi: i32): boolean {
   const start = uFieldStart[vi]
   let fj = 0
   while fj < cnt {
-    const fname = uFieldNames[start + fj]
+    const fname = sFieldNames[start + fj]
     const sfi = sFieldIndex(ssi, fname)
     if sfi < 0 { return false }
-    if sFieldTypeAt(ssi, sfi) != uFieldTypes[start + fj] { return false }
+    if sFieldTypeAt(ssi, sfi) != sFieldTypes[start + fj] { return false }
     fj = fj + 1
   }
   true
@@ -631,10 +637,10 @@ export function structIdxConvertsToVariantIdx(ssi: i32, vi: i32): boolean {
   const start = uFieldStart[vi]
   let fj = 0
   while fj < cnt {
-    const sfi = sFieldIndex(ssi, uFieldNames[start + fj])
+    const sfi = sFieldIndex(ssi, sFieldNames[start + fj])
     if sfi < 0 { return false }
     const sc = sFieldTypeAt(ssi, sfi)
-    const vc = uFieldTypes[start + fj]
+    const vc = sFieldTypes[start + fj]
     if sc != vc {
       const sk = fieldCodeNumKind(sc)
       const vk = fieldCodeNumKind(vc)
@@ -925,9 +931,9 @@ function sharedFieldLitArmKind(vi: i32, fi: i32): i32 {
   if n > 1 { return 2 }
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const at = uFieldStart[vi] + fi
-  if at < 0 || at >= uFieldTyText.length { return -1 }
-  if at < uFieldLitTyIx.length && uFieldLitTyIx[at] >= 0 { return -1 }
-  if uFieldTyText[at] == "string" { 3 } else { -1 }
+  if at < 0 || at >= sFieldTyText.length { return -1 }
+  if at < sFieldLitTyIx.length && sFieldLitTyIx[at] >= 0 { return -1 }
+  if sFieldTyText[at] == "string" { 3 } else { -1 }
 }
 
 // The string literal texts member `vi` declares shared field `fi` at, from its arena type and
@@ -940,12 +946,12 @@ export function sharedFieldArmLitTexts(vi: i32, fi: i32): string[] {
 export function sharedFieldArmLitTy(vi: i32, fi: i32): i32 {
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const at = uFieldStart[vi] + fi
-  if at < 0 || at >= uFieldNames.length { return -1 }
+  if at < 0 || at >= sFieldNames.length { return -1 }
   if vi < uVarTyIx.length && uVarTyIx[vi] >= 0 {
-    const ft = tyFieldTyOf(uVarTyIx[vi], uFieldNames[at])
+    const ft = tyFieldTyOf(uVarTyIx[vi], sFieldNames[at])
     if ft >= 0 { return ft }
   }
-  if at < uFieldLitTyIx.length { return uFieldLitTyIx[at] }
+  if at < armFieldLitTyIx().length { return armFieldLitTyIx()[at] }
   -1
 }
 
@@ -970,24 +976,58 @@ export function sharedFieldPlanLitTy(vis: i32[], fis: i32[]): i32 {
   -1
 }
 
-// `isVariantSpellingOfShape`, then the arm row of the receiver `recvIx`'s union that holds the
-// tested record: an inline arm's row spells a lone literal field at its base (D5143). A
-// receiver already narrowed to that record names the one row any union stores it in (D5157).
-export function isVariantSpellingAtRecv(
-  variant: string,
-  tyIx: i32,
-  recvIx: i32,
-): string {
-  const sp = isVariantSpellingOfShape(variant, tyIx)
-  if variantIndexOf(sp) >= 0 || recvIx < 0 { return sp }
-  let nm = armRowNameOfDeclaredMember(
-    nodeTyInOf(unwrapParen(recvIx), emitCurFnIx),
-    tyIx,
-  )
-  if nm == "" && recvIsTestedRecord(recvIx, tyIx) {
-    nm = armRowNameOfRecord(tyIx)
+// The variant row an `is` test's tested type `ty` names, from the type alone (D15250): the row of
+// its own declared name, else the one row of the receiver `recvIx`'s union holding it, else the
+// one row of the program holding it. -1 for none, or when rows of two names hold it.
+export function isTestedRowOf(ty: i32, recvIx: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const own = variantIndexOf(structNameOfTy(ty))
+  if own >= 0 { return own }
+  if recvIx >= 0 {
+    const ut = unionTyOfRecv(nodeTyInOf(unwrapParen(recvIx), emitCurFnIx))
+    const u = if ut >= 0 { unRowOfKey(ut) } else { -1 }
+    if u >= 0 && u < unVarStart.length && u < unVarCount.length {
+      const lo = unVarStart[u]
+      const hi = lo + unVarCount[u]
+      for how in [1, 2, 3] {
+        const r = isTestedRowIn(lo, hi, ty, how)
+        if r != -1 { return if r >= 0 { r } else { -1 } }
+      }
+    }
   }
-  if nm != "" { nm } else { sp }
+  for how in [1, 2, 3] {
+    const r = isTestedRowIn(0, uVariants.length, ty, how)
+    if r != -1 { return if r >= 0 { r } else { -1 } }
+  }
+  -1
+}
+
+// The first of rows `lo` to `hi` holding `ty` by `isTestedRowHolds`' test `how`: -1 for none, -2
+// when two of different names do.
+function isTestedRowIn(lo: i32, hi: i32, ty: i32, how: i32): i32 {
+  let found = -1
+  let r = lo
+  while r < hi {
+    if isTestedRowHolds(r, ty, how) {
+      if found >= 0 && uVariants[r] != uVariants[found] { return -2 }
+      if found < 0 { found = r }
+    }
+    r = r + 1
+  }
+  if found >= 0 { variantIndexOf(uVariants[found]) } else { -1 }
+}
+
+// Whether row `r` stores `ty`: 1 as that very type, 2 as one member (a record by its row's own
+// fields, D5143), 3 once a Set is spelled as its boolean map (D4668).
+function isTestedRowHolds(r: i32, ty: i32, how: i32): boolean {
+  if r < 0 || r >= uVarTyIx.length || uVarTyIx[r] < 0 { return false }
+  const rt = uVarTyIx[r]
+  if how == 1 { return rt == ty }
+  if how == 3 { return tySameSpelled(rt, ty, TY_WALK_DEPTH) }
+  if tyAt(ty) is TyObj {
+    return armRowIsMember(r, ty) || tySameSet(rt, ty, TY_WALK_DEPTH)
+  }
+  tySame(rt, ty) || mapTwinSame(rt, ty)
 }
 
 // The name every variant row storing record `ty` shares, or "" when none does or two differ.
@@ -1006,34 +1046,6 @@ export function armRowNameOfRecord(ty: i32): string {
     r = ovnNextOf(r)
   }
   nm
-}
-
-// The variant name of the row of the receiver's union holding member `ty`, or "" unless every
-// row of that union matching it shares one name. `recvTy` is the receiver's type, through one
-// `| null`; an inline arm's row spells a lone literal field at its base (D5143), so arms that
-// differ only there share a row, which `armRowSharedAtRecv` names (D5157).
-export function armRowNameOfDeclaredMember(recvTy: i32, ty: i32): string {
-  if ty < 0 { return "" }
-  const ut = unionTyOfRecv(recvTy)
-  if ut < 0 { return "" }
-  const u = unRowOfKey(ut)
-  if u < 0 || u >= unVarStart.length || u >= unVarCount.length { return "" }
-  let found = -1
-  let r = unVarStart[u]
-  while r < unVarStart[u] + unVarCount[u] {
-    if armRowIsMember(r, ty) {
-      if found >= 0 && uVariants[r] != uVariants[found] { return "" }
-      if found < 0 { found = r }
-    }
-    r = r + 1
-  }
-  if found < 0 { return "" }
-  const rt = tyAt(ut)
-  if !(rt is TyUnion) { return "" }
-  for m in rt.uMembers {
-    if tyEq(m, ty) { return uVariants[found] }
-  }
-  ""
 }
 
 // Whether row `vi` holds more than one member of the receiver `recvIx`'s union, so its tag
@@ -1094,11 +1106,11 @@ function armRowIsMember(vi: i32, ty: i32): boolean {
   while fi < uFieldCount[vi] {
     const at = uFieldStart[vi] + fi
     let own = sharedFieldArmLitTexts(vi, fi)
-    if own.length == 0 && at < uFieldLitTyIx.length {
-      own = tyLitMemberTexts(uFieldLitTyIx[at])
+    if own.length == 0 && at < sFieldLitTyIx.length {
+      own = tyLitMemberTexts(sFieldLitTyIx[at])
     }
     if own.length > 0 {
-      const want = tyLitMemberTexts(tyFieldTyOf(ty, uFieldNames[at]))
+      const want = tyLitMemberTexts(tyFieldTyOf(ty, sFieldNames[at]))
       if !textSetsEqual(own, want) { return false }
     }
     fi = fi + 1
@@ -1234,10 +1246,10 @@ export function sharedFieldArmAtomKind(vi: i32, fi: i32): i32 {
   if variantFieldTypeAt(vi, fi) == FC_UNION { return -1 }
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const at = uFieldStart[vi] + fi
-  if at < 0 || at >= uFieldTyText.length { return -1 }
-  if at < uFieldLitTyIx.length && uFieldLitTyIx[at] >= 0 { return -1 }
+  if at < 0 || at >= sFieldTyText.length { return -1 }
+  if at < sFieldLitTyIx.length && sFieldLitTyIx[at] >= 0 { return -1 }
   if variantFieldIsLitUnion(vi, fi) { return -1 }
-  const k = valueAtomKind(uFieldTyText[at])
+  const k = valueAtomKind(sFieldTyText[at])
   if k < 0 || k > 5 || k == nullValKind() { return -1 }
   k
 }

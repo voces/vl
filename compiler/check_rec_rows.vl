@@ -5,12 +5,14 @@ import {
   ArrayLit,
   BinExpr,
   Call,
+  FieldInit,
   FuncDecl,
   Ident,
   Index,
   LetDecl,
   Member,
   Node,
+  ObjLit,
   P,
   arenaSetNode,
   i32ToStr,
@@ -38,15 +40,21 @@ import {
   recAdPinned,
   recAdSetAt,
   recAdSetDecl,
+  recAdSetDeclined,
   recAdSetDst,
   recAdSetElem,
   recAdSetGrp,
   recAdSetGrps,
+  recAdSetLit,
+  recAdSetLitGrp,
+  recAdSetLitOk,
+  recAdSetLitTy,
   recAdSetWhole,
   recAdWhole,
   recAdWidth,
 } from "./check_rec_adopt_rows"
 import { i32ListHas } from "./listutil"
+import { nodeTyIxOf } from "./check_node_tys"
 import {
   T,
   TY_I32,
@@ -55,6 +63,7 @@ import {
   TyMap,
   TyObj,
   TyUnion,
+  objFieldType,
   tyAt,
   tyHasInferHole,
   tyHoldsObjDeep,
@@ -75,6 +84,7 @@ import {
   objFieldNameSetsEq,
   recAdLanding,
   recNumChanges,
+  recNumMergeField,
 } from "./check_ty_relate"
 import { recAdMergeRefuse } from "./check_rec_adopt"
 
@@ -187,6 +197,13 @@ export function recArgRepNote(x: i32, fd: i32, rep: i32) {
   0
 }
 
+// Every argument `recArgRepNote` noted this pass.
+export function recArgRepArgs(): i32[] {
+  const out: i32[] = []
+  for x in recArgRep.keys() { out.push(x) }
+  out
+}
+
 // The record argument `x` is stored at where its callee is instanced at it, else -1.
 export function recArgRepOf(x: i32): i32 { recArgRep.get(x) ?? -1 }
 
@@ -198,15 +215,47 @@ export function recRepFnHas(fd: i32): boolean { (recRepFns.get(fd) ?? 0) == 1 }
 export let recOwnSrc: i32[] = []
 export function recOwnSrcSet(v: i32[]) { recOwnSrc = v }
 
-// Queue `srcExpr` (a `srcTy`) when it holds a record and could name a fresh binding or call.
+// Queue `srcExpr` (a `srcTy`) when it holds a record and could name a fresh binding or call. A list
+// or record literal queues each element or field value its own storage delivers at (D15180).
 export function recOwnPend(srcExpr: i32, srcTy: i32) {
-  if srcExpr < 0 || srcTy < 0 { return 0 }
+  recOwnPendAt(srcExpr, srcTy, false, 8)
+}
+
+// `recOwnPend`, where `part` says `srcExpr` is a literal's element or field, queued only when its
+// own type stores as `srcTy` does.
+function recOwnPendAt(srcExpr: i32, srcTy: i32, part: boolean, depth: i32) {
+  if srcExpr < 0 || srcTy < 0 || srcTy >= T.tys.length || depth <= 0 {
+    return 0
+  }
   if !tyHoldsObjDeep(srcTy) { return 0 }
   const p = cwPeelValue(srcExpr)
   if p < 0 || p >= P.nodes.length { return 0 }
   const e = nodeAt(p)
-  if e is Ident || e is Call || e is Index || e is Member || e is BinExpr {
-    recOwnSrc.push(p)
+  const st = tyAt(srcTy)
+  if e is ArrayLit {
+    if st is TyArray {
+      for el in e.arrElems { recOwnPendAt(el, st.aElem, true, depth - 1) }
+    }
+  } else if e is ObjLit {
+    if st is TyObj {
+      for fx in e.objFields {
+        const fi = nodeAt(fx)
+        if fi is FieldInit {
+          const ft = objFieldType(st, fi.fiName)
+          if ft >= 0 { recOwnPendAt(fi.fiValue, ft, true, depth - 1) }
+        }
+      }
+    }
+  } else if (
+    e is Ident
+    || e is Call
+    || e is Index
+    || e is Member
+    || e is BinExpr
+  ) {
+    if !part || fieldStorageEq(nodeTyIxOf(p), srcTy, REC_STORE_DEPTH) {
+      recOwnSrc.push(p)
+    }
   }
   0
 }
@@ -214,6 +263,20 @@ export function recOwnPend(srcExpr: i32, srcTy: i32) {
 // Record list literals checked this pass, asked once it is over where their elements are built.
 export let recListLits: i32[] = []
 export function recListLitsSet(v: i32[]) { recListLits = v }
+
+// Record literals with fields checked outside a capture probe, asked once the check settles which
+// arm each is built at (`recArmLitsAdopt`), which empties it.
+export let recObjLits: i32[] = []
+export function recObjLitsSet(v: i32[]) { recObjLits = v }
+
+// Record list literals checked outside a capture probe, asked once the arm stamp settles whether
+// their elements are built at one arm (`recArmLitsAdopt`), which empties it.
+export let recArmListLits: i32[] = []
+export function recArmListLitsSet(v: i32[]) { recArmListLits = v }
+
+// The record list literals `recListLitsBuild` left for the rep rows `callBindAdoptReps` sets.
+export let recListLitsLate: i32[] = []
+export function recListLitsLateSet(v: i32[]) { recListLitsLate = v }
 
 // Fresh bindings and functions not adopted (a function's result, or a width change into a
 // record that drops a nested field): each delivery the emitter builds at the destination's row.
@@ -229,6 +292,17 @@ export function recKeptAtSet(v: i32[]) { recKeptAt = v }
 export let recKeptOwn: i32[] = []
 export function recKeptOwnSet(v: i32[]) { recKeptOwn = v }
 
+// Bindings the adoption undid that a delivery still builds as another record (`recAdPushDecl`'s
+// no-adopt arm), with that record and delivery; `recApartRefuse` refuses their own-storage ones.
+export let recApartDecl: i32[] = []
+export let recApartDst: i32[] = []
+export let recApartAt: i32[] = []
+export function recApartReset() {
+  recApartDecl = []
+  recApartDst = []
+  recApartAt = []
+}
+
 // Keep function `fd`'s result typed `own` and build it as `dst`, for the delivery at `at`.
 export function recKeptFnPush(fd: i32, own: i32, dst: i32, at: i32) {
   if fd < 0 || own < 0 || dst < 0 || !(nodeAt(fd) is FuncDecl) { return 0 }
@@ -236,6 +310,30 @@ export function recKeptFnPush(fd: i32, own: i32, dst: i32, at: i32) {
   recKeptDst.push(dst)
   recKeptAt.push(at)
   recKeptOwn.push(own)
+  0
+}
+
+// Calls of a function with no declared result that deliver its list result into a wider list
+// this pass: the function, its result's own list, the list it is delivered as, and the call.
+export let recWideFnDecl: i32[] = []
+export let recWideFnOwn: i32[] = []
+export let recWideFnDst: i32[] = []
+export let recWideFnAt: i32[] = []
+
+export function recWideFnPush(fd: i32, own: i32, dst: i32, at: i32) {
+  if fd < 0 || own < 0 || dst < 0 || !(nodeAt(fd) is FuncDecl) { return 0 }
+  recWideFnDecl.push(fd)
+  recWideFnOwn.push(own)
+  recWideFnDst.push(dst)
+  recWideFnAt.push(at)
+  0
+}
+
+export function recWideFnReset() {
+  recWideFnDecl = []
+  recWideFnOwn = []
+  recWideFnDst = []
+  recWideFnAt = []
   0
 }
 
@@ -263,11 +361,18 @@ export function recKeptFnNote() {
 }
 
 // The record the result of function `decl`, typed `own`, is built as where a kept delivery
-// builds it at another storage, else -1.
+// builds it at another storage, else -1; -1 too for an `own` outside the type arena.
 export function recKeptFnDstOf(decl: i32, own: i32): i32 {
+  if own < 0 || own >= T.tys.length { return -1 }
   let k = 0
-  while k < recKeptFnDecl.length {
-    if recKeptFnDecl[k] == decl && tySame(recKeptFnOwn[k], own) {
+  while k < recKeptFnDecl.length && k < recKeptFnOwn.length {
+    const ko = recKeptFnOwn[k]
+    if (
+      recKeptFnDecl[k] == decl
+      && ko >= 0
+      && ko < T.tys.length
+      && tySame(ko, own)
+    ) {
       return recKeptFnDst[k]
     }
     k = k + 1
@@ -379,6 +484,9 @@ export function recBuildCount(): i32 { recBuildN }
 // `recBuildAt` of every recorded binding: declaration to the storage its builds agree on, -2
 // where they disagree. Read through `recBuildTyIn`.
 export function recBuildTable(): Map<i32, i32> { recBuildLast }
+
+// The builds the current pass has recorded so far, read like `recBuildTable`'s.
+export function recBuildPassTable(): Map<i32, i32> { recBuildPass }
 
 // `recBuildTyOf` (`elems` false) or `recBuildElemTyOf` (true) of `decl`, read from `tbl`.
 export function recBuildTyIn(
@@ -502,6 +610,16 @@ export function recAdPushDecl(
   if recAdNoAdopt.has(decl) {
     recBuildPush(decl, own, dst, elem)
     recAdMergeRefuse(decl, own, dst, elem, at)
+    // Built apart from its own storage with no merge refused: the pass end refuses each delivery
+    // of it at its own storage (D15281).
+    if (
+      recNumMergeField(own, dst, REC_STORE_DEPTH) == ""
+      && !fieldStorageEq(own, dst, REC_STORE_DEPTH)
+    ) {
+      recApartDecl.push(decl)
+      recApartDst.push(dst)
+      recApartAt.push(at)
+    }
     return 0
   }
   if wide { recAdWidth[decl] = true }
@@ -566,6 +684,26 @@ export function recAdPushSettled(decl: i32, whole: i32, at: i32, grp: i32) {
   recAdSetWhole.push(wh)
   recAdSetAt.push(at)
   recAdSetGrp.push(grp)
+  0
+}
+
+// The literal `lit` a judged call `grp` builds as `ty`: queued beside that call's settled
+// deliveries, so it adopts only where no other call builds it at another storage.
+export function recAdPushSettledLit(lit: i32, ty: i32, grp: i32) {
+  if lit < 0 || lit >= P.nodes.length || ty < 0 || ty >= T.tys.length {
+    return 0
+  }
+  recAdSetLit.push(lit)
+  recAdSetLitTy.push(ty)
+  recAdSetLitGrp.push(grp)
+  recAdSetLitOk.push(false)
+  0
+}
+
+// Declines every settled delivery judged call `grp` queues, and each other call's delivery of
+// the same binding or literal with them.
+export function recAdDeclineSettled(grp: i32) {
+  recAdSetDeclined.push(grp)
   0
 }
 

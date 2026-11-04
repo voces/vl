@@ -969,6 +969,14 @@ export function cwFrameOfUse(ix: i32): i32 {
   cwFrameOfDecl(identDeclOf(ix))
 }
 
+// Whether the read `ix` sits in another function than the one that declares what it names: a
+// capture, or a module binding read from a function. False where the frames do not model it.
+export function cwUseInOtherFrame(ix: i32): boolean {
+  if !cwFrameOfOpen(ix) { return false }
+  const fr = cwFrameOfUse(ix)
+  fr != CW_FR_UNKNOWN && fr != cwFrameOf[ix]
+}
+
 // Whether the read `ix` is from a function nested in the one that declares what it names, a
 // capture; false for a module binding, true where the frames do not model the binder.
 export function cwUseCaptures(ix: i32): boolean {
@@ -1208,7 +1216,7 @@ export function cwMethodCalls(fnIx: i32, out: i32[]) {
 
 // Every call of the function `fnIx`: those whose callee name resolves to it, and the calls of
 // its name whose callee resolves to no function.
-function cwFnCalls(fnIx: i32, out: i32[]) {
+export function cwFnCalls(fnIx: i32, out: i32[]) {
   const ow = cwOccWalk(fnIx)
   while cwOccNext(ow) {
     if cwIxKind[ow.row] == CW_OCC_CALL { out.push(cwIxNode[ow.row]) }
@@ -1448,6 +1456,13 @@ export function cwReadsWrittenLet(a: i32): boolean {
   cwBindingWrittenValues(cwBindingOf(ix)).length > 1
 }
 
+// Whether no `nm = v` re-points the `let` node `bd`: its initialiser is every value it holds.
+export function cwLetUnwritten(bd: i32): boolean {
+  if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) { return false }
+  cwIxWant()
+  cwBindingWrittenValues(bd).length == 1
+}
+
 // Whether the `let` node `bd` is written from another function than the one that declares it, a
 // module binding included: a cell every function reading it sees after the write. True where the
 // frames do not model the write.
@@ -1507,13 +1522,59 @@ export function cwLetSlotFnTargets(bd: i32): i32[] {
 // The functions stored in the elements of the list the `let` node `bd` binds: its initialiser's
 // and every write through it or an alias of it; [-1] when one is not a function.
 export function cwListElemFnTargets(bd: i32): i32[] {
+  cwPathFnTargets(bd, ["[]"])
+}
+
+// The functions stored at slot `path` under the `let` node `bd`: a field name for a record field,
+// `"[]"` for a list element or a map slot, through any alias; [-1] when one is not a function.
+export function cwPathFnTargets(bd: i32, path: string[]): i32[] {
   const bad: i32[] = [-1]
   const vals: i32[] = []
   const ats: i32[] = []
-  if cwSlotWrittenValues(cwDeclKeyOf(bd), ["[]"], vals, ats) < 0 { return bad }
+  if cwSlotWrittenValues(cwDeclKeyOf(bd), path, vals, ats) < 0 { return bad }
   const out: i32[] = []
   for v in vals {
     if !cwFvAddValue(v, out) { return bad }
+  }
+  out
+}
+
+// `cwPathFnTargets` with the values `inits` standing for what the binding's initialiser stores, as
+// a call's returned records do for `const r = mk()` (`holeSlotCallRets`); [-1] as there.
+export function cwPathFnTargetsFrom(
+  bd: i32,
+  path: string[],
+  inits: i32[],
+): i32[] {
+  const bad: i32[] = [-1]
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if bd < 0 || bd >= P.nodes.length { return bad }
+  const bn = nodeAt(bd)
+  if !(bn is LetDecl) { return bad }
+  if cwSlotValuesFrom(cwDeclKeyOf(bd), bn.letInit, inits, path, vals, ats) < 0 {
+    return bad
+  }
+  const out: i32[] = []
+  for v in vals {
+    if !cwFvAddValue(v, out) { return bad }
+  }
+  out
+}
+
+// `cwListElemFnTargets` without what `bd`'s initialiser stores: only the writes through it or an
+// alias of it.
+export function cwListElemWriteFnTargets(bd: i32): i32[] {
+  const bad: i32[] = [-1]
+  const vals: i32[] = []
+  const ats: i32[] = []
+  const n = cwSlotWrittenValues(cwDeclKeyOf(bd), ["[]"], vals, ats)
+  if n < 0 { return bad }
+  const out: i32[] = []
+  let i = vals.length - n
+  while i < vals.length {
+    if !cwFvAddValue(vals[i], out) { return bad }
+    i = i + 1
   }
   out
 }
@@ -1834,7 +1895,107 @@ function cwSlotWritesInto(
     if i == 0 || cwSlotHandle(keys[i]) {
       if !cwSlotWritesThrough(keys[i], path, vals, ats) { return false }
       if !cwSlotHeldWrites(keys[i], path, vals, ats, depth) { return false }
+      if !cwSlotParamWrites(keys[i], path, vals, ats, depth) { return false }
+      if !cwSlotProjAliasWrites(keys[i], path, vals, ats, depth) {
+        return false
+      }
     }
+    i = i + 1
+  }
+  true
+}
+
+// What each callee stores at `path` through the parameter the container keyed `k` is handed to,
+// as an argument: the parameter's own writes, its aliases' and those of the calls it is handed
+// on to, so a write two calls down is the container's write (D14648). False when one is not a
+// literal's part.
+function cwSlotParamWrites(
+  k: i32,
+  path: string[],
+  vals: i32[],
+  ats: i32[],
+  depth: i32,
+): boolean {
+  const fr = cwKeyFrame(k)
+  const ow = cwOccWalk(k)
+  while cwOccNext(ow) {
+    const r = ow.row
+    const u = cwIxNode[r]
+    if (
+      cwIxKind[r] == CW_OCC_USE
+      && cwIxFr[r] == fr
+      && u >= 0
+      && u < cwIxUpKind.length
+      && cwIxUpKind[u] == CW_UP_ARG
+    ) {
+      const pk = cwArgParamKey(u)
+      if pk >= 0 && pk != k {
+        if !cwSlotWritesInto(pk, path, vals, ats, depth + 1) { return false }
+      }
+    }
+  }
+  true
+}
+
+// What each write through a binding initialised by a field or element read of the container keyed
+// `k` (`const ys = r.xs`, `const e = rs[0]`) stores at the rest of `path`, so a write through the
+// alias is the container's write (D15165, D15201). False when one is not a literal's part.
+function cwSlotProjAliasWrites(
+  k: i32,
+  path: string[],
+  vals: i32[],
+  ats: i32[],
+  depth: i32,
+): boolean {
+  if path.length < 2 { return true }
+  const fr = cwKeyFrame(k)
+  const ow = cwOccWalk(k)
+  while cwOccNext(ow) {
+    const r = ow.row
+    const u = cwIxNode[r]
+    if (
+      cwIxKind[r] == CW_OCC_USE
+      && cwIxFr[r] == fr
+      && u >= 0
+      && u < cwIxUpKind.length
+    ) {
+      // Climb the field and element reads `r.a[0]` to the `let` they initialise, if any.
+      let m = u
+      while m >= 0 && m < cwIxUpKind.length && cwIxUpKind[m] == CW_UP_OBJ {
+        m = cwIxUp[m]
+      }
+      if (
+        m != u
+        && m >= 0
+        && m < cwIxUpKind.length
+        && cwIxUpKind[m] == CW_UP_LETINIT
+      ) {
+        const d = cwIxUp[m]
+        const prefix: string[] = []
+        const root = cwSlotAliasPathOf(d, prefix)
+        if root >= 0 && cwKeyOfRoot(root) == k && cwPathStarts(path, prefix) {
+          const rest: string[] = []
+          let j = prefix.length
+          while j < path.length {
+            rest.push(path[j])
+            j = j + 1
+          }
+          if !cwSlotWritesInto(cwKeyOfDecl(d), rest, vals, ats, depth + 1) {
+            return false
+          }
+        }
+      }
+    }
+  }
+  true
+}
+
+// Whether `path` begins with every step of `prefix` and has a step past them.
+function cwPathStarts(path: string[], prefix: string[]): boolean {
+  if prefix.length == 0 || prefix.length >= path.length { return false }
+  let i = 0
+  while i < prefix.length {
+    if path[i] != prefix[i] { return false }
     i = i + 1
   }
   true
@@ -1942,16 +2103,45 @@ function cwSplitPath(p: string): string[] {
 
 // The identifier the `let` binding `b` is bound once to when it names another `let`, or -1.
 function cwSlotAliasOf(b: i32): i32 {
+  const prefix: string[] = []
+  const r = cwSlotAliasPathOf(b, prefix)
+  if prefix.length > 0 { return -1 }
+  r
+}
+
+// The binding read `cwSlotAliasOf` names, where the `let` `b` may also be bound once to a field
+// or element read of it (`const ys = r.xs`, `const e = rs[0]`): the read's steps go to `prefix`,
+// outermost first, an element as `[]`, so the alias holds the container at that path (D15165,
+// D15201). -1 when `b` is no such alias.
+function cwSlotAliasPathOf(b: i32, prefix: string[]): i32 {
   const bd = cwSoleDecl(b)
   if bd < 0 || bd >= P.nodes.length || !cwBoundOnce(cwOccWalk(bd)) { return -1 }
   const bn = nodeAt(bd)
   if !(bn is LetDecl) { return -1 }
-  const init = cwPeel(bn.letInit)
+  let init = cwPeel(bn.letInit)
+  const rev: string[] = []
+  while init >= 0 && init < P.nodes.length && rev.length < 16 {
+    const mn = nodeAt(init)
+    if mn is Member {
+      rev.push(mn.memProp)
+      init = cwPeel(mn.memObj)
+    } else if mn is Index {
+      rev.push(CW_ELEM_FLD)
+      init = cwPeel(mn.idxArr)
+    } else {
+      break
+    }
+  }
   if init < 0 || init >= P.nodes.length || !cwFramedNode(init) { return -1 }
   const inn = nodeAt(init)
   if !(inn is Ident) { return -1 }
   const ib = cwSoleBinderAt(init)
   if ib < 0 || ib >= P.nodes.length || !(nodeAt(ib) is LetDecl) { return -1 }
+  let i = rev.length - 1
+  while i >= 0 {
+    prefix.push(rev[i])
+    i = i - 1
+  }
   init
 }
 
@@ -2084,7 +2274,7 @@ function cwPathPrefix(p: string[], path: string[]): boolean {
 // Add to `vals` what value `e` holds at the steps of `path` from `k`, through list and record
 // literals and the bindings they name, blamed on `blame` (or on the value itself at -1); false at
 // any other node.
-function cwSlotDescend(
+export function cwSlotDescend(
   e: i32,
   path: string[],
   k: i32,
@@ -2101,6 +2291,29 @@ function cwSlotDescend(
   }
   const n = nodeAt(v)
   if n is Ident { return cwSlotDescendBinding(v, path, k, vals, ats) }
+  // A value `if` or `match` holds at `path` what each arm's value does (D15335).
+  if n is IfStmt {
+    if n.ifElse < 0 { return false }
+    return cwSlotDescend(n.ifThen, path, k, blame, vals, ats)
+      && cwSlotDescend(n.ifElse, path, k, blame, vals, ats)
+  }
+  if n is MatchExpr {
+    for mb in n.matchBodies {
+      if !cwSlotDescend(mb, path, k, blame, vals, ats) { return false }
+    }
+    return n.matchBodies.length > 0
+  }
+  if n is Block {
+    if n.blkStmts.length == 0 { return false }
+    return cwSlotDescend(
+      n.blkStmts[n.blkStmts.length - 1],
+      path,
+      k,
+      blame,
+      vals,
+      ats,
+    )
+  }
   if path[k] == "[]" {
     if cwFreshMap(v) { return true }
     if !(n is ArrayLit) { return false }

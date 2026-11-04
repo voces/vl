@@ -3,6 +3,9 @@
 // import/function/global/export/code sections, the shared runtime helpers, the start-function
 // model, per-function code emission, the opt-in name section). Sits above `wasmEmit.vl`, calling down into it for every statement/expression body.
 
+import { recordRowClassOf, recordRowsRun } from "./record_rows"
+import { fvaMakerCallRows } from "./check_assignable"
+import { boxDstShadowBegin } from "./box_dst_shadow"
 import { canonShowCanon, canonShowWritten } from "./check_canon_raw"
 import {
   nodeTyCarry,
@@ -18,19 +21,22 @@ import { recCopyAny } from "./check_core_state"
 import { scalarViewPairs } from "./check_side_rows"
 import { nodeSrc } from "./symbols"
 import {
+  elabDeliveredRowClassFn,
   elabErrors,
   elabErrorsMuted,
+  elabJoinDemandsReset,
+  elabJoinDemandsTake,
   elabMintFacts,
   elabRun,
 } from "./emit_elab"
 import { fnTagRedecide } from "./check_fn_tag"
 import { elabHoleRowCut, elabHoleRowMark } from "./check_elab_cap"
-import { isVarTyIxOf } from "./check_list_union"
+import { isPatTyIxOf, isVarTyIxOf } from "./check_list_union"
 import { topLetScalarOf } from "./check_nj_join"
 import { nodeTyComparesAsString } from "./check_getter_effects"
 import { refViewSrcTys } from "./check_ref_list_view"
-import { lbiArenaReset } from "./check_num_lit_state"
-import { T, TyLit, tyLitMemberTexts } from "./check_types"
+import { lbiArenaReset, lbiKeptDeclUnread } from "./check_num_lit_state"
+import { T, TyLit, tyIsLitUnionOrLit, tyLitMemberTexts } from "./check_types"
 import {
   ATOMIC_SIG_FENCE,
   SIMD_SIG_LOAD,
@@ -125,6 +131,7 @@ import {
   externRetIsVoid,
   i32ToStr,
   isDefaultGlobalRef,
+  isExprKid,
   nodeAt,
   nodeChildren,
   nodeToks,
@@ -246,6 +253,7 @@ import {
   emitCurStmtIx,
   emitErr,
   emitErrAt,
+  emitErrCursorAt,
   emitFailed,
   emitFnSpanEnd,
   emitFnSpanKind,
@@ -369,6 +377,9 @@ import {
   gInitAny,
   gInitAt,
   gInitAtNode,
+  gInitBitBase,
+  gInitBitIdx,
+  gInitBitN,
   gInitFnReach,
   gInitGIdx,
   gInitGLocs,
@@ -483,8 +494,8 @@ import {
   rlWrapIdx,
   rvNul,
   rvSrcSlot,
+  rvTag,
   rvUnionSlot,
-  rvVariant,
   rvViewTy,
   sAnonOwnTy,
   sBackIdx,
@@ -521,12 +532,8 @@ import {
   uBoxIdx,
   uBoxNewEnd,
   uFieldCount,
-  uFieldElemKeyKind,
-  uFieldElemTyIx,
-  uFieldNames,
   uFieldStart,
   uSinkFired,
-  uTags,
   uVarRow,
   uVariantRowBySid,
   unMemAtomIds,
@@ -535,9 +542,11 @@ import {
   unMemTyCount,
   unMemTyStart,
   unMemTys,
+  unNames,
   unRowBySid,
   unionSinkBase,
   variantHeap,
+  variantRowOf,
   vbF32Idx,
   vbF64Idx,
   vbI32Idx,
@@ -670,6 +679,7 @@ import {
   variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import {
+  boxDstTyAt,
   capMemoEditsReset,
   fnEnvIdxOf,
   nfdReset,
@@ -692,7 +702,6 @@ import {
   globalCellKind,
   globalCellStructIdx,
   inferredRetMapSlot,
-  letBindIsAtom,
   letCellSlot,
   letNulMapReadUnionBox,
   letUnionNameOf,
@@ -741,7 +750,7 @@ import {
   addLocalSlot,
   applyPushPopBits,
   recordRefPushSlot,
-} from "./emit_narrow_slots"
+} from "./emit_local_slots"
 import {
   fnRetNullBearing,
   fnUnionLetSinkOk,
@@ -774,6 +783,7 @@ import { typeOrderReset, typeOrderRun } from "./emit_type_order"
 import {
   mvShapeNestReset,
   registerValueUnionNameAB,
+  unRowOfRecordTy,
   valueUnionNameOfTy,
 } from "./emit_union_atoms"
 import {
@@ -785,14 +795,9 @@ import {
 } from "./emit_union_casts"
 import { printPlanReset, unionRegistryABSweep } from "./emit_union_registry"
 import { unTyKeyShadowSweep } from "./emit_union_tykey"
-import {
-  auditRecordJoinLeaves,
-  callResultTextsReset,
-  exprEmittedRefListSlot,
-  globalRefListSlot,
-} from "./emit_value_sites"
+import { auditRecordJoinLeaves, callResultTextsReset } from "./emit_value_sites"
 import { callBindShadowBegin } from "./call_bind_shadow"
-import { fnRetShadowRun } from "./fn_ret_shadow"
+import { fnKindShadowRun, fnRetShadowRun } from "./fn_ret_shadow"
 import {
   fnFlowShadowBegin,
   fnFlowShadowBuild,
@@ -824,6 +829,7 @@ import {
   collectU,
   computeRetInference,
   computeVoidFns,
+  criAfterMonoSet,
   declareForInLocals,
   declareForRangeLocals,
   gaeDeclsReset,
@@ -842,6 +848,7 @@ import {
   synthCaptureEmptyListAnns,
   synthCaptureReadAnns,
   synthGlobalEmptyListAnns,
+  synthRecordedRetAnnots,
 } from "./emit_collect"
 import {
   assignValueSpill,
@@ -869,7 +876,6 @@ import {
   monomorphize,
 } from "./emit_mono"
 import {
-  ExpCtx,
   capCacheBuild,
   emitAtomToStr,
   emitClosureValueCore,
@@ -882,8 +888,6 @@ import {
   emitMapGetUnionBox,
   emitNulNoneBoxPayload,
   emitNullForRet,
-  emitRefListWidenSite,
-  emitScalarListWidenSite,
   emitStmt,
   emitUnionBoxArg,
   emitUnionCoerce,
@@ -895,9 +899,6 @@ import {
   eqHelpFnName,
   eqHelpFuncType,
   eqHelpReserve,
-  expCtxApply,
-  expCtxDefault,
-  expCtxHere,
   initGuardValue,
   maFoldCandidateCount,
   mapSetFnBody,
@@ -1024,12 +1025,10 @@ function emitHeader() {
   0
 }
 
-// Rebuild the local columns for the function at `fnIx`: clear them, then collect every
-// declared local in the body (validating each as i32). Returns 0 on success,
-// or -1 (via `emitFail`) on any unsupported local. Must run before lowering the
-// body so identifier resolution and the locals vector see the full set.
-function buildLocals(fnIx: i32) {
-  localFrameNote()
+// Empties the frame's local registry and lexical scope stack. A pass before the first frame
+// is built reads them, so a compile starts from them empty too, not from the last program's
+// last frame.
+function localRegistryReset() {
   localIsRef = []
   localStructIdx = []
   localLoopVar = []
@@ -1040,11 +1039,21 @@ function buildLocals(fnIx: i32) {
   localUnset = []
   localByNode = []
   declSlotByNode = Map()
-  // Reset the lexical scope stack per function. `collectLocals` pushes/pops frames as
-  // it walks (leaving it balanced/empty), then the emit pass rebuilds it in lockstep.
   scopeNames = []
   scopeSlots = []
   scopeFrames = []
+  0
+}
+
+// Rebuild the local columns for the function at `fnIx`: clear them, then collect every
+// declared local in the body (validating each as i32). Returns 0 on success,
+// or -1 (via `emitFail`) on any unsupported local. Must run before lowering the
+// body so identifier resolution and the locals vector see the full set.
+function buildLocals(fnIx: i32) {
+  localFrameNote()
+  // The lexical scope stack too: `collectLocals` pushes/pops frames as it walks (leaving it
+  // balanced/empty), then the emit pass rebuilds it in lockstep.
+  localRegistryReset()
   const fn = nodeAt(fnIx)
   if fn is FuncDecl { return collectLocals(fn.fnBody, fnIx) }
   emitFail("emitProgram: not a function declaration")
@@ -1266,7 +1275,7 @@ function envCacheOpen(fnPos: i32) {
 // (declared locals, all i32), the body's statement instructions, then `end`. Framed bytes are
 // appended onto `out`. Returns 0, or -1 (via `emitFail`) on any unsupported shape. Every
 // declared local is i32, so the vector is one run `(L, 0x7f)`; params are not counted here — they are encoded in the functype, not the locals vector.
-function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32, ec: ExpCtx) {
+function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     // Anchors any emit failure raised while lowering this body at its declaration (`emitFail`
@@ -1316,7 +1325,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32, ec: ExpCtx) {
     // `emitFuncBody` banks a row per STATEMENT, relative to `bodyExpr`; the rebase below
     // moves them onto the code payload with the rest of this entry (ROADMAP row 22).
     const stmtSpanBase = emitFnSpanStart.length
-    if emitFuncBody(bodyExpr, fn.fnBody, fnIx, ec) < 0 { return -1 }
+    if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return -1 }
     // A void body whose last instruction is a call falls off its end with nothing to hand
     // back, so that call is a tail call (D4655).
     emitVoidTailCall(fnIx)
@@ -1540,7 +1549,7 @@ function promoMark(marks: i32[], ix: i32, val: i32) {
       return promoMark(marks, n.omObj, v)
     }
     IsExpr => {
-      return promoMark(marks, n.isObj, v)
+      return promoMark(marks, isExprKid(n), v)
     }
     AsExpr => {
       return promoMark(marks, n.asObj, v)
@@ -2223,19 +2232,7 @@ function startFnDetectScratch() {
 // `fnIx = -1`). Resets the local registry + scope stack like `buildLocals`.
 function collectStartLocals() {
   localFrameNote()
-  localIsRef = []
-  localStructIdx = []
-  localLoopVar = []
-  localLoopIter = []
-  localPairIter = []
-  localDeclIx = []
-  localSlotOfDecl = Map()
-  localUnset = []
-  localByNode = []
-  declSlotByNode = Map()
-  scopeNames = []
-  scopeSlots = []
-  scopeFrames = []
+  localRegistryReset()
   scopePush()
   let i = swS0
   while i < swS1 {
@@ -2325,11 +2322,11 @@ function collectStartLocals() {
 // Emits the synthetic start function's size-prefixed code entry onto `out`: the pool fills,
 // then a call to each module's init function, or every top-level node itself when
 // `gInitMods` is empty. `n` is the user function count.
-function emitStartFnCode(out: u8[], n: i32, ec: ExpCtx) {
+function emitStartFnCode(out: u8[], n: i32) {
   emitCurFnIx = -1
   emitCurFnPos = -1
   startWalkWindows(-1, -1)
-  if gInitMods.length == 0 { return emitStartBodyCode(out, -1, ec) }
+  if gInitMods.length == 0 { return emitStartBodyCode(out, -1) }
   // The whole top level is scanned once, so every init reads one accumulator answer.
   if collectStartLocals() < 0 { return -1 }
   startFnDetectFrames()
@@ -2353,13 +2350,13 @@ function emitStartFnCode(out: u8[], n: i32, ec: ExpCtx) {
 }
 
 // Emits the code entry of init function `k` onto `out`: the top-level nodes of its windows.
-function emitInitFnCode(out: u8[], k: i32, ec: ExpCtx) {
+function emitInitFnCode(out: u8[], k: i32) {
   emitCurFnIx = -1
   emitCurFnPos = -1
   startWalkWindows(ifW0[k], ifW1[k])
   fnUsesU8Push = false
   fnUsesMapVals = false
-  const rc = emitStartBodyCode(out, k, ec)
+  const rc = emitStartBodyCode(out, k)
   rc
 }
 
@@ -2377,7 +2374,7 @@ function emitInitProgressAt(ord: i32) {
 // The body both entries above share, over the nodes `startWalkWindows` set: the whole start
 // when `k` is -1, else init function `k`, which runs no pool fill and keeps the narrowing
 // its predecessor left. Frames exactly as `emitFuncCode` does.
-function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
+function emitStartBodyCode(out: u8[], k: i32) {
   // Locals first, detection second: the scratch detectors classify expressions through the
   // declared-locals registry, so it must be populated first. The start function is synthetic
   // and has no `FuncDecl` to anchor a failure at; -1 is the honest anchor for a failure with no
@@ -2457,7 +2454,6 @@ function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
         exprPrev,
         gi,
         globalStmts[gi],
-        ec,
       )
       if gArmKept >= 0 { stmtArmScopeClose(gArmKept) }
       if gInitRc < 0 { return gInitRc }
@@ -2473,7 +2469,7 @@ function emitStartBodyCode(out: u8[], k: i32, ec: ExpCtx) {
       emitCurStmtIx = startStmts[si]
       gInitStartOrd = startStmtOrd[si]
       const sSpanAt = bodyExpr.length
-      if emitStmt(bodyExpr, startStmts[si], -1, ec) < 0 {
+      if emitStmt(bodyExpr, startStmts[si], -1) < 0 {
         wTarget(exprPrev)
         return -1
       }
@@ -2532,9 +2528,9 @@ function emitStartGlobalInit(
   exprPrev: u8[],
   gi: i32,
   gst: i32,
-  ec: ExpCtx,
 ) {
-  if globalRunsInStartFn(gi) {
+  // A `const` every read copied the tree of is never read, as at a local (D15001).
+  if globalRunsInStartFn(gi) && !lbiKeptDeclUnread(gst) {
     const g = nodeAt(gst)
     if g is LetDecl {
       // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
@@ -2543,44 +2539,24 @@ function emitStartGlobalInit(
       // matches the cell valtype. An i32 cell is untouched. (Slice 5 widening.)
       const gck = globalCellKind(gst)
       if gck == "f32" {
-        if emitExprAsF32(bodyExpr, g.letInit, -1, ec) < 0 {
+        if emitExprAsF32(bodyExpr, g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if gck == "f64" {
-        if emitExprAsF64(bodyExpr, g.letInit, -1, ec) < 0 {
+        if emitExprAsF64(bodyExpr, g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if gck == "i64" {
-        if emitExprAsI64(bodyExpr, g.letInit, -1, ec) < 0 {
+        if emitExprAsI64(bodyExpr, g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else {
-        emitStartGlobalSeedCtx(gst, ec)
-        if (emitStartGlobalInitValue(bodyExpr, exprPrev, gst, g, gck, ec) < 0) {
+        if (emitStartGlobalInitValue(bodyExpr, exprPrev, gst, g, gck) < 0) {
           return -1
         }
-        // Back to idle: a left armed null seed retypes the next global's bare `null` (D1563).
-        const idle = expCtxHere(ec)
-        idle.litUnion = 0
-        expCtxApply(idle, ec)
-        // Read-only covariance at the module-global binding (D822), a delivery form of its own:
-        // a global is not a `let`, so no let-side delivery reaches it. A const
-        // global's init is a wasm constexpr and cannot carry a loop, so the widening copy can only go
-        // here — which is where a global reading another global always runs anyway (`globalIsNonConst`).
-        if gck == "reflist" {
-          emitRefListWidenSite(
-            bodyExpr,
-            g.letInit,
-            exprEmittedRefListSlot(g.letInit, -1),
-            globalRefListSlot(gst),
-          )
-        }
-        // The scalar dual (D965), and the same argument for it living here: a const global's init is
-        // a wasm constexpr and cannot carry a loop, so the copy can only go in the non-const init body — which is where a global reading another global always runs.
-        emitScalarListWidenSite(bodyExpr, g.letInit, -1, gck)
         emitGlobalInitArmUnbox(gst, gck, g.letInit)
       }
       const setPrev = wTarget(bodyExpr)
@@ -2595,15 +2571,6 @@ function emitStartGlobalInit(
   0
 }
 
-// `emitStartGlobalInit`'s seeding step for global statement `gst`: an atom global's start-fn
-// init lowers a member literal as its atom id, the start-fn twin of the const-path seeding.
-function emitStartGlobalSeedCtx(gst: i32, ec: ExpCtx) {
-  const sc = expCtxHere(ec)
-  if letBindIsAtom(gst, -1) { sc.litUnion = 1 }
-  expCtxApply(sc, ec)
-  0
-}
-
 // `emitStartGlobalInit`'s value step for global statement `gst` (its `LetDecl` `g`, cell kind
 // `gck`): emits the initializer into `bodyExpr` by the cell's coercion. On
 // failure restores the writer to `exprPrev` and returns -1, else 0.
@@ -2613,7 +2580,6 @@ function emitStartGlobalInitValue(
   gst: i32,
   g: LetDecl,
   gck: VKind,
-  ec: ExpCtx,
 ) {
   let svi = -1
   if gck == "variant" { svi = globalCellStructIdx(gst) }
@@ -2638,10 +2604,7 @@ function emitStartGlobalInitValue(
   if gUmr {
     const gumrN = nodeAt(unwrapParen(g.letInit))
     if gumrN is Index {
-      if (
-        emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1, ec)
-        < 0
-      ) {
+      if (emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1) < 0) {
         wTarget(exprPrev)
         return -1
       }
@@ -2652,24 +2615,24 @@ function emitStartGlobalInitValue(
       )
     }
   } else if gun != "" {
-    if emitUnionBoxArg(bodyExpr, gun, gunTy, g.letInit, -1, ec) < 0 {
+    if emitUnionBoxArg(bodyExpr, gun, gunTy, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if (gck == "variant" && svi >= 0 && svi < uVarRow.length) {
     // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
-    if emitVariantCoerce(bodyExpr, svi, g.letInit, -1, ec) < 0 {
+    if emitVariantCoerce(bodyExpr, svi, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if gAliasFe >= 0 {
-    if emitClosureValueCore(bodyExpr, gAliasFe, -1, ec) < 0 {
+    if emitClosureValueCore(bodyExpr, gAliasFe, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if gck == "nulnone" {
     // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
-    if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1, ec) < 0 {
+    if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
@@ -2680,12 +2643,12 @@ function emitStartGlobalInitValue(
     // A literal-union atom initializing a `string` global widens to its member string.
     // The start fn is a real function, so the runtime widening tower runs here (unlike a
     // CONST global, whose constexpr init has no `select`/scratch).
-    if emitAtomToStr(bodyExpr, g.letInit, -1, ec) < 0 {
+    if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else {
-    if emitExpr(bodyExpr, g.letInit, -1, ec) < 0 {
+    if emitExpr(bodyExpr, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
@@ -2757,7 +2720,7 @@ function helpFrameBody(out: u8[], body: u8[]) {
 // Frame `__eq_<si>__` onto `out`: the frames a user function comparing row `si` reserves, laid
 // out after the two params, then the compare. A list or function field stages its operands
 // in those frames, so the locals vector is built as `emitFuncCode` builds one (D9962).
-function eqHelpFnCode(out: u8[], si: i32, ec: ExpCtx): i32 {
+function eqHelpFnCode(out: u8[], si: i32): i32 {
   resetFnScratchFlags()
   envCacheOpen(-1)
   fnUsesUnionSink = false
@@ -2766,7 +2729,7 @@ function eqHelpFnCode(out: u8[], si: i32, ec: ExpCtx): i32 {
   if shapeHasCloField(si, []) { fnUsesCloEq = true }
   leqNoteStructRowFields(si, [])
   fbBeginFunc(2, 0)
-  const code = eqHelpFnBody(si, ec)
+  const code = eqHelpFnBody(si)
   const body: u8[] = []
   if fbEmitLocalsVec(body, 0) < 0 { return -1 }
   appendAll(body, code)
@@ -5121,7 +5084,7 @@ function svLenFnCode(out: u8[], d: i32) {
 // —— record-list views (D3041) ——
 // A view of source row `p` is `{back, len, cap, src}`, a final subtype of the union-box list's
 // wrapper: the first three fields a snapshot the sync helper refreshes, `src` the record list
-// whose elements it boxes under variant `rvVariant[p]`.
+// whose elements it boxes under tag `rvTag[p]`.
 
 // Whether this module reserves the view helpers: the checker saw a record row delivered as a
 // union-box list from an unfresh root, and the module has a union-box list.
@@ -5250,7 +5213,7 @@ function rvSrcElem(p: i32, sL: i32, idx: i32, guard: boolean) {
   0
 }
 
-// Box that element under view row `p`'s variant, `{tag, record}`; a `null` element of a
+// Box that element under view row `p`'s tag, `{tag, record}`; a `null` element of a
 // nullable record row boxes under the null tag, as the element-converting copy does.
 function rvBoxElem(p: i32, sL: i32, idx: i32, guard: boolean) {
   if rvNul[p] == 1 {
@@ -5261,13 +5224,13 @@ function rvBoxElem(p: i32, sL: i32, idx: i32, guard: boolean) {
     fbRefNullNone()
     fbStructNew(uBoxIdx)
     fbElse()
-    fbI32Rel(RS_TAG, uTags[rvVariant[p]])
+    fbI32Rel(RS_TAG, rvTag[p])
     rvSrcElem(p, sL, idx, guard)
     fbStructNew(uBoxIdx)
     fbEnd()
     return 0
   }
-  fbI32Rel(RS_TAG, uTags[rvVariant[p]])
+  fbI32Rel(RS_TAG, rvTag[p])
   rvSrcElem(p, sL, idx, guard)
   fbStructNew(uBoxIdx)
   0
@@ -5964,7 +5927,7 @@ function typeSeeds(g: i32): string[] {
     if kind == TSK_STRUCT && slot >= 0 && slot < sFieldCount.length {
       s = "R" + seedNames(sFieldNames, sFieldStart[slot], sFieldCount[slot])
     } else if kind == TSK_VARIANT && slot >= 0 && slot < uFieldCount.length {
-      s = "R" + seedNames(uFieldNames, uFieldStart[slot], uFieldCount[slot])
+      s = "R" + seedNames(sFieldNames, uFieldStart[slot], uFieldCount[slot])
     } else if (
       (kind == TSK_REF_BACK || kind == TSK_REF_WRAP)
       && slot >= 0
@@ -6080,7 +6043,7 @@ function collectStrPool() {
   while i < P.nodes.length {
     const nd = nodeAt(i)
     if nd is StrLit { strLitCollect(nd.strText) }
-    if nd is IsExpr && strPoolIsTest(nd) {
+    if nd is IsExpr && strPoolIsTest(nd, i) {
       const texts = tyLitMemberTexts(isVarTyIxOf(i))
       let k = 0
       while k < texts.length {
@@ -6124,14 +6087,12 @@ function strFillPlan() {
   0
 }
 
-// Whether `is` test `n` compares its literals with `__str_eq__` and so wants them pooled: over a
-// `string` or `string | null` whatever the test is spelled, and over a string-stored literal
-// union only when the test spells its literals out (a named test there compares otherwise).
-function strPoolIsTest(n: IsExpr): boolean {
+// Whether `is` test `n` at node `ix` compares its literals with `__str_eq__` and so wants them
+// pooled: over a `string` or `string | null` whatever the test is, and over a string-stored
+// literal union when the pattern's own type is a string literal set, named or spelled (D15253).
+function strPoolIsTest(n: IsExpr, ix: i32): boolean {
   if nodeTyIsStringPrim(n.isObj) || nodeTyIsNulString(n.isObj) { return true }
-  n.isVariant.length > 0
-    && n.isVariant[0] == '"'
-    && nodeTyComparesAsString(n.isObj)
+  tyIsLitUnionOrLit(isPatTyIxOf(ix)) && nodeTyComparesAsString(n.isObj)
 }
 
 // Pools raw literal lexeme `lex` unless it is pooled already or past the `array.new_fixed` cap.
@@ -6215,7 +6176,7 @@ function emitDataSection() {
 // wasm's mandated section-id order. Before any section bytes go out, this fixes the
 // module-wide index spaces every section then references — start-function and `__log__`
 // indices, shared-helper indices, the string pool, and every heap type — so no emitter has to re-derive an index another already chose.
-function emitModule(_stmts: i32[], ec: ExpCtx) {
+function emitModule(_stmts: i32[]) {
   emitReset()
   typeOrderReset()
   relReset()
@@ -6289,7 +6250,7 @@ function emitModule(_stmts: i32[], ec: ExpCtx) {
 
   if memUsed && !memImported() { emitMemorySection() }
 
-  emitGlobalSection(ec)
+  emitGlobalSection()
 
   emitExportSection(n)
 
@@ -6305,7 +6266,7 @@ function emitModule(_stmts: i32[], ec: ExpCtx) {
     seekChunk: 0,
     seekBase: 0,
   }
-  const built = buildCodePayload(codePayload, n, hasStart, memFn, nHelpers, ec)
+  const built = buildCodePayload(codePayload, n, hasStart, memFn, nHelpers)
   dfeOn = false
   if built < 0 { return -1 }
   // The global section is framed first: it sits after the function section in the rope, so
@@ -6862,6 +6823,9 @@ function initGuardScan(): i32 {
   gInitFnReach = []
   gInitAny = false
   gInitProgIdx = -1
+  gInitBitIdx = []
+  gInitBitBase = -1
+  gInitBitN = 0
   gInitStartOrd = -1
   initAtCompute()
   let anyCand = false
@@ -6938,6 +6902,28 @@ function initGuardScan(): i32 {
     if gInitGuard[g] >= 1 && gInitAt[g] != INIT_REACH_NEVER {
       gInitProgAfter[gInitAt[g]] = g
     }
+  }
+  // Each guarded global with no initializer that keeps a cell and that some top-level statement
+  // assigns gets an assigned bit; one only a function assigns keeps the progress cell's answer,
+  // which is never (D14360).
+  gi = 0
+  while gi < globalStmts.length {
+    gInitBitIdx.push(-1)
+    const d = nodeAt(globalStmts[gi])
+    if (
+      gi < gInitGuard.length
+      && gInitGuard[gi] == 1
+      && gi < gCellIdx.length
+      && gCellIdx[gi] >= 0
+      && gi < gInitAt.length
+      && gInitAt[gi] != INIT_REACH_NEVER
+      && d is LetDecl
+      && d.letInit < 0
+    ) {
+      gInitBitIdx[gi] = gInitBitN
+      gInitBitN = gInitBitN + 1
+    }
+    gi = gi + 1
   }
   0
 }
@@ -7423,6 +7409,7 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
       return synthRecEqCores()
     }
     "buildFnMap#2" => {
+      synthRecordedRetAnnots()
       return buildFnMap(stmts)
     }
     "synthParamAnnots" => {
@@ -7434,7 +7421,11 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
       return cv
     }
     "computeRetInference#2" => {
-      return computeRetInference()
+      criAfterMonoSet(true)
+      const cr = computeRetInference()
+      criAfterMonoSet(false)
+      fnKindShadowRun()
+      return cr
     }
     "collectMapFilterUse" => {
       return collectMapFilterUse()
@@ -7497,6 +7488,7 @@ function emitProgramReset(rootIx: i32) {
   memoCompileReset()
   // Every module's per-compile scalars back to their declared values (lane L7).
   emitStateReset()
+  localRegistryReset()
   wasmEmitStateReset()
   nliFnIndexReset()
   bcReset()
@@ -7574,19 +7566,17 @@ function emitProgramReset(rootIx: i32) {
   fmSeenSFields = -1
   fmSeenUFields = -1
   fmSeenTyParams = -1
-  sFieldElemTyIx = []    // a struct FIELD's element type     [collectS]
-  uFieldElemTyIx = []    // a VARIANT field's element type    [collectU]
-  armStageElemTyIx = uFieldElemTyIx
-  sFieldElemKeyKind = [] // a struct FIELD's map KEY rep    [collectS]
-  uFieldElemKeyKind = [] // a VARIANT field's map KEY rep   [collectU]
-  armStageElemKeyKind = uFieldElemKeyKind
-  unMemTyStart = []      // union MEMBER types per row        [collectU]
+  sFieldElemTyIx = []      // a struct FIELD's element type     [collectS]
+  armStageElemTyIx = []    // a VARIANT field's element type    [collectU]
+  sFieldElemKeyKind = []   // a struct FIELD's map KEY rep    [collectS]
+  armStageElemKeyKind = [] // a VARIANT field's map KEY rep [collectU]
+  unMemTyStart = []        // union MEMBER types per row        [collectU]
   unMemTyCount = []
   unMemTys = []
-  unMemAtoms = []        // the member-REFERENCE columns      [collectU]
+  unMemAtoms = []          // the member-REFERENCE columns      [collectU]
   unMemAtomIds = []
   unMemKinds = []
-  msPoolReset()          // the member SETS interned over those columns
+  msPoolReset()            // the member SETS interned over those columns
   // The if-expression arm blocks whose prelude locals the collect pass allocated. Arena node
   // indices, so it is the same hazard as the columns above and worse: a stale index that happens
   // to name a node in program N grants the emitter permission to lower a prelude with no allocated locals, claiming another binding's slot.
@@ -7596,6 +7586,7 @@ function emitProgramReset(rootIx: i32) {
   // Fresh per program: the diagnostic anchor + the "function being lowered"
   // cursor. A failure before any function body emits leaves these -1 (positionless).
   emitErrAt = -1
+  emitErrCursorAt = -1
   emitCurFnIx = -1
   emitCurFnPos = -1
   emitCurStmtIx = -1
@@ -7821,6 +7812,7 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
   // program's must not survive into this one's early passes.
   monoSubTablesReset()
   callBindShadowBegin()
+  boxDstShadowBegin()
   fnFlowShadowBegin()
   identAuditBegin()
   const passDone: EmitPass[] = []
@@ -7885,8 +7877,11 @@ export function elabPrepare(rootIx: i32) {
   elabPreparedFor = -1
   emitProgramReset(rootIx)
   if rootIx < 0 || !(nodeAt(rootIx) is Program) { return 0 }
+  // The maker calls whose result one closed signature serves, banked before the elaboration runs.
+  fvaMakerCallRows()
   const d0 = T.diags.length
   const hm = elabHoleRowMark()
+  elabJoinDemandsReset()
   elabPrepareRun(rootIx)
   // A set the elaboration's calls let the tag decision tag is elaborated as tagged, from scratch,
   // until no decision tags another; each later decision only adds sets, so they bound the rounds.
@@ -7894,12 +7889,15 @@ export function elabPrepare(rootIx: i32) {
   let grew = if elabMintFacts() > 0 { fnTagRedecide(rootIx) } else { 0 }
   // The check's decision saw no instance; the first one after the elaboration replaces it.
   if grew == 2 { grew = 1 }
+  // A join that found instances missing has the next round mint them.
+  if grew == 0 && elabJoinDemandsTake() { grew = 1 }
   while grew == 1 && rounds < ELAB_TAG_ROUNDS {
     // The rows an earlier round's instances banked are its own, not the program's.
     elabHoleRowCut(hm)
     elabPrepareRun(rootIx)
     rounds = rounds + 1
     grew = if elabMintFacts() > 0 { fnTagRedecide(rootIx) } else { 0 }
+    if grew == 0 && elabJoinDemandsTake() { grew = 1 }
   }
   if grew != 0 {
     emitFail(
@@ -7926,6 +7924,8 @@ function elabPrepareRun(rootIx: i32) {
   repReset()
   monoElabDefaultsPrime(progStmts)
   canonShowWritten()
+  recordRowsRun()
+  elabDeliveredRowClassFn = recordRowClassOf
   elabRun()
   canonShowCanon()
 }
@@ -7952,7 +7952,7 @@ function emitProgramRun(rootIx: i32) {
     // After the arena is final, so a literal binding re-seated at a join's row is seen there.
     if auditRecordJoinLeaves() < 0 { return -1 }
     // The expected-type context every emitter threads, unseeded.
-    const rc = emitModule(stmts, expCtxDefault())
+    const rc = emitModule(stmts)
     if rc < 0 { return rc }
     // An `emitFail` whose -1 a deep helper swallowed (e.g. inside a valtype write)
     // must still fail the WHOLE emit: a failed module never reaches instantiation.
@@ -8231,7 +8231,15 @@ function emitOneFuncType(ti: i32) {
       if infKind == "struct" || infKind == "nulstruct" {
         infSlot = fRetStructIdx[ti]
       }
-      if infKind == "reflist" { infSlot = fnRetRefListSlot(ti) }
+      if infKind == "reflist" {
+        infSlot = fnRetRefListSlot(ti)
+        // The returned lists are built at rows, or hold function sets, no one list row joins.
+        if infSlot == -2 {
+          emitFail(
+            "emitProgram: the lists this function returns are built at different rows, so its inferred list result has none",
+          )
+        }
+      }
       // A concrete-variant inferred result (kind 8) — the variant index, from the same companion
       // column the struct kinds read. The annotated path below has carried the variant through
       // `retStructIndex` all along; the inferred half had no arm and resolved -1, which
@@ -8320,10 +8328,10 @@ function structRowIsProperPrefix(p: i32, c: i32): boolean {
   true
 }
 
-// Builds `sSuper`/`sSubbed`: every representative struct row takes as its declared supertype
-// the longest proper-prefix representative row in the module, or -1. Representatives only, on
-// both ends — a twin shares an earlier row's heap index and has no form of its own to carry a
-// `sub` or be named a parent. Longest, so the chain is transitively closed: a row's other required prefixes are prefixes of its longest one, and that row takes them in turn.
+// Builds `sSuper`/`sSubbed`: every representative struct row, and every arm's own row, takes as
+// its declared supertype the longest proper-prefix row in the module, an arm's row among them,
+// or -1. A twin shares an earlier row's heap index and has no form of its own to carry a `sub`.
+// Longest, so the chain is transitively closed: a row's shorter prefixes are its longest one's.
 export function buildStructSupers() {
   sSuper = []
   sSubbed = []
@@ -8333,9 +8341,10 @@ export function buildStructSupers() {
     sSubbed.push(false)
     i = i + 1
   }
+  armRowsBuild()
   let c = 0
   while c < sNames.length {
-    if sTwin[c] == c && !sIsRefRow(c) {
+    if (sTwin[c] == c && !sIsRefRow(c)) || (armRowIs[c] ?? false) {
       let best = -1
       let bestLen = 0
       let bestAgrees = false
@@ -8359,6 +8368,8 @@ export function buildStructSupers() {
         }
         pi = pi + 1
       }
+      const arm = armSuperOf(c, bestLen)
+      if arm >= 0 { best = arm }
       if best >= 0 {
         sSuper[c] = best
         sSubbed[best] = true
@@ -8367,6 +8378,43 @@ export function buildStructSupers() {
     c = c + 1
   }
   0
+}
+
+// The reference rows of the union arms (rows on a variant's own heap, with no struct entry), as
+// a set and by first field name; `armRowsBuild` fills both for one `buildStructSupers`.
+let armRowIs: {[i32]: boolean} = Map()
+let armRowsByFirst: {[string]: i32[]} = Map()
+function armRowsBuild() {
+  armRowIs = Map()
+  armRowsByFirst = Map()
+  let vi = 0
+  while vi < uVarRow.length {
+    const r = variantRowOf(vi)
+    if r >= 0 && sIsRefRow(r) && !(armRowIs[r] ?? false) && sFieldCount[r] > 0 {
+      armRowIs[r] = true
+      const f = sFieldNames[sFieldStart[r]]
+      const b = armRowsByFirst[f] ?? []
+      if b.length == 0 { armRowsByFirst[f] = b }
+      b.push(r)
+    }
+    vi = vi + 1
+  }
+  0
+}
+
+// The longest arm row that is a proper prefix of row `c` and longer than `bestLen`, or -1: a
+// record wider than an arm boxes under that arm's tag as it stands.
+function armSuperOf(c: i32, bestLen: i32): i32 {
+  if c < 0 || c >= sFieldStart.length || sFieldCount[c] == 0 { return -1 }
+  let best = -1
+  let len = bestLen
+  for r in armRowsByFirst[sFieldNames[sFieldStart[c]]] ?? [] {
+    if r != c && structRowIsProperPrefix(r, c) && sFieldCount[r] > len {
+      best = r
+      len = sFieldCount[r]
+    }
+  }
+  best
 }
 
 // The rec-group entries `emitTypeSection` has written so far; entry k is heap type k.
@@ -8395,6 +8443,21 @@ function tsEntryAt(idx: i32, what: string) {
   0
 }
 
+// Row `si`'s `sub` header: its supertype, or none but not final when it is one; nothing for a
+// row in neither role, which is final.
+function tsSubHeader(si: i32) {
+  const sup = sSuperAt(si)
+  if sup >= 0 {
+    wU8(80) // 0x50 sub
+    wULEB(1)
+    wULEB(sHeapIdx[sup])
+  } else if sSubbedAt(si) {
+    wU8(80) // 0x50 sub
+    wULEB(0)
+  }
+  0
+}
+
 // One struct per declared type, in `structEmitOrder` — the same order `mAssignTypeIndices`
 // assigned heap indices in: declaration order except that a row waits for every proper prefix
 // of it (D622, since wasm needs a supertype's index lower than its subtype's). A field is
@@ -8404,15 +8467,7 @@ function tsStruct(si: i32) {
   // The declared-supertype form (D622): a row with a parent, or that is one, is written
   // with WasmGC's `0x50 sub` header instead of a bare `0x5f`, since a type without `sub`
   // is final. `(type $Wide (sub $Narrow …))` is what makes a `(ref $Wide)` acceptable at a `(ref $Narrow)` slot; a module with no proper-prefix pair emits the same bytes as before.
-  const sup = sSuperAt(si)
-  if sup >= 0 {
-    wU8(80)  // 0x50 sub
-    wULEB(1) // one supertype
-    wULEB(sHeapIdx[sup])
-  } else if sSubbedAt(si) {
-    wU8(80)  // 0x50 sub
-    wULEB(0) // no supertype, but NOT final — something declares this its parent
-  }
+  tsSubHeader(si)
   wU8(95) // 0x5f struct
   const cnt = sFieldCount[si]
   wULEB(cnt)
@@ -8434,6 +8489,8 @@ function tsStruct(si: i32) {
 // — an immutable i32 tag and an immutable `anyref` value — mirroring binaryen's `unionStruct` output.
 function tsVariant(vi: i32) {
   tsEntryAt(variantHeap(vi), "union variant")
+  // An arm wider than another record or arm declares it its supertype (`armSuperOf`).
+  tsSubHeader(variantRowOf(vi))
   wU8(95) // 0x5f struct
   const cnt = uFieldCount[vi]
   wULEB(cnt)
@@ -9417,8 +9474,8 @@ let gGlobalFixedN = 0
 let gGlobalEntries: u8[] = []
 let gGlobalRopeAt = 0
 
-function emitGlobalSection(ec: ExpCtx) {
-  if captureFoldedConsts(ec) < 0 { return -1 }
+function emitGlobalSection() {
+  if captureFoldedConsts() < 0 { return -1 }
   // Global section (id 6): one global per top-level `let`/`const`, in declaration
   // order (that order is the global index `global.get`/`global.set` use). Each entry is
   // `<valtype> <mutability> <init constexpr> 0x0b`, immutable for a constant `const`; a non-constexpr init fails loudly via `emitExpr`.
@@ -9444,13 +9501,16 @@ function emitGlobalSection(ec: ExpCtx) {
     nProg = 1
     gInitProgIdx = externGlobalCount() + np + nCells + nHeap
   }
+  // The assigned bits of the guarded bindings with no initializer trail the progress cell.
+  const nBits = if gInitAny { gInitBitN } else { 0 }
+  gInitBitBase = externGlobalCount() + np + nCells + nHeap + nProg
   // The synthetic constants trail everything, and the section is framed once the bodies that
   // mint them are built (`frameGlobalSection`), at this point of the module.
-  gSynthBase = externGlobalCount() + np + nCells + nHeap + nProg
-  gGlobalFixedN = nCells + np + nHeap + nProg
+  gSynthBase = externGlobalCount() + np + nCells + nHeap + nProg + nBits
+  gGlobalFixedN = nCells + np + nHeap + nProg + nBits
   gGlobalRopeAt = W.chunks.length
   gGlobalEntries = []
-  if nCells + np + nHeap + nProg > 0 {
+  if nCells + np + nHeap + nProg + nBits > 0 {
     const globalPayload: u8[] = gGlobalEntries
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
     // each entry's valtype (`fbValtype`), mutability flag, and init constexpr (`fb*`
@@ -9523,7 +9583,7 @@ function emitGlobalSection(ec: ExpCtx) {
           // A `const` cell is immutable: nothing but this constexpr writes it, and an exported one
           // is what an `extern const` import links to. A constexpr `let` stays mutable.
           if globalCellIsImmutable(gi) { wU8(0) } else { wU8(1) }
-          if emitConstCellInit(globalPayload, gi, ec) < 0 { return -1 }
+          if emitConstCellInit(globalPayload, gi) < 0 { return -1 }
           fbEnd() // 0x0b end of init expr
         }
       }
@@ -9540,11 +9600,14 @@ function emitGlobalSection(ec: ExpCtx) {
       fbI32Const(gHeapLimit)
       fbEnd()
     }
-    if nProg == 1 {
+    // The progress cell, then each assigned bit: a mutable i32 that starts at 0.
+    let bk = 0
+    while bk < nProg + nBits {
       wU8(127) // 0x7f i32
       wU8(1)   // mutable
       fbI32Const(0)
       fbEnd()
+      bk = bk + 1
     }
     wTarget(gPrev)
     relHold(globalPayload)
@@ -9596,19 +9659,10 @@ function frameGlobalSection() {
 // the seeds its cell kind implies. Every seed is scoped to this one init and restored after it:
 // a constexpr runs before every function body, so a leaked null rep would retype a bare `null`
 // anywhere in the module (D1563). Shared by the global section and `captureFoldedConsts`.
-function emitConstCellInit(buf: u8[], gi: i32, ec: ExpCtx): i32 {
+function emitConstCellInit(buf: u8[], gi: i32): i32 {
   const g = nodeAt(globalStmts[gi])
   if g is LetDecl {
-    const gcSaved = expCtxHere(ec)
     const gck = globalCellKind(globalStmts[gi])
-    // The rungs a cell derives from its kind alone, shared with the local `let`, the
-    // start-function init and the `global.set` arm.
-    const cc = expCtxHere(ec)
-    // A literal-union const lowers its member init as `i32.const <id>`; a nullable one lowers a
-    // bare `null` as the -1 sentinel. Un-seeded, a member init emitted the string ref into the
-    // i32 niche cell (invalid wasm) and a `null` init drew a loud reject.
-    if letBindIsAtom(globalStmts[gi], -1) { cc.litUnion = 1 }
-    expCtxApply(cc, ec)
     // A union cell boxes its init in the constexpr (`struct.new` / `array.new_fixed` /
     // `i32.const` are all constant in WasmGC), and a `const f = add` aliasing a generic named
     // function emits its closure through the floor-less core, as `emitLetDeclStmt` does.
@@ -9624,16 +9678,23 @@ function emitConstCellInit(buf: u8[], gi: i32, ec: ExpCtx): i32 {
     if letInitFoldsExpr(g) {
       rc = emitConstFoldValue(buf, gck, g.letInit, constFoldOfLet(g).cfV)
     } else if gun2 != "" {
-      rc = emitUnionCoerce(buf, gun2, gun2Ty, g.letInit, -1, ec)
+      // The union is the one the checker records the init delivered into, under the name of
+      // the registry row it names (`unRowOfRecordTy`).
+      const rec = boxDstTyAt(g.letInit, -1)
+      const recRow = unRowOfRecordTy(rec)
+      if rec >= 0 && recRow >= 0 && recRow < unNames.length {
+        rc = emitUnionCoerce(buf, unNames[recRow], rec, g.letInit, -1)
+      } else {
+        rc = emitUnionCoerce(buf, gun2, gun2Ty, g.letInit, -1)
+      }
     } else if gAliasFe >= 0 {
-      rc = emitClosureValueCore(buf, gAliasFe, -1, ec)
+      rc = emitClosureValueCore(buf, gAliasFe, -1)
     } else {
-      rc = emitExpr(buf, g.letInit, -1, ec)
+      rc = emitExpr(buf, g.letInit, -1)
     }
     gConstExprEmit = ceSaved
     // The snapshot restored, rather than a chosen list of seeds cleared: one this function
     // leaves standing would outlive the whole global section.
-    expCtxApply(gcSaved, ec)
     if rc < 0 { return -1 }
     return 0
   }
@@ -9662,7 +9723,7 @@ function emitConstFoldValue(buf: u8[], gck: VKind, init: i32, v: i64): i32 {
 // Folds every immutable cell whose own constexpr is exactly one scalar `*.const`: its bytes go
 // to `gFoldPool` for `emitFoldedConstRead`, and the cell is dropped unless an export names it.
 // Runs before the global section writes its count and before any body reads a global index.
-function captureFoldedConsts(ec: ExpCtx): i32 {
+function captureFoldedConsts(): i32 {
   let gi = 0
   while gi < globalStmts.length {
     // A guarded cell keeps its reads, so one before the declaration still traps (D2652).
@@ -9670,7 +9731,7 @@ function captureFoldedConsts(ec: ExpCtx): i32 {
     if gCellIdx[gi] >= 0 && globalCellIsImmutable(gi) && !guarded {
       const one: u8[] = []
       const prev = wTarget(one)
-      const rc = emitConstCellInit(one, gi, ec)
+      const rc = emitConstCellInit(one, gi)
       wTarget(prev)
       if rc < 0 { return -1 }
       if wIsOneScalarConst(one) {
@@ -9943,7 +10004,6 @@ function buildCodePayload(
   hasStart: i32,
   memFn: i32,
   nHelpers: i32,
-  ec: ExpCtx,
 ) {
   // The count is written once the bodies have decided the thunks, into the head chunk pushed
   // here; `rowsAt` marks the span rows its width change moves.
@@ -9966,7 +10026,7 @@ function buildCodePayload(
     // until `writeCodeSection` places the payload in the module.
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitFuncCode(entry, fnStmts[ci], ci, ec) < 0 { return -1 }
+    if emitFuncCode(entry, fnStmts[ci], ci) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, fnStmts[ci], ci, 0, "")
     ci = ci + 1
   }
@@ -9976,14 +10036,14 @@ function buildCodePayload(
     // Pushed after them, since `emitFnSpanAt` returns the first row whose range holds the offset and the narrower answer is the useful one.
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitStartFnCode(entry, n, ec) < 0 { return -1 }
+    if emitStartFnCode(entry, n) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 4, "")
   }
   let ik = 0
   while ik < gInitMods.length {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitInitFnCode(entry, ik, ec) < 0 { return -1 }
+    if emitInitFnCode(entry, ik) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 4, "")
     ik = ik + 1
   }
@@ -10111,7 +10171,7 @@ function buildCodePayload(
       helpFrameBody(entry, mapSetFnBody(mapCompactRowShape(row)))
       placeCodeEntry(codePayload, entry, rows, -1, -1, 3, mapSetFnName(row))
     } else {
-      if eqHelpFnCode(entry, -1 - row, ec) < 0 { return -1 }
+      if eqHelpFnCode(entry, -1 - row) < 0 { return -1 }
       placeCodeEntry(
         codePayload,
         entry,

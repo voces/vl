@@ -2,6 +2,7 @@
 // push/pop and atom-widening bits, string, equality, map and list ops, and which union arm
 // a closure call reaches.
 
+import { isPatTyIxOf } from "./check_list_union"
 import {
   ArrayLit,
   AsExpr,
@@ -44,6 +45,7 @@ import {
   WhileStmt,
   arithRegionSeen,
   callIsNever,
+  isExprKid,
   nodeAt,
 } from "./ast"
 import { recCopyTyOf } from "./check_core_state"
@@ -59,13 +61,19 @@ import {
   nodeTyPrimName,
 } from "./check_node_tys"
 import { inferRetFnKey } from "./check_side_rows"
-import { EqCmpKind, EqCore, eqCoreKindOfTyToken } from "./check_ty_relate"
+import {
+  EqCmpKind,
+  EqCore,
+  eqCoreKindOfTyToken,
+  xrepListPair,
+} from "./check_ty_relate"
 import { isValueUnionName, valueAtomKind } from "./check_ty_rep"
 import {
   T,
   TyUnion,
   tyAt,
   tyIsLitUnion,
+  tyIsLitUnionOrLit,
   tyIsNullableLitUnion,
   tyNulInnerTy,
 } from "./check_types"
@@ -162,7 +170,7 @@ import {
   gLitUnionUsed,
   pushStagesAtomNarrow,
 } from "./emit_lit_atoms"
-import { PushKind, globalLetOfDeclRead, pushKindBit } from "./emit_narrow_slots"
+import { PushKind, globalLetOfDeclRead, pushKindBit } from "./emit_local_slots"
 import {
   assignTargetSpills,
   fnDeclaresNonVoid,
@@ -234,7 +242,6 @@ import {
   unionSetHasNullTy,
 } from "./emit_union_registry"
 import { strListHas } from "./listutil"
-import { nameIsQuotedLeaf } from "./tyname"
 import { tyStepElem } from "./tyquery"
 
 // Classify the `.push` or `.pop` receiver at `objIx` into its PushKind bits with one classifier
@@ -434,7 +441,7 @@ function exprPopBitsGo(exprIx: i32, fnIx: i32) {
       return exprPopBits(e.asObj, fnIx)
     }
     IsExpr => {
-      return exprPopBits(e.isObj, fnIx)
+      return exprPopBits(isExprKid(e), fnIx)
     }
     // A spread's source is an operand like any other (D2334).
     Spread => {
@@ -485,9 +492,10 @@ export function blockPushPopBits(blockIx: i32, fnIx: i32) {
         bits = bits | exprPopBits(s.retArg, fnIx)
       } else if s is BinExpr {
         bits = bits | exprPopBits(stmts[i], fnIx)
-      } else if s is Call {
+      } else if s is Call || s is Paren {
         // `exprPopBits` asks `callPushBits` of every `Call` it reaches (D1592), so the
-        // statement receiver is covered by the same descent as a value-position one.
+        // statement receiver is covered by the same descent as a value-position one; a
+        // parenthesized call statement is that call (D2637, D14793).
         bits = bits | exprPopBits(stmts[i], fnIx)
       } else if s is IfStmt {
         bits = bits | ifChainPushPopBits(stmts[i], fnIx)
@@ -1040,11 +1048,28 @@ export function catSlotOfBin(binIx: i32, fnIx: i32) {
   listOpSlotOfBin(binIx, fnIx)
 }
 
+// Whether the `==` / `!=` `e` compares two lists the checker admitted as stored apart
+// (`xrepListPair`) whose operands are built at two different reps. A list literal is built at
+// the other operand's rep, so that pair compares through one core.
+export function xrepEmitPair(e: BinExpr, fnIx: i32): boolean {
+  if !xrepListPair(nodeTyAt(e.binLeft, fnIx), nodeTyAt(e.binRight, fnIx)) {
+    return false
+  }
+  const kA = eqgListKindOfExpr(e.binLeft, fnIx)
+  const kB = eqgListKindOfExpr(e.binRight, fnIx)
+  if kA < 0 || kB < 0 { return false }
+  let sA = 0
+  if kA == LBK_REF { sA = refListSlotOfExpr(e.binLeft, fnIx) }
+  let sB = 0
+  if kB == LBK_REF { sB = refListSlotOfExpr(e.binRight, fnIx) }
+  kA != kB || sA != sB
+}
+
 // One `==` operand's list rep, in `catListKindOfExpr`'s alphabet, through a `| null`.
 // `emitNulNicheEq` guards the compare and then runs the rep's own core on the unwrapped refs,
 // so a niche and its base share one core by construction. `catListKindOfExpr`'s classifiers
 // are non-null, so without this the guard is emitted and the core underneath finds no frame.
-function eqgListKindOfExpr(exprIx: i32, fnIx: i32) {
+export function eqgListKindOfExpr(exprIx: i32, fnIx: i32) {
   const k = catListKindOfExpr(exprIx, fnIx)
   if k >= 0 { return k }
   // The four distinct-backing nullable scalar lists, off the same home the build side reads
@@ -1382,11 +1407,11 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
       return exprHasStrOp(e.parInner, fnIx)
     }
     IsExpr => {
-      // A string-literal `is` (`s is "a"`) lowers through `emitStrEqCore`, so it stages operands
-      // in the string scratch frame like a string `==`. The quoted-leaf test is at its home in
-      // `tyname.nameIsQuotedLeaf`, with the `length > 0` bound in front of it.
-      if e.isVariant.length > 0 && nameIsQuotedLeaf(e.isVariant) { return true }
-      return exprHasStrOp(e.isObj, fnIx)
+      // A string-literal `is` (`s is "a"`, or a named set of them) lowers through `emitStrEqCore`,
+      // so it stages operands in the string scratch frame like a string `==`. The pattern's own
+      // type answers, whatever the receiver: a box's string arm compares the same way (D15253).
+      if tyIsLitUnionOrLit(isPatTyIxOf(exprIx)) { return true }
+      return exprHasStrOp(isExprKid(e), fnIx)
     }
     AsExpr => {
       return exprHasStrOp(e.asObj, fnIx)
@@ -1825,7 +1850,7 @@ export function blockStashMisses(ix: i32, fnIx: i32, rem: i32): i32 {
       r = blockStashMisses(n.parInner, fnIx, r)
     }
     IsExpr => {
-      r = blockStashMisses(n.isObj, fnIx, r)
+      r = blockStashMisses(isExprKid(n), fnIx, r)
     }
     AsExpr => {
       r = blockStashMisses(n.asObj, fnIx, r)

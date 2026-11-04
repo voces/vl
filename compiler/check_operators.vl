@@ -1,12 +1,14 @@
 // The type of an operator expression: binary and assignment operators (with a declared
 // operator function), `in`, unary operators, `as` casts and `is` tests.
 
+import { mapFitBuild } from "./check_annot_resolve"
 import { strListIndexOf } from "./listutil"
 import { callBindNote, recordCollapsedIsAt } from "./check_bind_rows"
 import {
   ArrayLit,
   AsExpr,
   BinExpr,
+  Call,
   ErrExpr,
   FuncDecl,
   Ident,
@@ -22,7 +24,12 @@ import {
   Unary,
   nodeAt,
 } from "./ast"
-import { nodeTyIxOf, nodeTySet, nodeTySetGrow } from "./check_node_tys"
+import {
+  nodeTyIxOf,
+  nodeTyRecord,
+  nodeTySet,
+  nodeTySetGrow,
+} from "./check_node_tys"
 import {
   elabCallDeclNote,
   elabCapAlwaysTestNote,
@@ -30,6 +37,8 @@ import {
   elabCapLive,
   elabFnListWidened,
   elabLiveTyOf,
+  elabTyClosed,
+  fnLetReadTyOf,
 } from "./check_elab_cap"
 import {
   declareAmbient,
@@ -77,6 +86,7 @@ import {
 } from "./check_coal"
 import {
   checkNodeHook,
+  coalNodeHole,
   concatsAsStr,
   fvaDone,
   getWriteTarget,
@@ -93,7 +103,7 @@ import {
   noteLetCstr,
   noteMemCstr,
 } from "./check_cstr_rows"
-import { inferQuiet, tpEnvNames } from "./check_cursor"
+import { inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
 import { ctnBindingDeclOf, ctnWrRecvPut, wrDstDeclPut } from "./check_decl_scan"
 import {
   daIsUnassignedSid,
@@ -103,6 +113,7 @@ import {
 } from "./check_definite"
 import {
   castConstDecide,
+  castMissNullDeliver,
   castPropagationFits,
   cnhNullNote,
   cnhPinTy,
@@ -137,9 +148,11 @@ import {
   recContainerReadFresh,
   recFitMeetTy,
   recJoinFixed,
+  recordBoxTy,
   recordContainedIsAt,
   recordCtxTy,
   stampNullUnitCell,
+  storeWritePush,
   strLitSetsDisjoint,
 } from "./check_fit_rules"
 import { HD_BINOP, HD_ELEM, elemValueHoleBase } from "./check_hole_pins"
@@ -170,11 +183,13 @@ import {
   tvWriteTy,
 } from "./check_leaf_steps"
 import {
+  isPatTyIxPut,
   isVarTyIx,
   isVarTyIxCap,
   isVarTyIxPush,
   isVarTyIxSetAt,
   luWriteTgtPut,
+  monoRecheckDepth,
 } from "./check_list_union"
 import { constLitNeverMsg, litSetNeverMsg } from "./check_lit_never_msgs"
 import {
@@ -207,6 +222,9 @@ import {
   crNoteRhsRetired,
   popScope,
   retireNarrowingsForWrite,
+  scWrEnter,
+  scWrLeave,
+  scWrNote,
   writeBarredErr,
   writeLeavesLoopEntry,
   writeStorageTy,
@@ -218,10 +236,11 @@ import {
   pushScope,
   writeBarredByLoop,
 } from "./check_narrow_paths"
-import { armLit, njExprHeld } from "./check_nj_join"
+import { armLit } from "./check_nj_join"
 import {
   checkInferredMapKey,
   fsbNoteStore,
+  noteTpIfJoin,
   voidValueSlotErr,
 } from "./check_node_rules"
 import {
@@ -268,6 +287,7 @@ import {
   cnhFill,
   constrainEmpty,
   eqKeepsWideLit,
+  eqNonNullMutual,
   fnSlotRetWidens,
   joinArmLit,
   joinTys,
@@ -297,6 +317,7 @@ import { noteArrayWriteDemand } from "./check_subst"
 import {
   coalParamDefault,
   tpGradualView,
+  tpIfOkAt,
   unionHasDeclaredParam,
 } from "./check_tp_join"
 import {
@@ -305,6 +326,7 @@ import {
   mapTwinTestMsg,
   mixesNumeric,
   widerNumeric,
+  xrepListPair,
 } from "./check_ty_relate"
 import { nomBaseTyIx, nomErasedTyIx } from "./check_ty_rep"
 import { eqListFieldPath, nomBinMixes } from "./check_type_shape"
@@ -332,6 +354,7 @@ import {
   softenLitTy,
   tyAt,
   tyBuiltinIndexable,
+  tyEq,
   tyHasHole,
   tyHasInferHole,
   tyIsFuncArena,
@@ -351,7 +374,7 @@ import {
 } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
 import { arrDefRowServed } from "./check_hole_links"
-import { fnDeclIx } from "./check_write_scan"
+import { cwUseInOtherFrame, fnDeclIx } from "./check_write_scan"
 import { identDeclOf, sidOfNode } from "./symbols"
 import {
   arrElemValueTy,
@@ -367,6 +390,8 @@ import {
   tyExcludesNull,
   tyHasTyVar,
   tyIsV128Brand,
+  tyMapValOfHeld,
+  tyUnionCovers,
   unionCoversTy,
 } from "./tyquery"
 
@@ -563,18 +588,18 @@ function checkLogicalBinNode(n: BinExpr, ix: i32): i32 {
   } else {
     collectElseNarrows(n.binLeft, cnames, ctys)
   }
-  let cpushed = 0
   const npBase = npKeys.length
-  if cnames.length > 0 {
-    pushScope(-1)
-    applyNarrows(cnames, ctys)
-    cpushed = 1
-  }
+  // The right side may not run, so its own writes narrow only inside its scope; the arm it
+  // decides takes them back through `scWrFacts` (D2451).
+  pushScope(-1)
+  if cnames.length > 0 { applyNarrows(cnames, ctys) }
+  scWrEnter(ix)
   const crt = checkNodeHook(n.binRight)
-  if cpushed == 1 {
+  scWrLeave()
+  if cnames.length > 0 {
     crNoteRhsRetired(ix, n.binRight, cnames, ctys, npBase)
-    popScope()
   }
+  popScope()
   if !assignable(clt, TY_BOOL) || !assignable(crt, TY_BOOL) {
     tErr("operator '" + op + "' expects boolean operands", ix)
   }
@@ -624,6 +649,7 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   } else {
     asgBarred = writeBarredByLoop(n.binLeft)
   }
+  asgPinOpenListElem(n.binLeft, asgLt, rt)
   // A plain assignment pins the source's open holes, exactly as an annotated let-init, call
   // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
   constrainEmptyExpr(n.binRight, rt, asgLt)
@@ -634,7 +660,11 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   if asgFits { stampNullUnitCell(n.binRight, asgLt) }
   nlAsgTgt = -1
   const asgMem = nodeAt(n.binLeft)
-  if asgMem is Member { markFieldValue(n.binRight, n.binLeft, asgMem.memProp) }
+  if asgMem is Member {
+    markFieldValue(n.binRight, n.binLeft, asgMem.memProp)
+    // The value is stored where the receiver is, which the pass's builds decide.
+    if asgFits { storeWritePush(n.binRight, asgMem.memObj, asgMem.memProp) }
+  }
   const asgOk = asgFits
     && !writeLeavesLoopEntry(n.binLeft, asgLitRhsTy(ix, asgLt, rt))
   if !asgOk {
@@ -719,6 +749,7 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
             } else {
               declareAt(asgSlot, asgTgt.identName, nonNullTy(asgCur))
             }
+            scWrNote(n.binLeft, identTyOf(n.binLeft, asgTgt.identName))
           }
         } else if asgCt.nInner < 0 && rtT is TyNullable {
           // A nullable write fills the hole from its non-null part and narrows nothing: the
@@ -743,7 +774,31 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   // A function value of a wider signature is stored as the adapter at the place's, and the
   // adapter is the value the expression yields, so it has the place's type (D3866).
   if asgOk && (fvaDone[parenPeelIx(n.binRight)] ?? false) { return asgLt }
+  // A widened function `let` written from another function holds its set's value, which that
+  // function's write yields, so the write has the binding's type.
+  if asgOk && asgLt >= 0 && asgWritesWideCell(n.binLeft, asgLt) { return asgLt }
+  // A string literal delivered into a literal-union place is that literal's atom, as it is
+  // in a direct binding, so the expression yields the literal's own type (D14822).
+  if asgOk { return asgLitRhsTy(ix, asgLt, rt) }
   return rt
+}
+
+// Pins the open element of the `[]` or `[] | null` storage `place` of a name or field `tgt` to
+// the element of the list `rt` written into it, as a push would: the first write decides
+// (D2225). A source whose element is itself open, or a place whose element is known, is left alone.
+function asgPinOpenListElem(tgt: i32, place: i32, rt: i32) {
+  if place < 0 || rt < 0 || tyHasHole(rt) { return 0 }
+  const t = nodeAt(parenPeelIx(tgt))
+  if !(t is Ident || t is Member) { return 0 }
+  const pl = tyAt(nonNullTy(place))
+  const src = tyAt(nonNullTy(rt))
+  if pl is TyArray && src is TyArray {
+    if pl.aElem < 0 && src.aElem >= 0 && pl.aRead != 1 {
+      pl.aElem = widenLitTy(src.aElem)
+      tyMutEpoch = tyMutEpoch + 1 // the write pinned the element in place
+    }
+  }
+  0
 }
 
 // Whether assignment `n` writes a place: a name, a field or an element, through any parentheses.
@@ -843,7 +898,7 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     // does — the two write spellings of one program must infer identically.
     if arrT0 is TyMap {
       if arrT0.mKey < 0 {
-        let kt0 = nodeTyIxOf(tgt.idxIndex)
+        let kt0 = elabLiveTyOf(tgt.idxIndex)
         if kt0 < 0 { kt0 = checkNodeHook(tgt.idxIndex) }
         if kt0 >= 0 {
           arrT0.mKey = widenLitTy(kt0)
@@ -936,10 +991,28 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
 // `lt ?? rt`, with `lt` bound. Nullish coalescing peels the full nullability of the merged
 // type (`nonNullTy`), not one layer: a stored null in a nullable-valued map read is a double
 // nullable, just like a miss. Answers the result type.
+// The value type of the map the read `x` indexes (`m[k]` or `m.get(k)`), else -1.
+function coalMapReadValTy(x: i32): i32 {
+  const u = parenPeelIx(x)
+  const n = if u >= 0 { nodeAt(u) } else { null }
+  if n is Index { return tyMapValOfHeld(nodeTyIxOf(parenPeelIx(n.idxArr))) }
+  if n is Call && n.callArgs.length == 1 && n.callFn >= 0 {
+    const f = nodeAt(n.callFn)
+    if f is Member && f.memProp == "get" {
+      return tyMapValOfHeld(nodeTyIxOf(parenPeelIx(f.memObj)))
+    }
+  }
+  coalNotMapRead(u)
+}
+
+// Every other read indexes no map.
+function coalNotMapRead(_ix: i32): i32 { -1 }
+
 function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   // A `??` whose left operand can never be null has a dead default — recorded (a lint), not
-  // rejected, since `emit_rewrite` folds it. A narrowed place is exempt: its storage still admits null.
-  if tyExcludesNull(lt) {
+  // rejected, since `emit_rewrite` folds it. A narrowed place is exempt: its storage still admits
+  // null. So is an open type, whose pin may hold one (D4170).
+  if tyExcludesNull(lt) && !tyHasTyVar(lt) {
     // A parked hole cast has no answer yet: `a as? i32` inside a hole's body types `i32`
     // until the call pins the operand, so a `??` over it looks dead here and is not (D1371).
     if (
@@ -1011,6 +1084,7 @@ function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   if cdDft < 0 { cdDft = rt }
   const cd = mkCoalHole(cdDft, isF32AdoptingLitExpr(n.binRight), lt)
   if cd >= 0 {
+    if monoRecheckDepth == 0 { coalNodeHole[ix] = cd }
     noteCoalResultHole(cd)
     return cd
   }
@@ -1044,6 +1118,26 @@ function splitWidenedFnRead(ix: i32): boolean {
     if fsMinted(p) { return true }
   }
   false
+}
+
+// Whether operand `ix` is a list literal, through parentheses.
+function eqOperandIsListLit(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is Paren { return eqOperandIsListLit(n.parInner) }
+  n is ArrayLit
+}
+
+// Records list literal `lit` (typed `own`) delivered at `other` when it fits it, else at `own`.
+function eqLitDeliver(lit: i32, own: i32, other: i32): i32 {
+  if assignableExpr(lit, own, other) {
+    adoptLitAt(lit, other)
+    nodeTyRecord(lit, other)
+    recordCtxTy(lit, other)
+    return 1
+  }
+  recordCtxTy(lit, own)
+  0
 }
 
 // `==` / `!=` over `lt` and `rt`: the operands must be mutually compatible and comparable.
@@ -1126,11 +1220,18 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     || assignable(lt, rt)
     || assignable(rt, lt)
     || nomEqLit
+    || eqNonNullMutual(lt, rt)
   if !eqMutual {
     tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
   }
   // Both `==` gates share one home (`eqRefusals`): structural soundness (field-by-field
   // compare needs every component comparable) and emitter-capability (no compare core exists).
+  // A list literal beside a list stored apart is delivered at the other operand's type where it
+  // fits it, else at its own, and the record says which: the compare reads the rep it is built at (D15091).
+  if xrepListPair(lt, rt) {
+    if eqOperandIsListLit(n.binLeft) { eqLitDeliver(n.binLeft, lt, rt) }
+    if eqOperandIsListLit(n.binRight) { eqLitDeliver(n.binRight, rt, lt) }
+  }
   const eqMsgs: string[] = []
   const eqChan: i32[] = []
   eqRefusals(op, lt, rt, eqMutual, eqMsgs, eqChan)
@@ -1646,7 +1747,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   const savedLbiTgt = lbiWriteTgt
   const lt = binCheckLeftOperand(n, op)
   ltOut.push(lt)
+  // A `??` default may not run, so a write in it narrows nothing after the operator (D2451).
+  if op == "??" { pushScope(-1) }
   const rt = binCheckRightOperand(n, ix, op, lt, savedLbiTgt)
+  if op == "??" { popScope() }
   binTyOfSides(n, ix, lt, rt, ltOut)
 }
 
@@ -1737,8 +1841,6 @@ function binTyOfSides(n: BinExpr, ix: i32, lt0: i32, rt0: i32, ltOut: i32[]) {
     && (tyIsNumUnion(lt) || tyIsNumUnion(rt))
     && numUnionOp(op)
     && !nullTestOp(op, lt, rt)
-    && !njExprHeld(n.binLeft)
-    && !njExprHeld(n.binRight)
     && !(op == "+" && (concatsAsStr(lt) || concatsAsStr(rt)))
   ) {
     return binNumUnionOpTy(n, ix, op, lt, rt)
@@ -1752,8 +1854,39 @@ function binTyOfSides(n: BinExpr, ix: i32, lt0: i32, rt0: i32, ltOut: i32[]) {
   if lt < 0 { return TY_ERR }
   if op == "??" {
     const ct = checkCoalesceBinNode(n, ix, lt, rt)
+    // A generic `??` is the `if` it spells, so a pin that joins its sides apart re-asks it (D2846).
+    const clt = tyAt(lt)
+    if clt is TyNullable && clt.nInner >= 0 {
+      noteTpIfJoin(ix, clt.nInner, rt, ct, tpIfOkAt.has(ix))
+    }
     adoptLitAt(n.binRight, ct)
-    recordCtxTy(n.binRight, ct)
+    // A string default outside a closed result (`k ?? "n"` at `k: K`, whose default never runs)
+    // is delivered at the join the nullable spelling widens to, not at the result it cannot hold.
+    let dct = ct
+    const wrt = widenLitTy(rt)
+    if (
+      wrt == TY_STR
+      && elabTyClosed(ct, 0)
+      && !assignableExpr(n.binRight, rt, ct)
+    ) {
+      dct = joinTys(ct, wrt)
+    }
+    recordCtxTy(n.binRight, dct)
+    recordBoxTy(n.binLeft, ct)
+    // A map read whose default fits the map's values is one fused read, built where the map
+    // stores them whatever narrows the read; any other default joins at the result.
+    const mvt = coalMapReadValTy(n.binLeft)
+    if mvt >= 0 && assignable(rt, mvt) { recordBoxTy(n.binRight, mvt) }
+    // An instance types a `??` its template typed as a hole at that hole's pinned join, the type
+    // the pin gives its callers, and boxes the left operand into it.
+    const ch = coalNodeHole[ix] ?? -1
+    if ch >= 0 && monoRecheckDepth > 0 {
+      const pj = substTyDeep(ch, tpEnvNames, tpEnvTys)
+      if pj >= 0 && !tyHasTyVar(pj) && !tyHasHole(pj) {
+        recordBoxTy(n.binLeft, pj)
+        return pj
+      }
+    }
     return ct
   }
   if op == "==" || op == "!=" { return checkEqualityBinNode(n, ix, lt, rt) }
@@ -1781,7 +1914,7 @@ export function checkCastNode(n: AsExpr, ix: i32) {
   // A literal tree cast exactly to `i64` is computed there, as one delivered to an `i64` is
   // (D2709). The wrap cast keeps the 32-bit reading it names.
   if target == TY_I64 && arg == TY_I32 && n.asMode != "wrap" {
-    if litTreeAdoptDst(parenPeelIx(n.asObj), TY_I64) >= 0 { arg = TY_I64 }
+    if litTreeAdoptDst(n.asObj, TY_I64) >= 0 { arg = TY_I64 }
   }
   // A bare literal cast to a number it holds exactly is that number's literal (`7 as i64`).
   // A float literal cast converts its f64 value, so it keeps that type.
@@ -1885,7 +2018,7 @@ function checkCastUnionArm(
   }
   // A numeric union converts at whichever member it holds when no member's conversion
   // can fail, as each member alone would.
-  if numUnionAsConverts(argU, target) && !njExprHeld(n.asObj) { return target }
+  if numUnionAsConverts(argU, target) { return target }
   if !unionCoversTy(argT, target) {
     // A gradual union's parameter may hold the target at a pin: the cast is parked on the
     // parameter and re-asked there, as over a bare one (D2906).
@@ -1903,6 +2036,22 @@ function checkCastUnionArm(
   const twin = mapTwinTestMsg([argU], target, "`as`")
   if twin != "" {
     tErr(twin, ix)
+    return TY_ERR
+  }
+  const wider = castRecWiderMember(argT.uMembers, target)
+  if wider >= 0 {
+    tErr(
+      "`as "
+        + n.asTy
+        + "` would hand over an object a member "
+        + tyToStr(wider)
+        + " of "
+        + tyToStr(argU)
+        + " can still write wider fields; test it with `is "
+        + n.asTy
+        + "` and copy its fields",
+      ix,
+    )
     return TY_ERR
   }
   const rest = subtractTy(argU, target)
@@ -1925,6 +2074,30 @@ function checkCastUnionArm(
   // goes. A pending return (-2) is refused rather than joined into.
   if !castPropagationFits(rest, n.asTy, ix, T.curRet, -1) { return TY_ERR }
   target
+}
+
+// The member of `mems` a value of the record `target` may be held as while it stores some field
+// wider, or -1. A cast to `target` fits such a value by its fields' current values only (D4134).
+function castRecWiderMember(mems: i32[], target: i32): i32 {
+  const t = tyAt(target)
+  if !(t is TyObj) { return -1 }
+  for m in mems {
+    const mo = tyAt(m)
+    if (
+      m != target
+      && mo is TyObj
+      && assignable(target, m)
+      && !assignable(m, target)
+    ) {
+      let f = 0
+      while f < t.objFieldNames.length {
+        const mt = objFieldType(mo, t.objFieldNames[f])
+        if mt >= 0 && !tySame(mt, t.objFieldTypes[f]) { return m }
+        f = f + 1
+      }
+    }
+  }
+  -1
 }
 
 // A cast of the non-union operand `arg` to `target`: a v128 re-brand, a boolean, or a numeric
@@ -1954,6 +2127,10 @@ function checkCastScalar(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
     // An instance's re-check converts a pinned parameter: a pin at no number takes the miss
     // the template already typed (D2791), not the direct spelling's refusal.
     if elabCapLive() && tyHasTyVar(nodeTyIxOf(n.asObj)) && targetIsScalar {
+      // A bare `as` misses at every value of this pin, so its `null` is this instance's result.
+      if n.asMode == "prop" && T.curRet >= 0 {
+        castMissNullDeliver(ix, T.curRet)
+      }
       const tt = nodeTyIxOf(ix)
       if tt >= 0 { return tt }
       return target
@@ -1988,6 +2165,7 @@ function checkCastScalar(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
     if !castPropagationFits(TY_NULL, n.asTy, ix, T.curRet, arg) {
       return TY_ERR
     }
+    castMissNullDeliver(ix, T.curRet)
   }
   target
 }
@@ -2046,14 +2224,7 @@ function unTyOfArg(n: Unary, ix: i32, arg: i32) {
     }
   }
   // A numeric union negates at each member's own type.
-  if (
-    numUnionMinted
-    && n.unOp == "-"
-    && tyIsNumUnion(arg2)
-    && !njExprHeld(n.unArg)
-  ) {
-    return arg2
-  }
+  if (numUnionMinted && n.unOp == "-" && tyIsNumUnion(arg2)) { return arg2 }
   // A literal set negates at its base, as `x - 1` computes over it.
   if n.unOp == "-" && !isNumeric(arg2) && isNumeric(softenLitOpTy(arg2)) {
     arg2 = softenLitOpTy(arg2)
@@ -2091,11 +2262,56 @@ function isAlwaysAtPin(obj: i32, cur: i32, chk: i32): boolean {
   !(tyAt(cur) is TyUnion) && assignable(cur, chk)
 }
 
+// Whether a list of type `own` can pass `is chk` by value fit: `chk` is a list type, and an
+// empty list fits every one (D4771).
+function isListFitsWhenEmpty(chk: i32, own: i32): boolean {
+  if chk < 0 || chk >= T.tys.length || own < 0 || own >= T.tys.length {
+    return false
+  }
+  tyAt(chk) is TyArray && tyAt(own) is TyArray
+}
+
+// Check the minted content check of `n`, and answer its operand's type.
+function isFitObjTy(n: IsExpr): i32 {
+  checkNodeHook(n.isFit)
+  nodeTyIxOf(n.isObj)
+}
+
+// The member of union `objTy` that tested record `t` names, where `t` is one of them spelled
+// another way (`{a: i32 | string}` for `{a: string | i32}`): its own arena index, so every
+// reader of the test finds the member exactly. `t` itself otherwise (D2781).
+function isRecvMemberOf(objTy: i32, t: i32): i32 {
+  if objTy < 0 || objTy >= T.tys.length || t < 0 || t >= T.tys.length {
+    return t
+  }
+  const o = T.tys[objTy]
+  if !(o is TyUnion) || !isClosedRecord(t) { return t }
+  let found = -1
+  for m in o.uMembers {
+    if m == t || tyEq(m, t) { return t }
+    if isClosedRecord(m) && assignable(m, t) && assignable(t, m) {
+      if found >= 0 { return t }
+      found = m
+    }
+  }
+  if found >= 0 { found } else { t }
+}
+
+// Whether `t` is a record with no hole or type parameter in it: one a test names by its fields.
+function isClosedRecord(t: i32): boolean {
+  t >= 0
+    && t < T.tys.length
+    && T.tys[t] is TyObj
+    && !tyHasHole(t)
+    && !tyHasTyVar(t)
+}
+
 export function checkIsExprNode(n: IsExpr, ix: i32) {
   // The tested place is a test, not a use: its lowering reads the field's own rep.
   const savedIsObj = crIsObj
   crIsObjSet(n.isObj)
-  let objTy = checkNodeHook(n.isObj)
+  // A minted content check holds the operand, so checking it checks the operand once.
+  let objTy = if n.isFit >= 0 { isFitObjTy(n) } else { checkNodeHook(n.isObj) }
   crIsObjSet(savedIsObj)
   const chkTy = isTypeTy(n.isVariant, ix)
   const chkClash = if chkTy < 0 { unkTyClash } else { "" }
@@ -2123,13 +2339,23 @@ export function checkIsExprNode(n: IsExpr, ix: i32) {
       objTy = widenLitTy(objTy)
     }
   }
+  // A map tested against a narrower map is decided by its contents at runtime (D2701).
+  if chkTy >= 0 && objTy >= 0 && !inferQuiet && n.isFit < 0 {
+    const mfb = mapFitBuild(n.isObj, ix, objTy, chkTy, n.pos)
+    if mfb >= 0 {
+      n.isFit = mfb
+      checkNodeHook(mfb)
+    }
+  }
   // Bank the resolved check type on the `is` node as an arena index, so the emitter does not
   // re-classify the spelling.
   if chkTy >= 0 {
     if ix >= 0 {
       if ix < isVarTyIxCap {
         while isVarTyIx.length <= ix { isVarTyIxPush(-1) }
-        isVarTyIxSetAt(ix, if meet >= 0 { meet } else { chkTy })
+        const tested = if meet >= 0 { meet } else { chkTy }
+        isVarTyIxSetAt(ix, isRecvMemberOf(objTy, tested))
+        isPatTyIxPut(ix, chkTy)
       }
     }
   }
@@ -2177,11 +2403,16 @@ export function checkIsExprNode(n: IsExpr, ix: i32) {
     } else if meet >= 0 {
       0
     } else if (
-      !assignable(chkTy, baseTy)
-      || isWidenNotVariant(chkTy, baseTy)
-      || fnSlotRetWidens(chkTy, baseTy)
+      (!assignable(chkTy, baseTy)
+        || isWidenNotVariant(chkTy, baseTy)
+        || fnSlotRetWidens(chkTy, baseTy))
+      && !(!inUnion && tyUnionCovers(chkTy, baseTy))
     ) {
-      if deadArm {
+      if deadArm && isListFitsWhenEmpty(chkTy, baseTy) {
+        // An empty list fits every list type, so the instance's arm is live and is checked: what
+        // it delivers the list to is answered there (ruling (c), D4981).
+        0
+      } else if deadArm {
         elabCapDeadTestNote()
       } else if jwBadMsg != "" {
         tErr(
@@ -2276,4 +2507,13 @@ function oerOperandTy(ix: i32): i32 {
     }
   }
   t
+}
+
+// Whether the place `l` is a widened function `let` typed `t`, written from another function
+// than the one that declares it.
+function asgWritesWideCell(l: i32, t: i32): boolean {
+  const r = parenPeelIx(l)
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return false }
+  const bd = identDeclOf(r)
+  bd >= 0 && fnLetReadTyOf(bd) == t && cwUseInOtherFrame(r)
 }

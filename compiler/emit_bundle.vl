@@ -1,0 +1,237 @@
+// The bundle (D14841): a lambda a hole parameter calls at two or more signatures is handed as one
+// anonymous record holding a closure per signature, field `c<k>` the closure at the `k`th. Mono
+// decides a bundle and notes it here, by the instance parameter's annotation node; the emitter
+// asks it at the delivery and at each call through the parameter.
+import { FuncDecl, Ident, Param, nodeAt } from "./ast"
+import { widenLitTy } from "./check_relate_core"
+import { T, TyFunc, tyAt, tySame } from "./check_types"
+import { nodeTyIxOf } from "./check_node_tys"
+import { nodeTyAt, parentBindingFrameOf } from "./emit_capture_frames"
+import { unwrapParen } from "./emit_base"
+import { declaredSlotOf } from "./emit_struct_order"
+import { fnStmts, fnStmtsPosOf } from "./emit_state"
+import { identDeclOf } from "./symbols"
+
+// The signatures each bundle parameter's annotation node holds.
+let bundleParamSigs: {[i32]: i32[]} = Map()
+// Each bundle record type a closure's parameter takes, and its signatures.
+let bundleTys: i32[] = []
+let bundleTySigs: i32[][] = []
+// The record member each argument that hands a bundle to a one-closure parameter takes.
+let bundleHandMembers: {[i32]: i32} = Map()
+// The parameter each function instance returns whole as its bundle's record.
+let bundleRetParams: {[i32]: i32} = Map()
+
+export function bundleReset() {
+  bundleParamSigs = Map()
+  bundleHandMembers = Map()
+  bundleRetParams = Map()
+  bundleTys = []
+  bundleTySigs = []
+  bundleRecs = []
+  bundleRecSigs = []
+  0
+}
+
+// Notes that record type `t`, a closure's parameter type, is the bundle of `sigs`.
+export function bundleTyNote(t: i32, sigs: i32[]) {
+  for b in bundleTys {
+    if b == t { return 0 }
+  }
+  bundleTys.push(t)
+  bundleTySigs.push(sigs)
+  0
+}
+
+// Each record type mono built a bundle parameter's record at, and its signatures.
+let bundleRecs: i32[] = []
+let bundleRecSigs: i32[][] = []
+
+// Notes that mono built record type `t` for a bundle of `sigs`.
+export function bundleRecordNote(t: i32, sigs: i32[]) {
+  for b in bundleRecs {
+    if b == t { return 0 }
+  }
+  bundleRecs.push(t)
+  bundleRecSigs.push(sigs)
+  0
+}
+
+// The record type mono built for a bundle of `sigs`, in that order, or -1.
+export function bundleRecordOfSigs(sigs: i32[]): i32 {
+  let k = 0
+  while k < bundleRecs.length && k < bundleRecSigs.length {
+    const have = bundleRecSigs[k]
+    let same = have.length == sigs.length
+    let j = 0
+    while same && j < sigs.length {
+      if !tySame(have[j], sigs[j]) { same = false }
+      j = j + 1
+    }
+    if same { return bundleRecs[k] }
+    k = k + 1
+  }
+  -1
+}
+
+// Each record type noted as a closure parameter's bundle.
+export function bundleTysNoted(): i32[] { bundleTys }
+
+// The signatures bundle record type `t` holds; none for any other type.
+export function bundleTySigsOf(t: i32): i32[] {
+  let k = 0
+  while k < bundleTys.length {
+    if bundleTys[k] == t { return bundleTySigs[k] }
+    k = k + 1
+  }
+  []
+}
+
+// The signatures of a closure's argument `i` the call through the parameter read `callFn` in
+// function `fnIx` takes as a bundle, with its record type in `tyOut[0]`; none for any other.
+export function bundleCallArgSigs(
+  callFn: i32,
+  fnIx: i32,
+  i: i32,
+  tyOut: i32[],
+): i32[] {
+  const none: i32[] = []
+  if bundleTys.length == 0 { return none }
+  const cfx = unwrapParen(callFn)
+  if cfx < 0 || fnIx < 0 { return none }
+  const r = nodeAt(cfx)
+  const d = identDeclOf(cfx)
+  const fn = nodeAt(fnIx)
+  if !(r is Ident) || d < 0 || !(nodeAt(d) is Param) || !(fn is FuncDecl) {
+    return none
+  }
+  for par in fn.fnParams {
+    const p = nodeAt(par)
+    if p is Param {
+      if p.parName == r.identName && p.parType >= 0 {
+        const f = tyAt(nodeTyIxOf(p.parType))
+        if !(f is TyFunc) || i >= f.fnParamTypes.length { return none }
+        const at = f.fnParamTypes[i]
+        let k = 0
+        while k < bundleTys.length {
+          if bundleTys[k] == at {
+            tyOut[0] = at
+            return bundleTySigs[k]
+          }
+          k = k + 1
+        }
+        return none
+      }
+    }
+  }
+  none
+}
+
+// Notes that the instance parameter annotated by node `parType` holds a bundle of `sigs`.
+export function bundleParamNote(parType: i32, sigs: i32[]) {
+  if parType >= 0 { bundleParamSigs[parType] = sigs }
+  0
+}
+
+// Notes that argument node `arg` hands its bundle's member `m` (-1 for none that fits).
+export function bundleHandMemberNote(arg: i32, m: i32) {
+  if arg >= 0 { bundleHandMembers[arg] = m }
+  0
+}
+
+// The member argument `arg` hands of the bundle it reads: its index, -1 where the record holds
+// none at the parameter's type, -2 where none is noted.
+export function bundleHandMemberOf(arg: i32): i32 {
+  bundleHandMembers.get(arg) ?? -2
+}
+
+// Notes that function instance `fn` returns its parameter `i`, a bundle, as its record.
+export function bundleRetParamNote(fn: i32, i: i32) {
+  if fn >= 0 { bundleRetParams[fn] = i }
+  0
+}
+
+// The parameter function instance `fn` returns whole as its bundle's record, or -1.
+export function bundleRetParamOf(fn: i32): i32 { bundleRetParams.get(fn) ?? -1 }
+
+// The signatures bundle parameter `par` holds; none for any other parameter.
+export function bundleSigsOfParam(par: i32): i32[] {
+  const p = nodeAt(par)
+  if !(p is Param) || p.parType < 0 { return [] }
+  bundleParamSigs.get(p.parType) ?? []
+}
+
+// The bundle parameter of function `fnIx` the read `x` names, or -1 where it names none. The
+// read is the template's; the parameter is matched by name in the instance, or, for a read a
+// nested function captures, in the frame that binds it.
+export function bundleParamOfRead(x: i32, fnIx: i32): i32 {
+  const cfx = unwrapParen(x)
+  if cfx < 0 || fnIx < 0 || declaredSlotOf(cfx) >= 0 { return -1 }
+  const r = nodeAt(cfx)
+  const d = identDeclOf(cfx)
+  const fn = nodeAt(fnIx)
+  if !(r is Ident) || d < 0 || !(nodeAt(d) is Param) || !(fn is FuncDecl) {
+    return -1
+  }
+  const own = bundleParamNamed(fnIx, r.identName)
+  if own != -2 { return own }
+  const bf = parentBindingFrameOf(fnStmtsPosOf(fnIx), r.identName)
+  if bf < 0 || bf >= fnStmts.length { return -1 }
+  const at = bundleParamNamed(fnStmts[bf], r.identName)
+  if at >= 0 { at } else { -1 }
+}
+
+// The bundle parameter of function `fnIx` named `nm`; -1 where that parameter holds no bundle,
+// -2 where `fnIx` has no parameter of that name.
+function bundleParamNamed(fnIx: i32, nm: string): i32 {
+  const fn = nodeAt(fnIx)
+  if !(fn is FuncDecl) { return -2 }
+  for par in fn.fnParams {
+    const p = nodeAt(par)
+    if p is Param {
+      if p.parName == nm {
+        return if bundleSigsOfParam(par).length > 0 { par } else { -1 }
+      }
+    }
+  }
+  0 - 2
+}
+
+// The field index `k` the call through bundle parameter `par` with arguments `args`, in function
+// `fnIx`, reads: the first signature taking the arguments' types, or -1 for none.
+export function bundleFieldOfCall(par: i32, args: i32[], fnIx: i32): i32 {
+  const sigs = bundleSigsOfParam(par)
+  let k = 0
+  while k < sigs.length {
+    const f = tyAt(sigs[k])
+    if f is TyFunc {
+      if f.fnParamTypes.length == args.length {
+        let ok = true
+        let j = 0
+        while j < args.length {
+          const at = nodeTyAt(args[j], fnIx)
+          if (
+            at < 0
+            || at >= T.tys.length
+            || !tySame(widenLitTy(at), f.fnParamTypes[j])
+          ) {
+            ok = false
+          }
+          j = j + 1
+        }
+        if ok { return k }
+      }
+    }
+    k = k + 1
+  }
+  -1
+}
+
+// The signature the call `c` through a bundle parameter reads in function `fnIx`, or -1 where
+// its callee holds no bundle or no signature takes its arguments.
+export function bundleCallSig(callFn: i32, args: i32[], fnIx: i32): i32 {
+  const par = bundleParamOfRead(callFn, fnIx)
+  if par < 0 { return -1 }
+  const k = bundleFieldOfCall(par, args, fnIx)
+  if k < 0 { -1 } else { bundleSigsOfParam(par)[k] }
+}

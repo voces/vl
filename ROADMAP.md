@@ -42,10 +42,9 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 1. **The architecture migration**, in [target §3](docs/internals/architecture-target-2026-10.md)
    order. The forward items after the latest landings are in §3.1, "Open after #5115". Status is in
    [the plan](docs/internals/architecture-refactor-plan.md).
-2. **Clause-1 defects:** D13960 (a wider record list spread into a narrower rest parameter is
-   check-clean invalid wasm). For the rest, run `ls.vl -- --status open` and grep for `clause 1`.
+2. **Clause-1 defects:** run `ls.vl -- --status open` and grep for `clause 1`.
 3. **Initialization order** (DECISIONS.md, "Initialization order"). Make init-before-read a compile
-   error and reorder initializers. D14361 is open beside it.
+   error and reorder initializers.
 4. **Generated-code performance:**
    - print imports only when reachable;
    - B-range (D4000);
@@ -77,6 +76,25 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   - separate compilation and wasm linking;
   - WASI;
   - in-language GC knobs.
+
+## Backlogged: ruled, waiting to be built
+
+- **Flow-sensitive reads of a `let`** (owner ruling B, 2026-11-02). A read of a `let` takes
+  the type of the most recent write in scope, not the join of every write. Witnesses: D2660
+  (a read before a filling write, delivered at `null`) and its function-value twin, a
+  re-pointed `let` read into a list. Both rows wait on this item. DECISIONS.md §"A read of a
+  `let` takes its most recent write's type".
+- **An inferred result built at its destination** (owner ruling B, 2026-11-02). When one use
+  delivers an un-annotated function's result into a wider record (or a list of them), the
+  result is built at the destination and the function's other uses read it at that storage.
+  The value must not be writable, between the delivery and a use, in a way that breaks the
+  wider or the narrower type. Witnesses: D14385 and D14890. DECISIONS.md §"An inferred result
+  one use delivers wider is built at the destination".
+- **Exact trap kinds through `-O`/`-O3`** (owner ruling (c), 2026-11-02). An optimizer that
+  proves a trap always fires folds it into `unreachable`, and the banner can only list the
+  causes. Routing each trap kind through a named function kept out of inlining (wasm-opt
+  `--no-inline`), or reading a source-map row at the trap, would name the one that fired.
+  DECISIONS.md §"An optimized build's `unreachable` banner names what it may stand for".
 
 ## Consumers
 

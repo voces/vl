@@ -4792,7 +4792,13 @@ fn trap_explanation(trap: Trap) -> Option<&'static str> {
         // for exactly this reason, so reaching here means a genuinely oversized
         // allocation rather than accumulated garbage.
         Trap::AllocationTooLarge => "an allocation larger than the GC heap can ever hold.",
-        Trap::UnreachableCodeReached => "an `unreachable` instruction — a compiler-emitted trap.",
+        // An optimizer that proves a trap always fires may fold it into `unreachable`, so an
+        // `-O`/`-O3` build reports that trap's cause here too (D3723).
+        Trap::UnreachableCodeReached => {
+            "an `unreachable` instruction — a compiler-emitted trap.\n      \
+             An -O/-O3 build also stops this way where the optimizer proved another trap \
+             always fires, such as an out-of-range index or a failed `as`."
+        }
         _ => return None,
     })
 }

@@ -110,7 +110,9 @@ import {
   WhileStmt,
   extGNames,
   extGTys,
+  isExprKid,
   nodeAt,
+  nodeChildren,
 } from "./ast"
 import { elabPrepare, emitProgram, sidKeyedTablesReset } from "./emit_sections"
 import { elabErrorCount, elabErrorsMuteSet } from "./emit_elab"
@@ -140,6 +142,7 @@ import {
   bl8TypeIdx,
   emitErr,
   emitErrAt,
+  emitErrCursorAt,
   emitFnSpanEnd,
   emitFnSpanKind,
   emitFnSpanNode,
@@ -255,7 +258,6 @@ import {
   mkObjLit,
   mkProgram,
   mkStr,
-  nodeChildren,
   nodeToks,
   ovCandText,
   ovCandsText,
@@ -351,6 +353,7 @@ import {
 // index, so a reused index would read the previous program's answer), and three of
 // the eight in-place name writers (the module merge's renames below).
 import {
+  nodeSrc,
   sidArrGet,
   sidArrPut,
   sidLookup,
@@ -3032,7 +3035,39 @@ export function diagCol(i: i32): i32 {
 // The token index the emit-failure diagnostic anchors at (its function's decl),
 // or -1 for a positionless (module-level) failure — the `emitErrAt` node resolved
 // through `nodeToks`, mirroring a type diag's node→token resolution.
-function emitErrTokIx(): i32 { declAnchorTokIx(emitErrAt) }
+function emitErrTokIx(): i32 {
+  const t = declAnchorTokIx(emitErrAt)
+  if t < 0 || t != P.pos - 1 { return t }
+  // A node minted after parsing holds the parser's final cursor until it adopts an anchor; that
+  // token names the end of the last module, so its source node answers, else its leading
+  // child's, and only then the cursor at the failure (D15157).
+  const m = mintedAnchorTok(emitErrAt, 8)
+  if m >= 0 { return m }
+  if emitErrCursorAt != emitErrAt {
+    const c = declAnchorTokIx(emitErrCursorAt)
+    if c >= 0 { return c }
+  }
+  t
+}
+
+// The token a node minted after parsing stands for: its own anchor when it took one, else its
+// recorded source node's, else that of its first child in source order that has one (a member
+// read's object, a call's callee); -1 past `depth` hops or where none has one.
+function mintedAnchorTok(ix: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth <= 0 { return -1 }
+  const t = declAnchorTokIx(ix)
+  if t >= 0 && t != P.pos - 1 { return t }
+  const src = nodeSrc[ix] ?? -1
+  if src >= 0 && src != ix {
+    const s = mintedAnchorTok(src, depth - 1)
+    if s >= 0 { return s }
+  }
+  for k in nodeChildren(ix) {
+    const c = mintedAnchorTok(k, depth - 1)
+    if c >= 0 { return c }
+  }
+  -1
+}
 
 // The token an emit-side diagnostic anchors arena node `nodeIx` at, or -1. Prefers
 // the declaring-name token over `nodeToks`' closing-brace anchor for a `FuncDecl`,
@@ -9040,7 +9075,7 @@ function modRwExpr(ix: i32): i32 {
       return modRwExpr(n.spdArg)
     }
     IsExpr => {
-      modRwExpr(n.isObj)
+      modRwExpr(isExprKid(n))
       return modRwIsType(ix)
     }
     AsExpr => {

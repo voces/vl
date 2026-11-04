@@ -4,6 +4,7 @@
 // (D14430, `elabMintFacts`). Scopes are rows by instance key; facts are rows by scope and call
 // node, and both are cleared before the elaboration notes them.
 import { i32ToStr } from "./ast"
+import { i32ListHas } from "./listutil"
 
 // The check's generation: a restart re-mints every type, so no row of an earlier one is read.
 let mintGen = 0
@@ -31,8 +32,24 @@ let mintFactRs: i32[][] = []
 let mintFactPrev: i32[] = []
 
 // Forgets every row; once per check, and again on each restart of it.
+// The nested declarations the elaboration built once per instance of their encloser, so a read
+// in their body is that instance's (nested-per-encloser-2026-11.md).
+let mintNestedPerEncl: {[i32]: boolean} = Map()
+
+// Records that nested declaration `d` is built per encloser instance.
+export function mintNestedPerEnclNote(d: i32) {
+  mintNestedPerEncl[d] = true
+  0
+}
+
+// Whether nested declaration `d` is built per encloser instance.
+export function mintNestedPerEnclOf(d: i32): boolean {
+  mintNestedPerEncl[d] ?? false
+}
+
 export function mintReset() {
   mintGen = mintGen + 1
+  mintNestedPerEncl = Map()
   mintScopeFn = []
   mintScopeKey = []
   mintScopeNames = []
@@ -41,6 +58,9 @@ export function mintReset() {
   mintScopeOf = Map()
   mintScopeFacts = []
   mintFactScope = []
+  mintCloAt = []
+  mintCloTy = []
+  mintCloSet = []
   mintFactCall = []
   mintFactSet = []
   mintFactKey = []
@@ -49,9 +69,34 @@ export function mintReset() {
   mintFactPrev = []
   mintPartial = []
   mintParamSets = Map()
+  mintSeedDecl = []
+  mintSeedPar = []
+  mintSeedHeld = []
+  mintSeedWide = []
+  mintSeedBind = []
   mintParamFwds = Map()
+  mintRetParams = Map()
+  mintAliases = []
   0
 }
+
+// Each declared function → the positions of the parameters it hands back: every value it returns
+// is a read of that parameter, at an instance binding the parameter to a function.
+let mintRetParams: {[i32]: i32[]} = Map()
+
+// Records that declared function `fn` hands back its parameter `i`; 1 when the fact is new.
+export function mintRetNote(fn: i32, i: i32): i32 {
+  const at = mintRetParams[fn] ?? []
+  for j in at {
+    if j == i { return 0 }
+  }
+  at.push(i)
+  mintRetParams[fn] = at
+  1
+}
+
+// The parameter positions declared function `fn` hands back, as `mintRetNote` noted them.
+export function mintRetParamsOf(fn: i32): i32[] { mintRetParams[fn] ?? [] }
 
 // Each function's parameter, keyed `decl|index`, → the parameters it is handed on to as
 // `[decl, index, ...]`.
@@ -83,9 +128,153 @@ export function mintParamSetNote(decl: i32, i: i32, s: i32) {
   0
 }
 
+// The sets the calls through parameter `i` of `decl` go through, as `mintParamSetNote` noted them.
+export function mintParamSetsOf(decl: i32, i: i32): i32[] {
+  mintParamSets[i32ToStr(decl) + "|" + i32ToStr(i)] ?? []
+}
+
+// One row per instance where parameter `mintSeedPar` of `mintSeedDecl`, holding set
+// `mintSeedHeld`, initialises written binding `mintSeedBind`, which holds set `mintSeedWide` there.
+let mintSeedDecl: i32[] = []
+let mintSeedPar: i32[] = []
+let mintSeedHeld: i32[] = []
+let mintSeedWide: i32[] = []
+let mintSeedBind: i32[] = []
+
+// Records that parameter `i` of `decl`, holding set `s`, initialises written binding `d`, which
+// holds set `w` in the same instance.
+export function mintSeedNote(decl: i32, i: i32, s: i32, d: i32, w: i32) {
+  let r = 0
+  while r < mintSeedDecl.length {
+    if (
+      mintSeedDecl[r] == decl
+      && mintSeedPar[r] == i
+      && mintSeedHeld[r] == s
+      && mintSeedBind[r] == d
+      && mintSeedWide[r] == w
+    ) {
+      return 0
+    }
+    r = r + 1
+  }
+  mintSeedDecl.push(decl)
+  mintSeedPar.push(i)
+  mintSeedHeld.push(s)
+  mintSeedBind.push(d)
+  mintSeedWide.push(w)
+  0
+}
+
+// The sets of the bindings parameter `i` of `decl` initialises while it holds set `s`.
+export function mintSeedWideOfParam(decl: i32, i: i32, s: i32): i32[] {
+  const out: i32[] = []
+  let r = 0
+  while r < mintSeedDecl.length {
+    if (
+      mintSeedDecl[r] == decl
+      && mintSeedPar[r] == i
+      && mintSeedHeld[r] == s
+      && !i32ListHas(out, mintSeedWide[r])
+    ) {
+      out.push(mintSeedWide[r])
+    }
+    r = r + 1
+  }
+  out
+}
+
+// The sets parameter-initialised written binding `d` holds.
+export function mintSeedWideOfBind(d: i32): i32[] {
+  const out: i32[] = []
+  let r = 0
+  while r < mintSeedBind.length {
+    if mintSeedBind[r] == d && !i32ListHas(out, mintSeedWide[r]) {
+      out.push(mintSeedWide[r])
+    }
+    r = r + 1
+  }
+  out
+}
+
+// The parameter-initialised written bindings that hold set `w`.
+export function mintSeedBindsOf(w: i32): i32[] {
+  const out: i32[] = []
+  let r = 0
+  while r < mintSeedWide.length {
+    if mintSeedWide[r] == w && !i32ListHas(out, mintSeedBind[r]) {
+      out.push(mintSeedBind[r])
+    }
+    r = r + 1
+  }
+  out
+}
+
+// The sets the parameters initialising a binding of set `w` hold there.
+export function mintSeedHeldOf(w: i32): i32[] {
+  const out: i32[] = []
+  let r = 0
+  while r < mintSeedWide.length {
+    if mintSeedWide[r] == w && !i32ListHas(out, mintSeedHeld[r]) {
+      out.push(mintSeedHeld[r])
+    }
+    r = r + 1
+  }
+  out
+}
+
+// The written bindings the elaboration reads as the parameter they hold.
+let mintAliases: i32[] = []
+
+// Records that the elaboration reads written binding `d` as the parameter it holds.
+export function mintAliasNote(d: i32) {
+  for x in mintAliases {
+    if x == d { return 0 }
+  }
+  mintAliases.push(d)
+  0
+}
+
+// Whether `mintAliasNote` recorded binding `d`.
+export function mintAliasHas(d: i32): boolean {
+  for x in mintAliases {
+    if x == d { return true }
+  }
+  false
+}
+
 // The sets some instance calls through a parameter that another instance of its function binds
 // to no set or to another set.
 let mintPartial: i32[] = []
+
+// Parameter reads an instance hands to a named function's parameter of a closed function type
+// while binding them to a set of one named function: the read, that type and the set. A read two
+// instances bind to different sets has set -2.
+let mintCloAt: i32[] = []
+let mintCloTy: i32[] = []
+let mintCloSet: i32[] = []
+
+// Notes that read `ix` is delivered to closed function type `ty` as set `s`'s one member; false
+// once an instance delivered it as another set or at another type.
+export function mintCloDeliveryNote(ix: i32, ty: i32, s: i32): boolean {
+  let i = 0
+  while i < mintCloAt.length {
+    if mintCloAt[i] == ix {
+      if mintCloSet[i] != s || mintCloTy[i] != ty { mintCloSet[i] = -2 }
+      return mintCloSet[i] >= 0
+    }
+    i = i + 1
+  }
+  mintCloAt.push(ix)
+  mintCloTy.push(ty)
+  mintCloSet.push(s)
+  true
+}
+
+// The rows `mintCloDeliveryNote` holds, by index: the read, its type and its set (-2 apart).
+export function mintCloRows(): i32 { mintCloAt.length }
+export function mintCloAtOf(r: i32): i32 { mintCloAt[r] }
+export function mintCloTyOf(r: i32): i32 { mintCloTy[r] }
+export function mintCloSetOf(r: i32): i32 { mintCloSet[r] }
 
 export function mintSetPartialNote(s: i32) {
   if s >= 0 && !mintSetPartial(s) { mintPartial.push(s) }

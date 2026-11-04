@@ -52,6 +52,8 @@ type Case = {
   want: Fix[];
   show: string;
   out: string;
+  // Also refused through a generic `T[]` the call pins, which must print the same fixes (D3402).
+  pin?: boolean;
 };
 
 const nnC = "const e = w[0]\nif e != null { print(e.n) }";
@@ -73,6 +75,7 @@ const CASES: Case[] = [
     want: ["readonly", "map"],
     show: "print(w[1] / 4.0)",
     out: "0.5",
+    pin: true,
   },
   {
     dst: "i64[]",
@@ -217,6 +220,10 @@ const POSITIONS = [
     `function take(w: ${dst}) {\n${show}\n}\ntake(${val})\n`,
 ];
 
+// The argument position reached through a generic list parameter, for a case marked `pin`.
+const PIN_POSITION = (dst: string, val: string, show: string) =>
+  `function take(w: ${dst}) {\n${show}\n}\nfunction via<T>(v: T[]) { take(v) }\nvia(${val})\n`;
+
 const plain = (val: string) => val.replaceAll("@", "");
 const mapped = (val: string, f: string) =>
   val.includes("@")
@@ -319,7 +326,12 @@ Deno.test({
     const dir = await Deno.makeTempDir({ prefix: "vl_widen_hint_" });
     try {
       const at = CASES.flatMap((c, ci) =>
-        POSITIONS.map((pos, pi) => ({ c, ci, pos, pi }))
+        (c.pin ? [...POSITIONS, PIN_POSITION] : POSITIONS).map((pos, pi) => ({
+          c,
+          ci,
+          pos,
+          pi,
+        }))
       );
       const files: string[] = [];
       for (const { c, ci, pos, pi } of at) {

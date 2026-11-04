@@ -2,12 +2,17 @@
 // checked, with the object-literal returns widened to the record they adopt.
 
 import { declTyOf } from "./check_nar_store"
+import { parenPeelIx } from "./check_places"
 import { declDepthOf } from "./check_scopes"
 import {
+  ArrayLit,
+  Block,
   FieldInit,
   FuncDecl,
+  IfStmt,
   NumLit,
   ObjLit,
+  P,
   Paren,
   i32ToStr,
   nodeAt,
@@ -29,12 +34,13 @@ import {
   inferSawErrSet,
 } from "./check_core_state"
 import { inferQuiet, quietDepth } from "./check_cursor"
-import { stampsStand } from "./check_elab_cap"
+import { elabFnSetsWiden, stampsStand } from "./check_elab_cap"
 import { bareBraceDeliver, noteRetJoinValues } from "./check_demands"
 import { paramSolveProbe } from "./check_exp_obs"
 import { cbExpectedRetFor, lambdaBodyTail } from "./check_expected"
 import {
   adoptLitAt,
+  constrainEmptyExpr,
   inferNoBasisErr,
   nullableRetName,
   openParamJoinOf,
@@ -55,7 +61,7 @@ import {
 } from "./check_leaf_steps"
 import { a20RetWalk } from "./check_nj_gate"
 import { gRootStmts } from "./check_nj_join"
-import { nodeTyIx, nodeTyOf, nodeTySet } from "./check_node_tys"
+import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import { numLitAdoptDeep } from "./check_num_adopt"
 import { cexLitPeel, isF32AdoptingLitExpr } from "./check_num_lits"
 import { isClassifiableRetName } from "./check_redundant_ret"
@@ -153,6 +159,7 @@ import {
   TyArray,
   TyFunc,
   TyLit,
+  TyMap,
   TyNullable,
   TyObj,
   TyUnion,
@@ -1249,6 +1256,11 @@ export function finishInferredReturn(
         inferred = expRet
         objRetAdopted = true
       }
+      // A fresh `Map()` tail is built at the expected result's map arm, as at an annotated return.
+      const emTail = lambdaBodyTail(n.fnBody)
+      if emTail >= 0 && tyAt(inferred) is TyMap && unresolvedHole(inferred) {
+        constrainEmptyExpr(emTail, inferred, expRet)
+      }
       inferred = inferRetAdoptNiche(n, inferred, expRet)
       // The struct-element-list result: a lambda body array literal's element structs
       // coerce field-wise into the expected shape and adopt it — `assignableExpr`'s
@@ -1326,11 +1338,46 @@ export function adoptRetLits(n: FuncDecl, ret: i32) {
   a20RetWalk(n.fnBody, true, vals)
   for v in vals {
     adoptLitAt(v, ret)
+    // A literal of the result's shape is built at the result where the result joins other
+    // returns' functions into its places, so every returned literal shares one rep (D15209).
+    const lv = parenPeelIx(v)
+    const ln = if lv >= 0 && lv < P.nodes.length { nodeAt(lv) } else { null }
+    if (
+      (ln is ArrayLit || ln is ObjLit)
+      && elabFnSetsWiden(nodeTyIxOf(lv), ret, 0)
+    ) {
+      recordRepTyAdopt(v, ret, 6)
+    }
     numLitAdoptDeep(v, ret, 6)
     stampNullReturn(v, ret)
     // A returned value is delivered to the inferred result, as a `let`'s initializer is to its
     // binding: a returned join of `const` literals lowers as the widened result's strings (D14800).
     if ret >= 0 { recordCtxTy(v, ret) }
+  }
+  // A value `if` at the tail is delivered to the result as a whole, as its arms are.
+  if ret >= 0 {
+    const ifs: i32[] = []
+    tailValueIfs(n.fnBody, ifs)
+    for f in ifs { recordCtxTy(f, ret) }
+  }
+  0
+}
+
+// Pushes onto `out` each value `if` the block at `ix` ends in, its arms' own tail ones included.
+function tailValueIfs(ix: i32, out: i32[]) {
+  let cur = ix
+  while cur >= 0 {
+    const at = cur
+    const n = nodeAt(at)
+    cur = -1
+    if n is Block {
+      if n.blkStmts.length > 0 { cur = n.blkStmts[n.blkStmts.length - 1] }
+    } else if n is IfStmt {
+      const t = nodeTyIxOf(at)
+      if t >= 0 && t != TY_VOID { out.push(at) }
+      tailValueIfs(n.ifThen, out)
+      cur = n.ifElse
+    }
   }
   0
 }

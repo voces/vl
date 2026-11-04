@@ -8,6 +8,7 @@
 import {
   BinExpr,
   Block,
+  BoolLit,
   Call,
   ForIn,
   ForRange,
@@ -17,16 +18,23 @@ import {
   MatchExpr,
   Member,
   Node,
+  NullLit,
+  NumLit,
   P,
   Param,
   Paren,
   RetStmt,
+  Spread,
+  StrLit,
   arenaNoteEdit,
   declNameTokOf,
+  hasNamedArgs,
   i32ToStr,
   mkTypeRef,
   nodeAt,
   nodeChildren,
+  orderArgsByParamNames,
+  paramDefaultOf,
   setAnnTs,
   tsToName,
   ufcsModOfNode,
@@ -35,13 +43,18 @@ import { expInfPinLets } from "./check_state"
 import { pinHint, pinHintDrop, pinHintReport } from "./check_pin_hints"
 import { nodeStartTok } from "./fmt_util"
 import { i32ListHas } from "./listutil"
+import { identDeclOf } from "./symbols"
 import { strContains } from "./strutil"
 import { checkRestart, fvaBuiltReset } from "./check_core_state"
 import { ovUnpinnedReport, recAdForcedReport } from "./check_emit_queries"
 import { checkProgramPass } from "./check_program"
-import { callBindAdoptReps } from "./check_bind_adopt"
+import {
+  callBindAdoptReps,
+  recArmLitsAdopt,
+  recListLitsBuildLate,
+} from "./check_bind_adopt"
 import { luTs } from "./check_annot_resolve"
-import { tErr } from "./check_relate_core"
+import { holeSlotLateReset, holeSlotLateRun, tErr } from "./check_relate_core"
 import { fnTagDecide } from "./check_fn_tag"
 import { fnTagEtaAgain, fnTagEtaReset, fnTyFactsReset } from "./check_elab_cap"
 import { pgrRefusals } from "./check_poly_growth"
@@ -78,7 +91,11 @@ import {
   recAdPinDecl,
   recAdRaising,
   recAdReset,
+  recAdSetLit,
+  recAdSetLitOk,
+  recAdSetLitTy,
 } from "./check_rec_adopt_rows"
+import { adoptLitAt } from "./check_fit_rules"
 import { recBindDeclOf } from "./check_record_origins"
 import {
   PinSolver,
@@ -149,7 +166,9 @@ function checkProgramResumed(rootIx: i32) {
   lbiReset()
   recAdReset()
   wsReset()
+  holeSlotLateReset()
   checkProgramPass(rootIx)
+  holeSlotLateRun()
   pinSolve()
   pinRun("expParam", rootIx)
   pinRun("width", rootIx)
@@ -157,9 +176,12 @@ function checkProgramResumed(rootIx: i32) {
   // A rewrite still pending after the last pass quieted a refusal nothing will apply.
   if wsDecline() { checkProgramAgain(rootIx) }
   pinReport()
+  if P.diags.length == 0 && T.diags.length == 0 { namedCallsPositional(rootIx) }
   fnTagDecide(rootIx)
   recordClosedHoles()
+  recArmLitsAdopt()
   callBindAdoptReps()
+  recListLitsBuildLate()
   pinDeepIs(rootIx)
   // Every body is typed now, so no summary memoised during the walk is what a later ask answers.
   weMemoDrop()
@@ -169,6 +191,71 @@ function checkProgramResumed(rootIx: i32) {
     fnTyFactsReset()
     checkProgramResumed(rootIx)
   }
+}
+
+// The default of parameter node `p` where it is a literal, which every call shares; -1 otherwise.
+function litDefaultOf(p: i32): i32 {
+  const d = paramDefaultOf(p)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const n = nodeAt(d)
+  if n is NumLit || n is StrLit || n is BoolLit || n is NullLit { return d }
+  -1
+}
+
+// Rewrites each named call to a declared function into its positional form where its names bind
+// every parameter but trailing defaults and literal-defaulted gaps, so the passes after the check
+// read argument `i` as parameter `i` (D14970). A named
+// call's arguments run in parameter order, so the rewrite changes no behaviour.
+function namedCallsPositional(rootIx: i32) {
+  const xs: i32[] = [rootIx]
+  while xs.length > 0 {
+    const x = xs.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      namedCallPositional(x)
+      for k in nodeChildren(x) { xs.push(k) }
+    }
+  }
+}
+
+// One call of `namedCallsPositional`: its arguments in parameter order, the trailing parameters
+// it leaves to their defaults left off as a positional call leaves them. A spread, an unbound
+// name, or an omitted parameter before a supplied one is left.
+function namedCallPositional(x: i32) {
+  const n = nodeAt(x)
+  if !(n is Call) || !hasNamedArgs(n.callArgNames) || n.callFn < 0 { return 0 }
+  if !(nodeAt(n.callFn) is Ident) { return 0 }
+  const d = identDeclOf(n.callFn)
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnParams.length < n.callArgs.length { return 0 }
+  const names: string[] = []
+  for q in f.fnParams {
+    const pn = nodeAt(q)
+    if !(pn is Param) { return 0 }
+    names.push(pn.parName)
+  }
+  for a in n.callArgs {
+    if a < 0 || nodeAt(a) is Spread { return 0 }
+  }
+  const ordered = orderArgsByParamNames(names, n.callArgs, n.callArgNames)
+  if ordered.length != names.length { return 0 }
+  // A parameter skipped before a supplied one takes its default where that is a literal, the
+  // node `fillArgDefaults` shares with every call at emit (D14970).
+  let last = ordered.length - 1
+  while last >= 0 && ordered[last] < 0 { last = last - 1 }
+  const supplied: i32[] = []
+  let k = 0
+  while k <= last {
+    let a = ordered[k]
+    if a < 0 { a = litDefaultOf(f.fnParams[k]) }
+    if a < 0 { return 0 }
+    supplied.push(a)
+    k = k + 1
+  }
+  const none: string[] = []
+  n.callArgs = supplied
+  n.callArgNames = none
+  arenaNoteEdit(x)
 }
 
 // The last stage, once per check and only over a program the walk found no error in: a deep
@@ -312,6 +399,12 @@ function pinSolve() {
   lbiSolve()
   lbiDropUnobservable()
   recAdSolve()
+  // Each literal a judged call built, where no other call builds it at another storage.
+  let k = 0
+  while k < recAdSetLit.length {
+    if recAdSetLitOk[k] { adoptLitAt(recAdSetLit[k], recAdSetLitTy[k]) }
+    k = k + 1
+  }
   0
 }
 

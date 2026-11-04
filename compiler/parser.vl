@@ -2054,6 +2054,15 @@ function parsePostfix() {
         },
       )
       advance()
+    } else if k == "BANG" && postfixBangBeforeIs(P.pos) {
+      // `x! is O`: an assertion before `is`, which `!is` would read as negating the test.
+      P.diags.push(
+        {
+          msg: "VL has no postfix `!` (non-null assertion), and `x! is O` is not `x !is O`; write `x is O` to test the type, or `x !is O` to negate the test",
+          at: P.pos,
+        },
+      )
+      advance()
     } else {
       going = false
     }
@@ -2092,6 +2101,18 @@ function parsePostfix() {
     }
   }
   node
+}
+
+// Whether the `!` at token `i` is written against the token before it and apart from an `is`
+// after it (`x! is O`); `x !is O` and `x!is O` are the negated test (D3585).
+function postfixBangBeforeIs(i: i32): boolean {
+  if i < 1 || i + 1 >= P.toks.length || P.toks[i + 1].kind != "IS" {
+    return false
+  }
+  const prev = P.toks[i - 1]
+  const bang = P.toks[i]
+  prev.start + prev.text.length == bang.start
+    && bang.start + 1 < P.toks[i + 1].start
 }
 
 // Whether a `!` directly after an operand, followed by a token of kind `k`, is a postfix
@@ -5171,6 +5192,7 @@ function parseImport(): i32 {
   let sawBrace = false
   let starAt = -1 // a depth-0 `*`: the namespace form
   let bareAt = -1 // a depth-0 name before any `{`: the default-import form
+  let needComma = false // a name-list item ended and no `,` has followed it yet
   while going {
     const k = peekKind()
     if k == "STAR" && depth == 0 && starAt < 0 { starAt = P.pos }
@@ -5207,7 +5229,15 @@ function parseImport(): i32 {
     } else {
       if k == "LBRACE" { depth = depth + 1 }
       if k == "RBRACE" && depth > 0 { depth = depth - 1 }
+      if k == "COMMA" && depth == 1 { needComma = false }
       if k == "IDENT" && depth == 1 {
+        // Two names with no comma between them, refused as a list literal's are (D14882).
+        if needComma {
+          P.diags.push(
+            { msg: "expected `,` but found `" + peekTok().text + "`", at: P.pos },
+          )
+        }
+        needComma = true
         // One name-list item: `a` or `a as b`, the `as` riding as an IDENT. On the rename
         // form, consume through the `as` so the loop's shared `advance()` lands past the alias.
         const nmTok = P.pos

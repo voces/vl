@@ -30,6 +30,8 @@ import {
   tyArrayElemPrimName,
   tyAt,
   tyBearsNull,
+  tyIsNulStringRep,
+  tyNulInnerIsPrim,
   tyPrimNameOf,
 } from "./check_types"
 import { letIsCopyOf, unwrapParen } from "./emit_base"
@@ -130,6 +132,12 @@ export function litAtomCastSlot() { scratchSlot(29, "i32", 0, SCRATCH_BY_CODE) }
 // One slot serves every such call: a dispatched call's arguments hold no call.
 export function fnTagIdSlot() { scratchSlot(43, "i32", 0, SCRATCH_BY_CODE) }
 
+// The number operand of a cross-width union `==`, code 44, keyed by its atom kind (0 i32, 3 i64,
+// 4 f64, 5 f32), staged once before the box's tag is read (D15090).
+export function numCrossEqSlot(kind: i32) {
+  scratchSlot(44, "i32", kind, SCRATCH_BY_KEY)
+}
+
 // The stash of a numeric literal-union scalar `as` operand, code 41, typed by its base's rep.
 export function numLitCastSlot(kind: MfKind) {
   scratchSlot(41, kind, 0, SCRATCH_BY_KIND)
@@ -164,17 +172,23 @@ export function widenTmpSlot(which: i32) {
 }
 
 // The ref-list row of the element the checker typed list literal `arrIx` at, or -1.
-export function spreadLitElemRow(arrIx: i32): i32 {
-  const de = tyStepElem(nodeTyIxOf(arrIx))
+export function spreadLitElemRow(arrIx: i32, fnIx: i32): i32 {
+  const de = tyStepElem(nodeTyAt(arrIx, fnIx))
   if de < 0 { return -1 }
   rlSlotOfTy(de)
 }
 
 // The value atom a scalar list `src`'s element boxes under in union `un`: its own when that is
 // a member, else the member it widens to losslessly (`i32` to `i64` or `f64`, `f32` to `f64`),
-// each element then converted before it is boxed (D2882). -1 when neither.
-export function spreadSrcBoxAtom(src: i32, un: string): i32 {
-  const pn = tyArrayElemPrimName(nodeTyIxOf(src))
+// each element then converted before it is boxed (D2882). Read at instance `fnIx`, where a
+// generic's `T[]` is the list its pin binds (D2968). -1 when neither.
+export function spreadSrcBoxAtom(src: i32, un: string, fnIx: i32): i32 {
+  let pn = tyArrayElemPrimName(nodeTyAt(src, fnIx))
+  // A `(string | null)[]` or `(boolean | null)[]` boxes its values as the plain list does, and
+  // its nulls as null (D15045, D15044).
+  const nm = spreadSrcNulMode(src, fnIx)
+  if pn == "" && nm == SPREAD_NUL_REF { pn = "string" }
+  if pn == "" && nm == SPREAD_NUL_NICHE { pn = "boolean" }
   if pn == "" { return -1 }
   const k = valueAtomKind(pn)
   if k < 0 || k > 5 { return -1 }
@@ -184,10 +198,23 @@ export function spreadSrcBoxAtom(src: i32, un: string): i32 {
   -1
 }
 
+// How spread source `src`, read at instance `fnIx`, holds a null element: not at all, as a null
+// ref (`(string | null)[]`), or as the boolean niche's sentinel (`(boolean | null)[]`).
+export const SPREAD_NUL_NONE = 0
+export const SPREAD_NUL_REF = 1
+export const SPREAD_NUL_NICHE = 2
+
+export function spreadSrcNulMode(src: i32, fnIx: i32): i32 {
+  const se = tyStepElem(nodeTyAt(src, fnIx))
+  if tyIsNulStringRep(se) { return SPREAD_NUL_REF }
+  if tyNulInnerIsPrim(se, "boolean") { return SPREAD_NUL_NICHE }
+  SPREAD_NUL_NONE
+}
+
 // Whether the checker typed spread literal `arrIx` a `string[]` or a `(string | null)[]`,
 // which share one rep.
-export function spreadLitElemIsString(arrIx: i32): boolean {
-  let de = tyStepElem(nodeTyIxOf(arrIx))
+export function spreadLitElemIsString(arrIx: i32, fnIx: i32): boolean {
+  let de = tyStepElem(nodeTyAt(arrIx, fnIx))
   if de < 0 { return false }
   const dt = tyAt(de)
   if dt is TyNullable { de = dt.nInner }
@@ -196,8 +223,8 @@ export function spreadLitElemIsString(arrIx: i32): boolean {
 }
 
 // The scalar element kind the checker typed list literal `arrIx` at, or `null` for any other.
-export function spreadLitScalarElem(arrIx: i32): MfKind | null {
-  const t = nodeTyIxOf(arrIx)
+export function spreadLitScalarElem(arrIx: i32, fnIx: i32): MfKind | null {
+  const t = nodeTyAt(arrIx, fnIx)
   if t < 0 { return null }
   const at = tyAt(t)
   if !(at is TyArray) { return null }

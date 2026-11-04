@@ -21,7 +21,7 @@ import {
   rlElemListRep,
 } from "./emit_list_rep"
 import { i32ListHas } from "./listutil"
-import { variantIndexOf } from "./emit_narrow_slots"
+import { variantIndexOf } from "./emit_local_slots"
 import {
   rlElemInnerSlot,
   rlElemStructRow,
@@ -51,6 +51,7 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   RLK_REF_LIST,
+  RLK_UNION,
   rlElemNullable,
   rlElemTyIx,
   sFieldCount,
@@ -138,6 +139,7 @@ export type EqgElemClass = "none"
   | "string"
   | "list"
   | "struct"
+  | "union"
   | "call"
 export function eqgElemClass(kind: i32, slot: i32): EqgElemClass {
   // The scalar-leaf list reps: i32 (and everything that reps as one), f64, i64, f32, u8.
@@ -163,17 +165,15 @@ export function eqgElemClass(kind: i32, slot: i32): EqgElemClass {
 // loop over it would overwrite the outer one's counter.
 function eqgRefElemClass(slot: i32, seen: i32[]): EqgElemClass {
   if slot < 0 || slot >= rlElemTyIx.length { return "none" }
+  // A union-box element, by the box's tag and then the arm the tag selects.
+  if rlElemKindAt(slot) == RLK_UNION { return "union" }
   // An inner list of any rep compares through its own list core.
   if rlElemListRep(rlElemKindAt(slot)) != null { return "list" }
   if eqgCoreFeOfSlot(slot) >= 0 { return "call" }
   if i32ListHas(seen, slot) { return "none" }
-  // A struct element, field-wise. A nullable element is excluded here rather than by the row
-  // lookup, and the two are not the same test: `(Circle | null)[]` resolves the same row a
-  // `Circle[]` does, so a row-based gate would admit it and the field compare would
-  // `struct.get` through a null.
-  if slot < rlElemNullable.length {
-    if rlElemNullable[slot] == 1 { return "none" }
-  }
+  // A struct element, field-wise; a nullable one (`(Circle | null)[]`, which resolves the row a
+  // `Circle[]` does) compares under `emitEqGStructElem`'s null guard, which runs the field
+  // compare only when neither element is null.
   if eqgElemHasEqRow(slot) {
     seen.push(slot)
     const ok = eqgStructElemFlat(eqgElemEqRow(slot), 0, seen)
@@ -459,7 +459,7 @@ export function leqCoreKindOfAtomKind(k: i32): i32 {
 export function eqgRepComparable(kind: i32, slot: i32, depth: i32): boolean {
   if depth > 32 { return false }
   match eqgElemClass(kind, slot) {
-    "scalar" | "string" | "struct" | "call" => {
+    "scalar" | "string" | "struct" | "union" | "call" => {
       return true
     }
     "list" => {
