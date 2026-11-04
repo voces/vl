@@ -1873,20 +1873,8 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
       && recInferredFnOf(lp) >= 0
       && recInferredFnOf(lp) != fd
     ) {
-      // A leaf whose function cannot itself be built at `dst` leaves the delivery to its converting
-      // copy where one serves (D15216); else the hand-on refuses the two builds, as D14516 pins.
-      if (
-        recCopyConverts(nodeTyIxOf(lp), dst)
-        && !recFnBuildsAt(
-          recInferredFnOf(lp),
-          lp,
-          nodeTyIxOf(lp),
-          dst,
-          REC_STORE_DEPTH,
-        )
-      ) {
-        return false
-      }
+      // Else the hand-on refuses the two builds, as D14516 pins.
+      if recLeafLeavesToCopy(lp, dst) { return false }
       calls.push(lp)
     } else if lp != call && recSolePinArg(lp) >= 0 {
       let x = lp
@@ -1925,6 +1913,27 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
     ci = ci + 1
   }
   true
+}
+
+// Whether value leaf `lp`, a call of another function that cannot itself be built at `dst`, leaves
+// the delivery to its converting copy, where one serves (D15216).
+function recLeafLeavesToCopy(lp: i32, dst: i32): boolean {
+  const lfn = recInferredFnOf(lp)
+  lfn >= 0
+    && recCopyConverts(nodeTyIxOf(lp), dst)
+    && !recFnBuildsAt(lfn, lp, nodeTyIxOf(lp), dst, REC_STORE_DEPTH)
+}
+
+// Whether some value leaf of `fd` is a call of another function that leaves the delivery at `dst`
+// to its converting copy (`recLeafLeavesToCopy`): `fd` relays a result it does not build (D15244).
+function recRelayLeavesToCopy(fd: i32, dst: i32): boolean {
+  const via: i32[] = []
+  for lf in recFnValueOrigins(fd, via) {
+    if lf >= 0 && recInferredFnOf(lf) != fd && recLeafLeavesToCopy(lf, dst) {
+      return true
+    }
+  }
+  false
 }
 
 // Whether inferred function `fd`, called at `call` with result `own`, can be built at `dst`: its call
@@ -2468,7 +2477,7 @@ function recNullWidenedAt(
           !fieldStorageEq(of, at, REC_STORE_DEPTH)
           && !(of == TY_NULL && inner >= 0)
           && !(stored && of == TY_I32 && at == TY_I64)
-          && !(inner < 0 && recNullWidenedAt(of, at, stored, depth - 1))
+          && !recNullWidenedAt(of, at, stored, depth - 1)
         ) {
           return false
         }
@@ -4370,6 +4379,8 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       }
       if recHoleIdentityAt(p, fd, srcTy, dstTy) { return 0 }
       recIdentityLeavesAt(fd, ld)
+      // A relay of a result built elsewhere is converted where it is delivered, not kept at `ld`.
+      if ld >= 0 && recRelayLeavesToCopy(fd, ld) { return 0 }
       return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
     }
     const pa = recPassThroughArg(p)
