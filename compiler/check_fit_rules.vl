@@ -103,6 +103,7 @@ import {
   nodeBoxTyIx,
   nodeCtxTyIx,
   nodeRepTyIx,
+  nodeRepTyIxOf,
   nodeRepUnionIx,
   optReadParts,
   recCopyTyIx,
@@ -2368,7 +2369,7 @@ function recNullWidened(own: i32, dst: i32, stored: boolean): boolean {
 }
 
 // Whether `x` is the object of a field read that is not a method's callee.
-function recFieldRead(x: i32): boolean {
+export function recFieldRead(x: i32): boolean {
   if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_OBJ {
     return false
   }
@@ -3052,16 +3053,23 @@ export function recBuiltReadRefuse(u: i32) {
 // Whether `p` is assigned into an un-annotated binding whose initialiser is a built read at
 // `rep` too: the binding is stored at `rep`, so the write converts nothing (D15124).
 function recAsgIntoBuiltAt(p: i32, rep: i32): boolean {
-  const a = if p < cwIxUp.length { cwIxUp[p] } else { -1 }
+  const b = recAsgBuiltRep(p)
+  b >= 0 && tySame(b, rep)
+}
+
+// The record an un-annotated binding `p` is assigned into is stored at, when its initialiser is
+// a built read; else -1. A record literal assigned there is built at it (D15185).
+export function recAsgBuiltRep(p: i32): i32 {
+  const a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
   const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
   if (!(an is BinExpr) || an.binOp != "=" || cwPeelValue(an.binRight) != p) {
-    return false
+    return -1
   }
   const d = if nodeAt(an.binLeft) is Ident { recBindDeclOf(an.binLeft) } else { -1 }
   const dn = if d >= 0 { nodeAt(d) } else { null }
-  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
   const b = recBuiltReadTy(cwPeelValue(dn.letInit))
-  b >= 0 && tySame(nonNullTy(b), rep)
+  if b >= 0 { nonNullTy(b) } else { -1 }
 }
 
 // Whether `p` is `read ?? { … }` handed to a parameter that takes the rep `rep`; the literal is
@@ -3407,7 +3415,7 @@ function recRepWider(narrow: i32, wide: i32): boolean {
 }
 
 // The function declaration whose body holds node `x`, or -1.
-function recEnclosingFn(x: i32): i32 {
+export function recEnclosingFn(x: i32): i32 {
   let cur = if x >= 0 && x < cwIxParent.length { cwIxParent[x] } else { -1 }
   let guard = 0
   while cur >= 0 && cur < P.nodes.length && guard < 4096 {
@@ -3492,6 +3500,8 @@ function recBuiltReadTyAt(
     // A call handing its argument back reads where that argument does (D14819).
     const ia = recIdentityArgOf(x)
     if ia >= 0 {
+      const lb = recLitArgBuiltTy(cwPeelValue(ia))
+      if lb >= 0 { return lb }
       return recBuiltReadTyAt(cwPeelValue(ia), tbl, false, depth - 1)
     }
     return recBuiltLeavesTy(recInferredFnOf(x), tbl, depth - 1)
@@ -3508,6 +3518,24 @@ function recBuiltReadTyAt(
   const dn = nodeAt(d)
   if b >= 0 || !(dn is LetDecl) { return b }
   recBuiltReadTyAt(cwPeelValue(dn.letInit), tbl, fresh, depth - 1)
+}
+
+// Whether `u` is a call handing back a record literal a pin built at another record (D15185).
+export function recHandsBackPinLit(u: i32): boolean {
+  const p = cwPeelValue(u)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Call) { return false }
+  const ia = recIdentityArgOf(p)
+  ia >= 0 && recLitArgBuiltTy(cwPeelValue(ia)) >= 0
+}
+
+// The record literal `x` is built at when a pin stamped it at another record than its own, else -1:
+// a call handing it back reads it there (D15185).
+function recLitArgBuiltTy(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) { return -1 }
+  const rt = nodeRepTyIxOf(x)
+  const own = nodeTyIxOf(x)
+  if rt < 0 || rt >= T.tys.length || own < 0 || tySame(rt, own) { return -1 }
+  if tyAt(rt) is TyObj { rt } else { -1 }
 }
 
 // The record every value leaf of function `fd` is a built read at (`recBuiltReadTyAt`), else -1.
