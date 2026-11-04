@@ -86,7 +86,7 @@ callee is resolved by declaration (`fnTagArmCalleeOf`, #5990), and in an instanc
 resolve to that body's copy (`monoDeclCopyIn`), not to the template's declaration. An id that
 leaves the instance (returned, stored outside) keeps the set a closure, as today.
 
-**M3 step 2, planned (D15110, per-frame's class F).** Measured: a lambda's elaboration key has no
+**M3 step 2, planned (D15110, per-frame's class F).** Owner from 2026-11-04: lane LWM (session_01Bgv4zZm53LsqFEVpJavQfD), branch `claude/split-dep-LWM-7`; acceptance includes D15436 at two instances with the split plan off. Measured: a lambda's elaboration key has no
 parent, so one `?#L…` key covers every instance of its encloser, and a lambda no instance calls
 gets no key at all. Mono then decides "per instance" with a predicate of its own
 (`monoLamNodeIsTemplateCore`), and the tag decision with another (`ftWithinInstancedFn`). They
