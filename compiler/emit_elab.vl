@@ -4660,7 +4660,16 @@ function elabResScanIdent(g: i32) {
   const n = nodeAt(g)
   if n is Ident {
     const d = identDeclOf(g)
-    if elabResMayHold(d) { elabResReads[d] = (elabResReads.get(d) ?? 0) + 1 }
+    if elabResMayHold(d) {
+      elabResReads[d] = (elabResReads.get(d) ?? 0) + 1
+      if (
+        elabResStoredRead(g)
+        && elabResInLiteral(g)
+        && elabSlotHolderOf(g) >= 0
+      ) {
+        elabResSlotCalls.push(g)
+      }
+    }
     if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
       elabFnReads[d] = (elabFnReads.get(d) ?? 0) + 1
     }
@@ -4702,6 +4711,48 @@ function elabResInLiteral(g: i32): boolean {
   const p = cwIxParent[g]
   const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
   pn is ArrayLit || pn is FieldInit || pn is BinExpr || pn is Call
+}
+
+// Whether read `g` is a value a slot is written: a field or element of a literal, or a map store.
+function elabResStoredRead(g: i32): boolean {
+  if g < 0 || g >= cwIxUpKind.length { return false }
+  const k = cwIxUpKind[g]
+  k == CW_UP_FIELD || k == CW_UP_ELEM || k == CW_UP_ASG_RHS || k == CW_UP_ARG
+}
+
+// The `const` call holder read `v` names, written only by its initialiser; -1 for any other node.
+function elabSlotHolderOf(v: i32): i32 {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const h = identDeclOf(x)
+  const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return -1 }
+  if !elabResCallHolder(h) || (elabResWrites.get(h) ?? []).length > 1 {
+    return -1
+  }
+  h
+}
+
+// The call a slot's written value `v` stands for: itself, or a holder read's initialiser.
+function elabSlotValueCall(v: i32): i32 {
+  const h = elabSlotHolderOf(v)
+  if h < 0 { return parenPeelIx(v) }
+  const hn = nodeAt(h)
+  if hn is LetDecl { parenPeelIx(hn.letInit) } else { -1 }
+}
+
+// Whether holder `h`, stored `stores` times into a slot of record `rec`, is read only by those
+// stores and by calls through it at the record's signatures, all in its own function.
+function elabSlotHolderHolds(h: i32, stores: i32, rec: i32[]): boolean {
+  const through = elabResThrough.get(h) ?? []
+  if through.length + stores != (elabResReads.get(h) ?? 0) { return false }
+  const fd = elabEnclosingFn(h)
+  for t in through {
+    if elabEnclosingFn(t) != fd || elabCallSigMember(t, rec) < 0 {
+      return false
+    }
+  }
+  true
 }
 
 // Whether call `v` can return a record: its callee names a function with no return annotation,
@@ -4851,23 +4902,42 @@ function elabSlotRecordNote(c: i32) {
     if isList && !(ln is ArrayLit) || !isList && !(ln is ObjLit) { return 0 }
   }
   if elabSlotFieldRecord(d, f).length > 0 { return 0 }
-  const rec = elabCallRecord(c, -1, 4)
+  const rec = elabCallRecord(elabSlotValueCall(c), -1, 4)
   if rec.length < 2 { return 0 }
   // Every value the slot is written is a call returning the same record.
   const vals: i32[] = []
   const ats: i32[] = []
   if cwSlotWrittenValues(d, [f], vals, ats) < 0 || vals.length == 0 { return 0 }
+  // A value that reads a holder stands for the holder's call, and the holder is held whole.
+  const linked: i32[] = []
+  const stores: i32[] = []
   for v0 in vals {
-    const v = parenPeelIx(v0)
+    const v = elabSlotValueCall(v0)
     if (
       v < 0
       || v >= P.nodes.length
       || !(nodeAt(v) is Call)
       || !elabInPlainCode(v)
+      || !elabInPlainCode(parenPeelIx(v0))
     ) {
       return 0
     }
     if !elabTyListSame(elabCallRecord(v, -1, 4), rec) { return 0 }
+    const h = elabSlotHolderOf(v0)
+    if h >= 0 {
+      const li = i32ListIndexOf(linked, h)
+      if li >= 0 {
+        stores[li] = stores[li] + 1
+      } else {
+        linked.push(h)
+        stores.push(1)
+      }
+    }
+  }
+  let li = 0
+  while li < linked.length {
+    if !elabSlotHolderHolds(linked[li], stores[li], rec) { return 0 }
+    li = li + 1
   }
   const places: i32[] = []
   const ms: i32[] = []
@@ -4948,7 +5018,13 @@ function elabSlotRecordNote(c: i32) {
   elabSlotRecField.push(f)
   elabSlotRecAt.push(at)
   elabAnyRetRecord = true
-  for v in vals { elabTriplePut(elabResKeeps, parenPeelIx(v), -1, 1) }
+  for v in vals { elabTriplePut(elabResKeeps, elabSlotValueCall(v), -1, 1) }
+  for h in linked {
+    elabTriplePut(elabHolderRecs, h, -1, at)
+    for t in elabResThrough.get(h) ?? [] {
+      elabTriplePut(elabThroughMembers, t, -1, elabCallSigMember(t, rec))
+    }
+  }
   let i = 0
   while i < places.length {
     elabTriplePut(elabPlaceRecs, places[i], -1, at)
