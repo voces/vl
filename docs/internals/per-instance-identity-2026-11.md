@@ -374,10 +374,11 @@ Each slice is graded on every hard control above, with the split plan on and off
    (slice 3, `elabMintHandedNested` / `elabNestNote`), so the fact is a per-key flag the
    elaboration sets where it mints that nested copy (`elabCellLocal`), not a syntactic scan here.
    Reader: `ftInstLeafOk` takes a nested write when the flag holds, in place of refusing every
-   nested write. Deletion: with the cell's id dispatched per instance, `monoBindingAtPin`'s
-   per-binding signature count (`monoDeclPathPins`, `monoDeclLivePathPins`, `monoBindSigFail` at
-   that call) has no binding of a tagged lambda set left to count under a cell; the count goes with
-   its last reader, and the pin-helper baseline is lowered in the same PR. D15434 (the `const`
+   nested write. The early decision runs before the elaboration, so the admission is the late
+   decision's (`fnTagRedecide`). Deletion candidate: `monoBindingAtPin`'s live-pin retry
+   (`monoDeclLivePathPins`, its one caller) and the `monoBindSigFail` behind it, once a census over
+   `tests/` shows no untagged binding reaching two live pins there; `monoDeclPathPins` itself has
+   other callers and stays. The pin-helper baseline is lowered in the PR that deletes them. D15434 (the `const`
    spelling) was clause 1 until 4b-i admitted a `const` seed of a captured `let` as the `let`
    spelling (#6330's `ftConstSeedsCell`); both spellings now run with the split plan on and refuse
    loudly with it off, and both close with 4b-ii.
