@@ -416,7 +416,9 @@ import {
   recAdLanding,
   recDeclaredRowOf,
   recFloatField,
+  recFloatFieldAt,
   recIntToFloat,
+  recNumChanges,
   recNumClass,
   recStorageFieldOf,
   scalarElemWidenServed,
@@ -522,6 +524,7 @@ import {
   CW_OCC_BIND,
   CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_ARM,
   CW_UP_ASG_LHS,
   CW_UP_ASG_RHS,
   CW_UP_CALLEE,
@@ -1773,22 +1776,63 @@ function recLandingOf(srcTy: i32, dstTy: i32): i32 {
 }
 
 // A record a function built, or an element of a list binding, delivered where a field it holds as
-// an integer is a bare float: the value is built at its own row and has no conversion, so it is
-// refused as an existing record is (D3339). True when it refused.
+// an integer is a float (D3339), or a number stored at another width that no converting copy
+// serves (D15247): the value is built at its own row and refused. True when it refused.
 function recFloatBuiltElsewhere(at: i32, srcTy: i32, dstTy: i32): boolean {
   const own = nonNulTyOf(srcTy)
   const dst = nonNulTyOf(dstTy)
-  if !recIntToFloat(own, dst, REC_STORE_DEPTH) { return false }
+  if !recIntToFloat(own, dst, REC_STORE_DEPTH) {
+    if !recNumChanges(own, dst, REC_STORE_DEPTH) || recCopyConverts(own, dst) {
+      return false
+    }
+    recWidthCopyGapErr(at, own, dst)
+    return true
+  }
   shapeAdaptSrcTySet(own)
   shapeAdaptDstTySet(dst)
   shapeAdaptSrcExprSet(at)
   shapeAdaptElemPairSet(false)
   shapeAdaptWidthFieldSet(false)
   shapeAdaptRecStorageSet(true)
-  shapeAdaptRecStorageFieldSet(recFloatField(own, dst))
+  const ff = recFloatFieldAt(own, dst, true)
+  shapeAdaptRecStorageFieldSet(
+    if ff != "" { ff } else { recStorageFieldOf(own, dst) },
+  )
   objShapeAdapterlessErr(at, own, dst)
   shapeAdaptRecStorageSet(false)
   true
+}
+
+// The refusal of a record `own` delivered to `dst`, which stores a number at another width in a
+// nested or nullable field the converting copy does not reach (D15247).
+function recWidthCopyGapErr(at: i32, own: i32, dst: i32) {
+  const fnm = recStorageFieldOf(own, dst)
+  let note = ""
+  const o = tyAt(own)
+  const d = tyAt(dst)
+  if o is TyObj {
+    if d is TyObj {
+      const of = objFieldType(o, fnm)
+      const df = objFieldType(d, fnm)
+      if of >= 0 && df >= 0 {
+        note = " (`" + tyToStr(of) + "` into `" + tyToStr(df) + "`)"
+      }
+    }
+  }
+  tErr(
+    tyToStr(own)
+      + " is not "
+      + tyToStr(dst)
+      + ": they store field `"
+      + fnm
+      + "` differently"
+      + note
+      + ", and the record is also kept at its own type; converting it into "
+      + tyToStr(dst)
+      + " is not yet supported: the converting copy does not reach a nested or nullable field",
+    at,
+  )
+  0
 }
 
 // A function with no declared result called only at `call`, whose every returned value is an
@@ -1855,6 +1899,7 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
       recBuildPush(recHeldDecl(litVia[i]), nodeTyIxOf(lits[i]), dst, false)
     }
     recordRepTyAdopt(lits[i], dst, 6)
+    recLitFieldsDeliver(lits[i], dst, REC_STORE_DEPTH)
     i = i + 1
   }
   // A leaf calling another such function hands the destination on to it (D8143).
@@ -1922,6 +1967,39 @@ function recFnBuildsAt(
     }
   }
   true
+}
+
+// Delivers each field value of record literal `lit`, built at record `dst`, at `dst`'s field, as
+// the literal written at `dst` delivers it: a call or binding holding a record there is built at
+// or copied to that field (D15215). Nested literals are walked to `depth`.
+function recLitFieldsDeliver(lit: i32, dst: i32, depth: i32) {
+  if (
+    depth <= 0
+    || lit < 0
+    || lit >= P.nodes.length
+    || dst < 0
+    || dst >= T.tys.length
+  ) {
+    return 0
+  }
+  const e = nodeAt(parenPeelIx(lit))
+  const d = tyAt(nonNulTyOf(dst))
+  if !(e is ObjLit) || !(d is TyObj) { return 0 }
+  for fx in e.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit {
+      const df = objFieldType(d, f.fiName)
+      const v = parenPeelIx(f.fiValue)
+      if df >= 0 && v >= 0 && v < P.nodes.length {
+        if nodeAt(v) is ObjLit {
+          recLitFieldsDeliver(v, df, depth - 1)
+        } else {
+          recAdoptNote(v, nodeTyIxOf(v), df)
+        }
+      }
+    }
+  }
+  0
 }
 
 // What an inferred function `fd` of result `own` returns when its call sites all land where
@@ -2022,7 +2100,19 @@ function recParamTyName(px: i32): string {
 // Whether record `wide` can be copied into record `own` field for field: each field stored alike,
 // or a `null` field of `own` where `wide` stores the field as nullable.
 function recCopyNarrows(wide: i32, own: i32): boolean {
-  if wide < 0 || own < 0 || wide >= T.tys.length || own >= T.tys.length {
+  recCopyNarrowsAt(wide, own, REC_STORE_DEPTH)
+}
+
+// `recCopyNarrows` with at most `depth` levels of record fields left: a field holding a record at
+// another row is copied into its own row by the level below.
+function recCopyNarrowsAt(wide: i32, own: i32, depth: i32): boolean {
+  if (
+    depth <= 0
+    || wide < 0
+    || own < 0
+    || wide >= T.tys.length
+    || own >= T.tys.length
+  ) {
     return false
   }
   const w = tyAt(wide)
@@ -2039,12 +2129,24 @@ function recCopyNarrows(wide: i32, own: i32): boolean {
       !fieldStorageEq(wf, of, REC_STORE_DEPTH)
       && !(of == TY_NULL && nullableInnerOrNone(wf) >= 0)
       && !recCopyUnwraps(wf, of)
+      && !(recCopyNestable(wf, of)
+        && recCopyNarrowsAt(wf, nonNulTyOf(of), depth - 1))
     ) {
       return false
     }
     i = i + 1
   }
   true
+}
+
+// Whether a copy reads field `sf` as a record of its own to copy into the record `df` holds:
+// `sf` a record, never null, and `df` a record or a nullable one.
+function recCopyNestable(sf: i32, df: i32): boolean {
+  if sf < 0 || df < 0 || sf >= T.tys.length || df >= T.tys.length {
+    return false
+  }
+  const dn = nonNulTyOf(df)
+  tyAt(sf) is TyObj && dn >= 0 && dn < T.tys.length && tyAt(dn) is TyObj
 }
 
 // Whether a field stored as `wf` in the wide row is copied into own field `of` by unwrapping it:
@@ -2055,26 +2157,46 @@ function recCopyUnwraps(wf: i32, of: i32): boolean {
   of != TY_NULL && inner >= 0 && fieldStorageEq(inner, of, REC_STORE_DEPTH)
 }
 
-// The fields of record `own` a copy from wide row `wide` unwraps (`recCopyUnwraps`).
+// The fields of record `own` a copy from wide row `wide` unwraps (`recCopyUnwraps`), as field
+// paths (`j.f`) through the records a copy nests (`recCopyNestable`).
 function recCopyUnwrapNames(wide: i32, own: i32): string[] {
   const out: string[] = []
+  recCopyUnwrapNamesAt(wide, own, "", REC_STORE_DEPTH, out)
+  out
+}
+
+// `recCopyUnwrapNames` below the path `pre`, at most `depth` levels down, pushed onto `out`.
+function recCopyUnwrapNamesAt(
+  wide: i32,
+  own: i32,
+  pre: string,
+  depth: i32,
+  out: string[],
+) {
+  if depth <= 0 { return 0 }
   const w = if wide >= 0 && wide < T.tys.length { tyAt(wide) } else { tyAt(TY_ERR) }
   const o = if own >= 0 && own < T.tys.length { tyAt(own) } else { tyAt(TY_ERR) }
-  if !(w is TyObj) || !(o is TyObj) { return out }
+  if !(w is TyObj) || !(o is TyObj) { return 0 }
   let i = 0
   while i < o.objFieldNames.length {
     const wf = objFieldType(w, o.objFieldNames[i])
     const of = o.objFieldTypes[i]
-    if (
-      wf >= 0
-      && !fieldStorageEq(wf, of, REC_STORE_DEPTH)
-      && recCopyUnwraps(wf, of)
-    ) {
-      out.push(o.objFieldNames[i])
+    if wf >= 0 && !fieldStorageEq(wf, of, REC_STORE_DEPTH) {
+      if recCopyUnwraps(wf, of) {
+        out.push(pre + o.objFieldNames[i])
+      } else if recCopyNestable(wf, of) {
+        recCopyUnwrapNamesAt(
+          wf,
+          nonNulTyOf(of),
+          pre + o.objFieldNames[i] + ".",
+          depth - 1,
+          out,
+        )
+      }
     }
     i = i + 1
   }
-  out
+  0
 }
 
 // Whether call `c` is an argument to a parameter typed `T` of a generic callee, or an element of a
@@ -3183,7 +3305,11 @@ export function recHeldLitPlaceAdopt(l: i32) {
   }
   let i = 0
   while i < ats.length {
-    recHeldBindAdopt(d, reps[i], ats[i], ats)
+    if recAsgBindInit(ats[i]) >= 0 {
+      recHeldAsgStamp(d, reps[i], ats[i], ats)
+    } else {
+      recHeldBindAdopt(d, reps[i], ats[i], ats)
+    }
     i = i + 1
   }
   0
@@ -3233,14 +3359,24 @@ export function recHeldElemBuilt(x: i32): i32 {
   recBuiltElemOf(cwPeelValue(dn.letInit))
 }
 
-// The initialiser of the un-annotated binding `p` is assigned into, peeled; else -1.
+// The initialiser of the un-annotated binding `p` is assigned into, peeled, where `p` is the
+// assigned value or one of its `if` or `match` arm leaves (`tailValueLeaves`, D15280); else -1.
 export function recAsgBindInit(p: i32): i32 {
   cwIxBuild()
-  const a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
+  let x = p
+  let hops = 0
+  while x >= 0 && x < cwIxUp.length && cwIxUpKind[x] == CW_UP_ARM && hops < 16 {
+    x = cwIxUp[x]
+    hops = hops + 1
+  }
+  const a = if x >= 0 && x < cwIxUp.length { cwIxUp[x] } else { -1 }
   const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
-  if (!(an is BinExpr) || an.binOp != "=" || cwPeelValue(an.binRight) != p) {
+  if (!(an is BinExpr) || an.binOp != "=" || cwPeelValue(an.binRight) != x) {
     return -1
   }
+  const leaves: i32[] = []
+  tailValueLeaves(an.binRight, leaves)
+  if !i32ListHas(leaves, p) { return -1 }
   const d = if nodeAt(an.binLeft) is Ident { recBindDeclOf(an.binLeft) } else { -1 }
   const dn = if d >= 0 { nodeAt(d) } else { null }
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
@@ -3283,6 +3419,25 @@ export function recCoalesceHeldAdopt(p: i32, rep: i32): boolean {
 // delivery of `d` at its own storage outside `skip`, since one record cannot be both.
 function recHeldBindAdopt(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
   recAdPushDecl(d, nodeTyIxOf(recCoalesceHeldLit(d)), rep, false, p)
+  recHeldOwnRefuse(d, rep, p, skip)
+}
+
+// Builds the fresh record `const` `d`, assigned by `p` into a binding held at the record `rep`, by
+// stamping its literal there; its type stays, so each delivery of it at its own storage outside
+// `skip` is refused. False, building nothing, where `d` holds no fresh literal (D15238).
+export function recHeldAsgStamp(
+  d: i32,
+  rep: i32,
+  p: i32,
+  skip: i32[],
+): boolean {
+  const l = recCoalesceHeldLit(d)
+  if l < 0 { return false }
+  adoptLitAt(l, rep)
+  recHeldOwnRefuse(d, rep, p, skip)
+}
+
+function recHeldOwnRefuse(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
   // The store column runs after `recKeptConflicts`, so `d`'s own-storage deliveries are refused here,
   // unless `d` is kept, whose deliveries that pass already refused: one refusal per delivery.
   if i32ListHas(recKeptDecl, d) { return true }
@@ -6212,6 +6367,21 @@ function recCopyAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
 // Whether the record `dst` stores some field of the record `src` as another number class, and
 // every other field as `src` stores it.
 function recCopyConverts(src: i32, dst: i32): boolean {
+  recCopyConvertsAt(src, dst, REC_STORE_DEPTH)
+}
+
+// `recCopyConverts` with at most `depth` levels of record fields left: a field holding a record
+// that converts is copied by the level below.
+function recCopyConvertsAt(src: i32, dst: i32, depth: i32): boolean {
+  if (
+    depth <= 0
+    || src < 0
+    || dst < 0
+    || src >= T.tys.length
+    || dst >= T.tys.length
+  ) {
+    return false
+  }
   const s = tyAt(src)
   const d = tyAt(dst)
   if !(s is TyObj) || !(d is TyObj) { return false }
@@ -6227,7 +6397,13 @@ function recCopyConverts(src: i32, dst: i32): boolean {
       if nonNulTyOf(sf) != sf || nonNulTyOf(df) != df { return false }
       converts = true
     } else if !fieldStorageEq(sf, df, REC_STORE_DEPTH) {
-      return false
+      if (
+        !recCopyNestable(sf, df)
+        || !recCopyConvertsAt(sf, nonNulTyOf(df), depth - 1)
+      ) {
+        return false
+      }
+      converts = true
     }
     i = i + 1
   }
