@@ -1830,6 +1830,20 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
       && recInferredFnOf(lp) >= 0
       && recInferredFnOf(lp) != fd
     ) {
+      // A leaf whose function cannot itself be built at `dst` leaves the delivery to its converting
+      // copy where one serves (D15216); else the hand-on refuses the two builds, as D14516 pins.
+      if (
+        recCopyConverts(nodeTyIxOf(lp), dst)
+        && !recFnBuildsAt(
+          recInferredFnOf(lp),
+          lp,
+          nodeTyIxOf(lp),
+          dst,
+          REC_STORE_DEPTH,
+        )
+      ) {
+        return false
+      }
       calls.push(lp)
     } else if lp != call && recSolePinArg(lp) >= 0 {
       let x = lp
@@ -1866,6 +1880,37 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
     const un = recCopyUnwrapNames(dst, own)
     if un.length > 0 { recCopyUnwrap[cp] = un }
     ci = ci + 1
+  }
+  true
+}
+
+// Whether inferred function `fd`, called at `call` with result `own`, can be built at `dst`: its call
+// sites land there (`recSitesLandAt`), and each value leaf calling another such function can be
+// too, to `depth` calls (`REC_STORE_DEPTH` from the solve, D15216).
+function recFnBuildsAt(
+  fd: i32,
+  call: i32,
+  own: i32,
+  dst: i32,
+  depth: i32,
+): boolean {
+  if depth <= 0 || fd < 0 { return false }
+  cwIxBuild()
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || !recSitesLandAt(sites, call, own, dst) {
+    return false
+  }
+  const via: i32[] = []
+  for lf in recFnValueOrigins(fd, via) {
+    if lf < 0 { return false }
+    const lfn = recInferredFnOf(lf)
+    if (
+      lfn >= 0
+      && lfn != fd
+      && !recFnBuildsAt(lfn, lf, nodeTyIxOf(lf), dst, depth - 1)
+    ) {
+      return false
+    }
   }
   true
 }
@@ -2659,10 +2704,12 @@ function recHoleIdentityAt(p: i32, fd: i32, srcTy: i32, dstTy: i32): boolean {
   const ap = cwPeelValue(a)
   if ap < 0 || ap >= P.nodes.length { return false }
   if nodeAt(ap) is ObjLit { return recHoleAdoptLit(ap, srcTy, dstTy) }
-  // A call of an inferred function takes the destination on, as a result leaf does (D14736).
-  const ia = recInferredFnOf(ap)
+  // A call of an inferred function, directly or through bindings holding it (`recOriginExpr`),
+  // takes the destination on, as a result leaf does (D14736, D15179).
+  const ao = recOriginExpr(a)
+  const ia = if ao >= 0 { recInferredFnOf(ao) } else { -1 }
   if ia >= 0 && ia != fd {
-    recAdoptNote(ap, nodeTyIxOf(ap), dstTy)
+    recAdoptNote(ao, nodeTyIxOf(ao), dstTy)
     return true
   }
   if recFreshDeclOf(ap) < 0 { return false }
@@ -3077,27 +3124,76 @@ export function recBuiltReadRefuse(u: i32) {
 // Whether `p` is assigned into an un-annotated binding whose initialiser is a built read at
 // `rep` too: the binding is stored at `rep`, so the write converts nothing (D15124).
 function recAsgIntoBuiltAt(p: i32, rep: i32): boolean {
-  const b = recAsgBuiltRep(p)
+  const b = recLitPlaceBuiltTy(p)
   b >= 0 && tySame(b, rep)
 }
 
-// The record an un-annotated binding `p` is assigned into is stored at, when its initialiser is
-// a built read, or the list when it holds a built list; else -1. A literal there is built at it.
-export function recAsgBuiltRep(p: i32): i32 {
+// The record (or list) a literal or read `p` delivered into a built place is built at: an
+// un-annotated binding whose initialiser is a built read or a built list (D15188, D15189), or a
+// literal pushed or index-stored into a list with a recorded element build (D15235); else -1.
+export function recLitPlaceBuiltTy(p: i32): i32 {
   const init = recAsgBindInit(p)
   const b = if init >= 0 { recBuiltReadTy(init) } else { -1 }
   if b >= 0 { return nonNullTy(b) }
-  // A list literal assigned into a binding holding a list built elsewhere is built at it (D15189).
-  if init < 0 || p < 0 || p >= P.nodes.length || !(nodeAt(p) is ArrayLit) {
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const pn = nodeAt(p)
+  if init >= 0 {
+    if !(pn is ArrayLit) { return -1 }
+    const it = nodeTyIxOf(init)
+    const e = recHeldElemBuilt(init)
+    return if e >= 0 && it >= 0 && it < T.tys.length && tyAt(it) is TyArray { mkArrayTy(e) } else { -1 }
+  }
+  const r = recLitSlotReceiver(p)
+  const e = if r >= 0 { recHeldElemBuilt(r) } else { -1 }
+  if e < 0 { return -1 }
+  // A list literal reaches the list's slots only spread into a push, whose elements it holds.
+  if pn is ObjLit { e }
+  else if pn is ArrayLit { mkArrayTy(e) }
+  else { -1 }
+}
+
+// The list a record literal `p` is pushed, unshifted or index-stored into, or a list literal `p`
+// is spread into a push of, peeled; else -1.
+function recLitSlotReceiver(p: i32): i32 {
+  cwIxBuild()
+  let x = p
+  let a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
+  if nodeAt(p) is ArrayLit {
+    if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Spread) { return -1 }
+    x = a
+    a = if a < cwIxUp.length { cwIxUp[a] } else { -1 }
+  }
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if an is Call && an.callFn >= 0 && i32ListHas(an.callArgs, x) {
+    const f = nodeAt(an.callFn)
+    if f is Member && (f.memProp == "push" || f.memProp == "unshift") {
+      return cwPeelValue(f.memObj)
+    }
     return -1
   }
-  const it = nodeTyIxOf(init)
-  const e = recBuiltElemOf(init)
-  if e >= 0 && it >= 0 && it < T.tys.length && tyAt(it) is TyArray {
-    mkArrayTy(e)
-  } else {
-    -1
+  if (
+    x == p
+    && an is BinExpr
+    && an.binOp == "="
+    && cwPeelValue(an.binRight) == p
+  ) {
+    const l = nodeAt(an.binLeft)
+    if l is Index { return cwPeelValue(l.idxArr) }
   }
+  -1
+}
+
+// The record the elements of the list `x` reads are built at: its own recorded build, or, for an
+// un-annotated binding, its initialiser's; -1 when none is recorded.
+export function recHeldElemBuilt(x: i32): i32 {
+  const e = recBuiltElemOf(x)
+  if e >= 0 || x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) {
+    return e
+  }
+  const d = recBindDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  recBuiltElemOf(cwPeelValue(dn.letInit))
 }
 
 // The initialiser of the un-annotated binding `p` is assigned into, peeled; else -1.
@@ -4226,8 +4322,11 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       ) {
         return recAdoptNote(pa, nodeTyIxOf(pa), dstTy)
       }
-      // A fresh call handed through is built at its own row, as it is delivered directly.
-      const pf = if pp >= 0 { recInferredFnOf(pp) } else { -1 }
+      // A fresh call handed through, directly or through bindings holding it, is built at its own
+      // row, as it is delivered directly; the origin is the walk the arm's other branches read
+      // (`recOriginExpr`, D15179).
+      const pc = if pp >= 0 { recOriginExpr(pp) } else { -1 }
+      const pf = if pc >= 0 { recInferredFnOf(pc) } else { -1 }
       if pf >= 0 {
         const pl = nonNulTyOf(dstTy)
         if (
@@ -4241,9 +4340,9 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         if (
           recSolePinArg(p) >= 0
           && recLandingOf(srcTy, dstTy) == pl
-          && recFnBuiltAtDst(pf, pp, srcTy, dstTy)
+          && recFnBuiltAtDst(pf, pc, srcTy, dstTy)
         ) {
-          return recAdPushDecl(pf, srcTy, nonNulTyOf(dstTy), false, pp)
+          return recAdPushDecl(pf, srcTy, nonNulTyOf(dstTy), false, pc)
         }
         if recHasLitLeaf(pf) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
         const pld = recLandingOf(srcTy, dstTy)
