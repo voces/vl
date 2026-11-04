@@ -4491,6 +4491,10 @@ let elabResHands: {[i32]: i32[]} = Map()
 // is not a plain assignment of a call.
 let elabResWrites: {[i32]: i32[]} = Map()
 let elabResBadWrite: {[i32]: boolean} = Map()
+// Per `let` holder, the holders a plain assignment writes into it, and per holder, the holders
+// it is written into.
+let elabResAsgFrom: {[i32]: i32[]} = Map()
+let elabResAsgTo: {[i32]: i32[]} = Map()
 // Per parameter, the unannotated `const` bindings initialised with a read of it; per bundle key,
 // whether a call hands that parameter a record whole.
 let elabResCopies: {[i32]: i32[]} = Map()
@@ -4523,6 +4527,8 @@ function elabResultScanReset() {
   elabResWrites = Map()
   elabResBadWrite = Map()
   elabResCopies = Map()
+  elabResAsgFrom = Map()
+  elabResAsgTo = Map()
   elabResRets = Map()
   elabRecParams = Map()
   elabFnReads = Map()
@@ -4616,12 +4622,35 @@ function elabResScanAssign(g: i32) {
         const ws = elabResWrites.get(d) ?? []
         ws.push(v)
         elabResWrites[d] = ws
+      } else if elabResHolderLink(g, d, v) {
+        const fs = elabResAsgFrom.get(d) ?? []
+        fs.push(identDeclOf(v))
+        elabResAsgFrom[d] = fs
+        const ts = elabResAsgTo.get(identDeclOf(v)) ?? []
+        ts.push(d)
+        elabResAsgTo[identDeclOf(v)] = ts
       } else {
         elabResBadWrite[d] = true
       }
     }
   }
   0
+}
+
+// Whether assignment `g` to holder `d`, in the function declaring `d`, writes it a read `v` of
+// another call holder.
+function elabResHolderLink(g: i32, d: i32, v: i32): boolean {
+  const n = nodeAt(g)
+  if !(n is BinExpr) || n.binOp != "=" || n.binCompound != "" { return false }
+  if (
+    v < 0
+    || !(nodeAt(v) is Ident)
+    || elabEnclosingFn(g) != elabEnclosingFn(d)
+  ) {
+    return false
+  }
+  const s = identDeclOf(v)
+  s != d && elabResMayHold(s) && elabResCallHolder(s)
 }
 
 // A read counts against the binding it reads.
@@ -5222,16 +5251,22 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
     + elabResWriteReads(h)
     + rets.length
     + copies.length
+    + elabResLinkReads(h)
   if (
     reads != (elabResReads.get(h) ?? 0)
     || !elabHolderWritesAgree(h, from, rec)
+    || !elabHolderLinksHold(h, from, rec)
   ) {
     return 0
   }
   if rets.length > 0 && !elabHolderCanHoldReturned(h, from, rec) { return 0 }
   if copies.length > 0 && !elabHolderCopiesHold(h, copies, rec) { return 0 }
   const ms: i32[] = []
-  let two = hands.length > 0 || c < 0 || rets.length > 0 || copies.length > 0
+  let two = hands.length > 0
+    || c < 0
+    || rets.length > 0
+    || copies.length > 0
+    || elabResLinkReads(h) > 0
   for t in through {
     const m = elabCallSigMember(t, rec)
     if m < 0 { return 0 }
@@ -5343,6 +5378,71 @@ function elabLambdaWithin(f: i32, fd: i32): boolean {
     guard = guard + 1
   }
   cur == fd
+}
+
+// The reads of holder `h` that link it to another holder: the target of an assignment from one,
+// and the value of an assignment into one.
+function elabResLinkReads(h: i32): i32 {
+  (elabResAsgFrom.get(h) ?? []).length + (elabResAsgTo.get(h) ?? []).length
+}
+
+// Whether holder `h`, linked to other holders by assignments, holds record `rec` together with
+// each of them: every one is a call holder read only by calls through it at the record's
+// signatures, copies, links and write targets, written only by calls returning `rec`, all in the
+// function declaring `h`, and a link's source has no link into it. True for an unlinked holder.
+function elabHolderLinksHold(h: i32, from: i32, rec: i32[]): boolean {
+  if elabResLinkReads(h) == 0 { return true }
+  const group: i32[] = [h]
+  for f in elabResAsgFrom.get(h) ?? [] { group.push(f) }
+  for t in elabResAsgTo.get(h) ?? [] { group.push(t) }
+  const fd = elabEnclosingFn(h)
+  for g in group {
+    if (
+      (elabResAsgFrom.get(g) ?? []).length > 0
+      && (elabResAsgTo.get(g) ?? []).length > 0
+    ) {
+      return false
+    }
+    if !elabHolderLinkedHolds(g, from, rec, fd) { return false }
+  }
+  true
+}
+
+// `elabHolderLinksHold` for one member `g` of a linked group declared in function `fd`.
+function elabHolderLinkedHolds(
+  g: i32,
+  from: i32,
+  rec: i32[],
+  fd: i32,
+): boolean {
+  const through = elabResThrough.get(g) ?? []
+  const copies = elabResCopies.get(g) ?? []
+  if (
+    elabEnclosingFn(g) != fd
+    || (elabResHands.get(g) ?? []).length > 0
+    || (elabResRets.get(g) ?? []).length > 0
+    || !elabResCallHolder(g)
+    || !elabHolderWritesAgree(g, from, rec)
+    || (elabResWrites.get(g) ?? []).length == 0
+    || !elabTyListSame(
+      elabCallRecord((elabResWrites.get(g) ?? [])[0], from, 4),
+      rec,
+    )
+  ) {
+    return false
+  }
+  const reads = through.length
+    + elabResWriteReads(g)
+    + copies.length
+    + elabResLinkReads(g)
+  if reads != (elabResReads.get(g) ?? 0) { return false }
+  if copies.length > 0 && !elabHolderCopiesHold(g, copies, rec) { return false }
+  for t in through {
+    if elabEnclosingFn(t) != fd || elabCallSigMember(t, rec) < 0 {
+      return false
+    }
+  }
+  true
 }
 
 // The reads of holder `h` that are the targets of its assignments.
