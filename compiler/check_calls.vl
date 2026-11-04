@@ -90,6 +90,7 @@ import {
   elabCapTy,
   elabDefaultRowNote,
   elabEarlyCallNote,
+  elabFnFieldWidened,
   elabHoleDeclOf,
   elabHolePinNote,
   elabHoleRowCut,
@@ -3128,6 +3129,9 @@ function holeRecAdopt(s: HoleRecSrcs, rt: i32, at: i32, grp: i32) {
 function holeFieldCallAdopt(recv: i32, field: string, inst: i32, at: i32) {
   if inferQuiet || recv < 0 || recv >= P.nodes.length { return 0 }
   if inst < 0 || !(tyAt(inst) is TyFunc) || tyHasTyVar(inst) { return 0 }
+  // A binding a call initialises whose field the elaboration widened to the functions written
+  // into it holds the set at that field, so its call dispatches and builds no record (D15270).
+  if holeFieldCallWidened(recv, field) { return 0 }
   const rty = nonNullTy(nodeTyOf(recv))
   if rty < 0 || rty >= T.tys.length { return 0 }
   const ro = tyAt(rty)
@@ -3146,6 +3150,26 @@ function holeFieldCallAdopt(recv: i32, field: string, inst: i32, at: i32) {
   }
   if !holeRecSrcsOf(recv, [], false, s, 0) { return 0 }
   holeRecAdopt(s, mkObjTy(ro.objFieldNames, tys), at, recAdSetGroup())
+}
+
+// Whether `recv` reads a binding a call initialises, directly or through `const` copies, whose
+// function field `field` the elaboration widened.
+function holeFieldCallWidened(recv: i32, field: string): boolean {
+  let rx = parenPeelIx(recv)
+  let hops = 0
+  while hops < 8 && rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Ident {
+    const d = identDeclOf(rx)
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if !(dn is LetDecl) || dn.letInit < 0 { return false }
+    const init = parenPeelIx(dn.letInit)
+    if init >= 0 && init < P.nodes.length && nodeAt(init) is Call {
+      return elabFnFieldWidened(d, [field])
+    }
+    // A `const` copy reads the binding it copies.
+    rx = if dn.letKw == "const" { init } else { -1 }
+    hops = hops + 1
+  }
+  false
 }
 
 // Whether `ft` is a function type with a parameter an inference hole still types, not a declared
