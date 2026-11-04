@@ -364,5 +364,33 @@ Each slice is graded on every hard control above, with the split plan on and off
    D15103, a delivery at a type that differs per instance (`ftCtxOk`). Writing 4b-i's escape control
    found D15110, a returned per-instance lambda that runs at the first instance's type.
 
+   4b-ii, planned (2026-11-04, lane LWM). The witness is D15436: `let d1 = (y) => y` and a peer,
+   in an instanced body, `d1` written from a nested `function w1() { d1 = d1 }` and called at two
+   types. The decline is `ftInstLeafOk`'s `c == b && inFn`: a write from a nested function may run
+   outside the instance. The fact it needs is the elaboration's, per capture cell: the writing
+   function is declared in the same instanced body and is never itself a value that leaves it (not
+   returned, stored or handed on), so the cell, the id written into it and every call through it
+   stay in one instance. The elaboration already keys a nested declaration per encloser instance
+   (slice 3, `elabMintHandedNested` / `elabNestNote`), so the fact is a per-key flag the
+   elaboration sets where it mints that nested copy (`elabCellLocal`), not a syntactic scan here.
+   Reader: `ftInstLeafOk` takes a nested write when the flag holds, in place of refusing every
+   nested write. The early decision runs before the elaboration, so the admission is the late
+   decision's (`fnTagRedecide`). Deletion candidate: `monoBindingAtPin`'s live-pin retry
+   (`monoDeclLivePathPins`, its one caller) and the `monoBindSigFail` behind it, once a census over
+   `tests/` shows no untagged binding reaching two live pins there; `monoDeclPathPins` itself has
+   other callers and stays. The pin-helper baseline is lowered in the PR that deletes them.
+   Measured before building the fact: admitting D15436 in `ftInstLeafOk` takes three things:
+   - a call-only nested writer (`elabEncl`);
+   - a self-write;
+   - a copy into a `let` of the same body.
+   That tags the set and builds invalid wasm in both plan states, because each instance's capture
+   cell is still built at the closure type. So 4b-ii is two steps, in this order. First, the cell's
+   element is built at the instance's rep for a tagged set (the emitter's cell, read per instance).
+   Second, the decision's admission. The first step alone moves nothing, so it is graded by the byte
+   sweep at 0 movers. D15434 (the `const`
+   spelling) was clause 1 until 4b-i admitted a `const` seed of a captured `let` as the `let`
+   spelling (#6330's `ftConstSeedsCell`); both spellings now run with the split plan on and refuse
+   loudly with it off, and both close with 4b-ii.
+
 **Out of scope.** Sets whose identity varies per instance and escapes the instance; those stay
 closures. A per-instance `fnTagBind` (#6000), which no witness needs yet.
