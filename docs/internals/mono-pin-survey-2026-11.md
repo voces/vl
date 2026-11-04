@@ -14,7 +14,7 @@ and bodies; not ablated.
 | fn | callers | note |
 |---|---|---|
 | monoPinnedTyOf | 13 | recorded type of ix at binding bN/bT; already reads elabWalkTy/elabWalkNarrowedTy, then substitutes |
-| monoPinSubTyOf | 12 | t under ctx's pinned binding (elabInstTyAt) |
+| monoPinSubTyOf | 12 | t under ctx's pinned binding (elabInstTyAt). Its five calls at a node's own type read `monoNodeTyAt` (elabNodeTyAt, else the node's type); it stays for the seven that substitute a derived type (an element, a return, a parameter type) |
 | monoExactPinTyOf | 9 | t under ctx's exact binding, else parameters' pins |
 | monoNumOperandPinTy | 4 | operand at pin, else hole instance's own binding |
 | monoPinnedOperandTy | 4 | body expr reading a monomorphized param |
@@ -26,7 +26,57 @@ Store: elabNodeTyAt(ix, inst) already exists (3 mono callers). These five are se
 | monoArgPinTyIx | 12 | ladder: fn-typed own, unfilled null, clo-pin ann, variant, lit-built, rep row, copy |
 | monoElemValArgTy | 3 | value arg's type in ctx, else instance's |
 | monoElemArgSetTy | 3 | tagged-set arg's type (elabWalkTy) |
-Store: elabCallParamTy (9 mono callers) is the existing fact; monoArgPinTyIx is the big second producer.
+**Measured 2026-11-04: neither existing store is the fact `monoArgPinTyIx` produces.** A pin is
+this call's argument type. It is an input to the instance key. `elabCallParamTy` is the type the
+instance settled for the parameter, which is an output of the solve. So switching the pin to the
+store would key each instance by its own result.
+
+The probe wrapped `monoArgPinTyIx` in a non-halting `VL_REP_SHADOW` note per rung and ran over
+`tests/cases` and `distilled/named` (17,605 files). It compared only calls whose callee declares
+the parameter with an open type, and skipped member calls, whose receiver shifts the argument
+index. Cells are calls/files. `EQEXACT` means equal after `monoExactPinTyOf`. `CLOSEDPARAM`,
+`MEMBER` and `NOTARG` were not compared.
+
+Against `elabCallParamTy` (the instance's parameter):
+
+| rung | EQ | EQEXACT | NE | no store | CLOSEDPARAM | MEMBER | NOTARG |
+|---|---|---|---|---|---|---|---|
+| own (fallthrough) | 21,547/3,701 | 2,163/296 | 1,790/188 | 141/29 | 5,039/909 | 349/33 | 2,204/478 |
+| fnOwn | 1,308/128 | 12/2 | 739/54 | 46/10 | 25/16 | 4/1 | 252/31 |
+| cloAnn | 73/10 | | | 2/1 | | | |
+| repRow | 71/20 | | | | | | |
+| litBuilt | 37/8 | | 5/3 | | 7/3 | | |
+| null | 22/4 | | | | | | |
+| nulFn | 20/1 | | 4/1 | | | | |
+| copy | 11/5 | | | | | | |
+| variant | 2/1 | | | | | | |
+
+The 2,989 `NE` calls break down as follows:
+
+- **1,332 elab-wider.** The instance's parameter is a union of what its calls deliver, for example
+  `i32` against `i32 | f64 | null`, or `Set<i32>` against `Set<i32> | null`.
+- **403 mono-open.** The pin still holds `T` or `_` where the elaboration closed it.
+- **About 800 other.** These include residual index misalignment at callback positions.
+
+Against the call's own binding row (`callBindRowOf`, with the rep row where keyed there,
+substituted into the parameter type):
+
+| rung | EQ | NE | no row |
+|---|---|---|---|
+| own | 20,973/3,653 | 1,575/144 | 3,090/415 |
+| fnOwn | 1,306/127 | 573/45 | 226/27 |
+| cloAnn | 3/1 | | 72/10 |
+| repRow | 71/20 | | |
+| litBuilt | 37/8 | 2/2 | 3/1 |
+| null | | 14/2 | 8/3 |
+| copy | 11/5 | | |
+| variant | 2/1 | | |
+
+The binding row is also a join: 1,128 calls still read elab-wider. Group B therefore needs a
+per-argument delivered-type fact that does not exist yet. The `#r.<i>` delivered-row entry (D15173)
+is its record-only precedent. The probe is `docs/internals/mono-argpin-probe.patch` (apply, build, run under
+`VL_NO_COMPILE_CACHE=1 VL_REP_SHADOW=1`, grep `repAB/argpin`). Until that fact exists, only `repRow`, `copy`, `variant` and most of
+`litBuilt` agree everywhere they are compared.
 
 ## C. Slot/holder closed types (the elabHeldClosedTy / G1 shape: computed on demand, not stored)
 | fn | callers | note |
