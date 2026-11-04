@@ -2337,11 +2337,30 @@ function recRepArgsNote(sites: i32[], own: i32, dst: i32) {
   0
 }
 
-// Whether the record `dst` stores each field of the record `own` as `own` does, or as that
-// type or null, or, where `stored` (the record is held in a container built at `dst`), as `i64`
-// where `own` holds `i32`. A field read of a widened number must have the checker's type, so
-// the record is otherwise built at its own row and its delivery copies (D8302).
+// Whether record `dst` stores each field of record `own` as `own` does, as that type or null, or,
+// where `stored` (held in a container built at `dst`), as `i64` for `i32`; a record field is judged
+// alike, to `REC_STORE_DEPTH` levels. Otherwise the record is built at its own row and each delivery
+// copies, since a widened number's read must have the checker's type (D8302).
 function recNullWidened(own: i32, dst: i32, stored: boolean): boolean {
+  recNullWidenedAt(own, dst, stored, REC_STORE_DEPTH)
+}
+
+// `recNullWidened` with at most `depth` levels of record fields left.
+function recNullWidenedAt(
+  own: i32,
+  dst: i32,
+  stored: boolean,
+  depth: i32,
+): boolean {
+  if (
+    depth <= 0
+    || own < 0
+    || dst < 0
+    || own >= T.tys.length
+    || dst >= T.tys.length
+  ) {
+    return false
+  }
   const o = tyAt(own)
   const d = tyAt(dst)
   if o is TyObj && d is TyObj {
@@ -2357,6 +2376,7 @@ function recNullWidened(own: i32, dst: i32, stored: boolean): boolean {
           !fieldStorageEq(of, at, REC_STORE_DEPTH)
           && !(of == TY_NULL && inner >= 0)
           && !(stored && of == TY_I32 && at == TY_I64)
+          && !(inner < 0 && recNullWidenedAt(of, at, stored, depth - 1))
         ) {
           return false
         }
@@ -3060,6 +3080,14 @@ function recAsgIntoBuiltAt(p: i32, rep: i32): boolean {
 // The record an un-annotated binding `p` is assigned into is stored at, when its initialiser is
 // a built read; else -1. A record literal assigned there is built at it (D15185).
 export function recAsgBuiltRep(p: i32): i32 {
+  const init = recAsgBindInit(p)
+  const b = if init >= 0 { recBuiltReadTy(init) } else { -1 }
+  if b >= 0 { nonNullTy(b) } else { -1 }
+}
+
+// The initialiser of the un-annotated binding `p` is assigned into, peeled; else -1.
+export function recAsgBindInit(p: i32): i32 {
+  cwIxBuild()
   const a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
   const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
   if (!(an is BinExpr) || an.binOp != "=" || cwPeelValue(an.binRight) != p) {
@@ -3068,22 +3096,42 @@ export function recAsgBuiltRep(p: i32): i32 {
   const d = if nodeAt(an.binLeft) is Ident { recBindDeclOf(an.binLeft) } else { -1 }
   const dn = if d >= 0 { nodeAt(d) } else { null }
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
-  const b = recBuiltReadTy(cwPeelValue(dn.letInit))
-  if b >= 0 { nonNullTy(b) } else { -1 }
+  cwPeelValue(dn.letInit)
 }
 
 // Whether `p` is `read ?? { … }` handed to a parameter that takes the rep `rep`; the literal is
 // then built at `rep`, so the whole value is one record of it.
 function recCoalesceLitBuilt(p: i32, rep: i32): boolean {
-  const n = nodeAt(p)
-  if !(n is BinExpr) || n.binOp != "??" { return false }
-  const lit = cwPeelValue(n.binRight)
-  if lit < 0 || !(nodeAt(lit) is ObjLit) || !(tyAt(rep) is TyObj) {
-    return false
-  }
+  if recCoalesceLitOf(p, rep) < 0 { return false }
   if !recArgTakesRep(p, 4) && !recAnnArgTakesRep(p, rep) { return false }
+  recCoalesceLitAdopt(p, rep)
+}
+
+// Builds the record literal that `p`, a `read ?? { … }`, defaults to at the record `rep`; false,
+// building nothing, where `p` is no such value. The store column builds an un-annotated
+// binding of one there (D15230), as `recCoalesceLitBuilt` does an argument.
+export function recCoalesceLitAdopt(p: i32, rep: i32): boolean {
+  const lit = recCoalesceLitOf(p, rep)
+  if lit < 0 { return false }
   recordRepTyAdopt(lit, rep, 6)
   true
+}
+
+// The record literal `p`, a `??`, defaults to where `rep` is a record; else -1.
+function recCoalesceLitOf(p: i32, rep: i32): i32 {
+  const n = nodeAt(p)
+  if !(n is BinExpr) || n.binOp != "??" { return -1 }
+  const lit = cwPeelValue(n.binRight)
+  if (
+    lit < 0
+    || !(nodeAt(lit) is ObjLit)
+    || rep < 0
+    || rep >= T.tys.length
+    || !(tyAt(rep) is TyObj)
+  ) {
+    return -1
+  }
+  lit
 }
 
 // Whether `x` is an argument whose parameter takes its rep (`recParamTakesRep`), up to `depth`
@@ -3470,6 +3518,10 @@ function recBuiltReadTyAt(
     if n.callFn < 0 { return -1 }
     const f = nodeAt(n.callFn)
     if n.callArgs.length == 1 && f is Member && f.memProp == "get" {
+      return recBuiltElemIn(cwPeelValue(f.memObj), tbl)
+    }
+    // A list's `pop()` reads an element, as an index does (D15230).
+    if n.callArgs.length == 0 && f is Member && f.memProp == "pop" {
       return recBuiltElemIn(cwPeelValue(f.memObj), tbl)
     }
     // A call handing its argument back reads where that argument does (D14819).
