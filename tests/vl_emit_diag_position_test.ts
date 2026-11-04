@@ -60,9 +60,7 @@ const errorBlock = (out: string): string => {
 
 // A BODY-phase refusal: a function returning a parameter it calls at two signatures, its result
 // put in a list element (D15144's B2 position, `bundle-record-value-2026-11.md`), anchored at
-// that call on line 7. The collect phase has no positioned refusal a check-clean program
-// reaches: the last one ran (D15098), and D15150's refusal is raised there with no position at
-// all (D15154). When D15154 is fixed, D15150's witness is the collect-phase case again.
+// that call on line 7.
 const BODY_WITNESS = `function lap(f) {
   print(f(2.5))
   print(f(3))
@@ -224,18 +222,11 @@ Deno.test({
   },
 });
 
-// A refusal raised before any body is lowered (D15154): the union discrimination is anchored at
-// the union's declaration, line 5, and a `monomorphize:` refusal at the call being instantiated,
-// line 8. The instance case above is the restore's control: `take(id)` is instantiated before
-// `take`'s body refuses, and a cursor left armed would name the call instead of `take`.
-const COLLECT_WITNESS = `type R = { r: i32 }
-type S = { r: i32 }
-type A = { n: i32, g: R }
-type B = { n: i32, g: S }
-type U = A | B
-const b: B = { n: 4, g: { r: 1 } }
-print(b.g.r)
-`;
+// A refusal raised before any body is lowered (D15154): a `monomorphize:` refusal is anchored at
+// the call being instantiated, line 8. The collect phase has no known check-clean refusal left
+// (D15150, the last, now runs); add the next one found here, anchored at its declaration. The
+// instance case above is the restore's control: `take(id)` is instantiated before `take`'s body
+// refuses, and a cursor left armed would name the call instead of `take`.
 const MONO_WITNESS = `function id<T>(x: T): T { x }
 function use<T>(ys: T[]) { print(ys.length) }
 function take<T>(a: T) {
@@ -248,11 +239,10 @@ take(id)
 
 Deno.test({
   name:
-    "vl-emit-diag-position: a refusal raised before any body is lowered names the union or the call",
+    "vl-emit-diag-position: a refusal raised before any body is lowered names the call",
   ignore: !ENABLED,
   fn: async () => {
     const cases: { name: string; src: string; line: number }[] = [
-      { name: "union discrimination", src: COLLECT_WITNESS, line: 5 },
       { name: "monomorphize", src: MONO_WITNESS, line: 8 },
     ];
     for (const c of cases) {

@@ -109,6 +109,7 @@ import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
 import {
   REC_REBUILT_DEPTH,
   callArgRepTy,
+  cbaArgHoldsHeld,
   recArgBuiltTyIn,
   recRebuiltRetRow,
   recRepWidens,
@@ -23118,6 +23119,62 @@ function monoTyFillHoles(t: i32, fill: i32, depth: i32): i32 {
   }
 }
 
+// Instances, for a call through field `f` of a record literal no binding holds (`{ f: g, n: 1 }.f(x)`),
+// the un-annotated function the field names at the field's type in the record the literal is built
+// at (`nodeRepTyIxOf`), where that type is closed: no binding's reads pin it (D15206).
+function monoPinLitFieldCall(c: Call, ctx: i32): i32 {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return 0 }
+  const cf = nodeAt(c.callFn)
+  if !(cf is Member) { return 0 }
+  const ox = unwrapParen(cf.memObj)
+  if ox < 0 || !(nodeAt(ox) is ObjLit) { return 0 }
+  const lit = nodeAt(ox)
+  const rt = nodeRepTyIxOf(ox)
+  const ro = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
+  if !(lit is ObjLit) || !(ro is TyObj) { return 0 }
+  let ft = -1
+  let i = 0
+  while i < ro.objFieldNames.length && i < ro.objFieldTypes.length {
+    if ro.objFieldNames[i] == cf.memProp { ft = ro.objFieldTypes[i] }
+    i = i + 1
+  }
+  const fty = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+  if (
+    !(fty is TyFunc)
+    || tyHasTyVar(ft)
+    || fty.fnParamTypes.length != c.callArgs.length
+  ) {
+    return 0
+  }
+  // The row is the call's own signature only where it takes the call's arguments as checked: two
+  // literals of one shape may share a row built at another call's types (D15113).
+  let k = 0
+  while k < c.callArgs.length {
+    if !tySame(widenLitTy(nodeTyIxOf(c.callArgs[k])), fty.fnParamTypes[k]) {
+      return 0
+    }
+    k = k + 1
+  }
+  for fx in lit.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit && f.fiName == cf.memProp {
+      const vx = unwrapParen(f.fiValue)
+      const d = if vx >= 0 && nodeAt(vx) is Ident { identDeclOf(vx) } else { -1 }
+      const fe = if d >= 0 && nodeAt(d) is FuncDecl { fnStmtsPosOf(d) } else { -1 }
+      if fe >= 0 && fnHasUnannotatedParam(fe) {
+        return monoCoerceFnValueTys(
+          f.fiValue,
+          monoConcreteFnTyName(ft),
+          ctx,
+          ft,
+          fty.fnParamTypes,
+        )
+      }
+    }
+  }
+  0
+}
+
 // The refusal for a parameter `par` of `callee` no argument pin closes.
 function monoArgTyFail(par: string, callee: string): i32 {
   emitFail(
@@ -24245,6 +24302,21 @@ function monoPinAnnotatedParam(
   // shadows a type alias arrives resolved and pins the alias's body type.
   const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), fn.fnTyParams)
   const tp = monoTyParamOf(ann, fn.fnTyParams)
+  // A list of a type parameter in a mixed instance, handed a literal holding a held binding, pins at
+  // the elaboration's type for it as a composite annotation does, not through the instance's (D15210).
+  if tp != "" && ann != tp {
+    const tpl = monoCallTplOf(callIx)
+    const row = callBindRowOf(tpl)
+    if row >= 0 && callBindRepMixedAt(row) && cbaArgHoldsHeld(tpl, i) {
+      const mpt = elabCallParamTy(tpl, i)
+      const mpn = if mpt >= 0 && !tyHasTyVar(mpt) { monoClosedTyPin(mpt) } else { "" }
+      if mpn != "" {
+        pinned.push(mpn)
+        pinTys.push(mpt)
+        return 0
+      }
+    }
+  }
   if tp == "" {
     // A composite annotation riding type params (`Box<T>`): bind them by
     // matching the pattern against the argument's concrete type name, then
@@ -26058,6 +26130,7 @@ function monoWalk(ix: i32, ctx: i32) {
   const n = nodeAt(ix)
   match n {
     Call => {
+      if monoPinLitFieldCall(n, ctx) < 0 { return -1 }
       // A call through a tagged function set is each member's direct call (`fnTagDecide`); a
       // call an instance makes through its parameter is noted only as that instance's fact.
       let tagArms = fnTagCallArms(ix)
