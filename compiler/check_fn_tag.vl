@@ -226,7 +226,7 @@ let ftArmOnlyLams: {[i32]: boolean} = Map()
 // Fills `ftArmOnlyLams` by one walk from `rootIx`, the shape `ftScan` walks the program in.
 function ftArmOnlyLamsNote(rootIx: i32) {
   ftArmOnlyLams = Map()
-  const written: i32[] = []
+  const written: {[i32]: boolean} = Map()
   const lets: i32[] = []
   const todo: i32[] = [rootIx]
   while todo.length > 0 {
@@ -242,7 +242,7 @@ function ftArmOnlyLamsNote(rootIx: i32) {
   }
   for d in lets {
     const n = nodeAt(d)
-    if n is LetDecl && i32ListHas(written, d) { ftArmOnlyLamMark(n.letInit) }
+    if n is LetDecl && (written[d] ?? false) { ftArmOnlyLamMark(n.letInit) }
   }
   0
 }
@@ -276,14 +276,14 @@ function ftArmOnlyIndexStoreNote(x: i32) {
 }
 
 // Marks the lambda store `x` writes to a `let`, and adds the `let` to `written`.
-function ftArmOnlyLetStoreNote(x: i32, written: i32[]) {
+function ftArmOnlyLetStoreNote(x: i32, written: {[i32]: boolean}) {
   const n = nodeAt(x)
   if !(n is BinExpr) || !ftIsStore(n) { return 0 }
   const l = parenPeelIx(n.binLeft)
   if l < 0 || l >= P.nodes.length || !(nodeAt(l) is Ident) { return 0 }
   const d = identDeclOf(l)
   if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return 0 }
-  if !i32ListHas(written, d) { written.push(d) }
+  written[d] = true
   ftArmOnlyLamMark(n.binRight)
   0
 }
@@ -3038,10 +3038,9 @@ function ftParamUnread(d: i32, i: i32): boolean {
   true
 }
 
-// Whether callee `x` names a member of set `s` by its declaration, a direct call whatever the
-// set's rep; counted after the elaboration only.
-function ftLateDirectCall(x: i32, s: i32): boolean {
-  if !ftLate { return false }
+// Whether callee `x` names a member of set `s` by its declaration: a direct call, whatever the
+// set's rep, so it reads no id of the set (D15338).
+function ftMemberDirectCall(x: i32, s: i32): boolean {
   const d = identDeclOf(x)
   d >= 0
     && d < P.nodes.length
@@ -3197,7 +3196,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     Call => {
       if pn.callFn == x {
-        return fnTagCallSetOf(p) == s || ftLateDirectCall(x, s)
+        return fnTagCallSetOf(p) == s || ftMemberDirectCall(x, s)
       }
       return (ftParamOfSet(pn, x, s) && ftLateParamOk(pn, x, s))
         || ftListCallHoleArg(pn, x, s)
@@ -3319,12 +3318,18 @@ function ftLitJoin(
     }
     return true
   }
-  // A list of maps of the set holds only maps whose own value is the set: a map of a smaller set
-  // holds closures, which one list cannot store beside ids (D15187).
+  // A list of maps of the set holds only maps whose own value is the set (D15187), or a smaller
+  // set decided with this one, whose ids are this set's (D15234).
   if ftHoldKind(lt, s, FT_HOLD_DEPTH) == 7 {
     for el in n.arrElems {
-      const ek = ftHoldKind(nodeTyIxOf(el), s, FT_HOLD_DEPTH)
-      if ek != 3 && ek != 7 { return false }
+      const et = nodeTyIxOf(el)
+      const ek = ftHoldKind(et, s, FT_HOLD_DEPTH)
+      const em = if et >= 0 && et < T.tys.length { tyAt(et) } else { null }
+      const es = if em is TyMap { fnTagSetOfTy(em.mVal) } else { -1 }
+      if ek != 3 && ek != 7 {
+        if es < 0 || es == s || !ftSetWithin(es, s) { return false }
+        if !i32ListHas(ftSubNeed, es) { ftSubNeed.push(es) }
+      }
     }
     return true
   }
@@ -3743,6 +3748,8 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     // A container slot of the holder's type is a holder of holders, which `ftHoldKind` names.
     ArrayLit => {
+      // A list of maps of a wider set decided with this one holds this set's maps (D15234).
+      if ftMapListOfWider(p, x, s) { return true }
       if !ftHolds(p, s) { return false }
       const pk = ftHoldKind(nodeTyIxOf(p), s, FT_HOLD_DEPTH)
       return ftDstTakes(ftArrElemTy(p), x, s) || pk == 4 || pk == 6
@@ -3774,6 +3781,28 @@ function ftTyHoldsDecided(t: i32, s: i32): boolean {
   false
 }
 
+// Whether list literal `p` is a list of maps of a set decided with `s` that `s` is within, and
+// `x` a map whose value carries `s`: its ids are that set's (D15234).
+function ftMapListOfWider(p: i32, x: i32, s: i32): boolean {
+  if (
+    x < 0
+    || x >= P.nodes.length
+    || ftHoldKind(nodeTyIxOf(x), s, FT_HOLD_DEPTH) != 3
+  ) {
+    return false
+  }
+  for o in ftAssume {
+    if (
+      o != s
+      && ftSetWithin(s, o)
+      && ftHoldKind(nodeTyIxOf(p), o, FT_HOLD_DEPTH) == 7
+    ) {
+      return true
+    }
+  }
+  false
+}
+
 // Whether a destination of type `dst` takes the holder `x` of set `s` as it is: its own type, or a
 // record of the storage `x` is built at that holds `s` or a set decided with it, so the holder's
 // one rep is the destination's. A list's storage is its element's, so only its own type takes it.
@@ -3781,6 +3810,18 @@ function ftDstTakes(dst: i32, x: i32, s: i32): boolean {
   if dst < 0 || x < 0 || x >= P.nodes.length { return false }
   const tx = nodeTyIxOf(x)
   if dst == tx { return true }
+  // Two maps of one key whose values carry the set have one storage, a map of its ids (D15233).
+  const dm = if dst < T.tys.length { tyAt(dst) } else { null }
+  const xm = if tx >= 0 && tx < T.tys.length { tyAt(tx) } else { null }
+  if (
+    dm is TyMap
+    && xm is TyMap
+    && tySame(dm.mKey, xm.mKey)
+    && fnTagSetOfTy(dm.mVal) == s
+    && fnTagSetOfTy(xm.mVal) == s
+  ) {
+    return true
+  }
   const bt = nodeRepTyIxOf(x)
   bt >= 0
     && bt < T.tys.length
