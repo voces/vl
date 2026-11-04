@@ -7,11 +7,12 @@
 // collection leaving more than 75% of a semispace live (`SeedGcHeadroom`,
 // scripts/vl-host/src/main.rs; docs/internals/perf/gc-heap-policy-2026-09.md §4).
 //
-// The workload is `vl check compiler/wasmEmit.vl` at the default first heap (128 MiB a
-// semispace), whose live set crosses the 96 MiB the policy grows at: 9 collections, and 46 to
-// 142 with the policy off, across master and two PRs on 2026-11-03. `typecheck.vl` was the
-// workload until its policy-off count fell from 42 to 18–20 on a 50 KiB move in the seed's live
-// set; `check_relate_core.vl` and `emit_base.vl` before it fell the same way. A target whose live
+// The workload is `vl check compiler/emit_elab.vl` at the default first heap (128 MiB a
+// semispace), whose live set crosses the 96 MiB the policy grows at: 6 collections, and 26 to
+// 32 with the policy off (4.3x through this harness, 5.0x direct) across six seeds on
+// 2026-11-04. `wasmEmit.vl` was the workload until its policy-off count fell from 46–142 to
+// 21–31, 2.3–3.4x against its 9; `typecheck.vl`, `check_relate_core.vl` and `emit_base.vl`
+// before it fell the same way. A target whose live
 // set sits just under a semispace is a cliff, so each one is graded across seeds and sources,
 // not on one (the PR body of the change that chose it). The
 // default heap is the engine configuration every other compile shares, so its
@@ -36,11 +37,12 @@ if (!ENABLED) {
   );
 }
 
-const TARGET = `${ROOT}/compiler/wasmEmit.vl`;
+const TARGET = `${ROOT}/compiler/emit_elab.vl`;
 
-// 9 at the time of writing; loose so a compiler change that moves the live set cannot red it.
+// 6 at the time of writing; loose so a compiler change that moves the live set cannot red it.
 const MAX_DEFAULT = 12;
-// 92 / 9 on master at the time of writing; 46 / 9 the weakest reading of the three trees.
+// 26 / 6 through this harness at the time of writing (three runs, one seed); 30–32 / 6 direct
+// across six seeds.
 const MIN_SPREAD = 3;
 
 async function collections(grow: string, label: string): Promise<number> {
