@@ -1373,6 +1373,9 @@ function instRecvFieldFnTy(recvIx: i32, prop: string, fnIx: i32): i32 {
 // to: first by following the receiver to the literal that built it, so two same-shaped
 // receivers from different monomorphized makers each resolve their own closure, else by
 // the receiver's struct shape (`fieldClosureFeOf`). -1 when neither resolves.
+// Whether the raw walk in progress resolved through the receiver's own binding or literal.
+let fcrOwnLit = false
+
 export function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32) {
   // A receiver already being resolved further up answers -1 here: the walk reaches a maker's
   // tail through `fnRetExprOf`, and that tail can be this same member call (D4290).
@@ -1384,7 +1387,9 @@ export function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32) {
   if objLitFieldNames[prop] == null { return -1 }
   fcrRecvStack.push(recvIx)
   fcrFnStack.push(fnIx)
+  fcrOwnLit = false
   const fe = fieldClosureFeOfRecvRaw(recvIx, prop, fnIx)
+  const own = fcrOwnLit
   fcrRecvStack.pop()
   fcrFnStack.pop()
   if fe < 0 { return fe }
@@ -1394,6 +1399,9 @@ export function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32) {
   const want = instRecvFieldFnTy(recvIx, prop, fnIx)
   const fty = nodeTyIxOf(fnStmts[fe])
   if want < 0 || tyEq(fty, want) { return fe }
+  // The receiver's own literal names its closure; an open one takes the wanted type, where the
+  // row scan below would answer another literal's of the same shape (D15114).
+  if own && (fty < 0 || tyHasTyVar(fty) || tyHasInferHole(fty, 0)) { return fe }
   const tfe = fieldClosureFeOfWant(structIndexOfExpr(recvIx, fnIx), prop, want)
   if tfe >= 0 { return tfe }
   if (
@@ -1425,7 +1433,10 @@ function fieldClosureFeOfRecvRaw(recvIx: i32, prop: string, fnIx: i32) {
       const d = nodeAt(li)
       if d is LetDecl {
         const ffe = fieldClosureFeOfInit(d.letInit, prop, fnIx)
-        if ffe >= 0 { return ffe }
+        if ffe >= 0 {
+          fcrOwnLit = true
+          return ffe
+        }
       }
     }
   }
@@ -1433,7 +1444,10 @@ function fieldClosureFeOfRecvRaw(recvIx: i32, prop: string, fnIx: i32) {
   // the template's, so the shape scan below would answer the template's closure (D2551).
   if e is Call || e is ObjLit {
     const ffe2 = fieldClosureFeOfInit(unwrapParen(recvIx), prop, fnIx)
-    if ffe2 >= 0 { return ffe2 }
+    if ffe2 >= 0 {
+      fcrOwnLit = true
+      return ffe2
+    }
   }
   // A hole param's receiver is its argument, which the struct-index fallback below cannot
   // see: `{f: () => string}` and `{f: () => i32}` collapse to one struct row, so the scan
