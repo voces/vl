@@ -1,0 +1,149 @@
+diff --git a/compiler/check_bind_adopt.vl b/compiler/check_bind_adopt.vl
+index 8e2fb2001..01b0790b9 100644
+--- a/compiler/check_bind_adopt.vl
++++ b/compiler/check_bind_adopt.vl
+@@ -29,6 +29,7 @@ import {
+   callBindRepTysSet,
+   callBindRowOf,
+   callBindTysAt,
++  callBindRepKeyedAt,
+ } from "./check_bind_rows"
+ import { nodeRepStamped, nodeRepTyIxOf } from "./check_core_state"
+ import { inferQuiet } from "./check_cursor"
+@@ -964,3 +965,21 @@ function recRebuiltCallRow(lp: i32, depth: i32): i32 {
+   if kd >= 0 && kd < T.tys.length && tyAt(kd) is TyObj { return kd }
+   recRebuiltRetRow(cd, depth - 1)
+ }
++
++// PROBE: parameter `i` of call `ix` at its call row's binding (rep row where the row is keyed there).
++export function callParamBoundTyProbe(ix: i32, i: i32): i32 {
++  const r = callBindRowOf(ix)
++  if r < 0 { return -1 }
++  const decl = elabCallDeclOf(ix)
++  if decl < 0 || decl >= P.nodes.length { return -1 }
++  const sig = nodeTyIxOf(decl)
++  if sig < 0 || sig >= T.tys.length { return -1 }
++  const f = tyAt(sig)
++  if !(f is TyFunc) || i < 0 || i >= f.fnParamTypes.length { return -1 }
++  const tys = if callBindRepKeyedAt(r) { callBindRepTysAt(r) } else { callBindTysAt(r) }
++  const q = inferQuiet
++  inferQuiet = true
++  const rt = substTyDeep(f.fnParamTypes[i], callBindNamesAt(r), tys)
++  inferQuiet = q
++  if rt < 0 || tyHasTyVar(rt) || tyHasHole(rt) { -1 } else { rt }
++}
+diff --git a/compiler/emit_mono.vl b/compiler/emit_mono.vl
+index 35ee4451b..2d2d03adc 100644
+--- a/compiler/emit_mono.vl
++++ b/compiler/emit_mono.vl
+@@ -97,6 +97,8 @@ import {
+ import { ovPickFor } from "./check_demands"
+ import { primTyOfName } from "./check_decl_scan"
+ import { unionTyIxOfIdentAt } from "./emit_start_block"
++import { repABNote } from "./emit_nullable_rets"
++import { repShadowOn } from "./emit_rep"
+ import {
+   CW_UP_ARG,
+   cwFnValueDeclOf,
+@@ -111,6 +113,7 @@ import {
+   cbaArgHoldsHeld,
+   recArgBuiltTyIn,
+   recRepWidens,
++  callParamBoundTyProbe,
+ } from "./check_bind_adopt"
+ import { inferRetFnKey } from "./check_side_rows"
+ import { recordClonedCallRetire } from "./check_asg_rows"
+@@ -204,6 +207,7 @@ import {
+   tyUnionAllLists,
+   tyVarRenameRow,
+   tyWrapsRecord,
++  tyHasHole,
+ } from "./check_types"
+ import {
+   blockHasBareReturn,
+@@ -797,6 +801,7 @@ import {
+   fnTagSetTy,
+   fnTagTyIsTagged,
+   paramCopySeedOf,
++  elabCallDeclOf,
+ } from "./check_elab_cap"
+ 
+ // D943 — the lifted slots `monoPinBodyLambdas` minted for the instance being built. A
+@@ -1207,30 +1212,70 @@ function monoCloPinAnnNodeOfExpr(ax: i32, fnIx: i32): i32 {
+ // own recorded type, except where the pin came from a binding's annotation, in which case
+ // it is that annotation's type. One home for the `pinTys` entry, so a pin's name and type
+ // can never be sourced from two different nodes.
+-export function monoArgPinTyIx(ix: i32, fnIx: i32) {
++let monoAPRung = ""
++export function monoArgPinTyIx(ix: i32, fnIx: i32): i32 {
++  monoAPRung = ""
++  const r = monoArgPinTyIxGo(ix, fnIx)
++  if repShadowOn {
++    cwIxWant()
++    const ax = unwrapParen(ix)
++    let cls = "NOTARG"
++    if ax >= 0 && ax < cwIxUpKind.length && cwIxUpKind[ax] == CW_UP_ARG {
++      const cl = cwIxUp[ax]
++      const cn = nodeAt(cl)
++      const dcl = elabCallDeclOf(cl)
++      const sig = if dcl >= 0 { nodeTyIxOf(dcl) } else { -1 }
++      const sf = if sig >= 0 && sig < T.tys.length { T.tys[sig] } else { null }
++      let open = false
++      if sf is TyFunc && cwIxUpAux[ax] < sf.fnParamTypes.length {
++        const pt = sf.fnParamTypes[cwIxUpAux[ax]]
++        open = tyHasTyVar(pt) || tyHasHole(pt)
++      }
++      const memberCall = cn is Call && cn.callFn >= 0 && nodeAt(cn.callFn) is Member
++      const e = if open && !memberCall { callParamBoundTyProbe(cl, cwIxUpAux[ax]) } else { -2 }
++      const r2 = monoExactPinTyOf(r, fnIx)
++      if e == -2 { cls = if memberCall { "MEMBER" } else { "CLOSEDPARAM" } } else if e < 0 { cls = "ELABNONE" } else if r >= 0 && tySame(r, e) { cls = "EQ" } else if r2 >= 0 && tySame(r2, e) { cls = "EQEXACT" } else {
++        cls = "NE mono=" + (if r2 >= 0 { tyToStr(r2) } else { "-1" }) + " elab=" + tyToStr(e)
++      }
++    }
++    repABNote("argpin", monoAPRung, cls)
++  }
++  r
++}
++
++function monoArgPinTyIxGo(ix: i32, fnIx: i32) {
+   const ax = unwrapParen(ix)
+   const own = nodeTyIxOf(ax)
+   // The node's own recorded type wins wherever it already names a function value (bare
+   // or nullable); the annotation channel exists only for the clone whose node carries `T`.
+-  if own >= 0 && nodeTyIsFunc(ax) { return own }
+-  if tyNulFuncInner(own) >= 0 { return own }
++  if own >= 0 && nodeTyIsFunc(ax) { monoAPRung = "fnOwn"
++ return own }
++  if tyNulFuncInner(own) >= 0 { monoAPRung = "nulFn"
++ return own }
+   if monoReadsUnfilledNull(ax) || monoParamPinnedNull(ax, fnIx) {
++    monoAPRung = "null"
+     return TY_NULL
+   }
+   const pn = monoCloPinAnnNodeOfExpr(ax, fnIx)
+-  if pn >= 0 { return nodeTyIxOf(pn) }
++  if pn >= 0 { monoAPRung = "cloAnn"
++ return nodeTyIxOf(pn) }
+   // The variant `monoArgTyNameRep` pinned an unadopted literal at banks that variant's type.
+   const ov = monoArgOwnVariant(ax)
+-  if ov >= 0 && ov < uVarTyIx.length { return uVarTyIx[ov] }
++  if ov >= 0 && ov < uVarTyIx.length { monoAPRung = "variant"
++ return uVarTyIx[ov] }
+   // A literal the record solve built at another record banks that build, as its pin names it.
+   const lb = monoLitBuiltTy(ax)
+-  if lb >= 0 { return lb }
++  if lb >= 0 { monoAPRung = "litBuilt"
++ return lb }
+   const rr = monoArgRepRowTy(ax)
+-  if rr >= 0 { return rr }
++  if rr >= 0 { monoAPRung = "repRow"
++ return rr }
+   const cpy = recCopyTyOf(ax)
+   if cpy >= 0 && cpy < T.tys.length && monoRecordNominalPin(cpy) != "" {
++    monoAPRung = "copy"
+     return cpy
+   }
++  monoAPRung = "own"
+   own
+ }
+ 
