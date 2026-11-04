@@ -3662,19 +3662,78 @@ export function recAsgBindInit(p: i32): i32 {
   cwPeelValue(dn.letInit)
 }
 
-// The record a record literal `p` assigned whole into a binding the field widener widened is built
-// at: the binding's own (D15306); else -1.
+// The record a record literal `p` written whole into a binding the field widener widened, a field
+// or element slot of one, or pushed onto a list one roots, is built at (D15306, D15307, D15336);
+// else -1.
 export function recAsgFnWidenedTy(p: i32): i32 {
   if p < 0 || p >= P.nodes.length || !(nodeAt(p) is ObjLit) { return -1 }
-  const d = recAsgBindDecl(p)
-  if d < 0 || recAsgBindInit(p) < 0 || !elabFnFieldWidenedAny(d) { return -1 }
-  const t = nodeTyIxOf(d)
+  // The place, a binding or a field or element slot of one, and the binding it is rooted at;
+  // `steps` is the slot's path from the place inward.
+  let x = recAsgPlaceOf(p)
+  // A literal pushed onto a list is a write of one of its elements (D15336).
+  const pushed = x < 0
+  if pushed { x = recLitPushReceiverOf(p) }
+  const steps: string[] = []
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 16 {
+    const xn = nodeAt(x)
+    if xn is Member {
+      steps.push(xn.memProp)
+      x = cwPeelValue(xn.memObj)
+    } else if xn is Index {
+      steps.push("")
+      x = cwPeelValue(xn.idxArr)
+    } else {
+      hops = 16
+    }
+    hops = hops + 1
+  }
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const d = recBindDeclOf(x)
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letType >= 0
+    || dn.letInit < 0
+    || !elabFnFieldWidenedAny(d)
+  ) {
+    return -1
+  }
+  let t = nodeTyIxOf(d)
+  let k = steps.length - 1
+  while k >= 0 {
+    const st = steps[k]
+    k = k - 1
+    const tt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    t = if st == "" && tt is TyArray { tt.aElem } else if st != "" && tt is TyObj { tyFieldTyOf(t, st) } else { -1 }
+  }
+  if pushed {
+    const lt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    t = if lt is TyArray { lt.aElem } else { -1 }
+  }
   if t >= 0 && t < T.tys.length && tyAt(t) is TyObj { t } else { -1 }
+}
+
+// The list a record literal `p` is pushed onto, peeled; else -1.
+function recLitPushReceiverOf(p: i32): i32 {
+  cwIxBuild()
+  const a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if !(an is Call) || an.callFn < 0 || !i32ListHas(an.callArgs, p) { return -1 }
+  const f = nodeAt(an.callFn)
+  if f is Member && f.memProp == "push" { cwPeelValue(f.memObj) } else { -1 }
 }
 
 // The un-annotated binding a literal or read `p` is assigned whole into, through `if` arms; -1
 // when it is no such value.
 function recAsgBindDecl(p: i32): i32 {
+  const l = recAsgPlaceOf(p)
+  if l >= 0 && nodeAt(l) is Ident { recBindDeclOf(l) } else { -1 }
+}
+
+// The place a literal or read `p` is assigned whole into, through `if` arms; -1 when it is no
+// such value.
+function recAsgPlaceOf(p: i32): i32 {
   cwIxBuild()
   let x = p
   let hops = 0
@@ -3690,7 +3749,7 @@ function recAsgBindDecl(p: i32): i32 {
   const leaves: i32[] = []
   tailValueLeaves(an.binRight, leaves)
   if !i32ListHas(leaves, p) { return -1 }
-  if nodeAt(an.binLeft) is Ident { recBindDeclOf(an.binLeft) } else { -1 }
+  an.binLeft
 }
 
 // Whether `p` is `read ?? { … }` handed to a parameter that takes the rep `rep`; the literal is
@@ -3733,7 +3792,7 @@ export function recCoalesceDefaultDeliver(p: i32, rep: i32): boolean {
   const d = if nodeAt(v) is Ident { recHeldDecl(v) } else { -1 }
   // A fresh `const` literal keeps its own type and is built at `rep`, so the join stays one record
   // (D15310); one record cannot also be delivered at its own storage, so those are refused.
-  if recCoalesceHeldLit(d) >= 0 {
+  if recCoalesceDefaultBuilt(p) {
     recBuildPush(d, own, rep, false)
     recHeldOwnRefuse(d, rep, p, recCoalesceDefaultsAt(d, rep))
     return true
@@ -3747,6 +3806,17 @@ export function recCoalesceDefaultDeliver(p: i32, rep: i32): boolean {
   }
   recAdoptNote(v, own, rep)
   true
+}
+
+// Whether `p`, a `??`, defaults to a binding of a fresh `const` record literal, which the general
+// arm builds at the read's record while it keeps its own type, so the join is one record. False
+// for a `let` or a `const` of a call, which the record solve adopts at the read's record instead.
+export function recCoalesceDefaultBuilt(p: i32): boolean {
+  const n = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if !(n is BinExpr) || n.binOp != "??" { return false }
+  const v = cwPeelValue(n.binRight)
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  recCoalesceHeldLit(recHeldDecl(v)) >= 0
 }
 
 // Every read of the binding `d` that defaults a `??` over a read built at the record `rep`, and
@@ -3770,6 +3840,48 @@ function recCoalesceDefaultsAt(d: i32, rep: i32): i32[] {
   out
 }
 
+// Whether every read of the binding `d` defaults a `??` over a read built at the record `rep`
+// (`recCoalesceDefaultsAt`). Narrow on purpose: with an own-type delivery the pin's refusal is
+// what stops invalid wasm, and an unscoped hand-on broke a maker also called at its own (D15311).
+function recUsedOnlyAsDefaultAt(d: i32, rep: i32): boolean {
+  cwIxBuild()
+  let uses = 0
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    if cwIxKind[w.row] == CW_OCC_USE { uses = uses + 1 }
+  }
+  uses > 0 && uses * 2 == recCoalesceDefaultsAt(d, rep).length
+}
+
+// Whether inferred function `fd` hands back another inferred function's call: a returned value is
+// such a call, or a binding holding one. False for -1 and for a maker of its own literal.
+function recMakerHandsOnCall(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length { return false }
+  for lf in recFnValueLeaves(fd) {
+    const v = cwPeelValue(lf)
+    if (
+      v >= 0
+      && v < P.nodes.length
+      && nodeAt(v) is Call
+      && recInferredFnOf(v) >= 0
+    ) {
+      return true
+    }
+    if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident {
+      const c = recHeldCallOrigin(v)
+      if (
+        c >= 0
+        && c < P.nodes.length
+        && nodeAt(c) is Call
+        && recInferredFnOf(c) >= 0
+      ) {
+        return true
+      }
+    }
+  }
+  false
+}
+
 // Builds the fresh record `const` `d` at the record `rep` where `p` delivers it, refusing each
 // delivery of `d` at its own storage outside `skip`, since one record cannot be both.
 function recHeldBindAdopt(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
@@ -3777,6 +3889,14 @@ function recHeldBindAdopt(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
   // A call's function is built at `rep` too, as a delivery of the call there builds it (D15240).
   if init >= 0 && init < P.nodes.length && nodeAt(init) is Call {
     recAdoptNote(init, nodeTyIxOf(init), rep)
+    // A maker handing back another maker's call is built at `rep` down the chain by that
+    // delivery; adopting the binding as well declines the hand-on, so it is not (D15311).
+    if (
+      recMakerHandsOnCall(recInferredFnOf(init))
+      && recUsedOnlyAsDefaultAt(d, rep)
+    ) {
+      return recHeldOwnRefuse(d, rep, p, skip)
+    }
   }
   recAdPushDecl(d, nodeTyIxOf(init), rep, false, p)
   recHeldOwnRefuse(d, rep, p, skip)
@@ -7312,6 +7432,15 @@ function tyIsUnionDst(t: i32): boolean {
   d is TyUnion || d is TyNullable
 }
 
+let repTemplateMuted = false
+
+// Runs nothing; while `on`, a stamp outside an elaboration writes no template column, for a
+// question asked at one instance's pin of a node every instance shares (D15288).
+export function repTemplateMute(on: boolean): i32 {
+  repTemplateMuted = on
+  1
+}
+
 // Records `t` as the type node `ix` is built at, in the elaboration in progress when one is
 // re-checking an instance; 1.
 function repStamp(ix: i32, t: i32): i32 {
@@ -7319,6 +7448,7 @@ function repStamp(ix: i32, t: i32): i32 {
     elabCapRep[ix] = t
     return 1
   }
+  if repTemplateMuted { return 1 }
   while nodeRepTyIx.length <= ix { nodeRepTyIx.push(-1) }
   nodeRepTyIx[ix] = t
   1
@@ -7336,6 +7466,7 @@ function repStampUnion(ix: i32, u: i32): i32 {
     elabCapRepUnion[ix] = u
     return 1
   }
+  if repTemplateMuted { return 1 }
   nodeRepUnionIx[ix] = u
   1
 }

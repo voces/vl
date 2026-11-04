@@ -19,6 +19,7 @@ import {
 import { rcwCallSites } from "./check_record_writes"
 import { callRetRepTy } from "./check_bind_adopt"
 import { nodeTyIxOf } from "./check_node_tys"
+import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
 import { tErr } from "./check_relate_core"
 import {
   nodeRepStamped,
@@ -40,6 +41,7 @@ import {
 import { nonNullTy } from "./tyquery"
 import {
   recBuiltReadTy,
+  recCoalesceDefaultBuilt,
   recCoalesceDefaultDeliver,
   recCoalesceLitAdopt,
   recHoleIdentityArg,
@@ -63,7 +65,7 @@ import {
 import { recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
 import { recSolePinArg } from "./check_record_origins"
 import { recFnValueLeaves } from "./check_type_shape"
-import { cwIxUp, cwPeelValue } from "./check_write_scan"
+import { cwFrJoins, cwIxUp, cwPeelValue } from "./check_write_scan"
 import { recArgRepArgs, recArgRepOf, recBuildPush } from "./check_rec_rows"
 import { identBoundFnDeclOf } from "./check_scopes"
 import { identDeclOf } from "./symbols"
@@ -302,13 +304,14 @@ function storeSlotHeldAt(v: i32, depth: i32): i32 {
   if nested >= 0 { return nested }
   const own = nodeTyIxOf(v)
   const r = if n is BinExpr { storeHeldAt(v) } else if n is Ident { storeBindingHeldAt(v) } else { storeSlotKeepsOwnRow(v) }
-  // A join whose default is a binding is held there and at the join's own row at once, so a
-  // literal slot holding it has no one record to build at (D15313).
+  // A join whose default is a binding the record solve adopts (a `let`, a `const` of a call) is
+  // typed as a union of its own row and the read's record, which a literal slot built at that
+  // record cannot hold; a fresh `const` literal is built there and joins as one record (D15316).
   const j = if n is Ident { storeJoinOfBinding(v) } else { v }
   const jb = if j >= 0 && j < P.nodes.length && nodeAt(j) is BinExpr { recBuiltReadTy(j) } else { -1 }
-  if jb >= 0 && storeJoinDefaultHeld(j) {
+  if jb >= 0 && storeJoinDefaultHeld(j) && !recCoalesceDefaultBuilt(j) {
     tErr(
-      "a `??` whose default is a binding, built at "
+      "a `??` whose default is a `let` or a call's result held in a `const`, built at "
         + tyToStr(nonNullTy(jb))
         + " for a read of a container built wider, is not yet supported inside a list or record "
         + "literal",
@@ -369,6 +372,60 @@ export function retValueRootCall(v: i32): i32 {
     hops = hops + 1
   }
   -1
+}
+
+// Refuses each `??` over a read of a container built wider whose default is a parameter or an
+// annotated binding stored apart from the read's record: no build can move it, so the join would
+// hold two storages; a converting copy of the read is the capability this stands in for (D15241).
+export function storeCoalescesResolve() {
+  for j in cwFrJoins {
+    const n = if j >= 0 && j < P.nodes.length { nodeAt(j) } else { null }
+    if n is BinExpr && n.binOp == "??" {
+      const b = recBuiltReadTy(j)
+      const bt = if b >= 0 { nonNullTy(b) } else { -1 }
+      const v = cwPeelValue(n.binRight)
+      if (
+        bt >= 0
+        && bt < T.tys.length
+        && tyAt(bt) is TyObj
+        && storeDefaultFixed(v)
+      ) {
+        const vt = nodeTyIxOf(v)
+        // An un-annotated parameter's own type is its hole here, so no storage can be compared;
+        // every pin of one joins the read with a record no build moves (D15318).
+        const apart = storeDefaultIsHoleParam(v)
+          || (vt >= 0
+          && vt < T.tys.length
+          && tyAt(vt) is TyObj
+          && !fieldStorageEq(vt, bt, REC_STORE_DEPTH))
+        if apart {
+          tErr(
+            "a `??` whose default is a parameter or an annotated binding, stored apart from the "
+              + tyToStr(bt)
+              + " a read of a container built wider holds, is not yet supported",
+            v,
+          )
+        }
+      }
+    }
+  }
+}
+
+// Whether `v` reads a parameter or an annotated binding, a record no build can move.
+function storeDefaultFixed(v: i32): boolean {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  const d = identDeclOf(v)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if dn is Param { return true }
+  dn is LetDecl && dn.letType >= 0
+}
+
+// Whether `v` reads an un-annotated parameter, whose type is its hole until a call pins it.
+function storeDefaultIsHoleParam(v: i32): boolean {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  const d = identDeclOf(v)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  dn is Param && dn.parType < 0
 }
 
 // Stamps every value a queued function returns with the record a build holds it at, where each

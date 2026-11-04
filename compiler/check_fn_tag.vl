@@ -3,7 +3,7 @@
 // node carrying it is a place the emitter can lower as an id: a name of a member, a binding, a
 // return, an `if`/`match` arm, or the callee of a call through it. A call through a tagged set
 // dispatches on the id to a direct call of each member, which this pass builds.
-import { recordBoxTy } from "./check_fit_rules"
+import { recAsgFnWidenedTy, recordBoxTy } from "./check_fit_rules"
 import {
   ArrayLit,
   AsExpr,
@@ -140,7 +140,6 @@ import { identFnDeclOf } from "./check_scopes"
 import { declIsExportedFn } from "./check_exp_obs"
 import {
   coerceRecordOpen,
-  elabFnFieldWidenedAny,
   elabFnIdOf,
   elabLiveTyOf,
   elabMakerRowHas,
@@ -227,7 +226,7 @@ let ftArmOnlyLams: {[i32]: boolean} = Map()
 // Fills `ftArmOnlyLams` by one walk from `rootIx`, the shape `ftScan` walks the program in.
 function ftArmOnlyLamsNote(rootIx: i32) {
   ftArmOnlyLams = Map()
-  const written: i32[] = []
+  const written: {[i32]: boolean} = Map()
   const lets: i32[] = []
   const todo: i32[] = [rootIx]
   while todo.length > 0 {
@@ -243,7 +242,7 @@ function ftArmOnlyLamsNote(rootIx: i32) {
   }
   for d in lets {
     const n = nodeAt(d)
-    if n is LetDecl && i32ListHas(written, d) { ftArmOnlyLamMark(n.letInit) }
+    if n is LetDecl && (written[d] ?? false) { ftArmOnlyLamMark(n.letInit) }
   }
   0
 }
@@ -277,14 +276,14 @@ function ftArmOnlyIndexStoreNote(x: i32) {
 }
 
 // Marks the lambda store `x` writes to a `let`, and adds the `let` to `written`.
-function ftArmOnlyLetStoreNote(x: i32, written: i32[]) {
+function ftArmOnlyLetStoreNote(x: i32, written: {[i32]: boolean}) {
   const n = nodeAt(x)
   if !(n is BinExpr) || !ftIsStore(n) { return 0 }
   const l = parenPeelIx(n.binLeft)
   if l < 0 || l >= P.nodes.length || !(nodeAt(l) is Ident) { return 0 }
   const d = identDeclOf(l)
   if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return 0 }
-  if !i32ListHas(written, d) { written.push(d) }
+  written[d] = true
   ftArmOnlyLamMark(n.binRight)
   0
 }
@@ -1268,17 +1267,16 @@ function ftScan(
           }
         }
       }
-      // A record written whole into a binding the field widener widened stores ids at its fields;
-      // the store column builds the literal at the binding's row (D15306). Only a binding: no
-      // producer builds a literal written into a field or element slot at the slot's row.
+      // A record literal written whole into a binding the field widener widened, or a field or
+      // element slot of one, stores ids at its fields; the record solve builds the literal at that
+      // place's record (`recAsgFnWidenedTy`, D15306, D15307).
       const rw = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
       if (
         ftHolds(x, s)
-        && nodeAt(x) is Ident
-        && elabFnFieldWidenedAny(identDeclOf(x))
         && rw is BinExpr
         && ftIsStore(rw)
         && rw.binLeft == x
+        && recAsgFnWidenedTy(parenPeelIx(rw.binRight)) >= 0
         && !ftRecWriteJoins(rw.binRight, nodeTyIxOf(x), s, ds, leaves, ids, 0)
       ) {
         return false
@@ -1314,7 +1312,20 @@ function ftScan(
       }
       // A value a slot method writes into the holder is an id of the set, as a store's is.
       for v in ftSlotWrites(x, p, g, s) {
-        if !ftJoinAt(v, ftSlotTyOf(nodeTyIxOf(x), s), s, ds, leaves, ids) {
+        const xti = nodeTyIxOf(x)
+        const xt = if xti >= 0 && xti < T.tys.length { tyAt(xti) } else { null }
+        const rec = ftHoldKind(xti, s, FT_HOLD_DEPTH) == 6 && xt is TyArray
+        if (
+          rec
+          && xt is TyArray
+          && !ftRecWriteJoins(v, xt.aElem, s, ds, leaves, ids, 0)
+        ) {
+          return false
+        }
+        if (
+          !rec
+          && !ftJoinAt(v, ftSlotTyOf(nodeTyIxOf(x), s), s, ds, leaves, ids)
+        ) {
           return false
         }
       }
@@ -3027,10 +3038,9 @@ function ftParamUnread(d: i32, i: i32): boolean {
   true
 }
 
-// Whether callee `x` names a member of set `s` by its declaration, a direct call whatever the
-// set's rep; counted after the elaboration only.
-function ftLateDirectCall(x: i32, s: i32): boolean {
-  if !ftLate { return false }
+// Whether callee `x` names a member of set `s` by its declaration: a direct call, whatever the
+// set's rep, so it reads no id of the set (D15338).
+function ftMemberDirectCall(x: i32, s: i32): boolean {
   const d = identDeclOf(x)
   d >= 0
     && d < P.nodes.length
@@ -3186,7 +3196,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     Call => {
       if pn.callFn == x {
-        return fnTagCallSetOf(p) == s || ftLateDirectCall(x, s)
+        return fnTagCallSetOf(p) == s || ftMemberDirectCall(x, s)
       }
       return (ftParamOfSet(pn, x, s) && ftLateParamOk(pn, x, s))
         || ftListCallHoleArg(pn, x, s)
@@ -3308,12 +3318,18 @@ function ftLitJoin(
     }
     return true
   }
-  // A list of maps of the set holds only maps whose own value is the set: a map of a smaller set
-  // holds closures, which one list cannot store beside ids (D15187).
+  // A list of maps of the set holds only maps whose own value is the set (D15187), or a smaller
+  // set decided with this one, whose ids are this set's (D15234).
   if ftHoldKind(lt, s, FT_HOLD_DEPTH) == 7 {
     for el in n.arrElems {
-      const ek = ftHoldKind(nodeTyIxOf(el), s, FT_HOLD_DEPTH)
-      if ek != 3 && ek != 7 { return false }
+      const et = nodeTyIxOf(el)
+      const ek = ftHoldKind(et, s, FT_HOLD_DEPTH)
+      const em = if et >= 0 && et < T.tys.length { tyAt(et) } else { null }
+      const es = if em is TyMap { fnTagSetOfTy(em.mVal) } else { -1 }
+      if ek != 3 && ek != 7 {
+        if es < 0 || es == s || !ftSetWithin(es, s) { return false }
+        if !i32ListHas(ftSubNeed, es) { ftSubNeed.push(es) }
+      }
     }
     return true
   }
@@ -3542,6 +3558,16 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
       || !tyHasTyVar(pt) && !tyReachesHole(pt, 8)
       || ftHoleCallback(c.callArgs[0])
   }
+  // A list of records rooted at a binding the field widener widened takes a pushed literal the
+  // record solve builds at its element (D15336).
+  if k == 6 && op == "push" {
+    const c = nodeAt(g)
+    if !(c is Call) || c.callArgs.length == 0 { return false }
+    for a in c.callArgs {
+      if recAsgFnWidenedTy(parenPeelIx(a)) < 0 { return false }
+    }
+    return true
+  }
   // A slice copies the list's ids into a list of the same set, read as the holder is (D14931).
   if k == 1 {
     return op == "push" || op == "slice" || op == "pop" || op == "get"
@@ -3722,6 +3748,8 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     // A container slot of the holder's type is a holder of holders, which `ftHoldKind` names.
     ArrayLit => {
+      // A list of maps of a wider set decided with this one holds this set's maps (D15234).
+      if ftMapListOfWider(p, x, s) { return true }
       if !ftHolds(p, s) { return false }
       const pk = ftHoldKind(nodeTyIxOf(p), s, FT_HOLD_DEPTH)
       return ftDstTakes(ftArrElemTy(p), x, s) || pk == 4 || pk == 6
@@ -3747,6 +3775,28 @@ function ftTyHoldsDecided(t: i32, s: i32): boolean {
   if ftHoldKind(t, s, FT_HOLD_DEPTH) > 0 { return true }
   for o in ftAssume {
     if o != s && ftSetWithin(s, o) && ftHoldKind(t, o, FT_HOLD_DEPTH) > 0 {
+      return true
+    }
+  }
+  false
+}
+
+// Whether list literal `p` is a list of maps of a set decided with `s` that `s` is within, and
+// `x` a map whose value carries `s`: its ids are that set's (D15234).
+function ftMapListOfWider(p: i32, x: i32, s: i32): boolean {
+  if (
+    x < 0
+    || x >= P.nodes.length
+    || ftHoldKind(nodeTyIxOf(x), s, FT_HOLD_DEPTH) != 3
+  ) {
+    return false
+  }
+  for o in ftAssume {
+    if (
+      o != s
+      && ftSetWithin(s, o)
+      && ftHoldKind(nodeTyIxOf(p), o, FT_HOLD_DEPTH) == 7
+    ) {
       return true
     }
   }

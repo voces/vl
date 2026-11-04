@@ -73,6 +73,15 @@ The next readers would be `litBuilt`, `copy`, `variant` and `cloAnn` (step 2), t
 fallthrough. `own` is the large one: 21,547 EQ, 2,163 EQEXACT and 403 mono-open calls, where the
 fact answers with a closed type and mono today keeps `T`.
 
+## A second reader of the same confusion
+
+`litRepTyAt`'s second rung, `elabArgTyAt`, answers a literal argument with the parameter type its
+call closes. That is the instance's settled parameter: an output. It used to rank above the
+literal's own rep stamp, which is where the literal is built. D15288 was that ordering. A list
+literal spread into a push took `push`'s parameter `{f: i32}[]` over its `J[]` stamp. Since
+D15288's fix, a closed stamp ranks first, and `elabArgTyAt` answers only for an open stamp.
+`elabArgTyAt` should become a reader of the per-argument fact once that fact exists.
+
 ## Not decided here
 
 - **`fnOwn`.** The argument names a function value: 739 NE, mostly `(T) => T` against an
