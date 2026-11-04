@@ -18,6 +18,7 @@ import {
   Spread,
   TypeRef,
   callHasTyArgs,
+  i32ToStr,
   nodeAt,
 } from "./ast"
 import {
@@ -72,7 +73,9 @@ import {
 } from "./check_fit_rules"
 import { isNullTy, nonNullTy, tyHasTyVar } from "./tyquery"
 import { recSolePinArg } from "./check_record_origins"
-import { assignable, bindGenWalk, substTyDeep } from "./check_relate_core"
+import { assignable, bindGenWalk, substTyDeep, tErr } from "./check_relate_core"
+import { nodeLineOf } from "./check_capture_loss"
+import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
 import { identBoundFnDeclOf } from "./check_scopes"
 import {
   CW_OCC_BIND,
@@ -109,11 +112,13 @@ import {
   cUserTypesVer,
   mkArrayTy,
   mkObjTy,
+  tyArrayElemIx,
   tyAt,
   tyFieldTyOf,
   tyHasHole,
   tyMentionsErr,
   tySame,
+  tyToStr,
 } from "./check_types"
 
 // How many sole-pin identities and argument-free calls a rebuilt literal is followed through.
@@ -435,6 +440,19 @@ function recListLitBuiltTyOf(l: ArrayLit, own: i32, tbl: Map<i32, i32>): i32 {
 }
 
 // `callRetRepTy` of the call `x` is, or of the call a `const` binding read `x` holds; -1 else.
+// The call value `x` is, or the call the `const` it names holds; else -1.
+function recListCallOf(x: i32): i32 {
+  const n = nodeAt(x)
+  if n is Call { return x }
+  if !(n is Ident) { return -1 }
+  const d = recHeldDecl(x)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+  const iv = parenPeelIx(dn.letInit)
+  if iv >= 0 && nodeAt(iv) is Call { iv } else { -1 }
+}
+
 function recListCallRepTy(x: i32, own: i32): i32 {
   const n = nodeAt(x)
   if n is Call { return callRetRepTy(x, own) }
@@ -666,6 +684,8 @@ function recListLitBuild(l: i32, late: boolean): boolean {
   // Fresh literal parts, and spread list literals, take the build the other parts agree on.
   const fresh: i32[] = []
   const freshLists: i32[] = []
+  const owns: i32[] = []
+  let btAt = -1
   for e in n.arrElems {
     const pe = parenPeelIx(e)
     const pn = if pe >= 0 && pe < P.nodes.length { nodeAt(pe) } else { null }
@@ -682,9 +702,21 @@ function recListLitBuild(l: i32, late: boolean): boolean {
       const ix = if pn is Index { recElemOfElemStamp(parenPeelIx(pn.idxArr)) } else { -1 }
       const b = if pn is Spread { recSpreadPartBuiltTy(sv) } else if ix >= 0 { mkArrayTy(ix) } else { recLitPartBuiltTy(e, late) }
       if b == -2 { return !late }
-      if b < 0 || (bt >= 0 && !tySame(b, bt)) { return false }
-      bt = b
+      if b < 0 {
+        owns.push(pe)
+      } else if bt >= 0 && !tySame(b, bt) {
+        return false
+      } else {
+        // A call's result is copied where it lands (D14817), so only a held part pins the list.
+        if !(pn is Call) { btAt = pe }
+        bt = b
+      }
     }
+  }
+  // A part held at its own storage beside one built elsewhere: the list cannot hold both (D15372).
+  if owns.length > 0 {
+    if bt >= 0 && btAt >= 0 { recListPartsApartRefuse(owns, bt, btAt) }
+    return false
   }
   if bt >= 0 && !nodeRepStamped(l) {
     for f in fresh { adoptLitAt(f, bt) }
@@ -693,6 +725,35 @@ function recListLitBuild(l: i32, late: boolean): boolean {
     recLitStamped[l] = true
   }
   false
+}
+
+// Refuses each part in `owns` of a list literal whose elements are held at their own storage,
+// where another part, at `at`, is built at `bt` and stores a field differently (D15372).
+function recListPartsApartRefuse(owns: i32[], bt: i32, at: i32) {
+  for o in owns {
+    const on = nodeAt(o)
+    // A binding of a fresh literal can be built where the list is: not refused here.
+    if recFreshDeclOf(o) >= 0 { continue }
+    const ot = if on is Spread { tyArrayElemIx(nodeTyIxOf(parenPeelIx(on.spdArg))) } else { nodeTyIxOf(o) }
+    if (
+      ot >= 0
+      && ot < T.tys.length
+      && !fieldStorageEq(ot, bt, REC_STORE_DEPTH)
+    ) {
+      tErr(
+        "this list holds elements built as "
+          + tyToStr(bt)
+          + " where line "
+          + i32ToStr(nodeLineOf(at))
+          + " gives them, and elements held at their own "
+          + tyToStr(ot)
+          + " here, which store a field differently; a record is shared, not copied, so one "
+          + "list cannot hold both. Copy these with an object literal",
+        o,
+      )
+    }
+  }
+  0
 }
 
 // The type each element of list `x`, spread as a part of a list literal, is built at: an inner
@@ -757,7 +818,8 @@ function recLitPartBuiltTy(e: i32, late: boolean): i32 {
   let b = if br >= 0 { nonNullTy(br) } else { -1 }
   const valued = pn is Call || pn is Ident
   if br < 0 && valued { b = recArgBuiltTyOf(pe, own) }
-  if b < 0 && valued {
+  // Only a call, or a `const` holding one, waits on a rep row; any other part answers now (D15372).
+  if b < 0 && valued && (late || recListCallOf(pe) >= 0) {
     if late { b = recListCallRepTy(pe, own) } else { return -2 }
   }
   if b >= 0 && !tySame(b, own) && tyAt(b) is TyObj { b } else { -1 }
