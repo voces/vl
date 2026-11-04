@@ -4,8 +4,7 @@ import { recNarrowRecordOf } from "./check_bind_adopt"
 // ref-array element resolves to, and the heap twins of a variant's struct rows.
 
 import { elabListFnElemTy } from "./emit_elab"
-import { fnTagHoldsTy, fnTagListTy, fnTagTyIsTagged } from "./check_elab_cap"
-import { identDeclOf } from "./symbols"
+import { fnTagHeldRepOf, fnTagListTy, fnTagTyIsTagged } from "./check_elab_cap"
 import {
   ArrayLit,
   AsExpr,
@@ -180,7 +179,6 @@ import {
   nullablePartOf,
   parenUnionArrElemName,
   setShapeOfTy,
-  unwrapParen,
 } from "./emit_base"
 import { emitFail } from "./emit_bytes"
 import {
@@ -342,7 +340,6 @@ import {
   sFieldStart,
   sFieldTypes,
   sIsRefRow,
-  sLitMintRow,
   sNames,
   sTyIx,
   slUsed,
@@ -3501,86 +3498,18 @@ function declRecNameAbove(ty: i32, depth: i32): string {
   nm + sfx
 }
 
-// The type a literal's `#anon` row name with one or more `[]` is spelled from: the record that
-// row recorded, one list per `[]`; -1 for any other name, which no annotation spells (D15220).
-export function anonListNameTy(name: string): i32 {
-  if name.length < 7 || name[0] != '#' { return -1 }
-  let base = name
-  let lists = 0
-  while base.length > 2 && base.slice(base.length - 2, base.length) == "[]" {
-    base = base.slice(0, base.length - 2)
-    lists = lists + 1
-  }
-  if lists == 0 { return -1 }
-  const r = structIndexByName(base)
-  if r < 0 || r >= sTyIx.length || sTyIx[r] < 0 { return -1 }
-  let t = sTyIx[r]
-  while lists > 0 {
-    t = mkArrayTy(t)
-    lists = lists - 1
-  }
-  t
-}
-
-// `arrLitMintedLeafName` where list literal `arrIx`'s element is a list holding a tagged set's
-// ids through a record, else "".
-function arrLitMintedLeafNameOf(arrIx: i32): string {
-  const e = tyArrayElemIx(nodeTyIxOf(arrIx))
-  if e < 0 || !(tyAt(e) is TyArray) || !fnTagHoldsTy(e, 8) { return "" }
-  arrLitMintedLeafName(arrIx)
-}
-
-// The element name of list literal `arrIx` whose elements are list literals down to a record
-// literal, each reached directly or through an un-annotated `const`: that literal's minted row,
-// with one `[]` per list between; "" where it minted none.
-function arrLitMintedLeafName(arrIx: i32): string {
-  let x = arrIx
-  let sfx = ""
-  let depth = 0
-  while depth < 16 {
-    const n = nodeAt(x)
-    if !(n is ArrayLit) || n.arrElems.length == 0 { return "" }
-    const e0 = constLitOf(n.arrElems[0])
-    if e0 < 0 { return "" }
-    if nodeAt(e0) is ObjLit {
-      const r = sLitMintRow[e0] ?? -1
-      if r < 0 || r >= sNames.length || depth == 0 { return "" }
-      return sNames[r] + sfx
-    }
-    sfx = sfx + "[]"
-    x = e0
-    depth = depth + 1
-  }
-  ""
-}
-
-// The literal expression `ix` is, through parentheses and an un-annotated `const` naming it; -1
-// for any other value.
-function constLitOf(ix: i32): i32 {
-  const v = unwrapParen(ix)
-  if v < 0 || v >= P.nodes.length { return -1 }
-  const vn = nodeAt(v)
-  if vn is ArrayLit || vn is ObjLit { return v }
-  if !(vn is Ident) { return -1 }
-  const d = identDeclOf(v)
-  if d < 0 || d >= P.nodes.length { return -1 }
-  const dn = nodeAt(d)
-  if (
-    !(dn is LetDecl)
-    || dn.letType >= 0
-    || dn.letKw != "const"
-    || dn.letInit < 0
-  ) {
-    return -1
-  }
-  const iv = unwrapParen(dn.letInit)
-  if iv < 0 || iv >= P.nodes.length { return -1 }
-  const ivn = nodeAt(iv)
-  if ivn is ArrayLit || ivn is ObjLit { return iv }
-  -1
+// The element of the rep the checker stamped on list literal `arrIx` holding a tagged set's ids
+// (`fnTagHeldRepOf`), where that element is itself a list; -1 otherwise.
+export function heldListElemTy(arrIx: i32): i32 {
+  const e = tyArrayElemIx(fnTagHeldRepOf(arrIx))
+  if e < 0 || e >= T.tys.length || !(tyAt(e) is TyArray) { return -1 }
+  e
 }
 
 export function arrLitNestedElemName(arrIx: i32): string {
+  // A list holding a tagged set's ids is named by the rep the checker stamped on it (D15220).
+  const held = heldListElemTy(arrIx)
+  if held >= 0 { return tyToNominalName(held) }
   const ty = nodeTyIxOf(arrIx)
   if ty < 0 { return "" }
   const t = tyAt(ty)
@@ -3590,9 +3519,6 @@ export function arrLitNestedElemName(arrIx: i32): string {
       if el is TyArray {
         // A list of a tagged set's ids is stored as the i32 list it is, at any depth (D15204).
         if fnTagListTy(t.aElem) { return fnTagListRepName(t.aElem) }
-        // A list of records holding them is keyed by the row its record literal minted (D15220).
-        const mn = arrLitMintedLeafNameOf(arrIx)
-        if mn != "" { return mn }
         // The gate is the same one `nodeArrayElemName`'s arm asks (D702): does this element
         // render? A spelling with no render is one no row can be keyed under.
         const dn = deepDeclRecName(t.aElem)
@@ -3625,8 +3551,8 @@ export function arrLitNestedElemKind(arrIx: i32): i32 {
   if fnTagListTy(et) {
     return if fnTagListTy(tyArrayElemIx(et)) { RLK_REF_LIST } else { RLK_I32_LIST }
   }
-  // A list of records holding them is the ref list of the record's minted row (D15220).
-  if arrLitMintedLeafNameOf(arrIx) != "" { return RLK_REF_LIST }
+  const held = heldListElemTy(arrIx)
+  if held >= 0 { return refListElemKindOfTy(held) }
   if arrLitElemRender(arrIx) == "" { return RLK_I32_LIST }
   refListElemKindOfTy(tyArrayElemIx(nodeTyIxOf(arrIx)))
 }
@@ -4122,7 +4048,7 @@ function fnRetKeepsAlias(r: i32): boolean {
 
 // The shared body: the rep key, then `rlSlotOfTyTwin(twinTy)`.
 function rlSlotByNameK(name: string, twinTy: i32): i32 {
-  const key = repElemIdOfNameTy(name, anonListNameTy(name))
+  const key = repElemIdOfNameTy(name, -1)
   let ci = 0
   while ci < rlElemName.length {
     if rlElemKey[ci] == key { return ci }
