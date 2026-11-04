@@ -128,8 +128,6 @@ import {
   mintFactSetOf,
   mintFactSplits,
   mintNestedPerEnclOf,
-  mintParamBoundSets,
-  mintParamKeyCount,
   mintParamSetsOf,
   mintParamTakes,
   mintRetParamsOf,
@@ -717,7 +715,6 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   ftWideSeen = false
   ftBindsCur = []
   ftHeldCur = []
-  ftFwdFn = ftCallsHandFn(rootIx, s, calls, mint)
   if !ftScan(rootIx, s, ds, leaves, ids) { return false }
   // A written `let` a parameter initialises holds `s` only in an instance, so the members written
   // to it are the set's leaves, and the parameter's own set is decided with it.
@@ -1340,8 +1337,7 @@ function ftScan(
       if (
         ftHolds(x, s)
         && !ftHolderCoerced(x, s)
-        && (ftFwdFn && ftInOpenFn(fn) && ftMemberCallsParamTwice(s)
-          || !ftHoldCtxOk(x, p, g, fn, s))
+        && !ftHoldCtxOk(x, p, g, fn, s)
       ) {
         return false
       }
@@ -2132,82 +2128,6 @@ function ftJoinSplit(x: i32, sp: i32[], vs: i32[]) {
   0
 }
 
-// Whether a call through the set being decided hands on a function value (`ftCallsHandFn`).
-let ftFwdFn = false
-
-// Whether a call through set `s` hands on an argument of function type.
-function ftCallsHandFn(
-  rootIx: i32,
-  s: i32,
-  calls: i32[],
-  mint: i32[],
-): boolean {
-  for c in calls {
-    if fnTagCallSetOf(c) == s && ftArgsHoldFn(rootIx, c, s) { return true }
-  }
-  for r in mint {
-    if mintFactSetOf(r) == s && ftArgsHoldFn(rootIx, mintFactCallOf(r), s) {
-      return true
-    }
-  }
-  false
-}
-
-// Whether call `c` through set `s` has an argument of function type, or one a member hands to a
-// parameter it calls; a set of functions read nowhere but as such an argument is an id the
-// arms key.
-function ftArgsHoldFn(rootIx: i32, c: i32, s: i32): boolean {
-  if c < 0 || c >= P.nodes.length { return false }
-  const cn = nodeAt(c)
-  if !(cn is Call) { return false }
-  let i = 0
-  while i < cn.callArgs.length {
-    const ax = parenPeelIx(cn.callArgs[i])
-    const as = fnTagSetOfTy(nodeTyIxOf(ax))
-    if as >= 0 && as != s && ftSetOnlyArgOf(rootIx, as) {
-      i = i + 1
-      continue
-    }
-    // A parameter read through a local alias of it hands on the same ids.
-    const src = ftConstSource(ax, 8)
-    if ftLate && ftParamBoundTagged(rootIx, identDeclOf(src)) {
-      i = i + 1
-      continue
-    }
-    const t = nodeTyIxOf(cn.callArgs[i])
-    if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc { return true }
-    for d in fnTagMembers(s) {
-      const f = nodeAt(d)
-      if (
-        f is FuncDecl
-        && i < f.fnParams.length
-        && ftParamCalled(f.fnBody, f.fnParams[i])
-      ) {
-        return true
-      }
-    }
-    i = i + 1
-  }
-  false
-}
-
-// Whether `pd` is an un-annotated parameter every instance of its function binds to a tagged
-// set, so handing it on hands that instance's ids, which each arm keys at its own set. A function
-// nested in it that reads it has one body for every such instance, so it hands no id (D14842).
-function ftParamBoundTagged(rootIx: i32, pd: i32): boolean {
-  if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return false }
-  const fd = ftParamOwner(rootIx, pd)
-  if fd < 0 || fd >= P.nodes.length { return false }
-  const f = nodeAt(fd)
-  if !(f is FuncDecl) || ftReadInNestedFn(f.fnBody, pd) { return false }
-  const sets = mintParamBoundSets(fd, i32ListIndexOf(f.fnParams, pd))
-  if sets.length == 0 { return false }
-  for st in sets {
-    if st < 0 || !fnTagSetIsTagged(st) { return false }
-  }
-  true
-}
-
 // Whether `v` reads an un-annotated parameter of a function every call reaching which
 // (`ftReachHandSets`) hands it a value of `s` or of a set within it, so a write of `v` stores one
 // of `s`'s ids (D15053). A smaller set is decided with `s`.
@@ -2508,55 +2428,6 @@ function ftParamOwner(rootIx: i32, pd: i32): i32 {
     }
   }
   ftParamOwners[pd] ?? -1
-}
-
-// Whether every name read under `rootIx` holding set `as` is a direct argument of a call
-// through a set of functions, or of a named function's parameter that only hands it on unread.
-function ftSetOnlyArgOf(rootIx: i32, as: i32): boolean {
-  const xs: i32[] = [rootIx]
-  const ps: i32[] = [-1]
-  while xs.length > 0 {
-    const x = xs.pop() ?? -1
-    const p = ps.pop() ?? -1
-    if x >= 0 && x < P.nodes.length {
-      const n = nodeAt(x)
-      // A binding's initialiser is its reads' value, and each read carries the set and is asked
-      // in its own turn (D15046).
-      const pl = if p >= 0 { nodeAt(p) } else { n }
-      const init = pl is LetDecl && parenPeelIx(pl.letInit) == x
-      if n is Ident && fnTagSetOfTy(nodeTyIxOf(x)) == as && !init {
-        const pn = if p >= 0 { nodeAt(p) } else { n }
-        if !(pn is Call) || !i32ListHas(pn.callArgs, x) { return false }
-        const cf = parenPeelIx(pn.callFn)
-        if (
-          fnTagSetOfTy(nodeTyIxOf(cf)) < 0
-          && !(ftArgIsParam(pn, i32ListIndexOf(pn.callArgs, x))
-            && ftParamInert(ftNamedFn(cf), i32ListIndexOf(pn.callArgs, x), 0))
-        ) {
-          return false
-        }
-      }
-      for k in nodeChildren(x) {
-        xs.push(k)
-        ps.push(x)
-      }
-    }
-  }
-  true
-}
-
-// Whether a call in `body` calls parameter `par` by name.
-function ftParamCalled(body: i32, par: i32): boolean {
-  const todo: i32[] = [body]
-  while todo.length > 0 {
-    const x = todo.pop() ?? -1
-    if x >= 0 && x < P.nodes.length {
-      const n = nodeAt(x)
-      if n is Call && identDeclOf(parenPeelIx(n.callFn)) == par { return true }
-      nodeChildrenPush(x, todo)
-    }
-  }
-  false
 }
 
 // Whether the set being decided is held by a written `let`, whose writes a call must agree on.
@@ -3974,36 +3845,6 @@ function ftArrElemTy(p: i32): i32 {
   const a = tyAt(t)
   if a is TyArray { return a.aElem }
   -1
-}
-
-// Whether a member of set `s` calls a function parameter at two or more signatures in one
-// instance (`mintParamKeyCount`): a list of that set handed on in an open function keeps its
-// closures, since each instance must build the member at both (D15068, D15100).
-function ftMemberCallsParamTwice(s: i32): boolean {
-  for m in fnTagMembers(s) {
-    const d = nodeAt(m)
-    if d is FuncDecl {
-      for px in d.fnParams {
-        const pn = nodeAt(px)
-        if pn is Param && mintParamKeyCount(m, pn.parName) >= 2 { return true }
-      }
-    }
-  }
-  false
-}
-
-// Whether function `fn`, or one it sits inside, takes a parameter with no annotation; a list there
-// whose calls hand on a function stays untagged, since the split plan copies the hole parameters
-// a call hands on per tuple and the set's arms do not see the copies (D14430).
-function ftInOpenFn(fn: i32): boolean {
-  let f = fn
-  let hops = 0
-  while f >= 0 && hops < 64 {
-    if ftOpenFn(f) { return true }
-    f = fnDeclParent[f] ?? -1
-    hops = hops + 1
-  }
-  false
 }
 
 // Whether `x` is an argument of call `c` to a declared function whose parameter there has no
