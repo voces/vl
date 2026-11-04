@@ -19,13 +19,22 @@ import { rcwCallSites } from "./check_record_writes"
 import { callRetRepTy } from "./check_bind_adopt"
 import { nodeTyIxOf } from "./check_node_tys"
 import { nodeRepTyIxOf } from "./check_core_state"
-import { T, TyArray, TyObj, objFieldType, tyAt, tySame } from "./check_types"
+import {
+  T,
+  TyArray,
+  TyObj,
+  objFieldType,
+  tyAt,
+  tyHoldsObjDeep,
+  tySame,
+} from "./check_types"
 import { nonNullTy } from "./tyquery"
 import {
   adoptLitAt,
   recBuiltReadTy,
   recCoalesceHeldAdopt,
   recCoalesceLitAdopt,
+  recCopyBackNote,
   recHoleIdentityArg,
   recordBoxTy,
   repStampHeldRead,
@@ -48,9 +57,18 @@ import { recSolePinArg } from "./check_record_origins"
 import { recFnValueLeaves } from "./check_type_shape"
 import {
   CW_OCC_ASG,
+  CW_OCC_USE,
+  CW_UP_ASG_LHS,
+  CW_UP_CMP,
+  CW_UP_IS,
+  CW_UP_NONE,
+  CW_UP_OBJ,
+  cwIxFr,
   cwIxKind,
   cwIxNode,
   cwIxUp,
+  cwIxUpKind,
+  cwKeyFrame,
   cwOccNext,
   cwOccWalk,
   cwPeelValue,
@@ -209,6 +227,17 @@ export function storeLetsResolve() {
     if own >= 0 && own < T.tys.length && tyAt(own) is TyObj {
       const r = storeHeldAt(u)
       if r >= 0 && r < T.tys.length && tyAt(r) is TyObj && !tySame(r, own) {
+        // A binding written through, or handing on a record it holds, takes its own copy of the
+        // call's result rather than sharing its build (D15246).
+        const d = storeLetDeclAt(i)
+        if (
+          nodeAt(u) is Call
+          && storeBindWrittenThrough(d)
+          && recCopyBackNote(u, r, own)
+        ) {
+          i = i + 1
+          continue
+        }
         storeLetBuiltSet(u, r)
         // A binding of a call is built where the call's results are (`recBuildTyOf`, D15172).
         if nodeAt(u) is Call {
@@ -219,6 +248,41 @@ export function storeLetsResolve() {
     }
     i = i + 1
   }
+}
+
+// Whether binding `d` may be written through: a field path of it is assigned, or a value it holds
+// that holds a record (itself or a field path) is handed on anywhere but a comparison or a test.
+function storeBindWrittenThrough(d: i32): boolean {
+  if d < 0 { return false }
+  const fr = cwKeyFrame(d)
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const r = w.row
+    if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == fr {
+      let top = cwIxNode[r]
+      while (
+        top >= 0
+        && top < cwIxUpKind.length
+        && cwIxUpKind[top] == CW_UP_OBJ
+      ) {
+        top = cwIxUp[top]
+      }
+      if top >= 0 && top < cwIxUpKind.length {
+        const uk = cwIxUpKind[top]
+        if uk == CW_UP_ASG_LHS && top != cwIxNode[r] { return true }
+        if (
+          uk != CW_UP_NONE
+          && uk != CW_UP_CMP
+          && uk != CW_UP_IS
+          && uk != CW_UP_ASG_LHS
+          && tyHoldsObjDeep(nodeTyIxOf(top))
+        ) {
+          return true
+        }
+      }
+    }
+  }
+  false
 }
 
 // Builds each record literal assigned into binding `d`, held at the record `r`, at `r`, as a
