@@ -916,6 +916,8 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 
 L-map, F-let, B, C, H-b, H-nested, N and W-field have no dependent. D15101 runs with the split plan off and is closed.
 
+**Re-censused at `a090a48b` (2026-11-04), then with D15430.** 16 of 5,730 `@run` files refuse with the split plan off on master; the two L-set files that forward through a two-member list run, so L-set's one file left is the capturing choice, which is D14841's (a capturing member's id would carry its environment). With D15430 (a named closed function's result handed to a hole parameter holds the set's id, as a binding does) the M maker file runs too: **15**. The rest of this lane's groups are named by mechanism: W-hand is D15103 (slice 4b-iii), W-lam's file is D15433 (a capture cell over lambda members, tagged but refused by mono's per-binding signature count), the spread push is D15432 (the copy's adapter is built at the template and receives an id in the instance), and M's `is` file stays parked on the row question.
+
 
 F's 15 files are four shapes by witness:
 
