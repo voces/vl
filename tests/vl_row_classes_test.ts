@@ -128,22 +128,23 @@ Deno.test({
 
 Deno.test({
   name:
-    "row classes: arms whose direct record fields name different records have no row",
+    "row classes: arms whose direct record fields name different records of one shape share a row",
   ignore: !assertSeed(),
   fn: () => {
-    // D15150's witness: refused, and neither arm reaches a row.
+    // D15150's witness: `R` and `S` are one record-row class, so `A` and `B` are one layout.
     const d = dump(
       "type R = { r: i32 }\ntype S = { r: i32 }\ntype A = { n: i32, g: R }\n" +
         "type B = { n: i32, g: S }\ntype U = A | B\nconst b: B = { n: 4, g: { r: 1 } }\nprint(b.g.r)\n",
     );
-    if (d.rc === 0) {
-      throw new Error("want the union refused (D15150), got rc 0");
+    if (d.rc !== 0) {
+      throw new Error(`want the union built (D15150), got rc ${d.rc}`);
     }
-    for (const nm of ["A", "B"]) {
-      const a = arm(d, nm);
-      if (a.twin !== -1) {
-        throw new Error(`want ${nm} with no row, got twin=${a.twin}`);
-      }
+    const a = arm(d, "A");
+    const b = arm(d, "B");
+    if (a.twin < 0 || a.twin !== b.twin) {
+      throw new Error(
+        `want A and B on one row, got twin=${a.twin} and twin=${b.twin}`,
+      );
     }
   },
 });

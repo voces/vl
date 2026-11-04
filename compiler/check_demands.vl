@@ -3,6 +3,7 @@
 // overload resolution, cast pins, bare-brace delivery and the inferred-return notes. Each
 // reads what the core checker recorded and reports through the relation core.
 
+import { cbaParamRepTransparent } from "./check_bind_adopt"
 import { declTyOf, npInvBy, npKeys, npPlace, npTys } from "./check_nar_store"
 import {
   ArrayLit,
@@ -135,6 +136,7 @@ import {
   inferVoidRetSites,
   omitFieldKey,
   omitFieldNull,
+  pinLitServed,
   retNatural,
   retNaturalErrSet,
   retNaturalSet,
@@ -427,7 +429,12 @@ import {
   tpJoinUnions,
   tyIsDeferredJoin,
 } from "./check_tp_join"
-import { eqRefusals, isWidenNotVariant } from "./check_ty_relate"
+import {
+  REC_STORE_DEPTH,
+  eqRefusals,
+  fieldStorageEq,
+  isWidenNotVariant,
+} from "./check_ty_relate"
 import { nomErasedTyIx, tyBoxesV128 } from "./check_ty_rep"
 import { elemHasZero, fieldSigOf, jsonReceiverDeclTy } from "./check_type_shape"
 import {
@@ -486,6 +493,8 @@ import {
   CW_OCC_BIND,
   CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_FIELD,
+  CW_UP_LETINIT,
   CW_UP_OBJ,
   cwIxBuild,
   cwIxKind,
@@ -902,7 +911,53 @@ function pinArgOfParamRead(rx: i32, at: i32): i32 {
   // A record literal is built where the pin delivers it, when the parameter never hands the
   // value back out of the call (D14760).
   if nodeAt(ap) is ObjLit && paramOnlyDelivered(d) { return a }
+  // So is one handed back whole, where the call's instance is keyed at the built rep (D15185).
+  if nodeAt(ap) is ObjLit && cbaParamRepTransparent(d, fd, 4) { return a }
   rx
+}
+
+// Whether record literal `src`, typed `sub` at the pin and delivered as `dst`, stores apart only
+// at fields whose value reads a parameter the call `at` hands a fresh record literal: each such
+// literal is then built at its field's destination, and true. False, nothing queued, otherwise.
+function pinLitFieldArgs(src: i32, sub: i32, dst: i32, at: i32): boolean {
+  const lp = parenPeelIx(src)
+  const ln = if lp >= 0 && lp < P.nodes.length { nodeAt(lp) } else { null }
+  const dn = nonNullTy(dst)
+  if !(ln is ObjLit) || sub < 0 || dn < 0 || dn >= T.tys.length { return false }
+  const st = tyAt(sub)
+  const dt = tyAt(dn)
+  if !(st is TyObj) || !(dt is TyObj) { return false }
+  const args: i32[] = []
+  const subs: i32[] = []
+  const dsts: i32[] = []
+  const reads: i32[] = []
+  for fx in ln.objFields {
+    const fi = nodeAt(fx)
+    if !(fi is FieldInit) { return false }
+    const fs = objFieldType(st, fi.fiName)
+    const fd = objFieldType(dt, fi.fiName)
+    if fs < 0 || fd < 0 { return false }
+    if !fieldStorageEq(fs, fd, REC_STORE_DEPTH) {
+      const a = pinArgOfParamRead(fi.fiValue, at)
+      const ap = if a >= 0 { parenPeelIx(a) } else { -1 }
+      if a == fi.fiValue || ap < 0 || !(nodeAt(ap) is ObjLit) { return false }
+      if objShapeAdapterlessAt(a, fs, fd) { return false }
+      args.push(a)
+      subs.push(fs)
+      dsts.push(fd)
+      reads.push(fi.fiValue)
+    }
+  }
+  if args.length == 0 { return false }
+  pinLitServed[lp] = true
+  let k = 0
+  while k < args.length {
+    adoptLitAt(parenPeelIx(args[k]), dsts[k])
+    rcwPend(args[k], subs[k], dsts[k])
+    recPend(args[k], subs[k], dsts[k], reads[k])
+    k = k + 1
+  }
+  true
 }
 
 // Whether parameter `d` is only read for a field or a method, or handed to an annotated parameter
@@ -918,20 +973,10 @@ function paramOnlyDelivered(d: i32): boolean {
       if u < 0 || u >= cwIxUpKind.length { return false }
       const k = cwIxUpKind[u]
       if k == CW_UP_ARG {
-        const cn = nodeAt(cwIxUp[u])
-        const fd = if cn is Call && cn.callFn >= 0 { identBoundFnDeclOf(cn.callFn) } else { -1 }
-        const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
-        const ai = cwIxUpAux[u]
-        if (
-          !(f is FuncDecl)
-          || f.fnTyParams.length > 0
-          || ai < 0
-          || ai >= f.fnParams.length
-        ) {
-          return false
-        }
-        const pn = nodeAt(f.fnParams[ai])
-        if !(pn is Param) || pn.parType < 0 { return false }
+        if !argToAnnotatedPlainParam(u) { return false }
+      } else if k == CW_UP_FIELD {
+        // A field of a record literal that is itself only delivered (D15184).
+        if !litOnlyDelivered(cwIxUp[u]) { return false }
       } else if k != CW_UP_OBJ {
         return false
       }
@@ -941,6 +986,36 @@ function paramOnlyDelivered(d: i32): boolean {
     }
   }
   used
+}
+
+// Whether record literal `l` is handed to an annotated parameter of a non-generic function, or bound
+// to an annotated binding that is only delivered (`paramOnlyDelivered`): a value placed in its field
+// cannot leave the call through it.
+function litOnlyDelivered(l: i32): boolean {
+  if l < 0 || l >= cwIxUpKind.length { return false }
+  if cwIxUpKind[l] == CW_UP_ARG { return argToAnnotatedPlainParam(l) }
+  if cwIxUpKind[l] != CW_UP_LETINIT { return false }
+  const d = cwIxUp[l]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  dn is LetDecl && dn.letType >= 0 && paramOnlyDelivered(d)
+}
+
+// Whether `u`, a call argument, is handed to an annotated parameter of a non-generic function.
+function argToAnnotatedPlainParam(u: i32): boolean {
+  const cn = nodeAt(cwIxUp[u])
+  const fd = if cn is Call && cn.callFn >= 0 { identBoundFnDeclOf(cn.callFn) } else { -1 }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  const ai = cwIxUpAux[u]
+  if (
+    !(f is FuncDecl)
+    || f.fnTyParams.length > 0
+    || ai < 0
+    || ai >= f.fnParams.length
+  ) {
+    return false
+  }
+  const pn = nodeAt(f.fnParams[ai])
+  pn is Param && pn.parType >= 0
 }
 
 // The argument seam's container refusals for a generic body's receiver, re-asked once the
@@ -995,7 +1070,11 @@ export function validateRcwPins(
           // then a widened field something writes.
           // A parameter read stands for the call's fresh argument, judged where it is built.
           const sx = pinArgOfParamRead(rcwPinSrc[i], at)
-          if objShapeAdapterlessAt(sx, sub, rcwPinDstTy[i]) {
+          // A record literal whose fields hold such reads is built around those arguments, each
+          // built at its field's destination (D15184).
+          if pinLitFieldArgs(rcwPinSrc[i], sub, rcwPinDstTy[i], at) {
+            // handled field by field
+          } else if objShapeAdapterlessAt(sx, sub, rcwPinDstTy[i]) {
             objShapeAdapterlessErr(rcwPinSrc[i], sub, rcwPinDstTy[i])
           } else {
             if sx != rcwPinSrc[i] && nodeAt(parenPeelIx(sx)) is ObjLit {
