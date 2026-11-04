@@ -664,6 +664,7 @@ import {
   elabParamCarriedInstAt,
   elabResultAtParams,
   elabRetOf,
+  elabSlotFieldRecord,
   elabSlotNote,
   elabSrcDecl,
   elabStampAt,
@@ -6638,6 +6639,10 @@ function monoReIsExpr(ix: i32, io: i32) {
   }
   ix
 }
+// The instance's exact type-parameter bindings while `monoFoldTyParamLayout` folds its body;
+// empty outside it, and for an instance not keyed by its exact pins.
+let monoFoldSubN: string[] = []
+let monoFoldSubT: i32[] = []
 // D951 — `is T` against the type parameter itself. Under monomorphization `T` is concrete
 // per instance, so substituting the spelling makes `y is T` at `T := i32` the same program
 // as `y is i32` and the whole existing ladder applies unchanged. The banked row must come
@@ -6651,8 +6656,14 @@ function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
     const aty = monoAnonRowListTy(variant)
     if aty >= 0 {
       recordClonedIsVarTyIx(nx, aty)
-    } else {
-      recordClonedIsVarTy(nx, variant)
+    } else if (
+      recordClonedIsVarTy(nx, variant) < 0
+      && sigKeyPinPayload(variant) != ""
+    ) {
+      // A signature key (D951) is no spelling `nameToTy` reads: the tested type is banked with
+      // the instance's exact bindings substituted.
+      const sub = substTyDeep(isVarTyIxOf(ix), monoFoldSubN, monoFoldSubT)
+      if sub >= 0 && !tyHasTyVar(sub) { recordClonedIsVarTyIx(nx, sub) }
     }
     // A list-union rewrite's test keeps its mark at the arm the instance names (D14084).
     if luIsTyOf(ix) >= 0 && isVarTyIxOf(nx) >= 0 {
@@ -10720,7 +10731,11 @@ function monoMakeInstanceBodyRewrite(
   monoCgcSubT = []
   // Per-instance layout constants for the type parameters this body reads
   // (`i * T.size`) — folded HERE because the binding is what makes them exist.
+  monoFoldSubN = exSubN
+  monoFoldSubT = exSubT
   const instBody4 = monoFoldTyParamLayout(instBody3, tps, tvN, tvV)
+  monoFoldSubN = []
+  monoFoldSubT = []
   // The two questions `dispatchRewrite` asks of a hole, re-asked at the pin. Last in the
   // chain, so it sees the body every rung above produced; copy-on-write, so a body with
   // no such operator is the same node index.
@@ -16764,6 +16779,47 @@ function monoNoteFieldReadTy(rd: i32, fx: i32, ft: i32) {
   ps.push(fx)
   ps.push(ft)
   monoFieldReadTys.set(rd, ps)
+  0
+}
+
+// Types each field of the un-annotated record literal `d` binds at `at` in frame `ctx` that holds a
+// returned record of members whole (`elabSlotFieldRecord`) at that record's row, with the literal
+// and the field's reads; -1 where no row is minted for it.
+function monoPinSlotRecords(d: LetDecl, at: i32, ctx: i32): i32 {
+  const lx = unwrapParen(d.letInit)
+  const lit = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  const ot = nodeTyIxOf(lx)
+  if !(lit is ObjLit) || ot < 0 || ot >= T.tys.length { return 0 }
+  const o = tyAt(ot)
+  if !(o is TyObj) { return 0 }
+  const tys: i32[] = []
+  for t in o.objFieldTypes { tys.push(t) }
+  let any = false
+  for fi in lit.objFields {
+    const f = nodeAt(fi)
+    if f is FieldInit {
+      const sigs = elabSlotFieldRecord(at, f.fiName)
+      let k = 0
+      while k < o.objFieldNames.length && o.objFieldNames[k] != f.fiName {
+        k = k + 1
+      }
+      if sigs.length >= 2 && k < tys.length {
+        const bt = monoBundleRecordTy(sigs, f.fiValue)
+        if bt < 0 { return -1 }
+        nodeTyRecord(unwrapParen(f.fiValue), bt)
+        monoRetypeSlotReads(ctx, at, "f." + f.fiName, bt)
+        tys[k] = bt
+        any = true
+      }
+    }
+  }
+  if any {
+    const rt = mkObjTy(o.objFieldNames, tys)
+    monoClosedRecordOwnRow(rt)
+    monoSupersededObjTys.push(ot)
+    nodeTyRecord(lx, rt)
+    monoGradualObjList.push(lx)
+  }
   0
 }
 
@@ -26365,6 +26421,7 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
     if monoPinListElems(n, ix, ctx) < 0 { return -1 }
   }
   if n.letType < 0 && n.letInit >= 0 && nodeAt(n.letInit) is ObjLit {
+    if monoPinSlotRecords(n, ix, ctx) < 0 { return -1 }
     if n.letKw == "const" {
       if monoPinRecordFields(n, ix, ctx) < 0 { return -1 }
     }
