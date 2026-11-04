@@ -13,11 +13,11 @@ and bodies; not ablated.
 ## A. Substitution of a type under the instance's binding (pure function of (type, instance))
 | fn | callers | note |
 |---|---|---|
-| monoPinnedTyOf | 13 | recorded type of ix at binding bN/bT; already reads elabWalkTy/elabWalkNarrowedTy, then substitutes |
+| monoPinnedTyOf | 13 | recorded type of ix at binding bN/bT; already reads elabWalkTy/elabWalkNarrowedTy, then substitutes. Not group A: moved to C/D below |
 | monoPinSubTyOf | 12 | t under ctx's pinned binding (elabInstTyAt). Its five calls at a node's own type read `monoNodeTyAt` (elabNodeTyAt, else the node's type); it stays for the seven that substitute a derived type (an element, a return, a parameter type) |
-| monoExactPinTyOf | 9 | t under ctx's exact binding, else parameters' pins |
-| monoNumOperandPinTy | 4 | operand at pin, else hole instance's own binding |
-| monoPinnedOperandTy | 4 | body expr reading a monomorphized param |
+| monoExactPinTyOf | 9 | t under ctx's exact binding, else parameters' pins. Its three calls at a node's own type read `monoNodeTyAt` (1,907 reaches, 0 disagreements); the six at a parameter's pin are group B |
+| monoNumOperandPinTy | 4 | operand at pin, else hole instance's own binding. Not group A: moved to C/D below |
+| monoPinnedOperandTy | 4 | body expr reading a monomorphized param. Not group A: moved to C/D below |
 Store: elabNodeTyAt(ix, inst) already exists (3 mono callers). These five are second producers of it.
 
 ## B. Per-call, per-parameter delivered type (the elab call key's facts)
@@ -89,6 +89,17 @@ is its record-only precedent. The probe is `docs/internals/mono-argpin-probe.pat
 On-demand elab computations mono calls, same shape: elabHeldClosedTy (79 lines), elabHoleMapClosed,
 elabHoleFnClosed, elabResultAtParams (demands an instance), elabCallBundleSigs, elabLamInheritedOwn.
 Store: one per-(binding, slot path, instance) closed-type fact; G1's list arm is the first reader.
+
+### Moved here from A: mono's pins that defer to the hole binding
+
+`monoPinnedTyOf`, `monoPinnedOperandTy` and `monoNumOperandPinTy` were probed against the
+instance's record (`elabWalkTy`) over the tests and the distilled corpus. Of 75,880
+`monoPinnedTyOf` calls, 10,875 disagreed, 9,876 of them with mono's answer open where the
+record is closed. Preferring the record broke 21 programs (10 traps, 11 refusals), and
+preferring it only where mono's answer is open still broke 18, nearly all hole instances.
+Mono's open answer is a deferral to the hole binding, not a second producer; retiring it needs
+the store to record the hole-instance answer first. [D15259](inventory/D15259.md) is the gap in
+the other direction, where the record is open and mono's substitution closes it.
 
 ## D. Function values at an annotation (contextual typing of a fn value)
 | fn | callers | note |
