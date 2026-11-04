@@ -137,6 +137,7 @@ import {
   elabCapLive,
   elabCapRep,
   elabCapRepUnion,
+  elabFnFieldWidenedAny,
   elabFnIdOf,
   elabTyClosed,
   fnLetIsWide,
@@ -352,6 +353,7 @@ import {
   joinRetTys,
   joinTys,
   keepListStorage,
+  njFixSet,
   recArmFitKind,
   sameVariantTy,
   substTyDeep,
@@ -761,6 +763,9 @@ export function sharedUnionFieldTy(u: TyUnion, prop: string) {
         // Runtime field values of different numeric types join apart, as an `if` over the
         // members' reads would.
         njApartSet(true)
+        // Each member's field is a record that already exists, so the join keeps it a member
+        // rather than widening it in place, as a `??` over two existing records does (D15314).
+        njFixSet(true, true)
         shared = joinTys(shared, ft)
       }
     } else {
@@ -3480,6 +3485,9 @@ export function recLitPlaceBuiltTy(p: i32): i32 {
   if b >= 0 { return nonNullTy(b) }
   if p < 0 || p >= P.nodes.length { return -1 }
   const pn = nodeAt(p)
+  // A binding whose function fields its writes widened is built at its own record (D15306).
+  const fw = recAsgFnWidenedTy(p)
+  if fw >= 0 { return fw }
   // A call's build is the store column's (`callBuiltTy`), unless the record solve copies the
   // call back to its own record (D15246, D15282).
   const call = init >= 0 && nodeAt(init) is Call && recCopyFromOf(init) < 0
@@ -3497,6 +3505,14 @@ export function recLitPlaceBuiltTy(p: i32): i32 {
     const it = nodeTyIxOf(init)
     const e = recHeldElemBuilt(init)
     return if e >= 0 && it >= 0 && it < T.tys.length && tyAt(it) is TyArray { mkArrayTy(e) } else { -1 }
+  }
+  // A list literal that is itself an element of a built list of lists is built at its inner
+  // lists' build (D15284).
+  if pn is ArrayLit {
+    cwIxBuild()
+    const er = recSlotReceiverOf(p, p)
+    const ee = if er >= 0 { recElemOfElemStamp(er) } else { -1 }
+    if ee >= 0 { return mkArrayTy(ee) }
   }
   const r = recLitSlotReceiver(p)
   const e = if r >= 0 { recHeldElemBuilt(r) } else { -1 }
@@ -3543,13 +3559,16 @@ export function recHeldLitPlaceAdopt(l: i32) {
 // is spread into a push of, peeled; else -1.
 function recLitSlotReceiver(p: i32): i32 {
   cwIxBuild()
-  let x = p
-  let a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
-  if nodeAt(p) is ArrayLit {
-    if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Spread) { return -1 }
-    x = a
-    a = if a < cwIxUp.length { cwIxUp[a] } else { -1 }
-  }
+  if !(nodeAt(p) is ArrayLit) { return recSlotReceiverOf(p, p) }
+  const a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
+  if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Spread) { return -1 }
+  recSlotReceiverOf(a, p)
+}
+
+// The list value `x` (the literal `p` itself, or a spread of it) is pushed, unshifted or
+// index-stored into, peeled; else -1.
+function recSlotReceiverOf(x: i32, p: i32): i32 {
+  const a = if x >= 0 && x < cwIxUp.length { cwIxUp[x] } else { -1 }
   const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
   if an is Call && an.callFn >= 0 && i32ListHas(an.callArgs, x) {
     const f = nodeAt(an.callFn)
@@ -3570,22 +3589,62 @@ function recLitSlotReceiver(p: i32): i32 {
   -1
 }
 
-// The record the elements of the list `x` reads are built at: its own recorded build, or, for an
-// un-annotated binding, its initialiser's; -1 when none is recorded.
+// The record the elements of the list `x` reads are built at: its own recorded build, an element
+// of a built list of lists, or, for an un-annotated binding, its initialiser's; else -1.
 export function recHeldElemBuilt(x: i32): i32 {
   const e = recBuiltElemOf(x)
-  if e >= 0 || x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) {
-    return e
-  }
+  if e >= 0 || x < 0 || x >= P.nodes.length { return e }
+  const xn = nodeAt(x)
+  // An element of a list of lists is read at its literal's build, one level in (D15236).
+  if xn is Index { return recElemOfElemStamp(cwPeelValue(xn.idxArr)) }
+  if !(xn is Ident) { return -1 }
   const d = recBindDeclOf(x)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
-  recBuiltElemOf(cwPeelValue(dn.letInit))
+  recHeldElemBuilt(cwPeelValue(dn.letInit))
+}
+
+// The record the elements of an element of the list binding read `a` are built at, from its
+// list literal initialiser's rep stamp (`T[][]`), through bindings of bindings; else -1.
+function recElemOfElemStamp(a: i32): i32 {
+  if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) { return -1 }
+  const d = recBindDeclOf(a)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  const iv = cwPeelValue(dn.letInit)
+  // A binding of another such binding reads that one's literal.
+  if iv >= 0 && iv < P.nodes.length && nodeAt(iv) is Ident {
+    return recElemOfElemStamp(iv)
+  }
+  const rt = nodeRepTyIxOf(iv)
+  const ro = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
+  const it = if ro is TyArray { ro.aElem } else { -1 }
+  const io = if it >= 0 && it < T.tys.length { tyAt(it) } else { null }
+  if io is TyArray { io.aElem } else { -1 }
 }
 
 // The initialiser of the un-annotated binding `p` is assigned into, peeled, where `p` is the
 // assigned value or one of its `if` or `match` arm leaves (`tailValueLeaves`, D15280); else -1.
 export function recAsgBindInit(p: i32): i32 {
+  const d = recAsgBindDecl(p)
+  const dn = if d >= 0 { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  cwPeelValue(dn.letInit)
+}
+
+// The record a record literal `p` assigned whole into a binding the field widener widened is built
+// at: the binding's own (D15306); else -1.
+export function recAsgFnWidenedTy(p: i32): i32 {
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is ObjLit) { return -1 }
+  const d = recAsgBindDecl(p)
+  if d < 0 || recAsgBindInit(p) < 0 || !elabFnFieldWidenedAny(d) { return -1 }
+  const t = nodeTyIxOf(d)
+  if t >= 0 && t < T.tys.length && tyAt(t) is TyObj { t } else { -1 }
+}
+
+// The un-annotated binding a literal or read `p` is assigned whole into, through `if` arms; -1
+// when it is no such value.
+function recAsgBindDecl(p: i32): i32 {
   cwIxBuild()
   let x = p
   let hops = 0
@@ -3601,10 +3660,7 @@ export function recAsgBindInit(p: i32): i32 {
   const leaves: i32[] = []
   tailValueLeaves(an.binRight, leaves)
   if !i32ListHas(leaves, p) { return -1 }
-  const d = if nodeAt(an.binLeft) is Ident { recBindDeclOf(an.binLeft) } else { -1 }
-  const dn = if d >= 0 { nodeAt(d) } else { null }
-  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
-  cwPeelValue(dn.letInit)
+  if nodeAt(an.binLeft) is Ident { recBindDeclOf(an.binLeft) } else { -1 }
 }
 
 // Whether `p` is `read ?? { … }` handed to a parameter that takes the rep `rep`; the literal is
