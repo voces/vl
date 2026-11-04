@@ -867,9 +867,19 @@ export function recRebuiltRetRow(fd: i32, depth: i32): i32 {
   row
 }
 
+// Whether every parameter in `ps` is annotated, so a call's arguments cannot change the record
+// the callee's literals are built at.
+function recParamsAllAnnotated(ps: i32[]): boolean {
+  for px in ps {
+    const p = nodeAt(px)
+    if !(p is Param) || p.parType < 0 { return false }
+  }
+  true
+}
+
 // The record value `lf` is built at when it is an object literal adopted at another record, an
-// identity over one, a binding of one, or an argument-free call of an inferred function whose
-// results are; else -1.
+// identity over one, a binding of one, or a call of an inferred function whose parameters are all
+// annotated and whose results are; else -1.
 export function recRebuiltLeafRow(lf: i32, depth: i32): i32 {
   const lp = parenPeelIx(lf)
   if lp < 0 || lp >= P.nodes.length || depth <= 0 { return -1 }
@@ -890,29 +900,32 @@ export function recRebuiltLeafRow(lf: i32, depth: i32): i32 {
     const bt = recBuildTyOf(hd)
     return if bt >= 0 { bt } else { recRebuiltLeafRow(hn.letInit, depth - 1) }
   }
-  if n is Call && n.callFn >= 0 && n.callFn < P.nodes.length {
-    const ha = recHoleIdentityArg(lp, identBoundFnDeclOf(n.callFn))
-    if ha >= 0 { return recRebuiltLeafRow(ha, depth - 1) }
-  }
+  // The rest is the call ladder's, which answers -1 for every kind but a call.
+  recRebuiltCallRow(lp, depth)
+}
+
+// The record call `lp` is built at: an identity's argument's, or the rebuilt row of an inferred
+// function whose parameters are all annotated; -1 for any other node.
+function recRebuiltCallRow(lp: i32, depth: i32): i32 {
+  const n = nodeAt(lp)
+  if !(n is Call) || n.callFn < 0 || n.callFn >= P.nodes.length { return -1 }
+  const ha = recHoleIdentityArg(lp, identBoundFnDeclOf(n.callFn))
+  if ha >= 0 { return recRebuiltLeafRow(ha, depth - 1) }
+  const cn = nodeAt(n.callFn)
+  if !(cn is Ident) { return -1 }
+  const cd = identBoundFnDeclOf(n.callFn)
+  if cd < 0 || cd >= P.nodes.length { return -1 }
+  const f = nodeAt(cd)
   if (
-    n is Call
-    && n.callArgs.length == 0
-    && n.callFn >= 0
-    && n.callFn < P.nodes.length
+    !(f is FuncDecl)
+    || f.fnRet >= 0
+    || f.fnTyParams.length > 0
+    || !recParamsAllAnnotated(f.fnParams)
   ) {
-    const cn = nodeAt(n.callFn)
-    if cn is Ident {
-      const cd = identBoundFnDeclOf(n.callFn)
-      if cd >= 0 && cd < P.nodes.length {
-        const f = nodeAt(cd)
-        if f is FuncDecl && f.fnRet < 0 && f.fnTyParams.length == 0 {
-          // A kept delivery builds the function's result at its own record.
-          const kd = recKeptFnDstOf(cd, nodeTyIxOf(lp))
-          if kd >= 0 && kd < T.tys.length && tyAt(kd) is TyObj { return kd }
-          return recRebuiltRetRow(cd, depth - 1)
-        }
-      }
-    }
+    return -1
   }
-  -1
+  // A kept delivery builds the function's result at its own record.
+  const kd = recKeptFnDstOf(cd, nodeTyIxOf(lp))
+  if kd >= 0 && kd < T.tys.length && tyAt(kd) is TyObj { return kd }
+  recRebuiltRetRow(cd, depth - 1)
 }
