@@ -161,6 +161,7 @@ import {
   elabWideRowN,
   elabWideRowRet,
   elabWideRowT,
+  fnSetCalledWithAny,
   fnSetHasCapturingLambda,
   fnTagCallArms,
   fnTagLeafSetOf,
@@ -8373,57 +8374,115 @@ export function elabHoleFnClosed(t: i32): i32 {
   mkFuncTy(ps, r)
 }
 
-// The one closed signature every function of set type `t` is instanced at outside a guess, the
-// D9100 default where none is instanced, or -1 where two instances disagree.
-function elabHeldFnTy(t: i32): i32 {
+// The one closed signature every function `ds` names is instanced at outside a guess, or the
+// D9100 default where none is instanced and no call reaches one of them; -1 where two
+// instances disagree, only some are instanced, or a call no instance answers reaches them.
+function elabHeldFnTy(t: i32, ds: i32[]): i32 {
   let sig = -1
-  for d in elabFnSetOf(t) {
+  let bare = 0
+  for d in ds {
     if d < 0 { return -1 }
+    let seen = false
     let k = 0
     while k < ekDecl.length {
       if ekDecl[k] == d && !(elabGuessKeys.get(k) ?? false) {
         const st = elabSubstClosed(nodeTyIxOf(d), k)
         if st < 0 || (sig >= 0 && !tySame(sig, st)) { return -1 }
         sig = st
+        seen = true
       }
       k = k + 1
     }
+    if !seen { bare = bare + 1 }
   }
-  if sig >= 0 { sig } else { elabHoleFnClosed(t) }
+  if sig >= 0 { return if bare == 0 { sig } else { -1 } }
+  if ds.length == 0 || fnSetCalledWithAny(ds) { return -1 }
+  elabHoleFnClosed(t)
 }
 
-// Type `t` a list, record or map holds, with each open function leaf at the signature its set is
-// instanced at (`elabHeldFnTy`) and each open map at `elabHoleMapClosed`, through lists, records
-// and maps (D15294). `t` where nothing is open; -1 where a leaf cannot close.
-export function elabHeldClosedTy(t: i32, depth: i32): i32 {
+// Type `t` a list, record or map holds, the values `vals` stored at it, with each open function
+// leaf at the signature `elabHeldFnTy` gives the functions its set and those values name, and
+// each open map at `elabHoleMapClosed`, through lists, records and maps (D15294). `t` where
+// nothing is open; -1 where a leaf cannot close or a stored value is not followed.
+export function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
   if t < 0 || t >= T.tys.length || depth > 8 { return -1 }
   if !tyHasTyVar(t) { return t }
   const o = tyAt(t)
   match o {
     TyFunc => {
-      return elabHeldFnTy(t)
+      const ds: i32[] = []
+      for d in elabFnSetOf(t) {
+        if !i32ListHas(ds, d) { ds.push(d) }
+      }
+      for v in vals {
+        const x = parenPeelIx(v)
+        const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+        let d = -1
+        if xn is FuncDecl { d = x }
+        else if xn is Ident { d = identDeclOf(x) }
+        if d < 0 || d >= P.nodes.length || !(nodeAt(d) is FuncDecl) {
+          return -1
+        }
+        if !i32ListHas(ds, d) { ds.push(d) }
+      }
+      return elabHeldFnTy(t, ds)
     }
     TyArray => {
-      const e = elabHeldClosedTy(o.aElem, depth + 1)
+      const ev: i32[] = []
+      for v in vals {
+        const x = parenPeelIx(v)
+        const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+        if !(xn is ArrayLit) { return -1 }
+        for e in xn.arrElems { ev.push(e) }
+      }
+      const e = elabHeldClosedTy(o.aElem, ev, depth + 1)
       return if e < 0 { -1 } else if e == o.aElem { t } else { mkArrayTy(e) }
     }
     TyObj => {
       const tys: i32[] = []
-      for f in o.objFieldTypes {
-        const c = elabHeldClosedTy(f, depth + 1)
+      let i = 0
+      while i < o.objFieldNames.length {
+        const fv: i32[] = []
+        for v in vals {
+          const x = parenPeelIx(v)
+          const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+          if !(xn is ObjLit) { return -1 }
+          for fx in xn.objFields {
+            const f = nodeAt(fx)
+            if f is FieldInit && f.fiName == o.objFieldNames[i] {
+              fv.push(f.fiValue)
+            }
+          }
+        }
+        const c = elabHeldClosedTy(o.objFieldTypes[i], fv, depth + 1)
         if c < 0 { return -1 }
         tys.push(c)
+        i = i + 1
       }
       const names: string[] = []
       for nm in o.objFieldNames { names.push(nm) }
       return mkObjTy(names, tys)
     }
     TyMap => {
-      const hm = elabHoleMapClosed(t)
-      if hm >= 0 { return hm }
-      const v = elabHeldClosedTy(o.mVal, depth + 1)
-      if v < 0 || tyHasTyVar(o.mKey) { return -1 }
-      return mkMapTy(o.mKey, v, o.mSet)
+      // A map binding stored here holds what its own scope writes into its values.
+      const wv: i32[] = []
+      for v in vals {
+        const x = parenPeelIx(v)
+        const d = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+        if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return -1 }
+        const ats: i32[] = []
+        if cwSlotWrittenValues(d, ["[]"], wv, ats) < 0 { return -1 }
+      }
+      const v = elabHeldClosedTy(o.mVal, wv, depth + 1)
+      if v < 0 { return -1 }
+      let k = o.mKey
+      if tyHasTyVar(k) {
+        const hm = elabHoleMapClosed(t)
+        const hmt = if hm >= 0 { tyAt(hm) } else { tyAt(TY_ERR) }
+        if !(hmt is TyMap) { return -1 }
+        k = hmt.mKey
+      }
+      return mkMapTy(k, v, o.mSet)
     }
     // No other kind holds a function a slot can close.
     TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
