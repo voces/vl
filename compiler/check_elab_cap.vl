@@ -33,6 +33,7 @@ import {
 } from "./check_write_scan"
 import {
   T,
+  TY_I32,
   Ty,
   TyArray,
   TyErr,
@@ -46,6 +47,9 @@ import {
   TyUnion,
   TyVar,
   mkArrayTy,
+  mkMapTy,
+  mkNullableTy,
+  mkObjTy,
   tySame,
 } from "./check_types"
 import { declTyOf } from "./check_nar_store"
@@ -2210,6 +2214,63 @@ export function fnTagHoldsTy(t: i32, depth: i32): boolean {
   }
 }
 
+// The rep each held list literal and `let` of a tagged set is built at, stamped when the set is
+// tagged: its type with every list of the set's ids the `i32` list it is (D15220).
+let fnTagHeldRep: {[i32]: i32} = Map()
+
+// The rep `fnTagHeldNote` stamped on node `x`, or -1 where it stamped none.
+export function fnTagHeldRepOf(x: i32): i32 { fnTagHeldRep[x] ?? -1 }
+
+// Stamps held node `x`, a list literal or a `let`, with its type's rep, where that differs.
+export function fnTagHeldNote(x: i32) {
+  if x < 0 || x >= P.nodes.length { return 0 }
+  const n = nodeAt(x)
+  let t = nodeTyIxOf(x)
+  if n is LetDecl && n.letInit >= 0 { t = nodeTyIxOf(n.letInit) }
+  const r = fnTagRepTyOf(t, 16)
+  if r >= 0 && r != t { fnTagHeldRep[x] = r }
+  0
+}
+
+// Type `t` with every list whose element is a tagged set an `i32` list, through lists, records,
+// nullables and map values; `t` itself where nothing is rewritten.
+function fnTagRepTyOf(t: i32, depth: i32): i32 {
+  if depth <= 0 || t < 0 || t >= T.tys.length { return t }
+  const o = T.tys[t]
+  match o {
+    TyArray => {
+      if fnTagTyIsTagged(o.aElem) { return mkArrayTy(TY_I32) }
+      const e = fnTagRepTyOf(o.aElem, depth - 1)
+      return if e == o.aElem { t } else { mkArrayTy(e) }
+    }
+    TyObj => {
+      const tys: i32[] = []
+      let changed = false
+      for f in o.objFieldTypes {
+        const r = fnTagRepTyOf(f, depth - 1)
+        if r != f { changed = true }
+        tys.push(r)
+      }
+      if !changed { return t }
+      const names: string[] = []
+      for nm in o.objFieldNames { names.push(nm) }
+      return mkObjTy(names, tys)
+    }
+    TyNullable => {
+      const r = fnTagRepTyOf(o.nInner, depth - 1)
+      return if r == o.nInner { t } else { mkNullableTy(r) }
+    }
+    TyMap => {
+      const r = fnTagRepTyOf(o.mVal, depth - 1)
+      return if r == o.mVal { t } else { mkMapTy(o.mKey, r, o.mSet) }
+    }
+    // No other kind holds a set's ids as a container.
+    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
+      return t
+    }
+  }
+}
+
 // Whether set `s` is tagged.
 export function fnTagSetIsTagged(s: i32): boolean { fnTagged[s] ?? false }
 
@@ -2360,6 +2421,7 @@ export function fnTagCallCopy(nc: i32, tpl: i32, s: i32, arms: i32[]) {
 
 // Forgets every tagging decision, before the checker's last pass makes them again.
 export function fnTagUndecide() {
+  fnTagHeldRep = Map()
   fnTagged = Map()
   fnTagLeaf = Map()
   fnTagLeafSet = Map()
