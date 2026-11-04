@@ -215,6 +215,14 @@ Recorded, not built:
   calls that instance's re-check noted, and from the instances elaboration already enumerated
   under it, demanding none. It has no program-level fact. Generic-frame calls where mono closes
   fall from 47 missing to **30**, with 0 disagreements over the 253 files.
+- **2c, the first switched reader:** `monoPinNestedListElems` reads the inner element's type from
+  `elabSlotTyAt`, with its pin-agreement scan and per-element derivation deleted; the deliveries
+  stay. This needed a function with an un-annotated parameter (a hole function) to be collected
+  per instance like a generic. Its 13 calls are all EQ, with 0 missing.
+- **`monoRetypePinCalls` retires with step 4, not with a fact.** All 44 single-member callees take its
+  arguments path, which only assembles `mkFuncTy(args, result)` from the call's own types, so
+  `elabMemberKeyAt` agrees there and nothing is deleted. The D6003 pins path
+  (`fnFlowDeclPathPinTysAt`, `monoPinCallRet`) is taken only by 2–3 member sets, which is set dispatch.
 - **E, G, H:** folded in when A, B or C touches the same code.
 - **F:** set dispatch (step 4), not a missing fact.
 
