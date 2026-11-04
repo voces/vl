@@ -103,6 +103,7 @@ import {
   cwPeelValue,
   cwSlotWrittenValues,
   cwUseInOtherFrame,
+  fnDeclIx,
 } from "./check_write_scan"
 import { declIsExportedFn } from "./check_exp_obs"
 import { recHoleIdentityArg, recordRepTyAdopt } from "./check_fit_rules"
@@ -168,6 +169,7 @@ import {
   fnSetCallArgsOf,
   fnSetCalledWithAny,
   fnSetHasCapturingLambda,
+  fnSlotCallArgsOf,
   fnTagCallArms,
   fnTagLeafSetOf,
   fnTagListTy,
@@ -208,6 +210,7 @@ import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
 import { narrowedFromTyOf, nodeTyIxOf } from "./check_node_tys"
 import {
   nodeCtxTyIxOf,
+  nodeRepStamped,
   nodeRepTyIx,
   nodeRepTyIxOf,
   nodeRepUnionIx,
@@ -7117,6 +7120,7 @@ export function elabRun() {
   elabSlotKeys = Map()
   elabNodeTys = Map()
   elabNodeReps = Map()
+  elabSlotTys = Map()
   elabHandBackMemo = Map()
   elabNodeRepUnions = Map()
   elabNodeCtxs = Map()
@@ -7391,6 +7395,7 @@ export function elabRun() {
     lr = lr + 1
   }
   elabHeldListFacts()
+  elabSlotFacts()
   elabPinsClosedSet(true)
   elabRunDone = true
 }
@@ -8853,9 +8858,10 @@ export function elabHoleFnClosed(t: i32): i32 {
 // The one closed signature every function `ds` names is instanced at outside a guess, or the
 // D9100 default where none is instanced and no call reaches one of them; -1 where two
 // instances disagree, only some are instanced, or a call no instance answers reaches them.
-function elabHeldFnTy(t: i32, ds: i32[]): i32 {
+function elabHeldFnTy(t: i32, ds: i32[], holder: i32, path: string[]): i32 {
   let sig = -1
   let bare = 0
+  const bares: i32[] = []
   for d in ds {
     if d < 0 { return -1 }
     let seen = false
@@ -8869,17 +8875,36 @@ function elabHeldFnTy(t: i32, ds: i32[]): i32 {
       }
       k = k + 1
     }
-    if !seen { bare = bare + 1 }
+    if !seen {
+      bare = bare + 1
+      bares.push(d)
+    }
   }
-  if sig >= 0 { return if bare == 0 { sig } else { -1 } }
+  if sig >= 0 && bare == 0 { return sig }
+  // A member no instance answers yet is demanded at the others' parameters, and must agree.
+  const so = if sig >= 0 { tyAt(sig) } else { null }
+  if so is TyFunc {
+    for d in bares {
+      if (
+        !elabTopFn(d)
+        || !tySame(elabResultAtParams(d, so.fnParamTypes), so.fnRet)
+      ) {
+        return -1
+      }
+    }
+    return sig
+  }
   if ds.length == 0 { return -1 }
   if !fnSetCalledWithAny(ds) { return elabHoleFnClosed(t) }
   // Called through a function value at one closed tuple no instance records yet: each member's
-  // instance there, demanded now, gives the signature when every one agrees.
-  const pts = fnSetCallArgsOf(ds)
+  // instance there, demanded now, gives the signature when every one agrees. The slot's own
+  // calls decide before the set's.
+  const own = if holder >= 0 { fnSlotCallArgsOf(holder, path) } else { [] }
+  const pts = if own.length > 0 { own } else { fnSetCallArgsOf(ds) }
   if pts.length == 0 { return -1 }
   let r = -1
   for d in ds {
+    if holder >= 0 && !elabTopFn(d) { return -1 }
     const dr = elabResultAtParams(d, pts)
     if dr < 0 || (r >= 0 && !tySame(r, dr)) { return -1 }
     r = dr
@@ -8887,13 +8912,36 @@ function elabHeldFnTy(t: i32, ds: i32[]): i32 {
   if r < 0 { -1 } else { mkFuncTy(pts, r) }
 }
 
+// Whether `d` is a top-level function, which the slot producer may demand an instance of: a nested
+// one or a lambda checks only in its own scope.
+function elabTopFn(d: i32): boolean {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  dn is FuncDecl && dn.fnName != "" && (fnDeclIx[dn.fnName] ?? -1) == d
+}
+
 // Type `t` a list, record or map holds, the values `vals` stored at it, with each open function
 // leaf at the signature `elabHeldFnTy` gives the functions its set and those values name, and
 // each open map at `elabHoleMapClosed`, through lists, records and maps (D15294). `t` where
 // nothing is open; -1 where a leaf cannot close or a stored value is not followed.
-export function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
+function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
+  const none: string[] = []
+  elabHeldClosedTyAt(t, vals, depth, -1, none)
+}
+
+// `elabHeldClosedTy` at slot `path` of binding `holder` (-1 for none), whose calls decide a
+// function leaf's parameters first, and where a value that reads another binding takes that
+// binding's slot fact.
+function elabHeldClosedTyAt(
+  t: i32,
+  vals: i32[],
+  depth: i32,
+  holder: i32,
+  path: string[],
+): i32 {
   if t < 0 || t >= T.tys.length || depth > 8 { return -1 }
   if !tyHasTyVar(t) { return t }
+  const bound = elabHeldBoundTy(vals)
+  if bound >= 0 { return bound }
   const o = tyAt(t)
   match o {
     TyFunc => {
@@ -8912,7 +8960,7 @@ export function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
         }
         if !i32ListHas(ds, d) { ds.push(d) }
       }
-      return elabHeldFnTy(t, ds)
+      return elabHeldFnTy(t, ds, holder, path)
     }
     TyArray => {
       const ev: i32[] = []
@@ -8922,7 +8970,13 @@ export function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
         if !(xn is ArrayLit) { return -1 }
         for e in xn.arrElems { ev.push(e) }
       }
-      const e = elabHeldClosedTy(o.aElem, ev, depth + 1)
+      const e = elabHeldClosedTyAt(
+        o.aElem,
+        ev,
+        depth + 1,
+        holder,
+        elabPathPlus(path, "e"),
+      )
       return if e < 0 { -1 } else if e == o.aElem { t } else { mkArrayTy(e) }
     }
     TyObj => {
@@ -8941,7 +8995,13 @@ export function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
             }
           }
         }
-        const c = elabHeldClosedTy(o.objFieldTypes[i], fv, depth + 1)
+        const c = elabHeldClosedTyAt(
+          o.objFieldTypes[i],
+          fv,
+          depth + 1,
+          holder,
+          elabPathPlus(path, "f." + o.objFieldNames[i]),
+        )
         if c < 0 { return -1 }
         tys.push(c)
         i = i + 1
@@ -8955,8 +9015,14 @@ export function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
       if vals.length > 0 { return -1 }
       const hm = elabHoleMapClosed(t)
       if hm >= 0 { return hm }
-      const none: i32[] = []
-      const v = elabHeldClosedTy(o.mVal, none, depth + 1)
+      const noVals: i32[] = []
+      const v = elabHeldClosedTyAt(
+        o.mVal,
+        noVals,
+        depth + 1,
+        holder,
+        elabPathPlus(path, "v"),
+      )
       if v < 0 || tyHasTyVar(o.mKey) { return -1 }
       return mkMapTy(o.mKey, v, o.mSet)
     }
@@ -8965,6 +9031,183 @@ export function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
       return -1
     }
   }
+}
+
+// `path` with step `k` appended, a fresh list.
+function elabPathPlus(path: string[], k: string): string[] {
+  const out: string[] = []
+  for p in path { out.push(p) }
+  out.push(k)
+  out
+}
+
+// The slot fact of the binding every one of `vals` reads, where they all read bindings that have
+// one and agree; -1 otherwise.
+function elabHeldBoundTy(vals: i32[]): i32 {
+  if vals.length == 0 { return -1 }
+  let t = -1
+  for v in vals {
+    const x = parenPeelIx(v)
+    if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+    const d = identDeclOf(x)
+    const ft = elabSlotTys[elabSlotKey(d, -1)] ?? -1
+    if ft < 0 || (t >= 0 && !tySame(t, ft)) { return -1 }
+    t = ft
+  }
+  t
+}
+
+// Holder and instance → the closed type the holder's value is built at there: a `let` binding's
+// declaration, or a function's for the value it returns. Present only where the elaboration
+// closed it; read through `elabSlotTyAt`.
+let elabSlotTys: {[string]: i32} = Map()
+
+function elabSlotKey(holder: i32, k: i32): string {
+  i32ToStr(holder) + "|" + i32ToStr(k)
+}
+
+// The closed type slot `path` (`e`, `v`, `f.<name>`, outermost last; empty for the value) of
+// `holder` is built at in emitted function `fnIx`'s frame; -1 where the elaboration has none.
+export function elabSlotTyAt(holder: i32, path: string[], fnIx: i32): i32 {
+  if holder < 0 { return -1 }
+  const fd = if fnIx >= 0 && fnIx < P.nodes.length { nodeAt(fnIx) } else { null }
+  if fd is FuncDecl && fd.fnTyParams.length > 0 { return -1 }
+  let t = elabSlotTys[elabSlotKey(holder, -1)] ?? -1
+  for p in path {
+    if t < 0 || t >= T.tys.length { return -1 }
+    const o = tyAt(t)
+    if p == "e" && o is TyArray {
+      t = o.aElem
+    } else if p == "v" && o is TyMap {
+      t = o.mVal
+    } else if o is TyObj && p.length > 2 && p.slice(0, 2) == "f." {
+      const nm = p.slice(2, p.length)
+      let next = -1
+      let i = 0
+      while i < o.objFieldNames.length {
+        if o.objFieldNames[i] == nm { next = o.objFieldTypes[i] }
+        i = i + 1
+      }
+      t = next
+    } else {
+      return -1
+    }
+  }
+  t
+}
+
+// Closes every `let` binding outside a generic whose value holds an open function leaf, and every
+// such function's returned list literals, at the type `elabHeldClosedTyAt` gives the values its
+// slots are written, for `elabSlotTyAt`.
+function elabSlotFacts() {
+  const n0 = ekDecl.length
+  let ix = 0
+  while ix < P.nodes.length {
+    const n = nodeAt(ix)
+    if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
+      const t = nodeTyIxOf(ix)
+      if elabSlotOpenFn(t) {
+        const ft = elabSlotClose(ix, t, [n.letInit])
+        if ft >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = ft }
+      }
+    }
+    if (
+      n is FuncDecl
+      && n.fnRet < 0
+      && n.fnTyParams.length == 0
+      && n.fnBody >= 0
+    ) {
+      const ft0 = nodeTyIxOf(ix)
+      const fo = if ft0 >= 0 && ft0 < T.tys.length { tyAt(ft0) } else { null }
+      if fo is TyFunc && elabSlotOpenFn(fo.fnRet) {
+        const vs: i32[] = []
+        collectRetValues(n.fnBody, vs)
+        const ev = elabSlotRetElems(vs)
+        if ev.length > 0 {
+          const ft = elabSlotCloseElems(-1, fo.fnRet, ev)
+          if ft >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = ft }
+        }
+      }
+    }
+    ix = ix + 1
+  }
+  if ekDecl.length > n0 { elabSettle(0) }
+  0
+}
+
+// The elements every value of `vs` stores, a list literal's own or those a `let` binding's slot is
+// written; empty when one is neither.
+function elabSlotRetElems(vs: i32[]): i32[] {
+  const none: i32[] = []
+  const ev: i32[] = []
+  for v in vs {
+    const x = parenPeelIx(v)
+    const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if xn is ArrayLit {
+      for e in xn.arrElems { ev.push(e) }
+    } else if (
+      xn is Ident
+      && identDeclOf(x) >= 0
+      && nodeAt(identDeclOf(x)) is LetDecl
+    ) {
+      const ats: i32[] = []
+      if cwSlotWrittenValues(identDeclOf(x), ["[]"], ev, ats) < 0 {
+        return none
+      }
+    } else {
+      return none
+    }
+  }
+  ev
+}
+
+// The list type `t` built at the closed type its elements `ev` give its element, read at slot `e`
+// of `d` (-1 for none); -1 where it does not close.
+function elabSlotCloseElems(d: i32, t: i32, ev: i32[]): i32 {
+  const o = tyAt(t)
+  if !(o is TyArray) || ev.length == 0 { return -1 }
+  const path: string[] = ["e"]
+  const e = elabHeldClosedTyAt(o.aElem, ev, 0, d, path)
+  if e < 0 || tyHasTyVar(e) { -1 } else { mkArrayTy(e) }
+}
+
+// Whether `t` is an open list, record or map holding a function leaf.
+function elabSlotOpenFn(t: i32): boolean {
+  if t < 0 || t >= T.tys.length || !tyHasTyVar(t) { return false }
+  const o = tyAt(t)
+  if !(o is TyArray) && !(o is TyObj) && !(o is TyMap) { return false }
+  const ds: i32[] = []
+  elabFnIdsIn(t, ds, 0)
+  ds.length > 0
+}
+
+// The closed type of a value of type `t` stored from `inits`, a list's elements read through every
+// write the binding `d` (-1 for none) takes at them; -1 where one does not close or a write is not
+// followed.
+function elabSlotClose(d: i32, t: i32, inits: i32[]): i32 {
+  const o = tyAt(t)
+  if o is TyArray {
+    const ev: i32[] = []
+    const ats: i32[] = []
+    if cwSlotWrittenValues(d, ["[]"], ev, ats) < 0 { return -1 }
+    return elabSlotCloseElems(d, t, ev)
+  }
+  // A map binding's values are what its writes store; an open key closes as an unwritten one does.
+  if o is TyMap && o.mSet != 1 {
+    const mv: i32[] = []
+    const ats: i32[] = []
+    if cwSlotWrittenValues(d, ["[]"], mv, ats) < 0 || mv.length == 0 {
+      return -1
+    }
+    const path: string[] = ["v"]
+    const v = elabHeldClosedTyAt(o.mVal, mv, 0, d, path)
+    if v < 0 || tyHasTyVar(v) { return -1 }
+    const k = if tyHasInferHole(o.mKey, 0) { TY_STR } else { o.mKey }
+    return if tyHasTyVar(k) { -1 } else { mkMapTy(k, v, o.mSet) }
+  }
+  const none: string[] = []
+  const c = elabHeldClosedTyAt(t, inits, 0, d, none)
+  if c < 0 || tyHasTyVar(c) { -1 } else { c }
 }
 
 // Binding `tys` of call `ix` with each un-annotated parameter, or one its own type parameter
@@ -9364,6 +9607,11 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   const k = elabKeyAt(fnIx)
   const r = elabPairIn(elabNodeReps, ix, k)
   if r >= 0 { return r }
+  // The record solve's closed stamp is where the literal is built; the parameter its call
+  // closes is only where it is delivered (D15288).
+  if nodeRepStamped(ix) && !tyHasTyVar(nodeRepTyIx[ix]) {
+    return nodeRepTyIx[ix]
+  }
   const pa = elabArgTyAt(ix, k, 0)
   if pa >= 0 { return pa }
   const sp = elabSpreadInner[ix] ?? -1

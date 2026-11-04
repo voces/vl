@@ -7,24 +7,46 @@ import { decDigitsOf } from "./strutil"
 import { identTyOf } from "./check_nar_store"
 import {
   ArrayLit,
+  AsExpr,
+  BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
+  ForRange,
   FuncDecl,
   Ident,
+  IfStmt,
+  ImportDecl,
   Index,
+  IsExpr,
   LetDecl,
+  LoopVar,
+  MatchExpr,
   Member,
   Node,
+  NullLit,
   NumLit,
   ObjLit,
   OptMember,
   P,
   Param,
+  Paren,
+  Program,
   RetStmt,
   Spread,
+  StrLit,
+  TypeDecl,
   TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
   annTsOf,
   callHasTyArgs,
   callIsRestPacked,
@@ -101,6 +123,7 @@ import {
   fnLetOpenHandNote,
   fnParamHandNote,
   fnSetCalleeNote,
+  fnSlotCallNote,
   fnTagArmMemberOf,
   fnTagChoiceOfTy,
   fnTagMembers,
@@ -3932,8 +3955,61 @@ export function checkCallNode(n: Call, ix: i32) {
       cf is Ident && identFnDeclOf(n.callFn) >= 0,
       argTys,
     )
+    const path: string[] = []
+    const holder = calleeSlotOf(n.callFn, path, 0)
+    if holder >= 0 && path.length > 0 { fnSlotCallNote(holder, path, argTys) }
   }
   t
+}
+
+// The `let` binding a callee read `x` takes its value from through a field, element or map value,
+// with that slot's path (`f.<name>`, `e`, `v`, outermost last) pushed onto `path`; -1 for none.
+function calleeSlotOf(x0: i32, path: string[], depth: i32): i32 {
+  const x = parenPeelIx(x0)
+  if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
+  const n = nodeAt(x)
+  match n {
+    Ident => {
+      const d = identDeclOf(x)
+      return if d >= 0 && d < P.nodes.length && nodeAt(d) is LetDecl { d } else { -1 }
+    }
+    Member => {
+      const h = calleeSlotOf(n.memObj, path, depth + 1)
+      if h >= 0 { path.push("f." + n.memProp) }
+      return h
+    }
+    OptMember => {
+      const h = calleeSlotOf(n.omObj, path, depth + 1)
+      if h >= 0 { path.push("f." + n.omProp) }
+      return h
+    }
+    Index => {
+      const h = calleeSlotOf(n.idxArr, path, depth + 1)
+      const at = nodeTyIxOf(n.idxArr)
+      const isMap = at >= 0 && at < T.tys.length && T.tys[at] is TyMap
+      if h >= 0 { path.push(if isMap { "v" } else { "e" }) }
+      return h
+    }
+    Call => {
+      return calleeMapGetSlot(n, path, depth)
+    }
+    // No other expression reads a binding's slot.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return -1
+    }
+  }
+}
+
+// `calleeSlotOf` for `m.get(k)` on a map `m`: the slot of `m`'s values; -1 for any other call.
+function calleeMapGetSlot(n: Call, path: string[], depth: i32): i32 {
+  if n.callArgs.length != 1 { return -1 }
+  const f = nodeAt(parenPeelIx(n.callFn))
+  if !(f is Member) || f.memProp != "get" { return -1 }
+  const ot = nodeTyIxOf(f.memObj)
+  if ot < 0 || ot >= T.tys.length || !(T.tys[ot] is TyMap) { return -1 }
+  const h = calleeSlotOf(f.memObj, path, depth + 1)
+  if h >= 0 { path.push("v") }
+  h
 }
 
 // `checkCallNode` before the callee's set is noted.

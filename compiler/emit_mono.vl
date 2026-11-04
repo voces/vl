@@ -649,7 +649,6 @@ import {
   elabCallSetIn,
   elabCopyTyOwn,
   elabDemand,
-  elabHeldClosedTy,
   elabHolderRecordAt,
   elabHoleFnClosed,
   elabHoleMapClosed,
@@ -674,6 +673,7 @@ import {
   elabSlotNote,
   elabSlotRecCount,
   elabSlotRecDeclAt,
+  elabSlotTyAt,
   elabSrcDecl,
   elabStampAt,
   elabStubArgSet,
@@ -16403,10 +16403,10 @@ function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
   0
 }
 
-// The list type the record-list literal `lx` of frame `lf` is built at: the elaboration's type
-// for its elements, `repoints` and `writes` (`elabHeldClosedTy`), recorded on `lx`, the re-pointed
-// literals and the values they hold, spelling onto `spell`. -1 left alone, -2 refused. A binding
-// and a function's result read it alike (D15294).
+// The list type the record-list literal `lx` of frame `lf` is built at: the elaboration's slot
+// fact for the elements of `lf`'s binding or result (`elabSlotTyAt`), or in a generic instance its
+// stamp, recorded on `lx`, the re-pointed literals and `writes`' values, spelling onto `spell`. -1
+// left alone, -2 refused. A binding and a function's result read it alike (D15294).
 function monoHeldRecordListAt(
   lx: i32,
   lf: i32[],
@@ -16433,8 +16433,6 @@ function monoHeldRecordListAt(
     ri = ri + 2
   }
   for w in writes { stored.push(w) }
-  const sv: i32[] = []
-  for st in stored { sv.push(st[0]) }
   // A generic instance's literal reads the type its instance stamped; another frame's has none.
   if (
     gen
@@ -16446,8 +16444,9 @@ function monoHeldRecordListAt(
   const nv = if gen {
     if at >= 0 && at < T.tys.length { tyArrayElemIx(at) } else { -1 }
   } else {
-    elabHeldClosedTy(monoHeldBoundFieldsTy(et, stored), sv, 0)
+    elabSlotTyAt(lf[1], ["e"], ctx)
   }
+  if !gen && nv >= 0 && !monoHeldReadsBuiltAt(stored, nv) { return -1 }
   if nv < 0 || nv == et || monoTyOpen(nv) { return -1 }
   const nm = monoPinAnnSpelling(nv)
   if nm == "" { return -1 }
@@ -16465,42 +16464,6 @@ function monoHeldRecordListAt(
     ri = ri + 2
   }
   nt
-}
-
-// Record type `et` with each field every one of the record literals `stored` fills from a binding
-// read at the binding's own closed type (`monoClosedFieldValTy`), which the field then holds as
-// that binding is built; `et` when no field is so filled.
-function monoHeldBoundFieldsTy(et: i32, stored: i32[][]): i32 {
-  if et < 0 || et >= T.tys.length || stored.length == 0 { return et }
-  const o = tyAt(et)
-  if !(o is TyObj) { return et }
-  const tys: i32[] = []
-  let changed = false
-  let i = 0
-  while i < o.objFieldNames.length {
-    let ft = o.objFieldTypes[i]
-    const fvals = monoMapStoredFields(stored, o.objFieldNames[i])
-    if monoTyOpen(ft) && fvals.length == stored.length {
-      let bt = -1
-      for fv in fvals {
-        const x = unwrapParen(fv[0])
-        const t = if x >= 0 && nodeAt(x) is Ident { monoClosedFieldValTy(x, fv[1], false) } else { -1 }
-        if t < 0 || (bt >= 0 && !tyEq(bt, t)) { bt = -2 }
-        if bt != -2 { bt = t }
-      }
-      if bt >= 0 {
-        for fv in fvals { monoClosedFieldValTy(fv[0], fv[1], true) }
-        ft = bt
-        changed = true
-      }
-    }
-    tys.push(ft)
-    i = i + 1
-  }
-  if !changed { return et }
-  const names: string[] = []
-  for nm in o.objFieldNames { names.push(nm) }
-  mkObjTy(names, tys)
 }
 
 // Builds value `v`, written in frame `wf`, at the closed type `t` the elaboration gives its holder
@@ -16564,8 +16527,47 @@ function monoHeldValueAt(
     }
     if n is Ident { monoReachNote(x, true) }
     monoRecordOpen(x, t, wf)
+    return 0
   }
+  // A read of another binding is built at the type that binding is built at.
+  if !(tt is TyFunc) && n is Ident { monoClosedReadTy(x, wf, true) }
   0
+}
+
+// Whether each record literal of `stored` whose field reads another binding finds that binding built
+// at the field's type in record type `t`, so the record and the binding it reads agree.
+function monoHeldReadsBuiltAt(stored: i32[][], t: i32): boolean {
+  const o = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if !(o is TyObj) { return true }
+  for st in stored {
+    const x = unwrapParen(st[0])
+    const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if n is ObjLit {
+      for fx in n.objFields {
+        const f = nodeAt(fx)
+        if f is FieldInit {
+          const v = unwrapParen(f.fiValue)
+          let i = 0
+          while i < o.objFieldNames.length {
+            const ft = o.objFieldTypes[i]
+            if (
+              o.objFieldNames[i] == f.fiName
+              && v >= 0
+              && nodeAt(v) is Ident
+              && ft >= 0
+              && ft < T.tys.length
+              && !(tyAt(ft) is TyFunc)
+            ) {
+              const bt = monoClosedReadTy(v, st[1], false)
+              if bt < 0 || !tySame(bt, ft) { return false }
+            }
+            i = i + 1
+          }
+        }
+      }
+    }
+  }
+  true
 }
 
 // Records the list literal of record literals `rx` the un-annotated function `fnIx` returns, by
@@ -26525,12 +26527,8 @@ function monoWalk(ix: i32, ctx: i32) {
               for t in monoFnTyParamTys(nodeTyIxOf(n.binLeft)) { snTys.push(t) }
             }
             // A function whose result there is not the element's is refused, not stored (D9093).
-            const vt = monoValueAtAnnTy(n.binRight, sn)
-            if (
-              sn != ""
-              && vt >= 0
-              && sigKeyOfTy(vt) != sigKeyOfTy(nodeTyIxOf(n.binLeft))
-            ) {
+            const vt = if sn == "" { -1 } else { monoValueAtAnnTy(n.binRight, sn) }
+            if vt >= 0 && sigKeyOfTy(vt) != sigKeyOfTy(nodeTyIxOf(n.binLeft)) {
               return emitFailAt(
                 "emitProgram: the function written to this element returns another type than "
                   + "the element's, at the arguments its calls pass — a list holds functions of "
