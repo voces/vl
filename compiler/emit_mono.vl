@@ -526,6 +526,7 @@ import {
 } from "./emit_capture_frames"
 import {
   arrLitElemName,
+  bundleRecordRowOfTy,
   captureCountOf,
   exprArray,
   exprF32Array,
@@ -648,7 +649,9 @@ import {
   elabCallSetIn,
   elabCopyTyOwn,
   elabDemand,
+  elabHeldClosedTy,
   elabHolderRecordAt,
+  elabHoleFnClosed,
   elabHoleMapClosed,
   elabInstSlotAt,
   elabInstSpelling,
@@ -10876,7 +10879,7 @@ function monoInstanceRet(
   // A parameter pinned at a bundle's record and returned whole is returned as that record.
   const bp = if fn.fnRet < 0 { monoReturnedBundlePin(fn, pins) } else { -1 }
   if bp >= 0 {
-    const brow = monoBundleRowOf(bp)
+    const brow = bundleRecordRowOfTy(bp)
     if brow >= 0 && brow < sNames.length {
       return synthTypeRefTy(sNames[brow], -1, bp)
     }
@@ -10927,10 +10930,10 @@ function monoReturnedBundleParam(fn: FuncDecl, pins: i32[]): i32 {
 
 // Whether pin `t` is a bundle's record, matched by row since a pin is spelled afresh.
 function monoIsBundleTy(t: i32): boolean {
-  const r = monoBundleRowOf(t)
+  const r = bundleRecordRowOfTy(t)
   if r < 0 { return false }
   for b in monoBundleTys {
-    if monoBundleRowOf(b) == r { return true }
+    if bundleRecordRowOfTy(b) == r { return true }
   }
   false
 }
@@ -16369,10 +16372,9 @@ function monoUncalledNestedListElems(
   1
 }
 
-// Gives the un-annotated list `d` (`lf`) of record literals, whose element the checker left open
-// at a record of functions, the record type the flow table pins each function field at
-// (`monoPinRecordListAt`), over its elements, the elements its `repoints` hold and the record
-// literals its element writes store (D9140); 0 when it is left alone, -1 when refused.
+// Annotates the un-annotated list `d` (`lf`) of record literals, whose element the checker left
+// open at a record of functions, with the type the elaboration gives it (`monoHeldRecordListAt`)
+// over its elements, its `repoints` and its element writes (D9140); 0 left alone, -1 refused.
 function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
   const stored: i32[][] = []
   for w in monoWritesOf("e:", lf[1]) {
@@ -16381,7 +16383,7 @@ function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
     if wb is BinExpr && wf.length == 1 { stored.push([wb.binRight, wf[0]]) }
   }
   const sp: string[] = []
-  const nt = monoPinRecordListAt(d.letInit, lf, ["e"], repoints, stored, sp)
+  const nt = monoHeldRecordListAt(d.letInit, lf, repoints, stored, sp)
   if nt == -2 { return -1 }
   if nt < 0 { return 0 }
   d.letType = synthTypeRefTy(sp[0] + "[]", -1, nt)
@@ -16389,14 +16391,13 @@ function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
   0
 }
 
-// The list type the record-list literal `lx` at slot `path` of `lf` is pinned at, each function
-// field at its flow-table pin (`monoPinStoredRecords`) over its elements, `repoints` and `writes`;
-// recorded on `lx` and the re-pointed literals, spelling onto `spell`. -1 left alone, -2 refused.
-// A binding and a function's result share it (D15207).
-function monoPinRecordListAt(
+// The list type the record-list literal `lx` of frame `lf` is built at: the elaboration's type
+// for its elements, `repoints` and `writes` (`elabHeldClosedTy`), recorded on `lx`, the re-pointed
+// literals and the values they hold, spelling onto `spell`. -1 left alone, -2 refused. A binding
+// and a function's result read it alike (D15294).
+function monoHeldRecordListAt(
   lx: i32,
   lf: i32[],
-  path: string[],
   repoints: i32[],
   writes: i32[][],
   spell: string[],
@@ -16408,8 +16409,7 @@ function monoPinRecordListAt(
   if ctx >= 0 && monoFrameIsGenericInstance(ctx) { return -1 }
   const et = tyArrayElemIx(nodeTyIxOf(lx))
   if et < 0 || et >= T.tys.length || !monoTyOpen(et) { return -1 }
-  const v = tyAt(et)
-  if !(v is TyObj) { return -1 }
+  if !(tyAt(et) is TyObj) { return -1 }
   const stored: i32[][] = []
   for e in lit.arrElems { stored.push([e, ctx]) }
   let ri = 0
@@ -16421,8 +16421,18 @@ function monoPinRecordListAt(
     ri = ri + 2
   }
   for w in writes { stored.push(w) }
-  const nv = monoPinStoredRecords(lf, path, v, stored, spell)
-  if nv < 0 { return nv }
+  const sv: i32[] = []
+  for st in stored { sv.push(st[0]) }
+  const nv = elabHeldClosedTy(monoHeldBoundFieldsTy(et, stored), sv, 0)
+  if nv < 0 || nv == et || monoTyOpen(nv) { return -1 }
+  const nm = monoPinAnnSpelling(nv)
+  if nm == "" { return -1 }
+  const dTys: i32[] = []
+  for st in stored {
+    if monoHeldValueAt(st[0], nv, st[1], dTys, 0) < 0 { return -2 }
+  }
+  structTyMarkAliasable(nv)
+  spell.push(nm)
   const nt = mkArrayTy(nv)
   nodeTyRecord(lx, nt)
   ri = 0
@@ -16433,9 +16443,110 @@ function monoPinRecordListAt(
   nt
 }
 
-// Pins the list literal of record literals `rx` that the un-annotated function `fnIx` returns, by
-// `return` or as its body's value, as a binding of it is pinned (`monoPinRecordListAt` at the
-// function's result slot); a tagged list keeps its ids. -1 when refused.
+// Record type `et` with each field every one of the record literals `stored` fills from a binding
+// read at the binding's own closed type (`monoClosedFieldValTy`), which the field then holds as
+// that binding is built; `et` when no field is so filled.
+function monoHeldBoundFieldsTy(et: i32, stored: i32[][]): i32 {
+  if et < 0 || et >= T.tys.length || stored.length == 0 { return et }
+  const o = tyAt(et)
+  if !(o is TyObj) { return et }
+  const tys: i32[] = []
+  let changed = false
+  let i = 0
+  while i < o.objFieldNames.length {
+    let ft = o.objFieldTypes[i]
+    const fvals = monoMapStoredFields(stored, o.objFieldNames[i])
+    if monoTyOpen(ft) && fvals.length == stored.length {
+      let bt = -1
+      for fv in fvals {
+        const x = unwrapParen(fv[0])
+        const t = if x >= 0 && nodeAt(x) is Ident { monoClosedFieldValTy(x, fv[1], false) } else { -1 }
+        if t < 0 || (bt >= 0 && !tyEq(bt, t)) { bt = -2 }
+        if bt != -2 { bt = t }
+      }
+      if bt >= 0 {
+        for fv in fvals { monoClosedFieldValTy(fv[0], fv[1], true) }
+        ft = bt
+        changed = true
+      }
+    }
+    tys.push(ft)
+    i = i + 1
+  }
+  if !changed { return et }
+  const names: string[] = []
+  for nm in o.objFieldNames { names.push(nm) }
+  mkObjTy(names, tys)
+}
+
+// Builds value `v`, written in frame `wf`, at the closed type `t` the elaboration gives its holder
+// (`elabHeldClosedTy`): a literal records `t` and its parts theirs, a function is instanced at
+// its signature or noted reached for its stub. -1 when an instance is refused.
+function monoHeldValueAt(
+  v: i32,
+  t: i32,
+  wf: i32,
+  dTys: i32[],
+  depth: i32,
+): i32 {
+  const x = unwrapParen(v)
+  if x < 0 || x >= P.nodes.length || t < 0 || t >= T.tys.length || depth > 8 {
+    return 0
+  }
+  const n = nodeAt(x)
+  const tt = tyAt(t)
+  if n is ObjLit && tt is TyObj {
+    // A record re-typed here is built at its closed row, not at the one its open type keyed.
+    if monoTyOpen(nodeTyIxOf(x)) {
+      monoSupersededObjTys.push(nodeTyIxOf(x))
+      monoGradualObjList.push(x)
+    }
+    monoRecordOpen(x, t, wf)
+    for fx in n.objFields {
+      const f = nodeAt(fx)
+      if f is FieldInit {
+        let k = 0
+        while k < tt.objFieldNames.length {
+          if tt.objFieldNames[k] == f.fiName {
+            if (
+              monoHeldValueAt(
+                f.fiValue,
+                tt.objFieldTypes[k],
+                wf,
+                dTys,
+                depth + 1,
+              )
+              < 0
+            ) {
+              return -1
+            }
+          }
+          k = k + 1
+        }
+      }
+    }
+    return 0
+  }
+  if n is ArrayLit && tt is TyArray {
+    monoRecordOpen(x, t, wf)
+    for e in n.arrElems {
+      if monoHeldValueAt(e, tt.aElem, wf, dTys, depth + 1) < 0 { return -1 }
+    }
+    return 0
+  }
+  if tt is TyFunc && !monoTyClosedFn(nodeTyIxOf(x)) {
+    if monoCoerceFnValueTys(x, monoPinAnnSpelling(t), wf, -1, dTys) < 0 {
+      return -1
+    }
+    if n is Ident { monoReachNote(x, true) }
+    monoRecordOpen(x, t, wf)
+  }
+  0
+}
+
+// Records the list literal of record literals `rx` the un-annotated function `fnIx` returns, by
+// `return` or as its body's value, at the type a binding of it reads (`monoHeldRecordListAt`); a
+// tagged list keeps its ids. -1 when refused.
 function monoPinReturnedList(rx: i32, fnIx: i32): i32 {
   if rx < 0 || rx >= P.nodes.length { return 0 }
   const lx = unwrapParen(rx)
@@ -16446,14 +16557,7 @@ function monoPinReturnedList(rx: i32, fnIx: i32): i32 {
   const none: i32[] = []
   const noWrites: i32[][] = []
   const sp: string[] = []
-  const nt = monoPinRecordListAt(
-    lx,
-    [fnIx, fnIx],
-    ["r", "e"],
-    none,
-    noWrites,
-    sp,
-  )
+  const nt = monoHeldRecordListAt(lx, [fnIx, fnIx], none, noWrites, sp)
   if nt == -2 { -1 } else { 0 }
 }
 
@@ -16907,7 +17011,7 @@ function monoPinSlotRecordList(
   if sigs.length < 2 { return 0 }
   const bt = monoBundleRecordTy(sigs, lx)
   if bt < 0 { return -1 }
-  const row = structRowRecordingTy(bt)
+  const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length { return 0 }
   for e in lit.arrElems { nodeTyRecord(unwrapParen(e), bt) }
   const lt = mkArrayTy(bt)
@@ -18316,13 +18420,7 @@ function monoUncalledSlotFnTy(vals: i32[][], spell: string[]): i32 {
       if ft >= 0 && sigKeyOfTy(ft) != sigKeyOfTy(vt) { return -1 }
       ft = vt
     } else if dft < 0 {
-      const ps: i32[] = []
-      for p in f.fnParamTypes {
-        if monoTyOpen(p) { ps.push(TY_I32) } else { ps.push(p) }
-      }
-      let r = f.fnRet
-      if monoTyOpen(r) { r = TY_I32 }
-      dft = mkFuncTy(ps, r)
+      dft = elabHoleFnClosed(vt)
     }
   }
   if ft < 0 { ft = dft }
@@ -23846,7 +23944,7 @@ function monoBundlePinArg(
   const ar = elabCallArgRecordSigs(monoCallTplOf(callIx), i)
   if ar.length > 0 && monoSigsSame(ar, sigs) {
     const bt = monoBundleRecordTy(sigs, arg)
-    const brow = if bt >= 0 { monoBundleRowOf(bt) } else { -1 }
+    const brow = if bt >= 0 { bundleRecordRowOfTy(bt) } else { -1 }
     if brow < 0 || brow >= sNames.length { return -1 }
     pinned.push(sNames[brow])
     pinTys.push(bt)
@@ -23878,8 +23976,7 @@ function monoBundlePinArg(
   }
   const bt = mkObjTy(names, sigs)
   monoClosedRecordOwnRow(bt)
-  const si = structRowRecordingTy(bt)
-  const row = if si >= 0 { si } else { repRowOfTyStruct(bt, sScanLim()) }
+  const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length {
     return emitFailAt(
       "emitProgram: monomorphize: a lambda called at two signatures has no row for its closures",
@@ -23917,7 +24014,7 @@ function monoBundleHandOnPin(
   ) {
     return 1
   }
-  const pr = monoBundleRowOf(bt)
+  const pr = bundleRecordRowOfTy(bt)
   if pr < 0 || pr >= sNames.length { return 1 }
   pinned.push(sNames[pr])
   pinTys.push(bt)
@@ -23933,13 +24030,6 @@ function monoSigsSame(a: i32[], b: i32[]): boolean {
     j = j + 1
   }
   true
-}
-
-// The struct row of record type `t`, or -1.
-function monoBundleRowOf(t: i32): i32 {
-  if t < 0 { return -1 }
-  const si = structRowRecordingTy(t)
-  if si >= 0 { si } else { repRowOfTyStruct(t, sScanLim()) }
 }
 
 // `monoBundlePin` for a generic named by read `x`, handed to a lambda that calls its parameter at
@@ -23967,8 +24057,7 @@ function monoBundleNamedPin(
   }
   const bt = monoBundleRecordTy(sigs, x)
   if bt < 0 { return -1 }
-  const si = structRowRecordingTy(bt)
-  const row = if si >= 0 { si } else { repRowOfTyStruct(bt, sScanLim()) }
+  const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length {
     return emitFailAt(
       "emitProgram: monomorphize: a generic handed as a bundle has no row",
@@ -23994,8 +24083,7 @@ function monoBundleRecordTy(sigs: i32[], at: i32): i32 {
   for _s in sigs { names.push("c" + i32ToStr(names.length)) }
   const bt = mkObjTy(names, sigs)
   monoClosedRecordOwnRow(bt)
-  const si = structRowRecordingTy(bt)
-  const row = if si >= 0 { si } else { repRowOfTyStruct(bt, sScanLim()) }
+  const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length {
     emitFailAt(
       "emitProgram: monomorphize: a lambda called at two signatures has no row for its closures",
