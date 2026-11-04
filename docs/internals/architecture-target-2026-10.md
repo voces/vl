@@ -906,15 +906,17 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 | group | files | witness |
 | --- | --- | --- |
 | F | 6 | a function parameter copied, aliased or re-pointed in a generic body and called at two types (`let b = a1; if c { b = a }; a("x"); b(3)`): `fn-value-param-copied-into-binding-called-at-another-type`, `written-let-reassigned-to-other-param-called-at-two-types`, `written-param-alias-called-at-two-types-runs`, `param-copied-into-unread-binding-of-other-type-param`, `hole-fn-copy-in-record-called-beside-other-key`, `generic-fn-value-type-param-params-swapped-nested-generic` |
-| W-hand | 1 | `written-let-handed-at-two-pins-in-generic-body-at-two-types` (D15103) |
-| W, other | 2 | a void and a value generic written to one `let` and called at two types (`generic-value-return-written-to-void-generic-let`, W-split's ruling question), and a written set handed to a hole parameter then spread into a closed list (`fn-set-list-of-hole-param-spread-into-closed-push`) |
-| W-lam | 1 | two lambda cells re-pointed at each other, called at two types (`cell-peer-called-at-two-types`) |
-| L-set | 3 | a hole parameter forwarded through a two-member list (`forwarded-hole-fn-to-list-element-value-param`, `hole-fn-list-handed-hole-param`) or an `if` choice of a nested capturing function (`choice-of-nested-capturing-function-handed-to-hole-param`, which may be L-nested's) |
+| W-hand | 1 | `written-let-handed-at-two-pins-in-generic-body-at-two-types` (D15103, slice 4b-iii: `ftCtxOk` declines the hand at `T = U`) |
+| W, other | 2 | a void and a value generic written to one `let` and called at two types (`generic-value-return-written-to-void-generic-let`, W-split's ruling question), and a written set handed to a hole parameter then spread into a closed list (`fn-set-list-of-hole-param-spread-into-closed-push`, D15432: the copy's adapter is built at the template) |
+| W-lam | 1 | two lambda cells re-pointed at each other, called at two types (`cell-peer-called-at-two-types`, D15433: tagged, then refused by mono's per-binding signature count under a capture cell) |
+| L-set | 3 → 1 at `a090a48b` | a hole parameter forwarded through a two-member list (`forwarded-hole-fn-to-list-element-value-param`, `hole-fn-list-handed-hole-param`: both run unsplit at `a090a48b`) or an `if` choice of a nested capturing function (`choice-of-nested-capturing-function-handed-to-hole-param`: a capturing member is declined, `ftMemberSeenAtArms`; D14841's shape, the closure-at-delivery design) |
 | returned list | 2 | a returned list's element called at two types (`deliver0()[0](1.25)` beside `take0(deliver0())`): `function-list-element-at-two-types-in-record-pushed-onto-records` runs without the plan since D15062's record escape closed (a record literal pushed onto a list whose element widens only its function fields is built at that element, and holds its closures, `ftLitBuiltAt`); `function-list-element-at-two-types-pushed-through-hole-helper` is D15440, the member's hand to a hole helper that pushes it |
-| M | 2 | a maker's generic result in a record field called at two types (`maker-result-in-module-record-field-returned-or-listed`), and a generic record field narrowed by `is` to a declared row (`record-generic-field-called-and-read-under-is`) |
+| M | 2 → 1 with D15430 | a maker's generic result in a record field called at two types (`maker-result-in-module-record-field-returned-or-listed`: closed by D15430, a closed named call's result handed to a hole parameter holds the set's id), and a generic record field narrowed by `is` to a declared row (`record-generic-field-called-and-read-under-is`, parked on the row question) |
 | alias | 1 | a hole function aliased and handed different functions (`const k = apply2; k(h)`, `k(add)`): `apply-fn-read-as-value-five-ways`, D15441: a call through the list `[apply2]` gets `{apply2}` tried, and the module alias call `k(add)` is no member call and no noted set call, so the set stays a closure; its sibling D15442 is check-clean invalid wasm with the plan on |
 
 L-map, F-let, B, C, H-b, H-nested, N and W-field have no dependent. D15101 runs with the split plan off and is closed.
+
+**Re-censused at `a090a48b` (2026-11-04), then with D15430.** 16 of 5,730 `@run` files refuse with the split plan off on master; the two L-set files that forward through a two-member list run, so L-set's one file left is the capturing choice, which is D14841's (a capturing member's id would carry its environment). With D15430 (a named closed function's result handed to a hole parameter holds the set's id, as a binding does) the M maker file runs too: **15**. The rest of this lane's groups are named by mechanism: W-hand is D15103 (slice 4b-iii), W-lam's file is D15433 (a capture cell over lambda members, tagged but refused by mono's per-binding signature count), the spread push is D15432 (the copy's adapter is built at the template and receives an id in the instance), and M's `is` file stays parked on the row question.
 
 
 F's 15 files are four shapes by witness:
@@ -980,6 +982,8 @@ No dependent would turn into a miscompile if the plan were deleted today: H-choi
 ## 4. Scoreboard
 
 The scoreboard reports side effects of the migration; it is not a landing criterion (§3).
+
+One row is now held: the pin and position layer, row (a) of the special-case helpers, may only fall. It grew from 1,516 functions (76a3eb8fd, 2026-10-25) to 1,571 (f2599d8e5, 2026-11-04) while the elaboration that replaces it was built beside it, because no gate graded it. `tests/budget_pin_helper_test.ts` holds each of the three files at or below `scripts/pin-helper-budget-baseline.json`. A PR that retires helpers lowers the baseline in the same PR; a PR that needs a new one says why in its body and raises it there.
 
 ### 4.1 Baselines (76a3eb8fd)
 
