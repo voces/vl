@@ -102,6 +102,7 @@ import {
   mapUnboxTyIx,
   nodeBoxTyIx,
   nodeCtxTyIx,
+  nodeRepStamped,
   nodeRepTyIx,
   nodeRepTyIxOf,
   nodeRepUnionIx,
@@ -538,6 +539,8 @@ import {
   CW_UP_RET,
   CW_UP_TAIL,
   covarRootName,
+  cwBindingOf,
+  cwGetRecv,
   cwIxBuild,
   cwIxFr,
   cwIxKind,
@@ -552,6 +555,8 @@ import {
   cwOccWalk,
   cwPeel,
   cwPeelValue,
+  cwSlotPath,
+  cwSlotWrittenValues,
 } from "./check_write_scan"
 import {
   Cex,
@@ -2090,7 +2095,7 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     ) {
       return false
     } else if (
-      !mapped
+      (!mapped || recStoreDeclOf(c) >= 0)
       && recValueWrittenThrough(c, own, REC_STORE_DEPTH)
       && recCopyNarrows(dst, own)
     ) {
@@ -2126,7 +2131,12 @@ function recValueWrittenThrough(c: i32, own: i32, depth: i32): boolean {
     return recOwnTypedAt(d, own) && recBindWrittenThrough(d, 4)
   }
   const uk = cwIxUpKind[c]
+  // A value stored into a container slot is asked of the slot's reads.
+  if uk == CW_UP_ARG && recAtStoreArg(c) { return recSlotWrittenThrough(c) }
   if uk == CW_UP_ARG { return recArgWrittenThrough(c, own) }
+  if uk == CW_UP_ELEM || uk == CW_UP_FIELD || uk == CW_UP_ASG_RHS {
+    return recSlotWrittenThrough(c)
+  }
   if uk == CW_UP_RET || uk == CW_UP_TAIL {
     const fd = recEnclosingFn(c)
     const sites: i32[] = []
@@ -2138,6 +2148,46 @@ function recValueWrittenThrough(c: i32, own: i32, depth: i32): boolean {
     }
   }
   false
+}
+
+// Whether the container slot value `c` is stored at is read, through the binding the literal holding
+// it initialises, into a place a record is written through: the write scan's slot model
+// (`cwSlotPath`, `cwSlotWrittenValues`) decides which reads see `c`.
+function recSlotWrittenThrough(c: i32): boolean {
+  const md = recStoreDeclOf(c)
+  if md < 0 { return false }
+  const w = cwOccWalk(md)
+  while cwOccNext(w) {
+    const r = w.row
+    let m = if cwIxKind[r] == CW_OCC_USE { cwIxNode[r] } else { -1 }
+    let steps = 0
+    while (
+      m >= 0
+      && m < cwIxUpKind.length
+      && cwIxUpKind[m] == CW_UP_OBJ
+      && steps < 16
+    ) {
+      m = cwIxUp[m]
+      const mg = if m >= 0 && m < cwIxUpKind.length && cwIxUpKind[m] == CW_UP_CALLEE { cwIxUp[m] } else { -1 }
+      if mg >= 0 && cwGetRecv(mg) >= 0 { m = mg }
+      if recSlotReadHolds(m, c) && recUseWritesThrough(m, 4) { return true }
+      steps = steps + 1
+    }
+  }
+  false
+}
+
+// Whether the place `m` reads is a slot `c` is stored at.
+function recSlotReadHolds(m: i32, c: i32): boolean {
+  const path: string[] = []
+  const root = cwSlotPath(m, path)
+  if root < 0 || path.length == 0 { return false }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwBindingOf(root), path, vals, ats) < 0 {
+    return false
+  }
+  i32ListHas(vals, c)
 }
 
 // Whether binding or parameter `d` is typed at the record `own` stores as, or at an open hole a
@@ -4287,6 +4337,14 @@ function recKeptValueDst(v: i32, depth: i32): i32 {
   if p < 0 || p >= P.nodes.length { return -1 }
   const sa = recSolePinArg(p)
   if sa >= 0 { return recKeptValueDst(sa, depth - 1) }
+  // A call the solve stamped at its own record is kept nowhere else (D15266).
+  if (
+    nodeAt(p) is Call
+    && nodeRepStamped(p)
+    && tySame(nodeRepTyIxOf(p), nodeTyIxOf(p))
+  ) {
+    return -1
+  }
   const kd = recKeptDstOfDecl(recFreshOriginDecl(p, 6))
   if kd >= 0 { return kd }
   const fd = recInferredFnOf(p)
