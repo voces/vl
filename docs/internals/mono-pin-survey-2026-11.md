@@ -97,9 +97,20 @@ instance's record (`elabWalkTy`) over the tests and the distilled corpus. Of 75,
 `monoPinnedTyOf` calls, 10,875 disagreed, 9,876 of them with mono's answer open where the
 record is closed. Preferring the record broke 21 programs (10 traps, 11 refusals), and
 preferring it only where mono's answer is open still broke 18, nearly all hole instances.
-Mono's open answer is a deferral to the hole binding, not a second producer; retiring it needs
-the store to record the hole-instance answer first. [D15259](inventory/D15259.md) is the gap in
+Mono's open answer is a deferral to the hole binding, not a second producer. The store already
+holds the hole-instance answer (below), so retiring it needs the two re-making sites to stop
+pinning early. [D15259](inventory/D15259.md) is the gap in
 the other direction, where the record is open and mono's substitution closes it.
+
+**Why the remaining readers stay on the ladder.** Emit already reads the hole-instance answer
+from the store: `scopeTyAt` returns `elabNodeTyAt` for an open type once the program is
+monomorphized. Two of `monoPinnedTyOf`'s 14 call sites break when given the store's type where
+mono's is open. They are `monoExprRebuild` (10 of the 21 broken programs alone) and
+`monoPinRetype` (7 alone). Both re-make a node and pin the closed type on it before the hole
+instance's emission reads the store. The other 12 read the store with no effect: 0 emitted-wasm
+movers over 7,528 test files and 11,726 corpus cells. So that switch was not landed, because it
+adds a helper and deletes nothing. It is worth doing when it can delete the ladder rungs inside
+`monoPinnedTyOf`; until then sites 5 and 11 say in a comment that they defer to `scopeTyAt`.
 
 ## D. Function values at an annotation (contextual typing of a fn value)
 | fn | callers | note |
@@ -110,10 +121,44 @@ the other direction, where the record is open and mono's substitution closes it.
 | monoCloseRetFnTy | 4 | records what monoPinnedAnnTyAt reads (D9503) |
 | monoHoleLamAtAnnTy | 3 | |
 | monoPinWrittenLam | 2 | lambda written into a fn-typed slot, at that type |
-These take a SPELLING (`ann: string`) as input: the destination is known by name, not as a type fact. That is step 5 (contextual type), not an elab store.
+Three take a SPELLING (`ann: string`): `monoValueAtAnnTy`, `monoHoleLamAtAnnTy` and
+`monoPinWrittenLam`. The spelling is not a declared destination. It is `monoSigFnTyName(pins[0])`,
+the signature the function-value flow table says the slot is called at, with its return spelled
+`void`. The other three take no spelling. They re-read types mono pinned earlier.
+
+**Measured 2026-11-04: the checker records no closed destination where these work.** A
+non-halting note at each function's answer put mono's answer beside the node's checker destination
+(`nodeCtxTyIx`, from `recordCtxTy`), the walked instance's destination (`elabNodeCtxs`) and the
+node's elaborated type. Swept over `tests` and the distilled corpus (19,264 files). Cells are
+calls/files.
+
+| fn | compared | agrees with a store | store open | store closed, differs | no store |
+|---|---|---|---|---|---|
+| monoValueAtAnnTy | 536/114 | 7 | 400 | 64 | 65 |
+| monoPinWrittenLam | 139/45 | 2 | 112 | | 25 |
+| monoHoleLamAtAnnTy | 2/1 | | 2 | | |
+
+- **`monoValueAtAnnTy` is mostly asked with no pin.** A further 9,825 of its calls (1,410 files)
+  pass `ann == ""` and return -1 at once; one more passes a spelling `nameToTy` does not resolve.
+- **The closed-but-different stores mostly agree.** 49 of the 64 differ only in the `void`
+  return the spelling carries, and mono's result equals the store.
+- **The open stores are the slot's inferred hole type.** Mono's pin is what closes them.
+
+The three that take no spelling:
+
+- `monoPinnedAnnTyAt` (26/8, through `monoPinnedListAnnTy`) and `monoRetypePinCalls` (59/26) read
+  nodes with no destination store, whose own type is open.
+- `monoCloseRetFnTy` (791/382) answers -1 on 757. Where it closes a type (34), 15 have an open
+  store, 3 an equal one and 16 none.
+
+So the producer group D needs is G1's group C fact, not a contextual-type stamp:
+`elabSlotTyAt(holder, path, k)`, the closed type a slot is built and called at. These six are its
+future readers, alongside group C's. The flow table must not stamp it; that would be a third
+producer. The probe is `docs/internals/mono-groupd-probe.patch` (apply, build, run under
+`VL_NO_COMPILE_CACHE=1 VL_REP_SHADOW=1`, grep `repAB/gd`).
 
 ## Ranking (by callers, then by how much a store would delete)
 1. A (42 call sites over 5 fns): one existing store (elabNodeTyAt), five second producers. Highest count, lowest risk: readers switch, producers delete.
 2. B, monoArgPinTyIx (12): its ladder's rungs are each a fact elab or the checker already has (lit-built, rep row, copy); a per-call-param store would retire the ladder.
 3. C (18 + the elab on-demand set): the G1 pattern proper; needs the new (binding, path, instance) fact; monoStoredSlotFnTy is the largest body.
-4. D (25): not an elab store; contextual-type work (step 5), listed so it is not double-counted.
+4. D (25): no store of its own. Its readers wait on C's slot fact (`elabSlotTyAt`), measured above.
