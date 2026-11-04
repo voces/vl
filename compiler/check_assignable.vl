@@ -4,7 +4,7 @@
 // parameter pinned. The per-kind checkers reach `checkNode` through `checkNodeHook`.
 
 import { identTyOf } from "./check_nar_store"
-import { declareDecl, identFnDeclOf } from "./check_scopes"
+import { declareDecl, identBoundFnDeclOf, identFnDeclOf } from "./check_scopes"
 import {
   ArrayLit,
   AsExpr,
@@ -408,6 +408,7 @@ import {
   dstAdmitsF64,
   fnTyHasHole,
   numKindMask,
+  recFnValueLeaves,
 } from "./check_type_shape"
 import {
   T,
@@ -453,10 +454,27 @@ import { wideLitByNode } from "./check_wide_lits"
 import { recAdPinInit } from "./check_rec_adopt_rows"
 import { argLitAt, wsSuppress } from "./check_width"
 import {
+  CW_OCC_BIND,
+  CW_OCC_CALL,
+  CW_OCC_FDECL,
+  CW_OCC_USE,
+  CW_UP_CALLEE,
+  CW_UP_LETINIT,
+  CW_UP_NONE,
   cwBindingOf,
   cwCalleeDeclOf,
   cwFnValueDeclOf,
   cwFnValueTargets,
+  cwIxBuild,
+  cwIxKind,
+  cwIxNode,
+  cwIxParent,
+  cwIxUp,
+  cwIxUpKind,
+  cwOccNext,
+  cwOccWalk,
+  cwPeelValue,
+  cwUseInOtherFrame,
   fnDeclIx,
 } from "./check_write_scan"
 import { numLexIsFloat } from "./emit_bignum"
@@ -564,6 +582,148 @@ function fsbAdaptWrites(c: i32, rt: i32, nm: string[], ty: i32[], rhs: i32[]) {
   }
   for r in rhs { fvaAdapt(r, rt, dst) }
   0
+}
+
+// The clause a refusal adds where one member of a value called at several signatures fits the
+// destination but the member pick is not yet served there: a capability, not a type rule (D15146).
+const BUNDLE_POS_GAP = "; taking the member this destination names is not yet supported at this position"
+
+// Whether `got`, under the bindings `bNames`/`bTys` of `call`, fits `want` once each lambda
+// parameter's hole is bound at another signature the callee calls one of its parameters at:
+// a value called at several signatures is a record of one member each, and a destination takes
+// the member it names (D15146).
+function bundleMemberFits(
+  got: i32,
+  want: i32,
+  bNames: string[],
+  bTys: i32[],
+  call: i32,
+): boolean {
+  const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { null }
+  const fd = if cn is Call && cn.callFn >= 0 { identBoundFnDeclOf(cn.callFn) } else { -1 }
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) { return false }
+  cwIxBuild()
+  for par in f.fnParams {
+    const ow = cwOccWalk(par)
+    while cwOccNext(ow) {
+      const u = cwIxNode[ow.row]
+      const isCallee = u >= 0
+        && u < cwIxUpKind.length
+        && cwIxUpKind[u] == CW_UP_CALLEE
+      const pc = if isCallee { nodeAt(cwIxUp[u]) } else { null }
+      if pc is Call && bundleSigFits(got, want, bNames, bTys, pc.callArgs) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Whether `got` fits `want` with each lambda-parameter hole of `bNames` bound at the matching
+// argument of `args` instead (`?#L<n>.<i>` binds parameter `i`).
+function bundleSigFits(
+  got: i32,
+  want: i32,
+  bNames: string[],
+  bTys: i32[],
+  args: i32[],
+): boolean {
+  const ty: i32[] = []
+  let moved = false
+  let i = 0
+  while i < bNames.length {
+    let t = bTys[i]
+    const nm = bNames[i]
+    let dot = nm.length - 1
+    while dot >= 0 && nm.charCodeAt(dot) != 46 { dot = dot - 1 }
+    if nm.slice(0, 3) == "?#L" && dot > 0 {
+      const ai = bundleHoleIndex(nm, dot + 1)
+      if ai >= 0 && ai < args.length {
+        const at = nodeTyIxOf(args[ai])
+        if at >= 0 { t = widenLitTy(at); moved = true }
+      }
+    }
+    ty.push(t)
+    i = i + 1
+  }
+  if !moved { return false }
+  const g = substTyDeep(got, bNames, ty)
+  !tyHasHole(g) && assignable(g, want)
+}
+
+// The decimal index spelled from `at` to the end of hole name `nm`, or -1 where it is not one.
+function bundleHoleIndex(nm: string, at: i32): i32 {
+  if at >= nm.length { return -1 }
+  let v = 0
+  let i = at
+  while i < nm.length {
+    const c = nm.charCodeAt(i)
+    if c < 48 || c > 57 { return -1 }
+    v = v * 10 + (c - 48)
+    i = i + 1
+  }
+  v
+}
+
+// Whether let row `ci`'s destination is one where the member a returned record of members is used
+// as is picked: an annotated binding of a direct call of a function handing back a held value, read
+// in its own function only by calls or by un-annotated copies read so, and never assigned on. Each
+// position the member pick comes to serve deletes a test here (D15146).
+function letCstrBundleServed(ci: i32): boolean {
+  if letCstr.name[ci] == "" || !(tyAt(letCstr.want[ci]) is TyFunc) {
+    return false
+  }
+  const init = cwPeelValue(letCstr.ix[ci])
+  const n = if init >= 0 && init < P.nodes.length { nodeAt(init) } else { null }
+  if !(n is Call) || n.callFn < 0 { return false }
+  const fd = identBoundFnDeclOf(n.callFn)
+  if fd < 0 { return false }
+  // A function handing back another call's result is not yet one (the `return_inferred` cells).
+  for lf in recFnValueLeaves(fd) {
+    const l = cwPeelValue(lf)
+    if l < 0 || nodeAt(l) is Call { return false }
+  }
+  cwIxBuild()
+  const d = if init < cwIxParent.length { cwIxParent[init] } else { -1 }
+  d >= 0 && nodeAt(d) is LetDecl && bundleUsesServed(d, 2)
+}
+
+// Whether every read of binding `d` is a call through it, or the initialiser of an un-annotated
+// binding whose reads are, to `depth` copies, each in `d`'s own function, with no write to `d`.
+function bundleUsesServed(d: i32, depth: i32): boolean {
+  if depth <= 0 { return false }
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const k = cwIxKind[ow.row]
+    const u = cwIxNode[ow.row]
+    if k == CW_OCC_CALL {
+      // The row's node is the call through `d`; its callee is the read.
+      const cc = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+      if !(cc is Call) || cc.callFn < 0 || cwUseInOtherFrame(cc.callFn) {
+        return false
+      }
+    } else if k == CW_OCC_USE {
+      if cwUseInOtherFrame(u) { return false }
+      const uk = if u < cwIxUpKind.length { cwIxUpKind[u] } else { CW_UP_NONE }
+      if uk == CW_UP_LETINIT {
+        const ld = cwIxUp[u]
+        const ln = if ld >= 0 { nodeAt(ld) } else { null }
+        if (
+          !(ln is LetDecl)
+          || ln.letType >= 0
+          || !bundleUsesServed(ld, depth - 1)
+        ) {
+          return false
+        }
+      } else if uk != CW_UP_CALLEE {
+        return false
+      }
+    } else if k != CW_OCC_BIND && k != CW_OCC_FDECL {
+      return false
+    }
+  }
+  true
 }
 
 // Re-ask, at call `c`, each owner row recorded since it last asked.
@@ -2784,6 +2944,15 @@ export function validateRetCstrs(
           ) {
             let rWho = "the callee's return"
             if who != "" { rWho = "the return of `" + who + "`" }
+            const rMember = !rClash
+              && bundleMemberFits(
+              retCstr.got[ci],
+              rw,
+              bNames,
+              bTys,
+              ix,
+            )
+            const rGap = if rMember { BUNDLE_POS_GAP } else { "" }
             tErr(
               "return type mismatch: expected "
                 + tyToStr(rw)
@@ -2794,6 +2963,7 @@ export function validateRetCstrs(
                 + rWho
                 + " at the call's argument types"
                 + unboundParamsNote(bNames, bTys)
+                + rGap
                 + ")",
               ix,
             )
@@ -2900,15 +3070,23 @@ export function validateLetCstrs(
       const clash = tyHasHole(lg) && !tyHasHole(lw) && fnShapeClash(lg, lw, 0)
       if !tyHasHole(lg) && !tyHasHole(lw) || clash {
         if clash || !litPinAssignable(letCstr.ix[ci], lg, lw, bNames, bTys) {
-          let lWho = "the callee's body"
-          if who != "" { lWho = "the body of `" + who + "`" }
-          tErr(
-            letAssignMsg(letCstr.ix[ci], lg, lw, letCstr.name[ci], -1)
-              + " ("
-              + lWho
-              + " at the call's argument types)",
-            ix,
-          )
+          // A destination one member of a value called at several signatures fits (D15146).
+          const member = !clash
+            && bundleMemberFits(letCstr.got[ci], lw, bNames, bTys, ix)
+          if !member || !letCstrBundleServed(ci) {
+            let lWho = "the callee's body"
+            if who != "" { lWho = "the body of `" + who + "`" }
+            const gap = if member { BUNDLE_POS_GAP } else { "" }
+            tErr(
+              letAssignMsg(letCstr.ix[ci], lg, lw, letCstr.name[ci], -1)
+                + " ("
+                + lWho
+                + " at the call's argument types"
+                + gap
+                + ")",
+              ix,
+            )
+          }
         }
       }
     }
