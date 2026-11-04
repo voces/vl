@@ -7,7 +7,7 @@ import { tyParamIsBareOnly } from "./check_scopes"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { paramHoleName } from "./check_tp_join"
 import { decDigitsOf } from "./strutil"
-import { constListFnElemDecl, slotOfRead } from "./check_calls"
+import { constListFnElemDecl } from "./check_calls"
 
 import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx } from "./check_ty_rep"
@@ -170,8 +170,6 @@ import {
   fnSetCalledWithAny,
   fnSetHasCapturingLambda,
   fnSlotCallArgsOf,
-  fnSlotDelivIxs,
-  fnSlotDelivTys,
   fnTagCallArms,
   fnTagLeafSetOf,
   fnTagListTy,
@@ -8736,13 +8734,6 @@ function elabHeldFnTy(t: i32, ds: i32[], holder: i32, path: string[]): i32 {
   // The slot's own calls, where they agree on one closed tuple, decide before any instance.
   const own = if holder >= 0 { fnSlotCallArgsOf(holder, path) } else { [] }
   if own.length > 0 && ds.length > 0 { return elabHeldAtArgs(ds, own) }
-  // A slot read only where it is delivered at a closed function type is taken at that type.
-  const dt = if holder >= 0 && own.length == 0 { elabSlotDelivFnTy(holder, path) } else { -1 }
-  const df = if dt >= 0 { tyAt(dt) } else { null }
-  if df is TyFunc && ds.length > 0 {
-    const r = elabHeldAtArgs(ds, df.fnParamTypes)
-    return if r >= 0 && tySame(r, dt) { r } else { -1 }
-  }
   let sig = -1
   let bare = 0
   const bares: i32[] = []
@@ -8990,16 +8981,8 @@ export function elabSlotTyAt(holder: i32, path: string[], fnIx: i32): i32 {
   if holder < 0 { return -1 }
   const fd = if fnIx >= 0 && fnIx < P.nodes.length { nodeAt(fnIx) } else { null }
   if fd is FuncDecl && fd.fnTyParams.length > 0 { return -1 }
-  elabTyAlong(elabSlotTys[elabSlotKey(holder, -1)] ?? -1, path, 0)
-}
-
-// Type `t` read along `path` from step `from` on: a list's element (`e`), a map's value (`v`), a
-// record's field (`f.<name>`); -1 where a step does not apply.
-function elabTyAlong(t0: i32, path: string[], from: i32): i32 {
-  let t = t0
-  let k = from
-  while k < path.length {
-    const p = path[k]
+  let t = elabSlotTys[elabSlotKey(holder, -1)] ?? -1
+  for p in path {
     if t < 0 || t >= T.tys.length { return -1 }
     const o = tyAt(t)
     if p == "e" && o is TyArray {
@@ -9018,60 +9001,8 @@ function elabTyAlong(t0: i32, path: string[], from: i32): i32 {
     } else {
       return -1
     }
-    k = k + 1
   }
   t
-}
-
-// Holder and path ("h|p/q/") → the closed destinations the checker delivered a read of that slot
-// at (`fnSlotDelivNote`), resolved through `slotOfRead` when the slot facts are made.
-let elabSlotDelivs: {[string]: i32[]} = Map()
-
-function elabSlotPathKey(holder: i32, path: string[], upto: i32): string {
-  let k = i32ToStr(holder) + "|"
-  let i = 0
-  while i < upto && i < path.length {
-    k = k + path[i] + "/"
-    i = i + 1
-  }
-  k
-}
-
-// Resolves every delivered read the checker noted to the slot it reads.
-function elabSlotDelivBuild() {
-  elabSlotDelivs = Map()
-  const ixs = fnSlotDelivIxs()
-  const tys = fnSlotDelivTys()
-  let i = 0
-  while i < ixs.length && i < tys.length {
-    const path: string[] = []
-    const h = slotOfRead(ixs[i], path)
-    if h >= 0 {
-      const key = elabSlotPathKey(h, path, path.length)
-      const ts = elabSlotDelivs[key] ?? []
-      ts.push(tys[i])
-      elabSlotDelivs[key] = ts
-    }
-    i = i + 1
-  }
-  0
-}
-
-// The one closed function type slot `path` of `holder` is delivered at, read through every
-// delivery of it or of a slot enclosing it; -1 where none is, one is not a function, or two differ.
-function elabSlotDelivFnTy(holder: i32, path: string[]): i32 {
-  let ft = -1
-  let k = 0
-  while k <= path.length {
-    for t in elabSlotDelivs[elabSlotPathKey(holder, path, k)] ?? [] {
-      const at = elabTyAlong(t, path, k)
-      if at < 0 || at >= T.tys.length || !(tyAt(at) is TyFunc) { return -1 }
-      if ft >= 0 && !tySame(ft, at) { return -1 }
-      ft = at
-    }
-    k = k + 1
-  }
-  ft
 }
 
 // Closes every `let` binding outside a generic whose value holds an open function leaf, and every
@@ -9079,7 +9010,6 @@ function elabSlotDelivFnTy(holder: i32, path: string[]): i32 {
 // slots are written, for `elabSlotTyAt`.
 function elabSlotFacts() {
   const n0 = ekDecl.length
-  elabSlotDelivBuild()
   let ix = 0
   while ix < P.nodes.length {
     const n = nodeAt(ix)
