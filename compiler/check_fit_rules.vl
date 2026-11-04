@@ -109,6 +109,7 @@ import {
   recCopyFrom,
   recCopyFromOf,
   recCopyTyIx,
+  recCopyTyOf,
   recCopyUnwrap,
   setCtorKeys,
 } from "./check_core_state"
@@ -2075,7 +2076,7 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     ) {
       return false
     } else if (
-      !mapped
+      (!mapped || recStoreDeclOf(c) >= 0)
       && recValueWrittenThrough(c, own, REC_STORE_DEPTH)
       && recCopyNarrows(dst, own)
     ) {
@@ -2112,6 +2113,9 @@ function recValueWrittenThrough(c: i32, own: i32, depth: i32): boolean {
   }
   const uk = cwIxUpKind[c]
   if uk == CW_UP_ARG { return recArgWrittenThrough(c, own) }
+  if uk == CW_UP_ELEM || uk == CW_UP_FIELD {
+    return recSlotWrittenThrough(c, uk)
+  }
   if uk == CW_UP_RET || uk == CW_UP_TAIL {
     const fd = recEnclosingFn(c)
     const sites: i32[] = []
@@ -2120,6 +2124,36 @@ function recValueWrittenThrough(c: i32, own: i32, depth: i32): boolean {
       if s % 2 == 0 && recValueWrittenThrough(s / 2, own, depth - 1) {
         return true
       }
+    }
+  }
+  false
+}
+
+// Whether a read of the container slot value `c` is stored at (a list element, or a record field,
+// of the binding the literal holding it initialises) writes a record through (`recUseWritesThrough`).
+function recSlotWrittenThrough(c: i32, uk: i32): boolean {
+  const md = recStoreDeclOf(c)
+  if md < 0 { return false }
+  const lit = cwIxUp[c]
+  const ln = if lit >= 0 && lit < P.nodes.length { nodeAt(lit) } else { nodeAt(0) }
+  let fld = ""
+  if uk == CW_UP_FIELD && ln is ObjLit {
+    for fx in ln.objFields {
+      const fi = nodeAt(fx)
+      if fi is FieldInit && parenPeelIx(fi.fiValue) == c { fld = fi.fiName }
+    }
+    if fld == "" { return false }
+  }
+  const fr = cwKeyFrame(md)
+  const w = cwOccWalk(md)
+  while cwOccNext(w) {
+    const r = w.row
+    const u = if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == fr { cwIxNode[r] } else { -1 }
+    if u >= 0 && u < cwIxUpKind.length && cwIxUpKind[u] == CW_UP_OBJ {
+      const m = cwIxUp[u]
+      const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { nodeAt(0) }
+      const reads = if uk == CW_UP_ELEM { mn is Index } else { mn is Member && mn.memProp == fld }
+      if reads && recUseWritesThrough(m, 4) { return true }
     }
   }
   false
@@ -4272,6 +4306,8 @@ function recKeptValueDst(v: i32, depth: i32): i32 {
   if p < 0 || p >= P.nodes.length { return -1 }
   const sa = recSolePinArg(p)
   if sa >= 0 { return recKeptValueDst(sa, depth - 1) }
+  // A call copied back to its own record is stored as that copy (D15266).
+  if nodeAt(p) is Call && recCopyFromOf(p) >= 0 { return recCopyTyOf(p) }
   const kd = recKeptDstOfDecl(recFreshOriginDecl(p, 6))
   if kd >= 0 { return kd }
   const fd = recInferredFnOf(p)
