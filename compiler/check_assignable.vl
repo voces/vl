@@ -214,7 +214,7 @@ import {
   validateUfcsCstrs,
 } from "./check_demands"
 import { bmArgMsg, tpMembersListText } from "./check_diag_text"
-import { callDstTyOf, setCallDstTy } from "./check_expected"
+import { callDstTyForGeneric, setCallDstTy } from "./check_expected"
 import {
   adoptFnNameAt,
   cexDeliver,
@@ -454,27 +454,18 @@ import { wideLitByNode } from "./check_wide_lits"
 import { recAdPinInit } from "./check_rec_adopt_rows"
 import { argLitAt, wsSuppress } from "./check_width"
 import {
-  CW_OCC_BIND,
-  CW_OCC_CALL,
-  CW_OCC_FDECL,
-  CW_OCC_USE,
   CW_UP_CALLEE,
-  CW_UP_LETINIT,
-  CW_UP_NONE,
   cwBindingOf,
   cwCalleeDeclOf,
   cwFnValueDeclOf,
   cwFnValueTargets,
   cwIxBuild,
-  cwIxKind,
   cwIxNode,
-  cwIxParent,
   cwIxUp,
   cwIxUpKind,
   cwOccNext,
   cwOccWalk,
   cwPeelValue,
-  cwUseInOtherFrame,
   fnDeclIx,
 } from "./check_write_scan"
 import { numLexIsFloat } from "./emit_bignum"
@@ -666,62 +657,18 @@ function bundleHoleIndex(nm: string, at: i32): i32 {
   v
 }
 
-// Whether let row `ci`'s destination is one where the member a returned record of members is used
-// as is picked: an annotated binding of a direct call of a function handing back a held value, read
-// in its own function only by calls or by un-annotated copies read so, and never assigned on. Each
-// position the member pick comes to serve deletes a test here (D15146).
+// Whether let row `ci`'s destination takes the member of a returned record of members it names:
+// every position does, since the call picks the member its delivery type names, except an
+// initialiser calling a function that hands back another call's result (D15243).
 function letCstrBundleServed(ci: i32): boolean {
-  if letCstr.name[ci] == "" || !(tyAt(letCstr.want[ci]) is TyFunc) {
-    return false
-  }
   const init = cwPeelValue(letCstr.ix[ci])
   const n = if init >= 0 && init < P.nodes.length { nodeAt(init) } else { null }
-  if !(n is Call) || n.callFn < 0 { return false }
+  if !(n is Call) || n.callFn < 0 { return true }
   const fd = identBoundFnDeclOf(n.callFn)
-  if fd < 0 { return false }
-  // A function handing back another call's result is not yet one (the `return_inferred` cells).
+  if fd < 0 { return true }
   for lf in recFnValueLeaves(fd) {
     const l = cwPeelValue(lf)
     if l < 0 || nodeAt(l) is Call { return false }
-  }
-  cwIxBuild()
-  const d = if init < cwIxParent.length { cwIxParent[init] } else { -1 }
-  d >= 0 && nodeAt(d) is LetDecl && bundleUsesServed(d, 2)
-}
-
-// Whether every read of binding `d` is a call through it, or the initialiser of an un-annotated
-// binding whose reads are, to `depth` copies, each in `d`'s own function, with no write to `d`.
-function bundleUsesServed(d: i32, depth: i32): boolean {
-  if depth <= 0 { return false }
-  const ow = cwOccWalk(d)
-  while cwOccNext(ow) {
-    const k = cwIxKind[ow.row]
-    const u = cwIxNode[ow.row]
-    if k == CW_OCC_CALL {
-      // The row's node is the call through `d`; its callee is the read.
-      const cc = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
-      if !(cc is Call) || cc.callFn < 0 || cwUseInOtherFrame(cc.callFn) {
-        return false
-      }
-    } else if k == CW_OCC_USE {
-      if cwUseInOtherFrame(u) { return false }
-      const uk = if u < cwIxUpKind.length { cwIxUpKind[u] } else { CW_UP_NONE }
-      if uk == CW_UP_LETINIT {
-        const ld = cwIxUp[u]
-        const ln = if ld >= 0 { nodeAt(ld) } else { null }
-        if (
-          !(ln is LetDecl)
-          || ln.letType >= 0
-          || !bundleUsesServed(ld, depth - 1)
-        ) {
-          return false
-        }
-      } else if uk != CW_UP_CALLEE {
-        return false
-      }
-    } else if k != CW_OCC_BIND && k != CW_OCC_FDECL {
-      return false
-    }
   }
   true
 }
@@ -2941,18 +2888,10 @@ export function validateRetCstrs(
           if (
             rClash
             || !litPinAssignable(retCstr.ix[ci], rgc, rw, bNames, bTys)
+              && !bundleMemberFits(retCstr.got[ci], rw, bNames, bTys, ix)
           ) {
             let rWho = "the callee's return"
             if who != "" { rWho = "the return of `" + who + "`" }
-            const rMember = !rClash
-              && bundleMemberFits(
-              retCstr.got[ci],
-              rw,
-              bNames,
-              bTys,
-              ix,
-            )
-            const rGap = if rMember { BUNDLE_POS_GAP } else { "" }
             tErr(
               "return type mismatch: expected "
                 + tyToStr(rw)
@@ -2963,7 +2902,6 @@ export function validateRetCstrs(
                 + rWho
                 + " at the call's argument types"
                 + unboundParamsNote(bNames, bTys)
-                + rGap
                 + ")",
               ix,
             )
@@ -3179,7 +3117,7 @@ export function dstBindLitTyParams(
   bTys: i32[],
   outNames: string[],
 ) {
-  const dst = dstForArgs(callDstTyOf(ix), args, ret)
+  const dst = dstForArgs(callDstTyForGeneric(ix), args, ret)
   if dst < 0 || ret < 0 || !anyArgIsLitOnly(args) || !tyHasTyVar(ret) {
     return 0
   }
