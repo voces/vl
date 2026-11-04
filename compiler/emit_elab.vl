@@ -7,7 +7,7 @@ import { tyParamIsBareOnly } from "./check_scopes"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { paramHoleName } from "./check_tp_join"
 import { decDigitsOf } from "./strutil"
-import { constListFnElemDecl } from "./check_calls"
+import { constListFnElemDecl, slotOfRead } from "./check_calls"
 
 import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx } from "./check_ty_rep"
@@ -101,6 +101,7 @@ import {
   cwOccNext,
   cwOccWalk,
   cwPeelValue,
+  cwSlotValuesFrom,
   cwSlotWrittenValues,
   cwUseInOtherFrame,
   fnDeclIx,
@@ -9320,16 +9321,18 @@ function elabSlotClose(d: i32, t: i32, inits: i32[]): i32 {
   if o is TyArray {
     const ev: i32[] = []
     const ats: i32[] = []
-    if cwSlotWrittenValues(d, ["[]"], ev, ats) < 0 { return -1 }
+    if cwSlotWrittenValues(d, ["[]"], ev, ats) < 0 {
+      return elabSlotFromSources(d, t)
+    }
     return elabSlotCloseElems(d, t, ev)
   }
   // A map binding's values are what its writes store; an open key closes as an unwritten one does.
   if o is TyMap && o.mSet != 1 {
     const mv: i32[] = []
     const ats: i32[] = []
-    if cwSlotWrittenValues(d, ["[]"], mv, ats) < 0 || mv.length == 0 {
-      return -1
-    }
+    const wr = cwSlotWrittenValues(d, ["[]"], mv, ats)
+    if wr < 0 { return elabSlotFromSources(d, t) }
+    if mv.length == 0 { return -1 }
     const path: string[] = ["v"]
     const v = elabHeldClosedTyAt(o.mVal, mv, 0, d, path)
     if v < 0 || tyHasTyVar(v) { return -1 }
@@ -9339,6 +9342,78 @@ function elabSlotClose(d: i32, t: i32, inits: i32[]): i32 {
   const none: string[] = []
   const c = elabHeldClosedTyAt(t, inits, 0, d, none)
   if c < 0 || tyHasTyVar(c) { -1 } else { c }
+}
+
+// The closed list or map type `t` of `let` binding `d` whose initialiser reads other holders'
+// slots (`slotOfRead`, each `...b` of a literal one more) rather than a literal: their one closed
+// fact, the functions `d`'s own writes and the literal's other elements store agreeing at it; -1
+// where a source has no fact, two differ, or a stored function is not that type at its parameters.
+function elabSlotFromSources(d: i32, t: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letInit < 0 || t < 0 || t >= T.tys.length {
+    return -1
+  }
+  const init = parenPeelIx(dn.letInit)
+  if init < 0 || init >= P.nodes.length { return -1 }
+  const own: i32[] = []
+  const srcs: i32[] = []
+  const il = nodeAt(init)
+  if il is ArrayLit {
+    for e in il.arrElems {
+      const en = nodeAt(parenPeelIx(e))
+      if en is Spread { srcs.push(en.spdArg) } else { own.push(e) }
+    }
+  } else {
+    srcs.push(init)
+  }
+  if srcs.length == 0 { return -1 }
+  // A copy of a whole binding (`b.slice(...)`, `[...b, v]`) holds `b`'s values and is decided at
+  // its own calls; a read of a slot or a call's result holds that slot's fact.
+  const ev: i32[] = []
+  let whole = true
+  for x in srcs {
+    const path: string[] = []
+    const h = slotOfRead(x, path)
+    const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+    if !(hn is LetDecl) || path.length > 0 || h == d {
+      whole = false
+    } else {
+      const ats0: i32[] = []
+      if cwSlotWrittenValues(h, ["[]"], ev, ats0) < 0 { whole = false }
+    }
+  }
+  if whole && tyAt(t) is TyArray {
+    for v in own { ev.push(v) }
+    const ats1: i32[] = []
+    if cwSlotValuesFrom(d, dn.letInit, [], ["[]"], ev, ats1) < 0 { return -1 }
+    return elabSlotCloseElems(d, t, ev)
+  }
+  let st = -1
+  for x in srcs {
+    const path: string[] = []
+    const h = slotOfRead(x, path)
+    if h < 0 || h == d { return -1 }
+    const ft = elabSlotTyAt(h, path, -1)
+    if ft < 0 || tyHasTyVar(ft) || (st >= 0 && !tySame(st, ft)) { return -1 }
+    st = ft
+  }
+  const ats: i32[] = []
+  if cwSlotValuesFrom(d, dn.letInit, [], ["[]"], own, ats) < 0 { return -1 }
+  if own.length == 0 { return st }
+  const so = tyAt(st)
+  const ot = tyAt(t)
+  const et = if so is TyArray { so.aElem } else if so is TyMap { so.mVal } else { -1 }
+  const oe = if ot is TyArray { ot.aElem } else if ot is TyMap { ot.mVal } else { -1 }
+  const ef = if et >= 0 { tyAt(et) } else { null }
+  if !(ef is TyFunc) || oe < 0 || !(tyAt(oe) is TyFunc) { return -1 }
+  const ds: i32[] = []
+  const closed: i32[] = []
+  for v in own {
+    if !elabHeldValFns(parenPeelIx(v), ds, closed) { return -1 }
+  }
+  const r = if ds.length > 0 { elabHeldAtArgs(ds, ef.fnParamTypes) } else { et }
+  if elabHeldClosedAgree(r, closed) < 0 || !tySame(r, et) { return -1 }
+  st
 }
 
 // Binding `tys` of call `ix` with each un-annotated parameter, or one its own type parameter
