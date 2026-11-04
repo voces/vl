@@ -79,6 +79,7 @@ import {
   CW_OCC_USE,
   CW_UP_ASG_LHS,
   CW_UP_CALLEE,
+  CW_UP_ELEM,
   CW_UP_FIELD,
   CW_UP_LETINIT,
   CW_UP_OBJ,
@@ -4535,6 +4536,7 @@ function elabResultScanReset() {
   elabResKeeps = Map()
   elabThroughMembers = Map()
   elabSlotRecDecl = []
+  elabResSlotCalls = []
   elabSlotRecField = []
   elabSlotRecAt = []
   elabPlaceRecs = Map()
@@ -4659,6 +4661,14 @@ function elabResCallHolder(d: i32): boolean {
   v >= 0 && v < P.nodes.length && elabResMayReturnRecord(v)
 }
 
+// Whether call `g` is an element of a list literal or a field of a record literal.
+function elabResInLiteral(g: i32): boolean {
+  if g < 0 || g >= cwIxParent.length { return false }
+  const p = cwIxParent[g]
+  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  pn is ArrayLit || pn is FieldInit
+}
+
 // Whether call `v` can return a record: its callee names a function with no return annotation,
 // as only such an instance returns one.
 function elabResMayReturnRecord(v: i32): boolean {
@@ -4682,6 +4692,9 @@ function elabResScanCall(g: i32) {
       if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
         elabFnCalleeReads[d] = (elabFnCalleeReads.get(d) ?? 0) + 1
         if elabPlainCallee(g) >= 0 { elabResPlainCalls[g] = d }
+        if elabResMayReturnRecord(g) && elabResInLiteral(g) {
+          elabResSlotCalls.push(g)
+        }
       }
       if elabResMayHold(d) {
         const at = elabResThrough.get(d) ?? []
@@ -4747,13 +4760,13 @@ function elabResultMembersNote() {
   if elabResCopies.length > 0 { elabCopyRecordsNote() }
   elabRetRecordKeepsNote()
   if elabResPlainCalls.length > 0 { elabPlainCallsNote() }
-  for c in elabResPlainCalls.keys() { elabSlotRecordNote(c) }
-  for c in elabCallKeys.keys() {
-    if !elabResPlainCalls.has(c) { elabSlotRecordNote(c) }
-  }
+  for c in elabResSlotCalls { elabSlotRecordNote(c) }
   0
 }
 
+// Each call initialising a slot of a literal, whose callee can return a record (the candidates
+// `elabSlotRecordNote` asks), in the order `elabRun` met them.
+let elabResSlotCalls: i32[] = []
 // Each slot `d.f` of an un-annotated record literal the `let` `d` binds, holding a returned record
 // of members whole, keyed as the write scan keys slots (binding, path): an index into
 // `elabRecTable`.
@@ -4763,27 +4776,42 @@ let elabSlotRecAt: i32[] = []
 // Each call through such a field's place, with the record it calls a member of.
 let elabPlaceRecs: {[i32]: i32[]} = Map()
 
-// Call `c` in plain code, initialising field `f` of an un-annotated record literal bound by `let`
-// `d`, keeps its record whole there when every write of the slot `d.f` (`cwSlotWrittenValues`) is
-// such a call and every read of `d` is a read of a field: of `f`, a call through the place at one
-// of the record's signatures or the initialiser of a `const` read only by such calls.
+// Call `c` in plain code, initialising slot `d.f` or `d[]` of an un-annotated literal `let` `d`, keeps
+// its record whole there when every write of the slot (`cwSlotWrittenValues`) is such a call and
+// every read of `d` reads the slot (a call through it at one of the record's signatures, or a
+// `const` read only by such calls), a sibling field, or a list's length.
 function elabSlotRecordNote(c: i32) {
   if c < 0 || c >= P.nodes.length || !elabInPlainCode(c) { return 0 }
   cwIxBuild()
-  if c >= cwIxUpKind.length || cwIxUpKind[c] != CW_UP_FIELD { return 0 }
+  if c >= cwIxUpKind.length { return 0 }
   const lit = cwIxUp[c]
-  const fx = cwIxUpAux[c]
-  const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
-  if !(fiv is FieldInit) || lit < 0 || lit >= cwIxUpKind.length { return 0 }
-  if cwIxUpKind[lit] != CW_UP_LETINIT { return 0 }
-  const d = cwIxUp[lit]
-  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if !(dn is LetDecl) || dn.letType >= 0 || !(nodeAt(lit) is ObjLit) {
+  const uk0 = cwIxUpKind[c]
+  let f = ""
+  if uk0 == CW_UP_FIELD {
+    const fx = cwIxUpAux[c]
+    const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+    if !(fiv is FieldInit) { return 0 }
+    f = fiv.fiName
+  } else if uk0 == CW_UP_ELEM {
+    f = "[]"
+  } else {
     return 0
   }
+  if lit < 0 || lit >= cwIxUpKind.length || cwIxUpKind[lit] != CW_UP_LETINIT {
+    return 0
+  }
+  const isList = f == "[]"
+  const d = cwIxUp[lit]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const ln = nodeAt(lit)
+  if !(dn is LetDecl) || dn.letType >= 0 { return 0 }
+  if isList && !(ln is ArrayLit) || !isList && !(ln is ObjLit) { return 0 }
+  if elabSlotFieldRecord(d, f).length > 0 { return 0 }
   const rec = elabCallRecord(c, -1, 4)
   if rec.length < 2 { return 0 }
-  const f = fiv.fiName
+  // One list per record holds it whole: a second list of the same record is not yet built at its
+  // record list, so it keeps its refusal (D15149).
+  if isList && elabSlotListOfRec(rec) { return 0 }
   // Every value the slot is written is a call returning the same record.
   const vals: i32[] = []
   const ats: i32[] = []
@@ -4817,8 +4845,16 @@ function elabSlotRecordNote(c: i32) {
       }
       const m = cwIxUp[u]
       const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
-      if !(mn is Member) { return 0 }
-      if mn.memProp == f {
+      // The slot's own place: the field `f`, or any element of the list.
+      let own = false
+      if isList {
+        if mn is Index { own = true }
+        else if !(mn is Member) || mn.memProp != "length" { return 0 }
+      } else {
+        if !(mn is Member) { return 0 }
+        own = mn.memProp == f
+      }
+      if own {
         const uk = if m < cwIxUpKind.length { cwIxUpKind[m] } else { -1 }
         if uk == CW_UP_CALLEE {
           const pm = elabCallSigMember(cwIxUp[m], rec)
@@ -4858,6 +4894,24 @@ function elabSlotRecordNote(c: i32) {
   0
 }
 
+// Whether a list slot already holds record `rec` whole.
+function elabSlotListOfRec(rec: i32[]): boolean {
+  let i = 0
+  while i < elabSlotRecDecl.length {
+    const at = elabSlotRecAt[i]
+    if (
+      elabSlotRecField[i] == "[]"
+      && at >= 0
+      && at < elabRecTable.length
+      && elabTyListSame(elabRecTable[at], rec)
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
 // Whether `const` binding `h` holds record `rec` read from a slot: un-annotated, read only as the
 // callee of a call at one of the record's signatures, in its own frame.
 function elabSlotHolderOk(h: i32, rec: i32[]): boolean {
@@ -4891,6 +4945,35 @@ function elabSlotHolderCalls(h: i32): i32[] {
     if t < 0 || !i32ListHas(out, t) { out.push(t) }
   }
   out
+}
+
+// How many slots hold a returned record of members whole, and the binding of slot `i`: mono types
+// each at its record before its walk.
+export function elabSlotRecCount(): i32 { elabSlotRecDecl.length }
+export function elabSlotRecDeclAt(i: i32): i32 {
+  if i >= 0 && i < elabSlotRecDecl.length { elabSlotRecDecl[i] } else { -1 }
+}
+
+// The record signatures the elements of the binding list literal `lit` initialises hold whole;
+// none where it initialises no such binding.
+export function elabSlotRecordListSigs(lit: i32): i32[] {
+  let i = 0
+  while i < elabSlotRecDecl.length {
+    const d = elabSlotRecDecl[i]
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    const at = elabSlotRecAt[i]
+    if (
+      elabSlotRecField[i] == "[]"
+      && dn is LetDecl
+      && parenPeelIx(dn.letInit) == lit
+      && at >= 0
+      && at < elabRecTable.length
+    ) {
+      return elabRecTable[at]
+    }
+    i = i + 1
+  }
+  []
 }
 
 // The record signatures slot `d.f` of the `let` `d` holds whole; none where it holds none.
