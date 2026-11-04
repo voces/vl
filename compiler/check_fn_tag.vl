@@ -80,6 +80,7 @@ import { valueTailSplit } from "./check_num_adopt"
 import { collectRetValues } from "./check_nj_join"
 import { rcwInferredRetTy } from "./check_rcw"
 import { tErr, widenLitTy } from "./check_relate_core"
+import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
 import {
   T,
   TY_VOID,
@@ -3618,8 +3619,8 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     Call => {
       // A binding handed to a hole parameter binds it to the binding's own type, and the callee's
       // writes through it join this set (D14648).
-      return ftArgDstTy(pn, x) == tx
-        || ftMapSetValTy(pn, x, s) == tx
+      return ftDstTakes(ftArgDstTy(pn, x), x, s)
+        || ftDstTakes(ftMapSetValTy(pn, x, s), x, s)
         || ftLate
         && ftHoleArg(pn, x)
         && ftInnerLit(parenPeelIx(x))
@@ -3632,10 +3633,11 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     BinExpr => {
       if ftIsStore(pn) && pn.binRight == x {
-        return nodeTyIxOf(pn.binLeft) == tx || ftMapEntryOf(pn.binLeft, s) == tx
+        return ftDstTakes(nodeTyIxOf(pn.binLeft), x, s)
+          || ftDstTakes(ftMapEntryOf(pn.binLeft, s), x, s)
       }
       if ftIsStore(pn) && pn.binLeft == x {
-        return nodeTyIxOf(pn.binRight) == tx
+        return ftDstTakes(tx, pn.binRight, s)
       }
       if pn.binOp != "??" { return false }
       return nodeTyIxOf(p) == tx
@@ -3648,8 +3650,10 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     // A function body's last statement is its result, delivered as a `return`'s value is (D15208).
     // A value `if` or `match` arm's is the choice's value, which is the holder in its place.
+    // A statement before a block's last hands nothing on: its value is discarded.
     Block => {
-      return nodeTyIxOf(p) == tx
+      return ftStmtDiscarded(p, x)
+        || nodeTyIxOf(p) == tx
         || ftFnBodyTail(p, x, fn) && rcwInferredRetTy(fn) == tx
         || ftArmTail(p, x, g) && ftHoldsDecided(g, s)
     }
@@ -3657,7 +3661,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     ArrayLit => {
       if !ftHolds(p, s) { return false }
       const pk = ftHoldKind(nodeTyIxOf(p), s, FT_HOLD_DEPTH)
-      return ftArrElemTy(p) == tx || pk == 4 || pk == 6
+      return ftDstTakes(ftArrElemTy(p), x, s) || pk == 4 || pk == 6
     }
     FieldInit => {
       return pn.fiValue == x && ftHolds(g, s)
@@ -3684,6 +3688,32 @@ function ftTyHoldsDecided(t: i32, s: i32): boolean {
     }
   }
   false
+}
+
+// Whether a destination of type `dst` takes the holder `x` of set `s` as it is: its own type, or a
+// record of the storage `x` is built at that holds `s` or a set decided with it, so the holder's
+// one rep is the destination's. A list's storage is its element's, so only its own type takes it.
+function ftDstTakes(dst: i32, x: i32, s: i32): boolean {
+  if dst < 0 || x < 0 || x >= P.nodes.length { return false }
+  const tx = nodeTyIxOf(x)
+  if dst == tx { return true }
+  const bt = nodeRepTyIxOf(x)
+  bt >= 0
+    && bt < T.tys.length
+    && dst < T.tys.length
+    && tyAt(dst) is TyObj
+    && tyAt(bt) is TyObj
+    && fieldStorageEq(dst, bt, REC_STORE_DEPTH)
+    && ftTyHoldsDecided(dst, s)
+}
+
+// Whether `x` is a statement of block `b` other than its last.
+function ftStmtDiscarded(b: i32, x: i32): boolean {
+  const bn = nodeAt(b)
+  bn is Block
+    && bn.blkStmts.length > 0
+    && bn.blkStmts[bn.blkStmts.length - 1] != x
+    && i32ListHas(bn.blkStmts, x)
 }
 
 // Whether `x` is the last statement of block `b`, an arm of the `if` or `match` `g`.
