@@ -18,12 +18,13 @@ import {
 import { rcwCallSites } from "./check_record_writes"
 import { callRetRepTy } from "./check_bind_adopt"
 import { nodeTyIxOf } from "./check_node_tys"
-import { nodeRepTyIxOf } from "./check_core_state"
+import { nodeRepTyIxOf, recCopyFromOf, recCopyTyOf } from "./check_core_state"
 import { T, TyArray, TyObj, objFieldType, tyAt, tySame } from "./check_types"
 import { nonNullTy } from "./tyquery"
 import {
   adoptLitAt,
   recBuiltReadTy,
+  recCoalesceCallAdopt,
   recCoalesceHeldAdopt,
   recCoalesceLitAdopt,
   recHeldAsgStamp,
@@ -71,7 +72,12 @@ export function callBuiltTy(x: i32, depth: i32): i32 {
   const p = solePinPeel(x)
   const hd = if p >= 0 && nodeAt(p) is Ident { recHeldDecl(p) } else { -1 }
   const hn = if hd >= 0 { nodeAt(hd) } else { nodeAt(0) }
-  if hd >= 0 && hn is LetDecl { return callBuiltTy(hn.letInit, depth - 1) }
+  if hd >= 0 && hn is LetDecl {
+    // A binding holding its own copy of a call is built at the copy's record (D15246).
+    const ci = unwrapParen(hn.letInit)
+    if ci >= 0 && recCopyFromOf(ci) >= 0 { return recCopyTyOf(ci) }
+    return callBuiltTy(hn.letInit, depth - 1)
+  }
   // A binding's literal is built at its rep stamp, as a result literal is.
   if p >= 0 && nodeAt(p) is ObjLit {
     const ls = litRepTyAt(p, -1)
@@ -210,7 +216,15 @@ export function storeLetsResolve() {
     const own = if u >= 0 && u < P.nodes.length { nodeTyIxOf(u) } else { -1 }
     if own >= 0 && own < T.tys.length && tyAt(own) is TyObj {
       const r = storeHeldAt(u)
-      if r >= 0 && r < T.tys.length && tyAt(r) is TyObj && !tySame(r, own) {
+      // A call the record solve copies back to its own record is not held at its build (D15246).
+      const back = recCopyFromOf(u) >= 0
+      if (
+        !back
+        && r >= 0
+        && r < T.tys.length
+        && tyAt(r) is TyObj
+        && !tySame(r, own)
+      ) {
         storeLetBuiltSet(u, r)
         // A binding of a call is built where the call's results are (`recBuildTyOf`, D15172).
         if nodeAt(u) is Call {
@@ -311,13 +325,15 @@ export function storeRetsResolve() {
 function storeHeldAt(u: i32): i32 {
   const n = nodeAt(u)
   if n is Call { return callBuiltTy(u, 8) }
-  // A built read defaulted to a record literal, or to a held one built there too, is held at the
-  // read's build (D15230).
+  // A built read defaulted to a record literal, a held one or a call, built there too, is held at
+  // the read's build (D15230, D15240).
   if n is BinExpr {
     const b = recBuiltReadTy(u)
     const r = if b >= 0 { nonNullTy(b) } else { -1 }
     const adopted = r >= 0
-      && (recCoalesceLitAdopt(u, r) || recCoalesceHeldAdopt(u, r))
+      && (recCoalesceLitAdopt(u, r)
+      || recCoalesceHeldAdopt(u, r)
+      || recCoalesceCallAdopt(u, r))
     return if adopted { r } else { -1 }
   }
   if n is Index {

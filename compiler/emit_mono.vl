@@ -668,6 +668,8 @@ import {
   elabRetOf,
   elabSlotFieldRecord,
   elabSlotNote,
+  elabSlotRecCount,
+  elabSlotRecDeclAt,
   elabSrcDecl,
   elabStampAt,
   elabStubArgSet,
@@ -16369,18 +16371,45 @@ function monoUncalledNestedListElems(
 
 // Gives the un-annotated list `d` (`lf`) of record literals, whose element the checker left open
 // at a record of functions, the record type the flow table pins each function field at
-// (`monoPinStoredRecords`), over its elements, the elements its `repoints` hold and the record
+// (`monoPinRecordListAt`), over its elements, the elements its `repoints` hold and the record
 // literals its element writes store (D9140); 0 when it is left alone, -1 when refused.
 function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
+  const stored: i32[][] = []
+  for w in monoWritesOf("e:", lf[1]) {
+    const wb = nodeAt(w)
+    const wf = monoLetWriteFrame(lf, w)
+    if wb is BinExpr && wf.length == 1 { stored.push([wb.binRight, wf[0]]) }
+  }
+  const sp: string[] = []
+  const nt = monoPinRecordListAt(d.letInit, lf, ["e"], repoints, stored, sp)
+  if nt == -2 { return -1 }
+  if nt < 0 { return 0 }
+  d.letType = synthTypeRefTy(sp[0] + "[]", -1, nt)
+  monoRetypeMapReads(lf[0], lf[1], nt, tyArrayElemIx(nt), "")
+  0
+}
+
+// The list type the record-list literal `lx` at slot `path` of `lf` is pinned at, each function
+// field at its flow-table pin (`monoPinStoredRecords`) over its elements, `repoints` and `writes`;
+// recorded on `lx` and the re-pointed literals, spelling onto `spell`. -1 left alone, -2 refused.
+// A binding and a function's result share it (D15207).
+function monoPinRecordListAt(
+  lx: i32,
+  lf: i32[],
+  path: string[],
+  repoints: i32[],
+  writes: i32[][],
+  spell: string[],
+): i32 {
   const ctx = lf[0]
-  if d.letInit < 0 || d.letInit >= P.nodes.length { return 0 }
-  const lit = nodeAt(d.letInit)
-  if !(lit is ArrayLit) || lit.arrElems.length == 0 { return 0 }
-  if ctx >= 0 && monoFrameIsGenericInstance(ctx) { return 0 }
-  const et = tyArrayElemIx(nodeTyIxOf(d.letInit))
-  if et < 0 || et >= T.tys.length || !monoTyOpen(et) { return 0 }
+  if lx < 0 || lx >= P.nodes.length { return -1 }
+  const lit = nodeAt(lx)
+  if !(lit is ArrayLit) || lit.arrElems.length == 0 { return -1 }
+  if ctx >= 0 && monoFrameIsGenericInstance(ctx) { return -1 }
+  const et = tyArrayElemIx(nodeTyIxOf(lx))
+  if et < 0 || et >= T.tys.length || !monoTyOpen(et) { return -1 }
   const v = tyAt(et)
-  if !(v is TyObj) { return 0 }
+  if !(v is TyObj) { return -1 }
   const stored: i32[][] = []
   for e in lit.arrElems { stored.push([e, ctx]) }
   let ri = 0
@@ -16391,25 +16420,41 @@ function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
     }
     ri = ri + 2
   }
-  for w in monoWritesOf("e:", lf[1]) {
-    const wb = nodeAt(w)
-    const wf = monoLetWriteFrame(lf, w)
-    if wb is BinExpr && wf.length == 1 { stored.push([wb.binRight, wf[0]]) }
-  }
-  const sp: string[] = []
-  const nv = monoPinStoredRecords(lf, ["e"], v, stored, sp)
-  if nv == -2 { return -1 }
-  if nv < 0 { return 0 }
+  for w in writes { stored.push(w) }
+  const nv = monoPinStoredRecords(lf, path, v, stored, spell)
+  if nv < 0 { return nv }
   const nt = mkArrayTy(nv)
-  d.letType = synthTypeRefTy(sp[0] + "[]", -1, nt)
-  nodeTyRecord(d.letInit, nt)
+  nodeTyRecord(lx, nt)
   ri = 0
   while ri + 1 < repoints.length {
     nodeTyRecord(repoints[ri], nt)
     ri = ri + 2
   }
-  monoRetypeMapReads(ctx, lf[1], nt, nv, "")
-  0
+  nt
+}
+
+// Pins the list literal of record literals `rx` that the un-annotated function `fnIx` returns, by
+// `return` or as its body's value, as a binding of it is pinned (`monoPinRecordListAt` at the
+// function's result slot); a tagged list keeps its ids. -1 when refused.
+function monoPinReturnedList(rx: i32, fnIx: i32): i32 {
+  if rx < 0 || rx >= P.nodes.length { return 0 }
+  const lx = unwrapParen(rx)
+  if lx < 0 || lx >= P.nodes.length || !(nodeAt(lx) is ArrayLit) { return 0 }
+  if fnTagListTy(nodeTyIxOf(lx)) || fnTagListTy(elabNodeTyAt(lx, fnIx)) {
+    return 0
+  }
+  const none: i32[] = []
+  const noWrites: i32[][] = []
+  const sp: string[] = []
+  const nt = monoPinRecordListAt(
+    lx,
+    [fnIx, fnIx],
+    ["r", "e"],
+    none,
+    noWrites,
+    sp,
+  )
+  if nt == -2 { -1 } else { 0 }
 }
 
 // The list literals the `let` `d` (`lf`, `monoReadLetFrame`) is re-pointed to, each followed by
@@ -16787,12 +16832,32 @@ function monoNoteFieldReadTy(rd: i32, fx: i32, ft: i32) {
   0
 }
 
+// Each binding the elaboration found holding a returned record of members whole in a slot is typed
+// at that record before the walk, in the binding's own frame, whatever the walk reaches (B2).
+function monoSlotRecordsApply(): i32 {
+  const done: i32[] = []
+  let i = 0
+  while i < elabSlotRecCount() {
+    const at = elabSlotRecDeclAt(i)
+    const dn = if at >= 0 && at < P.nodes.length { nodeAt(at) } else { null }
+    if dn is LetDecl && !i32ListHas(done, at) {
+      done.push(at)
+      if dn.letType < 0 && dn.letInit >= 0 {
+        if monoPinSlotRecords(dn, at, monoTopFrameOf(at)) < 0 { return -1 }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Types each field of the un-annotated record literal `d` binds at `at` in frame `ctx` that holds a
 // returned record of members whole (`elabSlotFieldRecord`) at that record's row, with the literal
 // and the field's reads; -1 where no row is minted for it.
 function monoPinSlotRecords(d: LetDecl, at: i32, ctx: i32): i32 {
   const lx = unwrapParen(d.letInit)
   const lit = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if lit is ArrayLit { return monoPinSlotRecordList(d, lit, lx, at, ctx) }
   const ot = nodeTyIxOf(lx)
   if !(lit is ObjLit) || ot < 0 || ot >= T.tys.length { return 0 }
   const o = tyAt(ot)
@@ -16825,6 +16890,29 @@ function monoPinSlotRecords(d: LetDecl, at: i32, ctx: i32): i32 {
     nodeTyRecord(lx, rt)
     monoGradualObjList.push(lx)
   }
+  0
+}
+
+// `monoPinSlotRecords` for the list literal `lit` at `lx`: its elements, the list and its element
+// reads take the record its slot holds, and the binding the list of it.
+function monoPinSlotRecordList(
+  d: LetDecl,
+  lit: ArrayLit,
+  lx: i32,
+  at: i32,
+  ctx: i32,
+): i32 {
+  const sigs = elabSlotFieldRecord(at, "[]")
+  if sigs.length < 2 { return 0 }
+  const bt = monoBundleRecordTy(sigs, lx)
+  if bt < 0 { return -1 }
+  const row = structRowRecordingTy(bt)
+  if row < 0 || row >= sNames.length { return 0 }
+  for e in lit.arrElems { nodeTyRecord(unwrapParen(e), bt) }
+  const lt = mkArrayTy(bt)
+  d.letType = synthTypeRefTy(sNames[row] + "[]", -1, lt)
+  nodeTyRecord(lx, lt)
+  monoRetypeSlotReads(ctx, at, "e", bt)
   0
 }
 
@@ -18794,7 +18882,8 @@ function monoReachLitTys() {
 
 // The list half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a list.
 function monoReachListTy(a: i32, t: Ty) {
-  if t is TyArray {
+  // An element already typed at a returned record of members holds it whole (B2).
+  if t is TyArray && !monoIsBundleTy(t.aElem) {
     const ct = monoReachSlotTy(a, t.aElem, "e,")
     if ct >= 0 { nodeTyRecord(a, mkArrayTy(ct)) }
   }
@@ -18808,11 +18897,8 @@ function monoReachRecTy(a: i32, t: Ty) {
     let moved = false
     let i = 0
     while i < t.objFieldTypes.length {
-      const ct = monoReachSlotTy(
-        a,
-        t.objFieldTypes[i],
-        "f:" + t.objFieldNames[i] + ",",
-      )
+      const ft = t.objFieldTypes[i]
+      const ct = if monoIsBundleTy(ft) { -1 } else { monoReachSlotTy(a, ft, "f:" + t.objFieldNames[i] + ",") }
       if ct >= 0 {
         fts.push(ct)
         moved = true
@@ -26218,6 +26304,7 @@ function monoWalk(ix: i32, ctx: i32) {
           if cf.fnRet < 0 && monoCoerceRetAtPin(n.retArg, ctx) < 0 { return -1 }
           if cf.fnRet < 0 {
             monoPinReturnedObj(n.retArg, ctx)
+            if monoPinReturnedList(n.retArg, ctx) < 0 { return -1 }
           } else {
             monoRetRecordOf(ctx)
           }
@@ -26426,7 +26513,6 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
     if monoPinListElems(n, ix, ctx) < 0 { return -1 }
   }
   if n.letType < 0 && n.letInit >= 0 && nodeAt(n.letInit) is ObjLit {
-    if monoPinSlotRecords(n, ix, ctx) < 0 { return -1 }
     if n.letKw == "const" {
       if monoPinRecordFields(n, ix, ctx) < 0 { return -1 }
     }
@@ -26774,6 +26860,7 @@ function monoWalkFnBodyIn(fnIx: i32) {
       if b is Block && b.blkStmts.length > 0 {
         const tail = b.blkStmts[b.blkStmts.length - 1]
         if monoCoerceRetAtPin(tail, fnIx) < 0 { return -1 }
+        if monoPinReturnedList(tail, fnIx) < 0 { return -1 }
       }
     }
     return monoWalk(fn.fnBody, fnIx)
@@ -29311,6 +29398,7 @@ export function monomorphize(stmts: i32[]) {
   if monoShadowRename(fnStmts.length) < 0 { return -1 }
   monoFlowReads(stmts)
   monoInertReach(stmts)
+  if monoSlotRecordsApply() < 0 { return -1 }
   // Top-level statements first, in source order (global inits + start stmts).
   let i = 0
   while i < stmts.length {

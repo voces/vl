@@ -11,6 +11,7 @@ import {
   bundleFieldOfCall,
   bundleHandMemberOf,
   bundleParamOfRead,
+  bundleRecordOfSigs,
   bundleRetParamOf,
   bundleSigsOfParam,
   bundleTySigsOf,
@@ -52,6 +53,7 @@ import {
   elabInstTyAt,
   elabNestedCopyOnChain,
   elabNodeRepAt,
+  elabSlotRecordListSigs,
   elabSpreadNote,
   elabSpreadRunHolderOf,
   elabSpreadRunNote,
@@ -84,6 +86,7 @@ import {
   nodeCtxTyIxOf,
   omitFieldKey,
   omitFieldNull,
+  recCopyFromOf,
   recCopyTyOf,
   recCopyUnwrapOf,
 } from "./check_core_state"
@@ -139,6 +142,7 @@ import {
   TyUnion,
   TyVar,
   listArmFitAcrossReps,
+  mkArrayTy,
   numLitUnionBaseName,
   numLitUnionBaseTy,
   objFieldType,
@@ -1347,6 +1351,7 @@ import {
   sFieldMapShape,
   sFieldRefSlot,
   structRowFieldStoresAtom,
+  structRowOfAnnTy,
   variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
 import {
@@ -3151,7 +3156,16 @@ function rcFieldTy(dTy: i32, name: string): i32 {
 // copy is recorded.
 function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
   const dst = recCopyTyOf(exprIx)
-  if dst < 0 || !exprStruct(exprIx, fnIx) { return -1 }
+  if dst < 0 { return -1 }
+  // A call copied back to its own record lands in that record's row, read off its function's
+  // build at `recCopyFromOf` (D15246).
+  if recCopyFromOf(exprIx) >= 0 {
+    let dsi = structIndexOfTy(dst)
+    if dsi < 0 { dsi = structRowOfAnnTy("", dst, dst) }
+    if dsi < 0 || dsi >= sHeapIdx.length { return -1 }
+    return dsi
+  }
+  if !exprStruct(exprIx, fnIx) { return -1 }
   const ssi = structIndexOfExpr(exprIx, fnIx)
   if ssi < 0 || ssi >= sHeapIdx.length { return -1 }
   const vi = repVariantShapeRowOf(dst)
@@ -3170,7 +3184,9 @@ function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
 function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
   const names: string[] = []
   const codes: i32[] = []
-  const ssi = structIndexOfExpr(exprIx, fnIx)
+  // A call copied back to its own record is read at the row its function builds it at.
+  const from = recCopyFromOf(exprIx)
+  const ssi = if from >= 0 { structIndexOfTy(from) } else { structIndexOfExpr(exprIx, fnIx) }
   if row <= -2 {
     const vi = -2 - row
     if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
@@ -12748,11 +12764,15 @@ function emitArrAt(body: u8[], arrIx: i32, fnIx: i32, lb: ListBuild) {
 
 // The build pair list literal `arrIx` takes in `fnIx`: its stamp's, else its own shape's.
 function arrLitListBuild(arrIx: i32, fnIx: i32): ListBuild {
-  // A list holding a tagged set's ids is built at the rep the checker stamped (D15220).
+  // A list holding a tagged set's ids is built at the rep the checker stamped (D15220), and one
+  // whose elements hold a returned record whole at the list of it mono typed it (B2).
   const held = fnTagHeldRepOf(arrIx)
+  const recSigs = elabSlotRecordListSigs(arrIx)
+  const recBt = if recSigs.length >= 2 { bundleRecordOfSigs(recSigs) } else { -1 }
+  const recTy = if recBt >= 0 { mkArrayTy(recBt) } else { -1 }
   const tb = arrLitBuild(
     arrIx,
-    if held >= 0 { held } else { arrLitTyAt(arrIx, fnIx) },
+    if held >= 0 { held } else if recTy >= 0 { recTy } else { arrLitTyAt(arrIx, fnIx) },
     fnIx,
   )
   if tb != null { return tb }
@@ -26507,7 +26527,7 @@ function emitHolderCall(body: u8[], callIx: i32, c: Call, fnIx: i32): i32 {
   const cfx = unwrapParen(c.callFn)
   if cfx < 0 { return 1 }
   // A call through a field's place holding the record whole is the same call (B2).
-  const place = nodeAt(cfx) is Member
+  const place = nodeAt(cfx) is Member || nodeAt(cfx) is Index
   if !place && !(nodeAt(cfx) is Ident) { return 1 }
   const d = if place { -1 } else { identDeclOf(cfx) }
   const sigs = if place { placeRecordSigs(callIx, fnIx) } else { holderRecordSigs(d, fnIx) }
