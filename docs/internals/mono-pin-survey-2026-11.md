@@ -14,7 +14,7 @@ and bodies; not ablated.
 | fn | callers | note |
 |---|---|---|
 | monoPinnedTyOf | 13 | recorded type of ix at binding bN/bT; already reads elabWalkTy/elabWalkNarrowedTy, then substitutes |
-| monoPinSubTyOf | 12 | t under ctx's pinned binding (elabInstTyAt) |
+| monoPinSubTyOf | 12 | t under ctx's pinned binding (elabInstTyAt). Its five calls at a node's own type read `monoNodeTyAt` (elabNodeTyAt, else the node's type); it stays for the seven that substitute a derived type (an element, a return, a parameter type) |
 | monoExactPinTyOf | 9 | t under ctx's exact binding, else parameters' pins |
 | monoNumOperandPinTy | 4 | operand at pin, else hole instance's own binding |
 | monoPinnedOperandTy | 4 | body expr reading a monomorphized param |
