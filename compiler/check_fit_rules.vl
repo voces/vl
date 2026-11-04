@@ -535,6 +535,8 @@ import {
   CW_UP_FIELD,
   CW_UP_LETINIT,
   CW_UP_OBJ,
+  CW_UP_RET,
+  CW_UP_TAIL,
   covarRootName,
   cwIxBuild,
   cwIxFr,
@@ -2072,7 +2074,11 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
       || (!mapped && recQueuedReaches(c, own, dst))
     ) {
       return false
-    } else if !mapped && recSiteWrittenThrough(c) && recCopyNarrows(dst, own) {
+    } else if (
+      !mapped
+      && recValueWrittenThrough(c, own, REC_STORE_DEPTH)
+      && recCopyNarrows(dst, own)
+    ) {
       // A binding a record is written through takes its own copy of the build rather than sharing
       // it; one no copy serves shares it as before (D15246).
       recSiteCopies.push(c)
@@ -2091,14 +2097,61 @@ let recSiteCopyTys: i32[] = []
 // The copies among `recSiteCopies` that a binding written through takes back to its own record.
 let recSiteCopyBack: i32[] = []
 
-// Whether the binding call site `c` initialises is written through (`recBindWrittenThrough`).
-function recSiteWrittenThrough(c: i32): boolean {
+// Whether the value call site `c` produces reaches a binding a record is written through: the
+// binding it initialises, the parameter it is handed to, or, through a return, whatever each call
+// of the enclosing function reaches, to `depth` such hops (`recBindWrittenThrough`, D15266).
+function recValueWrittenThrough(c: i32, own: i32, depth: i32): boolean {
   cwIxBuild()
-  if c < 0 || c >= cwIxParent.length { return false }
+  if depth <= 0 || c < 0 || c >= cwIxParent.length || c >= cwIxUpKind.length {
+    return false
+  }
   const d = cwIxParent[c]
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
-  if !(dn is LetDecl) || parenPeelIx(dn.letInit) != c { return false }
-  recBindWrittenThrough(d, 4)
+  if dn is LetDecl && parenPeelIx(dn.letInit) == c {
+    return recOwnTypedAt(d, own) && recBindWrittenThrough(d, 4)
+  }
+  const uk = cwIxUpKind[c]
+  if uk == CW_UP_ARG { return recArgWrittenThrough(c, own) }
+  if uk == CW_UP_RET || uk == CW_UP_TAIL {
+    const fd = recEnclosingFn(c)
+    const sites: i32[] = []
+    if fd < 0 || rcwCallSites(fd, sites) >= 0 { return false }
+    for s in sites {
+      if s % 2 == 0 && recValueWrittenThrough(s / 2, own, depth - 1) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Whether binding or parameter `d` is typed at the record `own` stores as, or at an open hole a
+// call pins: a copy back to `own` is what it holds then.
+function recOwnTypedAt(d: i32, own: i32): boolean {
+  const t = nodeTyIxOf(d)
+  if t < 0 || t >= T.tys.length { return false }
+  tyReachesHole(t, 8)
+    || tyHasTyVar(t)
+    || fieldStorageEq(t, own, REC_STORE_DEPTH)
+}
+
+// Whether argument `a` is handed to a parameter a record is written through (`recBindWrittenThrough`).
+function recArgWrittenThrough(a: i32, own: i32): boolean {
+  const up = cwIxUp[a]
+  const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { nodeAt(0) }
+  if !(un is Call) { return false }
+  const fd = recInferredFnOf(up)
+  const fn = if fd >= 0 { nodeAt(fd) } else { nodeAt(0) }
+  if !(fn is FuncDecl) { return false }
+  let i = 0
+  while i < un.callArgs.length && i < fn.fnParams.length {
+    if parenPeelIx(un.callArgs[i]) == a {
+      const pd = fn.fnParams[i]
+      return recOwnTypedAt(pd, own) && recBindWrittenThrough(pd, 4)
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Whether binding or parameter `d` may be written through: a field path of it is assigned, or it
