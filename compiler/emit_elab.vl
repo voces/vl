@@ -4632,6 +4632,38 @@ function elabResultScanAt(g: i32) {
   elabResScanBlock(g)
   elabResScanAssign(g)
   elabResScanRet(g)
+  elabResScanSlots(g)
+  0
+}
+
+// Each value literal or map store `g` writes a slot, where it is a call that can return a record or
+// a read of a `const` call holder: a slot record's candidate. Read off the literal or store itself,
+// so the candidate set depends on no other index having been built.
+function elabResScanSlots(g: i32) {
+  const n = nodeAt(g)
+  if n is ArrayLit {
+    for e in n.arrElems { elabResSlotValue(e) }
+  } else if n is ObjLit {
+    for fx in n.objFields {
+      const fv = nodeAt(fx)
+      if fv is FieldInit { elabResSlotValue(fv.fiValue) }
+    }
+  } else if n is BinExpr && n.binOp == "=" && n.binCompound == "" {
+    if nodeAt(parenPeelIx(n.binLeft)) is Index { elabResSlotValue(n.binRight) }
+  } else if n is Call && n.callArgs.length == 2 {
+    const fm = nodeAt(parenPeelIx(n.callFn))
+    if fm is Member && fm.memProp == "set" { elabResSlotValue(n.callArgs[1]) }
+  }
+  0
+}
+
+// `elabResScanSlots` for value `e`.
+function elabResSlotValue(e: i32) {
+  const v = parenPeelIx(e)
+  if v < 0 || v >= P.nodes.length { return 0 }
+  if elabResMayReturnRecord(v) || elabSlotHolderOf(v) >= 0 {
+    elabResSlotCalls.push(v)
+  }
   0
 }
 
@@ -4729,16 +4761,7 @@ function elabResScanIdent(g: i32) {
   const n = nodeAt(g)
   if n is Ident {
     const d = identDeclOf(g)
-    if elabResMayHold(d) {
-      elabResReads[d] = (elabResReads.get(d) ?? 0) + 1
-      if (
-        elabResStoredRead(g)
-        && elabResInLiteral(g)
-        && elabSlotHolderOf(g) >= 0
-      ) {
-        elabResSlotCalls.push(g)
-      }
-    }
+    if elabResMayHold(d) { elabResReads[d] = (elabResReads.get(d) ?? 0) + 1 }
     if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
       elabFnReads[d] = (elabFnReads.get(d) ?? 0) + 1
     }
@@ -4771,22 +4794,6 @@ function elabResCallHolder(d: i32): boolean {
   if !(n is LetDecl) || n.letInit < 0 { return false }
   const v = parenPeelIx(n.letInit)
   v >= 0 && v < P.nodes.length && elabResMayReturnRecord(v)
-}
-
-// Whether call `g` is an element of a list literal, a field of a record literal, or stored by an
-// assignment or a call (a map's `d[k] = g` or `d.set(k, g)`).
-function elabResInLiteral(g: i32): boolean {
-  if g < 0 || g >= cwIxParent.length { return false }
-  const p = cwIxParent[g]
-  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
-  pn is ArrayLit || pn is FieldInit || pn is BinExpr || pn is Call
-}
-
-// Whether read `g` is a value a slot is written: a field or element of a literal, or a map store.
-function elabResStoredRead(g: i32): boolean {
-  if g < 0 || g >= cwIxUpKind.length { return false }
-  const k = cwIxUpKind[g]
-  k == CW_UP_FIELD || k == CW_UP_ELEM || k == CW_UP_ASG_RHS || k == CW_UP_ARG
 }
 
 // The `const` call holder read `v` names, written only by its initialiser; -1 for any other node.
@@ -4888,9 +4895,6 @@ function elabResScanCall(g: i32) {
       if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
         elabFnCalleeReads[d] = (elabFnCalleeReads.get(d) ?? 0) + 1
         if elabPlainCallee(g) >= 0 { elabResPlainCalls[g] = d }
-        if elabResMayReturnRecord(g) && elabResInLiteral(g) {
-          elabResSlotCalls.push(g)
-        }
       }
       if elabResMayHold(d) {
         const at = elabResThrough.get(d) ?? []
