@@ -356,6 +356,7 @@ import {
   fRetKind,
   fRetLitAtom,
   fRetRArrElem,
+  fRetRListRow,
   fRetStructIdx,
   fRetVoid,
   fa32TypeIdx,
@@ -625,6 +626,7 @@ import {
   arrLitIsRef,
   arrLitIsStr,
   arrLitNumKind,
+  arrLitRowSlotIn,
   arrLitUnionElemName,
   arrNewIntrKind,
   captureCountOf,
@@ -653,6 +655,7 @@ import {
   letBindRepClaims,
   letCellKind,
   letCellSlot,
+  listRowOfExpr,
   mapCtorOpenInstTy,
   mapShapeOfExpr,
   mapUnionResultRow,
@@ -722,7 +725,11 @@ import {
 } from "./emit_fn_scans"
 import { initJoinsWiderRecord } from "./emit_join_records"
 
-import { isScalarBackedListRep, rlElemListRep } from "./emit_list_rep"
+import {
+  arrLitHasSpread,
+  isScalarBackedListRep,
+  rlElemListRep,
+} from "./emit_list_rep"
 import {
   fieldCloSigOfTy,
   shapeFieldElemRow,
@@ -2661,6 +2668,7 @@ function buildFnMapPutRow(
     fRetVoid[li] = rv
     fRetStructIdx[li] = sidx
     fRetRArrElem[li] = rae
+    fRetRListRow[li] = -1
     fRetBool[li] = rb
     fRetKind[li] = rk
     fRetLitAtom[li] = 0
@@ -2669,6 +2677,7 @@ function buildFnMapPutRow(
   fRetVoid.push(rv)
   fRetStructIdx.push(sidx)
   fRetRArrElem.push(rae)
+  fRetRListRow.push(-1)
   fRetBool.push(rb)
   fRetKind.push(rk)
   fRetLitAtom.push(0)
@@ -2859,6 +2868,7 @@ export function buildFnMap(_stmts: i32[]) {
     fRetVoid = []
     fRetStructIdx = []
     fRetRArrElem = []
+    fRetRListRow = []
     fRetBool = []
     fRetKind = []
     // Round 1 drops the previous program's recorded column; round 2 keeps the one just banked.
@@ -3132,6 +3142,106 @@ function fnRetRefListDemand(i: i32) {
   0
 }
 
+// The ref-list row inferred list result `i` is built at: the row its element name keys or its
+// closed element type has, else the row every returned value is built at. -2 when the returned
+// values' rows or the function sets their elements hold disagree, which no one row can build; -1
+// when none is found (D15203).
+function fnRetRefListRowJoin(i: i32): i32 {
+  if i < 0 || i >= fnStmts.length || i >= fRetRArrElem.length { return -1 }
+  const fn = nodeAt(fnStmts[i])
+  if !(fn is FuncDecl) { return -1 }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  let row = -1
+  let sig = ""
+  let rowsKnown = vals.length > 0
+  for v in vals {
+    const vs = retListValueSig(v, i)
+    if vs == "!" { return -2 }
+    if sig != "" && vs != sig { return -2 }
+    sig = vs
+    const r = retListValueRow(v, i)
+    if r < 0 { rowsKnown = false }
+    if r >= 0 && row >= 0 && r != row { return -2 }
+    if r >= 0 { row = r }
+  }
+  const byName = rlSlotByNameTwin(fRetRArrElem[i], -1)
+  if byName >= 0 { return byName }
+  const et = fnRetRArrElemTy(i)
+  if et >= 0 && !tyHasTyVar(et) { return rlSlotOfRowTy(et) }
+  if rowsKnown { row } else { -1 }
+}
+
+// The ref-list row returned value `v` of function `i` is built at: its stamp's row, else a list
+// literal's own row, else the row its expression names; -1 for none.
+function retListValueRow(v: i32, i: i32): i32 {
+  const r = listRowOfExpr(v, i)
+  if r >= 0 { return r }
+  const av = unwrapParen(v)
+  if av >= 0 && nodeAt(av) is ArrayLit && !arrLitHasSpread(av) {
+    return arrLitRowSlotIn(av, i)
+  }
+  refListSlotOfExpr(v, i)
+}
+
+// The function sets returned value `v`'s elements hold, as one fingerprint; for a list literal
+// every element's, `!` when two of its elements differ in them or in their struct row.
+function retListValueSig(v: i32, i: i32): string {
+  const av = unwrapParen(v)
+  if av < 0 { return "" }
+  const an = nodeAt(av)
+  if an is ArrayLit {
+    let sig = ""
+    let row = -2
+    for e in an.arrElems {
+      const ex = unwrapParen(e)
+      if ex < 0 { return "!" }
+      const es = tyFnSetSig(nodeTyIxOf(ex), 6)
+      if sig != "" && es != sig { return "!" }
+      sig = es
+      if nodeAt(ex) is ObjLit {
+        const r = structIndexOfObjCtx(ex, i)
+        if row != -2 && r != row { return "!" }
+        row = r
+      }
+    }
+    return sig
+  }
+  tyFnSetSig(tyArrayElemIx(nodeRepTyIxOf(av)), 6)
+}
+
+// A fingerprint of the function sets type `t` holds at its function positions, through records
+// and lists, `depth` levels deep.
+function tyFnSetSig(t: i32, depth: i32): string {
+  if t < 0 || t >= T.tys.length || depth <= 0 { return "_" }
+  const a = tyAt(t)
+  match a {
+    TyFunc => {
+      return "s" + i32ToStr(fnTagSetOfTy(t))
+    }
+    TyArray => {
+      return tyFnSetSig(a.aElem, depth - 1) + "[]"
+    }
+    TyObj => {
+      let out = "{"
+      let k = 0
+      while k < a.objFieldNames.length && k < a.objFieldTypes.length {
+        out = out
+          + a.objFieldNames[k]
+          + ":"
+          + tyFnSetSig(a.objFieldTypes[k], depth - 1)
+          + ","
+        k = k + 1
+      }
+      return out + "}"
+    }
+    // A scalar, map, union or open type holds no set this join compares.
+    TyPrim | TyErr | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+      return "_"
+    }
+  }
+}
+
 // The record row of un-annotated function `i` read from the rep stamp of every value it returns,
 // where its recorded result is a record, variant or nullable record and each stamp names one
 // row; a value stamped open, or built by a call, reads its function's recorded row. True if set.
@@ -3235,7 +3345,10 @@ export function computeRetInference() {
     if nnFn is FuncDecl {
       if nnFn.fnRet < 0 && fRetVoid[nn] == 0 {
         criSettleNonNullRecordRet(nn)
-        if fRetKind[nn] == "reflist" { fnRetRefListDemand(nn) }
+        if fRetKind[nn] == "reflist" {
+          fnRetRefListDemand(nn)
+          fRetRListRow[nn] = fnRetRefListRowJoin(nn)
+        }
       }
     }
     nn = nn + 1
