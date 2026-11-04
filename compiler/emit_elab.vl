@@ -3443,6 +3443,58 @@ function elabConstCalleeDecl(v: i32, depth: i32): i32 {
   r
 }
 
+// The parameter of `decl` the binding `d` reads an element of, where `d` is initialised by an
+// element read of that parameter (`xs[i]`) and every read of `d` in the body, so never a write, is
+// a call's callee (D15365); -1 otherwise.
+function elabElemCallAlias(d: i32, decl: i32): i32 {
+  if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
+    return -1
+  }
+  const ln = nodeAt(d)
+  const fn = nodeAt(decl)
+  if !(ln is LetDecl) || ln.letType >= 0 { return -1 }
+  if !(fn is FuncDecl) { return -1 }
+  const init = parenPeelIx(ln.letInit)
+  if init < 0 || init >= P.nodes.length || !(nodeAt(init) is Index) {
+    return -1
+  }
+  const root = elabSlotRoot(init)
+  if root < 0 || root >= P.nodes.length || !(nodeAt(root) is Ident) {
+    return -1
+  }
+  const pd = identDeclOf(root)
+  if !i32ListHas(fn.fnParams, pd) { return -1 }
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == d {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        if !(pn is Call && parenPeelIx(pn.callFn) == x) { return -1 }
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+      }
+    }
+  }
+  pd
+}
+
+// Callee `cf`, or the element read it aliases when it names such a binding of `decl`.
+function elabElemAliasInit(cf: i32, decl: i32): i32 {
+  if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return cf }
+  const d = identDeclOf(cf)
+  if d < 0 || d >= P.nodes.length || elabElemCallAlias(d, decl) < 0 {
+    return cf
+  }
+  const ln = nodeAt(d)
+  if ln is LetDecl { return parenPeelIx(ln.letInit) }
+  cf
+}
+
 // `elabMintFacts` over the subtree at `ix` of declaration `decl`'s body, nested functions aside.
 function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return 0 }
@@ -3464,6 +3516,13 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
     for kid in nodeSpineChildren(cur) {
       if cn is Call && kid == cn.callFn {
         if cb <= 0 { n = n + elabMintCalleeIn(kid, decl, k, sc) }
+      } else if (
+        cn is LetDecl
+        && kid == cn.letInit
+        && elabElemCallAlias(cur, decl) >= 0
+      ) {
+        // An element alias only ever called reads its holder's slot, as the callee chain does.
+        n = n + elabMintCalleeIn(kid, decl, k, sc)
       } else {
         elabMintHandedIn(kid, cur, decl, k, sc)
         n = n + elabMintFactsIn(kid, decl, k, sc)
@@ -6546,7 +6605,7 @@ export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
 // binds to a set of functions each instanced at the call's closed argument types.
 function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const cf = parenPeelIx(c.callFn)
-  const root = elabSlotRoot(cf)
+  const root = elabSlotRoot(elabElemAliasInit(cf, decl))
   const pd = elabCalleeParam(root, decl, k)
   if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) {
     if elabMintOuterSlotFactAt(c, ix, k, sc) { return true }
@@ -8927,11 +8986,38 @@ function elabHeldAtArgs(ds: i32[], pts: i32[]): i32 {
   if r < 0 { -1 } else { mkFuncTy(pts, r) }
 }
 
-// Whether `d` is a top-level function, which the slot producer may demand an instance of: a nested
-// one or a lambda checks only in its own scope.
+// Whether the slot producer may demand an instance of `d`: a top-level declaration, or a lambda
+// whose enclosing scope is the module, which captures no local and so has the instance a top-level
+// declaration would. A nested or capturing one checks only in its own scope.
 function elabTopFn(d: i32): boolean {
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  dn is FuncDecl && dn.fnName != "" && (fnDeclIx[dn.fnName] ?? -1) == d
+  if !(dn is FuncDecl) { return false }
+  if dn.fnName != "" && (fnDeclIx[dn.fnName] ?? -1) == d { return true }
+  elabModuleLam(d)
+}
+
+// Whether lambda `d` sits in a module-level statement with no function, block or loop around it,
+// so every name it reads is the module's.
+function elabModuleLam(d: i32): boolean {
+  let cur = if d < cwIxParent.length { cwIxParent[d] } else { -1 }
+  let guard = 0
+  while cur >= 0 && cur < P.nodes.length && guard < 64 {
+    const c = nodeAt(cur)
+    if c is Program { return true }
+    if (
+      c is FuncDecl
+      || c is Block
+      || c is ForIn
+      || c is ForRange
+      || c is WhileStmt
+      || c is MatchExpr
+    ) {
+      return false
+    }
+    cur = if cur < cwIxParent.length { cwIxParent[cur] } else { -1 }
+    guard = guard + 1
+  }
+  false
 }
 
 // Type `t` a list, record or map holds, the values `vals` stored at it, with each open function

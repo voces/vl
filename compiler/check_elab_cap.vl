@@ -55,6 +55,8 @@ import {
   mkMapTy,
   mkNullableTy,
   mkObjTy,
+  tyArrayElemIx,
+  tyFieldTyOf,
   tySame,
 } from "./check_types"
 import { declTyOf } from "./check_nar_store"
@@ -2650,27 +2652,138 @@ export function fnTagHeldNote(x: i32) {
   const n = nodeAt(x)
   let t = nodeTyIxOf(x)
   if n is LetDecl && n.letInit >= 0 { t = nodeTyIxOf(n.letInit) }
-  const r = fnTagRepTyOf(t, 16)
+  // A binding of a read of a stamped place holds that place's rep (D15350).
+  const pr = if n is LetDecl { fnTagPlaceRep(n.letInit) } else { -1 }
+  if pr >= 0 {
+    if pr != t { fnTagHeldRep[x] = pr }
+    return 0
+  }
+  const v0 = if n is LetDecl { n.letInit } else { x }
+  const deep = fnTagListOfLists(t) && fnTagInnerLitsOnly(v0, t, 0)
+  const r = fnTagRepTyIn(t, 16, deep)
   if r >= 0 && r != t { fnTagHeldRep[x] = r }
+  // The inner literals of a list of lists are built at the same rep's elements (D15350).
+  if deep { fnTagHeldInner(v0, r, 0) }
+  0
+}
+
+// The rep stamped at the place `v` reads: a stamped node or binding, or an element or field of
+// one; -1 where no stamp reaches it.
+function fnTagPlaceRep(v: i32): i32 {
+  // The place is walked inward to the first stamped node or binding; `steps` is the path back.
+  let x = if v >= 0 && v < P.nodes.length { parenPeelIx(v) } else { -1 }
+  let t = -1
+  const steps: string[] = []
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 16 {
+    t = fnTagHeldRep[x] ?? -1
+    const xn = nodeAt(x)
+    if t >= 0 {
+      hops = 16
+    } else if xn is Member {
+      steps.push(xn.memProp)
+      x = parenPeelIx(xn.memObj)
+    } else if xn is Index {
+      steps.push("")
+      x = parenPeelIx(xn.idxArr)
+    } else {
+      // Any other node is the root: a name reads its binding's stamp.
+      const d = identDeclOf(x)
+      t = if d >= 0 && d != x { fnTagHeldRep[d] ?? -1 } else { -1 }
+      hops = 16
+    }
+    hops = hops + 1
+  }
+  let k = steps.length - 1
+  while k >= 0 && t >= 0 {
+    t = if steps[k] == "" { tyArrayElemIx(t) } else { tyFieldTyOf(t, steps[k]) }
+    k = k - 1
+  }
+  t
+}
+
+// Whether record type `t` has a field of a tagged set itself, not a list of one.
+function fnTagHasTaggedField(t: i32): boolean {
+  const o = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if !(o is TyObj) { return false }
+  for f in o.objFieldTypes {
+    if fnTagTyIsTagged(f) { return true }
+  }
+  false
+}
+
+// The record literals `fnTagHeldInner` found built at another record, each beside that record;
+// the tag pass stamps and drains them.
+export let fnTagHeldRecs: i32[] = []
+
+// Whether `t` is a list whose element is a list.
+function fnTagListOfLists(t: i32): boolean {
+  const o = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  const e = if o is TyArray && o.aElem >= 0 && o.aElem < T.tys.length { T.tys[o.aElem] } else { null }
+  e is TyArray
+}
+
+// Whether `v`, of list type `t`, is a list literal whose every element of a list type is a list
+// literal too, all the way down: a binding read there keeps its own rep (D15350).
+function fnTagInnerLitsOnly(v: i32, t: i32, depth: i32): boolean {
+  const vx = if v >= 0 && v < P.nodes.length { parenPeelIx(v) } else { -1 }
+  const vn = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
+  const o = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if !(vn is ArrayLit) || !(o is TyArray) || depth > 8 { return false }
+  if !fnTagListOfLists(t) { return true }
+  for el in vn.arrElems {
+    if !fnTagInnerLitsOnly(el, o.aElem, depth + 1) { return false }
+  }
+  true
+}
+
+// Stamps each list literal element of list literal `v` with the element of rep `r`.
+function fnTagHeldInner(v: i32, r: i32, depth: i32) {
+  const vx = if v >= 0 && v < P.nodes.length { parenPeelIx(v) } else { -1 }
+  const vn = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
+  const ro = if r >= 0 && r < T.tys.length { T.tys[r] } else { null }
+  if !(vn is ArrayLit) || !(ro is TyArray) || depth > 8 { return 0 }
+  const eo = if ro.aElem >= 0 && ro.aElem < T.tys.length { T.tys[ro.aElem] } else { null }
+  for el in vn.arrElems {
+    const ex = parenPeelIx(el)
+    if ex >= 0 && ex < P.nodes.length && nodeAt(ex) is ArrayLit {
+      if ro.aElem != nodeTyIxOf(ex) { fnTagHeldRep[ex] = ro.aElem }
+      fnTagHeldInner(ex, ro.aElem, depth + 1)
+    }
+    // A record literal whose function field the rep holds as its id is built at the rep's
+    // record, so it shares that record's row.
+    if (
+      ex >= 0
+      && ex < P.nodes.length
+      && nodeAt(ex) is ObjLit
+      && eo is TyObj
+      && fnTagHasTaggedField(nodeTyIxOf(ex))
+    ) {
+      fnTagHeldRecs.push(ex)
+      fnTagHeldRecs.push(ro.aElem)
+    }
+  }
   0
 }
 
 // Type `t` with every list whose element is a tagged set an `i32` list, through lists, records,
-// nullables and map values; `t` itself where nothing is rewritten.
-function fnTagRepTyOf(t: i32, depth: i32): i32 {
+// nullables and map values; `t` itself where nothing is rewritten. With `deep`, `t` is inside a
+// list's element list, where a record's tagged function field is its `i32` id, since no literal of
+// the outer list mints that record's row (D15350).
+function fnTagRepTyIn(t: i32, depth: i32, deep: boolean): i32 {
   if depth <= 0 || t < 0 || t >= T.tys.length { return t }
   const o = T.tys[t]
   match o {
     TyArray => {
       if fnTagTyIsTagged(o.aElem) { return mkArrayTy(TY_I32) }
-      const e = fnTagRepTyOf(o.aElem, depth - 1)
+      const e = fnTagRepTyIn(o.aElem, depth - 1, deep)
       return if e == o.aElem { t } else { mkArrayTy(e) }
     }
     TyObj => {
       const tys: i32[] = []
       let changed = false
       for f in o.objFieldTypes {
-        const r = fnTagRepTyOf(f, depth - 1)
+        const r = if deep && fnTagTyIsTagged(f) { TY_I32 } else { fnTagRepTyIn(f, depth - 1, deep) }
         if r != f { changed = true }
         tys.push(r)
       }
@@ -2680,11 +2793,11 @@ function fnTagRepTyOf(t: i32, depth: i32): i32 {
       return mkObjTy(names, tys)
     }
     TyNullable => {
-      const r = fnTagRepTyOf(o.nInner, depth - 1)
+      const r = fnTagRepTyIn(o.nInner, depth - 1, deep)
       return if r == o.nInner { t } else { mkNullableTy(r) }
     }
     TyMap => {
-      const r = fnTagRepTyOf(o.mVal, depth - 1)
+      const r = fnTagRepTyIn(o.mVal, depth - 1, deep)
       return if r == o.mVal { t } else { mkMapTy(o.mKey, r, o.mSet) }
     }
     // No other kind holds a set's ids as a container.

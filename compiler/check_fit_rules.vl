@@ -141,6 +141,7 @@ import {
   elabFnIdOf,
   elabTyClosed,
   fnLetIsWide,
+  fnTagHeldRepOf,
   stampsStand,
 } from "./check_elab_cap"
 import { boundObjRootOf } from "./check_decl_scan"
@@ -303,6 +304,9 @@ import {
   recAdPushDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
+  recApartAt,
+  recApartDecl,
+  recApartDst,
   recArgRepNote,
   recArgRepOf,
   recBuildPassAt,
@@ -3570,16 +3574,38 @@ export function recHeldListSpreadAdopt(l: i32) {
   const own = nodeTyIxOf(l)
   const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
   const oe = if ot is TyArray { ot.aElem } else { -1 }
-  if oe < 0 || oe >= T.tys.length || !(tyAt(oe) is TyObj) { return 0 }
+  if oe < 0 || oe >= T.tys.length { return 0 }
+  const oo = tyAt(oe)
+  // A list of record lists is built by its literal's stamp at the receiver's (D15370).
+  const nested = oo is TyArray
+    && oo.aElem >= 0
+    && oo.aElem < T.tys.length
+    && tyAt(oo.aElem) is TyObj
+  if !(oo is TyObj) && !nested { return 0 }
   const w = cwOccWalk(d)
   while cwOccNext(w) {
     const u = if cwIxKind[w.row] == CW_OCC_USE { cwIxNode[w.row] } else { -1 }
     const sp = if u >= 0 && u < cwIxUp.length { cwIxUp[u] } else { -1 }
     const r = if sp >= 0 && nodeAt(sp) is Spread { recSlotReceiverOf(sp, u) } else { -1 }
-    const e = if r >= 0 { recHeldElemBuilt(r) } else { -1 }
-    if e >= 0 && e < T.tys.length && tyAt(e) is TyObj && !tySame(e, oe) {
-      recAdPushDecl(d, oe, e, true, u)
-      recHeldOwnRefuse(d, e, u, [u])
+    if nested {
+      const ie = if r >= 0 { recElemOfElemStamp(r) } else { -1 }
+      if (
+        ie >= 0
+        && ie < T.tys.length
+        && tyAt(ie) is TyObj
+        && oo is TyArray
+        && !tySame(ie, oo.aElem)
+      ) {
+        const lt = mkArrayTy(mkArrayTy(ie))
+        adoptLitAt(l, lt)
+        recHeldOwnRefuse(d, lt, u, [u])
+      }
+    } else {
+      const e = if r >= 0 { recHeldElemBuilt(r) } else { -1 }
+      if e >= 0 && e < T.tys.length && tyAt(e) is TyObj && !tySame(e, oe) {
+        recAdPushDecl(d, oe, e, true, u)
+        recHeldOwnRefuse(d, e, u, [u])
+      }
     }
   }
   0
@@ -3636,7 +3662,7 @@ export function recHeldElemBuilt(x: i32): i32 {
 
 // The record the elements of an element of the list binding read `a` are built at, from its
 // list literal initialiser's rep stamp (`T[][]`), through bindings of bindings; else -1.
-function recElemOfElemStamp(a: i32): i32 {
+export function recElemOfElemStamp(a: i32): i32 {
   if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) { return -1 }
   const d = recBindDeclOf(a)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
@@ -3699,7 +3725,9 @@ export function recAsgFnWidenedTy(p: i32): i32 {
   ) {
     return -1
   }
-  let t = nodeTyIxOf(d)
+  // A holder of a tagged set's ids is built at the rep the tag stamped on it (D15350).
+  const held = fnTagHeldRepOf(d)
+  let t = if held >= 0 { held } else { nodeTyIxOf(d) }
   let k = steps.length - 1
   while k >= 0 {
     const st = steps[k]
@@ -4893,6 +4921,17 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     const iv = nodeAt(parenPeelIx(recDeclInit(decl)))
     if iv is ArrayLit {
       if recAdoptUnionList(srcExpr, srcTy, dstTy) { return 0 }
+      // A list of record lists is built at the destination by its literal's stamp, keeping its
+      // type, and its own-storage deliveries are refused at the pass end (D15370).
+      const land = recAdLandingList(nonNulTyOf(dstTy))
+      const se = tyArrayElemIx(srcTy)
+      if se >= 0 && se < T.tys.length && tyAt(se) is TyArray && land >= 0 {
+        adoptLitAt(parenPeelIx(recDeclInit(decl)), land)
+        recApartDecl.push(decl)
+        recApartDst.push(land)
+        recApartAt.push(p)
+        return 0
+      }
       return recAdPushDecl(
         decl,
         tyArrayElemIx(srcTy),
