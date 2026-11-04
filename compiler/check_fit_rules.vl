@@ -3538,7 +3538,8 @@ export function recHeldLitPlaceAdopt(l: i32) {
   cwIxBuild()
   if l < 0 || l >= cwIxUp.length || cwIxUpKind[l] != CW_UP_LETINIT { return 0 }
   const d = cwIxUp[l]
-  if recCoalesceHeldLit(d) != l { return 0 }
+  const written = recCoalesceHeldLit(d) != l
+  if written && recWrittenLetLit(d) != l { return 0 }
   const own = nodeTyIxOf(l)
   const ats: i32[] = []
   const reps: i32[] = []
@@ -3553,7 +3554,9 @@ export function recHeldLitPlaceAdopt(l: i32) {
   }
   let i = 0
   while i < ats.length {
-    if recAsgBindInit(ats[i]) >= 0 {
+    if written {
+      recHeldLetWritesAt(d, l, reps[i], ats[i], ats)
+    } else if recAsgBindInit(ats[i]) >= 0 {
       recHeldAsgStamp(d, reps[i], ats[i], ats)
     } else {
       recHeldBindAdopt(d, reps[i], ats[i], ats)
@@ -4019,6 +4022,73 @@ function recCoalesceHeldInit(d: i32): i32 {
   }
   const c = cwPeelValue(dn.letInit)
   if c >= 0 && nodeAt(c) is Call && recInferredFnOf(c) >= 0 { c } else { -1 }
+}
+
+// The fresh record literal an un-annotated `let` `d` that is reassigned is initialised with,
+// else -1 (D15374).
+function recWrittenLetLit(d: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letType >= 0
+    || dn.letKw != "let"
+    || dn.letInit < 0
+  ) {
+    return -1
+  }
+  const lit = cwPeelValue(dn.letInit)
+  if lit >= 0 && lit < P.nodes.length && nodeAt(lit) is ObjLit {
+    lit
+  } else {
+    -1
+  }
+}
+
+// Builds the reassigned fresh record `let` `d`, initialised with literal `l` and delivered at `p`
+// into a place held at the record `rep`, there: every record literal written into it is stamped
+// at `rep`, a value held at its own storage written into it is refused, and each delivery of it
+// at its own storage outside `skip` is refused (D15374).
+function recHeldLetWritesAt(
+  d: i32,
+  l: i32,
+  rep: i32,
+  p: i32,
+  skip: i32[],
+): boolean {
+  adoptLitAt(l, rep)
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const a = if cwIxKind[w.row] == CW_OCC_ASG { cwIxNode[w.row] } else { -1 }
+    const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+    const leaves: i32[] = []
+    if an is BinExpr && an.binOp == "=" { tailValueLeaves(an.binRight, leaves) }
+    for v in leaves {
+      if nodeAt(v) is ObjLit {
+        adoptLitAt(v, rep)
+      } else {
+        const vt = nodeTyIxOf(v)
+        // A read its container builds at `rep` is already stored there.
+        const vb = recBuiltReadTy(v)
+        const held = vb >= 0
+          && fieldStorageEq(nonNullTy(vb), rep, REC_STORE_DEPTH)
+        if vt >= 0 && !held && !fieldStorageEq(vt, rep, REC_STORE_DEPTH) {
+          recAdRaising = true
+          tErr(
+            recKeptWhat(d)
+              + " is built as "
+              + tyToStr(rep)
+              + " where line "
+              + i32ToStr(nodeLineOf(p))
+              + " delivers it, and this value of its own type is assigned into it, which stores a "
+              + "field differently; a record is shared, not copied. Copy it with an object literal",
+            v,
+          )
+          recAdRaising = false
+        }
+      }
+    }
+  }
+  recHeldOwnRefuse(d, rep, p, skip)
 }
 
 // The fresh record literal an un-annotated `const`, or `let` nothing reassigns, `d` is
