@@ -4373,6 +4373,8 @@ let elabResBadWrite: {[i32]: boolean} = Map()
 // Per parameter, the unannotated `const` bindings initialised with a read of it; per bundle key,
 // whether a call hands that parameter a record whole.
 let elabResCopies: {[i32]: i32[]} = Map()
+// Per holder, the `return` statements that return it.
+let elabResRets: {[i32]: i32[]} = Map()
 let elabRecParams: {[i32]: boolean} = Map()
 // Per named function, its reads and those that are a call's callee; per instance, the record it
 // returns as a call's value (`elabRetCallRecord`, memoised).
@@ -4400,6 +4402,7 @@ function elabResultScanReset() {
   elabResWrites = Map()
   elabResBadWrite = Map()
   elabResCopies = Map()
+  elabResRets = Map()
   elabRecParams = Map()
   elabFnReads = Map()
   elabFnCalleeReads = Map()
@@ -4425,6 +4428,24 @@ function elabResultScanAt(g: i32) {
   elabResScanCall(g)
   elabResScanBlock(g)
   elabResScanAssign(g)
+  elabResScanRet(g)
+  0
+}
+
+// A `return` of a holder reads it whole.
+function elabResScanRet(g: i32) {
+  const n = nodeAt(g)
+  if n is RetStmt {
+    const a = parenPeelIx(n.retArg)
+    if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident {
+      const d = identDeclOf(a)
+      if elabResMayHold(d) {
+        const rs = elabResRets.get(d) ?? []
+        rs.push(g)
+        elabResRets[d] = rs
+      }
+    }
+  }
   0
 }
 
@@ -4691,15 +4712,20 @@ function elabHolderRecordNote(c: i32, from: i32, kc: i32) {
 function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
   const through = elabResThrough.get(h) ?? []
   const hands = elabResHands.get(h) ?? []
-  const reads = through.length + hands.length / 2 + elabResWriteReads(h)
+  const rets = elabResRets.get(h) ?? []
+  const reads = through.length
+    + hands.length / 2
+    + elabResWriteReads(h)
+    + rets.length
   if (
     reads != (elabResReads.get(h) ?? 0)
     || !elabHolderWritesAgree(h, from, rec)
   ) {
     return 0
   }
+  if rets.length > 0 && !elabHolderCanHoldReturned(h, from, rec) { return 0 }
   const ms: i32[] = []
-  let two = hands.length > 0 || c < 0
+  let two = hands.length > 0 || c < 0 || rets.length > 0
   for t in through {
     const m = elabCallSigMember(t, rec)
     if m < 0 { return 0 }
@@ -4740,6 +4766,32 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
     j = j + 2
   }
   0
+}
+
+// Whether holder `h` in instance `from`, returned whole, holds record `rec`: every read is a call
+// through it at one of the record's signatures, a write target or a `return`, there is no hand,
+// and each is in the function declaring `h`. Pure, so a function's result fact can ask it.
+function elabHolderCanHoldReturned(h: i32, from: i32, rec: i32[]): boolean {
+  const through = elabResThrough.get(h) ?? []
+  const rets = elabResRets.get(h) ?? []
+  if rets.length == 0 || (elabResHands.get(h) ?? []).length > 0 { return false }
+  const reads = through.length + elabResWriteReads(h) + rets.length
+  if (
+    reads != (elabResReads.get(h) ?? 0)
+    || !elabHolderWritesAgree(h, from, rec)
+  ) {
+    return false
+  }
+  const fd = elabEnclosingFn(h)
+  for r in rets {
+    if elabEnclosingFn(r) != fd { return false }
+  }
+  for t in through {
+    if elabEnclosingFn(t) != fd || elabCallSigMember(t, rec) < 0 {
+      return false
+    }
+  }
+  true
 }
 
 // The reads of holder `h` that are the targets of its assignments.
@@ -4991,8 +5043,12 @@ function elabRetValuesRecord(body: i32, from: i32, depth: i32): i32[] {
   if !elabRetValues(body, rets) || rets.length == 0 { return none }
   let rec: i32[] = []
   for c in rets {
-    const r = elabCallRecord(c, from, depth - 1)
+    const hc = elabRetHolderCall(c)
+    const r = elabCallRecord(if hc >= 0 { hc } else { c }, from, depth - 1)
     if r.length < 2 || rec.length > 0 && !elabTyListSame(r, rec) { return none }
+    if hc >= 0 && !elabHolderCanHoldReturned(identDeclOf(c), from, r) {
+      return none
+    }
     rec = r
   }
   rec
@@ -5042,13 +5098,25 @@ function elabRetValues(body: i32, out: i32[]): boolean {
   elabStmtRetValues(body, out)
 }
 
+// The initialiser call of the holder returned read `a` names, or -1 where `a` is no such read.
+function elabRetHolderCall(a: i32): i32 {
+  if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) { return -1 }
+  const d = identDeclOf(a)
+  if d < 0 || d >= P.nodes.length || !elabResMayHold(d) { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) { return -1 }
+  const v = parenPeelIx(dn.letInit)
+  if v >= 0 && v < P.nodes.length && nodeAt(v) is Call { v } else { -1 }
+}
+
 // `elabRetValues`'s `return`s inside statement `x`.
 function elabStmtRetValues(x: i32, out: i32[]): boolean {
   if x < 0 || x >= P.nodes.length { return true }
   const n = nodeAt(x)
   if n is RetStmt {
     const a = parenPeelIx(n.retArg)
-    if a < 0 || !(nodeAt(a) is Call) { return false }
+    if a < 0 || a >= P.nodes.length { return false }
+    if !(nodeAt(a) is Call) && elabRetHolderCall(a) < 0 { return false }
     out.push(a)
     return true
   }
@@ -5081,7 +5149,9 @@ function elabPlainCallsNote() {
       const dn = nodeAt(d)
       const rets: i32[] = []
       if dn is FuncDecl && elabRetValues(dn.fnBody, rets) {
-        for r in rets { elabTriplePut(elabResKeeps, r, -1, 1) }
+        for r in rets {
+          if nodeAt(r) is Call { elabTriplePut(elabResKeeps, r, -1, 1) }
+        }
       }
     }
   }
@@ -5116,7 +5186,9 @@ function elabRetRecordKeepsNote() {
       if elabRetCallRecord(k, 4).length >= 2 {
         const rets: i32[] = []
         if elabRetValues(dn.fnBody, rets) {
-          for c in rets { elabTriplePut(elabResKeeps, c, k, 1) }
+          for c in rets {
+            if nodeAt(c) is Call { elabTriplePut(elabResKeeps, c, k, 1) }
+          }
           elabAnyRetRecord = true
         }
       }
