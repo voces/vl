@@ -646,7 +646,9 @@ import {
   elabCallSetIn,
   elabCopyTyOwn,
   elabDemand,
+  elabHeldClosedTy,
   elabHolderRecordAt,
+  elabHoleFnClosed,
   elabHoleMapClosed,
   elabInstSlotAt,
   elabInstSpelling,
@@ -16401,8 +16403,11 @@ function monoPinRecordListAt(
   if ctx >= 0 && monoFrameIsGenericInstance(ctx) { return -1 }
   const et = tyArrayElemIx(nodeTyIxOf(lx))
   if et < 0 || et >= T.tys.length || !monoTyOpen(et) { return -1 }
-  const v = tyAt(et)
-  if !(v is TyObj) { return -1 }
+  if !(tyAt(et) is TyObj) { return -1 }
+  const nv = elabHeldClosedTy(et, 0)
+  if nv < 0 || nv == et || monoTyOpen(nv) { return -1 }
+  const nm = monoPinAnnSpelling(nv)
+  if nm == "" { return -1 }
   const stored: i32[][] = []
   for e in lit.arrElems { stored.push([e, ctx]) }
   let ri = 0
@@ -16414,8 +16419,12 @@ function monoPinRecordListAt(
     ri = ri + 2
   }
   for w in writes { stored.push(w) }
-  const nv = monoPinStoredRecords(lf, path, v, stored, spell)
-  if nv < 0 { return nv }
+  const dTys: i32[] = []
+  for sv in stored {
+    if monoHeldValueAt(sv[0], nv, sv[1], dTys, 0) < 0 { return -2 }
+  }
+  structTyMarkAliasable(nv)
+  spell.push(nm)
   const nt = mkArrayTy(nv)
   nodeTyRecord(lx, nt)
   ri = 0
@@ -16424,6 +16433,71 @@ function monoPinRecordListAt(
     ri = ri + 2
   }
   nt
+}
+
+// Builds value `v`, written in frame `wf`, at the closed type `t` the elaboration gives its holder
+// (`elabHeldClosedTy`): a literal records `t` and its parts theirs, a function is instanced at
+// its signature or noted reached for its stub. -1 when an instance is refused.
+function monoHeldValueAt(
+  v: i32,
+  t: i32,
+  wf: i32,
+  dTys: i32[],
+  depth: i32,
+): i32 {
+  const x = unwrapParen(v)
+  if x < 0 || x >= P.nodes.length || t < 0 || t >= T.tys.length || depth > 8 {
+    return 0
+  }
+  const n = nodeAt(x)
+  const tt = tyAt(t)
+  if n is ObjLit && tt is TyObj {
+    // A record re-typed here is built at its closed row, not at the one its open type keyed.
+    if monoTyOpen(nodeTyIxOf(x)) {
+      monoSupersededObjTys.push(nodeTyIxOf(x))
+      monoGradualObjList.push(x)
+    }
+    monoRecordOpen(x, t, wf)
+    for fx in n.objFields {
+      const f = nodeAt(fx)
+      if f is FieldInit {
+        let k = 0
+        while k < tt.objFieldNames.length {
+          if tt.objFieldNames[k] == f.fiName {
+            if (
+              monoHeldValueAt(
+                f.fiValue,
+                tt.objFieldTypes[k],
+                wf,
+                dTys,
+                depth + 1,
+              )
+              < 0
+            ) {
+              return -1
+            }
+          }
+          k = k + 1
+        }
+      }
+    }
+    return 0
+  }
+  if n is ArrayLit && tt is TyArray {
+    monoRecordOpen(x, t, wf)
+    for e in n.arrElems {
+      if monoHeldValueAt(e, tt.aElem, wf, dTys, depth + 1) < 0 { return -1 }
+    }
+    return 0
+  }
+  if tt is TyFunc && !monoTyClosedFn(nodeTyIxOf(x)) {
+    if monoCoerceFnValueTys(x, monoPinAnnSpelling(t), wf, -1, dTys) < 0 {
+      return -1
+    }
+    if n is Ident { monoReachNote(x, true) }
+    monoRecordOpen(x, t, wf)
+  }
+  0
 }
 
 // Pins the list literal of record literals `rx` that the un-annotated function `fnIx` returns, by
@@ -18244,13 +18318,7 @@ function monoUncalledSlotFnTy(vals: i32[][], spell: string[]): i32 {
       if ft >= 0 && sigKeyOfTy(ft) != sigKeyOfTy(vt) { return -1 }
       ft = vt
     } else if dft < 0 {
-      const ps: i32[] = []
-      for p in f.fnParamTypes {
-        if monoTyOpen(p) { ps.push(TY_I32) } else { ps.push(p) }
-      }
-      let r = f.fnRet
-      if monoTyOpen(r) { r = TY_I32 }
-      dft = mkFuncTy(ps, r)
+      dft = elabHoleFnClosed(vt)
     }
   }
   if ft < 0 { ft = dft }
