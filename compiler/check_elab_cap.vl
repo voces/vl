@@ -85,7 +85,7 @@ import { inferQuiet, quietDepth } from "./check_cursor"
 import { litPinN } from "./check_literals"
 import { restoreSlot, scopeVisibleSnapshot } from "./check_scopes"
 import { tyHasTyVar } from "./tyquery"
-import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
+import { i32ListHas, i32ListIndexOf, strListHas, strListIndexOf } from "./listutil"
 import { identArmNote, identDeclOf, identIsArm, nodeSrc } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
 import { hdBase, hdRowOf } from "./check_hole_pins"
@@ -997,6 +997,58 @@ export function elabFnJoinListTy(j: i32, a: i32, b: i32): i32 {
 // widens (D15209). A list under a record under a list is not joined: no row is built for it.
 export function elabFnJoinDeepTy(j: i32, a: i32, b: i32, rowDepth: i32): i32 {
   elabFnJoinDeepAt(j, a, b, rowDepth, 0)
+}
+
+// Notes, for a value `if` or `match` whose arms typed `a` and `b` joined to `j`, each function
+// set inside a record field of `j` beside the arm's own set there: the choice holds each arm's
+// ids, so each arm's set is decided with the join's (D15290).
+export function elabFnArmJoinNote(j: i32, a: i32, b: i32) {
+  elabFnArmJoinAt(j, a, b, 0, false)
+}
+
+function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
+  if depth > 6 || j < 0 || j >= T.tys.length || a < 0 || a >= T.tys.length || b < 0 || b >= T.tys.length {
+    return 0
+  }
+  const jt = T.tys[j]
+  const at = T.tys[a]
+  const bt = T.tys[b]
+  match jt {
+    TyFunc => {
+      const u = elabFnSetTy[j] ?? -1
+      if !inRec || u < 0 { return 0 }
+      for sd in [elabFnSetTy[a] ?? -1, elabFnSetTy[b] ?? -1] {
+        if sd >= 0 && sd != u {
+          fnWidenSrcTo.push(u)
+          fnWidenSrcFrom.push(sd)
+        }
+      }
+      return 0
+    }
+    TyArray => {
+      if at is TyArray && bt is TyArray {
+        elabFnArmJoinAt(jt.aElem, at.aElem, bt.aElem, depth + 1, inRec)
+      }
+      return 0
+    }
+    TyObj => {
+      if !(at is TyObj) || !(bt is TyObj) { return 0 }
+      let i = 0
+      while i < jt.objFieldNames.length {
+        const nm = jt.objFieldNames[i]
+        const ia = strListIndexOf(at.objFieldNames, nm)
+        const ib = strListIndexOf(bt.objFieldNames, nm)
+        if ia >= 0 && ib >= 0 {
+          elabFnArmJoinAt(jt.objFieldTypes[i], at.objFieldTypes[ia], bt.objFieldTypes[ib], depth + 1, true)
+        }
+        i = i + 1
+      }
+      return 0
+    }
+    TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyMap => {
+      return 0
+    }
+  }
 }
 
 // `elabFnJoinDeepTy` at `j`, `shape` saying what holds it: 0 nothing, 1 a list, 2 a record in
