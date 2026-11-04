@@ -52,8 +52,18 @@ Where the column held a type, the disagreements fall into three groups.
      hole instance.
 2. **The column's type is still open inside an instance.** This group is about 480 calls in about
    90 files.
-3. **Both sides are closed and differ.** This group is 435 calls in 13 files. They are the fixture
-   set for the last deletion:
+3. **Both sides are closed and differ.** This group is 435 calls in 13 files, graded one by one:
+
+| mechanism | files | calls | what the name carries that the column does not | waits on |
+|---|---|---|---|---|
+| M2, a record built wider or elsewhere | 5 | ~340 | the record-solve build of a call or literal, e.g. `keep([mkcall()])` read at the instance's `T` where the call's rep-keyed row (D15172) builds it at `Circle` | the per-argument delivered type ([per-argument-delivered-type-2026-11.md](per-argument-delivered-type-2026-11.md)) |
+| M3, a function result built at its concrete record | 1 | 4 | `Circle` where the column reads the declared readonly view `Shape` | the result-side twin of the same fact |
+| M1, a written hole-lambda list built at the stub | 4 | ~84 | the one `() => void` row such a list is built at across instances (D7142) | function identity, `Fn#d` (step 3/4) |
+| M4a, a mixed-width integer literal-union element | 1 | 4 | the row of the members' bases (D6460) | closed here: `rlSlotOfRowTy` finds that row |
+| M4b, a union element whose name row is one arm | 1 | 2 | `{w: i32}` for an `i32 \| {w: i32}` element | classifier-side, not a column gap |
+| M5, a layout twin | 1 | 11 | `R` for a literal whose function field differs. The two rows lower to one struct, and D3180 says the literal is not `R` | classifier-side, not a column gap |
+
+   The files are:
    - `tests/cases/closures/closure-array-composite-result.vl`
    - `tests/cases/closures/lambda-returns-readonly-record-view.vl`
    - `tests/cases/closures/written-let-in-list-called-in-two-instances.vl`
