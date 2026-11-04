@@ -387,7 +387,11 @@ Each slice is graded on every hard control above, with the split plan on and off
    cell is still built at the closure type. So 4b-ii is two steps, in this order. First, the cell's
    element is built at the instance's rep for a tagged set (the emitter's cell, read per instance).
    Second, the decision's admission. The first step alone moves nothing, so it is graded by the byte
-   sweep at 0 movers. D15434 (the `const`
+   sweep at 0 movers.
+   Measured further: with mono keeping a tagged set's cell at the set's type
+   (`monoRetypeLamCells`), D15436 at one instance runs. At two it is still invalid wasm, because
+   the second instance dispatches to the first instance's lambda arm. So the admission also waits
+   on M3 step 2's per-instance arms. D15434 (the `const`
    spelling) was clause 1 until 4b-i admitted a `const` seed of a captured `let` as the `let`
    spelling (#6330's `ftConstSeedsCell`); both spellings now run with the split plan on and refuse
    loudly with it off, and both close with 4b-ii.
