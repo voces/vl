@@ -3515,6 +3515,9 @@ export function recLitPlaceBuiltTy(p: i32): i32 {
     if ee >= 0 { return mkArrayTy(ee) }
   }
   const r = recLitSlotReceiver(p)
+  // A list literal spread into a built list of lists holds its inner lists (D15285).
+  const ie = if r >= 0 && pn is ArrayLit { recElemOfElemStamp(r) } else { -1 }
+  if ie >= 0 { return mkArrayTy(mkArrayTy(ie)) }
   const e = if r >= 0 { recHeldElemBuilt(r) } else { -1 }
   if e < 0 { return -1 }
   // A list literal reaches the list's slots only spread into a push, whose elements it holds.
@@ -3810,6 +3813,48 @@ function recCoalesceDefaultsAt(d: i32, rep: i32): i32[] {
   out
 }
 
+// Whether every read of the binding `d` defaults a `??` over a read built at the record `rep`
+// (`recCoalesceDefaultsAt`). Narrow on purpose: with an own-type delivery the pin's refusal is
+// what stops invalid wasm, and an unscoped hand-on broke a maker also called at its own (D15311).
+function recUsedOnlyAsDefaultAt(d: i32, rep: i32): boolean {
+  cwIxBuild()
+  let uses = 0
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    if cwIxKind[w.row] == CW_OCC_USE { uses = uses + 1 }
+  }
+  uses > 0 && uses * 2 == recCoalesceDefaultsAt(d, rep).length
+}
+
+// Whether inferred function `fd` hands back another inferred function's call: a returned value is
+// such a call, or a binding holding one. False for -1 and for a maker of its own literal.
+function recMakerHandsOnCall(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length { return false }
+  for lf in recFnValueLeaves(fd) {
+    const v = cwPeelValue(lf)
+    if (
+      v >= 0
+      && v < P.nodes.length
+      && nodeAt(v) is Call
+      && recInferredFnOf(v) >= 0
+    ) {
+      return true
+    }
+    if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident {
+      const c = recHeldCallOrigin(v)
+      if (
+        c >= 0
+        && c < P.nodes.length
+        && nodeAt(c) is Call
+        && recInferredFnOf(c) >= 0
+      ) {
+        return true
+      }
+    }
+  }
+  false
+}
+
 // Builds the fresh record `const` `d` at the record `rep` where `p` delivers it, refusing each
 // delivery of `d` at its own storage outside `skip`, since one record cannot be both.
 function recHeldBindAdopt(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
@@ -3817,6 +3862,14 @@ function recHeldBindAdopt(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
   // A call's function is built at `rep` too, as a delivery of the call there builds it (D15240).
   if init >= 0 && init < P.nodes.length && nodeAt(init) is Call {
     recAdoptNote(init, nodeTyIxOf(init), rep)
+    // A maker handing back another maker's call is built at `rep` down the chain by that
+    // delivery; adopting the binding as well declines the hand-on, so it is not (D15311).
+    if (
+      recMakerHandsOnCall(recInferredFnOf(init))
+      && recUsedOnlyAsDefaultAt(d, rep)
+    ) {
+      return recHeldOwnRefuse(d, rep, p, skip)
+    }
   }
   recAdPushDecl(d, nodeTyIxOf(init), rep, false, p)
   recHeldOwnRefuse(d, rep, p, skip)
