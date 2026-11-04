@@ -3508,10 +3508,38 @@ export function recCoalesceHeldAdopt(p: i32, rep: i32): boolean {
   )
 }
 
+// Builds the call `p`, a `read ?? call()`, defaults to at the record `rep`, as a delivery of the
+// call there builds it (D15240); false when the default is no call of an inferred function whose
+// result reads back from `rep`.
+export function recCoalesceCallAdopt(p: i32, rep: i32): boolean {
+  const n = nodeAt(p)
+  if !(n is BinExpr) || n.binOp != "??" || rep < 0 || rep >= T.tys.length {
+    return false
+  }
+  const c = cwPeelValue(n.binRight)
+  if (
+    c < 0
+    || !(nodeAt(c) is Call)
+    || recInferredFnOf(c) < 0
+    || !(tyAt(rep) is TyObj)
+  ) {
+    return false
+  }
+  const own = nodeTyIxOf(c)
+  if own < 0 || !recNullWidened(own, rep, false) { return false }
+  recAdoptNote(c, own, rep)
+  true
+}
+
 // Builds the fresh record `const` `d` at the record `rep` where `p` delivers it, refusing each
 // delivery of `d` at its own storage outside `skip`, since one record cannot be both.
 function recHeldBindAdopt(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
-  recAdPushDecl(d, nodeTyIxOf(recCoalesceHeldLit(d)), rep, false, p)
+  const init = recCoalesceHeldInit(d)
+  // A call's function is built at `rep` too, as a delivery of the call there builds it (D15240).
+  if init >= 0 && init < P.nodes.length && nodeAt(init) is Call {
+    recAdoptNote(init, nodeTyIxOf(init), rep)
+  }
+  recAdPushDecl(d, nodeTyIxOf(init), rep, false, p)
   recHeldOwnRefuse(d, rep, p, skip)
 }
 
@@ -3603,11 +3631,29 @@ function recCoalesceHeldOf(p: i32, rep: i32): i32 {
   const r = cwPeelValue(n.binRight)
   if r < 0 || !(nodeAt(r) is Ident) || !(tyAt(rep) is TyObj) { return -1 }
   const d = recHeldDecl(r)
-  const lit = recCoalesceHeldLit(d)
-  if lit < 0 { return -1 }
-  const own = nodeTyIxOf(lit)
+  const init = recCoalesceHeldInit(d)
+  if init < 0 { return -1 }
+  const own = nodeTyIxOf(init)
   if own < 0 || !recNullWidened(own, rep, false) { return -1 }
   d
+}
+
+// What an un-annotated `const` `d` holds fresh: its record literal, or a call of an inferred
+// function, whose result `recFnBuiltAtDst` can build elsewhere; else -1.
+function recCoalesceHeldInit(d: i32): i32 {
+  const lit = recCoalesceHeldLit(d)
+  if lit >= 0 { return lit }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letType >= 0
+    || dn.letKw != "const"
+    || dn.letInit < 0
+  ) {
+    return -1
+  }
+  const c = cwPeelValue(dn.letInit)
+  if c >= 0 && nodeAt(c) is Call && recInferredFnOf(c) >= 0 { c } else { -1 }
 }
 
 // The fresh record literal an un-annotated `const` `d` is initialised with, else -1.
