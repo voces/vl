@@ -8,6 +8,7 @@
 import {
   elabCapOn,
   elabFnFieldWidened,
+  elabFnJoinDeepTy,
   elabFnJoinTy,
   elabFnLetMembers,
   elabFnListWidened,
@@ -511,6 +512,7 @@ import {
 } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
 import {
+  covarRootName,
   cwBindingOf,
   cwBindingWrittenValues,
   cwBoundInitOf,
@@ -2277,7 +2279,7 @@ export function joinRetTys(a: i32, b: i32) {
     njApartSet(njApartRet)
     const j = joinTys(a, b)
     tpApartConcreteSet(saved)
-    return elabFnJoinTy(j, a, b)
+    return elabFnJoinDeepTy(j, a, b, 0)
   }
   const kept: i32[] = []
   flattenVariantsInto(a, kept)
@@ -5507,6 +5509,13 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   if an is ForIn {
     root = cwSlotPath(an.fiIter, p0)
     p0.push("[]")
+    if root < 0 {
+      const cp: string[] = []
+      const c = holeSlotCallPath(an.fiIter, cp)
+      if c < 0 { return false }
+      cp.push("[]")
+      return holeSlotCallJudgeAt(c, cp, wp, pts)
+    }
   } else if an is Param {
     root = cwSlotPath(cwElemCallbackRecv(a), p0)
     p0.push("[]")
@@ -5639,7 +5648,13 @@ function holeSlotCallPath(a: i32, path: string[]): i32 {
   let ix = cwPeel(a)
   while ix >= 0 && ix < P.nodes.length && rev.length < 16 {
     const n = nodeAt(ix)
-    if cwGetRecv(ix) >= 0 {
+    const fi = cwForInBinderOf(ix)
+    const fl = if fi >= 0 { nodeAt(fi) } else { null }
+    if fl is ForIn {
+      // A `for` loop's element reads an element of what the loop walks (D15209).
+      rev.push("[]")
+      ix = cwPeel(fl.fiIter)
+    } else if cwGetRecv(ix) >= 0 {
       rev.push("[]")
       ix = cwPeel(cwGetRecv(ix))
     } else if n is Call {
@@ -5665,13 +5680,14 @@ function holeSlotCallPath(a: i32, path: string[]): i32 {
   -1
 }
 
-// How a diagnostic names the call `c` a slot is rooted at, by the function it runs: `mk()`; ""
-// for a callee that is no named function.
+// How a diagnostic names the call `c` a slot is rooted at, by the function it runs or the name
+// it is called by: `mk()`; "" for a callee that is neither.
 function holeCallRootName(c: Call): string {
   const d = cwCalleeDeclOf(c.callFn)
   const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if f is FuncDecl && f.fnName != "" { return f.fnName + "()" }
-  ""
+  const nm = covarRootName(c.callFn)
+  if nm != "" { nm + "()" } else { "" }
 }
 
 // `holeSlotCallRets`, each returned call of such a function replaced by its own returns, at
@@ -6036,8 +6052,9 @@ function holeSlotRetJudge(
   false
 }
 
-// Adds to `out` each value the top-level function declaring no type parameter that `c` calls,
-// by name or as a UFCS method, returns; false when `c` calls anything else.
+// Adds to `out` each value the function declaring no type parameter that `c` calls returns: a
+// top-level function by name or as a UFCS method, or a lambda a `const` binds; false for
+// anything else.
 export function holeSlotCallRets(c: Call, out: i32[]): boolean {
   if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
   const cf = nodeAt(parenPeelIx(c.callFn))
@@ -6047,7 +6064,10 @@ export function holeSlotCallRets(c: Call, out: i32[]): boolean {
     fx = cwUfcsDeclOf(c.callFn)
   } else if cf is Ident {
     fx = fnDeclIx[cf.identName] ?? -1
-    if identFnDeclOf(parenPeelIx(c.callFn)) != fx { return false }
+    // A name that is no top-level function runs the lambda a `const` binds it to (D15209).
+    if fx < 0 || identFnDeclOf(parenPeelIx(c.callFn)) != fx {
+      fx = cwCalleeDeclOf(c.callFn)
+    }
   }
   if fx < 0 || fx >= P.nodes.length { return false }
   const fd = nodeAt(fx)
