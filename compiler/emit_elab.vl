@@ -79,6 +79,7 @@ import {
   CW_OCC_USE,
   CW_UP_ASG_LHS,
   CW_UP_CALLEE,
+  CW_UP_ELEM,
   CW_UP_FIELD,
   CW_UP_LETINIT,
   CW_UP_OBJ,
@@ -4763,27 +4764,40 @@ let elabSlotRecAt: i32[] = []
 // Each call through such a field's place, with the record it calls a member of.
 let elabPlaceRecs: {[i32]: i32[]} = Map()
 
-// Call `c` in plain code, initialising field `f` of an un-annotated record literal bound by `let`
-// `d`, keeps its record whole there when every write of the slot `d.f` (`cwSlotWrittenValues`) is
-// such a call and every read of `d` is a read of a field: of `f`, a call through the place at one
-// of the record's signatures or the initialiser of a `const` read only by such calls.
+// Call `c` in plain code, initialising a slot of an un-annotated literal bound by `let` `d` (field
+// `f` of a record, or an element `[]` of a list), keeps its record whole there when every write of
+// the slot (`cwSlotWrittenValues`) is such a call and every read of `d` is a read of the slot or a
+// sibling field: a call through the place at one of the record's signatures or the initialiser of
+// a `const` read only by such calls. A list is read otherwise only for its length.
 function elabSlotRecordNote(c: i32) {
   if c < 0 || c >= P.nodes.length || !elabInPlainCode(c) { return 0 }
   cwIxBuild()
-  if c >= cwIxUpKind.length || cwIxUpKind[c] != CW_UP_FIELD { return 0 }
+  if c >= cwIxUpKind.length { return 0 }
   const lit = cwIxUp[c]
-  const fx = cwIxUpAux[c]
-  const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
-  if !(fiv is FieldInit) || lit < 0 || lit >= cwIxUpKind.length { return 0 }
-  if cwIxUpKind[lit] != CW_UP_LETINIT { return 0 }
-  const d = cwIxUp[lit]
-  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if !(dn is LetDecl) || dn.letType >= 0 || !(nodeAt(lit) is ObjLit) {
+  const uk0 = cwIxUpKind[c]
+  let f = ""
+  if uk0 == CW_UP_FIELD {
+    const fx = cwIxUpAux[c]
+    const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+    if !(fiv is FieldInit) { return 0 }
+    f = fiv.fiName
+  } else if uk0 == CW_UP_ELEM {
+    f = "[]"
+  } else {
     return 0
   }
+  if lit < 0 || lit >= cwIxUpKind.length || cwIxUpKind[lit] != CW_UP_LETINIT {
+    return 0
+  }
+  const isList = f == "[]"
+  const d = cwIxUp[lit]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const ln = nodeAt(lit)
+  if !(dn is LetDecl) || dn.letType >= 0 { return 0 }
+  if isList && !(ln is ArrayLit) || !isList && !(ln is ObjLit) { return 0 }
+  if elabSlotFieldRecord(d, f).length > 0 { return 0 }
   const rec = elabCallRecord(c, -1, 4)
   if rec.length < 2 { return 0 }
-  const f = fiv.fiName
   // Every value the slot is written is a call returning the same record.
   const vals: i32[] = []
   const ats: i32[] = []
@@ -4817,8 +4831,16 @@ function elabSlotRecordNote(c: i32) {
       }
       const m = cwIxUp[u]
       const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
-      if !(mn is Member) { return 0 }
-      if mn.memProp == f {
+      // The slot's own place: the field `f`, or any element of the list.
+      let own = false
+      if isList {
+        if mn is Index { own = true }
+        else if !(mn is Member) || mn.memProp != "length" { return 0 }
+      } else {
+        if !(mn is Member) { return 0 }
+        own = mn.memProp == f
+      }
+      if own {
         const uk = if m < cwIxUpKind.length { cwIxUpKind[m] } else { -1 }
         if uk == CW_UP_CALLEE {
           const pm = elabCallSigMember(cwIxUp[m], rec)
