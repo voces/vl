@@ -58,19 +58,20 @@ const errorBlock = (out: string): string => {
   return lines.slice(start, end).join("\n");
 };
 
-// A BODY-phase refusal: a function returning a parameter it calls at two signatures, its result
-// put in a list element (D15144's B2 position, `bundle-record-value-2026-11.md`), anchored at
-// that call on line 7.
-const BODY_WITNESS = `function lap(f) {
-  print(f(2.5))
-  print(f(3))
-  return f
+// A BODY-phase refusal: a `let` with no initializer whose type has no zero value, shared with a
+// closure (D2340), anchored at that `let` on line 7.
+const BODY_WITNESS = `function twice(n: i32) {
+  n * 2
 }
-function go(k: i32) {
-  const xs = [lap((a) => a + k)]
-  print(xs[0](4))
+type P = { x: i32 }
+function main() {
+  print(twice(1))
+  let p: P
+  const g = () => p.x
+  p = { x: 7 }
+  print(g())
 }
-go(1)
+main()
 `;
 
 Deno.test({
@@ -95,10 +96,10 @@ Deno.test({
           `expected the emit refusal to carry body.vl:<line>:<col>, got:\n${blk}`,
         );
       }
-      // The anchor is the refused call on line 7, not the last statement in the file.
+      // The anchor is the refused `let` on line 7, not the last statement in the file.
       if (!/at \S*body\.vl:7:\d+/.test(blk)) {
         throw new Error(
-          `expected the anchor on line 7 (the refused call), got:\n${blk}`,
+          `expected the anchor on line 7 (the refused let), got:\n${blk}`,
         );
       }
     } finally {
