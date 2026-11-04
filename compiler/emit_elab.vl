@@ -165,7 +165,12 @@ import {
   callBindTyOf,
   callBindTysAt,
 } from "./check_bind_rows"
-import { callArgRepTy, recRepWidens } from "./check_bind_adopt"
+import {
+  REC_REBUILT_DEPTH,
+  callArgRepTy,
+  recRebuiltLeafRow,
+  recRepWidens,
+} from "./check_bind_adopt"
 import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
 import { monoRecheckEnd } from "./check_demands"
 import { cbExpMark, cbExpTruncate } from "./check_expected"
@@ -320,7 +325,8 @@ function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
   let k = ""
   for o in elabNameOrder(names) {
     if o < tys.length {
-      k = k + names[o] + "=" + elabBindStr(tys[o], exact) + ";"
+      const v = if elabIsRowEntry(names[o]) { elabDeliveredRowClassFn(tys[o]) } else { elabBindStr(tys[o], exact) }
+      k = k + names[o] + "=" + v + ";"
     }
   }
   i32ToStr(decl) + "|" + k
@@ -330,6 +336,56 @@ function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
 // checker keys the instance there (`callBindRepKeyedAt`); else its own.
 function elabRowTys(r: i32): i32[] {
   if callBindRepKeyedAt(r) { callBindRepTysAt(r) } else { callBindTysAt(r) }
+}
+
+// The record-row class of a delivered record (`recordRowClassOf`), installed by the emitter before
+// the elaboration runs, since the row module sits above this one in the import graph; a read before
+// that traps.
+function elabDeliveredRowClassUnset(_ty: i32): string { __trap__() }
+export let elabDeliveredRowClassFn: (ty: i32) => string = elabDeliveredRowClassUnset
+
+// Whether binding name `nm` is a delivered-row entry (`#r.<param>`), keyed by its record's row class.
+function elabIsRowEntry(nm: string): boolean {
+  nm.length > 3 && nm.slice(0, 3) == "#r."
+}
+
+// The record a call argument `i` of call `call` is delivered at: the record the checker rebuilds
+// it at (`recRebuiltLeafRow`); -1 for none, for a binding (D15172's answer) and for a literal,
+// whose built row is the record build's own fact.
+function elabArgRowTy(call: i32, i: i32): i32 {
+  const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { nodeAt(0) }
+  if !(cn is Call) || i >= cn.callArgs.length { return -1 }
+  const ax = parenPeelIx(cn.callArgs[i])
+  if ax < 0 || !(nodeAt(ax) is Call) { return -1 }
+  recRebuiltLeafRow(ax, REC_REBUILT_DEPTH)
+}
+
+// Appends to `names`/`tys` a delivered-row entry per un-annotated parameter of `decl` whose
+// argument at call `call` is delivered as a record other than the hole's closed binding, beside
+// that binding, which this leaves alone; an open binding is closed by the demand (D15173).
+function elabRowEntries(call: i32, decl: i32, names: string[], tys: i32[]) {
+  const f = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { nodeAt(0) }
+  if !(f is FuncDecl) { return 0 }
+  let i = 0
+  while i < f.fnParams.length {
+    const p = nodeAt(f.fnParams[i])
+    if p is Param && p.parType < 0 {
+      const rt = elabArgRowTy(call, i)
+      const hb = bindOf(names, tys, "?" + f.fnName + "." + i32ToStr(i))
+      if (
+        rt >= 0
+        && hb >= 0
+        && elabTyClosed(hb, 0)
+        && !tySame(hb, rt)
+        && elabDeliveredRowClassFn(rt) != ""
+      ) {
+        names.push("#r." + i32ToStr(i))
+        tys.push(rt)
+      }
+    }
+    i = i + 1
+  }
+  0
 }
 
 // Per declaration: 1 when its body tests a value of a type parameter, directly or by handing one
@@ -956,7 +1012,10 @@ function elabCanon(
     for x in names {
       if x == nm { has = true }
     }
-    if !has && (elabOwnName(decl, nm) || elabSigReads(decl, nm)) {
+    if (
+      !has
+      && (elabOwnName(decl, nm) || elabSigReads(decl, nm) || elabIsRowEntry(nm))
+    ) {
       if !elabTyClosed(tys0[i0], 0) { return false }
       names.push(nm)
       tys.push(if exact { tys0[i0] } else { widenLitTy(tys0[i0]) })
@@ -1546,6 +1605,7 @@ function elabDemandFrom(
     const pk = elabKeyAtPins(decl, names0, tys0, pTys, from)
     if pk >= 0 { return pk }
   }
+  elabRowEntries(call, decl, names, tys)
   const n0 = ekDecl.length
   const k = elabEnqueue(decl, names, tys, from)
   elabReachNote(from, k, -1)
@@ -1948,7 +2008,11 @@ function elabCkTakesPins(ck: i32, sig: i32, pTys: i32[]): boolean {
   let strWidened = false
   let p = 0
   while p < f.fnParamTypes.length && p < pTys.length {
-    if elabTyClosed(pTys[p], 0) && !elabBundlePinTaken(ck, p, pTys[p]) {
+    if (
+      elabTyClosed(pTys[p], 0)
+      && !elabBundlePinTaken(ck, p, pTys[p])
+      && !tySame(elabKeyRowAt(ck, p), pTys[p])
+    ) {
       const bt = substTyDeep(f.fnParamTypes[p], ekNames[ck], ekTys[ck])
       const how = elabPinTakes(pTys[p], bt)
       if how == 0 { return false }
@@ -1961,6 +2025,25 @@ function elabCkTakesPins(ck: i32, sig: i32, pTys: i32[]): boolean {
   // literal instance's atoms where the widened pin builds strings.
   if strWidened && elabSigHasLit(f) { return false }
   !widened || elabSoleTaker(ck, f, pTys)
+}
+
+// The record instance `k` delivers its parameter `i` at (its `#r.<i>` entry, D15173), or -1: a
+// pin naming that record is the instance's own row, its walk keeping the hole's binding.
+function elabKeyRowAt(k: i32, i: i32): i32 {
+  if k < 0 || k >= ekNames.length { return -1 }
+  const nm = "#r." + i32ToStr(i)
+  let j = 0
+  while j < ekNames[k].length && j < ekTys[k].length {
+    if ekNames[k][j] == nm { return ekTys[k][j] }
+    j = j + 1
+  }
+  -1
+}
+
+// The record the instance call `ix` reaches delivers its parameter `i` at, or -1 (D15173).
+export function elabCallParamRowTy(ix: i32, i: i32): i32 {
+  const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  elabKeyRowAt(elabCallInstFrom(ix, from), i)
 }
 
 // Whether one of the pins `pTys` is the bundle of instance `ck`'s parameter at its position.
@@ -2439,6 +2522,7 @@ function elabOneAt(k: i32) {
     // An instance's call binds a tagged set or a primed stub as a root call does.
     const ct = elabSetArgBind(elabCallIx[c], cn, ct0)
     if tysClosed(ct) {
+      elabRowEntries(elabCallIx[c], elabCallD[c], cn, ct)
       elabReachNote(k, elabEnqueue(elabCallD[c], cn, ct, k), elabCallIx[c])
       elabArgRows(elabCallIx[c], elabCallD[c], cn, ct, k)
     }
@@ -6412,6 +6496,7 @@ export function elabRun() {
       const rn: string[] = []
       const rt: i32[] = []
       elabRowComplete(ix, d, callBindNamesAt(r), tys, rn, rt)
+      elabRowEntries(ix, d, rn, rt)
       if elabRowByArms(ix, d) {
         // The row's own instance serves a set left untagged; no call reaches it.
         elabSigAlting = elabRowAtSetRep(ix, d)
