@@ -7,8 +7,10 @@ import { parenPeelIx } from "./check_places"
 import {
   CW_OCC_USE,
   CW_UP_ELEM,
+  CW_UP_LETINIT,
   cwBindingOf,
   cwFnValueDeclOf,
+  cwFnCalls,
   cwFnValueTargets,
   cwFramedNode,
   cwIxKind,
@@ -29,6 +31,7 @@ import {
   cwPathFnTargets,
   cwPathFnTargetsFrom,
   cwSlotPath,
+  cwSlotValuesFrom,
   cwSlotWrittenValues,
   cwUseCaptures,
   fnDeclIx,
@@ -1259,6 +1262,8 @@ export function elabFnFieldTy(
   const vals: i32[] = []
   const ats: i32[] = []
   if !fnFieldListedWith(bd, path, vals, ats) { return t }
+  // Bindings a call of the same function initialises hold the same returned literal (D15273).
+  if seeds.length > 0 && !fnFieldCalledWith(bd, path, seeds, vals, ats) { return t }
   const ds: i32[] = []
   for v in vals {
     const d = cwFnValueDeclOf(v)
@@ -1291,6 +1296,40 @@ export function elabFnFieldTy(
   const lt = if listed { mkArrayTy(fresh) } else { fresh }
   fnJoinMemo[key] = lt
   lt
+}
+
+// Adds to `vals` what each other binding a call of `bd`'s own callee initialises stores at
+// `path`, that callee returning `seeds`, so bindings of one function's returned record share its
+// field's set. False when one of those writes is not a literal's part.
+function fnFieldCalledWith(
+  bd: i32,
+  path: string[],
+  seeds: i32[],
+  vals: i32[],
+  ats: i32[],
+): boolean {
+  const b = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
+  if !(b is LetDecl) || b.letInit < 0 { return true }
+  const c = nodeAt(parenPeelIx(b.letInit))
+  if !(c is Call) || c.callFn < 0 { return true }
+  const cf = parenPeelIx(c.callFn)
+  const cn = nodeAt(cf)
+  if !(cn is Ident) { return true }
+  const fx = fnDeclIx[cn.identName] ?? -1
+  if fx < 0 || identDeclOf(cf) != fx { return true }
+  const calls: i32[] = []
+  cwFnCalls(fx, calls)
+  for at in calls {
+    if at >= 0 && at < cwIxUpKind.length && cwIxUpKind[at] == CW_UP_LETINIT {
+      const d = cwIxUp[at]
+      if d >= 0 && d != bd && d < P.nodes.length && nodeAt(d) is LetDecl {
+        const dl = nodeAt(d)
+        const di = if dl is LetDecl { dl.letInit } else { -1 }
+        if cwSlotValuesFrom(cwKeyOfDecl(d), di, seeds, path, vals, ats) < 0 { return false }
+      }
+    }
+  }
+  true
 }
 
 // Adds to `vals` what each other binding listed beside `bd` in a list literal stores at `path`,
