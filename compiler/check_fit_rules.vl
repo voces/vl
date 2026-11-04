@@ -106,6 +106,7 @@ import {
   nodeRepTyIxOf,
   nodeRepUnionIx,
   optReadParts,
+  recCopyFrom,
   recCopyTyIx,
   recCopyUnwrap,
   setCtorKeys,
@@ -521,6 +522,7 @@ import { objSigSame } from "./check_union_arm_msgs"
 import { mkUnionTy } from "./check_union_mint"
 import { isWideLitJoin, mkWideStrLitTy } from "./check_wide_lits"
 import {
+  CW_OCC_ASG,
   CW_OCC_BIND,
   CW_OCC_USE,
   CW_UP_ARG,
@@ -534,12 +536,14 @@ import {
   CW_UP_OBJ,
   covarRootName,
   cwIxBuild,
+  cwIxFr,
   cwIxKind,
   cwIxNode,
   cwIxParent,
   cwIxUp,
   cwIxUpAux,
   cwIxUpKind,
+  cwKeyFrame,
   cwKeyOfRoot,
   cwOccNext,
   cwOccWalk,
@@ -1853,8 +1857,10 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   }
   const copies: i32[] = []
   const copyTys: i32[] = []
+  const copyBack: i32[] = []
   for cs in recSiteCopies { copies.push(cs) }
   for ct in recSiteCopyTys { copyTys.push(ct) }
+  for cb in recSiteCopyBack { copyBack.push(cb) }
   const via: i32[] = []
   const leaves = recFnValueOrigins(fd, via)
   if leaves.length == 0 { return false }
@@ -1910,6 +1916,7 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
     const cp = copies[ci]
     while recCopyTyIx.length <= cp { recCopyTyIx.push(-1) }
     recCopyTyIx[cp] = copyTys[ci]
+    if i32ListHas(copyBack, cp) { recCopyFrom[cp] = dst }
     const un = recCopyUnwrapNames(dst, own)
     if un.length > 0 { recCopyUnwrap[cp] = un }
     ci = ci + 1
@@ -2038,6 +2045,7 @@ function recFnReturns(fd: i32): i32[] {
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   recSiteCopies = []
   recSiteCopyTys = []
+  recSiteCopyBack = []
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
   for s in sites {
@@ -2063,6 +2071,12 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
       || (!mapped && recQueuedReaches(c, own, dst))
     ) {
       return false
+    } else if !mapped && recSiteWrittenThrough(c) && recCopyNarrows(dst, own) {
+      // A binding a record is written through takes its own copy of the build rather than sharing
+      // it; one no copy serves shares it as before (D15246).
+      recSiteCopies.push(c)
+      recSiteCopyTys.push(own)
+      recSiteCopyBack.push(c)
     }
   }
   if hasCall { recRepArgsNote(sites, own, dst) }
@@ -2073,6 +2087,82 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
 // each the record it is copied into.
 let recSiteCopies: i32[] = []
 let recSiteCopyTys: i32[] = []
+// The copies among `recSiteCopies` that a binding written through takes back to its own record.
+let recSiteCopyBack: i32[] = []
+
+// Whether the binding call site `c` initialises is written through (`recBindWrittenThrough`).
+function recSiteWrittenThrough(c: i32): boolean {
+  cwIxBuild()
+  if c < 0 || c >= cwIxParent.length { return false }
+  const d = cwIxParent[c]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+  if !(dn is LetDecl) || parenPeelIx(dn.letInit) != c { return false }
+  recBindWrittenThrough(d, 4)
+}
+
+// Whether binding or parameter `d` may be written through: a field path of it is assigned, or it
+// is bound by `const` or handed as an argument to a binding or parameter that is, to `depth` hops.
+function recBindWrittenThrough(d: i32, depth: i32): boolean {
+  if d < 0 || depth <= 0 { return false }
+  const fr = cwKeyFrame(d)
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const r = w.row
+    const an = if cwIxKind[r] == CW_OCC_ASG && cwIxFr[r] == fr { nodeAt(cwIxNode[r]) } else { null }
+    if (
+      an is BinExpr
+      && an.binOp == "="
+      && !(nodeAt(parenPeelIx(an.binLeft)) is Ident)
+      && tyHoldsObjDeep(nodeTyIxOf(an.binRight))
+    ) {
+      return true
+    }
+    const u = if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == fr { cwIxNode[r] } else { -1 }
+    if u >= 0 && u < cwIxUpKind.length && recUseWritesThrough(u, depth) {
+      return true
+    }
+  }
+  false
+}
+
+// Whether assignment `a` stores a value holding a record: a scalar field write is served by the
+// shared build's own field storage.
+function recAsgStoresRecord(a: i32): boolean {
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { nodeAt(0) }
+  an is BinExpr && tyHoldsObjDeep(nodeTyIxOf(an.binRight))
+}
+
+// Whether the read `u` of a binding writes through it: the field path it roots is assigned, or the
+// whole value is bound by `const` or handed as an argument to a binding written through.
+function recUseWritesThrough(u: i32, depth: i32): boolean {
+  let top = u
+  while top >= 0 && top < cwIxUpKind.length && cwIxUpKind[top] == CW_UP_OBJ {
+    top = cwIxUp[top]
+  }
+  if top < 0 || top >= cwIxUpKind.length { return false }
+  const uk = cwIxUpKind[top]
+  if uk == CW_UP_ASG_LHS { return top != u && recAsgStoresRecord(cwIxUp[top]) }
+  if top != u { return false }
+  const up = cwIxUp[top]
+  if up < 0 || up >= P.nodes.length { return false }
+  const un = nodeAt(up)
+  if uk == CW_UP_LETINIT && un is LetDecl {
+    return recBindWrittenThrough(up, depth - 1)
+  }
+  if uk == CW_UP_ARG && un is Call {
+    const fd = recInferredFnOf(up)
+    const fn = if fd >= 0 { nodeAt(fd) } else { nodeAt(0) }
+    if !(fn is FuncDecl) { return false }
+    let i = 0
+    while i < un.callArgs.length && i < fn.fnParams.length {
+      if parenPeelIx(un.callArgs[i]) == top {
+        return recBindWrittenThrough(fn.fnParams[i], depth - 1)
+      }
+      i = i + 1
+    }
+  }
+  false
+}
 
 // The record call `c` of own type `own` is copied into: the type its pin names, which a written
 // type argument spells as a declared record, else `own` (D14818).
