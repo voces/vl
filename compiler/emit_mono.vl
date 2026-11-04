@@ -666,6 +666,8 @@ import {
   elabRetOf,
   elabSlotFieldRecord,
   elabSlotNote,
+  elabSlotRecCount,
+  elabSlotRecDeclAt,
   elabSrcDecl,
   elabStampAt,
   elabStubArgSet,
@@ -16768,6 +16770,25 @@ function monoNoteFieldReadTy(rd: i32, fx: i32, ft: i32) {
   0
 }
 
+// Each binding the elaboration found holding a returned record of members whole in a slot is typed
+// at that record before the walk, in the binding's own frame, whatever the walk reaches (B2).
+function monoSlotRecordsApply(): i32 {
+  const done: i32[] = []
+  let i = 0
+  while i < elabSlotRecCount() {
+    const at = elabSlotRecDeclAt(i)
+    const dn = if at >= 0 && at < P.nodes.length { nodeAt(at) } else { null }
+    if dn is LetDecl && !i32ListHas(done, at) {
+      done.push(at)
+      if dn.letType < 0 && dn.letInit >= 0 {
+        if monoPinSlotRecords(dn, at, monoTopFrameOf(at)) < 0 { return -1 }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Types each field of the un-annotated record literal `d` binds at `at` in frame `ctx` that holds a
 // returned record of members whole (`elabSlotFieldRecord`) at that record's row, with the literal
 // and the field's reads; -1 where no row is minted for it.
@@ -18799,7 +18820,8 @@ function monoReachLitTys() {
 
 // The list half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a list.
 function monoReachListTy(a: i32, t: Ty) {
-  if t is TyArray {
+  // An element already typed at a returned record of members holds it whole (B2).
+  if t is TyArray && !monoIsBundleTy(t.aElem) {
     const ct = monoReachSlotTy(a, t.aElem, "e,")
     if ct >= 0 { nodeTyRecord(a, mkArrayTy(ct)) }
   }
@@ -18813,11 +18835,8 @@ function monoReachRecTy(a: i32, t: Ty) {
     let moved = false
     let i = 0
     while i < t.objFieldTypes.length {
-      const ct = monoReachSlotTy(
-        a,
-        t.objFieldTypes[i],
-        "f:" + t.objFieldNames[i] + ",",
-      )
+      const ft = t.objFieldTypes[i]
+      const ct = if monoIsBundleTy(ft) { -1 } else { monoReachSlotTy(a, ft, "f:" + t.objFieldNames[i] + ",") }
       if ct >= 0 {
         fts.push(ct)
         moved = true
@@ -26427,10 +26446,6 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   }
   // An un-annotated list of function values takes the one type the calls through its elements
   // give it, as an annotation would (D3977).
-  // A slot holding a returned record of members whole takes that record first (B2).
-  if n.letType < 0 && n.letInit >= 0 {
-    if monoPinSlotRecords(n, ix, ctx) < 0 { return -1 }
-  }
   if n.letType < 0 {
     if monoPinListElems(n, ix, ctx) < 0 { return -1 }
   }
@@ -29319,6 +29334,7 @@ export function monomorphize(stmts: i32[]) {
   if monoShadowRename(fnStmts.length) < 0 { return -1 }
   monoFlowReads(stmts)
   monoInertReach(stmts)
+  if monoSlotRecordsApply() < 0 { return -1 }
   // Top-level statements first, in source order (global inits + start stmts).
   let i = 0
   while i < stmts.length {
