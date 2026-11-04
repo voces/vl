@@ -1369,6 +1369,14 @@ function instRecvFieldFnTy(recvIx: i32, prop: string, fnIx: i32): i32 {
   ft
 }
 
+// Whether call `callIx` inside `fnIx` has a checked type with no type variable and no inference
+// hole. A classifier asks `fieldClosureFeOfRecv` about a field call only where this is false: a
+// field's resolved closure can be another instance of the same function (D15114, D15115).
+export function callTyClosedIn(callIx: i32, fnIx: i32): boolean {
+  const ct = nodeTyInOf(callIx, fnIx)
+  ct >= 0 && ct < T.tys.length && !tyHasTyVar(ct) && !tyHasInferHole(ct, 0)
+}
+
 // The lifted-function position of the closure a member call `recv.prop(...)` dispatches
 // to: first by following the receiver to the literal that built it, so two same-shaped
 // receivers from different monomorphized makers each resolve their own closure, else by
@@ -1621,7 +1629,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
         if sigKeyRetKind(nvck) == "nulvariant" { return sigKeyRetSlot(nvck) }
         return -1
       }
-      if callee is Member {
+      if callee is Member && !callTyClosedIn(exprIx, fnIx) {
         const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
         if ffe >= 0 {
           const fvr = cloRetNulVariantRow(ffe)
@@ -9850,7 +9858,7 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
   }
   // A field-closure call (`(a."[]")(i)` — a chained index trap whose "[]"
   // returns another trap object) yields the field function's return struct.
-  if callee is Member {
+  if callee is Member && !callTyClosedIn(exprIx, fnIx) {
     if (
       drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp)
     ) {
@@ -10348,8 +10356,10 @@ function exprUnionCall(e: Call, exprIx: i32, fnIx: i32): boolean {
     // riding as its tag, so every box-typed destination must pass it through rather than
     // box it again — the predicate twin of `unionNameOfExpr`'s own arm (D1881).
     if popUnionBoxElem(popRefRecvSlot(exprIx, fnIx)) { return true }
-    const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-    if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "union" }
+    if !callTyClosedIn(exprIx, fnIx) {
+      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "union" }
+    }
   }
   // A union-returning INDEXED closure-element call (`xs[i](1)` over a
   // `((i32) => A | B)[]`): the element signature's result token is the box (`>u`).
@@ -13995,10 +14005,9 @@ export function exprString(exprIx: i32, fnIx: i32) {
       }
       // A string-returning FIELD-closure call (`o.label(3)` over a `(i32) => string` field).
       if callee is Member {
-        // A call the checker typed closed is that type: which closure the field holds is asked
-        // only where the type is open (D15114).
-        const ct = nodeTyInOf(exprIx, fnIx)
-        if ct >= 0 && ct < T.tys.length && !tyHasTyVar(ct) {
+        // A call the checker typed closed is that type (D15114).
+        if callTyClosedIn(exprIx, fnIx) {
+          const ct = nodeTyInOf(exprIx, fnIx)
           if nodeTyIsLitUnionAlias(exprIx) { return false }
           return tyKindOf(ct) == TK_STR || tyIsBareStrLit(ct)
         }
