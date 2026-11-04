@@ -63,6 +63,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  structNameOfTy,
   tyAt,
   tyBearsNull,
   tyEq,
@@ -92,6 +93,7 @@ import { variantIndexOf } from "./emit_local_slots"
 import { retNulRefArrFlag } from "./emit_nullable_rets"
 import { paramTypeNodeOfRead } from "./emit_query"
 import { nodeMapValTyIx, nullValKind, unRowOfKey } from "./emit_rep"
+import { mapTwinSame } from "./emit_map_twins"
 import {
   emptyArrLitIxOf,
   mvValKindOfNameTy,
@@ -139,7 +141,12 @@ import {
   variantHeap,
 } from "./emit_state"
 import { declaredSlotOf, rlSlotOfTy, sFieldIndex } from "./emit_struct_order"
-import { nodeTyInOf } from "./emit_ty_canon"
+import {
+  TY_WALK_DEPTH,
+  nodeTyInOf,
+  tySameSet,
+  tySameSpelled,
+} from "./emit_ty_canon"
 import {
   registerValueUnionNameAB,
   valueUnionKeyTextOfTy,
@@ -1469,37 +1476,45 @@ export function emptyArrHoleElemSlot(exprIx: i32) {
 }
 
 // PROBE: the variant row name holding tested type `ty`, by type only; "" for none or two names.
-function probeRowHolds(r: i32, ty: i32): boolean {
+function probeRowHolds(r: i32, ty: i32, mode: i32, own: string): boolean {
   if r < 0 || r >= uVarTyIx.length || uVarTyIx[r] < 0 { return false }
-  if tyAt(ty) is TyObj { return armRowIsMember(r, ty) }
-  tySame(uVarTyIx[r], ty)
+  if mode == 0 { return own != "" && uVariants[r] == own }
+  if mode == 1 { return uVarTyIx[r] == ty }
+  if mode == 3 { return tySameSpelled(uVarTyIx[r], ty, TY_WALK_DEPTH) }
+  if tyAt(ty) is TyObj {
+    return armRowIsMember(r, ty) || tySameSet(uVarTyIx[r], ty, TY_WALK_DEPTH)
+  }
+  tySame(uVarTyIx[r], ty) || mapTwinSame(uVarTyIx[r], ty)
 }
 export function probeRowNameOfTy(ty: i32, recvIx: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
+  const own = structNameOfTy(ty)
+  if own != "" && variantIndexOf(own) >= 0 { return own }
+  let lo = -1
+  let hi = -1
   if recvIx >= 0 {
     const ut = unionTyOfRecv(nodeTyInOf(unwrapParen(recvIx), emitCurFnIx))
     if ut >= 0 {
       const u = unRowOfKey(ut)
       if u >= 0 && u < unVarStart.length && u < unVarCount.length {
-        let nm = ""
-        let two = false
-        let r = unVarStart[u]
-        while r < unVarStart[u] + unVarCount[u] {
-          if probeRowHolds(r, ty) {
-            if nm != "" && uVariants[r] != nm { two = true }
-            nm = uVariants[r]
-          }
-          r = r + 1
-        }
-        if nm != "" && !two { return nm }
-        if two { return "<two-in-recv>" }
+        lo = unVarStart[u]
+        hi = unVarStart[u] + unVarCount[u]
       }
     }
   }
+  for g in [false, true] {
+    for mode in [1, 2, 3] {
+      const a = if g { probeRowIn(0, uVariants.length, ty, mode, own) } else if lo >= 0 { probeRowIn(lo, hi, ty, mode, own) } else { "" }
+      if a != "" { return a }
+    }
+  }
+  ""
+}
+function probeRowIn(lo: i32, hi: i32, ty: i32, mode: i32, own: string): string {
   let nm = ""
-  let r = 0
-  while r < uVariants.length {
-    if probeRowHolds(r, ty) {
+  let r = lo
+  while r < hi {
+    if probeRowHolds(r, ty, mode, own) {
       if nm != "" && uVariants[r] != nm { return "<two>" }
       nm = uVariants[r]
     }
