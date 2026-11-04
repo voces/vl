@@ -5,6 +5,7 @@
 // dispatches on the id to a direct call of each member, which this pass builds.
 import {
   recAsgFnWidenedTy,
+  recFnFieldsWiden,
   recordBoxTy,
   repStampHeldRead,
 } from "./check_fit_rules"
@@ -70,9 +71,13 @@ import {
 import {
   CW_OCC_CALL,
   CW_OCC_USE,
+  CW_UP_ARG,
   cwBindingWrittenValues,
+  cwIxBuild,
   cwIxKind,
   cwIxNode,
+  cwIxUp,
+  cwIxUpKind,
   cwIxWant,
   cwLetUnwritten,
   cwOccNext,
@@ -101,6 +106,7 @@ import {
   TyUnion,
   TyVar,
   tyAt,
+  tyFieldTyOf,
   tyHasHole,
   tySame,
 } from "./check_types"
@@ -1273,7 +1279,7 @@ function ftScan(
         if !ftSetWithin(s, ot) { return false }
         if !i32ListHas(ftSubNeed, ot) { ftSubNeed.push(ot) }
       }
-      if ftIsS(x, s) && ot < 0 && !ftNamedAtClosed(x, p, s) {
+      if ftIsS(x, s) && ot < 0 && !ftNamedAtClosed(x, p, g, s) {
         if !ok || !ftNodeOk(x, p, s, ds, leaves, ids) { return false }
         if !ftCtxOk(x, p, g, fn, s) { return false }
         const pn = nodeAt(p)
@@ -1602,16 +1608,22 @@ function ftParamClosed(q: i32): boolean {
   pn.parType >= 0 || elabTyClosed(nodeTyIxOf(q), 0)
 }
 
-// Whether `x`, the child of `p`, names a member of set `s` delivered to a closed function type: a
-// parameter of a declared callee annotated so, or a binding annotated so. The name is its own instance
-// there, not a value of the set, as a generic member's is.
-function ftNamedAtClosed(x: i32, p: i32, s: i32): boolean {
+// Whether `x`, the child of `p` in `g`, names a member of set `s` delivered to a closed function
+// type: a parameter of a declared callee annotated so, a binding annotated so, or a field of a
+// record literal built at a record whose field is so. The name is its own instance there, not a
+// value of the set, as a generic member's is.
+function ftNamedAtClosed(x: i32, p: i32, g: i32, s: i32): boolean {
   if x < 0 || p < 0 || !(nodeAt(x) is Ident) { return false }
   const d = identDeclOf(x)
   if d < 0 || !i32ListHas(fnTagMembers(s), d) { return false }
   const pn = nodeAt(p)
   if pn is LetDecl {
     return pn.letInit == x && pn.letType >= 0 && ftClosedFnTy(nodeTyIxOf(p))
+  }
+  // A field of a record literal the record solve builds at a record whose field is closed.
+  if pn is FieldInit {
+    if pn.fiValue != x || g < 0 || !(nodeAt(g) is ObjLit) { return false }
+    return ftClosedFnTy(tyFieldTyOf(ftLitBuiltAt(g), pn.fiName))
   }
   if !(pn is Call) || pn.callFn == x { return false }
   const i = i32ListIndexOf(pn.callArgs, x)
@@ -3280,6 +3292,12 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
   // A copy `fvaListSetCopy` built is a fresh list of adapters, which holds no id (D15132).
   if fvaListCopyAt(x) { return true }
   const n = nodeAt(x)
+  // A record literal the record solve builds at a place holding no set decided with `s` holds
+  // that place's closures.
+  if n is ObjLit {
+    const r = ftLitBuiltAt(x)
+    if r >= 0 && !ftTyHoldsDecided(r, s) { return true }
+  }
   // An annotated binding of such a literal, and a write of one, hold what the literal holds.
   if n is LetDecl {
     return n.letType >= 0
@@ -3691,6 +3709,25 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     Param | WhileStmt | NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | OptMember | ErrExpr | TypeRef | BreakStmt | ContinueStmt | FieldDef | TypeDecl | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ImportDecl | Spread | LoopVar => {
       return false
     }
+  }
+}
+
+// The record the record solve builds literal `x` at where a write or push places it, or -1:
+// `recAsgFnWidenedTy`'s answer, or the stamp a pushed literal took at a list's element that
+// differs from its own record in function fields alone.
+function ftLitBuiltAt(x: i32): i32 {
+  const r = recAsgFnWidenedTy(x)
+  if r >= 0 { return r }
+  cwIxBuild()
+  if x < 0 || x >= cwIxUp.length || cwIxUpKind[x] != CW_UP_ARG { return -1 }
+  const c = nodeAt(cwIxUp[x])
+  const f = if c is Call && c.callFn >= 0 { nodeAt(parenPeelIx(c.callFn)) } else { null }
+  if !(f is Member) || f.memProp != "push" { return -1 }
+  const rt = nodeRepTyIxOf(x)
+  if rt != nodeTyIxOf(x) && recFnFieldsWiden(nodeTyIxOf(x), rt) {
+    rt
+  } else {
+    -1
   }
 }
 

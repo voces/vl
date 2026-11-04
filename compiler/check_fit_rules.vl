@@ -142,6 +142,7 @@ import {
   elabTyClosed,
   fnLetIsWide,
   fnTagHeldRepOf,
+  fnTagSetOfTy,
   stampsStand,
 } from "./check_elab_cap"
 import { boundObjRootOf } from "./check_decl_scan"
@@ -3746,8 +3747,8 @@ export function recAsgBindInit(p: i32): i32 {
 }
 
 // The record a record literal `p` written whole into a binding the field widener widened, a field
-// or element slot of one, or pushed onto a list one roots, is built at (D15306, D15307, D15336);
-// else -1.
+// or element slot of one, or pushed onto a list one roots or whose element widens only its
+// function fields, is built at (D15306, D15307, D15336); else -1.
 export function recAsgFnWidenedTy(p: i32): i32 {
   if p < 0 || p >= P.nodes.length || !(nodeAt(p) is ObjLit) { return -1 }
   // The place, a binding or a field or element slot of one, and the binding it is rooted at;
@@ -3774,11 +3775,12 @@ export function recAsgFnWidenedTy(p: i32): i32 {
   if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
   const d = recBindDeclOf(x)
   const dn = if d >= 0 { nodeAt(d) } else { null }
+  const widened = elabFnFieldWidenedAny(d)
   if (
     !(dn is LetDecl)
     || dn.letType >= 0
     || dn.letInit < 0
-    || !elabFnFieldWidenedAny(d)
+    || !widened && !pushed
   ) {
     return -1
   }
@@ -3796,7 +3798,58 @@ export function recAsgFnWidenedTy(p: i32): i32 {
     const lt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
     t = if lt is TyArray { lt.aElem } else { -1 }
   }
+  // A list no write widened takes a pushed literal at its element only where the two differ in
+  // function fields alone, each element field a closed type or another set.
+  if !widened && !recFnFieldsWiden(nodeTyIxOf(p), t) { return -1 }
   if t >= 0 && t < T.tys.length && tyAt(t) is TyObj { t } else { -1 }
+}
+
+// Whether record `w` is record `own` with at least one function field holding a set that `w`'s
+// field holds another set at or closes, and every other field the same.
+export function recFnFieldsWiden(own: i32, w: i32): boolean {
+  if own < 0 || w < 0 || own >= T.tys.length || w >= T.tys.length {
+    return false
+  }
+  const o = tyAt(own)
+  const t = tyAt(w)
+  if (
+    !(o is TyObj)
+    || !(t is TyObj)
+    || o.objFieldNames.length != t.objFieldNames.length
+  ) {
+    return false
+  }
+  let wider = false
+  let i = 0
+  while i < o.objFieldNames.length && i < o.objFieldTypes.length {
+    const k = strListIndexOf(t.objFieldNames, o.objFieldNames[i])
+    if k < 0 || k >= t.objFieldTypes.length { return false }
+    const of = o.objFieldTypes[i]
+    const tf = t.objFieldTypes[k]
+    // Two sets' types spell alike, so a function field is compared by its set.
+    if fnTagSetOfTy(of) >= 0 {
+      if !recFnSetWidens(of, tf) { return false }
+      if fnTagSetOfTy(tf) != fnTagSetOfTy(of) { wider = true }
+    } else if !tySame(of, tf) {
+      return false
+    }
+    i = i + 1
+  }
+  wider
+}
+
+// Whether function type `wf` takes a value of set-carrying `of`: a closed type, or another set,
+// which the list's later writes join.
+function recFnSetWidens(of: i32, wf: i32): boolean {
+  if (
+    fnTagSetOfTy(of) < 0
+    || wf < 0
+    || wf >= T.tys.length
+    || !(tyAt(wf) is TyFunc)
+  ) {
+    return false
+  }
+  fnTagSetOfTy(wf) >= 0 || !tyHasTyVar(wf) && !tyReachesHole(wf, 8)
 }
 
 // The list a record literal `p` is pushed onto, peeled; else -1.
