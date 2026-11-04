@@ -286,6 +286,7 @@ import { recordRedundantAnnot } from "./check_redundant_annot"
 import {
   assignable,
   bindGenWalk,
+  holeSlotCallRets,
   mintedAnnTy,
   nameToTyAt,
   substTyDeep,
@@ -579,6 +580,13 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     if (initLit is ObjLit || initLit is ArrayLit) && tpEnvNames.length == 0 {
       const none: string[] = []
       bound = letLitListsWidenAt(ix, parenPeelIx(n.letInit), bound, none)
+    } else if initLit is Call && tpEnvNames.length == 0 {
+      // A binding a call initialises holds the records the call returns, so its function fields
+      // take what is written into them too (D15270).
+      const rets: i32[] = []
+      if holeSlotCallRets(initLit, rets) {
+        bound = letCallFieldsWiden(ix, bound, rets)
+      }
     }
     recordCtxTy(n.letInit, bound)
   } else if (
@@ -1933,7 +1941,8 @@ function letLitListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
   // A list of functions below the binding's own value is the leaf `elabFnFieldTy` widens.
   const ea = if ta.aElem >= 0 && ta.aElem < T.tys.length { T.tys[ta.aElem] } else { T.tys[TY_ERR] }
   if ea is TyFunc {
-    return if pre.length > 0 { elabFnFieldTy(bd, pre, t) } else { t }
+    const none: i32[] = []
+    return if pre.length > 0 { elabFnFieldTy(bd, pre, t, none) } else { t }
   }
   const steps: string[] = []
   for st in pre { steps.push(st) }
@@ -1959,6 +1968,34 @@ function letLitListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
 }
 
 // `letFieldListsWiden` for the record literal `lit` of type `t` at field path `pre`.
+// Type `t` of the record a call returns into binding `bd`, each function field widened by
+// `elabFnFieldTy` over the call's returned values `rets` and the writes through `bd`.
+function letCallFieldsWiden(bd: i32, t: i32, rets: i32[]): i32 {
+  if t < 0 || t >= T.tys.length { return t }
+  const to = T.tys[t]
+  if !(to is TyObj) { return t }
+  const tys: i32[] = []
+  let changed = false
+  let i = 0
+  while i < to.objFieldNames.length {
+    let ft = to.objFieldTypes[i]
+    if ft >= 0 && ft < T.tys.length && T.tys[ft] is TyFunc {
+      const steps: string[] = [to.objFieldNames[i]]
+      const w = elabFnFieldTy(bd, steps, ft, rets)
+      if w != ft {
+        ft = w
+        changed = true
+      }
+    }
+    tys.push(ft)
+    i = i + 1
+  }
+  if !changed { return t }
+  const names: string[] = []
+  for nm in to.objFieldNames { names.push(nm) }
+  mkObjTy(names, tys)
+}
+
 function letFieldListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
   if t < 0 || t >= T.tys.length || pre.length > 8 { return t }
   const to = T.tys[t]
@@ -1985,7 +2022,8 @@ function letFieldListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
           w = letFieldListsWidenAt(bd, v, ft, steps)
         } else if ft >= 0 && ft < T.tys.length && T.tys[ft] is TyFunc {
           // A field holding a function takes the functions written into it too (D15119).
-          w = elabFnFieldTy(bd, steps, ft)
+          const none: i32[] = []
+          w = elabFnFieldTy(bd, steps, ft, none)
         }
         if w != ft {
           nodeTySetGrow(v, w)
