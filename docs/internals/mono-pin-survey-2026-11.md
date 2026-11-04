@@ -157,6 +157,51 @@ future readers, alongside group C's. The flow table must not stamp it; that woul
 producer. The probe is `docs/internals/mono-groupd-probe.patch` (apply, build, run under
 `VL_NO_COMPILE_CACHE=1 VL_REP_SHADOW=1`, grep `repAB/gd`).
 
+### Group D on the slot fact (`elabSlotTyAt`), measured 2026-11-04
+
+A non-halting note at mono's four slot-type producers (`monoPinListElems`,
+`monoPinNestedListElems`, `monoPinRecordField`, `monoStoredSlotFnTy`) and its three re-readers
+(`monoPinnedListAnnTy`, `monoCloseRetFnTy`, `monoRetypePinCalls`) put mono's answer beside
+`elabSlotTyAt(holder, path, ctx)`. It ran over the tests and the distilled corpus. Where both
+answer they agreed **141 times, with 0 disagreements**. Mono closed a type the fact did not have
+on 285 calls:
+
+| bucket | calls | owner |
+|---|---|---|
+| the slot's checked type is already closed | 48 | no gap: a reader reads the node's type |
+| generic frames (`elabSlotTyAt` is -1 there) | 51 | (2) per-instance slot facts |
+| an open list, map or record binding with no fact | 88 | below |
+| a bare `TyFunc` binding's own value | 27 | `Fn#d` singleton typing (step 3), not a slot fact |
+| holders that are not a `let` or a function | 48 | not ablated |
+| function results not built from a returned list literal | 19 | (5)/(6), not ablated |
+| annotated `let`s | 4 | |
+
+The 88 are 74 once group C's two producer fixes land. By the producer's first failing step:
+
+| mechanism | calls | |
+|---|---|---|
+| A. a stored value is not a declaration or a name for one | 27 | read it at its own checked type |
+| C. the slot is called only through a binding that reads it | 15 | checker per-slot call notes |
+| B. the slot's writes are not followed | 12 | |
+| E. own calls agree; the result at them fails | 6 | |
+| D. own calls agree; a member is not top-level | 5 | |
+| F. the slot is called at two tuples | 5 | set dispatch (step 4), not a missing fact |
+| G. holder not visited | 3 | |
+| H. a map slot holding stored values | 1 | |
+
+Each PR on these re-sweeps the 74 and reports what remains.
+
+**A, landed.** `elabHeldClosedTyAt` reads a stored value that is not a declaration at its own
+checked type. A closed function type must agree with the slot's signature. An open one adds the
+top-level members of the set it names (`Fn#d`); a lambda member is refused. The 74 fall to **60**,
+and every fact present equals mono's answer. A's 12 that remain are 5 parameters with no set,
+waiting for per-instance facts (2), and 7 module-scope lambdas, waiting for D.
+
+Recorded, not built:
+- **D:** to lift only for a lambda whose enclosing scope is the module.
+- **E, G, H:** folded in when A, B or C touches the same code.
+- **F:** set dispatch (step 4), not a missing fact.
+
 ## Ranking (by callers, then by how much a store would delete)
 1. A (42 call sites over 5 fns): one existing store (elabNodeTyAt), five second producers. Highest count, lowest risk: readers switch, producers delete.
 2. B, monoArgPinTyIx (12): its ladder's rungs are each a fact elab or the checker already has (lit-built, rep row, copy); a per-call-param store would retire the ladder.
