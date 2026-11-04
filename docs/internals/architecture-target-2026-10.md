@@ -968,6 +968,36 @@ pin rule then becomes an elaboration fact mono reads:
 - D6760's un-annotated seed, which waits on this move, since pinning it in mono mints a late
   demand.
 
+**The first slice: a type parameter bound per parameter (D15401).** A type parameter is
+*bare-only* when it appears only as the whole annotation of parameters and of unassigned copies of
+them, and never in the result, another annotation, an `is` or `as`, or type arguments
+(`tyParamIsBareOnly`). The check drops such a type parameter, so each parameter it annotated
+becomes a hole of its own (`tyParamSplitAt`: `f<F>(a: F, c: F)` checks as `f(a, c)`). It does
+this only under two conditions:
+- nothing relates the parameters: each is read only as a callee, as an argument to a hole, or as
+  the seed of an unassigned copy;
+- every call hands them named functions of one signature.
+
+Under those conditions each hole binds what the shared parameter bound at every call. The
+elaboration then keys each parameter apart, and the tag rules see each one as a hole, with no rule
+of their own.
+
+Three things stay on the shared binding:
+- a write that joins two parameters (a `let` seeded from one and assigned the other, D15402);
+- a hand to an annotated parameter;
+- a recursive call that permutes the parameters.
+
+Giving each parameter a fresh type parameter (`f<F, F__1>`) instead of a hole turned three
+handed generics into a refusal, which the hole spelling runs.
+
+The slice deletes no mono rule yet. Measured over the `@run` files, with the split plan on:
+- D6090's keep-own-pin is still reached by D6240's swapped-recursion files. The split cannot take
+  a permuting recursion until D15406 is fixed: a swap of a tagged and an untagged generic is keyed
+  as one instance, and is invalid wasm on master.
+- The set pin through `fnTagOwnTyParamShared` fell from 12 files to 7: written copies, swaps and
+  aliases.
+- The copy pin in `monoLetTyParamMisfit` is still reached by 11 files.
+
 Besides the programs, four kinds of reader ask the plan, and each must lose its question before the files go:
 
 - the checker: the D14439 rule that leaves a choice of names called at two instances untagged because the plan splits it, which is H-choice's mechanism;
