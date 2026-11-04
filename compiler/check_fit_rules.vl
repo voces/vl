@@ -3147,9 +3147,37 @@ export function recLitPlaceBuiltTy(p: i32): i32 {
   const e = if r >= 0 { recHeldElemBuilt(r) } else { -1 }
   if e < 0 { return -1 }
   // A list literal reaches the list's slots only spread into a push, whose elements it holds.
-  if pn is ObjLit { e }
+  if pn is ObjLit || pn is Ident { e }
   else if pn is ArrayLit { mkArrayTy(e) }
   else { -1 }
+}
+
+// Builds the fresh record `const` record literal `l` initialises at the record a read of it is
+// pushed or assigned into, where that place's build is recorded (D15237). Two places at two
+// records each push their demand, and the solve refuses the pair.
+export function recHeldLitPlaceAdopt(l: i32) {
+  cwIxBuild()
+  if l < 0 || l >= cwIxUp.length || cwIxUpKind[l] != CW_UP_LETINIT { return 0 }
+  const d = cwIxUp[l]
+  if recCoalesceHeldLit(d) != l { return 0 }
+  const own = nodeTyIxOf(l)
+  const ats: i32[] = []
+  const reps: i32[] = []
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const u = if cwIxKind[w.row] == CW_OCC_USE { cwIxNode[w.row] } else { -1 }
+    const b = if u >= 0 { recLitPlaceBuiltTy(u) } else { -1 }
+    if b >= 0 && own >= 0 && !tySame(b, own) && tyAt(b) is TyObj {
+      ats.push(u)
+      reps.push(b)
+    }
+  }
+  let i = 0
+  while i < ats.length {
+    recHeldBindAdopt(d, reps[i], ats[i], ats)
+    i = i + 1
+  }
+  0
 }
 
 // The list a record literal `p` is pushed, unshifted or index-stored into, or a list literal `p`
@@ -3233,15 +3261,25 @@ export function recCoalesceLitAdopt(p: i32, rep: i32): boolean {
 export function recCoalesceHeldAdopt(p: i32, rep: i32): boolean {
   const d = recCoalesceHeldOf(p, rep)
   if d < 0 { return false }
+  const pn = nodeAt(p)
+  recHeldBindAdopt(
+    d,
+    rep,
+    p,
+    [p, if pn is BinExpr { cwPeelValue(pn.binRight) } else { -1 }],
+  )
+}
+
+// Builds the fresh record `const` `d` at the record `rep` where `p` delivers it, refusing each
+// delivery of `d` at its own storage outside `skip`, since one record cannot be both.
+function recHeldBindAdopt(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
   recAdPushDecl(d, nodeTyIxOf(recCoalesceHeldLit(d)), rep, false, p)
   // The store column runs after `recKeptConflicts`, so `d`'s own-storage deliveries are refused here,
   // unless `d` is kept, whose deliveries that pass already refused: one refusal per delivery.
   if i32ListHas(recKeptDecl, d) { return true }
-  const pn = nodeAt(p)
-  const dr = if pn is BinExpr { cwPeelValue(pn.binRight) } else { -1 }
   for u in recOwnSrc {
     const pu = cwPeelValue(u)
-    const o = if pu == p || pu == dr || recOwnPinSkip(u) { -1 } else { recFreshOriginDecl(u, 6) }
+    const o = if i32ListHas(skip, pu) || recOwnPinSkip(u) { -1 } else { recFreshOriginDecl(u, 6) }
     if o == d && recArgRepOf(u) < 0 {
       recAdRaising = true
       tErr(recKeptOwnMsg(d, rep, p, false), u)

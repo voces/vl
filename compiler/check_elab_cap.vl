@@ -989,6 +989,120 @@ export function elabFnJoinListTy(j: i32, a: i32, b: i32): i32 {
   mkArrayTy(ne)
 }
 
+// `elabFnJoinTy` through lists and records, for a function's returned values: join `j` of `a`
+// and `b` takes the union of the function sets at every leaf the three share, `j` when none
+// widens (D15209). A list under a record under a list is not joined: no row is built for it.
+export function elabFnJoinDeepTy(j: i32, a: i32, b: i32, rowDepth: i32): i32 {
+  elabFnJoinDeepAt(j, a, b, rowDepth, 0)
+}
+
+// `elabFnJoinDeepTy` at `j`, `shape` saying what holds it: 0 nothing, 1 a list, 2 a record in
+// a list.
+function elabFnJoinDeepAt(j: i32, a: i32, b: i32, depth: i32, shape: i32): i32 {
+  if (
+    depth > 6
+    || j < 0
+    || j >= T.tys.length
+    || a < 0
+    || a >= T.tys.length
+    || b < 0
+    || b >= T.tys.length
+  ) {
+    return j
+  }
+  const jt = T.tys[j]
+  const at = T.tys[a]
+  const bt = T.tys[b]
+  match jt {
+    TyFunc => {
+      return elabFnJoinTy(j, a, b)
+    }
+    TyArray => {
+      if !(at is TyArray) || !(bt is TyArray) || shape == 2 { return j }
+      const ne = elabFnJoinDeepAt(jt.aElem, at.aElem, bt.aElem, depth + 1, 1)
+      return if ne == jt.aElem { j } else { mkArrayTy(ne) }
+    }
+    TyObj => {
+      if !(at is TyObj) || !(bt is TyObj) { return j }
+      const n = jt.objFieldNames.length
+      if at.objFieldNames.length != n || bt.objFieldNames.length != n {
+        return j
+      }
+      const tys: i32[] = []
+      let changed = false
+      let i = 0
+      while i < n {
+        const nm = jt.objFieldNames[i]
+        if at.objFieldNames[i] != nm || bt.objFieldNames[i] != nm { return j }
+        const f = jt.objFieldTypes[i]
+        const w = elabFnJoinDeepAt(
+          f,
+          at.objFieldTypes[i],
+          bt.objFieldTypes[i],
+          depth + 1,
+          if shape >= 1 { 2 } else { 0 },
+        )
+        if w != f { changed = true }
+        tys.push(w)
+        i = i + 1
+      }
+      if !changed { return j }
+      const names: string[] = []
+      for nm in jt.objFieldNames { names.push(nm) }
+      return mkObjTy(names, tys)
+    }
+    // No other kind holds a function at a place both sides share.
+    TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyMap => {
+      return j
+    }
+  }
+}
+
+// Whether `dst` holds, at some place `own` shares through lists and records, a function set
+// other than `own`'s there, so a value of `own` delivered to `dst` takes `dst`'s sets (D15209).
+export function elabFnSetsWiden(own: i32, dst: i32, depth: i32): boolean {
+  if (
+    depth > 6
+    || own < 0
+    || own >= T.tys.length
+    || dst < 0
+    || dst >= T.tys.length
+  ) {
+    return false
+  }
+  const ot = T.tys[own]
+  const dt = T.tys[dst]
+  match dt {
+    TyFunc => {
+      return ot is TyFunc
+        && (elabFnSetTy[dst] ?? -1) != (elabFnSetTy[own] ?? -1)
+    }
+    TyArray => {
+      return ot is TyArray && elabFnSetsWiden(ot.aElem, dt.aElem, depth + 1)
+    }
+    TyObj => {
+      if !(ot is TyObj) || ot.objFieldNames.length != dt.objFieldNames.length {
+        return false
+      }
+      let i = 0
+      while i < dt.objFieldNames.length {
+        if (
+          ot.objFieldNames[i] == dt.objFieldNames[i]
+          && elabFnSetsWiden(ot.objFieldTypes[i], dt.objFieldTypes[i], depth + 1)
+        ) {
+          return true
+        }
+        i = i + 1
+      }
+      return false
+    }
+    // No other kind holds a function at a place both sides share.
+    TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyMap => {
+      return false
+    }
+  }
+}
+
 // The set of every function the `let` node `bd` may hold: its initialiser and each value its
 // own scope writes to it, read from the source; -1 when one is not a function.
 function fnLetSetOf(bd: i32): i32 {
