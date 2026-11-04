@@ -4525,7 +4525,17 @@ function elabResMayHold(d: i32): boolean {
     return false
   }
   const pd = identDeclOf(v)
-  pd >= 0 && pd < P.nodes.length && nodeAt(pd) is Param
+  if pd < 0 || pd >= P.nodes.length { return false }
+  nodeAt(pd) is Param || elabResCallHolder(pd)
+}
+
+// Whether declaration `d` is a binding initialised by a call that can return a record.
+function elabResCallHolder(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letInit < 0 { return false }
+  const v = parenPeelIx(n.letInit)
+  v >= 0 && v < P.nodes.length && elabResMayReturnRecord(v)
 }
 
 // Whether call `v` can return a record: its callee names a function with no return annotation,
@@ -4746,10 +4756,12 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
   const through = elabResThrough.get(h) ?? []
   const hands = elabResHands.get(h) ?? []
   const rets = elabResRets.get(h) ?? []
+  const copies = if c >= 0 { elabResCopies.get(h) ?? [] } else { [] }
   const reads = through.length
     + hands.length / 2
     + elabResWriteReads(h)
     + rets.length
+    + copies.length
   if (
     reads != (elabResReads.get(h) ?? 0)
     || !elabHolderWritesAgree(h, from, rec)
@@ -4757,8 +4769,9 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
     return 0
   }
   if rets.length > 0 && !elabHolderCanHoldReturned(h, from, rec) { return 0 }
+  if copies.length > 0 && !elabHolderCopiesHold(h, copies, rec) { return 0 }
   const ms: i32[] = []
-  let two = hands.length > 0 || c < 0 || rets.length > 0
+  let two = hands.length > 0 || c < 0 || rets.length > 0 || copies.length > 0
   for t in through {
     const m = elabCallSigMember(t, rec)
     if m < 0 { return 0 }
@@ -4779,6 +4792,13 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
   const at = elabRecTable.length - 1
   elabTriplePut(elabHolderRecs, h, from, at)
   if c >= 0 { elabTriplePut(elabResKeeps, c, from, 1) }
+  // Each copy holds the same record, and each call through it takes its member.
+  for w in copies {
+    elabTriplePut(elabHolderRecs, w, from, at)
+    for t in elabResThrough.get(w) ?? [] {
+      elabTriplePut(elabThroughMembers, t, from, elabCallSigMember(t, rec))
+    }
+  }
   let i = 0
   while i < through.length {
     elabTriplePut(elabThroughMembers, through[i], from, ms[i])
@@ -4822,6 +4842,28 @@ function elabHolderCanHoldReturned(h: i32, from: i32, rec: i32[]): boolean {
   for t in through {
     if elabEnclosingFn(t) != fd || elabCallSigMember(t, rec) < 0 {
       return false
+    }
+  }
+  true
+}
+
+// Whether every copy in `copies` of holder `h` can hold record `rec`: it is read only by calls
+// through it at the record's signatures, in the function declaring `h`. Pure, so the holder and
+// its copies are recorded together or not at all.
+function elabHolderCopiesHold(h: i32, copies: i32[], rec: i32[]): boolean {
+  const fd = elabEnclosingFn(h)
+  for w in copies {
+    const through = elabResThrough.get(w) ?? []
+    if (
+      elabEnclosingFn(w) != fd
+      || through.length != (elabResReads.get(w) ?? 0)
+    ) {
+      return false
+    }
+    for t in through {
+      if elabEnclosingFn(t) != fd || elabCallSigMember(t, rec) < 0 {
+        return false
+      }
     }
   }
   true
@@ -9279,6 +9321,19 @@ function elabParamTyOf(k: i32, i: i32): i32 {
   const pt = nodeTyIxOf(dn.fnParams[i])
   if pt < 0 { return -1 }
   elabOutTy(substTyDeep(pt, ekNames[k], ekTys[k]), k)
+}
+
+// The type the instance call `ix` reaches binds its parameter `i` to, holes and sets kept, -1
+// where the call reaches no instance.
+export function elabCallParamBoundTy(ix: i32, i: i32): i32 {
+  const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const k = elabCallInstFrom(ix, from)
+  if k < 0 { return -1 }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || i >= dn.fnParams.length { return -1 }
+  const pt = nodeTyIxOf(dn.fnParams[i])
+  if pt < 0 { return -1 }
+  substTyDeep(pt, ekNames[k], ekTys[k])
 }
 
 // The instance call `ix` reaches from instance `from`'s body (the root when -1), or -1.

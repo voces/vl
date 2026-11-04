@@ -17,6 +17,7 @@ import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftOwnTyParamHandedBack, ftOwnTyParamSharedBack } from "./check_fn_tag"
+import { elabCallParamBoundTy } from "./emit_elab"
 import {
   mkNumTyped,
   narrowedFromTyCopy,
@@ -710,6 +711,7 @@ import {
   buildFnMap,
   buildFnMapNoteFnSlotWrite,
   buildFnMapNoteFnStmtWrite,
+  collectFnTagMapReadBox,
   registerInlineUnionOfTy,
   registerTyReachUnions,
 } from "./emit_collect"
@@ -8858,6 +8860,17 @@ function monoPinMemberCall(
       nodeTyRecord(prIx, precvTy)
       const pmg = mkIndex(prIx, nargs[0], n.pos)
       nodeTyCarry(pmg, ix)
+      // A map of a tagged set's ids reads `F | null` at the pinned map's value, not the call's
+      // open type, so the read is boxed as the id it is.
+      if monoTagMapTy(precvTy) {
+        const pm = tyAt(precvTy)
+        if pm is TyMap {
+          nodeTyRecord(pmg, mkNullableTy(pm.mVal))
+          // The collect pass that boxes a function map's read (D15139) has run; this read is
+          // minted after it, so it asks for its box itself.
+          collectFnTagMapReadBox(pmg)
+        }
+      }
       return pmg
     }
   }
@@ -9589,6 +9602,11 @@ function monoSetPinDiscrim(tyIx: i32): string {
     t = a.aElem
     depth = depth + 1
   }
+  // A map of the set's ids keys by the set as a list of them does.
+  if depth == 0 && t >= 0 && t < T.tys.length && monoTagMapTy(t) {
+    const mm = tyAt(t)
+    if mm is TyMap { return "#set" + i32ToStr(fnTagSetOfTy(mm.mVal)) + "{}" }
+  }
   if depth == 0 || !fnTagTyIsTagged(t) { return "" }
   "#set" + i32ToStr(fnTagSetOfTy(t)) + sfx
 }
@@ -9608,8 +9626,45 @@ function monoArgTaggedSetTy(ax: i32): i32 {
   if fnTagTyIsTagged(t) || fnTagListTy(t) { return t }
   // A parameter handed on holds the set its instance binds it to.
   const it = elabWalkTy(x)
-  if it >= 0 && (fnTagTyIsTagged(it) || fnTagListTy(it)) { return it }
+  if it >= 0 && (fnTagTyIsTagged(it) || fnTagListTy(it) || monoTagMapTy(it)) {
+    return it
+  }
   -1
+}
+
+// Whether the elaboration's binding `bt` of a hole is a closed type other than `i32`, which the
+// rep cascade's `i32` floor would pin wrongly.
+function monoFloorDisagrees(bt: i32): boolean {
+  if bt < 0 || bt >= T.tys.length || tyHasTyVar(bt) || tyReachesHole(bt, 16) {
+    return false
+  }
+  !tySame(bt, TY_I32)
+}
+
+// The spelling of the map of ids a map `t` of a tagged set is stored as.
+function monoTagMapRepName(t: i32): string {
+  if t < 0 || t >= T.tys.length { return "" }
+  const m = tyAt(t)
+  if !(m is TyMap) { return "" }
+  "{[" + tyToStr(m.mKey) + "]: i32}"
+}
+
+// The type of argument `ax` where it is a tagged function set's value itself, else -1.
+function monoArgTaggedFnTy(ax: i32): i32 {
+  const x = unwrapParen(ax)
+  if x < 0 { return -1 }
+  const t = nodeTyIxOf(x)
+  if fnTagTyIsTagged(t) { return t }
+  const it = elabWalkTy(x)
+  if it >= 0 && fnTagTyIsTagged(it) { return it }
+  -1
+}
+
+// Whether `t` is a map whose values are a tagged set's ids.
+function monoTagMapTy(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const m = tyAt(t)
+  m is TyMap && fnTagTyIsTagged(m.mVal)
 }
 
 // The registry name of pinned type `st`'s box: its emitter spelling, canon'd as a union name.
@@ -10446,8 +10501,9 @@ function monoMakeInstanceParams(
           if pinTys[pj] >= 0 { monoParamPinTy.set(nt, pinTys[pj]) }
           synthed = true
         }
-      } else if fnTagTyIsTagged(pinTys[pj]) {
-        // A tagged set's parameter is the set itself, not a closure of its signature.
+      } else if fnTagTyIsTagged(pinTys[pj]) || monoTagMapTy(pinTys[pj]) {
+        // A tagged set's parameter is the set itself, not a closure of its signature; a map of
+        // its ids is that map.
         nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
         synthed = true
       } else if annotateI32 || pinned[pj] != "i32" {
@@ -23063,57 +23119,21 @@ function monoTyFillHoles(t: i32, fill: i32, depth: i32): i32 {
   }
 }
 
-// Instances, for a call through field `f` of a record literal no binding holds (`{ f: g, n: 1 }.f(x)`),
-// the un-annotated function the field names at the field's type in the record the literal is built
-// at (`nodeRepTyIxOf`), where that type is closed: no binding's reads pin it (D15206).
+// Coerces the called field of a record literal no binding holds (`{ f: g, n: 1 }.f(x)`) at the
+// signature the elaboration stamps that field's value with, so each literal gets its own (D15113).
 function monoPinLitFieldCall(c: Call, ctx: i32): i32 {
   if c.callFn < 0 || c.callFn >= P.nodes.length { return 0 }
   const cf = nodeAt(c.callFn)
   if !(cf is Member) { return 0 }
   const ox = unwrapParen(cf.memObj)
-  if ox < 0 || !(nodeAt(ox) is ObjLit) { return 0 }
+  if ox < 0 { return 0 }
   const lit = nodeAt(ox)
-  const rt = nodeRepTyIxOf(ox)
-  const ro = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
-  if !(lit is ObjLit) || !(ro is TyObj) { return 0 }
-  let ft = -1
-  let i = 0
-  while i < ro.objFieldNames.length && i < ro.objFieldTypes.length {
-    if ro.objFieldNames[i] == cf.memProp { ft = ro.objFieldTypes[i] }
-    i = i + 1
-  }
-  const fty = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
-  if (
-    !(fty is TyFunc)
-    || tyHasTyVar(ft)
-    || fty.fnParamTypes.length != c.callArgs.length
-  ) {
-    return 0
-  }
-  // The row is the call's own signature only where it takes the call's arguments as checked: two
-  // literals of one shape may share a row built at another call's types (D15113).
-  let k = 0
-  while k < c.callArgs.length {
-    if !tySame(widenLitTy(nodeTyIxOf(c.callArgs[k])), fty.fnParamTypes[k]) {
-      return 0
-    }
-    k = k + 1
-  }
+  if !(lit is ObjLit) { return 0 }
   for fx in lit.objFields {
     const f = nodeAt(fx)
     if f is FieldInit && f.fiName == cf.memProp {
-      const vx = unwrapParen(f.fiValue)
-      const d = if vx >= 0 && nodeAt(vx) is Ident { identDeclOf(vx) } else { -1 }
-      const fe = if d >= 0 && nodeAt(d) is FuncDecl { fnStmtsPosOf(d) } else { -1 }
-      if fe >= 0 && fnHasUnannotatedParam(fe) {
-        return monoCoerceFnValueTys(
-          f.fiValue,
-          monoConcreteFnTyName(ft),
-          ctx,
-          ft,
-          fty.fnParamTypes,
-        )
-      }
+      const path: string[] = ["f." + f.fiName]
+      return monoCoerceLitPart(f.fiValue, ox, path, ctx)
     }
   }
   0
@@ -24021,11 +24041,13 @@ function monoPinHoleParam(
   // the callee only calls, is a closure taking that parameter's bundle.
   const cbun = monoClosureBundlePin(fn, params[i], args[i], ctx, pinned, pinTys)
   if cbun != 1 { return cbun }
-  // A tagged function set is handed on as itself: the instance calls each member directly.
-  const setTy = monoArgTaggedSetTy(args[i])
+  // A list or map of a tagged set's ids is handed on as the elaboration binds the hole, pinned
+  // by the i32 list or map it is stored as; a tagged function value itself, by the argument's
+  // own type, since the hole's binding names the set where the call delivers a closure.
+  const bound = elabCallParamBoundTy(monoCallTplOf(callIx), i)
+  const setTy = if fnTagListTy(bound) || monoTagMapTy(bound) { bound } else { monoArgTaggedFnTy(args[i]) }
   if setTy >= 0 {
-    // A list of the set's ids is pinned by the i32 list it is stored as.
-    const rn = fnTagListRepName(setTy)
+    const rn = if monoTagMapTy(setTy) { monoTagMapRepName(setTy) } else { fnTagListRepName(setTy) }
     pinned.push(if rn != "" { rn } else { tyToStr(setTy) })
     pinTys.push(setTy)
     return 0
@@ -24118,6 +24140,19 @@ function monoPinHoleParam(
   if an == "" {
     // Kept for an argument the elaboration leaves open at this call.
     an = monoArgPinName(args[i], ctx)
+    // The rep cascade's `i32` floor is not a pin for a hole the elaboration binds to another
+    // closed type: that demand would key an instance no call has.
+    if an == "i32" && monoFloorDisagrees(setTy) {
+      return emitFailAt(
+        "emitProgram: internal: parameter `"
+          + p.parName
+          + "` of `"
+          + fn.fnName
+          + "` would be pinned at the `i32` floor, but the elaboration binds it to "
+          + tyToStr(setTy),
+        args[i],
+      )
+    }
     // The rep cascade's `i32` floor is a guess for a value the checker left open: it pins at
     // the type this frame's instance closes it to, or the elaboration's, or not at all.
     const openTy = if an == "i32" { monoArgOpenValueTy(args[i], ctx, et) } else { 0 - 2 }
