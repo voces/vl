@@ -198,7 +198,9 @@ and every fact present equals mono's answer. A's 12 that remain are 5 parameters
 waiting for per-instance facts (2), and 7 module-scope lambdas, waiting for D.
 
 Recorded, not built:
-- **D:** to lift only for a lambda whose enclosing scope is the module.
+- **D, landed:** `elabTopFn` admits a lambda whose enclosing scope is the module, with no
+  function, block or loop around it, so it captures no local. With C1 in, the 57 fall to **51**,
+  all EQ. Still refused: 7 nested or capturing lambdas.
 - **E, G, H:** folded in when A, B or C touches the same code.
 - **F:** set dispatch (step 4), not a missing fact.
 
