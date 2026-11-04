@@ -817,13 +817,38 @@ export function elabFnSetMembers(): i32[] {
 }
 // `elabFnSetMembers` less a function every set of which holds it alone: one a binding holds by
 // itself and calls.
-export function elabFnSetMembersShared(): i32[] {
+function elabFnSetMembersShared(): i32[] {
   const out: i32[] = fnValGenerics.slice(0, fnValGenerics.length)
   for ms in fnSets {
     if ms.length < 2 { continue }
     for m in ms {
       if !i32ListHas(out, m) { out.push(m) }
     }
+  }
+  out
+}
+// `elabFnSetMembersShared` less a function no untagged set called through holds: a call through
+// a tagged set dispatches at that call, so each instance of the member takes its own arm.
+export function elabFnSetMembersUntagged(): i32[] {
+  const called: i32[] = []
+  for c in fnTagCallIxs {
+    const s = fnTagCallSet[c] ?? -1
+    if (
+      s >= 0
+      && s < fnSets.length
+      && !(fnTagged[s] ?? false)
+      && !i32ListHas(called, s)
+    ) {
+      called.push(s)
+    }
+  }
+  const out: i32[] = []
+  for m in elabFnSetMembersShared() {
+    let open = i32ListHas(fnValGenerics, m)
+    for s in called {
+      if i32ListHas(fnSets[s], m) { open = true }
+    }
+    if open { out.push(m) }
   }
   out
 }
@@ -1014,6 +1039,18 @@ export function elabFnArmJoinNote(j: i32, a: i32, b: i32) {
   elabFnArmJoinAt(j, a, b, 0, false)
 }
 
+// `elabFnArmJoinNote` for a function's returned values, `a` and `b` joined to `j`. Each returned
+// literal is built at the function's result row, so a list a returned record holds is noted
+// too (D15366).
+export function elabFnRetJoinNote(j: i32, a: i32, b: i32) {
+  elabFnJoinRecLists = true
+  elabFnArmJoinAt(j, a, b, 0, false)
+  elabFnJoinRecLists = false
+}
+
+// Whether the join note in progress is a return's, whose records' lists are noted too.
+let elabFnJoinRecLists = false
+
 function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
   if (
     depth > 6
@@ -1062,10 +1099,39 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
       }
       return 0
     }
-    TyArray | TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyMap => {
+    // A list of functions, at any depth of lists, holds each side's ids at the join's set, as a
+    // record field does (D15227). One an arm's record holds, and a list of records, is built at
+    // that record's own row and is not noted (D15290, D15303); a returned one is (D15366).
+    TyArray => {
+      if (
+        inRec && !elabFnJoinRecLists
+        || !(at is TyArray)
+        || !(bt is TyArray)
+        || !elabListLeafIsFn(j, 6)
+      ) {
+        return 0
+      }
+      const inner = jt.aElem >= 0
+        && jt.aElem < T.tys.length
+        && T.tys[jt.aElem] is TyFunc
+      elabFnArmJoinAt(jt.aElem, at.aElem, bt.aElem, depth + 1, inner)
+      return 0
+    }
+    TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyMap => {
       return 0
     }
   }
+}
+
+// Whether list type `t`'s elements, through at most `depth` nested lists, are functions.
+function elabListLeafIsFn(t: i32, depth: i32): boolean {
+  if depth <= 0 || t < 0 || t >= T.tys.length { return false }
+  const tt = T.tys[t]
+  if !(tt is TyArray) { return false }
+  const e = tt.aElem
+  if e < 0 || e >= T.tys.length { return false }
+  if T.tys[e] is TyFunc { return true }
+  elabListLeafIsFn(e, depth - 1)
 }
 
 // `elabFnJoinDeepTy` at `j`, `shape` saying what holds it: 0 nothing, 1 a list, 2 a record in
@@ -2090,6 +2156,17 @@ export function fnSlotCallNote(holder: i32, path: string[], args: i32[]) {
   const tup: i32[] = []
   for a in args { tup.push(if a >= 0 && !tyHasTyVar(a) { a } else { -1 }) }
   fnSlotCallArgs[at].push(tup)
+  // An instance's re-check notes the call again under that instance's key.
+  if elabCapLive() && elabCapKey >= 0 {
+    const kk = key + "#" + i32ToStr(elabCapKey)
+    let ka = fnSlotCallAt[kk] ?? -1
+    if ka < 0 {
+      fnSlotCallArgs.push([])
+      ka = fnSlotCallArgs.length - 1
+      fnSlotCallAt[kk] = ka
+    }
+    fnSlotCallArgs[ka].push(tup)
+  }
   0
 }
 
@@ -2102,8 +2179,15 @@ function fnSlotKey(holder: i32, path: string[]): string {
 // The one tuple of closed argument types every call reading its callee from slot `path` of
 // `holder` is made at; empty when none is, two differ, or one is open.
 export function fnSlotCallArgsOf(holder: i32, path: string[]): i32[] {
+  fnSlotCallArgsAt(holder, path, -1)
+}
+
+// `fnSlotCallArgsOf` over the calls instance `k`'s re-check noted (-1: every call, unkeyed).
+export function fnSlotCallArgsAt(holder: i32, path: string[], k: i32): i32[] {
   const none: i32[] = []
-  const at = fnSlotCallAt[fnSlotKey(holder, path)] ?? -1
+  const key = fnSlotKey(holder, path)
+    + (if k >= 0 { "#" + i32ToStr(k) } else { "" })
+  const at = fnSlotCallAt[key] ?? -1
   if at < 0 { return none }
   let one: i32[] = []
   let have = false
