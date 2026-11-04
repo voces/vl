@@ -364,5 +364,23 @@ Each slice is graded on every hard control above, with the split plan on and off
    D15103, a delivery at a type that differs per instance (`ftCtxOk`). Writing 4b-i's escape control
    found D15110, a returned per-instance lambda that runs at the first instance's type.
 
+   4b-ii, planned (2026-11-04, lane LWM). The witness is D15436: `let d1 = (y) => y` and a peer,
+   in an instanced body, `d1` written from a nested `function w1() { d1 = d1 }` and called at two
+   types. The decline is `ftInstLeafOk`'s `c == b && inFn`: a write from a nested function may run
+   outside the instance. The fact it needs is the elaboration's, per capture cell: the writing
+   function is declared in the same instanced body and is never itself a value that leaves it (not
+   returned, stored or handed on), so the cell, the id written into it and every call through it
+   stay in one instance. The elaboration already keys a nested declaration per encloser instance
+   (slice 3, `elabMintHandedNested` / `elabNestNote`), so the fact is a per-key flag the
+   elaboration sets where it mints that nested copy (`elabCellLocal`), not a syntactic scan here.
+   Reader: `ftInstLeafOk` takes a nested write when the flag holds, in place of refusing every
+   nested write. Deletion: with the cell's id dispatched per instance, `monoBindingAtPin`'s
+   per-binding signature count (`monoDeclPathPins`, `monoDeclLivePathPins`, `monoBindSigFail` at
+   that call) has no binding of a tagged lambda set left to count under a cell; the count goes with
+   its last reader, and the pin-helper baseline is lowered in the same PR. D15434 (the `const`
+   spelling) was clause 1 until 4b-i admitted a `const` seed of a captured `let` as the `let`
+   spelling (#6330's `ftConstSeedsCell`); both spellings now run with the split plan on and refuse
+   loudly with it off, and both close with 4b-ii.
+
 **Out of scope.** Sets whose identity varies per instance and escapes the instance; those stay
 closures. A per-instance `fnTagBind` (#6000), which no witness needs yet.
