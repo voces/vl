@@ -74,12 +74,15 @@ import {
   CW_UP_ARG,
   cwBindingWrittenValues,
   cwIxBuild,
+  cwIxCovers,
   cwIxKind,
   cwIxNode,
+  cwIxParent,
   cwIxUp,
   cwIxUpKind,
   cwIxWant,
   cwLetUnwritten,
+  cwLetWrittenInClosure,
   cwOccNext,
   cwOccWalk,
   cwOccWalkSpelled,
@@ -2558,13 +2561,14 @@ function ftInstLeafReadOk(r: i32, p: i32, inFn: boolean): boolean {
 }
 
 // Whether lambda `x` is the value its parent `p` writes into a binding: a `let`'s initialiser or
-// a store's right side, so the binding's reads are the only names it has.
+// a store's right side, so the binding's reads are the only names it has. A `const`'s counts where
+// it seeds a `let` a nested function writes, whose cell the lambda is a peer of (D15435).
 function ftWrittenAt(x: i32, p: i32): boolean {
   if p < 0 || p >= P.nodes.length { return false }
   const pn = nodeAt(p)
   match pn {
     LetDecl => {
-      return pn.letKw == "let" && pn.letInit == x
+      return pn.letInit == x && (pn.letKw == "let" || ftConstSeedsCell(p))
     }
     BinExpr => {
       return ftIsStore(pn) && pn.binRight == x
@@ -3719,7 +3723,7 @@ function ftLitBuiltAt(x: i32): i32 {
   const r = recAsgFnWidenedTy(x)
   if r >= 0 { return r }
   cwIxBuild()
-  if x < 0 || x >= cwIxUp.length || cwIxUpKind[x] != CW_UP_ARG { return -1 }
+  if x < 0 || !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_ARG { return -1 }
   const c = nodeAt(cwIxUp[x])
   const f = if c is Call && c.callFn >= 0 { nodeAt(parenPeelIx(c.callFn)) } else { null }
   if !(f is Member) || f.memProp != "push" { return -1 }
@@ -3934,4 +3938,25 @@ function ftNamedCallOf(x: i32): boolean {
   const d = ftNamedFn(parenPeelIx(c.callFn))
   const f = if d >= 0 { nodeAt(d) } else { null }
   f is FuncDecl && f.fnTyParams.length == 0 && !ftOpenFn(d)
+}
+
+// Whether some read of the `const` declared at `c` is the initialiser of a `let` written from
+// another function than the one declaring it.
+function ftConstSeedsCell(c: i32): boolean {
+  cwIxWant()
+  const ow = cwOccWalk(c)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    const q = if cwIxKind[ow.row] == CW_OCC_USE && u >= 0 && u < cwIxParent.length { cwIxParent[u] } else { -1 }
+    const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
+    if (
+      qn is LetDecl
+      && qn.letKw == "let"
+      && parenPeelIx(qn.letInit) == u
+      && cwLetWrittenInClosure(q)
+    ) {
+      return true
+    }
+  }
+  false
 }
