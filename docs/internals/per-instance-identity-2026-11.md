@@ -378,7 +378,16 @@ Each slice is graded on every hard control above, with the split plan on and off
    decision's (`fnTagRedecide`). Deletion candidate: `monoBindingAtPin`'s live-pin retry
    (`monoDeclLivePathPins`, its one caller) and the `monoBindSigFail` behind it, once a census over
    `tests/` shows no untagged binding reaching two live pins there; `monoDeclPathPins` itself has
-   other callers and stays. The pin-helper baseline is lowered in the PR that deletes them. D15434 (the `const`
+   other callers and stays. The pin-helper baseline is lowered in the PR that deletes them.
+   Measured before building the fact: admitting D15436 in `ftInstLeafOk` takes three things:
+   - a call-only nested writer (`elabEncl`);
+   - a self-write;
+   - a copy into a `let` of the same body.
+   That tags the set and builds invalid wasm in both plan states, because each instance's capture
+   cell is still built at the closure type. So 4b-ii is two steps, in this order. First, the cell's
+   element is built at the instance's rep for a tagged set (the emitter's cell, read per instance).
+   Second, the decision's admission. The first step alone moves nothing, so it is graded by the byte
+   sweep at 0 movers. D15434 (the `const`
    spelling) was clause 1 until 4b-i admitted a `const` seed of a captured `let` as the `let`
    spelling (#6330's `ftConstSeedsCell`); both spellings now run with the split plan on and refuse
    loudly with it off, and both close with 4b-ii.
