@@ -17,6 +17,7 @@ import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftOwnTyParamHandedBack, ftOwnTyParamSharedBack } from "./check_fn_tag"
+import { elabCallParamBoundTy } from "./emit_elab"
 import {
   mkNumTyped,
   narrowedFromTyCopy,
@@ -8857,6 +8858,12 @@ function monoPinMemberCall(
       nodeTyRecord(prIx, precvTy)
       const pmg = mkIndex(prIx, nargs[0], n.pos)
       nodeTyCarry(pmg, ix)
+      // A map of a tagged set's ids reads `F | null` at the pinned map's value, not the call's
+      // open type, so the read is boxed as the id it is.
+      if monoTagMapTy(precvTy) {
+        const pm = tyAt(precvTy)
+        if pm is TyMap { nodeTyRecord(pmg, mkNullableTy(pm.mVal)) }
+      }
       return pmg
     }
   }
@@ -9609,13 +9616,22 @@ function monoArgTaggedSetTy(ax: i32): i32 {
   const x = unwrapParen(ax)
   if x < 0 { return -1 }
   const t = nodeTyIxOf(x)
-  if fnTagTyIsTagged(t) || fnTagListTy(t) || monoTagMapTy(t) { return t }
+  if fnTagTyIsTagged(t) || fnTagListTy(t) { return t }
   // A parameter handed on holds the set its instance binds it to.
   const it = elabWalkTy(x)
   if it >= 0 && (fnTagTyIsTagged(it) || fnTagListTy(it) || monoTagMapTy(it)) {
     return it
   }
   -1
+}
+
+// Whether the elaboration's binding `bt` of a hole is a closed type other than `i32`, which the
+// rep cascade's `i32` floor would pin wrongly.
+function monoFloorDisagrees(bt: i32): boolean {
+  if bt < 0 || bt >= T.tys.length || tyHasTyVar(bt) || tyReachesHole(bt, 16) {
+    return false
+  }
+  !tySame(bt, TY_I32)
 }
 
 // The spelling of the map of ids a map `t` of a tagged set is stored as.
@@ -23986,10 +24002,11 @@ function monoPinHoleParam(
   // the callee only calls, is a closure taking that parameter's bundle.
   const cbun = monoClosureBundlePin(fn, params[i], args[i], ctx, pinned, pinTys)
   if cbun != 1 { return cbun }
-  // A tagged function set is handed on as itself: the instance calls each member directly.
-  const setTy = monoArgTaggedSetTy(args[i])
-  if setTy >= 0 {
-    // A list or map of the set's ids is pinned by the i32 list or map it is stored as.
+  // A tagged function set, or a list or map of its ids, is handed on as the elaboration binds
+  // the hole: the instance calls each member directly, and the container is pinned by the i32
+  // list or map it is stored as.
+  const setTy = elabCallParamBoundTy(monoCallTplOf(callIx), i)
+  if fnTagTyIsTagged(setTy) || fnTagListTy(setTy) || monoTagMapTy(setTy) {
     const rn = if monoTagMapTy(setTy) { monoTagMapRepName(setTy) } else { fnTagListRepName(setTy) }
     pinned.push(if rn != "" { rn } else { tyToStr(setTy) })
     pinTys.push(setTy)
@@ -24083,6 +24100,19 @@ function monoPinHoleParam(
   if an == "" {
     // Kept for an argument the elaboration leaves open at this call.
     an = monoArgPinName(args[i], ctx)
+    // The rep cascade's `i32` floor is not a pin for a hole the elaboration binds to another
+    // closed type: that demand would key an instance no call has.
+    if an == "i32" && monoFloorDisagrees(setTy) {
+      return emitFailAt(
+        "emitProgram: internal: parameter `"
+          + p.parName
+          + "` of `"
+          + fn.fnName
+          + "` would be pinned at the `i32` floor, but the elaboration binds it to "
+          + tyToStr(setTy),
+        args[i],
+      )
+    }
     // The rep cascade's `i32` floor is a guess for a value the checker left open: it pins at
     // the type this frame's instance closes it to, or the elaboration's, or not at all.
     const openTy = if an == "i32" { monoArgOpenValueTy(args[i], ctx, et) } else { 0 - 2 }
