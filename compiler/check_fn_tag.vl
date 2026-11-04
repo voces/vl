@@ -102,7 +102,12 @@ import {
 import { parenPeelIx } from "./check_places"
 import { nonNullTy, tyHasTyVar, tyReachesHole } from "./tyquery"
 import { lpExitsOf } from "./check_if_value"
-import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
+import {
+  i32ListHas,
+  i32ListIndexOf,
+  strListHas,
+  strListIndexOf,
+} from "./listutil"
 import {
   mintAliasHas,
   mintCallSoleSet,
@@ -135,6 +140,7 @@ import { identFnDeclOf } from "./check_scopes"
 import { declIsExportedFn } from "./check_exp_obs"
 import {
   coerceRecordOpen,
+  elabFnFieldWidenedAny,
   elabFnIdOf,
   elabLiveTyOf,
   elabMakerRowHas,
@@ -1262,6 +1268,21 @@ function ftScan(
           }
         }
       }
+      // A record written whole into a binding the field widener widened stores ids at its fields;
+      // the store column builds the literal at the binding's row (D15306). Only a binding: no
+      // producer builds a literal written into a field or element slot at the slot's row.
+      const rw = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+      if (
+        ftHolds(x, s)
+        && nodeAt(x) is Ident
+        && elabFnFieldWidenedAny(identDeclOf(x))
+        && rw is BinExpr
+        && ftIsStore(rw)
+        && rw.binLeft == x
+        && !ftRecWriteJoins(rw.binRight, nodeTyIxOf(x), s, ds, leaves, ids, 0)
+      ) {
+        return false
+      }
       // A written slot of a holder of the set's ids stores an id of it, whatever type the slot
       // read had before the holder's first write pinned it.
       const st = ftSlotStoreTy(x, p, s)
@@ -1954,6 +1975,48 @@ function ftJoinOk(
   ids: i32[],
 ): boolean {
   ftJoinAt(x, nodeTyIxOf(x), s, ds, leaves, ids)
+}
+
+// `ftJoinAt` over each field of the record literal `lit` stored as `dst`, a record holding set
+// `s`: a field `dst` types at `s` joins there, a nested literal at its own field. True when `lit`
+// is no literal.
+function ftRecWriteJoins(
+  lit: i32,
+  dst: i32,
+  s: i32,
+  ds: i32[],
+  leaves: i32[],
+  ids: i32[],
+  depth: i32,
+): boolean {
+  const lx = parenPeelIx(lit)
+  const ln = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  if (
+    !(ln is ObjLit)
+    || depth > FT_HOLD_DEPTH
+    || dst < 0
+    || dst >= T.tys.length
+  ) {
+    return true
+  }
+  const dt = tyAt(dst)
+  if !(dt is TyObj) { return true }
+  for fx in ln.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit {
+      const fi = strListIndexOf(dt.objFieldNames, f.fiName)
+      const ft = if fi >= 0 { dt.objFieldTypes[fi] } else { -1 }
+      if ft >= 0 && fnTagSetOfTy(ft) == s {
+        if !ftJoinAt(f.fiValue, ft, s, ds, leaves, ids) { return false }
+      } else if (
+        ft >= 0
+        && !ftRecWriteJoins(f.fiValue, ft, s, ds, leaves, ids, depth + 1)
+      ) {
+        return false
+      }
+    }
+  }
+  true
 }
 
 // `ftJoinOk` over the value `x` a node of type `t` takes: each nested join not yet of set `s`
