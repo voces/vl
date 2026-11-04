@@ -210,6 +210,7 @@ import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
 import { narrowedFromTyOf, nodeTyIxOf } from "./check_node_tys"
 import {
   nodeCtxTyIxOf,
+  nodeRepStamped,
   nodeRepTyIx,
   nodeRepTyIxOf,
   nodeRepUnionIx,
@@ -4550,6 +4551,7 @@ function elabResultScanReset() {
   elabThroughMembers = Map()
   elabSlotRecDecl = []
   elabResSlotCalls = []
+  elabStoreMembers = Map()
   elabSlotRecField = []
   elabSlotRecAt = []
   elabPlaceRecs = Map()
@@ -4662,7 +4664,16 @@ function elabResScanIdent(g: i32) {
   const n = nodeAt(g)
   if n is Ident {
     const d = identDeclOf(g)
-    if elabResMayHold(d) { elabResReads[d] = (elabResReads.get(d) ?? 0) + 1 }
+    if elabResMayHold(d) {
+      elabResReads[d] = (elabResReads.get(d) ?? 0) + 1
+      if (
+        elabResStoredRead(g)
+        && elabResInLiteral(g)
+        && elabSlotHolderOf(g) >= 0
+      ) {
+        elabResSlotCalls.push(g)
+      }
+    }
     if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
       elabFnReads[d] = (elabFnReads.get(d) ?? 0) + 1
     }
@@ -4704,6 +4715,89 @@ function elabResInLiteral(g: i32): boolean {
   const p = cwIxParent[g]
   const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
   pn is ArrayLit || pn is FieldInit || pn is BinExpr || pn is Call
+}
+
+// Whether read `g` is a value a slot is written: a field or element of a literal, or a map store.
+function elabResStoredRead(g: i32): boolean {
+  if g < 0 || g >= cwIxUpKind.length { return false }
+  const k = cwIxUpKind[g]
+  k == CW_UP_FIELD || k == CW_UP_ELEM || k == CW_UP_ASG_RHS || k == CW_UP_ARG
+}
+
+// The `const` call holder read `v` names, written only by its initialiser; -1 for any other node.
+function elabSlotHolderOf(v: i32): i32 {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const h = identDeclOf(x)
+  const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return -1 }
+  if !elabResCallHolder(h) || (elabResWrites.get(h) ?? []).length > 1 {
+    return -1
+  }
+  h
+}
+
+// The call a slot's written value `v` stands for: itself, or a holder read's initialiser.
+function elabSlotValueCall(v: i32): i32 {
+  const h = elabSlotHolderOf(v)
+  if h < 0 { return parenPeelIx(v) }
+  const hn = nodeAt(h)
+  if hn is LetDecl { parenPeelIx(hn.letInit) } else { -1 }
+}
+
+// Holder read `c`, stored into field `f` of the record binding `d` whose type closes the field at
+// one function type: the holder holds its record whole, and the store takes the member of that
+// type, by the rule a hand to a parameter of one closure type takes (`elabRecMemberAt`).
+function elabSlotStoreMemberNote(c: i32, d: i32, f: string) {
+  const h = elabSlotHolderOf(c)
+  if h < 0 || !elabInPlainCode(c) { return 0 }
+  const call = elabSlotValueCall(c)
+  const rec = elabCallRecord(call, -1, 4)
+  if rec.length < 2 { return 0 }
+  const dt = nodeTyIxOf(d)
+  const o = if dt >= 0 && dt < T.tys.length { tyAt(dt) } else { null }
+  if !(o is TyObj) { return 0 }
+  let ft = -1
+  let k = 0
+  while k < o.objFieldNames.length && k < o.objFieldTypes.length {
+    if o.objFieldNames[k] == f { ft = o.objFieldTypes[k] }
+    k = k + 1
+  }
+  if ft < 0 || ft >= T.tys.length || !(tyAt(ft) is TyFunc) || tyHasTyVar(ft) {
+    return 0
+  }
+  const m = elabRecMemberAt(rec, ft)
+  if m < 0 || !elabSlotHolderHolds(h, 1, rec) { return 0 }
+  elabRecTable.push(rec)
+  const at = elabRecTable.length - 1
+  elabAnyRetRecord = true
+  elabTriplePut(elabHolderRecs, h, -1, at)
+  elabTriplePut(elabResKeeps, call, -1, 1)
+  for t in elabResThrough.get(h) ?? [] {
+    elabTriplePut(elabThroughMembers, t, -1, elabCallSigMember(t, rec))
+  }
+  elabStoreMembers[c] = m
+  0
+}
+
+// Per holder read stored into a field of one closure type, the member of its record it stores.
+let elabStoreMembers: {[i32]: i32} = Map()
+
+// The member holder read `x` stores into a field of one closure type, or -2 for no such store.
+export function elabStoreMemberOf(x: i32): i32 { elabStoreMembers.get(x) ?? -2 }
+
+// Whether holder `h`, stored `stores` times into a slot of record `rec`, is read only by those
+// stores and by calls through it at the record's signatures, all in its own function.
+function elabSlotHolderHolds(h: i32, stores: i32, rec: i32[]): boolean {
+  const through = elabResThrough.get(h) ?? []
+  if through.length + stores != (elabResReads.get(h) ?? 0) { return false }
+  const fd = elabEnclosingFn(h)
+  for t in through {
+    if elabEnclosingFn(t) != fd || elabCallSigMember(t, rec) < 0 {
+      return false
+    }
+  }
+  true
 }
 
 // Whether call `v` can return a record: its callee names a function with no return annotation,
@@ -4847,29 +4941,53 @@ function elabSlotRecordNote(c: i32) {
   const isList = f == "[]" && !isMap
   const d = if isMap { md } else { cwIxUp[lit] }
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if !(dn is LetDecl) || dn.letType >= 0 { return 0 }
+  if !(dn is LetDecl) { return 0 }
+  // A binding annotated at one closure type for the field stores the member of that type.
+  if dn.letType >= 0 {
+    if !isMap && !isList { elabSlotStoreMemberNote(c, d, f) }
+    return 0
+  }
   if !isMap {
     const ln = nodeAt(lit)
     if isList && !(ln is ArrayLit) || !isList && !(ln is ObjLit) { return 0 }
   }
   if elabSlotFieldRecord(d, f).length > 0 { return 0 }
-  const rec = elabCallRecord(c, -1, 4)
+  const rec = elabCallRecord(elabSlotValueCall(c), -1, 4)
   if rec.length < 2 { return 0 }
   // Every value the slot is written is a call returning the same record.
   const vals: i32[] = []
   const ats: i32[] = []
   if cwSlotWrittenValues(d, [f], vals, ats) < 0 || vals.length == 0 { return 0 }
+  // A value that reads a holder stands for the holder's call, and the holder is held whole.
+  const linked: i32[] = []
+  const stores: i32[] = []
   for v0 in vals {
-    const v = parenPeelIx(v0)
+    const v = elabSlotValueCall(v0)
     if (
       v < 0
       || v >= P.nodes.length
       || !(nodeAt(v) is Call)
       || !elabInPlainCode(v)
+      || !elabInPlainCode(parenPeelIx(v0))
     ) {
       return 0
     }
     if !elabTyListSame(elabCallRecord(v, -1, 4), rec) { return 0 }
+    const h = elabSlotHolderOf(v0)
+    if h >= 0 {
+      const li = i32ListIndexOf(linked, h)
+      if li >= 0 {
+        stores[li] = stores[li] + 1
+      } else {
+        linked.push(h)
+        stores.push(1)
+      }
+    }
+  }
+  let li = 0
+  while li < linked.length {
+    if !elabSlotHolderHolds(linked[li], stores[li], rec) { return 0 }
+    li = li + 1
   }
   const places: i32[] = []
   const ms: i32[] = []
@@ -4950,7 +5068,13 @@ function elabSlotRecordNote(c: i32) {
   elabSlotRecField.push(f)
   elabSlotRecAt.push(at)
   elabAnyRetRecord = true
-  for v in vals { elabTriplePut(elabResKeeps, parenPeelIx(v), -1, 1) }
+  for v in vals { elabTriplePut(elabResKeeps, elabSlotValueCall(v), -1, 1) }
+  for h in linked {
+    elabTriplePut(elabHolderRecs, h, -1, at)
+    for t in elabResThrough.get(h) ?? [] {
+      elabTriplePut(elabThroughMembers, t, -1, elabCallSigMember(t, rec))
+    }
+  }
   let i = 0
   while i < places.length {
     elabTriplePut(elabPlaceRecs, places[i], -1, at)
@@ -5507,7 +5631,11 @@ function elabHandMemberOf(x: i32, i: i32, from: i32, rec: i32[]): i32 {
   const ko = elabCallInstFrom(x, from)
   if ko < 0 || i >= 64 { return -1 }
   if (elabBundleSigs.get(elabBundleKey(ko, i)) ?? []).length >= 2 { return -1 }
-  const t = elabBundleKeyClosedFn(elabBundleKey(ko, i))
+  elabRecMemberAt(rec, elabBundleKeyClosedFn(elabBundleKey(ko, i)))
+}
+
+// The member of record `rec` whose closure type is `t`: its index, or -1 where none is.
+function elabRecMemberAt(rec: i32[], t: i32): i32 {
   if t < 0 { return -1 }
   let j = 0
   while j < rec.length {
@@ -9524,6 +9652,11 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   const k = elabKeyAt(fnIx)
   const r = elabPairIn(elabNodeReps, ix, k)
   if r >= 0 { return r }
+  // The record solve's closed stamp is where the literal is built; the parameter its call
+  // closes is only where it is delivered (D15288).
+  if nodeRepStamped(ix) && !tyHasTyVar(nodeRepTyIx[ix]) {
+    return nodeRepTyIx[ix]
+  }
   const pa = elabArgTyAt(ix, k, 0)
   if pa >= 0 { return pa }
   const sp = elabSpreadInner[ix] ?? -1
