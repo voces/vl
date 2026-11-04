@@ -1,3 +1,5 @@
+import { objSigSame } from "./check_union_arm_msgs"
+
 // Flow narrowing: the narrowing ledger (`nar*`) and its joins at an `if`, the facts a test
 // pushes, and what retires them: a write to a place, a call that may write (`call*`), a loop
 // back-edge or a capture (`cr*`). Callers in the core checker record and query; nothing here
@@ -456,6 +458,7 @@ import {
   joinArmTys,
   joinTys,
   joinVariantTys,
+  recArmFitKind,
   sameVariantTy,
   subtractTy,
   tErr,
@@ -570,6 +573,7 @@ import {
   mkNullableTy,
   objFieldType,
   tyAt,
+  tyBearsNull,
   tyFieldTyOf,
   tyHasHole,
   tyIsHole,
@@ -597,9 +601,11 @@ import { i32ListHas, i32ListWith } from "./listutil"
 import { declOutermostOf, declShadowOf, identDeclOf, sidOf } from "./symbols"
 import {
   arrElemValueTy,
+  flattenVariantsInto,
   isLitBearing,
   isNullTy,
   litPeekBaseTy,
+  litSetBaseTy,
   nonNullTy,
   tyAdmitsNull,
   tyHasTyVar,
@@ -4202,6 +4208,93 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   0
+}
+
+// An `is` test of an operand of type `op` against `t`: 1 when it always holds, 0 when it never
+// does, -1 when the stored value decides. Member by member over `op`, by D15252's rules: open
+// types defer, a covering union holds, literals meet, scalars and records go by their own type.
+export function isTestAnswer(op: i32, t: i32): i32 {
+  if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(op, ms)
+  if ms.length == 0 { return -1 }
+  let all1 = true
+  let all0 = true
+  for m in ms {
+    const a = isTestMemberAnswer(m, t, 8)
+    if a != 1 { all1 = false }
+    if a != 0 { all0 = false }
+  }
+  if all1 { return 1 }
+  if all0 { return 0 }
+  -1
+}
+
+// The kind of value type `ty` is, for `isTestMemberAnswer`: 1 scalar or literal, 2 record, 3 list,
+// 4 map, 5 function; 0 for any other type.
+function isTestKindOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = tyAt(ty)
+  match t {
+    TyPrim | TyLit => 1
+    TyObj => 2
+    TyArray => 3
+    TyMap => 4
+    TyFunc => 5
+    TyErr | TyUnion | TyNullable | TyVar | TyNeg => 0
+  }
+}
+
+// `isTestAnswer` for one member `m` of the operand against `t`.
+function isTestMemberAnswer(m: i32, t: i32, depth: i32): i32 {
+  if depth <= 0 || m < 0 || t < 0 || m >= T.tys.length || t >= T.tys.length {
+    return -1
+  }
+  const mt = tyAt(m)
+  const tt = tyAt(t)
+  if mt is TyVar || tt is TyVar || tyIsHole(m) || tyIsHole(t) { return -1 }
+  if m == t || tySame(m, t) || tyUnionCovers(t, m) { return 1 }
+  if isNullTy(m) { return if tyBearsNull(t) { 1 } else { 0 } }
+  if isNullTy(t) { return 0 }
+  // A tested union holds where one of its members does.
+  if tt is TyUnion && litSetBaseTy(t) < 0 {
+    let any1 = false
+    let all0 = true
+    for x in tt.uMembers {
+      const a = isTestMemberAnswer(m, x, depth - 1)
+      if a == 1 { any1 = true }
+      if a != 0 { all0 = false }
+    }
+    return if any1 { 1 } else if all0 { 0 } else { -1 }
+  }
+  // A value of one kind is never one of another: a scalar, a record, a list, a map, a function.
+  const km = isTestKindOf(m)
+  const kt = isTestKindOf(t)
+  if km > 0 && kt > 0 && km != kt { return 0 }
+  const lbm = litSetBaseTy(m)
+  const lbt = litSetBaseTy(t)
+  if lbm >= 0 || lbt >= 0 {
+    const meet = litSetMeetTy(m, t)
+    if meet == m { return 1 }
+    if meet >= 0 { return -1 }
+    const bm = if lbm >= 0 { lbm } else { m }
+    const bt = if lbt >= 0 { lbt } else { t }
+    return if tySame(bm, bt) { -1 } else { 0 }
+  }
+  if mt is TyPrim && tt is TyPrim {
+    return if mt.primName == tt.primName { 1 } else { 0 }
+  }
+  if recIsFitsAcrossTags(m, t) || listIsFitsAcrossReps(m, t) { return -1 }
+  if mt is TyObj && tt is TyObj {
+    if !objSigSame(mt, tt) || !objSigSame(tt, mt) { return 0 }
+    const k = recArmFitKind(t, m)
+    return if k == 1 { 1 } else if k == 0 { 0 } else { -1 }
+  }
+  if mt is TyArray && tt is TyArray {
+    return isTestMemberAnswer(mt.aElem, tt.aElem, depth - 1)
+  }
+  if mt is TyFunc && tt is TyFunc { return if tySame(m, t) { 1 } else { 0 } }
+  -1
 }
 
 // `subtractTy` for an `is` test's else arm. A concrete tested type stays apart from a type
