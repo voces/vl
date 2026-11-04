@@ -55,6 +55,8 @@ import {
   mkMapTy,
   mkNullableTy,
   mkObjTy,
+  tyArrayElemIx,
+  tyFieldTyOf,
   tySame,
 } from "./check_types"
 import { declTyOf } from "./check_nar_store"
@@ -2650,6 +2652,12 @@ export function fnTagHeldNote(x: i32) {
   const n = nodeAt(x)
   let t = nodeTyIxOf(x)
   if n is LetDecl && n.letInit >= 0 { t = nodeTyIxOf(n.letInit) }
+  // A binding of a read of a stamped place holds that place's rep (D15350).
+  const pr = if n is LetDecl { fnTagPlaceRep(n.letInit) } else { -1 }
+  if pr >= 0 {
+    if pr != t { fnTagHeldRep[x] = pr }
+    return 0
+  }
   const v0 = if n is LetDecl { n.letInit } else { x }
   const deep = fnTagListOfLists(t) && fnTagInnerLitsOnly(v0, t, 0)
   const r = fnTagRepTyIn(t, 16, deep)
@@ -2658,6 +2666,45 @@ export function fnTagHeldNote(x: i32) {
   if deep { fnTagHeldInner(v0, r, 0) }
   0
 }
+
+// The rep stamped at the place `v` reads: a stamped node or binding, or an element or field of
+// one; -1 where no stamp reaches it.
+function fnTagPlaceRep(v: i32): i32 {
+  // The place is walked inward to the first stamped node or binding; `steps` is the path back.
+  let x = if v >= 0 && v < P.nodes.length { parenPeelIx(v) } else { -1 }
+  let t = -1
+  const steps: string[] = []
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 16 {
+    t = fnTagHeldRep[x] ?? -1
+    const xn = nodeAt(x)
+    if t >= 0 {
+      hops = 16
+    } else if xn is Member {
+      steps.push(xn.memProp)
+      x = parenPeelIx(xn.memObj)
+    } else if xn is Index {
+      steps.push("")
+      x = parenPeelIx(xn.idxArr)
+    } else {
+      // Any other node is the root: a name reads its binding's stamp.
+      const d = identDeclOf(x)
+      t = if d >= 0 && d != x { fnTagHeldRep[d] ?? -1 } else { -1 }
+      hops = 16
+    }
+    hops = hops + 1
+  }
+  let k = steps.length - 1
+  while k >= 0 && t >= 0 {
+    t = if steps[k] == "" { tyArrayElemIx(t) } else { tyFieldTyOf(t, steps[k]) }
+    k = k - 1
+  }
+  t
+}
+
+// The record literals `fnTagHeldInner` found built at another record, each beside that record;
+// the tag pass stamps and drains them.
+export let fnTagHeldRecs: i32[] = []
 
 // Whether `t` is a list whose element is a list.
 function fnTagListOfLists(t: i32): boolean {
@@ -2686,11 +2733,23 @@ function fnTagHeldInner(v: i32, r: i32, depth: i32) {
   const vn = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
   const ro = if r >= 0 && r < T.tys.length { T.tys[r] } else { null }
   if !(vn is ArrayLit) || !(ro is TyArray) || depth > 8 { return 0 }
+  const eo = if ro.aElem >= 0 && ro.aElem < T.tys.length { T.tys[ro.aElem] } else { null }
   for el in vn.arrElems {
     const ex = parenPeelIx(el)
     if ex >= 0 && ex < P.nodes.length && nodeAt(ex) is ArrayLit {
       if ro.aElem != nodeTyIxOf(ex) { fnTagHeldRep[ex] = ro.aElem }
       fnTagHeldInner(ex, ro.aElem, depth + 1)
+    }
+    // A record literal is built at the rep's record, so it shares that record's row.
+    if (
+      ex >= 0
+      && ex < P.nodes.length
+      && nodeAt(ex) is ObjLit
+      && eo is TyObj
+      && ro.aElem != nodeTyIxOf(ex)
+    ) {
+      fnTagHeldRecs.push(ex)
+      fnTagHeldRecs.push(ro.aElem)
     }
   }
   0
