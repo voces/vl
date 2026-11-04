@@ -18,7 +18,7 @@ import {
 import { rcwCallSites } from "./check_record_writes"
 import { callRetRepTy } from "./check_bind_adopt"
 import { nodeTyIxOf } from "./check_node_tys"
-import { nodeRepTyIxOf } from "./check_core_state"
+import { nodeRepTyIxOf, recCopyFromOf, recCopyTyOf } from "./check_core_state"
 import {
   T,
   TyArray,
@@ -73,7 +73,12 @@ import {
   cwOccWalk,
   cwPeelValue,
 } from "./check_write_scan"
-import { recArgRepArgs, recArgRepOf, recBuildPush } from "./check_rec_rows"
+import {
+  recArgRepArgs,
+  recArgRepOf,
+  recBuildPush,
+  recKeptFnDstOf,
+} from "./check_rec_rows"
 import { identBoundFnDeclOf } from "./check_scopes"
 import { identDeclOf } from "./symbols"
 import { unwrapParen } from "./emit_base"
@@ -87,7 +92,12 @@ export function callBuiltTy(x: i32, depth: i32): i32 {
   const p = solePinPeel(x)
   const hd = if p >= 0 && nodeAt(p) is Ident { recHeldDecl(p) } else { -1 }
   const hn = if hd >= 0 { nodeAt(hd) } else { nodeAt(0) }
-  if hd >= 0 && hn is LetDecl { return callBuiltTy(hn.letInit, depth - 1) }
+  if hd >= 0 && hn is LetDecl {
+    // A binding holding its own copy of a call is built at the copy's record (D15246).
+    const ci = unwrapParen(hn.letInit)
+    if ci >= 0 && recCopyFromOf(ci) >= 0 { return recCopyTyOf(ci) }
+    return callBuiltTy(hn.letInit, depth - 1)
+  }
   // A binding's literal is built at its rep stamp, as a result literal is.
   if p >= 0 && nodeAt(p) is ObjLit {
     const ls = litRepTyAt(p, -1)
@@ -225,19 +235,17 @@ export function storeLetsResolve() {
     const u = unwrapParen(storeLetInitAt(i))
     const own = if u >= 0 && u < P.nodes.length { nodeTyIxOf(u) } else { -1 }
     if own >= 0 && own < T.tys.length && tyAt(own) is TyObj {
+      // A binding written through, or handing on a record it holds, takes its own copy of the
+      // call's result rather than sharing the record its function is kept at (D15246).
+      const d = storeLetDeclAt(i)
+      const fd = if nodeAt(u) is Call { recInferredFnOf(u) } else { -1 }
+      const kd = if fd >= 0 { recKeptFnDstOf(fd, own) } else { -1 }
+      if kd >= 0 && storeBindWrittenThrough(d) && recCopyBackNote(u, kd, own) {
+        i = i + 1
+        continue
+      }
       const r = storeHeldAt(u)
       if r >= 0 && r < T.tys.length && tyAt(r) is TyObj && !tySame(r, own) {
-        // A binding written through, or handing on a record it holds, takes its own copy of the
-        // call's result rather than sharing its build (D15246).
-        const d = storeLetDeclAt(i)
-        if (
-          nodeAt(u) is Call
-          && storeBindWrittenThrough(d)
-          && recCopyBackNote(u, r, own)
-        ) {
-          i = i + 1
-          continue
-        }
         storeLetBuiltSet(u, r)
         // A binding of a call is built where the call's results are (`recBuildTyOf`, D15172).
         if nodeAt(u) is Call {
@@ -258,6 +266,15 @@ function storeBindWrittenThrough(d: i32): boolean {
   const w = cwOccWalk(d)
   while cwOccNext(w) {
     const r = w.row
+    // An assignment whose target is a field path of the binding writes through it.
+    const an = if cwIxKind[r] == CW_OCC_ASG && cwIxFr[r] == fr { nodeAt(cwIxNode[r]) } else { null }
+    if (
+      an is BinExpr
+      && an.binOp == "="
+      && !(nodeAt(unwrapParen(an.binLeft)) is Ident)
+    ) {
+      return true
+    }
     if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == fr {
       let top = cwIxNode[r]
       while (
