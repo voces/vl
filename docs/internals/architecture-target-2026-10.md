@@ -981,6 +981,8 @@ No dependent would turn into a miscompile if the plan were deleted today: H-choi
 
 The scoreboard reports side effects of the migration; it is not a landing criterion (§3).
 
+One row is now held: the pin and position layer, row (a) of the special-case helpers, may only fall. It grew from 1,516 functions (76a3eb8fd, 2026-10-25) to 1,571 (f2599d8e5, 2026-11-04) while the elaboration that replaces it was built beside it, because no gate graded it. `tests/budget_pin_helper_test.ts` holds each of the three files at or below `scripts/pin-helper-budget-baseline.json`. A PR that retires helpers lowers the baseline in the same PR; a PR that needs a new one says why in its body and raises it there.
+
 ### 4.1 Baselines (76a3eb8fd)
 
 | Metric | Today | Population and source |
