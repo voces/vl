@@ -10,6 +10,7 @@
 // feature, so a program that does not use it emits the bytes it would emit without the
 // feature at all. Each pass below states only its own gate.
 
+import { recordRowClassOf } from "./record_rows"
 import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { chainHasPrelude } from "./emit_if_arm_values"
 import { arrNewInFn } from "./check_decl_scan"
@@ -8538,6 +8539,47 @@ function collectVariantFields(stmts: i32[], name: string, ty: i32) {
   emitFail("emitProgram: union variant names an unknown struct type")
 }
 
+// Whether field `fi` of variants `a` and `b` holds one shape under two record names (`R`, `S` =
+// `{r: i32}`), directly or as a list element, map key or value, or nullable inner (D15150).
+function variantRecordFieldsOneRow(a: i32, b: i32, fi: i32): boolean {
+  if a >= uVarTyIx.length || b >= uVarTyIx.length { return false }
+  const fnm = armFieldNames()[uFieldStart[a] + fi]
+  recordShapesOneRow(
+    recFieldTyOf(uVarTyIx[a], fnm),
+    recFieldTyOf(uVarTyIx[b], fnm),
+    0,
+  )
+}
+
+// Whether `ta` and `tb` are one shape whose records, at every leaf, share a record-row class.
+function recordShapesOneRow(ta: i32, tb: i32, depth: i32): boolean {
+  if ta < 0 || tb < 0 || depth > 16 { return false }
+  const ca = recordRowClassOf(ta)
+  if ca != "" { return ca == recordRowClassOf(tb) }
+  const na = tyAt(ta)
+  const nb = tyAt(tb)
+  match na {
+    TyNullable => {
+      if !(nb is TyNullable) { return false }
+      return recordShapesOneRow(na.nInner, nb.nInner, depth + 1)
+    }
+    TyArray => {
+      if !(nb is TyArray) || na.aRead != nb.aRead { return false }
+      return recordShapesOneRow(na.aElem, nb.aElem, depth + 1)
+    }
+    TyMap => {
+      if !(nb is TyMap) || na.mSet != nb.mSet { return false }
+      const keyOne = na.mKey == nb.mKey
+        || recordShapesOneRow(na.mKey, nb.mKey, depth + 1)
+      return keyOne && recordShapesOneRow(na.mVal, nb.mVal, depth + 1)
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
+      // No record inside, or a record or union `recordRowClassOf` already answered.
+      return false
+    }
+  }
+}
+
 // True if variants `a` and `b` are the same type per field — the field-type half of variant
 // identity (`variantSig` is the name half); `assignTags`'s exemption depends on this being
 // identity, not storage: `{a: i32}` and `{a: boolean}` share a wasm code but are different
@@ -8552,17 +8594,19 @@ function variantFieldTysEq(a: i32, b: i32) {
     ) {
       return false
     }
-    if (
-      armFieldTyText()[uFieldStart[a] + fi]
-      != armFieldTyText()[uFieldStart[b] + fi]
-    ) {
-      return false
-    }
-    if (
-      armFieldElemName()[uFieldStart[a] + fi]
-      != armFieldElemName()[uFieldStart[b] + fi]
-    ) {
-      return false
+    if !variantRecordFieldsOneRow(a, b, fi) {
+      if (
+        armFieldTyText()[uFieldStart[a] + fi]
+        != armFieldTyText()[uFieldStart[b] + fi]
+      ) {
+        return false
+      }
+      if (
+        armFieldElemName()[uFieldStart[a] + fi]
+        != armFieldElemName()[uFieldStart[b] + fi]
+      ) {
+        return false
+      }
     }
     // B6b — the map field's key half: the elem-name column above records only `V`, so two
     // differently-keyed maps compare equal there; this column catches it.

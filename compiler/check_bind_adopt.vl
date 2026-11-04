@@ -51,9 +51,13 @@ import {
   recObjLitsSet,
 } from "./check_rec_rows"
 import {
+  adoptLitAt,
   litAtDstStorage,
+  recAsgBuiltRep,
   recBuiltReadTy,
   recBuiltReadTyIn,
+  recEnclosingFn,
+  recFieldRead,
   recHoleIdentityArg,
   recReachTvAt,
   recordRepTyAdopt,
@@ -67,6 +71,8 @@ import {
   CW_OCC_BIND,
   CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_ASG_LHS,
+  CW_UP_OBJ,
   cwIxBuild,
   cwIxKind,
   cwIxNode,
@@ -82,9 +88,16 @@ import { strListHas } from "./listutil"
 import {
   T,
   TyArray,
+  TyErr,
   TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
   TyObj,
+  TyPrim,
   TyUnion,
+  TyVar,
   cUserTypes,
   cUserTypesVer,
   mkArrayTy,
@@ -170,7 +183,8 @@ function cbaRowRepKeys(
 }
 
 // Whether parameter `par` of function `fd` only hands its value on: each read is a value `fd`
-// returns whole, or an argument to a parameter that does the same, to `depth` calls (D15172).
+// returns whole, an argument to a parameter that does the same, to `depth` calls (D15172), or an
+// argument to a record-annotated parameter of a non-generic function (D15185).
 export function cbaParamRepTransparent(par: i32, fd: i32, depth: i32): boolean {
   if depth <= 0 || par < 0 || fd < 0 { return false }
   cwIxBuild()
@@ -191,6 +205,7 @@ export function cbaParamRepTransparent(par: i32, fd: i32, depth: i32): boolean {
         const i = cwIxUpAux[u]
         if gn is FuncDecl && i >= 0 && i < gn.fnParams.length {
           ok = cbaParamRepTransparent(gn.fnParams[i], g, depth - 1)
+            || cbaAnnRecordParam(g, i)
         }
       }
       if !ok { return false }
@@ -199,6 +214,56 @@ export function cbaParamRepTransparent(par: i32, fd: i32, depth: i32): boolean {
     }
   }
   true
+}
+
+// Whether parameter `i` of the non-generic function `fd` is annotated with a record type and only
+// read for a scalar field in its own body: an argument handed there is built at that record,
+// and nothing the callee does is seen by a caller reading the value back at its own type.
+function cbaAnnRecordParam(fd: i32, i: i32): boolean {
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+  const par = f.fnParams[i]
+  const pn = nodeAt(par)
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const pt = nodeTyIxOf(par)
+  if pt < 0 || pt >= T.tys.length || !(tyAt(pt) is TyObj) { return false }
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if !recFieldRead(u) || recEnclosingFn(u) != fd { return false }
+      const m = cwIxUp[u]
+      if (
+        m < cwIxUpKind.length
+        && (cwIxUpKind[m] == CW_UP_ASG_LHS || cwIxUpKind[m] == CW_UP_OBJ)
+      ) {
+        return false
+      }
+      const mt = nodeTyIxOf(m)
+      if !cbaHoldsNoShared(mt) { return false }
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  true
+}
+
+// Whether a value of type `ty` holds no record, list or map another reader could write through.
+function cbaHoldsNoShared(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  match t {
+    TyObj | TyArray | TyMap | TyFunc => false
+    TyNullable => cbaHoldsNoShared(t.nInner)
+    TyUnion => {
+      for m in t.uMembers {
+        if !cbaHoldsNoShared(m) { return false }
+      }
+      true
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => true
+  }
 }
 
 // Builds each fresh record literal call `ix` hands to a parameter typed by a bare type variable
@@ -549,6 +614,13 @@ let recLitStamped: {[i32]: boolean} = Map()
 // with each field built at another record at that record; with `late`, a generic call's rep row
 // counts too. Whether `l` waits on that rep row.
 function recListLitBuild(l: i32, late: boolean): boolean {
+  // Assigned into a binding stored at a built read, the literal is built where it is (D15188).
+  const ar = recAsgBuiltRep(l)
+  if ar >= 0 && !tySame(ar, nodeTyIxOf(l)) {
+    adoptLitAt(l, ar)
+    if tySame(nodeRepTyIxOf(l), ar) { recLitStamped[l] = true }
+    return false
+  }
   const n = nodeAt(l)
   if n is ObjLit { return recObjLitBuild(l, n, late) }
   if !(n is ArrayLit) { return false }
