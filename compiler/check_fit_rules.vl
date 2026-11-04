@@ -3506,6 +3506,14 @@ export function recLitPlaceBuiltTy(p: i32): i32 {
     const e = recHeldElemBuilt(init)
     return if e >= 0 && it >= 0 && it < T.tys.length && tyAt(it) is TyArray { mkArrayTy(e) } else { -1 }
   }
+  // A list literal that is itself an element of a built list of lists is built at its inner
+  // lists' build (D15284).
+  if pn is ArrayLit {
+    cwIxBuild()
+    const er = recSlotReceiverOf(p, p)
+    const ee = if er >= 0 { recElemOfElemStamp(er) } else { -1 }
+    if ee >= 0 { return mkArrayTy(ee) }
+  }
   const r = recLitSlotReceiver(p)
   const e = if r >= 0 { recHeldElemBuilt(r) } else { -1 }
   if e < 0 { return -1 }
@@ -3551,13 +3559,16 @@ export function recHeldLitPlaceAdopt(l: i32) {
 // is spread into a push of, peeled; else -1.
 function recLitSlotReceiver(p: i32): i32 {
   cwIxBuild()
-  let x = p
-  let a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
-  if nodeAt(p) is ArrayLit {
-    if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Spread) { return -1 }
-    x = a
-    a = if a < cwIxUp.length { cwIxUp[a] } else { -1 }
-  }
+  if !(nodeAt(p) is ArrayLit) { return recSlotReceiverOf(p, p) }
+  const a = if p >= 0 && p < cwIxUp.length { cwIxUp[p] } else { -1 }
+  if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Spread) { return -1 }
+  recSlotReceiverOf(a, p)
+}
+
+// The list value `x` (the literal `p` itself, or a spread of it) is pushed, unshifted or
+// index-stored into, peeled; else -1.
+function recSlotReceiverOf(x: i32, p: i32): i32 {
+  const a = if x >= 0 && x < cwIxUp.length { cwIxUp[x] } else { -1 }
   const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
   if an is Call && an.callFn >= 0 && i32ListHas(an.callArgs, x) {
     const f = nodeAt(an.callFn)
@@ -3594,13 +3605,18 @@ export function recHeldElemBuilt(x: i32): i32 {
 }
 
 // The record the elements of an element of the list binding read `a` are built at, from its
-// list literal initialiser's rep stamp (`T[][]`); else -1.
+// list literal initialiser's rep stamp (`T[][]`), through bindings of bindings; else -1.
 function recElemOfElemStamp(a: i32): i32 {
   if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) { return -1 }
   const d = recBindDeclOf(a)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
-  const rt = nodeRepTyIxOf(cwPeelValue(dn.letInit))
+  const iv = cwPeelValue(dn.letInit)
+  // A binding of another such binding reads that one's literal.
+  if iv >= 0 && iv < P.nodes.length && nodeAt(iv) is Ident {
+    return recElemOfElemStamp(iv)
+  }
+  const rt = nodeRepTyIxOf(iv)
   const ro = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
   const it = if ro is TyArray { ro.aElem } else { -1 }
   const io = if it >= 0 && it < T.tys.length { tyAt(it) } else { null }
@@ -3728,7 +3744,7 @@ export function recCoalesceDefaultDeliver(p: i32, rep: i32): boolean {
   const d = if nodeAt(v) is Ident { recHeldDecl(v) } else { -1 }
   // A fresh `const` literal keeps its own type and is built at `rep`, so the join stays one record
   // (D15310); one record cannot also be delivered at its own storage, so those are refused.
-  if recCoalesceHeldLit(d) >= 0 {
+  if recCoalesceDefaultBuilt(p) {
     recBuildPush(d, own, rep, false)
     recHeldOwnRefuse(d, rep, p, recCoalesceDefaultsAt(d, rep))
     return true
@@ -3742,6 +3758,17 @@ export function recCoalesceDefaultDeliver(p: i32, rep: i32): boolean {
   }
   recAdoptNote(v, own, rep)
   true
+}
+
+// Whether `p`, a `??`, defaults to a binding of a fresh `const` record literal, which the general
+// arm builds at the read's record while it keeps its own type, so the join is one record. False
+// for a `let` or a `const` of a call, which the record solve adopts at the read's record instead.
+export function recCoalesceDefaultBuilt(p: i32): boolean {
+  const n = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if !(n is BinExpr) || n.binOp != "??" { return false }
+  const v = cwPeelValue(n.binRight)
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  recCoalesceHeldLit(recHeldDecl(v)) >= 0
 }
 
 // Every read of the binding `d` that defaults a `??` over a read built at the record `rep`, and
