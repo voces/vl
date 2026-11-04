@@ -5,6 +5,7 @@ import {
   ArrayLit,
   BinExpr,
   Call,
+  FieldInit,
   FuncDecl,
   Ident,
   Index,
@@ -18,8 +19,19 @@ import {
 import { rcwCallSites } from "./check_record_writes"
 import { callRetRepTy } from "./check_bind_adopt"
 import { nodeTyIxOf } from "./check_node_tys"
+import { tErr } from "./check_relate_core"
 import { nodeRepStamped, nodeRepTyIxOf, recCopyFromOf, recCopyTyOf } from "./check_core_state"
-import { T, TyArray, TyObj, objFieldType, tyAt, tySame } from "./check_types"
+import {
+  T,
+  TyArray,
+  TyObj,
+  mkArrayTy,
+  mkObjTy,
+  objFieldType,
+  tyAt,
+  tySame,
+  tyToStr,
+} from "./check_types"
 import { nonNullTy } from "./tyquery"
 import {
   adoptLitAt,
@@ -30,6 +42,7 @@ import {
   recHeldAsgStamp,
   recHoleIdentityArg,
   recordBoxTy,
+  recordRepTyAdopt,
   repStampHeldRead,
   storeFnAt,
   storeFnCount,
@@ -213,7 +226,16 @@ export function storeLetsResolve() {
   while i < storeLetCount() {
     const u = unwrapParen(storeLetInitAt(i))
     const own = if u >= 0 && u < P.nodes.length { nodeTyIxOf(u) } else { -1 }
-    if own >= 0 && own < T.tys.length && tyAt(own) is TyObj {
+    const lit = u >= 0
+      && u < P.nodes.length
+      && (nodeAt(u) is ArrayLit || nodeAt(u) is ObjLit)
+    if lit && own >= 0 && own < T.tys.length {
+      // A literal holding a value held at another record is built there (D15312).
+      const lt = storeLitHeldAt(u, 4)
+      if lt >= 0 && lt < T.tys.length && !tySame(lt, own) {
+        recordRepTyAdopt(u, lt, 6)
+      }
+    } else if own >= 0 && own < T.tys.length && tyAt(own) is TyObj {
       const r = storeHeldAt(u)
       // A call the record solve copies back to its own record is not held at its build (D15246).
       const back = recCopyFromOf(u) >= 0
@@ -234,6 +256,108 @@ export function storeLetsResolve() {
     }
     i = i + 1
   }
+}
+
+// The type list or record literal `l` is built at where an element or field is a value held at
+// another record (a built read's `??` join, or a binding of one): its own type with that slot at the
+// held record; -1 when none is, or two elements are held at different records.
+function storeLitHeldAt(l: i32, depth: i32): i32 {
+  if depth <= 0 || l < 0 || l >= P.nodes.length { return -1 }
+  const own = nodeTyIxOf(l)
+  if own < 0 || own >= T.tys.length { return -1 }
+  const n = nodeAt(l)
+  if n is ArrayLit {
+    let held = -1
+    for e in n.arrElems {
+      const r = storeSlotHeldAt(unwrapParen(e), depth - 1)
+      if r >= 0 {
+        if held >= 0 && !tySame(held, r) { return -1 }
+        held = r
+      }
+    }
+    return if held >= 0 { mkArrayTy(held) } else { -1 }
+  }
+  const o = tyAt(own)
+  if !(n is ObjLit) || !(o is TyObj) { return -1 }
+  const names: string[] = []
+  const tys: i32[] = []
+  let any = false
+  let k = 0
+  while k < o.objFieldNames.length {
+    names.push(o.objFieldNames[k])
+    let ft = o.objFieldTypes[k]
+    for fx in n.objFields {
+      const f = nodeAt(fx)
+      if f is FieldInit && f.fiName == o.objFieldNames[k] {
+        const r = storeSlotHeldAt(unwrapParen(f.fiValue), depth - 1)
+        if r >= 0 {
+          ft = r
+          any = true
+        }
+      }
+    }
+    tys.push(ft)
+    k = k + 1
+  }
+  if any { mkObjTy(names, tys) } else { -1 }
+}
+
+// The record the value `v` in a literal's slot is held at, where that is another record than its own
+// type: a `??` join or a binding the store column builds elsewhere, or a nested literal holding one.
+function storeSlotHeldAt(v: i32, depth: i32): i32 {
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const n = nodeAt(v)
+  // A nested literal is held where a slot of its own is (`storeLitHeldAt` answers -1 otherwise).
+  const nested = storeLitHeldAt(v, depth)
+  if nested >= 0 { return nested }
+  const own = nodeTyIxOf(v)
+  const r = if n is BinExpr { storeHeldAt(v) } else if n is Ident { storeBindingHeldAt(v) } else { storeSlotKeepsOwnRow(v) }
+  // A join whose default is a binding is held there and at the join's own row at once, so a
+  // literal slot holding it has no one record to build at (D15313).
+  const j = if n is Ident { storeJoinOfBinding(v) } else { v }
+  const jb = if j >= 0 && j < P.nodes.length && nodeAt(j) is BinExpr { recBuiltReadTy(j) } else { -1 }
+  if jb >= 0 && storeJoinDefaultHeld(j) {
+    tErr(
+      "a `??` whose default is a binding, built at "
+        + tyToStr(nonNullTy(jb))
+        + " for a read of a container built wider, is not yet supported inside a list or record "
+        + "literal",
+      v,
+    )
+    return -1
+  }
+  if (
+    r < 0
+    || r >= T.tys.length
+    || own < 0
+    || tySame(r, own)
+    || !(tyAt(r) is TyObj)
+  ) {
+    return -1
+  }
+  if n is BinExpr { storeLetBuiltSet(v, r) }
+  r
+}
+
+// -1 for slot value `v`, which is neither a `??` join nor a binding of one: it keeps its own row
+// in the literal, and the literal's own delivery builds it where it is held (D15215).
+function storeSlotKeepsOwnRow(_v: i32): i32 { -1 }
+
+// The `??` join binding read `x` is initialised with, or -1.
+function storeJoinOfBinding(x: i32): i32 {
+  const d = recHeldDecl(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
+  unwrapParen(dn.letInit)
+}
+
+// Whether `j` is a `??` whose default operand is a binding read.
+function storeJoinDefaultHeld(j: i32): boolean {
+  if j < 0 || j >= P.nodes.length { return false }
+  const n = nodeAt(j)
+  if !(n is BinExpr) || n.binOp != "??" { return false }
+  const r = unwrapParen(n.binRight)
+  r >= 0 && r < P.nodes.length && nodeAt(r) is Ident
 }
 
 // Builds each record literal assigned into binding `d`, held at the record `r`, at `r`, as a
