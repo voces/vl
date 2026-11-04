@@ -3,7 +3,12 @@
 // node carrying it is a place the emitter can lower as an id: a name of a member, a binding, a
 // return, an `if`/`match` arm, or the callee of a call through it. A call through a tagged set
 // dispatches on the id to a direct call of each member, which this pass builds.
-import { recAsgFnWidenedTy, recordBoxTy } from "./check_fit_rules"
+import {
+  recAsgFnWidenedTy,
+  recordBoxTy,
+  repStampHeldRead,
+} from "./check_fit_rules"
+import { recLitFnFieldsRestamp } from "./check_bind_adopt"
 import {
   ArrayLit,
   AsExpr,
@@ -169,6 +174,7 @@ import {
   fnTagEtaSetOf,
   fnTagEtaWant,
   fnTagHeldNote,
+  fnTagHeldRecs,
   fnTagMark,
   fnTagMembers,
   fnTagOwnTyParamAlone,
@@ -491,8 +497,31 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     k = k + 1
   }
   // Every holder's rep, once each planned set is tagged.
-  for hs in ftPlHeld {
-    for h in hs { fnTagHeldNote(h) }
+  // Twice, so a binding of a read of another holder sees that holder's stamp (D15350).
+  for _pass in [0, 1] {
+    for hs in ftPlHeld {
+      for h in hs { fnTagHeldNote(h) }
+    }
+  }
+  // A record literal of an inner list is built at that list's record, so it shares its row.
+  let q2 = 0
+  while q2 + 1 < fnTagHeldRecs.length {
+    repStampHeldRead(fnTagHeldRecs[q2], fnTagHeldRecs[q2 + 1])
+    q2 = q2 + 2
+  }
+  while fnTagHeldRecs.length > 0 { fnTagHeldRecs.pop() }
+  // A record literal written into a holder is built at the record its stamped rep holds there.
+  for l in ftWrittenLits {
+    const t = recAsgFnWidenedTy(l)
+    if t >= 0 { recLitFnFieldsRestamp(l, t) }
+  }
+  0
+}
+
+// Notes record literal `l` as written into a holder of the plan in progress.
+function ftWrittenNote(l: i32) {
+  if recAsgFnWidenedTy(l) >= 0 && !i32ListHas(ftWrittenLits, l) {
+    ftWrittenLits.push(l)
   }
   0
 }
@@ -516,8 +545,11 @@ let ftBindsCur: i32[] = []
 // The list literals and `let` declarations each planned set is held by, and the scan's own.
 let ftPlHeld: i32[][] = []
 let ftHeldCur: i32[] = []
+// The record literals the plans write into a holder's slot or push onto one.
+let ftWrittenLits: i32[] = []
 
 function ftPlReset() {
+  ftWrittenLits = []
   ftPlS = []
   ftPlLeaves = []
   ftPlIds = []
@@ -1280,6 +1312,9 @@ function ftScan(
         && !ftRecWriteJoins(rw.binRight, nodeTyIxOf(x), s, ds, leaves, ids, 0)
       ) {
         return false
+      }
+      if ftHolds(x, s) && rw is BinExpr && ftIsStore(rw) && rw.binLeft == x {
+        ftWrittenNote(parenPeelIx(rw.binRight))
       }
       // A written slot of a holder of the set's ids stores an id of it, whatever type the slot
       // read had before the holder's first write pinned it.
@@ -3580,6 +3615,7 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
     for a in c.callArgs {
       if recAsgFnWidenedTy(parenPeelIx(a)) < 0 { return false }
     }
+    for a in c.callArgs { ftWrittenNote(parenPeelIx(a)) }
     return true
   }
   // A slice copies the list's ids into a list of the same set, read as the holder is (D14931).
