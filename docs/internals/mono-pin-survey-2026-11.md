@@ -210,6 +210,11 @@ Recorded, not built:
   delivered at a closed function type takes that type. Built, and it closes 0: its two `zs`
   slots join a pushed `inc` that the delivered type cannot take, and mono reads them after a
   reassignment.
+- **(2), per-instance facts, landed:** a binding in a generic's body is closed once per
+  non-guess instance, keyed by that instance, after the run's last settle. It is closed from the
+  calls that instance's re-check noted, and from the instances elaboration already enumerated
+  under it, demanding none. It has no program-level fact. Generic-frame calls where mono closes
+  fall from 47 missing to **30**, with 0 disagreements over the 253 files.
 - **E, G, H:** folded in when A, B or C touches the same code.
 - **F:** set dispatch (step 4), not a missing fact.
 
