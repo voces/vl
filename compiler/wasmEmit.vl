@@ -58,6 +58,7 @@ import {
   elabSpreadRunHolderOf,
   elabSpreadRunNote,
   elabSrcDecl,
+  elabStoreMemberOf,
   litRepTyAt,
   readNarrowedStoreAt,
   storageReadEnter,
@@ -1359,6 +1360,7 @@ import {
   identCellSlot,
   sigKeyOfTy,
   sigKeyRetIsVoid,
+  sigKeyRetKind,
   tyIsUnionMemberOf,
 } from "./emit_sig_tokens"
 import {
@@ -1934,6 +1936,11 @@ function emitStructFieldValue(
   valIx: i32,
   fnIx: i32,
 ) {
+  // A holder stored into a field of one closure type stores its record's member of that type.
+  const sm = elabStoreMemberOf(nodeSrc[valIx] ?? valIx)
+  if sm >= 0 && emitHolderRead(valIx, fnIx) {
+    return emitBundleMemberPick(body, valIx, sm, fnIx)
+  }
   emitStructFieldValueUnder(body, si, fi, valIx, fnIx)
 }
 
@@ -26056,6 +26063,21 @@ function emitCallRefArg(
     if clu == 0 && (pkk == "i32" || pkk == null) {
       if tyIsLitUnion(nodeTyAt(args[i], fnIx)) { clu = 1 }
     }
+    // Nor has a string or a heap value, outside a literal union's atom, where the call has an
+    // interned signature; with none, the signature refusal names the gap (D15338, D15011).
+    if (
+      clu == 0
+      && pkk == "i32"
+      && cloSigTypeIdxAt(cloSigPosOfKey(ckey)) >= 0
+      && (exprString(args[i], fnIx)
+        || exprStruct(args[i], fnIx)
+        || exprArray(args[i], fnIx)
+        || exprMap(args[i], fnIx))
+    ) {
+      return emitFail(
+        "emitProgram: a function value is called at two signatures, and the closure it holds was built for one: this call passes a string or a heap value to its `i32` parameter",
+      )
+    }
     // the value-union param position (the box `u`): the kind comes off the resolved
     // `$fnsig` key so the coercion cannot disagree with the bytes; the box's own
     // identity comes from the checker type instead, since it is slot-free in the ABI —
@@ -26326,6 +26348,17 @@ function emitCallRefAt(
         + cloCallSigRejectWhat(callIx, fnIx),
     )
   }
+  // A wide result has no conversion into this call's `i32` result: the closure is built at
+  // another of the value's signatures (D15338).
+  const rk = sigKeyRetKind(ckey)
+  if (
+    (rk == "f64" || rk == "i64" || rk == "f32")
+    && exprScalarWidth(callIx, fnIx) == "i32"
+  ) {
+    return emitFail(
+      "emitProgram: a function value is called at two signatures, and the closure it holds was built for one: this call reads an `i32` result from a wider one",
+    )
+  }
   fbLocalGet(crSlot)
   fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
   fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
@@ -26347,7 +26380,12 @@ function emitBundleRecordRead(arg: i32, fnIx: i32): boolean {
 // The bundle read `arg` handed to a parameter that takes one closure: the record's member the
 // elaboration chose for that parameter's type. 0, or -1.
 function emitBundleMemberArg(body: u8[], arg: i32, fnIx: i32): i32 {
-  const m = bundleHandMemberOf(arg)
+  emitBundleMemberPick(body, arg, bundleHandMemberOf(arg), fnIx)
+}
+
+// The bundle read `arg`'s member `m`, -1 where the record holds none at the destination's type.
+// 0, or -1.
+function emitBundleMemberPick(body: u8[], arg: i32, m: i32, fnIx: i32): i32 {
   const rp = bundleParamOfRead(unwrapParen(arg), fnIx)
   const ua = unwrapParen(arg)
   const si = if rp >= 0 { paramStructIdxOf(rp) } else if ua >= 0 && nodeAt(ua) is Ident { holderRecordRow(identDeclOf(ua), fnIx) } else { -1 }
