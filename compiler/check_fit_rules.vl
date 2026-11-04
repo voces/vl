@@ -300,6 +300,7 @@ import {
   recAdPushMapDecl,
   recAdPushUnionList,
   recArgRepNote,
+  recArgRepOf,
   recBuildPassAt,
   recBuildPassTable,
   recBuildPush,
@@ -308,6 +309,7 @@ import {
   recKeptDecl,
   recKeptDst,
   recKeptFnPush,
+  recOwnSrc,
   recPend,
   recPendDstTy,
   recPendSrc,
@@ -321,7 +323,9 @@ import {
   recElemPinLit,
   recIndexBase,
   recIsJoin,
+  recKeptWhat,
   recLeafEscapes,
+  recOwnIsPin,
   recPassThroughArg,
   recShapePassArg,
   recSolePinArg,
@@ -3078,11 +3082,22 @@ function recAsgIntoBuiltAt(p: i32, rep: i32): boolean {
 }
 
 // The record an un-annotated binding `p` is assigned into is stored at, when its initialiser is
-// a built read; else -1. A record literal assigned there is built at it (D15185).
+// a built read, or the list when it holds a built list; else -1. A literal there is built at it.
 export function recAsgBuiltRep(p: i32): i32 {
   const init = recAsgBindInit(p)
   const b = if init >= 0 { recBuiltReadTy(init) } else { -1 }
-  if b >= 0 { nonNullTy(b) } else { -1 }
+  if b >= 0 { return nonNullTy(b) }
+  // A list literal assigned into a binding holding a list built elsewhere is built at it (D15189).
+  if init < 0 || p < 0 || p >= P.nodes.length || !(nodeAt(p) is ArrayLit) {
+    return -1
+  }
+  const it = nodeTyIxOf(init)
+  const e = recBuiltElemOf(init)
+  if e >= 0 && it >= 0 && it < T.tys.length && tyAt(it) is TyArray {
+    mkArrayTy(e)
+  } else {
+    -1
+  }
 }
 
 // The initialiser of the un-annotated binding `p` is assigned into, peeled; else -1.
@@ -3115,6 +3130,97 @@ export function recCoalesceLitAdopt(p: i32, rep: i32): boolean {
   if lit < 0 { return false }
   recordRepTyAdopt(lit, rep, 6)
   true
+}
+
+// Builds the binding that `p`, a `read ?? d`, defaults to at the record `rep` (`recCoalesceHeldOf`).
+// A held record is shared, so it is built there rather than copied; false, building nothing, else.
+export function recCoalesceHeldAdopt(p: i32, rep: i32): boolean {
+  const d = recCoalesceHeldOf(p, rep)
+  if d < 0 { return false }
+  recAdPushDecl(d, nodeTyIxOf(recCoalesceHeldLit(d)), rep, false, p)
+  // The store column runs after `recKeptConflicts`, so `d`'s own-storage deliveries are refused here,
+  // unless `d` is kept, whose deliveries that pass already refused: one refusal per delivery.
+  if i32ListHas(recKeptDecl, d) { return true }
+  const pn = nodeAt(p)
+  const dr = if pn is BinExpr { cwPeelValue(pn.binRight) } else { -1 }
+  for u in recOwnSrc {
+    const pu = cwPeelValue(u)
+    const o = if pu == p || pu == dr || recOwnPinSkip(u) { -1 } else { recFreshOriginDecl(u, 6) }
+    if o == d && recArgRepOf(u) < 0 {
+      recAdRaising = true
+      tErr(recKeptOwnMsg(d, rep, p, false), u)
+      recAdRaising = false
+    }
+  }
+  true
+}
+
+// Whether own-storage delivery `u` is left to the pins: it is, or sits in a literal that is, an
+// argument to a generic, and is a call or reaches a type parameter the call binds at a type that
+// does not store as `u`'s own (D15180).
+export function recOwnPinSkip(u: i32): boolean {
+  const x = recArgOfReach(u)
+  if x < 0 || !recOwnIsPin(x) { return false }
+  if nodeAt(u) is Call { return true }
+  const pt = recReachPinTy(u)
+  pt < 0 || !fieldStorageEq(pt, nodeTyIxOf(u), REC_STORE_DEPTH)
+}
+
+// D15180's refusal of a value `d` built as `dst` where `at` delivers it, handed on at its own type
+// elsewhere; `inst` where `at` is that delivery itself, at one instance of the generic around it.
+export function recKeptOwnMsg(
+  d: i32,
+  dst: i32,
+  at: i32,
+  inst: boolean,
+): string {
+  let how = " where line "
+    + i32ToStr(nodeLineOf(at))
+    + " delivers it, and it is handed on here at its own type"
+  if inst {
+    how = " by this delivery at one instance of the generic function around it, and "
+      + "kept at its own type at another"
+  }
+  recKeptWhat(d)
+    + " is built as "
+    + tyToStr(dst)
+    + how
+    + ", which stores a field differently; a record is shared, not copied, so one "
+    + "value cannot be both. Annotate it with one of the types, and copy it with an "
+    + "object literal for the other"
+}
+
+// The binding `p`, a `read ?? d`, defaults to where it can be built at the record `rep`: `d` names
+// an un-annotated `const` of a fresh record literal whose fields read back from `rep` exactly; else
+// -1 (D15217).
+function recCoalesceHeldOf(p: i32, rep: i32): i32 {
+  const n = nodeAt(p)
+  if !(n is BinExpr) || n.binOp != "??" || rep < 0 || rep >= T.tys.length {
+    return -1
+  }
+  const r = cwPeelValue(n.binRight)
+  if r < 0 || !(nodeAt(r) is Ident) || !(tyAt(rep) is TyObj) { return -1 }
+  const d = recHeldDecl(r)
+  const lit = recCoalesceHeldLit(d)
+  if lit < 0 { return -1 }
+  const own = nodeTyIxOf(lit)
+  if own < 0 || !recNullWidened(own, rep, false) { return -1 }
+  d
+}
+
+// The fresh record literal an un-annotated `const` `d` is initialised with, else -1.
+function recCoalesceHeldLit(d: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letType >= 0
+    || dn.letKw != "const"
+    || dn.letInit < 0
+  ) {
+    return -1
+  }
+  const lit = cwPeelValue(dn.letInit)
+  if lit >= 0 && nodeAt(lit) is ObjLit { lit } else { -1 }
 }
 
 // The record literal `p`, a `??`, defaults to where `rep` is a record; else -1.
