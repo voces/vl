@@ -2905,7 +2905,10 @@ function emitStructExprAsVariantBox(
   const codes: i32[] = []
   variantRowFields(vi, names, codes)
   fbI32Rel(RS_TAG, uTags[vi])
-  if (emitRecCopy(body, exprIx, ssi, variantHeap(vi), names, codes, fnIx) < 0) {
+  if (
+    emitRecCopy(body, exprIx, ssi, variantHeap(vi), -1, names, codes, fnIx)
+    < 0
+  ) {
     return -1
   }
   fbStructNew(uBoxIdx)
@@ -2915,22 +2918,83 @@ function emitStructExprAsVariantBox(
 // A fresh record at the heap `dHeap`, whose fields are `dNames` stored as `dCodes`, built from
 // the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
 // (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`.
+// `dRow` is the destination's struct row, or -1 for a variant row, whose fields are not nested.
 function emitRecCopy(
   body: u8[],
   exprIx: i32,
   ssi: i32,
   dHeap: i32,
+  dRow: i32,
   dNames: string[],
   dCodes: i32[],
   fnIx: i32,
 ): i32 {
   const held = coerceHeld
   coerceHeld = exprIx
-  const r = emitRecCopyFields(body, exprIx, ssi, dNames, dCodes, fnIx)
+  const r = emitRecCopyFields(body, exprIx, ssi, dRow, dNames, dCodes, fnIx)
   coerceHeld = held
   if r < 0 { return -1 }
   fbStructNew(dHeap)
   0
+}
+
+// The struct steps from the copied value to the record a nested copy level reads: each a heap and
+// a field index, applied after the value itself is read.
+let rcPathHeap: i32[] = []
+let rcPathField: i32[] = []
+
+// The value `exprIx` a copy reads, re-read or from `variantReboxSlot`, then each step of the path.
+function rcReadSource(
+  body: u8[],
+  exprIx: i32,
+  sHeap: i32,
+  reReadable: boolean,
+  fnIx: i32,
+) {
+  if reReadable {
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  } else {
+    fbLocalGet(variantReboxSlot)
+    fbRefCast(sHeap)
+  }
+  let k = 0
+  while k < rcPathHeap.length {
+    fbStructGet(rcPathHeap[k], rcPathField[k])
+    k = k + 1
+  }
+  0
+}
+
+// The destination row nested field `fj` of `dRow` is copied into, where its record is stored at
+// another row than the source row `sRow`'s field `sfi`; -1 where the field is not copied apart.
+function rcNestedRow(sRow: i32, sfi: i32, dRow: i32, fj: i32, code: i32): i32 {
+  if dRow < 0 || code != FC_STRUCT || sFieldTypeAt(sRow, sfi) != FC_STRUCT {
+    return -1
+  }
+  const sIn = sFieldTgtStructIdx(sRow, sfi)
+  const dIn = sFieldTgtStructIdx(dRow, fj)
+  if sIn < 0 || dIn < 0 || sIn >= sHeapIdx.length || dIn >= sHeapIdx.length {
+    return -1
+  }
+  if sHeapIdx[sIn] == sHeapIdx[dIn] { -1 } else { dIn }
+}
+
+// Whether any field of destination row `dRow` is copied at a nested row (`rcNestedRow`).
+function rcHasNested(
+  ssi: i32,
+  dRow: i32,
+  dNames: string[],
+  dCodes: i32[],
+): boolean {
+  let fj = 0
+  while fj < dNames.length {
+    const sfi = sFieldIndex(ssi, dNames[fj])
+    if sfi >= 0 && rcNestedRow(ssi, sfi, dRow, fj, dCodes[fj]) >= 0 {
+      return true
+    }
+    fj = fj + 1
+  }
+  false
 }
 
 // `emitRecCopy`'s field loop, with `exprIx` held so each read emits the record itself.
@@ -2938,6 +3002,7 @@ function emitRecCopyFields(
   body: u8[],
   exprIx: i32,
   ssi: i32,
+  dRow: i32,
   dNames: string[],
   dCodes: i32[],
   fnIx: i32,
@@ -2949,7 +3014,9 @@ function emitRecCopyFields(
     )
   }
   const sHeap = sHeapIdx[ssi]
-  const reReadable = dNames.length == 1 || exprReReadable(unwrapParen(exprIx))
+  const reReadable = exprReReadable(unwrapParen(exprIx))
+    || (dNames.length == 1
+    && !rcHasNested(ssi, dRow, dNames, dCodes))
   if !reReadable {
     if !fnUsesVariantRebox {
       return emitFail(
@@ -2959,9 +3026,50 @@ function emitRecCopyFields(
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
     fbLocalSet(variantReboxSlot)
   }
+  rcPathHeap = []
+  rcPathField = []
+  const dTy = recCopyTyOf(exprIx)
+  emitRecCopyLevel(
+    body,
+    exprIx,
+    sHeap,
+    reReadable,
+    ssi,
+    dRow,
+    dTy,
+    "",
+    dNames,
+    dCodes,
+    fnIx,
+  )
+}
+
+// One level of a copy: each field of destination `dNames`/`dCodes` read off source row `sRow` at
+// the current path, a nested record copied by the level below it. `dTy` is this level's checked
+// destination record and `pre` its field path (`j.`), which key the fields a copy unwraps.
+function emitRecCopyLevel(
+  body: u8[],
+  exprIx: i32,
+  sHeap: i32,
+  reReadable: boolean,
+  sRow: i32,
+  dRow: i32,
+  dTy: i32,
+  pre: string,
+  dNames: string[],
+  dCodes: i32[],
+  fnIx: i32,
+): i32 {
+  if sRow < 0 || sRow >= sHeapIdx.length {
+    return emitFailAt(
+      "emitProgram: a record copied at its delivery has no row",
+      exprIx,
+    )
+  }
+  const unwrap = recCopyUnwrapOf(exprIx)
   let fj = 0
   while fj < dNames.length {
-    const sfi = sFieldIndex(ssi, dNames[fj])
+    const sfi = sFieldIndex(sRow, dNames[fj])
     if sfi < 0 {
       return emitFailAt(
         "emitProgram: a copied record lacks a field of its destination",
@@ -2974,23 +3082,53 @@ function emitRecCopyFields(
       fj = fj + 1
       continue
     }
-    if reReadable {
-      if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-    } else {
-      fbLocalGet(variantReboxSlot)
-      fbRefCast(sHeap)
-    }
-    fbStructGet(sHeap, sfi)
-    // A field the checker recorded as unwrapped holds its own type's value in the wide row's box
-    // (`recCopyUnwrapOf`); its payload is that value (D15184).
-    if strListHas(recCopyUnwrapOf(exprIx), dNames[fj]) {
-      if emitUnboxToAtomKind(recCopyUnwrapKind(exprIx, dNames[fj])) < 0 {
-        return -1
+    const dFt = rcFieldTy(dTy, dNames[fj])
+    const nest = rcNestedRow(sRow, sfi, dRow, fj, dCodes[fj])
+    if nest >= 0 {
+      rcPathHeap.push(sHeapIdx[sRow])
+      rcPathField.push(sfi)
+      const names: string[] = []
+      const codes: i32[] = []
+      let k = 0
+      while k < sFieldCount[nest] {
+        names.push(sFieldNames[sFieldStart[nest] + k])
+        codes.push(sFieldTypeAt(nest, k))
+        k = k + 1
       }
+      const inner = nullableInnerOrNone(dFt)
+      const nTy = if inner >= 0 { inner } else { dFt }
+      const sIn = sFieldTgtStructIdx(sRow, sfi)
+      const r = emitRecCopyLevel(
+        body,
+        exprIx,
+        sHeap,
+        reReadable,
+        sIn,
+        nest,
+        nTy,
+        pre + dNames[fj] + ".",
+        names,
+        codes,
+        fnIx,
+      )
+      rcPathHeap.pop()
+      rcPathField.pop()
+      if r < 0 { return -1 }
+      fbStructNew(sHeapIdx[nest])
       fj = fj + 1
       continue
     }
-    const sk = fieldCodeNumKind(sFieldTypeAt(ssi, sfi))
+    if rcReadSource(body, exprIx, sHeap, reReadable, fnIx) < 0 { return -1 }
+    fbStructGet(sHeapIdx[sRow], sfi)
+    // A field the checker recorded as unwrapped holds its own type's value in the wide row's box
+    // (`recCopyUnwrapOf`); its payload is that value (D15184).
+    if strListHas(unwrap, pre + dNames[fj]) {
+      const kind = if dFt >= 0 { boxTagOfTy(dFt) } else { -1 }
+      if emitUnboxToAtomKind(kind) < 0 { return -1 }
+      fj = fj + 1
+      continue
+    }
+    const sk = fieldCodeNumKind(sFieldTypeAt(sRow, sfi))
     const vk = fieldCodeNumKind(dCodes[fj])
     if sk >= 0 && vk >= 0 && sk != vk {
       if njConvert(sk, vk) < 0 { return -1 }
@@ -3000,13 +3138,11 @@ function emitRecCopyFields(
   0
 }
 
-// The atom kind of field `name` of the record the copy at `exprIx` lands in (`recCopyTyOf`).
-function recCopyUnwrapKind(exprIx: i32, name: string): i32 {
-  const dst = recCopyTyOf(exprIx)
-  const d = if dst >= 0 && dst < T.tys.length { tyAt(dst) } else { tyAt(TY_ERR) }
+// The type of field `name` of the checked record `dTy`, or -1.
+function rcFieldTy(dTy: i32, name: string): i32 {
+  const d = if dTy >= 0 && dTy < T.tys.length { tyAt(dTy) } else { tyAt(TY_ERR) }
   if !(d is TyObj) { return -1 }
-  const ft = objFieldType(d, name)
-  if ft < 0 { -1 } else { boxTagOfTy(ft) }
+  objFieldType(d, name)
 }
 
 // The row a delivery of `exprIx` copies its record into (`recCopyTyOf`): a struct row, `-2 - vi`
@@ -3038,7 +3174,16 @@ function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
     const vi = -2 - row
     if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
     variantRowFields(vi, names, codes)
-    return emitRecCopy(body, exprIx, ssi, variantHeap(vi), names, codes, fnIx)
+    return emitRecCopy(
+      body,
+      exprIx,
+      ssi,
+      variantHeap(vi),
+      -1,
+      names,
+      codes,
+      fnIx,
+    )
   }
   if (
     row < 0
@@ -3057,7 +3202,7 @@ function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
     codes.push(sFieldTypeAt(row, fj))
     fj = fj + 1
   }
-  emitRecCopy(body, exprIx, ssi, sHeapIdx[row], names, codes, fnIx)
+  emitRecCopy(body, exprIx, ssi, sHeapIdx[row], row, names, codes, fnIx)
 }
 
 // Pushes variant row `vi`'s field names and codes onto `names` and `codes`, in layout order.
