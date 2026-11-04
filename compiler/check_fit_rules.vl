@@ -107,6 +107,7 @@ import {
   nodeRepUnionIx,
   optReadParts,
   recCopyTyIx,
+  recCopyUnwrap,
   setCtorKeys,
 } from "./check_core_state"
 import {
@@ -1858,6 +1859,8 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
     const cp = copies[ci]
     while recCopyTyIx.length <= cp { recCopyTyIx.push(-1) }
     recCopyTyIx[cp] = copyTys[ci]
+    const un = recCopyUnwrapNames(dst, own)
+    if un.length > 0 { recCopyUnwrap[cp] = un }
     ci = ci + 1
   }
   true
@@ -1977,12 +1980,43 @@ function recCopyNarrows(wide: i32, own: i32): boolean {
     if (
       !fieldStorageEq(wf, of, REC_STORE_DEPTH)
       && !(of == TY_NULL && nullableInnerOrNone(wf) >= 0)
+      && !recCopyUnwraps(wf, of)
     ) {
       return false
     }
     i = i + 1
   }
   true
+}
+
+// Whether a field stored as `wf` in the wide row is copied into own field `of` by unwrapping it:
+// `wf` is `of` or null, `of` is not. Sound for the copy because `own` is the copied call's own
+// result type, so every value its function builds holds an `of` there (D15184).
+function recCopyUnwraps(wf: i32, of: i32): boolean {
+  const inner = nullableInnerOrNone(wf)
+  of != TY_NULL && inner >= 0 && fieldStorageEq(inner, of, REC_STORE_DEPTH)
+}
+
+// The fields of record `own` a copy from wide row `wide` unwraps (`recCopyUnwraps`).
+function recCopyUnwrapNames(wide: i32, own: i32): string[] {
+  const out: string[] = []
+  const w = if wide >= 0 && wide < T.tys.length { tyAt(wide) } else { tyAt(TY_ERR) }
+  const o = if own >= 0 && own < T.tys.length { tyAt(own) } else { tyAt(TY_ERR) }
+  if !(w is TyObj) || !(o is TyObj) { return out }
+  let i = 0
+  while i < o.objFieldNames.length {
+    const wf = objFieldType(w, o.objFieldNames[i])
+    const of = o.objFieldTypes[i]
+    if (
+      wf >= 0
+      && !fieldStorageEq(wf, of, REC_STORE_DEPTH)
+      && recCopyUnwraps(wf, of)
+    ) {
+      out.push(o.objFieldNames[i])
+    }
+    i = i + 1
+  }
+  out
 }
 
 // Whether call `c` is an argument to a parameter typed `T` of a generic callee, or an element of a
@@ -2196,11 +2230,31 @@ function recReachHeldPin(
       && qn is Param
       && qn.parType >= 0
       && tsMentionsAnyName(annTsOf(qn.parType), [tv])
-      && (recHeldNotFrom(a, fd) || (deep && recHeldInside(a, fd, 8)))
+      && (recHeldNotFrom(a, fd)
+        || ((deep || recParamsMeet(g, i, j)) && recHeldInside(a, fd, 8)))
     ) {
       return true
     }
     j = j + 1
+  }
+  false
+}
+
+// Whether parameters `i` and `j` of `g` are both read, so values handed to the two can meet in its
+// body; a literal holding a held value then pins the instance at a bare reach too (D15129).
+function recParamsMeet(g: FuncDecl, i: i32, j: i32): boolean {
+  if i < 0 || j < 0 || i >= g.fnParams.length || j >= g.fnParams.length {
+    return false
+  }
+  recParamRead(g.fnParams[i]) && recParamRead(g.fnParams[j])
+}
+
+// Whether parameter `par` is read anywhere in its function.
+function recParamRead(par: i32): boolean {
+  cwIxBuild()
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    if cwIxKind[ow.row] == CW_OCC_USE { return true }
   }
   false
 }

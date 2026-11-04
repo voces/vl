@@ -84,6 +84,7 @@ import {
   omitFieldKey,
   omitFieldNull,
   recCopyTyOf,
+  recCopyUnwrapOf,
 } from "./check_core_state"
 import {
   nodeTyProvesNonNull,
@@ -118,6 +119,7 @@ import { covarRootFreshLocal, covarValueWriteState } from "./check_covar_write"
 import { EqCmpKind, eqCoreKindOfTyToken } from "./check_ty_relate"
 import {
   T,
+  TY_ERR,
   TY_F32,
   TY_F64,
   TY_I32,
@@ -133,6 +135,7 @@ import {
   listArmFitAcrossReps,
   numLitUnionBaseName,
   numLitUnionBaseTy,
+  objFieldType,
   oneListUnionRender,
   primNameStr,
   tyArrayElemIx,
@@ -908,12 +911,14 @@ import {
   asgYieldsNullLit,
   assignTargetReReads,
   binMixHardF64,
+  bundleRecordRowOfSigs,
   callIsArrSlice,
   callIsMapFilter,
   callLoweredKindOf,
   callResultMember,
   callResultMemberTy,
   calleeIsVoidExtern,
+  calleeReturnsRecord,
   calleeReturnsVoidOfRead,
   capCellName,
   capCellTargetOf,
@@ -2972,6 +2977,15 @@ function emitRecCopyFields(
       fbRefCast(sHeap)
     }
     fbStructGet(sHeap, sfi)
+    // A field the checker recorded as unwrapped holds its own type's value in the wide row's box
+    // (`recCopyUnwrapOf`); its payload is that value (D15184).
+    if strListHas(recCopyUnwrapOf(exprIx), dNames[fj]) {
+      if emitUnboxToAtomKind(recCopyUnwrapKind(exprIx, dNames[fj])) < 0 {
+        return -1
+      }
+      fj = fj + 1
+      continue
+    }
     const sk = fieldCodeNumKind(sFieldTypeAt(ssi, sfi))
     const vk = fieldCodeNumKind(dCodes[fj])
     if sk >= 0 && vk >= 0 && sk != vk {
@@ -2980,6 +2994,15 @@ function emitRecCopyFields(
     fj = fj + 1
   }
   0
+}
+
+// The atom kind of field `name` of the record the copy at `exprIx` lands in (`recCopyTyOf`).
+function recCopyUnwrapKind(exprIx: i32, name: string): i32 {
+  const dst = recCopyTyOf(exprIx)
+  const d = if dst >= 0 && dst < T.tys.length { tyAt(dst) } else { tyAt(TY_ERR) }
+  if !(d is TyObj) { return -1 }
+  const ft = objFieldType(d, name)
+  if ft < 0 { -1 } else { boxTagOfTy(ft) }
 }
 
 // The row a delivery of `exprIx` copies its record into (`recCopyTyOf`): a struct row, `-2 - vi`
@@ -27826,6 +27849,14 @@ function popRecvIsList(recvIx: i32, fnIx: i32) {
   exprArray(recvIx, fnIx)
 }
 
+// Whether `t` is `F | null` for a function type `F` of a tagged set, whose value is a member id.
+function popNulTagId(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const n = tyAt(t)
+  if !(n is TyNullable) || n.nInner < 0 { return false }
+  fnTagSetIsTagged(fnTagSetOfTy(n.nInner))
+}
+
 // A checked list read (`xs.pop()`/`xs.get(i)`) at a numeric-scalar element rep, delivered
 // as the `T | null` the checker gives it: the `{tag, anyref}` value-union box, absent →
 // the null tag. `vk` is the non-null member's kind. Mirrors the boolean arm one rep out —
@@ -28048,7 +28079,8 @@ function emitPopGo(
         // shared value box, built here. The statement caller passes `false` and keeps
         // the raw form, since boxing there would allocate for a value no one reads.
         if nulBox {
-          const pnk = tyNulNumScalarValKind(nodeTyIxOf(callIx))
+          // A tagged set's member id is an `i32`, boxed as one.
+          const pnk = if popNulTagId(nodeTyIxOf(callIx)) { 0 } else { tyNulNumScalarValKind(nodeTyIxOf(callIx)) }
           if pnk >= 0 {
             return emitPopNulBox(body, lIdx, lTy, aTy, pnk, getIdx, fnIx)
           }
@@ -37633,14 +37665,17 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
 function emitBundleResultPick(callIx: i32, target: i32, fnIx: i32): i32 {
   const cFn = nodeAt(fnStmts[target])
   const rp = bundleRetParamOf(fnStmts[target])
-  if rp < 0 || !(cFn is FuncDecl) || rp >= cFn.fnParams.length { return 0 }
+  const own = rp >= 0 && cFn is FuncDecl && rp < cFn.fnParams.length
+  // A function returning another's record as a call's value returns it as that record.
+  const rec = if own { [] } else { calleeReturnsRecord(fnStmts[target]) }
+  if !own && rec.length < 2 { return 0 }
   // A holder keeps the record whole and picks at each call through it (D15144).
   if elabCallKeepsRecordAt(nodeSrc[callIx] ?? callIx, elabKeyOfFn(fnIx)) {
     return 0
   }
   const m = callResultMember(callIx, fnIx)
   if m == -1 { return 0 }
-  const si = paramStructIdxOf(cFn.fnParams[rp])
+  const si = if own && cFn is FuncDecl { paramStructIdxOf(cFn.fnParams[rp]) } else { bundleRecordRowOfSigs(rec) }
   const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
   if fi < 0 || si < 0 || si >= sHeapIdx.length {
     return emitFailAt(

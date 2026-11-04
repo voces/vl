@@ -152,8 +152,9 @@ Deno.test({
 });
 
 // A refusal raised while a hole parameter's instance is lowered (D15010): the instance's body is
-// rebuilt into nodes minted after parsing, so the anchor is the instance's template, `take` on
-// line 3, in the module that declares it (D15155). The same shapes with `use` generic.
+// rebuilt into nodes minted after parsing, and the anchor is the line they were rebuilt from,
+// line 6 inside `take`, in the module that declares it (D15155, D15157). The same shapes with
+// `use` generic.
 const INSTANCE_WITNESS = `function id<T>(x: T): T { x }
 function use(ys) { print(ys.length) }
 function take(a) {
@@ -165,7 +166,7 @@ function take(a) {
 
 Deno.test({
   name:
-    "vl-emit-diag-position: a refusal inside a parameter's instance names its template, in its own module",
+    "vl-emit-diag-position: a refusal inside a parameter's instance names its body line, in its own module",
   ignore: !ENABLED,
   fn: async () => {
     const generic = INSTANCE_WITNESS.replace(
@@ -211,9 +212,9 @@ Deno.test({
           );
         }
         const blk = errorBlock(r.out);
-        if (!/at \S*lib\.vl:3:\d+/.test(blk)) {
+        if (!/at \S*lib\.vl:6:\d+/.test(blk)) {
           throw new Error(
-            `${s.name}: want the anchor at lib.vl:3 (\`take\`), got:\n${blk}`,
+            `${s.name}: want the anchor at lib.vl:6 (the refused read in \`take\`), got:\n${blk}`,
           );
         }
       } finally {

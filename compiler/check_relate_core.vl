@@ -5529,8 +5529,16 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     if holeSlotDeferring { return false }
     const args: i32[] = []
     if cwElemCallbackRecv(bd) >= 0 || !cwParamArgs(bd, args) { return false }
+    // An argument bound after the read has no widening facts yet, so the read is judged again
+    // after the pass (`holeSlotLateRun`): its refusal reports then, at the same location.
+    if !holeSlotReplaying && !inferQuiet && holeSlotArgsAhead(args, a) {
+      holeSlotLateNote(a, wp, pts)
+      return false
+    }
     for v in args {
-      if holeSlotArgJudge(v, rn.identName, path, wp, pts, 0) { return true }
+      if holeSlotArgJudge(v, rn.identName, path, wp, pts, 0, true) {
+        return true
+      }
     }
     return false
   }
@@ -5542,7 +5550,7 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     const cn = nodeAt(init)
     holeSlotRetApart = elem
     const rj = cn is Call
-      && holeSlotRetJudge(cn, rn.identName, path, wp, pts, 0)
+      && holeSlotRetJudge(cn, rn.identName, path, wp, pts, 0, true)
     holeSlotRetApart = false
     if rj { return true }
     if cn is Call { called = holeSlotCallRets(cn, rets) }
@@ -5564,13 +5572,74 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     nW,
     wp,
     pts,
-    elem
-      && (nW == 0
-      || elabFnListWidened(bd)
-      || elabFnSlotWidened(bd)
-      || path.length >= 2 && elabFnFieldWidened(bd, holeSlotPathSteps(path))
-      || holeSlotRepointLift(bd, cwBindingOf(root), path)),
+    elem && (nW == 0 || holeSlotWidenLift(bd, cwBindingOf(root), path)),
   )
+}
+
+// Whether the check widened the element at `path` of the binding `bd`, keyed `b`, to one set,
+// directly (D15137, D15138) or through the names it is re-pointed to (D15196), so a function
+// read there needs no common result with the binding's other writes.
+function holeSlotWidenLift(bd: i32, b: i32, path: string[]): boolean {
+  if path.length == 0 || path[path.length - 1] != "[]" { return false }
+  elabFnListWidened(bd)
+    || elabFnSlotWidened(bd)
+    || path.length >= 2 && elabFnFieldWidened(bd, holeSlotPathSteps(path))
+    || holeSlotRepointLift(bd, b, path)
+}
+
+// The slot reads `holeSlotJudge` left for after the pass, with their call types.
+let holeLateA: i32[] = []
+let holeLateWp: i32[][] = []
+let holeLatePts: i32[][] = []
+let holeSlotReplaying = false
+
+// Whether an argument in `args` names a binding declared after the read `a`.
+function holeSlotArgsAhead(args: i32[], a: i32): boolean {
+  for v in args {
+    const ix = parenPeelIx(v)
+    if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Ident {
+      const d = identDeclOf(ix)
+      if (
+        d >= 0
+        && d < P.nodes.length
+        && nodeAt(d) is LetDecl
+        && nodeStartTok(d) > nodeStartTok(a)
+      ) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// Leaves the read `a` at `wp` and `pts` for `holeSlotLateRun`, once.
+function holeSlotLateNote(a: i32, wp: i32[], pts: i32[]) {
+  if i32ListHas(holeLateA, a) { return 0 }
+  holeLateA.push(a)
+  holeLateWp.push(wp.slice(0, wp.length))
+  holeLatePts.push(pts.slice(0, pts.length))
+  0
+}
+
+// Judges each slot read `holeSlotJudge` left for after the pass, now that every binding it reads
+// through is checked: the same judge at a second time, after the producers of the facts it reads.
+export function holeSlotLateRun() {
+  holeSlotReplaying = true
+  let i = 0
+  while i < holeLateA.length {
+    holeSlotJudge(holeLateA[i], holeLateWp[i], holeLatePts[i])
+    i = i + 1
+  }
+  holeSlotReplaying = false
+  holeSlotLateReset()
+}
+
+// Forgets the reads left for after the pass.
+export function holeSlotLateReset() {
+  holeLateA = []
+  holeLateWp = []
+  holeLatePts = []
+  0
 }
 
 // Whether the `let` `bd`, keyed `b`, is bound and re-pointed only to names of containers the
@@ -5696,6 +5765,8 @@ function holeSlotRebase(root: i32, p0: string[], out: string[]): i32 {
 
 // `holeSlotJudge` for argument `v` handed to the parameter `pNm` the slot `path` reads: an
 // inline list literal's elements, or the slot of the binding it names, `depth` calls deep.
+// `lift` takes a widened slot's set as already joined; a delivery to a closed function type
+// passes false, since it calls every element at its one signature.
 function holeSlotArgJudge(
   v: i32,
   pNm: string,
@@ -5703,6 +5774,7 @@ function holeSlotArgJudge(
   wp: i32[],
   pts: i32[],
   depth: i32,
+  lift: boolean,
 ): boolean {
   const ix = parenPeelIx(v)
   if ix < 0 || ix >= P.nodes.length { return false }
@@ -5727,21 +5799,22 @@ function holeSlotArgJudge(
     )
   }
   if depth > 8 { return false }
-  if n is Call { return holeSlotRetJudge(n, pNm, path, wp, pts, depth) }
-  // A field or element read judges that slot of the binding it reads (D15199).
+  if n is Call { return holeSlotRetJudge(n, pNm, path, wp, pts, depth, lift) }
+  // A field or element read judges that slot of the binding it reads (D15199), with no lift:
+  // the instance reads such an argument's slot at the binding's checked type, not its widened set.
   if !(n is Ident) {
     const pre: string[] = []
     const rt = cwSlotPath(ix, pre)
     if rt < 0 || rt == ix || pre.length == 0 { return false }
     for st in path { pre.push(st) }
-    return holeSlotArgJudge(rt, pNm, pre, wp, pts, depth + 1)
+    return holeSlotArgJudge(rt, pNm, pre, wp, pts, depth + 1, false)
   }
   if !cwFramedNode(ix) { return false }
   // A binding bound to another place reads that place's slot.
   const rp: string[] = []
   const rx = holeSlotRebase(ix, path, rp)
   if rx != ix && rx >= 0 && rx < P.nodes.length {
-    return holeSlotArgJudge(rx, pNm, rp, wp, pts, depth + 1)
+    return holeSlotArgJudge(rx, pNm, rp, wp, pts, depth + 1, lift)
   }
   if cwKeyOfRoot(ix) < 0 { return false }
   const bd = cwSoleBinderAt(ix)
@@ -5749,7 +5822,7 @@ function holeSlotArgJudge(
   const init = parenPeelIx(cwBoundInitOf(cwBindingOf(ix)))
   if nodeAt(bd) is LetDecl && init >= 0 && init < P.nodes.length {
     const cn = nodeAt(init)
-    if cn is Call && holeSlotRetJudge(cn, pNm, path, wp, pts, depth) {
+    if cn is Call && holeSlotRetJudge(cn, pNm, path, wp, pts, depth, lift) {
       return true
     }
   }
@@ -5758,7 +5831,7 @@ function holeSlotArgJudge(
     const args: i32[] = []
     if cwElemCallbackRecv(bd) >= 0 || !cwParamArgs(bd, args) { return false }
     for a in args {
-      if holeSlotArgJudge(a, n.identName, path, wp, pts, depth + 1) {
+      if holeSlotArgJudge(a, n.identName, path, wp, pts, depth + 1, lift) {
         return true
       }
     }
@@ -5774,7 +5847,7 @@ function holeSlotArgJudge(
     nW,
     wp,
     pts,
-    false,
+    lift && holeSlotWidenLift(bd, cwBindingOf(ix), path),
   )
 }
 
@@ -5809,7 +5882,7 @@ export function holeSlotDeliveryJudge(v: i32, srcTy: i32, dstTy: i32): boolean {
       if rt >= 0 && rt != vx && !holeSlotRootCut(rt) { return false }
     }
   }
-  const out = holeSlotArgJudge(v, nm, ["[]"], pts, pts, 0)
+  const out = holeSlotArgJudge(v, nm, ["[]"], pts, pts, 0, false)
   ctnCutClear()
   out
 }
@@ -5837,11 +5910,12 @@ function holeSlotRetJudge(
   wp: i32[],
   pts: i32[],
   depth: i32,
+  lift: boolean,
 ): boolean {
   const rv: i32[] = []
   if !holeSlotCallRets(c, rv) { return false }
   for r in rv {
-    if holeSlotArgJudge(r, pNm, path, wp, pts, depth + 1) { return true }
+    if holeSlotArgJudge(r, pNm, path, wp, pts, depth + 1, lift) { return true }
   }
   false
 }
