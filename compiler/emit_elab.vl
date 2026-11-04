@@ -73,13 +73,32 @@ import {
 } from "./check_rec_rows"
 import {
   CW_FR_MOD,
+  CW_OCC_ASG,
+  CW_OCC_BIND,
+  CW_OCC_CALL,
+  CW_OCC_USE,
+  CW_UP_ASG_LHS,
+  CW_UP_CALLEE,
+  CW_UP_FIELD,
+  CW_UP_LETINIT,
+  CW_UP_OBJ,
   cwBindingWrittenValues,
   cwFnValueDeclOf,
   cwFrameOfDecl,
+  cwIxBuild,
+  cwIxKind,
+  cwIxNode,
   cwIxParent,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
   cwIxWant,
   cwLetWrittenInClosure,
+  cwOccNext,
+  cwOccWalk,
   cwPeelValue,
+  cwSlotWrittenValues,
+  cwUseInOtherFrame,
 } from "./check_write_scan"
 import { declIsExportedFn } from "./check_exp_obs"
 import { recHoleIdentityArg, recordRepTyAdopt } from "./check_fit_rules"
@@ -4515,6 +4534,10 @@ function elabResultScanReset() {
   elabHolderRecs = Map()
   elabResKeeps = Map()
   elabThroughMembers = Map()
+  elabSlotRecDecl = []
+  elabSlotRecField = []
+  elabSlotRecAt = []
+  elabPlaceRecs = Map()
   elabRecTable = []
   0
 }
@@ -4724,7 +4747,170 @@ function elabResultMembersNote() {
   if elabResCopies.length > 0 { elabCopyRecordsNote() }
   elabRetRecordKeepsNote()
   if elabResPlainCalls.length > 0 { elabPlainCallsNote() }
+  for c in elabResPlainCalls.keys() { elabSlotRecordNote(c) }
+  for c in elabCallKeys.keys() {
+    if !elabResPlainCalls.has(c) { elabSlotRecordNote(c) }
+  }
   0
+}
+
+// Each slot `d.f` of an un-annotated record literal the `let` `d` binds, holding a returned record
+// of members whole, keyed as the write scan keys slots (binding, path): an index into
+// `elabRecTable`.
+let elabSlotRecDecl: i32[] = []
+let elabSlotRecField: string[] = []
+let elabSlotRecAt: i32[] = []
+// Each call through such a field's place, with the record it calls a member of.
+let elabPlaceRecs: {[i32]: i32[]} = Map()
+
+// Call `c` in plain code, initialising field `f` of an un-annotated record literal bound by `let`
+// `d`, keeps its record whole there when every write of the slot `d.f` (`cwSlotWrittenValues`) is
+// such a call and every read of `d` is a read of a field: of `f`, a call through the place at one
+// of the record's signatures or the initialiser of a `const` read only by such calls.
+function elabSlotRecordNote(c: i32) {
+  if c < 0 || c >= P.nodes.length || !elabInPlainCode(c) { return 0 }
+  cwIxBuild()
+  if c >= cwIxUpKind.length || cwIxUpKind[c] != CW_UP_FIELD { return 0 }
+  const lit = cwIxUp[c]
+  const fx = cwIxUpAux[c]
+  const fiv = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+  if !(fiv is FieldInit) || lit < 0 || lit >= cwIxUpKind.length { return 0 }
+  if cwIxUpKind[lit] != CW_UP_LETINIT { return 0 }
+  const d = cwIxUp[lit]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || !(nodeAt(lit) is ObjLit) {
+    return 0
+  }
+  const rec = elabCallRecord(c, -1, 4)
+  if rec.length < 2 { return 0 }
+  const f = fiv.fiName
+  // Every value the slot is written is a call returning the same record.
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(d, [f], vals, ats) < 0 || vals.length == 0 { return 0 }
+  for v0 in vals {
+    const v = parenPeelIx(v0)
+    if (
+      v < 0
+      || v >= P.nodes.length
+      || !(nodeAt(v) is Call)
+      || !elabInPlainCode(v)
+    ) {
+      return 0
+    }
+    if !elabTyListSame(elabCallRecord(v, -1, 4), rec) { return 0 }
+  }
+  const places: i32[] = []
+  const ms: i32[] = []
+  const holders: i32[] = []
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const k = cwIxKind[ow.row]
+    const u = cwIxNode[ow.row]
+    if k == CW_OCC_USE {
+      if (
+        cwUseInOtherFrame(u)
+        || u >= cwIxUpKind.length
+        || cwIxUpKind[u] != CW_UP_OBJ
+      ) {
+        return 0
+      }
+      const m = cwIxUp[u]
+      const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+      if !(mn is Member) { return 0 }
+      if mn.memProp == f {
+        const uk = if m < cwIxUpKind.length { cwIxUpKind[m] } else { -1 }
+        if uk == CW_UP_CALLEE {
+          const pm = elabCallSigMember(cwIxUp[m], rec)
+          if pm < 0 { return 0 }
+          places.push(cwIxUp[m])
+          ms.push(pm)
+        } else if uk == CW_UP_LETINIT {
+          if !elabSlotHolderOk(cwIxUp[m], rec) { return 0 }
+          holders.push(cwIxUp[m])
+        } else if uk != CW_UP_ASG_LHS {
+          return 0
+        }
+      }
+    } else if k != CW_OCC_BIND && k != CW_OCC_ASG {
+      return 0
+    }
+  }
+  elabRecTable.push(rec)
+  const at = elabRecTable.length - 1
+  elabSlotRecDecl.push(d)
+  elabSlotRecField.push(f)
+  elabSlotRecAt.push(at)
+  elabAnyRetRecord = true
+  for v in vals { elabTriplePut(elabResKeeps, parenPeelIx(v), -1, 1) }
+  let i = 0
+  while i < places.length {
+    elabTriplePut(elabPlaceRecs, places[i], -1, at)
+    elabTriplePut(elabThroughMembers, places[i], -1, ms[i])
+    i = i + 1
+  }
+  for h in holders {
+    elabTriplePut(elabHolderRecs, h, -1, at)
+    for t in elabSlotHolderCalls(h) {
+      elabTriplePut(elabThroughMembers, t, -1, elabCallSigMember(t, rec))
+    }
+  }
+  0
+}
+
+// Whether `const` binding `h` holds record `rec` read from a slot: un-annotated, read only as the
+// callee of a call at one of the record's signatures, in its own frame.
+function elabSlotHolderOk(h: i32, rec: i32[]): boolean {
+  const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return false }
+  for t in elabSlotHolderCalls(h) {
+    if t < 0 || elabCallSigMember(t, rec) < 0 { return false }
+  }
+  true
+}
+
+// The calls through binding `h`, each a call row of its own (`CW_OCC_CALL`) in `h`'s frame; a -1
+// entry where `h` is read any other way.
+function elabSlotHolderCalls(h: i32): i32[] {
+  const out: i32[] = []
+  const hw = cwOccWalk(h)
+  while cwOccNext(hw) {
+    const k = cwIxKind[hw.row]
+    const u = cwIxNode[hw.row]
+    const cn = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+    let t = -1
+    if k == CW_OCC_CALL {
+      if cn is Call && cn.callFn >= 0 && !cwUseInOtherFrame(cn.callFn) { t = u }
+    } else if k == CW_OCC_USE {
+      // A read that is a call's callee is the same call, filed by the read.
+      const ok = u < cwIxUpKind.length && cwIxUpKind[u] == CW_UP_CALLEE
+      if ok && !cwUseInOtherFrame(u) { t = cwIxUp[u] }
+    } else if k == CW_OCC_BIND {
+      continue
+    }
+    if t < 0 || !i32ListHas(out, t) { out.push(t) }
+  }
+  out
+}
+
+// The record signatures slot `d.f` of the `let` `d` holds whole; none where it holds none.
+export function elabSlotFieldRecord(d: i32, f: string): i32[] {
+  let i = 0
+  while i < elabSlotRecDecl.length {
+    if elabSlotRecDecl[i] == d && elabSlotRecField[i] == f {
+      const at = elabSlotRecAt[i]
+      if at >= 0 && at < elabRecTable.length { return elabRecTable[at] }
+    }
+    i = i + 1
+  }
+  []
+}
+
+// The record signatures call `c` through a field's place calls a member of, under instance `k`;
+// none where it is no such call.
+export function elabPlaceRecordAt(c: i32, k: i32): i32[] {
+  const at = elabPairUnder(elabPlaceRecs, c, k)
+  if at >= 0 && at < elabRecTable.length { elabRecTable[at] } else { [] }
 }
 
 // For each instance of a function whose parameter a call hands a record whole, each copy of that
