@@ -77,8 +77,11 @@ import {
   CW_OCC_BIND,
   CW_OCC_CALL,
   CW_OCC_USE,
+  CW_UP_ARG,
   CW_UP_ASG_LHS,
+  CW_UP_ASG_RHS,
   CW_UP_CALLEE,
+  CW_UP_CMP,
   CW_UP_ELEM,
   CW_UP_FIELD,
   CW_UP_LETINIT,
@@ -4661,12 +4664,13 @@ function elabResCallHolder(d: i32): boolean {
   v >= 0 && v < P.nodes.length && elabResMayReturnRecord(v)
 }
 
-// Whether call `g` is an element of a list literal or a field of a record literal.
+// Whether call `g` is an element of a list literal, a field of a record literal, or stored by an
+// assignment or a call (a map's `d[k] = g` or `d.set(k, g)`).
 function elabResInLiteral(g: i32): boolean {
   if g < 0 || g >= cwIxParent.length { return false }
   const p = cwIxParent[g]
   const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
-  pn is ArrayLit || pn is FieldInit
+  pn is ArrayLit || pn is FieldInit || pn is BinExpr || pn is Call
 }
 
 // Whether call `v` can return a record: its callee names a function with no return annotation,
@@ -4794,24 +4798,30 @@ function elabSlotRecordNote(c: i32) {
     f = fiv.fiName
   } else if uk0 == CW_UP_ELEM {
     f = "[]"
+  } else if uk0 == CW_UP_ASG_RHS || uk0 == CW_UP_ARG {
+    f = "[]"
   } else {
     return 0
   }
-  if lit < 0 || lit >= cwIxUpKind.length || cwIxUpKind[lit] != CW_UP_LETINIT {
-    return 0
+  // A map's value is stored by `d[k] = c` or `d.set(k, c)` into a fresh `Map()`.
+  const md = if uk0 == CW_UP_ASG_RHS || uk0 == CW_UP_ARG { elabMapStoreDecl(c) } else { -1 }
+  const isMap = md >= 0
+  if !isMap {
+    if lit < 0 || lit >= cwIxUpKind.length || cwIxUpKind[lit] != CW_UP_LETINIT {
+      return 0
+    }
   }
-  const isList = f == "[]"
-  const d = cwIxUp[lit]
+  const isList = f == "[]" && !isMap
+  const d = if isMap { md } else { cwIxUp[lit] }
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const ln = nodeAt(lit)
   if !(dn is LetDecl) || dn.letType >= 0 { return 0 }
-  if isList && !(ln is ArrayLit) || !isList && !(ln is ObjLit) { return 0 }
+  if !isMap {
+    const ln = nodeAt(lit)
+    if isList && !(ln is ArrayLit) || !isList && !(ln is ObjLit) { return 0 }
+  }
   if elabSlotFieldRecord(d, f).length > 0 { return 0 }
   const rec = elabCallRecord(c, -1, 4)
   if rec.length < 2 { return 0 }
-  // One list per record holds it whole: a second list of the same record is not yet built at its
-  // record list, so it keeps its refusal (D15149).
-  if isList && elabSlotListOfRec(rec) { return 0 }
   // Every value the slot is written is a call returning the same record.
   const vals: i32[] = []
   const ats: i32[] = []
@@ -4845,16 +4855,37 @@ function elabSlotRecordNote(c: i32) {
       }
       const m = cwIxUp[u]
       const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
-      // The slot's own place: the field `f`, or any element of the list.
+      // The slot's own place: the field `f`, any element of the list, or a map's value read by
+      // index or `get`; its `set` is a write the slot's writes already hold.
       let own = false
-      if isList {
+      let place = m
+      if isMap {
+        if mn is Index {
+          own = true
+        } else if mn is Member && (mn.memProp == "get" || mn.memProp == "set") {
+          const mk = if m < cwIxUpKind.length { cwIxUpKind[m] } else { -1 }
+          if mk != CW_UP_CALLEE { return 0 }
+          own = mn.memProp == "get"
+          place = cwIxUp[m]
+        } else if !(mn is Member) || mn.memProp != "has" {
+          return 0
+        }
+      } else if isList {
         if mn is Index { own = true }
         else if !(mn is Member) || mn.memProp != "length" { return 0 }
       } else {
         if !(mn is Member) { return 0 }
         own = mn.memProp == f
       }
-      if own {
+      if own && isMap {
+        // A map's value reads as nullable: held by a `const` that is tested, called or copied.
+        const pk = if place >= 0 && place < cwIxUpKind.length { cwIxUpKind[place] } else { -1 }
+        if pk == CW_UP_ASG_LHS { continue }
+        if pk != CW_UP_LETINIT { return 0 }
+        const nh = cwIxUp[place]
+        if !elabSlotNulHolderOk(nh, rec, holders) { return 0 }
+        holders.push(nh)
+      } else if own {
         const uk = if m < cwIxUpKind.length { cwIxUpKind[m] } else { -1 }
         if uk == CW_UP_CALLEE {
           const pm = elabCallSigMember(cwIxUp[m], rec)
@@ -4888,28 +4919,72 @@ function elabSlotRecordNote(c: i32) {
   for h in holders {
     elabTriplePut(elabHolderRecs, h, -1, at)
     for t in elabSlotHolderCalls(h) {
-      elabTriplePut(elabThroughMembers, t, -1, elabCallSigMember(t, rec))
+      if t >= 0 {
+        elabTriplePut(elabThroughMembers, t, -1, elabCallSigMember(t, rec))
+      }
     }
   }
   0
 }
 
-// Whether a list slot already holds record `rec` whole.
-function elabSlotListOfRec(rec: i32[]): boolean {
-  let i = 0
-  while i < elabSlotRecDecl.length {
-    const at = elabSlotRecAt[i]
-    if (
-      elabSlotRecField[i] == "[]"
-      && at >= 0
-      && at < elabRecTable.length
-      && elabTyListSame(elabRecTable[at], rec)
-    ) {
-      return true
-    }
-    i = i + 1
+// The `let` binding a fresh `Map()` whose value call `c` stores, by `d[k] = c` or `d.set(k, c)`;
+// -1 for any other call.
+function elabMapStoreDecl(c: i32): i32 {
+  const up = cwIxUp[c]
+  const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+  let recv = -1
+  if un is BinExpr && un.binOp == "=" {
+    const l = nodeAt(parenPeelIx(un.binLeft))
+    if l is Index { recv = parenPeelIx(l.idxArr) }
+  } else if un is Call && cwIxUpAux[c] == 1 && un.callArgs.length == 2 {
+    const fm = nodeAt(parenPeelIx(un.callFn))
+    if fm is Member && fm.memProp == "set" { recv = parenPeelIx(fm.memObj) }
   }
-  false
+  if recv < 0 || !(nodeAt(recv) is Ident) { return -1 }
+  const d = identDeclOf(recv)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) { return -1 }
+  const mc = nodeAt(parenPeelIx(dn.letInit))
+  if !(mc is Call) || mc.callArgs.length != 0 { return -1 }
+  const mf = nodeAt(parenPeelIx(mc.callFn))
+  if (
+    mf is Ident
+    && mf.identName == "Map"
+    && identDeclOf(parenPeelIx(mc.callFn)) < 0
+  ) {
+    return d
+  }
+  -1
+}
+
+// Whether `const` binding `h`, holding a map's nullable value of record `rec`, is read only by a
+// comparison, a call through it at one of the record's signatures, or the initialiser of a `const`
+// copy (`elabSlotHolderOk`), which joins `copies`.
+function elabSlotNulHolderOk(h: i32, rec: i32[], copies: i32[]): boolean {
+  const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return false }
+  const hw = cwOccWalk(h)
+  while cwOccNext(hw) {
+    const k = cwIxKind[hw.row]
+    const u = cwIxNode[hw.row]
+    if k == CW_OCC_USE {
+      if cwUseInOtherFrame(u) || u >= cwIxUpKind.length { return false }
+      const uk = cwIxUpKind[u]
+      if uk == CW_UP_LETINIT {
+        if !elabSlotHolderOk(cwIxUp[u], rec) { return false }
+        copies.push(cwIxUp[u])
+      } else if uk == CW_UP_CALLEE {
+        if elabCallSigMember(cwIxUp[u], rec) < 0 { return false }
+      } else if uk != CW_UP_CMP {
+        return false
+      }
+    } else if k == CW_OCC_CALL {
+      if elabCallSigMember(u, rec) < 0 { return false }
+    } else if k != CW_OCC_BIND {
+      return false
+    }
+  }
+  true
 }
 
 // Whether `const` binding `h` holds record `rec` read from a slot: un-annotated, read only as the
