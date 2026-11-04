@@ -56,6 +56,7 @@ import {
   njSetPinFn,
   nodeRepTyIxOf,
   recCopyTyOf,
+  nodeCtxTyIxOf,
 } from "./check_core_state"
 import {
   bindGenUnionShapedArmInto,
@@ -97,6 +98,8 @@ import {
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
+import { repABNote } from "./emit_nullable_rets"
+import { repShadowOn } from "./emit_rep"
 import {
   CW_UP_ARG,
   cwFnValueDeclOf,
@@ -686,6 +689,7 @@ import {
   elabWalkPop,
   elabWalkPush,
   elabWalkTy,
+  elabWalkCtxProbe,
   elabWidenedRet,
   litRepTyAt,
   readNarrowedStoreAt,
@@ -16182,7 +16186,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     if ft < 0 && monoTyClosedFn(et) { ft = et }
     // An instance whose pins bind none of the holes its recorded type names: read `ann`'s
     // parameters, as a shared list's hole functions do at this instance's own pin.
-    if ft < 0 && (holeLam || shared) { ft = monoHoleLamAtAnnTy(et0, ann) }
+    if ft < 0 && (holeLam || shared) { ft = monoHoleLamAtAnnTyP(e, et0, ann) }
     // An element joining hole functions has no one instance: each arm's result at `ann` (D7840).
     if ft < 0 { ft = armFt }
   }
@@ -16341,7 +16345,7 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
     }
     const et = nodeTyIxOf(v)
     if ft < 0 && monoTyClosedFn(et) { ft = et }
-    if ft < 0 { ft = monoHoleLamAtAnnTy(et0, ann) }
+    if ft < 0 { ft = monoHoleLamAtAnnTyP(v, et0, ann) }
   }
   if !monoTyClosedFn(ft) { return 0 }
   const fty = tyAt(ft)
@@ -16751,6 +16755,11 @@ function monoHoleLamAtAnnTy(et: i32, ann: string): i32 {
 // The function type value `v` takes at the parameters `ann` spells, when `v` is a function or an
 // `if` joining functions whose results there are closed and agree; -1 otherwise.
 function monoValueAtAnnTy(v: i32, ann: string): i32 {
+  const r = monoValueAtAnnTy0(v, ann)
+  pdNote("valueAtAnn", v, nameToTy(ann), r)
+  r
+}
+function monoValueAtAnnTy0(v: i32, ann: string): i32 {
   const at = nameToTy(ann)
   if at < 0 || at >= T.tys.length { return -1 }
   const a = tyAt(at)
@@ -16795,6 +16804,7 @@ function monoValueRetAt(v: i32, qs: i32[], depth: i32): i32 {
 // would; -1 when it cannot take it (refused). The checker refuses a call that gives it a type it
 // does not take, at each instance of a generic body too (D12238).
 function monoPinWrittenLam(v: i32, ann: string, wf: i32): i32 {
+  pdNote("writtenLam", v, nameToTy(ann), -1)
   const x = unwrapParen(v)
   if x < 0 || !(nodeAt(x) is FuncDecl) { return 0 }
   const lfe = monoLamValueFe(x, wf)
@@ -17080,7 +17090,7 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   let ft = -1
   if monoLastInstFe >= 0 {
     ft = monoNodeTyAt(val, fnStmts[monoLastInstFe])
-    if !monoTyConcreteFn(ft) && holeLam { ft = monoHoleLamAtAnnTy(vt0, ann) }
+    if !monoTyConcreteFn(ft) && holeLam { ft = monoHoleLamAtAnnTyP(val, vt0, ann) }
   }
   // A value naming no one instance (a `let` written twice) takes the result its functions
   // agree on at the pin's parameters, as a list element does (D9010).
@@ -18283,7 +18293,7 @@ function monoStoredSlotFnTy(
     let vft = -1
     if monoLastInstFe >= 0 {
       vft = monoNodeTyAt(val, fnStmts[monoLastInstFe])
-      if !monoTyClosedFn(vft) && holeLam { vft = monoHoleLamAtAnnTy(vt0, ann) }
+      if !monoTyClosedFn(vft) && holeLam { vft = monoHoleLamAtAnnTyP(val, vt0, ann) }
     }
     // The instance's hole binding carries the result the checker guessed at a call it could not
     // see through; the function's own result at the pin is the one its instance returns (D9064).
@@ -20209,7 +20219,11 @@ function monoOpenFnListLitTy(recv: i32, ctx: i32): i32 {
 // The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
 // read through a binding initialised from another, a list element, a map value or a record
 // field, every value written there agreeing (D9173, D9502); -1 when none is found.
-function monoPinnedListAnnTy(recv: i32): i32 { monoPinnedAnnTyAt(recv, 0) }
+function monoPinnedListAnnTy(recv: i32): i32 {
+  const t = monoPinnedAnnTyAt(recv, 0)
+  pdNote("pinnedListAnn", recv, -1, t)
+  t
+}
 
 // Records the pinned list type `t` on a receiver read `recv` and on each un-annotated binding it
 // reads through, where the checker left them open, so a binding holds the type it is called at.
@@ -20431,6 +20445,7 @@ function monoCloseRetFnTy(ix: i32, ctx: i32) {
     return monoAskSplitRetCopies(ix)
   }
   const t = monoPinnedAnnTyAt(ix, 0)
+  pdNote("closeRetFn", ix, -1, t)
   if t >= 0 && !monoTyOpen(t) { monoRecordOpen(ix, t, ctx) }
   0
 }
@@ -28261,6 +28276,7 @@ function monoRetypePinCalls(d: i32, path: string[]): i32 {
           && ps.length == c.callArgs.length
           && monoWritesTypedAt(d, ps)
         ) {
+          pdNote("retypePinCalls", cf, -1, mkFuncTy(ps, r))
           nodeTyRecord(cf, mkFuncTy(ps, r))
         }
       }
@@ -30482,4 +30498,35 @@ function monoRetListRowName(ty: i32): string {
   const rn = monoRetRowName(t)
   if rn == "" { return "" }
   rn + suffix
+}
+
+// PROBE (group D): mono's answer beside the checker's destination stores at node `v`.
+function monoHoleLamAtAnnTyP(v: i32, et: i32, ann: string): i32 {
+  const r = monoHoleLamAtAnnTy(et, ann)
+  pdNote("holeLamAtAnn", v, nameToTy(ann), r)
+  r
+}
+function pdCmp(a: i32, b: i32): string {
+  if b < 0 || b >= T.tys.length { return "none" }
+  if a < 0 || a >= T.tys.length { return "mono-none" }
+  if a == b || tyEq(a, b) { return "eq" }
+  const ka = sigKeyOfTy(a)
+  if ka != "" && ka == sigKeyOfTy(b) { return "sig" }
+  if tyHasTyVar(b) { return "ne-open" }
+  "ne"
+}
+function pdNote(fam: string, v: i32, dst: i32, res: i32): i32 {
+  if !repShadowOn { return 0 }
+  const x = unwrapParen(v)
+  let c = nodeCtxTyIxOf(x)
+  if c < 0 { c = nodeCtxTyIxOf(v) }
+  const e = elabWalkCtxProbe(x)
+  const own = elabWalkTy(x)
+  const ot = if own >= 0 { own } else { nodeTyIxOf(x) }
+  repABNote(
+    "gd/" + fam,
+    "dst~ctx:" + pdCmp(dst, c) + " res~ctx:" + pdCmp(res, c),
+    "dst~ictx:" + pdCmp(dst, e) + " res~ictx:" + pdCmp(res, e) + " res~ty:" + pdCmp(res, ot),
+  )
+  0
 }
