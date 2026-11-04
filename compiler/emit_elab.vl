@@ -4789,6 +4789,8 @@ function elabResultMemberWith(c: i32, from: i32, rec: i32[]) {
   if m == -2 && packed >= 0 {
     m = elabArgParamMember(packed / 64, packed % 64, from, rec)
   }
+  // A value delivered to a destination declared at one closed function type takes that member.
+  if m == -2 { m = elabRecIndexOf(rec, elabDestDeclTy(c, 4)) }
   // A dropped value is stored as 1 and a member as itself plus 2, so -1 reads as no fact.
   if m >= -1 { elabTriplePut(elabResMembers, c, from, m + 2) }
   if m >= 0 { elabTriplePut(elabResTys, c, from, rec[m]) }
@@ -4821,6 +4823,120 @@ function elabArgParamMember(outer: i32, i: i32, from: i32, rec: i32[]): i32 {
     j = j + 1
   }
   -2
+}
+
+// The index in record `rec` of closed function type `t`; -2 for none.
+function elabRecIndexOf(rec: i32[], t: i32): i32 {
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || tyHasTyVar(t) {
+    return -2
+  }
+  let j = 0
+  while j < rec.length {
+    if tySame(rec[j], t) { return j }
+    j = j + 1
+  }
+  -2
+}
+
+// The type declared for the destination value node `x` is delivered to, or -1: an annotated
+// binding it initialises, the annotated return of the function it is returned from, a field or
+// element of a literal whose own destination is declared, the target of a plain assignment it is
+// the right side of, or the element of a typed list it is pushed onto or the value of a typed map
+// it is set into. `depth` bounds the literals walked through.
+function elabDestDeclTy(x: i32, depth: i32): i32 {
+  if depth <= 0 || x < 0 || x >= cwIxParent.length { return -1 }
+  let p = cwIxParent[x]
+  while p >= 0 && p < P.nodes.length && nodeAt(p) is Paren {
+    p = if p < cwIxParent.length { cwIxParent[p] } else { -1 }
+  }
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const pn = nodeAt(p)
+  if pn is LetDecl {
+    if pn.letType < 0 || parenPeelIx(pn.letInit) != x { return -1 }
+    return nodeTyIxOf(pn.letType)
+  }
+  if pn is RetStmt {
+    const f = elabEnclosingFn(p)
+    const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+    if fn is FuncDecl && fn.fnRet >= 0 { return nodeTyIxOf(fn.fnRet) }
+    return -1
+  }
+  if pn is FieldInit {
+    const o = if p < cwIxParent.length { cwIxParent[p] } else { -1 }
+    const ot = elabDestDeclTy(o, depth - 1)
+    if ot < 0 || ot >= T.tys.length { return -1 }
+    const t = tyAt(ot)
+    if !(t is TyObj) { return -1 }
+    let i = 0
+    while i < t.objFieldNames.length {
+      if t.objFieldNames[i] == pn.fiName { return t.objFieldTypes[i] }
+      i = i + 1
+    }
+    return -1
+  }
+  if pn is ArrayLit {
+    const at = elabDestDeclTy(p, depth - 1)
+    if at < 0 || at >= T.tys.length { return -1 }
+    const t = tyAt(at)
+    if t is TyArray { t.aElem } else { -1 }
+  } else if pn is BinExpr {
+    if (
+      pn.binOp != "="
+      || pn.binCompound != ""
+      || parenPeelIx(pn.binRight) != x
+    ) {
+      return -1
+    }
+    elabPlaceDeclTy(parenPeelIx(pn.binLeft))
+  } else if pn is Call {
+    const cf = parenPeelIx(pn.callFn)
+    const f = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
+    if !(f is Member) { return -1 }
+    const ot = elabPlaceDeclTy(parenPeelIx(f.memObj))
+    if ot < 0 || ot >= T.tys.length { return -1 }
+    const t = tyAt(ot)
+    if (
+      f.memProp == "push"
+      && pn.callArgs.length == 1
+      && parenPeelIx(pn.callArgs[0]) == x
+    ) {
+      if t is TyArray { return t.aElem }
+    }
+    if (
+      f.memProp == "set"
+      && pn.callArgs.length == 2
+      && parenPeelIx(pn.callArgs[1]) == x
+    ) {
+      if t is TyMap { return t.mVal }
+    }
+    -1
+  } else {
+    -1
+  }
+}
+
+// The declared type of place `l`: a binding's annotation, or the checker's type of a field or
+// element read; -1 for none.
+function elabPlaceDeclTy(l: i32): i32 {
+  if l < 0 || l >= P.nodes.length { return -1 }
+  const ln = nodeAt(l)
+  if ln is Ident {
+    const d = identDeclOf(l)
+    if d < 0 || d >= P.nodes.length { return -1 }
+    const dn = nodeAt(d)
+    if dn is LetDecl && dn.letType >= 0 { return nodeTyIxOf(dn.letType) }
+    return -1
+  }
+  if ln is Index {
+    // A map's slot and a list's element are the container's declared value and element type.
+    const ot = elabPlaceDeclTy(parenPeelIx(ln.idxArr))
+    const t = if ot >= 0 && ot < T.tys.length { tyAt(ot) } else { null }
+    if t is TyMap { return t.mVal }
+    if t is TyArray { return t.aElem }
+    return nodeTyIxOf(l)
+  }
+  if ln is Member { return nodeTyIxOf(l) }
+  -1
 }
 
 // For call `c` from instance `from` into instance `kc` returning a record, held whole by a
