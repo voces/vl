@@ -86,6 +86,7 @@ import {
   nodeCtxTyIxOf,
   omitFieldKey,
   omitFieldNull,
+  recCopyFromOf,
   recCopyTyOf,
   recCopyUnwrapOf,
 } from "./check_core_state"
@@ -105,7 +106,7 @@ import {
 import { listDisjointDepth, listFitLitLeafOf } from "./check_type_shape"
 import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
 import { litNumUnionBasesOf, u8LexValue } from "./check_literals"
-import { isVarTyIxOf, luIsTyOf } from "./check_list_union"
+import { isPatTyIxOf, isVarTyIxOf, luIsTyOf } from "./check_list_union"
 import {
   deliveryRetagHas,
   listWidenRetagAny,
@@ -335,6 +336,7 @@ import {
   isRecvStagedIx,
   isRecvStagedNonNull,
   isRecvStagedSlot,
+  isTestedLitLex,
   litLexIsMember,
   loopStackFind,
   mapShapeFoldSet,
@@ -1349,6 +1351,7 @@ import {
   sFieldMapShape,
   sFieldRefSlot,
   structRowFieldStoresAtom,
+  structRowOfAnnTy,
   variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
 import {
@@ -3153,7 +3156,16 @@ function rcFieldTy(dTy: i32, name: string): i32 {
 // copy is recorded.
 function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
   const dst = recCopyTyOf(exprIx)
-  if dst < 0 || !exprStruct(exprIx, fnIx) { return -1 }
+  if dst < 0 { return -1 }
+  // A call copied back to its own record lands in that record's row, read off its function's
+  // build at `recCopyFromOf` (D15246).
+  if recCopyFromOf(exprIx) >= 0 {
+    let dsi = structIndexOfTy(dst)
+    if dsi < 0 { dsi = structRowOfAnnTy("", dst, dst) }
+    if dsi < 0 || dsi >= sHeapIdx.length { return -1 }
+    return dsi
+  }
+  if !exprStruct(exprIx, fnIx) { return -1 }
   const ssi = structIndexOfExpr(exprIx, fnIx)
   if ssi < 0 || ssi >= sHeapIdx.length { return -1 }
   const vi = repVariantShapeRowOf(dst)
@@ -3172,7 +3184,9 @@ function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
 function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
   const names: string[] = []
   const codes: i32[] = []
-  const ssi = structIndexOfExpr(exprIx, fnIx)
+  // A call copied back to its own record is read at the row its function builds it at.
+  const from = recCopyFromOf(exprIx)
+  const ssi = if from >= 0 { structIndexOfTy(from) } else { structIndexOfExpr(exprIx, fnIx) }
   if row <= -2 {
     const vi = -2 - row
     if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
@@ -6026,7 +6040,13 @@ function emitIsTestArmTag(body: u8[], isIx: i32, ndv: IsExpr, fnIx: i32) {
   // `x is i32` over a literal box banks the literals it covers, held under the base's tag (D3522).
   if !tyIsPrimIx(patTy) {
     const plb = numLitUnionBaseTy(patTy)
-    if plb >= 0 && primNameStr(tyEmitPrimOf(plb)) == ndv.isVariant {
+    const pat = isPatTyIxOf(isIx)
+    if (
+      plb >= 0
+      && tyIsPrimIx(pat)
+      && tyEmitPrimOf(plb) != null
+      && tyEmitPrimOf(pat) == tyEmitPrimOf(plb)
+    ) {
       patTy = plb
     }
   }
@@ -6499,10 +6519,8 @@ function emitIsTestRungs(body: u8[], isIx: i32, fnIx: i32) {
   }
 
   if nd0 is IsExpr {
-    const lv = nd0.isVariant
-    if isLitVariantName(lv) {
-      return emitLitMemberEq(body, nd0.isObj, lv, fnIx)
-    }
+    const lv = isTestedLitLex(isVarTyIxOf(isIx))
+    if lv != "" { return emitLitMemberEq(body, nd0.isObj, lv, fnIx) }
   }
 
   if nd0 is IsExpr {
