@@ -201,6 +201,15 @@ Recorded, not built:
 - **D, landed:** `elabTopFn` admits a lambda whose enclosing scope is the module, with no
   function, block or loop around it, so it captures no local. With C1 in, the 57 fall to **51**,
   all EQ. Still refused: 7 nested or capturing lambdas.
+- **B, landed:** a `let` whose initialiser is not followed (`cwSlotWrittenValues` < 0) reads
+  its sources. A whole-binding copy (`b.slice(...)`, `[...b, v]`) holds `b`'s values and is
+  decided at its own calls. A slot read or a call's result (`w.f`, `xs[0]`, `m["k"] ?? []`, `mk()`)
+  takes that slot's fact, and must agree with what its own writes store. The 51 fall to **47**,
+  with 0 disagreements over the 253 files.
+- **C2a, held to land with B's flow-sensitive follow-up:** a slot read only where it is
+  delivered at a closed function type takes that type. Built, and it closes 0: its two `zs`
+  slots join a pushed `inc` that the delivered type cannot take, and mono reads them after a
+  reassignment.
 - **E, G, H:** folded in when A, B or C touches the same code.
 - **F:** set dispatch (step 4), not a missing fact.
 
