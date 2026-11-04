@@ -528,10 +528,12 @@ import {
   cwKeyOfRoot,
   cwParamArgs,
   cwPeel,
+  cwSlotDescend,
   cwSlotPath,
   cwSlotValuesFrom,
   cwSlotWrittenValues,
   cwSoleBinderAt,
+  cwUfcsDeclOf,
   fnDeclIx,
 } from "./check_write_scan"
 import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
@@ -5510,11 +5512,21 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     p0.push("[]")
   } else {
     root = cwSlotPath(a, p0)
+    if root < 0 { return holeSlotCallRootJudge(a, wp, pts) }
   }
   if root < 0 || p0.length == 0 || !cwFramedNode(root) { return false }
   const path: string[] = []
   root = holeSlotRebase(root, p0, path)
   if root < 0 || root >= P.nodes.length || !cwFramedNode(root) { return false }
+  // A binding bound once to a place a call's result is read through reads that place.
+  if nodeAt(root) is Ident && cwKeyOfRoot(root) >= 0 {
+    const cp: string[] = []
+    const c = holeSlotCallPath(cwBoundInitOf(cwBindingOf(root)), cp)
+    if c >= 0 && cp.length > 0 {
+      for st in path { cp.push(st) }
+      return holeSlotCallJudgeAt(c, cp, wp, pts)
+    }
+  }
   // A call through an element fixes the tuple of the member it runs (D3975 A), so an element
   // holding only its initialiser's functions needs no common result (D14435).
   const elem = path.length > 0 && path[path.length - 1] == "[]"
@@ -5574,6 +5586,110 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     pts,
     elem && (nW == 0 || holeSlotWidenLift(bd, cwBindingOf(root), path)),
   )
+}
+
+// `holeSlotJudge` for a slot read `a` rooted at a call, `mk()[1].f`: every function the call's
+// returns store there judged at `wp`, as for a binding the call initialises (D15221, D15225).
+function holeSlotCallRootJudge(a: i32, wp: i32[], pts: i32[]): boolean {
+  const path: string[] = []
+  const c = holeSlotCallPath(a, path)
+  if c < 0 || path.length == 0 { return false }
+  holeSlotCallJudgeAt(c, path, wp, pts)
+}
+
+// `holeSlotCallRootJudge` for the slot `path` (root first) of what the call `c` returns.
+function holeSlotCallJudgeAt(
+  c: i32,
+  path: string[],
+  wp: i32[],
+  pts: i32[],
+): boolean {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return false }
+  const nm = holeCallRootName(cn)
+  if nm == "" { return false }
+  const elem = path[path.length - 1] == "[]"
+  holeSlotRetApart = elem
+  const rj = holeSlotRetJudge(cn, nm, path, wp, pts, 0, true)
+  holeSlotRetApart = false
+  if rj { return true }
+  const rets: i32[] = []
+  if !holeSlotCallRetsDeep(cn, rets, 0) { return false }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  for r in rets {
+    if !cwSlotDescend(r, path, 0, -1, vals, ats) { return false }
+  }
+  holeSlotValsJudge(
+    holeSlotName(nm, path),
+    holeSlotSpell(nm, path),
+    vals,
+    ats,
+    0,
+    wp,
+    pts,
+    elem,
+  )
+}
+
+// The call the place `a` reads through list elements, map values and record fields is rooted
+// at, its steps in `path` root first as `cwSlotPath` gives a name's; -1 for any other root.
+function holeSlotCallPath(a: i32, path: string[]): i32 {
+  const rev: string[] = []
+  let ix = cwPeel(a)
+  while ix >= 0 && ix < P.nodes.length && rev.length < 16 {
+    const n = nodeAt(ix)
+    if cwGetRecv(ix) >= 0 {
+      rev.push("[]")
+      ix = cwPeel(cwGetRecv(ix))
+    } else if n is Call {
+      let k = rev.length - 1
+      while k >= 0 {
+        path.push(rev[k])
+        k = k - 1
+      }
+      return ix
+    } else if n is Index {
+      rev.push("[]")
+      ix = cwPeel(n.idxArr)
+    } else if n is Member {
+      rev.push(n.memProp)
+      ix = cwPeel(n.memObj)
+    } else if n is OptMember {
+      rev.push(n.omProp)
+      ix = cwPeel(n.omObj)
+    } else {
+      return -1
+    }
+  }
+  -1
+}
+
+// How a diagnostic names the call `c` a slot is rooted at, by the function it runs: `mk()`; ""
+// for a callee that is no named function.
+function holeCallRootName(c: Call): string {
+  const d = cwCalleeDeclOf(c.callFn)
+  const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if f is FuncDecl && f.fnName != "" { return f.fnName + "()" }
+  ""
+}
+
+// `holeSlotCallRets`, each returned call of such a function replaced by its own returns, at
+// most 8 calls deep; false when a call reached is not one `holeSlotCallRets` follows.
+function holeSlotCallRetsDeep(c: Call, out: i32[], depth: i32): boolean {
+  if depth > 8 { return false }
+  const rv: i32[] = []
+  if !holeSlotCallRets(c, rv) { return false }
+  for r in rv {
+    const x = cwPeel(r)
+    const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if xn is Call && cwGetRecv(x) < 0 {
+      if !holeSlotCallRetsDeep(xn, out, depth + 1) { return false }
+    } else {
+      out.push(r)
+    }
+  }
+  true
 }
 
 // Whether the check widened the element at `path` of the binding `bd`, keyed `b`, to one set,
@@ -5920,20 +6036,20 @@ function holeSlotRetJudge(
   false
 }
 
-// Adds to `out` each value the top-level function declaring no type parameter that `c` calls
-// returns; false when `c` calls anything else.
+// Adds to `out` each value the top-level function declaring no type parameter that `c` calls,
+// by name or as a UFCS method, returns; false when `c` calls anything else.
 export function holeSlotCallRets(c: Call, out: i32[]): boolean {
   if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
   const cf = nodeAt(parenPeelIx(c.callFn))
-  if !(cf is Ident) { return false }
-  const fx = fnDeclIx[cf.identName] ?? -1
-  if (
-    fx < 0
-    || fx >= P.nodes.length
-    || identFnDeclOf(parenPeelIx(c.callFn)) != fx
-  ) {
-    return false
+  // A UFCS call `x.mk()` runs the `self`-function its member names.
+  let fx = -1
+  if cf is Member {
+    fx = cwUfcsDeclOf(c.callFn)
+  } else if cf is Ident {
+    fx = fnDeclIx[cf.identName] ?? -1
+    if identFnDeclOf(parenPeelIx(c.callFn)) != fx { return false }
   }
+  if fx < 0 || fx >= P.nodes.length { return false }
   const fd = nodeAt(fx)
   if !(fd is FuncDecl) || fd.fnTyParams.length > 0 || fd.fnBody < 0 {
     return false
