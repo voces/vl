@@ -97,6 +97,8 @@ import {
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
+import { repABNote } from "./emit_nullable_rets"
+import { repShadowOn } from "./emit_rep"
 import {
   CW_UP_ARG,
   cwFnValueDeclOf,
@@ -674,6 +676,7 @@ import {
   elabSlotRecCount,
   elabSlotRecDeclAt,
   elabSlotTyAt,
+  elabSlotWhyOf,
   elabSrcDecl,
   elabStampAt,
   elabStubArgSet,
@@ -797,6 +800,7 @@ import {
   fnTagSetTy,
   fnTagTyIsTagged,
   paramCopySeedOf,
+  fnSlotCallState,
 } from "./check_elab_cap"
 
 // D943 — the lifted slots `monoPinBodyLambdas` minted for the instance being built. A
@@ -16201,6 +16205,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       monoRetypeMethodReads(ctx, at, "pop", mkNullableTy(ft))
     }
   }
+  gfNote("listElems", at, path, ctx, ft)
   if !monoTyClosedFn(ft) { return 0 }
   const fty = tyAt(ft)
   if !(fty is TyFunc) { return 0 }
@@ -16343,6 +16348,7 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
     if ft < 0 && monoTyClosedFn(et) { ft = et }
     if ft < 0 { ft = monoHoleLamAtAnnTy(et0, ann) }
   }
+  gfNote("nestedList", lf[1], ["e", "e"], ctx, ft)
   if !monoTyClosedFn(ft) { return 0 }
   const fty = tyAt(ft)
   if !(fty is TyFunc) { return 0 }
@@ -17087,6 +17093,7 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   // A value naming no one instance (a `let` written twice) takes the result its functions
   // agree on at the pin's parameters, as a list element does (D9010).
   if !monoTyConcreteFn(ft) { ft = monoValueAtAnnTy(val, ann) }
+  gfNote("recordField", at, path, ctx, ft)
   if !monoTyConcreteFn(ft) { return 0 }
   const vt = nodeTyIxOf(val)
   // A generic's instances share `val`, so its type stays open there (D5079).
@@ -18303,6 +18310,7 @@ function monoStoredSlotFnTy(
   // A map no write here reaches, such as one a call returns, takes the result every function
   // its slot can hold agrees on at the pinned parameters.
   if vals.length == 0 { ft = monoHeldSrcsFnTy(at, path) }
+  gfNote("storedSlot", at, path, lf[0], ft)
   if ft < 0 { return -1 }
   const fty = tyAt(ft)
   if !(fty is TyFunc) { return -1 }
@@ -20211,7 +20219,14 @@ function monoOpenFnListLitTy(recv: i32, ctx: i32): i32 {
 // The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
 // read through a binding initialised from another, a list element, a map value or a record
 // field, every value written there agreeing (D9173, D9502); -1 when none is found.
-function monoPinnedListAnnTy(recv: i32): i32 { monoPinnedAnnTyAt(recv, 0) }
+function monoPinnedListAnnTy(recv: i32): i32 {
+  const t = monoPinnedAnnTyAt(recv, 0)
+  const x = unwrapParen(recv)
+  const d = if x >= 0 && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+  const none: string[] = []
+  if d >= 0 { gfNote("pinnedListAnn", d, none, -1, t) }
+  t
+}
 
 // Records the pinned list type `t` on a receiver read `recv` and on each un-annotated binding it
 // reads through, where the checker left them open, so a binding holds the type it is called at.
@@ -20433,6 +20448,11 @@ function monoCloseRetFnTy(ix: i32, ctx: i32) {
     return monoAskSplitRetCopies(ix)
   }
   const t = monoPinnedAnnTyAt(ix, 0)
+  if n is Call {
+    const fd = monoCalleeDeclOf(n)
+    const none: string[] = []
+    if fd >= 0 { gfNote("closeRetFn", fd, none, ctx, t) }
+  }
   if t >= 0 && !monoTyOpen(t) { monoRecordOpen(ix, t, ctx) }
   0
 }
@@ -28263,6 +28283,7 @@ function monoRetypePinCalls(d: i32, path: string[]): i32 {
           && ps.length == c.callArgs.length
           && monoWritesTypedAt(d, ps)
         ) {
+          gfNote("retypePinCalls", d, path, -1, mkFuncTy(ps, r))
           nodeTyRecord(cf, mkFuncTy(ps, r))
         }
       }
@@ -30484,4 +30505,67 @@ function monoRetListRowName(ty: i32): string {
   const rn = monoRetRowName(t)
   if rn == "" { return "" }
   rn + suffix
+}
+
+// PROBE (group D on the slot fact): mono's answer `t` beside `elabSlotTyAt(holder, path, ctx)`.
+function gfNote(fam: string, holder: i32, path: string[], ctx: i32, t: i32): i32 {
+  if !repShadowOn { return 0 }
+  const f = elabSlotTyAt(holder, path, ctx)
+  const g = if ctx >= 0 && monoFrameIsGenericInstance(ctx) { "gen" } else { "plain" }
+  const mt = if t >= 0 && t < T.tys.length && !tyHasTyVar(t) { "closed" } else if t >= 0 { "open" } else { "none" }
+  let c = "fact-none/" + gfHolderKind(holder) + "/" + gfSlotState(holder, path) + "/" + elabSlotWhyOf(holder) + "/" + fnSlotCallState(holder, path)
+  if f >= 0 {
+    if mt != "closed" { c = "mono-" + mt }
+    else if t == f || tyEq(t, f) { c = "EQ" }
+    else if sigKeyOfTy(t) != "" && sigKeyOfTy(t) == sigKeyOfTy(f) { c = "SIG" }
+    else { c = "NE" }
+  }
+  let ps = ""
+  for p in path { ps = ps + p + "/" }
+  repABNote("gf/" + fam, g + " " + ps + " mono:" + mt, c)
+  0
+}
+function gfHolderKind(h: i32): string {
+  if h < 0 || h >= P.nodes.length { return "none" }
+  const n = nodeAt(h)
+  if n is FuncDecl { return if n.fnRet >= 0 { "fn-ann" } else if n.fnTyParams.length > 0 { "fn-gen" } else { "fn" } }
+  if n is LetDecl {
+    if n.letType >= 0 { return "let-ann" }
+    const t = nodeTyIxOf(h)
+    if t < 0 || t >= T.tys.length { return "let-?" }
+    const o = tyAt(t)
+    if o is TyArray { return "let-list" }
+    if o is TyObj { return "let-rec" }
+    if o is TyMap { return "let-map" }
+    if o is TyFunc { return "let-fn" }
+    return "let-other"
+  }
+  if n is Param { return "param" }
+  "other"
+}
+function gfSlotState(h: i32, path: string[]): string {
+  if h < 0 || h >= P.nodes.length { return "?" }
+  let t = nodeTyIxOf(h)
+  const hn = nodeAt(h)
+  if hn is FuncDecl {
+    const ft = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    t = if ft is TyFunc { ft.fnRet } else { -1 }
+  }
+  for p in path {
+    if t < 0 || t >= T.tys.length { return "?" }
+    const o = tyAt(t)
+    if p == "e" && o is TyArray { t = o.aElem }
+    else if p == "v" && o is TyMap { t = o.mVal }
+    else if o is TyObj && p.length > 2 && p.slice(0, 2) == "f." {
+      const nm = p.slice(2, p.length)
+      let nx = -1
+      let i = 0
+      while i < o.objFieldNames.length {
+        if o.objFieldNames[i] == nm { nx = o.objFieldTypes[i] }
+        i = i + 1
+      }
+      t = nx
+    } else { return "?" }
+  }
+  if t < 0 || t >= T.tys.length { "?" } else if tyHasTyVar(t) { "open" } else { "closed" }
 }
