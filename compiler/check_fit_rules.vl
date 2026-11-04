@@ -141,6 +141,7 @@ import {
   elabFnIdOf,
   elabTyClosed,
   fnLetIsWide,
+  fnTagHeldRepOf,
   stampsStand,
 } from "./check_elab_cap"
 import { boundObjRootOf } from "./check_decl_scan"
@@ -557,6 +558,7 @@ import {
   cwIxUpKind,
   cwKeyFrame,
   cwKeyOfRoot,
+  cwLetUnwritten,
   cwOccNext,
   cwOccWalk,
   cwPeel,
@@ -2855,6 +2857,21 @@ function recSitesLandApart(fd: i32, own: i32, dst: i32): boolean {
   false
 }
 
+// The record a queued delivery of `src` as `dstTy` lands at: the default of a `??` over a read
+// built wider is delivered at the read's record, as the store column delivers it (D15317).
+function recCoalesceDefaultLanding(src: i32, dstTy: i32): i32 {
+  const v = cwPeelValue(src)
+  if v < 0 || v >= cwIxUpKind.length || cwIxUpKind[v] != CW_UP_COAL {
+    return dstTy
+  }
+  const q = cwIxUp[v]
+  const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
+  if !(qn is BinExpr) || cwPeelValue(qn.binRight) != v { return dstTy }
+  const b = recBuiltReadTy(q)
+  const r = if b >= 0 { nonNullTy(b) } else { -1 }
+  if r >= 0 && r < T.tys.length && tyAt(r) is TyObj { r } else { dstTy }
+}
+
 // The record a queued delivery lands call `c`'s record of `own` on, through generic identities
 // only it pins and the fields and elements of literals; -1 when no queued delivery reaches `c` or
 // two land it differently.
@@ -2868,7 +2885,7 @@ function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
     }
     const t = recLandingIn(
       recPendSrc[i],
-      recPendDstTy[i],
+      recCoalesceDefaultLanding(recPendSrc[i], recPendDstTy[i]),
       c,
       own,
       REC_STORE_DEPTH,
@@ -3536,7 +3553,8 @@ export function recHeldLitPlaceAdopt(l: i32) {
   cwIxBuild()
   if l < 0 || l >= cwIxUp.length || cwIxUpKind[l] != CW_UP_LETINIT { return 0 }
   const d = cwIxUp[l]
-  if recCoalesceHeldLit(d) != l { return 0 }
+  const written = recCoalesceHeldLit(d) != l
+  if written && recWrittenLetLit(d) != l { return 0 }
   const own = nodeTyIxOf(l)
   const ats: i32[] = []
   const reps: i32[] = []
@@ -3551,7 +3569,9 @@ export function recHeldLitPlaceAdopt(l: i32) {
   }
   let i = 0
   while i < ats.length {
-    if recAsgBindInit(ats[i]) >= 0 {
+    if written {
+      recHeldLetWritesAt(d, l, reps[i], ats[i], ats)
+    } else if recAsgBindInit(ats[i]) >= 0 {
       recHeldAsgStamp(d, reps[i], ats[i], ats)
     } else {
       recHeldBindAdopt(d, reps[i], ats[i], ats)
@@ -3661,7 +3681,7 @@ export function recHeldElemBuilt(x: i32): i32 {
 
 // The record the elements of an element of the list binding read `a` are built at, from its
 // list literal initialiser's rep stamp (`T[][]`), through bindings of bindings; else -1.
-function recElemOfElemStamp(a: i32): i32 {
+export function recElemOfElemStamp(a: i32): i32 {
   if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) { return -1 }
   const d = recBindDeclOf(a)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
@@ -3724,7 +3744,9 @@ export function recAsgFnWidenedTy(p: i32): i32 {
   ) {
     return -1
   }
-  let t = nodeTyIxOf(d)
+  // A holder of a tagged set's ids is built at the rep the tag stamped on it (D15350).
+  const held = fnTagHeldRepOf(d)
+  let t = if held >= 0 { held } else { nodeTyIxOf(d) }
   let k = steps.length - 1
   while k >= 0 {
     const st = steps[k]
@@ -4017,16 +4039,83 @@ function recCoalesceHeldInit(d: i32): i32 {
   if c >= 0 && nodeAt(c) is Call && recInferredFnOf(c) >= 0 { c } else { -1 }
 }
 
-// The fresh record literal an un-annotated `const` `d` is initialised with, else -1.
-function recCoalesceHeldLit(d: i32): i32 {
+// The fresh record literal an un-annotated `let` `d` that is reassigned is initialised with,
+// else -1 (D15374).
+function recWrittenLetLit(d: i32): i32 {
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if (
     !(dn is LetDecl)
     || dn.letType >= 0
-    || dn.letKw != "const"
+    || dn.letKw != "let"
     || dn.letInit < 0
   ) {
     return -1
+  }
+  const lit = cwPeelValue(dn.letInit)
+  if lit >= 0 && lit < P.nodes.length && nodeAt(lit) is ObjLit {
+    lit
+  } else {
+    -1
+  }
+}
+
+// Builds the reassigned fresh record `let` `d`, initialised with literal `l` and delivered at `p`
+// into a place held at the record `rep`, there: every record literal written into it is stamped
+// at `rep`, a value held at its own storage written into it is refused, and each delivery of it
+// at its own storage outside `skip` is refused (D15374).
+function recHeldLetWritesAt(
+  d: i32,
+  l: i32,
+  rep: i32,
+  p: i32,
+  skip: i32[],
+): boolean {
+  adoptLitAt(l, rep)
+  const w = cwOccWalk(d)
+  while cwOccNext(w) {
+    const a = if cwIxKind[w.row] == CW_OCC_ASG { cwIxNode[w.row] } else { -1 }
+    const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+    const leaves: i32[] = []
+    if an is BinExpr && an.binOp == "=" { tailValueLeaves(an.binRight, leaves) }
+    for v in leaves {
+      if nodeAt(v) is ObjLit {
+        adoptLitAt(v, rep)
+      } else {
+        const vt = nodeTyIxOf(v)
+        // A read its container builds at `rep` is already stored there.
+        const vb = recBuiltReadTy(v)
+        const held = vb >= 0
+          && fieldStorageEq(nonNullTy(vb), rep, REC_STORE_DEPTH)
+        if vt >= 0 && !held && !fieldStorageEq(vt, rep, REC_STORE_DEPTH) {
+          recAdRaising = true
+          tErr(
+            recKeptWhat(d)
+              + " is built as "
+              + tyToStr(rep)
+              + " where line "
+              + i32ToStr(nodeLineOf(p))
+              + " delivers it, and this value of its own type is assigned into it, which stores a "
+              + "field differently; a record is shared, not copied. Copy it with an object literal",
+            v,
+          )
+          recAdRaising = false
+        }
+      }
+    }
+  }
+  recHeldOwnRefuse(d, rep, p, skip)
+}
+
+// The fresh record literal an un-annotated `const`, or `let` nothing reassigns, `d` is
+// initialised with, else -1.
+function recCoalesceHeldLit(d: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  // A `let` nothing reassigns holds its literal as a `const` does; the index is built first, so
+  // the answer does not hang on whether a reader before this one built it (D15283).
+  if dn.letKw != "const" {
+    cwIxBuild()
+    if !cwLetUnwritten(d) { return -1 }
   }
   const lit = cwPeelValue(dn.letInit)
   if lit >= 0 && nodeAt(lit) is ObjLit { lit } else { -1 }

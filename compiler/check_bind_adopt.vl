@@ -14,6 +14,7 @@ import {
   ObjLit,
   P,
   Param,
+  Spread,
   TypeRef,
   callHasTyArgs,
   nodeAt,
@@ -56,8 +57,10 @@ import {
   recAsgFnWidenedTy,
   recBuiltReadTy,
   recBuiltReadTyIn,
+  recElemOfElemStamp,
   recEnclosingFn,
   recFieldRead,
+  recHeldElemBuilt,
   recHeldListSpreadAdopt,
   recHeldLitPlaceAdopt,
   recHoleIdentityArg,
@@ -606,6 +609,11 @@ export function recListLitsBuild() {
   0
 }
 
+// `recLitFnFieldsAt` from the top: record literal `l` built at record `r` (D15350).
+export function recLitFnFieldsRestamp(l: i32, r: i32) {
+  recLitFnFieldsAt(l, r, 0)
+}
+
 // Builds record literal `l` at record `r` whose function fields hold wider sets: each function
 // field value takes `r`'s field type and each nested literal is built at its field (D15306).
 function recLitFnFieldsAt(l: i32, r: i32, depth: i32) {
@@ -654,17 +662,46 @@ function recListLitBuild(l: i32, late: boolean): boolean {
   if n is ObjLit { return recObjLitBuild(l, n, late) }
   if !(n is ArrayLit) { return false }
   let bt = -1
+  // Fresh literal parts, and spread list literals, take the build the other parts agree on.
+  const fresh: i32[] = []
+  const freshLists: i32[] = []
   for e in n.arrElems {
-    const b = recLitPartBuiltTy(e, late)
-    if b == -2 { return !late }
-    if b < 0 || (bt >= 0 && !tySame(b, bt)) { return false }
-    bt = b
+    const pe = parenPeelIx(e)
+    const pn = if pe >= 0 && pe < P.nodes.length { nodeAt(pe) } else { null }
+    const sv = if pn is Spread { parenPeelIx(pn.spdArg) } else { -1 }
+    const svn = if sv >= 0 && sv < P.nodes.length { nodeAt(sv) } else { null }
+    if svn is ArrayLit && !(recLitStamped[sv] ?? false) {
+      freshLists.push(sv)
+    } else if (
+      (pn is ObjLit || pn is ArrayLit)
+      && !(recLitStamped[pe] ?? false)
+    ) {
+      fresh.push(pe)
+    } else {
+      const ix = if pn is Index { recElemOfElemStamp(parenPeelIx(pn.idxArr)) } else { -1 }
+      const b = if pn is Spread { recSpreadPartBuiltTy(sv) } else if ix >= 0 { mkArrayTy(ix) } else { recLitPartBuiltTy(e, late) }
+      if b == -2 { return !late }
+      if b < 0 || (bt >= 0 && !tySame(b, bt)) { return false }
+      bt = b
+    }
   }
   if bt >= 0 && !nodeRepStamped(l) {
+    for f in fresh { adoptLitAt(f, bt) }
+    for f in freshLists { adoptLitAt(f, mkArrayTy(bt)) }
     repStampListBuilt(l, mkArrayTy(bt))
     recLitStamped[l] = true
   }
   false
+}
+
+// The type each element of list `x`, spread as a part of a list literal, is built at: an inner
+// list of a built list of lists (`recElemOfElemStamp`), or a record its builds record
+// (`recHeldElemBuilt`); else -1 (D15371).
+function recSpreadPartBuiltTy(x: i32): i32 {
+  const ie = recElemOfElemStamp(x)
+  if ie >= 0 { return mkArrayTy(ie) }
+  const e = recHeldElemBuilt(x)
+  if e >= 0 && e < T.tys.length && tyAt(e) is TyObj { e } else { -1 }
 }
 
 // `recListLitBuild` for record literal `l`: built at its record with each field a part built
