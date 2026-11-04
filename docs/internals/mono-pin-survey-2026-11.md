@@ -97,9 +97,20 @@ instance's record (`elabWalkTy`) over the tests and the distilled corpus. Of 75,
 `monoPinnedTyOf` calls, 10,875 disagreed, 9,876 of them with mono's answer open where the
 record is closed. Preferring the record broke 21 programs (10 traps, 11 refusals), and
 preferring it only where mono's answer is open still broke 18, nearly all hole instances.
-Mono's open answer is a deferral to the hole binding, not a second producer; retiring it needs
-the store to record the hole-instance answer first. [D15259](inventory/D15259.md) is the gap in
+Mono's open answer is a deferral to the hole binding, not a second producer. The store already
+holds the hole-instance answer (below), so retiring it needs the two re-making sites to stop
+pinning early. [D15259](inventory/D15259.md) is the gap in
 the other direction, where the record is open and mono's substitution closes it.
+
+**Why the remaining readers stay on the ladder.** Emit already reads the hole-instance answer
+from the store: `scopeTyAt` returns `elabNodeTyAt` for an open type once the program is
+monomorphized. Two of `monoPinnedTyOf`'s 14 call sites break when given the store's type where
+mono's is open. They are `monoExprRebuild` (10 of the 21 broken programs alone) and
+`monoPinRetype` (7 alone). Both re-make a node and pin the closed type on it before the hole
+instance's emission reads the store. The other 12 read the store with no effect: 0 emitted-wasm
+movers over 7,528 test files and 11,726 corpus cells. So that switch was not landed, because it
+adds a helper and deletes nothing. It is worth doing when it can delete the ladder rungs inside
+`monoPinnedTyOf`; until then sites 5 and 11 say in a comment that they defer to `scopeTyAt`.
 
 ## D. Function values at an annotation (contextual typing of a fn value)
 | fn | callers | note |
