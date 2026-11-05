@@ -1124,21 +1124,25 @@ instance's parameter types with the elaboration's per call, union members order-
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
-a record built wider, which is why 34 of the 74 pairs close under `callArgRepTy`. The 40 that remain
-are three delivery kinds the rep row does not record yet:
+a record built wider, which is why 34 of the 74 pairs close under `callArgRepTy`. Each remaining kind
+was checked against the emitted wasm before anything was built:
 
-- a closure bundle handed to a parameter (14 pairs): mono instances at the bundle record
-  `{c0: ..., c1: ...}`, the binding is one member's function type;
-- a value delivered non-null to a nullable parameter (16 pairs, 14 of them function values): mono
-  instances at the non-null type, the binding keeps `| null`;
+- a value delivered non-null to a nullable function parameter (16 pairs) is not a gap. Mono spells
+  the instance's parameter at the non-null type, but every instance lowers it to the same nullable
+  closure reference, so the binding's `| null` type already is the rep;
+- a closure bundle handed to a parameter (14 pairs) is a real rep, a struct of closures. The
+  elaboration already holds its signatures (`elabCallBundleSigs`); mono adds the gate that the
+  callee only calls the parameter (`monoBodyReadsOtherThanCalled`), without which the signatures
+  claim a bundle mono does not build (5 calls). The gate moves into the elaboration beside them;
 - a record whose row mono keys narrower or wider than the binding, or cannot spell because it holds
-  generic functions (8 pairs); and literal-union spellings the render softens (2 pairs).
+  generic functions (8 pairs), and literal-union spellings the render softens (2 pairs), are still to
+  be checked against the wasm the same way.
 
-The fact: for each argument `i` of each call, the rep it is delivered at. `callBindAdoptReps` (check
-time) writes it, extended to those three kinds. `callArgRepTy` reads it, as today. Mono's instance
-choice in `monoWalkIdentCall` and `monoPinHoleParam` then reads the elaboration's type and this rep,
-and stops deriving either. The acceptance set is the 40 pairs above: each must read the same under
-both, then the 339 no-answer calls, before the instance choice switches.
+The fact: for each argument `i` of each call, the rep it is delivered at, read through `callArgRepTy`
+and the bundle record of `elabCallBundleSigs`. Mono's instance choice in `monoWalkIdentCall` and
+`monoPinHoleParam` then reads the elaboration's type and this rep, and stops deriving either. The
+acceptance set is the 24 bundle, record and spelling pairs: each must read the same under both, then
+the 339 no-answer calls, before the instance choice switches.
 
 ---
 
@@ -1203,8 +1207,15 @@ and after. A file counts as moved if its output changed.
 the split plan on and off (the byte-diff sweep, error fixtures included), then deletes the
 entries.
 
-1. **Hole-lambda chains** (7 files, no overlap). The readers become hole-row lookups keyed by the
-   callee's set. The capture cell is settled here, which the sources step reuses.
+1. **Hole-lambda chains** (7 files, no overlap). Landed 2026-11-05; fn_flow_shadow.vl is down
+   from 139 functions to 128.
+   - The alias, cell and respell chains read `check_lam_chain.vl`. For each un-annotated binding
+     it records the initializer, the values written to it and the function declaring it. These are
+     source facts noted from the write index before `captureBoxRewrite` turns a captured `let` into
+     a cell. The rewrite mutates that `let` in place, so a cell read names the same binding.
+   - The one pin a lambda's class agrees on is the one parameter list that every elaboration
+     instance of the lambda closes at (`elabDeclOnePin`).
+   - Of the 7 files, the chains carry 5 and the pin carries 2.
 2. **Sources and writes** (47 files). `fnFlowDeclWritten` and `fnFlowReadWritten` move to the write
    index. `fnFlowReadGenFn` moves to `fnTagSharedArgDecl`. `fnFlowDeclPathSrcs` and
    `fnFlowDeclPathHeldSrcs` move to the members of the slot type's set. The 14 files shared with

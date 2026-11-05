@@ -1,0 +1,232 @@
+// The hole lambda a binding read holds through a chain of un-annotated bindings, read from the
+// source program: each binding's initializer, its writes and the function declaring it, noted
+// once when the check ends, before an emit rewrite turns a captured `let` into a capture cell.
+import { nodeTyIxOf } from "./check_node_tys"
+import {
+  cwArenaSync,
+  cwBindingWrittenValues,
+  cwIxBuild,
+} from "./check_write_scan"
+import { recEnclosingFn } from "./check_fit_rules"
+import { FuncDecl, Ident, Index, LetDecl, NumLit, P, nodeAt } from "./ast"
+import { declOrigOf, identDeclOf } from "./symbols"
+import { T, TyFunc, tyAt } from "./check_types"
+import { tyHasTyVar } from "./tyquery"
+
+// The most links a chain may have before its call has no signature to lower at.
+const LC_CHAIN_MAX = 64
+// The answer for a chain longer than `LC_CHAIN_MAX`.
+export const LC_CHAIN_LONG = -3
+
+// By un-annotated binding: its initializer, the values `=` writes to it, and the function
+// declaring it (-1 at module scope). Empty when the program binds no lambda.
+let lcInit: {[i32]: i32} = Map()
+let lcWrites: {[i32]: i32[]} = Map()
+let lcFn: {[i32]: i32} = Map()
+
+// Notes every un-annotated binding's facts, when some binding is initialised with a lambda.
+export function lamChainSnap() {
+  lcInit = Map()
+  lcWrites = Map()
+  lcFn = Map()
+  const lets: i32[] = []
+  let any = false
+  let x = 0
+  while x < P.nodes.length {
+    const n = nodeAt(x)
+    if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
+      lets.push(x)
+      const iv = nodeAt(n.letInit)
+      if iv is FuncDecl && lcIsLambdaName(iv.fnName) { any = true }
+    }
+    x = x + 1
+  }
+  if !any { return 0 }
+  cwArenaSync()
+  cwIxBuild()
+  for d in lets {
+    const n = nodeAt(d)
+    if n is LetDecl {
+      lcInit[d] = n.letInit
+      lcFn[d] = recEnclosingFn(d)
+      if n.letKw == "let" {
+        const ws: i32[] = []
+        for v in cwBindingWrittenValues(d) {
+          if v != n.letInit { ws.push(v) }
+        }
+        lcWrites[d] = ws
+      }
+    }
+  }
+  0
+}
+
+function lcIsLambdaName(nm: string): boolean {
+  nm == "" || (nm.length >= 8 && nm.slice(0, 8) == "__lambda")
+}
+
+// The source binding `d` stands for, an instance's copy mapped to its template's.
+function lcOrig(d: i32): i32 {
+  if d < 0 { return -1 }
+  const o = declOrigOf(d)
+  if o >= 0 { o } else { d }
+}
+
+// The noted binding read `ix` names, directly or as a capture cell's `d[0]`; -1 for any other.
+function lcReadLet(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = nodeAt(ix)
+  let d = -1
+  if n is Ident {
+    d = identDeclOf(ix)
+  } else if n is Index {
+    const k = nodeAt(n.idxIndex)
+    if nodeAt(n.idxArr) is Ident && k is NumLit && k.numText == "0" {
+      d = identDeclOf(n.idxArr)
+    }
+  }
+  const o = lcOrig(d)
+  if o >= 0 && lcInit.has(o) { o } else { -1 }
+}
+
+// The function declaring noted binding `d`: -1 at module scope, -2 for a binding not noted.
+function lcFnOf(d: i32): i32 { lcFn[d] ?? -2 }
+
+// Whether noted binding `d` is a `let`.
+function lcIsLet(d: i32): boolean {
+  const n = nodeAt(d)
+  n is LetDecl && n.letKw == "let"
+}
+
+// The binding of a hole lambda that noted binding `d` holds: `d` itself for `const d = (..) =>`,
+// the module `const` of one it names; -2 for a declared function or a named lambda, -1 otherwise.
+function lcClosureOf(d: i32): i32 {
+  const init = lcInit[d] ?? -1
+  if init < 0 { return -1 }
+  const iv = nodeAt(init)
+  if iv is FuncDecl {
+    if lcIsLambdaName(iv.fnName) { return d }
+    return -2
+  }
+  if !(iv is Ident) { return -1 }
+  const nd = identDeclOf(init)
+  if nd < 0 || nd >= P.nodes.length { return -1 }
+  if nodeAt(nd) is FuncDecl { return -2 }
+  const t = lcOrig(nd)
+  if t < 0 || t >= P.nodes.length || !lcInit.has(t) || lcFnOf(t) != -1 {
+    return -1
+  }
+  const tn = nodeAt(t)
+  const ti = lcInit[t] ?? -1
+  if tn is LetDecl && tn.letKw == "const" && ti >= 0 {
+    const tl = nodeAt(ti)
+    if tl is FuncDecl {
+      if lcIsLambdaName(tl.fnName) { return t }
+      return -2
+    }
+  }
+  -1
+}
+
+// Whether value `v` is a hole lambda, or a read of a chain of noted bindings ending at one.
+function lcIsLamValue(v: i32): boolean {
+  const vn = nodeAt(v)
+  if vn is FuncDecl { return lcIsLambdaName(vn.fnName) }
+  let d = lcReadLet(v)
+  let hops = 0
+  while d >= 0 && hops < LC_CHAIN_MAX {
+    const c = lcClosureOf(d)
+    if c != -1 { return c >= 0 }
+    d = lcReadLet(lcInit[d] ?? -1)
+    hops = hops + 1
+  }
+  false
+}
+
+// Whether every value written to noted `let` `d` is a hole lambda or of a closed function type.
+function lcWritesAreLams(d: i32): boolean {
+  for v in lcWrites[d] ?? [] {
+    const t = nodeTyIxOf(v)
+    const closed = t >= 0
+      && t < T.tys.length
+      && !tyHasTyVar(t)
+      && tyAt(t) is TyFunc
+    if !lcIsLamValue(v) && !closed { return false }
+  }
+  true
+}
+
+// The binding of the hole lambda noted binding `d0` holds through un-annotated `const` and `let`
+// links, each `let` written only with lambdas and at least one on the chain (`viaLet` counts one
+// already behind); -1 for none, `LC_CHAIN_LONG` past `LC_CHAIN_MAX` links.
+function lcChainFrom(d0: i32, viaLet: boolean): i32 {
+  let d = d0
+  let sawLet = viaLet
+  let hops = 0
+  while hops < LC_CHAIN_MAX {
+    if d < 0 { return -1 }
+    const n = nodeAt(d)
+    if !(n is LetDecl) { return -1 }
+    const top = lcFnOf(d) == -1
+    // A module-scope `let` is a link, walked on with its writes checked (D3847, D3856).
+    if (hops > 0 || viaLet) && !(n.letKw == "let" && top) {
+      const c = lcClosureOf(d)
+      if c != -1 {
+        if c < 0 || n.letKw != "const" || !sawLet { return -1 }
+        return c
+      }
+    }
+    if n.letKw == "let" {
+      sawLet = true
+      if !lcWritesAreLams(d) { return -1 }
+    }
+    d = lcReadLet(lcInit[d] ?? -1)
+    hops = hops + 1
+  }
+  LC_CHAIN_LONG
+}
+
+// The binding of the hole lambda the binding read `at` holds through a chain of un-annotated
+// bindings (`lcChainFrom`); -1 for none.
+export function lamChainOf(at: i32, viaLet: boolean): i32 {
+  lcChainFrom(lcReadLet(at), viaLet)
+}
+
+// The hole lambda's binding the capture cell read `at` (`d[0]`, or `d`) holds: its `let`, written
+// only with lambdas, seeds a chain ending at one.
+export function lamCellOf(at: i32): i32 {
+  if at < 0 || at >= P.nodes.length { return -1 }
+  const d = lcReadLet(at)
+  if d < 0 || !lcIsLet(d) || !lcWritesAreLams(d) { return -1 }
+  lcChainFrom(lcReadLet(lcInit[d] ?? -1), true)
+}
+
+// The un-annotated `const` binding a call through read `at` is re-spelled to: the end of a chain of
+// at most eight un-annotated `const` aliases, each link read in the frame declaring it, when it
+// binds a lambda; -1 for any other read.
+export function lamRespellOf(at: i32): i32 {
+  let d = lcReadLet(at)
+  let hops = 0
+  while hops < 8 && d >= 0 {
+    const n = nodeAt(d)
+    const init = lcInit[d] ?? -1
+    if !(n is LetDecl) || n.letKw != "const" || init < 0 { return -1 }
+    if !(nodeAt(init) is Ident) { return -1 }
+    const s = lcReadLet(init)
+    if s < 0 { return -1 }
+    const sf = lcFnOf(s)
+    // A link read from the frame declaring it, or a module-scope binding.
+    if sf == -1 || sf == lcFnOf(d) {
+      const c = lcClosureOf(s)
+      if c == -2 { return -1 }
+      if c >= 0 {
+        const sn = nodeAt(s)
+        if sn is LetDecl && sn.letKw != "const" { return -1 }
+        return s
+      }
+    }
+    d = s
+    hops = hops + 1
+  }
+  -1
+}
