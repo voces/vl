@@ -517,12 +517,7 @@ import {
   structTyAliasableReset,
   structTyMarkAliasable,
 } from "./emit_atom_kinds"
-import {
-  capMemoNoteEdit,
-  fnStmtsPosOf,
-  nestedFnDeclaredIn,
-  nodeTyAt,
-} from "./emit_capture_frames"
+import { capMemoNoteEdit, fnStmtsPosOf, nodeTyAt } from "./emit_capture_frames"
 import {
   arrLitElemName,
   bundleRecordRowOfTy,
@@ -2285,21 +2280,6 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
   // through `monoAnnPinName`, the same home the array is named through — the two ends of
   // one cut must claim the same spelling set. The peel is `listElemNameOf`.
   if argN is Index {
-    // An element of a captured list: its recorded type, or the enclosing instance's pin of the
-    // type parameter it names, where the capture's own name rungs know only its default (D3831).
-    const cl = nodeAt(unwrapParen(argN.idxArr))
-    if cl is Ident && fnIx >= 0 {
-      if monoNameIsCapture(fnIx, unwrapParen(argN.idxArr), cl.identName) {
-        let ep = nodeTyIxOf(unwrapParen(ix))
-        // The cell of a written capture is read through an index the rewrite minted untyped.
-        if ep < 0 { ep = tyArrayElemIx(nodeTyIxOf(unwrapParen(argN.idxArr))) }
-        if ep >= 0 && tyHasTyVar(ep) { ep = monoPinSubTyOf(ep, fnIx) }
-        if ep >= 0 && !tyHasTyVar(ep) && !tyIsLitUnion(ep) {
-          const en = monoAnnPinName(monoPinAnnSpelling(ep))
-          if en != "" { return en }
-        }
-      }
-    }
     const eur = monoProjectedUnionRowPin(cax, fnIx)
     if eur != "" { return eur }
     // The array NAME cannot carry a literal-union element: such an array reps as the
@@ -6768,24 +6748,6 @@ function monoLamBoundNames(ix: i32, out: string[]) {
     i = i + 1
   }
   0
-}
-
-// Whether `name`, read in frame `fx`, is a parameter of `fx` or of a frame enclosing it before a
-// frame that declares a nested function of that name.
-function monoNameIsParamOnChain(name: string, fx: i32): boolean {
-  let f = fx
-  let guard = 0
-  while f >= 0 && f < P.nodes.length && guard <= fnStmts.length {
-    if monoFnBindsParam(f, name) { return true }
-    const slot = fnStmtsPosOf(f)
-    if slot < 0 || slot >= fnParent.length { return false }
-    if nestedFnDeclaredIn(name, slot) >= 0 { return false }
-    const ps = fnParent[slot]
-    if ps < 0 || ps >= fnStmts.length { return false }
-    f = fnStmts[ps]
-    guard = guard + 1
-  }
-  false
 }
 
 // The template slot of the generic function the flow table says read `at` names through its
@@ -12664,34 +12626,6 @@ function monoCallIfValue(n: Call, ix: i32, ctx: i32): i32 {
   if ct == "" { return 0 }
   if monoCoerceFnValueTys(iv, ct, ctx, -1, dTys) < 0 { return -1 }
   monoRetypeIfInit(n.callFn, g0, n.callFn, ctx)
-  monoCloseIfCalleeFnParams(n, iv)
-}
-
-// Retypes the `if` callee `iv` of call `n` when a function-valued hole parameter leaves its type
-// without a signature key: that parameter takes the type of the argument passed there (D7848).
-function monoCloseIfCalleeFnParams(n: Call, iv: i32): i32 {
-  const ft = nodeTyIxOf(n.callFn)
-  if ft < 0 || ft >= T.tys.length || sigKeyOfTy(ft) != "" { return 0 }
-  const f = tyAt(ft)
-  if !(f is TyFunc) || f.fnParamTypes.length != n.callArgs.length { return 0 }
-  const ps: i32[] = []
-  let k = 0
-  while k < f.fnParamTypes.length {
-    const pk = f.fnParamTypes[k]
-    const ak = nodeTyIxOf(n.callArgs[k])
-    const open = pk >= 0
-      && pk < T.tys.length
-      && tyAt(pk) is TyFunc
-      && sigKeyOfTy(pk) == ""
-    ps.push(
-      if open && monoTyConcreteFn(ak) && sigKeyOfTy(ak) != "" { ak } else { pk },
-    )
-    k = k + 1
-  }
-  const et = mkFuncTy(ps, f.fnRet)
-  if sigKeyOfTy(et) == "" { return 0 }
-  nodeTyRecord(iv, et)
-  nodeTyRecord(n.callFn, et)
   0
 }
 
@@ -18550,19 +18484,6 @@ function monoMethodCallRecv(ix: i32, method: string): i32 {
   cf.memObj
 }
 
-// Whether call `ix` calls a field of the record its nullable receiver type `ot` holds, which the
-// flow table pins as it pins the same call on a non-null receiver (D9065).
-function monoNullableRecFieldCall(ix: i32, ot: i32): boolean {
-  const c = nodeAt(ix)
-  if !(c is Call) || c.callFn < 0 { return false }
-  const cf = nodeAt(unwrapParen(c.callFn))
-  const n = tyAt(ot)
-  if !(cf is Member) || !(n is TyNullable) { return false }
-  if n.nInner < 0 || n.nInner >= T.tys.length { return false }
-  const o = tyAt(n.nInner)
-  o is TyObj && strListHas(o.objFieldNames, cf.memProp)
-}
-
 // Whether a method of a value of the map binding `name` declared at `at`, or of a `const` bound
 // to one, is called on a receiver typed nullable, as a `?.` call's guarded arm is, other than a
 // record field's: the flow table pins no such call, so a slot type taken from the pins could miss it.
@@ -18587,11 +18508,7 @@ function monoMapValueUnpinnedCall(
     if recv >= 0 {
       const o = unwrapParen(recv)
       const ot = nodeTyIxOf(o)
-      if (
-        ot < 0
-        || ot >= T.tys.length
-        || (tyAt(ot) is TyNullable && !monoNullableRecFieldCall(ix, ot))
-      ) {
+      if (ot < 0 || ot >= T.tys.length) {
         if monoIsMapValueRead(o, name, fld, ctx, at) { return true }
         for ax in aliases {
           const a = nodeAt(ax)
@@ -19210,12 +19127,6 @@ function monoCellValueTakeAt(
     if monoCoerceFnValueTys(x, tname, ctx, -1, tys) < 0 { return 2 }
     return 0
   }
-  // A parameter holds a value its caller already built at this instance's type, which a
-  // concrete parameter type has to be.
-  if nm != "" && monoNameIsParamOnChain(nm, ctx) {
-    // Narrowed or not, a nullable parameter keeps its representation, as a local does below.
-    return monoCellConcreteTake(nodeTyIxOf(x), tname, 0)
-  }
   // An un-annotated alias never written after its initializer is that initializer.
   if nm != "" && depth < MONO_ALIAS_CHAIN_MAX {
     const lf = monoReadLetFrame(x, ctx)
@@ -19720,12 +19631,6 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   // flow linked to it (D9761).
   const open = rt < 0 || tyHasTyVar(rt) && !fnTagListTy(rt)
   if (lam || nodeAt(ax) is Ident) && open { rt = monoPinnedListAnnTy(m.memObj) }
-  // A list literal receiver is read at the type its own element slot is pinned at.
-  if rt < 0 || tyHasTyVar(rt) && !fnTagListTy(rt) {
-    const lr = monoOpenFnListLitTy(m.memObj, ctx)
-    if lr == -2 { return -1 }
-    if lr >= 0 { rt = lr }
-  }
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = tyAt(rt)
   // A tagged set element is closed: the callback's instance takes the set, as a direct call's does.
@@ -19775,33 +19680,6 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     nodeTyRecord(a, ft)
   }
   0
-}
-
-// The list type literal `recv` of open functions takes at the one agreed pin of its own element
-// slot, its elements delivered there and the literal retyped; -1 when it is no such literal or the
-// pin does not close, -2 when an element is refused.
-function monoOpenFnListLitTy(recv: i32, ctx: i32): i32 {
-  const x = unwrapParen(recv)
-  if x < 0 { return -1 }
-  const al = nodeAt(x)
-  if !(al is ArrayLit) || al.arrElems.length == 0 || al.pos < 0 { return -1 }
-  const t0 = nodeTyIxOf(x)
-  if t0 < 0 || t0 >= T.tys.length { return -1 }
-  const la = tyAt(t0)
-  if !(la is TyArray) || la.aElem < 0 || la.aElem >= T.tys.length { return -1 }
-  if !(tyAt(la.aElem) is TyFunc) || !tyHasTyVar(la.aElem) { return -1 }
-  // A tagged set's list keeps its ids; the checker built the callback at its element.
-  if fnTagListTy(t0) { return -1 }
-  for e in al.arrElems {
-    const ex = unwrapParen(e)
-    if ex < 0 || nodeAt(ex) is Spread { return -1 }
-  }
-  const ft = monoListSlotPinnedFnTy(x, al.arrElems, -1)
-  if ft < 0 || sigKeyOfTy(ft) == "" { return -1 }
-  if !monoDeliverFnElemsAt(al.arrElems, ft, ctx) { return -2 }
-  const lt = mkArrayTy(ft)
-  nodeTyRecord(x, lt)
-  lt
 }
 
 // The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
@@ -20139,7 +20017,6 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
     for pts in rows {
       if pts[j] >= 0 { fill = pts[j] }
     }
-    if fill < 0 { fill = monoSameReadArgTy(n.callArgs, rows, j) }
     if fill < 0 { return 0 }
     for pts in rows {
       if pts[j] < 0 { pts[j] = fill }
@@ -20254,26 +20131,6 @@ function monoElemsAtSet(
   const rt = monoFnTyRet(ft)
   if rt >= 0 && !tySame(rt, nodeTyIxOf(ix)) { nodeTyRecord(ix, rt) }
   1
-}
-
-// The type some element takes at a position other than `j` whose argument reads the declaration
-// `args[j]` reads, or -1.
-function monoSameReadArgTy(args: i32[], rows: i32[][], j: i32): i32 {
-  const ax = unwrapParen(args[j])
-  if ax < 0 || ax >= P.nodes.length || !(nodeAt(ax) is Ident) { return -1 }
-  const d = identDeclOf(ax)
-  if d < 0 { return -1 }
-  let k = 0
-  while k < args.length {
-    const kx = unwrapParen(args[k])
-    if k != j && kx >= 0 && nodeAt(kx) is Ident && identDeclOf(kx) == d {
-      for pts in rows {
-        if pts[k] >= 0 { return pts[k] }
-      }
-    }
-    k = k + 1
-  }
-  -1
 }
 
 // Whether callee `c` is a `for` variable over a list literal written in the loop's header, so
@@ -22087,23 +21944,6 @@ function monoHoleGenBindFnArgs(
     j = j + 1
   }
   0
-}
-
-// Delivers each function of `elems` at function type `ft`, a hole function's name as a direct
-// argument is (`monoFnPinAt`); false when one is refused.
-function monoDeliverFnElemsAt(elems: i32[], ft: i32, ctx: i32): boolean {
-  const nm = monoConcreteFnTyName(ft)
-  if nm == "" { return true }
-  for el in elems {
-    const ex = unwrapParen(el)
-    if ex < 0 { return false }
-    if nodeAt(ex) is Ident {
-      if monoCoerceFnValueName(ex, nm, ctx, ft) < 0 { return false }
-    } else {
-      monoLamLitTake(ex, nm, ctx)
-    }
-  }
-  true
 }
 
 // The closed result of function declaration `lx` called at the closed parameter types `qs`: its
@@ -25021,17 +24861,6 @@ function monoCapturedLamFe(calleeIx: i32, ctx: i32): i32 {
   fe
 }
 
-// Whether `name` read at `readIx` in function `fx` is bound by neither its parameters nor a
-// `let` of its body.
-function monoNameIsCapture(fx: i32, readIx: i32, name: string): boolean {
-  const f = nodeAt(fx)
-  if f is FuncDecl {
-    if monoFnBindsParam(fx, name) { return false }
-    return fnLetOfRead(fx, readIx) < 0
-  }
-  false
-}
-
 // The source declaration that declaration `d` is a rewrite's copy of, or `d` itself.
 function monoDeclCanon(d: i32): i32 {
   const o = declOrigOf(d)
@@ -27527,134 +27356,6 @@ function monoBindingAtPin(lf: i32[], nDecl: i32): i32 {
   0
 }
 
-// For generic `x` read in frame `ctx` and pinned at binding `d` of frame `fr`: its declared
-// parameter types then its result, when every pin of `d` binds them to one closed signature that
-// widens a pin at a parameter that admits `null`, such as a function value at `((x: T) => T) | null`;
-// else empty.
-function monoRetGenWidePins(x: i32, ctx: i32, d: i32, fr: i32): i32[] {
-  const none: i32[] = []
-  const xn = nodeAt(x)
-  if !(xn is Ident) { return none }
-  let gfe = monoFnFeOfIdent(x, xn.identName, ctx)
-  if gfe < 0 { gfe = monoReadGenFnFe(x) }
-  if gfe < 0 || gfe >= monoGen.length || monoGen[gfe] != 1 { return none }
-  const fn = nodeAt(monoOrigNode[gfe])
-  if !(fn is FuncDecl) || fn.fnTyParams.length == 0 || fn.fnRet < 0 {
-    return none
-  }
-  const noPath: string[] = []
-  let out: i32[] = []
-  let widens = false
-  for sig in monoDeclPathPins([fr, d], noPath) {
-    const pt = fnFlowDeclPathPinTysOf(d, noPath, sig)
-    const one = monoGenDeclPinTys(fn, pt)
-    if one.length == 0 { return none }
-    if out.length == 0 { out = one }
-    else if !monoTyListsEq(out, one) { return none }
-    let j = 0
-    while j < pt.length {
-      if tyBearsNull(one[j]) && !tyEq(pt[j], one[j]) { widens = true }
-      j = j + 1
-    }
-  }
-  // A call passing a narrower argument than its pin, a function value where the pin admits `null`,
-  // is retyped past the pin at the declared signature too.
-  for cx in fnFlowDeclPathPinCalls(d, noPath) {
-    const c = nodeAt(cx)
-    if c is Call && out.length == c.callArgs.length + 1 {
-      let k = 0
-      while k < c.callArgs.length {
-        const at = nodeTyIxOf(c.callArgs[k])
-        if (
-          at >= 0
-          && !tyHasTyVar(at)
-          && tyBearsNull(out[k])
-          && !tyEq(at, out[k])
-        ) {
-          widens = true
-        }
-        k = k + 1
-      }
-    }
-  }
-  if !widens { return none }
-  out
-}
-
-// The parameter types of generic `fn` then its result, with its type parameters bound by unifying
-// each declared parameter with its pin in `pt`; empty when one stays open or a pin does not fit.
-function monoGenDeclPinTys(fn: FuncDecl, pt: i32[]): i32[] {
-  const none: i32[] = []
-  if pt.length != fn.fnParams.length { return none }
-  const rN: string[] = []
-  const rT: i32[] = []
-  const decl: i32[] = []
-  for px in fn.fnParams {
-    const p = nodeAt(px)
-    if !(p is Param) || p.parType < 0 { return none }
-    decl.push(nodeTyIxOf(p.parType))
-  }
-  let i = 0
-  while i < pt.length {
-    if decl[i] < 0 || pt[i] < 0 || pt[i] >= T.tys.length { return none }
-    bindGenWalk(decl[i], pt[i], rN, rT)
-    i = i + 1
-  }
-  const out: i32[] = []
-  i = 0
-  while i < pt.length {
-    const t = substTyDeep(decl[i], rN, rT)
-    if t < 0 || tyHasTyVar(t) || !assignable(pt[i], t) { return none }
-    out.push(t)
-    i = i + 1
-  }
-  const r = substTyDeep(nodeTyIxOf(fn.fnRet), rN, rT)
-  if r < 0 || tyHasTyVar(r) { return none }
-  out.push(r)
-  out
-}
-
-// Whether type lists `a` and `b` are pairwise the same types.
-function monoTyListsEq(a: i32[], b: i32[]): boolean {
-  if a.length != b.length { return false }
-  let i = 0
-  while i < a.length {
-    if !tyEq(a[i], b[i]) { return false }
-    i = i + 1
-  }
-  true
-}
-
-// The function type spelling of closed parameter types `ps` and result `r`.
-function monoTysFnName(ps: i32[], r: i32): string {
-  monoConcreteFnTyName(mkFuncTy(ps, r))
-}
-
-// Each call taking a pin of binding `d`'s slot `path` is typed at closed parameters `ps`, the one
-// signature every pin takes, and its own closed result.
-function monoRetypePinCallsAt(d: i32, path: string[], ps: i32[]): i32 {
-  for cx in fnFlowDeclPathPinCalls(d, path) {
-    const c = nodeAt(cx)
-    if c is Call && fnTagCallArms(cx).length == 0 {
-      const cf = unwrapParen(c.callFn)
-      const ct = nodeTyIxOf(cf)
-      const rt = nodeTyIxOf(cx)
-      if (
-        cf >= 0
-        && ct >= 0
-        && ct < T.tys.length
-        && tyAt(ct) is TyFunc
-        && rt >= 0
-        && !tyHasTyVar(rt)
-        && c.callArgs.length == ps.length
-      ) {
-        nodeTyRecord(cf, mkFuncTy(ps, rt))
-      }
-    }
-  }
-  0
-}
-
 // For the binding `d` held at its one pin: each call taking that pin whose callee the checker left
 // an open type, as one past an inferred return is, is typed at its own arguments and result,
 // which are the pin's (D5062). In a body a generic's instances share, those types are closed, so
@@ -27764,22 +27465,6 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
       const tr = monoIdentAtPosIn(it[1], xn.identName, xn.pos, 0)
       if tr >= 0 { d = tr }
     }
-  }
-  // Pins its declared parameters widen, such as a function value and `null` at `((x: T) => T) |
-  // null`, are one signature: the declared one, with its type parameters bound (D9850).
-  const wide = monoRetGenWidePins(x, ctx, d, fr)
-  if wide.length > 1 {
-    const ps = wide.slice(0, wide.length - 1)
-    monoInstanceWidenRet = true
-    const wr = monoCoerceFnValueName(
-      x,
-      monoTysFnName(ps, wide[wide.length - 1]),
-      ctx,
-      -1,
-    )
-    monoInstanceWidenRet = false
-    if wr < 0 { return -1 }
-    return monoRetypePinCallsAt(d, noPath, ps)
   }
   const nmTys: i32[] = []
   const nm = monoSlotPinNameTys(d, noPath, fr, nmTys)
