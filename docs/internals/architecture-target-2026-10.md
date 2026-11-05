@@ -354,6 +354,22 @@ rule and the call rule are written once.
 - A literal's contextual type is computed the same way whether the destination is annotated or inferred
   (rulings B′+C). That is what deletes ExpCtx, rather than requiring annotations to replace it.
 
+**A type parameter several set arguments bind is bound to their joined set.** When one type
+parameter annotates several parameters and a call hands each a function set (`one<F>(a: F, c: F)`
+called `one(id, dup)`), the elaboration binds that type parameter, for that call's instance, to the
+union of the sets the arguments carry (`{id, dup}`), not to the first argument's set. An argument
+is then delivered as the id it already holds: an id is its member's declaration (`ftScan`'s ids,
+which `emitFnTagDispatch` compares against each member's declaration), so a member's id is the same
+in every set holding it and the delivery converts nothing. The one fact is the elaboration's
+binding of the type parameter at the call (`elabSetArgBind`'s tagged branch, widened from one
+argument's set to the join); the tag decision tags the joined set with each argument's set decided
+with it (`ftSubNeed`), and mono pins the parameter at the binding it reads (`monoArgTaggedSetTy`
+over the elaboration's type, with no rule of its own). This is the shape the four annotated-parameter
+gates (`fnTagOwnTyParamAlone`, `fnTagOwnTyParamShared`, `ftOwnTyParamHandedBack`,
+`ftOwnTyParamSharedBack`) each test for one case: a joined set of one argument is that argument's
+set, so each gate's witness is a joined-set binding of one member, and the gates collapse into it
+once it holds.
+
 ### 2.5 Alternatives rejected
 
 | Alternative | Why rejected |
@@ -925,8 +941,8 @@ L-map, F-let, B, C, H-b, H-nested, N and W-field have no dependent. D15101 runs 
 | `closures/choice-of-nested-capturing-function-handed-to-hole-param` | `unsupported argument type for f in a call to both` | D15450 (L-set, a capturing member's id), closed: it runs without the plan as a bundle |
 | `closures/fn-set-list-of-hole-param-spread-into-closed-push` | `the reassigned function binding f holds functions called at more than one argument type` | D15432 (step-2 lane) |
 | `closures/function-list-element-at-two-types-pushed-through-hole-helper` | `a function value is called at two signatures, and the closure it holds was built for one` | D15440 (split-dep lane) |
-| `closures/written-let-copy-of-hole-param-in-list-called-at-two-types` | the same as the row above | none yet: added by D15404's close (#6364), whose holder rule covers the un-written copy only |
-| `closures/written-let-copy-of-hole-param-in-record-called-at-two-types` | the same | none yet, as the row above |
+| `closures/written-let-copy-of-hole-param-in-list-called-at-two-types` | the same as the row above | runs without the plan since #6383: the seed rule takes a `const` list read only as `r[i](...)`, as #6376 made it take the record, and mono copies a callee `x[0]` as a capture cell's read only where `x` is a cell (`monoIsCellRead`) |
+| `closures/written-let-copy-of-hole-param-in-record-called-at-two-types` | the same | runs without the plan since #6376: a seeded written `let` read only as a field of a `const` record called in place keeps the seed rule (`elabHolderOnlyCalled`) |
 | `closures/written-let-reassigned-to-other-param-called-at-two-types` | `parameter a of one is called at two function types that no parameter per type separates` | D15409 (group F, the residue of D15122 and D15123: two sources carrying different generics, one also called directly at another type) |
 | `generics/generic-value-return-written-to-void-generic-let` | `the reassigned function binding m holds functions called at more than one argument type` | D15030 (W-split, Q5), closed by the owner's ruling (2026-11-05): the write is refused in both orders and the file is now `generics/error-generic-value-return-written-to-void-generic-let`, an error fixture |
 | `objects/record-generic-field-called-and-read-under-is` | `a generic function taken as a value reaches no call that fixes its type` | D15252 (M, the `is` relation), runs without the plan since the direct call through a `const` record literal's field (`constRecFieldFnRead`): the field keeps one meaning, so the relation is not asked |
