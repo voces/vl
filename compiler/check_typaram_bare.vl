@@ -86,8 +86,8 @@ export function tyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
 
 // Drops a bare-only type parameter `tp`, leaving each parameter it annotates a hole of its own
 // (`f<F>(a: F, c: F)` checks as `f(a, c)`) when nothing relates them: each is read only as a
-// callee, a hole's argument or an unassigned copy's seed, and every call hands them named
-// functions of one signature, so each binding is the one the shared `tp` took (D15401).
+// callee, a hole's argument, an unassigned copy's seed or an argument of the function's own
+// recursion, and every other call hands them named functions of one signature (D15401).
 export function tyParamSplitBegin() {
   tpbCands = []
   tpbParent = Map()
@@ -234,7 +234,9 @@ function tpbSplitOne(d: i32, tp: string) {
       const un = nodeAt(up)
       let ok = false
       if un is Call {
-        ok = parenPeelIx(un.callFn) == r || tpbHandedToHole(un, r)
+        ok = parenPeelIx(un.callFn) == r
+          || tpbHandedToHole(un, r)
+          || tpbSelfGroupArg(d, un, r, ps)
       }
       if un is LetDecl && parenPeelIx(un.letInit) == r {
         if !pcLetUnassigned(up) { return 0 }
@@ -350,15 +352,46 @@ function tpbCallsHandOneSig(d: i32, fn: FuncDecl, ps: i32[]): boolean {
     for nm in pn.callArgNames {
       if nm != "" { return false }
     }
-    let sig = ""
-    for k in idx {
-      if k < 0 || k >= pn.callArgs.length { return false }
-      const s = tpbNamedSig(pn.callArgs[k])
-      if s == "" || sig != "" && s != sig { return false }
-      sig = s
+    if !tpbSelfGroupCall(pn, idx, ps) {
+      let sig = ""
+      for k in idx {
+        if k < 0 || k >= pn.callArgs.length { return false }
+        const s = tpbNamedSig(pn.callArgs[k])
+        if s == "" || sig != "" && s != sig { return false }
+        sig = s
+      }
     }
   }
   true
+}
+
+// Whether call `c` hands each position in `idx` a read of one of parameters `ps`: a recursive
+// call passing the group's own values on, in any order, binds what the outer call bound.
+function tpbSelfGroupCall(c: Call, idx: i32[], ps: i32[]): boolean {
+  for k in idx {
+    if k < 0 || k >= c.callArgs.length { return false }
+    const a = parenPeelIx(c.callArgs[k])
+    if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) { return false }
+    if !i32ListHas(ps, identDeclOf(a)) { return false }
+  }
+  true
+}
+
+// Whether `x` is an argument of a call of `d` itself at a position one of `ps` takes.
+function tpbSelfGroupArg(d: i32, c: Call, x: i32, ps: i32[]): boolean {
+  const f = parenPeelIx(c.callFn)
+  if (
+    f < 0
+    || f >= P.nodes.length
+    || !(nodeAt(f) is Ident)
+    || identDeclOf(f) != d
+  ) {
+    return false
+  }
+  const fn = nodeAt(d)
+  if !(fn is FuncDecl) { return false }
+  const k = i32ListIndexOf(c.callArgs, x)
+  k >= 0 && k < fn.fnParams.length && i32ListHas(ps, fn.fnParams[k])
 }
 
 // The signature spelling of the named function argument `a` reads, through `const` aliases, with
