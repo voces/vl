@@ -962,9 +962,8 @@ The "reassigned function binding" refusal (`monoBindSigFail`) is read by two of 
     - `emit_collect.liftFnsInExpr`.
   - Without the plan, an ask hook is a no-op and `fsMinted` is always false. Each caller's asking branch is deleted with it, and nothing has to move.
   - `fsModeOf` is also read by four mono bundle pins: `monoBundlePin`, `monoBundleNamedPin`, `monoBundleHandOnPin` and `monoClosureBundlePin`. Their plan-mode arms go too.
-- `fn_flow_shadow.vl` is **not** plan code. It has 184 functions over 3,529 lines.
-  - 143 are mono's flow table: built by `monomorphize` (`fnFlowTableBuild`) and the emit passes (`fnFlowShadowBegin`, `…Build`, `…Sweep`), and read through 28 query entries by 44 emit_mono functions.
-  - The other 41 are the shadow audit (`ffGrade`, `ffSweep*`). Only `entry.vl`'s wasm exports `fnFlowShadowArm`, `…Finish` and `…Work` reach them, and only `tests/vl_fn_flow_shadow_test.ts` and `tests/vl_scaling_shape_test.ts` call those.
+- `fn_flow_shadow.vl` is **not** plan code. It has 140 functions over about 2,600 lines: mono's flow table, built by `monomorphize` (`fnFlowTableBuild`, reset by `fnFlowShadowBegin`) and read through 28 query entries by 44 emit_mono functions.
+  - Its shadow audit (`ffGrade`, `ffSweep*`, 44 functions reached only through wasm exports) was deleted on 2026-11-05. Four one-line mutations of the table showed the audit caught only one that no other gate caught, and it caught that one through its own verdict rows. The cost bound on the table's walk is now the `fn-flow` fuel pair in `tests/vl_scaling_shape_test.ts`.
   - The file can go only once those 44 mono readers are deleted or rebuilt on the elaboration's flow facts. That is the pin-helper work, not the plan's deletion.
   - Deleting `fn_split.vl` does not require it.
 
