@@ -1287,9 +1287,14 @@ instance `monoMakeInstance` built was recorded with its elaboration key (`monoKe
 - **Callback specialization (96 groups).** Mono keys an instance by the function value it is handed
   (`@inc`, `@__lambda_3`), so the call inside is direct. One elaboration key, several instances. The
   elaboration has no such dimension; the key keeps it as its own component.
-- **One instance spelled two ways (15 groups).** `(()=>i32)` against `()=>i32`, an alias against its
-  structure, an enclosing-instance marker, an unbound parameter's binding. Where checked, the
-  instances' bodies are identical (`deliver`, `len`, `F$m…`): duplicates the canonical key removes.
+- **One elaboration key, several mono keys besides specialization (15 groups).** Under the key
+  below, 9 differ by their specialization value once mono's `(()=>i32)` / `()=>i32` spelling is read
+  as "unspecialized" / "specialized". 2 are one nested generic instanced per enclosing instance
+  (`shadowOther`'s `inner`, marker `^20`), whose copies read different environment structs: the
+  parent component. 2 are a check-reject fixture's. 2 are true duplicates with identical bodies
+  (`deliver` in `closures/generic-returned-record-param.vl`, `F$m…` in
+  `generics/instance-call-of-literal-union-field-function.vl`), which the key merges with no change
+  in output.
 - **No elaboration key (127 instances).** 36 annotated functions instanced per storage row, 46
   lambdas, 45 hole-parameter functions solved closed. None is generic to the elaboration, so its key
   is the declaration plus the rep row.
