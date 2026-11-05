@@ -24,10 +24,11 @@ const MERGES: Record<string, string[]> = {
   ],
 };
 // Controls: instances the key must keep apart (callback specialization; one nested generic per
-// enclosing call frame).
+// enclosing call frame; one helper handed two tagged sets of one signature).
 const CONTROLS = [
   "tests/cases/closures/callback-specialization.vl",
   "tests/cases/generics/nested-generic-capture-callers-that-run.vl",
+  "tests/cases/closures/tagged-sets-of-one-signature-to-one-helper-keep-two-instances.vl",
 ];
 
 const exists = (p: string) => {
