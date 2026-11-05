@@ -3,6 +3,7 @@
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
 import { cwIxCoveredLen, cwIxCovers } from "./check_write_scan"
+import { recFieldTyOf } from "./emit_rec_field_codes"
 import { monoIsGenericDecl } from "./emit_base"
 import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
@@ -4082,21 +4083,38 @@ function elabParamSeedsListSlot(ix: i32, p: i32, fn: FuncDecl): i32 {
   if d < 0 { return -1 }
   const dn = nodeAt(d)
   if !(dn is LetDecl) || dn.letKw != "const" && !cwLetUnwritten(d) { return -1 }
+  if !elabSlotValuesOk(d, "[]", ix, fn) || !elabSlotReadsOk(d, "[]", fn) {
+    return -1
+  }
+  d
+}
+
+// Whether every value stored at slot `nm` (a field name, or "[]" for an element) of binding `d`,
+// one written after its literal, is `ix`, a named function or a parameter of `fn`.
+function elabSlotValuesOk(d: i32, nm: string, ix: i32, fn: FuncDecl): boolean {
   cwIxWant()
   const vals: i32[] = []
   const ats: i32[] = []
-  if cwSlotWrittenValues(cwKeyOfDecl(d), ["[]"], vals, ats) < 1 { return -1 }
+  if cwSlotWrittenValues(cwKeyOfDecl(d), [nm], vals, ats) < 1 { return false }
   for v in vals {
     const vx = parenPeelIx(v)
     if vx != ix {
-      if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) { return -1 }
+      if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) {
+        return false
+      }
       const vd = identDeclOf(vx)
-      if vd < 0 || vd >= P.nodes.length { return -1 }
+      if vd < 0 || vd >= P.nodes.length { return false }
       const vn = nodeAt(vd)
       const named = vn is FuncDecl && vn.fnName != ""
-      if !named && !i32ListHas(fn.fnParams, vd) { return -1 }
+      if !named && !i32ListHas(fn.fnParams, vd) { return false }
     }
   }
+  true
+}
+
+// Whether every read of binding `d` in `fn`'s body, none nested, is its slot `nm` (a field name,
+// or "[]" for an element) called in place or assigned to.
+function elabSlotReadsOk(d: i32, nm: string, fn: FuncDecl): boolean {
   const work: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
   const gpar: i32[] = [-1]
@@ -4109,16 +4127,21 @@ function elabParamSeedsListSlot(ix: i32, p: i32, fn: FuncDecl): i32 {
     if x >= 0 && x < P.nodes.length {
       const xn = nodeAt(x)
       if xn is Ident && identDeclOf(x) == d {
-        if nested || q < 0 || g < 0 { return -1 }
+        if nested || q < 0 || g < 0 { return false }
         const qn = nodeAt(q)
         const gn = nodeAt(g)
-        if !(qn is Index) || qn.idxArr != x { return -1 }
+        const elem = nm == "[]" && qn is Index && qn.idxArr == x
+        const field = nm != "[]"
+          && qn is Member
+          && qn.memObj == x
+          && qn.memProp == nm
+        if !elem && !field { return false }
         const called = gn is Call && parenPeelIx(gn.callFn) == q
         const stored = gn is BinExpr
           && gn.binOp == "="
           && gn.binCompound == ""
           && gn.binLeft == q
-        if !called && !stored { return -1 }
+        if !called && !stored { return false }
       }
       for c in nodeChildren(x) {
         work.push(c)
@@ -4128,6 +4151,59 @@ function elabParamSeedsListSlot(ix: i32, p: i32, fn: FuncDecl): i32 {
       }
     }
   }
+  true
+}
+
+// The `const`, or `let` nothing re-points, of `fn` whose record literal holds parameter read `ix`
+// at field `fld[0]`, or whose field `ix` is assigned to by `p`, where every value the field holds is
+// a named function or a parameter of `fn`, one written after the literal, and every read, none
+// nested, is that field called in place or assigned to (D15455); -1 otherwise.
+function elabParamSeedsRecField(
+  ix: i32,
+  p: i32,
+  fn: FuncDecl,
+  fld: string[],
+): i32 {
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const pn = nodeAt(p)
+  let d = -1
+  let nm = ""
+  if (
+    pn is BinExpr
+    && pn.binOp == "="
+    && pn.binCompound == ""
+    && parenPeelIx(pn.binRight) == ix
+  ) {
+    const l = nodeAt(parenPeelIx(pn.binLeft))
+    const a = if l is Member { parenPeelIx(l.memObj) } else { -1 }
+    if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident && l is Member {
+      d = identDeclOf(a)
+      nm = l.memProp
+    }
+  } else if pn is FieldInit && parenPeelIx(pn.fiValue) == ix {
+    nm = pn.fiName
+    const todo: i32[] = [fn.fnBody]
+    while todo.length > 0 && d < 0 {
+      const x = todo.pop() ?? -1
+      if x >= 0 && x < P.nodes.length {
+        const xn = nodeAt(x)
+        const li = if xn is LetDecl { parenPeelIx(xn.letInit) } else { -1 }
+        const ol = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { xn }
+        if ol is ObjLit && i32ListHas(ol.objFields, p) { d = x }
+        for c in nodeChildren(x) { todo.push(c) }
+      }
+    }
+  }
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letType >= 0 { return -1 }
+  if dn.letKw != "const" && !cwLetUnwritten(d) { return -1 }
+  const li = parenPeelIx(dn.letInit)
+  if li < 0 || li >= P.nodes.length || !(nodeAt(li) is ObjLit) { return -1 }
+  if !elabSlotValuesOk(d, nm, -1, fn) || !elabSlotReadsOk(d, nm, fn) {
+    return -1
+  }
+  fld.push(nm)
   d
 }
 
@@ -4638,6 +4714,18 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
         const ws = if la is TyArray { fnTagSetOfTy(la.aElem) } else { -1 }
         if ss >= 0 && ws >= 0 {
           mintSeedNote(decl, i32ListIndexOf(dn.fnParams, pd), ss, ls, ws)
+          return 0
+        }
+      }
+      // So does a record it seeds whose field is written only with named functions or parameters
+      // (D15455).
+      const rfld: string[] = []
+      const rs = elabParamSeedsRecField(ix, p, dn, rfld)
+      if rs >= 0 {
+        const ss = fnTagSetOfTy(elabNodeTy(ix, k))
+        const ws = fnTagSetOfTy(recFieldTyOf(elabNodeTy(rs, k), rfld[0]))
+        if ss >= 0 && ws >= 0 {
+          mintSeedNote(decl, i32ListIndexOf(dn.fnParams, pd), ss, rs, ws)
           return 0
         }
       }
@@ -7081,7 +7169,158 @@ export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
     substTyDeep(nodeTyIxOf(dn.fnParams[ri]), ekNames[rk], ekTys[rk]),
   )
   if s < 0 || fnTagSetIsTagged(s) { return none }
+  // The callee reads the record only as a callee, or hands it whole to a named function: any
+  // other read of the parameter wants one closure.
+  const ck = elabCallParamKey(ix, i)
+  const cd = nodeAt(ekDecl[k])
+  if !(cd is FuncDecl) || i >= cd.fnParams.length { return none }
+  if (
+    elabBodyReadsOtherThanCalled(
+      cd.fnBody,
+      cd.fnParams[i],
+      true,
+      if ck >= 0 { ck / 64 } else { -1 },
+    )
+  ) {
+    return none
+  }
   sigs
+}
+
+// Whether node `x` or one beneath it reads parameter `par` other than as the callee of a call in
+// its own function's body (`own`): handed on, stored, or read by a nested function. With `fwd`, a
+// read handed whole to a named function as a positional argument is not counted, and with `cap` a
+// call through it or such a hand in a nested function at any depth is not either.
+export function elabParamReadOtherThanCalled(
+  x: i32,
+  par: i32,
+  own: boolean,
+  fwd: boolean,
+  cap: boolean,
+): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is Ident { return identDeclOf(x) == par }
+  if n is FuncDecl {
+    for k in nodeChildren(x) {
+      if elabParamReadOtherThanCalled(k, par, cap, cap, cap) { return true }
+    }
+    return false
+  }
+  if n is Call {
+    const cf = parenPeelIx(n.callFn)
+    const cd = if cf >= 0 && nodeAt(cf) is Ident { identDeclOf(cf) } else { -1 }
+    const called = own && cd == par
+    const named = own
+      && fwd
+      && cd >= 0
+      && cd < P.nodes.length
+      && (nodeAt(cd) is FuncDecl || elabConstFnCopy(cd))
+    for k in nodeChildren(x) {
+      const ku = parenPeelIx(k)
+      const handed = named
+        && i32ListHas(n.callArgs, k)
+        && ku >= 0
+        && nodeAt(ku) is Ident
+        && identDeclOf(ku) == par
+      if (
+        !(called && ku == cf)
+        && !handed
+        && elabParamReadOtherThanCalled(k, par, own, fwd, cap)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+  for k in nodeChildren(x) {
+    if elabParamReadOtherThanCalled(k, par, own, fwd, cap) { return true }
+  }
+  false
+}
+
+// Whether `d` is a `const` binding whose value is a read of a named function.
+function elabConstFnCopy(d: i32): boolean {
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letKw != "const" { return false }
+  const v = parenPeelIx(n.letInit)
+  if v < 0 || !(nodeAt(v) is Ident) { return false }
+  const fd = identDeclOf(v)
+  fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl
+}
+
+// `elabParamReadOtherThanCalled` over function body `body`, where with `fwd` a return of `par`
+// from the function itself, by `return` or as the body's last statement, is not counted either,
+// nor is a copy the elaboration holds the record in under callee instance `hk`.
+function elabBodyReadsOtherThanCalled(
+  body: i32,
+  par: i32,
+  fwd: boolean,
+  hk: i32,
+): boolean {
+  if body < 0 { return false }
+  const b = nodeAt(body)
+  if !(b is Block) {
+    return elabParamReadOtherThanCalled(body, par, true, fwd, fwd)
+  }
+  if !fwd {
+    for st in b.blkStmts {
+      if (
+        !elabCopyHeld(st, par, hk)
+        && elabParamReadOtherThanCalled(st, par, true, false, false)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+  let i = 0
+  while i < b.blkStmts.length {
+    const st = b.blkStmts[i]
+    const last = i == b.blkStmts.length - 1
+    if !(last && elabIsParamRead(st, par)) && elabStmtReadsOther(st, par, hk) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether node `x` is a read of parameter `par`, under parentheses.
+export function elabIsParamRead(x: i32, par: i32): boolean {
+  const u = if x >= 0 { parenPeelIx(x) } else { -1 }
+  u >= 0 && nodeAt(u) is Ident && identDeclOf(u) == par
+}
+
+// Whether statement `x` is a copy of parameter `par` the elaboration holds the record in under
+// callee instance `hk`.
+function elabCopyHeld(x: i32, par: i32, hk: i32): boolean {
+  if hk < 0 || x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  n is LetDecl
+    && elabIsParamRead(n.letInit, par)
+    && elabHolderRecordAt(x, hk).length > 0
+}
+
+// `elabBodyReadsOtherThanCalled` for statement `x` of the function's own body.
+function elabStmtReadsOther(x: i32, par: i32, hk: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is RetStmt && elabIsParamRead(n.retArg, par) { return false }
+  if elabCopyHeld(x, par, hk) { return false }
+  if (
+    n is Block
+    || n is IfStmt
+    || n is WhileStmt
+    || n is ForIn
+    || n is ForRange
+  ) {
+    for k in nodeChildren(x) {
+      if elabStmtReadsOther(k, par, hk) { return true }
+    }
+    return false
+  }
+  elabParamReadOtherThanCalled(x, par, true, true, true)
 }
 
 // Notes the fact for call `c` at `ix` when its callee is a parameter of `decl` that instance `k`
