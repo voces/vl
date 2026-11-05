@@ -1,9 +1,7 @@
 // The function-value flow table (`docs/internals/fn-value-flow-design.md` §(f)). Before
 // `monomorphize` it unions the checked tree's bindings into classes, each holding the functions
 // that may flow into it (sources) and the signatures it is called or annotated at (pins).
-// `monomorphize` reads it to pin a hole lambda that shares a class with a peer. Armed by a host,
-// it also grades every function value the monomorphizer decided against its class after the last
-// pass, and counts the verdicts as `flow | …` rows in the per-call shadow's bank.
+// `monomorphize` reads it to pin a hole lambda that shares a class with a peer.
 import { nodeTyIxOf } from "./check_node_tys"
 import { cwParamArgs } from "./check_write_scan"
 import {
@@ -19,7 +17,6 @@ import {
   IfStmt,
   Index,
   LetDecl,
-  LoopVar,
   MatchExpr,
   Member,
   NumLit,
@@ -33,29 +30,18 @@ import {
   TypeRef,
   hasNamedArgs,
   i32ToStr,
-  loopVarName,
   nodeAt,
   nodeChildren,
   orderArgsByParamNames,
 } from "./ast"
-import { callBindShadowCount, fnFlowSigFails } from "./call_bind_shadow"
 import { monoIsGenericDecl, normTypeAtom, unwrapParen } from "./emit_base"
 import { declTyIxOfName, repNameCanonId } from "./emit_rep"
-import {
-  fnParent,
-  fnStmts,
-  monoInstFe,
-  monoInstOrig,
-  monoOrigNode,
-  monoStubValueOk,
-} from "./emit_state"
+import { fnStmts } from "./emit_state"
 import { i32ListHas, strListHas } from "./listutil"
 import {
   IDENT_BUILTIN,
   declOrigOf,
   identDeclOf,
-  identOrigArm,
-  identOrigOf,
   sidArrGet,
   sidArrPut,
 } from "./symbols"
@@ -81,11 +67,6 @@ import {
 import { nonNullTy, tyHasTyVar } from "./tyquery"
 import { sigKeyOfTy } from "./emit_sig_tokens"
 
-// 0 off, 1 armed, 2 armed with names in each row, 3 armed and keyed by call path instead of by
-// instance (the control the scaling pair must see blow up), 4 named with `trace |` rows.
-let ffMode = 0
-let ffWork = 0
-const FF_NAIVE_CAP = 400000
 // The most instance contexts one generic function's calls mint.
 const FF_CTX_PER_FN = 64
 
@@ -186,27 +167,12 @@ let rdHead: {[i32]: i32} = Map()
 let rdNext: i32[] = []
 let rdKind: i32[] = []
 let rdSlot: i32[] = []
-let rdPos: string[] = []
-let rdFn: i32[] = []
-let rdCtx: i32[] = []
 let rdWalk: i32[] = []
 
-let ffStmts: i32[] = []
-let ffSwept = false
 let ffBuilt = false
-
-// Arm the shadow for the compiles that follow (see `ffMode`).
-export function fnFlowShadowArm(mode: i32) {
-  ffMode = mode
-  0
-}
-
-// The deterministic work the last armed build did: nodes visited plus classes merged.
-export function fnFlowShadowWork() { ffWork }
 
 // Start a compile: drop the previous one's table and stop the origin column recording.
 export function fnFlowShadowBegin() {
-  ffWork = 0
   ffPairHead = [[], [], []]
   ffPairNeg = Map()
   ffPairCtx = []
@@ -262,14 +228,8 @@ export function fnFlowShadowBegin() {
   rdNext = []
   rdKind = []
   rdSlot = []
-  rdPos = []
-  rdFn = []
-  rdCtx = []
   rdWalk = []
-  ffStmts = []
-  ffSwept = false
   ffBuilt = false
-  identOrigArm(false)
   0
 }
 
@@ -487,7 +447,6 @@ function ffMerge(a: i32, b: i32): i32 {
   const rb = ffFind(b)
   if ra < 0 || rb < 0 { return -1 }
   if ra == rb { return ra }
-  ffWork = ffWork + 1
   // The larger class keeps its lists and the smaller one's move into them, so a slot's facts
   // move O(log n) times however a program chains its merges (D4942).
   let keep = ra
@@ -689,38 +648,10 @@ function ffAddSrc(s: i32, fn: i32, ctx: i32) {
   0
 }
 
-function ffRecord(
-  ix: i32,
-  kind: i32,
-  slot: i32,
-  pos: string,
-  fn: i32,
-  ctx: i32,
-) {
-  if ffMode == 4 {
-    callBindShadowCount(
-      "trace | record "
-        + i32ToStr(kind)
-        + " "
-        + pos
-        + " node "
-        + i32ToStr(ix)
-        + " fn "
-        + i32ToStr(fn)
-        + " ctx "
-        + i32ToStr(ctx)
-        + " walk "
-        + i32ToStr(ffCtx)
-        + " pins "
-        + ffJoin(ffClassPins(slot)),
-    )
-  }
+function ffRecord(ix: i32, kind: i32, slot: i32) {
   const id = rdKind.length
   rdKind.push(kind)
   rdSlot.push(slot)
-  rdPos.push(pos)
-  rdFn.push(fn)
-  rdCtx.push(ctx)
   rdWalk.push(ffCtx)
   rdNext.push(rdHead[ix] ?? -1)
   rdHead[ix] = id
@@ -730,7 +661,6 @@ function ffRecord(
 // ── the walk ─────────────────────────────────────────────────────────────────────────────────
 function ffEnsureWalked(fn: i32, ctx: i32) {
   if ffWalked(fn, ctx) { return 0 }
-  if ffMode == 3 && ffWork > FF_NAIVE_CAP { return 0 }
   ffPairAdd(FF_PAIR_WALKED, fn, ctx, 1)
   const svCtx = ffCtx
   const svFn = ffFn
@@ -755,15 +685,15 @@ function ffWalkFn(fn: i32) {
         if p.parType >= 0 {
           ffPinTy(s, ffSubst(ffAnnTy(p.parType)), 0)
         } else {
-          ffRecord(pi, 3, s, "parameter", fn, ffCtx)
+          ffRecord(pi, 3, s)
         }
-        if p.parDefault >= 0 { ffInto(s, ffFlow(p.parDefault, "default")) }
+        if p.parDefault >= 0 { ffInto(s, ffFlow(p.parDefault)) }
       }
     }
     if fd.fnRet >= 0 {
       ffPinTy(ffRetSlotIn(fn, ffCtx), ffSubst(ffAnnTy(fd.fnRet)), 0)
     }
-    ffInto(ffRetSlotIn(fn, ffCtx), ffFlow(fd.fnBody, "return"))
+    ffInto(ffRetSlotIn(fn, ffCtx), ffFlow(fd.fnBody))
   }
   0
 }
@@ -787,7 +717,6 @@ function ffIsLambdaName(nm: string): boolean {
 // Walk statement `ix` for its effects; its value is dropped.
 function ffStmt(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
-  ffWork = ffWork + 1
   const n = nodeAt(ix)
   if n is LetDecl {
     declCtx[ix] = ffCtx
@@ -800,20 +729,18 @@ function ffStmt(ix: i32) {
     if n.letType >= 0 { ffPinTy(s, ffSubst(ffAnnTy(n.letType)), 0) }
     if n.letInit >= 0 {
       ffDeclFrom[ix] = ffInitBinding(n.letInit)
-      ffInto(s, ffFlow(n.letInit, "binding"))
+      ffInto(s, ffFlow(n.letInit))
     }
     return 0
   }
   if n is RetStmt {
-    if n.retArg >= 0 {
-      ffInto(ffRetSlotIn(ffFn, ffCtx), ffFlow(n.retArg, "return"))
-    }
+    if n.retArg >= 0 { ffInto(ffRetSlotIn(ffFn, ffCtx), ffFlow(n.retArg)) }
     return 0
   }
   if n is FuncDecl {
     // A named nested function: a concrete one is walked here, where its captures stand; a
     // generic one when a call or a read reaches it.
-    if ffIsLambdaName(n.fnName) { return ffFlow(ix, "statement") }
+    if ffIsLambdaName(n.fnName) { return ffFlow(ix) }
     if !monoIsGenericDecl(ix) {
       fnCtx[ix] = ffCtx
       ffEnsureWalked(ix, ffCtx)
@@ -827,7 +754,7 @@ function ffStmt(ix: i32) {
     declCtx[vd] = ffCtx
     const s = ffDeclSlotIn(vd, ffCtx)
     ffAddDecl(s, vd)
-    ffInto(s, ffKid(ffFlow(n.fiIter, "loop"), kid))
+    ffInto(s, ffKid(ffFlow(n.fiIter), kid))
     return ffStmt(n.fiBody)
   }
   if n is Block {
@@ -835,11 +762,11 @@ function ffStmt(ix: i32) {
     return 0
   }
   if n is IfStmt {
-    ffFlow(n.ifCond, "condition")
+    ffFlow(n.ifCond)
     ffStmt(n.ifThen)
     return ffStmt(n.ifElse)
   }
-  ffFlow(ix, "statement")
+  ffFlow(ix)
   0
 }
 
@@ -875,7 +802,7 @@ function ffIsCellRead(ix: i32): boolean {
 }
 
 function ffKids(ix: i32): i32 {
-  for k in nodeChildren(ix) { ffFlow(k, "operand") }
+  for k in nodeChildren(ix) { ffFlow(k) }
   -1
 }
 
@@ -901,7 +828,7 @@ function ffNoteWrite(w: i32, ix: i32) {
 }
 
 // The flow of the value of a block: its last statement's, when that is an expression.
-function ffBlock(ix: i32, pos: string): i32 {
+function ffBlock(ix: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = nodeAt(ix)
   if n is Block {
@@ -918,9 +845,9 @@ function ffBlock(ix: i32, pos: string): i32 {
     if ln is FuncDecl {
       if !ffIsLambdaName(ln.fnName) { return ffStmt(last) - 1 }
     }
-    return ffFlow(last, pos)
+    return ffFlow(last)
   }
-  ffFlow(ix, pos)
+  ffFlow(ix)
 }
 
 // The element slot kind for indexing `arr`: a map's value or a list's element.
@@ -945,25 +872,21 @@ function ffPlace(ix: i32): i32 {
     return ffDeclSlot(d)
   }
   if n is Index {
-    ffFlow(n.idxIndex, "index")
-    return ffKid(ffFlow(n.idxArr, "write target"), fnFlowElemKind(n.idxArr))
+    ffFlow(n.idxIndex)
+    return ffKid(ffFlow(n.idxArr), fnFlowElemKind(n.idxArr))
   }
-  if n is Member {
-    return ffKid(ffFlow(n.memObj, "write target"), "f." + n.memProp)
-  }
-  ffFlow(u, "write target")
+  if n is Member { return ffKid(ffFlow(n.memObj), "f." + n.memProp) }
+  ffFlow(u)
 }
 
-// The class slot of expression `ix`'s value, or -1 when it carries nothing the table tracks;
-// `pos` names the position, for the rows of a function read there.
-function ffFlow(ix: i32, pos: string): i32 {
+// The class slot of expression `ix`'s value, or -1 when it carries nothing the table tracks.
+function ffFlow(ix: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
-  ffWork = ffWork + 1
   const n = nodeAt(ix)
-  if n is Ident { return ffIdent(ix, pos) }
-  if n is Paren { return ffFlow(n.parInner, pos) }
-  if n is AsExpr { return ffFlow(n.asObj, pos) }
-  if n is FuncDecl { return ffLambda(ix, pos) }
+  if n is Ident { return ffIdent(ix) }
+  if n is Paren { return ffFlow(n.parInner) }
+  if n is AsExpr { return ffFlow(n.asObj) }
+  if n is FuncDecl { return ffLambda(ix) }
   if n is Call {
     const r = ffCall(ix, n.callFn)
     // A call returning an open function value is banked as a read is, so its pins are asked
@@ -980,7 +903,7 @@ function ffFlow(ix: i32, pos: string): i32 {
     }
     return r
   }
-  if n is Block { return ffBlock(ix, pos) }
+  if n is Block { return ffBlock(ix) }
   if n is ArrayLit {
     const s = ffNew()
     ffBankDeclSlot(ffOrigDecl(ix), s)
@@ -988,9 +911,9 @@ function ffFlow(ix: i32, pos: string): i32 {
     for el in n.arrElems {
       const en = nodeAt(el)
       if en is Spread {
-        ffInto(e, ffKid(ffFlow(en.spdArg, "spread"), "e"))
+        ffInto(e, ffKid(ffFlow(en.spdArg), "e"))
       } else {
-        ffInto(e, ffFlow(el, "list element"))
+        ffInto(e, ffFlow(el))
       }
     }
     return s
@@ -1000,46 +923,41 @@ function ffFlow(ix: i32, pos: string): i32 {
     ffBankDeclSlot(ffOrigDecl(ix), s)
     for fi in n.objFields {
       const f = nodeAt(fi)
-      if f is FieldInit {
-        ffInto(ffKid(s, "f." + f.fiName), ffFlow(f.fiValue, "field"))
-      } else if f is Spread {
-        ffInto(s, ffFlow(f.spdArg, "spread"))
-      }
+      if f is FieldInit { ffInto(ffKid(s, "f." + f.fiName), ffFlow(f.fiValue)) }
+      else if f is Spread { ffInto(s, ffFlow(f.spdArg)) }
     }
     return s
   }
   if n is Index {
-    ffFlow(n.idxIndex, "index")
-    return ffKid(ffFlow(n.idxArr, "indexed"), fnFlowElemKind(n.idxArr))
+    ffFlow(n.idxIndex)
+    return ffKid(ffFlow(n.idxArr), fnFlowElemKind(n.idxArr))
   }
   if n is Member {
     if n.memProp == "length" {
-      ffFlow(n.memObj, "operand")
+      ffFlow(n.memObj)
       return -1
     }
-    return ffKid(ffFlow(n.memObj, "member"), "f." + n.memProp)
+    return ffKid(ffFlow(n.memObj), "f." + n.memProp)
   }
-  if n is OptMember { return ffKid(ffFlow(n.omObj, "member"), "f." + n.omProp) }
+  if n is OptMember { return ffKid(ffFlow(n.omObj), "f." + n.omProp) }
   if n is BinExpr {
     if n.binOp == "=" {
       ffNoteWrite(ix, n.binLeft)
       const pl = ffPlace(n.binLeft)
       ffMarkWritten(pl)
-      return ffInto(pl, ffFlow(n.binRight, "write"))
+      return ffInto(pl, ffFlow(n.binRight))
     }
-    if n.binOp == "??" {
-      return ffJoin2(ffFlow(n.binLeft, pos), ffFlow(n.binRight, pos))
-    }
+    if n.binOp == "??" { return ffJoin2(ffFlow(n.binLeft), ffFlow(n.binRight)) }
     return ffKids(ix)
   }
   if n is IfStmt {
-    ffFlow(n.ifCond, "condition")
-    return ffJoin2(ffBlock(n.ifThen, pos), ffBlock(n.ifElse, pos))
+    ffFlow(n.ifCond)
+    return ffJoin2(ffBlock(n.ifThen), ffBlock(n.ifElse))
   }
   if n is MatchExpr {
-    ffFlow(n.matchScrut, "operand")
+    ffFlow(n.matchScrut)
     let s = -1
-    for b in n.matchBodies { s = ffJoin2(s, ffBlock(b, pos)) }
+    for b in n.matchBodies { s = ffJoin2(s, ffBlock(b)) }
     return s
   }
   if n is LetDecl { return ffStmt(ix) - 1 }
@@ -1050,7 +968,7 @@ function ffFlow(ix: i32, pos: string): i32 {
 
 // A read of a name: a named function is a source of a fresh class, a binding is its slot. The
 // read's class is banked under the read, so its pins are asked as a binding's are.
-function ffIdent(ix: i32, pos: string): i32 {
+function ffIdent(ix: i32): i32 {
   const d = identDeclOf(ix)
   if d < 0 || d >= P.nodes.length { return -1 }
   const dn = nodeAt(d)
@@ -1059,7 +977,7 @@ function ffIdent(ix: i32, pos: string): i32 {
     const c = ffSrcCtx(d)
     ffAddSrc(t, d, c)
     ffBankDeclSlot(ffOrigDecl(ix), t)
-    ffRecord(ix, 0, t, pos, d, c)
+    ffRecord(ix, 0, t)
     return t
   }
   ffLocalRead[ix] = d
@@ -1067,7 +985,7 @@ function ffIdent(ix: i32, pos: string): i32 {
 }
 
 // A lambda: the source of a fresh class, its body walked here in the current context.
-function ffLambda(ix: i32, pos: string): i32 {
+function ffLambda(ix: i32): i32 {
   const t = ffNew()
   ffAddSrc(t, ix, ffCtx)
   let hole = ffCtx != 0
@@ -1080,7 +998,7 @@ function ffLambda(ix: i32, pos: string): i32 {
       }
     }
   }
-  if hole { ffRecord(ix, 1, t, pos, ix, ffCtx) }
+  if hole { ffRecord(ix, 1, t) }
   t
 }
 
@@ -1129,16 +1047,16 @@ function ffCall(ix: i32, fnIx: i32): i32 {
       const rk = if ty is TyVar && n is Call { ffReadKindOf(cn.memProp, cn.memObj) } else { "" }
       if rk == "ev" && n is Call {
         // Lists and maps both handed to it: the read is either one's slot.
-        const r = ffFlow(cn.memObj, "receiver")
-        for a in n.callArgs { ffFlow(a, "argument") }
+        const r = ffFlow(cn.memObj)
+        for a in n.callArgs { ffFlow(a) }
         return ffJoin2(ffKid(r, "e"), ffKid(r, "v"))
       }
       if rk != "" { return ffMethodAt(ix, cn.memObj, cn.memProp, rk) }
       if ffObjHasField(rt, cn.memProp) || ffBoundObjHasField(rt, cn.memProp) {
-        return ffSlotCall(ix, ffFlow(c, "callee"), [])
+        return ffSlotCall(ix, ffFlow(c), [])
       }
     }
-    ffFlow(cn.memObj, "receiver")
+    ffFlow(cn.memObj)
     ffOpaque(ix, "." + cn.memProp)
     if !ffTyKnown(rt) { return ffUntypedResult() }
     return -1
@@ -1167,7 +1085,7 @@ function ffBoundObjHasField(rt: i32, prop: string): boolean {
 }
 
 // Any other callee is a value: its slot is the one the call reads a function from.
-function ffCalleeSlot(c: i32): i32 { ffFlow(c, "callee") }
+function ffCalleeSlot(c: i32): i32 { ffFlow(c) }
 
 // The lambda an un-annotated declaration `d` with keyword `kw` binds when that lambda is generic
 // or has a hole, as mono instances it per call; -1 otherwise.
@@ -1305,7 +1223,7 @@ function ffSlotCall(ix: i32, s: i32, fl: i32[]): i32 {
       }
       if t < 0 { t = nodeTyIxOf(a) }
       tys.push(ffSubst(t))
-      const af = ffFlow(a, "argument")
+      const af = ffFlow(a)
       fl.push(af)
       ffInto(ffKid(s, "p" + i32ToStr(i)), af)
       i = i + 1
@@ -1373,7 +1291,7 @@ function ffOpaque(ix: i32, name: string): i32 {
   const n = nodeAt(ix)
   if n is Call {
     for a in n.callArgs {
-      const f = ffFlow(a, "argument")
+      const f = ffFlow(a)
       if f >= 0 && ffTyHasFn(nodeTyIxOf(a), 0) {
         ffMarkTop(f, "argument of " + name)
       }
@@ -1391,7 +1309,7 @@ function ffMethod(ix: i32, recv: i32, name: string): i32 {
 // `ffMethod` with the receiver's slot kind `k` given by the caller.
 function ffMethodAt(ix: i32, recv: i32, name: string, k: string): i32 {
   const n = nodeAt(ix)
-  const r = ffFlow(recv, "receiver")
+  const r = ffFlow(recv)
   if n is Call {
     if (
       name == "push"
@@ -1401,10 +1319,10 @@ function ffMethodAt(ix: i32, recv: i32, name: string, k: string): i32 {
       || name == "add"
     ) {
       if n.callArgs.length > 0 {
-        ffInto(ffKid(r, k), ffFlow(n.callArgs[n.callArgs.length - 1], "stored"))
+        ffInto(ffKid(r, k), ffFlow(n.callArgs[n.callArgs.length - 1]))
         let i = 0
         while i < n.callArgs.length - 1 {
-          ffFlow(n.callArgs[i], "argument")
+          ffFlow(n.callArgs[i])
           i = i + 1
         }
       }
@@ -1412,7 +1330,7 @@ function ffMethodAt(ix: i32, recv: i32, name: string, k: string): i32 {
     }
     let mapped = -1
     for a in n.callArgs {
-      const af = ffFlow(a, "argument")
+      const af = ffFlow(a)
       // A lambda over a list of functions takes the element as its first parameter (D9093),
       // and what a `.map` lambda returns is the element of the list it gives (D9171).
       if ffIsElemCallback(name, a, recv) {
@@ -1590,14 +1508,14 @@ function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
   if n is Call {
     if fd is FuncDecl {
       if monoIsGenericDecl(fn) {
-        ffRecord(callee, 2, -1, "direct call", fn, ctx)
+        ffRecord(callee, 2, -1)
         const was = ffCallCtx[ix] ?? ctx
         ffCallCtx[ix] = if was == ctx { ctx } else { -1 }
       }
       ffEnsureWalked(fn, ctx)
       const ord = ffArgsInParamOrder(n, fd)
       for a in n.callArgs {
-        const f = ffFlow(a, "argument")
+        const f = ffFlow(a)
         const j = ffParamIxIn(ord, a, fd.fnParams.length)
         if j >= 0 { ffInto(ffDeclSlotIn(fd.fnParams[j], ctx), f) }
       }
@@ -1639,9 +1557,6 @@ function ffInstCtx(ix: i32, fn: i32): i32 {
           }
           i = i + 1
         }
-        if ffMode == 3 {
-          key = key + "/" + i32ToStr(ffCtx) + "/" + i32ToStr(ix)
-        }
         // A nested generic's captures resolve in the walk that calls it, so each walk of its
         // enclosing function walks its own instance (D13720).
         if (fnDeclParent[fn] ?? -1) != -1 { key = key + "^" + i32ToStr(ffCtx) }
@@ -1661,50 +1576,6 @@ function ffInstCtx(ix: i32, fn: i32): i32 {
   ctx
 }
 
-// The result type function `fn`'s final signature spells: its checked type, else its written
-// result, else its template's concrete one; "" when none of them can be read.
-function ffResSpell(fn: i32): string {
-  const own = ffConcreteRet(fn)
-  if own != "" { return own }
-  const fd = nodeAt(fn)
-  if fd is FuncDecl {
-    if fd.fnRet >= 0 && fd.fnRet < P.nodes.length {
-      const rn = nodeAt(fd.fnRet)
-      if rn is TypeRef {
-        const ti = declTyIxOfName(rn.tyName)
-        if ti >= 0 && ti < T.tys.length { return ffTyKey(ti) }
-      }
-      return ""
-    }
-  }
-  const t = ffTemplateOf(fn)
-  if t == fn || t < 0 || t >= P.nodes.length { return "" }
-  ffConcreteRet(t)
-}
-
-// The result type spelled on function `fn`'s declaration, "" when it carries none.
-function ffWrittenRet(fn: i32): string {
-  const fd = nodeAt(fn)
-  if fd is FuncDecl {
-    if fd.fnRet >= 0 && fd.fnRet < P.nodes.length {
-      const rn = nodeAt(fd.fnRet)
-      if rn is TypeRef { return rn.tyName }
-    }
-  }
-  ""
-}
-
-function ffConcreteRet(fn: i32): string {
-  const ft = nodeTyIxOf(fn)
-  if ft < 0 || ft >= T.tys.length { return "" }
-  const fty = tyAt(ft)
-  if fty is TyFunc {
-    if tyHasTyVar(fty.fnRet) { return "" }
-    return ffTyKey(fty.fnRet)
-  }
-  ""
-}
-
 function ffTyKey(t: i32): string {
   if t < 0 { return "-" }
   tyToEmitName(t)
@@ -1714,15 +1585,6 @@ function ffTyKey(t: i32): string {
 function ffCtxTyKey(t: i32): string {
   if t < 0 { return "-" }
   tyEmitNameKey(t)
-}
-
-// Build the table over the tree `monomorphize` is about to rewrite, and start recording which
-// nodes mono copies from which. Runs on every armed compile, generic or not.
-export function fnFlowShadowBuild(stmts: i32[]) {
-  if ffMode == 0 { return 0 }
-  ffBuild(stmts)
-  identOrigArm(true)
-  0
 }
 
 // Build the table `monomorphize` reads, unless the armed shadow already built it this compile.
@@ -2585,33 +2447,6 @@ function ffBuild(stmts: i32[]) {
   0
 }
 
-// Keep the final tree's roots for the sweep `fnFlowShadowFinish` runs once the compile is over.
-export function fnFlowShadowSweep(stmts: i32[]) {
-  if ffMode == 0 || !ffBuilt { return 0 }
-  ffStmts = stmts
-  ffSwept = true
-  0
-}
-
-// ── the sweep ────────────────────────────────────────────────────────────────────────────────
-let swByName: {[string]: i32} = Map()
-let swTmpl: {[i32]: i32} = Map()
-let swSeen: i32[] = []
-let swStamp = 0
-let swNextStamp = 0
-let swCtxs: i32[] = []
-let swChain: i32[] = []
-let swFeOf: {[i32]: i32} = Map()
-let swVisited: {[string]: boolean} = Map()
-let swResOf: {[string]: string} = Map()
-let swParamOrig: {[i32]: i32} = Map()
-
-function ffRow(verdict: string, pos: string, name: string) {
-  let key = "flow | " + verdict + " | " + pos
-  if ffMode >= 2 { key = key + " | " + name }
-  callBindShadowCount(key)
-}
-
 // Pin `id`'s spellings, rendered once.
 function ffPinNames(id: i32): string[] {
   while pinName.length <= id {
@@ -2640,20 +2475,6 @@ function ffPinOpen(id: i32): boolean {
     if t < 0 || tyHasTyVar(t) { return true }
   }
   false
-}
-
-// The distinct pins of slot `s`'s class, each rendered as one string, open ones left out.
-function ffClassPins(s: i32): string[] {
-  const out: string[] = []
-  const r = ffFind(s)
-  if r < 0 { return out }
-  for id in ufPin[r] {
-    if !ffPinOpen(id) {
-      const j = ffJoin(ffPinNames(id))
-      if !strListHas(out, j) { out.push(j) }
-    }
-  }
-  out
 }
 
 function ffSpellSame(a: string, b: string): boolean {
@@ -2746,318 +2567,6 @@ function ffInstParamSpells(inst: i32, tmpl: i32): string[] {
   out
 }
 
-function ffHasHole(ps: string[]): boolean { strListHas(ps, "?") }
-
-// Map each parameter of instance `inst` to the same-position parameter of template `tmpl`.
-function ffMapParams(inst: i32, tmpl: i32) {
-  if inst < 0 || inst >= P.nodes.length || tmpl < 0 || tmpl >= P.nodes.length {
-    return 0
-  }
-  const a = nodeAt(inst)
-  const b = nodeAt(tmpl)
-  if a is FuncDecl {
-    if b is FuncDecl {
-      let i = 0
-      while i < a.fnParams.length && i < b.fnParams.length {
-        if a.fnParams[i] != b.fnParams[i] {
-          swParamOrig[a.fnParams[i]] = b.fnParams[i]
-        }
-        i = i + 1
-      }
-    }
-  }
-  0
-}
-
-// The template a final-tree function stands for: an instance's, a minted declaration's, or
-// itself.
-function ffTemplateOf(fn: i32): i32 {
-  const t = swTmpl[fn] ?? -1
-  if t >= 0 { return t }
-  const o = declOrigOf(fn)
-  if o >= 0 { return o }
-  fn
-}
-
-// The function a final-tree read `ix` names: its recorded declaration when that declares the
-// name it now spells, else the lifted function of that name.
-function ffTargetOf(ix: i32): i32 {
-  const n = nodeAt(ix)
-  if n is Ident {
-    const fe = swByName[n.identName] ?? -1
-    if fe >= 0 && fe < fnStmts.length { return fnStmts[fe] }
-    const d = identDeclOf(ix)
-    if d >= 0 && d < P.nodes.length {
-      const dn = nodeAt(d)
-      if dn is FuncDecl {
-        if dn.fnName == n.identName { return d }
-      }
-    }
-  }
-  -1
-}
-
-// Whether final function `fn` is a registry entry mono left as a stub.
-function ffIsStub(fn: i32): boolean {
-  const fe = swFeOf[fn] ?? -1
-  fe >= 0 && !monoStubValueOk(fe, -2)
-}
-
-// Grade a decided function value `target` against the records of pre-mono node `o`.
-function ffGrade(o: i32, target: i32, name: string) {
-  let r = ffRecHead(o)
-  if r < 0 { return 0 }
-  const only = ffRecIn(r)
-  const kind = rdKind[r]
-  const pos = rdPos[r]
-  if target < 0 {
-    return ffRow("undecided: resolves to no function", pos, name)
-  }
-  if kind != 1 {
-    if ffTemplateOf(target) != rdFn[r] && target != rdFn[r] {
-      if ffIsStub(target) { return ffRow("undecided: a stub", pos, name) }
-      return ffRow("disagree: another function", pos, name)
-    }
-  }
-  if ffIsStub(target) { return ffRow("undecided: a stub", pos, name) }
-  const ps = ffParamSpells(target)
-  if ffHasHole(ps) {
-    if kind == 1 {
-      return ffRow("undecided: lambda left un-annotated", pos, name)
-    }
-    return ffRow("undecided: template left un-instanced", pos, name)
-  }
-  if kind == 2 { return ffGradeDirect(o, ps, name) }
-  // A generic named function still carrying its type parameters is not an instance either.
-  const td = nodeAt(target)
-  if td is FuncDecl {
-    if td.fnTyParams.length > 0 {
-      return ffRow("undecided: template left un-instanced", pos, name)
-    }
-  }
-  const rs = ffResSpell(target)
-  const wr = ffWrittenRet(target)
-  const cr = ffConcreteRet(target)
-  if wr != "" && cr != "" && wr != cr {
-    return ffRow("disagree: written result is not the checked one", pos, name)
-  }
-  const root = ffFind(rdSlot[r])
-  if root >= 0 && rs != "" {
-    const rk = i32ToStr(root) + "@" + i32ToStr(rdWalk[r])
-    const seen = swResOf[rk] ?? ""
-    if seen == "" {
-      swResOf[rk] = rs
-    } else if seen != rs {
-      return ffRow("disagree: one class, two results", pos, name)
-    }
-  }
-  let anyPin = false
-  let fitsOne = false
-  let fitsMany = false
-  while r >= 0 {
-    if !only || ffRecIn(r) {
-      const pins = ffClassPins(rdSlot[r])
-      if pins.length > 0 { anyPin = true }
-      for pin in pins {
-        if ffPinFits(pin, ps) {
-          if pins.length == 1 { fitsOne = true } else { fitsMany = true }
-        }
-      }
-    }
-    r = rdNext[r]
-  }
-  if !anyPin { return ffRow("unpinned: mono decided alone", pos, name) }
-  if fitsOne { return ffRow("agree", pos, name) }
-  if fitsMany {
-    return ffRow(
-      "disagree: one instance for a class of several pins",
-      pos,
-      name,
-    )
-  }
-  ffRow("disagree: instance fits no pin", pos, name)
-}
-
-// A direct generic call: the instance's parameters against the callee's checked parameter
-// types under the bindings the table keyed the instance by, in any context that walked it.
-function ffGradeDirect(o: i32, ps: string[], name: string) {
-  let r = ffRecHead(o)
-  const only = r >= 0 && ffRecIn(r)
-  let anyOpen = false
-  while r >= 0 {
-    const fn = rdFn[r]
-    const ft = nodeTyIxOf(fn)
-    const ctx = rdCtx[r]
-    if (
-      (!only || ffRecIn(r))
-      && ft >= 0
-      && ft < T.tys.length
-      && ctx >= 0
-      && ctx < ctxBN.length
-    ) {
-      const fty = tyAt(ft)
-      if fty is TyFunc {
-        const want: string[] = []
-        let open = false
-        for pt in fty.fnParamTypes {
-          let t = pt
-          if tyHasTyVar(t) { t = substTyDeep(t, ctxBN[ctx], ctxBT[ctx]) }
-          if t < 0 || tyHasTyVar(t) { open = true }
-          want.push(ffTyKey(t))
-        }
-        if open {
-          anyOpen = true
-        } else if ffPinFits(ffJoin(want), ps) {
-          return ffRow("agree", "direct call", name)
-        }
-      }
-    }
-    r = rdNext[r]
-  }
-  if anyOpen {
-    return ffRow("unpinned: binding left open", "direct call", name)
-  }
-  ffRow("disagree: instance fits no binding", "direct call", name)
-}
-
-function ffSweepNode(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length || ix >= swSeen.length { return 0 }
-  if swSeen[ix] == swStamp { return 0 }
-  swSeen[ix] = swStamp
-  const n = nodeAt(ix)
-  if n is FuncDecl { return ffSweepFn(ix) }
-  ffSweepAt(ix)
-}
-
-// A function in the final tree, swept once per set of walk contexts it stands for: a node an
-// instance shares with its template is graded under each instance's own bindings.
-function ffSweepFn(ix: i32) {
-  const ctxs = ffCtxsOf(ix)
-  let key = i32ToStr(ix) + "@"
-  for c in ctxs { key = key + i32ToStr(c) + "," }
-  if swVisited[key] ?? false { return 0 }
-  swVisited[key] = true
-  const svCtxs = swCtxs
-  const svStamp = swStamp
-  swCtxs = ctxs
-  swStamp = swNextStamp
-  swNextStamp = swNextStamp + 1
-  swSeen[ix] = swStamp
-  swChain.push(ix)
-  ffSweepAt(ix)
-  swChain.pop()
-  swCtxs = svCtxs
-  swStamp = svStamp
-  0
-}
-
-// Whether final function `fn`, or a template or copy it descends from, is among the sources
-// of slot `s`'s class.
-function ffClassHasSrc(s: i32, fn: i32): boolean {
-  const r = ffFind(s)
-  if r < 0 { return false }
-  let x = fn
-  let depth = 0
-  while x >= 0 && depth < 8 {
-    if ffFactHas(ufSrcAt, r, x) { return true }
-    let nx = ffTemplateOf(x)
-    if nx == x { nx = ffOrig(x) }
-    if nx == x { return false }
-    x = nx
-    depth = depth + 1
-  }
-  false
-}
-
-// Whether the sweep is inside a generic template, which is never emitted and not graded.
-function ffInTemplate(): boolean {
-  for c in swChain {
-    const cn = nodeAt(c)
-    if cn is FuncDecl {
-      if cn.fnTyParams.length > 0 && monoIsGenericDecl(c) { return true }
-    }
-  }
-  false
-}
-
-// A read the walk resolved to local binding `ld` that mono pointed at function `d`: the
-// function must be one the binding holds, and fit its class's pins in the swept instance.
-function ffSweepLocalRead(ld: i32, d: i32, name: string) {
-  if ld < 0 || ffInTemplate() { return 0 }
-  const s = ffSlotOfDecl(ld)
-  if !ffClassHasSrc(s, d) {
-    return ffRow(
-      "disagree: a local read names a function it never held",
-      "reference",
-      name,
-    )
-  }
-  const pins = ffClassPins(s)
-  if pins.length == 0 { return 0 }
-  const ps = ffParamSpells(d)
-  for pin in pins {
-    if ffPinFits(pin, ps) { return 0 }
-  }
-  ffRow(
-    "disagree: a local read names an instance it does not hold",
-    "reference",
-    name,
-  )
-}
-
-// The final function enclosing function `f` in the registry, -1 for a top-level one.
-function ffOwnerOf(f: i32): i32 {
-  const fe = swFeOf[f] ?? -1
-  if fe < 0 || fe >= fnParent.length { return -1 }
-  const pfe = fnParent[fe]
-  if pfe < 0 || pfe >= fnStmts.length { return -1 }
-  fnStmts[pfe]
-}
-
-// A reference to nested function `d`, owned by one instance of a generic, from inside another
-// instance of that generic: mono pointed the use at the wrong instance's clone.
-function ffSweepOwner(d: i32, name: string) {
-  const owner = ffOwnerOf(d)
-  if owner < 0 || swChain.length == 0 || ffInTemplate() { return 0 }
-  const ot = swTmpl[owner] ?? -1
-  if ot < 0 { return 0 }
-  let sibling = false
-  for c in swChain {
-    let p = c
-    let depth = 0
-    while p >= 0 && depth < 64 {
-      if p == owner { return 0 }
-      if p != owner && (swTmpl[p] ?? -1) == ot { sibling = true }
-      p = ffOwnerOf(p)
-      depth = depth + 1
-    }
-  }
-  if !sibling { return 0 }
-  ffRow("disagree: a nested instance used outside its owner", "reference", name)
-}
-
-// The walk contexts final function `fn` stands for: a template's own, an instance's matching
-// contexts of its template, else the enclosing function's (empty: any context).
-function ffCtxsOf(fn: i32): i32[] {
-  const out: i32[] = []
-  const fd = nodeAt(fn)
-  if fd is FuncDecl {
-    if fd.fnTyParams.length > 0 && monoIsGenericDecl(fn) {
-      out.push(1)
-      return out
-    }
-  }
-  const t = swTmpl[fn] ?? -1
-  if t < 0 { return swCtxs }
-  const ps = ffParamSpells(fn)
-  let c = 2
-  while c < ctxBN.length {
-    if (ffWalked(t, c) && ffCtxFits(t, c, ps)) { out.push(c) }
-    c = c + 1
-  }
-  out
-}
-
 // Whether template `t`'s parameter types under context `c`'s bindings spell `ps`.
 function ffCtxFits(t: i32, c: i32, ps: string[]): boolean {
   const ft = nodeTyIxOf(t)
@@ -3076,270 +2585,6 @@ function ffCtxFits(t: i32, c: i32, ps: string[]): boolean {
   false
 }
 
-// Whether record `r` comes from a context the function being swept stands for.
-function ffRecIn(r: i32): boolean {
-  swCtxs.length == 0 || i32ListHas(swCtxs, rdWalk[r])
-}
-
-// The first record of `o` made in the swept function's contexts, else the first of any.
-function ffRecHead(o: i32): i32 {
-  let r = rdHead[o] ?? -1
-  while r >= 0 {
-    if ffRecIn(r) { return r }
-    r = rdNext[r]
-  }
-  rdHead[o] ?? -1
-}
-
-function ffSweepAt(ix: i32) {
-  const n = nodeAt(ix)
-  const o = ffOrig(ix)
-  if ffMode == 4 && (rdHead[o] ?? -1) >= 0 {
-    callBindShadowCount(
-      "trace | sweep node " + i32ToStr(ix) + " orig " + i32ToStr(o),
-    )
-  }
-  if n is Ident {
-    const r = rdHead[o] ?? -1
-    if ffMode == 4 && r < 0 {
-      callBindShadowCount(
-        "trace | unrecorded ident "
-          + n.identName
-          + " node "
-          + i32ToStr(ix)
-          + " decl "
-          + i32ToStr(identDeclOf(ix))
-          + " stamp "
-          + i32ToStr(swStamp),
-      )
-    }
-    if r >= 0 && rdKind[r] == 0 { ffGrade(o, ffTargetOf(ix), n.identName) }
-    const d = identDeclOf(ix)
-    if d >= 0 && d < P.nodes.length {
-      const dn = nodeAt(d)
-      if dn is FuncDecl {
-        ffSweepLocalRead(ffLocalRead[o] ?? -1, d, n.identName)
-        ffSweepOwner(d, n.identName)
-      }
-    }
-    return 0
-  }
-  if n is Call {
-    const c = unwrapParen(n.callFn)
-    if c >= 0 && c < P.nodes.length {
-      let co = identOrigOf(c)
-      if co < 0 { co = c }
-      const r = rdHead[co] ?? -1
-      if r >= 0 && rdKind[r] == 2 {
-        const cn = nodeAt(c)
-        if cn is Ident { ffGrade(co, ffTargetOf(c), cn.identName) }
-        if c < swSeen.length { swSeen[c] = swStamp }
-      }
-    }
-  }
-  if n is FuncDecl {
-    if ffMode == 4 {
-      let rs = "-"
-      if n.fnRet >= 0 && n.fnRet < P.nodes.length {
-        const rn = nodeAt(n.fnRet)
-        if rn is TypeRef { rs = rn.tyName } else { rs = "?" }
-      }
-      callBindShadowCount(
-        "trace | fn "
-          + n.fnName
-          + " node "
-          + i32ToStr(ix)
-          + " orig "
-          + i32ToStr(o)
-          + " "
-          + ffJoin(ffParamSpells(ix))
-          + " -> "
-          + rs
-          + " res "
-          + ffResSpell(ix),
-      )
-    }
-    const r = rdHead[o] ?? -1
-    if r >= 0 && rdKind[r] == 1 { ffGrade(o, ix, n.fnName) }
-    ffSweepParams(n.fnParams, n.fnName)
-    ffSweepShadow(ix)
-    ffSweepRet(ix, n.fnName)
-  }
-  for k in nodeChildren(ix) { ffSweepNode(k) }
-  0
-}
-
-// An instance of a generic whose return is left to inference while the table sees that return
-// come out of a call, in its own body, through a value the checker gave no function type: mono
-// left the result's type open.
-function ffSweepRet(fn: i32, fnName: string) {
-  const fd = nodeAt(fn)
-  if fd is FuncDecl {
-    if fd.fnRet >= 0 { return 0 }
-  }
-  const t = ffTemplateOf(fn)
-  if t < 0 || t >= P.nodes.length || !monoIsGenericDecl(t) { return 0 }
-  let c = 0
-  while c < ctxBN.length {
-    const s = ffPairGet(FF_PAIR_RET, t, c)
-    const r = ffFind(s)
-    if r >= 0 && ffFactHas(ufResAt, r, t) {
-      return ffRow(
-        "undecided: return through a function value",
-        "return",
-        fnName,
-      )
-    }
-    c = c + 1
-  }
-  0
-}
-
-// An un-annotated parameter left in the final tree whose class carries a function.
-function ffSweepParams(params: i32[], fnName: string) {
-  for pi in params {
-    const p = nodeAt(pi)
-    if p is Param {
-      const r = rdHead[ffOrig(pi)] ?? -1
-      if (
-        r >= 0
-        && rdKind[r] == 3
-        && p.parType < 0
-        && ffCarriesFn(rdSlot[r], 0)
-      ) {
-        ffRow(
-          "undecided: parameter left un-annotated",
-          "parameter",
-          fnName + "." + p.parName,
-        )
-      }
-    }
-  }
-  0
-}
-
-// Whether `s`'s class, or a slot derived from it, holds a function source.
-function ffCarriesFn(s: i32, depth: i32): boolean {
-  const r = ffFind(s)
-  if r < 0 || depth > 4 { return false }
-  if ufSrc[r].length > 0 { return true }
-  for k in ufKidS[r] {
-    if ffCarriesFn(k, depth + 1) { return true }
-  }
-  false
-}
-
-// Two bindings of one name in one final function whose classes carry functions called at
-// different signatures, or a direct call spelled like a local binding: the emitter keys a local
-// by its name, so neither pair may meet in one function.
-function ffSweepShadow(fn: i32) {
-  const names: string[] = []
-  const sigs: string[] = []
-  const calls: string[] = []
-  const srcs: string[] = []
-  ffShadowCollect(fn, names, sigs, srcs, calls, true)
-  let i = 0
-  if ffMode == 4 {
-    while i < names.length {
-      callBindShadowCount("trace | shadow " + names[i] + " = " + sigs[i])
-      i = i + 1
-    }
-    i = 0
-  }
-  while i < names.length {
-    let j = i + 1
-    while j < names.length {
-      if (
-        names[i] == names[j]
-        && sigs[i] != sigs[j]
-        && sigs[i] != ""
-        && sigs[j] != ""
-      ) {
-        ffRow(
-          "disagree: one name, two signatures",
-          "shadowed binding",
-          names[i],
-        )
-      } else if (
-        names[i] == names[j]
-        && srcs[i] != srcs[j]
-        && srcs[i] != ""
-        && srcs[j] != ""
-      ) {
-        ffRow(
-          "undecided: one name over two function sets",
-          "shadowed binding",
-          names[i],
-        )
-      }
-      j = j + 1
-    }
-    if strListHas(calls, names[i]) {
-      ffRow(
-        "disagree: a call spelled like a local binding",
-        "shadowed binding",
-        names[i],
-      )
-    }
-    i = i + 1
-  }
-  0
-}
-
-// The pins of `s`'s class and of every slot derived from it that carries a function, as one
-// string; "" when the class carries none.
-function ffDeepSig(s: i32, depth: i32): string {
-  const r = ffFind(s)
-  if r < 0 || depth > 4 || !ffCarriesFn(r, 0) { return "" }
-  let out = ffJoin(ffClassPins(r))
-  const ks: string[] = []
-  let i = 0
-  while i < ufKidK[r].length {
-    const sub = ffDeepSig(ufKidS[r][i], depth + 1)
-    if sub != "" { ks.push(ufKidK[r][i] + "=" + sub) }
-    i = i + 1
-  }
-  ffSortStrs(ks)
-  for k in ks { out = out + " " + k }
-  out
-}
-
-// The function sources of `s`'s class and of the slots derived from it, into `out`.
-function ffDeepSrc(s: i32, depth: i32, out: string[]) {
-  const r = ffFind(s)
-  if r < 0 || depth > 4 { return 0 }
-  for f in ufSrc[r] {
-    const k = i32ToStr(f)
-    if !strListHas(out, k) { out.push(k) }
-  }
-  for k in ufKidS[r] { ffDeepSrc(k, depth + 1, out) }
-  0
-}
-
-function ffSortStrs(xs: string[]) {
-  let i = 1
-  while i < xs.length {
-    let j = i
-    while j > 0 && ffStrLess(xs[j], xs[j - 1]) {
-      const t = xs[j]
-      xs[j] = xs[j - 1]
-      xs[j - 1] = t
-      j = j - 1
-    }
-    i = i + 1
-  }
-  0
-}
-
-function ffStrLess(a: string, b: string): boolean {
-  let i = 0
-  while i < a.length && i < b.length {
-    if a[i] != b[i] { return a[i] < b[i] }
-    i = i + 1
-  }
-  a.length < b.length
-}
-
 // The declaration of the variable a `for` loop `ix` binds its value to: a list's first variable, a
 // map's second (`for k, v in m`). -1 when `ix` is no `for` loop.
 function ffLoopValueDecl(ix: i32): i32 {
@@ -3347,183 +2592,4 @@ function ffLoopValueDecl(ix: i32): i32 {
   if !(n is ForIn) { return -1 }
   if n.fiDecl2 >= 0 && fnFlowElemKind(n.fiIter) == "v" { return n.fiDecl2 }
   n.fiDecl1
-}
-
-// The name declaration `ix` binds, "" for a node that binds none the table tracks.
-function ffBindName(ix: i32): string {
-  const n = nodeAt(ix)
-  if n is LetDecl { return n.letName }
-  if n is Param { return n.parName }
-  if n is LoopVar { return loopVarName(ix) }
-  ffNoBinding(ix)
-}
-
-// Every other kind binds no slot the table tracks; a function declaration names a source.
-function ffNoBinding(_ix: i32): string { "" }
-
-function ffShadowCollect(
-  ix: i32,
-  names: string[],
-  sigs: string[],
-  srcs: string[],
-  calls: string[],
-  top: boolean,
-) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = nodeAt(ix)
-  if n is FuncDecl && !top { return 0 }
-  let bd = ix
-  if n is ForIn { bd = ffLoopValueDecl(ix) }
-  const nm = ffBindName(bd)
-  if nm != "" {
-    const s = ffSlotOfDecl(ffOrig(bd))
-    names.push(nm)
-    if s >= 0 { sigs.push(ffDeepSig(s, 0)) } else { sigs.push("") }
-    const ss: string[] = []
-    ffDeepSrc(s, 0, ss)
-    ffSortStrs(ss)
-    srcs.push(ffJoin(ss))
-  }
-  if n is Call {
-    const c = unwrapParen(n.callFn)
-    if c >= 0 && c < P.nodes.length {
-      const cn = nodeAt(c)
-      if cn is Ident {
-        if (swByName[cn.identName] ?? -1) >= 0 { calls.push(cn.identName) }
-      }
-    }
-  }
-  for k in nodeChildren(ix) {
-    ffShadowCollect(k, names, sigs, srcs, calls, false)
-  }
-  0
-}
-
-// The pre-mono node final-tree node `ix` copies: the origin column's answer, else the
-// same-position parameter of the template that minted an instance, else `ix`.
-function ffOrig(ix: i32): i32 {
-  const o = identOrigOf(ix)
-  if o >= 0 { return o }
-  swParamOrig[ix] ?? ix
-}
-
-// The slot of declaration `d` in a context the swept function stands for, else in the last
-// context that declared it; -1 when the table never declared it.
-function ffSlotOfDecl(d: i32): i32 {
-  for sc in swCtxs {
-    const hit = ffPairGet(FF_PAIR_DECL, d, sc)
-    if hit >= 0 { return hit }
-  }
-  const c = declCtx[d] ?? -1
-  if c < 0 { return -1 }
-  ffPairGet(FF_PAIR_DECL, d, c)
-}
-
-// The name a class is known by: its bindings' names.
-function ffClassNames(r: i32): string[] {
-  const out: string[] = []
-  for d in ufDecl[r] {
-    const nm = ffBindName(d)
-    if nm != "" { out.push(nm) }
-  }
-  out
-}
-
-// Multi-pin agreement, both directions: a class with two or more pins that holds two functions or
-// is written, against the bindings the monomorphizer refused for the same reason.
-function ffMultiPin() {
-  const fails = fnFlowSigFails()
-  const matched: string[] = []
-  let r = 0
-  while r < ufPar.length {
-    if (
-      ufPar[r] == r
-      && ffClassPins(r).length >= 2
-      && (ufSrc[r].length >= 2 || ufWritten[r])
-    ) {
-      const names = ffClassNames(r)
-      let both = ""
-      for nm in names {
-        if strListHas(fails, nm) { both = nm }
-      }
-      if both != "" {
-        matched.push(both)
-        ffRow("multi-pin: both", "binding", both)
-      } else if names.length > 0 {
-        ffRow("multi-pin: table only", "binding", names[0])
-      }
-    }
-    r = r + 1
-  }
-  for nm in fails {
-    if !strListHas(matched, nm) { ffRow("multi-pin: mono only", "binding", nm) }
-  }
-  0
-}
-
-// The classes a function argument escaped from, once each, by the position that let it go.
-function ffTopRows() {
-  let r = 0
-  while r < ufPar.length {
-    if ufPar[r] == r && ufTop[r] != "" && ufSrc[r].length > 0 {
-      ffRow("top", ufTop[r], "")
-    }
-    r = r + 1
-  }
-  0
-}
-
-// Count the last armed compile's verdicts into the shared bank; the host calls this after the
-// compile returns, since a refused compile never reaches the sweep's hook.
-export function fnFlowShadowFinish() {
-  if ffMode == 0 || !ffBuilt { return 0 }
-  identOrigArm(false)
-  ffMultiPin()
-  ffTopRows()
-  if !ffSwept { return 0 }
-  swByName = Map()
-  swFeOf = Map()
-  swChain = []
-  let fe = 0
-  while fe < fnStmts.length {
-    const f = fnStmts[fe]
-    if f >= 0 && f < P.nodes.length {
-      const fd = nodeAt(f)
-      if fd is FuncDecl {
-        if (swByName[fd.fnName] ?? -1) < 0 { swByName[fd.fnName] = fe }
-        swFeOf[f] = fe
-      }
-    }
-    fe = fe + 1
-  }
-  swTmpl = Map()
-  swParamOrig = Map()
-  let k = 0
-  while k < monoInstFe.length && k < monoInstOrig.length {
-    const ife = monoInstFe[k]
-    const ofe = monoInstOrig[k]
-    if (
-      ife >= 0
-      && ife < fnStmts.length
-      && ofe >= 0
-      && ofe < monoOrigNode.length
-    ) {
-      swTmpl[fnStmts[ife]] = monoOrigNode[ofe]
-      ffMapParams(fnStmts[ife], monoOrigNode[ofe])
-    }
-    k = k + 1
-  }
-  swSeen = []
-  swResOf = Map()
-  while swSeen.length < P.nodes.length { swSeen.push(-1) }
-  swStamp = 0
-  swNextStamp = 1
-  swCtxs = []
-  swVisited = Map()
-  for st in ffStmts { ffSweepNode(st) }
-  for f in fnStmts { ffSweepNode(f) }
-  swSeen = []
-  swVisited = Map()
-  ffSwept = false
-  0
 }
