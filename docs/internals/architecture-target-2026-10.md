@@ -1021,8 +1021,10 @@ pin rule then becomes an elaboration fact mono reads:
 - D6090's per-parameter pin for a generic handed to a second `T` parameter (`genPin`,
   `monoTyParamOnlyBareParams`);
 - a copy of a parameter taking that parameter's pin (`monoCopySeedParam`, `monoLetPinAt`);
-- the set pin of a type-parameter-annotated parameter, which mirrors the tag decision's rules for
-  one (`ftOwnTyParamJoins`), so a rule added there is added here too;
+- the set pin of a type-parameter-annotated parameter. Since 2026-11-05 it reads the tag
+  decision's output, a tagged argument, instead of mirroring `ftOwnTyParamJoins`, and the joined
+  set it pins at is the elaboration's binding, recorded per call and argument by `elabSetArgBind`
+  (`fnTagCallJoinOf`), since a union over a type variable has no instance row to read it from;
 - D6760's un-annotated seed, which waits on this move, since pinning it in mono mints a late
   demand.
 
