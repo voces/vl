@@ -1,3 +1,4 @@
+import { demangleName } from "./check_suggest"
 // Which sets of functions a value holds as the i32 id of its member rather than as a closure
 // (D3975). A set is tagged when some call through it needs a member's own instance, and every
 // node carrying it is a place the emitter can lower as an id: a name of a member, a binding, a
@@ -1229,7 +1230,7 @@ function ftOtherTail(x: i32, p: i32, g: i32, fn: i32, s: i32, ds: i32[]): i32 {
   if p < 0 || ftLeafMember(x, ds) < 0 { return -1 }
   const pn = nodeAt(p)
   if pn is RetStmt {
-    if fn < 0 || pn.retArg != x { return -1 }
+    if fn < 0 || pn.retArg != x || ftFnNeverNamed(fn) { return -1 }
     const o = fnTagSetOfTy(rcwInferredRetTy(fn))
     if o == s { return -1 }
     return o
@@ -1256,6 +1257,20 @@ function ftOtherTail(x: i32, p: i32, g: i32, fn: i32, s: i32, ds: i32[]): i32 {
   const o = fnTagSetOfTy(nodeTyIxOf(g))
   if o == s { return -1 }
   o
+}
+
+// Whether no read, call or method call of function `fn`'s spelling may stand for it and it is not
+// exported, so no call ever runs it.
+function ftFnNeverNamed(fn: i32): boolean {
+  if fn < 0 || fn >= P.nodes.length || declIsExportedFn(fn) { return false }
+  const f = nodeAt(fn)
+  if !(f is FuncDecl) || f.fnName == "" { return false }
+  cwIxWant()
+  const w = cwOccWalkSpelled(fn, demangleName(f.fnName))
+  while cwOccNext(w) {
+    if cwIxNode[w.row] != fn { return false }
+  }
+  true
 }
 
 // Walks the program for every node carrying set `s`, pushing each member name it reaches to
@@ -1302,7 +1317,9 @@ function ftScan(
         if !ftSetWithin(s, ot) { return false }
         if !i32ListHas(ftSubNeed, ot) { ftSubNeed.push(ot) }
       }
-      if ftIsS(x, s) && ot < 0 && !ftNamedAtClosed(x, p, g, s) {
+      // A function nothing names never returns, so a member it returns is no leaf (D15070).
+      const deadRet = p >= 0 && nodeAt(p) is RetStmt && ftFnNeverNamed(fn)
+      if ftIsS(x, s) && ot < 0 && !deadRet && !ftNamedAtClosed(x, p, g, s) {
         if !ok || !ftNodeOk(x, p, s, ds, leaves, ids) { return false }
         if !ftCtxOk(x, p, g, fn, s) { return false }
         const pn = nodeAt(p)
@@ -3248,8 +3265,9 @@ function ftLateArgOfSet(c: Call, x: i32, s: i32): boolean {
   const cs = fnTagSetOfTy(nodeTyIxOf(cf))
   const ds = fnTagMembers(cs)
   if ds.length == 0 { return false }
+  // A member that never reads the parameter takes any id, as `ftLateParamTakes` lets it (D15038).
   for d in ds {
-    if !mintParamTakes(d, i, s) { return false }
+    if !mintParamTakes(d, i, s) && !ftParamUnread(d, i) { return false }
   }
   // A call through a closure of named functions takes the closure's one signature, which holds
   // `s`'s id only where no instance hands the members' parameter another set; else the callee's
