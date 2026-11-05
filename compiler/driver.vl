@@ -22,18 +22,7 @@ import {
   mimpNoteMoved,
   mimpSpecsFor,
 } from "./missing_import"
-import {
-  FS_APPLY,
-  FS_COMPILE,
-  FS_PLAN,
-  fsAfterParse,
-  fsAsked,
-  fsGrew,
-  fsModeOf,
-  fsPlan,
-  fsReset,
-  fsSetMode,
-} from "./fn_split"
+import { constLetsAfterParse } from "./const_lets"
 import {
   midSalted,
   modIdAssign,
@@ -1187,37 +1176,8 @@ function pipelineReset(): i32 {
   0
 }
 
-// How many instance diagnostics the last compile's split-applied pass raised; -1 when none ran.
-let fsApplyElabErrors = -1
-
-// 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error. A program whose only emit
-// error is a function binding wanting two signatures compiles again with an instance record
-// (`fn_split.vl`), once more per round that asks for a parse node no earlier round asked
-// for (D6262); when none builds, the first compile's error is the one reported.
-export function compileSrc(): i32 {
-  fsReset()
-  fsApplyElabErrors = -1
-  const rc = compileSrcOnce()
-  if rc != 3 || !fsAsked() { return rc }
-  let going = true
-  while going {
-    fsSetMode(FS_PLAN)
-    if compileSrcOnce() != 0 {
-      going = false
-    } else {
-      fsSetMode(FS_APPLY)
-      const rc3 = compileSrcOnce()
-      // The applied plan's program is the one built, so its type errors are the program's.
-      if rc3 == 0 || rc3 == 2 {
-        fsSetMode(FS_COMPILE)
-        return rc3
-      }
-      if rc3 != 3 || !fsGrew() { going = false }
-    }
-  }
-  fsSetMode(FS_COMPILE)
-  compileSrcOnce()
-}
+// 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
+export function compileSrc(): i32 { compileSrcOnce() }
 
 function compileSrcOnce(): i32 {
   plusLinksClear()
@@ -1230,7 +1190,7 @@ function compileSrcOnce(): i32 {
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
-  if fsAfterParse() < 0 { return 3 }
+  constLetsAfterParse()
   // No vcEpBank: only a check's tree is replayed by the lint, and a compile never is.
   ambientRenameSingle(root)
   csPreMintLocs()
@@ -1267,13 +1227,11 @@ function compileSrcOnce(): i32 {
     }
     xt = xt + 1
   }
-  if fsModeOf() == FS_PLAN { return fsPlan(root) }
   // Read before emit, which may elaborate again and drop what that raises.
   const owed = elabErrorCount()
-  if fsModeOf() == FS_APPLY { fsApplyElabErrors = owed }
   const rc = emitProgram(root)
-  // A program a split does not replace owes its instances' diagnostics (`elabErrors`).
-  if rc < 0 && (fsAsked() || owed == 0) {
+  // A program that builds no further owes its instances' diagnostics (`elabErrors`).
+  if rc < 0 && owed == 0 {
     while T.diags.length > 0 { T.diags.pop() }
     return 3
   }
@@ -1328,8 +1286,7 @@ export function checkSrc(): i32 {
   const rc = checkSrcOnce()
   if elabErrorCount() == 0 { return rc }
   const built = compileSrc()
-  fsReset()
-  elabErrorsMuteSet(built == 0 || fsApplyElabErrors == 0)
+  elabErrorsMuteSet(built == 0)
   const again = checkSrcOnce()
   // The diagnostics that stand are type errors, which a caller reads only on a non-zero rc.
   const owed = elabErrorCount()
@@ -5213,7 +5170,7 @@ function modCompile(emit: i32): i32 {
   // quantifier spans the WHOLE graph — one lossy diagnostic in any module stops
   // the merge for all of them, which is what the shared arena requires anyway.
   if vcParseBlocked() { return 1 }
-  if fsAfterParse() < 0 { return 3 }
+  constLetsAfterParse()
   modCheckReservedAll(roots)
   if vcParseBlocked() { return 1 }
   modRewriteAll(roots)
@@ -5257,12 +5214,10 @@ function modCompile(emit: i32): i32 {
   if wiLiveNow && emit == 0 && keep.length == 0 { wiBankWhole(roots) }
   // The elaboration is the last step of check; emit builds from it.
   elabPrepare(merged)
-  if fsModeOf() == FS_PLAN { return fsPlan(merged) }
   if emit != 0 {
     const owed = elabErrorCount()
-    if fsModeOf() == FS_APPLY { fsApplyElabErrors = owed }
     const rc = emitProgram(merged)
-    if rc < 0 && (fsAsked() || owed == 0) {
+    if rc < 0 && owed == 0 {
       while T.diags.length > 0 { T.diags.pop() }
       return 3
     }
@@ -5666,9 +5621,7 @@ function skCallsOnly(root: i32, merged: string): boolean {
 // module whose source the bank does not hold, closed over its imports. `skReason` says why.
 function skPlan(roots: i32[], tokEnd: i32): boolean[] {
   const whole: boolean[] = []
-  if !skValid || skMask != ihMask() || fsAsked() || fsModeOf() != FS_COMPILE {
-    return whole
-  }
+  if !skValid || skMask != ihMask() { return whole }
   if modKeys.length != skKeys.length {
     skReason = SK_GRAPH
     return whole
@@ -7033,8 +6986,6 @@ function wiBankWhole(roots: i32[]): i32 {
   const clean = P.diags.length == 0
     && (wiDirtyNow || jwSiteNode.length == 0)
     && mimpMissed.length == 0
-    && !fsAsked()
-    && fsModeOf() == FS_COMPILE
     && placed
   const pos = skPosOf()
   let ready = false
