@@ -2,7 +2,7 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
-import { cwIxCovers } from "./check_write_scan"
+import { cwIxCoveredLen, cwIxCovers } from "./check_write_scan"
 import { monoIsGenericDecl } from "./emit_base"
 import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
@@ -3208,36 +3208,51 @@ function elabRetHandsBack(decl: i32, ix: i32, i: i32): boolean {
 // the body, so one walk per function serves all its instances.
 let elabHandBackMemo: {[i32]: i32} = Map()
 
-// The parameter of `dn` the returned call `x` hands back: `x` calls a declared function that hands
-// back its positional argument, and that argument reads the parameter; -1 otherwise.
-function elabHandBackThrough(dn: FuncDecl, x: i32): i32 {
-  const cn = nodeAt(x)
-  if !(cn is Call) { return -1 }
-  const g = identFnDeclOf(parenPeelIx(cn.callFn))
-  if g < 0 || g >= P.nodes.length { return -1 }
-  const gn = nodeAt(g)
-  if !(gn is FuncDecl) { return -1 }
-  const j = elabHandBackIx(g, gn)
-  if j < 0 || j >= cn.callArgs.length { return -1 }
-  if j < cn.callArgNames.length && cn.callArgNames[j] != "" { return -1 }
-  const a = parenPeelIx(cn.callArgs[j])
-  if a < 0 || !(nodeAt(a) is Ident) { return -1 }
-  i32ListIndexOf(dn.fnParams, identDeclOf(a))
+// The un-annotated parameter `dn` (declared at `decl`) hands back: its own (`elabHandBackIx`), or
+// the one every returned value reads through a call of a declared function handing back that
+// argument (`fw2(f) { return fw(f) }`); -1 otherwise.
+function elabHoleHandBackIx(decl: i32, dn: FuncDecl, depth: i32): i32 {
+  const own = elabHandBackIx(decl, dn)
+  if own >= 0 || depth > 8 { return own }
+  const vs: i32[] = []
+  collectRetValues(dn.fnBody, vs)
+  let at = -1
+  for v in vs {
+    const x = parenPeelIx(v)
+    const cn = if x >= 0 { nodeAt(x) } else { nodeAt(0) }
+    if !(cn is Call) { return -1 }
+    const g = identFnDeclOf(parenPeelIx(cn.callFn))
+    const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { nodeAt(0) }
+    if !(gn is FuncDecl) { return -1 }
+    const j = elabHoleHandBackIx(g, gn, depth + 1)
+    if j < 0 || j >= cn.callArgs.length { return -1 }
+    if j < cn.callArgNames.length && cn.callArgNames[j] != "" { return -1 }
+    const ad = parenPeelIx(cn.callArgs[j])
+    const i = if ad >= 0 && nodeAt(ad) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(ad)) } else { -1 }
+    if i < 0 || at >= 0 && i != at { return -1 }
+    at = i
+  }
+  if at < 0 { return -1 }
+  const pn = nodeAt(dn.fnParams[at])
+  if (
+    !(pn is Param)
+    || pn.parType >= 0
+    || !elabParamOnlyReturned(dn, dn.fnParams[at], vs)
+  ) {
+    return -1
+  }
+  at
 }
 
 function elabHandBackIx(decl: i32, dn: FuncDecl): i32 {
   const had = elabHandBackMemo[decl] ?? -2
   if had > -2 { return had }
   let at = -1
-  // A cycle of calls handing each other back reads as handing nothing back.
-  elabHandBackMemo[decl] = -1
   const vs: i32[] = []
   collectRetValues(dn.fnBody, vs)
   for v in vs {
     const x = parenPeelIx(v)
     let i = if x >= 0 && nodeAt(x) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(x)) } else { -1 }
-    // A returned call of a function that hands back its argument hands back what that reads.
-    if i < 0 && x >= 0 { i = elabHandBackThrough(dn, x) }
     // A returned `const` copy of a parameter hands that parameter back.
     if i < 0 && x >= 0 && nodeAt(x) is Ident {
       i = i32ListIndexOf(dn.fnParams, fnTagParamCopyOf(dn, identDeclOf(x)))
@@ -10119,10 +10134,17 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
         }
         j = j + 1
       }
-    } else if !named && pn is Param && i == elabHandBackIx(d, f) {
+    } else if (
+      !named
+      && pn is Param
+      && (i == elabHandBackIx(d, f)
+        || pn.parType < 0 && i == elabHoleHandBackIx(d, f, 0))
+    ) {
       // A function handed back to a closed function-typed destination is bound at that type:
-      // the call's value is delivered there, and the open binding names no instance.
-      const ct = elabClosedFnCtx(ix)
+      // the call's value is delivered there, and the open binding names no instance. A hole
+      // parameter takes, failing that, the one type every call through the value takes (D5530).
+      const cx = elabClosedFnCtx(ix)
+      const ct = if cx >= 0 || pn.parType >= 0 { cx } else { elabResultCallTy(ix) }
       const hn = elabParamTyVarName(f, i)
       let j = 0
       while ct >= 0 && j < names.length && j < out.length {
@@ -10180,7 +10202,7 @@ function elabSoleInstFnTy(ax: i32): i32 {
 function elabClosedFnCtx(ix: i32): i32 {
   const t = nodeCtxTyIxOf(ix)
   if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || !elabTyClosed(t, 0) {
-    return elabResultCallTy(ix)
+    return -1
   }
   t
 }
@@ -10189,7 +10211,8 @@ function elabClosedFnCtx(ix: i32): i32 {
 // callee of, or each call through the un-annotated `const` it initialises when that binding is
 // read only as a callee (D5530); -1 when there is none, one is open, or two differ.
 function elabResultCallTy(ix: i32): i32 {
-  if ix < 0 || !cwIxCovers(ix) { return -1 }
+  // A call an instance minted after the index was built has no row there.
+  if ix < 0 || ix >= cwIxCoveredLen() { return -1 }
   const up = cwIxUp[ix]
   const k = cwIxUpKind[ix]
   let calls: i32[] = []
