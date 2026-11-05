@@ -605,13 +605,10 @@ Deno.test("no reserved inventory range is stale", async () => {
   }
 });
 
-// A RUNNING ROW STATES WHAT IT PRINTS. A row filed as running (closed, or must keep running)
-// is graded on its exit and, only through a `Want:` block, on its output; a `// PRINTS` line in a
-// running row's repro is history the grader never reads. D14160 was closed as printing `true`, kept
-// grading `as filed`, and printed `false` on master for days (D15481). Every running row carries a
-// `Want:` block unless it is on `scripts/inventory/want-baseline.txt`, the rows that predate the
-// rule, which may only shrink: a baselined row is pinned once its output is checked against its
-// own history, never by copying today's output wholesale.
+// A running row (closed, or must keep running) states its stdout in a `Want:` block, the only
+// output the grader reads on such a row; a `// PRINTS` line there is never graded (D15481). The rows
+// that predate this rule are on `scripts/inventory/want-baseline.txt`, which may only shrink, and a
+// baselined row is pinned only after its output is checked against its own history.
 const WANT_BASELINE = "scripts/inventory/want-baseline.txt";
 
 /** A `const NAME = [ "…", … ]` string list of the grader's library, parsed. */
