@@ -318,6 +318,7 @@ function ftArmOnlyLamMark(v: i32) {
 }
 
 export function fnTagDecide(rootIx: i32) {
+  ftRetJoinFns = Map()
   ftArmOnlyLamsNote(rootIx)
   ftParamOwners = Map()
   ftParamOwnersBuilt = false
@@ -742,6 +743,21 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   ftBindsCur = []
   ftHeldCur = []
   if !ftScan(rootIx, s, ds, leaves, ids) { return false }
+  // A function a member's tail returns into `s` returns each member it names as `s`'s id, though
+  // nothing calls it (D15457).
+  for rf in ftRetJoinFns[s] ?? [] {
+    const fd = nodeAt(rf)
+    const rv: i32[] = []
+    if fd is FuncDecl && fd.fnBody >= 0 { collectRetValues(fd.fnBody, rv) }
+    for v in rv {
+      const vx = parenPeelIx(v)
+      const vd = if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is Ident { identDeclOf(vx) } else { -1 }
+      if vd >= 0 && i32ListHas(ds, vd) && !i32ListHas(leaves, vx) {
+        leaves.push(vx)
+        ids.push(vd)
+      }
+    }
+  }
   // A written `let` a parameter initialises holds `s` only in an instance, so the members written
   // to it are the set's leaves, and the parameter's own set is decided with it.
   for b in mintSeedBindsOf(s) {
@@ -1249,6 +1265,10 @@ function ftIsS(x: i32, s: i32): boolean {
   x >= 0 && fnTagSetOfTy(nodeTyIxOf(x)) == s
 }
 
+// Per wider set a member's `return` joins, the functions returning it, whose returned members
+// are its leaves when nothing calls them (D15457).
+let ftRetJoinFns: {[i32]: i32[]} = Map()
+
 // The set other than `s` that a join carries, when member name `x` is an element of list literal
 // `p`, a value call `p` writes into a list or map slot, the tail of block `p` of join `g`, or
 // returned by `fn`; -1 otherwise. That set's own decision builds the leaf, and its rep is the
@@ -1260,6 +1280,11 @@ function ftOtherTail(x: i32, p: i32, g: i32, fn: i32, s: i32, ds: i32[]): i32 {
     if fn < 0 || pn.retArg != x || ftFnNeverNamed(fn) { return -1 }
     const o = fnTagSetOfTy(rcwInferredRetTy(fn))
     if o == s { return -1 }
+    if o >= 0 {
+      const have = ftRetJoinFns[o] ?? []
+      if !i32ListHas(have, fn) { have.push(fn) }
+      ftRetJoinFns[o] = have
+    }
     return o
   }
   if pn is Call && pn.callFn != x {
@@ -1327,7 +1352,7 @@ function ftScan(
         const cn = nodeAt(p)
         if (
           !ftRetAtOwn(x, p, g, fn)
-          && !ftConstLambdaOnlyCalled(x, p)
+          && !ftConstFnOnlyCalled(x, p)
           && !ftMakerTwinServes(x)
           && (!(cn is Call)
             || cn.callFn != x
@@ -2797,15 +2822,19 @@ function ftConstLambdaOf(v: i32): i32 {
   if f is FuncDecl && f.fnName == "" { li } else { -1 }
 }
 
-// Whether lambda `x` initialises the `const` node `p`, and every read of that binding is a call's
-// callee: what a call hands back is the lambda's result, and nothing holds the lambda itself.
-function ftConstLambdaOnlyCalled(x: i32, p: i32): boolean {
+// Whether function `x` (a lambda or a named function's read) initialises the un-annotated `const`
+// node `p`, and every read of that binding is a call's callee: what a call hands back is the
+// function's result, and nothing holds the function itself (D15457).
+function ftConstFnOnlyCalled(x: i32, p: i32): boolean {
   if p < 0 || p >= P.nodes.length { return false }
   const b = nodeAt(p)
   if !(b is LetDecl) || b.letKw != "const" || b.letType >= 0 { return false }
   if parenPeelIx(b.letInit) != x { return false }
   const f = nodeAt(x)
-  if !(f is FuncDecl) || f.fnName != "" { return false }
+  const named = f is Ident
+    && identDeclOf(x) >= 0
+    && nodeAt(identDeclOf(x)) is FuncDecl
+  if !named && (!(f is FuncDecl) || f.fnName != "") { return false }
   cwIxWant()
   const callees: i32[] = []
   const cw = cwOccWalk(p)
