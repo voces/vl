@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **D15441 and D15443 closed:** a call through a function-local `const` alias of a function is read by the tag decision as that function's direct call (`ftLocalAliasedFn`), so `apply-fn-read-as-value-five-ways` runs without the split plan and the in-function spelling of D15442 no longer builds invalid wasm.
 - **D15442 closed:** a module `const` alias of a hole function, handed a function of a set, is a call through the alias's set (`holeAliasHandsSet`), so a call through a loop over a list of that function dispatches to each instance instead of building invalid wasm; the alias inside a function is D15443.
 - **Split-plan dependents, "returned list":** a record literal pushed onto a list whose element differs only in function fields is built at that element, and the tag decision reads it as holding that element's closures, so D15062's witness runs without the split plan; `elabCapReset` clears the held reps, which a reused instance's next compile read. D15440 (the hole-helper escape), D15441 (the module alias) and D15442 (clause 1) filed.
 - **Step 5: `ExpCtx` is deleted.** Its last field, `litUnion`, had one reader, a string literal at an open program record, which reads its recorded type now (#5606). The `ctx` parameter goes from 458 functions, compiler −1,938 lines, every built module byte-identical. Before it: a `??` default records the join (#5591), and an index store pins a hole map's key at the instance (#5599, D14229 closed).
