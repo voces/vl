@@ -1240,7 +1240,7 @@ happen where no fact can see them, so the slot has to be treated as called.
   function value. Escape is a fact about the function, not the slot. Under §2.2 a slot's value is
   one of its set's members, so a slot escapes when one of the functions it holds escapes.
 - **Who writes it.** The check's last pass over the source program (`lamChainSnap` in
-  check_lam_chain.vl, at `elabPrepareRun`, before any emit rewrite), as `fnEscapes(f)`:
+  check_lam_chain.vl, at `elabPrepareRun`, before any emit rewrite), as `fnEscapes(f)` (private as `_fnEscapes` until this reader lands):
   - at each such call, for each argument whose type carries a set, every member of that set;
   - for an argument naming a declared function directly, that function.
   - The answer is the same in every instance, because it depends on the callee being opaque and on
