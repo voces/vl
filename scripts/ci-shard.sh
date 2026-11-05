@@ -164,7 +164,6 @@ vl_list_index_trap_test.ts 0.5
 vl_shared_instance_test.ts 0.5
 vl_check_redundant_type_test.ts 0.4
 selfhost_native_diag_code_test.ts 0.4
-vl_fn_flow_shadow_test.ts 0.4
 selfhost_native_conv_test.ts 0.4
 vl_parse_image_stable_test.ts 0.4
 vl_no_method_suggestion_test.ts 0.4
