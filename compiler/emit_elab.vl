@@ -41,6 +41,7 @@ import {
   LoopVar,
   MatchExpr,
   Member,
+  Node,
   NullLit,
   NumLit,
   ObjLit,
@@ -10644,7 +10645,7 @@ export function elabSlotDeliveries(d: i32, path: string[]): i32[] {
   const dn = nodeAt(d)
   if dn is ArrayLit || dn is ObjLit {
     const lt = elabSlotTyOf(nodeTyIxOf(d), path)
-    if lt >= 0 && tyAt(lt) is TyFunc { elabRetsAdd(out, lt) }
+    if lt >= 0 && tyAt(lt) is TyFunc && elabLitSlotDepth == 0 { elabRetsAdd(out, lt) }
     for h in elabLitHolders(d) {
       for t in elabSlotDeliveries(h, path) { elabRetsAdd(out, t) }
     }
@@ -10666,11 +10667,19 @@ export function elabSlotDeliveries(d: i32, path: string[]): i32[] {
     return out
   }
   const seen: i32[] = []
-  // A function named by value is delivered where that occurrence's own value goes.
+  // A function named by value is delivered where that occurrence's value flows on. A declared
+  // generic named as the argument of a parameter with no written type is instanced at each call
+  // there instead.
   if dn is Ident {
     cwIxWant()
     const r = elabSlotReadUp(d, path)
-    if r >= 0 { elabReadDeliveries(r, out, seen) }
+    const fd = identFnDeclOf(d)
+    const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+    elabGenericByValue = fn is FuncDecl && fn.fnTyParams.length > 0
+    elabGenericRead = r
+    if r >= 0 { elabReadOn(r, out, seen) }
+    elabGenericByValue = false
+    elabGenericRead = -1
   }
   const o = if declOrigOf(d) >= 0 { declOrigOf(d) } else { d }
   elabSlotReadDeliveries(o, path, out, seen)
@@ -10700,8 +10709,11 @@ export function elabSlotDeliveries(d: i32, path: string[]): i32[] {
       elabCallDeliveryAdd(c, out)
     }
   }
+  // Reached through an edge, only a written type is a delivery; an inferred one is the value's own.
   const own = elabSlotTyOf(nodeTyIxOf(o), path)
-  if own >= 0 && tyAt(own) is TyFunc { elabRetsAdd(out, own) }
+  if own >= 0 && tyAt(own) is TyFunc && (elabLitSlotDepth == 0 || elabDeclAnnotated(o)) {
+    elabRetsAdd(out, own)
+  }
   out
 }
 
@@ -10792,6 +10804,11 @@ function elabElemMethod(m: string): boolean {
 
 // Adds to `out` the closed function types read `r` is delivered at, and follows its value on.
 function elabReadDeliveries(r: i32, out: i32[], seen: i32[]) {
+  // A value given to a binding or returned from a function with no written type is stamped with
+  // what that destination infers.
+  if (elabGivenTo(r) >= 0 && !elabDeclAnnotated(elabGivenTo(r))) || elabRetUnwritten(r) {
+    return elabReadOn(r, out, seen)
+  }
   const ct = nodeCtxTyIxOf(r)
   if ct >= 0 && ct < T.tys.length && tyAt(ct) is TyFunc { elabRetsAdd(out, ct) }
   const cs = elabNodeCtxs[r] ?? []
@@ -10801,6 +10818,12 @@ function elabReadDeliveries(r: i32, out: i32[], seen: i32[]) {
     if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc { elabRetsAdd(out, t) }
     i = i + 2
   }
+  elabReadOn(r, out, seen)
+}
+
+// Adds to `out` what the value read at `r` is delivered at where it flows on, leaving out `r`'s own
+// stamps.
+function elabReadOn(r: i32, out: i32[], seen: i32[]) {
   if !cwIxCovers(r) { return 0 }
   const k = cwIxUpKind[r]
   const up = cwIxUp[r]
@@ -10848,7 +10871,12 @@ function elabReadDeliveries(r: i32, out: i32[], seen: i32[]) {
     const fd = if cn is Call && cn.callFn >= 0 { identFnDeclOf(parenPeelIx(cn.callFn)) } else { -1 }
     const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
     const ai = cwIxUpAux[r]
-    if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
+    if (
+      fn is FuncDecl
+      && ai >= 0
+      && ai < fn.fnParams.length
+      && !(elabGenericByValue && r == elabGenericRead && !elabDeclAnnotated(fn.fnParams[ai]))
+    ) {
       elabSlotReadDeliveries(fn.fnParams[ai], [], out, seen)
     }
   }
@@ -10856,6 +10884,50 @@ function elabReadDeliveries(r: i32, out: i32[], seen: i32[]) {
 }
 
 let elabLitSlotDepth = 0
+let elabGenericByValue = false
+let elabGenericRead = -1
+
+// The binding read `r` initialises, or the parameter of a declared function it is an argument to;
+// -1 for any other position.
+function elabGivenTo(r: i32): i32 {
+  if !cwIxCovers(r) { return -1 }
+  if cwIxUpKind[r] == CW_UP_LETINIT { return cwIxUp[r] }
+  // An element or field is typed by its literal, so it is given where the literal is.
+  if cwIxUpKind[r] == CW_UP_ELEM || cwIxUpKind[r] == CW_UP_FIELD {
+    return if elabLitSlotDepth < 4 { elabGivenTo(cwIxUp[r]) } else { -1 }
+  }
+  if cwIxUpKind[r] != CW_UP_ARG { return -1 }
+  const up = cwIxUp[r]
+  const cn = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+  const fd = if cn is Call && cn.callFn >= 0 { identFnDeclOf(parenPeelIx(cn.callFn)) } else { -1 }
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  const ai = cwIxUpAux[r]
+  if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length { fn.fnParams[ai] } else { -1 }
+}
+
+// Whether read `r` is returned from a declared function with no written return type.
+function elabRetUnwritten(r: i32): boolean {
+  if !cwIxCovers(r) { return false }
+  const k = cwIxUpKind[r]
+  if k != CW_UP_RET && k != CW_UP_TAIL { return false }
+  const f = if k == CW_UP_RET { cwFrameOfDecl(cwIxUp[r]) } else { cwIxUp[r] }
+  const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+  fn is FuncDecl && fn.fnRet < 0
+}
+
+// Whether binding `b` is a `let` or parameter with a written type.
+function elabDeclAnnotated(b: i32): boolean {
+  if b < 0 || b >= P.nodes.length { return false }
+  elabLetWritten(nodeAt(b)) || elabParamWritten(nodeAt(b))
+}
+
+function elabLetWritten(n: Node): boolean {
+  n is LetDecl && n.letType >= 0
+}
+
+function elabParamWritten(n: Node): boolean {
+  n is Param && n.parType >= 0
+}
 
 // Adds to `out` what slot `step` of literal `lit` is delivered at, a bounded number of literals deep.
 function elabLitSlotDeliveries(lit: i32, step: string, out: i32[]) {
