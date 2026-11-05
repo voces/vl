@@ -905,7 +905,7 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 
 | group | files | witness |
 | --- | --- | --- |
-| F | 6 → 1 at `3f036bfe` | a function parameter copied, aliased or re-pointed in a generic body and called at two types (`let b = a1; if c { b = a }; a("x"); b(3)`): `written-let-reassigned-to-other-param-called-at-two-types`; `written-param-alias-called-at-two-types-runs` and `generic-fn-value-type-param-params-swapped-nested-generic` run without the plan at `3f036bfe`, `param-copied-into-unread-binding-of-other-type-param` runs without the plan since D15403, `hole-fn-copy-in-record-called-beside-other-key` since D15404 (D15445's record holder, and an un-written `let` copy read as a `const` one), and `fn-value-param-copied-into-binding-called-at-another-type` since D15400 (a closure-keyed instance on a chain the set entered is excused from the partial rule, `elabReachHandsSet`) |
+| F | 6 → 3 at `3f036bfe` | a function parameter copied, aliased or re-pointed in a generic body and called at two types (`let b = a1; if c { b = a }; a("x"); b(3)`): `written-let-reassigned-to-other-param-called-at-two-types` (D15409), and the two re-pointed `let`-copy files D15404's close added (`written-let-copy-of-hole-param-in-{list,record}-called-at-two-types`), one family with one owner (a parameter both a written `let`'s source and called directly at a second type); `written-param-alias-called-at-two-types-runs` and `generic-fn-value-type-param-params-swapped-nested-generic` run without the plan at `3f036bfe`, `param-copied-into-unread-binding-of-other-type-param` runs without the plan since D15403, `hole-fn-copy-in-record-called-beside-other-key` since D15404 (D15445's record holder, and an un-written `let` copy read as a `const` one), and `fn-value-param-copied-into-binding-called-at-another-type` since D15400 (a closure-keyed instance on a chain the set entered is excused from the partial rule, `elabReachHandsSet`) |
 | W-hand | 1 → 0 | `written-let-handed-at-two-pins-in-generic-body-at-two-types` (D15103, slice 4b-iii) runs without the plan: a `let`'s hand at the enclosing generic's own `U` is an escape, its adapter calling a `const` copy of the value per instance (`fvaAdapt`) |
 | W, other | 2 | a void and a value generic written to one `let` and called at two types (`generic-value-return-written-to-void-generic-let`, W-split's ruling question), and a written set handed to a hole parameter then spread into a closed list (`fn-set-list-of-hole-param-spread-into-closed-push`, D15432: the copy's adapter is built at the template) |
 | W-lam | 1 → 0 at `3f036bfe` | two lambda cells re-pointed at each other, called at two types (`cell-peer-called-at-two-types`: D15433, mono's per-binding signature count under a capture cell, is closed; the file stays on D15435, its `const`-seeded lambdas declined as leaves) |
@@ -951,21 +951,6 @@ The "reassigned function binding" refusal (`monoBindSigFail`) is read by two of 
   - The file can go only once those 44 mono readers are deleted or rebuilt on the elaboration's flow facts. That is the pin-helper work, not the plan's deletion.
   - Deleting `fn_split.vl` does not require it.
 
-
-**Re-censused at `3f036bfe` (2026-11-05).** With the split plan off, against a fixpoint seed, 8 of
-the 5,757 `@run` files under `tests/cases` refuse where the plan runs them, and no file runs to a
-different output. Two of the 8 are refusal pins this lane added with D15404: a re-pointed `let`
-copy of a parameter held in a list or record keeps its loud refusal without the plan. The other 6,
-by blocker:
-
-| file | group | blocker |
-| --- | --- | --- |
-| `written-let-reassigned-to-other-param-called-at-two-types` | F | two `F`-annotated parameters written to one `let`, called at `i32` through it and at `string` directly: the late decision declines each one-member set where it is handed to `one`'s `F` parameter (`ftCtxOk` → `ftParamOfSet`), so mono sees `a` at two function types |
-| `choice-of-nested-capturing-function-handed-to-hole-param` | L-set | D15450: a capturing member's id carries no environment, so the choice is one closure at two signatures (D14841's capturing shape) |
-| `function-list-element-at-two-types-pushed-through-hole-helper` | returned list | D15440: the member's hand to a hole helper that pushes it |
-| `fn-set-list-of-hole-param-spread-into-closed-push` | W, other | D15432: the copy's adapter is built at the template |
-| `generic-value-return-written-to-void-generic-let` | W, other | W-split's ruling question (a void and a value generic in one `let`) |
-| `record-generic-field-called-and-read-under-is` | M | the row question (D6702, D15252) |
 
 F's 15 files are four shapes by witness:
 
