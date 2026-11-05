@@ -89,28 +89,74 @@ export function tyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
 // callee, a hole's argument or an unassigned copy's seed, and every call hands them named
 // functions of one signature, so each binding is the one the shared `tp` took (D15401).
 export function tyParamSplitBegin() {
+  tpbCands = []
   tpbParent = Map()
   tpbRefs = Map()
   tpbWithTyArgs = []
   0
 }
 
-// Notes node `i`'s children's parent, the declaration an identifier reads, and a callee given
-// explicit type arguments.
-export function tyParamSplitNote(i: i32) {
-  for c in nodeChildren(i) { tpbParent[c] = i }
-  tpbNoteRead(i)
+// Notes node `i` when it is a candidate, a named generic with two parameters one type
+// parameter annotates bare, and when it calls a callee with explicit type arguments.
+export function tyParamSplitScan(i: i32) {
+  tpbNoteCand(i)
   tpbNoteTyArgs(i)
 }
 
-function tpbNoteRead(i: i32) {
+// Whether any candidate was noted, so the reads of the candidates are worth noting.
+export function tyParamSplitAny(): boolean { tpbCands.length > 0 }
+
+// Notes each read of a candidate among node `i`'s children, with `i` as its parent.
+export function tyParamSplitNote(i: i32) {
+  for c in nodeChildren(i) {
+    if c >= 0 && c < P.nodes.length && nodeAt(c) is Ident {
+      const d = identDeclOf(c)
+      if i32ListHas(tpbCands, d) {
+        const rs = tpbRefs[d] ?? []
+        rs.push(c)
+        tpbRefs[d] = rs
+        tpbParent[c] = i
+      }
+    }
+  }
+  0
+}
+
+// Drops each type parameter of each candidate the conditions above allow.
+export function tyParamSplitRun() {
+  for d in tpbCands {
+    if !i32ListHas(tpbWithTyArgs, d) {
+      const n = nodeAt(d)
+      const tps: string[] = if n is FuncDecl { n.fnTyParams.slice(0, n.fnTyParams.length) } else { [] }
+      for tp in tps { tpbSplitOne(d, tp) }
+    }
+  }
+  tpbCands = []
+  tpbParent = Map()
+  tpbRefs = Map()
+  0
+}
+
+function tpbNoteCand(i: i32) {
   const n = nodeAt(i)
-  if !(n is Ident) { return 0 }
-  const d = identDeclOf(i)
-  if d >= 0 {
-    const rs = tpbRefs[d] ?? []
-    rs.push(i)
-    tpbRefs[d] = rs
+  if (
+    !(n is FuncDecl)
+    || n.fnName == ""
+    || n.fnTyParams.length == 0
+    || declHasExportKw(i)
+  ) {
+    return 0
+  }
+  for tp in n.fnTyParams {
+    let k = 0
+    for pIx in n.fnParams {
+      const p = nodeAt(pIx)
+      if p is Param && p.parType >= 0 {
+        const tn = nodeAt(p.parType)
+        if tn is TypeRef && tn.tyName == tp { k = k + 1 }
+      }
+    }
+    if k >= 2 && !i32ListHas(tpbCands, i) { tpbCands.push(i) }
   }
   0
 }
@@ -123,34 +169,45 @@ function tpbNoteTyArgs(i: i32) {
   0
 }
 
-// Drops each type parameter of the named function at node `i` the conditions above allow.
-export function tyParamSplitAt(i: i32) {
-  const n = nodeAt(i)
-  if (
-    n is FuncDecl
-    && n.fnName != ""
-    && n.fnTyParams.length > 0
-    && !declHasExportKw(i)
-    && !i32ListHas(tpbWithTyArgs, i)
-  ) {
-    for tp in n.fnTyParams.slice(0, n.fnTyParams.length) { tpbSplitOne(i, tp) }
-  }
-  0
-}
-
-// Each node's parent, each declaration's reads, and the callees given type arguments, while
-// `checkProgramPass` splits.
+// The candidates, each read of one with its parent, and the callees given type arguments.
+let tpbCands: i32[] = []
 let tpbParent: {[i32]: i32} = Map()
 let tpbRefs: {[i32]: i32[]} = Map()
 let tpbWithTyArgs: i32[] = []
 
-// The node above `x`, or `x` itself at the root.
+// The node above read `x`, or `x` itself at the root.
 function tpbUp(x: i32): i32 {
   const p = tpbParent[x] ?? -1
   if p >= 0 && p < P.nodes.length { p } else { x }
 }
 
-// Drops `tp` of function `d` when `tyParamSplitApart`'s conditions hold.
+// Notes each read inside function `fn`'s body by the declaration it reads, with its parent.
+function tpbBodyReads(fn: FuncDecl) {
+  tpbBodyRefs = Map()
+  tpbBodyUp = Map()
+  const xs: i32[] = [fn.fnBody]
+  while xs.length > 0 {
+    const x = xs.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      for c in nodeChildren(x) {
+        if c >= 0 && c < P.nodes.length && nodeAt(c) is Ident {
+          const d = identDeclOf(c)
+          const rs = tpbBodyRefs[d] ?? []
+          rs.push(c)
+          tpbBodyRefs[d] = rs
+          tpbBodyUp[c] = x
+        }
+        xs.push(c)
+      }
+    }
+  }
+  0
+}
+
+let tpbBodyRefs: {[i32]: i32[]} = Map()
+let tpbBodyUp: {[i32]: i32} = Map()
+
+// Drops `tp` of function `d` when `tyParamSplitRun`'s conditions hold.
 function tpbSplitOne(d: i32, tp: string) {
   const fn = nodeAt(d)
   if !(fn is FuncDecl) { return 0 }
@@ -166,12 +223,13 @@ function tpbSplitOne(d: i32, tp: string) {
   if !tpbCallsHandOneSig(d, fn, ps) { return 0 }
   // Each binding holding a parameter's value: the parameters, then each unassigned binding a held
   // read seeds, annotated `tp` or not at all.
+  tpbBodyReads(fn)
   const held: i32[] = []
   for p in ps { held.push(p) }
   let h = 0
   while h < held.length {
-    for r in tpbRefs[held[h]] ?? [] {
-      const up = tpbUp(r)
+    for r in tpbBodyRefs[held[h]] ?? [] {
+      const up = tpbBodyUp[r] ?? -1
       if up < 0 || up >= P.nodes.length { return 0 }
       const un = nodeAt(up)
       let ok = false

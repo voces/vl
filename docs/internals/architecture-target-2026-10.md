@@ -972,7 +972,7 @@ pin rule then becomes an elaboration fact mono reads:
 *bare-only* when it appears only as the whole annotation of parameters and of unassigned copies of
 them, and never in the result, another annotation, an `is` or `as`, or type arguments
 (`tyParamIsBareOnly`). The check drops such a type parameter, so each parameter it annotated
-becomes a hole of its own (`tyParamSplitAt`: `f<F>(a: F, c: F)` checks as `f(a, c)`). It does
+becomes a hole of its own (`tyParamSplitRun`: `f<F>(a: F, c: F)` checks as `f(a, c)`). It does
 this only under two conditions:
 - nothing relates the parameters: each is read only as a callee, as an argument to a hole, or as
   the seed of an unassigned copy;
