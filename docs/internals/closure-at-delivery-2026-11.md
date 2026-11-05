@@ -147,6 +147,13 @@ emitter stages the row's answer for `elabArmFeOf` around each arm of a dispatch
 Over the 3,944 test and corpus files that spell `=>`, the build is byte-identical to master with
 the split plan on and off. D15433 and D15436 print as filed both ways.
 
+**Step 2's second PR (2026-11-05).** #6338's per-instance lambda arms are retired: an arm node is
+shared by every instance again, as a named member's is, and D15436 still runs with the plan on and
+off. The seed shrinks by 898 bytes. One file's bytes move in both modes and print the same:
+`literal-unions/coalesce-hole-call-retyped-dead.vl`. A shared arm's arguments are the template
+call's nodes, so `applied`'s `f(g())` arm calls `g` through the closure parameter, where the
+instance clone's `g()` had been resolved to a direct call.
+
 ### Matrix
 
 The bundle record is an anonymous record, so its position matrix must include a same-shape
