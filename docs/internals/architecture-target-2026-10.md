@@ -1286,7 +1286,7 @@ instance `monoMakeInstance` built was recorded with its elaboration key (`monoKe
 
 - **Callback specialization (96 groups).** Mono keys an instance by the function value it is handed
   (`@inc`, `@__lambda_3`), so the call inside is direct. One elaboration key, several instances. The
-  elaboration has no such dimension; the key keeps it as its own component (ruling pending).
+  elaboration has no such dimension; the key keeps it as its own component.
 - **One instance spelled two ways (15 groups).** `(()=>i32)` against `()=>i32`, an alias against its
   structure, an enclosing-instance marker, an unbound parameter's binding. Where checked, the
   instances' bodies are identical (`deliver`, `len`, `F$m…`): duplicates the canonical key removes.
@@ -1300,6 +1300,17 @@ The per-parameter comparison (`callArgRepTy` against mono's pin, 37 pairs) found
 is nearer the wasm than the elaboration. The key is therefore: the elaboration key (or the
 declaration), the parent key, the rep row of each parameter with union members in canonical order
 and a literal union named by its rep, and the callback specialization.
+
+**Callback specialization is mono's component of the key** (coordinator ruling, 2026-11-05). The
+elaboration owns what an instance means: its type and its rep. Specializing an instance on the
+function value it is handed makes the call inside direct and changes no meaning, so it is a
+code-generation choice and mono's to make. The key is (elaboration type and rep, the parent where
+the spelling omits it, the specialization value or none); the 96 groups above are its evidence.
+The condition: one predicate decides "specialize this call on this value". Today that is
+`monoSpecializableCallbackName`, but each of its two callers gates it differently. The generic
+instance key (`monoMakeInstance`'s `cbFnNames`, suffix `@name,`) skips a callee read through a
+written binding (`viaWritten`). The non-generic specialization (key `C<fe>@name`) has its own
+assignment check (`monoReadIsAssigned`). Those gates move into the one predicate before the switch.
 
 ## 4. Scoreboard
 
