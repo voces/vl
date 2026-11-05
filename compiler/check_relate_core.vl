@@ -5444,6 +5444,17 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
   0
 }
 
+// `holeLetJudge`'s result for a function that returns a value whose type stays open.
+const HOLE_RET_OPEN = -2
+
+// Whether function `d`'s signature returns nothing, as `setMemberRetAt` reads a body with no value.
+function holeDeclVoid(d: i32): boolean {
+  const sig = nodeTyOf(d)
+  if sig < 0 || sig >= T.tys.length { return false }
+  const sf = tyAt(sig)
+  sf is TyFunc && sf.fnRet == TY_VOID
+}
+
 // `holeLetWritesDisagree` for the `let` read at `ix`, at the widened parameter types `wp`.
 function holeLetJudge(ix: i32, wp: i32[]): boolean {
   const bd = cwSoleBinderAt(ix)
@@ -5466,10 +5477,25 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
   const ws: i32[] = []
   let b = 0
   let k = 0
+  // A function that returns nothing is `void`, which no value matches, even one whose type stays
+  // open behind a declared result (`HOLE_RET_OPEN`, D15015); any other open result is not judged.
+  let open = false
+  let voids = 0
   while k < ds.length {
-    const r = holeLamRetAt(ds[k], ft, noN, noT)
-    if r < 0 || tyHasTyVar(r) { return false }
-    rs.push(widenLitTy(r))
+    let r = TY_VOID
+    if holeDeclVoid(ds[k]) {
+      voids = voids + 1
+    } else {
+      r = holeLamRetAt(ds[k], ft, noN, noT)
+      if r < 0 || tyHasTyVar(r) { r = setMemberRetAt(ds[k], ft) }
+      if r < 0 || tyHasTyVar(r) {
+        const f = nodeAt(ds[k])
+        if !(f is FuncDecl) || f.fnRet < 0 { return false }
+        open = true
+        r = HOLE_RET_OPEN
+      }
+    }
+    rs.push(if r < 0 { r } else { widenLitTy(r) })
     // Only a write that names the function itself: one through a parameter is per call.
     const w = cwFnValueWriteOf(cwBindingOf(ix), ds[k])
     if w < 0 { return false }
@@ -5482,9 +5508,10 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
     if nodeStartTok(w) < nodeStartTok(ws[b]) { b = k }
     k = k + 1
   }
+  if open && (voids == 0 || voids == ds.length) { return false }
   k = 0
   while k < ds.length {
-    if !tySame(rs[k], rs[b]) {
+    if (rs[k] == TY_VOID) != (rs[b] == TY_VOID) || rs[k] >= 0 && rs[b] >= 0 && !tySame(rs[k], rs[b]) {
       tErr(
         holeLetDisagreeMsg(
           "'" + bn.letName + "'",
@@ -6550,14 +6577,21 @@ function holeLetDisagreeMsg(
     + ": called at "
     + ps
     + " it returns "
-    + tyToStr(r)
+    + holeRetStr(r)
     + ", where "
     + holeDeclName(d0)
     + also
-    + tyToStr(r0)
+    + holeRetStr(r0)
     + " — every function a call through "
     + nm
     + " may run must return one type"
+}
+
+// How a diagnostic names the result `r`, `void` for none.
+function holeRetStr(r: i32): string {
+  if r == TY_VOID { return "void" }
+  if r == HOLE_RET_OPEN { return "a value" }
+  tyToStr(r)
 }
 
 // How a diagnostic names the function or lambda `d`.
