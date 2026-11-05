@@ -22731,19 +22731,12 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       }
       // Callback specialization: a known, non-capturing, non-generic function argument is
       // baked into this instance as a direct call, keyed on its identity; anything else is a
-      // `call_ref`. A call through a written binding bakes none, since the binding holds one
-      // instance and each baked callback would key its own (D12219).
-      const cfx = c.callFn
-      const viaWritten = cfx >= 0
-        && cfx < P.nodes.length
-        && nodeAt(cfx) is Ident
-        && monoIdentNameOf(cfx) != fn.fnName
-        && monoNameWrittenAt(monoIdentNameOf(cfx), cfx)
+      // `call_ref`. `monoSpecializableCallbackName` alone decides it.
       const cbFnNames: string[] = []
       let ci = 0
       while ci < args.length {
         cbFnNames.push(
-          if viaWritten { "" } else { monoSpecializableCallbackName(args[ci], ctx) },
+          monoSpecializableCallbackName(callIx, fn.fnName, args[ci], ctx),
         )
         ci = ci + 1
       }
@@ -24411,11 +24404,16 @@ function monoPinTyParamComposite(
   0
 }
 
-// The callback name to bake for a closure-valued argument, or "" when it is not
-// specializable: the argument must resolve to a known function that captures nothing and
-// is itself non-generic, so a direct by-name call (which passes the null env a
-// non-capturing callee wants) is valid. Anything else keeps the per-element `call_ref`.
-function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
+// The one decision of callback specialization: the function call `callIx` (to `selfName`) bakes
+// for its argument `argIx` as a direct call, or "" to keep the `call_ref`. Baked only for a known,
+// non-capturing, non-generic function whose name means it at top level, on a call not made
+// through a written binding of another name (architecture-target §3.4).
+function monoSpecializableCallbackName(
+  callIx: i32,
+  selfName: string,
+  argIx: i32,
+  ctx: i32,
+) {
   const ax = unwrapParen(argIx)
   if ax < 0 { return "" }
   const an = nodeAt(ax)
@@ -24443,6 +24441,21 @@ function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
     // `fnParent = -1`, so the name is re-resolved with no enclosing frame. Decline rather
     // than bake a name that does not mean what the caller meant; `__lambda_N` is unique.
     if fe != fnIndexOf(fn.fnName) { return "" }
+    // A call through a written binding bakes none: the binding holds one instance, and each
+    // baked callback would key its own (D12219).
+    const cl = nodeAt(callIx)
+    if cl is Call {
+      const cfx = cl.callFn
+      if (
+        cfx >= 0
+        && cfx < P.nodes.length
+        && nodeAt(cfx) is Ident
+        && monoIdentNameOf(cfx) != selfName
+        && monoNameWrittenAt(monoIdentNameOf(cfx), cfx)
+      ) {
+        return ""
+      }
+    }
     return fn.fnName
   }
   ""
@@ -24519,22 +24532,12 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         } else {
           cbParamNames.push("")
         }
-        cbFnNames.push(monoSpecializableCallbackName(args[i], ctx))
+        cbFnNames.push(
+          monoSpecializableCallbackName(callIx, fn.fnName, args[i], ctx),
+        )
         i = i + 1
       }
       if !monoAnyBakedCallback(cbFnNames) { return 0 }
-      // Both renames below point the call site at a specialization resolved from the
-      // binding's initializer, faithful only while the binding still holds it. There is
-      // no instance to keep, so declining simply leaves the `call_ref`.
-      const spCal = nodeAt(c.callFn)
-      if spCal is Ident {
-        if (
-          spCal.identName != fn.fnName
-          && monoReadIsAssigned(spCal.identName, c.callFn)
-        ) {
-          return 0
-        }
-      }
       // Key on the callee plus each baked callback identity, so `reduce(xs, add, …)` and
       // `reduce(xs, mul, …)` get distinct specializations. The `C` prefix keeps these out
       // of the generic keyspace, which always carries a `#`.
