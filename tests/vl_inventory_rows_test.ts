@@ -604,3 +604,85 @@ Deno.test("no reserved inventory range is stale", async () => {
     throw new Error(`stale reserved ranges:\n  ${stale.join("\n  ")}`);
   }
 });
+
+// A running row (closed, or must keep running) states its stdout in a `Want:` block, the only
+// output the grader reads on such a row; a `// PRINTS` line there is never graded (D15481). The rows
+// that predate this rule are on `scripts/inventory/want-baseline.txt`, which may only shrink, and a
+// baselined row is pinned only after its output is checked against its own history.
+const WANT_BASELINE = "scripts/inventory/want-baseline.txt";
+
+/** A `const NAME = [ "…", … ]` string list of the grader's library, parsed. */
+function stringList(src: string, name: string): string[] {
+  const block = src.split(new RegExp(`(?:export )?const ${name} = \\[`))[1];
+  if (block === undefined) {
+    throw new Error(`${CHECKER}: no \`const ${name} = [\` list found — the parse here moved with it`);
+  }
+  return [...block.split("]")[0].matchAll(/"([^"]*)"/g)].map((m) => m[1]);
+}
+
+/** `declaredOutcome` mirrored from the grader's library, over its own lists. */
+function declaredOutcomeOf(src: string): (status: string) => string {
+  const needles = stringList(src, "DECLARED_NEEDLE");
+  const outcomes = stringList(src, "DECLARED_OUTCOME");
+  const negations = stringList(src, "NEGATIONS");
+  const seps = stringList(src, "CLAUSE_SEPS");
+  if (needles.length !== outcomes.length) {
+    throw new Error(
+      `${CHECKER}: DECLARED_NEEDLE has ${needles.length} phrases, DECLARED_OUTCOME ${outcomes.length}`,
+    );
+  }
+  return (status: string) => {
+    const low = status.toLowerCase();
+    for (let k = 0; k < needles.length; k++) {
+      const pos = low.indexOf(needles[k]);
+      if (pos === -1) continue;
+      let w = low.slice(0, pos);
+      for (const s of seps) {
+        const cut = w.lastIndexOf(s);
+        if (cut !== -1) w = w.slice(cut + s.length);
+      }
+      w = ` ${w} `;
+      return negations.some((n) => w.includes(n)) ? "" : outcomes[k];
+    }
+    return "";
+  };
+}
+
+Deno.test("a running row declares its output in a `Want:` block, or is on the baseline", async () => {
+  const declared = declaredOutcomeOf(await Deno.readTextFile(CHECKER));
+  const baseline = new Set(
+    (await Deno.readTextFile(WANT_BASELINE)).split("\n").map((l) => l.trim())
+      .filter((l) => l !== "" && !l.startsWith("#")),
+  );
+  const bad: string[] = [];
+  const seen = new Set<string>();
+  for (const dir of DIRS) {
+    const tag = dir.split("/").pop();
+    for (const doc of await docsOf(dir)) {
+      for (const r of parseRows(await Deno.readTextFile(doc))) {
+        const key = `${tag}/${r.id}`;
+        const running = declared(r.status ?? "") === "runs";
+        if (running && !r.hasWant) {
+          seen.add(key);
+          if (!baseline.has(key)) {
+            bad.push(
+              `${doc}:${r.line}  ${r.id} — a running row with no \`Want:\` block\n` +
+                `      want: the program's correct stdout as a \`Want:\` block under its repro\n` +
+                `      got:  none. A \`// PRINTS\` line is not graded on a running row.`,
+            );
+          }
+        }
+      }
+    }
+  }
+  for (const key of baseline) {
+    if (!seen.has(key)) {
+      bad.push(
+        `${WANT_BASELINE}: ${key} — on the baseline but no longer a running row without \`Want:\`\n` +
+          `      want: the entry removed, so the list only shrinks\n` +
+          `      got:  the row now has a \`Want:\` block, is not running, or does not exist`,
+      );
+    }
+  }
+  if (bad.length > 0) throw new Error(`${bad.length} row(s):\n\n${bad.join("\n\n")}`);
+});
