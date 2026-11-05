@@ -104,9 +104,12 @@ import {
   cwLetWrittenInClosure,
   cwOccNext,
   cwOccWalk,
+  cwPathFnTargets,
+  cwPathFnTargetsFrom,
   cwPeelValue,
   cwSlotValuesFrom,
   cwSlotWrittenValues,
+  cwSpreadPeers,
   cwUseInOtherFrame,
   fnDeclIx,
 } from "./check_write_scan"
@@ -195,6 +198,7 @@ import {
   fnTagSetOfTy,
   fnTagSetTy,
   fnTagSharedJoinSet,
+  fnTagSlotMembers,
   fnTagTyIsTagged,
   paramCopySeedOf,
 } from "./check_elab_cap"
@@ -236,6 +240,7 @@ import {
   assignable,
   bindGenWalk,
   holeFnArgDecl,
+  holeSlotCallRets,
   joinTys,
   substTyDeep,
   substTyDeepOf,
@@ -327,7 +332,7 @@ import {
   tyHasTyVar,
   tyReachesHole,
 } from "./tyquery"
-import { identDeclOf, nodeSrc } from "./symbols"
+import { declOrigOf, identDeclOf, nodeSrc } from "./symbols"
 
 // The instances: declaration, binding names and types, and the canonical key.
 export let ekDecl: i32[] = []
@@ -10570,6 +10575,77 @@ function elabTyIn(ix: i32, k: i32): i32 {
 export function elabCheckedTyOf(ix: i32): i32 {
   const own = nodeTyIxOf(ix)
   if own >= 0 { own } else { nodeTyIxOf(nodeSrc[ix] ?? -1) }
+}
+
+// `elabSlotHeldFns` of a slot below the binding's own value, [] for the value itself.
+export function elabSlotSrcFns(d: i32, path: string[]): i32[] {
+  if path.length == 0 { return [] }
+  elabSlotHeldFns(d, path)
+}
+
+// Every function the slot `path` (steps `e`, `v`, `r`, `f.<name>`) of binding declaration `d` can
+// hold: the members of the set its type carries, in the checked tree and in each instance of the
+// function declaring it, and each function the write index stores at that slot.
+export function elabSlotHeldFns(d: i32, path: string[]): i32[] {
+  const out: i32[] = []
+  if d < 0 || d >= P.nodes.length { return out }
+  const o = if declOrigOf(d) >= 0 { declOrigOf(d) } else { d }
+  for t in [nodeTyIxOf(d), nodeTyIxOf(o)] {
+    for m in fnTagSlotMembers(t, path) {
+      if !i32ListHas(out, m) { out.push(m) }
+    }
+  }
+  const fd = recEnclosingFn(o)
+  let k = 0
+  while k < ekDecl.length {
+    if ekDecl[k] == fd {
+      for m in fnTagSlotMembers(elabNodeTy(o, k), path) {
+        if !i32ListHas(out, m) { out.push(m) }
+      }
+    }
+    k = k + 1
+  }
+  if path.length > 0 {
+    const cp: string[] = []
+    for st in path {
+      if st == "e" || st == "v" {
+        cp.push("[]")
+      } else if st.length > 2 && st.slice(0, 2) == "f." {
+        cp.push(st.slice(2, st.length))
+      } else {
+        return out
+      }
+    }
+    cwIxWant()
+    // A binding a call initialises holds what the called function returns there.
+    const on = nodeAt(o)
+    const ci = if on is LetDecl && on.letInit >= 0 { parenPeelIx(on.letInit) } else { -1 }
+    const cn = if ci >= 0 && ci < P.nodes.length { nodeAt(ci) } else { null }
+    const rets: i32[] = []
+    const ts = if cn is Call && holeSlotCallRets(cn, rets) { cwPathFnTargetsFrom(o, cp, rets) } else { cwPathFnTargets(o, cp) }
+    for f in ts {
+      if f >= 0 && !i32ListHas(out, f) { out.push(f) }
+    }
+    // A list spread into another, or spreading one, holds the other's elements too.
+    if path[0] == "e" {
+      const seen: i32[] = [o]
+      const todo: i32[] = cwSpreadPeers(o)
+      while todo.length > 0 && seen.length < 16 {
+        const b = todo.pop() ?? -1
+        if b >= 0 && !i32ListHas(seen, b) {
+          seen.push(b)
+          for m in fnTagSlotMembers(nodeTyIxOf(b), path) {
+            if !i32ListHas(out, m) { out.push(m) }
+          }
+          for f in cwPathFnTargets(b, cp) {
+            if f >= 0 && !i32ListHas(out, f) { out.push(f) }
+          }
+          for x in cwSpreadPeers(b) { todo.push(x) }
+        }
+      }
+    }
+  }
+  out
 }
 
 // The closed type of node `ix` at instance `k`: what the elaboration recorded, else (a node it

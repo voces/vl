@@ -6,6 +6,7 @@
 // declarations for later phases. Consults the classifiers (`emit_classify.vl`);
 // writes no bytes.
 
+import { cwDeclAssigned } from "./check_write_scan"
 import { deliveryRetagMove } from "./check_retag_rows"
 import { elabNodeInstTys, litRepTyAt } from "./emit_elab"
 import { collectRetValues } from "./check_nj_join"
@@ -227,6 +228,7 @@ import {
   drwDispatchOp,
   isTestsNull,
   monoAnnOpenTyNote,
+  monoIsGenericDecl,
   nodeIsTypeDecl,
   noteCallOrigin,
   plCacheBust,
@@ -4024,6 +4026,69 @@ let cboxYieldCtr = 0
 // value is still one a binding is written with, which the emitter tells apart from any other
 // value (D4123).
 let cboxWriteLets: {[i32]: i32} = Map()
+// Whether an `=` writes the binding the read `at` names, other than through the shared cell
+// `captureBoxRewrite` made of it, whose writes are the cell's.
+export function cboxDeclWritten(at: i32): boolean {
+  const d = identDeclOf(at)
+  if d < 0 || (cboxCellDecls[cboxDeclKey(d)] ?? 0) == 1 { return false }
+  cboxAssigned(cboxDeclKey(d))
+}
+
+// Whether binding declaration `d`, as its source, may hold a value other than its initializer's:
+// an `=` writes it, or `captureBoxRewrite` made it a shared cell.
+function cboxDeclMayMove(d: i32): boolean {
+  const o = cboxDeclKey(d)
+  (cboxCellDecls[o] ?? 0) == 1 || cboxAssigned(o)
+}
+
+// `cwDeclAssigned` of source declaration `o`, asked once per compile: mono asks it of every read.
+let cboxAssignedMemo: {[i32]: boolean} = Map()
+function cboxAssigned(o: i32): boolean {
+  const have = cboxAssignedMemo.get(o)
+  if have != null { return have }
+  const w = cwDeclAssigned(o)
+  cboxAssignedMemo.set(o, w)
+  w
+}
+
+// Whether the binding read `at`, or one its initializer chain of names copies, may hold a value
+// other than its initializer's.
+export function cboxReadWritten(at: i32): boolean {
+  let d = identDeclOf(at)
+  let hops = 0
+  while d >= 0 && d < P.nodes.length && hops < 64 {
+    if cboxDeclMayMove(d) { return true }
+    const n = nodeAt(cboxDeclKey(d))
+    const i = if n is LetDecl && n.letInit >= 0 { n.letInit } else { -1 }
+    const v = if i >= 0 && nodeAt(i) is Ident { identDeclOf(i) } else { -1 }
+    if v < 0 || v >= P.nodes.length || nodeAt(v) is FuncDecl { return false }
+    d = v
+    hops = hops + 1
+  }
+  hops >= 64
+}
+
+// The named generic function the read `at` names through a chain of un-annotated aliases none of
+// which may move (`const k = inner; const j = k`), as its declaration; -1 for any other read.
+export function cboxReadGenFn(at: i32): i32 {
+  let d = cboxDeclKey(identDeclOf(at))
+  let hops = 0
+  while d >= 0 && d < P.nodes.length && hops < 64 {
+    const n = nodeAt(d)
+    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return -1 }
+    if n.letKw != "const" && cboxDeclMayMove(d) { return -1 }
+    if !(nodeAt(n.letInit) is Ident) { return -1 }
+    const nd = identDeclOf(n.letInit)
+    if nd < 0 || nd >= P.nodes.length { return -1 }
+    if nodeAt(nd) is FuncDecl {
+      return if monoIsGenericDecl(nd) { nd } else { -1 }
+    }
+    d = cboxDeclKey(nd)
+    hops = hops + 1
+  }
+  -1
+}
+
 // Whether `let` `d`, or the declaration a monomorphized copy `d` stands for, is such a local.
 export function cboxIsWriteLet(d: i32): boolean {
   (cboxWriteLets[cboxDeclKey(d)] ?? 0) == 1
@@ -4719,6 +4784,7 @@ function cboxScalarLets(
 // through the cell. Usage-gated: a frame with no such binding rewrites nothing.
 export function captureBoxRewrite(_stmts: i32[]) {
   cboxWriteLets = Map()
+  cboxAssignedMemo = Map()
   cboxCellDecls = Map()
   cboxReadTy = Map()
   cboxStoreCells = Map()

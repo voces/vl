@@ -29,6 +29,8 @@ import {
   elabCallParamBoundTy,
   elabIsParamRead,
   elabParamReadOtherThanCalled,
+  elabSlotHeldFns,
+  elabSlotSrcFns,
 } from "./emit_elab"
 import {
   mkNumTyped,
@@ -416,26 +418,24 @@ import {
   fnFlowDeclFn,
   fnFlowDeclPathAgreedPinTys,
   fnFlowDeclPathAgreedPinTysSkipping,
-  fnFlowDeclPathHeldSrcs,
   fnFlowDeclPathOnlyPinCall,
   fnFlowDeclPathPinCalls,
   fnFlowDeclPathPinRets,
   fnFlowDeclPathPinSigs,
   fnFlowDeclPathPinSigsOmitting,
   fnFlowDeclPathPinTysOf,
-  fnFlowDeclPathSrcs,
   fnFlowDeclPathUncalled,
-  fnFlowDeclWritten,
   fnFlowElemKind,
   fnFlowPinSigOf,
-  fnFlowReadGenFn,
-  fnFlowReadWritten,
   fnFlowStageInstHoles,
   fnFlowTableBuild,
   fnFlowWholeSliceRecv,
 } from "./fn_flow_shadow"
 import { ifArmValueExpr, paramIndexOf, paramTypeNodeOfRead } from "./emit_query"
 import {
+  cboxDeclWritten,
+  cboxReadGenFn,
+  cboxReadWritten,
   drwFillDefaults,
   drwMemberDeferred,
   drwOpCallOrigin,
@@ -6758,9 +6758,9 @@ function monoLamBoundNames(ix: i32, out: string[]) {
 }
 
 // The template slot of the generic function the flow table says read `at` names through its
-// aliases (`fnFlowReadGenFn`); -1 for none.
+// aliases (`cboxReadGenFn`); -1 for none.
 function monoReadGenFnFe(at: i32): i32 {
-  const d = fnFlowReadGenFn(at)
+  const d = cboxReadGenFn(at)
   if d < 0 { return -1 }
   const fe = fnStmtsPosOf(d)
   if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 { return -1 }
@@ -12501,7 +12501,7 @@ function monoIfBindingWalk(rd: i32, ctx: i32, open: boolean): i32[] {
   while lf[1] >= 0 && hops < MONO_ALIAS_CHAIN_MAX {
     const ld = nodeAt(lf[1])
     if !(ld is LetDecl) || ld.letType >= 0 || ld.letInit < 0 { return none }
-    if fnFlowDeclWritten(r) { return none }
+    if cboxDeclWritten(r) { return none }
     if !(nodeAt(ld.letInit) is Ident) { break }
     r = ld.letInit
     lf = monoReadLetFrame(r, lf[0])
@@ -13828,7 +13828,7 @@ function monoFlowLetLeaf(d: i32): i32 {
 // Whether the slot at `path` of binding `d` holds generic `g` alone, unwritten: each source the
 // flow table records is `g` or an adapter lambda calling it.
 function monoFlowSrcIs(d: i32, path: string[], g: i32): boolean {
-  const srcs = fnFlowDeclPathSrcs(d, path)
+  const srcs = elabSlotSrcFns(d, path)
   if srcs.length == 0 { return false }
   for x in srcs {
     if x != g && monoFlowLeafGen(x) != g { return false }
@@ -13838,7 +13838,7 @@ function monoFlowSrcIs(d: i32, path: string[], g: i32): boolean {
 
 // Whether generic `g` is among the sources of `d`'s slot at `path`.
 function monoFlowSrcHas(d: i32, path: string[], g: i32): boolean {
-  for x in fnFlowDeclPathSrcs(d, path) {
+  for x in elabSlotSrcFns(d, path) {
     if x == g || monoFlowLeafGen(x) == g { return true }
   }
   false
@@ -14825,7 +14825,7 @@ function monoFlowSpreadSrcElem(
   } else if monoFlowLeafGen(monoFlowElemAt(vs[0], xn.idxIndex)) != g {
     return false
   }
-  if !i32ListHas(fnFlowDeclPathHeldSrcs(d, path), g) { return false }
+  if !i32ListHas(elabSlotHeldFns(d, path), g) { return false }
   for u in mfrUses[d] ?? [] {
     const p = mfrParentOf(u)
     if p >= 0 && nodeAt(p) is Spread { return true }
@@ -14948,7 +14948,7 @@ function monoFlowMapQuery(prop: string, p: i32): boolean {
 
 // Whether every function the slot at `path` of binding `d` can hold, written or not, is `g`.
 function monoFlowHeldIs(d: i32, path: string[], g: i32): boolean {
-  const srcs = fnFlowDeclPathHeldSrcs(d, path)
+  const srcs = elabSlotHeldFns(d, path)
   if srcs.length == 0 { return false }
   for x in srcs {
     if x != g && monoFlowLeafGen(x) != g { return false }
@@ -14959,7 +14959,7 @@ function monoFlowHeldIs(d: i32, path: string[], g: i32): boolean {
 // Whether every function the slot at `path` of binding `d` can hold, written or not, is one
 // generic, as a written `let` holding it only ever is (D9791).
 function monoFlowHeldOneGen(d: i32, path: string[]): boolean {
-  const srcs = fnFlowDeclPathHeldSrcs(d, path)
+  const srcs = elabSlotHeldFns(d, path)
   if srcs.length == 0 { return false }
   const g = if mfrGen[srcs[0]] ?? false { srcs[0] } else { monoFlowLeafGen(srcs[0]) }
   g >= 0 && monoFlowHeldIs(d, path, g)
@@ -18538,7 +18538,7 @@ function monoHeldSrcsFnTy(at: i32, path: string[]): i32 {
   for q in qs {
     if tyHasTyVar(q) { return -1 }
   }
-  const srcs = fnFlowDeclPathHeldSrcs(at, path)
+  const srcs = elabSlotHeldFns(at, path)
   if srcs.length == 0 { return -1 }
   let r = -1
   for s in srcs {
@@ -18817,7 +18817,7 @@ function monoAliasCellRead(at: i32, ctx: i32): i32[] {
 // Whether read `at` names a reassigned `let` annotated with a function type: the binding already
 // holds a function of that type, whichever write it took, and the check admitted the delivery.
 function monoAnnWrittenLetAt(at: i32, ctx: i32): boolean {
-  if !fnFlowDeclWritten(at) { return false }
+  if !cboxDeclWritten(at) { return false }
   const lf = monoCoercibleLet(at, ctx)
   if lf[1] < 0 { return false }
   const d = nodeAt(lf[1])
@@ -18837,7 +18837,7 @@ function monoCoerceWrittenLetTys(
 ): boolean {
   // Asked of every value read, so the cheap tests come first.
   if annArrowAt(tname) < 1 { return false }
-  if !fnFlowDeclWritten(at) { return false }
+  if !cboxDeclWritten(at) { return false }
   const lf = monoCoercibleLet(at, ctx)
   if lf[1] < 0 { return false }
   const d = nodeAt(lf[1])
@@ -22113,7 +22113,7 @@ function monoArgIsOpenFnChoice(a: i32, depth: i32): boolean {
     if d < 0 || d >= P.nodes.length { return false }
     const dn = nodeAt(d)
     if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
-    if fnFlowDeclWritten(x) { return false }
+    if cboxDeclWritten(x) { return false }
     return monoArgIsOpenFnChoice(dn.letInit, depth + 1)
   }
   if !(n is IfStmt) || n.ifElse < 0 { return false }
@@ -26012,7 +26012,7 @@ function monoWalkIdentCall(
       // The chain names the lambda it is initialized with. Where a link is written, that
       // need not be the value the alias holds at this call, so the call keeps its
       // `call_ref` and only the lambda is pinned (D3849); an unwritten chain always holds it.
-      if afe >= 0 && fnFlowReadWritten(n.callFn) { monoNoRename.push(n.callFn) }
+      if afe >= 0 && cboxReadWritten(n.callFn) { monoNoRename.push(n.callFn) }
     }
     // An alias of a `let` calls what the `let` holds: an unwritten one its hole lambda, and a
     // written one the value last written to it, so the seed is pinned at this call, which

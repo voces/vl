@@ -83,9 +83,7 @@ let ffPairVal: i32[] = []
 let ffPairNext: i32[] = []
 // Reads the walk resolved to a local binding, by node: the sweep checks none now names a function.
 let ffLocalRead: {[i32]: i32} = Map()
-// Per declaration: the binding its initializer reads (-2 for a capture cell, which exists because
-// its binding is written), and whether an `=` writes it.
-let ffDeclFrom: {[i32]: i32} = Map()
+// Per declaration, whether an `=` writes it.
 let ffDeclWr: {[i32]: boolean} = Map()
 // Per pre-mono declaration (`ffOrigDecl`): its node in the walked tree, the function declaring it
 // (-1 at module scope), and the `=` writes of it and of its capture cell (`d[0] = v`), by node.
@@ -178,7 +176,6 @@ export function fnFlowShadowBegin() {
   ffPairVal = []
   ffPairNext = []
   ffLocalRead = Map()
-  ffDeclFrom = Map()
   ffDeclWr = Map()
   ffDeclNode = Map()
   ffDeclFnOf = Map()
@@ -352,13 +349,6 @@ function ffKid(s: i32, k: string): i32 {
   ufKidK[r2].push(ffKidKey(k))
   ufKidS[r2].push(n)
   n
-}
-
-function ffI32Merge(into: i32[], from: i32[]) {
-  for x in from {
-    if !i32ListHas(into, x) { into.push(x) }
-  }
-  0
 }
 
 // How many facts root `r`'s class holds, which decides the side a merge keeps.
@@ -717,10 +707,7 @@ function ffStmt(ix: i32) {
     ffAddDecl(s, ix)
     ffBankDeclSlot(o, s)
     if n.letType >= 0 { ffPinTy(s, ffSubst(ffAnnTy(n.letType)), 0) }
-    if n.letInit >= 0 {
-      ffDeclFrom[ix] = ffInitBinding(n.letInit)
-      ffInto(s, ffFlow(n.letInit))
-    }
+    if n.letInit >= 0 { ffInto(s, ffFlow(n.letInit)) }
     return 0
   }
   if n is RetStmt {
@@ -758,27 +745,6 @@ function ffStmt(ix: i32) {
   }
   ffFlow(ix)
   0
-}
-
-// The binding initializer `ix` reads by name, -2 for a capture cell or a read through one, -1
-// for any other value.
-function ffInitBinding(ix: i32): i32 {
-  const n = nodeAt(ix)
-  if n is Ident {
-    const d = identDeclOf(ix)
-    if d < 0 || d >= P.nodes.length || nodeAt(d) is FuncDecl { return -1 }
-    return d
-  }
-  if ffIsCellValue(ix) { return -2 }
-  -1
-}
-
-// Whether `ix` is the rewrite's capture cell `[v]`, which carries no source position, or a read
-// `c[0]` through one.
-function ffIsCellValue(ix: i32): boolean {
-  const n = nodeAt(ix)
-  if n is ArrayLit { return n.pos < 0 && n.arrElems.length == 1 }
-  ffIsCellRead(ix)
 }
 
 // Whether `ix` is a read `c[0]` of a name.
@@ -1582,53 +1548,6 @@ export function fnFlowTableBuild(stmts: i32[]) {
   ffBuild(stmts)
 }
 
-// Whether the binding read `at`, or one its initializer chain copies, may hold a value other than
-// its initializer's: an `=` writes it, or it is a capture cell. True without a built table, the
-// safe answer.
-export function fnFlowReadWritten(at: i32): boolean {
-  if !ffBuilt { return true }
-  let d = ffOrigDecl(identDeclOf(at))
-  let hops = 0
-  while d >= 0 && hops < 64 {
-    if ffDeclWr[d] ?? false { return true }
-    const f = ffDeclFrom[d] ?? -1
-    if f == -2 { return true }
-    d = ffOrigDecl(f)
-    hops = hops + 1
-  }
-  hops >= 64
-}
-
-// The named generic function the read `at` names through a chain of un-annotated aliases none of
-// which an `=` writes (`const k = inner; const j = k`), as its declaration; -1 for any other read.
-export function fnFlowReadGenFn(at: i32): i32 {
-  if !ffBuilt { return -1 }
-  let d = ffOrigDecl(identDeclOf(at))
-  let hops = 0
-  while d >= 0 && d < P.nodes.length && hops < 64 {
-    const n = nodeAt(d)
-    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return -1 }
-    if n.letKw != "const" && (ffDeclWr[d] ?? false) { return -1 }
-    if !(nodeAt(n.letInit) is Ident) { return -1 }
-    const nd = identDeclOf(n.letInit)
-    if nd < 0 || nd >= P.nodes.length { return -1 }
-    if nodeAt(nd) is FuncDecl {
-      if !monoIsGenericDecl(nd) { return -1 }
-      return nd
-    }
-    d = ffOrigDecl(nd)
-    hops = hops + 1
-  }
-  -1
-}
-
-// Whether an `=` writes the binding the read `at` names (a capture cell's `d[0] = v` aside).
-export function fnFlowDeclWritten(at: i32): boolean {
-  const d = identDeclOf(at)
-  if !ffBuilt || d < 0 { return false }
-  (ffDeclWrites[ffOrigDecl(d)] ?? []).length > 0
-}
-
 // The function declaring the binding declaration `d` stands for, -1 at module scope, and -2
 // when the walk saw no such declaration.
 export function fnFlowDeclFn(d: i32): i32 { ffDeclFnOf[ffOrigDecl(d)] ?? -2 }
@@ -1955,46 +1874,6 @@ function ffPathPinKeys(s: i32, path: string[], rets: boolean): string[] {
 function ffStrCopy(xs: string[]): string[] {
   const out: string[] = []
   for x in xs { out.push(x) }
-  out
-}
-
-// Every source of the slot `path` of `d`, in every context `d` is walked in, a write's value
-// among them; empty for an empty path or when a slot is missing or has no source. A generic's template
-// walk holds only what a call past the context cap delivers, so an empty slot there is skipped.
-export function fnFlowDeclPathSrcs(d: i32, path: string[]): i32[] {
-  const out: i32[] = []
-  if !ffBuilt || d < 0 || path.length == 0 { return out }
-  const o = ffOrigDecl(d)
-  const slots = ffDeclSlots[o] ?? []
-  const ctxs = ffDeclSlotCtx[o] ?? []
-  let i = 0
-  while i < slots.length {
-    let r = ffFind(slots[i])
-    for k in path { r = ffFind(ffKidOf(r, k)) }
-    const tmpl = i < ctxs.length && ctxs[i] == 1
-    if tmpl && (r < 0 || ufSrc[r].length == 0) {
-      i = i + 1
-      continue
-    }
-    if r < 0 || ufSrc[r].length == 0 { return [] }
-    ffI32Merge(out, ufSrc[r])
-    i = i + 1
-  }
-  out
-}
-
-// Every function the slot `path` of `d` (`d`'s own for an empty path) can hold, written or not, in
-// every context `d` is walked in; empty when a slot is missing, has no source, or escapes where
-// the table cannot follow.
-export function fnFlowDeclPathHeldSrcs(d: i32, path: string[]): i32[] {
-  const out: i32[] = []
-  if !ffBuilt || d < 0 { return out }
-  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
-    let r = ffFind(s)
-    for k in path { r = ffFind(ffKidOf(r, k)) }
-    if r < 0 || ufTop[r] != "" || ufSrc[r].length == 0 { return [] }
-    ffI32Merge(out, ufSrc[r])
-  }
   out
 }
 
