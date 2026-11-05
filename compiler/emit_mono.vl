@@ -10789,8 +10789,10 @@ function monoMakeInstanceLater(
   if cal3 is Ident && cal3.identName != fn.fnName {
     // A binding written anywhere on its alias chain holds one signature as surely as one
     // written itself (D3858).
-    const written = monoNameWrittenAt(cal3.identName, calleeIx)
-      || i32ListHas(monoNoRename, calleeIx)
+    // A lambda dispatch arm's instances are each frame's row entry, not one binding's.
+    const written = monoArmLamFe(calleeIx, cal3) < 0
+      && (monoNameWrittenAt(cal3.identName, calleeIx)
+      || i32ListHas(monoNoRename, calleeIx))
     if (written && !monoWrittenLetSigCall && calleeIx != monoWriteCoercedCall) {
       // A frame-keyed instance differs by its enclosing instance, not its argument type.
       if callFrame >= 0 {
@@ -26825,6 +26827,7 @@ function monoWalkIdentCall(
     n.callFn,
   )
   const direct = fe >= 0
+  let armLam = false
   let wlName = callee.identName
   let wlAt = n.callFn
   let wlFr = ctx
@@ -26834,6 +26837,12 @@ function monoWalkIdentCall(
     let afe = monoArmLamFe(n.callFn, callee)
     if afe >= 0 && !i32ListHas(monoLamCallCallees, n.callFn) {
       monoLamCallCallees.push(n.callFn)
+    }
+    // Its instance is answered by the row per frame, so the arm node every instance shares is
+    // never renamed.
+    if afe >= 0 {
+      armLam = true
+      monoNoRename.push(n.callFn)
     }
     // A call through a `const` alias of a lambda's `const` binding calls that lambda, and is
     // instantiated per call alike (D2896).
@@ -26918,6 +26927,16 @@ function monoWalkIdentCall(
       }
       const ri = monoInstantiate(fe, ix, ctx)
       monoWriteCoercedCall = -1
+      // The row answers a lambda arm's instance per frame, at the signature it is called at.
+      if armLam && ri >= 0 {
+        const site = elabSrcDecl(identDeclOf(n.callFn))
+        monoCadRowWrite(
+          site,
+          monoCadInstOf(ctx),
+          monoArmSig(ix, ctx),
+          monoLastInstFe,
+        )
+      }
       monoNoteBindCall(n.callFn, ctx, ix)
       // The call keeps its `call_ref` through a written `let`, so each generic written to it
       // takes the instance's signature, as a delivery of the binding does (D3961).
@@ -29245,6 +29264,24 @@ function monoCadRowWrite(site: i32, inst: i32, sig: i32, fe: i32) {
   cadSig.push(sig)
   cadFe.push(fe)
   0
+}
+
+// The closed signature dispatch arm call `call` calls its lambda at in frame `fnIx`: its arguments'
+// types to its own; -1 where one does not close. The arm's callee keeps the lambda's open type.
+export function monoArmSig(call: i32, fnIx: i32): i32 {
+  const c = nodeAt(call)
+  if !(c is Call) { return -1 }
+  const ps: i32[] = []
+  for a in c.callArgs {
+    let t = elabNodeTyAt(a, fnIx)
+    if t < 0 { t = nodeTyIxOf(a) }
+    if !monoCadTyClosed(t) { return -1 }
+    ps.push(t)
+  }
+  let r = elabNodeTyAt(call, fnIx)
+  if r < 0 { r = nodeTyIxOf(call) }
+  if !monoCadTyClosed(r) { return -1 }
+  mkFuncTy(ps, r)
 }
 
 // Whether two row signatures are one: the same type, with each tagged set the same set.
