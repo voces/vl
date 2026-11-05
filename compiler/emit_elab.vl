@@ -4,7 +4,7 @@
 
 import { cwIxCovers } from "./check_write_scan"
 import { monoIsGenericDecl } from "./emit_base"
-import { tyParamIsBareOnly } from "./check_scopes"
+import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { paramHoleName } from "./check_tp_join"
 import { decDigitsOf } from "./strutil"
@@ -3208,15 +3208,36 @@ function elabRetHandsBack(decl: i32, ix: i32, i: i32): boolean {
 // the body, so one walk per function serves all its instances.
 let elabHandBackMemo: {[i32]: i32} = Map()
 
+// The parameter of `dn` the returned call `x` hands back: `x` calls a declared function that hands
+// back its positional argument, and that argument reads the parameter; -1 otherwise.
+function elabHandBackThrough(dn: FuncDecl, x: i32): i32 {
+  const cn = nodeAt(x)
+  if !(cn is Call) { return -1 }
+  const g = identFnDeclOf(parenPeelIx(cn.callFn))
+  if g < 0 || g >= P.nodes.length { return -1 }
+  const gn = nodeAt(g)
+  if !(gn is FuncDecl) { return -1 }
+  const j = elabHandBackIx(g, gn)
+  if j < 0 || j >= cn.callArgs.length { return -1 }
+  if j < cn.callArgNames.length && cn.callArgNames[j] != "" { return -1 }
+  const a = parenPeelIx(cn.callArgs[j])
+  if a < 0 || !(nodeAt(a) is Ident) { return -1 }
+  i32ListIndexOf(dn.fnParams, identDeclOf(a))
+}
+
 function elabHandBackIx(decl: i32, dn: FuncDecl): i32 {
   const had = elabHandBackMemo[decl] ?? -2
   if had > -2 { return had }
   let at = -1
+  // A cycle of calls handing each other back reads as handing nothing back.
+  elabHandBackMemo[decl] = -1
   const vs: i32[] = []
   collectRetValues(dn.fnBody, vs)
   for v in vs {
     const x = parenPeelIx(v)
     let i = if x >= 0 && nodeAt(x) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(x)) } else { -1 }
+    // A returned call of a function that hands back its argument hands back what that reads.
+    if i < 0 && x >= 0 { i = elabHandBackThrough(dn, x) }
     // A returned `const` copy of a parameter hands that parameter back.
     if i < 0 && x >= 0 && nodeAt(x) is Ident {
       i = i32ListIndexOf(dn.fnParams, fnTagParamCopyOf(dn, identDeclOf(x)))
@@ -10159,9 +10180,53 @@ function elabSoleInstFnTy(ax: i32): i32 {
 function elabClosedFnCtx(ix: i32): i32 {
   const t = nodeCtxTyIxOf(ix)
   if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || !elabTyClosed(t, 0) {
-    return -1
+    return elabResultCallTy(ix)
   }
   t
+}
+
+// The closed function type every call through call `ix`'s value takes: the call `ix` is the
+// callee of, or each call through the un-annotated `const` it initialises when that binding is
+// read only as a callee (D5530); -1 when there is none, one is open, or two differ.
+function elabResultCallTy(ix: i32): i32 {
+  if ix < 0 || !cwIxCovers(ix) { return -1 }
+  const up = cwIxUp[ix]
+  const k = cwIxUpKind[ix]
+  let calls: i32[] = []
+  if k == CW_UP_CALLEE {
+    calls.push(up)
+  } else if k == CW_UP_LETINIT && up >= 0 && up < P.nodes.length {
+    const ln = nodeAt(up)
+    if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return -1 }
+    calls = elabSlotHolderCalls(up)
+  }
+  let t = -1
+  for c in calls {
+    const ct = elabCallSiteFnTy(c)
+    if ct < 0 || t >= 0 && !tySame(t, ct) { return -1 }
+    t = ct
+  }
+  t
+}
+
+// The function type call `c` is made at: its positional arguments' types and its own, when each
+// is closed; -1 otherwise.
+function elabCallSiteFnTy(c: i32): i32 {
+  if c < 0 || c >= P.nodes.length { return -1 }
+  const cn = nodeAt(c)
+  if !(cn is Call) { return -1 }
+  const ps: i32[] = []
+  let i = 0
+  while i < cn.callArgs.length {
+    if i < cn.callArgNames.length && cn.callArgNames[i] != "" { return -1 }
+    const ax = parenPeelIx(cn.callArgs[i])
+    if ax < 0 || nodeAt(ax) is Spread { return -1 }
+    ps.push(widenLitTy(nodeTyIxOf(ax)))
+    i = i + 1
+  }
+  const ft = mkFuncTy(ps, nodeTyIxOf(c))
+  if ft < 0 || !elabTyClosed(ft, 0) { return -1 }
+  ft
 }
 
 // The type variable parameter `i` of `f` is typed by: its own type parameter, or its hole's.
@@ -11315,6 +11380,11 @@ function elabOutTyVia(t: i32, k: i32, via: i32): i32 {
 
 // The closed type of parameter `i` of the instance call `ix` reaches from the instance being
 // walked, its function values taking the instances its body reaches; -1 where that does not close.
+// `elabCallParamTy` of the instance call `ix` makes from instance `from` (-1 at the root).
+export function elabCallParamTyFrom(ix: i32, i: i32, from: i32): i32 {
+  elabParamTyOf(elabCallInstFrom(ix, from), i)
+}
+
 export function elabCallParamTy(ix: i32, i: i32): i32 {
   const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
   elabParamTyOf(elabCallInstFrom(ix, from), i)
