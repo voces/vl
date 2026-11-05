@@ -1063,6 +1063,83 @@ Besides the programs, four kinds of reader ask the plan, and each must lose its 
 
 No dependent would turn into a miscompile if the plan were deleted today: H-choice's 3 such rows run since #5838. The checker no longer requests a split (#5870).
 
+
+### 3.3 emit_mono's decision arms, measured (2026-11-05)
+
+A coverage probe counted, per program, every `if`/`else` body in `emit_mono.vl` at master f0caaf0:
+5,575 arms, over 23,810 programs (every `tests/cases` file, the distilled corpus, every filed
+witness in both inventories). The counter was validated on `monomorphize`'s own arms before any zero
+was read. A *decision arm* records a node type (`nodeTyRecord`, `monoRetype*`, `monoRecordOpen`) or
+returns a computed pin; an arm that refuses (`emitFail`, a `*Fail` helper) is a refusal arm.
+
+**Arms are not deleted on zero hits** (coordinator ruling). A dead function's callers are already
+unreachable; a dead arm sits in a live function, and deleting it reroutes an unmeasured program to the
+next rung. `monoArgTyNameRep`'s scalar tail (`exprIsF64` to `"f64"` and its neighbours) is unreached,
+and its cascade ends in `"i32"` (D23): deleting a rung would pin an unmeasured f64 argument at `i32`,
+a clause-1 miscompile no corpus program sees. The zero list is a map of what earlier rungs or the
+elaboration already decide:
+
+- 46 decision arms with no hit, by function: `monoArgTyNameCascade` (2), `monoArgTyNameProjected`,
+  `monoArgTyNameRep` (14), `monoCallWrittenLet`, `monoCapturedDestListPin`, `monoCoerceChoiceBinding`
+  (2), `monoCopyCellRead`, `monoHeldRecPaths`, `monoHoleGenFnPin`, `monoInitHeldTy`,
+  `monoLoopVarRecordPin`, `monoModuleLetPin` (2), `monoPinCallRecord`, `monoPinFieldContainer`,
+  `monoPinFieldValue`, `monoPinOpenCallLams`, `monoPinWidened`, `monoPinnedAnnTyAt`,
+  `monoRecordInstOpen`, `monoRecordPinnedRecv`, `monoRetConstRecord`, `monoRetypeCallsAt` (5),
+  `monoRetypeLamCells` (2), `monoRetypeMethodReads`, `monoSigFnTyNameAt`.
+- 36 refusal arms with no hit, kept: `monoBindExplicitTyArgs`, `monoBindingAtPin` (2),
+  `monoBundleNamedPin` (2), `monoBundlePinArg`, `monoBundleRecordTy`, `monoCloCoerceBuild` (2),
+  `monoClosureBundlePin`, `monoCoerceWrittenCell` (3), `monoHandWrittenLet` (2),
+  `monoIfChainRebuildPinned`, `monoInertArgsStubbed`, `monoInstantiateCallIn`, `monoLayoutConstOf`
+  (2), `monoLetTyParamMisfit`, `monoMakeInstanceGo` (2), `monoMakeInstanceLater` (2),
+  `monoMakeInstanceParams`, `monoMakeInstanceWalk`, `monoNicheNulListCheck`, `monoOpenCallAtElems`
+  (2), `monoPinColsMisalignedFail`, `monoPinHoleParam`, `monoPruneTemplates`, `monoShadowRenameDecl`
+  (2), `monoTwoListArgFail`.
+
+**The most-reached decision arms are the next stage's queue**, each to be shadowed against the
+elaboration fact that should carry the same answer: `monoWalkIdentCall`'s instance of a generic call
+(9,384 programs, D3961), `monoHoleGenFnPin` (7,937), `monoPinNoteReturns`,
+`monoNarrowedNominalPinName`, `monoReachListTy`, `monoCloneGenericCallArm` (D12702),
+`monoReachRecTy`, `monoCloPinAnnNodeOfExpr`, `monoMakeInstanceGo`'s instance note,
+`monoIfChainRebuild`, `monoPinBodyLambdasRaw` (D1990), `monoCloneGenericCalls` (D2849, two arms),
+`monoCloneLambdaSubst` (two arms, D943 and seven more), `monoPinLamFromCheckedTy` (D3820, D3834).
+
+**Shadow of `monoHoleGenFnPin`** (the signature a generic handed to a hole parameter takes), against
+`callArgRepTy` over `elabCallParamTy` at `monoPinHoleParam`: 83 programs agree, 0 disagree, and 4 get
+no elaboration answer: `closures/generic-fn-value-returned-through-identity-hole.vl`,
+`closures/hole-fn-if-join-result-handed-hole-fn.vl`, D12340 and D15455. Each is a signature fixed
+past the call, by calls through the result, which only the flow table carries. The switch to the
+elaboration's answer waits for those four, so it lands with the derivation's deletion and not beside it.
+
+**Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), comparing the
+instance's parameter types with the elaboration's per call, union members order-normalised:
+
+- against `elabCallParamTy` alone, 66 programs (74 pairs) disagree, most of them a record delivered
+  at a wider row than its type. Minimal witness, where mono is right: with `const wideJ: J = mk()`
+  beside `const xs = [mk()]`, `mk`'s literal is built in `J`'s row `{f: i32 | null}`, so `rd(xs[0])`
+  must be instanced at that row; the type is `{f: i32}`.
+- against `callArgRepTy` (the rep row `callBindAdoptReps` records beside the binding), 8,358 agree,
+  339 get no answer and 33 programs (40 pairs) disagree.
+
+#### Next stage, first item: a per-call delivered-rep fact
+
+DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
+instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
+a record built wider, which is why 34 of the 74 pairs close under `callArgRepTy`. The 40 that remain
+are three delivery kinds the rep row does not record yet:
+
+- a closure bundle handed to a parameter (14 pairs): mono instances at the bundle record
+  `{c0: ..., c1: ...}`, the binding is one member's function type;
+- a value delivered non-null to a nullable parameter (16 pairs, 14 of them function values): mono
+  instances at the non-null type, the binding keeps `| null`;
+- a record whose row mono keys narrower or wider than the binding, or cannot spell because it holds
+  generic functions (8 pairs); and literal-union spellings the render softens (2 pairs).
+
+The fact: for each argument `i` of each call, the rep it is delivered at. `callBindAdoptReps` (check
+time) writes it, extended to those three kinds. `callArgRepTy` reads it, as today. Mono's instance
+choice in `monoWalkIdentCall` and `monoPinHoleParam` then reads the elaboration's type and this rep,
+and stops deriving either. The acceptance set is the 40 pairs above: each must read the same under
+both, then the 339 no-answer calls, before the instance choice switches.
+
 ---
 
 ## 4. Scoreboard
