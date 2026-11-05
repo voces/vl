@@ -48,6 +48,7 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
+  arenaNoteRefWrite,
   callHasTyArgs,
   callIsRestPacked,
   fillArgDefaults,
@@ -60,6 +61,7 @@ import {
   hasSpreadItem,
   i32ToStr,
   loopVarLoop,
+  mkIdent,
   mkIndex,
   mkNull,
   nodeAt,
@@ -70,6 +72,7 @@ import {
   ufcsAliasInScope,
 } from "./ast"
 import { collCtorTyArgsTy } from "./check_annot_resolve"
+import { luGrow } from "./check_list_union"
 import {
   adoptHoleLitArgs,
   assignableExpr,
@@ -233,6 +236,7 @@ import {
   collapseDeferredJoin,
   constrainEmptyExpr,
   rcwCovs,
+  recEnclosingFn,
   recordCtxTy,
   stampNullUnitCell,
 } from "./check_fit_rules"
@@ -496,6 +500,7 @@ import {
   cwBindingOf,
   cwBoundInitOf,
   cwBoundOnce,
+  cwFieldNameWritten,
   cwFnDeclAt,
   cwGetRecv,
   cwKeyOfRoot,
@@ -509,7 +514,7 @@ import {
   fnDeclIx,
 } from "./check_write_scan"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
-import { identDeclOf } from "./symbols"
+import { identDeclOf, identFrom } from "./symbols"
 import {
   isNullTy,
   isVoidTy,
@@ -4115,9 +4120,82 @@ function checkCallNodeAt(n: Call, ix: i32) {
   checkCallNodeGo(n, ix)
 }
 
+// The `Ident` naming a declared function that callee `m` reads as a field of a `const`
+// un-annotated record literal, where no assignment anywhere writes a field of that name; else -1.
+function constRecFieldFnRead(m: i32): i32 {
+  if m < 0 || m >= P.nodes.length { return -1 }
+  const mn = nodeAt(m)
+  if !(mn is Member) { return -1 }
+  const o = parenPeelIx(mn.memObj)
+  if o < 0 || o >= P.nodes.length || !(nodeAt(o) is Ident) { return -1 }
+  const d = identDeclOf(o)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const ln = nodeAt(d)
+  if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return -1 }
+  const li = parenPeelIx(ln.letInit)
+  if li < 0 || li >= P.nodes.length { return -1 }
+  const ol = nodeAt(li)
+  if !(ol is ObjLit) { return -1 }
+  for fi in ol.objFields {
+    const f = nodeAt(fi)
+    if f is FieldInit && f.fiName == mn.memProp {
+      const v = parenPeelIx(f.fiValue)
+      if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return -1 }
+      const fd = identFnDeclOf(v)
+      if fd < 0 || fd >= P.nodes.length || !(nodeAt(fd) is FuncDecl) {
+        return -1
+      }
+      if cwFieldNameWritten(mn.memProp) { return -1 }
+      // The direct call names the function, so a declaration of that name around the call would
+      // be the one it reaches.
+      const vn = nodeAt(v)
+      if vn is Ident && nameDeclaredAround(m, vn.identName) { return -1 }
+      return v
+    }
+  }
+  -1
+}
+
+// Whether some function enclosing node `x` declares `nm` in its body or parameters: a nested
+// function, a parameter, a binding or a loop variable.
+function nameDeclaredAround(x: i32, nm: string): boolean {
+  let f = recEnclosingFn(x)
+  let guard = 0
+  while f >= 0 && f < P.nodes.length && guard < 64 {
+    const todo: i32[] = [f]
+    while todo.length > 0 {
+      const at = todo.pop() ?? -1
+      if at >= 0 && at < P.nodes.length {
+        const n = nodeAt(at)
+        if n is FuncDecl && at != f && n.fnName == nm { return true }
+        if n is Param && n.parName == nm { return true }
+        if n is LetDecl && n.letName == nm { return true }
+        if n is ForRange && n.frVar == nm { return true }
+        if n is ForIn && (n.fiVar == nm || n.fiVar2 == nm) { return true }
+        for c in nodeChildren(at) { todo.push(c) }
+      }
+    }
+    f = recEnclosingFn(f)
+    guard = guard + 1
+  }
+  false
+}
+
 // `checkCallNode`'s dispatch.
 function checkCallNodeGo(n: Call, ix: i32) {
   if n.callFn < 0 { return TY_ERR }
+  // A call through a field that always holds one declared function is that function's direct
+  // call: the callee is repointed to a name of it, after its own check records the field read.
+  const rv = constRecFieldFnRead(n.callFn)
+  if rv >= 0 {
+    checkNodeHook(n.callFn)
+    const nm = nodeAt(rv)
+    const k = mkIdent(if nm is Ident { nm.identName } else { "" }, -1)
+    identFrom(k, rv)
+    n.callFn = k
+    arenaNoteRefWrite()
+    luGrow()
+  }
   const cfn = nodeAt(n.callFn)
   if callHasTyArgs(ix) {
     if !callTyArgsCalleeOk(cfn, n.callFn, ix) { return TY_ERR }
