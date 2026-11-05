@@ -927,7 +927,7 @@ L-map, F-let, B, C, H-b, H-nested, N and W-field have no dependent. D15101 runs 
 | `closures/function-list-element-at-two-types-pushed-through-hole-helper` | `a function value is called at two signatures, and the closure it holds was built for one` | D15440 (split-dep lane) |
 | `closures/written-let-copy-of-hole-param-in-list-called-at-two-types` | the same as the row above | none yet: added by D15404's close (#6364), whose holder rule covers the un-written copy only |
 | `closures/written-let-copy-of-hole-param-in-record-called-at-two-types` | the same | none yet, as the row above |
-| `closures/written-let-reassigned-to-other-param-called-at-two-types` | `parameter a of one is called at two function types that no parameter per type separates` | none yet: residue of the closed D15122 and D15123 (group F) |
+| `closures/written-let-reassigned-to-other-param-called-at-two-types` | `parameter a of one is called at two function types that no parameter per type separates` | D15409 (group F, the residue of D15122 and D15123: two sources carrying different generics, one also called directly at another type) |
 | `generics/generic-value-return-written-to-void-generic-let` | `the reassigned function binding m holds functions called at more than one argument type` | D15030 (W-split, Q5) |
 | `objects/record-generic-field-called-and-read-under-is` | `a generic function taken as a value reaches no call that fixes its type` | D15252 (M, the `is` relation) |
 
