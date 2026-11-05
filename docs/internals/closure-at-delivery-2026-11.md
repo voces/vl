@@ -102,6 +102,29 @@ signature, carried as one value.
   exactly an instance of the maker's open result. A maker is instanced only when every read of it
   takes an instance (`fvaMakerCoverCheck`): the root the others reach shares its body with them.
 
+### Dispatch arms (measured 2026-11-05, lane LWM)
+
+The row is already on master, keyed `(site, monoCadInstOf(fnIx), sig) → fe`. It is written at
+three sites, not one: `monoCadNoteInstance`, `monoCadNoteLamClone` and `monoCadNotePinnedLam`.
+It is read by `monoBundleFe`, `monoBundleReadFe` and `monoTokenFe`.
+
+A tagged set's lambda arm does not read it yet. Mono instances a lambda arm by renaming its
+callee in place (`monoArmLamFe`), and #6338 gave each instance clone its own lambda arm node
+(`fnTagCallCopy`) so that the rename is per instance. That is the interim.
+
+Retiring the rename was measured by stopping it (`monoNoRename` for a lambda arm) with the arms
+shared again. Every lambda arm then refuses in mono, before the emitter is reached, with `the
+function binding ``, a copy of a reassigned binding, is called at more than one…`. The
+non-generic D15433 refuses too. So the switch is three readers moving together:
+
+- mono's instancing of a lambda arm writes the row once per frame at the frame's signature
+  (`elabNodeTyAt(arm callee, fnIx)`), with no rename;
+- mono's binding-signature checks take an arm whose member the row answers as dispatched;
+- the emitter's call path resolves an arm callee through the row (`monoBundleReadFe` from
+  wasmEmit.vl). It cannot do so from `elabArmFeOf`, since emit_elab.vl does not import mono.
+
+#6338's per-arm minting can be reverted only after all three land.
+
 ### Matrix
 
 The bundle record is an anonymous record, so its position matrix must include a same-shape
