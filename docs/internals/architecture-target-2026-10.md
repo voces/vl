@@ -1239,8 +1239,8 @@ happen where no fact can see them, so the slot has to be treated as called.
   argument to a call whose callee resolves to no declared function and is not a call through a
   function value. Escape is a fact about the function, not the slot. Under §2.2 a slot's value is
   one of its set's members, so a slot escapes when one of the functions it holds escapes.
-- **Who writes it.** The elaboration, beside its call rows (`elabCallNote` and its per-instance
-  re-check):
+- **Who writes it.** The check's last pass over the source program (`lamChainSnap` in
+  check_lam_chain.vl, at `elabPrepareRun`, before any emit rewrite), as `fnEscapes(f)`:
   - at each such call, for each argument whose type carries a set, every member of that set;
   - for an argument naming a declared function directly, that function.
   - The answer is the same in every instance, because it depends on the callee being opaque and on
@@ -1252,7 +1252,17 @@ happen where no fact can see them, so the slot has to be treated as called.
   - the split-dep lane's `elabSlotDeliveries(d, path)` is empty: no closed delivery;
   - no function `elabSlotHeldFns(d, path)` returns has escaped.
 - **What it replaces.** The table's per-class *top* label, which is the only escape the table
-  records. A value written into a container that is later handed to an opaque callee escapes through
+  records.
+- **Globals and exports.** The table marks neither, and does not need to:
+  - A module global is a binding in the one merged arena. Every read of it is a node the program's
+    own facts see, and a call through it is a call through its set.
+  - A binding another module imports is in the same compile, because modules are merged before the
+    check.
+  - The host is handed only scalar module bindings as wasm globals (`exportGlobalRows`), so a
+    function value never reaches it that way.
+  - An opaque callee can therefore only receive a function as an argument at its own call, and
+    that call is where the fact is written. A function stored first and passed later escapes at
+    the later call. A value written into a container that is later handed to an opaque callee escapes through
   the container's type, which carries the same set, so the set-keyed fact covers it without
   following the container.
 - **Acceptance.** The uncalled cut's 3 files:

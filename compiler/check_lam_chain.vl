@@ -1,6 +1,7 @@
-// The hole lambda a binding read holds through a chain of un-annotated bindings, read from the
-// source program: each binding's initializer, its writes and the function declaring it, noted
-// once when the check ends, before an emit rewrite turns a captured `let` into a capture cell.
+// Facts about the source program noted once when the check ends, before any emit rewrite: the hole
+// lambda a binding read holds through a chain of un-annotated bindings (each binding's initializer,
+// writes and declaring function), and the functions that escape to a callee the program does not
+// declare, whose calls no fact sees.
 import { nodeTyIxOf } from "./check_node_tys"
 import {
   cwArenaSync,
@@ -8,9 +9,22 @@ import {
   cwIxBuild,
 } from "./check_write_scan"
 import { recEnclosingFn } from "./check_fit_rules"
-import { FuncDecl, Ident, Index, LetDecl, NumLit, P, nodeAt } from "./ast"
-import { declOrigOf, identDeclOf } from "./symbols"
-import { T, TyFunc, tyAt } from "./check_types"
+import {
+  Call,
+  FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  Member,
+  NumLit,
+  P,
+  nodeAt,
+} from "./ast"
+import { parenPeelIx } from "./check_places"
+import { IDENT_BUILTIN, declOrigOf, identDeclOf } from "./symbols"
+import { fnTagMembers, fnTagSetOfTy } from "./check_elab_cap"
+import { identFnDeclOf } from "./check_scopes"
+import { T, TyArray, TyFunc, TyMap, TyObj, tyAt } from "./check_types"
 import { tyHasTyVar } from "./tyquery"
 
 // The most links a chain may have before its call has no signature to lower at.
@@ -23,17 +37,21 @@ export const LC_CHAIN_LONG = -3
 let lcInit: {[i32]: i32} = Map()
 let lcWrites: {[i32]: i32[]} = Map()
 let lcFn: {[i32]: i32} = Map()
+// The declared functions a value handed to an opaque call may hold (`lcEscapeNote`).
+let lcEscaped: {[i32]: boolean} = Map()
 
 // Notes every un-annotated binding's facts, when some binding is initialised with a lambda.
 export function lamChainSnap() {
   lcInit = Map()
   lcWrites = Map()
   lcFn = Map()
+  lcEscaped = Map()
   const lets: i32[] = []
   let any = false
   let x = 0
   while x < P.nodes.length {
     const n = nodeAt(x)
+    lcEscapeNote(x)
     if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
       lets.push(x)
       const iv = nodeAt(n.letInit)
@@ -60,6 +78,45 @@ export function lamChainSnap() {
   }
   0
 }
+
+// At node `x`, a call whose callee is no declared function and no function value: a builtin or
+// unresolved name, or a method no declared function serves on a receiver that is no list, map or
+// record. Each function an argument may hold escapes there: its set's members, or the one it names.
+function lcEscapeNote(x: i32) {
+  const n = nodeAt(x)
+  if !(n is Call) { return 0 }
+  const cf = parenPeelIx(n.callFn)
+  if !lcIdentOpaque(cf) && !lcMemberOpaque(cf) { return 0 }
+  for a in n.callArgs {
+    const ax = parenPeelIx(a)
+    for m in fnTagMembers(fnTagSetOfTy(nodeTyIxOf(ax))) { lcEscaped[m] = true }
+    const fd = if ax >= 0 && nodeAt(ax) is Ident { identFnDeclOf(ax) } else { -1 }
+    if fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl {
+      lcEscaped[fd] = true
+    }
+  }
+  0
+}
+
+// Whether callee `cf` is a name no declaration binds, or one only a builtin does.
+function lcIdentOpaque(cf: i32): boolean {
+  if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return false }
+  const d = identDeclOf(cf)
+  d == IDENT_BUILTIN || d < 0
+}
+
+// Whether callee `cf` is a method no declared function serves, on a receiver that is no list, map
+// or record, whose methods move values into its slots or call them.
+function lcMemberOpaque(cf: i32): boolean {
+  const cn = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
+  if !(cn is Member) { return false }
+  const rt = nodeTyIxOf(cn.memObj)
+  const r = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
+  !(r is TyArray || r is TyMap || r is TyObj) && identFnDeclOf(cf) < 0
+}
+
+// Whether function `d` escapes to a call the program does not declare (`lcEscapeNote`).
+export function fnEscapes(d: i32): boolean { lcEscaped[d] ?? false }
 
 function lcIsLambdaName(nm: string): boolean {
   nm == "" || (nm.length >= 8 && nm.slice(0, 8) == "__lambda")
