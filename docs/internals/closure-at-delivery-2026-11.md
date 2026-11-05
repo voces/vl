@@ -125,6 +125,28 @@ non-generic D15433 refuses too. So the switch is three readers moving together:
 
 #6338's per-arm minting can be reverted only after all three land.
 
+**As built (2026-11-05, step 2's first PR).** The three readers moved together, with two
+departures from the plan above, both measured:
+
+- *The arm's signature.* `elabNodeTyAt(arm callee, fnIx)` stays the lambda's open type
+  (`(_) => _`) in every frame, so no row keyed by it closes. The arm is keyed by the signature it
+  is called at there: its arguments' types to the call's own (`elabArmSigAt`, emit_elab.vl, which
+  mono and the emitter both read).
+- *The site.* Keyed by the lambda's declaration, two calls of one lambda at one signature in one
+  frame shared a key, though mono can give them different instances (a callback baked into one):
+  `let-hole-lambda-reassigned-fn-param.vl` counted a conflict and called the unbaked instance. The
+  site is the arm's callee read, as `monoBundleReadFe`'s other reads are.
+
+The write sits where the callee is handed its instance, beside `monoNoteOpenArgs` at the
+registry hit and at a new instance (`monoArmRowNote`). `monoLastInstFe` after `monoInstantiate`
+names the last instance minted anywhere under the call, including the generics the new body calls,
+and reading it built `lambda-list-element-called-at-two-function-types.vl` as invalid wasm. The
+emitter stages the row's answer for `elabArmFeOf` around each arm of a dispatch
+(`elabArmStagePush`), and a hole lambda's arm the row does not answer is refused by name.
+
+Over the 3,944 test and corpus files that spell `=>`, the build is byte-identical to master with
+the split plan on and off. D15433 and D15436 print as filed both ways.
+
 ### Matrix
 
 The bundle record is an anonymous record, so its position matrix must include a same-shape
