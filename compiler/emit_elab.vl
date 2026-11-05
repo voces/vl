@@ -10744,6 +10744,12 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
     for h in elabLitHolders(d) {
       for t in elabSlotDeliveriesAt(h, path) { elabRetsAdd(out, t) }
     }
+    // A returned literal is also read where each call of its function is.
+    const rf = elabLitReturnedBy(d)
+    if rf >= 0 {
+      const rseen: i32[] = []
+      elabRetSlotOn(rf, path, out, rseen)
+    }
     // An element or field of an outer literal is delivered where that literal's slot is.
     cwIxWant()
     if (
@@ -11079,6 +11085,33 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
     if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
       elabSlotReadDeliveries(fn.fnParams[ai], path, out, seen)
     }
+  } else if k == CW_UP_RET || k == CW_UP_TAIL {
+    elabRetSlotOn(
+      if k == CW_UP_RET { cwFrameOfDecl(up) } else { up },
+      path,
+      out,
+      seen,
+    )
+  }
+  0
+}
+
+// Adds to `out` where slot `path` of the value function `f` returns is delivered: read at each call
+// of `f`, or handed on from it.
+function elabRetSlotOn(f: i32, path: string[], out: i32[], seen: i32[]) {
+  const key = 0 - 2 - (f * 8 + path.length)
+  if f < 0 || f >= P.nodes.length || i32ListHas(seen, key) || seen.length > 32 {
+    return 0
+  }
+  seen.push(key)
+  const calls: i32[] = []
+  cwFnCalls(f, calls)
+  for c in calls {
+    if c >= 0 && c < P.nodes.length {
+      const r = elabSlotReadUp(c, path)
+      if r >= 0 { elabReadDeliveries(r, out, seen) }
+      elabSlotAliasOn(c, path, out, seen)
+    }
   }
   0
 }
@@ -11093,16 +11126,8 @@ function elabLitHolders(lit: i32): i32[] {
     out.push(cwIxUp[lit])
     return out
   }
-  const rv: i32[] = []
-  const fd = recEnclosingFn(lit)
-  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
-  if !(fn is FuncDecl) || fn.fnBody < 0 { return out }
-  collectRetValues(fn.fnBody, rv)
-  let returned = false
-  for v in rv {
-    if parenPeelIx(v) == lit { returned = true }
-  }
-  if !returned { return out }
+  const fd = elabLitReturnedBy(lit)
+  if fd < 0 { return out }
   const calls: i32[] = []
   cwFnCalls(fd, calls)
   for c in calls {
@@ -11116,6 +11141,19 @@ function elabLitHolders(lit: i32): i32[] {
     }
   }
   out
+}
+
+// The function returning literal `lit` as one of its values, or -1.
+function elabLitReturnedBy(lit: i32): i32 {
+  const fd = recEnclosingFn(lit)
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || fn.fnBody < 0 { return -1 }
+  const rv: i32[] = []
+  collectRetValues(fn.fnBody, rv)
+  for v in rv {
+    if parenPeelIx(v) == lit { return fd }
+  }
+  -1
 }
 
 // Whether `x` reads slot `cp` of binding `o`, itself or through an un-annotated `const` aliasing it.
