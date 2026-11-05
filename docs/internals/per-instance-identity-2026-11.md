@@ -391,7 +391,18 @@ Each slice is graded on every hard control above, with the split plan on and off
    Measured further: with mono keeping a tagged set's cell at the set's type
    (`monoRetypeLamCells`), D15436 at one instance runs. At two it is still invalid wasm, because
    the second instance dispatches to the first instance's lambda arm. So the admission also waits
-   on M3 step 2's per-instance arms. D15434 (the `const`
+   on M3 step 2's per-instance arms.
+
+   Traced (2026-11-05, branch `claude/split-dep-LWM-7`, disassembled): in D15436 both `mk` and
+   `mk$1` call `$__lambda_0$1`, the lambda instanced at `(string) => string`. Dispatch arms are
+   shared nodes: `fnTagCallCopy` hands an instance's clone of the call the template's arm list,
+   not copies. `monoArmLamFe` takes an arm as a lambda arm only while its callee is still
+   unnamed, and the first instance's walk renames that shared callee to its instance. The second
+   instance's walk then reads the renamed slot. Named members do not hit this: `n36` (a generic
+   `id<V>` and a hole `dbl` in the same shape) runs with the plan off at both instances. The mono
+   half of item 1 is a lambda arm instanced per (arm, elaboration instance) instead of renamed in
+   place, read through `elabArmFeOf` (#6336). Cloning a lambda the elaboration keyed under the
+   instance (`elabLamPinsUnderWalk`) changes nothing until that holds. D15434 (the `const`
    spelling) was clause 1 until 4b-i admitted a `const` seed of a captured `let` as the `let`
    spelling (#6330's `ftConstSeedsCell`); both spellings now run with the split plan on and refuse
    loudly with it off, and both close with 4b-ii.
