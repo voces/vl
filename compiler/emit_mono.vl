@@ -17,7 +17,11 @@ import { typeRowClassOf } from "./record_rows"
 import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
-import { ftOwnTyParamHandedBack, ftOwnTyParamSharedBack } from "./check_fn_tag"
+import {
+  ftOwnTyParamHandedBack,
+  ftOwnTyParamSharedBack,
+  ftWithinInstancedFn,
+} from "./check_fn_tag"
 import { elabArmFeOf, elabCallParamBoundTy } from "./emit_elab"
 import {
   mkNumTyped,
@@ -4647,7 +4651,22 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
           fnTagLeafCarry(clone, unwrapParen(argIx))
           fnStmts.push(clone)
           fnParent.push(-1)
-          monoCadNotePinnedLam(unwrapParen(argIx), fnStmts.length - 1, elemTyIx)
+          // The row records the callback at the signature its element type closes, in the
+          // instance whose body is walked.
+          if !cadInBaked {
+            const pinSlot = fnStmts.length - 1
+            const pinSig = monoCadSigOf(
+              pinSlot,
+              [elemTyIx],
+              monoCadCheckedRet(unwrapParen(argIx)),
+            )
+            monoCadRowWrite(
+              elabSrcDecl(unwrapParen(argIx)),
+              cadInstTop(),
+              pinSig,
+              pinSlot,
+            )
+          }
           fnDispNames.push("")
           fnValUsed = true
           fnNestUsed = true
@@ -29160,9 +29179,11 @@ let cadSig: i32[] = []
 let cadFe: i32[] = []
 // The row entries of each creation site, so a write scans only its own site's.
 let cadBySite: {[i32]: i32[]} = Map()
-// Writes whose key already answered another slot, and writes whose signature did not close.
+// Writes whose key already answered another slot, writes whose signature did not close, and
+// writes at no instance for a site declared inside a function mono instances.
 let cadConflicts = 0
 let cadUnkeyed = 0
+let cadInstMissed = 0
 // Each built slot's closed signature, minted once; -1 where it does not close.
 let cadFeSig: {[i32]: i32} = Map()
 // The instance being walked when each per-instance lambda clone is minted.
@@ -29194,6 +29215,8 @@ export function cadRowConflicts(): i32 { cadConflicts }
 
 export function cadRowUnkeyed(): i32 { cadUnkeyed }
 
+export function cadRowInstMissed(): i32 { cadInstMissed }
+
 function cadRowReset() {
   cadSite = []
   cadInst = []
@@ -29202,6 +29225,7 @@ function cadRowReset() {
   cadBySite = Map()
   cadConflicts = 0
   cadUnkeyed = 0
+  cadInstMissed = 0
   cadFeSig = Map()
   cadCloneInst = Map()
   cadDelivery = 0 - 1
@@ -29242,13 +29266,18 @@ function cadPatchPending(nfn: i32) {
   0
 }
 
-// Records that slot `fe` is the closure built for (`site`, `inst`, `sig`). A key already
-// answering another slot counts a conflict and keeps the first answer; -1 `sig` is unkeyed.
+// The row's one writer: records that slot `fe` is the closure built for (`site`, `inst`, `sig`),
+// the caller naming the instance. A key already answering another slot counts a conflict and
+// keeps the first answer; -1 `sig` is unkeyed; -1 `inst` at a site inside an instanced function
+// is counted, since a reader in an instance's body asks for that instance.
 function monoCadRowWrite(site: i32, inst: i32, sig: i32, fe: i32) {
   if site < 0 || fe < 0 { return 0 }
   if sig < 0 {
     cadUnkeyed = cadUnkeyed + 1
     return 0
+  }
+  if inst == -1 && ftWithinInstancedFn(site) {
+    cadInstMissed = cadInstMissed + 1
   }
   const rows = cadBySite.get(site) ?? []
   for r in rows {
@@ -29395,15 +29424,6 @@ function monoCadCheckedRet(d: i32): i32 {
     if elabSigTyClosed(ft.fnRet) { return ft.fnRet }
   }
   -1
-}
-
-// A `.map`/`.filter` callback lambda `arg` cloned into slot `slot` with its parameter at
-// `elemTy`: records it in the row at the signature its own type closes to.
-function monoCadNotePinnedLam(arg: i32, slot: i32, elemTy: i32) {
-  if cadInBaked { return 0 }
-  const ps: i32[] = [elemTy]
-  const sig = monoCadSigOf(slot, ps, monoCadCheckedRet(arg))
-  monoCadRowWrite(elabSrcDecl(arg), cadInstTop(), sig, slot)
 }
 
 // Builds, for each delivery the tag decision recorded as a closure from a one-member set
