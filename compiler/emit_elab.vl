@@ -4472,11 +4472,53 @@ function elabClosedDestTy(ix: i32, p: i32): i32 {
   dt
 }
 
+// The closed function type of the elements of the untagged list `p` pushes read `ix` onto
+// (`xs.push(ix)`) at instance `k`: the element, or where that is open the signature calls through
+// a list binding of its set close (`elabListSigRow`); -1 for any other read or none closing.
+function elabPushDestTy(ix: i32, p: i32, k: i32): i32 {
+  if p < 0 || p >= P.nodes.length || k < 0 { return -1 }
+  const pn = nodeAt(p)
+  if (
+    !(pn is Call)
+    || pn.callArgs.length != 1
+    || parenPeelIx(pn.callArgs[0]) != ix
+  ) {
+    return -1
+  }
+  const cf = nodeAt(parenPeelIx(pn.callFn))
+  if !(cf is Member) || cf.memProp != "push" { return -1 }
+  const lt = elabNodeTy(parenPeelIx(cf.memObj), k)
+  if lt < 0 || lt >= T.tys.length { return -1 }
+  const la = tyAt(lt)
+  if !(la is TyArray) { return -1 }
+  const dt = la.aElem
+  if (
+    dt < 0
+    || dt >= T.tys.length
+    || !(tyAt(dt) is TyFunc)
+    || fnTagTyIsTagged(dt)
+  ) {
+    return -1
+  }
+  if !tyHasTyVar(dt) && !tyReachesHole(dt, 8) { return dt }
+  // An open element is the signature calls through a list binding of the holder's set close.
+  const hs = fnTagSetOfTy(dt)
+  if hs < 0 || fnTagSetIsTagged(hs) { return -1 }
+  elabListSigOfSet.get(hs) ?? -1
+}
+
 // Whether read `ix` of parameter `pd` of instance `k`'s function, handed as `p`'s argument to a
 // closed function type, delivers the closure there of the one named member of the set the
 // instance binds `pd` to, the same at every instance; it records that delivery (D6741).
 function elabCloNoteAt(ix: i32, p: i32, pd: i32, k: i32): boolean {
-  const dt = elabClosedDestTy(ix, p)
+  let dt = elabClosedDestTy(ix, p)
+  if dt < 0 {
+    dt = elabPushDestTy(ix, p, k)
+    // A guess's or a representation's key is no instance a value reaches: its push is no delivery.
+    if dt >= 0 && ((elabGuessKeys[k] ?? false) || (elabReprKeys[k] ?? false)) {
+      return true
+    }
+  }
   if dt < 0 || pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) {
     return false
   }
@@ -7286,6 +7328,7 @@ export function elabRun() {
   elabCandKeys = Map()
   elabPerEnclDecls = Map()
   elabListSigRows = []
+  elabListSigOfSet = Map()
   elabListSigNames = []
   elabListSigTys = []
   elabListSigReps = []
@@ -8343,6 +8386,8 @@ function elabListSigRow(ix: i32, names: string[], tys: i32[], rep: i32[]) {
         out[j] = mkArrayTy(sig)
         elabListSigFound.push(s)
         elabListSigFoundTy.push(sig)
+        const had = elabListSigOfSet.get(s) ?? -2
+        elabListSigOfSet[s] = if had == -2 || had >= 0 && tySame(had, sig) { sig } else { -1 }
         moved = true
       }
     }
@@ -8367,6 +8412,10 @@ function elabListSigRow(ix: i32, names: string[], tys: i32[], rep: i32[]) {
   elabReachNote(-1, k, -1)
   elabSettle(0)
 }
+
+// Each untagged set `elabListSigRow` found a list binding of it called at one signature through,
+// and that signature; -1 for a set two lists of which are called at two.
+let elabListSigOfSet: {[i32]: i32} = Map()
 
 // The sets `elabListSigRow` found a list signature for, in its current row, and each signature.
 let elabListSigFound: i32[] = []
