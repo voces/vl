@@ -1065,6 +1065,87 @@ No dependent would turn into a miscompile if the plan were deleted today: H-choi
 
 ---
 
+### 3.3 Retiring the flow table, reader by reader (proposal, 2026-11-05)
+
+`fn_flow_shadow.vl` (139 functions) is the last producer of function-value facts outside the
+elaboration. It is a union-find over the checked tree's bindings. Each class records the functions
+that flow in (sources) and the closed signatures it is called or annotated at (pins). Mono reads it
+through 32 entries from 48 functions. The cad lane's coverage probe hit 138 of the 139 functions
+over 23,803 programs, so there is no dead code to plan around.
+
+**What the table carries, measured.** On master `63dae4dc` (fixpoint seed), each group of entries
+was cut to its no-table answer, and the 5,792 `tests/cases` files marked `@run` were run before
+and after. A file counts as moved if its output changed.
+
+| group | entries | mono readers | files moved | of which print nothing |
+| --- | --- | --- | --- | --- |
+| whole table (`fnFlowTableBuild` skipped) | 32 | 48 | 135 | 121 |
+| sources and writes | `fnFlowDeclWritten`, `fnFlowReadWritten`, `fnFlowReadGenFn`, `fnFlowDeclPathSrcs`, `fnFlowDeclPathHeldSrcs` | 13 | 47 | 47 |
+| pins | the 13 `fnFlow*Pin*` entries, plus `fnFlowDeclPathUncalled` | 24 | 84 | 70 |
+| hole-lambda chains | `fnFlowLamPin`, `fnFlowAliasLam`, `fnFlowCellLam`, `fnFlowRespellLam` | 7 | 7 | 7 |
+
+- The groups overlap only between sources and pins (14 files). Together they cover 119 of the
+  whole-table population's 135.
+- The other 16 move only when the table is not built at all. They are reached through
+  `fnFlowDeclFn`, `fnFlowStageInstHoles` and the slice helper.
+- 108 of the 135 are under `closures/`.
+
+**What the elaboration already records for each group.**
+
+- **Sources and writes.**
+  - The write index (`cwBindingWrittenValues`, check_write_scan.vl) answers whether an `=` writes
+    a binding and with what.
+  - `fnTagSharedArgDecl` follows the same un-annotated `const` alias chain that `fnFlowReadGenFn`
+    does.
+  - A slot's held functions are the members of the set its type carries
+    (`fnTagMembers(fnTagSetOfTy(..))`), now including the joins at a shared type parameter
+    (`fnTagCallJoinOf`) and at a list, record or map slot.
+  - The one gap is the capture cell (`let d = [v]`, `d[0] = v`). The cell is built after the check
+    by emit_collect's rewrite, so the write index never sees it. Either the rewrite records its
+    cells as writes, or the cell reads its binding's set.
+- **Hole-lambda chains.**
+  - The elaboration instances a hole lambda at each closed signature a call through its set
+    takes (hole rows, `elabHolePinNote`).
+  - The four entries name a lambda through `const` and `let` chains and capture cells, so that
+    mono can find the instance. The elaboration resolves the same chain at the call, so the
+    instance is the hole row keyed at the callee's set. The cell is the gap again.
+- **Pins.** A pin is a closed parameter list some call or annotated destination delivers a slot's
+  value at. The elaboration has these facts per instance, not per class:
+  - each call's bound parameter types (`elabCallParamTy`, `elabNodeTy(ix, k)`);
+  - each member's instance at those types (`elabMemberKeyAt(d, pTys)`);
+  - each closure delivery at a closed type (`mintCloDeliveryNote`).
+
+  An agreed pin (`fnFlowDeclPathAgreedPinTys`, `fnFlowDeclPathOnlyPinCall`) is then "every member
+  of the slot's set has one instance key". The per-call pins (`fnFlowDeclPathPinTysAt`,
+  `fnFlowCallPath*`) are that call's instance types. Annotation pins (`fnFlowDeclPathPinRets`,
+  `fnFlowCallPathAnnPinTys`) need the delivery types recorded with a result, which today's
+  delivery rows do not carry. `fnFlowDeclPathUncalled` is "no member has an instance and the set
+  escapes nowhere". That needs an escape fact the elaboration does not have yet.
+
+**Order.** Each step cuts its readers to the elaboration's answer, grades the cut at 0 movers with
+the split plan on and off (the byte-diff sweep, error fixtures included), then deletes the
+entries.
+
+1. **Hole-lambda chains** (7 files, no overlap). The readers become hole-row lookups keyed by the
+   callee's set. The capture cell is settled here, which the sources step reuses.
+2. **Sources and writes** (47 files). `fnFlowDeclWritten` and `fnFlowReadWritten` move to the write
+   index. `fnFlowReadGenFn` moves to `fnTagSharedArgDecl`. `fnFlowDeclPathSrcs` and
+   `fnFlowDeclPathHeldSrcs` move to the members of the slot type's set. The 14 files shared with
+   pins are graded again in step 3.
+3. **Pins**, by reader family, smallest population first:
+   1. agreed and only-call pins, read off member instance keys;
+   2. the per-call pins `monoRetypePinCalls` and `monoHoleOwnCallsDiffer`, read off the call's
+      instance types;
+   3. the slot pins `monoPinListElems`, `monoStoredSlotFnTy`, `monoFlowSlotPins` and
+      `monoDeclPathKeys`. This is the (γ) e/f population in §3.1; its open rows go first;
+   4. annotation pins, once a delivery row records its result;
+   5. `fnFlowDeclPathUncalled`, once an escape fact exists.
+
+   Each family is measured alone by its own cut before it is scheduled.
+4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
+   `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
+   `fnFlowStageInstHoles` go with the file.
+
 ## 4. Scoreboard
 
 The scoreboard reports side effects of the migration; it is not a landing criterion (§3).
