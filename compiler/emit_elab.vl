@@ -91,6 +91,7 @@ import {
   CW_UP_COAL,
   CW_UP_ELEM,
   CW_UP_FIELD,
+  CW_UP_ITER,
   CW_UP_LETINIT,
   CW_UP_OBJ,
   CW_UP_RET,
@@ -10737,8 +10738,15 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
   // A list or record literal is delivered where the bindings holding it are.
   const dn = nodeAt(d)
   if dn is ArrayLit || dn is ObjLit {
+    // The literal's own type is a delivery unless only un-annotated functions fill the slot: their
+    // type there is inferred, not delivered.
     const lt = elabSlotTyOf(nodeTyIxOf(d), path)
-    if lt >= 0 && tyAt(lt) is TyFunc && elabLitSlotDepth == 0 {
+    if (
+      lt >= 0
+      && tyAt(lt) is TyFunc
+      && elabLitSlotDepth == 0
+      && !elabLitSlotAllHole(d, path, 0)
+    ) {
       elabRetsAdd(out, lt)
     }
     for h in elabLitHolders(d) {
@@ -11085,6 +11093,16 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
     if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
       elabSlotReadDeliveries(fn.fnParams[ai], path, out, seen)
     }
+  } else if k == CW_UP_ITER && un is ForIn && path.length > 0 {
+    // A loop over a list binds its element, over a map its value.
+    const b = if path[0] == "e" { un.fiDecl1 } else if path[0] == "v" { un.fiDecl2 } else { -1 }
+    const rest: string[] = []
+    let j = 1
+    while j < path.length {
+      rest.push(path[j])
+      j = j + 1
+    }
+    if b >= 0 { elabLoopVarDeliveries(b, rest, out, seen) }
   } else if k == CW_UP_RET || k == CW_UP_TAIL {
     elabRetSlotOn(
       if k == CW_UP_RET { cwFrameOfDecl(up) } else { up },
@@ -11092,6 +11110,34 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
       out,
       seen,
     )
+  }
+  0
+}
+
+// Adds to `out` where slot `path` of loop variable `b` is delivered. Its reads come from the write
+// index, since a rewrite of the loop body can name another declaration for them.
+function elabLoopVarDeliveries(
+  b: i32,
+  path: string[],
+  out: i32[],
+  seen: i32[],
+) {
+  const key = b * 8 + path.length
+  if i32ListHas(seen, key) || seen.length > 32 { return 0 }
+  seen.push(key)
+  const ow = cwOccWalk(b)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if (
+      cwIxKind[ow.row] == CW_OCC_USE
+      && u >= 0
+      && u < P.nodes.length
+      && u != b
+    ) {
+      const r = elabSlotReadUp(u, path)
+      if r >= 0 { elabReadDeliveries(r, out, seen) }
+      if path.length > 0 { elabSlotAliasOn(u, path, out, seen) }
+    }
   }
   0
 }
@@ -11141,6 +11187,30 @@ function elabLitHolders(lit: i32): i32[] {
     }
   }
   out
+}
+
+// Whether every value at slot `path` of literal `lit` names an un-annotated function; false where
+// the slot holds none or a step leaves the literals.
+function elabLitSlotAllHole(lit: i32, path: string[], at: i32): boolean {
+  const v = parenPeelIx(lit)
+  if v < 0 || v >= P.nodes.length { return false }
+  if at >= path.length { return holeFnArgDecl(v) >= 0 }
+  const n = nodeAt(v)
+  const st = path[at]
+  const vals: i32[] = []
+  if st == "e" && n is ArrayLit {
+    for e in n.arrElems { vals.push(e) }
+  } else if n is ObjLit && st.length > 2 && st.slice(0, 2) == "f." {
+    for f in n.objFields {
+      const fi = nodeAt(f)
+      if fi is FieldInit && "f." + fi.fiName == st { vals.push(fi.fiValue) }
+    }
+  }
+  if vals.length == 0 { return false }
+  for x in vals {
+    if !elabLitSlotAllHole(x, path, at + 1) { return false }
+  }
+  true
 }
 
 // The function returning literal `lit` as one of its values, or -1.
