@@ -185,7 +185,6 @@ import {
   tyHasLitLeaf,
   tyHoldsObj,
   tyIsLitUnion,
-  tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsMap,
   tyIsOneStrLit,
@@ -754,7 +753,6 @@ import {
   tyStepElem,
 } from "./tyquery"
 import {
-  isValueUnionTyOr,
   nameIsLitUnionType,
   nulNumScalarUnionName,
   nulNumScalarUnionRowTy,
@@ -1369,13 +1367,6 @@ function monoArmCount(wide: string): i32 {
   arms.length
 }
 
-// Whether arena type `ty` renders with more than one top-level arm: a union or a nullable.
-function monoTyIsUnionShaped(ty: i32): boolean {
-  if ty < 0 { return false }
-  const t = tyAt(ty)
-  t is TyUnion || t is TyNullable
-}
-
 // The pin a narrowed argument at `ax` wants, given the pin `wide` the annotation ladder
 // chose — else "" (the ladder's answer stands). A pin becomes the instance's parameter
 // annotation, so it is safe exactly where a non-generic function carrying that annotation
@@ -1392,11 +1383,7 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   // reaches the membership test looking like a match on both sides, and the pin then
   // drops from the interned atom to a string ref. `tyRenderSoftensLits` is the home for
   // that hazard, and a litunion argument's pin is claimed by the litunion rungs anyway.
-  if tyRenderSoftensLits(nt) {
-    const ln = monoNarrowedLitPinName(nt, wide)
-    if ln != "" { return ln }
-    return monoNarrowedNonNullPinName(nt, wide)
-  }
+  if tyRenderSoftensLits(nt) { return monoNarrowedLitPinName(nt, wide) }
   // A record renders as a brace span, so it can be an arm of `wide` only when `wide` holds a
   // brace; the render doubles with each nested level of a shared shape, so it is skipped (D2780).
   if monoTyIsObj(nt) && !strContains(wide, "{") {
@@ -1462,61 +1449,6 @@ function monoNulRecNamesNarrow(nt: i32, wide: string): boolean {
   false
 }
 
-// The pin of a value union `nt` holding literal arms, read out of the nullable union `wide` with
-// only its `null` narrowed away: `wide`'s spelling less `null`, registered as the row `nt` is,
-// else "". The render of `nt` softens its literals, so the arms are compared as `wide` spells
-// them (D8281).
-function monoNarrowedNonNullPinName(nt: i32, wide: string): string {
-  if nt < 0 || !(tyAt(nt) is TyUnion) || tyIsLitUnion(nt) { return "" }
-  const wa: string[] = []
-  unionArmsOf(wide, wa)
-  let hasNull = false
-  let base = ""
-  for a in wa {
-    if a == "null" {
-      hasNull = true
-    } else {
-      if base != "" { base = base + "|" }
-      base = base + a
-    }
-  }
-  if !hasNull || base == "" || wa.length < 3 { return "" }
-  let arms = monoUnionArmCount(nt, TY_WALK_DEPTH)
-  if arms < 0 { return "" }
-  if monoUnionStrLitCount(nt, TY_WALK_DEPTH) > 0 { arms = arms + 1 }
-  if arms != wa.length - 1 { return "" }
-  if monoRegisterPinUnion(base, nt) < 0 { return "" }
-  if monoAnnPinName(base) != base { return "" }
-  base
-}
-
-// The arms union `ty` renders, less its string literals, which the render softens into one
-// `string` arm: a nested union's flattened, a literal-union alias as one. -1 past `depth`.
-function monoUnionArmCount(ty: i32, depth: i32): i32 {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return -1 }
-  const t = tyAt(ty)
-  if t is TyLit && t.litKind == "str" { return 0 }
-  if !(t is TyUnion) || tyIsLitUnionAlias(ty) { return 1 }
-  let n = 0
-  for m in t.uMembers {
-    const k = monoUnionArmCount(m, depth - 1)
-    if k < 0 { return -1 }
-    n = n + k
-  }
-  n
-}
-
-// The string literals `monoUnionArmCount` leaves out of the union `ty`.
-function monoUnionStrLitCount(ty: i32, depth: i32): i32 {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
-  const t = tyAt(ty)
-  if t is TyLit && t.litKind == "str" { return 1 }
-  if !(t is TyUnion) || tyIsLitUnionAlias(ty) { return 0 }
-  let n = 0
-  for m in t.uMembers { n = n + monoUnionStrLitCount(m, depth - 1) }
-  n
-}
-
 // The narrowed pin of a literal-union argument: its alias, when that alias is a member of the
 // union `wide` the ladder chose, so `T` pins at the atom the checker typed the argument at,
 // not at the box that holds it (D3098). "" otherwise.
@@ -1542,31 +1474,6 @@ function monoLoopVarRecordPin(ix: i32, fnIx: i32): string {
     return ""
   }
   monoAnnPinNameOfTy(t)
-}
-
-// The union name a pin can carry for the node at `ix`, or "". The render, then the
-// registry: `tyToEmitName` spells a declared alias as its member set while
-// `monoAnnPinName`'s union-alias rung reads the alias's key, so `unRowOfTyKey` keys the
-// registry on the type's literal-preserving key instead of on a spelling. D1516.
-function monoUnionPinName(ix: i32): string {
-  monoUnionPinNameOfTy(nodeTyIxOf(ix))
-}
-
-// `monoUnionPinName` over arena type `ty`, or "".
-function monoUnionPinNameOfTy(ty: i32): string {
-  if ty < 0 { return "" }
-  const r = monoAnnPinNameOfTy(ty)
-  if r != "" { return r }
-  const ur = unRowOfTyKey(ty)
-  if ur >= 0 && ur < unNames.length { return monoAnnPinName(unNames[ur]) }
-  // An inferred value union nothing spells (an if-expression argument's join) has no row
-  // until a pin mints one, as a binding of the same join registers its own (D2824).
-  const vn = monoRegisterValueUnion(ty)
-  if vn != "" {
-    const vr = monoAnnPinName(vn)
-    if vr != "" { return vr }
-  }
-  ""
 }
 
 // Registers the row of value union `ty`, returning its name, or "" when it is no value union or
@@ -2041,31 +1948,6 @@ function monoClosedTyName(ty: i32): string {
   ""
 }
 
-// The union pin of a `??` at `ix` whose recorded join is a value union, or "".
-function monoCoalJoinPinName(ix: i32): string {
-  if ix < 0 { return "" }
-  const n = nodeAt(ix)
-  if !(n is BinExpr) { return "" }
-  if n.binOp != "??" { return "" }
-  const t = nodeTyIxOf(ix)
-  if t < 0 || !(tyAt(t) is TyUnion) || isValueUnionTyOr(t) != 1 { return "" }
-  monoUnionPinName(ix)
-}
-
-// The join of a `??` at `ix` typed at a hole that instance `fnIx` binds to a union or a nullable:
-// the row the collect pass registered for it, or "".
-function monoHoleCoalPinName(ix: i32, fnIx: i32): string {
-  if ix < 0 { return "" }
-  const n = nodeAt(ix)
-  if !(n is BinExpr) { return "" }
-  if n.binOp != "??" { return "" }
-  const t = nodeTyIxOf(ix)
-  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyVar) { return "" }
-  const p = nodeTyInOf(ix, fnIx)
-  if p < 0 || p == t || !monoTyIsUnionShaped(p) { return "" }
-  monoUnionPinNameOfTy(p)
-}
-
 // Whether `ix` is an `Ident` the checker resolved to a declaration other than a function's: a
 // parameter, a binding or a loop variable, which shadows any function of its name.
 function monoIdentReadsValue(ix: i32): boolean {
@@ -2115,10 +1997,6 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   // `nodeTyIsStringPrim` reads the `TyPrim` variant and its `primName` directly, and being
   // `TyPrim`-only is the narrowing to watch — a literal union canon-softens to `string`.
   if nodeTyIsStringPrim(unwrapParen(ix)) { return "string" }
-  // A `??` joining into a value union is built as that union's box; the string and scalar
-  // rungs below would pin its left side's type.
-  const cjp = monoCoalJoinPinName(cax)
-  if cjp != "" { return cjp }
   if exprString(ix, fnIx) { return "string" }
   if exprStringArray(ix, fnIx) {
     // A `(string | null)[]` shares the string list's rep exactly, so the rep cascade cannot
@@ -2170,15 +2048,8 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     if nodeTyArrayElemIsBoolPrim(ix) { return "boolean[]" }
     return "i32[]"
   }
-  if exprUnion(ix, fnIx) {
-    // D1516 — the union floor owes the arena one question first, exactly as the struct
-    // floor below already asks it: every arm above resolves a union from a binding, so a
-    // projection has no channel at all. At the floor, so it re-pins nothing the ladder
-    // resolved, and through `monoAnnPinName`, the one pin membership list.
-    const upn = monoUnionPinName(unwrapParen(ix))
-    if upn != "" { return upn }
-    return ""
-  }
+  // A union no arm above resolved has no pin; the elaboration closes projections upstream.
+  if exprUnion(ix, fnIx) { return "" }
   if exprNullableStruct(ix, fnIx) {
     // The nullable-struct floor owes the arena the same question D1516 gave the union floor
     // above it: every arm before this resolves a binding, so an if-expression or any other
@@ -2195,12 +2066,6 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   if nodeTyIsNullable(unwrapParen(ix)) {
     const nulPin = monoAnnPinNameOfTy(nodeTyIxOf(unwrapParen(ix)))
     if nulPin != "" { return nulPin }
-  }
-  // A boxed union no binding arm resolves, a `for` walk's variable among them, pins at its
-  // recorded union: the variant and scalar rungs below would pin one member's rep (D3071).
-  if nodeTyIsUnionish(cax) && numLitUnionBaseName(nodeTyAt(cax, fnIx)) == "" {
-    const wun = monoUnionPinName(cax)
-    if wun != "" { return wun }
   }
   // A walk variable the checker typed as a record: the struct and variant rungs below read its
   // rep from the locals table, which mid-mono has none, and would pin `i32` (D3139).
@@ -2510,16 +2375,9 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
         if isSName(fnm) { return fnm }
       }
     }
-    // D1516 — the union-valued field, whose companion column is a member set rather than a
-    // struct name, so the code-15 rung above cannot carry it. Asked here, gated to a union
-    // so no struct / list / scalar pin is touched, and through `monoAnnPinName` so the
-    // answer is a spelling an annotated parameter already lowers.
+    // A union-valued field, whose companion column is a member set rather than a struct name.
     const fur = monoProjectedUnionRowPin(cax, fnIx)
     if fur != "" { return fur }
-    if nodeTyIsUnionish(cax) {
-      const mun = monoUnionPinName(cax)
-      if mun != "" { return mun }
-    }
   }
   monoArgTyNameRep(ix, fnIx, cax)
 }
@@ -2913,8 +2771,6 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
   }
   // An `i32` niche, a nullable literal union or `boolean | null`: the annotation's name and the
   // scalar cascade both name its raw `i32`, or its non-null half (D2998, D2985).
-  const hcp = monoHoleCoalPinName(cax, fnIx)
-  if hcp != "" { return hcp }
   const nluTy = argNichePinTyOf(cax, fnIx)
   if nluTy >= 0 {
     const nluName = tyToEmitName(nluTy)
