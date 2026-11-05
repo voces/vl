@@ -3,6 +3,7 @@
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
 import { cwIxCovers } from "./check_write_scan"
+import { recFieldTyOf } from "./emit_rec_field_codes"
 import { monoIsGenericDecl } from "./emit_base"
 import { tyParamIsBareOnly } from "./check_scopes"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
@@ -4046,21 +4047,38 @@ function elabParamSeedsListSlot(ix: i32, p: i32, fn: FuncDecl): i32 {
   if d < 0 { return -1 }
   const dn = nodeAt(d)
   if !(dn is LetDecl) || dn.letKw != "const" && !cwLetUnwritten(d) { return -1 }
+  if !elabSlotValuesOk(d, "[]", ix, fn) || !elabSlotReadsOk(d, "[]", fn) {
+    return -1
+  }
+  d
+}
+
+// Whether every value stored at slot `nm` (a field name, or "[]" for an element) of binding `d`,
+// one written after its literal, is `ix`, a named function or a parameter of `fn`.
+function elabSlotValuesOk(d: i32, nm: string, ix: i32, fn: FuncDecl): boolean {
   cwIxWant()
   const vals: i32[] = []
   const ats: i32[] = []
-  if cwSlotWrittenValues(cwKeyOfDecl(d), ["[]"], vals, ats) < 1 { return -1 }
+  if cwSlotWrittenValues(cwKeyOfDecl(d), [nm], vals, ats) < 1 { return false }
   for v in vals {
     const vx = parenPeelIx(v)
     if vx != ix {
-      if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) { return -1 }
+      if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) {
+        return false
+      }
       const vd = identDeclOf(vx)
-      if vd < 0 || vd >= P.nodes.length { return -1 }
+      if vd < 0 || vd >= P.nodes.length { return false }
       const vn = nodeAt(vd)
       const named = vn is FuncDecl && vn.fnName != ""
-      if !named && !i32ListHas(fn.fnParams, vd) { return -1 }
+      if !named && !i32ListHas(fn.fnParams, vd) { return false }
     }
   }
+  true
+}
+
+// Whether every read of binding `d` in `fn`'s body, none nested, is its slot `nm` (a field name,
+// or "[]" for an element) called in place or assigned to.
+function elabSlotReadsOk(d: i32, nm: string, fn: FuncDecl): boolean {
   const work: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
   const gpar: i32[] = [-1]
@@ -4073,16 +4091,21 @@ function elabParamSeedsListSlot(ix: i32, p: i32, fn: FuncDecl): i32 {
     if x >= 0 && x < P.nodes.length {
       const xn = nodeAt(x)
       if xn is Ident && identDeclOf(x) == d {
-        if nested || q < 0 || g < 0 { return -1 }
+        if nested || q < 0 || g < 0 { return false }
         const qn = nodeAt(q)
         const gn = nodeAt(g)
-        if !(qn is Index) || qn.idxArr != x { return -1 }
+        const elem = nm == "[]" && qn is Index && qn.idxArr == x
+        const field = nm != "[]"
+          && qn is Member
+          && qn.memObj == x
+          && qn.memProp == nm
+        if !elem && !field { return false }
         const called = gn is Call && parenPeelIx(gn.callFn) == q
         const stored = gn is BinExpr
           && gn.binOp == "="
           && gn.binCompound == ""
           && gn.binLeft == q
-        if !called && !stored { return -1 }
+        if !called && !stored { return false }
       }
       for c in nodeChildren(x) {
         work.push(c)
@@ -4092,6 +4115,59 @@ function elabParamSeedsListSlot(ix: i32, p: i32, fn: FuncDecl): i32 {
       }
     }
   }
+  true
+}
+
+// The `const`, or `let` nothing re-points, of `fn` whose record literal holds parameter read `ix`
+// at field `fld[0]`, or whose field `ix` is assigned to by `p`, where every value the field holds is
+// a named function or a parameter of `fn`, one written after the literal, and every read, none
+// nested, is that field called in place or assigned to (D15455); -1 otherwise.
+function elabParamSeedsRecField(
+  ix: i32,
+  p: i32,
+  fn: FuncDecl,
+  fld: string[],
+): i32 {
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const pn = nodeAt(p)
+  let d = -1
+  let nm = ""
+  if (
+    pn is BinExpr
+    && pn.binOp == "="
+    && pn.binCompound == ""
+    && parenPeelIx(pn.binRight) == ix
+  ) {
+    const l = nodeAt(parenPeelIx(pn.binLeft))
+    const a = if l is Member { parenPeelIx(l.memObj) } else { -1 }
+    if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident && l is Member {
+      d = identDeclOf(a)
+      nm = l.memProp
+    }
+  } else if pn is FieldInit && parenPeelIx(pn.fiValue) == ix {
+    nm = pn.fiName
+    const todo: i32[] = [fn.fnBody]
+    while todo.length > 0 && d < 0 {
+      const x = todo.pop() ?? -1
+      if x >= 0 && x < P.nodes.length {
+        const xn = nodeAt(x)
+        const li = if xn is LetDecl { parenPeelIx(xn.letInit) } else { -1 }
+        const ol = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { xn }
+        if ol is ObjLit && i32ListHas(ol.objFields, p) { d = x }
+        for c in nodeChildren(x) { todo.push(c) }
+      }
+    }
+  }
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letType >= 0 { return -1 }
+  if dn.letKw != "const" && !cwLetUnwritten(d) { return -1 }
+  const li = parenPeelIx(dn.letInit)
+  if li < 0 || li >= P.nodes.length || !(nodeAt(li) is ObjLit) { return -1 }
+  if !elabSlotValuesOk(d, nm, -1, fn) || !elabSlotReadsOk(d, nm, fn) {
+    return -1
+  }
+  fld.push(nm)
   d
 }
 
@@ -4602,6 +4678,18 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
         const ws = if la is TyArray { fnTagSetOfTy(la.aElem) } else { -1 }
         if ss >= 0 && ws >= 0 {
           mintSeedNote(decl, i32ListIndexOf(dn.fnParams, pd), ss, ls, ws)
+          return 0
+        }
+      }
+      // So does a record it seeds whose field is written only with named functions or parameters
+      // (D15455).
+      const rfld: string[] = []
+      const rs = elabParamSeedsRecField(ix, p, dn, rfld)
+      if rs >= 0 {
+        const ss = fnTagSetOfTy(elabNodeTy(ix, k))
+        const ws = fnTagSetOfTy(recFieldTyOf(elabNodeTy(rs, k), rfld[0]))
+        if ss >= 0 && ws >= 0 {
+          mintSeedNote(decl, i32ListIndexOf(dn.fnParams, pd), ss, rs, ws)
           return 0
         }
       }
