@@ -138,6 +138,8 @@ import {
   mintFactSetOf,
   mintFactSplits,
   mintNestedPerEnclOf,
+  mintParamHeldOf,
+  mintParamHeldSets,
   mintParamSetsOf,
   mintParamTakes,
   mintRetParamsOf,
@@ -360,6 +362,16 @@ export function fnTagDecide(rootIx: i32) {
       if s >= 0 && one == (pass == 1) && !i32ListHas(seen, s) {
         seen.push(s)
         ftTry(rootIx, s, calls, mint)
+      }
+    }
+    // After the elaboration, a set every instance binds a parameter to, which a copy of it may
+    // store (D15432).
+    if ftLate && pass == 1 {
+      for s in mintParamHeldSets() {
+        if !i32ListHas(seen, s) {
+          seen.push(s)
+          ftTry(rootIx, s, calls, mint)
+        }
       }
     }
     // After the elaboration, a set an instance delivers to a closed function type, called or not.
@@ -2935,7 +2947,14 @@ function ftParamStored(f: FuncDecl, par: i32): boolean {
           }
         }
         // A list holding it, copied element by element into a closed holder (D15131).
-        if i32ListHas(lists, d) && pn is Member && fvaListCopyAt(p) {
+        // One every instance binds to one set is copied through its adapter's call, at each
+        // instance's own id (D15432).
+        if (
+          i32ListHas(lists, d)
+          && pn is Member
+          && fvaListCopyAt(p)
+          && !(ftLate && mintParamHeldOf(par) >= 0)
+        ) {
           return true
         }
       }
@@ -2943,6 +2962,37 @@ function ftParamStored(f: FuncDecl, par: i32): boolean {
         xs.push(k)
         ps.push(x)
       }
+    }
+  }
+  false
+}
+
+// Whether `f`'s body copies a `const` list literal holding a read of parameter `par` element by
+// element into a closed holder (D15131), the store D15432's adapter makes through each element.
+export function ftParamListCopied(f: FuncDecl, par: i32): boolean {
+  const lists: i32[] = []
+  const xs: i32[] = [f.fnBody]
+  while xs.length > 0 {
+    const x = xs.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is LetDecl && ftLitHoldsParam(f, xn.letInit, par) { lists.push(x) }
+      nodeChildrenPush(x, xs)
+    }
+  }
+  if lists.length == 0 { return false }
+  const ys: i32[] = [f.fnBody]
+  while ys.length > 0 {
+    const y = ys.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      const yn = nodeAt(y)
+      if yn is Member && fvaListCopyAt(y) {
+        const o = parenPeelIx(yn.memObj)
+        if o >= 0 && nodeAt(o) is Ident && i32ListHas(lists, identDeclOf(o)) {
+          return true
+        }
+      }
+      nodeChildrenPush(y, ys)
     }
   }
   false
