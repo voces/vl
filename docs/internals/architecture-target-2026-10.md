@@ -991,9 +991,13 @@ Giving each parameter a fresh type parameter (`f<F, F__1>`) instead of a hole tu
 handed generics into a refusal, which the hole spelling runs.
 
 The slice deletes no mono rule yet. Measured over the `@run` files, with the split plan on:
-- D6090's keep-own-pin is still reached by D6240's swapped-recursion files. The split cannot take
-  a permuting recursion until D15406 is fixed: a swap of a tagged and an untagged generic is keyed
-  as one instance, and is invalid wasm on master.
+- Since #6340 (D15406) and the recursion slice (D15405), D6090's keep-own-pin is reached by one
+  file, `generic-fn-value-type-param-params-swapped-into-other-generic`. Its forwarded parameters
+  are handed to another generic of the same shape. That same file is the last that needs
+  `monoFwdCarriedRewrite`'s rename to a generic's name.
+  - The split takes a function's own permuting recursion. A hand to another generic's group stays
+    shared, because its hole spelling refuses with the plan on.
+  - Both rules go when an argument is emitted at the callee instance's own slot rep.
 - The set pin through `fnTagOwnTyParamShared` fell from 12 files to 7: written copies, swaps and
   aliases.
 - The copy pin in `monoLetTyParamMisfit` is still reached by 11 files.
