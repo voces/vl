@@ -169,8 +169,11 @@ entry.vl:
 
 Over the 3,944 files: 0 conflicts; 16 unkeyed writes in 8 files; 116 writes at no instance in 30
 files, every one a lambda instance whose template was never cloned (`monoCadNoteInstance`).
-Deriving those from the frame the slot hangs under moves the bytes of 2 files that print the
-same, so some reader reads them. That is a behaviour change, made separately.
+**Fourth PR (2026-11-05).** A lambda instance whose template was never cloned takes the instance
+of the frame its slot hangs under. That leaves 10 writes at no instance in 4 files, with the
+build byte-identical with the plan on and off, so no reader in the 3,944 files reads those
+entries. An earlier reading of 2 movers was a comparison against a seed missing another lane's
+merged change.
 
 ### Matrix
 
