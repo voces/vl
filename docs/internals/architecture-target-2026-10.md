@@ -354,6 +354,22 @@ rule and the call rule are written once.
 - A literal's contextual type is computed the same way whether the destination is annotated or inferred
   (rulings B′+C). That is what deletes ExpCtx, rather than requiring annotations to replace it.
 
+**A type parameter several set arguments bind is bound to their joined set.** When one type
+parameter annotates several parameters and a call hands each a function set (`one<F>(a: F, c: F)`
+called `one(id, dup)`), the elaboration binds that type parameter, for that call's instance, to the
+union of the sets the arguments carry (`{id, dup}`), not to the first argument's set. An argument
+is then delivered as the id it already holds: an id is its member's declaration (`ftScan`'s ids,
+which `emitFnTagDispatch` compares against each member's declaration), so a member's id is the same
+in every set holding it and the delivery converts nothing. The one fact is the elaboration's
+binding of the type parameter at the call (`elabSetArgBind`'s tagged branch, widened from one
+argument's set to the join); the tag decision tags the joined set with each argument's set decided
+with it (`ftSubNeed`), and mono pins the parameter at the binding it reads (`monoArgTaggedSetTy`
+over the elaboration's type, with no rule of its own). This is the shape the four annotated-parameter
+gates (`fnTagOwnTyParamAlone`, `fnTagOwnTyParamShared`, `ftOwnTyParamHandedBack`,
+`ftOwnTyParamSharedBack`) each test for one case: a joined set of one argument is that argument's
+set, so each gate's witness is a joined-set binding of one member, and the gates collapse into it
+once it holds.
+
 ### 2.5 Alternatives rejected
 
 | Alternative | Why rejected |
