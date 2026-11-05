@@ -98,6 +98,7 @@ import {
   cwIxUpAux,
   cwIxUpKind,
   cwIxWant,
+  cwKeyOfDecl,
   cwLetUnwritten,
   cwLetWrittenInClosure,
   cwOccNext,
@@ -3974,6 +3975,83 @@ function elabParamFeedsWritten(ix: i32, p: i32, fn: FuncDecl, k: i32): i32 {
   d
 }
 
+// The `const`, or `let` nothing re-points, of `fn` whose list literal `p` holds parameter read `ix`,
+// or whose element `ix` is assigned to by `p`, where every value its slots hold is a named function
+// or a parameter of `fn`, one written after the literal, and every read, none nested, is an element
+// called in place or an element assignment's target; -1 otherwise.
+function elabParamSeedsListSlot(ix: i32, p: i32, fn: FuncDecl): i32 {
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const pn = nodeAt(p)
+  let d = -1
+  if pn is BinExpr && pn.binOp == "=" && parenPeelIx(pn.binRight) == ix {
+    const l = nodeAt(parenPeelIx(pn.binLeft))
+    const a = if l is Index { parenPeelIx(l.idxArr) } else { -1 }
+    if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { d = identDeclOf(a) }
+    if d < 0 || d >= P.nodes.length { return -1 }
+  } else if !(pn is ArrayLit) {
+    return -1
+  }
+  const todo: i32[] = [fn.fnBody]
+  while todo.length > 0 && d < 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is LetDecl && xn.letType < 0 && parenPeelIx(xn.letInit) == p { d = x }
+      for c in nodeChildren(x) { todo.push(c) }
+    }
+  }
+  if d < 0 { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letKw != "const" && !cwLetUnwritten(d) { return -1 }
+  cwIxWant()
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwKeyOfDecl(d), ["[]"], vals, ats) < 1 { return -1 }
+  for v in vals {
+    const vx = parenPeelIx(v)
+    if vx != ix {
+      if vx < 0 || vx >= P.nodes.length || !(nodeAt(vx) is Ident) { return -1 }
+      const vd = identDeclOf(vx)
+      if vd < 0 || vd >= P.nodes.length { return -1 }
+      const vn = nodeAt(vd)
+      const named = vn is FuncDecl && vn.fnName != ""
+      if !named && !i32ListHas(fn.fnParams, vd) { return -1 }
+    }
+  }
+  const work: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  const gpar: i32[] = [-1]
+  const deep: boolean[] = [false]
+  while work.length > 0 {
+    const x = work.pop() ?? -1
+    const q = par.pop() ?? -1
+    const g = gpar.pop() ?? -1
+    const nested = deep.pop() ?? false
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Ident && identDeclOf(x) == d {
+        if nested || q < 0 || g < 0 { return -1 }
+        const qn = nodeAt(q)
+        const gn = nodeAt(g)
+        if !(qn is Index) || qn.idxArr != x { return -1 }
+        const called = gn is Call && parenPeelIx(gn.callFn) == q
+        const stored = gn is BinExpr
+          && gn.binOp == "="
+          && gn.binCompound == ""
+          && gn.binLeft == q
+        if !called && !stored { return -1 }
+      }
+      for c in nodeChildren(x) {
+        work.push(c)
+        par.push(x)
+        gpar.push(q)
+        deep.push(nested || xn is FuncDecl)
+      }
+    }
+  }
+  d
+}
+
 // Whether every read of binding `d` in `fn`'s own body is a call's callee, an assignment's target,
 // or a positional argument of a named function's or (as instance `k` types it) a set's open
 // parameter, and none is in a nested function.
@@ -4468,6 +4546,19 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
         const ws = fnTagSetOfTy(elabNodeTy(fed, k))
         if ss >= 0 && ws >= 0 {
           mintSeedNote(decl, i32ListIndexOf(dn.fnParams, pd), ss, fed, ws)
+          return 0
+        }
+      }
+      // So does a list it seeds whose slots are written only with named functions or parameters
+      // (D15453).
+      const ls = elabParamSeedsListSlot(ix, p, dn)
+      if ls >= 0 {
+        const ss = fnTagSetOfTy(elabNodeTy(ix, k))
+        const lt = elabNodeTy(ls, k)
+        const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+        const ws = if la is TyArray { fnTagSetOfTy(la.aElem) } else { -1 }
+        if ss >= 0 && ws >= 0 {
+          mintSeedNote(decl, i32ListIndexOf(dn.fnParams, pd), ss, ls, ws)
           return 0
         }
       }
