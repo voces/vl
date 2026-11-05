@@ -361,7 +361,9 @@ Each slice is graded on every hard control above, with the split plan on and off
    the first shape only (`ftInstLeafOk`, check_fn_tag.vl): the binding is written only in the body
    that declares the lambda, and every read is a call. That closes D15102. **4b-ii** is D15101, a
    write inside a nested closure, where the id meets a closure-typed capture cell. **4b-iii** is
-   D15103, a delivery at a type that differs per instance (`ftCtxOk`). Writing 4b-i's escape control
+   D15103, a delivery at a type that differs per instance (`ftCtxOk`), closed by treating that
+   delivery as an escape: its adapter calls a `const` copy of the value, read once in an
+   if-expression arm, and is instanced with the body, so no id is per instance (D15408). Writing 4b-i's escape control
    found D15110, a returned per-instance lambda that runs at the first instance's type.
 
    4b-ii, planned (2026-11-04, lane LWM). The witness is D15436: `let d1 = (y) => y` and a peer,
