@@ -918,6 +918,39 @@ L-map, F-let, B, C, H-b, H-nested, N and W-field have no dependent. D15101 runs 
 
 **Re-censused at `a090a48b` (2026-11-04), then with D15430.** 16 of 5,730 `@run` files refuse with the split plan off on master; the two L-set files that forward through a two-member list run, so L-set's one file left is the capturing choice, which is D14841's (a capturing member's id would carry its environment). With D15430 (a named closed function's result handed to a hole parameter holds the set's id, as a binding does) the M maker file runs too: **15**. The rest of this lane's groups are named by mechanism: W-hand is D15103 (slice 4b-iii), W-lam's file is D15435 once D15433 (mono's per-binding signature count under a capture cell) closed, the spread push is D15432 (the copy's adapter is built at the template and receives an id in the instance), and M's `is` file stays parked on the row question.
 
+**Re-censused at `3f036bfe` (2026-11-05), `@run` and error fixtures.** Plan on is the fixpoint seed; plan off is the same tree with `compileSrc` returning after its first compile. Every `@run` file (5,758) was compared on exit code and output, and every `@error`/`@emit-error` fixture (1,285) on exit code and diagnostics. **8 `@run` files differ and no error fixture does.** All 8 run with the plan on and refuse at emit with it off:
+
+| file | refusal with the plan off | row, owner |
+| --- | --- | --- |
+| `closures/choice-of-nested-capturing-function-handed-to-hole-param` | `unsupported argument type for f in a call to both` | D15450 (L-set, a capturing member's id) |
+| `closures/fn-set-list-of-hole-param-spread-into-closed-push` | `the reassigned function binding f holds functions called at more than one argument type` | D15432 (step-2 lane) |
+| `closures/function-list-element-at-two-types-pushed-through-hole-helper` | `a function value is called at two signatures, and the closure it holds was built for one` | D15440 (split-dep lane) |
+| `closures/written-let-copy-of-hole-param-in-list-called-at-two-types` | the same as the row above | none yet: added by D15404's close (#6364), whose holder rule covers the un-written copy only |
+| `closures/written-let-copy-of-hole-param-in-record-called-at-two-types` | the same | none yet, as the row above |
+| `closures/written-let-reassigned-to-other-param-called-at-two-types` | `parameter a of one is called at two function types that no parameter per type separates` | D15409 (group F, the residue of D15122 and D15123: two sources carrying different generics, one also called directly at another type) |
+| `generics/generic-value-return-written-to-void-generic-let` | `the reassigned function binding m holds functions called at more than one argument type` | D15030 (W-split, Q5) |
+| `objects/record-generic-field-called-and-read-under-is` | `a generic function taken as a value reaches no call that fixes its type` | D15252 (M, the `is` relation) |
+
+The "reassigned function binding" refusal (`monoBindSigFail`) is read by two of these, D15432 and W-split. Before D3942, D15408 and D12219 closed (#6367, #6369), three more shapes reached it.
+
+**What deleting the two files touches, by call graph (2026-11-05, `3f036bfe`).** The graph resolves names through each module's imports over `compiler/*.vl`: 16,277 functions and 62,023 edges. The plan's entry points are the driver's `fsPlan` and `fsAfterParse`, plus the mode plumbing `fsReset`, `fsSetMode`, `fsModeOf`, `fsAsked` and `fsGrew`.
+
+- `fn_split.vl` has 243 functions over 6,087 lines.
+  - **231 are reached only through the plan entries** and go with the driver loop.
+  - The other 12 are the ask hooks and their helpers: `fsAsk`, `fsAskCallee`, `fsAskList`, `fsAskOpenCall`, `fsAskTyParam`, `fsNoteListCall`, `fsMinted`, `fsNoteLoopCallee`, `fsParenPeel`, `fsParseReadOf`, `hasI32` and `letDeclOfRead`.
+  - They are called from 22 functions outside the plan:
+    - 17 in emit_mono.vl, among them `monoBindSigFail`, `monoMakeInstanceLater`, `monoPinAnnotatedParam` and `monoHoleGenFnPin`;
+    - 3 in wasmEmit.vl (`emitDirectCall`, `emitIdentNonLocalRead`, `emitCallRefAt`);
+    - `check_operators.splitWidenedFnRead`;
+    - `emit_collect.liftFnsInExpr`.
+  - Without the plan, an ask hook is a no-op and `fsMinted` is always false. Each caller's asking branch is deleted with it, and nothing has to move.
+  - `fsModeOf` is also read by four mono bundle pins: `monoBundlePin`, `monoBundleNamedPin`, `monoBundleHandOnPin` and `monoClosureBundlePin`. Their plan-mode arms go too.
+- `fn_flow_shadow.vl` is **not** plan code. It has 184 functions over 3,529 lines.
+  - 143 are mono's flow table: built by `monomorphize` (`fnFlowTableBuild`) and the emit passes (`fnFlowShadowBegin`, `…Build`, `…Sweep`), and read through 28 query entries by 44 emit_mono functions.
+  - The other 41 are the shadow audit (`ffGrade`, `ffSweep*`). Only `entry.vl`'s wasm exports `fnFlowShadowArm`, `…Finish` and `…Work` reach them, and only `tests/vl_fn_flow_shadow_test.ts` and `tests/vl_scaling_shape_test.ts` call those.
+  - The file can go only once those 44 mono readers are deleted or rebuilt on the elaboration's flow facts. That is the pin-helper work, not the plan's deletion.
+  - Deleting `fn_split.vl` does not require it.
+
 
 **Re-censused at `3f036bfe` (2026-11-05).** With the split plan off, against a fixpoint seed, 8 of
 the 5,757 `@run` files under `tests/cases` refuse where the plan runs them, and no file runs to a
