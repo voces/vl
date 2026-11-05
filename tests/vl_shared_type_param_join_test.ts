@@ -66,6 +66,17 @@ Deno.test({
 });
 
 Deno.test({
+  name: "shared type parameter: a generic and a hole function in either order are one instance",
+  ignore,
+  async fn() {
+    const got = await twoInstances(
+      HEAD + "function dbl(x) { x }\none(id, dbl, true)\none(dbl, id, false)\n",
+    );
+    if (got) throw new Error("want one instance of `one`, got: a second (`one$1`)");
+  },
+});
+
+Deno.test({
   name: "shared type parameter: control, two different joined sets are two instances",
   ignore,
   async fn() {
