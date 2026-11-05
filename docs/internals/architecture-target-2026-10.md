@@ -1014,9 +1014,9 @@ pin rule then becomes an elaboration fact mono reads:
   `monoTyParamOnlyBareParams`);
 - a copy of a parameter taking that parameter's pin (`monoCopySeedParam`, `monoLetPinAt`);
 - the set pin of a type-parameter-annotated parameter. Since 2026-11-05 it reads the tag
-  decision's output, a tagged argument, instead of mirroring `ftOwnTyParamJoins`; the joined set
-  it pins at is `fnTagSharedJoinSet`, the fact the elaboration binds from, because a union over a
-  type variable has no instance row for mono to read the elaboration's binding from;
+  decision's output, a tagged argument, instead of mirroring `ftOwnTyParamJoins`, and the joined
+  set it pins at is the elaboration's binding, recorded per call and argument by `elabSetArgBind`
+  (`fnTagCallJoinOf`), since a union over a type variable has no instance row to read it from;
 - D6760's un-annotated seed, which waits on this move, since pinning it in mono mints a late
   demand.
 
