@@ -152,6 +152,7 @@ import { identFnDeclOf } from "./check_scopes"
 import { declIsExportedFn } from "./check_exp_obs"
 import {
   coerceRecordOpen,
+  elabEncl,
   elabFnIdOf,
   elabLiveTyOf,
   elabMakerRowHas,
@@ -2501,6 +2502,9 @@ function ftInstLeafOk(x: i32, p: i32): boolean {
   const xs: i32[] = [fd.fnBody]
   const ps: i32[] = [-1]
   const ins: boolean[] = [false]
+  // The body's own `let`s, and the bindings a read of `b` is copied into.
+  const own: Map<i32, boolean> = Map()
+  const into: i32[] = []
   while xs.length > 0 {
     const c = xs.pop() ?? -1
     const cp = ps.pop() ?? -1
@@ -2508,20 +2512,57 @@ function ftInstLeafOk(x: i32, p: i32): boolean {
     if c >= 0 && c < P.nodes.length {
       const n = nodeAt(c)
       if c == b && inFn { return false }
+      if n is LetDecl && n.letKw == "let" && !inFn { own[c] = true }
+      const cpn = if cp >= 0 { nodeAt(cp) } else { n }
+      const copied = if (n is Ident
+        && identDeclOf(c) == b
+        && !inFn
+        && cpn is BinExpr
+        && ftIsStore(cpn)
+        && cpn.binRight == c
+        && nodeAt(parenPeelIx(cpn.binLeft)) is Ident) { identDeclOf(parenPeelIx(cpn.binLeft)) } else { -1 }
+      if copied >= 0 { into.push(copied) }
       if (
         n is Ident
         && identDeclOf(c) == b
+        && copied < 0
         && !ftInstLeafReadOk(c, cp, inFn)
         && !(!inFn && ftSeedsCellAt(c, cp))
       ) {
         return false
       }
-      const deeper = inFn || n is FuncDecl
+      // A function declared in this body whose every use is a call runs in this instance only, so
+      // its reads and writes of the binding are the instance's own (slice 4b-ii, D15436).
+      const deeper = inFn || n is FuncDecl && !ftWriterStays(c, f)
       for k in nodeChildren(c) {
         xs.push(k)
         ps.push(c)
         ins.push(deeper)
       }
+    }
+  }
+  // A copy into another binding keeps the id in the instance only when that binding is the body's.
+  for t in into {
+    if t != b && !(own[t] ?? false) { return false }
+  }
+  true
+}
+
+// Whether nested declaration `w`, declared directly in `f`'s body, is used only as a callee there:
+// no value of it leaves the instance of `f` that declares it.
+function ftWriterStays(w: i32, f: i32): boolean {
+  const wn = nodeAt(w)
+  if !(wn is FuncDecl) || wn.fnName == "" || (elabEncl[w] ?? -1) != f {
+    return false
+  }
+  cwIxWant()
+  const ow = cwOccWalk(w)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if cwIxKind[ow.row] == CW_OCC_USE {
+      const q = if u >= 0 && u < cwIxParent.length { cwIxParent[u] } else { -1 }
+      const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
+      if !(qn is Call) || qn.callFn != u { return false }
     }
   }
   true
@@ -2568,7 +2609,12 @@ function ftInstLeafReadOk(r: i32, p: i32, inFn: boolean): boolean {
   if p < 0 || p >= P.nodes.length { return false }
   const pn = nodeAt(p)
   if pn is Call { return pn.callFn == r }
-  pn is BinExpr && ftIsStore(pn) && pn.binLeft == r && !inFn
+  if !(pn is BinExpr) || !ftIsStore(pn) || inFn { return false }
+  // A write of the binding, or a write of its own value back into it.
+  if pn.binLeft == r { return true }
+  const l = parenPeelIx(pn.binLeft)
+  if l < 0 || l >= P.nodes.length { return false }
+  pn.binRight == r && nodeAt(l) is Ident && identDeclOf(l) == identDeclOf(r)
 }
 
 // Whether lambda `x` is the value its parent `p` writes into a binding: a `let`'s initialiser or
