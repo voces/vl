@@ -1071,7 +1071,165 @@ Besides the programs, four kinds of reader ask the plan, and each must lose its 
 
 No dependent would turn into a miscompile if the plan were deleted today: H-choice's 3 such rows run since #5838. The checker no longer requests a split (#5870).
 
+
+### 3.3 emit_mono's decision arms, measured (2026-11-05)
+
+A coverage probe counted, per program, every `if`/`else` body in `emit_mono.vl` at master f0caaf0:
+5,575 arms, over 23,810 programs (every `tests/cases` file, the distilled corpus, every filed
+witness in both inventories). The counter was validated on `monomorphize`'s own arms before any zero
+was read. A *decision arm* records a node type (`nodeTyRecord`, `monoRetype*`, `monoRecordOpen`) or
+returns a computed pin; an arm that refuses (`emitFail`, a `*Fail` helper) is a refusal arm.
+
+**Arms are not deleted on zero hits** (coordinator ruling). A dead function's callers are already
+unreachable; a dead arm sits in a live function, and deleting it reroutes an unmeasured program to the
+next rung. `monoArgTyNameRep`'s scalar tail (`exprIsF64` to `"f64"` and its neighbours) is unreached,
+and its cascade ends in `"i32"` (D23): deleting a rung would pin an unmeasured f64 argument at `i32`,
+a clause-1 miscompile no corpus program sees. The zero list is a map of what earlier rungs or the
+elaboration already decide:
+
+- 46 decision arms with no hit, by function: `monoArgTyNameCascade` (2), `monoArgTyNameProjected`,
+  `monoArgTyNameRep` (14), `monoCallWrittenLet`, `monoCapturedDestListPin`, `monoCoerceChoiceBinding`
+  (2), `monoCopyCellRead`, `monoHeldRecPaths`, `monoHoleGenFnPin`, `monoInitHeldTy`,
+  `monoLoopVarRecordPin`, `monoModuleLetPin` (2), `monoPinCallRecord`, `monoPinFieldContainer`,
+  `monoPinFieldValue`, `monoPinOpenCallLams`, `monoPinWidened`, `monoPinnedAnnTyAt`,
+  `monoRecordInstOpen`, `monoRecordPinnedRecv`, `monoRetConstRecord`, `monoRetypeCallsAt` (5),
+  `monoRetypeLamCells` (2), `monoRetypeMethodReads`, `monoSigFnTyNameAt`.
+- 36 refusal arms with no hit, kept: `monoBindExplicitTyArgs`, `monoBindingAtPin` (2),
+  `monoBundleNamedPin` (2), `monoBundlePinArg`, `monoBundleRecordTy`, `monoCloCoerceBuild` (2),
+  `monoClosureBundlePin`, `monoCoerceWrittenCell` (3), `monoHandWrittenLet` (2),
+  `monoIfChainRebuildPinned`, `monoInertArgsStubbed`, `monoInstantiateCallIn`, `monoLayoutConstOf`
+  (2), `monoLetTyParamMisfit`, `monoMakeInstanceGo` (2), `monoMakeInstanceLater` (2),
+  `monoMakeInstanceParams`, `monoMakeInstanceWalk`, `monoNicheNulListCheck`, `monoOpenCallAtElems`
+  (2), `monoPinColsMisalignedFail`, `monoPinHoleParam`, `monoPruneTemplates`, `monoShadowRenameDecl`
+  (2), `monoTwoListArgFail`.
+
+**The most-reached decision arms are the next stage's queue**, each to be shadowed against the
+elaboration fact that should carry the same answer: `monoWalkIdentCall`'s instance of a generic call
+(9,384 programs, D3961), `monoHoleGenFnPin` (7,937), `monoPinNoteReturns`,
+`monoNarrowedNominalPinName`, `monoReachListTy`, `monoCloneGenericCallArm` (D12702),
+`monoReachRecTy`, `monoCloPinAnnNodeOfExpr`, `monoMakeInstanceGo`'s instance note,
+`monoIfChainRebuild`, `monoPinBodyLambdasRaw` (D1990), `monoCloneGenericCalls` (D2849, two arms),
+`monoCloneLambdaSubst` (two arms, D943 and seven more), `monoPinLamFromCheckedTy` (D3820, D3834).
+
+**Shadow of `monoHoleGenFnPin`** (the signature a generic handed to a hole parameter takes), against
+`callArgRepTy` over `elabCallParamTy` at `monoPinHoleParam`: 83 programs agree, 0 disagree, and 4 get
+no elaboration answer: `closures/generic-fn-value-returned-through-identity-hole.vl`,
+`closures/hole-fn-if-join-result-handed-hole-fn.vl`, D12340 and D15455. Each is a signature fixed
+past the call, by calls through the result, which only the flow table carries. The switch to the
+elaboration's answer waits for those four, so it lands with the derivation's deletion and not beside it.
+
+**Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), comparing the
+instance's parameter types with the elaboration's per call, union members order-normalised:
+
+- against `elabCallParamTy` alone, 66 programs (74 pairs) disagree, most of them a record delivered
+  at a wider row than its type. Minimal witness, where mono is right: with `const wideJ: J = mk()`
+  beside `const xs = [mk()]`, `mk`'s literal is built in `J`'s row `{f: i32 | null}`, so `rd(xs[0])`
+  must be instanced at that row; the type is `{f: i32}`.
+- against `callArgRepTy` (the rep row `callBindAdoptReps` records beside the binding), 8,358 agree,
+  339 get no answer and 33 programs (40 pairs) disagree.
+
+#### Next stage, first item: a per-call delivered-rep fact
+
+DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
+instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
+a record built wider, which is why 34 of the 74 pairs close under `callArgRepTy`. The 40 that remain
+are three delivery kinds the rep row does not record yet:
+
+- a closure bundle handed to a parameter (14 pairs): mono instances at the bundle record
+  `{c0: ..., c1: ...}`, the binding is one member's function type;
+- a value delivered non-null to a nullable parameter (16 pairs, 14 of them function values): mono
+  instances at the non-null type, the binding keeps `| null`;
+- a record whose row mono keys narrower or wider than the binding, or cannot spell because it holds
+  generic functions (8 pairs); and literal-union spellings the render softens (2 pairs).
+
+The fact: for each argument `i` of each call, the rep it is delivered at. `callBindAdoptReps` (check
+time) writes it, extended to those three kinds. `callArgRepTy` reads it, as today. Mono's instance
+choice in `monoWalkIdentCall` and `monoPinHoleParam` then reads the elaboration's type and this rep,
+and stops deriving either. The acceptance set is the 40 pairs above: each must read the same under
+both, then the 339 no-answer calls, before the instance choice switches.
+
 ---
+
+### 3.3 Retiring the flow table, reader by reader (proposal, 2026-11-05)
+
+`fn_flow_shadow.vl` (139 functions) is the last producer of function-value facts outside the
+elaboration. It is a union-find over the checked tree's bindings. Each class records the functions
+that flow in (sources) and the closed signatures it is called or annotated at (pins). Mono reads it
+through 32 entries from 48 functions. The cad lane's coverage probe hit 138 of the 139 functions
+over 23,803 programs, so there is no dead code to plan around.
+
+**What the table carries, measured.** On master `63dae4dc` (fixpoint seed), each group of entries
+was cut to its no-table answer, and the 5,792 `tests/cases` files marked `@run` were run before
+and after. A file counts as moved if its output changed.
+
+| group | entries | mono readers | files moved | of which print nothing |
+| --- | --- | --- | --- | --- |
+| whole table (`fnFlowTableBuild` skipped) | 32 | 48 | 135 | 121 |
+| sources and writes | `fnFlowDeclWritten`, `fnFlowReadWritten`, `fnFlowReadGenFn`, `fnFlowDeclPathSrcs`, `fnFlowDeclPathHeldSrcs` | 13 | 47 | 47 |
+| pins | the 13 `fnFlow*Pin*` entries, plus `fnFlowDeclPathUncalled` | 24 | 84 | 70 |
+| hole-lambda chains | `fnFlowLamPin`, `fnFlowAliasLam`, `fnFlowCellLam`, `fnFlowRespellLam` | 7 | 7 | 7 |
+
+- The groups overlap only between sources and pins (14 files). Together they cover 119 of the
+  whole-table population's 135.
+- The other 16 move only when the table is not built at all. They are reached through
+  `fnFlowDeclFn`, `fnFlowStageInstHoles` and the slice helper.
+- 108 of the 135 are under `closures/`.
+
+**What the elaboration already records for each group.**
+
+- **Sources and writes.**
+  - The write index (`cwBindingWrittenValues`, check_write_scan.vl) answers whether an `=` writes
+    a binding and with what.
+  - `fnTagSharedArgDecl` follows the same un-annotated `const` alias chain that `fnFlowReadGenFn`
+    does.
+  - A slot's held functions are the members of the set its type carries
+    (`fnTagMembers(fnTagSetOfTy(..))`), now including the joins at a shared type parameter
+    (`fnTagCallJoinOf`) and at a list, record or map slot.
+  - The one gap is the capture cell (`let d = [v]`, `d[0] = v`). The cell is built after the check
+    by emit_collect's rewrite, so the write index never sees it. Either the rewrite records its
+    cells as writes, or the cell reads its binding's set.
+- **Hole-lambda chains.**
+  - The elaboration instances a hole lambda at each closed signature a call through its set
+    takes (hole rows, `elabHolePinNote`).
+  - The four entries name a lambda through `const` and `let` chains and capture cells, so that
+    mono can find the instance. The elaboration resolves the same chain at the call, so the
+    instance is the hole row keyed at the callee's set. The cell is the gap again.
+- **Pins.** A pin is a closed parameter list some call or annotated destination delivers a slot's
+  value at. The elaboration has these facts per instance, not per class:
+  - each call's bound parameter types (`elabCallParamTy`, `elabNodeTy(ix, k)`);
+  - each member's instance at those types (`elabMemberKeyAt(d, pTys)`);
+  - each closure delivery at a closed type (`mintCloDeliveryNote`).
+
+  An agreed pin (`fnFlowDeclPathAgreedPinTys`, `fnFlowDeclPathOnlyPinCall`) is then "every member
+  of the slot's set has one instance key". The per-call pins (`fnFlowDeclPathPinTysAt`,
+  `fnFlowCallPath*`) are that call's instance types. Annotation pins (`fnFlowDeclPathPinRets`,
+  `fnFlowCallPathAnnPinTys`) need the delivery types recorded with a result, which today's
+  delivery rows do not carry. `fnFlowDeclPathUncalled` is "no member has an instance and the set
+  escapes nowhere". That needs an escape fact the elaboration does not have yet.
+
+**Order.** Each step cuts its readers to the elaboration's answer, grades the cut at 0 movers with
+the split plan on and off (the byte-diff sweep, error fixtures included), then deletes the
+entries.
+
+1. **Hole-lambda chains** (7 files, no overlap). The readers become hole-row lookups keyed by the
+   callee's set. The capture cell is settled here, which the sources step reuses.
+2. **Sources and writes** (47 files). `fnFlowDeclWritten` and `fnFlowReadWritten` move to the write
+   index. `fnFlowReadGenFn` moves to `fnTagSharedArgDecl`. `fnFlowDeclPathSrcs` and
+   `fnFlowDeclPathHeldSrcs` move to the members of the slot type's set. The 14 files shared with
+   pins are graded again in step 3.
+3. **Pins**, by reader family, smallest population first:
+   1. agreed and only-call pins, read off member instance keys;
+   2. the per-call pins `monoRetypePinCalls` and `monoHoleOwnCallsDiffer`, read off the call's
+      instance types;
+   3. the slot pins `monoPinListElems`, `monoStoredSlotFnTy`, `monoFlowSlotPins` and
+      `monoDeclPathKeys`. This is the (γ) e/f population in §3.1; its open rows go first;
+   4. annotation pins, once a delivery row records its result;
+   5. `fnFlowDeclPathUncalled`, once an escape fact exists.
+
+   Each family is measured alone by its own cut before it is scheduled.
+4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
+   `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
+   `fnFlowStageInstHoles` go with the file.
 
 ## 4. Scoreboard
 
