@@ -3,7 +3,7 @@
 // call's argument, return, binding and method constraints, and the `if` joins a type
 // parameter pinned. The per-kind checkers reach `checkNode` through `checkNodeHook`.
 
-import { cwIxCovers, cwLetSettledAt } from "./check_write_scan"
+import { cwIxCovers } from "./check_write_scan"
 import { identTyOf } from "./check_nar_store"
 import { declareDecl, identBoundFnDeclOf, identFnDeclOf } from "./check_scopes"
 import {
@@ -57,6 +57,8 @@ import {
   mkCall,
   mkFieldInit,
   mkIdent,
+  mkBlock,
+  mkIf,
   mkMember,
   mkNull,
   mkNum,
@@ -69,11 +71,13 @@ import {
   nodeContains,
   nodeSpineChildren,
   spreadArgOf,
+  valueIfAdd,
 } from "./ast"
 import {
   fvaAnnot,
   fvaAnnotMinted,
   fvaRefuse,
+  luDecl,
   fvaRefuseNested,
   fvaUnionArm,
 } from "./check_annot_resolve"
@@ -273,6 +277,7 @@ import {
   luAt,
   luGrow,
   luRef,
+  luTrap,
   monoRecheckDepth,
   monoRecheckDepthSet,
   tpIfCmpBad,
@@ -3899,6 +3904,16 @@ export function fvaValueRowAt(decl: i32, dt: i32) {
   elabWideRowNote(decl, names, tys, d.fnRet)
 }
 
+// A copy of the node at `site`, keeping its token and the declaration an identifier resolves to,
+// so the site itself can be rewritten around it.
+function fvaMoveSite(site: i32): i32 {
+  const siteNode = nodeAt(site)
+  const moved = addNode(siteNode)
+  if siteNode is Ident { identFrom(moved, site) }
+  adoptNodeTok(moved, site)
+  moved
+}
+
 // Rewrites the function value at `srcExpr`, of type `srcTy`, into an adapter at `dstTy`'s
 // function type, when the two may differ in rep. True when the delivery is settled here,
 // rewritten or refused; false leaves it to the caller unchanged.
@@ -3978,13 +3993,12 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   if s.fnRet < 0 || d.fnRet < 0 { return false }
-  // A set's value read from a `let` no later write re-points, delivered at a type only the
-  // enclosing generic's own type parameters leave open, is built per instance of that generic by
-  // an adapter that calls the `let` itself (D9131).
+  // A set's value delivered at a type only the enclosing generic's own type parameters leave
+  // open is built per instance of that generic, by an adapter over a `const` copy of the value
+  // (D9131).
   const encSet = tyHasTyVar(dt)
     && (fnTagChoiceAt(srcExpr, srcTy) || fnTagSetValueOfTy(srcTy))
     && tyVarsOfEnclosingGeneric(dt)
-    && cwLetSettledAt(srcExpr)
   const dOpen = !encOk && !encSet && !fvaSetSlotsClosed(d)
   if (
     tyHasTyVar(dt) && dOpen
@@ -4070,16 +4084,21 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     return true
   }
   // A function declaration or a `const` is stable; any other value is read once, as the
-  // argument of an enclosing lambda called in place, so the adapter calls the delivered value
-  // rather than what a `let` later holds.
-  const stable = fvaStableName(pe, parenPeelIx(site)) || encSet
+  // argument of an enclosing lambda called in place, or into a `const` beside the adapter for a
+  // set at the enclosing generic's types, so the adapter calls the delivered value rather than
+  // what a `let` later holds.
+  const stable = fvaStableName(pe, parenPeelIx(site))
   let callee = -1
   let fvParam = -1
+  let snap = -1
   if stable {
     if pe is Ident {
       callee = luAt(mkIdent(pe.identName, pos), site)
       identFrom(callee, parenPeelIx(site))
     }
+  } else if encSet {
+    snap = luDecl("const", "$fv" + i32ToStr(site), -1, fvaMoveSite(site), site, pos)
+    callee = luRef(snap, site, pos)
   } else {
     let held = srcTy
     if holeInst >= 0 { held = holeInst }
@@ -4105,11 +4124,22 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   const mark = T.diags.length
   if stable {
     arenaSetNode(site, lam)
+  } else if snap >= 0 {
+    const stmts: i32[] = []
+    stmts.push(snap)
+    stmts.push(luAt(mkParen(luAt(addNode(lam), site), pos), site))
+    const tl: i32[] = []
+    tl.push(luAt(mkCall(luTrap(site, pos), [], pos), site))
+    const iff = mkIf(
+      luAt(mkBool(1, pos), site),
+      luAt(mkBlock(stmts, pos), site),
+      luAt(mkBlock(tl, pos), site),
+      pos,
+    )
+    arenaSetNode(site, nodeAt(luAt(iff, site)))
+    valueIfAdd(site)
   } else {
-    const siteNode = nodeAt(site)
-    const moved = addNode(siteNode)
-    if siteNode is Ident { identFrom(moved, site) }
-    adoptNodeTok(moved, site)
+    const moved = fvaMoveSite(site)
     const li = luAt(addNode(lam), site)
     const outerPs: i32[] = []
     outerPs.push(fvParam)
