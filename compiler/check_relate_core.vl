@@ -5445,15 +5445,7 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
 }
 
 // `holeLetJudge`'s result for a function that returns a value whose type stays open.
-const HOLE_RET_OPEN = -2
-
-// Whether function `d`'s signature returns nothing, as `setMemberRetAt` reads a body with no value.
-function holeDeclVoid(d: i32): boolean {
-  const sig = nodeTyOf(d)
-  if sig < 0 || sig >= T.tys.length { return false }
-  const sf = tyAt(sig)
-  sf is TyFunc && sf.fnRet == TY_VOID
-}
+const HOLE_RET_OPEN = -3
 
 // `holeLetWritesDisagree` for the `let` read at `ix`, at the widened parameter types `wp`.
 function holeLetJudge(ix: i32, wp: i32[]): boolean {
@@ -5477,16 +5469,16 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
   const ws: i32[] = []
   let b = 0
   let k = 0
-  // A function that returns nothing is `void`, which no value matches, even one whose type stays
-  // open behind a declared result (`HOLE_RET_OPEN`, D15015); any other open result is not judged.
+  // A function that returns nothing is `HOLE_RET_VOID`, which no value matches, even one whose
+  // type stays open behind a declared result (`HOLE_RET_OPEN`, D15015); any other open result is
+  // not judged.
   let open = false
   let voids = 0
   while k < ds.length {
-    let r = TY_VOID
-    if holeDeclVoid(ds[k]) {
+    let r = holeLamRetAt(ds[k], ft, noN, noT)
+    if r == HOLE_RET_VOID {
       voids = voids + 1
     } else {
-      r = holeLamRetAt(ds[k], ft, noN, noT)
       if r < 0 || tyHasTyVar(r) { r = setMemberRetAt(ds[k], ft) }
       if r < 0 || tyHasTyVar(r) {
         const f = nodeAt(ds[k])
@@ -5509,10 +5501,21 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
     k = k + 1
   }
   if open && (voids == 0 || voids == ds.length) { return false }
+  // The seed is the function the initializer holds, whatever is written back to it later.
+  const seed = if bn.letInit >= 0 { cwHeldFnOf(bn.letInit) } else { -1 }
+  k = 0
+  while k < ds.length {
+    if ds[k] == seed { b = k }
+    k = k + 1
+  }
+  // A binding seeded with a function that returns nothing takes one that returns a value, whose
+  // result its calls drop (owner ruling B2); the other order is refused.
+  const voidSeedTakesValues = rs[b] == HOLE_RET_VOID
+  if voidSeedTakesValues { return false }
   k = 0
   while k < ds.length {
     if (
-      (rs[k] == TY_VOID) != (rs[b] == TY_VOID)
+      rs[k] == HOLE_RET_VOID
       || rs[k] >= 0 && rs[b] >= 0 && !tySame(rs[k], rs[b])
     ) {
       tErr(
@@ -6592,7 +6595,7 @@ function holeLetDisagreeMsg(
 
 // How a diagnostic names the result `r`, `void` for none.
 function holeRetStr(r: i32): string {
-  if r == TY_VOID { return "void" }
+  if r == HOLE_RET_VOID { return "void" }
   if r == HOLE_RET_OPEN { return "a value" }
   tyToStr(r)
 }
@@ -7288,10 +7291,14 @@ export function fvaHeldHoleFnDiffers(s: i32, d: i32, depth: i32): boolean {
   }
 }
 
+// `holeLamRetAt` for a function whose signature returns nothing, which every caller testing
+// `< 0` reads as no result, as it did -1 (D15015).
+export const HOLE_RET_VOID = -2
+
 // The result of un-annotated lambda `lx` delivered at function type `pt`: its body's type with
 // its parameters at `pt`'s and its captures under `bNames`/`bTys`, as a direct call's contextual
-// typing gives it; -1 when `pt` is no function type of closed parameters and the lambda's
-// arity, or the result stays open.
+// typing gives it; `HOLE_RET_VOID` when its signature returns nothing; -1 when `pt` is no
+// function type of closed parameters and the lambda's arity, or the result stays open.
 export function holeLamRetAt(
   lx: i32,
   pt: i32,
@@ -7307,6 +7314,7 @@ export function holeLamRetAt(
   const lf = tyAt(lt)
   if !(pc is TyFunc) || !(lf is TyFunc) { return -1 }
   if pc.fnParamTypes.length != lf.fnParamTypes.length { return -1 }
+  if lf.fnRet == TY_VOID { return HOLE_RET_VOID }
   const hN: string[] = []
   const hT: i32[] = []
   for nm in bNames { hN.push(nm) }
