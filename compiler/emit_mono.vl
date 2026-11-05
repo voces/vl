@@ -17,11 +17,7 @@ import { typeRowClassOf } from "./record_rows"
 import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
-import {
-  ftOwnTyParamHandedBack,
-  ftOwnTyParamSharedBack,
-  ftWithinInstancedFn,
-} from "./check_fn_tag"
+import { ftOwnTyParamJoins, ftWithinInstancedFn } from "./check_fn_tag"
 import { elabArmFeOf, elabCallParamBoundTy } from "./emit_elab"
 import {
   mkNumTyped,
@@ -792,8 +788,7 @@ import {
   fnTagLeafSetOf,
   fnTagListTy,
   fnTagMembers,
-  fnTagOwnTyParamAlone,
-  fnTagOwnTyParamShared,
+  fnTagOwnTyParamJoins,
   fnTagRetIsTagged,
   fnTagSetIsTagged,
   fnTagSetOfTy,
@@ -19231,14 +19226,21 @@ function monoCoerceWrittenLetTys(
   if take == MONO_PIN_KEEP { return true }
   monoWrittenLetBusy.push(lf[1])
   monoLastInstFe = -1
+  // A binding seeded with a function that returns nothing drops the result of every function
+  // written to it, hole ones too (owner ruling B2, D15015).
+  const ix0 = unwrapParen(d.letInit)
+  const sd = if ix0 >= 0 && nodeAt(ix0) is Ident { identDeclOf(ix0) } else { -1 }
+  const st = if sd >= 0 && sd < P.nodes.length && nodeAt(sd) is FuncDecl { nodeTyIxOf(sd) } else { -1 }
+  const sf = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
+  const holes = sf is TyFunc && sf.fnRet == TY_VOID
   monoCoerceNamedGenericTys(d.letInit, tname, lf[0], delTys)
-  monoNoteVoidTwin(d.letInit, tname, lf[0])
+  monoNoteVoidTwin(d.letInit, tname, lf[0], holes)
   for i in monoWritesOf("n:", lf[1]) {
     const nd = nodeAt(i)
     const wf = monoLetWriteFrame(lf, i)
     if nd is BinExpr && wf.length == 1 {
       monoCoerceNamedGenericTys(nd.binRight, tname, wf[0], delTys)
-      monoNoteVoidTwin(nd.binRight, tname, wf[0])
+      monoNoteVoidTwin(nd.binRight, tname, wf[0], holes)
       // The binding's own call is the type a hole lambda literal written to it is called at.
       if byCall { monoLamLitTakeTys(nd.binRight, tname, wf[0], delTys) }
     }
@@ -19249,8 +19251,9 @@ function monoCoerceWrittenLetTys(
 
 // Notes value `v`, read in frame `ctx`, for its instance's void twin where it names a declared
 // generic's instance that returns a value and the slot it is delivered to, the binding's own call
-// or a write's pin at type `tname`, returns nothing (D3969, D14785).
-function monoNoteVoidTwin(v: i32, tname: string, ctx: i32) {
+// or a write's pin at type `tname`, returns nothing (D3969, D14785); a hole function's too when
+// `holes`, the binding being seeded with a function that returns nothing.
+function monoNoteVoidTwin(v: i32, tname: string, ctx: i32, holes: boolean) {
   const x = unwrapParen(v)
   if x < 0 || !monoSigRetVoid(tname) { return 0 }
   if !monoNamesGenericInstance(x, ctx) && !monoNamesDeclaredGeneric(x, ctx) {
@@ -19261,11 +19264,11 @@ function monoNoteVoidTwin(v: i32, tname: string, ctx: i32) {
   const fe = monoFnFeOfIdent(x, n.identName, ctx)
   if fe < 0 || fe >= fnStmts.length { return 0 }
   if fe >= fRetVoid.length || fRetVoid[fe] != 0 { return 0 }
-  // A hole function is a set member its own rep answers; only a declared generic is twinned.
+  // Otherwise a hole function is a set member its own rep answers; a declared generic is twinned.
   const o = if fe < fnInstOrigin.length && fnInstOrigin[fe] >= 0 { fnInstOrigin[fe] } else { fe }
   const on = if o >= 0 && o < monoOrigNode.length { monoOrigNode[o] } else { -1 }
   const od = if on >= 0 && on < P.nodes.length { nodeAt(on) } else { n }
-  if !(od is FuncDecl) || od.fnTyParams.length == 0 { return 0 }
+  if !(od is FuncDecl) || (od.fnTyParams.length == 0 && !holes) { return 0 }
   voidTwinSeamNote(x, fe, tname)
 }
 
@@ -23648,7 +23651,7 @@ function monoPreBindTaggedSets(
       p is Param
       && st >= 0
       && p.parType >= 0
-      && (fnTagOwnTyParamAlone(fn, i) || fnTagOwnTyParamShared(fn, i, args))
+      && fnTagOwnTyParamJoins(fn, i, args)
     ) {
       const tn = nodeAt(p.parType)
       if tn is TypeRef && !strListHas(tvN, tn.tyName) {
@@ -24547,11 +24550,7 @@ function monoPinAnnotatedParam(
     // A tagged set handed to a parameter its own type parameter alone annotates is pinned at
     // the set, as a hole handed one is; one several arguments share, at the set the elaboration
     // joined theirs to.
-    const argSet = if (ann == tp
-      && (fnTagOwnTyParamAlone(fn, i)
-      || fnTagOwnTyParamShared(fn, i, args)
-      || ftOwnTyParamHandedBack(decl, fn, i)
-      || ftOwnTyParamSharedBack(decl, fn, i, args))) { monoArgTaggedSetTy(args[i]) } else { -1 }
+    const argSet = if ann == tp && ftOwnTyParamJoins(decl, fn, i, args) { monoArgTaggedSetTy(args[i]) } else { -1 }
     const js = if argSet >= 0 { fnTagSharedJoinSet(fn, i, args) } else { -1 }
     const setTy = if fnTagSetIsTagged(js) && js != fnTagSetOfTy(argSet) { fnTagSetTy(js) } else { argSet }
     if setTy >= 0 {
@@ -26477,7 +26476,7 @@ function monoWalk(ix: i32, ctx: i32) {
             if byPin {
               monoLamLitTake(n.binRight, atn, ctx)
               // A generic returning a value, written where its stamp returns nothing, is twinned.
-              if byStamp { monoNoteVoidTwin(n.binRight, atn, ctx) }
+              if byStamp { monoNoteVoidTwin(n.binRight, atn, ctx, false) }
             }
             if !byPin && monoDeliverCallAt(n.binRight, atn) < 0 { return -1 }
           }

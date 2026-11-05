@@ -365,11 +365,11 @@ in every set holding it and the delivery converts nothing. The one fact is the u
 parameter to it at the call before tagging as well as after (`elabSetArgBind`), so the instance's
 facts are keyed at the union; the tag decision asks the parameter at the union and decides each
 argument's set with it (`ftSubNeed`); and mono pins the parameter at it, with no rule of its own.
-Built 2026-11-05 (D15409). This is the shape the four annotated-parameter
-gates (`fnTagOwnTyParamAlone`, `fnTagOwnTyParamShared`, `ftOwnTyParamHandedBack`,
-`ftOwnTyParamSharedBack`) each test for one case: a joined set of one argument is that argument's
-set, so each gate's witness is a joined-set binding of one member, and the gates collapse into it
-once it holds.
+Built 2026-11-05 (D15409). The four annotated-parameter gates it generalises are folded into
+two predicates, byte-identical over the corpus: `fnTagOwnTyParamJoins` (a lone parameter takes
+any argument; a shared one takes the joined set) and `ftOwnTyParamJoins`, which adds a result
+naming the type parameter bare, still limited to one named function. Widening that result case to
+a union is a capability, not a fold, and is D15461.
 
 ### 2.5 Alternatives rejected
 
@@ -924,7 +924,7 @@ Each dependent was delta-debugged to a witness: greedy line removal, keeping the
 | --- | --- | --- |
 | F | 6 → 3 at `3f036bfe` | a function parameter copied, aliased or re-pointed in a generic body and called at two types (`let b = a1; if c { b = a }; a("x"); b(3)`): `written-let-reassigned-to-other-param-called-at-two-types` (D15409), and the two re-pointed `let`-copy files D15404's close added (`written-let-copy-of-hole-param-in-{list,record}-called-at-two-types`), one family with one owner (a parameter both a written `let`'s source and called directly at a second type); `written-param-alias-called-at-two-types-runs` and `generic-fn-value-type-param-params-swapped-nested-generic` run without the plan at `3f036bfe`, `param-copied-into-unread-binding-of-other-type-param` runs without the plan since D15403, `hole-fn-copy-in-record-called-beside-other-key` since D15404 (D15445's record holder, and an un-written `let` copy read as a `const` one), and `fn-value-param-copied-into-binding-called-at-another-type` since D15400 (a closure-keyed instance on a chain the set entered is excused from the partial rule, `elabReachHandsSet`) |
 | W-hand | 1 → 0 | `written-let-handed-at-two-pins-in-generic-body-at-two-types` (D15103, slice 4b-iii) runs without the plan: a `let`'s hand at the enclosing generic's own `U` is an escape, its adapter calling a `const` copy of the value per instance (`fvaAdapt`) |
-| W, other | 2 | a void and a value generic written to one `let` and called at two types (`generic-value-return-written-to-void-generic-let`, W-split's ruling question), and a written set handed to a hole parameter then spread into a closed list (`fn-set-list-of-hole-param-spread-into-closed-push`, D15432: the copy's adapter is built at the template) |
+| W, other | 2 | a void and a value generic written to one `let` and called at two types (`generic-value-return-written-to-void-generic-let`, W-split's ruling question; ruled B2 on 2026-11-05, the void-seeded order is accepted and its module block, the binding called at two types, is [D15449](inventory/D15449.md)), and a written set handed to a hole parameter then spread into a closed list (`fn-set-list-of-hole-param-spread-into-closed-push`, D15432: the copy's adapter is built at the template) |
 | W-lam | 1 → 0 at `3f036bfe` | two lambda cells re-pointed at each other, called at two types (`cell-peer-called-at-two-types`: D15433, mono's per-binding signature count under a capture cell, is closed; the file stays on D15435, its `const`-seeded lambdas declined as leaves) |
 | L-set | 3 → 1 at `a090a48b`, → 0 with D15450 | a hole parameter forwarded through a two-member list (`forwarded-hole-fn-to-list-element-value-param`, `hole-fn-list-handed-hole-param`: both run unsplit at `a090a48b`) or an `if` choice of a nested capturing function (`choice-of-nested-capturing-function-handed-to-hole-param`: a capturing member is declined, `ftMemberSeenAtArms`; D14841's shape, the closure-at-delivery design) |
 | returned list | 2 → 1 | a returned list's element called at two types (`deliver0()[0](1.25)` beside `take0(deliver0())`): `function-list-element-at-two-types-in-record-pushed-onto-records` runs without the plan since D15062's record escape closed (a record literal pushed onto a list whose element widens only its function fields is built at that element, and holds its closures, `ftLitBuiltAt`); `function-list-element-at-two-types-pushed-through-hole-helper` is D15440, the member's hand to a hole helper that pushes it |
@@ -945,10 +945,10 @@ L-map, F-let, B, C, H-b, H-nested, N and W-field have no dependent. D15101 runs 
 | `closures/written-let-copy-of-hole-param-in-list-called-at-two-types` | the same as the row above | runs without the plan since #6383: the seed rule takes a `const` list read only as `r[i](...)`, as #6376 made it take the record, and mono copies a callee `x[0]` as a capture cell's read only where `x` is a cell (`monoIsCellRead`) |
 | `closures/written-let-copy-of-hole-param-in-record-called-at-two-types` | the same | runs without the plan since #6376: a seeded written `let` read only as a field of a `const` record called in place keeps the seed rule (`elabHolderOnlyCalled`) |
 | `closures/written-let-reassigned-to-other-param-called-at-two-types` | `parameter a of one is called at two function types that no parameter per type separates` | D15409 (group F, the residue of D15122 and D15123: two sources carrying different generics, one also called directly at another type) |
-| `generics/generic-value-return-written-to-void-generic-let` | `the reassigned function binding m holds functions called at more than one argument type` | D15030 (W-split, Q5) |
+| `generics/generic-value-return-written-to-void-generic-let` | `the reassigned function binding m holds functions called at more than one argument type` | D15030 (W-split, Q5), ruled B2 on 2026-11-05: D15030's order is refused by design and this file's void-seeded order is accepted; the refusal is now its module block's two-type call, D15449 |
 | `objects/record-generic-field-called-and-read-under-is` | `a generic function taken as a value reaches no call that fixes its type` | D15252 (M, the `is` relation), runs without the plan since the direct call through a `const` record literal's field (`constRecFieldFnRead`): the field keeps one meaning, so the relation is not asked |
 
-The "reassigned function binding" refusal (`monoBindSigFail`) is read by two of these, D15432 and W-split. Before D3942, D15408 and D12219 closed (#6367, #6369), three more shapes reached it.
+The "reassigned function binding" refusal (`monoBindSigFail`) is read by two of these, D15432 and W-split; with D15432 closed (2026-11-05), only W-split's D15449 reaches it, through `monoLetPinTake`'s refusal, so both stay until it closes. Before D3942, D15408 and D12219 closed (#6367, #6369), three more shapes reached it.
 
 **What deleting the two files touches, by call graph (2026-11-05, `3f036bfe`).** The graph resolves names through each module's imports over `compiler/*.vl`: 16,277 functions and 62,023 edges. The plan's entry points are the driver's `fsPlan` and `fsAfterParse`, plus the mode plumbing `fsReset`, `fsSetMode`, `fsModeOf`, `fsAsked` and `fsGrew`.
 
@@ -1015,8 +1015,7 @@ pin rule then becomes an elaboration fact mono reads:
   `monoTyParamOnlyBareParams`);
 - a copy of a parameter taking that parameter's pin (`monoCopySeedParam`, `monoLetPinAt`);
 - the set pin of a type-parameter-annotated parameter, which mirrors the tag decision's rules for
-  one (`fnTagOwnTyParamAlone`, `fnTagOwnTyParamShared`, `ftOwnTyParamHandedBack`,
-  `ftOwnTyParamSharedBack`), so a rule added there is added here too;
+  one (`ftOwnTyParamJoins`), so a rule added there is added here too;
 - D6760's un-annotated seed, which waits on this move, since pinning it in mono mints a late
   demand.
 
