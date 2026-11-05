@@ -1126,8 +1126,15 @@ and after. A file counts as moved if its output changed.
 the split plan on and off (the byte-diff sweep, error fixtures included), then deletes the
 entries.
 
-1. **Hole-lambda chains** (7 files, no overlap). The readers become hole-row lookups keyed by the
-   callee's set. The capture cell is settled here, which the sources step reuses.
+1. **Hole-lambda chains** (7 files, no overlap). Landed 2026-11-05; fn_flow_shadow.vl is down
+   from 139 functions to 128.
+   - The alias, cell and respell chains read `check_lam_chain.vl`. For each un-annotated binding
+     it records the initializer, the values written to it and the function declaring it. These are
+     source facts noted from the write index before `captureBoxRewrite` turns a captured `let` into
+     a cell. The rewrite mutates that `let` in place, so a cell read names the same binding.
+   - The one pin a lambda's class agrees on is the one parameter list that every elaboration
+     instance of the lambda closes at (`elabDeclOnePin`).
+   - Of the 7 files, the chains carry 5 and the pin carries 2.
 2. **Sources and writes** (47 files). `fnFlowDeclWritten` and `fnFlowReadWritten` move to the write
    index. `fnFlowReadGenFn` moves to `fnTagSharedArgDecl`. `fnFlowDeclPathSrcs` and
    `fnFlowDeclPathHeldSrcs` move to the members of the slot type's set. The 14 files shared with
