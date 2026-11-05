@@ -360,11 +360,12 @@ called `one(id, dup)`), the elaboration binds that type parameter, for that call
 union of the sets the arguments carry (`{id, dup}`), not to the first argument's set. An argument
 is then delivered as the id it already holds: an id is its member's declaration (`ftScan`'s ids,
 which `emitFnTagDispatch` compares against each member's declaration), so a member's id is the same
-in every set holding it and the delivery converts nothing. The one fact is the elaboration's
-binding of the type parameter at the call (`elabSetArgBind`'s tagged branch, widened from one
-argument's set to the join); the tag decision tags the joined set with each argument's set decided
-with it (`ftSubNeed`), and mono pins the parameter at the binding it reads (`monoArgTaggedSetTy`
-over the elaboration's type, with no rule of its own). This is the shape the four annotated-parameter
+in every set holding it and the delivery converts nothing. The one fact is the union
+(`fnTagSharedJoinSet`, check_elab_cap.vl), read three times: the elaboration binds the type
+parameter to it at the call before tagging as well as after (`elabSetArgBind`), so the instance's
+facts are keyed at the union; the tag decision asks the parameter at the union and decides each
+argument's set with it (`ftSubNeed`); and mono pins the parameter at it, with no rule of its own.
+Built 2026-11-05 (D15409). This is the shape the four annotated-parameter
 gates (`fnTagOwnTyParamAlone`, `fnTagOwnTyParamShared`, `ftOwnTyParamHandedBack`,
 `ftOwnTyParamSharedBack`) each test for one case: a joined set of one argument is that argument's
 set, so each gate's witness is a joined-set binding of one member, and the gates collapse into it
