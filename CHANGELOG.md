@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **D15400 closed:** a closure-keyed instance whose every reaching call hands a parameter the reaching instance was handed the set at is excused from the elaboration's partial-set rule (`elabReachHandsSet`), so a parameter re-pointed into a written `let` and handed to a hole forwarder runs without the split plan, and so does `fn-value-param-copied-into-binding-called-at-another-type`.
 - **D15403 closed:** a parameter handed to a non-generic function's closed function-type parameter reaches the handed generic's instance at that type in the elaboration (`elabInstAtTy`), so a bare-only parameter gets its own binding and `param-copied-into-unread-binding-of-other-type-param` runs without the split plan.
 - **D15434's `const`-seeded spelling runs without the split plan:** a `const` lambda every read of which seeds a `let` of the body is that `let`'s value in the per-instance identity rule (`ftConstSeedsLets`), so `cell-lambda-members-const-seed-generic` leaves the split-plan dependents.
 - **D15441 and D15443 closed:** a call through a function-local `const` alias of a function is read by the tag decision as that function's direct call (`ftLocalAliasedFn`), so `apply-fn-read-as-value-five-ways` runs without the split plan and the in-function spelling of D15442 no longer builds invalid wasm.
