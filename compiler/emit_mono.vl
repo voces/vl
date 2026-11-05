@@ -20270,11 +20270,10 @@ function monoCalleeAnnNode(callee: i32, fnIx: i32): i32 {
 function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
   const elems = monoCalleeElems(n.callFn, ctx)
   if elems.length == 0 { return 0 }
-  const inline = monoForInlineElems(n.callFn)
   const rows: i32[][] = []
   const own: i32[] = []
   for el in elems {
-    const pts = monoElemParamTys(el, elems, n.callArgs, ctx, inline, own)
+    const pts = monoElemParamTys(el, elems, n.callArgs, ctx, own)
     if pts.length != n.callArgs.length { return 0 }
     rows.push(pts)
   }
@@ -20639,16 +20638,14 @@ function monoElemFnDecl(el: i32, ctx: i32): i32 {
   monoOpenFnArgDecl(el)
 }
 
-// The closed parameter types the named function `el` takes called with `args` (at instance `ctx`
-// when `inline`): a generic argument's at the types its calls agree on, else its own calls apart
-// from other `elems`' with 1 pushed on `own` (D13202); -1 for a parameter the body never reads,
-// any other argument's own type; empty when one is open.
+// The closed parameter types the named function `el` takes called with `args` at instance `ctx`,
+// each argument naming a function: at the types its calls agree on, else its own calls apart from
+// other `elems`' with 1 pushed on `own` (D13202), else its tagged set; empty when one is open.
 function monoElemParamTys(
   el: i32,
   elems: i32[],
   args: i32[],
   ctx: i32,
-  inline: boolean,
   own: i32[],
 ): i32[] {
   const none: i32[] = []
@@ -20663,27 +20660,10 @@ function monoElemParamTys(
   // (D10700); a forwarded one's pins are still read without that binding (D12701).
   let named = false
   for a in args {
-    if monoElemArgNamesFn(a, ctx) || monoParamHeldFns(a).length > 0 {
-      named = true
-    }
+    if monoElemArgNamesFn(a, ctx) { named = true }
   }
   const bNames: string[] = []
   const bTys: i32[] = []
-  let i = 0
-  while named && i < args.length {
-    if monoElemArgFns(args[i], ctx).length == 0 {
-      const at = monoElemValArgTy(args[i], ctx)
-      const vt = nodeTyIxOf(f.fnParams[i])
-      if at >= 0 && !tyHasTyVar(at) && vt >= 0 {
-        const tv = tyAt(vt)
-        if tv is TyVar {
-          bNames.push(tv.tvName)
-          bTys.push(at)
-        }
-      }
-    }
-    i = i + 1
-  }
   // An element nested in a hole function reads that function's parameters at the types its one
   // instance gives them (D12880).
   if named { monoOneInstHoleBinds(bNames, bTys) }
@@ -20727,22 +20707,7 @@ function monoElemParamTys(
       } else if monoElemArgSetTy(args[j]) >= 0 {
         // A function the late decision made an id is taken at its set, as a direct call does.
         pt = monoElemArgSetTy(args[j])
-      } else if (
-        monoElemFwdFnFits(args[j], f.fnParams[j], f.fnBody, bNames, bTys, ctx)
-      ) {
-        // A forwarded parameter holds the one instance its frame's own instance receives.
-        pt = monoElemValArgTy(args[j], ctx)
-      } else if !monoSubtreeReads(f.fnBody, f.fnParams[j]) {
-        pts.push(-1)
-        j = j + 1
-        continue
       }
-    } else if named || inline {
-      // An instance's own copy of the elements reads a value at the type the instance gives it;
-      // elements the instances share stay at the template's type.
-      pt = monoElemValArgTy(args[j], ctx)
-    } else {
-      pt = nodeTyIxOf(unwrapParen(args[j]))
     }
     if pt < 0 || pt >= T.tys.length || tyHasTyVar(pt) && !fnTagTyIsTagged(pt) {
       return none
@@ -20881,21 +20846,12 @@ function monoOneInstHoleBinds(bNames: string[], bTys: i32[]): i32 {
   0
 }
 
-// The type value argument `a` has in the function `ctx` walked: its own, else where that is open,
-// the one the instance `ctx` gives it.
-function monoElemValArgTy(a: i32, ctx: i32): i32 {
-  const x = unwrapParen(a)
-  const t = nodeTyIxOf(x)
-  if t < 0 || !tyHasTyVar(t) || ctx < 0 { return t }
-  nodeTyInOf(x, ctx)
-}
-
 // The declared functions argument `a` of a call through elements hands an element's function
 // parameter: what an un-annotated parameter holds, or the generic or hole lambda it names; empty
 // for a value argument.
 function monoElemArgFns(a: i32, ctx: i32): i32[] {
   if monoElemArgNamesFn(a, ctx) { return [monoOpenFnArgDecl(a)] }
-  monoParamHeldFns(a)
+  []
 }
 
 // Whether argument `a` names its function itself, a generic or a hole lambda, rather than a
@@ -20959,53 +20915,6 @@ function monoElemPinTysUnder(
   true
 }
 
-// Whether argument `a`, a parameter forwarding the function its frame's instance holds, is closed
-// there at the parameter types every call of element parameter `par` in `body` passes under the
-// element's value binding `bNames`/`bTys`; false when `par` is read any other way (D13102).
-function monoElemFwdFnFits(
-  a: i32,
-  par: i32,
-  body: i32,
-  bNames: string[],
-  bTys: i32[],
-  ctx: i32,
-): boolean {
-  if monoElemArgNamesFn(a, ctx) { return false }
-  const at = monoElemValArgTy(a, ctx)
-  if at < 0 || at >= T.tys.length || !monoTyClosedFn(at) { return false }
-  const ft = tyAt(at)
-  if !(ft is TyFunc) { return false }
-  const want = fnFlowPinSigOf(ft.fnParamTypes)
-  let calls = 0
-  const stack: i32[] = [body]
-  while stack.length > 0 {
-    const x = stack.pop() ?? -1
-    if x >= 0 && x < P.nodes.length {
-      const n = nodeAt(x)
-      if n is Ident && identDeclOf(x) == par { return false }
-      if (
-        n is Call
-        && n.callFn >= 0
-        && nodeAt(n.callFn) is Ident
-        && identDeclOf(n.callFn) == par
-      ) {
-        const sub: i32[] = []
-        for c in n.callArgs {
-          const st = substTyDeep(nodeTyIxOf(unwrapParen(c)), bNames, bTys)
-          if st < 0 || tyHasTyVar(st) { return false }
-          sub.push(st)
-        }
-        if fnFlowPinSigOf(sub) != want { return false }
-        calls = calls + 1
-        for c in n.callArgs { stack.push(c) }
-      } else {
-        for c in nodeChildren(x) { stack.push(c) }
-      }
-    }
-  }
-  calls > 0
-}
-
 // What call `n`, through list elements or `if` arms, hands as un-annotated parameters or hole
 // lambdas: 2 when a parameter's type still holds a hole, 1 when each such one's is closed or the
 // call hands only lambdas, 0 when it hands none.
@@ -21041,39 +20950,6 @@ function monoIsHoleLamArg(a: i32): boolean {
     && d < P.nodes.length
     && nodeAt(d) is LetDecl
     && monoOpenFnArgDecl(x) >= 0
-}
-
-// The declared functions the un-annotated parameter read `a` can hold, each once; empty when it
-// is no such read or can hold anything else (D7845).
-function monoParamHeldFns(a: i32): i32[] {
-  const none: i32[] = []
-  const x = unwrapParen(a)
-  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return none }
-  const d = identDeclOf(x)
-  if d < 0 || d >= P.nodes.length { return none }
-  const dn = nodeAt(d)
-  if !(dn is Param) || dn.parType >= 0 { return none }
-  const noPath: string[] = []
-  const out: i32[] = []
-  for v in fnFlowDeclPathHeldSrcs(d, noPath) {
-    const g = if nodeAt(v) is FuncDecl { v } else { monoFlowLeafGen(v) }
-    if g < 0 || !(nodeAt(g) is FuncDecl) { return none }
-    if !i32ListHas(out, g) { out.push(g) }
-  }
-  out
-}
-
-// Whether the subtree at `ix` reads the declaration `d`.
-function monoSubtreeReads(ix: i32, d: i32): boolean {
-  const stack: i32[] = [ix]
-  while stack.length > 0 {
-    const x = stack.pop() ?? -1
-    if x >= 0 && x < P.nodes.length {
-      if nodeAt(x) is Ident && identDeclOf(x) == d { return true }
-      for c in nodeChildren(x) { stack.push(c) }
-    }
-  }
-  false
 }
 
 // The refusal for a call `monoGenArgAtOpenParam` names, at node `ix` (D3956); the split may
