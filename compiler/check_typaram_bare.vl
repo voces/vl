@@ -5,18 +5,35 @@ import {
   AsExpr,
   Call,
   FuncDecl,
+  Ident,
   IsExpr,
   LetDecl,
+  Node,
   P,
   Param,
+  TS_NAME,
   TypeRef,
+  annTsOf,
+  arenaSetNode,
   callHasTyArgs,
+  declHasExportKw,
+  i32ToStr,
   nodeAt,
   nodeChildren,
+  tsLeaf,
+  tsSubstTree,
+  tsToName,
 } from "./ast"
 import { monoAnnHasTyParam } from "./emit_base"
 import { isVarTyIxOf } from "./check_list_union"
-import { paramCopySeedOf } from "./check_elab_cap"
+import {
+  fnTagSharedArgDecl,
+  paramCopySeedOf,
+  pcLetUnassigned,
+} from "./check_elab_cap"
+import { identDeclOf } from "./symbols"
+import { parenPeelIx } from "./check_places"
+import { i32ListHas, i32ListIndexOf } from "./listutil"
 
 // Whether `fn` names type parameter `tp` only as the whole annotation of some parameters: not
 // in its return type, another annotation, an `is`/`as` or a call's type arguments. The check
@@ -65,4 +82,323 @@ export function tyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
     }
   }
   true
+}
+
+// Drops a bare-only type parameter `tp`, leaving each parameter it annotates a hole of its own
+// (`f<F>(a: F, c: F)` checks as `f(a, c)`) when nothing relates them: each is read only as a
+// callee, a hole's argument or an unassigned copy's seed, and every call hands them named
+// functions of one signature, so each binding is the one the shared `tp` took (D15401).
+export function tyParamSplitBegin() {
+  tpbCands = []
+  tpbParent = Map()
+  tpbRefs = Map()
+  tpbWithTyArgs = []
+  0
+}
+
+// Notes node `i` when it is a candidate, a named generic with two parameters one type
+// parameter annotates bare, and when it calls a callee with explicit type arguments.
+export function tyParamSplitScan(i: i32) {
+  tpbNoteCand(i)
+  tpbNoteTyArgs(i)
+}
+
+// Whether any candidate exists, so its reads are worth noting.
+export function tyParamSplitAny(): boolean { tpbCands.length > 0 }
+
+// Notes each read of a candidate among node `i`'s children, with `i` as its parent.
+export function tyParamSplitNote(i: i32) {
+  for c in nodeChildren(i) {
+    if c >= 0 && c < P.nodes.length && nodeAt(c) is Ident {
+      const d = identDeclOf(c)
+      if i32ListHas(tpbCands, d) {
+        const rs = tpbRefs[d] ?? []
+        rs.push(c)
+        tpbRefs[d] = rs
+        tpbParent[c] = i
+      }
+    }
+  }
+  0
+}
+
+// Drops each type parameter of each candidate the conditions above allow.
+export function tyParamSplitRun() {
+  for d in tpbCands {
+    if !i32ListHas(tpbWithTyArgs, d) {
+      const n = nodeAt(d)
+      const tps: string[] = if n is FuncDecl { n.fnTyParams.slice(0, n.fnTyParams.length) } else { [] }
+      for tp in tps { tpbSplitOne(d, tp) }
+    }
+  }
+  tpbCands = []
+  tpbParent = Map()
+  tpbRefs = Map()
+  0
+}
+
+function tpbNoteCand(i: i32) {
+  const n = nodeAt(i)
+  if (
+    !(n is FuncDecl)
+    || n.fnName == ""
+    || n.fnTyParams.length == 0
+    || declHasExportKw(i)
+  ) {
+    return 0
+  }
+  for tp in n.fnTyParams {
+    let k = 0
+    for pIx in n.fnParams {
+      const p = nodeAt(pIx)
+      if p is Param && p.parType >= 0 {
+        const tn = nodeAt(p.parType)
+        if tn is TypeRef && tn.tyName == tp { k = k + 1 }
+      }
+    }
+    if k >= 2 && !i32ListHas(tpbCands, i) { tpbCands.push(i) }
+  }
+  0
+}
+
+function tpbNoteTyArgs(i: i32) {
+  const n = nodeAt(i)
+  if !(n is Call) || !callHasTyArgs(i) { return 0 }
+  const f = parenPeelIx(n.callFn)
+  if f >= 0 && nodeAt(f) is Ident { tpbWithTyArgs.push(identDeclOf(f)) }
+  0
+}
+
+// The candidates, each read of one with its parent, and the callees given type arguments.
+let tpbCands: i32[] = []
+let tpbParent: {[i32]: i32} = Map()
+let tpbRefs: {[i32]: i32[]} = Map()
+let tpbWithTyArgs: i32[] = []
+
+// The node above read `x`, or `x` itself at the root.
+function tpbUp(x: i32): i32 {
+  const p = tpbParent[x] ?? -1
+  if p >= 0 && p < P.nodes.length { p } else { x }
+}
+
+// Notes each read inside function `fn`'s body by the declaration it reads, with its parent.
+function tpbBodyReads(fn: FuncDecl) {
+  tpbBodyRefs = Map()
+  tpbBodyUp = Map()
+  const xs: i32[] = [fn.fnBody]
+  while xs.length > 0 {
+    const x = xs.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      for c in nodeChildren(x) {
+        if c >= 0 && c < P.nodes.length && nodeAt(c) is Ident {
+          const d = identDeclOf(c)
+          const rs = tpbBodyRefs[d] ?? []
+          rs.push(c)
+          tpbBodyRefs[d] = rs
+          tpbBodyUp[c] = x
+        }
+        xs.push(c)
+      }
+    }
+  }
+  0
+}
+
+let tpbBodyRefs: {[i32]: i32[]} = Map()
+let tpbBodyUp: {[i32]: i32} = Map()
+
+// Drops `tp` of function `d` when `tyParamSplitRun`'s conditions hold.
+function tpbSplitOne(d: i32, tp: string) {
+  const fn = nodeAt(d)
+  if !(fn is FuncDecl) { return 0 }
+  const ps: i32[] = []
+  for pIx in fn.fnParams {
+    const p = nodeAt(pIx)
+    if p is Param && p.parType >= 0 {
+      const tn = nodeAt(p.parType)
+      if tn is TypeRef && tn.tyName == tp { ps.push(pIx) }
+    }
+  }
+  if ps.length < 2 || !tyParamOnlyBareParams(fn, tp) { return 0 }
+  if !tpbCallsHandOneSig(d, fn, ps) { return 0 }
+  // Each binding holding a parameter's value: the parameters, then each unassigned binding a held
+  // read seeds, annotated `tp` or not at all.
+  tpbBodyReads(fn)
+  const held: i32[] = []
+  for p in ps { held.push(p) }
+  let h = 0
+  while h < held.length {
+    for r in tpbBodyRefs[held[h]] ?? [] {
+      const up = tpbBodyUp[r] ?? -1
+      if up < 0 || up >= P.nodes.length { return 0 }
+      const un = nodeAt(up)
+      let ok = false
+      if un is Call {
+        ok = parenPeelIx(un.callFn) == r || tpbHandedToHole(un, r)
+      }
+      if un is LetDecl && parenPeelIx(un.letInit) == r {
+        if !pcLetUnassigned(up) { return 0 }
+        if un.letType >= 0 {
+          const lt = nodeAt(un.letType)
+          if !(lt is TypeRef) || lt.tyName != tp { return 0 }
+        }
+        if !i32ListHas(held, up) { held.push(up) }
+        ok = true
+      }
+      if !ok { return 0 }
+    }
+    h = h + 1
+  }
+  // Every annotation naming `tp` is one of the held bindings', so dropping them drops `tp`.
+  let named = 0
+  const todo: i32[] = [fn.fnBody]
+  for pIx in fn.fnParams { todo.push(pIx) }
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is TypeRef && xn.tyName == tp { named = named + 1 }
+      for c in nodeChildren(x) { todo.push(c) }
+    }
+  }
+  let dropping = 0
+  for x in held {
+    if tpbAnnOf(x) >= 0 { dropping = dropping + 1 }
+  }
+  if named != dropping { return 0 }
+  for x in held { tpbDropAnn(x) }
+  const keep: string[] = []
+  for t in fn.fnTyParams {
+    if t != tp { keep.push(t) }
+  }
+  const nf: Node = {
+    fnName: fn.fnName,
+    fnTyParams: keep,
+    fnParams: fn.fnParams,
+    fnRet: fn.fnRet,
+    fnBody: fn.fnBody,
+    pos: fn.pos,
+  }
+  arenaSetNode(d, nf)
+  0
+}
+
+// The annotation node of held binding `x` when it is a bare `TypeRef`, else -1: a parameter's,
+// or a copy's.
+function tpbAnnOf(x: i32): i32 {
+  const ann = tpbParamAnnOf(x)
+  const a = if ann >= 0 { ann } else { tpbLetAnnOf(x) }
+  if a >= 0 && nodeAt(a) is TypeRef { a } else { -1 }
+}
+
+function tpbParamAnnOf(x: i32): i32 {
+  const n = nodeAt(x)
+  if n is Param { n.parType } else { -1 }
+}
+
+function tpbLetAnnOf(x: i32): i32 {
+  const n = nodeAt(x)
+  if n is LetDecl { n.letType } else { -1 }
+}
+
+// Drops the annotation of held binding `x`, a parameter or a copy, leaving a hole.
+function tpbDropAnn(x: i32) {
+  tpbDropParamAnn(x)
+  tpbDropLetAnn(x)
+}
+
+function tpbDropParamAnn(x: i32) {
+  const n = nodeAt(x)
+  if !(n is Param) { return 0 }
+  const np: Node = {
+    parName: n.parName,
+    parType: -1,
+    parDefault: n.parDefault,
+    parOpt: n.parOpt,
+    parRest: n.parRest,
+    pos: n.pos,
+  }
+  arenaSetNode(x, np)
+  0
+}
+
+function tpbDropLetAnn(x: i32) {
+  const n = nodeAt(x)
+  if !(n is LetDecl) { return 0 }
+  const nl: Node = {
+    letKw: n.letKw,
+    letName: n.letName,
+    letType: -1,
+    letInit: n.letInit,
+    pos: n.pos,
+  }
+  arenaSetNode(x, nl)
+  0
+}
+
+// Whether `d` is read only as a callee, and every call hands each of parameters `ps` a named
+// function, all of one signature: the shared binding accepts each such call, so binding each
+// parameter apart accepts no call it refused.
+function tpbCallsHandOneSig(d: i32, fn: FuncDecl, ps: i32[]): boolean {
+  const idx: i32[] = []
+  for p in ps { idx.push(i32ListIndexOf(fn.fnParams, p)) }
+  const rs = tpbRefs[d] ?? []
+  if rs.length == 0 { return false }
+  for x in rs {
+    const pn = nodeAt(tpbUp(x))
+    if !(pn is Call) || parenPeelIx(pn.callFn) != x { return false }
+    for nm in pn.callArgNames {
+      if nm != "" { return false }
+    }
+    let sig = ""
+    for k in idx {
+      if k < 0 || k >= pn.callArgs.length { return false }
+      const s = tpbNamedSig(pn.callArgs[k])
+      if s == "" || sig != "" && s != sig { return false }
+      sig = s
+    }
+  }
+  true
+}
+
+// The signature spelling of the named function argument `a` reads, through `const` aliases, with
+// its type parameters numbered; "" for any other argument or an unannotated parameter or result.
+function tpbNamedSig(a: i32): string {
+  const fd = fnTagSharedArgDecl(a)
+  if fd < 0 || fd >= P.nodes.length { return "" }
+  const f = nodeAt(fd)
+  if !(f is FuncDecl) || f.fnName == "" || f.fnRet < 0 { return "" }
+  const reps: i32[] = []
+  let k = 0
+  while k < f.fnTyParams.length {
+    reps.push(tsLeaf(TS_NAME, "$" + i32ToStr(k)))
+    k = k + 1
+  }
+  let out = "<" + i32ToStr(f.fnTyParams.length) + ">("
+  for pIx in f.fnParams {
+    const pn = nodeAt(pIx)
+    if !(pn is Param) || pn.parType < 0 { return "" }
+    const t = tsSubstTree(annTsOf(pn.parType), f.fnTyParams, reps)
+    if t < 0 { return "" }
+    out = out + tsToName(t) + ","
+  }
+  const r = tsSubstTree(annTsOf(f.fnRet), f.fnTyParams, reps)
+  if r < 0 { return "" }
+  out + ")" + tsToName(r)
+}
+
+// Whether `x` is a positional argument of call `c` to a named function whose parameter there is
+// un-annotated: a hole binds per call, so it relates the argument to nothing.
+function tpbHandedToHole(c: Call, x: i32): boolean {
+  const f = parenPeelIx(c.callFn)
+  if f < 0 || !(nodeAt(f) is Ident) { return false }
+  const fd = identDeclOf(f)
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const fn = nodeAt(fd)
+  if !(fn is FuncDecl) || fn.fnName == "" { return false }
+  const k = i32ListIndexOf(c.callArgs, x)
+  if k < 0 || k >= fn.fnParams.length { return false }
+  if k < c.callArgNames.length && c.callArgNames[k] != "" { return false }
+  const pn = nodeAt(fn.fnParams[k])
+  pn is Param && pn.parType < 0
 }
