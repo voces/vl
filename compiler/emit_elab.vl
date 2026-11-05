@@ -7045,7 +7045,158 @@ export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
     substTyDeep(nodeTyIxOf(dn.fnParams[ri]), ekNames[rk], ekTys[rk]),
   )
   if s < 0 || fnTagSetIsTagged(s) { return none }
+  // The callee reads the record only as a callee, or hands it whole to a named function: any
+  // other read of the parameter wants one closure.
+  const ck = elabCallParamKey(ix, i)
+  const cd = nodeAt(ekDecl[k])
+  if !(cd is FuncDecl) || i >= cd.fnParams.length { return none }
+  if (
+    elabBodyReadsOtherThanCalled(
+      cd.fnBody,
+      cd.fnParams[i],
+      true,
+      if ck >= 0 { ck / 64 } else { -1 },
+    )
+  ) {
+    return none
+  }
   sigs
+}
+
+// Whether node `x` or one beneath it reads parameter `par` other than as the callee of a call in
+// its own function's body (`own`): handed on, stored, or read by a nested function. With `fwd`, a
+// read handed whole to a named function as a positional argument is not counted, and with `cap` a
+// call through it or such a hand in a nested function at any depth is not either.
+export function elabParamReadOtherThanCalled(
+  x: i32,
+  par: i32,
+  own: boolean,
+  fwd: boolean,
+  cap: boolean,
+): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is Ident { return identDeclOf(x) == par }
+  if n is FuncDecl {
+    for k in nodeChildren(x) {
+      if elabParamReadOtherThanCalled(k, par, cap, cap, cap) { return true }
+    }
+    return false
+  }
+  if n is Call {
+    const cf = parenPeelIx(n.callFn)
+    const cd = if cf >= 0 && nodeAt(cf) is Ident { identDeclOf(cf) } else { -1 }
+    const called = own && cd == par
+    const named = own
+      && fwd
+      && cd >= 0
+      && cd < P.nodes.length
+      && (nodeAt(cd) is FuncDecl || elabConstFnCopy(cd))
+    for k in nodeChildren(x) {
+      const ku = parenPeelIx(k)
+      const handed = named
+        && i32ListHas(n.callArgs, k)
+        && ku >= 0
+        && nodeAt(ku) is Ident
+        && identDeclOf(ku) == par
+      if (
+        !(called && ku == cf)
+        && !handed
+        && elabParamReadOtherThanCalled(k, par, own, fwd, cap)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+  for k in nodeChildren(x) {
+    if elabParamReadOtherThanCalled(k, par, own, fwd, cap) { return true }
+  }
+  false
+}
+
+// Whether `d` is a `const` binding whose value is a read of a named function.
+function elabConstFnCopy(d: i32): boolean {
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letKw != "const" { return false }
+  const v = parenPeelIx(n.letInit)
+  if v < 0 || !(nodeAt(v) is Ident) { return false }
+  const fd = identDeclOf(v)
+  fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl
+}
+
+// `elabParamReadOtherThanCalled` over function body `body`, where with `fwd` a return of `par`
+// from the function itself, by `return` or as the body's last statement, is not counted either,
+// nor is a copy the elaboration holds the record in under callee instance `hk`.
+function elabBodyReadsOtherThanCalled(
+  body: i32,
+  par: i32,
+  fwd: boolean,
+  hk: i32,
+): boolean {
+  if body < 0 { return false }
+  const b = nodeAt(body)
+  if !(b is Block) {
+    return elabParamReadOtherThanCalled(body, par, true, fwd, fwd)
+  }
+  if !fwd {
+    for st in b.blkStmts {
+      if (
+        !elabCopyHeld(st, par, hk)
+        && elabParamReadOtherThanCalled(st, par, true, false, false)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+  let i = 0
+  while i < b.blkStmts.length {
+    const st = b.blkStmts[i]
+    const last = i == b.blkStmts.length - 1
+    if !(last && elabIsParamRead(st, par)) && elabStmtReadsOther(st, par, hk) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether node `x` is a read of parameter `par`, under parentheses.
+export function elabIsParamRead(x: i32, par: i32): boolean {
+  const u = if x >= 0 { parenPeelIx(x) } else { -1 }
+  u >= 0 && nodeAt(u) is Ident && identDeclOf(u) == par
+}
+
+// Whether statement `x` is a copy of parameter `par` the elaboration holds the record in under
+// callee instance `hk`.
+function elabCopyHeld(x: i32, par: i32, hk: i32): boolean {
+  if hk < 0 || x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  n is LetDecl
+    && elabIsParamRead(n.letInit, par)
+    && elabHolderRecordAt(x, hk).length > 0
+}
+
+// `elabBodyReadsOtherThanCalled` for statement `x` of the function's own body.
+function elabStmtReadsOther(x: i32, par: i32, hk: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is RetStmt && elabIsParamRead(n.retArg, par) { return false }
+  if elabCopyHeld(x, par, hk) { return false }
+  if (
+    n is Block
+    || n is IfStmt
+    || n is WhileStmt
+    || n is ForIn
+    || n is ForRange
+  ) {
+    for k in nodeChildren(x) {
+      if elabStmtReadsOther(k, par, hk) { return true }
+    }
+    return false
+  }
+  elabParamReadOtherThanCalled(x, par, true, true, true)
 }
 
 // Notes the fact for call `c` at `ix` when its callee is a parameter of `decl` that instance `k`
