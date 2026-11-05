@@ -189,7 +189,7 @@ C has no call. Its destination is closed, so it is S1's adoption reached through
 type-parameter identity (`sel`). It belongs to adoption, not to the call set, and it is listed
 here only because the hole-parameter pin carries it today.
 
-`tests/cases/functions/error-generic-fn-value-two-type-param-params-read-elsewhere.vl` is in H.
+`tests/cases/functions/generic-fn-value-two-type-param-params-either-returned.vl` is in H.
 It is an expected-error file, so the probe could not run it.
 
 ## 3. Zero call sites, and call sites the checker cannot see
