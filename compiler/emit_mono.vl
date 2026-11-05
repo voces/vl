@@ -631,7 +631,6 @@ import {
   tySameSpelled,
 } from "./emit_ty_canon"
 import {
-  ekDecl,
   ekNames,
   ekTys,
   elabAliasNote,
@@ -668,7 +667,6 @@ import {
   elabNodeRepAt,
   elabNodeTyAt,
   elabNodeTys,
-  elabParamCarriedInstAt,
   elabResultAtParams,
   elabRetOf,
   elabSigTyClosed,
@@ -19435,79 +19433,6 @@ function monoCoerceNamedGenericTys(
 }
 
 // Whether value node `v`, read in frame `ctx`, names a declared generic function by name.
-// Rewrites argument `v`, a read in frame `ctx` of one of its parameters annotated with a bare
-// type parameter, to a read of the generic that parameter carries (`elabParamCarriedDeclAt`),
-// so the call pins that generic at its own parameter's close as a direct name is (D6202).
-function monoFwdCarriedRewrite(v: i32, ctx: i32): i32 {
-  const x = unwrapParen(v)
-  if x < 0 || ctx < 0 { return 0 }
-  const xn = nodeAt(x)
-  const f = nodeAt(ctx)
-  if !(xn is Ident) || !(f is FuncDecl) { return 0 }
-  const fe = fnStmtsPosOf(ctx)
-  let ofe = -1
-  let kk = 0
-  while kk < monoInstFe.length && ofe < 0 {
-    if monoInstFe[kk] == fe { ofe = monoInstOrig[kk] }
-    kk = kk + 1
-  }
-  if ofe < 0 && fe >= 0 && fe < monoOrigNode.length { ofe = fe }
-  const tfn = if ofe >= 0 && ofe < monoOrigNode.length && monoOrigNode[ofe] >= 0 { nodeAt(monoOrigNode[ofe]) } else { f }
-  const tf = if tfn is FuncDecl { tfn } else { f }
-  let qi = -1
-  let q = 0
-  while q < tf.fnParams.length && q < f.fnParams.length {
-    const pn = nodeAt(tf.fnParams[q])
-    if pn is Param && pn.parName == xn.identName && pn.parType >= 0 {
-      const tn = nodeAt(pn.parType)
-      if tn is TypeRef && strListHas(tf.fnTyParams, tn.tyName) { qi = q }
-    }
-    q = q + 1
-  }
-  if qi < 0 { return 0 }
-  const ck = elabParamCarriedInstAt(elabKeyAt(ctx), qi)
-  const d = if ck >= 0 && ck < ekDecl.length { ekDecl[ck] } else { -1 }
-  // The name stands for the parameter at every instance only when each other parameter of its
-  // type parameter carries the same generic here; a swap of two generics would hand one the
-  // other's name (D15406).
-  const qp = nodeAt(tf.fnParams[qi])
-  const qtn = if qp is Param && qp.parType >= 0 { nodeAt(qp.parType) } else { qp }
-  if d < 0 || !(qtn is TypeRef) { return 0 }
-  let shared = 0
-  let q2 = 0
-  while q2 < tf.fnParams.length {
-    const on = nodeAt(tf.fnParams[q2])
-    const ot = if on is Param && on.parType >= 0 { nodeAt(on.parType) } else { qtn }
-    if (
-      q2 != qi
-      && on is Param
-      && on.parType >= 0
-      && ot is TypeRef
-      && ot.tyName == qtn.tyName
-    ) {
-      const oc = elabParamCarriedInstAt(elabKeyAt(ctx), q2)
-      if oc < 0 || oc >= ekDecl.length || ekDecl[oc] != d { return 0 }
-      shared = shared + 1
-    }
-    q2 = q2 + 1
-  }
-  if shared == 0 { return 0 }
-  const dn = if d >= 0 { nodeAt(d) } else { null }
-  if !(dn is FuncDecl) || dn.fnName == "" { return 0 }
-  // Only a top-level generic, whose name reaches it from any call; one nested in another frame
-  // is no name here, and its instances are keyed by that frame.
-  let dfe = -1
-  let j = 0
-  while j < monoOrigNode.length && dfe < 0 {
-    if monoOrigNode[j] == d { dfe = j }
-    j = j + 1
-  }
-  if dfe < 0 || dfe >= fnParent.length || fnParent[dfe] >= 0 { return 0 }
-  const n: Node = { identName: dn.fnName, pos: xn.pos }
-  arenaSetNode(x, n)
-  sidNoteNodeName(x, d)
-  0
-}
 
 function monoNamesDeclaredGeneric(v: i32, ctx: i32): boolean {
   if v < 0 { return false }
@@ -24590,7 +24515,6 @@ function monoPinAnnotatedParam(
       const pinTy: i32[] = [0 - 1]
       // A type parameter read only as whole parameter annotations: the elaboration closes each
       // parameter at the instances it alone carries.
-      if tyParamIsBareOnly(decl, tp) { monoFwdCarriedRewrite(args[i], ctx) }
       const own = if tyParamIsBareOnly(decl, tp) { elabCallParamTyOwn(monoCallTplOf(callIx), i) } else { -1 }
       if (
         own >= 0
@@ -24712,20 +24636,18 @@ function monoPinAnnotatedParam(
       tvV.push(bind)
       monoTvTyLast(tvN, tvT, bindTy)
     } else if genPin && b != an2 && monoPinIsFnTy(an2Ty) {
-      // A generic handed to a second `T` parameter called at another type keeps its own pin
-      // when `T` is read nowhere else, and is refused when it is (D6090).
-      if !tyParamIsBareOnly(decl, tp) {
-        fsAskTyParam(params[i])
-        return emitFail(
-          "emitProgram: monomorphize: a generic function handed to two parameters of type `"
-            + tp
-            + "` in a call to `"
-            + fn.fnName
-            + "` is called at two types, and `"
-            + tp
-            + "` takes one",
-        )
-      }
+      // A generic handed to a second `T` parameter called at another type: a bare-only `T` is
+      // split per parameter by the check, or tagged as one set, so `T` takes one here (D6090).
+      fsAskTyParam(params[i])
+      return emitFail(
+        "emitProgram: monomorphize: a generic function handed to two parameters of type `"
+          + tp
+          + "` in a call to `"
+          + fn.fnName
+          + "` is called at two types, and `"
+          + tp
+          + "` takes one",
+      )
     } else {
       bind = b
     }
