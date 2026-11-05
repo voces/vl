@@ -22,16 +22,16 @@ const p = Deno.args[0] + "/compiler/emit_mono.vl";
 let s = Deno.readTextFileSync(p);
 const old = "  fnFlowDeclPathPinSigs(d, path, inst, tmpl, dead)\n}";
 if (!s.includes(old)) throw new Error("monoDeclPathKeysIn changed shape: update the audit");
-s = s.replace(old, "  zzPins(fnFlowDeclPathPinSigs(d, path, inst, tmpl, dead), d, path)\n}");
+s = s.replace(old, "  zzPins(fnFlowDeclPathPinSigs(d, path, inst, tmpl, dead), d, path, inst)\n}");
 s = s.replace(
   "import { emitFail, emitFailAt } from \"./emit_bytes\"",
   "import { emitFail, emitFailAt } from \"./emit_bytes\"\nimport { elabSlotDeliveries as zzDeliv } from \"./emit_elab\"",
 );
 s += `
-function zzPins(a: string[], d: i32, path: string[]): string[] {
+function zzPins(a: string[], d: i32, path: string[], inst: i32): string[] {
   if a.length == 1 && a[0] == FF_PIN_DECLINE { return a }
   const b: string[] = []
-  for t in zzDeliv(d, path) {
+  for t in zzDeliv(d, path, if inst >= 0 { elabKeyAt(inst) } else { -1 }) {
     const ft = tyAt(t)
     if ft is TyFunc {
       const sg = fnFlowPinSigOf(ft.fnParamTypes)
