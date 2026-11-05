@@ -154,6 +154,24 @@ off. The seed shrinks by 898 bytes. One file's bytes move in both modes and prin
 call's nodes, so `applied`'s `f(g())` arm calls `g` through the closure parameter, where the
 instance clone's `g()` had been resolved to a direct call.
 
+What the arm's site means for the other readers: an arm's entry is keyed by its callee read, a
+node no bundle or token reader asks about, so it never shares a key with the lambda's own entry
+at its declaration. It names the instance mono already built for that call, the one the registry
+holds, so no lambda is built twice for it. Over the 3,944 files the conflict count stays 0.
+
+**Step 2's third PR (2026-11-05): one writer.** `monoCadRowWrite` is the only writer, and every
+caller names the instance. It counts three things beside the row, exported for a self-check from
+entry.vl:
+- a key already answering another slot (`cadRowConflicts`);
+- a signature that does not close, which is skipped (`cadRowUnkeyed`);
+- a write at no instance for a site declared inside a function mono instances (`cadRowInstMissed`).
+  These are counted, not refused: 30 files that run today write one.
+
+Over the 3,944 files: 0 conflicts; 16 unkeyed writes in 8 files; 116 writes at no instance in 30
+files, every one a lambda instance whose template was never cloned (`monoCadNoteInstance`).
+Deriving those from the frame the slot hangs under moves the bytes of 2 files that print the
+same, so some reader reads them. That is a behaviour change, made separately.
+
 ### Matrix
 
 The bundle record is an anonymous record, so its position matrix must include a same-shape
