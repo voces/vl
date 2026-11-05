@@ -2043,6 +2043,8 @@ let fnTagArmsBy: {[string]: i32[]} = Map()
 let fnTagArmMember: {[i32]: i32} = Map()
 // By `let` declaration: the tagged set it holds, recorded when the set is tagged.
 let fnTagBind: {[i32]: i32} = Map()
+// Per union a shared type parameter is bound to (`fnTagSharedJoinSet`), the arguments' sets.
+let fnTagJoinFrom: {[i32]: i32[]} = Map()
 
 // Whether call `ix` names the one member of set `s` by its own name: a direct call, not a call
 // through a value of the set.
@@ -3133,12 +3135,14 @@ export function elabCapReset() {
   fnTagArmsBy = Map()
   fnTagArmMember = Map()
   fnTagBind = Map()
+  fnTagJoinFrom = Map()
   0
 }
 
 // Whether parameter `i` of `f` is annotated by a bare own type parameter `T` that no return
 // annotation names, every other parameter naming `T` is annotated by it bare, and `args` hands
-// each of them the same named function, so `T` binds to one set.
+// each of them the same named function or each a generic one, so `T` binds to one set: the
+// union of theirs (`fnTagJoinedSetTy`), whose ids are each member's own.
 export function fnTagOwnTyParamShared(
   f: FuncDecl,
   i: i32,
@@ -3169,13 +3173,86 @@ export function fnTagOwnTyParamShared(
       if !(qt is TypeRef) || qt.tyName != tn.tyName || k >= args.length {
         return false
       }
-      if d >= 0 && fnTagSharedArgDecl(args[k]) != d { return false }
+      if d >= 0 && !fnTagJoinsWith(d, fnTagSharedArgDecl(args[k])) {
+        return false
+      }
       if d < 0 && fnTagSharedArgTyParam(args[k]) != g { return false }
     }
     k = k + 1
   }
   true
 }
+
+// Whether named functions `d` and `e` bind one type parameter together: the same function, or
+// two generic ones, each a set member whose id holds in their union.
+function fnTagJoinsWith(d: i32, e: i32): boolean {
+  if d == e { return true }
+  if d < 0 || e < 0 || d >= P.nodes.length || e >= P.nodes.length {
+    return false
+  }
+  const dn = nodeAt(d)
+  const en = nodeAt(e)
+  dn is FuncDecl
+    && en is FuncDecl
+    && dn.fnTyParams.length > 0
+    && en.fnTyParams.length > 0
+}
+
+// A function type carrying the union of the sets types `a` and `b` carry: `a` when they carry
+// one, a type of `a`'s signature when no type carries the union yet, -1 when either carries none.
+function fnTagJoinedSetTy(a: i32, b: i32): i32 {
+  const sa = fnTagSetOfTy(a)
+  const sb = fnTagSetOfTy(b)
+  if sa < 0 || sb < 0 { return -1 }
+  if sa == sb { return a }
+  const u = fnSetIntern(fnSetUnion(sa, sb))
+  const have = fnTagSetTy(u)
+  if have >= 0 { return have }
+  if a >= T.tys.length { return -1 }
+  const af = T.tys[a]
+  if !(af is TyFunc) { return -1 }
+  const ps: i32[] = []
+  for q in af.fnParamTypes { ps.push(q) }
+  const g: Ty = { fnParamTypes: ps, fnRet: af.fnRet }
+  T.tys.push(g)
+  elabFnSetTy[T.tys.length - 1] = u
+  T.tys.length - 1
+}
+
+// The set parameter `i` of `f` binds where `fnTagOwnTyParamShared` holds and `args` hands its
+// type parameter two generic functions: the union of the arguments' sets; -1 for any other.
+export function fnTagSharedJoinSet(f: FuncDecl, i: i32, args: i32[]): i32 {
+  if !fnTagOwnTyParamShared(f, i, args) { return -1 }
+  const pn = nodeAt(f.fnParams[i])
+  if !(pn is Param) || pn.parType < 0 || pn.parType >= P.nodes.length {
+    return -1
+  }
+  const tn = nodeAt(pn.parType)
+  if !(tn is TypeRef) { return -1 }
+  let jt = nodeTyIxOf(parenPeelIx(args[i]))
+  let k = 0
+  while k < f.fnParams.length && k < args.length && jt >= 0 {
+    const q = nodeAt(f.fnParams[k])
+    const qt = if q is Param && q.parType >= 0 { nodeAt(q.parType) } else { null }
+    if k != i && qt is TypeRef && qt.tyName == tn.tyName {
+      jt = fnTagJoinedSetTy(jt, nodeTyIxOf(parenPeelIx(args[k])))
+    }
+    k = k + 1
+  }
+  fnTagSetOfTy(jt)
+}
+
+// Records that an instance binds a shared type parameter to union `u`, which set `s` joins.
+export function fnTagJoinFromNote(u: i32, s: i32) {
+  if u < 0 || s < 0 || u == s { return 0 }
+  const have = fnTagJoinFrom[u] ?? []
+  if !i32ListHas(have, s) { have.push(s) }
+  fnTagJoinFrom[u] = have
+  0
+}
+
+// The argument sets an instance's shared type parameter joins into union `u`.
+export function fnTagJoinFromOf(u: i32): i32[] { fnTagJoinFrom[u] ?? [] }
 
 // The type parameter that bare-annotates the parameter argument `a` reads, or "" for any other
 // argument.
