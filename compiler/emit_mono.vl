@@ -376,7 +376,7 @@ import {
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
-import { callBindShadowNote, fnFlowSigFailNote } from "./call_bind_shadow"
+import { callBindShadowNote } from "./call_bind_shadow"
 import {
   FS_COMPILE,
   fsAsk,
@@ -13016,7 +13016,7 @@ function monoCoerceWrittenCell(
   monoWrittenLetBusy.push(lf[1])
   monoLastInstFe = -1
   const took = monoCellValueTake(seed, tname, lf[0], tys)
-  if took == 1 { monoBindSigFail(name, lf[1]) }
+  if took == 1 { emitFail(MONO_BIND_SIG_PRE + name + MONO_BIND_SIG_POST) }
   if took == 2 { monoCellValueFail(name) }
   if monoLastInstFe >= 0 && monoLastInstFe < fnStmts.length {
     const it = monoPinSubTyOf(
@@ -13034,7 +13034,7 @@ function monoCoerceWrittenCell(
       const wt = monoCellValueTake(nd.binRight, tname, wf[0], tys)
       if wt == 1 {
         if wf[0] == lf[0] || !monoFrameIsGenericInstance(lf[0]) {
-          monoBindSigFail(name, lf[1])
+          emitFail(MONO_BIND_SIG_PRE + name + MONO_BIND_SIG_POST)
         } else {
           monoCellWriterSigFail(name)
         }
@@ -19201,9 +19201,8 @@ function monoAnnWrittenLetAt(at: i32, ctx: i32): boolean {
   lt >= 0 && lt < T.tys.length && tyAt(lt) is TyFunc
 }
 
-// For an un-annotated `let` read at `at` that an `=` writes: takes `tname` against the join of
-// the pins its value flows to (`monoLetPinTake`), then instances each named generic function its
-// initializer or a live write names at that type (at `delTys`, the slot's parameter types, when
+// For an un-annotated `let` read at `at` that an `=` writes: instances each named generic
+// function its initializer or a live write names at type `tname` (at `delTys`, the slot's parameter types, when
 // not empty), and answers true; false for any other read, which keeps its value (D3930).
 function monoCoerceWrittenLetTys(
   at: i32,
@@ -19223,12 +19222,6 @@ function monoCoerceWrittenLetTys(
   if fnTagTyIsTagged(nodeTyIxOf(at)) { return false }
   const byCall = monoCellSigByCall
   monoCellSigByCall = false
-  const take = monoLetPinTake(lf, tname, byCall)
-  if take == MONO_PIN_REFUSE {
-    monoBindSigFail(d.letName, lf[1])
-    return true
-  }
-  if take == MONO_PIN_KEEP { return true }
   monoWrittenLetBusy.push(lf[1])
   monoLastInstFe = -1
   // A binding seeded with a function that returns nothing drops the result of every function
@@ -19277,77 +19270,7 @@ function monoNoteVoidTwin(v: i32, tname: string, ctx: i32, holes: boolean) {
   voidTwinSeamNote(x, fe, tname)
 }
 
-// `monoLetPinTake`'s answers: coerce the binding's values at the delivery's type, keep them at
-// the wider join, or refuse the binding (`monoBindSigFail`).
-const MONO_PIN_COERCE = 0
-const MONO_PIN_KEEP = 1
-const MONO_PIN_REFUSE = 2
-
-// How the written `let` `lf` takes a delivery at function type `tname`, in any delivery order: it
-// is held at the join (`monoSigJoin`) of its pins (`monoLetPins`), which must be one of them.
-// Differing pins join only when nothing is returned, and only the binding's own call (`byCall`),
-// which converts its argument, may arrive at a list the join widens.
-function monoLetPinTake(lf: i32[], tname: string, byCall: boolean): i32 {
-  const sig = monoFnNameSig(tname)
-  if sig == "" { return MONO_PIN_COERCE }
-  const pins = monoLetPins(lf)
-  if pins.length == 0 { return MONO_PIN_COERCE }
-  let join = pins[0]
-  let i = 1
-  while i < pins.length {
-    join = monoSigJoin(join, pins[i])
-    if join == "" { return MONO_PIN_REFUSE }
-    i = i + 1
-  }
-  if !strListHas(pins, join) { return MONO_PIN_REFUSE }
-  const quiet = monoSigRetVoid(tname)
-  if pins.length > 1 && !quiet { return MONO_PIN_REFUSE }
-  if sig == join { return MONO_PIN_COERCE }
-  // A function-value pin (`=>k`) names a wasm signature, so it is compared at the closed
-  // parameter types of the call that pins it (D9851).
-  const noPath: string[] = []
-  if sig == monoFnNameSig(monoSlotPinAnn(lf, noPath, join, "void")) {
-    return MONO_PIN_COERCE
-  }
-  // The binding's own call takes an instance whose parameters each admit the one pin's, such as
-  // a function value at a nullable function parameter, and converts its arguments (D9852).
-  if byCall && pins.length == 1 && monoPinWidensTo(lf[1], join, tname) {
-    return MONO_PIN_COERCE
-  }
-  if byCall && quiet && monoSigJoin(sig, join) == join { return MONO_PIN_KEEP }
-  MONO_PIN_REFUSE
-}
-
-// Whether each closed type pin `sig` of binding `d` is taken at is assignable to the matching
-// parameter of function type `tname`, compared on the arena.
-function monoPinWidensTo(d: i32, sig: string, tname: string): boolean {
-  const noPath: string[] = []
-  const pt = fnFlowDeclPathPinTysOf(d, noPath, sig)
-  const parts: string[] = []
-  if annFnDecompose(peelGroupParens(nonNulBaseOf(tname)), parts) == "" {
-    return false
-  }
-  if pt.length != parts.length { return false }
-  let k = 0
-  while k < pt.length {
-    const want = nameToTy(parts[k])
-    if pt[k] < 0 || want < 0 || tyHasTyVar(pt[k]) || tyHasTyVar(want) {
-      return false
-    }
-    if !assignable(pt[k], want) { return false }
-    k = k + 1
-  }
-  true
-}
-
-// The pins (`fnFlowDeclPathPinSigs`) of the written `let` `lf`, in the walk its frame's instance
-// stands for; empty when the table answers none.
-function monoLetPins(lf: i32[]): string[] {
-  const path: string[] = []
-  monoDeclPathPins(lf, path)
-}
-
-// `monoLetPins` for the slot `path` derives from the binding (`fnFlowDeclPathPinSigs`).
+// The pins of the written `let` `lf` at the slot `path` derives from it (`fnFlowDeclPathPinSigs`).
 function monoDeclPathPins(lf: i32[], path: string[]): string[] {
   const dead: {[i32]: boolean} = Map()
   monoDeclPathKeys(lf, path, false, dead)
@@ -25083,7 +25006,7 @@ function monoHandWrittenLet(
     const d = nodeAt(lf[1])
     let nm = ""
     if d is LetDecl { nm = d.letName }
-    return monoBindSigFail(nm, lf[1])
+    return emitFail(MONO_BIND_SIG_PRE + nm + MONO_BIND_SIG_POST)
   }
   monoWrittenLetHanded[key] = pre
   monoCoerceWrittenLetTys(
@@ -28080,14 +28003,16 @@ function monoBindingAtPin(lf: i32[], nDecl: i32): i32 {
   const path: string[] = []
   if ce >= 0 { path.push("e") }
   const pins = monoDeclPathPins(lf, path)
-  if pins.length > 1 { return monoBindSigFail(d.letName, lf[1]) }
+  if pins.length > 1 {
+    return emitFail(MONO_BIND_SIG_PRE + d.letName + MONO_BIND_SIG_POST)
+  }
   // One read by name is renamed to the instance at the pin, as a write by name is.
   if (
     pins.length == 1
     && monoWriteNamesLam(iv, monoLamValueFe(iv, lf[0]), lf[0])
   ) {
     if monoRenameInitAt(lf[1], lf[0], pins[0] + ";", nDecl) < 0 {
-      return monoBindSigFail(d.letName, lf[1])
+      return emitFail(MONO_BIND_SIG_PRE + d.letName + MONO_BIND_SIG_POST)
     }
     return monoRetypePinCalls(lf[1], path)
   }
@@ -28852,19 +28777,12 @@ function monoSigListHas(all: string, one: string): boolean {
   false
 }
 
-// Refuses `let` `decl` for holding functions called at two signatures, and asks the driver
-// to give it an instance record (`fn_split.vl`), which replaces this compile when it builds.
-function monoBindSigFail(nm: string, decl: i32): i32 {
-  fsAsk(decl)
-  fnFlowSigFailNote(nm)
-  emitFail(
-    "emitProgram: the reassigned function binding `"
-      + nm
-      + "` holds functions called at more than one argument type — one binding holds one closure "
-      + "signature, and the values written to it want two. Annotate the parameters, or "
-      + "bind a separate value per type",
-  )
-}
+// The refusal of a `let` whose values are called at two signatures; the binding's name goes
+// between the two halves.
+const MONO_BIND_SIG_PRE = "emitProgram: the reassigned function binding `"
+const MONO_BIND_SIG_POST = "` holds functions called at more than one argument type — one binding holds one closure "
+  + "signature, and the values written to it want two. Annotate the parameters, or "
+  + "bind a separate value per type"
 
 // Instantiate the un-annotated lambda in slot `fe` at the concrete parameter types the checker
 // recorded for it (a callback's contextual type), so a generic its body calls is pinned there
