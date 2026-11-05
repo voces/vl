@@ -1302,9 +1302,11 @@ instance `monoMakeInstance` built was recorded with its elaboration key (`monoKe
   `K|null#litK`), with identical bodies: duplicates. The other 14 are the gap: 7 annotated,
   non-generic functions each instanced at two storage rows (`take` at `{f: i32 | null}` and at
   `{f: i32}`, in the `soundness/built-container-*` and `fresh-literal-handed-back-wider-*` fixtures).
-  `callArgRepTy` answers only a call with a bind row, that is, a generic one, so the elaboration has
-  no delivered-rep fact for these calls. That fact, per argument of a non-generic call, is what the
-  key's rep component needs.
+  Their rep is already a checker fact: `recArgRepNote` records the row a built-container read
+  handed to an annotated parameter is stored at (D14532), and `monoPinAnnotatedParam` pins at
+  `recArgRepOf` of the argument, else the annotation. The key's rep component is therefore
+  `callArgRepTy` for a generic call and `recArgRepOf`, else the parameter's declared type, for a
+  non-generic one: no fact is missing.
 - **One spelling, several keys (26 groups).** One generic returned by different functions;
   `elabInstSpelling` omits the parent, so the key carries it.
 
