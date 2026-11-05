@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **D15404 closed:** an un-annotated `let` copy of a parameter that nothing re-points is the parameter for the elaboration's list and record rules, as a `const` copy is (`elabParamCopyOf`, read through `cwLetUnwritten`), so `hole-fn-copy-in-record-called-beside-other-key` leaves the split-plan dependents; a re-pointed copy keeps its loud refusal.
 - **D15445 closed:** a hole parameter held in a `const` record literal and called through the field runs at any number of types: a record literal an instance types holding a tagged set's id has its own row (`sLitIdRow`), and a `const` record literal of a parameter whose every read is a field called in place is a call of the parameter in the elaboration (`elabRecParamSource`), the record twin of the list rule.
 - **D15305 closed:** a record literal an instance types holding a tagged set's id has its own row at that instance (`sLitIdRow`), so a function of an un-annotated parameter returning one of two record literals of different un-annotated functions runs.
 - **D15400 closed:** a closure-keyed instance whose every reaching call hands a parameter the reaching instance was handed the set at is excused from the elaboration's partial-set rule (`elabReachHandsSet`), so a parameter re-pointed into a written `let` and handed to a hole forwarder runs without the split plan, and so does `fn-value-param-copied-into-binding-called-at-another-type`.
