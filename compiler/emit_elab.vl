@@ -10635,10 +10635,61 @@ export function elabCheckedTyOf(ix: i32): i32 {
 }
 
 // The closed function types slot `path` (steps `e`, `v`, `f.<name>`) of binding or literal `d` is
-// delivered at: the destination recorded for each read of it or of a binding given its value
-// (`recordCtxTy`, per instance too), each call through such a read, and the slot's own closed type.
+// delivered at in instance `k` and the instances it reaches (every instance at -1): each read's
+// recorded destination (`recordCtxTy`), each call through a read, and the slot's own closed type.
 // A literal answers for the bindings holding it.
-export function elabSlotDeliveries(d: i32, path: string[]): i32[] {
+export function elabSlotDeliveries(d: i32, path: string[], k: i32): i32[] {
+  const was = elabDlvKey
+  const wasAdmit = elabDlvAdmit
+  elabDlvKey = k
+  elabDlvAdmit = elabReachClosure(k)
+  const out = elabSlotDeliveriesAt(d, path)
+  elabDlvKey = was
+  elabDlvAdmit = wasAdmit
+  out
+}
+
+// Instance `k` and every instance its body reaches, transitively.
+function elabReachClosure(k: i32): {[i32]: boolean} {
+  const got: {[i32]: boolean} = Map()
+  if k < 0 { return got }
+  const todo: i32[] = [k]
+  got[k] = true
+  let i = 0
+  while i < todo.length {
+    const x = todo[i]
+    const rs = if x < ekReach.length { ekReach[x] } else { [] }
+    for r in rs {
+      if !got.has(r) {
+        got[r] = true
+        todo.push(r)
+      }
+    }
+    i = i + 1
+  }
+  got
+}
+
+// The instance key `elabSlotDeliveries` answers for, -1 for every instance, and the instances its
+// body reaches.
+let elabDlvKey = -1
+let elabDlvAdmit: {[i32]: boolean} = Map()
+
+// Whether instance key `kk` is one the asked instance reaches, or nested in one.
+function elabDlvKeyOk(kk: i32): boolean {
+  if elabDlvKey < 0 { return true }
+  let x = kk
+  let hops = 0
+  while x >= 0 && x < ekParent.length && hops < 32 {
+    if elabDlvAdmit.has(x) { return true }
+    x = ekParent[x]
+    hops = hops + 1
+  }
+  false
+}
+
+// `elabSlotDeliveries` under the instance filter.
+function elabSlotDeliveriesAt(d: i32, path: string[]): i32[] {
   const out: i32[] = []
   if d < 0 || d >= P.nodes.length || elabDlvDepth > 8 { return out }
   elabDlvDepth = elabDlvDepth + 1
@@ -10670,7 +10721,8 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
           && nodeAt(a) is Ident
           && identDeclOf(a) >= 0
         ) {
-          for t in elabSlotDeliveries(identDeclOf(a), path) {
+          // The argument is the caller's, read in no instance of this function.
+          for t in elabSlotDeliveries(identDeclOf(a), path, -1) {
             elabRetsAdd(out, t)
           }
         }
@@ -10685,7 +10737,7 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
       elabRetsAdd(out, lt)
     }
     for h in elabLitHolders(d) {
-      for t in elabSlotDeliveries(h, path) { elabRetsAdd(out, t) }
+      for t in elabSlotDeliveriesAt(h, path) { elabRetsAdd(out, t) }
     }
     // An element or field of an outer literal is delivered where that literal's slot is.
     cwIxWant()
@@ -10699,7 +10751,7 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
       const outer: string[] = [step]
       for k in path { outer.push(k) }
       if up >= 0 && up < P.nodes.length && outer.length < 12 {
-        for t in elabSlotDeliveries(up, outer) { elabRetsAdd(out, t) }
+        for t in elabSlotDeliveriesAt(up, outer) { elabRetsAdd(out, t) }
       }
     }
     return 0
@@ -10869,7 +10921,9 @@ function elabReadDeliveries(r: i32, out: i32[], seen: i32[]) {
   let i = 0
   while i + 1 < cs.length {
     const t = cs[i + 1]
-    if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc { elabRetsAdd(out, t) }
+    if elabDlvKeyOk(cs[i]) && t >= 0 && t < T.tys.length && tyAt(t) is TyFunc {
+      elabRetsAdd(out, t)
+    }
     i = i + 2
   }
   elabReadOn(r, out, seen)
@@ -10993,7 +11047,7 @@ function elabParamWritten(n: Node): boolean { n is Param && n.parType >= 0 }
 function elabLitSlotDeliveries(lit: i32, step: string, out: i32[]) {
   if elabLitSlotDepth >= 4 { return 0 }
   elabLitSlotDepth = elabLitSlotDepth + 1
-  for t in elabSlotDeliveries(lit, [step]) { elabRetsAdd(out, t) }
+  for t in elabSlotDeliveriesAt(lit, [step]) { elabRetsAdd(out, t) }
   elabLitSlotDepth = elabLitSlotDepth - 1
   0
 }
@@ -11099,7 +11153,7 @@ function elabCallDeliveryAdd(c: i32, out: i32[]) {
   if !(cn is Call) { return 0 }
   const agreed = elabCallArgTysAgreed(c)
   const r = elabNodeTyAgreed(c)
-  if agreed.length == cn.callArgs.length && r >= 0 {
+  if elabDlvKey < 0 && agreed.length == cn.callArgs.length && r >= 0 {
     elabRetsAdd(out, mkFuncTy(agreed, r))
     return 0
   }
@@ -11120,6 +11174,10 @@ function elabCallDeliveryAdd(c: i32, out: i32[]) {
   let i = 0
   while i + 1 < ks.length {
     const k = ks[i]
+    if !elabDlvKeyOk(k) {
+      i = i + 2
+      continue
+    }
     const tys: i32[] = []
     for a in cn.callArgs {
       const t = elabTyIn(a, k)
