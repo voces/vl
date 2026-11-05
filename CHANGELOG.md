@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **A choice of a capturing nested function and top-level generics** handed to a parameter called at two types is one bundle, so `choice-of-nested-capturing-and-top-level-generic-handed-to-param` runs without the split plan; D15446 files the same generic also handed alone, a hidden split-plan dependent.
 - **D15450 closed:** a function nested in non-generic functions, capturing them, or a choice between such functions, handed to a parameter called at two types is delivered as a bundle, one closure per signature (D14841's capturing shape), so `choice-of-nested-capturing-function-handed-to-hole-param` runs without the split plan.
 - **D15404 closed:** an un-annotated `let` copy of a parameter that nothing re-points is the parameter for the elaboration's list and record rules, as a `const` copy is (`elabParamCopyOf`, read through `cwLetUnwritten`), so `hole-fn-copy-in-record-called-beside-other-key` leaves the split-plan dependents; a re-pointed copy keeps its loud refusal.
 - **D15445 closed:** a hole parameter held in a `const` record literal and called through the field runs at any number of types: a record literal an instance types holding a tagged set's id has its own row (`sLitIdRow`), and a `const` record literal of a parameter whose every read is a field called in place is a call of the parameter in the elaboration (`elabRecParamSource`), the record twin of the list rule.
