@@ -1295,9 +1295,16 @@ instance `monoMakeInstance` built was recorded with its elaboration key (`monoKe
   (`deliver` in `closures/generic-returned-record-param.vl`, `F$m…` in
   `generics/instance-call-of-literal-union-field-function.vl`), which the key merges with no change
   in output.
-- **No elaboration key (127 instances).** 36 annotated functions instanced per storage row, 46
-  lambdas, 45 hole-parameter functions solved closed. None is generic to the elaboration, so its key
-  is the declaration plus the rep row.
+- **No elaboration key (127 instances).** 109 are their template's only instance (46 lambdas, 41
+  hole-parameter functions solved closed, 22 annotated functions at one storage row): the
+  declaration is the key. 4 are two hole-parameter functions instanced twice at one literal-union
+  type (`elem`, `glob` in `generics/type-param-write-literal-union-at-pin.vl`, `K|null` against
+  `K|null#litK`), with identical bodies: duplicates. The other 14 are the gap: 7 annotated,
+  non-generic functions each instanced at two storage rows (`take` at `{f: i32 | null}` and at
+  `{f: i32}`, in the `soundness/built-container-*` and `fresh-literal-handed-back-wider-*` fixtures).
+  `callArgRepTy` answers only a call with a bind row, that is, a generic one, so the elaboration has
+  no delivered-rep fact for these calls. That fact, per argument of a non-generic call, is what the
+  key's rep component needs.
 - **One spelling, several keys (26 groups).** One generic returned by different functions;
   `elabInstSpelling` omits the parent, so the key carries it.
 
