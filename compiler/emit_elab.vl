@@ -3707,9 +3707,99 @@ function elabCalleeParam(root: i32, decl: i32, k: i32): i32 {
   if nodeAt(d) is Param { return d }
   const ap = elabCallOnlyAlias(d, dn, k)
   if ap >= 0 { return ap }
-  const lp = elabListParamSource(d, dn)
+  const lp = elabHolderParamSource(d, dn)
   if lp >= 0 { return lp }
   elabWrittenParamAlias(d, dn)
+}
+
+// `elabListParamSource`, or else `elabRecParamSource`.
+function elabHolderParamSource(d: i32, fn: FuncDecl): i32 {
+  const lp = elabListParamSource(d, fn)
+  if lp >= 0 { return lp }
+  elabRecParamSource(d, fn)
+}
+
+// The parameter of `fn` every field of the `const` record literal bound at `d` reads, where each
+// read of `d` in `fn`'s own body is a field called in place (`d.f(...)`); else -1 (D15445).
+function elabRecParamSource(d: i32, fn: FuncDecl): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const ln = nodeAt(d)
+  if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return -1 }
+  const li = parenPeelIx(ln.letInit)
+  if li < 0 || li >= P.nodes.length { return -1 }
+  const ol = nodeAt(li)
+  if !(ol is ObjLit) || ol.objFields.length == 0 { return -1 }
+  let pd = -1
+  for f in ol.objFields {
+    const fi = nodeAt(f)
+    if !(fi is FieldInit) { return -1 }
+    const ex = parenPeelIx(fi.fiValue)
+    if ex < 0 || ex >= P.nodes.length || !(nodeAt(ex) is Ident) { return -1 }
+    const src0 = identDeclOf(ex)
+    const src = if i32ListHas(fn.fnParams, src0) { src0 } else { elabConstParamCopy(src0, fn) }
+    if src < 0 || pd >= 0 && src != pd { return -1 }
+    pd = src
+  }
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  const gpar: i32[] = [-1]
+  const deep: boolean[] = [false]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    const g = gpar.pop() ?? -1
+    const nested = deep.pop() ?? false
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Ident && identDeclOf(x) == d {
+        if nested || p < 0 || g < 0 { return -1 }
+        const pn = nodeAt(p)
+        const gn = nodeAt(g)
+        if !(pn is Member) || pn.memObj != x { return -1 }
+        if !(gn is Call) || parenPeelIx(gn.callFn) != p { return -1 }
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+        gpar.push(p)
+        deep.push(nested || xn is FuncDecl)
+      }
+    }
+  }
+  pd
+}
+
+// The binding a call through field read `x` reads, where `x` reads a field of a record
+// `elabRecParamSource` takes; else `x` itself.
+function elabRecFieldRoot(x: i32, fn: FuncDecl): i32 {
+  if x < 0 || x >= P.nodes.length { return x }
+  const m = nodeAt(x)
+  if !(m is Member) { return x }
+  const o = parenPeelIx(m.memObj)
+  if o < 0 || o >= P.nodes.length || !(nodeAt(o) is Ident) { return x }
+  if elabRecParamSource(identDeclOf(o), fn) < 0 { return x }
+  o
+}
+
+// Whether field initialiser `fi` belongs to a record literal that initialises a binding in
+// `fn`'s body `elabRecParamSource` takes as parameter `pd`.
+function elabRecLitOfParam(fi: i32, fn: FuncDecl, pd: i32): boolean {
+  const todo: i32[] = [fn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is LetDecl {
+        const li = parenPeelIx(xn.letInit)
+        const ol = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { nodeAt(x) }
+        if ol is ObjLit && i32ListHas(ol.objFields, fi) {
+          return elabRecParamSource(x, fn) == pd
+        }
+      }
+      for c in nodeChildren(x) { todo.push(c) }
+    }
+  }
+  false
 }
 
 // The parameter of `fn` every element of the `const` list literal bound at `d` reads, where each
@@ -3799,6 +3889,7 @@ function elabCopyOnlyListed(d: i32, fn: FuncDecl, pd: i32): boolean {
         if (
           !chained
           && (p < 0 || !(nodeAt(p) is ArrayLit) || !elabListLitOfParam(p, fn, pd))
+          && (p < 0 || !(nodeAt(p) is FieldInit) || !elabRecLitOfParam(p, fn, pd))
         ) {
           return false
         }
@@ -4264,6 +4355,10 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       }
       // So does a `const` list literal of it whose elements are only ever called.
       if (p >= 0 && nodeAt(p) is ArrayLit && elabListLitOfParam(p, dn, pd)) {
+        return 0
+      }
+      // So does a `const` record literal of it whose fields are only ever called.
+      if p >= 0 && nodeAt(p) is FieldInit && elabRecLitOfParam(p, dn, pd) {
         return 0
       }
       // A `const` alias that is only ever called reads the set where its calls do.
@@ -6654,7 +6749,9 @@ export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
 // binds to a set of functions each instanced at the call's closed argument types.
 function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const cf = parenPeelIx(c.callFn)
-  const root = elabSlotRoot(elabElemAliasInit(cf, decl))
+  const dn0 = nodeAt(decl)
+  const root0 = elabSlotRoot(elabElemAliasInit(cf, decl))
+  const root = if dn0 is FuncDecl { elabRecFieldRoot(root0, dn0) } else { root0 }
   const pd = elabCalleeParam(root, decl, k)
   if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) {
     if elabMintOuterSlotFactAt(c, ix, k, sc) { return true }
@@ -6692,7 +6789,7 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   if !split { elabNodeTyFill(ix, k, rs[0]) }
   // An element of a list literal of the parameter is the parameter's value, so its call goes
   // through the parameter's set too.
-  if root != cf && elabListParamSource(identDeclOf(root), dn) == pd {
+  if root != cf && elabHolderParamSource(identDeclOf(root), dn) == pd {
     mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
   }
   if root == cf {
@@ -6715,7 +6812,7 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const own = root != cf && identDeclOf(root) == pd
   const held = root != cf
     && !own
-    && elabListParamSource(identDeclOf(root), dn) != pd
+    && elabHolderParamSource(identDeclOf(root), dn) != pd
   if (
     was != fnTagSetOfTy(st)
     && (held
