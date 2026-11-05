@@ -18,7 +18,12 @@ import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftWithinInstancedFn } from "./check_fn_tag"
-import { elabArmFeOf, elabCallParamBoundTy } from "./emit_elab"
+import {
+  elabArmFeOf,
+  elabCallParamBoundTy,
+  elabIsParamRead,
+  elabParamReadOtherThanCalled,
+} from "./emit_elab"
 import {
   mkNumTyped,
   narrowedFromTyCopy,
@@ -643,7 +648,6 @@ import {
   elabCallSetIn,
   elabCopyTyOwn,
   elabDemand,
-  elabHolderRecordAt,
   elabHoleFnClosed,
   elabHoleMapClosed,
   elabInstSlotAt,
@@ -10765,7 +10769,7 @@ function monoBodyReturnsParam(body: i32, par: i32): boolean {
   if body < 0 { return false }
   const b = nodeAt(body)
   if b is Block && b.blkStmts.length > 0 {
-    if monoIsParamRead(b.blkStmts[b.blkStmts.length - 1], par) { return true }
+    if elabIsParamRead(b.blkStmts[b.blkStmts.length - 1], par) { return true }
   }
   monoStmtReturnsParam(body, par)
 }
@@ -10774,7 +10778,7 @@ function monoBodyReturnsParam(body: i32, par: i32): boolean {
 function monoStmtReturnsParam(x: i32, par: i32): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   const n = nodeAt(x)
-  if n is RetStmt { return monoIsParamRead(n.retArg, par) }
+  if n is RetStmt { return elabIsParamRead(n.retArg, par) }
   if (
     n is Block
     || n is IfStmt
@@ -23031,149 +23035,11 @@ function monoCadRowFe(site: i32, inst: i32, sig: i32): i32 {
   -1
 }
 
-// Whether node `x` or one beneath it reads parameter `par` other than as the callee of a call in
-// its own function's body (`own`): handed on, stored, or read by a nested function. With `fwd`, a
-// read handed whole to a named function as a positional argument is not counted, and with `cap` a
-// call through it or such a hand in a nested function at any depth is not either.
-function monoParamReadOtherThanCalled(
-  x: i32,
-  par: i32,
-  own: boolean,
-  fwd: boolean,
-  cap: boolean,
-): boolean {
-  if x < 0 || x >= P.nodes.length { return false }
-  const n = nodeAt(x)
-  if n is Ident { return identDeclOf(x) == par }
-  if n is FuncDecl {
-    for k in nodeChildren(x) {
-      if monoParamReadOtherThanCalled(k, par, cap, cap, cap) { return true }
-    }
-    return false
-  }
-  if n is Call {
-    const cf = unwrapParen(n.callFn)
-    const cd = if cf >= 0 && nodeAt(cf) is Ident { identDeclOf(cf) } else { -1 }
-    const called = own && cd == par
-    const named = own
-      && fwd
-      && cd >= 0
-      && cd < P.nodes.length
-      && (nodeAt(cd) is FuncDecl || monoConstFnCopy(cd))
-    for k in nodeChildren(x) {
-      const ku = unwrapParen(k)
-      const handed = named
-        && i32ListHas(n.callArgs, k)
-        && ku >= 0
-        && nodeAt(ku) is Ident
-        && identDeclOf(ku) == par
-      if (
-        !(called && ku == cf)
-        && !handed
-        && monoParamReadOtherThanCalled(k, par, own, fwd, cap)
-      ) {
-        return true
-      }
-    }
-    return false
-  }
-  for k in nodeChildren(x) {
-    if monoParamReadOtherThanCalled(k, par, own, fwd, cap) { return true }
-  }
-  false
-}
-
-// Whether `d` is a `const` binding whose value is a read of a named function.
-function monoConstFnCopy(d: i32): boolean {
-  const n = nodeAt(d)
-  if !(n is LetDecl) || n.letKw != "const" { return false }
-  const v = unwrapParen(n.letInit)
-  if v < 0 || !(nodeAt(v) is Ident) { return false }
-  const fd = identDeclOf(v)
-  fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl
-}
-
-// `monoParamReadOtherThanCalled` over function body `body`, where with `fwd` a return of `par`
-// from the function itself, by `return` or as the body's last statement, is not counted either,
-// nor is a copy the elaboration holds the record in under callee instance `hk`.
-function monoBodyReadsOtherThanCalled(
-  body: i32,
-  par: i32,
-  fwd: boolean,
-  hk: i32,
-): boolean {
-  if body < 0 { return false }
-  const b = nodeAt(body)
-  if !(b is Block) {
-    return monoParamReadOtherThanCalled(body, par, true, fwd, fwd)
-  }
-  if !fwd {
-    for st in b.blkStmts {
-      if (
-        !monoCopyHeld(st, par, hk)
-        && monoParamReadOtherThanCalled(st, par, true, false, false)
-      ) {
-        return true
-      }
-    }
-    return false
-  }
-  let i = 0
-  while i < b.blkStmts.length {
-    const st = b.blkStmts[i]
-    const last = i == b.blkStmts.length - 1
-    if !(last && monoIsParamRead(st, par)) && monoStmtReadsOther(st, par, hk) {
-      return true
-    }
-    i = i + 1
-  }
-  false
-}
-
-// Whether node `x` is a read of parameter `par`, under parentheses.
-function monoIsParamRead(x: i32, par: i32): boolean {
-  const u = if x >= 0 { unwrapParen(x) } else { -1 }
-  u >= 0 && nodeAt(u) is Ident && identDeclOf(u) == par
-}
-
-// Whether statement `x` is a copy of parameter `par` the elaboration holds the record in under
-// callee instance `hk`.
-function monoCopyHeld(x: i32, par: i32, hk: i32): boolean {
-  if hk < 0 || x < 0 || x >= P.nodes.length { return false }
-  const n = nodeAt(x)
-  n is LetDecl
-    && monoIsParamRead(n.letInit, par)
-    && elabHolderRecordAt(x, hk).length > 0
-}
-
-// `monoBodyReadsOtherThanCalled` for statement `x` of the function's own body.
-function monoStmtReadsOther(x: i32, par: i32, hk: i32): boolean {
-  if x < 0 || x >= P.nodes.length { return false }
-  const n = nodeAt(x)
-  if n is RetStmt && monoIsParamRead(n.retArg, par) { return false }
-  if monoCopyHeld(x, par, hk) { return false }
-  if (
-    n is Block
-    || n is IfStmt
-    || n is WhileStmt
-    || n is ForIn
-    || n is ForRange
-  ) {
-    for k in nodeChildren(x) {
-      if monoStmtReadsOther(k, par, hk) { return true }
-    }
-    return false
-  }
-  monoParamReadOtherThanCalled(x, par, true, true, true)
-}
-
 // `monoPinHoleParam`'s bundle: where the callee's instance calls the hole lambda literal `arg`,
-// its argument `i`, at two or more signatures, builds the lambda at each and pins the parameter
+// its argument `i`, at the two or more signatures the elaboration answers, builds the lambda at each and pins the parameter
 // at the anonymous record holding one closure per signature. 0, -1 on a failure, or 1 where the
 // argument is no bundle.
 function monoBundlePin(
-  fn: FuncDecl,
-  par: i32,
   arg: i32,
   i: i32,
   callIx: i32,
@@ -23183,12 +23049,6 @@ function monoBundlePin(
 ): i32 {
   const sigs = elabCallBundleSigs(monoCallTplOf(callIx), i)
   if sigs.length < 2 { return 1 }
-  // The callee reads the record only as a callee, or hands it whole to a named function: any other
-  // read wants one closure.
-  const fwd = fsModeOf() == FS_COMPILE
-  const pk = elabCallParamKey(monoCallTplOf(callIx), i)
-  const hk = if pk >= 0 { pk / 64 } else { -1 }
-  if monoBodyReadsOtherThanCalled(fn.fnBody, par, fwd, hk) { return 1 }
   const at = pinTys.length
   const rc = monoBundlePinArg(arg, i, callIx, ctx, sigs, pinned, pinTys)
   // The record each parameter key is pinned at, read by a hand of that parameter.
@@ -23426,7 +23286,7 @@ function monoClosureBundlePin(
   const inst: i32[] = [0 - 1]
   const sigs = elabLamParamSigs(elabSrcDecl(lam), 0, inst)
   if sigs.length < 2 { return 1 }
-  if monoParamReadOtherThanCalled(fn.fnBody, par, true, false, false) {
+  if elabParamReadOtherThanCalled(fn.fnBody, par, true, false, false) {
     return 1
   }
   if !monoCallsHandGenerics(fn.fnBody, par) { return 1 }
@@ -23496,16 +23356,7 @@ function monoPinHoleParam(
   const hm = elabCallHandMember(monoCallTplOf(callIx), i)
   if hm >= -1 { bundleHandMemberNote(args[i], hm) }
   // A lambda the callee calls at two or more signatures is handed as a bundle (D14841).
-  const bun = monoBundlePin(
-    fn,
-    params[i],
-    args[i],
-    i,
-    callIx,
-    ctx,
-    pinned,
-    pinTys,
-  )
+  const bun = monoBundlePin(args[i], i, callIx, ctx, pinned, pinTys)
   if bun != 1 { return bun }
   // A hole lambda that calls its own parameter at two or more signatures, handed to a parameter
   // the callee only calls, is a closure taking that parameter's bundle.
