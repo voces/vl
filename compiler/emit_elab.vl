@@ -91,6 +91,7 @@ import {
   CW_UP_LETINIT,
   CW_UP_OBJ,
   cwBindingWrittenValues,
+  cwFnCalls,
   cwFnValueDeclOf,
   cwFrameOfDecl,
   cwIxBuild,
@@ -109,6 +110,7 @@ import {
   cwPathFnTargets,
   cwPathFnTargetsFrom,
   cwPeelValue,
+  cwSlotPath,
   cwSlotValuesFrom,
   cwSlotWrittenValues,
   cwSpreadPeers,
@@ -318,6 +320,8 @@ import {
 import {
   bodyRebuiltFrom,
   buildFnChildIndex,
+  cboxCellDecls,
+  cboxDeclKey,
   fnChildHead,
   fnChildNext,
   fnInstOrigin,
@@ -10623,6 +10627,316 @@ function elabTyIn(ix: i32, k: i32): i32 {
 export function elabCheckedTyOf(ix: i32): i32 {
   const own = nodeTyIxOf(ix)
   if own >= 0 { own } else { nodeTyIxOf(nodeSrc[ix] ?? -1) }
+}
+
+// The closed function types slot `path` (steps `e`, `v`, `f.<name>`) of binding or literal `d` is
+// delivered at: the destination recorded for each read of it or of a binding given its value
+// (`recordCtxTy`, per instance too), each call through such a read, and the slot's own closed type.
+// A literal answers for the bindings holding it.
+export function elabSlotDeliveries(d: i32, path: string[]): i32[] {
+  const out: i32[] = []
+  if d < 0 || d >= P.nodes.length { return out }
+  // A list or record literal is delivered where the bindings holding it are.
+  const dn = nodeAt(d)
+  if dn is ArrayLit || dn is ObjLit {
+    const lt = elabSlotTyOf(nodeTyIxOf(d), path)
+    if lt >= 0 && tyAt(lt) is TyFunc { elabRetsAdd(out, lt) }
+    for h in elabLitHolders(d) {
+      for t in elabSlotDeliveries(h, path) { elabRetsAdd(out, t) }
+    }
+    // An element or field of an outer literal is delivered where that literal's slot is.
+    cwIxWant()
+    if (
+      cwIxCovers(d)
+      && (cwIxUpKind[d] == CW_UP_ELEM || cwIxUpKind[d] == CW_UP_FIELD)
+    ) {
+      const up = cwIxUp[d]
+      const fi = if cwIxUpKind[d] == CW_UP_FIELD { nodeAt(cwIxUpAux[d]) } else { null }
+      const step = if fi is FieldInit { "f." + fi.fiName } else { "e" }
+      const outer: string[] = [step]
+      for k in path { outer.push(k) }
+      if up >= 0 && up < P.nodes.length && outer.length < 12 {
+        for t in elabSlotDeliveries(up, outer) { elabRetsAdd(out, t) }
+      }
+    }
+    return out
+  }
+  const o = if declOrigOf(d) >= 0 { declOrigOf(d) } else { d }
+  const seen: i32[] = []
+  elabSlotReadDeliveries(o, path, out, seen)
+  const cp: string[] = []
+  for st in path {
+    if st == "e" || st == "v" {
+      cp.push("[]")
+    } else if st.length > 2 && st.slice(0, 2) == "f." {
+      cp.push(st.slice(2, st.length))
+    } else {
+      return out
+    }
+  }
+  for c in elabCalls {
+    const cn = nodeAt(c)
+    if cn is Call && cn.callFn >= 0 && elabSlotReadOf(cn.callFn, o, cp) {
+      elabCallDeliveryAdd(c, out)
+    }
+  }
+  const own = elabSlotTyOf(nodeTyIxOf(o), path)
+  if own >= 0 && tyAt(own) is TyFunc { elabRetsAdd(out, own) }
+  out
+}
+
+// Adds to `out` the closed function types each read of slot `path` of binding `b` is delivered at
+// (its context type, checked and in each instance), following the value into the bindings an
+// un-annotated `let`, an assignment or a call's argument gives it; `seen` holds the bindings walked.
+function elabSlotReadDeliveries(
+  b: i32,
+  path: string[],
+  out: i32[],
+  seen: i32[],
+) {
+  const key = b * 8 + path.length
+  if (
+    b < 0
+    || b >= P.nodes.length
+    || path.length >= 8
+    || i32ListHas(seen, key)
+    || seen.length > 32
+  ) {
+    return 0
+  }
+  seen.push(key)
+  cwIxWant()
+  const ow = cwOccWalk(b)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if (
+      cwIxKind[ow.row] == CW_OCC_USE
+      && u >= 0
+      && u < P.nodes.length
+      && identDeclOf(u) == b
+    ) {
+      const r = elabSlotReadUp(u, path)
+      if r >= 0 { elabReadDeliveries(r, out, seen) }
+    }
+  }
+  0
+}
+
+// The node reading slot `path` (steps `e`, `v`, `f.<name>`) of the value `u` reads, climbing its
+// index and member parents; -1 where a step does not match.
+function elabSlotReadUp(u: i32, path: string[]): i32 {
+  let cur = u
+  for k in path {
+    const p = if cur >= 0 && cur < cwIxParent.length { cwIxParent[cur] } else { -1 }
+    if p < 0 || p >= P.nodes.length { return -1 }
+    const pn = nodeAt(p)
+    if (k == "e" || k == "v") && pn is Index && parenPeelIx(pn.idxArr) == cur {
+      cur = p
+    } else if (
+      pn is Member
+      && parenPeelIx(pn.memObj) == cur
+      && k == "f." + pn.memProp
+    ) {
+      cur = p
+    } else {
+      return -1
+    }
+  }
+  cur
+}
+
+// Adds to `out` the closed function types read `r` is delivered at, and follows its value on.
+function elabReadDeliveries(r: i32, out: i32[], seen: i32[]) {
+  const ct = nodeCtxTyIxOf(r)
+  if ct >= 0 && ct < T.tys.length && tyAt(ct) is TyFunc { elabRetsAdd(out, ct) }
+  const cs = elabNodeCtxs[r] ?? []
+  let i = 0
+  while i + 1 < cs.length {
+    const t = cs[i + 1]
+    if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc { elabRetsAdd(out, t) }
+    i = i + 2
+  }
+  if !cwIxCovers(r) { return 0 }
+  const k = cwIxUpKind[r]
+  const up = cwIxUp[r]
+  if k == CW_UP_CALLEE && up >= 0 {
+    elabCallDeliveryAdd(up, out)
+  } else if k == CW_UP_LETINIT && up >= 0 && up < P.nodes.length {
+    const ln = nodeAt(up)
+    if ln is LetDecl && ln.letType < 0 {
+      elabSlotReadDeliveries(up, [], out, seen)
+    }
+  } else if k == CW_UP_ASG_RHS && up >= 0 && up < P.nodes.length {
+    const an = nodeAt(up)
+    const l = if an is BinExpr { parenPeelIx(an.binLeft) } else { -1 }
+    const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+    if ln is Ident {
+      elabSlotReadDeliveries(identDeclOf(l), [], out, seen)
+    } else if ln is Index {
+      // A write into a shared cell `c[0] = v` the capture rewrite made gives the cell's binding.
+      const a = parenPeelIx(ln.idxArr)
+      const cd = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
+      if cd >= 0 && (cboxCellDecls[cboxDeclKey(cd)] ?? 0) == 1 {
+        elabSlotReadDeliveries(cd, ["e"], out, seen)
+      }
+    }
+  } else if k == CW_UP_ARG && up >= 0 && up < P.nodes.length {
+    const cn = nodeAt(up)
+    const fd = if cn is Call && cn.callFn >= 0 { identFnDeclOf(parenPeelIx(cn.callFn)) } else { -1 }
+    const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+    const ai = cwIxUpAux[r]
+    if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
+      elabSlotReadDeliveries(fn.fnParams[ai], [], out, seen)
+    }
+  }
+  0
+}
+
+// The bindings literal `lit` initialises: the `let` it is the initialiser of, or, when the function
+// declaring it returns it, each `let` a call of that function initialises.
+function elabLitHolders(lit: i32): i32[] {
+  const out: i32[] = []
+  cwIxWant()
+  if !cwIxCovers(lit) { return out }
+  if cwIxUpKind[lit] == CW_UP_LETINIT {
+    out.push(cwIxUp[lit])
+    return out
+  }
+  const rv: i32[] = []
+  const fd = recEnclosingFn(lit)
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || fn.fnBody < 0 { return out }
+  collectRetValues(fn.fnBody, rv)
+  let returned = false
+  for v in rv {
+    if parenPeelIx(v) == lit { returned = true }
+  }
+  if !returned { return out }
+  const calls: i32[] = []
+  cwFnCalls(fd, calls)
+  for c in calls {
+    if (
+      c >= 0
+      && cwIxCovers(c)
+      && cwIxUpKind[c] == CW_UP_LETINIT
+      && !i32ListHas(out, cwIxUp[c])
+    ) {
+      out.push(cwIxUp[c])
+    }
+  }
+  out
+}
+
+// Whether `x` reads slot `cp` of binding `o`, itself or through an un-annotated `const` aliasing it.
+function elabSlotReadOf(x: i32, o: i32, cp: string[]): boolean {
+  let at = parenPeelIx(x)
+  let hops = 0
+  while hops < 8 {
+    const p: string[] = []
+    const root = cwSlotPath(at, p)
+    if root < 0 { return false }
+    const rd = identDeclOf(root)
+    const ro = if declOrigOf(rd) >= 0 { declOrigOf(rd) } else { rd }
+    let same = ro == o && p.length == cp.length
+    let j = 0
+    while same && j < p.length {
+      if p[j] != cp[j] { same = false }
+      j = j + 1
+    }
+    if same { return true }
+    if p.length > 0 || rd < 0 || rd >= P.nodes.length { return false }
+    const rn = nodeAt(rd)
+    if (
+      !(rn is LetDecl)
+      || rn.letType >= 0
+      || rn.letInit < 0
+      || !cwLetUnwritten(rd)
+    ) {
+      return false
+    }
+    at = parenPeelIx(rn.letInit)
+    hops = hops + 1
+  }
+  false
+}
+
+// Adds to `out` the closed function type call `c` is made at: its arguments' and result's types
+// in every instance where they agree, else in each instance that closes them.
+function elabCallDeliveryAdd(c: i32, out: i32[]) {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return 0 }
+  const agreed = elabCallArgTysAgreed(c)
+  const r = elabNodeTyAgreed(c)
+  if agreed.length == cn.callArgs.length && r >= 0 {
+    elabRetsAdd(out, mkFuncTy(agreed, r))
+    return 0
+  }
+  const ks = elabNodeTys[c] ?? []
+  // A call no instance elaborated is typed by the check.
+  if ks.length == 0 {
+    const tys: i32[] = []
+    for a in cn.callArgs {
+      const t = nodeTyIxOf(a)
+      if t >= 0 && !tyHasTyVar(t) { tys.push(widenLitTy(t)) }
+    }
+    const rt = nodeTyIxOf(c)
+    if tys.length == cn.callArgs.length && rt >= 0 {
+      elabRetsAdd(out, mkFuncTy(tys, rt))
+    }
+    return 0
+  }
+  let i = 0
+  while i + 1 < ks.length {
+    const k = ks[i]
+    const tys: i32[] = []
+    for a in cn.callArgs {
+      const t = elabTyIn(a, k)
+      if t >= 0 && !tyHasTyVar(t) { tys.push(t) }
+    }
+    if tys.length == cn.callArgs.length && ks[i + 1] >= 0 {
+      elabRetsAdd(out, mkFuncTy(tys, ks[i + 1]))
+    }
+    i = i + 2
+  }
+  0
+}
+
+// The type at slot `path` of a value of type `t`, nullable wrappers looked through; -1 where a step
+// does not apply.
+function elabSlotTyOf(t: i32, path: string[]): i32 {
+  let c = t
+  for k in path {
+    c = nonNullTy(c)
+    if c < 0 || c >= T.tys.length { return -1 }
+    const ct = tyAt(c)
+    if (k == "e" || k == "v") && ct is TyArray {
+      c = ct.aElem
+    } else if (k == "e" || k == "v") && ct is TyMap {
+      c = ct.mVal
+    } else if ct is TyObj && k.length > 2 && k.slice(0, 2) == "f." {
+      const i = strListIndexOf(ct.objFieldNames, k.slice(2, k.length))
+      if i < 0 { return -1 }
+      c = ct.objFieldTypes[i]
+    } else {
+      return -1
+    }
+  }
+  nonNullTy(c)
+}
+
+// Adds closed type `t` to `out` unless one the same is there.
+function elabRetsAdd(out: i32[], t: i32) {
+  if t < 0 || t >= T.tys.length { return 0 }
+  const ft = tyAt(t)
+  if !(ft is TyFunc) { return 0 }
+  for p in ft.fnParamTypes {
+    if p < 0 || tyHasTyVar(p) || tyReachesHole(p, 8) { return 0 }
+  }
+  for o in out {
+    if tySame(o, t) { return 0 }
+  }
+  out.push(t)
+  0
 }
 
 // `elabSlotHeldFns` of a slot below the binding's own value, [] for the value itself.
