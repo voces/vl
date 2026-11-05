@@ -17,7 +17,7 @@ import { typeRowClassOf } from "./record_rows"
 import { tyParamIsBareOnly } from "./check_scopes"
 import { fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
-import { ftOwnTyParamJoins, ftWithinInstancedFn } from "./check_fn_tag"
+import { ftWithinInstancedFn } from "./check_fn_tag"
 import { elabArmFeOf, elabCallParamBoundTy } from "./emit_elab"
 import {
   mkNumTyped,
@@ -779,18 +779,17 @@ import {
   fnTagArmsAt,
   fnTagCallArms,
   fnTagCallCopy,
+  fnTagCallJoinOf,
   fnTagCallSetOf,
   fnTagHoldsTy,
   fnTagLeafCarry,
   fnTagLeafSetOf,
   fnTagListTy,
   fnTagMembers,
-  fnTagOwnTyParamJoins,
   fnTagRetIsTagged,
   fnTagSetIsTagged,
   fnTagSetOfTy,
   fnTagSetTy,
-  fnTagSharedJoinSet,
   fnTagTyIsTagged,
   paramCopySeedOf,
 } from "./check_elab_cap"
@@ -22360,57 +22359,6 @@ function monoHoleGenBindFnArgs(
   0
 }
 
-// Collects into `qs` the argument types of the calls `<px>.<fld>(...)` under `ix`, where `px` is
-// the parameter the receiver resolves to, counting them in `seen[0]`; false when two disagree or
-// one is open. A read of parameter `ps[j]` is typed `pa[j]` when that is not -1.
-function monoFieldCallArgTys(
-  ix: i32,
-  px: i32,
-  fld: string,
-  qs: i32[],
-  seen: i32[],
-  ps: i32[],
-  pa: i32[],
-): boolean {
-  if ix < 0 || ix >= P.nodes.length { return true }
-  const n = nodeAt(ix)
-  if n is Call {
-    const c = unwrapParen(n.callFn)
-    if c < 0 || c >= P.nodes.length { return true }
-    const cn = nodeAt(c)
-    if cn is Member && cn.memProp == fld {
-      const o = unwrapParen(cn.memObj)
-      if (
-        o >= 0
-        && o < P.nodes.length
-        && nodeAt(o) is Ident
-        && identDeclOf(o) == px
-      ) {
-        if seen[0] > 0 && qs.length != n.callArgs.length { return false }
-        let a = 0
-        while a < n.callArgs.length {
-          let at = nodeTyIxOf(n.callArgs[a])
-          const ax = unwrapParen(n.callArgs[a])
-          if ax >= 0 && nodeAt(ax) is Ident {
-            let j = 0
-            while j < ps.length && ps[j] != identDeclOf(ax) { j = j + 1 }
-            if j < ps.length && j < pa.length && pa[j] >= 0 { at = pa[j] }
-          }
-          if at < 0 || tyHasTyVar(at) || tyReachesHole(at, 16) { return false }
-          if seen[0] == 0 { qs.push(at) }
-          else if !tyEq(qs[a], at) { return false }
-          a = a + 1
-        }
-        seen[0] = seen[0] + 1
-      }
-    }
-  }
-  for k in nodeChildren(ix) {
-    if !monoFieldCallArgTys(k, px, fld, qs, seen, ps, pa) { return false }
-  }
-  true
-}
-
 // Delivers each function of `elems` at function type `ft`, a hole function's name as a direct
 // argument is (`monoFnPinAt`); false when one is refused.
 function monoDeliverFnElemsAt(elems: i32[], ft: i32, ctx: i32): boolean {
@@ -22424,49 +22372,6 @@ function monoDeliverFnElemsAt(elems: i32[], ft: i32, ctx: i32): boolean {
     } else {
       monoLamLitTake(ex, nm, ctx)
     }
-  }
-  true
-}
-
-// Adds to `srcs` the record literal initialising the un-annotated `const` the name `v` (read in
-// frame `ctx`) reads, unwritten and read only there, with its declaration to `binds` and `v` to
-// `reads`; false for any other read.
-function monoRecSrcBinding(
-  v: i32,
-  ctx: i32,
-  srcs: i32[][],
-  binds: i32[],
-  reads: i32[],
-): boolean {
-  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
-  const sf = monoReadLetFrame(v, ctx)
-  if sf[1] < 0 || !monoRecSrcReadOnce(sf, v) { return false }
-  const sd = nodeAt(sf[1])
-  if !(sd is LetDecl) || sd.letKw != "const" || sd.letType >= 0 { return false }
-  const li = unwrapParen(sd.letInit)
-  if li < 0 || li >= P.nodes.length || monoWritesOf("f:", sf[1]).length > 0 {
-    return false
-  }
-  // A `const` initialised by another such name carries that name's literal (`const v = r`).
-  if nodeAt(li) is Ident && binds.length < 16 && !i32ListHas(binds, sf[1]) {
-    binds.push(sf[1])
-    reads.push(v)
-    return monoRecSrcBinding(li, sf[0], srcs, binds, reads)
-  }
-  if !(nodeAt(li) is ObjLit) { return false }
-  srcs.push([li, sf[0]])
-  binds.push(sf[1])
-  reads.push(v)
-  true
-}
-
-// Whether the read `v` is the only read of the binding `[frame, declaration]` `lf` names in its
-// frame, nested functions included.
-function monoRecSrcReadOnce(lf: i32[], v: i32): boolean {
-  const d = nodeAt(lf[1])
-  if !(d is LetDecl) { return false }
-  for ix in monoFrameNodes(lf[0]) {
-    if ix != v && monoReadsBinding(ix, d.letName, lf[0], lf[1]) { return false }
   }
   true
 }
@@ -23218,7 +23123,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         declTys,
       )
       monoDefaultTyParamsOnlyGenFns(fn, params, args, ctx, tvN, tvV, tvT)
-      monoPreBindTaggedSets(fn, args, tvN, tvV, tvT)
+      monoPreBindTaggedSets(callIx, fn, args, tvN, tvV, tvT)
       let oDecl = -1
       if origFe >= 0 && origFe < monoOrigNode.length {
         oDecl = monoOrigNode[origFe]
@@ -23422,6 +23327,7 @@ function monoDefaultTyParamsOnlyGenFns(
 // Binds each type parameter that alone annotates a parameter handed a tagged set to the set
 // itself, as a hole handed one is pinned: the instance calls each member directly.
 function monoPreBindTaggedSets(
+  callIx: i32,
   fn: FuncDecl,
   args: i32[],
   tvN: string[],
@@ -23432,16 +23338,15 @@ function monoPreBindTaggedSets(
   while i < args.length && i < fn.fnParams.length {
     const p = nodeAt(fn.fnParams[i])
     const at = monoArgTaggedSetTy(args[i])
-    const js = if at >= 0 { fnTagSharedJoinSet(fn, i, args) } else { -1 }
+    const js = if at >= 0 { fnTagCallJoinOf(monoCallTplOf(callIx), i) } else { -1 }
     const st = if fnTagSetIsTagged(js) && js != fnTagSetOfTy(at) { fnTagSetTy(js) } else { at }
-    if (
-      p is Param
-      && st >= 0
-      && p.parType >= 0
-      && fnTagOwnTyParamJoins(fn, i, args)
-    ) {
+    if (p is Param && st >= 0 && p.parType >= 0) {
       const tn = nodeAt(p.parType)
-      if tn is TypeRef && !strListHas(tvN, tn.tyName) {
+      if (
+        tn is TypeRef
+        && strListHas(fn.fnTyParams, tn.tyName)
+        && !strListHas(tvN, tn.tyName)
+      ) {
         tvN.push(tn.tyName)
         tvV.push(tyToStr(st))
         monoTvTyLast(tvN, tvT, st)
@@ -24337,8 +24242,8 @@ function monoPinAnnotatedParam(
     // A tagged set handed to a parameter its own type parameter alone annotates is pinned at
     // the set, as a hole handed one is; one several arguments share, at the set the elaboration
     // joined theirs to.
-    const argSet = if ann == tp && ftOwnTyParamJoins(decl, fn, i, args) { monoArgTaggedSetTy(args[i]) } else { -1 }
-    const js = if argSet >= 0 { fnTagSharedJoinSet(fn, i, args) } else { -1 }
+    const argSet = if ann == tp { monoArgTaggedSetTy(args[i]) } else { -1 }
+    const js = if argSet >= 0 { fnTagCallJoinOf(monoCallTplOf(callIx), i) } else { -1 }
     const setTy = if fnTagSetIsTagged(js) && js != fnTagSetOfTy(argSet) { fnTagSetTy(js) } else { argSet }
     if setTy >= 0 {
       pinned.push(tyToStr(setTy))
@@ -26341,7 +26246,18 @@ function monoWalk(ix: i32, ctx: i32) {
         }
       }
       if monoWalk(n.binLeft, ctx) < 0 { return -1 }
-      return monoWalk(n.binRight, ctx)
+      if monoWalk(n.binRight, ctx) < 0 { return -1 }
+      // A `??` default is an arm of the join: a hole or generic function there is instanced at
+      // the join's function type, as an `if` arm is (D15463).
+      if n.binOp == "??" {
+        const ct0 = nodeTyIxOf(ix)
+        const ct = if monoTyConcreteFn(ct0) { ct0 } else { elabWalkTy(ix) }
+        const cn = if monoTyConcreteFn(ct) { monoConcreteFnTyName(ct) } else { "" }
+        if cn != "" && monoCoerceFnValueName(n.binRight, cn, ctx, ct) < 0 {
+          return -1
+        }
+      }
+      return 0
     }
     Unary => {
       return monoWalk(n.unArg, ctx)
