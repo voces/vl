@@ -8,6 +8,7 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **A call through a field of a `const` record literal that names a declared function**, where no assignment anywhere writes a field of that name and no declaration around the call shadows the name, is that function's direct call (`constRecFieldFnRead`, rewritten at check), so `record-generic-field-called-and-read-under-is` runs without the split plan and D15447 (invalid wasm through the plan) closes.
 - **A choice of a capturing nested function and top-level generics** handed to a parameter called at two types is one bundle, so `choice-of-nested-capturing-and-top-level-generic-handed-to-param` runs without the split plan; D15446 files the same generic also handed alone, a hidden split-plan dependent.
 - **D15450 closed:** a function nested in non-generic functions, capturing them, or a choice between such functions, handed to a parameter called at two types is delivered as a bundle, one closure per signature (D14841's capturing shape), so `choice-of-nested-capturing-function-handed-to-hole-param` runs without the split plan.
 - **D15404 closed:** an un-annotated `let` copy of a parameter that nothing re-points is the parameter for the elaboration's list and record rules, as a `const` copy is (`elabParamCopyOf`, read through `cwLetUnwritten`), so `hole-fn-copy-in-record-called-beside-other-key` leaves the split-plan dependents; a re-pointed copy keeps its loud refusal.
