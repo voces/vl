@@ -10694,6 +10694,28 @@ function elabDlvKeyOk(kk: i32): boolean {
   false
 }
 
+// Narrows the instance filter to the instances call `c` ran from an admitted caller (from any
+// caller when every instance is admitted), and what they reach; unchanged where it ran none.
+function elabDlvEnterCall(c: i32) {
+  const row = elabCallKeys[c] ?? []
+  const admit: {[i32]: boolean} = Map()
+  let first = -1
+  let i = 0
+  while i + 1 < row.length {
+    const from = row[i]
+    const to = row[i + 1]
+    if to >= 0 && (elabDlvKey < 0 || (from >= 0 && elabDlvKeyOk(from))) {
+      for kk in elabReachClosure(to).keys() { admit[kk] = true }
+      if first < 0 { first = to }
+    }
+    i = i + 2
+  }
+  if first < 0 { return 0 }
+  elabDlvKey = first
+  elabDlvAdmit = admit
+  0
+}
+
 // `elabSlotDeliveries` under the instance filter.
 function elabSlotDeliveriesAt(d: i32, path: string[]): i32[] {
   const out: i32[] = []
@@ -10751,6 +10773,11 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
     }
     for h in elabLitHolders(d) {
       for t in elabSlotDeliveriesAt(h, path) { elabRetsAdd(out, t) }
+    }
+    // A literal read in place is delivered where that read is.
+    if path.length > 0 && elabLitSlotDepth == 0 {
+      const lseen: i32[] = []
+      elabSlotClimb(d, path, out, lseen)
     }
     // A returned literal is also read where each call of its function is.
     const rf = elabLitReturnedBy(d)
@@ -10917,6 +10944,75 @@ function elabSlotReadUp(u: i32, path: string[]): i32 {
     }
   }
   cur
+}
+
+// Adds to `out` where slot `path` of the value `u` reads is delivered: climbs the steps its index,
+// member and element-method parents read, then follows the value the climb stops at with the steps
+// left.
+function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
+  let cur = u
+  let i = 0
+  let guard = 0
+  while i < path.length && guard < 16 {
+    guard = guard + 1
+    const k = path[i]
+    const p = if cur >= 0 && cur < cwIxParent.length { cwIxParent[cur] } else { -1 }
+    const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+    const c = if p >= 0 && p < cwIxParent.length { cwIxParent[p] } else { -1 }
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    const called = cn is Call && cn.callFn == p
+    if (k == "e" || k == "v") && pn is Index && parenPeelIx(pn.idxArr) == cur {
+      cur = p
+      i = i + 1
+    } else if (
+      pn is Member
+      && parenPeelIx(pn.memObj) == cur
+      && k == "f." + pn.memProp
+    ) {
+      cur = p
+      i = i + 1
+    } else if (
+      pn is OptMember
+      && parenPeelIx(pn.omObj) == cur
+      && k == "f." + pn.omProp
+    ) {
+      cur = p
+      i = i + 1
+    } else if (
+      (k == "e" || k == "v")
+      && pn is Member
+      && parenPeelIx(pn.memObj) == cur
+      && called
+      && elabElemMethod(pn.memProp)
+    ) {
+      cur = c
+      i = i + 1
+    } else if (
+      k == "e"
+      && pn is Member
+      && parenPeelIx(pn.memObj) == cur
+      && called
+      && elabSameSlotsMethod(pn.memProp)
+    ) {
+      // A copy of the list holds the same elements.
+      cur = c
+    } else {
+      const rest: string[] = []
+      while i < path.length {
+        rest.push(path[i])
+        i = i + 1
+      }
+      elabSlotAliasOn(cur, rest, out, seen)
+      return 0
+    }
+  }
+  if i == path.length { elabReadDeliveries(cur, out, seen) }
+  0
+}
+
+// Whether list method `m` hands back a list of the receiver's own elements.
+function elabSameSlotsMethod(m: string): boolean {
+  m == "slice" || m == "filter" || m == "reverse" || m == "concat"
 }
 
 // Whether list or map method `m` hands back one of the receiver's elements.
@@ -11091,7 +11187,13 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
     const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
     const ai = cwIxUpAux[u]
     if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
+      // The parameter is read in the instances this call ran.
+      const wasKey = elabDlvKey
+      const wasAdmit = elabDlvAdmit
+      elabDlvEnterCall(up)
       elabSlotReadDeliveries(fn.fnParams[ai], path, out, seen)
+      elabDlvKey = wasKey
+      elabDlvAdmit = wasAdmit
     }
   } else if k == CW_UP_ITER && un is ForIn && path.length > 0 {
     // A loop over a list binds its element, over a map its value.
@@ -11134,9 +11236,7 @@ function elabLoopVarDeliveries(
       && u < P.nodes.length
       && u != b
     ) {
-      const r = elabSlotReadUp(u, path)
-      if r >= 0 { elabReadDeliveries(r, out, seen) }
-      if path.length > 0 { elabSlotAliasOn(u, path, out, seen) }
+      elabSlotClimb(u, path, out, seen)
     }
   }
   0
@@ -11153,11 +11253,7 @@ function elabRetSlotOn(f: i32, path: string[], out: i32[], seen: i32[]) {
   const calls: i32[] = []
   cwFnCalls(f, calls)
   for c in calls {
-    if c >= 0 && c < P.nodes.length {
-      const r = elabSlotReadUp(c, path)
-      if r >= 0 { elabReadDeliveries(r, out, seen) }
-      elabSlotAliasOn(c, path, out, seen)
-    }
+    if c >= 0 && c < P.nodes.length { elabSlotClimb(c, path, out, seen) }
   }
   0
 }
