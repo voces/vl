@@ -365,11 +365,11 @@ in every set holding it and the delivery converts nothing. The one fact is the u
 parameter to it at the call before tagging as well as after (`elabSetArgBind`), so the instance's
 facts are keyed at the union; the tag decision asks the parameter at the union and decides each
 argument's set with it (`ftSubNeed`); and mono pins the parameter at it, with no rule of its own.
-Built 2026-11-05 (D15409). This is the shape the four annotated-parameter
-gates (`fnTagOwnTyParamAlone`, `fnTagOwnTyParamShared`, `ftOwnTyParamHandedBack`,
-`ftOwnTyParamSharedBack`) each test for one case: a joined set of one argument is that argument's
-set, so each gate's witness is a joined-set binding of one member, and the gates collapse into it
-once it holds.
+Built 2026-11-05 (D15409). The four annotated-parameter gates it generalises are folded into
+two predicates, byte-identical over the corpus: `fnTagOwnTyParamJoins` (a lone parameter takes
+any argument; a shared one takes the joined set) and `ftOwnTyParamJoins`, which adds a result
+naming the type parameter bare, still limited to one named function. Widening that result case to
+a union is a capability, not a fold, and is D15461.
 
 ### 2.5 Alternatives rejected
 
@@ -1015,8 +1015,7 @@ pin rule then becomes an elaboration fact mono reads:
   `monoTyParamOnlyBareParams`);
 - a copy of a parameter taking that parameter's pin (`monoCopySeedParam`, `monoLetPinAt`);
 - the set pin of a type-parameter-annotated parameter, which mirrors the tag decision's rules for
-  one (`fnTagOwnTyParamAlone`, `fnTagOwnTyParamShared`, `ftOwnTyParamHandedBack`,
-  `ftOwnTyParamSharedBack`), so a rule added there is added here too;
+  one (`ftOwnTyParamJoins`), so a rule added there is added here too;
 - D6760's un-annotated seed, which waits on this move, since pinning it in mono mints a late
   demand.
 
