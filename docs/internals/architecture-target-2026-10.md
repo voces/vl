@@ -1497,6 +1497,28 @@ Where the elaboration has no closed type (parameters):
 - `no:noframe`, 39 in 20: keys exist, none from the instance being walked
   (`closures/generic-list-to-unannotated-param.vl`).
 
+**The fallback sources, graded** (2026-11-06, master `361a98fd6`, the same population). For each
+parameter the walk top leaves without a closed type, the probe grades three other elaboration
+sources against mono's pin: the instances the parameter carries, the argument's own type and the
+bundle signatures. A non-generic callee with no key is graded against `recArgRepOf`, else its
+annotation (`argrep`): all 118 parameters in 55 programs agree, so that bucket needs no new fact.
+
+| bucket | params | answered, agrees | no source | what mono pins where none answers |
+|---|---|---|---|---|
+| `openhole` | 520 | 261: 251 bundle signatures, 8 the parameter's own instances, 2 the argument's type | 258 | 137 a list of hole functions pinned at the tagged set's `i32[]` (D14648); 37 a single closure signature (D12340); 26 a map, 26 a record holding hole-function lists; 31 a type parameter of a nested generic (D15263) |
+| `nokey-gen` | 86 | 8 the argument's type | 78 | a type parameter the call leaves unbound or ambiguous, which mono defaults: `f(Map())` (D14735), `one(Set())` (D15040), `F<A, B>(v: A \| B)` at `5` (D14803) |
+| `nokey-plainhole` | 71 | 2 | 69 | a non-generic function's hole parameter |
+| `noframe` | 39 | 27 the argument's type | 12 | |
+| `nokey-emptylist` | 10 | 0 | 10 | `len([])` (D12581) |
+| `nokey-value` | 7 | 0 | 7 | a call through a value |
+
+One source disagrees, and it is not a gap: `closures/lambda-bundle-through-hole-param-at-several-signatures.vl:19`
+hands a function taking a bundle, which mono pins at `({c0, c1}) => string`; the one signature the
+elaboration records is for the inner call.
+
+Mono declines 1,969 calls (573 programs). For 662 of their parameters (183 programs) the
+elaboration closes the type anyway (`eo:yes`). Those are the cells the switch must keep declining.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
