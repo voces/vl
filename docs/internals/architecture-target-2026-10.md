@@ -1497,7 +1497,7 @@ elaboration fact that should carry the same answer: `monoWalkIdentCall`'s instan
 `monoNarrowedNominalPinName`, `monoReachListTy`, `monoCloneGenericCallArm` (D12702),
 `monoReachRecTy`, `monoCloPinAnnNodeOfExpr`, `monoMakeInstanceGo`'s instance note,
 `monoIfChainRebuild`, `monoPinBodyLambdasRaw` (D1990), `monoCloneGenericCalls` (D2849, two arms),
-`monoCloneLambdaSubst` (two arms, D943 and seven more), `monoPinLamFromCheckedTy` (D3820, D3834).
+`monoCloneLambdaSubst` (two arms, D943 and seven more), `monoPinLamFromCheckedTy` (now `monoPinLamAtDelivery`; D3820, D3834).
 
 **Three of the queue close without a switch (2026-11-06).**
 - `monoNarrowedNominalPinName` is DECISIONS.md's rung 2 (D25, "Which channel owns a NARROWED
@@ -1559,6 +1559,63 @@ no elaboration answer: `closures/generic-fn-value-returned-through-identity-hole
 `closures/hole-fn-if-join-result-handed-hole-fn.vl`, D12340 and D15455. Each is a signature fixed
 past the call, by calls through the result, which only the flow table carries. The switch to the
 elaboration's answer waits for those four, so it lands with the derivation's deletion and not beside it.
+
+**Shadow of `monoCloneGenericCalls`' recorded type** (2026-11-06, master `361a98fd`, parked). A node
+the instance body clone re-makes records `monoCgcTplTy(ix)`: the template's checker type with the
+instance's holes read in. That was compared against `elabTyIn(ix, ek)`, with `ek` the elaboration
+key `monoMakeInstanceGo` builds under, over 19,316 programs. 1,214 reach the arm. Counted by programs
+showing each class at least once:
+
+- 952 agree;
+- 282 open: the old type names a type variable that a later pin substitutes, so they are not graded;
+- 21 differ: i32/f64 in 10, string against a number in 4, an `<error>` template type in 6 (the
+  elaboration has the instance's type, e.g. the recursive call in
+  `generics/recursion-at-same-type-runs.vl`), and boolean/f64 in 1;
+- 488 old-only. 448 of them are `elabTyIn`'s own -2, "the emitter retyped this node since", and 40
+  have no entry;
+- 243 new-only: the template node records no type and the elaboration does, mostly function lists
+  and nullable function values. Switching would type nodes mono leaves untyped today.
+
+The 448 retyped cells are not a missing fact. The elaboration knows the emitter retyped the node, so
+the open question is which pass owns the node's type. Order the passes before switching this arm.
+
+**Shadow of `monoPinLamFromCheckedTy`'s pin** (now `monoPinLamAtDelivery`) (2026-11-06, same population). The lambda's
+contextual parameter types, read off the checker (`monoFnValueParamTys(nodeTyIxOf(lam))`), were
+compared against the one closed delivery `elabSlotDeliveries(lam, [], elabKeyAt(lam))` gives at the
+lambda's arity. 968 programs reach the function, 950 of them leave at the gate because the body calls
+no generic, and 1 takes the D9712 row spelling. Of the 22 that reach the pin, 18 agree and 4 have no
+closed tuple on either side. None differs, none is one-sided, and none has two deliveries. Switched:
+the pin reads `elabLamDeliveredParams` (emit_elab), and the function is `monoPinLamAtDelivery`. It
+deletes nothing: `monoFnValueParamTys` has three other callers.
+
+**Shadow of `monoCloneLambdaSubst`'s return pin** (`monoLamPinRetAnn`, same population). The
+elaboration's per-instance result of the lambda (`monoLamElabRet`) is asked first, and the binding's
+substitution is the fallback. 690 programs reach a return still naming a type variable. The
+elaboration answers in 272 of them and the fallback runs in 429, closing a pin in 489. The pins are
+mostly scalars, nullables and literal unions (`string` 61, `i32 | string | null` 56, `i32` 51). The
+fallback is live, so the arm and its helpers (`monoSubstInst` at the result, `monoLamReachParamTy`,
+`monoRetReadsHoleParam`) stay until the elaboration types a cloned lambda's result under the instance
+key in those programs. That gap is this family's real blocker.
+
+It was not a missing fact. `monoLamElabRet` asked the elaboration only at an instance with hole
+pins. Asked at every instance, with a hole the walk keeps open read from the binding, it gives the
+fallback's pin in 376 of the 429 programs and closes nothing in the other 53. It answers 1 program
+the fallback left open (`generics/generic-value-slot-written-in-generic-body-at-two-instances.vl`)
+and closes 1 the fallback closed only by substitution (`generics/hole-lambda-calls-per-instance.vl`,
+whose `(_) => _` walk type the binding closes). It differs in none. Switched: the fallback block is
+gone, and `er` keeps its old meaning (the hole instance's own elaboration answer) for the box
+registration and the literal-member gate, so the switch is byte-neutral over all 19,316 programs.
+The helpers stay: `monoLamReachParamTy` still serves the parameter pin, and `monoRetReadsHoleParam`
+serves `monoLamTyNamesHoleValue`.
+
+**Shadow of `monoLamParamPinAnn`** (the parameter side, same population). The binding's substitution,
+else `monoLamReachParamTy` (D7181), was compared against the elaboration's walk type of the parameter,
+with a hole read from the binding. 654 programs reach the pin: 597 agree and 37 close nothing on
+either side. 53 are old-only, where the elaboration keeps the parameter open: a type variable of
+another declaration (`U`/`V`) on a lambda held in a written `let`, a capture cell or a returned
+lambda called across instances, or a hole `_`. 10 are new-only, and none differs. The parameter pin,
+and `monoLamReachParamTy` with it, waits for the elaboration to type those lambdas' parameters per
+instance.
 
 **Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), re-measured on
 2026-11-06, master `611070b80`, with `scripts/inst-shadow/run.sh` over 23,380 programs: `tests/cases`,
@@ -1749,7 +1806,7 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 
 - [ ] **unbound default** (12): `monoElabDefaultsPrime` 18,170, `monoHoleGenFnFlowTy` 7,941, `monoChoiceArmFlowTy` 7,929, `monoDefaultTyParamsOnlyGenFns` 5,541, `monoArgClosedPin` 2,657, `monoUncalledSlotFnTy` 318, `monoUncalledListElems` 225, `monoUnboundDefaultTy` 90, `monoBindTyParamDefault` 50, `monoDefaultUnboundTyParams` 21, `monoHoleFnPinTyOf` 21, `monoUncalledNestedListElems` 15.
 - [ ] **slot held fns** (29): `monoWalkIdentCall` 9,604, `monoWrittenGenLetFrame` 9,601, `monoFlowReadsAll` 9,597, `monoFlowLetCalls` 8,067, `monoFlowLetVals` 7,770, `monoFlowParamVals` 7,769, `monoFlowDeclVals` 7,740, `monoFlowValsOf` 7,511, `monoCoerceWrittenLetTys` 5,811, `monoFlowReadsRound` 2,993, `monoFlowUsePlanAt` 2,921, `monoArmWrittenLetSeed` 1,627, `monoFlowAliasReadVals` 1,174, `monoFlowLetLeaf` 655, `monoFlowRetLocalLists` 581, `monoFlowKeptIndexElem` 511, `monoFlowMapVals` 384, `monoFlowDirectSet` 186, `monoFlowAliasMaps` 170, `monoFlowElemsGen` 105, `monoFlowLetMapLeaf` 75, `monoFlowReadElemAt` 72, `monoFlowMapReadVals` 50, `monoFlowLoopVarVals` 26, `monoFlowReplanPending` 18, `monoLetSeedGenFe` 5, `monoCellCall` 5, `monoFlowReadElem` 0, `monoFlowUsePlan` 0.
-- [ ] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, `monoReachSlotPins` 546, `monoDeclPathPinsOrReach` 173, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, `monoReachSlotPinsAt` 78.
+- [ ] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, ~~`monoReachSlotPins` 546~~, ~~`monoDeclPathPinsOrReach` 173~~, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, ~~`monoReachSlotPinsAt` 78~~.
 - [ ] **node type** (29): `monoCloseRetFnTy` 9,592, `monoInitHeldTy` 6,742, `monoArgClosedTyIn` 5,475, `monoPinBin` 4,320, `monoPinnedOperandTy` 3,781, `monoSubstLetType` 3,348, `monoCloneLetDecl` 3,020, `monoCoerceListCbArg` 2,889, `monoPinReturnedObj` 1,945, `monoCbFnListRowSpell` 1,107, `monoDeadNullTest` 882, `monoCgcTplTy` 668, `monoRetFnListTy` 608, `monoPinnedAnnTyAt` 509, `monoLeafParamPin` 420, `monoBoundFnListElemsTy` 352, `monoPinnedReadTy` 341, `monoClosedObjLitTy` 174, `monoLetAnnTyOf` 66, `monoHoleFnPinTy` 33, `monoLetWriteRhsTyRec` 15, `monoPinnedListElemPin` 14, `monoLetWritesRecord` 6, `monoModuleDupPin` 3, `monoArgOpenValueTy` 1, `monoModuleLetPin` 0, `monoClosedFieldValTy` 0, `monoLetWriteRhsTy` 0, `monoPinnedListAnnTy` 0.
 - [ ] **slot type** (27): `monoBindingAdoptInit` 9,578, `monoHoleGenFnPin` 7,952, `monoListSrcElemTy` 7,925, `monoReachLitTys` 6,959, `monoReachSlotTy` 6,938, `monoPinMapValues` 6,754, `monoPinFieldContainers` 798, `monoPinRecordFields` 733, `monoLetWritesClosed` 703, `monoPinObjFields` 695, `monoRetypeLamCells` 565, `monoPinRecordField` 466, `monoWritesCoercedFirstCall` 454, `monoPinNestedListElems` 315, `monoPinFieldContainer` 112, `monoPinMapSlot` 66, `monoLetWritesAt` 57, `monoNoteBindCall` 28, `monoPinFieldValue` 25, `monoPinJoin` 22, `monoPinStoredRecords` 20, `monoRenameInitAt` 12, `monoSigJoin` 3, `monoPinnedElemAnnTy` 2, `monoHandWrittenLet` 2, `monoPinMapNestedFnLists` 0, `monoWrittenLetRetsDisagree` 0.
 - [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, `monoLamReachParamTy` 124, `monoRecvParamElem` 41, `monoDeliverLamLit` 6, `monoLamInstSigs` 2.
@@ -1763,6 +1820,15 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
 with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
+
+**Slot deliveries, the reach rung deleted** (2026-11-06). `monoDeclPathPinsOrReach` and
+`monoStoredSlotFnTy` fell back to value reach (`vrCalleeTy`) where the elaboration's slot pins were
+empty. Over the 23,456 programs the reach rung never answered alone: at 1,553 site-hits the pins
+agree 61 times, the elaboration alone answers 383, and neither answers 1,109. The rung and its
+three functions are deleted. The written `let`'s seed signature (`monoSeedCallSigTys`, under
+`monoCallIfBound`, `monoCallWrittenLet` and `monoCallIfValue`) is reached past its gates by 8
+programs: in 6 its parameters agree with `elabCallParamBoundTy`, and in 2 neither closes (D15260's
+shape, which runs).
 
 **Instance result, first pass (2026-11-06).**
 - `monoRetRecordOf` and its consumers `monoRetConstRecord`, `monoPinCallRecord` and

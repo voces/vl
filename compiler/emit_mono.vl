@@ -31,6 +31,7 @@ import {
   elabDeclFnOf,
   elabDeclIsValue,
   elabIsParamRead,
+  elabLamDeliveredParams,
   elabLitSlotCallTys,
   elabParamReadOtherThanCalled,
   elabSlotAnnRets,
@@ -4846,21 +4847,13 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32, bN: string[], bT: i32[]) {
     && tyBearsNull(kept)
   if nulJoin && isNullTy(rty) { rty = nonNullTy(kept) }
   if rty >= 0 && tyHasTyVar(rty) {
-    // The instance's elaboration types the lambda at its holes; the binding is the fallback
-    // where it has no instance.
-    const er = monoLamElabRet(fnIx)
-    let rs = er
-    if rs < 0 {
-      // A result typed at another generic's variable is not this instance's to pin: the clone
-      // keeps it open, as it keeps a parameter of that type, and is instanced at its calls (D15032).
-      rs = if tyVarOwnedByOtherGeneric(rty, monoInstOwn) { rty } else { monoSubstInst(rty, bN, bT) }
-      if rs >= 0 && tyHasTyVar(rs) {
-        const rr = monoLamReachParamTy(fnIx, -1, bN, bT)
-        if rr >= 0 { rs = rr }
-      }
-      if monoRetReadsHoleParam(rex, fnIx) { rs = monoHoleTy(rs) }
-      if nulJoin && rs >= 0 && !tyHasTyVar(rs) { rs = mkNullableTy(rs) }
-    }
+    // The instance's elaboration types the lambda's result; `er` is that answer at a hole
+    // instance, which alone registers the result's box and lifts the literal-member gate.
+    const ea = monoLamElabRet(fnIx, bN, bT)
+    const er = if monoPinHoleN.length > 0 && !monoLamRetFromBinding { ea } else { -1 }
+    // A result typed at another generic's variable is not this instance's to pin: the clone
+    // keeps it open, as it keeps a parameter of that type, and is instanced at its calls (D15032).
+    const rs = if er < 0 && tyVarOwnedByOtherGeneric(rty, monoInstOwn) { rty } else { ea }
     if rs >= 0 && rs != rty {
       const litGate = rex < 0 && monoTyHasLitMember(rs) && !keptJoin && er < 0
       if !tyHasTyVar(rs) && !litGate {
@@ -4879,19 +4872,27 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32, bN: string[], bT: i32[]) {
   nret
 }
 
-// Lambda `fnIx`'s return at the hole instance being built, closed, from the instance's
-// elaboration, else the one its own instances there agree on; -1 outside one or when open.
-function monoLamElabRet(fnIx: i32): i32 {
-  if monoPinHoleN.length == 0 { return -1 }
+// Lambda `fnIx`'s return at the instance being built, closed: the instance's elaboration of it,
+// with a hole it keeps open read from the instance's binding `bN`/`bT`, else the one its own
+// instances there agree on; -1 when none closes it.
+function monoLamElabRet(fnIx: i32, bN: string[], bT: i32[]): i32 {
+  monoLamRetFromBinding = false
   const et = elabWalkTy(fnIx)
   if et >= 0 {
     const ft = tyAt(et)
-    if ft is TyFunc {
-      if ft.fnRet >= 0 && !tyHasTyVar(ft.fnRet) { return ft.fnRet }
+    if ft is TyFunc && ft.fnRet >= 0 {
+      if !tyHasTyVar(ft.fnRet) { return ft.fnRet }
+      const sr = monoSubstInst(ft.fnRet, bN, bT)
+      if sr >= 0 && !tyHasTyVar(sr) {
+        monoLamRetFromBinding = true
+        return sr
+      }
     }
   }
   elabWalkKidRet(fnIx)
 }
+// Whether `monoLamElabRet`'s last answer read a hole the elaboration kept open from the binding.
+let monoLamRetFromBinding = false
 
 // `monoCloneLambdaSubst`'s last step: lifts `clone`, the instance of the lambda template `a`
 // at `fnIx`, into its own `fnStmts` slot and re-parents the lambdas minted since `mark`.
@@ -15837,7 +15838,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     if nr != 0 { return if nr < 0 { -1 } else { 0 } }
   }
   const path: string[] = ["e"]
-  const rawPins = monoDeclPathPinsOrReach(lf, path)
+  const rawPins = monoDeclPathPins(lf, path)
   let pins = rawPins
   if pins.length > 1 {
     // Pushed functions whose every read now names its generic are called through no slot (D9441).
@@ -16024,7 +16025,7 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
     inner.push(x)
     for v in il.arrElems { vals.push(v) }
   }
-  const pins = monoDeclPathPinsOrReach(lf, ["e", "e"])
+  const pins = monoDeclPathPins(lf, ["e", "e"])
   if pins.length != 1 {
     // A slot nothing calls, or one whose every read now names its generic (D9711), takes the
     // type its functions hold at no call, as the flat list does.
@@ -16771,7 +16772,7 @@ function monoPinSlotRecordMap(d: LetDecl, lx: i32, at: i32, ctx: i32): i32 {
 function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   const lf: i32[] = [ctx, at]
   const path: string[] = ["f." + name]
-  const pins = monoDeclPathPinsOrReach(lf, path)
+  const pins = monoDeclPathPins(lf, path)
   if pins.length != 1 { return 0 }
   const ann = monoSigFnTyName(pins[0] + ";")
   const dTys = monoPinFnParamTys(at, path, pins[0])
@@ -17695,8 +17696,6 @@ function monoStoredSlotFnTy(
     const live = monoFlowSlotPins(at, path)
     if live.length == 1 { pins = live }
   }
-  // A slot the flow table pinned at no call takes the one its reads' calls make.
-  if pins.length == 0 { pins = monoReachSlotPinsAt(lf, path) }
   if pins.length != 1 { return -1 }
   const ann = monoSlotPinAnn(lf, path, pins[0], "void")
   const dTys: i32[] = []
@@ -17758,64 +17757,6 @@ function monoLitReachesNoCall(lit: ArrayLit, ctx: i32): boolean {
     vals.push([e, ctx])
   }
   monoValsReachNoCall(vals)
-}
-
-// `monoDeclPathPins`, or where the flow table pinned the slot at no call, the pin every call a read
-// of it reaches makes (`monoReachSlotPins`).
-function monoDeclPathPinsOrReach(lf: i32[], path: string[]): string[] {
-  const pins = monoDeclPathPins(lf, path)
-  if pins.length > 0 { return pins }
-  monoReachSlotPinsAt(lf, path)
-}
-
-// `monoReachSlotPins` for the binding of frame `lf`; [] inside a generic or an instance of one,
-// whose calls make a type per instance rather than one.
-function monoReachSlotPinsAt(lf: i32[], path: string[]): string[] {
-  const none: string[] = []
-  if (
-    monoFrameIsGenericInstance(lf[0])
-    || monoFrameTyParamsOf(lf[1]).length > 0
-  ) {
-    return none
-  }
-  monoReachSlotPins(lf[1], path)
-}
-
-// The pin every call through slot `path` of the binding declared at `d` makes (`vrCalleeTy`),
-// written-into containers followed, as `[sig]`; [] when a read reaches no call, a place the
-// question does not follow, or calls of more than one type.
-function monoReachSlotPins(d: i32, path: string[]): string[] {
-  const out: string[] = []
-  if (
-    monoPrimeIndexed
-    || monoReachRoots.length == 0
-    || d < 0
-    || d >= P.nodes.length
-  ) {
-    return out
-  }
-  const dn = nodeAt(d)
-  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return out }
-  let vp = ""
-  for k in path {
-    if k == "e" || k == "v" {
-      vp = vp + "e,"
-    } else if k.length > 2 && k.slice(0, 2) == "f." {
-      vp = vp + "f:" + k.slice(2, k.length) + ","
-    } else {
-      return out
-    }
-  }
-  vrStash()
-  vrResetFor("monoslot", monoReachStmts, true, false)
-  vrSetFollow()
-  vrIndex(monoReachRoots, [])
-  const x = dn.letInit
-  const t = if vrIndexed(x) { vrCalleeTy(x, vp, monoFrameTyParamsOf(x)) } else { -1 }
-  vrUnstash()
-  const f = if t >= 0 { tyAt(t) } else { null }
-  if f is TyFunc { out.push(pinSigOf(f.fnParamTypes)) }
-  out
 }
 
 // Whether every function value of `vals` reaches no call or observation, written-into containers
@@ -27547,10 +27488,10 @@ const MONO_BIND_SIG_POST = "` holds functions called at more than one argument t
   + "signature, and the values written to it want two. Annotate the parameters, or "
   + "bind a separate value per type"
 
-// Instantiate the un-annotated lambda in slot `fe` at the concrete parameter types the checker
-// recorded for it (a callback's contextual type), so a generic its body calls is pinned there
-// rather than at the hole's default (D3820). 0 when it declines, -1 on a failed mint.
-function monoPinLamFromCheckedTy(fe: i32) {
+// Instantiate the un-annotated lambda in slot `fe` at the one closed parameter list the
+// elaboration delivers it at (a callback's contextual type), so a generic its body calls is pinned
+// there rather than at the hole's default (D3820). 0 when it declines, -1 on a failed mint.
+function monoPinLamAtDelivery(fe: i32) {
   const fn = nodeAt(fnStmts[fe])
   if fn is FuncDecl {
     const rowSp = monoCbFnListRowSpell(fnStmts[fe])
@@ -27558,7 +27499,7 @@ function monoPinLamFromCheckedTy(fe: i32) {
       return monoInstanceFor(fe, [rowSp], fnStmts[fe], -1, [])
     }
     if !monoSubtreeCallsGeneric(fn.fnBody, fnStmts[fe], 0) { return 0 }
-    const tys = monoFnValueParamTys(nodeTyIxOf(fnStmts[fe]), fn.fnParams.length)
+    const tys = elabLamDeliveredParams(fnStmts[fe], fn.fnParams.length)
     // A callback of a built-in `.map` / `.filter` is called at its element's own spelling; one
     // handed to a function takes that function's parameter type, keyed by its render (D3834).
     return monoPinLamAtTys(fe, tys, monoIsBuiltinCallback(fnStmts[fe]))
@@ -28295,7 +28236,7 @@ export function monomorphize(stmts: i32[]) {
   while fe3 < nDecl {
     if monoGen[fe3] == 1 && criFnIsAnonLambda(fe3) {
       if !monoInstantiatedAny(fe3) {
-        if monoPinLamFromCheckedTy(fe3) < 0 { return -1 }
+        if monoPinLamAtDelivery(fe3) < 0 { return -1 }
         // `monoInstanceFor` declines silently on a boundary it cannot reproduce, so the
         // walk is gated on the outcome rather than on having tried — a declined pin
         // still needs its body walked.
