@@ -1291,6 +1291,23 @@ shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-functio
 Its failing twin, through a list or joined callee given a hole function and a closed-typed
 function, is D15484.
 
+**The only-call pin, switched** (2026-11-06). `monoPinOpenCallLams` reads `elabValueOnlyCall(d)`,
+the forward climb's one call. It falls back to `fnFlowDeclPathOnlyPinCall` in two named cases:
+
+- the climb reaches none, which covers the 5 table-only hits above;
+- the value is one the write index does not cover (minted after its build), whose climb would
+  read an index row that is not there.
+
+Graded on fixpoint seeds against #6471, over all 7,538 sweep programs with the split plan on and
+off:
+
+- 0 runs → not-runs;
+- 1 file builds different wasm, `closures/generic-returned-to-un-annotated-param-lambda.vl`. Its
+  output is unchanged, and the only difference is an unreachable stub's signature.
+
+Without the second fallback, `generics/hole-fn-arg-through-hole-callee.vl` trapped the compiler.
+The shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
+
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
    `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
    `fnFlowStageInstHoles` go with the file.

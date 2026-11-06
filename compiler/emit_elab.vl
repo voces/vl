@@ -10728,7 +10728,10 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
       elabDlvMemo = Map()
       elabDlvMemoEpoch = arenaEpochNow()
     }
-    mk = i32ToStr(d) + ":" + i32ToStr(k)
+    mk = i32ToStr(d)
+      + ":"
+      + i32ToStr(k)
+      + (if elabDlvAnnOnly { ":a" } else { "" })
     for st in path { mk = mk + ":" + st }
     const hit = elabDlvMemo.get(mk)
     if hit != null {
@@ -10764,6 +10767,28 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
   }
   out
 }
+
+// The closed results of the closed function types written destinations deliver slot `path` of `d`
+// at, in instance `k`, each once; a call names no return, and an open result answers nothing.
+export function elabSlotAnnRets(d: i32, path: string[], k: i32): i32[] {
+  const was = elabDlvAnnOnly
+  elabDlvAnnOnly = true
+  const ts = elabSlotDeliveries(d, path, k)
+  elabDlvAnnOnly = was
+  const out: i32[] = []
+  for t in ts {
+    const ft = tyAt(t)
+    // An open result names no representation, so it is no answer.
+    const r = if ft is TyFunc { ft.fnRet } else { -1 }
+    if r >= 0 && !tyHasTyVar(r) && !tyReachesHole(r, 8) && !i32ListHas(out, r) {
+      out.push(r)
+    }
+  }
+  out
+}
+
+// Whether `elabSlotDeliveries` counts only the types written destinations deliver.
+let elabDlvAnnOnly = false
 
 // `elabSlotDeliveries`' answers by query, and the arena epoch that keeps them valid.
 let elabDlvMemo: {[string]: i32[]} = Map()
@@ -10971,6 +10996,7 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
       lt >= 0
       && tyAt(lt) is TyFunc
       && elabLitSlotDepth == 0
+      && !elabDlvAnnOnly
       && !elabLitSlotAllHole(d, path, 0)
     ) {
       elabRetsAdd(out, lt)
@@ -11065,7 +11091,7 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
   if (
     own >= 0
     && tyAt(own) is TyFunc
-    && (elabLitSlotDepth == 0 || elabDeclAnnotated(o))
+    && ((elabLitSlotDepth == 0 && !elabDlvAnnOnly) || elabDeclAnnotated(o))
   ) {
     elabRetsAdd(out, own)
   }
@@ -11462,6 +11488,29 @@ function elabReadStamps(r: i32, out: i32[]) {
   0
 }
 
+// The calls the value of `d` reaches as their callee, recorded while `elabValueOnlyCall` climbs.
+let elabCallRec = false
+let elabCallsSeen: i32[] = []
+
+// The one call the value bound at `d` (a binding, parameter or literal) reaches as its callee,
+// following it forward through arguments, aliases, joins, returns and slots; -1 for none, for two,
+// and for a value the write index does not cover.
+export function elabValueOnlyCall(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  elabCallRec = true
+  elabCallsSeen = []
+  const dn = nodeAt(d)
+  if dn is LetDecl || dn is Param || dn is ArrayLit || dn is ObjLit {
+    elabSlotDeliveries(d, [], -1)
+  } else if d < cwIxCoveredLen() {
+    const out: i32[] = []
+    const seen: i32[] = []
+    elabSlotClimb(d, [], out, seen)
+  }
+  elabCallRec = false
+  if elabCallsSeen.length == 1 { elabCallsSeen[0] } else { -1 }
+}
+
 // Adds to `out` what the value read at `r` is delivered at where it flows on, leaving out `r`'s own
 // stamps.
 function elabReadOn(r: i32, out: i32[], seen: i32[]) {
@@ -11469,6 +11518,7 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
   const k = cwIxUpKind[r]
   const up = cwIxUp[r]
   if k == CW_UP_CALLEE && up >= 0 {
+    if elabCallRec && !i32ListHas(elabCallsSeen, up) { elabCallsSeen.push(up) }
     if elabNoCallParam < 0 || identDeclOf(r) != elabNoCallParam {
       elabCallDeliveryAdd(up, out)
     }
@@ -12097,7 +12147,7 @@ function elabSlotReadKeys(x: i32): string[] {
 // in every instance where they agree, else in each instance that closes them.
 function elabCallDeliveryAdd(c: i32, out: i32[]) {
   const cn = nodeAt(c)
-  if !(cn is Call) || i32ListHas(elabDlvOmit, c) { return 0 }
+  if !(cn is Call) || i32ListHas(elabDlvOmit, c) || elabDlvAnnOnly { return 0 }
   if elabCallSinkOn && !i32ListHas(elabCallSink, c) { elabCallSink.push(c) }
   const agreed = elabCallArgTysAgreed(c)
   const r = elabNodeTyAgreed(c)
