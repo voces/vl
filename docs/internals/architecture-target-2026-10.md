@@ -1742,6 +1742,14 @@ deleted. Its price is one late demand per tagged `T[]` call (five in three files
 `T[]` at the list of ids, a spelling no elaboration key uses, so the instance is minted after the
 run. Foreseeing it means keying `T[]` at the id list's rep.
 
+G2's write through a parameter (D15492) lands in the caller's map with its set; what refused it
+was the store into the parameter's slot, which the tag rule now takes when every call hands a
+holder of the set or a wider one decided with it (`ftParamHolderHolds`), and only for a written
+value naming a declared function, whose set no call changes. Bucket 1 is 32 parameters in 16
+programs. The map pin (`r5_rt`, the argument's checked type) still answers 13: 5 in D9480's
+fixture, whose map holding a non-generic keeps the set untagged, 3 written as a record `{f: id}`,
+3 an uncalled set (G5), and 2 outside bucket 1.
+
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
 not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
