@@ -2166,9 +2166,12 @@ callback (`closures/hole-fn-list-reached-through-alias-called-in-callback.vl`).
 **The `monoFlow*` rewrite takes its generic from the elaboration** (2026-11-06).
 `monoFlowReadSet` re-points a read only where the elaboration names the same one generic
 (`mfrElabNames`). The value-set walkers no longer choose the generic. They are now only the soundness
-gate: they decide which reads are asked. A node minted after `elabRun`, such as a desugared optional
-call's callee, keeps the walkers' choice. Declining there turns two programs into loud refusals
+gate: they decide which reads are asked. A desugared optional call's callee is minted after
+`elabRun`; the emit rewrite records the `?.` read it stands for (`optCallCalleeOf`), and the
+elaboration answers through that read. Over the 7,538 sweep programs this moves no bytes, and both
+programs that a decline there turned into loud refusals run
 (`closures/container-of-generic-flow-reads.vl`, `closures/hole-fn-generic-in-map-called-at-two-types.vl`).
+Any other node minted after `elabRun` still keeps the walkers' choice.
 One program's bytes move with the same output: `closures/hole-fn-list-reached-through-alias-called-in-callback.vl`,
 where the elaboration names several generics and the read is no longer rewritten.
 
