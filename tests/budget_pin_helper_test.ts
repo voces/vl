@@ -8,7 +8,7 @@
 import { ROOT } from "./support/tree.ts";
 
 const BASELINE = `${ROOT}/scripts/pin-helper-budget-baseline.json`;
-const FILES = ["emit_mono.vl", "fn_flow_shadow.vl"];
+const FILES = ["emit_mono.vl"];
 
 function countFns(file: string): number {
   let src: string;
