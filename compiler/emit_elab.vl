@@ -1333,6 +1333,10 @@ function elabParamsClosed(decl: i32, names: string[], tys: i32[]): boolean {
   !open
 }
 
+// The call's own instance each key mono demanded at closed pins refines, where that instance
+// keyed the call's parameters open and mono's pins agree with every one it closed.
+let elabKeyRefines: {[i32]: i32} = Map()
+
 // Enqueues the instance of `decl` at `names0`/`tys0`; answers its key, or -1.
 // The instances only a D4551 default asks for, and those made inside one: mono builds them for
 // parity, no call needs their bodies, so a diagnostic in one is not the program's.
@@ -1763,6 +1767,15 @@ function elabDemandFrom(
   elabRowEntries(call, decl, names, tys)
   const n0 = ekDecl.length
   const k = elabEnqueue(decl, names, tys, from)
+  if (
+    k >= 0
+    && k != ck
+    && ck >= 0
+    && ekDecl[ck] == decl
+    && elabPinsRefine(ck, sig, pTys)
+  ) {
+    elabKeyRefines[k] = ck
+  }
   elabReachNote(from, k, -1)
   if k >= 0 && !ekDone[k] { elabOne(k) }
   elabSettle(n0)
@@ -8085,6 +8098,7 @@ export function elabRun() {
   elabReprKeys = Map()
   elabGuessKeys = Map()
   elabUnboundOnly = Map()
+  elabKeyRefines = Map()
   elabUnboundFailed = Map()
   elabCandKeys = Map()
   elabPerEnclDecls = Map()
@@ -14117,7 +14131,56 @@ function elabCallInstFrom(ix: i32, from: i32): i32 {
     if ks[j] == from { k = ks[j + 1] }
     j = j + 2
   }
-  k
+  if k >= 0 || from < 0 { return k }
+  // Through the refined instance, only a call it keys once, at the callee the call names now: a
+  // rewrite may have renamed a value call's callee since the elaboration keyed it.
+  const r = elabKeyRefines.get(from) ?? -1
+  if r < 0 { return -1 }
+  let n = 0
+  j = 0
+  while j + 1 < ks.length {
+    if ks[j] == r {
+      k = ks[j + 1]
+      n = n + 1
+    }
+    j = j + 2
+  }
+  if n != 1 { return -1 }
+  // A call through a value answers only where the refined instance types its callee as a set of
+  // exactly the declaration `k` instances.
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const c = nodeAt(ix)
+  if !(c is Call) { return -1 }
+  const cf = if c.callFn >= 0 { nodeAt(c.callFn) } else { nodeAt(ix) }
+  if cf is Ident {
+    const kd = nodeAt(ekDecl[k])
+    return if kd is FuncDecl && kd.fnName == cf.identName { k } else { -1 }
+  }
+  const ct = elabPairIn(elabNodeTys, c.callFn, r)
+  const ds: i32[] = []
+  elabFnIdsIn(ct, ds, 0)
+  if ds.length == 1 && elabSrcDecl(ds[0]) == ekDecl[k] { k } else { -1 }
+}
+
+// Whether the closed pins `pTys` agree with every parameter instance `ck` of signature `sig`
+// keys closed; a parameter `ck` keys open or as a function set takes any closed pin.
+function elabPinsRefine(ck: i32, sig: i32, pTys: i32[]): boolean {
+  if sig < 0 || sig >= T.tys.length { return false }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || pTys.length != f.fnParamTypes.length { return false }
+  let p = 0
+  while p < pTys.length {
+    if !elabTyClosed(pTys[p], 0) { return false }
+    const bt = substTyDeep(f.fnParamTypes[p], ekNames[ck], ekTys[ck])
+    if bt < 0 { return false }
+    const ds: i32[] = []
+    elabFnIdsIn(bt, ds, 0)
+    if ds.length == 0 && elabTyClosed(bt, 0) && !tySame(bt, pTys[p]) {
+      return false
+    }
+    p = p + 1
+  }
+  true
 }
 
 // The closed type call `call` binds type parameter `tp` to under the instance being walked: its
