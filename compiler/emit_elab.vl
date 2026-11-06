@@ -2315,17 +2315,6 @@ function elabLitBaseTy(t: i32, depth: i32): i32 {
   }
 }
 
-// The checker's instance call `call` is elaborated at under the instance being walked, when a
-// demand with parameter pins `pTys` answers with it; else -1.
-export function elabCallInstWant(decl0: i32, call: i32, pTys: i32[]): i32 {
-  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
-  const decl = elabSrcDecl(decl0)
-  if top < -1 || decl < 0 { return -1 }
-  const ck = elabCkUsable(decl, call, top)
-  if ck < 0 || !elabCkTakesPins(ck, nodeTyIxOf(decl), pTys) { return -1 }
-  ck
-}
-
 // Instance `k`'s elaboration, spelled without its parent: the bindings of the type variables its
 // declaration reads, each once and with union members in sorted order. Two instances it agrees
 // on check alike.
@@ -11188,12 +11177,7 @@ function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
 // Adds to `out` the closed function types at slot `rest` of each type the check stamped read `r` as
 // delivered at, where that destination's type is written.
 function elabReadStampsAt(r: i32, rest: string[], out: i32[]) {
-  if (
-    (elabGivenTo(r) >= 0 && !elabDeclAnnotated(elabGivenTo(r)))
-    || elabRetUnwritten(r)
-  ) {
-    return 0
-  }
+  if !elabWrittenDest(r) { return 0 }
   const ts: i32[] = [nodeCtxTyIxOf(r)]
   const cs = elabNodeCtxs[r] ?? []
   let i = 0
@@ -11365,8 +11349,8 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
 
 let elabLitSlotDepth = 0
 // The functions a walk entered through an argument, and the calls it entered them at.
-let elabEntryFns: i32[] = []
-let elabEntryCalls: i32[] = []
+const elabEntryFns: i32[] = []
+const elabEntryCalls: i32[] = []
 
 // Pushes onto `calls` the calls a value returned from `f` comes back out of: the one call the walk
 // entered `f` at, else every call of `f`.
@@ -11417,6 +11401,19 @@ function elabRetUnwritten(r: i32): boolean {
   const f = if k == CW_UP_RET { cwFrameOfDecl(cwIxUp[r]) } else { cwIxUp[r] }
   const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
   fn is FuncDecl && fn.fnRet < 0
+}
+
+// Whether read `r` is given to a destination whose type is written: an annotated binding or
+// declared function's parameter, or the result of a function with a written return type.
+function elabWrittenDest(r: i32): boolean {
+  if r < 0 || r >= cwIxUp.length || !cwIxCovers(r) { return false }
+  const g = elabGivenTo(r)
+  if g >= 0 { return elabDeclAnnotated(g) }
+  const k = cwIxUpKind[r]
+  if k != CW_UP_RET && k != CW_UP_TAIL { return false }
+  const f = if k == CW_UP_RET { cwFrameOfDecl(cwIxUp[r]) } else { cwIxUp[r] }
+  const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+  fn is FuncDecl && fn.fnRet >= 0
 }
 
 // Pushes onto `calls` the calls made through value `x`, a lambda or a call's result, where it
@@ -12617,6 +12614,58 @@ export function elabWalkKeyOf(x: i32, isCall: boolean, decl: i32): i32 {
     j = j + 2
   }
   -1
+}
+
+// Whether instance `k` of `d`, typed `f`, takes parameter types `pTys`, reading a hole parameter's
+// type from the binding `k` holds for its hole name.
+function elabKeyBindsParams(k: i32, d: i32, f: TyFunc, pTys: i32[]): boolean {
+  const fd = nodeAt(d)
+  const nm = if fd is FuncDecl { fd.fnName } else { "" }
+  let i = 0
+  while i < pTys.length {
+    let st = substTyDeep(f.fnParamTypes[i], ekNames[k], ekTys[k])
+    if st >= 0 && tyHasHole(st) {
+      const at = strListIndexOf(ekNames[k], paramHoleName(nm, d, i))
+      st = if at >= 0 && at < ekTys[k].length { ekTys[k][at] } else { -1 }
+    }
+    if st < 0 || !tySame(widenLitTy(st), pTys[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The key the elaboration noted for function value `x` of `decl` under the instance being walked;
+// where it noted several (a bundle, one instance per signature), the one taking parameter types
+// `pTys`. -1 for none.
+export function elabValueKeyAt(x: i32, decl: i32, pTys: i32[]): i32 {
+  if x < 0 { return -1 }
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const d = elabSrcDecl(decl)
+  const sig = if d >= 0 && d < P.nodes.length { nodeTyIxOf(d) } else { -1 }
+  const f = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { tyAt(0) }
+  const vs = elabValueKeys[x] ?? []
+  let first = -1
+  let j = 0
+  while j + 1 < vs.length {
+    const k = vs[j + 1]
+    if vs[j] == top && ekDecl[k] == d {
+      if first < 0 { first = k }
+      if (
+        f is TyFunc
+        && f.fnParamTypes.length == pTys.length
+        && elabKeyBindsParams(k, d, f, pTys)
+      ) {
+        return k
+      }
+    }
+    j = j + 2
+  }
+  if (first >= 0 && f is TyFunc && f.fnParamTypes.length == pTys.length) {
+    for k in elabKidsAt(d, top) {
+      if elabKeyBindsParams(k, d, f, pTys) { return k }
+    }
+  }
+  first
 }
 
 // The instance of `decl` a function value at `x` delivered to a typed slot is: the one the

@@ -612,6 +612,7 @@ import {
   instKeyDstSet,
   instKeyNote,
   instKeyReset,
+  instKeyValueTime,
 } from "./emit_inst_key"
 import {
   gaeAppHasNulParamListField,
@@ -655,7 +656,6 @@ import {
   elabCallBundleSigs,
   elabCallHandMember,
   elabCallHandOwner,
-  elabCallInstWant,
   elabCallParamKey,
   elabCallParamRowTy,
   elabCallParamTy,
@@ -11372,23 +11372,6 @@ let monoTypedKeys: {[string]: string} = Map()
 let monoKeyEk: {[string]: i32} = Map()
 let monoKeyPins: {[string]: i32[]} = Map()
 
-// `key`, or `key` marked with the elaboration template call `call` is answered with when the
-// function registered under `key` is elaborated otherwise: two calls share one emitted function
-// only when their reps and their elaborations agree.
-function monoElabSplitKey(key: string, origFe: i32, call: i32): string {
-  const ek = monoKeyEk[key] ?? -1
-  if ek < 0 || call < 0 { return key }
-  const want = elabCallInstWant(
-    monoOrigNode[origFe],
-    call,
-    monoKeyPins[key] ?? [],
-  )
-  if want < 0 { return key }
-  const ws = elabInstSpelling(want)
-  if ws == elabInstSpelling(ek) { return key }
-  key + "~" + ws
-}
-
 // Instance fe → its parameters' types as the clone resolved them (`monoMakeInstanceLetTyCol`).
 let monoInstParamTyCol: {[i32]: i32[]} = Map()
 
@@ -11524,15 +11507,17 @@ function monoMakeInstanceGo(
     if retWiden != "" { k.key = k.key + "=>" + retWidenKey }
     const tplCall = if makeCall >= 0 { monoCallTplOf(makeCall) } else { -1 }
     // Mono's own spelling, which the typed fallback below slices at `k`'s recorded offsets.
-    const spelledKey = monoElabSplitKey(k.key, origFe, tplCall)
+    const spelledKey = k.key
     // A call's instance is keyed by the elaboration's key for that call plus the pinned reps, not
-    // by the pins' spelling; a function also delivered as a value keeps mono's key for all its
-    // instances (architecture-target §3.4, the call half and the value half).
+    // by the pins' spelling (architecture-target §3.4, the call half).
     const valueHalf = elabDeclIsValue(monoOrigNode[origFe])
     const callKey = if tplCall >= 0 && !valueHalf { elabWalkKeyOf(tplCall, true, monoOrigNode[origFe]) } else { -1 }
     // A lambda's instance is keyed by the instance it is nested in and its own pinned reps
     // (architecture-target §3.4, the lambda key); one made outside any instance keeps mono's key.
     const lamTop = if callKey < 0 && monoCadIsLam(monoOrigNode[origFe]) { elabWalkTop() } else { -1 }
+    // A function delivered as a value is keyed, call and value alike, by the elaboration's key for
+    // the instance (architecture-target §3.4, the value half); one with none keeps mono's spelling.
+    const valueKey = if callKey < 0 && lamTop < 0 && (valueHalf || tplCall < 0) { instKeyValueTime(tplCall, calleeIx, monoOrigNode[origFe], pinTys) } else { -1 }
     if callKey >= 0 {
       const pinSets: string[] = []
       for pt in pinTys { pinSets.push(monoSetPinDiscrim(pt)) }
@@ -11550,6 +11535,19 @@ function monoMakeInstanceGo(
       for pt in pinTys { pinSets.push(monoSetPinDiscrim(pt)) }
       k.key = "L"
         + instKeyCanon(origFe, lamTop, pinTys, pinSets, -1, cbFnNames)
+        + (if retWiden != "" { "=>" + retWidenKey } else { "" })
+    } else if valueKey >= 0 {
+      const pinSets: string[] = []
+      for pt in pinTys { pinSets.push(monoSetPinDiscrim(pt)) }
+      k.key = "V"
+        + instKeyCanon(
+        origFe,
+        valueKey,
+        pinTys,
+        pinSets,
+        callFrame,
+        cbFnNames,
+      )
         + (if retWiden != "" { "=>" + retWidenKey } else { "" })
     } else {
       k.key = spelledKey
@@ -11609,9 +11607,15 @@ function monoMakeInstanceGo(
     )
     k.key = instKey
     const typedHit = monoTypedKeys.get(typedKey) ?? ""
+    // The instance registered under the typed key serves this request only where the two name the
+    // same elaborated instance when both are known: one rep can carry two types whose bodies differ.
+    const reqKey = if callKey >= 0 { callKey } else { valueKey }
+    const hitKey = if typedHit != "" { monoKeyEk[typedHit] ?? -1 } else { -1 }
     if (
       typedHit != ""
-      && monoElabSplitKey(typedHit, origFe, tplCall) == typedHit
+      && (reqKey < 0
+        || hitKey < 0
+        || elabInstSpelling(hitKey) == elabInstSpelling(reqKey))
     ) {
       monoShPendFlush(shAt)
       if (
@@ -11672,7 +11676,12 @@ function monoMakeInstanceGo(
     const ekN: string[] = []
     const ekT: i32[] = []
     elabLamInheritedOwn(monoOrigNode[origFe], ekN1, ekT1, ekN, ekT)
-    const ctk = instKeyCallTime(tplCall, calleeIx, monoOrigNode[origFe])
+    const ctk = instKeyCallTime(
+      tplCall,
+      calleeIx,
+      monoOrigNode[origFe],
+      pinnedTyIx,
+    )
     const ekDemand = elabDemand(
       monoOrigNode[origFe],
       ekN,
@@ -21906,7 +21915,15 @@ function monoHoleGenFnFlowDecl(argIx: i32, ctx: i32): i32[] {
 function monoHoleGenFnFlowTy(argIx: i32, lf: i32[]): i32 {
   if lf[1] < 0 { return -1 }
   const path: string[] = []
-  const dl = elabSlotDeliveries(lf[1], path, -1)
+  // A delivery of the generic's value has its arity; another is a placeholder's inferred type.
+  const vt0 = nodeTyIxOf(unwrapParen(argIx))
+  const vf0 = if vt0 >= 0 && vt0 < T.tys.length { tyAt(vt0) } else { null }
+  const arity = if vf0 is TyFunc { vf0.fnParamTypes.length } else { -1 }
+  const dl: i32[] = []
+  for t in elabSlotDeliveries(lf[1], path, -1) {
+    const ft = tyAt(t)
+    if ft is TyFunc && ft.fnParamTypes.length == arity { dl.push(t) }
+  }
   let ps: i32[] = []
   let cx = -1
   if dl.length == 1 {

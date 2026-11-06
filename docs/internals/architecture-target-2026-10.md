@@ -1340,14 +1340,20 @@ movers that keying by rep could not close.
   frame and the callback specialization (`instKeyCanon`). The body is still elaborated at mono's
   demanded key, which is rep-consistent. Measured over `tests/cases` with fixpoint seeds: 8,450 of
   11,271 call-made instances, 76 programs' bytes move and 0 programs' outputs.
-- **The value half** keeps mono's key (`monoElabSplitKey`) and `elabDemand` until the slot-delivery
-  reader (`elabSlotDeliveries`, `elabSlotSetCalls`) answers every delivery: 2,821 instances of 1,669
-  functions. Its typed-slot rule is `elabMemberKeyAt(decl, T)` with `T` the type the checker
-  recorded for the slot, never mono's pins. A lambda inherits its enclosing instance's key; an index
-  by (enclosing key, lambda declaration) is measured after the switch.
+- **The value half** keys an instance of a function delivered as a value, call and value alike,
+  by the elaboration's key for it (`instKeyValueTime`: the call's key, else the value's, else the
+  typed slot's), plus the same rep, frame and specialization components. Its typed-slot rule is
+  `elabMemberKeyAt(decl, T)` with `T` the type the checker recorded for the slot, never mono's pins.
+  Measured over `tests/cases` with fixpoint seeds: 0 programs' bytes move. An instance the
+  elaboration has no key for keeps mono's spelling.
 
-`emit_mono.vl`'s function count is flat at this step: `monoElabSplitKey` still serves the value
-half, and its deletion is what the value half's switch earns.
+The typed fallback (`monoTypedKeys`), which reuses an instance by its pinned types, serves a
+request only where the request's elaboration key and the instance's spell the same instance: one
+rep can carry two types whose bodies differ, by an `is` test (a `Set` and its map twin, D10540) or
+by a type parameter read as a value (`R.size` in the `flat-generic-rows-*` fixtures). That guard
+replaced `monoElabSplitKey`, which asked the elaboration for the call's wanted instance a second
+way (`elabCallInstWant`); both are deleted. Gating the guard on `elabTestsTyVar` alone misses the
+`R.size` reads and miscompiles three programs, so it applies to every body.
 
 **A lambda's instance is keyed by the instance it is nested in** (2026-11-06): the walk top
 (`elabWalkTop`), the declaration, and the rep and tagged set of each pin. Measured against the
