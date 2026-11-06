@@ -1,8 +1,33 @@
 // The monoFlow* read rewrite's shadow: at each read the rewrite names a generic, the function the
 // elaboration says the read holds, noted under the rep shadow (architecture-target §3.4).
-import { Ident, LetDecl, P, nodeAt } from "./ast"
+import {
+  ArrayLit,
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  Member,
+  NumLit,
+  ObjLit,
+  P,
+  Spread,
+  i32ToStr,
+  nodeAt,
+} from "./ast"
 import { identDeclOf } from "./symbols"
-import { cwIxCoveredLen, cwSlotPath } from "./check_write_scan"
+import {
+  cwBindingOf,
+  cwHeldFnOf,
+  cwIxCoveredLen,
+  cwLetUnwritten,
+  cwParamArgs,
+  cwSlotPath,
+  cwSlotWriteCount,
+} from "./check_write_scan"
+import { collectRetValues } from "./check_nj_join"
+import { identFnDeclOf } from "./check_scopes"
 import { parenPeelIx } from "./check_places"
 import { constListFnElemDecl } from "./check_calls"
 import { elabCalleeFnsOf, elabSlotFlowFns } from "./emit_elab"
@@ -22,13 +47,21 @@ export function mfrShadowNote(x: i32, g: i32, call: i32) {
   repABNote("mfr", oc, if call >= 0 { "call" } else { "read" })
 }
 
-// The functions the elaboration says read `x` holds: the element a literal index of a module-scope
-// `const` list names, else its slot's value-flow set, else what its call's callee can be.
+// The functions read `x` holds, by the first that answers: a module-scope `const` list's element
+// (`constListFnElemDecl`), the element its literal-index steps reach (`mfrIndexedFns`), the field or
+// element of a literal it reads straight out of, its slot's value-flow set, its call's callees.
 function mfrElabFns(x: i32, call: i32): i32[] {
   const none: i32[] = []
   if x < 0 || x >= cwIxCoveredLen() { return none }
   const el = constListFnElemDecl(x)
   if el >= 0 { return [el] }
+  const ix = mfrIndexedFns(x)
+  if ix.length > 0 { return ix }
+  const lv = mfrLitReadValue(x)
+  if lv >= 0 {
+    const lf = cwHeldFnOf(lv)
+    return if lf >= 0 { [lf] } else { none }
+  }
   const path: string[] = []
   const rt = cwSlotPath(x, path)
   const d = if rt >= 0 { identDeclOf(rt) } else { -1 }
@@ -49,4 +82,273 @@ function mfrLeafFn(g: i32): i32 {
   const gn = nodeAt(g)
   if gn is LetDecl { return parenPeelIx(gn.letInit) }
   g
+}
+
+// The value a read straight out of a literal names: field `f` of `{ f: v }.f`, else element `k`
+// of a spread-free `[..][k]` at a literal index (`mfrLitElemValue`); -1 for any other read.
+function mfrLitReadValue(x: i32): i32 {
+  const n = nodeAt(x)
+  if n is Member {
+    const o = nodeAt(parenPeelIx(n.memObj))
+    if o is ObjLit {
+      for f in o.objFields {
+        const fi = nodeAt(f)
+        if fi is FieldInit {
+          if fi.fiName == n.memProp { return fi.fiValue }
+        }
+      }
+    }
+    return -1
+  }
+  mfrLitElemValue(x)
+}
+
+// Element `k` of the spread-free list literal an index read `x` reads at a literal index; -1 for
+// any other read.
+function mfrLitElemValue(x: i32): i32 {
+  const n = nodeAt(x)
+  if !(n is Index) { return -1 }
+  const a = nodeAt(parenPeelIx(n.idxArr))
+  const k = nodeAt(n.idxIndex)
+  if !(a is ArrayLit) || !(k is NumLit) { return -1 }
+  for e in a.arrElems {
+    if nodeAt(e) is Spread { return -1 }
+  }
+  let j = 0
+  while j < a.arrElems.length {
+    if i32ToStr(j) == k.numText { return a.arrElems[j] }
+    j = j + 1
+  }
+  -1
+}
+
+// The one function an indexed read `x` (`r[k]...`, a literal index at least once) names: the
+// element each value its root can hold has at those steps, the root a `const` (its initialiser, or
+// what the call initialising it returns) or a parameter (each call's argument); [] when they differ,
+// a step is not a literal's part, or the slot is written after it is built.
+function mfrIndexedFns(x: i32): i32[] {
+  const none: i32[] = []
+  const rev: string[] = []
+  let cur = parenPeelIx(x)
+  let hasIdx = false
+  while cur >= 0 && cur < P.nodes.length && rev.length < 8 {
+    const st = mfrStep(cur)
+    if st == "" { break }
+    if st.length > 0 && st[0] == "#"[0] { hasIdx = true }
+    rev.push(st)
+    cur = parenPeelIx(mfrStepObj(cur))
+  }
+  if !hasIdx || cur < 0 { return none }
+  const steps: string[] = []
+  const cp: string[] = []
+  let k = rev.length - 1
+  while k >= 0 {
+    steps.push(rev[k])
+    cp.push(
+      if rev[k][0] == "#"[0] { "[]" } else { rev[k].slice(2, rev[k].length) },
+    )
+    k = k - 1
+  }
+  const seeds: i32[] = []
+  // A call's result is fresh, so no write reaches it before the read.
+  const cfd = mfrCalledFnDecl(cur)
+  const cfn = if cfd >= 0 { nodeAt(cfd) } else { nodeAt(cur) }
+  if cfn is FuncDecl {
+    collectRetValues(cfn.fnBody, seeds)
+  } else {
+    if !(nodeAt(cur) is Ident) { return none }
+    const d = identDeclOf(cur)
+    if d < 0 || d >= cwIxCoveredLen() { return none }
+    if cwSlotWriteCount(cwBindingOf(cur), cp) != 0 { return none }
+    if !mfrRootSeeds(d, seeds) { return none }
+  }
+  if seeds.length == 0 { return none }
+  let g = -1
+  const leaves: i32[] = []
+  for sd in seeds {
+    if !mfrDescendSteps(sd, steps, 0, 0, leaves) { return none }
+  }
+  for leaf in leaves {
+    const f = mfrLeafHeldFn(leaf, 0)
+    if f < 0 || (g >= 0 && f != g) { return none }
+    g = f
+  }
+  if g >= 0 { [g] } else { none }
+}
+
+// The step read `ix` takes from its object: `#k` for a literal index, `f.<name>` for a field; ""
+// for any other node.
+function mfrStep(ix: i32): string {
+  const n = nodeAt(ix)
+  if n is Member { return "f." + n.memProp }
+  mfrIndexStep(ix)
+}
+
+function mfrIndexStep(ix: i32): string {
+  const n = nodeAt(ix)
+  if !(n is Index) { return "" }
+  const k = nodeAt(n.idxIndex)
+  if k is NumLit { "#" + k.numText } else { "" }
+}
+
+// The object node step `ix` reads from (`mfrStep`).
+function mfrStepObj(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if n is Member { return n.memObj }
+  mfrIndexObj(ix)
+}
+
+function mfrIndexObj(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if n is Index { n.idxArr } else { -1 }
+}
+
+// The values the binding declared at `d` can be built from, onto `out`: a `const`'s initialiser, or
+// what the function its initialising call names returns; a parameter's argument at each call. False
+// when one is not known.
+function mfrRootSeeds(d: i32, out: i32[]): boolean {
+  const dn = nodeAt(d)
+  if dn is LetDecl {
+    if dn.letKw != "const" || dn.letType >= 0 || dn.letInit < 0 { return false }
+    const fd = mfrCalledFnDecl(dn.letInit)
+    if fd < 0 {
+      out.push(dn.letInit)
+      return true
+    }
+    const fn = nodeAt(fd)
+    if fn is FuncDecl {
+      collectRetValues(fn.fnBody, out)
+      return true
+    }
+    return false
+  }
+  cwParamArgs(d, out)
+}
+
+// The declared function a call `e` names; -1 for any other node.
+function mfrCalledFnDecl(e: i32): i32 {
+  const n = nodeAt(parenPeelIx(e))
+  if n is Call { identFnDeclOf(parenPeelIx(n.callFn)) } else { -1 }
+}
+
+// The function leaf `v` names, through `const` aliases and a parameter's argument at each call
+// (all of which must agree); -1 otherwise.
+function mfrLeafHeldFn(v: i32, hops: i32): i32 {
+  const f = cwHeldFnOf(v)
+  if f >= 0 || hops > 8 { return f }
+  const x = parenPeelIx(v)
+  if x < 0 || !(nodeAt(x) is Ident) { return -1 }
+  const d = identDeclOf(x)
+  const args: i32[] = []
+  if d < 0 || !cwParamArgs(d, args) || args.length == 0 { return -1 }
+  let g = -1
+  for a in args {
+    const af = mfrLeafHeldFn(a, hops + 1)
+    if af < 0 || (g >= 0 && af != g) { return -1 }
+    g = af
+  }
+  g
+}
+
+// The nodes value `v` holds after `steps[i..]`, onto `out`: through `const` aliases, a parameter's
+// argument at each call, and list and record literals; false where a step is not a literal's part.
+function mfrDescendSteps(
+  v: i32,
+  steps: string[],
+  i: i32,
+  hops: i32,
+  out: i32[],
+): boolean {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= P.nodes.length || hops > 16 { return false }
+  if i >= steps.length {
+    out.push(x)
+    return true
+  }
+  const n = nodeAt(x)
+  if n is Ident {
+    const d = identDeclOf(x)
+    if d < 0 { return false }
+    const dn = nodeAt(d)
+    if dn is LetDecl {
+      if dn.letType >= 0 || dn.letInit < 0 { return false }
+      if dn.letKw != "const" && !cwLetUnwritten(d) { return false }
+      const rest: string[] = []
+      let r = i
+      while r < steps.length {
+        rest.push(
+          if steps[r][0] == "#"[0] { "[]" } else { steps[r].slice(2, steps[r].length) },
+        )
+        r = r + 1
+      }
+      if cwSlotWriteCount(cwBindingOf(x), rest) != 0 { return false }
+      return mfrDescendSteps(dn.letInit, steps, i, hops + 1, out)
+    }
+    const args: i32[] = []
+    if !cwParamArgs(d, args) || args.length == 0 { return false }
+    for a in args {
+      if !mfrDescendSteps(a, steps, i, hops + 1, out) { return false }
+    }
+    return true
+  }
+  // A call holds what its declared function returns.
+  const cfd = mfrCalledFnDecl(x)
+  const cfn = if cfd >= 0 { nodeAt(cfd) } else { n }
+  if cfn is FuncDecl {
+    const rets: i32[] = []
+    collectRetValues(cfn.fnBody, rets)
+    if rets.length == 0 { return false }
+    for rv in rets {
+      if !mfrDescendSteps(rv, steps, i, hops + 1, out) { return false }
+    }
+    return true
+  }
+  mfrDescendLit(x, steps, i, hops, out)
+}
+
+// One step of `mfrDescendSteps` into the list or record literal `x`.
+function mfrDescendLit(
+  x: i32,
+  steps: string[],
+  i: i32,
+  hops: i32,
+  out: i32[],
+): boolean {
+  const n = nodeAt(x)
+  const st = steps[i]
+  if n is ArrayLit {
+    if st[0] != "#"[0] { return false }
+    for e in n.arrElems {
+      if nodeAt(e) is Spread { return false }
+    }
+    let j = 0
+    while j < n.arrElems.length {
+      if "#" + i32ToStr(j) == st {
+        return mfrDescendSteps(n.arrElems[j], steps, i + 1, hops + 1, out)
+      }
+      j = j + 1
+    }
+    return false
+  }
+  mfrDescendObj(x, steps, i, hops, out)
+}
+
+function mfrDescendObj(
+  x: i32,
+  steps: string[],
+  i: i32,
+  hops: i32,
+  out: i32[],
+): boolean {
+  const n = nodeAt(x)
+  if !(n is ObjLit) { return false }
+  for f in n.objFields {
+    const fi = nodeAt(f)
+    if fi is FieldInit {
+      if "f." + fi.fiName == steps[i] {
+        return mfrDescendSteps(fi.fiValue, steps, i + 1, hops + 1, out)
+      }
+    }
+  }
+  false
 }

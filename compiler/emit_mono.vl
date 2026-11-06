@@ -1,3 +1,4 @@
+import { elabTyClosed } from "./check_elab_cap"
 import { mfrShadowNote } from "./mfr_shadow"
 import {
   LC_CHAIN_LONG,
@@ -35,7 +36,9 @@ import {
   elabLamDeliveredParams,
   elabLamParamTy,
   elabLitSlotCallTys,
+  elabNodeTy,
   elabParamReadOtherThanCalled,
+  elabReturnedClosedTy,
   elabSlotAnnRets,
   elabSlotDeliveries,
   elabSlotDeliveriesOmitting,
@@ -3184,24 +3187,12 @@ function monoIfChainRebuildPinned(
       }
       // A join the checker kept apart as `T | C` is read at the pin wherever it goes (D2906), and
       // so is a `??` over one, whose result the checker re-joins without the mark (D3568).
-      const tpu = tyIsTpJoinUnion(raw) || monoCoalOverTpJoin(c.ifCond, c.ifThen)
-      if monoIfArmsAllTy(at, raw, bN, bT) {
-        pty = monoPinnedTyOf(at, bN, bT)
-        // Such a join is a union at the pin only as a box registered here.
-        if tpu { pty = monoPinUnionBoxed(pty, false) }
-      } else if sink || tpu {
-        pty = monoIfArmsPinJoin(at, raw, bN, bT)
-      } else if monoHoleJoinPinsString(raw, at, bN, bT) {
-        // A hole join the pin makes a string is built as one, its atom arms widened (D3291).
-        pty = monoHoleJoinPinTy(at, bN, bT)
-      }
-      // Arms with no pinned join of their own (a record arm) read the recorded union (D3520).
-      if pty < 0 && (tpu || monoTyIsUnionOrNulUnion(raw)) {
-        pty = monoPinUnionBoxed(monoPinnedTyOf(at, bN, bT), true)
+      // The instance's elaborated join, where it is closed and is not the template's own.
+      const et = elabNodeTy(at, elabWalkTop())
+      if et >= 0 && et != raw && elabTyClosed(et, 0) {
+        pty = monoPinUnionBoxed(et, true)
       }
       const retype = pty >= 0
-        && pty != raw
-        && (tpu || monoPinKeepsMembers(raw, pty))
       if (
         ccs[li] == c.ifCond
         && cts[li] == c.ifThen
@@ -3220,110 +3211,6 @@ function monoIfChainRebuildPinned(
     li = li - 1
   }
   ce
-}
-
-// Whether the `if` chain at `at`, typed at inference hole `raw`, is pinned at `string` or
-// `string | null`: the rep its arms' own atoms would otherwise leave it at is not the pin's.
-function monoHoleJoinPinsString(
-  raw: i32,
-  at: i32,
-  bN: string[],
-  bT: i32[],
-): boolean {
-  if raw < 0 || raw >= T.tys.length { return false }
-  const rt = tyAt(raw)
-  if !(rt is TyVar) { return false }
-  if rt.tvName.length > 0 && rt.tvName[0] != "?"[0] { return false }
-  const p = monoHoleJoinPinTy(at, bN, bT)
-  if p < 0 || p >= T.tys.length || tyHasTyVar(p) { return false }
-  const pt = tyAt(p)
-  const str = tyPrimNameOf(p) == "string"
-    || (pt is TyNullable && tyPrimNameOf(pt.nInner) == "string")
-  // A literal's element or field joins at the literal's own row, which widens its arms.
-  str && !monoPinInLit && monoHoleJoinHasAtomArm(at, bN, bT)
-}
-
-// Whether some arm value of the `if` chain at `at` is a literal union at the pin, the arm a
-// `string` join widens.
-function monoHoleJoinHasAtomArm(at: i32, bN: string[], bT: i32[]): boolean {
-  let cur = at
-  while cur >= 0 {
-    const c = nodeAt(cur)
-    cur = -1
-    if c is IfStmt {
-      if monoArmPinsLitUnion(ifArmValueExpr(c.ifThen), bN, bT) { return true }
-      if c.ifElse >= 0 {
-        if nodeAt(c.ifElse) is IfStmt {
-          cur = c.ifElse
-        } else if monoArmPinsLitUnion(ifArmValueExpr(c.ifElse), bN, bT) {
-          return true
-        }
-      }
-    }
-  }
-  false
-}
-
-// Whether arm value `v` is typed, at the pin, at a literal union or its nullable.
-function monoArmPinsLitUnion(v: i32, bN: string[], bT: i32[]): boolean {
-  if v < 0 { return false }
-  const t = monoHoleJoinPinTy(v, bN, bT)
-  t >= 0 && t < T.tys.length && !tyHasTyVar(t) && tyIsLitUnion(nonNullTy(t))
-}
-
-// The pinned type of join `at`, through a hole instance's own hole binding where the
-// parameters' binding leaves it open.
-function monoHoleJoinPinTy(at: i32, bN: string[], bT: i32[]): i32 {
-  const p = monoPinnedTyOf(at, bN, bT)
-  if (p >= 0 && !tyHasTyVar(p)) || monoPinHoleN.length == 0 { return p }
-  const e = elabWalkTy(at)
-  if e >= 0 { return e }
-  const jN: string[] = []
-  const jT: i32[] = []
-  monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
-  const s = monoSubstInst(nodeTyIxOf(at), jN, jT)
-  if s < 0 || tyHasTyVar(s) { return p }
-  s
-}
-
-// Whether `ty` names a type parameter and every arm value of the `if` chain at `ix` is typed
-// `ty` too (or never completes), an arm whose value is itself an `if` answering for its own.
-function monoIfArmsAllTy(ix: i32, ty: i32, bN: string[], bT: i32[]): boolean {
-  if ty < 0 || ty >= T.tys.length || !tyHasTyVar(ty) { return false }
-  let cur = ix
-  while cur >= 0 {
-    const c = nodeAt(cur)
-    cur = -1
-    if c is IfStmt {
-      if !monoArmTailIsTy(c.ifThen, ty, bN, bT) { return false }
-      if c.ifElse < 0 { return false }
-      if nodeAt(c.ifElse) is IfStmt { cur = c.ifElse }
-      else if !monoArmTailIsTy(c.ifElse, ty, bN, bT) { return false }
-    }
-  }
-  true
-}
-
-// The join a chain whose recorded join is a bare type parameter takes at the binding `bN`/`bT`
-// when an arm holds another type (`5` beside `t`): its arms' pinned types joined, a union only
-// as a value union registered here. -1 when an arm has no concrete pinned type (D2893).
-function monoIfArmsPinJoin(ix: i32, raw: i32, bN: string[], bT: i32[]): i32 {
-  if raw < 0 || raw >= T.tys.length { return -1 }
-  // A concrete join (`5` first) is re-asked only where an arm's own type names a parameter.
-  if !(tyAt(raw) is TyVar) && !monoIfArmHasTyVar(ix) { return -1 }
-  const ts: i32[] = []
-  monoPinArmLits = []
-  const got = monoChainPinnedTys(ix, bN, bT, ts)
-  if got < 0 { return -1 }
-  const j = joinPinnedArmLit(ts, monoPinArmLits)
-  if j < 0 || j >= T.tys.length || tyHasTyVar(j) { return -1 }
-  // A nested arm joins into its enclosing box, which only a union join builds.
-  if got == 1 && !(tyAt(j) is TyUnion) { return -1 }
-  if monoTyIsUnionOrNulUnion(j) {
-    const name = valueUnionRetName(j)
-    if name == "" || monoRegisterPinUnion(name, j) < 0 { return -1 }
-  }
-  j
 }
 
 // Whether an `if` join the checker typed as an inference hole `raw` (a `??` result absorbing a
@@ -3428,12 +3315,6 @@ function monoChainPinnedTys(ix: i32, bN: string[], bT: i32[], out: i32[]): i32 {
   nested
 }
 
-// Whether the link `cond`/`thenIx` is a desugared `??` whose operand is a join kept apart.
-function monoCoalOverTpJoin(cond: i32, thenIx: i32): boolean {
-  if !monoArmIsTestedNonNull(cond, thenIx) { return false }
-  tyIsTpJoinUnion(nodeTyIxOf(unwrapParen(ifArmValueExpr(thenIx))))
-}
-
 // Whether `cond` is `x != null` and the then arm `thenIx` yields that same `x` node.
 function monoArmIsTestedNonNull(cond: i32, thenIx: i32): boolean {
   const cn = nodeAt(unwrapParen(cond))
@@ -3511,64 +3392,6 @@ function monoDropUnboundMembers(ty: i32): i32 {
     i = i + 1
   }
   joinPinnedArmTys(rest)
-}
-
-// Whether the tail value of arm block `blockIx` is typed `ty`, or is a call that never returns,
-// or is the join at the binding `bN`/`bT` (a narrowed parameter, `x` in the `else` of `x is S`).
-function monoArmTailIsTy(
-  blockIx: i32,
-  ty: i32,
-  bN: string[],
-  bT: i32[],
-): boolean {
-  const v = ifArmValueExpr(blockIx)
-  if v < 0 { return false }
-  const vt = nodeTyIxOf(v)
-  if vt == ty { return true }
-  if vt < 0 || vt >= T.tys.length { return false }
-  const t = tyAt(vt)
-  if t is TyPrim && t.primName == "never" { return true }
-  if monoTySameOrVar(vt, ty) { return true }
-  // A member of a union join, which the pinned union still holds apart.
-  const u = tyAt(ty)
-  if u is TyUnion {
-    let i = 0
-    while i < u.uMembers.length {
-      if monoTySameOrVar(vt, u.uMembers[i]) { return true }
-      i = i + 1
-    }
-  }
-  if !tyHasTyVar(vt) { return false }
-  const pv = monoSubstInst(vt, bN, bT)
-  const pj = monoSubstInst(ty, bN, bT)
-  if pv < 0 || pj < 0 || tyHasTyVar(pv) || tyHasTyVar(pj) { return false }
-  tyEq(pv, pj)
-}
-
-// Whether `a` and `b` are one type: one index, one type parameter's name, or equal.
-function monoTySameOrVar(a: i32, b: i32): boolean {
-  if a == b { return true }
-  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
-  const ta = tyAt(a)
-  const tb = tyAt(b)
-  if ta is TyVar {
-    if tb is TyVar { return ta.tvName == tb.tvName }
-    return false
-  }
-  if tb is TyVar { return false }
-  tyEq(a, b)
-}
-
-// Whether pinned `pty` keeps every member union `raw` has: a pin that merges two members
-// (`boolean | i32`, `T[] | i32[]` at `i32`) is left to its arms, which still tell them apart.
-function monoPinKeepsMembers(raw: i32, pty: i32): boolean {
-  const r = tyAt(raw)
-  if r is TyUnion {
-    const p = tyAt(pty)
-    if p is TyUnion { return p.uMembers.length == r.uMembers.length }
-    return false
-  }
-  true
 }
 
 // The operand children of expression `ix` a copy-on-write rewrite descends into, in the
@@ -5340,9 +5163,9 @@ function monoPinCoalListDefault(
   nb
 }
 
-// `monoIfArmsPinJoin` for a `??` at `ix`, rebuilt as `rb`: where its sides' pinned types join
-// to other than the template's recorded join (`t ?? 5` at a `string | null` pin), a node
-// answering that join. `rb` unchanged otherwise.
+// For a `??` at `ix`, rebuilt as `rb`: where its sides' pinned types join to other than the
+// template's recorded join (`t ?? 5` at a `string | null` pin), a node answering that join. `rb`
+// unchanged otherwise.
 function monoPinCoalJoin(ix: i32, rb: i32, bN: string[], bT: i32[]): i32 {
   const n = nodeAt(ix)
   if !(n is BinExpr) { return rb }
@@ -18045,18 +17868,8 @@ function monoReachSlotTy(a: i32, st: i32, step: string): i32 {
     + ","
   let ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
   if ct < 0 { return -1 }
-  const qs: i32[] = []
-  const vals: i32[] = []
-  if !tyHasTyVar(ct) && elabLitSlotCallTys(a, step, qs, vals) {
-    let ft = -1
-    for v in vals {
-      const ex = monoOpenFnArgDecl(v)
-      let r = if ex >= 0 { monoFnDeclRetAt(ex, qs) } else { monoFnTyRetAt(nodeTyIxOf(v), qs) }
-      if r < 0 && ex >= 0 { r = elabResultAtParams(ex, qs) }
-      const et = if r >= 0 { mkFuncTy(qs, r) } else { -1 }
-      if et < 0 || (ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft)) { ft = -2 }
-      else if ft != -2 { ft = et }
-    }
+  if !tyHasTyVar(ct) {
+    const ft = monoLitSlotCallTy(a, step, 0)
     if ft >= 0 { ct = ft }
   }
   for c in vrCalls(a, path) {
@@ -19082,7 +18895,7 @@ function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
   if xn is Member {
     return tyFieldTyOf(monoPinnedAnnTyAt(xn.memObj, depth + 1), xn.memProp)
   }
-  if xn is Call { return monoPinnedRetAnnTy(xn, depth) }
+  if xn is Call { return monoPinnedRetAnnTy(x, xn) }
   if xn is ArrayLit {
     let t = -1
     for e in xn.arrElems {
@@ -19161,31 +18974,74 @@ function monoPinnedAgree(a: i32, b: i32): i32 {
   b
 }
 
-// `monoPinnedAnnTyAt` for call `c` of an un-annotated declared function, generic or not: the one
-// type every value it returns reads at, a returned list literal of functions instanced at its
-// element's pin first, since the caller can be walked before the body (D9501); -1 when they
-// differ or one has none.
-function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
+// `monoPinnedAnnTyAt` for call `c` (node `x`) of an un-annotated declared function: the one type
+// each returned list literal closes at, from the calls its functions reach (the climb), else as
+// the elaboration closes a held literal, where the callee is a generic's instance or the list holds
+// no record; -1 when they differ or one does not close.
+function monoPinnedRetAnnTy(x: i32, c: Call): i32 {
   const fd = monoCalleeDeclOf(c)
   if fd < 0 { return -1 }
   const fn = nodeAt(fd)
   if !(fn is FuncDecl) { return -1 }
   if fn.fnRet >= 0 { return monoInstAnnRetTy(fd, fn.fnRet) }
-  const it = monoCallInstRetTy(c, fd)
-  if it >= 0 { return it }
+  const itp = monoFrameInstTmpl(fd)
+  const gen = fn.fnTyParams.length > 0
+    || (itp[0] == fd && itp[1] >= 0 && itp[1] != fd)
   let t = -1
   for r in monoFnRetArgs(fn) {
     if r >= 0 && !(nodeAt(r) is RetStmt) {
       const rx = monoRetListLitOf(r)
-      let pft = -9
-      if rx >= 0 { pft = monoRetFnListTy(rx, fd) }
-      let rt = monoPinnedAnnTyAt(r, depth + 1)
-      if rt < 0 && pft >= 0 { rt = mkArrayTy(pft) }
-      if rt < 0 || (t >= 0 && !tyEq(t, rt)) { return -1 }
-      t = rt
+      if rx < 0 { return -1 }
+      const st = monoLitSlotCallTy(rx, "e", 0)
+      let lt = if st >= 0 { mkArrayTy(st) } else { -1 }
+      let et = nodeTyIxOf(rx)
+      while et >= 0 && et < T.tys.length && tyAt(et) is TyArray {
+        et = tyArrayElemIx(et)
+      }
+      const rec = et >= 0 && et < T.tys.length && tyAt(et) is TyObj
+      if lt < 0 && (gen || !rec) { lt = elabReturnedClosedTy(rx, x) }
+      if lt < 0 || (t >= 0 && !tyEq(t, lt)) { return -1 }
+      t = lt
     }
   }
   t
+}
+
+// The type the values in slot `step` of literal `a` close at from the calls they reach: for list
+// literal rows, the list of their own element type, which must agree; for functions, the one type
+// they take at the argument tuple every reached call agrees on (`elabLitSlotCallTys`), each result
+// read at those parameters; -1 where calls or results disagree or one has no such result.
+function monoLitSlotCallTy(a: i32, step: string, depth: i32): i32 {
+  const n = nodeAt(a)
+  if step == "e" && n is ArrayLit && n.arrElems.length > 0 && depth <= 6 {
+    let rows = true
+    for e in n.arrElems {
+      if !(nodeAt(unwrapParen(e)) is ArrayLit) { rows = false }
+    }
+    if rows {
+      let it = -1
+      for e in n.arrElems {
+        const et = monoLitSlotCallTy(unwrapParen(e), "e", depth + 1)
+        if et < 0 || (it >= 0 && !tyEq(it, et)) { return -1 }
+        it = et
+      }
+      return mkArrayTy(it)
+    }
+  }
+  const qs: i32[] = []
+  const vals: i32[] = []
+  if !elabLitSlotCallTys(a, step, qs, vals) { return -1 }
+  let ft = -1
+  for v in vals {
+    const ex = monoOpenFnArgDecl(v)
+    let r = if ex >= 0 { monoFnDeclRetAt(ex, qs) } else { monoFnTyRetAt(nodeTyIxOf(v), qs) }
+    if r < 0 && ex >= 0 { r = elabResultAtParams(ex, qs) }
+    if r < 0 { return -1 }
+    const et = mkFuncTy(qs, r)
+    if ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft) { return -1 }
+    ft = et
+  }
+  ft
 }
 
 // The closed list-of-functions type that the return annotation `ret` of instance `fd` takes at its
@@ -19202,53 +19058,6 @@ function monoInstAnnRetTy(fd: i32, ret: i32): i32 {
     || !tyMayHoldFn(t, 0)
   ) {
     return -1
-  }
-  t
-}
-
-// The closed list result of the instance of template `fd` that call `c` now names, as the
-// emitter resolves its callee; -1 before the call takes one, or when that result is open or not
-// a list (D9552).
-function monoCallInstRetTy(c: Call, fd: i32): i32 {
-  if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
-  const cf = nodeAt(c.callFn)
-  if !(cf is Ident) { return -1 }
-  const fe = fnIndexOf(cf.identName)
-  if fe < 0 || fe >= fnStmts.length { return -1 }
-  const d = fnStmts[fe]
-  if d < 0 || d >= P.nodes.length { return -1 }
-  const it = monoFrameInstTmpl(d)
-  if d == fd || it[0] != d || it[1] != fd { return -1 }
-  const dn = nodeAt(d)
-  if !(dn is FuncDecl) { return -1 }
-  if dn.fnRet < 0 { return monoInstRetLitTy(dn) }
-  const t = nodeTyIxOf(dn.fnRet)
-  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyArray) || monoTyOpen(t) {
-    return -1
-  }
-  t
-}
-
-// The one closed list-of-functions type every value un-annotated instance `fn` returns records,
-// each a returned list literal its own copy of the body instanced (D9601); -1 otherwise.
-function monoInstRetLitTy(fn: FuncDecl): i32 {
-  let t = -1
-  for r in monoFnRetArgs(fn) {
-    if r >= 0 && !(nodeAt(r) is RetStmt) {
-      const rx = monoRetListLitOf(r)
-      const rt = if rx >= 0 { nodeTyIxOf(rx) } else { -1 }
-      if (
-        rt < 0
-        || rt >= T.tys.length
-        || !(tyAt(rt) is TyArray)
-        || monoTyOpen(rt)
-        || !tyMayHoldFn(rt, 0)
-        || (t >= 0 && !tyEq(t, rt))
-      ) {
-        return -1
-      }
-      t = rt
-    }
   }
   t
 }
