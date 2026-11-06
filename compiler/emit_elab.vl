@@ -98,6 +98,7 @@ import {
   CW_UP_RET,
   CW_UP_SPREAD,
   CW_UP_TAIL,
+  cwBindingOf,
   cwBindingWrittenValues,
   cwFnCalls,
   cwFnValueDeclOf,
@@ -11522,43 +11523,79 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
     elabReadStamps(up, out)
   } else if k == CW_UP_ARG && up >= 0 && up < P.nodes.length {
     const cn = nodeAt(up)
-    const fd = if cn is Call && cn.callFn >= 0 { identFnDeclOf(parenPeelIx(cn.callFn)) } else { -1 }
-    const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
     const ai = cwIxUpAux[r]
-    if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
-      // A declared generic handed to a parameter with no written type is instanced at each call
-      // made through that parameter; only where its value flows on out is it delivered.
-      const hole = elabGenericByValue
-        && r == elabGenericRead
-        && !elabDeclAnnotated(fn.fnParams[ai])
-      const was = elabNoCallParam
-      if hole { elabNoCallParam = fn.fnParams[ai] }
-      // The parameter is read in the instances this call ran.
-      const wasKey = elabDlvKey
-      const wasAdmit = elabDlvAdmit
-      elabDlvEnterCall(up)
-      elabEntryFns.push(fd)
-      elabEntryCalls.push(up)
-      // Another instance reads the parameter afresh; what this one saw says nothing of it.
-      const narrowed = elabDlvKey != wasKey && elabEntryFns.length < 8
-      const inSeen = if narrowed { elabSeenFresh() } else { seen }
-      const got: i32[] = []
-      elabSlotReadDeliveries(fn.fnParams[ai], [], got, inSeen)
-      // An instance minted under the call that its key row does not name still reads it.
-      if narrowed && got.length == 0 {
+    const fds = if cn is Call && cn.callFn >= 0 { elabCalleeFns(cn) } else { [] }
+    for fd in fds {
+      const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+      if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
+        // A declared generic handed to a parameter with no written type is instanced at each call
+        // made through that parameter; only where its value flows on out is it delivered.
+        const hole = elabGenericByValue
+          && r == elabGenericRead
+          && !elabDeclAnnotated(fn.fnParams[ai])
+        const was = elabNoCallParam
+        if hole { elabNoCallParam = fn.fnParams[ai] }
+        // The parameter is read in the instances this call ran.
+        const wasKey = elabDlvKey
+        const wasAdmit = elabDlvAdmit
+        elabDlvEnterCall(up)
+        elabEntryFns.push(fd)
+        elabEntryCalls.push(up)
+        // Another instance reads the parameter afresh; what this one saw says nothing of it.
+        const narrowed = elabDlvKey != wasKey && elabEntryFns.length < 8
+        const inSeen = if narrowed { elabSeenFresh() } else { seen }
+        const got: i32[] = []
+        elabSlotReadDeliveries(fn.fnParams[ai], [], got, inSeen)
+        // An instance minted under the call that its key row does not name still reads it.
+        if narrowed && got.length == 0 {
+          elabDlvKey = wasKey
+          elabDlvAdmit = wasAdmit
+          elabSlotReadDeliveries(fn.fnParams[ai], [], got, seen)
+        }
+        for t in got { elabRetsAdd(out, t) }
+        elabEntryFns.pop()
+        elabEntryCalls.pop()
         elabDlvKey = wasKey
         elabDlvAdmit = wasAdmit
-        elabSlotReadDeliveries(fn.fnParams[ai], [], got, seen)
+        elabNoCallParam = was
       }
-      for t in got { elabRetsAdd(out, t) }
-      elabEntryFns.pop()
-      elabEntryCalls.pop()
-      elabDlvKey = wasKey
-      elabDlvAdmit = wasAdmit
-      elabNoCallParam = was
     }
   }
   0
+}
+
+// The functions call `c`'s callee can be: the declared function it names, else each function the
+// slot it reads can hold (a binding aliasing a function value, a list element, a joined value).
+function elabCalleeFns(c: Call): i32[] {
+  const cf = parenPeelIx(c.callFn)
+  const fd = identFnDeclOf(cf)
+  if fd >= 0 { return [fd] }
+  const steps: string[] = []
+  const root = cwSlotPath(cf, steps)
+  const d = if root >= 0 { identDeclOf(root) } else { -1 }
+  // A binding the write index does not cover (one minted after its build) has no frame to read.
+  if d < 0 || d >= cwIxCoveredLen() { return [] }
+  const path: string[] = []
+  for st in steps { path.push(if st == "[]" { "e" } else { "f." + st }) }
+  const out: i32[] = []
+  for f in elabSlotHeldFns(d, path) {
+    if f >= 0 && f < P.nodes.length && nodeAt(f) is FuncDecl { out.push(f) }
+  }
+  // A bare binding also holds each function written to it, its initialiser included.
+  if path.length == 0 {
+    for v in cwBindingWrittenValues(cwBindingOf(root)) {
+      const f = cwPeelValue(v)
+      if (
+        f >= 0
+        && f < P.nodes.length
+        && nodeAt(f) is FuncDecl
+        && !i32ListHas(out, f)
+      ) {
+        out.push(f)
+      }
+    }
+  }
+  out
 }
 
 let elabLitSlotDepth = 0
@@ -11771,22 +11808,23 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
       }
     }
   } else if k == CW_UP_ARG && un is Call && un.callFn >= 0 {
-    const fd = identFnDeclOf(parenPeelIx(un.callFn))
-    const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
     const ai = cwIxUpAux[u]
-    if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
-      // The parameter is read in the instances this call ran.
-      const wasKey = elabDlvKey
-      const wasAdmit = elabDlvAdmit
-      elabDlvEnterCall(up)
-      elabEntryFns.push(fd)
-      elabEntryCalls.push(up)
-      const inSeen = if elabDlvKey != wasKey && elabEntryFns.length < 8 { elabSeenFresh() } else { seen }
-      elabSlotReadDeliveries(fn.fnParams[ai], path, out, inSeen)
-      elabEntryFns.pop()
-      elabEntryCalls.pop()
-      elabDlvKey = wasKey
-      elabDlvAdmit = wasAdmit
+    for fd in elabCalleeFns(un) {
+      const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+      if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
+        // The parameter is read in the instances this call ran.
+        const wasKey = elabDlvKey
+        const wasAdmit = elabDlvAdmit
+        elabDlvEnterCall(up)
+        elabEntryFns.push(fd)
+        elabEntryCalls.push(up)
+        const inSeen = if elabDlvKey != wasKey && elabEntryFns.length < 8 { elabSeenFresh() } else { seen }
+        elabSlotReadDeliveries(fn.fnParams[ai], path, out, inSeen)
+        elabEntryFns.pop()
+        elabEntryCalls.pop()
+        elabDlvKey = wasKey
+        elabDlvAdmit = wasAdmit
+      }
     }
   } else if (k == CW_UP_ELEM || k == CW_UP_FIELD) && elabLitSlotDepth < 4 {
     // A value written as a literal's element or field is held at that slot of the literal.
