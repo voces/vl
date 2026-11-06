@@ -1966,7 +1966,14 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   type keeps it declining. What is left mono-derived is the gate deciding the slot is uncalled.
   Before #6503 gated the stored slot on `elabSlotUncalled` alone, 59 of the 105 reach the default through `monoValsInert`, `monoValsReachNoCall` or
   `monoLitReachesNoCall` while `elabSlotUncalled` says the slot is called. That calledness
-  disagreement is this family's next item.
+  disagreement, shadowed at the four gate sites on 2026-11-06, is 53 decisions in about 31
+  programs where mono says uncalled and the elaboration says called: 23 at the flat list with no
+  pins (`monoLitReachesNoCall`), 28 at the stored slot and 2 at the pushed list (`monoValsInert`).
+  `elabSlotUncalled` now counts no call whose callee names a function or is a const element read
+  naming one (`fnSlotThroughCalls`, `elabCallNamesOne`), which moves 22 of the 23 to agree with no
+  new disagreement. The 31 left, the pushed-list and stored-slot ones and one call through a list
+  of one lambda, are the calls the `monoFlowReads` rewrite repoints, which the cad lane records
+  after B2; then `monoLitReachesNoCall`, `monoValsReachNoCall` and `monoValsInert` go.
 
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
 with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
