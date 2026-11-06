@@ -1861,6 +1861,37 @@ instance):
 - `monoRetRepOf` and `monoReturnedBundlePin` are rep decisions, so they move to the per-call
   delivered rep below.
 
+**`monoPinnedRetAnnTy` is parked.** Re-keyed onto the forward climb (`elabLitSlotCallTys` over
+each returned list literal, with each element's result) and shadowed over the 23,103 programs:
+
+| outcome | events |
+| --- | --- |
+| both answer, agree | 11 |
+| both answer, differ | 0 |
+| old only | 18 |
+| new only | 1 |
+| neither | 1,027 |
+
+The 18 old-only fall into two groups:
+- 13 are an uncalled slot, which takes the unbound default (the D15293, D15207 and D15294 named
+  sets; `named/d15293_string_alone.vl`). That belongs to the uncalled-slot and unbound-default work.
+- 5 are a returned list reached only through a callback method or a hand-on
+  (`hole-fn-list-unbound-and-returned.vl`), which the climb does not follow yet.
+
+The switch waits for the default, then for that climb edge.
+
+**Value returns are aligned.** `monoFlowCallLeaf` names the module-level generic every `return` of
+a call's callee reads. Over the 23,103 programs the climb confirms it: the one top-level generic
+whose value `elabValueReturnsFrom` finds reaching that return agrees at 87 queries. It differs at
+none, misses none, and answers 2 more. A reverse fact ("the values reaching `f`'s returns") would
+replace at most the walk's 3 producers, so the family stays.
+
+The shadow found a defect in `elabValueReturnsFrom`. `elabSlotDeliveries` memoised an outermost
+query whenever no call sink was on, but the return sink was not in that gate. A second query for
+the same value read the memo, walked nothing and answered false. The memo now skips a return-sink
+query; `tests/vl_elab_rets_reach_test.ts` asks the query three times. No program in the population
+changed output.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
