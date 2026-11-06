@@ -2249,7 +2249,8 @@ where the elaboration names several generics and the read is no longer rewritten
 `mfrChainFns` of every call's callee read: one walk down the read's value chain, gated at every
 link. A written binding holds every value written to it; a slot holds every value stored there
 (`cwSlotWrittenValues`, through a callee's parameter too); `??` holds both sides; a parameter
-holds every call's argument. A literal index needs the literal unwritten after its build and the
+holds every call's argument, unless its function is exported, whose callers outside the program
+the walk cannot see. A literal index needs the literal unwritten after its build and the
 index inside it, so a read past the end still traps. A lambda leaf, a parenthesised name (the emitter does not
 instance one taken as a value: [D4120](inventory/D4120.md)), an
 annotation, a parameter default, or any unknown link declines. The read's ROOT must be a `let` or `const`: a read rooted at
