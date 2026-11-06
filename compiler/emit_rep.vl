@@ -144,6 +144,11 @@ import {
   tySame,
   tyToEmitName,
   tyToNominalName,
+  TY_I32,
+  TY_NEVER,
+  mkArrayTy as repMkArrayTy,
+  mkNullableTy as repMkNullableTy,
+  mkObjTy as repMkObjTy,
 } from "./check_types"
 import { sidOf } from "./symbols"
 import {
@@ -3356,11 +3361,43 @@ export function repSigKindOfTy(ty: i32): VKind | null {
   repTreeVKind(repTreeOfTy(ty))
 }
 
+// `ty` with each `never` a list element or record field holds read as the D4551 default `i32`:
+// no value reaches such a slot, so it needs only a valid rep (D15530). A bare `never`, and one
+// a nullable holds directly, stay.
+function repNeverCanon(ty: i32, depth: i32) {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return ty }
+  const t = tyAt(ty)
+  match t {
+    TyArray => {
+      const e = if t.aElem == TY_NEVER { TY_I32 } else { repNeverCanon(t.aElem, depth + 1) }
+      return if e == t.aElem { ty } else { repMkArrayTy(e) }
+    }
+    TyNullable => {
+      const i = repNeverCanon(t.nInner, depth + 1)
+      return if i == t.nInner { ty } else { repMkNullableTy(i) }
+    }
+    TyObj => {
+      const fs: i32[] = []
+      let moved = false
+      for f in t.objFieldTypes {
+        const c = if f == TY_NEVER { TY_I32 } else { repNeverCanon(f, depth + 1) }
+        if c != f { moved = true }
+        fs.push(c)
+      }
+      return if moved { repMkObjTy(t.objFieldNames, fs) } else { ty }
+    }
+    TyPrim | TyFunc | TyMap | TyUnion | TyVar | TyNeg | TyLit | TyErr => {
+      return ty
+    }
+  }
+}
+
 // The flat derivation: one table-driven arm per `Ty` variant. Invariant: every
 // covered arm must decide the rep exactly as the emitter's annotation-name
 // classifier ladder (`vtKindOfType`'s arm order) does for the same type — the
 // migration gates (fixpoint + corpus byte-compare) hold each arm to that.
-function repOfTyFlat(ty: i32): RepDesc {
+function repOfTyFlat(ty0: i32): RepDesc {
+  const ty = repNeverCanon(ty0, 0)
   if ty < 0 { return repUncovered() }
   const t = tyAt(ty)
   // EXHAUSTIVE over `Ty` and deliberately `_`-less: a 12th arena variant breaks
@@ -4468,7 +4505,8 @@ function repTreeOfTy(ty: i32): i32 {
   rtGo(ty)
 }
 
-function rtGo(ty: i32): i32 {
+function rtGo(ty0: i32): i32 {
+  const ty = repNeverCanon(ty0, 0)
   if ty < 0 { return rtLeafOf("unsup", 0, "hole", -1) }
   if ty < rtByTy.length {
     if rtByTy[ty] >= 0 { return rtByTy[ty] }
