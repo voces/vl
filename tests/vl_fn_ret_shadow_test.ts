@@ -382,6 +382,22 @@ function main() {
 main()
 `;
 
+// An identity instance handed a record literal and returned into a union with its own row reaches
+// the row class: its recorded result keys the slot elsewhere, and the value's stamp agrees.
+const ROW_ID_UNION = `type J = { r: i32 | null }
+function idn<T>(v: T): T { v }
+function take(u: J | string) {
+  if u is J { print(u.r ?? 0) } else { print(u) }
+}
+const w0 = idn({ r: 5 })
+function deliver(): J | string { return idn({ r: 4 }) }
+function deliver6(): J | string { return idn({ r: 6 }) }
+const v: J | string = deliver()
+if v is J { print(v.r ?? 0) } else { print(0) }
+take(deliver6())
+print(w0.r)
+`;
+
 const ROW_DELIVERY = `type J = { r: i32 | null }
 function idn<T>(v: T): T { v }
 const u: J | string = idn({ r: 4 })
@@ -467,6 +483,14 @@ Deno.test({
       DROP_NONE,
       true,
       "kind agree | d=1; kind agree | di=1; kind agree | ds=1; kind agree | id$1=1; kind agree | id=1",
+      true,
+    );
+    expectRows(
+      "row identity into union",
+      ROW_ID_UNION,
+      DROP_NONE,
+      true,
+      "kind agree | deliver6=1; kind agree | deliver=1; kind agree | idn=1; row agree | idn$1=1",
       true,
     );
     expectRows(
