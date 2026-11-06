@@ -1349,6 +1349,19 @@ movers that keying by rep could not close.
 `emit_mono.vl`'s function count is flat at this step: `monoElabSplitKey` still serves the value
 half, and its deletion is what the value half's switch earns.
 
+**A lambda's instance is keyed by the instance it is nested in** (2026-11-06): the walk top
+(`elabWalkTop`), the declaration, and the rep and tagged set of each pin. Measured against the
+elaboration's own index of nested instances (`elabKidsAt`) over the 1,423 lambda instances in
+`tests/cases`, that key names exactly the elaboration's instance for all 1,377 made inside an
+instance walk; the 46 made outside one have no elaboration key and keep mono's. It moves no
+module's bytes.
+
+The typed fallback (`monoTypedInstKey`) slices mono's spelled key at the offsets
+`monoMakeInstanceKeyOf` recorded, so it is derived from that spelling and never from the
+canonical key that replaces it. Sliced from the canonical key it read garbage: the 76 byte
+movers of the call half were that, and it reused a wrong lambda instance when the lambda key
+first switched (`generics/hole-call-generic-lambda-arg.vl` trapped).
+
 ## 4. Scoreboard
 
 The scoreboard reports side effects of the migration; it is not a landing criterion (§3).
