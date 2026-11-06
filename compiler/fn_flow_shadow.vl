@@ -35,7 +35,7 @@ import {
   orderArgsByParamNames,
 } from "./ast"
 import { monoIsGenericDecl, normTypeAtom, unwrapParen } from "./emit_base"
-import { declTyIxOfName, repNameCanonId } from "./emit_rep"
+import { declTyIxOfName } from "./emit_rep"
 import { fnStmts } from "./emit_state"
 import { i32ListHas, strListHas } from "./listutil"
 import {
@@ -61,7 +61,6 @@ import {
   TyVar,
   tyAt,
   tyEmitNameKey,
-  tyToEmitName,
   tyToStr,
 } from "./check_types"
 import { nonNullTy, tyHasTyVar } from "./tyquery"
@@ -83,14 +82,11 @@ let ffPairVal: i32[] = []
 let ffPairNext: i32[] = []
 // Reads the walk resolved to a local binding, by node: the sweep checks none now names a function.
 let ffLocalRead: {[i32]: i32} = Map()
-// Per declaration: the binding its initializer reads (-2 for a capture cell, which exists because
-// its binding is written), and whether an `=` writes it.
-let ffDeclFrom: {[i32]: i32} = Map()
+// Per declaration, whether an `=` writes it.
 let ffDeclWr: {[i32]: boolean} = Map()
-// Per pre-mono declaration (`ffOrigDecl`): its node in the walked tree, the function declaring it
-// (-1 at module scope), and the `=` writes of it and of its capture cell (`d[0] = v`), by node.
+// Per pre-mono declaration (`ffOrigDecl`): its node in the walked tree, and the `=` writes of it
+// and of its capture cell (`d[0] = v`), by node.
 let ffDeclNode: {[i32]: i32} = Map()
-let ffDeclFnOf: {[i32]: i32} = Map()
 let ffDeclWrites: {[i32]: i32[]} = Map()
 let ffCellWrites: {[i32]: i32[]} = Map()
 // Calls through an un-annotated `let` lambda, by call: the lambda, the binding, the walk context
@@ -137,14 +133,6 @@ let pinFn: i32[] = []
 // The call each pin is taken at, -1 for an annotation.
 let pinAt: i32[] = []
 let ffPinSkip: {[i32]: boolean} = Map()
-// The calls a query leaves out, as `ffPinSkip` leaves out functions.
-let ffPinCallSkip: {[i32]: boolean} = Map()
-// A slot's closed directed pin keys (`ffPathPinKeys`) at `2 * slot`, sigs, and `2 * slot + 1`,
-// rets, set where `ffKeyHas` is; valid while no slot, edge or pin has been added since
-// (`ffKeyStamp`), and bypassed by a query with `ffPinSkip` set (D4942).
-let ffKeyMemo: string[][] = []
-let ffKeyHas: boolean[] = []
-let ffKeyStamp: i32[] = [-1, -1, -1]
 let dfEdgeN = 0
 
 // A context is one walk of a function body: the type bindings its type variables take. Context 0
@@ -178,10 +166,8 @@ export function fnFlowShadowBegin() {
   ffPairVal = []
   ffPairNext = []
   ffLocalRead = Map()
-  ffDeclFrom = Map()
   ffDeclWr = Map()
   ffDeclNode = Map()
-  ffDeclFnOf = Map()
   ffDeclWrites = Map()
   ffCellWrites = Map()
   ffLetLamAt = []
@@ -204,9 +190,6 @@ export function fnFlowShadowBegin() {
   dfTo = []
   dfPin = []
   dfEdgeN = 0
-  ffKeyMemo = []
-  ffKeyHas = []
-  ffKeyStamp = [-1, -1, -1]
   ffDeclSlots = Map()
   ffDeclSlotCtx = Map()
   ffCallCtx = Map()
@@ -352,13 +335,6 @@ function ffKid(s: i32, k: string): i32 {
   ufKidK[r2].push(ffKidKey(k))
   ufKidS[r2].push(n)
   n
-}
-
-function ffI32Merge(into: i32[], from: i32[]) {
-  for x in from {
-    if !i32ListHas(into, x) { into.push(x) }
-  }
-  0
 }
 
 // How many facts root `r`'s class holds, which decides the side a merge keeps.
@@ -712,15 +688,11 @@ function ffStmt(ix: i32) {
     declCtx[ix] = ffCtx
     const o = ffOrigDecl(ix)
     ffDeclNode[o] = ix
-    ffDeclFnOf[o] = ffFn
     const s = ffDeclSlotIn(ix, ffCtx)
     ffAddDecl(s, ix)
     ffBankDeclSlot(o, s)
     if n.letType >= 0 { ffPinTy(s, ffSubst(ffAnnTy(n.letType)), 0) }
-    if n.letInit >= 0 {
-      ffDeclFrom[ix] = ffInitBinding(n.letInit)
-      ffInto(s, ffFlow(n.letInit))
-    }
+    if n.letInit >= 0 { ffInto(s, ffFlow(n.letInit)) }
     return 0
   }
   if n is RetStmt {
@@ -758,27 +730,6 @@ function ffStmt(ix: i32) {
   }
   ffFlow(ix)
   0
-}
-
-// The binding initializer `ix` reads by name, -2 for a capture cell or a read through one, -1
-// for any other value.
-function ffInitBinding(ix: i32): i32 {
-  const n = nodeAt(ix)
-  if n is Ident {
-    const d = identDeclOf(ix)
-    if d < 0 || d >= P.nodes.length || nodeAt(d) is FuncDecl { return -1 }
-    return d
-  }
-  if ffIsCellValue(ix) { return -2 }
-  -1
-}
-
-// Whether `ix` is the rewrite's capture cell `[v]`, which carries no source position, or a read
-// `c[0]` through one.
-function ffIsCellValue(ix: i32): boolean {
-  const n = nodeAt(ix)
-  if n is ArrayLit { return n.pos < 0 && n.arrElems.length == 1 }
-  ffIsCellRead(ix)
 }
 
 // Whether `ix` is a read `c[0]` of a name.
@@ -1565,11 +1516,6 @@ function ffInstCtx(ix: i32, fn: i32): i32 {
   ctx
 }
 
-function ffTyKey(t: i32): string {
-  if t < 0 { return "-" }
-  tyToEmitName(t)
-}
-
 // A binding's part of a context key: equal where `ffTyKey`'s are, short for a deep record (D2780).
 function ffCtxTyKey(t: i32): string {
   if t < 0 { return "-" }
@@ -1580,205 +1526,6 @@ function ffCtxTyKey(t: i32): string {
 export function fnFlowTableBuild(stmts: i32[]) {
   if ffBuilt { return 0 }
   ffBuild(stmts)
-}
-
-// The parameter types of the one signature every call through a class holding lambda `lam`
-// agrees on; empty when nothing pins the class, two signatures do, or the lambda is walked
-// inside a generic.
-export function fnFlowLamPin(lam: i32): i32[] {
-  const none: i32[] = []
-  let r = rdHead[lam] ?? -1
-  let pick = -1
-  let pickName = ""
-  while r >= 0 {
-    if rdKind[r] == 1 {
-      if rdWalk[r] != 0 { return none }
-      const root = ffFind(rdSlot[r])
-      if root < 0 { return none }
-      for id in ufPin[root] {
-        if !ffPinOpen(id) {
-          const nm = ffJoin(ffPinNames(id))
-          if pick < 0 {
-            pick = id
-            pickName = nm
-          } else if nm != pickName {
-            return none
-          }
-        }
-      }
-    }
-    r = rdNext[r]
-  }
-  if pick < 0 { return none }
-  pinTys[pick]
-}
-
-// Whether the binding read `at`, or one its initializer chain copies, may hold a value other than
-// its initializer's: an `=` writes it, or it is a capture cell. True without a built table, the
-// safe answer.
-export function fnFlowReadWritten(at: i32): boolean {
-  if !ffBuilt { return true }
-  let d = ffOrigDecl(identDeclOf(at))
-  let hops = 0
-  while d >= 0 && hops < 64 {
-    if ffDeclWr[d] ?? false { return true }
-    const f = ffDeclFrom[d] ?? -1
-    if f == -2 { return true }
-    d = ffOrigDecl(f)
-    hops = hops + 1
-  }
-  hops >= 64
-}
-
-// The named generic function the read `at` names through a chain of un-annotated aliases none of
-// which an `=` writes (`const k = inner; const j = k`), as its declaration; -1 for any other read.
-export function fnFlowReadGenFn(at: i32): i32 {
-  if !ffBuilt { return -1 }
-  let d = ffOrigDecl(identDeclOf(at))
-  let hops = 0
-  while d >= 0 && d < P.nodes.length && hops < 64 {
-    const n = nodeAt(d)
-    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return -1 }
-    if n.letKw != "const" && (ffDeclWr[d] ?? false) { return -1 }
-    if !(nodeAt(n.letInit) is Ident) { return -1 }
-    const nd = identDeclOf(n.letInit)
-    if nd < 0 || nd >= P.nodes.length { return -1 }
-    if nodeAt(nd) is FuncDecl {
-      if !monoIsGenericDecl(nd) { return -1 }
-      return nd
-    }
-    d = ffOrigDecl(nd)
-    hops = hops + 1
-  }
-  -1
-}
-
-// Whether an `=` writes the binding the read `at` names (a capture cell's `d[0] = v` aside).
-export function fnFlowDeclWritten(at: i32): boolean {
-  const d = identDeclOf(at)
-  if !ffBuilt || d < 0 { return false }
-  (ffDeclWrites[ffOrigDecl(d)] ?? []).length > 0
-}
-
-// The function declaring the binding declaration `d` stands for, -1 at module scope, and -2
-// when the walk saw no such declaration.
-export function fnFlowDeclFn(d: i32): i32 { ffDeclFnOf[ffOrigDecl(d)] ?? -2 }
-
-// The distinct closed parameter lists (`p1,p2,`) calls and annotated destinations pin the slot
-// `path` (`e`, `v`, `f.<name>`; empty is the value) of `d` at, in walk instance `inst` of generic
-// `tmpl` (-1, -1 outside one), leaving out pins taken in a function in `dead`. `[FF_PIN_DECLINE]`
-// with no table, no walk of `d`, or walks that disagree with none picked out by the instance.
-export function fnFlowDeclPathPinSigs(
-  d: i32,
-  path: string[],
-  inst: i32,
-  tmpl: i32,
-  dead: {[i32]: boolean},
-): string[] {
-  ffPinSkip = dead
-  const out = ffDeclPathPinKeys(d, path, inst, tmpl, false)
-  ffPinSkip = Map()
-  out
-}
-
-// `fnFlowDeclPathPinSigs` leaving out as well the pins taken at a call in `calls`.
-export function fnFlowDeclPathPinSigsOmitting(
-  d: i32,
-  path: string[],
-  inst: i32,
-  tmpl: i32,
-  dead: {[i32]: boolean},
-  calls: i32[],
-): string[] {
-  for c in calls { ffPinCallSkip[c] = true }
-  const out = fnFlowDeclPathPinSigs(d, path, inst, tmpl, dead)
-  ffPinCallSkip = Map()
-  out
-}
-
-// The functions that take the pins downstream of the slot `path` of `d`, over every walk of `d`, -1
-// for module code; empty without a table.
-export function fnFlowDeclPathPinFns(d: i32, path: string[]): i32[] {
-  const out: i32[] = []
-  if !ffBuilt || d < 0 { return out }
-  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
-    let r = s
-    for k in path {
-      if r >= 0 { r = ffKidOf(ffFind(r), k) }
-    }
-    if r >= 0 {
-      for id in ffDirectedPins(r) {
-        if !i32ListHas(out, pinFn[id]) { out.push(pinFn[id]) }
-      }
-    }
-  }
-  out
-}
-
-// The calls that take the pins downstream of the slot `path` of `d`, over every walk of `d`; an
-// annotation's pin names none. Empty without a table.
-export function fnFlowDeclPathPinCalls(d: i32, path: string[]): i32[] {
-  const out: i32[] = []
-  if !ffBuilt || d < 0 { return out }
-  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
-    let r = s
-    for k in path {
-      if r >= 0 { r = ffKidOf(ffFind(r), k) }
-    }
-    if r >= 0 {
-      for id in ffDirectedPins(r) {
-        if pinAt[id] >= 0 && !i32ListHas(out, pinAt[id]) { out.push(pinAt[id]) }
-      }
-    }
-  }
-  out
-}
-
-// The parameter types of a closed pin downstream of the slot `path` of `d` whose parameter list
-// `fnFlowDeclPathPinSigs` spells `sig`; empty without a table or with no such pin.
-export function fnFlowDeclPathPinTysOf(
-  d: i32,
-  path: string[],
-  sig: string,
-): i32[] {
-  const none: i32[] = []
-  if !ffBuilt || d < 0 { return none }
-  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
-    let r = s
-    for k in path {
-      if r >= 0 { r = ffKidOf(ffFind(r), k) }
-    }
-    if r >= 0 {
-      for id in ffDirectedPins(r) {
-        if !ffPinOpen(id) && ffPinSig(id) == sig { return pinTys[id] }
-      }
-    }
-  }
-  none
-}
-
-// The parameter types every closed pin call `cx` takes downstream of the slot `path` of `d`
-// agrees on; empty without a table, with no closed pin at that call, or with two that differ.
-export function fnFlowDeclPathPinTysAt(d: i32, path: string[], cx: i32): i32[] {
-  const none: i32[] = []
-  if !ffBuilt || d < 0 { return none }
-  let hit = -1
-  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
-    let r = s
-    for k in path {
-      if r >= 0 { r = ffKidOf(ffFind(r), k) }
-    }
-    if r >= 0 {
-      for id in ffDirectedPins(r) {
-        if pinAt[id] == cx && !ffPinOpen(id) {
-          if hit >= 0 && ffPinSig(hit) != ffPinSig(id) { return none }
-          hit = id
-        }
-      }
-    }
-  }
-  if hit < 0 { return none }
-  pinTys[hit]
 }
 
 // The one call that pins the slot `path` of `d`, open or closed, with its parameter types pushed
@@ -1838,50 +1585,6 @@ export function fnFlowDeclPathAgreedPinTysSkipping(
   const ok = ffAgreedPinTys(d, path, -1, tys)
   ffPinSkip = Map()
   ok
-}
-
-// Each call pin's parameter list of the slot `path` of `d`, open ones included, for a caller that
-// closes them itself, leaving out the calls made in the functions `skip` (such as the other
-// elements of a list a call reaches one element through, D13202); empty without a table, with no
-// pin, or when an annotation pins the slot.
-export function fnFlowDeclPathCallPinTyLists(
-  d: i32,
-  path: string[],
-  skip: i32[],
-): i32[][] {
-  const out: i32[][] = []
-  if !ffBuilt || d < 0 { return out }
-  ffPinSkipFns(skip)
-  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
-    let r = s
-    for k in path {
-      if r >= 0 { r = ffKidOf(ffFind(r), k) }
-    }
-    if r >= 0 {
-      for id in ffDirectedPins(r) {
-        if pinAt[id] < 0 {
-          ffPinSkip = Map()
-          return []
-        }
-        if !(ffPinSkip[pinFn[id]] ?? false) { out.push(pinTys[id]) }
-      }
-    }
-  }
-  ffPinSkip = Map()
-  out
-}
-
-// `fnFlowDeclPathAgreedPinTys` over the walk pre-mono call `call` makes of `d`'s function alone,
-// so another call's instance adds no pin; over every walk when the table has no one for it.
-export function fnFlowCallPathAgreedPinTys(
-  d: i32,
-  path: string[],
-  call: i32,
-  tys: i32[],
-): boolean {
-  const cx = ffCallCtx[call] ?? -1
-  if cx < 2 { return ffAgreedPinTys(d, path, -1, tys) }
-  ffAgreedPinTys(d, path, cx, tys)
 }
 
 // Sets `ffPinSkip` to the functions `fns`, each as the walks know it.
@@ -1949,168 +1652,7 @@ function ffAgreedPinHit(d: i32, path: string[], cx: i32, ann: boolean): i32 {
   hit
 }
 
-// Whether no call, open or closed, and no annotation reaches the value of the slot `path` of `d`
-// in any walk of it, and the slot's class escapes nowhere the table cannot follow; false without
-// a table or a walk of `d`, or when a walk derived no such slot.
-export function fnFlowDeclPathUncalled(d: i32, path: string[]): boolean {
-  if !ffBuilt || d < 0 { return false }
-  const slots = ffDeclSlots[ffOrigDecl(d)] ?? []
-  if slots.length == 0 { return false }
-  for s in slots {
-    let r = s
-    for k in path {
-      if r >= 0 { r = ffKidOf(ffFind(r), k) }
-    }
-    if r < 0 { return false }
-    const root = ffFind(r)
-    if root < 0 || ufTop[root] != "" || ffDirectedPins(r).length > 0 {
-      return false
-    }
-  }
-  true
-}
-
-// `fnFlowDeclPathPinSigs` answering the distinct returns annotated destinations pin the slot at
-// instead; a call's pin names no return and is left out.
-export function fnFlowDeclPathPinRets(
-  d: i32,
-  path: string[],
-  inst: i32,
-  tmpl: i32,
-): string[] {
-  ffDeclPathPinKeys(d, path, inst, tmpl, true)
-}
-
-// The pins' parameter lists, or their returns when `rets`, as `fnFlowDeclPathPinSigs` picks them.
-function ffDeclPathPinKeys(
-  d: i32,
-  path: string[],
-  inst: i32,
-  tmpl: i32,
-  rets: boolean,
-): string[] {
-  const decline: string[] = [FF_PIN_DECLINE]
-  if !ffBuilt || d < 0 { return decline }
-  const o = ffOrigDecl(d)
-  const slots = ffDeclSlots[o] ?? []
-  const ctxs = ffDeclSlotCtx[o] ?? []
-  if slots.length == 0 { return decline }
-  const first = ffPathPinKeys(slots[0], path, rets)
-  let agree = true
-  let i = 1
-  while i < slots.length {
-    if !ffSameSigs(first, ffPathPinKeys(slots[i], path, rets)) { agree = false }
-    i = i + 1
-  }
-  if agree { return first }
-  if tmpl < 0 || inst < 0 { return decline }
-  const ps = ffInstParamSpells(inst, tmpl)
-  let pick = decline
-  i = 0
-  while i < slots.length && i < ctxs.length {
-    const c = ctxs[i]
-    if (c >= 2 && ffWalked(tmpl, c) && ffCtxFits(tmpl, c, ps)) {
-      const sigs = ffPathPinKeys(slots[i], path, rets)
-      if pick.length == 1 && pick[0] == FF_PIN_DECLINE { pick = sigs }
-      else if !ffSameSigs(pick, sigs) { return decline }
-    }
-    i = i + 1
-  }
-  pick
-}
-
 export const FF_PIN_DECLINE = "?"
-
-// The closed pins (`ffPinSigsOf`, or `ffPinRetsOf` when `rets`) taken downstream of the slot
-// `path` derives from slot `s`; empty when no walk derived a step of the path.
-function ffPathPinKeys(s: i32, path: string[], rets: boolean): string[] {
-  let r = s
-  for k in path {
-    r = ffKidOf(ffFind(r), k)
-    if r < 0 { return [] }
-  }
-  if ffPinSkip.length > 0 || ffPinCallSkip.length > 0 {
-    if rets { return ffPinRetsOf(ffDirectedPins(r)) }
-    return ffPinSigsOf(ffDirectedPins(r))
-  }
-  if (
-    ffKeyStamp[0] != ufPar.length
-    || ffKeyStamp[1] != dfEdgeN
-    || ffKeyStamp[2] != pinTys.length
-  ) {
-    ffKeyMemo = []
-    ffKeyHas = []
-    ffKeyStamp = [ufPar.length, dfEdgeN, pinTys.length]
-  }
-  let at = 2 * r
-  if rets { at = at + 1 }
-  if at < ffKeyHas.length && ffKeyHas[at] { return ffStrCopy(ffKeyMemo[at]) }
-  const keys = if rets { ffPinRetsOf(ffDirectedPins(r)) } else { ffPinSigsOf(ffDirectedPins(r)) }
-  while ffKeyHas.length <= at {
-    const none: string[] = []
-    ffKeyMemo.push(none)
-    ffKeyHas.push(false)
-  }
-  ffKeyMemo[at] = keys
-  ffKeyHas[at] = true
-  ffStrCopy(keys)
-}
-
-// A fresh copy of `xs`, so a caller that extends an answer leaves the memo alone.
-function ffStrCopy(xs: string[]): string[] {
-  const out: string[] = []
-  for x in xs { out.push(x) }
-  out
-}
-
-// Every source of the slot `path` of `d`, in every context `d` is walked in, a write's value
-// among them; empty for an empty path or when a slot is missing or has no source. A generic's template
-// walk holds only what a call past the context cap delivers, so an empty slot there is skipped.
-export function fnFlowDeclPathSrcs(d: i32, path: string[]): i32[] {
-  const out: i32[] = []
-  if !ffBuilt || d < 0 || path.length == 0 { return out }
-  const o = ffOrigDecl(d)
-  const slots = ffDeclSlots[o] ?? []
-  const ctxs = ffDeclSlotCtx[o] ?? []
-  let i = 0
-  while i < slots.length {
-    let r = ffFind(slots[i])
-    for k in path { r = ffFind(ffKidOf(r, k)) }
-    const tmpl = i < ctxs.length && ctxs[i] == 1
-    if tmpl && (r < 0 || ufSrc[r].length == 0) {
-      i = i + 1
-      continue
-    }
-    if r < 0 || ufSrc[r].length == 0 { return [] }
-    ffI32Merge(out, ufSrc[r])
-    i = i + 1
-  }
-  out
-}
-
-// Every function the slot `path` of `d` (`d`'s own for an empty path) can hold, written or not, in
-// every context `d` is walked in; empty when a slot is missing, has no source, or escapes where
-// the table cannot follow.
-export function fnFlowDeclPathHeldSrcs(d: i32, path: string[]): i32[] {
-  const out: i32[] = []
-  if !ffBuilt || d < 0 { return out }
-  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
-    let r = ffFind(s)
-    for k in path { r = ffFind(ffKidOf(r, k)) }
-    if r < 0 || ufTop[r] != "" || ufSrc[r].length == 0 { return [] }
-    ffI32Merge(out, ufSrc[r])
-  }
-  out
-}
-
-// Whether the lists `a` and `b` hold the same strings.
-function ffSameSigs(a: string[], b: string[]): boolean {
-  if a.length != b.length { return false }
-  for x in a {
-    if !strListHas(b, x) { return false }
-  }
-  true
-}
 
 // The pins taken at every slot `s`'s value reaches along the directed edges, `s` included.
 function ffDirectedPins(s: i32): i32[] {
@@ -2163,22 +1705,6 @@ function ffPinSpell(t: i32): string {
   out + s.slice(st, s.length)
 }
 
-// The distinct closed pins among `ids`, each as `p1,p2,`, in the order first taken.
-function ffPinSigsOf(ids: i32[]): string[] {
-  const out: string[] = []
-  for id in ids {
-    if (
-      !ffPinOpen(id)
-      && !(ffPinSkip[pinFn[id]] ?? false)
-      && !(ffPinCallSkip[pinAt[id]] ?? false)
-    ) {
-      const sig = ffPinSig(id)
-      if !strListHas(out, sig) { out.push(sig) }
-    }
-  }
-  out
-}
-
 // Pin `id`'s parameter list spelled `p1,p2,`.
 function ffPinSig(id: i32): string { fnFlowPinSigOf(pinTys[id]) }
 
@@ -2189,96 +1715,6 @@ export function fnFlowPinSigOf(tys: i32[]): string {
   sig
 }
 
-// The distinct returns of the closed pins among `ids` an annotation took, in the order first taken.
-function ffPinRetsOf(ids: i32[]): string[] {
-  const out: string[] = []
-  for id in ids {
-    if !ffPinOpen(id) && pinRet[id] >= 0 {
-      const r = ffPinSpell(pinRet[id])
-      if !strListHas(out, r) { out.push(r) }
-    }
-  }
-  out
-}
-
-// The longest alias chain the lambda answers below follow; `FF_CHAIN_LONG` reports one longer.
-const FF_CHAIN_MAX = 64
-export const FF_CHAIN_LONG = -3
-
-// The un-annotated `const` binding of a hole lambda the binding read `at` holds through a chain
-// of un-annotated `const` and `let` bindings, each `let` written only with lambdas and at least one
-// on the chain (`viaLet` counts one already behind), as its declaration; -1 for none, and
-// `FF_CHAIN_LONG` past `FF_CHAIN_MAX` links.
-export function fnFlowAliasLam(at: i32, viaLet: boolean): i32 {
-  if !ffBuilt { return -1 }
-  ffAliasLamFrom(ffReadLet(at), viaLet)
-}
-
-// The hole lambda's binding the capture cell read at `at` (`d[0]`, or `d` itself) holds: the
-// rewrite's `let d = [v]`, written only with lambdas, whose `v` is such a chain.
-export function fnFlowCellLam(at: i32): i32 {
-  if !ffBuilt || at < 0 || at >= P.nodes.length { return -1 }
-  let r = at
-  const rn = nodeAt(at)
-  if rn is Index { r = rn.idxArr }
-  const d = ffLetOf(identDeclOf(r))
-  if d < 0 { return -1 }
-  const n = nodeAt(d)
-  if !(n is LetDecl) || n.letKw != "let" || n.letInit < 0 { return -1 }
-  const lit = nodeAt(n.letInit)
-  if !(lit is ArrayLit) { return -1 }
-  if lit.pos >= 0 || lit.arrElems.length != 1 { return -1 }
-  if !ffWritesAreLams(ffCellWrites[ffOrigDecl(d)] ?? []) { return -1 }
-  ffAliasLamFrom(ffReadLet(lit.arrElems[0]), true)
-}
-
-// The un-annotated `const` binding the call through read `at` is re-spelled to: the end of a chain
-// of at most eight un-annotated `const` aliases (`const c2 = c`), each link's name read in the
-// frame declaring the link, when it binds a lambda. -1 for any other read.
-export function fnFlowRespellLam(at: i32): i32 {
-  if !ffBuilt { return -1 }
-  let d = ffReadLet(at)
-  let hops = 0
-  while hops < 8 && d >= 0 {
-    const n = nodeAt(d)
-    if !(n is LetDecl) { return -1 }
-    if n.letKw != "const" || n.letType >= 0 || n.letInit < 0 { return -1 }
-    if !(nodeAt(n.letInit) is Ident) { return -1 }
-    const s = ffLetOf(identDeclOf(n.letInit))
-    if s < 0 { return -1 }
-    const sf = ffDeclFnOf[ffOrigDecl(s)] ?? -2
-    // A link read from the frame declaring it, or a module-scope binding.
-    if sf == -1 || sf == (ffDeclFnOf[ffOrigDecl(d)] ?? -2) {
-      const c = ffClosureOf(s)
-      if c == -2 { return -1 }
-      if c >= 0 {
-        const sn = nodeAt(s)
-        if sn is LetDecl {
-          if sn.letKw != "const" || sn.letType >= 0 { return -1 }
-        }
-        return s
-      }
-    }
-    d = s
-    hops = hops + 1
-  }
-  -1
-}
-
-// The declaration node the walk saw for the binding read at `ix` (a name, or a cell read
-// `d[0]`), or -1.
-function ffReadLet(ix: i32): i32 {
-  if ix < 0 || ix >= P.nodes.length { return -1 }
-  const n = nodeAt(ix)
-  let d = -1
-  if n is Ident {
-    d = identDeclOf(ix)
-  } else if n is Index {
-    if ffIsCellRead(ix) { d = identDeclOf(n.idxArr) }
-  }
-  ffLetOf(d)
-}
-
 // The `LetDecl` node the walk saw for declaration `d`, else `d` when it is one; -1 otherwise.
 function ffLetOf(d: i32): i32 {
   if d < 0 || d >= P.nodes.length { return -1 }
@@ -2286,118 +1722,6 @@ function ffLetOf(d: i32): i32 {
   if t >= 0 { return t }
   if nodeAt(d) is LetDecl { return d }
   -1
-}
-
-// The binding of a lambda that declaration node `d`'s initializer names: its own lambda, or a
-// module-scope un-annotated `const` of one it reads. -2 when it names a named function, else -1.
-function ffClosureOf(d: i32): i32 {
-  const n = nodeAt(d)
-  if !(n is LetDecl) || n.letInit < 0 { return -1 }
-  const iv = nodeAt(n.letInit)
-  if iv is FuncDecl {
-    if ffIsLambdaName(iv.fnName) { return d }
-    return -2
-  }
-  if !(iv is Ident) { return -1 }
-  const nd = identDeclOf(n.letInit)
-  if nd < 0 || nd >= P.nodes.length { return -1 }
-  if nodeAt(nd) is FuncDecl { return -2 }
-  const t = ffLetOf(nd)
-  if t < 0 || (ffDeclFnOf[ffOrigDecl(t)] ?? -2) != -1 { return -1 }
-  const tn = nodeAt(t)
-  if tn is LetDecl {
-    if tn.letKw == "const" && tn.letType < 0 && tn.letInit >= 0 {
-      const tl = nodeAt(tn.letInit)
-      if tl is FuncDecl {
-        if ffIsLambdaName(tl.fnName) { return t }
-        return -2
-      }
-    }
-  }
-  -1
-}
-
-// `fnFlowAliasLam` from declaration node `d0`.
-function ffAliasLamFrom(d0: i32, viaLet: boolean): i32 {
-  let d = d0
-  let sawLet = viaLet
-  let hops = 0
-  while hops < FF_CHAIN_MAX {
-    if d < 0 { return -1 }
-    const n = nodeAt(d)
-    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return -1 }
-    const o = ffOrigDecl(d)
-    const top = (ffDeclFnOf[o] ?? -2) == -1
-    // A module-scope `let` is a link, walked on with its writes checked (D3847, D3856).
-    if (hops > 0 || viaLet) && !(n.letKw == "let" && top) {
-      const c = ffClosureOf(d)
-      if c != -1 {
-        if c < 0 || n.letKw != "const" || !sawLet { return -1 }
-        return c
-      }
-    }
-    let init = n.letInit
-    let cell = false
-    const lit = nodeAt(n.letInit)
-    if lit is ArrayLit {
-      if lit.pos < 0 && lit.arrElems.length == 1 {
-        init = lit.arrElems[0]
-        cell = true
-      }
-    }
-    if n.letKw == "let" {
-      sawLet = true
-      let ws = ffDeclWrites[o] ?? []
-      if cell { ws = ffCellWrites[o] ?? [] }
-      if !ffWritesAreLams(ws) { return -1 }
-    }
-    d = ffReadLet(init)
-    hops = hops + 1
-  }
-  FF_CHAIN_LONG
-}
-
-// Whether every write in `ws` stores a lambda, or a value whose function type is concrete (a
-// typed parameter, D3848): a call's arguments fit it, so the lambdas pin at them.
-function ffWritesAreLams(ws: i32[]): boolean {
-  for w in ws {
-    const b = nodeAt(w)
-    if b is BinExpr {
-      if !ffIsLamValue(b.binRight) && !ffFnTyConcrete(b.binRight) {
-        return false
-      }
-    }
-  }
-  true
-}
-
-// Whether value `v` is a lambda, or a name bound through un-annotated bindings to one.
-function ffIsLamValue(v: i32): boolean {
-  const vn = nodeAt(v)
-  if vn is FuncDecl { return ffIsLambdaName(vn.fnName) }
-  let d = ffReadLet(v)
-  let hops = 0
-  while d >= 0 && hops < FF_CHAIN_MAX {
-    const c = ffClosureOf(d)
-    if c != -1 { return c >= 0 }
-    const n = nodeAt(d)
-    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return false }
-    let init = n.letInit
-    const lit = nodeAt(n.letInit)
-    if lit is ArrayLit {
-      if lit.pos < 0 && lit.arrElems.length == 1 { init = lit.arrElems[0] }
-    }
-    d = ffReadLet(init)
-    hops = hops + 1
-  }
-  false
-}
-
-// Whether node `v`'s recorded type is a function type naming no type variable.
-function ffFnTyConcrete(v: i32): boolean {
-  const t = nodeTyIxOf(v)
-  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return false }
-  tyAt(t) is TyFunc
 }
 
 // The pre-mono declaration minted declaration `d` stands for, else `d`.
@@ -2436,140 +1760,10 @@ function ffBuild(stmts: i32[]) {
   0
 }
 
-// Pin `id`'s spellings, rendered once.
-function ffPinNames(id: i32): string[] {
-  while pinName.length <= id {
-    const tys = pinTys[pinName.length]
-    const out: string[] = []
-    for t in tys { out.push(ffTyKey(t)) }
-    pinName.push(out)
-  }
-  pinName[id]
-}
-
-function ffJoin(xs: string[]): string {
-  let out = ""
-  let i = 0
-  while i < xs.length {
-    if i > 0 { out = out + ", " }
-    out = out + xs[i]
-    i = i + 1
-  }
-  "(" + out + ")"
-}
-
 // Whether pin `id` leaves a parameter type unknown or open.
 function ffPinOpen(id: i32): boolean {
   for t in pinTys[id] {
     if t < 0 || tyHasTyVar(t) { return true }
-  }
-  false
-}
-
-function ffSpellSame(a: string, b: string): boolean {
-  if a == b { return true }
-  const ca = repNameCanonId(a)
-  ca >= 0 && ca == repNameCanonId(b)
-}
-
-// Whether pin `pin` (a rendered list) is the parameter spelling list `ps`.
-function ffPinFits(pin: string, ps: string[]): boolean {
-  if pin == ffJoin(ps) { return true }
-  const inner = pin.slice(1, pin.length - 1)
-  const parts: string[] = []
-  let st = 0
-  let depth = 0
-  let i = 0
-  while i < inner.length {
-    const ch = inner[i]
-    if ch == '(' || ch == '[' || ch == '{' || ch == '<' { depth = depth + 1 }
-    if ch == ')' || ch == ']' || ch == '}' || ch == '>' { depth = depth - 1 }
-    if ch == ',' && depth == 0 {
-      parts.push(inner.slice(st, i))
-      st = i + 2
-    }
-    i = i + 1
-  }
-  if inner.length > 0 { parts.push(inner.slice(st, inner.length)) }
-  if parts.length != ps.length { return false }
-  let k = 0
-  while k < ps.length {
-    if !ffSpellSame(parts[k], ps[k]) { return false }
-    k = k + 1
-  }
-  true
-}
-
-// Function `fn`'s parameter spellings in the final tree, "?" for one still un-annotated.
-function ffParamSpells(fn: i32): string[] {
-  const out: string[] = []
-  const fd = nodeAt(fn)
-  if fd is FuncDecl {
-    for pi in fd.fnParams {
-      const p = nodeAt(pi)
-      if p is Param {
-        let sp = "?"
-        if p.parType >= 0 && p.parType < P.nodes.length {
-          const tn = nodeAt(p.parType)
-          if tn is TypeRef {
-            sp = tn.tyName
-          } else {
-            const t = nodeTyIxOf(p.parType)
-            if t >= 0 { sp = tyToEmitName(t) }
-          }
-        }
-        out.push(sp)
-      }
-    }
-  }
-  out
-}
-
-// The hole binding of the instance the next pin question is asked in, staged by the caller.
-let ffInstHoleN: string[] = []
-let ffInstHoleT: i32[] = []
-
-// Stages the hole binding `n`/`t` of the instance the next pin questions are asked in.
-export function fnFlowStageInstHoles(n: string[], t: i32[]) {
-  ffInstHoleN = n
-  ffInstHoleT = t
-  0
-}
-
-// `ffParamSpells` of instance `inst` of template `tmpl`, an un-annotated parameter spelled at
-// the template's type under the staged hole binding when that closes it.
-function ffInstParamSpells(inst: i32, tmpl: i32): string[] {
-  const out = ffParamSpells(inst)
-  const ft = nodeTyIxOf(tmpl)
-  if ffInstHoleN.length == 0 || ft < 0 || ft >= T.tys.length { return out }
-  const fty = tyAt(ft)
-  if !(fty is TyFunc) || fty.fnParamTypes.length != out.length { return out }
-  let k = 0
-  while k < out.length {
-    let pt = fty.fnParamTypes[k]
-    if out[k] == "?" && pt >= 0 && tyHasTyVar(pt) {
-      pt = substTyDeep(pt, ffInstHoleN, ffInstHoleT)
-      if pt >= 0 && !tyHasTyVar(pt) { out[k] = tyToEmitName(pt) }
-    }
-    k = k + 1
-  }
-  out
-}
-
-// Whether template `t`'s parameter types under context `c`'s bindings spell `ps`.
-function ffCtxFits(t: i32, c: i32, ps: string[]): boolean {
-  const ft = nodeTyIxOf(t)
-  if ft < 0 || ft >= T.tys.length { return false }
-  const fty = tyAt(ft)
-  if fty is TyFunc {
-    const want: string[] = []
-    for pt in fty.fnParamTypes {
-      let u = pt
-      if tyHasTyVar(u) { u = substTyDeep(u, ctxBN[c], ctxBT[c]) }
-      if u < 0 || tyHasTyVar(u) { return false }
-      want.push(ffTyKey(u))
-    }
-    return ffPinFits(ffJoin(want), ps)
   }
   false
 }
