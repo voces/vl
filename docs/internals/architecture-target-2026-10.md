@@ -1876,7 +1876,7 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
-- [ ] **instance result** (10): `monoRetRecordOf` 8,023, `monoRetRepOf` 7,745, `monoPinCallRecord` 6,765, `monoPinInPlaceCallRecord` 6,763, `monoReturnedBundlePin` 6,538, `monoPinnedRetAnnTy` 505, `monoCallInstRetTy` 205, `monoRetConstRecord` 66, `monoInstRetLitTy` 34, `monoInstAnnRetTy` 26.
+- [x] **instance result** (10): ~~`monoRetRecordOf` 8,023~~, ~~`monoRetRepOf` 7,745~~, ~~`monoPinCallRecord` 6,765~~, ~~`monoPinInPlaceCallRecord` 6,763~~, ~~`monoReturnedBundlePin` 6,538~~, `monoPinnedRetAnnTy` 505 (switched, #6511), ~~`monoCallInstRetTy` 205~~, ~~`monoRetConstRecord` 66~~, ~~`monoInstRetLitTy` 34~~, ~~`monoInstAnnRetTy` 26~~. #6498 deleted the record-pin four, #6511 the instance-literal pair, and the delivered-rep fact the rest (below).
 - [ ] **walk type** (33): `monoExprRebuild` 7,470, `monoPinRetype` 7,368, `monoPinnedTyOf` 6,521, `monoElseRemainderAt` 6,167, `monoPinFnValueTy` 4,955, `monoPinRecvName` 3,289, `monoPinRecvLit` 3,162, `monoPinCoalJoin` 2,708, `monoIfChainRebuildPinned` 2,654, ~~`monoIfArmsAllTy` 2,641~~, ~~`monoHoleJoinPinsString` 2,368~~, `monoPinMemberCall` 1,241, `monoLamPinRetAnn` 1,112, `monoNumUnionOpPin` 788, `monoPinCoalListDefault` 781, `monoHoleNodeTy` 686, ~~`monoArmTailIsTy` 643~~, `monoLamCallTy` 522, `monoHoleCoalUnion` 321, `monoHoleTy` 252, `monoNumOperandPinTy` 241, `monoPinArmSubst` 124, ~~`monoIfArmsPinJoin` 86~~, `monoChainPinnedTys` 74, `monoHoleJoinDropsArm` 72, `monoTpJoinObjTy` 54, `monoSubstIsExpr` 53, `monoHoleBindingOf` 24, ~~`monoHoleJoinPinTy` 11~~, `monoArmPinnedTy` 5, ~~`monoHoleJoinHasAtomArm` 1~~, `monoNumUnionCompoundPin` 1, ~~`monoArmPinsLitUnion` 0~~.
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
@@ -2150,6 +2150,25 @@ shows they decline harmlessly. The one "several" is a list reached through an al
 callback (`closures/hole-fn-list-reached-through-alias-called-in-callback.vl`).
 
 #### Next stage, first item: a per-call delivered-rep fact
+
+**Built for the instance result** (2026-11-06). The reach rows (`elabReachRows`, emit_elab) hold,
+per reach the elaboration recorded (a call node and the instance it reaches), the rep each
+parameter of that instance is delivered at where it is not the parameter's type: the record of one
+closure per signature a bundle parameter is called at, or the wider record `callArgRepTy` names.
+`elabCallArgRep` reads them, `ELAB_REP_NO_ROW` where no reach was recorded, which mono refuses
+loudly. `elabRetParamOf` names the parameter a function returns whole, and `monoInstanceRet`
+returns that parameter's delivered rep in place of `monoReturnedBundlePin` and `monoRetRepOf`.
+
+Shadowed over 23,103 programs and the deno inline programs: every instance agrees, 148 of them
+moved off the result's type (135 bundles, 13 wider records), and 0 reach no row once the rows key a
+method call's receiver as its first parameter and a `[]=` write's dispatch call carries its operator
+node (`drwOpCall`). The byte sweep against master's fixpoint is 23,103 identical.
+`tests/vl_elab_arg_rep_test.ts` holds the rule that a rep differs from its type only as one of the
+two. The other readers (`monoArgRepRowTy`, `monoPinHoleParam`, `monoPinAnnotatedParam`,
+`monoBundlePin`) come next.
+
+`pass2(m, Set())` returning its parameter (D15040's set at a bare type parameter) reaches no row
+and is now a loud emit refusal; D1578's witness, which must stay invalid wasm, returns `i32`.
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
