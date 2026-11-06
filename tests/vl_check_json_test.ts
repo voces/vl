@@ -349,12 +349,13 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // A live emit-side refusal (`scripts/capability-probes/length-of-list-holding-a-generic-function.vl`):
-      // `vl check` accepts it and the emitter refuses the `.length` (D15010).
+      // A live emit-side refusal (`scripts/capability-probes/length-of-pushed-list-holding-a-generic-function.vl`):
+      // `vl check` accepts it and the emitter refuses the `.length` (D15529). It is D15010's witness plus
+      // a push; D15010's own spelling runs, and the stage under test is unchanged.
       await Deno.writeTextFile(
         file,
         "function id<T>(x: T): T { x }\nfunction use(ys) { print(ys.length) }\n" +
-          "function take(a) {\n  const xs = [a]\n  use(xs)\n" +
+          "function take(a) {\n  const xs = [a]\n  xs.push(a)\n  use(xs)\n" +
           '  print(xs[0]("abc").length + xs[0](2))\n}\ntake(id)\n',
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);

@@ -353,9 +353,9 @@ Deno.test({
 
 // The row shadow: a recorded result whose slot the lowering keys elsewhere is graded by the row
 // each returned value was stamped built at. A fresh record a kept delivery builds wider is
-// recorded at that row (`recKeptFnDstOf`) and agrees outright; a list of an instance's function
-// value agrees by its stamp; an identity instance's value, stamped at its binding, is built at
-// the delivery's.
+// recorded at that row (`recKeptFnDstOf`) and agrees outright; a returned list of an instance's
+// function value is typed at the call type its element reaches, so it agrees by kind; an identity
+// instance's value, stamped at its binding, is built at the delivery's.
 const ROW_STAMP = `const i: { f: i32 } = { f: 4 }
 type I = { f: i32 | null }
 function mk() { { f: 7 } }
@@ -380,6 +380,22 @@ function main() {
   for f in xs { print(f(3)) }
 }
 main()
+`;
+
+// An identity instance handed a record literal and returned into a union with its own row reaches
+// the row class: its recorded result keys the slot elsewhere, and the value's stamp agrees.
+const ROW_ID_UNION = `type J = { r: i32 | null }
+function idn<T>(v: T): T { v }
+function take(u: J | string) {
+  if u is J { print(u.r ?? 0) } else { print(u) }
+}
+const w0 = idn({ r: 5 })
+function deliver(): J | string { return idn({ r: 4 }) }
+function deliver6(): J | string { return idn({ r: 6 }) }
+const v: J | string = deliver()
+if v is J { print(v.r ?? 0) } else { print(0) }
+take(deliver6())
+print(w0.r)
 `;
 
 const ROW_DELIVERY = `type J = { r: i32 | null }
@@ -466,7 +482,15 @@ Deno.test({
       ROW_LIST,
       DROP_NONE,
       true,
-      "kind agree | ds=1; kind agree | id$1=1; kind agree | id=1; row agree | d=1; row agree | di=1",
+      "kind agree | d=1; kind agree | di=1; kind agree | ds=1; kind agree | id$1=1; kind agree | id=1",
+      true,
+    );
+    expectRows(
+      "row identity into union",
+      ROW_ID_UNION,
+      DROP_NONE,
+      true,
+      "kind agree | deliver6=1; kind agree | deliver=1; kind agree | idn=1; row agree | idn$1=1",
       true,
     );
     expectRows(
