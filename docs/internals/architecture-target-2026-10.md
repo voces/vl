@@ -1308,9 +1308,42 @@ off:
 Without the second fallback, `generics/hole-fn-arg-through-hole-callee.vl` trapped the compiler.
 The shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
 
-4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
-   `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
-   `fnFlowStageInstHoles` go with the file.
+4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax, and move out with
+   the helpers they need. `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild` and
+   `fnFlowShadowBegin` go with the file.
+
+**The annotation pin, deleted** (2026-11-06). `fnFlowCallPathAnnPinTys`, read only by
+`monoPathSlotPinnedFnTy`, returned no pin on any of 23,374 programs: `tests/cases`, the distilled
+`cells/` and `named/`, and the 4,065 filed witnesses of both inventories. The probe was checked
+three ways:
+
+- an entry marker shows its call site is reached, in 4 programs;
+- an `emitFail` on a returned pin fired in none;
+- a trap on a returned pin, which no earlier refusal can mask, fired only in D12131, which traps
+  the checker on master too.
+
+It is deleted with the table's result column (`pinRet`) and `ffCallCtx`. `monoPathSlotPinnedFnTy`
+folds into `monoListSlotPinnedFnTy`, which now answers only from `slotCallArgsInto`.
+
+**Deletion checklist** (2026-11-06, after the annotation pin). These are what `fn_flow_shadow.vl`
+still exports and who reads each one. The file goes when every row is checked.
+
+| export | read by | owner | replacement |
+| --- | --- | --- | --- |
+| `fnFlowDeclPathOnlyPinCall` | `monoPinOpenCallLams` (fallback only) | cad | the forward climb's one call (`elabValueOnlyCall`), once its two fallback cases close |
+| `fnFlowDeclPathAgreedPinTys` | `monoElemFnPinTys`, `monoHoleGenBindFnArgs` | cad | the agreed pin read off member instance keys or the check's slot-call index |
+| `fnFlowDeclPathAgreedPinTysSkipping` | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
+| `fnFlowDeclFn` | `monoDeclFrameIn`, `monoReadIsBinding` | lane F | `recEnclosingFn` |
+| `FF_PIN_DECLINE` | `monoDeclPathKeys`, `monoDeclPathKeysIn`, `monoDeclPathPinsPerInstance`, `monoSlotRetName`, `monoSlotRetCount` | builder | none needed: its readers are all mono's own, so the sentinel moves to a module mono imports |
+| `fnFlowPinSigOf` (with `ffPinSpell`) | `monoDeclPathKeysIn`, `monoElemPinTysUnder`, `monoFlowSlotPins`, `monoPinFnParamTys`, `monoReachSlotPins` | builder | none needed: pure spelling of a parameter list; moves beside `sigKeyOfTy` in `emit_sig_tokens.vl` |
+| `fnFlowElemKind` | `monoPlaceRoot` | builder | none needed: a node's type is a map or not; moves to `emit_query.vl` |
+| `fnFlowWholeSliceRecv` (with `ffTyHasFn`) | `monoFlowSliceAsSpread` | builder | none needed: syntax plus a deep function-in-type test (`crTyHasFn` is shallow, so `ffTyHasFn` moves with it); moves to `emit_query.vl` |
+| `fnFlowTableBuild` | `monomorphize` | builder | deleted when the cad and lane F rows are done |
+| `fnFlowShadowBegin` | `runEmitPasses` (emit_sections) | builder | deleted with the build |
+
+The four "moves" rows can land now and independently: none needs the table, and `emit_mono.vl`
+takes no new functions. The file is deleted after the last cad and lane F rows, together with the
+build and begin hooks and the budget row.
 
 
 ---
