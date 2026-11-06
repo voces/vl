@@ -11518,7 +11518,8 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
     }
   } else if k == CW_UP_LETINIT && up >= 0 && up < P.nodes.length {
     const ln = nodeAt(up)
-    if ln is LetDecl && !elabLetTypeWritten(ln.letType) {
+    // A written type stops the delivery, not the value: a call search follows it on.
+    if ln is LetDecl && (!elabLetTypeWritten(ln.letType) || elabCallRec) {
       elabSlotReadDeliveries(up, [], out, seen)
     }
   } else if k == CW_UP_ASG_RHS && up >= 0 && up < P.nodes.length {
@@ -11534,6 +11535,11 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
       if cd >= 0 && (cboxCellDecls[cboxDeclKey(cd)] ?? 0) == 1 {
         elabSlotReadDeliveries(cd, ["e"], out, seen)
       }
+    } else if ln is Member && elabCallRec {
+      // A call search follows a value written into a named binding's field to that field's reads.
+      const o = parenPeelIx(ln.memObj)
+      const od = if o >= 0 && o < P.nodes.length && nodeAt(o) is Ident { identDeclOf(o) } else { -1 }
+      if od >= 0 { elabSlotReadDeliveries(od, ["f." + ln.memProp], out, seen) }
     }
   } else if (
     (k == CW_UP_COAL || k == CW_UP_ARM)
@@ -11568,8 +11574,10 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
     && up >= 0
     && up < P.nodes.length
     && (fvaBuilt[up] ?? false)
+    && !elabCallRec
   ) {
-    // A function-value adapter around the value carries the delivery's own stamps.
+    // A function-value adapter around the value carries the delivery's own stamps; a call search
+    // still enters the callee.
     elabReadStamps(up, out)
   } else if k == CW_UP_ARG && up >= 0 && up < P.nodes.length {
     const cn = nodeAt(up)
@@ -11620,14 +11628,49 @@ function elabCalleeFns(c: Call): i32[] {
   const cf = parenPeelIx(c.callFn)
   const fd = identFnDeclOf(cf)
   if fd >= 0 { return [fd] }
+  const out: i32[] = []
+  // A `for` loop's one variable holds each function the list it walks holds.
+  const cn = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
+  const vd = if cn is Ident { identDeclOf(cf) } else { -1 }
+  const lv = if vd >= 0 && vd < cwIxCoveredLen() { nodeAt(vd) } else { null }
+  if lv is LoopVar {
+    const ln = if lv.lvLoop >= 0 && lv.lvLoop < P.nodes.length { nodeAt(lv.lvLoop) } else { null }
+    if ln is ForIn && ln.fiVar2 == "" {
+      const it = parenPeelIx(ln.fiIter)
+      const itn = if it >= 0 && it < P.nodes.length { nodeAt(it) } else { null }
+      if itn is ArrayLit {
+        for e in itn.arrElems {
+          const f = identFnDeclOf(parenPeelIx(e))
+          if f >= 0 && !i32ListHas(out, f) { out.push(f) }
+        }
+      } else if (
+        itn is Ident
+        && identDeclOf(it) >= 0
+        && identDeclOf(it) < cwIxCoveredLen()
+      ) {
+        for f in elabSlotHeldFns(identDeclOf(it), ["e"]) {
+          if (
+            f >= 0
+            && f < P.nodes.length
+            && nodeAt(f) is FuncDecl
+            && !i32ListHas(out, f)
+          ) {
+            out.push(f)
+          }
+        }
+      }
+    }
+    return out
+  }
   const steps: string[] = []
   const root = cwSlotPath(cf, steps)
-  const d = if root >= 0 { identDeclOf(root) } else { -1 }
+  const d0 = if root >= 0 { identDeclOf(root) } else { -1 }
+  // A read a rewrite re-resolved past the index answers as the declaration it named there.
+  const d = if d0 >= cwIxCoveredLen() && srcDeclOf(root) >= 0 { srcDeclOf(root) } else { d0 }
   // A binding the write index does not cover (one minted after its build) has no frame to read.
-  if d < 0 || d >= cwIxCoveredLen() { return [] }
+  if d < 0 || d >= cwIxCoveredLen() { return out }
   const path: string[] = []
   for st in steps { path.push(if st == "[]" { "e" } else { "f." + st }) }
-  const out: i32[] = []
   for f in elabSlotHeldFns(d, path) {
     if f >= 0 && f < P.nodes.length && nodeAt(f) is FuncDecl { out.push(f) }
   }

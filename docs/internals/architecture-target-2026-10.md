@@ -1206,7 +1206,7 @@ variable over a list is that list's element slot (`calleeSlotOf`). Then 165 of 1
 
 | entry | family | mono callers | witness (hits / files) | elaboration answers today |
 | --- | --- | --- | --- | --- |
-| `fnFlowDeclPathOnlyPinCall` | agreed, only call | monoPinOpenCallLams | `generics/hole-call-generic-lambda-arg.vl` (91 / 32) | partly: not where calls through a result fix the pin |
+| `fnFlowDeclPathOnlyPinCall` | agreed, only call | monoPinOpenCallLams | `generics/hole-call-generic-lambda-arg.vl` (91 / 32) | retired: `elabValueOnlyCall`, the forward climb's one call |
 | `fnFlowDeclPathAgreedPinTys` | agreed | monoHeldSrcsFnTy, monoHoleGenBindFnArgs | `closures/hole-fn-in-unannotated-map.vl` (2 / 2) | as above |
 | `fnFlowDeclPathAgreedPinTysSkipping` | agreed | monoElemFnPinTys | `closures/hole-fn-if-join-result-handed-hole-fn.vl` (10 / 5) | as above |
 | `fnFlowCallPathAgreedPinTys` | agreed, per call | monoPathSlotPinnedFnTy | `closures/generic-fn-in-unannotated-map.vl` (9 / 5) | the call's instance types |
@@ -1307,6 +1307,14 @@ off:
 
 Without the second fallback, `generics/hole-fn-arg-through-hole-callee.vl` trapped the compiler.
 The shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
+
+**The only-call fallbacks, closed** (2026-11-06). The climb's call search now goes on through a `let`
+annotated with a type parameter, through a value written into a named binding's field, into a callee
+an argument adapter wraps, and through a call whose callee is a `for` loop variable or a read a
+rewrite re-resolved past the index (`elabCalleeFns`). The second fallback had no hit left: the climb
+skips an uncovered value, and the table answers none there either. With the table compared at
+every only-call site over all 19,309 sweep programs, no site disagrees, and
+`fnFlowDeclPathOnlyPinCall` is deleted.
 
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
    `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
