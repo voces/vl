@@ -1545,13 +1545,25 @@ elaboration's type wherever mono retypes leaves 499 of those 500 programs byte-i
 one that moves prints the same. Whether to retype at all stays mono's gate (ruling (a)), so the
 function stays.
 
-**Named follow-up: the 384 new retypes.** Mono declines them because it computes no join (231),
-because its pin leaves the template type (105), or because `monoPinKeepsMembers` refuses (48).
-Taking them with the gate read off the elaboration would delete the six helpers only this function
-uses: `monoIfArmsAllTy`, `monoIfArmsPinJoin`, `monoHoleJoinPinsString`, `monoHoleJoinHasAtomArm`,
-`monoPinKeepsMembers` and `monoCoalOverTpJoin`. Over the 227 programs, taking them leaves 223
-byte-identical and moves 2. It makes `generics/generic-optchain-map-get-coalesce-scalar.vl` a
-compiler trap, which is the first thing that capability PR must fix.
+**The gate reads the elaboration** (2026-11-06). `monoIfChainRebuildPinned` retypes a link at
+`elabNodeTy(at, elabWalkTop())` wherever that is closed and is not the template's type, its union
+box registered as before (`monoPinUnionBoxed`). Re-measured at `e925b06a`: 983 agree, 5 differ,
+0 old only and 457 new only (293 programs). The six helpers only the old gate used, and four they
+alone reached, are deleted (`monoIfArmsAllTy`, `monoIfArmsPinJoin`, `monoHoleJoinPinsString`,
+`monoHoleJoinHasAtomArm`, `monoPinKeepsMembers`, `monoCoalOverTpJoin`, `monoArmPinsLitUnion`,
+`monoArmTailIsTy`, `monoHoleJoinPinTy`, `monoTySameOrVar`).
+
+The 5 that differ take the elaboration's type. Four of their programs are byte-identical and the
+fifth (`generics/match-join-of-nullable-param-keeps-concrete-arm.vl`) prints the same. Taking the
+new retypes made the `boolean` instance of `generics/generic-optchain-map-get-coalesce-scalar.vl`
+invalid wasm. That was [D15500](inventory/D15500.md), live on master in other spellings: a
+generic's `?.get` default `null` read the template's open stamp. `nullOwnAt` now reads the
+instance's context there.
+
+The byte sweep against master's fixpoint moves 5 of 23,103 programs, each printing the same:
+`coalesce-join-tag-in-instance`, `generic-if-null-join-coalesce-scalar`,
+`generic-optchain-map-get-coalesce-scalar`, `match-join-of-nullable-param-keeps-concrete-arm`
+(`generics/`) and `maps/optional-chain-get-nullable-map`.
 
 **Shadow of `monoHoleGenFnPin`** (the signature a generic handed to a hole parameter takes), against
 `callArgRepTy` over `elabCallParamTy` at `monoPinHoleParam`: 83 programs agree, 0 disagree, and 4 get
@@ -1865,7 +1877,7 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
 - [ ] **instance result** (10): `monoRetRecordOf` 8,023, `monoRetRepOf` 7,745, `monoPinCallRecord` 6,765, `monoPinInPlaceCallRecord` 6,763, `monoReturnedBundlePin` 6,538, `monoPinnedRetAnnTy` 505, `monoCallInstRetTy` 205, `monoRetConstRecord` 66, `monoInstRetLitTy` 34, `monoInstAnnRetTy` 26.
-- [ ] **walk type** (33): `monoExprRebuild` 7,470, `monoPinRetype` 7,368, `monoPinnedTyOf` 6,521, `monoElseRemainderAt` 6,167, `monoPinFnValueTy` 4,955, `monoPinRecvName` 3,289, `monoPinRecvLit` 3,162, `monoPinCoalJoin` 2,708, `monoIfChainRebuildPinned` 2,654, `monoIfArmsAllTy` 2,641, `monoHoleJoinPinsString` 2,368, `monoPinMemberCall` 1,241, `monoLamPinRetAnn` 1,112, `monoNumUnionOpPin` 788, `monoPinCoalListDefault` 781, `monoHoleNodeTy` 686, `monoArmTailIsTy` 643, `monoLamCallTy` 522, `monoHoleCoalUnion` 321, `monoHoleTy` 252, `monoNumOperandPinTy` 241, `monoPinArmSubst` 124, `monoIfArmsPinJoin` 86, `monoChainPinnedTys` 74, `monoHoleJoinDropsArm` 72, `monoTpJoinObjTy` 54, `monoSubstIsExpr` 53, `monoHoleBindingOf` 24, `monoHoleJoinPinTy` 11, `monoArmPinnedTy` 5, `monoHoleJoinHasAtomArm` 1, `monoNumUnionCompoundPin` 1, `monoArmPinsLitUnion` 0.
+- [ ] **walk type** (33): `monoExprRebuild` 7,470, `monoPinRetype` 7,368, `monoPinnedTyOf` 6,521, `monoElseRemainderAt` 6,167, `monoPinFnValueTy` 4,955, `monoPinRecvName` 3,289, `monoPinRecvLit` 3,162, `monoPinCoalJoin` 2,708, `monoIfChainRebuildPinned` 2,654, ~~`monoIfArmsAllTy` 2,641~~, ~~`monoHoleJoinPinsString` 2,368~~, `monoPinMemberCall` 1,241, `monoLamPinRetAnn` 1,112, `monoNumUnionOpPin` 788, `monoPinCoalListDefault` 781, `monoHoleNodeTy` 686, ~~`monoArmTailIsTy` 643~~, `monoLamCallTy` 522, `monoHoleCoalUnion` 321, `monoHoleTy` 252, `monoNumOperandPinTy` 241, `monoPinArmSubst` 124, ~~`monoIfArmsPinJoin` 86~~, `monoChainPinnedTys` 74, `monoHoleJoinDropsArm` 72, `monoTpJoinObjTy` 54, `monoSubstIsExpr` 53, `monoHoleBindingOf` 24, ~~`monoHoleJoinPinTy` 11~~, `monoArmPinnedTy` 5, ~~`monoHoleJoinHasAtomArm` 1~~, `monoNumUnionCompoundPin` 1, ~~`monoArmPinsLitUnion` 0~~.
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
   The type an uncalled slot holds its functions at is the elaboration's (`elabUncalledSlotTy`,
@@ -2122,6 +2134,26 @@ What is left before the planner reads the elaboration:
 - none, 4: nested field paths.
 - none, 12: nodes minted after `elabRun`, which wait on the same source mapping as the instance
   ladder's tail.
+
+**The `monoFlow*` rewrite, second reading** (2026-11-06). `mfr_shadow` gains two lookups:
+- a read straight out of a literal (`{ f: inc0 }.f(3)`, `[a, b][1]`);
+- a descent along literal index and field steps from the read's root, through `const`s, unwritten
+  `let`s, a call's returned values and a parameter's argument at each call. It declines where the
+  slot is written after it is built (`cwSlotWriteCount`) or where the leaves name different
+  functions.
+
+Over the same population:
+
+| outcome | site-hits | files |
+|---|---|---|
+| agree | 372 | 140 |
+| the elaboration names several | 1 | 1 |
+| the elaboration names none | 14 | 7 |
+| differ | 0 | 0 |
+
+The 14 are the callees of desugared optional calls (`m["k"]?.f(2)`), minted after `elabRun`; S2
+shows they decline harmlessly. The one "several" is a list reached through an alias and called in a
+callback (`closures/hole-fn-list-reached-through-alias-called-in-callback.vl`).
 
 #### Next stage, first item: a per-call delivered-rep fact
 
