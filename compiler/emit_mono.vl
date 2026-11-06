@@ -398,15 +398,6 @@ import {
 } from "./emit_base"
 import { callBindShadowNote } from "./call_bind_shadow"
 import {
-  FS_COMPILE,
-  fsAsk,
-  fsAskList,
-  fsAskOpenCall,
-  fsAskTyParam,
-  fsModeOf,
-  fsNoteListCall,
-} from "./fn_split"
-import {
   monoCalleeDeclOf,
   monoFrameInstTmpl,
   monoNameIsExported,
@@ -10637,9 +10628,6 @@ function monoMakeInstanceLater(
       let what = "the reassigned function binding `" + cal3.identName + "` is"
       let wants = "the values written to it want two"
       if !monoNameWrittenAt(cal3.identName, calleeIx) {
-        // The copy is split with the binding it copies, one slot per call signature (D5171).
-        const cd = identDeclOf(calleeIx)
-        if cd >= 0 && cd < P.nodes.length && nodeAt(cd) is LetDecl { fsAsk(cd) }
         what = "the function binding `"
           + cal3.identName
           + "`, a copy of a reassigned binding, is"
@@ -12556,7 +12544,7 @@ function monoIfBoundRetAtPin(at: i32, ctx: i32): i32 {
   }
   const cTys: i32[] = []
   const ct = monoSlotPinNameTys(key, noPath, fr, cTys)
-  if ct == "" { return monoAskRetCopies(fr, key, ctx, -1) }
+  if ct == "" { return 0 }
   if monoCoerceFnValueTys(iv, ct, fr, -1, cTys) < 0 { return -1 }
   monoRetypeIfInit(init, g0, at, fr)
   monoRetypePinCalls(key, noPath)
@@ -12619,13 +12607,11 @@ function monoChoiceBindIx(lf: i32[]): i32 {
 
 // Notes that the choice binding `lf` (`[frame, declaration]`), its first arm naming generic `gen`,
 // is coerced at function type `key`: 0 the first time, 1 when it already is at `key`, and -1 at
-// another type, refused and asked of the split (`fn_split.vl`), which gives each type a binding
-// of its own (D9120, D9121).
+// another type, refused (D9120, D9121).
 function monoChoiceBindNote(lf: i32[], key: string, gen: i32): i32 {
   const k = monoChoiceBindIx(lf)
   if k >= 0 {
     if monoChoiceBindTy[k] == key { return 1 }
-    fsAsk(lf[1])
     emitFail(
       "emitProgram: a binding of an `if` choosing generic functions is delivered at two function types — annotate the binding",
     )
@@ -19944,12 +19930,12 @@ function monoCloseRetFnTy(ix: i32, ctx: i32) {
     for e in n.arrElems {
       const ex = unwrapParen(e)
       if ex < 0 || !(nodeAt(ex) is Call) { return 0 }
-      if monoRetSlotsSplit(ex) { return monoAskSplitRetCopies(ex) }
+      if monoRetSlotsSplit(ex) { return 0 }
     }
   } else if !(n is Call) {
     return 0
   } else if monoRetSlotsSplit(ix) {
-    return monoAskSplitRetCopies(ix)
+    return 0
   }
   const t = monoPinnedAnnTyAt(ix, 0)
   if t >= 0 && !monoTyOpen(t) { monoRecordOpen(ix, t, ctx) }
@@ -19970,16 +19956,6 @@ function monoRetSlotsSplit(ix: i32): boolean {
     if rx >= 0 && monoDeclPathPins([fd, rx], ["e"]).length > 1 { return true }
   }
   false
-}
-
-// A call `x` whose returned literal's slot takes two pins asks for a copy of its function per
-// pin, each read of it then closed at its own copy (D9553).
-function monoAskSplitRetCopies(x: i32) {
-  const ix = unwrapParen(x)
-  if ix < 0 || ix >= P.nodes.length || !monoRetSlotsSplit(ix) { return 0 }
-  const c = nodeAt(ix)
-  if c is Call { fsAsk(monoCalleeDeclOf(c)) }
-  0
 }
 
 // The list literal returned value `r` is, or initialises as the un-annotated `const` or `let`
@@ -20109,17 +20085,9 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
   const nm = monoConcreteFnTyName(ft)
   if nm == "" { return 0 }
   // An element holds one instance, so a call that coerces it to another instance than an earlier
-  // call through it did cannot be served by the one value; a `const` list asks for a copy per
-  // type (D10701).
-  const lr = monoCalleeListRead(n.callFn)
-  if lr >= 0 { fsNoteListCall(n.callFn, lr, identDeclOf(lr), nm) }
+  // call through it did cannot be served by the one value (D10701).
   for el in elems {
     if monoElemTakenSig.has(el) && monoElemTakenSig[el] != nm {
-      if lr >= 0 {
-        fsAskList(identDeclOf(lr))
-      } else {
-        monoAskJoinBinding(n.callFn)
-      }
       return emitFailAt(
         "emitProgram: a function this call reaches through a list or join is already taken at another function type by an earlier call through it",
         n.callFn,
@@ -20200,53 +20168,6 @@ function monoForInlineGenElems(c: i32, ctx: i32): boolean {
     if monoNamesDeclaredGeneric(el, ctx) { return true }
   }
   false
-}
-
-// A callee naming an un-annotated `const` join of functions asks for a copy per call type.
-function monoAskJoinBinding(c: i32): i32 {
-  const x = unwrapParen(c)
-  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return 0 }
-  const d = identDeclOf(x)
-  if d < 0 || d >= P.nodes.length { return 0 }
-  const dn = nodeAt(d)
-  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return 0 }
-  fsAsk(d)
-}
-
-// The identifier callee `c` reads its list through, as the indexed list, a `for` variable's
-// iterable or an element `const`'s list, when it names an un-annotated `const`; -1 otherwise.
-function monoCalleeListRead(c: i32): i32 {
-  const x = unwrapParen(c)
-  if x < 0 || x >= P.nodes.length { return -1 }
-  const n = nodeAt(x)
-  let r = -1
-  if n is Index { r = unwrapParen(n.idxArr) }
-  if n is Ident {
-    const d = identDeclOf(x)
-    if d >= 0 && d < P.nodes.length {
-      const dn = nodeAt(d)
-      const lp = loopVarLoop(d)
-      if lp >= 0 && lp < P.nodes.length {
-        const fl = nodeAt(lp)
-        if fl is ForIn && fl.fiDecl1 == d { r = unwrapParen(fl.fiIter) }
-      }
-      if (
-        dn is LetDecl
-        && dn.letKw == "const"
-        && dn.letType < 0
-        && dn.letInit >= 0
-      ) {
-        const ix = nodeAt(dn.letInit)
-        if ix is Index { r = unwrapParen(ix.idxArr) }
-      }
-    }
-  }
-  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return -1 }
-  const ld = identDeclOf(r)
-  if ld < 0 || ld >= P.nodes.length { return -1 }
-  const l = nodeAt(ld)
-  if !(l is LetDecl) || l.letKw != "const" || l.letType >= 0 { return -1 }
-  r
 }
 
 // The function values callee `c` reads: a list literal's through an index, a `for` variable or
@@ -20720,10 +20641,8 @@ function monoIsHoleLamArg(a: i32): boolean {
     && monoOpenFnArgDecl(x) >= 0
 }
 
-// The refusal for a call `monoGenArgAtOpenParam` names, at node `ix` (D3956); the split may
-// give each function the call reaches a parameter per type its argument is called at (D7183).
+// The refusal for a call `monoGenArgAtOpenParam` names, at node `ix` (D3956, D7183).
 function monoGenArgOpenFail(ix: i32): i32 {
-  fsAskOpenCall(monoCallTplOf(ix))
   emitFailAt(
     "emitProgram: a generic function is passed to a function value whose parameter type "
       + "names a type parameter this closure does not bind, so no instance of it can be "
@@ -20969,7 +20888,6 @@ function monoLetTyParamMisfit(
             ) {
               break
             }
-            fsAskTyParam(params[j])
             return emitFail(
               "emitProgram: monomorphize: `"
                 + n.letName
@@ -21492,22 +21410,10 @@ function monoHoleGenFnPin(
   // The plan decides whether the hole is called at two types; the flow pins may stop at a
   // recursive forward before they reach both (D6091).
   if ft < 0 && fl[1] >= 0 {
-    fsAsk(pIx)
     const noPath: string[] = []
     monoHoleGenManyPins = monoDeclPathPins(fl, noPath).length > 1
     monoHoleGenTwoPins = monoHoleGenManyPins
       && monoHoleOwnCallsDiffer(fl[1], pIx)
-  }
-  // A choice of generics no one pin closes asks the plan for a parameter per type, each handed
-  // the choice's arm by one evaluation of it (D13360).
-  const ax = unwrapParen(argIx)
-  if (
-    ft < 0
-    && ax >= 0
-    && nodeAt(ax) is IfStmt
-    && monoValueNamesGenerics(ax, ctx, 0)
-  ) {
-    fsAsk(pIx)
   }
   monoFnPinAt(argIx, ctx, ft, fl[1], tyOut)
 }
@@ -23223,7 +23129,6 @@ function monoBundleHandOnPin(
   pinned: string[],
   pinTys: i32[],
 ): i32 {
-  if fsModeOf() != FS_COMPILE { return 1 }
   const owner = elabCallHandOwner(monoCallTplOf(callIx), i)
   const bt = if owner >= 0 { monoBundleKeyTys.get(owner) ?? -1 } else { -1 }
   const bi = i32ListIndexOf(monoBundleTys, bt)
@@ -23263,7 +23168,7 @@ function monoBundleNamedPin(
   pinTys: i32[],
 ): i32 {
   const nested = identClosureFeOfRead(x, ctx) >= 0
-  if fsModeOf() != FS_COMPILE || !monoCalleeIsGeneric(x) && !nested { return 1 }
+  if !monoCalleeIsGeneric(x) && !nested { return 1 }
   const d = identDeclOf(x)
   for sg in sigs {
     const sf = tyAt(sg)
@@ -23333,8 +23238,6 @@ function monoClosureBundlePin(
   pinned: string[],
   pinTys: i32[],
 ): i32 {
-  // A compile the split plan applies to keeps the plan's copies for every caller.
-  if fsModeOf() != FS_COMPILE { return 1 }
   // A reassigned binding holds the lambda last written to it, so no one closure.
   const ax = unwrapParen(arg)
   if (
@@ -23381,8 +23284,6 @@ function monoClosureBundlePin(
       arg,
     )
   }
-  // Should the compile go on to a split plan, the parameter is planned as the old path plans it.
-  fsAsk(par)
   pinned.push(an)
   pinTys.push(ft)
   0
@@ -23577,24 +23478,14 @@ function monoPinHoleParam(
   // An argument open in this frame at a call no instance elaborates at a closed type: no
   // instance is demanded here.
   if an == "" && guessed { return 1 }
-  if an == "" {
-    // A name handed through an identity call into a binding can take a slot per type.
-    if nodeAt(args[i]) is Ident {
-      fsAsk(args[i])
-      fsAsk(params[i])
-    }
-    return monoArgTyFail(p.parName, fn.fnName)
-  }
+  if an == "" { return monoArgTyFail(p.parName, fn.fnName) }
   pinned.push(an)
   if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
   pinTys.push(anTy)
   if monoFwdFnPinMisfits(fn, params[i], args[i], anTy) {
-    // The plan gives the parameter one per type its calls take (D6202).
-    fsAsk(params[i])
     return monoFwdFnPinFail(p.parName, fn.fnName)
   }
   if monoHoleCopyCallsMisfit(fn, params[i], anTy) {
-    fsAsk(params[i])
     return monoHoleManyPinsFail(p.parName, fn.fnName)
   }
   0
@@ -23787,8 +23678,6 @@ function monoPinAnnotatedParam(
         an2Ty = pinTy[0]
       }
       if an2 == "" && monoHoleGenManyPins {
-        // The plan gives a parameter handed to closed function types one per type (D6741).
-        fsAsk(params[i])
         monoHoleManyPinsFail(p.parName, fn.fnName)
       }
     }
@@ -23828,20 +23717,11 @@ function monoPinAnnotatedParam(
         monoArgClosedTyIn(args[i], ctx, an2Ty),
       )
     }
-    if an2 == "" {
-      if ann == tp && nodeAt(args[i]) is Ident {
-        fsAsk(args[i])
-        fsAsk(params[i])
-      }
-      return monoArgTyFail(p.parName, fn.fnName)
-    }
+    if an2 == "" { return monoArgTyFail(p.parName, fn.fnName) }
     if ann == tp && monoFwdFnPinMisfits(fn, params[i], args[i], an2Ty) {
-      fsAsk(params[i])
       return monoFwdFnPinFail(p.parName, fn.fnName)
     }
     if ann == tp && monoHoleCopyCallsMisfit(fn, params[i], an2Ty) {
-      fsAsk(params[i])
-      fsAskTyParam(params[i])
       return monoHoleManyPinsFail(p.parName, fn.fnName)
     }
     // A parameter handed on keeps its own pin as a generic does (D6202).
@@ -23874,7 +23754,6 @@ function monoPinAnnotatedParam(
     } else if genPin && b != an2 && monoPinIsFnTy(an2Ty) {
       // A generic handed to a second `T` parameter called at another type: a bare-only `T` is
       // split per parameter by the check, or tagged as one set, so `T` takes one here (D6090).
-      fsAskTyParam(params[i])
       return emitFail(
         "emitProgram: monomorphize: a generic function handed to two parameters of type `"
           + tp
@@ -25547,9 +25426,6 @@ function monoWalk(ix: i32, ctx: i32) {
       ) {
         return monoGenArgOpenFail(ix)
       }
-      // A parameter of open type handed through list elements asks the split as a generic does
-      // (D7845).
-      if elemsTyped == 0 && paramArgs == 2 { fsAskOpenCall(monoCallTplOf(ix)) }
       if callee is Ident {
         const wr = monoWalkIdentCall(n, callee, ix, ctx, elemsTyped)
         if wr >= 0 && genCallee { monoCloseRetFnTy(ix, ctx) }
@@ -27431,7 +27307,7 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
     if lf[1] >= 0 && dn is LetDecl && dn.letInit >= 0 {
       rd = unwrapParen(dn.letInit)
     }
-    return monoAskRetCopies(fr, d, ctx, rd)
+    return monoNoteRetCopyRead(fr, d, rd)
   }
   monoInstanceWidenRet = true
   const cr = monoCoerceFnValueTys(x, nm, ctx, -1, nmTys)
@@ -27595,19 +27471,15 @@ function monoRecordInstOpen(x: i32, t: i32, wf: i32) {
   monoRecordOpen(x, t, wf)
 }
 
-// A generic read `x` (keyed `d` in frame `fr`) that `ctx` returns past two pins or two results
-// asks for a copy of `ctx`'s template per pin, and is refused until the copies exist even when
-// another delivery already instanced the generic (D9380, D9383).
-function monoAskRetCopies(fr: i32, d: i32, ctx: i32, x: i32): i32 {
+// Notes generic read `x` (keyed `d` in frame `fr`) when its frame returns it past two pins or two
+// results, so it is refused even when another delivery already instanced the generic (D9380,
+// D9383).
+function monoNoteRetCopyRead(fr: i32, d: i32, x: i32): i32 {
   const noPath: string[] = []
-  const it = monoFrameInstTmpl(ctx)
-  let asked = ctx
-  if it[0] == ctx && it[1] >= 0 { asked = it[1] }
   if (
     monoDeclPathPins([fr, d], noPath).length > 1
     || monoSlotRetCount(d, fr) > 1
   ) {
-    fsAsk(asked)
     if x >= 0 && !i32ListHas(monoRetCopyReads, x) { monoRetCopyReads.push(x) }
   }
   0
