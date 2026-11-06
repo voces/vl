@@ -1191,6 +1191,37 @@ happen where no fact can see them, so the slot has to be treated as called.
   must not be answered uncalled.
 
    Each family is measured alone by its own cut before it is scheduled.
+
+**The uncalled family, landed** (2026-11-06). `elabSlotUncalled(d, path)` answers it from the
+elaboration: no call reads its callee from the slot (`fnSlotCalled`, the checker's per-slot call
+index), no call goes through the set its type carries (`elabSlotSetCalls`), no closed delivery
+(`elabSlotDeliveries`), and no function it holds escapes (`fnEscapes`). Shadowed against the
+table at its three mono readers, it agreed at 159 of 165 site-hits until two gaps closed: a call
+through a one-member set reads its callee from the slot but the set records no call, and a `for`
+variable over a list is that list's element slot (`calleeSlotOf`). Then 165 of 165.
+`fnFlowDeclPathUncalled` is deleted.
+
+**Census of the remaining non-slot readers** (2026-11-06, master `214bc5d9`; witnesses are the
+`tests/cases` files where the entry gives a non-default answer):
+
+| entry | family | mono callers | witness (hits / files) | elaboration answers today |
+| --- | --- | --- | --- | --- |
+| `fnFlowDeclPathOnlyPinCall` | agreed, only call | monoPinOpenCallLams | `generics/hole-call-generic-lambda-arg.vl` (91 / 32) | partly: not where calls through a result fix the pin |
+| `fnFlowDeclPathAgreedPinTys` | agreed | monoHeldSrcsFnTy, monoHoleGenBindFnArgs | `closures/hole-fn-in-unannotated-map.vl` (2 / 2) | as above |
+| `fnFlowDeclPathAgreedPinTysSkipping` | agreed | monoElemFnPinTys | `closures/hole-fn-if-join-result-handed-hole-fn.vl` (10 / 5) | as above |
+| `fnFlowCallPathAgreedPinTys` | agreed, per call | monoPathSlotPinnedFnTy | `closures/generic-fn-in-unannotated-map.vl` (9 / 5) | the call's instance types |
+| `fnFlowCallPathAnnPinTys` | annotation | monoPathSlotPinnedFnTy | none in `tests/cases` | no: delivery rows record no result |
+| `fnFlowPinSigOf` | spelling helper | 4 | `maps/function-valued-map.vl` (3,523 / 554) | needs no table; the table uses it too |
+| `fnFlowElemKind` | syntax | monoPlaceRoot | `std/array-sorted.vl` (3,608 / 495) | needs no table; the table uses it too |
+| `fnFlowWholeSliceRecv` | syntax | monoFlowSliceAsSpread | `closures/generic-list-slice-copy-own-instances.vl` (7 / 2) | needs no table; the table uses it too |
+| `fnFlowDeclFn` | rest | monoDeclFrameIn, monoReadIsBinding | `loops/loop-value.vl` (67,693 / 1,188) | `recEnclosingFn`; last, with a full A/B |
+
+The last three are also read by the table's own walk, so they leave with the file. The four
+programs `monoHoleGenFnPin` still has no elaboration answer for split across families: the only-call
+pin (`closures/generic-fn-value-returned-through-identity-hole.vl`, D12340), the skipping agreed pin
+(`closures/hole-fn-if-join-result-handed-hole-fn.vl`) and the uncalled slot
+(`closures/hole-helper-pushes-listed-member-onto-uncalled-list.vl`). The agreed family's missing fact
+is a pin fixed by calls through a function's result (`fw(x)(y)`, `mk(g).f(3)`).
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
    `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
    `fnFlowStageInstHoles` go with the file.
