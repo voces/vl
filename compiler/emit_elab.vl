@@ -4,7 +4,11 @@
 
 import { cwIxCoveredLen, cwIxCovers } from "./check_write_scan"
 import { recFieldTyOf } from "./emit_rec_field_codes"
-import { monoIsGenericDecl } from "./emit_base"
+import {
+  monoIsGenericDecl,
+  monoParamsMention,
+  monoTyParamReachesSpelling,
+} from "./emit_base"
 import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
 import { fnSlotCalled, fnTagCallSetOf, fnTagCalls } from "./check_elab_cap"
 import { tyArrayElemIx } from "./check_types"
@@ -1048,6 +1052,27 @@ function elabRowClosedOrSet(tys: i32[]): boolean {
 // the type they default to (D4551); primed by the monomorphizer before the worklist runs.
 export let elabTpDefaults: {[i32]: string[]} = Map()
 export let elabTpDefaultTy = -1
+
+// Records the type parameters of declaration `d` an inferred call that leaves them unbound
+// defaults to `t`: each no parameter annotation names and whose binding reaches no spelling the
+// default would answer (`monoTyParamReachesSpelling`).
+export function elabTpDefaultsNote(d: i32, t: i32) {
+  const fn = nodeAt(d)
+  if !(fn is FuncDecl) || fn.fnTyParams.length == 0 { return 0 }
+  const out: string[] = []
+  for tp in fn.fnTyParams {
+    const one: string[] = [tp]
+    const seen: i32[] = []
+    if (
+      !monoParamsMention(fn.fnParams, one)
+      && !monoTyParamReachesSpelling(fn.fnBody, one, seen)
+    ) {
+      out.push(tp)
+    }
+  }
+  if out.length > 0 { elabTpDefaultsSet(d, out, t) }
+  0
+}
 
 export function elabTpDefaultsSet(d: i32, names: string[], t: i32) {
   elabTpDefaults[d] = names
@@ -10759,6 +10784,7 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
   const memo = elabDlvDepth == 0
     && elabDlvOmit.length == 0
     && !elabCallSinkOn
+    && !elabRetSinkOn
     && !elabCallRec
   let mk = ""
   if memo {
@@ -12299,6 +12325,21 @@ export function elabValueReturnsFrom(d: i32, f: i32): boolean {
   hit
 }
 
+// Test probe: with top-level functions `g`, `f1` and `f2` in the checked program, whether `g`'s
+// value reaches a return of `f1`, of `f2`, and of `f1` asked again, as bits 0, 1 and 2; -1
+// without them.
+export function elabRetsReachProbe(): i32 {
+  const g = fnDeclIx["g"] ?? -1
+  const f1 = fnDeclIx["f1"] ?? -1
+  const f2 = fnDeclIx["f2"] ?? -1
+  if g < 0 || f1 < 0 || f2 < 0 { return -1 }
+  let bits = 0
+  if elabValueReturnsFrom(g, f1) { bits = bits + 1 }
+  if elabValueReturnsFrom(g, f2) { bits = bits + 2 }
+  if elabValueReturnsFrom(g, f1) { bits = bits + 4 }
+  bits
+}
+
 // The functions a delivery walk reached a return of, recorded while `elabRetSinkOn`.
 let elabRetSink: i32[] = []
 let elabRetSinkOn = false
@@ -12482,6 +12523,27 @@ export function elabSlotUncalled(d: i32, path: string[]): boolean {
     if fnEscapes(f) { return false }
   }
   true
+}
+
+// The type slot `path` of binding declaration `d`, which nothing calls, holds its functions at:
+// the one closed function type among them, else the first open one's with each open parameter and
+// an open result as `i32`, a default no program can observe (D9100). -1 for none or two.
+export function elabUncalledSlotTy(d: i32, path: string[]): i32 {
+  let closed = -1
+  let open = -1
+  for f in elabSlotHeldFns(d, path) {
+    const t = if f >= 0 && f < P.nodes.length { nodeTyIxOf(f) } else { -1 }
+    if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc {
+      if !tyHasTyVar(t) && !tyReachesHole(t, 16) {
+        if closed >= 0 && !tySame(closed, t) { return -1 }
+        closed = t
+      } else if open < 0 {
+        open = t
+      }
+    }
+  }
+  if closed >= 0 { return closed }
+  if open >= 0 { elabHoleFnClosed(open) } else { -1 }
 }
 
 // Every function the slot `path` (steps `e`, `v`, `r`, `f.<name>`) of binding declaration `d` can
