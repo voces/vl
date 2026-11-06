@@ -1764,7 +1764,7 @@ programs. The map pin (`r5_rt`, the argument's checked type) still answers 13: 5
 fixture, whose map holding a non-generic keeps the set untagged, 3 written as a record `{f: id}`,
 3 an uncalled set (G5), and 2 outside bucket 1. The 3 record-written hits are all in
 `closures/hole-fn-generic-map-stored-through-parameter.vl`, whose `{id}` set three maps keep on
-mono, each alone: `c`, written only directly (the m8 row interning below); `b`, a map of records
+mono, each alone: `c`, written only directly (served since D15532); `b`, a map of records
 a helper widens to two generics (D15493); and `h`, a map of functions a helper widens to two
 generics (D15531). They move only when all three are served.
 
@@ -1779,20 +1779,18 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   at two types, is a check reject at both spellings, as the design says. The per-instance mint's
   population was measured over the same programs: `fnCloCoerceSetAt`'s -2 had 0 hits.
 - **The map-of-records holder kind** (3, and D15493's gain): holder kind 8, a map binding of the
-  set's records, is a holder where a parameter it is handed writes a record literal into it
-  (`ftMapRecHanded`), so mono pins that helper's instance at the binding's held rep. Every literal
-  written into the binding, through the helper or directly, is stamped at the rep's record, and
-  emit builds a stamped literal at that record's own row (`mintPinnedObjLit`) rather than minting
-  an id row of its own, which had left the callee's literal on a second `struct {mut i32}` row
-  beside the map's. An entry read through `?.` is not a holder: `drwOptGuard`'s call gets no id
-  member call, so `closures/generic-record-written-into-map-through-param-read-through-optional.vl`
-  runs on mono as on master (a decline, not a refusal). The price is one late demand per such
-  program, the helper's instance keyed at the held map, as with `T[]` above. A map written only directly stays on mono (`ftMapRecUnhanded`):
-  its literal's row is emit's anonymous mint, which a list holding the same record type twins
-  (`closures/map-of-records-beside-list-of-same-record.vl`), so the matrix's `map_value` and
-  `map_set` cells wait on one named fact: emit interning a direct-only held map's record row at
-  top level. A set one such binding holds stays untagged whole. Two different generics in one map
-  of records still refuse loudly (D15493).
+  set's records, is a holder whether it is written directly or through a helper's parameter. Every
+  literal written into it is stamped at the binding's held rep's record, and emit builds a stamped
+  literal at that record's own row (`mintPinnedObjLit`) rather than minting an id row of its own.
+  collectA interns the held rep's value row and mv slot (`fnTagHeldRepOf`), the rep `Map()` and
+  every read of the binding already resolve to; without it a map written only directly had no slot
+  (`closures/map-of-records-beside-list-of-same-record.vl`, D15532). Mono still pins a helper's
+  parameter at the held rep (`monoPinHoleParam`); that pin is the instance's type, not only the
+  intern, and without it the helper's store refuses. An entry read through `?.` is not a holder:
+  `drwOptGuard`'s call gets no id member call, so
+  `closures/generic-record-written-into-map-through-param-read-through-optional.vl` runs on mono as
+  on master (a decline, not a refusal). The price is one late demand per helper handed a held map,
+  as with `T[]` above. Two different generics in one map of records still refuse loudly (D15493).
 
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
