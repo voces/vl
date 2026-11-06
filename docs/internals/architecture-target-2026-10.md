@@ -967,6 +967,14 @@ The "reassigned function binding" refusal (`monoBindSigFail`) is read by two of 
   - The file can go only once those 44 mono readers are deleted or rebuilt on the elaboration's flow facts. That is the pin-helper work, not the plan's deletion.
   - Deleting `fn_split.vl` does not require it.
 
+**The deletion, prepared (2026-11-05, branch `claude/fn-split-delete`, draft until the census is 0).** It deletes `fn_split.vl` and the driver's plan loop, as the call graph above predicts, with three corrections to it:
+
+- **`fsAfterParse` was not only plan plumbing.** Every compile, the plan's or not, ran `fsConstLets`: it respells an un-annotated, unexported `let` that nothing re-points as `const` when it holds a lambda, a function or a list literal of those (D6472, D13521). It and its seven helpers move to `const_lets.vl` unchanged (`constLetsAfterParse`), so 8 of the 231 functions survive the deletion.
+- **Three parser helpers die with it.** `reparseArrowLambdaAt`, `reparseChoiceExprAt` and `reparseFuncDeclAt` had no reader but the plan.
+- **Four callers of the ask hooks go whole**, since asking was all they did or answered: `splitWidenedFnRead` (check_operators), `monoAskSplitRetCopies`, `monoAskJoinBinding` and `monoCalleeListRead` (emit_mono). `emit_mono.vl` falls from 1,138 functions to 1,135.
+
+`checkSrc`'s instance-diagnostic mute reduces to "the build succeeded", the rule #6398 left once the kept-program filter went. The seed falls from 6,520,731 to 6,349,672 bytes (−2.6%).
+
 
 F's 15 files are four shapes by witness:
 
@@ -1771,6 +1779,10 @@ pin ladder's deletion (step 2) is the other 113 KB.
 
 "↑ small" on check fuel means work moved from emit into check. The step's proof is that check plus build
 falls on diderven.
+
+Step 4's deletion half, measured on its prepared branch (§3.2, 2026-11-05): `fn_split.vl` goes
+(243 functions, 6,087 lines; 8 move to `const_lets.vl`), `emit_mono.vl` falls from 1,138 to 1,135
+functions, and the seed falls 2.6%.
 
 ### 4.3 L6 render-parse: done as a lane, the rest goes with the steps
 
