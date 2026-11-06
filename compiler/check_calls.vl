@@ -462,6 +462,7 @@ import {
   TY_F64,
   TY_I32,
   TY_NEVER,
+  TY_NULL,
   TY_STR,
   TY_U8,
   TY_VOID,
@@ -2193,13 +2194,51 @@ function elabUnboundCallNote(n: Call, ix: i32) {
   const tys: i32[] = []
   let byDefault = false
   for tp in f.fnTyParams {
-    const t = elabUnionArgPin(f, n, tp)
+    const t = if elabNullOnlyTp(f, n, tp) { TY_NEVER } else { elabUnionArgPin(f, n, tp) }
     if t < 0 { byDefault = true }
     tys.push(if t < 0 { TY_I32 } else { t })
   }
   elabValueRowNote(d, f.fnTyParams, tys)
   elabUnboundCallKeyNote(ix, d, f.fnTyParams, tys)
   if byDefault { elabDefaultRowNote(d, tys) }
+}
+
+// Whether every argument of call `n` at a parameter of `f` naming `tp` is a `null` handed to a
+// `tp | null` parameter, so `tp` has no candidate and binds `never` (D3178).
+export function elabNullOnlyTp(f: FuncDecl, n: Call, tp: string): boolean {
+  let seen = false
+  let i = 0
+  while i < f.fnParams.length {
+    const pt = nodeTyIxOf(f.fnParams[i])
+    if pt >= 0 && pt < T.tys.length && tyMentionsTyVarNamed(pt, tp, 8) {
+      if i >= n.callArgs.length { return false }
+      const ax = parenPeelIx(n.callArgs[i])
+      if ax < 0 || ax >= P.nodes.length || !(nodeAt(ax) is NullLit) { return false }
+      if !tyBareOrNull(pt, tp) { return false }
+      seen = true
+    }
+    i = i + 1
+  }
+  seen
+}
+
+// Whether `t` is `tp | null` with `tp` bare: a parameter only a `null` reaches binds `tp` to no
+// value, and `never` has a value type only in that position.
+function tyBareOrNull(t: i32, tp: string): boolean {
+  const u = tyAt(t)
+  if u is TyNullable {
+    const iv = if u.nInner >= 0 && u.nInner < T.tys.length { tyAt(u.nInner) } else { tyAt(TY_I32) }
+    return iv is TyVar && iv.tvName == tp
+  }
+  if !(u is TyUnion) || u.uMembers.length != 2 { return false }
+  let hasNull = false
+  let hasTp = false
+  for m in u.uMembers {
+    if m == TY_NULL { hasNull = true }
+    const mv = if m >= 0 && m < T.tys.length { tyAt(m) } else { tyAt(TY_I32) }
+    if mv is TyVar && mv.tvName == tp { hasTp = true }
+  }
+  hasNull && hasTp
 }
 
 // The type call `n`'s argument gives type parameter `tp` of `f` where `tp` is a bare member of a
@@ -4403,6 +4442,8 @@ function checkCallNodeGo(n: Call, ix: i32) {
   ) {
     return TY_NEVER
   }
+  // An instance binding a type parameter to `never` calls no value through it (D3178).
+  if elabCapLive() && fnTy == TY_NEVER { return TY_NEVER }
   // `v.d()` over a getter reads `v.d` and calls the result: say which getter it read.
   let calledGetter = getSiteFnOf(n.callFn)
   if calledGetter == "" && cfn is Member {
