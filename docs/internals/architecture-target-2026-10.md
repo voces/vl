@@ -1971,6 +1971,15 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
 with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
 
+**Slot type, map values switched** (2026-11-06). `monoPinMapValues` takes the map's type from
+`elabSlotTyAt` wherever it closes; `monoPinMapSlot` only instances the stored values at it, and a
+disagreement is a loud refusal. Two fact fixes came first: a non-generic slot member answers from
+its own signature (#6536), and a slot handed to an open function parameter declines (#6539); the
+refusal found the second on D10311, D10383, D10401 and D14400. Where the elaboration declines, an
+untagged map whose generic is called at two signatures, mono's one-signature spelling stays: it is
+a rep spelling, not a type, and waits on a holder bundle fact (D15494). Over 19,318 programs with
+fixpoint seeds no byte moves, and 4,601 filed witnesses grade as filed.
+
 **Slot deliveries, the reach rung deleted** (2026-11-06). `monoDeclPathPinsOrReach` and
 `monoStoredSlotFnTy` fell back to value reach (`vrCalleeTy`) where the elaboration's slot pins were
 empty. Over the 23,456 programs the reach rung never answered alone: at 1,553 site-hits the pins
