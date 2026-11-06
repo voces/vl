@@ -11806,6 +11806,13 @@ function elabPushRecvDecl(c: Call): i32 {
   d
 }
 
+// `elabCalleeFns` for the call at node `c`; [] for any other node.
+export function elabCalleeFnsOf(c: i32): i32[] {
+  const n = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if n is Call { return elabCalleeFns(n) }
+  []
+}
+
 // The functions call `c`'s callee can be: the declared function it names, else each function the
 // slot it reads can hold (a binding aliasing a function value, a list element, a joined value).
 function elabCalleeFns(c: Call): i32[] {
@@ -12622,6 +12629,18 @@ export function elabUncalledSlotTy(d: i32, path: string[]): i32 {
 // hold: the members of the set its type carries, in the checked tree and in each instance of the
 // function declaring it, and each function the write index stores at that slot.
 export function elabSlotHeldFns(d: i32, path: string[]): i32[] {
+  elabSlotHeldIn(d, path, false)
+}
+
+// `elabSlotHeldFns` as value flow: a list holds what the lists its own literal spreads hold, but
+// not what is written into a list that spreads it. It answers which function a read can be, where
+// `elabSlotHeldFns` answers which functions the slot's rep must cover.
+export function elabSlotFlowFns(d: i32, path: string[]): i32[] {
+  elabSlotHeldIn(d, path, true)
+}
+
+// `elabSlotHeldFns`, or with `flow` its value-flow reading `elabSlotFlowFns`.
+function elabSlotHeldIn(d: i32, path: string[], flow: boolean): i32[] {
   const out: i32[] = []
   if d < 0 || d >= P.nodes.length { return out }
   const o = if declOrigOf(d) >= 0 { declOrigOf(d) } else { d }
@@ -12661,10 +12680,11 @@ export function elabSlotHeldFns(d: i32, path: string[]): i32[] {
     for f in ts {
       if f >= 0 && !i32ListHas(out, f) { out.push(f) }
     }
-    // A list spread into another, or spreading one, holds the other's elements too.
+    // A list spread into another, or spreading one, holds the other's elements too; under `flow`,
+    // only a list it spreads.
     if path[0] == "e" {
       const seen: i32[] = [o]
-      const todo: i32[] = cwSpreadPeers(o)
+      const todo: i32[] = if flow { elabSpreadSources(o) } else { cwSpreadPeers(o) }
       while todo.length > 0 && seen.length < 16 {
         const b = todo.pop() ?? -1
         if b >= 0 && !i32ListHas(seen, b) {
@@ -12675,8 +12695,35 @@ export function elabSlotHeldFns(d: i32, path: string[]): i32[] {
           for f in cwPathFnTargets(b, cp) {
             if f >= 0 && !i32ListHas(out, f) { out.push(f) }
           }
-          for x in cwSpreadPeers(b) { todo.push(x) }
+          for x in (if flow { elabSpreadSources(b) } else { cwSpreadPeers(b) }) {
+            todo.push(x)
+          }
         }
+      }
+    }
+  }
+  out
+}
+
+// The bindings whose lists the literal initialising binding `d` spreads.
+function elabSpreadSources(d: i32): i32[] {
+  const out: i32[] = []
+  if d < 0 || d >= P.nodes.length { return out }
+  const dn = nodeAt(d)
+  const li = if dn is LetDecl && dn.letInit >= 0 { parenPeelIx(dn.letInit) } else { -1 }
+  const ln = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+  if ln is ArrayLit {
+    for e in ln.arrElems {
+      const en = nodeAt(parenPeelIx(e))
+      const a = if en is Spread { parenPeelIx(en.spdArg) } else { -1 }
+      const b = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
+      if (
+        b >= 0
+        && b < P.nodes.length
+        && nodeAt(b) is LetDecl
+        && !i32ListHas(out, b)
+      ) {
+        out.push(b)
       }
     }
   }
