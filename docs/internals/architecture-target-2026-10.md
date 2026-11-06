@@ -1805,7 +1805,7 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 | unbound default | an elaboration-owned default for an unbound type parameter or hole | 12 | 18,170 | split-dep |
 | slot held fns | `elabSlotHeldFns` of the binding or slot | 29 | 9,604 | split-dep |
 | slot deliveries | `elabSlotDeliveries` of the binding or cell | 9 | 9,601 | — |
-| node type | `elabNodeTyAt` at the instance | 29 | 9,592 | — |
+| node type | `elabNodeTyAt` at the instance | 29 | 9,592 | blocked on Fn#d |
 | slot type | `elabSlotTyAt` / `elabSlotTys` of the slot | 27 | 9,578 | — |
 | lambda sigs | `elabLamParamSigs` | 11 | 9,023 | lane F |
 | instance binding | the instance key's binding (`ekTys`, `elabInstTyAt`, `elabParamTyOwnAt`) | 34 | 9,023 | reach, split-dep |
@@ -1841,6 +1841,184 @@ three functions are deleted. The written `let`'s seed signature (`monoSeedCallSi
 `monoCallIfBound`, `monoCallWrittenLet` and `monoCallIfValue`) is reached past its gates by 8
 programs: in 6 its parameters agree with `elabCallParamBoundTy`, and in 2 neither closes (D15260's
 shape, which runs).
+
+**Node type, first reading** (2026-11-06, the same population, against `elabNodeTyAt` at the
+instance):
+
+| function | path | agree | both decline | mono only | elaboration only | differ |
+|---|---|---|---|---|---|---|
+| `monoArgClosedTyIn` | past a closed caller pin | 4,336 | 210 | 0 | 0 | 4 |
+| `monoArgClosedTyIn` | the caller's pin | 4,163 | 0 | 38,241 | 0 | 11 |
+| `monoCloseRetFnTy` | | 0 | 873 | 28 | 19 | 0 |
+
+- **Switched: past a closed caller pin.** The four differences are one test
+  (`pin-exact-key-set-and-its-map.vl`), where the elaboration's type is the `match` arm's non-null
+  narrowing. It prints the same either way. `pinnedParamTyAt` and `nodeTyInOf` leave `emit_mono`.
+- **Not this family: the caller's pin.** It is `monoArgPinTyIx`, the rep cascade, which belongs to
+  the call-param family.
+- **Not switched: `monoCloseRetFnTy`.** The elaboration declines a returned list of functions (28
+  reads), and it closes 19 calls mono leaves open.
+
+**Instance result, first pass (2026-11-06).**
+- `monoRetRecordOf` and its consumers `monoRetConstRecord`, `monoPinCallRecord` and
+  `monoPinInPlaceCallRecord` are deleted. The chain never pinned: over the 23,103 programs
+  `monoRetRecordOf` returned no record in 112,273 calls, and a build refusing wherever it would
+  return one passes the deno suites. A byte sweep of the 23,103 against master's fixpoint seed
+  differs on none. The elaboration's result (`elabResultAtParams`) answers 10 of those calls, all
+  in `std/idtable-*.vl`. That is a capability question, declined under ruling (a).
+- `monoPinnedRetAnnTy`'s 29 answers are a returned list literal of hole functions pinned by its
+  caller's calls (`hole-fn-list-returned-reread.vl`). The instance result is open there, so its
+  owning fact is the forward climb over the literal's element slot, as for the reach pair, and not
+  `elabRetOf`.
+- `monoRetRepOf` and `monoReturnedBundlePin` are rep decisions, so they move to the per-call
+  delivered rep below.
+
+**Node type, blocked on closed function-holding types** (2026-11-06). Two more helpers were
+shadowed against `elabNodeTyAt` at the instance:
+
+| function | agree | both decline | mono only | elaboration only |
+|---|---|---|---|---|
+| `monoClosedObjLitTy` | 0 | 158 | 8 | 272 |
+| `monoRetFnListTy` | 0 | 767 | 23 | 563 |
+
+Mono answers only a type that holds a function (`{m:{[string]:(i32)=>i32}}`, `((i32)=>i32)[]`,
+`(i32)=>i32`), which is all these helpers exist for. The elaboration declines every one, and where
+it answers (`{q:i32}`, `i32[]`) mono declines by design. `monoCloseRetFnTy` has the same shape.
+The rest of the family waits on `elabNodeTyAt` closing a function-holding type at the instance,
+the Fn#d lane's function-value identity (D15298). Those mono-only rows are its acceptance
+witnesses. Four helpers move to the instance-binding family: `monoPinBin`, `monoPinnedOperandTy`,
+`monoPinnedReadTy` and `monoDeadNullTest` read only the instance's own pin column, in
+`monoMakeInstanceGo`'s body rewrite.
+
+**Slot type, first reading: `monoReachSlotTy`** (2026-11-06). Value reach (`vrCalleeTy`) against
+the climb's agreed tuple (`elabLitSlotCallTys`), each computed on its own:
+
+| outcome | site-hits | files |
+|---|---|---|
+| agree | 314 | 161 |
+| both decline | 505 | 253 |
+| the elaboration only, reach declines | 228 | 107 |
+| reach open, the elaboration declines | 26 | 20 |
+| the elaboration only, reach open | 1 | 1 |
+| reach only | 17 | 10 |
+| differ | 0 | 0 |
+
+The rung stays. The 17 reach-only site-hits are where the climb records no tuple, so they are the
+next forward-climb edges to add:
+- a list built by `push` or spread (`closures/hole-fn-generic-pushed-list-spread.vl`,
+  `closures/hole-fn-into-pushed-lambda-bound-by-every-call.vl`);
+- a lambda member of a capturing list (`closures/hole-fn-list-capturing-lambda-member-at-handed-result.vl`,
+  `closures/hole-lambda-on-hole-fn-list-capturing-hole-param.vl`);
+- a function field handed to a narrower declared parameter
+  (`structs/record-with-generic-fn-field-into-narrower-declared-param.vl`,
+  `functions/exported-generic-reached-through-lambda-field-or-list-called.vl`);
+- D2853, D2862, D12880 and D12940.
+
+The 228 the elaboration alone answers are calls mono leaves untyped today, so the switch admits them
+too, and they are graded as newly admitted programs.
+
+**Slot type, parked and pruned** (2026-11-06).
+
+- **`monoReachSlotTy` is parked.** 13 of its 17 reach-only site-hits call the slot's function with a
+  lambda argument whose type is open at the call (D12880, D12940, and the pushed-lambda and
+  capturing-lambda-member tests). That is the lambda-signature family's, and lane F has them as
+  acceptance witnesses. In D2853 and D2862 the call is through a field of a record a call returns
+  (`mk(7).g()`), which the reach lane's value-returns family owns. The other 4 are answered by the
+  binding's slot call tuple (`slotCallArgsInto`), which lands with the deletion. The rung keeps
+  reach's decline for the 228 sites only the elaboration answers.
+- **Value reach's no-call half, dropped where it never decided.** Three gates ask
+  `elabSlotUncalled(...) || reach finds no call`. Where the elaboration says the slot is called,
+  reach alone said "no call" this often:
+
+| gate | elaboration uncalled | reach alone | site-hits |
+|---|---|---|---|
+| `monoStoredSlotFnTy` | 136 | 0 | 136 |
+| `monoPinNestedListElems` | 19 | 0 | 19 |
+| `monoPinListElems` | 256 | 23 | 293 |
+
+  The first two now read `elabSlotUncalled` alone. In the third, reach's answer stays: 23 site-hits
+  in 17 files where the elaboration has no uncalled answer (D10795, D10796, D10893 to D10895, D12472
+  and others). `monoValsInert` stays too, since it decides 34 site-hits with two pins that the
+  elaboration has no fact for.
+- **No longer mono-derived since #6496:** `monoPinRecordField`, `monoPinRecordFields` and
+  `monoPinNestedListElems` read only the elaboration's slot pins (`monoDeclPathPins`).
+
+**`monoPinnedRetAnnTy` is parked.** Re-keyed onto the forward climb (`elabLitSlotCallTys` over
+each returned list literal, with each element's result) and shadowed over the 23,103 programs:
+
+| outcome | events |
+| --- | --- |
+| both answer, agree | 11 |
+| both answer, differ | 0 |
+| old only | 18 |
+| new only | 1 |
+| neither | 1,027 |
+
+The 18 old-only fall into two groups:
+- 13 are an uncalled slot, which takes the unbound default (the D15293, D15207 and D15294 named
+  sets; `named/d15293_string_alone.vl`). That belongs to the uncalled-slot and unbound-default work.
+- 5 are a returned list reached only through a callback method or a hand-on
+  (`hole-fn-list-unbound-and-returned.vl`), which the climb does not follow yet.
+
+The switch waits for the default, then for that climb edge.
+
+**Value returns are aligned.** `monoFlowCallLeaf` names the module-level generic every `return` of
+a call's callee reads. Over the 23,103 programs the climb confirms it: the one top-level generic
+whose value `elabValueReturnsFrom` finds reaching that return agrees at 87 queries. It differs at
+none, misses none, and answers 2 more. A reverse fact ("the values reaching `f`'s returns") would
+replace at most the walk's 3 producers, so the family stays.
+
+The shadow found a defect in `elabValueReturnsFrom`. `elabSlotDeliveries` memoised an outermost
+query whenever no call sink was on, but the return sink was not in that gate. A second query for
+the same value read the memo, walked nothing and answered false. The memo now skips a return-sink
+query; `tests/vl_elab_rets_reach_test.ts` asks the query three times. No program in the population
+changed output.
+
+**The uncalled-slot gates are rewrite-owned.** `monoPinListElems`' reach half
+(`monoLitReachesNoCall`) and `monoValsInert` are kept, and they close only when the flow pass's
+`monoFlow*`/`mfr*` family (the slot held fns row, 29 functions) is retired. Each gate answers
+"uncalled" about the program after `monoFlowReadSet` has rewritten every read of the slot to name
+its generic. `elabSlotUncalled` answers about the program before that rewrite. An elaboration fact
+that took mono's rewrite as an omit set would move the dependency, not remove it.
+
+Shadow over the 23,103 programs at `4f3d9023`. Both predicates are asked at every slot reaching a
+gate. E is `elabSlotUncalled`; M is the mono predicate the gate reads.
+
+| gate | both called | both uncalled | E only | M only |
+| --- | --- | --- | --- | --- |
+| list, no pin (`monoLitReachesNoCall`) | 14 | 27 | 245 | 23 |
+| list, pushed, two pins (`monoValsInert`) | 5 | 0 | 0 | 2 |
+| nested list, no pin (`monoValsReachNoCall`) | 0 | 1 | 22 | 0 |
+| stored slot, no pin (`monoValsReachNoCall`) | 0 | 23 | 129 | 0 |
+| stored slot, two pins (`monoValsInert`) | 17 | 0 | 0 | 34 |
+
+The two rows with no M-only cell read `elabSlotUncalled` alone since #6503. At a no-pin gate the two
+answers are joined by `||`, so E only changes nothing. All 59 M-only cells run correctly, and only
+through the uncalled default.
+
+Each M-only cell is graded by what makes E answer "called", and by which reasons are left once the
+rewritten calls (`mfrSetCalls`) are omitted:
+
+- **`fnSlotCalled` (44 cells): every list cell, and 19 stored ones.** It is the checker's
+  call-through-slot note. It is keyed by holder and path, with argument tuples and no call node
+  (`fnSlotCallNote`), so it cannot omit a rewritten call. In 18 of the list cells and both pushed
+  ones, every set call and delivery is a rewritten call as well. In 6 of the stored cells a held
+  function also escapes through a map parameter.
+  - List witnesses: D7385, D12472, D10795, D10796, D10893, D10894, D10895,
+    `closures/hole-fn-list-computed-index-call-as-value.vl` and
+    `functions/lambda-through-const-list-element*.vl`.
+  - Pushed: D9482 and `closures/hole-fn-generic-pushed-list-spread.vl`.
+  - Stored: D9310, D9480, D9591, D15298 and `closures/hole-fn-generic-in-map-called-at-two-types.vl`.
+- **Rewritten calls only (2 cells).** Omitting `mfrSetCalls` leaves no reason
+  (`closures/container-of-generic-flow-reads.vl`).
+- **Handed reads (13 cells).** The rewritten read is an argument, as in `run(mv, 2)` where `run`
+  calls `f`, so the two pins are the deliveries through `run` at two types. `monoFlowReadSet` lists
+  only called reads in `mfrSetCalls`, so these deliveries survive the omission. Witnesses:
+  D10311, D10383, D10384, D10401, D14400 and
+  `generics/fn-value-generic-handed-from-call-map-or-repointed-let.vl`.
+
+Whoever retires `monoFlowReadSet` needs two facts that do not exist yet: `fnSlotCalled` keyed by the
+call node, and the handed reads.
 
 #### Next stage, first item: a per-call delivered-rep fact
 
