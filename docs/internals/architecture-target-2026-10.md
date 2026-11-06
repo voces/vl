@@ -1791,7 +1791,7 @@ about 600 are new-only and 22,518 decline on both sides. The byte sweep moves 4 
   `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
   `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
   named fallback, a defaulting rule rather than a missing fact. The elaboration should own the
-  default eventually, but not in this change. After the two `nokey-gen` key fixes below, 2 `nokey-gen`
+  default eventually, but not in this change. After the two `nokey-gen` key fixes below, the 2 `nokey-gen`
   parameters remain, both this default: `id` called inside a lambda forwarder no call instances
   (`generics/mono-lambda-forwarder-uninstantiated.vl:49` and `:54`), which mono pins at `i32`.
 - **A call inside a body mono cloned** (12 `noframe`), which the walk top does not index:
@@ -1799,6 +1799,16 @@ about 600 are new-only and 22,518 decline on both sides. The byte sweep moves 4 
   `closures/hole-fn-record-field-called-at-other-param.vl`.
 - **A call through a value** (7), and three solved hole parameters the checker leaves open
   (D15331).
+
+**`nokey-gen` is the unbound default alone** (2026-11-06). Of its 22 parameters on master, 20 were
+a call node mono made that never pointed back at the call the elaboration keyed:
+- 14 were a UFCS member call that `monoPinMemberCall` lowers to a direct call. The lowered call now
+  reads the member call's bind row (`monoNoteCallTpl`).
+- 6 were a free `"[]="` operator's dispatch call. It now records its assignment in `drwOpOrigin`,
+  as a dispatched operator does.
+
+Instance shadow: `nokey-gen` 22 → 2, 0 new REAL. Fixpoint seeds over 19,318 programs
+(`tests/cases` and the distilled corpus, `std/idtable-*` among them): 0 bytes move.
 
 Mono declines 1,969 calls (573 programs). For 662 of their parameters (183 programs) the
 elaboration closes the type anyway (`eo:yes`). Those are the decline set, and the switch keeps them
