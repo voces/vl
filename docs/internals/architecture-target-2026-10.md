@@ -1905,6 +1905,32 @@ next forward-climb edges to add:
 The 228 the elaboration alone answers are calls mono leaves untyped today, so the switch admits them
 too, and they are graded as newly admitted programs.
 
+**Slot type, parked and pruned** (2026-11-06).
+
+- **`monoReachSlotTy` is parked.** 13 of its 17 reach-only site-hits call the slot's function with a
+  lambda argument whose type is open at the call (D12880, D12940, and the pushed-lambda and
+  capturing-lambda-member tests). That is the lambda-signature family's, and lane F has them as
+  acceptance witnesses. In D2853 and D2862 the call is through a field of a record a call returns
+  (`mk(7).g()`), which the reach lane's value-returns family owns. The other 4 are answered by the
+  binding's slot call tuple (`slotCallArgsInto`), which lands with the deletion. The rung keeps
+  reach's decline for the 228 sites only the elaboration answers.
+- **Value reach's no-call half, dropped where it never decided.** Three gates ask
+  `elabSlotUncalled(...) || reach finds no call`. Where the elaboration says the slot is called,
+  reach alone said "no call" this often:
+
+| gate | elaboration uncalled | reach alone | site-hits |
+|---|---|---|---|
+| `monoStoredSlotFnTy` | 136 | 0 | 136 |
+| `monoPinNestedListElems` | 19 | 0 | 19 |
+| `monoPinListElems` | 256 | 23 | 293 |
+
+  The first two now read `elabSlotUncalled` alone. In the third, reach's answer stays: 23 site-hits
+  in 17 files where the elaboration has no uncalled answer (D10795, D10796, D10893 to D10895, D12472
+  and others). `monoValsInert` stays too, since it decides 34 site-hits with two pins that the
+  elaboration has no fact for.
+- **No longer mono-derived since #6496:** `monoPinRecordField`, `monoPinRecordFields` and
+  `monoPinNestedListElems` read only the elaboration's slot pins (`monoDeclPathPins`).
+
 **`monoPinnedRetAnnTy` is parked.** Re-keyed onto the forward climb (`elabLitSlotCallTys` over
 each returned list literal, with each element's result) and shadowed over the 23,103 programs:
 
