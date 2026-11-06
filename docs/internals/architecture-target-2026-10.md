@@ -1347,12 +1347,13 @@ movers that keying by rep could not close.
   Measured over `tests/cases` with fixpoint seeds: 0 programs' bytes move. An instance the
   elaboration has no key for keeps mono's spelling.
 
-`monoElabSplitKey` is not yet deletable. Besides spelling the keys of instances with no
-elaboration key, it guards the typed fallback (`monoTypedKeys`), which reuses an instance by its
-pinned types: without the guard, a type-testing body instanced at one rep for two types (a `Set`
-and its map twin, D10540; the `flat-generic-rows-*` and `i32-keyed-function-type-parameter`
-fixtures) is reused across both and 5 programs print wrong. Its deletion needs that guard read
-from the elaboration's key instead.
+The typed fallback (`monoTypedKeys`), which reuses an instance by its pinned types, serves a
+request only where the request's elaboration key and the instance's spell the same instance: one
+rep can carry two types whose bodies differ, by an `is` test (a `Set` and its map twin, D10540) or
+by a type parameter read as a value (`R.size` in the `flat-generic-rows-*` fixtures). That guard
+replaced `monoElabSplitKey`, which asked the elaboration for the call's wanted instance a second
+way (`elabCallInstWant`); both are deleted. Gating the guard on `elabTestsTyVar` alone misses the
+`R.size` reads and miscompiles three programs, so it applies to every body.
 
 **A lambda's instance is keyed by the instance it is nested in** (2026-11-06): the walk top
 (`elabWalkTop`), the declaration, and the rep and tagged set of each pin. Measured against the
