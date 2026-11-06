@@ -1617,14 +1617,17 @@ lambda called across instances, or a hole `_`. 10 are new-only, and none differs
 The binding's substitution stays first, so what the elaboration has to replace is the reach rung
 alone, and every one of the 53 is a cell the substitution answers. `elabLamParamTy` (emit_elab)
 climbs from the lambda node under the walk top's reach closure, records the calls its value
-reaches as callee, and takes the one closed parameter type across their delivered types. On the
-reach rung's own cells (programs, 19,316 run): 5 agree, 3 new-only, 0 old-only, 0 differ.
+reaches as callee, and takes the one closed parameter type across their delivered types. A call
+inside another lambda counts only where that lambda's own parameters close the same way. On the
+reach rung's own cells (programs, 19,316 run): 4 agree, 3 new-only, 0 old-only, 0 differ.
 
-A first reader that also took the lambda's walk type and its slot deliveries answered 21 programs
-the rung left open, and pinned a lambda's own per-call hole at the type one call delivers (D1795's
-`use(p)`). That broke 7 filed witnesses and 8 `tests/cases` programs, so the reader asks for calls
-only. Switched, and `monoLamReachParamTy` is deleted. Of the 3 new-only, 2 build byte-identical,
-and `generics/hole-lambda-calls-per-instance.vl` moves bytes but prints the same output.
+Two narrower readers came first and each was refuted by a witness. One that also took the
+lambda's walk type and slot deliveries pinned a lambda's own per-call hole at the type one call
+delivers (D1795's `use(p)`), which broke 7 filed witnesses and 8 `tests/cases` programs. Counting
+every call inside a lambda pinned D12235's `g`, whose capture `n` stays open, which turned a loud
+emit refusal into invalid wasm. Switched, and `monoLamReachParamTy` is deleted. Of the 3
+new-only, 2 build byte-identical, and `generics/hole-lambda-calls-per-instance.vl` moves bytes
+but prints the same output.
 
 `monoRetReadsHoleParam` (D2878) asked syntactically whether a `const` lambda the instance only
 calls returns a hole parameter or a field chain off one. Asked instead whether the template's
