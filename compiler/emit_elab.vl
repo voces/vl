@@ -7708,6 +7708,7 @@ function ekByDeclNote(d: i32, k: i32) {
   const ks = ekByDecl[d] ?? []
   ks.push(k)
   ekByDecl[d] = ks
+  if ks.length == 2 { elabFnHoldingMemo = Map() }
   0
 }
 
@@ -8031,6 +8032,7 @@ export function elabRun() {
   ekNames = []
   ekTys = []
   ekByDecl = Map()
+  elabFnHoldingMemo = Map()
   ekIndex = Map()
   ekRetWide = Map()
   elabExactMemo = Map()
@@ -10687,9 +10689,7 @@ export function elabCheckedTyOf(ix: i32): i32 {
 export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
   // A literal or name an instance minted after the write index has no index facts to read; a
   // binding answers through its source (`declOrigOf`).
-  // A cell literal the capture rewrite minted, or an instance's copy of one, answers as the
-  // binding it seeds.
-  const d = cboxCellLits[d0] ?? (cboxCellLits[nodeSrc[d0] ?? -1] ?? d0)
+  const d = elabCellLitBinding(d0)
   // A program whose check never asked for the write index builds it here.
   cwIxBuild()
   const late = d >= cwIxCoveredLen()
@@ -10763,6 +10763,12 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
 let elabDlvMemo: {[string]: i32[]} = Map()
 let elabDlvMemoEpoch = -1
 
+// A cell literal the capture rewrite minted, or an instance's copy of one, answers as the binding
+// it seeds; any other node as itself.
+function elabCellLitBinding(d: i32): i32 {
+  cboxCellLits[d] ?? (cboxCellLits[nodeSrc[d] ?? -1] ?? d)
+}
+
 function elabIsBinding(n: Node): boolean {
   n is LetDecl || n is Param || n is FuncDecl
 }
@@ -10807,12 +10813,29 @@ let elabDlvOmit: i32[] = []
 
 // Whether the instances of the function declaring `d` deliver slot `path` at different closed
 // function types, so its delivery is asked per instance.
-export function elabSlotPerInstance(d0: i32, path: string[]): boolean {
+export function elabSlotPerInstance(d1: i32, p0: string[]): boolean {
+  let d0 = elabCellLitBinding(d1)
+  // A capture temp holds its cell's element.
+  let path = p0
+  const wc = cboxWriteCells[d0] ?? (cboxWriteCells[declOrigOf(d0)] ?? -1)
+  if wc >= 0 {
+    const full: string[] = ["e"]
+    for st in p0 { full.push(st) }
+    d0 = wc
+    path = full
+  }
   // A node an instance minted after the write index is asked as its source.
   const late = cwIxCoveredLen() > 0 && d0 >= cwIxCoveredLen()
   const d = if late && declOrigOf(d0) >= 0 { declOrigOf(d0) } else { d0 }
   if d < 0 || (cwIxCoveredLen() > 0 && d >= cwIxCoveredLen()) { return false }
-  const fd = recEnclosingFn(d)
+  // A slot in a closure the instances share differs with the instances of the function around it.
+  // A `let` the index files no parent for is found by the function its check ran in.
+  let fd = if recEnclosingFn(d) >= 0 { recEnclosingFn(d) } else { elabInstancedFnHolding(d) }
+  let hops = 0
+  while fd >= 0 && (ekByDecl[fd] ?? []).length < 2 && hops < 16 {
+    fd = recEnclosingFn(fd)
+    hops = hops + 1
+  }
   const ks = if fd >= 0 { ekByDecl[fd] ?? [] } else { [] }
   if ks.length < 2 { return false }
   const first = elabSlotDeliveries(d, path, ks[0])
@@ -10824,6 +10847,22 @@ export function elabSlotPerInstance(d0: i32, path: string[]): boolean {
   }
   false
 }
+
+// The innermost function with two or more instance keys whose body holds `d`, or -1: what a
+// declaration the index files no parent for (a generic template's own) is found by.
+function elabInstancedFnHolding(d: i32): i32 {
+  const memo = elabFnHoldingMemo[d] ?? -2
+  if memo != -2 { return memo }
+  let best = -1
+  for f in ekByDecl.keys() {
+    if (ekByDecl[f] ?? []).length >= 2 && f != d && nodeContains(f, d) {
+      if best < 0 || nodeContains(best, f) { best = f }
+    }
+  }
+  elabFnHoldingMemo[d] = best
+  best
+}
+let elabFnHoldingMemo: {[i32]: i32} = Map()
 
 // Whether `a` and `b` hold the same types, in any order.
 function elabSameTys(a: i32[], b: i32[]): boolean {
@@ -10964,7 +11003,8 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
   // A function named by value is delivered where that occurrence's value flows on.
   if dn is Ident {
     cwIxWant()
-    const r = elabSlotReadUp(d, path)
+    // A name minted after the index has no read to climb; only a replaced loop's carrier seeds one.
+    const r = if d < cwIxCoveredLen() { elabSlotReadUp(d, path) } else { -1 }
     const fd = identFnDeclOf(d)
     const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
     elabGenericByValue = fn is FuncDecl && fn.fnTyParams.length > 0
@@ -10975,6 +11015,7 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
     if lx >= 0 && lx < P.nodes.length { elabSlotClimb(lx, path, out, seen) }
     elabGenericByValue = false
     elabGenericRead = -1
+    if d >= cwIxCoveredLen() { return 0 }
   }
   // A temp the capture rewrite minted for a closure's tail write holds the cell's element; an
   // instance's copy of the temp, its source's cell.
@@ -11498,8 +11539,17 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
       elabEntryFns.push(fd)
       elabEntryCalls.push(up)
       // Another instance reads the parameter afresh; what this one saw says nothing of it.
-      const inSeen = if elabDlvKey != wasKey && elabEntryFns.length < 8 { elabSeenFresh() } else { seen }
-      elabSlotReadDeliveries(fn.fnParams[ai], [], out, inSeen)
+      const narrowed = elabDlvKey != wasKey && elabEntryFns.length < 8
+      const inSeen = if narrowed { elabSeenFresh() } else { seen }
+      const got: i32[] = []
+      elabSlotReadDeliveries(fn.fnParams[ai], [], got, inSeen)
+      // An instance minted under the call that its key row does not name still reads it.
+      if narrowed && got.length == 0 {
+        elabDlvKey = wasKey
+        elabDlvAdmit = wasAdmit
+        elabSlotReadDeliveries(fn.fnParams[ai], [], got, seen)
+      }
+      for t in got { elabRetsAdd(out, t) }
       elabEntryFns.pop()
       elabEntryCalls.pop()
       elabDlvKey = wasKey
