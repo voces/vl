@@ -14,7 +14,15 @@
 // `ci-native` installs no npm deps, so it self-ignores there; the `ci-release-shape` job names
 // this file and runs it with npm deps.
 
-import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen, wasmDis } from "./support/tree.ts";
+import {
+  binaryen,
+  COMPILER,
+  exists,
+  nativeEnv,
+  ROOT,
+  VL,
+  wasmDis,
+} from "./support/tree.ts";
 
 const WASM_DIS = binaryen("wasm-dis");
 const ENABLED = exists(VL) && exists(COMPILER) && exists(WASM_DIS);
@@ -227,7 +235,8 @@ Deno.test({
 // The write-back keeps a self call in tail position a tail call, so deep recursion that
 // assigns a capture does not grow the stack (D3664).
 Deno.test({
-  name: "closure lift shape: a self tail call that assigns a capture stays return_call",
+  name:
+    "closure lift shape: a self tail call that assigns a capture stays return_call",
   ignore: !ENABLED,
   fn: async () => {
     const all = await disassemble([
@@ -277,7 +286,8 @@ const fixture = (name: string): string =>
   Deno.readTextFileSync(`${ROOT}/tests/cases/closures/${name}`);
 
 Deno.test({
-  name: "closure lift shape: lift-written-capture.vl's hosts build no cell (D3664)",
+  name:
+    "closure lift shape: lift-written-capture.vl's hosts build no cell (D3664)",
   ignore: !ENABLED,
   fn: async () => {
     const all = await disassemble(fixture("lift-written-capture.vl"));
@@ -301,7 +311,9 @@ Deno.test({
       }
     }
     if (count(bodyOf(all, "escapes"), "struct.new") === 0) {
-      throw new Error("escapes: want the shared cell its escaping closure needs");
+      throw new Error(
+        "escapes: want the shared cell its escaping closure needs",
+      );
     }
   },
 });
@@ -405,3 +417,50 @@ for (const [name, src, libs] of SPECIALISED) {
     },
   });
 }
+
+// AN EXPORTED FUNCTION READS ITS PARAMETER: the chain walk takes an exported function's parameter
+// as unknown, since a caller outside the program can hand it a value no call here shows, so the
+// field read through it stays a read of the record (`struct.get`). The call that follows dispatches
+// over the field's tag set, here `{id}`; that set is the tag layer's, not this walk's. The
+// un-exported twin is the control: its read is renamed to `id` and the record is never read.
+const READS_PARAM = (exported: boolean) =>
+  [
+    "function id<T>(x: T): T { x }",
+    `${exported ? "export " : ""}function run(f) {`,
+    "  const o = { g: f }",
+    "  return o.g(1)",
+    "}",
+    "print(run(id))",
+  ].join("\n");
+
+Deno.test({
+  name:
+    "closure lift shape: an exported function reads its parameter's field, never renames it",
+  ignore: !ENABLED,
+  fn: async () => {
+    const runOf = async (exported: boolean): Promise<string> => {
+      const fns = await disassemble(READS_PARAM(exported));
+      const hit = [...fns.keys()].find((n) =>
+        n === "run" || n.startsWith("run@")
+      );
+      if (hit === undefined) {
+        throw new Error(
+          `want a function run, got ${JSON.stringify([...fns.keys()])}`,
+        );
+      }
+      return fns.get(hit)!;
+    };
+    const ctl = await runOf(false);
+    if (count(ctl, "struct.get") !== 0) {
+      throw new Error(
+        `control: want the un-exported run's read renamed (no struct.get), got\n${ctl}`,
+      );
+    }
+    const exp = await runOf(true);
+    if (count(exp, "struct.get") === 0) {
+      throw new Error(
+        `want the exported run to read its parameter's field (struct.get), got\n${exp}`,
+      );
+    }
+  },
+});
