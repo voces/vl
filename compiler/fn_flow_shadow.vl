@@ -132,7 +132,6 @@ let pinName: string[][] = []
 let pinFn: i32[] = []
 // The call each pin is taken at, -1 for an annotation.
 let pinAt: i32[] = []
-let ffPinSkip: {[i32]: boolean} = Map()
 let dfEdgeN = 0
 
 // A context is one walk of a function body: the type bindings its type variables take. Context 0
@@ -1528,133 +1527,7 @@ export function fnFlowTableBuild(stmts: i32[]) {
   ffBuild(stmts)
 }
 
-// The one call that pins the slot `path` of `d`, open or closed, with its parameter types pushed
-// onto `tys`; -1 without a table, with no pin, with an annotation's pin, or with two calls.
-export function fnFlowDeclPathOnlyPinCall(
-  d: i32,
-  path: string[],
-  tys: i32[],
-): i32 {
-  if !ffBuilt || d < 0 { return -1 }
-  let hit = -1
-  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
-    let r = s
-    for k in path {
-      if r >= 0 { r = ffKidOf(ffFind(r), k) }
-    }
-    if r >= 0 {
-      for id in ffDirectedPins(r) {
-        if !(ffPinSkip[pinFn[id]] ?? false) {
-          if pinAt[id] < 0 { return -1 }
-          if (
-            hit >= 0
-            && (pinAt[hit] != pinAt[id] || ffPinSig(hit) != ffPinSig(id))
-          ) {
-            return -1
-          }
-          hit = id
-        }
-      }
-    }
-  }
-  if hit < 0 { return -1 }
-  for t in pinTys[hit] { tys.push(t) }
-  pinAt[hit]
-}
-
-// Whether every pin of the slot `path` of `d` is a call at one closed parameter list, pushed onto
-// `tys`; false without a table, with no pin, with an open or an annotation's pin, or with two
-// lists.
-export function fnFlowDeclPathAgreedPinTys(
-  d: i32,
-  path: string[],
-  tys: i32[],
-): boolean {
-  ffAgreedPinTys(d, path, -1, tys)
-}
-
-// `fnFlowDeclPathAgreedPinTys` leaving out the pins taken in the functions `skip`, such as the
-// other elements of a list a call reaches one element through (D13202).
-export function fnFlowDeclPathAgreedPinTysSkipping(
-  d: i32,
-  path: string[],
-  skip: i32[],
-  tys: i32[],
-): boolean {
-  ffPinSkipFns(skip)
-  const ok = ffAgreedPinTys(d, path, -1, tys)
-  ffPinSkip = Map()
-  ok
-}
-
-// Sets `ffPinSkip` to the functions `fns`, each as the walks know it.
-function ffPinSkipFns(fns: i32[]) {
-  ffPinSkip = Map()
-  for f in fns { ffPinSkip[ffOrigDecl(f)] = true }
-}
-
-// `fnFlowDeclPathAgreedPinTys` over the walks of context `cx`, every walk when it is -1.
-function ffAgreedPinTys(d: i32, path: string[], cx: i32, tys: i32[]): boolean {
-  const hit = ffAgreedPinHit(d, path, cx)
-  if hit < 0 { return false }
-  for t in pinTys[hit] { tys.push(t) }
-  true
-}
-
-// The one agreed closed pin `ffAgreedPinTys` reads; -1 when the pins do not agree, or an
-// annotation pins the slot.
-function ffAgreedPinHit(d: i32, path: string[], cx: i32): i32 {
-  if !ffBuilt || d < 0 { return -1 }
-  let hit = -1
-  const o = ffOrigDecl(d)
-  const slots = ffDeclSlots[o] ?? []
-  const ctxs = ffDeclSlotCtx[o] ?? []
-  let si = 0
-  while si < slots.length {
-    let r = slots[si]
-    if cx >= 0 && (si >= ctxs.length || ctxs[si] != cx) { r = -1 }
-    si = si + 1
-    for k in path {
-      if r >= 0 { r = ffKidOf(ffFind(r), k) }
-    }
-    if r >= 0 {
-      for id in ffDirectedPins(r) {
-        if !(ffPinSkip[pinFn[id]] ?? false) {
-          if pinAt[id] < 0 || ffPinOpen(id) { return -1 }
-          if hit >= 0 && ffPinSig(hit) != ffPinSig(id) { return -1 }
-          hit = id
-        }
-      }
-    }
-  }
-  hit
-}
-
 export const FF_PIN_DECLINE = "?"
-
-// The pins taken at every slot `s`'s value reaches along the directed edges, `s` included.
-function ffDirectedPins(s: i32): i32[] {
-  const out: i32[] = []
-  // Every edge joins one class, and every pin is its class's too: a pinless class reaches none.
-  const root = ffFind(s)
-  if root >= 0 && ufPin[root].length == 0 { return out }
-  const seen: {[i32]: boolean} = Map()
-  const work: i32[] = [s]
-  seen[s] = true
-  let i = 0
-  while i < work.length {
-    const x = work[i]
-    for id in dfPin[x] { out.push(id) }
-    for y in dfTo[x] {
-      if !(seen[y] ?? false) {
-        seen[y] = true
-        work.push(y)
-      }
-    }
-    i = i + 1
-  }
-  out
-}
 
 // Type `t` spelled as a pin: its render with each union bar written `A|B`, the spelling a
 // function type's name and an instance's parameter give the same type (D5170). A function type
@@ -1682,9 +1555,6 @@ function ffPinSpell(t: i32): string {
   }
   out + s.slice(st, s.length)
 }
-
-// Pin `id`'s parameter list spelled `p1,p2,`.
-function ffPinSig(id: i32): string { fnFlowPinSigOf(pinTys[id]) }
 
 // Parameter types `tys` spelled as a pin's parameter list, `p1,p2,`.
 export function fnFlowPinSigOf(tys: i32[]): string {
@@ -1736,14 +1606,6 @@ function ffBuild(stmts: i32[]) {
   ffLetLamFinish()
   ffBuilt = true
   0
-}
-
-// Whether pin `id` leaves a parameter type unknown or open.
-function ffPinOpen(id: i32): boolean {
-  for t in pinTys[id] {
-    if t < 0 || tyHasTyVar(t) { return true }
-  }
-  false
 }
 
 // The declaration of the variable a `for` loop `ix` binds its value to: a list's first variable, a

@@ -967,6 +967,14 @@ The "reassigned function binding" refusal (`monoBindSigFail`) is read by two of 
   - The file can go only once those 44 mono readers are deleted or rebuilt on the elaboration's flow facts. That is the pin-helper work, not the plan's deletion.
   - Deleting `fn_split.vl` does not require it.
 
+**The deletion, prepared (2026-11-05, branch `claude/fn-split-delete`, draft until the census is 0).** It deletes `fn_split.vl` and the driver's plan loop, as the call graph above predicts, with three corrections to it:
+
+- **`fsAfterParse` was not only plan plumbing.** Every compile, the plan's or not, ran `fsConstLets`: it respells an un-annotated, unexported `let` that nothing re-points as `const` when it holds a lambda, a function or a list literal of those (D6472, D13521). It and its seven helpers move to `const_lets.vl` unchanged (`constLetsAfterParse`), so 8 of the 231 functions survive the deletion.
+- **Three parser helpers die with it.** `reparseArrowLambdaAt`, `reparseChoiceExprAt` and `reparseFuncDeclAt` had no reader but the plan.
+- **Four callers of the ask hooks go whole**, since asking was all they did or answered: `splitWidenedFnRead` (check_operators), `monoAskSplitRetCopies`, `monoAskJoinBinding` and `monoCalleeListRead` (emit_mono). `emit_mono.vl` falls from 1,138 functions to 1,135.
+
+`checkSrc`'s instance-diagnostic mute reduces to "the build succeeded", the rule #6398 left once the kept-program filter went. The seed falls from 6,520,731 to 6,349,672 bytes (−2.6%).
+
 
 F's 15 files are four shapes by witness:
 
@@ -1206,7 +1214,7 @@ variable over a list is that list's element slot (`calleeSlotOf`). Then 165 of 1
 
 | entry | family | mono callers | witness (hits / files) | elaboration answers today |
 | --- | --- | --- | --- | --- |
-| `fnFlowDeclPathOnlyPinCall` | agreed, only call | monoPinOpenCallLams | `generics/hole-call-generic-lambda-arg.vl` (91 / 32) | partly: not where calls through a result fix the pin |
+| `fnFlowDeclPathOnlyPinCall` | agreed, only call | monoPinOpenCallLams | `generics/hole-call-generic-lambda-arg.vl` (91 / 32) | retired: `elabValueOnlyCall`, the forward climb's one call |
 | `fnFlowDeclPathAgreedPinTys` | agreed | monoHeldSrcsFnTy, monoHoleGenBindFnArgs | `closures/hole-fn-in-unannotated-map.vl` (2 / 2) | as above |
 | `fnFlowDeclPathAgreedPinTysSkipping` | agreed | monoElemFnPinTys | `closures/hole-fn-if-join-result-handed-hole-fn.vl` (10 / 5) | as above |
 | `fnFlowCallPathAgreedPinTys` | agreed, per call | monoPathSlotPinnedFnTy | `closures/generic-fn-in-unannotated-map.vl` (9 / 5) | the call's instance types |
@@ -1308,6 +1316,39 @@ off:
 Without the second fallback, `generics/hole-fn-arg-through-hole-callee.vl` trapped the compiler.
 The shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
 
+**The only-call fallbacks, closed** (2026-11-06). The climb's call search now goes on through a `let`
+annotated with a type parameter, through a value written into a named binding's field, into a callee
+an argument adapter wraps, and through a call whose callee is a `for` loop variable or a read a
+rewrite re-resolved past the index (`elabCalleeFns`). The second fallback had no hit left: the climb
+skips an uncovered value, and the table answers none there either. With the table compared at
+every only-call site over all 19,309 sweep programs, no site disagrees, and
+`fnFlowDeclPathOnlyPinCall` is deleted.
+
+Two routes record the calls a value reaches, and they count different sets. The only-call search
+(`elabValueOnlyCall`) records through `elabCallRec`, in the climb's callee edge, before the
+`elabNoCallParam` and `elabDlvOmit` filters. `elabCallSink` (`elabSlotOnlyCall`, and the agreed
+reader's `elabValueAgreedCallTys`) records in `elabCallDeliveryAdd`, after them. Neither query is
+answered from the slot memo. They are not unified, so a reader of one cannot assume the other's
+answer.
+
+**The agreed pin's parameter readers, switched** (2026-11-06). `monoElemFnPinTys` (skipping) and
+`monoHoleGenBindFnArgs` (lamparam) now read `elabValueAgreedCallTys(d, skip, tys)`. That is the one
+closed argument tuple across the calls the value reaches as their callee, recorded through
+`elabCallSink` (which bypasses the delivery memo), leaving out calls inside `skip`.
+`fnFlowDeclPathAgreedPinTys` and `fnFlowDeclPathAgreedPinTysSkipping` are deleted.
+
+- **Skipping site, shadowed over `tests/cases`:** 10 agree, 0 table only, 12 elaboration only,
+  29 neither, 0 differ.
+- **Lamparam site:** reached by no program in a population of 23,451. That population is
+  `tests/**`, the distilled corpus (cells and named, 11,774 files) and both inventories'
+  single-file witnesses. The control is an entry marker in `monoHoleGenBindFnArgs`: it fires once
+  (`closures/generic-returned-to-un-annotated-param-lambda.vl`), with its parameter loop run
+  twice. The zero excludes programs written inline in `tests/*.ts`, so the arm is switched, not
+  deleted.
+
+Fixpoint seeds against master `3682cc74` build all 7,538 sweep programs byte-identical with the
+split plan on and off, the 12 elaboration-only answers included. The shared-slot witness runs.
+
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax, and move out with
    the helpers they need. `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild` and
    `fnFlowShadowBegin` go with the file.
@@ -1342,9 +1383,9 @@ still exports and who reads each one. The file goes when every row is checked.
 
 | export | read by | owner | replacement |
 | --- | --- | --- | --- |
-| `fnFlowDeclPathOnlyPinCall` | `monoPinOpenCallLams` (fallback only) | cad | the forward climb's one call (`elabValueOnlyCall`), once its two fallback cases close |
-| `fnFlowDeclPathAgreedPinTys` | `monoElemFnPinTys`, `monoHoleGenBindFnArgs` | cad | the agreed pin read off member instance keys or the check's slot-call index |
-| `fnFlowDeclPathAgreedPinTysSkipping` | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
+| ~~`fnFlowDeclPathOnlyPinCall`~~ (done, #6480) | `monoPinOpenCallLams` | lane F | the forward climb's one call (`elabValueOnlyCall`) |
+| ~~`fnFlowDeclPathAgreedPinTys`~~ (done, #6479) | `monoElemFnPinTys`, `monoHoleGenBindFnArgs` | cad | the agreed pin read off member instance keys or the check's slot-call index |
+| ~~`fnFlowDeclPathAgreedPinTysSkipping`~~ (done, #6479) | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
 | ~~`fnFlowCallPathAnnPinTys`~~ (done) | `monoPathSlotPinnedFnTy` (via `monoListSlotPinnedFnTy`) | builder | `slotAnnFnTyOf`: the closed function type a parameter is annotated with, noted where a slot read is handed to it (`fnSlotAnnNote`) |
 | ~~`fnFlowDeclFn`~~ (done, #6475) | `monoDeclFrameIn`, `monoReadIsBinding` | lane F | `recEnclosingFn` |
 | `FF_PIN_DECLINE` | `monoDeclPathKeys`, `monoDeclPathKeysIn`, `monoDeclPathPinsPerInstance`, `monoSlotRetName`, `monoSlotRetCount` | builder | none needed: its readers are all mono's own, so the sentinel moves to a module mono imports |
@@ -1738,6 +1779,10 @@ pin ladder's deletion (step 2) is the other 113 KB.
 
 "↑ small" on check fuel means work moved from emit into check. The step's proof is that check plus build
 falls on diderven.
+
+Step 4's deletion half, measured on its prepared branch (§3.2, 2026-11-05): `fn_split.vl` goes
+(243 functions, 6,087 lines; 8 move to `const_lets.vl`), `emit_mono.vl` falls from 1,138 to 1,135
+functions, and the seed falls 2.6%.
 
 ### 4.3 L6 render-parse: done as a lane, the rest goes with the steps
 
