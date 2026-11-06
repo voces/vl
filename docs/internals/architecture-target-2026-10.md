@@ -1443,7 +1443,7 @@ elaboration fact that should carry the same answer: `monoWalkIdentCall`'s instan
 `monoNarrowedNominalPinName`, `monoReachListTy`, `monoCloneGenericCallArm` (D12702),
 `monoReachRecTy`, `monoCloPinAnnNodeOfExpr`, `monoMakeInstanceGo`'s instance note,
 `monoIfChainRebuild`, `monoPinBodyLambdasRaw` (D1990), `monoCloneGenericCalls` (D2849, two arms),
-`monoCloneLambdaSubst` (two arms, D943 and seven more), `monoPinLamFromCheckedTy` (D3820, D3834).
+`monoCloneLambdaSubst` (two arms, D943 and seven more), `monoPinLamFromCheckedTy` (now `monoPinLamAtDelivery`; D3820, D3834).
 
 **Shadow of `monoHoleGenFnPin`** (the signature a generic handed to a hole parameter takes), against
 `callArgRepTy` over `elabCallParamTy` at `monoPinHoleParam`: 83 programs agree, 0 disagree, and 4 get
@@ -1471,13 +1471,14 @@ showing each class at least once:
 The 448 retyped cells are not a missing fact. The elaboration knows the emitter retyped the node, so
 the open question is which pass owns the node's type. Order the passes before switching this arm.
 
-**Shadow of `monoPinLamFromCheckedTy`'s pin** (2026-11-06, same population). The lambda's
+**Shadow of `monoPinLamFromCheckedTy`'s pin** (now `monoPinLamAtDelivery`) (2026-11-06, same population). The lambda's
 contextual parameter types, read off the checker (`monoFnValueParamTys(nodeTyIxOf(lam))`), were
 compared against the one closed delivery `elabSlotDeliveries(lam, [], elabKeyAt(lam))` gives at the
 lambda's arity. 968 programs reach the function, 950 of them leave at the gate because the body calls
 no generic, and 1 takes the D9712 row spelling. Of the 22 that reach the pin, 18 agree and 4 have no
-closed tuple on either side. None differs, none is one-sided, and none has two deliveries. A switch
-is output-neutral but deletes nothing: `monoFnValueParamTys` has three other callers.
+closed tuple on either side. None differs, none is one-sided, and none has two deliveries. Switched:
+the pin reads `elabLamDeliveredParams` (emit_elab), and the function is `monoPinLamAtDelivery`. It
+deletes nothing: `monoFnValueParamTys` has three other callers.
 
 **Shadow of `monoCloneLambdaSubst`'s return pin** (`monoLamPinRetAnn`, same population). The
 elaboration's per-instance result of the lambda (`monoLamElabRet`) is asked first, and the binding's
@@ -1487,6 +1488,26 @@ mostly scalars, nullables and literal unions (`string` 61, `i32 | string | null`
 fallback is live, so the arm and its helpers (`monoSubstInst` at the result, `monoLamReachParamTy`,
 `monoRetReadsHoleParam`) stay until the elaboration types a cloned lambda's result under the instance
 key in those programs. That gap is this family's real blocker.
+
+It was not a missing fact. `monoLamElabRet` asked the elaboration only at an instance with hole
+pins. Asked at every instance, with a hole the walk keeps open read from the binding, it gives the
+fallback's pin in 376 of the 429 programs and closes nothing in the other 53. It answers 1 program
+the fallback left open (`generics/generic-value-slot-written-in-generic-body-at-two-instances.vl`)
+and closes 1 the fallback closed only by substitution (`generics/hole-lambda-calls-per-instance.vl`,
+whose `(_) => _` walk type the binding closes). It differs in none. Switched: the fallback block is
+gone, and `er` keeps its old meaning (the hole instance's own elaboration answer) for the box
+registration and the literal-member gate, so the switch is byte-neutral over all 19,316 programs.
+The helpers stay: `monoLamReachParamTy` still serves the parameter pin, and `monoRetReadsHoleParam`
+serves `monoLamTyNamesHoleValue`.
+
+**Shadow of `monoLamParamPinAnn`** (the parameter side, same population). The binding's substitution,
+else `monoLamReachParamTy` (D7181), was compared against the elaboration's walk type of the parameter,
+with a hole read from the binding. 654 programs reach the pin: 597 agree and 37 close nothing on
+either side. 53 are old-only, where the elaboration keeps the parameter open: a type variable of
+another declaration (`U`/`V`) on a lambda held in a written `let`, a capture cell or a returned
+lambda called across instances, or a hole `_`. 10 are new-only, and none differs. The parameter pin,
+and `monoLamReachParamTy` with it, waits for the elaboration to type those lambdas' parameters per
+instance.
 
 **Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), re-measured on
 2026-11-06, master `611070b80`, with `scripts/inst-shadow/run.sh` over 23,380 programs: `tests/cases`,
