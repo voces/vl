@@ -43,6 +43,7 @@ import {
   elabSlotUncalled,
   elabValueAgreedCallTys,
   elabValueOnlyCall,
+  elabValueReturnsFrom,
   elabWalkKeyOf,
   elabWalkTop,
 } from "./emit_elab"
@@ -5526,6 +5527,34 @@ let monoPinSink = false
 // The names the instance body reads anywhere but as such a sink, set before its walk.
 let monoPinUnsafeNames: {[string]: boolean} = Map()
 
+// Notes in `monoPinReachNames` each `let` of template function `td` whose value reaches one of its
+// returns (`elabValueReturnsFrom`).
+function monoPinNoteReach(td: i32) {
+  const tn = if td >= 0 && td < P.nodes.length { nodeAt(td) } else { null }
+  if tn is FuncDecl { monoPinNoteReachLets(tn.fnBody, td) }
+  0
+}
+
+function monoPinNoteReachLets(ix: i32, td: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is FuncDecl { return 0 }
+  if n is LetDecl && elabValueReturnsFrom(ix, td) {
+    monoPinReachNames[n.letName] = true
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      monoPinNoteReachLets(kids[i], td)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
 // Whether a name in `monoPinReachNames` is declared more than once under `body`.
 function monoPinReachShadowed(body: i32): boolean {
   const seen: {[string]: i32} = Map()
@@ -5556,88 +5585,12 @@ function monoPinCountDecls(ix: i32, seen: {[string]: i32}): i32 {
   dup
 }
 
-// The bindings whose value reaches the instance's return: a name the body returns, and a name
-// such a binding is initialized from. Only these can put a join's rep into the return box.
+// The names of the template's bindings whose value reaches its return. Only these can put a
+// join's rep into the return box.
 let monoPinReachNames: {[string]: boolean} = Map()
 
 // Whether the binding whose initializer the per-instance walk is in reaches the return.
 let monoPinLetReaches = false
-
-function monoPinNoteReach(body: i32) {
-  const b = nodeAt(body)
-  if b is Block {
-    if b.blkStmts.length > 0 {
-      monoPinNoteReachExpr(b.blkStmts[b.blkStmts.length - 1])
-    }
-  }
-  monoPinNoteReturns(body)
-  // Follow initializers that are bare names until a round adds none; each adds a name.
-  let grew = true
-  while grew { grew = monoPinReachStep(body) }
-  0
-}
-
-// Records a bare name `ix` hands out as reaching the return.
-function monoPinNoteReachExpr(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const u = unwrapParen(ix)
-  if u < 0 || u >= P.nodes.length { return 0 }
-  const n = nodeAt(u)
-  if n is Ident { monoPinReachNames[n.identName] = true }
-  0
-}
-
-// Records the operand of every `return` under `ix` outside a nested function.
-function monoPinNoteReturns(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = nodeAt(ix)
-  if n is FuncDecl { return 0 }
-  if n is RetStmt { return monoPinNoteReachExpr(n.retArg) }
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      monoPinNoteReturns(kids[i])
-      i = i + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  0
-}
-
-// One pass adding the name a reaching binding is initialized from; whether it added any.
-function monoPinReachStep(ix: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = nodeAt(ix)
-  if n is FuncDecl { return false }
-  let grew = false
-  if n is LetDecl {
-    if (monoPinReachNames.get(n.letName) ?? false) && n.letInit >= 0 {
-      const u = unwrapParen(n.letInit)
-      if u >= 0 && u < P.nodes.length {
-        const iu = nodeAt(u)
-        if iu is Ident {
-          if !(monoPinReachNames.get(iu.identName) ?? false) {
-            monoPinReachNames[iu.identName] = true
-            grew = true
-          }
-        }
-      }
-    }
-  }
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      if monoPinReachStep(kids[i]) { grew = true }
-      i = i + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  grew
-}
 
 // Whether the instance being walked returns an annotated union box, so a binding its body
 // returns by name is delivered as that union too (D2912).
@@ -10452,7 +10405,7 @@ function monoMakeInstanceBodyPinned(
       && !tyBearsNull(nrb)
   }
   monoPinReachNames = Map()
-  monoPinNoteReach(instBody0)
+  monoPinNoteReach(monoOrigNode[origFe])
   if monoPinReachShadowed(instBody0) {
     monoPinRetBox = false
     monoPinReachNames = Map()

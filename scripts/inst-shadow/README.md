@@ -1,11 +1,12 @@
 # inst-shadow: mono's instance choice against the elaboration's
 
-`run.sh` measures how far `monoWalkIdentCall`'s instance of a generic call is from the answer
-the elaboration already holds. For each call it compares the parameter types of the instance the
-call made or hit (`monoInstParamPinTys`) with `callArgRepTy(ix, i, elabCallParamTy(ix, i))`.
-This is the instrument the switch to the elaboration's answer is graded with
-(architecture-target-2026-10.md §3.4): the switch lands once it reports no `REAL` tag, and every
-`no:` bucket left is a named fallback.
+`run.sh` measures how far mono's instance of a call is from the answer the elaboration already
+holds, at every call `monoInstantiateCallIn` instances. For each call it compares the parameter
+types of the instance the call made or hit (`monoInstParamPinTys`) with
+`callArgRepTy(ix, i, elabCallParamTy(ix, i))`. A call that `monoWalkIdentCall` did not hand on is
+marked `*` after its line number. This is the instrument the instance choice is graded with
+(architecture-target-2026-10.md §3.4): the order of elaboration sources mono reads, then the named
+fallback tail, then a loud refusal no corpus program reaches.
 
 ```sh
 scripts/inst-shadow/run.sh [--seed S] [--jobs N] [--out F] [FILE...]
@@ -15,7 +16,7 @@ scripts/inst-shadow/run.sh [--seed S] [--jobs N] [--out F] [FILE...]
 tree. Each line the probe prints reaches stdout through `$VL_LATE_DEMANDS`, so the probe adds no
 host import. When the patch stops applying, re-anchor it on the five sites it names:
 - the `monoInstantiate` call in `monoWalkIdentCall`;
-- the `monoMakeInstance` call in `monoInstantiateCallIn`;
+- the `monoMakeInstance` call in `monoInstantiateCallIn`, and its `return made`;
 - the registry hit and register in `monoMakeInstanceHit` and `monoMakeInstanceRegister`;
 - `elabLateCount` in `emit_elab.vl`.
 
@@ -49,7 +50,7 @@ When the walk-top instance gives no closed type, the tag is `<why>:xyz`. `<why>`
 | `nokey-nonident` | no key, and the callee is not an identifier |
 | `nokey-emptylist` | no key, and the argument is an empty list |
 
-`xyz…` grades eight other elaboration sources against mono's pin, one letter each, in this order:
+`xyz…` grades ten other elaboration sources against mono's pin, one letter each, in this order:
 1. the instances the parameter itself carries (`elabCallParamTyOwn`);
 2. the argument's own type (`elabNodeTyAgreed`);
 3. the bundle signatures (`elabCallBundleSigs`), several compared as mono's bundle record;
@@ -57,7 +58,9 @@ When the walk-top instance gives no closed type, the tag is `<why>:xyz`. `<why>`
 5. the parameter's type with the shadow aliases a rename minted (`T__sh<d>`) bound as their names;
 6. the parameter's open type, when mono's pin spells it the same;
 7. the one signature the callee calls the parameter at, which `elabCallBundleSigs` drops as no bundle;
-8. the checker's closed type for the callee's parameter, as a solved hole leaves it.
+8. the checker's closed type for the callee's parameter, as a solved hole leaves it;
+9. the parameter in the instance the walk top ran the call at through a function value (`elabValCallInst`);
+10. the parameter's closed type in every instance any frame reaches the call at, when they agree.
 
 Each letter is `a` when that source agrees with mono, `d` when it disagrees and `n` when it gives
 nothing. A non-generic callee whose annotated row does not match reads `no:argrep-dis`.

@@ -7,7 +7,8 @@
 # compiler with --seed (default build/vl-compiler.wasm), builds each FILE with it (default:
 # tests/cases and the distilled corpus) and prints the class table. --out keeps the raw lines.
 #
-# One line per call `monoWalkIdentCall` instances, one tag per parameter (README.md):
+# One line per call `monoInstantiateCallIn` instances (`*` after the line when another caller
+# than `monoWalkIdentCall` handed it on), one tag per parameter (README.md):
 #   ok repeq litrep nulfn bundle monoopenrec colstub annrow argrep   the two sides agree
 #   REAL[...]                     they disagree; the line names both
 #   <why>:xyz, no:argrep-dis      the walk top has no closed type, and what else answers
