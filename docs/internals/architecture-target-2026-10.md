@@ -1733,10 +1733,21 @@ pins it splits them:
 | G5, a set nothing calls through | 5 | 4 | never tried: the closure rep by design | the rep cascade's default |
 
 G5 is a default, like bucket 2, not a missing fact. G1 closed with D15490 (S1), which leaves 42
-parameters in 18 programs. `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and
-`monoChoiceArmFlowTy`) pinned 33 parameters on master: G1's 7, and 26 whose instance already
-agrees with the elaboration's. It is the next deletion, graded by a three-outcome shadow at the
-function.
+parameters in 18 programs. S2 (D15491) tags a list whose helper pushes one of its own elements back
+onto it, by a hole parameter or by `T` beside `T[]`, and S2b the method spellings `v.insert(0, v[1])`
+and `v.fill(v[1])`, whose receiver is the declared callee's first parameter. `monoPinnedListElemPin`
+answered 5 calls in the whole population: S2 and S2b move 4 onto the tagged set, and the fifth, an
+annotated function slot, reads the elaboration's closed type for the parameter. The function is
+deleted. Its price is one late demand per tagged `T[]` call (five in three files): mono pins the
+`T[]` at the list of ids, a spelling no elaboration key uses, so the instance is minted after the
+run. Foreseeing it means keying `T[]` at the id list's rep.
+
+`monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
+parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
+not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
+elaboration's parameter type was measured at the function after S1: 35 calls agree, 1 is old-only,
+about 600 are new-only and 22,518 decline on both sides. The byte sweep moves 4 files, one of them
+`runs` to a refusal, the same three #6485 found and one more.
 - **A type parameter the call leaves unbound or ambiguous** (62 `nokey-gen` and 10
   `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
   `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
@@ -2075,6 +2086,36 @@ rewritten calls (`mfrSetCalls`) are omitted:
 
 Whoever retires `monoFlowReadSet` needs two facts that do not exist yet: `fnSlotCalled` keyed by the
 call node, and the handed reads.
+
+**The `monoFlow*` read rewrite, first reading** (2026-11-06). The rewrite (`monoFlowReads`) runs once,
+before the walk. `monoFlowReadSet` re-points a read of a list element, a record field or a written
+`let` at the one generic it holds, so each read takes its own instance. Every elaboration fact sees
+the reads before that rewrite. `compiler/mfr_shadow.vl` asks, before each rewrite, which function
+the elaboration says the read holds:
+- the element a literal index of a module-scope `const` list names (`constListFnElemDecl`);
+- else the read slot's value-flow set (`elabSlotFlowFns`), new here;
+- else what its call's callee can be (`elabCalleeFns`).
+
+`elabSlotFlowFns` is `elabSlotHeldFns` with one-way spreads. A list holds what the lists it spreads
+hold, but not what is written into a list that spreads it. Without that, `xs.push(id); ys = [...xs];
+ys[0] = inc` reads `xs[0]` as `id` or `inc`. `elabSlotHeldFns` keeps its two-way union, which is
+what a shared element rep needs. Over the 23,456 programs:
+
+| outcome | site-hits | files |
+|---|---|---|
+| agree | 351 | 129 |
+| the elaboration names several | 10 | 5 |
+| the elaboration names none | 26 | 18 |
+| differ | 0 | 0 |
+
+What is left before the planner reads the elaboration:
+- several: a list parameter's element read per call site, and nested lists. These need an
+  instance-keyed held set.
+- none, 10: a record literal stored in a map value and read back by field (`s.set("k", {f: id});
+  s.get("k").f(..)`). The write index does not follow a stored literal to its field.
+- none, 4: nested field paths.
+- none, 12: nodes minted after `elabRun`, which wait on the same source mapping as the instance
+  ladder's tail.
 
 #### Next stage, first item: a per-call delivered-rep fact
 
