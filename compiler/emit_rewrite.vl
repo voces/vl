@@ -243,6 +243,7 @@ import { assignTags, registerInlineUnionOfTy } from "./emit_collect"
 import {
   bodyRebuiltFrom,
   cboxCellDecls,
+  cboxCellLits,
   cboxDeclKey,
   cboxReadTy,
   cboxStoreCells,
@@ -255,6 +256,7 @@ import {
   fnStmts,
   fnValUsed,
   gSharedMemPages,
+  lvExitLoops,
   sIsRefRow,
   sNames,
   startStmts,
@@ -303,6 +305,7 @@ import {
   identFrom,
   identFromDecl,
   identRedirect,
+  lvCarrierNote,
   memberDeclOf,
   memberMethodOf,
   nodeSrc,
@@ -369,6 +372,7 @@ export function deadTailDrop() {
 // list, where the statement walks collect its locals. An explicit stack, for deep chains.
 export function loopValueRewrite(rootIx: i32) {
   exitArmsEndNever()
+  lvExitLoops = Map()
   if !loopValAny() { return 0 }
   const todo: i32[] = [rootIx]
   const todoStmt: boolean[] = [true]
@@ -484,6 +488,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
   const body = lvBodyOf(x)
   // A choice among functions of an open signature carries the index of the one chosen.
   const fns = lvOpenFnChoice(x, ty)
+  lvNoteExits(x, body, label)
   let cty = ty
   if fns.length > 0 { cty = TY_I32 }
   // The loop moves to a fresh node, and the if-expression takes its place.
@@ -507,6 +512,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
       const sr = lvOpenFnSeedRead(x, ty)
       if sr >= 0 { init = drwRecvClone(sr) }
       seeded = init >= 0
+      if seeded { lvExitLoops[init] = x }
     }
   }
   // A spelling naming a type parameter is resolved from its name, as each instance's own is.
@@ -523,6 +529,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
   // choice among functions stores.
   const decl = mkLet("let", name, tr, init, pos)
   nodeTyRecord(decl, cty)
+  if fns.length == 0 { lvCarrierNote(decl, x) }
   if loop is WhileStmt {
     if !nullable { loop.whileLv = decl }
     if loop.whileBlk == 1 {
@@ -547,6 +554,17 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
   const thenB = mkBlock(thenSt, pos)
   lvIfAt(x, thenB, ty, atStmt)
   y
+}
+
+// Notes each value the loop at `x` hands out, under `lvExitLoops`.
+function lvNoteExits(x: i32, body: i32, label: string) {
+  const vals: i32[] = []
+  lvRewriteBreaks(body, label, "", -1, -1, 0, false, vals)
+  const n = nodeAt(x)
+  if n is WhileStmt && n.whileBlk == 1 { vals.push(loopValTailOf(x)) }
+  for v in vals {
+    if v >= 0 { lvExitLoops[unwrapParen(v)] = x }
+  }
 }
 
 // Each exit value `lvOpenFnChoice` moved into the choice, to the index `lvAssign` stores instead.
@@ -4229,6 +4247,7 @@ function cboxBoxLet(ix: i32, key: i32) {
   const els: i32[] = []
   els.push(n.letInit)
   n.letInit = mkArrayLit(els, -1)
+  cboxCellLits[n.letInit] = ix
   nodeTyRecord(n.letInit, cboxCellTy[key] ?? -1)
   // The binding holds the cell now, so its own type is the cell's.
   if (cboxCellTy[key] ?? -1) >= 0 { nodeTyRecord(ix, cboxCellTy[key] ?? -1) }
@@ -4279,6 +4298,7 @@ function cboxVecBoxLet(ix: i32, n: LetDecl, key: i32): boolean {
   const els: i32[] = []
   els.push(n.letInit)
   n.letInit = mkArrayLit(els, -1)
+  cboxCellLits[n.letInit] = ix
   nodeTyRecord(n.letInit, cellTy)
   true
 }
@@ -4789,6 +4809,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
   cboxAssignedMemo = Map()
   cboxCellDecls = Map()
   cboxWriteCells = Map()
+  cboxCellLits = Map()
   cboxReadTy = Map()
   cboxStoreCells = Map()
   cboxRenamedRows = Map()
