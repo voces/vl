@@ -1326,6 +1326,29 @@ instance key (`monoMakeInstance`'s `cbFnNames`, suffix `@name,`) skips a callee 
 written binding (`viaWritten`). The non-generic specialization (key `C<fe>@name`) has its own
 assignment check (`monoReadIsAssigned`). Those gates move into the one predicate before the switch.
 
+#### The call half and the value half (2026-11-06)
+
+**A function delivered as a value has all its instances in the value half; a function only ever
+called by name has all its instances in the call half** (coordinator ruling, 2026-11-06). The
+predicate is `elabDeclIsValue`: some read of the name is not a call's callee. Under it no function
+has instances keyed two ways. Splitting one function's instances across the halves (the written
+binding a value is copied through, which one instance has to serve) was the one source of output
+movers that keying by rep could not close.
+
+- **The call half** keys an instance made for a call by the elaboration's call-time key
+  (`elabWalkKeyOf`) plus the rep and tagged set each parameter is pinned at, the enclosing call
+  frame and the callback specialization (`instKeyCanon`). The body is still elaborated at mono's
+  demanded key, which is rep-consistent. Measured over `tests/cases` with fixpoint seeds: 8,450 of
+  11,271 call-made instances, 76 programs' bytes move and 0 programs' outputs.
+- **The value half** keeps mono's key (`monoElabSplitKey`) and `elabDemand` until the slot-delivery
+  reader (`elabSlotDeliveries`, `elabSlotSetCalls`) answers every delivery: 2,821 instances of 1,669
+  functions. Its typed-slot rule is `elabMemberKeyAt(decl, T)` with `T` the type the checker
+  recorded for the slot, never mono's pins. A lambda inherits its enclosing instance's key; an index
+  by (enclosing key, lambda declaration) is measured after the switch.
+
+`emit_mono.vl`'s function count is flat at this step: `monoElabSplitKey` still serves the value
+half, and its deletion is what the value half's switch earns.
+
 ## 4. Scoreboard
 
 The scoreboard reports side effects of the migration; it is not a landing criterion (§3).
