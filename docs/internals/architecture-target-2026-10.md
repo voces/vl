@@ -1206,7 +1206,7 @@ variable over a list is that list's element slot (`calleeSlotOf`). Then 165 of 1
 
 | entry | family | mono callers | witness (hits / files) | elaboration answers today |
 | --- | --- | --- | --- | --- |
-| `fnFlowDeclPathOnlyPinCall` | agreed, only call | monoPinOpenCallLams | `generics/hole-call-generic-lambda-arg.vl` (91 / 32) | partly: not where calls through a result fix the pin |
+| `fnFlowDeclPathOnlyPinCall` | agreed, only call | monoPinOpenCallLams | `generics/hole-call-generic-lambda-arg.vl` (91 / 32) | retired: `elabValueOnlyCall`, the forward climb's one call |
 | `fnFlowDeclPathAgreedPinTys` | agreed | monoHeldSrcsFnTy, monoHoleGenBindFnArgs | `closures/hole-fn-in-unannotated-map.vl` (2 / 2) | as above |
 | `fnFlowDeclPathAgreedPinTysSkipping` | agreed | monoElemFnPinTys | `closures/hole-fn-if-join-result-handed-hole-fn.vl` (10 / 5) | as above |
 | `fnFlowCallPathAgreedPinTys` | agreed, per call | monoPathSlotPinnedFnTy | `closures/generic-fn-in-unannotated-map.vl` (9 / 5) | the call's instance types |
@@ -1308,6 +1308,21 @@ off:
 Without the second fallback, `generics/hole-fn-arg-through-hole-callee.vl` trapped the compiler.
 The shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
 
+**The only-call fallbacks, closed** (2026-11-06). The climb's call search now goes on through a `let`
+annotated with a type parameter, through a value written into a named binding's field, into a callee
+an argument adapter wraps, and through a call whose callee is a `for` loop variable or a read a
+rewrite re-resolved past the index (`elabCalleeFns`). The second fallback had no hit left: the climb
+skips an uncovered value, and the table answers none there either. With the table compared at
+every only-call site over all 19,309 sweep programs, no site disagrees, and
+`fnFlowDeclPathOnlyPinCall` is deleted.
+
+Two routes record the calls a value reaches, and they count different sets. The only-call search
+(`elabValueOnlyCall`) records through `elabCallRec`, in the climb's callee edge, before the
+`elabNoCallParam` and `elabDlvOmit` filters. `elabCallSink` (`elabSlotOnlyCall`, and the agreed
+reader's `elabValueAgreedCallTys`) records in `elabCallDeliveryAdd`, after them. Neither query is
+answered from the slot memo. They are not unified, so a reader of one cannot assume the other's
+answer.
+
 **The agreed pin's parameter readers, switched** (2026-11-06). `monoElemFnPinTys` (skipping) and
 `monoHoleGenBindFnArgs` (lamparam) now read `elabValueAgreedCallTys(d, skip, tys)`. That is the one
 closed argument tuple across the calls the value reaches as their callee, recorded through
@@ -1360,9 +1375,9 @@ still exports and who reads each one. The file goes when every row is checked.
 
 | export | read by | owner | replacement |
 | --- | --- | --- | --- |
-| `fnFlowDeclPathOnlyPinCall` | `monoPinOpenCallLams` (fallback only) | cad | the forward climb's one call (`elabValueOnlyCall`), once its two fallback cases close |
-| ~~`fnFlowDeclPathAgreedPinTys`~~ (done, this PR) | `monoElemFnPinTys`, `monoHoleGenBindFnArgs` | cad | the agreed pin read off member instance keys or the check's slot-call index |
-| ~~`fnFlowDeclPathAgreedPinTysSkipping`~~ (done, this PR) | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
+| ~~`fnFlowDeclPathOnlyPinCall`~~ (done, #6480) | `monoPinOpenCallLams` | lane F | the forward climb's one call (`elabValueOnlyCall`) |
+| ~~`fnFlowDeclPathAgreedPinTys`~~ (done, #6479) | `monoElemFnPinTys`, `monoHoleGenBindFnArgs` | cad | the agreed pin read off member instance keys or the check's slot-call index |
+| ~~`fnFlowDeclPathAgreedPinTysSkipping`~~ (done, #6479) | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
 | `fnFlowCallPathAnnPinTys` | `monoPathSlotPinnedFnTy` (via `monoListSlotPinnedFnTy`) | builder | an annotated destination's parameters for a list element handed on to it; witness above |
 | ~~`fnFlowDeclFn`~~ (done, #6475) | `monoDeclFrameIn`, `monoReadIsBinding` | lane F | `recEnclosingFn` |
 | `FF_PIN_DECLINE` | `monoDeclPathKeys`, `monoDeclPathKeysIn`, `monoDeclPathPinsPerInstance`, `monoSlotRetName`, `monoSlotRetCount` | builder | none needed: its readers are all mono's own, so the sentinel moves to a module mono imports |
