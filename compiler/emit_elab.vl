@@ -2272,8 +2272,15 @@ function elabLamBundleInst(d: i32, pTys: i32[]): i32 {
   -1
 }
 
+// The bundle record of `sigs`: the anonymous record whose field `c<k>` holds a closure at the `k`th.
+export function bundleRecordTyOf(sigs: i32[]): i32 {
+  const names: string[] = []
+  for _s in sigs { names.push("c" + i32ToStr(names.length)) }
+  mkObjTy(names, sigs)
+}
+
 // Whether `pin` is the record whose field `c<j>` is the `j`th of `sigs`.
-function elabPinIsBundleOf(pin: i32, sigs: i32[]): boolean {
+export function elabPinIsBundleOf(pin: i32, sigs: i32[]): boolean {
   if pin < 0 || pin >= T.tys.length { return false }
   const o = tyAt(pin)
   if !(o is TyObj) || o.objFieldNames.length != sigs.length { return false }
@@ -8610,15 +8617,51 @@ export function elabArgBuiltRep(a: i32, from: i32): i32 {
 // else the wider record the call builds it as (`callArgRepTy`); -1 where the rep is the type.
 function elabArgRepFrom(ix: i32, i: i32, from: i32): i32 {
   const sigs = elabCallBundleSigsFrom(ix, i, from)
-  if sigs.length >= 2 {
-    const names: string[] = []
-    for _s in sigs { names.push("c" + i32ToStr(names.length)) }
-    return mkObjTy(names, sigs)
-  }
+  // A lambda that calls its own parameter at two or more signatures is one closure taking their
+  // bundle, whatever signatures the callee calls it at.
+  const cb = elabCloBundleRep(ix, i, from)
+  if cb != 0 - 2 { return cb }
+  if sigs.length >= 2 { return bundleRecordTyOf(sigs) }
   const pt = elabCallParamTyFrom(ix, i, from)
   if pt < 0 { return -1 }
   const rt = callArgRepTy(ix, i, pt)
   if rt == pt { -1 } else { rt }
+}
+
+// The closure call `ix`'s argument `i`, reached from instance `from`, is delivered at where the
+// parameter's one function is a lambda calling its own parameter at two or more signatures: taking
+// the record of one closure per signature, returning that lambda's result. -1 where that closure has
+// no closed type, -2 where the parameter holds no such lambda.
+function elabCloBundleRep(ix: i32, i: i32, from: i32): i32 {
+  const k = elabCallInstFrom(ix, from)
+  if k < 0 { return 0 - 2 }
+  const cd = nodeAt(ekDecl[k])
+  if !(cd is FuncDecl) || i >= cd.fnParams.length { return 0 - 2 }
+  const ds = elabFnSetOf(
+    substTyDeep(nodeTyIxOf(cd.fnParams[i]), ekNames[k], ekTys[k]),
+  )
+  // The callee only calls the parameter, each time handing it one named generic function.
+  if (
+    ds.length != 1
+    || elabParamReadOtherThanCalled(cd.fnBody, cd.fnParams[i], true, false, false)
+    || !elabCallsHandGenerics(cd.fnBody, cd.fnParams[i])
+  ) {
+    return 0 - 2
+  }
+  const dn = nodeAt(ds[0])
+  if !(dn is FuncDecl) || dn.fnName != "" || dn.fnParams.length != 1 {
+    return 0 - 2
+  }
+  const inst: i32[] = [0 - 1]
+  const lsigs = elabLamParamSigs(ds[0], 0, inst)
+  if lsigs.length < 2 { return 0 - 2 }
+  const ret = elabRetOf(inst[0])
+  if ret < 0 || tyHasTyVar(ret) { return -1 }
+  for sg in lsigs {
+    if tyHasTyVar(sg) || !(tyAt(sg) is TyFunc) { return -1 }
+  }
+  const ps: i32[] = [bundleRecordTyOf(lsigs)]
+  mkFuncTy(ps, ret)
 }
 
 // How many argument slots the reach rows record a built record at (`erArgBuilt`); read by
@@ -8631,8 +8674,54 @@ export function elabArgBuiltProbe(): i32 {
   n
 }
 
+// Whether every call through parameter `par` under node `x` hands one argument, a read naming a
+// generic function.
+function elabCallsHandGenerics(x: i32, par: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return true }
+  const n = nodeAt(x)
+  if n is Call {
+    const cf = parenPeelIx(n.callFn)
+    if cf >= 0 && nodeAt(cf) is Ident && identDeclOf(cf) == par {
+      if n.callArgs.length != 1 { return false }
+      const a = parenPeelIx(n.callArgs[0])
+      const g = if a >= 0 && nodeAt(a) is Ident { identFnDeclOf(a) } else { -1 }
+      if g < 0 || !monoIsGenericDecl(g) { return false }
+    }
+  }
+  for k in nodeChildren(x) {
+    if !elabCallsHandGenerics(k, par) { return false }
+  }
+  true
+}
+
+// The reach rows' bundle-family slots: closures taking a bundle in the thousands, bundle records in
+// the units; read by `tests/vl_elab_arg_rep_test.ts`.
+export function elabArgBundleKindProbe(): i32 {
+  let clos = 0
+  let recs = 0
+  for rep in erArgRep {
+    if elabRepIsFunc(rep) { clos = clos + 1 }
+    const fs = elabRecFieldTys(rep)
+    if fs.length >= 2 && elabPinIsBundleOf(rep, fs) { recs = recs + 1 }
+  }
+  clos * 1000 + recs
+}
+
+// Whether `rep` is a function type.
+function elabRepIsFunc(rep: i32): boolean {
+  const t = if rep >= 0 && rep < T.tys.length { tyAt(rep) } else { null }
+  t is TyFunc
+}
+
+// The field types of record `rep`, in order; none where it is no record.
+function elabRecFieldTys(rep: i32): i32[] {
+  const none: i32[] = []
+  const t = if rep >= 0 && rep < T.tys.length { tyAt(rep) } else { null }
+  if t is TyObj { t.objFieldTypes } else { none }
+}
+
 // Grades every reach row against the rule that a rep differs from its parameter's type only as a
-// bundle's record or a wider record: bundles in the thousands, wider records in the units, and each
+// bundle's record (or a closure taking one) or a wider record: bundles in the thousands, wider records in the units, and each
 // slot breaking the rule a million; read by `tests/vl_elab_arg_rep_test.ts`.
 export function elabArgRepProbe(): i32 {
   let bundles = 0
