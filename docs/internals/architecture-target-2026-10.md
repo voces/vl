@@ -670,7 +670,7 @@ The order: checker rows for value-of-generic deliveries, one slice per kind; the
 - 11: a set row that took the stub rep inside a container (`{[string]: Fn#}` handed to `f(mm)` that only reads `mm.length`) takes the rep of its hole-function members' default instances, their parameter holes at `i32` (D4551), as mono builds it; a bare set value stays the stub, built as no body.
 - 10 (#5256, the mono-keying lane): a list argument whose pin names another record's row of the same layout takes the argument's own type (`monoPinRowNamesOtherTy` peels list layers), so `take([...src])` is keyed at `{f: {v: i32}}[]`, not `J[]`.
 
-- 1 (#5383): two calls of one declaration that the checker typed apart, each built at the same wider record (D14532's rep row), are one instance at that rep, which `elabRepRowInstances` enqueues; only the `@emit-error` fixture `closures/listed-hole-fn-escaping-list-reject.vl` is still late.
+- 1 (#5383): two calls of one declaration that the checker typed apart, each built at the same wider record (D14532's rep row), are one instance at that rep, which `elabRepRowInstances` enqueues; only the `@emit-error` fixture `closures/listed-hole-fn-escaping-list.vl` is still late.
 
 A producer inside `elabRun` decides without minting types. `substTyDeep` interns the types it builds, and calling it there, even with the result unused, changed later checking: D14426's and D14532's fixtures became type errors. Compare the rows' types (`tySame`) instead.
 
@@ -1925,6 +1925,27 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
 - [x] **instance result** (10): ~~`monoRetRecordOf` 8,023~~, ~~`monoRetRepOf` 7,745~~, ~~`monoPinCallRecord` 6,765~~, ~~`monoPinInPlaceCallRecord` 6,763~~, ~~`monoReturnedBundlePin` 6,538~~, `monoPinnedRetAnnTy` 505 (switched, #6511), ~~`monoCallInstRetTy` 205~~, ~~`monoRetConstRecord` 66~~, ~~`monoInstRetLitTy` 34~~, ~~`monoInstAnnRetTy` 26~~. #6498 deleted the record-pin four, #6511 the instance-literal pair, and the delivered-rep fact the rest (below).
 - [ ] **walk type** (33): `monoExprRebuild` 7,470, `monoPinRetype` 7,368, `monoPinnedTyOf` 6,521, `monoElseRemainderAt` 6,167, `monoPinFnValueTy` 4,955, `monoPinRecvName` 3,289, `monoPinRecvLit` 3,162, `monoPinCoalJoin` 2,708, `monoIfChainRebuildPinned` 2,654, ~~`monoIfArmsAllTy` 2,641~~, ~~`monoHoleJoinPinsString` 2,368~~, `monoPinMemberCall` 1,241, `monoLamPinRetAnn` 1,112, `monoNumUnionOpPin` 788, `monoPinCoalListDefault` 781, `monoHoleNodeTy` 686, ~~`monoArmTailIsTy` 643~~, `monoLamCallTy` 522, `monoHoleCoalUnion` 321, `monoHoleTy` 252, `monoNumOperandPinTy` 241, `monoPinArmSubst` 124, ~~`monoIfArmsPinJoin` 86~~, `monoChainPinnedTys` 74, `monoHoleJoinDropsArm` 72, `monoTpJoinObjTy` 54, `monoSubstIsExpr` 53, `monoHoleBindingOf` 24, ~~`monoHoleJoinPinTy` 11~~, `monoArmPinnedTy` 5, ~~`monoHoleJoinHasAtomArm` 1~~, `monoNumUnionCompoundPin` 1, ~~`monoArmPinsLitUnion` 0~~.
+  The hub is `monoPinnedTyOf`: the recorded type substituted at the binding, which most of the
+  family reads. Shadowed against the elaboration's closed type at the instance (`elabWalkNarrowedTy`,
+  else `elabWalkTy`) over 23,384 programs, 6,163 reaching a node whose recorded type names a
+  variable (per program, answer and node kind): agree 4,487, differ 58, mono only 151, elaboration
+  only 6,855, neither 1,413. Graded by output: taking the elaboration's answer in every differ cell
+  leaves 45 of 46 programs printing the same, and the one that moves is
+  `generics/filled-string-literal-typed-by-literal-union-destination.vl`, where mono's `i32[]` for a
+  `(1 | 2 | 7)[]` list works around [D3540](inventory/D3540.md) (a numeric literal union is its base
+  only in a field slot, D611). Switched: where mono's pin closes, the elaboration answers, except
+  that list. Against a master fixpoint over 19,316 programs, 2 byte movers
+  (`closures/hole-fn-generic-map-handed-two-maps.vl`,
+  `functions/hole-param-lambda-open-map-result-pinned-by-callee.vl`), both printing master's output.
+  The mono-only cells stay with the lambda-sig family: dropping mono's answer there leaves 53 of 59
+  programs printing the same, and the other 6 already refuse and change only their message
+  (`closures/listed-hole-fn-written-param-reject.vl`, `closures/listed-hole-fn-escaping-list-reject.vl`,
+  D15010, D15011, D15483, D1666). The elaboration-only cells are mono's decision not to retype.
+  The rebuild helpers (`monoExprRebuild`, `monoPinRetype`, `monoPinFnValueTy`, `monoPinRecvName`,
+  `monoPinRecvLit`, `monoPinCoalJoin`, `monoPinCoalListDefault`, `monoTpJoinObjTy`,
+  `monoIfChainRebuildPinned`, `monoNumUnionOpPin`, `monoNumUnionCompoundPin`, `monoPinMemberCall`,
+  `monoSubstIsExpr`, `monoHoleCoalUnion`) remake syntax and consume a type: class (c) once their
+  type reads the elaboration, which through the hub it now does where the pin closes.
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
   The type an uncalled slot holds its functions at is the elaboration's (`elabUncalledSlotTy`,
@@ -2223,6 +2244,27 @@ programs that a decline there turned into loud refusals run
 Any other node minted after `elabRun` still keeps the walkers' choice.
 One program's bytes move with the same output: `closures/hole-fn-list-reached-through-alias-called-in-callback.vl`,
 where the elaboration names several generics and the read is no longer rewritten.
+
+**B1: the chain gate admits callee reads** (2026-11-06). `monoFlowAdmitChain` asks
+`mfrChainFns` of every call's callee read: one walk down the read's value chain, gated at every
+link. A written binding holds every value written to it; a slot holds every value stored there
+(`cwSlotWrittenValues`, through a callee's parameter too); `??` holds both sides; a parameter
+holds every call's argument. A literal index needs the literal unwritten after its build and the
+index inside it, so a read past the end still traps. A lambda leaf, a parenthesised name (the emitter does not
+instance one taken as a value: [D4120](inventory/D4120.md)), an
+annotation, a parameter default, or any unknown link declines. The read's ROOT must be a `let` or `const`: a read rooted at
+a parameter keeps its argument built as closures at the call, and renaming it lost 8 runs and
+moved 2 outputs (`closures/hole-fn-{bound-list-returned-from-hole-param, flat-list-called-at-one-type,
+flat-list-called-at-one-type-tagged, list-handed-to-hole-param-tagged,
+list-literal-results-differ-handed-to-param-runs, list-returned-index-call-at-two-types,
+list-returned-reread, nested-list-handed-open, nested-list-length-read-tagged}.vl`,
+`closures/mixed-result-fn-list-literal-handed-to-hole-param-runs.vl`). The target is a generic or
+un-annotated-parameter function at module scope whose name nothing else declares. A written
+binding takes every value written to it rather than the value at the read; reaching writes are
+deferred until a census shows a walker-rewritten read this declines. `monoFlowDirectSet` is
+deleted. `monoFlowLetCalls` (its `LetLeaf`) and `monoFlowConstCallArgs` stay: they rename
+ARGUMENT reads, which the gate does not ask about, and switching them off lost 3 runs. They go
+with B2. Use classification stays mono's (syntax, class c).
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and

@@ -1,5 +1,6 @@
 import { elabTyClosed } from "./check_elab_cap"
-import { mfrElabNames, mfrShadowNote } from "./mfr_shadow"
+import { recEnclosingFn } from "./check_fit_rules"
+import { mfrChainFns, mfrElabNames, mfrShadowNote } from "./mfr_shadow"
 import {
   LC_CHAIN_LONG,
   lamCellOf,
@@ -3499,20 +3500,28 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
     if et < 0 || et >= T.tys.length || tyHasTyVar(et) { return ty }
     return et
   }
+  // Where mono's pin closes, the elaboration's closed type at the instance answers: its narrowing,
+  // else its walk type. A list of numeric literals stays at mono's base list, which `filled`
+  // can build (D3540); the list layer keeps a literal union apart from its base (D611).
+  const nt = elabWalkNarrowedTy(ix)
+  const wt = elabWalkTy(ix)
+  let et = if nt >= 0 && nt < T.tys.length && !tyHasTyVar(nt) { nt } else { -1 }
+  if et < 0 && wt >= 0 && wt < T.tys.length && !tyHasTyVar(wt) { et = wt }
+  const ea = if et >= 0 { tyAt(et) } else { null }
+  const eu = if ea is TyArray && ea.aElem >= 0 { tyAt(ea.aElem) } else { null }
+  if eu is TyUnion {
+    let lits = eu.uMembers.length > 0
+    for m in eu.uMembers {
+      const mt = tyAt(m)
+      if !(mt is TyLit) || mt.litKind == "str" { lits = false }
+    }
+    if lits { et = -1 }
+  }
   const rem = monoElseRemainderAt(ty, bN, bT)
-  if rem >= 0 { return rem }
+  if rem >= 0 { return if et >= 0 { et } else { rem } }
   let st = monoSubstInst(ty, bN, bT)
   // A read the instance narrowed is typed at its narrowing, not at its storage's substitution.
-  const nt = elabWalkNarrowedTy(ix)
-  if (
-    st >= 0
-    && !tyHasTyVar(st)
-    && nt >= 0
-    && nt < T.tys.length
-    && !tyHasTyVar(nt)
-  ) {
-    return nt
-  }
+  if st >= 0 && !tyHasTyVar(st) && et >= 0 { return et }
   if (st < 0 || tyHasTyVar(st)) && monoPinHoleN.length > 0 {
     // A hole instance's list literal, element read and call of a function value are typed at
     // its holes, which `bN` does not name (D3066): the instance's elaboration answers, and the
@@ -3533,21 +3542,7 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
     }
   }
   if st < 0 || tyHasTyVar(st) { return ty }
-  // A template that collapsed a join to its open side (`{f: T}` for `{f: 1}` beside `{f: t}`)
-  // substitutes narrower than the instance reads it: the instance's wider union answers (D14021).
-  const wt = elabWalkTy(ix)
-  if (
-    wt >= 0
-    && wt < T.tys.length
-    && wt != st
-    && !tyHasTyVar(wt)
-    && tyAt(wt) is TyUnion
-    && !tyEq(wt, st)
-    && assignable(st, wt)
-  ) {
-    return wt
-  }
-  st
+  if et >= 0 { et } else { st }
 }
 
 // Whether call `ix` calls a function value: a name, or a call of one (`k()()`), typed as a
@@ -12548,7 +12543,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrLetBusy = Map()
   mfrLetDepth = 0
   const lets: i32[] = []
-  const direct: i32[] = []
+  const calls: i32[] = []
   const seen: boolean[] = __array_new__(P.nodes.length, false)
   const roots: i32[] = []
   for s in stmts { roots.push(s) }
@@ -12560,7 +12555,7 @@ function monoFlowReads(stmts: i32[]): i32 {
       if ix >= 0 && ix < P.nodes.length && !(ix < seen.length && seen[ix]) {
         while seen.length <= ix { seen.push(false) }
         seen[ix] = true
-        monoFlowReadsNote(ix, lets, direct)
+        monoFlowReadsNote(ix, lets, calls)
         const kids = nodeChildren(ix)
         let k = kids.length - 1
         while k >= 0 {
@@ -12581,20 +12576,38 @@ function monoFlowReads(stmts: i32[]): i32 {
   }
   for d in lets { monoFlowMapNoteAliasWrites(d) }
   for a in mfrAnnLets { monoFlowAnnLits(a) }
-  for x in direct {
-    const n = nodeAt(x)
-    if n is Index {
-      monoFlowDirectSet(
-        x,
-        unwrapParen(n.idxArr),
-        monoFlowElemAt(unwrapParen(n.idxArr), n.idxIndex),
-      )
-    } else if n is Member {
-      monoFlowDirectSet(
-        x,
-        unwrapParen(n.memObj),
-        monoFlowFieldOf(unwrapParen(n.memObj), n.memProp),
-      )
+  monoFlowAdmitChain(calls)
+  0
+}
+
+// Rewrites each callee read the chain walk resolves to one function (`mfrChainFns`) to that
+// function, so each call instances it at its own arguments: an element or field read, or a name a
+// `let` or `const` declares, resolving to a generic or a function with an un-annotated parameter,
+// declared at module scope under a name nothing else in the program declares.
+function monoFlowAdmitChain(calls: i32[]) {
+  const none: i32[] = []
+  for c in calls {
+    const cn = nodeAt(c)
+    const cf = if cn is Call { unwrapParen(cn.callFn) } else { -1 }
+    const fn0 = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
+    const d = if fn0 is Ident { identDeclOf(cf) } else { -1 }
+    const shaped = fn0 is Index
+      || fn0 is Member
+      || (d >= 0 && d < P.nodes.length && nodeAt(d) is LetDecl)
+    const es = if shaped && !i32ListHas(mfrSetCalls, c) { mfrChainFns(cf) } else { none }
+    const g = if es.length == 1 { es[0] } else { -1 }
+    const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { null }
+    if (
+      gn is FuncDecl
+      && recEnclosingFn(g) < 0
+      && (mfrNameCount[gn.fnName] ?? 0) == 1
+    ) {
+      let open = gn.fnTyParams.length > 0
+      for p in gn.fnParams {
+        const pn = nodeAt(p)
+        if pn is Param && pn.parType < 0 { open = true }
+      }
+      if open { monoFlowReadSet(cf, g) }
     }
   }
   0
@@ -12858,29 +12871,6 @@ function monoFlowAnnLits(a: i32) {
 // The literals `monoFlowAnnLits` banked for the annotated binding declared at `a`.
 function monoFlowAnnLitsOf(a: i32): i32[] { mfrAnnLits[a] ?? [] }
 
-// Rewrites read `x` of element or field `el` of literal `host` to the generic `el` names, when
-// every element or field value of `host` is a name, so dropping the literal drops no effect.
-function monoFlowDirectSet(x: i32, host: i32, el: i32) {
-  const g = monoFlowLeafGen(el)
-  if g < 0 || monoFlowIsWrite(x) { return 0 }
-  const hn = nodeAt(host)
-  if hn is ArrayLit {
-    for e in hn.arrElems {
-      if !(nodeAt(unwrapParen(e)) is Ident) { return 0 }
-    }
-  } else if hn is ObjLit {
-    for fi in hn.objFields {
-      const f = nodeAt(fi)
-      if !(f is FieldInit) { return 0 }
-      if !(nodeAt(unwrapParen(f.fiValue)) is Ident) { return 0 }
-    }
-  } else {
-    return 0
-  }
-  monoFlowReadSet(x, g)
-  0
-}
-
 // Whether `s` declares a named function whose value has no one signature: type parameters, or an
 // un-annotated parameter (a hole function, D6603).
 function monoFlowTyParamGen(s: i32): boolean {
@@ -13000,24 +12990,11 @@ function monoFlowLeafName(g: i32): string {
 
 // Banks node `ix` for `monoFlowReads`: a name read, a declared name, a candidate binding, a
 // read straight out of a literal.
-function monoFlowReadsNote(ix: i32, lets: i32[], direct: i32[]) {
+function monoFlowReadsNote(ix: i32, lets: i32[], calls: i32[]) {
   const n = nodeAt(ix)
-  if n is Index {
-    if (
-      nodeAt(unwrapParen(n.idxArr)) is ArrayLit
-      && !fnTagListTy(nodeTyIxOf(n.idxArr))
-    ) {
-      direct.push(ix)
-    }
-  } else if n is Member {
-    if (
-      nodeAt(unwrapParen(n.memObj)) is ObjLit
-      && !fnTagHoldsTy(nodeTyIxOf(n.memObj), 4)
-    ) {
-      direct.push(ix)
-    }
-  } else if n is Call {
+  if n is Call {
     monoFlowSliceAsSpread(ix, n.pos)
+    calls.push(ix)
   } else if n is Ident {
     const d = identDeclOf(ix)
     if d >= 0 {
