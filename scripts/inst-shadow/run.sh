@@ -67,12 +67,12 @@ awk '
     for (i = 4; i <= NF; i++) {
       t = $i
       if (t ~ /^REAL/) { sub(/\[.*/, "", t) }
-      if (t ~ /^(ok|repeq|litrep|nulfn|bundle|monoopenrec|colstub|annrow|argrep|REAL|monoopen|eo:(yes|no)|no:[a-z-]+|[a-z-]+:[adn][adn][adn])$/) {
+      if (t ~ /^(ok|repeq|litrep|nulfn|bundle|monoopenrec|colstub|annrow|argrep|REAL|monoopen|eo:(yes|no)|no:[a-z-]+|[a-z-]+:[adn][adn][adn]+)$/) {
         n[t]++
         if (!((t, f) in seen)) { seen[t, f] = 1; p[t]++ }
         if (t == "REAL") call = "disagree"
         else if (t == "monoopen") call = "mono pin open"
-        else if (t ~ /^(no:|[a-z-]+:[adn][adn][adn]$)/ && call == "agree") call = "no answer"
+        else if (t ~ /^(no:|[a-z-]+:[adn][adn][adn]+$)/ && call == "agree") call = "no answer"
       }
     }
     c[call]++
