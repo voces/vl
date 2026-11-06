@@ -1962,6 +1962,52 @@ the same value read the memo, walked nothing and answered false. The memo now sk
 query; `tests/vl_elab_rets_reach_test.ts` asks the query three times. No program in the population
 changed output.
 
+**The uncalled-slot gates are rewrite-owned.** `monoPinListElems`' reach half
+(`monoLitReachesNoCall`) and `monoValsInert` are kept, and they close only when the flow pass's
+`monoFlow*`/`mfr*` family (the slot held fns row, 29 functions) is retired. Each gate answers
+"uncalled" about the program after `monoFlowReadSet` has rewritten every read of the slot to name
+its generic. `elabSlotUncalled` answers about the program before that rewrite. An elaboration fact
+that took mono's rewrite as an omit set would move the dependency, not remove it.
+
+Shadow over the 23,103 programs at `4f3d9023`. Both predicates are asked at every slot reaching a
+gate. E is `elabSlotUncalled`; M is the mono predicate the gate reads.
+
+| gate | both called | both uncalled | E only | M only |
+| --- | --- | --- | --- | --- |
+| list, no pin (`monoLitReachesNoCall`) | 14 | 27 | 245 | 23 |
+| list, pushed, two pins (`monoValsInert`) | 5 | 0 | 0 | 2 |
+| nested list, no pin (`monoValsReachNoCall`) | 0 | 1 | 22 | 0 |
+| stored slot, no pin (`monoValsReachNoCall`) | 0 | 23 | 129 | 0 |
+| stored slot, two pins (`monoValsInert`) | 17 | 0 | 0 | 34 |
+
+The two rows with no M-only cell read `elabSlotUncalled` alone since #6503. At a no-pin gate the two
+answers are joined by `||`, so E only changes nothing. All 59 M-only cells run correctly, and only
+through the uncalled default.
+
+Each M-only cell is graded by what makes E answer "called", and by which reasons are left once the
+rewritten calls (`mfrSetCalls`) are omitted:
+
+- **`fnSlotCalled` (44 cells): every list cell, and 19 stored ones.** It is the checker's
+  call-through-slot note. It is keyed by holder and path, with argument tuples and no call node
+  (`fnSlotCallNote`), so it cannot omit a rewritten call. In 18 of the list cells and both pushed
+  ones, every set call and delivery is a rewritten call as well. In 6 of the stored cells a held
+  function also escapes through a map parameter.
+  - List witnesses: D7385, D12472, D10795, D10796, D10893, D10894, D10895,
+    `closures/hole-fn-list-computed-index-call-as-value.vl` and
+    `functions/lambda-through-const-list-element*.vl`.
+  - Pushed: D9482 and `closures/hole-fn-generic-pushed-list-spread.vl`.
+  - Stored: D9310, D9480, D9591, D15298 and `closures/hole-fn-generic-in-map-called-at-two-types.vl`.
+- **Rewritten calls only (2 cells).** Omitting `mfrSetCalls` leaves no reason
+  (`closures/container-of-generic-flow-reads.vl`).
+- **Handed reads (13 cells).** The rewritten read is an argument, as in `run(mv, 2)` where `run`
+  calls `f`, so the two pins are the deliveries through `run` at two types. `monoFlowReadSet` lists
+  only called reads in `mfrSetCalls`, so these deliveries survive the omission. Witnesses:
+  D10311, D10383, D10384, D10401, D14400 and
+  `generics/fn-value-generic-handed-from-call-map-or-repointed-let.vl`.
+
+Whoever retires `monoFlowReadSet` needs two facts that do not exist yet: `fnSlotCalled` keyed by the
+call node, and the handed reads.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
