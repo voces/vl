@@ -1,18 +1,46 @@
-// The function the elaboration says a read the monoFlow* rewrite re-points holds: the rewrite's
-// answer (`mfrElabNames`), and its shadow under the rep shadow (architecture-target §3.4).
+// The function a read the monoFlow* rewrite re-points holds: the elaboration's answer
+// (`mfrElabNames`) and its shadow, and the chain walk that admits a callee read (`mfrChainFns`).
 import {
   ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
+  ForIn,
+  ForRange,
   FuncDecl,
   Ident,
+  IfStmt,
+  ImportDecl,
   Index,
+  IsExpr,
   LetDecl,
+  LoopVar,
+  MatchExpr,
   Member,
+  NullLit,
   NumLit,
   ObjLit,
+  OptMember,
   P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
   Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
   i32ToStr,
   nodeAt,
 } from "./ast"
@@ -20,12 +48,14 @@ import { identDeclOf } from "./symbols"
 import { optCallCalleeOf } from "./check_core_state"
 import {
   cwBindingOf,
+  cwBindingWrittenValues,
   cwHeldFnOf,
   cwIxCoveredLen,
   cwLetUnwritten,
   cwParamArgs,
   cwSlotPath,
   cwSlotWriteCount,
+  cwSlotWrittenValues,
 } from "./check_write_scan"
 import { collectRetValues } from "./check_nj_join"
 import { identFnDeclOf } from "./check_scopes"
@@ -364,6 +394,239 @@ function mfrDescendObj(
       if "f." + fi.fiName == steps[i] {
         return mfrDescendSteps(fi.fiValue, steps, i + 1, hops + 1, out)
       }
+    }
+  }
+  false
+}
+
+// The one function read `x` holds along every link of its value chain: a written binding holds
+// every value written to it, a slot every value stored there, `??` both sides, a parameter every
+// call's argument. [] when a link is unknown, the links name two, or the read is rooted at a
+// parameter (its argument stays built as a value at the call).
+export function mfrChainFns(x: i32): i32[] {
+  const none: i32[] = []
+  if x < 0 || x >= cwIxCoveredLen() { return none }
+  let rt = parenPeelIx(x)
+  let k = 0
+  while rt >= 0 && k < 16 {
+    const st = mfrChainStep(rt)
+    if st == "" || st == "!" { break }
+    rt = parenPeelIx(mfrChainStepObj(rt))
+    k = k + 1
+  }
+  if rt < 0 || !(nodeAt(rt) is Ident) { return none }
+  const rd = identDeclOf(rt)
+  if rd < 0 || rd >= P.nodes.length || !(nodeAt(rd) is LetDecl) { return none }
+  const leaves: i32[] = []
+  const steps: string[] = []
+  if !mfrChainDescend(x, steps, 0, 0, leaves) { return none }
+  let g = -1
+  for f in leaves {
+    if g >= 0 && f != g { return none }
+    g = f
+  }
+  if g >= 0 { [g] } else { none }
+}
+
+// The step read `ix` takes from its object: `#k` a literal index, `f.<name>` a field, `[]` a map
+// key (a string index or `.get`); "!" for a computed index; "" when `ix` is not a read.
+function mfrChainStep(ix: i32): string {
+  const n = nodeAt(ix)
+  if n is Member { return "f." + n.memProp }
+  if n is Index {
+    const k = nodeAt(n.idxIndex)
+    if k is NumLit { return "#" + k.numText }
+    if k is StrLit { return "[]" }
+    return "!"
+  }
+  if n is Call { return if mfrChainGetObj(ix) >= 0 { "[]" } else { "" } }
+  ""
+}
+
+function mfrChainStepObj(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if n is Member { return n.memObj }
+  if n is Index { return n.idxArr }
+  mfrChainGetObj(ix)
+}
+
+// The receiver of a `m.get(k)` call `ix`; -1 otherwise.
+function mfrChainGetObj(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if !(n is Call) || n.callArgs.length != 1 || n.callFn < 0 { return -1 }
+  const f = nodeAt(parenPeelIx(n.callFn))
+  if f is Member && f.memProp == "get" { f.memObj } else { -1 }
+}
+
+// The functions value `v` holds after `steps[i..]`, onto `out`; false when a link is unknown.
+function mfrChainDescend(
+  v: i32,
+  steps: string[],
+  i: i32,
+  hops: i32,
+  out: i32[],
+): boolean {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= cwIxCoveredLen() || hops > 24 { return false }
+  // A parenthesised name taken as a value is not instanced where it is built (D4120).
+  if x != v && i >= steps.length && nodeAt(x) is Ident { return false }
+  const st = mfrChainStep(x)
+  if st == "!" { return false }
+  if st != "" {
+    const more: string[] = [st]
+    let r = i
+    while r < steps.length {
+      more.push(steps[r])
+      r = r + 1
+    }
+    return mfrChainDescend(mfrChainStepObj(x), more, 0, hops + 1, out)
+  }
+  const n = nodeAt(x)
+  if n is Ident { return mfrChainIdent(x, steps, i, hops, out) }
+  if n is BinExpr {
+    if n.binOp != "??" { return false }
+    return mfrChainDescend(n.binLeft, steps, i, hops + 1, out)
+      && mfrChainDescend(n.binRight, steps, i, hops + 1, out)
+  }
+  if n is Call { return mfrChainCall(x, steps, i, hops, out) }
+  if i >= steps.length { return false }
+  mfrChainLit(x, steps, i, hops, out)
+}
+
+function mfrChainIdent(
+  x: i32,
+  steps: string[],
+  i: i32,
+  hops: i32,
+  out: i32[],
+): boolean {
+  const d = identDeclOf(x)
+  if d < 0 {
+    const fd = identFnDeclOf(x)
+    if fd < 0 || i < steps.length || !(nodeAt(fd) is FuncDecl) { return false }
+    out.push(fd)
+    return true
+  }
+  if d >= cwIxCoveredLen() { return false }
+  const vals: i32[] = []
+  const dn = nodeAt(d)
+  match dn {
+    FuncDecl => {
+      if i < steps.length { return false }
+      out.push(d)
+      return true
+    }
+    Param => {
+      if dn.parType >= 0 || dn.parDefault >= 0 { return false }
+      if !cwParamArgs(d, vals) || vals.length == 0 { return false }
+    }
+    LetDecl => {
+      if dn.letType >= 0 { return false }
+    }
+    // no other declaration holds a value the chain follows
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return false
+    }
+  }
+  const b = cwBindingOf(x)
+  if b < 0 { return false }
+  for w in cwBindingWrittenValues(b) { vals.push(w) }
+  if vals.length == 0 { return false }
+  if i < steps.length {
+    const cp: string[] = []
+    let idx = false
+    let r = i
+    while r < steps.length {
+      if steps[r][0] == "#"[0] { idx = true }
+      cp.push(
+        if steps[r][0] == "f"[0] { steps[r].slice(2, steps[r].length) } else { "[]" },
+      )
+      r = r + 1
+    }
+    if dn is Param {
+      if cwSlotWriteCount(b, cp) != 0 { return false }
+    } else {
+      const sv: i32[] = []
+      const ats: i32[] = []
+      const nw = cwSlotWrittenValues(b, cp, sv, ats)
+      if nw < 0 || (idx && nw != 0) { return false }
+      if !idx {
+        for w in sv {
+          if !mfrChainDescend(w, steps, steps.length, hops + 1, out) {
+            return false
+          }
+        }
+      }
+    }
+  }
+  for w in vals {
+    if !mfrChainDescend(w, steps, i, hops + 1, out) { return false }
+  }
+  true
+}
+
+// A call holds what its declared function returns; `Map()` holds nothing below it.
+function mfrChainCall(
+  x: i32,
+  steps: string[],
+  i: i32,
+  hops: i32,
+  out: i32[],
+): boolean {
+  const n = nodeAt(x)
+  if !(n is Call) || n.callFn < 0 { return false }
+  const cf = parenPeelIx(n.callFn)
+  if cf < 0 || cf >= P.nodes.length { return false }
+  const fd = identFnDeclOf(cf)
+  if fd < 0 {
+    const c = nodeAt(cf)
+    return i < steps.length
+      && n.callArgs.length == 0
+      && c is Ident
+      && c.identName == "Map"
+      && identDeclOf(cf) < 0
+  }
+  const fn = nodeAt(fd)
+  if !(fn is FuncDecl) { return false }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  if rets.length == 0 { return false }
+  for rv in rets {
+    if !mfrChainDescend(rv, steps, i, hops + 1, out) { return false }
+  }
+  true
+}
+
+// One step into the list or record literal `x`; false past a list literal's end.
+function mfrChainLit(
+  x: i32,
+  steps: string[],
+  i: i32,
+  hops: i32,
+  out: i32[],
+): boolean {
+  const n = nodeAt(x)
+  const st = steps[i]
+  if n is ArrayLit {
+    if st[0] != "#"[0] { return false }
+    for e in n.arrElems {
+      if nodeAt(e) is Spread { return false }
+    }
+    let j = 0
+    while j < n.arrElems.length {
+      if "#" + i32ToStr(j) == st {
+        return mfrChainDescend(n.arrElems[j], steps, i + 1, hops + 1, out)
+      }
+      j = j + 1
+    }
+    return false
+  }
+  if !(n is ObjLit) { return false }
+  for f in n.objFields {
+    const fi = nodeAt(f)
+    if !(fi is FieldInit) { return false }
+    if "f." + fi.fiName == st {
+      return mfrChainDescend(fi.fiValue, steps, i + 1, hops + 1, out)
     }
   }
   false
