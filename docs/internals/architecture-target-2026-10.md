@@ -2056,6 +2056,36 @@ rewritten calls (`mfrSetCalls`) are omitted:
 Whoever retires `monoFlowReadSet` needs two facts that do not exist yet: `fnSlotCalled` keyed by the
 call node, and the handed reads.
 
+**The `monoFlow*` read rewrite, first reading** (2026-11-06). The rewrite (`monoFlowReads`) runs once,
+before the walk. `monoFlowReadSet` re-points a read of a list element, a record field or a written
+`let` at the one generic it holds, so each read takes its own instance. Every elaboration fact sees
+the reads before that rewrite. `compiler/mfr_shadow.vl` asks, before each rewrite, which function
+the elaboration says the read holds:
+- the element a literal index of a module-scope `const` list names (`constListFnElemDecl`);
+- else the read slot's value-flow set (`elabSlotFlowFns`), new here;
+- else what its call's callee can be (`elabCalleeFns`).
+
+`elabSlotFlowFns` is `elabSlotHeldFns` with one-way spreads. A list holds what the lists it spreads
+hold, but not what is written into a list that spreads it. Without that, `xs.push(id); ys = [...xs];
+ys[0] = inc` reads `xs[0]` as `id` or `inc`. `elabSlotHeldFns` keeps its two-way union, which is
+what a shared element rep needs. Over the 23,456 programs:
+
+| outcome | site-hits | files |
+|---|---|---|
+| agree | 351 | 129 |
+| the elaboration names several | 10 | 5 |
+| the elaboration names none | 26 | 18 |
+| differ | 0 | 0 |
+
+What is left before the planner reads the elaboration:
+- several: a list parameter's element read per call site, and nested lists. These need an
+  instance-keyed held set.
+- none, 10: a record literal stored in a map value and read back by field (`s.set("k", {f: id});
+  s.get("k").f(..)`). The write index does not follow a stored literal to its field.
+- none, 4: nested field paths.
+- none, 12: nodes minted after `elabRun`, which wait on the same source mapping as the instance
+  ladder's tail.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
