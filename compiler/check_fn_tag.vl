@@ -505,6 +505,8 @@ export function fnTagRedecide(rootIx: i32): i32 {
 function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   if fnTagSetIsTagged(s) { return 0 }
   ftPlReset()
+  ftCloAt = []
+  ftCloTy = []
   ftSubNeed = []
   ftAssume = [s]
   let ok = ftPlan(rootIx, s, calls, mint)
@@ -523,6 +525,11 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   while k < ftPlS.length {
     ftCommit(rootIx, k, calls, mint)
     k = k + 1
+  }
+  let ci = 0
+  while ci < ftCloAt.length {
+    fnCloCoerceNote(ftCloAt[ci], ftCloTy[ci])
+    ci = ci + 1
   }
   // Every holder's rep, once each planned set is tagged.
   // Twice, so a binding of a read of another holder sees that holder's stamp (D15350).
@@ -1728,6 +1735,41 @@ function ftNamedAtClosed(x: i32, p: i32, g: i32, s: i32): boolean {
   if !(f is FuncDecl) || i >= f.fnParams.length { return false }
   const q = nodeAt(f.fnParams[i])
   q is Param && q.parType >= 0 && ftClosedFnTy(nodeTyIxOf(f.fnParams[i]))
+}
+
+// Whether `x` is a call handing back one of its arguments (`ftHandBackArg`), the initialiser of
+// `p`, a binding annotated with a closed function type.
+function ftHandBackAtClosed(x: i32, p: i32): boolean {
+  if !ftLate || x < 0 || p < 0 || ftHandBackArg(x) < 0 { return false }
+  const pn = nodeAt(p)
+  pn is LetDecl
+    && pn.letInit == x
+    && pn.letType >= 0
+    && ftClosedFnTy(nodeTyIxOf(p))
+}
+
+// Whether set `s` has one member, a generic declaration.
+function ftOneGenericMember(s: i32): boolean {
+  const ms = fnTagMembers(s)
+  ms.length == 1 && ftNamedDecl(ms[0]) && !ftPlainDecl(ms[0])
+}
+
+// The deliveries the plan in progress builds as the closure of its one member, and their types.
+let ftCloAt: i32[] = []
+let ftCloTy: i32[] = []
+
+// The argument call `x` hands back, by the elaboration's hand-back fact for its declared callee:
+// a positional argument naming a function; -1 for any other node.
+function ftHandBackArg(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const c = nodeAt(x)
+  if !(c is Call) { return -1 }
+  const d = ftNamedFn(c.callFn)
+  if d < 0 { return -1 }
+  const rp = mintRetParamsOf(d)
+  if rp.length != 1 || !ftArgIsParam(c, rp[0]) { return -1 }
+  const a = parenPeelIx(c.callArgs[rp[0]])
+  if a >= 0 && nodeAt(a) is Ident && identFnDeclOf(a) >= 0 { a } else { -1 }
 }
 
 // Whether `t` is a function type with no type parameter or hole in it.
@@ -3410,6 +3452,13 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     // A binding's annotation delivers the value to a declared function type, a closure.
     // So does a `const` copy of a parameter annotated with the function's type parameter.
     LetDecl => {
+      // A call handing back the one generic member, bound to a closed function type, delivers
+      // that member's closure there, built from the id the call hands back.
+      if ftHandBackAtClosed(x, p) && ftOneGenericMember(s) {
+        ftCloAt.push(x)
+        ftCloTy.push(nodeTyIxOf(p))
+        return true
+      }
       return pn.letInit == x && (pn.letType < 0 || ftParamCopyAt(p, fn))
     }
     RetStmt => {

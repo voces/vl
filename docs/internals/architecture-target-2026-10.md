@@ -1697,6 +1697,26 @@ What no source answers:
   calls made through it later: D9480, D9890, D10023, `closures/generic-fn-value-returned-through-identity-hole.vl`.
   Most of these run today. The missing fact is the one D15298 pins: function-value identity in the
   type (`Fn#d`, §2.2 steps 3 and 4). This bucket is blocked on it.
+
+**Bucket 1 is untagged sets, in five groups** (2026-11-06, master `d0f6b772`, re-measured with
+inst-shadow: 50 parameters in 19 programs). `Fn#d`'s machinery has landed: function sets on
+`TyFunc`, the tag, and per-member dispatch. Every bucket-1 parameter is a set the tag decision
+leaves untagged, or no set at all. A probe naming the refusal of each set and the mono rung that
+pins it splits them:
+
+| group | params | programs | what refuses the set | mono's pin |
+|---|---|---|---|---|
+| G1, a generic handed back by a hole identity | 8 | 1 | hand-back through a forwarder; an annotated hand-back (D15490) | `monoHoleGenFnPin`'s flow sub-rung |
+| G2, a map of generics handed to a hole parameter | 13 | 4 | the map's value carries no set: identity is lost at an un-annotated `Map()` write (D15298) | the argument's checked type |
+| G3, a list of hole functions handed to a hole parameter | 15 | 7 | `mintSetPartial`, or a coerced holder | `monoArgPinName`, `monoPinnedListElemPin` |
+| G4, a lambda calling its parameter with a generic at two types | 9 | 4 | `ftLambdaIdOk` | `monoClosureBundlePin` (D3975) |
+| G5, a set nothing calls through | 5 | 4 | never tried: the closure rep by design | the rep cascade's default |
+
+G5 is a default, like bucket 2, not a missing fact. G1 closed with D15490 (S1), which leaves 42
+parameters in 18 programs. `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and
+`monoChoiceArmFlowTy`) pinned 33 parameters on master: G1's 7, and 26 whose instance already
+agrees with the elaboration's. It is the next deletion, graded by a three-outcome shadow at the
+function.
 - **A type parameter the call leaves unbound or ambiguous** (62 `nokey-gen` and 10
   `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
   `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
@@ -1732,8 +1752,8 @@ type-parameter binding behind the bare and composite pushes) fire only for param
 above leaves unanswered. The alignment is done, and what is left is that fallback tail.
 
 The tail is closed by four things:
-- function-value identity in the type (`Fn#d`, D15298), for the 72 generic function values fixed
-  past the call;
+- function-value identity in the type (`Fn#d`, D15298), for the generic function values fixed
+  past the call (42 after D15490, in the four groups above that are not defaults);
 - an elaboration-owned default for an unbound type parameter (72);
 - the 16 calls in cloned bodies and through values;
 - anything a wider population finds.
