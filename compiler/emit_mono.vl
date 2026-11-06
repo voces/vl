@@ -1156,55 +1156,14 @@ function monoCompositeListAnnName(name: string, isArr: boolean) {
   ""
 }
 
-// True when the type-annotation node `annIx` is a function-value pin in either spelling
-// `monoArgTyName` mints — the bare closure's `$fnsig` marker, or a nullable function
-// type. One predicate, so the gate, the name and the banked type agree.
-function monoAnnIsCloPin(annIx: i32) {
-  if annIx < 0 { return false }
-  if sigKeyPinPayload(tyNameOf(annIx)) != "" { return true }
-  tyNulFuncInner(nodeTyIxOf(annIx)) >= 0
-}
-
-// The annotation node of a binding of `fnIx` already pinned to a monomorphized function value,
-// or -1; the node carries both halves (`tyNameOf` key, `nodeTyIxOf` banked `TyFunc`). Param
-// before local. A read `fnIx` does not bind is a capture, read at the nearest enclosing frame
-// that binds it (D13660).
-function monoCloPinAnnNodeOf(readIx: i32, fnIx: i32): i32 {
-  const identName = sidText(sidOfNode(readIx))
-  let fx = fnIx
-  let steps = 0
-  while fx >= 0 && steps < 64 {
-    const ptn = paramTypeNodeOfRead(fx, readIx)
-    if monoAnnIsCloPin(ptn) { return ptn }
-    const ctxFn = nodeAt(fx)
-    let li = -1
-    if ctxFn is FuncDecl {
-      li = fnLetOfRead(fx, readIx)
-      if li >= 0 {
-        const ld = nodeAt(li)
-        if ld is LetDecl {
-          if monoAnnIsCloPin(ld.letType) { return ld.letType }
-        }
-      }
-    }
-    if li >= 0 || paramIndexOf(fx, identName) >= 0 { return -1 }
-    const pp = fnStmtsPosOf(fx)
-    if pp < 0 || pp >= fnParent.length { return -1 }
-    const up = fnParent[pp]
-    if up < 0 || up >= fnStmts.length { return -1 }
-    fx = fnStmts[up]
-    steps = steps + 1
-  }
-  -1
-}
-
-// `monoCloPinAnnNodeOf` over an EXPRESSION — the Ident unwrap, in one place, so the gate
-// and the type-banking helper below cannot ask the question of different nodes.
-function monoCloPinAnnNodeOfExpr(ax: i32, fnIx: i32): i32 {
-  if ax < 0 { return -1 }
-  const n = nodeAt(ax)
-  if n is Ident { return monoCloPinAnnNodeOf(ax, fnIx) }
-  -1
+// The closed function type an instance's read `ax` takes there, where its own recorded type is not
+// a function (a forwarder's `x: T` holding a function value): the elaboration's type for it at
+// that instance; -1 otherwise.
+function monoCloPinTyOf(ax: i32, fnIx: i32): i32 {
+  if ax < 0 || !(nodeAt(ax) is Ident) || nodeTyIsFunc(ax) { return -1 }
+  const t = elabNodeTyAt(ax, fnIx)
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -1 }
+  if tyAt(t) is TyFunc || tyNulFuncInner(t) >= 0 { t } else { -1 }
 }
 
 // The arena type to bank beside the pin `monoArgTyName` chose for `ix` — the argument's
@@ -1221,8 +1180,8 @@ export function monoArgPinTyIx(ix: i32, fnIx: i32) {
   if monoReadsUnfilledNull(ax) || monoParamPinnedNull(ax, fnIx) {
     return TY_NULL
   }
-  const pn = monoCloPinAnnNodeOfExpr(ax, fnIx)
-  if pn >= 0 { return nodeTyIxOf(pn) }
+  const pt = monoCloPinTyOf(ax, fnIx)
+  if pt >= 0 { return pt }
   // The variant `monoArgTyNameRep` pinned an unadopted literal at banks that variant's type.
   const ov = monoArgOwnVariant(ax)
   if ov >= 0 && ov < uVarTyIx.length { return uVarTyIx[ov] }
@@ -2767,7 +2726,7 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
   // The third channel, read here because the function-value arm below needs it: an instance's
   // own `x: T` parameter or `const y: T = x` local carries the pin as its annotation, and
   // neither other channel can see it. This is what a generic forwarder hands its inner call.
-  const cloPinNode = monoCloPinAnnNodeOfExpr(cax, fnIx)
+  const cloPinTy = monoCloPinTyOf(cax, fnIx)
   // D941 — the fourth channel, the third one's sibling: the instance's own parameter
   // annotation (`paramTypeNodeOfRead`), gated to a generic application. Every other channel asks
   // the argument node, and a clone shares its leaf expressions, so a forwarded `e`'s
@@ -2798,7 +2757,7 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
   // The arena asks the closure question, because `exprIsClosure` cannot ask it here: that
   // predicate resolves through tables `buildLocals` fills post-mono. `nodeTyIsFunc` is the
   // checker's answer and needs no emit-side table. The gates are OR'd, not swapped, since
-  // without `cloPinNode` a forwarder's `gid(x)` falls to the same catch-all.
+  // without `cloPinTy` a forwarder's `gid(x)` falls to the same catch-all.
   const valRead = monoIdentReadsValue(cax)
   // A read that resolves to a value binding is not the function its name may also spell.
   let cloArg = false
@@ -2807,7 +2766,7 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
   } else {
     cloArg = exprIsClosure(ix, fnIx)
   }
-  if cloArg || nodeTyIsFunc(cax) || cloPinNode >= 0 {
+  if cloArg || nodeTyIsFunc(cax) || cloPinTy >= 0 {
     // A function-value argument pins its param as a closure (kind 14). The pinned name
     // carries the callee's `$fnsig` key so the instance's value-call ref-casts to the
     // exact signature.
@@ -2830,7 +2789,7 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
     const ak = sigKeyOfTy(nodeTyAt(cax, fnIx))
     if ak != "" { return "=>" + ak }
     // Last: the pin an instance's OWN binding already carries (a generic forwarder).
-    if cloPinNode >= 0 { return tyNameOf(cloPinNode) }
+    if cloPinTy >= 0 { return monoFnTyPin(cloPinTy) }
     return ""
   }
   // An if-expression whose join is still a type parameter and whose then arm's value is a
