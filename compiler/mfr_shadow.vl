@@ -44,13 +44,16 @@ import {
   i32ToStr,
   nodeAt,
 } from "./ast"
-import { identDeclOf } from "./symbols"
+import { identDeclOf, memberMethodOf } from "./symbols"
+import { i32ListHas } from "./listutil"
 import { optCallCalleeOf } from "./check_core_state"
 import {
   cwBindingOf,
   cwBindingWrittenValues,
   cwHeldFnOf,
+  cwIxBuild,
   cwIxCoveredLen,
+  cwKeyOfDecl,
   cwLetUnwritten,
   cwParamArgs,
   cwSlotPath,
@@ -63,7 +66,10 @@ import { parenPeelIx } from "./check_places"
 import { constListFnElemDecl } from "./check_calls"
 import { elabCalleeFnsOf, elabSlotFlowFns } from "./emit_elab"
 import { repABNote } from "./emit_nullable_rets"
+import { monoIsGenericDecl, tyIsFuncType } from "./emit_base"
 import { recEnclosingFn } from "./check_fit_rules"
+import { opDeclAtNode } from "./check_callee"
+import { elabCallDeclOf } from "./check_elab_cap"
 import { monoNameIsExported } from "./value_reach"
 
 // Notes how the elaboration's answer for read `x` compares with generic `g`, the one the rewrite
@@ -636,4 +642,312 @@ function mfrChainLit(
     }
   }
   false
+}
+
+// Per declaration, the list, record and `Map()` literals it can hold, filled after the
+// elaboration and before any emit rewrite: 0 unasked, 1 asking, 2 known (`mfrLitStart` into the
+// -1-terminated `mfrLitNodes`), 3 unknown. A `Map()` root's binding is `mfrLitMapDecl`.
+let mfrLitState: i32[] = []
+let mfrLitStart: i32[] = []
+let mfrLitNodes: i32[] = []
+let mfrLitMapDecl: i32[] = []
+
+// Fills the literal roots of every binding, its links gated as the chain walk's are.
+export function mfrLitsRun() {
+  // Only where the mono pass can run, its sole reader: some function is generic or takes a
+  // function-typed parameter (`monoIsGenericDecl`, `feHasClosureParam`).
+  let want = false
+  let w = 0
+  while !want && w < P.nodes.length {
+    const fn = nodeAt(w)
+    if fn is FuncDecl {
+      want = monoIsGenericDecl(w)
+      for p in fn.fnParams {
+        const pn = nodeAt(p)
+        if pn is Param && pn.parType >= 0 && tyIsFuncType(pn.parType) {
+          want = true
+        }
+      }
+    }
+    w = w + 1
+  }
+  if !want { return 0 }
+  cwIxBuild()
+  const len = P.nodes.length
+  mfrLitState = __array_new__(len, 0)
+  mfrLitStart = __array_new__(len, -1)
+  mfrLitNodes = []
+  mfrLitMapDecl = __array_new__(len, -1)
+  let i = 0
+  while i < len {
+    const n = nodeAt(i)
+    if n is LetDecl || n is Param { mfrLitsDecl(i) }
+    i = i + 1
+  }
+  0
+}
+
+// The literal roots binding or function `d` can hold, onto `out`; false when they are unknown.
+function mfrLitsAt(d: i32, out: i32[]): boolean {
+  if d < 0 || d >= mfrLitState.length || mfrLitState[d] != 2 { return false }
+  let k = mfrLitStart[d]
+  while k >= 0 && k < mfrLitNodes.length && mfrLitNodes[k] >= 0 {
+    out.push(mfrLitNodes[k])
+    k = k + 1
+  }
+  true
+}
+
+// The literal roots of binding `d` (`mfrLitsAt`), or of a binding minted after the elaboration,
+// which stands for its initialiser: `emit_rewrite`'s `spillLocal` (`asg#<ix>#<tag>`) and its
+// capture-cell write temp (`__cbv<n>`) each bind an existing expression. Only a covered list or
+// record literal, or a read of a covered binding, is forwarded; anything else is unknown.
+export function mfrLitsOf(d: i32, out: i32[]): boolean {
+  if mfrLitsAt(d, out) { return true }
+  if d < cwIxCoveredLen() || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letType >= 0 { return false }
+  const v = parenPeelIx(dn.letInit)
+  if v < 0 || v >= cwIxCoveredLen() { return false }
+  const vn = nodeAt(v)
+  if vn is ArrayLit || vn is ObjLit {
+    out.push(v)
+    return true
+  }
+  vn is Ident && mfrLitsAt(identDeclOf(v), out)
+}
+
+// `mfrLitState` for `d`, computed once; a cycle back into a binding being asked is unknown.
+function mfrLitsDecl(d: i32): boolean {
+  if d < 0 || d >= mfrLitState.length { return false }
+  const st = mfrLitState[d]
+  if st != 0 { return st == 2 }
+  mfrLitState[d] = 1
+  const out: i32[] = []
+  if !mfrLitsDeclVals(d, out) || out.length == 0 {
+    mfrLitState[d] = 3
+    return false
+  }
+  mfrLitStart[d] = mfrLitNodes.length
+  for x in out { mfrLitNodes.push(x) }
+  mfrLitNodes.push(-1)
+  mfrLitState[d] = 2
+  true
+}
+
+// The values binding or function `d` holds: a function's returns, a parameter's argument at each
+// call (none for an exported function's), a binding's every write; each resolved to its roots.
+function mfrLitsDeclVals(d: i32, out: i32[]): boolean {
+  const vals: i32[] = []
+  const dn = nodeAt(d)
+  match dn {
+    FuncDecl => {
+      if dn.fnTyParams.length > 0 { return false }
+      collectRetValues(dn.fnBody, vals)
+    }
+    Param => {
+      if dn.parType >= 0 || dn.parDefault >= 0 { return false }
+      const pf = recEnclosingFn(d)
+      const pfn = if pf >= 0 { nodeAt(pf) } else { null }
+      if !(pfn is FuncDecl) || monoNameIsExported(pfn.fnName) { return false }
+      if !cwParamArgs(d, vals) { return false }
+      for w in cwBindingWrittenValues(cwKeyOfDecl(d)) { vals.push(w) }
+    }
+    LetDecl => {
+      if dn.letType >= 0 { return false }
+      // A `const` built by `Map()` is the map's own root; what it holds is read through its slots.
+      const iv = parenPeelIx(dn.letInit)
+      if (
+        dn.letKw == "const"
+        && mfrLitIsMapNew(iv)
+        && iv < mfrLitMapDecl.length
+      ) {
+        mfrLitMapDecl[iv] = d
+        out.push(iv)
+        return true
+      }
+      for w in cwBindingWrittenValues(cwKeyOfDecl(d)) { vals.push(w) }
+    }
+    // no other declaration holds a value
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return false
+    }
+  }
+  if vals.length == 0 { return false }
+  for v in vals {
+    if !mfrLitsVal(v, out) { return false }
+  }
+  true
+}
+
+// Whether `x` is a bare `Map()` call.
+function mfrLitIsMapNew(x: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const c = nodeAt(x)
+  if !(c is Call) || c.callArgs.length != 0 || c.callFn < 0 { return false }
+  const f = nodeAt(parenPeelIx(c.callFn))
+  f is Ident && f.identName == "Map" && identDeclOf(parenPeelIx(c.callFn)) < 0
+}
+
+function mfrLitPush(out: i32[], x: i32) {
+  if !i32ListHas(out, x) { out.push(x) }
+  0
+}
+
+// The roots value `v` holds, onto `out`: a list or record literal itself, a function's name as a
+// leaf, a binding's or a called function's roots, both sides of `??`, an element, field or map
+// read's; false where any part is unknown.
+function mfrLitsVal(v0: i32, out: i32[]): boolean {
+  const v = parenPeelIx(v0)
+  if v < 0 || v >= cwIxCoveredLen() { return false }
+  const n = nodeAt(v)
+  match n {
+    ArrayLit => {
+      if n.pos < 0 { return false }
+      mfrLitPush(out, v)
+      return true
+    }
+    ObjLit => {
+      mfrLitPush(out, v)
+      return true
+    }
+    Ident => {
+      const d = identDeclOf(v)
+      const fd = if d < 0 { identFnDeclOf(v) } else { d }
+      if fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl {
+        mfrLitPush(out, v)
+        return true
+      }
+      return mfrLitsDecl(d) && mfrLitsAt(d, out)
+    }
+    BinExpr => {
+      // A user operator is a call of the function the checker resolved it to.
+      const od = mfrLitCallDecl(v)
+      if od >= 0 { return mfrLitsDecl(od) && mfrLitsAt(od, out) }
+      if n.binOp != "??" { return false }
+      // A `null` side holds no literal.
+      const l = nodeAt(parenPeelIx(n.binLeft)) is NullLit
+        || mfrLitsVal(n.binLeft, out)
+      return l
+        && (nodeAt(parenPeelIx(n.binRight)) is NullLit
+        || mfrLitsVal(n.binRight, out))
+    }
+    Call => {
+      return mfrLitsCall(v, n, out)
+    }
+    Index => {
+      const base: i32[] = []
+      if !mfrLitsVal(n.idxArr, base) || base.length == 0 { return false }
+      // A map read at any key holds every value the map stores.
+      if mfrLitAllMaps(base) { return mfrLitsStored(base, out) }
+      const kn = nodeAt(n.idxIndex)
+      if !(kn is NumLit) { return false }
+      for b in base {
+        const el = mfrLitElemOf(b, kn.numText)
+        if el < 0 || !mfrLitsVal(el, out) { return false }
+      }
+      return true
+    }
+    Member => {
+      const base: i32[] = []
+      if !mfrLitsVal(n.memObj, base) { return false }
+      for b in base {
+        const fv = mfrLitFieldOf(b, n.memProp)
+        if fv < 0 || !mfrLitsVal(fv, out) { return false }
+      }
+      return true
+    }
+    // no other node holds a literal the walk follows
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return false
+    }
+  }
+}
+
+// A call's roots: a `self`-function's or a declared function's returns, a slice's receiver's,
+// or a map `.get`'s stored values.
+function mfrLitsCall(v: i32, n: Call, out: i32[]): boolean {
+  const c = parenPeelIx(n.callFn)
+  if c < 0 || c >= P.nodes.length { return false }
+  const cm = nodeAt(c)
+  if cm is Member {
+    const mf = mfrLitCallDecl(v)
+    if mf >= 0 { return mfrLitsDecl(mf) && mfrLitsAt(mf, out) }
+    // A slice holds its receiver's elements.
+    if cm.memProp == "slice" { return mfrLitsVal(cm.memObj, out) }
+    if cm.memProp != "get" || n.callArgs.length != 1 { return false }
+    return mfrLitsMapRead(cm.memObj, out)
+  }
+  const fd = identFnDeclOf(c)
+  fd >= 0 && mfrLitsDecl(fd) && mfrLitsAt(fd, out)
+}
+
+// Element `k` of the spread-free list literal `b`; -1 otherwise.
+function mfrLitElemOf(b: i32, k: string): i32 {
+  const ln = nodeAt(b)
+  if !(ln is ArrayLit) { return -1 }
+  for e in ln.arrElems {
+    if nodeAt(e) is Spread { return -1 }
+  }
+  let j = 0
+  while j < ln.arrElems.length {
+    if i32ToStr(j) == k { return ln.arrElems[j] }
+    j = j + 1
+  }
+  -1
+}
+
+// Field `name` of the record literal `b`; -1 otherwise.
+function mfrLitFieldOf(b: i32, name: string): i32 {
+  const on = nodeAt(b)
+  if !(on is ObjLit) { return -1 }
+  for f in on.objFields {
+    const fi = nodeAt(f)
+    if !(fi is FieldInit) { return -1 }
+    if fi.fiName == name { return fi.fiValue }
+  }
+  -1
+}
+
+// The values every `Map()` root of `m` stores, resolved to their roots.
+function mfrLitsMapRead(m: i32, out: i32[]): boolean {
+  const base: i32[] = []
+  if !mfrLitsVal(m, base) || base.length == 0 { return false }
+  mfrLitsStored(base, out)
+}
+
+// Whether every root in `base` is a `Map()`.
+function mfrLitAllMaps(base: i32[]): boolean {
+  for b in base {
+    if b < 0 || b >= mfrLitMapDecl.length || mfrLitMapDecl[b] < 0 {
+      return false
+    }
+  }
+  true
+}
+
+// The values each `Map()` root in `base` stores, resolved to their roots.
+function mfrLitsStored(base: i32[], out: i32[]): boolean {
+  for b in base {
+    const ow = if b >= 0 && b < mfrLitMapDecl.length { mfrLitMapDecl[b] } else { -1 }
+    if ow < 0 { return false }
+    const sv: i32[] = []
+    const ats: i32[] = []
+    if cwSlotWrittenValues(cwKeyOfDecl(ow), ["[]"], sv, ats) < 0 {
+      return false
+    }
+    for w in sv {
+      if !mfrLitsVal(w, out) { return false }
+    }
+  }
+  true
+}
+
+// The function the checker resolved member or operator call `ix` to (`elabCallDeclOf`); -1 when
+// it noted none or it is not a declared function.
+function mfrLitCallDecl(ix: i32): i32 {
+  let d = elabCallDeclOf(ix)
+  if d < 0 { d = opDeclAtNode(ix) }
+  if d < 0 { d = memberMethodOf(ix) }
+  if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl { d } else { -1 }
 }
