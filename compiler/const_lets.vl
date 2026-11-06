@@ -1,0 +1,233 @@
+// Respells an un-annotated, unexported `let` nobody re-points as `const` once the source is parsed,
+// when it holds a lambda, a function, or a list literal of those (D6472, D13521): every reader that
+// follows a `const` to a function or its list then follows it too.
+import {
+  ArrayLit,
+  BinExpr,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  Node,
+  P,
+  Param,
+  Paren,
+  labelBlockValue,
+  nodeAt,
+} from "./ast"
+
+// How many nodes the parse made; the respelling reads only those.
+let clParseLen = 0
+
+// Runs the respelling over the nodes the parse just made; the driver calls it once per parse.
+export function constLetsAfterParse(): i32 {
+  clParseLen = P.nodes.length
+  clConstLets()
+}
+
+// `a` with parentheses and a labelled block's value stripped.
+function clParenPeel(a: i32): i32 {
+  let x = a
+  while x >= 0 && x < P.nodes.length {
+    const n = nodeAt(x)
+    const v = labelBlockValue(x)
+    if v >= 0 { x = v }
+    else if n is Paren { x = n.parInner }
+    else { return x }
+  }
+  x
+}
+
+// The names some `=` or an exported `let` writes, how often each name is declared, and the
+// one binding or named function declaring it, for `clConstLets`. Only the names in `clNeed`
+// are recorded; a walk that reaches another name notes it in `clMissed` and answers false.
+let clWritten: {[string]: boolean} = Map()
+let clDecls: {[string]: i32} = Map()
+let clLet: {[string]: i32} = Map()
+let clNeed: {[string]: boolean} = Map()
+let clMissed: string[] = []
+
+// An un-annotated, unexported `let` that no `=` anywhere writes by name, holding a lambda, a
+// name that is a function for good, or a list literal of those, is spelled `const`, so every
+// reader that follows a `const` to a function or its list follows it too (D6472, D13521).
+function clConstLets(): i32 {
+  const cands: i32[] = []
+  const names: string[] = []
+  const decls: i32[] = []
+  const asg: string[] = []
+  let i = 0
+  while i < clParseLen {
+    const n = nodeAt(i)
+    if n is LetDecl {
+      if n.letName != "" {
+        names.push(n.letName)
+        decls.push(i)
+      }
+      if n.letKw == "let" && n.letType < 0 && n.letInit >= 0 {
+        if clMayHoldFixedFn(n.letInit) { cands.push(i) }
+      }
+    } else if n is Param {
+      if n.parName != "" {
+        names.push(n.parName)
+        decls.push(-1)
+      }
+    } else if n is FuncDecl {
+      if n.fnName != "" {
+        names.push(n.fnName)
+        decls.push(i)
+      }
+    } else {
+      clNoteWrite(n, asg)
+    }
+    i = i + 1
+  }
+  if cands.length == 0 { return 0 }
+  clWritten = Map()
+  clDecls = Map()
+  clLet = Map()
+  clNeed = Map()
+  let fresh: string[] = []
+  for c in cands {
+    const cd = nodeAt(c)
+    if cd is LetDecl {
+      fresh.push(cd.letName)
+      const v = nodeAt(clParenPeel(cd.letInit))
+      if v is Ident { fresh.push(v.identName) }
+      if v is ArrayLit {
+        for e in v.arrElems {
+          const en = nodeAt(clParenPeel(e))
+          if en is Ident { fresh.push(en.identName) }
+        }
+      }
+    }
+  }
+  let alive: i32[] = []
+  while fresh.length > 0 {
+    clRecord(fresh, names, decls, asg)
+    clMissed = []
+    alive = clConstAlive(cands)
+    fresh = clMissed
+  }
+  if alive.length == 0 { return 0 }
+  let t = 0
+  while t + 2 < P.toks.length {
+    if P.toks[t].kind == "EXPORT" && P.toks[t + 1].kind == "LET" {
+      clWritten[P.toks[t + 2].text] = true
+    }
+    t = t + 1
+  }
+  for c in clConstAlive(alive) {
+    const cd = nodeAt(c)
+    if cd is LetDecl { cd.letKw = "const" }
+  }
+  0
+}
+
+// Notes in `asg` the name the `=` `n` writes, when its target is a bare name; every node kind
+// that declares no name reaches here, and only an assignment writes one.
+function clNoteWrite(n: Node, asg: string[]): i32 {
+  if n is BinExpr && n.binOp == "=" {
+    const l = nodeAt(n.binLeft)
+    if l is Ident { asg.push(l.identName) }
+  }
+  0
+}
+
+// The candidates in `cands` that no `=` writes by name and whose value `clFixedFnValue` fixes.
+function clConstAlive(cands: i32[]): i32[] {
+  const out: i32[] = []
+  for c in cands {
+    const n = nodeAt(c)
+    if (
+      n is LetDecl
+      && !(clWritten[n.letName] ?? false)
+      && (clFixedFnValue(n.letInit, 0) || clFixedFnList(n.letInit))
+    ) {
+      out.push(c)
+    }
+  }
+  out
+}
+
+// Whether `v` is a non-empty list literal whose every element `clFixedFnValue` fixes.
+function clFixedFnList(v: i32): boolean {
+  const n = nodeAt(clParenPeel(v))
+  if !(n is ArrayLit) || n.arrElems.length == 0 { return false }
+  let ok = true
+  for e in n.arrElems {
+    if !clFixedFnValue(e, 0) { ok = false }
+  }
+  ok
+}
+
+// Records the `=` writes, declaration count and declaring node of each name in `fresh` not yet
+// in `clNeed`. `names[k]` is declared by node `decls[k]` (-1 for a parameter, which counts but
+// is never the declaring node), and `asg` holds every `=` target name.
+function clRecord(
+  fresh: string[],
+  names: string[],
+  decls: i32[],
+  asg: string[],
+): i32 {
+  const add: {[string]: boolean} = Map()
+  for nm in fresh {
+    if !(clNeed[nm] ?? false) {
+      clNeed[nm] = true
+      add[nm] = true
+    }
+  }
+  for nm in asg {
+    if add[nm] ?? false { clWritten[nm] = true }
+  }
+  let k = 0
+  while k < names.length {
+    const nm = names[k]
+    if add[nm] ?? false {
+      clDecls[nm] = (clDecls[nm] ?? 0) + 1
+      if decls[k] >= 0 { clLet[nm] = decls[k] }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Whether `clFixedFnValue` of `v`, or `clFixedFnList`, can hold: `v` is a lambda, a name or a
+// non-empty list literal of those, parentheses aside.
+function clMayHoldFixedFn(v: i32): boolean {
+  const x = clParenPeel(v)
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if !(n is ArrayLit) { return clMayBeFixedFn(x) }
+  if n.arrElems.length == 0 { return false }
+  for e in n.arrElems {
+    if !clMayBeFixedFn(e) { return false }
+  }
+  true
+}
+
+// Whether `v` is a lambda or a name, parentheses aside.
+function clMayBeFixedFn(v: i32): boolean {
+  const x = clParenPeel(v)
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if n is FuncDecl { return n.fnName == "" }
+  n is Ident
+}
+
+// Whether value `v` is a lambda, or a name declared once as a named function or as an unwritten
+// binding holding such a value; a copy of a written binding holds whatever the last write stored.
+function clFixedFnValue(v: i32, depth: i32): boolean {
+  const n = nodeAt(clParenPeel(v))
+  if n is FuncDecl { return n.fnName == "" }
+  if !(n is Ident) || depth > 16 { return false }
+  const nm = n.identName
+  if !(clNeed[nm] ?? false) {
+    clMissed.push(nm)
+    return false
+  }
+  if (clDecls[nm] ?? 0) != 1 || (clWritten[nm] ?? false) { return false }
+  const d = clLet[nm] ?? -1
+  if d < 0 { return false }
+  const dn = nodeAt(d)
+  if dn is FuncDecl { return true }
+  dn is LetDecl && dn.letInit >= 0 && clFixedFnValue(dn.letInit, depth + 1)
+}
