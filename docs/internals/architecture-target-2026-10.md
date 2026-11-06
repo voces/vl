@@ -1771,14 +1771,19 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   per-instance rep for one node (the per-instance mint; `fnCloCoerceSetAt` gives up at -2 for the
   same reason). Controls: a map holding `inc` and written `id`, directly or through `fill`, called
   at two types, is a check reject at both spellings, as the design says.
-- **The map-of-records holder kind** (3, and D15493's gain): the tag side and the rep stamp are done
-  on `claude/fnd-mrec` (holder kind 8, a `null`-check and a void-tail holder arm, the record
-  literal written into a map slot or through a parameter, `fnTagRepTyIn` stamping a map's record
-  value with ids, mono's hole pin reading that stamp). It is blocked on emit's record-row
-  interning: a literal built inside a callee and written through a parameter into a holder of
-  id-records lands at a second `struct {mut i32}` row beside the map's own, so the one-generic
-  spellings are invalid wasm on the branch. Two different generics in one map of records still
-  refuse loudly there.
+- **The map-of-records holder kind** (3, and D15493's gain): holder kind 8, a map binding of the
+  set's records, is a holder where a parameter it is handed writes a record literal into it
+  (`ftMapRecHanded`), so mono pins that helper's instance at the binding's held rep. Every literal
+  written into the binding, through the helper or directly, is stamped at the rep's record, and
+  emit builds a stamped literal at that record's own row (`mintPinnedObjLit`) rather than minting
+  an id row of its own, which had left the callee's literal on a second `struct {mut i32}` row
+  beside the map's. An entry read through `?.` is not a holder: `drwOptGuard`'s call gets no id
+  member call. The price is one late demand per such program, the helper's instance keyed at the
+  held map, as with `T[]` above. A map written only directly stays on mono (`ftMapRecUnhanded`):
+  its literal's row is emit's anonymous mint, which a list holding the same record type twins
+  (`closures/hole-fn-inline-list-record-stored.vl`), so the matrix's `map_value` and `map_set`
+  cells wait on emit interning a held map's record row at top level. Two different generics in
+  one map of records still refuse loudly (D15493).
 
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
