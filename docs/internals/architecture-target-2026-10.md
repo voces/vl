@@ -1402,6 +1402,29 @@ build and begin hooks and the budget row.
 
 ---
 
+**A shadow compares three outcomes, not two** (2026-11-06). A reader switch has to agree on the
+answer when both sides answer, *and* on declines: where the old reader declines, the new one has
+to decline too. A caller's later fallbacks treat "declined" differently from "pinned", so an
+answer the new side alone gives is a behaviour change until a sweep proves otherwise. Measure at
+the function that is being replaced, not at a downstream site that sees only the final answer.
+
+The worked instance is `monoHoleGenFnPin`. The elaboration's answer, `et` where it closes and
+otherwise the argument read's one same-arity delivery, matched the final pin at all 230 site-hits
+of `monoPinHoleParam`. Switched inside `monoHoleGenFnPin`, it broke two programs and changed one
+program's output. Measured at the function over 23,456 programs (`tests/**`, the distilled corpus
+and both inventories' witnesses), against the chain it would replace:
+
+| source | site | agree | old only | new only | differ | both decline |
+| --- | --- | --- | --- | --- | --- | --- |
+| `et` at the frame's key | hole | 35 | 8 | 114 | 0 | 1 |
+| `et` | type parameter | 6 | 2 | 5 | 0 | 6 |
+| argument read's delivery | hole | 42 | 0 | 52 | 1 | 63 |
+| argument read's delivery | type parameter | 8 | 0 | 5 | 0 | 6 |
+
+The chain itself no longer reads the flow table. `monoHoleGenFnFlowTy` reads `elabSlotDeliveries`
+and `elabSlotOnlyCall` at the read's binding, so there is no table reader to retire here, and the
+57 new pins would be a capability change to grade one by one. `monoHoleGenFnPin` stays as it is.
+
 ### 3.4 emit_mono's decision arms, measured (2026-11-05)
 
 A coverage probe counted, per program, every `if`/`else` body in `emit_mono.vl` at master f0caaf0:
