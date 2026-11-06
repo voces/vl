@@ -1,3 +1,5 @@
+import { i32ListHas } from "./listutil"
+import { fnIndexBySid, fnStmts } from "./emit_state"
 // `emit_base.vl` — the emitter's pure vocabulary: type-name analysis (`name*`/`ty*`/
 // `ann*`/`ret*`/`nul*`), monomorphization name logic (`mono*`/`gae*`), and low-level
 // string/byte/opcode helpers. Touches no emitter state; a leaf the emitter (and
@@ -47,8 +49,8 @@ import {
   sidOf,
   sidOfNode,
 } from "./symbols"
-import { isNullTy, nulLitUnionPeelTy } from "./tyquery"
-import { isPatTyIxOf, luIsTyOf } from "./check_list_union"
+import { isNullTy, nulLitUnionPeelTy, tyHasTyVar } from "./tyquery"
+import { isPatTyIxOf, isVarTyIxOf, luIsTyOf } from "./check_list_union"
 // ── the type-name grammars this file calls, homed in `tyname.vl` ──
 // A leaf with zero imports; this file binds them for its own calls and republishes
 // none — every emitter module asks the home directly. The layering is one-directional:
@@ -136,6 +138,10 @@ import {
   tsKind,
   tsMentionsAnyName,
   tsText,
+  callTyArgsOf,
+  elseIfLink,
+  nodeContains,
+  nodeSpineChildren,
 } from "./ast"
 import { hexVal } from "./strutil"
 import {
@@ -3958,4 +3964,243 @@ export function setShapeOfTy(ty: i32): i32 {
     return -2
   }
   0
+}
+
+// Does the subtree at `ix` carry a spelling `monoFoldTyParamLayout` substitutes — an `is`
+// whose check type mentions a type parameter, or a `T.field` layout constant? Those are
+// the two places a type parameter reaches the emitter as source text. Walked through
+// `nodeChildren` rather than a second copy of the fold's arm ladder, which would drift.
+export function monoNodeNamesTyParam(ix: i32, typarams: string[]) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if typarams.length == 0 { return false }
+  const n = nodeAt(ix)
+  if n is IsExpr {
+    if monoAnnHasTyParam(ix, isVarTyIxOf(ix), typarams) { return true }
+  }
+  if n is Member {
+    const mo = nodeAt(n.memObj)
+    if mo is Ident {
+      if monoTyParamOf(mo.identName, typarams) != "" { return true }
+    }
+  }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if monoNodeNamesTyParam(kids[i], typarams) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Whether a binding of `names` could reach an `is` check type or a `T.field` layout constant,
+// in the subtree at `ix` or in a generic it calls with a type argument naming them or an
+// argument whose type has a type variable. Those spellings would answer the default, so a
+// parameter that reaches one stays unbound. `seen` holds the callees already walked.
+export function monoTyParamReachesSpelling(
+  ix: i32,
+  names: string[],
+  seen: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if monoNodeNamesTyParam(ix, names) { return true }
+  if monoListIsUnhandable(ix, names, ix) { return true }
+  monoTyParamCallReaches(ix, names, seen)
+}
+
+// Whether an `is K[]` under `ix` tests a receiver whose type names one of `names` and whose arm
+// reads it where it cannot be handed an empty `K[]` in place of the default's (D4911): a field,
+// whose region reads it through another place of the same name.
+export function monoListIsUnhandable(ix: i32, names: string[], body: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is IsExpr {
+    const kTy = isVarTyIxOf(ix)
+    const rTy = nodeTyIxOf(n.isObj)
+    if (
+      kTy >= 0
+      && kTy < T.tys.length
+      && tyAt(kTy) is TyArray
+      && rTy >= 0
+      && rTy < T.tys.length
+      && monoAnnHasTyParam(-1, rTy, names)
+    ) {
+      const r = nodeAt(unwrapParen(n.isObj))
+      if r is Member && narrowRegionReads(body, ix, r.memProp, true) == 2 {
+        return true
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if monoListIsUnhandable(k, names, body) { return true }
+  }
+  false
+}
+
+// `monoTyParamReachesSpelling`'s walk over the generic calls in the subtree at `ix`.
+export function monoTyParamCallReaches(
+  ix: i32,
+  names: string[],
+  seen: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is Call && n.callFn >= 0 {
+    const cf = nodeAt(n.callFn)
+    if cf is Ident {
+      const fe = sidArrGet(fnIndexBySid, sidLookup(cf.identName))
+      if fe >= 0 && fe < fnStmts.length && !i32ListHas(seen, fe) {
+        const g = nodeAt(fnStmts[fe])
+        if g is FuncDecl {
+          if g.fnTyParams.length > 0 && monoCallMayBind(ix, n.callArgs, names) {
+            seen.push(fe)
+            if monoTyParamReachesSpelling(g.fnBody, g.fnTyParams, seen) {
+              return true
+            }
+          }
+        }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if monoTyParamCallReaches(kids[i], names, seen) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Whether the call `callIx` can hand a binding of `names` to its callee: a written type
+// argument naming one, or an argument whose type is unknown or has a type variable.
+export function monoCallMayBind(callIx: i32, args: i32[], names: string[]): boolean {
+  for ta in callTyArgsOf(callIx) {
+    if monoAnnHasTyParam(ta, -1, names) { return true }
+  }
+  for a in args {
+    const at = nodeTyIxOf(a)
+    if at < 0 || tyHasTyVar(at) { return true }
+  }
+  false
+}
+
+// Whether any parameter annotation in `params` names one of `typarams`.
+export function monoParamsMention(params: i32[], typarams: string[]): boolean {
+  let i = 0
+  while i < params.length {
+    const p = nodeAt(params[i])
+    if p is Param {
+      if p.parType >= 0 {
+        if monoAnnHasTyParam(p.parType, -1, typarams) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Where `isIx` sits under `ix`: 0 not there, 2 when a region it narrows reads `name` (an `if`
+// or `while` body or else, the right of an `&&`/`||`, and the block's later statements after an
+// `if` whose condition negates the test), 3 for that negated `if` before its block is read,
+// else 1. A later `is` over the same receiver is not a read.
+export function narrowRegionReads(
+  ix: i32,
+  isIx: i32,
+  name: string,
+  field: boolean,
+): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if ix == isIx { return 1 }
+  const n = nodeAt(ix)
+  if n is IfStmt {
+    const c = narrowRegionReads(n.ifCond, isIx, name, field)
+    if c == 0 {
+      const t = narrowRegionReads(n.ifThen, isIx, name, field)
+      if t != 0 { return t }
+      return narrowRegionReads(n.ifElse, isIx, name, field)
+    }
+    if (
+      c == 2
+      || nodeReadsName(n.ifThen, name, field)
+      || nodeReadsName(n.ifElse, name, field)
+    ) {
+      return 2
+    }
+    return if condNegates(n.ifCond, isIx) { 3 } else { 1 }
+  }
+  if n is WhileStmt {
+    const c = narrowRegionReads(n.whileCond, isIx, name, field)
+    if c == 0 { return narrowRegionReads(n.whileBody, isIx, name, field) }
+    if c == 2 || nodeReadsName(n.whileBody, name, field) { return 2 }
+    return if condNegates(n.whileCond, isIx) { 3 } else { 1 }
+  }
+  if n is BinExpr && (n.binOp == "&&" || n.binOp == "||") {
+    const c = narrowRegionReads(n.binLeft, isIx, name, field)
+    if c == 0 { return narrowRegionReads(n.binRight, isIx, name, field) }
+    if c == 2 || nodeReadsName(n.binRight, name, field) { return 2 }
+    return c
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    const k = narrowRegionReads(kids[i], isIx, name, field)
+    if k == 3 && n is Block {
+      let j = i + 1
+      while j < kids.length {
+        if nodeReadsName(kids[j], name, field) { return 2 }
+        j = j + 1
+      }
+      return 1
+    }
+    if k != 0 { return k }
+    i = i + 1
+  }
+  0
+}
+
+// Whether `name` is read anywhere under `ix`, as an identifier or, for a `field`, a member; the
+// receiver of an `is` is not a read.
+export function nodeReadsName(ix: i32, name: string, field: boolean): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if field && n is Member && n.memProp == name { return true }
+  if !field && n is Ident && n.identName == name { return true }
+  if n is IsExpr {
+    const r = nodeAt(unwrapParen(n.isObj))
+    if !field && r is Ident && r.identName == name { return false }
+    if field && r is Member && r.memProp == name {
+      return nodeReadsName(r.memObj, name, field)
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeReadsName(kids[i], name, field) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether the condition `ix` holds the test `isIx` under an odd number of negations, counting
+// `!` and a `!is` itself.
+export function condNegates(ix: i32, isIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if ix == isIx { return n is IsExpr && n.isNeg != 0 }
+  if n is Unary && n.unOp == "!" { return !condNegates(n.unArg, isIx) }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeContains(kids[i], isIx) { return condNegates(kids[i], isIx) }
+    i = i + 1
+  }
+  false
 }
