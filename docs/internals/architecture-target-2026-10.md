@@ -1526,6 +1526,33 @@ elaboration fact that should carry the same answer: `monoWalkIdentCall`'s instan
   half and the value half" below). The only spelling left is an instance the elaboration has no key
   for; the 4 bundle members that section names are keyed since #6461.
 
+**`monoIfChainRebuildPinned` is aligned (2026-11-06).** It retypes a rebuilt value `if` link in an
+instance at a pinned join. Shadowed by rep (`repCanonKey`) against the instance's elaborated type
+of that `if` (`elabNodeTy(at, elabWalkTop())`, where closed and other than the template's type), over
+the 23,103 programs (2,638 reach it):
+
+| outcome | events |
+| --- | --- |
+| both answer, agree | 983 |
+| both answer, differ | 5 |
+| old only | 0 |
+| new only | 384 (227 programs) |
+| neither | 6,101 |
+
+The 5 that differ are narrower or boxed pins: `string` where the elaboration has `string | i32`
+(D3366), `(A|B|null)` against `(A|B)?`, and `f64?` against `(f64|i32)?`. Retyping at the
+elaboration's type wherever mono retypes leaves 499 of those 500 programs byte-identical, and the
+one that moves prints the same. Whether to retype at all stays mono's gate (ruling (a)), so the
+function stays.
+
+**Named follow-up: the 384 new retypes.** Mono declines them because it computes no join (231),
+because its pin leaves the template type (105), or because `monoPinKeepsMembers` refuses (48).
+Taking them with the gate read off the elaboration would delete the six helpers only this function
+uses: `monoIfArmsAllTy`, `monoIfArmsPinJoin`, `monoHoleJoinPinsString`, `monoHoleJoinHasAtomArm`,
+`monoPinKeepsMembers` and `monoCoalOverTpJoin`. Over the 227 programs, taking them leaves 223
+byte-identical and moves 2. It makes `generics/generic-optchain-map-get-coalesce-scalar.vl` a
+compiler trap, which is the first thing that capability PR must fix.
+
 **Shadow of `monoHoleGenFnPin`** (the signature a generic handed to a hole parameter takes), against
 `callArgRepTy` over `elabCallParamTy` at `monoPinHoleParam`: 83 programs agree, 0 disagree, and 4 get
 no elaboration answer: `closures/generic-fn-value-returned-through-identity-hole.vl`,
