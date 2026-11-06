@@ -100,6 +100,7 @@ import {
   inferObservedLitSet,
   inferObservedSet,
   listCopyTyIx,
+  litRetUnionIx,
   mapUnboxTyIx,
   nodeBoxTyIx,
   nodeCtxTyIx,
@@ -7649,6 +7650,40 @@ function repStampUnion(ix: i32, u: i32): i32 {
   1
 }
 
+// Records union `u` (members `ms`) against each object literal call `x` hands back: an argument
+// of the call's own type, or of a nested such call, which exactly one member of `ms` matches both
+// ways (D8381). An instance's re-check records nothing; 0.
+function retLitAdoptUnion(x: i32, u: i32, ms: i32[], depth: i32): i32 {
+  const c = nodeAt(x)
+  if !(c is Call) || depth <= 0 || elabCapLive() || repTemplateMuted {
+    return 0
+  }
+  const ct = nodeTyIxOf(x)
+  for a in c.callArgs {
+    const ax = parenPeelIx(a)
+    const at = if ax >= 0 { nodeTyIxOf(ax) } else { -1 }
+    if ax >= 0 && tyMutual(at, ct) {
+      const an = nodeAt(ax)
+      if an is Call {
+        retLitAdoptUnion(ax, u, ms, depth - 1)
+      } else if an is ObjLit && nodeRepTyIxOf(ax) == at {
+        let n = 0
+        for m in ms {
+          if tyMutual(m, at) { n = n + 1 }
+        }
+        if n == 1 { litRetUnionIx[ax] = u }
+      }
+    }
+  }
+  0
+}
+
+// Whether types `a` and `b` are each assignable to the other; false for a hole.
+function tyMutual(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  assignable(a, b) && assignable(b, a)
+}
+
 // The list member of union `u` the array literal `ix` is built at: the first whose element type
 // each element has exactly, else the first each element fits, else the first list member, looking
 // through `| null` and nested unions (a recursive alias's union holds itself that way); -1 for none.
@@ -7910,8 +7945,12 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       if any != 0 && d is TyObj { repStamp(srcExpr, dtix) }
       return any
     }
-    // A fresh `Map()` or `Set()` is built as the map it is delivered to.
+    // A call handing a literal back delivers it into a union destination; a fresh `Map()` or
+    // `Set()` is built as the map it is delivered to.
     Call => {
+      if d is TyUnion {
+        return retLitAdoptUnion(srcExpr, dtix, d.uMembers, depth)
+      }
       if !(d is TyMap) || !freshLitValue(srcExpr) { return 0 }
       if freshSetCall(srcExpr) { return setCtorKeyNote(srcExpr, d.mKey) }
       return repStamp(srcExpr, dtix)
