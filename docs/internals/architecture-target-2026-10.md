@@ -1770,7 +1770,8 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   instanced, by design). The tag decision is per node, so it refuses the set for both. It needs a
   per-instance rep for one node (the per-instance mint; `fnCloCoerceSetAt` gives up at -2 for the
   same reason). Controls: a map holding `inc` and written `id`, directly or through `fill`, called
-  at two types, is a check reject at both spellings, as the design says.
+  at two types, is a check reject at both spellings, as the design says. The per-instance mint's
+  population was measured over the same programs: `fnCloCoerceSetAt`'s -2 had 0 hits.
 - **The map-of-records holder kind** (3, and D15493's gain): the tag side and the rep stamp are done
   on `claude/fnd-mrec` (holder kind 8, a `null`-check and a void-tail holder arm, the record
   literal written into a map slot or through a parameter, `fnTagRepTyIn` stamping a map's record
@@ -1790,7 +1791,9 @@ about 600 are new-only and 22,518 decline on both sides. The byte sweep moves 4 
   `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
   `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
   named fallback, a defaulting rule rather than a missing fact. The elaboration should own the
-  default eventually, but not in this change.
+  default eventually, but not in this change. After the two `nokey-gen` key fixes below, 2 `nokey-gen`
+  parameters remain, both this default: `id` called inside a lambda forwarder no call instances
+  (`generics/mono-lambda-forwarder-uninstantiated.vl:49` and `:54`), which mono pins at `i32`.
 - **A call inside a body mono cloned** (12 `noframe`), which the walk top does not index:
   `len$m…$2` in `generics/typaram-list-union-param-forwards-to-generic.vl`, `inc3$1` in
   `closures/hole-fn-record-field-called-at-other-param.vl`.
