@@ -49,14 +49,15 @@ When the walk-top instance gives no closed type, the tag is `<why>:xyz`. `<why>`
 | `nokey-nonident` | no key, and the callee is not an identifier |
 | `nokey-emptylist` | no key, and the argument is an empty list |
 
-`xyz…` grades seven other elaboration sources against mono's pin, one letter each, in this order:
+`xyz…` grades eight other elaboration sources against mono's pin, one letter each, in this order:
 1. the instances the parameter itself carries (`elabCallParamTyOwn`);
 2. the argument's own type (`elabNodeTyAgreed`);
 3. the bundle signatures (`elabCallBundleSigs`), several compared as mono's bundle record;
 4. the tagged set the argument carries (`monoArgTaggedSetTy`), spelled as the ids it is stored as;
 5. the parameter's type with the shadow aliases a rename minted (`T__sh<d>`) bound as their names;
 6. the parameter's open type, when mono's pin spells it the same;
-7. the one signature the callee calls the parameter at, which `elabCallBundleSigs` drops as no bundle.
+7. the one signature the callee calls the parameter at, which `elabCallBundleSigs` drops as no bundle;
+8. the checker's closed type for the callee's parameter, as a solved hole leaves it.
 
 Each letter is `a` when that source agrees with mono, `d` when it disagrees and `n` when it gives
 nothing. A non-generic callee whose annotated row does not match reads `no:argrep-dis`.
