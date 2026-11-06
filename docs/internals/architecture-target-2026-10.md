@@ -2293,6 +2293,32 @@ Open, not acted on: an exported function's function-typed parameter takes the ta
 closed-world set, so a call through it dispatches over the program's own members even when a host
 calls the export. Closed-world tag set vs open needs a host-ABI ruling.
 
+**B2-prep: the literal roots are an elaboration fact** (2026-11-06). `mfrLitsRun` runs straight after
+`elabRun`, before any emit rewrite mints a node the write index does not cover, and fills per
+declaration the list, record and `Map()` literals it can hold (`mfrLitsOf`). The links are the chain
+walk's: a binding's every write, a parameter's every argument unless its function is exported, a
+function's returns, `??` (a `null` side adds nothing), a member or operator call through
+`elabCallDeclOf`, a slice's receiver, a map read at any key through `cwSlotWrittenValues`, and an
+element or field of a literal. A function's name is a leaf. A binding minted after the elaboration
+stands for its initialiser when that is a covered literal or a read of a covered binding; that
+serves `emit_rewrite`'s `spillLocal` (`asg#<ix>#<tag>`) and its capture-cell write temp (`__cbv<n>`).
+Its shadow against the walkers' `mfrVals`, over the 23,456-program population with each value read
+as its literal or the generic it names: 5,327 agree, 3 walker-only, 5 differ, 2,436 elaboration-only
+(wider). Walker-only: 3 minted spills the pass-through declines (two
+`asg#` spills whose initialiser is not a plain read, in `eval-order/compound-assign-place-once.vl`,
+and `lists/concat-nested-right-operand.vl`), which stay on mono. Differ: 4 are `.slice()`, whose
+walker root is the spread literal `monoFlowSliceAsSpread` mints; that literal is mono's class-(c)
+mechanic, so B2's consumer maps a binding initialised by `.slice()` to mono's minted literal rather
+than to the receiver's. The fifth is `simd/f32x4-positions.vl`'s `sb = Buffer(16)`, where the
+elaboration also sees the return inside `Buffer`'s shared-memory branch: the walkers' set was an
+under-approximation.
+Its 2,436 elaboration-only roots are three classes, and every program among them builds today.
+215 hold only non-generic functions, which canonicalise to nothing mono plans. 1,986 hold a generic
+function and no container (`let v = id`, `const g = r.f`, a parameter handed one): those are callee
+reads, and the chain gate (`mfrChainFns`) owns them, so **B2's consumer takes container roots only**
+and a second consumer of a function-only set is not added. The 232 container roots are B2's
+widening, sweep-proven with every mover named; a subclass that moves output is declined.
+
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
 move no output. These are the reads the gate does not answer: an argument handed on, a loop over a
