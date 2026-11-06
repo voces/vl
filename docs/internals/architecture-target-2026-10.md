@@ -1605,17 +1605,29 @@ and closes 1 the fallback closed only by substitution (`generics/hole-lambda-cal
 whose `(_) => _` walk type the binding closes). It differs in none. Switched: the fallback block is
 gone, and `er` keeps its old meaning (the hole instance's own elaboration answer) for the box
 registration and the literal-member gate, so the switch is byte-neutral over all 19,316 programs.
-The helpers stay: `monoLamReachParamTy` still serves the parameter pin, and `monoRetReadsHoleParam`
-serves `monoLamTyNamesHoleValue`.
+The helpers went with the parameter side, below.
 
 **Shadow of `monoLamParamPinAnn`** (the parameter side, same population). The binding's substitution,
 else `monoLamReachParamTy` (D7181), was compared against the elaboration's walk type of the parameter,
 with a hole read from the binding. 654 programs reach the pin: 597 agree and 37 close nothing on
 either side. 53 are old-only, where the elaboration keeps the parameter open: a type variable of
 another declaration (`U`/`V`) on a lambda held in a written `let`, a capture cell or a returned
-lambda called across instances, or a hole `_`. 10 are new-only, and none differs. The parameter pin,
-and `monoLamReachParamTy` with it, waits for the elaboration to type those lambdas' parameters per
-instance.
+lambda called across instances, or a hole `_`. 10 are new-only, and none differs.
+
+The binding's substitution stays first, so what the elaboration has to replace is the reach rung
+alone. `elabLamParamTy` (emit_elab) answers it: the walk type's closed parameter, else the one
+closed function type the lambda is delivered at under the walk top (`elabSlotDeliveries`), else
+the one its node climbs to under the walk top, else under any key. Measured on the reach rung's
+own cells (programs, 19,316 run): 4 agree, 21 new-only, 0 old-only, 0 differ. Switched, and
+`monoLamReachParamTy` is deleted; the 21 new-only build byte-identical.
+
+`monoRetReadsHoleParam` (D2878) asked syntactically whether a `const` lambda the instance only
+calls returns a hole parameter or a field chain off one. Asked instead whether the template's
+return names a variable that the elaboration types closed, and not a function, at the instance:
+4 programs agree, 0 old-only, and 58 new-only lambdas (mostly `() => <capture>` with a closed
+scalar or nullable result) build byte-identical. Switched, and the helper is deleted with the
+`monoCgcHoleParams` table and `monoHoleParamNames` that only fed it. Both switches are byte-neutral
+over all 19,316 programs against a master fixpoint.
 
 **Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), re-measured on
 2026-11-06, master `611070b80`, with `scripts/inst-shadow/run.sh` over 23,380 programs: `tests/cases`,
@@ -1809,7 +1821,7 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, ~~`monoReachSlotPins` 546~~, ~~`monoDeclPathPinsOrReach` 173~~, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, ~~`monoReachSlotPinsAt` 78~~.
 - [ ] **node type** (29): `monoCloseRetFnTy` 9,592, `monoInitHeldTy` 6,742, `monoArgClosedTyIn` 5,475, `monoPinBin` 4,320, `monoPinnedOperandTy` 3,781, `monoSubstLetType` 3,348, `monoCloneLetDecl` 3,020, `monoCoerceListCbArg` 2,889, `monoPinReturnedObj` 1,945, `monoCbFnListRowSpell` 1,107, `monoDeadNullTest` 882, `monoCgcTplTy` 668, `monoRetFnListTy` 608, `monoPinnedAnnTyAt` 509, `monoLeafParamPin` 420, `monoBoundFnListElemsTy` 352, `monoPinnedReadTy` 341, `monoClosedObjLitTy` 174, `monoLetAnnTyOf` 66, `monoHoleFnPinTy` 33, `monoLetWriteRhsTyRec` 15, `monoPinnedListElemPin` 14, `monoLetWritesRecord` 6, `monoModuleDupPin` 3, `monoArgOpenValueTy` 1, `monoModuleLetPin` 0, `monoClosedFieldValTy` 0, `monoLetWriteRhsTy` 0, `monoPinnedListAnnTy` 0.
 - [ ] **slot type** (27): `monoBindingAdoptInit` 9,578, `monoHoleGenFnPin` 7,952, `monoListSrcElemTy` 7,925, `monoReachLitTys` 6,959, `monoReachSlotTy` 6,938, `monoPinMapValues` 6,754, `monoPinFieldContainers` 798, `monoPinRecordFields` 733, `monoLetWritesClosed` 703, `monoPinObjFields` 695, `monoRetypeLamCells` 565, `monoPinRecordField` 466, `monoWritesCoercedFirstCall` 454, `monoPinNestedListElems` 315, `monoPinFieldContainer` 112, `monoPinMapSlot` 66, `monoLetWritesAt` 57, `monoNoteBindCall` 28, `monoPinFieldValue` 25, `monoPinJoin` 22, `monoPinStoredRecords` 20, `monoRenameInitAt` 12, `monoSigJoin` 3, `monoPinnedElemAnnTy` 2, `monoHandWrittenLet` 2, `monoPinMapNestedFnLists` 0, `monoWrittenLetRetsDisagree` 0.
-- [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, `monoLamReachParamTy` 124, `monoRecvParamElem` 41, `monoDeliverLamLit` 6, `monoLamInstSigs` 2.
+- [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, ~~`monoLamReachParamTy` 124~~, `monoRecvParamElem` 41, `monoDeliverLamLit` 6, `monoLamInstSigs` 2.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
 - [ ] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0.
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
