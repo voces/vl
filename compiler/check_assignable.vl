@@ -252,7 +252,8 @@ import {
   fsbOwnerCallee,
   genericBodyClosed,
 } from "./check_generic_args"
-import { HD_PARAM, hdKindIs, holePinHeldSet } from "./check_hole_pins"
+import { HD_PARAM, hdBase, hdKindIs, hdRowOf, holePinHeldSet } from "./check_hole_pins"
+import { nodeLineOf } from "./check_capture_loss"
 import { lbiNoteDelivery } from "./check_lbi_notes"
 import {
   ACF_CHOICE,
@@ -2296,6 +2297,61 @@ function validateChoiceCstr(ci: i32, rat: i32, calleeFn: i32) {
   0
 }
 
+// Refuses demand `ci` at the argument of call `ix` that bound the type parameter its callee is
+// typed by to a closed function, naming the argument, the parameter and the demand's line; false,
+// raising nothing, when the demanded callee is not such a parameter.
+function argCstrFixedErr(
+  rat: i32,
+  rexp: i32,
+  ci: i32,
+  ix: i32,
+  calleeFn: i32,
+  bNames: string[],
+  bTys: i32[],
+): boolean {
+  const r = hdRowOf(argCstr.exp[ci])
+  const base = if r >= 0 && argCstr.form[ci] > 0 { hdBase[r] } else { -1 }
+  const bt = if base >= 0 && base < T.tys.length { tyAt(base) } else { null }
+  if !(bt is TyVar) { return false }
+  const bound = bindOf(bNames, bTys, bt.tvName)
+  if bound < 0 || !(tyAt(bound) is TyFunc) || tyHasTyVar(bound) { return false }
+  const cn = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  const fn = if calleeFn >= 0 && calleeFn < P.nodes.length { nodeAt(calleeFn) } else { null }
+  if !(cn is Call) || !(fn is FuncDecl) { return false }
+  let i = 0
+  while i < fn.fnParams.length && i < cn.callArgs.length {
+    const pt = nodeTyIxOf(fn.fnParams[i])
+    const pv = if pt >= 0 && pt < T.tys.length { tyAt(pt) } else { null }
+    const a = cn.callArgs[i]
+    if pv is TyVar && pv.tvName == bt.tvName && tySame(nodeTyIxOf(a), bound) {
+      const an = nodeAt(parenPeelIx(a))
+      const who = if an is Ident { "`" + an.identName + "`" } else { "this argument" }
+      tErr(
+        who
+          + " is passed as `"
+          + bt.tvName
+          + "`, but `"
+          + fn.fnName
+          + "` calls `"
+          + bt.tvName
+          + "` with `"
+          + tyToStr(widenLitTy(rat))
+          + "` (line "
+          + i32ToStr(nodeLineOf(argCstr.call[ci]))
+          + "); "
+          + who
+          + " takes `"
+          + tyToStr(rexp)
+          + "`",
+        a,
+      )
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
 // Re-validates every deferred call-argument constraint this call's callee owns
 // (`cstrOwnedBy`), substituting the hole to the call's argument type. A hole that substitutes
 // to another hole is re-recorded under it for the outer call that pins it, and only where the
@@ -2393,12 +2449,17 @@ export function validateArgCstrs(
         bTys,
       )
       if gWant >= 0 && !assignable(rat, gWant) {
-        argCstrErr(litPinnedOr(rat, ci, hNames, hArgNode), gWant, ci, ix)
+        if !argCstrFixedErr(rat, gWant, ci, ix, calleeFn, bNames, bTys) {
+          argCstrErr(litPinnedOr(rat, ci, hNames, hArgNode), gWant, ci, ix)
+        }
       } else if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
         // An argument still open here (a lambda's `Map()` result) is built at the parameter it
         // reaches, as the direct spelling's delivery pins it.
         if tyReachesEmptyHole(rat, 8) { constrainEmpty(rat, rexp) }
-        if !argCstrFitsAt(rat, rexp, ci, hNames, hArgNode) {
+        if (
+          !argCstrFitsAt(rat, rexp, ci, hNames, hArgNode)
+          && !argCstrFixedErr(rat, rexp, ci, ix, calleeFn, bNames, bTys)
+        ) {
           argCstrErr(litPinnedOr(rat, ci, hNames, hArgNode), rexp, ci, ix)
         }
       }
