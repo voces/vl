@@ -1982,6 +1982,15 @@ untagged map whose generic is called at two signatures, mono's one-signature spe
 a rep spelling, not a type, and waits on a holder bundle fact (D15494). Over 19,318 programs with
 fixpoint seeds no byte moves, and 4,601 filed witnesses grade as filed.
 
+**Slot type, record fields** (2026-11-06). `monoPinRecordField`'s 10 mono-only decisions were
+gates in the slot close, not missing facts. An instance's binding now falls back to its
+initialiser's closed type there (`elabNodeTy`), and a member not instanced per call answers from its
+own signature: four now agree. The four D15494-shape decisions (a generic in a field called at two
+types) join its grading list. The last two (`inRecord`: a written `let` of nested lambdas in an
+instance) need a nested member read from its instances under the key; that admits the fact but mints
+late demands for the lambdas, so it waits until the run foresees them. No byte moves over 19,318
+programs.
+
 **Slot deliveries, the reach rung deleted** (2026-11-06). `monoDeclPathPinsOrReach` and
 `monoStoredSlotFnTy` fell back to value reach (`vrCalleeTy`) where the elaboration's slot pins were
 empty. Over the 23,456 programs the reach rung never answered alone: at 1,553 site-hits the pins
