@@ -35,7 +35,7 @@ import {
   orderArgsByParamNames,
 } from "./ast"
 import { monoIsGenericDecl, normTypeAtom, unwrapParen } from "./emit_base"
-import { declTyIxOfName, repNameCanonId } from "./emit_rep"
+import { declTyIxOfName } from "./emit_rep"
 import { fnStmts } from "./emit_state"
 import { i32ListHas, strListHas } from "./listutil"
 import {
@@ -61,7 +61,6 @@ import {
   TyVar,
   tyAt,
   tyEmitNameKey,
-  tyToEmitName,
   tyToStr,
 } from "./check_types"
 import { nonNullTy, tyHasTyVar } from "./tyquery"
@@ -135,12 +134,6 @@ let pinFn: i32[] = []
 // The call each pin is taken at, -1 for an annotation.
 let pinAt: i32[] = []
 let ffPinSkip: {[i32]: boolean} = Map()
-// A slot's closed directed pin keys (`ffPathPinKeys`) at `2 * slot`, sigs, and `2 * slot + 1`,
-// rets, set where `ffKeyHas` is; valid while no slot, edge or pin has been added since
-// (`ffKeyStamp`), and bypassed by a query with `ffPinSkip` set (D4942).
-let ffKeyMemo: string[][] = []
-let ffKeyHas: boolean[] = []
-let ffKeyStamp: i32[] = [-1, -1, -1]
 let dfEdgeN = 0
 
 // A context is one walk of a function body: the type bindings its type variables take. Context 0
@@ -199,9 +192,6 @@ export function fnFlowShadowBegin() {
   dfTo = []
   dfPin = []
   dfEdgeN = 0
-  ffKeyMemo = []
-  ffKeyHas = []
-  ffKeyStamp = [-1, -1, -1]
   ffDeclSlots = Map()
   ffDeclSlotCtx = Map()
   ffCallCtx = Map()
@@ -1529,11 +1519,6 @@ function ffInstCtx(ix: i32, fn: i32): i32 {
   ctx
 }
 
-function ffTyKey(t: i32): string {
-  if t < 0 { return "-" }
-  tyToEmitName(t)
-}
-
 // A binding's part of a context key: equal where `ffTyKey`'s are, short for a deep record (D2780).
 function ffCtxTyKey(t: i32): string {
   if t < 0 { return "-" }
@@ -1674,110 +1659,7 @@ function ffAgreedPinHit(d: i32, path: string[], cx: i32, ann: boolean): i32 {
   hit
 }
 
-// The distinct returns annotated destinations pin the slot `path` (`e`, `v`, `f.<name>`; empty is
-// the value) of `d` at, in walk instance `inst` of generic `tmpl` (-1, -1 outside one); a call's pin
-// names no return and is left out. `[FF_PIN_DECLINE]` with no table, no walk of `d`, or walks that
-// disagree with none picked out by the instance.
-export function fnFlowDeclPathPinRets(
-  d: i32,
-  path: string[],
-  inst: i32,
-  tmpl: i32,
-): string[] {
-  ffDeclPathPinKeys(d, path, inst, tmpl, true)
-}
-
-// The pins' parameter lists (`p1,p2,`), or their returns when `rets`, as `fnFlowDeclPathPinRets`
-// picks them.
-function ffDeclPathPinKeys(
-  d: i32,
-  path: string[],
-  inst: i32,
-  tmpl: i32,
-  rets: boolean,
-): string[] {
-  const decline: string[] = [FF_PIN_DECLINE]
-  if !ffBuilt || d < 0 { return decline }
-  const o = ffOrigDecl(d)
-  const slots = ffDeclSlots[o] ?? []
-  const ctxs = ffDeclSlotCtx[o] ?? []
-  if slots.length == 0 { return decline }
-  const first = ffPathPinKeys(slots[0], path, rets)
-  let agree = true
-  let i = 1
-  while i < slots.length {
-    if !ffSameSigs(first, ffPathPinKeys(slots[i], path, rets)) { agree = false }
-    i = i + 1
-  }
-  if agree { return first }
-  if tmpl < 0 || inst < 0 { return decline }
-  const ps = ffInstParamSpells(inst, tmpl)
-  let pick = decline
-  i = 0
-  while i < slots.length && i < ctxs.length {
-    const c = ctxs[i]
-    if (c >= 2 && ffWalked(tmpl, c) && ffCtxFits(tmpl, c, ps)) {
-      const sigs = ffPathPinKeys(slots[i], path, rets)
-      if pick.length == 1 && pick[0] == FF_PIN_DECLINE { pick = sigs }
-      else if !ffSameSigs(pick, sigs) { return decline }
-    }
-    i = i + 1
-  }
-  pick
-}
-
 export const FF_PIN_DECLINE = "?"
-
-// The closed pins (`ffPinSigsOf`, or `ffPinRetsOf` when `rets`) taken downstream of the slot
-// `path` derives from slot `s`; empty when no walk derived a step of the path.
-function ffPathPinKeys(s: i32, path: string[], rets: boolean): string[] {
-  let r = s
-  for k in path {
-    r = ffKidOf(ffFind(r), k)
-    if r < 0 { return [] }
-  }
-  if ffPinSkip.length > 0 {
-    if rets { return ffPinRetsOf(ffDirectedPins(r)) }
-    return ffPinSigsOf(ffDirectedPins(r))
-  }
-  if (
-    ffKeyStamp[0] != ufPar.length
-    || ffKeyStamp[1] != dfEdgeN
-    || ffKeyStamp[2] != pinTys.length
-  ) {
-    ffKeyMemo = []
-    ffKeyHas = []
-    ffKeyStamp = [ufPar.length, dfEdgeN, pinTys.length]
-  }
-  let at = 2 * r
-  if rets { at = at + 1 }
-  if at < ffKeyHas.length && ffKeyHas[at] { return ffStrCopy(ffKeyMemo[at]) }
-  const keys = if rets { ffPinRetsOf(ffDirectedPins(r)) } else { ffPinSigsOf(ffDirectedPins(r)) }
-  while ffKeyHas.length <= at {
-    const none: string[] = []
-    ffKeyMemo.push(none)
-    ffKeyHas.push(false)
-  }
-  ffKeyMemo[at] = keys
-  ffKeyHas[at] = true
-  ffStrCopy(keys)
-}
-
-// A fresh copy of `xs`, so a caller that extends an answer leaves the memo alone.
-function ffStrCopy(xs: string[]): string[] {
-  const out: string[] = []
-  for x in xs { out.push(x) }
-  out
-}
-
-// Whether the lists `a` and `b` hold the same strings.
-function ffSameSigs(a: string[], b: string[]): boolean {
-  if a.length != b.length { return false }
-  for x in a {
-    if !strListHas(b, x) { return false }
-  }
-  true
-}
 
 // The pins taken at every slot `s`'s value reaches along the directed edges, `s` included.
 function ffDirectedPins(s: i32): i32[] {
@@ -1830,18 +1712,6 @@ function ffPinSpell(t: i32): string {
   out + s.slice(st, s.length)
 }
 
-// The distinct closed pins among `ids`, each as `p1,p2,`, in the order first taken.
-function ffPinSigsOf(ids: i32[]): string[] {
-  const out: string[] = []
-  for id in ids {
-    if (!ffPinOpen(id) && !(ffPinSkip[pinFn[id]] ?? false)) {
-      const sig = ffPinSig(id)
-      if !strListHas(out, sig) { out.push(sig) }
-    }
-  }
-  out
-}
-
 // Pin `id`'s parameter list spelled `p1,p2,`.
 function ffPinSig(id: i32): string { fnFlowPinSigOf(pinTys[id]) }
 
@@ -1850,18 +1720,6 @@ export function fnFlowPinSigOf(tys: i32[]): string {
   let sig = ""
   for t in tys { sig = sig + ffPinSpell(t) + "," }
   sig
-}
-
-// The distinct returns of the closed pins among `ids` an annotation took, in the order first taken.
-function ffPinRetsOf(ids: i32[]): string[] {
-  const out: string[] = []
-  for id in ids {
-    if !ffPinOpen(id) && pinRet[id] >= 0 {
-      const r = ffPinSpell(pinRet[id])
-      if !strListHas(out, r) { out.push(r) }
-    }
-  }
-  out
 }
 
 // The `LetDecl` node the walk saw for declaration `d`, else `d` when it is one; -1 otherwise.
@@ -1909,129 +1767,10 @@ function ffBuild(stmts: i32[]) {
   0
 }
 
-function ffJoin(xs: string[]): string {
-  let out = ""
-  let i = 0
-  while i < xs.length {
-    if i > 0 { out = out + ", " }
-    out = out + xs[i]
-    i = i + 1
-  }
-  "(" + out + ")"
-}
-
 // Whether pin `id` leaves a parameter type unknown or open.
 function ffPinOpen(id: i32): boolean {
   for t in pinTys[id] {
     if t < 0 || tyHasTyVar(t) { return true }
-  }
-  false
-}
-
-function ffSpellSame(a: string, b: string): boolean {
-  if a == b { return true }
-  const ca = repNameCanonId(a)
-  ca >= 0 && ca == repNameCanonId(b)
-}
-
-// Whether pin `pin` (a rendered list) is the parameter spelling list `ps`.
-function ffPinFits(pin: string, ps: string[]): boolean {
-  if pin == ffJoin(ps) { return true }
-  const inner = pin.slice(1, pin.length - 1)
-  const parts: string[] = []
-  let st = 0
-  let depth = 0
-  let i = 0
-  while i < inner.length {
-    const ch = inner[i]
-    if ch == '(' || ch == '[' || ch == '{' || ch == '<' { depth = depth + 1 }
-    if ch == ')' || ch == ']' || ch == '}' || ch == '>' { depth = depth - 1 }
-    if ch == ',' && depth == 0 {
-      parts.push(inner.slice(st, i))
-      st = i + 2
-    }
-    i = i + 1
-  }
-  if inner.length > 0 { parts.push(inner.slice(st, inner.length)) }
-  if parts.length != ps.length { return false }
-  let k = 0
-  while k < ps.length {
-    if !ffSpellSame(parts[k], ps[k]) { return false }
-    k = k + 1
-  }
-  true
-}
-
-// Function `fn`'s parameter spellings in the final tree, "?" for one still un-annotated.
-function ffParamSpells(fn: i32): string[] {
-  const out: string[] = []
-  const fd = nodeAt(fn)
-  if fd is FuncDecl {
-    for pi in fd.fnParams {
-      const p = nodeAt(pi)
-      if p is Param {
-        let sp = "?"
-        if p.parType >= 0 && p.parType < P.nodes.length {
-          const tn = nodeAt(p.parType)
-          if tn is TypeRef {
-            sp = tn.tyName
-          } else {
-            const t = nodeTyIxOf(p.parType)
-            if t >= 0 { sp = tyToEmitName(t) }
-          }
-        }
-        out.push(sp)
-      }
-    }
-  }
-  out
-}
-
-// The hole binding of the instance the next pin question is asked in, staged by the caller.
-let ffInstHoleN: string[] = []
-let ffInstHoleT: i32[] = []
-
-// Stages the hole binding `n`/`t` of the instance the next pin questions are asked in.
-export function fnFlowStageInstHoles(n: string[], t: i32[]) {
-  ffInstHoleN = n
-  ffInstHoleT = t
-  0
-}
-
-// `ffParamSpells` of instance `inst` of template `tmpl`, an un-annotated parameter spelled at
-// the template's type under the staged hole binding when that closes it.
-function ffInstParamSpells(inst: i32, tmpl: i32): string[] {
-  const out = ffParamSpells(inst)
-  const ft = nodeTyIxOf(tmpl)
-  if ffInstHoleN.length == 0 || ft < 0 || ft >= T.tys.length { return out }
-  const fty = tyAt(ft)
-  if !(fty is TyFunc) || fty.fnParamTypes.length != out.length { return out }
-  let k = 0
-  while k < out.length {
-    let pt = fty.fnParamTypes[k]
-    if out[k] == "?" && pt >= 0 && tyHasTyVar(pt) {
-      pt = substTyDeep(pt, ffInstHoleN, ffInstHoleT)
-      if pt >= 0 && !tyHasTyVar(pt) { out[k] = tyToEmitName(pt) }
-    }
-    k = k + 1
-  }
-  out
-}
-
-// Whether template `t`'s parameter types under context `c`'s bindings spell `ps`.
-function ffCtxFits(t: i32, c: i32, ps: string[]): boolean {
-  const ft = nodeTyIxOf(t)
-  if ft < 0 || ft >= T.tys.length { return false }
-  const fty = tyAt(ft)
-  if fty is TyFunc {
-    const want: string[] = []
-    for pt in fty.fnParamTypes {
-      let u = pt
-      if tyHasTyVar(u) { u = substTyDeep(u, ctxBN[c], ctxBT[c]) }
-      if u < 0 || tyHasTyVar(u) { return false }
-      want.push(ffTyKey(u))
-    }
-    return ffPinFits(ffJoin(want), ps)
   }
   false
 }
