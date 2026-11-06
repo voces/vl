@@ -2201,6 +2201,27 @@ Any other node minted after `elabRun` still keeps the walkers' choice.
 One program's bytes move with the same output: `closures/hole-fn-list-reached-through-alias-called-in-callback.vl`,
 where the elaboration names several generics and the read is no longer rewritten.
 
+**B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
+off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
+move no output. These are the reads the gate does not answer: an argument handed on, a loop over a
+literal, a spread or slice, a map store through a parameter. B2 replaces the planner's literal roots
+with the chain walk's and must recover all 16:
+- argument reads: `generics/fn-value-generic-copied-returned-or-aliased-handed.vl`,
+  `generics/fn-value-generic-container-read-listed-or-stored.vl`,
+  `generics/fn-value-generic-handed-from-call-map-or-repointed-let.vl`;
+- spreads and slices: `closures/generic-list-spread-copy-written.vl`,
+  `closures/generic-list-spread-copy-written-inside-function.vl`,
+  `closures/hole-fn-generic-pushed-list-spread.vl`, `closures/generic-list-sliced-called-at-two-types.vl`,
+  `closures/generic-list-to-unannotated-param.vl`;
+- map stores through a parameter: `closures/hole-fn-generic-map-handed-two-maps.vl`,
+  `closures/hole-fn-generic-map-stored-through-parameter.vl`;
+- no call fixes the type: `closures/container-of-generic-flow-reads.vl`,
+  `closures/hole-fn-generic-in-map-called-at-two-types.vl`,
+  `closures/list-of-generic-element-called-at-its-stub-signature.vl`;
+- `closures/hole-fn-in-record-field-at-field-call-instance.vl`,
+  `closures/lambda-called-directly-with-generic-at-two-signatures-beside-one-signature-consumer.vl`,
+  `closures/container-of-generic-read-positions.vl`.
+
 Letting the elaboration also choose the candidates (option B) fails the soundness bar. Over the 7,538
 sweep programs, with the gate "a `const` or unwritten `let` whose slot nothing writes later", 23
 programs move output, lose a run, or build a refusal fixture. The gate still needs three facts:
