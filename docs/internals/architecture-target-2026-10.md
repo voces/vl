@@ -1386,7 +1386,7 @@ still exports and who reads each one. The file goes when every row is checked.
 | ~~`fnFlowDeclPathOnlyPinCall`~~ (done, #6480) | `monoPinOpenCallLams` | lane F | the forward climb's one call (`elabValueOnlyCall`) |
 | ~~`fnFlowDeclPathAgreedPinTys`~~ (done, #6479) | `monoElemFnPinTys`, `monoHoleGenBindFnArgs` | cad | the agreed pin read off member instance keys or the check's slot-call index |
 | ~~`fnFlowDeclPathAgreedPinTysSkipping`~~ (done, #6479) | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
-| `fnFlowCallPathAnnPinTys` | `monoPathSlotPinnedFnTy` (via `monoListSlotPinnedFnTy`) | builder | an annotated destination's parameters for a list element handed on to it; witness above |
+| ~~`fnFlowCallPathAnnPinTys`~~ (done) | `monoPathSlotPinnedFnTy` (via `monoListSlotPinnedFnTy`) | builder | `slotAnnFnTyOf`: the closed function type a parameter is annotated with, noted where a slot read is handed to it (`fnSlotAnnNote`) |
 | ~~`fnFlowDeclFn`~~ (done, #6475) | `monoDeclFrameIn`, `monoReadIsBinding` | lane F | `recEnclosingFn` |
 | ~~`FF_PIN_DECLINE`~~ (moved: `PIN_DECLINE`, `emit_sig_tokens.vl`) | `monoDeclPathKeys`, `monoDeclPathKeysIn`, `monoDeclPathPinsPerInstance`, `monoSlotRetName`, `monoSlotRetCount` | builder | none needed: its readers are all mono's own, so the sentinel moves to a module mono imports |
 | ~~`fnFlowPinSigOf` (with `ffPinSpell`)~~ (moved: `pinSigOf` / `pinSpell`, `emit_sig_tokens.vl`) | `monoDeclPathKeysIn`, `monoElemPinTysUnder`, `monoFlowSlotPins`, `monoPinFnParamTys`, `monoReachSlotPins` | builder | none needed: pure spelling of a parameter list; moves beside `sigKeyOfTy` in `emit_sig_tokens.vl` |
