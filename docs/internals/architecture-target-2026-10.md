@@ -1679,7 +1679,7 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 
 | family | owning elaboration fact | functions | programs reached, most | held by |
 |---|---|---|---|---|
-| unbound default | an elaboration-owned default for an unbound type parameter or hole | 12 | 18,170 | — |
+| unbound default | an elaboration-owned default for an unbound type parameter or hole | 12 | 18,170 | split-dep |
 | slot held fns | `elabSlotHeldFns` of the binding or slot | 29 | 9,604 | split-dep |
 | slot deliveries | `elabSlotDeliveries` of the binding or cell | 9 | 9,601 | — |
 | node type | `elabNodeTyAt` at the instance | 29 | 9,592 | — |
@@ -1707,8 +1707,8 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
 
-The unbound default comes first. It is the only family no lane holds in part, and every program
-reaches it through `monoElabDefaultsPrime`. It is also the §3.4 tail's second item.
+The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
+with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
 
 #### Next stage, first item: a per-call delivered-rep fact
 
