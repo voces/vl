@@ -119,16 +119,9 @@ let dfTo: i32[][] = []
 let dfPin: i32[][] = []
 let ffDeclSlots: {[i32]: i32[]} = Map()
 let ffDeclSlotCtx: {[i32]: i32[]} = Map()
-// Per pre-mono direct call of a generic, the context it walks its callee in; -1 when two walks of
-// the call's own frame give it two.
-let ffCallCtx: {[i32]: i32} = Map()
 
-// A pin is the parameter types a class is called or annotated at, in the context that read
-// them, and the return an annotation gives it (-1 for a call); `pinName` renders them once the
-// compile is over.
+// A pin is the parameter types a class is called or annotated at, in the context that read them.
 let pinTys: i32[][] = []
-let pinRet: i32[] = []
-let pinName: string[][] = []
 // The function each pin is taken in, -1 in module code, and the functions a query leaves out.
 let pinFn: i32[] = []
 // The call each pin is taken at, -1 for an annotation.
@@ -194,10 +187,7 @@ export function fnFlowShadowBegin() {
   dfEdgeN = 0
   ffDeclSlots = Map()
   ffDeclSlotCtx = Map()
-  ffCallCtx = Map()
   pinTys = []
-  pinRet = []
-  pinName = []
   pinFn = []
   pinAt = []
   ctxKeyIx = Map()
@@ -522,12 +512,11 @@ function ffTyHasFn(ty: i32, depth: i32): boolean {
 }
 
 // ── sources and pins ─────────────────────────────────────────────────────────────────────────
-function ffAddPin(s: i32, tys: i32[], ret: i32, at: i32) {
+function ffAddPin(s: i32, tys: i32[], at: i32) {
   const r = ffFind(s)
   if r < 0 { return 0 }
   const id = pinTys.length
   pinTys.push(tys)
-  pinRet.push(ret)
   pinFn.push(ffFn)
   pinAt.push(at)
   ufPin[r].push(id)
@@ -542,7 +531,7 @@ function ffPinTy(s: i32, ty: i32, depth: i32) {
   if !ffTyHasFn(ty, 0) { return 0 }
   const t = tyAt(ty)
   if t is TyFunc {
-    if !tyHasTyVar(ty) { ffAddPin(s, t.fnParamTypes, t.fnRet, -1) }
+    if !tyHasTyVar(ty) { ffAddPin(s, t.fnParamTypes, -1) }
     ffPinTy(ffKid(s, "r"), t.fnRet, depth + 1)
     let i = 0
     while i < t.fnParamTypes.length {
@@ -1171,7 +1160,7 @@ function ffSlotCall(ix: i32, s: i32, fl: i32[]): i32 {
       ffInto(ffKid(s, "p" + i32ToStr(i)), af)
       i = i + 1
     }
-    if s >= 0 { ffAddPin(s, tys, -1, ix) }
+    if s >= 0 { ffAddPin(s, tys, ix) }
     const res = ffKid(s, "r")
     const rr = ffFind(res)
     if rr >= 0 && !typed { ffFactAdd(ufResAt, ufRes[rr], rr, ffFn) }
@@ -1450,11 +1439,7 @@ function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
   const ctx = ffInstCtx(ix, fn)
   if n is Call {
     if fd is FuncDecl {
-      if monoIsGenericDecl(fn) {
-        ffRecord(callee, 2, -1)
-        const was = ffCallCtx[ix] ?? ctx
-        ffCallCtx[ix] = if was == ctx { ctx } else { -1 }
-      }
+      if monoIsGenericDecl(fn) { ffRecord(callee, 2, -1) }
       ffEnsureWalked(fn, ctx)
       const ord = ffArgsInParamOrder(n, fd)
       for a in n.callArgs {
@@ -1600,36 +1585,17 @@ function ffPinSkipFns(fns: i32[]) {
   for f in fns { ffPinSkip[ffOrigDecl(f)] = true }
 }
 
-// The result of the annotation pinning the slot `path` of `d` in the walk `call` makes, with its
-// parameter types pushed onto `tys`, when every pin there, call or annotation, agrees on one closed
-// parameter list and every annotation on one result; -1 when no annotation pins it.
-export function fnFlowCallPathAnnPinTys(
-  d: i32,
-  path: string[],
-  call: i32,
-  tys: i32[],
-): i32 {
-  let cx = ffCallCtx[call] ?? -1
-  if cx < 2 { cx = -1 }
-  const hit = ffAgreedPinHit(d, path, cx, true)
-  if hit < 0 || pinAt[hit] >= 0 || pinRet[hit] < 0 || tyHasTyVar(pinRet[hit]) {
-    return -1
-  }
-  for t in pinTys[hit] { tys.push(t) }
-  pinRet[hit]
-}
-
 // `fnFlowDeclPathAgreedPinTys` over the walks of context `cx`, every walk when it is -1.
 function ffAgreedPinTys(d: i32, path: string[], cx: i32, tys: i32[]): boolean {
-  const hit = ffAgreedPinHit(d, path, cx, false)
+  const hit = ffAgreedPinHit(d, path, cx)
   if hit < 0 { return false }
   for t in pinTys[hit] { tys.push(t) }
   true
 }
 
-// The one agreed closed pin `ffAgreedPinTys` reads, an annotation's when `ann` admits them and one
-// pins the slot; -1 when the pins do not agree, or `ann` is false and an annotation pins it.
-function ffAgreedPinHit(d: i32, path: string[], cx: i32, ann: boolean): i32 {
+// The one agreed closed call pin `ffAgreedPinTys` reads; -1 when the pins do not agree or an
+// annotation pins the slot.
+function ffAgreedPinHit(d: i32, path: string[], cx: i32): i32 {
   if !ffBuilt || d < 0 { return -1 }
   let hit = -1
   const o = ffOrigDecl(d)
@@ -1646,12 +1612,9 @@ function ffAgreedPinHit(d: i32, path: string[], cx: i32, ann: boolean): i32 {
     if r >= 0 {
       for id in ffDirectedPins(r) {
         if !(ffPinSkip[pinFn[id]] ?? false) {
-          if (pinAt[id] < 0 && !ann) || ffPinOpen(id) { return -1 }
+          if pinAt[id] < 0 || ffPinOpen(id) { return -1 }
           if hit >= 0 && ffPinSig(hit) != ffPinSig(id) { return -1 }
-          if hit >= 0 && pinAt[hit] < 0 && pinAt[id] < 0 {
-            if ffPinSpell(pinRet[hit]) != ffPinSpell(pinRet[id]) { return -1 }
-          }
-          if hit < 0 || pinAt[hit] >= 0 { hit = id }
+          hit = id
         }
       }
     }
