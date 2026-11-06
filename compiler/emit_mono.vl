@@ -34,6 +34,7 @@ import {
   elabDeclIsValue,
   elabLamDeliveredParams,
   elabLamParamTy,
+  elabLitSlotCallRet,
   elabLitSlotCallTys,
   elabNodeTy,
   elabParamReadOtherThanCalled,
@@ -411,7 +412,6 @@ import {
   monoFrameInstTmpl,
   monoNameIsExported,
   monoParamBareTyParam,
-  vrCalleeTy,
   vrCalls,
   vrFrameOf,
   vrIndex,
@@ -7274,7 +7274,7 @@ function monoBindTyParamElab(
 ) {
   const eb = if callIx >= 0 { elabCallBindTy(monoCallTplOf(callIx), tp) } else { -1 }
   const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
-  const sp = if eb >= 0 && !tySame(eb, dt) { monoPinAnnSpelling(eb) } else { "" }
+  const sp = if eb == TY_NEVER { "never" } else if eb >= 0 && !tySame(eb, dt) { monoPinAnnSpelling(eb) } else { "" }
   if sp == "" { return monoBindTyParamDefault(tp, tvN, tvV, tvT) }
   tvN.push(tp)
   tvV.push(sp)
@@ -8120,7 +8120,11 @@ function monoPinCall(ix: i32, n: Call, pNames: string[], pTys: i32[]): i32 {
     const pcallee = nodeAt(n.callFn)
     if pcallee is Member {
       const mc = monoPinMemberCall(ix, n, pcallee, nargs, pNames, pTys)
-      if mc >= 0 { return mc }
+      if mc >= 0 {
+        // The lowered direct call answers from the member call the checker bound.
+        monoNoteCallTpl(ix, mc)
+        return mc
+      }
     }
   }
   if !changed { return ix }
@@ -17731,20 +17735,15 @@ function monoReachLitTys() {
 
 // The call type slot `step` (`e`, `f.<name>`) of literal `a`, of open function type `st`, is
 // pinned at, recorded on each reached callee still open; -1 for a tagged set or no one call type.
-// The climb's agreed tuple (`elabLitSlotCallTys`) answers; value_reach's own type stands where
-// that tuple is missing or its type keeps the enclosing generic's type parameter (§3.4).
+// The climb's agreed tuple (`elabLitSlotCallTys`) answers.
 function monoReachSlotTy(a: i32, st: i32, step: string): i32 {
   if st < 0 || st >= T.tys.length || !(tyAt(st) is TyFunc) { return -1 }
   if fnTagTyIsTagged(st) { return -1 }
   if !tyHasTyVar(st) { return -1 }
   const path = (if step == "e" { "e" } else { "f:" + step.slice(2, step.length) })
     + ","
-  let ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
+  const ct = monoLitSlotCallTy(a, step, 0)
   if ct < 0 { return -1 }
-  if !tyHasTyVar(ct) {
-    const ft = monoLitSlotCallTy(a, step, 0)
-    if ft >= 0 { ct = ft }
-  }
   for c in vrCalls(a, path) {
     if c < 0 || c >= P.nodes.length { continue }
     const cn = nodeAt(c)
@@ -17756,20 +17755,6 @@ function monoReachSlotTy(a: i32, st: i32, step: string): i32 {
     }
   }
   ct
-}
-
-// The type parameters the generic frames enclosing node `a` declare, which each instance binds.
-function monoFrameTyParamsOf(a: i32): string[] {
-  const out: string[] = []
-  let f = vrFrameOf(a)
-  while f >= 0 {
-    const fn = nodeAt(f)
-    if fn is FuncDecl {
-      for tp in fn.fnTyParams { out.push(tp) }
-    }
-    f = vrFrameOf(f)
-  }
-  out
 }
 
 // Adds to `monoInertReach`'s index the subtrees under `roots` not yet in it, such as an
@@ -18925,10 +18910,14 @@ function monoLitSlotCallTy(a: i32, step: string, depth: i32): i32 {
   const vals: i32[] = []
   if !elabLitSlotCallTys(a, step, qs, vals) { return -1 }
   let ft = -1
+  let vi = 0
   for v in vals {
     const ex = monoOpenFnArgDecl(v)
     let r = if ex >= 0 { monoFnDeclRetAt(ex, qs) } else { monoFnTyRetAt(nodeTyIxOf(v), qs) }
     if r < 0 && ex >= 0 { r = elabResultAtParams(ex, qs) }
+    // A result still open takes the one closed type the value's calls agree on.
+    if r < 0 || tyHasTyVar(r) { r = elabLitSlotCallRet(vi) }
+    vi = vi + 1
     if r < 0 { return -1 }
     const et = mkFuncTy(qs, r)
     if ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft) { return -1 }
