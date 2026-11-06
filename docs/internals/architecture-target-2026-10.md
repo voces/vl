@@ -1425,6 +1425,14 @@ The chain itself no longer reads the flow table. `monoHoleGenFnFlowTy` reads `el
 and `elabSlotOnlyCall` at the read's binding, so there is no table reader to retire here, and the
 57 new pins would be a capability change to grade one by one. `monoHoleGenFnPin` stays as it is.
 
+**Named follow-up: the 57 new pins.** The argument read's delivery answers at 52 hole-site and
+5 type-parameter-site calls where `monoHoleGenFnPin` declines today (the table above). Taking
+them is a capability change, not an alignment. Each is graded on its own: an output sweep, the
+run of each moved program, and a named fallback where it moves. Three of them, as first
+switched, broke `generics/list-of-fns-at-generic-list-param.vl` and
+`closures/hole-fn-list-row-index-alias-and-generic-arg.vl` and changed the output of
+`functions/hole-lambda-literal-two-instance-types.vl`.
+
 ### 3.4 emit_mono's decision arms, measured (2026-11-05)
 
 A coverage probe counted, per program, every `if`/`else` body in `emit_mono.vl` at master f0caaf0:
