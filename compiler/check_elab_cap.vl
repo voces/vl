@@ -1664,6 +1664,83 @@ export function fnTagWriteLeavesOf(d: i32, s: i32, out: i32[]): i32 {
   et
 }
 
+// Appends to `out` each value a slot write into a map binding of `held` whose value carries set `s`
+// stores that names member `d`, a write a callee makes through a parameter included, and returns
+// that map's value type; -1 when no such write lands only in maps of `s` (D15531).
+export function fnTagMapWriteLeavesOf(
+  d: i32,
+  s: i32,
+  held: i32[],
+  out: i32[],
+): i32 {
+  let vt = -1
+  for hb in held {
+    const mt = fnMapBindValTy(hb)
+    if mt >= 0 && fnTagSetOfTy(mt) == s {
+      const vals: i32[] = []
+      const ats: i32[] = []
+      if cwSlotWrittenValues(cwKeyOfDecl(hb), ["[]"], vals, ats) >= 0 {
+        for v in vals {
+          if cwFnValueDeclOf(v) == d && !i32ListHas(out, v) {
+            if !fnWriteOnlyIntoMap(v, s) { return -1 }
+            out.push(v)
+            vt = mt
+          }
+        }
+      }
+    }
+  }
+  vt
+}
+
+// The value type of map binding `hb`, a `let` whose initialiser or own type is a map; -1 otherwise.
+function fnMapBindValTy(hb: i32): i32 {
+  if hb < 0 || hb >= P.nodes.length { return -1 }
+  const n = nodeAt(hb)
+  if !(n is LetDecl) { return -1 }
+  const t = if n.letInit >= 0 { nodeTyIxOf(n.letInit) } else { nodeTyIxOf(hb) }
+  const m = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if m is TyMap { m.mVal } else { -1 }
+}
+
+// Whether the store of write value `v` lands only in maps whose value carries set `s`: its target
+// roots at one, or at a parameter every call hands only such maps or such parameters.
+function fnWriteOnlyIntoMap(v: i32, s: i32): boolean {
+  if v < 0 || !cwIxCovers(v) { return false }
+  const p = cwIxUp[v]
+  if p < 0 { return false }
+  const pn = nodeAt(p)
+  let tgt = -1
+  if pn is BinExpr && pn.binOp == "=" && parenPeelIx(pn.binRight) == v {
+    tgt = pn.binLeft
+  } else if pn is Call {
+    const f = nodeAt(parenPeelIx(pn.callFn))
+    if f is Member && f.memProp == "set" { tgt = f.memObj }
+  }
+  if tgt < 0 { return false }
+  const path: string[] = []
+  const root = cwSlotPath(tgt, path)
+  if root < 0 || !(nodeAt(root) is Ident) { return false }
+  fnMapArgOnlyOf(identDeclOf(root), s, 0)
+}
+
+// Whether declaration `d` is a map binding whose value carries set `s`, or a parameter every call
+// hands only such bindings through such parameters.
+function fnMapArgOnlyOf(d: i32, s: i32, depth: i32): boolean {
+  if d < 0 || d >= P.nodes.length || depth > 8 { return false }
+  const mt = fnMapBindValTy(d)
+  if mt >= 0 { return fnTagSetOfTy(mt) == s }
+  if !(nodeAt(d) is Param) { return false }
+  const args: i32[] = []
+  if !cwParamArgs(d, args) || args.length == 0 { return false }
+  for a in args {
+    const ap = parenPeelIx(a)
+    if ap < 0 || !(nodeAt(ap) is Ident) { return false }
+    if !fnMapArgOnlyOf(identDeclOf(ap), s, depth + 1) { return false }
+  }
+  true
+}
+
 // Whether the store of write value `v` lands only in lists widened to `bd`'s set: its target
 // roots at one, or at a parameter every call hands one or another such parameter. The leaf then emits its id at
 // every instance of the writing function.

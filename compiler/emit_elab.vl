@@ -220,6 +220,7 @@ import {
   fnTagArmCalleeOf,
   fnTagCallArms,
   fnTagCallJoinNote,
+  fnTagHeldRepOf,
   fnTagJoinFromNote,
   fnTagLeafSetOf,
   fnTagListTy,
@@ -1721,10 +1722,12 @@ function elabDemandFrom(
   // An argument holding a tagged set binds its hole parameter to the set itself, which no
   // checker instance at the set's rep has.
   const tagged = elabCallTaggedArgs(call, decl, from)
+  const unheld = elabPinsUnheld(call, pTys)
   if (
     !tagged
-    && elabCkUsable(decl, call, from) >= 0
-    && elabCkTakesPins(ck, sig, pTys)
+    && (elabCkUsable(decl, call, from) >= 0
+      || elabCkHeldUsable(decl, call, from, pTys, unheld))
+    && elabCkTakesPins(ck, sig, unheld)
   ) {
     elabReachNote(from, ck, -1)
     const n1 = ekDecl.length
@@ -2196,6 +2199,55 @@ function elabCkUsable(decl: i32, call: i32, from: i32): i32 {
     if ds.length > 0 { return -1 }
   }
   ck
+}
+
+// The checker's instance of `decl` call `call` reaches from `from`, binding a tagged set, where
+// some pin in `pTys` is its argument's held rep (`unheld` leaves those open): the set-bound
+// instance is the one a held argument's pin spells. Else false.
+function elabCkHeldUsable(
+  decl: i32,
+  call: i32,
+  from: i32,
+  pTys: i32[],
+  unheld: i32[],
+): boolean {
+  let held = false
+  let p = 0
+  while p < pTys.length && p < unheld.length {
+    if pTys[p] >= 0 && unheld[p] < 0 { held = true }
+    p = p + 1
+  }
+  if !held || call < 0 || decl < 0 { return false }
+  const ck = elabCallInstFrom(call, from)
+  if ck < 0 || ekDecl[ck] != decl { return false }
+  // The set's own function type is open by nature; only an error type disqualifies it.
+  for t in ekTys[ck] {
+    if t < 0 || t >= T.tys.length || tyMentionsErr(t, 8) { return false }
+  }
+  true
+}
+
+// `pTys` with each pin that is the rep call `call`'s argument is held as left open (-1): that is
+// how mono spells the argument's own instance, not a type the instance binds.
+function elabPinsUnheld(call: i32, pTys: i32[]): i32[] {
+  const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { null }
+  if !(cn is Call) { return pTys }
+  const out = pTys.slice(0, pTys.length)
+  let p = 0
+  while p < out.length && p < cn.callArgs.length {
+    const hr = elabArgHeldRep(parenPeelIx(cn.callArgs[p]))
+    if hr >= 0 && tySame(hr, out[p]) { out[p] = -1 }
+    p = p + 1
+  }
+  out
+}
+
+// The rep the held binding argument `ax` names, or the held literal `ax` is, is stored as; -1
+// where the tag rule stamped none.
+function elabArgHeldRep(ax: i32): i32 {
+  if ax < 0 || ax >= P.nodes.length { return -1 }
+  const d = if nodeAt(ax) is Ident { identDeclOf(ax) } else { ax }
+  if d >= 0 { fnTagHeldRepOf(d) } else { -1 }
 }
 
 // Whether each closed parameter pin in `pTys` is assignable to instance `ck`'s parameter of
@@ -10398,12 +10450,18 @@ function elabHeldFnTy(t: i32, ds: i32[], holder: i32, path: string[]): i32 {
 function elabHeldAtArgs(ds: i32[], pts: i32[]): i32 {
   let r = -1
   for d in ds {
-    if !elabTopFn(d) { return -1 }
+    if !elabTopFn(d) && elabHeldDemands(d) { return -1 }
     const dr = elabHeldOwnResult(d, pts)
     if dr < 0 || (r >= 0 && !tySame(r, dr)) { return -1 }
     r = dr
   }
   if r < 0 { -1 } else { mkFuncTy(pts, r) }
+}
+
+// Whether answering for member `d` demands an instance of it: it is instanced per call.
+function elabHeldDemands(d: i32): boolean {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  !(dn is FuncDecl) || elabFnInstanced(dn)
 }
 
 // The result member `d` gives at parameter types `pts`: a function instanced per call answers from
@@ -10757,8 +10815,12 @@ function elabSlotInstFacts(hs: i32[], fns: i32[]) {
         && !(elabGuessKeys.get(k) ?? false)
         && hn is LetDecl
       ) {
-        const ft = elabSlotClose(h, nodeTyIxOf(h), [hn.letInit], k)
-        if ft >= 0 && !tyHasTyVar(ft) { elabSlotTys[elabSlotKey(h, k)] = ft }
+        let ft = elabSlotClose(h, nodeTyIxOf(h), [hn.letInit], k)
+        // Where the slot close declines, the initialiser's own type at the instance, if closed.
+        if ft < 0 || tyHasTyVar(ft) { ft = elabNodeTy(hn.letInit, k) }
+        if ft >= 0 && ft < T.tys.length && elabTyClosed(ft, 0) {
+          elabSlotTys[elabSlotKey(h, k)] = ft
+        }
       }
       k = k + 1
     }

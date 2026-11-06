@@ -1750,11 +1750,14 @@ onto it, by a hole parameter or by `T` beside `T[]`, and S2b the method spelling
 and `v.fill(v[1])`, whose receiver is the declared callee's first parameter. `monoPinnedListElemPin`
 answered 5 calls in the whole population: S2 and S2b move 4 onto the tagged set, and the fifth, an
 annotated function slot, reads the elaboration's closed type for the parameter. The function is
-deleted. Its price is one late demand per tagged `T[]` call (five in three files): mono pins the
-`T[]` at the list of ids, a spelling no elaboration key uses, so the instance is minted after the
-run. Foreseeing it means keying `T[]` at the id list's rep. The map-of-records holder kind below
-pays the same price, one late demand per helper handed a held map. One follow-up retires all four:
-key a hole or `T[]` parameter handed a held list or map at the held rep in the elaboration.
+deleted. Mono pins the `T[]` at the list of ids, and a hole parameter handed a held map at the
+held map (`monoPinHoleParam`), spellings no elaboration key uses: a held rep is a storage rep, and
+keying the run at it makes the instance's re-check refuse the helper's own store. So the call's own
+set-bound instance answers such a pin instead (`elabPinsUnheld`, `elabCkHeldUsable`): late demands
+fell from 7 to 1 running program; the two refusing fixtures that guard a helper shared by maps of
+different sets count one each. The one left, `use` in `closures/listed-hole-fn-escaping-list.vl`,
+is the closure-list rep of D15010, which mono should read from the elaboration. One helper instance
+serves holders of different sets, since a tagged id is its member's declaration index in every set.
 
 G2's write through a parameter (D15492) lands in the caller's map with its set; what refused it
 was the store into the parameter's slot, which the tag rule now takes when every call hands a
@@ -1766,7 +1769,8 @@ fixture, whose map holding a non-generic keeps the set untagged, 3 written as a 
 `closures/hole-fn-generic-map-stored-through-parameter.vl`, whose `{id}` set three maps keep on
 mono, each alone: `c`, written only directly (served since D15532); `b`, a map of records
 a helper widens to two generics (D15493); and `h`, a map of functions a helper widens to two
-generics (D15531). They move only when all three are served.
+generics (served since D15531: the helper's write is the member's leaf, `fnTagMapWriteLeavesOf`).
+They move only when `b` is served too.
 
 Two of the 13 are residuals with a named blocker, not a missing admission:
 
@@ -1789,8 +1793,8 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   intern, and without it the helper's store refuses. An entry read through `?.` is not a holder:
   `drwOptGuard`'s call gets no id member call, so
   `closures/generic-record-written-into-map-through-param-read-through-optional.vl` runs on mono as
-  on master (a decline, not a refusal). The price is one late demand per helper handed a held map,
-  as with `T[]` above. Two different generics in one map of records still refuse loudly (D15493).
+  on master (a decline, not a refusal). Two different generics in one map of records still refuse
+  loudly (D15493).
 
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
@@ -1979,6 +1983,15 @@ refusal found the second on D10311, D10383, D10401 and D14400. Where the elabora
 untagged map whose generic is called at two signatures, mono's one-signature spelling stays: it is
 a rep spelling, not a type, and waits on a holder bundle fact (D15494). Over 19,318 programs with
 fixpoint seeds no byte moves, and 4,601 filed witnesses grade as filed.
+
+**Slot type, record fields** (2026-11-06). `monoPinRecordField`'s 10 mono-only decisions were
+gates in the slot close, not missing facts. An instance's binding now falls back to its
+initialiser's closed type there (`elabNodeTy`), and a member not instanced per call answers from its
+own signature: four now agree. The four D15494-shape decisions (a generic in a field called at two
+types) join its grading list. The last two (`inRecord`: a written `let` of nested lambdas in an
+instance) need a nested member read from its instances under the key; that admits the fact but mints
+late demands for the lambdas, so it waits until the run foresees them. No byte moves over 19,318
+programs.
 
 **Slot deliveries, the reach rung deleted** (2026-11-06). `monoDeclPathPinsOrReach` and
 `monoStoredSlotFnTy` fell back to value reach (`vrCalleeTy`) where the elaboration's slot pins were
@@ -2290,6 +2303,32 @@ with B2. Use classification stays mono's (syntax, class c).
 Open, not acted on: an exported function's function-typed parameter takes the tag layer's
 closed-world set, so a call through it dispatches over the program's own members even when a host
 calls the export. Closed-world tag set vs open needs a host-ABI ruling.
+
+**B2-prep: the literal roots are an elaboration fact** (2026-11-06). `mfrLitsRun` runs straight after
+`elabRun`, before any emit rewrite mints a node the write index does not cover, and fills per
+declaration the list, record and `Map()` literals it can hold (`mfrLitsOf`). The links are the chain
+walk's: a binding's every write, a parameter's every argument unless its function is exported, a
+function's returns, `??` (a `null` side adds nothing), a member or operator call through
+`elabCallDeclOf`, a slice's receiver, a map read at any key through `cwSlotWrittenValues`, and an
+element or field of a literal. A function's name is a leaf. A binding minted after the elaboration
+stands for its initialiser when that is a covered literal or a read of a covered binding; that
+serves `emit_rewrite`'s `spillLocal` (`asg#<ix>#<tag>`) and its capture-cell write temp (`__cbv<n>`).
+Its shadow against the walkers' `mfrVals`, over the 23,456-program population with each value read
+as its literal or the generic it names: 5,327 agree, 3 walker-only, 5 differ, 2,436 elaboration-only
+(wider). Walker-only: 3 minted spills the pass-through declines (two
+`asg#` spills whose initialiser is not a plain read, in `eval-order/compound-assign-place-once.vl`,
+and `lists/concat-nested-right-operand.vl`), which stay on mono. Differ: 4 are `.slice()`, whose
+walker root is the spread literal `monoFlowSliceAsSpread` mints; that literal is mono's class-(c)
+mechanic, so B2's consumer maps a binding initialised by `.slice()` to mono's minted literal rather
+than to the receiver's. The fifth is `simd/f32x4-positions.vl`'s `sb = Buffer(16)`, where the
+elaboration also sees the return inside `Buffer`'s shared-memory branch: the walkers' set was an
+under-approximation.
+Its 2,436 elaboration-only roots are three classes, and every program among them builds today.
+215 hold only non-generic functions, which canonicalise to nothing mono plans. 1,986 hold a generic
+function and no container (`let v = id`, `const g = r.f`, a parameter handed one): those are callee
+reads, and the chain gate (`mfrChainFns`) owns them, so **B2's consumer takes container roots only**
+and a second consumer of a function-only set is not added. The 232 container roots are B2's
+widening, sweep-proven with every mover named; a subclass that moves output is declined.
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
