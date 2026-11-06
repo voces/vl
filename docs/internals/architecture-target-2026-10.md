@@ -1762,7 +1762,11 @@ holder of the set or a wider one decided with it (`ftParamHolderHolds`), and onl
 value naming a declared function, whose set no call changes. Bucket 1 is 32 parameters in 16
 programs. The map pin (`r5_rt`, the argument's checked type) still answers 13: 5 in D9480's
 fixture, whose map holding a non-generic keeps the set untagged, 3 written as a record `{f: id}`,
-3 an uncalled set (G5), and 2 outside bucket 1.
+3 an uncalled set (G5), and 2 outside bucket 1. The 3 record-written hits are all in
+`closures/hole-fn-generic-map-stored-through-parameter.vl`, whose `{id}` set three maps keep on
+mono, each alone: `c`, written only directly (the m8 row interning below); `b`, a map of records
+a helper widens to two generics (D15493); and `h`, a map of functions a helper widens to two
+generics (D15531). They move only when all three are served.
 
 Two of the 13 are residuals with a named blocker, not a missing admission:
 
@@ -1787,9 +1791,8 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   its literal's row is emit's anonymous mint, which a list holding the same record type twins
   (`closures/map-of-records-beside-list-of-same-record.vl`), so the matrix's `map_value` and
   `map_set` cells wait on one named fact: emit interning a direct-only held map's record row at
-  top level. A set one such binding holds stays untagged whole, so the 3 record-written hits of
-  the map pin in `closures/hole-fn-generic-map-stored-through-parameter.vl` stay with it. Two
-  different generics in one map of records still refuse loudly (D15493).
+  top level. A set one such binding holds stays untagged whole. Two different generics in one map
+  of records still refuse loudly (D15493).
 
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
