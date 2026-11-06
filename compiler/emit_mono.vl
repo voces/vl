@@ -96,7 +96,6 @@ import {
 import {
   bindGenUnionShapedArmInto,
   holePinReadOf,
-  joinPinnedArmLit,
   joinPinnedArmTys,
   nominalStructNameOfTy,
   nulRecListNominalName,
@@ -126,14 +125,13 @@ import {
   nameToTy,
   substTyDeep,
   substTyDeepOf,
-  subtractTy,
   tyProvesNonNull,
   widenLitTy,
 } from "./check_relate_core"
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
-import { cwFnValueDeclOf } from "./check_write_scan"
+import { cwFnValueDeclOf, cwIxBuild } from "./check_write_scan"
 import { tyLeavesDisjoint } from "./check_type_shape"
 import {
   callArgRepTy,
@@ -151,7 +149,7 @@ import {
   luIsTyPut,
   recordClonedIsVarTyIx,
 } from "./check_list_union"
-import { collectRetValues, joinArmIsLit } from "./check_nj_join"
+import { collectRetValues } from "./check_nj_join"
 import {
   callBindAgreedHoles,
   callBindHas,
@@ -777,7 +775,6 @@ import {
   holeNamesTpJoin,
   tpIfJoinAt,
   tvElseBase,
-  tvElseTested,
   tyIsArmedDeferredJoin,
   tyIsTpJoinUnion,
 } from "./check_tp_join"
@@ -3128,14 +3125,27 @@ function monoIfChainRebuildPinned(
       let pty = -1
       // Only a binding the return reads: a sink or a tail re-joins its arms itself. Recorded,
       // not returned: the rebuild goes on and the failure stops the build (D2915).
-      if (
-        !sink
-        && monoPinLetReaches
-        && monoHoleJoinDropsArm(at, raw, monoPinnedTyOf(at, bN, bT), bN, bT)
-      ) {
-        emitFail(
-          "emitProgram: a join of a `??` with a type parameter drops a member of that parameter at this instance",
-        )
+      // A `??` join over a type parameter pinned narrower than the instance's elaborated join loses
+      // a member; the template's join keeps the arm since D14649, so this refusal stays loud (D2915).
+      if !sink && monoPinLetReaches && raw >= 0 && raw < T.tys.length {
+        const rv = tyAt(raw)
+        const pin = monoPinnedTyOf(at, bN, bT)
+        const ej = elabNodeTy(at, elabWalkTop())
+        if (
+          rv is TyVar
+          && rv.tvName.length > 0
+          && rv.tvName[0] == "?"[0]
+          && pin >= 0
+          && pin < T.tys.length
+          && tyAt(pin) is TyUnion
+          && ej >= 0
+          && elabTyClosed(ej, 0)
+          && !assignable(ej, pin)
+        ) {
+          emitFail(
+            "emitProgram: a join of a `??` with a type parameter drops a member of that parameter at this instance",
+          )
+        }
       }
       // A join the checker kept apart as `T | C` is read at the pin wherever it goes (D2906), and
       // so is a `??` over one, whose result the checker re-joins without the mark (D3568).
@@ -3165,35 +3175,6 @@ function monoIfChainRebuildPinned(
   ce
 }
 
-// Whether an `if` join the checker typed as an inference hole `raw` (a `??` result absorbing a
-// type parameter) is pinned at `pty` while its arms' own pinned types join wider: the
-// parameter's member is lost there, and building it would be invalid (D2915).
-function monoHoleJoinDropsArm(
-  at: i32,
-  raw: i32,
-  pty: i32,
-  bN: string[],
-  bT: i32[],
-): boolean {
-  if raw < 0 || raw >= T.tys.length || pty < 0 || pty >= T.tys.length {
-    return false
-  }
-  const rt = tyAt(raw)
-  if !(rt is TyVar) { return false }
-  if rt.tvName.length > 0 && rt.tvName[0] != "?"[0] { return false }
-  if !monoIfArmHasTyVar(at) { return false }
-  const ts: i32[] = []
-  monoPinArmLits = []
-  if monoChainPinnedTys(at, bN, bT, ts) < 0 { return false }
-  const j = joinPinnedArmLit(ts, monoPinArmLits)
-  // Only a box: a scalar pin is re-joined by the return set, and a box is built at `pty`.
-  tyAt(pty) is TyUnion
-    && j >= 0
-    && j < T.tys.length
-    && !tyHasTyVar(j)
-    && !assignable(j, pty)
-}
-
 // `j`, its value-union box registered first when it is a union whose box has a name; a union
 // with a record arm is named only when `refArm` (an `if` whose arms have no pinned join).
 function monoPinUnionBoxed(j: i32, refArm: boolean): i32 {
@@ -3206,112 +3187,6 @@ function monoPinUnionBoxed(j: i32, refArm: boolean): i32 {
   if name != "" { monoRegisterPinUnion(name, j) }
   j
 }
-
-// Whether some arm value along the `if` chain at `ix` is typed with a type parameter.
-function monoIfArmHasTyVar(ix: i32): boolean {
-  let cur = ix
-  while cur >= 0 {
-    const c = nodeAt(cur)
-    cur = -1
-    if c is IfStmt {
-      if monoArmTyHasTyVar(c.ifThen) { return true }
-      if c.ifElse >= 0 {
-        if nodeAt(c.ifElse) is IfStmt { cur = c.ifElse }
-        else if monoArmTyHasTyVar(c.ifElse) { return true }
-      }
-    }
-  }
-  false
-}
-
-function monoArmTyHasTyVar(blockIx: i32): boolean {
-  const v = ifArmValueExpr(blockIx)
-  if v < 0 { return false }
-  const vt = nodeTyIxOf(v)
-  vt >= 0 && vt < T.tys.length && tyHasTyVar(vt)
-}
-
-// Whether `monoArmPinnedTy` is inside a nested arm's own chain.
-let monoArmNested = false
-
-// Appends the pinned types of every arm along the `if` chain at `ix` to `out`: 0, 1 when an arm
-// is itself an `if`, or -1 when an arm has none or the chain has no `else`.
-function monoChainPinnedTys(ix: i32, bN: string[], bT: i32[], out: i32[]): i32 {
-  let nested = 0
-  let cur = ix
-  while cur >= 0 {
-    const c = nodeAt(cur)
-    cur = -1
-    if c is IfStmt {
-      const rt = monoArmPinnedTy(c.ifThen, bN, bT, out)
-      if rt < 0 || c.ifElse < 0 { return -1 }
-      // A `??` desugars to `if x != null { x } …` over one shared `x`, whose recorded type is
-      // the nullable operand's: past its own test that arm cannot be null (D3568).
-      if (
-        rt == 0
-        && out.length > 0
-        && monoArmIsTestedNonNull(c.ifCond, c.ifThen)
-      ) {
-        out.push(nonNullTy(out.pop() ?? -1))
-      }
-      if rt == 1 { nested = 1 }
-      if nodeAt(c.ifElse) is IfStmt {
-        cur = c.ifElse
-      } else {
-        const re = monoArmPinnedTy(c.ifElse, bN, bT, out)
-        if re < 0 { return -1 }
-        if re == 1 { nested = 1 }
-      }
-    }
-  }
-  nested
-}
-
-// Whether `cond` is `x != null` and the then arm `thenIx` yields that same `x` node.
-function monoArmIsTestedNonNull(cond: i32, thenIx: i32): boolean {
-  const cn = nodeAt(unwrapParen(cond))
-  if !(cn is BinExpr) || cn.binOp != "!=" { return false }
-  if !(nodeAt(unwrapParen(cn.binRight)) is NullLit) { return false }
-  const x = unwrapParen(cn.binLeft)
-  const v = unwrapParen(ifArmValueExpr(thenIx))
-  if x < 0 || v < 0 { return false }
-  x == v
-}
-
-// Appends the pinned type of arm block `blockIx`'s tail value to `out`; 0, 1 for an arm that is
-// an `if`, or -1 when it has none. An arm that never completes adds nothing.
-function monoArmPinnedTy(
-  blockIx: i32,
-  bN: string[],
-  bT: i32[],
-  out: i32[],
-): i32 {
-  const v = ifArmValueExpr(blockIx)
-  if v < 0 { return -1 }
-  // An arm whose value is an `if` adds its own arms, as the union lowering joins them (1). One
-  // level only: a deeper nest is left to its template type.
-  if nodeAt(unwrapParen(v)) is IfStmt {
-    if monoArmNested { return -1 }
-    monoArmNested = true
-    const rc = monoChainPinnedTys(unwrapParen(v), bN, bT, out)
-    monoArmNested = false
-    if rc < 0 { return -1 }
-    return 1
-  }
-  const vt = nodeTyIxOf(v)
-  if vt < 0 || vt >= T.tys.length { return -1 }
-  const t = tyAt(vt)
-  if t is TyPrim && t.primName == "never" { return 0 }
-  const pv = monoPinArmSubst(vt, bN, bT)
-  if pv < 0 { return -1 }
-  out.push(pv)
-  monoPinArmLits.push(joinArmIsLit(v))
-  0
-}
-
-// Per type `monoChainPinnedTys` appends, whether that arm's value is a literal; reset by the
-// caller with its list, so the pinned join adapts a literal arm and keeps runtime ones apart.
-let monoPinArmLits: boolean[] = []
 
 // `ty` at the binding `bN`/`bT` widened by the parameters' union-arm bindings, a member no
 // argument bound dropped; -1 when a type parameter remains.
@@ -3473,19 +3348,6 @@ function monoPinRecordTy(nx: i32, ty: i32) {
   0
 }
 
-// The instance's remainder of an `is` else over a type parameter's list (`mkTvElseRemTy`), or -1
-// when `ty` is not one or the instance leaves nothing to subtract.
-function monoElseRemainderAt(ty: i32, bN: string[], bT: i32[]): i32 {
-  if tvElseBase.length == 0 { return -1 }
-  const base = tvElseBase.get(ty)
-  const tested = tvElseTested.get(ty)
-  if base == null || tested == null { return -1 }
-  const sb = monoSubstInst(base, bN, bT)
-  const sx = monoSubstInst(tested, bN, bT)
-  if sb < 0 || sx < 0 || tyHasTyVar(sb) || tyHasTyVar(sx) { return -1 }
-  subtractTy(sb, sx)
-}
-
 // The recorded type of `ix` at the instance binding `bN`/`bT`: substituted where that leaves
 // no type variable, else as recorded. -1 when the node has none. Arithmetic over a gradual
 // union (`T | i32`) records its concrete view, so the instance's own check answers it.
@@ -3518,8 +3380,15 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
     }
     if lits { et = -1 }
   }
-  const rem = monoElseRemainderAt(ty, bN, bT)
-  if rem >= 0 { return if et >= 0 { et } else { rem } }
+  // An `is` else over a type parameter's list reads its remainder at the instance (`mkTvElseRemTy`);
+  // with no closed remainder there the program is refused rather than read unsubtracted.
+  if tvElseBase.get(ty) != null {
+    if et >= 0 { return et }
+    emitFail(
+      "monoPinnedTyOf: an `is` else's remainder has no closed type at this instance",
+    )
+    return ty
+  }
   let st = monoSubstInst(ty, bN, bT)
   // A read the instance narrowed is typed at its narrowing, not at its storage's substitution.
   if st >= 0 && !tyHasTyVar(st) && et >= 0 { return et }
@@ -12588,6 +12457,8 @@ function monoFlowReads(stmts: i32[]): i32 {
 // `let` or `const` declares, resolving to a generic or a function with an un-annotated parameter,
 // declared at module scope under a name nothing else in the program declares.
 function monoFlowAdmitChain(calls: i32[]) {
+  // The chain walk reads the write index; build it here rather than rely on an earlier reader.
+  cwIxBuild()
   const none: i32[] = []
   for c in calls {
     const cn = nodeAt(c)
