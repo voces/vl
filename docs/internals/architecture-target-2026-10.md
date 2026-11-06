@@ -1437,6 +1437,29 @@ switched, broke `generics/list-of-fns-at-generic-list-param.vl` and
 `closures/hole-fn-list-row-index-alias-and-generic-arg.vl` and changed the output of
 `functions/hole-lambda-literal-two-instance-types.vl`.
 
+**The reach pair reads the climb (2026-11-06).** `monoReachListTy` and `monoReachRecTy` are
+deleted. A list or record literal's open function slot is typed at the forward climb's agreed call
+tuple (`elabLitSlotCallTys`) and each value's result there (`elabResultAtParams` where the template
+leaves it open). value_reach's `vrCalleeTy` stays as the gate: a slot it finds no one call type for
+is left open, as before. Of the 380 slots it types over the 23,103 programs (every `tests/cases`
+entry, both inventories, the distilled corpus), 333 take the climb's answer. One of those differs
+from value_reach's: `named/d15209_fs_in_list_half.vl` types `[half]` at `(i32) => f64` where
+value_reach gave `(i32) => i32`, and that program refuses either way. The other 47 keep
+value_reach's own type as a named fallback:
+- 27 whose call type keeps the enclosing generic's own type parameter, which the climb's closed
+  tuple cannot carry (it needs a per-instance tuple);
+- 14 whose one call passes a generic or hole function;
+- 4 the climb reaches no call for;
+- 2 with a spread element.
+A byte sweep of the 23,103 against master's fixpoint seed differs on none.
+
+**Named follow-up: the 222 new reach slots.** The climb answers 222 slots value_reach leaves open:
+- 173 whose value reaches a place value_reach does not follow (`vrLostIn`);
+- 33 whose call sits in a template whose result stays open;
+- 16 where value_reach finds no call.
+None of the 222 is a slot called at two closed types. Taking them is a capability change, graded one
+by one like the 57 above.
+
 ### 3.4 emit_mono's decision arms, measured (2026-11-05)
 
 A coverage probe counted, per program, every `if`/`else` body in `emit_mono.vl` at master f0caaf0:
