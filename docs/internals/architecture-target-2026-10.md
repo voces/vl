@@ -1253,6 +1253,23 @@ both reps. The switch therefore lands:
    fallback named here, rather than a wider rule.
 **The slot-delivery family, landed** (2026-11-06, #6465). `monoDeclPathKeysIn` reads `elabSlotDeliveries`; `rets` mode stays on the table. Known over-width: `closures/binding-copied-through-uncalled-chain.vl` lowers one closure with an unused trailing `i32` parameter that its call site fills (output unchanged), for a later rep pass to drop.
 
+**The slot readers of the agreed pin, landed** (2026-11-06). `monoPathSlotPinnedFnTy` and
+`monoHeldSrcsFnTy` read a slot's pin from the checker's per-slot call index
+(`slotCallArgsInto`, check_calls.vl) in place of `fnFlowCallPathAgreedPinTys` and
+`fnFlowDeclPathAgreedPinTys`. Shadowed at both sites over `tests/cases`, the index first agreed
+at 8 of 14 site-hits. Two gaps closed the rest:
+
+- a call through a `const` copy of a list (`const bs = [...ps]; bs[0](2)`) is noted at the
+  binding the copy reads, so the reader asks that binding (`calleeSlotHolderOf`);
+- one call with no arguments (`ks[0]()`) is a tuple, not the absence of one
+  (`fnSlotCallArgsInto`).
+
+That gave 11 agree with equal tuples, 3 where neither answers, and none on one side only. The
+reader is unkeyed by call. The table's per-call narrowing moved no file: fixpoint seeds against
+master build all 7,538 sweep programs byte-identical with the split plan on and off.
+`fnFlowCallPathAgreedPinTys` is deleted. `fnFlowDeclPathAgreedPinTys` stays for
+`monoHoleGenBindFnArgs`.
+
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
    `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
    `fnFlowStageInstHoles` go with the file.
