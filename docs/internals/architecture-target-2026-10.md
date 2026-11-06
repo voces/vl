@@ -1762,6 +1762,24 @@ programs. The map pin (`r5_rt`, the argument's checked type) still answers 13: 5
 fixture, whose map holding a non-generic keeps the set untagged, 3 written as a record `{f: id}`,
 3 an uncalled set (G5), and 2 outside bucket 1.
 
+Two of the 13 are residuals with a named blocker, not a missing admission:
+
+- **D9480's mixed map** (5): one store node `mm["k"] = id` in `fill` lands as an id of `{id}` in
+  the instance for a map holding only generics, and as `id@i32`'s closure in the instance for a map
+  that holds a non-generic `inc` (its value type is closed, so a generic written there is
+  instanced, by design). The tag decision is per node, so it refuses the set for both. It needs a
+  per-instance rep for one node (the per-instance mint; `fnCloCoerceSetAt` gives up at -2 for the
+  same reason). Controls: a map holding `inc` and written `id`, directly or through `fill`, called
+  at two types, is a check reject at both spellings, as the design says.
+- **The map-of-records holder kind** (3, and D15493's gain): the tag side and the rep stamp are done
+  on `claude/fnd-mrec` (holder kind 8, a `null`-check and a void-tail holder arm, the record
+  literal written into a map slot or through a parameter, `fnTagRepTyIn` stamping a map's record
+  value with ids, mono's hole pin reading that stamp). It is blocked on emit's record-row
+  interning: a literal built inside a callee and written through a parameter into a holder of
+  id-records lands at a second `struct {mut i32}` row beside the map's own, so the one-generic
+  spellings are invalid wasm on the branch. Two different generics in one map of records still
+  refuse loudly there.
+
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
 not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
