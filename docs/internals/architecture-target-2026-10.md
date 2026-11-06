@@ -2117,6 +2117,26 @@ What is left before the planner reads the elaboration:
 - none, 12: nodes minted after `elabRun`, which wait on the same source mapping as the instance
   ladder's tail.
 
+**The `monoFlow*` rewrite, second reading** (2026-11-06). `mfr_shadow` gains two lookups:
+- a read straight out of a literal (`{ f: inc0 }.f(3)`, `[a, b][1]`);
+- a descent along literal index and field steps from the read's root, through `const`s, unwritten
+  `let`s, a call's returned values and a parameter's argument at each call. It declines where the
+  slot is written after it is built (`cwSlotWriteCount`) or where the leaves name different
+  functions.
+
+Over the same population:
+
+| outcome | site-hits | files |
+|---|---|---|
+| agree | 372 | 140 |
+| the elaboration names several | 1 | 1 |
+| the elaboration names none | 14 | 7 |
+| differ | 0 | 0 |
+
+The 14 are the callees of desugared optional calls (`m["k"]?.f(2)`), minted after `elabRun`; S2
+shows they decline harmlessly. The one "several" is a list reached through an alias and called in a
+callback (`closures/hole-fn-list-reached-through-alias-called-in-callback.vl`).
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
