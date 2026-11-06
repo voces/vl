@@ -10,7 +10,13 @@ import {
   monoTyParamReachesSpelling,
 } from "./emit_base"
 import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
-import { fnSlotCalled, fnTagCallSetOf, fnTagCalls } from "./check_elab_cap"
+import {
+  elabHoleRowCut,
+  elabHoleRowMark,
+  fnSlotCalled,
+  fnTagCallSetOf,
+  fnTagCalls,
+} from "./check_elab_cap"
 import { tyArrayElemIx } from "./check_types"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { paramHoleName } from "./check_tp_join"
@@ -248,7 +254,7 @@ import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
 import { monoRecheckEnd } from "./check_demands"
 import { callDstTyOf, cbExpMark, cbExpTruncate } from "./check_expected"
 import { RB_ALL, checkMark, checkRollback } from "./check_rollback"
-import { argIsLitAggregate, bindOf } from "./check_leaf_steps"
+import { argIsLitAggregate, bindOf, i32TyIx } from "./check_leaf_steps"
 import { holePinHeldSet } from "./check_hole_pins"
 import { a20RetWalk } from "./check_nj_gate"
 import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
@@ -12379,6 +12385,38 @@ export function elabValueAgreedCallTys(
   have
 }
 
+// The type parameters the generic frames enclosing the literal `elabLitSlotCallTys` asks about
+// declare; a tuple may stay open in them.
+let elabSlotKeep: string[] = []
+
+// The type parameters the functions enclosing node `a` declare, innermost first.
+function elabFrameTyParams(a: i32): string[] {
+  const out: string[] = []
+  let f = recEnclosingFn(a)
+  let hops = 0
+  while f >= 0 && f < P.nodes.length && hops < 16 {
+    const fn = nodeAt(f)
+    if fn is FuncDecl {
+      for tp in fn.fnTyParams { out.push(tp) }
+    }
+    f = recEnclosingFn(f)
+    hops = hops + 1
+  }
+  out
+}
+
+// Whether type `t` names no type variable but those in `keep` and reaches no inference hole.
+function elabOpenOnlyIn(t: i32, keep: string[]): boolean {
+  if keep.length == 0 || t < 0 || t >= T.tys.length { return false }
+  const fill: i32[] = []
+  for _k in keep { fill.push(i32TyIx()) }
+  // The placeholder asks a question; it pins no hole an instance would be built at.
+  const r0 = elabHoleRowMark()
+  const u = substTyDeep(t, keep, fill)
+  elabHoleRowCut(r0)
+  !tyHasTyVar(u) && !tyReachesHole(u, 16)
+}
+
 // The one closed result the calls `elabValueCallTysOpenFns` last read agree on, or -1.
 let elabSlotCallRet = -1
 
@@ -12471,6 +12509,11 @@ function elabSlotCallTysOpenFns(
           tup.push(w)
           fs.push(-1)
           k = k + tyToStr(w) + ","
+        } else if tyHasTyVar(t) && elabOpenOnlyIn(t, elabSlotKeep) {
+          // Open only in the enclosing generics' own parameters, it stays: each instance binds them.
+          tup.push(t)
+          fs.push(-1)
+          k = k + tyToStr(t) + ","
         } else if tyHasTyVar(t) {
           const fd = cwFnValueDeclOf(a)
           if fd < 0 { return false }
@@ -12622,6 +12665,7 @@ export function elabLitSlotCallTys(
 ): boolean {
   // A literal an instance copied reads its source's values.
   const a0 = if a >= cwIxCoveredLen() { nodeSrc[a] ?? a } else { a }
+  elabSlotKeep = elabFrameTyParams(a0)
   const n = if a0 >= 0 && a0 < P.nodes.length { nodeAt(a0) } else { null }
   // Values a spread copied in are called where the literal's own slot is.
   let fromSpread = -1
