@@ -1214,7 +1214,7 @@ variable over a list is that list's element slot (`calleeSlotOf`). Then 165 of 1
 | `fnFlowPinSigOf` | spelling helper | 4 | `maps/function-valued-map.vl` (3,523 / 554) | needs no table; the table uses it too |
 | `fnFlowElemKind` | syntax | monoPlaceRoot | `std/array-sorted.vl` (3,608 / 495) | needs no table; the table uses it too |
 | `fnFlowWholeSliceRecv` | syntax | monoFlowSliceAsSpread | `closures/generic-list-slice-copy-own-instances.vl` (7 / 2) | needs no table; the table uses it too |
-| `fnFlowDeclFn` | rest | monoDeclFrameIn, monoReadIsBinding | `loops/loop-value.vl` (67,693 / 1,188) | `recEnclosingFn`; last, with a full A/B |
+| `fnFlowDeclFn` | rest | monoDeclFrameIn, monoReadIsBinding | `loops/loop-value.vl` (67,693 / 1,188) | retired: `elabDeclFnOf` (`recEnclosingFn`, through a minted `let`'s anchor) |
 
 The last three are also read by the table's own walk, so they leave with the file. The four
 programs `monoHoleGenFnPin` still has no elaboration answer for split across families: the only-call
