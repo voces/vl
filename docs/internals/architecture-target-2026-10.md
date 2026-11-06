@@ -1222,6 +1222,35 @@ pin (`closures/generic-fn-value-returned-through-identity-hole.vl`, D12340), the
 (`closures/hole-fn-if-join-result-handed-hole-fn.vl`) and the uncalled slot
 (`closures/hole-helper-pushes-listed-member-onto-uncalled-list.vl`). The agreed family's missing fact
 is a pin fixed by calls through a function's result (`fw(x)(y)`, `mk(g).f(3)`).
+
+**The only-call pin is the slot-delivery climb's calls** (2026-11-06, measured on #6465's head
+`732c3b24`, a probe recording every call `elabReadOn`'s callee arm reaches during
+`elabSlotDeliveries` / `elabSlotClimb` from the value `monoHoleGenFnFlowDecl` names). Against
+`fnFlowDeclPathOnlyPinCall` over the 55 `tests/cases` files the table answers in, counting
+site-hits:
+
+| result | hits | files | cause |
+| --- | --- | --- | --- |
+| agree | 68 | 22 | the forward climb's one call is the table's |
+| table only | 18 | 11 | forward gap: the argument edge in `elabReadOn` and `elabSlotAliasOn` resolves a callee only through `identFnDeclOf`, so a call through a function value (`const k = lap; k(id)`, `fs[i](add)`, `if c { p } else { q }` as the callee) stops the climb |
+| elaboration only | 35 | 13 | the table's class is a bidirectional union: `keep((x) => x + 1)` is called only at `q(7)` inside `keep`, but `lap(f) { f(2.5); f(3); keep(f) }` puts `lap.f` and `keep.g` in one class, so the table declines |
+
+No new fact is needed: the climb already follows a value through argument passing, aliases,
+joins, returns, element and field writes and capture cells, and the agreed and skipping pins are
+the same climb's calls with the same forward gap.
+
+**The forward answer is adopted** (coordinator ruling): it is more precise than the class union,
+which pins a value at calls that never reach it. The union also kept the reps of a shared slot
+aligned, and that is the condition the switch carries. A slot one value reaches as a plain closure
+and another as a bundle (`keep.g` above) is called through one body, so the call site has to serve
+both reps. The switch therefore lands:
+
+1. after the forward gap closes (a callee resolved through the value it reads);
+2. graded on output, not bytes alone, with 0 runs → not-runs over the 35 sites that change;
+3. with a witness of the shared-slot shape (a lambda and a bundle reaching one parameter called
+   once) that runs and prints the right values;
+4. falling back to the table's answer wherever the forward answer moves output or validity, each
+   fallback named here, rather than a wider rule.
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
    `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
    `fnFlowStageInstHoles` go with the file.
