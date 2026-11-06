@@ -61,7 +61,11 @@ const show = (rows: Map<string, number>) =>
 
 const expectRows = (name: string, src: string, drop: number, want: string) => {
   const { rc, rows } = shadow(src, drop);
-  if (rc !== 0) throw new Error(`${name}: want compileSrc rc 0, got ${rc}`);
+  // A dropped row leaves the elaboration no reach of the call, which mono refuses loudly where the
+  // instance returns a parameter whose delivered rep it needs (`ELAB_REP_NO_ROW`); the shadow's
+  // rows are still the point.
+  const ok = rc === 0 || (drop !== DROP_NONE && rc === 3);
+  if (!ok) throw new Error(`${name}: want compileSrc rc 0, got ${rc}`);
   const got = show(rows);
   if (got !== want) {
     throw new Error(`${name} (drop ${drop}):\n  want: ${want}\n  got:  ${got}`);
