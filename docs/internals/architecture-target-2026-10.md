@@ -1615,19 +1615,24 @@ another declaration (`U`/`V`) on a lambda held in a written `let`, a capture cel
 lambda called across instances, or a hole `_`. 10 are new-only, and none differs.
 
 The binding's substitution stays first, so what the elaboration has to replace is the reach rung
-alone. `elabLamParamTy` (emit_elab) answers it: the walk type's closed parameter, else the one
-closed function type the lambda is delivered at under the walk top (`elabSlotDeliveries`), else
-the one its node climbs to under the walk top, else under any key. Measured on the reach rung's
-own cells (programs, 19,316 run): 4 agree, 21 new-only, 0 old-only, 0 differ. Switched, and
-`monoLamReachParamTy` is deleted; the 21 new-only build byte-identical.
+alone, and every one of the 53 is a cell the substitution answers. `elabLamParamTy` (emit_elab)
+climbs from the lambda node under the walk top's reach closure, records the calls its value
+reaches as callee, and takes the one closed parameter type across their delivered types. On the
+reach rung's own cells (programs, 19,316 run): 5 agree, 3 new-only, 0 old-only, 0 differ.
+
+A first reader that also took the lambda's walk type and its slot deliveries answered 21 programs
+the rung left open, and pinned a lambda's own per-call hole at the type one call delivers (D1795's
+`use(p)`). That broke 7 filed witnesses and 8 `tests/cases` programs, so the reader asks for calls
+only. Switched, and `monoLamReachParamTy` is deleted. Of the 3 new-only, 2 build byte-identical,
+and `generics/hole-lambda-calls-per-instance.vl` moves bytes but prints the same output.
 
 `monoRetReadsHoleParam` (D2878) asked syntactically whether a `const` lambda the instance only
 calls returns a hole parameter or a field chain off one. Asked instead whether the template's
 return names a variable that the elaboration types closed, and not a function, at the instance:
 4 programs agree, 0 old-only, and 58 new-only lambdas (mostly `() => <capture>` with a closed
 scalar or nullable result) build byte-identical. Switched, and the helper is deleted with the
-`monoCgcHoleParams` table and `monoHoleParamNames` that only fed it. Both switches are byte-neutral
-over all 19,316 programs against a master fixpoint.
+`monoCgcHoleParams` table and `monoHoleParamNames` that only fed it. Against a master fixpoint,
+both switches together move the bytes of 1 of 19,316 programs, the one named above.
 
 **Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), re-measured on
 2026-11-06, master `611070b80`, with `scripts/inst-shadow/run.sh` over 23,380 programs: `tests/cases`,

@@ -11533,22 +11533,34 @@ let elabCallsSeen: i32[] = []
 // of the calls its value reaches as callee in the instance being walked, or in an instance that
 // one reaches; -1 for none, for two, or for a lambda the write index does not cover (D7181).
 export function elabLamParamTy(lam: i32, pi: i32, n: i32): i32 {
-  if pi < 0 || pi >= n || lam < 0 || lam >= cwIxCoveredLen() { return -1 }
-  const k = elabWalkTop()
+  elabLamParamTyAt(lam, pi, n, 0)
+}
+
+// `elabLamParamTy` at nesting `depth`. A call inside another lambda counts only where that
+// lambda's own parameters close the same way: one left open is pinned per call (D12235).
+function elabLamParamTyAt(lam: i32, pi: i32, n: i32, depth: i32): i32 {
+  if pi < 0 || pi >= n || lam < 0 || lam >= cwIxCoveredLen() || depth > 4 {
+    return -1
+  }
   const was = elabDlvKey
   const wasAdmit = elabDlvAdmit
-  elabDlvKey = k
-  elabDlvAdmit = elabReachClosure(k)
+  elabDlvKey = elabWalkTop()
+  elabDlvAdmit = elabReachClosure(elabDlvKey)
   elabCallRec = true
   elabCallsSeen = []
   const reached: i32[] = []
   const seen: i32[] = []
   elabSlotClimb(lam, [], reached, seen)
   elabCallRec = false
+  const calls = elabCallsSeen
   const out: i32[] = []
-  for c in elabCallsSeen { elabCallDeliveryAdd(c, out) }
+  for c in calls { elabCallDeliveryAdd(c, out) }
   elabDlvKey = was
   elabDlvAdmit = wasAdmit
+  for c in calls {
+    const fd = recEnclosingFn(c)
+    if fd != lam && !elabLamParamsClose(fd, depth + 1) { return -1 }
+  }
   let r = -1
   for t in out {
     const f = tyAt(t)
@@ -11561,6 +11573,32 @@ export function elabLamParamTy(lam: i32, pi: i32, n: i32): i32 {
     }
   }
   r
+}
+
+// Whether every un-annotated parameter of `fd` closes by `elabLamParamTyAt`, where `fd` is an
+// anonymous lambda; true for any other function and for -1.
+function elabLamParamsClose(fd: i32, depth: i32): boolean {
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if (
+    !(fn is FuncDecl)
+    || fn.fnName.length <= 9
+    || fn.fnName.slice(0, 9) != "__lambda_"
+  ) {
+    return true
+  }
+  let i = 0
+  while i < fn.fnParams.length {
+    const p = nodeAt(fn.fnParams[i])
+    if (
+      p is Param
+      && p.parType < 0
+      && elabLamParamTyAt(fd, i, fn.fnParams.length, depth) < 0
+    ) {
+      return false
+    }
+    i = i + 1
+  }
+  true
 }
 
 // The parameter types of the one closed function type lambda `lam` is delivered at with `n`
