@@ -2262,7 +2262,8 @@ where the elaboration names several generics and the read is no longer rewritten
 `mfrChainFns` of every call's callee read: one walk down the read's value chain, gated at every
 link. A written binding holds every value written to it; a slot holds every value stored there
 (`cwSlotWrittenValues`, through a callee's parameter too); `??` holds both sides; a parameter
-holds every call's argument. A literal index needs the literal unwritten after its build and the
+holds every call's argument, unless its function is exported, whose callers outside the program
+the walk cannot see. A literal index needs the literal unwritten after its build and the
 index inside it, so a read past the end still traps. A lambda leaf, a parenthesised name (the emitter does not
 instance one taken as a value: [D4120](inventory/D4120.md)), an
 annotation, a parameter default, or any unknown link declines. The read's ROOT must be a `let` or `const`: a read rooted at
@@ -2278,6 +2279,10 @@ deferred until a census shows a walker-rewritten read this declines. `monoFlowDi
 deleted. `monoFlowLetCalls` (its `LetLeaf`) and `monoFlowConstCallArgs` stay: they rename
 ARGUMENT reads, which the gate does not ask about, and switching them off lost 3 runs. They go
 with B2. Use classification stays mono's (syntax, class c).
+
+Open, not acted on: an exported function's function-typed parameter takes the tag layer's
+closed-world set, so a call through it dispatches over the program's own members even when a host
+calls the export. Closed-world tag set vs open needs a host-ABI ruling.
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
