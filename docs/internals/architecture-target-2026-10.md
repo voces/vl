@@ -1308,6 +1308,24 @@ off:
 Without the second fallback, `generics/hole-fn-arg-through-hole-callee.vl` trapped the compiler.
 The shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
 
+**The agreed pin's parameter readers, switched** (2026-11-06). `monoElemFnPinTys` (skipping) and
+`monoHoleGenBindFnArgs` (lamparam) now read `elabValueAgreedCallTys(d, skip, tys)`. That is the one
+closed argument tuple across the calls the value reaches as their callee, recorded through
+`elabCallSink` (which bypasses the delivery memo), leaving out calls inside `skip`.
+`fnFlowDeclPathAgreedPinTys` and `fnFlowDeclPathAgreedPinTysSkipping` are deleted.
+
+- **Skipping site, shadowed over `tests/cases`:** 10 agree, 0 table only, 12 elaboration only,
+  29 neither, 0 differ.
+- **Lamparam site:** reached by no program in a population of 23,451. That population is
+  `tests/**`, the distilled corpus (cells and named, 11,774 files) and both inventories'
+  single-file witnesses. The control is an entry marker in `monoHoleGenBindFnArgs`: it fires once
+  (`closures/generic-returned-to-un-annotated-param-lambda.vl`), with its parameter loop run
+  twice. The zero excludes programs written inline in `tests/*.ts`, so the arm is switched, not
+  deleted.
+
+Fixpoint seeds against master `3682cc74` build all 7,538 sweep programs byte-identical with the
+split plan on and off, the 12 elaboration-only answers included. The shared-slot witness runs.
+
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax, and move out with
    the helpers they need. `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild` and
    `fnFlowShadowBegin` go with the file.
@@ -1343,8 +1361,8 @@ still exports and who reads each one. The file goes when every row is checked.
 | export | read by | owner | replacement |
 | --- | --- | --- | --- |
 | `fnFlowDeclPathOnlyPinCall` | `monoPinOpenCallLams` (fallback only) | cad | the forward climb's one call (`elabValueOnlyCall`), once its two fallback cases close |
-| `fnFlowDeclPathAgreedPinTys` | `monoElemFnPinTys`, `monoHoleGenBindFnArgs` | cad | the agreed pin read off member instance keys or the check's slot-call index |
-| `fnFlowDeclPathAgreedPinTysSkipping` | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
+| ~~`fnFlowDeclPathAgreedPinTys`~~ (done, this PR) | `monoElemFnPinTys`, `monoHoleGenBindFnArgs` | cad | the agreed pin read off member instance keys or the check's slot-call index |
+| ~~`fnFlowDeclPathAgreedPinTysSkipping`~~ (done, this PR) | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
 | `fnFlowCallPathAnnPinTys` | `monoPathSlotPinnedFnTy` (via `monoListSlotPinnedFnTy`) | builder | an annotated destination's parameters for a list element handed on to it; witness above |
 | ~~`fnFlowDeclFn`~~ (done, #6475) | `monoDeclFrameIn`, `monoReadIsBinding` | lane F | `recEnclosingFn` |
 | `FF_PIN_DECLINE` | `monoDeclPathKeys`, `monoDeclPathKeysIn`, `monoDeclPathPinsPerInstance`, `monoSlotRetName`, `monoSlotRetCount` | builder | none needed: its readers are all mono's own, so the sentinel moves to a module mono imports |
