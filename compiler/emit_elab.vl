@@ -12366,6 +12366,75 @@ export function elabValueAgreedCallTys(
   have
 }
 
+// `elabValueAgreedCallTys` over the calls the value of `d` reaches, except that an open argument
+// naming a function declaration is pushed as -1 onto `tys`, with that declaration at the same
+// position of `fas` (-1 elsewhere); false where two calls disagree, or an open argument is not one.
+function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
+  elabCallSink = []
+  elabCallSinkOn = true
+  elabSlotDeliveries(d, [], -1)
+  elabCallSinkOn = false
+  const hits = elabCallSink
+  elabCallSink = []
+  let key = ""
+  let have = false
+  for c in hits {
+    const cn = nodeAt(c)
+    if cn is Call {
+      const tup: i32[] = []
+      const fs: i32[] = []
+      let k = ""
+      for a in cn.callArgs {
+        const t = nodeTyIxOf(a)
+        if t < 0 || t >= T.tys.length { return false }
+        if tyHasTyVar(t) {
+          const fd = cwFnValueDeclOf(a)
+          if fd < 0 { return false }
+          tup.push(-1)
+          fs.push(fd)
+          k = k + "#" + i32ToStr(fd) + ","
+        } else {
+          const w = widenLitTy(t)
+          tup.push(w)
+          fs.push(-1)
+          k = k + tyToStr(w) + ","
+        }
+      }
+      if have && k != key { return false }
+      while tys.length > 0 { tys.pop() }
+      while fas.length > 0 { fas.pop() }
+      for t in tup { tys.push(t) }
+      for f in fs { fas.push(f) }
+      key = k
+      have = true
+    }
+  }
+  have
+}
+
+// Closes each -1 of `tys` (a call tuple of the function `v` holds) at the type `v`'s parameter in
+// that position gives the function `fas` names there: the one closed tuple that parameter is called
+// at, and the function's result at it; false where one does not close.
+function elabCloseFnArgs(v: i32, tys: i32[], fas: i32[]): boolean {
+  const vd = cwFnValueDeclOf(v)
+  const vn = if vd >= 0 && vd < P.nodes.length { nodeAt(vd) } else { null }
+  let i = 0
+  while i < tys.length {
+    if tys[i] < 0 {
+      if !(vn is FuncDecl) || i >= vn.fnParams.length || i >= fas.length {
+        return false
+      }
+      const pq: i32[] = []
+      if !elabValueAgreedCallTys(vn.fnParams[i], [], pq) { return false }
+      const r = elabResultAtParams(fas[i], pq)
+      if r < 0 { return false }
+      tys[i] = mkFuncTy(pq, r)
+    }
+    i = i + 1
+  }
+  true
+}
+
 // The one closed argument tuple every value slot `step` (`e`, or `f.<name>`) of list or record
 // literal `a` holds reaches as its callee (`elabValueAgreedCallTys`), pushed onto `qs`, with those
 // values pushed onto `vals`; false for a spread, a value reaching no call or an open one, or two.
@@ -12390,7 +12459,10 @@ export function elabLitSlotCallTys(
   for v in vals {
     if nodeAt(v) is Spread { return false }
     const q: i32[] = []
-    if !elabValueAgreedCallTys(v, [], q) { return false }
+    const fa: i32[] = []
+    if !elabValueCallTysOpenFns(v, q, fa) || !elabCloseFnArgs(v, q, fa) {
+      return false
+    }
     if have {
       if q.length != qs.length { return false }
       let i = 0

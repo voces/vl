@@ -1985,6 +1985,12 @@ too, and they are graded as newly admitted programs.
   (`mk(7).g()`), which the reach lane's value-returns family owns. The other 4 are answered by the
   binding's slot call tuple (`slotCallArgsInto`), which lands with the deletion. The rung keeps
   reach's decline for the 228 sites only the elaboration answers.
+- **The 13 lambda-argument site-hits now have the climb's tuple.** The open argument is a generic
+  function handed by name (`f(snd)`). `elabLitSlotCallTys` closes it, per slot value, at the one
+  tuple that value's parameter is called at and the function's result there. Re-read on master
+  `e925b06a` over 23,384 programs (counts per program and answer type): agree 175 → 180, reach only
+  20 → 9, differ 1 → 1 (`named/d15209_fs_in_list_half.vl`, already on master), elaboration only
+  132 → 132. No byte moves over the 19,316-program sweep. The 9 left keep the rung.
 - **Value reach's no-call half, dropped where it never decided.** Three gates ask
   `elabSlotUncalled(...) || reach finds no call`. Where the elaboration says the slot is called,
   reach alone said "no call" this often:
