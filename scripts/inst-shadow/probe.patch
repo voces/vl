@@ -30,18 +30,19 @@ index fcf05d290..611e94aa1 100644
  
  export function elabLateAt(i: i32, j: i32): i32 { elabLateNames[i][j] }
 diff --git a/compiler/emit_mono.vl b/compiler/emit_mono.vl
-index 465210b40..7fc666c8d 100644
+index 5099095b3..794655e4a 100644
 --- a/compiler/emit_mono.vl
 +++ b/compiler/emit_mono.vl
-@@ -1,3 +1,7 @@
+@@ -1,3 +1,8 @@
 +import { repCanonKey } from "./emit_rep"
++import { tyHasHole } from "./check_types"
 +import { softenLitTy } from "./check_types"
 +import { strLess } from "./emit_base"
 +import { nodeLineOf } from "./check_capture_loss"
  import {
    LC_CHAIN_LONG,
    lamCellOf,
-@@ -643,6 +647,8 @@ import {
+@@ -643,6 +648,8 @@ import {
    elabCallArgTysAgreed,
    elabCallBindTy,
    elabCallBundleSigs,
@@ -50,7 +51,7 @@ index 465210b40..7fc666c8d 100644
    elabCallHandMember,
    elabCallHandOwner,
    elabCallParamKey,
-@@ -10133,6 +10139,7 @@ function monoMakeInstanceHit(
+@@ -10133,6 +10140,7 @@ function monoMakeInstanceHit(
    while k < monoKeys.length {
      if monoKeys[k] == key {
        monoLastInstFe = monoInstFe[k]
@@ -58,7 +59,7 @@ index 465210b40..7fc666c8d 100644
        monoArmRowNote(calleeIx, monoInstFe[k])
        monoNoteOpenArgs(calleeIx, monoInstFe[k])
        monoPoisonSharedPins(monoInstFe[k], pinTys)
-@@ -10894,6 +10901,7 @@ function monoMakeInstanceRegister(
+@@ -10894,6 +10902,7 @@ function monoMakeInstanceRegister(
    monoInstName.push(instName)
    monoInstFe.push(instFe)
    monoLastInstFe = instFe
@@ -66,7 +67,7 @@ index 465210b40..7fc666c8d 100644
    if twoListTy >= 0 { monoTwoListRet.set(instFe, twoListTy) }
    while fnInstOrigin.length <= instFe { fnInstOrigin.push(-1) }
    if instFe != origFe { fnInstOrigin[instFe] = origFe }
-@@ -22773,6 +22781,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
+@@ -22772,6 +22781,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
        monoMakeCallIx = callIx
        monoOpenLamOwner = callIx
        monoOpenLamDefer = -1
@@ -74,7 +75,7 @@ index 465210b40..7fc666c8d 100644
        const made = monoMakeInstance(
          origFe,
          pinned,
-@@ -25983,7 +25992,10 @@ function monoWalkIdentCall(
+@@ -25982,7 +25992,10 @@ function monoWalkIdentCall(
          monoArmCall = ix
          monoArmCtx = ctx
        }
@@ -85,7 +86,7 @@ index 465210b40..7fc666c8d 100644
        monoWriteCoercedCall = -1
        monoArmCall = -1
        monoNoteBindCall(n.callFn, ctx, ix)
-@@ -26039,6 +26051,121 @@ function monoWalkIdentCall(
+@@ -26038,6 +26051,189 @@ function monoWalkIdentCall(
    return 0
  }
  
@@ -111,28 +112,60 @@ index 465210b40..7fc666c8d 100644
 +  const cn = nodeAt(ix)
 +  const cd = if cn is Call { monoCalleeDeclOf(cn) } else { -1 }
 +  const cdn = if cd >= 0 && cd < P.nodes.length { nodeAt(cd) } else { nodeAt(0) }
++  const args = monoArgsInParamOrder(ix, cd)
++  let gen = false
 +  let line = "@@IS " + i32ToStr(nodeLineOf(ix))
 +  if cdn is FuncDecl {
++    gen = cdn.fnTyParams.length > 0
 +    line = line + " " + (if cdn.fnName == "" { "<lambda>" } else { cdn.fnName })
-+    line = line + (if cdn.fnTyParams.length > 0 { "/gen" } else { "/plain" })
++    line = line + (if gen { "/gen" } else { "/plain" })
 +  } else {
 +    line = line + " ?/plain"
 +  }
-+  if tys.length == 0 { return elabShadowNote(line + " monoopen") }
++  if tys.length == 0 {
++    // Mono declines: does the elaboration close each parameter anyway?
++    line = line + " monoopen"
++    let j = 0
++    while j < args.length {
++      line = line + (if elabCallParamTy(tpl, j) >= 0 { " eo:yes" } else { " eo:no" })
++      j = j + 1
++    }
++    return elabShadowNote(line)
++  }
 +  let i = 0
 +  while i < tys.length {
 +    const e = elabCallParamTy(tpl, i)
++    const pn = if cdn is FuncDecl && i < cdn.fnParams.length { nodeAt(cdn.fnParams[i]) } else { nodeAt(0) }
++    const at = if pn is Param && pn.parType >= 0 { nodeTyIxOf(pn.parType) } else { -1 }
 +    if e < 0 {
-+      line = line + " no:" + elabShadowNoAnswer(tpl, i)
++      const why = elabShadowNoAnswer(tpl, i)
++      const arg = if i < args.length { args[i] } else { -1 }
++      if why == "nokey" && !gen && at >= 0 && !tyHasTyVar(at) {
++        // A non-generic callee's parameter: its rep is the argument's stored row, else the annotation.
++        const ar = if arg >= 0 { recArgRepOf(monoArgSrcOf(arg)) } else { -1 }
++        const want = if ar >= 0 { ar } else { at }
++        const c = instShadowCls(tys[i], want, tpl, i)
++        line = line + (if c == "REAL" { " no:argrep-dis" } else { " argrep" })
++      } else {
++        let sub = why
++        if why == "nokey" {
++          const f = if cn is Call { unwrapParen(cn.callFn) } else { -1 }
++          const fdn = if f >= 0 { nodeAt(f) } else { nodeAt(0) }
++          const ax = if arg >= 0 { unwrapParen(arg) } else { -1 }
++          const axn = if ax >= 0 { nodeAt(ax) } else { nodeAt(0) }
++          if !(fdn is Ident) { sub = "nokey-nonident" }
++          else if !(cdn is FuncDecl) || identDeclOf(f) != cd { sub = "nokey-value" }
++          else if axn is ArrayLit && axn.arrElems.length == 0 { sub = "nokey-emptylist" }
++          else if !gen { sub = "nokey-plainhole" }
++          else { sub = "nokey-gen" }
++        }
++        line = line + " " + instShadowCands(sub, tys[i], tpl, i, arg)
++      }
 +    } else {
 +      const r = callArgRepTy(tpl, i, e)
 +      let c = instShadowCls(tys[i], r, tpl, i)
 +      // A concrete annotation is the parameter's emitted type whatever row the column records.
-+      if c == "REAL" && cdn is FuncDecl && i < cdn.fnParams.length {
-+        const pn = nodeAt(cdn.fnParams[i])
-+        const at = if pn is Param && pn.parType >= 0 { nodeTyIxOf(pn.parType) } else { -1 }
-+        if at >= 0 && !tyHasTyVar(at) && tySame(at, r) { c = "annrow" }
-+      }
++      if c == "REAL" && at >= 0 && !tyHasTyVar(at) && tySame(at, r) { c = "annrow" }
 +      line = line + " " + c
 +      if c == "REAL" {
 +        line = line + "[" + i32ToStr(i) + " mono=" + tyToStr(tys[i]) + " elab=" + tyToStr(r) + "]"
@@ -141,6 +174,42 @@ index 465210b40..7fc666c8d 100644
 +    i = i + 1
 +  }
 +  elabShadowNote(line)
++}
++
++// The tag of a parameter the walk-top instance leaves without a closed type: `<why>:` and, for
++// each other elaboration source in turn (the instances the parameter carries, the argument's own
++// type, the bundle signature), `a` when it agrees with mono's `m`, `d` when it disagrees, `n` when
++// it gives nothing.
++function instShadowCands(why: string, m: i32, tpl: i32, i: i32, arg: i32): string {
++  let out = why + ":"
++  const own = elabCallParamTyOwn(tpl, i)
++  out = out + instShadowCandCh(m, own, tpl, i)
++  const aty = if arg >= 0 { elabNodeTyAgreed(unwrapParen(arg)) } else { -1 }
++  out = out + instShadowCandCh(m, aty, tpl, i)
++  const sigs = elabCallBundleSigs(tpl, i)
++  out = out + instShadowBundleCh(m, sigs, tpl, i)
++  out
++}
++
++// The bundle source: one signature compares as a type, several as mono's bundle record.
++function instShadowBundleCh(m: i32, sigs: i32[], tpl: i32, i: i32): string {
++  if sigs.length == 0 { return "n" }
++  if sigs.length == 1 { return instShadowCandCh(m, sigs[0], tpl, i) }
++  const mt = tyAt(m)
++  if !(mt is TyObj) || mt.objFieldTypes.length != sigs.length { return "d" }
++  for ft in mt.objFieldTypes {
++    let hit = false
++    for sg in sigs {
++      if tySame(sg, ft) { hit = true }
++    }
++    if !hit { return "d" }
++  }
++  "a"
++}
++
++function instShadowCandCh(m: i32, c: i32, tpl: i32, i: i32): string {
++  if c < 0 || tyHasTyVar(c) || tyHasHole(c) { return "n" }
++  if instShadowCls(m, c, tpl, i) == "REAL" { "d" } else { "a" }
 +}
 +
 +// The agreement class of mono's parameter type `m` and the elaboration's `r` (argument `i` of
