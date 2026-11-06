@@ -40,6 +40,7 @@ const probe = (src: string) => {
     bad: Math.floor(g / 1000000),
     bundles: Math.floor((g % 1000000) / 1000),
     wides: g % 1000,
+    built: exp.elabArgBuiltProbe(),
   };
 };
 
@@ -59,6 +60,21 @@ function g(v) {
 }
 const c: A = g({ d: 5 })
 print(c.d ?? 0)
+`;
+
+// A call whose bind row is keyed at its rep builds its argument at the wider record (`erArgBuilt`).
+const REP_KEYED = `type J = { r: i32 | null, g: i32 }
+function idn<T>(v: T): T { v }
+function mk() { { r: 15, g: 1 } }
+const j: J = idn(mk())
+print(j.g)
+`;
+
+// A record handed to a wider declared field (D2060) keeps its own record: no built rep.
+const COVARIANT = `function boundShow<T: { x: i32 | string }>(t: T) {
+  if t.x is i32 { print(t.x) }
+}
+boundShow({ x: 5 })
 `;
 
 const PLAIN = `function id<T>(x: T): T { x }
@@ -95,6 +111,28 @@ Deno.test({
     const got = probe(PLAIN);
     if (got.bad !== 0 || got.bundles !== 0 || got.wides !== 0) {
       throw new Error(`want no rep apart from the type, got ${JSON.stringify(got)}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "elab-arg-rep: an argument a rep-keyed call builds wider records its built record",
+  ignore,
+  fn() {
+    const got = probe(REP_KEYED);
+    if (got.bad !== 0 || got.built < 1) {
+      throw new Error(`want a built record, got ${JSON.stringify(got)}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "elab-arg-rep: a record handed to a wider declared field records no built record",
+  ignore,
+  fn() {
+    const got = probe(COVARIANT);
+    if (got.bad !== 0 || got.built !== 0) {
+      throw new Error(`want no built record, got ${JSON.stringify(got)}`);
     }
   },
 });
