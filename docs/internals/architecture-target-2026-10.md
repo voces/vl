@@ -1471,6 +1471,23 @@ showing each class at least once:
 The 448 retyped cells are not a missing fact. The elaboration knows the emitter retyped the node, so
 the open question is which pass owns the node's type. Order the passes before switching this arm.
 
+**Shadow of `monoPinLamFromCheckedTy`'s pin** (2026-11-06, same population). The lambda's
+contextual parameter types, read off the checker (`monoFnValueParamTys(nodeTyIxOf(lam))`), were
+compared against the one closed delivery `elabSlotDeliveries(lam, [], elabKeyAt(lam))` gives at the
+lambda's arity. 968 programs reach the function, 950 of them leave at the gate because the body calls
+no generic, and 1 takes the D9712 row spelling. Of the 22 that reach the pin, 18 agree and 4 have no
+closed tuple on either side. None differs, none is one-sided, and none has two deliveries. A switch
+is output-neutral but deletes nothing: `monoFnValueParamTys` has three other callers.
+
+**Shadow of `monoCloneLambdaSubst`'s return pin** (`monoLamPinRetAnn`, same population). The
+elaboration's per-instance result of the lambda (`monoLamElabRet`) is asked first, and the binding's
+substitution is the fallback. 690 programs reach a return still naming a type variable. The
+elaboration answers in 272 of them and the fallback runs in 429, closing a pin in 489. The pins are
+mostly scalars, nullables and literal unions (`string` 61, `i32 | string | null` 56, `i32` 51). The
+fallback is live, so the arm and its helpers (`monoSubstInst` at the result, `monoLamReachParamTy`,
+`monoRetReadsHoleParam`) stay until the elaboration types a cloned lambda's result under the instance
+key in those programs. That gap is this family's real blocker.
+
 **Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), re-measured on
 2026-11-06, master `611070b80`, with `scripts/inst-shadow/run.sh` over 23,380 programs: `tests/cases`,
 the distilled cells and named sets, and every filed witness. 8,678 of them make such a call. Mono's
