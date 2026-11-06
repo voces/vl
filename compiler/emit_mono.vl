@@ -4712,95 +4712,22 @@ function monoPinBodyLambdasRaw(
 }
 
 // An operator operand's type at the pin: its pinned type, or, for a name typed at a hole the
-// parameters' binding leaves open, the hole instance's own binding of it. A derived hole is
-// left as pinned.
+// parameters' binding leaves open, the elaboration's closed type of it at the instance. An operator
+// reaches a nullable number only past the check that excluded its `null`. A derived hole is left
+// as pinned.
 function monoNumOperandPinTy(ix: i32, bN: string[], bT: i32[]): i32 {
   const p = monoPinnedTyOf(ix, bN, bT)
   if p < 0 || p >= T.tys.length || !tyHasTyVar(p) { return p }
-  const id = nodeAt(unwrapParen(ix))
-  if !(id is Ident) { return p }
+  if !(nodeAt(unwrapParen(ix)) is Ident) { return p }
   const t = tyAt(p)
   if !(t is TyVar) { return p }
   if t.tvName.length > 1 && t.tvName[1] == "#"[0] { return p }
-  // The binding read directly, not substituted: re-joining a pinned union mints rows.
-  const b = monoHoleBindingOf(t.tvName)
-  // An operator reaches a nullable number only past the check that excluded its `null`.
-  if b >= 0 && tyIsNumericBox(b) { return nonNullTy(b) }
-  if b >= 0 { return b }
-  // A parameter read past its `null` test is typed at the narrowing's own hole: the
-  // parameter's hole answers for it, and for an un-annotated local it initialises.
-  const pb = monoHoleBindingOf(
-    monoParamHoleName(monoAliasedParam(id.identName)),
-  )
-  if pb >= 0 && tyIsNumericBox(pb) && tyBearsNull(pb) { return nonNullTy(pb) }
-  p
-}
-
-// The hole binding of the instance being built for hole `name`, -1 for none.
-function monoHoleBindingOf(name: string): i32 {
-  if name == "" { return -1 }
-  let i = 0
-  while i < monoPinHoleN.length && i < monoPinHoleT.length {
-    if monoPinHoleN[i] == name { return monoPinHoleT[i] }
-    i = i + 1
-  }
-  -1
-}
-
-// The name an un-annotated local `name` of the instance being built is initialised from, when
-// that initialiser is a bare name, followed to a name no such local declares; `name` otherwise.
-function monoAliasedParam(name: string): string {
-  let cur = name
-  let hops = 0
-  while hops < 4 {
-    const nx = monoLocalInitName(monoInstBody, cur)
-    if nx == "" { return cur }
-    cur = nx
-    hops = hops + 1
-  }
-  cur
-}
-
-// The bare name the un-annotated `let`/`const` `name` under `ix` is initialised from, or "".
-function monoLocalInitName(ix: i32, name: string): string {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      const n = nodeAt(at)
-      if n is LetDecl {
-        if n.letName == name && n.letType < 0 && n.letInit >= 0 {
-          const iv = nodeAt(unwrapParen(n.letInit))
-          if iv is Ident { return iv.identName }
-          return ""
-        }
-      }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  ""
-}
-
-// The hole an un-annotated parameter `name` of the instance being built is typed at, or "".
-function monoParamHoleName(name: string): string {
-  let i = 0
-  while i < monoInstParams.length {
-    const pn = nodeAt(monoInstParams[i])
-    if pn is Param {
-      if pn.parName == name {
-        if pn.parType >= 0 { return "" }
-        const pt = nodeTyIxOf(monoInstParams[i])
-        if pt < 0 || pt >= T.tys.length { return "" }
-        const ptv = tyAt(pt)
-        if ptv is TyVar { return ptv.tvName }
-        return ""
-      }
-    }
-    i = i + 1
-  }
-  ""
+  const nt = elabWalkNarrowedTy(ix)
+  const wt = elabWalkTy(ix)
+  let e = if nt >= 0 && nt < T.tys.length && !tyHasTyVar(nt) { nt } else { -1 }
+  if e < 0 && wt >= 0 && wt < T.tys.length && !tyHasTyVar(wt) { e = wt }
+  if e < 0 { return p }
+  if tyIsNumericBox(e) && tyBearsNull(e) { nonNullTy(e) } else { e }
 }
 
 // `monoNumUnionOpPin` for a compound assignment `rb` rebuilt from `ix`: its operator node.
@@ -5104,10 +5031,6 @@ let monoPinRetBox = false
 
 // The hole binding of the instance whose body `monoPinBodyLambdas` walks; empty outside it.
 let monoPinHoleN: string[] = []
-// The parameters of the instance being built (`monoParamHoleName`).
-let monoInstParams: i32[] = []
-// The template body of the instance being built (`monoAliasedParam`).
-let monoInstBody = -1
 let monoPinHoleT: i32[] = []
 
 // Records in `monoPinUnsafeNames` every name read under `ix` outside a sink.
@@ -9087,9 +9010,7 @@ export function monoStateReset() {
   monoElemTakenSig = Map()
   monoElemAtSet = Map()
   monoTopStmts = []
-  monoInstBody = -1
   monoInstIsFirst = false
-  monoInstParams = []
   monoInstRetWidenTy = 0 - 1
   monoLastInstFe = 0 - 1
   monoMakeCallIx = 0 - 1
@@ -9606,7 +9527,6 @@ function monoMakeInstanceBodyPinned(
   origFe: i32,
   first: boolean,
   nret: i32,
-  params: i32[],
   tps: string[],
   tvN: string[],
   tvV: string[],
@@ -9660,10 +9580,6 @@ function monoMakeInstanceBodyPinned(
   const svHoleT = monoPinHoleT
   monoPinHoleN = instHoleN
   monoPinHoleT = instHoleT
-  const svParams = monoInstParams
-  monoInstParams = params
-  const svBody = monoInstBody
-  monoInstBody = fn.fnBody
   const instBody0L = monoPinBodyLambdas(
     instBody0,
     tps,
@@ -9673,8 +9589,6 @@ function monoMakeInstanceBodyPinned(
     bodyBT,
   )
   monoPinHoleN = svHoleN
-  monoInstParams = svParams
-  monoInstBody = svBody
   njSetPinFn(svPinFn)
   monoPinHoleT = svHoleT
   instBody0L
@@ -10822,7 +10736,6 @@ function monoMakeInstanceGo(
       origFe,
       first,
       nret,
-      params,
       k.tps,
       tvN,
       tvV,
