@@ -32,7 +32,6 @@ import {
   elabCallParamBoundTy,
   elabDeclFnOf,
   elabDeclIsValue,
-  elabIsParamRead,
   elabLamDeliveredParams,
   elabLamParamTy,
   elabLitSlotCallTys,
@@ -141,7 +140,7 @@ import {
   cwIxUpKind,
   cwIxWant,
 } from "./check_write_scan"
-import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
+import { tyLeavesDisjoint } from "./check_type_shape"
 import {
   callArgRepTy,
   cbaArgHoldsHeld,
@@ -636,19 +635,21 @@ import {
   elabClosedTyAt,
   exactBindWalk,
   holeNulStringPinTyOf,
-  instanceBindsNothingClosed,
   tyCanonKey,
   tySameSet,
   tySameSpelled,
 } from "./emit_ty_canon"
 import {
+  ELAB_REP_NO_ROW,
   ekNames,
   ekTys,
   elabAliasNote,
+  elabArgBuiltTy,
   elabArmSigAt,
   elabBindingCalls,
   elabBodyDeclNote,
   elabCallArgRecordSigs,
+  elabCallArgRep,
   elabCallArgTysAgreed,
   elabCallBindTy,
   elabCallBundleSigs,
@@ -683,6 +684,7 @@ import {
   elabNodeTys,
   elabResultAtParams,
   elabRetOf,
+  elabRetParamOf,
   elabSigTyClosed,
   elabSlotFieldRecord,
   elabSlotNote,
@@ -2430,7 +2432,7 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
     if cn != "" { return cn }
   }
   let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
-  if t < 0 { t = monoUnboundDefaultTy(nodeTyAt(cax, fnIx), fnIx) }
+  if t < 0 { t = elabArgBuiltTy(cax) }
   if t < 0 || t >= T.tys.length { return "" }
   // A record type pins at its nominal spelling, and a narrowed record read at the one its place
   // holds, since a record is handed as the reference it is stored as; a structural record
@@ -2560,23 +2562,6 @@ function monoFnTyPin(ty: i32): string {
   }
   if tyNulFuncInner(ty) >= 0 { return tyToEmitName(ty) }
   monoClosedTyPin(ty)
-}
-
-// The unbound-parameter default's list for a list type `ty` whose element is a type variable no
-// instance on `fnIx`'s chain binds to a closed type (D12581); else -1.
-function monoUnboundDefaultTy(ty: i32, fnIx: i32): i32 {
-  if ty < 0 || ty >= T.tys.length { return -1 }
-  const a = tyAt(ty)
-  if !(a is TyArray) || a.aElem < 0 || a.aElem >= T.tys.length { return -1 }
-  const el = tyAt(a.aElem)
-  if !(el is TyVar) || !instanceBindsNothingClosed(ty, fnIx) { return -1 }
-  const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
-  if dt < 0 { return -1 }
-  const nm: string[] = [el.tvName]
-  const tv: i32[] = [dt]
-  const s = substTyDeep(ty, nm, tv)
-  if s < 0 || s >= T.tys.length || tyHasTyVar(s) { return -1 }
-  s
 }
 
 // Whether `ix` reads a place at a type other than the one the place holds: a binding, field or
@@ -10074,26 +10059,35 @@ function monoMakeInstanceLater(
   instFe
 }
 
-// The instance's return annotation node: its template's checked signature substituted through the
-// instance's binding (`elabRetOf`), the declared node where that names no type parameter, -1 for
-// none; -2 when a union it mints cannot be registered.
+// The instance's return annotation node: `elabRetOf` substituted through its binding, or the
+// rep `retRep` its returned parameter is delivered at (`elabCallArgRep`) where that is a bundle's
+// or a wider record; the declared node where it names no type parameter; -1 for none, -2 when a
+// union it mints cannot be registered. `ELAB_REP_NO_ROW` is a recorded failure.
 function monoInstanceRet(
   fn: FuncDecl,
-  decl: i32,
   ek: i32,
   tps: string[],
-  pins: i32[],
+  retRep: i32,
 ): i32 {
   if fn.fnRet >= 0 && !monoAnnHasTyParam(fn.fnRet, -1, tps) { return fn.fnRet }
-  // A parameter pinned at a bundle's record and returned whole is returned as that record.
-  const bp = if fn.fnRet < 0 { monoReturnedBundlePin(fn, pins) } else { -1 }
-  if bp >= 0 {
-    const brow = bundleRecordRowOfTy(bp)
+  // The failure is recorded and the walk goes on at the result's own type (emitFail does not halt).
+  if retRep == ELAB_REP_NO_ROW {
+    emitFail(
+      "emitProgram: monomorphize: the elaboration records no reach of `"
+        + fn.fnName
+        + "` by the call building it, so the rep its returned parameter takes is unknown",
+    )
+  }
+  // A parameter delivered as a bundle's record and returned whole is returned as that record.
+  if fn.fnRet < 0 && retRep >= 0 && monoIsBundleTy(retRep) {
+    const brow = bundleRecordRowOfTy(retRep)
     if brow >= 0 && brow < sNames.length {
-      return synthTypeRefTy(sNames[brow], -1, bp)
+      return synthTypeRefTy(sNames[brow], -1, retRep)
     }
   }
-  const r = monoRetRepOf(decl, fn, pins, elabRetOf(ek))
+  let r = elabRetOf(ek)
+  // A parameter delivered at a wider record than its type is returned at that record.
+  if r >= 0 && retRep >= 0 && recRepWidens(r, retRep) { r = retRep }
   if r < 0 {
     if fn.fnRet < 0 { return -1 }
     return emitFail(
@@ -10113,30 +10107,6 @@ function monoInstanceRet(
   synthTypeRefTy(nm, -1, if at >= 0 { at } else { r })
 }
 
-// The bundle record a parameter of `fn` is pinned at in `pins`, where the body returns that
-// parameter whole; -1 for none.
-function monoReturnedBundlePin(fn: FuncDecl, pins: i32[]): i32 {
-  const i = monoReturnedBundleParam(fn, pins)
-  if i >= 0 { pins[i] } else { -1 }
-}
-
-// The index of the parameter of `fn` pinned at a bundle's record in `pins` that the body returns
-// whole, or -1.
-function monoReturnedBundleParam(fn: FuncDecl, pins: i32[]): i32 {
-  if fn.fnRet >= 0 { return -1 }
-  let i = 0
-  while i < fn.fnParams.length && i < pins.length {
-    if (
-      monoIsBundleTy(pins[i])
-      && monoBodyReturnsParam(fn.fnBody, fn.fnParams[i])
-    ) {
-      return i
-    }
-    i = i + 1
-  }
-  -1
-}
-
 // Whether pin `t` is a bundle's record, matched by row since a pin is spelled afresh.
 function monoIsBundleTy(t: i32): boolean {
   const r = bundleRecordRowOfTy(t)
@@ -10145,76 +10115,6 @@ function monoIsBundleTy(t: i32): boolean {
     if bundleRecordRowOfTy(b) == r { return true }
   }
   false
-}
-
-// Whether function body `body` returns parameter `par` whole, by `return` or as its last
-// statement; nested functions aside.
-function monoBodyReturnsParam(body: i32, par: i32): boolean {
-  if body < 0 { return false }
-  const b = nodeAt(body)
-  if b is Block && b.blkStmts.length > 0 {
-    if elabIsParamRead(b.blkStmts[b.blkStmts.length - 1], par) { return true }
-  }
-  monoStmtReturnsParam(body, par)
-}
-
-// Whether statement `x` holds a `return` of parameter `par`, nested functions aside.
-function monoStmtReturnsParam(x: i32, par: i32): boolean {
-  if x < 0 || x >= P.nodes.length { return false }
-  const n = nodeAt(x)
-  if n is RetStmt { return elabIsParamRead(n.retArg, par) }
-  if (
-    n is Block
-    || n is IfStmt
-    || n is WhileStmt
-    || n is ForIn
-    || n is ForRange
-  ) {
-    for k in nodeChildren(x) {
-      if monoStmtReturnsParam(k, par) { return true }
-    }
-  }
-  false
-}
-
-// Result `r` of the instance of `decl` at parameter pins `pins`, or the record pin every result
-// copies, where each result is a parameter or a binding of one and that pin widens `r`.
-function monoRetRepOf(decl: i32, fn: FuncDecl, pins: i32[], r: i32): i32 {
-  if r < 0 || r >= T.tys.length || !(tyAt(r) is TyObj) { return r }
-  let row = -1
-  for lf in recFnValueLeaves(decl) {
-    const pt = monoLeafParamPin(lf, fn, pins, 4)
-    if pt < 0 || (row >= 0 && !tySame(row, pt)) { return r }
-    row = pt
-  }
-  if recRepWidens(r, row) { row } else { r }
-}
-
-// The pin of the parameter of `fn` that value `lf` reads, directly or through bindings of one
-// that `monoLetTypeOpen` admits, else -1.
-function monoLeafParamPin(lf: i32, fn: FuncDecl, pins: i32[], depth: i32): i32 {
-  const u = unwrapParen(lf)
-  if u < 0 || depth <= 0 || !(nodeAt(u) is Ident) { return -1 }
-  const d = identDeclOf(u)
-  if d < 0 { return -1 }
-  let i = 0
-  while i < fn.fnParams.length && i < pins.length {
-    if fn.fnParams[i] == d { return pins[i] }
-    i = i + 1
-  }
-  const dn = nodeAt(d)
-  if dn is LetDecl && dn.letInit >= 0 && monoLetTypeOpen(dn.letType, fn) {
-    return monoLeafParamPin(dn.letInit, fn, pins, depth - 1)
-  }
-  -1
-}
-
-// Whether a binding annotated `ann` (-1 for none) in `fn` is typed by its initializer: no
-// annotation, or one naming a type parameter of `fn` alone.
-function monoLetTypeOpen(ann: i32, fn: FuncDecl): boolean {
-  if ann < 0 { return true }
-  const a = nodeAt(ann)
-  a is TypeRef && strListHas(fn.fnTyParams, a.tyName)
 }
 
 // The source node of argument `a`, peeled: an instance copy's argument maps to its template's,
@@ -11048,6 +10948,9 @@ function monoMakeInstanceGo(
       retWidenTy,
     )
     const ek = ekDemand
+    // The parameter the body hands back whole, and the rep its call delivers it at (`-1` the type).
+    const retParam = elabRetParamOf(monoOrigNode[origFe])
+    const retRep = if retParam >= 0 && tplCall >= 0 { elabCallArgRep(tplCall, ek, elabWalkTop(), retParam) } else { -1 }
     // Everything this build mints is demanded under this instance.
     elabWalkPush(ek)
     cadWalkFn.push(0 - 3)
@@ -11058,13 +10961,7 @@ function monoMakeInstanceGo(
     if fn.fnRet >= 0 {
       monoNicheNulListCheck(fn.fnRet, k.tps, tvN, tvV, letBN, letBT)
     }
-    const nret = monoInstanceRet(
-      fn,
-      monoOrigNode[origFe],
-      ek,
-      k.tps,
-      pinnedTyIx,
-    )
+    const nret = monoInstanceRet(fn, ek, k.tps, retRep)
     if nret < -1 { return monoBuildPop() - 1 }
     // A widened delivery's result is the one the elaboration records for this instance.
     if retWiden != "" && !tySame(elabRetOf(ek), retWidenTy) {
@@ -11123,8 +11020,9 @@ function monoMakeInstanceGo(
     )
     const nfn = monoMakeInstanceFunc(fn, origFe, nretW, instBody, instName, nps)
     if retWiden != "" { monoRetWidenFns[nfn] = true }
-    const rbp = monoReturnedBundleParam(fn, pinnedTyIx)
-    if rbp >= 0 { bundleRetParamNote(nfn, rbp) }
+    if fn.fnRet < 0 && retRep >= 0 && monoIsBundleTy(retRep) {
+      bundleRetParamNote(nfn, retParam)
+    }
     cadWalkFn[cadWalkFn.length - 1] = nfn
     cadPatchPending(nfn)
     const instFe = monoMakeInstanceInstall(
@@ -18988,7 +18886,27 @@ function monoPinnedRetAnnTy(x: i32, c: Call): i32 {
   if fd < 0 { return -1 }
   const fn = nodeAt(fd)
   if !(fn is FuncDecl) { return -1 }
-  if fn.fnRet >= 0 { return monoInstAnnRetTy(fd, fn.fnRet) }
+  if fn.fnRet >= 0 {
+    // An instance's closed list-of-functions return annotation would be the answer here, and no
+    // program reaches one (§3.4), so it refuses rather than read an unchecked rule.
+    const it = monoFrameInstTmpl(fd)
+    const at = nodeTyIxOf(fn.fnRet)
+    if (
+      it[0] == fd
+      && it[1] >= 0
+      && it[1] != fd
+      && at >= 0
+      && at < T.tys.length
+      && tyAt(at) is TyArray
+      && !monoTyOpen(at)
+      && tyMayHoldFn(at, 0)
+    ) {
+      return emitFail(
+        "emitProgram: monomorphize: an instance's closed list-of-functions return annotation is not read for its call's type",
+      )
+    }
+    return -1
+  }
   const itp = monoFrameInstTmpl(fd)
   const gen = fn.fnTyParams.length > 0
     || (itp[0] == fd && itp[1] >= 0 && itp[1] != fd)
@@ -19047,24 +18965,6 @@ function monoLitSlotCallTy(a: i32, step: string, depth: i32): i32 {
     ft = et
   }
   ft
-}
-
-// The closed list-of-functions type that the return annotation `ret` of instance `fd` takes at its
-// pin (D9602); -1 when `fd` is not an instance or that type is open.
-function monoInstAnnRetTy(fd: i32, ret: i32): i32 {
-  const it = monoFrameInstTmpl(fd)
-  if it[0] != fd || it[1] < 0 || it[1] == fd { return -1 }
-  const t = nodeTyIxOf(ret)
-  if (
-    t < 0
-    || t >= T.tys.length
-    || !(tyAt(t) is TyArray)
-    || monoTyOpen(t)
-    || !tyMayHoldFn(t, 0)
-  ) {
-    return -1
-  }
-  t
 }
 
 // A call `ix` of an un-annotated function, or a list literal of such calls, whose open type holds

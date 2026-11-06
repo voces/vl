@@ -237,6 +237,7 @@ import {
 import {
   REC_REBUILT_DEPTH,
   callArgRepTy,
+  recListRepWidens,
   recRebuiltLeafRow,
   recRepWidens,
 } from "./check_bind_adopt"
@@ -964,6 +965,7 @@ function elabDrainHoleRows() {
       elabUnboundCallT[u],
       uf,
     )
+    elabArgCallNote(elabUnboundCallIx[u])
     if uk >= 0 && !(elabGuessKeys[uk] ?? false) {
       elabReachNote(uf, uk, elabUnboundCallIx[u])
     } else if uk >= 0 {
@@ -7327,8 +7329,12 @@ export function elabLamParamSigs(d: i32, i: i32, inst: i32[]): i32[] {
 // The signatures call `ix`'s instance, reached from the instance being walked, calls the lambda
 // handed to its parameter `i` at: two or more, with the lambda's set untagged; else none.
 export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
+  elabCallBundleSigsFrom(ix, i, elabWalkTop())
+}
+
+// `elabCallBundleSigs` for the instance call `ix` reaches from instance `from`.
+function elabCallBundleSigsFrom(ix: i32, i: i32, from: i32): i32[] {
   const none: i32[] = []
-  const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
   const k = elabCallInstFrom(ix, from)
   if k < 0 || i < 0 || i >= 64 { return none }
   const sigs = elabBundleSigs.get(elabBundleKey(k, i)) ?? none
@@ -8098,6 +8104,7 @@ export function elabRun() {
   elabReprKeys = Map()
   elabGuessKeys = Map()
   elabUnboundOnly = Map()
+  elabArgCall = Map()
   elabKeyRefines = Map()
   elabUnboundFailed = Map()
   elabCandKeys = Map()
@@ -8123,6 +8130,7 @@ export function elabRun() {
   ekReach = []
   elabReadsMemo = Map()
   elabCallKeys = Map()
+  erRowAt = Map()
   elabValCalls = Map()
   elabValueKeys = Map()
   elabHoleMapMemo = Map()
@@ -8442,6 +8450,171 @@ export function elabRun() {
   elabSlotFacts()
   elabPinsClosedSet(true)
   elabRunDone = true
+}
+
+// One row per reach the run recorded (call `erCall[r]` from instance `erFrom[r]` reaching instance
+// `erKey[r]`), holding the rep each parameter of that instance is delivered at from `erArgAt[r]` in
+// `erArgRep`, by parameter index (a method call's receiver is its first); `erRowAt` is a call's
+// first row. The rep depends on the call and the instance it reaches alone.
+let erCall: i32[] = []
+let erFrom: i32[] = []
+let erKey: i32[] = []
+let erArgAt: i32[] = []
+let erArgRep: i32[] = []
+let erRowAt: {[i32]: i32} = Map()
+
+// `elabCallArgRep`'s answer where the run recorded no reach of the call from that instance.
+export const ELAB_REP_NO_ROW = -2
+
+// Fills the reach rows from the run's recorded reaches (`elabCallKeys`), once the tag decision's
+// rounds have settled the bundle facts (`elabMintFacts`).
+export function elabReachRows() {
+  erCall = []
+  erFrom = []
+  erKey = []
+  erArgAt = []
+  erArgRep = []
+  erRowAt = Map()
+  for ix in elabCallKeys.keys() {
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const ks = elabCallKeys[ix] ?? []
+    let j = 0
+    while j + 1 < ks.length {
+      if j == 0 { erRowAt[ix] = erCall.length }
+      const k = ks[j + 1]
+      erCall.push(ix)
+      erFrom.push(ks[j])
+      erKey.push(k)
+      erArgAt.push(erArgRep.length)
+      const dn = if k >= 0 && k < ekDecl.length { nodeAt(ekDecl[k]) } else { null }
+      const np = if dn is FuncDecl { dn.fnParams.length } else { 0 }
+      let i = 0
+      while i < np {
+        erArgRep.push(elabArgRepFrom(ix, i, ks[j]))
+        i = i + 1
+      }
+      j = j + 2
+    }
+  }
+  0
+}
+
+// The rep parameter `i` of the instance call `ix` reaches from `from` is delivered at, where
+// that is not its type: the record of one closure per signature a bundle parameter is called at,
+// else the wider record the call builds it as (`callArgRepTy`); -1 where the rep is the type.
+function elabArgRepFrom(ix: i32, i: i32, from: i32): i32 {
+  const sigs = elabCallBundleSigsFrom(ix, i, from)
+  if sigs.length >= 2 {
+    const names: string[] = []
+    for _s in sigs { names.push("c" + i32ToStr(names.length)) }
+    return mkObjTy(names, sigs)
+  }
+  const pt = elabCallParamTyFrom(ix, i, from)
+  if pt < 0 { return -1 }
+  const rt = callArgRepTy(ix, i, pt)
+  if rt == pt { -1 } else { rt }
+}
+
+// Grades every reach row against the rule that a rep differs from its parameter's type only as a
+// bundle's record or a wider record: bundles in the thousands, wider records in the units, and each
+// slot breaking the rule a million; read by `tests/vl_elab_arg_rep_test.ts`.
+export function elabArgRepProbe(): i32 {
+  let bundles = 0
+  let wides = 0
+  let bad = 0
+  let r = 0
+  while r < erCall.length {
+    const end = if r + 1 < erArgAt.length { erArgAt[r + 1] } else { erArgRep.length }
+    let at = erArgAt[r]
+    while at < end {
+      const rep = erArgRep[at]
+      if rep >= 0 {
+        const i = at - erArgAt[r]
+        const sigs = elabCallBundleSigsFrom(erCall[r], i, erFrom[r])
+        const pt = elabCallParamTyFrom(erCall[r], i, erFrom[r])
+        if sigs.length >= 2 {
+          bundles = bundles + 1
+        } else if (
+          pt >= 0
+          && (recRepWidens(pt, rep) || recListRepWidens(pt, rep))
+        ) {
+          wides = wides + 1
+        } else {
+          bad = bad + 1
+        }
+      }
+      at = at + 1
+    }
+    r = r + 1
+  }
+  bad * 1000000 + bundles * 1000 + wides
+}
+
+// The rep parameter `i` of the instance call `ix` reaches is delivered at, that instance being `k`
+// or the one the call reaches from instance `from`: a type where that rep is not the parameter's
+// type, -1 where it is, and `ELAB_REP_NO_ROW` where the run recorded neither reach.
+export function elabCallArgRep(ix: i32, k: i32, from: i32, i: i32): i32 {
+  const r0 = erRowAt[ix] ?? -1
+  if r0 < 0 { return ELAB_REP_NO_ROW }
+  let r = r0
+  let hit = -1
+  while r < erCall.length && erCall[r] == ix {
+    if erKey[r] == k { hit = r }
+    r = r + 1
+  }
+  r = r0
+  while hit < 0 && r < erCall.length && erCall[r] == ix {
+    if erFrom[r] == from { hit = r }
+    r = r + 1
+  }
+  if hit < 0 { return ELAB_REP_NO_ROW }
+  const at = erArgAt[hit] + i
+  const end = if hit + 1 < erArgAt.length { erArgAt[hit + 1] } else { erArgRep.length }
+  if i >= 0 && at < end { erArgRep[at] } else { ELAB_REP_NO_ROW }
+}
+
+// The parameter of function `decl` every value its body returns reads whole, directly or through
+// bindings typed by their initializer (un-annotated, or annotated only with one of its own type
+// parameters); -1 where they read none, or two.
+export function elabRetParamOf(decl: i32): i32 {
+  const fn = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  if !(fn is FuncDecl) { return -1 }
+  // A function returning nothing, or with no checked signature, hands no parameter back.
+  const ft = nodeTyIxOf(decl)
+  const f = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+  if !(f is TyFunc) || f.fnRet == TY_VOID { return -1 }
+  let p = -1
+  for lf in recFnValueLeaves(decl) {
+    const q = elabLeafParamIx(lf, fn, 4)
+    if q < 0 || (p >= 0 && q != p) { return -1 }
+    p = q
+  }
+  p
+}
+
+// The index of the parameter of `fn` value `lf` reads, directly or through bindings typed by
+// their initializer, else -1.
+function elabLeafParamIx(lf: i32, fn: FuncDecl, depth: i32): i32 {
+  const u = parenPeelIx(lf)
+  if u < 0 || depth <= 0 || !(nodeAt(u) is Ident) { return -1 }
+  const d = identDeclOf(u)
+  if d < 0 { return -1 }
+  let i = 0
+  while i < fn.fnParams.length {
+    if fn.fnParams[i] == d { return i }
+    i = i + 1
+  }
+  const dn = nodeAt(d)
+  if dn is LetDecl && dn.letInit >= 0 {
+    const ann = if dn.letType >= 0 { nodeAt(dn.letType) } else { null }
+    if (
+      dn.letType < 0
+      || (ann is TypeRef && strListHas(fn.fnTyParams, ann.tyName))
+    ) {
+      return elabLeafParamIx(dn.letInit, fn, depth - 1)
+    }
+  }
+  -1
 }
 
 // Stamps each instance's record-list literal whose stored functions are left open to be built at
@@ -13661,6 +13834,42 @@ function elabValCallNote(from: i32, ix: i32, k: i32) {
 // those of them whose body does not check.
 let elabUnboundOnly: {[i32]: boolean} = Map()
 let elabUnboundFailed: {[i32]: boolean} = Map()
+
+// Each argument of an unbound call, mapped to that call.
+let elabArgCall: {[i32]: i32} = Map()
+
+function elabArgCallNote(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const c = nodeAt(ix)
+  if !(c is Call) { return 0 }
+  for a in c.callArgs {
+    const ax = parenPeelIx(a)
+    if ax >= 0 { elabArgCall[ax] = ix }
+  }
+  0
+}
+
+// The closed type the instance its unbound call is keyed at under the walk top builds argument
+// `arg` at: the callee's parameter with that instance's bindings; -1 for none.
+export function elabArgBuiltTy(arg: i32): i32 {
+  const call = elabArgCall.get(arg) ?? -1
+  if call < 0 { return -1 }
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const k = elabCallInstFrom(call, top)
+  if k < 0 { return -1 }
+  const c = nodeAt(call)
+  const dn = nodeAt(ekDecl[k])
+  if !(c is Call) || !(dn is FuncDecl) { return -1 }
+  let i = 0
+  while i < c.callArgs.length && i < dn.fnParams.length {
+    if parenPeelIx(c.callArgs[i]) == arg {
+      const t = substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k])
+      return if t >= 0 && elabTyClosed(t, 0) { t } else { -1 }
+    }
+    i = i + 1
+  }
+  -1
+}
 
 // Unkeys each unbound call whose default instance does not check, so the call has no instance.
 function elabUnboundKeyDrop() {
