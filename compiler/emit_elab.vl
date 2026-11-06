@@ -95,6 +95,7 @@ import {
   CW_UP_LETINIT,
   CW_UP_OBJ,
   CW_UP_RET,
+  CW_UP_SPREAD,
   CW_UP_TAIL,
   cwBindingWrittenValues,
   cwFnCalls,
@@ -10694,6 +10695,23 @@ function elabReachClosure(k: i32): {[i32]: boolean} {
   got
 }
 
+// `elabSlotDeliveries` leaving out what calls `omit` deliver: their arguments' and result's types
+// and the stamp of the read each calls through.
+export function elabSlotDeliveriesOmitting(
+  d: i32,
+  path: string[],
+  k: i32,
+  omit: i32[],
+): i32[] {
+  const was = elabDlvOmit
+  elabDlvOmit = omit
+  const out = elabSlotDeliveries(d, path, k)
+  elabDlvOmit = was
+  out
+}
+
+let elabDlvOmit: i32[] = []
+
 // The instance key `elabSlotDeliveries` answers for, -1 for every instance, and the instances its
 // body reaches.
 let elabDlvKey = -1
@@ -10909,9 +10927,7 @@ function elabSlotReadDeliveries(
       && u < P.nodes.length
       && identDeclOf(u) == b
     ) {
-      const r = elabSlotReadUp(u, path)
-      if r >= 0 { elabReadDeliveries(r, out, seen) }
-      if path.length > 0 { elabSlotAliasOn(u, path, out, seen) }
+      elabSlotClimb(u, path, out, seen)
     }
   }
   // An unwritten alias of another binding, or of one of its slots, shares that slot's slots.
@@ -11001,9 +11017,9 @@ function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
   while i < path.length && guard < 16 {
     guard = guard + 1
     const k = path[i]
-    const p = if cur >= 0 && cur < cwIxParent.length { cwIxParent[cur] } else { -1 }
+    const p = elabPlaceUp(cur)
     const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
-    const c = if p >= 0 && p < cwIxParent.length { cwIxParent[p] } else { -1 }
+    const c = elabPlaceUp(p)
     const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
     const called = cn is Call && cn.callFn == p
     if (k == "e" || k == "v") && pn is Index && parenPeelIx(pn.idxArr) == cur {
@@ -11036,11 +11052,45 @@ function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
       k == "e"
       && pn is Member
       && parenPeelIx(pn.memObj) == cur
+      && cn is Call
+      && called
+      && elabCallbackParamAt(pn.memProp) >= 0
+    ) {
+      // A callback method hands each element to its function argument's parameter; `filter`'s
+      // result then holds the same elements.
+      const fa = if cn.callArgs.length > 0 { cwFnValueDeclOf(cn.callArgs[0]) } else { -1 }
+      const fn = if fa >= 0 && fa < P.nodes.length { nodeAt(fa) } else { null }
+      const pi = elabCallbackParamAt(pn.memProp)
+      if fn is FuncDecl && pi < fn.fnParams.length {
+        const rest: string[] = []
+        let j = i + 1
+        while j < path.length {
+          rest.push(path[j])
+          j = j + 1
+        }
+        elabSlotReadDeliveries(fn.fnParams[pi], rest, out, seen)
+      }
+      if !elabSameSlotsMethod(pn.memProp) { return 0 }
+      cur = c
+    } else if (
+      k == "e"
+      && pn is Member
+      && parenPeelIx(pn.memObj) == cur
       && called
       && elabSameSlotsMethod(pn.memProp)
     ) {
       // A copy of the list holds the same elements.
       cur = c
+    } else if (
+      p >= 0
+      && cur >= 0
+      && cur < cwIxUpKind.length
+      && cwIxUpKind[cur] == CW_UP_OBJ
+      && elabStepIs(placeStepOf(p), k)
+    ) {
+      // A place a rewrite replaced still reads the step the source program read there.
+      cur = p
+      i = i + 1
     } else {
       const rest: string[] = []
       while i < path.length {
@@ -11053,6 +11103,23 @@ function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
   }
   if i == path.length { elabReadDeliveries(cur, out, seen) }
   0
+}
+
+// The parameter of list method `m`'s function argument that receives each element, or -1.
+function elabCallbackParamAt(m: string): i32 {
+  if (
+    m == "map"
+    || m == "filter"
+    || m == "forEach"
+    || m == "find"
+    || m == "findIndex"
+    || m == "some"
+    || m == "every"
+  ) {
+    return 0
+  }
+  if m == "reduce" { return 1 }
+  -1
 }
 
 // Whether list method `m` hands back a list of the receiver's own elements.
@@ -11080,8 +11147,16 @@ function elabReadDeliveries(r: i32, out: i32[], seen: i32[]) {
 }
 
 // Adds to `out` the closed function types the check stamped node `r` as delivered at, checked
-// and in each admitted instance.
+// and in each admitted instance; nothing for the callee read of a call left out.
 function elabReadStamps(r: i32, out: i32[]) {
+  if (
+    elabDlvOmit.length > 0
+    && cwIxCovers(r)
+    && cwIxUpKind[r] == CW_UP_CALLEE
+    && i32ListHas(elabDlvOmit, cwIxUp[r])
+  ) {
+    return 0
+  }
   const ct = nodeCtxTyIxOf(r)
   if ct >= 0 && ct < T.tys.length && tyAt(ct) is TyFunc { elabRetsAdd(out, ct) }
   const cs = elabNodeCtxs[r] ?? []
@@ -11254,6 +11329,12 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
       elabSlotReadDeliveries(fn.fnParams[ai], path, out, seen)
       elabDlvKey = wasKey
       elabDlvAdmit = wasAdmit
+    }
+  } else if k == CW_UP_SPREAD && path.length > 0 && path[0] == "e" {
+    // A list spread into a list literal hands its elements to the literal's.
+    const lit = if cwIxCovers(up) && cwIxUpKind[up] == CW_UP_ELEM { cwIxUp[up] } else { -1 }
+    if lit >= 0 && lit < P.nodes.length && nodeAt(lit) is ArrayLit {
+      for t in elabSlotDeliveriesAt(lit, path) { elabRetsAdd(out, t) }
     }
   } else if k == CW_UP_ITER && un is ForIn && path.length > 0 {
     // A loop over a list binds its element, over a map its value.
@@ -11438,7 +11519,7 @@ function elabSlotReadOf(x: i32, o: i32, cp: string[]): boolean {
 // in every instance where they agree, else in each instance that closes them.
 function elabCallDeliveryAdd(c: i32, out: i32[]) {
   const cn = nodeAt(c)
-  if !(cn is Call) { return 0 }
+  if !(cn is Call) || i32ListHas(elabDlvOmit, c) { return 0 }
   const agreed = elabCallArgTysAgreed(c)
   const r = elabNodeTyAgreed(c)
   if elabDlvKey < 0 && agreed.length == cn.callArgs.length && r >= 0 {
