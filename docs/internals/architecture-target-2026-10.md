@@ -2312,6 +2312,12 @@ mechanic, so B2's consumer maps a binding initialised by `.slice()` to mono's mi
 than to the receiver's. The fifth is `simd/f32x4-positions.vl`'s `sb = Buffer(16)`, where the
 elaboration also sees the return inside `Buffer`'s shared-memory branch: the walkers' set was an
 under-approximation.
+Its 2,436 elaboration-only roots are three classes, and every program among them builds today.
+215 hold only non-generic functions, which canonicalise to nothing mono plans. 1,986 hold a generic
+function and no container (`let v = id`, `const g = r.f`, a parameter handed one): those are callee
+reads, and the chain gate (`mfrChainFns`) owns them, so **B2's consumer takes container roots only**
+and a second consumer of a function-only set is not added. The 232 container roots are B2's
+widening, sweep-proven with every mover named; a subclass that moves output is declined.
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
