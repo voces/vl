@@ -12366,15 +12366,46 @@ export function elabValueAgreedCallTys(
   have
 }
 
+// The one closed result the calls `elabValueCallTysOpenFns` last read agree on, or -1.
+let elabSlotCallRet = -1
+
+// Call `c`'s closed result: the one every instance agrees on, else its checked type, else for a
+// function result the tuple and result of the calls that result reaches; -1 where none closes.
+function elabLitCallResultTy(c: i32): i32 {
+  const rt = elabNodeTyAgreed(c)
+  if rt >= 0 && rt < T.tys.length && !tyHasTyVar(rt) { return widenLitTy(rt) }
+  const ct = nodeTyIxOf(c)
+  if ct >= 0 && ct < T.tys.length && !tyHasTyVar(ct) { return widenLitTy(ct) }
+  if ct < 0 || ct >= T.tys.length || !(tyAt(ct) is TyFunc) || elabSlotCallResultDepth > 1 {
+    return -1
+  }
+  elabSlotCallResultDepth = elabSlotCallResultDepth + 1
+  const q: i32[] = []
+  const fa: i32[] = []
+  const ok = elabValueCallTysOpenFns(c, q, fa)
+  const r = elabSlotCallRet
+  elabSlotCallResultDepth = elabSlotCallResultDepth - 1
+  if !ok || r < 0 { return -1 }
+  for t in q {
+    if t < 0 { return -1 }
+  }
+  mkFuncTy(q, r)
+}
+
+// How deep `elabLitCallResultTy` has followed a function result to its own calls.
+let elabSlotCallResultDepth = 0
+
 // `elabValueAgreedCallTys` over the calls the value of `d` reaches, except that an open argument
 // naming a function declaration is pushed as -1 onto `tys`, with that declaration at the same
 // position of `fas` (-1 elsewhere); false where two calls disagree, or an open argument is not one.
 function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
+  elabSlotCallRet = -1
   elabCallSink = []
   elabCallSinkOn = true
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if dn is Call && d < cwIxCoveredLen() {
-    // A value a call hands back is climbed from the call itself, under every instance.
+  const anon = dn is FuncDecl && dn.fnName.length > 9 && dn.fnName.slice(0, 9) == "__lambda_"
+  if (dn is Call || anon) && d < cwIxCoveredLen() {
+    // A value a call hands back, or a lambda, is climbed from its node, under every instance.
     const out: i32[] = []
     const seen: i32[] = []
     const was = elabDlvKey
@@ -12392,6 +12423,7 @@ function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
   elabCallSink = []
   let key = ""
   let have = false
+  let ret = -1
   for c in hits {
     const cn = nodeAt(c)
     if cn is Call {
@@ -12422,6 +12454,12 @@ function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
         }
       }
       if have && k != key { return false }
+      const rc = elabLitCallResultTy(c)
+      if !have {
+        ret = rc
+      } else if ret >= 0 && (rc < 0 || !tySame(rc, ret)) {
+        ret = -1
+      }
       while tys.length > 0 { tys.pop() }
       while fas.length > 0 { fas.pop() }
       for t in tup { tys.push(t) }
@@ -12430,6 +12468,7 @@ function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
       have = true
     }
   }
+  elabSlotCallRet = ret
   have
 }
 
@@ -12456,6 +12495,14 @@ function elabCloseFnArgs(v: i32, tys: i32[], fas: i32[]): boolean {
   true
 }
 
+// Per value of the last `elabLitSlotCallTys`, the one closed result its calls agree on, or -1.
+let elabLitCallRets: i32[] = []
+
+// The closed result the calls of value `i` of the last `elabLitSlotCallTys` agree on, or -1.
+export function elabLitSlotCallRet(i: i32): i32 {
+  if i >= 0 && i < elabLitCallRets.length { elabLitCallRets[i] } else { -1 }
+}
+
 // The one closed argument tuple every value slot `step` (`e`, or `f.<name>`) of list or record
 // literal `a` holds reaches as its callee (`elabValueAgreedCallTys`), pushed onto `qs`, with those
 // values pushed onto `vals`; false for a spread, a value reaching no call or an open one, or two.
@@ -12478,6 +12525,7 @@ export function elabLitSlotCallTys(
     }
   }
   if vals.length == 0 { return false }
+  elabLitCallRets = []
   let have = false
   for v in vals {
     if nodeAt(v) is Spread { return false }
@@ -12486,6 +12534,7 @@ export function elabLitSlotCallTys(
     if !elabValueCallTysOpenFns(v, q, fa) || !elabCloseFnArgs(v, q, fa) {
       return false
     }
+    elabLitCallRets.push(elabSlotCallRet)
     if have {
       if q.length != qs.length { return false }
       let i = 0
