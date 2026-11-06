@@ -32,6 +32,7 @@ import {
   elabDeclIsValue,
   elabIsParamRead,
   elabLamDeliveredParams,
+  elabLitSlotCallTys,
   elabParamReadOtherThanCalled,
   elabSlotAnnRets,
   elabSlotDeliveries,
@@ -43,6 +44,7 @@ import {
   elabSlotUncalled,
   elabValueAgreedCallTys,
   elabValueOnlyCall,
+  elabValueReturnsFrom,
   elabWalkKeyOf,
   elabWalkTop,
 } from "./emit_elab"
@@ -179,7 +181,6 @@ import {
   TY_NEVER,
   TY_NULL,
   TY_VOID,
-  Ty,
   TyArray,
   TyErr,
   TyFunc,
@@ -5527,6 +5528,34 @@ let monoPinSink = false
 // The names the instance body reads anywhere but as such a sink, set before its walk.
 let monoPinUnsafeNames: {[string]: boolean} = Map()
 
+// Notes in `monoPinReachNames` each `let` of template function `td` whose value reaches one of its
+// returns (`elabValueReturnsFrom`).
+function monoPinNoteReach(td: i32) {
+  const tn = if td >= 0 && td < P.nodes.length { nodeAt(td) } else { null }
+  if tn is FuncDecl { monoPinNoteReachLets(tn.fnBody, td) }
+  0
+}
+
+function monoPinNoteReachLets(ix: i32, td: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is FuncDecl { return 0 }
+  if n is LetDecl && elabValueReturnsFrom(ix, td) {
+    monoPinReachNames[n.letName] = true
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      monoPinNoteReachLets(kids[i], td)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
 // Whether a name in `monoPinReachNames` is declared more than once under `body`.
 function monoPinReachShadowed(body: i32): boolean {
   const seen: {[string]: i32} = Map()
@@ -5557,88 +5586,12 @@ function monoPinCountDecls(ix: i32, seen: {[string]: i32}): i32 {
   dup
 }
 
-// The bindings whose value reaches the instance's return: a name the body returns, and a name
-// such a binding is initialized from. Only these can put a join's rep into the return box.
+// The names of the template's bindings whose value reaches its return. Only these can put a
+// join's rep into the return box.
 let monoPinReachNames: {[string]: boolean} = Map()
 
 // Whether the binding whose initializer the per-instance walk is in reaches the return.
 let monoPinLetReaches = false
-
-function monoPinNoteReach(body: i32) {
-  const b = nodeAt(body)
-  if b is Block {
-    if b.blkStmts.length > 0 {
-      monoPinNoteReachExpr(b.blkStmts[b.blkStmts.length - 1])
-    }
-  }
-  monoPinNoteReturns(body)
-  // Follow initializers that are bare names until a round adds none; each adds a name.
-  let grew = true
-  while grew { grew = monoPinReachStep(body) }
-  0
-}
-
-// Records a bare name `ix` hands out as reaching the return.
-function monoPinNoteReachExpr(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const u = unwrapParen(ix)
-  if u < 0 || u >= P.nodes.length { return 0 }
-  const n = nodeAt(u)
-  if n is Ident { monoPinReachNames[n.identName] = true }
-  0
-}
-
-// Records the operand of every `return` under `ix` outside a nested function.
-function monoPinNoteReturns(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = nodeAt(ix)
-  if n is FuncDecl { return 0 }
-  if n is RetStmt { return monoPinNoteReachExpr(n.retArg) }
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      monoPinNoteReturns(kids[i])
-      i = i + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  0
-}
-
-// One pass adding the name a reaching binding is initialized from; whether it added any.
-function monoPinReachStep(ix: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = nodeAt(ix)
-  if n is FuncDecl { return false }
-  let grew = false
-  if n is LetDecl {
-    if (monoPinReachNames.get(n.letName) ?? false) && n.letInit >= 0 {
-      const u = unwrapParen(n.letInit)
-      if u >= 0 && u < P.nodes.length {
-        const iu = nodeAt(u)
-        if iu is Ident {
-          if !(monoPinReachNames.get(iu.identName) ?? false) {
-            monoPinReachNames[iu.identName] = true
-            grew = true
-          }
-        }
-      }
-    }
-  }
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      if monoPinReachStep(kids[i]) { grew = true }
-      i = i + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  grew
-}
 
 // Whether the instance being walked returns an annotated union box, so a binding its body
 // returns by name is delivered as that union too (D2912).
@@ -10453,7 +10406,7 @@ function monoMakeInstanceBodyPinned(
       && !tyBearsNull(nrb)
   }
   monoPinReachNames = Map()
-  monoPinNoteReach(instBody0)
+  monoPinNoteReach(monoOrigNode[origFe])
   if monoPinReachShadowed(instBody0) {
     monoPinRetBox = false
     monoPinReachNames = Map()
@@ -18668,61 +18621,59 @@ function monoInertReach(stmts: i32[]) {
 }
 
 // Types each list or record literal whose function element or field the walk left open at the
-// one call type the value reaches (`vrCalleeTy`), so its slot's signature is the one those calls
-// make (D7103).
+// one call type the value reaches (`monoReachSlotTy`), so its slot's signature is the one those
+// calls make (D7103). An element or field already typed at a returned record of members holds it
+// whole (B2).
 function monoReachLitTys() {
   for a in vrLits {
     const at = nodeTyIxOf(a)
-    if at >= 0 && at < T.tys.length {
-      monoReachListTy(a, tyAt(at))
-      monoReachRecTy(a, tyAt(at))
-    }
-  }
-  0
-}
-
-// The list half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a list.
-function monoReachListTy(a: i32, t: Ty) {
-  // An element already typed at a returned record of members holds it whole (B2).
-  if t is TyArray && !monoIsBundleTy(t.aElem) {
-    const ct = monoReachSlotTy(a, t.aElem, "e,")
-    if ct >= 0 { nodeTyRecord(a, mkArrayTy(ct)) }
-  }
-  0
-}
-
-// The record half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a record.
-function monoReachRecTy(a: i32, t: Ty) {
-  if t is TyObj {
-    const fts: i32[] = []
-    let moved = false
-    let i = 0
-    while i < t.objFieldTypes.length {
-      const ft = t.objFieldTypes[i]
-      const ct = if monoIsBundleTy(ft) { -1 } else { monoReachSlotTy(a, ft, "f:" + t.objFieldNames[i] + ",") }
-      if ct >= 0 {
-        fts.push(ct)
-        moved = true
-      } else {
-        fts.push(t.objFieldTypes[i])
+    const t = if at >= 0 && at < T.tys.length { tyAt(at) } else { null }
+    if t is TyArray && !monoIsBundleTy(t.aElem) {
+      const ct = monoReachSlotTy(a, t.aElem, "e")
+      if ct >= 0 { nodeTyRecord(a, mkArrayTy(ct)) }
+    } else if t is TyObj {
+      const fts: i32[] = []
+      let moved = false
+      let i = 0
+      while i < t.objFieldTypes.length {
+        const ft = t.objFieldTypes[i]
+        const ct = if monoIsBundleTy(ft) { -1 } else { monoReachSlotTy(a, ft, "f." + t.objFieldNames[i]) }
+        fts.push(if ct >= 0 { ct } else { ft })
+        if ct >= 0 { moved = true }
+        i = i + 1
       }
-      i = i + 1
+      if moved { nodeTyRecord(a, mkObjTy(t.objFieldNames, fts)) }
     }
-    if moved { nodeTyRecord(a, mkObjTy(t.objFieldNames, fts)) }
   }
   0
 }
 
-// The call type literal `a`'s slot at `path`, of open function type `st`, reaches, recorded on
-// each reached callee still open; -1 when the slot is no such function or reaches no one type.
-// A slot with no type variable keeps its type (-1), and so does one holding a tagged set, the
-// set's one rep.
-function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
+// The call type slot `step` (`e`, `f.<name>`) of literal `a`, of open function type `st`, is
+// pinned at, recorded on each reached callee still open; -1 for a tagged set or no one call type.
+// The climb's agreed tuple (`elabLitSlotCallTys`) answers; value_reach's own type stands where
+// that tuple is missing or its type keeps the enclosing generic's type parameter (§3.4).
+function monoReachSlotTy(a: i32, st: i32, step: string): i32 {
   if st < 0 || st >= T.tys.length || !(tyAt(st) is TyFunc) { return -1 }
   if fnTagTyIsTagged(st) { return -1 }
   if !tyHasTyVar(st) { return -1 }
-  const ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
+  const path = (if step == "e" { "e" } else { "f:" + step.slice(2, step.length) })
+    + ","
+  let ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
   if ct < 0 { return -1 }
+  const qs: i32[] = []
+  const vals: i32[] = []
+  if !tyHasTyVar(ct) && elabLitSlotCallTys(a, step, qs, vals) {
+    let ft = -1
+    for v in vals {
+      const ex = monoOpenFnArgDecl(v)
+      let r = if ex >= 0 { monoFnDeclRetAt(ex, qs) } else { monoFnTyRetAt(nodeTyIxOf(v), qs) }
+      if r < 0 && ex >= 0 { r = elabResultAtParams(ex, qs) }
+      const et = if r >= 0 { mkFuncTy(qs, r) } else { -1 }
+      if et < 0 || (ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft)) { ft = -2 }
+      else if ft != -2 { ft = et }
+    }
+    if ft >= 0 { ct = ft }
+  }
   for c in vrCalls(a, path) {
     if c < 0 || c >= P.nodes.length { continue }
     const cn = nodeAt(c)
@@ -21353,9 +21304,9 @@ function monoParamIsTyParamList(pIx: i32, typarams: string[]): boolean {
 }
 
 // The one place a generic `argIx` handed to hole `pIx` of call `callIx` gets its signature: the
-// checker's binding, else the generic instanced at the one flow pin of its read past the call
-// (D5612), delivered concretely so the callee can forward it. "" when none closes; `tyOut[0]`
-// takes the pin's type. Two pins ask for a parameter per pin and set `monoHoleGenTwoPins` (D6280).
+// checker's binding, else the generic instanced at the one type its read is delivered at past the
+// call (D5612), delivered concretely so the callee can forward it. "" when none closes; `tyOut[0]`
+// takes that type. Two such types ask for a parameter per type and set `monoHoleGenTwoPins` (D6280).
 let monoHoleGenTwoPins = false
 // Whether that read's flow slot holds two pins, whoever's calls took them.
 let monoHoleGenManyPins = false
@@ -21406,8 +21357,8 @@ function monoHoleGenFnPin(
       monoRetypePinCalls(mfrListSrc[unwrapParen(argIx)] ?? -1, ePath)
     }
   }
-  // The plan decides whether the hole is called at two types; the flow pins may stop at a
-  // recursive forward before they reach both (D6091).
+  // Whether the hole is called at two types; the deliveries may stop at a recursive forward
+  // before they reach both (D6091).
   if ft < 0 && fl[1] >= 0 {
     const noPath: string[] = []
     monoHoleGenManyPins = monoDeclPathPins(fl, noPath).length > 1
@@ -21418,8 +21369,8 @@ function monoHoleGenFnPin(
 }
 
 // For an `if` argument `argIx` read in frame `ctx`, every arm naming a generic, the closed type
-// the first arm whose read the flow table pins takes there, as that read handed alone would;
-// -1 for any other argument or when no arm's read is pinned (D13282).
+// the first arm whose read has one delivery takes there, as that read handed alone would;
+// -1 for any other argument or when no arm's read has one (D13282).
 function monoChoiceArmFlowTy(argIx: i32, ctx: i32, depth: i32): i32 {
   const ax = unwrapParen(argIx)
   if ax < 0 || depth > MONO_ALIAS_CHAIN_MAX { return -1 }
@@ -21439,8 +21390,8 @@ function monoChoiceArmFlowTy(argIx: i32, ctx: i32, depth: i32): i32 {
 }
 
 // The closed function type at which the `let` list holding rewritten read `argIx`'s element is
-// pinned (`monoPinListElems`): the flow table keeps the read's pins on the list's slot, not on the
-// generic it now names. -1 for any other read (D9980).
+// pinned (`monoPinListElems`): the read's deliveries stay on the list's slot, not on the generic
+// it now names. -1 for any other read (D9980).
 function monoListSrcElemTy(argIx: i32): i32 {
   const ax = unwrapParen(argIx)
   if ax < 0 { return -1 }
@@ -21782,7 +21733,7 @@ function monoPinOpenCallLams(d: i32, bt: i32) {
   0
 }
 
-// The frame and binding (`monoReadLetFrame`) whose flow-table slot holds generic `argIx` read in
+// The frame and binding (`monoReadLetFrame`) whose deliveries are those of generic `argIx` read in
 // frame `ctx`: the read itself in `ctx` unless it names a `let`; `[-1, -1]` when `argIx` does not
 // name a generic.
 function monoHoleGenFnFlowDecl(argIx: i32, ctx: i32): i32[] {
@@ -21802,10 +21753,10 @@ function monoHoleGenFnFlowDecl(argIx: i32, ctx: i32): i32[] {
   out
 }
 
-// Generic `argIx`'s signature instanced at slot `lf`'s one closed flow pin as the direct call
-// binds it: closed arguments, an empty list's element at `i32` (D6542), else the call's
-// un-annotated lambdas at what the rest bind (D6543), and the result its body gives there.
-// -1 for no pin, two, a parameter that does not fit, or a type variable left open.
+// Generic `argIx`'s signature instanced at the one closed type binding `lf` is delivered at, as
+// the direct call binds it: closed arguments, an empty list's element at `i32` (D6542), else the
+// call's un-annotated lambdas at what the rest bind (D6543), and the result its body gives there.
+// -1 for no such type, two, a parameter that does not fit, or a type variable left open.
 function monoHoleGenFnFlowTy(argIx: i32, lf: i32[]): i32 {
   if lf[1] < 0 { return -1 }
   const path: string[] = []

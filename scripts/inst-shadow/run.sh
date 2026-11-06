@@ -7,11 +7,13 @@
 # compiler with --seed (default build/vl-compiler.wasm), builds each FILE with it (default:
 # tests/cases and the distilled corpus) and prints the class table. --out keeps the raw lines.
 #
-# One line per call `monoWalkIdentCall` instances, one tag per parameter:
-#   ok repeq litrep nulfn bundle monoopenrec colstub annrow   the two sides agree (see README.md)
-#   REAL[...]                                           they disagree; the line names both
-#   no:nokey no:noframe no:openhole no:open             the elaboration has no closed type
-# and a call whose own pin is not closed is `monoopen`. Run from the checkout root.
+# One line per call `monoInstantiateCallIn` instances (`*` after the line when another caller
+# than `monoWalkIdentCall` handed it on), one tag per parameter (README.md):
+#   ok repeq litrep nulfn bundle monoopenrec colstub annrow argrep   the two sides agree
+#   REAL[...]                     they disagree; the line names both
+#   <why>:xyz, no:argrep-dis      the walk top has no closed type, and what else answers
+# and a call whose own pin is not closed is `monoopen`, its parameters `eo:yes` / `eo:no` by
+# whether the elaboration closes them anyway. Run from the checkout root.
 set -euo pipefail
 
 SEED=build/vl-compiler.wasm
@@ -66,12 +68,12 @@ awk '
     for (i = 4; i <= NF; i++) {
       t = $i
       if (t ~ /^REAL/) { sub(/\[.*/, "", t) }
-      if (t ~ /^(ok|repeq|litrep|nulfn|bundle|monoopenrec|colstub|annrow|REAL|no:[a-z]+|monoopen)$/) {
+      if (t ~ /^(ok|repeq|litrep|nulfn|bundle|monoopenrec|colstub|annrow|argrep|REAL|monoopen|eo:(yes|no)|no:[a-z-]+|[a-z-]+:[adn][adn][adn]+)$/) {
         n[t]++
         if (!((t, f) in seen)) { seen[t, f] = 1; p[t]++ }
         if (t == "REAL") call = "disagree"
-        else if (t ~ /^no:/ && call == "agree") call = "no answer"
         else if (t == "monoopen") call = "mono pin open"
+        else if (t ~ /^(no:|[a-z-]+:[adn][adn][adn]+$)/ && call == "agree") call = "no answer"
       }
     }
     c[call]++

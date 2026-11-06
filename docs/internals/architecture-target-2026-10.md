@@ -1406,6 +1406,60 @@ pin-helper budget, which now holds `emit_mono.vl` alone.
 
 ---
 
+**A shadow compares three outcomes, not two** (2026-11-06). A reader switch has to agree on the
+answer when both sides answer, *and* on declines: where the old reader declines, the new one has
+to decline too. A caller's later fallbacks treat "declined" differently from "pinned", so an
+answer the new side alone gives is a behaviour change until a sweep proves otherwise. Measure at
+the function that is being replaced, not at a downstream site that sees only the final answer.
+
+The worked instance is `monoHoleGenFnPin`. The elaboration's answer, `et` where it closes and
+otherwise the argument read's one same-arity delivery, matched the final pin at all 230 site-hits
+of `monoPinHoleParam`. Switched inside `monoHoleGenFnPin`, it broke two programs and changed one
+program's output. Measured at the function over 23,456 programs (`tests/**`, the distilled corpus
+and both inventories' witnesses), against the chain it would replace:
+
+| source | site | agree | old only | new only | differ | both decline |
+| --- | --- | --- | --- | --- | --- | --- |
+| `et` at the frame's key | hole | 35 | 8 | 114 | 0 | 1 |
+| `et` | type parameter | 6 | 2 | 5 | 0 | 6 |
+| argument read's delivery | hole | 42 | 0 | 52 | 1 | 63 |
+| argument read's delivery | type parameter | 8 | 0 | 5 | 0 | 6 |
+
+The chain itself no longer reads the flow table. `monoHoleGenFnFlowTy` reads `elabSlotDeliveries`
+and `elabSlotOnlyCall` at the read's binding, so there is no table reader to retire here, and the
+57 new pins would be a capability change to grade one by one. `monoHoleGenFnPin` stays as it is.
+
+**Named follow-up: the 57 new pins.** The argument read's delivery answers at 52 hole-site and
+5 type-parameter-site calls where `monoHoleGenFnPin` declines today (the table above). Taking
+them is a capability change, not an alignment. Each is graded on its own: an output sweep, the
+run of each moved program, and a named fallback where it moves. Three of them, as first
+switched, broke `generics/list-of-fns-at-generic-list-param.vl` and
+`closures/hole-fn-list-row-index-alias-and-generic-arg.vl` and changed the output of
+`functions/hole-lambda-literal-two-instance-types.vl`.
+
+**The reach pair reads the climb (2026-11-06).** `monoReachListTy` and `monoReachRecTy` are
+deleted. A list or record literal's open function slot is typed at the forward climb's agreed call
+tuple (`elabLitSlotCallTys`) and each value's result there (`elabResultAtParams` where the template
+leaves it open). value_reach's `vrCalleeTy` stays as the gate: a slot it finds no one call type for
+is left open, as before. Of the 380 slots it types over the 23,103 programs (every `tests/cases`
+entry, both inventories, the distilled corpus), 333 take the climb's answer. One of those differs
+from value_reach's: `named/d15209_fs_in_list_half.vl` types `[half]` at `(i32) => f64` where
+value_reach gave `(i32) => i32`, and that program refuses either way. The other 47 keep
+value_reach's own type as a named fallback:
+- 27 whose call type keeps the enclosing generic's own type parameter, which the climb's closed
+  tuple cannot carry (it needs a per-instance tuple);
+- 14 whose one call passes a generic or hole function;
+- 4 the climb reaches no call for;
+- 2 with a spread element.
+A byte sweep of the 23,103 against master's fixpoint seed differs on none.
+
+**Named follow-up: the 222 new reach slots.** The climb answers 222 slots value_reach leaves open:
+- 173 whose value reaches a place value_reach does not follow (`vrLostIn`);
+- 33 whose call sits in a template whose result stays open;
+- 16 where value_reach finds no call.
+None of the 222 is a slot called at two closed types. Taking them is a capability change, graded one
+by one like the 57 above.
+
 ### 3.4 emit_mono's decision arms, measured (2026-11-05)
 
 A coverage probe counted, per program, every `if`/`else` body in `emit_mono.vl` at master f0caaf0:
@@ -1553,6 +1607,88 @@ Where the elaboration has no closed type (parameters):
     (`modules/generic-ufcs-overload-set/`), or an empty list at an unbound type parameter.
 - `no:noframe`, 39 in 20: keys exist, none from the instance being walked
   (`closures/generic-list-to-unannotated-param.vl`).
+
+**The fallback sources, graded** (2026-11-06, master `361a98fd6`, the same population). For each
+parameter the walk top leaves without a closed type, `scripts/inst-shadow` grades eight other
+elaboration sources against mono's pin, in the order the switch reads them:
+1. the instances the parameter carries;
+2. the argument's own type;
+3. the bundle signatures;
+4. the tagged set the argument carries;
+5. the parameter's type with the shadow aliases a rename minted (`T__sh<d>`, a spelling difference);
+6. the open type, where mono spells it the same;
+7. the single signature `elabCallBundleSigs` drops;
+8. the checker's closed type for a solved hole parameter.
+
+A non-generic callee with no key is graded against `recArgRepOf`, else its annotation (`argrep`):
+all 118 parameters in 55 programs agree, so that bucket needs no new fact.
+
+| bucket | params | answered and agreeing, by source | no source |
+|---|---|---|---|
+| `openhole` | 520 | 447: bundle 251, tagged set 122, same open spelling 33, shadow alias 31, own instances 8, argument 2 | 72 |
+| `nokey-gen` | 86 | 24: checked type 16, argument 8 | 62 |
+| `nokey-plainhole` | 71 | 68: checked type 66, argument 2 | 3 |
+| `noframe` | 39 | 27: argument | 12 |
+| `nokey-emptylist` | 10 | 0 | 10 |
+| `nokey-value` | 7 | 0 | 7 |
+
+One source disagrees, and it is no gap. `closures/lambda-bundle-through-hole-param-at-several-signatures.vl:19`
+hands a function that takes the bundle; the signature the elaboration records belongs to the
+inner call.
+
+What no source answers:
+
+- **A generic function value whose instance is fixed past the call** (72 `openhole`, 35
+  programs). The value is handed into a hole parameter, a map or a list, and mono pins it from the
+  calls made through it later: D9480, D9890, D10023, `closures/generic-fn-value-returned-through-identity-hole.vl`.
+  Most of these run today. The missing fact is the one D15298 pins: function-value identity in the
+  type (`Fn#d`, §2.2 steps 3 and 4). This bucket is blocked on it.
+- **A type parameter the call leaves unbound or ambiguous** (62 `nokey-gen` and 10
+  `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
+  `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
+  named fallback, a defaulting rule rather than a missing fact. The elaboration should own the
+  default eventually, but not in this change.
+- **A call inside a body mono cloned** (12 `noframe`), which the walk top does not index:
+  `len$m…$2` in `generics/typaram-list-union-param-forwards-to-generic.vl`, `inc3$1` in
+  `closures/hole-fn-record-field-called-at-other-param.vl`.
+- **A call through a value** (7), and three solved hole parameters the checker leaves open
+  (D15331).
+
+Mono declines 1,969 calls (573 programs). For 662 of their parameters (183 programs) the
+elaboration closes the type anyway (`eo:yes`). Those are the decline set, and the switch keeps them
+declining.
+
+**The ladder already reads the elaboration first** (2026-11-06, master `96d805081`). A coverage
+probe over `monoInstantiateCallIn`'s rungs labelled each of 37,711 pins in 8,682 programs with the
+rung that produced it. The heavy rungs are reads of the elaboration, spelled as mono keys the
+answer:
+
+| rung | pins |
+|---|---|
+| `monoElabPin` of the walk-top answer | 10,346 |
+| `monoPinOfClosedTy` | 1,816 |
+| `monoRecordRowPin` | 1,251 |
+| the tagged set | 2,077 |
+| the bundle rungs | about 300 |
+| the annotation and composite pushes | about 18,000 |
+
+Every rung has hits, so deleting rungs at zero hits deletes nothing. The mono-derived rungs
+(`monoArgPinName`'s rep cascade, `monoPinnedListElemPin`, `monoHoleGenFnPin`, and the first-use
+type-parameter binding behind the bare and composite pushes) fire only for parameters the order
+above leaves unanswered. The alignment is done, and what is left is that fallback tail.
+
+The tail is closed by four things:
+- function-value identity in the type (`Fn#d`, D15298), for the 72 generic function values fixed
+  past the call;
+- an elaboration-owned default for an unbound type parameter (72);
+- the 16 calls in cloned bodies and through values;
+- anything a wider population finds.
+
+Widened to every call `monoInstantiateCallIn` instances, not only `monoWalkIdentCall`'s, the
+shadow adds 31 calls: 26 agree, and one is a call through a value. No new class appears. The
+consolidation of the spelling rungs into one function is a pure refactor, graded by a
+byte-identical seed and corpus. It ends the tail in a loud refusal, "no elaboration answer for this
+parameter's instance (§3.4 fallback)", which no corpus program reaches.
 
 #### Next stage, first item: a per-call delivered-rep fact
 

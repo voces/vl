@@ -11581,6 +11581,7 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
   } else if (k == CW_UP_RET || k == CW_UP_TAIL) && up >= 0 {
     // A returned value is delivered where each call of the returning function is.
     const f = if k == CW_UP_RET { cwFrameOfDecl(up) } else { up }
+    if elabRetSinkOn && !i32ListHas(elabRetSink, f) { elabRetSink.push(f) }
     if f >= 0 && f < P.nodes.length && !i32ListHas(seen, -2 - f) {
       seen.push(-2 - f)
       const calls: i32[] = []
@@ -11608,6 +11609,9 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
   } else if k == CW_UP_ARG && up >= 0 && up < P.nodes.length {
     const cn = nodeAt(up)
     const ai = cwIxUpAux[r]
+    // A call search follows a value pushed onto a named list to that list's element reads.
+    const pd = if (elabCallRec || elabCallSinkOn) && cn is Call { elabPushRecvDecl(cn) } else { -1 }
+    if pd >= 0 { elabSlotReadDeliveries(pd, ["e"], out, seen) }
     const fds = if cn is Call && cn.callFn >= 0 { elabCalleeFns(cn) } else { [] }
     for fd in fds {
       const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
@@ -11646,6 +11650,27 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
     }
   }
   0
+}
+
+// The binding call `c` pushes onto (`xs.push(v)`, `xs.unshift(v)`, `xs` a named binding that is no
+// capture cell); -1 for any other call.
+function elabPushRecvDecl(c: Call): i32 {
+  const cf = parenPeelIx(c.callFn)
+  const fm = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
+  if !(fm is Member) || (fm.memProp != "push" && fm.memProp != "unshift") {
+    return -1
+  }
+  const o = parenPeelIx(fm.memObj)
+  if o < 0 || o >= P.nodes.length || !(nodeAt(o) is Ident) { return -1 }
+  const d = identDeclOf(o)
+  if (
+    d < 0
+    || d >= cwIxCoveredLen()
+    || (cboxCellDecls[cboxDeclKey(d)] ?? 0) == 1
+  ) {
+    return -1
+  }
+  d
 }
 
 // The functions call `c`'s callee can be: the declared function it names, else each function the
@@ -11928,6 +11953,13 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
     }
   } else if k == CW_UP_ARG && un is Call && un.callFn >= 0 {
     const ai = cwIxUpAux[u]
+    // A call search follows a value pushed onto a named list to that list's element reads.
+    const pd = if elabCallRec || elabCallSinkOn { elabPushRecvDecl(un) } else { -1 }
+    if pd >= 0 {
+      const full: string[] = ["e"]
+      for st in path { full.push(st) }
+      elabSlotReadDeliveries(pd, full, out, seen)
+    }
     for fd in elabCalleeFns(un) {
       const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
       if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
@@ -12179,6 +12211,62 @@ export function elabValueAgreedCallTys(
   for t in one { tys.push(t) }
   have
 }
+
+// The one closed argument tuple every value slot `step` (`e`, or `f.<name>`) of list or record
+// literal `a` holds reaches as its callee (`elabValueAgreedCallTys`), pushed onto `qs`, with those
+// values pushed onto `vals`; false for a spread, a value reaching no call or an open one, or two.
+export function elabLitSlotCallTys(
+  a: i32,
+  step: string,
+  qs: i32[],
+  vals: i32[],
+): boolean {
+  const n = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if n is ArrayLit && step == "e" {
+    for e in n.arrElems { vals.push(e) }
+  } else if n is ObjLit {
+    for f in n.objFields {
+      const fn = nodeAt(f)
+      if !(fn is FieldInit) { return false }
+      if "f." + fn.fiName == step { vals.push(fn.fiValue) }
+    }
+  }
+  if vals.length == 0 { return false }
+  let have = false
+  for v in vals {
+    if nodeAt(v) is Spread { return false }
+    const q: i32[] = []
+    if !elabValueAgreedCallTys(v, [], q) { return false }
+    if have {
+      if q.length != qs.length { return false }
+      let i = 0
+      while i < q.length {
+        if !tySame(q[i], qs[i]) { return false }
+        i = i + 1
+      }
+    } else {
+      for t in q { qs.push(t) }
+    }
+    have = true
+  }
+  true
+}
+
+// Whether the value bound at declaration `d` reaches a return of function `f`, as the forward
+// climb follows it through aliases, joins and slots.
+export function elabValueReturnsFrom(d: i32, f: i32): boolean {
+  elabRetSink = []
+  elabRetSinkOn = true
+  elabSlotDeliveries(d, [], -1)
+  elabRetSinkOn = false
+  const hit = i32ListHas(elabRetSink, f)
+  elabRetSink = []
+  hit
+}
+
+// The functions a delivery walk reached a return of, recorded while `elabRetSinkOn`.
+let elabRetSink: i32[] = []
+let elabRetSinkOn = false
 
 // The calls a delivery walk reached, recorded while `elabCallSinkOn`.
 let elabCallSink: i32[] = []
