@@ -7,7 +7,8 @@
 #
 # Builds <commit> into a scratch tree with `monoDeclPathKeysIn` patched to compare the two answers
 # (a disagreement fails the program with a `SIGDIFF` line), runs every program, prints the count,
-# and leaves the per-program lines in $TMPDIR/slot-delivery-audit.txt. Run from the checkout root.
+# and leaves the per-program lines in $TMPDIR/slot-delivery-audit.txt, the programs whose audit build
+# traps in $TMPDIR/slot-delivery-audit-trapped.txt. Run from the checkout root.
 set -euo pipefail
 commit=${1:?usage: slot-delivery-audit.sh <commit> [jobs]}
 jobs=${2:-6}
@@ -59,7 +60,11 @@ Deno.writeTextFileSync(p, s);
   --compiler "$root/build/vl-compiler.wasm" -o "$tmp/audit.wasm" >/dev/null)
 { find tests/cases -name '*.vl'; find scripts/silent-sweep/distilled/cells scripts/silent-sweep/distilled/named -name '*.vl'; } |
   sort | xargs -P "$jobs" -I{} sh -c \
-    'o=$(VL_STD="'"$root"'/std" timeout 120 "'"$vl"'" run "{}" --compiler "'"$tmp"'/audit.wasm" 2>&1 </dev/null | grep -o "SIGDIFF.*" | head -1); [ -n "$o" ] && echo "{} $o"; true' |
-  sort > "$out"
+    'o=$(VL_STD="'"$root"'/std" timeout 120 "'"$vl"'" run "{}" --compiler "'"$tmp"'/audit.wasm" 2>&1 </dev/null | grep -oE "SIGDIFF.*|compiler itself trapped" | head -1); [ -n "$o" ] && echo "{} $o"; true' |
+  sort > "$tmp/all.txt"
+grep "SIGDIFF" "$tmp/all.txt" > "$out" || true
+grep -v "SIGDIFF" "$tmp/all.txt" > "${out%.txt}-trapped.txt" || true
 echo "slot-delivery audit at $(git -C "$root" rev-parse --short "$commit"): $(wc -l < "$out") programs disagree ($out)"
 grep -o "class=[a-z]*-[a-z]*" "$out" | sort | uniq -c | sort -rn
+# A program whose audit build traps compares nothing, so it is counted apart rather than as agreeing.
+echo "$(wc -l < "${out%.txt}-trapped.txt") programs trap the audit build (${out%.txt}-trapped.txt)"
