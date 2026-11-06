@@ -1316,6 +1316,13 @@ skips an uncovered value, and the table answers none there either. With the tabl
 every only-call site over all 19,309 sweep programs, no site disagrees, and
 `fnFlowDeclPathOnlyPinCall` is deleted.
 
+Two routes record the calls a value reaches, and they count different sets. The only-call search
+(`elabValueOnlyCall`) records through `elabCallRec`, in the climb's callee edge, before the
+`elabNoCallParam` and `elabDlvOmit` filters. `elabCallSink` (`elabSlotOnlyCall`, and the agreed
+reader's `elabValueAgreedCallTys`) records in `elabCallDeliveryAdd`, after them. Neither query is
+answered from the slot memo. They are not unified, so a reader of one cannot assume the other's
+answer.
+
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
    `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
    `fnFlowStageInstHoles` go with the file.
