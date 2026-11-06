@@ -126,6 +126,7 @@ import {
   fnLetOpenHandNote,
   fnParamHandNote,
   fnSetCalleeNote,
+  fnSlotCallArgsInto,
   fnSlotCallNote,
   fnTagArmMemberOf,
   fnTagCallNote,
@@ -133,6 +134,8 @@ import {
   fnTagChoiceOfTy,
   fnTagMembers,
   fnTagSetOfTy,
+  stampsHeld,
+  stampsHeldSet,
 } from "./check_elab_cap"
 import { strLitRecvTy } from "./check_builtin_methods"
 import { builtinMethodNamesOf } from "./check_callee"
@@ -153,6 +156,7 @@ import {
   globalBeforeDecl,
   inferObserved,
   memSharedCalls,
+  optReadPartOf,
   optReadParts,
 } from "./check_core_state"
 import {
@@ -514,7 +518,7 @@ import {
   fnDeclIx,
 } from "./check_write_scan"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
-import { identDeclOf, identFrom } from "./symbols"
+import { declOrigOf, identDeclOf, identFrom } from "./symbols"
 import {
   isNullTy,
   isVoidTy,
@@ -2143,7 +2147,11 @@ function callFtyArgAssign(
     wsSuppress = true
     const savedOrigLit = argLitAt
     argLitAt = peelParenIx(args[i])
+    // The hold only checks: the argument is built at its own record, the one the instance binds (D15481).
+    const wsHeld = stampsHeld
+    stampsHeldSet(true)
     const wsOk = assignableExpr(args[i], at, wsOrig)
+    stampsHeldSet(wsHeld)
     argLitAt = savedOrigLit
     wsSuppress = false
     if !wsOk { argMismatchErr(i + 1, wsOrig, at, args[i]) }
@@ -3988,6 +3996,33 @@ export function checkCallNode(n: Call, ix: i32) {
   t
 }
 
+// The one closed argument tuple, pushed onto `qs`, every call through slot `path` of declaration
+// `d` is made at, as noted at the binding a copy of `d` reads; false when none is.
+export function slotCallArgsInto(d: i32, path: string[], qs: i32[]): boolean {
+  const o = if d >= 0 && declOrigOf(d) >= 0 { declOrigOf(d) } else { d }
+  const hp: string[] = []
+  for st in path { hp.push(st) }
+  fnSlotCallArgsInto(calleeSlotHolderOf(o, hp), hp, qs)
+}
+
+// The binding the calls through slot `path` of declaration `d` are noted at (`calleeSlotOf`'s
+// answer for a read of `d`), with `path` extended by the steps from it; `d` itself when none is.
+function calleeSlotHolderOf(d: i32, path: string[]): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return d }
+  const src = calleeCopySrc(dn.letInit)
+  const pre: string[] = []
+  const via = calleeSlotOf(src, pre, 1)
+  const alias = src >= 0 && src < P.nodes.length && nodeAt(src) is Ident
+  if via < 0 || !(pre.length > 0 || alias) { return d }
+  const rest: string[] = []
+  for st in path { rest.push(st) }
+  while path.length > 0 { path.pop() }
+  for st in pre { path.push(st) }
+  for st in rest { path.push(st) }
+  via
+}
+
 // The `let` binding a callee read `x` takes its value from through a field, element or map value,
 // with that slot's path (`f.<name>`, `e`, `v`, outermost last) pushed onto `path`; -1 for none.
 function calleeSlotOf(x0: i32, path: string[], depth: i32): i32 {
@@ -3998,6 +4033,16 @@ function calleeSlotOf(x0: i32, path: string[], depth: i32): i32 {
     Ident => {
       const d = identDeclOf(x)
       const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+      // A `for` variable over a list is the list's element slot.
+      const lp = loopVarLoop(d)
+      const fi = if lp >= 0 && lp < P.nodes.length { nodeAt(lp) } else { null }
+      if fi is ForIn && fi.fiDecl1 == d {
+        const it = nodeTyIxOf(fi.fiIter)
+        if it < 0 || it >= T.tys.length || !(T.tys[it] is TyArray) { return -1 }
+        const h = calleeSlotOf(fi.fiIter, path, depth + 1)
+        if h >= 0 { path.push("e") }
+        return h
+      }
       if !(dn is LetDecl) { return -1 }
       // A `const` copy of a slot (`const f = m["k"]`), of a whole binding (`const ws = zs`) or of
       // one spread binding (`[...ps]`) is that slot, at any depth.
@@ -4105,6 +4150,7 @@ function checkCallNodeAt(n: Call, ix: i32) {
         mkIndex(ocf.omObj, n.callArgs[0], n.pos),
       ]
       optReadParts[ix] = parts
+      optReadPartOf[parts[1]] = ix
     }
     const t = checkCallNodeGo(n, ix)
     for op in optReadParts[ix] ?? [] { recordCtxTy(op, t) }

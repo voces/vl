@@ -1063,7 +1063,442 @@ Besides the programs, four kinds of reader ask the plan, and each must lose its 
 
 No dependent would turn into a miscompile if the plan were deleted today: H-choice's 3 such rows run since #5838. The checker no longer requests a split (#5870).
 
+
+### 3.3 Retiring the flow table, reader by reader (proposal, 2026-11-05)
+
+`fn_flow_shadow.vl` (139 functions) is the last producer of function-value facts outside the
+elaboration. It is a union-find over the checked tree's bindings. Each class records the functions
+that flow in (sources) and the closed signatures it is called or annotated at (pins). Mono reads it
+through 32 entries from 48 functions. The cad lane's coverage probe hit 138 of the 139 functions
+over 23,803 programs, so there is no dead code to plan around.
+
+**What the table carries, measured.** On master `63dae4dc` (fixpoint seed), each group of entries
+was cut to its no-table answer, and the 5,792 `tests/cases` files marked `@run` were run before
+and after. A file counts as moved if its output changed.
+
+| group | entries | mono readers | files moved | of which print nothing |
+| --- | --- | --- | --- | --- |
+| whole table (`fnFlowTableBuild` skipped) | 32 | 48 | 135 | 121 |
+| sources and writes | `fnFlowDeclWritten`, `fnFlowReadWritten`, `fnFlowReadGenFn`, `fnFlowDeclPathSrcs`, `fnFlowDeclPathHeldSrcs` | 13 | 47 | 47 |
+| pins | the 13 `fnFlow*Pin*` entries, plus `fnFlowDeclPathUncalled` | 24 | 84 | 70 |
+| hole-lambda chains | `fnFlowLamPin`, `fnFlowAliasLam`, `fnFlowCellLam`, `fnFlowRespellLam` | 7 | 7 | 7 |
+
+- The groups overlap only between sources and pins (14 files). Together they cover 119 of the
+  whole-table population's 135.
+- The other 16 move only when the table is not built at all. They are reached through
+  `fnFlowDeclFn`, `fnFlowStageInstHoles` and the slice helper.
+- 108 of the 135 are under `closures/`.
+
+**What the elaboration already records for each group.**
+
+- **Sources and writes.**
+  - The write index (`cwBindingWrittenValues`, check_write_scan.vl) answers whether an `=` writes
+    a binding and with what.
+  - `fnTagSharedArgDecl` follows the same un-annotated `const` alias chain that `fnFlowReadGenFn`
+    does.
+  - A slot's held functions are the members of the set its type carries
+    (`fnTagMembers(fnTagSetOfTy(..))`), now including the joins at a shared type parameter
+    (`fnTagCallJoinOf`) and at a list, record or map slot.
+  - The one gap is the capture cell (`let d = [v]`, `d[0] = v`). The cell is built after the check
+    by emit_collect's rewrite, so the write index never sees it. Either the rewrite records its
+    cells as writes, or the cell reads its binding's set.
+- **Hole-lambda chains.**
+  - The elaboration instances a hole lambda at each closed signature a call through its set
+    takes (hole rows, `elabHolePinNote`).
+  - The four entries name a lambda through `const` and `let` chains and capture cells, so that
+    mono can find the instance. The elaboration resolves the same chain at the call, so the
+    instance is the hole row keyed at the callee's set. The cell is the gap again.
+- **Pins.** A pin is a closed parameter list some call or annotated destination delivers a slot's
+  value at. The elaboration has these facts per instance, not per class:
+  - each call's bound parameter types (`elabCallParamTy`, `elabNodeTy(ix, k)`);
+  - each member's instance at those types (`elabMemberKeyAt(d, pTys)`);
+  - each closure delivery at a closed type (`mintCloDeliveryNote`).
+
+  An agreed pin (`fnFlowDeclPathAgreedPinTys`, `fnFlowDeclPathOnlyPinCall`) is then "every member
+  of the slot's set has one instance key". The per-call pins (`fnFlowDeclPathPinTysAt`,
+  `fnFlowCallPath*`) are that call's instance types. Annotation pins (`fnFlowDeclPathPinRets`,
+  `fnFlowCallPathAnnPinTys`) need the delivery types recorded with a result, which today's
+  delivery rows do not carry. `fnFlowDeclPathUncalled` is "no member has an instance and the set
+  escapes nowhere". That needs an escape fact the elaboration does not have yet.
+
+**Order.** Each step cuts its readers to the elaboration's answer, grades the cut at 0 movers with
+the split plan on and off (the byte-diff sweep, error fixtures included), then deletes the
+entries.
+
+1. **Hole-lambda chains** (7 files, no overlap). Landed 2026-11-05; fn_flow_shadow.vl is down
+   from 139 functions to 128.
+   - The alias, cell and respell chains read `check_lam_chain.vl`. For each un-annotated binding
+     it records the initializer, the values written to it and the function declaring it. These are
+     source facts noted from the write index before `captureBoxRewrite` turns a captured `let` into
+     a cell. The rewrite mutates that `let` in place, so a cell read names the same binding.
+   - The one pin a lambda's class agrees on is the one parameter list that every elaboration
+     instance of the lambda closes at (`elabDeclOnePin`).
+   - Of the 7 files, the chains carry 5 and the pin carries 2.
+2. **Sources and writes** (47 files). `fnFlowDeclWritten` and `fnFlowReadWritten` move to the write
+   index. `fnFlowReadGenFn` moves to `fnTagSharedArgDecl`. `fnFlowDeclPathSrcs` and
+   `fnFlowDeclPathHeldSrcs` move to the members of the slot type's set. The 14 files shared with
+   pins are graded again in step 3.
+3. **Pins**, by reader family, smallest population first:
+   1. agreed and only-call pins, read off member instance keys;
+   2. the per-call pins `monoRetypePinCalls` and `monoHoleOwnCallsDiffer`, read off the call's
+      instance types;
+   3. the slot pins `monoPinListElems`, `monoStoredSlotFnTy`, `monoFlowSlotPins` and
+      `monoDeclPathKeys`. This is the (γ) e/f population in §3.1; its open rows go first;
+   4. annotation pins, once a delivery row records its result;
+   5. `fnFlowDeclPathUncalled`, once an escape fact exists (below).
+
+**The escape fact `fnFlowDeclPathUncalled` needs** (2026-11-05). The table answers "uncalled" for slot
+`(d, path)` when no pin reaches the slot's class and the class is not marked *top*. A pin is a call
+or an annotated delivery. The only writer of *top* is `ffOpaque`: a function-typed argument handed
+to a callee the program does not declare (a builtin, a host import, an unresolved name). Its calls
+happen where no fact can see them, so the slot has to be treated as called.
+
+- **What it means.** Function `f` *escapes* when a value holding `f` is passed as a positional
+  argument to a call whose callee resolves to no declared function and is not a call through a
+  function value. Escape is a fact about the function, not the slot. Under §2.2 a slot's value is
+  one of its set's members, so a slot escapes when one of the functions it holds escapes.
+- **Who writes it.** The check's last pass over the source program (`lamChainSnap` in
+  check_lam_chain.vl, at `elabPrepareRun`, before any emit rewrite), as `fnEscapes(f)` (private as `_fnEscapes` until this reader lands):
+  - at each such call, for each argument whose type carries a set, every member of that set;
+  - for an argument naming a declared function directly, that function.
+  - The answer is the same in every instance, because it depends on the callee being opaque and on
+    the argument's set, and neither changes per instance. One set per compile, reset with the
+    elaboration's other rows.
+- **What reads it.** `uncalled(d, path)` holds exactly when all three are true:
+  - `elabSlotSetCalls(d, path)` is empty: no call through the slot's set, or through a join that
+    holds the set;
+  - the split-dep lane's `elabSlotDeliveries(d, path)` is empty: no closed delivery;
+  - no function `elabSlotHeldFns(d, path)` returns has escaped.
+- **What it replaces.** The table's per-class *top* label, which is the only escape the table
+  records.
+- **Globals and exports.** The table marks neither, and does not need to:
+  - A module global is a binding in the one merged arena. Every read of it is a node the program's
+    own facts see, and a call through it is a call through its set.
+  - A binding another module imports is in the same compile, because modules are merged before the
+    check.
+  - The host is handed only scalar module bindings as wasm globals (`exportGlobalRows`), so a
+    function value never reaches it that way.
+  - An opaque callee can therefore only receive a function as an argument at its own call, and
+    that call is where the fact is written. A function stored first and passed later escapes at
+    the later call. A value written into a container that is later handed to an opaque callee escapes through
+  the container's type, which carries the same set, so the set-keyed fact covers it without
+  following the container.
+- **Acceptance.** The uncalled cut's 3 files:
+  - `closures/generic-stored-through-map-param-read-only-by-length.vl`;
+  - `closures/hole-fn-generic-map-handed-two-maps.vl`;
+  - `closures/hole-helper-pushes-listed-member-onto-uncalled-list.vl`.
+  Plus one control, where an uncalled-looking slot's function is passed to an opaque builtin, so it
+  must not be answered uncalled.
+
+   Each family is measured alone by its own cut before it is scheduled.
+
+**The uncalled family, landed** (2026-11-06). `elabSlotUncalled(d, path)` answers it from the
+elaboration: no call reads its callee from the slot (`fnSlotCalled`, the checker's per-slot call
+index), no call goes through the set its type carries (`elabSlotSetCalls`), no closed delivery
+(`elabSlotDeliveries`), and no function it holds escapes (`fnEscapes`). Shadowed against the
+table at its three mono readers, it agreed at 159 of 165 site-hits until two gaps closed: a call
+through a one-member set reads its callee from the slot but the set records no call, and a `for`
+variable over a list is that list's element slot (`calleeSlotOf`). Then 165 of 165.
+`fnFlowDeclPathUncalled` is deleted.
+
+**Census of the remaining non-slot readers** (2026-11-06, master `214bc5d9`; witnesses are the
+`tests/cases` files where the entry gives a non-default answer):
+
+| entry | family | mono callers | witness (hits / files) | elaboration answers today |
+| --- | --- | --- | --- | --- |
+| `fnFlowDeclPathOnlyPinCall` | agreed, only call | monoPinOpenCallLams | `generics/hole-call-generic-lambda-arg.vl` (91 / 32) | partly: not where calls through a result fix the pin |
+| `fnFlowDeclPathAgreedPinTys` | agreed | monoHeldSrcsFnTy, monoHoleGenBindFnArgs | `closures/hole-fn-in-unannotated-map.vl` (2 / 2) | as above |
+| `fnFlowDeclPathAgreedPinTysSkipping` | agreed | monoElemFnPinTys | `closures/hole-fn-if-join-result-handed-hole-fn.vl` (10 / 5) | as above |
+| `fnFlowCallPathAgreedPinTys` | agreed, per call | monoPathSlotPinnedFnTy | `closures/generic-fn-in-unannotated-map.vl` (9 / 5) | the call's instance types |
+| `fnFlowCallPathAnnPinTys` | annotation | monoPathSlotPinnedFnTy | none in `tests/cases` | no: delivery rows record no result |
+| `fnFlowPinSigOf` | spelling helper | 4 | `maps/function-valued-map.vl` (3,523 / 554) | needs no table; the table uses it too |
+| `fnFlowElemKind` | syntax | monoPlaceRoot | `std/array-sorted.vl` (3,608 / 495) | needs no table; the table uses it too |
+| `fnFlowWholeSliceRecv` | syntax | monoFlowSliceAsSpread | `closures/generic-list-slice-copy-own-instances.vl` (7 / 2) | needs no table; the table uses it too |
+| `fnFlowDeclFn` | rest | monoDeclFrameIn, monoReadIsBinding | `loops/loop-value.vl` (67,693 / 1,188) | `recEnclosingFn`; last, with a full A/B |
+
+The last three are also read by the table's own walk, so they leave with the file. The four
+programs `monoHoleGenFnPin` still has no elaboration answer for split across families: the only-call
+pin (`closures/generic-fn-value-returned-through-identity-hole.vl`, D12340), the skipping agreed pin
+(`closures/hole-fn-if-join-result-handed-hole-fn.vl`) and the uncalled slot
+(`closures/hole-helper-pushes-listed-member-onto-uncalled-list.vl`). The agreed family's missing fact
+is a pin fixed by calls through a function's result (`fw(x)(y)`, `mk(g).f(3)`).
+
+**The only-call pin is the slot-delivery climb's calls** (2026-11-06, measured on #6465's head
+`732c3b24`, a probe recording every call `elabReadOn`'s callee arm reaches during
+`elabSlotDeliveries` / `elabSlotClimb` from the value `monoHoleGenFnFlowDecl` names). Against
+`fnFlowDeclPathOnlyPinCall` over the 55 `tests/cases` files the table answers in, counting
+site-hits:
+
+| result | hits | files | cause |
+| --- | --- | --- | --- |
+| agree | 68 | 22 | the forward climb's one call is the table's |
+| table only | 18 | 11 | forward gap: the argument edge in `elabReadOn` and `elabSlotAliasOn` resolves a callee only through `identFnDeclOf`, so a call through a function value (`const k = lap; k(id)`, `fs[i](add)`, `if c { p } else { q }` as the callee) stops the climb |
+| elaboration only | 35 | 13 | the table's class is a bidirectional union: `keep((x) => x + 1)` is called only at `q(7)` inside `keep`, but `lap(f) { f(2.5); f(3); keep(f) }` puts `lap.f` and `keep.g` in one class, so the table declines |
+
+No new fact is needed: the climb already follows a value through argument passing, aliases,
+joins, returns, element and field writes and capture cells, and the agreed and skipping pins are
+the same climb's calls with the same forward gap.
+
+**The forward answer is adopted** (coordinator ruling): it is more precise than the class union,
+which pins a value at calls that never reach it. The union also kept the reps of a shared slot
+aligned, and that is the condition the switch carries. A slot one value reaches as a plain closure
+and another as a bundle (`keep.g` above) is called through one body, so the call site has to serve
+both reps. The switch therefore lands:
+
+1. after the forward gap closes (a callee resolved through the value it reads);
+2. graded on output, not bytes alone, with 0 runs → not-runs over the 35 sites that change;
+3. with a witness of the shared-slot shape (a lambda and a bundle reaching one parameter called
+   once) that runs and prints the right values;
+4. falling back to the table's answer wherever the forward answer moves output or validity, each
+   fallback named here, rather than a wider rule.
+**The slot-delivery family, landed** (2026-11-06, #6465). `monoDeclPathKeysIn` reads `elabSlotDeliveries`; `rets` mode stays on the table. Known over-width: `closures/binding-copied-through-uncalled-chain.vl` lowers one closure with an unused trailing `i32` parameter that its call site fills (output unchanged), for a later rep pass to drop.
+
+**The slot readers of the agreed pin, landed** (2026-11-06). `monoPathSlotPinnedFnTy` and
+`monoHeldSrcsFnTy` read a slot's pin from the checker's per-slot call index
+(`slotCallArgsInto`, check_calls.vl) in place of `fnFlowCallPathAgreedPinTys` and
+`fnFlowDeclPathAgreedPinTys`. Shadowed at both sites over `tests/cases`, the index first agreed
+at 8 of 14 site-hits. Two gaps closed the rest:
+
+- a call through a `const` copy of a list (`const bs = [...ps]; bs[0](2)`) is noted at the
+  binding the copy reads, so the reader asks that binding (`calleeSlotHolderOf`);
+- one call with no arguments (`ks[0]()`) is a tuple, not the absence of one
+  (`fnSlotCallArgsInto`).
+
+That gave 11 agree with equal tuples, 3 where neither answers, and none on one side only. The
+reader is unkeyed by call. The table's per-call narrowing moved no file: fixpoint seeds against
+master build all 7,538 sweep programs byte-identical with the split plan on and off.
+`fnFlowCallPathAgreedPinTys` is deleted. `fnFlowDeclPathAgreedPinTys` stays for
+`monoHoleGenBindFnArgs`.
+
+**The forward gap, closed** (2026-11-06). Both argument edges of the climb resolve a callee
+through `elabCalleeFns`. That is the declared function a name calls, else each function the slot
+it reads can hold: an alias, a list element, a joined value, or a written `let` and its writes.
+The only-call shadow on master `0e6d2104f`, over `tests/cases` (site-hits):
+
+| | agree | table only | elaboration only | neither |
+| --- | --- | --- | --- | --- |
+| before | 68 | 18 | 35 | 80 |
+| after | 81 | 5 | 53 | 62 |
+
+The 5 table-only hits left:
+
+- 2 are D15444's order rule;
+- 1 is D15455's parameter-written record field;
+- 2 are D6883's annotated copy stored in a record (`const b: F = a; const r = { f: b };
+  r.f("w")`), whose climb stops at the annotated `const`. Fixpoint seeds build all 7,538 sweep programs byte-identical
+with the split plan on and off, so this is shadow-only until the only-call reader switches. The
+shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
+Its failing twin, through a list or joined callee given a hole function and a closed-typed
+function, is D15484.
+
+**The only-call pin, switched** (2026-11-06). `monoPinOpenCallLams` reads `elabValueOnlyCall(d)`,
+the forward climb's one call. It falls back to `fnFlowDeclPathOnlyPinCall` in two named cases:
+
+- the climb reaches none, which covers the 5 table-only hits above;
+- the value is one the write index does not cover (minted after its build), whose climb would
+  read an index row that is not there.
+
+Graded on fixpoint seeds against #6471, over all 7,538 sweep programs with the split plan on and
+off:
+
+- 0 runs → not-runs;
+- 1 file builds different wasm, `closures/generic-returned-to-un-annotated-param-lambda.vl`. Its
+  output is unchanged, and the only difference is an unreachable stub's signature.
+
+Without the second fallback, `generics/hole-fn-arg-through-hole-callee.vl` trapped the compiler.
+The shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
+
+4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
+   `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
+   `fnFlowStageInstHoles` go with the file.
+
+
 ---
+
+### 3.4 emit_mono's decision arms, measured (2026-11-05)
+
+A coverage probe counted, per program, every `if`/`else` body in `emit_mono.vl` at master f0caaf0:
+5,575 arms, over 23,810 programs (every `tests/cases` file, the distilled corpus, every filed
+witness in both inventories). The counter was validated on `monomorphize`'s own arms before any zero
+was read. A *decision arm* records a node type (`nodeTyRecord`, `monoRetype*`, `monoRecordOpen`) or
+returns a computed pin; an arm that refuses (`emitFail`, a `*Fail` helper) is a refusal arm.
+
+**Arms are not deleted on zero hits** (coordinator ruling). A dead function's callers are already
+unreachable; a dead arm sits in a live function, and deleting it reroutes an unmeasured program to the
+next rung. `monoArgTyNameRep`'s scalar tail (`exprIsF64` to `"f64"` and its neighbours) is unreached,
+and its cascade ends in `"i32"` (D23): deleting a rung would pin an unmeasured f64 argument at `i32`,
+a clause-1 miscompile no corpus program sees. The zero list is a map of what earlier rungs or the
+elaboration already decide:
+
+- 46 decision arms with no hit, by function: `monoArgTyNameCascade` (2), `monoArgTyNameProjected`,
+  `monoArgTyNameRep` (14), `monoCallWrittenLet`, `monoCapturedDestListPin`, `monoCoerceChoiceBinding`
+  (2), `monoCopyCellRead`, `monoHeldRecPaths`, `monoHoleGenFnPin`, `monoInitHeldTy`,
+  `monoLoopVarRecordPin`, `monoModuleLetPin` (2), `monoPinCallRecord`, `monoPinFieldContainer`,
+  `monoPinFieldValue`, `monoPinOpenCallLams`, `monoPinWidened`, `monoPinnedAnnTyAt`,
+  `monoRecordInstOpen`, `monoRecordPinnedRecv`, `monoRetConstRecord`, `monoRetypeCallsAt` (5),
+  `monoRetypeLamCells` (2), `monoRetypeMethodReads`, `monoSigFnTyNameAt`.
+- 36 refusal arms with no hit, kept: `monoBindExplicitTyArgs`, `monoBindingAtPin` (2),
+  `monoBundleNamedPin` (2), `monoBundlePinArg`, `monoBundleRecordTy`, `monoCloCoerceBuild` (2),
+  `monoClosureBundlePin`, `monoCoerceWrittenCell` (3), `monoHandWrittenLet` (2),
+  `monoIfChainRebuildPinned`, `monoInertArgsStubbed`, `monoInstantiateCallIn`, `monoLayoutConstOf`
+  (2), `monoLetTyParamMisfit`, `monoMakeInstanceGo` (2), `monoMakeInstanceLater` (2),
+  `monoMakeInstanceParams`, `monoMakeInstanceWalk`, `monoNicheNulListCheck`, `monoOpenCallAtElems`
+  (2), `monoPinColsMisalignedFail`, `monoPinHoleParam`, `monoPruneTemplates`, `monoShadowRenameDecl`
+  (2), `monoTwoListArgFail`.
+
+**The most-reached decision arms are the next stage's queue**, each to be shadowed against the
+elaboration fact that should carry the same answer: `monoWalkIdentCall`'s instance of a generic call
+(9,384 programs, D3961), `monoHoleGenFnPin` (7,937), `monoPinNoteReturns`,
+`monoNarrowedNominalPinName`, `monoReachListTy`, `monoCloneGenericCallArm` (D12702),
+`monoReachRecTy`, `monoCloPinAnnNodeOfExpr`, `monoMakeInstanceGo`'s instance note,
+`monoIfChainRebuild`, `monoPinBodyLambdasRaw` (D1990), `monoCloneGenericCalls` (D2849, two arms),
+`monoCloneLambdaSubst` (two arms, D943 and seven more), `monoPinLamFromCheckedTy` (D3820, D3834).
+
+**Shadow of `monoHoleGenFnPin`** (the signature a generic handed to a hole parameter takes), against
+`callArgRepTy` over `elabCallParamTy` at `monoPinHoleParam`: 83 programs agree, 0 disagree, and 4 get
+no elaboration answer: `closures/generic-fn-value-returned-through-identity-hole.vl`,
+`closures/hole-fn-if-join-result-handed-hole-fn.vl`, D12340 and D15455. Each is a signature fixed
+past the call, by calls through the result, which only the flow table carries. The switch to the
+elaboration's answer waits for those four, so it lands with the derivation's deletion and not beside it.
+
+**Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), comparing the
+instance's parameter types with the elaboration's per call, union members order-normalised:
+
+- against `elabCallParamTy` alone, 66 programs (74 pairs) disagree, most of them a record delivered
+  at a wider row than its type. Minimal witness, where mono is right: with `const wideJ: J = mk()`
+  beside `const xs = [mk()]`, `mk`'s literal is built in `J`'s row `{f: i32 | null}`, so `rd(xs[0])`
+  must be instanced at that row; the type is `{f: i32}`.
+- against `callArgRepTy` (the rep row `callBindAdoptReps` records beside the binding), 8,358 agree,
+  339 get no answer and 33 programs (40 pairs) disagree.
+
+#### Next stage, first item: a per-call delivered-rep fact
+
+DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
+instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
+a record built wider, which is why 34 of the 74 pairs close under `callArgRepTy`. Each remaining kind
+was checked against the emitted wasm before anything was built:
+
+- a value delivered non-null to a nullable function parameter (16 pairs) is not a gap. Mono spells
+  the instance's parameter at the non-null type, but every instance lowers it to the same nullable
+  closure reference, so the binding's `| null` type already is the rep;
+- a closure bundle handed to a parameter (14 pairs) is a real rep, a struct of closures. The
+  elaboration already holds its signatures (`elabCallBundleSigs`); mono adds the gate that the
+  callee only calls the parameter (`monoBodyReadsOtherThanCalled`), without which the signatures
+  claim a bundle mono does not build (5 calls). The gate moves into the elaboration beside them;
+- a record whose row mono keys narrower or wider than the binding, or cannot spell because it holds
+  generic functions (8 pairs), and literal-union spellings the render softens (2 pairs), are still to
+  be checked against the wasm the same way.
+
+The fact: for each argument `i` of each call, the rep it is delivered at, read through `callArgRepTy`
+and the bundle record of `elabCallBundleSigs`. Mono's instance choice in `monoWalkIdentCall` and
+`monoPinHoleParam` then reads the elaboration's type and this rep, and stops deriving either. The
+acceptance set is the 24 bundle, record and spelling pairs: each must read the same under both, then
+the 339 no-answer calls, before the instance choice switches.
+
+#### The canonical instance key, measured (2026-11-05, master `82069a442`)
+
+The switch derives mono's instance key from the elaboration, not from mono's own spelling. Each
+instance `monoMakeInstance` built was recorded with its elaboration key (`monoKeyEk`), over every
+`tests/cases` file with a fixpoint seed: 13,046 instances in 2,415 files, 12,919 of them keyed.
+
+- **Callback specialization (96 groups).** Mono keys an instance by the function value it is handed
+  (`@inc`, `@__lambda_3`), so the call inside is direct. One elaboration key, several instances. The
+  elaboration has no such dimension; the key keeps it as its own component.
+- **One elaboration key, several mono keys besides specialization (15 groups).** Under the key
+  below, 9 differ by their specialization value once mono's `(()=>i32)` / `()=>i32` spelling is read
+  as "unspecialized" / "specialized". 2 are one nested generic instanced per enclosing instance
+  (`shadowOther`'s `inner`, marker `^20`), whose copies read different environment structs: the
+  parent component. 2 are a check-reject fixture's. 2 are true duplicates with identical bodies
+  (`deliver` in `closures/generic-returned-record-param.vl`, `F$m…` in
+  `generics/instance-call-of-literal-union-field-function.vl`), which the key merges with no change
+  in output.
+- **No elaboration key (127 instances).** 109 are their template's only instance (46 lambdas, 41
+  hole-parameter functions solved closed, 22 annotated functions at one storage row): the
+  declaration is the key. 4 are two hole-parameter functions instanced twice at one literal-union
+  type (`elem`, `glob` in `generics/type-param-write-literal-union-at-pin.vl`, `K|null` against
+  `K|null#litK`), with identical bodies: duplicates. The other 14 are the gap: 7 annotated,
+  non-generic functions each instanced at two storage rows (`take` at `{f: i32 | null}` and at
+  `{f: i32}`, in the `soundness/built-container-*` and `fresh-literal-handed-back-wider-*` fixtures).
+  Their rep is already a checker fact: `recArgRepNote` records the row a built-container read
+  handed to an annotated parameter is stored at (D14532), and `monoPinAnnotatedParam` pins at
+  `recArgRepOf` of the argument, else the annotation. The key's rep component is therefore
+  `callArgRepTy` for a generic call and `recArgRepOf`, else the parameter's declared type, for a
+  non-generic one: no fact is missing.
+- **One spelling, several keys (26 groups).** One generic returned by different functions;
+  `elabInstSpelling` omits the parent, so the key carries it.
+
+The per-parameter comparison (`callArgRepTy` against mono's pin, 37 pairs) found no pair where mono
+is nearer the wasm than the elaboration. The key is therefore: the elaboration key (or the
+declaration), the parent key, the rep row of each parameter with union members in canonical order
+and a literal union named by its rep, and the callback specialization.
+
+**Callback specialization is mono's component of the key** (coordinator ruling, 2026-11-05). The
+elaboration owns what an instance means: its type and its rep. Specializing an instance on the
+function value it is handed makes the call inside direct and changes no meaning, so it is a
+code-generation choice and mono's to make. The key is (elaboration type and rep, the parent where
+the spelling omits it, the specialization value or none); the 96 groups above are its evidence.
+The condition: one predicate decides "specialize this call on this value". Today that is
+`monoSpecializableCallbackName`, but each of its two callers gates it differently. The generic
+instance key (`monoMakeInstance`'s `cbFnNames`, suffix `@name,`) skips a callee read through a
+written binding (`viaWritten`). The non-generic specialization (key `C<fe>@name`) has its own
+assignment check (`monoReadIsAssigned`). Those gates move into the one predicate before the switch.
+
+#### The call half and the value half (2026-11-06)
+
+**A function delivered as a value has all its instances in the value half; a function only ever
+called by name has all its instances in the call half** (coordinator ruling, 2026-11-06). The
+predicate is `elabDeclIsValue`: some read of the name is not a call's callee. Under it no function
+has instances keyed two ways. Splitting one function's instances across the halves (the written
+binding a value is copied through, which one instance has to serve) was the one source of output
+movers that keying by rep could not close.
+
+- **The call half** keys an instance made for a call by the elaboration's call-time key
+  (`elabWalkKeyOf`) plus the rep and tagged set each parameter is pinned at, the enclosing call
+  frame and the callback specialization (`instKeyCanon`). The body is still elaborated at mono's
+  demanded key, which is rep-consistent. Measured over `tests/cases` with fixpoint seeds: 8,450 of
+  11,271 call-made instances, 76 programs' bytes move and 0 programs' outputs.
+- **The value half** keys an instance of a function delivered as a value, call and value alike,
+  by the elaboration's key for it (`instKeyValueTime`: the call's key, else the value's, else the
+  typed slot's), plus the same rep, frame and specialization components. Its typed-slot rule is
+  `elabMemberKeyAt(decl, T)` with `T` the type the checker recorded for the slot, never mono's pins.
+  Measured over `tests/cases` with fixpoint seeds: 0 programs' bytes move. An instance the
+  elaboration has no key for keeps mono's spelling.
+
+The typed fallback (`monoTypedKeys`), which reuses an instance by its pinned types, serves a
+request only where the request's elaboration key and the instance's spell the same instance: one
+rep can carry two types whose bodies differ, by an `is` test (a `Set` and its map twin, D10540) or
+by a type parameter read as a value (`R.size` in the `flat-generic-rows-*` fixtures). That guard
+replaced `monoElabSplitKey`, which asked the elaboration for the call's wanted instance a second
+way (`elabCallInstWant`); both are deleted. Gating the guard on `elabTestsTyVar` alone misses the
+`R.size` reads and miscompiles three programs, so it applies to every body.
+
+**A lambda's instance is keyed by the instance it is nested in** (2026-11-06): the walk top
+(`elabWalkTop`), the declaration, and the rep and tagged set of each pin. Measured against the
+elaboration's own index of nested instances (`elabKidsAt`) over the 1,423 lambda instances in
+`tests/cases`, that key names exactly the elaboration's instance for all 1,377 made inside an
+instance walk; the 46 made outside one have no elaboration key and keep mono's. It moves no
+module's bytes.
+
+The typed fallback (`monoTypedInstKey`) slices mono's spelled key at the offsets
+`monoMakeInstanceKeyOf` recorded, so it is derived from that spelling and never from the
+canonical key that replaces it. Sliced from the canonical key it read garbage: the 76 byte
+movers of the call half were that, and it reused a wrong lambda instance when the lambda key
+first switched (`generics/hole-call-generic-lambda-arg.vl` trapped).
+
+**Where the two keys still disagree** (2026-11-06, fixpoint of master `597704eca`). 165 instances
+have a call-time key (`instKeyCallTime`) that spells differently from the key mono demanded
+(`elabDemand`):
+
+| class | n | difference | partition |
+|---|---|---|---|
+| set vs signature | 140 | a hole parameter handed a tagged set is keyed by the set (`Fn#7`) on one side and by its closed signature on the other | one-to-one per declaration |
+| one set, two signatures | 3 | a generic in a set instanced at two types (`generic-fn-value-returned-through-identity-hole.vl`) | the set alone merges two instances; the pinned reps keep them apart |
+| nested member at another parent | 14 | the typed-slot lookup returned a nested instance under the first enclosing instance | fixed: `elabMemberKeyAtTys` prefers `elabKidsAt(decl, walkTop)` |
+| bundle member | 4 | a lambda handed as a closure bundle has one instance per signature; the value key names another member | the key needs the member's signature (`elabCallBundleSigs`) |
+| type vs rep | 4 | one side names the type (`T=(1\|2)`, `{r:null}`), the other the rep | expected; the rep component carries it |
+
+The value half's switch therefore owes the 4 bundle members; the other classes are spellings the
+canonical key already absorbs.
 
 ## 4. Scoreboard
 
