@@ -1717,6 +1717,26 @@ What no source answers:
   calls made through it later: D9480, D9890, D10023, `closures/generic-fn-value-returned-through-identity-hole.vl`.
   Most of these run today. The missing fact is the one D15298 pins: function-value identity in the
   type (`Fn#d`, §2.2 steps 3 and 4). This bucket is blocked on it.
+
+**Bucket 1 is untagged sets, in five groups** (2026-11-06, master `d0f6b772`, re-measured with
+inst-shadow: 50 parameters in 19 programs). `Fn#d`'s machinery has landed: function sets on
+`TyFunc`, the tag, and per-member dispatch. Every bucket-1 parameter is a set the tag decision
+leaves untagged, or no set at all. A probe naming the refusal of each set and the mono rung that
+pins it splits them:
+
+| group | params | programs | what refuses the set | mono's pin |
+|---|---|---|---|---|
+| G1, a generic handed back by a hole identity | 8 | 1 | hand-back through a forwarder; an annotated hand-back (D15490) | `monoHoleGenFnPin`'s flow sub-rung |
+| G2, a map of generics handed to a hole parameter | 13 | 4 | the map's value carries no set: identity is lost at an un-annotated `Map()` write (D15298) | the argument's checked type |
+| G3, a list of hole functions handed to a hole parameter | 15 | 7 | `mintSetPartial`, or a coerced holder | `monoArgPinName`, `monoPinnedListElemPin` |
+| G4, a lambda calling its parameter with a generic at two types | 9 | 4 | `ftLambdaIdOk` | `monoClosureBundlePin` (D3975) |
+| G5, a set nothing calls through | 5 | 4 | never tried: the closure rep by design | the rep cascade's default |
+
+G5 is a default, like bucket 2, not a missing fact. G1 closed with D15490 (S1), which leaves 42
+parameters in 18 programs. `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and
+`monoChoiceArmFlowTy`) pinned 33 parameters on master: G1's 7, and 26 whose instance already
+agrees with the elaboration's. It is the next deletion, graded by a three-outcome shadow at the
+function.
 - **A type parameter the call leaves unbound or ambiguous** (62 `nokey-gen` and 10
   `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
   `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
@@ -1752,8 +1772,8 @@ type-parameter binding behind the bare and composite pushes) fire only for param
 above leaves unanswered. The alignment is done, and what is left is that fallback tail.
 
 The tail is closed by four things:
-- function-value identity in the type (`Fn#d`, D15298), for the 72 generic function values fixed
-  past the call;
+- function-value identity in the type (`Fn#d`, D15298), for the generic function values fixed
+  past the call (42 after D15490, in the four groups above that are not defaults);
 - an elaboration-owned default for an unbound type parameter (72);
 - the 16 calls in cloned bodies and through values;
 - anything a wider population finds.
@@ -1831,12 +1851,20 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **slot type** (27): `monoBindingAdoptInit` 9,578, `monoHoleGenFnPin` 7,952, `monoListSrcElemTy` 7,925, `monoReachLitTys` 6,959, `monoReachSlotTy` 6,938, `monoPinMapValues` 6,754, `monoPinFieldContainers` 798, `monoPinRecordFields` 733, `monoLetWritesClosed` 703, `monoPinObjFields` 695, `monoRetypeLamCells` 565, `monoPinRecordField` 466, `monoWritesCoercedFirstCall` 454, `monoPinNestedListElems` 315, `monoPinFieldContainer` 112, `monoPinMapSlot` 66, `monoLetWritesAt` 57, `monoNoteBindCall` 28, `monoPinFieldValue` 25, `monoPinJoin` 22, `monoPinStoredRecords` 20, `monoRenameInitAt` 12, `monoSigJoin` 3, `monoPinnedElemAnnTy` 2, `monoHandWrittenLet` 2, `monoPinMapNestedFnLists` 0, `monoWrittenLetRetsDisagree` 0.
 - [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, ~~`monoLamReachParamTy` 124~~, `monoRecvParamElem` 41, `monoDeliverLamLit` 6, `monoLamInstSigs` 2.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
-- [ ] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0.
+- [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
 - [ ] **instance result** (10): `monoRetRecordOf` 8,023, `monoRetRepOf` 7,745, `monoPinCallRecord` 6,765, `monoPinInPlaceCallRecord` 6,763, `monoReturnedBundlePin` 6,538, `monoPinnedRetAnnTy` 505, `monoCallInstRetTy` 205, `monoRetConstRecord` 66, `monoInstRetLitTy` 34, `monoInstAnnRetTy` 26.
 - [ ] **walk type** (33): `monoExprRebuild` 7,470, `monoPinRetype` 7,368, `monoPinnedTyOf` 6,521, `monoElseRemainderAt` 6,167, `monoPinFnValueTy` 4,955, `monoPinRecvName` 3,289, `monoPinRecvLit` 3,162, `monoPinCoalJoin` 2,708, `monoIfChainRebuildPinned` 2,654, `monoIfArmsAllTy` 2,641, `monoHoleJoinPinsString` 2,368, `monoPinMemberCall` 1,241, `monoLamPinRetAnn` 1,112, `monoNumUnionOpPin` 788, `monoPinCoalListDefault` 781, `monoHoleNodeTy` 686, `monoArmTailIsTy` 643, `monoLamCallTy` 522, `monoHoleCoalUnion` 321, `monoHoleTy` 252, `monoNumOperandPinTy` 241, `monoPinArmSubst` 124, `monoIfArmsPinJoin` 86, `monoChainPinnedTys` 74, `monoHoleJoinDropsArm` 72, `monoTpJoinObjTy` 54, `monoSubstIsExpr` 53, `monoHoleBindingOf` 24, `monoHoleJoinPinTy` 11, `monoArmPinnedTy` 5, `monoHoleJoinHasAtomArm` 1, `monoNumUnionCompoundPin` 1, `monoArmPinsLitUnion` 0.
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
+  The type an uncalled slot holds its functions at is the elaboration's (`elabUncalledSlotTy`,
+  from `elabSlotHeldFns`), read by `monoUncalledSlotFnTy`. Shadowed over 23,381 programs, 507
+  decisions in 318 programs: 105 agree, 401 decline on both sides, 0 disagree. In one, D12218,
+  the elaboration answers where mono declines; a held value whose checked type is no function
+  type keeps it declining. What is left mono-derived is the gate deciding the slot is uncalled.
+  Before #6503 gated the stored slot on `elabSlotUncalled` alone, 59 of the 105 reach the default through `monoValsInert`, `monoValsReachNoCall` or
+  `monoLitReachesNoCall` while `elabSlotUncalled` says the slot is called. That calledness
+  disagreement is this family's next item.
 
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
 with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
