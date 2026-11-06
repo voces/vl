@@ -1720,10 +1720,14 @@ answered 5 calls in the whole population: S2 and S2b move 4 onto the tagged set,
 annotated function slot, reads the elaboration's closed type for the parameter. The function is
 deleted. Its price is one late demand per tagged `T[]` call (five in three files): mono pins the
 `T[]` at the list of ids, a spelling no elaboration key uses, so the instance is minted after the
-run. Foreseeing it means keying `T[]` at the id list's rep. `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and
-`monoChoiceArmFlowTy`) pinned 33 parameters on master: G1's 7, and 26 whose instance already
-agrees with the elaboration's. It is the next deletion, graded by a three-outcome shadow at the
-function.
+run. Foreseeing it means keying `T[]` at the id list's rep.
+
+`monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
+parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
+not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
+elaboration's parameter type was measured at the function after S1: 35 calls agree, 1 is old-only,
+about 600 are new-only and 22,518 decline on both sides. The byte sweep moves 4 files, one of them
+`runs` to a refusal, the same three #6485 found and one more.
 - **A type parameter the call leaves unbound or ambiguous** (62 `nokey-gen` and 10
   `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
   `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
