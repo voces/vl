@@ -2348,7 +2348,7 @@ at one slot first: a lambda calling its own parameter at two or more signatures 
 `closures/lambda-bundle-through-hole-param-at-several-signatures.vl`) is one closure taking their
 bundle, not a bundle record, and it now records the closure whatever the callee's own signature
 count. Shadowed over 23,103 programs: 295 bundle sites and 12 closure sites agree, none differs or
-is new-only.
+is new-only. The byte sweep against master's fixpoint is 23,103 identical.
 
 `monoBundleTys` and emit_bundle's `bundleTys` and `bundleRecs` still answer "is this type a bundle".
 A type-shaped answer from the fact agrees at 586 of 587 reads and is wrong at the other:
