@@ -1448,15 +1448,50 @@ no elaboration answer: `closures/generic-fn-value-returned-through-identity-hole
 past the call, by calls through the result, which only the flow table carries. The switch to the
 elaboration's answer waits for those four, so it lands with the derivation's deletion and not beside it.
 
-**Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), comparing the
-instance's parameter types with the elaboration's per call, union members order-normalised:
+**Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), re-measured on
+2026-11-06, master `611070b80`, with `scripts/inst-shadow/run.sh` over 23,380 programs: `tests/cases`,
+the distilled cells and named sets, and every filed witness. 8,678 of them make such a call. Mono's
+side is the parameter types of the instance the call itself made or hit. The elaboration's is
+`callArgRepTy` over `elabCallParamTy` at the walk top. Mono's own frame key (`monoFrameInstTmpl`)
+never answers where the walk top does not, and the walk top answers 22 parameters it misses.
 
-- against `elabCallParamTy` alone, 66 programs (74 pairs) disagree, most of them a record delivered
-  at a wider row than its type. Minimal witness, where mono is right: with `const wideJ: J = mk()`
-  beside `const xs = [mk()]`, `mk`'s literal is built in `J`'s row `{f: i32 | null}`, so `rd(xs[0])`
-  must be instanced at that row; the type is `{f: i32}`.
-- against `callArgRepTy` (the rep row `callBindAdoptReps` records beside the binding), 8,358 agree,
-  339 get no answer and 33 programs (40 pairs) disagree.
+| call | calls | programs |
+|---|---|---|
+| agree | 26,399 | 8,541 |
+| disagree | 2 | 2 |
+| the elaboration has no closed type | 807 | 348 |
+| mono's own pin is not closed | 1,969 | 573 |
+
+A parameter whose two types differ still agrees under a named rep rule. Each rule was checked
+against the emitted wasm:
+
+| tag | params | programs | the difference |
+|---|---|---|---|
+| `litrep` | 89 | 46 | a literal union against its base, member by member (`N \| null`, `i32 \| null`) |
+| `repeq` | 55 | 26 | a `Set` against its boolean map |
+| `bundle` | 45 | 10 | mono's closure bundle record, whose fields are `elabCallBundleSigs` |
+| `monoopenrec` | 19 | 10 | a record of generic functions mono leaves open and the elaboration closes |
+| `nulfn` | 15 | 5 | `F` against `F \| null`, one closure reference either way |
+| `colstub` | 12 | 4 | mono's pin column reads `i32` for a generic handed to a hole; the wasm takes the closure (`via(app)`, `generics/hole-call-generic-lambda-arg.vl`) |
+| `annrow` | 2 | 2 | a concrete annotation, emitted as the parameter's type whatever row mono's column records (D4300) |
+
+The two disagreements build no wasm. D3178 is an open emit reject: mono's `{f: () => boolean}`
+against the declared `{f: () => boolean} | null`. `soundness/error-generic-nulreflist-field-pin.vl`
+is a check-reject fixture. No call is left where mono is right and the elaboration wrong.
+
+Where the elaboration has no closed type (parameters):
+
+- `no:openhole`, 520 in 211 programs: the instance's parameter is a hole function type, a hole
+  parameter handed a closure or a bundle (`closures/bundle-parameter-called-from-a-capturing-closure.vl`).
+  This is `monoHoleGenFnPin`'s ground, re-measured after its switch.
+- `no:nokey`, 292 in 125: the call has no elaboration key. Two kinds:
+  - a non-generic callee at a storage row, whose rep is `recArgRepOf`, so no fact is missing
+    (`soundness/built-container-read-handed-to-annotated-callee-runs.vl`);
+  - a call that needs a key: through a generic value
+    (`generics/call-through-generic-value-owns-only-its-constraints.vl`), cross-module UFCS
+    (`modules/generic-ufcs-overload-set/`), or an empty list at an unbound type parameter.
+- `no:noframe`, 39 in 20: keys exist, none from the instance being walked
+  (`closures/generic-list-to-unannotated-param.vl`).
 
 #### Next stage, first item: a per-call delivered-rep fact
 
@@ -1479,8 +1514,11 @@ was checked against the emitted wasm before anything was built:
 The fact: for each argument `i` of each call, the rep it is delivered at, read through `callArgRepTy`
 and the bundle record of `elabCallBundleSigs`. Mono's instance choice in `monoWalkIdentCall` and
 `monoPinHoleParam` then reads the elaboration's type and this rep, and stops deriving either. The
-acceptance set is the 24 bundle, record and spelling pairs: each must read the same under both, then
-the 339 no-answer calls, before the instance choice switches.
+instance choice switches in one change with the derivation's deletion, graded by
+`scripts/inst-shadow/run.sh`. It needs no `REAL` tag, and every `no:` bucket left must be a named
+fallback. A cell where the elaboration answers and mono declines or leaves its pin open (the 1,969
+calls above) must keep declining, or be shown output-neutral by the sweep: a `monoHoleGenFnPin` switch
+whose site shadow read 230 of 230 agree still lost two runs to such cells.
 
 #### The canonical instance key, measured (2026-11-05, master `82069a442`)
 
