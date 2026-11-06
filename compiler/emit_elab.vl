@@ -247,7 +247,7 @@ import {
   nodeRepUnionIx,
   recCopyTyOf,
 } from "./check_core_state"
-import { placeStepOf, srcDeclOf } from "./check_lam_chain"
+import { placeStepOf } from "./check_lam_chain"
 import { adoptRetLits } from "./check_inferred_return"
 import {
   assignable,
@@ -7759,17 +7759,34 @@ export function elabMemberKeyAt(d: i32, pTys: i32[]): i32 {
   if !(f is TyFunc) || f.fnParamTypes.length != pTys.length { return -1 }
   let k = 0
   while k < ekDecl.length {
-    if ekDecl[k] == d {
-      let same = true
-      let i = 0
-      while i < pTys.length {
-        const st = substTyDeep(f.fnParamTypes[i], ekNames[k], ekTys[k])
-        if st < 0 || !tySame(widenLitTy(st), pTys[i]) { same = false }
-        i = i + 1
-      }
-      if same { return k }
-    }
+    if ekDecl[k] == d && elabKeyTakesTys(k, f, pTys) { return k }
     k = k + 1
+  }
+  -1
+}
+
+// Whether instance `k`, of a declaration typed `f`, takes parameter types `pTys`.
+function elabKeyTakesTys(k: i32, f: TyFunc, pTys: i32[]): boolean {
+  let i = 0
+  while i < pTys.length {
+    const st = substTyDeep(f.fnParamTypes[i], ekNames[k], ekTys[k])
+    if st < 0 || !tySame(widenLitTy(st), pTys[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// `elabMemberKeyAt` among the instances of nested declaration `d` under the instance being walked,
+// where the walk has any; -1 when none of those takes `pTys`.
+function elabMemberKeyUnderWalk(d: i32, pTys: i32[]): i32 {
+  const sig = if d >= 0 && d < P.nodes.length { nodeTyIxOf(d) } else { -1 }
+  if sig < 0 || sig >= T.tys.length { return -1 }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || f.fnParamTypes.length != pTys.length { return -1 }
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  if top < 0 { return -1 }
+  for k in elabKidsAt(d, top) {
+    if elabKeyTakesTys(k, f, pTys) { return k }
   }
   -1
 }
@@ -10673,15 +10690,7 @@ export function elabCheckedTyOf(ix: i32): i32 {
 // delivered at in instance `k` and the instances it reaches (every instance at -1): each read's
 // recorded destination (`recordCtxTy`), each call through a read, and the slot's own closed type.
 // A literal answers for the bindings holding it.
-export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
-  // A literal or name an instance minted after the write index has no index facts to read; a
-  // binding answers through its source (`declOrigOf`).
-  const d = d0
-  const late = cwIxCoveredLen() > 0 && d >= cwIxCoveredLen()
-  if d < 0 || (late && !elabIsBinding(nodeAt(d))) {
-    const none: i32[] = []
-    return none
-  }
+export function elabSlotDeliveries(d: i32, path: string[], k: i32): i32[] {
   const was = elabDlvKey
   const wasAdmit = elabDlvAdmit
   elabDlvKey = k
@@ -10690,10 +10699,6 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
   elabDlvKey = was
   elabDlvAdmit = wasAdmit
   out
-}
-
-function elabIsBinding(n: Node): boolean {
-  n is LetDecl || n is Param || n is FuncDecl
 }
 
 // Instance `k` and every instance its body reaches, transitively.
@@ -10956,7 +10961,7 @@ function elabSlotReadDeliveries(
       cwIxKind[ow.row] == CW_OCC_USE
       && u >= 0
       && u < P.nodes.length
-      && (identDeclOf(u) == b || srcDeclOf(u) == b)
+      && identDeclOf(u) == b
     ) {
       elabSlotClimb(u, path, out, seen)
     }
@@ -12479,13 +12484,17 @@ export function elabMemberKeyAtFnTy(t: i32, decl: i32): i32 {
   elabMemberKeyAtTys(f.fnParamTypes, decl)
 }
 
-// `elabMemberKeyAt` at closed parameter types `tys`, else -1.
+// `elabMemberKeyAt` at closed parameter types `tys`, preferring an instance nested under the
+// instance being walked over another parent's, else -1.
 export function elabMemberKeyAtTys(tys: i32[], decl: i32): i32 {
   if tys.length == 0 { return -1 }
   for p in tys {
     if p < 0 || p >= T.tys.length || tyHasTyVar(p) || tyHasHole(p) { return -1 }
   }
-  elabMemberKeyAt(elabSrcDecl(decl), tys)
+  const d = elabSrcDecl(decl)
+  const kw = elabMemberKeyUnderWalk(d, tys)
+  if kw >= 0 { return kw }
+  elabMemberKeyAt(d, tys)
 }
 
 // Notes that call `ix` through a function value in instance `from`'s body (the root when -1) ran
