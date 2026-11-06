@@ -1818,15 +1818,15 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 | lambda sigs | `elabLamParamSigs` | 11 | 9,023 | lane F |
 | instance binding | the instance key's binding (`ekTys`, `elabInstTyAt`, `elabParamTyOwnAt`) | 34 | 9,023 | reach, split-dep |
 | literal arm row | the record solve's literal arm row (`litArmRowOf`) | 5 | 8,956 | — |
-| value returns | `elabValueReturnsFrom` | 7 | 8,077 | — |
-| instance result | `elabRetOf` at the instance key | 10 | 8,023 | — |
+| value returns | `elabValueReturnsFrom` | 7 | 8,077 | reach |
+| instance result | `elabRetOf` at the instance key | 10 | 8,023 | reach |
 | walk type | `elabWalkTy` / `elabWalkNarrowedTy` at the instance | 33 | 7,470 | reach |
 | call param | `callArgRepTy` over `elabCallParamTy` | 13 | 5,624 | split-dep |
 | uncalled slot | `elabSlotUncalled`, and a default for an uncalled slot | 6 | 4,712 | — |
 
 - [ ] **unbound default** (12): `monoElabDefaultsPrime` 18,170, `monoHoleGenFnFlowTy` 7,941, `monoChoiceArmFlowTy` 7,929, `monoDefaultTyParamsOnlyGenFns` 5,541, `monoArgClosedPin` 2,657, `monoUncalledSlotFnTy` 318, `monoUncalledListElems` 225, `monoUnboundDefaultTy` 90, `monoBindTyParamDefault` 50, `monoDefaultUnboundTyParams` 21, `monoHoleFnPinTyOf` 21, `monoUncalledNestedListElems` 15.
 - [ ] **slot held fns** (29): `monoWalkIdentCall` 9,604, `monoWrittenGenLetFrame` 9,601, `monoFlowReadsAll` 9,597, `monoFlowLetCalls` 8,067, `monoFlowLetVals` 7,770, `monoFlowParamVals` 7,769, `monoFlowDeclVals` 7,740, `monoFlowValsOf` 7,511, `monoCoerceWrittenLetTys` 5,811, `monoFlowReadsRound` 2,993, `monoFlowUsePlanAt` 2,921, `monoArmWrittenLetSeed` 1,627, `monoFlowAliasReadVals` 1,174, `monoFlowLetLeaf` 655, `monoFlowRetLocalLists` 581, `monoFlowKeptIndexElem` 511, `monoFlowMapVals` 384, `monoFlowDirectSet` 186, `monoFlowAliasMaps` 170, `monoFlowElemsGen` 105, `monoFlowLetMapLeaf` 75, `monoFlowReadElemAt` 72, `monoFlowMapReadVals` 50, `monoFlowLoopVarVals` 26, `monoFlowReplanPending` 18, `monoLetSeedGenFe` 5, `monoCellCall` 5, `monoFlowReadElem` 0, `monoFlowUsePlan` 0.
-- [ ] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, `monoReachSlotPins` 546, `monoDeclPathPinsOrReach` 173, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, `monoReachSlotPinsAt` 78.
+- [ ] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, ~~`monoReachSlotPins` 546~~, ~~`monoDeclPathPinsOrReach` 173~~, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, ~~`monoReachSlotPinsAt` 78~~.
 - [ ] **node type** (29): `monoCloseRetFnTy` 9,592, `monoInitHeldTy` 6,742, `monoArgClosedTyIn` 5,475, `monoPinBin` 4,320, `monoPinnedOperandTy` 3,781, `monoSubstLetType` 3,348, `monoCloneLetDecl` 3,020, `monoCoerceListCbArg` 2,889, `monoPinReturnedObj` 1,945, `monoCbFnListRowSpell` 1,107, `monoDeadNullTest` 882, `monoCgcTplTy` 668, `monoRetFnListTy` 608, `monoPinnedAnnTyAt` 509, `monoLeafParamPin` 420, `monoBoundFnListElemsTy` 352, `monoPinnedReadTy` 341, `monoClosedObjLitTy` 174, `monoLetAnnTyOf` 66, `monoHoleFnPinTy` 33, `monoLetWriteRhsTyRec` 15, `monoPinnedListElemPin` 14, `monoLetWritesRecord` 6, `monoModuleDupPin` 3, `monoArgOpenValueTy` 1, `monoModuleLetPin` 0, `monoClosedFieldValTy` 0, `monoLetWriteRhsTy` 0, `monoPinnedListAnnTy` 0.
 - [ ] **slot type** (27): `monoBindingAdoptInit` 9,578, `monoHoleGenFnPin` 7,952, `monoListSrcElemTy` 7,925, `monoReachLitTys` 6,959, `monoReachSlotTy` 6,938, `monoPinMapValues` 6,754, `monoPinFieldContainers` 798, `monoPinRecordFields` 733, `monoLetWritesClosed` 703, `monoPinObjFields` 695, `monoRetypeLamCells` 565, `monoPinRecordField` 466, `monoWritesCoercedFirstCall` 454, `monoPinNestedListElems` 315, `monoPinFieldContainer` 112, `monoPinMapSlot` 66, `monoLetWritesAt` 57, `monoNoteBindCall` 28, `monoPinFieldValue` 25, `monoPinJoin` 22, `monoPinStoredRecords` 20, `monoRenameInitAt` 12, `monoSigJoin` 3, `monoPinnedElemAnnTy` 2, `monoHandWrittenLet` 2, `monoPinMapNestedFnLists` 0, `monoWrittenLetRetsDisagree` 0.
 - [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, `monoLamReachParamTy` 124, `monoRecvParamElem` 41, `monoDeliverLamLit` 6, `monoLamInstSigs` 2.
@@ -1840,6 +1840,46 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
 with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
+
+**Slot deliveries, the reach rung deleted** (2026-11-06). `monoDeclPathPinsOrReach` and
+`monoStoredSlotFnTy` fell back to value reach (`vrCalleeTy`) where the elaboration's slot pins were
+empty. Over the 23,456 programs the reach rung never answered alone: at 1,553 site-hits the pins
+agree 61 times, the elaboration alone answers 383, and neither answers 1,109. The rung and its
+three functions are deleted. The written `let`'s seed signature (`monoSeedCallSigTys`, under
+`monoCallIfBound`, `monoCallWrittenLet` and `monoCallIfValue`) is reached past its gates by 8
+programs: in 6 its parameters agree with `elabCallParamBoundTy`, and in 2 neither closes (D15260's
+shape, which runs).
+
+**Node type, first reading** (2026-11-06, the same population, against `elabNodeTyAt` at the
+instance):
+
+| function | path | agree | both decline | mono only | elaboration only | differ |
+|---|---|---|---|---|---|---|
+| `monoArgClosedTyIn` | past a closed caller pin | 4,336 | 210 | 0 | 0 | 4 |
+| `monoArgClosedTyIn` | the caller's pin | 4,163 | 0 | 38,241 | 0 | 11 |
+| `monoCloseRetFnTy` | | 0 | 873 | 28 | 19 | 0 |
+
+- **Switched: past a closed caller pin.** The four differences are one test
+  (`pin-exact-key-set-and-its-map.vl`), where the elaboration's type is the `match` arm's non-null
+  narrowing. It prints the same either way. `pinnedParamTyAt` and `nodeTyInOf` leave `emit_mono`.
+- **Not this family: the caller's pin.** It is `monoArgPinTyIx`, the rep cascade, which belongs to
+  the call-param family.
+- **Not switched: `monoCloseRetFnTy`.** The elaboration declines a returned list of functions (28
+  reads), and it closes 19 calls mono leaves open.
+
+**Instance result, first pass (2026-11-06).**
+- `monoRetRecordOf` and its consumers `monoRetConstRecord`, `monoPinCallRecord` and
+  `monoPinInPlaceCallRecord` are deleted. The chain never pinned: over the 23,103 programs
+  `monoRetRecordOf` returned no record in 112,273 calls, and a build refusing wherever it would
+  return one passes the deno suites. A byte sweep of the 23,103 against master's fixpoint seed
+  differs on none. The elaboration's result (`elabResultAtParams`) answers 10 of those calls, all
+  in `std/idtable-*.vl`. That is a capability question, declined under ruling (a).
+- `monoPinnedRetAnnTy`'s 29 answers are a returned list literal of hole functions pinned by its
+  caller's calls (`hole-fn-list-returned-reread.vl`). The instance result is open there, so its
+  owning fact is the forward climb over the literal's element slot, as for the reach pair, and not
+  `elabRetOf`.
+- `monoRetRepOf` and `monoReturnedBundlePin` are rep decisions, so they move to the per-call
+  delivered rep below.
 
 #### Next stage, first item: a per-call delivered-rep fact
 
