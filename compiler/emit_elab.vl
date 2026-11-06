@@ -10878,9 +10878,7 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
     return 0
   }
   const seen: i32[] = []
-  // A function named by value is delivered where that occurrence's value flows on. A declared
-  // generic named as the argument of a parameter with no written type is instanced at each call
-  // there instead.
+  // A function named by value is delivered where that occurrence's value flows on.
   if dn is Ident {
     cwIxWant()
     const r = elabSlotReadUp(d, path)
@@ -11157,12 +11155,7 @@ function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
 // Adds to `out` the closed function types at slot `rest` of each type the check stamped read `r` as
 // delivered at, where that destination's type is written.
 function elabReadStampsAt(r: i32, rest: string[], out: i32[]) {
-  if (
-    (elabGivenTo(r) >= 0 && !elabDeclAnnotated(elabGivenTo(r)))
-    || elabRetUnwritten(r)
-  ) {
-    return 0
-  }
+  if !elabWrittenDest(r) { return 0 }
   const ts: i32[] = [nodeCtxTyIxOf(r)]
   const cs = elabNodeCtxs[r] ?? []
   let i = 0
@@ -11252,7 +11245,9 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
   const k = cwIxUpKind[r]
   const up = cwIxUp[r]
   if k == CW_UP_CALLEE && up >= 0 {
-    elabCallDeliveryAdd(up, out)
+    if elabNoCallParam < 0 || identDeclOf(r) != elabNoCallParam {
+      elabCallDeliveryAdd(up, out)
+    }
   } else if k == CW_UP_LETINIT && up >= 0 && up < P.nodes.length {
     const ln = nodeAt(up)
     if ln is LetDecl && ln.letType < 0 {
@@ -11289,7 +11284,8 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
     if f >= 0 && f < P.nodes.length && !i32ListHas(seen, -2 - f) {
       seen.push(-2 - f)
       const calls: i32[] = []
-      cwFnCalls(f, calls)
+      elabRetCalls(f, calls)
+      elabValueCalls(f, calls, 0)
       for c in calls {
         if c >= 0 && c < P.nodes.length { elabReadDeliveries(c, out, seen) }
       }
@@ -11307,23 +11303,48 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
     const fd = if cn is Call && cn.callFn >= 0 { identFnDeclOf(parenPeelIx(cn.callFn)) } else { -1 }
     const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
     const ai = cwIxUpAux[r]
-    if (
-      fn is FuncDecl
-      && ai >= 0
-      && ai < fn.fnParams.length
-      && !(elabGenericByValue
+    if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
+      // A declared generic handed to a parameter with no written type is instanced at each call
+      // made through that parameter; only where its value flows on out is it delivered.
+      const hole = elabGenericByValue
         && r == elabGenericRead
-        && !elabDeclAnnotated(fn.fnParams[ai]))
-    ) {
+        && !elabDeclAnnotated(fn.fnParams[ai])
+      const was = elabNoCallParam
+      if hole { elabNoCallParam = fn.fnParams[ai] }
+      elabEntryFns.push(fd)
+      elabEntryCalls.push(up)
       elabSlotReadDeliveries(fn.fnParams[ai], [], out, seen)
+      elabEntryFns.pop()
+      elabEntryCalls.pop()
+      elabNoCallParam = was
     }
   }
   0
 }
 
 let elabLitSlotDepth = 0
+// The functions a walk entered through an argument, and the calls it entered them at.
+const elabEntryFns: i32[] = []
+const elabEntryCalls: i32[] = []
+
+// Pushes onto `calls` the calls a value returned from `f` comes back out of: the one call the walk
+// entered `f` at, else every call of `f`.
+function elabRetCalls(f: i32, calls: i32[]) {
+  let i = elabEntryFns.length - 1
+  while i >= 0 {
+    if elabEntryFns[i] == f {
+      calls.push(elabEntryCalls[i])
+      return 0
+    }
+    i = i - 1
+  }
+  cwFnCalls(f, calls)
+  0
+}
 let elabGenericByValue = false
 let elabGenericRead = -1
+// The parameter whose own calls deliver nothing (a declared generic handed to it by value), or -1.
+let elabNoCallParam = -1
 
 // The binding read `r` initialises, or the parameter of a declared function it is an argument to;
 // -1 for any other position.
@@ -11355,6 +11376,55 @@ function elabRetUnwritten(r: i32): boolean {
   const f = if k == CW_UP_RET { cwFrameOfDecl(cwIxUp[r]) } else { cwIxUp[r] }
   const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
   fn is FuncDecl && fn.fnRet < 0
+}
+
+// Whether read `r` is given to a destination whose type is written: an annotated binding or
+// declared function's parameter, or the result of a function with a written return type.
+function elabWrittenDest(r: i32): boolean {
+  if r < 0 || r >= cwIxUp.length || !cwIxCovers(r) { return false }
+  const g = elabGivenTo(r)
+  if g >= 0 { return elabDeclAnnotated(g) }
+  const k = cwIxUpKind[r]
+  if k != CW_UP_RET && k != CW_UP_TAIL { return false }
+  const f = if k == CW_UP_RET { cwFrameOfDecl(cwIxUp[r]) } else { cwIxUp[r] }
+  const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+  fn is FuncDecl && fn.fnRet >= 0
+}
+
+// Pushes onto `calls` the calls made through value `x`, a lambda or a call's result, where it
+// flows into an unwritten binding called by name, or out of a function each call of which is such
+// a value; `depth` bounds the walk.
+function elabValueCalls(x: i32, calls: i32[], depth: i32) {
+  if depth > 4 || x < 0 || x >= cwIxUp.length || !cwIxCovers(x) { return 0 }
+  const k = cwIxUpKind[x]
+  const up = cwIxUp[x]
+  if up < 0 || up >= P.nodes.length { return 0 }
+  const un = nodeAt(up)
+  if k == CW_UP_LETINIT && un is LetDecl && un.letType < 0 {
+    if un.letKw != "const" && !cwLetUnwritten(up) { return 0 }
+    const ow = cwOccWalk(up)
+    while cwOccNext(ow) {
+      const c = cwIxNode[ow.row]
+      const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+      if cwIxKind[ow.row] == CW_OCC_CALL && cn is Call {
+        const fx = parenPeelIx(cn.callFn)
+        if (
+          fx >= 0
+          && fx < P.nodes.length
+          && nodeAt(fx) is Ident
+          && identDeclOf(fx) == up
+        ) {
+          if !i32ListHas(calls, c) { calls.push(c) }
+        }
+      }
+    }
+  } else if k == CW_UP_RET || k == CW_UP_TAIL {
+    const f = if k == CW_UP_RET { cwFrameOfDecl(up) } else { up }
+    const fc: i32[] = []
+    if f >= 0 && f < P.nodes.length { cwFnCalls(f, fc) }
+    for c in fc { elabValueCalls(c, calls, depth + 1) }
+  }
+  0
 }
 
 // Whether binding `b` is a `let` or parameter with a written type.
@@ -11400,7 +11470,11 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
       const wasKey = elabDlvKey
       const wasAdmit = elabDlvAdmit
       elabDlvEnterCall(up)
+      elabEntryFns.push(fd)
+      elabEntryCalls.push(up)
       elabSlotReadDeliveries(fn.fnParams[ai], path, out, seen)
+      elabEntryFns.pop()
+      elabEntryCalls.pop()
       elabDlvKey = wasKey
       elabDlvAdmit = wasAdmit
     }
@@ -11476,7 +11550,7 @@ function elabRetSlotOn(f: i32, path: string[], out: i32[], seen: i32[]) {
   }
   seen.push(key)
   const calls: i32[] = []
-  cwFnCalls(f, calls)
+  elabRetCalls(f, calls)
   // A lambda is called through the binding it initialises.
   cwIxWant()
   const lb = if cwIxCovers(f) && cwIxUpKind[f] == CW_UP_LETINIT { cwIxUp[f] } else { -1 }
@@ -11566,6 +11640,26 @@ function elabLitReturnedBy(lit: i32): i32 {
   -1
 }
 
+// The one call slot `path` of `d` is delivered at, open or closed (the calls `elabSlotDeliveries`
+// reaches), with its arguments' checked types pushed onto `tys`; -1 for none or for two.
+export function elabSlotOnlyCall(d: i32, path: string[], tys: i32[]): i32 {
+  elabCallSink = []
+  elabCallSinkOn = true
+  elabSlotDeliveries(d, path, -1)
+  elabCallSinkOn = false
+  const hits = elabCallSink
+  elabCallSink = []
+  if hits.length != 1 { return -1 }
+  const hn = nodeAt(hits[0])
+  if !(hn is Call) { return -1 }
+  for a in hn.callArgs { tys.push(nodeTyIxOf(a)) }
+  hits[0]
+}
+
+// The calls a delivery walk reached, recorded while `elabCallSinkOn`.
+let elabCallSink: i32[] = []
+let elabCallSinkOn = false
+
 // Whether `x` reads slot `cp` of binding `o`, itself or through an un-annotated `const` aliasing it.
 function elabSlotReadOf(x: i32, o: i32, cp: string[]): boolean {
   let at = parenPeelIx(x)
@@ -11604,6 +11698,7 @@ function elabSlotReadOf(x: i32, o: i32, cp: string[]): boolean {
 function elabCallDeliveryAdd(c: i32, out: i32[]) {
   const cn = nodeAt(c)
   if !(cn is Call) || i32ListHas(elabDlvOmit, c) { return 0 }
+  if elabCallSinkOn && !i32ListHas(elabCallSink, c) { elabCallSink.push(c) }
   const agreed = elabCallArgTysAgreed(c)
   const r = elabNodeTyAgreed(c)
   if elabDlvKey < 0 && agreed.length == cn.callArgs.length && r >= 0 {
