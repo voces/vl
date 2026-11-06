@@ -1999,11 +1999,10 @@ The 18 old-only fall into two groups:
 The switch waits for the default, then for that climb edge.
 
 **`monoPinnedRetAnnTy` is switched** (2026-11-06). Each returned list literal closes from the climb
-(`monoLitSlotCallTy`, which follows nested list rows), else from the elaboration's uncalled default
-(`elabResultDefaultedOf`), which is gated on every held function being uncalled: it does not
-escape, the climb finds no call, and every instance of it is at the default signature. Ruling (a)
-keeps the default to a generic's instance or a list holding no record. `monoCallInstRetTy` and
-`monoInstRetLitTy` are deleted.
+(`monoLitSlotCallTy`, which follows nested list rows). Where the climb does not close it, it closes
+as the elaboration closes a held literal (`elabReturnedClosedTy` over `elabHeldClosedTyAt`, D15294's
+fact) at the instance the call reaches. Ruling (a) keeps that fallback to a generic's instance or a
+list holding no record. `monoCallInstRetTy` and `monoInstRetLitTy` are deleted.
 
 The re-shadow over the 23,103 programs reads 27 agree, 1 differ, 2 new only and 1 old only:
 
@@ -2011,8 +2010,9 @@ The re-shadow over the 23,103 programs reads 27 agree, 1 differ, 2 new only and 
   (`x: i32`, from the `mk(5)` instance), and the program prints the same output either way.
 - The old-only case is `hole-fn-list-unbound-and-returned.vl`, one instance called at two types,
   where declining is correct.
-- The 16 D15207/D15294 cells the default would also answer are declined, and are left to D15294's
-  own change.
+- The 16 D15207/D15294 cells the fallback would also answer are declined. Admitting them moves no
+  byte of any of the 23,103 programs: those cells are already served by `monoHeldRecordListAt`
+  (D15294's reader of `elabHeldListFacts`), so they need no change here.
 
 The byte sweep against master's fixpoint moves 2 of 23,103 programs with the same output:
 `list-of-generic-returned-measured.vl` and `named/d15207_fn_list_ret.vl`. Each loses the dead body
