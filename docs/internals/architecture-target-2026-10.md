@@ -1605,17 +1605,37 @@ and closes 1 the fallback closed only by substitution (`generics/hole-lambda-cal
 whose `(_) => _` walk type the binding closes). It differs in none. Switched: the fallback block is
 gone, and `er` keeps its old meaning (the hole instance's own elaboration answer) for the box
 registration and the literal-member gate, so the switch is byte-neutral over all 19,316 programs.
-The helpers stay: `monoLamReachParamTy` still serves the parameter pin, and `monoRetReadsHoleParam`
-serves `monoLamTyNamesHoleValue`.
+The helpers went with the parameter side, below.
 
 **Shadow of `monoLamParamPinAnn`** (the parameter side, same population). The binding's substitution,
 else `monoLamReachParamTy` (D7181), was compared against the elaboration's walk type of the parameter,
 with a hole read from the binding. 654 programs reach the pin: 597 agree and 37 close nothing on
 either side. 53 are old-only, where the elaboration keeps the parameter open: a type variable of
 another declaration (`U`/`V`) on a lambda held in a written `let`, a capture cell or a returned
-lambda called across instances, or a hole `_`. 10 are new-only, and none differs. The parameter pin,
-and `monoLamReachParamTy` with it, waits for the elaboration to type those lambdas' parameters per
-instance.
+lambda called across instances, or a hole `_`. 10 are new-only, and none differs.
+
+The binding's substitution stays first, so what the elaboration has to replace is the reach rung
+alone, and every one of the 53 is a cell the substitution answers. `elabLamParamTy` (emit_elab)
+climbs from the lambda node under the walk top's reach closure, records the calls its value
+reaches as callee, and takes the one closed parameter type across their delivered types. A call
+inside another lambda counts only where that lambda's own parameters close the same way. On the
+reach rung's own cells (programs, 19,316 run): 4 agree, 3 new-only, 0 old-only, 0 differ.
+
+Two narrower readers came first and each was refuted by a witness. One that also took the
+lambda's walk type and slot deliveries pinned a lambda's own per-call hole at the type one call
+delivers (D1795's `use(p)`), which broke 7 filed witnesses and 8 `tests/cases` programs. Counting
+every call inside a lambda pinned D12235's `g`, whose capture `n` stays open, which turned a loud
+emit refusal into invalid wasm. Switched, and `monoLamReachParamTy` is deleted. Of the 3
+new-only, 2 build byte-identical, and `generics/hole-lambda-calls-per-instance.vl` moves bytes
+but prints the same output.
+
+`monoRetReadsHoleParam` (D2878) asked syntactically whether a `const` lambda the instance only
+calls returns a hole parameter or a field chain off one. Asked instead whether the template's
+return names a variable that the elaboration types closed, and not a function, at the instance:
+4 programs agree, 0 old-only, and 58 new-only lambdas (mostly `() => <capture>` with a closed
+scalar or nullable result) build byte-identical. Switched, and the helper is deleted with the
+`monoCgcHoleParams` table and `monoHoleParamNames` that only fed it. Against a master fixpoint,
+both switches together move the bytes of 1 of 19,316 programs, the one named above.
 
 **Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), re-measured on
 2026-11-06, master `611070b80`, with `scripts/inst-shadow/run.sh` over 23,380 programs: `tests/cases`,
@@ -1713,10 +1733,21 @@ pins it splits them:
 | G5, a set nothing calls through | 5 | 4 | never tried: the closure rep by design | the rep cascade's default |
 
 G5 is a default, like bucket 2, not a missing fact. G1 closed with D15490 (S1), which leaves 42
-parameters in 18 programs. `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and
-`monoChoiceArmFlowTy`) pinned 33 parameters on master: G1's 7, and 26 whose instance already
-agrees with the elaboration's. It is the next deletion, graded by a three-outcome shadow at the
-function.
+parameters in 18 programs. S2 (D15491) tags a list whose helper pushes one of its own elements back
+onto it, by a hole parameter or by `T` beside `T[]`, and S2b the method spellings `v.insert(0, v[1])`
+and `v.fill(v[1])`, whose receiver is the declared callee's first parameter. `monoPinnedListElemPin`
+answered 5 calls in the whole population: S2 and S2b move 4 onto the tagged set, and the fifth, an
+annotated function slot, reads the elaboration's closed type for the parameter. The function is
+deleted. Its price is one late demand per tagged `T[]` call (five in three files): mono pins the
+`T[]` at the list of ids, a spelling no elaboration key uses, so the instance is minted after the
+run. Foreseeing it means keying `T[]` at the id list's rep.
+
+`monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
+parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
+not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
+elaboration's parameter type was measured at the function after S1: 35 calls agree, 1 is old-only,
+about 600 are new-only and 22,518 decline on both sides. The byte sweep moves 4 files, one of them
+`runs` to a refusal, the same three #6485 found and one more.
 - **A type parameter the call leaves unbound or ambiguous** (62 `nokey-gen` and 10
   `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
   `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
@@ -1829,7 +1860,7 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, ~~`monoReachSlotPins` 546~~, ~~`monoDeclPathPinsOrReach` 173~~, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, ~~`monoReachSlotPinsAt` 78~~.
 - [ ] **node type** (29): `monoCloseRetFnTy` 9,592, `monoInitHeldTy` 6,742, `monoArgClosedTyIn` 5,475, `monoPinBin` 4,320, `monoPinnedOperandTy` 3,781, `monoSubstLetType` 3,348, `monoCloneLetDecl` 3,020, `monoCoerceListCbArg` 2,889, `monoPinReturnedObj` 1,945, `monoCbFnListRowSpell` 1,107, `monoDeadNullTest` 882, `monoCgcTplTy` 668, `monoRetFnListTy` 608, `monoPinnedAnnTyAt` 509, `monoLeafParamPin` 420, `monoBoundFnListElemsTy` 352, `monoPinnedReadTy` 341, `monoClosedObjLitTy` 174, `monoLetAnnTyOf` 66, `monoHoleFnPinTy` 33, `monoLetWriteRhsTyRec` 15, `monoPinnedListElemPin` 14, `monoLetWritesRecord` 6, `monoModuleDupPin` 3, `monoArgOpenValueTy` 1, `monoModuleLetPin` 0, `monoClosedFieldValTy` 0, `monoLetWriteRhsTy` 0, `monoPinnedListAnnTy` 0.
 - [ ] **slot type** (27): `monoBindingAdoptInit` 9,578, `monoHoleGenFnPin` 7,952, `monoListSrcElemTy` 7,925, `monoReachLitTys` 6,959, `monoReachSlotTy` 6,938, `monoPinMapValues` 6,754, `monoPinFieldContainers` 798, `monoPinRecordFields` 733, `monoLetWritesClosed` 703, `monoPinObjFields` 695, `monoRetypeLamCells` 565, `monoPinRecordField` 466, `monoWritesCoercedFirstCall` 454, `monoPinNestedListElems` 315, `monoPinFieldContainer` 112, `monoPinMapSlot` 66, `monoLetWritesAt` 57, `monoNoteBindCall` 28, `monoPinFieldValue` 25, `monoPinJoin` 22, `monoPinStoredRecords` 20, `monoRenameInitAt` 12, `monoSigJoin` 3, `monoPinnedElemAnnTy` 2, `monoHandWrittenLet` 2, `monoPinMapNestedFnLists` 0, `monoWrittenLetRetsDisagree` 0.
-- [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, `monoLamReachParamTy` 124, `monoRecvParamElem` 41, `monoDeliverLamLit` 6, `monoLamInstSigs` 2.
+- [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, ~~`monoLamReachParamTy` 124~~, `monoRecvParamElem` 41, `monoDeliverLamLit` 6, `monoLamInstSigs` 2.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
@@ -1978,6 +2009,26 @@ The 18 old-only fall into two groups:
 
 The switch waits for the default, then for that climb edge.
 
+**`monoPinnedRetAnnTy` is switched** (2026-11-06). Each returned list literal closes from the climb
+(`monoLitSlotCallTy`, which follows nested list rows). Where the climb does not close it, it closes
+as the elaboration closes a held literal (`elabReturnedClosedTy` over `elabHeldClosedTyAt`, D15294's
+fact) at the instance the call reaches. Ruling (a) keeps that fallback to a generic's instance or a
+list holding no record. `monoCallInstRetTy` and `monoInstRetLitTy` are deleted.
+
+The re-shadow over the 23,103 programs reads 27 agree, 1 differ, 2 new only and 1 old only:
+
+- The differ is `named/d15293_bound_returned.vl` at `mk("s")`. The old answer was stale
+  (`x: i32`, from the `mk(5)` instance), and the program prints the same output either way.
+- The old-only case is `hole-fn-list-unbound-and-returned.vl`, one instance called at two types,
+  where declining is correct.
+- The 16 D15207/D15294 cells the fallback would also answer are declined. Admitting them moves no
+  byte of any of the 23,103 programs: those cells are already served by `monoHeldRecordListAt`
+  (D15294's reader of `elabHeldListFacts`), so they need no change here.
+
+The byte sweep against master's fixpoint moves 2 of 23,103 programs with the same output:
+`list-of-generic-returned-measured.vl` and `named/d15207_fn_list_ret.vl`. Each loses the dead body
+of an uncalled list function, which the old path instanced as a side effect of `monoRetFnListTy`.
+
 **Value returns are aligned.** `monoFlowCallLeaf` names the module-level generic every `return` of
 a call's callee reads. Over the 23,103 programs the climb confirms it: the one top-level generic
 whose value `elabValueReturnsFrom` finds reaching that return agrees at 87 queries. It differs at
@@ -2035,6 +2086,36 @@ rewritten calls (`mfrSetCalls`) are omitted:
 
 Whoever retires `monoFlowReadSet` needs two facts that do not exist yet: `fnSlotCalled` keyed by the
 call node, and the handed reads.
+
+**The `monoFlow*` read rewrite, first reading** (2026-11-06). The rewrite (`monoFlowReads`) runs once,
+before the walk. `monoFlowReadSet` re-points a read of a list element, a record field or a written
+`let` at the one generic it holds, so each read takes its own instance. Every elaboration fact sees
+the reads before that rewrite. `compiler/mfr_shadow.vl` asks, before each rewrite, which function
+the elaboration says the read holds:
+- the element a literal index of a module-scope `const` list names (`constListFnElemDecl`);
+- else the read slot's value-flow set (`elabSlotFlowFns`), new here;
+- else what its call's callee can be (`elabCalleeFns`).
+
+`elabSlotFlowFns` is `elabSlotHeldFns` with one-way spreads. A list holds what the lists it spreads
+hold, but not what is written into a list that spreads it. Without that, `xs.push(id); ys = [...xs];
+ys[0] = inc` reads `xs[0]` as `id` or `inc`. `elabSlotHeldFns` keeps its two-way union, which is
+what a shared element rep needs. Over the 23,456 programs:
+
+| outcome | site-hits | files |
+|---|---|---|
+| agree | 351 | 129 |
+| the elaboration names several | 10 | 5 |
+| the elaboration names none | 26 | 18 |
+| differ | 0 | 0 |
+
+What is left before the planner reads the elaboration:
+- several: a list parameter's element read per call site, and nested lists. These need an
+  instance-keyed held set.
+- none, 10: a record literal stored in a map value and read back by field (`s.set("k", {f: id});
+  s.get("k").f(..)`). The write index does not follow a stored literal to its field.
+- none, 4: nested field paths.
+- none, 12: nodes minted after `elabRun`, which wait on the same source mapping as the instance
+  ladder's tail.
 
 #### Next stage, first item: a per-call delivered-rep fact
 
