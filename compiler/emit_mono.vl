@@ -33,6 +33,7 @@ import {
   elabIsParamRead,
   elabLamDeliveredParams,
   elabLitSlotCallTys,
+  elabResultDefaultedOf,
   elabParamReadOtherThanCalled,
   elabSlotAnnRets,
   elabSlotDeliveries,
@@ -18186,18 +18187,8 @@ function monoReachSlotTy(a: i32, st: i32, step: string): i32 {
     + ","
   let ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
   if ct < 0 { return -1 }
-  const qs: i32[] = []
-  const vals: i32[] = []
-  if !tyHasTyVar(ct) && elabLitSlotCallTys(a, step, qs, vals) {
-    let ft = -1
-    for v in vals {
-      const ex = monoOpenFnArgDecl(v)
-      let r = if ex >= 0 { monoFnDeclRetAt(ex, qs) } else { monoFnTyRetAt(nodeTyIxOf(v), qs) }
-      if r < 0 && ex >= 0 { r = elabResultAtParams(ex, qs) }
-      const et = if r >= 0 { mkFuncTy(qs, r) } else { -1 }
-      if et < 0 || (ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft)) { ft = -2 }
-      else if ft != -2 { ft = et }
-    }
+  if !tyHasTyVar(ct) {
+    const ft = monoLitSlotCallFnTy(a, step)
     if ft >= 0 { ct = ft }
   }
   for c in vrCalls(a, path) {
@@ -19223,7 +19214,7 @@ function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
   if xn is Member {
     return tyFieldTyOf(monoPinnedAnnTyAt(xn.memObj, depth + 1), xn.memProp)
   }
-  if xn is Call { return monoPinnedRetAnnTy(xn, depth) }
+  if xn is Call { return monoPinnedRetAnnTy(x, xn) }
   if xn is ArrayLit {
     let t = -1
     for e in xn.arrElems {
@@ -19302,31 +19293,85 @@ function monoPinnedAgree(a: i32, b: i32): i32 {
   b
 }
 
-// `monoPinnedAnnTyAt` for call `c` of an un-annotated declared function, generic or not: the one
-// type every value it returns reads at, a returned list literal of functions instanced at its
-// element's pin first, since the caller can be walked before the body (D9501); -1 when they
-// differ or one has none.
-function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
+// `monoPinnedAnnTyAt` for call `c` (node `x`) of an un-annotated declared function: the one type
+// each returned list literal closes at, from the calls its functions reach (the climb), else from
+// the elaboration's uncalled default where the callee is a generic's instance or the list holds no
+// record; -1 when they differ or one does not close.
+function monoPinnedRetAnnTy(x: i32, c: Call): i32 {
   const fd = monoCalleeDeclOf(c)
   if fd < 0 { return -1 }
   const fn = nodeAt(fd)
   if !(fn is FuncDecl) { return -1 }
   if fn.fnRet >= 0 { return monoInstAnnRetTy(fd, fn.fnRet) }
-  const it = monoCallInstRetTy(c, fd)
-  if it >= 0 { return it }
+  const itp = monoFrameInstTmpl(fd)
+  const gen = fn.fnTyParams.length > 0
+    || (itp[0] == fd && itp[1] >= 0 && itp[1] != fd)
   let t = -1
   for r in monoFnRetArgs(fn) {
     if r >= 0 && !(nodeAt(r) is RetStmt) {
       const rx = monoRetListLitOf(r)
-      let pft = -9
-      if rx >= 0 { pft = monoRetFnListTy(rx, fd) }
-      let rt = monoPinnedAnnTyAt(r, depth + 1)
-      if rt < 0 && pft >= 0 { rt = mkArrayTy(pft) }
-      if rt < 0 || (t >= 0 && !tyEq(t, rt)) { return -1 }
-      t = rt
+      if rx < 0 { return -1 }
+      let lt = monoClimbListTy(rx, 0)
+      if lt < 0 && (gen || !tyHoldsRecord(nodeTyIxOf(rx), 0)) {
+        lt = elabResultDefaultedOf(rx, x)
+      }
+      if lt < 0 || (t >= 0 && !tyEq(t, lt)) { return -1 }
+      t = lt
     }
   }
   t
+}
+
+// Whether type `t` is a record or a list of records, at any list depth.
+function tyHoldsRecord(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 8 { return false }
+  const n = tyAt(t)
+  if n is TyObj { return true }
+  if n is TyArray { return tyHoldsRecord(n.aElem, depth + 1) }
+  false
+}
+
+// The list type list literal `rx` closes at from the calls its functions reach: a list of lists
+// by its rows, which must agree, else a list of the one function type `monoLitSlotCallFnTy` gives
+// its elements; -1 where none does.
+function monoClimbListTy(rx: i32, depth: i32): i32 {
+  const n = nodeAt(rx)
+  if !(n is ArrayLit) || n.arrElems.length == 0 || depth > 6 { return -1 }
+  let rows = true
+  for e in n.arrElems {
+    if !(nodeAt(unwrapParen(e)) is ArrayLit) { rows = false }
+  }
+  if !rows {
+    const ft = monoLitSlotCallFnTy(rx, "e")
+    return if ft >= 0 { mkArrayTy(ft) } else { -1 }
+  }
+  let it = -1
+  for e in n.arrElems {
+    const et = monoClimbListTy(unwrapParen(e), depth + 1)
+    if et < 0 || (it >= 0 && !tyEq(it, et)) { return -1 }
+    it = et
+  }
+  mkArrayTy(it)
+}
+
+// The one function type the values in slot `step` of literal `a` take at the argument tuple every
+// call they reach agrees on (`elabLitSlotCallTys`), each result read at those parameters; -1 where
+// the calls disagree, a value has no such result, or two results differ.
+function monoLitSlotCallFnTy(a: i32, step: string): i32 {
+  const qs: i32[] = []
+  const vals: i32[] = []
+  if !elabLitSlotCallTys(a, step, qs, vals) { return -1 }
+  let ft = -1
+  for v in vals {
+    const ex = monoOpenFnArgDecl(v)
+    let r = if ex >= 0 { monoFnDeclRetAt(ex, qs) } else { monoFnTyRetAt(nodeTyIxOf(v), qs) }
+    if r < 0 && ex >= 0 { r = elabResultAtParams(ex, qs) }
+    if r < 0 { return -1 }
+    const et = mkFuncTy(qs, r)
+    if ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft) { return -1 }
+    ft = et
+  }
+  ft
 }
 
 // The closed list-of-functions type that the return annotation `ret` of instance `fd` takes at its
@@ -19343,53 +19388,6 @@ function monoInstAnnRetTy(fd: i32, ret: i32): i32 {
     || !tyMayHoldFn(t, 0)
   ) {
     return -1
-  }
-  t
-}
-
-// The closed list result of the instance of template `fd` that call `c` now names, as the
-// emitter resolves its callee; -1 before the call takes one, or when that result is open or not
-// a list (D9552).
-function monoCallInstRetTy(c: Call, fd: i32): i32 {
-  if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
-  const cf = nodeAt(c.callFn)
-  if !(cf is Ident) { return -1 }
-  const fe = fnIndexOf(cf.identName)
-  if fe < 0 || fe >= fnStmts.length { return -1 }
-  const d = fnStmts[fe]
-  if d < 0 || d >= P.nodes.length { return -1 }
-  const it = monoFrameInstTmpl(d)
-  if d == fd || it[0] != d || it[1] != fd { return -1 }
-  const dn = nodeAt(d)
-  if !(dn is FuncDecl) { return -1 }
-  if dn.fnRet < 0 { return monoInstRetLitTy(dn) }
-  const t = nodeTyIxOf(dn.fnRet)
-  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyArray) || monoTyOpen(t) {
-    return -1
-  }
-  t
-}
-
-// The one closed list-of-functions type every value un-annotated instance `fn` returns records,
-// each a returned list literal its own copy of the body instanced (D9601); -1 otherwise.
-function monoInstRetLitTy(fn: FuncDecl): i32 {
-  let t = -1
-  for r in monoFnRetArgs(fn) {
-    if r >= 0 && !(nodeAt(r) is RetStmt) {
-      const rx = monoRetListLitOf(r)
-      const rt = if rx >= 0 { nodeTyIxOf(rx) } else { -1 }
-      if (
-        rt < 0
-        || rt >= T.tys.length
-        || !(tyAt(rt) is TyArray)
-        || monoTyOpen(rt)
-        || !tyMayHoldFn(rt, 0)
-        || (t >= 0 && !tyEq(t, rt))
-      ) {
-        return -1
-      }
-      t = rt
-    }
   }
   t
 }
