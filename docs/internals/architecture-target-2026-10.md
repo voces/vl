@@ -1817,6 +1817,14 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **walk type** (33): `monoExprRebuild` 7,470, `monoPinRetype` 7,368, `monoPinnedTyOf` 6,521, `monoElseRemainderAt` 6,167, `monoPinFnValueTy` 4,955, `monoPinRecvName` 3,289, `monoPinRecvLit` 3,162, `monoPinCoalJoin` 2,708, `monoIfChainRebuildPinned` 2,654, `monoIfArmsAllTy` 2,641, `monoHoleJoinPinsString` 2,368, `monoPinMemberCall` 1,241, `monoLamPinRetAnn` 1,112, `monoNumUnionOpPin` 788, `monoPinCoalListDefault` 781, `monoHoleNodeTy` 686, `monoArmTailIsTy` 643, `monoLamCallTy` 522, `monoHoleCoalUnion` 321, `monoHoleTy` 252, `monoNumOperandPinTy` 241, `monoPinArmSubst` 124, `monoIfArmsPinJoin` 86, `monoChainPinnedTys` 74, `monoHoleJoinDropsArm` 72, `monoTpJoinObjTy` 54, `monoSubstIsExpr` 53, `monoHoleBindingOf` 24, `monoHoleJoinPinTy` 11, `monoArmPinnedTy` 5, `monoHoleJoinHasAtomArm` 1, `monoNumUnionCompoundPin` 1, `monoArmPinsLitUnion` 0.
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
+  The type an uncalled slot holds its functions at is the elaboration's (`elabUncalledSlotTy`,
+  from `elabSlotHeldFns`), read by `monoUncalledSlotFnTy`. Shadowed over 23,381 programs, 507
+  decisions in 318 programs: 105 agree, 401 decline on both sides, 0 disagree. In one, D12218,
+  the elaboration answers where mono declines; a held value whose checked type is no function
+  type keeps it declining. What is left mono-derived is the gate deciding the slot is uncalled:
+  59 of the 105 reach the default through `monoValsInert`, `monoValsReachNoCall` or
+  `monoLitReachesNoCall` while `elabSlotUncalled` says the slot is called. That calledness
+  disagreement is this family's next item.
 
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
 with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
