@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The slot-delivery audit: how many programs the elaboration's slot reader (`elabSlotDeliveries`)
-# and the flow table's pins (`fnFlowDeclPathPinSigs`) disagree in, over `tests/cases` and the
+# and the flow table's pins (its `ffDeclPathPinKeys` walk) disagree in, over `tests/cases` and the
 # distilled corpus. A delivery writer's PR reports this count before and after.
 #
 #   scripts/slot-delivery-audit.sh <commit> [jobs]
@@ -19,26 +19,30 @@ out="${TMPDIR:-/tmp}/slot-delivery-audit.txt"
 trap 'git -C "$root" worktree remove --force "$tmp/tree" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
 git -C "$root" worktree add -q --detach "$tmp/tree" "$commit"
 deno eval '
-const p = Deno.args[0] + "/compiler/emit_mono.vl";
+const t = Deno.args[0];
+const fp = t + "/compiler/fn_flow_shadow.vl";
+let f = Deno.readTextFileSync(fp);
+if (!f.includes("function ffDeclPathPinKeys(")) throw new Error("ffDeclPathPinKeys is gone: update the audit");
+f += `
+export function zzTablePins(d: i32, path: string[], inst: i32, tmpl: i32): string[] {
+  ffDeclPathPinKeys(d, path, inst, tmpl, false)
+}
+`;
+Deno.writeTextFileSync(fp, f);
+const p = t + "/compiler/emit_mono.vl";
 let s = Deno.readTextFileSync(p);
-const old = "  fnFlowDeclPathPinSigs(d, path, inst, tmpl, dead)\n}";
-if (!s.includes(old)) throw new Error("monoDeclPathKeysIn changed shape: update the audit");
-s = s.replace(old, "  zzPins(fnFlowDeclPathPinSigs(d, path, inst, tmpl, dead), d, path, inst)\n}");
+const head = s.indexOf("function monoDeclPathKeysIn(");
+const tail = "  }\n  out\n}";
+const at = s.indexOf(tail, head);
+if (head < 0 || at < 0) throw new Error("monoDeclPathKeysIn changed shape: update the audit");
+s = s.slice(0, at) + "  }\n  zzPins(zzTablePins(d, path, inst, tmpl), out, path)\n}" + s.slice(at + tail.length);
 s = s.replace(
   "import { emitFail, emitFailAt } from \"./emit_bytes\"",
-  "import { emitFail, emitFailAt } from \"./emit_bytes\"\nimport { elabSlotDeliveries as zzDeliv } from \"./emit_elab\"",
+  "import { emitFail, emitFailAt } from \"./emit_bytes\"\nimport { zzTablePins } from \"./fn_flow_shadow\"",
 );
 s += `
-function zzPins(a: string[], d: i32, path: string[], inst: i32): string[] {
-  if a.length == 1 && a[0] == FF_PIN_DECLINE { return a }
-  const b: string[] = []
-  for t in zzDeliv(d, path, if inst >= 0 { elabKeyAt(inst) } else { -1 }) {
-    const ft = tyAt(t)
-    if ft is TyFunc {
-      const sg = fnFlowPinSigOf(ft.fnParamTypes)
-      if !strListHas(b, sg) { b.push(sg) }
-    }
-  }
+function zzPins(a: string[], b: string[], path: string[]): string[] {
+  if a.length == 1 && a[0] == FF_PIN_DECLINE { return b }
   let onlyTbl = ""
   for x in a { if !strListHas(b, x) { onlyTbl = onlyTbl + x + "|" } }
   let onlyNew = ""
@@ -46,12 +50,10 @@ function zzPins(a: string[], d: i32, path: string[], inst: i32): string[] {
   if onlyTbl != "" || onlyNew != "" {
     let ps = ""
     for k in path { ps = ps + k + "/" }
-    const dn = nodeAt(d)
-    const kind = if dn is LetDecl { "let" } else if dn is Param { "param" } else if dn is ArrayLit { "arr" } else if dn is ObjLit { "obj" } else if dn is Ident { "ident" } else { "other" }
     const dir = if onlyNew == "" { "tbl" } else if onlyTbl == "" { "new" } else { "both" }
-    emitFail("SIGDIFF class=" + kind + "-" + dir + " p=" + ps + " onlyTbl=[" + onlyTbl + "] onlyNew=[" + onlyNew + "]")
+    emitFail("SIGDIFF class=" + dir + " p=" + ps + " onlyTbl=[" + onlyTbl + "] onlyNew=[" + onlyNew + "]")
   }
-  a
+  b
 }
 `;
 Deno.writeTextFileSync(p, s);
@@ -65,6 +67,6 @@ Deno.writeTextFileSync(p, s);
 grep "SIGDIFF" "$tmp/all.txt" > "$out" || true
 grep -v "SIGDIFF" "$tmp/all.txt" > "${out%.txt}-trapped.txt" || true
 echo "slot-delivery audit at $(git -C "$root" rev-parse --short "$commit"): $(wc -l < "$out") programs disagree ($out)"
-grep -o "class=[a-z]*-[a-z]*" "$out" | sort | uniq -c | sort -rn
+grep -o "class=[a-z]*" "$out" | sort | uniq -c | sort -rn
 # A program whose audit build traps compares nothing, so it is counted apart rather than as agreeing.
 echo "$(wc -l < "${out%.txt}-trapped.txt") programs trap the audit build (${out%.txt}-trapped.txt)"
