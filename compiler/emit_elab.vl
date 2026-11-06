@@ -239,6 +239,7 @@ import {
   callBindIxAt,
   callBindNamesAt,
   callBindRepKeyedAt,
+  callBindRepMixedAt,
   callBindRepTysAt,
   callBindRowOf,
   callBindTyOf,
@@ -8491,6 +8492,9 @@ let erFrom: i32[] = []
 let erKey: i32[] = []
 let erArgAt: i32[] = []
 let erArgRep: i32[] = []
+// Beside each slot of `erArgRep`, the record the argument is built at where the call's bind row
+// keys or pins it at its rep, against the argument's own type; -1 otherwise.
+let erArgBuilt: i32[] = []
 let erRowAt: {[i32]: i32} = Map()
 
 // `elabCallArgRep`'s answer where the run recorded no reach of the call from that instance.
@@ -8504,6 +8508,7 @@ export function elabReachRows() {
   erKey = []
   erArgAt = []
   erArgRep = []
+  erArgBuilt = []
   erRowAt = Map()
   for ix in elabCallKeys.keys() {
     if ix < 0 || ix >= P.nodes.length { continue }
@@ -8521,12 +8526,82 @@ export function elabReachRows() {
       let i = 0
       while i < np {
         erArgRep.push(elabArgRepFrom(ix, i, ks[j]))
+        erArgBuilt.push(-1)
         i = i + 1
       }
       j = j + 2
     }
   }
+  elabReachBuilt()
   0
+}
+
+// Fills `erArgBuilt` for each argument the write index places at a recorded call, by the
+// parameter position it takes there.
+function elabReachBuilt() {
+  cwIxWant()
+  let r = 0
+  while r < erCall.length {
+    const ix = erCall[r]
+    const cn = nodeAt(ix)
+    if cn is Call {
+      const args: i32[] = []
+      for a in cn.callArgs { args.push(parenPeelIx(a)) }
+      const cf = if cn.callFn >= 0 { nodeAt(cn.callFn) } else { null }
+      if cf is Member { args.push(parenPeelIx(cf.memObj)) }
+      const end = if r + 1 < erArgAt.length { erArgAt[r + 1] } else { erArgRep.length }
+      for a in args {
+        if (
+          a >= 0
+          && a < cwIxCoveredLen()
+          && cwIxUpKind[a] == CW_UP_ARG
+          && cwIxUp[a] == ix
+        ) {
+          const at = erArgAt[r] + cwIxUpAux[a]
+          if at < end { erArgBuilt[at] = elabArgBuiltOf(ix, cwIxUpAux[a], a) }
+        }
+      }
+    }
+    r = r + 1
+  }
+  0
+}
+
+// The record argument `a` (position `i` of call `ix`) is built at, where the call's bind row keys
+// or pins it at its rep and that is another record than its own type; -1 otherwise.
+function elabArgBuiltOf(ix: i32, i: i32, a: i32): i32 {
+  const own = nodeTyIxOf(a)
+  if own < 0 || own >= T.tys.length { return -1 }
+  const row = callBindRowOf(ix)
+  if row < 0 || !(callBindRepKeyedAt(row) || callBindRepMixedAt(row)) {
+    return -1
+  }
+  const r = callArgRepTy(ix, i, own)
+  if r < 0 || r >= T.tys.length || tySame(r, own) || !(tyAt(r) is TyObj) {
+    -1
+  } else {
+    r
+  }
+}
+
+// The record argument `a` is built at by the call it is handed to, reached from instance `from`
+// (`erArgBuilt`); -1 where it is built at its own type or the write index places it at no
+// recorded call, as an instance copy mono minted past the index is.
+export function elabArgBuiltRep(a: i32, from: i32): i32 {
+  cwIxWant()
+  if a < 0 || a >= cwIxCoveredLen() || cwIxUpKind[a] != CW_UP_ARG { return -1 }
+  const ix = cwIxUp[a]
+  const r0 = erRowAt[ix] ?? -1
+  if r0 < 0 { return -1 }
+  let r = r0
+  let hit = r0
+  while r < erCall.length && erCall[r] == ix {
+    if erFrom[r] == from { hit = r }
+    r = r + 1
+  }
+  const at = erArgAt[hit] + cwIxUpAux[a]
+  const end = if hit + 1 < erArgAt.length { erArgAt[hit + 1] } else { erArgRep.length }
+  if at < end { erArgBuilt[at] } else { -1 }
 }
 
 // The rep parameter `i` of the instance call `ix` reaches from `from` is delivered at, where
@@ -8543,6 +8618,16 @@ function elabArgRepFrom(ix: i32, i: i32, from: i32): i32 {
   if pt < 0 { return -1 }
   const rt = callArgRepTy(ix, i, pt)
   if rt == pt { -1 } else { rt }
+}
+
+// How many argument slots the reach rows record a built record at (`erArgBuilt`); read by
+// `tests/vl_elab_arg_rep_test.ts`.
+export function elabArgBuiltProbe(): i32 {
+  let n = 0
+  for b in erArgBuilt {
+    if b >= 0 { n = n + 1 }
+  }
+  n
 }
 
 // Grades every reach row against the rule that a rep differs from its parameter's type only as a
