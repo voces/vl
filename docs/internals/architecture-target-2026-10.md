@@ -1362,6 +1362,21 @@ canonical key that replaces it. Sliced from the canonical key it read garbage: t
 movers of the call half were that, and it reused a wrong lambda instance when the lambda key
 first switched (`generics/hole-call-generic-lambda-arg.vl` trapped).
 
+**Where the two keys still disagree** (2026-11-06, fixpoint of master `597704eca`). 165 instances
+have a call-time key (`instKeyCallTime`) that spells differently from the key mono demanded
+(`elabDemand`):
+
+| class | n | difference | partition |
+|---|---|---|---|
+| set vs signature | 140 | a hole parameter handed a tagged set is keyed by the set (`Fn#7`) on one side and by its closed signature on the other | one-to-one per declaration |
+| one set, two signatures | 3 | a generic in a set instanced at two types (`generic-fn-value-returned-through-identity-hole.vl`) | the set alone merges two instances; the pinned reps keep them apart |
+| nested member at another parent | 14 | the typed-slot lookup returned a nested instance under the first enclosing instance | fixed: `elabMemberKeyAtTys` prefers `elabKidsAt(decl, walkTop)` |
+| bundle member | 4 | a lambda handed as a closure bundle has one instance per signature; the value key names another member | the key needs the member's signature (`elabCallBundleSigs`) |
+| type vs rep | 4 | one side names the type (`T=(1\|2)`, `{r:null}`), the other the rep | expected; the rep component carries it |
+
+The value half's switch therefore owes the 4 bundle members; the other classes are spellings the
+canonical key already absorbs.
+
 ## 4. Scoreboard
 
 The scoreboard reports side effects of the migration; it is not a landing criterion (§3).
