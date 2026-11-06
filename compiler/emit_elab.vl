@@ -10,12 +10,18 @@ import {
   monoTyParamReachesSpelling,
 } from "./emit_base"
 import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
-import { fnSlotCalled, fnTagCallSetOf, fnTagCalls } from "./check_elab_cap"
+import {
+  elabHoleRowCut,
+  elabHoleRowMark,
+  fnSlotCalled,
+  fnTagCallSetOf,
+  fnTagCalls,
+} from "./check_elab_cap"
 import { tyArrayElemIx } from "./check_types"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { paramHoleName } from "./check_tp_join"
 import { decDigitsOf } from "./strutil"
-import { constListFnElemDecl, slotOfRead } from "./check_calls"
+import { constListFnElemDecl, elabNullOnlyTp, slotOfRead } from "./check_calls"
 
 import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx } from "./check_ty_rep"
@@ -104,6 +110,8 @@ import {
   CW_UP_TAIL,
   cwBindingOf,
   cwBindingWrittenValues,
+  cwCalleeArgOff,
+  cwCalleeDeclOf,
   cwFnCalls,
   cwFnValueDeclOf,
   cwFrameOfDecl,
@@ -118,6 +126,7 @@ import {
   cwKeyOfDecl,
   cwLetUnwritten,
   cwLetWrittenInClosure,
+  cwMethodCalls,
   cwOccNext,
   cwOccWalk,
   cwPathFnTargets,
@@ -128,6 +137,7 @@ import {
   cwSlotWrittenValues,
   cwSpreadPeers,
   cwUseInOtherFrame,
+  declFirstParamIsSelf,
   fnDeclIx,
 } from "./check_write_scan"
 import { declIsExportedFn } from "./check_exp_obs"
@@ -237,6 +247,7 @@ import {
 import {
   REC_REBUILT_DEPTH,
   callArgRepTy,
+  recListRepWidens,
   recRebuiltLeafRow,
   recRepWidens,
 } from "./check_bind_adopt"
@@ -244,7 +255,7 @@ import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
 import { monoRecheckEnd } from "./check_demands"
 import { callDstTyOf, cbExpMark, cbExpTruncate } from "./check_expected"
 import { RB_ALL, checkMark, checkRollback } from "./check_rollback"
-import { argIsLitAggregate, bindOf } from "./check_leaf_steps"
+import { argIsLitAggregate, bindOf, i32TyIx } from "./check_leaf_steps"
 import { holePinHeldSet } from "./check_hole_pins"
 import { a20RetWalk } from "./check_nj_gate"
 import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
@@ -305,6 +316,7 @@ import {
   TDiag,
   TY_ERR,
   TY_I32,
+  TY_NEVER,
   TY_NULL,
   TY_STR,
   TY_VOID,
@@ -964,6 +976,7 @@ function elabDrainHoleRows() {
       elabUnboundCallT[u],
       uf,
     )
+    elabArgCallNote(elabUnboundCallIx[u])
     if uk >= 0 && !(elabGuessKeys[uk] ?? false) {
       elabReachNote(uf, uk, elabUnboundCallIx[u])
     } else if uk >= 0 {
@@ -1764,6 +1777,7 @@ function elabDemandFrom(
     const pk = elabKeyAtPins(decl, names0, tys0, pTys, from)
     if pk >= 0 { return pk }
   }
+  elabNullOnlyBind(decl, call, names, tys)
   elabRowEntries(call, decl, names, tys)
   const n0 = ekDecl.length
   const k = elabEnqueue(decl, names, tys, from)
@@ -1780,6 +1794,24 @@ function elabDemandFrom(
   if k >= 0 && !ekDone[k] { elabOne(k) }
   elabSettle(n0)
   k
+}
+
+// Binds `never` onto `names`/`tys` for each type parameter of `decl` call `call` leaves unbound
+// whose every argument is a `null` its parameter's `| null` arm takes (D3178).
+function elabNullOnlyBind(decl: i32, call: i32, names: string[], tys: i32[]) {
+  if decl < 0 || decl >= P.nodes.length || call < 0 || call >= P.nodes.length {
+    return 0
+  }
+  const f = nodeAt(decl)
+  const c = nodeAt(call)
+  if !(f is FuncDecl) || !(c is Call) { return 0 }
+  for tp in f.fnTyParams {
+    if !strListHas(names, tp) && elabNullOnlyTp(f, c, tp) {
+      names.push(tp)
+      tys.push(TY_NEVER)
+    }
+  }
+  0
 }
 
 // The instance of `decl` under `from` already keyed by `names0`/`tys0` with each parameter bound
@@ -7327,8 +7359,12 @@ export function elabLamParamSigs(d: i32, i: i32, inst: i32[]): i32[] {
 // The signatures call `ix`'s instance, reached from the instance being walked, calls the lambda
 // handed to its parameter `i` at: two or more, with the lambda's set untagged; else none.
 export function elabCallBundleSigs(ix: i32, i: i32): i32[] {
+  elabCallBundleSigsFrom(ix, i, elabWalkTop())
+}
+
+// `elabCallBundleSigs` for the instance call `ix` reaches from instance `from`.
+function elabCallBundleSigsFrom(ix: i32, i: i32, from: i32): i32[] {
   const none: i32[] = []
-  const from = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
   const k = elabCallInstFrom(ix, from)
   if k < 0 || i < 0 || i >= 64 { return none }
   const sigs = elabBundleSigs.get(elabBundleKey(k, i)) ?? none
@@ -8098,6 +8134,7 @@ export function elabRun() {
   elabReprKeys = Map()
   elabGuessKeys = Map()
   elabUnboundOnly = Map()
+  elabArgCall = Map()
   elabKeyRefines = Map()
   elabUnboundFailed = Map()
   elabCandKeys = Map()
@@ -8123,6 +8160,7 @@ export function elabRun() {
   ekReach = []
   elabReadsMemo = Map()
   elabCallKeys = Map()
+  erRowAt = Map()
   elabValCalls = Map()
   elabValueKeys = Map()
   elabHoleMapMemo = Map()
@@ -8442,6 +8480,171 @@ export function elabRun() {
   elabSlotFacts()
   elabPinsClosedSet(true)
   elabRunDone = true
+}
+
+// One row per reach the run recorded (call `erCall[r]` from instance `erFrom[r]` reaching instance
+// `erKey[r]`), holding the rep each parameter of that instance is delivered at from `erArgAt[r]` in
+// `erArgRep`, by parameter index (a method call's receiver is its first); `erRowAt` is a call's
+// first row. The rep depends on the call and the instance it reaches alone.
+let erCall: i32[] = []
+let erFrom: i32[] = []
+let erKey: i32[] = []
+let erArgAt: i32[] = []
+let erArgRep: i32[] = []
+let erRowAt: {[i32]: i32} = Map()
+
+// `elabCallArgRep`'s answer where the run recorded no reach of the call from that instance.
+export const ELAB_REP_NO_ROW = -2
+
+// Fills the reach rows from the run's recorded reaches (`elabCallKeys`), once the tag decision's
+// rounds have settled the bundle facts (`elabMintFacts`).
+export function elabReachRows() {
+  erCall = []
+  erFrom = []
+  erKey = []
+  erArgAt = []
+  erArgRep = []
+  erRowAt = Map()
+  for ix in elabCallKeys.keys() {
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const ks = elabCallKeys[ix] ?? []
+    let j = 0
+    while j + 1 < ks.length {
+      if j == 0 { erRowAt[ix] = erCall.length }
+      const k = ks[j + 1]
+      erCall.push(ix)
+      erFrom.push(ks[j])
+      erKey.push(k)
+      erArgAt.push(erArgRep.length)
+      const dn = if k >= 0 && k < ekDecl.length { nodeAt(ekDecl[k]) } else { null }
+      const np = if dn is FuncDecl { dn.fnParams.length } else { 0 }
+      let i = 0
+      while i < np {
+        erArgRep.push(elabArgRepFrom(ix, i, ks[j]))
+        i = i + 1
+      }
+      j = j + 2
+    }
+  }
+  0
+}
+
+// The rep parameter `i` of the instance call `ix` reaches from `from` is delivered at, where
+// that is not its type: the record of one closure per signature a bundle parameter is called at,
+// else the wider record the call builds it as (`callArgRepTy`); -1 where the rep is the type.
+function elabArgRepFrom(ix: i32, i: i32, from: i32): i32 {
+  const sigs = elabCallBundleSigsFrom(ix, i, from)
+  if sigs.length >= 2 {
+    const names: string[] = []
+    for _s in sigs { names.push("c" + i32ToStr(names.length)) }
+    return mkObjTy(names, sigs)
+  }
+  const pt = elabCallParamTyFrom(ix, i, from)
+  if pt < 0 { return -1 }
+  const rt = callArgRepTy(ix, i, pt)
+  if rt == pt { -1 } else { rt }
+}
+
+// Grades every reach row against the rule that a rep differs from its parameter's type only as a
+// bundle's record or a wider record: bundles in the thousands, wider records in the units, and each
+// slot breaking the rule a million; read by `tests/vl_elab_arg_rep_test.ts`.
+export function elabArgRepProbe(): i32 {
+  let bundles = 0
+  let wides = 0
+  let bad = 0
+  let r = 0
+  while r < erCall.length {
+    const end = if r + 1 < erArgAt.length { erArgAt[r + 1] } else { erArgRep.length }
+    let at = erArgAt[r]
+    while at < end {
+      const rep = erArgRep[at]
+      if rep >= 0 {
+        const i = at - erArgAt[r]
+        const sigs = elabCallBundleSigsFrom(erCall[r], i, erFrom[r])
+        const pt = elabCallParamTyFrom(erCall[r], i, erFrom[r])
+        if sigs.length >= 2 {
+          bundles = bundles + 1
+        } else if (
+          pt >= 0
+          && (recRepWidens(pt, rep) || recListRepWidens(pt, rep))
+        ) {
+          wides = wides + 1
+        } else {
+          bad = bad + 1
+        }
+      }
+      at = at + 1
+    }
+    r = r + 1
+  }
+  bad * 1000000 + bundles * 1000 + wides
+}
+
+// The rep parameter `i` of the instance call `ix` reaches is delivered at, that instance being `k`
+// or the one the call reaches from instance `from`: a type where that rep is not the parameter's
+// type, -1 where it is, and `ELAB_REP_NO_ROW` where the run recorded neither reach.
+export function elabCallArgRep(ix: i32, k: i32, from: i32, i: i32): i32 {
+  const r0 = erRowAt[ix] ?? -1
+  if r0 < 0 { return ELAB_REP_NO_ROW }
+  let r = r0
+  let hit = -1
+  while r < erCall.length && erCall[r] == ix {
+    if erKey[r] == k { hit = r }
+    r = r + 1
+  }
+  r = r0
+  while hit < 0 && r < erCall.length && erCall[r] == ix {
+    if erFrom[r] == from { hit = r }
+    r = r + 1
+  }
+  if hit < 0 { return ELAB_REP_NO_ROW }
+  const at = erArgAt[hit] + i
+  const end = if hit + 1 < erArgAt.length { erArgAt[hit + 1] } else { erArgRep.length }
+  if i >= 0 && at < end { erArgRep[at] } else { ELAB_REP_NO_ROW }
+}
+
+// The parameter of function `decl` every value its body returns reads whole, directly or through
+// bindings typed by their initializer (un-annotated, or annotated only with one of its own type
+// parameters); -1 where they read none, or two.
+export function elabRetParamOf(decl: i32): i32 {
+  const fn = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  if !(fn is FuncDecl) { return -1 }
+  // A function returning nothing, or with no checked signature, hands no parameter back.
+  const ft = nodeTyIxOf(decl)
+  const f = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+  if !(f is TyFunc) || f.fnRet == TY_VOID { return -1 }
+  let p = -1
+  for lf in recFnValueLeaves(decl) {
+    const q = elabLeafParamIx(lf, fn, 4)
+    if q < 0 || (p >= 0 && q != p) { return -1 }
+    p = q
+  }
+  p
+}
+
+// The index of the parameter of `fn` value `lf` reads, directly or through bindings typed by
+// their initializer, else -1.
+function elabLeafParamIx(lf: i32, fn: FuncDecl, depth: i32): i32 {
+  const u = parenPeelIx(lf)
+  if u < 0 || depth <= 0 || !(nodeAt(u) is Ident) { return -1 }
+  const d = identDeclOf(u)
+  if d < 0 { return -1 }
+  let i = 0
+  while i < fn.fnParams.length {
+    if fn.fnParams[i] == d { return i }
+    i = i + 1
+  }
+  const dn = nodeAt(d)
+  if dn is LetDecl && dn.letInit >= 0 {
+    const ann = if dn.letType >= 0 { nodeAt(dn.letType) } else { null }
+    if (
+      dn.letType < 0
+      || (ann is TypeRef && strListHas(fn.fnTyParams, ann.tyName))
+    ) {
+      return elabLeafParamIx(dn.letInit, fn, depth - 1)
+    }
+  }
+  -1
 }
 
 // Stamps each instance's record-list literal whose stored functions are left open to be built at
@@ -11917,6 +12120,15 @@ function elabRetCalls(f: i32, calls: i32[]) {
     i = i - 1
   }
   cwFnCalls(f, calls)
+  // A `self` function is also called by its UFCS spelling (`x.f()`), as the checker picked it.
+  const fn = nodeAt(f)
+  if fn is FuncDecl && fn.fnName != "" && declFirstParamIsSelf(fn.fnName) {
+    const ms: i32[] = []
+    cwMethodCalls(f, ms)
+    for c in ms {
+      if nodeAt(c) is Call && !i32ListHas(calls, c) { calls.push(c) }
+    }
+  }
   0
 }
 let elabGenericByValue = false
@@ -12366,18 +12578,116 @@ export function elabValueAgreedCallTys(
   have
 }
 
+// The type parameters the generic frames enclosing the literal `elabLitSlotCallTys` asks about
+// declare; a tuple may stay open in them.
+let elabSlotKeep: string[] = []
+
+// The type parameters the functions enclosing node `a` declare, innermost first.
+function elabFrameTyParams(a: i32): string[] {
+  const out: string[] = []
+  // A node minted after the write index has no parents there to climb.
+  if a < 0 || a >= cwIxCoveredLen() { return out }
+  let f = recEnclosingFn(a)
+  let hops = 0
+  while f >= 0 && f < P.nodes.length && hops < 16 {
+    const fn = nodeAt(f)
+    if fn is FuncDecl {
+      for tp in fn.fnTyParams { out.push(tp) }
+    }
+    f = recEnclosingFn(f)
+    hops = hops + 1
+  }
+  out
+}
+
+// Whether type `t` names no type variable but those in `keep` and reaches no inference hole.
+function elabOpenOnlyIn(t: i32, keep: string[]): boolean {
+  if keep.length == 0 || t < 0 || t >= T.tys.length { return false }
+  const fill: i32[] = []
+  for _k in keep { fill.push(i32TyIx()) }
+  // The placeholder asks a question; it pins no hole an instance would be built at.
+  const r0 = elabHoleRowMark()
+  const u = substTyDeep(t, keep, fill)
+  elabHoleRowCut(r0)
+  !tyHasTyVar(u) && !tyReachesHole(u, 16)
+}
+
+// The one closed result the calls `elabValueCallTysOpenFns` last read agree on, or -1.
+let elabSlotCallRet = -1
+
+// Call `c`'s closed result: the one every instance agrees on, else its checked type, else for a
+// function result the tuple and result of the calls that result reaches; -1 where none closes.
+function elabLitCallResultTy(c: i32): i32 {
+  const rt = elabNodeTyAgreed(c)
+  if rt >= 0 && rt < T.tys.length && !tyHasTyVar(rt) { return widenLitTy(rt) }
+  const ct = nodeTyIxOf(c)
+  if ct >= 0 && ct < T.tys.length && !tyHasTyVar(ct) { return widenLitTy(ct) }
+  if (
+    ct < 0
+    || ct >= T.tys.length
+    || !(tyAt(ct) is TyFunc)
+    || elabSlotCallResultDepth > 1
+  ) {
+    return -1
+  }
+  elabSlotCallResultDepth = elabSlotCallResultDepth + 1
+  const q: i32[] = []
+  const fa: i32[] = []
+  const ok = elabValueCallTysOpenFns(c, q, fa)
+  const r = elabSlotCallRet
+  elabSlotCallResultDepth = elabSlotCallResultDepth - 1
+  if !ok || r < 0 { return -1 }
+  for t in q {
+    if t < 0 { return -1 }
+  }
+  mkFuncTy(q, r)
+}
+
+// How deep `elabLitCallResultTy` has followed a function result to its own calls.
+let elabSlotCallResultDepth = 0
+
 // `elabValueAgreedCallTys` over the calls the value of `d` reaches, except that an open argument
 // naming a function declaration is pushed as -1 onto `tys`, with that declaration at the same
 // position of `fas` (-1 elsewhere); false where two calls disagree, or an open argument is not one.
 function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
+  const none: string[] = []
+  elabSlotCallTysOpenFns(d, none, tys, fas)
+}
+
+// `elabValueCallTysOpenFns` over the calls slot `path` of `d` reaches.
+function elabSlotCallTysOpenFns(
+  d: i32,
+  path: string[],
+  tys: i32[],
+  fas: i32[],
+): boolean {
+  elabSlotCallRet = -1
   elabCallSink = []
   elabCallSinkOn = true
-  elabSlotDeliveries(d, [], -1)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const anon = dn is FuncDecl
+    && dn.fnName.length > 9
+    && dn.fnName.slice(0, 9) == "__lambda_"
+  if (dn is Call || anon) && d < cwIxCoveredLen() && path.length == 0 {
+    // A value a call hands back, or a lambda, is climbed from its node, under every instance.
+    const out: i32[] = []
+    const seen: i32[] = []
+    const was = elabDlvKey
+    const wasAdmit = elabDlvAdmit
+    elabDlvKey = -1
+    elabDlvAdmit = elabReachClosure(-1)
+    elabSlotClimb(d, [], out, seen)
+    elabDlvKey = was
+    elabDlvAdmit = wasAdmit
+  } else {
+    elabSlotDeliveries(d, path, -1)
+  }
   elabCallSinkOn = false
   const hits = elabCallSink
   elabCallSink = []
   let key = ""
   let have = false
+  let ret = -1
   for c in hits {
     const cn = nodeAt(c)
     if cn is Call {
@@ -12387,7 +12697,19 @@ function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
       for a in cn.callArgs {
         const t = nodeTyIxOf(a)
         if t < 0 || t >= T.tys.length { return false }
-        if tyHasTyVar(t) {
+        const at = if tyHasTyVar(t) { elabNodeTyAgreed(a) } else { -1 }
+        if at >= 0 && !tyHasTyVar(at) {
+          // An argument open at check takes the one type every instance gives it.
+          const w = widenLitTy(at)
+          tup.push(w)
+          fs.push(-1)
+          k = k + tyToStr(w) + ","
+        } else if tyHasTyVar(t) && elabOpenOnlyIn(t, elabSlotKeep) {
+          // Open only in the enclosing generics' own parameters, it stays: each instance binds them.
+          tup.push(t)
+          fs.push(-1)
+          k = k + tyToStr(t) + ","
+        } else if tyHasTyVar(t) {
           const fd = cwFnValueDeclOf(a)
           if fd < 0 { return false }
           tup.push(-1)
@@ -12401,6 +12723,9 @@ function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
         }
       }
       if have && k != key { return false }
+      const rc = elabLitCallResultTy(c)
+      if !have { ret = rc }
+      else if ret >= 0 && (rc < 0 || !tySame(rc, ret)) { ret = -1 }
       while tys.length > 0 { tys.pop() }
       while fas.length > 0 { fas.pop() }
       for t in tup { tys.push(t) }
@@ -12409,6 +12734,7 @@ function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
       have = true
     }
   }
+  elabSlotCallRet = ret
   have
 }
 
@@ -12435,6 +12761,94 @@ function elabCloseFnArgs(v: i32, tys: i32[], fas: i32[]): boolean {
   true
 }
 
+// Pushes onto `vals` the values list `src` holds when it names a binding the index covers whose
+// every occurrence is its list literal initialiser, a `push` onto it, or a read; false otherwise.
+function elabSpreadValuesInto(src: i32, vals: i32[]): boolean {
+  const s0 = parenPeelIx(src)
+  if s0 < 0 || s0 >= P.nodes.length || !(nodeAt(s0) is Ident) { return false }
+  const b = cwBindingOf(s0)
+  if b < 0 || b >= P.nodes.length || !(nodeAt(b) is LetDecl) { return false }
+  elabListHeldValuesInto(b, vals, 0)
+}
+
+// `elabSpreadValuesInto` for binding `b`, a `let` or, `depth` calls in, a declared function's
+// parameter the list is handed to.
+function elabListHeldValuesInto(b: i32, vals: i32[], depth: i32): boolean {
+  if depth > 2 { return false }
+  const ow = cwOccWalk(b)
+  while cwOccNext(ow) {
+    const k = cwIxKind[ow.row]
+    const u = cwIxNode[ow.row]
+    const un = nodeAt(u)
+    if k == CW_OCC_BIND && un is Param {
+      // A parameter's own declaration holds nothing until a call hands it a list.
+    } else if k == CW_OCC_BIND && un is LetDecl {
+      const init = if un.letInit >= 0 { nodeAt(parenPeelIx(un.letInit)) } else { null }
+      if !(init is ArrayLit) { return false }
+      for e in init.arrElems {
+        if nodeAt(e) is Spread { return false }
+        vals.push(e)
+      }
+    } else if k == CW_OCC_USE {
+      const m = elabPlaceUp(u)
+      const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+      const c = elabPlaceUp(m)
+      const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+      if mn is Member && mn.memProp == "push" && cn is Call && cn.callFn == m {
+        for a in cn.callArgs { vals.push(a) }
+      } else if mn is Call && mn.callFn != u {
+        // Handed to a declared function, the list also holds what that parameter is given.
+        const fd = cwCalleeDeclOf(mn.callFn)
+        const fdn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+        const ai = i32ListIndexOf(mn.callArgs, u) + cwCalleeArgOff(mn.callFn)
+        if !(fdn is FuncDecl) || ai < 0 || ai >= fdn.fnParams.length {
+          return false
+        }
+        if !elabListHeldValuesInto(fdn.fnParams[ai], vals, depth + 1) {
+          return false
+        }
+      } else if (
+        mn is Spread
+        || (mn is Member && mn.memProp == "length" && !(cn is Call))
+      ) {
+        // A copy or a length read leaves the values as they are.
+      } else if mn is Index && parenPeelIx(mn.idxArr) == u {
+        // An element read leaves them as they are; an element write adds its value.
+        const w = elabAssignedValue(m)
+        if w >= 0 { vals.push(w) }
+      } else {
+        return false
+      }
+    } else {
+      return false
+    }
+  }
+  true
+}
+
+// The value assigned to place `x` when it is the left side of a plain `=`, else -1.
+function elabAssignedValue(x: i32): i32 {
+  const p = if x >= 0 && x < cwIxParent.length && cwIxCovers(x) { cwIxParent[x] } else { -1 }
+  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if (
+    pn is BinExpr
+    && pn.binOp == "="
+    && pn.binCompound == ""
+    && parenPeelIx(pn.binLeft) == x
+  ) {
+    return pn.binRight
+  }
+  -1
+}
+
+// Per value of the last `elabLitSlotCallTys`, the one closed result its calls agree on, or -1.
+let elabLitCallRets: i32[] = []
+
+// The closed result the calls of value `i` of the last `elabLitSlotCallTys` agree on, or -1.
+export function elabLitSlotCallRet(i: i32): i32 {
+  if i >= 0 && i < elabLitCallRets.length { elabLitCallRets[i] } else { -1 }
+}
+
 // The one closed argument tuple every value slot `step` (`e`, or `f.<name>`) of list or record
 // literal `a` holds reaches as its callee (`elabValueAgreedCallTys`), pushed onto `qs`, with those
 // values pushed onto `vals`; false for a spread, a value reaching no call or an open one, or two.
@@ -12444,9 +12858,24 @@ export function elabLitSlotCallTys(
   qs: i32[],
   vals: i32[],
 ): boolean {
-  const n = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  // A literal an instance copied reads its source's values.
+  const a0 = if a >= cwIxCoveredLen() { nodeSrc[a] ?? a } else { a }
+  elabSlotKeep = elabFrameTyParams(a0)
+  const n = if a0 >= 0 && a0 < P.nodes.length { nodeAt(a0) } else { null }
+  // Values a spread copied in are called where the literal's own slot is.
+  let fromSpread = -1
   if n is ArrayLit && step == "e" {
-    for e in n.arrElems { vals.push(e) }
+    for e in n.arrElems {
+      const en = nodeAt(e)
+      if en is Spread {
+        // A spread of a list binding holds the values that binding is built and pushed with.
+        if fromSpread < 0 { fromSpread = vals.length }
+        if !elabSpreadValuesInto(en.spdArg, vals) { return false }
+      } else {
+        if fromSpread >= 0 { return false }
+        vals.push(e)
+      }
+    }
   } else if n is ObjLit {
     for f in n.objFields {
       const fn = nodeAt(f)
@@ -12455,14 +12884,17 @@ export function elabLitSlotCallTys(
     }
   }
   if vals.length == 0 { return false }
+  elabLitCallRets = []
   let have = false
+  let vi = 0
   for v in vals {
     if nodeAt(v) is Spread { return false }
     const q: i32[] = []
     const fa: i32[] = []
-    if !elabValueCallTysOpenFns(v, q, fa) || !elabCloseFnArgs(v, q, fa) {
-      return false
-    }
+    const got = if fromSpread >= 0 && vi >= fromSpread { elabSlotCallTysOpenFns(a0, [step], q, fa) } else { elabValueCallTysOpenFns(v, q, fa) }
+    vi = vi + 1
+    if !got || !elabCloseFnArgs(v, q, fa) { return false }
+    elabLitCallRets.push(elabSlotCallRet)
     if have {
       if q.length != qs.length { return false }
       let i = 0
@@ -13661,6 +14093,42 @@ function elabValCallNote(from: i32, ix: i32, k: i32) {
 // those of them whose body does not check.
 let elabUnboundOnly: {[i32]: boolean} = Map()
 let elabUnboundFailed: {[i32]: boolean} = Map()
+
+// Each argument of an unbound call, mapped to that call.
+let elabArgCall: {[i32]: i32} = Map()
+
+function elabArgCallNote(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const c = nodeAt(ix)
+  if !(c is Call) { return 0 }
+  for a in c.callArgs {
+    const ax = parenPeelIx(a)
+    if ax >= 0 { elabArgCall[ax] = ix }
+  }
+  0
+}
+
+// The closed type the instance its unbound call is keyed at under the walk top builds argument
+// `arg` at: the callee's parameter with that instance's bindings; -1 for none.
+export function elabArgBuiltTy(arg: i32): i32 {
+  const call = elabArgCall.get(arg) ?? -1
+  if call < 0 { return -1 }
+  const top = if elabWalkKeys.length > 0 { elabWalkKeys[elabWalkKeys.length - 1] } else { -1 }
+  const k = elabCallInstFrom(call, top)
+  if k < 0 { return -1 }
+  const c = nodeAt(call)
+  const dn = nodeAt(ekDecl[k])
+  if !(c is Call) || !(dn is FuncDecl) { return -1 }
+  let i = 0
+  while i < c.callArgs.length && i < dn.fnParams.length {
+    if parenPeelIx(c.callArgs[i]) == arg {
+      const t = substTyDeep(nodeTyIxOf(dn.fnParams[i]), ekNames[k], ekTys[k])
+      return if t >= 0 && elabTyClosed(t, 0) { t } else { -1 }
+    }
+    i = i + 1
+  }
+  -1
+}
 
 // Unkeys each unbound call whose default instance does not check, so the call has no instance.
 function elabUnboundKeyDrop() {

@@ -40,9 +40,9 @@ const BUG_LINE = "this is a bug in vl, not in your program";
 // so one diagnostic reached two columns depending on which command found it. `cli-design.md`
 // makes the output 1-based ("`col` (1-based, inclusive)"); the host shifts too now.
 const WANT_AT = "take.vl:2:10";
-const INVALID = `function pass2<A, B>(a: A, _b: B): A { return a }
-function take(m: {[string]: i32}): {[string]: i32} { return pass2(m, Set()) }
-print(take(Map()).length)
+const INVALID = `function pass2<A, B>(_a: A, _b: B): i32 { return 1 }
+function take(m: {[string]: i32}): i32 { return pass2(m, Set()) }
+print(take(Map()))
 `;
 
 const VALID = `print(6 * 7)\n`;
