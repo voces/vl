@@ -1754,6 +1754,32 @@ deleted. Its price is one late demand per tagged `T[]` call (five in three files
 `T[]` at the list of ids, a spelling no elaboration key uses, so the instance is minted after the
 run. Foreseeing it means keying `T[]` at the id list's rep.
 
+G2's write through a parameter (D15492) lands in the caller's map with its set; what refused it
+was the store into the parameter's slot, which the tag rule now takes when every call hands a
+holder of the set or a wider one decided with it (`ftParamHolderHolds`), and only for a written
+value naming a declared function, whose set no call changes. Bucket 1 is 32 parameters in 16
+programs. The map pin (`r5_rt`, the argument's checked type) still answers 13: 5 in D9480's
+fixture, whose map holding a non-generic keeps the set untagged, 3 written as a record `{f: id}`,
+3 an uncalled set (G5), and 2 outside bucket 1.
+
+Two of the 13 are residuals with a named blocker, not a missing admission:
+
+- **D9480's mixed map** (5): one store node `mm["k"] = id` in `fill` lands as an id of `{id}` in
+  the instance for a map holding only generics, and as `id@i32`'s closure in the instance for a map
+  that holds a non-generic `inc` (its value type is closed, so a generic written there is
+  instanced, by design). The tag decision is per node, so it refuses the set for both. It needs a
+  per-instance rep for one node (the per-instance mint; `fnCloCoerceSetAt` gives up at -2 for the
+  same reason). Controls: a map holding `inc` and written `id`, directly or through `fill`, called
+  at two types, is a check reject at both spellings, as the design says.
+- **The map-of-records holder kind** (3, and D15493's gain): the tag side and the rep stamp are done
+  on `claude/fnd-mrec` (holder kind 8, a `null`-check and a void-tail holder arm, the record
+  literal written into a map slot or through a parameter, `fnTagRepTyIn` stamping a map's record
+  value with ids, mono's hole pin reading that stamp). It is blocked on emit's record-row
+  interning: a literal built inside a callee and written through a parameter into a holder of
+  id-records lands at a second `struct {mut i32}` row beside the map's own, so the one-generic
+  spellings are invalid wasm on the branch. Two different generics in one map of records still
+  refuse loudly there.
+
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
 not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
@@ -2154,6 +2180,23 @@ Over the same population:
 The 14 are the callees of desugared optional calls (`m["k"]?.f(2)`), minted after `elabRun`; S2
 shows they decline harmlessly. The one "several" is a list reached through an alias and called in a
 callback (`closures/hole-fn-list-reached-through-alias-called-in-callback.vl`).
+
+**The `monoFlow*` rewrite takes its generic from the elaboration** (2026-11-06).
+`monoFlowReadSet` re-points a read only where the elaboration names the same one generic
+(`mfrElabNames`). The value-set walkers no longer choose the generic. They are now only the soundness
+gate: they decide which reads are asked. A node minted after `elabRun`, such as a desugared optional
+call's callee, keeps the walkers' choice. Declining there turns two programs into loud refusals
+(`closures/container-of-generic-flow-reads.vl`, `closures/hole-fn-generic-in-map-called-at-two-types.vl`).
+One program's bytes move with the same output: `closures/hole-fn-list-reached-through-alias-called-in-callback.vl`,
+where the elaboration names several generics and the read is no longer rewritten.
+
+Letting the elaboration also choose the candidates (option B) fails the soundness bar. Over the 7,538
+sweep programs, with the gate "a `const` or unwritten `let` whose slot nothing writes later", 23
+programs move output, lose a run, or build a refusal fixture. The gate still needs three facts:
+- a callee's write into a container handed to it as an argument;
+- the value a copy of a written `let` held when it was copied, which is a flow-sensitive fact the
+  elaboration does not have;
+- per-instance generic results.
 
 #### Next stage, first item: a per-call delivered-rep fact
 
