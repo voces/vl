@@ -1754,9 +1754,10 @@ deleted. Mono pins the `T[]` at the list of ids, and a hole parameter handed a h
 held map (`monoPinHoleParam`), spellings no elaboration key uses: a held rep is a storage rep, and
 keying the run at it makes the instance's re-check refuse the helper's own store. So the call's own
 set-bound instance answers such a pin instead (`elabPinsUnheld`, `elabCkHeldUsable`): late demands
-fell from 7 to 1. The one left, `use` in `closures/listed-hole-fn-escaping-list.vl`, is a
-closure-list pin with no held stamp. One helper instance serves holders of different sets, since a
-tagged id is its member's declaration index in every set.
+fell from 7 to 1 running program; the two refusing fixtures that guard a helper shared by maps of
+different sets count one each. The one left, `use` in `closures/listed-hole-fn-escaping-list.vl`,
+is the closure-list rep of D15010, which mono should read from the elaboration. One helper instance
+serves holders of different sets, since a tagged id is its member's declaration index in every set.
 
 G2's write through a parameter (D15492) lands in the caller's map with its set; what refused it
 was the store into the parameter's slot, which the tag rule now takes when every call hands a
@@ -1768,7 +1769,8 @@ fixture, whose map holding a non-generic keeps the set untagged, 3 written as a 
 `closures/hole-fn-generic-map-stored-through-parameter.vl`, whose `{id}` set three maps keep on
 mono, each alone: `c`, written only directly (served since D15532); `b`, a map of records
 a helper widens to two generics (D15493); and `h`, a map of functions a helper widens to two
-generics (D15531). They move only when all three are served.
+generics (served since D15531: the helper's write is the member's leaf, `fnTagMapWriteLeavesOf`).
+They move only when `b` is served too.
 
 Two of the 13 are residuals with a named blocker, not a missing admission:
 
@@ -1988,6 +1990,15 @@ refusal found the second on D10311, D10383, D10401 and D14400. Where the elabora
 untagged map whose generic is called at two signatures, mono's one-signature spelling stays: it is
 a rep spelling, not a type, and waits on a holder bundle fact (D15494). Over 19,318 programs with
 fixpoint seeds no byte moves, and 4,601 filed witnesses grade as filed.
+
+**Slot type, record fields** (2026-11-06). `monoPinRecordField`'s 10 mono-only decisions were
+gates in the slot close, not missing facts. An instance's binding now falls back to its
+initialiser's closed type there (`elabNodeTy`), and a member not instanced per call answers from its
+own signature: four now agree. The four D15494-shape decisions (a generic in a field called at two
+types) join its grading list. The last two (`inRecord`: a written `let` of nested lambdas in an
+instance) need a nested member read from its instances under the key; that admits the fact but mints
+late demands for the lambdas, so it waits until the run foresees them. No byte moves over 19,318
+programs.
 
 **Slot deliveries, the reach rung deleted** (2026-11-06). `monoDeclPathPinsOrReach` and
 `monoStoredSlotFnTy` fell back to value reach (`vrCalleeTy`) where the elaboration's slot pins were
