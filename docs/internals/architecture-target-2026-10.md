@@ -1830,6 +1830,23 @@ three functions are deleted. The written `let`'s seed signature (`monoSeedCallSi
 programs: in 6 its parameters agree with `elabCallParamBoundTy`, and in 2 neither closes (D15260's
 shape, which runs).
 
+**Node type, first reading** (2026-11-06, the same population, against `elabNodeTyAt` at the
+instance):
+
+| function | path | agree | both decline | mono only | elaboration only | differ |
+|---|---|---|---|---|---|---|
+| `monoArgClosedTyIn` | past a closed caller pin | 4,336 | 210 | 0 | 0 | 4 |
+| `monoArgClosedTyIn` | the caller's pin | 4,163 | 0 | 38,241 | 0 | 11 |
+| `monoCloseRetFnTy` | | 0 | 873 | 28 | 19 | 0 |
+
+- **Switched: past a closed caller pin.** The four differences are one test
+  (`pin-exact-key-set-and-its-map.vl`), where the elaboration's type is the `match` arm's non-null
+  narrowing. It prints the same either way. `pinnedParamTyAt` and `nodeTyInOf` leave `emit_mono`.
+- **Not this family: the caller's pin.** It is `monoArgPinTyIx`, the rep cascade, which belongs to
+  the call-param family.
+- **Not switched: `monoCloseRetFnTy`.** The elaboration declines a returned list of functions (28
+  reads), and it closes 19 calls mono leaves open.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
