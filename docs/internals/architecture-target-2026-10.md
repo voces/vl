@@ -1925,6 +1925,27 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
 - [x] **instance result** (10): ~~`monoRetRecordOf` 8,023~~, ~~`monoRetRepOf` 7,745~~, ~~`monoPinCallRecord` 6,765~~, ~~`monoPinInPlaceCallRecord` 6,763~~, ~~`monoReturnedBundlePin` 6,538~~, `monoPinnedRetAnnTy` 505 (switched, #6511), ~~`monoCallInstRetTy` 205~~, ~~`monoRetConstRecord` 66~~, ~~`monoInstRetLitTy` 34~~, ~~`monoInstAnnRetTy` 26~~. #6498 deleted the record-pin four, #6511 the instance-literal pair, and the delivered-rep fact the rest (below).
 - [ ] **walk type** (33): `monoExprRebuild` 7,470, `monoPinRetype` 7,368, `monoPinnedTyOf` 6,521, `monoElseRemainderAt` 6,167, `monoPinFnValueTy` 4,955, `monoPinRecvName` 3,289, `monoPinRecvLit` 3,162, `monoPinCoalJoin` 2,708, `monoIfChainRebuildPinned` 2,654, ~~`monoIfArmsAllTy` 2,641~~, ~~`monoHoleJoinPinsString` 2,368~~, `monoPinMemberCall` 1,241, `monoLamPinRetAnn` 1,112, `monoNumUnionOpPin` 788, `monoPinCoalListDefault` 781, `monoHoleNodeTy` 686, ~~`monoArmTailIsTy` 643~~, `monoLamCallTy` 522, `monoHoleCoalUnion` 321, `monoHoleTy` 252, `monoNumOperandPinTy` 241, `monoPinArmSubst` 124, ~~`monoIfArmsPinJoin` 86~~, `monoChainPinnedTys` 74, `monoHoleJoinDropsArm` 72, `monoTpJoinObjTy` 54, `monoSubstIsExpr` 53, `monoHoleBindingOf` 24, ~~`monoHoleJoinPinTy` 11~~, `monoArmPinnedTy` 5, ~~`monoHoleJoinHasAtomArm` 1~~, `monoNumUnionCompoundPin` 1, ~~`monoArmPinsLitUnion` 0~~.
+  The hub is `monoPinnedTyOf`: the recorded type substituted at the binding, which most of the
+  family reads. Shadowed against the elaboration's closed type at the instance (`elabWalkNarrowedTy`,
+  else `elabWalkTy`) over 23,384 programs, 6,163 reaching a node whose recorded type names a
+  variable (per program, answer and node kind): agree 4,487, differ 58, mono only 151, elaboration
+  only 6,855, neither 1,413. Graded by output: taking the elaboration's answer in every differ cell
+  leaves 45 of 46 programs printing the same, and the one that moves is
+  `generics/filled-string-literal-typed-by-literal-union-destination.vl`, where mono's `i32[]` for a
+  `(1 | 2 | 7)[]` list works around [D3540](inventory/D3540.md) (a numeric literal union is its base
+  only in a field slot, D611). Switched: where mono's pin closes, the elaboration answers, except
+  that list. Against a master fixpoint over 19,316 programs, 2 byte movers
+  (`closures/hole-fn-generic-map-handed-two-maps.vl`,
+  `functions/hole-param-lambda-open-map-result-pinned-by-callee.vl`), both printing master's output.
+  The mono-only cells stay with the lambda-sig family: dropping mono's answer there leaves 53 of 59
+  programs printing the same, and the other 6 already refuse and change only their message
+  (`closures/listed-hole-fn-written-param-reject.vl`, `closures/listed-hole-fn-escaping-list-reject.vl`,
+  D15010, D15011, D15483, D1666). The elaboration-only cells are mono's decision not to retype.
+  The rebuild helpers (`monoExprRebuild`, `monoPinRetype`, `monoPinFnValueTy`, `monoPinRecvName`,
+  `monoPinRecvLit`, `monoPinCoalJoin`, `monoPinCoalListDefault`, `monoTpJoinObjTy`,
+  `monoIfChainRebuildPinned`, `monoNumUnionOpPin`, `monoNumUnionCompoundPin`, `monoPinMemberCall`,
+  `monoSubstIsExpr`, `monoHoleCoalUnion`) remake syntax and consume a type: class (c) once their
+  type reads the elaboration, which through the hub it now does where the pin closes.
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
   The type an uncalled slot holds its functions at is the elaboration's (`elabUncalledSlotTy`,
