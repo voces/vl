@@ -1713,7 +1713,13 @@ pins it splits them:
 | G5, a set nothing calls through | 5 | 4 | never tried: the closure rep by design | the rep cascade's default |
 
 G5 is a default, like bucket 2, not a missing fact. G1 closed with D15490 (S1), which leaves 42
-parameters in 18 programs. `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and
+parameters in 18 programs. S2 (D15491) tags a list whose helper pushes one of its own elements back
+onto it, by a hole parameter or by `T` beside `T[]`. `monoPinnedListElemPin` answers 5 calls in the
+whole population: S2 moves 2 onto the tagged set, 2 are the method spellings `v.insert(0, v[1])` and
+`v.fill(v[1])`, whose `Member` callee the tag rule does not resolve, and 1 already agrees with the
+elaboration. Those are what is left before it can be deleted. Its price is one late demand in each
+of two files: mono pins the `T[]` at the list of ids, a spelling no elaboration key uses, so `put`
+at that binding is minted after the run. Foreseeing it means keying `T[]` at the id list's rep. `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and
 `monoChoiceArmFlowTy`) pinned 33 parameters on master: G1's 7, and 26 whose instance already
 agrees with the elaboration's. It is the next deletion, graded by a three-outcome shadow at the
 function.
