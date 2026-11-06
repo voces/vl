@@ -1770,7 +1770,8 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   instanced, by design). The tag decision is per node, so it refuses the set for both. It needs a
   per-instance rep for one node (the per-instance mint; `fnCloCoerceSetAt` gives up at -2 for the
   same reason). Controls: a map holding `inc` and written `id`, directly or through `fill`, called
-  at two types, is a check reject at both spellings, as the design says.
+  at two types, is a check reject at both spellings, as the design says. The per-instance mint's
+  population was measured over the same programs: `fnCloCoerceSetAt`'s -2 had 0 hits.
 - **The map-of-records holder kind** (3, and D15493's gain): the tag side and the rep stamp are done
   on `claude/fnd-mrec` (holder kind 8, a `null`-check and a void-tail holder arm, the record
   literal written into a map slot or through a parameter, `fnTagRepTyIn` stamping a map's record
@@ -1790,7 +1791,9 @@ about 600 are new-only and 22,518 decline on both sides. The byte sweep moves 4 
   `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
   `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
   named fallback, a defaulting rule rather than a missing fact. The elaboration should own the
-  default eventually, but not in this change.
+  default eventually, but not in this change. After the two `nokey-gen` key fixes below, the 2 `nokey-gen`
+  parameters remain, both this default: `id` called inside a lambda forwarder no call instances
+  (`generics/mono-lambda-forwarder-uninstantiated.vl:49` and `:54`), which mono pins at `i32`.
 - **A call inside a body mono cloned** (12 `noframe`), which the walk top does not index:
   `len$m…$2` in `generics/typaram-list-union-param-forwards-to-generic.vl`, `inc3$1` in
   `closures/hole-fn-record-field-called-at-other-param.vl`. Closed by #6515: mono's closed-pin
@@ -1800,6 +1803,16 @@ about 600 are new-only and 22,518 decline on both sides. The byte sweep moves 4 
   instance key; its checked type is the fact.
 - **A generic call with no key** (22 `nokey-gen` with no source): module UFCS imports (`$m`) and
   `[]=` index operators. Unowned.
+
+**`nokey-gen` is the unbound default alone** (2026-11-06). Of its 22 parameters on master, 20 were
+a call node mono made that never pointed back at the call the elaboration keyed:
+- 14 were a UFCS member call that `monoPinMemberCall` lowers to a direct call. The lowered call now
+  reads the member call's bind row (`monoNoteCallTpl`).
+- 6 were a free `"[]="` operator's dispatch call, which records its assignment through `drwOpCall`
+  since #6522.
+
+Instance shadow: `nokey-gen` 22 → 2, 0 new REAL. Fixpoint seeds over 19,318 programs
+(`tests/cases` and the distilled corpus, `std/idtable-*` among them): 0 bytes move.
 
 Mono declines 1,969 calls (573 programs). For 662 of their parameters (183 programs) the
 elaboration closes the type anyway (`eo:yes`). Those are the decline set, and the switch keeps them
