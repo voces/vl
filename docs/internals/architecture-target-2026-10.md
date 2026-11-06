@@ -1578,6 +1578,38 @@ Mono declines 1,969 calls (573 programs). For 662 of their parameters (183 progr
 elaboration closes the type anyway (`eo:yes`). Those are the decline set, and the switch keeps them
 declining.
 
+**The ladder already reads the elaboration first** (2026-11-06, master `96d805081`). A coverage
+probe over `monoInstantiateCallIn`'s rungs labelled each of 37,711 pins in 8,682 programs with the
+rung that produced it. The heavy rungs are reads of the elaboration, spelled as mono keys the
+answer:
+
+| rung | pins |
+|---|---|
+| `monoElabPin` of the walk-top answer | 10,346 |
+| `monoPinOfClosedTy` | 1,816 |
+| `monoRecordRowPin` | 1,251 |
+| the tagged set | 2,077 |
+| the bundle rungs | about 300 |
+| the annotation and composite pushes | about 18,000 |
+
+Every rung has hits, so deleting rungs at zero hits deletes nothing. The mono-derived rungs
+(`monoArgPinName`'s rep cascade, `monoPinnedListElemPin`, `monoHoleGenFnPin`, and the first-use
+type-parameter binding behind the bare and composite pushes) fire only for parameters the order
+above leaves unanswered. The alignment is done, and what is left is that fallback tail.
+
+The tail is closed by four things:
+- function-value identity in the type (`Fn#d`, D15298), for the 72 generic function values fixed
+  past the call;
+- an elaboration-owned default for an unbound type parameter (72);
+- the 16 calls in cloned bodies and through values;
+- anything a wider population finds.
+
+Widened to every call `monoInstantiateCallIn` instances, not only `monoWalkIdentCall`'s, the
+shadow adds 31 calls: 26 agree, and one is a call through a value. No new class appears. The
+consolidation of the spelling rungs into one function is a pure refactor, graded by a
+byte-identical seed and corpus. It ends the tail in a loud refusal, "no elaboration answer for this
+parameter's instance (§3.4 fallback)", which no corpus program reaches.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
