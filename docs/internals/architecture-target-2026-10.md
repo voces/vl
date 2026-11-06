@@ -1452,6 +1452,25 @@ no elaboration answer: `closures/generic-fn-value-returned-through-identity-hole
 past the call, by calls through the result, which only the flow table carries. The switch to the
 elaboration's answer waits for those four, so it lands with the derivation's deletion and not beside it.
 
+**Shadow of `monoCloneGenericCalls`' recorded type** (2026-11-06, master `361a98fd`, parked). A node
+the instance body clone re-makes records `monoCgcTplTy(ix)`: the template's checker type with the
+instance's holes read in. That was compared against `elabTyIn(ix, ek)`, with `ek` the elaboration
+key `monoMakeInstanceGo` builds under, over 19,316 programs. 1,214 reach the arm. Counted by programs
+showing each class at least once:
+
+- 952 agree;
+- 282 open: the old type names a type variable that a later pin substitutes, so they are not graded;
+- 21 differ: i32/f64 in 10, string against a number in 4, an `<error>` template type in 6 (the
+  elaboration has the instance's type, e.g. the recursive call in
+  `generics/recursion-at-same-type-runs.vl`), and boolean/f64 in 1;
+- 488 old-only. 448 of them are `elabTyIn`'s own -2, "the emitter retyped this node since", and 40
+  have no entry;
+- 243 new-only: the template node records no type and the elaboration does, mostly function lists
+  and nullable function values. Switching would type nodes mono leaves untyped today.
+
+The 448 retyped cells are not a missing fact. The elaboration knows the emitter retyped the node, so
+the open question is which pass owns the node's type. Order the passes before switching this arm.
+
 **Shadow of `monoWalkIdentCall`** (the instance a generic call is pointed at), re-measured on
 2026-11-06, master `611070b80`, with `scripts/inst-shadow/run.sh` over 23,380 programs: `tests/cases`,
 the distilled cells and named sets, and every filed witness. 8,678 of them make such a call. Mono's
