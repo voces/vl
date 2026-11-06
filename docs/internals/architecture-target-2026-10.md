@@ -1340,14 +1340,19 @@ movers that keying by rep could not close.
   frame and the callback specialization (`instKeyCanon`). The body is still elaborated at mono's
   demanded key, which is rep-consistent. Measured over `tests/cases` with fixpoint seeds: 8,450 of
   11,271 call-made instances, 76 programs' bytes move and 0 programs' outputs.
-- **The value half** keeps mono's key (`monoElabSplitKey`) and `elabDemand` until the slot-delivery
-  reader (`elabSlotDeliveries`, `elabSlotSetCalls`) answers every delivery: 2,821 instances of 1,669
-  functions. Its typed-slot rule is `elabMemberKeyAt(decl, T)` with `T` the type the checker
-  recorded for the slot, never mono's pins. A lambda inherits its enclosing instance's key; an index
-  by (enclosing key, lambda declaration) is measured after the switch.
+- **The value half** keys an instance of a function delivered as a value, call and value alike,
+  by the elaboration's key for it (`instKeyValueTime`: the call's key, else the value's, else the
+  typed slot's), plus the same rep, frame and specialization components. Its typed-slot rule is
+  `elabMemberKeyAt(decl, T)` with `T` the type the checker recorded for the slot, never mono's pins.
+  Measured over `tests/cases` with fixpoint seeds: 0 programs' bytes move. An instance the
+  elaboration has no key for keeps mono's spelling.
 
-`emit_mono.vl`'s function count is flat at this step: `monoElabSplitKey` still serves the value
-half, and its deletion is what the value half's switch earns.
+`monoElabSplitKey` is not yet deletable. Besides spelling the keys of instances with no
+elaboration key, it guards the typed fallback (`monoTypedKeys`), which reuses an instance by its
+pinned types: without the guard, a type-testing body instanced at one rep for two types (a `Set`
+and its map twin, D10540; the `flat-generic-rows-*` and `i32-keyed-function-type-parameter`
+fixtures) is reused across both and 5 programs print wrong. Its deletion needs that guard read
+from the elaboration's key instead.
 
 **A lambda's instance is keyed by the instance it is nested in** (2026-11-06): the walk top
 (`elabWalkTop`), the declaration, and the rep and tagged set of each pin. Measured against the
