@@ -33,6 +33,7 @@ import {
   elabDeclIsValue,
   elabIsParamRead,
   elabLamDeliveredParams,
+  elabLamParamTy,
   elabLitSlotCallTys,
   elabParamReadOtherThanCalled,
   elabSlotAnnRets,
@@ -4482,28 +4483,14 @@ function monoLamParamPinAnn(
     if pty < 0 || !tyHasTyVar(pty) { return -1 }
     let st = monoSubstInst(pty, bN, bT)
     // A type variable of another declaration (the generic initializing the binding) is
-    // pinned by the calls the lambda's value reaches in this instance (D7181).
-    if st >= 0 && tyHasTyVar(st) { st = monoLamReachParamTy(fnIx, pi, bN, bT) }
+    // pinned by the elaboration's typing of the lambda in this instance (D7181).
+    if st >= 0 && tyHasTyVar(st) {
+      st = elabLamParamTy(fnIx, pi, lt.fnParamTypes.length)
+    }
     if st < 0 || tyHasTyVar(st) { return -1 }
     const nm = monoPinAnnSpelling(st)
     if nm == "" { return -1 }
     return synthTypeRefTy(nm, -1, st)
-  }
-  -1
-}
-
-// Parameter `pi`'s type, or with `pi` -1 the result's, in the one call type lambda `fnIx`'s
-// value reaches at instance binding `bN`/`bT` (`vrCalleeTy`); -1 when it reaches no one type.
-function monoLamReachParamTy(fnIx: i32, pi: i32, bN: string[], bT: i32[]): i32 {
-  if !vrIndexed(fnIx) { return -1 }
-  const ct = vrCalleeTy(fnIx, "", bN)
-  if ct < 0 || ct >= T.tys.length { return -1 }
-  const f = tyAt(ct)
-  if f is TyFunc {
-    if pi < 0 { return monoSubstInst(f.fnRet, bN, bT) }
-    if pi < f.fnParamTypes.length {
-      return monoSubstInst(f.fnParamTypes[pi], bN, bT)
-    }
   }
   -1
 }
@@ -6396,29 +6383,6 @@ function monoLamCallTy(ix: i32, t: i32): i32 {
   st
 }
 
-// Whether lambda `fnIx`, bound by a `const` of the instance body that only calls it directly,
-// returns a hole parameter of the instance or a field chain off one, which its env stores at
-// the pin. Any other lambda keeps its inferred return: a value read of its binding, or a call
-// from inside another lambda, sees the template's signature (D2878).
-function monoRetReadsHoleParam(rex: i32, fnIx: i32): boolean {
-  if rex < 0 || !i32ListHas(monoCgcLamDeclX, fnIx) { return false }
-  let at = unwrapParen(rex)
-  let hops = 0
-  while at >= 0 && hops < 16 {
-    const n = nodeAt(at)
-    if n is Member {
-      at = unwrapParen(n.memObj)
-    } else if n is Ident {
-      if monoFnBindsParam(fnIx, n.identName) { return false }
-      return monoStrListHas(monoCgcHoleParams, n.identName)
-    } else {
-      return false
-    }
-    hops = hops + 1
-  }
-  false
-}
-
 // The lambdas the instance body binds by an un-annotated `const`, once, and reads only as the
 // callee of a direct call outside any lambda (`monoCollectLamDecls`).
 let monoCgcLamDeclX: i32[] = []
@@ -6477,9 +6441,6 @@ function monoNameOnlyCalled(ix: i32, name: string, inLam: boolean): boolean {
   true
 }
 
-// The instance's un-annotated parameter names, beside `monoCgcHoleN`.
-let monoCgcHoleParams: string[] = []
-
 // `t` with the instance's holes substituted, when it still names a variable; `t` otherwise.
 function monoHoleTy(t: i32): i32 {
   if t < 0 || !tyHasTyVar(t) || monoCgcHoleN.length == 0 { return t }
@@ -6491,25 +6452,6 @@ function monoHoleTy(t: i32): i32 {
 function monoHoleNodeTy(ix: i32, t: i32): i32 {
   const e = elabWalkTy(ix)
   if e >= 0 { e } else { monoHoleTy(t) }
-}
-
-// The names of the un-annotated parameters in `params` that `body` binds nowhere again.
-function monoHoleParamNames(params: i32[], body: i32): string[] {
-  const bn: string[] = []
-  const bc: i32[] = []
-  monoBinderCounts(body, bn, bc)
-  const out: string[] = []
-  let i = 0
-  while i < params.length {
-    const pp = nodeAt(params[i])
-    if pp is Param {
-      if pp.parType < 0 && monoBinderCount(bn, bc, pp.parName) == 0 {
-        out.push(pp.parName)
-      }
-    }
-    i = i + 1
-  }
-  out
 }
 
 // Binds, into `hN`/`hT`, each hole parameter of the generic at `origFe` to its column in
@@ -6730,18 +6672,21 @@ function monoInstLamNames(body: i32): string[] {
   out
 }
 
-// Whether lambda `li`'s type names a type variable, its result is not a function (a call of a
-// returned function is typed by no copy) and its return is pinned at the holes, so a copied
-// call's type is the rep the lambda returns (`monoRetReadsHoleParam`).
+// Whether lambda `li`, bound by a `const` the instance only calls directly, has a template return
+// naming a type variable that the elaboration types closed, and not a function, in this instance,
+// so a copied call's type is the rep the lambda returns. A value read of the binding sees the
+// template's signature (D2878).
 function monoLamTyNamesHoleValue(li: i32): boolean {
   const t = nodeTyIxOf(li)
   if t < 0 || !tyHasTyVar(t) { return false }
-  const rex = fnRetExprOf(li)
-  if rex < 0 || !monoRetReadsHoleParam(rex, li) { return false }
+  if !i32ListHas(monoCgcLamDeclX, li) { return false }
   const ft = tyAt(t)
-  if ft is TyFunc {
-    if ft.fnRet < 0 { return false }
-    return !(tyAt(ft.fnRet) is TyFunc)
+  if !(ft is TyFunc) || ft.fnRet < 0 || !tyHasTyVar(ft.fnRet) { return false }
+  const e = elabWalkTy(li)
+  if e < 0 || e >= T.tys.length { return false }
+  const ef = tyAt(e)
+  if ef is TyFunc {
+    return ef.fnRet >= 0 && !tyHasTyVar(ef.fnRet) && !(tyAt(ef.fnRet) is TyFunc)
   }
   false
 }
@@ -10170,7 +10115,6 @@ function monoMakeInstanceBodyRewrite(
   monoCgcLamDeclX = []
   monoCgcHoleN = []
   monoCgcHoleT = []
-  monoCgcHoleParams = []
   monoCgcBN = []
   monoCgcBT = []
   monoCgcTyParams = []
@@ -10654,17 +10598,10 @@ function monoInstanceCount(origFe: i32): i32 {
   count
 }
 
-// Hands the body clone the instance's hole binding `holeN`/`holeT` in `monoCgcHoleN`/`monoCgcHoleT`
-// and names its un-annotated parameters in `monoCgcHoleParams`.
-function monoMakeInstanceHoles(
-  holeN: string[],
-  holeT: i32[],
-  params: i32[],
-  body: i32,
-) {
+// Hands the body clone the instance's hole binding `holeN`/`holeT` in `monoCgcHoleN`/`monoCgcHoleT`.
+function monoMakeInstanceHoles(holeN: string[], holeT: i32[]) {
   monoCgcHoleN = holeN
   monoCgcHoleT = holeT
-  monoCgcHoleParams = monoHoleParamNames(params, body)
   0
 }
 
@@ -11324,7 +11261,7 @@ function monoMakeInstanceGo(
     // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
     // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
     // no such annotation.
-    monoMakeInstanceHoles(holeN, holeT, params, fn.fnBody)
+    monoMakeInstanceHoles(holeN, holeT)
     const instBody0L = monoMakeInstanceBodyPinned(
       fn,
       origFe,
