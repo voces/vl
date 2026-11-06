@@ -1499,6 +1499,33 @@ elaboration fact that should carry the same answer: `monoWalkIdentCall`'s instan
 `monoIfChainRebuild`, `monoPinBodyLambdasRaw` (D1990), `monoCloneGenericCalls` (D2849, two arms),
 `monoCloneLambdaSubst` (two arms, D943 and seven more), `monoPinLamFromCheckedTy` (D3820, D3834).
 
+**Three of the queue close without a switch (2026-11-06).**
+- `monoNarrowedNominalPinName` is DECISIONS.md's rung 2 (D25, "Which channel owns a NARROWED
+  argument's type at a monomorphization pin"). It reads the argument's checked type, or
+  `elabClosedTyAt` inside a generic body, and pins the narrowed name where that type is a member of
+  the annotation's union. Shadowed against the elaboration's binding of the type parameter at the
+  call (`elabCallBindTy`, the call found through the write index's argument edge), over the 23,103
+  programs (5,203 reach it):
+
+  | outcome | events |
+  | --- | --- |
+  | both answer, agree | 28 |
+  | both answer, differ | 4 |
+  | old only | 0 |
+  | new only | 10,021 |
+  | neither | 5,816 |
+
+  The 4 that differ pin `Circle` where the elaboration binds the whole union
+  (`soundness/nulvariant-generic-pin.vl`, `std/array-reduce-narrowed-variant-init.vl`). That is the
+  ruling: the pin narrows below the binding. The new-only cells are calls the rung leaves to the
+  ladder. No elaboration fact carries the narrowed pin, so it stays.
+- `monoIfChainRebuild` computes no pin. It rebuilds a rewritten `else if` chain, and its one
+  decision arm gives each rebuilt link its original's checked type. Its per-instance twin
+  `monoIfChainRebuildPinned` is the one with pin logic.
+- `monoMakeInstanceGo`'s instance note is the instance key, already the elaboration's ("The call
+  half and the value half" below). The only spelling left is an instance the elaboration has no key
+  for, and the 4 bundle members that section names.
+
 **Shadow of `monoHoleGenFnPin`** (the signature a generic handed to a hole parameter takes), against
 `callArgRepTy` over `elabCallParamTy` at `monoPinHoleParam`: 83 programs agree, 0 disagree, and 4 get
 no elaboration answer: `closures/generic-fn-value-returned-through-identity-hole.vl`,
