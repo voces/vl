@@ -2340,6 +2340,21 @@ the column at all 40 sites a rep reaches. They stay on it: 157 of their queries 
 reach row (124 the elaboration never reached, the rest reached only from another instance), where
 the rep is the type and the column has nothing to answer.
 
+**The bundle pins read the fact** (2026-11-06). `monoBundlePin` takes the record a bundle argument
+is delivered at from `elabCallArgRep`, and `monoClosureBundlePin` takes the closure, in place of
+minting either from the signatures; `monoCallsHandGenerics` is deleted, its gate now the
+elaboration's (`elabCloBundleRep`). One minter, `bundleRecordTyOf`, serves both. The fact was wrong
+at one slot first: a lambda calling its own parameter at two or more signatures (`use(lap)` in
+`closures/lambda-bundle-through-hole-param-at-several-signatures.vl`) is one closure taking their
+bundle, not a bundle record, and it now records the closure whatever the callee's own signature
+count. Shadowed over 23,103 programs: 295 bundle sites and 12 closure sites agree, none differs or
+is new-only.
+
+`monoBundleTys` and emit_bundle's `bundleTys` and `bundleRecs` still answer "is this type a bundle".
+A type-shaped answer from the fact agrees at 586 of 587 reads and is wrong at the other:
+`closures/hole-lambda-bundle-positions.vl` writes `type B = { c0: …, c1: … }` by hand, a bundle's
+shape that keeps its own fields. Their replacement has to ask per call, not per type.
+
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
 a record built wider, which is why 34 of the 74 pairs close under `callArgRepTy`. Each remaining kind
