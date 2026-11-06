@@ -104,6 +104,8 @@ import {
   CW_UP_TAIL,
   cwBindingOf,
   cwBindingWrittenValues,
+  cwCalleeArgOff,
+  cwCalleeDeclOf,
   cwFnCalls,
   cwFnValueDeclOf,
   cwFrameOfDecl,
@@ -118,6 +120,7 @@ import {
   cwKeyOfDecl,
   cwLetUnwritten,
   cwLetWrittenInClosure,
+  cwMethodCalls,
   cwOccNext,
   cwOccWalk,
   cwPathFnTargets,
@@ -128,6 +131,7 @@ import {
   cwSlotWrittenValues,
   cwSpreadPeers,
   cwUseInOtherFrame,
+  declFirstParamIsSelf,
   fnDeclIx,
 } from "./check_write_scan"
 import { declIsExportedFn } from "./check_exp_obs"
@@ -11917,6 +11921,15 @@ function elabRetCalls(f: i32, calls: i32[]) {
     i = i - 1
   }
   cwFnCalls(f, calls)
+  // A `self` function is also called by its UFCS spelling (`x.f()`), as the checker picked it.
+  const fn = nodeAt(f)
+  if fn is FuncDecl && fn.fnName != "" && declFirstParamIsSelf(fn.fnName) {
+    const ms: i32[] = []
+    cwMethodCalls(f, ms)
+    for c in ms {
+      if nodeAt(c) is Call && !i32ListHas(calls, c) { calls.push(c) }
+    }
+  }
   0
 }
 let elabGenericByValue = false
@@ -12376,7 +12389,12 @@ function elabLitCallResultTy(c: i32): i32 {
   if rt >= 0 && rt < T.tys.length && !tyHasTyVar(rt) { return widenLitTy(rt) }
   const ct = nodeTyIxOf(c)
   if ct >= 0 && ct < T.tys.length && !tyHasTyVar(ct) { return widenLitTy(ct) }
-  if ct < 0 || ct >= T.tys.length || !(tyAt(ct) is TyFunc) || elabSlotCallResultDepth > 1 {
+  if (
+    ct < 0
+    || ct >= T.tys.length
+    || !(tyAt(ct) is TyFunc)
+    || elabSlotCallResultDepth > 1
+  ) {
     return -1
   }
   elabSlotCallResultDepth = elabSlotCallResultDepth + 1
@@ -12399,12 +12417,25 @@ let elabSlotCallResultDepth = 0
 // naming a function declaration is pushed as -1 onto `tys`, with that declaration at the same
 // position of `fas` (-1 elsewhere); false where two calls disagree, or an open argument is not one.
 function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
+  const none: string[] = []
+  elabSlotCallTysOpenFns(d, none, tys, fas)
+}
+
+// `elabValueCallTysOpenFns` over the calls slot `path` of `d` reaches.
+function elabSlotCallTysOpenFns(
+  d: i32,
+  path: string[],
+  tys: i32[],
+  fas: i32[],
+): boolean {
   elabSlotCallRet = -1
   elabCallSink = []
   elabCallSinkOn = true
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const anon = dn is FuncDecl && dn.fnName.length > 9 && dn.fnName.slice(0, 9) == "__lambda_"
-  if (dn is Call || anon) && d < cwIxCoveredLen() {
+  const anon = dn is FuncDecl
+    && dn.fnName.length > 9
+    && dn.fnName.slice(0, 9) == "__lambda_"
+  if (dn is Call || anon) && d < cwIxCoveredLen() && path.length == 0 {
     // A value a call hands back, or a lambda, is climbed from its node, under every instance.
     const out: i32[] = []
     const seen: i32[] = []
@@ -12416,7 +12447,7 @@ function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
     elabDlvKey = was
     elabDlvAdmit = wasAdmit
   } else {
-    elabSlotDeliveries(d, [], -1)
+    elabSlotDeliveries(d, path, -1)
   }
   elabCallSinkOn = false
   const hits = elabCallSink
@@ -12455,11 +12486,8 @@ function elabValueCallTysOpenFns(d: i32, tys: i32[], fas: i32[]): boolean {
       }
       if have && k != key { return false }
       const rc = elabLitCallResultTy(c)
-      if !have {
-        ret = rc
-      } else if ret >= 0 && (rc < 0 || !tySame(rc, ret)) {
-        ret = -1
-      }
+      if !have { ret = rc }
+      else if ret >= 0 && (rc < 0 || !tySame(rc, ret)) { ret = -1 }
       while tys.length > 0 { tys.pop() }
       while fas.length > 0 { fas.pop() }
       for t in tup { tys.push(t) }
@@ -12495,6 +12523,86 @@ function elabCloseFnArgs(v: i32, tys: i32[], fas: i32[]): boolean {
   true
 }
 
+// Pushes onto `vals` the values list `src` holds when it names a binding the index covers whose
+// every occurrence is its list literal initialiser, a `push` onto it, or a read; false otherwise.
+function elabSpreadValuesInto(src: i32, vals: i32[]): boolean {
+  const s0 = parenPeelIx(src)
+  if s0 < 0 || s0 >= P.nodes.length || !(nodeAt(s0) is Ident) { return false }
+  const b = cwBindingOf(s0)
+  if b < 0 || b >= P.nodes.length || !(nodeAt(b) is LetDecl) { return false }
+  elabListHeldValuesInto(b, vals, 0)
+}
+
+// `elabSpreadValuesInto` for binding `b`, a `let` or, `depth` calls in, a declared function's
+// parameter the list is handed to.
+function elabListHeldValuesInto(b: i32, vals: i32[], depth: i32): boolean {
+  if depth > 2 { return false }
+  const ow = cwOccWalk(b)
+  while cwOccNext(ow) {
+    const k = cwIxKind[ow.row]
+    const u = cwIxNode[ow.row]
+    const un = nodeAt(u)
+    if k == CW_OCC_BIND && un is Param {
+      // A parameter's own declaration holds nothing until a call hands it a list.
+    } else if k == CW_OCC_BIND && un is LetDecl {
+      const init = if un.letInit >= 0 { nodeAt(parenPeelIx(un.letInit)) } else { null }
+      if !(init is ArrayLit) { return false }
+      for e in init.arrElems {
+        if nodeAt(e) is Spread { return false }
+        vals.push(e)
+      }
+    } else if k == CW_OCC_USE {
+      const m = elabPlaceUp(u)
+      const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+      const c = elabPlaceUp(m)
+      const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+      if mn is Member && mn.memProp == "push" && cn is Call && cn.callFn == m {
+        for a in cn.callArgs { vals.push(a) }
+      } else if mn is Call && mn.callFn != u {
+        // Handed to a declared function, the list also holds what that parameter is given.
+        const fd = cwCalleeDeclOf(mn.callFn)
+        const fdn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+        const ai = i32ListIndexOf(mn.callArgs, u) + cwCalleeArgOff(mn.callFn)
+        if !(fdn is FuncDecl) || ai < 0 || ai >= fdn.fnParams.length {
+          return false
+        }
+        if !elabListHeldValuesInto(fdn.fnParams[ai], vals, depth + 1) {
+          return false
+        }
+      } else if (
+        mn is Spread
+        || (mn is Member && mn.memProp == "length" && !(cn is Call))
+      ) {
+        // A copy or a length read leaves the values as they are.
+      } else if mn is Index && parenPeelIx(mn.idxArr) == u {
+        // An element read leaves them as they are; an element write adds its value.
+        const w = elabAssignedValue(m)
+        if w >= 0 { vals.push(w) }
+      } else {
+        return false
+      }
+    } else {
+      return false
+    }
+  }
+  true
+}
+
+// The value assigned to place `x` when it is the left side of a plain `=`, else -1.
+function elabAssignedValue(x: i32): i32 {
+  const p = if x >= 0 && x < cwIxParent.length && cwIxCovers(x) { cwIxParent[x] } else { -1 }
+  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if (
+    pn is BinExpr
+    && pn.binOp == "="
+    && pn.binCompound == ""
+    && parenPeelIx(pn.binLeft) == x
+  ) {
+    return pn.binRight
+  }
+  -1
+}
+
 // Per value of the last `elabLitSlotCallTys`, the one closed result its calls agree on, or -1.
 let elabLitCallRets: i32[] = []
 
@@ -12515,8 +12623,20 @@ export function elabLitSlotCallTys(
   // A literal an instance copied reads its source's values.
   const a0 = if a >= cwIxCoveredLen() { nodeSrc[a] ?? a } else { a }
   const n = if a0 >= 0 && a0 < P.nodes.length { nodeAt(a0) } else { null }
+  // Values a spread copied in are called where the literal's own slot is.
+  let fromSpread = -1
   if n is ArrayLit && step == "e" {
-    for e in n.arrElems { vals.push(e) }
+    for e in n.arrElems {
+      const en = nodeAt(e)
+      if en is Spread {
+        // A spread of a list binding holds the values that binding is built and pushed with.
+        if fromSpread < 0 { fromSpread = vals.length }
+        if !elabSpreadValuesInto(en.spdArg, vals) { return false }
+      } else {
+        if fromSpread >= 0 { return false }
+        vals.push(e)
+      }
+    }
   } else if n is ObjLit {
     for f in n.objFields {
       const fn = nodeAt(f)
@@ -12527,13 +12647,14 @@ export function elabLitSlotCallTys(
   if vals.length == 0 { return false }
   elabLitCallRets = []
   let have = false
+  let vi = 0
   for v in vals {
     if nodeAt(v) is Spread { return false }
     const q: i32[] = []
     const fa: i32[] = []
-    if !elabValueCallTysOpenFns(v, q, fa) || !elabCloseFnArgs(v, q, fa) {
-      return false
-    }
+    const got = if fromSpread >= 0 && vi >= fromSpread { elabSlotCallTysOpenFns(a0, [step], q, fa) } else { elabValueCallTysOpenFns(v, q, fa) }
+    vi = vi + 1
+    if !got || !elabCloseFnArgs(v, q, fa) { return false }
     elabLitCallRets.push(elabSlotCallRet)
     if have {
       if q.length != qs.length { return false }
