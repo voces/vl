@@ -150,14 +150,15 @@ Deno.test({
   },
 });
 
-// A refusal raised while a hole parameter's instance is lowered (D15010): the instance's body is
-// rebuilt into nodes minted after parsing, and the anchor is the line they were rebuilt from,
-// line 6 inside `take`, in the module that declares it (D15155, D15157). The same shapes with
-// `use` generic.
+// A refusal raised while a hole parameter's instance is lowered (D15529, D15010's witness plus a
+// push, since D15010's own spelling runs): the instance's body is rebuilt into nodes minted after
+// parsing, and the anchor is the line they were rebuilt from, line 7 inside `take`, in the module
+// that declares it (D15155, D15157). The same shapes with `use` generic.
 const INSTANCE_WITNESS = `function id<T>(x: T): T { x }
 function use(ys) { print(ys.length) }
 function take(a) {
   const xs = [a]
+  xs.push(a)
   use(xs)
   print(xs[0]("abc").length + xs[0](2))
 }
@@ -207,13 +208,13 @@ Deno.test({
         if (!r.out.includes("emit error")) {
           throw new Error(
             `${s.name}: the instance witness no longer reaches an emit refusal, so this guard ` +
-              `is measuring nothing — replace INSTANCE_WITNESS (D15010 closed?).\n${r.out}`,
+              `is measuring nothing — replace INSTANCE_WITNESS (D15529 closed?).\n${r.out}`,
           );
         }
         const blk = errorBlock(r.out);
-        if (!/at \S*lib\.vl:6:\d+/.test(blk)) {
+        if (!/at \S*lib\.vl:7:\d+/.test(blk)) {
           throw new Error(
-            `${s.name}: want the anchor at lib.vl:6 (the refused read in \`take\`), got:\n${blk}`,
+            `${s.name}: want the anchor at lib.vl:7 (the refused read in \`take\`), got:\n${blk}`,
           );
         }
       } finally {

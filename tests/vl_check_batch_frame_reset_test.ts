@@ -12,7 +12,7 @@ import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 const FIRST =
   `${ROOT}/tests/cases/closures/error-hole-lambda-alias-chain-too-long.vl`;
 const SECOND =
-  `${ROOT}/tests/cases/closures/listed-hole-fn-escaping-list-reject.vl`;
+  `${ROOT}/tests/cases/closures/listed-hole-fn-escaping-list.vl`;
 
 type Rec = { file: string; exit: number; diagnostics: { message: string }[] };
 
