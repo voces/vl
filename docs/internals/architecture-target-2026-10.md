@@ -2171,6 +2171,23 @@ The 14 are the callees of desugared optional calls (`m["k"]?.f(2)`), minted afte
 shows they decline harmlessly. The one "several" is a list reached through an alias and called in a
 callback (`closures/hole-fn-list-reached-through-alias-called-in-callback.vl`).
 
+**The `monoFlow*` rewrite takes its generic from the elaboration** (2026-11-06).
+`monoFlowReadSet` re-points a read only where the elaboration names the same one generic
+(`mfrElabNames`). The value-set walkers no longer choose the generic. They are now only the soundness
+gate: they decide which reads are asked. A node minted after `elabRun`, such as a desugared optional
+call's callee, keeps the walkers' choice. Declining there turns two programs into loud refusals
+(`closures/container-of-generic-flow-reads.vl`, `closures/hole-fn-generic-in-map-called-at-two-types.vl`).
+One program's bytes move with the same output: `closures/hole-fn-list-reached-through-alias-called-in-callback.vl`,
+where the elaboration names several generics and the read is no longer rewritten.
+
+Letting the elaboration also choose the candidates (option B) fails the soundness bar. Over the 7,538
+sweep programs, with the gate "a `const` or unwritten `let` whose slot nothing writes later", 23
+programs move output, lose a run, or build a refusal fixture. The gate still needs three facts:
+- a callee's write into a container handed to it as an argument;
+- the value a copy of a written `let` held when it was copied, which is a flow-sensitive fact the
+  elaboration does not have;
+- per-instance generic results.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
