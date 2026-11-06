@@ -31,6 +31,7 @@ import {
   elabDeclFnOf,
   elabDeclIsValue,
   elabIsParamRead,
+  elabLitSlotCallTys,
   elabParamReadOtherThanCalled,
   elabSlotAnnRets,
   elabSlotDeliveries,
@@ -179,7 +180,6 @@ import {
   TY_NEVER,
   TY_NULL,
   TY_VOID,
-  Ty,
   TyArray,
   TyErr,
   TyFunc,
@@ -18579,61 +18579,59 @@ function monoInertReach(stmts: i32[]) {
 }
 
 // Types each list or record literal whose function element or field the walk left open at the
-// one call type the value reaches (`vrCalleeTy`), so its slot's signature is the one those calls
-// make (D7103).
+// one call type the value reaches (`monoReachSlotTy`), so its slot's signature is the one those
+// calls make (D7103). An element or field already typed at a returned record of members holds it
+// whole (B2).
 function monoReachLitTys() {
   for a in vrLits {
     const at = nodeTyIxOf(a)
-    if at >= 0 && at < T.tys.length {
-      monoReachListTy(a, tyAt(at))
-      monoReachRecTy(a, tyAt(at))
-    }
-  }
-  0
-}
-
-// The list half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a list.
-function monoReachListTy(a: i32, t: Ty) {
-  // An element already typed at a returned record of members holds it whole (B2).
-  if t is TyArray && !monoIsBundleTy(t.aElem) {
-    const ct = monoReachSlotTy(a, t.aElem, "e,")
-    if ct >= 0 { nodeTyRecord(a, mkArrayTy(ct)) }
-  }
-  0
-}
-
-// The record half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a record.
-function monoReachRecTy(a: i32, t: Ty) {
-  if t is TyObj {
-    const fts: i32[] = []
-    let moved = false
-    let i = 0
-    while i < t.objFieldTypes.length {
-      const ft = t.objFieldTypes[i]
-      const ct = if monoIsBundleTy(ft) { -1 } else { monoReachSlotTy(a, ft, "f:" + t.objFieldNames[i] + ",") }
-      if ct >= 0 {
-        fts.push(ct)
-        moved = true
-      } else {
-        fts.push(t.objFieldTypes[i])
+    const t = if at >= 0 && at < T.tys.length { tyAt(at) } else { null }
+    if t is TyArray && !monoIsBundleTy(t.aElem) {
+      const ct = monoReachSlotTy(a, t.aElem, "e")
+      if ct >= 0 { nodeTyRecord(a, mkArrayTy(ct)) }
+    } else if t is TyObj {
+      const fts: i32[] = []
+      let moved = false
+      let i = 0
+      while i < t.objFieldTypes.length {
+        const ft = t.objFieldTypes[i]
+        const ct = if monoIsBundleTy(ft) { -1 } else { monoReachSlotTy(a, ft, "f." + t.objFieldNames[i]) }
+        fts.push(if ct >= 0 { ct } else { ft })
+        if ct >= 0 { moved = true }
+        i = i + 1
       }
-      i = i + 1
+      if moved { nodeTyRecord(a, mkObjTy(t.objFieldNames, fts)) }
     }
-    if moved { nodeTyRecord(a, mkObjTy(t.objFieldNames, fts)) }
   }
   0
 }
 
-// The call type literal `a`'s slot at `path`, of open function type `st`, reaches, recorded on
-// each reached callee still open; -1 when the slot is no such function or reaches no one type.
-// A slot with no type variable keeps its type (-1), and so does one holding a tagged set, the
-// set's one rep.
-function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
+// The call type slot `step` (`e`, `f.<name>`) of literal `a`, of open function type `st`, is
+// pinned at, recorded on each reached callee still open; -1 for a tagged set or no one call type.
+// The climb's agreed tuple (`elabLitSlotCallTys`) answers; value_reach's own type stands where
+// that tuple is missing or its type keeps the enclosing generic's type parameter (§3.4).
+function monoReachSlotTy(a: i32, st: i32, step: string): i32 {
   if st < 0 || st >= T.tys.length || !(tyAt(st) is TyFunc) { return -1 }
   if fnTagTyIsTagged(st) { return -1 }
   if !tyHasTyVar(st) { return -1 }
-  const ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
+  const path = (if step == "e" { "e" } else { "f:" + step.slice(2, step.length) })
+    + ","
+  let ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
   if ct < 0 { return -1 }
+  const qs: i32[] = []
+  const vals: i32[] = []
+  if !tyHasTyVar(ct) && elabLitSlotCallTys(a, step, qs, vals) {
+    let ft = -1
+    for v in vals {
+      const ex = monoOpenFnArgDecl(v)
+      let r = if ex >= 0 { monoFnDeclRetAt(ex, qs) } else { monoFnTyRetAt(nodeTyIxOf(v), qs) }
+      if r < 0 && ex >= 0 { r = elabResultAtParams(ex, qs) }
+      const et = if r >= 0 { mkFuncTy(qs, r) } else { -1 }
+      if et < 0 || (ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft)) { ft = -2 }
+      else if ft != -2 { ft = et }
+    }
+    if ft >= 0 { ct = ft }
+  }
   for c in vrCalls(a, path) {
     if c < 0 || c >= P.nodes.length { continue }
     const cn = nodeAt(c)
