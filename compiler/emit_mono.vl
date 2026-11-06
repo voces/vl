@@ -37,7 +37,6 @@ import {
   elabLitSlotCallRet,
   elabLitSlotCallTys,
   elabNodeTy,
-  elabParamReadOtherThanCalled,
   elabReturnedClosedTy,
   elabSlotAnnRets,
   elabSlotDeliveries,
@@ -631,6 +630,7 @@ import {
 } from "./emit_ty_canon"
 import {
   ELAB_REP_NO_ROW,
+  bundleRecordTyOf,
   ekNames,
   ekTys,
   elabAliasNote,
@@ -673,6 +673,7 @@ import {
   elabNodeTyAgreed,
   elabNodeTyAt,
   elabNodeTys,
+  elabPinIsBundleOf,
   elabResultAtParams,
   elabRetOf,
   elabRetParamOf,
@@ -6010,15 +6011,14 @@ let monoCgcHoleN: string[] = []
 let monoCgcHoleT: i32[] = []
 
 // The type copied call `ix` through a lambda binding answers at this instance: the instance's
-// elaboration at a hole instance, else its recorded type `t` substituted through the binding,
-// then its holes; `t` when a variable stays.
+// elaboration at a hole instance, or where its recorded type `t` is open and the elaboration
+// closes it; `t` otherwise.
 function monoLamCallTy(ix: i32, t: i32): i32 {
   const e = if monoCgcHoleN.length > 0 { elabWalkTy(ix) } else { -1 }
   if e >= 0 { return e }
   if t < 0 || !tyHasTyVar(t) { return t }
-  const st = monoHoleTy(monoSubstInst(t, monoCgcBN, monoCgcBT))
-  if st < 0 || tyHasTyVar(st) { return t }
-  st
+  const w = elabWalkTy(ix)
+  if w >= 0 && w < T.tys.length && !tyHasTyVar(w) { w } else { t }
 }
 
 // The lambdas the instance body binds by an un-annotated `const`, once, and reads only as the
@@ -6079,17 +6079,10 @@ function monoNameOnlyCalled(ix: i32, name: string, inLam: boolean): boolean {
   true
 }
 
-// `t` with the instance's holes substituted, when it still names a variable; `t` otherwise.
-function monoHoleTy(t: i32): i32 {
-  if t < 0 || !tyHasTyVar(t) || monoCgcHoleN.length == 0 { return t }
-  substTyDeep(t, monoCgcHoleN, monoCgcHoleT)
-}
-
-// Node `ix`'s type at the hole instance being built: the elaboration's, else its recorded type `t`
-// through the instance's holes where the elaboration has no instance for the node.
+// Node `ix`'s type at the hole instance being built: the elaboration's, else its recorded type `t`.
 function monoHoleNodeTy(ix: i32, t: i32): i32 {
   const e = elabWalkTy(ix)
-  if e >= 0 { e } else { monoHoleTy(t) }
+  if e >= 0 { e } else { t }
 }
 
 // Binds, into `hN`/`hT`, each hole parameter of the generic at `origFe` to its column in
@@ -15884,7 +15877,7 @@ function monoPinSlotRecords(d: LetDecl, at: i32, ctx: i32): i32 {
         k = k + 1
       }
       if sigs.length >= 2 && k < tys.length {
-        const bt = monoBundleRecordTy(sigs, f.fiValue)
+        const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), sigs, f.fiValue)
         if bt < 0 { return -1 }
         nodeTyRecord(unwrapParen(f.fiValue), bt)
         monoRetypeSlotReads(ctx, at, "f." + f.fiName, bt)
@@ -15914,7 +15907,7 @@ function monoPinSlotRecordList(
 ): i32 {
   const sigs = elabSlotFieldRecord(at, "[]")
   if sigs.length < 2 { return 0 }
-  const bt = monoBundleRecordTy(sigs, lx)
+  const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), sigs, lx)
   if bt < 0 { return -1 }
   const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length { return 0 }
@@ -15934,7 +15927,7 @@ function monoPinSlotRecordMap(d: LetDecl, lx: i32, at: i32, ctx: i32): i32 {
   if sigs.length < 2 || ot < 0 || ot >= T.tys.length { return 0 }
   const om = tyAt(ot)
   if !(om is TyMap) { return 0 }
-  const bt = monoBundleRecordTy(sigs, lx)
+  const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), sigs, lx)
   if bt < 0 { return -1 }
   const mt = mkMapTy(om.mKey, bt, 0)
   const nm = monoPinAnnSpelling(mt)
@@ -16378,10 +16371,21 @@ function monoPinMapValues(d: LetDecl, at: i32, ctx: i32): i32 {
   if d.letInit < 0 || monoOpenMapValTy(d.letInit) < 0 { return 0 }
   if !monoLetWritesClosed(d, at, ctx) { return 0 }
   const spell: string[] = []
+  // The map's type is the elaboration's slot fact. `monoPinMapSlot` instances the stored values
+  // at it; a map whose generic is called at two signatures has no fact and keeps that spelling
+  // (D15494).
+  const et = elabSlotTyAt(at, [], ctx)
   const nt = monoPinMapSlot(d.letInit, at, ctx, "", spell)
   if nt < 0 { return monoStoredSlotDecline(nt) }
-  if !monoLetWritesAt(d, at, ctx, nt) { return 0 }
-  d.letType = synthTypeRefTy(spell[0], -1, nt)
+  if et >= 0 && !tyEq(et, nt) {
+    emitFail(
+      "monoPinMapValues: the map's stored functions close at another type than its slot fact",
+    )
+    return -1
+  }
+  const mt = if et >= 0 { et } else { nt }
+  if !monoLetWritesAt(d, at, ctx, mt) { return 0 }
+  d.letType = synthTypeRefTy(spell[0], -1, mt)
   0
 }
 
@@ -21805,8 +21809,17 @@ function monoBundlePin(
 ): i32 {
   const sigs = elabCallBundleSigs(monoCallTplOf(callIx), i)
   if sigs.length < 2 { return 1 }
+  // The record the elaboration delivers the argument at; a closure taking a bundle is no bundle.
+  const bt = elabCallArgRep(monoCallTplOf(callIx), -1, elabWalkTop(), i)
+  if bt == ELAB_REP_NO_ROW {
+    return emitFailAt(
+      "emitProgram: monomorphize: a bundle argument's call has no delivered rep",
+      arg,
+    )
+  }
+  if !elabPinIsBundleOf(bt, sigs) { return 1 }
   const at = pinTys.length
-  const rc = monoBundlePinArg(arg, i, callIx, ctx, sigs, pinned, pinTys)
+  const rc = monoBundlePinArg(arg, i, callIx, ctx, sigs, bt, pinned, pinTys)
   // The record each parameter key is pinned at, read by a hand of that parameter.
   const key = elabCallParamKey(monoCallTplOf(callIx), i)
   if rc == 0 && key >= 0 && pinTys.length == at + 1 {
@@ -21815,7 +21828,7 @@ function monoBundlePin(
   rc
 }
 
-// `monoBundlePin` once the callee takes a record of `sigs`: the record argument `arg` builds or
+// `monoBundlePin` once the callee takes record `bt` of `sigs`: the record argument `arg` builds or
 // hands on. 0, -1 on a failure, or 1 where the argument is no bundle.
 function monoBundlePinArg(
   arg: i32,
@@ -21823,6 +21836,7 @@ function monoBundlePinArg(
   callIx: i32,
   ctx: i32,
   sigs: i32[],
+  bt: i32,
   pinned: string[],
   pinTys: i32[],
 ): i32 {
@@ -21830,8 +21844,8 @@ function monoBundlePinArg(
   // A call returning a record at these signatures hands it whole (D15144).
   const ar = elabCallArgRecordSigs(monoCallTplOf(callIx), i)
   if ar.length > 0 && monoSigsSame(ar, sigs) {
-    const bt = monoBundleRecordTy(sigs, arg)
-    const brow = if bt >= 0 { bundleRecordRowOfTy(bt) } else { -1 }
+    if monoBundleRecordAt(bt, sigs, arg) < 0 { return -1 }
+    const brow = bundleRecordRowOfTy(bt)
     if brow < 0 || brow >= sNames.length { return -1 }
     pinned.push(sNames[brow])
     pinTys.push(bt)
@@ -21840,7 +21854,7 @@ function monoBundlePinArg(
   if x >= 0 && nodeAt(x) is Ident {
     const fw = monoBundleHandOnPin(callIx, i, sigs, pinned, pinTys)
     if fw != 1 { return fw }
-    return monoBundleNamedPin(x, sigs, ctx, pinned, pinTys)
+    return monoBundleNamedPin(x, sigs, bt, ctx, pinned, pinTys)
   }
   // A choice of such reads hands the record its taken arm builds (D15450).
   if x >= 0 && nodeAt(x) is IfStmt {
@@ -21850,7 +21864,7 @@ function monoBundlePinArg(
     const pt: i32[] = []
     for l in lv {
       if !(nodeAt(l) is Ident) { return 1 }
-      const r = monoBundleNamedPin(l, sigs, ctx, pk, pt)
+      const r = monoBundleNamedPin(l, sigs, bt, ctx, pk, pt)
       if r != 0 { return r }
     }
     if pk.length == 0 { return 1 }
@@ -21868,16 +21882,13 @@ function monoBundlePinArg(
   ) {
     return 1
   }
-  const names: string[] = []
   for s in sigs {
     const f = tyAt(s)
     if !(f is TyFunc) { return 1 }
     const pn: string[] = []
     for pt in f.fnParamTypes { pn.push(monoPinOfClosedTy(pt)) }
     if monoInstanceFor(lfe, pn, x, s, f.fnParamTypes) < 0 { return -1 }
-    names.push("c" + i32ToStr(names.length))
   }
-  const bt = mkObjTy(names, sigs)
   monoClosedRecordOwnRow(bt)
   const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length {
@@ -21940,6 +21951,7 @@ function monoSigsSame(a: i32[], b: i32[]): boolean {
 function monoBundleNamedPin(
   x: i32,
   sigs: i32[],
+  bt: i32,
   ctx: i32,
   pinned: string[],
   pinTys: i32[],
@@ -21958,15 +21970,9 @@ function monoBundleNamedPin(
       )
     }
   }
-  const bt = monoBundleRecordTy(sigs, x)
-  if bt < 0 { return -1 }
+  if monoBundleRecordAt(bt, sigs, x) < 0 { return -1 }
   const row = bundleRecordRowOfTy(bt)
-  if row < 0 || row >= sNames.length {
-    return emitFailAt(
-      "emitProgram: monomorphize: a generic handed as a bundle has no row",
-      x,
-    )
-  }
+  if row < 0 || row >= sNames.length { return -1 }
   // The read stays the generic, so each signature instances it afresh.
   monoNoRename.push(x)
   for sg in sigs {
@@ -21979,12 +21985,9 @@ function monoBundleNamedPin(
   0
 }
 
-// The bundle row of `sigs`: the anonymous record whose field `c<k>` holds a closure at the `k`th,
-// noted as a bundle type; -1 where no row is minted for it.
-function monoBundleRecordTy(sigs: i32[], at: i32): i32 {
-  const names: string[] = []
-  for _s in sigs { names.push("c" + i32ToStr(names.length)) }
-  const bt = mkObjTy(names, sigs)
+// Registers `bt`, the bundle record of `sigs`, with its row and as a bundle type; `bt`, or -1 where
+// no row is minted for it.
+function monoBundleRecordAt(bt: i32, sigs: i32[], at: i32): i32 {
   monoClosedRecordOwnRow(bt)
   const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length {
@@ -22003,13 +22006,12 @@ function monoBundleRecordTy(sigs: i32[], at: i32): i32 {
   bt
 }
 
-// `monoPinHoleParam`'s closure bundle: where the hole lambda `arg` handed to `fn`'s parameter
-// `par` calls its one parameter at two or more signatures, and `fn` only calls `par`, pins `par`
-// at the lambda's closure taking that parameter's bundle. 0, -1 on a failure, or 1 where the
-// argument is no such lambda.
+// `monoPinHoleParam`'s closure bundle: where call `callIx` delivers its argument `i`, the hole
+// lambda `arg`, as the closure taking its own parameter's bundle (`elabCallArgRep`), pins the
+// parameter at that closure. 0, -1 on a failure, or 1 where the argument is no such lambda.
 function monoClosureBundlePin(
-  fn: FuncDecl,
-  par: i32,
+  callIx: i32,
+  i: i32,
   arg: i32,
   ctx: i32,
   pinned: string[],
@@ -22039,19 +22041,10 @@ function monoClosureBundlePin(
   const inst: i32[] = [0 - 1]
   const sigs = elabLamParamSigs(elabSrcDecl(lam), 0, inst)
   if sigs.length < 2 { return 1 }
-  if elabParamReadOtherThanCalled(fn.fnBody, par, true, false, false) {
-    return 1
-  }
-  if !monoCallsHandGenerics(fn.fnBody, par) { return 1 }
-  const ret = elabRetOf(inst[0])
-  if ret < 0 || tyHasTyVar(ret) { return 1 }
-  for sg in sigs {
-    if tyHasTyVar(sg) || !(tyAt(sg) is TyFunc) { return 1 }
-  }
-  const bt = monoBundleRecordTy(sigs, arg)
-  if bt < 0 { return -1 }
-  const ps: i32[] = [bt]
-  const ft = mkFuncTy(ps, ret)
+  const ft = elabCallArgRep(monoCallTplOf(callIx), -1, elabWalkTop(), i)
+  const f = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+  if !(f is TyFunc) || f.fnParamTypes.length != 1 { return 1 }
+  if monoBundleRecordAt(f.fnParamTypes[0], sigs, arg) < 0 { return -1 }
   const tyOut: i32[] = [0 - 1]
   const an = monoFnPinAt(arg, ctx, ft, -1, tyOut)
   if an == "" {
@@ -22064,27 +22057,6 @@ function monoClosureBundlePin(
   pinned.push(an)
   pinTys.push(ft)
   0
-}
-
-// Whether every call through parameter `par` under node `x` hands a named generic function, the
-// one argument a bundle is built from at each of its signatures.
-function monoCallsHandGenerics(x: i32, par: i32): boolean {
-  if x < 0 || x >= P.nodes.length { return true }
-  const n = nodeAt(x)
-  if n is Call {
-    const cf = unwrapParen(n.callFn)
-    if cf >= 0 && nodeAt(cf) is Ident && identDeclOf(cf) == par {
-      if n.callArgs.length != 1 { return false }
-      const a = unwrapParen(n.callArgs[0])
-      if a < 0 || !(nodeAt(a) is Ident) || !monoCalleeIsGeneric(a) {
-        return false
-      }
-    }
-  }
-  for k in nodeChildren(x) {
-    if !monoCallsHandGenerics(k, par) { return false }
-  }
-  true
 }
 
 // Pins un-annotated `p`, `fn`'s `i`th parameter, into `pinned`/`pinTys`: -1 on a refusal, else 0.
@@ -22111,7 +22083,7 @@ function monoPinHoleParam(
   if bun != 1 { return bun }
   // A hole lambda that calls its own parameter at two or more signatures, handed to a parameter
   // the callee only calls, is a closure taking that parameter's bundle.
-  const cbun = monoClosureBundlePin(fn, params[i], args[i], ctx, pinned, pinTys)
+  const cbun = monoClosureBundlePin(callIx, i, args[i], ctx, pinned, pinTys)
   if cbun != 1 { return cbun }
   // A tagged set's value, or a list or map of its ids, is handed on as the elaboration binds the
   // hole, pinned by the i32 list or map it is stored as.
