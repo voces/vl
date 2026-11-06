@@ -41,6 +41,8 @@ const probe = (src: string) => {
     bundles: Math.floor((g % 1000000) / 1000),
     wides: g % 1000,
     built: exp.elabArgBuiltProbe(),
+    closures: Math.floor(exp.elabArgBundleKindProbe() / 1000),
+    records: exp.elabArgBundleKindProbe() % 1000,
   };
 };
 
@@ -75,6 +77,16 @@ const COVARIANT = `function boundShow<T: { x: i32 | string }>(t: T) {
   if t.x is i32 { print(t.x) }
 }
 boundShow({ x: 5 })
+`;
+
+// A lambda calling its own parameter at two signatures, handed to a parameter called at two, is one
+// closure taking its bundle: `use(lap)`'s slot holds that closure, not a bundle record. The two
+// records are `k(id)` and `k(dup)`, each handing a generic to `g` at its two signatures.
+const CLOSURE_BUNDLE = `function id(a) { return a }
+function dup(a) { return a }
+function use(k) { print(k(id)); return k(dup) }
+const lap = (g) => { print(g(1) + 1); return g("s") }
+print(use(lap))
 `;
 
 const PLAIN = `function id<T>(x: T): T { x }
@@ -133,6 +145,17 @@ Deno.test({
     const got = probe(COVARIANT);
     if (got.bad !== 0 || got.built !== 0) {
       throw new Error(`want no built record, got ${JSON.stringify(got)}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "elab-arg-rep: a lambda taking its own bundle is delivered as a closure, not a record",
+  ignore,
+  fn() {
+    const got = probe(CLOSURE_BUNDLE);
+    if (got.bad !== 0 || got.closures !== 1 || got.records !== 2) {
+      throw new Error(`want a closure rep and no bundle record, got ${JSON.stringify(got)}`);
     }
   },
 });

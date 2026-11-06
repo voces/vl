@@ -1750,11 +1750,13 @@ onto it, by a hole parameter or by `T` beside `T[]`, and S2b the method spelling
 and `v.fill(v[1])`, whose receiver is the declared callee's first parameter. `monoPinnedListElemPin`
 answered 5 calls in the whole population: S2 and S2b move 4 onto the tagged set, and the fifth, an
 annotated function slot, reads the elaboration's closed type for the parameter. The function is
-deleted. Its price is one late demand per tagged `T[]` call (five in three files): mono pins the
-`T[]` at the list of ids, a spelling no elaboration key uses, so the instance is minted after the
-run. Foreseeing it means keying `T[]` at the id list's rep. The map-of-records holder kind below
-pays the same price, one late demand per helper handed a held map. One follow-up retires all four:
-key a hole or `T[]` parameter handed a held list or map at the held rep in the elaboration.
+deleted. Mono pins the `T[]` at the list of ids, and a hole parameter handed a held map at the
+held map (`monoPinHoleParam`), spellings no elaboration key uses: a held rep is a storage rep, and
+keying the run at it makes the instance's re-check refuse the helper's own store. So the call's own
+set-bound instance answers such a pin instead (`elabPinsUnheld`, `elabCkHeldUsable`): late demands
+fell from 7 to 1. The one left, `use` in `closures/listed-hole-fn-escaping-list.vl`, is a
+closure-list pin with no held stamp. One helper instance serves holders of different sets, since a
+tagged id is its member's declaration index in every set.
 
 G2's write through a parameter (D15492) lands in the caller's map with its set; what refused it
 was the store into the parameter's slot, which the tag rule now takes when every call hands a
@@ -1789,8 +1791,8 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   intern, and without it the helper's store refuses. An entry read through `?.` is not a holder:
   `drwOptGuard`'s call gets no id member call, so
   `closures/generic-record-written-into-map-through-param-read-through-optional.vl` runs on mono as
-  on master (a decline, not a refusal). The price is one late demand per helper handed a held map,
-  as with `T[]` above. Two different generics in one map of records still refuse loudly (D15493).
+  on master (a decline, not a refusal). Two different generics in one map of records still refuse
+  loudly (D15493).
 
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
@@ -2374,6 +2376,21 @@ such sites stay declined.
 the column at all 40 sites a rep reaches. They stay on it: 157 of their queries are calls with no
 reach row (124 the elaboration never reached, the rest reached only from another instance), where
 the rep is the type and the column has nothing to answer.
+
+**The bundle pins read the fact** (2026-11-06). `monoBundlePin` takes the record a bundle argument
+is delivered at from `elabCallArgRep`, and `monoClosureBundlePin` takes the closure, in place of
+minting either from the signatures; `monoCallsHandGenerics` is deleted, its gate now the
+elaboration's (`elabCloBundleRep`). One minter, `bundleRecordTyOf`, serves both. The fact was wrong
+at one slot first: a lambda calling its own parameter at two or more signatures (`use(lap)` in
+`closures/lambda-bundle-through-hole-param-at-several-signatures.vl`) is one closure taking their
+bundle, not a bundle record, and it now records the closure whatever the callee's own signature
+count. Shadowed over 23,103 programs: 295 bundle sites and 12 closure sites agree, none differs or
+is new-only. The byte sweep against master's fixpoint is 23,103 identical.
+
+`monoBundleTys` and emit_bundle's `bundleTys` and `bundleRecs` still answer "is this type a bundle".
+A type-shaped answer from the fact agrees at 586 of 587 reads and is wrong at the other:
+`closures/hole-lambda-bundle-positions.vl` writes `type B = { c0: …, c1: … }` by hand, a bundle's
+shape that keeps its own fields. Their replacement has to ask per call, not per type.
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
