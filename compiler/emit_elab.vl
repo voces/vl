@@ -10693,9 +10693,18 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
   const wasAdmit = elabDlvAdmit
   elabDlvKey = k
   elabDlvAdmit = elabReachClosure(k)
-  const out = elabSlotDeliveriesAt(d, path)
+  const all = elabSlotDeliveriesAt(d, path)
   elabDlvKey = was
   elabDlvAdmit = wasAdmit
+  // A function value is delivered only at its own arity; another is a placeholder's inferred type.
+  const own = elabSlotTyOf(nodeTyIxOf(d), path)
+  const of = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+  if !(of is TyFunc) { return all }
+  const out: i32[] = []
+  for t in all {
+    const ft = tyAt(t)
+    if ft is TyFunc && ft.fnParamTypes.length == of.fnParamTypes.length { out.push(t) }
+  }
   out
 }
 
@@ -11331,6 +11340,9 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
       for c in calls {
         if c >= 0 && c < P.nodes.length { elabReadDeliveries(c, out, seen) }
       }
+      // A `.map` callback's result is an element of the list the call builds.
+      const mc = elabMapCallOf(f)
+      if mc >= 0 { elabSlotClimb(mc, ["e"], out, seen) }
     }
   } else if (
     k == CW_UP_ARG
@@ -11433,6 +11445,15 @@ function elabWrittenDest(r: i32): boolean {
   fn is FuncDecl && fn.fnRet >= 0
 }
 
+// The `.map` call function `f` is the callback argument of, or -1.
+function elabMapCallOf(f: i32): i32 {
+  if f < 0 || f >= cwIxUp.length || !cwIxCovers(f) || cwIxUpKind[f] != CW_UP_ARG { return -1 }
+  const c = cwIxUp[f]
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  const m = if cn is Call && cn.callFn >= 0 { nodeAt(parenPeelIx(cn.callFn)) } else { null }
+  if m is Member && m.memProp == "map" { c } else { -1 }
+}
+
 // Pushes onto `calls` the calls made through value `x`, a lambda or a call's result, where it
 // flows into an unwritten binding called by name, or out of a function each call of which is such
 // a value; `depth` bounds the walk.
@@ -11465,6 +11486,29 @@ function elabValueCalls(x: i32, calls: i32[], depth: i32) {
     const fc: i32[] = []
     if f >= 0 && f < P.nodes.length { cwFnCalls(f, fc) }
     for c in fc { elabValueCalls(c, calls, depth + 1) }
+  } else if (k == CW_UP_ELEM || k == CW_UP_FIELD) && cwIxCovers(up) && cwIxUpKind[up] == CW_UP_LETINIT {
+    // An element or field of a literal an unwritten binding holds is called through that slot.
+    const fi = if k == CW_UP_FIELD { nodeAt(cwIxUpAux[x]) } else { null }
+    const step = if fi is FieldInit { "f." + fi.fiName } else { "e" }
+    const b = cwIxUp[up]
+    const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
+    if (
+      bn is LetDecl
+      && !elabLetTypeWritten(bn.letType)
+      && (bn.letKw == "const" || cwLetUnwritten(b))
+    ) {
+      const ow = cwOccWalk(b)
+      while cwOccNext(ow) {
+        const u = cwIxNode[ow.row]
+        if cwIxKind[ow.row] == CW_OCC_USE && u >= 0 && u < P.nodes.length && identDeclOf(u) == b {
+          const r = elabSlotReadUp(u, [step])
+          if r >= 0 && cwIxCovers(r) && cwIxUpKind[r] == CW_UP_CALLEE {
+            const c = cwIxUp[r]
+            if c >= 0 && !i32ListHas(calls, c) { calls.push(c) }
+          }
+        }
+      }
+    }
   }
   0
 }
