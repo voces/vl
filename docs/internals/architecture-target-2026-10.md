@@ -1821,8 +1821,8 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   from `elabSlotHeldFns`), read by `monoUncalledSlotFnTy`. Shadowed over 23,381 programs, 507
   decisions in 318 programs: 105 agree, 401 decline on both sides, 0 disagree. In one, D12218,
   the elaboration answers where mono declines; a held value whose checked type is no function
-  type keeps it declining. What is left mono-derived is the gate deciding the slot is uncalled:
-  59 of the 105 reach the default through `monoValsInert`, `monoValsReachNoCall` or
+  type keeps it declining. What is left mono-derived is the gate deciding the slot is uncalled.
+  Before #6503 gated the stored slot on `elabSlotUncalled` alone, 59 of the 105 reach the default through `monoValsInert`, `monoValsReachNoCall` or
   `monoLitReachesNoCall` while `elabSlotUncalled` says the slot is called. That calledness
   disagreement is this family's next item.
 
@@ -1913,6 +1913,32 @@ next forward-climb edges to add:
 The 228 the elaboration alone answers are calls mono leaves untyped today, so the switch admits them
 too, and they are graded as newly admitted programs.
 
+**Slot type, parked and pruned** (2026-11-06).
+
+- **`monoReachSlotTy` is parked.** 13 of its 17 reach-only site-hits call the slot's function with a
+  lambda argument whose type is open at the call (D12880, D12940, and the pushed-lambda and
+  capturing-lambda-member tests). That is the lambda-signature family's, and lane F has them as
+  acceptance witnesses. In D2853 and D2862 the call is through a field of a record a call returns
+  (`mk(7).g()`), which the reach lane's value-returns family owns. The other 4 are answered by the
+  binding's slot call tuple (`slotCallArgsInto`), which lands with the deletion. The rung keeps
+  reach's decline for the 228 sites only the elaboration answers.
+- **Value reach's no-call half, dropped where it never decided.** Three gates ask
+  `elabSlotUncalled(...) || reach finds no call`. Where the elaboration says the slot is called,
+  reach alone said "no call" this often:
+
+| gate | elaboration uncalled | reach alone | site-hits |
+|---|---|---|---|
+| `monoStoredSlotFnTy` | 136 | 0 | 136 |
+| `monoPinNestedListElems` | 19 | 0 | 19 |
+| `monoPinListElems` | 256 | 23 | 293 |
+
+  The first two now read `elabSlotUncalled` alone. In the third, reach's answer stays: 23 site-hits
+  in 17 files where the elaboration has no uncalled answer (D10795, D10796, D10893 to D10895, D12472
+  and others). `monoValsInert` stays too, since it decides 34 site-hits with two pins that the
+  elaboration has no fact for.
+- **No longer mono-derived since #6496:** `monoPinRecordField`, `monoPinRecordFields` and
+  `monoPinNestedListElems` read only the elaboration's slot pins (`monoDeclPathPins`).
+
 **`monoPinnedRetAnnTy` is parked.** Re-keyed onto the forward climb (`elabLitSlotCallTys` over
 each returned list literal, with each element's result) and shadowed over the 23,103 programs:
 
@@ -1943,6 +1969,52 @@ query whenever no call sink was on, but the return sink was not in that gate. A 
 the same value read the memo, walked nothing and answered false. The memo now skips a return-sink
 query; `tests/vl_elab_rets_reach_test.ts` asks the query three times. No program in the population
 changed output.
+
+**The uncalled-slot gates are rewrite-owned.** `monoPinListElems`' reach half
+(`monoLitReachesNoCall`) and `monoValsInert` are kept, and they close only when the flow pass's
+`monoFlow*`/`mfr*` family (the slot held fns row, 29 functions) is retired. Each gate answers
+"uncalled" about the program after `monoFlowReadSet` has rewritten every read of the slot to name
+its generic. `elabSlotUncalled` answers about the program before that rewrite. An elaboration fact
+that took mono's rewrite as an omit set would move the dependency, not remove it.
+
+Shadow over the 23,103 programs at `4f3d9023`. Both predicates are asked at every slot reaching a
+gate. E is `elabSlotUncalled`; M is the mono predicate the gate reads.
+
+| gate | both called | both uncalled | E only | M only |
+| --- | --- | --- | --- | --- |
+| list, no pin (`monoLitReachesNoCall`) | 14 | 27 | 245 | 23 |
+| list, pushed, two pins (`monoValsInert`) | 5 | 0 | 0 | 2 |
+| nested list, no pin (`monoValsReachNoCall`) | 0 | 1 | 22 | 0 |
+| stored slot, no pin (`monoValsReachNoCall`) | 0 | 23 | 129 | 0 |
+| stored slot, two pins (`monoValsInert`) | 17 | 0 | 0 | 34 |
+
+The two rows with no M-only cell read `elabSlotUncalled` alone since #6503. At a no-pin gate the two
+answers are joined by `||`, so E only changes nothing. All 59 M-only cells run correctly, and only
+through the uncalled default.
+
+Each M-only cell is graded by what makes E answer "called", and by which reasons are left once the
+rewritten calls (`mfrSetCalls`) are omitted:
+
+- **`fnSlotCalled` (44 cells): every list cell, and 19 stored ones.** It is the checker's
+  call-through-slot note. It is keyed by holder and path, with argument tuples and no call node
+  (`fnSlotCallNote`), so it cannot omit a rewritten call. In 18 of the list cells and both pushed
+  ones, every set call and delivery is a rewritten call as well. In 6 of the stored cells a held
+  function also escapes through a map parameter.
+  - List witnesses: D7385, D12472, D10795, D10796, D10893, D10894, D10895,
+    `closures/hole-fn-list-computed-index-call-as-value.vl` and
+    `functions/lambda-through-const-list-element*.vl`.
+  - Pushed: D9482 and `closures/hole-fn-generic-pushed-list-spread.vl`.
+  - Stored: D9310, D9480, D9591, D15298 and `closures/hole-fn-generic-in-map-called-at-two-types.vl`.
+- **Rewritten calls only (2 cells).** Omitting `mfrSetCalls` leaves no reason
+  (`closures/container-of-generic-flow-reads.vl`).
+- **Handed reads (13 cells).** The rewritten read is an argument, as in `run(mv, 2)` where `run`
+  calls `f`, so the two pins are the deliveries through `run` at two types. `monoFlowReadSet` lists
+  only called reads in `mfrSetCalls`, so these deliveries survive the omission. Witnesses:
+  D10311, D10383, D10384, D10401, D14400 and
+  `generics/fn-value-generic-handed-from-call-map-or-repointed-let.vl`.
+
+Whoever retires `monoFlowReadSet` needs two facts that do not exist yet: `fnSlotCalled` keyed by the
+call node, and the handed reads.
 
 #### Next stage, first item: a per-call delivered-rep fact
 
