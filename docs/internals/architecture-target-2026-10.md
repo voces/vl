@@ -1191,6 +1191,66 @@ happen where no fact can see them, so the slot has to be treated as called.
   must not be answered uncalled.
 
    Each family is measured alone by its own cut before it is scheduled.
+
+**The uncalled family, landed** (2026-11-06). `elabSlotUncalled(d, path)` answers it from the
+elaboration: no call reads its callee from the slot (`fnSlotCalled`, the checker's per-slot call
+index), no call goes through the set its type carries (`elabSlotSetCalls`), no closed delivery
+(`elabSlotDeliveries`), and no function it holds escapes (`fnEscapes`). Shadowed against the
+table at its three mono readers, it agreed at 159 of 165 site-hits until two gaps closed: a call
+through a one-member set reads its callee from the slot but the set records no call, and a `for`
+variable over a list is that list's element slot (`calleeSlotOf`). Then 165 of 165.
+`fnFlowDeclPathUncalled` is deleted.
+
+**Census of the remaining non-slot readers** (2026-11-06, master `214bc5d9`; witnesses are the
+`tests/cases` files where the entry gives a non-default answer):
+
+| entry | family | mono callers | witness (hits / files) | elaboration answers today |
+| --- | --- | --- | --- | --- |
+| `fnFlowDeclPathOnlyPinCall` | agreed, only call | monoPinOpenCallLams | `generics/hole-call-generic-lambda-arg.vl` (91 / 32) | partly: not where calls through a result fix the pin |
+| `fnFlowDeclPathAgreedPinTys` | agreed | monoHeldSrcsFnTy, monoHoleGenBindFnArgs | `closures/hole-fn-in-unannotated-map.vl` (2 / 2) | as above |
+| `fnFlowDeclPathAgreedPinTysSkipping` | agreed | monoElemFnPinTys | `closures/hole-fn-if-join-result-handed-hole-fn.vl` (10 / 5) | as above |
+| `fnFlowCallPathAgreedPinTys` | agreed, per call | monoPathSlotPinnedFnTy | `closures/generic-fn-in-unannotated-map.vl` (9 / 5) | the call's instance types |
+| `fnFlowCallPathAnnPinTys` | annotation | monoPathSlotPinnedFnTy | none in `tests/cases` | no: delivery rows record no result |
+| `fnFlowPinSigOf` | spelling helper | 4 | `maps/function-valued-map.vl` (3,523 / 554) | needs no table; the table uses it too |
+| `fnFlowElemKind` | syntax | monoPlaceRoot | `std/array-sorted.vl` (3,608 / 495) | needs no table; the table uses it too |
+| `fnFlowWholeSliceRecv` | syntax | monoFlowSliceAsSpread | `closures/generic-list-slice-copy-own-instances.vl` (7 / 2) | needs no table; the table uses it too |
+| `fnFlowDeclFn` | rest | monoDeclFrameIn, monoReadIsBinding | `loops/loop-value.vl` (67,693 / 1,188) | `recEnclosingFn`; last, with a full A/B |
+
+The last three are also read by the table's own walk, so they leave with the file. The four
+programs `monoHoleGenFnPin` still has no elaboration answer for split across families: the only-call
+pin (`closures/generic-fn-value-returned-through-identity-hole.vl`, D12340), the skipping agreed pin
+(`closures/hole-fn-if-join-result-handed-hole-fn.vl`) and the uncalled slot
+(`closures/hole-helper-pushes-listed-member-onto-uncalled-list.vl`). The agreed family's missing fact
+is a pin fixed by calls through a function's result (`fw(x)(y)`, `mk(g).f(3)`).
+
+**The only-call pin is the slot-delivery climb's calls** (2026-11-06, measured on #6465's head
+`732c3b24`, a probe recording every call `elabReadOn`'s callee arm reaches during
+`elabSlotDeliveries` / `elabSlotClimb` from the value `monoHoleGenFnFlowDecl` names). Against
+`fnFlowDeclPathOnlyPinCall` over the 55 `tests/cases` files the table answers in, counting
+site-hits:
+
+| result | hits | files | cause |
+| --- | --- | --- | --- |
+| agree | 68 | 22 | the forward climb's one call is the table's |
+| table only | 18 | 11 | forward gap: the argument edge in `elabReadOn` and `elabSlotAliasOn` resolves a callee only through `identFnDeclOf`, so a call through a function value (`const k = lap; k(id)`, `fs[i](add)`, `if c { p } else { q }` as the callee) stops the climb |
+| elaboration only | 35 | 13 | the table's class is a bidirectional union: `keep((x) => x + 1)` is called only at `q(7)` inside `keep`, but `lap(f) { f(2.5); f(3); keep(f) }` puts `lap.f` and `keep.g` in one class, so the table declines |
+
+No new fact is needed: the climb already follows a value through argument passing, aliases,
+joins, returns, element and field writes and capture cells, and the agreed and skipping pins are
+the same climb's calls with the same forward gap.
+
+**The forward answer is adopted** (coordinator ruling): it is more precise than the class union,
+which pins a value at calls that never reach it. The union also kept the reps of a shared slot
+aligned, and that is the condition the switch carries. A slot one value reaches as a plain closure
+and another as a bundle (`keep.g` above) is called through one body, so the call site has to serve
+both reps. The switch therefore lands:
+
+1. after the forward gap closes (a callee resolved through the value it reads);
+2. graded on output, not bytes alone, with 0 runs → not-runs over the 35 sites that change;
+3. with a witness of the shared-slot shape (a lambda and a bundle reaching one parameter called
+   once) that runs and prints the right values;
+4. falling back to the table's answer wherever the forward answer moves output or validity, each
+   fallback named here, rather than a wider rule.
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
    `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
    `fnFlowStageInstHoles` go with the file.
