@@ -58,6 +58,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  arenaEpochNow,
   callTyArgsOf,
   elseIfLink,
   hasNamedArgs,
@@ -10705,6 +10706,23 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
     elabDlvAdmit = wasAdmit0
     return lout
   }
+  // An outermost plain query is answered once per arena epoch.
+  const memo = elabDlvDepth == 0 && elabDlvOmit.length == 0 && !elabCallSinkOn
+  let mk = ""
+  if memo {
+    if elabDlvMemoEpoch != arenaEpochNow() {
+      elabDlvMemo = Map()
+      elabDlvMemoEpoch = arenaEpochNow()
+    }
+    mk = i32ToStr(d) + ":" + i32ToStr(k)
+    for st in path { mk = mk + ":" + st }
+    const hit = elabDlvMemo.get(mk)
+    if hit != null {
+      const cp: i32[] = []
+      for t in hit { cp.push(t) }
+      return cp
+    }
+  }
   const was = elabDlvKey
   const wasAdmit = elabDlvAdmit
   elabDlvKey = k
@@ -10712,8 +10730,17 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
   const out = elabSlotDeliveriesAt(d, path)
   elabDlvKey = was
   elabDlvAdmit = wasAdmit
+  if memo {
+    const keep: i32[] = []
+    for t in out { keep.push(t) }
+    elabDlvMemo[mk] = keep
+  }
   out
 }
+
+// `elabSlotDeliveries`' answers by query, valid for the arena epoch they were taken in.
+let elabDlvMemo: {[string]: i32[]} = Map()
+let elabDlvMemoEpoch = -1
 
 function elabIsBinding(n: Node): boolean {
   n is LetDecl || n is Param || n is FuncDecl
@@ -10964,12 +10991,7 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
       return 0
     }
   }
-  for c in elabCalls {
-    const cn = nodeAt(c)
-    if cn is Call && cn.callFn >= 0 && elabSlotReadOf(cn.callFn, o, cp) {
-      elabCallDeliveryAdd(c, out)
-    }
-  }
+  for c in elabCallsReading(o, cp) { elabCallDeliveryAdd(c, out) }
   // Reached through an edge, only a written type is a delivery; an inferred one is the value's own.
   const own = elabSlotTyOf(nodeTyIxOf(o), path)
   if (
@@ -11097,9 +11119,13 @@ function elabPlaceUp(x: i32): i32 {
 // left.
 function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
   // Each value and path is climbed once per query: the alias edges reach one from several sides.
-  const key = elabClimbKey - u * 8 - path.length
-  if u < 0 || path.length >= 8 || i32ListHas(seen, key) { return 0 }
-  seen.push(key)
+  // A name's occurrence is climbed once already, by its binding's walk.
+  if u < 0 || u >= P.nodes.length || path.length >= 8 { return 0 }
+  if !(nodeAt(u) is Ident) {
+    const key = elabClimbKey - u * 8 - path.length
+    if i32ListHas(seen, key) { return 0 }
+    seen.push(key)
+  }
   let cur = u
   let i = 0
   let guard = 0
@@ -11729,24 +11755,52 @@ export function elabSlotOnlyCall(d: i32, path: string[], tys: i32[]): i32 {
 let elabCallSink: i32[] = []
 let elabCallSinkOn = false
 
-// Whether `x` reads slot `cp` of binding `o`, itself or through an un-annotated `const` aliasing it.
-function elabSlotReadOf(x: i32, o: i32, cp: string[]): boolean {
+// The calls in `elabCalls` whose callee reads slot `cp` of binding `o`, itself or through an
+// un-annotated `const` aliasing it, in `elabCalls` order.
+function elabCallsReading(o: i32, cp: string[]): i32[] {
+  if elabReadIxEpoch != arenaEpochNow() || elabReadIxLen != elabCalls.length {
+    elabReadIx = Map()
+    for c in elabCalls {
+      const cn = nodeAt(c)
+      if cn is Call && cn.callFn >= 0 {
+        for k in elabSlotReadKeys(cn.callFn) {
+          const row = elabReadIx[k] ?? []
+          if row.length == 0 || row[row.length - 1] != c { row.push(c) }
+          elabReadIx[k] = row
+        }
+      }
+    }
+    elabReadIxEpoch = arenaEpochNow()
+    elabReadIxLen = elabCalls.length
+  }
+  elabReadIx[elabSlotReadKey(o, cp)] ?? []
+}
+
+// Each call by the slot key (`elabSlotReadKey`) its callee reads, for one arena epoch.
+let elabReadIx: {[string]: i32[]} = Map()
+let elabReadIxEpoch = -1
+let elabReadIxLen = -1
+
+function elabSlotReadKey(o: i32, cp: string[]): string {
+  let k = i32ToStr(o)
+  for st in cp { k = k + "/" + st }
+  k
+}
+
+// The slot keys callee `x` reads: its own place, and through each un-annotated unwritten `let`
+// its root names, that binding's initialiser's.
+function elabSlotReadKeys(x: i32): string[] {
+  const out: string[] = []
   let at = parenPeelIx(x)
   let hops = 0
   while hops < 8 {
     const p: string[] = []
     const root = cwSlotPath(at, p)
-    if root < 0 { return false }
+    if root < 0 { return out }
     const rd = identDeclOf(root)
     const ro = if declOrigOf(rd) >= 0 { declOrigOf(rd) } else { rd }
-    let same = ro == o && p.length == cp.length
-    let j = 0
-    while same && j < p.length {
-      if p[j] != cp[j] { same = false }
-      j = j + 1
-    }
-    if same { return true }
-    if p.length > 0 || rd < 0 || rd >= P.nodes.length { return false }
+    out.push(elabSlotReadKey(ro, p))
+    if p.length > 0 || rd < 0 || rd >= P.nodes.length { return out }
     const rn = nodeAt(rd)
     if (
       !(rn is LetDecl)
@@ -11754,12 +11808,12 @@ function elabSlotReadOf(x: i32, o: i32, cp: string[]): boolean {
       || rn.letInit < 0
       || !cwLetUnwritten(rd)
     ) {
-      return false
+      return out
     }
     at = parenPeelIx(rn.letInit)
     hops = hops + 1
   }
-  false
+  out
 }
 
 // Adds to `out` the closed function type call `c` is made at: its arguments' and result's types
