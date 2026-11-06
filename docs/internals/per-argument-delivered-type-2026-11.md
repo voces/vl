@@ -24,7 +24,7 @@ argument is delivered as `i32`. The 1,332 elab-wider calls in the survey are thi
    mono rungs:
    - a literal the record solve built (`monoLitBuiltTy`);
    - a call copied back (`recCopyTyOf`, and since #6242 the call's stamp `nodeRepStamped`);
-   - an adopted variant (`monoArgOwnVariant`);
+   - an adopted variant (`litRetArmRow`);
    - the closure-pin annotation (`monoCloPinAnnNodeOfExpr`).
 
 It is -1 when step 1 is still open. Mono then keeps today's ladder for that argument, so the switch
