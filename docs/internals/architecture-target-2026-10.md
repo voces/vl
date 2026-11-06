@@ -1687,6 +1687,31 @@ consolidation of the spelling rungs into one function is a pure refactor, graded
 byte-identical seed and corpus. It ends the tail in a loud refusal, "no elaboration answer for this
 parameter's instance (§3.4 fallback)", which no corpus program reaches.
 
+**Three more of the queue, graded** (2026-11-06, the 23,456-program population):
+
+- `monoPinNoteReturns` reads `elabValueReturnsFrom`, the climb's RET/TAIL edges (#6489).
+- `monoCloPinAnnNodeOfExpr`, the closed function type of a forwarder's read that its own recorded
+  type does not carry, reads `elabNodeTyAt` at the instance. Of the reads it answered, 81 agree
+  (79 at a parameter annotation, 2 at a `let`). Neither side answers alone, and 18,367 reads have
+  no answer on either side. The annotation walk is deleted.
+- `monoCloneGenericCallArm` (D12702) is closed as node mechanics, not switched. At each identifier
+  callee the earlier arms leave to it:
+
+| `monoCalleeElems` fires | callee type | per-instance type | site-hits | files |
+|---|---|---|---|---|
+| yes | open | moves | 13 | 7 |
+| yes | open | same | 193 | 94 |
+| yes | closed | same | 2 | 1 |
+| no | open | moves | 2,971 | 811 |
+| no | closed | moves | 316 | 157 |
+| no | open | same | 463 | 126 |
+| no | closed | same | 13,929 | 3,906 |
+
+  No typed condition reproduces the arm. "The type moves" holds at 3,287 site-hits the arm declines,
+  and the arm copies 195 callees whose type does not move. The arm copies a callee node read out of
+  a list literal, a `for` variable or an `if`. The callee's per-instance type is already the
+  elaboration's (`monoHoleNodeTy`), and no elaboration fact owns the choice to copy the node.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
