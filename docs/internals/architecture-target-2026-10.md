@@ -1333,7 +1333,7 @@ still exports and who reads each one. The file goes when every row is checked.
 | `fnFlowDeclPathOnlyPinCall` | `monoPinOpenCallLams` (fallback only) | cad | the forward climb's one call (`elabValueOnlyCall`), once its two fallback cases close |
 | `fnFlowDeclPathAgreedPinTys` | `monoElemFnPinTys`, `monoHoleGenBindFnArgs` | cad | the agreed pin read off member instance keys or the check's slot-call index |
 | `fnFlowDeclPathAgreedPinTysSkipping` | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
-| `fnFlowDeclFn` | `monoDeclFrameIn`, `monoReadIsBinding` | lane F | `recEnclosingFn` |
+| ~~`fnFlowDeclFn`~~ (done, #6475) | `monoDeclFrameIn`, `monoReadIsBinding` | lane F | `recEnclosingFn` |
 | `FF_PIN_DECLINE` | `monoDeclPathKeys`, `monoDeclPathKeysIn`, `monoDeclPathPinsPerInstance`, `monoSlotRetName`, `monoSlotRetCount` | builder | none needed: its readers are all mono's own, so the sentinel moves to a module mono imports |
 | `fnFlowPinSigOf` (with `ffPinSpell`) | `monoDeclPathKeysIn`, `monoElemPinTysUnder`, `monoFlowSlotPins`, `monoPinFnParamTys`, `monoReachSlotPins` | builder | none needed: pure spelling of a parameter list; moves beside `sigKeyOfTy` in `emit_sig_tokens.vl` |
 | `fnFlowElemKind` | `monoPlaceRoot` | builder | none needed: a node's type is a map or not; moves to `emit_query.vl` |
