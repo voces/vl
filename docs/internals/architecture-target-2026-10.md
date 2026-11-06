@@ -1741,8 +1741,8 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 | lambda sigs | `elabLamParamSigs` | 11 | 9,023 | lane F |
 | instance binding | the instance key's binding (`ekTys`, `elabInstTyAt`, `elabParamTyOwnAt`) | 34 | 9,023 | reach, split-dep |
 | literal arm row | the record solve's literal arm row (`litArmRowOf`) | 5 | 8,956 | — |
-| value returns | `elabValueReturnsFrom` | 7 | 8,077 | — |
-| instance result | `elabRetOf` at the instance key | 10 | 8,023 | — |
+| value returns | `elabValueReturnsFrom` | 7 | 8,077 | reach |
+| instance result | `elabRetOf` at the instance key | 10 | 8,023 | reach |
 | walk type | `elabWalkTy` / `elabWalkNarrowedTy` at the instance | 33 | 7,470 | reach |
 | call param | `callArgRepTy` over `elabCallParamTy` | 13 | 5,624 | split-dep |
 | uncalled slot | `elabSlotUncalled`, and a default for an uncalled slot | 6 | 4,712 | — |
@@ -1763,6 +1763,20 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
 with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
+
+**Instance result, first pass (2026-11-06).**
+- `monoRetRecordOf` and its consumers `monoRetConstRecord`, `monoPinCallRecord` and
+  `monoPinInPlaceCallRecord` are deleted. The chain never pinned: over the 23,103 programs
+  `monoRetRecordOf` returned no record in 112,273 calls, and a build refusing wherever it would
+  return one passes the deno suites. A byte sweep of the 23,103 against master's fixpoint seed
+  differs on none. The elaboration's result (`elabResultAtParams`) answers 10 of those calls, all
+  in `std/idtable-*.vl`. That is a capability question, declined under ruling (a).
+- `monoPinnedRetAnnTy`'s 29 answers are a returned list literal of hole functions pinned by its
+  caller's calls (`hole-fn-list-returned-reread.vl`). The instance result is open there, so its
+  owning fact is the forward climb over the literal's element slot, as for the reach pair, and not
+  `elabRetOf`.
+- `monoRetRepOf` and `monoReturnedBundlePin` are rep decisions, so they move to the per-call
+  delivered rep below.
 
 #### Next stage, first item: a per-call delivered-rep fact
 
