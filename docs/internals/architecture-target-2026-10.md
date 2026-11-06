@@ -1270,6 +1270,27 @@ master build all 7,538 sweep programs byte-identical with the split plan on and 
 `fnFlowCallPathAgreedPinTys` is deleted. `fnFlowDeclPathAgreedPinTys` stays for
 `monoHoleGenBindFnArgs`.
 
+**The forward gap, closed** (2026-11-06). Both argument edges of the climb resolve a callee
+through `elabCalleeFns`. That is the declared function a name calls, else each function the slot
+it reads can hold: an alias, a list element, a joined value, or a written `let` and its writes.
+The only-call shadow on master `0e6d2104f`, over `tests/cases` (site-hits):
+
+| | agree | table only | elaboration only | neither |
+| --- | --- | --- | --- | --- |
+| before | 68 | 18 | 35 | 80 |
+| after | 81 | 5 | 53 | 62 |
+
+The 5 table-only hits left:
+
+- 2 are D15444's order rule;
+- 1 is D15455's parameter-written record field;
+- 2 are D6883's annotated copy stored in a record (`const b: F = a; const r = { f: b };
+  r.f("w")`), whose climb stops at the annotated `const`. Fixpoint seeds build all 7,538 sweep programs byte-identical
+with the split plan on and off, so this is shadow-only until the only-call reader switches. The
+shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
+Its failing twin, through a list or joined callee given a hole function and a closed-typed
+function, is D15484.
+
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
    `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
    `fnFlowStageInstHoles` go with the file.
