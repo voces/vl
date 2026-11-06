@@ -2017,6 +2017,16 @@ too, and they are graded as newly admitted programs.
   `e925b06a` over 23,384 programs (counts per program and answer type): agree 175 → 180, reach only
   20 → 9, differ 1 → 1 (`named/d15209_fs_in_list_half.vl`, already on master), elaboration only
   132 → 132. No byte moves over the 19,316-program sweep. The 9 left keep the rung.
+- **`monoReachSlotTy`'s value-reach rung is deleted.** The climb gained the 9 left: a value a call
+  hands back or a lambda is climbed from its node; a reached call's result is its agreed or checked
+  type, or, for a function result, the result's own calls (`ks[0]()(5)`, D2853, D2862); a literal
+  an instance copied reads its source, and an argument open at check takes its agreed instance
+  type; a spread copy reads its source's held values (initialiser, pushes, element writes, pushes in
+  a function it is handed to) at the copy's own slot; a `self` function's UFCS calls count as its
+  calls. Reach only 9 → 0, differ 1 (D15510), elaboration only 160. Reach's answers open in the
+  enclosing generics' own type parameters (D7202) are kept by the climb (`elabOpenOnlyIn`). Against
+  a master fixpoint over 19,316 programs: 0 runs lost, 13 byte movers, every one printing master's
+  output. `vrCalleeTy`, `vrCallTy`, `vrOpen` and `monoFrameTyParamsOf` go.
 - **Value reach's no-call half, dropped where it never decided.** Three gates ask
   `elabSlotUncalled(...) || reach finds no call`. Where the elaboration says the slot is called,
   reach alone said "no call" this often:
