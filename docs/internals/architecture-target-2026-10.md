@@ -1762,6 +1762,24 @@ programs. The map pin (`r5_rt`, the argument's checked type) still answers 13: 5
 fixture, whose map holding a non-generic keeps the set untagged, 3 written as a record `{f: id}`,
 3 an uncalled set (G5), and 2 outside bucket 1.
 
+Two of the 13 are residuals with a named blocker, not a missing admission:
+
+- **D9480's mixed map** (5): one store node `mm["k"] = id` in `fill` lands as an id of `{id}` in
+  the instance for a map holding only generics, and as `id@i32`'s closure in the instance for a map
+  that holds a non-generic `inc` (its value type is closed, so a generic written there is
+  instanced, by design). The tag decision is per node, so it refuses the set for both. It needs a
+  per-instance rep for one node (the per-instance mint; `fnCloCoerceSetAt` gives up at -2 for the
+  same reason). Controls: a map holding `inc` and written `id`, directly or through `fill`, called
+  at two types, is a check reject at both spellings, as the design says.
+- **The map-of-records holder kind** (3, and D15493's gain): the tag side and the rep stamp are done
+  on `claude/fnd-mrec` (holder kind 8, a `null`-check and a void-tail holder arm, the record
+  literal written into a map slot or through a parameter, `fnTagRepTyIn` stamping a map's record
+  value with ids, mono's hole pin reading that stamp). It is blocked on emit's record-row
+  interning: a literal built inside a callee and written through a parameter into a holder of
+  id-records lands at a second `struct {mut i32}` row beside the map's own, so the one-generic
+  spellings are invalid wasm on the branch. Two different generics in one map of records still
+  refuse loudly there.
+
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
 not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
@@ -1775,9 +1793,13 @@ about 600 are new-only and 22,518 decline on both sides. The byte sweep moves 4 
   default eventually, but not in this change.
 - **A call inside a body mono cloned** (12 `noframe`), which the walk top does not index:
   `len$m…$2` in `generics/typaram-list-union-param-forwards-to-generic.vl`, `inc3$1` in
-  `closures/hole-fn-record-field-called-at-other-param.vl`.
-- **A call through a value** (7), and three solved hole parameters the checker leaves open
-  (D15331).
+  `closures/hole-fn-record-field-called-at-other-param.vl`. Closed by #6515: mono's closed-pin
+  key refines the call's open-keyed instance (`elabKeyRefines`), and none is left without a source.
+- **A call through a value** (8 `nokey-value`, 5 programs), and three solved hole parameters the
+  checker leaves open (D15331). These are aligned, not a gap: a closed-typed callee needs no
+  instance key; its checked type is the fact.
+- **A generic call with no key** (22 `nokey-gen` with no source): module UFCS imports (`$m`) and
+  `[]=` index operators. Unowned.
 
 Mono declines 1,969 calls (573 programs). For 662 of their parameters (183 programs) the
 elaboration closes the type anyway (`eo:yes`). Those are the decline set, and the switch keeps them
@@ -1806,7 +1828,8 @@ The tail is closed by four things:
 - function-value identity in the type (`Fn#d`, D15298), for the generic function values fixed
   past the call (42 after D15490, in the four groups above that are not defaults);
 - an elaboration-owned default for an unbound type parameter (72);
-- the 16 calls in cloned bodies and through values;
+- the 16 calls in cloned bodies and through values, the cloned-body ones closed by #6515 and the
+  value calls aligned as above;
 - anything a wider population finds.
 
 Widened to every call `monoInstantiateCallIn` instances, not only `monoWalkIdentCall`'s, the
@@ -1875,7 +1898,10 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 | call param | `callArgRepTy` over `elabCallParamTy` | 13 | 5,624 | split-dep |
 | uncalled slot | `elabSlotUncalled`, and a default for an uncalled slot | 6 | 4,712 | — |
 
-- [ ] **unbound default** (12): `monoElabDefaultsPrime` 18,170, `monoHoleGenFnFlowTy` 7,941, `monoChoiceArmFlowTy` 7,929, `monoDefaultTyParamsOnlyGenFns` 5,541, `monoArgClosedPin` 2,657, `monoUncalledSlotFnTy` 318, `monoUncalledListElems` 225, `monoUnboundDefaultTy` 90, `monoBindTyParamDefault` 50, `monoDefaultUnboundTyParams` 21, `monoHoleFnPinTyOf` 21, `monoUncalledNestedListElems` 15.
+- [ ] **unbound default** (12): `monoElabDefaultsPrime` 18,170, `monoHoleGenFnFlowTy` 7,941, `monoChoiceArmFlowTy` 7,929, `monoDefaultTyParamsOnlyGenFns` 5,541, `monoArgClosedPin` 2,657, `monoUncalledSlotFnTy` 318, `monoUncalledListElems` 225, ~~`monoUnboundDefaultTy` 90~~, `monoBindTyParamDefault` 50, `monoDefaultUnboundTyParams` 21, `monoHoleFnPinTyOf` 21, `monoUncalledNestedListElems` 15.
+  An empty `[]` argument of an unbound call is built at the elaboration's default instance
+  (`elabArgBuiltTy`: the callee's parameter at that instance's bindings), which `monoArgClosedPin`
+  reads where mono's own default rung was: 12 decisions in 6 programs, all byte-identical.
 - [ ] **slot held fns** (29): `monoWalkIdentCall` 9,604, `monoWrittenGenLetFrame` 9,601, `monoFlowReadsAll` 9,597, `monoFlowLetCalls` 8,067, `monoFlowLetVals` 7,770, `monoFlowParamVals` 7,769, `monoFlowDeclVals` 7,740, `monoFlowValsOf` 7,511, `monoCoerceWrittenLetTys` 5,811, `monoFlowReadsRound` 2,993, `monoFlowUsePlanAt` 2,921, `monoArmWrittenLetSeed` 1,627, `monoFlowAliasReadVals` 1,174, `monoFlowLetLeaf` 655, `monoFlowRetLocalLists` 581, `monoFlowKeptIndexElem` 511, `monoFlowMapVals` 384, `monoFlowDirectSet` 186, `monoFlowAliasMaps` 170, `monoFlowElemsGen` 105, `monoFlowLetMapLeaf` 75, `monoFlowReadElemAt` 72, `monoFlowMapReadVals` 50, `monoFlowLoopVarVals` 26, `monoFlowReplanPending` 18, `monoLetSeedGenFe` 5, `monoCellCall` 5, `monoFlowReadElem` 0, `monoFlowUsePlan` 0.
 - [ ] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, ~~`monoReachSlotPins` 546~~, ~~`monoDeclPathPinsOrReach` 173~~, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, ~~`monoReachSlotPinsAt` 78~~.
 - [ ] **node type** (29): `monoCloseRetFnTy` 9,592, `monoInitHeldTy` 6,742, `monoArgClosedTyIn` 5,475, `monoPinBin` 4,320, `monoPinnedOperandTy` 3,781, `monoSubstLetType` 3,348, `monoCloneLetDecl` 3,020, `monoCoerceListCbArg` 2,889, `monoPinReturnedObj` 1,945, `monoCbFnListRowSpell` 1,107, `monoDeadNullTest` 882, `monoCgcTplTy` 668, `monoRetFnListTy` 608, `monoPinnedAnnTyAt` 509, `monoLeafParamPin` 420, `monoBoundFnListElemsTy` 352, `monoPinnedReadTy` 341, `monoClosedObjLitTy` 174, `monoLetAnnTyOf` 66, `monoHoleFnPinTy` 33, `monoLetWriteRhsTyRec` 15, `monoPinnedListElemPin` 14, `monoLetWritesRecord` 6, `monoModuleDupPin` 3, `monoArgOpenValueTy` 1, `monoModuleLetPin` 0, `monoClosedFieldValTy` 0, `monoLetWriteRhsTy` 0, `monoPinnedListAnnTy` 0.
