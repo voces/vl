@@ -3537,7 +3537,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       return (ftParamOfSet(pn, x, s) && ftLateParamOk(pn, x, s))
         || ftMethodTyParamArg(p, x, s)
         || ftListCallHoleArg(pn, x, s)
-        || ftSlotWriteArg(pn, x, s)
+        || ftSlotWriteArg(pn, x, s, fn)
         || ftLateArgOfSet(pn, x, s)
     }
     // A binding's annotation delivers the value to a declared function type, a closure.
@@ -3615,7 +3615,9 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       // `h[k] = v` stores into the slot `h.set(k, v)` does, so the holder's type decides (D15116).
       if ln is Member { return ftSlotHoldsSet(ln.memObj, ln.memProp, s) }
       return ln is Index
-        && (ftSlotHoldsSet(ln.idxArr, "", s) || ftStoreInWider(ln.idxArr, s))
+        && (ftSlotHoldsSet(ln.idxArr, "", s)
+        || ftStoreInWider(ln.idxArr, s)
+        || ftNamedFnValue(x) && ftParamHolderHolds(ln.idxArr, s, fn))
     }
     FuncDecl => {
       if i32ListHas(pn.fnParams, x) { return true }
@@ -3940,17 +3942,57 @@ function ftHoleCallback(v: i32): boolean {
 
 // Whether argument `x` of call `c` is a value `m.set(k, v)` or `xs.push(v)` stores into a
 // holder of set `s`.
-function ftSlotWriteArg(c: Call, x: i32, s: i32): boolean {
+function ftSlotWriteArg(c: Call, x: i32, s: i32, encl: i32): boolean {
   const f = parenPeelIx(c.callFn)
   if f < 0 { return false }
   const fn = nodeAt(f)
   if !(fn is Member) { return false }
   const k = ftHoldKind(nodeTyIxOf(fn.memObj), s, FT_HOLD_DEPTH)
   if k == 1 && fn.memProp == "push" { return i32ListHas(c.callArgs, x) }
-  (ftSlotHoldsSet(fn.memObj, "", s) || k == 5)
+  (ftSlotHoldsSet(fn.memObj, "", s)
+    || k == 5
+    || ftNamedFnValue(x) && ftParamHolderHolds(fn.memObj, s, encl))
     && fn.memProp == "set"
     && c.callArgs.length == 2
     && c.callArgs[1] == x
+}
+
+// Whether `x` names a declared function, a value whose set is the same at every call of the
+// function it is written in.
+function ftNamedFnValue(x: i32): boolean {
+  const v = parenPeelIx(x)
+  v >= 0 && v < P.nodes.length && nodeAt(v) is Ident && identFnDeclOf(v) >= 0
+}
+
+// Whether `h` reads an un-annotated parameter of `fd`, the function the read is in, that every call
+// hands, positionally, a list or map whose element or value carries set `s` or a wider one decided
+// with it: a write into its slot lands in that holder, as the same write at each call site would.
+function ftParamHolderHolds(h: i32, s: i32, fd: i32): boolean {
+  const v = parenPeelIx(h)
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+  const pd = identDeclOf(v)
+  const pn = if pd >= 0 && pd < P.nodes.length { nodeAt(pd) } else { null }
+  if !(pn is Param) || pn.parType >= 0 { return false }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) { return false }
+  const pi = i32ListIndexOf(f.fnParams, pd)
+  if pi < 0 { return false }
+  const args = fnParamHandArgsOf(fd, pi)
+  if args.length == 0 { return false }
+  // A holder of a wider set takes the write as one of its ids, the wider set decided with `s`.
+  const wider: i32[] = []
+  for a in args {
+    const t = nodeTyIxOf(a)
+    const at = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    const slot = if at is TyArray { at.aElem } else if at is TyMap { at.mVal } else { -1 }
+    const o = fnTagSetOfTy(slot)
+    if o < 0 || o != s && !ftSetWithin(s, o) { return false }
+    if o != s && !i32ListHas(wider, o) { wider.push(o) }
+  }
+  for o in wider {
+    if !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
+  }
+  true
 }
 
 // Whether a slot of holder `h` holds set `s`'s ids itself: with `prop` "" a list's element or a
