@@ -553,6 +553,7 @@ import {
   letBindTy,
   letInitUnionListTy,
   litArmRowOf,
+  litRetArmRow,
   spreadLitSrcRowName,
   structIndexOfExpr,
 } from "./emit_classify"
@@ -1185,7 +1186,7 @@ export function monoArgPinTyIx(ix: i32, fnIx: i32) {
   const pt = monoCloPinTyOf(ax, fnIx)
   if pt >= 0 { return pt }
   // The variant `monoArgTyNameRep` pinned an unadopted literal at banks that variant's type.
-  const ov = monoArgOwnVariant(ax)
+  const ov = litRetArmRow(ax)
   if ov >= 0 && ov < uVarTyIx.length { return uVarTyIx[ov] }
   // A literal the record solve built at another record banks that build, as its pin names it.
   const lb = monoLitBuiltTy(ax)
@@ -2034,7 +2035,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     if avn != "" { return avn }
   }
   if exprStruct(ix, fnIx) {
-    const olv = monoArgOwnVariant(cax)
+    const olv = litRetArmRow(unwrapParen(cax))
     if olv >= 0 && olv < uVariants.length {
       const olp = monoAnnPinName(uVariants[olv])
       if olp != "" { return olp }
@@ -2103,89 +2104,6 @@ function monoRowBoxesBareField(si: i32, ty: i32): boolean {
     }
   }
   false
-}
-
-// Unadopted object literal -> the variant row of the union destination its generic calls hand
-// it to, as `monoNoteLitDest` records it.
-let monoLitDestVariant: {[i32]: i32} = Map()
-
-// The variant row `monoNoteLitDest` recorded for argument `ix`, else -1.
-function monoArgOwnVariant(ix: i32): i32 {
-  monoLitDestVariant[unwrapParen(ix)] ?? -1
-}
-
-// Records the variant row an unadopted object literal at `at` lands in when `at`, a generic
-// call handing the literal back, is delivered to union-typed `tyNode`. The literal's own type
-// is that variant's, while the field-name scan would pin a declared record sharing it (D8381).
-function monoNoteLitDest(at: i32, tyNode: i32): i32 {
-  if at < 0 || tyNode < 0 { return 0 }
-  const dt = nodeTyIxOf(tyNode)
-  if dt < 0 || dt >= T.tys.length { return 0 }
-  const du = tyAt(dt)
-  if !(du is TyUnion) { return 0 }
-  monoNoteLitDestIn(unwrapParen(at), du.uMembers, 0)
-}
-
-// `monoNoteLitDest` through call `x` at nesting `depth`, over destination members `ms`.
-function monoNoteLitDestIn(x: i32, ms: i32[], depth: i32): i32 {
-  const c = nodeAt(x)
-  if !(c is Call) || depth > TY_WALK_DEPTH { return 0 }
-  const ct = nodeTyIxOf(x)
-  for a in c.callArgs {
-    const ax = unwrapParen(a)
-    const at = nodeTyIxOf(ax)
-    if ax >= 0 && monoTyMutual(at, ct) {
-      if nodeAt(ax) is Call {
-        monoNoteLitDestIn(ax, ms, depth + 1)
-      } else if nodeAt(ax) is ObjLit && nodeRepTyIxOf(ax) == at {
-        const vr = monoVariantRowAmong(at, ms)
-        if vr >= 0 { monoLitDestVariant[ax] = vr }
-      }
-    }
-  }
-  0
-}
-
-// The one variant row whose type is in `ms` and is `ty`'s own, else -1.
-function monoVariantRowAmong(ty: i32, ms: i32[]): i32 {
-  let vr = -1
-  let i = 0
-  while i < uVarTyIx.length && i < uVariants.length {
-    const vt = uVarTyIx[i]
-    if monoTyIn(vt, ms) && monoTyMutual(vt, ty) {
-      if vr >= 0 { return -1 }
-      vr = i
-    }
-    i = i + 1
-  }
-  vr
-}
-
-// `monoNoteLitDestIn` for each call element of list literal `ix`, where the list's element
-// type is a variant's: the list stores that variant's row.
-function monoNoteListLitDests(ix: i32): i32 {
-  const n = nodeAt(ix)
-  const lt = nodeTyIxOf(ix)
-  if !(n is ArrayLit) || lt < 0 || lt >= T.tys.length { return 0 }
-  const l = tyAt(lt)
-  if !(l is TyArray) || l.aElem < 0 { return 0 }
-  const ms = [l.aElem]
-  for e in n.arrElems { monoNoteLitDestIn(unwrapParen(e), ms, 0) }
-  0
-}
-
-// Whether type `t` is, up to mutual assignability, one of `ms`.
-function monoTyIn(t: i32, ms: i32[]): boolean {
-  for m in ms {
-    if m == t || monoTyMutual(m, t) { return true }
-  }
-  false
-}
-
-// Whether types `a` and `b` are each assignable to the other; false for a hole.
-function monoTyMutual(a: i32, b: i32): boolean {
-  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
-  assignable(a, b) && assignable(b, a)
 }
 
 // The pin a litunion or litunion-list argument `ix` takes, "" for any other argument.
@@ -24839,7 +24757,6 @@ function monoWalk(ix: i32, ctx: i32) {
         }
         return 0
       }
-      monoNoteCallLitDests(n, ix, ctx)
       const args = n.callArgs
       let i = 0
       while i < args.length {
@@ -25105,7 +25022,6 @@ function monoWalk(ix: i32, ctx: i32) {
     }
     ArrayLit => {
       const es = n.arrElems
-      monoNoteListLitDests(ix)
       let i3 = 0
       while i3 < es.length {
         // An alias of a capture cell's read in a program's list is called through the list, which
@@ -25190,7 +25106,6 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   }
   monoInstanceExactRet = false
   if monoNoteBindDelivery(n.letInit, n.letType, ctx, -1) < 0 { return -1 }
-  monoNoteLitDest(n.letInit, n.letType)
   if monoWalk(n.letInit, ctx) < 0 { return -1 }
   monoCloseListCbBindReads(n, ix, ctx)
   // A field a call initialises reads at the instance the walk just gave that call (D9714).
@@ -25236,26 +25151,6 @@ function monoObjLitOpenCallField(n: LetDecl): boolean {
     }
   }
   false
-}
-
-// `monoNoteLitDest` for each argument of call `n` (node `ix`) at a concrete annotated
-// parameter, ahead of the walk that instantiates the generic calls inside those arguments.
-function monoNoteCallLitDests(n: Call, ix: i32, ctx: i32) {
-  if n.callFn < 0 { return 0 }
-  const callee = nodeAt(n.callFn)
-  if !(callee is Ident) { return 0 }
-  const dfe = monoFnFeOfIdent(n.callFn, callee.identName, ctx)
-  if dfe < 0 { return 0 }
-  const pargs = monoArgsInParamOrder(ix, monoFnDeclNodeAt(dfe))
-  let ca = 0
-  while ca < pargs.length {
-    const pty = monoFnParamTypeAt(dfe, ca)
-    if pty >= 0 && !monoFnParamAnnRidesTyParam(dfe, ca) {
-      monoNoteLitDest(pargs[ca], pty)
-    }
-    ca = ca + 1
-  }
-  0
 }
 
 // The template slot of the lambda a dispatch arm's nameless callee `cf` is bound to, or -1.
@@ -27814,7 +27709,6 @@ export function monomorphize(stmts: i32[]) {
   monoCloCoerceFe = Map()
   monoClashLits = []
   monoCallTpl = Map()
-  monoLitDestVariant = Map()
   monoLamCallCallees = []
   monoProgLamNames = []
   monoBodyDeclStamp = 0 - 1
