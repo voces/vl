@@ -1762,7 +1762,11 @@ holder of the set or a wider one decided with it (`ftParamHolderHolds`), and onl
 value naming a declared function, whose set no call changes. Bucket 1 is 32 parameters in 16
 programs. The map pin (`r5_rt`, the argument's checked type) still answers 13: 5 in D9480's
 fixture, whose map holding a non-generic keeps the set untagged, 3 written as a record `{f: id}`,
-3 an uncalled set (G5), and 2 outside bucket 1.
+3 an uncalled set (G5), and 2 outside bucket 1. The 3 record-written hits are all in
+`closures/hole-fn-generic-map-stored-through-parameter.vl`, whose `{id}` set three maps keep on
+mono, each alone: `c`, written only directly (served since D15532); `b`, a map of records
+a helper widens to two generics (D15493); and `h`, a map of functions a helper widens to two
+generics (D15531). They move only when all three are served.
 
 Two of the 13 are residuals with a named blocker, not a missing admission:
 
@@ -1775,21 +1779,18 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   at two types, is a check reject at both spellings, as the design says. The per-instance mint's
   population was measured over the same programs: `fnCloCoerceSetAt`'s -2 had 0 hits.
 - **The map-of-records holder kind** (3, and D15493's gain): holder kind 8, a map binding of the
-  set's records, is a holder where a parameter it is handed writes a record literal into it
-  (`ftMapRecHanded`), so mono pins that helper's instance at the binding's held rep. Every literal
-  written into the binding, through the helper or directly, is stamped at the rep's record, and
-  emit builds a stamped literal at that record's own row (`mintPinnedObjLit`) rather than minting
-  an id row of its own, which had left the callee's literal on a second `struct {mut i32}` row
-  beside the map's. An entry read through `?.` is not a holder: `drwOptGuard`'s call gets no id
-  member call, so `closures/generic-record-written-into-map-through-param-read-through-optional.vl`
-  runs on mono as on master (a decline, not a refusal). The price is one late demand per such
-  program, the helper's instance keyed at the held map, as with `T[]` above. A map written only directly stays on mono (`ftMapRecUnhanded`):
-  its literal's row is emit's anonymous mint, which a list holding the same record type twins
-  (`closures/map-of-records-beside-list-of-same-record.vl`), so the matrix's `map_value` and
-  `map_set` cells wait on one named fact: emit interning a direct-only held map's record row at
-  top level. A set one such binding holds stays untagged whole, so the 3 record-written hits of
-  the map pin in `closures/hole-fn-generic-map-stored-through-parameter.vl` stay with it. Two
-  different generics in one map of records still refuse loudly (D15493).
+  set's records, is a holder whether it is written directly or through a helper's parameter. Every
+  literal written into it is stamped at the binding's held rep's record, and emit builds a stamped
+  literal at that record's own row (`mintPinnedObjLit`) rather than minting an id row of its own.
+  collectA interns the held rep's value row and mv slot (`fnTagHeldRepOf`), the rep `Map()` and
+  every read of the binding already resolve to; without it a map written only directly had no slot
+  (`closures/map-of-records-beside-list-of-same-record.vl`, D15532). Mono still pins a helper's
+  parameter at the held rep (`monoPinHoleParam`); that pin is the instance's type, not only the
+  intern, and without it the helper's store refuses. An entry read through `?.` is not a holder:
+  `drwOptGuard`'s call gets no id member call, so
+  `closures/generic-record-written-into-map-through-param-read-through-optional.vl` runs on mono as
+  on master (a decline, not a refusal). The price is one late demand per helper handed a held map,
+  as with `T[]` above. Two different generics in one map of records still refuse loudly (D15493).
 
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
@@ -2259,7 +2260,8 @@ where the elaboration names several generics and the read is no longer rewritten
 `mfrChainFns` of every call's callee read: one walk down the read's value chain, gated at every
 link. A written binding holds every value written to it; a slot holds every value stored there
 (`cwSlotWrittenValues`, through a callee's parameter too); `??` holds both sides; a parameter
-holds every call's argument. A literal index needs the literal unwritten after its build and the
+holds every call's argument, unless its function is exported, whose callers outside the program
+the walk cannot see. A literal index needs the literal unwritten after its build and the
 index inside it, so a read past the end still traps. A lambda leaf, a parenthesised name (the emitter does not
 instance one taken as a value: [D4120](inventory/D4120.md)), an
 annotation, a parameter default, or any unknown link declines. The read's ROOT must be a `let` or `const`: a read rooted at
@@ -2275,6 +2277,10 @@ deferred until a census shows a walker-rewritten read this declines. `monoFlowDi
 deleted. `monoFlowLetCalls` (its `LetLeaf`) and `monoFlowConstCallArgs` stay: they rename
 ARGUMENT reads, which the gate does not ask about, and switching them off lost 3 runs. They go
 with B2. Use classification stays mono's (syntax, class c).
+
+Open, not acted on: an exported function's function-typed parameter takes the tag layer's
+closed-world set, so a call through it dispatches over the program's own members even when a host
+calls the export. Closed-world tag set vs open needs a host-ABI ruling.
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
