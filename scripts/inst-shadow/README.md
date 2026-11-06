@@ -1,11 +1,12 @@
 # inst-shadow: mono's instance choice against the elaboration's
 
-`run.sh` measures how far `monoWalkIdentCall`'s instance of a generic call is from the answer
-the elaboration already holds. For each call it compares the parameter types of the instance the
-call made or hit (`monoInstParamPinTys`) with `callArgRepTy(ix, i, elabCallParamTy(ix, i))`.
-This is the instrument the switch to the elaboration's answer is graded with
-(architecture-target-2026-10.md §3.4): the switch lands once it reports no `REAL` tag, and every
-`no:` bucket left is a named fallback.
+`run.sh` measures how far mono's instance of a call is from the answer the elaboration already
+holds, at every call `monoInstantiateCallIn` instances. For each call it compares the parameter
+types of the instance the call made or hit (`monoInstParamPinTys`) with
+`callArgRepTy(ix, i, elabCallParamTy(ix, i))`. A call that `monoWalkIdentCall` did not hand on is
+marked `*` after its line number. This is the instrument the instance choice is graded with
+(architecture-target-2026-10.md §3.4): the order of elaboration sources mono reads, then the named
+fallback tail, then a loud refusal no corpus program reaches.
 
 ```sh
 scripts/inst-shadow/run.sh [--seed S] [--jobs N] [--out F] [FILE...]
@@ -15,7 +16,7 @@ scripts/inst-shadow/run.sh [--seed S] [--jobs N] [--out F] [FILE...]
 tree. Each line the probe prints reaches stdout through `$VL_LATE_DEMANDS`, so the probe adds no
 host import. When the patch stops applying, re-anchor it on the five sites it names:
 - the `monoInstantiate` call in `monoWalkIdentCall`;
-- the `monoMakeInstance` call in `monoInstantiateCallIn`;
+- the `monoMakeInstance` call in `monoInstantiateCallIn`, and its `return made`;
 - the registry hit and register in `monoMakeInstanceHit` and `monoMakeInstanceRegister`;
 - `elabLateCount` in `emit_elab.vl`.
 
