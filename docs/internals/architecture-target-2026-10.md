@@ -1253,6 +1253,44 @@ both reps. The switch therefore lands:
    fallback named here, rather than a wider rule.
 **The slot-delivery family, landed** (2026-11-06, #6465). `monoDeclPathKeysIn` reads `elabSlotDeliveries`; `rets` mode stays on the table. Known over-width: `closures/binding-copied-through-uncalled-chain.vl` lowers one closure with an unused trailing `i32` parameter that its call site fills (output unchanged), for a later rep pass to drop.
 
+**The slot readers of the agreed pin, landed** (2026-11-06). `monoPathSlotPinnedFnTy` and
+`monoHeldSrcsFnTy` read a slot's pin from the checker's per-slot call index
+(`slotCallArgsInto`, check_calls.vl) in place of `fnFlowCallPathAgreedPinTys` and
+`fnFlowDeclPathAgreedPinTys`. Shadowed at both sites over `tests/cases`, the index first agreed
+at 8 of 14 site-hits. Two gaps closed the rest:
+
+- a call through a `const` copy of a list (`const bs = [...ps]; bs[0](2)`) is noted at the
+  binding the copy reads, so the reader asks that binding (`calleeSlotHolderOf`);
+- one call with no arguments (`ks[0]()`) is a tuple, not the absence of one
+  (`fnSlotCallArgsInto`).
+
+That gave 11 agree with equal tuples, 3 where neither answers, and none on one side only. The
+reader is unkeyed by call. The table's per-call narrowing moved no file: fixpoint seeds against
+master build all 7,538 sweep programs byte-identical with the split plan on and off.
+`fnFlowCallPathAgreedPinTys` is deleted. `fnFlowDeclPathAgreedPinTys` stays for
+`monoHoleGenBindFnArgs`.
+
+**The forward gap, closed** (2026-11-06). Both argument edges of the climb resolve a callee
+through `elabCalleeFns`. That is the declared function a name calls, else each function the slot
+it reads can hold: an alias, a list element, a joined value, or a written `let` and its writes.
+The only-call shadow on master `0e6d2104f`, over `tests/cases` (site-hits):
+
+| | agree | table only | elaboration only | neither |
+| --- | --- | --- | --- | --- |
+| before | 68 | 18 | 35 | 80 |
+| after | 81 | 5 | 53 | 62 |
+
+The 5 table-only hits left:
+
+- 2 are D15444's order rule;
+- 1 is D15455's parameter-written record field;
+- 2 are D6883's annotated copy stored in a record (`const b: F = a; const r = { f: b };
+  r.f("w")`), whose climb stops at the annotated `const`. Fixpoint seeds build all 7,538 sweep programs byte-identical
+with the split plan on and off, so this is shadow-only until the only-call reader switches. The
+shared-slot witness is `closures/shared-slot-hole-fn-and-closure-through-function-value-callee.vl`.
+Its failing twin, through a list or joined callee given a hole function and a closed-typed
+function, is D15484.
+
 4. **The rest.** `fnFlowElemKind` and `fnFlowWholeSliceRecv` are syntax and move into mono.
    `fnFlowDeclFn` becomes `recEnclosingFn`. `fnFlowTableBuild`, `fnFlowShadowBegin` and
    `fnFlowStageInstHoles` go with the file.
