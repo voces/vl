@@ -1528,6 +1528,56 @@ Where the elaboration has no closed type (parameters):
 - `no:noframe`, 39 in 20: keys exist, none from the instance being walked
   (`closures/generic-list-to-unannotated-param.vl`).
 
+**The fallback sources, graded** (2026-11-06, master `361a98fd6`, the same population). For each
+parameter the walk top leaves without a closed type, `scripts/inst-shadow` grades eight other
+elaboration sources against mono's pin, in the order the switch reads them:
+1. the instances the parameter carries;
+2. the argument's own type;
+3. the bundle signatures;
+4. the tagged set the argument carries;
+5. the parameter's type with the shadow aliases a rename minted (`T__sh<d>`, a spelling difference);
+6. the open type, where mono spells it the same;
+7. the single signature `elabCallBundleSigs` drops;
+8. the checker's closed type for a solved hole parameter.
+
+A non-generic callee with no key is graded against `recArgRepOf`, else its annotation (`argrep`):
+all 118 parameters in 55 programs agree, so that bucket needs no new fact.
+
+| bucket | params | answered and agreeing, by source | no source |
+|---|---|---|---|
+| `openhole` | 520 | 447: bundle 251, tagged set 122, same open spelling 33, shadow alias 31, own instances 8, argument 2 | 72 |
+| `nokey-gen` | 86 | 24: checked type 16, argument 8 | 62 |
+| `nokey-plainhole` | 71 | 68: checked type 66, argument 2 | 3 |
+| `noframe` | 39 | 27: argument | 12 |
+| `nokey-emptylist` | 10 | 0 | 10 |
+| `nokey-value` | 7 | 0 | 7 |
+
+One source disagrees, and it is no gap. `closures/lambda-bundle-through-hole-param-at-several-signatures.vl:19`
+hands a function that takes the bundle; the signature the elaboration records belongs to the
+inner call.
+
+What no source answers:
+
+- **A generic function value whose instance is fixed past the call** (72 `openhole`, 35
+  programs). The value is handed into a hole parameter, a map or a list, and mono pins it from the
+  calls made through it later: D9480, D9890, D10023, `closures/generic-fn-value-returned-through-identity-hole.vl`.
+  Most of these run today. The missing fact is the one D15298 pins: function-value identity in the
+  type (`Fn#d`, §2.2 steps 3 and 4). This bucket is blocked on it.
+- **A type parameter the call leaves unbound or ambiguous** (62 `nokey-gen` and 10
+  `nokey-emptylist`). Mono defaults it (`monoDefaultUnboundTyParams`): `f(Map())` (D14735),
+  `one(Set())` (D15040), `len([])` (D12581), and `F<A, B>(v: A | B)` at `5` (D14803). This is a
+  named fallback, a defaulting rule rather than a missing fact. The elaboration should own the
+  default eventually, but not in this change.
+- **A call inside a body mono cloned** (12 `noframe`), which the walk top does not index:
+  `len$m…$2` in `generics/typaram-list-union-param-forwards-to-generic.vl`, `inc3$1` in
+  `closures/hole-fn-record-field-called-at-other-param.vl`.
+- **A call through a value** (7), and three solved hole parameters the checker leaves open
+  (D15331).
+
+Mono declines 1,969 calls (573 programs). For 662 of their parameters (183 programs) the
+elaboration closes the type anyway (`eo:yes`). Those are the decline set, and the switch keeps them
+declining.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
