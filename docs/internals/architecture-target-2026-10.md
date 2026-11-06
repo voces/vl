@@ -1524,7 +1524,7 @@ elaboration fact that should carry the same answer: `monoWalkIdentCall`'s instan
   `monoIfChainRebuildPinned` is the one with pin logic.
 - `monoMakeInstanceGo`'s instance note is the instance key, already the elaboration's ("The call
   half and the value half" below). The only spelling left is an instance the elaboration has no key
-  for, and the 4 bundle members that section names.
+  for; the 4 bundle members that section names are keyed since #6461.
 
 **Shadow of `monoHoleGenFnPin`** (the signature a generic handed to a hole parameter takes), against
 `callArgRepTy` over `elabCallParamTy` at `monoPinHoleParam`: 83 programs agree, 0 disagree, and 4 get
@@ -1789,7 +1789,8 @@ have a call-time key (`instKeyCallTime`) that spells differently from the key mo
 | bundle member | 4 | a lambda handed as a closure bundle has one instance per signature; the value key names another member | the key needs the member's signature (`elabCallBundleSigs`) |
 | type vs rep | 4 | one side names the type (`T=(1\|2)`, `{r:null}`), the other the rep | expected; the rep component carries it |
 
-The value half's switch therefore owes the 4 bundle members; the other classes are spellings the
+The 4 bundle members are keyed since #6461: the value key (`instKeyValueTime`) asks
+`elabValueKeyAt` for the member taking the pinned types. The other classes are spellings the
 canonical key already absorbs.
 
 ## 4. Scoreboard
