@@ -670,7 +670,7 @@ The order: checker rows for value-of-generic deliveries, one slice per kind; the
 - 11: a set row that took the stub rep inside a container (`{[string]: Fn#}` handed to `f(mm)` that only reads `mm.length`) takes the rep of its hole-function members' default instances, their parameter holes at `i32` (D4551), as mono builds it; a bare set value stays the stub, built as no body.
 - 10 (#5256, the mono-keying lane): a list argument whose pin names another record's row of the same layout takes the argument's own type (`monoPinRowNamesOtherTy` peels list layers), so `take([...src])` is keyed at `{f: {v: i32}}[]`, not `J[]`.
 
-- 1 (#5383): two calls of one declaration that the checker typed apart, each built at the same wider record (D14532's rep row), are one instance at that rep, which `elabRepRowInstances` enqueues; only the `@emit-error` fixture `closures/listed-hole-fn-escaping-list-reject.vl` is still late.
+- 1 (#5383): two calls of one declaration that the checker typed apart, each built at the same wider record (D14532's rep row), are one instance at that rep, which `elabRepRowInstances` enqueues; only the `@emit-error` fixture `closures/listed-hole-fn-escaping-list.vl` is still late.
 
 A producer inside `elabRun` decides without minting types. `substTyDeep` interns the types it builds, and calling it there, even with the result unused, changed later checking: D14426's and D14532's fixtures became type errors. Compare the rows' types (`tySame`) instead.
 
@@ -2200,6 +2200,27 @@ programs that a decline there turned into loud refusals run
 Any other node minted after `elabRun` still keeps the walkers' choice.
 One program's bytes move with the same output: `closures/hole-fn-list-reached-through-alias-called-in-callback.vl`,
 where the elaboration names several generics and the read is no longer rewritten.
+
+**B1: the chain gate admits callee reads** (2026-11-06). `monoFlowAdmitChain` asks
+`mfrChainFns` of every call's callee read: one walk down the read's value chain, gated at every
+link. A written binding holds every value written to it; a slot holds every value stored there
+(`cwSlotWrittenValues`, through a callee's parameter too); `??` holds both sides; a parameter
+holds every call's argument. A literal index needs the literal unwritten after its build and the
+index inside it, so a read past the end still traps. A lambda leaf, a parenthesised name (the emitter does not
+instance one taken as a value: [D4120](inventory/D4120.md)), an
+annotation, a parameter default, or any unknown link declines. The read's ROOT must be a `let` or `const`: a read rooted at
+a parameter keeps its argument built as closures at the call, and renaming it lost 8 runs and
+moved 2 outputs (`closures/hole-fn-{bound-list-returned-from-hole-param, flat-list-called-at-one-type,
+flat-list-called-at-one-type-tagged, list-handed-to-hole-param-tagged,
+list-literal-results-differ-handed-to-param-runs, list-returned-index-call-at-two-types,
+list-returned-reread, nested-list-handed-open, nested-list-length-read-tagged}.vl`,
+`closures/mixed-result-fn-list-literal-handed-to-hole-param-runs.vl`). The target is a generic or
+un-annotated-parameter function at module scope whose name nothing else declares. A written
+binding takes every value written to it rather than the value at the read; reaching writes are
+deferred until a census shows a walker-rewritten read this declines. `monoFlowDirectSet` is
+deleted. `monoFlowLetCalls` (its `LetLeaf`) and `monoFlowConstCallArgs` stay: they rename
+ARGUMENT reads, which the gate does not ask about, and switching them off lost 3 runs. They go
+with B2. Use classification stays mono's (syntax, class c).
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
