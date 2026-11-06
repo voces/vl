@@ -751,8 +751,8 @@ const hofAxis = (shape: HofShape, bar: number, note: string) =>
     note,
     (d) => twoFiles(d, genHofBodies(2000, shape), genHofBodies(500, shape)),
   );
-hofAxis("copy", 5.1, "`ffMerge` (compiler/fn_flow_shadow.vl) is copying the larger class into the smaller root, or deduping by scan (D4942).");
-hofAxis("list", 5.1, "`ffDirectedPins` (compiler/fn_flow_shadow.vl) is walking slots that reach no pin (D4942).");
+hofAxis("copy", 5.1, "`elabSlotDeliveries` (compiler/emit_elab.vl) is re-walking a slot per query, or its memo stopped answering (D4942).");
+hofAxis("list", 5.1, "`elabCallsReading` (compiler/emit_elab.vl) is scanning every call per slot query (D4942).");
 hofAxis("rewrite", 5.1, "`monoSubtreeHolds` or `monoTopFrameOf` (compiler/emit_mono.vl) is walking the program per write (D4942).");
 hofAxis("global", 5.1, "`monoTopFnUnnamed` (compiler/emit_mono.vl) is walking the program per module-scope function (D4942).");
 
@@ -2509,7 +2509,7 @@ const genFnFlowOne = (n: number): string => {
 axis(
   "fn-flow",
   2.5,
-  "The flow table is re-walking a function per caller or per merge (`ffEnsureWalked`, compiler/fn_flow_shadow.vl).",
+  "The elaboration is re-walking a function per caller (`elabSlotReadDeliveries`, compiler/emit_elab.vl).",
   (d) => twoFiles(d, genFnFlowChain(64), genFnFlowOne(64)),
 );
 
@@ -2596,7 +2596,7 @@ const genGenericProgram = (n: number): string => {
 axis(
   "functions in a program with one generic",
   5.0,
-  "A flow-table merge (`ffMerge`, compiler/fn_flow_shadow.vl) or a `monomorphize` frame question (compiler/emit_mono.vl) is re-walking the program per site.",
+  "An elaboration slot query (`elabSlotDeliveries`, compiler/emit_elab.vl) or a `monomorphize` frame question (compiler/emit_mono.vl) is re-walking the program per site.",
   (d) => twoFiles(d, genGenericProgram(1600), genGenericProgram(400)),
 );
 

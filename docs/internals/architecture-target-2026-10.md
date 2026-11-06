@@ -1392,12 +1392,16 @@ still exports and who reads each one. The file goes when every row is checked.
 | ~~`fnFlowPinSigOf` (with `ffPinSpell`)~~ (moved: `pinSigOf` / `pinSpell`, `emit_sig_tokens.vl`) | `monoDeclPathKeysIn`, `monoElemPinTysUnder`, `monoFlowSlotPins`, `monoPinFnParamTys`, `monoReachSlotPins` | builder | none needed: pure spelling of a parameter list; moves beside `sigKeyOfTy` in `emit_sig_tokens.vl` |
 | ~~`fnFlowElemKind`~~ (moved: `elemSlotKind`, `emit_query.vl`) | `monoPlaceRoot` | builder | none needed: a node's type is a map or not; moves to `emit_query.vl` |
 | ~~`fnFlowWholeSliceRecv` (with `ffTyHasFn`)~~ (moved: `wholeSliceRecv` / `tyHasFnDeep`, `emit_query.vl`) | `monoFlowSliceAsSpread` | builder | none needed: syntax plus a deep function-in-type test (`crTyHasFn` is shallow, so `ffTyHasFn` moves with it); moves to `emit_query.vl` |
-| `fnFlowTableBuild` | `monomorphize` | builder | deleted when the cad and lane F rows are done |
-| `fnFlowShadowBegin` | `runEmitPasses` (emit_sections) | builder | deleted with the build |
+| ~~`fnFlowTableBuild`~~ (done, with the file) | `monomorphize` | lane F | deleted when the cad and lane F rows are done |
+| ~~`fnFlowShadowBegin`~~ (done, with the file) | `runEmitPasses` (emit_sections) | lane F | deleted with the build; its one outside reset, `tyHasFnMemoReset`, is called there directly |
 
 The four "moves" rows can land now and independently: none needs the table, and `emit_mono.vl`
 takes no new functions. The file is deleted after the last cad and lane F rows, together with the
 build and begin hooks and the budget row.
+
+**`fn_flow_shadow.vl` deleted** (2026-11-06). Every row above is checked, and the file goes with
+`fnFlowTableBuild` in `monomorphize`, `fnFlowShadowBegin` in `runEmitPasses`, and its row in the
+pin-helper budget, which now holds `emit_mono.vl` alone.
 
 
 ---
