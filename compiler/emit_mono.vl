@@ -16883,149 +16883,6 @@ function monoPinReturnedObj(rx: i32, ctx: i32) {
   0
 }
 
-// Types the un-annotated binding `d` declared at `at` in frame `ctx`, initialized by a call of a
-// non-generic un-annotated function whose every result is a record literal `monoPinReturnedObj`
-// types alike, at that record, with the call and the reads through each function field (D9181).
-function monoPinCallRecord(d: LetDecl, at: i32, ctx: i32) {
-  if d.letInit < 0 || (ctx >= 0 && monoFrameIsGenericInstance(ctx)) { return 0 }
-  const cx = unwrapParen(d.letInit)
-  if cx < 0 || cx >= P.nodes.length { return 0 }
-  const c = nodeAt(cx)
-  if !(c is Call) || c.callFn < 0 || !monoTyOpen(nodeTyIxOf(cx)) { return 0 }
-  const callee = nodeAt(c.callFn)
-  if !(callee is Ident) { return 0 }
-  const fe = monoFnFeOfIdent(c.callFn, callee.identName, ctx)
-  if (
-    fe < 0
-    || fe >= fnStmts.length
-    || (fe < monoGen.length && monoGen[fe] != 0)
-  ) {
-    return 0
-  }
-  const rt = monoRetRecordOf(fnStmts[fe])
-  if (
-    rt < 0
-    || !monoLetWritesClosed(d, at, ctx)
-    || !monoLetWritesAt(d, at, ctx, rt)
-  ) {
-    return 0
-  }
-  monoLetWritesRecord(d, at, ctx)
-  nodeTyRecord(cx, rt)
-  for ix in monoFrameNodes(ctx) {
-    if monoTyOpen(nodeTyIxOf(ix)) && monoReadsBinding(ix, d.letName, ctx, at) {
-      nodeTyRecord(ix, rt)
-    }
-  }
-  monoRetypeRecFieldReads(ctx, at, rt)
-  0
-}
-
-// Types the call at the root of the field and index reads `v` makes (`mk().m["k"]`) at the record
-// `monoRetRecordOf` gives its non-generic un-annotated callee, and the reads through it (D9302).
-function monoPinInPlaceCallRecord(v: i32, ctx: i32) {
-  if ctx >= 0 && monoFrameIsGenericInstance(ctx) { return 0 }
-  let x = unwrapParen(v)
-  let hops = 0
-  while x >= 0 && x < P.nodes.length && hops < 16 {
-    const n = nodeAt(x)
-    if n is Member { x = unwrapParen(n.memObj) }
-    else if n is Index { x = unwrapParen(n.idxArr) }
-    else { break }
-    hops = hops + 1
-  }
-  if hops == 0 || x < 0 || x >= P.nodes.length { return 0 }
-  const c = nodeAt(x)
-  if !(c is Call) || c.callFn < 0 || !monoTyOpen(nodeTyIxOf(x)) { return 0 }
-  const callee = nodeAt(c.callFn)
-  if !(callee is Ident) { return 0 }
-  const fe = monoFnFeOfIdent(c.callFn, callee.identName, ctx)
-  if (
-    fe < 0
-    || fe >= fnStmts.length
-    || (fe < monoGen.length && monoGen[fe] != 0)
-  ) {
-    return 0
-  }
-  const rt = monoRetRecordOf(fnStmts[fe])
-  if rt < 0 { return 0 }
-  nodeTyRecord(x, rt)
-  monoRetypeRecMemberReads(ctx, monoFrameNodes(ctx), x, rt, 0)
-  0
-}
-
-// The record every value un-annotated function `fx` returns takes at the closed bindings it
-// reads, -1 unless all of them are record literals that close alike. A result the emitter
-// pinned to the checker's open record is re-pinned to it (D9250).
-function monoRetRecordOf(fx: i32): i32 {
-  if fx < 0 || fx >= P.nodes.length { return -1 }
-  const fd = nodeAt(fx)
-  if !(fd is FuncDecl) || monoIsGenericDecl(fx) { return -1 }
-  let pinned = false
-  if fd.fnRet >= 0 {
-    const done = monoRetRepinned.get(fx) ?? -1
-    if done >= 0 { return done }
-    const at = nodeTyIxOf(fd.fnRet)
-    if at < 0 || !monoTyOpen(at) || monoFrameIsGenericInstance(fx) { return -1 }
-    pinned = true
-  }
-  let rt = -1
-  for r in monoFnRetArgs(fd) {
-    if r < 0 { return -1 }
-    let v = r
-    const rn = nodeAt(r)
-    if rn is RetStmt { v = rn.retArg }
-    if v < 0 { return -1 }
-    const lx = unwrapParen(v)
-    if lx < 0 || lx >= P.nodes.length { return -1 }
-    let lt = -1
-    if nodeAt(lx) is ObjLit {
-      monoClosedObjLitTy(lx, fx, true)
-      lt = nodeTyIxOf(lx)
-    } else {
-      lt = monoRetConstRecord(lx, fx)
-    }
-    if lt < 0 || monoTyOpen(lt) || (rt >= 0 && !tyEq(rt, lt)) { return -1 }
-    rt = lt
-  }
-  if rt >= 0 && pinned {
-    const nm = monoPinAnnSpelling(rt)
-    if nm == "" { return -1 }
-    buildFnMapNoteFnSlotWrite()
-    fd.fnRet = synthTypeRefTy(nm, -1, rt)
-    monoRetRepinned.set(fx, rt)
-  }
-  rt
-}
-
-// The record the `const` that identifier `vx` returns in frame `fx` holds once its record
-// literal is typed at the closed bindings it reads, recorded on the literal and each read of
-// the binding; -1 for any other expression (D9251).
-function monoRetConstRecord(vx: i32, fx: i32): i32 {
-  const vn = nodeAt(vx)
-  if !(vn is Ident) { return -1 }
-  const at = monoReadLetFrame(vx, fx)[1]
-  if at < 0 { return -1 }
-  const d = nodeAt(at)
-  if !(d is LetDecl) || d.letKw != "const" || d.letType >= 0 || d.letInit < 0 {
-    return -1
-  }
-  const lx = unwrapParen(d.letInit)
-  if lx < 0 || lx >= P.nodes.length || !(nodeAt(lx) is ObjLit) { return -1 }
-  monoClosedObjLitTy(lx, fx, true)
-  const rt = nodeTyIxOf(lx)
-  if rt < 0 || monoTyOpen(rt) { return -1 }
-  for ix in monoFrameNodes(fx) {
-    if monoTyOpen(nodeTyIxOf(ix)) && monoReadsBinding(ix, d.letName, fx, at) {
-      nodeTyRecord(ix, rt)
-    }
-  }
-  rt
-}
-
-// Per function node `monoRetRecordOf` re-pinned, the record its result now names.
-let monoRetRepinned: {[i32]: i32} = Map()
-
 // Types the reads in frame `ctx` through each field of the record `rt` held by the binding
 // declared at `at`: a container of functions by its slot, any other field by its held paths.
 function monoRetypeRecFieldReads(ctx: i32, at: i32, rt: i32) {
@@ -25345,8 +25202,6 @@ function monoWalk(ix: i32, ctx: i32) {
           if cf.fnRet < 0 {
             monoPinReturnedObj(n.retArg, ctx)
             if monoPinReturnedList(n.retArg, ctx) < 0 { return -1 }
-          } else {
-            monoRetRecordOf(ctx)
           }
         }
       }
@@ -25570,8 +25425,6 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   // So does an un-annotated map of function values (D4579).
   if n.letType < 0 {
     if monoPinMapValues(n, ix, ctx) < 0 { return -1 }
-    monoPinCallRecord(n, ix, ctx)
-    monoPinInPlaceCallRecord(n.letInit, ctx)
   }
   // An annotated function-typed binding to a generic named function: materialize the
   // instance for the annotation's param types and point the binding at it, so the value
@@ -25910,7 +25763,6 @@ function monoWalkFnBodyIn(fnIx: i32) {
     monoReachIndex(one)
   }
   if fn is FuncDecl {
-    if fn.fnRet >= 0 { monoRetRecordOf(fnIx) }
     const widen = monoRetWidenFns.get(fnIx) ?? false
     if widen { monoInstanceWidenRet = true }
     const bc = monoCoerceFnValue(fn.fnBody, fn.fnRet, fnIx)
@@ -28235,7 +28087,6 @@ export function monomorphize(stmts: i32[]) {
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
   monoRetDeliveredAt = Map()
-  monoRetRepinned = Map()
   monoCellCoercedSig = Map()
   monoSigCallRet = -2
   monoHoleLamSlots = Map()

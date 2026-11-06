@@ -1847,6 +1847,20 @@ instance):
 - **Not switched: `monoCloseRetFnTy`.** The elaboration declines a returned list of functions (28
   reads), and it closes 19 calls mono leaves open.
 
+**Instance result, first pass (2026-11-06).**
+- `monoRetRecordOf` and its consumers `monoRetConstRecord`, `monoPinCallRecord` and
+  `monoPinInPlaceCallRecord` are deleted. The chain never pinned: over the 23,103 programs
+  `monoRetRecordOf` returned no record in 112,273 calls, and a build refusing wherever it would
+  return one passes the deno suites. A byte sweep of the 23,103 against master's fixpoint seed
+  differs on none. The elaboration's result (`elabResultAtParams`) answers 10 of those calls, all
+  in `std/idtable-*.vl`. That is a capability question, declined under ruling (a).
+- `monoPinnedRetAnnTy`'s 29 answers are a returned list literal of hole functions pinned by its
+  caller's calls (`hole-fn-list-returned-reread.vl`). The instance result is open there, so its
+  owning fact is the forward climb over the literal's element slot, as for the reach pair, and not
+  `elabRetOf`.
+- `monoRetRepOf` and `monoReturnedBundlePin` are rep decisions, so they move to the per-call
+  delivered rep below.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
