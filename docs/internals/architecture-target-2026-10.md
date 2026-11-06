@@ -2251,6 +2251,20 @@ two. The other readers (`monoArgRepRowTy`, `monoPinHoleParam`, `monoPinAnnotated
 `pass2(m, Set())` returning its parameter (D15040's set at a bare type parameter) reaches no row
 and is now a loud emit refusal; D1578's witness, which must stay invalid wasm, returns `i32`.
 
+**An argument's built record** (2026-11-06). Beside each slot, `erArgBuilt` holds the record the
+argument is built at where the call's bind row keys or pins it at its rep (`callBindRepKeyedAt`,
+`callBindRepMixedAt`), measured against the argument's own type. `elabArgBuiltRep` reads it where
+`monoArgRepRowTy` derived it, which is deleted. The rep slot alone answers the parameter's
+question, not the argument's: at a declared wider parameter (D2060's covariant records) the
+parameter's type differs from the argument's own while the argument keeps its record, and the 272
+such sites stay declined.
+
+**The parameter pins are aligned.** `monoPinHoleParam` and `monoPinAnnotatedParam` read
+`callArgRepTy` over `elabCallParamTy`, the checker's fact `erArgRep` is built from, and agree with
+the column at all 40 sites a rep reaches. They stay on it: 157 of their queries are calls with no
+reach row (124 the elaboration never reached, the rest reached only from another instance), where
+the rep is the type and the column has nothing to answer.
+
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
 a record built wider, which is why 34 of the 74 pairs close under `callArgRepTy`. Each remaining kind
