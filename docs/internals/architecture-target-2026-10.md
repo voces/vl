@@ -1793,7 +1793,7 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 | unbound default | an elaboration-owned default for an unbound type parameter or hole | 12 | 18,170 | split-dep |
 | slot held fns | `elabSlotHeldFns` of the binding or slot | 29 | 9,604 | split-dep |
 | slot deliveries | `elabSlotDeliveries` of the binding or cell | 9 | 9,601 | — |
-| node type | `elabNodeTyAt` at the instance | 29 | 9,592 | — |
+| node type | `elabNodeTyAt` at the instance | 29 | 9,592 | blocked on Fn#d |
 | slot type | `elabSlotTyAt` / `elabSlotTys` of the slot | 27 | 9,578 | — |
 | lambda sigs | `elabLamParamSigs` | 11 | 9,023 | lane F |
 | instance binding | the instance key's binding (`ekTys`, `elabInstTyAt`, `elabParamTyOwnAt`) | 34 | 9,023 | reach, split-dep |
@@ -1860,6 +1860,50 @@ instance):
   `elabRetOf`.
 - `monoRetRepOf` and `monoReturnedBundlePin` are rep decisions, so they move to the per-call
   delivered rep below.
+
+**Node type, blocked on closed function-holding types** (2026-11-06). Two more helpers were
+shadowed against `elabNodeTyAt` at the instance:
+
+| function | agree | both decline | mono only | elaboration only |
+|---|---|---|---|---|
+| `monoClosedObjLitTy` | 0 | 158 | 8 | 272 |
+| `monoRetFnListTy` | 0 | 767 | 23 | 563 |
+
+Mono answers only a type that holds a function (`{m:{[string]:(i32)=>i32}}`, `((i32)=>i32)[]`,
+`(i32)=>i32`), which is all these helpers exist for. The elaboration declines every one, and where
+it answers (`{q:i32}`, `i32[]`) mono declines by design. `monoCloseRetFnTy` has the same shape.
+The rest of the family waits on `elabNodeTyAt` closing a function-holding type at the instance,
+the Fn#d lane's function-value identity (D15298). Those mono-only rows are its acceptance
+witnesses. Four helpers move to the instance-binding family: `monoPinBin`, `monoPinnedOperandTy`,
+`monoPinnedReadTy` and `monoDeadNullTest` read only the instance's own pin column, in
+`monoMakeInstanceGo`'s body rewrite.
+
+**Slot type, first reading: `monoReachSlotTy`** (2026-11-06). Value reach (`vrCalleeTy`) against
+the climb's agreed tuple (`elabLitSlotCallTys`), each computed on its own:
+
+| outcome | site-hits | files |
+|---|---|---|
+| agree | 314 | 161 |
+| both decline | 505 | 253 |
+| the elaboration only, reach declines | 228 | 107 |
+| reach open, the elaboration declines | 26 | 20 |
+| the elaboration only, reach open | 1 | 1 |
+| reach only | 17 | 10 |
+| differ | 0 | 0 |
+
+The rung stays. The 17 reach-only site-hits are where the climb records no tuple, so they are the
+next forward-climb edges to add:
+- a list built by `push` or spread (`closures/hole-fn-generic-pushed-list-spread.vl`,
+  `closures/hole-fn-into-pushed-lambda-bound-by-every-call.vl`);
+- a lambda member of a capturing list (`closures/hole-fn-list-capturing-lambda-member-at-handed-result.vl`,
+  `closures/hole-lambda-on-hole-fn-list-capturing-hole-param.vl`);
+- a function field handed to a narrower declared parameter
+  (`structs/record-with-generic-fn-field-into-narrower-declared-param.vl`,
+  `functions/exported-generic-reached-through-lambda-field-or-list-called.vl`);
+- D2853, D2862, D12880 and D12940.
+
+The 228 the elaboration alone answers are calls mono leaves untyped today, so the switch admits them
+too, and they are graded as newly admitted programs.
 
 #### Next stage, first item: a per-call delivered-rep fact
 
