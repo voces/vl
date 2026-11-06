@@ -1998,6 +1998,26 @@ The 18 old-only fall into two groups:
 
 The switch waits for the default, then for that climb edge.
 
+**`monoPinnedRetAnnTy` is switched** (2026-11-06). Each returned list literal closes from the climb
+(`monoLitSlotCallTy`, which follows nested list rows), else from the elaboration's uncalled default
+(`elabResultDefaultedOf`), which is gated on every held function being uncalled: it does not
+escape, the climb finds no call, and every instance of it is at the default signature. Ruling (a)
+keeps the default to a generic's instance or a list holding no record. `monoCallInstRetTy` and
+`monoInstRetLitTy` are deleted.
+
+The re-shadow over the 23,103 programs reads 27 agree, 1 differ, 2 new only and 1 old only:
+
+- The differ is `named/d15293_bound_returned.vl` at `mk("s")`. The old answer was stale
+  (`x: i32`, from the `mk(5)` instance), and the program prints the same output either way.
+- The old-only case is `hole-fn-list-unbound-and-returned.vl`, one instance called at two types,
+  where declining is correct.
+- The 16 D15207/D15294 cells the default would also answer are declined, and are left to D15294's
+  own change.
+
+The byte sweep against master's fixpoint moves 2 of 23,103 programs with the same output:
+`list-of-generic-returned-measured.vl` and `named/d15207_fn_list_ret.vl`. Each loses the dead body
+of an uncalled list function, which the old path instanced as a side effect of `monoRetFnListTy`.
+
 **Value returns are aligned.** `monoFlowCallLeaf` names the module-level generic every `return` of
 a call's callee reads. Over the 23,103 programs the climb confirms it: the one top-level generic
 whose value `elabValueReturnsFrom` finds reaching that return agrees at 87 queries. It differs at
