@@ -2277,6 +2277,10 @@ deleted. `monoFlowLetCalls` (its `LetLeaf`) and `monoFlowConstCallArgs` stay: th
 ARGUMENT reads, which the gate does not ask about, and switching them off lost 3 runs. They go
 with B2. Use classification stays mono's (syntax, class c).
 
+Open, not acted on: an exported function's function-typed parameter takes the tag layer's
+closed-world set, so a call through it dispatches over the program's own members even when a host
+calls the export. Closed-world tag set vs open needs a host-ABI ruling.
+
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
 move no output. These are the reads the gate does not answer: an argument handed on, a loop over a
