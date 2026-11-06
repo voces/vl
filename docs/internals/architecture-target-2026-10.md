@@ -1499,6 +1499,60 @@ elaboration fact that should carry the same answer: `monoWalkIdentCall`'s instan
 `monoIfChainRebuild`, `monoPinBodyLambdasRaw` (D1990), `monoCloneGenericCalls` (D2849, two arms),
 `monoCloneLambdaSubst` (two arms, D943 and seven more), `monoPinLamFromCheckedTy` (now `monoPinLamAtDelivery`; D3820, D3834).
 
+**Three of the queue close without a switch (2026-11-06).**
+- `monoNarrowedNominalPinName` is DECISIONS.md's rung 2 (D25, "Which channel owns a NARROWED
+  argument's type at a monomorphization pin"). It reads the argument's checked type, or
+  `elabClosedTyAt` inside a generic body, and pins the narrowed name where that type is a member of
+  the annotation's union. Shadowed against the elaboration's binding of the type parameter at the
+  call (`elabCallBindTy`, the call found through the write index's argument edge), over the 23,103
+  programs (5,203 reach it):
+
+  | outcome | events |
+  | --- | --- |
+  | both answer, agree | 28 |
+  | both answer, differ | 4 |
+  | old only | 0 |
+  | new only | 10,021 |
+  | neither | 5,816 |
+
+  The 4 that differ pin `Circle` where the elaboration binds the whole union
+  (`soundness/nulvariant-generic-pin.vl`, `std/array-reduce-narrowed-variant-init.vl`). That is the
+  ruling: the pin narrows below the binding. The new-only cells are calls the rung leaves to the
+  ladder. No elaboration fact carries the narrowed pin, so it stays.
+- `monoIfChainRebuild` computes no pin. It rebuilds a rewritten `else if` chain, and its one
+  decision arm gives each rebuilt link its original's checked type. Its per-instance twin
+  `monoIfChainRebuildPinned` is the one with pin logic.
+- `monoMakeInstanceGo`'s instance note is the instance key, already the elaboration's ("The call
+  half and the value half" below). The only spelling left is an instance the elaboration has no key
+  for; the 4 bundle members that section names are keyed since #6461.
+
+**`monoIfChainRebuildPinned` is aligned (2026-11-06).** It retypes a rebuilt value `if` link in an
+instance at a pinned join. Shadowed by rep (`repCanonKey`) against the instance's elaborated type
+of that `if` (`elabNodeTy(at, elabWalkTop())`, where closed and other than the template's type), over
+the 23,103 programs (2,638 reach it):
+
+| outcome | events |
+| --- | --- |
+| both answer, agree | 983 |
+| both answer, differ | 5 |
+| old only | 0 |
+| new only | 384 (227 programs) |
+| neither | 6,101 |
+
+The 5 that differ are narrower or boxed pins: `string` where the elaboration has `string | i32`
+(D3366), `(A|B|null)` against `(A|B)?`, and `f64?` against `(f64|i32)?`. Retyping at the
+elaboration's type wherever mono retypes leaves 499 of those 500 programs byte-identical, and the
+one that moves prints the same. Whether to retype at all stays mono's gate (ruling (a)), so the
+function stays.
+
+**Named follow-up: the 384 new retypes.** Mono declines them because it computes no join (231),
+because its pin leaves the template type (105), or because `monoPinKeepsMembers` refuses (48).
+Taking them with the gate read off the elaboration would delete the six helpers only this function
+uses: `monoIfArmsAllTy`, `monoIfArmsPinJoin`, `monoHoleJoinPinsString`, `monoHoleJoinHasAtomArm`,
+`monoPinKeepsMembers` and `monoCoalOverTpJoin`. Over the 227 programs, taking them leaves 223
+byte-identical and moves 2. It makes `generics/generic-optchain-map-get-coalesce-scalar.vl` a
+compiler trap, which is the first thing that capability PR must fix.
+
 **Shadow of `monoHoleGenFnPin`** (the signature a generic handed to a hole parameter takes), against
 `callArgRepTy` over `elabCallParamTy` at `monoPinHoleParam`: 83 programs agree, 0 disagree, and 4 get
 no elaboration answer: `closures/generic-fn-value-returned-through-identity-hole.vl`,
@@ -1690,6 +1744,31 @@ consolidation of the spelling rungs into one function is a pure refactor, graded
 byte-identical seed and corpus. It ends the tail in a loud refusal, "no elaboration answer for this
 parameter's instance (§3.4 fallback)", which no corpus program reaches.
 
+**Three more of the queue, graded** (2026-11-06, the 23,456-program population):
+
+- `monoPinNoteReturns` reads `elabValueReturnsFrom`, the climb's RET/TAIL edges (#6489).
+- `monoCloPinAnnNodeOfExpr`, the closed function type of a forwarder's read that its own recorded
+  type does not carry, reads `elabNodeTyAt` at the instance. Of the reads it answered, 81 agree
+  (79 at a parameter annotation, 2 at a `let`). Neither side answers alone, and 18,367 reads have
+  no answer on either side. The annotation walk is deleted.
+- `monoCloneGenericCallArm` (D12702) is closed as node mechanics, not switched. At each identifier
+  callee the earlier arms leave to it:
+
+| `monoCalleeElems` fires | callee type | per-instance type | site-hits | files |
+|---|---|---|---|---|
+| yes | open | moves | 13 | 7 |
+| yes | open | same | 193 | 94 |
+| yes | closed | same | 2 | 1 |
+| no | open | moves | 2,971 | 811 |
+| no | closed | moves | 316 | 157 |
+| no | open | same | 463 | 126 |
+| no | closed | same | 13,929 | 3,906 |
+
+  No typed condition reproduces the arm. "The type moves" holds at 3,287 site-hits the arm declines,
+  and the arm copies 195 callees whose type does not move. The arm copies a callee node read out of
+  a list literal, a `for` variable or an `if`. The callee's per-instance type is already the
+  elaboration's (`monoHoleNodeTy`), and no elaboration fact owns the choice to copy the node.
+
 #### Next stage, first item: a per-call delivered-rep fact
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
@@ -1819,7 +1898,8 @@ have a call-time key (`instKeyCallTime`) that spells differently from the key mo
 | bundle member | 4 | a lambda handed as a closure bundle has one instance per signature; the value key names another member | the key needs the member's signature (`elabCallBundleSigs`) |
 | type vs rep | 4 | one side names the type (`T=(1\|2)`, `{r:null}`), the other the rep | expected; the rep component carries it |
 
-The value half's switch therefore owes the 4 bundle members; the other classes are spellings the
+The 4 bundle members are keyed since #6461: the value key (`instKeyValueTime`) asks
+`elabValueKeyAt` for the member taking the pinned types. The other classes are spellings the
 canonical key already absorbs.
 
 ## 4. Scoreboard
