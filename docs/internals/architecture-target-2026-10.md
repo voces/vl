@@ -1388,10 +1388,10 @@ still exports and who reads each one. The file goes when every row is checked.
 | ~~`fnFlowDeclPathAgreedPinTysSkipping`~~ (done, #6479) | `monoElemFnPinTys` | cad | as above, with the skipped functions' calls left out |
 | `fnFlowCallPathAnnPinTys` | `monoPathSlotPinnedFnTy` (via `monoListSlotPinnedFnTy`) | builder | an annotated destination's parameters for a list element handed on to it; witness above |
 | ~~`fnFlowDeclFn`~~ (done, #6475) | `monoDeclFrameIn`, `monoReadIsBinding` | lane F | `recEnclosingFn` |
-| `FF_PIN_DECLINE` | `monoDeclPathKeys`, `monoDeclPathKeysIn`, `monoDeclPathPinsPerInstance`, `monoSlotRetName`, `monoSlotRetCount` | builder | none needed: its readers are all mono's own, so the sentinel moves to a module mono imports |
-| `fnFlowPinSigOf` (with `ffPinSpell`) | `monoDeclPathKeysIn`, `monoElemPinTysUnder`, `monoFlowSlotPins`, `monoPinFnParamTys`, `monoReachSlotPins` | builder | none needed: pure spelling of a parameter list; moves beside `sigKeyOfTy` in `emit_sig_tokens.vl` |
-| `fnFlowElemKind` | `monoPlaceRoot` | builder | none needed: a node's type is a map or not; moves to `emit_query.vl` |
-| `fnFlowWholeSliceRecv` (with `ffTyHasFn`) | `monoFlowSliceAsSpread` | builder | none needed: syntax plus a deep function-in-type test (`crTyHasFn` is shallow, so `ffTyHasFn` moves with it); moves to `emit_query.vl` |
+| ~~`FF_PIN_DECLINE`~~ (moved: `PIN_DECLINE`, `emit_sig_tokens.vl`) | `monoDeclPathKeys`, `monoDeclPathKeysIn`, `monoDeclPathPinsPerInstance`, `monoSlotRetName`, `monoSlotRetCount` | builder | none needed: its readers are all mono's own, so the sentinel moves to a module mono imports |
+| ~~`fnFlowPinSigOf` (with `ffPinSpell`)~~ (moved: `pinSigOf` / `pinSpell`, `emit_sig_tokens.vl`) | `monoDeclPathKeysIn`, `monoElemPinTysUnder`, `monoFlowSlotPins`, `monoPinFnParamTys`, `monoReachSlotPins` | builder | none needed: pure spelling of a parameter list; moves beside `sigKeyOfTy` in `emit_sig_tokens.vl` |
+| ~~`fnFlowElemKind`~~ (moved: `elemSlotKind`, `emit_query.vl`) | `monoPlaceRoot` | builder | none needed: a node's type is a map or not; moves to `emit_query.vl` |
+| ~~`fnFlowWholeSliceRecv` (with `ffTyHasFn`)~~ (moved: `wholeSliceRecv` / `tyHasFnDeep`, `emit_query.vl`) | `monoFlowSliceAsSpread` | builder | none needed: syntax plus a deep function-in-type test (`crTyHasFn` is shallow, so `ffTyHasFn` moves with it); moves to `emit_query.vl` |
 | `fnFlowTableBuild` | `monomorphize` | builder | deleted when the cad and lane F rows are done |
 | `fnFlowShadowBegin` | `runEmitPasses` (emit_sections) | builder | deleted with the build |
 
