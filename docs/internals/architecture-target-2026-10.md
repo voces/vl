@@ -2469,6 +2469,16 @@ variable's `monoFlowDeclVals` and otherwise the elaboration's roots, with the sa
 0 moved, three times. `monoFlowMapVals` stays while it records an alias's writes (D9651), and
 `monoFlowElemsGen` while its walk ties a spread to the pushed list it copies (D9482).
 
+**B2b, part 2a: list writes and map values** (2026-11-07). What a list's owner pushes or writes into
+it after its literal is `cwSlotWrittenAfter` (the writes `cwSlotWriteCount` counts, so a literal
+holding a spread still answers), and a value is a push when its parent is a `.push` call; that
+replaces `monoFlowPushed`, `monoFlowElemWrites` and `monoFlowOwnerReads`. `monoFlowMapVals` takes
+each stored expression from `cwSlotWrittenValues`: a literal or a read naming a generic as written,
+since the inert walk marks the site that writes the generic, and anything else as its elaboration
+roots, which deletes `monoFlowReadElem`. The alias-write walk (D9651, D9440) stays in mono as
+syntax. Each step graded alone against master's fixpoint: 0 moved, after the two fixes the first
+cut needed (a push blamed on its value, not its call; a map's inert site lost to its root).
+
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
 move no output. These are the reads the gate does not answer: an argument handed on, a loop over a
