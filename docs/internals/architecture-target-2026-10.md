@@ -2168,6 +2168,45 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   `monoSubstIsExpr`, `monoHoleCoalUnion`) remake syntax and consume a type: class (c) once their
   type reads the elaboration, which through the hub it now does where the pin closes.
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
+  **`monoArgTyName`, shadowed** (2026-11-07, master `1cebe3ff`, the full population, 14,974
+  decisions). Each is graded against the argument's own type at the instance: `elabNodeTyAt`,
+  else the root walk's, else the checker's. Agreement is `tySame`; spelling is a column of its own.
+  - The closed rung (`monoArgClosedPin`, 14,394) already pins at that type.
+    - 12,893 agree, 11,384 of them through the checker's type where the elaboration declines at
+      the root.
+    - 1,403 bank the template's `T` beside a name that is already the closed type's spelling.
+    - 82 differ by design. 80 are records built wider at delivery, which pin at the build
+      (`elabArgBuiltRep`, `recCopyTyOf`; D15181, D15183). 2 are a hole call of a generic at its own
+      instance, where the elaboration's `f64` is right.
+    - What mono owns is the spelling: 328 registry names (`P` for `{x: i32}`, `#anon0`).
+  - The cascade (580) is type = elaboration; spelling = row key; waits on row identity. In a
+    generic clone the elaboration gives a declared record argument its structural type, and the
+    closed rung's spelling declines a record spelled by its fields, so it matches 3 of the 580.
+    Its rungs, by answers:
+
+    | rung | reads | answers | nominal spelling eq / ne / open |
+    |---|---|---|---|
+    | `monoArgTyNameRep`, struct row (`sNames`) | the row name | 167 | 25 / 127 / 15 |
+    | `monoArgTyNameBound`, a module global's annotation | the annotation | 109 | 103 / 2 / 4 |
+    | `monoArgTyNameRep`, list literal (`arrLitElemName`) | the element | 108 | 31 / 51 / 26 |
+    | `monoArgTyNameBound`, a parameter's annotation | the annotation | 49 | 22 / 18 / 9 |
+    | `monoArgTyNameBound`, a generic application's inner | the annotation | 47 | 13 / 32 / 2 |
+    | `monoArgTyNameRep`, a union variant (`litRetArmRow`) | the variant | 28 | 19 / 9 / 0 |
+    | the cascade's function value and `""` floor | the signature key | 19 | open |
+    | `monoArgTyNameRep`'s tail, `ELAB_TP_DEFAULT` by name (D23) | the default | 11 | open |
+    | the rest | | 42 | |
+
+    No rung goes through `monoPinNominalSpelling`: each big one has rows it spells otherwise,
+    and a switch would rekey the instance. Its literal returns are rep names, not defaults: the
+    scalar and list floors (`"string"`, `"f64[]"`, `"i32[]"`, …) name the rep an `expr*` test
+    found, and the `i32[]` list floor is reached by no program.
+  - `monoBindSeededTyParams` makes 21 decisions over the population where `elabCallSeedBind`
+    answers. 1 agrees, 15 are open on both sides, and 0 differ. In 5, mono closes the type (for
+    example `(string) => string`) where the elaboration's seed binding is the seed parameter's own
+    `(T) => T`, because mono substitutes the binding that parameter got at the instance.
+  - `monoCallIfValue` makes no decision over the population: every entry returns at its gate.
+  - `monoPreBindArgName`, `monoPreBindArgTy`, `monoArgPinName` and `monoArgPinTyIx` wrap the pin
+    measured above. `monoSpelledRecordLeavesRow` is a row-layout test, in the row-key family.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
   The type an uncalled slot holds its functions at is the elaboration's (`elabUncalledSlotTy`,
   from `elabSlotHeldFns`), read by `monoUncalledSlotFnTy`. Shadowed over 23,381 programs, 507
