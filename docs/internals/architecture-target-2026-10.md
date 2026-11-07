@@ -3745,21 +3745,32 @@ Where output held, bytes were compared too. The split with split-dep: these thre
 this lane's, and the one-producer redesign, `monoArgTyNameProjected` and `monoArgTyNameRep` are
 split-dep's.
 
-**Deleted: output- and byte-identical.** In each, the fallback answers the same pin. Byte
-identity covers the step-7 scans too: a scan reading a different name would move bytes. B1, B2
-and B4 rest on one program each, named, so a regression in that spelling points at the arm.
+**Deleted: output-, byte- and pin-identical.** In each, the fallback answers the same pin. The
+pin text was compared too, by logging every `monoArgTyName` answer on master and on the branch
+over the programs these arms reach (209 decisions, 64 programs): bytes alone cannot see it, since
+an instance's function name is not its pin. B2 rests on one program, named, so a regression in
+that spelling points at the arm.
 
 | arm | what it read | programs reaching it | case |
 |---|---|---|---|
 | P2 | `monoLitBuiltTy` → nominal (D15181) | 13 | fallback answers identically |
 | P3 | `elabArgBuiltRep` → nominal | 32 | fallback answers identically |
 | P4 | `recCopyTyOf` → nominal (D15183) | 8 | fallback answers identically |
-| P10 | function-holding closed type → `monoFnTyPin` | 65 | fallback answers identically |
-| B1 | `monoBuildTyPin` | 1 (`soundness/covariant-record-field-read-only-runs`) | fallback answers identically |
 | B2 | the callee's concrete return annotation | 1 (`generics/nested-generic-call`) | fallback answers identically |
-| B4 | an annotated local's annotation | 1 (`structs/inline-shape-local-beside-declared-twin`) | fallback answers identically |
-| B8 | an un-annotated local's initializer, when not `i32` | 3 | fallback answers identically |
-| B17 | an un-annotated global's `""` floor | 5 | ends in the same named refusal: all 5 are rejects, with the same message |
+
+**Kept: output and bytes hold, the pin text moves.** These wait on the naming rule.
+
+| arm | what it reads | programs | off |
+|---|---|---|---|
+| P10 | function-holding closed type → `monoFnTyPin`, the wasm signature | 65 | the pin spells the full type; `vl_call_bind_shadow_test`'s FNV witness, the "agree at the wasm signature" class, reads `agree` |
+| B1 | `monoBuildTyPin` | 1 (`soundness/covariant-record-field-read-only-runs`) | `W$m…` becomes `{x:i32\|string}` |
+| B4 | an annotated local's annotation | 1 (`structs/inline-shape-local-beside-declared-twin`) | `Circle` becomes `{r:i32}` |
+
+**Kept: identical, but one half of a twin.** B8 (a local's initializer, when not `i32`, 3
+programs) and B17 (a global's `""` floor, 5 programs, all rejects) are each output- and
+byte-identical off. The local and module-global rungs of `monoArgTyNameBound` are written as twins
+so that a rung cannot exist in one scope only. B8's twin is B16 and B17's is B9; B16 is
+load-bearing and B9 never answers, so deleting B8 or B17 alone would break the pairing.
 
 **Kept: load-bearing.** Turning the arm off moves output.
 
@@ -3780,8 +3791,6 @@ The redesign must preserve P6, B12 and B13. B12 off traps the compiler, so do no
 | P8 | a narrowed record read → the record its place holds | 12 | 1 program: a parameter becomes `ref` instead of `ref null` |
 | P11 | a numeric literal union → its base scalar | 33 | 1 program: an instance splits, one more function |
 | B6 | an un-annotated local's held type (D14440) | 20 | 1 program: its struct types change |
-
-**No arm changed only a function name**, so none of these waits on the naming rule.
 
 **Never answers: 20 returns, handed to split-dep's one-producer redesign.** None of them
 answers in any of the 23,828 programs, and none is reached by its own filed witness. Turning all
