@@ -1944,6 +1944,16 @@ shadow. Per family, by status, each with its reach:
   - blocked: `monoWrittenGenLetFrame` 9,451 (split-dep: written-let slot fact (initialiser-fallback fix) + D4307 set join), `monoCoerceWrittenLetTys` 5,748 (split-dep: written-let per-instance signature), `monoArmWrittenLetSeed` 1,620 (split-dep: as monoWrittenGenLetFrame), `monoLetSeedGenFe` 0 (split-dep: as monoWrittenGenLetFrame).
   - parked: `monoWalkIdentCall` 9,452 ((S3): derivation waits on argument-keyed instances / reverse map; call_ref policy is mono), `monoCellCall` 255 (callee choice is call_ref policy (16/16 agree); coercion half waits on split-dep).
   - parked: `monoFlowMapReadVals` 286, `monoFlowAliasMaps` 225 (lane F: the map-value facts, beside the six `Map()` bundle reads).
+    Scoped 2026-11-07. Both are the PRODUCER side, what a map stores; `elabSlotDeliveries(d,
+    ["v"])` answers the consumer side and replaces neither. `monoFlowMapReadVals` already reads
+    `cwSlotWrittenValues(owner, ["[]"])` through `mfrLitsMapStored`, so only the root expansion is
+    mono's. `monoFlowAliasMaps` is a root-set soundness test (a binding handed a map holds no other
+    map), tied to D9480's per-instance mint, not a type decision. The climb after a map read in
+    `monoFlowUsePlanAt` needs the use node and `elabSlotDeliveries` returns types, so no
+    node-returning climb is added for it. `monoFlowMapVals` takes its alias writes from
+    `cwSlotWrittenValues` (the writes not through the owner), which follows every handle,
+    annotated parameters and calls two deep included (D14648), where mono's own chase followed
+    un-annotated parameters and `const`s one hop at a time.
   - switched: `monoFlowDeclVals` 7,946, `monoFlowLetLeaf` 656, `monoFlowKeptIndexElem` 516, `monoFlowValsOf` 81, `monoFlowLetMapLeaf` 75.
   - (c): `monoFlowReadsAll` 9,453, `monoFlowReadsRound` 9,453, `monoFlowReplanPending` 9,453, `monoFlowLetCalls` 7,932, `monoFlowUsePlanAt` 2,907, `monoFlowUsePlan` 2,907, `monoFlowAliasReadVals` 1,182, `monoFlowMapVals` 373, `monoFlowElemsGen` 131, `monoFlowRetLocalLists` 89.
 - **slot deliveries**:
@@ -2606,6 +2616,12 @@ So identity typing is not the prerequisite for this population; one fact is.
   The deliveries row keeps two controls declining: `closures/hole-fn-if-to-hole-param.vl`'s `x`,
   handed on and never called, and the D10384 shape. A named generic held as a map value stays
   D15494's.
+
+  **The `??` row, the cheap route, parked** (2026-11-07). Widening the map arm of `elabSlotClose`
+  to fall back on the type the written values carry (`elabWrittenValueTy`) closes `v5` of
+  `closures/hole-fn-list-returned-reread.vl` and leaves `m4` and `m5` open. It also closes `qa` in
+  `closures/hole-fn-generic-map-handed-two-maps.vl`, a D15494 control that has to decline. The
+  attempt stays on `claude/coalesce-empty-default`, unmerged.
 
   **The split-dep rows, measured row by row.** Of the 64:
   - **Closed, 9.**
