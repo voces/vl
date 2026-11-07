@@ -2008,17 +2008,17 @@ Reach is the number of programs that enter the function.
 | node type | 25 | 4 | 5 | 13 | 2 | 0 | 1 |
 | slot type | 24 | 12 | 4 | 2 | 2 | 0 | 4 |
 | lambda sigs | 7 | 1 | 3 | 3 | 0 | 0 | 0 |
-| instance binding | 31 | 6 | 11 | 1 | 2 | 4 | 7 |
+| instance binding | 31 | 10 | 11 | 1 | 2 | 0 | 7 |
 | value returns | 5 | 1 | 4 | 0 | 0 | 0 | 0 |
 | instance result | 1 | 1 | 0 | 0 | 0 | 0 | 0 |
 | walk type | 19 | 6 | 11 | 2 | 0 | 0 | 0 |
 | call param | 13 | 3 | 1 | 8 | 0 | 0 | 1 |
 | uncalled slot | 2 | 0 | 2 | 0 | 0 | 0 | 0 |
-| **all** | **165** | **52** | **52** | **31** | **11** | **4** | **15** |
+| **all** | **165** | **56** | **52** | **31** | **11** | **0** | **15** |
 
-Switched, (c) or deleted: **119 of 165**, against 84 in the morning's table (38 switched and 46
+Switched, (c) or deleted: **123 of 165**, against 84 in the morning's table (38 switched and 46
 (c)). What stands between master and the endpoint is
-31 blocked, 11 parked and 4 unassessed functions. Per family, with reach:
+31 blocked and 11 parked functions, and none unassessed. Per family, with reach:
 
 - **unbound default**:
   - switched: `monoUncalledSlotFnTy` 293, `monoUncalledListElems` 209, `monoHoleFnPinTyOf` 19, `monoUncalledNestedListElems` 15.
@@ -2050,11 +2050,10 @@ Switched, (c) or deleted: **119 of 165**, against 84 in the morning's table (38 
   - (c): `monoPinBodyLambdasRaw` 9,004, `monoDeliverLamLit` 6,170, `monoCloneLambdaSubst` 1,258.
   - blocked: `monoPinMapLambdas` 9,004 (lane F: needs callback parameter read per instance; today: Fn#d's per-instance callback signature (program list handed over)), `monoNoteBindDeliveryCall` 7,181 (lane F: delivered-signature fact for named hole lambdas; today: Fn#d's delivery note at a name (first slice in progress)), `monoLamParamPinAnn` 801 (split-dep holder fact (c2) + per-instance identity residual (4b-i); its pin now used only where elaboration open (#6662)).
 - **instance binding**:
-  - switched: `monoPreBindPastEmptyLit` 8,697, `monoPinAnnotatedParam` 5,744, `monoParamPinnedNull` 5,585, `monoExactBind` 1,261, `monoInstParamPinTys` 441, `monoPreBindNonArrowArgs` 46.
+  - switched: `monoPreBindPastEmptyLit` 8,697, `monoPinAnnotatedParam` 5,744, `monoParamPinnedNull` 5,585, `monoExactBind` 1,261, `monoInstParamPinTys` 441, `monoPreBindNonArrowArgs` 46, `monoPreBindPastUnionRest` 8,697, `monoBindInnerUnionArms` 3,516, `monoBindBareUnionArm` 3,421, `monoBindNullArm` 3,389 (the call's elaboration binding, `elabCallBindTy`: 45 of 45 decisions).
   - (c): `monoCadNoteInstance` 9,004, `monoMakeInstanceLetTyCol` 9,004, `monoBindEnclosingPins` 9,004, `monoMakeInstanceGo` 9,004, `monoSlotParamPins` 8,698, `monoInstantiateCallIn` 8,697, `monoSlotSig` 8,694, `monoBindCols` 3,421, `monoSubstAnnNode` 1,227, `monoSubstTyArgNodes` 47, `monoLayoutConstOf` 4.
   - blocked: `monoPinTyParamComposite` 391 (Fn#d call-param hub).
   - parked: `monoHoleBinding` 3,421 (function-holding residue stays on the rebuild: argument identity typing (A, owner-level, 689 programs) and bind-type-not-rep (56 sites); keyless lambda/value instances are the argument-keyed design (owner)), `monoPinnedTyParamCanon` 988 (waits on the key settling names (canonical instance key)).
-  - unassessed: `monoPreBindPastUnionRest` 8,697, `monoBindInnerUnionArms` 3,516, `monoBindBareUnionArm` 3,421, `monoBindNullArm` 3,389.
   - deleted: `monoSeedCallSigTys`, `monoNicheNulParamsCheck`, `monoLetTyParamMisfit`, `monoExactPinTyOf`, `monoNicheNulListCheck`, `monoPoisonSharedPins`, `monoLetSeedMisfits`.
 - **value returns**:
   - switched: `monoIfBoundRetAtPin` 24.
@@ -2068,7 +2067,7 @@ Switched, (c) or deleted: **119 of 165**, against 84 in the morning's table (38 
 - **call param**:
   - switched: `monoPinHoleParam` 3,737, `monoPreBindArgName` 198, `monoPreBindArgTy` 198.
   - (c): `monoCallIfValue` 2,873.
-  - blocked: `monoBindSeededTyParams` 8,688 (identity typing for the seed: binds from mono's pin of the argument it seeds; waits on that argument's elabIdentityTy replacing the pin (5 open decisions); today: elabIdentityTy (#6656) is the fact it waits on: shadow next), `monoArgPinTyIx` 5,620 (needs a pin fact of its own after holes-close), `monoArgTyName` 5,448 (split-dep one-producer redesign; pin string now serves only instance name + annotation text (dedupe is tyCanonKey); kept arms wait on the naming rule), `monoArgPinName` 5,401 (rep cascade, mono-derived rung), `monoArgTyNameCascade` 340 (C9 load-bearing; C1-C8, C10, C11, C13 never answer, handed to split-dep one-producer redesign; naming rule), `monoArgTyNameBound` 321 (arms graded: B2 deleted (#6641); B1/B4 wait on naming rule; B8/B17 twin halves; B12/B13/B16 load-bearing; B3,B5,B7,B9-B11,B14,B15,B18 never answer, handed to split-dep one-producer redesign), `monoArgTyNameProjected` 223 (split-dep's one-producer redesign), `monoArgTyNameRep` 220 (split-dep's one-producer redesign (scalar tail unreached, D23)).
+  - blocked: `monoBindSeededTyParams` 8,688 (identity typing for the seed: binds from mono's pin of the argument it seeds; waits on that argument's elabIdentityTy replacing the pin (5 open decisions); measured after #6656 and #6645: 12 programs decide, every one seeded from a generic function value whose identity is open; `elabIdentityTy` answers 1, `elabCallBindTy` 1 and the value-instance signature none, all agreeing, so it waits on identity typing for function values (A)), `monoArgPinTyIx` 5,620 (needs a pin fact of its own after holes-close), `monoArgTyName` 5,448 (split-dep one-producer redesign; pin string now serves only instance name + annotation text (dedupe is tyCanonKey); kept arms wait on the naming rule), `monoArgPinName` 5,401 (rep cascade, mono-derived rung), `monoArgTyNameCascade` 340 (C9 load-bearing; C1-C8, C10, C11, C13 never answer, handed to split-dep one-producer redesign; naming rule), `monoArgTyNameBound` 321 (arms graded: B2 deleted (#6641); B1/B4 wait on naming rule; B8/B17 twin halves; B12/B13/B16 load-bearing; B3,B5,B7,B9-B11,B14,B15,B18 never answer, handed to split-dep one-producer redesign), `monoArgTyNameProjected` 223 (split-dep's one-producer redesign), `monoArgTyNameRep` 220 (split-dep's one-producer redesign (scalar tail unreached, D23)).
   - deleted: `monoSpelledRecordLeavesRow`.
 - **uncalled slot**:
   - (c): `monoInertReach` 9,585, `monoInertParamStubPin` 4,706.
@@ -2207,13 +2206,18 @@ The slot fact is the wrong reference: a written `let` of generics has no one clo
 - **Switched in #6645, the by-call site** (the call through the binding that takes the chosen
   instance's signature). `tname` is `elabKeySig` of the member keys `elabValueInstKey` gives the
   binding's read. By `sigKeyOfTy` against mono's signature, 42 decisions agree, 0 differ and 9 have
-  no key; those 9 keep the instance's own signature as the named fallback. The 28 that differ in
-  spelling are a hole parameter written as its pin (`=>i>i` against `(i32)=>i32`) or bracketed.
+  no key. The 28 that differ in spelling are a hole parameter written as its pin (`=>i>i` against
+  `(i32)=>i32`) or bracketed.
+- **The fallback is deleted.** The 9 with no key read the written `let` in an alias's initializer
+  (`const k = lap`, then `k(...)`), and the call's own callee read carries the key; all 9 agree. The
+  call reads the binding's keys, else the callee's, inside `monoCoerceWrittenLetTys` after its gates,
+  so only a call it coerces asks. Of the 1,917 calls that reach the site, the 51 the gates pass all
+  have one closed signature: 42 from the binding's keys, 9 from the callee's.
 - **The delivery path stays mono's.** `elabValueInstKey` reads none at 99 of its 115 decisions: a
   delivered read is not a callee read, so no member key is noted on it.
-- **Next, the hole-function argument.** 59 agree, 0 differ and 49 read none. Most of the 49 are
-  non-generic annotated functions, which have no instance, so their signature is the argument's own
-  type (`elabIdentityTy`).
+- **The hole-function argument is not switched: it replaces nothing.** Its read agrees at 59, differs
+  at 0 and is none at 49. But the by-call signature already comes from the binding or callee keys,
+  so no mono derivation is left for it to replace.
 
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
@@ -3035,6 +3039,14 @@ programs, counted by program).
   `hole-lambda-literal-two-instance-types`, and the witnesses of D14729, D5931 and D12235. The substitution arm never ran with the elaboration open, so that branch is now a
   loud internal refusal. About 140 programs reach the arm with the type closed and keep running.
   Over 19,316 programs no byte moves.
+- **Switched: the union-arm and pre-bind bindings take the call's elaboration binding.**
+  `monoBindBareUnionArm` (with `monoBindNullArm`), `monoPreBindPastUnionRest` and the
+  argument pre-bind through `monoBindInnerUnionArms` still decide which type parameter a union
+  arm binds. The type each binding takes is now `elabCallBindTy` at the call, where it is closed.
+  Shadowed over the 9,013 programs that enter them, they decide 45 times, and the elaboration
+  answers all 45 and agrees with every one. `monoBindCols`' own call of `monoBindInnerUnionArms`
+  never bound anything and is deleted. The helpers stay, because the inner walk still reaches the
+  bare arm at depth. Over 19,316 programs no byte moves.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
@@ -4232,6 +4244,43 @@ C12, the closure arm's `""` floor, is not in the table and is unchanged.
 | B14 | `monoDestListPinName` of a global | — | deleted with B5 |
 | B15 | an empty-literal global | D764 | deleted with B7 |
 | B18 | `monoModuleDupPin` | — | deleted, with its helper |
+
+#### A function list's hole binding: the type is right, a callback lambda shares (2026-11-07)
+
+#6664 binds a hole pinned at its argument's bundle record at the argument's type. The function-list
+rows of the same residue stay on today's binding, `i32[]`, a tagged set's id list spelled by its
+storage. The binding is not the only obstacle; a refused candidate shows what else is.
+
+**The set is a fact, and the instance key already carries it.** The checker's type of a list
+argument carries the tagged set on its element (`fnTagSetOfTy` of the element of
+`nodeTyFrozenOf(arg)`). The elaboration's closed identity type does not. Over 23,828 programs, 618
+of them hand a set-bearing argument to an instance. They mint 1,364 instance keys, and **no key
+serves calls whose argument element sets differ**. The key separates them by `#set<id>`
+(`monoSetPinDiscrim`). Four keys serve two signatures, and each is two value-set arguments in
+swapped order, members of one joined set the key names.
+
+**The refused candidate (T3, named set `t3-fnlist-set-binding-price`, D15541).** The hole binds at
+the list of `fnTagSetTy(set)`, with the set read by an emit_elab reader over `nodeTyFrozenOf`. On
+its target rows it runs. Over the corpus it moves 5: two invalid modules and three wrong values.
+
+- **One-member set returning `f64`:** `fnTagSetTy` gives an open `(_) => _`, so the `.map`
+  result is typed `i32` and the module fails to validate.
+- **Two one-member sets (`take3([inc0])`, `take3([dbl0])`):** the two `take3` instances stay apart,
+  but both call one `.map` callback lambda, built for the first set. The second set's member is
+  never instanced, and the second call prints the first set's result. On master each instance
+  has its own callback lambda.
+- **The lambda reuse is not only `monoListCbLamAt`.** That function pins the callback at
+  `monoPinAnnSpelling(el)`, a spelling that cannot carry a set, and reuses any instantiated lambda
+  whose spelling matches. Master never reaches it, because the element is `i32`. Skipping it for a
+  tagged element leaves the three wrong values standing, so a second path still shares the lambda.
+  Not yet ablated past that.
+
+So moving these rows needs two things beyond the binding:
+
+- a set type with the members' result, which `fnTagSetTy` does not give;
+- a callback lambda keyed by its element's set, not its spelling. This is the same problem as
+  the pin text the argument-pin arms carry (previous subsection: P10, B1 and B4 wait on the
+  naming rule): a spelling used as a key cannot carry what tells two values apart.
 
 #### Argument-keyed instances: design note (2026-11-07, for a ruling; nothing built)
 
