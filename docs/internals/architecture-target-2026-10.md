@@ -2337,6 +2337,12 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
     example `(string) => string`) where the elaboration's seed binding is the seed parameter's own
     `(T) => T`, because mono substitutes the binding that parameter got at the instance.
   - `monoCallIfValue` makes no decision over the population: every entry returns at its gate.
+    Built with its signature step as a loud refusal, a fixpoint sweep moved no program and every
+    filed witness graded as filed, so the step is deleted. With it go `monoSeedCallSigTys`,
+    `monoInstFnPinTys` and the `monoWrittenLetSigCall` flag. What stays is class (c): a gate that
+    recognises a call through an `if` naming generic functions in every arm, and refuses it with
+    "a call through an `if` naming generic functions in every arm has no signature to instance
+    them at".
   - `monoPreBindArgName`, `monoPreBindArgTy`, `monoArgPinName` and `monoArgPinTyIx` wrap the pin
     measured above. `monoSpelledRecordLeavesRow` is a row-layout test, in the row-key family.
 - [x] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
@@ -2597,8 +2603,8 @@ instance. It is the signature twin of an instance the elaboration holds by ident
 territory, not foreseen. `monoCallWrittenLet` instances its writes at the delivery's pin, and
 `monoCallIfBound` no longer falls back to the seed. Mono's result derivation then decides nothing
 in the population, so `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy` and `monoHeldSrcsFnTy` are
-deleted. `monoSeedCallSigTys` stays for `monoCallIfValue`, an inline
-`if` with no binding, which is the call-param family's.
+deleted. `monoSeedCallSigTys` stayed for `monoCallIfValue`, an inline
+`if` with no binding; it went with that function's signature step, which no program reaches.
 
 **Node type, first reading** (2026-11-06, the same population, against `elabNodeTyAt` at the
 instance):
