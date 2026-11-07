@@ -34,12 +34,10 @@ baseline of 27 before this change. The entry that left is `emit_field_codes.vl`'
 **Census.** `scripts/classifier-census.vl` now has 103 probed classifiers (6 post-only, 1
 pre-only, 95 both, 1 uncalled). It had 105 before `letIsStruct` and `letInitCellKind` left.
 
-**Proof.** Seeds are fixpoints (two refreshes, byte-identical).
+**Proof.** Seeds are fixpoints (two refreshes, byte-identical). Base is master `e1a7c565`,
+which has #6733 in it.
 
-| seed | bytes | sweep: same, output movers, bytes-only, runs lost, new traps |
-| --- | --- | --- | --- |
-| #6733 (`letIsStruct` deleted) | 6,475,579 | — |
-| this PR | 6,473,605 (−1,974) | 23,613, 0, 0, 0, 0 |
-
-Against master `fa202cbb` (6,473,613), the movers are #6733's: 7 bytes-only, none of them
-output movers.
+| seed | bytes | sweep vs base: same, output movers, bytes-only, runs lost, new traps |
+| --- | --- | --- |
+| base | 6,494,526 | — |
+| this PR | 6,492,552 (−1,974) | 23,613, 0, 0, 0, 0 |
