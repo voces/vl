@@ -66,6 +66,7 @@ import { fnStmtsPosOf } from "./emit_capture_frames"
 import {
   fnParent,
   fnStmts,
+  monoInertValues,
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
@@ -84,6 +85,8 @@ let vrMemoState: {[string]: i32} = Map()
 let vrMemoVal: {[string]: i32[]} = Map()
 let vrSeen: i32[] = []
 let vrStmts: i32[] = []
+// Each binding the index holds: 1 when it carried an annotation as indexed, else 0.
+let vrLetAnnAt: {[i32]: i32} = Map()
 // The list and record literals the index holds, in the order it reached them.
 export let vrLits: i32[] = []
 let vrInst = false
@@ -91,6 +94,37 @@ let vrExact = false
 // Whether a lambda's result and a write into a fresh literal's field or element are followed;
 // only the checker's question asks, so the monomorphizer's answers stay put.
 let vrFollow = false
+
+// The reads the monomorphizer took as naming a generic function when it indexed them.
+let vrGenCand: {[i32]: boolean} = Map()
+
+// Notes read `x` as naming a generic function, as the monomorphizer reads it at indexing.
+export function vrNoteGenericCand(x: i32) {
+  vrGenCand[x] = true
+  0
+}
+
+// Gives `copy`, a fresh node standing for read `orig`, `orig`'s note.
+export function vrGenericCandCopy(orig: i32, copy: i32) {
+  if vrGenCand[orig] ?? false { vrGenCand[copy] = true }
+  0
+}
+
+// Whether value `x` reaches no call: a generic function read the monomorphizer's index holds and
+// `vrInert` clears, or one the monomorphizer noted inert itself.
+export function vrValueInert(x: i32): boolean {
+  if i32ListHas(monoInertValues, x) { return true }
+  if vrOwner != "mono" || !vrIndexed(x) || !(vrGenCand[x] ?? false) {
+    return false
+  }
+  vrInert(x, "")
+}
+
+// Forgets every note, for a new program.
+export function vrGenericCandClear() {
+  vrGenCand = Map()
+  0
+}
 
 // Follows a lambda's result and a write into a fresh literal for the question `vrReset` started.
 export function vrSetFollow() { vrFollow = true }
@@ -114,6 +148,7 @@ let vrStashMemoState: {[string]: i32} = Map()
 let vrStashMemoVal: {[string]: i32[]} = Map()
 let vrStashSeen: i32[] = []
 let vrStashStmts: i32[] = []
+let vrStashLetAnnAt: {[i32]: i32} = Map()
 let vrStashLits: i32[] = []
 let vrStashFlags: boolean[] = []
 let vrStashOwner = ""
@@ -127,6 +162,7 @@ export function vrStash() {
   vrStashMemoVal = vrMemoVal
   vrStashSeen = vrSeen
   vrStashStmts = vrStmts
+  vrStashLetAnnAt = vrLetAnnAt
   vrStashLits = vrLits
   vrStashFlags = [vrInst, vrExact, vrFollow]
   vrStashOwner = vrOwner
@@ -142,6 +178,7 @@ export function vrUnstash() {
   vrMemoVal = vrStashMemoVal
   vrSeen = vrStashSeen
   vrStmts = vrStashStmts
+  vrLetAnnAt = vrStashLetAnnAt
   vrLits = vrStashLits
   if vrStashFlags.length == 3 {
     vrInst = vrStashFlags[0]
@@ -167,6 +204,7 @@ export function vrResetFor(
   vrMemoState = Map()
   vrMemoVal = Map()
   vrStmts = stmts
+  vrLetAnnAt = Map()
   vrLits = []
   vrInst = inst
   vrExact = exact
@@ -192,6 +230,9 @@ export function vrIndex(roots: i32[], cands: i32[]) {
         const n = nodeAt(ix)
         if n is ArrayLit || n is ObjLit { vrLits.push(ix) }
         if n is Ident { vrNoteRead(ix, cands) }
+        if n is LetDecl {
+          vrLetAnnAt[ix] = (if n.letType >= 0 { 1 } else { 0 })
+        }
         const k0 = stack.length
         nodeChildrenPush(ix, stack)
         let k = k0
@@ -208,6 +249,16 @@ export function vrIndex(roots: i32[], cands: i32[]) {
 
 // Whether node `ix` is in the index.
 export function vrIndexed(ix: i32): boolean { sidArrGet(vrSeen, ix) == 1 }
+
+// Whether binding `d` carries an annotation: as the index saw it, so an annotation a later
+// rewrite adds does not change an answer.
+function vrLetAnnotated(d: i32): boolean {
+  const at = vrLetAnnAt[d] ?? -1
+  if at >= 0 { return at == 1 }
+  const dn = nodeAt(d)
+  if dn is LetDecl { return dn.letType >= 0 }
+  false
+}
 
 function vrNoteRead(ix: i32, cands: i32[]) {
   const n = nodeAt(ix)
@@ -337,7 +388,7 @@ function vrStep(x: i32, path: string): i32[] {
       return vrCalls(p, "f:" + pn.fiName + "," + path)
     }
     LetDecl => {
-      if x == pn.letInit && pn.letType < 0 { return vrDecl(p, path) }
+      if x == pn.letInit && !vrLetAnnotated(p) { return vrDecl(p, path) }
     }
     BinExpr => {
       // A comparison reads the function's identity, its declaration and captures, and calls
@@ -562,7 +613,7 @@ function vrBin(n: BinExpr, p: i32, x: i32, path: string): i32[] {
   if d < 0 || d >= P.nodes.length { return vrLost() }
   const dn = nodeAt(d)
   if dn is LetDecl {
-    if dn.letType >= 0 && dn.letName.slice(0, 3) != "$lv" { return vrLost() }
+    if vrLetAnnotated(d) && dn.letName.slice(0, 3) != "$lv" { return vrLost() }
   } else if dn is Param {
     if dn.parType >= 0 { return vrLost() }
   } else {
@@ -613,7 +664,7 @@ function vrPlaceRoots(
     w = w + 1
     if d < 0 || d >= P.nodes.length { return false }
     const dn = nodeAt(d)
-    if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
+    if !(dn is LetDecl) || vrLetAnnotated(d) || dn.letInit < 0 { return false }
     let p = path
     let k = 0
     while k < n {

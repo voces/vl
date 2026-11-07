@@ -8,6 +8,47 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **Pin helpers onto elaboration facts, Fn#d (architecture-target §3.4):** twelve PRs move mono
+  decisions onto the elaboration or delete the guess they stood on, each graded by a shadow against
+  it, a byte sweep of the corpus against a master fixpoint, and the filed witnesses.
+  - *Slot facts:* a record slot in an instance closes from its instance, and a closed non-generic
+    member from its own signature (#6547); a program-level slot read takes its holder's closed fact
+    (#6550); a nested lambda's instances are read inside an instance without noting a hole pin, so no
+    late demand is minted (#6553).
+  - *Call parameters:* a seeded type parameter binds at a cloned call's template (D15495, #6560); an
+    un-annotated parameter's pin type is the elaboration's where it closes (#6565), and the
+    elaboration now answers first, a parameter the checker solved from its uses included, with loud
+    refusals where the rungs it replaced stood (#6585); `monoArgOpenValueTy` goes (#6587).
+  - *Bindings:* an open binding takes the elaboration's closed type, keyed by a walk of every body
+    because an instance clone's nodes postdate the write index (#6570), and a captured binding's cell
+    agrees with its value type (#6573); a named generic handed through a function set closes to the
+    instance its members' calls demand (#6576).
+  - *D23:* the pin cascade has no `i32` catch-all. A bare type variable or a list of one takes the
+    elaboration's unbound default, and anything else refuses at the pinning call, so three error
+    fixtures refuse earlier and D15040 moves from invalid wasm to a loud refusal (#6591).
+  - *Lambda signatures:* an annotated lambda parameter takes the elaboration's type, spelled
+    nominally; the rest of the family is recorded as gated on the holder fact (#6594).
+- **Pin helpers onto elaboration facts, lane F (architecture-target §3.4):** fifteen PRs move mono
+  decisions onto the elaboration, each graded by a shadow against it, a byte sweep of the corpus
+  against a master fixpoint, and the filed witnesses; `emit_mono` went from 1,040 to 1,000 functions
+  over the same span, other lanes' deletions included.
+  - *Walk type:* the hub `monoPinnedTyOf` takes the elaboration's closed type where its pin closes,
+    except a list of a numeric literal union (D3540) (#6528); the `is`-else remainder, the D2915 join
+    refusal, the hole and lambda-call fallbacks and an operator operand typed at a hole follow, and
+    `monoElseRemainderAt`, the arm walk, `monoHoleTy`, `monoHoleBindingOf` and its parameter-alias walk
+    go (#6535, #6541, #6545, #6551). A slot call's open function argument closes at the slot value's
+    parameter, and `monoReachSlotTy` reads the climb alone (`vrCalleeTy` deleted) (#6516, #6526).
+  - *Lambda signatures:* a `.map`/`.filter` callback over an instance parameter takes its element from
+    the elaboration, `monoRecvParamElem` and the pinned-element columns deleted (#6559);
+    `monoLamInstSigs` and `monoSigListHas` deleted, and the hub's two missing facts recorded (#6561).
+  - *Instance binding:* an instance's type-parameter binding reads the elaboration's key, where it
+    differs from mono's in 20 programs that build the same bytes either way, and the empty-literal and
+    non-arrow pre-binds read it too (#6574); the bare-`T` arena binding, D2816's clash pin, a minted
+    instance's parameter types and a type-testing instance's exact binding follow, and
+    `monoBindFromLaterArg`, `monoBindBareArenaPins`, `monoLitElemPin`, `monoTyIsOpenUnion`,
+    `exactBindWalk` and three clone columns go (#6581, #6584, #6586, #6588).
+  - *Uncalled slot:* a list slot's calledness is `elabSlotUncalledOmitting`, less the calls the flow
+    rewrite repointed, and `monoLitReachesNoCall` and `monoValsReachNoCall` go (#6595).
 - **Flow-table step 3, slot family, first readers:** `monoPinsAtElemParams` and `monoFlowSlotPinsAllSet` are retired (architecture-target §3.3). Cut alone to the answer the flow table gives without a build, each moved no file in `tests/cases`, so the element-parameter re-typing of a list's pins and the all-pins-taken-at-a-set-call early return are deleted with them. `emit_mono.vl` 1,100 → 1,098 functions.
 - **Flow-table step 2, sources half:** `fnFlowDeclPathSrcs` and `fnFlowDeclPathHeldSrcs` are retired (architecture-target §3.3). Their seven mono readers take the functions a binding's slot can hold from the elaboration (`elabSlotHeldFns`, emit_elab.vl): the members of the set the slot's type carries, in the checked tree and in each instance of the function declaring the binding (`fnTagSlotMembers`), and the functions the write index resolves at that slot, through aliases, parameters, a call's returned values and a list spread into or out of the binding (`cwSpreadPeers`), as the table joined a spread copy with its source. `fn_flow_shadow.vl` loses three more functions, with no file moved in `tests/cases` with the split plan on and off.
 - **Flow-table step 2, writes half:** `fnFlowDeclWritten`, `fnFlowReadWritten` and `fnFlowReadGenFn` are retired (architecture-target §3.3). Their six mono readers ask the write index whether an `=` writes a binding (`cwDeclAssigned`), with a binding the capture rewrite made a shared cell counted as written through its cell (`cboxDeclWritten`, `cboxReadWritten`, `cboxReadGenFn`, emit_rewrite.vl). `fn_flow_shadow.vl` 128 → 123 functions, with no file moved in `tests/cases` with the split plan on and off.
