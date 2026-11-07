@@ -2149,12 +2149,13 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
       1,622 of 1,622. What stays is a (c) gate: a re-made clone node in a hole instance whose
       recorded type is open.
     - `monoHoleFnPinTy`, which reads the elaboration's default fill.
-    - `monoClosedFieldValTy`. Its 8 answers agree with the checker's closed type where the
-      elaboration declines, so it answers that, with its literal and read derivations as the
-      fallback and its recording kept. It still declines wherever they decline.
   - Deleted: `monoLetAnnTyOf`. Built answering as a loud refusal, a fixpoint sweep moved no
     program and every filed witness graded as filed.
   - Blocked:
+    - `monoClosedFieldValTy`, records of functions. Its switch (#6636) read the checker's type
+      after mono's walk had re-recorded it closed. Before the walk all 8 of its decisions are open
+      to both the elaboration and the checker, so the "8 of 8" was mono's answer read back. It is
+      mono's own derivation again, and waits on the function-holding fact below.
     - `monoLetWriteRhsTyRec`, with `monoLetWriteRhsTy` and `monoLetWritesRecord`. All 18
       decisions are records holding hole functions written into a `let`, the fact
       `monoClosedObjLitTy` waits on.
@@ -2512,6 +2513,35 @@ wrapped every such mono decision and asked what the elaboration can say there to
 | (ii) needs identity typing | 1 |
 | (iii) other | 6 |
 | not reached by the probe (D6480, `hole-lambda-forwarded-to-unread-hole-param`) | 2 |
+
+**Re-measured before mono's walk** (2026-11-07, master `7836b63a`). The table above read
+`nodeTyIxOf` at mono's decision sites, after the walk had re-recorded many of those nodes closed at
+mono's own answer, so its node-type column compared mono with itself. The re-run copies the
+node-type column at the end of emit prep (after the elaboration's tag rounds, before
+`monomorphize`) and swaps that copy in while every reader is asked, so each reader's own fallback to
+`nodeTyIxOf` is pre-walk too. Only mono's held type, the answer being graded, is read after the
+walk. Each decision is classed by the first source that agrees with mono, in this order:
+
+| class | decisions |
+|---|---|
+| not blocked: the elaboration's or the checker's node type agrees | 621 |
+| (i) the slot fact answers | 70 |
+| (i) the written-value leaf answers | 27 |
+| (i) the value key already noted for arguments and callbacks (`elabValueKeys`) answers | 72 |
+| (i) the value-call note (`elabValueInstKey`, shadow) answers | 19 |
+| (i) every member already has the instance; the site is not linked to it | 283 |
+| open: a member lacks the instance | 23 |
+| open: no member and no fact | 90 |
+| **total** | **1,205** |
+
+The two tables do not share a classifier, so they are compared by total only. All 234 adopted
+bindings move out of "not blocked"; they are the family table below. The value-call note answers
+44 decisions, 26 of which no earlier note answers, and disagrees with mono at none. Two more, in
+`generics/hole-call-of-generic-at-its-own-instance.vl`, carry two signatures where mono holds one:
+the value is called at two types, so the consumer picks by the call the read reaches. Of the 283
+unlinked, 94 are lane F's instance bindings, mostly a record or list of functions handed to a
+parameter and called as `p.f(x)` or `xs[0](x)`; the note does not yet follow a field or element
+callee off an open parameter.
 
 So identity typing is not the prerequisite for this population; one fact is.
 - **The fact:** `elabValueInstKey(x, k)`, the member instance or instances the elaboration made for
