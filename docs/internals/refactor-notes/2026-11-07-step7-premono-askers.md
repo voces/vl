@@ -63,5 +63,6 @@ post-only (pre-mono asks in base): `retCapturedMapShape` 46,225, `cloRetValSlot`
 | check | result |
 | --- | --- |
 | fixpoint | two `refresh-compiler.sh` runs byte-identical |
-| seed size | 6,473,613 → 6,473,358 (−255), both fixpoints |
+| seed size | 6,473,613 → 6,473,355 (−258), both fixpoints |
 | `scripts/sweep.vl` diff, 23,613 cells | 23,613 same, 0 bytes-only, 0 movers, 0 `runs → not-runs` |
+| after merging master `e1a7c565` | seed 6,494,526 → 6,494,268 (−258); sweep 23,613 same |
