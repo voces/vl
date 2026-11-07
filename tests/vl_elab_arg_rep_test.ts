@@ -1,12 +1,15 @@
-// A CALL ARGUMENT'S DELIVERED REP DIFFERS FROM ITS TYPE ONLY AS A BUNDLE OR A WIDER RECORD
-// (`elabCallArgRep`, compiler/emit_elab.vl).
+// A CALL ARGUMENT'S DELIVERED REP DIFFERS FROM ITS TYPE ONLY AS A BUNDLE, A WIDER RECORD OR A
+// LITERAL BUILT AT ITS PARAMETER (`elabCallArgRep`, `elabArgDeliveredTy`, compiler/emit_elab.vl).
 //
 // The elaboration keeps an instance's type and the rep its call delivers each argument at as
 // separate facts (DECISIONS.md, "An instance's type and its rep are separate facts"). The reach
 // rows record the rep only where it is not the parameter's type, and it may differ in two ways
 // alone: the record of one closure per signature a bundle parameter is called at, or a record the
 // call builds wider than the parameter's type. `elabArgRepProbe` grades every row: wider records
-// in the units, bundles in the thousands, and each slot breaking the rule a million.
+// in the units, bundles in the thousands, and each slot breaking the rule a million. A third kind
+// is the converting delivery (`erArgConv`): a list or record literal built at the instance
+// parameter's type rather than its own, which `elabArgConvProbe` counts in the units and grades
+// against the instance parameter in the thousands.
 //
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores.
 //
@@ -43,6 +46,8 @@ const probe = (src: string) => {
     built: exp.elabArgBuiltProbe(),
     closures: Math.floor(exp.elabArgBundleKindProbe() / 1000),
     records: exp.elabArgBundleKindProbe() % 1000,
+    conv: exp.elabArgConvProbe() % 1000,
+    convBad: Math.floor(exp.elabArgConvProbe() / 1000),
     twins: Math.floor(exp.elabBundleTwinProbe() / 1000),
     delivered: exp.elabBundleTwinProbe() % 1000,
   };
@@ -106,6 +111,27 @@ function inFn(k: i32) { lap((a) => a + k) }
 inFn(1)
 const nb: B = { c0: (n: i32) => n * 2, c1: (n: f64) => n * 2.0 }
 useB(nb)
+`;
+
+// D5930: a list literal whose leaf is a hole, handed on by a forwarder, is built at the `f64[]`
+// the called function takes, not at the `i32[]` its leaf binds.
+const CONVERTED = `function flat(a: i32, b: f64[]) { b[a - 3] * 2.5 }
+function fwd(g, x, y) { return g(x, y) }
+function outer(h, v) { return fwd(h, 3, [v]) }
+print(outer(flat, 1))
+`;
+
+// D2459: an `i32` read joined with an `f64` use is handed over at its own rep and converted at
+// the call, so no literal is built at the parameter.
+const JOINED = `function f<T>(x: T, g: (i32) => T) { return g(2) }
+const two: i32 = 2
+print(f(two, (i) => i * 1.5))
+`;
+
+// A closed list of number literals at a wider list parameter converts at the delivery.
+const CLOSED_LIST = `function len<T>(xs: T[], ys: T[]): i32 { xs.length + ys.length }
+const a: i64[] = [1]
+print(len(a, [2, 3]))
 `;
 
 const PLAIN = `function id<T>(x: T): T { x }
@@ -187,6 +213,30 @@ Deno.test({
     // Records interning by structure would fold `B` into the bundle and read twins 0.
     if (got.bad !== 0 || got.delivered < 1 || got.twins < 1) {
       throw new Error(`want a delivered bundle and an undelivered twin, got ${JSON.stringify(got)}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "elab-arg-rep: a hole-leaf list literal is delivered built at its parameter's type",
+  ignore,
+  fn() {
+    const got = probe(CONVERTED);
+    if (got.bad !== 0 || got.conv < 1 || got.convBad !== 0) {
+      throw new Error(`want a converting delivery, got ${JSON.stringify(got)}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "elab-arg-rep: a joined read and a closed list of literals record no converting delivery",
+  ignore,
+  fn() {
+    for (const src of [JOINED, CLOSED_LIST, PLAIN]) {
+      const got = probe(src);
+      if (got.bad !== 0 || got.conv !== 0 || got.convBad !== 0) {
+        throw new Error(`want no converting delivery, got ${JSON.stringify(got)}`);
+      }
     }
   },
 });
