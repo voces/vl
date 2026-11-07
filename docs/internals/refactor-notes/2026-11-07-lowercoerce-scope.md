@@ -66,3 +66,9 @@ box is built at). A table entry converts a value already built at its own rep.
 1. A numeric-pair recorder, shadowed against the 25 three-way positions (the brief's step 3).
 2. `box` from `boxDstTyAt` where `box_dst_shadow` grades every site agreeing.
 3. Narrowed-arm and atom → string, each after its source is recorded.
+
+## The switch this PR carries
+
+`monoArgClosedTyIn` at a closed pin now answers `elabArgDeliveredTy`, else the pin for a number
+literal, else the closed hole-free identity type (`elabIdentityFnTy`), else the pin. Fixpoint seed
+6,488,554 bytes (+1,647 against master `922a64e1`'s). Sweep: 23,613 same, 0 bytes-only.
