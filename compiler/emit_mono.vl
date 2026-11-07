@@ -238,7 +238,6 @@ import {
   tyPrimNameOf,
   tyRenderSoftensLits,
   tySame,
-  tyScalarBasePrim,
   tyToEmitName,
   tyToNominalName,
   tyToStr,
@@ -792,11 +791,7 @@ import {
   tyReachesHole,
   tyStepElem,
 } from "./tyquery"
-import {
-  nameIsLitUnionType,
-  nulNumScalarUnionName,
-  nulNumScalarUnionRowTy,
-} from "./check_ty_rep"
+import { nulNumScalarUnionName, nulNumScalarUnionRowTy } from "./check_ty_rep"
 import { tyIsWriteLandRead } from "./check_hole_pins"
 import { recFreshDeclOf } from "./check_rec_fresh"
 import { recArgRepOf, recBuildTable, recBuildTyOf } from "./check_rec_rows"
@@ -17484,51 +17479,6 @@ function monoCellSigOne(v: i32, tname: string): boolean {
   true
 }
 
-// The parameter list both `a` and `b` (`p1,p2,`) pass their values as, pin by pin
-// (`monoPinJoin`); "" when some pair has none.
-function monoSigJoin(a: string, b: string): string {
-  const pa = monoSigPins(a)
-  const pb = monoSigPins(b)
-  if pa.length != pb.length { return "" }
-  let out = ""
-  let i = 0
-  while i < pa.length {
-    const j = monoPinJoin(pa[i], pb[i])
-    if j == "" { return "" }
-    out = out + j + ","
-    i = i + 1
-  }
-  out
-}
-
-// The pin a value of pin `p` and one of pin `q` are both passed as: either, when equal; `string`
-// for a string literal union and `string`; a union of primitives with a string member, for it
-// and `string`, since its box carries any string. "" otherwise.
-function monoPinJoin(p: string, q: string): string {
-  if p == q { return p }
-  const wp = monoPinWidened(p)
-  if wp == monoPinWidened(q) { return wp }
-  if p == "string" && monoPinCarriesString(q) { return q }
-  if q == "string" && monoPinCarriesString(p) { return p }
-  ""
-}
-
-// Whether pin `pin` names a declared union of primitives and literals, not all string literals,
-// with a string or string literal member: its box carries any string as that member.
-function monoPinCarriesString(pin: string): boolean {
-  const ty = cUserTypes.get(pin) ?? -1
-  if ty < 0 || ty >= T.tys.length || tyIsLitUnion(ty) { return false }
-  const u = tyAt(ty)
-  if !(u is TyUnion) { return false }
-  let str = false
-  for m in u.uMembers {
-    const base = tyScalarBasePrim(m)
-    if base == null { return false }
-    if base == "string" { str = true }
-  }
-  str
-}
-
 // Whether function node `fx` is an instance of a generic function, or the generic itself.
 function monoFrameIsGenericInstance(fx: i32): boolean {
   const slot = fnStmtsPosOf(fx)
@@ -22785,7 +22735,7 @@ function monoCellCall(
   if !viaAlias && cfe >= 0 && cfe < monoGen.length && monoGen[cfe] == 1 {
     monoLastInstFe = -1
     const rc = monoInstantiate(cfe, ix, ctx)
-    monoNoteBindCall(at, cctx, ix)
+    monoNoteBindCall(at, cctx)
     if rc < 0 { return -1 }
     return 1
   }
@@ -22820,7 +22770,7 @@ function monoCellCall(
   ) {
     monoLastInstFe = -1
     if monoInstantiate(lfe, ix, ctx) < 0 { return -1 }
-    monoNoteBindCall(at, cctx, ix)
+    monoNoteBindCall(at, cctx)
     ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
     ctnTys = monoInstParamPinTys(monoLastInstFe)
   }
@@ -23768,7 +23718,7 @@ function monoWalkIdentCall(
       const ri = monoInstantiate(fe, ix, ctx)
       monoWriteCoercedCall = -1
       monoArmCall = -1
-      monoNoteBindCall(n.callFn, ctx, ix)
+      monoNoteBindCall(n.callFn, ctx)
       // The call keeps its `call_ref` through a written `let`, so each generic written to it
       // takes the instance's signature, as a delivery of the binding does (D3961).
       if ri >= 0 && !direct && monoLastInstFe >= 0 {
@@ -24310,14 +24260,11 @@ let monoLastInstFe = 0 - 1
 // Per binding node a call goes through, the `;`-joined signatures the calls take.
 let monoBindCallSigs: {[i32]: string} = Map()
 
-// Records the signature of call `ix` just lowered through the binding read at `at` in frame
+// Records the signature of the call just lowered through the binding read at `at` in frame
 // `ctx`, on that binding and on every binding its initializer chain names.
-function monoNoteBindCall(at: i32, ctx: i32, ix: i32) {
+function monoNoteBindCall(at: i32, ctx: i32) {
   if monoLastInstFe < 0 { return 0 }
-  const prev = monoSigCallRet
-  monoSigCallRet = nodeTyIxOf(ix)
-  monoNoteBindSig(at, ctx, monoSlotSig(monoLastInstFe), monoSigRetVoid(""))
-  monoSigCallRet = prev
+  monoNoteBindSig(at, ctx, monoSlotSig(monoLastInstFe))
   0
 }
 
@@ -24375,7 +24322,7 @@ function monoNoteBindDeliveryCall(at: i32, ann: string, ctx: i32, callIx: i32) {
     // by the first such delivery and found by every later one (D3867, D3881).
     if monoInstanceFor(fe, monoSigPins(sig + ";"), at, -1, []) < 0 { return -1 }
   }
-  monoNoteBindSig(at, ctx, sig + ";", monoSigRetVoid(ann))
+  monoNoteBindSig(at, ctx, sig + ";")
 }
 
 // A hole lambda written as a literal where function type `ann` is delivered is pinned there in
@@ -24815,7 +24762,7 @@ let monoDeliveredArgs: i32[] = []
 
 // Records signature `sig` on the binding read at `at` (a name or a capture cell's `d[0]`) in
 // frame `ctx`, and on every binding its initializer chain names.
-function monoNoteBindSig(at: i32, ctx: i32, sig: string, quiet: boolean) {
+function monoNoteBindSig(at: i32, ctx: i32, sig: string) {
   if sig == "" { return 0 }
   let ax = at
   let fr = ctx
@@ -24830,7 +24777,7 @@ function monoNoteBindSig(at: i32, ctx: i32, sig: string, quiet: boolean) {
     // function is lowered, and with it the call (D3868).
     if hops == 0 && lf[0] >= 0 && monoWriteFrameDead(ctx, lf[0]) { return 0 }
     const had = monoBindCallSigs.get(lf[1]) ?? ""
-    monoBindCallSigs.set(lf[1], monoSigListAdd(had, sig, quiet))
+    monoBindCallSigs.set(lf[1], monoSigListAdd(had, sig))
     if d.letInit < 0 { return 0 }
     let iv = d.letInit
     const ce = monoGeneratedCellElem(iv)
@@ -25501,36 +25448,17 @@ function monoSigPins(sig: string): string[] {
   out
 }
 
-// Signature list `all` with `one` added. When `quiet` (the call returns nothing), one joining an
-// entry (`monoSigJoin`) at either of the two is one signature, held at the join: a call at the
-// other passes its value as the join's.
-function monoSigListAdd(all: string, one: string, quiet: boolean): string {
-  let out = ""
+// Signature list `all` with `one` added, once.
+function monoSigListAdd(all: string, one: string): string {
   let st = 0
   let i = 0
-  let met = false
   while i < all.length {
     if all[i] == ";"[0] {
-      const e = all.slice(st, i + 1)
-      let j = ""
-      if !met && quiet {
-        const sj = monoSigJoin(e, one)
-        if sj != "" { j = sj + ";" }
-      }
-      if e == one || j == e {
-        met = true
-        out = out + e
-      } else if j != "" && j == one {
-        met = true
-        out = out + one
-      } else {
-        out = out + e
-      }
+      if all.slice(st, i + 1) == one { return all }
       st = i + 1
     }
     i = i + 1
   }
-  if met { return out }
   all + one
 }
 
@@ -25770,13 +25698,6 @@ function monoLiftedDescendants(slot: i32): i32[] {
     }
   }
   out
-}
-
-// A parameter pin spelled as its value's type: a string literal union holds strings, so an
-// instance at it and one at `string` are one signature.
-function monoPinWidened(pin: string): string {
-  if nameIsLitUnionType(pin) { return "string" }
-  pin
 }
 
 // The concrete parameter spellings a lifted slot's declaration carries, appended to `out`

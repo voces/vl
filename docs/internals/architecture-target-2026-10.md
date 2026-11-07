@@ -2359,6 +2359,25 @@ first (D9003, `holeLetWritesDisagree`). So it is deleted, with `monoBoundTys` an
 `monoArrowParamTysAt`, which only it called. A missing elaborated type is a loud refusal. Over
 19,316 programs no byte moves.
 
+**The rest of the slot-type tail, measured** (2026-11-07, one probe over 23,384 programs, counted
+by program).
+
+- **`monoSigJoin` / `monoPinJoin` never join.** A quiet call signature joined another entry of a
+  binding's signature list at a widened pin (a string literal union with `string`). No program
+  joins two distinct signatures. `monoSigListAdd` now adds a signature once and never joins, and
+  `monoSigJoin`, `monoPinJoin`, `monoPinCarriesString` and `monoPinWidened` are deleted. The
+  vacated position's floor is the existing `MONO_BIND_SIG` refusal: a binding called at two
+  signatures is refused loudly. Over 19,316 programs no byte moves.
+- **`monoRenameInitAt` is class (c).** It is reached by 15 programs: 11 already hold an instance at
+  the pin and 4 instance one, and its refusal fires in none. Its pin is the elaboration's
+  (`monoDeclPathPins`); what it does is instancing and renaming.
+- **`monoPinStoredRecords`, `monoPinFieldValue` and `monoLetWritesAt` disagree with
+  `elabSlotTyAt` nowhere.** `monoPinStoredRecords`: 8 agree and 0 differ. Its 2 mono-only programs
+  are D15494 maps, and in its 4 elab-only programs mono declines. `monoPinFieldValue`: 6 agree and
+  0 differ. Its 1 mono-only program is D15190, a refused program, and it has 57 elab-only, all with
+  mono declining. `monoLetWritesAt` is reached past its `const` arm by 1 program, which agrees.
+  These are graded together next.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
