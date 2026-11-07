@@ -7,6 +7,7 @@ with a line in this index; the PR that moves a step also updates the target doc'
 
 Newest first:
 
+- [2026-11-07-identity-typing-shadow](2026-11-07-identity-typing-shadow.md): Identity typing (A) as a shadow: every specialized argument has its singleton, instance delta 0, 1,557 joins become sets.
 - [2026-11-07-record-literals-closed-from-bindings](2026-11-07-record-literals-closed-from-bindings.md): Record literals closed from the bindings they read (was §3.4).
 - [2026-11-07-argument-keyed-instances-design](2026-11-07-argument-keyed-instances-design.md): Argument-keyed instances: design note (was §3.4).
 - [2026-11-07-function-let-slot-fact](2026-11-07-function-let-slot-fact.md): A function-holding let's slot fact, from its calls (was §3.4).
