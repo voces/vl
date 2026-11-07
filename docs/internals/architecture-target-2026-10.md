@@ -2497,6 +2497,14 @@ So identity typing is not the prerequisite for this population; one fact is.
 - **(ii):** `closures/listed-hole-fn-escaping-list.vl`. A generic held in a list by identity is called
   at two types, so the list's one concrete rep is mono's choice. It is D15010's signature twin, parked
   in this section.
+- **Not reached (2):** neither decision gets to a probed site.
+  - D6480 refuses first, at `monoWalkIdentCall`'s `monoGenArgAtOpenParam` gate. A call through
+    the alias `k` of a written `let` holding a hole lambda has no lambda for `monoAliasLetLamFe`
+    to return. That gate is the hook that would see it, and it reads the same fact through the
+    alias.
+  - `functions/hole-lambda-forwarded-to-unread-hole-param.vl` takes the unread parameter's
+    default (`holeParamUnreadIn`, D6191). No call instances the lambda, so no producer writes the
+    fact, and the default stays the checker's.
 - **(iii):**
   - five uncalled members, the inert-stub (c) cells `monoInertParamStubPin` carries (D6910 and its
     pair) and two uncalled list members;
