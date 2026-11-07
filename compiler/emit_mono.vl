@@ -5,6 +5,7 @@ import {
   mfrElabNames,
   mfrLitsDirectFn,
   mfrLitsExprOf,
+  mfrLitsMapStored,
   mfrLitsOf,
   mfrShadowNote,
 } from "./mfr_shadow"
@@ -36,6 +37,7 @@ import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftWithinInstancedFn } from "./check_fn_tag"
 import {
   elabArmFeOf,
+  elabCallHoleParamTy,
   elabCallParamBoundTy,
   elabDeclFnOf,
   elabDeclIsValue,
@@ -6974,7 +6976,8 @@ function monoBindSeededTyParams(
   tvT: i32[],
 ) {
   for tp in fn.fnTyParams {
-    const et = if monoBindOf(tvN, tvV, tp) == "" { elabCallSeedBind(decl, callIx, tp) } else { -1 }
+    // A call in a cloned body answers from the template call the elaboration keyed (D15495).
+    const et = if monoBindOf(tvN, tvV, tp) == "" { elabCallSeedBind(decl, monoCallTplOf(callIx), tp) } else { -1 }
     const pd = if et >= 0 { elabTyParamSeedParam(fn, tp) } else { -1 }
     const j = i32ListIndexOf(fn.fnParams, pd)
     let nm = ""
@@ -13120,11 +13123,11 @@ function monoFlowMapNoteAliasWrites(d: i32) {
 function monoFlowAliasStored(at: i32): i32[] { mfrAliasWrites[at] ?? [] }
 
 // Appends to `out` the values a read of map `x` may give, `x[k]` or `x.get(k)` beside each map in
-// `base`; false when one of `base` is no map.
+// `base`: the roots of what each stores (`mfrLitsMapStored`); false when one of `base` is no map.
 function monoFlowMapReadVals(base: i32[], out: i32[]): boolean {
   if base.length == 0 { return false }
   for b in base {
-    if monoFlowMapOwner(b) < 0 || !monoFlowMapVals(b, out) { return false }
+    if monoFlowMapOwner(b) < 0 || !mfrLitsMapStored(b, out) { return false }
   }
   true
 }
@@ -13146,107 +13149,26 @@ function monoFlowNullTest(p: i32, cur: i32): boolean {
   nodeAt(unwrapParen(o)) is NullLit
 }
 
-// Appends to `out` every literal value node `x` may evaluate to: a list or record literal, the
-// values of a candidate binding it names, or a literal-index or field read of those; false when
-// it may evaluate to anything else. A map read gives what its writes store, generics included.
+// Appends to `out` the literals expression `x` may evaluate to: a candidate binding's or loop
+// variable's (`monoFlowDeclVals`), else the elaboration's roots (`mfrLitsExprOf`), where a function
+// counts only when a map read gives it; false when it may evaluate to anything else.
 function monoFlowValsOf(x: i32, out: i32[]): boolean {
-  if x < 0 { return false }
-  const v = unwrapParen(x)
+  const v = if x < 0 { -1 } else { unwrapParen(x) }
   if v < 0 { return false }
-  const n = nodeAt(v)
-  if monoFlowMapOwner(v) >= 0 {
-    out.push(v)
-    return true
-  }
-  if n is ArrayLit {
-    if n.pos < 0 { return false }
-    out.push(v)
-    return true
-  }
-  if n is ObjLit {
-    out.push(v)
-    return true
-  }
-  if n is Ident {
+  if nodeAt(v) is Ident {
     const d = identDeclOf(v)
-    if loopVarLoop(d) >= 0 { return monoFlowLoopVarVals(d, out) }
-    if d < 0 || !(mfrCand[d] ?? false) { return false }
+    if d < 0 || loopVarLoop(d) < 0 && !(mfrCand[d] ?? false) { return false }
     const dv = monoFlowDeclVals(d)
-    if dv.length == 0 { return false }
     for y in dv { out.push(y) }
-    return true
+    return dv.length > 0
   }
-  if n is Call {
-    const c = unwrapParen(n.callFn)
-    if c < 0 { return false }
-    const cm = nodeAt(c)
-    if cm is Member {
-      if cm.memProp != "get" || n.callArgs.length != 1 { return false }
-      const mb: i32[] = []
-      if !monoFlowValsOf(cm.memObj, mb) { return false }
-      return monoFlowMapReadVals(mb, out)
-    }
-    if !(cm is Ident) { return false }
-    const fd = identDeclOf(c)
-    if fd < 0 { return false }
-    const fn = nodeAt(fd)
-    if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return false }
-    const rv = monoFlowDeclVals(fd)
-    if rv.length == 0 { return false }
-    for y in rv { out.push(y) }
-    return true
+  const ev: i32[] = []
+  const r = mfrLitsExprOf(v, ev)
+  if r < 0 || ev.length == 0 { return false }
+  for e in ev {
+    if r == 1 && !monoFlowIsLit(e) && monoFlowMapOwner(e) < 0 { return false }
   }
-  const base: i32[] = []
-  if n is Index {
-    if !monoFlowValsOf(n.idxArr, base) { return false }
-    if monoFlowMapCount(base) > 0 { return monoFlowMapReadVals(base, out) }
-    for b in base {
-      const el = monoFlowElemAt(b, n.idxIndex)
-      if !monoFlowIsLit(el) { return false }
-      out.push(el)
-    }
-    return true
-  }
-  let obj = -1
-  let prop = ""
-  if n is Member {
-    obj = n.memObj
-    prop = n.memProp
-  } else if n is OptMember {
-    obj = n.omObj
-    prop = n.omProp
-  } else {
-    return false
-  }
-  if !monoFlowValsOf(obj, base) { return false }
-  for b in base {
-    const fv = monoFlowFieldOf(b, prop)
-    if !monoFlowIsLit(fv) { return false }
-    out.push(fv)
-  }
-  true
-}
-
-// Appends to `out` the rows the variable of the one-variable loop `d` takes: each element of the
-// list literals its iterable holds, when every one is a list literal no push grows; false when it
-// may hold anything else (D9981).
-function monoFlowLoopVarVals(d: i32, out: i32[]): boolean {
-  const fi = nodeAt(loopVarLoop(d))
-  if !(fi is ForIn) || fi.fiDecl1 != d || fi.fiDecl2 >= 0 { return false }
-  const lists: i32[] = []
-  if !monoFlowValsOf(fi.fiIter, lists) || lists.length == 0 { return false }
-  const rows: i32[] = []
-  for l in lists {
-    const ln = nodeAt(l)
-    if !(ln is ArrayLit) || monoFlowListGrows(l, 0) { return false }
-    for e in ln.arrElems {
-      const ex = unwrapParen(e)
-      if ex < 0 || !(nodeAt(ex) is ArrayLit) { return false }
-      rows.push(ex)
-    }
-  }
-  if rows.length == 0 { return false }
-  for r in rows { out.push(r) }
+  for e in ev { out.push(e) }
   true
 }
 
@@ -13272,7 +13194,7 @@ function monoFlowDeclVals(d: i32): i32[] {
       const sp = nodeAt(il.arrElems[0])
       if sp is Spread {
         const rv: i32[] = []
-        if !mfrLitsExprOf(sp.spdArg, rv) { return [] }
+        if mfrLitsExprOf(sp.spdArg, rv) < 0 { return [] }
         const kept: i32[] = [iv]
         for v in ev {
           if !i32ListHas(rv, v) && !i32ListHas(kept, v) { kept.push(v) }
@@ -22020,8 +21942,25 @@ function monoPinHoleParam(
   // instance is demanded here.
   if an == "" && guessed { return 1 }
   if an == "" { return monoArgTyFail(p.parName, fn.fnName) }
-  pinned.push(an)
   if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
+  // The parameter's type at this call is the elaboration's where it closes; mono's own rungs
+  // answer only where it does not, and a disagreement is refused, never picked silently.
+  const elTy = elabCallHoleParamTy(monoCallTplOf(callIx), i)
+  if elTy >= 0 {
+    const elPin = if tyHoldsObj(elTy, 8) { monoRecordRowPin(elTy) } else { monoPinOfClosedTy(elTy) }
+    if elPin != an && !(anTy >= 0 && tySame(anTy, elTy)) {
+      return emitFailAt(
+        "emitProgram: internal: parameter `"
+          + p.parName
+          + "` of `"
+          + fn.fnName
+          + "` is pinned at another type than the elaboration's at this call",
+        args[i],
+      )
+    }
+    anTy = elTy
+  }
+  pinned.push(an)
   pinTys.push(anTy)
   if monoFwdFnPinMisfits(fn, params[i], args[i], anTy) {
     return monoFwdFnPinFail(p.parName, fn.fnName)
