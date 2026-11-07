@@ -45,7 +45,14 @@ smaller population. Here every key is accounted for, and both tables are equal k
 - Sweep, master fixpoint against the candidate: 23,610 same, 0 bytes-only, 0 output movers,
   0 `runs → not-runs`, 0 new traps.
 
-## Next
+## The switch (PR 2)
 
-Switch the elaboration to its own keys and delete `monoElabStubArgsPrime` and its five helpers
-(emit_mono 943 → 937 functions).
+`elabStubArgsPrime` now runs unconditionally from `elabPrepareRun`, in the slot where mono's prime
+ran, and writes `elabStubArg` itself. `monoElabStubArgsPrime` is deleted, along with its five
+helpers (`monoPrimeInert`, `monoInertStubTy`, `monoStubFnTy`, `monoBreaksTo`, `monoInertFnsAt`)
+and the shadow. That takes emit_mono from 943 to 937 functions; the pin-helper baseline is 937.
+Measured on master `43a4f18e` plus both PRs:
+
+- Seed: 6,455,914 bytes for the master fixpoint, 6,455,938 for the candidate (+24).
+- Sweep: 23,610 same. No output movers, no bytes-only movers, 0 `runs → not-runs`.
+- D15494's witness (a refutation pin) grades `runs`, as filed.
