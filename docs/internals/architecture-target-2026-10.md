@@ -1944,6 +1944,16 @@ shadow. Per family, by status, each with its reach:
   - blocked: `monoWrittenGenLetFrame` 9,451 (split-dep: written-let slot fact (initialiser-fallback fix) + D4307 set join), `monoCoerceWrittenLetTys` 5,748 (split-dep: written-let per-instance signature), `monoArmWrittenLetSeed` 1,620 (split-dep: as monoWrittenGenLetFrame), `monoLetSeedGenFe` 0 (split-dep: as monoWrittenGenLetFrame).
   - parked: `monoWalkIdentCall` 9,452 ((S3): derivation waits on argument-keyed instances / reverse map; call_ref policy is mono), `monoCellCall` 255 (callee choice is call_ref policy (16/16 agree); coercion half waits on split-dep).
   - parked: `monoFlowMapReadVals` 286, `monoFlowAliasMaps` 225 (lane F: the map-value facts, beside the six `Map()` bundle reads).
+    Scoped 2026-11-07. Both are the PRODUCER side, what a map stores; `elabSlotDeliveries(d,
+    ["v"])` answers the consumer side and replaces neither. `monoFlowMapReadVals` already reads
+    `cwSlotWrittenValues(owner, ["[]"])` through `mfrLitsMapStored`, so only the root expansion is
+    mono's. `monoFlowAliasMaps` is a root-set soundness test (a binding handed a map holds no other
+    map), tied to D9480's per-instance mint, not a type decision. The climb after a map read in
+    `monoFlowUsePlanAt` needs the use node and `elabSlotDeliveries` returns types, so no
+    node-returning climb is added for it. `monoFlowMapVals` takes its alias writes from
+    `cwSlotWrittenValues` (the writes not through the owner), which follows every handle,
+    annotated parameters and calls two deep included (D14648), where mono's own chase followed
+    un-annotated parameters and `const`s one hop at a time.
   - switched: `monoFlowDeclVals` 7,946, `monoFlowLetLeaf` 656, `monoFlowKeptIndexElem` 516, `monoFlowValsOf` 81, `monoFlowLetMapLeaf` 75.
   - (c): `monoFlowReadsAll` 9,453, `monoFlowReadsRound` 9,453, `monoFlowReplanPending` 9,453, `monoFlowLetCalls` 7,932, `monoFlowUsePlanAt` 2,907, `monoFlowUsePlan` 2,907, `monoFlowAliasReadVals` 1,182, `monoFlowMapVals` 373, `monoFlowElemsGen` 131, `monoFlowRetLocalLists` 89.
 - **slot deliveries**:
@@ -2114,6 +2124,16 @@ The slot fact is the wrong reference: a written `let` of generics has no one clo
   27 with no answer. Each signature takes a hole function as a parameter, which no closed delivery
   carries; D5841 and D6480 are among them. Once that fact exists, all four callers that pass
   `tname` switch together.
+- **Switched in #6645, the by-call site** (the call through the binding that takes the chosen
+  instance's signature). `tname` is `elabKeySig` of the member keys `elabValueInstKey` gives the
+  binding's read. By `sigKeyOfTy` against mono's signature, 42 decisions agree, 0 differ and 9 have
+  no key; those 9 keep the instance's own signature as the named fallback. The 28 that differ in
+  spelling are a hole parameter written as its pin (`=>i>i` against `(i32)=>i32`) or bracketed.
+- **The delivery path stays mono's.** `elabValueInstKey` reads none at 99 of its 115 decisions: a
+  delivered read is not a callee read, so no member key is noted on it.
+- **Next, the hole-function argument.** 59 agree, 0 differ and 49 read none. Most of the 49 are
+  non-generic annotated functions, which have no instance, so their signature is the argument's own
+  type (`elabIdentityTy`).
 
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
@@ -2632,6 +2652,12 @@ So identity typing is not the prerequisite for this population; one fact is.
   handed on and never called, and the D10384 shape. A named generic held as a map value stays
   D15494's.
 
+  **The `??` row, the cheap route, parked** (2026-11-07). Widening the map arm of `elabSlotClose`
+  to fall back on the type the written values carry (`elabWrittenValueTy`) closes `v5` of
+  `closures/hole-fn-list-returned-reread.vl` and leaves `m4` and `m5` open. It also closes `qa` in
+  `closures/hole-fn-generic-map-handed-two-maps.vl`, a D15494 control that has to decline. The
+  attempt stays on `claude/coalesce-empty-default`, unmerged.
+
   **The split-dep rows, measured row by row.** Of the 64:
   - **Closed, 9.**
     - #6647 closes 2. A call through a `??` or value `if` callee notes each operand's slot. The
@@ -2910,6 +2936,19 @@ programs, counted by program).
   0 differ. No decision read the mark. The one shape that reached it, a literal-union map and its
   plain twin through one instance, is still refused, and now by the soft-twin test whose message
   names the fix. Both call orders are fixtures (`error-literal-union-map-twin-through-one-instance*`).
+  Over 19,316 programs no byte moves.
+- **Switched: a cloned lambda's parameter takes the elaboration's type at the instance.**
+  `monoLamSubstParams` already read the lambda's elaborated type (`elabNodeTy` at the walk key)
+  for an annotation that rides a type parameter. Its un-annotated arm now reads it too: where
+  `monoLamParamPinAnn` pins a parameter, the elaboration's closed type is used, and mono's pin
+  only where that type is open. Shadowed over 23,384 programs, the arm acts in 690. The
+  elaboration agrees in 602 and differs in none, and is open in 89, which stay on mono's pin. In 74 more the elaboration
+  closes a parameter mono leaves bare (69 `i32`). Those keep mono's answer: taking the closed
+  type there too leaves 66 byte-identical and makes 5 invalid wasm, because one lambda literal
+  serving instances at two types gets pinned at the walk key's type for both. The 5 are the
+  fixtures `hole-param-alias-call-delivers-lambda-at-callee-type` and
+  `hole-lambda-literal-two-instance-types`, and the witnesses of D14729, D5931 and D12235. The substitution arm never ran with the elaboration open, so that branch is now a
+  loud internal refusal. About 140 programs reach the arm with the type closed and keep running.
   Over 19,316 programs no byte moves.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
