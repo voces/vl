@@ -2917,8 +2917,11 @@ programs, counted by program).
   `monoLamParamPinAnn` pins a parameter, the elaboration's closed type is used, and mono's pin
   only where that type is open. Shadowed over 23,384 programs, the arm acts in 690. The
   elaboration agrees in 602 and differs in none, and is open in 89, which stay on mono's pin. In 74 more the elaboration
-  closes a parameter mono leaves bare (69 `i32`). Those keep mono's answer and are priced
-  separately. The substitution arm never ran with the elaboration open, so that branch is now a
+  closes a parameter mono leaves bare (69 `i32`). Those keep mono's answer: taking the closed
+  type there too leaves 66 byte-identical and makes 5 invalid wasm, because one lambda literal
+  serving instances at two types gets pinned at the walk key's type for both. The 5 are the
+  fixtures `hole-param-alias-call-delivers-lambda-at-callee-type` and
+  `hole-lambda-literal-two-instance-types`, and the witnesses of D14729, D5931 and D12235. The substitution arm never ran with the elaboration open, so that branch is now a
   loud internal refusal. About 140 programs reach the arm with the type closed and keep running.
   Over 19,316 programs no byte moves.
 
