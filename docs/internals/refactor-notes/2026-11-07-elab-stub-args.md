@@ -51,8 +51,9 @@ smaller population. Here every key is accounted for, and both tables are equal k
 ran, and writes `elabStubArg` itself. `monoElabStubArgsPrime` is deleted, along with its five
 helpers (`monoPrimeInert`, `monoInertStubTy`, `monoStubFnTy`, `monoBreaksTo`, `monoInertFnsAt`)
 and the shadow. That takes emit_mono from 943 to 937 functions; the pin-helper baseline is 937.
-Measured on master `43a4f18e` plus both PRs:
+Measured on master `b055cc92` (which includes PR 1) plus this change:
 
-- Seed: 6,455,914 bytes for the master fixpoint, 6,455,938 for the candidate (+24).
+- Seed: 6,476,942 bytes for the master fixpoint, 6,470,935 for the candidate (−6,007; the
+  shadow's code leaves with mono's copy).
 - Sweep: 23,610 same. No output movers, no bytes-only movers, 0 `runs → not-runs`.
 - D15494's witness (a refutation pin) grades `runs`, as filed.
