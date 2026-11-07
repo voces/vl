@@ -2004,6 +2004,30 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   happens in 6 programs, the same literals-at-two-types the hub's regression cells name, and its
   refusal is reached by none. It is class (c) mechanics over mono's own instance registry, and
   goes with that registry, not with a fact.
+  **The six non-hub helpers, shadowed (2026-11-07, Fn#d, 19,337 programs).** Each decision was read
+  against the lambda's parameters in `elabNodeTy(lam, elabWalkTop())`, and the bind site also
+  against the delivered name's slot fact and `elabLamDeliveredParams`.
+  - `monoLamSubstParams`: an annotated parameter riding a type parameter, substituted through the
+    binding. 244 rows, 244 agree by type. Switched: the parameter takes the elaboration's type,
+    spelled by `monoPinNominalSpelling` as the binders spell it (`monoPinAnnSpelling` gave `string |
+    null` and a row name in 5 programs and lost 3 `tests/cases` runs), and a substitution spelled
+    otherwise refuses. `monoSubstAnnNode` stays as the classifier (no type parameter, or one this
+    instance cannot bind) and for its two other callers, `monoCloneLambdaSubst`'s return step and
+    `monoSubstTyArgNodes`.
+  - `monoPinMapLambdas` waits. Its element is already the elaboration's (`monoRecvParamElemTy`), and
+    what is left is the clone. Of 1,017 rows mono clones in 64: 45 agree, 10 read `T` or `_` at the
+    walk top and 9 have no answer, so switching needs the callback's parameter read per instance.
+  - `monoNoteBindDeliveryCall` waits. A named hole lambda is pinned at the signature it is delivered
+    at. Over 219 rows the name has no slot fact, and `elabLamDeliveredParams` agrees in 43, spells the
+    same rep otherwise in 8 (`Dot` for `Circle`, `Z` for `i32`) and has nothing in about 168. It
+    needs a delivered-signature fact for named hole lambdas.
+  - `monoPinBodyLambdasRaw` and `monoCloneLambdaSubst` are the instance body's clone walk; their
+    type decisions are the substitution above and the hub.
+  - The hub (`monoLamParamPinAnn`) waits on split-dep's holder fact (c2) and on the per-instance
+    identity residual (4b-i), as above.
+  - Node type, gated on (c2) (#6593): `monoInitHeldTy` answers only adopt-init's mono-only holders,
+    and `monoRetFnListTy` / `monoBoundFnListElemsTy` answer 15 returned or nested lists of hole
+    lambdas whose type and instance result the elaboration leaves absent or `(_) => _`.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
   The hub is the binding `monoInstantiateCallIn` hands `monoMakeInstance` (`tvN` / `tvV` / `tvT`),
   against `ekTys` at the key the elaboration made for the call (`elabWalkKeyOf`, which already
