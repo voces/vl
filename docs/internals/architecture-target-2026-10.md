@@ -2023,7 +2023,8 @@ Switched, (c) or deleted: **119 of 165**, against 84 in the morning's table (38 
 - **unbound default**:
   - switched: `monoUncalledSlotFnTy` 293, `monoUncalledListElems` 209, `monoHoleFnPinTyOf` 19, `monoUncalledNestedListElems` 15.
   - (c): `monoChoiceArmFlowTy` 7,920.
-  - blocked: `monoElabDefaultsPrime` 18,172 (reach: the unbound default), `monoDefaultUnboundTyParams` 9,004 (reach: the unbound default).
+  - blocked: `monoElabDefaultsPrime` 18,172 (reach: the unbound default).
+  - deleted (2026-11-07): `monoDefaultUnboundTyParams`. Shadowed pre-walk over 23,103 programs, it was entered in 8,889 and never with a type parameter the declaration defaults; the 48 programs whose declarations default one bind it through the elaboration's call key (`elabCallKeyBinding`), whose key fill already holds the default. `elabTpDefaulted`, its one reader, went with it.
   - parked: `monoDefaultTyParamsOnlyGenFns` 8,697 (per-call rule no elaboration fact states (10 calls, 4 files)).
   - deleted: `monoArgClosedPin`.
 - **slot held fns**:
