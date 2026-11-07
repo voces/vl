@@ -2301,10 +2301,11 @@ delivered one, so a write of another result is refused where it is made, with th
 Without them D15353 and a list read before a helper writes a function of another result
 (`closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`) build check-clean and
 trap at the call (`indirect call type mismatch`), and D15190's refusal moves from the write to a
-mechanism message at the call. The fixture adds one late demand: +1 = D15136's uncalled-body `put`
-(`hand`'s body at the unbound default), pre-existing on master, newly counted by
-`closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`; foreseen by the
-uncalled-body minting slice, when the baseline drops back. `monoCallWrittenLet` instances its writes at the delivery's pin, and
+mechanism message at the call. The fixture adds one late demand, pre-existing on master and newly
+counted by `closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`. It is D15136's
+`put` at the argument's own type, demanded by the root call `put(xs)`. `hand` is never built: its
+second call of `put` makes `fnWriteOnlyInto` decline, so the elaboration delivers `xs` at `half`'s type.
+It exists only on that refusing build, and it goes with D15136's own fix. `monoCallWrittenLet` instances its writes at the delivery's pin, and
 `monoCallIfBound` no longer falls back to the seed. Mono's result derivation then decides nothing
 in the population, so `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy` and `monoHeldSrcsFnTy` are
 deleted. `monoSeedCallSigTys` stays for `monoCallIfValue`, an inline
