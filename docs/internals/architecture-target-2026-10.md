@@ -2814,8 +2814,8 @@ programs, counted by program).
   `monoCallKeyBinding` takes the instance's binding from `ekNames`/`ekTys` at the call's own key.
   It splits the binding as the rebuild did: type parameters onto the let binding, the holes of
   un-annotated parameters onto the hole binding. The gate is decided before any rebuild: every
-  parameter at the call key is closed, holds no hole and no function, and the binding holds no
-  literal and no record. Otherwise `monoBindCols` and `monoHoleBinding` rebuild it, and that is
+  parameter at the call key is closed and holds no hole and no function (a literal-or-record cut
+  stood here until D15537 closed; the counts below are from before). Otherwise `monoBindCols` and `monoHoleBinding` rebuild it, and that is
   the residue. Counted by program over 23,384, an instance takes:
 
   | branch | programs |
@@ -2831,6 +2831,20 @@ programs, counted by program).
   `ckb-callkey-binding-price`, and D15537 is the trap's witness. The key binds the argument's
   type where the rebuild pins the row the argument is built at. With the cut, over 19,316
   programs no byte moves.
+- **The cut is gone (D15537, closed).** The key is right as a type and the rebuild right as a
+  row, and the checker records both: `callBindTysAt` and `callBindRepTysAt`. `elabCallKeyBinding`
+  now binds each type parameter at the rep row where the checker records one, and the call key
+  keeps typing the call. A probe at every call where the two bindings differ found the rep row
+  equal to the rebuild's in all 23 record decisions. The numeric literal unions (`NK` against
+  `i32`) have no rep row and take the key's own binding; the one that could not lower was D3540,
+  closed by #6651. Widening the producer instead (`elabRowTys` reading the rep row without
+  `callBindRepKeyedAt`) breaks three of the four `ckb-callkey-binding-price` cells, because that
+  guard keeps the call's own rows at the type wherever a parameter does more than hand its value
+  on. So the row fact has one producer, the checker, and two readers asking different questions:
+  how the call is typed, and what the instance's argument is built at. Graded by output over
+  23,828 programs, 0 move. Over 19,346, two programs move bytes and not output: one instance
+  splits where the key binds `T := K` at one call and `i32` at another
+  (`numeric-litunion-beside-type-param-joins-one-set`), and one reorders.
 - **Two of the guards are deleted.** Each was graded by a hand-written probe of the plainest
   program its sentence forbids, built with the guard on and off, because the corpus reaches
   neither. Counted from the emitted message, attributed by site, against a control that refuses.
