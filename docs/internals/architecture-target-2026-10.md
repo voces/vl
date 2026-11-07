@@ -2606,6 +2606,35 @@ So identity typing is not the prerequisite for this population; one fact is.
   The deliveries row keeps two controls declining: `closures/hole-fn-if-to-hole-param.vl`'s `x`,
   handed on and never called, and the D10384 shape. A named generic held as a map value stays
   D15494's.
+
+  **The split-dep rows, measured row by row.** Of the 64:
+  - **Closed, 9.**
+    - #6647 closes 2. A call through a `??` or value `if` callee notes each operand's slot. The
+      hole-function maps `m` and `f` in `closures/coalesce-default-hole-function-over-map-read.vl`
+      then close at the call's types.
+    - #6649 closes 7. A written join closes through the functions it holds (`elabBindingFnSet`): a
+      labelled block's or an `if`'s value, under the unchanged hole-only and called-directly rules.
+  - **Declining by rule, 6.**
+    - 3 `if` choices with no call: `closures/fn-choice-bound-as-callback.vl`'s `h5`,
+      `closures/hole-fn-if-to-hole-param.vl`'s `x`, and one `x` in
+      `closures/hole-fn-labelled-block-loop-capture.vl`.
+    - 2 uncalled capture cells: `peerPinned`'s `d2` and `hole-lambda-peer-through-cell-read.vl`'s `d1`.
+    - `closures/delivered-alias-function-scope.vl`'s `localLambdas` `d`, below.
+  - **D15494, 30.** A named generic held in the map (26) or list (4); listed above.
+  - **Reach, 2.** The two remaining hole-function `Map()` rows close through the map
+    element-write source, built inside the same fold.
+  - **Fn#d, 17.**
+    - 7 capture cells are also written with a named generic (D3950); the instance at the delivery
+      is a call-instance signature.
+    - 10 lists of hole lambdas have elements that are handed on or returned, never called on
+      path `e`.
+  - **No cell-path closer.** The capture rewrite runs after `elabSlotFacts`, so a captured `let` is
+    closed as the function binding it is, at path `[]`.
+    - `localLambdas`' `d` declines. Its two members are local hole lambdas, and one is also called
+      directly at `string`.
+    - Its siblings that do close answer the function type against mono's cell list
+      `((i32) => i32)[]`. That is the cell-form difference already in the 22, so closing it would
+      add a 23rd.
 - **(ii):** `closures/listed-hole-fn-escaping-list.vl`. A generic held in a list by identity is called
   at two types, so the list's one concrete rep is mono's choice. It is D15010's signature twin, parked
   in this section.
