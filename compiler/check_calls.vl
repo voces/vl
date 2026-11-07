@@ -4046,6 +4046,16 @@ export function checkCallNode(n: Call, ix: i32) {
         argTys,
         if constListFnElemDecl(n.callFn) < 0 { ix } else { -1 },
       )
+    } else {
+      // A call through a `??` or a value `if` calls whichever operand it reaches, each at these
+      // arguments, so each operand that reads a slot is noted as called.
+      const ops: i32[] = []
+      calleeJoinOperands(n.callFn, ops, 0)
+      for op in ops {
+        const opath: string[] = []
+        const oh = calleeSlotOf(op, opath, 0)
+        if oh >= 0 { fnSlotCallNote(oh, opath, argTys, -1) }
+      }
     }
     if !hasNamedArgs(n.callArgNames) {
       noteSlotArgsAnn(n.callArgs, nodeTyIxOf(n.callFn))
@@ -4148,6 +4158,46 @@ function calleeSlotHolderOf(d: i32, path: string[]): i32 {
 
 // The `let` binding a callee read `x` takes its value from through a field, element or map value,
 // with that slot's path (`f.<name>`, `e`, `v`, outermost last) pushed onto `path`; -1 for none.
+// The values a callee `x0` that is a `??` or a value `if` may be, in `out`: each operand of a `??`
+// chain and each arm's tail value. Nothing for any other callee.
+function calleeJoinOperands(x0: i32, out: i32[], depth: i32) {
+  const x = parenPeelIx(x0)
+  if x < 0 || x >= P.nodes.length || depth > 8 { return 0 }
+  const n = nodeAt(x)
+  if n is BinExpr && n.binOp == "??" {
+    calleeJoinOperand(n.binLeft, out, depth)
+    calleeJoinOperand(n.binRight, out, depth)
+  } else if n is IfStmt {
+    calleeJoinOperand(calleeArmTail(n.ifThen), out, depth)
+    calleeJoinOperand(calleeArmTail(n.ifElse), out, depth)
+  }
+  0
+}
+
+// The value an `if` arm `a` hands on: a block's last statement unless it is a `return` (which
+// leaves the function instead), an `else if` itself; -1 for none.
+function calleeArmTail(a: i32): i32 {
+  if a < 0 || a >= P.nodes.length { return -1 }
+  const n = nodeAt(a)
+  if n is IfStmt { return a }
+  if !(n is Block) || n.blkStmts.length == 0 { return -1 }
+  const last = n.blkStmts[n.blkStmts.length - 1]
+  if nodeAt(last) is RetStmt { -1 } else { last }
+}
+
+// `calleeJoinOperands` for one operand `v`: a nested join's own operands, else `v` itself.
+function calleeJoinOperand(v: i32, out: i32[], depth: i32) {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= P.nodes.length { return 0 }
+  const n = nodeAt(x)
+  if (n is BinExpr && n.binOp == "??") || n is IfStmt {
+    calleeJoinOperands(x, out, depth + 1)
+  } else {
+    out.push(x)
+  }
+  0
+}
+
 function calleeSlotOf(x0: i32, path: string[], depth: i32): i32 {
   const x = parenPeelIx(x0)
   if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
