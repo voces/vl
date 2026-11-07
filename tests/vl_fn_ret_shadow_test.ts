@@ -38,10 +38,16 @@ const DROP_NOTHING = 1;
 const DROP_AS_VOID = 2;
 
 /** Compile `src` on a fresh instance with one shadow armed; the rows by class, summed. */
-const shadow = (src: string, drop: number, named: boolean, kind = false) => {
+const shadow = (
+  src: string,
+  drop: number,
+  named: boolean,
+  kind: boolean | "col" = false,
+) => {
   const exp = new WebAssembly.Instance(compiled!, {})
     .exports as unknown as Exports;
-  if (kind) exp.fnKindShadowArm(named ? 2 : 1);
+  if (kind === "col") exp.fnColShadowArm(named ? 2 : 1);
+  else if (kind) exp.fnKindShadowArm(named ? 2 : 1);
   else exp.fnRetShadowArm(named ? 2 : 1);
   exp.fnRetShadowDropSet(drop);
   exp.modReset();
@@ -67,7 +73,7 @@ const expectRows = (
   drop: number,
   named: boolean,
   want: string,
-  kind = false,
+  kind: boolean | "col" = false,
 ) => {
   const { rc, rows } = shadow(src, drop, named, kind);
   if (rc !== 0) throw new Error(`${name}: want compileSrc rc 0, got ${rc}`);
@@ -625,6 +631,59 @@ Deno.test({
       false,
       "kind: recorded void or never=1",
       true,
+    );
+  },
+});
+
+// THE RETURN-COLUMN SHADOW (`fnColShadowRun`): each un-annotated valued function, graded on every
+// return column against the rep of its recorded result, before and after each
+// `computeRetInference` run. `g` is annotated by the time the second run starts, so it grades
+// twice; a structural record names no row in the rep, while the column takes the one its value
+// is built at.
+const COL_REC = `function mk(n: i32) { { a: n, b: 2 } }
+print(mk(3).a)
+`;
+
+const COL_NO_ROW = "slot struct: recorded names no row, column does | mk=1";
+
+Deno.test({
+  name: "fn-ret shadow: return columns",
+  ignore,
+  fn() {
+    expectRows(
+      "col plain",
+      PLAIN,
+      DROP_NONE,
+      true,
+      "pre seed: agree i32 | g=1; pre settled: agree i32 | g=1",
+      "col",
+    );
+    expectRows(
+      "col record",
+      COL_REC,
+      DROP_NONE,
+      true,
+      `post seed: kind struct vs i32 | mk=1; post settled: ${COL_NO_ROW}; ` +
+        `pre seed: kind struct vs i32 | mk=1; pre settled: ${COL_NO_ROW}`,
+      "col",
+    );
+    expectRows(
+      "col, nothing",
+      COL_REC,
+      DROP_NOTHING,
+      false,
+      "post seed: no result recorded=1; post settled: no result recorded=1; " +
+        "pre seed: no result recorded=1; pre settled: no result recorded=1",
+      "col",
+    );
+    expectRows(
+      "col, all void",
+      COL_REC,
+      DROP_AS_VOID,
+      false,
+      "post seed: recorded void or never=1; post settled: recorded void or never=1; " +
+        "pre seed: recorded void or never=1; pre settled: recorded void or never=1",
+      "col",
     );
   },
 });

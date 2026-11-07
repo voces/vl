@@ -36,6 +36,7 @@ import {
 import { nodeHoleElemOf } from "./check_side_rows"
 import {
   T,
+  TY_BOOL,
   TY_NEVER,
   TY_VOID,
   TyArray,
@@ -59,10 +60,15 @@ import { unwrapParen } from "./emit_base"
 import { scopeTyAt } from "./emit_capture_frames"
 import { callsOfCallee } from "./emit_fn_ret_kinds"
 import { cloSigKeyExt } from "./emit_classify"
-import { repSigKindOfTy, repSigTokHasSlot } from "./emit_rep"
+import { repOfTy, repSigKindOfTy, repSigTokHasSlot } from "./emit_rep"
 import { repSigRetTokOfTy } from "./emit_rep_slot"
 import {
   emitPhaseReached,
+  fRetBool,
+  fRetKind,
+  fRetLitAtom,
+  fRetRArrElem,
+  fRetStructIdx,
   fRetVoid,
   fnParent,
   fnStmts,
@@ -79,6 +85,7 @@ import { nonNullTy, tyHasTyVar } from "./tyquery"
 let frsArmed = false
 let frsNamed = false
 let frsKindArmed = false
+let frsColArmed = false
 let frsDrop = 0
 let frsRowKey: string[] = []
 let frsRowN: i32[] = []
@@ -94,6 +101,13 @@ export function fnRetShadowArm(on: i32) {
 // function. It counts beside the voidness rows, once `computeRetInference` has settled.
 export function fnKindShadowArm(on: i32) {
   frsKindArmed = on != 0
+  frsNamed = on == 2
+  0
+}
+
+// Arm (1) or disarm (0) the return-column shadow (`fnColShadowRun`); 2 also names each function.
+export function fnColShadowArm(on: i32) {
+  frsColArmed = on != 0
   frsNamed = on == 2
   0
 }
@@ -407,9 +421,9 @@ function frsFnRet(ft0: i32): i32 {
 // Count every emitted function by how its recorded result meets `fRetVoid`. Run once the
 // voidness has settled (after `recordedVoidFns#2`).
 export function fnRetShadowRun() {
+  if !frsArmed { return 0 }
   frsRowKey = []
   frsRowN = []
-  if !frsArmed { return 0 }
   let fe = 0
   while fe < fnStmts.length && fe < fRetVoid.length {
     const fn = nodeAt(fnStmts[fe])
@@ -608,3 +622,66 @@ export function fnRetShadowRowLen(i: i32) { frsRowKey[i].length }
 export function fnRetShadowRowAt(i: i32, j: i32) { frsRowKey[i][j] }
 
 export function fnRetShadowRowN(i: i32) { frsRowN[i] }
+
+// Count every un-annotated function the emitter lowers valued by how the rep of its recorded
+// result meets the return columns, each class prefixed with `at`: the pass about to run or
+// just run.
+export function fnColShadowRun(at: string) {
+  if !frsColArmed { return 0 }
+  let fe = 0
+  while fe < fnStmts.length && fe < fRetVoid.length && fe < fRetKind.length {
+    const fn = nodeAt(fnStmts[fe])
+    if fn is FuncDecl {
+      if fRetVoid[fe] == 0 && fn.fnRet < 0 {
+        let key = at + ": " + frsColClass(fe)
+        if frsNamed { key = key + " | " + fn.fnName }
+        frsCount(key)
+      }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// The first return column of valued function `fe` that the rep of its recorded result does not
+// reproduce, as a class: kind, slot (for a kind that carries one), a ref list's element name,
+// boolean, atom. The slot is compared as numbers, whatever table each names.
+function frsColClass(fe: i32): string {
+  let r = fnRecordedRetTy(fe)
+  if frsDrop == 1 { r = -1 }
+  if frsDrop == 2 { r = TY_VOID }
+  if r == TY_VOID || r == TY_NEVER { return "recorded void or never" }
+  if r < 0 || r >= T.tys.length { return "no result recorded" }
+  const d = repOfTy(r)
+  if d.rdCovered == 0 {
+    const k = repSigKindOfTy(r)
+    if k == null { return "rep uncovered, no kind" }
+    if k != fRetKind[fe] {
+      return "rep uncovered, kind " + k + " vs " + fRetKind[fe]
+    }
+    return "rep uncovered, kind agree"
+  }
+  if d.rdKind != fRetKind[fe] {
+    return "kind " + d.rdKind + " vs " + fRetKind[fe]
+  }
+  if repSigTokHasSlot(d.rdKind) && d.rdSlot != fRetStructIdx[fe] {
+    if d.rdSlot < 0 {
+      return "slot " + d.rdKind + ": recorded names no row, column does"
+    }
+    if fRetStructIdx[fe] < 0 {
+      return "slot " + d.rdKind + ": column names no row, recorded does"
+    }
+    return "slot " + d.rdKind + ": rows differ"
+  }
+  if d.rdKind == "reflist" && fRetRArrElem[fe] == "" {
+    return "elem: reflist, column names none"
+  }
+  const b = if r == TY_BOOL { 1 } else { 0 }
+  if fe < fRetBool.length && b != fRetBool[fe] {
+    return if b == 1 { "bool: recorded boolean, column not" } else { "bool: column boolean, recorded not" }
+  }
+  if fe < fRetLitAtom.length && d.rdAtom != fRetLitAtom[fe] {
+    return if d.rdAtom == 1 { "atom: recorded atom, column not" } else { "atom: column atom, recorded not" }
+  }
+  "agree " + d.rdKind
+}

@@ -414,7 +414,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { callBindShadowNote } from "./call_bind_shadow"
-import { monoPinSpellNote } from "./pin_spell"
+import { monoPinRespell, monoPinSpellNote } from "./pin_spell"
 import {
   monoCalleeDeclOf,
   monoFrameInstTmpl,
@@ -2204,7 +2204,7 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
 // is pinned as a record (`monoRecordNominalPin`); `[-1, 0]` where its type does not decide the pin.
 // A record read narrowed below its place, or any read the instance alone narrows, is pinned from
 // the type its place holds.
-function monoArgClosedPinTy(ix: i32, fnIx: i32): i32[] {
+export function monoArgClosedPinTy(ix: i32, fnIx: i32): i32[] {
   const none: i32[] = [0 - 1, 0]
   const cax = unwrapParen(ix)
   if cax < 0 || cax >= P.nodes.length { return none }
@@ -9477,9 +9477,8 @@ function monoTypedInstKey(
           + tyCanonKey(pinnedTyIx[pk], TY_WALK_DEPTH)
       }
     }
-    // A hole function's pin is keyed by the closed type its `=>` key names.
+    // A function value's pin is keyed by its closed function type.
     const ht = monoSigPinHeadTy(
-      pinned[pk],
       if pk < pinTys.length { pinTys[pk] } else { -1 },
     )
     if ht >= 0 && pk < pinKinds.length {
@@ -9627,12 +9626,9 @@ function monoTypedTail(
   out
 }
 
-// `t` when `pin` is a `=>` pin and `t` is the closed function type its key names, else -1.
-function monoSigPinHeadTy(pin: string, t: i32): i32 {
-  if !monoPinIsFnSig(pin) || t < 0 || t >= T.tys.length { return -1 }
-  if !monoTyClosedFn(t) { return -1 }
-  if sigKeyOfTy(t) != pin.slice(2, pin.length) { return -1 }
-  t
+// `t` when it is a closed function type that pins as a wasm signature, else -1.
+function monoSigPinHeadTy(t: i32): i32 {
+  if monoPinTyIsFnSig(t) && monoTyClosedFn(t) { t } else { -1 }
 }
 
 // Typed instance key → the registry key of the instance first minted under it.
@@ -10222,11 +10218,6 @@ function monoInstanceFor(
     let j = 0
     while j < pinnedNames.length {
       let pt = if j < vty.length { vty[j] } else { -1 }
-      // A hole function's pin is the closed type its `=>` key names, as at a call's argument.
-      if monoPinIsFnSig(pinnedNames[j]) {
-        const ct = monoHoleFnPinTyOf(pt, pinnedNames[j])
-        if ct >= 0 { pt = ct }
-      }
       // A caller that holds only the pin's spelling resolves it through the registry.
       if pt < 0 {
         const nt = nameToTy(pinnedNames[j])
@@ -10321,7 +10312,7 @@ function monoInstanceFor(
         // call's argument keys it, so a delivery and a call at one signature share the instance.
         let fk = ""
         if !monoCadIsLam(monoOrigNode[origFe]) {
-          fk = monoHoleFnPinSpell(params[pj], pn, pinTys[pj])
+          fk = monoHoleFnPinSpell(params[pj], pinTys[pj])
         }
         pinned.push(if fk != "" { fk } else { pn })
       }
@@ -10332,6 +10323,7 @@ function monoInstanceFor(
     const noCb: string[] = []
     const pinKinds: i32[] = []
     monoBuildPinCol(pinned, pinKinds)
+    monoPinRespell(pinned, pinTys, params)
     cadDelivery = if cadDeliveryAt >= 0 { cadDeliveryAt } else { letInitIx }
     instKeyDstSet(expTy, deliveryTys)
     const made = monoMakeInstance(
@@ -10352,11 +10344,11 @@ function monoInstanceFor(
   0
 }
 
-// The `=>` pin of un-annotated parameter `par` pinned `pn` at the closed function type `pt`,
-// where `pn` spells it another way; "" otherwise.
-function monoHoleFnPinSpell(par: i32, pn: string, pt: i32): string {
+// The `=>` pin of un-annotated parameter `par` pinned at the closed function type `pt`; "" for an
+// annotated parameter, or a `pt` that is open or tagged.
+function monoHoleFnPinSpell(par: i32, pt: i32): string {
   const p = nodeAt(par)
-  if !(p is Param) || p.parType >= 0 || monoPinIsFnSig(pn) { return "" }
+  if !(p is Param) || p.parType >= 0 { return "" }
   if (
     pt < 0
     || pt >= T.tys.length
@@ -11136,7 +11128,7 @@ function monoSigFnTyNameAt(sig: string, fty: TyFunc): string {
   let k = -1
   while k < ps.length {
     let s = ""
-    if k < 0 || (pins.length == ps.length && monoPinIsFnSig(pins[k])) {
+    if k < 0 || monoPinTyIsFnSig(ps[k]) {
       s = tyToEmitName(if k < 0 { fty.fnRet } else { ps[k] })
     }
     names.push(s)
@@ -11155,9 +11147,10 @@ function monoSigFnTyNameAt(sig: string, fty: TyFunc): string {
   out + ")=>" + names[0]
 }
 
-// Whether pin `pn` is a function value's, which names only a wasm signature (`=>k`).
-function monoPinIsFnSig(pn: string): boolean {
-  pn.length >= 2 && pn.slice(0, 2) == "=>"
+// Whether type `t` pins as a function value's wasm signature (`=>k`): a function type whose
+// signature key has a token for every part.
+function monoPinTyIsFnSig(t: i32): boolean {
+  t >= 0 && t < T.tys.length && tyAt(t) is TyFunc && sigKeyOfTy(t) != ""
 }
 
 // For a name read at `at` in frame `ctx` that a chain of un-annotated aliases never written
@@ -11607,7 +11600,10 @@ function monoFlowLetMapLeaf(d: i32, stored: i32[]): i32 {
     if !(ib is Index) || !monoFlowValsOf(ib.idxArr, base) { return -1 }
     if base.length == 0 || monoFlowMapCount(base) != base.length { return -1 }
     const vs: i32[] = []
-    if !monoFlowMapReadVals(base, vs) || vs.length == 0 { return -1 }
+    for b in base {
+      if !mfrLitsMapStored(b, vs) { return -1 }
+    }
+    if vs.length == 0 { return -1 }
     for v in vs {
       const vg = monoFlowLeafGen(v)
       if vg < 0 || (g >= 0 && vg != g) { return -1 }
@@ -12091,12 +12087,14 @@ function monoFlowAliasMap(d: i32): i32 {
 }
 
 // The `Map()` values candidate binding `d`, an un-annotated parameter or `const` other than their
-// owner, holds; empty when it may hold anything else. A write through `d` stores into each (D9480).
+// owner, holds, from its literal roots (`mfrLitsOf`); empty when it may hold anything else. A
+// write through `d` stores into each (D9480).
 function monoFlowAliasMaps(d: i32): i32[] {
   if d < 0 || d >= P.nodes.length || !(mfrCand[d] ?? false) { return [] }
   const dn = nodeAt(d)
   if dn is LetDecl && dn.letKw != "const" { return [] }
-  const vs = monoFlowDeclVals(d)
+  const vs: i32[] = []
+  if !mfrLitsOf(d, vs) { return [] }
   for v in vs {
     const o = monoFlowMapOwner(v)
     if o < 0 || o == d { return [] }
@@ -12194,16 +12192,6 @@ function monoFlowMapNoteAliasWrites(d: i32) {
 // The values a write through a parameter or `const` the map declared at `at` is handed to stores,
 // as `monoFlowMapVals` found them.
 function monoFlowAliasStored(at: i32): i32[] { mfrAliasWrites[at] ?? [] }
-
-// Appends to `out` the values a read of map `x` may give, `x[k]` or `x.get(k)` beside each map in
-// `base`: the roots of what each stores (`mfrLitsMapStored`); false when one of `base` is no map.
-function monoFlowMapReadVals(base: i32[], out: i32[]): boolean {
-  if base.length == 0 { return false }
-  for b in base {
-    if monoFlowMapOwner(b) < 0 || !mfrLitsMapStored(b, out) { return false }
-  }
-  true
-}
 
 // How many of `cv` are maps `monoFlowMapOwner` knows.
 function monoFlowMapCount(cv: i32[]): i32 {
@@ -12607,7 +12595,9 @@ function monoFlowUsePlanAt(
         return false
       }
       const next: i32[] = []
-      if !monoFlowMapReadVals(cv, next) { return false }
+      for b in cv {
+        if !mfrLitsMapStored(b, next) { return false }
+      }
       cv = next
       path.push("v")
       viaMap = true
@@ -16227,29 +16217,24 @@ function monoInertReach(stmts: i32[]) {
   monoReachIndex(roots)
 }
 
-// Types each list or record literal whose function element or field the walk left open at the
-// one call type the value reaches (`monoReachSlotTy`), so its slot's signature is the one those
-// calls make (D7103). An element or field already typed at a returned record of members holds it
-// whole (B2).
+// Records, at each call reaching a list or record literal's open function element or field, the
+// one call type the slot is called at (`monoReachSlotTy`) (D7103). The literal's own type is the
+// elaboration's.
 function monoReachLitTys() {
   for a in vrLits {
     const at = nodeTyIxOf(a)
     const t = if at >= 0 && at < T.tys.length { tyAt(at) } else { null }
     if t is TyArray && !monoIsBundleTy(t.aElem) {
-      const ct = monoReachSlotTy(a, t.aElem, "e")
-      if ct >= 0 { nodeTyRecord(a, mkArrayTy(ct)) }
+      monoReachSlotTy(a, t.aElem, "e")
     } else if t is TyObj {
-      const fts: i32[] = []
-      let moved = false
       let i = 0
       while i < t.objFieldTypes.length {
         const ft = t.objFieldTypes[i]
-        const ct = if monoIsBundleTy(ft) { -1 } else { monoReachSlotTy(a, ft, "f." + t.objFieldNames[i]) }
-        fts.push(if ct >= 0 { ct } else { ft })
-        if ct >= 0 { moved = true }
+        if !monoIsBundleTy(ft) {
+          monoReachSlotTy(a, ft, "f." + t.objFieldNames[i])
+        }
         i = i + 1
       }
-      if moved { nodeTyRecord(a, mkObjTy(t.objFieldNames, fts)) }
     }
   }
   0
@@ -19649,15 +19634,6 @@ function monoInertArgsStubbed(): i32 {
   0
 }
 
-// The closed function type the `=>` pin `pin` keys for the function type `vt`: `vt` itself when
-// closed, else the elaboration's default fill (`elabHoleFnClosed`); -1 when neither keys as `pin`.
-function monoHoleFnPinTyOf(vt: i32, pin: string): i32 {
-  if vt < 0 || vt >= T.tys.length { return -1 }
-  const key = pin.slice(2, pin.length)
-  const t = if monoTyClosedFn(vt) { vt } else { elabHoleFnClosed(vt) }
-  if t >= 0 && monoTyClosedFn(t) && sigKeyOfTy(t) == key { t } else { -1 }
-}
-
 // Coerces the called field of a record literal no binding holds (`{ f: g, n: 1 }.f(x)`) at the
 // signature the elaboration stamps that field's value with, so each literal gets its own (D15113).
 function monoPinLitFieldCall(c: Call, ctx: i32): i32 {
@@ -19916,6 +19892,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       }
       const pinKinds: i32[] = []
       monoBuildPinCol(pinned, pinKinds)
+      monoPinRespell(pinned, pinTys, params)
       monoPinArgLit = []
       let li = 0
       while li < args.length {
@@ -20634,9 +20611,14 @@ function monoPinHoleParam(
           guessed = true
         }
       }
-      // A hole function's `=>` pin is typed at the closed signature its rep key names.
-      if anTy < 0 && monoPinIsFnSig(an) {
-        anTy = monoHoleFnPinTyOf(monoArgPinTyIx(args[i], ctx), an)
+      // A hole function's pin is typed at its closed signature, else the elaboration's default
+      // fill (`elabHoleFnClosed`); left open where neither pins as a wasm signature.
+      if anTy < 0 {
+        const vt = monoArgPinTyIx(args[i], ctx)
+        if vt >= 0 && vt < T.tys.length && tyAt(vt) is TyFunc {
+          const ct = if monoTyClosedFn(vt) { vt } else { elabHoleFnClosed(vt) }
+          if monoPinTyIsFnSig(ct) && monoTyClosedFn(ct) { anTy = ct }
+        }
       }
     }
     // An argument open in this frame at a call no instance elaborates at a closed type: no
@@ -23951,7 +23933,7 @@ function monoSlotPinAnn(
   let k = 0
   for pn in monoSigPinsTop(sig) {
     if k > 0 { out = out + "," }
-    if monoPinIsFnSig(pn) && fts.length > 0 {
+    if fts.length > 0 && monoPinTyIsFnSig(fts[k]) {
       out = out + "(" + monoConcreteFnTyName(fts[k]) + ")"
     } else if fts.length > 0 && monoConcreteNulFnTyName(fts[k]) != "" {
       out = out + monoConcreteNulFnTyName(fts[k])
@@ -24006,7 +23988,7 @@ function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
   if tys.length != ps.length { return none }
   let k = 0
   while k < ps.length {
-    if monoPinIsFnSig(ps[k]) && monoConcreteFnTyName(tys[k]) == "" {
+    if monoPinTyIsFnSig(tys[k]) && monoConcreteFnTyName(tys[k]) == "" {
       return none
     }
     k = k + 1
