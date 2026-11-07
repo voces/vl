@@ -151,7 +151,7 @@ import {
 import { letNullHoleFilledTy, letNullHoleUnfilled } from "./check_null_holes"
 import { canonUnionMembersInto } from "./check_program"
 import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
-import { tyVarRowsMinted } from "./check_subst"
+import { tyVarRowsMinted, tyVarsOwnScheme } from "./check_subst"
 import {
   MAP_KEY_I32,
   MAP_KEY_I64,
@@ -317,6 +317,7 @@ import {
   elabBundleRecordOf,
   elabCallResultMember,
   elabCallResultTy,
+  elabDeclFnOf,
   elabFnReturnsRecordAt,
   elabHasHolderMemberTy,
   elabHasResultFact,
@@ -926,7 +927,7 @@ import {
 } from "./symbols"
 import { peelGroupParens } from "./tyname"
 import { recNarrowRecordOf, recRepWidens } from "./check_bind_adopt"
-import { storeLetBuiltOf } from "./check_fit_rules"
+import { recEnclosingFn, storeLetBuiltOf } from "./check_fit_rules"
 import { holeFnArgRetAtParams, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
@@ -2786,10 +2787,16 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
   if ty < 0 { return no }
   // A function value's cell is the closure rep whatever its type variables bind to; a list or
   // record of one is not, since its row names the signature.
+  // A record holding a generic function value names its own scheme, not an open variable. Its
+  // row is the one its initializer builds: the type's function field names no row.
+  let ownScheme = false
   if tyHasTyVar(ty) {
     const t0 = tyAt(ty)
     const inner = if t0 is TyNullable { t0.nInner } else { ty }
-    if !tyIsFuncArena(inner) && !fnTagListTy(inner) { return no }
+    if !tyIsFuncArena(inner) && !fnTagListTy(inner) {
+      if !tyVarsOwnScheme(ty, letEnclFns(letIx, fnIx)) { return no }
+      ownScheme = true
+    }
   }
   if letMapCtorAtomKey(letIx, ty) { return no }
   const rd = repOfNodeAt(letIx, ty)
@@ -2801,6 +2808,7 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
     || k == "nulvariant"
     || k == "reflist"
     || k == "nulreflist")
+  if ownScheme && k != "struct" && k != "nulstruct" { return no }
   if rd.rdCovered != 1 || !rowed {
     return {
       bgClaims: rd.rdCovered == 1,
@@ -2810,8 +2818,28 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
       bgSlotHave: false,
     }
   }
-  const slot = repSlotOfKind(k, ty)
+  let slot = -1
+  if ownScheme {
+    slot = holderRecordRow(letIx, fnIx)
+    if slot < 0 { slot = structIndexOfLet(letIx, fnIx) }
+  } else {
+    slot = repSlotOfKind(k, ty)
+  }
   { bgClaims: slot >= 0, bgRep: rd, bgTy: ty, bgSlot: slot, bgSlotHave: true }
+}
+
+// The functions enclosing binding `letIx` at instance `fnIx`, innermost first, `fnIx` included.
+function letEnclFns(letIx: i32, fnIx: i32): i32[] {
+  const out: i32[] = []
+  if fnIx >= 0 { out.push(fnIx) }
+  let cur = elabDeclFnOf(letIx)
+  let guard = 0
+  while cur >= 0 && cur < P.nodes.length && guard < 256 {
+    out.push(cur)
+    cur = recEnclosingFn(cur)
+    guard = guard + 1
+  }
+  out
 }
 
 // Whether un-annotated binding `letIx` holds a union box at `fnIx` though its initializer reads as
