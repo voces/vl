@@ -4,7 +4,7 @@ Measured at origin/master 76a3eb8fd (2026-10-25), read and measure only. The wit
 tables it cites were scratch files and are not kept; re-run a witness from the text before quoting it.
 
 
-## Status (2026-11-07, master `df635dbd`)
+## Status (2026-11-07, master `a7f27705`)
 
 Each step is graded by whether its **Deletes** list below is still in `compiler/`, and §3.4's front by
 the evening census ([notes](refactor-notes/2026-11-07-exit-census-evening.md)). The PR that moves a step
@@ -13,7 +13,7 @@ updates this section. Dated measurements live in [`refactor-notes/`](refactor-no
 | Step | State | What is left |
 |---|---|---|
 | 1. Per-instance node types | done | Nothing: `nodeTyInDerived`'s rungs and the `monoOrigNode` scan are gone (landed with 2–3 as one mechanism). |
-| 2. The checker owns the instance set | in progress, the live front (§3.4) | 16 blocked and 12 parked `emit_mono` decision functions, below; `recordedParamPinName` and 178 `mono*Pin*` functions stand. |
+| 2. The checker owns the instance set | in progress, the live front (§3.4) | 14 blocked and 12 parked `emit_mono` decision functions, below; `recordedParamPinName` and 178 `mono*Pin*` functions stand. |
 | 3. Singleton function types | in progress | fn_split and the `genFnHole*` family are gone. Left: the Fn#d function-holding fact (7 blocked node-type functions) and identity typing for concrete function values (owner). `judgeFnArgHoleCalls` stands; its split arm was not re-checked here. |
 | 4. Finite function sets | deletions done | fn_split.vl, fn_flow_shadow.vl, the FS loop, `holeChoice*` and the list and capture pinners are gone, and the flow table is retired (§3.3). The residue is step 2's blocked list. |
 | 5. Contextual type and coercion records | deletions done | ExpCtx and the `emit*WidenSite` calls are gone. The one `lowerCoerce(srcRep, dstRep)` table is not built. |
@@ -40,23 +40,24 @@ census left.
 | **all** | **165** | **64** | **51** | **16** | **12** | **22** |
 
 None is unassessed. Since the census, #6689 switched `monoDefaultTyParamsOnlyGenFns` (unbound default,
-parked → switched), so master reads 65 switched and 11 parked.
+parked → switched), and #6684 deleted `monoClosedFieldValTy` and parked `monoPinReturnedObj` (node type,
+both from blocked), so master reads 65 switched, 51 (c), 14 blocked, 12 parked and 23 deleted.
 
-**Blocked (16), each on a named fact:**
+**Blocked at the census (16; 14 on master), each on a named fact:**
 - node type: `monoArgClosedTyIn` (the delivery signature of an argument forwarded through a generic to a
   hole function; D5930's `hole-leaf-literal-through-forwarder` rules out `elabInstNodeTy`),
   `monoCoerceListCbArg` (a callback signature over a list element with no elaboration instance),
   `monoPinReturnedObj`, `monoRetFnListTy` and `monoClosedObjLitTy` (Fn#d: lambdas returning records,
-  returned lists of hole lambdas, records holding functions), `monoClosedFieldValTy` (the
-  function-holding fact; re-blocked by #6644), `monoCloseRetFnTy` (no fact for a stored call returning
-  a list of functions);
+  returned lists of hole lambdas, records holding functions; #6684 parked `monoPinReturnedObj` on a
+  returned record of hole-function lists), `monoClosedFieldValTy` (deleted by #6684),
+  `monoCloseRetFnTy` (no fact for a stored call returning a list of functions);
 - lambda sigs: `monoLamParamPinAnn` (split-dep's holder fact (c2) and the per-instance identity residual);
 - call param: `monoBindSeededTyParams` (identity typing for function values, A), `monoArgPinTyIx` (a
   pin fact of its own after holes-close), `monoArgPinName` (the rep cascade), and `monoArgTyName`,
   `monoArgTyNameCascade`, `monoArgTyNameBound`, `monoArgTyNameProjected` and `monoArgTyNameRep`
   (split-dep's one-producer redesign; the kept arms wait on the naming rule).
 
-**Parked (12), each on a named question:**
+**Parked at the census (12; 12 on master), each on a named question:**
 - `monoElabStubArgsPrime`: the stub half waits on D15494 (owner);
 - `monoDefaultTyParamsOnlyGenFns`: switched by #6689 after the census;
 - `monoWalkIdentCall` and `monoHoleBinding`: argument-keyed instances, behind identity typing for
@@ -432,6 +433,7 @@ Moved, one file per part, in the order the section held them; the live summary i
 - [The argument pin's arms, measured](refactor-notes/2026-11-07-argument-pin-arms.md)
 - [A function list's hole binding](refactor-notes/2026-11-07-function-list-hole-binding.md)
 - [A function-holding let's slot fact, from its calls](refactor-notes/2026-11-07-function-let-slot-fact.md)
+- [Record literals closed from the bindings they read](refactor-notes/2026-11-07-record-literals-closed-from-bindings.md)
 - [Argument-keyed instances: design note](refactor-notes/2026-11-07-argument-keyed-instances-design.md)
 - [The call half and the value half](refactor-notes/2026-11-06-call-half-and-value-half.md)
 
