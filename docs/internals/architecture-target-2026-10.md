@@ -2596,6 +2596,24 @@ by program).
   (`monoBindCalled`). `monoSigListAdd` is deleted, and `monoNoteBindCall`, a two-line forwarder,
   is inlined into its three callers. Over 19,316 programs no byte moves.
 
+**Instance binding: the union-arm and null binds, first measurements** (2026-11-07, 23,384
+programs, counted by program).
+
+- **`monoExactPinTyOf` was a second `monoPinSubTyOf`.** Both read `elabInstTyAt` at the instance
+  and fall back to the pin. `monoExactPinTyOf` returned a closed pin untouched, while
+  `monoPinSubTyOf` still substitutes it. The two differ in 63 programs, and in all 63 they are the
+  same type at another id (`tySame`). `monoExactPinTyOf` is deleted and its five callers read
+  `monoPinSubTyOf`. Over 19,316 programs no byte moves.
+- **`monoParamPinnedNull` compares the annotation's type, not its spelling.** It is true in 5
+  programs, and in each the annotation's type is `null`.
+- **The rebuilt binding.** In 7,140 programs the key mono demands from its rebuilt binding is the
+  call's own key (`elabWalkKeyOf(tplCall, true, decl)`). In 19 more the two keys type every
+  parameter alike. In 90 the call key leaves a function-holding parameter open (`((_) => _)[]`,
+  `{f: (_) => _}`, `(T) => T`) where mono's key holds the concrete rep. That is Fn#d's question:
+  the elaboration minted the concrete instance, and no fact maps the call to it. In 13 a closed
+  parameter differs by name, not value: an alias, literal union or narrower structure against
+  its base (`NK` against `i32`, `{r: null}[]` against `Circle[]`), which is rowintern's row key.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
