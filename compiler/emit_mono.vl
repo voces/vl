@@ -139,7 +139,13 @@ import {
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
-import { cwFnValueDeclOf, cwIxBuild, cwIxCoveredLen } from "./check_write_scan"
+import {
+  cwFnValueDeclOf,
+  cwIxBuild,
+  cwIxCoveredLen,
+  cwKeyOfDecl,
+  cwSlotWrittenValues,
+} from "./check_write_scan"
 import { tyLeavesDisjoint } from "./check_type_shape"
 import {
   callArgRepTy,
@@ -14083,8 +14089,8 @@ function monoFlowElemLeaves(v: i32, depth: i32): i32[] {
       out.push(x)
     }
   }
-  for x in monoFlowPushed(v) { out.push(x) }
-  for x in monoFlowElemWrites(v) { out.push(x) }
+  const pushes: i32[] = []
+  if !monoFlowListWritten(v, out, pushes) { return [] }
   out
 }
 
@@ -14096,7 +14102,9 @@ function monoFlowPushedSpreadSrc(x: i32): i32 { monoFlowGrownSpreadSrc(x, 0) }
 function monoFlowListGrows(v: i32, depth: i32): boolean {
   const ln = nodeAt(v)
   if !(ln is ArrayLit) || depth > 8 { return false }
-  if monoFlowPushed(v).length > 0 { return true }
+  const written: i32[] = []
+  const pushes: i32[] = []
+  if !monoFlowListWritten(v, written, pushes) || pushes.length > 0 { return true }
   for e in ln.arrElems {
     if monoFlowGrownSpreadSrc(unwrapParen(e), depth + 1) >= 0 { return true }
   }
@@ -14187,32 +14195,29 @@ function monoFlowListNames(d: i32): i32[] {
   out
 }
 
-// Each read, past its parentheses, of a name `monoFlowListNames` gives the owner of list literal
-// `v`; empty when `v` has no owner.
-function monoFlowOwnerReads(v: i32): i32[] {
-  const out: i32[] = []
+// Every value written into list literal `v`'s element slot after its literal, onto `out`, with
+// each one's `.push` onto `pushes` too (`cwSlotWrittenValues` on its owner); false when the write
+// index cannot answer. A literal with no owner is written nowhere.
+function monoFlowListWritten(v: i32, out: i32[], pushes: i32[]): boolean {
   const d = monoFlowListOwner(v)
-  if d < 0 { return out }
-  for a in monoFlowListNames(d) {
-    for u in mfrUses[a] ?? [] {
-      let x = u
-      while (mfrParentOf(x)) >= 0 && nodeAt(mfrParentOf(x)) is Paren {
-        x = mfrParentOf(x)
-      }
+  if d < 0 { return true }
+  const ln = nodeAt(v)
+  if !(ln is ArrayLit) { return false }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwKeyOfDecl(d), ["[]"], vals, ats) < 0 { return false }
+  const own: i32[] = []
+  for e in ln.arrElems { own.push(unwrapParen(e)) }
+  let i = 0
+  while i < vals.length {
+    const x = unwrapParen(vals[i])
+    if x >= 0 && !i32ListHas(own, x) {
       out.push(x)
+      if i < ats.length && ats[i] >= 0 && nodeAt(ats[i]) is Call { pushes.push(x) }
     }
+    i = i + 1
   }
-  out
-}
-
-// Each value the owner of list literal `v` appends by `.push` through its own name or an alias.
-function monoFlowPushed(v: i32): i32[] {
-  const out: i32[] = []
-  for x in monoFlowOwnerReads(v) {
-    const s = monoFlowPushOf(x)
-    if s >= 0 { out.push(unwrapParen(s)) }
-  }
-  out
+  true
 }
 
 // The value a plain `=` stores into an element of read `x`, as `x[k] = v`; -1 otherwise.
@@ -14228,16 +14233,6 @@ function monoFlowElemWriteOf(x: i32): i32 {
   wn.binRight
 }
 
-// Each value the owner of list literal `v` stores by an element write through its own name or an
-// alias (D10340).
-function monoFlowElemWrites(v: i32): i32[] {
-  const out: i32[] = []
-  for x in monoFlowOwnerReads(v) {
-    const s = monoFlowElemWriteOf(x)
-    if s >= 0 { out.push(unwrapParen(s)) }
-  }
-  out
-}
 
 // Whether node `x` is the target of an assignment, plain or compound.
 function monoFlowIsWrite(x: i32): boolean {
@@ -14579,8 +14574,10 @@ function monoFlowNoteInertIn(v: i32, depth: i32) {
   }
   if n is ArrayLit {
     for e in n.arrElems { monoFlowNoteInertIn(e, depth + 1) }
-    for e in monoFlowPushed(x) { monoFlowNoteInertIn(e, depth + 1) }
-    for e in monoFlowElemWrites(x) { monoFlowNoteInertIn(e, depth + 1) }
+    const written: i32[] = []
+    const pushes: i32[] = []
+    monoFlowListWritten(x, written, pushes)
+    for e in written { monoFlowNoteInertIn(e, depth + 1) }
     return 0
   }
   if n is ObjLit {
