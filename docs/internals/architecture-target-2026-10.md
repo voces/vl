@@ -2299,6 +2299,16 @@ the inner literals at it. A map of that shape without a closed fact is a loud re
 program reaches. The stored values need no instancing of their own here, because their deliveries
 already instance them. The fixture prints the same, and over 19,316 programs no byte moves.
 
+**`monoPinnedElemAnnTy` was unreached** (2026-11-07). It is the element-read arm of the pinned
+receiver climb (`monoPinnedListAnnTy`), which a `.map` / `.filter` callback asks only where the
+elaboration's walk type for the receiver is open. Over 23,384 programs that climb is entered by 3 and
+closes in 2 (`closures/fn-list-mapped-to-functions.vl`, `closures/hole-fn-list-returned-reread.vl`),
+both through a binding. The element arm is reached by none: since the tail table was measured the
+walk type answers its fixture first. A probe at the call site fires there as the control. The arm
+is now a loud refusal and the helper is deleted. The climb itself stays: declining it moves both
+closing programs from runs to an emit refusal (`ref valtype with no interned shape`, `call to
+unknown function`). Over 19,316 programs no byte moves.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
@@ -2522,6 +2532,27 @@ pair differs where both answer.
   `named/d15207_rec_ret`, parked with D15494, and six writes in
   `closures/hole-fn-map-record-let-rewritten.vl` (D15534's fixture). Filling the 272 elab-only
   literals moves no byte.
+
+**Walk type, what the helpers still derived** (2026-11-07, 19,338 programs, master `1b3572f1`).
+Six of the family's eleven helpers were already gone. The other five, against the walk type
+(`elabWalkNarrowedTy`, else `elabWalkTy`), 4,395 decisions:
+
+| helper | decisions (programs) | reading |
+|---|---|---|
+| `monoLamPinRetAnn` | 1,260 (637) | every annotation it writes is the elaboration's (`monoLamElabRet`) |
+| `monoHoleNodeTy` | 17 (9) | the elaboration first; its fallback, the recorded type, is open in all 17 |
+| `monoLamCallTy` | 782 (164) | the elaboration first; its fallback, the recorded type, is open in all 782 |
+| `monoNumOperandPinTy` | 1,577 (211) | the walk type agrees 1,484; both open 65; elab only 6; differ 22 |
+| `monoPinArmSubst` | 759 (243) | the walk type agrees 546; elab only 203; differ 10 |
+
+Every difference is a numeric literal operand. Mono typed the literal at its own `i32`, and the walk
+type gives the width its context widens it to (`i64`, `f64`, `f32`). Taking the walk type alone
+moves no byte over the 431 programs reaching the last two, so the widened width is the honest
+answer: mono's `i32` was re-widened downstream. `monoNumOperandPinTy` and the two `??` rebuilds
+(`monoPinCoalJoin`, `monoPinCoalListDefault`) now read the walk type (`monoClosedWalkTy`).
+`monoPinArmSubst` and `monoDropUnboundMembers` are deleted, and a hole instance's `??` with a list
+default whose left side has no closed walk type refuses loudly where the hole-binding substitution
+was; no program reaches it. The first three helpers already read the elaboration and stay.
 
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
@@ -2987,6 +3018,25 @@ A clone copy takes its original's entry in each of them.
 after mapping each lambda clone through `elabSrcDecl`. That mapping brings D3928's 21 differing
 decisions to agree. `nodeSrc`, `declOrigOf` and `lfOriginOf` do not link an instance body's lambda
 copies.
+
+**The hub's callee choice is parked: its derivation duplicates an elaboration fact, and its policy
+is mono's** (2026-11-07). `monoWalkIdentCall` picks a callee through eight rungs: arm, respell,
+closure, the instance-origin hop, captured, readgen, alias-lambda and alias-let end. That choice
+agrees with the elaboration's (`elabCalleeFnsOf`, with a lambda clone mapped by `elabSrcDecl`) on
+**122,691 of the 122,722 decisions both sides answer**. The remaining 31 are the D5841 several-sets,
+over 23,456 programs. Two things in the hub are mono's own:
+- **The `call_ref` policy**, which calls may be made direct. Whether a rung fires is what keeps the
+  2,079 elab-only calls `call_ref` (ruling (a); (S2), making a subset direct, stays declined), and
+  the rungs' `monoNoRename` and written-let frame side effects are that policy.
+- **Callback specialization**, recorded below.
+
+What duplicates the elaboration is the rungs' derivation of which function is called. That
+derivation is the endgame to move (S1). The rung would become a firing predicate, and the callee the
+elaboration's single member. The move is blocked on a cheap reverse map from a source declaration to
+its clone in an instance, because the elaboration names the source and mono needs the instance's
+slot. The canonical-instance-key work is the expected provider. Moving it today would delete about
+two functions (`monoRespellLamFe` and `monoCapturedLamFe` become predicates), so it waits for that
+map.
 
 **Mono-owned: callback specialization's direct calls** (2026-11-07). `monoWalkIdentCall`'s
 instance choice was compared with the elaboration over 23,456 programs: 122,691 decisions agree.
