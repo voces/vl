@@ -11,9 +11,9 @@
 // that printed it for every program, so the controls below assert that a VALID module is
 // unchanged: rc 0, no banner, and the program's own output.
 //
-// THE WITNESS MUST STILL BE INVALID. This is D15040's empty `Set()` at a bare type parameter,
-// called from a function, and it is check-clean invalid wasm on the current seed. When D15040
-// is fixed this suite goes RED at the "still invalid"
+// THE WITNESS MUST STILL BE INVALID. This is D15042's if of record literals delivered to a
+// generic's annotated union of records, and it is check-clean invalid wasm on the current seed.
+// When D15042 is fixed this suite goes RED at the "still invalid"
 // assertion rather than silently measuring nothing; the replacement is any other
 // check-clean invalid-wasm program (`scripts/goal-scoreboard.vl` names the population).
 //
@@ -33,16 +33,20 @@ if (GATED && !ENABLED) {
 const EXIT_COMPILER_BUG = 70;
 const BUG_LINE = "this is a bug in vl, not in your program";
 
-// D15040's empty `Set()` at a bare type parameter (D1471's, D1413's and then D1887's witness
-// served until those rows closed): `vl check` rc 0, and the engine refuses the module. `take` is declared on line 2,
+// D15042's union-of-records delivery (D1471's, D1413's, D1887's and then D15040's witness served
+// until those rows closed or refused): `vl check` rc 0, and the engine refuses the module. `take` is declared on line 2,
 // so the position this suite asserts names its NAME token: `2:10`, ONE literal for all three channels. The host used to
 // print `2:9` here — the guest's raw 0-based column — while the CLI pump shifted to 1-based,
 // so one diagnostic reached two columns depending on which command found it. `cli-design.md`
 // makes the output 1-based ("`col` (1-based, inclusive)"); the host shifts too now.
 const WANT_AT = "take.vl:2:10";
-const INVALID = `function pass2<A, B>(_a: A, _b: B): i32 { return 1 }
-function take(m: {[string]: i32}): i32 { return pass2(m, Set()) }
-print(take(Map()))
+const INVALID = `function pick(b: boolean) { b }
+function take<T>(b: boolean, t: T) {
+  const v: {f: i32} | {f: T} = if pick(b) { {f: 1} } else { {f: t} }
+  print(v.f)
+}
+take(true, 2.5)
+take(false, 2.5)
 `;
 
 const VALID = `print(6 * 7)\n`;
@@ -117,7 +121,7 @@ Deno.test({
       const chk = await run(["check", "take.vl"], dir);
       if (chk.code !== 0) {
         throw new Error(
-          `the witness no longer check-cleans (D15040 fixed?) — replace it: ${chk.out}`,
+          `the witness no longer check-cleans (D15042 fixed?) — replace it: ${chk.out}`,
         );
       }
       const r = await run(["check", "--codegen", "take.vl"], dir);

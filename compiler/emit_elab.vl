@@ -11124,7 +11124,7 @@ function elabSlotFacts() {
     const n = nodeAt(ix)
     if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
       const t = nodeTyIxOf(ix)
-      if elabSlotOpenFn(t) {
+      if elabSlotOpenFn(t) || elabSlotWholeFn(t) {
         // A binding in an instanced function's body is closed per instance only: a program-level
         // fact would be one computed at the template's open types, and an instance must never read it.
         const fd = recEnclosingFn(ix)
@@ -11133,7 +11133,7 @@ function elabSlotFacts() {
           inst.push(ix)
           instFn.push(fd)
         } else {
-          const ft = elabSlotClose(ix, t, [n.letInit], -1)
+          const ft = if elabSlotWholeFn(t) { elabSlotCloseWhole(ix, t, -1) } else { elabSlotClose(ix, t, [n.letInit], -1) }
           if ft >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = ft }
         }
       }
@@ -11188,7 +11188,8 @@ function elabSlotInstFacts(hs: i32[], fns: i32[]) {
         && !(elabGuessKeys.get(k) ?? false)
         && hn is LetDecl
       ) {
-        let ft = elabSlotClose(h, nodeTyIxOf(h), [hn.letInit], k)
+        const ht = nodeTyIxOf(h)
+        let ft = if elabSlotWholeFn(ht) { elabSlotCloseWhole(h, ht, k) } else { elabSlotClose(h, ht, [hn.letInit], k) }
         // Where the slot close declines, the initialiser's own type at the instance, if closed.
         if ft < 0 || tyHasTyVar(ft) { ft = elabNodeTy(hn.letInit, k) }
         if ft >= 0 && ft < T.tys.length && elabTyClosed(ft, 0) {
@@ -11278,6 +11279,62 @@ function elabSlotOpenFn(t: i32): boolean {
   const ds: i32[] = []
   elabFnIdsIn(t, ds, 0)
   ds.length > 0
+}
+
+// Whether `t` is an open function, or a nullable function or holder, whose functions a set names:
+// a binding of it is closed from every value written to the whole binding.
+function elabSlotWholeFn(t: i32): boolean {
+  if t < 0 || t >= T.tys.length || !tyHasTyVar(t) { return false }
+  const o = tyAt(t)
+  const inner = if o is TyNullable { o.nInner } else { t }
+  if !(tyAt(inner) is TyFunc) && !(o is TyNullable && elabSlotOpenFn(inner)) {
+    return false
+  }
+  const ds: i32[] = []
+  elabFnIdsIn(t, ds, 0)
+  ds.length > 0
+}
+
+// Whether every function set `t` names is a function with no type parameter and no annotated
+// parameter.
+function elabSetAllHoleParams(t: i32): boolean {
+  const ms = elabFnSetOf(t)
+  if ms.length == 0 { return false }
+  for m in ms {
+    const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+    if !(mn is FuncDecl) || mn.fnTyParams.length > 0 { return false }
+    for p in mn.fnParams {
+      const pn = nodeAt(p)
+      if pn is Param && pn.parType >= 0 { return false }
+    }
+  }
+  true
+}
+
+// `elabSlotWholeFn` binding `d` of type `t` closed from the non-null values written to it whole
+// (`cwBindingWrittenValues`), in instance `k` (-1 for the program); -1 where one does not close.
+function elabSlotCloseWhole(d: i32, t: i32, k: i32): i32 {
+  const o = tyAt(t)
+  const inner = if o is TyNullable { o.nInner } else { t }
+  cwIxWant()
+  const vals: i32[] = []
+  for v in cwBindingWrittenValues(d) {
+    const vx = parenPeelIx(v)
+    if vx >= 0 && vx < P.nodes.length && !(nodeAt(vx) is NullLit) {
+      vals.push(v)
+    }
+  }
+  if vals.length == 0 { return -1 }
+  const none: string[] = []
+  // A function binding no call reads directly is handed on, or uncalled: its own type stays open.
+  if tyAt(inner) is TyFunc && fnSlotCallArgsOf(d, none).length == 0 {
+    return -1
+  }
+  // Its calls' arguments are its parameters only where every function it holds declares none.
+  if tyAt(inner) is TyFunc && !elabSetAllHoleParams(inner) { return -1 }
+  const c = if tyAt(inner) is TyFunc { elabHeldClosedTyAt(inner, vals, 0, d, none, k) } else { elabSlotClose(d, inner, vals, k) }
+  if c < 0 || tyHasTyVar(c) { return -1 }
+  if o is TyNullable { mkNullableTy(c) } else { c }
 }
 
 // The closed type of a value of type `t` stored from `inits`, a list's elements read through every
