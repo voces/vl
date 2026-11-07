@@ -2173,15 +2173,17 @@ The switch: `monoStoredSlotFnTy`, `monoPinListElems` and `monoCoerceWrittenCell`
 type from the one delivery (`monoSlotDeliveryTy`, omitting the repointed calls where the pins came
 from `monoFlowSlotPins`). `monoPinListElems` falls back to `elabSlotTyAt`, which answers its one
 mono-only decision left after the omission. Where neither answers, `monoStoredSlotFnTy` refuses
-loudly (`monoSlotNoDeliveryFail`, reached by no program), and `monoPinListElems` leaves the list as
+loudly (reached by no program), and `monoPinListElems` leaves the list as
 checked, as it did: an open generic's delivery is no answer
 (`functions/exported-generic-reached-through-lambda-field-or-list-called.vl`). Two gates stay,
-because a delivery is the slot's type, not each value's: `monoStoredSlotFnTy` declines a stored
-value whose own result at the pin is not the delivered one, and `monoPinListElems` refuses such an
-element (and keeps `monoListStoresAgree`). Without them D15353 and a list read
-before a helper writes a function of another result
+because a delivery is the slot's type, not each value's (`monoValsOwnFnTy`). `monoStoredSlotFnTy`
+declines values whose own results at the pin disagree, and both it and `monoPinListElems` (which
+keeps `monoListStoresAgree`) type the slot at the values' own agreed type where that is not the
+delivered one, so a write of another result is refused where it is made, with the contract message.
+Without them D15353 and a list read before a helper writes a function of another result
 (`closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`) build check-clean and
-trap at the call (`indirect call type mismatch`). `monoCallWrittenLet` instances its writes at the delivery's pin, and
+trap at the call (`indirect call type mismatch`), and D15190's refusal moves from the write to a
+mechanism message at the call. `monoCallWrittenLet` instances its writes at the delivery's pin, and
 `monoCallIfBound` no longer falls back to the seed. Mono's result derivation then decides nothing
 in the population, so `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy` and `monoHeldSrcsFnTy` are
 deleted. `monoSeedCallSigTys` stays for `monoCallIfValue`, an inline
