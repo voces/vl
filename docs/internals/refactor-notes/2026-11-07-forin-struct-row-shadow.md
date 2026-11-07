@@ -36,6 +36,8 @@ finds a row. Its callers rely on the declared-only answer: they read a miss as
 through `repSlotOfKind`, and `repSlotOfTy` keeps its name's narrower contract. The probe is
 not committed.
 
+**Ruling (orchestrator, 2026-11-07):** `repSlotOfTy` keeps its declared-slot contract; a canonical-row read goes through `repSlotOfKind`.
+
 **Other shadows.** The re-census's other row-reading shadow was `callLoweredKindOf` against
 `rdKind`. It compares kinds, not rows, so nothing here moves it. Its instrument was never
 committed, and it was not re-run.
