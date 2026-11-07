@@ -11806,7 +11806,9 @@ function monoCoerceWrittenCell(
   // The cell takes the one closed type the elaboration delivers the binding at.
   if monoLastInstFe >= 0 && monoLastInstFe < fnStmts.length {
     const it = monoSlotDeliveryTy(lf, [], false)
-    if it >= 0 { monoRetypeCell(lf[1], seed, it, monoCellReadsIn(lf[0], lf[1])) }
+    if it >= 0 {
+      monoRetypeCell(lf[1], seed, it, monoCellReadsIn(lf[0], lf[1]))
+    }
   }
   for i in monoWritesOf("c:", lf[1]) {
     const nd = nodeAt(i)
@@ -14680,6 +14682,8 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     && monoDeclPathPinsPerInstance(at, path)
   const ann = monoSigFnTyName(pins[0] + ";")
   const dTys: i32[] = []
+  // Stores whose results at the pin disagree share no element rep.
+  if !monoListStoresAgree(lit, repoints, at, ann) { return 0 }
   // The element type is the one the elaboration delivers the slot at, else its slot type here.
   let ft = monoSlotDeliveryTy(lf, path, omit)
   if ft < 0 {
@@ -14687,6 +14691,15 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     if monoTyClosedFn(st) { ft = st }
   }
   for e in lit.arrElems {
+    // An element whose own result at the pin is not the slot's has no rep in the list.
+    const er = monoValueAtAnnTy(e, ann)
+    if ft >= 0 && er >= 0 && sigKeyOfTy(er) != sigKeyOfTy(ft) {
+      emitFailAt(
+        "emitProgram: the function at this list element returns another type than a function written to the list",
+        e,
+      )
+      return -1
+    }
     monoLastInstFe = -1
     const holeLam = monoListElemHoleLamFe(e, ctx) >= 0
     if monoCoerceFnValueTys(e, ann, ctx, -1, dTys) < 0 { return -1 }
@@ -14705,10 +14718,8 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       monoRetypeMethodReads(ctx, at, "pop", mkNullableTy(ft))
     }
   }
-  if !monoTyClosedFn(ft) {
-    monoSlotNoDeliveryFail(d.letInit)
-    return -1
-  }
+  // A list the elaboration delivers at no one closed type, an open generic's, is left as checked.
+  if !monoTyClosedFn(ft) { return 0 }
   const fty = tyAt(ft)
   if !(fty is TyFunc) { return 0 }
   if shared {
@@ -15154,11 +15165,7 @@ function monoSlotDeliveryTy(lf: i32[], path: string[], omit: boolean): i32 {
     k = if it[0] >= 0 { elabKeyAt(it[0]) } else { -1 }
     if k < 0 { return -1 }
   }
-  const ts = if omit {
-    elabSlotDeliveriesOmitting(lf[1], path, -1, mfrSetCalls)
-  } else {
-    elabSlotDeliveries(lf[1], path, k)
-  }
+  const ts = if omit { elabSlotDeliveriesOmitting(lf[1], path, -1, mfrSetCalls) } else { elabSlotDeliveries(lf[1], path, k) }
   let one = -1
   for t in ts {
     if tyAt(t) is TyFunc {
@@ -15168,6 +15175,38 @@ function monoSlotDeliveryTy(lf: i32[], path: string[], omit: boolean): i32 {
   }
   if !monoTyClosedFn(one) { return -1 }
   one
+}
+
+// Whether the functions list literal `lit`, the list literals of `repoints` and the element writes
+// of the binding declared at `at` store give one result at the parameters `ann` spells, where
+// they close there.
+function monoListStoresAgree(
+  lit: ArrayLit,
+  repoints: i32[],
+  at: i32,
+  ann: string,
+): boolean {
+  const vals: i32[] = []
+  for e in lit.arrElems { vals.push(e) }
+  let ri = 0
+  while ri + 1 < repoints.length {
+    const rl = nodeAt(repoints[ri])
+    if rl is ArrayLit {
+      for e in rl.arrElems { vals.push(e) }
+    }
+    ri = ri + 2
+  }
+  for w in monoWritesOf("e:", at) {
+    const wb = nodeAt(w)
+    if wb is BinExpr { vals.push(wb.binRight) }
+  }
+  let pre = -1
+  for v in vals {
+    const r = monoValueAtAnnTy(v, ann)
+    if r >= 0 && pre >= 0 && sigKeyOfTy(r) != sigKeyOfTy(pre) { return false }
+    if r >= 0 { pre = r }
+  }
+  true
 }
 
 // Refuses a function slot at `at` pinned at one signature that the elaboration delivers at no
@@ -16456,6 +16495,11 @@ function monoStoredSlotFnTy(
   // The slot's type is the one the elaboration delivers it at; each value is instanced there.
   const ft = monoSlotDeliveryTy(lf, path, omit)
   if ft < 0 { return monoSlotNoDeliveryFail(at) }
+  // A value whose own result at the pin is not the delivered one has no rep in the slot.
+  for vw in vals {
+    const r = monoValueAtAnnTy(vw[0], ann)
+    if r >= 0 && sigKeyOfTy(r) != sigKeyOfTy(ft) { return -1 }
+  }
   const dTys: i32[] = []
   for vw in vals {
     const val = vw[0]
