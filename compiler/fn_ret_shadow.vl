@@ -14,6 +14,7 @@ import {
   Member,
   ObjLit,
   P,
+  i32ToStr,
   nodeAt,
 } from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
@@ -59,15 +60,22 @@ import {
 import { unwrapParen } from "./emit_base"
 import { scopeTyAt } from "./emit_capture_frames"
 import { callsOfCallee } from "./emit_fn_ret_kinds"
-import { cloSigKeyExt } from "./emit_classify"
-import { repOfTy, repSigKindOfTy, repSigTokHasSlot } from "./emit_rep"
-import { repSigRetTokOfTy } from "./emit_rep_slot"
+import { bundleRetParamOf, bundleSigsOfParam } from "./emit_bundle"
 import {
+  bundleRecordRowOfSigs,
+  calleeReturnsRecord,
+  cloSigKeyExt,
+} from "./emit_classify"
+import { repOfTy, repSigKindOfTy, repSigTokHasSlot } from "./emit_rep"
+import { repSigRetTokOfTy, repSlotOfKind } from "./emit_rep_slot"
+import {
+  VKind,
   emitPhaseReached,
   fRetBool,
   fRetKind,
   fRetLitAtom,
   fRetRArrElem,
+  fRetRListRow,
   fRetStructIdx,
   fRetVoid,
   fnParent,
@@ -77,6 +85,7 @@ import {
   monoInstOrig,
   monoOrigNode,
   monoStubSlots,
+  rlElemName,
 } from "./emit_state"
 import { i32ListHas } from "./listutil"
 import { identDeclOf } from "./symbols"
@@ -628,14 +637,23 @@ export function fnRetShadowRowN(i: i32) { frsRowN[i] }
 // just run.
 export function fnColShadowRun(at: string) {
   if !frsColArmed { return 0 }
+  if at == "post seed" { frsColSnap() }
   let fe = 0
   while fe < fnStmts.length && fe < fRetVoid.length && fe < fRetKind.length {
     const fn = nodeAt(fnStmts[fe])
     if fn is FuncDecl {
       if fRetVoid[fe] == 0 && fn.fnRet < 0 {
-        let key = at + ": " + frsColClass(fe)
+        const cls = frsColClass(fe)
+        let key = at + ": " + cls
         if frsNamed { key = key + " | " + fn.fnName }
         frsCount(key)
+        // Whether the run just ended moved the columns `buildFnMap#2` seeded, by class.
+        if at == "post settled" && fe < frsSnapKind.length {
+          const mv = if frsColMoved(fe) { "moved" } else { "unmoved" }
+          let mk = "post moved: " + mv + ": " + cls
+          if frsNamed { mk = mk + " | " + fn.fnName }
+          frsCount(mk)
+        }
       }
     }
     fe = fe + 1
@@ -643,45 +661,202 @@ export function fnColShadowRun(at: string) {
   0
 }
 
-// The first return column of valued function `fe` that the rep of its recorded result does not
-// reproduce, as a class: kind, slot (for a kind that carries one), a ref list's element name,
-// boolean, atom. The slot is compared as numbers, whatever table each names.
+let frsSnapKind: VKind[] = []
+let frsSnapSlot: i32[] = []
+let frsSnapElem: string[] = []
+let frsSnapBool: i32[] = []
+
+// Snapshot the return columns, for `frsColMoved`.
+function frsColSnap() {
+  frsSnapKind = []
+  frsSnapSlot = []
+  frsSnapElem = []
+  frsSnapBool = []
+  let fe = 0
+  while fe < fRetKind.length {
+    frsSnapKind.push(fRetKind[fe])
+    frsSnapSlot.push(fRetStructIdx[fe])
+    frsSnapElem.push(
+      if fe < fRetRArrElem.length { fRetRArrElem[fe] } else { "" },
+    )
+    frsSnapBool.push(if fe < fRetBool.length { fRetBool[fe] } else { 0 })
+    fe = fe + 1
+  }
+  0
+}
+
+// Whether function `fe`'s kind, slot, element name or boolean flag differs from the snapshot.
+function frsColMoved(fe: i32): boolean {
+  if frsSnapKind[fe] != fRetKind[fe] || frsSnapSlot[fe] != fRetStructIdx[fe] {
+    return true
+  }
+  if fe < fRetRArrElem.length && frsSnapElem[fe] != fRetRArrElem[fe] {
+    return true
+  }
+  fe < fRetBool.length && frsSnapBool[fe] != fRetBool[fe]
+}
+
+// The first return column of valued function `fe` that its recorded result's columns
+// (`fnRecordedRetCols`) do not reproduce, as a class; a missing fact is named by its class.
 function frsColClass(fe: i32): string {
   let r = fnRecordedRetTy(fe)
   if frsDrop == 1 { r = -1 }
   if frsDrop == 2 { r = TY_VOID }
+  const miss = frsColsOfTy(fe, r)
+  if miss != "" { return miss }
+  if frcKind != fRetKind[fe] {
+    return "kind " + frcKind + " vs " + fRetKind[fe]
+  }
+  if (
+    frcKind == "reflist"
+    && fe < fRetRListRow.length
+    && frcRow != fRetRListRow[fe]
+  ) {
+    return "row reflist: "
+      + i32ToStr(frcRow)
+      + " vs "
+      + i32ToStr(fRetRListRow[fe])
+  }
+  if frcSlot != fRetStructIdx[fe] {
+    if frcKind == "map" || frcKind == "nulmap" {
+      return "slot "
+        + frcKind
+        + ": "
+        + i32ToStr(frcRow)
+        + " vs "
+        + i32ToStr(fRetStructIdx[fe])
+    }
+    if !repSigTokHasSlot(frcKind) {
+      return "slot " + frcKind + ": no-slot kind, slots differ"
+    }
+    if frcSlot < 0 {
+      return "slot " + frcKind + ": recorded names no row, column does"
+    }
+    if fRetStructIdx[fe] < 0 {
+      return "slot " + frcKind + ": column names no row, recorded does"
+    }
+    return "slot " + frcKind + ": rows differ"
+  }
+  if fe < fRetRArrElem.length && frcElem != fRetRArrElem[fe] {
+    if fRetRArrElem[fe] == "" {
+      return "elem " + frcKind + ": column names none"
+    }
+    if frcElem == "" { return "elem " + frcKind + ": recorded names none" }
+    return "elem " + frcKind + ": names differ"
+  }
+  if fe < fRetBool.length && frcBool != fRetBool[fe] {
+    return if frcBool == 1 { "bool: recorded boolean, column not" } else { "bool: column boolean, recorded not" }
+  }
+  if fe < fRetLitAtom.length && frcAtom != fRetLitAtom[fe] {
+    return if frcAtom == 1 { "atom: recorded atom, column not" } else { "atom: column atom, recorded not" }
+  }
+  "agree " + frcKind
+}
+
+// The return columns `fnRecordedRetCols` last answered: kind, slot, ref-list element name,
+// boolean flag and literal-atom flag.
+export let frcKind: VKind = "i32"
+export let frcSlot = -1
+export let frcRow = -1
+export let frcElem = ""
+export let frcBool = 0
+export let frcAtom = 0
+
+// The struct row of the bundle record emitted function `fe` returns where its result is one:
+// the record of members its value's call returns, else its handed-back bundle parameter's; -2
+// where mono minted no row for it, -1 where the result is no bundle.
+function frsBundleRetRow(fe: i32): i32 {
+  const fx = fnStmts[fe]
+  const rec = calleeReturnsRecord(fx)
+  if rec.length >= 2 {
+    const row = bundleRecordRowOfSigs(rec)
+    return if row >= 0 { row } else { -2 }
+  }
+  const bp = bundleRetParamOf(fx)
+  const fn = nodeAt(fx)
+  if bp < 0 || !(fn is FuncDecl) || bp >= fn.fnParams.length { return -1 }
+  const sigs = bundleSigsOfParam(fn.fnParams[bp])
+  if sigs.length < 2 { return -1 }
+  const row = bundleRecordRowOfSigs(sigs)
+  if row >= 0 { row } else { -2 }
+}
+
+// Whether a value function `fx` returns is an assignment: the emitter returns the target cell's
+// kind, which the recorded result, the assigned value's type, does not name.
+function frsReturnsAssign(fx: i32): boolean {
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) || fn.fnBody < 0 { return false }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  for v in vals {
+    const u = unwrapParen(v)
+    if u >= 0 && u < P.nodes.length {
+      const n = nodeAt(u)
+      if n is BinExpr {
+        if n.binOp == "=" { return true }
+      }
+    }
+  }
+  frsTailIsAssign(fx)
+}
+
+// Whether recorded kind `k` of function `fe` is a variant while its own checker result is a
+// record: a delivery widened the result to a union, and the function builds the record.
+function frsOwnRecordAtVariant(fe: i32, k: VKind): boolean {
+  if k != "variant" && k != "nulvariant" { return false }
+  const own = repSigKindOfTy(frsFnRet(elabCheckedTyOf(fnStmts[fe])))
+  own == "struct" || own == "nulstruct"
+}
+
+// Whether return kind `k` keeps its table row in `fRetStructIdx`.
+function frsKindHasRow(k: VKind): boolean {
+  k == "struct" || k == "nulstruct" || k == "variant" || k == "nulvariant"
+}
+
+// Read valued function `fe`'s return columns off its recorded result into `frcKind`..`frcAtom`:
+// the rep's kind (a closure keyed `i32`), the row `repSlotOfKind` finds, a ref list's element
+// name. "" when read, else the missing fact that leaves them to the body walk, by class.
+export function fnRecordedRetCols(fe: i32): string {
+  frsColsOfTy(fe, fnRecordedRetTy(fe))
+}
+
+// `fnRecordedRetCols` of function `fe` over result `r`.
+function frsColsOfTy(fe: i32, r: i32): string {
   if r == TY_VOID || r == TY_NEVER { return "recorded void or never" }
   if r < 0 || r >= T.tys.length { return "no result recorded" }
   const d = repOfTy(r)
-  if d.rdCovered == 0 {
-    const k = repSigKindOfTy(r)
-    if k == null { return "rep uncovered, no kind" }
-    if k != fRetKind[fe] {
-      return "rep uncovered, kind " + k + " vs " + fRetKind[fe]
+  if d.rdCovered == 0 { return "rep uncovered" }
+  if repSigRetTokOfTy(r) == "" { return "recorded result has no token" }
+  if frsReturnsAssign(fnStmts[fe]) { return "result is an assignment's value" }
+  frcKind = if d.rdKind == "closure" { "i32" } else { d.rdKind }
+  // A variant row a delivery widened a function's own record to is not where it builds it.
+  if frsOwnRecordAtVariant(fe, frcKind) {
+    return "recorded variant, own result a record"
+  }
+  // A closure result mono lowered as its bundle's record: the record of members a call returns,
+  // or the bundle parameter the instance hands back.
+  if d.rdKind == "closure" {
+    const br = frsBundleRetRow(fe)
+    if br == -2 { return "bundle record has no row" }
+    if br >= 0 {
+      frcKind = "struct"
+      frcSlot = br
+      frcRow = br
+      frcElem = ""
+      frcBool = 0
+      frcAtom = 0
+      return ""
     }
-    return "rep uncovered, kind agree"
   }
-  if d.rdKind != fRetKind[fe] {
-    return "kind " + d.rdKind + " vs " + fRetKind[fe]
+  // `fRetStructIdx` carries a row only for a record or variant; a ref list's row is
+  // `fRetRListRow`, and a map's shape is read off its type.
+  frcRow = if repSigTokHasSlot(frcKind) { repSlotOfKind(frcKind, r) } else { -1 }
+  frcSlot = if frsKindHasRow(frcKind) { frcRow } else { -1 }
+  frcElem = ""
+  if frcKind == "reflist" && frcRow >= 0 && frcRow < rlElemName.length {
+    frcElem = rlElemName[frcRow]
   }
-  if repSigTokHasSlot(d.rdKind) && d.rdSlot != fRetStructIdx[fe] {
-    if d.rdSlot < 0 {
-      return "slot " + d.rdKind + ": recorded names no row, column does"
-    }
-    if fRetStructIdx[fe] < 0 {
-      return "slot " + d.rdKind + ": column names no row, recorded does"
-    }
-    return "slot " + d.rdKind + ": rows differ"
-  }
-  if d.rdKind == "reflist" && fRetRArrElem[fe] == "" {
-    return "elem: reflist, column names none"
-  }
-  const b = if r == TY_BOOL { 1 } else { 0 }
-  if fe < fRetBool.length && b != fRetBool[fe] {
-    return if b == 1 { "bool: recorded boolean, column not" } else { "bool: column boolean, recorded not" }
-  }
-  if fe < fRetLitAtom.length && d.rdAtom != fRetLitAtom[fe] {
-    return if d.rdAtom == 1 { "atom: recorded atom, column not" } else { "atom: column atom, recorded not" }
-  }
-  "agree " + d.rdKind
+  frcBool = if r == TY_BOOL { 1 } else { 0 }
+  frcAtom = d.rdAtom
+  ""
 }
