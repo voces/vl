@@ -2640,6 +2640,13 @@ record taken at index time. Asked at query time without the annotation snapshot,
 over 23,456 programs read lost (D10251 is one: `const xs = [id]`). With the snapshot and the
 generic note, the query-time answer and the old record differ in 0 decisions.
 
+**Standing hazard: the monomorphizer mutates the checked tree in place.** It annotates
+un-annotated bindings, strips a nested generic's `fnTyParams`, and renumbers its function slots
+(`monoGen`, `fnStmts`). So any fact asked after the walk can see the walk's mutation. A per-node
+fact taken before the walk reads the tree the program wrote. An answer computed after the walk
+can differ from it with nothing in the reader saying so. When a query-time answer disagrees with
+an earlier one, look for a field the walk rewrote before looking for a missing edge.
+
 `value_reach` is therefore still a live fact source for these readers, and its inert answer is the
 next fact that needs an elaboration twin. It is not `elabSlotUncalled`. "Reaches no call" is one
 half of it. The other half, "nothing observes its signature", is something `value_reach` answers
