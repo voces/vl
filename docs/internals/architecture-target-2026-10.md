@@ -18,7 +18,7 @@ updates this section. Dated measurements live in [`refactor-notes/`](refactor-no
 | 4. Finite function sets | deletions done | fn_split.vl, fn_flow_shadow.vl, the FS loop, `holeChoice*` and the list and capture pinners are gone, and the flow table is retired (§3.3). The residue is step 2's blocked list. |
 | 5. Contextual type and coercion records | deletions done | ExpCtx and the `emit*WidenSite` calls are gone. The one `lowerCoerce(srcRep, dstRep)` table is not built. |
 | 6. Narrowing produced once | in progress | `emit_narrow_slots.vl`, `pushNarrow*` and `capNarrowBuild` are gone. `criWalkBlock` replays no narrowing; it is `computeRetInference`'s return walk and goes with it in step 7. Ten of the sixteen `synth*Ann*` functions are gone (eight write-backs and two of their helpers), with three passes. Five write-backs and the helper `synthAnnOfTy` stand; the five are parked on a reader that reads the recorded type (`refactor-notes/2026-11-07-step6-write-back-census.md`). |
-| 7. `repOf(ty)`, one row per type | waiting (shadows only) | `computeRetInference`, `buildFnMap`, `computeVoidFns`, `rlSlotByNameTwin` and `letInitDeliversRow` stand. `fn_ret_shadow.vl` shadows the recorded result against `computeVoidFns`. Needs 4 and 5. |
+| 7. `repOf(ty)`, one row per type | in progress | `computeVoidFns` is gone: `recordedVoidFns` reads the recorded result ([notes](refactor-notes/2026-11-07-step7-void-from-recorded.md)). `computeRetInference`, `buildFnMap`'s return-kind columns, `rlSlotByNameTwin` and `letInitDeliversRow` stand; the kind shadow has 82 functions outside its agree classes. |
 
 **§3.4, the evening census of 2026-11-07** (master `3401b65f2`): the 165 `emit_mono` functions the morning
 census left.
