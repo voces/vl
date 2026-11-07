@@ -2299,6 +2299,16 @@ the inner literals at it. A map of that shape without a closed fact is a loud re
 program reaches. The stored values need no instancing of their own here, because their deliveries
 already instance them. The fixture prints the same, and over 19,316 programs no byte moves.
 
+**`monoPinnedElemAnnTy` was unreached** (2026-11-07). It is the element-read arm of the pinned
+receiver climb (`monoPinnedListAnnTy`), which a `.map` / `.filter` callback asks only where the
+elaboration's walk type for the receiver is open. Over 23,384 programs that climb is entered by 3 and
+closes in 2 (`closures/fn-list-mapped-to-functions.vl`, `closures/hole-fn-list-returned-reread.vl`),
+both through a binding. The element arm is reached by none: since the tail table was measured the
+walk type answers its fixture first. A probe at the call site fires there as the control. The arm
+is now a loud refusal and the helper is deleted. The climb itself stays: declining it moves both
+closing programs from runs to an emit refusal (`ref valtype with no interned shape`, `call to
+unknown function`). Over 19,316 programs no byte moves.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
