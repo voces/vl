@@ -18,7 +18,7 @@ updates this section. Dated measurements live in [`refactor-notes/`](refactor-no
 | 4. Finite function sets | deletions done | fn_split.vl, fn_flow_shadow.vl, the FS loop, `holeChoice*` and the list and capture pinners are gone, and the flow table is retired (§3.3). The residue is step 2's blocked list. |
 | 5. Contextual type and coercion records | deletions done | ExpCtx and the `emit*WidenSite` calls are gone. The one `lowerCoerce(srcRep, dstRep)` table is not built. |
 | 6. Narrowing produced once | in progress | `emit_narrow_slots.vl`, `pushNarrow*` and `capNarrowBuild` are gone. `criWalkBlock` replays no narrowing; it is `computeRetInference`'s return walk and goes with it in step 7. Ten of the sixteen `synth*Ann*` functions are gone (eight write-backs and two of their helpers), with three passes. Five write-backs and the helper `synthAnnOfTy` stand; the five are parked on a reader that reads the recorded type (`refactor-notes/2026-11-07-step6-write-back-census.md`). |
-| 7. `repOf(ty)`, one row per type | in progress | `computeVoidFns` is gone: `recordedVoidFns` reads the recorded result ([notes](refactor-notes/2026-11-07-step7-void-from-recorded.md)). `computeRetInference`, `buildFnMap`'s return-kind columns, `rlSlotByNameTwin` and `letInitDeliversRow` stand; the kind shadow has 82 functions outside its agree classes. The type-blind classifiers' phase census is `scripts/classifier-census.vl` (`$VL_CLS_CENSUS`): 6 post-only, 4 pre-only, 102 both. |
+| 7. `repOf(ty)`, one row per type | in progress | `computeVoidFns` is gone: `recordedVoidFns` reads the recorded result ([notes](refactor-notes/2026-11-07-step7-void-from-recorded.md)). `computeRetInference`, `buildFnMap`'s return-kind columns, `rlSlotByNameTwin` and `letInitDeliversRow` stand; the kind shadow has 82 functions outside its agree classes. The column shadow: post-mono 2,348 of 2,994 un-annotated functions agree on every return column; pre-mono 6,902 of 18,111 record an open result, so the first run cannot read it ([notes](refactor-notes/2026-11-07-step7-ret-columns-shadow.md)). The type-blind classifiers' phase census is `scripts/classifier-census.vl` (`$VL_CLS_CENSUS`): 6 post-only, 4 pre-only, 102 both. |
 
 **§3.4, the evening census of 2026-11-07** (master `3401b65f2`): the 165 `emit_mono` functions the morning
 census left.
@@ -60,7 +60,10 @@ map-value facts then deleted `monoFlowMapReadVals`, moved `monoFlowAliasMaps` to
   `monoArgTyNameCascade`, `monoArgTyNameBound`, `monoArgTyNameProjected` and `monoArgTyNameRep`
   (split-dep's one-producer redesign; the kept arms wait on the naming rule). No decision reads an
   instance pin's spelling any more (naming-rule slice 2a: `monoPinIsFnSig` deleted, `isNumRecvBaseName`
-  reads the pin type), so slice 2b can switch the names to `monoPinSpellOf`;
+  reads the pin type). Slice 2b names an un-annotated parameter's pin by `monoPinSpellOf` when it
+  holds no record, map or non-literal union; the rest waits on a pin-type column (an annotated
+  parameter's pin is its annotation, not the argument's type `pinTys` holds) and on the emit readers
+  that resolve a record or union pin by name (2026-11-07-pin-spelling-hole-params.md);
 - per-call slot type: `monoReachSlotTy` and `monoReachLitTys` (the call nodes a literal slot's climb
   reaches, so each callee read is typed at the agreed tuple; the climb records the tuple, not the calls).
 
