@@ -219,6 +219,7 @@ import {
   fnSetCallGenAt,
   fnSetCalledWithAny,
   fnSetHasCapturingLambda,
+  fnSlotAnnTyOf,
   fnSlotCallArgsAt,
   fnSlotCallArgsOf,
   fnSlotHandedOpen,
@@ -11350,15 +11351,31 @@ function elabSlotCloseWhole(d: i32, t: i32, k: i32): i32 {
   }
   if vals.length == 0 { return -1 }
   const none: string[] = []
-  // A function binding no call reads directly is handed on, or uncalled: its own type stays open.
-  if tyAt(inner) is TyFunc && fnSlotCallArgsOf(d, none).length == 0 {
-    return -1
-  }
+  const isFn = tyAt(inner) is TyFunc
+  // A function binding is fixed by a direct call or by the one closed annotated parameter it is
+  // handed to; with neither it is handed on, or uncalled, and its own type stays open.
+  const own = if isFn { fnSlotCallArgsOf(d, none) } else { [] }
+  const ann = if isFn { fnSlotAnnTyOf(d, none) } else { -1 }
+  if isFn && own.length == 0 && ann < 0 { return -1 }
   // Its calls' arguments are its parameters only where every function it holds declares none.
-  if tyAt(inner) is TyFunc && !elabSetAllHoleParams(inner) { return -1 }
-  const c = if tyAt(inner) is TyFunc { elabHeldClosedTyAt(inner, vals, 0, d, none, k) } else { elabSlotClose(d, inner, vals, k) }
+  if isFn && !elabSetAllHoleParams(inner) { return -1 }
+  let c = if isFn { elabHeldClosedTyAt(inner, vals, 0, d, none, k) } else { elabSlotClose(d, inner, vals, k) }
+  if isFn && ann >= 0 {
+    // The annotation answers only where every function held returns its result at its parameters.
+    if c < 0 && own.length == 0 { c = elabWholeAtAnn(inner, ann) }
+    if c >= 0 && !tySame(c, ann) { return -1 }
+  }
   if c < 0 || tyHasTyVar(c) { return -1 }
   if o is TyNullable { mkNullableTy(c) } else { c }
+}
+
+// Closed annotation `ann` where every function the set `t` names returns `ann`'s result at its
+// parameters, or -1.
+function elabWholeAtAnn(t: i32, ann: i32): i32 {
+  const ao = tyAt(ann)
+  if !(ao is TyFunc) { return -1 }
+  const r = elabHeldAtArgsOr(elabFnSetOf(t), ao.fnParamTypes)
+  if r >= 0 && tySame(r, ann) { ann } else { -1 }
 }
 
 // The closed type of a value of type `t` stored from `inits`, a list's elements read through every
@@ -13923,6 +13940,47 @@ export function elabSlotUncalledOmitting(
     if !i32ListHas(omit, c) && !elabCallNamesOne(c) { return false }
   }
   elabSlotDeliveriesOmitting(d, path, -1, omit).length == 0
+}
+
+// The slot of binding `elabValueSlotAt[x]` at path `elabValueSlotPath[x]` the monomorphizer built
+// value `x` at the type of, as nothing calls it, and the reads its flow rewrite repointed.
+let elabValueSlotAt: {[i32]: i32} = Map()
+let elabValueSlotPath: {[i32]: string[]} = Map()
+let elabValueSlotOmit: i32[] = []
+
+// Notes value `x` as held by slot `path` of binding `d`.
+export function elabValueSlotNote(x: i32, d: i32, path: string[]) {
+  elabValueSlotAt[x] = d
+  elabValueSlotPath[x] = path
+  0
+}
+
+// Gives `copy`, a fresh node standing for value `orig`, `orig`'s slot.
+export function elabValueSlotCopy(orig: i32, copy: i32) {
+  const d = elabValueSlotAt[orig] ?? -1
+  if d >= 0 { elabValueSlotNote(copy, d, elabValueSlotPath[orig] ?? []) }
+  0
+}
+
+// Starts a program with no value noted.
+export function elabValueSlotReset() {
+  elabValueSlotAt = Map()
+  elabValueSlotPath = Map()
+  elabValueSlotOmit = []
+  0
+}
+
+// Takes `omit` as the reads the flow rewrite repoints.
+export function elabValueSlotOmitSet(omit: i32[]) {
+  elabValueSlotOmit = omit
+  0
+}
+
+// Whether value `x` is held by a noted slot nothing calls, leaving out the repointed reads.
+export function elabValueSlotUncalled(x: i32): boolean {
+  const d = elabValueSlotAt[x] ?? -1
+  if d < 0 { return false }
+  elabSlotUncalledOmitting(d, elabValueSlotPath[x] ?? [], elabValueSlotOmit)
 }
 
 // Whether call `c` reaches one function whatever its slot holds: its callee names a function, or is
