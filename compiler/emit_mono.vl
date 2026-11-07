@@ -2840,6 +2840,11 @@ function monoPinRecordTy(nx: i32, ty: i32) {
 function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
   const ty = nodeTyIxOf(ix)
   if ty < 0 || ty >= T.tys.length { return ty }
+  // Where this function settles a type, the instance's elaboration of the node answers it when
+  // closed (`elabInstNodeTy`); the reads below only decide whether it settles one.
+  const wk = elabWalkTop()
+  const inst0 = if wk >= 0 { elabInstNodeTy(ix, wk) } else { -1 }
+  const inst = if inst0 >= 0 && inst0 < T.tys.length && !tyHasTyVar(inst0) { inst0 } else { -1 }
   if !tyHasTyVar(ty) {
     const an = nodeAt(unwrapParen(ix))
     let arith = an is Unary && an.unOp == "-"
@@ -2847,7 +2852,7 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
     if !arith { return ty }
     const et = elabWalkTy(ix)
     if et < 0 || et >= T.tys.length || tyHasTyVar(et) { return ty }
-    return et
+    return if inst >= 0 { inst } else { et }
   }
   // Where mono's pin closes, the elaboration's closed type at the instance answers: its narrowing,
   // else its walk type. A list of numeric literals stays at mono's base list, which `filled`
@@ -2869,7 +2874,7 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
   // An `is` else over a type parameter's list reads its remainder at the instance (`mkTvElseRemTy`);
   // with no closed remainder there the program is refused rather than read unsubtracted.
   if tvElseBase.get(ty) != null {
-    if et >= 0 { return et }
+    if et >= 0 { return if inst >= 0 { inst } else { et } }
     emitFail(
       "monoPinnedTyOf: an `is` else's remainder has no closed type at this instance",
     )
@@ -2877,7 +2882,9 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
   }
   let st = monoSubstInst(ty, bN, bT)
   // A read the instance narrowed is typed at its narrowing, not at its storage's substitution.
-  if st >= 0 && !tyHasTyVar(st) && et >= 0 { return et }
+  if st >= 0 && !tyHasTyVar(st) && et >= 0 {
+    return if inst >= 0 { inst } else { et }
+  }
   if (st < 0 || tyHasTyVar(st)) && monoPinHoleN.length > 0 {
     // A hole instance's list literal, element read and call of a function value are typed at
     // its holes, which `bN` does not name (D3066): the instance's elaboration answers, and the
@@ -2898,7 +2905,9 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
     }
   }
   if st < 0 || tyHasTyVar(st) { return ty }
-  if et >= 0 { et } else { st }
+  if inst >= 0 { inst }
+  else if et >= 0 { et }
+  else { st }
 }
 
 // Whether call `ix` calls a function value: a name, or a call of one (`k()()`), typed as a
@@ -5392,11 +5401,16 @@ let monoCgcHoleT: i32[] = []
 // elaboration at a hole instance, or where its recorded type `t` is open and the elaboration
 // closes it; `t` otherwise.
 function monoLamCallTy(ix: i32, t: i32): i32 {
+  const wk = elabWalkTop()
+  const i0 = if wk >= 0 { elabInstNodeTy(ix, wk) } else { -1 }
+  const inst = if i0 >= 0 && i0 < T.tys.length && !tyHasTyVar(i0) { i0 } else { -1 }
   const e = if monoCgcHoleN.length > 0 { elabWalkTy(ix) } else { -1 }
-  if e >= 0 { return e }
+  if e >= 0 { return if inst >= 0 { inst } else { e } }
   if t < 0 || !tyHasTyVar(t) { return t }
   const w = elabWalkTy(ix)
-  if w >= 0 && w < T.tys.length && !tyHasTyVar(w) { w } else { t }
+  if inst >= 0 { inst }
+  else if w >= 0 && w < T.tys.length && !tyHasTyVar(w) { w }
+  else { t }
 }
 
 // The lambdas the instance body binds by an un-annotated `const`, once, and reads only as the
@@ -11092,22 +11106,6 @@ function monoCellSeedGenFe(at: i32, ctx: i32): i32 {
   ) {
     return -1
   }
-  fe
-}
-
-// The hole lambda the capture cell read at `at` (`d[0]`) is seeded with, as a slot; -1 for any
-// other seed. Read off the seed itself, since the binding's writes make its alias chain decline.
-function monoCellSeedLamFe(at: i32, ctx: i32): i32 {
-  const lf = monoReadLetFrame(at, ctx)
-  if lf[1] < 0 { return -1 }
-  const d = nodeAt(lf[1])
-  if !(d is LetDecl) || d.letType >= 0 || d.letKw != "let" { return -1 }
-  const cel = monoGeneratedCellElem(d.letInit)
-  if cel < 0 { return -1 }
-  const seed = unwrapParen(cel)
-  if seed < 0 { return -1 }
-  const fe = monoLamValueFe(seed, lf[0])
-  if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 { return -1 }
   fe
 }
 
@@ -22018,25 +22016,6 @@ function monoCellCall(
     const sr = monoInstantiate(sfe, ix, ctx)
     monoWriteCoercedCall = -1
     if sr < 0 { return -1 }
-    ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
-    ctnTys = monoInstParamPinTys(monoLastInstFe)
-  }
-  // A hole lambda seed is pinned by this call's arguments, which the callee's recorded type
-  // need not agree with, and a generic written beside it takes the lambda's signature (D3951).
-  const lfe = monoCellSeedLamFe(at, cctx)
-  if (
-    sfe < 0
-    && live
-    && ctn == ""
-    && lfe >= 0
-    && lfe < monoGen.length
-    && monoGen[lfe] == 1
-  ) {
-    monoLastInstFe = -1
-    if monoInstantiate(lfe, ix, ctx) < 0 { return -1 }
-    if monoLastInstFe >= 0 {
-      monoNoteBindSig(at, cctx, monoSlotSig(monoLastInstFe))
-    }
     ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
     ctnTys = monoInstParamPinTys(monoLastInstFe)
   }
