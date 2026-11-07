@@ -2621,7 +2621,9 @@ next source, so the elaboration gets no second composer for the same binding.
 **The second source, built from bundles: `elabWrittenBuiltTy`** (2026-11-07). It covers four
 kinds of value:
 - a call, through `elabCallBundleRet`, which answers with the bundle record the call's returned
-  parameter (`elabRetParamOf`) is delivered as (`elabCallArgRep`, `elabDeliveredBundleSigs`);
+  parameter (`elabRetParamOf`) is delivered as (`elabCallArgRep`, `elabDeliveredBundleSigs`), or,
+  where the callee hands back no parameter, with the values it returns, built the same way at the
+  call's own instance;
 - a record of its fields' answers, each other field at its closed checked type;
 - a list of its elements' agreed answer;
 - a field or list element of such a value, or an un-annotated `let` written once.
@@ -2629,18 +2631,16 @@ kinds of value:
 The reach rows holding the bundles are written by `elabReachRows`, after `elabRun`'s `elabSlotFacts`.
 So `elabSlotBundleFacts` re-runs the same reader there, for program-level holders still without a
 fact, and never overwrites one. That timing is why the binding reader runs twice. The bundle source
-cannot answer in `elabSlotFacts`, so folding the two runs into one loses all 14.
+cannot answer in `elabSlotFacts`, so folding the two runs into one loses all 15.
 
 Over master `fd7ef721`'s 21 `monoBindingAdoptInit` decisions holding a bundle record, all at program
 level in seven programs (the five `closures/bundle-record-*.vl` tests, D15323 and D15324),
-`elabNodeTy` agrees at 14, differs at none, and leaves 7 to mono:
-- six reads of an un-annotated `Map()` whose value comes from its writes, which wait for lane F's
-  map-value facts;
-- `{ f: gen("s", 3), n: 3 }`, where the generic hands back a `let` and not a parameter. That needs
-  `elabRetOf` through a returned binding, its own item.
+`elabNodeTy` agrees at 15, differs at none, and leaves to mono six reads of an un-annotated `Map()`
+whose value comes from its writes, which wait for lane F's map-value facts. The fifteenth is
+`{ f: gen("s", 3), n: 3 }`, where the generic hands back a `let` rather than a parameter.
 
 A holder inside an instance written from a bundle still declines, because the late pass is
-program-level only, so 14 of 21 does not mean that bundles close at every instance.
+program-level only, so 15 of 21 does not mean that bundles close at every instance.
 
 A captured cell (`let d = c` re-written by a lambda) gets no fact this way yet. Its written lambdas
 are nested and capture, so `elabHeldAtArgs` declines, and `elabHeldFnTy` returns that decline
