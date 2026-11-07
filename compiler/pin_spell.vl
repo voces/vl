@@ -1,6 +1,6 @@
 // The naming rule's one producer: the spelling an instance's pin takes from its canonical type
 // alone (architecture-target-2026-10.md §3.4), and, under `$VL_REP_SHADOW`, its shadow against the
-// spelling mono's cascade chose. Nothing decides from the producer yet.
+// spelling mono's cascade chose. It names an un-annotated parameter's pin (`monoPinRespell`).
 import {
   T,
   TyArray,
@@ -14,13 +14,17 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  litUnionAliasNameOfTy,
+  litUnionAliasOfLitTexts,
+  numLitUnionBaseTy,
   tyAt,
   tyHoldsObj,
 } from "./check_types"
+import { Param, nodeAt } from "./ast"
 import { tyIsUnionish } from "./check_node_tys"
-import { repRowOfTyStruct, repShadowOn } from "./emit_rep"
+import { repRowOfTyStruct, repShadowOn, repVariantShapeRowOf } from "./emit_rep"
 import { repABNote } from "./emit_nullable_rets"
-import { sNames } from "./emit_state"
+import { sNames, uVariants } from "./emit_state"
 import { strContains } from "./strutil"
 import { tyHasTyVar } from "./tyquery"
 
@@ -33,8 +37,11 @@ export function monoPinSpellOf(ty: i32): string {
   match t {
     TyObj => {
       const r = repRowOfTyStruct(ty, sNames.length)
-      if r < 0 || r >= sNames.length { return "" }
-      return sNames[r]
+      if r >= 0 && r < sNames.length { return sNames[r] }
+      // A union member's record has no struct row; it spells as its variant row.
+      const vr = repVariantShapeRowOf(ty)
+      if vr >= 0 && vr < uVariants.length { return uVariants[vr] }
+      return ""
     }
     TyPrim => {
       return t.primName
@@ -55,6 +62,8 @@ export function monoPinSpellOf(ty: i32): string {
       return monoPinSpellAtom(t.nInner, inner) + "|null"
     }
     TyUnion => {
+      const lu = monoPinSpellLitUnion(ty, t.uMembers)
+      if lu != "" { return lu }
       const ms: string[] = []
       for m in t.uMembers {
         const s = monoPinSpellOf(m)
@@ -95,6 +104,82 @@ export function monoPinSpellOf(ty: i32): string {
     TyErr | TyVar | TyNeg => {}
   }
   ""
+}
+
+// The naming rule at an un-annotated parameter, whose pin is its argument's type: a closed pin
+// takes that type's spelling (`monoPinSpellOf`). An annotated parameter's pin is its annotation,
+// which `pinTys` does not hold, so it keeps mono's spelling, as does an open pin.
+export function monoPinRespell(pinned: string[], pinTys: i32[], params: i32[]) {
+  let i = 0
+  while i < pinned.length && i < pinTys.length && i < params.length {
+    const p = nodeAt(params[i])
+    if !(p is Param) || p.parType >= 0 {
+      i = i + 1
+      continue
+    }
+    const sp = if monoPinRespellOk(pinTys[i], 0) { monoPinSpellOf(pinTys[i]) } else { "" }
+    if sp != "" { pinned[i] = sp }
+    i = i + 1
+  }
+  0
+}
+
+// Whether pin type `ty` holds no record, map or non-literal union: the part of the naming rule
+// whose spelling no emit reader resolves by name.
+function monoPinRespellOk(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 16 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyPrim | TyLit => true
+    TyArray => monoPinRespellOk(t.aElem, depth + 1)
+    TyNullable => monoPinRespellOk(t.nInner, depth + 1)
+    TyUnion => {
+      // A union of string and numeric literals has no one rep to spell it by.
+      let str = false
+      let num = false
+      for m in t.uMembers {
+        const mt = tyAt(m)
+        if mt is TyLit {
+          if mt.litKind == "str" { str = true } else { num = true }
+        } else if !(mt is TyPrim && mt.primName == "null") {
+          return false
+        }
+      }
+      !(str && num)
+    }
+    TyFunc => {
+      for p in t.fnParamTypes {
+        if !monoPinRespellOk(p, depth + 1) { return false }
+      }
+      monoPinRespellOk(t.fnRet, depth + 1)
+    }
+    TyObj | TyMap | TyErr | TyVar | TyNeg => false
+  }
+}
+
+// A literal union's spelling is its rep: a numeric one spells as its base scalar, a string one as
+// its alias, and with a null member as that alias and `|null`. "" for any other union.
+function monoPinSpellLitUnion(ty: i32, ms: i32[]): string {
+  const nb = numLitUnionBaseTy(ty)
+  if nb >= 0 { return monoPinSpellOf(nb) }
+  const al = litUnionAliasNameOfTy(ty)
+  if al != "" { return al }
+  const texts: string[] = []
+  let nul = false
+  for m in ms {
+    const mt = tyAt(m)
+    if mt is TyLit {
+      if mt.litKind != "str" { return "" }
+      texts.push(mt.litText)
+    } else if mt is TyPrim && mt.primName == "null" {
+      nul = true
+    } else {
+      return ""
+    }
+  }
+  if !nul || texts.length == 0 { return "" }
+  const a = litUnionAliasOfLitTexts(texts)
+  if a == "" { "" } else { a + "|null" }
 }
 
 // `s`, the spelling of `ty`, as one atom where a suffix follows it: parenthesized when `ty` is a
