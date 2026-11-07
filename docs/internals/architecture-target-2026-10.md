@@ -4281,12 +4281,17 @@ closed. Over 23,828 programs, 89 decisions in 73 programs. 75 had no slot fact, 
 closers decline a holder whose members are hole functions with open own types. Read pre-walk
 (`nodeTyFrozenOf`), every row answers as it does post-walk.
 
-| holder's function slots | decisions | outcome |
+| holder's function slots | decisions | outcome on #6673 |
 |---|---|---|
-| one closed call signature each | 5 | fact from the calls (#6673) |
+| one closed call signature each | 5 | 1 takes a fact; 3 hold a member returning another result; 1 is outside the gate |
 | a slot called at two or more signatures | 53 + 17 | parked, below |
 | a nested slot never called | 1 | no fact |
-| fact exists, mono said open | 6 | `monoLetWritesClosed` reads the fact |
+| fact exists, mono said open | 6 | `monoLetWritesClosed` reads the fact: open to closed, output unchanged |
+
+The three that decline (`q`, D15354 and D15355 `m2`) hold `inc0`, which returns `i32`, in a slot
+called at `(i32) => f64`. Closing them needs an instance that widens the result, not a fact. The
+fifth, `r5`, holds the closed `m`, so the open-slot gate never admits it; its writes are closed
+already.
 
 **The fact.** `elabSlotBundleFacts` rebuilds a holder no closer closes from
 `elabSlotDeliveries`, one leaf at a time, through lists, maps and records. A leaf takes the
