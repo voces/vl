@@ -355,7 +355,6 @@ import {
   tyHasHole,
   tyHasInferHole,
   tyHasLitLeaf,
-  tyHoldsObj,
   tyIsLitUnion,
   tyIsParamHole,
   tyMayHoldFn,
@@ -11361,10 +11360,10 @@ function elabSlotWholeFn(t: i32): boolean {
   ds.length > 0
 }
 
-// Whether every function set `t` names is a function with no type parameter and no annotated
-// parameter.
-function elabSetAllHoleParams(t: i32): boolean {
-  const ms = elabFnSetOf(t)
+// Whether every function in `ms` (else in the set type `t` carries, when `ms` is empty) declares no
+// type parameter and no annotated parameter; false when neither names a function.
+function elabHoleParamsAll(ms0: i32[], t: i32): boolean {
+  const ms = if ms0.length > 0 || t < 0 { ms0 } else { elabFnSetOf(t) }
   if ms.length == 0 { return false }
   for m in ms {
     const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
@@ -11709,9 +11708,13 @@ function elabSlotCloseWhole(d: i32, t: i32, k: i32): i32 {
   const own = if isFn { fnSlotCallArgsOf(d, none) } else { [] }
   const ann = if isFn { fnSlotAnnTyOf(d, none) } else { -1 }
   if isFn && own.length == 0 && ann < 0 { return -1 }
-  // Its calls' arguments are its parameters only where every function it holds declares none.
-  if isFn && !elabSetAllHoleParams(inner) { return -1 }
-  let c = if isFn { elabHeldClosedTyAt(inner, vals, 0, d, none, k) } else { elabSlotClose(d, inner, vals, k) }
+  // Its calls' arguments are its parameters only where every function it holds declares none: the
+  // functions its writes hold (`elabBindingFnSet`), else the set its own type carries.
+  const held = if isFn { elabBindingFnSet(d) } else { [] }
+  if isFn && !elabHoleParamsAll(held, inner) { return -1 }
+  // A written join (a labelled block's or an `if`'s value) is closed through the functions it holds.
+  const hv = if isFn && held.length > 0 && !elabValsAreFns(vals) { held } else { vals }
+  let c = if isFn { elabHeldClosedTyAt(inner, hv, 0, d, none, k) } else { elabSlotClose(d, inner, vals, k) }
   if isFn && ann >= 0 {
     // The annotation answers only where every function held returns its result at its parameters.
     if c < 0 && own.length == 0 { c = elabWholeAtAnn(inner, ann) }
@@ -11719,6 +11722,24 @@ function elabSlotCloseWhole(d: i32, t: i32, k: i32): i32 {
   }
   if c < 0 || tyHasTyVar(c) { return -1 }
   if o is TyNullable { mkNullableTy(c) } else { c }
+}
+
+// Whether every value in `vals` is a function literal or a name of a function.
+function elabValsAreFns(vals: i32[]): boolean {
+  for v in vals {
+    const x = parenPeelIx(v)
+    if x < 0 || x >= P.nodes.length { return false }
+    const n = nodeAt(x)
+    if n is Ident {
+      const dl = identDeclOf(x)
+      if dl < 0 || dl >= P.nodes.length || !(nodeAt(dl) is FuncDecl) {
+        return false
+      }
+    } else if !(n is FuncDecl) {
+      return false
+    }
+  }
+  true
 }
 
 // Closed annotation `ann` where every function the set `t` names returns `ann`'s result at its
@@ -16394,12 +16415,13 @@ export function elabCallHoleParamTy(tpl: i32, i: i32, par: i32): i32 {
   }
 }
 
-// Call key `callKey`'s binding, split as mono's rebuild splits it: type parameters of `tps` onto
-// `bN`/`bT`, holes of `decl`'s un-annotated parameters onto `hN`/`hT`. False, binding nothing,
-// unless every parameter is closed with no hole or function and the binding holds no literal or
-// record, a row the key may name apart from the one the argument is built at (D15537).
+// Call key `callKey`'s binding for call `call`, split as mono's rebuild splits it: type parameters
+// of `tps` onto `bN`/`bT`, holes of `decl`'s un-annotated parameters onto `hN`/`hT`, each at the
+// checker's rep row where it records one (D15537). False, binding nothing, unless every parameter
+// is closed with no hole or function.
 export function elabCallKeyBinding(
   callKey: i32,
+  call: i32,
   decl: i32,
   params: i32[],
   tps: string[],
@@ -16424,14 +16446,24 @@ export function elabCallKeyBinding(
     }
   }
   for t in ekTys[callKey] {
-    if t < 0 || elabTyHasLit(t, 8) || tyHoldsObj(t, 9) { return false }
+    if t < 0 { return false }
   }
+  // An argument is built at the checker's rep row where it records one, a wider or nominal record
+  // than the key's type; the instance reads it there (D15537).
+  const row = if call >= 0 { callBindRowOf(call) } else { -1 }
+  const repN = if row >= 0 { callBindNamesAt(row) } else { [] }
+  const repT = if row >= 0 { callBindRepTysAt(row) } else { [] }
   const ftIx = if decl >= 0 && decl < P.nodes.length { nodeTyIxOf(decl) } else { -1 }
   const ft = if ftIx >= 0 && ftIx < T.tys.length { tyAt(ftIx) } else { tyAt(0) }
   let i = 0
   while i < ekNames[callKey].length && i < ekTys[callKey].length {
     const nm = ekNames[callKey][i]
-    const t = ekTys[callKey][i]
+    let t = ekTys[callKey][i]
+    let r = 0
+    while r < repN.length && r < repT.length {
+      if repN[r] == nm && repT[r] >= 0 { t = repT[r] }
+      r = r + 1
+    }
     if strListHas(tps, nm) {
       if !strListHas(bN, nm) {
         bN.push(nm)
@@ -16460,38 +16492,4 @@ export function elabCallKeyBinding(
     i = i + 1
   }
   true
-}
-
-// Whether a literal type sits in `t` outside a record or function: a union member, a nullable's
-// inner, a list's element, a map's key or value. Past `depth`, true. Twin of `tyHasLitDeep`
-// (emit_anon_fields.vl), which also reads a record's fields.
-function elabTyHasLit(t: i32, depth: i32): boolean {
-  if t < 0 || t >= T.tys.length { return false }
-  if depth <= 0 { return true }
-  const a = tyAt(t)
-  match a {
-    TyLit => {
-      return true
-    }
-    TyNullable => {
-      return elabTyHasLit(a.nInner, depth - 1)
-    }
-    TyArray => {
-      return elabTyHasLit(a.aElem, depth - 1)
-    }
-    TyMap => {
-      return elabTyHasLit(a.mKey, depth - 1) || elabTyHasLit(a.mVal, depth - 1)
-    }
-    TyUnion => {
-      for m in a.uMembers {
-        if elabTyHasLit(m, depth - 1) { return true }
-      }
-      return false
-    }
-    // A record answers through `tyHoldsObj`, which refuses it whole; a function's own literals
-    // are its signature's, not a row the binding holds.
-    TyObj | TyFunc | TyPrim | TyErr | TyVar | TyNeg => {
-      return false
-    }
-  }
 }
