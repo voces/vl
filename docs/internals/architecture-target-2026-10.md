@@ -1975,6 +1975,37 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   refusal is reached by none. It is class (c) mechanics over mono's own instance registry, and
   goes with that registry, not with a fact.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
+  The hub is the binding `monoInstantiateCallIn` hands `monoMakeInstance` (`tvN` / `tvV` / `tvT`),
+  against `ekTys` at the key the elaboration made for the call (`elabWalkKeyOf`, which already
+  keys the instance). Shadowed (2026-11-07, 23,384 programs) where the binding is final, by type
+  (same type or same representation): agree 4,978 programs, differ 20, mono only 13, elaboration
+  only 9, neither 92 (mostly function-signature pins left open on both sides), and 10 more where mono
+  holds only a spelling. Switched: a closed elaboration binding replaces a closed mono binding of
+  another representation; one of the same representation keeps mono's spelling, and one mono
+  leaves open or unbound stays mono's. The 20 differ programs print the same output and build the
+  same bytes either way, because the value reaches nothing that lowers: the pins and the
+  elaboration-keyed instance key carry it. They are the cells a later producer deletion has to keep
+  byte-identical, and they are re-graded by output at each one:
+  - a declared record against the literal's own shape (`V` / `{y: i32, x: i32}`, `Circle` /
+    `{r: null}`, `Circle` / `K`, `J` / `{f: i32}`): `modules/overload-generic-fresh-binding-runs`,
+    `soundness/mixed-instance-unrelated-arguments-runs.vl`, `soundness/mixed-instance-list-reach-runs.vl`,
+    `soundness/fresh-literal-at-generic-placed-in-wider-field-runs.vl`,
+    `soundness/fresh-literal-at-generic-delivered-wider-runs.vl`,
+    `soundness/bound-record-built-wider-at-unpinned-generic-runs.vl`,
+    `generics/hole-instance-typed-at-binding-stored-at-build.vl`, named `d15172_viafield` and
+    `d15172_listviafield`, D14760, D15184, D15210;
+  - a map mono leaves holed (`{[_]: _}` / `{[string]: i32}`): `generics/empty-map-to-bare-type-parameter.vl`, D1887;
+  - `void` or `null` against `never`: `functions/never-function-value.vl`,
+    `functions/never-generic-pin-traps.vl`, D3178;
+  - `i32 | null` against `i32`: `generics/recursion-at-same-type-runs.vl`, D14581;
+  - a literal union whose two renders print empty: `literal-unions/one-literal-list-container-generic.vl`.
+
+  `monoPreBindPastEmptyLit` and `monoPreBindNonArrowArgs` bind from the elaboration's key, and
+  `monoBindFromLaterArg` is deleted. Their shadows: the empty-literal pre-bind agrees in all 3
+  programs that reach it, and the non-arrow pre-bind agrees in 40 of 46, binds nothing in 5, and is
+  mono only in 1 (`closures/fn-value-generic-nullable-fn-param.vl`), which prints the same without it.
+  The per-argument pins are a separate fact (the argument's representation, per union arm) and
+  wait for the producers.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
 - [x] **instance result** (10): ~~`monoRetRecordOf` 8,023~~, ~~`monoRetRepOf` 7,745~~, ~~`monoPinCallRecord` 6,765~~, ~~`monoPinInPlaceCallRecord` 6,763~~, ~~`monoReturnedBundlePin` 6,538~~, `monoPinnedRetAnnTy` 505 (switched, #6511), ~~`monoCallInstRetTy` 205~~, ~~`monoRetConstRecord` 66~~, ~~`monoInstRetLitTy` 34~~, ~~`monoInstAnnRetTy` 26~~. #6498 deleted the record-pin four, #6511 the instance-literal pair, and the delivered-rep fact the rest (below).

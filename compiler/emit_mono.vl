@@ -594,6 +594,7 @@ import {
   bundleRetParamNote,
 } from "./emit_bundle"
 import {
+  repCanonId,
   repElemTyOfName,
   repRowId,
   repRowOfTyStruct,
@@ -19534,10 +19535,11 @@ function monoLetSeedMisfits(
 // an empty list literal (`f([], d)`), from its first use that names an element: that loop
 // would bind it to the literal's `i32[]` default, which the checker never inferred (D2607).
 function monoPreBindPastEmptyLit(
+  origFe: i32,
+  callIx: i32,
   params: i32[],
   args: i32[],
   typarams: string[],
-  ctx: i32,
   tvN: string[],
   tvV: string[],
   tvT: i32[],
@@ -19549,17 +19551,12 @@ function monoPreBindPastEmptyLit(
     if tp != "" && !seen.has(tp) {
       seen[tp] = 1
       if monoBindOf(tvN, tvV, tp) == "" && monoArgIsEmptyLit(args[i]) {
-        monoBindFromLaterArg(
-          tp,
-          i + 1,
-          params,
-          args,
-          typarams,
-          ctx,
-          tvN,
-          tvV,
-          tvT,
-        )
+        const et = monoElabBindTy(origFe, callIx, tp)
+        if et >= 0 {
+          tvN.push(tp)
+          tvV.push(tyToEmitName(et))
+          monoTvTyLast(tvN, tvT, et)
+        }
       }
     }
     i = i + 1
@@ -19567,47 +19564,26 @@ function monoPreBindPastEmptyLit(
   0
 }
 
-// Binds `tp` from the first argument at or after `from` whose parameter rides it bare and
-// which is not an empty list literal. Binds nothing when no such argument names an element.
-function monoBindFromLaterArg(
-  tp: string,
-  from: i32,
-  params: i32[],
-  args: i32[],
-  typarams: string[],
-  ctx: i32,
-  tvN: string[],
-  tvV: string[],
-  tvT: i32[],
-) {
-  let j = from
-  while j < args.length && j < params.length {
-    const pj = nodeAt(params[j])
-    if pj is Param {
-      if (
-        monoParamBareTyParam(params[j], typarams) == tp
-        && !monoArgIsEmptyLit(args[j])
-      ) {
-        const annj = monoDeclAnnName(pj.parType, tyNameOf(pj.parType), typarams)
-        const an = monoArgPinName(args[j], ctx)
-        if an == "" { return 0 }
-        let bind = an
-        const pinTy = monoArgPinTyIx(args[j], ctx)
-        let bindTy = monoArgClosedTyIn(args[j], ctx, pinTy)
-        if annj != tp {
-          if !monoTyIsArrayShaped(bindTy, pinTy) { return 0 }
-          bind = listElemNameOf(an)
-          bindTy = tyArrayElemIx(bindTy)
-        }
-        tvN.push(tp)
-        tvV.push(bind)
-        monoTvTyLast(tvN, tvT, bindTy)
-        return 0
-      }
+// The closed type the elaboration binds type parameter `tp` to at call `callIx` of the template
+// in slot `origFe`, under the instance being walked; -1 for a call it did not key, a value
+// declaration, or a binding that stays open.
+function monoElabBindTy(origFe: i32, callIx: i32, tp: string): i32 {
+  if origFe < 0 || origFe >= monoOrigNode.length { return -1 }
+  const d = monoOrigNode[origFe]
+  const tc = monoCallTplOf(callIx)
+  if tc < 0 || elabDeclIsValue(d) { return -1 }
+  const k = elabWalkKeyOf(tc, true, d)
+  if k < 0 || k >= ekNames.length || k >= ekTys.length { return -1 }
+  let i = 0
+  while i < ekNames[k].length && i < ekTys[k].length {
+    if ekNames[k][i] == tp {
+      const t = ekTys[k][i]
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -1 }
+      return t
     }
-    j = j + 1
+    i = i + 1
   }
-  0
+  -1
 }
 
 // The index in `ms` of the one member naming a type parameter in `typarams`, or -1 when none or
@@ -21157,9 +21133,18 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       // the two orders agree, so they differ only when one answer is a type variable.
       const declTys = monoDeclParamTys(origFe, params.length)
       if monoCallGenFnToTyParamArrow(params, args, fn.fnTyParams, ctx) {
-        monoPreBindNonArrowArgs(fn, params, args, ctx, tvN, tvV, tvT, declTys)
+        monoPreBindNonArrowArgs(origFe, callIx, fn, params, args, tvN, tvV, tvT)
       }
-      monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV, tvT)
+      monoPreBindPastEmptyLit(
+        origFe,
+        callIx,
+        params,
+        args,
+        fn.fnTyParams,
+        tvN,
+        tvV,
+        tvT,
+      )
       if monoTwoListArgFail(fn, params, args, ctx) < 0 { return -1 }
       monoPreBindPastUnionRest(
         params,
@@ -21260,6 +21245,27 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         return -1
       }
       callBindShadowNote(callIx, fn.fnName, fn.fnTyParams, tvN, tvV)
+      // The elaboration's binding replaces a closed one of another representation; one of the
+      // same representation keeps mono's spelling, and one mono left open stays mono's.
+      for tp in fn.fnTyParams {
+        const et = monoElabBindTy(origFe, callIx, tp)
+        let j = 0
+        while et >= 0 && j < tvN.length && j < tvV.length && j < tvT.length {
+          const mt = tvT[j]
+          if (
+            tvN[j] == tp
+            && mt >= 0
+            && mt < T.tys.length
+            && !tyHasTyVar(mt)
+            && !tySame(mt, et)
+            && repCanonId(mt) != repCanonId(et)
+          ) {
+            tvT[j] = et
+            tvV[j] = tyToEmitName(et)
+          }
+          j = j + 1
+        }
+      }
       monoExactPinTys(pinTys, ctx)
       const pinKinds: i32[] = []
       monoBuildPinCol(pinned, pinKinds)
@@ -21290,38 +21296,39 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
   0
 }
 
-// Binds `fn`'s type parameters from the concrete arguments at its non-arrow annotations.
+// Binds `fn`'s type parameters each non-arrow annotation of call `callIx` mentions, ahead of the
+// first-use loop, at the elaboration's binding for the call (D58).
 function monoPreBindNonArrowArgs(
+  origFe: i32,
+  callIx: i32,
   fn: FuncDecl,
   params: i32[],
   args: i32[],
-  ctx: i32,
   tvN: string[],
   tvV: string[],
   tvT: i32[],
-  declTys: i32[],
 ) {
   let pb = 0
-  while pb < args.length {
+  while pb < args.length && pb < params.length {
     const pbp = nodeAt(params[pb])
-    if pbp is Param {
-      if pbp.parType >= 0 {
-        // The ARROW parameters are the ones whose binding is in question; every other
-        // annotation reads its type off the argument the call actually passes, except a literal
-        // of generics, which takes the type the others bind (D10250).
+    // The ARROW parameters are the ones whose binding is in question, and a literal of generics
+    // takes the type the others bind (D10250).
+    if (
+      pbp is Param
+      && pbp.parType >= 0
+      && !monoAnnIsFnSlot(pbp.parType)
+      && !monoLitHoldsGenericFn(args[pb], 0)
+    ) {
+      for tp in fn.fnTyParams {
         if (
-          !monoAnnIsFnSlot(pbp.parType)
-          && !monoLitHoldsGenericFn(args[pb], 0)
+          monoBindOf(tvN, tvV, tp) == ""
+          && monoAnnHasTyParam(pbp.parType, -1, [tp])
         ) {
-          if monoAnnHasTyParam(pbp.parType, -1, fn.fnTyParams) {
-            monoBindArenaFullTys(
-              monoParamPatTy(params, pb, declTys),
-              monoExactPinTyOf(monoArgPinTyIx(args[pb], ctx), ctx),
-              fn.fnTyParams,
-              tvN,
-              tvV,
-              tvT,
-            )
+          const et = monoElabBindTy(origFe, callIx, tp)
+          if et >= 0 {
+            tvN.push(tp)
+            tvV.push(tyToEmitName(et))
+            monoTvTyLast(tvN, tvT, et)
           }
         }
       }
