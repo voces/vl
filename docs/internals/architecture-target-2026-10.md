@@ -1935,7 +1935,45 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, ~~`monoReachSlotPins` 546~~, ~~`monoDeclPathPinsOrReach` 173~~, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, ~~`monoReachSlotPinsAt` 78~~.
 - [ ] **node type** (29): `monoCloseRetFnTy` 9,592, `monoInitHeldTy` 6,742, `monoArgClosedTyIn` 5,475, `monoPinBin` 4,320, `monoPinnedOperandTy` 3,781, `monoSubstLetType` 3,348, `monoCloneLetDecl` 3,020, `monoCoerceListCbArg` 2,889, `monoPinReturnedObj` 1,945, `monoCbFnListRowSpell` 1,107, `monoDeadNullTest` 882, `monoCgcTplTy` 668, `monoRetFnListTy` 608, `monoPinnedAnnTyAt` 509, `monoLeafParamPin` 420, `monoBoundFnListElemsTy` 352, `monoPinnedReadTy` 341, `monoClosedObjLitTy` 174, `monoLetAnnTyOf` 66, `monoHoleFnPinTy` 33, `monoLetWriteRhsTyRec` 15, `monoPinnedListElemPin` 14, `monoLetWritesRecord` 6, `monoModuleDupPin` 3, `monoArgOpenValueTy` 1, `monoModuleLetPin` 0, `monoClosedFieldValTy` 0, `monoLetWriteRhsTy` 0, `monoPinnedListAnnTy` 0.
 - [ ] **slot type** (27): `monoBindingAdoptInit` 9,578, `monoHoleGenFnPin` 7,952, `monoListSrcElemTy` 7,925, `monoReachLitTys` 6,959, `monoReachSlotTy` 6,938, `monoPinMapValues` 6,754, `monoPinFieldContainers` 798, `monoPinRecordFields` 733, `monoLetWritesClosed` 703, `monoPinObjFields` 695, `monoRetypeLamCells` 565, `monoPinRecordField` 466, `monoWritesCoercedFirstCall` 454, `monoPinNestedListElems` 315, `monoPinFieldContainer` 112, `monoPinMapSlot` 66, `monoLetWritesAt` 57, `monoNoteBindCall` 28, `monoPinFieldValue` 25, `monoPinJoin` 22, `monoPinStoredRecords` 20, `monoRenameInitAt` 12, `monoSigJoin` 3, `monoPinnedElemAnnTy` 2, `monoHandWrittenLet` 2, `monoPinMapNestedFnLists` 0, `monoWrittenLetRetsDisagree` 0.
-- [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, ~~`monoLamReachParamTy` 124~~, `monoRecvParamElem` 41, `monoDeliverLamLit` 6, `monoLamInstSigs` 2.
+- [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, ~~`monoLamReachParamTy` 124~~, ~~`monoRecvParamElem` 41~~, `monoDeliverLamLit` 6, ~~`monoLamInstSigs` 2~~.
+  The hub is `monoLamParamPinAnn`: an un-annotated lambda parameter's pin is the checked type
+  substituted at the instance binding. Shadowed (2026-11-07, 23,384 programs, 748 reaching it)
+  against three elaboration readings: `elabLamParamTy`, `elabLamDeliveredParams`, and the
+  parameter of `elabNodeTy(lam, elabWalkTop())`. Where mono's pin closes, the node type agrees in
+  600 notes and the other two in 75, none differs, and 25 programs have no elaboration answer.
+  `elabLamParamTy` misses most of them because a built-in `.map` / `.filter` callback has no
+  callee call. The node type is only right where the parameter rides this instance's own
+  binding: taking it where mono stays open (another declaration's variable, typed per call) gives
+  check-clean invalid wasm in 8 programs, which are regression cells for the switch
+  (`functions/hole-lambda-literal-two-instance-types.vl`, `generics/nested-capture-per-pin-clone.vl`,
+  `closures/hole-fn-list-handed-two-sets-lists-beside-a-wider-read.vl`,
+  `closures/hole-param-alias-call-delivers-lambda-at-callee-type.vl`,
+  `closures/hole-fn-list-map-result-returned-from-param.vl`, D5931, D12235, D14729).
+  Dropping mono's answer in the 25 leaves 19 printing the same and loses `runs` in 6, in two
+  shapes:
+  - A built-in callback over a list of hole functions read through a hole parameter
+    (`function take(a) { return a.map((f) => f(3)) }`, 5 of the 6). The checker types the
+    callback `(_) => _` and mono pins `f` at `i32`, the hole list's tag rep, through
+    `?take.0 = i32[]`. The missing fact is the TYPE of the holder at the instance,
+    `((i32) => i32)[]`, which split-dep's hole-lambda holder closure builds (hole parameters are
+    its step c). The pin then reads that type and spells the tag rep where its set is tagged
+    (`fnTagRepTyIn`), since a function's type is never `i32`.
+  - A lambda written into a captured cell from a closure inside a generic body
+    (`closures/captured-cell-shared-writer-hole-lambda-alias.vl`, 1 of the 6; 16 more are output
+    neutral). Mono binds the lambda's own hole per instance (`?#L22.0`), and the elaboration has
+    no instance key for that lambda (`elabKeyAt` -3). This is the per-instance identity residual
+    (4b-i): mono keeps that arm until the key exists.
+
+  `monoRecvParamElem` is switched: the callback's element is the receiver's closed element at the
+  walk top, which agreed in all 26 decisions (13 programs), with 0 byte diffs over 19,316 programs.
+  `monoLamInstSigs` is deleted. Its one reader, `monoRenameInitAt`, checked after minting a
+  lambda's instance at a signature that some instance carries it. That held in all 4 programs that
+  reach it, so the check now asks the instance just minted and refuses loudly otherwise. The
+  refusal fires 0 times over the corpus. `monoDeliverLamLit` decides no type: it re-instances a
+  hole lambda literal already pinned at another signature, once per call it is handed to. That
+  happens in 6 programs, the same literals-at-two-types the hub's regression cells name, and its
+  refusal is reached by none. It is class (c) mechanics over mono's own instance registry, and
+  goes with that registry, not with a fact.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
@@ -2089,6 +2127,15 @@ comes from the tag layer. Three steps:
   over the union population;
 - (c) a hole parameter is closed per instance from its callers' arguments, and declines where two
   callers at one key pass different types.
+
+**Identity and signature are two facts.** `elabTyClosed` accepts a function type that a known set
+closes by identity (Fn#d), while its signature still holds its members' own holes, e.g.
+`((_) => _)[]`. `elabNodeTy` answers that identity-closed type, and rep readers dispatch on its
+set. `elabSlotTyAt` answers the closed signature (`((i32) => i32)[]`). Answering the signature from
+`elabNodeTy` in place of the identity drops the set. #6566 (closed) tried it and broke 16 oracle
+fixtures plus D7381, D9600 and D9660. A reader that needs the signature asks `elabSlotTyAt`. A
+shadow that sees identity on one side and a signature on the other has found two facts, not a
+disagreement.
 
 **Slot type, first reading: `monoReachSlotTy`** (2026-11-06). Value reach (`vrCalleeTy`) against
 the climb's agreed tuple (`elabLitSlotCallTys`), each computed on its own:
