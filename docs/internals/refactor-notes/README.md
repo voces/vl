@@ -7,6 +7,7 @@ with a line in this index; the PR that moves a step also updates the target doc'
 
 Newest first:
 
+- [2026-11-07-step6-write-back-census](2026-11-07-step6-write-back-census.md): Step 6's write-back census: ten of sixteen `synth*Ann*` deleted, five write-backs parked on a reader, `criWalkBlock` has no replay left.
 - [2026-11-07-record-literals-closed-from-bindings](2026-11-07-record-literals-closed-from-bindings.md): Record literals closed from the bindings they read (was §3.4).
 - [2026-11-07-argument-keyed-instances-design](2026-11-07-argument-keyed-instances-design.md): Argument-keyed instances: design note (was §3.4).
 - [2026-11-07-function-let-slot-fact](2026-11-07-function-let-slot-fact.md): A function-holding let's slot fact, from its calls (was §3.4).
