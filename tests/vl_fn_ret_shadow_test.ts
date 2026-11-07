@@ -644,17 +644,23 @@ const COL_REC = `function mk(n: i32) { { a: n, b: 2 } }
 print(mk(3).a)
 `;
 
-// A function returning an assignment reads its value off the recorded result where the target
-// cell's rep agrees (`setN`); a module literal-union cell holds the atom while the recorded value
-// is the string literal, so `setK` is left to the walk.
+// A function returning an assignment reads its value off the recorded result, whatever the
+// target cell's rep: a module literal-union cell (\`setK\`) and a captured one (\`set\`) both
+// lower the string the result records, parenthesized or not.
 const COL_ASSIGN = `type K = "a" | "b"
 let k: K = "a"
 function setK() { return (k = "b") }
 let n = 0
 function setN() { return (n = 3) }
+function outer() {
+  let c: K = "a"
+  const set = () => { return (c = "b") }
+  print(set())
+}
 setK()
 print(setN())
 print(k)
+outer()
 `;
 
 Deno.test({
@@ -684,11 +690,12 @@ Deno.test({
       COL_ASSIGN,
       DROP_NONE,
       true,
-      "post moved: unmoved: assignment target's rep differs | setK=1; " +
-        "post seed: assignment target's rep differs | setK=1; " +
-        "post settled: assignment target's rep differs | setK=1; pre seed: agree i32 | setN=1; " +
-        "pre seed: assignment target's rep differs | setK=1; pre settled: agree i32 | setN=1; " +
-        "pre settled: assignment target's rep differs | setK=1",
+      "post moved: moved: agree str | __lambda_0=1; post moved: moved: agree str | setK=1; " +
+        "post seed: kind str vs i32 | __lambda_0=1; post seed: kind str vs i32 | setK=1; " +
+        "post settled: agree str | __lambda_0=1; post settled: agree str | setK=1; " +
+        "pre seed: agree i32 | setN=1; pre seed: kind str vs i32 | __lambda_0=1; " +
+        "pre seed: kind str vs i32 | setK=1; pre settled: agree i32 | setN=1; " +
+        "pre settled: kind str vs i32 | __lambda_0=1; pre settled: kind str vs i32 | setK=1",
       "col",
     );
     expectRows(
