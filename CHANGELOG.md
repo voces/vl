@@ -8,6 +8,27 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **Maps of generic records and slot deliveries, rowintern (architecture-target §3.4):** eight PRs
+  make a map of records holding generic functions tag and run, and move the slot-delivery family's
+  decisions onto the elaboration; each code change is graded by a fixpoint byte sweep against
+  master, the corpus and the filed witnesses.
+  - *Map of records:* a record literal stamped into a held map is built at the binding's record row,
+    not a twin of its own (#6530); collectA interns a held map's record rep and mv slot, so a map
+    written only directly has one (D15532, #6538); a call's set-bound instance answers mono's held
+    pin, and late demands fall from 7 to 1 running program (#6544).
+  - *Writes through helpers:* a member written through a helper into a held map of its set has that
+    write as its leaf, the map twin of D14648 (D15531, #6549); a map slot's record joins each function
+    field with every function written there, which closes D15493 and D9440 (#6557); the `.set`
+    spelling is filed with its four layers (D15533, #6567).
+  - *Hole parameters:* `monoPinHoleParam`'s rung pinning at the argument's checked type is deleted;
+    it fired 15 times and the fallback answered each with the same pin (#6575). D15534 and D15535
+    are filed from its measurement.
+  - *Slot deliveries:* `monoStoredSlotFnTy`, `monoPinListElems` and `monoCoerceWrittenCell` take a
+    slot's type from the one type the elaboration delivers it at, and the written and `if`-bound
+    `let` calls no longer instance the seed at the call. Values agreeing on another result keep
+    theirs, so a write of the delivered type still refuses with the contract message rather than
+    trapping (D15353, D15190). `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy`, `monoHeldSrcsFnTy`,
+    `slotCallArgsInto` and `fnSlotCallArgsInto` go (#6589).
 - **Pin helpers onto elaboration facts, Fn#d (architecture-target §3.4):** twelve PRs move mono
   decisions onto the elaboration or delete the guess they stood on, each graded by a shadow against
   it, a byte sweep of the corpus against a master fixpoint, and the filed witnesses.
