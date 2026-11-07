@@ -7,6 +7,7 @@ with a line in this index; the PR that moves a step also updates the target doc'
 
 Newest first:
 
+- [2026-11-07-classifier-phase-census](2026-11-07-classifier-phase-census.md): The classifier phase census committed (`$VL_CLS_CENSUS`, `scripts/classifier-census.vl`), and its reading on master.
 - [2026-11-07-identity-typing-fact](2026-11-07-identity-typing-fact.md): Identity typing (A) slice 2a: the fact in the elaboration; 1,505 of 1,505 concrete specialization decisions read mono's declaration, byte-identical; the checker-type variant refused (16 runs lost).
 - [2026-11-07-step7-void-from-recorded](2026-11-07-step7-void-from-recorded.md): Step 7: voidness read from the recorded result, `computeVoidFns` retired.
 - [2026-11-07-fn-holding-facts](2026-11-07-fn-holding-facts.md): `elabHeldValTy`, the closed type of a function-holding value, shadowed against four mono functions: 0 differ, 2 old-only (D4515).
