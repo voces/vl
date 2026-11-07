@@ -36,6 +36,7 @@ import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftWithinInstancedFn } from "./check_fn_tag"
 import {
   elabArmFeOf,
+  elabBindingFnSet,
   elabCallHoleParamTy,
   elabCallParamBoundTy,
   elabCbArgSig,
@@ -2235,10 +2236,8 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
 function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
   const bp = monoBuildTyPin(cax)
   if bp != "" { return bp }
-  // A call argument whose callee has a concrete return annotation takes that annotation.
-  // Needed for a generic call used as an argument (`box(box(7))`): `buildFnMap` is
-  // post-mono, so `exprStruct` cannot classify the inner call and the type param would
-  // default to i32. The instance's already-substituted return annotation resolves it.
+  // A call argument whose callee has no return annotation takes the checker's inferred return:
+  // `buildFnMap` is post-mono, so nothing else classifies the inner call.
   const argN = nodeAt(unwrapParen(ix))
   if argN is Call && argN.callFn >= 0 {
     const argCallee = nodeAt(argN.callFn)
@@ -2255,22 +2254,7 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
       if acfe >= 0 {
         const acfn = nodeAt(fnStmts[acfe])
         if acfn is FuncDecl {
-          if acfn.fnRet >= 0 {
-            // The declared spelling again — this arm tells a concrete return from a
-            // parametric one, and a shadowed parameter reads as concrete once canon
-            // has resolved it.
-            const arn = monoDeclAnnName(
-              acfn.fnRet,
-              tyNameOf(acfn.fnRet),
-              acfn.fnTyParams,
-            )
-            if (
-              arn != ""
-              && !monoAnnHasTyParam(acfn.fnRet, -1, acfn.fnTyParams)
-            ) {
-              return arn
-            }
-          } else {
+          if acfn.fnRet < 0 {
             // An inferred return is as good a pin as an annotated one:
             // `inferRetNameOf` is the checker's own record, routed through
             // `monoAnnPinName` so the pin is one that ladder claims.
@@ -2411,18 +2395,6 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
 function monoArgClosedPin(ix: i32, fnIx: i32): string {
   const cax = unwrapParen(ix)
   if cax < 0 || cax >= P.nodes.length { return "" }
-  // A list or record literal the record solve built at another record pins at that build (D15181).
-  const lb = monoLitBuiltTy(cax)
-  if lb >= 0 { return monoRecordNominalPin(lb) }
-  // An argument its call's rep row binds at another record pins there, as elaboration keys it.
-  const rr = elabArgBuiltRep(cax, elabWalkTop())
-  if rr >= 0 { return monoRecordNominalPin(rr) }
-  // A call copied where it is delivered pins at the declared record its copy lands in (D15183).
-  const cpy = recCopyTyOf(cax)
-  if cpy >= 0 && cpy < T.tys.length {
-    const cn = monoRecordNominalPin(cpy)
-    if cn != "" { return cn }
-  }
   let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
   if t < 0 { t = elabArgBuiltTy(cax) }
   if t < 0 || t >= T.tys.length { return "" }
@@ -11149,10 +11121,38 @@ function monoMakerTwin(
   r
 }
 
+// Whether each written, un-annotated `let` holds only named functions `monoIsGenericDecl`
+// instances, by the elaboration's set of the values written to it (`elabBindingFnSet`; empty is
+// no). Read once before the walk, which retypes the values that set is read from.
+let monoWrittenLetGen: {[i32]: boolean} = Map()
+
+function monoWrittenLetGenSnap() {
+  monoWrittenLetGen = Map()
+  monoLetWritesExtend()
+  for d in monoDeclWrites.keys() {
+    const n = nodeAt(d)
+    if n is LetDecl {
+      if n.letType < 0 && n.letKw == "let" {
+        const ms = elabBindingFnSet(d)
+        let gen = ms.length > 0
+        for m in ms {
+          const mn = nodeAt(m)
+          if !(mn is FuncDecl) || !monoIsGenericDecl(m) {
+            gen = false
+          } else if mn.fnName == "" || mn.fnName.slice(0, 8) == "__lambda" {
+            gen = false
+          }
+        }
+        monoWrittenLetGen[d] = gen
+      }
+    }
+  }
+}
+
 // For the read at `at` in frame `ctx`: `[frame, declaration]` of the written, un-annotated `let`
-// it names when every value of it names a declared generic, which each take their own instance;
-// `[-1, -1]` otherwise. A lambda written in is one body, shared across the enclosing instances,
-// so it keeps its own path.
+// it names when every value of it names a function that needs instancing, which each take their
+// own instance; `[-1, -1]` otherwise. A lambda written in is one body, shared across the
+// enclosing instances, so it keeps its own path.
 function monoWrittenGenLetFrame(at: i32, ctx: i32): i32[] {
   const none: i32[] = [0 - 1, 0 - 1]
   if !(nodeAt(at) is Ident) { return none }
@@ -11163,24 +11163,13 @@ function monoWrittenGenLetFrame(at: i32, ctx: i32): i32[] {
   if !(d is LetDecl) || d.letType >= 0 || d.letKw != "let" { return none }
   if !monoLetWrittenIn(lf) { return none }
   if d.letInit < 0 { return none }
-  // An `if` seed is each of its arms, the first of which seeds the binding's signature.
+  const src = nodeSrc[lf[1]] ?? -1
+  const srcKey = if src >= 0 { monoDeclCanon(src) } else { -1 }
   if (
-    !monoNamesDeclaredGeneric(d.letInit, lf[0])
-    && !(nodeAt(unwrapParen(d.letInit)) is IfStmt
-      && monoValueNamesGenerics(d.letInit, lf[0], 0)
-      && monoLetSeedGenFe(d.letInit, lf[0]) >= 0)
+    !(monoWrittenLetGen[monoDeclCanon(lf[1])]
+      ?? (monoWrittenLetGen[srcKey] ?? false))
   ) {
     return none
-  }
-  for w in monoWritesOf("n:", lf[1]) {
-    const wn = nodeAt(w)
-    if wn is BinExpr {
-      if monoFrameHolds(lf[0], w) {
-        let wf = monoTopFrameOf(w)
-        if lf[0] >= 0 { wf = monoFrameOfNode(w, lf[0]) }
-        if !monoValueNamesGenOrInst(wn.binRight, wf, 0) { return none }
-      }
-    }
   }
   if monoGeneratedCellElem(d.letInit) >= 0 { return none }
   lf
@@ -11202,27 +11191,6 @@ function monoValueNamesGenerics(v: i32, ctx: i32, depth: i32): boolean {
   if tn && en { return false }
   (tn || monoArmNamesGenerics(n.ifThen, ctx, depth + 1))
     && (en || monoArmNamesGenerics(n.ifElse, ctx, depth + 1))
-}
-
-// `monoValueNamesGenerics`, also taking a name an earlier coercion renamed to an instance of a
-// declared generic, by itself or as an `if` arm, as a write a delivery already coerced is (D10321).
-function monoValueNamesGenOrInst(v: i32, ctx: i32, depth: i32): boolean {
-  if monoValueNamesGenerics(v, ctx, depth) || monoNamesGenericInstance(v, ctx) {
-    return true
-  }
-  const x = unwrapParen(v)
-  if x < 0 || depth > MONO_ALIAS_CHAIN_MAX { return false }
-  const n = nodeAt(x)
-  if !(n is IfStmt) { return false }
-  const tn = monoArmEndsNever(n.ifThen)
-  const en = monoArmEndsNever(n.ifElse)
-  if tn && en { return false }
-  const tv = monoArmTailValue(n.ifThen)
-  const ev = monoArmTailValue(n.ifElse)
-  const ta = if tv >= 0 { tv } else { n.ifThen }
-  const ea = if ev >= 0 { ev } else { n.ifElse }
-  (tn || monoValueNamesGenOrInst(ta, ctx, depth + 1))
-    && (en || monoValueNamesGenOrInst(ea, ctx, depth + 1))
 }
 
 // Whether `if` arm block `arm` ends in a call that never returns.
@@ -11956,36 +11924,6 @@ function monoListElemHoleLamFe(e: i32, ctx: i32): i32 {
   }
   if !monoWriteNamesLam(x, fe, ctx) { return -1 }
   fe
-}
-
-// The declared generic function list element `e` names in frame `ctx`, as a slot; -1 otherwise.
-function monoListElemGenFe(e: i32, ctx: i32): i32 {
-  const x = unwrapParen(e)
-  if x < 0 { return -1 }
-  const nm = monoIdentNameOf(x)
-  if nm == "" { return -1 }
-  // A written `let` holds its latest write, which no pin of the list can follow (D3978).
-  const lf = monoReadLetFrame(x, ctx)
-  if lf[1] >= 0 {
-    const d = nodeAt(lf[1])
-    if d is LetDecl {
-      if d.letKw != "const" && monoLetWrittenIn(lf) { return -1 }
-    }
-  }
-  if monoNamesDeclaredGeneric(x, ctx) { return monoFnFeOfIdent(x, nm, ctx) }
-  monoReadGenFnFe(x)
-}
-
-// The declared generic function seed `v` of a written `let` names in frame `ctx`, or the one its
-// first `if` arm names, as a slot; -1 otherwise.
-function monoLetSeedGenFe(v: i32, ctx: i32): i32 {
-  const fe = monoListElemGenFe(v, ctx)
-  if fe >= 0 { return fe }
-  const x = unwrapParen(v)
-  if x < 0 || !(nodeAt(x) is IfStmt) { return -1 }
-  const g = monoFirstArmGenName(x, ctx, 0)
-  if g < 0 { return -1 }
-  monoFnFeOfIdent(g, monoIdentNameOf(g), ctx)
 }
 
 // ── reads of a literal slot that holds one generic ──────────────────────────────────────────
@@ -26048,6 +25986,7 @@ export function monomorphize(stmts: i32[]) {
   if !any { return 0 }
   if monoShadowRename(fnStmts.length) < 0 { return -1 }
   monoFlowReads(stmts)
+  monoWrittenLetGenSnap()
   monoInertReach(stmts)
   if monoSlotRecordsApply() < 0 { return -1 }
   // Top-level statements first, in source order (global inits + start stmts).
