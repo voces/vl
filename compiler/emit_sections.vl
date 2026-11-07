@@ -6,6 +6,7 @@ import { mfrLitsRun } from "./mfr_shadow"
 // model, per-function code emission, the opt-in name section). Sits above `wasmEmit.vl`, calling down into it for every statement/expression body.
 
 import { idShadowInstRow, idShadowSnap } from "./emit_id_shadow"
+import { elabFnIdReset } from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
 import { lamChainSnap } from "./check_lam_chain"
 import { recordRowClassOf, recordRowsRun } from "./record_rows"
@@ -777,7 +778,6 @@ import {
   retRefArrFlag,
   retStructRowIndex,
   retVariantFlag,
-  tailSelfFnReset,
   tyAnnRefListSlot,
   vtKindOfParam,
   vtKindOfType,
@@ -834,7 +834,6 @@ import {
   collectTyParamNames,
   collectU,
   computeRetInference,
-  computeVoidFns,
   criAfterMonoSet,
   declareForInLocals,
   declareForRangeLocals,
@@ -846,14 +845,12 @@ import {
   mAssignTypeIndices,
   mfScan,
   reconcileVariantFieldSpans,
+  recordedVoidFns,
   scanArrLitCommit,
   scanExprArmLocals,
   stmtArmRoot,
   stmtArmScopeClose,
   stmtArmScopeOpen,
-  synthCaptureEmptyListAnns,
-  synthCaptureReadAnns,
-  synthGlobalEmptyListAnns,
   synthRecordedRetAnnots,
 } from "./emit_collect"
 import {
@@ -6615,7 +6612,7 @@ type EmitPass = "deadTailDrop"
   | "collectFns"
   | "checkTopLevel"
   | "buildFnMap"
-  | "computeVoidFns"
+  | "recordedVoidFns"
   | "computeRetInference"
   | "dispatchRewrite"
   | "captureBoxRewrite"
@@ -6627,14 +6624,12 @@ type EmitPass = "deadTailDrop"
   | "collectAnnShapes"
   | "collectA#2"
   | "collectArrNewFrames"
-  | "synthGlobalEmptyListAnns"
   | "synthVoidTwins"
   | "synthExternValues"
   | "synthRecEqCores"
   | "buildFnMap#2"
   | "synthParamAnnots"
-  | "computeVoidFns#2"
-  | "synthCaptureReadAnns"
+  | "recordedVoidFns#2"
   | "computeRetInference#2"
   | "collectMapFilterUse"
   | "collectFnValUse"
@@ -6642,7 +6637,6 @@ type EmitPass = "deadTailDrop"
   | "initGuardScan"
   | "scanPrintUse"
   | "capCacheBuild"
-  | "synthCaptureEmptyListAnns"
   | "scanExprArmLocals"
   | "cloLiftScan"
 
@@ -7312,8 +7306,8 @@ function passKeepsCaptures(name: string): boolean {
   if name == "monomorphize" { return true }
   if name == "computeRetInference" { return true }
   if name == "computeRetInference#2" { return true }
-  // Writes only `fRetVoid` and `tailSelfFnIx`, which no `capScan` path reads.
-  name == "computeVoidFns" || name == "computeVoidFns#2"
+  // Writes only `fRetVoid`, which no `capScan` path reads.
+  name == "recordedVoidFns" || name == "recordedVoidFns#2"
 }
 
 // Dispatch one pass-table row, exhaustively over `EmitPass`. Every pass returns an i32 status (< 0 =
@@ -7362,8 +7356,8 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
     "buildFnMap" => {
       return buildFnMap(stmts)
     }
-    "computeVoidFns" => {
-      return computeVoidFns()
+    "recordedVoidFns" => {
+      return recordedVoidFns()
     }
     "computeRetInference" => {
       return computeRetInference()
@@ -7403,9 +7397,6 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
     "collectArrNewFrames" => {
       return collectArrNewFrames()
     }
-    "synthGlobalEmptyListAnns" => {
-      return synthGlobalEmptyListAnns()
-    }
     "synthVoidTwins" => {
       return synthVoidTwins(stmts)
     }
@@ -7422,8 +7413,8 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
     "synthParamAnnots" => {
       return synthParamAnnots()
     }
-    "computeVoidFns#2" => {
-      const cv = computeVoidFns()
+    "recordedVoidFns#2" => {
+      const cv = recordedVoidFns()
       fnRetShadowRun()
       return cv
     }
@@ -7451,12 +7442,6 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
     }
     "capCacheBuild" => {
       return capCacheBuild()
-    }
-    "synthCaptureEmptyListAnns" => {
-      return synthCaptureEmptyListAnns()
-    }
-    "synthCaptureReadAnns" => {
-      return synthCaptureReadAnns()
     }
     "scanExprArmLocals" => {
       return scanExprArmLocals()
@@ -7510,7 +7495,6 @@ function emitProgramReset(rootIx: i32) {
   printPlanReset()
   rewriteCountersReset()
   shapeRowsReset()
-  tailSelfFnReset()
   monoStateReset()
   classifyStateReset()
   callResultTextsReset()
@@ -7667,10 +7651,13 @@ function emitPassTable(): PassRow[] {
     },
     { pass: "checkTopLevel", needs: ["collectFns"] },
     { pass: "buildFnMap", needs: ["collectFns"] },
-    { pass: "computeVoidFns", needs: ["buildFnMap"] },
+    {
+      pass: "recordedVoidFns",
+      needs: ["buildFnMap"],
+    },
     {
       pass: "computeRetInference",
-      needs: ["buildFnMap", "computeVoidFns"],
+      needs: ["buildFnMap", "recordedVoidFns"],
     },
     {
       pass: "dispatchRewrite",
@@ -7716,10 +7703,6 @@ function emitPassTable(): PassRow[] {
       needs: ["collectA#2", "collectFns", "monomorphize"],
     },
     {
-      pass: "synthGlobalEmptyListAnns",
-      needs: ["collectA#2", "collectFns"],
-    },
-    {
       pass: "synthVoidTwins",
       needs: ["collectFns", "monomorphize"],
     },
@@ -7743,18 +7726,12 @@ function emitPassTable(): PassRow[] {
       needs: ["monomorphize", "buildFnMap#2"],
     },
     {
-      pass: "computeVoidFns#2",
-      needs: ["synthParamAnnots"],
-    },
-    {
-      pass: "synthCaptureReadAnns",
+      pass: "recordedVoidFns#2",
       needs: ["synthParamAnnots"],
     },
     {
       pass: "computeRetInference#2",
-      needs: [
-        "synthParamAnnots", "computeVoidFns#2", "synthCaptureReadAnns",
-      ],
+      needs: ["synthParamAnnots", "recordedVoidFns#2"],
     },
     {
       pass: "collectMapFilterUse",
@@ -7786,10 +7763,6 @@ function emitPassTable(): PassRow[] {
       needs: ["monomorphize", "synthParamAnnots"],
     },
     {
-      pass: "synthCaptureEmptyListAnns",
-      needs: ["collectA#2", "capCacheBuild"],
-    },
-    {
       pass: "scanExprArmLocals",
       needs: [
         "monomorphize", "synthParamAnnots", "synthVoidTwins",
@@ -7805,10 +7778,6 @@ function emitPassTable(): PassRow[] {
   // mono (`fnStmts` positions are final; the twin table stores them) and
   // before `buildFnMap#2`, whose `retVoidAnnFlag` seed classifies the twins.
 
-  // Last, and the two edges say why. `collectA#2` is the same prerequisite
-  // `synthGlobalEmptyListAnns` carries — the synthesis resolves a ref-list row and never mints
-  // one, so the intern pass must have already run — and `capCacheBuild` is the pass that makes
-  // the capture lists this walks final. It runs before `emitModule` because the section that reads the annotation (the type section's env structs, here) is emitted after it.
   passTable
 }
 
@@ -7920,6 +7889,7 @@ export function elabPrepare(rootIx: i32) {
     for e in elabErrors { T.diags.push(e) }
   }
   elabIdentitySnap()
+  elabFnIdReset()
   idShadowSnap()
   elabPreparedFor = rootIx
   0
