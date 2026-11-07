@@ -7,8 +7,8 @@ tables it cites were scratch files and are not kept; re-run a witness from the t
 ## Status (2026-11-07, master `a7f27705`)
 
 Each step is graded by whether its **Deletes** list below is still in `compiler/`, and §3.4's front by
-the evening census ([notes](refactor-notes/2026-11-07-exit-census-evening.md)). The PR that moves a step
-updates this section. Dated measurements live in [`refactor-notes/`](refactor-notes/README.md).
+the evening census ([notes](refactor-notes/2026-11-07-exit-census-evening.md)). The orchestrator updates
+this section from each PR's report; a PR does not edit it (it conflicted on nearly every merge). Dated measurements live in [`refactor-notes/`](refactor-notes/README.md).
 
 | Step | State | What is left |
 |---|---|---|
@@ -68,14 +68,18 @@ map-value facts then deleted `monoFlowMapReadVals`, moved `monoFlowAliasMaps` to
   reaches, so each callee read is typed at the agreed tuple; the climb records the tuple, not the calls).
 
 **Parked at the census (12; 8 on master), each on a named question:**
-- `monoElabStubArgsPrime`: the stub half waits on D15494 (owner);
+- `monoElabStubArgsPrime`: the stub half, D15494. Ruled 2026-11-07 (internal): the elaboration owns the
+  default stub signature of an uncalled hole-function argument, and mono stops minting it;
 - `monoDefaultTyParamsOnlyGenFns`: switched by #6689 after the census;
-- `monoWalkIdentCall` and `monoHoleBinding`: argument-keyed instances, behind identity typing for
-  concrete function values (A, owner);
+- `monoWalkIdentCall` and `monoHoleBinding`: argument-keyed instances. Identity typing (A) is ruled and
+  built in the elaboration (#6694 shadow, #6699 slice 2a); slice 2b keys the instances (#6707) and slice 3
+  shadows the callee answer these two read;
 - `monoCellCall`: mono's `call_ref` policy and the capture rewrite's per-instance cell signature (#6676);
 - `monoInitHeldTy`: a named hole function stored in a map has no member-instance key;
-- `monoPinTyParamComposite`: the naming rule (owner item 4);
-- `monoPinnedTyParamCanon`: the canonical instance key settling names.
+- `monoPinTyParamComposite`: the naming rule, ruled 2026-11-07 (internal; [notes](refactor-notes/2026-11-07-pin-spelling-shadow.md)),
+  waits on the pin-type column;
+- `monoPinnedTyParamCanon`: the canonical instance key settling names, which the naming rule now settles
+  (the name derives from the canonical type); waits on the pin-type column.
 
 ---
 
