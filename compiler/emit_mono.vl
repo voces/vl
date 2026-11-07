@@ -124,7 +124,7 @@ import {
   recordClonedNodeTy,
   tpIfJoinPinName,
 } from "./check_emit_queries"
-import { bindOf, i32TyIx, tyIsGradualUnion } from "./check_leaf_steps"
+import { i32TyIx, tyIsGradualUnion } from "./check_leaf_steps"
 import { canonEmitName } from "./check_program"
 import {
   topFnOwnerOf,
@@ -133,8 +133,6 @@ import {
 } from "./check_subst"
 import {
   assignable,
-  bindGenFnRetUnionArm,
-  bindGenUnionArm,
   bindGenWalk,
   bindGenWalkFull,
   holeFnArgRetAtParams,
@@ -143,7 +141,6 @@ import {
   substTyDeep,
   substTyDeepOf,
   tyProvesNonNull,
-  widenLitTy,
 } from "./check_relate_core"
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
@@ -240,7 +237,6 @@ import {
   tyLitMemberTexts,
   tyMayHoldFn,
   tyMentionsTyVarNamed,
-  tyNulInnerTy,
   tyPrimNameOf,
   tyRenderSoftensLits,
   tySame,
@@ -400,11 +396,9 @@ import {
   monoIsCopyNote,
   monoIsGenericDecl,
   monoNodeNamesTyParam,
-  monoParamsMention,
   monoSubstAnn,
   monoTyMentionsTyParam,
   monoTyParamOf,
-  monoTyParamReachesSpelling,
   nameIsBareMap,
   nameIsClosureArray,
   nameIsShapeSpanEnds,
@@ -663,8 +657,8 @@ import {
   elabArgBuiltRep,
   elabArgBuiltTy,
   elabArmSigAt,
+  elabBindUnionArmsFromCall,
   elabBindingCalls,
-  elabBodyDeclNote,
   elabCallArgRecordSigs,
   elabCallArgRep,
   elabCallArgTysAgreed,
@@ -706,6 +700,7 @@ import {
   elabNodeTyAt,
   elabNodeTys,
   elabParamTyOwnAt,
+  elabParamsMention,
   elabPinIsBundleOf,
   elabResultAtParams,
   elabRetOf,
@@ -719,11 +714,11 @@ import {
   elabSlotTyAt,
   elabSrcDecl,
   elabStampAt,
+  elabStubArgReset,
   elabStubArgSet,
   elabTestsTyVar,
   elabTpDefaulted,
-  elabTpDefaultsNote,
-  elabTpDefaultsReset,
+  elabTyParamReachesSpelling,
   elabTyParamSeedParam,
   elabWalkKidRet,
   elabWalkNarrowedTy,
@@ -2744,162 +2739,19 @@ function monoBindCols(
     bi = bi + 1
   }
   // A union over a bare type parameter binds only what no other parameter did (D2734), at the
-  // elaboration's binding for the call where that is closed.
+  // elaboration's binding for the call.
   let ui = 0
   while ui < params.length && ui < tyCol.length {
     const up = nodeAt(params[ui])
-    if up is Param {
-      const n0 = bN.length
-      monoBindBareUnionArm(
+    if up is Param && tyCol[ui] >= 0 && !tyHasTyVar(tyCol[ui]) {
+      elabBindUnionArmsFromCall(
+        call,
         monoParamPatTy(params, ui, declTys),
-        tyCol[ui],
         bN,
         bT,
       )
-      let k = n0
-      while k < bN.length && k < bT.length {
-        const et = elabCallBindTy(call, bN[k])
-        if (
-          et >= 0
-          && et < T.tys.length
-          && !tyHasTyVar(et)
-          && !tyReachesHole(et, 16)
-        ) {
-          bT[k] = et
-        }
-        k = k + 1
-      }
     }
     ui = ui + 1
-  }
-  0
-}
-
-// The union arms of parameter type `decl` that sit inside a list element, a nullable, a record
-// field or a map value (`(T | i32)[]`), bound from the same position of argument type `at` as a
-// top-level union's are: `bindGenWalk` passes over a union, at any depth (D10880).
-function monoBindInnerUnionArms(
-  decl: i32,
-  at: i32,
-  bN: string[],
-  bT: i32[],
-  depth: i32,
-) {
-  if decl < 0 || at < 0 || decl >= T.tys.length || at >= T.tys.length {
-    return 0
-  }
-  if depth > TY_WALK_DEPTH || !tyHasTyVar(decl) || tyHasTyVar(at) { return 0 }
-  const d = tyAt(decl)
-  match d {
-    TyUnion => {
-      // A top-level union is `monoBindCols`'s own arm walk.
-      if depth > 0 {
-        monoBindBareUnionArm(decl, at, bN, bT)
-        bindGenUnionShapedArmInto(decl, at, bN, bT)
-      }
-    }
-    TyArray => {
-      monoBindInnerUnionArms(d.aElem, tyArrayElemIx(at), bN, bT, depth + 1)
-    }
-    TyNullable => {
-      monoBindInnerUnionArms(d.nInner, tyNulInnerTy(at), bN, bT, depth + 1)
-    }
-    TyObj => {
-      let i = 0
-      while i < d.objFieldNames.length && i < d.objFieldTypes.length {
-        const af = tyFieldTyOf(at, d.objFieldNames[i])
-        monoBindInnerUnionArms(d.objFieldTypes[i], af, bN, bT, depth + 1)
-        i = i + 1
-      }
-    }
-    TyMap => {
-      monoBindInnerUnionArms(d.mVal, tyMapValOf(at), bN, bT, depth + 1)
-    }
-    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {}
-  }
-  0
-}
-
-// Whether function type `e`'s result, through nested function results matched by `a`'s, is a
-// union (`() => T | string`), which `bindGenFnRetUnionArm` binds.
-function monoFnRetIsUnion(e: i32, a: i32): boolean {
-  const x = monoFnRetEnd(e, a, true)
-  x >= 0 && tyAt(x) is TyUnion
-}
-
-// The first result of function type `e` (when `exp`, else of `a`, matched level by level) that is
-// not itself a function type; -1 where the two stop matching first.
-function monoFnRetEnd(e: i32, a: i32, exp: boolean): i32 {
-  let x = e
-  let y = a
-  let depth = 0
-  while x >= 0 && y >= 0 && x < T.tys.length && y < T.tys.length && depth < 8 {
-    const xf = tyAt(x)
-    const yf = tyAt(y)
-    if !(xf is TyFunc) {
-      if exp { return x }
-      return y
-    }
-    if !(yf is TyFunc) { return -1 }
-    x = xf.fnRet
-    y = yf.fnRet
-    depth = depth + 1
-  }
-  -1
-}
-
-// `T | null` at a `null` argument binds `T` to `null`, as the spelling's pin does: the
-// substituted type is `null`, there being no second null (D10271).
-function monoBindNullArm(e: i32, a: i32, bN: string[], bT: i32[]) {
-  if e < 0 || a < 0 || e >= T.tys.length || a != TY_NULL { return 0 }
-  const en = tyAt(e)
-  if !(en is TyNullable) || en.nInner < 0 { return 0 }
-  const iv = tyAt(en.nInner)
-  if iv is TyVar && bindOf(bN, bT, iv.tvName) < 0 {
-    bN.push(iv.tvName)
-    bT.push(TY_NULL)
-  }
-  0
-}
-
-// Binds the one bare type parameter of union parameter type `decl` from argument type `at`, as
-// the spelling's pin does: to the argument's members no concrete member admits, or to the whole
-// argument when one admits them all (`T | string` at `string` binds `T` to `string`); a function
-// type's result binds as the checker's call does.
-function monoBindBareUnionArm(decl: i32, at: i32, bN: string[], bT: i32[]) {
-  if decl < 0 || at < 0 || decl >= T.tys.length || at >= T.tys.length {
-    return 0
-  }
-  if tyHasTyVar(at) { return 0 }
-  if tyAt(decl) is TyFunc {
-    if monoFnRetIsUnion(decl, at) {
-      bindGenFnRetUnionArm(decl, at, bN, bT, false)
-    }
-    monoBindNullArm(
-      monoFnRetEnd(decl, at, true),
-      monoFnRetEnd(decl, at, false),
-      bN,
-      bT,
-    )
-    return 0
-  }
-  monoBindNullArm(decl, at, bN, bT)
-  if !(tyAt(decl) is TyUnion) { return 0 }
-  const gms: i32[] = []
-  flattenVariantsInto(decl, gms)
-  let open = ""
-  for g in gms {
-    if g >= 0 && tyHasTyVar(g) {
-      const gt = tyAt(g)
-      if !(gt is TyVar) || open != "" { return 0 }
-      open = gt.tvName
-    }
-  }
-  if open == "" || bindOf(bN, bT, open) >= 0 { return 0 }
-  bindGenUnionArm(decl, at, bN, bT)
-  if bindOf(bN, bT, open) < 0 {
-    bN.push(open)
-    bT.push(widenLitTy(at))
   }
   0
 }
@@ -6603,7 +6455,7 @@ function monoBindExplicitTyArgs(
       // A lone string literal binds at its own literal type, the type its spelling names.
       if at >= 0 && !tyHasTyVar(at) { monoTvTyLast(tvN, tvT, at) }
       const one: string[] = [typarams[i]]
-      if !monoParamsMention(params, one) {
+      if !elabParamsMention(params, one) {
         extra = extra + typarams[i] + "=" + nm + ";"
       }
     }
@@ -6634,24 +6486,15 @@ function monoPreBindNumJoin(
   0
 }
 
-// The spelling an inferred call binds a type parameter to when no parameter names it and no
-// type argument is written. Only a body local can name such a parameter and it holds no value
-// of it, and an `is` arm reading it at another type reads an empty list, so no read tells (D4911;
-// DECISIONS.md §"An unbound type parameter defaults at the call").
-
-// Records, for the elaboration, each generic declaration's type parameters an inferred call that
-// leaves them unbound defaults, by `monoDefaultUnboundTyParams`'s rule (D4551).
-export function monoElabDefaultsPrime(stmts: i32[]) {
-  elabTpDefaultsReset()
+// Records, for the elaboration, the stub each argument of only uncalled hole functions is keyed
+// at (D15494).
+export function monoElabStubArgsPrime(stmts: i32[]) {
+  elabStubArgReset()
   monoPrimeStmts = stmts
   monoPrimeIndexed = false
   let d = 0
   while d < P.nodes.length {
     const fn = nodeAt(d)
-    if fn is FuncDecl {
-      elabBodyDeclNote(d, fn.fnBody)
-      elabTpDefaultsNote(d)
-    }
     // An argument of only uncalled hole functions is keyed at the stub it is delivered at.
     if fn is Call {
       let k = 0
@@ -6847,8 +6690,8 @@ function monoDefaultAnnTyParams(
     if (
       monoBindOf(tvN, tvV, tp) == ""
       && monoAnnHasTyParam(atAnn, -1, one)
-      && !monoParamsMention(others, one)
-      && !monoTyParamReachesSpelling(body, one, seen)
+      && !elabParamsMention(others, one)
+      && !elabTyParamReachesSpelling(body, one, seen)
     ) {
       const bt = callBindRepTyOf(callIx, tp)
       const sp = if bt >= 0 && bt < T.tys.length && !tyHasTyVar(bt) { monoPinAnnSpelling(bt) } else { "" }
@@ -20415,7 +20258,7 @@ function monoDefaultTyParamsOnlyGenFns(
         named > 0
         && open
         && !monoRetMentions(fn, one)
-        && !monoTyParamReachesSpelling(fn.fnBody, one, seen)
+        && !elabTyParamReachesSpelling(fn.fnBody, one, seen)
       ) {
         monoBindTyParamElab(callIx, tp, tvN, tvV, tvT)
       }
@@ -21421,9 +21264,10 @@ function monoBindArenaFullTys(
   0
 }
 
-// The binding of `pt` at `at` for the union arms inside `pt`'s lists, nullables, fields and map values
-// (`(S | T)[]`), which a spelling cannot pair when `at` spells a member another way (D10880).
+// Binds each type parameter of `typarams` still unbound in `tvN`/`tvV` that stands as a union arm
+// of parameter type `pt`, where argument pin `at` is known, at the call's elaboration binding. 0.
 function monoBindInnerArmPins(
+  call: i32,
   pt: i32,
   at: i32,
   typarams: string[],
@@ -21434,7 +21278,7 @@ function monoBindInnerArmPins(
   if pt < 0 || at < 0 || at >= T.tys.length { return 0 }
   const rN: string[] = []
   const rT: i32[] = []
-  monoBindInnerUnionArms(pt, at, rN, rT, 0)
+  elabBindUnionArmsFromCall(call, pt, rN, rT)
   monoPushPins(rN, rT, typarams, tvN, tvV, tvT)
 }
 
@@ -21646,7 +21490,7 @@ function monoElabCompositeTy(
     const seen: i32[] = []
     if (
       monoAnnHasTyParam(p.parType, -1, one)
-      && monoTyParamReachesSpelling(fn.fnBody, one, seen)
+      && elabTyParamReachesSpelling(fn.fnBody, one, seen)
     ) {
       return -1
     }
@@ -21759,8 +21603,8 @@ function monoPinTyParamComposite(
   // empty `Map()` or `[]` is, binds them by the call's instance, else at the default (D14735).
   const openArg = !annIsFn && monoTyMentionsTyParam(atTy, fn.fnTyParams)
   if anC == "" && !openArg { return monoArgTyFail(p.parName, fn.fnName) }
-  const ni0 = tvN.length
   monoBindInnerArmPins(
+    monoCallTplOf(callIx),
     nodeTyIxOf(p.parType),
     monoPinSubTyOf(monoArgPinTyIx(args[i], ctx), ctx),
     fn.fnTyParams,
@@ -21768,17 +21612,6 @@ function monoPinTyParamComposite(
     tvV,
     tvT,
   )
-  // Each binding the walk adds takes the elaboration's binding for the call where that is closed.
-  let ek = ni0
-  while ek < tvN.length && ek < tvT.length {
-    const et = elabCallBindTy(monoCallTplOf(callIx), tvN[ek])
-    const esp = if et >= 0 && et < T.tys.length && !tyHasTyVar(et) && !tyReachesHole(et, 16) { monoPinAnnSpelling(et) } else { "" }
-    if esp != "" {
-      tvT[ek] = et
-      if ek < tvV.length { tvV[ek] = esp }
-    }
-    ek = ek + 1
-  }
   monoBindArenaFullTys(patTy, atTy, fn.fnTyParams, tvN, tvV, tvT)
   if tyHasTyVar(atTy) {
     monoBindListLitElems(patTy, args[i], fn.fnTyParams, tvN, tvV, tvT)
