@@ -131,7 +131,6 @@ import {
   bindGenUnionArm,
   bindGenWalk,
   bindGenWalkFull,
-  holeFnArgDecls,
   holeFnArgRetAtParams,
   holeLamRetAt,
   nameToTy,
@@ -21829,29 +21828,6 @@ function monoPushPins(
   0
 }
 
-// Appends each binding of `tvN` to `hN`/`hT` at its type in `tvT`; a binding pushed by spelling
-// alone (an argument whose type stays open at the instance) at the type its spelling names, and
-// not at all when it names none.
-function monoBoundTys(
-  tvN: string[],
-  tvV: string[],
-  tvT: i32[],
-  hN: string[],
-  hT: i32[],
-): i32 {
-  let k = 0
-  while k < tvN.length && k < tvV.length {
-    let bt = if k < tvT.length { tvT[k] } else { -1 }
-    if bt < 0 { bt = nameToTy(tvV[k]) }
-    if bt >= 0 {
-      hN.push(tvN[k])
-      hT.push(bt)
-    }
-    k = k + 1
-  }
-  0
-}
-
 // The arena type of `tp`'s first binding in `tvN`/`tvT`; -1 for a binding by spelling alone.
 function monoBindTyOf(tvN: string[], tvT: i32[], tp: string): i32 {
   let k = 0
@@ -21923,47 +21899,6 @@ function monoSlotParamTysAt(
   monoFnTyParamTys(s)
 }
 
-// The parameter types of arrow `af` under `hN`/`hT`; [-1] when one stays open.
-function monoArrowParamTysAt(af: TyFunc, hN: string[], hT: i32[]): i32[] {
-  const qs: i32[] = []
-  for pt in af.fnParamTypes {
-    const q = substTyDeep(pt, hN, hT)
-    if q < 0 || tyHasTyVar(q) { return [0 - 1] }
-    qs.push(q)
-  }
-  qs
-}
-
-// Whether the re-pointed `let` read at `at` holds un-annotated functions whose bodies give two
-// result types at arrow annotation `annIx`'s parameters under `tvN`/`tvV` (D9001).
-function monoWrittenLetRetsDisagree(
-  annIx: i32,
-  at: i32,
-  tvN: string[],
-  tvV: string[],
-  tvT: i32[],
-): boolean {
-  const ds = holeFnArgDecls(at)
-  if ds.length < 2 { return false }
-  const t = nodeTyIxOf(annIx)
-  if t < 0 || t >= T.tys.length { return false }
-  const af = tyAt(t)
-  if !(af is TyFunc) { return false }
-  const hN: string[] = []
-  const hT: i32[] = []
-  monoBoundTys(tvN, tvV, tvT, hN, hT)
-  const qs = monoArrowParamTysAt(af, hN, hT)
-  if qs.length > 0 && qs[0] < 0 { return false }
-  let r0 = -1
-  for d in ds {
-    const r = monoFnDeclRetAt(d, qs)
-    if r < 0 { return false }
-    if r0 >= 0 && !tySameSpelled(r, r0, TY_WALK_DEPTH) { return true }
-    r0 = r
-  }
-  false
-}
-
 // The read `[read, frame]` of the written `let` of generics (`monoWrittenGenLetFrame`) that the
 // name read at `at` in frame `ctx` is, or reaches through a chain of un-annotated aliases never
 // written after their initializer (D9130); `[-1, -1]` for none.
@@ -22011,19 +21946,19 @@ function monoHandWrittenLet(
 ): i32 {
   const at = unwrapParen(arg)
   const lf = monoWrittenGenLetFrame(at, ctx)
-  if monoWrittenLetRetsDisagree(p.parType, at, tvN, tvV, tvT) {
-    return emitFailAt(
-      "emitProgram: the reassigned function binding handed here holds functions that give "
-        + "different result types at this parameter's type — one binding holds one closure "
-        + "signature. Annotate the functions' results, or bind a separate value per function",
-      at,
-    )
-  }
   if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
     monoBindArrowRet(p.parType, callIx, argI, fn.fnTyParams, tvN, tvV, tvT)
   }
-  const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
-  if pre == "" { return 0 }
+  // The functions are instanced at the type the elaboration gives the parameter at this call;
+  // the checker refuses a binding whose functions give two results there (D9003).
+  const ept = elabCallParamTy(monoCallTplOf(callIx), argI)
+  const pre = if monoTyClosedFn(ept) { monoPinAnnSpelling(ept) } else { "" }
+  if pre == "" {
+    return emitFailAt(
+      "emitProgram: internal: a reassigned function binding handed to a function parameter has no closed elaborated parameter type",
+      at,
+    )
+  }
   const key = i32ToStr(lf[0]) + ":" + i32ToStr(lf[1])
   const was = monoWrittenLetHanded.get(key) ?? ""
   if was != "" && was != pre {
