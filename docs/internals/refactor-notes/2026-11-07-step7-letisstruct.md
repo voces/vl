@@ -5,7 +5,7 @@
 a nullable record of a generic function value. The typed claim declined them, because the
 function's own `T` read as an open type variable.
 
-**The own-scheme query.** `tyVarsOwnScheme(ty, encl)` (`check_subst.vl`, #6724) asks whether
+**The own-scheme query.** `tyVarsOwnScheme(ty, encl)` (`check_subst.vl`, #6724, merged) asks whether
 every type variable in `ty` belongs to a function type, all of whose variables come from one
 function that is not among `encl`, the functions enclosing the binding. `bindCellGo`'s guard
 declines only when that fails. This PR widens which variables count as "one function's":
@@ -42,15 +42,14 @@ off the binding rep it already computed. The captured-slot index reads the same 
 `letBindRepKind`, and `emit_closure_sites.vl`'s return arm reads it through
 `retLetHoldsRecord`.
 
-**Proof.** Seeds are fixpoints (two refreshes, byte-identical). Base is master `5ca7df50`.
+**Proof.** Seeds are fixpoints (two refreshes, byte-identical). Base is master `fa202cbb`,
+which has #6724 in it.
 
-| seed | bytes | sweep vs base: output movers, bytes-only, runs lost, new traps |
-| --- | --- | --- | --- |
-| base | 6,476,334 | — |
-| #6724 | 6,477,619 | 2, 10, 0, 0 |
-| this PR | 6,479,585 | 2, 17, 0, 0 |
+| seed | bytes | sweep vs base: same, output movers, bytes-only, runs lost, new traps |
+| --- | --- | --- |
+| base | 6,473,613 | — |
+| this PR | 6,475,579 | 23,606, 0, 7, 0, 0 |
 
-The two output movers are D15543 and its fixture (trap → runs). The seven new bytes-only
-movers are the hole-function face of the same class, now held in the `nulstruct` cell with the
-same output: D12340, D9183, `d15221_get_dbl`/`getb_dbl`/`rebget_dbl`,
+The seven bytes-only movers are the hole-function face of D15543's class, now held in the
+`nulstruct` cell with the same output: D12340, D9183, `d15221_get_dbl`/`getb_dbl`/`rebget_dbl`,
 `hole-fn-inline-list-record-stored.vl` and `map-of-records-beside-list-of-same-record.vl`.
