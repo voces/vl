@@ -11370,16 +11370,91 @@ function elabBindingWholeTy(d: i32, t: i32, k: i32): i32 {
 }
 
 // The closed type value node `x` written to binding `d` carries at instance `k`, or -1. A value
-// that reads another holder's slot takes that slot's closed fact; nothing else answers yet.
+// that reads another holder's slot takes that slot's closed fact; a call returning a list of
+// functions takes the type its returned literals are delivered at.
 function elabWrittenValueTy(d: i32, x: i32, k: i32): i32 {
   const path: string[] = []
   const h = slotOfRead(x, path)
-  if h < 0 || h == d { return -1 }
-  const st = elabSlotTyAtKey(h, path, k)
-  if st < 0 || st >= T.tys.length || !elabTyClosed(st, 0) || tyHasTyVar(st) {
+  const st = if h >= 0 && h != d { elabSlotTyAtKey(h, path, k) } else { -1 }
+  if st >= 0 && st < T.tys.length && elabTyClosed(st, 0) && !tyHasTyVar(st) {
+    return st
+  }
+  if x >= 0 && x < P.nodes.length && nodeAt(x) is Call {
+    return elabCallRetFnListTy(x, k)
+  }
+  -1
+}
+
+// The closed type of call `x` in instance `k` whose callee returns list literals of functions, or
+// of such lists, each as `elabRetFnListLitTy` reads it, all agreeing; -1 for any other call or
+// where one does not close.
+function elabCallRetFnListTy(x: i32, k: i32): i32 {
+  const c = nodeAt(x)
+  if !(c is Call) { return -1 }
+  const d = identFnDeclOf(parenPeelIx(c.callFn))
+  const fd = if d >= 0 { nodeAt(d) } else { c }
+  if !(fd is FuncDecl) { return -1 }
+  const rets: i32[] = []
+  a20RetWalk(fd.fnBody, true, rets)
+  const ck = elabCallInstFrom(x, k)
+  let t = -1
+  for r in rets {
+    const lt = elabRetFnListLitTy(parenPeelIx(r), ck)
+    if lt < 0 || t >= 0 && !tySame(t, lt) { return -1 }
+    t = lt
+  }
+  t
+}
+
+// The closed type of returned list literal `lit` of functions, or of such lists, in instance `k`:
+// its innermost element slot as the elaboration delivers it; -1 where that is not one closed
+// function type.
+export function elabRetFnListLitTy(lit: i32, k: i32): i32 {
+  if lit < 0 || lit >= P.nodes.length || !(nodeAt(lit) is ArrayLit) {
     return -1
   }
-  st
+  // Down to the innermost lists, every element a list literal at each level above them.
+  let lits: i32[] = [lit]
+  const path: string[] = ["e"]
+  let nested = true
+  while nested {
+    const inner: i32[] = []
+    let n = 0
+    for li in lits {
+      const ln = nodeAt(li)
+      if !(ln is ArrayLit) || ln.arrElems.length == 0 { return -1 }
+      for e in ln.arrElems {
+        const ex = parenPeelIx(e)
+        if ex >= 0 && ex < P.nodes.length && nodeAt(ex) is ArrayLit {
+          inner.push(ex)
+        }
+        n = n + 1
+      }
+    }
+    nested = inner.length > 0
+    if nested {
+      if inner.length != n || path.length > 8 { return -1 }
+      lits = inner
+      path.push("e")
+    }
+  }
+  const per = elabSlotPerInstance(lit, path)
+  if per && k < 0 { return -1 }
+  let ft = -1
+  for dt in elabSlotDeliveries(lit, path, if per { k } else { -1 }) {
+    if tyAt(dt) is TyFunc {
+      if ft >= 0 && !tySame(ft, dt) { return -1 }
+      ft = dt
+    }
+  }
+  if ft < 0 || !elabTyClosed(ft, 0) || tyHasTyVar(ft) { return -1 }
+  let lt = ft
+  let w = 0
+  while w < path.length {
+    lt = mkArrayTy(lt)
+    w = w + 1
+  }
+  lt
 }
 
 // `elabSlotWholeFn` binding `d` of type `t` closed from the non-null values written to it whole
