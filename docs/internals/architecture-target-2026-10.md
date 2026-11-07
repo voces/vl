@@ -3616,6 +3616,83 @@ serves only the instance's function name and its annotation text, which the step
 Which of its arms can go is graded by output, since names move bytes. An arm the scans need waits
 on the naming rule.
 
+#### The argument pin's arms, measured (2026-11-07)
+
+Instance dedupe no longer reads the pin string (previous subsection), so each arm of
+`monoArgClosedPin` (P), `monoArgTyNameCascade` (C) and `monoArgTyNameBound` (B) was graded by
+turning it off alone. Each candidate was built to its own two-level seed from the master fixpoint
+`a87d79b88` and graded by run output (exit code, stdout, message) over every program the arm
+reaches. The population is 19,338 programs plus 4,490 single-file inventory witnesses: 23,828.
+Where output held, bytes were compared too. The split with split-dep: these three functions are
+this lane's, and the one-producer redesign, `monoArgTyNameProjected` and `monoArgTyNameRep` are
+split-dep's.
+
+**Deleted: output- and byte-identical.** In each, the fallback answers the same pin.
+
+| arm | what it read | programs reaching it | case |
+|---|---|---|---|
+| P2 | `monoLitBuiltTy` → nominal (D15181) | 13 | fallback answers identically |
+| P3 | `elabArgBuiltRep` → nominal | 32 | fallback answers identically |
+| P4 | `recCopyTyOf` → nominal (D15183) | 8 | fallback answers identically |
+| P10 | function-holding closed type → `monoFnTyPin` | 65 | fallback answers identically |
+| B1 | `monoBuildTyPin` | 1 | fallback answers identically |
+| B2 | the callee's concrete return annotation | 1 | fallback answers identically |
+| B4 | an annotated local's annotation | 1 | fallback answers identically |
+| B8 | an un-annotated local's initializer, when not `i32` | 3 | fallback answers identically |
+| B17 | an un-annotated global's `""` floor | 5 | ends in the same named refusal: all 5 are rejects, with the same message |
+
+**Kept: load-bearing.** Turning the arm off moves output.
+
+| arm | what it reads | programs | off |
+|---|---|---|---|
+| P6 | a record type, not narrowed → its nominal pin | 672 | 2 runs → not-runs (D3458's witness, `named-hole-function-to-generic-callback-parameter`) |
+| C9 | a named function value → `=>` + its `fnSigKey` | 17 | 2 runs → not-runs, 8 message changes |
+| B12 | a parameter's annotation | 36 | 4 runs → not-runs, one a **compiler trap** (exit 70, `record-with-generic-fn-field-into-narrower-declared-param`) |
+| B13 | a module global's annotation | 74 | 8 runs → not-runs, 2 message changes |
+| B16 | an un-annotated global's initializer, when not `i32` | 34 | 1 message change (D15190's witness) |
+
+The redesign must preserve P6, B12 and B13. B12 off traps the compiler, so do not try it blind.
+
+**Kept: output holds, the code moves.**
+
+| arm | what it reads | programs | off |
+|---|---|---|---|
+| P8 | a narrowed record read → the record its place holds | 12 | 1 program: a parameter becomes `ref` instead of `ref null` |
+| P11 | a numeric literal union → its base scalar | 33 | 1 program: an instance splits, one more function |
+| B6 | an un-annotated local's held type (D14440) | 20 | 1 program: its struct types change |
+
+**No arm changed only a function name**, so none of these waits on the naming rule.
+
+**Never answers: 20 returns, handed to split-dep's one-producer redesign.** None of them
+answers in any of the 23,828 programs, and none is reached by its own filed witness. Turning all
+20 off together moves no output, and a 400-program sample is byte-identical wherever it builds.
+That is not enough to delete them: no program shows the fallback (the cascade's tail, then
+`monoArgTyNameBound`, `monoArgTyNameProjected` and `monoArgTyNameRep`) answering identically. The
+redesign states each one's fate: folded into the producer, or a named refusal.
+
+| return | what it reads | row |
+|---|---|---|
+| C1 | `holeLitPinOf`, a literal retyped at a hole parameter | D5840 |
+| C2 | `holeOperandI32PinTyOf`, a shared node at a boolean or literal-union hole | D2919, D2942 |
+| C3 | `argNichePinTyOf`, an `i32` niche or nullable literal union | D2998, D2985 |
+| C4 | `holeNulStringPinTyOf`, a `string \| null` hole | D3016 |
+| C5 | `loopVarArgPinTyOf`, a for-in loop variable | D3015 |
+| C6 | `litAtomPinElemTyOf`, a list literal of atoms | — |
+| C7 | a generic-application parameter annotation | D941 |
+| C8 | a fallible numeric `as?` | D1041 |
+| C10 | a function value's own signature key | — |
+| C11 | a forwarder's own closure pin | D1795 |
+| C13 | an if-arm's prelude local | D2821 |
+| B3 | the callee's inferred return | — |
+| B5 | `monoDestListPinName` of a local | — |
+| B7 | an empty-literal local | D764 |
+| B9 | a local initializer's `""` floor | — |
+| B10 | `monoCapturedDestListPin` | — |
+| B11 | `monoCapturedParamPin` | — |
+| B14 | `monoDestListPinName` of a global | — |
+| B15 | an empty-literal global | D764 |
+| B18 | `monoModuleDupPin` | — |
+
 #### Argument-keyed instances: design note (2026-11-07, for a ruling; nothing built)
 
 Five parked items share one missing fact. An instance key that says which function a function-typed

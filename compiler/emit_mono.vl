@@ -794,8 +794,7 @@ import {
 } from "./tyquery"
 import { nulNumScalarUnionName, nulNumScalarUnionRowTy } from "./check_ty_rep"
 import { tyIsWriteLandRead } from "./check_hole_pins"
-import { recFreshDeclOf } from "./check_rec_fresh"
-import { recArgRepOf, recBuildTable, recBuildTyOf } from "./check_rec_rows"
+import { recArgRepOf, recBuildTable } from "./check_rec_rows"
 import { valueUnionRetName } from "./check_ret_names"
 import {
   holeNamesTpJoin,
@@ -1826,17 +1825,6 @@ function monoAnnPinNameOfTy(ty: i32): string {
   monoAnnPinName(tyToEmitName(ty))
 }
 
-// The pin of a read of an un-annotated literal binding the record solve builds at another
-// record (`recBuildTyOf`): the instance is the one its storage is, else "".
-function monoBuildTyPin(cax: i32): string {
-  if cax < 0 || !(nodeAt(cax) is Ident) { return "" }
-  const d = recFreshDeclOf(cax)
-  if d < 0 { return "" }
-  const bt = recBuildTyOf(d)
-  if bt < 0 { return "" }
-  monoClosedTyPin(bt)
-}
-
 // The pin of closed checker type `ty`, its alias and nominal identity kept: a litunion by
 // its alias or kept spelling, a record or nullable record by its declared name, a union by
 // its registry row, else the annotation ladder over its render.
@@ -2233,12 +2221,8 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
 // argument's local, captured, parameter or module binding. "" refuses; falls to
 // `monoArgTyNameProjected` where none answers.
 function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
-  const bp = monoBuildTyPin(cax)
-  if bp != "" { return bp }
-  // A call argument whose callee has a concrete return annotation takes that annotation.
-  // Needed for a generic call used as an argument (`box(box(7))`): `buildFnMap` is
-  // post-mono, so `exprStruct` cannot classify the inner call and the type param would
-  // default to i32. The instance's already-substituted return annotation resolves it.
+  // A call argument whose callee has no return annotation takes the checker's inferred return:
+  // `buildFnMap` is post-mono, so nothing else classifies the inner call.
   const argN = nodeAt(unwrapParen(ix))
   if argN is Call && argN.callFn >= 0 {
     const argCallee = nodeAt(argN.callFn)
@@ -2255,22 +2239,7 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
       if acfe >= 0 {
         const acfn = nodeAt(fnStmts[acfe])
         if acfn is FuncDecl {
-          if acfn.fnRet >= 0 {
-            // The declared spelling again — this arm tells a concrete return from a
-            // parametric one, and a shadowed parameter reads as concrete once canon
-            // has resolved it.
-            const arn = monoDeclAnnName(
-              acfn.fnRet,
-              tyNameOf(acfn.fnRet),
-              acfn.fnTyParams,
-            )
-            if (
-              arn != ""
-              && !monoAnnHasTyParam(acfn.fnRet, -1, acfn.fnTyParams)
-            ) {
-              return arn
-            }
-          } else {
+          if acfn.fnRet < 0 {
             // An inferred return is as good a pin as an annotated one:
             // `inferRetNameOf` is the checker's own record, routed through
             // `monoAnnPinName` so the pin is one that ladder claims.
@@ -2286,9 +2255,8 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
       }
     }
   }
-  // An Ident argument bound to a generic-call result (`const inner = box(7); box(inner)`):
-  // resolve via its un-annotated `let` init, the local's type table being unbuilt mid-mono.
-  // Only a resolved non-i32 type is adopted; a param or non-let ident falls through.
+  // An Ident argument bound to an un-annotated `let` resolves through its initializer, the
+  // local's type table being unbuilt mid-mono; a param or non-let ident falls through.
   if argN is Ident {
     if fnIx >= 0 {
       const ctxFn = nodeAt(fnIx)
@@ -2297,16 +2265,6 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
         if li >= 0 {
           const ld = nodeAt(li)
           if ld is LetDecl {
-            // A struct- or struct-array-typed annotated local: read its annotation
-            // name directly. `buildLocals` is post-mono, so the `exprStruct` and
-            // `exprRefArray` cases below would default the type param to i32.
-            if ld.letType >= 0 {
-              // A composite-element list local (`xs: i32[][]`, `(i32|null)[]`) is
-              // among the spellings `monoAnnPinName` claims: the cascade below either
-              // declines it or answers one dimension short.
-              const r = monoAnnPinName(tyNameOf(ld.letType))
-              if r != "" { return r }
-            }
             if ld.letType < 0 && ld.letInit >= 0 {
               const ldp = monoDestListPinName(li, fnIx)
               if ldp != "" { return ldp }
@@ -2325,7 +2283,6 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
                 }
               }
               const innerTy = monoArgTyName(ld.letInit, fnIx)
-              if innerTy != "" && innerTy != "i32" { return innerTy }
               // A refusal propagates: `""` here is one of this ladder's explicit
               // floors, and falling through hands the question back to a cascade that
               // is post-mono blind for a local and answers `"i32"`.
@@ -2340,15 +2297,14 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
           if cpp != "" { return cpp }
         }
       }
-      // A struct-typed param argument (`g(v)` inside a generic body where `v: P`): same as
-      // the annotated-local case — read the param annotation, the locals table being unbuilt.
+      // A struct-typed param argument (`g(v)` inside a generic body where `v: P`) reads the param
+      // annotation, the locals table being unbuilt.
       const ptn = paramTypeNodeOfRead(fnIx, cax)
       if ptn >= 0 {
         const pt = nodeAt(ptn)
         if pt is TypeRef {
-          // The annotated-local arm's param twin — a generic body passing its own
-          // `xs: i32[][]` / `boolean[]` / `P` parameter on to a second generic call, the
-          // shape a generic forwarder has. One home, so the two cannot drift.
+          // A generic body passing its own `xs: i32[][]` / `boolean[]` / `P` parameter on to a
+          // second generic call, the shape a generic forwarder has.
           const r = monoAnnPinName(pt.tyName)
           if r != "" { return r }
         }
@@ -2363,21 +2319,16 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
       const gd = nodeAt(gli)
       if gd is LetDecl {
         if gd.letType >= 0 {
-          // The global's annotation, through the one pin membership list — the same
-          // call the annotated-local and param arms make, so a generic call pins its
-          // instance identically wherever its argument's binding lives.
+          // The global's annotation, through the one pin membership list the param arm uses.
           const rg = monoAnnPinName(tyNameOf(gd.letType))
           if rg != "" { return rg }
         }
-        // The un-annotated global, the other half of the local arm's pair, whose type
-        // only its initializer knows. The recursion is the local arm's verbatim,
-        // including its two rules on an `"i32"` answer and on a `""` refusal.
+        // The un-annotated global, whose type only its initializer knows; a non-`i32` answer of
+        // the initializer is the pin.
         if gd.letType < 0 && gd.letInit >= 0 {
           const gdp = monoDestListPinName(gli, -1)
           if gdp != "" { return gdp }
-          // The empty-literal rung's module-scope twin (D764) — see the local arm for the
-          // ablation and the witness. A rung added to one scope and not the other is the
-          // asymmetry this ladder exists to make unstateable.
+          // The empty-literal rung's module-scope twin (D764).
           const geln = nodeAt(gd.letInit)
           if geln is ArrayLit {
             if geln.arrElems.length == 0 {
@@ -2387,7 +2338,6 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
           }
           const ginner = monoArgTyName(gd.letInit, fnIx)
           if ginner != "" && ginner != "i32" { return ginner }
-          if ginner == "" { return "" }
         }
       }
     } else {
@@ -2411,18 +2361,6 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
 function monoArgClosedPin(ix: i32, fnIx: i32): string {
   const cax = unwrapParen(ix)
   if cax < 0 || cax >= P.nodes.length { return "" }
-  // A list or record literal the record solve built at another record pins at that build (D15181).
-  const lb = monoLitBuiltTy(cax)
-  if lb >= 0 { return monoRecordNominalPin(lb) }
-  // An argument its call's rep row binds at another record pins there, as elaboration keys it.
-  const rr = elabArgBuiltRep(cax, elabWalkTop())
-  if rr >= 0 { return monoRecordNominalPin(rr) }
-  // A call copied where it is delivered pins at the declared record its copy lands in (D15183).
-  const cpy = recCopyTyOf(cax)
-  if cpy >= 0 && cpy < T.tys.length {
-    const cn = monoRecordNominalPin(cpy)
-    if cn != "" { return cn }
-  }
   let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
   if t < 0 { t = elabArgBuiltTy(cax) }
   if t < 0 || t >= T.tys.length { return "" }
@@ -2449,7 +2387,6 @@ function monoArgClosedPin(ix: i32, fnIx: i32): string {
     }
     t = held
   }
-  if tyMayHoldFn(t, 0) { return monoFnTyPin(t) }
   // A union of numeric literals is its base scalar, which is how its values are stored.
   if tyAt(t) is TyUnion {
     const nb = numLitUnionBaseName(t)
