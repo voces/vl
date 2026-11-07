@@ -7,9 +7,13 @@ with a line in this index; the PR that moves a step also updates the target doc'
 
 Newest first:
 
+- [2026-11-07-forin-struct-row-shadow](2026-11-07-forin-struct-row-shadow.md): `forInVarStructIdx` against `repSlotOfKind`: 284 of 286 agree, both misses function-valued fields (step 3); `repSlotOfTy` not widened.
+- [2026-11-07-classifier-phase-census](2026-11-07-classifier-phase-census.md): The classifier phase census committed (`$VL_CLS_CENSUS`, `scripts/classifier-census.vl`), and its reading on master.
+- [2026-11-07-identity-typing-fact](2026-11-07-identity-typing-fact.md): Identity typing (A) slice 2a: the fact in the elaboration; 1,505 of 1,505 concrete specialization decisions read mono's declaration, byte-identical; the checker-type variant refused (16 runs lost).
+- [2026-11-07-step7-void-from-recorded](2026-11-07-step7-void-from-recorded.md): Step 7: voidness read from the recorded result, `computeVoidFns` retired.
 - [2026-11-07-fn-holding-facts](2026-11-07-fn-holding-facts.md): `elabHeldValTy`, the closed type of a function-holding value, shadowed against four mono functions: 0 differ, 2 old-only (D4515).
-- [2026-11-07-heldval-consumers](2026-11-07-heldval-consumers.md): three mono functions read `elabHeldValTy`; `monoClosedObjLitTy` deleted; 0 output movers, three guards and why.
 - [2026-11-07-identity-typing-shadow](2026-11-07-identity-typing-shadow.md): Identity typing (A) as a shadow: every specialized argument has its singleton, instance delta 0, 1,557 joins become sets.
+- [2026-11-07-pin-spelling-shadow](2026-11-07-pin-spelling-shadow.md): The naming rule's producer `monoPinSpellOf`, shadowed against every instance's pins.
 - [2026-11-07-step7-classifier-recensus](2026-11-07-step7-classifier-recensus.md): Step 7 re-census: the type-blind classifiers by caller phase; `mapRetExprShape` deleted.
 - [2026-11-07-record-literals-closed-from-bindings](2026-11-07-record-literals-closed-from-bindings.md): Record literals closed from the bindings they read (was §3.4).
 - [2026-11-07-argument-keyed-instances-design](2026-11-07-argument-keyed-instances-design.md): Argument-keyed instances: design note (was §3.4).
