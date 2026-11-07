@@ -1984,10 +1984,12 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   against the lambda's parameters in `elabNodeTy(lam, elabWalkTop())`, and the bind site also
   against the delivered name's slot fact and `elabLamDeliveredParams`.
   - `monoLamSubstParams`: an annotated parameter riding a type parameter, substituted through the
-    binding. 244 rows, 244 agree by type. Not switched: the elaboration's type agrees but its
-    annotation spelling (`monoPinAnnSpelling`) is not mono's in 5 programs (`string | null` for
-    `string|null`, a record's row name for its nominal name), and refusing on spelling loses 3
-    `tests/cases` programs. Taking the type with mono's spelling would be a guard, not a move.
+    binding. 244 rows, 244 agree by type. Switched: the parameter takes the elaboration's type,
+    spelled by `monoPinNominalSpelling` as the binders spell it (`monoPinAnnSpelling` gave `string |
+    null` and a row name in 5 programs and lost 3 `tests/cases` runs), and a substitution spelled
+    otherwise refuses. `monoSubstAnnNode` stays as the classifier (no type parameter, or one this
+    instance cannot bind) and for its two other callers, `monoCloneLambdaSubst`'s return step and
+    `monoSubstTyArgNodes`.
   - `monoPinMapLambdas` waits. Its element is already the elaboration's (`monoRecvParamElemTy`), and
     what is left is the clone. Of 1,017 rows mono clones in 64: 45 agree, 10 read `T` or `_` at the
     walk top and 9 have no answer, so switching needs the callback's parameter read per instance.
