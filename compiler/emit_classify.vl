@@ -1746,24 +1746,12 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32): boolean {
   exprNulKind(exprIx, fnIx) == "nulreflist"
 }
 
-// Binding test for a kind-18 nullable ref-array local: annotation `<ref-array> | null`, else an
-// un-annotated init that yields a nullable ref array.
-export function letIsNulRefArray(letIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("letIsNulRefArray") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = nodeAt(d.letType)
-      if lt is TypeRef {
-        // The nullable annotation's inner element row — the read counterpart of
-        // `nulRefArrayInnerSlotOfLet`'s slot; both must agree on which bindings are kind 18.
-        if annNulRefArrSlot(d.letType) >= 0 { return true }
-      }
-      return false
-    }
-    return exprNullableRefArray(d.letInit, fnIx)
-  }
-  false
+// The rep kind of the type binding `letIx` holds inside `fnIx` (`letBindTy`), or null where that
+// type has no covered rep, an open one at a generic's template included.
+function letBindRepKind(letIx: i32, fnIx: i32): VKind | null {
+  const rd = repOfTy(letBindTy(letIx, fnIx))
+  if rd.rdCovered != 1 { return null }
+  rd.rdKind
 }
 
 // The nullable distinct-backing list kind (`nulstrlist`, `nulf64list`, …) of the value at
@@ -2029,20 +2017,6 @@ export function letInitTyIsNarrowedArm(letIx: i32, fnIx: i32): boolean {
     return letInitIsBox(d.letInit, fnIx)
   }
   false
-}
-
-// The element kind of the walk variable a binding's initializer bare-reads, or null.
-function letInitLoopElemKind(letIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("letInitLoopElemKind") }
-  if letIx < 0 { return null }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    const ix = unwrapParen(d.letInit)
-    if ix < 0 { return null }
-    const e = nodeAt(ix)
-    if e is Ident { return readLoopElemKind(ix, fnIx) }
-  }
-  null
 }
 
 // The value-atom kind the identifier read at `ix` unboxes to, or -1 when it reads its cell as
@@ -2335,17 +2309,20 @@ function letInitIsBox(init: i32, fnIx: i32): boolean {
 // Whether the read `ix` in frame `fnIx` (-1 the module) is a `for-in` variable over
 // value-union-box elements.
 function readIsLoopBox(ix: i32, fnIx: i32): boolean {
-  readLoopElemKind(ix, fnIx) == "union"
+  readLoopElemRepKind(ix, fnIx) == "union"
 }
 
-// The element kind of the `for-in` loop whose variable the read `ix` in frame `fnIx`
-// (-1 the module) is, or null.
-function readLoopElemKind(ix: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("readLoopElemKind") }
+// The rep kind of the element of the `for-in` loop whose variable the read `ix` in frame `fnIx`
+// (-1 the module) is, read off the iterable's type there; null for any other read, and where the
+// element has no covered rep.
+function readLoopElemRepKind(ix: i32, fnIx: i32): VKind | null {
   const lp = readLoopNodeOf(ix, fnIx)
   if lp < 0 { return null }
   const ln = nodeAt(lp)
-  if ln is ForIn { return forInElemKind(frameBlindIter(ln.fiIter, fnIx), fnIx) }
+  if ln is ForIn {
+    const rd = repOfTy(tyStepElem(nodeTyAt(unwrapParen(ln.fiIter), fnIx)))
+    if rd.rdCovered == 1 { return rd.rdKind }
+  }
   null
 }
 
@@ -2431,9 +2408,9 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   const nsk = letInitTyNarrowedScalarKind(letIx, fnIx)
   if nsk != null { return nsk }
   if (
-    letIsF64Array(letIx, fnIx)
+    letBindRepKind(letIx, fnIx) == "f64list"
     && !letIsUnion(letIx, fnIx)
-    && !letIsNulRefArray(letIx, fnIx)
+    && letBindRepKind(letIx, fnIx) != "nulreflist"
   ) {
     return "f64list"
   }
@@ -2441,7 +2418,7 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   if (
     letIsStringArray(letIx, fnIx)
     && !letIsUnion(letIx, fnIx)
-    && !letIsNulRefArray(letIx, fnIx)
+    && letBindRepKind(letIx, fnIx) != "nulreflist"
   ) {
     return "strlist"
   }
@@ -3999,7 +3976,10 @@ export function captureValKind(fe: i32, name: string): VKind {
             if initK == nicheK { return nicheK }
             // …and a walk variable over niche elements, whose cell only the loop knows (D3139).
             if (
-              letInitLoopElemKind(b, parentBindingFrameArenaOf(fe, name))
+              readLoopElemRepKind(
+                unwrapParen(bn.letInit),
+                parentBindingFrameArenaOf(fe, name),
+              )
               == nicheK
             ) {
               return nicheK
@@ -8931,7 +8911,12 @@ export function loopVarPinTyOf(exprIx: i32, fnIx: i32): i32 {
   if t < 0 || fnIx < 0 { return -1 }
   const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return -1 }
-  if !loopVarReadIsAtom(unwrapParen(exprIx), fn.fnBody, fnIx) { return -1 }
+  // The loop's list holds `i32` cells, not string refs: its iterable's rep is no string list.
+  const lp = frameElemLoopOfRead(fn.fnBody, unwrapParen(exprIx))
+  if lp < 0 { return -1 }
+  const fl = nodeAt(lp)
+  if !(fl is ForIn) { return -1 }
+  if repOfNode(unwrapParen(fl.fiIter), fnIx).rdKind == "strlist" { return -1 }
   t
 }
 
@@ -8951,31 +8936,6 @@ export function loopVarElemPinTyOf(exprIx: i32, fnIx: i32): i32 {
     return -1
   }
   elabClosedTyAt(ix, fnIx)
-}
-
-// Whether Ident `ix` is a for-in loop variable of body `bodyIx` whose list holds `i32` cells, not
-// the string refs a literal of strings builds (D2983).
-function loopVarReadIsAtom(ix: i32, bodyIx: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("loopVarReadIsAtom") }
-  const lp = frameElemLoopOfRead(bodyIx, ix)
-  if lp < 0 { return false }
-  const fl = nodeAt(lp)
-  if fl is ForIn {
-    const it = nodeAt(unwrapParen(fl.fiIter))
-    if it is Ident {
-      const il = bodyLetOfRead(bodyIx, unwrapParen(fl.fiIter))
-      if il >= 0 {
-        const d = nodeAt(il)
-        if d is LetDecl {
-          if d.letType < 0 && d.letInit >= 0 && nodeAt(d.letInit) is ArrayLit {
-            return !arrLitIsStr(d.letInit, fnIx)
-          }
-        }
-      }
-    }
-    return true
-  }
-  false
 }
 
 // The map an `as` cast out of a union box yields (`u as! M`), or with `wantNull` the map of
@@ -10630,7 +10590,7 @@ export function letIsUnion(letIx: i32, fnIx: i32) {
       const li = unwrapParen(d.letInit)
       if li >= 0 && nodeAt(li) is Ident && nodeTyIsUnionShaped(li, fnIx) {
         if nodeTyIsBoxRep(li, fnIx) {
-          if letInitLoopElemKind(letIx, fnIx) == "union" { return true }
+          if readLoopElemRepKind(li, fnIx) == "union" { return true }
         }
       }
     }
@@ -13019,7 +12979,7 @@ export function letIsStringArray(letIx: i32, fnIx: i32) {
           if tyScalarListKind(nodeTyIxOf(d.letType)) == "strlist" {
             return true
           }
-          // A ref-array annotation is authoritative (see `letIsF64Array`) — `annBareRefArrSlot`
+          // A ref-array annotation is authoritative — `annBareRefArrSlot`
           // answers the intern-state question for spellings `annRepKindOf` leaves uncovered.
           if annBareRefArrSlot(d.letType) >= 0 { return false }
         }
@@ -13489,35 +13449,6 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
 // True if `exprIx` evaluates to an `i64[]`: a projection of `exprListRep`.
 export function exprI64Array(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "i64list"
-}
-
-// True if the `LetDecl` at `letIx` declares an `f64[]` local: its annotation is `f64[]`,
-// OR its initializer produces an f64 list. Picks the local's valtype (`(ref $fl64TypeIdx)`)
-// and the code-`12` flag in `collectLocals`.
-export function letIsF64Array(letIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("letIsF64Array") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      // Arena-first: a covered annotation's kind is the authority the three name tests below
-      // spell out — nothing else can reach the init fallback wrongly.
-      const k = annRepKindOf(d.letType)
-      if k != null {
-        if k == "f64list" { return true }
-        if k == "reflist" { return false }
-        if k == "f32list" { return false }
-      } else {
-        // An uncovered annotation still decides by its type: an `f64[]` is the f64 list, and
-        // a ref-array or `f32[]` annotation keeps the float-literal init from claiming one.
-        const sk = tyScalarListKind(nodeTyAt(d.letType, fnIx))
-        if sk == "f64list" { return true }
-        if sk == "f32list" { return false }
-        if annBareRefArrSlot(d.letType) >= 0 { return false }
-      }
-    }
-    return exprF64Array(d.letInit, fnIx)
-  }
-  false
 }
 
 // True if evaluating the expression at `exprIx` yields a nullable map ref (`{[string]: V} | null`,
