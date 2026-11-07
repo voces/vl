@@ -140,6 +140,7 @@ import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
 import {
+  cwBindingWrittenValues,
   cwFnValueDeclOf,
   cwIxBuild,
   cwIxCoveredLen,
@@ -602,6 +603,7 @@ import {
   bundleRetParamNote,
 } from "./emit_bundle"
 import {
+  repCanonId,
   repElemTyOfName,
   repRowId,
   repRowOfTyStruct,
@@ -12194,8 +12196,10 @@ let mfrUses: {[i32]: i32[]} = Map()
 let mfrNameCount: {[string]: i32} = Map()
 let mfrGen: {[i32]: boolean} = Map()
 let mfrCand: {[i32]: boolean} = Map()
-let mfrVals: {[i32]: i32[]} = Map()
-let mfrValsState: {[i32]: i32} = Map()
+// The roots of each binding the planner asked about, filled only by `monoFlowDeclVals` from the
+// elaboration's values; the root sweep and tie bookkeeping read it for planned bindings alone.
+let mfrPlannedRoots: {[i32]: i32[]} = Map()
+let mfrPlannedRootsState: {[i32]: i32} = Map()
 let mfrDirty: {[i32]: boolean} = Map()
 let mfrAnnLits: {[i32]: i32[]} = Map()
 let mfrAnnLets: i32[] = []
@@ -12235,8 +12239,8 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrNameCount = Map()
   mfrGen = Map()
   mfrCand = Map()
-  mfrVals = Map()
-  mfrValsState = Map()
+  mfrPlannedRoots = Map()
+  mfrPlannedRootsState = Map()
   mfrDirty = Map()
   mfrAnnLits = Map()
   mfrAnnLets = []
@@ -12374,21 +12378,16 @@ function monoFlowLetCalls(d: i32) {
   0
 }
 
-// The one generic written `let` `d` holds when its initializer and every whole `=` to it is a
+// The one generic written `let` `d` holds when its initializer and every write to it is a
 // read, narrowed non-null, of an un-annotated `const` bound to a map read whose stored values all
 // name it, so every read of `d` names it too (D10384), with those values pushed onto `stored`;
 // -1 otherwise.
 function monoFlowLetMapLeaf(d: i32, stored: i32[]): i32 {
   const dn = nodeAt(d)
   if !(dn is LetDecl) { return -1 }
-  const srcs: i32[] = [unwrapParen(dn.letInit)]
-  for u in mfrUses[d] ?? [] {
-    if monoFlowIsWrite(u) {
-      const w = monoFlowWholeWrite(u)
-      if w < 0 { return -1 }
-      srcs.push(unwrapParen(w))
-    }
-  }
+  const srcs: i32[] = []
+  for w in cwBindingWrittenValues(cwKeyOfDecl(d)) { srcs.push(unwrapParen(w)) }
+  if srcs.length == 0 { return -1 }
   let g = -1
   for s in srcs {
     if s < 0 || !(nodeAt(s) is Ident) { return -1 }
@@ -12797,9 +12796,9 @@ function monoFlowLeafGen(v: i32): i32 {
   -1
 }
 
-// The generic un-annotated `let` `d` holds when its initializer and every write to it, each a
-// whole `=`, name that one generic, so any read of it names it too (D9791); -1 otherwise. Inside a
-// cycle of such writes a `let` already being resolved answers -3, which agrees with any generic.
+// The generic un-annotated `let` `d` holds when its initializer and every write to it
+// (`cwBindingWrittenValues`) name that one generic, so any read of it names it too (D9791); -1
+// otherwise. Inside a cycle of such writes a `let` already being resolved answers -3.
 function monoFlowLetLeaf(d: i32): i32 {
   const dn = nodeAt(d)
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
@@ -12807,10 +12806,9 @@ function monoFlowLetLeaf(d: i32): i32 {
   mfrLetBusy[d] = true
   mfrLetDepth = mfrLetDepth + 1
   let g = monoFlowLeafGen(unwrapParen(dn.letInit))
-  for u in mfrUses[d] ?? [] {
-    if g != -1 && monoFlowIsWrite(u) {
-      const w = monoFlowWholeWrite(u)
-      const wg = if w < 0 { -1 } else { monoFlowLeafGen(unwrapParen(w)) }
+  for w in cwBindingWrittenValues(cwKeyOfDecl(d)) {
+    if g != -1 && w != dn.letInit {
+      const wg = monoFlowLeafGen(unwrapParen(w))
       if g == -3 { g = wg }
       else if wg != -3 && wg != g { g = -1 }
     }
@@ -13088,10 +13086,10 @@ function monoFlowValsOf(x: i32, out: i32[]): boolean {
 // a root is no container and `d` reached a function other than through a map read. A `.slice()`
 // copy mono rewrote to a minted spread literal holds that literal in place of its receiver's roots.
 function monoFlowDeclVals(d: i32): i32[] {
-  const st = mfrValsState[d] ?? 0
-  if st == 2 { return mfrVals[d] ?? [] }
+  const st = mfrPlannedRootsState[d] ?? 0
+  if st == 2 { return mfrPlannedRoots[d] ?? [] }
   if st != 0 { return [] }
-  mfrValsState[d] = 3
+  mfrPlannedRootsState[d] = 3
   let ev: i32[] = []
   if !mfrLitsOf(d, ev) { return [] }
   const dn = nodeAt(d)
@@ -13120,8 +13118,8 @@ function monoFlowDeclVals(d: i32): i32[] {
       return []
     }
   }
-  mfrVals[d] = ev
-  mfrValsState[d] = 2
+  mfrPlannedRoots[d] = ev
+  mfrPlannedRootsState[d] = 2
   ev
 }
 
@@ -13155,7 +13153,7 @@ function monoFlowReadsAll(lets: i32[]) {
   const again: i32[] = []
   for d in lets {
     let holds = false
-    for v in mfrVals[d] ?? [] {
+    for v in mfrPlannedRoots[d] ?? [] {
       const r = monoFlowLitRoot(v)
       for h in hosts {
         if h == r { holds = true }
@@ -13353,7 +13351,7 @@ function monoFlowTagPairs(out: i32[], d: i32, pairs: i32[]) {
 
 // Whether every literal tree binding `d` may hold is clear of a decline by another binding.
 function monoFlowDeclClean(d: i32): boolean {
-  for v in mfrVals[d] ?? [] {
+  for v in mfrPlannedRoots[d] ?? [] {
     if mfrDirty[monoFlowLitRoot(v)] ?? false { return false }
   }
   true
@@ -14421,11 +14419,11 @@ function monoFlowNoteInert(planned: i32[], through: i32[], copied: i32[]) {
   const kept: i32[] = []
   for r in copied { kept.push(r) }
   for d in through {
-    for v in mfrVals[d] ?? [] { kept.push(monoFlowLitRoot(v)) }
+    for v in mfrPlannedRoots[d] ?? [] { kept.push(monoFlowLitRoot(v)) }
   }
   for d in planned {
     if monoFlowDeclClean(d) {
-      for v in mfrVals[d] ?? [] {
+      for v in mfrPlannedRoots[d] ?? [] {
         if !i32ListHas(kept, monoFlowLitRoot(v)) { monoFlowNoteInertIn(v, 0) }
       }
     }
@@ -19436,10 +19434,11 @@ function monoLetSeedMisfits(
 // an empty list literal (`f([], d)`), from its first use that names an element: that loop
 // would bind it to the literal's `i32[]` default, which the checker never inferred (D2607).
 function monoPreBindPastEmptyLit(
+  origFe: i32,
+  callIx: i32,
   params: i32[],
   args: i32[],
   typarams: string[],
-  ctx: i32,
   tvN: string[],
   tvV: string[],
   tvT: i32[],
@@ -19451,17 +19450,13 @@ function monoPreBindPastEmptyLit(
     if tp != "" && !seen.has(tp) {
       seen[tp] = 1
       if monoBindOf(tvN, tvV, tp) == "" && monoArgIsEmptyLit(args[i]) {
-        monoBindFromLaterArg(
-          tp,
-          i + 1,
-          params,
-          args,
-          typarams,
-          ctx,
-          tvN,
-          tvV,
-          tvT,
-        )
+        const et = monoElabBindTy(origFe, callIx, tp)
+        const sp = if et >= 0 { monoPinNominalSpelling(et) } else { "" }
+        if sp != "" {
+          tvN.push(tp)
+          tvV.push(sp)
+          monoTvTyLast(tvN, tvT, et)
+        }
       }
     }
     i = i + 1
@@ -19469,47 +19464,26 @@ function monoPreBindPastEmptyLit(
   0
 }
 
-// Binds `tp` from the first argument at or after `from` whose parameter rides it bare and
-// which is not an empty list literal. Binds nothing when no such argument names an element.
-function monoBindFromLaterArg(
-  tp: string,
-  from: i32,
-  params: i32[],
-  args: i32[],
-  typarams: string[],
-  ctx: i32,
-  tvN: string[],
-  tvV: string[],
-  tvT: i32[],
-) {
-  let j = from
-  while j < args.length && j < params.length {
-    const pj = nodeAt(params[j])
-    if pj is Param {
-      if (
-        monoParamBareTyParam(params[j], typarams) == tp
-        && !monoArgIsEmptyLit(args[j])
-      ) {
-        const annj = monoDeclAnnName(pj.parType, tyNameOf(pj.parType), typarams)
-        const an = monoArgPinName(args[j], ctx)
-        if an == "" { return 0 }
-        let bind = an
-        const pinTy = monoArgPinTyIx(args[j], ctx)
-        let bindTy = monoArgClosedTyIn(args[j], ctx, pinTy)
-        if annj != tp {
-          if !monoTyIsArrayShaped(bindTy, pinTy) { return 0 }
-          bind = listElemNameOf(an)
-          bindTy = tyArrayElemIx(bindTy)
-        }
-        tvN.push(tp)
-        tvV.push(bind)
-        monoTvTyLast(tvN, tvT, bindTy)
-        return 0
-      }
+// The closed type the elaboration binds type parameter `tp` to at call `callIx` of the template
+// in slot `origFe`, under the instance being walked; -1 for a call it did not key, a value
+// declaration, or a binding that stays open.
+function monoElabBindTy(origFe: i32, callIx: i32, tp: string): i32 {
+  if origFe < 0 || origFe >= monoOrigNode.length { return -1 }
+  const d = monoOrigNode[origFe]
+  const tc = monoCallTplOf(callIx)
+  if tc < 0 || elabDeclIsValue(d) { return -1 }
+  const k = elabWalkKeyOf(tc, true, d)
+  if k < 0 || k >= ekNames.length || k >= ekTys.length { return -1 }
+  let i = 0
+  while i < ekNames[k].length && i < ekTys[k].length {
+    if ekNames[k][i] == tp {
+      const t = ekTys[k][i]
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -1 }
+      return t
     }
-    j = j + 1
+    i = i + 1
   }
-  0
+  -1
 }
 
 // The index in `ms` of the one member naming a type parameter in `typarams`, or -1 when none or
@@ -21059,9 +21033,18 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       // the two orders agree, so they differ only when one answer is a type variable.
       const declTys = monoDeclParamTys(origFe, params.length)
       if monoCallGenFnToTyParamArrow(params, args, fn.fnTyParams, ctx) {
-        monoPreBindNonArrowArgs(fn, params, args, ctx, tvN, tvV, tvT, declTys)
+        monoPreBindNonArrowArgs(origFe, callIx, fn, params, args, tvN, tvV, tvT)
       }
-      monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV, tvT)
+      monoPreBindPastEmptyLit(
+        origFe,
+        callIx,
+        params,
+        args,
+        fn.fnTyParams,
+        tvN,
+        tvV,
+        tvT,
+      )
       if monoTwoListArgFail(fn, params, args, ctx) < 0 { return -1 }
       monoPreBindPastUnionRest(
         params,
@@ -21161,6 +21144,30 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         return -1
       }
       callBindShadowNote(callIx, fn.fnName, fn.fnTyParams, tvN, tvV)
+      // The elaboration's binding replaces a closed one of another representation; one of the
+      // same representation keeps mono's spelling, and one mono left open stays mono's.
+      for tp in fn.fnTyParams {
+        const et = monoElabBindTy(origFe, callIx, tp)
+        let j = 0
+        while et >= 0 && j < tvN.length && j < tvV.length && j < tvT.length {
+          const mt = tvT[j]
+          if (
+            tvN[j] == tp
+            && mt >= 0
+            && mt < T.tys.length
+            && !tyHasTyVar(mt)
+            && !tySame(mt, et)
+            && repCanonId(mt) != repCanonId(et)
+          ) {
+            const sp = monoPinNominalSpelling(et)
+            if sp != "" {
+              tvT[j] = et
+              tvV[j] = sp
+            }
+          }
+          j = j + 1
+        }
+      }
       monoExactPinTys(pinTys, ctx)
       const pinKinds: i32[] = []
       monoBuildPinCol(pinned, pinKinds)
@@ -21191,38 +21198,40 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
   0
 }
 
-// Binds `fn`'s type parameters from the concrete arguments at its non-arrow annotations.
+// Binds `fn`'s type parameters each non-arrow annotation of call `callIx` mentions, ahead of the
+// first-use loop, at the elaboration's binding for the call (D58).
 function monoPreBindNonArrowArgs(
+  origFe: i32,
+  callIx: i32,
   fn: FuncDecl,
   params: i32[],
   args: i32[],
-  ctx: i32,
   tvN: string[],
   tvV: string[],
   tvT: i32[],
-  declTys: i32[],
 ) {
   let pb = 0
-  while pb < args.length {
+  while pb < args.length && pb < params.length {
     const pbp = nodeAt(params[pb])
-    if pbp is Param {
-      if pbp.parType >= 0 {
-        // The ARROW parameters are the ones whose binding is in question; every other
-        // annotation reads its type off the argument the call actually passes, except a literal
-        // of generics, which takes the type the others bind (D10250).
+    // The ARROW parameters are the ones whose binding is in question, and a literal of generics
+    // takes the type the others bind (D10250).
+    if (
+      pbp is Param
+      && pbp.parType >= 0
+      && !monoAnnIsFnSlot(pbp.parType)
+      && !monoLitHoldsGenericFn(args[pb], 0)
+    ) {
+      for tp in fn.fnTyParams {
         if (
-          !monoAnnIsFnSlot(pbp.parType)
-          && !monoLitHoldsGenericFn(args[pb], 0)
+          monoBindOf(tvN, tvV, tp) == ""
+          && monoAnnHasTyParam(pbp.parType, -1, [tp])
         ) {
-          if monoAnnHasTyParam(pbp.parType, -1, fn.fnTyParams) {
-            monoBindArenaFullTys(
-              monoParamPatTy(params, pb, declTys),
-              monoExactPinTyOf(monoArgPinTyIx(args[pb], ctx), ctx),
-              fn.fnTyParams,
-              tvN,
-              tvV,
-              tvT,
-            )
+          const et = monoElabBindTy(origFe, callIx, tp)
+          const sp = if et >= 0 { monoPinNominalSpelling(et) } else { "" }
+          if sp != "" {
+            tvN.push(tp)
+            tvV.push(sp)
+            monoTvTyLast(tvN, tvT, et)
           }
         }
       }
@@ -21793,22 +21802,6 @@ function monoPinHoleParam(
     if it >= 0 && it < T.tys.length && !tyHasTyVar(it) {
       an = if tyHoldsObj(it, 8) { monoRecordRowPin(it) } else { monoPinOfClosedTy(it) }
       if an != "" { anTy = it }
-    }
-  }
-  // Else an argument the checker types closed, with no type variable or hole, pins at that
-  // type, the same at every instance; a record at the row it is built at.
-  if an == "" {
-    const own = nodeTyIxOf(unwrapParen(args[i]))
-    if (
-      own >= 0
-      && own < T.tys.length
-      && !tyHasTyVar(own)
-      && !tyReachesHole(own, 16)
-    ) {
-      const bt = if tyHoldsObj(own, 8) { monoArgBuildTy(unwrapParen(args[i]), ctx) } else { 0 - 1 }
-      const rt = if bt >= 0 { bt } else { own }
-      an = if tyHoldsObj(rt, 8) { monoRecordRowPin(rt) } else { monoPinOfClosedTy(rt) }
-      if an != "" { anTy = rt }
     }
   }
   if an == "" {

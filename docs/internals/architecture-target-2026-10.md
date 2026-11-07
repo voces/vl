@@ -1797,6 +1797,12 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   on master (a decline, not a refusal). Two different generics in one map of records join field-wise
   and run (D15493); written by `.set`, a record literal is not admitted, so that spelling refuses.
 
+The `r5_rt` rung itself is deleted. Re-measured after D15531 it fired 15 times over `tests/cases`
+(11 function-holding pins in D9480's fixture, G5's, the stored-through-parameter file and the `?.`
+decline; 4 `i32` pins of un-annotated helpers), and in every one `monoArgPinName` answers the same
+pin: without the rung every fixture and the compiler's own build are byte-identical, the corpus and
+the filed witnesses do not move. The residuals above stay where they are, served by that fallback.
+
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
 not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
@@ -1975,6 +1981,37 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   refusal is reached by none. It is class (c) mechanics over mono's own instance registry, and
   goes with that registry, not with a fact.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
+  The hub is the binding `monoInstantiateCallIn` hands `monoMakeInstance` (`tvN` / `tvV` / `tvT`),
+  against `ekTys` at the key the elaboration made for the call (`elabWalkKeyOf`, which already
+  keys the instance). Shadowed (2026-11-07, 23,384 programs) where the binding is final, by type
+  (same type or same representation): agree 4,978 programs, differ 20, mono only 13, elaboration
+  only 9, neither 92 (mostly function-signature pins left open on both sides), and 10 more where mono
+  holds only a spelling. Switched: a closed elaboration binding replaces a closed mono binding of
+  another representation; one of the same representation keeps mono's spelling, and one mono
+  leaves open or unbound stays mono's. The 20 differ programs print the same output and build the
+  same bytes either way, because the value reaches nothing that lowers: the pins and the
+  elaboration-keyed instance key carry it. They are the cells a later producer deletion has to keep
+  byte-identical, and they are re-graded by output at each one:
+  - a declared record against the literal's own shape (`V` / `{y: i32, x: i32}`, `Circle` /
+    `{r: null}`, `Circle` / `K`, `J` / `{f: i32}`): `modules/overload-generic-fresh-binding-runs`,
+    `soundness/mixed-instance-unrelated-arguments-runs.vl`, `soundness/mixed-instance-list-reach-runs.vl`,
+    `soundness/fresh-literal-at-generic-placed-in-wider-field-runs.vl`,
+    `soundness/fresh-literal-at-generic-delivered-wider-runs.vl`,
+    `soundness/bound-record-built-wider-at-unpinned-generic-runs.vl`,
+    `generics/hole-instance-typed-at-binding-stored-at-build.vl`, named `d15172_viafield` and
+    `d15172_listviafield`, D14760, D15184, D15210;
+  - a map mono leaves holed (`{[_]: _}` / `{[string]: i32}`): `generics/empty-map-to-bare-type-parameter.vl`, D1887;
+  - `void` or `null` against `never`: `functions/never-function-value.vl`,
+    `functions/never-generic-pin-traps.vl`, D3178;
+  - `i32 | null` against `i32`: `generics/recursion-at-same-type-runs.vl`, D14581;
+  - a literal union whose two renders print empty: `literal-unions/one-literal-list-container-generic.vl`.
+
+  `monoPreBindPastEmptyLit` and `monoPreBindNonArrowArgs` bind from the elaboration's key, and
+  `monoBindFromLaterArg` is deleted. Their shadows: the empty-literal pre-bind agrees in all 3
+  programs that reach it, and the non-arrow pre-bind agrees in 40 of 46, binds nothing in 5, and is
+  mono only in 1 (`closures/fn-value-generic-nullable-fn-param.vl`), which prints the same without it.
+  The per-argument pins are a separate fact (the argument's representation, per union arm) and
+  wait for the producers.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
 - [ ] **value returns** (7): `monoFlowRetVals` 8,077, `monoFlowConstCallArgs` 8,064, `monoFlowAnnLits` 6,049, `monoDeliverCallRets` 1,021, `monoFlowCallLeafAt` 175, `monoIfBoundRetAtPin` 24, `monoFlowCallLeaf` 0.
 - [x] **instance result** (10): ~~`monoRetRecordOf` 8,023~~, ~~`monoRetRepOf` 7,745~~, ~~`monoPinCallRecord` 6,765~~, ~~`monoPinInPlaceCallRecord` 6,763~~, ~~`monoReturnedBundlePin` 6,538~~, `monoPinnedRetAnnTy` 505 (switched, #6511), ~~`monoCallInstRetTy` 205~~, ~~`monoRetConstRecord` 66~~, ~~`monoInstRetLitTy` 34~~, ~~`monoInstAnnRetTy` 26~~. #6498 deleted the record-pin four, #6511 the instance-literal pair, and the delivered-rep fact the rest (below).
@@ -2018,8 +2055,23 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   of one lambda, are the calls the `monoFlowReads` rewrite repoints, which the cad lane records
   after B2; then `monoLitReachesNoCall`, `monoValsReachNoCall` and `monoValsInert` go.
 
-The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
-with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
+The unbound default, which every program reaches through `monoElabDefaultsPrime`, is the reach
+lane's. The cad lane takes slot deliveries, then node type, then slot type.
+
+**The unbound default, measured** (2026-11-07, master `75101d46`). The D4551 default is the
+elaboration's: `ELAB_TP_DEFAULT` and `elabTpDefaulted` (#6569), after its call reach was made to
+see into callees before collect runs (#6563). The uncalled slots already read it
+(`elabUncalledSlotTy`). Two parts stay in mono, for different reasons:
+
+- `monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy` answer a narrower question than the
+  elaboration's parameter binding `elabCallParamTyFrom`: the instance a hole generic's slot delivery
+  fixes. Shadowed at `monoHoleGenFnPin` over 23,103 programs, 38 agree, 0 differ and 2 answer where
+  the elaboration has none, but at 1,308 more pins mono leaves the type open while
+  `elabCallParamTyFrom` is closed. The replacement is a fact of that narrower question, which must
+  decline at all 1,308, with the D6542 empty-list `i32` a named default beside `ELAB_TP_DEFAULT`.
+- `monoDefaultTyParamsOnlyGenFns` is a per-call rule (a type parameter named only by function slots
+  handed generic values) that no elaboration fact states. It fires at 10 calls in 4 files; the
+  call binding `elabCallBindTy` is the default at 8 and absent at 2 inside a generic body.
 
 **Slot type, map values switched** (2026-11-06). `monoPinMapValues` takes the map's type from
 `elabSlotTyAt` wherever it closes; `monoPinMapSlot` only instances the stored values at it, and a
@@ -2038,6 +2090,26 @@ types) join its grading list. The last two (`inRecord`: a written `let` of neste
 instance) need a nested member read from its instances under the key; that admits the fact but mints
 late demands for the lambdas, so it waits until the run foresees them. No byte moves over 19,318
 programs.
+
+**Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
+binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
+and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
+an instance clone's nodes postdate the write index, whose parent table traps on them. The shadow
+read 21 agree, 0 disagree and 156 mono-only. A capture cell `E[]` agrees with a value fact `E`, and
+mono's cell is kept (#6573).
+
+**Slot type, a named generic handed through a set** (2026-11-07). In `for f in fs { f(snd) }` the
+holder's member `apply2(g)` has an instance whose `g` holds `snd`'s identity, `((_, _) => _)`, and the
+pushed lambda `(g) => print(g("z", k))` is not top-level, so the holder declined. A call through a
+set now records the generic declaration an open argument names (`fnSetCallGenAt`). A member's open
+parameter closes to that generic's instance at the calls the member makes of it. A lambda member
+reads those calls under each instance key of the function holding it. The parameter must be read
+only as a callee and every call must agree, else it declines. The 8 list holders of D12940's
+family now agree with mono, with no byte moves over 19,318 programs. Not closed by this:
+`functions/exported-generic-reached-through-lambda-field-or-list-called.vl`, whose element returns
+the generic (`(() => ((T) => T))[]`), and the 2 holders of
+`closures/hole-fn-generic-pushed-list-spread.vl`. There the generic itself is the member, called
+at two types, so they go to the reach lane's bundle fact.
 
 **Slot deliveries, the reach rung deleted** (2026-11-06). `monoDeclPathPinsOrReach` and
 `monoStoredSlotFnTy` fell back to value reach (`vrCalleeTy`) where the elaboration's slot pins were
@@ -2447,6 +2519,20 @@ since the inert walk marks the site that writes the generic, and anything else a
 roots, which deletes `monoFlowReadElem`. The alias-write walk (D9651, D9440) stays in mono as
 syntax. Each step graded alone against master's fixpoint: 0 moved, after the two fixes the first
 cut needed (a push blamed on its value, not its call; a map's inert site lost to its root).
+
+**B2b, part 2b, and what stays in mono** (2026-11-07). `monoFlowLetLeaf` and `monoFlowLetMapLeaf`
+read a `let`'s initialiser and writes from `cwBindingWrittenValues` (0 moved each). That ends B2's
+value derivations. What stays is class (c), and why:
+- `mfrPlannedRoots` (was `mfrVals`) is planner state: `monoFlowDeclVals` fills it from the
+  elaboration, and the root sweep and tie bookkeeping read only planned bindings, so it is not a cache
+  of every binding's roots.
+- `monoFlowAliasReadVals`, `monoFlowRetLocalLists` and `monoFlowRetUse` classify a use by syntax over
+  elaboration values; `monoFlowElemsGen` reads elements and the write index and keeps the spread
+  ties (D9482).
+- `mfrCand` and `mfrGen` are decided by syntax, plus one elaboration fact (`fnTagListTy`, a tagged
+  set's id list is no candidate); no member is added on mono's own type judgement.
+- The inert walk's as-written map site stays only as long as the inert walk, which leaves with the
+  inertness change to `elabSlotUncalled`.
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
