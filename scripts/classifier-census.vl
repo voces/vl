@@ -1,0 +1,607 @@
+// The classifier phase census: per type-blind classifier in `compiler/emit_classify.vl`, how
+// many calls it takes before and after monomorphize over the sweep population, and with
+// `--callers` which call sites make the pre-monomorphize ones (step 7,
+// docs/internals/architecture-target-2026-10.md).
+//
+//     vl run scripts/classifier-census.vl -- [--compiler <seed>] [--population P] [--shard K/N]
+//         [--callers] [--top N] [--rows <file.tsv>] [--keep <dir>]
+//
+// The population is `scripts/sweep.vl -- list`'s; each program is compiled by `vl check
+// --codegen` under `$VL_CLS_CENSUS=1`, `$JOBS` chunks of 100 at a time, each chunk writing
+// its own rows file. `--callers` first builds a probe compiler in scratch whose classifier
+// calls carry a site number (`compiler/emit_cls_census.vl`). Run from the checkout root.
+
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import { join, split, startsWith, trim } from "std:str"
+import {
+  die,
+  envOr,
+  exists,
+  fanOutArgv,
+  findFrom,
+  splitLines,
+} from "./lib/common"
+import {
+  cwd,
+  makeTempDir,
+  padLeft,
+  padRight,
+  readText,
+  sortStrings,
+  spawn,
+  writeText,
+} from "./lib/corpus"
+import { jobsFromEnv } from "./lib/census-grade"
+import { isWord } from "./lib/ladder-walk"
+
+const TOOL = "classifier-census"
+const CLASSIFY = "compiler/emit_classify.vl"
+const PROBE = "if clsCensusOn { clsCensusEnter(\""
+const CHUNK = 100
+const USAGE = "usage: vl run scripts/classifier-census.vl -- [--compiler <seed>] [--population P] [--shard K/N] [--callers] [--top N] [--rows <file.tsv>] [--keep <dir>]"
+
+// The phases before monomorphize has finished; every later phase counts as post.
+function isPre(phase: string): boolean {
+  phase == "passes" || phase == "monomorphizing"
+}
+
+function flagArg(args: string[], flag: string, dflt: string): string {
+  let k = 0
+  while k < args.length {
+    if args[k] == flag {
+      if k + 1 >= args.length { die("\{TOOL}: \{flag} needs a value", 2) }
+      return args[k + 1]
+    }
+    k = k + 1
+  }
+  dflt
+}
+
+function hasArg(args: string[], flag: string): boolean {
+  for a in args {
+    if a == flag { return true }
+  }
+  false
+}
+
+// The classifiers the census counts: every name `emit_classify.vl` carries a probe for.
+function probed(): string[] {
+  const out: string[] = []
+  for ln in splitLines(readText(CLASSIFY)) {
+    const at = ln.indexOf(PROBE)
+    if at < 0 { continue }
+    const from = at + PROBE.length
+    const end = findFrom(ln, "\"", from)
+    if end > from { out.push(ln.slice(from, end)) }
+  }
+  out
+}
+
+// The classifiers `rep-classifier-census.vl` finds in `emit_classify.vl` that read no
+// ARENA producer: the population the probes are meant to cover.
+function typeBlind(vl: string): string[] {
+  const p = spawn(
+    vl,
+    ["run", "scripts/rep-classifier-census.vl", "--", "--json"],
+  )
+  if p.code != 0 {
+    die("\{TOOL}: rep-classifier-census failed:\n" + p.out + p.err, 1)
+  }
+  const out: string[] = []
+  let fname = ""
+  let file = ""
+  let arena = false
+  let inReads = false
+  for raw in splitLines(p.out) {
+    const ln = raw.trim()
+    if startsWith(ln, "\"fn\": ") {
+      fname = ln.slice(7, ln.length - 2)
+      file = ""
+      arena = false
+    } else if startsWith(ln, "\"file\": ") {
+      file = ln.slice(9, ln.length - 2)
+    } else if startsWith(ln, "\"reads\": []") {
+      if file == CLASSIFY { out.push(fname) }
+    } else if startsWith(ln, "\"reads\": [") {
+      inReads = true
+    } else if inReads && startsWith(ln, "]") {
+      inReads = false
+      if file == CLASSIFY && !arena { out.push(fname) }
+    } else if inReads && ln.indexOf("\"ARENA\"") >= 0 {
+      arena = true
+    }
+  }
+  out
+}
+
+// ── the probe compiler: one site number per classifier call (`--callers`) ──────────
+
+// One numbered call site: the file, the 1-based line, and the top-level function holding it.
+type Site = { file: string, line: i32, caller: string }
+
+// The index just past the string or character literal opening at `i`.
+function skipQuoted(s: string, i: i32): i32 {
+  const q = s[i]
+  let k = i + 1
+  while k < s.length && s[k] != q {
+    if s[k] == '\\' { k = k + 1 }
+    k = k + 1
+  }
+  k + 1
+}
+
+// The index just past the line comment, string or character literal at `i`, or `i`.
+function skipInert(s: string, i: i32): i32 {
+  if s[i] == '"' || s[i] == '\'' { return skipQuoted(s, i) }
+  if s[i] == '/' && i + 1 < s.length && s[i + 1] == '/' {
+    const nl = findFrom(s, "\n", i)
+    if nl < 0 { return s.length }
+    return nl
+  }
+  i
+}
+
+// The `[lo, hi]` pairs of the arguments of the call whose `(` is at `open`, flattened, with a
+// trailing empty argument dropped.
+function argSpans(s: string, open: i32): i32[] {
+  const out: i32[] = []
+  let depth = 0
+  let k = open + 1
+  let lo = k
+  while k < s.length {
+    const j = skipInert(s, k)
+    if j != k {
+      k = j
+      continue
+    }
+    const c = s[k]
+    if c == '(' || c == '[' || c == '{' {
+      depth = depth + 1
+    } else if c == ')' || c == ']' || c == '}' {
+      if depth == 0 {
+        if trim(s.slice(lo, k)) != "" {
+          out.push(lo)
+          out.push(k)
+        }
+        return out
+      }
+      depth = depth - 1
+    } else if c == ',' && depth == 0 {
+      out.push(lo)
+      out.push(k)
+      lo = k + 1
+    }
+    k = k + 1
+  }
+  out
+}
+
+// The wrapper that marks a site through an argument of type `ty`, or "" when none fits.
+function wrapperOf(ty: string): string {
+  if ty == "i32" { return "clsCensusAtI" }
+  if ty == "boolean" { return "clsCensusAtB" }
+  if ty == "string" { return "clsCensusAtS" }
+  ""
+}
+
+// How a call of `fname` marks its site: `<wrapper>\t<argument index>` for its last parameter
+// a wrapper fits, from its declaration in `src`, or "" when none does. The last one is taken
+// so that no later argument can enter another classifier before the call.
+function wrapSlot(src: string, fname: string): string {
+  const at = findFrom(src, "function " + fname + "(", 0)
+  if at < 0 { return "" }
+  const sp = argSpans(src, at + 9 + fname.length)
+  let i = sp.length / 2 - 1
+  while i >= 0 {
+    const p = src.slice(sp[2 * i], sp[2 * i + 1])
+    const colon = findFrom(p, ":", 0)
+    if colon >= 0 {
+      const w = wrapperOf(trim(p.slice(colon + 1, p.length)))
+      if w != "" { return w + "\t" + toString(i) }
+    }
+    i = i - 1
+  }
+  ""
+}
+
+// The name of the top-level function whose header precedes `i` in `s`, or "<top>".
+function callerAt(s: string, i: i32): string {
+  let k = i
+  while k > 0 {
+    let nl = k - 1
+    while nl >= 0 && s[nl] != '\n' { nl = nl - 1 }
+    const ls = nl + 1
+    let h = ls
+    if startsWith(s.slice(ls, ls + 7), "export ") { h = ls + 7 }
+    if startsWith(s.slice(h, h + 9), "function ") {
+      let e = h + 9
+      while e < s.length && isWord(s[e]) { e = e + 1 }
+      return s.slice(h + 9, e)
+    }
+    if nl < 0 { break }
+    k = nl
+  }
+  "<top>"
+}
+
+// `src` with every call of a name in `wrap` marking its site; the sites are appended to
+// `sites` and the wrappers used to `used`.
+function rewrite(
+  file: string,
+  src: string,
+  wrap: Map<string, string>,
+  sites: Site[],
+  used: Map<string, boolean>,
+): string {
+  const edits: i32[] = []
+  const names: string[] = []
+  let line = 1
+  let k = 0
+  while k < src.length {
+    const j = skipInert(src, k)
+    if j != k {
+      let q = k
+      while q < j {
+        if src[q] == '\n' { line = line + 1 }
+        q = q + 1
+      }
+      k = j
+      continue
+    }
+    if src[k] == '\n' { line = line + 1 }
+    if isWord(src[k]) && (k == 0 || !isWord(src[k - 1])) {
+      let e = k
+      while e < src.length && isWord(src[e]) { e = e + 1 }
+      const slot = wrap[src.slice(k, e)]
+      const decl = k >= 9 && src.slice(k - 9, k) == "function "
+      if slot != null && e < src.length && src[e] == '(' && !decl {
+        const ws = split(slot, "\t")
+        const w = ws[0]
+        const ai = parseI32(ws[1]) ?? 0
+        const sp = argSpans(src, e)
+        if 2 * ai + 1 < sp.length {
+          edits.push(sp[2 * ai])
+          edits.push(sp[2 * ai + 1])
+          names.push(w + "(" + toString(sites.length) + ", ")
+          used[w] = true
+          sites.push({ file: file, line: line, caller: callerAt(src, k) })
+        }
+      }
+      k = e
+      continue
+    }
+    k = k + 1
+  }
+  // Opens and closes are applied together, ordered by position, so nested calls compose.
+  const marks: i32[] = []
+  const texts: string[] = []
+  let n = 0
+  while n < names.length {
+    marks.push(edits[2 * n])
+    texts.push(names[n])
+    marks.push(edits[2 * n + 1])
+    texts.push(")")
+    n = n + 1
+  }
+  const order = sortedMarks(marks, texts)
+  let out = ""
+  let at = 0
+  for o in order {
+    out = out + src.slice(at, marks[o]) + texts[o]
+    at = marks[o]
+  }
+  out + src.slice(at, src.length)
+}
+
+// The indices of `marks` by position; at one position every `)` comes before an open.
+function sortedMarks(marks: i32[], texts: string[]): i32[] {
+  const ix: i32[] = []
+  let m = 0
+  while m < marks.length {
+    ix.push(m)
+    m = m + 1
+  }
+  // Insertion sort: stable, so opens at one position keep their outer-first order.
+  let i = 1
+  while i < ix.length {
+    const v = ix[i]
+    let j = i - 1
+    while j >= 0 && markAfter(marks, texts, ix[j], v) {
+      ix[j + 1] = ix[j]
+      j = j - 1
+    }
+    ix[j + 1] = v
+    i = i + 1
+  }
+  ix
+}
+
+function markAfter(marks: i32[], texts: string[], a: i32, b: i32): boolean {
+  if marks[a] != marks[b] { return marks[a] > marks[b] }
+  texts[a] != ")" && texts[b] == ")"
+}
+
+// Builds the probe compiler into `dir`/probe.wasm and returns its call sites.
+function buildProbe(
+  vl: string,
+  seed: string,
+  dir: string,
+  fns: string[],
+): Site[] {
+  const tree = dir + "/tree"
+  spawn("mkdir", ["-p", tree])
+  const cp = spawn("cp", ["-r", "compiler", tree + "/"])
+  if cp.code != 0 { die("\{TOOL}: cannot copy compiler/: " + cp.err, 1) }
+  writeText(tree + "/deno.json", "{}\n")
+  const csrc = readText(CLASSIFY)
+  const wrap: Map<string, string> = Map()
+  let skipped = 0
+  for f in fns {
+    const w = wrapSlot(csrc, f)
+    if w == "" { skipped = skipped + 1 } else { wrap[f] = w }
+  }
+  const ls = spawn("sh", ["-c", "ls compiler/*.vl"])
+  const sites: Site[] = []
+  for file in splitLines(ls.out) {
+    if file == "" || file == "compiler/emit_cls_census.vl" { continue }
+    const src = readText(file)
+    const used: Map<string, boolean> = Map()
+    const out = rewrite(file, src, wrap, sites, used)
+    if used.length == 0 { continue }
+    const imp = "import { "
+      + join(sortStrings(used.keys()), ", ")
+      + " } from \"./emit_cls_census\"\n"
+    writeText(tree + "/" + file, imp + out)
+  }
+  if skipped > 0 {
+    print(
+      "\{TOOL}: \{toString(skipped)} classifiers take no argument a wrapper fits; their sites read -1",
+    )
+  }
+  const b = spawn(
+    "timeout",
+    [
+      "900",
+      vl,
+      "build",
+      tree + "/compiler/entry.vl",
+      "--compiler",
+      seed,
+      "-o",
+      dir + "/probe.wasm",
+    ],
+  )
+  if b.code != 0 {
+    die("\{TOOL}: the probe compiler did not build:\n" + b.out + b.err, 1)
+  }
+  sites
+}
+
+// ── the census ─────────────────────────────────────────────────────────────────────
+
+// One classifier's totals: calls before and after monomorphize, files reached, and its
+// pre-monomorphize calls by caller.
+type Tally = {
+  pre: i32,
+  during: i32,
+  post: i32,
+  files: Map<string, boolean>,
+  callers: Map<string, i32>,
+}
+
+function tallyOf(t: Map<string, Tally>, f: string): Tally {
+  const have = t[f]
+  if have != null { return have }
+  const n: Tally = { pre: 0, during: 0, post: 0, files: Map(), callers: Map() }
+  t[f] = n
+  n
+}
+
+function classOf(t: Tally): string {
+  if t.pre == 0 && t.post == 0 { return "uncalled" }
+  if t.pre == 0 { return "post-only" }
+  if t.post == 0 { return "pre-only" }
+  "both"
+}
+
+// The `n` callers with the most calls, as `name count` pairs.
+function topCallers(m: Map<string, i32>, n: i32): string {
+  const ks = sortStrings(m.keys())
+  const out: string[] = []
+  const taken: Map<string, boolean> = Map()
+  while out.length < n && out.length < ks.length {
+    let best = ""
+    let bestN = -1
+    for k in ks {
+      const c = m[k] ?? 0
+      if taken[k] == null && c > bestN {
+        best = k
+        bestN = c
+      }
+    }
+    taken[best] = true
+    out.push(best + " " + toString(bestN))
+  }
+  join(out, ", ")
+}
+
+function main(args: string[]): i32 {
+  if hasArg(args, "--help") {
+    print(USAGE)
+    return 0
+  }
+  const abs = cwd()
+  const vl = envOr("VL", abs + "/scripts/vl-host/target/release/vl")
+  let seed = flagArg(args, "--compiler", "build/vl-compiler.wasm")
+  if !startsWith(seed, "/") { seed = abs + "/" + seed }
+  if !exists(seed) { die("\{TOOL}: no seed at \{seed}", 2) }
+  const pop = flagArg(args, "--population", "all")
+  const top = parseI32(flagArg(args, "--top", "3")) ?? 3
+  const rowsOut = flagArg(args, "--rows", "")
+  const keep = flagArg(args, "--keep", "")
+  const callers = hasArg(args, "--callers")
+
+  const fns = probed()
+  const want = typeBlind(vl)
+  const have: Map<string, boolean> = Map()
+  for f in fns { have[f] = true }
+  const wanted: Map<string, boolean> = Map()
+  for f in want {
+    wanted[f] = true
+    if have[f] == null {
+      print("\{TOOL}: \{f} reads no ARENA producer and has no probe")
+    }
+  }
+  for f in fns {
+    if wanted[f] == null {
+      print("\{TOOL}: \{f} has a probe but reads an ARENA producer")
+    }
+  }
+
+  let root = keep
+  if root == "" { root = makeTempDir() } else { spawn("mkdir", ["-p", root]) }
+  let compiler = seed
+  let sites: Site[] = []
+  if callers {
+    sites = buildProbe(vl, seed, root, fns)
+    compiler = root + "/probe.wasm"
+  }
+
+  const shard = flagArg(args, "--shard", "1/1")
+  const ls = spawn(
+    vl,
+    [
+      "run",
+      "scripts/sweep.vl",
+      "--",
+      "list",
+      "--population",
+      pop,
+      "--shard",
+      shard,
+    ],
+  )
+  if ls.code != 0 {
+    die("\{TOOL}: sweep.vl list failed:\n" + ls.out + ls.err, 1)
+  }
+  const files: string[] = []
+  for l in splitLines(ls.out) {
+    const t = l.split("\t")
+    if t.length == 3 { files.push(t[1]) }
+  }
+  const chunks: string[] = []
+  let at = 0
+  while at < files.length {
+    const ch = root + "/c" + toString(chunks.length)
+    const hi = if at + CHUNK < files.length { at + CHUNK } else { files.length }
+    writeText(ch, join(files.slice(at, hi), "\n") + "\n")
+    chunks.push(ch)
+    at = hi
+  }
+  writeText(root + "/chunks", join(chunks, "\n") + "\n")
+  // Each chunk writes its own rows file, so no two workers append to one file.
+  // `$0` is the binary, `$1` the compiler, `$2` std and `$3` the chunk.
+  const one = "tr '\\n' '\\000' < \"$3\" | VL_CLS_CENSUS=1 VL_STD=\"$2\" xargs -0 \"$0\" check --batch --json --codegen --compiler \"$1\" > /dev/null 2> \"$3.err\"; grep '^\\[cls\\] ' \"$3.err\" > \"$3.cls\"; rm -f \"$3.err\""
+  const cmd = ["sh", "-c", one, vl, compiler]
+  const x = spawn("sh", fanArgs(root, cmd, abs + "/std"))
+  const tallies: Map<string, Tally> = Map()
+  for ch in chunks {
+    if !exists(ch + ".cls") {
+      die(
+        "\{TOOL}: chunk \{ch} wrote no rows (fan-out rc=\{toString(x.code)})\n"
+          + x.err,
+        1,
+      )
+    }
+    for l in splitLines(readText(ch + ".cls")) {
+      const colon = l.indexOf(": ")
+      if colon < 0 { continue }
+      const file = l.slice(6, colon)
+      const f = l.slice(colon + 2, l.length).split("\t")
+      if f.length != 4 { continue }
+      const t = tallyOf(tallies, f[0])
+      const n = parseI32(f[3]) ?? 0
+      t.files[file] = true
+      if isPre(f[2]) {
+        t.pre = t.pre + n
+        if f[2] == "monomorphizing" { t.during = t.during + n }
+        const site = parseI32(f[1]) ?? -1
+        let who = "?"
+        if site >= 0 && site < sites.length { who = sites[site].caller }
+        t.callers[who] = (t.callers[who] ?? 0) + n
+      } else {
+        t.post = t.post + n
+      }
+    }
+  }
+  if keep == "" { spawn("rm", ["-rf", root]) }
+
+  print(
+    "\{TOOL}: \{toString(files.length)} programs (\{pop}, shard \{shard}), \{toString(fns.length)} probed classifiers, compiler \{compiler}",
+  )
+  const classes = ["post-only", "pre-only", "both", "uncalled"]
+  const byClass: Map<string, i32> = Map()
+  for f in fns {
+    const c = classOf(tallyOf(tallies, f))
+    byClass[c] = (byClass[c] ?? 0) + 1
+  }
+  for c in classes {
+    print(padRight(c, 10) + padLeft(toString(byClass[c] ?? 0), 5))
+  }
+  print("")
+  const rows: string[] = [
+    "fn\tclass\tfiles\tpre\tduring\tpost\ttop pre callers",
+  ]
+  for f in sortStrings(fns) {
+    const t = tallyOf(tallies, f)
+    let cs = ""
+    if callers && t.pre > 0 { cs = topCallers(t.callers, top) }
+    rows.push(
+      join(
+        [
+          f,
+          classOf(t),
+          toString(t.files.length),
+          toString(t.pre),
+          toString(t.during),
+          toString(t.post),
+          cs,
+        ],
+        "\t",
+      ),
+    )
+  }
+  for r in rows {
+    const c = r.split("\t")
+    print(
+      padRight(c[0], 32)
+        + padRight(c[1], 10)
+        + padLeft(c[2], 7)
+        + padLeft(c[3], 9)
+        + padLeft(c[4], 9)
+        + padLeft(c[5], 9)
+        + "  "
+        + c[6],
+    )
+  }
+  if rowsOut != "" { writeText(rowsOut, join(rows, "\n") + "\n") }
+  0
+}
+
+// The `sh` arguments that run `cmd <chunk>` once per chunk listed in `root`/chunks.
+function fanArgs(root: string, cmd: string[], std: string): string[] {
+  const full: string[] = []
+  for c in cmd { full.push(c) }
+  full.push(std)
+  fanOutArgv(root + "/chunks", toString(jobsFromEnv(4)), full)
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("\{TOOL}: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
