@@ -1987,8 +1987,8 @@ with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node t
 disagreement is a loud refusal. Two fact fixes came first: a non-generic slot member answers from
 its own signature (#6536), and a slot handed to an open function parameter declines (#6539); the
 refusal found the second on D10311, D10383, D10401 and D14400. Where the elaboration declines, an
-untagged map whose generic is called at two signatures, mono's one-signature spelling stays: it is
-a rep spelling, not a type, and waits on a holder bundle fact (D15494). Over 19,318 programs with
+untagged map whose generic is called at two signatures, mono's spelling stays: it is a rep
+spelling, not a type, and is the unbound default (D15494). Over 19,318 programs with
 fixpoint seeds no byte moves, and 4,601 filed witnesses grade as filed.
 
 **Slot type, record fields** (2026-11-06). `monoPinRecordField`'s 10 mono-only decisions were
@@ -2466,11 +2466,18 @@ called it a bundle where the index does not (`tests/vl_elab_arg_rep_test.ts` hol
 Shadowed over 23,103 programs, the five shadowed reads agree everywhere;
 `monoBundleHandOnPin`'s is graded by the byte sweep alone.
 
-**Open: a held bundle has no fact.** `bundleRecs` (`bundleRecordOfSigs`, read in emit_classify and
-wasmEmit) still serves the bundles mono mints for a record field, a list or map element or a holder
-literal: 695 of its reads return a record no reach row delivers, and a lookup by signatures cannot
-tell two such bundles apart. The holder bundle D15494's two-signature maps wait on (above) is the
-same fact: a closure called at signatures S1..Sn, per holder node. Both close with it.
+**A bundle record is one per signature set** (2026-11-07). Every record mono minted for one
+signature list already shared one struct row (over 23,103 programs: 98 first, 6 same index, 203 a
+later index on the same row, 0 on another row), so `bundleRecordTyOf` (emit_elab) mints one record
+per signature list for the build and every site takes it: the reach rows, the closure bundle, the
+lambda arm and mono's field, list and map holders. emit_bundle's `bundleRecs`, `bundleRecordNote`
+and `bundleRecordOfSigs` are deleted; the readers ask `elabBundleRecordOf`. 25 reads that found no
+record before, where the elaboration holds a bundle mono never built, now find one; the byte sweep
+against master's fixpoint is 23,103 identical, so none of them reaches emitted code.
+
+**D15494 is no bundle.** Its two-signature maps hold uniform closure structs and each call site
+reaches its own closure signature; the map's `(i32) => i32` spelling is the unbound default, which
+slots no call reads take too. It belongs to the unbound-default family.
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
