@@ -2823,7 +2823,7 @@ programs, counted by program).
   | the call key | 4,047 |
   | rebuild, no call key (lambda and value instances) | 3,001 |
   | rebuild, a literal or record in the binding (rowintern's row key, #6629) | 2,418 |
-  | rebuild, a function-holding parameter (Fn#d's value-instance key, #6645) | 1,258 |
+  | rebuild, a function-holding parameter (see the residue bullet below) | 1,258 |
   | rebuild, a parameter open at the key | 3 |
 
   The literal-or-record cut was forced. The candidate without it moved 4 programs out of `runs`:
@@ -2845,6 +2845,23 @@ programs, counted by program).
   - **The seeded-binding check** (`monoLetTyParamMisfit`) is unreachable. The one probe of the
     shape it forbids is refused first, with "a generic function taken as a value reaches no call
     that fixes its type", in both states. That probe is now that refusal's witness.
+- **The function-holding residue stays on the rebuild: mono's binding carries reps, and some
+  arguments have no type.** Over the 2,470 programs whose instance takes the rebuild path, each
+  function-holding parameter was bound in a shadow from the argument's identity
+  (`elabNodeTy(arg)` at the call, then `elabNodeTyAt`) and compared with mono's binding. 129 agree.
+  The value-instance key (#6645) is a signature fact and is not the source here. It splits
+  per-identity instances into per-signature ones, which is the argument-keyed design and waits on
+  the owner. The rest is the target, not a switch:
+  - **Bind the type, not the rep (56 sites).** In 32 sites mono binds a bundle record
+    (`{c0: (f64) => f64, c1: (i32) => i32}`) where the identity is `(_) => _`. In 24 it binds the
+    table-index rep (`i32[]` for `((i32) => i32)[]`). The binding should hold the type and let the
+    rep layer pick the bundle or the table index. This is the type-versus-rep conflation that
+    `monoSameTyCtor` shows for adopted bundles.
+  - **Type the argument (689 programs).** A named function or a lambda literal passed as a value
+    has no elaboration type at the argument node, for example `[0, 1].mapIndexed(base)`. That is
+    prerequisite (A), identity typing for concrete function values.
+  - **23 sites are open on one side only.** In 11 the identity is concrete and mono is open
+    (`{f: (i32) => i32}` against `{f: (T) => T}`). In 12 it is the other way round.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
