@@ -2025,8 +2025,8 @@ with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node t
 disagreement is a loud refusal. Two fact fixes came first: a non-generic slot member answers from
 its own signature (#6536), and a slot handed to an open function parameter declines (#6539); the
 refusal found the second on D10311, D10383, D10401 and D14400. Where the elaboration declines, an
-untagged map whose generic is called at two signatures, mono's one-signature spelling stays: it is
-a rep spelling, not a type, and waits on a holder bundle fact (D15494). Over 19,318 programs with
+untagged map whose generic is called at two signatures, mono's spelling stays: it is a rep
+spelling, not a type, and is the unbound default (D15494). Over 19,318 programs with
 fixpoint seeds no byte moves, and 4,601 filed witnesses grade as filed.
 
 **Slot type, record fields** (2026-11-06). `monoPinRecordField`'s 10 mono-only decisions were
@@ -2094,6 +2094,38 @@ the Fn#d lane's function-value identity (D15298). Those mono-only rows are its a
 witnesses. Four helpers move to the instance-binding family: `monoPinBin`, `monoPinnedOperandTy`,
 `monoPinnedReadTy` and `monoDeadNullTest` read only the instance's own pin column, in
 `monoMakeInstanceGo`'s body rewrite.
+
+**Node type, second reading** (2026-11-07, a seeded 2,500-program sample of the reaching programs).
+Each A helper was wrapped, with the walk depth recorded.
+- **`monoArgClosedTyIn`.** Its `ctx` is a function index at all four callers. Inside an instance
+  (`elabKeyAt(ctx) >= 0`) the elaboration answers all 1,387 calls. Outside one, it has no answer at
+  7,443 calls, and there the checker's own type equals mono's at 7,361.
+- **The 57 "differs".** These are generic calls whose type parameter the destination binds:
+  `idn({ r: 4 })` into `J | string` passes `{r: i32}` at `T := J`. That is a different type, not a
+  spelling, so the helper's switch reads the callee instance's parameter type (`elabCallInstFrom`).
+- **`monoInitHeldTy`.** Probed where `monoBindingAdoptInit` acts on it, there are 36 decisions in
+  18 programs. Every one is a container of hole lambdas that the elaboration leaves `(_) => _`.
+
+**Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
+elaboration has no type of its own for the node, and every caller composes its own narrowing with
+it. A fallback to the checker's closed type (#6556, closed) broke four `runs` cells:
+- D3786;
+- `functions/tail-assign-nullable-i64-if`;
+- `expressions/assign-value-keeps-evaluation-order`;
+- `literals/hex-width-through-assignment-value`.
+
+The cause is in `readAtomAgreed`, which compares `asgReReadPinAt`'s narrowed `i64` with the answer
+and refuses on a mismatch. The fallback answered with the cell's declared `i64 | null`.
+
+**Hole-lambda holders, one fact.** `elabSlotTys`, written by `elabSlotFacts` and
+`elabSlotInstFacts`, is the closed type of a holder whose function leaves stay open. Fn#d's
+adopt-init switch and lane F's `.map` callback parameter both read it. It is a type only; the rep
+comes from the tag layer. Three steps:
+- (a) `elabNodeTy` answers it for the binding and for an un-narrowed read of the binding;
+- (b) `elabSlotClose` gains the sources it declines today, at 42 of the 47 acted adopt decisions
+  over the union population;
+- (c) a hole parameter is closed per instance from its callers' arguments, and declines where two
+  callers at one key pass different types.
 
 **Slot type, first reading: `monoReachSlotTy`** (2026-11-06). Value reach (`vrCalleeTy`) against
 the climb's agreed tuple (`elabLitSlotCallTys`), each computed on its own:
@@ -2481,9 +2513,9 @@ and `bundleRecordOfSigs` are deleted; the readers ask `elabBundleRecordOf`. 25 r
 record before, where the elaboration holds a bundle mono never built, now find one; the byte sweep
 against master's fixpoint is 23,103 identical, so none of them reaches emitted code.
 
-**Open: D15494's two-signature maps have no fact.** A map whose generic is called at two types is
-annotated with one signature, a rep the elaboration does not record: a closure called at
-signatures S1..Sn, per holder node, the held form of the bundle above.
+**D15494 is no bundle.** Its two-signature maps hold uniform closure structs and each call site
+reaches its own closure signature; the map's `(i32) => i32` spelling is the unbound default, which
+slots no call reads take too. It belongs to the unbound-default family.
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
