@@ -10,7 +10,7 @@ the shadow. The shadow sits beside the checker and no pass reads it. Its rule:
 - anything else (a parameter, a field, a call result) is open.
 
 Population: the 23,450 programs §3.4 uses. That is `tests/cases` (7,576), the distilled corpus
-(11,779) and 4,095 inventory `Repro:` blocks (`scripts/id-shadow/witnesses.py`). The sweep is
+(11,779) and 4,095 inventory `Repro:` blocks (`scripts/id-shadow/witnesses.sh`). The sweep is
 `scripts/id-shadow/run.sh`, and `tally.sh` prints the tables.
 
 **(a) Function-valued reads, by kind.** These are the reads the checker types as non-callee
