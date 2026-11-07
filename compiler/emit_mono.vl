@@ -42,6 +42,7 @@ import {
   elabCbArgSig,
   elabDeclFnOf,
   elabDeclIsValue,
+  elabKeySig,
   elabLamDeliveredParams,
   elabLamParamTy,
   elabLitSlotCallRet,
@@ -58,6 +59,7 @@ import {
   elabSlotUncalledOmitting,
   elabUncalledSlotTy,
   elabValueAgreedCallTys,
+  elabValueInstKey,
   elabValueOnlyCall,
   elabValueReturnsFrom,
   elabValueSlotCopy,
@@ -4195,10 +4197,9 @@ function monoLamSubstParams(
     const p = nodeAt(a.fnParams[i])
     if p is Param {
       const nt0 = monoSubstAnnNode(p.parType, typarams, tvN, tvV, bN, bT)
-      // A parameter whose annotation rides a type parameter takes the elaboration's type for it at
-      // this instance; the binding's substitution only says that one applies, and a substitution to
-      // another type is refused.
-      const lt = if nt0 >= 0 { elabNodeTy(fnIx, elabWalkTop()) } else { -1 }
+      // A parameter whose annotation rides a type parameter, or whose inferred type mono pins,
+      // takes the elaboration's type for it at this instance where that type is closed.
+      const lt = elabNodeTy(fnIx, elabWalkTop())
       const lo = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
       const et = if lo is TyFunc && i < lo.fnParamTypes.length { lo.fnParamTypes[i] } else { -1 }
       const etShut = et >= 0
@@ -4208,8 +4209,16 @@ function monoLamSubstParams(
       const sp = if etShut { monoPinNominalSpelling(et) } else { "" }
       const tn = if p.parType >= 0 && p.parType < P.nodes.length { nodeAt(p.parType) } else { null }
       const tpos = if tn is TypeRef { tn.pos } else { p.pos }
-      const nt = if etShut { synthTypeRefTy(sp, tpos, et) } else { nt0 }
-      if etShut && sp != tyNameOf(nt0) {
+      if nt0 >= 0 && !etShut {
+        return emitFailAt(
+          "emitProgram: internal: parameter `"
+            + p.parName
+            + "` of a lambda rides a type parameter the elaboration leaves open at this instance",
+          a.fnParams[i],
+        )
+      }
+      const nt = if etShut && nt0 >= 0 { synthTypeRefTy(sp, tpos, et) } else { nt0 }
+      if etShut && nt0 >= 0 && sp != tyNameOf(nt0) {
         return emitFailAt(
           "emitProgram: internal: parameter `"
             + p.parName
@@ -4234,7 +4243,9 @@ function monoLamSubstParams(
       } else {
         // An un-annotated parameter the checker inferred at the type parameter (a `.filter`
         // callback over a `T[]`) is annotated at this pin, since nothing else lowers it.
-        const ipn = monoLamParamPinAnn(fnIx, i, p.parType, bN, bT)
+        // The elaboration's closed type where mono pins one; mono's own pin where it is open.
+        const ipn0 = monoLamParamPinAnn(fnIx, i, p.parType, bN, bT)
+        const ipn = if ipn0 >= 0 && etShut { synthTypeRefTy(sp, p.pos, et) } else { ipn0 }
         if ipn >= 0 {
           ps.push(
             monoCopyOf(
@@ -12462,8 +12473,15 @@ function monoFlowStoreOf(x: i32): i32 {
   wn.callArgs[1]
 }
 
-// The `Map()` node whose owner a write `p` stores child `x` into, or -1.
-function monoFlowStoreMap(p: i32, x: i32): i32 {
+// The binding named by the map a write stores value `v` into, `t[k] = v` or `t.set(k, v)`;
+// -1 otherwise.
+function monoFlowStoreTarget(v: i32): i32 {
+  let x = v
+  while (mfrParentOf(x)) >= 0 && nodeAt(mfrParentOf(x)) is Paren {
+    x = mfrParentOf(x)
+  }
+  const p = mfrParentOf(x)
+  if p < 0 { return -1 }
   const pn = nodeAt(p)
   let tgt = -1
   if pn is BinExpr && pn.binOp == "=" && pn.binRight == x {
@@ -12474,15 +12492,7 @@ function monoFlowStoreMap(p: i32, x: i32): i32 {
     if f is Member && f.memProp == "set" { tgt = unwrapParen(f.memObj) }
   }
   if tgt < 0 || !(nodeAt(tgt) is Ident) { return -1 }
-  const d = identDeclOf(tgt)
-  if d < 0 { return -1 }
-  const am = monoFlowAliasMap(d)
-  if am >= 0 { return am }
-  const dn = nodeAt(d)
-  if !(dn is LetDecl) { return -1 }
-  const mv = unwrapParen(dn.letInit)
-  if monoFlowMapOwner(mv) != d { return -1 }
-  mv
+  identDeclOf(tgt)
 }
 
 // The first `Map()` candidate binding `d` holds (`monoFlowAliasMaps`), tying every other one to it;
@@ -12541,13 +12551,12 @@ function monoFlowMapHandOn(x: i32): i32 {
 
 // Appends to `out` the value each write into map `mv` (`monoFlowMapOwner`) stores: a literal or
 // a read naming a generic as written, anything else as its elaboration roots; false when one is
-// unknown. Notes the writes through the parameters and `const`s it is handed to
-// (`monoFlowAliasStored`), whose pins instance what they store (D9651, D9440).
+// unknown, or when a binding it is handed to may hold another map. Notes the writes through any
+// other handle (`monoFlowAliasStored`), whose pins instance what they store (D9651, D9440).
 function monoFlowMapVals(mv: i32, out: i32[]): boolean {
   const d = monoFlowMapOwner(mv)
   if d < 0 { return false }
   const via: i32[] = [d]
-  const writes: i32[] = []
   let i = 0
   while i < via.length {
     for u in mfrUses[via[i]] ?? [] {
@@ -12555,10 +12564,7 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
       while (mfrParentOf(x)) >= 0 && nodeAt(mfrParentOf(x)) is Paren {
         x = mfrParentOf(x)
       }
-      const s = monoFlowStoreOf(x)
-      if s >= 0 {
-        if via[i] != d { writes.push(s) }
-      } else {
+      if monoFlowStoreOf(x) < 0 {
         const h = monoFlowMapHandOn(x)
         if h >= 0 && !i32ListHas(via, h) {
           if !i32ListHas(monoFlowAliasMaps(h), mv) { return false }
@@ -12568,10 +12574,16 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
     }
     i = i + 1
   }
-  mfrAliasWrites[d] = writes
   const vals: i32[] = []
   const ats: i32[] = []
-  if cwSlotWrittenValues(cwKeyOfDecl(d), ["[]"], vals, ats) < 0 { return false }
+  const writes: i32[] = []
+  const r = cwSlotWrittenValues(cwKeyOfDecl(d), ["[]"], vals, ats)
+  for w in vals {
+    const b = monoFlowStoreTarget(w)
+    if b >= 0 && b != d { writes.push(w) }
+  }
+  mfrAliasWrites[d] = writes
+  if r < 0 { return false }
   for w in vals {
     const sv = unwrapParen(w)
     if monoFlowIsLit(sv) || monoFlowLeafGen(sv) >= 0 { out.push(sv) }
@@ -12701,11 +12713,15 @@ function monoFlowLitRoot(v: i32): i32 {
     p = mfrParentOf(x)
   }
   // A value a map write stores shares the map's tree: a read of either reads the other.
-  if p >= 0 {
-    const mv = monoFlowStoreMap(p, x)
-    if mv >= 0 { return mv }
-  }
-  r
+  const d = if p >= 0 { monoFlowStoreTarget(x) } else { -1 }
+  if d < 0 { return r }
+  const am = monoFlowAliasMap(d)
+  if am >= 0 { return am }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) { return r }
+  const mv = unwrapParen(dn.letInit)
+  if monoFlowMapOwner(mv) != d { return r }
+  mv
 }
 
 // Plans and applies the rewrites of every candidate binding in `lets`. A binding is rewritten
@@ -23332,19 +23348,32 @@ function monoWalkIdentCall(
         monoNoteBindSig(n.callFn, ctx, monoSlotSig(monoLastInstFe))
       }
       // The call keeps its `call_ref` through a written `let`, so each generic written to it
-      // takes the instance's signature, as a delivery of the binding does (D3961).
+      // takes the signature the elaboration instanced the binding's members at through this read,
+      // as a delivery of the binding does (D3961); the chosen instance's where it names none.
       if ri >= 0 && !direct && monoLastInstFe >= 0 {
-        const ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
+        const wit = monoFrameInstTmpl(wlFr)
+        const wk = if wit[0] >= 0 { elabKeyAt(wit[0]) } else { -1 }
+        let st = -1
+        for k in elabValueInstKey(wlAt, wk) {
+          const kt = elabKeySig(k)
+          st = if kt < 0 || st >= 0 && !tySame(st, kt) { -2 } else if st == -2 { -2 } else { kt }
+        }
+        const sf = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
+        let ctn = ""
+        let cts: i32[] = []
+        if sf is TyFunc {
+          ctn = monoSigFnTyName(pinSigOf(sf.fnParamTypes) + ";")
+          cts = sf.fnParamTypes
+        }
+        if ctn == "" {
+          ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
+          cts = monoInstParamPinTys(monoLastInstFe)
+        }
         if ctn != "" {
           const prev = monoSigCallRet
           monoSigCallRet = nodeTyIxOf(ix)
           monoCellSigByCall = true
-          monoCoerceWrittenLetTys(
-            wlAt,
-            wlFr,
-            ctn,
-            monoInstParamPinTys(monoLastInstFe),
-          )
+          monoCoerceWrittenLetTys(wlAt, wlFr, ctn, cts)
           monoCellSigByCall = false
           monoSigCallRet = prev
         }
@@ -25897,14 +25926,17 @@ function monoInitHeldTy(init: i32): i32 {
   dt
 }
 
-// Whether types `a` and `b` have the same outermost constructor.
+// Whether types `a` and `b` have the same constructor, under any matching nullable layers: a
+// function-typed binding never takes a record as its type, at any depth (a bundle is its rep).
 function monoSameTyCtor(a: i32, b: i32): boolean {
   const x = tyAt(a)
   const y = tyAt(b)
+  if x is TyNullable && y is TyNullable {
+    return monoSameTyCtor(x.nInner, y.nInner)
+  }
   (x is TyArray && y is TyArray)
     || (x is TyFunc && y is TyFunc)
     || (x is TyMap && y is TyMap)
-    || (x is TyNullable && y is TyNullable)
     || (x is TyObj && y is TyObj)
 }
 
