@@ -3644,6 +3644,26 @@ against master's fixpoint is 23,103 identical, so none of them reaches emitted c
 reaches its own closure signature; the map's `(i32) => i32` spelling is the unbound default, which
 slots no call reads take too. It belongs to the unbound-default family.
 
+**D15494's population at the adopted-binding read.** Thirty of the 130 `monoBindingAdoptInit`
+decisions the elaboration leaves open hold a named generic in a map or list slot, so the slot's value
+is a polymorphic identity with no one signature. They are this question, not a missing delivery, and
+they close with its answer. Bindings per file (`tests/cases/`):
+- maps (26):
+  - `closures/generic-fn-in-unannotated-map.vl`: `r`
+  - `closures/generic-record-written-into-map-through-param-read-through-optional.vl`: `a`
+  - `closures/hole-fn-generic-in-map-called-at-two-types.vl`: `m`, `b`, `n`, `z`, `o`, `q`
+  - `closures/hole-fn-generic-map-handed-two-maps.vl`: `m`, `m2`, `b`, `c`, `e`, `f`
+  - `closures/hole-fn-generic-map-stored-through-parameter.vl`: `a`, `c`, `d`
+  - `closures/map-read-field-store-repointed-let-listed-at-two-types.vl`: `m`
+  - `generics/fn-value-generic-container-read-listed-or-stored.vl`: `m`, `mg`, `ma`, `mp`, `mq`
+  - `generics/fn-value-generic-copied-returned-or-aliased-handed.vl`: `m`
+  - `generics/fn-value-generic-handed-from-call-map-or-repointed-let.vl`: `m`, `ml`
+- lists (4):
+  - `closures/nested-generic-written-into-capture-cell-at-two-instances.vl`: `k`
+  - `closures/written-let-seeded-from-parameter-written-with-generic.vl`: `k`
+  - `functions/exported-generic-reached-through-lambda-field-or-list-called.vl`: `ks`
+  - `generics/nested-capture-array-element.vl`: `fs`
+
 A captured cell nothing reads is the same question. In
 `closures/hole-lambda-cell-takes-instance-type.vl`'s `peerPinned`, `let d2 = e` is re-written by a
 lambda to `c` and never read or called. Closing `d2` needs an instance for `e`, a hole function no
