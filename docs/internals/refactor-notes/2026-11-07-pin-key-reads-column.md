@@ -43,12 +43,12 @@ in place of the spelling. Over the sweep population no instance merged or split.
 
 ## Measured
 
-Both seeds were built to a fixpoint (two `refresh-compiler.sh` runs, byte-identical). The base is
-`claude/pin-type-column` at `acd8e896`, with master `30d4bfd2` merged.
+Both seeds were built to a fixpoint (two `refresh-compiler.sh` runs, byte-identical): base master
+`b055cc92`, candidate that tree with this change.
 
 | | |
 |---|---|
 | sweep | 23,610 of 23,610 same (0 bytes-only, 0 output movers, 0 `runs → not-runs`) |
 | row-class disagreements, name against column (probe) | 4 → 0 |
-| seed | 6,457,284 → 6,457,371 bytes (+87) |
-| pin-helper budget (`emit_mono.vl`) | 943 → 943 |
+| seed | 6,476,942 → 6,477,029 bytes (+87) |
+| pin-helper budget (`emit_mono.vl`) | unchanged (the two helpers live in `pin_spell.vl`) |
