@@ -1,11 +1,13 @@
 import { idShadowSpec } from "./emit_id_shadow"
 import {
   elabIdentityFnTy,
-  elabSpecBakeNote,
   elabSpecDemand,
+  elabSpecKeyOf,
   elabSpecMonoGroup,
+  elabSpecParamCalledAt,
+  idCanon,
 } from "./elab_fn_id"
-import { idShadowModeOf } from "./id_shadow_state"
+import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
 import { recEnclosingFn } from "./check_fit_rules"
 import {
@@ -5069,6 +5071,10 @@ function monoPinMapLambdas(ix: i32, pNames: string[]) {
   ix
 }
 
+// The argument-keyed instance of the specialization `monoMakeInstance` is building, which its
+// bake reads; -1 outside one.
+let monoBakeSpecK = -1
+
 // Extend the name→index map over the instances minted since the last call, which the walk
 // resolves by name before collection runs.
 function monoRegisterInstance() {
@@ -5084,11 +5090,14 @@ function monoRegisterInstance() {
 // to the non-capturing function this instance carries; `cbFnNames == ""` leaves it a
 // `call_ref`. `fnDeclIx` is the ORIGINAL `FuncDecl` this walk descends from, or -1 where no
 // single root names the body — a lambda-pinned generic clone, which skips the shadow check.
+// `specK` is the elaboration's argument-keyed instance (-1: none); a call it answers is rewritten
+// by its answer alone.
 function monoBakeCallback(
   ix: i32,
   cbParamNames: string[],
   cbFnNames: string[],
   fnDeclIx: i32,
+  specK: i32,
 ) {
   if ix < 0 { return ix }
   const n = nodeAt(ix)
@@ -5103,6 +5112,7 @@ function monoBakeCallback(
           cbParamNames,
           cbFnNames,
           fnDeclIx,
+          specK,
         )
         ns.push(cs)
         if cs != n.blkStmts[i] { changed = true }
@@ -5112,12 +5122,12 @@ function monoBakeCallback(
       return mkBlock(ns, n.pos)
     }
     RetStmt => {
-      const ca = monoBakeCallback(n.retArg, cbParamNames, cbFnNames, fnDeclIx)
+      const ca = monoBakeCallback(n.retArg, cbParamNames, cbFnNames, fnDeclIx, specK)
       if ca == n.retArg { return ix }
       return mkReturn(ca, n.pos)
     }
     LetDecl => {
-      const ci = monoBakeCallback(n.letInit, cbParamNames, cbFnNames, fnDeclIx)
+      const ci = monoBakeCallback(n.letInit, cbParamNames, cbFnNames, fnDeclIx, specK)
       if ci == n.letInit { return ix }
       return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
     }
@@ -5127,6 +5137,7 @@ function monoBakeCallback(
         cbParamNames,
         cbFnNames,
         fnDeclIx,
+        specK,
       )
       if cb == n.whileBody { return ix }
       return mkWhileAs(n, n.whileCond, cb)
@@ -5142,7 +5153,7 @@ function monoBakeCallback(
         if c is IfStmt {
           ccs.push(c.ifCond)
           cts.push(
-            monoBakeCallback(c.ifThen, cbParamNames, cbFnNames, fnDeclIx),
+            monoBakeCallback(c.ifThen, cbParamNames, cbFnNames, fnDeclIx, specK),
           )
         }
         k = k + 1
@@ -5156,11 +5167,12 @@ function monoBakeCallback(
           cbParamNames,
           cbFnNames,
           fnDeclIx,
+          specK,
         ),
       )
     }
     ForRange => {
-      const cb = monoBakeCallback(n.frBody, cbParamNames, cbFnNames, fnDeclIx)
+      const cb = monoBakeCallback(n.frBody, cbParamNames, cbFnNames, fnDeclIx, specK)
       if cb == n.frBody { return ix }
       return mkForRange(
         n.frVar,
@@ -5174,12 +5186,12 @@ function monoBakeCallback(
       )
     }
     ForIn => {
-      const cb = monoBakeCallback(n.fiBody, cbParamNames, cbFnNames, fnDeclIx)
+      const cb = monoBakeCallback(n.fiBody, cbParamNames, cbFnNames, fnDeclIx, specK)
       if cb == n.fiBody { return ix }
       return mkForInCopy(n, n.fiIter, cb)
     }
     Paren => {
-      const ci = monoBakeCallback(n.parInner, cbParamNames, cbFnNames, fnDeclIx)
+      const ci = monoBakeCallback(n.parInner, cbParamNames, cbFnNames, fnDeclIx, specK)
       if ci == n.parInner { return ix }
       const np = mkParen(ci, n.pos)
       nodeTyCarry(np, ix)
@@ -5192,7 +5204,34 @@ function monoBakeCallback(
       let newCallee = n.callFn
       if n.callFn < 0 { return ix }
       const callee = nodeAt(n.callFn)
-      if callee is Ident {
+      // The elaboration's instance names the parameter a call calls through; a call it does not
+      // answer there is no baked call. Without an instance, mono derives it.
+      const kp = if specK >= 0 { elabSpecParamCalledAt(idCanon(ix), specK) } else { -1 }
+      if kp >= 0 && kp < cbFnNames.length && cbFnNames[kp] != "" && callee is Ident {
+        newCallee = mkIdent(cbFnNames[kp], callee.pos)
+        identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[kp]))
+      }
+      if idShadowModeOf() != 0 && specK >= 0 && callee is Ident {
+        let mp = monoBakeAliasParam(n.callFn, fnDeclIx)
+        if (
+          mp == ""
+          && !fnBlockShadowsAt(fnDeclIx, sidOfNode(n.callFn), n.callFn)
+          && monoReadsOwnParam(fnDeclIx, callee.identName, n.callFn)
+        ) {
+          mp = callee.identName
+        }
+        let mk = -1
+        let bq = 0
+        while bq < cbParamNames.length {
+          if cbFnNames[bq] != "" && mp == cbParamNames[bq] { mk = bq }
+          bq = bq + 1
+        }
+        const ek = if kp >= 0 && kp < cbFnNames.length && cbFnNames[kp] != "" { kp } else { -1 }
+        if mk >= 0 || ek >= 0 {
+          idShadowRow("TMPbake " + (if mk == ek { "same" } else if mk < 0 { "elabonly" } else if ek < 0 { "monoonly" } else { "differ" }))
+        }
+      }
+      if newCallee != n.callFn {} else if specK < 0 && callee is Ident {
         // A call through a never-written `const` alias of the parameter is a call of it too (D12216).
         let pname = monoBakeAliasParam(n.callFn, fnDeclIx)
         if (
@@ -5208,7 +5247,6 @@ function monoBakeCallback(
             if cbFnNames[bk] != "" && pname == cbParamNames[bk] {
               newCallee = mkIdent(cbFnNames[bk], callee.pos)
               identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[bk]))
-              elabSpecBakeNote(ix, cbFnNames[bk])
             }
             bk = bk + 1
           }
@@ -5223,6 +5261,7 @@ function monoBakeCallback(
           cbParamNames,
           cbFnNames,
           fnDeclIx,
+          specK,
         )
         nargs.push(cca)
         if cca != n.callArgs[ai] { changed = true }
@@ -5237,8 +5276,8 @@ function monoBakeCallback(
       // through `mkBinary` would drop its surface tag, and its call stays a `call_ref`.
       // The copy answers the template's type, which a `??` reads its niche off (D7452).
       if n.binCompound != "" { return ix }
-      const cl = monoBakeCallback(n.binLeft, cbParamNames, cbFnNames, fnDeclIx)
-      const cr = monoBakeCallback(n.binRight, cbParamNames, cbFnNames, fnDeclIx)
+      const cl = monoBakeCallback(n.binLeft, cbParamNames, cbFnNames, fnDeclIx, specK)
+      const cr = monoBakeCallback(n.binRight, cbParamNames, cbFnNames, fnDeclIx, specK)
       if cl == n.binLeft && cr == n.binRight { return ix }
       const nb = mkBinary(n.binOp, cl, cr, n.pos)
       nodeTyCarry(nb, ix)
@@ -8945,7 +8984,13 @@ function monoMakeInstanceBodyRewrite(
     // `monoPinMapLambdas`), not the original `fn.fnBody` — no single root names its
     // block structure, so the shadow guard cannot be asked here (see the -1 contract
     // on `monoBakeCallback`, D2325).
-    instBody2 = monoBakeCallback(instBody1, pElemNames, cbFnNames, -1)
+    instBody2 = monoBakeCallback(
+      instBody1,
+      pElemNames,
+      cbFnNames,
+      -1,
+      monoBakeSpecK,
+    )
   }
   // Per-instance copies of the direct generic calls this body makes, so instantiating
   // them rewrites only this instance's callee `Ident`s. No generic call → the same node.
@@ -19967,6 +20012,8 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       monoOpenLamOwner = callIx
       monoOpenLamDefer = -1
       const specKeys0 = monoKeys.length
+      const specKWas = monoBakeSpecK
+      monoBakeSpecK = elabSpecKeyOf(specAt)
       const made = monoMakeInstance(
         origFe,
         pinned,
@@ -19979,6 +20026,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         false,
         cbFnNames,
       )
+      monoBakeSpecK = specKWas
       const specFe = if monoKeys.length > specKeys0 { monoInstFe[specKeys0] } else { monoLastInstFe }
       elabSpecMonoGroup(specAt, i32ToStr(specFe))
       return made
@@ -21686,6 +21734,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         cbParamNames,
         cbFnNames,
         fnDeclIx,
+        elabSpecKeyOf(specAt),
       )
       const nps: i32[] = []
       let pj = 0
