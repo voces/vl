@@ -691,7 +691,9 @@ import {
   elabNodeTyAgreed,
   elabNodeTyAt,
   elabShadowNote,
-  elabKeyLateProbe,
+  elabKeyMintedLate,
+  elabArgPinTy,
+  elabCallParamTy,
   elabNodeTys,
   elabParamTyOwnAt,
   elabParamsMention,
@@ -1486,9 +1488,21 @@ function monoAnonArgSoftens(argIx: i32, ty: i32): boolean {
 function monoArgPinName(ix: i32, fnIx: i32) {
   const w = monoArgTyName(ix, fnIx)
   const r = monoArgPinNameRun(ix, fnIx, w)
-  apShadow(ix, fnIx, w, r)
-  r
+  // The elaboration's type wins where it differs from the core's as a type; where the two agree,
+  // the core's spelling stands.
+  const ct = monoArgClosedPinTy(ix, fnIx)[0]
+  const pt = elabArgPinTy(unwrapParen(ix), fnIx)
+  let out = r
+  if ct >= 0 && r == w && pt >= 0 && !tySame(pt, ct) {
+    const pp = monoPinOfClosedTy(pt)
+    if pp != "" { out = pp }
+  }
+  apShadow(ix, fnIx, w, r, out, ct, pt)
+  out
 }
+
+let apCall = -1
+let apIdx = -1
 
 function apTyText(t: i32): string {
   if t < 0 || t >= T.tys.length { return "-" }
@@ -1501,23 +1515,18 @@ function apPin(t: i32): string {
   if p == "" { "~" } else { p }
 }
 
-function apShadow(ix: i32, fnIx: i32, w: string, r: string): i32 {
+function apShadow(ix: i32, fnIx: i32, w: string, r: string, out: string, ct: i32, pt: i32): i32 {
   const x = unwrapParen(ix)
-  const k = if fnIx >= 0 { elabKeyAt(fnIx) } else { -1 }
-  const ct = monoArgClosedPinTy(ix, fnIx)[0]
+  const res = if apCall >= 0 && apIdx >= 0 { elabCallParamTy(apCall, apIdx) } else { -2 }
+  apCall = -1
+  apIdx = -1
   const arm = if ct >= 0 { "core" } else { "cascade" }
   const post = if r == w { "same" } else { "post" }
-  const inst = if k >= 0 { elabInstNodeTy(x, k) } else { -1 }
-  const at = elabNodeTyAt(x, fnIx)
-  const nt = elabNodeTy(x, k)
-  const sig = elabValueInstSig(x)
-  const idt = elabIdentityTy(x, fnIx)
-  const chk = nodeTyFrozenOf(x)
+  const sw = if out == r { "keep" } else { "SWITCH" }
   elabShadowNote(
-    "AP\t" + i32ToStr(x) + "\t" + i32ToStr(fnIx) + "\t" + arm + "\t" + post + "\tpin=" + r
-      + "\tinst=" + apPin(inst) + "\tat=" + apPin(at) + "\tsig=" + apPin(sig)
-      + "\tid=" + apPin(idt) + "\tchk=" + apTyText(chk) + "\tinstT=" + apTyText(inst)
-      + "\tatT=" + apTyText(at) + "\tnt=" + apPin(nt) + "\tlate=" + (if elabKeyLateProbe(k) { "1" } else { "0" }),
+    "AP\t" + i32ToStr(x) + "\t" + i32ToStr(fnIx) + "\t" + arm + "\t" + post + "\t" + sw
+      + "\tpin=" + r + "\tout=" + out + "\tpt=" + apPin(pt) + "\tct=" + apPin(ct)
+      + "\tres=" + (if res == -2 { "nocall" } else { apPin(res) }),
   )
 }
 
@@ -18563,6 +18572,8 @@ function monoPreBindPastUnionRest(
     // renders the whole argument type, which a wide type makes dear.
     if ann != "" && isUnion {
       if i < decl.length { dt = decl[i] }
+      apCall = callIx
+      apIdx = i
       act = monoPreBindArgName(args[i], ctx)
       if act != "" {
         at = monoPreBindArgTy(args[i], ctx)
@@ -18579,6 +18590,8 @@ function monoPreBindPastUnionRest(
   let a = 0
   while a < anns.length {
     if anns[a] != "" && acts[a] == "" {
+      apCall = callIx
+      apIdx = a
       acts[a] = monoPreBindArgName(args[a], ctx)
       if acts[a] != "" { ats[a] = monoPreBindArgTy(args[a], ctx) }
     }
@@ -19004,6 +19017,8 @@ function monoElabLitCopy(
   for cp in cps {
     const pt = holeLitPinOf(cp)
     if pt >= 0 && tySameSpelled(pt, t, TY_WALK_DEPTH) {
+      apCall = callIx
+      apIdx = i
       const nm = monoArgPinName(cp, ctx)
       if nm == "" { return "" }
       c.callArgs[k] = cp
@@ -20636,6 +20651,8 @@ function monoPinHoleParam(
     }
     if an == "" {
       // Kept for an argument the elaboration leaves open at this call.
+      apCall = callIx
+      apIdx = i
       an = monoArgPinName(args[i], ctx)
       // The rep cascade's `i32` floor is not a pin for a hole the elaboration binds to another
       // closed type: that demand would key an instance no call has.
@@ -20887,7 +20904,11 @@ function monoPinAnnotatedParam(
         if an2 != "" { an2Ty = lrt }
       }
     }
-    if an2 == "" { an2 = monoArgPinName(args[i], ctx) }
+    if an2 == "" {
+      apCall = callIx
+      apIdx = i
+      an2 = monoArgPinName(args[i], ctx)
+    }
     // A function the call hands back to a closed function type: the elaboration binds it there.
     if an2 == "" && ann == tp {
       const eft = elabCallParamTy(monoCallTplOf(callIx), i)
@@ -21380,6 +21401,8 @@ function monoPinTyParamComposite(
     }
   }
   if !annIsFn && anC == "" {
+    apCall = callIx
+    apIdx = i
     anC = monoArgPinName(args[i], ctx)
     // An anonymous row's `#anonN` has no fields to match the pattern against;
     // the checker's spelled shape does, unless the render softens a literal (D3123).
