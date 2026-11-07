@@ -12067,7 +12067,6 @@ let mfrCalled: i32[] = []
 let mfrKeptIndex: i32[] = []
 let mfrKeptTop: i32[] = []
 // Each read rewritten from an element of a `let` list to a generic's name, to that `let` (D9980).
-let mfrListSrc: {[i32]: i32} = Map()
 let mfrAliasWrites: {[i32]: i32[]} = Map()
 // Pairs `[a, b]` of literal roots read as one: a pushed list and a list it is spread into, or two
 // maps one binding is handed.
@@ -12107,7 +12106,6 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrCalled = []
   mfrKeptIndex = []
   mfrKeptTop = []
-  mfrListSrc = Map()
   mfrAliasWrites = Map()
   mfrTied = []
   mfrTiedCopy = Map()
@@ -14194,14 +14192,6 @@ function monoFlowReadSet(x: i32, g: i32): boolean {
   const nm = monoFlowLeafName(g)
   if nm == "" || !monoFlowInScope(x, g) { return false }
   if i32ListHas(mfrKeptIndex, x) && !monoFlowKeepIndex(x) { return false }
-  const xn = nodeAt(x)
-  if xn is Index {
-    const a = unwrapParen(xn.idxArr)
-    if a >= 0 && nodeAt(a) is Ident {
-      const d = identDeclOf(a)
-      if d >= 0 && nodeAt(d) is LetDecl { mfrListSrc[x] = d }
-    }
-  }
   const n: Node = { identName: nm, pos: nodePos(x) }
   const called = monoFlowCalledAt(x)
   const used = called || monoFlowHandedNarrowed(x)
@@ -15818,22 +15808,18 @@ function monoLetWritesClosed(d: LetDecl, at: i32, ctx: i32): boolean {
   true
 }
 
-// Whether each write of the `let` declared at `at` stores a value of type `t`; a fresh `Map()`
-// takes a map type `t`, and is recorded at it.
+// Whether the `let` declared at `at` holds values of type `t`: its slot fact is `t`, which the
+// elaboration closes only where every write agrees. A fresh `Map()` write is recorded at `t`.
 function monoLetWritesAt(d: LetDecl, at: i32, ctx: i32, t: i32): boolean {
   if d.letKw == "const" { return true }
-  const isMap = t >= 0 && t < T.tys.length && tyAt(t) is TyMap
-  const fresh: i32[] = []
-  for w in monoLetWholeWrites(at) {
-    const fx = monoLetWriteFreshMap(w)
-    if fx >= 0 && isMap {
-      fresh.push(fx)
-    } else {
-      const wt = monoLetWriteRhsTy(w, ctx)
-      if wt < 0 || !tyEq(wt, t) { return false }
+  const et = elabSlotTyAt(at, [], ctx)
+  if et < 0 || !tySame(et, t) { return false }
+  if t < T.tys.length && tyAt(t) is TyMap {
+    for w in monoLetWholeWrites(at) {
+      const fx = monoLetWriteFreshMap(w)
+      if fx >= 0 { nodeTyRecord(fx, t) }
     }
   }
-  for fx in fresh { nodeTyRecord(fx, t) }
   true
 }
 
@@ -19436,13 +19422,6 @@ function monoHoleGenFnPin(
     const et = elabCallParamTyFrom(monoCallTplOf(callIx), ai, from)
     if monoTyClosedFn(et) { ft = et }
   }
-  if ft < 0 {
-    ft = monoListSrcElemTy(argIx)
-    if ft >= 0 {
-      const ePath: string[] = ["e"]
-      monoRetypePinCalls(mfrListSrc[unwrapParen(argIx)] ?? -1, ePath)
-    }
-  }
   // Whether the hole is called at two types; the deliveries may stop at a recursive forward
   // before they reach both (D6091).
   if ft < 0 && fl[1] >= 0 {
@@ -19473,23 +19452,6 @@ function monoChoiceArmFlowTy(argIx: i32, ctx: i32, depth: i32): i32 {
     }
   }
   -1
-}
-
-// The closed function type at which the `let` list holding rewritten read `argIx`'s element is
-// pinned (`monoPinListElems`): the read's deliveries stay on the list's slot, not on the generic
-// it now names. -1 for any other read (D9980).
-function monoListSrcElemTy(argIx: i32): i32 {
-  const ax = unwrapParen(argIx)
-  if ax < 0 { return -1 }
-  const d = mfrListSrc[ax] ?? -1
-  if d < 0 { return -1 }
-  const dn = nodeAt(d)
-  if !(dn is LetDecl) || dn.letType < 0 { return -1 }
-  const lt = nodeTyIxOf(dn.letType)
-  if lt < 0 || lt >= T.tys.length || !(tyAt(lt) is TyArray) { return -1 }
-  const et = tyArrayElemIx(lt)
-  if !monoTyClosedFn(et) || tyHasTyVar(et) { return -1 }
-  et
 }
 
 // Whether two calls of the hole `pIx` itself take different parameter types, as every instance

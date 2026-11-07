@@ -2024,6 +2024,46 @@ largest first:
 - call param, 5;
 - slot held fns, unbound default and others, 3.
 
+**Slot type's 15 unassessed, measured** (2026-11-07, 23,456 programs, master `7a471b8c`).
+
+Each function's answer was compared with the stored slot fact `elabSlotTyAt(holder, path, frame)`,
+by type (`tySame`) and by spelling:
+
+| function | same | differ | mono only | elab only | both none |
+|---|---|---|---|---|---|
+| `monoPinFieldContainer` | 6 | 0 | 2 | 80 | 113 |
+| `monoPinObjFields` | 6 | 0 | 0 | 171 | 856 |
+| `monoPinStoredRecords` | 14 | 0 | 7 | 3 | 1 |
+| `monoLetWritesAt` | 77 | 0 | 0 | 0 | 0 |
+
+The same answers also spell the same. What each of the 15 comes to:
+
+- **Deleted here:**
+  - `monoListSrcElemTy`, its arm and `mfrListSrc`. It answered nothing in 23,456 programs: the map
+    was keyed by the original `Index` read, and its one caller passes the read the flow rewrite
+    minted.
+  - `monoLetWritesAt`'s per-write type walk. A `let` now passes where its slot fact is `t`, and the
+    elaboration closes that fact only where every write agrees. It keeps recording a fresh `Map()`
+    write at `t`.
+- **Lane F's switch:** the record-field trio (`monoPinFieldContainer`, `monoPinObjFields`,
+  `monoPinStoredRecords`), with `monoPinFieldValue` delegating. Mono's gate decides whether to
+  pin, and the slot fact gives the type. The 254 elab-only decisions are not acted on, and the
+  D15494 cells are a named fallback.
+- **(c):**
+  - `monoWritesCoercedFirstCall`, a walk-order gate ("no call has given it a signature yet"). It
+    reads the call-signature table that lane F's c89 rewrites, so it is rechecked against that.
+  - `monoRetypeLamCells`, which retypes capture cells the capture rewrite generates. The
+    elaboration has no node for them.
+  - The two delegators, `monoPinFieldValue` and `monoPinFieldContainers`.
+- **Already settled:**
+  - `monoSigJoin` and `monoPinJoin`, deleted by #6626.
+  - `monoRenameInitAt`, recorded as (c) there.
+  - `monoNoteBindCall`, inlined by c89.
+- **Blocked:** `monoLetWritesClosed`, on split-dep's written-value reader. Its gate is that each
+  write reads a binding already closed. 5 decisions (D9182) are no for mono and closed for the
+  elaboration.
+- **Parked:** `monoReachLitTys`, with `monoReachSlotTy`.
+
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
 read. A decision is a pin a function returns, a type it returns or records, or a gate choosing
