@@ -10,7 +10,7 @@ type of a value holding functions from `elabHeldValTy`; `monoClosedObjLitTy` is 
 | `monoRetFnListTy` | when the answer is not just the identity type | the reader declines (D4515, `container-of-generic-flow-reads.vl` L39/L40), answers by identity only, or the list holds literals in a generic instance |
 
 The reader's record type is recorded with `monoRecordObjLitAt`, the recorder `let` writes already
-use. A list's type goes down its literal (`monoRecordHeldList`) and its functions are delivered at
+use. A list's type goes down its literal (a walk inside `monoRetFnListTy`) and its functions are delivered at
 it (`monoDeliverLitAt` with no slot).
 
 ## Why each guard
@@ -41,6 +41,5 @@ elaboration type, where before the uncalled stub served it. The printed output i
 No witness changes outcome. D15274 and D15296 (open) still refuse. The intermediate draft ran
 `d15293_called_two.vl`, but the generic-instance guard parks it with its one-call twin.
 
-`pin-helper budget`: 945 → 946. `monoClosedObjLitTy` is deleted. `monoRecordHeldList`,
-`monoObjLitFieldsTake` and the reader's call replace it, and `monoRecordHeldList` is the net
-helper.
+`pin-helper budget`: no new helper. `monoClosedObjLitTy` is deleted, and `monoObjLitFieldsTake` (the guard,
+which also does the decline walk) replaces it; the list walk is folded into `monoRetFnListTy`.
