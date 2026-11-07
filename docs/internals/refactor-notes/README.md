@@ -7,6 +7,7 @@ with a line in this index; the PR that moves a step also updates the target doc'
 
 Newest first:
 
+- [2026-11-07-fn-holding-facts](2026-11-07-fn-holding-facts.md): `elabHeldValTy`, the closed type of a function-holding value, shadowed against four mono functions: 0 differ, 2 old-only (D4515).
 - [2026-11-07-identity-typing-shadow](2026-11-07-identity-typing-shadow.md): Identity typing (A) as a shadow: every specialized argument has its singleton, instance delta 0, 1,557 joins become sets.
 - [2026-11-07-pin-spelling-shadow](2026-11-07-pin-spelling-shadow.md): The naming rule's producer `monoPinSpellOf`, shadowed against every instance's pins.
 - [2026-11-07-step7-classifier-recensus](2026-11-07-step7-classifier-recensus.md): Step 7 re-census: the type-blind classifiers by caller phase; `mapRetExprShape` deleted.
